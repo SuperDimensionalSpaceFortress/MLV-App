@@ -29,8 +29,10 @@
 # error); 3 DEADLINE (-DeadlineUtc passed before every leg ran: queue busy, a live claim, or a window; the rest are NOT_RUN DEADLINE); 4 GATE_UNREADABLE
 # and 5 HOST_MISMATCH from Wait-VenueQuiet (the chain stops); 6 at least one leg was NOT_RUN VENUE_QUIET_UNKNOWN; 7 (r2) at least one leg process exited
 # non-zero, so it is LEG_FAILED / outcome INVALID in CHAIN_RESULT whatever DVE_OUTCOME it printed (a higher-priority code above is kept); 8 (r1, VENUE-CHAIN-UNHEALTHY-STREAK-STOP-1)
-# the chain stopped on a deterministic venue fault: -UnhealthyStreakStop consecutive RAN legs were VENUE_UNHEALTHY with the same DVE_DETAIL, or the first one carried an
-# owner-only detail; the rest are NOT_RUN VENUE_UNHEALTHY_STREAK. 8 replaces 0 or 7 (it stops the chain, 7 does not); codes 2-6 above are kept. 0 = the streak rule is off.
+# the chain stopped on a deterministic venue fault: -UnhealthyStreakStop consecutive RAN legs were VENUE_UNHEALTHY with the same DVE_DETAIL key (r1 of
+# VENUE-CHAIN-STREAK-DETAIL-NORMALISE-1: the leading reason token, else the text with every number replaced by #, so 'freeDiskGiB 42.4 < 50' and '41.9 < 50' are one fault),
+# or the first one carried an owner-only detail token; the rest are NOT_RUN VENUE_UNHEALTHY_STREAK. 8 replaces 0 or 7 (it stops the chain, 7 does not); codes 2-6 above are kept.
+# -UnhealthyStreakStop 0 switches off the COUNT rule only: the owner-only first-occurrence stop applies whatever N is.
 # -QuietScript / -LegScript / -ClaimDir / -NowUtc are seams for the offline tests (tools/repo_hygiene/test_venue_chain_runner.py); production passes none.
 [CmdletBinding(DefaultParameterSetName = 'Chain')]
 param(
@@ -149,11 +151,22 @@ if ($LegSet) {
 $results = [System.Collections.Generic.List[object]]::new()
 $exitCode = 0
 $stopReason = $null
-# VENUE-CHAIN-UNHEALTHY-STREAK-STOP-1: the running count of consecutive RAN legs that were VENUE_UNHEALTHY with the SAME DVE_DETAIL (and the receipts that formed it).
-# These details are owner-only (a retry cannot clear them): the first occurrence stops the chain whatever -UnhealthyStreakStop is (unless it is 0 = off).
+# VENUE-CHAIN-UNHEALTHY-STREAK-STOP-1: the running count of consecutive RAN legs that were VENUE_UNHEALTHY with the SAME DVE_DETAIL KEY (and the receipts that formed it).
+# These details are owner-only (a retry cannot clear them): the first occurrence stops the chain whatever -UnhealthyStreakStop is, 0 included (0 only switches off the count rule).
+# test_venue_chain_runner.py reads the tokens the emitters print and asserts each is in this list.
 $ownerOnlyDetails = @('SCREENSAVER_SECURE_OWNER_ONLY', 'SESSION_LOCKED', 'SESSION_LOCKED_OWNER_ONLY')
-$streakDetail = $null
+$streakKey = $null
+$streakRaw = $null
 $streakIds = [System.Collections.Generic.List[string]]::new()
+$streakStop = $null
+
+function Get-UnhealthyDetailKey([string]$Detail) {
+    # VENUE-CHAIN-STREAK-DETAIL-NORMALISE-1: the stable identity of a VENUE_UNHEALTHY fault. A detail that opens with a reason token (KEEPALIVE_FAILED,
+    # SCREENSAVER_SECURE_OWNER_ONLY, ...) is that token. Free text ('leg not submitted: freeDiskGiB 42.4 < 50') is compared with every number (signed,
+    # decimal, exponent) replaced by '#', so a measurement that moves between legs does not hide a deterministic fault.
+    if ($Detail -cmatch '^([A-Z][A-Z0-9_]{2,})(?=$|[\s:;,.])') { return $Matches[1] }
+    ([regex]::Replace($Detail, '[+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?', '#')).Trim()
+}
 
 function Invoke-QuietProbe([string]$Name, [string]$Phase, [int]$MaxWaitSec) {
     # One Wait-VenueQuiet run. verdict: QUIET | COOLDOWN_UNMET | GATE_BUSY | GATE_UNREADABLE | HOST_MISMATCH | USAGE | VENUE_QUIET_UNKNOWN (not measured).
@@ -302,19 +315,21 @@ foreach ($leg in $plan) {
                 Add-Result $leg 'RAN' $ranExtra
                 L "LEG $($leg.name) RAN exit=$legCode outcome=$outcome verdict=$($re.verdict) quietMean=$(Format-Mean $re.mean) preLoadMean=$(Format-Mean $preLoad) class=$class receipt=$receipt$(if ($detail) { " detail=$detail" })"
                 # VENUE-CHAIN-UNHEALTHY-STREAK-STOP-1: only a RAN leg counts or resets (LEG_FAILED / NOT_RUN never reach here). VENUE_UNHEALTHY with a detail extends the
-                # streak when the detail is the same, otherwise starts it at 1; anything else (a different outcome, or no detail to compare) resets it.
-                if ($UnhealthyStreakStop -gt 0) {
-                    $rid = $(if ($receipt) { [IO.Path]::GetFileNameWithoutExtension($receipt) } else { "leg:$($leg.name)" })
-                    if ($outcome -ceq 'VENUE_UNHEALTHY' -and $detail) {
-                        if ($detail -cne $streakDetail) { $streakDetail = $detail; $streakIds.Clear() }
-                        $streakIds.Add($rid)
-                    } else { $streakDetail = $null; $streakIds.Clear() }
-                    $ownerOnly = ($null -ne $streakDetail) -and ($ownerOnlyDetails -ccontains $streakDetail)
-                    if ($null -ne $streakDetail -and ($ownerOnly -or $streakIds.Count -ge $UnhealthyStreakStop)) {
-                        $stopReason = 'VENUE_UNHEALTHY_STREAK'
-                        if ($exitCode -eq 0 -or $exitCode -eq 7) { $exitCode = 8 }
-                        L "CHAIN_STOP VENUE_UNHEALTHY_STREAK detail=$streakDetail n=$($streakIds.Count) threshold=$UnhealthyStreakStop receipts=$($streakIds -join ',')$(if ($ownerOnly) { ' ownerOnly=1 (a retry cannot clear it)' })"
-                    }
+                # streak when the detail KEY is the same (Get-UnhealthyDetailKey), otherwise starts it at 1; anything else (a different outcome, or no detail to compare) resets it.
+                # -UnhealthyStreakStop 0 switches off the count only: the owner-only first occurrence stops the chain whatever N is.
+                $rid = $(if ($receipt) { [IO.Path]::GetFileNameWithoutExtension($receipt) } else { "leg:$($leg.name)" })
+                if ($outcome -ceq 'VENUE_UNHEALTHY' -and $detail) {
+                    $key = Get-UnhealthyDetailKey $detail
+                    if ($key -cne $streakKey) { $streakKey = $key; $streakIds.Clear() }
+                    $streakRaw = $detail
+                    $streakIds.Add($rid)
+                } else { $streakKey = $null; $streakRaw = $null; $streakIds.Clear() }
+                $ownerOnly = ($null -ne $streakKey) -and ($ownerOnlyDetails -ccontains $streakKey)
+                if ($null -ne $streakKey -and ($ownerOnly -or ($UnhealthyStreakStop -gt 0 -and $streakIds.Count -ge $UnhealthyStreakStop))) {
+                    $stopReason = 'VENUE_UNHEALTHY_STREAK'
+                    if ($exitCode -eq 0 -or $exitCode -eq 7) { $exitCode = 8 }
+                    $streakStop = [ordered]@{ detail = $streakRaw; key = $streakKey; n = $streakIds.Count; threshold = $UnhealthyStreakStop; ownerOnly = [bool]$ownerOnly; receipts = @($streakIds) }
+                    L "CHAIN_STOP VENUE_UNHEALTHY_STREAK detail=$streakRaw n=$($streakIds.Count) threshold=$UnhealthyStreakStop receipts=$($streakIds -join ',')$(if ($ownerOnly) { ' ownerOnly=1 (a retry cannot clear it)' })$(if ($streakRaw -cne $streakKey) { " key=[$streakKey]" })"
                 }
             }
             $ran = $true
@@ -334,6 +349,7 @@ $summary = [ordered]@{
     exitCode = $exitCode; stopReason = $stopReason; legs = @($results)
     ran = @($results | Where-Object { $_.status -ceq 'RAN' }).Count; failed = @($results | Where-Object { $_.status -ceq 'LEG_FAILED' }).Count; notRun = @($results | Where-Object { $_.status -ceq 'NOT_RUN' }).Count
 }
+if ($streakStop) { $summary['unhealthyStop'] = $streakStop }
 $resultLine = 'CHAIN_RESULT=' + ($summary | ConvertTo-Json -Compress -Depth 6)
 Add-Content -LiteralPath $ChainLog -Value $resultLine
 Write-Output $resultLine
