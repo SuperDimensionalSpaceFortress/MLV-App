@@ -75,6 +75,7 @@ TEST(RepoRootPin, APinnedRootThatIsTheBuildTreeWinsOverTheWalkUp)
     const RepoRootResolution r = resolve_repo_root( lane, lane, main );
     ASSERT_TRUE( r.refusal.isEmpty() );
     ASSERT_EQ( QDir( lane ).absolutePath().toStdString(), r.root.toStdString() );
+    ASSERT_TRUE( r.notice.isEmpty() );
 }
 
 TEST(RepoRootPin, APinnedRootThatIsNotTheBuildTreeIsRefused)
@@ -101,17 +102,93 @@ TEST(RepoRootPin, APinnedRootThatIsNotACheckoutIsRefused)
     ASSERT_TRUE( r.refusal.startsWith( QStringLiteral( "REPO_ROOT_PIN_INVALID: MLVAPP_TEST_REPO_ROOT=" ) ) );
 }
 
-// A binary whose build tree is gone (relocated) and a build that recorded none keep the walk-up, as before.
-TEST(RepoRootPin, ABuildTreeThatIsNoLongerACheckoutKeepsTheWalkUp)
+// A build that recorded no tree (no generated header) keeps the walk-up and the pin rules, as before, and says nothing.
+TEST(RepoRootPin, ABuildThatRecordedNoTreeKeepsTheWalkUp)
 {
     QTemporaryDir parent;
     ASSERT_TRUE( parent.isValid() );
     const QString main = makeCheckout( parent, QStringLiteral( "main" ) );
     ASSERT_TRUE( !main.isEmpty() );
-    const RepoRootResolution gone = resolve_repo_root( QString(), parent.filePath( QStringLiteral( "gone" ) ), main );
-    ASSERT_TRUE( gone.refusal.isEmpty() );
-    ASSERT_EQ( main.toStdString(), gone.root.toStdString() );
     const RepoRootResolution unrecorded = resolve_repo_root( QString(), QString(), main );
     ASSERT_TRUE( unrecorded.refusal.isEmpty() );
     ASSERT_EQ( main.toStdString(), unrecorded.root.toStdString() );
+    const RepoRootResolution pinned = resolve_repo_root( main, QString(), QString() );
+    ASSERT_TRUE( pinned.notice.isEmpty() );
+    ASSERT_TRUE( pinned.refusal.isEmpty() );
+    ASSERT_EQ( QDir( main ).absolutePath().toStdString(), pinned.root.toStdString() );
+}
+
+// A recorded build tree that is gone (the binary was relocated, or its checkout removed) never leads to a silent root: with
+// no pin the checkout above the binary is refused. The removed-lane-checkout shape: the walk-up lands on the main checkout.
+TEST(RepoRootPin, AMissingBuildTreeWithoutAPinIsRefused)
+{
+    QTemporaryDir parent;
+    ASSERT_TRUE( parent.isValid() );
+    const QString main = makeCheckout( parent, QStringLiteral( "main" ) );
+    ASSERT_TRUE( !main.isEmpty() );
+    const QString gone = parent.filePath( QStringLiteral( "gone" ) );
+    const RepoRootResolution r = resolve_repo_root( QString(), gone, main );
+    ASSERT_EQ( ( QStringLiteral( "REPO_ROOT_BUILD_TREE_MISSING: this binary was built from " ) + gone
+                 + QStringLiteral( ", which is no longer an MLV-App checkout; the checkout above it is " ) + main
+                 + QStringLiteral( "; set MLVAPP_TEST_REPO_ROOT=<checkout> to run a relocated binary explicitly" ) )
+                   .toStdString(),
+               r.refusal.toStdString() );
+    ASSERT_TRUE( r.root.isEmpty() );
+}
+
+TEST(RepoRootPin, AMissingBuildTreeWithNoCheckoutAboveIsRefused)
+{
+    QTemporaryDir parent;
+    ASSERT_TRUE( parent.isValid() );
+    const QString gone = parent.filePath( QStringLiteral( "gone" ) );
+    const RepoRootResolution r = resolve_repo_root( QString(), gone, QString() );
+    ASSERT_TRUE( r.refusal.startsWith( QStringLiteral( "REPO_ROOT_BUILD_TREE_MISSING: this binary was built from " ) + gone ) );
+    ASSERT_TRUE( r.refusal.contains( QStringLiteral( "the checkout above it is (none);" ) ) );
+    ASSERT_TRUE( r.root.isEmpty() );
+}
+
+// Moved rather than removed: the recorded directory still exists but is no longer a checkout.
+TEST(RepoRootPin, ABuildTreeThatIsNoLongerACheckoutIsRefused)
+{
+    QTemporaryDir parent;
+    ASSERT_TRUE( parent.isValid() );
+    const QString main = makeCheckout( parent, QStringLiteral( "main" ) );
+    ASSERT_TRUE( !main.isEmpty() );
+    ASSERT_TRUE( QDir( parent.path() ).mkpath( QStringLiteral( "moved/src" ) ) );
+    const QString moved = parent.filePath( QStringLiteral( "moved" ) );
+    const RepoRootResolution r = resolve_repo_root( QString(), moved, main );
+    ASSERT_TRUE( r.refusal.startsWith( QStringLiteral( "REPO_ROOT_BUILD_TREE_MISSING: this binary was built from " ) + moved ) );
+    ASSERT_TRUE( r.root.isEmpty() );
+}
+
+// The explicit pin is the one way to run a relocated binary: it is used, but with a notice naming both trees.
+TEST(RepoRootPin, AMissingBuildTreeWithAValidPinUsesThePinWithANotice)
+{
+    QTemporaryDir parent;
+    ASSERT_TRUE( parent.isValid() );
+    const QString main = makeCheckout( parent, QStringLiteral( "main" ) );
+    ASSERT_TRUE( !main.isEmpty() );
+    const QString gone = parent.filePath( QStringLiteral( "gone" ) );
+    const QString notice = QStringLiteral( "REPO_ROOT_BUILD_TREE_MISSING: built from " ) + gone
+                         + QStringLiteral( " (gone); using pinned " ) + main;
+    const RepoRootResolution underMain = resolve_repo_root( main, gone, main );
+    ASSERT_TRUE( underMain.refusal.isEmpty() );
+    ASSERT_EQ( QDir( main ).absolutePath().toStdString(), underMain.root.toStdString() );
+    ASSERT_EQ( notice.toStdString(), underMain.notice.toStdString() );
+    const RepoRootResolution outside = resolve_repo_root( main, gone, QString() );
+    ASSERT_TRUE( outside.refusal.isEmpty() );
+    ASSERT_EQ( QDir( main ).absolutePath().toStdString(), outside.root.toStdString() );
+    ASSERT_EQ( notice.toStdString(), outside.notice.toStdString() );
+}
+
+TEST(RepoRootPin, AMissingBuildTreeWithAnInvalidPinIsRefusedAsPinInvalid)
+{
+    QTemporaryDir parent;
+    ASSERT_TRUE( parent.isValid() );
+    const QString main = makeCheckout( parent, QStringLiteral( "main" ) );
+    ASSERT_TRUE( !main.isEmpty() );
+    const RepoRootResolution r = resolve_repo_root( parent.path(), parent.filePath( QStringLiteral( "gone" ) ), main );
+    ASSERT_TRUE( r.refusal.startsWith( QStringLiteral( "REPO_ROOT_PIN_INVALID: MLVAPP_TEST_REPO_ROOT=" ) ) );
+    ASSERT_TRUE( r.notice.isEmpty() );
+    ASSERT_TRUE( r.root.isEmpty() );
 }

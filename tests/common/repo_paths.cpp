@@ -4,6 +4,7 @@
 #include <QDir>
 #include <QFileInfo>
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 
@@ -71,6 +72,8 @@ RepoRootResolution resolve_repo_root(const QString & pinned, const QString & bui
 {
     RepoRootResolution resolution;
     const bool built_from_known = is_repo_root(built_from);
+    // Recorded, but no longer a checkout: the binary was relocated or its tree removed. Only an explicit pin may choose a root.
+    const bool built_from_missing = !built_from.isEmpty() && !built_from_known;
     if (!pinned.isEmpty()) {
         if (!is_repo_root(pinned)) {
             resolution.refusal = QStringLiteral("REPO_ROOT_PIN_INVALID: MLVAPP_TEST_REPO_ROOT=%1 is not an MLV-App checkout "
@@ -83,6 +86,17 @@ RepoRootResolution resolve_repo_root(const QString & pinned, const QString & bui
             return resolution;
         }
         resolution.root = QDir(pinned).absolutePath();
+        if (built_from_missing) {
+            resolution.notice = QStringLiteral("REPO_ROOT_BUILD_TREE_MISSING: built from %1 (gone); using pinned %2")
+                                    .arg(built_from, pinned);
+        }
+        return resolution;
+    }
+    if (built_from_missing) {
+        resolution.refusal = QStringLiteral("REPO_ROOT_BUILD_TREE_MISSING: this binary was built from %1, which is no longer an "
+                                            "MLV-App checkout; the checkout above it is %2; set MLVAPP_TEST_REPO_ROOT=<checkout> "
+                                            "to run a relocated binary explicitly")
+                                 .arg(built_from, walked_up.isEmpty() ? QStringLiteral("(none)") : walked_up);
         return resolution;
     }
     if (!walked_up.isEmpty() && built_from_known && !same_directory(walked_up, built_from)) {
@@ -104,6 +118,11 @@ QString find_repo_root()
         std::fflush(stderr);
         std::fflush(stdout);
         std::exit(kRepoRootRefusedExitCode);
+    }
+    static std::atomic<bool> noticed(false);
+    if (!resolution.notice.isEmpty() && !noticed.exchange(true)) {
+        std::fprintf(stderr, "[repo_paths] NOTICE %s\n", resolution.notice.toLocal8Bit().constData());
+        std::fflush(stderr);
     }
     return resolution.root;
 }
