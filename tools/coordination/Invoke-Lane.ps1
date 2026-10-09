@@ -288,6 +288,78 @@ function Resolve-CodexModelTier {
     return [string]$resolverParsed.resolvedModel
 }
 
+# CODEX-KEY-MCP-ESCAPE-1 (HUB RULING wf_d36c1040-11d): MCP servers (node_repl, agent_bridge, ...)
+# run OUTSIDE the codex sandbox, so a read-only codex lane whose shell was broken fell back to
+# them and routed around the sandbox entirely. Returns the per-call -c overrides that disable
+# every MCP server for ONE codex exec. Measured on codex-cli 0.160.1: features.plugins=false
+# drops plugin-provided servers (cua_repl, codex_app), features.apps=false drops the codex_apps
+# connector (absent from `codex mcp list`), and each server still listed under plugins=false is
+# a config.toml server that accepts mcp_servers.<name>.enabled=false (a plugin server named that
+# way fails "invalid transport", hence the plugins=false listing). The names are read from
+# `codex mcp list --json` at call time -- never a hard-coded list -- and the launch FAILS CLOSED
+# (throws 'codex-mcp-list-unreadable') when that list cannot be read. Bounded by $TimeoutMs.
+$CODEX_MCP_DISABLED_FEATURES = @('plugins', 'apps')
+function Get-CodexMcpDisableArgs {
+    param(
+        [Parameter(Mandatory = $true)][string]$CodexExe,
+        [Parameter(Mandatory = $true)][string]$WorkDir,
+        [Parameter(Mandatory = $true)][int]$TimeoutMs
+    )
+    $featureArgs = @()
+    foreach ($f in $CODEX_MCP_DISABLED_FEATURES) { $featureArgs += @('-c', "features.$f=false") }
+    $listPsi = [System.Diagnostics.ProcessStartInfo]::new()
+    $listPsi.FileName = $CodexExe
+    foreach ($a in @('mcp', 'list', '--json', '-c', 'features.plugins=false')) { [void]$listPsi.ArgumentList.Add($a) }
+    $listPsi.WorkingDirectory = $WorkDir
+    $listPsi.UseShellExecute = $false
+    $listPsi.CreateNoWindow = $true
+    $listPsi.RedirectStandardInput = $true
+    $listPsi.RedirectStandardOutput = $true
+    $listPsi.RedirectStandardError = $true
+    try {
+        $listProc = [System.Diagnostics.Process]::Start($listPsi)
+        $listProc.StandardInput.Close()
+        $listOut = $listProc.StandardOutput.ReadToEndAsync()
+        $listErr = $listProc.StandardError.ReadToEndAsync()
+        if (-not $listProc.WaitForExit([math]::Max(1, $TimeoutMs))) {
+            try { $listProc.Kill($true) } catch { }
+            throw "codex-mcp-list-unreadable: 'codex mcp list --json' did not exit within $TimeoutMs ms"
+        }
+        $listProc.WaitForExit()
+        $listExit = $listProc.ExitCode
+        $listText = $listOut.Result
+        $listErrText = $listErr.Result
+    } catch {
+        if ($_.Exception.Message -like 'codex-mcp-list-unreadable:*') { throw }
+        throw "codex-mcp-list-unreadable: could not run 'codex mcp list --json': $($_.Exception.Message)"
+    }
+    if ($listExit -ne 0) {
+        throw "codex-mcp-list-unreadable: 'codex mcp list --json' exited $listExit`: $listErrText $listText"
+    }
+    try {
+        $listed = ConvertFrom-Json -InputObject $listText -NoEnumerate
+    } catch {
+        throw "codex-mcp-list-unreadable: unparseable 'codex mcp list --json' output: $listText"
+    }
+    if ($listed -isnot [array]) {
+        throw "codex-mcp-list-unreadable: 'codex mcp list --json' did not return a JSON array: $listText"
+    }
+    $names = @()
+    foreach ($server in $listed) {
+        $nameProp = if ($null -ne $server) { $server.PSObject.Properties['name'] } else { $null }
+        $name = if ($null -ne $nameProp) { [string]$nameProp.Value } else { '' }
+        # A name outside [A-Za-z0-9_-] cannot be addressed as a bare dotted -c key, so it could
+        # not be disabled -- refuse rather than launch with that server still live.
+        if ($name -notmatch '^[A-Za-z0-9_-]+$') {
+            throw "codex-mcp-list-unreadable: MCP server entry without a usable name: $($server | ConvertTo-Json -Compress -Depth 3)"
+        }
+        $names += $name
+    }
+    $serverArgs = @()
+    foreach ($n in $names) { $serverArgs += @('-c', "mcp_servers.$n.enabled=false") }
+    return [pscustomobject]@{ Args = @($featureArgs + $serverArgs); Servers = @($names) }
+}
+
 # Every tool that either fans out to another agent (Agent, Task, Workflow, TaskCreate) or
 # promises a LATER turn a headless lane cannot receive (Monitor, ScheduleWakeup, CronCreate,
 # CronDelete, RemoteTrigger). ONE constant feeds the pre-reservation allowlist rejection, the
@@ -1120,10 +1192,19 @@ if ($cfg.engine -eq 'claude') {
     # workspace-write is untouched. Recorded as authority.windowsSandbox.
     $windowsSandbox = if ($sandbox -eq 'read-only' -and [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) { 'unelevated' } else { 'default' }
     $windowsSandboxArgs = if ($windowsSandbox -eq 'unelevated') { @('-c', 'windows.sandbox="unelevated"') } else { @() }
+    # CODEX-KEY-MCP-ESCAPE-1 (HUB RULING wf_d36c1040-11d): a read-only lane gets NO MCP tool,
+    # since every MCP server runs outside the sandbox (see Get-CodexMcpDisableArgs). Throws, so
+    # the launch is refused, when the server list cannot be read. workspace-write is untouched.
+    $mcpServers = 'default'; $mcpDisabledServers = @(); $mcpArgs = @()
+    if ($sandbox -eq 'read-only') {
+        $mcpListTimeoutMs = [int][math]::Min(60000.0, [math]::Max(1.0, ($TimeoutSec * 1000.0) - $sw.Elapsed.TotalMilliseconds))
+        $mcpDisable = Get-CodexMcpDisableArgs -CodexExe $exe -WorkDir $WorkDir -TimeoutMs $mcpListTimeoutMs
+        $mcpServers = 'disabled'; $mcpDisabledServers = @($mcpDisable.Servers); $mcpArgs = @($mcpDisable.Args)
+    }
     $argv = @('exec',
               '-m', $codexLaunchModel,
               '-c', ("model_reasoning_effort=`"{0}`"" -f $cfg.effort),
-              '-s', $sandbox) + $windowsSandboxArgs + @(
+              '-s', $sandbox) + $windowsSandboxArgs + $mcpArgs + @(
               '-C', $WorkDir,
               '-o', $lastPath,
               '--skip-git-repo-check',
@@ -1140,6 +1221,9 @@ if ($cfg.engine -eq 'claude') {
         allowedTools   = 'ALL'
         sandbox        = $sandbox
         windowsSandbox = $windowsSandbox
+        mcpServers     = $mcpServers
+        mcpDisabledServers  = $mcpDisabledServers
+        mcpDisabledFeatures = if ($mcpServers -eq 'disabled') { @($CODEX_MCP_DISABLED_FEATURES) } else { @() }
         writableRoot   = if ($AllowEdits) { $WorkDir } else { $null }
         maxTurns       = 'n/a (codex exec has no turn cap)'
         bulkReads      = 'ALLOWED (codex takes no settings deny-list)'
