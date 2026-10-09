@@ -308,6 +308,17 @@ path; the pair is its own record (`mlv-app/dual-venue-sheet-pair/v1`) because re
 * Shipped look legs: `m16-1243-look` (Classic, requests scale 4, cuda and cpu), `m16-1243-look-cinematic` (the Classic leg asking for the
   Cinematic flavor, cuda and cpu) and `m16-1243-look-scale2` (the Classic leg at `scaleFactor` 2, cuda and cpu). See "Requested scale and
   rendered scale" below for how the CUDA backend reaches scale 2 and 4.
+* **Optional look receipt** (LOOK-ASSIST-FILM-FLAVOR-2 r2). A look leg may name `look.receipt` (a file under
+  `tools/profiling/dual-venue/look-receipts/`) with its `look.receiptSha256`; the schema requires both or neither. The runner reads the
+  receipt's bytes as **committed** at the admission head, never from the working copy, and refuses the leg `LOOK_RECEIPT_UNBOUND`
+  (nothing generated or submitted) unless they hash to `receiptSha256`. Because the spec carries `receiptSha256`, a run receipt's
+  `legSpecSha256` also binds the look receipt's bytes. The job carries the bytes inline (base64 + sha256), re-verifies them in its work dir
+  (`LOOK_RECEIPT_SHA_MISMATCH`, exit 30, before the app launches), and passes them to the GUI smoke as `-Receipt`, so the app applies
+  them before playback. The success summary records `lookReceiptSha256`, and the receipt validator accepts it only when the committed
+  spec names the same hash. It is a **measurement instrument, not a product setting**. `look-receipts/agx-off.marxml` (Look Assist on,
+  AgX, LUT and filter off, default curve) makes a Cinematic capture re-gradable frame-locked by `look-flavor-diff.py regrade`, because
+  gradation is followed only by AgX, the LUT and the filter. The legs `m16-1243-look-scale2-{cinematic,film}-agxoff` are byte copies of
+  their scale-2 sources plus that receipt.
 * The sheet copy (`-SheetCopyDir`) and the pair files carry the **leg id** --
   `sheet-<legId>-<venue>-<backend>-<flavor>.png`, `sheet-<legId>-<venue>-cuda-vs-cpu-<flavor>.png`,
   `sheet-pair-<legId>-<venue>-<flavor>.json` -- so the scale-4 and scale-2 look legs of one venue cannot overwrite

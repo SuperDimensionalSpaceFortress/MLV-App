@@ -86,7 +86,10 @@ HEAVY_LEGS = ("legs/m16-1243-pace-cinematic-fullscreen-s4-heavy.json",)
 # LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1 added the scale-2 Cinematic twin of the scale-2 look leg (the Bachelor CPU Classic | Cinematic look pair).
 SHIPPED_LEGS = ("legs/m16-1243-speed.json", "legs/m16-1243-look.json", "legs/m16-1243-look-scale2.json", "legs/m16-1243-look-cinematic.json", *DISPLAY_MATRIX_LEGS, *PACE_LEGS,
                 *LOOKAHEAD_LEGS, *HEAVY_LEGS, "legs/m16-1243-look-scale2-cinematic.json", "legs/m16-1243-look-film.json",
-                "legs/m16-1243-look-scale2-film.json")
+                "legs/m16-1243-look-scale2-film.json", *(f"legs/m16-1243-look-scale2-{flavor}-agxoff.json" for flavor in ("cinematic", "film")))
+# LOOK-ASSIST-FILM-FLAVOR-2 r2: the AgX-off twins of the scale-2 Cinematic and Film legs carry a committed look receipt (look-receipts/agx-off.marxml).
+AGXOFF_LEGS = {f"m16-1243-look-scale2-{flavor}-agxoff": f"m16-1243-look-scale2-{flavor}" for flavor in ("cinematic", "film")}
+LOOK_RECEIPT_BASE = "6b6f66f52d5344a97de5068b2e7cae1a61edf295"   # the #328 head whose generator, legs and runner this round extends
 SHIPPED_LEGS_PS = ", ".join(f"'{rel}'" for rel in SHIPPED_LEGS)
 OTHER_CLIP = "Z99-9999"
 MLV_EXT = "." + "mlv"  # never spelled as one literal token (the NA-4 gate trips on fixture basenames)
@@ -4424,8 +4427,8 @@ class LegSpecSchemaTests(unittest.TestCase):
             elif spec["card"] == "PLAYBACK-BACHELOR-PRESENT-JITTER-1":   # the capture-free pace legs, named by flavor and cell
                 self.assertEqual(spec["legId"], path.stem, path.name)
                 self.assertRegex(spec["legId"], rf"^m16-1243-pace-{flavor}-(fullscreen|windowed)-s[124](-la[0-3]|-heavy)?$", path.name)
-            else:   # the scale-4 flavored look leg, or its scale-2 twin (LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1)
-                self.assertIn(spec["legId"], (f"m16-1243-look-{flavor}", f"m16-1243-look-scale2-{flavor}"), path.name)
+            else:   # the scale-4 flavored look leg, or its scale-2 twin (LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1), or that twin's AgX-off copy (LOOK-ASSIST-FILM-FLAVOR-2 r2)
+                self.assertIn(spec["legId"], (f"m16-1243-look-{flavor}", f"m16-1243-look-scale2-{flavor}", f"m16-1243-look-scale2-{flavor}-agxoff"), path.name)
                 self.assertEqual(spec["legId"], path.stem, path.name)
             for role, per_backend in spec["criteria"].items():
                 self.assertTrue(per_backend, f"{path.name}: {role} has no criteria")
@@ -4607,6 +4610,246 @@ class LegSpecSchemaTests(unittest.TestCase):
         bad = dict(spec, backends=["cuda", "vulkan"])
         with self.assertRaises(self.jsonschema.ValidationError):
             self.jsonschema.validate(bad, self.schema)
+
+
+# ---------------------------------------------------------------------------------------------------
+# LOOK-ASSIST-FILM-FLAVOR-2 r2: a look leg may name a COMMITTED receipt (look.receipt + look.receiptSha256) that the GUI smoke applies before playback.
+# The AgX-off receipt makes a Cinematic capture re-gradable frame-locked (gradation is followed only by AgX, the LUT and the filter). It is a measurement
+# instrument, never a product setting.
+def _base_commit_available() -> bool:
+    return subprocess.run(["git", "-C", str(ROOT), "cat-file", "-e", f"{LOOK_RECEIPT_BASE}^{{commit}}"], capture_output=True).returncode == 0
+
+
+AGXOFF_RECEIPT = DV / "look-receipts" / "agx-off.marxml"
+
+
+class LookReceiptLegSpecTests(unittest.TestCase):
+    def setUp(self) -> None:
+        try:
+            import jsonschema
+        except ImportError:
+            self.skipTest("jsonschema is required")
+        self.jsonschema = jsonschema
+        self.schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
+        self.receipt_sha = hashlib.sha256(AGXOFF_RECEIPT.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
+        self.film = json.loads((DV / "legs" / "m16-1243-look-scale2-film.json").read_text(encoding="utf-8"))
+
+    def with_look(self, **fields) -> dict:
+        return dict(self.film, look=dict(self.film["look"], **fields))
+
+    def test_a_receipt_and_its_hash_validate_together_and_either_alone_is_refused(self) -> None:
+        self.jsonschema.validate(self.with_look(receipt="look-receipts/agx-off.marxml", receiptSha256=self.receipt_sha), self.schema)
+        for alone in ({"receipt": "look-receipts/agx-off.marxml"}, {"receiptSha256": self.receipt_sha}):
+            with self.assertRaises(self.jsonschema.ValidationError, msg=repr(alone)):
+                self.jsonschema.validate(self.with_look(**alone), self.schema)
+
+    def test_a_receipt_outside_look_receipts_or_a_malformed_hash_is_refused(self) -> None:
+        for path in ("receipts/agx-off.marxml", "look-receipts/../venues.json", "look-receipts/agx-off.xml", "C:/x/look-receipts/agx-off.marxml",
+                     "look-receipts/AgX-Off.marxml", "look-receipts/sub/agx-off.marxml", "agx-off.marxml"):
+            with self.assertRaises(self.jsonschema.ValidationError, msg=path):
+                self.jsonschema.validate(self.with_look(receipt=path, receiptSha256=self.receipt_sha), self.schema)
+        for sha in (self.receipt_sha.upper(), self.receipt_sha[:-1], "g" * 64):
+            with self.assertRaises(self.jsonschema.ValidationError, msg=sha):
+                self.jsonschema.validate(self.with_look(receipt="look-receipts/agx-off.marxml", receiptSha256=sha), self.schema)
+
+    def test_every_committed_leg_spec_still_validates(self) -> None:
+        for path in sorted((DV / "legs").glob("*.json")):
+            self.jsonschema.validate(json.loads(path.read_text(encoding="utf-8")), self.schema)
+
+    def test_each_agxoff_leg_is_its_source_except_legId_and_the_two_look_receipt_fields(self) -> None:
+        for agx_id, source_id in AGXOFF_LEGS.items():
+            with self.subTest(leg=agx_id):
+                agx = json.loads((DV / "legs" / f"{agx_id}.json").read_text(encoding="utf-8"))
+                source = json.loads((DV / "legs" / f"{source_id}.json").read_text(encoding="utf-8"))
+                self.assertEqual(agx["legId"], agx_id)
+                self.assertEqual(agx["card"], "DUAL-VENUE-EVIDENCE-1", "one card across a flavor pair's sides (New-VenueFlavorPair)")
+                self.assertEqual(agx["look"].pop("receipt"), "look-receipts/agx-off.marxml")
+                self.assertEqual(agx["look"].pop("receiptSha256"), self.receipt_sha, "the spec binds the committed receipt's bytes")
+                self.assertEqual(dict(agx, legId=source_id), source)
+                self.assertEqual(list(agx), list(source), "same keys in the same order")
+                text = lambda n: (DV / "legs" / f"{n}.json").read_bytes().replace(b"\r\n", b"\n").decode("utf-8")
+                diff = [(a, b) for a, b in zip(text(agx_id).split("\n"), text(source_id).split("\n")) if a != b]
+                self.assertEqual(len(diff), 2, "byte copies: only the legId line and the look line differ")
+
+    def test_no_leg_spec_that_existed_at_the_base_changed(self) -> None:
+        if not _base_commit_available():
+            self.skipTest(f"base commit {LOOK_RECEIPT_BASE[:12]} is not in this clone")
+        legs = "tools/profiling/dual-venue/legs/"
+        changed = git("diff", "--name-only", "--diff-filter=a", LOOK_RECEIPT_BASE, "--", legs)
+        self.assertEqual(changed, "", "existing leg specs are byte-identical (their legSpecSha256 values sit in receipts)")
+        added = set(git("diff", "--name-only", "--diff-filter=A", LOOK_RECEIPT_BASE, "--", legs).split())
+        self.assertTrue({legs + f"{leg}.json" for leg in AGXOFF_LEGS} <= added)
+
+    def test_the_agx_off_receipt_turns_off_agx_lut_and_filter_keeps_look_assist_and_names_no_path(self) -> None:
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(AGXOFF_RECEIPT.read_bytes())
+        self.assertEqual((root.tag, root.get("version")), ("receipt", "4"))
+        self.assertEqual([(c.tag, c.text) for c in root], [("lookAssistEnabled", "1"), ("agx", "0"), ("lutEnabled", "0"), ("filterEnabled", "0")],
+                         "no gradationCurve: Film is laid only over a default curve, so the receipt must leave the curve default")
+        self.assertNotRegex(AGXOFF_RECEIPT.read_text(encoding="utf-8"), r"(?i)[a-z]:[\\/]|\\\\|\.mlv\b|M16-1243")
+
+
+@requires_windows_pwsh
+class LookReceiptRunnerTests(RunnerHarness, unittest.TestCase):
+    """(c) Invoke-VenueLeg reads the look receipt as COMMITTED (offline test mode: the RepoRoot's HEAD), never the working copy, and refuses
+    LOOK_RECEIPT_UNBOUND before anything is generated or submitted unless its bytes hash to look.receiptSha256."""
+
+    def setUp(self) -> None:
+        self.make_harness()
+        self.repo = self.tmp / "receipt-repo"
+        target = self.repo / "tools" / "profiling" / "dual-venue" / "look-receipts" / "agx-off.marxml"
+        target.parent.mkdir(parents=True)
+        self.committed = AGXOFF_RECEIPT.read_bytes().replace(b"\r\n", b"\n")
+        target.write_bytes(self.committed)
+        for args in (("init", "-q"), ("config", "user.email", "unit@example.invalid"), ("config", "user.name", "unit"), ("config", "core.autocrlf", "false"),
+                     ("add", "tools"), ("commit", "-q", "-m", "committed look receipt")):
+            subprocess.run(["git", "-C", str(self.repo), *args], capture_output=True, text=True, check=True)
+        self.working = self.committed.replace(b"<agx>0</agx>", b"<agx>1</agx>")
+        target.write_bytes(self.working)   # the working copy now differs from the committed blob
+        self.gen.write_text(STUB_GENERATOR.replace("$DisplayMode)", "$DisplayMode,$LookReceiptPath)", 1), encoding="utf-8")
+        self.work = self.tmp / "work"
+
+    def spec(self, **look) -> Path:
+        spec = json.loads(self.write_spec(leg_type="look", flavor="film", scale=2).read_text(encoding="utf-8"))
+        spec["look"].update(look)
+        path = self.tmp / f"spec-receipt-{hashlib.sha1(json.dumps(look, sort_keys=True).encode()).hexdigest()[:10]}.json"
+        path.write_text(json.dumps(spec), encoding="utf-8")
+        return path
+
+    def run_receipt_leg(self, spec: Path, gen_refusal: str | None = None) -> tuple[subprocess.CompletedProcess, dict | None, list[str]]:
+        cfg = {"log": str(self.log), "genLog": str(self.gen_log), "probe": BACHELOR_PROBE, "mainMode": "capture", "healthMode": "ok",
+               "artifactsAgentPath": "X:\\stub\\agent\\outbox\\unit.artifacts", "genRefusal": gen_refusal, "clipContentSha256": CLIP_CONTENT_SHA,
+               "token": None, "exitCode": 0}
+        self.stub_cfg.write_text(json.dumps(cfg), encoding="utf-8")
+        self.log.write_text("", encoding="utf-8")
+        self.gen_log.write_text("", encoding="utf-8")
+        before = set(self.receipts.rglob("*.json")) if self.receipts.exists() else set()
+        proc = run_pwsh(["-File", str(DV / "Invoke-VenueLeg.ps1"), "-Venue", "bachelor", "-LegSpec", str(spec), "-SourceCommit", self.sha, "-Backend", "cpu",
+                         "-BuildManifestSha256", self.build_sha, "-VenueTablePath", str(self.table), "-ReceiptRoot", str(self.receipts),
+                         "-OfflineTestMode", "-UmRunScript", str(self.um), "-GeneratorScript", str(self.gen), "-WorkDir", str(self.work),
+                         "-ConsentPath", str(self.consent), "-RepoRoot", str(self.repo), "-Actor", "unit-test"],
+                        env_extra={"DVE_STUB": str(self.stub_cfg)})
+        after = sorted((set(self.receipts.rglob("*.json")) if self.receipts.exists() else set()) - before, key=lambda f: f.stat().st_mtime_ns)
+        receipt = json.loads(after[-1].read_text(encoding="utf-8")) if after else None
+        return proc, receipt, [l.strip() for l in self.log.read_text(encoding="utf-8").splitlines() if l.strip()]
+
+    def assertUnbound(self, spec: Path) -> None:
+        proc, receipt, submitted = self.run_receipt_leg(spec)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIsNotNone(receipt, proc.stdout + proc.stderr)
+        self.assertEqual(receipt["refusal"], "LOOK_RECEIPT_UNBOUND", proc.stdout)
+        self.assertEqual(receipt["outcome"], "DEVICE_UNAVAILABLE")
+        self.assertEqual(self.generator_calls(), [], "nothing is generated")
+        self.assertEqual(submitted, [], "nothing is submitted, not even the health probe")
+
+    def test_a_hash_only_the_working_copy_matches_is_refused_and_nothing_is_generated_or_submitted(self) -> None:
+        self.assertNotEqual(self.committed, self.working)
+        self.assertUnbound(self.spec(receipt="look-receipts/agx-off.marxml", receiptSha256=hashlib.sha256(self.working).hexdigest()))
+
+    def test_a_wrong_hash_a_missing_half_an_uncommitted_file_or_a_path_outside_look_receipts_is_refused(self) -> None:
+        sha = hashlib.sha256(self.committed).hexdigest()
+        for look in ({"receipt": "look-receipts/agx-off.marxml", "receiptSha256": "0" * 64}, {"receipt": "look-receipts/agx-off.marxml"},
+                     {"receiptSha256": sha}, {"receipt": "look-receipts/never-committed.marxml", "receiptSha256": sha},
+                     {"receipt": "look-receipts/../look-receipts/agx-off.marxml", "receiptSha256": sha}):
+            with self.subTest(look=look):
+                self.assertUnbound(self.spec(**look))
+
+    def test_the_committed_bytes_reach_the_generator(self) -> None:
+        proc, receipt, submitted = self.run_receipt_leg(self.spec(receipt="look-receipts/agx-off.marxml", receiptSha256=hashlib.sha256(self.committed).hexdigest()),
+                                                        gen_refusal="DUAL_VENUE_UNIT_STOP")
+        self.assertEqual(receipt["refusal"], "GENERATOR_REFUSED_DUAL_VENUE_UNIT_STOP", proc.stdout + proc.stderr)
+        [call] = self.generator_calls()
+        found = re.search(r"(?:^|;)LookReceiptPath=([^;]+)", call)
+        self.assertIsNotNone(found, call)
+        self.assertEqual(Path(found.group(1)).read_bytes(), self.committed, "the generator is handed the COMMITTED bytes, not the working copy")
+        self.assertEqual(submitted, [])
+
+    def test_a_look_leg_without_a_receipt_passes_none(self) -> None:
+        proc, receipt, _ = self.run_receipt_leg(self.spec(), gen_refusal="DUAL_VENUE_UNIT_STOP")
+        self.assertEqual(receipt["refusal"], "GENERATOR_REFUSED_DUAL_VENUE_UNIT_STOP", proc.stdout + proc.stderr)
+        [call] = self.generator_calls()
+        self.assertNotIn("LookReceiptPath", call)
+
+
+@requires_windows_pwsh
+class LookReceiptGeneratorTests(unittest.TestCase):
+    """(d) The generator's -LookReceiptPath: without it the emitted job is byte-identical to the base (#328 head) generator's for the same arguments;
+    with it the job embeds the receipt base64 + sha256, passes -Receipt exactly once and records lookReceiptSha256 in its summary; off a look leg it throws."""
+
+    LOOK_ARGS = ["-Backend", "cpu", "-ScaleFactor", "2", "-ExpectedScaleRequest", "2", "-TelemetryArm", "LIGHT", "-CpuQuiescenceThresholdPercent", "95",
+                 "-ContactSheet", "-ContactSheetFrames", "6", "-ForceLookAssist"]
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._tmp = tempfile.TemporaryDirectory(prefix="dve-lookrcpt-")
+        cls.tmp = Path(cls._tmp.name)
+        cls.head = git("rev-parse", "HEAD")
+        cls.repo = cls.tmp / "repo"
+        subprocess.run(["git", "clone", "-q", "--shared", "--no-checkout", str(ROOT), str(cls.repo)], check=True)
+        subprocess.run(["git", "-C", str(cls.repo), "sparse-checkout", "set", "--cone", "tools", "tests/fixtures/clips"], check=True)
+        subprocess.run(["git", "-C", str(cls.repo), "checkout", "-q", cls.head], check=True)
+        for stem in FIXTURE_IDS:
+            write_synthetic_mlv(cls.repo / "tests" / "fixtures" / "clips" / (stem + MLV_EXT), FRAMES_30S_AT_23976)
+        cls.base_root = cls.tmp / "base"
+        if _base_commit_available():
+            tar = cls.tmp / "base.tar"
+            subprocess.run(["git", "-C", str(ROOT), "archive", LOOK_RECEIPT_BASE, "--format=tar", "-o", str(tar), "tools/profiling", "tools/gates"], check=True)
+            cls.base_root.mkdir()
+            subprocess.run(["tar", "-xf", str(tar), "-C", str(cls.base_root)], check=True)
+        cls.receipt = cls.tmp / "look-receipt.marxml"
+        cls.receipt.write_bytes(AGXOFF_RECEIPT.read_bytes().replace(b"\r\n", b"\n"))
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._tmp.cleanup()
+
+    def run_generator(self, script: Path, out_name: str, extra: list[str]) -> tuple[subprocess.CompletedProcess, Path]:
+        out = self.tmp / out_name
+        proc = run_pwsh(["-File", str(script), "-SourceCommit", self.head, "-BuildManifestSha256", "ab" * 32, "-ClipId", FIXTURE_IDS[0],
+                         "-FixtureSha256", "cd" * 32, "-RepoRoot", str(self.repo), "-OutFile", str(out), *extra])
+        return proc, out
+
+    def generate(self, script: Path, out_name: str, extra: list[str]) -> Path:
+        proc, out = self.run_generator(script, out_name, extra)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return out
+
+    def test_without_a_receipt_the_job_is_byte_identical_to_the_base_generators(self) -> None:
+        if not _base_commit_available():
+            self.skipTest(f"base commit {LOOK_RECEIPT_BASE[:12]} is not in this clone")
+        base_gen = self.base_root / "tools" / "profiling" / "bachelor" / "playback-attr-3-cuda-job.ps1"
+        for name, extra in (("default", []), ("cpu-look-film", [*self.LOOK_ARGS, "-LookFlavor", "film"]),
+                            ("cpu-look-cinematic", [*self.LOOK_ARGS, "-LookFlavor", "cinematic"]),
+                            ("cuda-look-cinematic", ["-ContactSheet", "-ContactSheetFrames", "6", "-ForceLookAssist", "-LookFlavor", "cinematic"])):
+            with self.subTest(variant=name):
+                new = self.generate(GENERATOR, f"new-{name}.job.ps1", extra).read_bytes()
+                old = self.generate(base_gen, f"base-{name}.job.ps1", extra).read_bytes()
+                self.assertEqual(new, old, f"{name}: the job without -LookReceiptPath must be the base generator's bytes")
+                self.assertNotIn(b"LookReceipt", new)
+
+    def test_with_a_receipt_the_job_embeds_its_bytes_passes_minus_receipt_once_and_records_its_hash(self) -> None:
+        sha = hashlib.sha256(self.receipt.read_bytes()).hexdigest()
+        text = self.generate(GENERATOR, "receipt.job.ps1", [*self.LOOK_ARGS, "-LookFlavor", "film", "-LookReceiptPath", str(self.receipt)]).read_text(encoding="utf-8")
+        [b64] = re.findall(r"(?m)^\$LookReceiptBase64 = '([A-Za-z0-9+/=]+)'\r?$", text)
+        import base64
+        self.assertEqual(base64.b64decode(b64), self.receipt.read_bytes())
+        self.assertEqual(re.findall(r"(?m)^\$LookReceiptSha256 = '([0-9a-f]{64})'\r?$", text), [sha])
+        self.assertEqual(text.count(" -Receipt "), 1, "the smoke runner is passed -Receipt exactly once")
+        self.assertIn("-RequireLookAssist:`$true -Receipt $(ConvertTo-PsSingleQuoted $LookReceiptJobPath) -Scope none", text)
+        self.assertEqual(text.count("    lookReceiptSha256 = $LookReceiptSha256\n") + text.count("    lookReceiptSha256 = $LookReceiptSha256\r\n"), 1, "the success summary records the hash")
+        self.assertIn("RESULT=LOOK_RECEIPT_SHA_MISMATCH", text)
+        self.assertLess(text.index("$LookReceiptJobPath = Join-Path $Work 'look-receipt.marxml'"), text.index(" -Receipt $(ConvertTo-PsSingleQuoted $LookReceiptJobPath)"),
+                        "the receipt is written and re-verified before the smoke command is built")
+        parsed = run_pwsh(["-Command", f"$e = $null; [void][System.Management.Automation.Language.Parser]::ParseFile('{self.tmp / 'receipt.job.ps1'}', [ref]$null, [ref]$e); $e.Count"])
+        self.assertEqual(parsed.stdout.strip(), "0", parsed.stdout + parsed.stderr)
+
+    def test_a_receipt_off_a_look_leg_is_refused_before_anything_is_emitted(self) -> None:
+        for name, extra in (("speed", []), ("pace", ["-ForceLookAssist", "-LookPaceLeg"])):
+            with self.subTest(leg=name):
+                proc, out = self.run_generator(GENERATOR, f"refused-{name}.job.ps1", [*extra, "-LookReceiptPath", str(self.receipt)])
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertIn("DUAL_VENUE_LOOK_RECEIPT_REQUIRES_LOOK_LEG", proc.stdout + proc.stderr)
+                self.assertFalse(out.exists())
 
 
 if __name__ == "__main__":
