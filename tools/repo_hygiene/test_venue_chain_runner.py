@@ -92,6 +92,8 @@ if ($env:FAKE_LEG_PRELOADS) {
     "DVE_RECEIPT_PATH=$rp"
 }
 if ($env:FAKE_LEG_LOG) { Add-Content -LiteralPath $env:FAKE_LEG_LOG -Value ("END {0} {1} {2}" -f [DateTime]::UtcNow.Ticks, $leaf, $PID) }
+# r2: the leg whose spec file name equals FAKE_LEG_FAIL_LEAF dies with FAKE_LEG_FAIL_CODE AFTER printing DVE_OUTCOME=PASS (a crash that leaves a stale verdict line).
+if ($env:FAKE_LEG_FAIL_LEAF -and $env:FAKE_LEG_FAIL_LEAF -eq $leaf) { exit ([int]$env:FAKE_LEG_FAIL_CODE) }
 exit 0
 """
 
@@ -377,6 +379,42 @@ class VenueChainRunnerTests(unittest.TestCase):
         ran = [l for l in self.chain_log(rd) if " RAN " in l]
         self.assertIn("verdict=COOLDOWN_UNMET quietMean=32.0 preLoadMean=29.6 class=COOLDOWN_UNMET", ran[0])
 
+    # ---------------------------------------------------------------- r2: a leg that exits non-zero is never a successful leg
+    def test_a_leg_that_exits_nonzero_is_leg_failed_invalid_never_ran(self) -> None:
+        rd = self.case / "lane-F"
+        r = self.run_chain(rd, self.specs, env=self.env(FAKE_LEG_FAIL_LEAF="fx-b.json", FAKE_LEG_FAIL_CODE="3"))
+        self.assertEqual(r.returncode, 7, r.stdout + r.stderr)
+        res = chain_result(r.stdout)
+        self.assertEqual(res["exitCode"], 7)
+        self.assertEqual([l["status"] for l in res["legs"]], ["RAN", "LEG_FAILED", "RAN"])
+        bad = res["legs"][1]
+        self.assertEqual((bad["outcome"], bad["printedOutcome"], bad["legExit"], bad["receipt"]), ("INVALID", "PASS", 3, None))
+        self.assertEqual((res["ran"], res["failed"], res["notRun"]), (2, 1, 0))
+        log = self.chain_log(rd)
+        self.assertEqual(len([l for l in log if " LEG_FAILED exit=3 outcome=INVALID printedOutcome=PASS " in l]), 1, log)
+        self.assertFalse([l for l in log if " RAN " in l and "02-fx-b" in l], "a leg that exited non-zero must never get a RAN line")
+        self.assertEqual(len([l for l in self.leg_calls() if l.startswith("START")]), 3, "the chain goes on to the next leg")
+
+    def test_exit_zero_legs_are_unchanged_by_the_leg_exit_rule(self) -> None:
+        r = self.run_chain(self.case / "lane-F0", self.specs, env=self.env(FAKE_LEG_FAIL_LEAF="no-such-leaf.json", FAKE_LEG_FAIL_CODE="3"))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        res = chain_result(r.stdout)
+        self.assertEqual(([l["status"] for l in res["legs"]], res["failed"]), (["RAN", "RAN", "RAN"], 0))
+
+    def test_a_failed_leg_does_not_mask_exit_6(self) -> None:
+        env = self.env(FAKE_QUIET_MODES="UNKNOWN,QUIET,QUIET", FAKE_LEG_FAIL_LEAF="fx-b.json", FAKE_LEG_FAIL_CODE="2")
+        r = self.run_chain(self.case / "lane-F6", self.specs[:2], "-OnUnknown", "Continue", env=env)
+        self.assertEqual(r.returncode, 6, r.stdout + r.stderr)
+        self.assertEqual([l["status"] for l in chain_result(r.stdout)["legs"]], ["NOT_RUN", "LEG_FAILED"])
+
+    def test_mutation_leg_exit_code_ignored_records_the_dead_leg_as_ran(self) -> None:
+        runner = self.mutated_runner("if ($legCode -ne 0) {", "if ($false) {", count=1)
+        r = self.run_chain(self.case / "lane-FM", self.specs[:2], runner=runner, env=self.env(FAKE_LEG_FAIL_LEAF="fx-b.json", FAKE_LEG_FAIL_CODE="3"))
+        res = chain_result(r.stdout)
+        self.assertEqual(r.returncode, 0, "the mutant must reproduce the defect: a dead leg and a clean chain exit")
+        self.assertEqual([l["status"] for l in res["legs"]], ["RAN", "RAN"])
+        self.assertEqual((res["legs"][1]["outcome"], res["legs"][1]["legExit"]), ("PASS", 3))
+
     # ---------------------------------------------------------------- the claim
     def _stale_case(self, reason: str, pid: int, created: str, expires: datetime) -> None:
         fixture = self.write_claim(pid, created, expires)
@@ -525,7 +563,7 @@ class VenueChainRunnerTests(unittest.TestCase):
         for needle in ("Get-CimInstance", "Win32_Process", "receipt.json", "prompt.md"):
             self.assertNotIn(needle, text + mod, f"{needle}: a waiter must never treat another chain's WAITING as venue use; only a live claim blocks")
         header = "\n".join(l for l in text.splitlines() if l.startswith("#"))
-        for token in ("0 every leg ran", "2 usage", "3 DEADLINE", "4 GATE_UNREADABLE", "5 HOST_MISMATCH", "6 at least one leg was NOT_RUN VENUE_QUIET_UNKNOWN", "CHAIN_RESULT=<json>"):
+        for token in ("0 every leg ran", "2 usage", "3 DEADLINE", "4 GATE_UNREADABLE", "5 HOST_MISMATCH", "6 at least one leg was NOT_RUN VENUE_QUIET_UNKNOWN", "7 (r2) at least one leg process exited", "CHAIN_RESULT=<json>"):
             self.assertIn(token, header)
         self.assertIn("IO.FileMode]::CreateNew", mod)
 

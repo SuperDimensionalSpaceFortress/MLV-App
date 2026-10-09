@@ -338,6 +338,10 @@ CONSUMER_ACTS_ON_EXIT: dict[str, str] = {
     # contradicts its own exit code is INVALID (Resolve-DvJobOutcome), and a PASS/FAIL also needs the oracle's verdict.
     "tools/profiling/dual-venue/Invoke-VenueLeg.ps1":
         r"\$exitCode\s*=\s*\[int\]\$run\.result\.exitCode[\s\S]*?if\s*\(\$exitCode\s+-ne\s+0\s+-and\s+\$resolved\.outcome\s+-eq\s+'CAPTURED'\)\s*\{",
+    # VENUE-CHAIN-RUNNER-1 r2: runs each leg through Invoke-VenueLeg.ps1 and publishes CHAIN_RESULT; a leg process that exits non-zero is
+    # LEG_FAILED / INVALID and the chain exits 7, whatever DVE_OUTCOME the dead leg printed (never recorded as a RAN leg).
+    "tools/profiling/dual-venue/Invoke-VenueChain.ps1":
+        r"\$legCode\s*=\s*\$LASTEXITCODE[\s\S]*?if\s*\(\$legCode\s+-ne\s+0\)\s*\{[\s\S]*?'LEG_FAILED'[\s\S]*?\$exitCode\s*=\s*7\b",
 }
 
 # Scripts that NAME an evidence launcher (or a consumer) and are not consumers that publish a result. Each reason is read
