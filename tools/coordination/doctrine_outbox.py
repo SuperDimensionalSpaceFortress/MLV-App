@@ -88,6 +88,10 @@ CARDS_TARGET = f"specs/{PROJECT}/cards.md"
 TARGETS = ("RECEIPTS.md", "TRAPS.md", "RULINGS.md", CARDS_TARGET)
 KINDS = ("receipt", "trap", "ruling")
 CARD_VALIDATOR_REL = "tools/validate-cards.mjs"
+# R14.1 card limits, mirrored from the bus's tools/validate-cards.mjs (MAX_CARD_LINES/MAX_CARD_BYTES);
+# a test pins them to the vendored copy. The drain's authority is still that validator.
+MAX_CARD_LINES = 15
+MAX_CARD_BYTES = 2000
 CARD_HEADING_RE = re.compile(r"^## " + re.escape(PROJECT) + r"/[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 CARDS_TITLE = f"# {PROJECT} cards (R14.1; written only by {PROJECT})\n\n"
 WORD_CAP = 450
@@ -346,6 +350,22 @@ def item_heading(item: dict) -> str:
     return item["body"].lstrip().splitlines()[0].rstrip()
 
 
+def screen_rendered_card(item: dict) -> None:
+    """Refuse a card whose RENDERED block (what the drain appends: body plus the Outbox note) is over
+    the validator's limits, so it fails at authoring time and not after it merges. The drain renders
+    with the resolved 40-hex source commit, so PENDING is judged at that full width."""
+    if item["meta"]["target"] != CARDS_TARGET:
+        return
+    src = item["meta"]["source_commit"]
+    _key, block = render_block(item, "0" * 40 if src == "PENDING" else src)
+    rows = block.replace("\r\n", "\n").strip("\n").split("\n")
+    size = len("\n".join(rows).encode("utf-8"))
+    if len(rows) > MAX_CARD_LINES:
+        raise Refusal("CARD_INVALID", f"rendered card is {len(rows)} lines; the limit is {MAX_CARD_LINES}")
+    if size > MAX_CARD_BYTES:
+        raise Refusal("CARD_INVALID", f"rendered card is {size} bytes; the limit is {MAX_CARD_BYTES}")
+
+
 # ---------- repository queries (committed bytes only, never the worktree) ----------
 
 def require_tool_at_ref(repo: pathlib.Path, ref: str) -> None:
@@ -577,7 +597,7 @@ def ensure_cards_file(path: pathlib.Path) -> None:
         path.write_bytes(CARDS_TITLE.encode("utf-8"))
 
 
-def validate_cards_file(wt: pathlib.Path) -> None:
+def validate_cards_file(wt: pathlib.Path, cards_file: pathlib.Path | None = None) -> None:
     """Run the tip's own validator over the would-be cards file in the drain's temp worktree.
     It only reads; any outcome but exit 0 refuses the publish (fail closed)."""
     node = find_node()
@@ -587,7 +607,7 @@ def validate_cards_file(wt: pathlib.Path) -> None:
         raise Refusal("CARD_VALIDATOR_ABSENT", f"{CARD_VALIDATOR_REL} is not in the bus worktree")
     try:
         proc = subprocess.run(
-            [node, str(wt / CARD_VALIDATOR_REL), "--bus", str(wt), "--file", str(wt / CARDS_TARGET), "--project", PROJECT],
+            [node, str(wt / CARD_VALIDATOR_REL), "--bus", str(wt), "--file", str(cards_file or wt / CARDS_TARGET), "--project", PROJECT],
             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120,
         )
     except (OSError, subprocess.TimeoutExpired) as e:
@@ -597,6 +617,45 @@ def validate_cards_file(wt: pathlib.Path) -> None:
         raise Refusal("CARD_INVALID", out[:1000])
     if proc.returncode != 0:
         raise Refusal("CARD_VALIDATOR_FAILED", f"exit {proc.returncode}: {out[:400]}")
+
+
+def invalid_cards(wt: pathlib.Path, tip: str, cards: list[dict]) -> list[tuple[dict, str, str]]:
+    """The cards to refuse, each as (card, code, validator message). Judged by the same tip validator
+    on a file outside the repo that starts as the cards file AT THE BUS TIP -- exactly the base the
+    batch validation used -- and takes the cards in drain order, keeping each one that passes: a
+    card is judged as (tip + the cards kept before it + that card). A card that clashes with the tip
+    or with an earlier pending card (duplicate id, any cross-card rule) is therefore named and
+    refused CARD_INVALID alone; the later-sorted of two clashing pending cards is the one refused.
+    A tip file the validator already rejects names no card: every card gets CARD_INVALID_UNATTRIBUTED
+    and nothing is published into it. A verdict other than valid/invalid (node gone, timeout, crash)
+    is not a verdict on any card and propagates."""
+    tip_bytes = cat_file_blob(wt, tip, CARDS_TARGET)
+    with tempfile.TemporaryDirectory(prefix="doctrine-outbox-card-") as tmp:
+        trial = pathlib.Path(tmp) / "cards.md"
+        if tip_bytes:
+            trial.write_bytes(tip_bytes)
+            try:
+                validate_cards_file(wt, trial)
+            except Refusal as e:
+                if e.code != "CARD_INVALID":
+                    raise
+                return [(c, "CARD_INVALID_UNATTRIBUTED", e.detail) for c in cards]
+        else:
+            ensure_cards_file(trial)
+        kept = trial.read_bytes()
+        bad = []
+        for c in cards:
+            trial.write_bytes(kept)
+            append_block_to_file(trial, c["block"])
+            try:
+                validate_cards_file(wt, trial)
+            except Refusal as e:
+                if e.code != "CARD_INVALID":
+                    raise
+                bad.append((c, "CARD_INVALID", e.detail))
+                continue
+            kept = trial.read_bytes()
+    return bad
 
 
 def git_commit(worktree: pathlib.Path, message: str) -> str:
@@ -692,10 +751,15 @@ def drain(repo: pathlib.Path, bus_repo: pathlib.Path, ref: str, ledger: pathlib.
 
     attempted: dict[str, str] = {}  # key -> the bus commit WE built for it, across attempts
     attempt = 0
+    card_pass_len = None  # candidates before the last per-card refusal; the next pass must hold fewer
     while True:
         attempt += 1
         # Re-gated on every attempt: a refetched tip may be the one that lands the validator.
         candidates = r14_gate(bus_repo, tip, candidates, report)
+        if card_pass_len is not None:
+            if len(candidates) >= card_pass_len:
+                raise Refusal("CARD_PASS_NOT_SHRINKING", f"{len(candidates)} candidates after a per-card refusal pass over {card_pass_len}")
+            card_pass_len = None
         pending = []
         tip_sent_rows = []
         landed_rows = []
@@ -747,7 +811,23 @@ def drain(repo: pathlib.Path, bus_repo: pathlib.Path, ref: str, ledger: pathlib.
                 if not head_bytes.startswith(tip_bytes):
                     raise Refusal("PREFIX_BROKEN", target)
             if any(c["target"] == CARDS_TARGET for c in pending):
-                validate_cards_file(wt)
+                try:
+                    validate_cards_file(wt)
+                except Refusal as e:
+                    if e.code != "CARD_INVALID":
+                        raise
+                    cards = [c for c in pending if c["target"] == CARDS_TARGET]
+                    bad = invalid_cards(wt, tip, cards)
+                    if not bad:
+                        # Invalid, yet no card can be named: that card set is not published (fail closed).
+                        bad = [(c, "CARD_INVALID_UNATTRIBUTED", e.detail) for c in cards]
+                    for c, code, detail in bad:
+                        report["refused"].append({"path": c["path"], "code": code, "detail": detail})
+                    dropped = {c["key"] for c, _code, _detail in bad}
+                    card_pass_len = len(candidates)
+                    candidates = [c for c in candidates if c["key"] not in dropped]
+                    attempt -= 1  # a per-card refusal is not a push attempt
+                    continue  # rebuild the commits without the refused cards and validate again
             if not push:
                 report["commit"] = head
                 report["would_push"] = [{"path": c["path"], "key": c["key"], "target": c["target"]} for c in pending]
@@ -1276,6 +1356,7 @@ def check_commit(repo: pathlib.Path, sha: str, added_items: set[str],
         try:
             parsed = parse_item(text + "\n")
             screen_law4(parsed["body"], deny_terms)
+            screen_rendered_card(parsed)
         except Refusal as e:
             problems.append(f"DOCTRINE_EXPORT_OUTBOX_ITEM_INVALID: {norm}: {e}")
     return problems
@@ -1313,6 +1394,7 @@ def cmd_validate(paths: list[pathlib.Path], deny_terms: list[tuple[str, str]]) -
                 text += "\n"
             item = parse_item(text)
             screen_law4(item["body"], deny_terms)
+            screen_rendered_card(item)
         except Refusal as e:
             print(f"[doctrine-outbox] REFUSED {p}: {e}", file=sys.stderr)
             ok = False

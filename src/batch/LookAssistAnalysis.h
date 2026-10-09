@@ -586,8 +586,9 @@ int lookAssistDisplayTargetMedianForScene( LookAssistScene scene );
  * (kCinematicFlavorDeltas, LookAssistAnalysis.cpp) laid over the same preset sliders -- contrast, pivot,
  * shadows, highlights, vibrance. It never touches exposure (Classic's, exactly) or temperatureDelta / tintDelta. Saturation and the
  * tone curve are not Look Assist sliders (no preset field, no baseline), so they are not used.
- * Film is Cinematic's tone (the same table) plus a colour grade: a blue-amber split in the receipt's R and B gradation
- * curves (lookAssistFilmGradationCurve), which every route already applies. The preset is Cinematic's; the curve is
+ * Film is Cinematic's tone (the same table) plus a colour grade in the receipt's gradation curves
+ * (lookAssistFilmGradationCurve, film-v2): a teal-shadow / warm-highlight split in R, G and B, a gentle black lift and
+ * a soft highlight shoulder in Y. Every route already applies those tables. The preset is Cinematic's; the curve is
  * laid by the consumers (GUI, headless) and only over a default curve. */
 enum class LookAssistFlavor
 {
@@ -642,19 +643,27 @@ LookAssistFlavorDeltas lookAssistCinematicDeltasForScene( LookAssistScene scene 
  * Film lays Cinematic's table (its tone IS Cinematic's); its colour grade is the gradation curve below. */
 void lookAssistApplyFlavorDeltas( LookAssistPreset *preset, LookAssistScene scene, LookAssistFlavor flavor );
 
-/* ---- The Film grade: a blue-amber split in the R and B gradation curves (docs/look-assist-flavors.md). ----
- * Per scene strength s (kFilmGradeStrength, the ONE table), a = shadowOffset = 0.022 s, b = highlightOffset = 0.030 s:
- *   R: (1e-5,1e-5) (0.18, 0.18 - a) (0.45, 0.45) (0.72, 0.72 + b) (1,1)
- *   B: (1e-5,1e-5) (0.18, 0.18 + a) (0.45, 0.45) (0.72, 0.72 - b) (1,1)
- *   Y, G: the default two points.
- * R and B move by equal and opposite amounts at every knot and the engine's spline is linear in y, so r[v] + b[v] == 2 g[v]
- * on every table entry: a neutral pixel keeps its green-magenta axis. A coloured pixel indexes different entries per
- * channel, so its axis moves by up to about (a + b)/2 (amber toward magenta, teal toward green; see the docs). */
+/* ---- The Film grade, film-v2: a teal / warm split in the R, G, B gradation curves plus a Y tone line
+ * (docs/look-assist-flavors.md). ----
+ * Per scene strength s (kFilmGradeStrength, the ONE table): t = tealOffset = 0.035 s, w = warmOffset = 0.045 s,
+ * k = greenShare = 0.15 (not scaled), L = blackLift = 0.020 s, h = shoulderOffset = 0.010 s, c = whiteRoll = 0.030 s:
+ *   Y: (1e-5, L) (0.50, 0.50) (0.80, 0.80 - h) (1, 1 - c)                     gentle black lift, soft shoulder
+ *   R: (1e-5,1e-5) (0.10, 0.10 - t) (0.20,0.20) (0.26,0.26) (0.52, 0.52 + w) (0.85, 0.85 + 0.3 w) (1,1)
+ *   G: the same x, (0.10, 0.10 + k t) .. (0.52, 0.52 + k w) (0.85, 0.85 + 0.3 k w)
+ *   B: R's mirror, (0.10, 0.10 + t) .. (0.52, 0.52 - w) (0.85, 0.85 - 0.3 w)
+ * R and B move by equal and opposite amounts at every knot and the engine's spline is linear in y, so r[v] + b[v] ==
+ * 2 def[v] on every table entry the Y line can reach; G takes the share k, so a neutral pixel's green-magenta axis leans
+ * by +k * offset: toward green, never toward magenta (at most about 1.8 8-bit codes at Shade). The skin-hue guard is the
+ * shape: the teal lift ends at 0.20, below a dark skin patch's B channel, and G's share partly matches skin's R push. */
 struct LookAssistFilmGrade
 {
-    double strength = 0.0;          // s
-    double shadowOffset = 0.0;      // a: R down / B up at 0.18
-    double highlightOffset = 0.0;   // b: R up / B down at 0.72
+    double strength = 0.0;         // s
+    double tealOffset = 0.0;       // t: R down / B up at 0.10 (G up by k t)
+    double warmOffset = 0.0;       // w: R up / B down at 0.52, 0.3 w at 0.85 (G up by k w, 0.3 k w)
+    double greenShare = 0.0;       // k
+    double blackLift = 0.0;        // L: Y at 0
+    double shoulderOffset = 0.0;   // h: Y down at 0.80
+    double whiteRoll = 0.0;        // c: Y at 1 is 1 - c
 };
 LookAssistFilmGrade lookAssistFilmGradeForScene( LookAssistScene scene );
 
@@ -664,6 +673,19 @@ QString lookAssistFilmGradeId();
 /* The receipt's gradationCurve string for the scene, in Curves::configuration's format (four lines Y?R?G?B, each
  * "x;y;x;y;...", every number as QString("%1").arg(double) writes it), so a widget round trip is byte-stable. */
 QString lookAssistFilmGradationCurve( LookAssistScene scene );
+
+/* film-v1 (LOOK-ASSIST-FILM-FLAVOR-1, #319), LEGACY: not selectable anywhere. Kept, byte for byte, so a receipt saved
+ * under it is still recognised as Film's own curve (lookAssistFilmOwnsGradationCurve) and for the frame-locked v1 / v2
+ * comparison. Per s, a = 0.022 s, b = 0.030 s:
+ *   R: (1e-5,1e-5) (0.18, 0.18 - a) (0.45, 0.45) (0.72, 0.72 + b) (1,1); B its mirror; Y, G the default two points. */
+struct LookAssistFilmGradeV1
+{
+    double strength = 0.0;          // s
+    double shadowOffset = 0.0;      // a: R down / B up at 0.18
+    double highlightOffset = 0.0;   // b: R up / B down at 0.72
+};
+LookAssistFilmGradeV1 lookAssistFilmGradeV1ForScene( LookAssistScene scene );
+QString lookAssistFilmGradationCurveV1( LookAssistScene scene );
 
 /* One gradation-curve string parsed the way Curves::setConfiguration parses it: up to four lines (Y, R, G, B) split on
  * '?', each a list of x;y pairs split on ';', every number read by QString::toFloat. Returns the number of lines read. */
@@ -679,12 +701,13 @@ int lookAssistParseGradationCurve( const QString &curve, std::vector<LookAssistG
  * over a default curve; a user's curve is never overwritten. */
 bool lookAssistIsDefaultGradationCurve( const QString &curve );
 
-/* The Film grade decision for one apply, as reported in grade=...: "film-v1" (the curve is laid), "skipped_user_curve"
+/* The Film grade decision for one apply, as reported in grade=...: "film-v2" (the curve is laid), "skipped_user_curve"
  * (Film, but the receipt holds a user curve) or "none" (not Film). */
 QString lookAssistFilmGradeDecision( LookAssistFlavor flavor, const QString &currentCurve );
 
 /* True while the Film grade still owns the curve: it is, point for point (within 1e-6, as parsed by
- * lookAssistParseGradationCurve), the curve Film lays for one of the scenes. A user's edit of a laid curve is not. */
+ * lookAssistParseGradationCurve), the curve Film lays for one of the scenes, v2 or the legacy v1 (8 curves). A user's
+ * edit of a laid curve is not. */
 bool lookAssistFilmOwnsGradationCurve( const QString &curve );
 
 /* The curve to keep when the Film grade's recorded baseline is put back: the baseline while Film still owns the current

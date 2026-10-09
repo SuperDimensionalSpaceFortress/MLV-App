@@ -61,7 +61,7 @@
   },
   "generator": {
     "executable": "pipeline_tests.exe",
-    "source_state_commit": "48ef2e7327638613f0ef1d018b9a20f918a71ffd",
+    "source_state_commit": "0595ec2dcf8b45f998a41cf5fccea024aa1050fa",
     "dependency_snapshot": {
       "complete": false,
       "scope": "listed_generator_sources_and_declared_fixture_receipt_inputs_only",
@@ -111,7 +111,7 @@
       },
       {
         "path": "tests/pipeline/test_gpu_preview_processing.cpp",
-        "sha256": "3ec4823d3e7e798a9713962a2a064249802c6b2293d219003e6b88ee1ee13d1a",
+        "sha256": "ce923c99ffb25c188bef52880b5183b325c8a8a447fd9495304c89412ab8e2b2",
         "hash_mode": "lf_normalized_sha256"
       }
     ],

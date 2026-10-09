@@ -350,6 +350,11 @@ param(
     # app as MLVAPP_PLAYBACK_RENDER_LOOKAHEAD_FRAMES, the lookahead A/B). -1 sets nothing, so every other job is unchanged.
     [ValidateRange(-1, 3)][int]$PlaybackRenderLookaheadFrames = -1,
 
+    # LOOK-ASSIST-FILM-FLAVOR-2 r2: a LOOK leg's receipt file (Invoke-VenueLeg writes the bytes COMMITTED for the leg spec's look.receipt). The job
+    # embeds it base64 with its sha256, writes it into its work dir, re-verifies the hash and passes it to the smoke runner as -Receipt, so the app
+    # applies it before playback. Only with -ForceLookAssist -ContactSheet. Empty (the default) adds nothing: the job is the text it was before.
+    [string]$LookReceiptPath = '',
+
     # Test seam: the venue table to read instead of tools/profiling/dual-venue/venues.json.
     [string]$VenueTablePath = '',
 
@@ -4066,6 +4071,16 @@ if ($LookPaceLeg -and ($ContactSheet -or -not $ForceLookAssist)) {
 if ($ForceLookAssist -and -not $ContactSheet -and -not $LookPaceLeg) {
     throw 'DUAL_VENUE_LOOK_REQUIRES_CONTACT_SHEET -ForceLookAssist (a LOOK leg) needs -ContactSheet: the look is judged on the contact sheet'
 }
+$hasLookReceipt = -not [string]::IsNullOrEmpty($LookReceiptPath)
+if ($hasLookReceipt -and -not ($ForceLookAssist -and $ContactSheet)) {
+    throw 'DUAL_VENUE_LOOK_RECEIPT_REQUIRES_LOOK_LEG -LookReceiptPath is only for a LOOK leg (-ForceLookAssist -ContactSheet)'
+}
+if ($hasLookReceipt) {
+    $lookReceiptBytes = [IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $LookReceiptPath).ProviderPath)
+    $lookReceiptHasher = [System.Security.Cryptography.SHA256]::Create()
+    try { $lookReceiptSha256 = ([BitConverter]::ToString($lookReceiptHasher.ComputeHash($lookReceiptBytes)) -replace '-', '').ToLowerInvariant() } finally { $lookReceiptHasher.Dispose() }
+    $lookReceiptBase64 = [Convert]::ToBase64String($lookReceiptBytes)
+}
 $isCpuBackend = ($Backend -eq 'cpu')
 if ($isCpuBackend -and $DisablePaintPerSubmit) {
     throw 'DUAL_VENUE_CPU_BACKEND_CONFLICT -DisablePaintPerSubmit sets a GPU-window env (MLVAPP_GPU_WINDOW_PAINT_PER_SUBMIT) and is CUDA-path only; it cannot be combined with -Backend cpu'
@@ -4175,6 +4190,30 @@ if ($ForceLookAssist) {
     # (automation_settings::isolate()), so the venue's persisted "use default receipt" setting (which could have
     # reset Look Assist off) is never read, and this job no longer seeds the venue's registry.
     $template = Edit-DualVenueTemplate $template '-RequireLookAssist:`$false -Scope none' '-RequireLookAssist:`$true -Scope none'
+    if ($hasLookReceipt) {
+        # LOOK-ASSIST-FILM-FLAVOR-2 r2: the receipt ships inline (base64 + sha256), is written into the work dir and re-verified before anything plays, and
+        # reaches the smoke runner as -Receipt, exactly once. A mismatch ends the job typed (LOOK_RECEIPT_SHA_MISMATCH, exit 30) before the app launches.
+        $template = Edit-DualVenueTemplate $template "`$TelemetryArm = '__TELEMETRY_ARM__'
+" ("`$LookReceiptBase64 = '$lookReceiptBase64'
+`$LookReceiptSha256 = '$lookReceiptSha256'
+`$TelemetryArm = '__TELEMETRY_ARM__'
+")
+        $template = Edit-DualVenueTemplate $template @'
+$envList = "'" + ($envs -join "','") + "'"
+'@ @'
+$lookReceiptPayload = Read-AttrCudaBase64Payload -Base64 $LookReceiptBase64
+$LookReceiptJobPath = Join-Path $Work 'look-receipt.marxml'
+if ($lookReceiptPayload.sha256 -ceq $LookReceiptSha256) { [void](Publish-AttrCudaBytes -Path $LookReceiptJobPath -Bytes $lookReceiptPayload.bytes) }
+if ($lookReceiptPayload.sha256 -cne $LookReceiptSha256 -or -not (Test-Path -LiteralPath $LookReceiptJobPath -PathType Leaf) -or (Get-Sha $LookReceiptJobPath 'look-receipt').ToLowerInvariant() -cne $LookReceiptSha256) {
+    [void](New-AttrCudaDirectory -Path $Pub)
+    Save-Json ([ordered]@{ schema='playback-attr-3-cuda-venue.v1'; result='LOOK_RECEIPT_SHA_MISMATCH'; fixtureRehearsal=$FixtureRehearsal; lookReceiptSha256=$LookReceiptSha256; sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub }) (Join-Path $Pub 'summary.json')
+    Write-Output "RESULT=LOOK_RECEIPT_SHA_MISMATCH ARTIFACTS=$Pub"
+    exit 30
+}
+$envList = "'" + ($envs -join "','") + "'"
+'@
+        $template = Edit-DualVenueTemplate $template '-RequireLookAssist:`$true -Scope none' '-RequireLookAssist:`$true -Receipt $(ConvertTo-PsSingleQuoted $LookReceiptJobPath) -Scope none'
+    }
     if ($LookFlavor -ne 'classic') {
         $template = Edit-DualVenueTemplate $template "    'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',
 " "    'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',
@@ -4212,7 +4251,7 @@ if ($isVariant) {
     lookFlavor = $(if ($LookLeg) { $LookFlavor } else { $null })
     lookFlavorReported = $(if ($LookLeg) { $lfReported = try { [string]$resultJson.log.visualState.look_assist_flavor } catch { '''' }; if ([string]::IsNullOrEmpty($lfReported)) { $lfReported = ''none'' }; $lfReported } else { $null })
     lookFlavorHonored = $(if ($LookLeg) { $lfReported -ceq $LookFlavor } else { $null })
-')
+' + $(if ($hasLookReceipt) { '    lookReceiptSha256 = $LookReceiptSha256' + "`n" } else { '' }))
 }
 
 # ATTR3-FOOTAGE-BIND-1 PR-B round 3 (STRUCTURAL): a single-pass substitution over the WHOLE

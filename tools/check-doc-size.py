@@ -160,6 +160,8 @@ def upstream_markdown(repo: Path) -> set[str]:
         ["git", "-C", str(repo), "ls-tree", "-r", "--name-only", "-z", UPSTREAM_REF],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="surrogateescape",
     )
     if proc.returncode != 0:
         return set()
@@ -185,6 +187,8 @@ def tracked_markdown(repo: Path) -> list[str]:
         ["git", "-C", str(repo), "ls-files", "-z", "*.md"],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="surrogateescape",
     )
     if proc.returncode != 0:
         print("git ls-files failed:", proc.stderr.strip(), file=sys.stderr)

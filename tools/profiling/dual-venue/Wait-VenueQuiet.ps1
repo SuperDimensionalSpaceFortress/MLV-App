@@ -19,9 +19,16 @@
 #          read cannot be keyed and is counted in a note. (Rejected: flag the name pidUnstable and drop it from the sum -- that hides real load from the gap. Known limit: two
 #          lives of one name cover disjoint parts of the window, so their means add to more than the window mean of that slot; both rows are flagged incomplete.)
 #        GAP: processorTotal (\Processor(_Total)), processActive (Process(_Total) minus Process(Idle), paired within a sample), attributed (sum of the top-10 rows), and
-#          unattributedKernel = processorTotal - processActive (kernel time that no process is charged for). The acceptance gap is |processActive - attributed|
-#          (`attribution_gap_points`); the 5-point bound is unchanged. All four figures are printed on the `attr gap` line.
+#          unattributedKernel = processorTotal - processActive (kernel time that no process is charged for), computed PER SAMPLE SET from the counters read in the same call and
+#          then averaged; processor and process counters are different counter sets read at slightly different instants, so a negative per-sample value is skew, not a
+#          measurement: it is INVALID (excluded from the mean, never clamped) and counted in a note, and with no valid sample the field is null with a reason.
+#          The acceptance gap is |processActive - attributed| (`attribution_gap_points`, never negative); the 5-point bound is unchanged. All four figures are printed on the `attr gap` line.
 #        RAW RETENTION: the raw VENUE_QUIET line is written verbatim (unrounded) to <WorkDir>\<jobId>.json, beside the job file, and its path is printed as `  raw <path>`.
+#        PAIR DENOMINATOR (VENUE-QUIET-ACTIVE-PAIR-MISSING-NOTE-1): process_active_dropped_samples and unattributed_kernel_dropped_samples (and the "no non-negative sample" reasons)
+#          divide by the sets that HAD the pair (kept + dropped), not by the set count. A set with a missing or invalid member is named in its own note, new keys
+#          `process_active_pair_missing` (Process(_Total) or Process(Idle) missing/invalid in that set) and `unattributed_kernel_pair_missing` (Processor(_Total) missing in a
+#          set whose process active was valid); neither moves a value. `top` cpuSeconds (after minus before) is keyed on (pid, process start time): a pid whose start time
+#          differs between the two snapshots (reused) or cannot be read is left out of `top` and counted in the new note `top_pid_reuse_dropped`, never a negative or foreign figure.
 #      None of this feeds the QUIET decision: its threshold, v1 fields and the offline -SamplesJson output are byte-identical to before.
 #   3. decides: QUIET when the UNROUNDED mean of the 3 samples is <= -ThresholdPercent (the printed mean is rounded to 0.1 for display only). A
 #      failed counter read makes the check UNKNOWN, never quiet.
@@ -252,7 +259,7 @@ function Read-CounterSet {
     if ($null -ne $t -and $t -le 100) { $set.v1 = $t }
     $set
 }
-function Get-CpuSnapshot { $h = @{}; foreach ($p in @(Get-Process -ErrorAction SilentlyContinue)) { try { if ($p.TotalProcessorTime) { $h[$p.Id] = @($p.Name, $p.TotalProcessorTime.TotalSeconds) } } catch { } }; $h }
+function Get-CpuSnapshot { $h = @{}; foreach ($p in @(Get-Process -ErrorAction SilentlyContinue)) { try { if ($p.TotalProcessorTime) { $st = $null; try { $st = $p.StartTime.ToFileTimeUtc() } catch { }; $h[$p.Id] = @($p.Name, $p.TotalProcessorTime.TotalSeconds, $st) } } catch { } }; $h }
 function Get-Mean($values) { $v = @($values); if ($v.Count -eq 0) { return $null }; [math]::Round(($v | Measure-Object -Average).Average, 2) }
 # Core topology: GetLogicalProcessorInformationEx(RelationAll) reports each physical core's EfficiencyClass and its logical processors (a mask per processor group),
 # plus the NUMA nodes. The highest class is a P-core, a lower class an E-core; one class only is "uniform". The \Processor Information instance "a,b" is read as
@@ -306,9 +313,16 @@ $before = Get-CpuSnapshot
 $samples = @(); $sets = @()
 for ($i = 0; $i -lt 3; $i++) { $set = Read-CounterSet; $sets += ,$set; $samples += ,$set.v1; if ($i -lt 2) { Start-Sleep -Seconds 12 } }
 $after = Get-CpuSnapshot
-$top = @($after.Keys | Where-Object { $before.ContainsKey($_) } | ForEach-Object { [pscustomobject]@{ name = $after[$_][0]; pid = $_; cpuSeconds = [math]::Round($after[$_][1] - $before[$_][1], 2) } } |
-    Sort-Object cpuSeconds -Descending | Select-Object -First 5)
+# top[] is keyed on (pid, process start time): a pid that exited and was reused between the two snapshots is a different process, so a start time that differs or cannot be read drops the entry
+$topKept = @(); $topDropped = 0
+foreach ($id in @($after.Keys | Where-Object { $before.ContainsKey($_) })) {
+    $b = $before[$id]; $a = $after[$id]
+    if ($null -eq $b[2] -or $null -eq $a[2] -or $b[2] -ne $a[2]) { $topDropped++; continue }
+    $topKept += [pscustomobject]@{ name = $a[0]; pid = $id; cpuSeconds = [math]::Round($a[1] - $b[1], 2) }
+}
+$top = @($topKept | Sort-Object cpuSeconds -Descending | Select-Object -First 5)
 $notes = [ordered]@{}
+if ($topDropped -gt 0) { $notes['top_pid_reuse_dropped'] = "$topDropped process(es) present in both snapshots were left out of top: the pid's process start time differs (pid reused) or could not be read, so its cpuSeconds would not be one process's" }
 function Get-GroupWhy([string]$Group) {
     $e = @($sets | Where-Object { $_.errs.ContainsKey($Group) } | ForEach-Object { $_.errs[$Group] }) | Select-Object -First 1
     if ($e) { "counter group '$Group' unreadable: $e" } else { "counter group '$Group' returned no valid sample" }
@@ -324,7 +338,9 @@ foreach ($k in $cpuNames.Keys) {
 $nSets = $sets.Count
 $acc = @{}; $seen = @{}; $keyed = @{}; $noPid = @{}
 $specialSum = @{}; $specialN = @{}
-$activeSum = 0.0; $activeN = 0
+$activeSum = 0.0; $activeN = 0; $activeNeg = 0
+$kernSum = 0.0; $kernN = 0; $kernNeg = 0
+$activeMissing = 0; $kernMissing = 0
 foreach ($set in $sets) {
     foreach ($k in $set.proc.Keys) {
         $v = $set.proc[$k]
@@ -341,8 +357,20 @@ foreach ($set in $sets) {
         $acc[$key].sum += $v; $acc[$key].n++
         $keyed[$k] = $true
     }
-    if ($null -ne $set.proc['_total'] -and $null -ne $set.proc['idle']) { $activeSum += $set.proc['_total'] - $set.proc['idle']; $activeN++ }
+    if ($null -ne $set.proc['_total'] -and $null -ne $set.proc['idle']) {
+        # VENUE-QUIET-PROCESS-ACTIVE-NEGATIVE-1: Process(_Total) and Process(Idle) are read at slightly different instants, so on a near-idle host (_Total - Idle) can be negative for a sample.
+        # A negative sample is INVALID (excluded from the mean and counted in $activeNeg, never clamped to 0 and never averaged in); no valid sample left -> null with a reason.
+        $d = $set.proc['_total'] - $set.proc['idle']
+        if ($d -ge 0) {
+            $activeSum += $d; $activeN++
+            # unattributedKernel is a cross-counter-set difference (Processor(_Total) minus Process active), taken per sample set from the one Get-Counter call; a negative one is skew, so INVALID (not clamped)
+            $cpuT = $set.cpu['% processor time']
+            if ($null -ne $cpuT) { $kv = $cpuT - $d / $cpuCount; if ($kv -ge 0) { $kernSum += $kv; $kernN++ } else { $kernNeg++ } } else { $kernMissing++ }
+        } else { $activeNeg++ }
+    } else { $activeMissing++ }
 }
+# the notes' denominators are the sets that HAD the pair (kept + dropped); a set missing a member is named on its own, never counted as a pair read
+$activePairs = $activeN + $activeNeg; $kernPairs = $kernN + $kernNeg
 function Get-SpecialMean([string]$Name) { if ($specialN.ContainsKey($Name)) { $specialSum[$Name] / $specialN[$Name] / $cpuCount } else { $null } }
 $rows = @($acc.Values | ForEach-Object { [pscustomobject]@{ instance = $_.instance; pid = $_.pid; mean = $_.sum / $_.n / $cpuCount; validSamples = $_.n; totalSamples = $nSets; incomplete = ($_.n -lt $nSets) } } |
     Sort-Object @{ Expression = 'mean'; Descending = $true }, instance, pid)
@@ -358,7 +386,7 @@ if ($specialN.Count -gt 0 -or $rows.Count -gt 0) {
     if ($topRows.Count -gt 0) { $attrRaw = ($topRows | ForEach-Object { $_.mean } | Measure-Object -Sum).Sum; $attributed = [math]::Round($attrRaw, 2) }
     if ($activeN -gt 0) { $activeRaw = $activeSum / $activeN / $cpuCount; $pActive = [math]::Round($activeRaw, 2) }
     if ($null -ne $activeRaw -and $null -ne $attrRaw) { $gap = [math]::Round([math]::Abs($activeRaw - $attrRaw), 2) }
-    if ($null -ne $activeRaw -and $null -ne $processor.total_percent) { $unattrKernel = [math]::Round($processor.total_percent - $activeRaw, 2) }
+    if ($kernN -gt 0) { $unattrKernel = [math]::Round($kernSum / $kernN, 2) }
     $incAll = @($rows | Where-Object { $_.incomplete }).Count
     if ($incAll -gt 0) { $notes['process_incomplete_rows'] = "$incAll of $($rows.Count) process rows have fewer valid samples than the $nSets sample sets (ranked: $(@($topRows | Where-Object { $_.incomplete }).Count) of $($topRows.Count)); each is the mean of its valid samples" }
     $omitted = @($seen.Keys | Where-Object { -not $keyed.ContainsKey($_) -and -not $noPid.ContainsKey($_) }).Count
@@ -369,9 +397,13 @@ if ($specialN.Count -gt 0 -or $rows.Count -gt 0) {
     if ($null -eq $pIdle) { $notes['idle_percent'] = 'no valid idle sample in the process counters' }
     if ($null -eq $pSystem) { $notes['system_percent'] = 'no valid system sample in the process counters' }
     if ($null -eq $attributed) { $notes['attributed_percent'] = 'no process row had a valid sample' }
-    if ($null -eq $pActive) { $notes['process_active_percent'] = 'no sample had a valid Process(_Total) and Process(Idle) together' }
+    if ($null -eq $pActive) { $notes['process_active_percent'] = $(if ($activeNeg -gt 0) { "no non-negative sample: Process(Idle) read above Process(_Total) in $activeNeg of $activePairs sample sets, which are invalid and not clamped" } else { 'no sample had a valid Process(_Total) and Process(Idle) together' }) }
+    elseif ($activeNeg -gt 0) { $notes['process_active_dropped_samples'] = "$activeNeg of $activePairs sample sets read Process(Idle) above Process(_Total) and are excluded from process_active_percent (mean of the other $activeN)" }
+    if ($activeMissing -gt 0) { $notes['process_active_pair_missing'] = "$activeMissing set(s) had no valid Process(Idle)/Process(_Total) pair (one member missing or invalid), so they are neither kept nor dropped in process_active_percent" }
     if ($null -eq $gap) { $notes['attribution_gap_points'] = 'needs both process_active_percent and attributed_percent' }
-    if ($null -eq $unattrKernel) { $notes['unattributed_kernel_percent'] = 'needs both process_active_percent and processor.total_percent' }
+    if ($null -eq $unattrKernel) { $notes['unattributed_kernel_percent'] = $(if ($kernNeg -gt 0) { "no non-negative sample: Processor(_Total) read below Process(_Total) minus Process(Idle) in $kernNeg of $kernPairs sample sets (different counter sets read at slightly different instants), which are invalid and not clamped" } elseif ($null -eq $pActive -or $null -eq $processor.total_percent) { 'needs both process_active_percent and processor.total_percent' } else { 'no sample set had Processor(_Total) and a valid process active together' }) }
+    elseif ($kernNeg -gt 0) { $notes['unattributed_kernel_dropped_samples'] = "$kernNeg of $kernPairs sample sets read Processor(_Total) below Process(_Total) minus Process(Idle) and are excluded from unattributed_kernel_percent (mean of the other $kernN)" }
+    if ($kernMissing -gt 0) { $notes['unattributed_kernel_pair_missing'] = "$kernMissing set(s) had no valid Processor(_Total)/Process active pair (Processor(_Total) missing in a set whose process active was valid), so they are neither kept nor dropped in unattributed_kernel_percent" }
 } else {
     foreach ($f in 'process_total_percent', 'idle_percent', 'system_percent', 'top_processes', 'attributed_percent', 'process_active_percent', 'attribution_gap_points', 'unattributed_kernel_percent') { $notes[$f] = Get-GroupWhy 'process' }
 }
@@ -409,7 +441,7 @@ Write-Output ('VENUE_QUIET=' + ([ordered]@{
     schema = 'mlv-app/venue-quiet-probe/v2'; host = $env:COMPUTERNAME; samples = $samples; top = $top
     cpu_count = $cpuCount
     percent_basis = 'per-process percents are percent of the whole machine (counter / cpu_count)'
-    aggregation = 'valid-sample mean per instance; process rows keyed on (instance, pid); gap = |process_active - attributed|; unattributed_kernel = processor.total - process_active'
+    aggregation = 'valid-sample mean per instance; process rows keyed on (instance, pid); gap = |process_active - attributed|; unattributed_kernel = per-sample-set (processor.total - process_active), negative samples invalid and excluded'
     processor = $processor
     process_total_percent = $pTotal; idle_percent = $pIdle; system_percent = $pSystem
     process_active_percent = $pActive; unattributed_kernel_percent = $unattrKernel

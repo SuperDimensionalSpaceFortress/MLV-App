@@ -544,6 +544,103 @@ class StagingNameSafetyTests(_PwshCase):
         self.assertIn(str(root / "ok.exe"), proc.stdout)
 
 
+@requires_pwsh
+class StageJobIdSuffixTests(_PwshCase):
+    """STAGE-JOBID-SINGLE-USE-RESTAGE-1: a JobId is single-use, so a re-stage needs a new one.
+
+    UmRunDrop refuses any reused JobId (UMRUN_JOBID_IN_USE), and the default stage id carries only
+    the short sha. -JobIdSuffix is how a caller re-stages one sha under a fresh id; absent, the id
+    must be exactly what it always was. STAGE_JOBID_TEST_GENERATOR lets the RED run point these
+    tests at a copy of the pre-change script.
+    """
+
+    GENERATOR = Path(os.environ.get("STAGE_JOBID_TEST_GENERATOR") or STAGE_GENERATOR)
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.build = self.tmp / "build"
+        self.staging = self.tmp / "staging"
+        self.staging.mkdir(parents=True)
+        self.agent = self.tmp / "agent"
+        (self.agent / "inbox").mkdir(parents=True)
+        (self.agent / "cache").mkdir(parents=True)
+        self.names = _fake_build_dir(self.build, SHA_FIXTURE)
+        self.default_id = f"playback-attr-3-cuda-stage-{SHA_FIXTURE[:12]}"
+
+    def generate(self, suffix: str | None = None) -> subprocess.CompletedProcess:
+        extra = "" if suffix is None else " -JobIdSuffix '" + suffix.replace("'", "''") + "'"
+        script = self.tmp / "generate.ps1"
+        script.write_text(
+            "$ErrorActionPreference = 'Stop'\n"
+            f"& '{self.GENERATOR}' -SourceCommit '{SHA_FIXTURE}' -BuildDir '{self.build}' "
+            f"-OutDir '{self.staging}' -AgentRoot '{self.agent}'{extra} | ConvertTo-Json -Depth 5\n",
+            encoding="utf-8",
+        )
+        return _run_pwsh_file(script)
+
+    def generate_ok(self, suffix: str | None = None) -> dict:
+        proc = self.generate(suffix)
+        self.assertEqual(proc.returncode, 0, f"{proc.stdout}\n{proc.stderr}")
+        return json.loads(proc.stdout)
+
+    def drop_side_files(self) -> None:
+        for name in self.names.values():
+            shutil.copy2(self.build / name, self.agent / "inbox" / name)
+
+    def test_no_suffix_keeps_the_default_job_id_everywhere(self) -> None:
+        generated = self.generate_ok()
+
+        self.assertEqual(generated["jobId"], self.default_id)
+        self.assertEqual(Path(generated["jobFile"]).name, f"{self.default_id}.job.ps1")
+        text = Path(generated["jobFile"]).read_text(encoding="utf-8")
+        self.assertIn(f"$JobId = '{self.default_id}'", text)
+
+    def test_a_suffix_reaches_the_job_file_name_the_baked_id_and_the_result(self) -> None:
+        new_id = f"{self.default_id}-rst2"
+        generated = self.generate_ok("rst2")
+
+        self.assertEqual(generated["jobId"], new_id)
+        job = Path(generated["jobFile"])
+        self.assertEqual(job.name, f"{new_id}.job.ps1")
+        self.assertIn(f"$JobId = '{new_id}'", job.read_text(encoding="utf-8"))
+        self.assertEqual([p.name for p in self.staging.iterdir()], [job.name])
+
+        self.drop_side_files()
+        proc = _run_job(job)
+
+        self.assertEqual(proc.returncode, 0, f"{proc.stdout}\n{proc.stderr}")
+        self.assertIn(f"[{new_id}] START", proc.stdout)
+        result = json.loads((self.agent / "outbox" / f"{new_id}.artifacts" / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(result["jobId"], new_id)
+        self.assertEqual(result["exitCode"], 0)
+        self.assertFalse(
+            (self.agent / "outbox" / f"{self.default_id}.artifacts").exists(),
+            "the default-id outbox was used by a suffixed run",
+        )
+
+    def test_a_suffixed_and_a_default_stage_of_one_sha_have_different_ids(self) -> None:
+        default = self.generate_ok()
+        suffixed = self.generate_ok("again")
+
+        self.assertNotEqual(default["jobId"], suffixed["jobId"])
+        self.assertEqual(len(list(self.staging.iterdir())), 2)
+
+    def test_the_longest_admitted_suffix_is_accepted(self) -> None:
+        suffix = "a-Z9" * 8
+        self.assertEqual(len(suffix), 32)
+
+        self.assertEqual(self.generate_ok(suffix)["jobId"], f"{self.default_id}-{suffix}")
+
+    def test_a_bad_suffix_is_refused_with_a_typed_error_and_nothing_is_emitted(self) -> None:
+        for bad in ("a b", "x/y", r"x\y", "..", "a.b", "a_b", "a'b", "x" * 33, "é"):
+            with self.subTest(suffix=bad):
+                proc = self.generate(bad)
+
+                self.assertNotEqual(proc.returncode, 0, f"{proc.stdout}\n{proc.stderr}")
+                self.assertIn("STAGE_JOBID_SUFFIX_INVALID", normalize_pwsh_message_text(proc.stderr + proc.stdout))
+                self.assertEqual(list(self.staging.iterdir()), [], "a job was emitted for a bad suffix")
+
+
 # --------------------------------------------------------------------------------------------
 # (c) build.json authentication
 # --------------------------------------------------------------------------------------------

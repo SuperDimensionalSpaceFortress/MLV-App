@@ -86,7 +86,10 @@ HEAVY_LEGS = ("legs/m16-1243-pace-cinematic-fullscreen-s4-heavy.json",)
 # LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1 added the scale-2 Cinematic twin of the scale-2 look leg (the Bachelor CPU Classic | Cinematic look pair).
 SHIPPED_LEGS = ("legs/m16-1243-speed.json", "legs/m16-1243-look.json", "legs/m16-1243-look-scale2.json", "legs/m16-1243-look-cinematic.json", *DISPLAY_MATRIX_LEGS, *PACE_LEGS,
                 *LOOKAHEAD_LEGS, *HEAVY_LEGS, "legs/m16-1243-look-scale2-cinematic.json", "legs/m16-1243-look-film.json",
-                "legs/m16-1243-look-scale2-film.json")
+                "legs/m16-1243-look-scale2-film.json", *(f"legs/m16-1243-look-scale2-{flavor}-agxoff.json" for flavor in ("cinematic", "film")))
+# LOOK-ASSIST-FILM-FLAVOR-2 r2: the AgX-off twins of the scale-2 Cinematic and Film legs carry a committed look receipt (look-receipts/agx-off.marxml).
+AGXOFF_LEGS = {f"m16-1243-look-scale2-{flavor}-agxoff": f"m16-1243-look-scale2-{flavor}" for flavor in ("cinematic", "film")}
+LOOK_RECEIPT_BASE = "6b6f66f52d5344a97de5068b2e7cae1a61edf295"   # the #328 head whose generator, legs and runner this round extends
 SHIPPED_LEGS_PS = ", ".join(f"'{rel}'" for rel in SHIPPED_LEGS)
 OTHER_CLIP = "Z99-9999"
 MLV_EXT = "." + "mlv"  # never spelled as one literal token (the NA-4 gate trips on fixture basenames)
@@ -4685,6 +4688,22 @@ function Get-Counter {
 }
 """
 
+# Canned Get-Process for the top[] before/after snapshots: call 1 is the "before" list, call 2 the "after" list. Each entry is
+# {id, name, cpu (seconds), start (FILETIME or null = StartTime unreadable)}.
+GET_PROCESS_PRELUDE = r"""$script:Snaps = @(ConvertFrom-Json -InputObject @'
+__SNAPSHOTS__
+'@)
+$script:SnapNo = 0
+function Get-Process {
+    [CmdletBinding()] param()
+    $snap = $script:Snaps[$script:SnapNo]; $script:SnapNo++
+    foreach ($e in @($snap)) {
+        $st = $null; if ($null -ne $e.start) { $st = [datetime]::FromFileTimeUtc([int64]$e.start) }
+        [pscustomobject]@{ Id = [int]$e.id; Name = [string]$e.name; TotalProcessorTime = [TimeSpan]::FromSeconds([double]$e.cpu); StartTime = $st }
+    }
+}
+"""
+
 
 @requires_windows_pwsh
 class VenueQuietValidSampleTests(unittest.TestCase):
@@ -4693,14 +4712,17 @@ class VenueQuietValidSampleTests(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.tmp = Path(tmp.name)
 
-    def probe(self, sets: list, cpus: int = 4) -> dict:
+    def probe(self, sets: list, cpus: int = 4, snapshots: list | None = None) -> dict:
         text = (DV / "Wait-VenueQuiet.ps1").read_text(encoding="utf-8")
         body = re.search(r"\$probeText = @'\r?\n(.*?)\r?\n'@", text, re.S).group(1)
         self.assertIn("[Environment]::ProcessorCount", body)
         body = body.replace("[Environment]::ProcessorCount", str(cpus)).replace("Start-Sleep -Seconds 12", "Start-Sleep -Seconds 0")
         canned = json.dumps([{"s": s} for s in sets])
         job = self.tmp / "canned-probe-job.ps1"
-        job.write_text(GET_COUNTER_PRELUDE.replace("__CANNED__", canned) + body, encoding="utf-8")
+        prelude = GET_COUNTER_PRELUDE.replace("__CANNED__", canned)
+        if snapshots is not None:
+            prelude += GET_PROCESS_PRELUDE.replace("__SNAPSHOTS__", json.dumps(snapshots))
+        job.write_text(prelude + body, encoding="utf-8")
         proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(job)], capture_output=True, text=True, timeout=180)
         lines = [ln for ln in proc.stdout.splitlines() if ln.startswith("VENUE_QUIET=")]
         self.assertEqual(len(lines), 1, proc.stdout + proc.stderr)
@@ -4787,6 +4809,179 @@ class VenueQuietValidSampleTests(unittest.TestCase):
         self.assertEqual(p["attributed_percent"], 15.0)
         self.assertEqual(p["attribution_gap_points"], 5.0, "the gap is |processActive - attributed|")
         self.assertEqual(p["unattributed_kernel_percent"], 20.0)
+
+    # VENUE-QUIET-PROCESS-ACTIVE-NEGATIVE-1 (hosted CI flake, run 37927671797: process_active_percent=-12.05): Process(_Total) and Process(Idle) are read at slightly different
+    # instants, so (_Total - Idle) can be negative for a sample on a near-idle host. Rule: a negative per-sample value is INVALID -- excluded from the mean (never clamped, never
+    # averaged in); with no valid sample left the field is null with a notes reason, and the derived gap / unattributedKernel follow (null with their own reason).
+    def test_a_negative_active_sample_is_excluded_from_the_mean_never_averaged_in_or_clamped(self) -> None:
+        # 4 CPUs: Processor(_Total)=30; samples 1 and 3 have _Total raw 160 (40) and Idle raw 80 (20) -> active 20; sample 2 has Idle above _Total (raw 100 - 120 = -20 -> -5)
+        good = lambda: _flat([_cs("processor", "_total", "% processor time", 30)], _proc("_total", 0, 160), _proc("idle", 0, 80), _proc("a", 1, 40), _proc("b", 2, 20))
+        skew = _flat([_cs("processor", "_total", "% processor time", 30)], _proc("_total", 0, 100), _proc("idle", 0, 120), _proc("a", 1, 40), _proc("b", 2, 20))
+        p = self.probe([good(), skew, good()])
+        self.assertEqual(p["process_active_percent"], 20.0, "-5.0 in the mean would give 11.67; clamping the sample to 0 would give 13.33")
+        self.assertGreaterEqual(p["process_active_percent"], 0)
+        self.assertEqual(p["attributed_percent"], 15.0)
+        self.assertEqual(p["attribution_gap_points"], 5.0, "the gap follows the excluded-sample mean")
+        self.assertEqual(p["unattributed_kernel_percent"], 10.0, "unattributedKernel follows the excluded-sample mean")
+        self.assertRegex(p["notes"]["process_active_dropped_samples"], r"^1 of 3 sample sets")
+        self.assertNotIn("process_active_percent", p["notes"], "a field that has a value carries no null reason")
+        self.assertEqual((p["process_total_percent"], p["idle_percent"]), (35.0, 23.33), "the _Total / Idle means are the unfiltered counter means, unchanged")
+
+    def test_when_every_active_sample_is_negative_the_field_is_null_with_a_reason_and_the_derived_fields_follow(self) -> None:
+        skew = lambda: _flat([_cs("processor", "_total", "% processor time", 30)], _proc("_total", 0, 100), _proc("idle", 0, 120), _proc("a", 1, 40), _proc("b", 2, 20))
+        p = self.probe([skew(), skew(), skew()])
+        self.assertIsNone(p["process_active_percent"])
+        self.assertIsNone(p["attribution_gap_points"])
+        self.assertIsNone(p["unattributed_kernel_percent"])
+        self.assertIn("3 of 3", p["notes"]["process_active_percent"])
+        for k in ("attribution_gap_points", "unattributed_kernel_percent"):
+            self.assertTrue(isinstance(p["notes"].get(k), str) and p["notes"][k], f"{k} is null without a reason")
+        self.assertNotIn("process_active_dropped_samples", p["notes"])
+        self.assertEqual(p["attributed_percent"], 15.0, "the attribution itself is unaffected")
+        for k in ("process_active_percent", "attribution_gap_points", "unattributed_kernel_percent", "attributed_percent"):
+            self.assertTrue(p[k] is None or p[k] >= 0, f"{k}={p[k]!r}")
+
+    def test_a_zero_active_sample_is_valid_and_kept(self) -> None:
+        # _Total == Idle is a legitimate fully-idle sample (0), not a skew: it stays in the mean
+        flat = lambda tot, idle: _flat([_cs("processor", "_total", "% processor time", 30)], _proc("_total", 0, tot), _proc("idle", 0, idle), _proc("a", 1, 40))
+        p = self.probe([flat(80, 80), flat(160, 80), flat(80, 80)])
+        self.assertEqual(p["process_active_percent"], 6.67)
+        self.assertNotIn("process_active_dropped_samples", p["notes"])
+
+    # VENUE-QUIET-PROCESS-ACTIVE-NEGATIVE-1 r2 (hosted CI, PR #342 merge_group run 37931263307, shard 6/8: unattributed_kernel_percent=-0.16): unattributedKernel is
+    # Processor(_Total) minus Process active, two different counter sets, so it can be negative on skew even when process_active_percent is not. Rule: computed per sample set
+    # from the one Get-Counter call; a negative per-sample value is INVALID (excluded from the mean, never clamped); none valid -> null with a notes reason.
+    # attribution_gap_points is |processActive - attributed| and cannot be negative; every other percent field is a direct counter mean or a sum of non-negative means.
+    def test_a_negative_unattributed_kernel_sample_is_excluded_from_the_mean_never_averaged_in_or_clamped(self) -> None:
+        # 4 CPUs: Process active 20 in every sample; Processor(_Total) 30, 15, 30 -> per-sample kernel 10, -5 (invalid), 10
+        mk = lambda cpu: _flat([_cs("processor", "_total", "% processor time", cpu)], _proc("_total", 0, 160), _proc("idle", 0, 80), _proc("a", 1, 40), _proc("b", 2, 20))
+        p = self.probe([mk(30), mk(15), mk(30)])
+        self.assertEqual(p["process_active_percent"], 20.0, "every active sample is valid")
+        self.assertEqual(p["processor"]["total_percent"], 25.0, "the processor mean is the unfiltered counter mean")
+        self.assertEqual(p["unattributed_kernel_percent"], 10.0, "the old processor.total - process_active gives 5.0; averaging -5 in gives 5.0; clamping it to 0 gives 6.67")
+        self.assertGreaterEqual(p["unattributed_kernel_percent"], 0)
+        self.assertRegex(p["notes"]["unattributed_kernel_dropped_samples"], r"^1 of 3 sample sets")
+        self.assertNotIn("unattributed_kernel_percent", p["notes"], "a field that has a value carries no null reason")
+        self.assertEqual(p["attribution_gap_points"], 5.0)
+
+    def test_when_every_unattributed_kernel_sample_is_negative_the_field_is_null_with_a_reason(self) -> None:
+        # this is the shape of the hosted flake: processor 20 against Process active 20.16 -> -0.16 in every sample (4 CPUs: raw 160 - 79.36 = 80.64 -> 20.16)
+        sk = lambda: _flat([_cs("processor", "_total", "% processor time", 20)], _proc("_total", 0, 160), _proc("idle", 0, 79.36), _proc("a", 1, 40), _proc("b", 2, 20))
+        p = self.probe([sk(), sk(), sk()])
+        self.assertEqual(p["process_active_percent"], 20.16)
+        self.assertIsNone(p["unattributed_kernel_percent"])
+        self.assertIn("3 of 3", p["notes"]["unattributed_kernel_percent"])
+        self.assertNotIn("unattributed_kernel_dropped_samples", p["notes"])
+        self.assertEqual(p["attribution_gap_points"], 5.16, "the gap is unaffected")
+        for k in ("process_active_percent", "attribution_gap_points", "unattributed_kernel_percent", "attributed_percent"):
+            self.assertTrue(p[k] is None or p[k] >= 0, f"{k}={p[k]!r}")
+
+    def test_a_zero_unattributed_kernel_sample_is_valid_and_kept(self) -> None:
+        # Processor(_Total) == Process active is a legitimate 0, not a skew
+        mk = lambda cpu: _flat([_cs("processor", "_total", "% processor time", cpu)], _proc("_total", 0, 160), _proc("idle", 0, 80), _proc("a", 1, 40))
+        p = self.probe([mk(20), mk(30), mk(20)])
+        self.assertEqual(p["unattributed_kernel_percent"], 3.33)
+        self.assertNotIn("unattributed_kernel_dropped_samples", p["notes"])
+
+    # VENUE-QUIET-ACTIVE-PAIR-MISSING-NOTE-1 (fable/sol hardening on PR #347 r2): a dropped-samples note divides by the sets that HAD the valid pair (kept + dropped), and a set with a
+    # missing pair member is named in its own note. No value, verdict or threshold moves.
+    def test_a_set_with_total_valid_and_idle_missing_is_not_counted_as_a_pair_in_the_dropped_note(self) -> None:
+        # 4 CPUs: set 1 pair valid (active 20); set 2 has Process(_Total) but NO Process(Idle); set 3 is a skewed pair (Idle above _Total -> negative)
+        cpu = [_cs("processor", "_total", "% processor time", 30)]
+        s1 = _flat(cpu, _proc("_total", 0, 160), _proc("idle", 0, 80), _proc("a", 1, 40))
+        s2 = _flat(cpu, _proc("_total", 0, 160), _proc("a", 1, 40))
+        s3 = _flat(cpu, _proc("_total", 0, 100), _proc("idle", 0, 120), _proc("a", 1, 40))
+        p = self.probe([s1, s2, s3])
+        self.assertEqual(p["process_active_percent"], 20.0, "the value is the mean of the one valid pair")
+        self.assertRegex(p["notes"]["process_active_dropped_samples"], r"^1 of 2 sample sets", "the set with no Idle never was a pair, so 1 of 3 overstates the pairs read")
+        self.assertRegex(p["notes"]["process_active_dropped_samples"], r"mean of the other 1\)")
+        self.assertRegex(p["notes"]["process_active_pair_missing"], r"^1 set\(s\) had no valid Process\(Idle\)/Process\(_Total\) pair")
+
+    def test_a_set_with_idle_valid_and_total_invalid_is_named_as_a_missing_pair_and_adds_no_dropped_note(self) -> None:
+        cpu = [_cs("processor", "_total", "% processor time", 30)]
+        ok = lambda: _flat(cpu, _proc("_total", 0, 160), _proc("idle", 0, 80), _proc("a", 1, 40))
+        bad = _flat(cpu, _proc("_total", 0, 160, valid=False), _proc("idle", 0, 80), _proc("a", 1, 40))
+        p = self.probe([ok(), bad, ok()])
+        self.assertEqual(p["process_active_percent"], 20.0)
+        self.assertNotIn("process_active_dropped_samples", p["notes"], "nothing read negative")
+        self.assertRegex(p["notes"]["process_active_pair_missing"], r"^1 set\(s\)")
+
+    def test_a_complete_set_of_pairs_adds_no_pair_missing_note(self) -> None:
+        cpu = [_cs("processor", "_total", "% processor time", 30)]
+        p = self.probe([_flat(cpu, _proc("_total", 0, 160), _proc("idle", 0, 80), _proc("a", 1, 40)) for _ in range(3)])
+        self.assertNotIn("process_active_pair_missing", p["notes"])
+        self.assertNotIn("unattributed_kernel_pair_missing", p["notes"])
+        self.assertNotIn("top_pid_reuse_dropped", p["notes"])
+
+    def test_the_all_negative_reason_counts_only_the_sets_that_had_a_pair(self) -> None:
+        cpu = [_cs("processor", "_total", "% processor time", 30)]
+        skew = lambda: _flat(cpu, _proc("_total", 0, 100), _proc("idle", 0, 120), _proc("a", 1, 40))
+        nopair = _flat(cpu, _proc("_total", 0, 100), _proc("a", 1, 40))
+        p = self.probe([skew(), nopair, skew()])
+        self.assertIsNone(p["process_active_percent"])
+        self.assertIn("2 of 2 sample sets", p["notes"]["process_active_percent"], "2 of 3 counts the set that never had an Idle sample as a pair")
+        self.assertRegex(p["notes"]["process_active_pair_missing"], r"^1 set\(s\)")
+
+    def test_a_kernel_sample_set_with_processor_total_null_lands_in_the_pair_missing_note_not_the_denominator(self) -> None:
+        # Process active 20 in every set; Processor(_Total) 30 / ABSENT / 15 -> kernel 10, no pair, -5 (invalid)
+        proc = lambda: _flat(_proc("_total", 0, 160), _proc("idle", 0, 80), _proc("a", 1, 40))
+        cpu = lambda v: [_cs("processor", "_total", "% processor time", v)]
+        p = self.probe([_flat(cpu(30), proc()), _flat(proc()), _flat(cpu(15), proc())])
+        self.assertEqual(p["unattributed_kernel_percent"], 10.0, "the value is the mean of the one valid kernel sample")
+        self.assertRegex(p["notes"]["unattributed_kernel_dropped_samples"], r"^1 of 2 sample sets")
+        self.assertRegex(p["notes"]["unattributed_kernel_pair_missing"], r"^1 set\(s\) had no valid Processor\(_Total\)/Process active pair")
+        self.assertNotIn("process_active_pair_missing", p["notes"], "the active pair itself was complete in every set")
+
+    def test_the_all_negative_kernel_reason_divides_by_the_sets_that_had_both_members(self) -> None:
+        proc = lambda: _flat(_proc("_total", 0, 160), _proc("idle", 0, 80), _proc("a", 1, 40))
+        cpu = lambda v: [_cs("processor", "_total", "% processor time", v)]
+        p = self.probe([_flat(cpu(15), proc()), _flat(proc()), _flat(cpu(15), proc())])
+        self.assertIsNone(p["unattributed_kernel_percent"])
+        self.assertIn("2 of 2 sample sets", p["notes"]["unattributed_kernel_percent"], "2 of 3 counts the set with no Processor(_Total) as a pair read")
+        self.assertRegex(p["notes"]["unattributed_kernel_pair_missing"], r"^1 set\(s\)")
+
+    # VENUE-QUIET-TOP-CPUSECONDS-PID-REUSE-1: top[].cpuSeconds is after-minus-before, so it is keyed on (pid, process start time); a pid reused between the two
+    # snapshots is a different process and is dropped and counted, never a negative or a foreign cpuSeconds.
+    T1, T2, T3 = 133000000000000000, 133000000500000000, 133000001000000000
+
+    def pid_probe(self, before: list, after: list) -> dict:
+        cpu = [_cs("processor", "_total", "% processor time", 30)]
+        sets = [_flat(cpu, _proc("_total", 0, 160), _proc("idle", 0, 80), _proc("a", 1, 40)) for _ in range(3)]
+        return self.probe(sets, snapshots=[before, after])
+
+    def test_a_pid_reused_between_snapshots_is_dropped_never_a_negative_cpuseconds(self) -> None:
+        before = [{"id": 100, "name": "old", "cpu": 50.0, "start": self.T1}, {"id": 200, "name": "steady", "cpu": 10.0, "start": self.T3}]
+        after = [{"id": 100, "name": "new", "cpu": 2.0, "start": self.T2}, {"id": 200, "name": "steady", "cpu": 15.0, "start": self.T3}]
+        p = self.pid_probe(before, after)
+        self.assertEqual([(t["name"], t["pid"], t["cpuSeconds"]) for t in p["top"]], [("steady", 200, 5.0)], "-48.0 for pid 100 is the old process's time subtracted from another's")
+        self.assertTrue(all(t["cpuSeconds"] >= 0 for t in p["top"]))
+        self.assertRegex(p["notes"]["top_pid_reuse_dropped"], r"^1 process")
+
+    def test_a_pid_reused_by_a_busier_process_does_not_report_its_whole_cpu_time_as_the_old_ones(self) -> None:
+        before = [{"id": 100, "name": "old", "cpu": 1.0, "start": self.T1}, {"id": 200, "name": "steady", "cpu": 10.0, "start": self.T3}]
+        after = [{"id": 100, "name": "new", "cpu": 90.0, "start": self.T2}, {"id": 200, "name": "steady", "cpu": 11.0, "start": self.T3}]
+        p = self.pid_probe(before, after)
+        self.assertEqual([(t["pid"], t["cpuSeconds"]) for t in p["top"]], [(200, 1.0)], "89.0 would be a foreign process's lifetime CPU attributed to the window")
+        self.assertRegex(p["notes"]["top_pid_reuse_dropped"], r"^1 process")
+
+    def test_an_unreadable_start_time_cannot_be_verified_so_it_is_dropped_and_counted(self) -> None:
+        before = [{"id": 100, "name": "locked", "cpu": 1.0, "start": None}, {"id": 200, "name": "steady", "cpu": 10.0, "start": self.T3}]
+        after = [{"id": 100, "name": "locked", "cpu": 9.0, "start": None}, {"id": 200, "name": "steady", "cpu": 12.0, "start": self.T3}]
+        p = self.pid_probe(before, after)
+        self.assertEqual([(t["pid"], t["cpuSeconds"]) for t in p["top"]], [(200, 2.0)])
+        self.assertRegex(p["notes"]["top_pid_reuse_dropped"], r"^1 process")
+
+    def test_the_same_process_in_both_snapshots_keeps_its_cpuseconds_and_adds_no_note(self) -> None:
+        before = [{"id": 100, "name": "busy", "cpu": 10.0, "start": self.T1}, {"id": 200, "name": "steady", "cpu": 10.0, "start": self.T3}]
+        after = [{"id": 100, "name": "busy", "cpu": 17.5, "start": self.T1}, {"id": 200, "name": "steady", "cpu": 11.0, "start": self.T3}]
+        p = self.pid_probe(before, after)
+        self.assertEqual([(t["name"], t["pid"], t["cpuSeconds"]) for t in p["top"]], [("busy", 100, 7.5), ("steady", 200, 1.0)])
+        self.assertNotIn("top_pid_reuse_dropped", p["notes"])
+
+    def test_the_header_documents_the_pair_denominator_and_the_pid_reuse_rule(self) -> None:
+        header = (DV / "Wait-VenueQuiet.ps1").read_text(encoding="utf-8").split("[CmdletBinding", 1)[0]
+        for needle in ("process_active_pair_missing", "unattributed_kernel_pair_missing", "top_pid_reuse_dropped", "process start time"):
+            self.assertIn(needle, header)
 
     def test_the_header_documents_the_valid_sample_mean_the_pid_keying_and_the_gap(self) -> None:
         header = (DV / "Wait-VenueQuiet.ps1").read_text(encoding="utf-8").split("[CmdletBinding", 1)[0]
@@ -4880,8 +5075,8 @@ class LegSpecSchemaTests(unittest.TestCase):
             elif spec["card"] == "PLAYBACK-BACHELOR-PRESENT-JITTER-1":   # the capture-free pace legs, named by flavor and cell
                 self.assertEqual(spec["legId"], path.stem, path.name)
                 self.assertRegex(spec["legId"], rf"^m16-1243-pace-{flavor}-(fullscreen|windowed)-s[124](-la[0-3]|-heavy)?$", path.name)
-            else:   # the scale-4 flavored look leg, or its scale-2 twin (LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1)
-                self.assertIn(spec["legId"], (f"m16-1243-look-{flavor}", f"m16-1243-look-scale2-{flavor}"), path.name)
+            else:   # the scale-4 flavored look leg, or its scale-2 twin (LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1), or that twin's AgX-off copy (LOOK-ASSIST-FILM-FLAVOR-2 r2)
+                self.assertIn(spec["legId"], (f"m16-1243-look-{flavor}", f"m16-1243-look-scale2-{flavor}", f"m16-1243-look-scale2-{flavor}-agxoff"), path.name)
                 self.assertEqual(spec["legId"], path.stem, path.name)
             for role, per_backend in spec["criteria"].items():
                 self.assertTrue(per_backend, f"{path.name}: {role} has no criteria")
@@ -4954,7 +5149,7 @@ class LegSpecSchemaTests(unittest.TestCase):
         self.jsonschema.validate(dict(look, look=dict(look["look"], lookFlavor="film")), self.schema)
         pace = json.loads((DV / "legs" / "m16-1243-pace-cinematic-fullscreen-s4.json").read_text(encoding="utf-8"))
         self.jsonschema.validate(dict(pace, generatorArgs=dict(pace["generatorArgs"], lookFlavor="film")), self.schema)
-        for bad in ("filmm", "Film", "film-v1"):
+        for bad in ("filmm", "Film", "film-v1", "film-v2"):
             with self.assertRaises(self.jsonschema.ValidationError, msg=bad):
                 self.jsonschema.validate(dict(look, look=dict(look["look"], lookFlavor=bad)), self.schema)
             with self.assertRaises(self.jsonschema.ValidationError, msg=bad):
@@ -5145,6 +5340,291 @@ class SessionLockedHealthTests(RunnerHarness, unittest.TestCase):
         self.assertEqual(out["parseErrors"], 0)
         self.assertLess(out["fnAt"], out["assignAt"])
         self.assertLess(out["assignAt"], out["printAt"], "sessionLocked must be set before the one DVE_PROBE line is printed")
+
+
+# ---------------------------------------------------------------------------------------------------
+# LOOK-ASSIST-FILM-FLAVOR-2 r2: a look leg may name a COMMITTED receipt (look.receipt + look.receiptSha256) that the GUI smoke applies before playback.
+# The AgX-off receipt makes a Cinematic capture re-gradable frame-locked (gradation is followed only by AgX, the LUT and the filter). It is a measurement
+# instrument, never a product setting.
+def _base_commit_available() -> bool:
+    return subprocess.run(["git", "-C", str(ROOT), "cat-file", "-e", f"{LOOK_RECEIPT_BASE}^{{commit}}"], capture_output=True).returncode == 0
+
+
+AGXOFF_RECEIPT = DV / "look-receipts" / "agx-off.marxml"
+
+
+class LookReceiptLegSpecTests(unittest.TestCase):
+    def setUp(self) -> None:
+        try:
+            import jsonschema
+        except ImportError:
+            self.skipTest("jsonschema is required")
+        self.jsonschema = jsonschema
+        self.schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
+        self.receipt_sha = hashlib.sha256(AGXOFF_RECEIPT.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
+        self.film = json.loads((DV / "legs" / "m16-1243-look-scale2-film.json").read_text(encoding="utf-8"))
+
+    def with_look(self, **fields) -> dict:
+        return dict(self.film, look=dict(self.film["look"], **fields))
+
+    def test_a_receipt_and_its_hash_validate_together_and_either_alone_is_refused(self) -> None:
+        self.jsonschema.validate(self.with_look(receipt="look-receipts/agx-off.marxml", receiptSha256=self.receipt_sha), self.schema)
+        for alone in ({"receipt": "look-receipts/agx-off.marxml"}, {"receiptSha256": self.receipt_sha}):
+            with self.assertRaises(self.jsonschema.ValidationError, msg=repr(alone)):
+                self.jsonschema.validate(self.with_look(**alone), self.schema)
+
+    def test_a_receipt_outside_look_receipts_or_a_malformed_hash_is_refused(self) -> None:
+        for path in ("receipts/agx-off.marxml", "look-receipts/../venues.json", "look-receipts/agx-off.xml", "C:/x/look-receipts/agx-off.marxml",
+                     "look-receipts/AgX-Off.marxml", "look-receipts/sub/agx-off.marxml", "agx-off.marxml"):
+            with self.assertRaises(self.jsonschema.ValidationError, msg=path):
+                self.jsonschema.validate(self.with_look(receipt=path, receiptSha256=self.receipt_sha), self.schema)
+        for sha in (self.receipt_sha.upper(), self.receipt_sha[:-1], "g" * 64):
+            with self.assertRaises(self.jsonschema.ValidationError, msg=sha):
+                self.jsonschema.validate(self.with_look(receipt="look-receipts/agx-off.marxml", receiptSha256=sha), self.schema)
+
+    def test_every_committed_leg_spec_still_validates(self) -> None:
+        for path in sorted((DV / "legs").glob("*.json")):
+            self.jsonschema.validate(json.loads(path.read_text(encoding="utf-8")), self.schema)
+
+    def test_each_agxoff_leg_is_its_source_except_legId_and_the_two_look_receipt_fields(self) -> None:
+        for agx_id, source_id in AGXOFF_LEGS.items():
+            with self.subTest(leg=agx_id):
+                agx = json.loads((DV / "legs" / f"{agx_id}.json").read_text(encoding="utf-8"))
+                source = json.loads((DV / "legs" / f"{source_id}.json").read_text(encoding="utf-8"))
+                self.assertEqual(agx["legId"], agx_id)
+                self.assertEqual(agx["card"], "DUAL-VENUE-EVIDENCE-1", "one card across a flavor pair's sides (New-VenueFlavorPair)")
+                self.assertEqual(agx["look"].pop("receipt"), "look-receipts/agx-off.marxml")
+                self.assertEqual(agx["look"].pop("receiptSha256"), self.receipt_sha, "the spec binds the committed receipt's bytes")
+                self.assertEqual(dict(agx, legId=source_id), source)
+                self.assertEqual(list(agx), list(source), "same keys in the same order")
+                text = lambda n: (DV / "legs" / f"{n}.json").read_bytes().replace(b"\r\n", b"\n").decode("utf-8")
+                diff = [(a, b) for a, b in zip(text(agx_id).split("\n"), text(source_id).split("\n")) if a != b]
+                self.assertEqual(len(diff), 2, "byte copies: only the legId line and the look line differ")
+
+    def test_no_leg_spec_that_existed_at_the_base_changed(self) -> None:
+        if not _base_commit_available():
+            self.skipTest(f"base commit {LOOK_RECEIPT_BASE[:12]} is not in this clone")
+        legs = "tools/profiling/dual-venue/legs/"
+        changed = git("diff", "--name-only", "--diff-filter=a", LOOK_RECEIPT_BASE, "--", legs)
+        self.assertEqual(changed, "", "existing leg specs are byte-identical (their legSpecSha256 values sit in receipts)")
+        added = set(git("diff", "--name-only", "--diff-filter=A", LOOK_RECEIPT_BASE, "--", legs).split())
+        self.assertTrue({legs + f"{leg}.json" for leg in AGXOFF_LEGS} <= added)
+
+    def test_the_agx_off_receipt_turns_off_agx_lut_and_filter_keeps_look_assist_and_names_no_path(self) -> None:
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(AGXOFF_RECEIPT.read_bytes())
+        self.assertEqual((root.tag, root.get("version")), ("receipt", "4"))
+        self.assertEqual([(c.tag, c.text) for c in root], [("lookAssistEnabled", "1"), ("agx", "0"), ("lutEnabled", "0"), ("filterEnabled", "0")],
+                         "no gradationCurve: Film is laid only over a default curve, so the receipt must leave the curve default")
+        self.assertNotRegex(AGXOFF_RECEIPT.read_text(encoding="utf-8"), r"(?i)[a-z]:[\\/]|\\\\|\.mlv\b|M16-1243")
+
+
+@requires_windows_pwsh
+class LookReceiptRunnerTests(RunnerHarness, unittest.TestCase):
+    """(c) Invoke-VenueLeg reads the look receipt as COMMITTED (offline test mode: the RepoRoot's HEAD), never the working copy, and refuses
+    LOOK_RECEIPT_UNBOUND before anything is generated or submitted unless its bytes hash to look.receiptSha256."""
+
+    def setUp(self) -> None:
+        self.make_harness()
+        self.repo = self.tmp / "receipt-repo"
+        target = self.repo / "tools" / "profiling" / "dual-venue" / "look-receipts" / "agx-off.marxml"
+        target.parent.mkdir(parents=True)
+        self.committed = AGXOFF_RECEIPT.read_bytes().replace(b"\r\n", b"\n")
+        target.write_bytes(self.committed)
+        for args in (("init", "-q"), ("config", "user.email", "unit@example.invalid"), ("config", "user.name", "unit"), ("config", "core.autocrlf", "false"),
+                     ("add", "tools"), ("commit", "-q", "-m", "committed look receipt")):
+            subprocess.run(["git", "-C", str(self.repo), *args], capture_output=True, text=True, check=True)
+        self.working = self.committed.replace(b"<agx>0</agx>", b"<agx>1</agx>")
+        target.write_bytes(self.working)   # the working copy now differs from the committed blob
+        self.gen.write_text(STUB_GENERATOR.replace("$DisplayMode)", "$DisplayMode,$LookReceiptPath)", 1), encoding="utf-8")
+        self.work = self.tmp / "work"
+
+    def spec(self, **look) -> Path:
+        spec = json.loads(self.write_spec(leg_type="look", flavor="film", scale=2).read_text(encoding="utf-8"))
+        spec["look"].update(look)
+        path = self.tmp / f"spec-receipt-{hashlib.sha1(json.dumps(look, sort_keys=True).encode()).hexdigest()[:10]}.json"
+        path.write_text(json.dumps(spec), encoding="utf-8")
+        return path
+
+    def run_receipt_leg(self, spec: Path, gen_refusal: str | None = None) -> tuple[subprocess.CompletedProcess, dict | None, list[str]]:
+        cfg = {"log": str(self.log), "genLog": str(self.gen_log), "probe": BACHELOR_PROBE, "mainMode": "capture", "healthMode": "ok",
+               "artifactsAgentPath": "X:\\stub\\agent\\outbox\\unit.artifacts", "genRefusal": gen_refusal, "clipContentSha256": CLIP_CONTENT_SHA,
+               "token": None, "exitCode": 0}
+        self.stub_cfg.write_text(json.dumps(cfg), encoding="utf-8")
+        self.log.write_text("", encoding="utf-8")
+        self.gen_log.write_text("", encoding="utf-8")
+        before = set(self.receipts.rglob("*.json")) if self.receipts.exists() else set()
+        proc = run_pwsh(["-File", str(DV / "Invoke-VenueLeg.ps1"), "-Venue", "bachelor", "-LegSpec", str(spec), "-SourceCommit", self.sha, "-Backend", "cpu",
+                         "-BuildManifestSha256", self.build_sha, "-VenueTablePath", str(self.table), "-ReceiptRoot", str(self.receipts),
+                         "-OfflineTestMode", "-UmRunScript", str(self.um), "-GeneratorScript", str(self.gen), "-WorkDir", str(self.work),
+                         "-ConsentPath", str(self.consent), "-RepoRoot", str(self.repo), "-Actor", "unit-test"],
+                        env_extra={"DVE_STUB": str(self.stub_cfg)})
+        after = sorted((set(self.receipts.rglob("*.json")) if self.receipts.exists() else set()) - before, key=lambda f: f.stat().st_mtime_ns)
+        receipt = json.loads(after[-1].read_text(encoding="utf-8")) if after else None
+        return proc, receipt, [l.strip() for l in self.log.read_text(encoding="utf-8").splitlines() if l.strip()]
+
+    def assertUnbound(self, spec: Path) -> None:
+        proc, receipt, submitted = self.run_receipt_leg(spec)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIsNotNone(receipt, proc.stdout + proc.stderr)
+        self.assertEqual(receipt["refusal"], "LOOK_RECEIPT_UNBOUND", proc.stdout)
+        self.assertEqual(receipt["outcome"], "DEVICE_UNAVAILABLE")
+        self.assertEqual(self.generator_calls(), [], "nothing is generated")
+        self.assertEqual(submitted, [], "nothing is submitted, not even the health probe")
+
+    def test_a_hash_only_the_working_copy_matches_is_refused_and_nothing_is_generated_or_submitted(self) -> None:
+        self.assertNotEqual(self.committed, self.working)
+        self.assertUnbound(self.spec(receipt="look-receipts/agx-off.marxml", receiptSha256=hashlib.sha256(self.working).hexdigest()))
+
+    def test_a_wrong_hash_a_missing_half_an_uncommitted_file_or_a_path_outside_look_receipts_is_refused(self) -> None:
+        sha = hashlib.sha256(self.committed).hexdigest()
+        for look in ({"receipt": "look-receipts/agx-off.marxml", "receiptSha256": "0" * 64}, {"receipt": "look-receipts/agx-off.marxml"},
+                     {"receiptSha256": sha}, {"receipt": "look-receipts/never-committed.marxml", "receiptSha256": sha},
+                     {"receipt": "look-receipts/../look-receipts/agx-off.marxml", "receiptSha256": sha}):
+            with self.subTest(look=look):
+                self.assertUnbound(self.spec(**look))
+
+    def test_the_committed_bytes_reach_the_generator(self) -> None:
+        proc, receipt, submitted = self.run_receipt_leg(self.spec(receipt="look-receipts/agx-off.marxml", receiptSha256=hashlib.sha256(self.committed).hexdigest()),
+                                                        gen_refusal="DUAL_VENUE_UNIT_STOP")
+        self.assertEqual(receipt["refusal"], "GENERATOR_REFUSED_DUAL_VENUE_UNIT_STOP", proc.stdout + proc.stderr)
+        [call] = self.generator_calls()
+        found = re.search(r"(?:^|;)LookReceiptPath=([^;]+)", call)
+        self.assertIsNotNone(found, call)
+        self.assertEqual(Path(found.group(1)).read_bytes(), self.committed, "the generator is handed the COMMITTED bytes, not the working copy")
+        self.assertEqual(submitted, [])
+
+    def test_a_look_leg_without_a_receipt_passes_none(self) -> None:
+        proc, receipt, _ = self.run_receipt_leg(self.spec(), gen_refusal="DUAL_VENUE_UNIT_STOP")
+        self.assertEqual(receipt["refusal"], "GENERATOR_REFUSED_DUAL_VENUE_UNIT_STOP", proc.stdout + proc.stderr)
+        [call] = self.generator_calls()
+        self.assertNotIn("LookReceiptPath", call)
+
+
+@requires_windows_pwsh
+class LookReceiptValidatorTests(EvidenceFactory, ModuleMutationMixin, unittest.TestCase):
+    """(f) Test-DvReceiptValid accepts a hashed summary.json's lookReceiptSha256 only when the committed leg spec names a look receipt with that hash;
+    a summary without one is accepted only for a spec without one (both absent is every leg before this round)."""
+
+    def setUp(self) -> None:
+        self.make_harness()
+        self.sha = hashlib.sha256(AGXOFF_RECEIPT.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
+
+    def receipt_spec(self) -> Path:
+        spec = json.loads(self.write_spec(leg_type="look").read_text(encoding="utf-8"))
+        spec["look"].update(receipt="look-receipts/agx-off.marxml", receiptSha256=self.sha)
+        path = self.tmp / "spec-look-receipt.json"
+        path.write_text(json.dumps(spec), encoding="utf-8")
+        return path
+
+    def cases(self, module: Path | None = None) -> tuple[list, list]:
+        plain_repo = self.prod_repo(leg_type="look")
+        plain_spec = self.spec_path
+        receipt_repo = self.prod_repo(leg_type="look", spec=self.receipt_spec())
+        receipt_spec = self.spec_path
+        bound = self.evidence("lr-bound", sheet=True, backend="cpu", leg_type="look", summary={"lookReceiptSha256": self.sha})
+        foreign = self.evidence("lr-foreign", sheet=True, backend="cpu", leg_type="look", summary={"lookReceiptSha256": "0" * 64})
+        none = self.evidence("lr-none", sheet=True, backend="cpu", leg_type="look")
+        rc = self.status_batch(receipt_repo, [(self.receipt_for(receipt_repo, ev, backend="cpu", leg_type="look", spec_path=receipt_spec), None)
+                                              for ev in (bound, foreign, none)], module=module)
+        pl = self.status_batch(plain_repo, [(self.receipt_for(plain_repo, ev, backend="cpu", leg_type="look", spec_path=plain_spec), None)
+                                            for ev in (none, bound)], module=module)
+        return rc, pl
+
+    def test_a_run_look_receipt_hash_is_accepted_only_where_the_committed_spec_names_it(self) -> None:
+        rc, pl = self.cases()
+        self.expect(rc[0], "ADVISORY", "the spec's receipt, bound in the hashed summary")
+        self.expect(rc[1], "INVALID", "another receipt hash", "LOOK_RECEIPT_MISMATCH")
+        self.expect(rc[2], "INVALID", "a receipt leg whose run recorded none", "LOOK_RECEIPT_MISMATCH")
+        self.expect(pl[0], "ADVISORY", "no receipt on either side (every earlier leg)")
+        self.expect(pl[1], "INVALID", "a receipt hash on a leg whose spec names none", "LOOK_RECEIPT_MISMATCH")
+
+    def test_mutation_without_the_rule_a_foreign_receipt_hash_is_advisory(self) -> None:
+        mutated = self.mutated_module([("if ([string](Get-DvProp $ev.summary 'lookReceiptSha256') -cne", "if ($false -and [string](Get-DvProp $ev.summary 'lookReceiptSha256') -cne")])
+        rc, pl = self.cases(module=mutated)
+        self.expect(rc[1], "ADVISORY", "with the rule removed a foreign receipt hash is believed -- so the rule is what refuses it")
+        self.expect(pl[1], "ADVISORY", "with the rule removed a receipt hash on a plain leg is believed")
+
+
+@requires_windows_pwsh
+class LookReceiptGeneratorTests(unittest.TestCase):
+    """(d) The generator's -LookReceiptPath: without it the emitted job is byte-identical to the base (#328 head) generator's for the same arguments;
+    with it the job embeds the receipt base64 + sha256, passes -Receipt exactly once and records lookReceiptSha256 in its summary; off a look leg it throws."""
+
+    LOOK_ARGS = ["-Backend", "cpu", "-ScaleFactor", "2", "-ExpectedScaleRequest", "2", "-TelemetryArm", "LIGHT", "-CpuQuiescenceThresholdPercent", "95",
+                 "-ContactSheet", "-ContactSheetFrames", "6", "-ForceLookAssist"]
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._tmp = tempfile.TemporaryDirectory(prefix="dve-lookrcpt-")
+        cls.tmp = Path(cls._tmp.name)
+        cls.head = git("rev-parse", "HEAD")
+        cls.repo = cls.tmp / "repo"
+        subprocess.run(["git", "clone", "-q", "--shared", "--no-checkout", str(ROOT), str(cls.repo)], check=True)
+        subprocess.run(["git", "-C", str(cls.repo), "sparse-checkout", "set", "--cone", "tools", "tests/fixtures/clips"], check=True)
+        subprocess.run(["git", "-C", str(cls.repo), "checkout", "-q", cls.head], check=True)
+        for stem in FIXTURE_IDS:
+            write_synthetic_mlv(cls.repo / "tests" / "fixtures" / "clips" / (stem + MLV_EXT), FRAMES_30S_AT_23976)
+        cls.base_root = cls.tmp / "base"
+        if _base_commit_available():
+            tar = cls.tmp / "base.tar"
+            subprocess.run(["git", "-C", str(ROOT), "archive", LOOK_RECEIPT_BASE, "--format=tar", "-o", str(tar), "tools/profiling", "tools/gates"], check=True)
+            cls.base_root.mkdir()
+            subprocess.run(["tar", "-xf", str(tar), "-C", str(cls.base_root)], check=True)
+        cls.receipt = cls.tmp / "look-receipt.marxml"
+        cls.receipt.write_bytes(AGXOFF_RECEIPT.read_bytes().replace(b"\r\n", b"\n"))
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._tmp.cleanup()
+
+    def run_generator(self, script: Path, out_name: str, extra: list[str]) -> tuple[subprocess.CompletedProcess, Path]:
+        out = self.tmp / out_name
+        proc = run_pwsh(["-File", str(script), "-SourceCommit", self.head, "-BuildManifestSha256", "ab" * 32, "-ClipId", FIXTURE_IDS[0],
+                         "-FixtureSha256", "cd" * 32, "-RepoRoot", str(self.repo), "-OutFile", str(out), *extra])
+        return proc, out
+
+    def generate(self, script: Path, out_name: str, extra: list[str]) -> Path:
+        proc, out = self.run_generator(script, out_name, extra)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return out
+
+    def test_without_a_receipt_the_job_is_byte_identical_to_the_base_generators(self) -> None:
+        if not _base_commit_available():
+            self.skipTest(f"base commit {LOOK_RECEIPT_BASE[:12]} is not in this clone")
+        base_gen = self.base_root / "tools" / "profiling" / "bachelor" / "playback-attr-3-cuda-job.ps1"
+        for name, extra in (("default", []), ("cpu-look-film", [*self.LOOK_ARGS, "-LookFlavor", "film"]),
+                            ("cpu-look-cinematic", [*self.LOOK_ARGS, "-LookFlavor", "cinematic"]),
+                            ("cuda-look-cinematic", ["-ContactSheet", "-ContactSheetFrames", "6", "-ForceLookAssist", "-LookFlavor", "cinematic"])):
+            with self.subTest(variant=name):
+                new = self.generate(GENERATOR, f"new-{name}.job.ps1", extra).read_bytes()
+                old = self.generate(base_gen, f"base-{name}.job.ps1", extra).read_bytes()
+                self.assertEqual(new, old, f"{name}: the job without -LookReceiptPath must be the base generator's bytes")
+                self.assertNotIn(b"LookReceipt", new)
+
+    def test_with_a_receipt_the_job_embeds_its_bytes_passes_minus_receipt_once_and_records_its_hash(self) -> None:
+        sha = hashlib.sha256(self.receipt.read_bytes()).hexdigest()
+        text = self.generate(GENERATOR, "receipt.job.ps1", [*self.LOOK_ARGS, "-LookFlavor", "film", "-LookReceiptPath", str(self.receipt)]).read_text(encoding="utf-8")
+        [b64] = re.findall(r"(?m)^\$LookReceiptBase64 = '([A-Za-z0-9+/=]+)'\r?$", text)
+        import base64
+        self.assertEqual(base64.b64decode(b64), self.receipt.read_bytes())
+        self.assertEqual(re.findall(r"(?m)^\$LookReceiptSha256 = '([0-9a-f]{64})'\r?$", text), [sha])
+        self.assertEqual(text.count(" -Receipt "), 1, "the smoke runner is passed -Receipt exactly once")
+        self.assertIn("-RequireLookAssist:`$true -Receipt $(ConvertTo-PsSingleQuoted $LookReceiptJobPath) -Scope none", text)
+        self.assertEqual(text.count("    lookReceiptSha256 = $LookReceiptSha256\n") + text.count("    lookReceiptSha256 = $LookReceiptSha256\r\n"), 1, "the success summary records the hash")
+        self.assertIn("RESULT=LOOK_RECEIPT_SHA_MISMATCH", text)
+        self.assertLess(text.index("$LookReceiptJobPath = Join-Path $Work 'look-receipt.marxml'"), text.index(" -Receipt $(ConvertTo-PsSingleQuoted $LookReceiptJobPath)"),
+                        "the receipt is written and re-verified before the smoke command is built")
+        parsed = run_pwsh(["-Command", f"$e = $null; [void][System.Management.Automation.Language.Parser]::ParseFile('{self.tmp / 'receipt.job.ps1'}', [ref]$null, [ref]$e); $e.Count"])
+        self.assertEqual(parsed.stdout.strip(), "0", parsed.stdout + parsed.stderr)
+
+    def test_a_receipt_off_a_look_leg_is_refused_before_anything_is_emitted(self) -> None:
+        for name, extra in (("speed", []), ("pace", ["-ForceLookAssist", "-LookPaceLeg"])):
+            with self.subTest(leg=name):
+                proc, out = self.run_generator(GENERATOR, f"refused-{name}.job.ps1", [*extra, "-LookReceiptPath", str(self.receipt)])
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertIn("DUAL_VENUE_LOOK_RECEIPT_REQUIRES_LOOK_LEG", proc.stdout + proc.stderr)
+                self.assertFalse(out.exists())
 
 
 if __name__ == "__main__":

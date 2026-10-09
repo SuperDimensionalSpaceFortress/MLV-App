@@ -307,6 +307,28 @@ function Get-DvBlobIdAtCommit {
 }
 
 $script:LegsRelativeDir = 'tools/profiling/dual-venue/legs'
+$script:LookReceiptPattern = '^look-receipts/[a-z0-9-]+\.marxml$'
+
+function Read-DvCommittedLookReceipt {
+    <#
+    .SYNOPSIS
+    LOOK-ASSIST-FILM-FLAVOR-2 r2: the optional receipt a look leg names (look.receipt + look.receiptSha256), read AS COMMITTED at $Commit
+    (tools/profiling/dual-venue/<receipt>), never from the working copy. ok only when both fields are well formed and the committed bytes hash
+    to receiptSha256; a look block naming neither is ok with present = $false. Returns [pscustomobject]@{ ok; present; bytes; sha256 }.
+    #>
+    param([Parameter(Mandatory)][string]$RepoRoot, [Parameter(Mandatory)][AllowEmptyString()][string]$Commit, $Look)
+    $rel = [string](Get-DvProp $Look 'receipt'); $want = [string](Get-DvProp $Look 'receiptSha256')
+    if ([string]::IsNullOrEmpty($rel) -and [string]::IsNullOrEmpty($want)) { return [pscustomobject]@{ ok = $true; present = $false; bytes = $null; sha256 = $null } }
+    $bad = [pscustomobject]@{ ok = $false; present = $true; bytes = $null; sha256 = $null }
+    if ($rel -cnotmatch $script:LookReceiptPattern -or $want -cnotmatch '^[0-9a-f]{64}$') { return $bad }
+    $id = Get-DvBlobIdAtCommit -RepoRoot $RepoRoot -Commit $Commit -RelativePath ('tools/profiling/dual-venue/' + $rel)
+    if ($null -eq $id) { return $bad }
+    $blob = Get-DvBlobById -RepoRoot $RepoRoot -BlobSha $id
+    if (-not $blob.ok) { return $bad }
+    $sha = Get-DvSha256OfBytes $blob.bytes
+    if ($sha -cne $want) { return $bad }
+    [pscustomobject]@{ ok = $true; present = $true; bytes = $blob.bytes; sha256 = $sha }
+}
 
 function Find-DvCommittedLegSpec {
     <#
@@ -1374,6 +1396,8 @@ function Test-DvReceiptValid {
                     if ((Get-DvProp $ev.summary 'lookAssistForced') -ne $true) { $invalid.Add('LEG_TYPE_MISMATCH: a look leg''s hashed summary.json does not say lookAssistForced') }
                     $specFlavor = [string](Get-DvProp (Get-DvProp $spec 'look') 'lookFlavor'); if ([string]::IsNullOrWhiteSpace($specFlavor)) { $specFlavor = 'classic' }
                     if ([string](Get-DvProp $ev.summary 'lookFlavor') -cne $specFlavor -or [string](Get-DvProp $subject 'lookFlavor') -cne $specFlavor) { $invalid.Add('LEG_TYPE_MISMATCH: the look flavor in the hashed summary.json / receipt subject is not the committed spec''s') }
+                    # LOOK-ASSIST-FILM-FLAVOR-2 r2: a run's lookReceiptSha256 is accepted only when the committed spec names a look receipt with that hash (both absent is the old leg).
+                    if ([string](Get-DvProp $ev.summary 'lookReceiptSha256') -cne [string](Get-DvProp (Get-DvProp $spec 'look') 'receiptSha256')) { $invalid.Add('LOOK_RECEIPT_MISMATCH: the hashed summary.json''s lookReceiptSha256 is not the committed spec''s look.receiptSha256') }
                 }
             }
         }
@@ -1750,6 +1774,6 @@ function Write-DvReceipt {
 Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-DvSha256OfBytes, Get-DvSha256OfText, Get-DvSha256OfFile,
     ConvertTo-DvLfBytes, Get-DvLegSpecSha256, Get-DvDerivedBackend, Get-DvBackendNotDerivable, Read-DvContactFrames, Get-DvSubjectDigest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
     Test-DvUnderClaudeState, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvPlaybackProblems,
-    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvDisplayEvidence, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvHealthVerdict,
+    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvDisplayEvidence, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvHealthVerdict,
     New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout,
     Get-DvResultToken, Resolve-DvJobOutcome, Test-DvCriteria, Get-DvVerbatimMetrics, New-DvReceipt, Write-DvReceipt

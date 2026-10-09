@@ -59,7 +59,6 @@ from __future__ import annotations
 import functools
 import re
 import subprocess
-import time
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
@@ -80,16 +79,21 @@ KNOWN_OPEN: dict[tuple[str, str], str] = {
     ("tools/profiling/run-release-gui-smoke.ps1", "ExtraEnvironment"): (
         "docs/04-external-auditor-guide.md:504 documents `-ExtraEnvironment @('KEY=VALUE')` with ONE element, which "
         "expands to one token and binds correctly; the guard flags the `@(...)` literal because it cannot count "
-        "elements. With two or more, the extra tokens land in $UnrecognizedArguments (ValueFromRemainingArguments) "
-        "and the script throws, so that failure is loud. Pass-through values may hold commas, so a comma split is "
-        "not the fix; follow-up PWSH-FILE-ARRAY-PASSTHRU-1 (queued in the hub card queue): fail loud or pass base64 JSON."
+        "elements. Observed under pwsh 7.6.6 (`pwsh -File`, `@(...)` expanded by the calling shell): with two elements the "
+        "second does NOT reach $UnrecognizedArguments, because ValueFromRemainingArguments only takes tokens no positional "
+        "parameter claims; it binds positionally to ExePath and the unrecognized-arguments gate passes without throwing. "
+        "A third lands on the [double] -Seconds and fails type conversion at bind time. Pass-through values may hold "
+        "commas, so a comma split is not the fix; follow-up PWSH-FILE-ARRAY-PASSTHRU-1 (queued in the hub card queue): "
+        "fail loud or pass base64 JSON."
     ),
     ("tools/profiling/run-release-playback-profile.ps1", "AdditionalArgs"): (
         "docs/14-performance-benchmarking.md:544-551 documents `-AdditionalArgs @('--stage-log', ..., '--raw-cache-mb', "
-        "...)`, six elements. PowerShell expands them to six tokens; only the first binds to -AdditionalArgs and the "
-        "rest bind positionally to unbound parameters (no [CmdletBinding()], so ExePath takes the stage-log path first "
-        "and fails at path resolution). That example fails visibly, but a pass-through value that happens to suit the "
-        "next parameter would bind silently. Same follow-up PWSH-FILE-ARRAY-PASSTHRU-1."
+        "...)`, six elements. Observed under pwsh 7.6.6 (`pwsh -File`, `@(...)` expanded by the calling shell): the six "
+        "tokens bind as the first to -AdditionalArgs, the second positionally to ExePath (the stage-log path), and the "
+        "other four (`--raw-cache-mb 128 --cache-cpu-cores 4`) land silently in $args (no [CmdletBinding()] and no "
+        "ValueFromRemainingArguments, so nothing throws at bind time); the failure of that example, if any, comes later "
+        "when the script resolves ExePath. A two-element list binds the second element to ExePath the same way. Same "
+        "follow-up PWSH-FILE-ARRAY-PASSTHRU-1."
     ),
 }
 
@@ -703,8 +707,46 @@ def _live_found() -> tuple[Violation, ...]:
     return tuple(find_violations(_live_files()))
 
 
+class _CountingStr(str):
+    """A str that counts the characters every slice and ranged search it serves touches (``work``).
+
+    ``_statements`` indexes its input one character at a time, so a linear scan touches each character O(1) times; a
+    ``body[i + 1:]`` copy or ``body.count(..., 0, i)`` per newline touches O(n) characters per line instead. Counting
+    that is deterministic, unlike a wall-clock ratio, which flakes on a contended runner.
+    """
+
+    def __new__(cls, text: str) -> "_CountingStr":
+        self = super().__new__(cls, text)
+        self.work = 0
+        return self
+
+    def __getitem__(self, key):
+        piece = super().__getitem__(key)
+        self.work += max(1, len(piece))
+        return piece
+
+    def _scan(self, start, end) -> None:
+        self.work += max(1, len(range(*slice(start, end).indices(len(self)))))
+
+    def count(self, sub, start=None, end=None):
+        self._scan(start, end)
+        return super().count(sub, start, end)
+
+    def find(self, sub, start=None, end=None):
+        self._scan(start, end)
+        return super().find(sub, start, end)
+
+    def rfind(self, sub, start=None, end=None):
+        self._scan(start, end)
+        return super().rfind(sub, start, end)
+
+    def index(self, sub, start=None, end=None):
+        self._scan(start, end)
+        return super().index(sub, start, end)
+
+
 class PwshStringArrayFileParams(unittest.TestCase):
-    RED_SCRIPT = "param(\n    [Parameter(Mandatory = $true)][string[]]$Dirs,\n    [int]$Top = 1\n)\n$Dirs | ForEach-Object { $_ }\n"
+    RED_SCRIPT ="param(\n    [Parameter(Mandatory = $true)][string[]]$Dirs,\n    [int]$Top = 1\n)\n$Dirs | ForEach-Object { $_ }\n"
 
     def test_red_usage_line_with_comma_list_and_no_split_is_flagged(self):
         files = {
@@ -1186,7 +1228,10 @@ class PwshStringArrayFileParams(unittest.TestCase):
             ("run-release-gui-smoke.ps1", "ExtraEnvironment"), ("run-release-playback-profile.ps1", "AdditionalArgs")))
         self.assertIn("ONE element", gui)
         self.assertIn("ValueFromRemainingArguments", files["tools/profiling/run-release-gui-smoke.ps1"])
+        self.assertIn("binds positionally to ExePath", gui)
+        self.assertNotIn("the script throws", gui)
         self.assertIn("positionally", profile)
+        self.assertIn("$args", profile)
         self.assertNotIn("CmdletBinding", files["tools/profiling/run-release-playback-profile.ps1"])
         for reason in KNOWN_OPEN.values():
             self.assertIn("PWSH-FILE-ARRAY-PASSTHRU-1", reason)
@@ -1196,17 +1241,16 @@ class PwshStringArrayFileParams(unittest.TestCase):
         self.assertEqual(["CdngCodecs"], validateset_string_arrays(_live_files()[path]))
 
     def test_statement_splitter_scales_linearly(self):
-        def best(lines: int) -> float:
-            body = "Write-Host $x\n" * lines
-            runs = []
-            for _ in range(3):
-                t0 = time.perf_counter()
-                _statements(body)
-                runs.append(time.perf_counter() - t0)
-            return min(runs)
+        # Counts the characters _statements touches instead of timing it (a wall-clock ratio flakes on a contended
+        # runner): linear is exactly 4.0x for 4x the lines, the per-newline `body[i + 1:]` copy of #313 is ~16x.
+        def work(lines: int) -> int:
+            body = _CountingStr("Write-Host $x\n" * lines)
+            self.assertEqual(["Write-Host $x"] * lines, _statements(body))
+            return body.work
 
-        small, large = best(20_000), best(80_000)
-        self.assertLess(large, small * 9, f"4x the lines took {large / small:.1f}x the time (quadratic is ~16x)")
+        small, large = work(2_000), work(8_000)
+        self.assertGreater(small, 0, "_statements no longer reads through slicing or ranged search; extend _CountingStr")
+        self.assertLessEqual(large, small * 5, f"4x the lines touched {large / small:.1f}x the characters (linear is 4.0x, quadratic ~16x)")
 
     def test_reverting_each_guarded_311_fix_in_memory_is_flagged(self):
         files = _live_files()

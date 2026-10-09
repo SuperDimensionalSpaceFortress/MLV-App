@@ -50,8 +50,11 @@
       "type": "object", "required": ["contactSheetFrames", "lookFlavor"], "additionalProperties": false,
       "properties": {
         "contactSheetFrames": { "type": "integer", "minimum": 1, "maximum": 60 },
-        "lookFlavor": { "enum": ["classic", "cinematic", "film"], "default": "classic" }
+        "lookFlavor": { "enum": ["classic", "cinematic", "film"], "default": "classic" },
+        "receipt": { "type": "string", "pattern": "^look-receipts/[a-z0-9-]+\\.marxml$", "description": "OPTIONAL (LOOK-ASSIST-FILM-FLAVOR-2 r2): a receipt file relative to tools/profiling/dual-venue/. The GUI smoke applies it before playback (--receipt). The runner reads it as COMMITTED at the admission head, never from the working copy. A measurement instrument (for example AgX off, so a capture can be re-graded frame-locked), not a product setting." },
+        "receiptSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "sha256 of the committed receipt bytes. legSpecSha256 binds this hash, and so the receipt's bytes; a mismatch refuses the leg (LOOK_RECEIPT_UNBOUND)." }
       },
+      "dependentRequired": { "receipt": ["receiptSha256"], "receiptSha256": ["receipt"] },
       "description": "Required when legType is 'look'. Look Assist is FORCED on for a look leg (Amendment 1 A2)."
     },
     "criteria": {
