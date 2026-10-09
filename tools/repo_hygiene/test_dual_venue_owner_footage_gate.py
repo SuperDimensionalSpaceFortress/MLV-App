@@ -180,6 +180,11 @@ ROUTE_DELETE_ALLOWED = {
         "non-recursive and without a wildcard, on the line after the pair record (or, second site sharing the line, the trio record) is written; a footage "
         "name cannot equal it, and the pair's -OutDir holds only derived sheets (never a clip). test_look_flavor_pair_hardening pins that the marker is gone "
         "after a finished pair or trio and kept after a crash.",
+    ("VenueChain.psm1", "[IO.File]::Delete($Path)"):
+        "VENUE-CHAIN-RUNNER-1: releases or breaks the venue claim file <ClaimDir>\\<venue>.claim.json (default under the board's "
+        ".claude-state\\dual-venue\\claims, never a venue share). $Path is built only by Get-VenueClaimPath from a venue name matching "
+        "^[a-z0-9][a-z0-9-]{0,62}$ plus the fixed suffix .claim.json, and the delete runs only after the open handle re-read the claim's own JSON "
+        "(its nonce, or the exact stale bytes judged); a footage name cannot equal it. test_venue_chain_runner pins release and stale-break.",
 }
 
 TRAILING_COMMENT = re.compile(r"\s+#\s.*$")
