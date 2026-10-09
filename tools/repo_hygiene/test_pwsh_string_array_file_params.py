@@ -17,8 +17,10 @@ only the first element binds (export-release-cuda-dogfood-kit.ps1 and invoke-ult
 this shape). Fix the caller with ``($arr -join ',')`` and split in the script. A variable counts as an array
 when the caller's file declares it ``[string[]]`` / ``[array]``, assigns it ``@(...)`` / a cast / a comma list /
 a ``-split`` / a ``Verb-...Array...`` helper (never a name that merely contains "array", like ``$arrayCount``),
-or aliases one of those. A split clears the parameter only in one of two whitelisted forms (``is_normalised``), and
-only when it splits ON A COMMA, and the credit is a whitelist of exact shapes: the ``-split`` delimiter must be ``','``
+a collection (``New-Object [-TypeName] System.Collections.ArrayList`` / ``...Generic.List[T]``, a
+``[System.Collections.ArrayList]`` / ``[Collections.Generic.List[T]]`` declaration, cast or ``::new()``, with or
+without the ``System.Collections.`` prefix; ``New-Object System.Text.StringBuilder`` is not one), or aliases one of
+those. A split clears the parameter only in one of two whitelisted forms (``is_normalised``), and only when it splits ON A COMMA, and the credit is a whitelist of exact shapes: the ``-split`` delimiter must be ``','``
 or ``','`` padded by ``\\s*`` / `` *`` on either side, with a limit that is absent or the literal 0; a ``.Split(...)``
 must take exactly one comma (``','``, ``[char]','``, ``@(',')``, ``[char[]]','``) and no count, option or second
 separator. A ``';'``, newline, ``', '``, empty or interpolated delimiter, a lookaround, alternation, class or
@@ -534,18 +536,23 @@ def _logical_commands(text: str) -> list[tuple[int, str]]:
     return cmds
 
 
+# A growable collection type name, with or without its namespace: ArrayList, List[string], Generic.List[string[]].
+_COLLECTION = r"(?:System\.)?(?:Collections\.)?(?:Generic\.)?(?:ArrayList\b|List\[[^\]]*\])"
+
+
 def _array_variable_names(text: str) -> frozenset[str]:
     """Names (lower-case) that the file declares or assigns as arrays, following ``$a = $b`` aliases."""
     names: set[str] = set()
-    for m in re.finditer(r"\[(?:string\[\]|object\[\]|array)\]\s*`?\$(\w+)", text, re.I):
+    for m in re.finditer(r"\[(?:string\[\]|object\[\]|array|" + _COLLECTION + r")\]\s*`?\$(\w+)", text, re.I):
         names.add(m.group(1).lower())
     assigns = re.findall(r"`?\$(\w+)\s*\+?=\s*([^\r\n]*)", text)
     # An array value: @(...), a cast, a -split or .Split( (unless its result is indexed down to one element), a
-    # comma list, or a cmdlet/helper whose NAME says Array (never a variable or member that merely contains the
-    # word, such as $arrayCount).
+    # comma list, a cmdlet/helper whose NAME says Array (never a variable or member that merely contains the
+    # word, such as $arrayCount), or a collection: a [ArrayList] / [List[T]] cast or ::new(), or New-Object of one.
     arrayish = re.compile(
-        r"^(?:@\(|\[(?:string\[\]|object\[\]|array)\]|.*-split\b|.*\.Split\s*\([^)]*\)(?!\s*\[)"
+        r"^(?:@\(|\[(?:string\[\]|object\[\]|array|" + _COLLECTION + r")\]|.*-split\b|.*\.Split\s*\([^)]*\)(?!\s*\[)"
         r"|&?\s*[A-Za-z]+-[\w-]*Array[\w-]*(?:\s|$)"
+        r"|\(?\s*New-Object\s+(?:-TypeName[\s:]+)?['\"]?" + _COLLECTION +
         r"|(?:'[^']*'|\"[^\"]*\"|`?\$\w+)\s*,)",
         re.I,
     )
@@ -1200,6 +1207,52 @@ class PwshStringArrayFileParams(unittest.TestCase):
             "$n = @($raw)\n",
         ):
             self.assertEqual([("tools/x/trace.ps1", "Dirs")], self._flagged({**script, "tools/x/run.ps1": assign + call}), assign)
+
+    def test_red_collection_constructor_and_declaration_callers_are_flagged(self):
+        script = {"tools/x/trace.ps1": self._split_fixed()}
+        call = "& pwsh -File tools\\x\\trace.ps1 -Dirs $n\n"
+        # The fable r5 repro, then every constructor / cast / declaration form of a growable collection.
+        for assign in (
+            "$n = New-Object System.Collections.ArrayList\n",
+            "$n = New-Object -TypeName System.Collections.ArrayList\n",
+            "$n = New-Object -TypeName:System.Collections.ArrayList\n",
+            "$n = New-Object 'System.Collections.ArrayList'\n",
+            "$n = (New-Object System.Collections.ArrayList)\n",
+            "$n = New-Object Collections.ArrayList\n",
+            "$n = New-Object ArrayList\n",
+            "$n = New-Object System.Collections.Generic.List[string]\n",
+            "$n = New-Object -TypeName System.Collections.Generic.List[string]\n",
+            "$n = New-Object Collections.Generic.List[string[]]\n",
+            "$n = New-Object 'System.Collections.Generic.List[string]'\n",
+            "$n = [System.Collections.ArrayList]::new()\n",
+            "$n = [System.Collections.ArrayList]@()\n",
+            "$n = [Collections.ArrayList]::new(4)\n",
+            "$n = [System.Collections.Generic.List[string]]::new()\n",
+            "$n = [Collections.Generic.List[string[]]]::new()\n",
+            "[System.Collections.ArrayList]$n = @()\n",
+            "[System.Collections.ArrayList] $n = $null\n",
+            "[Collections.Generic.List[string]]$n = [Collections.Generic.List[string]]::new()\n",
+            "[System.Collections.Generic.List[string]]$n\n",
+        ):
+            self.assertEqual([("tools/x/trace.ps1", "Dirs")], self._flagged({**script, "tools/x/run.ps1": assign + call}), assign)
+        # An alias of a collection is a collection.
+        alias = "$list = New-Object System.Collections.ArrayList\n$n = $list\n"
+        self.assertEqual([("tools/x/trace.ps1", "Dirs")], self._flagged({**script, "tools/x/run.ps1": alias + call}), alias)
+
+    def test_green_array_named_and_non_collection_objects_are_not_arrays(self):
+        script = {"tools/x/trace.ps1": self._split_fixed()}
+        # A name that merely contains "array" stays a scalar (#321), and a non-collection New-Object / cast is not an array.
+        for text in (
+            "$arrayCount = 3\n& pwsh -File tools\\x\\trace.ps1 -Dirs $arrayCount\n",
+            "$n = New-Object System.Text.StringBuilder\n& pwsh -File tools\\x\\trace.ps1 -Dirs $n\n",
+            "$n = New-Object -TypeName System.Text.StringBuilder\n& pwsh -File tools\\x\\trace.ps1 -Dirs $n\n",
+            "$n = New-Object System.Collections.Hashtable\n& pwsh -File tools\\x\\trace.ps1 -Dirs $n\n",
+            "$n = New-Object System.Collections.Generic.Dictionary[string,string]\n& pwsh -File tools\\x\\trace.ps1 -Dirs $n\n",
+            "$n = New-Object System.Collections.ArrayListFactory\n& pwsh -File tools\\x\\trace.ps1 -Dirs $n\n",
+            "$n = [System.Text.StringBuilder]::new()\n& pwsh -File tools\\x\\trace.ps1 -Dirs $n\n",
+            "[System.Text.StringBuilder]$n = $null\n& pwsh -File tools\\x\\trace.ps1 -Dirs $n\n",
+        ):
+            self.assertEqual([], self._flagged({**script, "tools/x/run.ps1": text}), text)
 
     def test_red_later_comma_list_is_not_masked_by_an_earlier_mention(self):
         two = "param(\n    [string[]]$Dirs,\n    [string[]]$Names\n)\n$Dirs | ForEach-Object { $_ }\n$Names | ForEach-Object { $_ }\n"
