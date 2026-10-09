@@ -13,7 +13,12 @@
 
     THE SAFE GATE - every probe has three outcomes; CANNOT-DETERMINE is never folded into pass:
       skipped  not-a-linked-worktree   WorkDir is the main checkout, or not a git worktree at all
-      kept     live-process            a process other than this one names the path on its command line
+      kept     live-process            a process other than this one HOLDS the path: it is on its command line, it is
+                                       the process current directory (or an ancestor of it), or a script it runs / loads
+                                       from its directory names it (2026-10-09, WORKTREE-REMOVED-UNDER-LIVE-CHAIN-1: a
+                                       measure chain named only its run dir; the worktree sat in a dot-sourced arms.ps1).
+                                       One `REFUSED ... pid=N` line per holder goes to stderr; the check is repeated on a
+                                       fresh scan right before anything is moved or deleted.
       kept     dirty                   `git status --porcelain -uall` is non-empty
       kept     unpushed                HEAD has commits not on any remote
       kept     unmerged                HEAD is on a remote but not an ancestor of -MergeTarget
@@ -56,6 +61,59 @@
 
 $script:SweepStampName = 'mlv-sweep-examined'
 $script:RetireDebrisPattern ='(^|/)(__pycache__|\.pytest_cache|\.hypothesis|build-release|build-debug|build-avx-parity|build-console)/$|\.pyc$'
+$script:HolderScriptExt = 'ps1|psm1|py|cmd|bat|js|mjs'
+$script:HolderMaxFilesPerProcess = 40
+$script:HolderMaxBytes = 524288
+$script:HolderMaxDepth = 3
+
+if (-not ('MlvProcCwd' -as [type])) {
+    # Current directory of another process: Win32_Process does not expose it. Reads PEB->ProcessParameters->CurrentDirectory
+    # of a 64-bit process the caller may open. Anything unreadable (other user, protected, 32-bit) returns null.
+    try {
+        Add-Type -ErrorAction Stop -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+public static class MlvProcCwd {
+    [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool CloseHandle(IntPtr h);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool IsWow64Process(IntPtr h, out bool wow);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool ReadProcessMemory(IntPtr h, IntPtr addr, byte[] buf, IntPtr size, out IntPtr read);
+    [DllImport("ntdll.dll")] static extern int NtQueryInformationProcess(IntPtr h, int cls, byte[] info, int len, out int retLen);
+    public static string Get(int pid) {
+        if (!Environment.Is64BitProcess || pid <= 4) return null;
+        IntPtr h = OpenProcess(0x0410, false, pid);
+        if (h == IntPtr.Zero) return null;
+        try {
+            bool wow;
+            if (!IsWow64Process(h, out wow) || wow) return null;
+            byte[] pbi = new byte[48]; int rl;
+            if (NtQueryInformationProcess(h, 0, pbi, 48, out rl) != 0) return null;
+            long peb = BitConverter.ToInt64(pbi, 8);
+            if (peb == 0) return null;
+            IntPtr rd; byte[] b8 = new byte[8];
+            if (!ReadProcessMemory(h, new IntPtr(peb + 0x20), b8, (IntPtr)8, out rd)) return null;
+            long pp = BitConverter.ToInt64(b8, 0);
+            if (pp == 0) return null;
+            byte[] us = new byte[16];
+            if (!ReadProcessMemory(h, new IntPtr(pp + 0x38), us, (IntPtr)16, out rd)) return null;
+            int len = BitConverter.ToUInt16(us, 0); long buf = BitConverter.ToInt64(us, 8);
+            if (len <= 0 || buf == 0) return null;
+            byte[] sb = new byte[len];
+            if (!ReadProcessMemory(h, new IntPtr(buf), sb, (IntPtr)len, out rd)) return null;
+            return Encoding.Unicode.GetString(sb);
+        } finally { CloseHandle(h); }
+    }
+}
+'@
+    } catch { }
+}
+
+function Get-ProcessCurrentDirectory {
+    param([int]$ProcessId)
+    if (-not ('MlvProcCwd' -as [type])) { return $null }
+    try { return [MlvProcCwd]::Get($ProcessId) } catch { return $null }
+}
 
 function Get-LaneProcessSnapshot {
     # ONE Win32_Process scan, then the self/ancestor chain is walked IN MEMORY from its ParentProcessId
@@ -80,6 +138,122 @@ function Get-LaneProcessSnapshot {
     }
 }
 
+function Get-ScriptCorpus {
+    # The text a live script process can load: the script on its command line plus, transitively (same directory,
+    # or an absolute path written in the text), the scripts it names. A chain whose command line names only its RUN
+    # DIR still reaches the worktree through a dot-sourced arms.ps1 (2026-10-09). Bounded by file count, size and depth.
+    param([string]$CommandLine, [hashtable]$FileCache)
+    $ext = $script:HolderScriptExt
+    $queue = New-Object System.Collections.Generic.Queue[object]
+    foreach ($m in [regex]::Matches($CommandLine, "(?i)`"([^`"]+\.(?:$ext))`"|([A-Za-z]:[\\/][^\s`"]+\.(?:$ext))")) {
+        $first = if ($m.Groups[1].Success) { $m.Groups[1].Value } else { $m.Groups[2].Value }
+        $queue.Enqueue(@($first, 0))
+    }
+    $seen = @{}
+    $out = New-Object System.Collections.Generic.List[object]
+    while ($queue.Count -gt 0 -and $out.Count -lt $script:HolderMaxFilesPerProcess) {
+        $item = $queue.Dequeue()
+        $full = $null; $text = $null
+        try {
+            $full = [IO.Path]::GetFullPath(([string]$item[0] -replace '/', '\'))
+            if ($seen.ContainsKey($full.ToLowerInvariant())) { continue }
+            $seen[$full.ToLowerInvariant()] = $true
+            if ($FileCache.ContainsKey($full.ToLowerInvariant())) { $text = $FileCache[$full.ToLowerInvariant()] }
+            else {
+                $fi = New-Object IO.FileInfo $full
+                $text = if ($fi.Exists -and $fi.Length -le $script:HolderMaxBytes) { [IO.File]::ReadAllText($full) } else { $null }
+                $FileCache[$full.ToLowerInvariant()] = $text
+            }
+        } catch { continue }
+        if ($null -eq $text) { continue }
+        $out.Add([pscustomobject]@{ File = $full; Text = $text })
+        if ([int]$item[1] -ge $script:HolderMaxDepth) { continue }
+        $dir = Split-Path -Parent $full
+        foreach ($m in [regex]::Matches($text, "(?i)[A-Za-z]:[\\/][^\s`"'<>|]+\.(?:$ext)\b|[\w.\-]+\.(?:$ext)\b")) {
+            $cand = if ($m.Value -match '^[A-Za-z]:') { $m.Value } else { Join-Path $dir $m.Value }
+            $queue.Enqueue(@($cand, ([int]$item[1] + 1)))
+        }
+    }
+    return $out.ToArray()
+}
+
+function Get-LaneHolderIndex {
+    # Per-snapshot cache: {Cwd: pid -> current directory, Scripts: [{ProcessId; File; Text}]}. Built once, on first use,
+    # so a sweep over N worktrees pays for the cwd reads and script reads once. A snapshot row may carry its own
+    # CurrentDirectory (tests, or a caller that already has it); otherwise it is read from the process.
+    param([object]$Snapshot)
+    $prop = $Snapshot.PSObject.Properties['HolderIndex']
+    if ($prop -and $null -ne $prop.Value) { return $prop.Value }
+    $cwd = @{}
+    $scripts = New-Object System.Collections.Generic.List[object]
+    $fileCache = @{}
+    $scriptRunner = '(?i)^(pwsh|powershell|python|pythonw|py|node|cmd|cscript|wscript)(\.exe)?$'
+    foreach ($proc in @($Snapshot.Procs)) {
+        $procId = [int]$proc.ProcessId
+        $own = $proc.PSObject.Properties['CurrentDirectory']
+        $c = if ($own) { [string]$own.Value } else { Get-ProcessCurrentDirectory -ProcessId $procId }
+        if ($c) { $cwd[$procId] = (($c -replace '/', '\').TrimEnd('\')) }
+        if ([string]$proc.Name -match $scriptRunner) {
+            foreach ($f in @(Get-ScriptCorpus -CommandLine ([string]$proc.CommandLine) -FileCache $fileCache)) {
+                $scripts.Add([pscustomobject]@{ ProcessId = $procId; File = $f.File; Text = $f.Text })
+            }
+        }
+    }
+    $byPid = @{}
+    foreach ($s in $scripts) {
+        if (-not $byPid.ContainsKey($s.ProcessId)) { $byPid[$s.ProcessId] = New-Object System.Collections.Generic.List[object] }
+        $byPid[$s.ProcessId].Add($s)
+    }
+    $idx = [pscustomobject]@{ Cwd = $cwd; Scripts = $scripts.ToArray(); ScriptsByPid = $byPid }
+    $Snapshot | Add-Member -NotePropertyName HolderIndex -NotePropertyValue $idx -Force
+    return $idx
+}
+
+function Find-WorktreeHolders {
+    # Live processes (other than the caller's own chain) that HOLD the worktree, by any of:
+    #   cmdline  the path is on the process command line (either slash spelling, case-insensitive)
+    #   cwd      the process current directory is the worktree or inside it
+    #   script   a script the process runs, or one it loads from its directory, names the path
+    # Returns one row per pid {ProcessId; Name; Via}. Unreadable cwd / script is not a hit (system and other-user
+    # processes cannot be opened); the three probes together are what a command-line-only check missed.
+    param([string]$WorktreePath, [object]$Snapshot)
+    $wd = $WorktreePath.TrimEnd('\')
+    $slash = $wd -replace '\\', '/'
+    $self = @($Snapshot.SelfPids)
+    $procs = @($Snapshot.Procs | Where-Object { $_.CommandLine -and $self -notcontains $_.ProcessId })
+    $idx = Get-LaneHolderIndex -Snapshot $Snapshot
+    $names = @($wd, $slash, ($wd -replace '\\', '\\')) | ForEach-Object { [regex]::Escape($_) + '(?![A-Za-z0-9_.\-])' }
+    $rows = New-Object System.Collections.Generic.List[object]
+    foreach ($p in $procs) {
+        $procId = [int]$p.ProcessId
+        $via = $null
+        if ($p.CommandLine.IndexOf($wd, [StringComparison]::OrdinalIgnoreCase) -ge 0 -or $p.CommandLine.IndexOf($slash, [StringComparison]::OrdinalIgnoreCase) -ge 0) { $via = 'cmdline' }
+        if (-not $via -and $idx.Cwd.ContainsKey($procId)) {
+            $c = [string]$idx.Cwd[$procId]
+            if ($c -ieq $wd -or $c.StartsWith($wd + '\', [StringComparison]::OrdinalIgnoreCase)) { $via = 'cwd' }
+        }
+        if (-not $via) {
+            $mine = if ($idx.ScriptsByPid.ContainsKey($procId)) { $idx.ScriptsByPid[$procId] } else { @() }
+            foreach ($s in $mine) {
+                foreach ($rx in $names) {
+                    if ([regex]::IsMatch($s.Text, $rx, [Text.RegularExpressions.RegexOptions]::IgnoreCase)) { $via = 'script:' + (Split-Path -Leaf $s.File); break }
+                }
+                if ($via) { break }
+            }
+        }
+        if ($via) { $rows.Add([pscustomobject]@{ ProcessId = $procId; Name = [string]$p.Name; Via = $via }) }
+    }
+    return $rows.ToArray()
+}
+
+function Write-RefusedHolders {
+    # One REFUSED line per holder pid, on stderr (stdout carries the caller's pipeline objects).
+    param([string]$WorktreePath, [object[]]$Holders)
+    foreach ($h in $Holders) {
+        try { [Console]::Error.WriteLine("REFUSED worktree-removal path=$WorktreePath pid=$($h.ProcessId) name=$($h.Name) via=$($h.Via) utc=$((Get-Date).ToUniversalTime().ToString('o'))") } catch { }
+    }
+}
+
 function Invoke-RetireLaneWorktree {
     [CmdletBinding()]
     param(
@@ -95,7 +269,7 @@ function Invoke-RetireLaneWorktree {
     )
     $d = [ordered]@{
         schema = 'mlv-app/lane-worktree-disposition/v1'; workDir = $WorkDir; action = 'kept'; reason = $null
-        head = $null; branch = $null; quarantined = @(); utc = (Get-Date).ToUniversalTime().ToString('o')
+        head = $null; branch = $null; quarantined = @(); holders = @(); utc = (Get-Date).ToUniversalTime().ToString('o')
     }
     function Run-Git([string]$C, [string[]]$A) {
         $o = & git.exe -C $C @A 2>&1
@@ -121,11 +295,13 @@ function Invoke-RetireLaneWorktree {
         }
 
         $snap = if ($null -ne $ProcessSnapshot) { $ProcessSnapshot } else { Get-LaneProcessSnapshot }
-        $self = @($snap.SelfPids)
-        $procs = @($snap.Procs | Where-Object { $_.CommandLine -and $self -notcontains $_.ProcessId })
-        $slash = $wd -replace '\\', '/'
-        $live = @($procs | Where-Object { $_.CommandLine.IndexOf($wd, [StringComparison]::OrdinalIgnoreCase) -ge 0 -or $_.CommandLine.IndexOf($slash, [StringComparison]::OrdinalIgnoreCase) -ge 0 })
-        if ($live.Count) { $d.reason = 'live-process: ' + (($live | ForEach-Object { "$($_.ProcessId) $($_.Name)" }) -join ', '); return [pscustomobject]$d }
+        $live = @(Find-WorktreeHolders -WorktreePath $wd -Snapshot $snap)
+        if ($live.Count) {
+            $d.holders = @($live | ForEach-Object { "$($_.ProcessId) $($_.Name) $($_.Via)" })
+            Write-RefusedHolders -WorktreePath $wd -Holders $live
+            $d.reason = 'live-process: ' + (($live | ForEach-Object { "$($_.ProcessId) $($_.Name) [$($_.Via)]" }) -join ', ')
+            return [pscustomobject]$d
+        }
 
         $s = Run-Git $wd @('status', '--porcelain', '-uall'); if ($s.code) { $d.reason = 'cannot-determine: status'; return [pscustomobject]$d }
         $dirty = @($s.out | Where-Object { $_ })
@@ -148,6 +324,18 @@ function Invoke-RetireLaneWorktree {
         $keep = @($ign.out | Where-Object { $_ -like '!!*' } | ForEach-Object { $_.Substring(3) } | Where-Object { $_ -notmatch $script:RetireDebrisPattern })
         if ($keep.Count -and -not $QuarantineRoot) { $d.reason = "cannot-determine: $($keep.Count) ignored non-debris entr(y/ies) and no -QuarantineRoot"; return [pscustomobject]$d }
         if ($WhatIf) { $d.action = 'would-retire'; $d.reason = 'ok'; $d.quarantined = $keep; return [pscustomobject]$d }
+
+        # Last look before anything is moved or deleted, on a FRESH scan: the gate above took seconds (a sweep reuses a
+        # snapshot up to 30 s old), and a holder that started since is not in it. A failed scan is not an all-clear.
+        $fresh = try { Get-LaneProcessSnapshot } catch { $null }
+        if ($null -eq $fresh) { $d.reason = 'cannot-determine: process rescan before removal'; return [pscustomobject]$d }
+        $live = @(Find-WorktreeHolders -WorktreePath $wd -Snapshot $fresh)
+        if ($live.Count) {
+            $d.holders = @($live | ForEach-Object { "$($_.ProcessId) $($_.Name) $($_.Via)" })
+            Write-RefusedHolders -WorktreePath $wd -Holders $live
+            $d.reason = 'live-process: ' + (($live | ForEach-Object { "$($_.ProcessId) $($_.Name) [$($_.Via)]" }) -join ', ')
+            return [pscustomobject]$d
+        }
 
         # <leaf>-<utc stamp>: two same-named worktrees retired the same day must not nest into each other.
         $qDir = Join-Path $QuarantineRoot ('{0}-{1}' -f (Split-Path $wd -Leaf), (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssfffZ'))

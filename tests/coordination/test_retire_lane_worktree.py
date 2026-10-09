@@ -448,3 +448,153 @@ def test_process_snapshot_self_pids_are_excluded_from_the_live_check(repo):
     snap = ("[pscustomobject]@{ Procs = @([pscustomobject]@{ ProcessId = 999996; Name = 'pwsh.exe'; "
             f"CommandLine = 'pwsh {wt}' }}); SelfPids = @(999996) }}")
     assert _gate_with_snapshot(wt, snap)["action"] == "would-retire"
+
+
+# --- WORKTREE-REMOVED-UNDER-LIVE-CHAIN-1: a live HOLDER that never names the path on its command line ---
+# 2026-10-09 00:19:54Z the lane-exit sweep retired C:\mlvtmp\lane-PLAYBACK-GL-PRESENT-BACKLOG-1-20261008 under a live
+# measure chain. The chain's command lines named its RUN DIR; the worktree was named only inside a dot-sourced
+# arms.ps1 ($script:Wt) and on the command line of a probe child that exists for ~40 s of every wait loop.
+# The gate must also refuse on (a) a process whose CURRENT DIRECTORY is the worktree, (b) a live script process
+# whose own script or a sibling script it dot-sources / calls by name (transitively) names the worktree path.
+
+def _spawn(args, cwd):
+    return subprocess.Popen([PWSH, "-NoProfile", "-NonInteractive", *args], cwd=str(cwd),
+                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def _stop(p):
+    p.kill()
+    p.wait(timeout=30)
+
+
+def _gate_real(workdir, *, whatif=True):
+    """Gate with the REAL process snapshot. Returns (disposition, stderr)."""
+    quarantine = Path(workdir).parent / "q"
+    script = (
+        "$ErrorActionPreference='Stop'; Set-StrictMode -Version Latest; "
+        f". '{HELPER}'; "
+        f"Invoke-RetireLaneWorktree -WorkDir '{workdir}' -MergeTarget 'origin/master' -QuarantineRoot '{quarantine}'"
+        f"{' -WhatIf' if whatif else ''} | ConvertTo-Json -Depth 4"
+    )
+    r = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", script],
+                       check=True, capture_output=True, text=True)
+    return json.loads(r.stdout), r.stderr
+
+
+def test_process_whose_cwd_is_the_worktree_keeps_it_and_the_refusal_names_the_pid(repo):
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-cwd")
+    p = _spawn(["-Command", "Start-Sleep -Seconds 120"], cwd=wt)   # command line does NOT name the worktree
+    try:
+        d, err = _gate_real(wt)
+    finally:
+        _stop(p)
+    assert d["action"] == "kept" and d["reason"].startswith(f"live-process: {p.pid} "), d
+    assert "cwd" in d["reason"], d
+    assert "REFUSED" in err and f"pid={p.pid}" in err, err
+    assert wt.exists()
+
+
+def test_process_whose_cwd_is_inside_the_worktree_keeps_it(repo):
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-cwd-sub")
+    sub = wt / "deep" / "er"
+    sub.mkdir(parents=True)
+    p = _spawn(["-Command", "Start-Sleep -Seconds 120"], cwd=sub)
+    try:
+        d, _ = _gate_real(wt)
+    finally:
+        _stop(p)
+    assert d["action"] == "kept" and d["reason"].startswith(f"live-process: {p.pid} "), d
+
+
+def _chain_scripts(tmp, wt_text):
+    """chain.ps1 -> quiet.ps1 -> arms.ps1 (the incident's shape); only arms.ps1 names the worktree."""
+    sd = tmp / "chain-run" / "tools"
+    sd.mkdir(parents=True)
+    (sd / "arms.ps1").write_text(f"$script:Wt = '{wt_text}'\n", encoding="utf-8")
+    (sd / "quiet.ps1").write_text('. "$PSScriptRoot\\arms.ps1"\nStart-Sleep -Seconds 120\n', encoding="utf-8")
+    (sd / "chain.ps1").write_text('& "$PSScriptRoot\\quiet.ps1"\n', encoding="utf-8")
+    return sd
+
+
+def test_live_script_whose_dot_sourced_sibling_names_the_worktree_keeps_it(repo):
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-script")
+    sd = _chain_scripts(tmp, str(wt))
+    p = _spawn(["-File", str(sd / "chain.ps1")], cwd=tmp)           # cwd elsewhere; command line names the RUN DIR only
+    try:
+        d, err = _gate_real(wt)
+    finally:
+        _stop(p)
+    assert d["action"] == "kept" and d["reason"].startswith(f"live-process: {p.pid} "), d
+    assert "script" in d["reason"] and "arms.ps1" in d["reason"], d
+    assert f"pid={p.pid}" in err, err
+    assert wt.exists()
+
+
+def test_live_script_naming_the_worktree_with_forward_slashes_keeps_it(repo):
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-script-slash")
+    sd = _chain_scripts(tmp, str(wt).replace("\\", "/"))
+    p = _spawn(["-File", str(sd / "chain.ps1")], cwd=tmp)
+    try:
+        d, _ = _gate_real(wt)
+    finally:
+        _stop(p)
+    assert d["action"] == "kept" and d["reason"].startswith(f"live-process: {p.pid} "), d
+
+
+def test_live_script_that_does_not_name_the_worktree_does_not_block_retirement(repo):
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-script-other")
+    sd = _chain_scripts(tmp, str(tmp / "some-other-place"))
+    p = _spawn(["-File", str(sd / "chain.ps1")], cwd=tmp)
+    try:
+        d, err = _gate_real(wt)
+    finally:
+        _stop(p)
+    assert (d["action"], d["reason"]) == ("would-retire", "ok"), d
+    assert "REFUSED" not in err, err
+
+
+def test_snapshot_cwd_inside_the_worktree_counts_but_a_sibling_with_the_same_prefix_does_not(repo):
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-cwdsnap")
+    inside = ("[pscustomobject]@{ Procs = @([pscustomobject]@{ ProcessId = 999995; Name = 'shell.exe'; "
+              f"CommandLine = 'shell.exe'; CurrentDirectory = '{wt}\\sub' }}); SelfPids = @($PID) }}")
+    d = _gate_with_snapshot(wt, inside)
+    assert d["action"] == "kept" and d["reason"].startswith("live-process: 999995 shell.exe"), d
+    sibling = ("[pscustomobject]@{ Procs = @([pscustomobject]@{ ProcessId = 999994; Name = 'shell.exe'; "
+               f"CommandLine = 'shell.exe'; CurrentDirectory = '{wt}2' }}); SelfPids = @($PID) }}")
+    assert _gate_with_snapshot(wt, sibling)["action"] == "would-retire"
+
+
+def test_holder_exit_releases_the_worktree_for_real_retirement(repo):
+    """End to end, not WhatIf: refused while the holder lives, retired once it is gone."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-release")
+    p = _spawn(["-Command", "Start-Sleep -Seconds 120"], cwd=wt)
+    try:
+        d, _ = _gate_real(wt, whatif=False)
+        assert d["action"] == "kept" and d["reason"].startswith(f"live-process: {p.pid} "), d
+        assert wt.exists()
+    finally:
+        _stop(p)
+    d, _ = _gate_real(wt, whatif=False)
+    assert (d["action"], d["reason"]) == ("retired", "ok"), d
+    assert not wt.exists()
+
+
+def test_sweep_keeps_a_worktree_held_only_by_a_process_cwd(repo):
+    tmp, main = repo
+    root = tmp / "lanes"
+    held = _add_wt(main, root / "lane-held")
+    free = _add_wt(main, root / "lane-free")
+    p = _spawn(["-Command", "Start-Sleep -Seconds 120"], cwd=held)
+    try:
+        s = _sweep(main, Root=str(root), MergeTarget="origin/master", MinIdleHours=0, QuarantineRoot=str(tmp / "q"))
+    finally:
+        _stop(p)
+    assert _swept_paths(s) == [_norm(free)] and s["kept"] == {"live-process": 1}, s
+    assert held.exists() and not free.exists()
