@@ -1265,6 +1265,58 @@ def test_codex_launch_stays_direct_without_claude_flags(fixture_tree):
     assert (fixture_tree["root"]/"bgtasks.txt").read_text(encoding="utf-8-sig").strip()==""
 
 
+# CODEX-READONLY-SANDBOX-UNELEVATED-1 (HUB RULING 2026-10-09T00:20:00Z): on Windows the
+# elevated sandbox setup fails ("setup refresh had errors", os error 32 on an in-use
+# node_repl.exe), so a read-only codex lane could run no shell command at all. The launcher
+# passes -c windows.sandbox="unelevated" per call for read-only lanes only. The fake shim's
+# cmd.exe -> pwsh -File hop may strip the inner quotes, so both spellings are accepted (the
+# same tolerance the effort assertion above already uses).
+_UNELEVATED_ARG_FORMS = ('windows.sandbox="unelevated"', 'windows.sandbox=unelevated')
+
+
+def _windows_sandbox_overrides(argv):
+    return [argv[i+1] for i,a in enumerate(argv[:-1]) if a=="-c" and argv[i+1].startswith("windows.sandbox")]
+
+
+def test_codex_read_only_lane_runs_unelevated_windows_sandbox(fixture_tree):
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="sol")
+    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    assert r.returncode==0,(r.stdout,r.stderr)
+    argv=json.loads((fixture_tree["root"]/"args.json").read_text(encoding="utf-8-sig"))
+    assert argv[argv.index("-s")+1]=="read-only"
+    overrides=_windows_sandbox_overrides(argv)
+    assert len(overrides)==1 and overrides[0] in _UNELEVATED_ARG_FORMS, argv
+    # '-' (prompt on stdin) must stay the LAST argument; see the comment beside $argv.
+    assert argv[-1]=="-", argv
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert q["authority"]["sandbox"]=="read-only"
+    assert q["authority"]["windowsSandbox"]=="unelevated"
+
+
+def test_codex_workspace_write_lane_keeps_default_windows_sandbox(fixture_tree):
+    # A codex+-AllowEdits launch is refused in production before argv is built, so (exactly as
+    # test_codex_editing_lane_with_denied_tool_in_allowlist_... above) only that throw is
+    # neutralised, to prove the unelevated override is keyed on read-only, not on engine alone.
+    def bypass_codex_never_edits(text):
+        old = ("if ($AllowEdits -and $LANES[$Lane].engine -eq 'codex') {\n"
+               "    throw \"codex-lane-never-edits: -Lane $Lane with -AllowEdits "
+               "(no Claude hook is visible to codex exec)\"\n"
+               "}")
+        assert text.count(old) == 1
+        return text.replace(old, "# fixture: codex-never-edits neutralised for this test only")
+    cmd,env,receipt=prepare(fixture_tree,"normal",editing=True,allowed_tools="Read,Write",
+                             lane="sol",mutation=bypass_codex_never_edits)
+    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    assert r.returncode==0,(r.stdout,r.stderr)
+    argv=json.loads((fixture_tree["root"]/"args.json").read_text(encoding="utf-8-sig"))
+    assert argv[argv.index("-s")+1]=="workspace-write"
+    assert _windows_sandbox_overrides(argv)==[], argv
+    assert argv[-1]=="-", argv
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert q["authority"]["sandbox"]=="workspace-write"
+    assert q["authority"]["windowsSandbox"]=="default"
+
+
 def test_startup_consumes_same_deadline_without_starting_provider(fixture_tree):
     def delay(text):
         return text.replace("$line=[Console]::In.ReadLine(); if([string]::IsNullOrWhiteSpace($line)){throw 'launch-frame-missing'}", "Start-Sleep -Seconds 8\n$line=[Console]::In.ReadLine(); if([string]::IsNullOrWhiteSpace($line)){throw 'launch-frame-missing'}")
