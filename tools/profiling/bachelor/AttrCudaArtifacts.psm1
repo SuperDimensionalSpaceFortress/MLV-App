@@ -5274,6 +5274,78 @@ function Invoke-AttrCudaInputDesktopNudge {
     }
 }
 
+function Get-AttrCudaSessionLocked {
+    <#
+    .SYNOPSIS
+    Whether the CALLING process's Windows session is locked: $true (locked), $false (unlocked), or
+    $null when that could not be read. Read-only and non-throwing, like every other probe here.
+    .DESCRIPTION
+    VENUE-SESSION-LOCKED-REFUSAL-1. A locked console is an owner-only boundary, and the desktop-name
+    gate in InputDesktopNudge.Run cannot see it: while the lock curtain or Modern Standby is
+    showing, the input desktop still reads "Default". Measured on Bachelor 2026-10-09 (probe
+    vkad-probe-r1-20261009T110317Z, run lane-VENUE-KEEPALIVE-ACCESS-DENIED-1-r1-20261009T1045Z):
+    the session stayed locked after a Windows Update reboot, the keep-alive's VK_F15 tap raised the
+    sign-in screen, and OpenInputDesktop then failed with ERROR_ACCESS_DENIED for about 32 s.
+    Reads this process's own session (ProcessIdToSessionId), then
+    WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, sid, WTSSessionInfoEx = 25). The buffer is
+    a WTSINFOEXW: DWORD Level at offset 0, then the WTSINFOEX_LEVEL1_W union, 8-aligned, so
+    SessionId is at 8 and SessionFlags at 16. SessionFlags 0 = WTS_SESSIONSTATE_LOCK and
+    1 = WTS_SESSIONSTATE_UNLOCK; anything else (WTS_SESSIONSTATE_UNKNOWN is 0xFFFFFFFF) is unknown.
+    The layout is checked (Level == 1 and SessionId == the session asked for), and a mismatch is
+    unknown, never unlocked. Measured: Bachelor locked reads level=1 flags=0; VIRTUAL-TEN unlocked
+    reads level=1 flags=1. Callers treat $null exactly like $true (fail closed): only a CONFIRMED
+    $false may ever reach SendInput.
+    #>
+    [CmdletBinding()]
+    param()
+    try {
+        if (-not ("MLVAppAttrCudaSessionLock.NativeMethods" -as [type])) {
+            # Indented so NO line of this embedded C# starts with an unindented '}' -- see
+            # Register-AttrCudaDisplayWakeNativeMethods for why that matters to the extraction.
+            Add-Type -TypeDefinition @'
+    using System;
+    using System.Runtime.InteropServices;
+
+    namespace MLVAppAttrCudaSessionLock
+    {
+        public static class NativeMethods
+        {
+            [DllImport("kernel32.dll", SetLastError = true)]
+            public static extern bool ProcessIdToSessionId(uint dwProcessId, out uint pSessionId);
+
+            [DllImport("wtsapi32.dll", SetLastError = true)]
+            public static extern bool WTSQuerySessionInformationW(IntPtr hServer, uint sessionId, int wtsInfoClass, out IntPtr ppBuffer, out uint pBytesReturned);
+
+            [DllImport("wtsapi32.dll")]
+            public static extern void WTSFreeMemory(IntPtr pMemory);
+        }
+    }
+'@ -ErrorAction Stop
+        }
+        $sessionId = [uint32]0
+        if (-not [MLVAppAttrCudaSessionLock.NativeMethods]::ProcessIdToSessionId([uint32]$PID, [ref]$sessionId)) { return $null }
+        $buffer = [IntPtr]::Zero
+        $bytes = [uint32]0
+        # WTS_CURRENT_SERVER_HANDLE = 0; WTSSessionInfoEx = 25.
+        if (-not [MLVAppAttrCudaSessionLock.NativeMethods]::WTSQuerySessionInformationW([IntPtr]::Zero, $sessionId, 25, [ref]$buffer, [ref]$bytes)) { return $null }
+        if ($buffer -eq [IntPtr]::Zero) { return $null }
+        try {
+            if ($bytes -lt 20) { return $null }
+            $level = [System.Runtime.InteropServices.Marshal]::ReadInt32($buffer, 0)
+            $reportedSessionId = [System.Runtime.InteropServices.Marshal]::ReadInt32($buffer, 8)
+            $sessionFlags = [System.Runtime.InteropServices.Marshal]::ReadInt32($buffer, 16)
+            if ($level -ne 1 -or [int64]$reportedSessionId -ne [int64]$sessionId) { return $null }
+            if ($sessionFlags -eq 0) { return $true }
+            if ($sessionFlags -eq 1) { return $false }
+            return $null
+        } finally {
+            [MLVAppAttrCudaSessionLock.NativeMethods]::WTSFreeMemory($buffer)
+        }
+    } catch {
+        return $null
+    }
+}
+
 function Start-AttrCudaDisplayWake {
     <#
     .SYNOPSIS
@@ -5329,10 +5401,25 @@ function Start-AttrCudaDisplayWake {
     read-only) and .screensaverActive (SPI_GETSCREENSAVEACTIVE, read-only) -- CUDA-PERF-DISPLAY-
     WAKE-2, so a run that still ends DISPLAY_ASLEEP shows what timeout it was racing -- and .utc.
     Never calls an SPI_SET* action and never changes a screen-saver or power setting.
+    VENUE-SESSION-LOCKED-REFUSAL-1 >>>
+    VENUE-SESSION-LOCKED-REFUSAL-1: .sessionLocked (Get-AttrCudaSessionLocked, read FIRST, before
+    anything else here: $true/$false/$null). Anything but a CONFIRMED $false is a locked console
+    (unknown fails closed): no input of any kind is sent on either nudge path, .sendInputError
+    carries ATTRCUDA_SESSION_LOCKED_OWNER_ONLY, .dismissFailed stays $false, and the caller stops
+    the leg with a typed SESSION_LOCKED_OWNER_ONLY result. Signing in is an owner action. An
+    unlocked session behaves exactly as before; the only difference is the added .sessionLocked.
+    VENUE-SESSION-LOCKED-REFUSAL-1 <<<
     #>
     [CmdletBinding()]
     param()
 
+    # VENUE-SESSION-LOCKED-REFUSAL-1 >>>
+    # The lock read comes before every other read and every input. A missing or throwing probe
+    # reads as unknown, which is refused like a lock.
+    $sessionLocked = $null
+    try { $sessionLocked = Get-AttrCudaSessionLocked } catch { $sessionLocked = $null }
+    $sessionLockedOwnerOnly = ($sessionLocked -ne $false)
+    # VENUE-SESSION-LOCKED-REFUSAL-1 <<<
     $screensaverTimeoutSeconds = Get-AttrCudaScreensaverTimeoutSeconds
     $screensaverActive = Get-AttrCudaScreensaverActive
     $screensaverBefore = Get-AttrCudaScreensaverRunning
@@ -5367,6 +5454,18 @@ function Start-AttrCudaDisplayWake {
     $inputDesktopNudge = $null
     $nativeAvailable = Register-AttrCudaDisplayWakeNativeMethods
 
+    # VENUE-SESSION-LOCKED-REFUSAL-1 >>>
+    # A locked (or unprovably-unlocked) console: no input of any kind. A key or mouse event raises
+    # the sign-in screen, and the secure desktop then takes the input desktop. The unchanged
+    # screen-saver branches below run only for a CONFIRMED unlocked session.
+    if ($sessionLockedOwnerOnly) {
+        $sendInputError = if ($null -eq $sessionLocked) {
+            'ATTRCUDA_SESSION_LOCKED_OWNER_ONLY whether this session is locked could not be read; treated as locked -- no input sent -- signing in is an owner action'
+        } else {
+            'ATTRCUDA_SESSION_LOCKED_OWNER_ONLY this session is locked; no input sent -- signing in is an owner action'
+        }
+    } else {
+    # VENUE-SESSION-LOCKED-REFUSAL-1 <<<
     if ($screensaverSecureOwnerOnly) {
         # A password-protected (or unprovably-not-password-protected) screen saver is a security
         # boundary: no dismiss attempt of any kind is made, on either path below. The caller (the
@@ -5402,6 +5501,9 @@ function Start-AttrCudaDisplayWake {
     } else {
         $sendInputError = 'ATTRCUDA_DISPLAY_WAKE_NATIVE_UNAVAILABLE native P/Invoke type could not be loaded'
     }
+    # VENUE-SESSION-LOCKED-REFUSAL-1 >>>
+    }
+    # VENUE-SESSION-LOCKED-REFUSAL-1 <<<
 
     if ($nativeAvailable) {
         try {
@@ -5426,6 +5528,9 @@ function Start-AttrCudaDisplayWake {
     # secure/unknown gate already stopped short, a single immediate read is unchanged -- there is
     # nothing to wait on either way.
     $dismissAttempted = (-not $screensaverSecureOwnerOnly) -and ($screensaverBefore -eq $true)
+    # VENUE-SESSION-LOCKED-REFUSAL-1 >>>
+    if ($sessionLockedOwnerOnly) { $dismissAttempted = $false }
+    # VENUE-SESSION-LOCKED-REFUSAL-1 <<<
     $dismissWait = $null
     if ($dismissAttempted) {
         $dismissWait = Wait-AttrCudaScreensaverDismissed
@@ -5453,10 +5558,19 @@ function Start-AttrCudaDisplayWake {
     # a quiet success. Never set when no dismiss was attempted at all ($screensaverBefore -eq $false,
     # or the secure/unknown owner-only gate already stopped the leg with its own typed refusal).
     $dismissFailed = (-not $screensaverSecureOwnerOnly) -and ($screensaverBefore -eq $true) -and ($screensaverAfter -ne $false)
+    # VENUE-SESSION-LOCKED-REFUSAL-1 >>>
+    if ($sessionLockedOwnerOnly) {
+        $method = "SessionLockedNoInputAttempted(sessionLocked=$(if ($null -eq $sessionLocked) { 'unknown' } else { 'true' }))+SetThreadExecutionState(ES_SYSTEM_REQUIRED|ES_DISPLAY_REQUIRED)"
+        $dismissFailed = $false
+    }
+    # VENUE-SESSION-LOCKED-REFUSAL-1 <<<
 
     [ordered]@{
         attempted = $true
         method = $method
+        # VENUE-SESSION-LOCKED-REFUSAL-1 >>>
+        sessionLocked = $sessionLocked
+        # VENUE-SESSION-LOCKED-REFUSAL-1 <<<
         screensaverRunningBefore = $screensaverBefore
         screensaverRunningAfter = $screensaverAfter
         screensaverSecure = $screensaverSecure
@@ -5567,6 +5681,11 @@ function Start-AttrCudaDisplayWakeKeepAlive {
     back on the MOST RECENT tick that actually reached InputDesktopNudge.Run (attempted or
     refused alike) -- $null before the first such tick, unchanged by a tick that never reached
     InputDesktopNudge.Run at all (the owner-only gate above tripping).
+    VENUE-SESSION-LOCKED-REFUSAL-1 >>>
+    VENUE-SESSION-LOCKED-REFUSAL-1: every tick reads Get-AttrCudaSessionLocked FIRST (bounded, like
+    the probes above). Anything but a CONFIRMED $false is a typed failure with no injection:
+    ATTRCUDA_KEEPALIVE_BLOCKED reason=session_locked, or reason=session_lock_unknown.
+    VENUE-SESSION-LOCKED-REFUSAL-1 <<<
     .setupError is $null when the background pipeline started; non-$null means either
     CreateRunspace/Open/BeginInvoke itself failed (recorded, never thrown -- CUDA-PERF-
     DISPLAY-WAKE-3 round 1 hardening) or the native P/Invoke type could not be loaded at all
@@ -5645,6 +5764,13 @@ function Start-AttrCudaDisplayWakeKeepAlive {
                 # InitialSessionState the same way -- so a probe (or a test's override of one) that
                 # never returns cannot block this tick, or Stop-AttrCudaDisplayWakeKeepAlive's own
                 # EndInvoke wait, indefinitely; see that function's own header.
+                # VENUE-SESSION-LOCKED-REFUSAL-1 >>>
+                # The session lock is re-read FIRST, every tick, also bounded. A console locked
+                # mid-leg (or one whose lock state cannot be read) gets no injection: the desktop-name
+                # gate inside InputDesktopNudge.Run cannot see a lock, because a locked console's
+                # input desktop still reads "Default".
+                $tickSessionLocked = Invoke-AttrCudaBoundedProbe -FunctionName 'Get-AttrCudaSessionLocked' -TimeoutMilliseconds $ProbeTimeoutMilliseconds
+                # VENUE-SESSION-LOCKED-REFUSAL-1 <<<
                 $tickRunning = Invoke-AttrCudaBoundedProbe -FunctionName 'Get-AttrCudaScreensaverRunning' -TimeoutMilliseconds $ProbeTimeoutMilliseconds
                 $tickSecure = Invoke-AttrCudaBoundedProbe -FunctionName 'Get-AttrCudaScreensaverSecure' -TimeoutMilliseconds $ProbeTimeoutMilliseconds
                 $tickSecureOwnerOnly = if ($tickRunning -eq $false) {
@@ -5654,6 +5780,18 @@ function Start-AttrCudaDisplayWakeKeepAlive {
                 } else {
                     $true
                 }
+                # VENUE-SESSION-LOCKED-REFUSAL-1 >>>
+                # Recorded as a typed failure like the screen-saver block below, so the job's next
+                # keep-alive checkpoint stops the leg. The unchanged branches below run only for a
+                # CONFIRMED unlocked session.
+                if ($tickSessionLocked -ne $false) {
+                    $NudgeState.count = [int]$NudgeState.count + 1
+                    $NudgeState.failureCount = [int]$NudgeState.failureCount + 1
+                    $sessionBlockedReason = if ($null -eq $tickSessionLocked) { 'session_lock_unknown' } else { 'session_locked' }
+                    $NudgeState.lastError = "ATTRCUDA_KEEPALIVE_BLOCKED reason=$sessionBlockedReason no injection attempted (a locked console is owner-only; signing in is an owner action)"
+                    $NudgeState.lastFailureUtc = (Get-Date).ToUniversalTime().ToString('o')
+                } else {
+                # VENUE-SESSION-LOCKED-REFUSAL-1 <<<
                 if ($tickSecureOwnerOnly) {
                     # No injection of any kind: ending a password-protected (or unprovably-not-
                     # password-protected) screen saver is an owner action, never an automated one --
@@ -5728,6 +5866,9 @@ function Start-AttrCudaDisplayWakeKeepAlive {
                         $NudgeState.successCount = [int]$NudgeState.successCount + 1
                     }
                 }
+                # VENUE-SESSION-LOCKED-REFUSAL-1 >>>
+                }
+                # VENUE-SESSION-LOCKED-REFUSAL-1 <<<
             } catch {
                 # Non-throwing by construction: a single nudge failure must never stop the loop or
                 # escape to the caller -- the next tick simply tries again. Still counted as a
@@ -5772,6 +5913,12 @@ function Start-AttrCudaDisplayWakeKeepAlive {
                 [System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new(
                     $tickProbeFunctionName, $tickProbeCommand.Definition))
         }
+        # VENUE-SESSION-LOCKED-REFUSAL-1 >>>
+        # The per-tick lock read, added the same late-binding-by-name way as the probes above.
+        $initialSessionState.Commands.Add(
+            [System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new(
+                'Get-AttrCudaSessionLocked', (Get-Command -Name 'Get-AttrCudaSessionLocked' -CommandType Function).Definition))
+        # VENUE-SESSION-LOCKED-REFUSAL-1 <<<
         $runspace = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace($initialSessionState)
         $runspace.Open()
         $shell = [System.Management.Automation.PowerShell]::Create()
@@ -6399,6 +6546,7 @@ Export-ModuleMember -Function `
     Invoke-AttrCudaBoundedProbe, `
     Wait-AttrCudaScreensaverDismissed, `
     Invoke-AttrCudaInputDesktopNudge, `
+    Get-AttrCudaSessionLocked, `
     Start-AttrCudaDisplayWake, `
     Stop-AttrCudaDisplayWake, `
     Start-AttrCudaDisplayWakeKeepAlive, `

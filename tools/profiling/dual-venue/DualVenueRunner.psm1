@@ -1460,13 +1460,22 @@ function Get-DvHealthVerdict {
     <#
     .SYNOPSIS
     Judge a health probe against a venue's thresholds. A missing or unparsable measurement is UNHEALTHY --
-    unknown is never healthy.
+    unknown is never healthy. VENUE-SESSION-LOCKED-REFUSAL-1: a console session that is locked, or whose lock state
+    is unknown (sessionLocked absent, null, or anything but a JSON false), is UNHEALTHY with .detail SESSION_LOCKED,
+    so the leg is never submitted. Signing in is an owner action, so a retry cannot clear it.
     #>
     param($Probe, $Thresholds)
     $reasons = [System.Collections.Generic.List[string]]::new()
+    $detail = $null
     if ($null -eq $Probe) {
         $reasons.Add('health probe returned no measurements')
     } else {
+        $locked = $Probe.PSObject.Properties['sessionLocked']
+        if ($null -eq $locked -or -not ($locked.Value -is [bool]) -or $locked.Value) {
+            $detail = 'SESSION_LOCKED'
+            $state = $(if ($null -ne $locked -and $locked.Value -is [bool]) { 'locked' } else { 'unknown' })
+            $reasons.Add("SESSION_LOCKED: the venue console session is $state (owner-only: signing in is an owner action)")
+        }
         $cold = $Probe.PSObject.Properties['pwshColdStartMs']; $hash = $Probe.PSObject.Properties['smallHashMs']
         $disk = $Probe.PSObject.Properties['freeDiskGiB'];     $commit = $Probe.PSObject.Properties['commitUsedGiB']
         $limit = $Probe.PSObject.Properties['commitLimitGiB']
@@ -1480,7 +1489,7 @@ function Get-DvHealthVerdict {
         elseif ($null -eq $limit -or $null -eq $limit.Value -or [double]$limit.Value -le 0) { $reasons.Add('commitLimitGiB unknown') }
         elseif (([double]$commit.Value / [double]$limit.Value) -gt [double]$Thresholds.maxCommitUsedFraction) { $reasons.Add("commit used $($commit.Value) of $($limit.Value) GiB exceeds fraction $($Thresholds.maxCommitUsedFraction)") }
     }
-    [pscustomobject]@{ healthy = ($reasons.Count -eq 0); reasons = @($reasons) }
+    [pscustomobject]@{ healthy = ($reasons.Count -eq 0); reasons = @($reasons); detail = $detail }
 }
 
 function New-DvHealthProbeJobText {
@@ -1489,11 +1498,15 @@ function New-DvHealthProbeJobText {
     The job that runs ON the venue for the health probe: pwsh cold start, write+hash of a fixed 4 MiB
     buffer inside the agent root, free disk of the agent-root drive, commit charge, host identity, GPU,
     and the PresentMon digest. Prints ONE line `DVE_PROBE=<json>`. Touches only the agent root; it
-    enumerates no drive root and no directory.
+    enumerates no drive root and no directory. VENUE-SESSION-LOCKED-REFUSAL-1: also records sessionLocked
+    ($true/$false/$null) from the SAME read the attribution job gates on -- Get-AttrCudaSessionLocked's text is
+    embedded verbatim from AttrCudaArtifacts.psm1. Read-only; it sends no input.
     #>
     param([Parameter(Mandatory)][string]$AgentRoot)
     $root = $AgentRoot.Replace("'", "''")
-    @"
+    Import-Module (Join-Path $PSScriptRoot '..\bachelor\AttrCudaArtifacts.psm1')
+    $sessionLockedSource = Get-AttrCudaEmbeddedFunctionSource -Name @('Get-AttrCudaSessionLocked')
+    $body = @"
 `$ErrorActionPreference = 'Stop'
 `$AgentRoot = '$root'
 `$probe = [ordered]@{ schema = 'mlv-app/dual-venue-health-probe/v1' }
@@ -1521,8 +1534,10 @@ Remove-Item -LiteralPath `$scratch -Force
 try { Add-Type -AssemblyName System.Windows.Forms; `$probe.displayDevice = [string][System.Windows.Forms.Screen]::PrimaryScreen.DeviceName } catch { }
 `$pm = Join-Path `$AgentRoot 'cache\PresentMon-2.5.1-x64.exe'
 `$probe.presentmonSha256 = `$(if (Test-Path -LiteralPath `$pm -PathType Leaf) { (Get-FileHash -LiteralPath `$pm -Algorithm SHA256).Hash.ToLowerInvariant() } else { `$null })
-Write-Output ('DVE_PROBE=' + (`$probe | ConvertTo-Json -Compress -Depth 4))
 "@
+    # The embedded function is concatenated, never interpolated: its own `$` must reach the venue as written.
+    $body + "`r`n" + $sessionLockedSource + "`r`n" + '$probe.sessionLocked = Get-AttrCudaSessionLocked' + "`r`n" +
+        'Write-Output (''DVE_PROBE='' + ($probe | ConvertTo-Json -Compress -Depth 4))' + "`r`n"
 }
 
 function ConvertFrom-DvProbeStdout([string]$Stdout) {
@@ -1544,7 +1559,7 @@ function ConvertFrom-DvProbeStdout([string]$Stdout) {
 # isolation -- a build the snapshot would have "protected" only after the fact.
 
 # --- job result -> typed outcome (P4) -------------------------------------------------------------
-$script:VenueConditionResults = @('SCREENSAVER_SECURE_OWNER_ONLY', 'DISPLAY_WAKE_DISMISS_FAILED', 'KEEPALIVE_FAILED', 'DISPLAY_ASLEEP')
+$script:VenueConditionResults = @('SCREENSAVER_SECURE_OWNER_ONLY', 'DISPLAY_WAKE_DISMISS_FAILED', 'KEEPALIVE_FAILED', 'DISPLAY_ASLEEP', 'SESSION_LOCKED_OWNER_ONLY')
 $script:DeviceUnavailableResults = @('BACKEND_NOT_AVAILABLE')
 # A FIXTURE_REHEARSAL_CAPTURED job is NOT a capture of venue playback (fixtures are never played on a venue); only
 # MEASUREMENT_CAPTURED can become PASS/FAIL. A rehearsal result falls through to FAIL ... and then to INVALID below.
@@ -1669,7 +1684,7 @@ function New-DvReceipt {
         method = [ordered]@{ script = $Method; gitBlobId = $MethodBlobId }
         startedUtc = [DateTime]::UtcNow.ToString('o')
         finishedUtc = $null
-        health = [ordered]@{ outcome = $null; pwshColdStartMs = $null; smallHashMs = $null; freeDiskGiB = $null; commitUsedGiB = $null; commitLimitGiB = $null }
+        health = [ordered]@{ outcome = $null; pwshColdStartMs = $null; smallHashMs = $null; freeDiskGiB = $null; commitUsedGiB = $null; commitLimitGiB = $null; sessionLocked = $null }
         outcome = $null
         outcomeDetail = $null
         # Round 1 of DUAL-VENUE-EVIDENCE-2: the receipt names its local evidence directory and the sha256 of EACH file in it

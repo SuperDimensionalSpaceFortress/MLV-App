@@ -404,6 +404,8 @@ try {
     $receipt.health.freeDiskGiB = $probe.freeDiskGiB
     $receipt.health.commitUsedGiB = $probe.commitUsedGiB
     $receipt.health.commitLimitGiB = $probe.commitLimitGiB
+    # VENUE-SESSION-LOCKED-REFUSAL-1: recorded as the probe said it ($null when the probe did not say: unknown).
+    $receipt.health.sessionLocked = $(if ($null -ne $probe.PSObject.Properties['sessionLocked']) { $probe.sessionLocked } else { $null })
     $receipt.venue.hostName = [string]$probe.hostName
     $receipt.venue.gpuNames = @($probe.gpuNames)
     $receipt.venue.driverVersion = $probe.driverVersion
@@ -421,6 +423,9 @@ try {
     $verdict = Get-DvHealthVerdict -Probe $probe -Thresholds $venueEntry.health
     if (-not $verdict.healthy) {
         $receipt.health.outcome = 'UNHEALTHY'
+        # VENUE-SESSION-LOCKED-REFUSAL-1: a locked (or unknown) console is owner-only; the detail is exactly SESSION_LOCKED so a chain
+        # can key on it. The measurements stay in receipt.health.
+        if ($verdict.detail -ceq 'SESSION_LOCKED') { Stop-Leg 'VENUE_UNHEALTHY' 'SESSION_LOCKED' }
         Stop-Leg 'VENUE_UNHEALTHY' ('leg not submitted: ' + ($verdict.reasons -join '; '))
     }
     $receipt.health.outcome = 'HEALTHY'

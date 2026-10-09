@@ -214,6 +214,13 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
     KEEPALIVE_HUNG_PROBE_OPEN = "CI-FLAKE-KEEPALIVE-HUNG-PROBE-SLEEP-1 >>>"
     KEEPALIVE_HUNG_PROBE_CLOSE = "CI-FLAKE-KEEPALIVE-HUNG-PROBE-SLEEP-1 <<<"
     KEEPALIVE_HUNG_PROBE_REGIONS = 1
+    # VENUE-SESSION-LOCKED-REFUSAL-1: the console-lock refusal. 14 regions: the Get-AttrCudaSessionLocked splice (1); in Start-AttrCudaDisplayWake the help text,
+    # the lock read, the open and the close of the wrapper around the unchanged nudge branches, the dismissAttempted override, the method/dismissFailed
+    # override and the sessionLocked field (7); in the keep-alive the help text, the per-tick read, the wrapper's open and close, and the runspace entry (5);
+    # and the job's exit-30 gate (1). Every baseline line stays verbatim outside them.
+    SESSION_LOCKED_OPEN = "VENUE-SESSION-LOCKED-REFUSAL-1 >>>"
+    SESSION_LOCKED_CLOSE = "VENUE-SESSION-LOCKED-REFUSAL-1 <<<"
+    SESSION_LOCKED_REGIONS = 14
 
     @classmethod
     def strip_regions(cls, text: str) -> tuple[str, dict[str, int]]:
@@ -221,7 +228,8 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         families = {"leg-terminals": (cls.LEG_TERMINALS_OPEN, cls.LEG_TERMINALS_CLOSE), "presentmon-evidence": (cls.PRESENTMON_EVIDENCE_OPEN, cls.PRESENTMON_EVIDENCE_CLOSE),
                     "orphan-sweep": (cls.ORPHAN_SWEEP_OPEN, cls.ORPHAN_SWEEP_CLOSE),
                     "contact-sheet-parity": (cls.CONTACT_SHEET_PARITY_OPEN, cls.CONTACT_SHEET_PARITY_CLOSE),
-                    "keepalive-hung-probe": (cls.KEEPALIVE_HUNG_PROBE_OPEN, cls.KEEPALIVE_HUNG_PROBE_CLOSE)}
+                    "keepalive-hung-probe": (cls.KEEPALIVE_HUNG_PROBE_OPEN, cls.KEEPALIVE_HUNG_PROBE_CLOSE),
+                    "session-locked": (cls.SESSION_LOCKED_OPEN, cls.SESSION_LOCKED_CLOSE)}
         kept: list[str] = []
         inside: str | None = None
         counts = {name: 0 for name in families}
@@ -264,6 +272,8 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         self.assertEqual(old_counts["contact-sheet-parity"], 0, "the baseline has none")
         self.assertEqual(new_counts["keepalive-hung-probe"], self.KEEPALIVE_HUNG_PROBE_REGIONS, "the default job carries exactly the pinned number of bracketed CI-FLAKE-KEEPALIVE-HUNG-PROBE-SLEEP-1 regions")
         self.assertEqual(old_counts["keepalive-hung-probe"], 0, "the baseline has none")
+        self.assertEqual(new_counts["session-locked"], self.SESSION_LOCKED_REGIONS, "the default job carries exactly the pinned number of bracketed VENUE-SESSION-LOCKED-REFUSAL-1 regions")
+        self.assertEqual(old_counts["session-locked"], 0, "the baseline has none")
         self.assertEqual(stripped, old_stripped,
                          "the DEFAULT (bachelor/cuda) emitted job changed outside the bracketed regions -- it must stay byte-identical to the pinned baseline")
 
@@ -542,7 +552,9 @@ Set-Content -LiteralPath $OutFile -Value "# stub job Venue=$Venue Backend=$Backe
 
 HEALTHY_PROBE = {"pwshColdStartMs": 500, "smallHashMs": 40, "freeDiskGiB": 600.0, "commitUsedGiB": 40.0, "commitLimitGiB": 128.0,
                  "hostName": "ULTRA-MAGNUS", "gpuNames": ["NVIDIA GeForce RTX 4090"], "driverVersion": "32.0.1", "displayDevice": "\\\\.\\DISPLAY2",
-                 "presentmonSha256": "9b" * 32}
+                 "presentmonSha256": "9b" * 32,
+                 # VENUE-SESSION-LOCKED-REFUSAL-1: the probe reports the console lock state; only a JSON false is healthy
+                 "sessionLocked": False}
 BACHELOR_PROBE = dict(HEALTHY_PROBE, hostName="BACHELOR")
 CLIP_CONTENT_SHA = "ab" * 32
 
@@ -5047,6 +5059,88 @@ class LegSpecSchemaTests(unittest.TestCase):
         bad = dict(spec, backends=["cuda", "vulkan"])
         with self.assertRaises(self.jsonschema.ValidationError):
             self.jsonschema.validate(bad, self.schema)
+
+
+@requires_windows_pwsh
+class SessionLockedHealthTests(RunnerHarness, unittest.TestCase):
+    """VENUE-SESSION-LOCKED-REFUSAL-1 item 3: a venue console that is locked, or whose lock state is unknown, is VENUE_UNHEALTHY with detail
+    exactly SESSION_LOCKED and the leg is never submitted; the job's SESSION_LOCKED_OWNER_ONLY result is a venue condition. Measured cause:
+    Bachelor stayed locked after a Windows Update reboot on 2026-10-09 and 24 legs ended KEEPALIVE_FAILED."""
+
+    def setUp(self) -> None:
+        self.make_harness()
+
+    def assert_locked_and_not_submitted(self, probe: dict, recorded) -> None:
+        proc, receipt, submitted = self.run_leg("bachelor", self.write_spec(), probe=probe)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(receipt["outcome"], "VENUE_UNHEALTHY")
+        self.assertEqual(receipt["outcomeDetail"], "SESSION_LOCKED")
+        self.assertIn("DVE_DETAIL=SESSION_LOCKED", proc.stdout)
+        self.assertEqual(receipt["health"]["outcome"], "UNHEALTHY")
+        self.assertEqual(receipt["health"]["sessionLocked"], recorded)
+        self.assertEqual(len(submitted), 1, f"only the health probe may be submitted, got {submitted}")
+        self.assertTrue(submitted[0].endswith("-health"))
+
+    def test_a_locked_console_is_unhealthy_session_locked_and_the_leg_is_not_submitted(self) -> None:
+        self.assert_locked_and_not_submitted(dict(BACHELOR_PROBE, sessionLocked=True), True)
+
+    def test_an_unknown_lock_state_fails_closed(self) -> None:
+        self.assert_locked_and_not_submitted(dict(BACHELOR_PROBE, sessionLocked=None), None)
+        absent = {k: v for k, v in BACHELOR_PROBE.items() if k != "sessionLocked"}
+        self.assert_locked_and_not_submitted(absent, None)
+        # a string is not a JSON false: never read as unlocked
+        self.assert_locked_and_not_submitted(dict(BACHELOR_PROBE, sessionLocked="false"), "false")
+
+    def test_an_unlocked_console_is_healthy_and_recorded(self) -> None:
+        proc, receipt, submitted = self.run_leg("bachelor", self.write_spec(), probe=BACHELOR_PROBE)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(receipt["health"]["outcome"], "HEALTHY")
+        self.assertIs(receipt["health"]["sessionLocked"], False)
+        self.assertGreater(len(submitted), 1, "an unlocked, healthy venue gets its leg submitted")
+
+    def test_the_verdict_names_session_locked_alongside_other_reasons(self) -> None:
+        script = ("$t = [pscustomobject]@{ maxPwshColdStartMs = 3000; maxSmallHashMs = 2000; minFreeDiskGiB = 20; maxCommitUsedFraction = 0.9 }\n"
+                  "$base = @{ pwshColdStartMs = 9000; smallHashMs = 40; freeDiskGiB = 600; commitUsedGiB = 40; commitLimitGiB = 128 }\n"
+                  "$out = [ordered]@{}\n"
+                  "foreach ($case in @('locked', 'unlocked', 'absent')) {\n"
+                  "  $p = [pscustomobject]$base\n"
+                  "  if ($case -eq 'locked') { $p | Add-Member sessionLocked $true } elseif ($case -eq 'unlocked') { $p | Add-Member sessionLocked $false }\n"
+                  "  $out[$case] = Get-DvHealthVerdict -Probe $p -Thresholds $t\n"
+                  "}\n"
+                  "$out | ConvertTo-Json -Depth 5")
+        proc, verdicts = run_pwsh_json(script)
+        self.assertIsNotNone(verdicts, proc.stdout + proc.stderr)
+        for case in ("locked", "absent"):
+            self.assertFalse(verdicts[case]["healthy"])
+            self.assertEqual(verdicts[case]["detail"], "SESSION_LOCKED")
+            self.assertTrue(any(r.startswith("SESSION_LOCKED:") for r in verdicts[case]["reasons"]), verdicts[case])
+            self.assertTrue(any("pwshColdStartMs" in r for r in verdicts[case]["reasons"]), verdicts[case])
+        self.assertIsNone(verdicts["unlocked"]["detail"])
+        self.assertFalse(any(r.startswith("SESSION_LOCKED") for r in verdicts["unlocked"]["reasons"]))
+
+    def test_the_job_result_session_locked_owner_only_is_a_venue_condition(self) -> None:
+        proc, out = run_pwsh_json("Resolve-DvJobOutcome -ResultToken 'SESSION_LOCKED_OWNER_ONLY' -ExitCode 30 | ConvertTo-Json")
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual(out, {"outcome": "VENUE_UNHEALTHY", "detail": "SESSION_LOCKED_OWNER_ONLY"})
+        doc = (ROOT / "docs" / "dual-venue-evidence.md").read_text(encoding="utf-8").split("## Outcome mapping", 1)[1]
+        self.assertIn("`SESSION_LOCKED_OWNER_ONLY` (exit 30", doc)
+        self.assertIn("exactly `SESSION_LOCKED`", doc)
+
+    def test_the_health_probe_embeds_the_jobs_own_lock_read_verbatim(self) -> None:
+        module = ROOT / "tools" / "profiling" / "bachelor" / "AttrCudaArtifacts.psm1"
+        script = (f"$p = New-DvHealthProbeJobText -AgentRoot 'C:\\mlvtmp\\mlv-agent'\n"
+                  f"Import-Module '{module}' -Force\n"
+                  "$fn = Get-AttrCudaEmbeddedFunctionSource -Name @('Get-AttrCudaSessionLocked')\n"
+                  "$tok = $null; $err = $null; [void][System.Management.Automation.Language.Parser]::ParseInput($p, [ref]$tok, [ref]$err)\n"
+                  "[ordered]@{ embedsVerbatim = $p.Contains($fn); parseErrors = @($err).Count;"
+                  " assignAt = $p.IndexOf('$probe.sessionLocked = Get-AttrCudaSessionLocked'); fnAt = $p.IndexOf($fn);"
+                  " printAt = $p.IndexOf('DVE_PROBE=') } | ConvertTo-Json")
+        proc, out = run_pwsh_json(script)
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertTrue(out["embedsVerbatim"], "the probe must carry the job's own Get-AttrCudaSessionLocked text, not a re-implementation")
+        self.assertEqual(out["parseErrors"], 0)
+        self.assertLess(out["fnAt"], out["assignAt"])
+        self.assertLess(out["assignAt"], out["printAt"], "sessionLocked must be set before the one DVE_PROBE line is printed")
 
 
 if __name__ == "__main__":

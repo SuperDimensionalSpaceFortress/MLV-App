@@ -87,6 +87,11 @@
 # the call. A log that is absent, unbound or outside this job's work tree exits 16
 # (SMOKE_LOG_UNAVAILABLE) -- a missing gate is never a passed gate.
 #
+# SESSION LOCK (VENUE-SESSION-LOCKED-REFUSAL-1): exit 30 = SESSION_LOCKED_OWNER_ONLY. The job's
+# first action after claim reads whether its own console session is locked
+# (Get-AttrCudaSessionLocked). Locked or unknown stops the leg before any input is sent; signing in
+# is an owner action. 30 is the next free code: this job's other exits are 0 and 12-29.
+#
 # Usage (owner clip, id-only -- no -ClipPath, no -FixtureSha256):
 #   pwsh -NoProfile -File tools\profiling\bachelor\playback-attr-3-cuda-job.ps1 `
 #       -SourceCommit <40-hex> -BuildManifestSha256 <64-lowercase-hex> `
@@ -866,6 +871,11 @@ $embeddedFunctions = $embeddedFunctions + "`r`n# UM-PRESENTMON-ORPHAN-SWEEP-1 >>
     'Add-AttrCudaPresentMonEventsLostDetail',
     'Add-AttrCudaPresentMonEventsLostDetailToReport'
 )) +"`r`n# UM-PRESENTMON-ORPHAN-SWEEP-1 <<<"
+# VENUE-SESSION-LOCKED-REFUSAL-1: the console-lock read Start-AttrCudaDisplayWake makes first and the keep-alive loop re-reads every
+# tick, spliced inside its own sentinel brackets for the same byte-identity reason as the splice above.
+$embeddedFunctions = $embeddedFunctions + "`r`n# VENUE-SESSION-LOCKED-REFUSAL-1 >>>`r`n" + (Get-AttrCudaEmbeddedFunctionSource -Name @(
+    'Get-AttrCudaSessionLocked'
+)) +"`r`n# VENUE-SESSION-LOCKED-REFUSAL-1 <<<"
 $smokeRunnerClosureDigest = Get-AttrCudaClosureDigestHex -Closure $smokeRunnerClosure
 if ($smokeRunnerClosureDigest -notmatch '^[0-9a-f]{64}$') {
     throw "ATTRCUDA_BLOB_SHA_MALFORMED smoke-runner closure digest is not 64 lowercase hex: '$smokeRunnerClosureDigest'"
@@ -1099,6 +1109,24 @@ Write-JobTrace 'step display-wake start'
 try {
 $displayWake = Start-AttrCudaDisplayWake
 Write-JobTrace 'step display-wake done'
+# VENUE-SESSION-LOCKED-REFUSAL-1 >>>
+# VENUE-SESSION-LOCKED-REFUSAL-1: a locked console (or one whose lock state could not be read) is
+# owner-only. Start-AttrCudaDisplayWake read the lock FIRST and sent no input; the leg stops here,
+# before the keep-alive is armed, so nothing is ever injected into a locked console.
+if ($displayWake.sessionLocked -ne $false) {
+    [void](New-AttrCudaDirectory -Path (Join-Path $Root 'outbox'))
+    [void](New-AttrCudaDirectory -Path $Pub)
+    $sessionLockedRefusal = [ordered]@{
+        schema='playback-attr-3-cuda-venue.v1'; result='SESSION_LOCKED_OWNER_ONLY'
+        fixtureRehearsal=$FixtureRehearsal
+        displayWake=$displayWake
+        sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
+    }
+    Save-Json $sessionLockedRefusal (Join-Path $Pub 'summary.json')
+    Write-Output "RESULT=SESSION_LOCKED_OWNER_ONLY ARTIFACTS=$Pub"
+    exit 30
+}
+# VENUE-SESSION-LOCKED-REFUSAL-1 <<<
 if ($displayWake.screensaverSecureOwnerOnly) {
     [void](New-AttrCudaDirectory -Path (Join-Path $Root 'outbox'))
     [void](New-AttrCudaDirectory -Path $Pub)
