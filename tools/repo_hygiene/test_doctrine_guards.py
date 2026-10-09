@@ -35,7 +35,8 @@ NON-PROMISES:
   reason; git_paths() in tools/coordination/doctrine_outbox.py adds -z itself. Every ls-tree
   form (long form `ls-tree -r` included; only --object-only is exempt) and `status --short|-s|-sb`
   count, as well as --name-only, --name-status and --porcelain.
-  Under tools/repo_hygiene/ the same guard also flags a Python subprocess call that lists git paths with
+  Under tools/repo_hygiene/ and for the Python files directly under tools/ (CHECK-DOC-SIZE-UTF8-1;
+  tools/*/** other than repo_hygiene is not) the same guard also flags a Python subprocess call that lists git paths with
   text=True (or universal_newlines=True) and no encoding=, even with -z: the locale codec mangles a
   UTF-8 path (DURATION-SCAN-UTF8-PATHS-1). Calls that build the argument list elsewhere are not seen.
 - DG-PS-NULL-COMPARE flags only a literal ``$null`` on the RIGHT of
@@ -493,15 +494,25 @@ def scan_git_pathlist(root: Path, rel_paths: list[str]) -> list[tuple[Violation,
 # path that named nothing"): git prints UTF-8, and text=True with no encoding decodes with the locale
 # codec (cp1252 on Windows outside UTF-8 mode), so even a `-z` path list arrives as mojibake.
 GIT_TEXT_DECODE_SCOPE = "tools/repo_hygiene/"
+# CHECK-DOC-SIZE-UTF8-1: tools/check-doc-size.py had the same defect outside tools/repo_hygiene/, so
+# the Python files directly under tools/ (not tools/*/**) are held to the explicit-encoding rule too.
+GIT_TEXT_DECODE_TOP_LEVEL_DIR = PurePosixPath("tools")
 _SUBPROCESS_READERS = frozenset(("run", "check_output", "Popen"))
 
 
+def in_git_text_decode_scope(rel: str) -> bool:
+    p = PurePosixPath(rel)
+    return (rel.startswith(GIT_TEXT_DECODE_SCOPE) or p.parent == GIT_TEXT_DECODE_TOP_LEVEL_DIR) \
+        and p.suffix.lower() == ".py"
+
+
 def scan_git_text_decode(root: Path, rel_paths: list[str]) -> list[Violation]:
-    """A subprocess call under tools/repo_hygiene/ that lists git paths with text=True (or
-    universal_newlines=True) and no `encoding=`. Calls whose argument list is built elsewhere are not seen."""
+    """A subprocess call under tools/repo_hygiene/ or directly under tools/ that lists git paths with
+    text=True (or universal_newlines=True) and no `encoding=`. Calls whose argument list is built
+    elsewhere are not seen."""
     found: list[Violation] = []
     for rel in rel_paths:
-        if not rel.startswith(GIT_TEXT_DECODE_SCOPE) or not rel.lower().endswith(".py"):
+        if not in_git_text_decode_scope(rel):
             continue
         try:
             text = (root / rel).read_text(encoding="utf-8")
@@ -634,7 +645,11 @@ FIXTURES: dict[str, dict[str, dict[str, str]]] = {
                            "$h2 = \"a # b\"; & git -C $root diff --name-only\n",
             # DG-GIT-PATHLIST-PREFILTER-NEGATIVE-TOKEN-1: the only line that spells a path-list command also
             # carries a negative token (--error-unmatch) in its comment, so it still has to be tokenized.
-            "tools/d.ps1": "$f = & git -C $root ls-files # --error-unmatch\n",
+            "tools/d.ps1":"$f = & git -C $root ls-files # --error-unmatch\n",
+            # CHECK-DOC-SIZE-UTF8-1: a Python file directly under tools/ is held to the explicit-encoding rule.
+            "tools/top.py": "import subprocess\n"
+                            "def f(repo):\n"
+                            "    subprocess.run(['git', '-C', repo, 'ls-files', '-z', '*.md'], capture_output=True, text=True)\n",
             # DURATION-SCAN-UTF8-PATHS-1: -z is present, but text=True decodes the UTF-8 paths with the locale codec.
             "tools/repo_hygiene/c.py": "import subprocess\n"
                                        "def f(repo):\n"
@@ -681,9 +696,13 @@ FIXTURES: dict[str, dict[str, dict[str, str]]] = {
                                        "    subprocess.run(['git', '-C', repo, 'ls-files', '-z'], capture_output=True, text=True, encoding='utf-8', errors='surrogateescape')\n"
                                        "    subprocess.run(['git', '-C', repo, 'ls-files', '-z'], capture_output=True)\n"
                                        "    subprocess.run(['git', '-C', repo, 'rev-parse', 'HEAD'], capture_output=True, text=True)\n",
-            # Out of scope: only tools/repo_hygiene/** is held to the explicit-encoding rule.
-            "tools/other.py": "import subprocess\n"
-                              "subprocess.run(['git', 'ls-files', '-z'], capture_output=True, text=True)\n",
+            # CHECK-DOC-SIZE-UTF8-1: the fixed form (explicit encoding) directly under tools/ passes.
+            "tools/fixed.py": "import subprocess\n"
+                              "subprocess.run(['git', 'ls-files', '-z'], capture_output=True, text=True, encoding='utf-8', errors='surrogateescape')\n",
+            # Out of scope: only tools/repo_hygiene/** and the Python files directly under tools/ are held to
+            # the explicit-encoding rule; a nested directory such as tools/other/ is not.
+            "tools/other/nested.py": "import subprocess\n"
+                                     "subprocess.run(['git', 'ls-files', '-z'], capture_output=True, text=True)\n",
         },
     },
     "PS-ONE-TRAP": {
@@ -835,12 +854,32 @@ class GuardFixtureTests(_PwshMixin, unittest.TestCase):
                                              ("tools/b.ps1", 7), ("tools/b.ps1", 8),
                                              ("tools/b.ps1", 10), ("tools/b.ps1", 12),
                                              ("tools/b.ps1", 15), ("tools/b.ps1", 18),
-                                             ("tools/d.ps1", 1),
+                                             ("tools/d.ps1", 1), ("tools/top.py", 3),
                                              ("tools/repo_hygiene/c.py", 3), ("tools/repo_hygiene/c.py", 4),
                                              ("tools/repo_hygiene/c.py", 5)})
 
     def test_git_pathlist_green_passes(self) -> None:
         self._assert_green("DG-GIT-PATHLIST")
+
+    def test_git_text_decode_scope_is_repo_hygiene_and_top_level_tools(self) -> None:
+        self.assertTrue(in_git_text_decode_scope("tools/repo_hygiene/x.py"))
+        self.assertTrue(in_git_text_decode_scope("tools/check-doc-size.py"))
+        self.assertFalse(in_git_text_decode_scope("tools/coordination/x.py"))
+        self.assertFalse(in_git_text_decode_scope("tools/check-doc-size.ps1"))
+        self.assertFalse(in_git_text_decode_scope("check-doc-size.py"))
+
+    def test_git_text_decode_flags_top_level_tools_file_and_not_the_fixed_form(self) -> None:
+        # CHECK-DOC-SIZE-UTF8-1: the shape tools/check-doc-size.py had at 98960da4.
+        broken = ("import subprocess\n"
+                  "def f(repo):\n"
+                  "    return subprocess.run(['git', '-C', str(repo), 'ls-files', '-z', '*.md'],\n"
+                  "                          capture_output=True, text=True)\n")
+        fixed = broken.replace("text=True)", "text=True, encoding='utf-8', errors='surrogateescape')")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            rels = _write_tree(root, {"tools/broken.py": broken, "tools/fixed.py": fixed})
+            found = scan_git_text_decode(root, rels)
+        self.assertEqual([(v.path, v.line) for v in found], [("tools/broken.py", 3)])
 
     def test_git_pathlist_allowlist_is_keyed_by_path(self) -> None:
         path, needle, _why = GIT_PATHLIST_ALLOW[0]
