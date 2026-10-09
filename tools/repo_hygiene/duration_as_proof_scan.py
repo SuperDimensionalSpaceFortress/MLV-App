@@ -468,9 +468,11 @@ class Candidate:
 
 
 def _tracked_files(root: Path) -> list[str]:
+    # git prints paths as UTF-8; text=True alone decodes with the locale codec (cp1252 here), which
+    # turns tests/caf<e-acute>.cpp into a path that names nothing on disk.
     proc = subprocess.run(
         ["git", "-C", str(root), "ls-files", "-z", *SCAN_GLOBS],
-        capture_output=True, text=True, check=True,
+        capture_output=True, text=True, encoding="utf-8", errors="surrogateescape", check=True,
     )
     return [part for part in proc.stdout.split("\0") if part.strip()]
 
