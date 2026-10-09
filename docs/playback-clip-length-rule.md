@@ -227,6 +227,7 @@ self-test). A new consumer is neither, so it fails until a reviewer classifies i
 | `bachelor/playback-attr-3-cuda-job.ps1` | a non-zero runner exit is `SMOKE_RUN_FAILED` |
 | `run-shipping-guard-smoke.ps1`, `run-local-cuda-playback-dng-smoke.ps1`, `invoke-ultramagnus-p3-evidence.ps1`, `export-release-cuda-dogfood-kit.ps1` | callers of the consumers above: each turns a child's exit code into its own status / exit |
 | `dual-venue/Invoke-VenueLeg.ps1` (DUAL-VENUE-EVIDENCE-1 r2) | submits the attribution job through um-run and reads the job's exit code: a printed capture with a non-zero exit is `INVALID`; a PASS/FAIL receipt also needs the job oracle's verdict (`source_advanced`, `required_source_frames`, run nonce, wrap, clip id) or it is `INVALID`. Legs name a clip id, never a path; a fixture is refused by the length gate before anything is generated; a venue without an owner-typed record in `venue-clip-consent.json` refuses before submitting (`docs/dual-venue-evidence.md`) |
+| `dual-venue/Invoke-VenueChain.ps1` (VENUE-CHAIN-RUNNER-1 r2) | runs each leg through `Invoke-VenueLeg.ps1` and reads its exit code: a leg that exits non-zero is `LEG_FAILED` / `INVALID` (whatever `DVE_OUTCOME` it printed first), never `RAN`, and the chain exits 7 |
 
 `app_play_scan.py` also pins every WRITE of the autoplay latch (one arm in the constructor, one fail, one resolve; the
 retired `m_automationVerdictExitCode` int cannot return), of the safety budget `m_playRequestedSeconds` and of the engine

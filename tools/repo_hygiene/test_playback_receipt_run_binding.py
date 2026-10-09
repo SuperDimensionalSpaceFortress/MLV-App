@@ -708,6 +708,10 @@ CONSUMER_FAILING_ACTION: dict[str, tuple[tuple[str, int], ...]] = {
     "tools/profiling/dual-venue/Invoke-VenueLeg.ps1": (
         (r"\$exitCode\s*=\s*\[int\]\$run\.result\.exitCode[\s\S]*?if\s*\(\$exitCode\s+-ne\s+0\s+-and\s+\$resolved\.outcome\s+-eq\s+'CAPTURED'\)\s*\{\s*"
          r"(?P<act>\$resolved\s*=\s*\[pscustomobject\]@\{\s*outcome\s*=\s*'INVALID')", 1),),
+    # VENUE-CHAIN-RUNNER-1 r3: a leg that exited non-zero is recorded LEG_FAILED / INVALID (never RAN) and the chain exits 7.
+    "tools/profiling/dual-venue/Invoke-VenueChain.ps1": (
+        (r"\$legCode\s*=\s*\$LASTEXITCODE[\s\S]*?if\s*\(\$legCode\s+-ne\s+0\)\s*\{\s*"
+         r"(?P<act>Add-Result\s+\$leg\s+'LEG_FAILED'\s+@\{[^\n]*outcome\s*=\s*'INVALID'[^\n]*\})", 1),),
 }
 
 
