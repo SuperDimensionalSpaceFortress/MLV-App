@@ -641,7 +641,7 @@ TEST(LookAssistFilmGrade, FilmV2NeutralLeansGreenNeverMagenta)
             neutralLo = std::min( neutralLo, dGA );
             neutralHi = std::max( neutralHi, dGA );
         }
-        const double lean = 0.6 * grade.greenShare * grade.warmOffset * 255.0;
+        const double lean = 0.6 * 0.15 * grade.warmOffset * 255.0;   // the documented k, not the code's (a k of 0 must fail here)
 
         // (b) Any pixel, and the share of the Y line alone (Film's Y with default R, G, B).
         const auto bound = []( const StageDeltas &x, double *lo, double *hi ) {
@@ -808,7 +808,9 @@ TEST(LookAssistFilmGrade, FilmV2SkinPatchesKeepTheirHue)
     struct Patch { double g, b, r; };
     const Patch patches[] = { { 0.72, 0.56, 0.35 }, { 0.72, 0.56, 0.50 }, { 0.72, 0.56, 0.65 }, { 0.72, 0.56, 0.80 },
                               { 0.80, 0.68, 0.55 }, { 0.80, 0.68, 0.75 }, { 0.80, 0.68, 0.90 } };
+    // Every value first (printed), then the guard's kill (G3), then G1 and G2, so a guard regression reads as G3.
     double v2MagentaShade = 0.0, v1MagentaShade = 0.0;
+    std::vector<std::pair<double, double>> graded;   // (hue_v2, dh_v2) for G1 / G2
     for( LookAssistScene scene : kFilmScenes )
     {
         const GradationTables v2 = gradationTables( lookAssistFilmGradationCurve( scene ) );
@@ -822,8 +824,7 @@ TEST(LookAssistFilmGrade, FilmV2SkinPatchesKeepTheirHue)
             std::fprintf( stderr, "FILM-V2-SKIN scene=%s patch=1:%.2f:%.2f R=%.2f hue_default=%.3f hue_v2=%.3f dh_v2=%+.3f"
                           " hue_v1=%.3f dh_v1=%+.3f\n", qPrintable( lookAssistSceneName( scene ) ), p.g, p.b, p.r, h0, h2,
                           h2 - h0, h1, h1 - h0 );
-            ASSERT_TRUE( h2 >= 12.0 && h2 <= 32.0 );
-            ASSERT_TRUE( h2 - h0 >= -3.5 );
+            graded.push_back( std::make_pair( h2, h2 - h0 ) );
             if( scene == LookAssistScene::Shade )
             {
                 v2MagentaShade = std::max( v2MagentaShade, h0 - h2 );
@@ -832,7 +833,12 @@ TEST(LookAssistFilmGrade, FilmV2SkinPatchesKeepTheirHue)
         }
     }
     std::fprintf( stderr, "FILM-V2-SKIN Shade max magenta-ward v2=%.3f v1=%.3f\n", v2MagentaShade, v1MagentaShade );
-    ASSERT_TRUE( v2MagentaShade <= v1MagentaShade );
+    ASSERT_TRUE( v2MagentaShade <= v1MagentaShade );                // G3
+    for( const std::pair<double, double> &h : graded )
+    {
+        ASSERT_TRUE( h.first >= 12.0 && h.first <= 32.0 );          // G1
+        ASSERT_TRUE( h.second >= -3.5 );                            // G2
+    }
 }
 
 TEST(LookAssistFilmGrade, FilmV2LiftsBlacksAndRollsWhites)
