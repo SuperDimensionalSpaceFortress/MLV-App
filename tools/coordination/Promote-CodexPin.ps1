@@ -20,8 +20,12 @@ Promotion gate, in order; the first failure refuses with its exit code and write
   3. zero-token sandbox probe: `codex sandbox -P :read-only -C <WorkDir> -- git --version` rc 0,
      elevated first (with -WindowsSandbox auto), unelevated only if elevated fails; the mode that
      passed is the one recorded in the pin
-  4. write probe: the same sandbox asked to write (`git init <new dir>`) is DENIED (non-zero rc
-     AND nothing created)
+  4. write probe: the same sandbox asked to write (`git init <new dir>`) is DENIED. DENIED is
+     positive evidence (PR #339 r2): the sandboxed run exits non-zero without timing out, creates
+     nothing, and its stderr carries a write-denial signature, AND a positive control -- the
+     identical `git init` WITHOUT the sandbox, same environment, in a scratch dir -- exits 0 and
+     creates its target. A write that went through is exit 13; any other outcome is UNPROVEN
+     (timed-out / control-failed / no-denial-signature), exit 19, never DENIED
   5. one real `codex exec` in the read-only sandbox, MCP servers disabled exactly as Invoke-Lane
      does for a review key, classified EXEC_OK by the codex-exec-health rule (at least one shell
      exec ran). This step spends tokens: one short call.
@@ -39,6 +43,8 @@ Exit codes:
   16  pin or evidence write failed
   17  `codex mcp list --json` unreadable, so MCP could not be disabled for the exec probe
   18  model resolution failed for the exec probe (pass -Model to skip it)
+  19  write probe UNPROVEN: refused, but not provably by the sandbox (see step 4)
+  20  a child's cleanup did not finish within its budget (exit-wait-expired / stream-drain-expired)
 
 ASCII only. PowerShell 7+.
 #>
@@ -64,6 +70,9 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+# ValidateSet matches case-insensitively; the pin carries the canonical lower-case spelling,
+# which is the only one Invoke-Lane.ps1 accepts.
+$WindowsSandbox = $WindowsSandbox.ToLowerInvariant()
 
 # Same rule as Invoke-Lane.ps1 ($CODEX_PIN_EXE_RELATIVE / $CODEX_PIN_VERSION_PATTERN); the
 # containment tests pin both literals in both files.
@@ -73,6 +82,14 @@ $CODEX_PIN_VERSION_PATTERN = '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'
 $EXEC_OK_PATTERN = '(?m)^[ \t]*(?:succeeded in \d+ms|exited (?!-1 in 0ms)-?\d+ in \d+ms)'
 $EXEC_REJECTED_PATTERN = '(?m)^.*(?:Failed to create unified exec process|setup refresh had errors|CreateProcess \{ message: "Rejected).*$'
 $AUTH_FAILURE_PATTERN = '(?i)(not logged in|codex login|401 Unauthorized|authentication (required|failed)|please (log|sign) in)'
+# Write-denial signature for the sandboxed `git init` (step 4). Live on codex-cli 0.160.1, both
+# sandbox modes: "fatal: cannot mkdir <name>: Permission denied"; the rest are the Windows, Rust
+# and POSIX spellings of the same denial.
+$WRITE_DENIAL_PATTERN = '(?i)(Permission denied|Access is denied|os error 5\b|EACCES)'
+# CODEX-PIN-PROMOTION-BOUNDS-1: after a child exits or is killed, the exit wait and the
+# stdout/stderr drains share this budget; a grandchild that escaped Kill(true) can hold the pipes
+# open forever, so on expiry the step fails with a named reason instead of hanging.
+$CLEANUP_BUDGET_SEC = 10
 
 if (-not $PinFile) { $PinFile = Join-Path $PSScriptRoot 'codex-pin.json' }
 if (-not $WorkDir) { $WorkDir = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..\..')).Path }
@@ -85,7 +102,7 @@ $evidence = [ordered]@{
 }
 
 function Invoke-Bounded {
-    param([string]$Exe, [string[]]$ArgList, [string]$Cwd, [int]$TimeoutSec, [string]$StdIn = '')
+    param([string]$Step, [string]$Exe, [string[]]$ArgList, [string]$Cwd, [int]$TimeoutSec, [string]$StdIn = '')
     $psi = [System.Diagnostics.ProcessStartInfo]::new()
     $psi.FileName = $Exe
     foreach ($a in $ArgList) { [void]$psi.ArgumentList.Add($a) }
@@ -104,13 +121,33 @@ function Invoke-Bounded {
     if ($StdIn) { $p.StandardInput.Write($StdIn) }
     $p.StandardInput.Close()
     $timedOut = -not $p.WaitForExit([math]::Max(1, $TimeoutSec) * 1000)
-    if ($timedOut) { try { $p.Kill($true) } catch { } }
-    $p.WaitForExit()
-    [pscustomobject]@{
-        exit = if ($timedOut) { $null } else { $p.ExitCode }; timedOut = $timedOut
-        out = $o.Result; err = $e.Result; seconds = [math]::Round($sw.Elapsed.TotalSeconds, 1)
-        argv = @($ArgList)
+    $killError = $null
+    if ($timedOut) { try { $p.Kill($true) } catch { $killError = $_.Exception.Message } }
+    # Bounded cleanup: the post-kill exit wait has its own deadline, the stream drains get what is
+    # left of the same budget, and neither is ever an unbounded wait.
+    $budgetMs = $CLEANUP_BUDGET_SEC * 1000
+    $cleanup = [System.Diagnostics.Stopwatch]::StartNew()
+    $exited = $p.WaitForExit($budgetMs)
+    $drained = $false
+    if ($exited) {
+        $leftMs = [int][math]::Max(0, $budgetMs - $cleanup.ElapsedMilliseconds)
+        try { $drained = [System.Threading.Tasks.Task]::WaitAll([System.Threading.Tasks.Task[]]@($o, $e), $leftMs) } catch { $drained = $true }
     }
+    $failure = if (-not $exited) { 'exit-wait-expired' } elseif (-not $drained) { 'stream-drain-expired' } else { $null }
+    $run = [pscustomobject]@{
+        exit = if ($timedOut -or -not $exited) { $null } else { $p.ExitCode }; timedOut = $timedOut
+        out = if ($o.IsCompletedSuccessfully) { $o.Result } else { '' }
+        err = if ($e.IsCompletedSuccessfully) { $e.Result } else { '' }
+        seconds = [math]::Round($sw.Elapsed.TotalSeconds, 1); argv = @($ArgList)
+        killError = $killError; cleanupFailure = $failure
+    }
+    if ($failure) {
+        $after = if ($timedOut) { "a ${TimeoutSec}s timeout" } else { 'exit' }
+        $killNote = if ($killError) { "; Kill(true) failed: $killError" } else { '' }
+        Add-Step $Step "FAILED: cleanup $failure" $run
+        Stop-Promotion 20 ("{0}: {1} after {2} (cleanup budget {3}s){4}" -f $Step, $failure, $after, $CLEANUP_BUDGET_SEC, $killNote)
+    }
+    $run
 }
 
 function Get-Tail([string]$Text, [int]$Max = 1500) {
@@ -124,6 +161,7 @@ function Add-Step([string]$Name, [string]$Outcome, $Run = $null, [hashtable]$Ext
     if ($null -ne $Run) {
         $s.argv = $Run.argv; $s.exit = $Run.exit; $s.timedOut = $Run.timedOut; $s.seconds = $Run.seconds
         $s.stdoutTail = Get-Tail $Run.out; $s.stderrTail = Get-Tail $Run.err
+        $s.killError = $Run.killError; $s.cleanupFailure = $Run.cleanupFailure
     }
     foreach ($k in $Extra.Keys) { $s[$k] = $Extra[$k] }
     $evidence.steps.Add($s)
@@ -162,7 +200,7 @@ if (-not (Test-Path -LiteralPath $WorkDir -PathType Container)) {
 if (-not $Version) {
     $globalExe = Join-Path $env:APPDATA 'npm\codex.cmd'
     if (Test-Path -LiteralPath $globalExe -PathType Leaf) {
-        $gv = Invoke-Bounded -Exe $globalExe -ArgList @('--version') -Cwd $WorkDir -TimeoutSec 30
+        $gv = Invoke-Bounded -Step 'global-version' -Exe $globalExe -ArgList @('--version') -Cwd $WorkDir -TimeoutSec 30
         if ($gv.exit -eq 0 -and $gv.out -match '(?m)^codex-cli\s+(\S+)\s*$') { $Version = $Matches[1] }
     }
     if (-not $Version) { Write-Host '[promote-codex-pin] REFUSED exit 2 -- no -Version and the global codex version is unreadable'; exit 2 }
@@ -182,19 +220,19 @@ $evidence.evidenceDir = $EvidenceDir
 
 function Get-ExeVersion {
     if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { return $null }
-    $r = Invoke-Bounded -Exe $exe -ArgList @('--version') -Cwd $WorkDir -TimeoutSec 30
+    $r = Invoke-Bounded -Step 'version-check' -Exe $exe -ArgList @('--version') -Cwd $WorkDir -TimeoutSec 30
     if ($r.exit -eq 0 -and $r.out -match '(?m)^codex-cli\s+(\S+)\s*$') { return $Matches[1] }
     return $null
 }
 
 # ------------------------------------------------------------------ 1. install
-if ((Get-ExeVersion) -eq $Version) {
+if ((Get-ExeVersion) -ceq $Version) {
     Add-Step 'install' "SKIPPED: $exe already reports $Version"
 } else {
     New-Item -ItemType Directory -Force -Path $prefix | Out-Null
     $npm = (Get-Command -Name 'npm.cmd' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1)
     if ($null -eq $npm) { Add-Step 'install' 'FAILED: npm.cmd not found'; Stop-Promotion 10 'npm.cmd not found on PATH' }
-    $ir = Invoke-Bounded -Exe $npm.Source -Cwd $prefix -TimeoutSec $InstallTimeoutSec -ArgList @(
+    $ir = Invoke-Bounded -Step 'install' -Exe $npm.Source -Cwd $prefix -TimeoutSec $InstallTimeoutSec -ArgList @(
         'install', '--prefix', $prefix, '--no-save', '--no-fund', '--no-audit', '--loglevel=error', "@openai/codex@$Version")
     if ($ir.timedOut -or $ir.exit -ne 0) {
         Add-Step 'install' 'FAILED' $ir
@@ -205,7 +243,7 @@ if ((Get-ExeVersion) -eq $Version) {
 
 # ------------------------------------------------------------------ 2. version
 $actual = Get-ExeVersion
-if ($actual -ne $Version) {
+if ($actual -cne $Version) {
     Add-Step 'version' "FAILED: $exe reports '$actual'"
     Stop-Promotion 11 "installed exe reports '$actual', expected '$Version'"
 }
@@ -215,7 +253,7 @@ Add-Step 'version' "OK: codex-cli $actual"
 $modes = if ($WindowsSandbox -eq 'auto') { @('elevated', 'unelevated') } else { @($WindowsSandbox) }
 $chosen = $null
 foreach ($m in $modes) {
-    $sr = Invoke-Bounded -Exe $exe -Cwd $WorkDir -TimeoutSec $ProbeTimeoutSec -ArgList @(
+    $sr = Invoke-Bounded -Step "sandbox-probe-$m" -Exe $exe -Cwd $WorkDir -TimeoutSec $ProbeTimeoutSec -ArgList @(
         'sandbox', '-c', ('windows.sandbox="{0}"' -f $m), '-P', ':read-only', '-C', $WorkDir, '--', 'git', '--version')
     Test-AuthFailure $sr "sandbox-probe-$m"
     if (-not $sr.timedOut -and $sr.exit -eq 0 -and $sr.out -match '(?m)^git version ') {
@@ -236,17 +274,49 @@ New-Item -ItemType Directory -Force -Path $probeDir | Out-Null
 # OUTSIDE the sandbox, and fake a "write allowed" result.
 $probeName = 'write-probe-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
 $probeFile = Join-Path $probeDir $probeName
-$wr = Invoke-Bounded -Exe $exe -Cwd $probeDir -TimeoutSec $ProbeTimeoutSec -ArgList @(
+$wr = Invoke-Bounded -Step 'write-probe' -Exe $exe -Cwd $probeDir -TimeoutSec $ProbeTimeoutSec -ArgList @(
     'sandbox', '-c', ('windows.sandbox="{0}"' -f $chosen), '-P', ':read-only', '-C', $probeDir, '--',
     'git', 'init', '-q', $probeName)
 Test-AuthFailure $wr 'write-probe'
 $written = Test-Path -LiteralPath $probeFile
-# DENIED needs both a non-zero exit and no write; a timeout proves neither.
-if ($written -or $wr.timedOut -or $wr.exit -eq 0) {
+if ($written -or (-not $wr.timedOut -and $wr.exit -eq 0)) {
     Add-Step 'write-probe' "NOT DENIED (exit $($wr.exit), file written=$written)" $wr
     Stop-Promotion 13 "the $chosen read-only sandbox let a write through (exit $($wr.exit), file written=$written)"
 }
-Add-Step 'write-probe' "DENIED (exit $($wr.exit), file written=False)" $wr
+# DENIED is positive evidence (PR #339 r2, sol blocker): a non-zero exit with nothing written also
+# describes a git that never reached the write -- GIT_CONFIG_COUNT=bogus makes `git init` exit 128
+# on "unable to parse command-line config" while `git --version` still passes. So DENIED also needs
+# a write-denial signature in the probe's stderr, and a POSITIVE CONTROL: the identical `git init`
+# run WITHOUT the sandbox, in the same environment, must exit 0 and create its target.
+$controlDir = Join-Path $EvidenceDir 'write-probe-control'
+New-Item -ItemType Directory -Force -Path $controlDir | Out-Null
+$controlName = 'write-control-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
+$controlTarget = Join-Path $controlDir $controlName
+$git = Get-Command -Name 'git.exe' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+$cr = $null
+if ($null -ne $git) {
+    $cr = Invoke-Bounded -Step 'write-probe-control' -Exe $git.Source -Cwd $controlDir -TimeoutSec $ProbeTimeoutSec -ArgList @(
+        'init', '-q', $controlName)
+}
+$controlCreated = Test-Path -LiteralPath $controlTarget -PathType Container
+$controlOk = $null -ne $cr -and -not $cr.timedOut -and $cr.exit -eq 0 -and $controlCreated
+$signature = if ($wr.err -match $WRITE_DENIAL_PATTERN) { $Matches[0] } else { $null }
+$control = [ordered]@{
+    exe = if ($null -ne $git) { $git.Source } else { $null }; cwd = $controlDir
+    argv = if ($null -ne $cr) { $cr.argv } else { $null }; exit = if ($null -ne $cr) { $cr.exit } else { $null }
+    timedOut = if ($null -ne $cr) { $cr.timedOut } else { $null }; created = $controlCreated
+    stderrTail = if ($null -ne $cr) { Get-Tail $cr.err } else { 'git.exe not found on PATH' }
+}
+$unproven = @()
+if ($wr.timedOut) { $unproven += 'timed-out' }
+if (-not $controlOk) { $unproven += 'control-failed' }
+if (-not $signature) { $unproven += 'no-denial-signature' }
+$writeExtra = @{ denialSignature = $signature; control = $control; unprovenReasons = $unproven }
+if ($unproven.Count -gt 0) {
+    Add-Step 'write-probe' "UNPROVEN: $($unproven -join ',') (exit $($wr.exit), file written=False)" $wr $writeExtra
+    Stop-Promotion 19 "write probe UNPROVEN ($($unproven -join ', ')): the refusal is not proof that the $chosen sandbox enforces read-only"
+}
+Add-Step 'write-probe' "DENIED (exit $($wr.exit), signature '$signature', control exit 0)" $wr $writeExtra
 
 # ------------------------------------------------------------------ 5. exec probe (spends tokens)
 if (-not $Model) {
@@ -259,7 +329,7 @@ if (-not $Model) {
     if (-not $py) { Add-Step 'model' 'FAILED: no python'; Stop-Promotion 18 'no python interpreter to resolve the codex tier (pass -Model)' }
     $pyArgs = @()
     if ((Split-Path -Leaf $py) -ieq 'py.exe') { $pyArgs += '-3' }
-    $mr = Invoke-Bounded -Exe $py -Cwd $WorkDir -TimeoutSec 30 -ArgList ($pyArgs + @($resolver, '--tier', $Tier))
+    $mr = Invoke-Bounded -Step 'model' -Exe $py -Cwd $WorkDir -TimeoutSec 30 -ArgList ($pyArgs + @($resolver, '--tier', $Tier))
     try { $mj = $mr.out | ConvertFrom-Json } catch { $mj = $null }
     $okProp = if ($null -ne $mj) { $mj.PSObject.Properties['ok'] } else { $null }
     if ($null -eq $okProp -or -not [bool]$okProp.Value) {
@@ -270,7 +340,7 @@ if (-not $Model) {
 }
 Add-Step 'model' "OK: $Model"
 
-$lr = Invoke-Bounded -Exe $exe -Cwd $WorkDir -TimeoutSec 60 -ArgList @('mcp', 'list', '--json', '-c', 'features.plugins=false')
+$lr = Invoke-Bounded -Step 'mcp-list' -Exe $exe -Cwd $WorkDir -TimeoutSec 60 -ArgList @('mcp', 'list', '--json', '-c', 'features.plugins=false')
 Test-AuthFailure $lr 'mcp-list'
 $mcpArgs = @('-c', 'features.plugins=false', '-c', 'features.apps=false')
 try {
@@ -293,7 +363,7 @@ $nonce = 'PINPROBE' + [guid]::NewGuid().ToString('N').Substring(0, 8)
 $lastFile = Join-Path $EvidenceDir 'exec-probe.last.txt'
 $execArgs = @('exec', '-m', $Model, '-c', 'model_reasoning_effort="low"', '-s', 'read-only',
     '-c', ('windows.sandbox="{0}"' -f $chosen)) + $mcpArgs + @('-C', $WorkDir, '-o', $lastFile, '--skip-git-repo-check', '-')
-$er = Invoke-Bounded -Exe $exe -Cwd $WorkDir -TimeoutSec $ExecTimeoutSec -ArgList $execArgs `
+$er = Invoke-Bounded -Step 'exec-probe' -Exe $exe -Cwd $WorkDir -TimeoutSec $ExecTimeoutSec -ArgList $execArgs `
     -StdIn ("PIN PROMOTION PROBE. Run exactly one shell command: git --version`nThen reply with exactly this one line and nothing else: $nonce`n")
 try {
     [System.IO.File]::WriteAllText((Join-Path $EvidenceDir 'exec-probe.stdout.txt'), $er.out, [System.Text.UTF8Encoding]::new($false))
@@ -323,7 +393,7 @@ $pin = [ordered]@{
     promotionEvidence = $evidencePath
     gate              = [ordered]@{
         sandboxProbe = "codex sandbox -P :read-only -- git --version rc 0 ($chosen)"
-        writeProbe   = "DENIED (exit $($wr.exit))"
+        writeProbe   = "DENIED (exit $($wr.exit), stderr '$signature'; unsandboxed control git init exit 0)"
         execProbe    = "$execClass ok=$okCount rejected=$rejCount model=$Model"
     }
 }

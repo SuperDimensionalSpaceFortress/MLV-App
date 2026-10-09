@@ -447,7 +447,8 @@ function Resolve-CodexExe {
         $pinSandbox = if ($null -ne $sandboxProp) { [string]$sandboxProp.Value } else { '' }
         if ($pinVersion -notmatch $CODEX_PIN_VERSION_PATTERN) {
             $r.pinState = 'PIN_INVALID'; $r.detail = "pin file $PinFile has no plain semver 'version' (got '$pinVersion')"
-        } elseif ($CODEX_PIN_WINDOWS_SANDBOXES -notcontains $pinSandbox) {
+        } elseif ($CODEX_PIN_WINDOWS_SANDBOXES -cnotcontains $pinSandbox) {
+            # Case-exact (PR #339 r2): 'Elevated' would otherwise pass and be forwarded verbatim.
             $r.pinState = 'PIN_INVALID'; $r.detail = "pin file $PinFile 'windowsSandbox' must be one of $($CODEX_PIN_WINDOWS_SANDBOXES -join '|') (got '$pinSandbox')"
         } else {
             $r.pinVersion = $pinVersion
@@ -458,7 +459,11 @@ function Resolve-CodexExe {
                 $r.pinState = 'PIN_EXE_MISSING'; $r.detail = "pinned exe absent: $candidate"
             } else {
                 $actual = Get-CodexCliVersion -CodexExe $candidate
-                if ($actual -ne $pinVersion) {
+                # Versions compare case-exactly; one that differs only in case is an invalid pin
+                # (the promoter writes the exe's own spelling), not a different version.
+                if ($null -ne $actual -and $actual -cne $pinVersion -and $actual -ieq $pinVersion) {
+                    $r.pinState = 'PIN_INVALID'; $r.detail = "pin file $PinFile 'version' '$pinVersion' differs only in case from the pinned exe's '$actual'"
+                } elseif ($actual -cne $pinVersion) {
                     $r.pinState = 'PIN_VERSION_MISMATCH'; $r.detail = "pinned exe $candidate reports '$actual', pin says '$pinVersion'"
                 } else {
                     $pinnedExe = $candidate
