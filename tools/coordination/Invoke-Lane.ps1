@@ -1112,10 +1112,18 @@ if ($cfg.engine -eq 'claude') {
     # -s and -c are set EXPLICITLY per call. ~/.codex/config.toml carries
     # approval_policy=never + sandbox_mode=danger-full-access globally, which is
     # fine for a watched interactive session and NOT fine for automated fan-out.
+    # CODEX-READONLY-SANDBOX-UNELEVATED-1 (HUB RULING 2026-10-09T00:20:00Z): on Windows the
+    # ELEVATED sandbox setup runs a read/execute validation that fails with os error 32 on an
+    # in-use node_repl.exe ("setup refresh had errors"), so exec_command is rejected and a
+    # read-only lane reviews nothing while still exiting 0. A read-only lane therefore runs the
+    # UNELEVATED Windows sandbox, set per call here and never in the user-global config.toml.
+    # workspace-write is untouched. Recorded as authority.windowsSandbox.
+    $windowsSandbox = if ($sandbox -eq 'read-only' -and [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) { 'unelevated' } else { 'default' }
+    $windowsSandboxArgs = if ($windowsSandbox -eq 'unelevated') { @('-c', 'windows.sandbox="unelevated"') } else { @() }
     $argv = @('exec',
               '-m', $codexLaunchModel,
               '-c', ("model_reasoning_effort=`"{0}`"" -f $cfg.effort),
-              '-s', $sandbox,
+              '-s', $sandbox) + $windowsSandboxArgs + @(
               '-C', $WorkDir,
               '-o', $lastPath,
               '--skip-git-repo-check',
@@ -1131,6 +1139,7 @@ if ($cfg.engine -eq 'claude') {
         permissionMode = 'n/a (codex)'
         allowedTools   = 'ALL'
         sandbox        = $sandbox
+        windowsSandbox = $windowsSandbox
         writableRoot   = if ($AllowEdits) { $WorkDir } else { $null }
         maxTurns       = 'n/a (codex exec has no turn cap)'
         bulkReads      = 'ALLOWED (codex takes no settings deny-list)'
