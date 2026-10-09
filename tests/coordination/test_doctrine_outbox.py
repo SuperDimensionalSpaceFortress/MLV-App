@@ -1258,6 +1258,7 @@ def test_law4_refusal_does_not_echo_a_home_path_or_a_token():
 # Named mutations for this block (each turns the named test red, then is reverted):
 #   M6  make card_validator_on_bus() always return False  -> test_r14_trap_to_traps_md_is_refused_once_the_bus_carries_the_validator
 #   M7  skip validate_cards_file() in drain                -> test_r14_card_the_validator_rejects_is_never_pushed
+#   M8  re-raise the CARD_INVALID instead of refusing per card -> test_r14_one_invalid_card_is_refused_alone_and_the_rest_of_the_drain_publishes
 
 CARDS = "specs/mlv-app/cards.md"
 FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures" / "bus-validate-cards"
@@ -1399,11 +1400,109 @@ def test_r14_card_the_validator_rejects_is_never_pushed(tmp_path):
     add_item(src, "20261007-bad-card.md", target=CARDS, body=CARD_BODY.replace("evidence: measured\n", ""))
     before = git(bare, "rev-parse", "master")
 
+    report = ob.drain(src, clone, "HEAD", tmp_path / "sent.jsonl", [], push=True)
+
+    assert [r["code"] for r in report["refused"]] == ["CARD_INVALID"]
+    assert "missing field 'evidence'" in report["refused"][0]["detail"]
+    assert report["published"] == [] and report["pushed"] is False
+    assert git(bare, "rev-parse", "master") == before
+
+
+OVERSIZED_CARD_BODY = CARD_BODY.replace("example-card", "oversized-card").replace("rule: the rule", "rule: " + "x" * 2100)
+
+
+@needs_node
+def test_r14_one_invalid_card_is_refused_alone_and_the_rest_of_the_drain_publishes(tmp_path, capsys):
+    """M8. The cards file is validated for the whole batch; a rejection used to raise out of drain()
+    and hold every other pending item. Now each card is judged on its own: the bad one is refused
+    (CARD_INVALID, with the validator's message) and the valid card and the receipt still land."""
+    bare, clone = init_bus(tmp_path)
+    add_validator(clone)
+    src = init_source(tmp_path)
+    add_item(src, "20261007-a-oversized.md", target=CARDS, body=OVERSIZED_CARD_BODY)
+    add_item(src, "20261007-b-good-card.md", target=CARDS, body=CARD_BODY)
+    add_item(src, "20261007-c-receipt.md", target="RECEIPTS.md", kind="receipt", body="### A receipt\nbody\n")
+    ledger = tmp_path / "sent.jsonl"
+
+    report = ob.drain(src, clone, "HEAD", ledger, [], push=True)
+
+    assert [(r["path"], r["code"]) for r in report["refused"]] == [("doctrine-outbox/20261007-a-oversized.md", "CARD_INVALID")]
+    assert "oversized-card" in report["refused"][0]["detail"] and "bytes" in report["refused"][0]["detail"]
+    assert sorted((p["path"], p["target"]) for p in report["published"]) == [
+        ("doctrine-outbox/20261007-b-good-card.md", CARDS), ("doctrine-outbox/20261007-c-receipt.md", "RECEIPTS.md")]
+    assert report["pushed"] is True
+    cards = git_raw(clone, "show", f"{report['commit']}:{CARDS}").decode("utf-8")
+    assert "## mlv-app/example-card" in cards and "oversized-card" not in cards
+    assert b"A receipt" in git_raw(clone, "show", f"{report['commit']}:RECEIPTS.md")
+    check = tmp_path / "check"
+    subprocess.run(["git", "clone", "-q", str(bare), str(check)], check=True, capture_output=True, text=True)
+    result = run_validator(check)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "1 card(s), 0 no-card line(s), 0 problem(s)" in result.stdout
+    assert len(ledger.read_text(encoding="utf-8").splitlines()) == 2, "only what landed is ledgered"
+
+    # The refused card is never retried by this ledger, and the CLI exit stays non-zero while it is pending.
+    rc = ob.main(["--repo", str(src), "drain", "--bus", str(clone), "--ref", "HEAD", "--ledger", str(ledger), "--push"])
+    captured = capsys.readouterr()
+    assert rc == 1 and "REFUSED doctrine-outbox/20261007-a-oversized.md: CARD_INVALID" in captured.err
+    assert json.loads(captured.out)["published"] == []
+
+
+@needs_node
+def test_r14_dry_run_also_reports_the_invalid_card_and_would_push_the_rest(tmp_path):
+    bare, clone = init_bus(tmp_path)
+    add_validator(clone)
+    src = init_source(tmp_path)
+    add_item(src, "20261007-a-oversized.md", target=CARDS, body=OVERSIZED_CARD_BODY)
+    add_item(src, "20261007-b-good-card.md", target=CARDS, body=CARD_BODY)
+    before = git(bare, "rev-parse", "master")
+
+    report = ob.drain(src, clone, "HEAD", tmp_path / "sent.jsonl", [], push=False)
+
+    assert [r["code"] for r in report["refused"]] == ["CARD_INVALID"]
+    assert [w["path"] for w in report["would_push"]] == ["doctrine-outbox/20261007-b-good-card.md"]
+    assert report["pushed"] is False and git(bare, "rev-parse", "master") == before
+
+
+@needs_node
+def test_r14_cards_that_are_only_invalid_together_still_refuse_the_whole_set(tmp_path):
+    """Two cards that each pass alone but clash (duplicate id): the per-card pass finds no offender,
+    so the original whole-set refusal stands and nothing is published (fail closed)."""
+    bare, clone = init_bus(tmp_path)
+    add_validator(clone)
+    src = init_source(tmp_path)
+    add_item(src, "20261007-a-card.md", target=CARDS, body=CARD_BODY)
+    add_item(src, "20261007-b-card.md", target=CARDS, body=CARD_BODY.replace("the mechanism", "another mechanism"))
+    before = git(bare, "rev-parse", "master")
+
     with pytest.raises(ob.Refusal) as excinfo:
         ob.drain(src, clone, "HEAD", tmp_path / "sent.jsonl", [], push=True)
 
-    assert excinfo.value.code == "CARD_INVALID"
-    assert "missing field 'evidence'" in excinfo.value.detail
+    assert excinfo.value.code == "CARD_INVALID" and "duplicate card id" in excinfo.value.detail
+    assert git(bare, "rev-parse", "master") == before
+
+
+@needs_node
+def test_r14_a_validator_failure_is_not_a_card_verdict_and_refuses_the_whole_set(tmp_path, monkeypatch):
+    """Only exit 1 (INVALID) is a per-card verdict. Any other validator outcome publishes nothing."""
+    bare, clone = init_bus(tmp_path)
+    add_validator(clone)
+    src = init_source(tmp_path)
+    add_item(src, "20261007-a-good-card.md", target=CARDS, body=CARD_BODY)
+    add_item(src, "20261007-b-receipt.md", target="RECEIPTS.md", kind="receipt", body="### A receipt\nbody\n")
+    before = git(bare, "rev-parse", "master")
+    real_run, node = subprocess.run, ob.find_node()
+
+    def run(cmd, *a, **kw):
+        if cmd[0] == node:
+            return subprocess.CompletedProcess(cmd, 2, "", "boom")
+        return real_run(cmd, *a, **kw)
+    monkeypatch.setattr(ob.subprocess, "run", run)
+
+    with pytest.raises(ob.Refusal) as excinfo:
+        ob.drain(src, clone, "HEAD", tmp_path / "sent.jsonl", [], push=True)
+
+    assert excinfo.value.code == "CARD_VALIDATOR_FAILED"
     assert git(bare, "rev-parse", "master") == before
 
 

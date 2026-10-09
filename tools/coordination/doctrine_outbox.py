@@ -577,7 +577,7 @@ def ensure_cards_file(path: pathlib.Path) -> None:
         path.write_bytes(CARDS_TITLE.encode("utf-8"))
 
 
-def validate_cards_file(wt: pathlib.Path) -> None:
+def validate_cards_file(wt: pathlib.Path, cards_file: pathlib.Path | None = None) -> None:
     """Run the tip's own validator over the would-be cards file in the drain's temp worktree.
     It only reads; any outcome but exit 0 refuses the publish (fail closed)."""
     node = find_node()
@@ -587,7 +587,7 @@ def validate_cards_file(wt: pathlib.Path) -> None:
         raise Refusal("CARD_VALIDATOR_ABSENT", f"{CARD_VALIDATOR_REL} is not in the bus worktree")
     try:
         proc = subprocess.run(
-            [node, str(wt / CARD_VALIDATOR_REL), "--bus", str(wt), "--file", str(wt / CARDS_TARGET), "--project", PROJECT],
+            [node, str(wt / CARD_VALIDATOR_REL), "--bus", str(wt), "--file", str(cards_file or wt / CARDS_TARGET), "--project", PROJECT],
             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120,
         )
     except (OSError, subprocess.TimeoutExpired) as e:
@@ -597,6 +597,24 @@ def validate_cards_file(wt: pathlib.Path) -> None:
         raise Refusal("CARD_INVALID", out[:1000])
     if proc.returncode != 0:
         raise Refusal("CARD_VALIDATOR_FAILED", f"exit {proc.returncode}: {out[:400]}")
+
+
+def invalid_cards(wt: pathlib.Path, cards: list[dict]) -> list[tuple[dict, str]]:
+    """The cards the validator rejects ON THEIR OWN, each with its message. Each card is judged in a
+    file of its own (title + that card) outside the repo, by the same tip validator. A verdict other
+    than valid/invalid (node gone, timeout, crash) is not a verdict on any card and propagates."""
+    bad = []
+    with tempfile.TemporaryDirectory(prefix="doctrine-outbox-card-") as tmp:
+        solo = pathlib.Path(tmp) / "cards.md"
+        for c in cards:
+            solo.write_bytes((CARDS_TITLE + c["block"]).encode("utf-8"))
+            try:
+                validate_cards_file(wt, solo)
+            except Refusal as e:
+                if e.code != "CARD_INVALID":
+                    raise
+                bad.append((c, e.detail))
+    return bad
 
 
 def git_commit(worktree: pathlib.Path, message: str) -> str:
@@ -747,7 +765,20 @@ def drain(repo: pathlib.Path, bus_repo: pathlib.Path, ref: str, ledger: pathlib.
                 if not head_bytes.startswith(tip_bytes):
                     raise Refusal("PREFIX_BROKEN", target)
             if any(c["target"] == CARDS_TARGET for c in pending):
-                validate_cards_file(wt)
+                try:
+                    validate_cards_file(wt)
+                except Refusal as e:
+                    if e.code != "CARD_INVALID":
+                        raise
+                    bad = invalid_cards(wt, [c for c in pending if c["target"] == CARDS_TARGET])
+                    if not bad:
+                        raise  # invalid only together (duplicate id ...): the whole card set stays refused
+                    for c, detail in bad:
+                        report["refused"].append({"path": c["path"], "code": "CARD_INVALID", "detail": detail})
+                    dropped = {c["key"] for c, _detail in bad}
+                    candidates = [c for c in candidates if c["key"] not in dropped]
+                    attempt -= 1  # a per-card refusal is not a push attempt
+                    continue  # rebuild the commits without the refused cards and validate again
             if not push:
                 report["commit"] = head
                 report["would_push"] = [{"path": c["path"], "key": c["key"], "target": c["target"]} for c in pending]
