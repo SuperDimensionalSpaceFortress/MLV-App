@@ -599,21 +599,42 @@ def validate_cards_file(wt: pathlib.Path, cards_file: pathlib.Path | None = None
         raise Refusal("CARD_VALIDATOR_FAILED", f"exit {proc.returncode}: {out[:400]}")
 
 
-def invalid_cards(wt: pathlib.Path, cards: list[dict]) -> list[tuple[dict, str]]:
-    """The cards the validator rejects ON THEIR OWN, each with its message. Each card is judged in a
-    file of its own (title + that card) outside the repo, by the same tip validator. A verdict other
-    than valid/invalid (node gone, timeout, crash) is not a verdict on any card and propagates."""
-    bad = []
+def invalid_cards(wt: pathlib.Path, tip: str, cards: list[dict]) -> list[tuple[dict, str, str]]:
+    """The cards to refuse, each as (card, code, validator message). Judged by the same tip validator
+    on a file outside the repo that starts as the cards file AT THE BUS TIP -- exactly the base the
+    batch validation used -- and takes the cards in drain order, keeping each one that passes: a
+    card is judged as (tip + the cards kept before it + that card). A card that clashes with the tip
+    or with an earlier pending card (duplicate id, any cross-card rule) is therefore named and
+    refused CARD_INVALID alone; the later-sorted of two clashing pending cards is the one refused.
+    A tip file the validator already rejects names no card: every card gets CARD_INVALID_UNATTRIBUTED
+    and nothing is published into it. A verdict other than valid/invalid (node gone, timeout, crash)
+    is not a verdict on any card and propagates."""
+    tip_bytes = cat_file_blob(wt, tip, CARDS_TARGET)
     with tempfile.TemporaryDirectory(prefix="doctrine-outbox-card-") as tmp:
-        solo = pathlib.Path(tmp) / "cards.md"
-        for c in cards:
-            solo.write_bytes((CARDS_TITLE + c["block"]).encode("utf-8"))
+        trial = pathlib.Path(tmp) / "cards.md"
+        if tip_bytes:
+            trial.write_bytes(tip_bytes)
             try:
-                validate_cards_file(wt, solo)
+                validate_cards_file(wt, trial)
             except Refusal as e:
                 if e.code != "CARD_INVALID":
                     raise
-                bad.append((c, e.detail))
+                return [(c, "CARD_INVALID_UNATTRIBUTED", e.detail) for c in cards]
+        else:
+            ensure_cards_file(trial)
+        kept = trial.read_bytes()
+        bad = []
+        for c in cards:
+            trial.write_bytes(kept)
+            append_block_to_file(trial, c["block"])
+            try:
+                validate_cards_file(wt, trial)
+            except Refusal as e:
+                if e.code != "CARD_INVALID":
+                    raise
+                bad.append((c, "CARD_INVALID", e.detail))
+                continue
+            kept = trial.read_bytes()
     return bad
 
 
@@ -710,10 +731,15 @@ def drain(repo: pathlib.Path, bus_repo: pathlib.Path, ref: str, ledger: pathlib.
 
     attempted: dict[str, str] = {}  # key -> the bus commit WE built for it, across attempts
     attempt = 0
+    card_pass_len = None  # candidates before the last per-card refusal; the next pass must hold fewer
     while True:
         attempt += 1
         # Re-gated on every attempt: a refetched tip may be the one that lands the validator.
         candidates = r14_gate(bus_repo, tip, candidates, report)
+        if card_pass_len is not None:
+            if len(candidates) >= card_pass_len:
+                raise Refusal("CARD_PASS_NOT_SHRINKING", f"{len(candidates)} candidates after a per-card refusal pass over {card_pass_len}")
+            card_pass_len = None
         pending = []
         tip_sent_rows = []
         landed_rows = []
@@ -770,12 +796,15 @@ def drain(repo: pathlib.Path, bus_repo: pathlib.Path, ref: str, ledger: pathlib.
                 except Refusal as e:
                     if e.code != "CARD_INVALID":
                         raise
-                    bad = invalid_cards(wt, [c for c in pending if c["target"] == CARDS_TARGET])
+                    cards = [c for c in pending if c["target"] == CARDS_TARGET]
+                    bad = invalid_cards(wt, tip, cards)
                     if not bad:
-                        raise  # invalid only together (duplicate id ...): the whole card set stays refused
-                    for c, detail in bad:
-                        report["refused"].append({"path": c["path"], "code": "CARD_INVALID", "detail": detail})
-                    dropped = {c["key"] for c, _detail in bad}
+                        # Invalid, yet no card can be named: that card set is not published (fail closed).
+                        bad = [(c, "CARD_INVALID_UNATTRIBUTED", e.detail) for c in cards]
+                    for c, code, detail in bad:
+                        report["refused"].append({"path": c["path"], "code": code, "detail": detail})
+                    dropped = {c["key"] for c, _code, _detail in bad}
+                    card_pass_len = len(candidates)
                     candidates = [c for c in candidates if c["key"] not in dropped]
                     attempt -= 1  # a per-card refusal is not a push attempt
                     continue  # rebuild the commits without the refused cards and validate again
