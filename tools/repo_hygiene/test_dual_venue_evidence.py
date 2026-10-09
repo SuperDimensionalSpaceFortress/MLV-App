@@ -4427,6 +4427,185 @@ class VenueQuietUnknownIsNotUnmetTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------------------------------
+# VENUE-QUIET-ATTRIBUTION-1: the probe job reports schema v2 -- the v1 fields plus WHAT is using the venue (top 10 \Process(*) instances as percent of the whole machine,
+# Process _Total / Idle / System, privileged / user / DPC / interrupt time, per-core load with P- and E-cores apart). The gate PRINTS the attribution after its verdict and
+# decides nothing with it: the QUIET decision, threshold, cooldown, exit codes and the offline -SamplesJson output are byte-identical to HEAD~ (proved by a diff run, not here).
+STUB_UM_RUN_FOR_QUIET_LINE = r"""param([string]$ScriptPath, [string]$JobId, [string]$AgentShare, [int]$TimeoutSec, [int]$MaxQueueWaitSec, [int]$MaxClaimedWaitSec)
+# test stub for tools\profiling\um-run.ps1: answers with UMSTUB_LINE verbatim as the probe's VENUE_QUIET= line
+[pscustomobject]@{ exitCode = 0; stdout = 'VENUE_QUIET=' + $env:UMSTUB_LINE }
+"""
+V1_PROBE = {"schema": "mlv-app/venue-quiet-probe/v1", "host": "BACHELOR", "samples": [50.0, 50.0, 50.0],
+            "top": [{"name": "pwsh", "pid": 4242, "cpuSeconds": 12.5}]}
+V2_PROBE = {"schema": "mlv-app/venue-quiet-probe/v2", "host": "BACHELOR", "samples": [50.0, 50.0, 50.0],
+            "top": [{"name": "pwsh", "pid": 4242, "cpuSeconds": 12.5}],
+            "cpu_count": 16, "percent_basis": "per-process percents are percent of the whole machine (counter / cpu_count)",
+            "processor": {"total_percent": 50.0, "privileged_percent": 30.0, "user_percent": 20.0, "dpc_percent": 0.5, "interrupt_percent": 1.0},
+            "process_total_percent": 70.0, "idle_percent": 50.0, "system_percent": 2.5,
+            "top_processes": [{"instance": "aws", "pid": 43644, "percent": 4.79}, {"instance": "system", "pid": 4, "percent": 2.5}, {"instance": "pwsh#3", "pid": None, "percent": 1.2}],
+            "attributed_percent": 8.49, "attribution_gap_points": 41.51,
+            "core_topology": "logical-processor-information-ex",
+            "core_classes": {"P": {"count": 8, "mean_percent": 60.0, "max_percent": 80.0}, "E": {"count": 16, "mean_percent": 40.0, "max_percent": 55.5}},
+            "cores": [{"instance": "0,0", "core_class": "P", "efficiency_class": 1, "percent": 60.0}, {"instance": "0,8", "core_class": "E", "efficiency_class": 0, "percent": 40.0}],
+            "notes": {}}
+
+
+@requires_windows_pwsh
+class VenueQuietAttributionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory(prefix="venue-quiet-attribution-")
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+        self.tree = self.tmp / "tree"
+        self.dv = self.tree / "tools" / "profiling" / "dual-venue"
+        shutil.copytree(DV, self.dv, ignore=shutil.ignore_patterns("__pycache__"))
+        share = self.tmp / "share-bachelor"
+        (share / "inbox").mkdir(parents=True)
+        (share / "running").mkdir()
+        table = json.loads((self.dv / "venues.json").read_text(encoding="utf-8"))
+        table["venues"]["bachelor"]["agentShare"] = str(share)
+        table["venues"]["bachelor"]["agentRoot"] = str(share) + "-root"
+        (self.dv / "venues.json").write_text(json.dumps(table), encoding="utf-8")
+        (self.tree / "tools" / "profiling" / "um-run.ps1").write_text(STUB_UM_RUN_FOR_QUIET_LINE, encoding="utf-8")
+        self.work = self.tmp / "work"
+
+    def gate(self, probe: dict) -> subprocess.CompletedProcess:
+        import os
+        return subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(self.dv / "Wait-VenueQuiet.ps1"), "-Venue", "bachelor",
+                               "-WorkDir", str(self.work), "-MaxWaitSec", "1", "-RecheckSec", "1"],
+                              capture_output=True, text=True, timeout=180, env=dict(os.environ, UMSTUB_LINE=json.dumps(probe)))
+
+    def test_a_v2_line_is_attributed_after_the_verdict_and_the_verdict_is_unchanged(self) -> None:
+        proc = self.gate(V2_PROBE)
+        out = proc.stdout
+        self.assertEqual(proc.returncode, 0, out + proc.stderr)
+        self.assertRegex(out, r"(?m)^COOLDOWN_UNMET mean=50\.0% threshold=20(\.0)?% waitedSec=\d+$")
+        self.assertRegex(out, r"(?m)^  top pwsh pid=4242 cpuSeconds=12\.5$", "the v1 top lines are still printed")
+        self.assertRegex(out, r"(?m)^  attr cpus=16 processor total=50\.0% privileged=30\.0% user=20\.0% dpc=0\.5% interrupt=1\.0%$")
+        self.assertRegex(out, r"(?m)^  attr process total=70\.0% idle=50\.0% system=2\.5% attributed=8\.5% gapVsProcessorTotal=41\.5 points$")
+        self.assertRegex(out, r"(?m)^  attr proc aws pid=43644 pct=4\.8%$")
+        self.assertRegex(out, r"(?m)^  attr proc pwsh#3 pid=n/a pct=1\.2%$", "a process with no stable pid prints n/a, not a guess")
+        self.assertRegex(out, r"(?m)^  attr cores topology=logical-processor-information-ex P n=8 mean=60\.0% max=80\.0% \| E n=16 mean=40\.0% max=55\.5%$")
+        self.assertLess(out.index("COOLDOWN_UNMET"), out.index("  attr cpus="), "the attribution follows the verdict, it never precedes or replaces it")
+
+    def test_a_quiet_v2_probe_is_still_quiet_and_is_attributed_too(self) -> None:
+        proc = self.gate(dict(V2_PROBE, samples=[5.0, 5.0, 5.0]))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertRegex(proc.stdout, r"(?m)^QUIET mean=5\.0% threshold=20(\.0)?% waitedSec=\d+$")
+        self.assertIn("  attr proc aws pid=43644", proc.stdout)
+
+    def test_a_v1_line_still_parses_and_prints_no_attribution(self) -> None:
+        proc = self.gate(V1_PROBE)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertRegex(proc.stdout, r"(?m)^COOLDOWN_UNMET mean=50\.0% threshold=20(\.0)?% waitedSec=\d+$")
+        self.assertRegex(proc.stdout, r"(?m)^  top pwsh pid=4242 cpuSeconds=12\.5$")
+        self.assertNotIn("  attr ", proc.stdout, "a v1 probe carries no attribution; the gate must not invent any")
+
+    def test_a_null_counter_with_a_reason_is_accepted_and_shown_as_unavailable(self) -> None:
+        probe = json.loads(json.dumps(V2_PROBE))
+        probe["processor"]["dpc_percent"] = None
+        probe["idle_percent"] = None
+        probe["attributed_percent"] = None
+        probe["attribution_gap_points"] = None
+        probe["core_topology"] = "unknown"
+        probe["core_classes"] = {"unknown": {"count": 2, "mean_percent": 50.0, "max_percent": 60.0}}
+        probe["notes"] = {"processor.dpc_percent": "counter group 'processor' returned no valid sample", "core_class": "core_class unknown: GetLogicalProcessorInformationEx failed"}
+        proc = self.gate(probe)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertRegex(proc.stdout, r"(?m)^COOLDOWN_UNMET mean=50\.0% ")
+        self.assertIn("dpc=n/a", proc.stdout)
+        self.assertIn("idle=n/a", proc.stdout)
+        self.assertIn("gapVsProcessorTotal=n/a", proc.stdout)
+        self.assertRegex(proc.stdout, r"(?m)^  attr note processor\.dpc_percent: counter group 'processor' returned no valid sample$")
+        self.assertRegex(proc.stdout, r"(?m)^  attr cores topology=unknown unknown n=2 mean=50\.0% max=60\.0%$")
+
+    def test_malformed_v2_fields_never_change_the_verdict_or_the_exit_code(self) -> None:
+        proc = self.gate(dict(V2_PROBE, processor="not-an-object", top_processes=7, core_classes=None, notes=None))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertRegex(proc.stdout, r"(?m)^COOLDOWN_UNMET mean=50\.0% ")
+
+    def test_an_unmeasured_venue_prints_no_attribution_and_still_exits_six(self) -> None:
+        proc = self.gate(dict(V2_PROBE, samples=[5.0, None, 5.0]))
+        self.assertEqual(proc.returncode, 6, proc.stdout + proc.stderr)
+        self.assertRegex(proc.stdout, r"(?m)^VENUE_QUIET_UNKNOWN mean=UNKNOWN threshold=")
+        self.assertNotIn("  attr ", proc.stdout)
+
+    def test_the_header_states_the_percent_basis_and_the_v2_additions(self) -> None:
+        header = (DV / "Wait-VenueQuiet.ps1").read_text(encoding="utf-8").split("[CmdletBinding", 1)[0]
+        self.assertIn("schema v2", header)
+        self.assertIn("percent of the WHOLE machine: counter / logical processors", header)
+        self.assertIn("core_class unknown", header)
+        self.assertIn("The v1 `samples` and `top` fields are unchanged", header)
+
+    def test_the_real_probe_job_emits_v2_with_every_field_typed_or_null_with_a_reason(self) -> None:
+        text = (DV / "Wait-VenueQuiet.ps1").read_text(encoding="utf-8")
+        job = re.search(r"\$probeText = @'\r?\n(.*?)\r?\n'@", text, re.S)
+        self.assertIsNotNone(job, "the probe job here-string must stay extractable")
+        body = job.group(1)
+        self.assertEqual(body.count("Start-Sleep -Seconds 12"), 1, "the 12 s sample cadence is the gate's contract; v2 must not change it")
+        self.assertIn("$samples += ,$set.v1", body)
+        job_file = self.tmp / "probe-job.ps1"
+        job_file.write_text(body.replace("Start-Sleep -Seconds 12", "Start-Sleep -Seconds 0"), encoding="utf-8")
+        proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(job_file)], capture_output=True, text=True, timeout=240)
+        lines = [ln for ln in proc.stdout.splitlines() if ln.startswith("VENUE_QUIET=")]
+        self.assertEqual(len(lines), 1, proc.stdout + proc.stderr)
+        p = json.loads(lines[0][len("VENUE_QUIET="):])
+
+        def number(v) -> bool:
+            return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+        def number_or_noted(container: dict, key: str, note_key: str) -> None:
+            v = container[key]
+            if v is None:
+                self.assertTrue(isinstance(p["notes"].get(note_key), str) and p["notes"][note_key], f"{note_key} is null without a reason")
+            else:
+                self.assertTrue(number(v) and v >= 0, f"{note_key}={v!r}")
+
+        self.assertEqual(p["schema"], "mlv-app/venue-quiet-probe/v2")
+        self.assertIsInstance(p["host"], str)
+        # v1 fields, unchanged
+        self.assertEqual(len(p["samples"]), 3)
+        self.assertTrue(all(s is None or (number(s) and 0 <= s <= 100) for s in p["samples"]), p["samples"])
+        self.assertIsInstance(p["top"], list)
+        self.assertTrue(all(set(t) == {"name", "pid", "cpuSeconds"} for t in p["top"]), p["top"])
+        # v2 additions
+        self.assertTrue(isinstance(p["cpu_count"], int) and p["cpu_count"] > 0)
+        self.assertIn("percent of the whole machine", p["percent_basis"])
+        self.assertEqual(set(p["processor"]), {"total_percent", "privileged_percent", "user_percent", "dpc_percent", "interrupt_percent"})
+        for k in p["processor"]:
+            number_or_noted(p["processor"], k, f"processor.{k}")
+        for k in ("process_total_percent", "idle_percent", "system_percent"):
+            number_or_noted(p, k, k)
+        self.assertIsInstance(p["top_processes"], list)
+        self.assertLessEqual(len(p["top_processes"]), 10)
+        pcts = [t["percent"] for t in p["top_processes"]]
+        self.assertEqual(pcts, sorted(pcts, reverse=True), "the ranking is descending")
+        for t in p["top_processes"]:
+            self.assertIsInstance(t["instance"], str)
+            self.assertNotIn(t["instance"], ("_total", "idle"), "_Total and Idle are never ranked")
+            self.assertTrue(t["pid"] is None or isinstance(t["pid"], int))
+            self.assertTrue(number(t["percent"]) and t["percent"] >= 0)
+        if p["top_processes"]:
+            self.assertTrue(number(p["attributed_percent"]))
+        self.assertTrue(p["attributed_percent"] is None or number(p["attributed_percent"]))
+        self.assertTrue(p["attribution_gap_points"] is None or number(p["attribution_gap_points"]))
+        self.assertIn(p["core_topology"], ("logical-processor-information-ex", "unknown"))
+        self.assertIsInstance(p["core_classes"], dict)
+        self.assertIsInstance(p["cores"], list)
+        if not p["cores"]:
+            self.assertIn("cores", p["notes"], "no per-core data and no reason")
+        for c in p["cores"]:
+            self.assertRegex(c["instance"], r"^\d+,\d+$")
+            self.assertIn(c["core_class"], ("P", "E", "uniform", "unknown"))
+            self.assertTrue(c["efficiency_class"] is None or isinstance(c["efficiency_class"], int))
+            self.assertTrue(number(c["percent"]) and c["percent"] >= 0)
+            if p["core_topology"] == "unknown":
+                self.assertEqual(c["core_class"], "unknown", "a topology that could not be derived must say unknown, never guess a class")
+        if p["core_topology"] == "unknown":
+            self.assertIn("core_class", p["notes"])
+        self.assertTrue(all(isinstance(k, str) and isinstance(v, str) and v for k, v in p["notes"].items()))
+
+
+# ---------------------------------------------------------------------------------------------------
 class LegSpecSchemaTests(unittest.TestCase):
     def setUp(self) -> None:
         try:
