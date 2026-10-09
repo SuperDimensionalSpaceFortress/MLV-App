@@ -4669,6 +4669,22 @@ function Get-Counter {
 }
 """
 
+# Canned Get-Process for the top[] before/after snapshots: call 1 is the "before" list, call 2 the "after" list. Each entry is
+# {id, name, cpu (seconds), start (FILETIME or null = StartTime unreadable)}.
+GET_PROCESS_PRELUDE = r"""$script:Snaps = @(ConvertFrom-Json -InputObject @'
+__SNAPSHOTS__
+'@)
+$script:SnapNo = 0
+function Get-Process {
+    [CmdletBinding()] param()
+    $snap = $script:Snaps[$script:SnapNo]; $script:SnapNo++
+    foreach ($e in @($snap)) {
+        $st = $null; if ($null -ne $e.start) { $st = [datetime]::FromFileTimeUtc([int64]$e.start) }
+        [pscustomobject]@{ Id = [int]$e.id; Name = [string]$e.name; TotalProcessorTime = [TimeSpan]::FromSeconds([double]$e.cpu); StartTime = $st }
+    }
+}
+"""
+
 
 @requires_windows_pwsh
 class VenueQuietValidSampleTests(unittest.TestCase):
@@ -4677,14 +4693,17 @@ class VenueQuietValidSampleTests(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.tmp = Path(tmp.name)
 
-    def probe(self, sets: list, cpus: int = 4) -> dict:
+    def probe(self, sets: list, cpus: int = 4, snapshots: list | None = None) -> dict:
         text = (DV / "Wait-VenueQuiet.ps1").read_text(encoding="utf-8")
         body = re.search(r"\$probeText = @'\r?\n(.*?)\r?\n'@", text, re.S).group(1)
         self.assertIn("[Environment]::ProcessorCount", body)
         body = body.replace("[Environment]::ProcessorCount", str(cpus)).replace("Start-Sleep -Seconds 12", "Start-Sleep -Seconds 0")
         canned = json.dumps([{"s": s} for s in sets])
         job = self.tmp / "canned-probe-job.ps1"
-        job.write_text(GET_COUNTER_PRELUDE.replace("__CANNED__", canned) + body, encoding="utf-8")
+        prelude = GET_COUNTER_PRELUDE.replace("__CANNED__", canned)
+        if snapshots is not None:
+            prelude += GET_PROCESS_PRELUDE.replace("__SNAPSHOTS__", json.dumps(snapshots))
+        job.write_text(prelude + body, encoding="utf-8")
         proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(job)], capture_output=True, text=True, timeout=180)
         lines = [ln for ln in proc.stdout.splitlines() if ln.startswith("VENUE_QUIET=")]
         self.assertEqual(len(lines), 1, proc.stdout + proc.stderr)
@@ -4844,6 +4863,106 @@ class VenueQuietValidSampleTests(unittest.TestCase):
         p = self.probe([mk(20), mk(30), mk(20)])
         self.assertEqual(p["unattributed_kernel_percent"], 3.33)
         self.assertNotIn("unattributed_kernel_dropped_samples", p["notes"])
+
+    # VENUE-QUIET-ACTIVE-PAIR-MISSING-NOTE-1 (fable/sol hardening on PR #347 r2): a dropped-samples note divides by the sets that HAD the valid pair (kept + dropped), and a set with a
+    # missing pair member is named in its own note. No value, verdict or threshold moves.
+    def test_a_set_with_total_valid_and_idle_missing_is_not_counted_as_a_pair_in_the_dropped_note(self) -> None:
+        # 4 CPUs: set 1 pair valid (active 20); set 2 has Process(_Total) but NO Process(Idle); set 3 is a skewed pair (Idle above _Total -> negative)
+        cpu = [_cs("processor", "_total", "% processor time", 30)]
+        s1 = _flat(cpu, _proc("_total", 0, 160), _proc("idle", 0, 80), _proc("a", 1, 40))
+        s2 = _flat(cpu, _proc("_total", 0, 160), _proc("a", 1, 40))
+        s3 = _flat(cpu, _proc("_total", 0, 100), _proc("idle", 0, 120), _proc("a", 1, 40))
+        p = self.probe([s1, s2, s3])
+        self.assertEqual(p["process_active_percent"], 20.0, "the value is the mean of the one valid pair")
+        self.assertRegex(p["notes"]["process_active_dropped_samples"], r"^1 of 2 sample sets", "the set with no Idle never was a pair, so 1 of 3 overstates the pairs read")
+        self.assertRegex(p["notes"]["process_active_dropped_samples"], r"mean of the other 1\)")
+        self.assertRegex(p["notes"]["process_active_pair_missing"], r"^1 set\(s\) had no valid Process\(Idle\)/Process\(_Total\) pair")
+
+    def test_a_set_with_idle_valid_and_total_invalid_is_named_as_a_missing_pair_and_adds_no_dropped_note(self) -> None:
+        cpu = [_cs("processor", "_total", "% processor time", 30)]
+        ok = lambda: _flat(cpu, _proc("_total", 0, 160), _proc("idle", 0, 80), _proc("a", 1, 40))
+        bad = _flat(cpu, _proc("_total", 0, 160, valid=False), _proc("idle", 0, 80), _proc("a", 1, 40))
+        p = self.probe([ok(), bad, ok()])
+        self.assertEqual(p["process_active_percent"], 20.0)
+        self.assertNotIn("process_active_dropped_samples", p["notes"], "nothing read negative")
+        self.assertRegex(p["notes"]["process_active_pair_missing"], r"^1 set\(s\)")
+
+    def test_a_complete_set_of_pairs_adds_no_pair_missing_note(self) -> None:
+        cpu = [_cs("processor", "_total", "% processor time", 30)]
+        p = self.probe([_flat(cpu, _proc("_total", 0, 160), _proc("idle", 0, 80), _proc("a", 1, 40)) for _ in range(3)])
+        self.assertNotIn("process_active_pair_missing", p["notes"])
+        self.assertNotIn("unattributed_kernel_pair_missing", p["notes"])
+        self.assertNotIn("top_pid_reuse_dropped", p["notes"])
+
+    def test_the_all_negative_reason_counts_only_the_sets_that_had_a_pair(self) -> None:
+        cpu = [_cs("processor", "_total", "% processor time", 30)]
+        skew = lambda: _flat(cpu, _proc("_total", 0, 100), _proc("idle", 0, 120), _proc("a", 1, 40))
+        nopair = _flat(cpu, _proc("_total", 0, 100), _proc("a", 1, 40))
+        p = self.probe([skew(), nopair, skew()])
+        self.assertIsNone(p["process_active_percent"])
+        self.assertIn("2 of 2 sample sets", p["notes"]["process_active_percent"], "2 of 3 counts the set that never had an Idle sample as a pair")
+        self.assertRegex(p["notes"]["process_active_pair_missing"], r"^1 set\(s\)")
+
+    def test_a_kernel_sample_set_with_processor_total_null_lands_in_the_pair_missing_note_not_the_denominator(self) -> None:
+        # Process active 20 in every set; Processor(_Total) 30 / ABSENT / 15 -> kernel 10, no pair, -5 (invalid)
+        proc = lambda: _flat(_proc("_total", 0, 160), _proc("idle", 0, 80), _proc("a", 1, 40))
+        cpu = lambda v: [_cs("processor", "_total", "% processor time", v)]
+        p = self.probe([_flat(cpu(30), proc()), _flat(proc()), _flat(cpu(15), proc())])
+        self.assertEqual(p["unattributed_kernel_percent"], 10.0, "the value is the mean of the one valid kernel sample")
+        self.assertRegex(p["notes"]["unattributed_kernel_dropped_samples"], r"^1 of 2 sample sets")
+        self.assertRegex(p["notes"]["unattributed_kernel_pair_missing"], r"^1 set\(s\) had no valid Processor\(_Total\)/Process active pair")
+        self.assertNotIn("process_active_pair_missing", p["notes"], "the active pair itself was complete in every set")
+
+    def test_the_all_negative_kernel_reason_divides_by_the_sets_that_had_both_members(self) -> None:
+        proc = lambda: _flat(_proc("_total", 0, 160), _proc("idle", 0, 80), _proc("a", 1, 40))
+        cpu = lambda v: [_cs("processor", "_total", "% processor time", v)]
+        p = self.probe([_flat(cpu(15), proc()), _flat(proc()), _flat(cpu(15), proc())])
+        self.assertIsNone(p["unattributed_kernel_percent"])
+        self.assertIn("2 of 2 sample sets", p["notes"]["unattributed_kernel_percent"], "2 of 3 counts the set with no Processor(_Total) as a pair read")
+        self.assertRegex(p["notes"]["unattributed_kernel_pair_missing"], r"^1 set\(s\)")
+
+    # VENUE-QUIET-TOP-CPUSECONDS-PID-REUSE-1: top[].cpuSeconds is after-minus-before, so it is keyed on (pid, process start time); a pid reused between the two
+    # snapshots is a different process and is dropped and counted, never a negative or a foreign cpuSeconds.
+    T1, T2, T3 = 133000000000000000, 133000000500000000, 133000001000000000
+
+    def pid_probe(self, before: list, after: list) -> dict:
+        cpu = [_cs("processor", "_total", "% processor time", 30)]
+        sets = [_flat(cpu, _proc("_total", 0, 160), _proc("idle", 0, 80), _proc("a", 1, 40)) for _ in range(3)]
+        return self.probe(sets, snapshots=[before, after])
+
+    def test_a_pid_reused_between_snapshots_is_dropped_never_a_negative_cpuseconds(self) -> None:
+        before = [{"id": 100, "name": "old", "cpu": 50.0, "start": self.T1}, {"id": 200, "name": "steady", "cpu": 10.0, "start": self.T3}]
+        after = [{"id": 100, "name": "new", "cpu": 2.0, "start": self.T2}, {"id": 200, "name": "steady", "cpu": 15.0, "start": self.T3}]
+        p = self.pid_probe(before, after)
+        self.assertEqual([(t["name"], t["pid"], t["cpuSeconds"]) for t in p["top"]], [("steady", 200, 5.0)], "-48.0 for pid 100 is the old process's time subtracted from another's")
+        self.assertTrue(all(t["cpuSeconds"] >= 0 for t in p["top"]))
+        self.assertRegex(p["notes"]["top_pid_reuse_dropped"], r"^1 process")
+
+    def test_a_pid_reused_by_a_busier_process_does_not_report_its_whole_cpu_time_as_the_old_ones(self) -> None:
+        before = [{"id": 100, "name": "old", "cpu": 1.0, "start": self.T1}, {"id": 200, "name": "steady", "cpu": 10.0, "start": self.T3}]
+        after = [{"id": 100, "name": "new", "cpu": 90.0, "start": self.T2}, {"id": 200, "name": "steady", "cpu": 11.0, "start": self.T3}]
+        p = self.pid_probe(before, after)
+        self.assertEqual([(t["pid"], t["cpuSeconds"]) for t in p["top"]], [(200, 1.0)], "89.0 would be a foreign process's lifetime CPU attributed to the window")
+        self.assertRegex(p["notes"]["top_pid_reuse_dropped"], r"^1 process")
+
+    def test_an_unreadable_start_time_cannot_be_verified_so_it_is_dropped_and_counted(self) -> None:
+        before = [{"id": 100, "name": "locked", "cpu": 1.0, "start": None}, {"id": 200, "name": "steady", "cpu": 10.0, "start": self.T3}]
+        after = [{"id": 100, "name": "locked", "cpu": 9.0, "start": None}, {"id": 200, "name": "steady", "cpu": 12.0, "start": self.T3}]
+        p = self.pid_probe(before, after)
+        self.assertEqual([(t["pid"], t["cpuSeconds"]) for t in p["top"]], [(200, 2.0)])
+        self.assertRegex(p["notes"]["top_pid_reuse_dropped"], r"^1 process")
+
+    def test_the_same_process_in_both_snapshots_keeps_its_cpuseconds_and_adds_no_note(self) -> None:
+        before = [{"id": 100, "name": "busy", "cpu": 10.0, "start": self.T1}, {"id": 200, "name": "steady", "cpu": 10.0, "start": self.T3}]
+        after = [{"id": 100, "name": "busy", "cpu": 17.5, "start": self.T1}, {"id": 200, "name": "steady", "cpu": 11.0, "start": self.T3}]
+        p = self.pid_probe(before, after)
+        self.assertEqual([(t["name"], t["pid"], t["cpuSeconds"]) for t in p["top"]], [("busy", 100, 7.5), ("steady", 200, 1.0)])
+        self.assertNotIn("top_pid_reuse_dropped", p["notes"])
+
+    def test_the_header_documents_the_pair_denominator_and_the_pid_reuse_rule(self) -> None:
+        header = (DV / "Wait-VenueQuiet.ps1").read_text(encoding="utf-8").split("[CmdletBinding", 1)[0]
+        for needle in ("process_active_pair_missing", "unattributed_kernel_pair_missing", "top_pid_reuse_dropped", "process start time"):
+            self.assertIn(needle, header)
 
     def test_the_header_documents_the_valid_sample_mean_the_pid_keying_and_the_gap(self) -> None:
         header = (DV / "Wait-VenueQuiet.ps1").read_text(encoding="utf-8").split("[CmdletBinding", 1)[0]
