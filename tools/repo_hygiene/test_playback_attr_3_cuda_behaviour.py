@@ -7877,6 +7877,8 @@ class SessionLockedKeepAliveCheckpointTests(unittest.TestCase):
         "        public static System.Threading.ManualResetEventSlim Paused = new System.Threading.ManualResetEventSlim(false);\n"
         "        public static System.Threading.ManualResetEventSlim Release = new System.Threading.ManualResetEventSlim(false);\n"
         "        public static object ReasonAtPause;\n"
+        "        public static object LastErrorAtPause;\n"
+        "        public static object LastFailureUtcAtPause;\n"
         "        static int pauses;\n"
         "        public override object this[object key] {\n"
         "            get { return base[key]; }\n"
@@ -7886,6 +7888,8 @@ class SessionLockedKeepAliveCheckpointTests(unittest.TestCase):
         "                if (\"failureCount\".Equals(key) && value != null && int.TryParse(value.ToString(), out n) && n >= 1\n"
         "                        && System.Threading.Interlocked.Increment(ref pauses) == 1) {\n"
         "                    ReasonAtPause = base[\"sessionLockReason\"];\n"
+        "                    LastErrorAtPause = base[\"lastError\"];\n"
+        "                    LastFailureUtcAtPause = base[\"lastFailureUtc\"];\n"
         "                    Paused.Set();\n"
         "                    Release.Wait(60000);\n"
         "                }\n"
@@ -7896,7 +7900,24 @@ class SessionLockedKeepAliveCheckpointTests(unittest.TestCase):
         "'@\n"
     )
 
-    def _checkpoint_mid_publication(self, name: str, lock_value: int):
+    # KEEPALIVE-FAILURE-PUBLISH-LAST-1: the non-lock failure branches of the same loop. The bounded probe
+    # is replaced by a function that answers from a static Mode, so a test can pick which branch fails:
+    # 1 = screen-saver state unreadable (secure branch), 2 = screen saver still running after the nudge
+    # (tickError branch), 3 = the probe throws (catch branch). Mode 0 is a healthy unlocked tick.
+    _FAILURE_MODE_STATE = (
+        "Add-Type -TypeDefinition 'namespace MLVAppTestFailurePublish { public static class State { public static int Mode; } }'\n"
+        "function Invoke-AttrCudaBoundedProbe { param([string]$FunctionName, [int]$TimeoutMilliseconds)\n"
+        "    $m = [MLVAppTestFailurePublish.State]::Mode\n"
+        "    if ($m -eq 3) { throw 'KEEPALIVE_PUBLISH_TEST_FAULT' }\n"
+        "    switch ($FunctionName) {\n"
+        "        'Get-AttrCudaSessionLocked' { $false }\n"
+        "        'Get-AttrCudaScreensaverRunning' { if ($m -eq 1) { $null } elseif ($m -eq 2) { $true } else { $false } }\n"
+        "        'Get-AttrCudaScreensaverSecure' { $false }\n"
+        "    }\n"
+        "}\n"
+    )
+
+    def _checkpoint_mid_publication(self, name: str, lock_value: int | None = None, failure_mode: int | None = None):
         job = ATTRIBUTION_GENERATOR.read_text(encoding="utf-8")
         first, after = self._CHECKPOINTS[name]
         start = job.index(first)
@@ -7906,10 +7927,17 @@ class SessionLockedKeepAliveCheckpointTests(unittest.TestCase):
         loop_text = module[loop_at:module.index(
             "# CUDA-PERF-DISPLAY-WAKE-3 round 1 (fable hardening): CreateRunspace/Open/BeginInvoke", loop_at)].rstrip()
         saved = self.tmp / "saved.json"
+        if failure_mode is None:
+            flip = f"[MLVAppTestLateLock.State]::Value = {lock_value}\n"
+            probe_overrides = ""
+        else:
+            flip = f"[MLVAppTestFailurePublish.State]::Mode = {failure_mode}\n"
+            probe_overrides = self._FAILURE_MODE_STATE
         body = (
             self._PAUSING_STATE +
             "function Get-AttrCudaScreensaverRunning { $false }\n"
             "function Get-AttrCudaScreensaverSecure { $false }\n"
+            + probe_overrides +
             "[MLVAppTestLateLock.State]::Value = 0\n"
             + loop_text + "\n"
             # The same state keys and Runspace set-up Start-AttrCudaDisplayWakeKeepAlive uses.
@@ -7928,9 +7956,11 @@ class SessionLockedKeepAliveCheckpointTests(unittest.TestCase):
             "$async = $ps.BeginInvoke()\n"
             "try {\n"
             "if (-not (Wait-Until { [int]$state['successCount'] -ge 1 })) { throw 'no unlocked tick succeeded' }\n"
-            f"[MLVAppTestLateLock.State]::Value = {lock_value}\n"
-            "if (-not [MLVAppTestPublish.PausingState]::Paused.Wait(45000)) { throw 'the locked tick never published failureCount' }\n"
+            + flip +
+            "if (-not [MLVAppTestPublish.PausingState]::Paused.Wait(45000)) { throw 'the failing tick never published failureCount' }\n"
             "Write-Output \"REASON_AT_PAUSE=$([MLVAppTestPublish.PausingState]::ReasonAtPause)\"\n"
+            "Write-Output \"LAST_ERROR_AT_PAUSE=$([MLVAppTestPublish.PausingState]::LastErrorAtPause)\"\n"
+            "Write-Output \"LAST_FAILURE_UTC_AT_PAUSE=$([MLVAppTestPublish.PausingState]::LastFailureUtcAtPause)\"\n"
             "$displayWakeKeepAlive = [ordered]@{ stopEvent = $stopEvent; runspace = $rs; powershell = $ps; asyncResult = $async; "
             "nudgeState = $state; setupError = $null }\n"
             "$displayWake = [ordered]@{ attempted = $true }\n"
@@ -7969,6 +7999,60 @@ class SessionLockedKeepAliveCheckpointTests(unittest.TestCase):
 
     def test_a_checkpoint_between_an_unknown_lock_ticks_publications_is_exit_30(self) -> None:
         self._assert_owner_only_mid_publication("start_of_measured_interval", 2, "session_lock_unknown")
+
+    # KEEPALIVE-FAILURE-PUBLISH-LAST-1: the same concurrent checkpoint for every non-lock failure branch.
+    # A checkpoint that lands between the branch's writes and failureCount must print a non-empty `last:`.
+    def _assert_keepalive_failed_with_last_error(self, failure_mode: int, expected_last_error: str) -> None:
+        proc, summary = self._checkpoint_mid_publication("start_of_measured_interval", failure_mode=failure_mode)
+        self.assertIn(f"LAST_ERROR_AT_PAUSE={expected_last_error}", proc.stdout,
+                      "lastError must be published no later than failureCount")
+        self.assertRegex(proc.stdout, r"LAST_FAILURE_UTC_AT_PAUSE=\d{4}-\d\d-\d\dT", proc.stdout)
+        self.assertEqual(proc.returncode, 26, proc.stdout + proc.stderr)
+        self.assertIn("RESULT=KEEPALIVE_FAILED CHECKPOINT=start_of_measured_interval ", proc.stdout)
+        self.assertRegex(proc.stdout, r"last: \S", "the checkpoint must not print an empty last error")
+        self.assertEqual(summary["result"], "KEEPALIVE_FAILED", summary)
+        self.assertIn(expected_last_error, summary["displayWake"]["keepAliveHealth"]["lastError"])
+        self.assertIsNone(summary["displayWake"]["keepAliveHealth"]["sessionLockReason"])
+
+    def test_a_checkpoint_between_the_secure_branch_publications_prints_a_non_empty_last_error(self) -> None:
+        self._assert_keepalive_failed_with_last_error(1, "ATTRCUDA_KEEPALIVE_BLOCKED reason=state_unknown ")
+
+    def test_a_checkpoint_between_the_tick_error_branch_publications_prints_a_non_empty_last_error(self) -> None:
+        self._assert_keepalive_failed_with_last_error(2, "ATTRCUDA_KEEPALIVE_STILL_RUNNING ")
+
+    def test_a_checkpoint_between_the_catch_branch_publications_prints_a_non_empty_last_error(self) -> None:
+        self._assert_keepalive_failed_with_last_error(3, "KEEPALIVE_PUBLISH_TEST_FAULT")
+
+    def test_every_failing_branch_of_the_loop_writes_failure_count_after_its_descriptive_fields(self) -> None:
+        # Static twin, branch by branch and not by count, so a branch added later is covered too: within
+        # the innermost block holding each failureCount increment, a lastError write precedes it, and no
+        # lastError / lastFailureUtc / sessionLockReason write follows it.
+        module = MODULE.read_text(encoding="utf-8")
+        loop_at = module.index("$loopScript = {")
+        loop_end = module.index(
+            "# CUDA-PERF-DISPLAY-WAKE-3 round 1 (fable hardening): CreateRunspace/Open/BeginInvoke", loop_at)
+        # Comment-only lines are blanked (same length) so a brace in prose cannot unbalance the scan.
+        loop = "\n".join("" if line.lstrip().startswith("#") else line for line in module[loop_at:loop_end].split("\n"))
+        blocks: list[tuple[int, int]] = []
+        stack: list[int] = []
+        for at, ch in enumerate(loop):
+            if ch == "{":
+                stack.append(at)
+            elif ch == "}":
+                blocks.append((stack.pop(), at))
+        increment = re.compile(r"\$NudgeState\.failureCount\s*=\s*\[int\]\$NudgeState\.failureCount\s*\+\s*1")
+        descriptive = re.compile(r"\$NudgeState\.(lastError|lastFailureUtc|sessionLockReason)\s*=")
+        found = list(increment.finditer(loop))
+        self.assertGreaterEqual(len(found), 4, "lock, secure-screen-saver, tick-error and catch branches")
+        for match in found:
+            with self.subTest(line=loop.count("\n", 0, match.start()) + 1):
+                start, end = min((b for b in blocks if b[0] < match.start() < b[1]), key=lambda b: b[1] - b[0])
+                before = loop[start:match.start()]
+                after = loop[match.end():end]
+                self.assertIsNotNone(re.search(r"\$NudgeState\.lastError\s*=", before),
+                                     "a lastError write must precede the failureCount increment in its branch")
+                self.assertIsNone(descriptive.search(after),
+                                  "failureCount must be the last descriptive publish of its branch")
 
     def test_the_lock_tick_publishes_its_classification_before_its_failure(self) -> None:
         # Static twin of the four runs above: in the tick's lock branch the sticky reason is written

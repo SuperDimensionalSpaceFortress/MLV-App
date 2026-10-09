@@ -5951,11 +5951,14 @@ function Start-AttrCudaDisplayWakeKeepAlive {
                     # same boundary Start-AttrCudaDisplayWake's own claim-time gate enforces. Recorded
                     # as a typed failure (never a silent skip) so the next keep-alive checkpoint stops
                     # the leg via Get-AttrCudaDisplayWakeKeepAliveHealth's existing failureCount gate.
+                    # KEEPALIVE-FAILURE-PUBLISH-LAST-1: lastError and lastFailureUtc are published BEFORE
+                    # failureCount, which is written last (same rule as the lock branch above), so a
+                    # checkpoint that runs mid-publication never sees this failure with an empty last error.
                     $NudgeState.count = [int]$NudgeState.count + 1
-                    $NudgeState.failureCount = [int]$NudgeState.failureCount + 1
                     $blockedReason = if ($null -eq $tickRunning) { 'state_unknown' } else { 'secure_screensaver_mid_leg' }
                     $NudgeState.lastError = "ATTRCUDA_KEEPALIVE_BLOCKED reason=$blockedReason no injection attempted (screen saver running/secure state mid-leg forbids touching it)"
                     $NudgeState.lastFailureUtc = (Get-Date).ToUniversalTime().ToString('o')
+                    $NudgeState.failureCount = [int]$NudgeState.failureCount + 1
                 } elseif ("MLVAppAttrCudaDisplayWake.InputDesktopNudge" -as [type]) {
                     # CUDA-PERF-DISPLAY-WAKE-3 round 2 (live UM evidence): the SAME dedicated-thread
                     # OpenInputDesktop+SetThreadDesktop+SendInput+CloseDesktop helper the one-time
@@ -6023,9 +6026,11 @@ function Start-AttrCudaDisplayWakeKeepAlive {
                         }
                     }
                     if ($tickError) {
-                        $NudgeState.failureCount = [int]$NudgeState.failureCount + 1
+                        # KEEPALIVE-FAILURE-PUBLISH-LAST-1: failureCount is written last, after lastError
+                        # and lastFailureUtc (and after .sessionLockReason, set above for a lock refusal).
                         $NudgeState.lastError = $tickError
                         $NudgeState.lastFailureUtc = (Get-Date).ToUniversalTime().ToString('o')
+                        $NudgeState.failureCount = [int]$NudgeState.failureCount + 1
                     } else {
                         $NudgeState.successCount = [int]$NudgeState.successCount + 1
                     }
@@ -6037,9 +6042,11 @@ function Start-AttrCudaDisplayWakeKeepAlive {
                 # Non-throwing by construction: a single nudge failure must never stop the loop or
                 # escape to the caller -- the next tick simply tries again. Still counted as a
                 # failure, unlike before, so it is visible to Get-AttrCudaDisplayWakeKeepAliveHealth.
-                $NudgeState.failureCount = [int]$NudgeState.failureCount + 1
+                # KEEPALIVE-FAILURE-PUBLISH-LAST-1: failureCount is written last, after lastError and
+                # lastFailureUtc, so a checkpoint never sees this failure with an empty last error.
                 $NudgeState.lastError = $_.Exception.Message
                 $NudgeState.lastFailureUtc = (Get-Date).ToUniversalTime().ToString('o')
+                $NudgeState.failureCount = [int]$NudgeState.failureCount + 1
             }
         }
     }
