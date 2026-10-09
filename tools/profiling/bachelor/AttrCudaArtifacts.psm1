@@ -5511,8 +5511,11 @@ function Start-AttrCudaDisplayWake {
     # VENUE-SESSION-LOCKED-REFUSAL-1 >>>
     # The lock read comes before every other read and every input. A missing or throwing probe
     # reads as unknown, which is refused like a lock.
+    # r4 (CLAIM-TIME-LOCK-READ-BOUNDED-1): every claim-time lock read here goes through the same
+    # bounded reader the keep-alive tick uses, so a read that never returns is unknown after
+    # -TimeoutMilliseconds (refused, no input) instead of holding the claim forever.
     $sessionLocked = $null
-    try { $sessionLocked = Get-AttrCudaSessionLocked } catch { $sessionLocked = $null }
+    try { $sessionLocked = Invoke-AttrCudaBoundedProbe -FunctionName 'Get-AttrCudaSessionLocked' } catch { $sessionLocked = $null }
     $sessionLockedOwnerOnly = ($sessionLocked -ne $false)
     # VENUE-SESSION-LOCKED-REFUSAL-1 <<<
     $screensaverTimeoutSeconds = Get-AttrCudaScreensaverTimeoutSeconds
@@ -5558,7 +5561,7 @@ function Start-AttrCudaDisplayWake {
     # before the branch that injects; the plain nudge reads it once more as the statement before
     # SendInput, and the dedicated thread reads it as its last step before its own SendInput.
     if (-not $sessionLockedOwnerOnly) {
-        try { $sessionLocked = Get-AttrCudaSessionLocked } catch { $sessionLocked = $null }
+        try { $sessionLocked = Invoke-AttrCudaBoundedProbe -FunctionName 'Get-AttrCudaSessionLocked' } catch { $sessionLocked = $null }
         $sessionLockedOwnerOnly = ($sessionLocked -ne $false)
     }
     if (-not $sessionLockedOwnerOnly) {
@@ -5599,7 +5602,7 @@ function Start-AttrCudaDisplayWake {
             # r2: this nudge runs on this thread, so the lock is read here, as the statement before
             # SendInput. Locked or unknown: no SendInput (the throw lands in the catch below).
             $sessionLockedAtInject = $null
-            try { $sessionLockedAtInject = Get-AttrCudaSessionLocked } catch { $sessionLockedAtInject = $null }
+            try { $sessionLockedAtInject = Invoke-AttrCudaBoundedProbe -FunctionName 'Get-AttrCudaSessionLocked' } catch { $sessionLockedAtInject = $null }
             if ($sessionLockedAtInject -ne $false) {
                 $sessionLocked = $sessionLockedAtInject
                 $sessionLockedOwnerOnly = $true
@@ -5813,6 +5816,8 @@ function Start-AttrCudaDisplayWakeKeepAlive {
     step before InputDesktopNudge.Run, and that thread reads it once more before SendInput. Any lock
     refusal also sets .nudgeState.sessionLockReason (sticky), which
     Get-AttrCudaDisplayWakeKeepAliveHealth reports so the job ends the leg SESSION_LOCKED_OWNER_ONLY.
+    r4: a lock-refusing tick writes .sessionLockReason before .failureCount, so a checkpoint that
+    reads the state mid-tick never sees the failure without its lock reason.
     VENUE-SESSION-LOCKED-REFUSAL-1 <<<
     .setupError is $null when the background pipeline started; non-$null means either
     CreateRunspace/Open/BeginInvoke itself failed (recorded, never thrown -- CUDA-PERF-
@@ -5926,14 +5931,18 @@ function Start-AttrCudaDisplayWakeKeepAlive {
                     $tickSessionLocked = Invoke-AttrCudaBoundedProbe -FunctionName 'Get-AttrCudaSessionLocked' -TimeoutMilliseconds $ProbeTimeoutMilliseconds
                 }
                 if ($tickSessionLocked -ne $false) {
-                    $NudgeState.count = [int]$NudgeState.count + 1
-                    $NudgeState.failureCount = [int]$NudgeState.failureCount + 1
                     $sessionBlockedReason = if ($null -eq $tickSessionLocked) { 'session_lock_unknown' } else { 'session_locked' }
                     # r2 (sol blocker 2): sticky, so the job's checkpoint ends the leg owner-only even
                     # when a later failure overwrites .lastError.
+                    # r4 (sol r3 blocker): the classification is published BEFORE failureCount, which is
+                    # written last. A checkpoint that runs mid-publication therefore never sees this
+                    # tick's failure without its lock reason (Get-AttrCudaDisplayWakeKeepAliveHealth
+                    # reads failureCount first, then the reason).
                     $NudgeState.sessionLockReason = $sessionBlockedReason
                     $NudgeState.lastError = "ATTRCUDA_KEEPALIVE_BLOCKED reason=$sessionBlockedReason no injection attempted (a locked console is owner-only; signing in is an owner action)"
                     $NudgeState.lastFailureUtc = (Get-Date).ToUniversalTime().ToString('o')
+                    $NudgeState.count = [int]$NudgeState.count + 1
+                    $NudgeState.failureCount = [int]$NudgeState.failureCount + 1
                 } else {
                 # VENUE-SESSION-LOCKED-REFUSAL-1 <<<
                 if ($tickSecureOwnerOnly) {
@@ -6191,6 +6200,9 @@ function Get-AttrCudaDisplayWakeKeepAliveHealth {
         # r2 (sol blocker 2): the keep-alive's own sticky classification of a lock refusal
         # ('session_locked' or 'session_lock_unknown', set by the tick that refused), read as written
         # -- never re-derived from .lastError text. Read defensively, like .successCount above.
+        # r4 (sol r3 blocker): read AFTER .failureCount on purpose. Every lock-refusing tick publishes
+        # this reason before it increments .failureCount, so a failure counted above is never missing
+        # its lock reason here, even when the tick is still publishing.
         $sessionLockReason = $null
         if ($Handle.nudgeState) {
             try { $sessionLockReason = $Handle.nudgeState.sessionLockReason } catch { $sessionLockReason = $null }

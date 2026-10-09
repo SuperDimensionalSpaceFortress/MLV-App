@@ -5091,6 +5091,8 @@ class DisplayWakeFunctionTests(_PwshCase):
             "'Get-AttrCudaScreensaverTimeoutSeconds','Get-AttrCudaScreensaverActive',"
             "'Get-AttrCudaScreensaverSecure','Wait-AttrCudaScreensaverDismissed',"
             "'Invoke-AttrCudaInputDesktopNudge',"
+            # VENUE-SESSION-LOCKED-REFUSAL-1 r4: the claim-time lock reads go through the bounded reader.
+            "'Invoke-AttrCudaBoundedProbe',"
             "'Start-AttrCudaDisplayWake','Stop-AttrCudaDisplayWake')\n"
             f"Set-Content -LiteralPath '{(self.tmp / 'extracted.ps1')}' -Value $src -Encoding utf8\n",
             encoding="utf-8",
@@ -5208,6 +5210,8 @@ class DisplayWakeFunctionTests(_PwshCase):
             "'Get-AttrCudaScreensaverTimeoutSeconds','Get-AttrCudaScreensaverActive',"
             "'Get-AttrCudaScreensaverSecure','Wait-AttrCudaScreensaverDismissed',"
             "'Invoke-AttrCudaInputDesktopNudge',"
+            # VENUE-SESSION-LOCKED-REFUSAL-1 r4: the claim-time lock reads go through the bounded reader.
+            "'Invoke-AttrCudaBoundedProbe',"
             "'Start-AttrCudaDisplayWake')\n"
             f"Set-Content -LiteralPath '{(self.tmp / 'extracted.ps1')}' -Value $src -Encoding utf8\n",
             encoding="utf-8",
@@ -7240,7 +7244,7 @@ class SessionLockedWakeTests(_PwshCase):
             "'Register-AttrCudaDisplayWakeNativeMethods','Get-AttrCudaScreensaverRunning',"
             "'Get-AttrCudaScreensaverTimeoutSeconds','Get-AttrCudaScreensaverActive',"
             "'Get-AttrCudaScreensaverSecure','Wait-AttrCudaScreensaverDismissed',"
-            "'Invoke-AttrCudaInputDesktopNudge','Start-AttrCudaDisplayWake')\n"
+            "'Invoke-AttrCudaInputDesktopNudge','Invoke-AttrCudaBoundedProbe','Start-AttrCudaDisplayWake')\n"
             f"Set-Content -LiteralPath '{(self.tmp / 'extracted.ps1')}' -Value $src -Encoding utf8\n",
             encoding="utf-8",
         )
@@ -7562,7 +7566,7 @@ class SessionLockedLateLockWakeTests(unittest.TestCase):
     _FUNCTIONS = ["Register-AttrCudaDisplayWakeNativeMethods", "Get-AttrCudaScreensaverRunning",
                   "Get-AttrCudaScreensaverTimeoutSeconds", "Get-AttrCudaScreensaverActive",
                   "Get-AttrCudaScreensaverSecure", "Wait-AttrCudaScreensaverDismissed",
-                  "Invoke-AttrCudaInputDesktopNudge", "Start-AttrCudaDisplayWake"]
+                  "Invoke-AttrCudaInputDesktopNudge", "Invoke-AttrCudaBoundedProbe", "Start-AttrCudaDisplayWake"]
 
     def setUp(self) -> None:
         if os.name != "nt":
@@ -7571,14 +7575,14 @@ class SessionLockedLateLockWakeTests(unittest.TestCase):
         self.tmp = _long_path(Path(self._tmp.name))
         self.addCleanup(self._tmp.cleanup)
 
-    def _wake(self, overrides: str) -> dict:
+    def _wake(self, overrides: str, timeout: int | None = None) -> dict:
         proc = _extract_then_append(self, self.tmp, self._FUNCTIONS, overrides + (
             "$w = Start-AttrCudaDisplayWake\n"
             "$out = [ordered]@{ wake = $w; "
             "sendInputCalls = [MLVAppAttrCudaDisplayWake.NativeMethods]::SendInputCalls; "
             "nudgeRunCalls = [MLVAppAttrCudaDisplayWake.InputDesktopNudge]::RunCalls; "
             "lockReads = [MLVAppTestLateLock.State]::Reads }\n"
-            f"[IO.File]::WriteAllText('{(self.tmp / 'w.json')}', ($out | ConvertTo-Json -Depth 6))\n"))
+            f"[IO.File]::WriteAllText('{(self.tmp / 'w.json')}', ($out | ConvertTo-Json -Depth 6))\n"), timeout=timeout)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         return json.loads((self.tmp / "w.json").read_text(encoding="utf-8"))
 
@@ -7639,6 +7643,33 @@ class SessionLockedLateLockWakeTests(unittest.TestCase):
                 self.assertIs(wake["inputDesktopNudge"]["sessionLockRefused"], True)
                 self.assertIs(wake["dismissFailed"], False)
                 self.assertIsNone(wake["dismissWait"])
+
+    def test_a_claim_time_lock_read_that_never_returns_is_unknown_and_refused_promptly(self) -> None:
+        # r4 (CLAIM-TIME-LOCK-READ-BOUNDED-1): the claim-time read is bounded like the per-tick read, so a
+        # lock read that never returns is unknown within the bound: refused, with zero input.
+        out = self._wake(
+            "function Get-AttrCudaSessionLocked { [MLVAppTestLateLock.State]::Reads++; Start-Sleep -Seconds 600; $false }\n"
+            "function Get-AttrCudaScreensaverRunning { $false }\n"
+            "function Get-AttrCudaScreensaverSecure { $false }\n",
+            timeout=60)   # an unbounded read would hold the claim for the full 600 s
+        self.assertEqual(out["sendInputCalls"], 0, out)
+        self.assertEqual(out["nudgeRunCalls"], 0, out)
+        self.assertEqual(out["lockReads"], 1, "the first (hung) read already refuses; nothing is read after it")
+        wake = out["wake"]
+        self.assertIsNone(wake["sessionLocked"], out)
+        self.assertTrue(wake["sendInputError"].startswith("ATTRCUDA_SESSION_LOCKED_OWNER_ONLY "), wake)
+        self.assertIn("could not be read; treated as locked", wake["sendInputError"])
+        self.assertIn("SessionLockedNoInputAttempted(sessionLocked=unknown)", wake["method"])
+        self.assertIs(wake["dismissFailed"], False)
+
+    def test_every_claim_time_lock_read_goes_through_the_bounded_reader(self) -> None:
+        module = MODULE.read_text(encoding="utf-8")
+        start = module.index("function Start-AttrCudaDisplayWake {")
+        fn = module[start:module.index("\nfunction Stop-AttrCudaDisplayWake {", start)]
+        body = fn[fn.index("#>"):]   # past the help block
+        code = "\n".join(line for line in body.splitlines() if not line.lstrip().startswith("#"))
+        self.assertEqual(code.count("Invoke-AttrCudaBoundedProbe -FunctionName 'Get-AttrCudaSessionLocked'"), 3, code)
+        self.assertEqual(code.count("Get-AttrCudaSessionLocked"), 3, "no unbounded direct call may remain")
 
 
 @requires_pwsh
@@ -7835,6 +7866,124 @@ class SessionLockedKeepAliveCheckpointTests(unittest.TestCase):
                 self.assertIn(f"keepAliveCheckpoint='{name}'", lock_block)
                 self.assertIn("exit 30", lock_block)
                 self.assertNotIn("exit 26", lock_block)
+
+    # r4 (sol r3 blocker VENUE-SESSION-LOCK-STATE-PUBLISH-ATOMIC-1): a checkpoint can run while the
+    # locked tick is still publishing. The production loop runs verbatim on a state table whose
+    # failureCount setter pauses on the first failure; the checkpoint runs during that pause.
+    _PAUSING_STATE = (
+        "Add-Type -TypeDefinition @'\n"
+        "namespace MLVAppTestPublish {\n"
+        "    public class PausingState : System.Collections.Hashtable {\n"
+        "        public static System.Threading.ManualResetEventSlim Paused = new System.Threading.ManualResetEventSlim(false);\n"
+        "        public static System.Threading.ManualResetEventSlim Release = new System.Threading.ManualResetEventSlim(false);\n"
+        "        public static object ReasonAtPause;\n"
+        "        static int pauses;\n"
+        "        public override object this[object key] {\n"
+        "            get { return base[key]; }\n"
+        "            set {\n"
+        "                base[key] = value;\n"
+        "                int n;\n"
+        "                if (\"failureCount\".Equals(key) && value != null && int.TryParse(value.ToString(), out n) && n >= 1\n"
+        "                        && System.Threading.Interlocked.Increment(ref pauses) == 1) {\n"
+        "                    ReasonAtPause = base[\"sessionLockReason\"];\n"
+        "                    Paused.Set();\n"
+        "                    Release.Wait(60000);\n"
+        "                }\n"
+        "            }\n"
+        "        }\n"
+        "    }\n"
+        "}\n"
+        "'@\n"
+    )
+
+    def _checkpoint_mid_publication(self, name: str, lock_value: int):
+        job = ATTRIBUTION_GENERATOR.read_text(encoding="utf-8")
+        first, after = self._CHECKPOINTS[name]
+        start = job.index(first)
+        block = job[start:job.index(after, start)]
+        module = MODULE.read_text(encoding="utf-8")
+        loop_at = module.index("$loopScript = {")
+        loop_text = module[loop_at:module.index(
+            "# CUDA-PERF-DISPLAY-WAKE-3 round 1 (fable hardening): CreateRunspace/Open/BeginInvoke", loop_at)].rstrip()
+        saved = self.tmp / "saved.json"
+        body = (
+            self._PAUSING_STATE +
+            "function Get-AttrCudaScreensaverRunning { $false }\n"
+            "function Get-AttrCudaScreensaverSecure { $false }\n"
+            "[MLVAppTestLateLock.State]::Value = 0\n"
+            + loop_text + "\n"
+            # The same state keys and Runspace set-up Start-AttrCudaDisplayWakeKeepAlive uses.
+            "$state = [MLVAppTestPublish.PausingState]::new()\n"
+            "foreach ($k in 'count', 'successCount', 'failureCount') { $state[$k] = 0 }\n"
+            "foreach ($k in 'lastError', 'lastFailureUtc', 'lastDesktopName', 'sessionLockReason') { $state[$k] = $null }\n"
+            "$iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()\n"
+            "foreach ($n in 'Register-AttrCudaDisplayWakeNativeMethods', 'Get-AttrCudaScreensaverRunning', 'Get-AttrCudaScreensaverSecure', "
+            "'Invoke-AttrCudaBoundedProbe', 'Get-AttrCudaSessionLocked') {\n"
+            "    $iss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new($n, (Get-Command -Name $n -CommandType Function).Definition))\n"
+            "}\n"
+            "$stopEvent = [System.Threading.ManualResetEventSlim]::new($false)\n"
+            "$rs = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace($iss); $rs.Open()\n"
+            "$ps = [System.Management.Automation.PowerShell]::Create(); $ps.Runspace = $rs\n"
+            "[void]$ps.AddScript($loopScript).AddArgument($stopEvent).AddArgument(1).AddArgument($state).AddArgument(5000).AddArgument(3000)\n"
+            "$async = $ps.BeginInvoke()\n"
+            "try {\n"
+            "if (-not (Wait-Until { [int]$state['successCount'] -ge 1 })) { throw 'no unlocked tick succeeded' }\n"
+            f"[MLVAppTestLateLock.State]::Value = {lock_value}\n"
+            "if (-not [MLVAppTestPublish.PausingState]::Paused.Wait(45000)) { throw 'the locked tick never published failureCount' }\n"
+            "Write-Output \"REASON_AT_PAUSE=$([MLVAppTestPublish.PausingState]::ReasonAtPause)\"\n"
+            "$displayWakeKeepAlive = [ordered]@{ stopEvent = $stopEvent; runspace = $rs; powershell = $ps; asyncResult = $async; "
+            "nudgeState = $state; setupError = $null }\n"
+            "$displayWake = [ordered]@{ attempted = $true }\n"
+            f"$FixtureRehearsal = $true; $SourceCommit = 'r4test'; $ClipId = 'clip'; $Pub = '{(self.tmp / 'pub')}'\n"
+            "$presentMonProc = $null; $PresentMonSessionName = 'r4test'\n"
+            f"$presentMonPath = '{(self.tmp / 'absent-presentmon.csv')}'\n"
+            f"function Save-Json($Object, $Path) {{ [IO.File]::WriteAllText('{saved}', ($Object | ConvertTo-Json -Depth 8)) }}\n"
+            "function Write-JobTrace { param($Message) }\n"
+            "function Stop-PresentMonCapture { param($Proc, $SessionName) "
+            "[ordered]@{ confirmedExited = $true; killError = $null; waitError = $null; postKillSessionTerminate = $null } }\n"
+            "function Format-PresentMonSessionTerminateText { param($Value) 'none' }\n"
+            "function Publish-AttrCudaFileCopy { param($Source, $Destination) $true }\n"
+            + block +
+            "\nWrite-Output 'CHECKPOINT_FELL_THROUGH'\nexit 0\n"
+            "} finally {\n"
+            "    [MLVAppTestPublish.PausingState]::Release.Set(); $stopEvent.Set(); [void]$async.AsyncWaitHandle.WaitOne(15000)\n"
+            "}\n"
+        )
+        proc = _extract_then_append(self, self.tmp, self._FUNCTIONS, body, timeout=_KEEPALIVE_TEST_TIMEOUT_SECONDS)
+        summary = json.loads(saved.read_text(encoding="utf-8")) if saved.exists() else None
+        return proc, summary
+
+    def _assert_owner_only_mid_publication(self, name: str, lock_value: int, reason: str) -> None:
+        proc, summary = self._checkpoint_mid_publication(name, lock_value)
+        self.assertIn(f"REASON_AT_PAUSE={reason}", proc.stdout, "the classification must be visible no later than the failure")
+        self._assert_owner_only(name, proc, summary, reason)
+
+    def test_a_checkpoint_between_the_locked_ticks_publications_at_measurement_start_is_exit_30(self) -> None:
+        self._assert_owner_only_mid_publication("start_of_measured_interval", 1, "session_locked")
+
+    def test_a_checkpoint_between_the_locked_ticks_publications_before_smoke_launch_is_exit_30(self) -> None:
+        self._assert_owner_only_mid_publication("before_smoke_launch", 1, "session_locked")
+
+    def test_a_checkpoint_between_the_locked_ticks_publications_after_the_interval_is_exit_30(self) -> None:
+        self._assert_owner_only_mid_publication("after_measured_interval", 1, "session_locked")
+
+    def test_a_checkpoint_between_an_unknown_lock_ticks_publications_is_exit_30(self) -> None:
+        self._assert_owner_only_mid_publication("start_of_measured_interval", 2, "session_lock_unknown")
+
+    def test_the_lock_tick_publishes_its_classification_before_its_failure(self) -> None:
+        # Static twin of the four runs above: in the tick's lock branch the sticky reason is written
+        # before failureCount, and the health read takes failureCount before the reason.
+        module = MODULE.read_text(encoding="utf-8")
+        loop_at = module.index("$loopScript = {")
+        branch_at = module.index("if ($tickSessionLocked -ne $false) {", loop_at)
+        branch = module[branch_at:module.index("# VENUE-SESSION-LOCKED-REFUSAL-1 <<<", branch_at)]
+        self.assertLess(branch.index("$NudgeState.sessionLockReason = $sessionBlockedReason"),
+                        branch.index("$NudgeState.failureCount = [int]$NudgeState.failureCount + 1"))
+        thread_at = module.index("if ($tickSessionLockRefused) {", loop_at)
+        self.assertLess(thread_at, module.index("$NudgeState.failureCount = [int]$NudgeState.failureCount + 1", thread_at))
+        health_at = module.index("function Get-AttrCudaDisplayWakeKeepAliveHealth {")
+        self.assertLess(module.index("$failureCount = [int]$Handle.nudgeState.failureCount", health_at),
+                        module.index("$sessionLockReason = $Handle.nudgeState.sessionLockReason", health_at))
 
 
 class SessionLockedNativeLastReadShapeTests(unittest.TestCase):

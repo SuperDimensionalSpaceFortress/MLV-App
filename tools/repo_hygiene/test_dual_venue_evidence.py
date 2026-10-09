@@ -5599,7 +5599,23 @@ class LookReceiptGeneratorTests(unittest.TestCase):
             with self.subTest(variant=name):
                 new = self.generate(GENERATOR, f"new-{name}.job.ps1", extra).read_bytes()
                 old = self.generate(base_gen, f"base-{name}.job.ps1", extra).read_bytes()
-                self.assertEqual(new, old, f"{name}: the job without -LookReceiptPath must be the base generator's bytes")
+                # VENUE-SESSION-LOCKED-REFUSAL-1 r4: that card's lines all sit inside its own sentinel regions (pinned by
+                # GeneratorByteIdentityAndVariantTests); outside them the job is still the base generator's bytes.
+                opener, closer = GeneratorByteIdentityAndVariantTests.SESSION_LOCKED_OPEN, GeneratorByteIdentityAndVariantTests.SESSION_LOCKED_CLOSE
+                kept, inside, regions = [], False, 0
+                for line in lf(new.decode("utf-8")).split("\n"):
+                    if opener in line:
+                        self.assertFalse(inside, "nested session-lock region")
+                        inside, regions = True, regions + 1
+                    elif closer in line:
+                        self.assertTrue(inside, "unopened session-lock region")
+                        inside = False
+                    elif not inside:
+                        kept.append(line)
+                self.assertFalse(inside, "unclosed session-lock region")
+                self.assertGreater(regions, 0)
+                self.assertNotIn(opener, old.decode("utf-8"), "the base predates the session-lock regions")
+                self.assertEqual("\n".join(kept), lf(old.decode("utf-8")), f"{name}: the job without -LookReceiptPath must be the base generator's bytes")
                 self.assertNotIn(b"LookReceipt", new)
 
     def test_with_a_receipt_the_job_embeds_its_bytes_passes_minus_receipt_once_and_records_its_hash(self) -> None:

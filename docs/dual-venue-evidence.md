@@ -313,7 +313,7 @@ path; the pair is its own record (`mlv-app/dual-venue-sheet-pair/v1`) because re
   receipt's bytes as **committed** at the admission head, never from the working copy, and refuses the leg `LOOK_RECEIPT_UNBOUND`
   (nothing generated or submitted) unless they hash to `receiptSha256`. Because the spec holds `receiptSha256`, a run receipt's
   `legSpecSha256` also binds the look receipt's bytes. The job embeds the bytes inline (base64 + sha256), re-verifies them in its work dir
-  (`LOOK_RECEIPT_SHA_MISMATCH`, exit 30, before the app launches), and passes them to the GUI smoke as `-Receipt`, so the app applies
+  (`LOOK_RECEIPT_SHA_MISMATCH`, exit 31, before the app launches), and passes them to the GUI smoke as `-Receipt`, so the app applies
   them before playback. The success summary records `lookReceiptSha256`, and the receipt validator accepts it only when the committed
   spec names the same hash. It is a **measurement instrument, not a product setting**. `look-receipts/agx-off.marxml` (Look Assist on,
   AgX, LUT and filter off, default curve) makes a Cinematic capture re-gradable frame-locked by `look-flavor-diff.py regrade`, because
@@ -469,7 +469,7 @@ the receipt -- the contact sheet, and, on a failed smoke run, `smoke-stderr.txt`
 | `VENUE_NOT_QUIESCENT` | `VENUE_NOT_QUIESCENT` |
 | `VENUE_HOST_MISMATCH` | `VENUE_HOST_MISMATCH` |
 | `BACKEND_NOT_AVAILABLE` | `DEVICE_UNAVAILABLE` |
-| `DISPLAY_ASLEEP`, `KEEPALIVE_FAILED`, `SCREENSAVER_SECURE_OWNER_ONLY`, `DISPLAY_WAKE_DISMISS_FAILED`, `SESSION_LOCKED_OWNER_ONLY` (exit 30: the venue console was locked, or its lock state unknown, at claim; no input was sent) | `VENUE_UNHEALTHY` (a venue condition, not a product result) |
+| `DISPLAY_ASLEEP`, `KEEPALIVE_FAILED`, `SCREENSAVER_SECURE_OWNER_ONLY`, `DISPLAY_WAKE_DISMISS_FAILED`, `SESSION_LOCKED_OWNER_ONLY` (exit 30: the venue console was locked, or its lock state unknown, at claim, where no input was sent; it also fires at the three mid-leg keep-alive checkpoints, where input was sent only on earlier unlocked ticks and never while locked) | `VENUE_UNHEALTHY` (a venue condition, not a product result) |
 | the health probe reads the console session as locked, or cannot read it (`sessionLocked` not `false`) | `VENUE_UNHEALTHY`, `outcomeDetail` exactly `SESSION_LOCKED`; the leg is not submitted. Signing in is an owner action |
 | a product failure the job reaches AFTER it published the run log (`GPU_RECON_FRAMES_ZERO`, `CPU_FALLBACK_DETECTED`, `CPU_BACKEND_PATH_MISMATCH`, `PRESENTMON_UNAVAILABLE`) **with a valid receipt-oracle verdict re-derived from that log** | `FAIL`, with the token in `outcomeDetail` (a production receipt for it is written as an **advisory** `FAIL`: its backend is derived from the summary's nested `gpuSummary` counters and its leg type is `LEG_TYPE_UNSTATED`) |
 | any terminal with no run log or a log that does not prove >= 20 s (`SMOKE_LOG_UNAVAILABLE`, or one of the failures above on a short, wrapped, foreign or overridden run) | `INVALID` (no proof, no signal) |

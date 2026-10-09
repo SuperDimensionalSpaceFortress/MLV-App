@@ -93,6 +93,8 @@
 # is an owner action. 30 is the next free code: this job's other exits are 0 and 12-29.
 # r2: a keep-alive tick refused for a lock that arrives mid-leg ends the leg the same way at each
 # of the three keep-alive checkpoints (SESSION_LOCKED_OWNER_ONLY, exit 30, not KEEPALIVE_FAILED/26).
+# r4: exit 31 = LOOK_RECEIPT_SHA_MISMATCH (LOOK-ASSIST-FILM-FLAVOR-2 r2 had also taken 30; moved so
+# each exit code names one result).
 #
 # Usage (owner clip, id-only -- no -ClipPath, no -FixtureSha256):
 #   pwsh -NoProfile -File tools\profiling\bachelor\playback-attr-3-cuda-job.ps1 `
@@ -4192,7 +4194,8 @@ if ($ForceLookAssist) {
     $template = Edit-DualVenueTemplate $template '-RequireLookAssist:`$false -Scope none' '-RequireLookAssist:`$true -Scope none'
     if ($hasLookReceipt) {
         # LOOK-ASSIST-FILM-FLAVOR-2 r2: the receipt ships inline (base64 + sha256), is written into the work dir and re-verified before anything plays, and
-        # reaches the smoke runner as -Receipt, exactly once. A mismatch ends the job typed (LOOK_RECEIPT_SHA_MISMATCH, exit 30) before the app launches.
+        # reaches the smoke runner as -Receipt, exactly once. A mismatch ends the job typed (LOOK_RECEIPT_SHA_MISMATCH, exit 31) before the app launches.
+        # VENUE-SESSION-LOCKED-REFUSAL-1 r4: was exit 30, which this job's header already gives to SESSION_LOCKED_OWNER_ONLY (the two landed concurrently).
         $template = Edit-DualVenueTemplate $template "`$TelemetryArm = '__TELEMETRY_ARM__'
 " ("`$LookReceiptBase64 = '$lookReceiptBase64'
 `$LookReceiptSha256 = '$lookReceiptSha256'
@@ -4208,7 +4211,7 @@ if ($lookReceiptPayload.sha256 -cne $LookReceiptSha256 -or -not (Test-Path -Lite
     [void](New-AttrCudaDirectory -Path $Pub)
     Save-Json ([ordered]@{ schema='playback-attr-3-cuda-venue.v1'; result='LOOK_RECEIPT_SHA_MISMATCH'; fixtureRehearsal=$FixtureRehearsal; lookReceiptSha256=$LookReceiptSha256; sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub }) (Join-Path $Pub 'summary.json')
     Write-Output "RESULT=LOOK_RECEIPT_SHA_MISMATCH ARTIFACTS=$Pub"
-    exit 30
+    exit 31
 }
 $envList = "'" + ($envs -join "','") + "'"
 '@
