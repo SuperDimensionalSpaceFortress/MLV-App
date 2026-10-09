@@ -39,7 +39,11 @@
 #
 # Usage:
 #   pwsh -NoProfile -File tools\profiling\bachelor\playback-attr-3-cuda-stage-job.ps1 `
-#       -SourceCommit <40-hex> -BuildDir <assembler -OutDir> -OutDir <staging-dir>
+#       -SourceCommit <40-hex> -BuildDir <assembler -OutDir> -OutDir <staging-dir> `
+#       [-JobIdSuffix <re-stage-tag>]
+# Re-staging a build whose default JobId was already used needs -JobIdSuffix: the job is then
+# playback-attr-3-cuda-stage-<sha12>-<suffix>. The generator does not submit anything, so it
+# cannot see an UMRUN_JOBID_IN_USE refusal; the caller of um-run.ps1 owns that.
 
 [CmdletBinding()]
 param(
@@ -58,14 +62,23 @@ param(
     # `~` is admitted because Windows temp roots carry 8.3 short names (RUNNER~1, OBABAL~1) and
     # the behavioural tests point -AgentRoot at one; it is inert everywhere this value is used.
     [ValidatePattern('^[A-Za-z]:\\[A-Za-z0-9 _.~\\-]+$')]
-    [string]$AgentRoot = 'C:\mlvtmp\mlv-agent'
+    [string]$AgentRoot = 'C:\mlvtmp\mlv-agent',
+
+    # A JobId is single-use (UmRunDrop refuses any reused one, UMRUN_JOBID_IN_USE), and the default
+    # id carries only the short sha, so a deliberate re-stage of an already-staged build needs a new
+    # one. Absent: the id is exactly what it always was. Present: <default id>-<suffix>.
+    [string]$JobIdSuffix = ''
 )
 
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSScriptRoot 'AttrCudaArtifacts.psm1') -Force
 
 $names = Get-AttrCudaArtifactNames -SourceCommit $SourceCommit
+if ($JobIdSuffix -ne '' -and $JobIdSuffix -cnotmatch '^[A-Za-z0-9-]{1,32}\z') {
+    throw "STAGE_JOBID_SUFFIX_INVALID -JobIdSuffix must match [A-Za-z0-9-]{1,32}; got '$JobIdSuffix'"
+}
 $JobId = "playback-attr-3-cuda-stage-$($names.shortSha)"
+if ($JobIdSuffix -ne '') { $JobId = "$JobId-$JobIdSuffix" }
 
 if (-not (Test-Path -LiteralPath $BuildDir -PathType Container)) { throw "BuildDir is not a directory: $BuildDir" }
 $BuildDir = (Resolve-Path -LiteralPath $BuildDir).Path
