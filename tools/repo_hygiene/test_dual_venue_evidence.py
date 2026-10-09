@@ -4339,6 +4339,94 @@ class DisplayMatrixRunTests(EvidenceFactory, unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------------------------------
+# VENUE-QUIET-UNKNOWN-PROBE-FAILS-1: Wait-VenueQuiet.ps1 used to print `COOLDOWN_UNMET mean=UNKNOWN` and exit 0 when the venue probe was unavailable or failed, and
+# its header told callers COOLDOWN_UNMET means proceed -- so a leg could run on a venue nobody measured. A final decision of UNKNOWN is now its own typed verdict
+# (`VENUE_QUIET_UNKNOWN`) with its own exit code (6); QUIET and a MEASURED COOLDOWN_UNMET (state BUSY) still exit 0. The probe is a stub um-run.ps1: offline, nothing is submitted.
+STUB_UM_RUN_FOR_QUIET = r"""param([string]$ScriptPath, [string]$JobId, [string]$AgentShare, [int]$TimeoutSec, [int]$MaxQueueWaitSec, [int]$MaxClaimedWaitSec)
+# test stub for tools\profiling\um-run.ps1: UMSTUB_MODE = samples (canned VENUE_QUIET line) | noline (a run with no VENUE_QUIET line) | fail (the submission throws)
+if ($env:UMSTUB_MODE -eq 'fail') { throw 'stub submission failed' }
+if ($env:UMSTUB_MODE -eq 'noline') { return [pscustomobject]@{ exitCode = 1; stdout = 'probe printed nothing useful' } }
+$probe = [ordered]@{ schema = 'mlv-app/venue-quiet-probe/v1'; host = 'BACHELOR'; samples = @($env:UMSTUB_SAMPLES | ConvertFrom-Json); top = @() }
+[pscustomobject]@{ exitCode = 0; stdout = 'VENUE_QUIET=' + ($probe | ConvertTo-Json -Compress -Depth 4) }
+"""
+
+
+@requires_windows_pwsh
+class VenueQuietUnknownIsNotUnmetTests(unittest.TestCase):
+    UNKNOWN_EXIT = 6
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory(prefix="venue-quiet-unknown-")
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+        self.tree = self.tmp / "tree"
+        self.dv = self.tree / "tools" / "profiling" / "dual-venue"
+        shutil.copytree(DV, self.dv, ignore=shutil.ignore_patterns("__pycache__"))
+        share = self.tmp / "share-bachelor"
+        (share / "inbox").mkdir(parents=True)
+        (share / "running").mkdir()
+        table = json.loads((self.dv / "venues.json").read_text(encoding="utf-8"))
+        table["venues"]["bachelor"]["agentShare"] = str(share)
+        table["venues"]["bachelor"]["agentRoot"] = str(share) + "-root"
+        (self.dv / "venues.json").write_text(json.dumps(table), encoding="utf-8")
+        self.work = self.tmp / "work"
+
+    def gate(self, mode: str, samples: str = "[]", stub: bool = True) -> subprocess.CompletedProcess:
+        import os
+        if stub:
+            (self.tree / "tools" / "profiling" / "um-run.ps1").write_text(STUB_UM_RUN_FOR_QUIET, encoding="utf-8")
+        # -MaxWaitSec 1 / -RecheckSec 1: one probe, no re-probe sleep, so the FINAL decision is the first one
+        return subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(self.dv / "Wait-VenueQuiet.ps1"), "-Venue", "bachelor",
+                               "-WorkDir", str(self.work), "-MaxWaitSec", "1", "-RecheckSec", "1"],
+                              capture_output=True, text=True, timeout=180, env=dict(os.environ, UMSTUB_MODE=mode, UMSTUB_SAMPLES=samples))
+
+    def assert_unknown_not_unmet(self, proc: subprocess.CompletedProcess, reason: str) -> None:
+        text = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, self.UNKNOWN_EXIT, text)
+        self.assertRegex(proc.stdout, r"(?m)^VENUE_QUIET_UNKNOWN mean=UNKNOWN threshold=")
+        self.assertIn(f"reason={reason}", proc.stdout)
+        self.assertNotRegex(proc.stdout, r"(?m)^(QUIET|COOLDOWN_UNMET) ", "an unmeasured venue must never print a QUIET or COOLDOWN_UNMET verdict")
+
+    def test_a_null_sample_is_a_typed_unknown_verdict_with_its_own_exit_code(self) -> None:
+        self.assert_unknown_not_unmet(self.gate("samples", "[5, null, 5]"), "invalid-samples")
+
+    def test_no_samples_at_all_is_a_typed_unknown_verdict(self) -> None:
+        self.assert_unknown_not_unmet(self.gate("samples", "[]"), "invalid-samples")
+
+    def test_a_probe_with_no_venue_quiet_line_is_a_typed_unknown_verdict_with_the_why(self) -> None:
+        proc = self.gate("noline")
+        self.assert_unknown_not_unmet(proc, "no-VENUE_QUIET-line")
+        self.assertIn("exit 1", proc.stdout)
+
+    def test_a_failed_probe_submission_is_a_typed_unknown_verdict_with_the_why(self) -> None:
+        proc = self.gate("fail")
+        self.assert_unknown_not_unmet(proc, "probe-failed")
+        self.assertIn("stub submission failed", proc.stdout)
+
+    def test_a_missing_um_run_is_a_typed_unknown_verdict(self) -> None:
+        self.assert_unknown_not_unmet(self.gate("samples", "[5, 5, 5]", stub=False), "probe-failed")
+
+    def test_the_unknown_exit_code_is_used_by_no_other_path_and_the_header_lists_it(self) -> None:
+        text = (DV / "Wait-VenueQuiet.ps1").read_text(encoding="utf-8")
+        code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+        self.assertEqual(len(re.findall(r"\bexit 6\b", code)), 1, "exit 6 is reserved for the UNKNOWN verdict")
+        header = text.split("[CmdletBinding", 1)[0]
+        self.assertRegex(header, r"6 VENUE_QUIET_UNKNOWN")
+        self.assertIn("A measured COOLDOWN_UNMET is recorded and the caller proceeds", header)
+        self.assertIn("VENUE_QUIET_UNKNOWN means the venue was NOT MEASURED", header, "the header must not tell callers an UNKNOWN venue may proceed")
+
+    def test_quiet_and_a_measured_cooldown_unmet_are_unchanged_and_still_exit_zero(self) -> None:
+        proc = self.gate("samples", "[5, 5, 5]")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertRegex(proc.stdout, r"(?m)^QUIET mean=5\.0% threshold=20(\.0)?% waitedSec=\d+$")
+        self.assertNotIn("VENUE_QUIET_UNKNOWN", proc.stdout)
+        proc = self.gate("samples", "[50, 50, 50]")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertRegex(proc.stdout, r"(?m)^COOLDOWN_UNMET mean=50\.0% threshold=20(\.0)?% waitedSec=\d+$")
+        self.assertNotIn("VENUE_QUIET_UNKNOWN", proc.stdout)
+
+
+# ---------------------------------------------------------------------------------------------------
 class LegSpecSchemaTests(unittest.TestCase):
     def setUp(self) -> None:
         try:
