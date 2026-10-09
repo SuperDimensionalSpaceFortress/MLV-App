@@ -884,7 +884,7 @@ if ($cfg.engine -eq 'codex') {
             $CodexExeStamp.path, $(if ($CodexExeStamp.version) { $CodexExeStamp.version } else { 'version unknown' }))
     }
 }
-$RealExeForLane =if ($cfg.engine -eq 'claude') { $REAL_CLAUDE_EXE } else { $REAL_CODEX_EXE }
+$RealExeForLane = if ($cfg.engine -eq 'claude') { $REAL_CLAUDE_EXE } else { $REAL_CODEX_EXE }
 $ConfiguredExeForLane = if ($cfg.engine -eq 'claude') { $CLAUDE_EXE } else { $CODEX_EXE }
 $LaneEffortMustBeHighRefusal = $null
 if ($ConfiguredExeForLane -eq $RealExeForLane -and $cfg.effort -ne 'high') {
