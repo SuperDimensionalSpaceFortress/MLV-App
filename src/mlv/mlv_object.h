@@ -312,6 +312,9 @@ typedef struct {
     uint8_t raw_uint16_prefetch_slot_state[MLV_RAW_UINT16_PREFETCH_SLOTS];
     uint64_t raw_uint16_prefetch_slot_frame[MLV_RAW_UINT16_PREFETCH_SLOTS];
     uint32_t raw_uint16_prefetch_slot_generation[MLV_RAW_UINT16_PREFETCH_SLOTS];
+    /* The LJ92 ms that produced each slot's frame, and whether any reader copied it since it was published. */
+    double raw_uint16_prefetch_slot_decode_ms[MLV_RAW_UINT16_PREFETCH_SLOTS];
+    uint8_t raw_uint16_prefetch_slot_consumed[MLV_RAW_UINT16_PREFETCH_SLOTS];
     uint32_t raw_uint16_prefetch_next_slot;
     uint64_t raw_uint16_prefetch_decode_failures;
     mlvRawUint16PrefetchStats_t raw_uint16_prefetch_stats;

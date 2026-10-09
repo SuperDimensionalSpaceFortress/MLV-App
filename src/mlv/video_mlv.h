@@ -393,6 +393,16 @@ double getMlvLastRawUint16Lj92Pred1FastPathPredictorMilliseconds(void);
 double getMlvLastRawUint16UnpackMilliseconds(void);
 double getMlvLastRawUint16CopyMilliseconds(void);
 int getMlvLastRawUint16PrefetchHit(void);
+/* PLAYBACK-LJ92-DECODE-THROUGHPUT-1: how the caller's last getMlvRawFrameUint16 got its frame (thread-local to the
+ * caller), the LJ92 ms that produced the frame (on whichever thread decoded it) and the in-flight wait ms. */
+#define MLV_RAW_UINT16_SOURCE_NONE 0
+#define MLV_RAW_UINT16_SOURCE_HIT 1
+#define MLV_RAW_UINT16_SOURCE_INFLIGHT_WAIT_HIT 2
+#define MLV_RAW_UINT16_SOURCE_DIRECT 3
+int getMlvLastRawUint16Source(void);
+const char * mlvRawUint16SourceName(int source);
+double getMlvLastRawUint16FrameLj92Milliseconds(void);
+double getMlvLastRawUint16InflightWaitMilliseconds(void);
 uint32_t mlvRawUint16PrefetchLookaheadForTesting(const mlvObject_t * video);
 int mlvRawUint16PrefetchAllowedForTesting(const mlvObject_t * video);
 /* Parks the prefetch worker after it claims a slot, before it decodes into it (process-wide). */

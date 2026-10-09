@@ -302,6 +302,9 @@ TEST(RawUint16PrefetchParallel, StatsCountWorkerLj92Time)
     for( uint64_t f = 0; f < 8; ++f )
     {
         ASSERT_EQ( 0, getMlvRawFrameUint16( video, f, frame.data() ) );
+        // Set on this (the caller's) thread whichever thread decoded the frame.
+        ASSERT_TRUE( getMlvLastRawUint16Source() != MLV_RAW_UINT16_SOURCE_NONE );
+        ASSERT_TRUE( getMlvLastRawUint16FrameLj92Milliseconds() > 0.0 );
     }
     ASSERT_TRUE( mlvWaitForRawUint16PrefetchIdleForTesting( video, 10000 ) );
     const mlvRawUint16PrefetchStats_t stats = prefetchStats( video );

@@ -84,6 +84,10 @@ static MLV_STAGE_THREAD_LOCAL double g_mlv_last_raw_uint16_lj92_pred1_fast_path_
 static MLV_STAGE_THREAD_LOCAL double g_mlv_last_raw_uint16_unpack_ms = 0.0;
 static MLV_STAGE_THREAD_LOCAL double g_mlv_last_raw_uint16_copy_ms = 0.0;
 static MLV_STAGE_THREAD_LOCAL int g_mlv_last_raw_uint16_prefetch_hit = 0;
+/* PLAYBACK-LJ92-DECODE-THROUGHPUT-1: set on the CALLER of getMlvRawFrameUint16, whichever thread decoded the frame. */
+static MLV_STAGE_THREAD_LOCAL int g_mlv_last_raw_uint16_source = 0;
+static MLV_STAGE_THREAD_LOCAL double g_mlv_last_raw_uint16_frame_lj92_ms = 0.0;
+static MLV_STAGE_THREAD_LOCAL double g_mlv_last_raw_uint16_inflight_wait_ms = 0.0;
 static MLV_STAGE_THREAD_LOCAL double g_mlv_last_llrawproc_ms = 0.0;
 static MLV_STAGE_THREAD_LOCAL double g_mlv_last_raw_float_convert_ms = 0.0;
 static MLV_STAGE_THREAD_LOCAL double g_mlv_last_debayered_frame_ms = 0.0;
@@ -181,6 +185,9 @@ static void mlv_reset_last_raw_stage_telemetry(void)
     g_mlv_last_raw_uint16_unpack_ms = 0.0;
     g_mlv_last_raw_uint16_copy_ms = 0.0;
     g_mlv_last_raw_uint16_prefetch_hit = 0;
+    g_mlv_last_raw_uint16_source = MLV_RAW_UINT16_SOURCE_NONE;
+    g_mlv_last_raw_uint16_frame_lj92_ms = 0.0;
+    g_mlv_last_raw_uint16_inflight_wait_ms = 0.0;
 }
 
 static int mlv_env_value_is_truthy(const char * value)
@@ -1339,8 +1346,21 @@ static void mlv_reset_raw_uint16_prefetch_locked(mlvObject_t * video)
         video->raw_uint16_prefetch_slot_state[slot] = MLV_RAW_UINT16_PREFETCH_EMPTY;
         video->raw_uint16_prefetch_slot_frame[slot] = 0;
         video->raw_uint16_prefetch_slot_generation[slot] = 0;
+        video->raw_uint16_prefetch_slot_decode_ms[slot] = 0.0;
+        video->raw_uint16_prefetch_slot_consumed[slot] = 0;
     }
     video->raw_uint16_prefetch_next_slot = 0;
+}
+
+/* evicted_unconsumed: a READY slot of the current generation is about to be reused before any reader copied it. */
+static void mlv_raw_uint16_prefetch_note_reuse_locked(mlvObject_t * video, uint32_t slot)
+{
+    if (video->raw_uint16_prefetch_slot_state[slot] == MLV_RAW_UINT16_PREFETCH_READY
+        && video->raw_uint16_prefetch_slot_generation[slot] == video->raw_uint16_prefetch_generation
+        && !video->raw_uint16_prefetch_slot_consumed[slot])
+    {
+        ++video->raw_uint16_prefetch_stats.evicted_unconsumed;
+    }
 }
 
 static uint16_t * mlv_raw_uint16_prefetch_slot_ptr(mlvObject_t * video, uint32_t slot)
@@ -1406,7 +1426,8 @@ static int mlv_raw_uint16_prefetch_find_slot_locked(mlvObject_t * video, uint64_
 
 static void mlv_raw_uint16_prefetch_store_frame(mlvObject_t * video,
                                                 uint64_t frameIndex,
-                                                const uint16_t * frameData)
+                                                const uint16_t * frameData,
+                                                double decodeMs)
 {
     pthread_mutex_lock(&video->raw_uint16_prefetch_mutex);
     if (!mlv_ensure_raw_uint16_prefetch_storage(video))
@@ -1427,6 +1448,7 @@ static void mlv_raw_uint16_prefetch_store_frame(mlvObject_t * video,
             (video->raw_uint16_prefetch_next_slot + 1) % MLV_RAW_UINT16_PREFETCH_SLOTS;
         if (video->raw_uint16_prefetch_slot_state[candidate] != MLV_RAW_UINT16_PREFETCH_DECODING)
         {
+            mlv_raw_uint16_prefetch_note_reuse_locked(video, candidate);
             slot = (int)candidate;
         }
     }
@@ -1449,6 +1471,8 @@ static void mlv_raw_uint16_prefetch_store_frame(mlvObject_t * video,
     video->raw_uint16_prefetch_slot_state[slot] = MLV_RAW_UINT16_PREFETCH_READY;
     video->raw_uint16_prefetch_slot_frame[slot] = frameIndex;
     video->raw_uint16_prefetch_slot_generation[slot] = video->raw_uint16_prefetch_generation;
+    video->raw_uint16_prefetch_slot_decode_ms[slot] = decodeMs;
+    video->raw_uint16_prefetch_slot_consumed[slot] = 0;
     pthread_mutex_unlock(&video->raw_uint16_prefetch_mutex);
 }
 
@@ -1476,9 +1500,13 @@ static int mlv_raw_uint16_prefetch_frame_in_flight_locked(const mlvObject_t * vi
 
 static int mlv_raw_uint16_prefetch_try_copy(mlvObject_t * video,
                                             uint64_t frameIndex,
-                                            uint16_t * unpackedFrame)
+                                            uint16_t * unpackedFrame,
+                                            double * frameLj92Ms,
+                                            double * inflightWaitMs)
 {
     int hit = 0;
+    *frameLj92Ms = 0.0;
+    *inflightWaitMs = -1.0;   /* < 0: the reader did not wait */
     pthread_mutex_lock(&video->raw_uint16_prefetch_mutex);
     /* PLAYBACK-DECODE-RENDER-OVERLAP-1: with two playback frames requested ahead, the render thread's decode worker
      * asked for the very frame the prefetch worker was decoding, missed (only READY slots hit) and decoded it a second
@@ -1490,6 +1518,8 @@ static int mlv_raw_uint16_prefetch_try_copy(mlvObject_t * video,
         struct timespec deadline;
         if (clock_gettime(CLOCK_REALTIME, &deadline) == 0)
         {
+            const double waitStart = mlv_stage_timing_now();
+            int timedOut = 0;
             deadline.tv_nsec += (long)MLV_RAW_UINT16_PREFETCH_IN_FLIGHT_WAIT_MS * 1000000L;
             while (deadline.tv_nsec >= 1000000000L)
             {
@@ -1502,9 +1532,15 @@ static int mlv_raw_uint16_prefetch_try_copy(mlvObject_t * video,
                                            &video->raw_uint16_prefetch_mutex,
                                            &deadline) == ETIMEDOUT)
                 {
+                    timedOut = mlv_raw_uint16_prefetch_frame_in_flight_locked(video, frameIndex);
                     break;
                 }
             }
+            *inflightWaitMs = (mlv_stage_timing_now() - waitStart) * 1000.0;
+            mlvRawUint16PrefetchStats_t * stats = &video->raw_uint16_prefetch_stats;
+            ++stats->fg_inflight_waits;
+            stats->fg_inflight_wait_ms_sum += *inflightWaitMs;
+            if (timedOut) ++stats->fg_inflight_wait_timeouts;
         }
     }
     int slot = mlv_raw_uint16_prefetch_find_slot_locked(video, frameIndex);
@@ -1518,6 +1554,8 @@ static int mlv_raw_uint16_prefetch_try_copy(mlvObject_t * video,
                    (size_t)video->raw_uint16_prefetch_slot_words * sizeof(uint16_t));
             hit = 1;
             ++video->raw_uint16_prefetch_stats.fg_hits;
+            video->raw_uint16_prefetch_slot_consumed[slot] = 1;
+            *frameLj92Ms = video->raw_uint16_prefetch_slot_decode_ms[slot];
         }
     }
     pthread_mutex_unlock(&video->raw_uint16_prefetch_mutex);
@@ -1695,6 +1733,7 @@ static void * mlv_raw_uint16_prefetch_thread_main(void * opaque)
                 continue;
             }
 
+            mlv_raw_uint16_prefetch_note_reuse_locked(video, slot);
             video->raw_uint16_prefetch_slot_state[slot] = MLV_RAW_UINT16_PREFETCH_DECODING;
             video->raw_uint16_prefetch_slot_frame[slot] = targetFrame;
             video->raw_uint16_prefetch_slot_generation[slot] = generation;
@@ -1731,6 +1770,8 @@ static void * mlv_raw_uint16_prefetch_thread_main(void * opaque)
                      && generation == video->raw_uint16_prefetch_generation)
                     ? MLV_RAW_UINT16_PREFETCH_READY
                     : MLV_RAW_UINT16_PREFETCH_EMPTY;
+                video->raw_uint16_prefetch_slot_decode_ms[slot] = workerLj92Ms;
+                video->raw_uint16_prefetch_slot_consumed[slot] = 0;
             }
             /* Wake a foreground reader waiting for this frame (mlv_raw_uint16_prefetch_try_copy). */
             pthread_cond_broadcast(&video->raw_uint16_prefetch_cond);
@@ -3957,8 +3998,18 @@ int getMlvRawFrameUint16(mlvObject_t * video, uint64_t frameIndex, uint16_t * un
         pthread_mutex_unlock(&video->raw_uint16_prefetch_mutex);
     }
 
-    if (prefetchEnabled && mlv_raw_uint16_prefetch_try_copy(video, frameIndex, unpackedFrame))
+    g_mlv_last_raw_uint16_source = MLV_RAW_UINT16_SOURCE_NONE;
+    g_mlv_last_raw_uint16_frame_lj92_ms = 0.0;
+    g_mlv_last_raw_uint16_inflight_wait_ms = 0.0;
+    double hitLj92Ms = 0.0;
+    double inflightWaitMs = -1.0;
+    if (prefetchEnabled && mlv_raw_uint16_prefetch_try_copy(video, frameIndex, unpackedFrame,
+                                                            &hitLj92Ms, &inflightWaitMs))
     {
+        g_mlv_last_raw_uint16_source = inflightWaitMs >= 0.0
+            ? MLV_RAW_UINT16_SOURCE_INFLIGHT_WAIT_HIT : MLV_RAW_UINT16_SOURCE_HIT;
+        g_mlv_last_raw_uint16_frame_lj92_ms = hitLj92Ms;
+        g_mlv_last_raw_uint16_inflight_wait_ms = inflightWaitMs >= 0.0 ? inflightWaitMs : 0.0;
         g_mlv_last_raw_uint16_disk_read_ms = 0.0;
         g_mlv_last_raw_uint16_decompress_ms = 0.0;
         g_mlv_last_raw_uint16_decompress_prepare_ms = 0.0;
@@ -3996,16 +4047,20 @@ int getMlvRawFrameUint16(mlvObject_t * video, uint64_t frameIndex, uint16_t * un
 
     mlv_raw_uint16_fg_test_hold_point();
     int result = getMlvRawFrameUint16Direct(video, frameIndex, unpackedFrame);
+    const double directLj92Ms = g_mlv_last_raw_uint16_decompress_ms;
+    g_mlv_last_raw_uint16_source = MLV_RAW_UINT16_SOURCE_DIRECT;
+    g_mlv_last_raw_uint16_frame_lj92_ms = directLj92Ms;
+    g_mlv_last_raw_uint16_inflight_wait_ms = inflightWaitMs >= 0.0 ? inflightWaitMs : 0.0;
     if (compressedRaw)
     {
         pthread_mutex_lock(&video->raw_uint16_prefetch_mutex);
         ++video->raw_uint16_prefetch_stats.fg_direct_decodes;
-        video->raw_uint16_prefetch_stats.fg_direct_lj92_ms_sum += g_mlv_last_raw_uint16_decompress_ms;
+        video->raw_uint16_prefetch_stats.fg_direct_lj92_ms_sum += directLj92Ms;
         pthread_mutex_unlock(&video->raw_uint16_prefetch_mutex);
     }
     if (result == 0 && prefetchEnabled)
     {
-        mlv_raw_uint16_prefetch_store_frame(video, frameIndex, unpackedFrame);
+        mlv_raw_uint16_prefetch_store_frame(video, frameIndex, unpackedFrame, directLj92Ms);
         mlv_raw_uint16_prefetch_note_request(video, frameIndex);
     }
 
@@ -8900,6 +8955,32 @@ double getMlvLastRawUint16CopyMilliseconds(void)
 int getMlvLastRawUint16PrefetchHit(void)
 {
     return g_mlv_last_raw_uint16_prefetch_hit;
+}
+
+int getMlvLastRawUint16Source(void)
+{
+    return g_mlv_last_raw_uint16_source;
+}
+
+const char * mlvRawUint16SourceName(int source)
+{
+    switch (source)
+    {
+    case MLV_RAW_UINT16_SOURCE_HIT: return "hit";
+    case MLV_RAW_UINT16_SOURCE_INFLIGHT_WAIT_HIT: return "inflight_wait_hit";
+    case MLV_RAW_UINT16_SOURCE_DIRECT: return "direct";
+    default: return "none";
+    }
+}
+
+double getMlvLastRawUint16FrameLj92Milliseconds(void)
+{
+    return g_mlv_last_raw_uint16_frame_lj92_ms;
+}
+
+double getMlvLastRawUint16InflightWaitMilliseconds(void)
+{
+    return g_mlv_last_raw_uint16_inflight_wait_ms;
 }
 
 int mlvRawUint16PrefetchAllowedForTesting(const mlvObject_t * video)
