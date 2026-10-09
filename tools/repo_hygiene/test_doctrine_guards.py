@@ -27,7 +27,8 @@ NON-PROMISES:
   carry -z or core.quotepath=false) and PowerShell by one source line with its comment tokens
   blanked first (the PowerShell tokenizer decides what a comment is: a -z or core.quotepath=false
   that sits only in a `#` or `<# #>` comment does not count, and a `#` inside a string is not a
-  comment; the remaining text is still split into words by a regex, so a path-list command that
+  comment, including one inside the `$( )` of an expandable string or here-string at any depth; the
+  remaining text is still split into words by a regex, so a path-list command that
   is not spelled on one source line, and a command assembled from variables or one joined string,
   are not seen). A script that does not parse cannot be tokenized and fails as could-not-check. Test files are not scanned. A call that
   needs no path text (exit code, emptiness, a count) is listed in GIT_PATHLIST_ALLOW with its
@@ -141,6 +142,17 @@ function IsCatchAllType([string]$name, $prefixes) {
     foreach ($prefix in $prefixes) { if ($catchAll -contains ($prefix + $name)) { return $true } }
     return $false
 }
+function CommentTokens($toks) {
+    foreach ($t in @($toks)) {
+        if ($t.Kind -eq [System.Management.Automation.Language.TokenKind]::Comment) {
+            [ordered]@{ sl = $t.Extent.StartLineNumber; sc = $t.Extent.StartColumnNumber
+                        el = $t.Extent.EndLineNumber; ec = $t.Extent.EndColumnNumber }
+        }
+        if ($t -is [System.Management.Automation.Language.StringExpandableToken] -and $null -ne $t.NestedTokens) {
+            CommentTokens $t.NestedTokens
+        }
+    }
+}
 $results = New-Object System.Collections.Generic.List[object]
 foreach ($p in $paths) {
     $tokens = $null; $perr = $null
@@ -176,13 +188,10 @@ foreach ($p in $paths) {
             [ordered]@{ count = $lines.Count; line = [int]$lines[1] }
         })
     # Comment tokens, so a caller can blank them: (start line, start column, end line, end column), 1-based,
-    # columns in UTF-16 units, end column exclusive.
-    $comments = @(foreach ($t in @($tokens)) {
-        if ($t.Kind -eq [System.Management.Automation.Language.TokenKind]::Comment) {
-            [ordered]@{ sl = $t.Extent.StartLineNumber; sc = $t.Extent.StartColumnNumber
-                        el = $t.Extent.EndLineNumber; ec = $t.Extent.EndColumnNumber }
-        }
-    })
+    # columns in UTF-16 units, end column exclusive. A comment inside "$( ... )" of an expandable string or
+    # here-string lives only in that string token's NestedTokens (the one token type that carries any), at
+    # any depth, so the walk recurses; nested extents are file-absolute like the top-level ones.
+    $comments = @(CommentTokens $tokens)
     $results.Add([ordered]@{ path = [string]$p; errors = @($errs); nullRight = @($nulls); trapBlocks = @($traps)
                              comments = @($comments) })
 }
@@ -368,6 +377,9 @@ def is_git_pathlist_scanned(rel: str) -> bool:
 _GIT_STATUS_SHORT = frozenset(("--short", "-s", "-sb", "-bs"))
 
 
+_PATHLIST_NEGATIVE = frozenset(("--error-unmatch", "--object-only"))
+
+
 def _git_pathlist_kind(tokens: set[str]) -> str | None:
     """Which path-listing git command a set of argument tokens spells, or None."""
     if "ls-files" in tokens and "--error-unmatch" not in tokens:  # --error-unmatch is read by exit code
@@ -438,8 +450,10 @@ def scan_git_pathlist(root: Path, rel_paths: list[str]) -> list[tuple[Violation,
     # Only a script that holds a '#' (every comment has one) and a line spelling a path-list command needs
     # the tokenizer (a block comment's inner lines carry no '#' of their own); one pwsh process then
     # tokenizes all of them.
+    # A negative token (--error-unmatch, --object-only) may itself sit in a comment, so it is left out here.
     needs_tokens = [rel for rel, text in texts.items() if not rel.lower().endswith(".py") and "#" in text
-                    and any(_git_pathlist_kind(set(_PS_TOKEN.findall(line))) for line in _ps_source_lines(text))]
+                    and any(_git_pathlist_kind(set(_PS_TOKEN.findall(line)) - _PATHLIST_NEGATIVE)
+                            for line in _ps_source_lines(text))]
     comments = ast_scan(root, needs_tokens) if needs_tokens else {}
     for rel in rel_paths:
         text = texts[rel]
@@ -605,7 +619,22 @@ FIXTURES: dict[str, dict[str, dict[str, str]]] = {
                            "$q = & git -C $root ls-files # core.quotepath=false\n"
                            "& git -C $root diff --name-only <# -z #>\n"
                            "& git -C $root diff --name-only <# multi-line\n"
-                           "-z #>\n",
+                           "-z #>\n"
+                           # DG-GIT-PATHLIST-NESTED-COMMENT-1: a comment inside "$( )" of an expandable string or
+                           # here-string is a nested token, at any depth; its -z is not an argument either.
+                           "$paths = \"$(& git -C $root diff --name-only # add -z later\n"
+                           ")\"\n"
+                           "$d2 = \"$(& git -C $root diff --name-only \"$(1 # -z\n"
+                           ")\")\"\n"
+                           "$hs = @\"\n"
+                           "$(& git -C $root diff --name-only # -z\n"
+                           ")\n"
+                           "\"@\n"
+                           # A `#` inside a string is not a comment: blanking from it would hide this command.
+                           "$h2 = \"a # b\"; & git -C $root diff --name-only\n",
+            # DG-GIT-PATHLIST-PREFILTER-NEGATIVE-TOKEN-1: the only line that spells a path-list command also
+            # carries a negative token (--error-unmatch) in its comment, so it still has to be tokenized.
+            "tools/d.ps1": "$f = & git -C $root ls-files # --error-unmatch\n",
             # DURATION-SCAN-UTF8-PATHS-1: -z is present, but text=True decodes the UTF-8 paths with the locale codec.
             "tools/repo_hygiene/c.py": "import subprocess\n"
                                        "def f(repo):\n"
@@ -638,7 +667,15 @@ FIXTURES: dict[str, dict[str, dict[str, str]]] = {
                            "& git -C $root diff --name-only -z # the comment may say anything, -z is a real argument\n"
                            "$h = \"a # b\"; & git -C $root diff --name-only -z\n"
                            "$p = @(& git -C $root ls-files -z <# inline #> )\n"
-                           "<#\n& git -C $root diff --name-only\n#>\n",
+                           "<#\n& git -C $root diff --name-only\n#>\n"
+                           # A real -z inside "$( )" still counts, with or without a comment after it.
+                           "$np = \"$(& git -C $root diff --name-only -z)\"\n"
+                           "$nm = \"$(& git -C $root diff --name-only -z # note\n"
+                           ")\"\n"
+                           "$hz = @\"\n"
+                           "$(& git -C $root ls-files -z # kept\n"
+                           ")\n"
+                           "\"@\n",
             "tools/repo_hygiene/c.py": "import subprocess\n"
                                        "def f(repo):\n"
                                        "    subprocess.run(['git', '-C', repo, 'ls-files', '-z'], capture_output=True, text=True, encoding='utf-8', errors='surrogateescape')\n"
@@ -796,6 +833,9 @@ class GuardFixtureTests(_PwshMixin, unittest.TestCase):
                                              ("tools/b.ps1", 3), ("tools/b.ps1", 4),
                                              ("tools/b.ps1", 5), ("tools/b.ps1", 6),
                                              ("tools/b.ps1", 7), ("tools/b.ps1", 8),
+                                             ("tools/b.ps1", 10), ("tools/b.ps1", 12),
+                                             ("tools/b.ps1", 15), ("tools/b.ps1", 18),
+                                             ("tools/d.ps1", 1),
                                              ("tools/repo_hygiene/c.py", 3), ("tools/repo_hygiene/c.py", 4),
                                              ("tools/repo_hygiene/c.py", 5)})
 
