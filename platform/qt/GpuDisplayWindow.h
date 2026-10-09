@@ -86,6 +86,10 @@ public:
         int displayWidth = 0,
         int displayHeight = 0,
         quint64 presentationSerial = 0);
+    /* PLAYBACK-GL-PRESENT-SETUP-STALL-1: the active window's lastPresentSetupTiming()
+     * (a default value when no window is active). GUI-thread only; read it right after
+     * presentGpuPlaybackReconAmazePostWbTextureIfActive. */
+    static GpuPresentSetupTiming lastPresentSetupTimingIfActive(void);
     static bool readGpuReconSourceBayer16TextureIfActive(QByteArray *textureBytes,
                                                         int *width,
                                                         int *height,
@@ -176,6 +180,9 @@ public:
         int displayWidth,
         int displayHeight,
         quint64 presentationSerial = 0);
+    /* Where the last setPresentedGpuPlaybackReconAmazePostWbTexture() call's setup block
+     * spent its time (reset at the start of every call). */
+    const GpuPresentSetupTiming &lastPresentSetupTiming(void) const { return m_lastPresentSetupTiming; }
     bool readGpuReconSourceBayer16Texture(QByteArray *textureBytes,
                                           int *width,
                                           int *height,
@@ -237,6 +244,7 @@ private:
     // through the SAME processing path the viewport uses, instead of passthrough.
     QOpenGLShaderProgram *m_previewProcessingProgram;
     GpuPreviewProcessingLutTextureSet m_lutSet;
+    GpuPresentSetupTiming m_lastPresentSetupTiming;
     // Presentation options captured at the most recent recon-texture submit; consumed
     // by paintGL() when it draws that texture (paintGL runs later / can run twice --
     // see grabPresentedFramebufferIfActive -- so the options must outlive the submit

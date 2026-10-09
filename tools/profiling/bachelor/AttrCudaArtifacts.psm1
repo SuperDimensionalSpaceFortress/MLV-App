@@ -5975,6 +5975,19 @@ function Stop-AttrCudaDisplayWakeKeepAlive {
         } catch {
             $stopError = $_.Exception.Message
         }
+        # CI-FLAKE-KEEPALIVE-HUNG-PROBE-SLEEP-1 >>>
+        # PowerShell.Dispose()/Runspace.Close() on a pipeline that is STILL RUNNING block until it
+        # stops -- i.e. until the stuck tick's bounded probe returns -- so after the timed-out wait
+        # above this call used to take ~ the probe bound (measured 12000ms for
+        # -ProbeTimeoutMilliseconds 12000, -TimeoutMilliseconds 300), making -TimeoutMilliseconds a
+        # lie. Same leak-on-purpose choice Invoke-AttrCudaBoundedProbe makes for the same reason: a
+        # still-running pipeline (and the stop event it is still waiting on, already Set above) is
+        # abandoned rather than torn down. Only the timeout branch above sets a stop error with
+        # this prefix (a thrown EndInvoke means the pipeline already completed), so the prefix
+        # alone says "still running". Dropping the handle makes the teardown below a no-op: each
+        # of its three blocks guards on a member of $Handle inside its own try.
+        if ($stopError -like 'ATTRCUDA_KEEPALIVE_STOP_TIMEOUT*') { $Handle = $null }
+        # CI-FLAKE-KEEPALIVE-HUNG-PROBE-SLEEP-1 <<<
         try { if ($Handle.powershell) { $Handle.powershell.Dispose() } } catch {
         }
         try { if ($Handle.stopEvent) { $Handle.stopEvent.Dispose() } } catch {

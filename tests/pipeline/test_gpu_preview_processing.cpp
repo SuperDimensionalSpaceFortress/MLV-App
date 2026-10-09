@@ -2214,6 +2214,55 @@ TEST(GpuPreviewProcessing, LutTextureCacheKeyIncludesTheRawLutsWithoutMovingTheS
     ASSERT_TRUE(tinted.rawLutSignature != base.rawLutSignature);
 }
 
+/* PLAYBACK-GL-PRESENT-SETUP-STALL-1 (T1, GL-free): two configs built from the same
+ * processing object key the LUT texture set identically (no rebuild), the rebuild names
+ * the group that really moved when the processing object changes, and `signature`
+ * itself is pinned (the per-group digests sit beside it and must never move it). */
+TEST(GpuPreviewProcessing, LutSetKeyIsStableForEqualConfigsAndARebuildNamesTheMovedGroup)
+{
+    MlvPipelineFixture fixture;
+    assert_gpu_preview_fixture_ready(fixture);
+    const GpuPreviewProcessingConfig first = assert_gpu_preview_subset_supported(fixture);
+    /* Pinned beside pipeline_hashes.json's tiny_dual_iso.gpu_preview_subset.signature.frame0:
+     * a changed hash order or an extra byte in `signature` fails here, locally. */
+    ASSERT_EQ(static_cast<uint64_t>(7674836058204671579ull), first.signature);
+
+    QString reason;
+    const GpuPreviewProcessingConfig second = gpuPreviewProcessingBuildConfig(fixture.processing(), &reason);
+    GpuPreviewProcessingLutTextureSet set;
+    set.signatureValid = true;
+    set.signature = first.signature;
+    set.rawLutSignature = first.rawLutSignature;
+    std::memcpy(set.lutGroupDigests, first.lutGroupDigests, sizeof(set.lutGroupDigests));
+    ASSERT_TRUE(gpuPreviewProcessingLutTextureSetKeyMatches(set, second));
+    for (int group = 0; group < GpuPreviewLutGroupCount; ++group)
+    {
+        ASSERT_EQ(first.lutGroupDigests[group], second.lutGroupDigests[group]);
+    }
+    ASSERT_EQ(std::string("unknown"), std::string(gpuPreviewProcessingLutTextureSetMissGroup(set, second)));
+    GpuPreviewProcessingLutTextureSet unbuilt;
+    ASSERT_EQ(std::string("unbuilt"), std::string(gpuPreviewProcessingLutTextureSetMissGroup(unbuilt, second)));
+
+    /* The scene-driven mover the design named: highest_green_diso alone. */
+    processingObject_t * processing = fixture.processing();
+    const uint16_t savedDiso = processing->highest_green_diso;
+    processing->highest_green_diso = static_cast<uint16_t>(savedDiso + 256u);
+    const GpuPreviewProcessingConfig disoMoved = gpuPreviewProcessingBuildConfig(processing, &reason);
+    processing->highest_green_diso = savedDiso;
+    ASSERT_EQ(std::string("highest_green_diso"),
+              std::string(gpuPreviewProcessingLutTextureSetMissGroup(set, disoMoved)));
+
+    /* A white-balance change moves texture content: the matrix LUTs come first. */
+    processingSetWhiteBalance(processing, 3200.0, 10.0);
+    const GpuPreviewProcessingConfig wbMoved = gpuPreviewProcessingBuildConfig(processing, &reason);
+    ASSERT_TRUE(!gpuPreviewProcessingLutTextureSetKeyMatches(set, wbMoved));
+    ASSERT_EQ(std::string("matrix"), std::string(gpuPreviewProcessingLutTextureSetMissGroup(set, wbMoved)));
+
+    ASSERT_EQ(std::string("levels"), std::string(gpuPreviewProcessingLutGroupName(GpuPreviewLutGroupLevels)));
+    ASSERT_EQ(std::string("other_uniforms"), std::string(gpuPreviewProcessingLutGroupName(GpuPreviewLutGroupOtherUniforms)));
+    ASSERT_EQ(std::string("unknown"), std::string(gpuPreviewProcessingLutGroupName(GpuPreviewLutGroupCount)));
+}
+
 TEST(GpuPreviewProcessing, MarkShadowsHighlightsBlurStaleClearsOnlyTheReadyFlag)
 {
     GpuPreviewProcessingLutTextureSet set;

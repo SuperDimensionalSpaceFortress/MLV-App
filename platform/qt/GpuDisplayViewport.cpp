@@ -780,6 +780,8 @@ bool GpuDisplayViewport::presentGpuPlaybackReconTexture(
     llrpGpuPlaybackReconTiming_t *timing)
 {
     GpuDisplayViewport *viewport = from(view);
+    // PLAYBACK-GL-PRESENT-SETUP-STALL-1: a refused call leaves no earlier call's split behind.
+    if ( viewport ) viewport->m_lastPresentSetupTiming = GpuPresentSetupTiming();
     if ( !viewport
       || !rawInputBayer14
       || !state
@@ -828,6 +830,8 @@ bool GpuDisplayViewport::presentGpuPlaybackReconAmazePostWbTexture(
     int retainedDeviceHeight)
 {
     GpuDisplayViewport *viewport = from(view);
+    // PLAYBACK-GL-PRESENT-SETUP-STALL-1: a refused call leaves no earlier call's split behind.
+    if ( viewport ) viewport->m_lastPresentSetupTiming = GpuPresentSetupTiming();
     const bool retainedDeviceValid =
         state
         && state->valid
@@ -1138,6 +1142,12 @@ const GpuDisplayViewport *GpuDisplayViewport::from(const QGraphicsView *view)
     return from(const_cast<QGraphicsView *>(view));
 }
 
+GpuPresentSetupTiming GpuDisplayViewport::lastPresentSetupTimingFor(const QGraphicsView *view)
+{
+    const GpuDisplayViewport *viewport = from(view);
+    return viewport ? viewport->lastPresentSetupTiming() : GpuPresentSetupTiming();
+}
+
 void GpuDisplayViewport::cleanupGLResources()
 {
     m_texturePresentationActive = false;
@@ -1313,8 +1323,13 @@ bool GpuDisplayViewport::setPresentedGpuPlaybackReconTexture(
     const bool madeCurrent = needsCurrent ? (makeCurrent(), true) : false;
     contextMs = elapsedMs() - contextStartMs;
 
+    // PLAYBACK-GL-PRESENT-SETUP-STALL-1: the setupMs block split into parts (wall time
+    // only, no GL query or fence); read via lastPresentSetupTiming().
+    GpuPresentSetupTiming &setupTiming = m_lastPresentSetupTiming;
     const double setupStartMs = elapsedMs();
     ensureProgram();
+    double partStartMs = elapsedMs();
+    setupTiming.program_ms = partStartMs - setupStartMs;
     if ( !m_program )
     {
         if ( madeCurrent ) doneCurrent();
@@ -1322,7 +1337,7 @@ bool GpuDisplayViewport::setPresentedGpuPlaybackReconTexture(
     }
 
     setPresentationOptions(options);
-    updateProcessingTexturesIfNeeded();
+    updateProcessingTexturesIfNeeded(&setupTiming);
     // CUDA-PLAYBACK-LOOK-PARITY-1-LAND r2 (fable r1 hardening): this raw-Bayer16 route
     // never refreshes the per-frame shadows/highlights blur, and it samples the frame
     // y-flipped while the blur lookup is not. The LUT set is shared with the AMaZE
@@ -1340,12 +1355,15 @@ bool GpuDisplayViewport::setPresentedGpuPlaybackReconTexture(
     // as the AMaZE route, so MainWindow's existing fallback runs instead.
     if ( !gpuPreviewProcessingLutTextureSetReady(m_lutSet, options.previewProcessing) )
     {
+        setupTiming.lut_ms = elapsedMs() - partStartMs;
         if ( madeCurrent ) doneCurrent();
         return fail(QStringLiteral(
             "GPU playback recon texture-present refused: LUT texture upload failed "
             "for a linear post-WB-undo texture (trace=gpu_viewport_recon_raw_lut_upload_failed)"));
     }
+    setupTiming.lut_ms = elapsedMs() - partStartMs;
 
+    partStartMs = elapsedMs();
     if ( !m_texture
       || m_texture->width() != width
       || m_texture->height() != height
@@ -1362,8 +1380,11 @@ bool GpuDisplayViewport::setPresentedGpuPlaybackReconTexture(
         m_textureIs16Bit = true;
         m_textureIsBayer16 = true;
     }
+    const double samplingStartMs = elapsedMs();
+    setupTiming.realloc_ms += samplingStartMs - partStartMs;
     applySamplingMode();
     setupMs = elapsedMs() - setupStartMs;
+    setupTiming.sampling_ms = setupStartMs + setupMs - samplingStartMs;
     m_gpuReconSourceTextureCurrent = false;
 
     int rc = -1;
@@ -1539,8 +1560,13 @@ bool GpuDisplayViewport::setPresentedGpuPlaybackReconAmazePostWbTexture(
     const bool madeCurrent = needsCurrent ? (makeCurrent(), true) : false;
     contextMs = elapsedMs() - contextStartMs;
 
+    // PLAYBACK-GL-PRESENT-SETUP-STALL-1: the setupMs block split into parts (wall time
+    // only, no GL query or fence); read via lastPresentSetupTiming().
+    GpuPresentSetupTiming &setupTiming = m_lastPresentSetupTiming;
     const double setupStartMs = elapsedMs();
     ensureProgram();
+    double partStartMs = elapsedMs();
+    setupTiming.program_ms = partStartMs - setupStartMs;
     if ( !m_program )
     {
         if ( madeCurrent ) doneCurrent();
@@ -1548,13 +1574,14 @@ bool GpuDisplayViewport::setPresentedGpuPlaybackReconAmazePostWbTexture(
     }
 
     setPresentationOptions(options);
-    updateProcessingTexturesIfNeeded();
+    updateProcessingTexturesIfNeeded(&setupTiming);
+    setupTiming.lut_ms = elapsedMs() - partStartMs;
     // CUDA-PLAYBACK-LOOK-PARITY-1: refresh the per-frame shadows/highlights blur
     // texture every present call, same as GpuDisplayWindow -- its content changes
     // every frame, unlike the signature-cached LUTs above. A miss is a soft
     // degrade (previewApplyShadowsHighlights bound false for this frame).
     gpuPreviewProcessingUpdateShadowsHighlightsBlurTexture(
-        m_lutSet, previewProcessing, width, height );
+        m_lutSet, previewProcessing, width, height, &setupTiming );
 
     // FAIL CLOSED (GPU-TEXNR-S1-DARK-GREEN-1 round 3, sol major): the options-usable
     // check above only proves the LUT *source bytes* were big enough to attempt an
@@ -1572,6 +1599,7 @@ bool GpuDisplayViewport::setPresentedGpuPlaybackReconAmazePostWbTexture(
             "for a linear post-WB-undo texture (trace=gpu_viewport_recon_lut_upload_failed)"));
     }
 
+    partStartMs = elapsedMs();
     if ( !m_texture
       || m_texture->width() != width
       || m_texture->height() != height
@@ -1602,8 +1630,11 @@ bool GpuDisplayViewport::setPresentedGpuPlaybackReconAmazePostWbTexture(
         m_gpuReconSourceTexture->setWrapMode(QOpenGLTexture::ClampToEdge);
         gpuPresentEventNoteTextureRealloc("viewport_r16_texture_realloc", width, height);
     }
+    const double samplingStartMs = elapsedMs();
+    setupTiming.realloc_ms += samplingStartMs - partStartMs;
     applySamplingMode();
     setupMs = elapsedMs() - setupStartMs;
+    setupTiming.sampling_ms = setupStartMs + setupMs - samplingStartMs;
     m_gpuReconSourceTextureCurrent = false;
 
     int rc = -1;
@@ -2089,14 +2120,14 @@ void GpuDisplayViewport::setPresentationOptions(const PresentationOptions &optio
     m_presentationOptions = options;
 }
 
-void GpuDisplayViewport::updateProcessingTexturesIfNeeded()
+void GpuDisplayViewport::updateProcessingTexturesIfNeeded(GpuPresentSetupTiming *setupTiming)
 {
     if ( !m_processingTexturesDirty && !m_presentationOptions.previewProcessing.enabled )
     {
         return;
     }
 
-    gpuPreviewProcessingUpdateLutTextureSet(m_lutSet, m_presentationOptions.previewProcessing);
+    gpuPreviewProcessingUpdateLutTextureSet(m_lutSet, m_presentationOptions.previewProcessing, setupTiming);
     m_processingTexturesDirty = false;
 }
 

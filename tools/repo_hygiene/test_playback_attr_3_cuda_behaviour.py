@@ -90,13 +90,22 @@ def _long_path(path: Path) -> Path:
     return resolved
 
 
-def _run_pwsh_file(script: Path) -> subprocess.CompletedProcess:
+def _run_pwsh_file(script: Path, timeout: float | None = None) -> subprocess.CompletedProcess:
+    # timeout=None (the default) keeps every existing caller unbounded exactly as before; a caller
+    # that passes one gets subprocess.TimeoutExpired (a test error) instead of a hung shard.
     return subprocess.run(
         [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
          "-File", str(script)],
         capture_output=True,
         text=True,
+        timeout=timeout,
     )
+
+
+# Bound for the keep-alive hung-probe tests' pwsh children: they normally finish in ~6-8s (up to
+# ~40s under 4x CPU oversubscription); 180s is far past that yet still fails a wedged pwsh instead
+# of hanging the CI shard.
+_KEEPALIVE_TEST_TIMEOUT_SECONDS = 180
 
 
 def _run_job(job: Path, *args: str) -> subprocess.CompletedProcess:
@@ -6930,7 +6939,14 @@ class KeepAliveHungProbeDoesNotBlockStopTests(unittest.TestCase):
                 "\n$ErrorActionPreference = 'Stop'\n"
                 "function Get-AttrCudaScreensaverRunning { Start-Sleep -Milliseconds 999999; return $true }\n"
                 "$h = Start-AttrCudaDisplayWakeKeepAlive -IntervalSeconds 1 -ProbeTimeoutMilliseconds 1000\n"
-                "Start-Sleep -Milliseconds 3500\n"
+                # CI-FLAKE-KEEPALIVE-HUNG-PROBE-SLEEP-1: poll for the failure itself instead of a
+                # fixed 3500ms sleep (first tick ~1000ms + bounded probe(s) ~1000ms each + runspace
+                # setup, which stretches on a loaded runner). lastError is written AFTER failureCount
+                # in the loop, so wait for both. Generous 20s deadline; the assertions below still
+                # fail (not hang) if the failure never arrives.
+                "$pollDeadline = [DateTime]::UtcNow.AddSeconds(20)\n"
+                "while (-not ([int]$h.nudgeState.failureCount -ge 1 -and $h.nudgeState.lastError) "
+                "-and [DateTime]::UtcNow -lt $pollDeadline) { Start-Sleep -Milliseconds 50 }\n"
                 "$midFailureCount = [int]$h.nudgeState.failureCount\n"
                 "$midLastError = $h.nudgeState.lastError\n"
                 "$stopSw = [System.Diagnostics.Stopwatch]::StartNew()\n"
@@ -6940,7 +6956,7 @@ class KeepAliveHungProbeDoesNotBlockStopTests(unittest.TestCase):
                 "stopElapsedMs = $stopSw.ElapsedMilliseconds; stopStopped = [bool]$r.stopped; stopError = $r.error }\n"
                 f"[IO.File]::WriteAllText('{(self.tmp / 'r.json')}', ($out | ConvertTo-Json -Depth 5))\n"
             )
-        proc = _run_pwsh_file(probe_script)
+        proc = _run_pwsh_file(probe_script, timeout=_KEEPALIVE_TEST_TIMEOUT_SECONDS)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         result = json.loads((self.tmp / "r.json").read_text(encoding="utf-8"))
         # Before this fix: 0, with no recorded failure at all (the tick never returned).
@@ -6961,26 +6977,67 @@ class KeepAliveHungProbeDoesNotBlockStopTests(unittest.TestCase):
         # before ever probing) -- so the sleep here is 1200ms, long enough for that first tick to
         # have entered its bounded (and, here, permanently stuck) probe call, short enough that it
         # has nowhere near returned by the time Stop- is called.
+        # CI-FLAKE-KEEPALIVE-HUNG-PROBE-SLEEP-1: the fixed 1200ms sleep (only ~200ms past the first
+        # tick's 1000ms StopEvent.Wait) is replaced by a marker the stuck probe stub writes as its
+        # first statement, polled with a generous deadline -- Stop- is now called only once the tick
+        # is KNOWN to be inside its stuck probe, never before it has entered one.
         probe_script = self._extracted_script()
+        marker = self.tmp / "probe-entered.marker"
         with probe_script.open("a", encoding="utf-8") as f:
             f.write(
                 "\n$ErrorActionPreference = 'Stop'\n"
-                "function Get-AttrCudaScreensaverRunning { Start-Sleep -Milliseconds 999999; return $true }\n"
+                f"function Get-AttrCudaScreensaverRunning {{ [IO.File]::WriteAllText('{marker}', '1'); "
+                "Start-Sleep -Milliseconds 999999; return $true }\n"
                 "$h = Start-AttrCudaDisplayWakeKeepAlive -IntervalSeconds 1 -ProbeTimeoutMilliseconds 5000\n"
-                "Start-Sleep -Milliseconds 1200\n"
+                "$pollDeadline = [DateTime]::UtcNow.AddSeconds(20)\n"
+                f"while (-not (Test-Path -LiteralPath '{marker}') -and [DateTime]::UtcNow -lt $pollDeadline) "
+                "{ Start-Sleep -Milliseconds 50 }\n"
                 "$stopSw = [System.Diagnostics.Stopwatch]::StartNew()\n"
                 "$r = Stop-AttrCudaDisplayWakeKeepAlive -Handle $h -TimeoutMilliseconds 300\n"
                 "$stopSw.Stop()\n"
                 "$out = [ordered]@{ stopElapsedMs = $stopSw.ElapsedMilliseconds; stopStopped = [bool]$r.stopped; stopError = $r.error }\n"
                 f"[IO.File]::WriteAllText('{(self.tmp / 'r.json')}', ($out | ConvertTo-Json -Depth 5))\n"
             )
-        proc = _run_pwsh_file(probe_script)
+        proc = _run_pwsh_file(probe_script, timeout=_KEEPALIVE_TEST_TIMEOUT_SECONDS)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         result = json.loads((self.tmp / "r.json").read_text(encoding="utf-8"))
         self.assertIs(result["stopStopped"], False)
         self.assertIn("ATTRCUDA_KEEPALIVE_STOP_TIMEOUT", result["stopError"])
         # Bounded by Stop's OWN -TimeoutMilliseconds (300ms), not by the probe's much longer 5000ms
         # bound or the probe's 999999ms sleep. A generous upper margin tolerates a slow CI host.
+        self.assertLess(result["stopElapsedMs"], 5000)
+
+    def test_stop_returns_within_its_own_bound_even_when_the_probe_bound_is_far_longer(self) -> None:
+        # CI-FLAKE-KEEPALIVE-HUNG-PROBE-SLEEP-1: pins the product fix. Stop- used to Dispose() the
+        # still-running pipeline after its timed-out wait, and Dispose blocks until the stuck tick's
+        # probe bound elapses -- so -TimeoutMilliseconds 300 really took ~the probe bound (the sibling
+        # test's `< 5000` against a 5000ms probe bound only passed on ~200ms of timing luck). A probe
+        # bound of 10000ms makes that failure unmistakable: Stop- must still return in well under it.
+        probe_script = self._extracted_script()
+        marker = self.tmp / "probe-entered.marker"
+        with probe_script.open("a", encoding="utf-8") as f:
+            f.write(
+                "\n$ErrorActionPreference = 'Stop'\n"
+                f"function Get-AttrCudaScreensaverRunning {{ [IO.File]::WriteAllText('{marker}', '1'); "
+                "Start-Sleep -Milliseconds 999999; return $true }\n"
+                "$h = Start-AttrCudaDisplayWakeKeepAlive -IntervalSeconds 1 -ProbeTimeoutMilliseconds 10000\n"
+                "$pollDeadline = [DateTime]::UtcNow.AddSeconds(20)\n"
+                f"while (-not (Test-Path -LiteralPath '{marker}') -and [DateTime]::UtcNow -lt $pollDeadline) "
+                "{ Start-Sleep -Milliseconds 50 }\n"
+                f"$entered = Test-Path -LiteralPath '{marker}'\n"
+                "$stopSw = [System.Diagnostics.Stopwatch]::StartNew()\n"
+                "$r = Stop-AttrCudaDisplayWakeKeepAlive -Handle $h -TimeoutMilliseconds 300\n"
+                "$stopSw.Stop()\n"
+                "$out = [ordered]@{ entered = $entered; stopElapsedMs = $stopSw.ElapsedMilliseconds; "
+                "stopStopped = [bool]$r.stopped; stopError = $r.error }\n"
+                f"[IO.File]::WriteAllText('{(self.tmp / 'r.json')}', ($out | ConvertTo-Json -Depth 5))\n"
+            )
+        proc = _run_pwsh_file(probe_script, timeout=_KEEPALIVE_TEST_TIMEOUT_SECONDS)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        result = json.loads((self.tmp / "r.json").read_text(encoding="utf-8"))
+        self.assertIs(result["entered"], True)
+        self.assertIs(result["stopStopped"], False)
+        self.assertIn("ATTRCUDA_KEEPALIVE_STOP_TIMEOUT", result["stopError"])
         self.assertLess(result["stopElapsedMs"], 5000)
 
 

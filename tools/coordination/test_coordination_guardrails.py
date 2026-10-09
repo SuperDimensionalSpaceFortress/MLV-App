@@ -676,6 +676,23 @@ def test_invoke_lane_maps_the_negative_sentinels_rather_than_passing_them_throug
     assert "-999    { 127 }" in body, "never-completed sentinel is not mapped"
 
 
+def test_invoke_lane_marks_only_the_claude_child_as_a_fleet_lane():
+    # KEY-VERDICT-OVERWRITTEN-BY-ROTATION-CHECKPOINT-1. The user-level Stop hook usage-guard.py skips
+    # its rotation-checkpoint block when MLV_FLEET_LANE is set; without it a headless lane takes one more
+    # turn and --output-format json reports only that turn as `result`, overwriting the verdict.
+    body = LANE_RUNNER.read_text(encoding="utf-8").replace("\r\n", "\n")
+    assert (
+        "if ($cfg.engine -eq 'claude') {\n    $psi.Environment['MLV_FLEET_LANE'] = '1'\n}" in body
+    ), "Invoke-Lane must set MLV_FLEET_LANE=1 on the claude child only; the codex path is unchanged"
+    assert body.count("MLV_FLEET_LANE") == 1
+    # The variable reaches the hook only if the contained host does not replace the provider's environment.
+    start = body.index("$hostSource = @'")
+    host = body[start:body.index("\n'@", start)]
+    assert ".Environment" not in host, "the contained host must let the provider inherit its environment"
+    # NA-3 prefixes: the new name must not be one of them.
+    assert not "MLV_FLEET_LANE".startswith(("ANTHROPIC_", "OPENAI_", "CLAUDE_CODE_"))
+
+
 def test_the_timeout_code_matches_the_taxonomy_the_repo_already_uses():
     # boundedRunnerExitCodes already fixes timeout=124; a second private meaning for the same
     # condition is how two tools end up disagreeing about one event.
