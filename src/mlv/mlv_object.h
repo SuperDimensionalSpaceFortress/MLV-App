@@ -19,6 +19,8 @@
 #define MLV_PROCESSED_8BIT_CACHE_SLOTS 8 /* original known-good. A 2026-06-10 bump to 16 appeared to collapse prefetch hits, but that A/B was THERMALLY CONFOUNDED - a cache-8 control run on the same heat-soaked machine degraded identically (99%->56% hit). Cache size NOT proven to matter; re-test only from a cooled machine before changing. */
 #define MLV_PROCESSED_16BIT_CACHE_SLOTS 2
 #define MLV_RAW_UINT16_PREFETCH_SLOTS 4
+#define MLV_RAW_UINT16_PREFETCH_MAX_DECODERS 4 /* PLAYBACK-LJ92-DECODE-THROUGHPUT-1: prefetch decoders per object */
+#define MLV_RAW_UINT16_FG_CLAIMS 4 /* foreground readers' slotless decode claims */
 
 /* PLAYBACK-LJ92-DECODE-THROUGHPUT-1: object-scoped raw-uint16 prefetch counters, kept under
  * raw_uint16_prefetch_mutex so any thread can read them (getMlvRawUint16PrefetchStats). */
@@ -297,11 +299,16 @@ typedef struct {
     /* Small raw uint16 decode-ahead ring for playback */
     pthread_mutex_t raw_uint16_prefetch_mutex;
     pthread_cond_t raw_uint16_prefetch_cond;
-    pthread_t raw_uint16_prefetch_thread;
-    int raw_uint16_prefetch_thread_started;
+    pthread_t raw_uint16_prefetch_threads[MLV_RAW_UINT16_PREFETCH_MAX_DECODERS];
+    int raw_uint16_prefetch_threads_started; /* how many of the threads exist (all start at the first request) */
+    int raw_uint16_prefetch_decoders;        /* K, fixed when the threads start */
     int raw_uint16_prefetch_stop;
-    int raw_uint16_prefetch_request_pending;
-    int raw_uint16_prefetch_worker_busy;
+    int raw_uint16_prefetch_request_pending; /* the request window is live (set by a request, cleared by a reset) */
+    int raw_uint16_prefetch_worker_busy;     /* workers decoding a claimed slot right now */
+    uint32_t raw_uint16_prefetch_window_lookahead;
+    uint64_t raw_uint16_fg_claim_frame[MLV_RAW_UINT16_FG_CLAIMS];
+    uint32_t raw_uint16_fg_claim_generation[MLV_RAW_UINT16_FG_CLAIMS];
+    uint8_t raw_uint16_fg_claim_active[MLV_RAW_UINT16_FG_CLAIMS];
     uint64_t raw_uint16_prefetch_request_frame;
     uint64_t raw_uint16_prefetch_last_request_frame;
     uint32_t raw_uint16_prefetch_request_stride;

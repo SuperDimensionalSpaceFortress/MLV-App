@@ -138,6 +138,7 @@ static uint64_t file_get_pos(FILE *stream)
 #define MLV_RAW_UINT16_PREFETCH_EMPTY 0
 #define MLV_RAW_UINT16_PREFETCH_READY 1
 #define MLV_RAW_UINT16_PREFETCH_DECODING 2
+#define MLV_RAW_UINT16_PREFETCH_FAILED 3
 #define MLV_RAW_UINT16_PREFETCH_LOOKAHEAD 2
 #define MLV_RAW_UINT16_PREFETCH_MAX_PREDICTIVE_STRIDE 32
 #define MLV_PROCESSED_8BIT_PREFETCH_EMPTY 0
@@ -1327,19 +1328,69 @@ static void mlv_raw_uint16_count_decode_for_testing(uint64_t frameIndex)
     pthread_mutex_unlock(&g_mlv_raw_uint16_decode_count_mutex);
 }
 
-/* LOOK-ASSIST-DUALISO-DETERMINISM-1: the worker decodes into its claimed slot OUTSIDE the mutex, so a DECODING
- * slot stays reserved until the worker finishes it: a reset keeps it (the worker then sees the stale generation
- * and marks it EMPTY), and a foreground store never reuses it. Reusing it let the worker's late write of another
- * frame land in a slot labelled READY for the stored frame, so every later read of that frame copied a mix of
- * both (the headless Look Assist on large_dual_iso frame 10: 6310 K or 6300 K, about 1 run in 20 under load). */
+/* PLAYBACK-LJ92-DECODE-THROUGHPUT-1: one LJ92 frame is a single scan with no restart markers (lj92.c parseImage),
+ * so a frame cannot be split across threads; throughput comes from K decoders working on DIFFERENT frames.
+ * MLVAPP_RAW_UINT16_PREFETCH_DECODERS sets K (read once, clamped to 1..MLV_RAW_UINT16_PREFETCH_MAX_DECODERS; unset or
+ * unparsable means the default). MLVAPP_DISABLE_RAW_UINT16_PREFETCH=1 still means no prefetch at all. */
+#define MLV_RAW_UINT16_PREFETCH_DEFAULT_DECODERS 2
+
+static int mlv_raw_uint16_prefetch_decoders_from_env_value(const char * value)
+{
+    if (!value || value[0] == '\0') return MLV_RAW_UINT16_PREFETCH_DEFAULT_DECODERS;
+    char * end = NULL;
+    errno = 0;
+    const long parsed = strtol(value, &end, 10);
+    if (end == value || *end != '\0' || errno != 0) return MLV_RAW_UINT16_PREFETCH_DEFAULT_DECODERS;
+    if (parsed < 1) return 1;
+    if (parsed > MLV_RAW_UINT16_PREFETCH_MAX_DECODERS) return MLV_RAW_UINT16_PREFETCH_MAX_DECODERS;
+    return (int)parsed;
+}
+
+static int mlv_raw_uint16_prefetch_env_decoders(void)
+{
+    static int decoders = -1;
+    if (decoders < 0)
+    {
+        decoders = mlv_raw_uint16_prefetch_decoders_from_env_value(getenv("MLVAPP_RAW_UINT16_PREFETCH_DECODERS"));
+    }
+    return decoders;
+}
+
+/* The object's decoder count: fixed once its decoders start; before that, the test override or the env knob. */
+static int mlv_raw_uint16_prefetch_decoders_locked(const mlvObject_t * video)
+{
+    if (video->raw_uint16_prefetch_threads_started > 0)
+    {
+        return video->raw_uint16_prefetch_decoders;
+    }
+    const int override = mlv_raw_uint16_prefetch_test_override();
+    return override >= 0 ? override : mlv_raw_uint16_prefetch_env_decoders();
+}
+
+/* THE CLAIM DISCIPLINE (everything below runs under raw_uint16_prefetch_mutex).
+ *
+ * A decode of (frame F, generation G) starts only after its decoder records a claim for (F, G), and only when no
+ * READY slot and no claim exist for (F, G) already. A prefetch worker's claim is its DECODING slot; a foreground
+ * reader's claim is a slotless raw_uint16_fg_claim_* entry (it decodes into its own buffer and publishes a copy).
+ * If the foreground table is full, or the reader's in-flight wait timed out on a live claim, the reader decodes
+ * unclaimed and counts fg_unclaimed_decodes; a publish that finds a READY (F, G) counts duplicate_publishes, the
+ * runtime witness that must stay 0. Workers skip any frame a reader has claimed, and a reader that finds a claim
+ * waits for it (the PR #264 in-flight wait, same 250 ms bound) instead of decoding the frame again.
+ *
+ * Slots: a DECODING slot always has a live owner, so no reset clears it and no store reuses it (a stale-generation
+ * decode is dropped when its owner finishes). The victim for a worker claim or a foreground store is an EMPTY (or
+ * FAILED) slot, else a READY slot of a stale generation or below the cursor (raw_uint16_prefetch_last_request_frame,
+ * a frame the reader has already passed) -- never a DECODING slot and never a READY slot at or ahead of the cursor.
+ * With no victim a worker stops claiming (backpressure) and a foreground store is skipped.
+ *
+ * Together these give, for any K: no frame is decoded twice per generation, and no slot is read while written. */
 static void mlv_reset_raw_uint16_prefetch_locked(mlvObject_t * video)
 {
     video->raw_uint16_prefetch_request_pending = 0;
     video->raw_uint16_prefetch_request_stride = 1;
     for (uint32_t slot = 0; slot < MLV_RAW_UINT16_PREFETCH_SLOTS; ++slot)
     {
-        if (video->raw_uint16_prefetch_worker_busy
-            && video->raw_uint16_prefetch_slot_state[slot] == MLV_RAW_UINT16_PREFETCH_DECODING)
+        if (video->raw_uint16_prefetch_slot_state[slot] == MLV_RAW_UINT16_PREFETCH_DECODING)
         {
             continue;
         }
@@ -1424,68 +1475,12 @@ static int mlv_raw_uint16_prefetch_find_slot_locked(mlvObject_t * video, uint64_
     return -1;
 }
 
-static void mlv_raw_uint16_prefetch_store_frame(mlvObject_t * video,
-                                                uint64_t frameIndex,
-                                                const uint16_t * frameData,
-                                                double decodeMs)
+/* A slot in `state` holds frameIndex for the current generation (DECODING = a worker's claim). */
+static int mlv_raw_uint16_prefetch_slot_holds_locked(const mlvObject_t * video, uint64_t frameIndex, uint8_t state)
 {
-    pthread_mutex_lock(&video->raw_uint16_prefetch_mutex);
-    if (!mlv_ensure_raw_uint16_prefetch_storage(video))
-    {
-        pthread_mutex_unlock(&video->raw_uint16_prefetch_mutex);
-        return;
-    }
-
-    int slot = mlv_raw_uint16_prefetch_find_slot_locked(video, frameIndex);
-    if (slot >= 0)
-    {
-        ++video->raw_uint16_prefetch_stats.duplicate_publishes;
-    }
-    for (uint32_t tries = 0; slot < 0 && tries < MLV_RAW_UINT16_PREFETCH_SLOTS; ++tries)
-    {
-        const uint32_t candidate = video->raw_uint16_prefetch_next_slot;
-        video->raw_uint16_prefetch_next_slot =
-            (video->raw_uint16_prefetch_next_slot + 1) % MLV_RAW_UINT16_PREFETCH_SLOTS;
-        if (video->raw_uint16_prefetch_slot_state[candidate] != MLV_RAW_UINT16_PREFETCH_DECODING)
-        {
-            mlv_raw_uint16_prefetch_note_reuse_locked(video, candidate);
-            slot = (int)candidate;
-        }
-    }
-    if (slot < 0)
-    {
-        pthread_mutex_unlock(&video->raw_uint16_prefetch_mutex);
-        return;
-    }
-
-    uint16_t * slotBuffer = mlv_raw_uint16_prefetch_slot_ptr(video, (uint32_t)slot);
-    if (!slotBuffer)
-    {
-        pthread_mutex_unlock(&video->raw_uint16_prefetch_mutex);
-        return;
-    }
-
-    memcpy(slotBuffer,
-           frameData,
-           (size_t)video->raw_uint16_prefetch_slot_words * sizeof(uint16_t));
-    video->raw_uint16_prefetch_slot_state[slot] = MLV_RAW_UINT16_PREFETCH_READY;
-    video->raw_uint16_prefetch_slot_frame[slot] = frameIndex;
-    video->raw_uint16_prefetch_slot_generation[slot] = video->raw_uint16_prefetch_generation;
-    video->raw_uint16_prefetch_slot_decode_ms[slot] = decodeMs;
-    video->raw_uint16_prefetch_slot_consumed[slot] = 0;
-    pthread_mutex_unlock(&video->raw_uint16_prefetch_mutex);
-}
-
-/* PLAYBACK-DECODE-RENDER-OVERLAP-1: true while the prefetch worker is decoding frameIndex for the current generation. */
-static int mlv_raw_uint16_prefetch_frame_in_flight_locked(const mlvObject_t * video, uint64_t frameIndex)
-{
-    if (!video->raw_uint16_prefetch_worker_busy || video->raw_uint16_prefetch_stop)
-    {
-        return 0;
-    }
     for (uint32_t slot = 0; slot < MLV_RAW_UINT16_PREFETCH_SLOTS; ++slot)
     {
-        if (video->raw_uint16_prefetch_slot_state[slot] == MLV_RAW_UINT16_PREFETCH_DECODING
+        if (video->raw_uint16_prefetch_slot_state[slot] == state
             && video->raw_uint16_prefetch_slot_frame[slot] == frameIndex
             && video->raw_uint16_prefetch_slot_generation[slot] == video->raw_uint16_prefetch_generation)
         {
@@ -1495,31 +1490,168 @@ static int mlv_raw_uint16_prefetch_frame_in_flight_locked(const mlvObject_t * vi
     return 0;
 }
 
-/* The upper bound on waiting for an in-flight prefetch of the same frame (one LJ92 decode is ~25-30 ms on Bachelor). */
+static int mlv_raw_uint16_fg_claimed_locked(const mlvObject_t * video, uint64_t frameIndex)
+{
+    for (uint32_t i = 0; i < MLV_RAW_UINT16_FG_CLAIMS; ++i)
+    {
+        if (video->raw_uint16_fg_claim_active[i]
+            && video->raw_uint16_fg_claim_frame[i] == frameIndex
+            && video->raw_uint16_fg_claim_generation[i] == video->raw_uint16_prefetch_generation)
+        {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* True while any decoder (worker or foreground) holds a claim on frameIndex for the current generation. */
+static int mlv_raw_uint16_prefetch_frame_in_flight_locked(const mlvObject_t * video, uint64_t frameIndex)
+{
+    if (video->raw_uint16_prefetch_stop)
+    {
+        return 0;
+    }
+    return mlv_raw_uint16_prefetch_slot_holds_locked(video, frameIndex, MLV_RAW_UINT16_PREFETCH_DECODING)
+        || mlv_raw_uint16_fg_claimed_locked(video, frameIndex);
+}
+
+/* The victim rule above; -1 when there is none. */
+static int mlv_raw_uint16_prefetch_pick_victim_locked(const mlvObject_t * video)
+{
+    for (uint32_t slot = 0; slot < MLV_RAW_UINT16_PREFETCH_SLOTS; ++slot)
+    {
+        const uint8_t state = video->raw_uint16_prefetch_slot_state[slot];
+        if (state == MLV_RAW_UINT16_PREFETCH_EMPTY || state == MLV_RAW_UINT16_PREFETCH_FAILED)
+        {
+            return (int)slot;
+        }
+    }
+    for (uint32_t slot = 0; slot < MLV_RAW_UINT16_PREFETCH_SLOTS; ++slot)
+    {
+        if (video->raw_uint16_prefetch_slot_state[slot] == MLV_RAW_UINT16_PREFETCH_READY
+            && (video->raw_uint16_prefetch_slot_generation[slot] != video->raw_uint16_prefetch_generation
+                || video->raw_uint16_prefetch_slot_frame[slot] < video->raw_uint16_prefetch_last_request_frame))
+        {
+            return (int)slot;
+        }
+    }
+    return -1;
+}
+
+/* The lowest frame of the current window that is not READY, not claimed and not a failed decode. The window is
+ * recomputed from the latest request on every claim, with the contiguous-vs-stride rule the batch loop used.
+ * Round-4 item 1: drop-frame playback advances by an alternating 1..3-frame pattern, so extrapolating the LAST
+ * delta as a fixed stride misses most next requests (measured 36-64% hit rate at x1/x2). A contiguous window
+ * contains every possible next request for small strides; the stride extrapolation stays only for genuinely
+ * large jumps (fast scrubs). */
+static int mlv_raw_uint16_prefetch_pick_target_locked(mlvObject_t * video, uint32_t lookahead, uint64_t * target)
+{
+    if (!video->raw_uint16_prefetch_request_pending || video->raw_uint16_prefetch_stop)
+    {
+        return 0;
+    }
+    const uint64_t baseFrame = video->raw_uint16_prefetch_request_frame;
+    const uint32_t requestStride = video->raw_uint16_prefetch_request_stride ? video->raw_uint16_prefetch_request_stride : 1;
+    const uint64_t frames = getMlvFrames(video);
+    for (uint32_t offset = 1; offset <= lookahead; ++offset)
+    {
+        const uint64_t targetFrame = (requestStride <= 4)
+            ? baseFrame + offset
+            : baseFrame + ((uint64_t)offset * requestStride);
+        if (targetFrame >= frames)
+        {
+            break;
+        }
+        if (targetFrame <= video->raw_uint16_prefetch_last_request_frame
+            || mlv_raw_uint16_prefetch_find_slot_locked(video, targetFrame) >= 0
+            || mlv_raw_uint16_prefetch_frame_in_flight_locked(video, targetFrame)
+            || mlv_raw_uint16_prefetch_slot_holds_locked(video, targetFrame, MLV_RAW_UINT16_PREFETCH_FAILED))
+        {
+            continue;
+        }
+        *target = targetFrame;
+        return 1;
+    }
+    return 0;
+}
+
+/* Publishes a foreground decode of (frameIndex, generation) -- frameData NULL when the decode failed -- and releases
+ * the reader's claim, in one critical section. A READY (frameIndex, generation) means the frame was decoded twice. */
+static void mlv_raw_uint16_prefetch_store_frame(mlvObject_t * video,
+                                                uint64_t frameIndex,
+                                                const uint16_t * frameData,
+                                                double decodeMs,
+                                                uint32_t generation,
+                                                int claimIndex)
+{
+    pthread_mutex_lock(&video->raw_uint16_prefetch_mutex);
+    if (claimIndex >= 0 && claimIndex < MLV_RAW_UINT16_FG_CLAIMS)
+    {
+        video->raw_uint16_fg_claim_active[claimIndex] = 0;
+    }
+    if (frameData
+        && !video->raw_uint16_prefetch_stop
+        && generation == video->raw_uint16_prefetch_generation
+        && mlv_ensure_raw_uint16_prefetch_storage(video))
+    {
+        if (mlv_raw_uint16_prefetch_find_slot_locked(video, frameIndex) >= 0)
+        {
+            ++video->raw_uint16_prefetch_stats.duplicate_publishes;
+        }
+        else
+        {
+            const int slot = mlv_raw_uint16_prefetch_pick_victim_locked(video);
+            uint16_t * slotBuffer = slot >= 0 ? mlv_raw_uint16_prefetch_slot_ptr(video, (uint32_t)slot) : NULL;
+            if (slotBuffer)
+            {
+                mlv_raw_uint16_prefetch_note_reuse_locked(video, (uint32_t)slot);
+                memcpy(slotBuffer,
+                       frameData,
+                       (size_t)video->raw_uint16_prefetch_slot_words * sizeof(uint16_t));
+                video->raw_uint16_prefetch_slot_state[slot] = MLV_RAW_UINT16_PREFETCH_READY;
+                video->raw_uint16_prefetch_slot_frame[slot] = frameIndex;
+                video->raw_uint16_prefetch_slot_generation[slot] = generation;
+                video->raw_uint16_prefetch_slot_decode_ms[slot] = decodeMs;
+                video->raw_uint16_prefetch_slot_consumed[slot] = 0;
+            }
+        }
+    }
+    /* A released claim or a new READY frame may end a reader's wait or a worker's skip. */
+    pthread_cond_broadcast(&video->raw_uint16_prefetch_cond);
+    pthread_mutex_unlock(&video->raw_uint16_prefetch_mutex);
+}
+
+/* The upper bound on waiting for an in-flight decode of the same frame (one LJ92 decode is ~25-30 ms on Bachelor). */
 #define MLV_RAW_UINT16_PREFETCH_IN_FLIGHT_WAIT_MS 250u
 
+/* A hit copies the READY frame. A miss records the reader's claim on (frameIndex, generation) in the same critical
+ * section, so no worker can claim that frame between the miss and the reader's own decode; *claimIndex is -1 when
+ * the reader decodes unclaimed. *claimGeneration is the generation the reader's decode belongs to. */
 static int mlv_raw_uint16_prefetch_try_copy(mlvObject_t * video,
                                             uint64_t frameIndex,
                                             uint16_t * unpackedFrame,
                                             double * frameLj92Ms,
-                                            double * inflightWaitMs)
+                                            double * inflightWaitMs,
+                                            int * claimIndex,
+                                            uint32_t * claimGeneration)
 {
     int hit = 0;
     *frameLj92Ms = 0.0;
     *inflightWaitMs = -1.0;   /* < 0: the reader did not wait */
+    *claimIndex = -1;
     pthread_mutex_lock(&video->raw_uint16_prefetch_mutex);
     /* PLAYBACK-DECODE-RENDER-OVERLAP-1: with two playback frames requested ahead, the render thread's decode worker
      * asked for the very frame the prefetch worker was decoding, missed (only READY slots hit) and decoded it a second
-     * time: ~27 ms of duplicate LJ92 decode a frame, competing with dual-ISO and S/H for the CPU. Wait for that slot
-     * instead. The slot discipline is unchanged (a DECODING slot is never handed out); a reset (new generation), a
-     * stop, a failed decode or the bound all fall through to the caller's own decode. */
+     * time: ~27 ms of duplicate LJ92 decode a frame, competing with dual-ISO and S/H for the CPU. Wait for that claim
+     * instead (a worker's or another reader's). A reset (new generation), a stop, a failed decode or the bound all
+     * fall through to the caller's own decode. */
+    int timedOut = 0;
     if (mlv_raw_uint16_prefetch_frame_in_flight_locked(video, frameIndex))
     {
         struct timespec deadline;
         if (clock_gettime(CLOCK_REALTIME, &deadline) == 0)
         {
             const double waitStart = mlv_stage_timing_now();
-            int timedOut = 0;
             deadline.tv_nsec += (long)MLV_RAW_UINT16_PREFETCH_IN_FLIGHT_WAIT_MS * 1000000L;
             while (deadline.tv_nsec >= 1000000000L)
             {
@@ -1543,20 +1675,37 @@ static int mlv_raw_uint16_prefetch_try_copy(mlvObject_t * video,
             if (timedOut) ++stats->fg_inflight_wait_timeouts;
         }
     }
+    *claimGeneration = video->raw_uint16_prefetch_generation;
     int slot = mlv_raw_uint16_prefetch_find_slot_locked(video, frameIndex);
-    if (slot >= 0)
+    uint16_t * slotBuffer = slot >= 0 ? mlv_raw_uint16_prefetch_slot_ptr(video, (uint32_t)slot) : NULL;
+    if (slotBuffer)
     {
-        uint16_t * slotBuffer = mlv_raw_uint16_prefetch_slot_ptr(video, (uint32_t)slot);
-        if (slotBuffer)
+        memcpy(unpackedFrame,
+               slotBuffer,
+               (size_t)video->raw_uint16_prefetch_slot_words * sizeof(uint16_t));
+        hit = 1;
+        ++video->raw_uint16_prefetch_stats.fg_hits;
+        video->raw_uint16_prefetch_slot_consumed[slot] = 1;
+        *frameLj92Ms = video->raw_uint16_prefetch_slot_decode_ms[slot];
+    }
+    else if (!video->raw_uint16_prefetch_stop && !mlv_raw_uint16_prefetch_frame_in_flight_locked(video, frameIndex))
+    {
+        for (uint32_t i = 0; i < MLV_RAW_UINT16_FG_CLAIMS; ++i)
         {
-            memcpy(unpackedFrame,
-                   slotBuffer,
-                   (size_t)video->raw_uint16_prefetch_slot_words * sizeof(uint16_t));
-            hit = 1;
-            ++video->raw_uint16_prefetch_stats.fg_hits;
-            video->raw_uint16_prefetch_slot_consumed[slot] = 1;
-            *frameLj92Ms = video->raw_uint16_prefetch_slot_decode_ms[slot];
+            if (!video->raw_uint16_fg_claim_active[i])
+            {
+                video->raw_uint16_fg_claim_active[i] = 1;
+                video->raw_uint16_fg_claim_frame[i] = frameIndex;
+                video->raw_uint16_fg_claim_generation[i] = *claimGeneration;
+                *claimIndex = (int)i;
+                break;
+            }
         }
+        if (*claimIndex < 0) ++video->raw_uint16_prefetch_stats.fg_unclaimed_decodes;
+    }
+    else
+    {
+        ++video->raw_uint16_prefetch_stats.fg_unclaimed_decodes;   /* the bound expired on a live claim */
     }
     pthread_mutex_unlock(&video->raw_uint16_prefetch_mutex);
     return hit;
@@ -1568,7 +1717,7 @@ static void mlv_raw_uint16_prefetch_note_request(mlvObject_t * video, uint64_t f
 {
     pthread_mutex_lock(&video->raw_uint16_prefetch_mutex);
 
-    if (!video->raw_uint16_prefetch_thread_started)
+    if (!video->raw_uint16_prefetch_threads_started)
     {
         pthread_mutex_unlock(&video->raw_uint16_prefetch_mutex);
         if (!mlv_start_raw_uint16_prefetch_thread(video))
@@ -1601,15 +1750,15 @@ static void mlv_raw_uint16_prefetch_note_request(mlvObject_t * video, uint64_t f
     video->raw_uint16_prefetch_last_request_frame = frameIndex;
     video->raw_uint16_prefetch_request_frame = frameIndex;
     video->raw_uint16_prefetch_request_stride = requestStride;
-    video->raw_uint16_prefetch_request_pending = 1;
-    /* Broadcast: a foreground reader may also wait on this condition (mlv_raw_uint16_prefetch_try_copy). */
+    video->raw_uint16_prefetch_request_pending = 1;   /* the window is live until the next reset */
+    /* Broadcast: every idle worker re-reads the window, and a foreground reader may wait on this condition too. */
     pthread_cond_broadcast(&video->raw_uint16_prefetch_cond);
     pthread_mutex_unlock(&video->raw_uint16_prefetch_mutex);
 }
 
 /* Test hooks: a worker parks at mlv_raw_uint16_prefetch_test_hold_point holding a claimed (DECODING) slot, and a
- * foreground reader parks at mlv_raw_uint16_fg_test_hold_point right before its own decode, until released. The
- * held values are counts (several decoders can park at once). */
+ * foreground reader parks at mlv_raw_uint16_fg_test_hold_point right before its own decode (after its claim), until
+ * released. The held values are counts (several decoders can park at once). */
 static pthread_mutex_t g_mlv_raw_uint16_prefetch_test_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_mlv_raw_uint16_prefetch_test_cond = PTHREAD_COND_INITIALIZER;
 static int g_mlv_raw_uint16_prefetch_test_hold = 0;
@@ -1645,170 +1794,132 @@ static void mlv_raw_uint16_fg_test_hold_point(void)
     pthread_mutex_unlock(&g_mlv_raw_uint16_prefetch_test_mutex);
 }
 
+/* One of K prefetch decoders. A free worker claims the lowest unclaimed, not-READY frame of the current window,
+ * decodes it into its claimed slot outside the mutex, publishes it and loops; with nothing to claim (or no victim
+ * slot) it sleeps until a request, a publish, a released claim, a reset or stop. */
 static void * mlv_raw_uint16_prefetch_thread_main(void * opaque)
 {
     mlvObject_t * video = (mlvObject_t *)opaque;
 
-    while (1)
+    pthread_mutex_lock(&video->raw_uint16_prefetch_mutex);
+    while (!video->raw_uint16_prefetch_stop)
     {
-        pthread_mutex_lock(&video->raw_uint16_prefetch_mutex);
-        while (!video->raw_uint16_prefetch_stop
-               && !video->raw_uint16_prefetch_request_pending)
-        {
-            pthread_cond_wait(&video->raw_uint16_prefetch_cond, &video->raw_uint16_prefetch_mutex);
-        }
-
-        if (video->raw_uint16_prefetch_stop)
-        {
-            pthread_mutex_unlock(&video->raw_uint16_prefetch_mutex);
-            break;
-        }
-
-        if (!mlv_ensure_raw_uint16_prefetch_storage(video))
+        /* The lookahead reads the preview-mode flag on THIS thread (see lookahead_max); unchanged from one worker. */
+        const uint32_t lookahead = mlv_raw_uint16_prefetch_lookahead_for_request(video);
+        video->raw_uint16_prefetch_window_lookahead = lookahead;
+        uint64_t targetFrame = 0;
+        int slot = -1;
+        uint16_t * slotBuffer = NULL;
+        if (video->raw_uint16_prefetch_request_pending && !mlv_ensure_raw_uint16_prefetch_storage(video))
         {
             video->raw_uint16_prefetch_request_pending = 0;
-            pthread_mutex_unlock(&video->raw_uint16_prefetch_mutex);
+        }
+        if (mlv_raw_uint16_prefetch_pick_target_locked(video, lookahead, &targetFrame))
+        {
+            slot = mlv_raw_uint16_prefetch_pick_victim_locked(video);
+            slotBuffer = slot >= 0 ? mlv_raw_uint16_prefetch_slot_ptr(video, (uint32_t)slot) : NULL;
+        }
+        if (!slotBuffer)
+        {
+            pthread_cond_wait(&video->raw_uint16_prefetch_cond, &video->raw_uint16_prefetch_mutex);
             continue;
         }
 
-        uint64_t baseFrame = video->raw_uint16_prefetch_request_frame;
-        uint32_t requestStride = video->raw_uint16_prefetch_request_stride;
-        uint32_t generation = video->raw_uint16_prefetch_generation;
-        video->raw_uint16_prefetch_request_pending = 0;
-        video->raw_uint16_prefetch_worker_busy = 1;
-        pthread_mutex_unlock(&video->raw_uint16_prefetch_mutex);
-
-        if (requestStride == 0)
-        {
-            requestStride = 1;
-        }
-
-        const uint32_t lookahead =
-            mlv_raw_uint16_prefetch_lookahead_for_request(video);
-        pthread_mutex_lock(&video->raw_uint16_prefetch_mutex);
         if (lookahead > video->raw_uint16_prefetch_stats.lookahead_max)
         {
             video->raw_uint16_prefetch_stats.lookahead_max = lookahead;
         }
+        const uint32_t generation = video->raw_uint16_prefetch_generation;
+        mlv_raw_uint16_prefetch_note_reuse_locked(video, (uint32_t)slot);
+        video->raw_uint16_prefetch_slot_state[slot] = MLV_RAW_UINT16_PREFETCH_DECODING;
+        video->raw_uint16_prefetch_slot_frame[slot] = targetFrame;
+        video->raw_uint16_prefetch_slot_generation[slot] = generation;
+        video->raw_uint16_prefetch_slot_decode_ms[slot] = 0.0;
+        video->raw_uint16_prefetch_slot_consumed[slot] = 0;
+        ++video->raw_uint16_prefetch_worker_busy;
         pthread_mutex_unlock(&video->raw_uint16_prefetch_mutex);
 
-        for (uint32_t offset = 1; offset <= lookahead; ++offset)
-        {
-            /* Round-4 item 1: drop-frame playback advances by an alternating
-             * 1..3-frame pattern, so extrapolating the LAST delta as a fixed
-             * stride misses most next requests (measured 36-64% hit rate at
-             * x1/x2). A contiguous window contains every possible next
-             * request for small strides; keep the stride extrapolation only
-             * for genuinely large jumps (fast scrubs). */
-            uint64_t targetFrame =
-                (requestStride <= 4)
-                ? baseFrame + offset
-                : baseFrame + ((uint64_t)offset * requestStride);
-            if (targetFrame >= getMlvFrames(video))
-            {
-                break;
-            }
-
-            pthread_mutex_lock(&video->raw_uint16_prefetch_mutex);
-            if (video->raw_uint16_prefetch_stop
-                || generation != video->raw_uint16_prefetch_generation)
-            {
-                pthread_mutex_unlock(&video->raw_uint16_prefetch_mutex);
-                break;
-            }
-
-            if (mlv_raw_uint16_prefetch_find_slot_locked(video, targetFrame) >= 0)
-            {
-                pthread_mutex_unlock(&video->raw_uint16_prefetch_mutex);
-                continue;
-            }
-
-            uint32_t slot = video->raw_uint16_prefetch_next_slot;
-            video->raw_uint16_prefetch_next_slot =
-                (video->raw_uint16_prefetch_next_slot + 1) % MLV_RAW_UINT16_PREFETCH_SLOTS;
-            uint16_t * slotBuffer = mlv_raw_uint16_prefetch_slot_ptr(video, slot);
-            if (!slotBuffer)
-            {
-                pthread_mutex_unlock(&video->raw_uint16_prefetch_mutex);
-                continue;
-            }
-
-            mlv_raw_uint16_prefetch_note_reuse_locked(video, slot);
-            video->raw_uint16_prefetch_slot_state[slot] = MLV_RAW_UINT16_PREFETCH_DECODING;
-            video->raw_uint16_prefetch_slot_frame[slot] = targetFrame;
-            video->raw_uint16_prefetch_slot_generation[slot] = generation;
-            pthread_mutex_unlock(&video->raw_uint16_prefetch_mutex);
-
-            mlv_raw_uint16_prefetch_test_hold_point();
-            int decodeOk = (getMlvRawFrameUint16Direct(video, targetFrame, slotBuffer) == 0);
-            const double workerLj92Ms = g_mlv_last_raw_uint16_decompress_ms;   /* this worker's own thread-local */
-
-            pthread_mutex_lock(&video->raw_uint16_prefetch_mutex);
-            if (!decodeOk)
-            {
-                ++video->raw_uint16_prefetch_decode_failures;
-            }
-            else
-            {
-                mlvRawUint16PrefetchStats_t * stats = &video->raw_uint16_prefetch_stats;
-                ++stats->worker_decodes;
-                stats->worker_lj92_ms_sum += workerLj92Ms;
-                if (workerLj92Ms > stats->worker_lj92_ms_max) stats->worker_lj92_ms_max = workerLj92Ms;
-                if (workerLj92Ms > 41.7) ++stats->worker_lj92_over_41_7;
-                const int readySlot = mlv_raw_uint16_prefetch_find_slot_locked(video, targetFrame);
-                if (generation == video->raw_uint16_prefetch_generation && readySlot >= 0 && readySlot != (int)slot)
-                {
-                    ++stats->duplicate_publishes;
-                }
-            }
-            if (slot < MLV_RAW_UINT16_PREFETCH_SLOTS
-                && video->raw_uint16_prefetch_slot_frame[slot] == targetFrame
-                && video->raw_uint16_prefetch_slot_generation[slot] == generation)
-            {
-                video->raw_uint16_prefetch_slot_state[slot] =
-                    (decodeOk && !video->raw_uint16_prefetch_stop
-                     && generation == video->raw_uint16_prefetch_generation)
-                    ? MLV_RAW_UINT16_PREFETCH_READY
-                    : MLV_RAW_UINT16_PREFETCH_EMPTY;
-                video->raw_uint16_prefetch_slot_decode_ms[slot] = workerLj92Ms;
-                video->raw_uint16_prefetch_slot_consumed[slot] = 0;
-            }
-            /* Wake a foreground reader waiting for this frame (mlv_raw_uint16_prefetch_try_copy). */
-            pthread_cond_broadcast(&video->raw_uint16_prefetch_cond);
-            pthread_mutex_unlock(&video->raw_uint16_prefetch_mutex);
-        }
+        mlv_raw_uint16_prefetch_test_hold_point();
+        const int decodeOk = (getMlvRawFrameUint16Direct(video, targetFrame, slotBuffer) == 0);
+        const double workerLj92Ms = g_mlv_last_raw_uint16_decompress_ms;   /* this worker's own thread-local */
 
         pthread_mutex_lock(&video->raw_uint16_prefetch_mutex);
-        video->raw_uint16_prefetch_worker_busy = 0;
+        --video->raw_uint16_prefetch_worker_busy;
+        if (!decodeOk)
+        {
+            ++video->raw_uint16_prefetch_decode_failures;
+        }
+        else
+        {
+            mlvRawUint16PrefetchStats_t * stats = &video->raw_uint16_prefetch_stats;
+            ++stats->worker_decodes;
+            stats->worker_lj92_ms_sum += workerLj92Ms;
+            if (workerLj92Ms > stats->worker_lj92_ms_max) stats->worker_lj92_ms_max = workerLj92Ms;
+            if (workerLj92Ms > 41.7) ++stats->worker_lj92_over_41_7;
+        }
+        /* The slot is still this worker's: no reset clears a DECODING slot and no store reuses one. */
+        if (video->raw_uint16_prefetch_slot_frame[slot] == targetFrame
+            && video->raw_uint16_prefetch_slot_generation[slot] == generation)
+        {
+            const int current = !video->raw_uint16_prefetch_stop
+                && generation == video->raw_uint16_prefetch_generation;
+            uint8_t state = MLV_RAW_UINT16_PREFETCH_EMPTY;
+            if (decodeOk && current)
+            {
+                if (mlv_raw_uint16_prefetch_find_slot_locked(video, targetFrame) >= 0)
+                {
+                    ++video->raw_uint16_prefetch_stats.duplicate_publishes;
+                }
+                else
+                {
+                    state = MLV_RAW_UINT16_PREFETCH_READY;
+                }
+            }
+            else if (!decodeOk && current)
+            {
+                state = MLV_RAW_UINT16_PREFETCH_FAILED;   /* not retried in this generation; a free victim */
+            }
+            video->raw_uint16_prefetch_slot_state[slot] = state;
+            video->raw_uint16_prefetch_slot_decode_ms[slot] = workerLj92Ms;
+            video->raw_uint16_prefetch_slot_consumed[slot] = 0;
+        }
+        /* Wake a foreground reader waiting for this frame (mlv_raw_uint16_prefetch_try_copy) and idle workers. */
         pthread_cond_broadcast(&video->raw_uint16_prefetch_cond);
-        pthread_mutex_unlock(&video->raw_uint16_prefetch_mutex);
     }
+    pthread_mutex_unlock(&video->raw_uint16_prefetch_mutex);
 
     return NULL;
 }
 
+/* Starts the object's K decoders (K from mlv_raw_uint16_prefetch_decoders_locked); 0 when none could start. */
 static int mlv_start_raw_uint16_prefetch_thread(mlvObject_t * video)
 {
     pthread_mutex_lock(&video->raw_uint16_prefetch_mutex);
-    if (video->raw_uint16_prefetch_thread_started)
+    if (video->raw_uint16_prefetch_threads_started)
     {
         pthread_mutex_unlock(&video->raw_uint16_prefetch_mutex);
         return 1;
     }
 
-    /* Hold the mutex across pthread_create so the started flag only publishes
-     * after the thread actually exists; otherwise a concurrent note_request
+    /* Hold the mutex across pthread_create so the started count only publishes
+     * after the threads actually exist; otherwise a concurrent note_request
      * could signal a cond for a thread that failed to spawn. */
-    int create_rc = pthread_create(&video->raw_uint16_prefetch_thread,
-                                   NULL,
-                                   mlv_raw_uint16_prefetch_thread_main,
-                                   video);
-    if (create_rc == 0)
+    const int decoders = mlv_raw_uint16_prefetch_decoders_locked(video);
+    int started = 0;
+    for (int i = 0; i < decoders && i < MLV_RAW_UINT16_PREFETCH_MAX_DECODERS; ++i)
     {
-        video->raw_uint16_prefetch_thread_started = 1;
+        if (pthread_create(&video->raw_uint16_prefetch_threads[started],
+                           NULL,
+                           mlv_raw_uint16_prefetch_thread_main,
+                           video) == 0)
+        {
+            ++started;
+        }
     }
+    video->raw_uint16_prefetch_threads_started = started;
+    video->raw_uint16_prefetch_decoders = started;
     pthread_mutex_unlock(&video->raw_uint16_prefetch_mutex);
-    return create_rc == 0 ? 1 : 0;
+    return started > 0 ? 1 : 0;
 }
 
 static void mlv_reset_processed_frame_16bit_cache(mlvObject_t * video)
@@ -3012,7 +3123,8 @@ void mlvCancelPreviewPrefetch(mlvObject_t * video)
     pthread_mutex_lock(&video->raw_uint16_prefetch_mutex);
     ++video->raw_uint16_prefetch_generation;
     mlv_reset_raw_uint16_prefetch_locked(video);
-    int raw_busy = video->raw_uint16_prefetch_worker_busy;
+    pthread_cond_broadcast(&video->raw_uint16_prefetch_cond);
+    int raw_busy = video->raw_uint16_prefetch_worker_busy;   /* every worker still decoding a claimed slot */
     pthread_mutex_unlock(&video->raw_uint16_prefetch_mutex);
 
     while (raw_busy)
@@ -3986,15 +4098,15 @@ int getMlvRawFrameUint16(mlvObject_t * video, uint64_t frameIndex, uint16_t * un
 {
     const int compressedRaw = isMcrawLoaded(video)
         || (video->MLVI.videoClass & MLV_VIDEO_CLASS_FLAG_LJ92);
-    const int prefetchEnabled = compressedRaw && mlv_raw_uint16_prefetch_allowed_for_request(video)
-        && mlv_raw_uint16_prefetch_test_override() != 0;
+    int prefetchEnabled = compressedRaw && mlv_raw_uint16_prefetch_allowed_for_request(video);
 
     g_mlv_last_raw_uint16_prefetch_hit = 0;
 
     if (prefetchEnabled)
     {
         pthread_mutex_lock(&video->raw_uint16_prefetch_mutex);
-        ++video->raw_uint16_prefetch_stats.admitted_requests;
+        prefetchEnabled = mlv_raw_uint16_prefetch_decoders_locked(video) > 0;   /* K = 0: every decode on the caller */
+        if (prefetchEnabled) ++video->raw_uint16_prefetch_stats.admitted_requests;
         pthread_mutex_unlock(&video->raw_uint16_prefetch_mutex);
     }
 
@@ -4003,8 +4115,11 @@ int getMlvRawFrameUint16(mlvObject_t * video, uint64_t frameIndex, uint16_t * un
     g_mlv_last_raw_uint16_inflight_wait_ms = 0.0;
     double hitLj92Ms = 0.0;
     double inflightWaitMs = -1.0;
+    int claimIndex = -1;
+    uint32_t claimGeneration = 0;
     if (prefetchEnabled && mlv_raw_uint16_prefetch_try_copy(video, frameIndex, unpackedFrame,
-                                                            &hitLj92Ms, &inflightWaitMs))
+                                                            &hitLj92Ms, &inflightWaitMs,
+                                                            &claimIndex, &claimGeneration))
     {
         g_mlv_last_raw_uint16_source = inflightWaitMs >= 0.0
             ? MLV_RAW_UINT16_SOURCE_INFLIGHT_WAIT_HIT : MLV_RAW_UINT16_SOURCE_HIT;
@@ -4045,6 +4160,7 @@ int getMlvRawFrameUint16(mlvObject_t * video, uint64_t frameIndex, uint16_t * un
         return 0;
     }
 
+    /* A miss: this reader holds the claim on (frameIndex, claimGeneration) unless claimIndex < 0. */
     mlv_raw_uint16_fg_test_hold_point();
     int result = getMlvRawFrameUint16Direct(video, frameIndex, unpackedFrame);
     const double directLj92Ms = g_mlv_last_raw_uint16_decompress_ms;
@@ -4058,10 +4174,12 @@ int getMlvRawFrameUint16(mlvObject_t * video, uint64_t frameIndex, uint16_t * un
         video->raw_uint16_prefetch_stats.fg_direct_lj92_ms_sum += directLj92Ms;
         pthread_mutex_unlock(&video->raw_uint16_prefetch_mutex);
     }
-    if (result == 0 && prefetchEnabled)
+    if (prefetchEnabled)
     {
-        mlv_raw_uint16_prefetch_store_frame(video, frameIndex, unpackedFrame, directLj92Ms);
-        mlv_raw_uint16_prefetch_note_request(video, frameIndex);
+        /* Publish (only while claimGeneration is current) and release the claim, even after a failed decode. */
+        mlv_raw_uint16_prefetch_store_frame(video, frameIndex, result == 0 ? unpackedFrame : NULL,
+                                            directLj92Ms, claimGeneration, claimIndex);
+        if (result == 0) mlv_raw_uint16_prefetch_note_request(video, frameIndex);
     }
 
     return result;
@@ -9015,7 +9133,17 @@ int mlvWaitForRawUint16PrefetchIdleForTesting(mlvObject_t * video, uint32_t time
     for (uint32_t waited = 0; ; waited += 1)
     {
         pthread_mutex_lock(&video->raw_uint16_prefetch_mutex);
-        const int busy = video->raw_uint16_prefetch_worker_busy || video->raw_uint16_prefetch_request_pending;
+        /* Busy while a worker decodes, or while a started worker would still claim a frame of the live window. */
+        int busy = video->raw_uint16_prefetch_worker_busy > 0;
+        if (!busy && video->raw_uint16_prefetch_threads_started > 0)
+        {
+            const uint32_t lookahead = video->raw_uint16_prefetch_window_lookahead
+                ? video->raw_uint16_prefetch_window_lookahead
+                : mlv_raw_uint16_prefetch_lookahead_for_request(video);
+            uint64_t target = 0;
+            busy = mlv_raw_uint16_prefetch_pick_target_locked(video, lookahead, &target)
+                && mlv_raw_uint16_prefetch_pick_victim_locked(video) >= 0;
+        }
         pthread_mutex_unlock(&video->raw_uint16_prefetch_mutex);
         if (!busy) return 1;
         if (waited >= timeout_ms) return 0;
@@ -9039,7 +9167,8 @@ void getMlvRawUint16PrefetchStats(mlvObject_t * video, mlvRawUint16PrefetchStats
     if (!video) return;
     pthread_mutex_lock(&video->raw_uint16_prefetch_mutex);
     *stats = video->raw_uint16_prefetch_stats;
-    stats->decoders = (mlv_raw_uint16_prefetch_enabled() && mlv_raw_uint16_prefetch_test_override() != 0) ? 1u : 0u;
+    stats->decoders = mlv_raw_uint16_prefetch_enabled()
+        ? (uint32_t)mlv_raw_uint16_prefetch_decoders_locked(video) : 0u;
     pthread_mutex_unlock(&video->raw_uint16_prefetch_mutex);
 }
 
@@ -9053,17 +9182,17 @@ void mlvResetRawUint16PrefetchStats(mlvObject_t * video)
 
 void mlvSetRawUint16PrefetchDecodersForTesting(int k)
 {
+    const int value = k < 0 ? -1 : (k > MLV_RAW_UINT16_PREFETCH_MAX_DECODERS ? MLV_RAW_UINT16_PREFETCH_MAX_DECODERS : k);
 #if defined(__GNUC__)
-    __atomic_store_n(&g_mlv_raw_uint16_prefetch_test_decoders, k < 0 ? -1 : k, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_mlv_raw_uint16_prefetch_test_decoders, value, __ATOMIC_RELEASE);
 #else
-    g_mlv_raw_uint16_prefetch_test_decoders = k < 0 ? -1 : k;
+    g_mlv_raw_uint16_prefetch_test_decoders = value;
 #endif
 }
 
 int mlvRawUint16PrefetchDecodersFromEnvValueForTesting(const char * value)
 {
-    (void)value;
-    return 1;   /* one prefetch thread; there is no decoder-count knob */
+    return mlv_raw_uint16_prefetch_decoders_from_env_value(value);
 }
 
 int mlvRawUint16PrefetchClaimsForTesting(mlvObject_t * video, int foreground, uint64_t * frames, int capacity)
@@ -9077,6 +9206,15 @@ int mlvRawUint16PrefetchClaimsForTesting(mlvObject_t * video, int foreground, ui
         {
             if (video->raw_uint16_prefetch_slot_state[slot] != MLV_RAW_UINT16_PREFETCH_DECODING) continue;
             if (frames && count < capacity) frames[count] = video->raw_uint16_prefetch_slot_frame[slot];
+            ++count;
+        }
+    }
+    else
+    {
+        for (uint32_t i = 0; i < MLV_RAW_UINT16_FG_CLAIMS; ++i)
+        {
+            if (!video->raw_uint16_fg_claim_active[i]) continue;
+            if (frames && count < capacity) frames[count] = video->raw_uint16_fg_claim_frame[i];
             ++count;
         }
     }
@@ -9402,10 +9540,13 @@ mlvObject_t * initMlvObject()
     video->processed8_prefetch_test_pause_before_store = 0;
     video->processed8_prefetch_test_paused_before_store = 0;
     video->processed8_prefetch_test_idle_waiters = 0;
-    video->raw_uint16_prefetch_thread_started = 0;
+    video->raw_uint16_prefetch_threads_started = 0;
+    video->raw_uint16_prefetch_decoders = 0;
     video->raw_uint16_prefetch_stop = 0;
     video->raw_uint16_prefetch_request_pending = 0;
     video->raw_uint16_prefetch_worker_busy = 0;
+    video->raw_uint16_prefetch_window_lookahead = 0;
+    memset(video->raw_uint16_fg_claim_active, 0, sizeof(video->raw_uint16_fg_claim_active));
     video->raw_uint16_prefetch_request_frame = 0;
     video->raw_uint16_prefetch_last_request_frame = 0;
     video->raw_uint16_prefetch_request_stride = 1;
@@ -9482,9 +9623,9 @@ void freeMlvObject(mlvObject_t * video)
     video->raw_uint16_prefetch_stop = 1;
     pthread_cond_broadcast(&video->raw_uint16_prefetch_cond);
     pthread_mutex_unlock(&video->raw_uint16_prefetch_mutex);
-    if (video->raw_uint16_prefetch_thread_started)
+    for (int i = 0; i < video->raw_uint16_prefetch_threads_started; ++i)
     {
-        pthread_join(video->raw_uint16_prefetch_thread, NULL);
+        pthread_join(video->raw_uint16_prefetch_threads[i], NULL);
     }
 
     /* Close all MLV file chunks */
