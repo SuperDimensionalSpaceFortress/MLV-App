@@ -26728,7 +26728,13 @@ void MainWindow::notePlaybackSmokePresentedFrame(
                     .arg( bool01( skippedScaledFocusPixels ) )
                     .arg( bool01( skippedScaledBadPixels ) )
                     .arg( bool01( skippedScaledVerticalStripes ) )
-                    .arg( bool01( skippedScaledPatternNoise ) );
+                    .arg( bool01( skippedScaledPatternNoise ) )
+            // PLAYBACK-LJ92-DECODE-THROUGHPUT-1: how this frame's raw-uint16 arrived and the LJ92 ms that produced it on
+            // whichever thread decoded it (a hit's raw_decompress_ms is 0). Appended, not positional: the line is at 38 args.
+            + QStringLiteral( " raw_uint16_source=%1 raw_uint16_frame_lj92_ms=%2 raw_uint16_inflight_wait_ms=%3" )
+                  .arg( timing.value( QStringLiteral("raw_uint16_source") ).toString( QStringLiteral("none") ) )
+                  .arg( telemetryDoubleValue( timing, "raw_uint16_frame_lj92_ms" ), 0, 'f', 3 )
+                  .arg( telemetryDoubleValue( timing, "raw_uint16_inflight_wait_ms" ), 0, 'f', 3 );
         /* Phase A3 (image-pipeline-hardening): ONE canonical, machine-parsable
          * render manifest per presented frame. key=value (QStringList join), NOT
          * positional %N -- the cpu_frame line above is already at 38 args and the
