@@ -30,6 +30,9 @@ NON-PROMISES:
   reason; git_paths() in tools/coordination/doctrine_outbox.py adds -z itself. Every ls-tree
   form (long form `ls-tree -r` included; only --object-only is exempt) and `status --short|-s|-sb`
   count, as well as --name-only, --name-status and --porcelain.
+  Under tools/repo_hygiene/ the same guard also flags a Python subprocess call that lists git paths with
+  text=True (or universal_newlines=True) and no encoding=, even with -z: the locale codec mangles a
+  UTF-8 path (DURATION-SCAN-UTF8-PATHS-1). Calls that build the argument list elsewhere are not seen.
 - DG-PS-NULL-COMPARE flags only a literal ``$null`` on the RIGHT of
   -eq/-ne/-ceq/-cne/-ieq/-ine, seen through parentheses and a one-statement ``$( )``
   (``$x -eq $(${null})``); a null reached through a variable, a call or a longer ``$( )`` is not seen.
@@ -405,9 +408,46 @@ def scan_git_pathlist(root: Path, rel_paths: list[str]) -> list[tuple[Violation,
     return found
 
 
+# DURATION-SCAN-UTF8-PATHS-1 (bus TRAPS.md "A locale decode turned a non-ASCII worktree path into a
+# path that named nothing"): git prints UTF-8, and text=True with no encoding decodes with the locale
+# codec (cp1252 on Windows outside UTF-8 mode), so even a `-z` path list arrives as mojibake.
+GIT_TEXT_DECODE_SCOPE = "tools/repo_hygiene/"
+_SUBPROCESS_READERS = frozenset(("run", "check_output", "Popen"))
+
+
+def scan_git_text_decode(root: Path, rel_paths: list[str]) -> list[Violation]:
+    """A subprocess call under tools/repo_hygiene/ that lists git paths with text=True (or
+    universal_newlines=True) and no `encoding=`. Calls whose argument list is built elsewhere are not seen."""
+    found: list[Violation] = []
+    for rel in rel_paths:
+        if not rel.startswith(GIT_TEXT_DECODE_SCOPE) or not rel.lower().endswith(".py"):
+            continue
+        try:
+            text = (root / rel).read_text(encoding="utf-8")
+            tree = ast.parse(text)
+        except (OSError, ValueError, SyntaxError) as exc:
+            raise CouldNotCheck(f"{rel} is not readable Python: {exc}") from exc
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call) and node.args and isinstance(node.args[0], (ast.List, ast.Tuple))):
+                continue
+            name = node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
+            if name not in _SUBPROCESS_READERS:
+                continue
+            tokens = {p.value for p in node.args[0].elts if isinstance(p, ast.Constant) and isinstance(p.value, str)}
+            kind = _git_pathlist_kind(tokens)
+            kwargs = {k.arg: k.value for k in node.keywords if k.arg}
+            text_mode = any(isinstance(kwargs.get(k), ast.Constant) and kwargs[k].value is True
+                            for k in ("text", "universal_newlines"))
+            if "git" in tokens and kind and text_mode and "encoding" not in kwargs:
+                found.append(Violation("DG-GIT-PATHLIST", rel, node.lineno,
+                                       f"{kind} read with text=True and no encoding= (locale codec mangles non-ASCII paths)"))
+    return found
+
+
 def check_git_pathlist(root: Path, rel_paths: list[str]) -> list[Violation]:
-    return [v for v, source in scan_git_pathlist(root, rel_paths)
-            if not any(v.path == path and needle in source for path, needle, _why in GIT_PATHLIST_ALLOW)]
+    quoted = [v for v, source in scan_git_pathlist(root, rel_paths)
+              if not any(v.path == path and needle in source for path, needle, _why in GIT_PATHLIST_ALLOW)]
+    return quoted + scan_git_text_decode(root, rel_paths)
 
 
 @dataclass(frozen=True)
@@ -493,6 +533,12 @@ FIXTURES: dict[str, dict[str, dict[str, str]]] = {
                            "$d = @(Run-Git $wd @('status', '--porcelain', '-uall'))\n"
                            "$t = Invoke-Git -GitArgs @('ls-tree', '-r', $commit, '--', $dir)\n"
                            "$s = @(& git -C $root status --short --branch 2>$null)\n",
+            # DURATION-SCAN-UTF8-PATHS-1: -z is present, but text=True decodes the UTF-8 paths with the locale codec.
+            "tools/repo_hygiene/c.py": "import subprocess\n"
+                                       "def f(repo):\n"
+                                       "    subprocess.run(['git', '-C', repo, 'ls-files', '-z'], capture_output=True, text=True)\n"
+                                       "    subprocess.check_output(['git', '-C', repo, 'diff', '--name-only', '-z'], universal_newlines=True)\n"
+                                       "    subprocess.run(['git', '-C', repo, 'ls-files', '-z'], capture_output=True, text=True, errors='replace')\n",
         },
         "green": {
             "tools/a.py": "import subprocess\n"
@@ -516,6 +562,14 @@ FIXTURES: dict[str, dict[str, dict[str, str]]] = {
                            "& git -C $root worktree list --porcelain\n"
                            "$t = Invoke-Git -GitArgs @('ls-tree', '-r', '-z', $commit, '--', $dir)\n"
                            "$s = @(& git -C $root -c core.quotepath=false status --short --branch 2>$null)\n",
+            "tools/repo_hygiene/c.py": "import subprocess\n"
+                                       "def f(repo):\n"
+                                       "    subprocess.run(['git', '-C', repo, 'ls-files', '-z'], capture_output=True, text=True, encoding='utf-8', errors='surrogateescape')\n"
+                                       "    subprocess.run(['git', '-C', repo, 'ls-files', '-z'], capture_output=True)\n"
+                                       "    subprocess.run(['git', '-C', repo, 'rev-parse', 'HEAD'], capture_output=True, text=True)\n",
+            # Out of scope: only tools/repo_hygiene/** is held to the explicit-encoding rule.
+            "tools/other.py": "import subprocess\n"
+                              "subprocess.run(['git', 'ls-files', '-z'], capture_output=True, text=True)\n",
         },
     },
     "PS-ONE-TRAP": {
@@ -644,7 +698,9 @@ class GuardFixtureTests(_PwshMixin, unittest.TestCase):
                                              ("tools/a.py", 6), ("tools/a.py", 7), ("tools/a.py", 8),
                                              ("tools/a.py", 9), ("tools/a.py", 10), ("tools/a.py", 11),
                                              ("tools/b.ps1", 1), ("tools/b.ps1", 2),
-                                             ("tools/b.ps1", 3), ("tools/b.ps1", 4)})
+                                             ("tools/b.ps1", 3), ("tools/b.ps1", 4),
+                                             ("tools/repo_hygiene/c.py", 3), ("tools/repo_hygiene/c.py", 4),
+                                             ("tools/repo_hygiene/c.py", 5)})
 
     def test_git_pathlist_green_passes(self) -> None:
         self._assert_green("DG-GIT-PATHLIST")
