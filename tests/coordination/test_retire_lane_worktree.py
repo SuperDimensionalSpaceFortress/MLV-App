@@ -1028,3 +1028,172 @@ def test_real_service_owner_map_holds_only_well_known_service_sids():
     out = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", script],
                          check=True, capture_output=True, text=True).stdout.strip()
     assert out and set(out.split(",")) <= {"S-1-5-18", "S-1-5-19", "S-1-5-20"}, out
+
+
+# --- r5 (RETIRE-CWD-UNKNOWN-STARVES-SWEEP-1 r2, sol blocker 1 on PR #353): the SCM StartName is the CONFIGURED account; it
+# exempts a pid only when every service key at that pid was last written strictly before the process started.
+
+def _key_written(wt, minutes, **by_name):
+    """Prelude: Get-ServiceKeyLastWriteUtc returns the worktree's CreationTimeUtc shifted by `minutes` (None -> $null, an
+    unreadable key) for every service, or by by_name[<service>] for the named ones."""
+    def expr(m):
+        return "$null" if m is None else _wt_created(wt, m)
+    arms = "".join(f"if ($Name -eq '{n}') {{ return {expr(m)} }}; " for n, m in by_name.items())
+    return "function Get-ServiceKeyLastWriteUtc { param([string]$Name) " + arms + "return " + expr(minutes) + " };"
+
+
+NSSM = "C:\\tools\\nssm\\nssm.exe"
+
+
+@pytest.mark.parametrize("key_minutes", [10, 5], ids=["key-written-after-start", "key-written-at-start"])
+def test_service_reconfigured_to_localsystem_after_the_process_started_is_still_cwd_unknown(repo, key_minutes):
+    """sol r1 blocker 1: a user-owned nssm.exe service reconfigured to LocalSystem and not yet restarted. The process was
+    created at worktree+5 min; its service key was written at/after that, so the configured account is not the live one."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-svc-reconf")
+    row = _fake_row("$PID", cmd=None, session=0, name="nssm.exe", created=_wt_created(wt, 5))
+    prelude = CWD_UNREADABLE_FOR_EVERY_PID + _svc_rows(("$PID", "LaneSvc", "LocalSystem", "Own Process", NSSM)) + _key_written(wt, key_minutes)
+    d = _gate_with_snapshot(wt, row, prelude=prelude)
+    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown"), d
+    assert d["cwdExemptOwner"] == [] and any("scm-config-newer-than-process:LaneSvc" in u for u in d["cwdUnknown"]), d
+
+
+def test_service_key_time_unreadable_is_still_cwd_unknown(repo):
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-svc-keyunread")
+    prelude = CWD_UNREADABLE_FOR_EVERY_PID + _svc_rows(("$PID", "BITS", "LocalSystem", "Share Process", SVCHOST)) + _key_written(wt, None)
+    d = _gate_with_snapshot(wt, _svchost_row(wt), prelude=prelude)
+    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown"), d
+    assert d["cwdExemptOwner"] == [] and any("scm-config-time-unreadable:BITS" in u for u in d["cwdUnknown"]), d
+
+
+def test_service_process_creation_time_unreadable_is_still_cwd_unknown(repo):
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-svc-procunread")
+    row = _fake_row("$PID", cmd=None, session=0, name="svchost.exe")   # no CreationDate at all
+    prelude = CWD_UNREADABLE_FOR_EVERY_PID + _svc_rows(("$PID", "BITS", "LocalSystem", "Share Process", SVCHOST)) + _key_written(wt, -60)
+    d = _gate_with_snapshot(wt, row, prelude=prelude)
+    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown"), d
+    assert d["cwdExemptOwner"] == [] and any("scm-process-time-unreadable" in u for u in d["cwdUnknown"]), d
+
+
+def test_share_process_with_one_service_key_newer_than_the_process_is_still_cwd_unknown(repo):
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-svc-sharenewer")
+    prelude = (CWD_UNREADABLE_FOR_EVERY_PID + _svc_rows(("$PID", "BITS", "LocalSystem", "Share Process", SVCHOST),
+                                                        ("$PID", "gpsvc", "LocalSystem", "Share Process", SVCHOST))
+               + _key_written(wt, -60, gpsvc=30))
+    d = _gate_with_snapshot(wt, _svchost_row(wt), prelude=prelude)
+    assert d["action"] == "kept" and any("scm-config-newer-than-process:gpsvc" in u for u in d["cwdUnknown"]), d
+
+
+def test_service_key_written_before_the_process_started_is_exempt_and_bound(repo):
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-svc-bound")
+    prelude = CWD_UNREADABLE_FOR_EVERY_PID + _svc_rows(("$PID", "BITS", "LocalSystem", "Share Process", SVCHOST)) + _key_written(wt, -60)
+    d = _gate_with_snapshot(wt, _svchost_row(wt), prelude=prelude)
+    assert (d["action"], d["reason"]) == ("would-retire", "ok"), d
+    assert len(d["cwdExemptOwner"]) == 1 and "exempt=service-sid:S-1-5-18 via=scm:BITS" in d["cwdExemptOwner"][0], d
+
+
+def test_live_binding_does_not_rewrite_the_shared_index_row_for_the_next_worktree(repo):
+    """A sweep reuses one snapshot index across worktrees: a pid refused by the binding for an OLDER worktree must still get
+    the creation-time exemption for a worktree created after the process started."""
+    tmp, main = repo
+    old = _add_wt(main, tmp / "wt-svc-sweep-old")
+    new = _add_wt(main, tmp / "wt-svc-sweep-new")
+    row = _fake_row("$PID", cmd=None, session=0, name="nssm.exe", created=_wt_created(old, 5))
+    script = (
+        "$ErrorActionPreference='Stop'; Set-StrictMode -Version Latest; "
+        f". '{HELPER}'; " + CWD_UNREADABLE_FOR_EVERY_PID
+        + _svc_rows(("$PID", "LaneSvc", "LocalSystem", "Own Process", NSSM)) + _key_written(old, 10)
+        + f" (Get-Item -LiteralPath '{new}').CreationTimeUtc = {_wt_created(old, 60)}; $snap = {row}; "
+        f"$a = Get-CwdUnknownRefusal -Snapshot $snap -WorktreePath '{old}'; "
+        f"$b = Get-CwdUnknownRefusal -Snapshot $snap -WorktreePath '{new}'; "
+        "[pscustomobject]@{ a = @($a.Unknown); b = @($b.Unknown); bExempt = $b.Exempt } | ConvertTo-Json -Depth 3"
+    )
+    out = json.loads(subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", script],
+                                    check=True, capture_output=True, text=True).stdout)
+    assert len(out["a"]) == 1 and "scm-config-newer-than-process:LaneSvc" in out["a"][0], out
+    assert out["b"] == [] and out["bExempt"] == 1, out
+
+
+@pytest.mark.parametrize("stype", ["Unknown", "Interactive Process"], ids=["unknown", "interactive"])
+def test_localsystem_service_of_a_non_own_or_share_type_is_still_cwd_unknown(repo, stype):
+    """fable r1 h1: pins the ServiceType guard. StartName, image and the key binding all pass, so only the type refuses."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-svc-type")
+    prelude = CWD_UNREADABLE_FOR_EVERY_PID + _svc_rows(("$PID", "BITS", "LocalSystem", stype, SVCHOST)) + _key_written(wt, -60)
+    d = _gate_with_snapshot(wt, _svchost_row(wt), prelude=prelude)
+    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown"), d
+    assert d["cwdExemptOwner"] == [], d
+
+
+GOOD_BITS_ROW = ("[pscustomobject]@{ ProcessId = $PID; Name = 'BITS'; StartName = 'LocalSystem'; ServiceType = 'Share Process'; "
+                 "PathName = '" + SVCHOST + "' }")
+
+
+@pytest.mark.parametrize("bad", [
+    "[pscustomobject]@{ ProcessId = 4321; Name = 'BadSvc'; StartName = 'LocalSystem'; ServiceType = 'Own Process' }",
+    "[pscustomobject]@{ ProcessId = 'n/a'; Name = 'BadSvc'; StartName = 'LocalSystem'; ServiceType = 'Own Process'; PathName = '" + SVCHOST + "' }",
+], ids=["pathname-missing", "pid-unparsable"])
+def test_one_unparsable_scm_row_is_skipped_and_named_and_the_other_rows_still_map(repo, bad):
+    """fable r1 h2: a malformed row used to throw out of the whole query (scm-failed, nothing exempt host-wide)."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-svc-badrow")
+    prelude = (CWD_UNREADABLE_FOR_EVERY_PID + "function Get-RunningServiceRows { @(" + bad + ", " + GOOD_BITS_ROW + ") };"
+               + _key_written(wt, -60))
+    d = _gate_with_snapshot(wt, _svchost_row(wt), prelude=prelude)
+    assert (d["action"], d["reason"]) == ("would-retire", "ok"), d
+    assert d["cwdOwnerProbe"] == "scm" and len(d["cwdExemptOwner"]) == 1 and "via=scm:BITS" in d["cwdExemptOwner"][0], d
+    assert len(d["cwdOwnerSkipped"]) == 1 and d["cwdOwnerSkipped"][0].startswith("BadSvc ") and "scm-row-unparsed" in d["cwdOwnerSkipped"][0], d
+
+
+def test_unparsable_scm_row_at_the_same_pid_drops_that_pid(repo):
+    """The bad row's account is unknown, so the pid it names is not exempt even when another row there looks fine."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-svc-badrow-same")
+    bad = "[pscustomobject]@{ ProcessId = $PID; Name = 'BadSvc'; StartName = 'LocalSystem'; ServiceType = 'Share Process' }"
+    prelude = (CWD_UNREADABLE_FOR_EVERY_PID + "function Get-RunningServiceRows { @(" + GOOD_BITS_ROW + ", " + bad + ") };"
+               + _key_written(wt, -60))
+    d = _gate_with_snapshot(wt, _svchost_row(wt), prelude=prelude)
+    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown"), d
+    assert d["cwdExemptOwner"] == [] and len(d["cwdOwnerSkipped"]) == 1, d
+
+
+def test_owner_probe_is_null_when_no_candidate_reaches_the_owner_check(repo):
+    """fable r1 h3: cwdOwnerProbe is scm | scm-failed only when some candidate reached the owner check."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-svc-probe-null")
+    svc = "function Get-RunningServiceRows { throw 'must not be queried' };"
+    old = _fake_row("$PID", cmd=None, session=0, name="svchost.exe", created=_wt_created(wt, -60))
+    d = _gate_with_snapshot(wt, old, prelude=CWD_UNREADABLE_FOR_EVERY_PID + svc)
+    assert (d["action"], d["reason"]) == ("would-retire", "ok") and d["cwdExempt"] == 1, d
+    assert d["cwdOwnerProbe"] is None and d["cwdExemptOwner"] == [] and d["cwdOwnerSkipped"] == [], d
+    off = _gate_with_snapshot(wt, _svchost_row(wt), prelude=FORCE_PROBE_UNAVAILABLE + svc)
+    assert off["action"] == "kept" and off["cwdOwnerProbe"] is None, off
+
+
+def test_merged_clean_worktree_whose_only_unreadable_pids_are_live_bound_service_owners_would_retire(repo):
+    """sol r1 acceptance row: merged clean worktree, zero real holders, every unreadable-cwd pid is a permitted service owner
+    whose configured account is bound to the live process -> would-retire / ok (WhatIf), each pid listed."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-svc-accept")
+    created = _wt_created(wt, 5)
+    snap = ("[pscustomobject]@{ Procs = @("
+            "[pscustomobject]@{ ProcessId = $PID; Name = 'svchost.exe'; CommandLine = $null; SessionId = 0; CreationDate = " + created + " }, "
+            "[pscustomobject]@{ ProcessId = $parentPid; Name = 'svchost.exe'; CommandLine = $null; SessionId = 0; CreationDate = " + created + " }"
+            "); SelfPids = @(1) }")
+    prelude = ("$parentPid = [int](Get-CimInstance Win32_Process -Filter ('ProcessId=' + $PID)).ParentProcessId; "
+               + CWD_UNREADABLE_FOR_EVERY_PID
+               + _svc_rows(("$PID", "BITS", "LocalSystem", "Share Process", SVCHOST),
+                           ("$PID", "gpsvc", "LocalSystem", "Share Process", SVCHOST),
+                           ("$parentPid", "Dnscache", "NT AUTHORITY\\NetworkService", "Share Process", SVCHOST))
+               + _key_written(wt, -60))
+    d = _gate_with_snapshot(wt, snap, prelude=prelude)
+    assert (d["action"], d["reason"]) == ("would-retire", "ok"), d
+    assert d["holders"] == [] and d["cwdUnknown"] == [] and d["cwdOwnerProbe"] == "scm" and d["cwdOwnerSkipped"] == [], d
+    owners = sorted(d["cwdExemptOwner"])
+    assert len(owners) == 2, d
+    assert any("exempt=service-sid:S-1-5-18 via=scm:BITS,gpsvc bound=config-older-than-process" in o for o in owners), d
+    assert any("exempt=service-sid:S-1-5-20 via=scm:Dnscache bound=config-older-than-process" in o for o in owners), d
