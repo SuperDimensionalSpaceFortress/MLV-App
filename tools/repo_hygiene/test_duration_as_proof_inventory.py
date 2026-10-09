@@ -510,6 +510,30 @@ class DurationAsProofInventoryTests(unittest.TestCase):
             self.assertIsNotNone(row, c)
             self.assertEqual(row["class"], "not_run_proof_structural", row)
 
+    def test_lower_bound_caveat_matches_scanner_behaviour(self) -> None:
+        # The caveat once claimed "only the four textual shapes above, per physical line (a
+        # comparison split across two physical lines is not caught)", which round 4B (token rule)
+        # and HARDENING-2 (balanced-paren macro/fabs sites) made false. Pin each claim to a fact.
+        caveat = self.meta["lower_bound_caveat"]
+        self.assertIn("LOWER BOUND", caveat)
+        self.assertNotIn("four textual shapes", caveat)
+        self.assertNotIn("(a comparison split across two physical lines is not caught)", caveat)
+        # Fact 1: a BARE comparison split across physical lines is not caught (and the caveat says so).
+        self.assertEqual(scan_text("if (elapsed_ms\n    > 0.0) {}", source="<split-bare>"), [])
+        self.assertIn("a bare comparison split across two physical lines is not caught", caveat)
+        # Fact 2: a macro call split across physical lines IS one site (and the caveat says so).
+        split_macro = scan_text("ASSERT_EQ(0.0,\n    stage.durationMs);", source="<split-macro>")
+        self.assertEqual([c.lines for c in split_macro], [(1,)])
+        self.assertIn("balanced-paren", caveat)
+        self.assertIn("split across physical lines IS caught", caveat)
+        # Fact 3: an indirected / call-with-arguments / comment-only comparison is not caught.
+        for snippet in ("bool ok = elapsed_ms;\nif (ok > 0) {}", "if (foo(elapsed_ms) > 0) {}",
+                        "// if (elapsed_ms > 0.0)\n/* if (elapsed_ms > 0.0) */"):
+            self.assertEqual(scan_text(snippet, source="<not-caught>"), [], snippet)
+        for phrase in ("intermediate variable", "helper function", "a call with arguments",
+                       "inside a comment"):
+            self.assertIn(phrase, caveat)
+
     def test_seeded_controls_do_not_leak_into_the_real_inventory(self) -> None:
         # The seeded snippets above are synthetic sources (source="<seeded-...>"), never written
         # under src/, platform/qt/ or tests/, so they must never appear as a live repo candidate

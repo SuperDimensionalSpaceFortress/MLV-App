@@ -171,9 +171,6 @@ def _is_duration_identifier(ident: str) -> bool:
     return False
 
 
-_QUALIFIER_TAILS = (".", "->", "::")
-
-
 def _is_duration_expr(text: str) -> bool:
     """True if `text` contains a duration identifier (bare or as a call), a JSON `_ms`
     read, or (recursively) a comparison already built from one of those -- used to decide
@@ -321,15 +318,15 @@ _RE_STATIC_CAST_HEAD = re.compile(r"^\s*static_cast\s*<\s*[A-Za-z_][A-Za-z0-9_:\
 _RE_C_CAST_HEAD = re.compile(rf"^\s*\(\s*(?:{'|'.join(_CAST_TYPES)})\s*\)\s*")
 
 
-def _operand_of_group(inner: str) -> tuple[str, bool, bool] | None:
-    """(identifier, is_niladic_call, is_qualified) if `inner` is a bare operand chain, looking
-    through any further redundant grouping parens; None otherwise."""
+def _operand_of_group(inner: str) -> tuple[str, bool] | None:
+    """(identifier, is_niladic_call) if `inner` is a bare operand chain, looking through any
+    further redundant grouping parens; None otherwise."""
     inner = _unwrap_parens(inner)
     m = _RE_DURATION_OPERAND_CHAIN.match(inner)
-    return (m.group(2), bool(m.group(3)), bool(m.group(1))) if m else None
+    return (m.group(2), bool(m.group(3))) if m else None
 
 
-def _left_operand(left: str) -> tuple[str, bool, bool] | None:
+def _left_operand(left: str) -> tuple[str, bool] | None:
     """The operand ending at the end of `left`: a bare ``ident`` / ``ident()`` (as before), or
     a PARENTHESIZED operand -- ``(elapsed_ms)``, ``((elapsed_ms))``, ``static_cast<double>(x)``.
     A call with arguments (``foo(elapsed_ms) > 0``) is deliberately NOT unwrapped: the paren
@@ -337,7 +334,7 @@ def _left_operand(left: str) -> tuple[str, bool, bool] | None:
     s = left.rstrip()
     m = _RE_LEFT_OPERAND.search(s)
     if m:
-        return m.group(1), bool(m.group(2)), s[:m.start()].rstrip().endswith(_QUALIFIER_TAILS)
+        return m.group(1), bool(m.group(2))
     if not s.endswith(")"):
         return None
     depth = 0
@@ -356,7 +353,7 @@ def _left_operand(left: str) -> tuple[str, bool, bool] | None:
     return None
 
 
-def _right_operand(right: str) -> tuple[str, bool, bool] | None:
+def _right_operand(right: str) -> tuple[str, bool] | None:
     """Mirror of `_left_operand` for the operand starting at the start of `right`; also looks
     through a leading C-style numeric cast (``(double)elapsed_ms``)."""
     s = right.lstrip()
@@ -369,8 +366,7 @@ def _right_operand(right: str) -> tuple[str, bool, bool] | None:
     else:
         m = _RE_RIGHT_OPERAND.match(s)
         if m:
-            # Followed by `.`/`->`/`::` the matched word is only a qualifier of the real operand.
-            return m.group(1), bool(m.group(2)), s[m.end():].lstrip().startswith(_QUALIFIER_TAILS)
+            return m.group(1), bool(m.group(2))
     if not s.startswith("("):
         return None
     close = _find_matching_close(s, 0)
