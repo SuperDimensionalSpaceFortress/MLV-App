@@ -1,0 +1,13 @@
+{
+  "schema": "mlv-app/codex-pin/v1",
+  "version": "0.160.1",
+  "windowsSandbox": "elevated",
+  "installPrefix": "<Invoke-Lane -CodexPinRoot, default C:\\mlvtmp\\codex-pin>\\0.160.1 (exe node_modules\\.bin\\codex.cmd); written by Promote-CodexPin.ps1",
+  "promotedAt": "2026-10-09T06:40:20.4145772Z",
+  "promotionEvidence": "C:\\mlvtmp\\codex-pin\\0.160.1-promotion-20261009T063906Z\\promotion.json",
+  "gate": {
+    "sandboxProbe": "codex sandbox -P :read-only -- git --version rc 0 (elevated)",
+    "writeProbe": "DENIED (exit 128)",
+    "execProbe": "EXEC_OK ok=1 rejected=0 model=gpt-6-luna"
+  }
+}

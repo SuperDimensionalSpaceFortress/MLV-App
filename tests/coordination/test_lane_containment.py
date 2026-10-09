@@ -127,6 +127,13 @@ if($args.Count -ge 2 -and $args[0] -eq 'mcp' -and $args[1] -eq 'list'){
   else{[Console]::Out.Write('[{"name":"agent_bridge","enabled":true},{"name":"node_repl","enabled":true}]')}
   exit ([int]$env:MLV_FIXTURE_MCP_LIST_EXIT)
 }
+# CODEX-KEY-PRIVATE-PIN-1: answers the launcher's `codex --version` stamp the same way (version
+# from MLV_FIXTURE_CODEX_VERSION, unset = 0.0.0-fixture) and exits before any lane-side write.
+if($args.Count -ge 1 -and $args[0] -eq '--version'){
+  $v=if($env:MLV_FIXTURE_CODEX_VERSION){$env:MLV_FIXTURE_CODEX_VERSION}else{'0.0.0-fixture'}
+  [Console]::Out.Write("codex-cli $v`n")
+  exit 0
+}
 $me=Get-Process -Id $PID
 $t=$env:MLV_FIXTURE_CHILD+'.tmp';@{pid=$PID;createdUtc=$me.StartTime.ToUniversalTime().ToString('o')}|ConvertTo-Json|Set-Content -Encoding utf8NoBOM $t;Move-Item -LiteralPath $t -Destination $env:MLV_FIXTURE_CHILD
 $args|ConvertTo-Json|Set-Content -Encoding utf8NoBOM $env:MLV_FIXTURE_ARGS
@@ -1417,6 +1424,158 @@ def test_codex_read_only_lane_refuses_launch_when_mcp_list_is_unreadable(fixture
     assert q["state"]=="failed"
     assert "codex-mcp-list-unreadable" in (q["failure"] or ""), q["failure"]
     assert not (fixture_tree["root"]/"args.json").exists(), "the codex exec lane must never start"
+
+
+# CODEX-KEY-PRIVATE-PIN-1: a read-only codex lane runs the private install named by the tracked
+# codex-pin.json (beside the launcher, i.e. the fixture root here) under -CodexPinRoot, falling back
+# to the global codex with a named reason. prepare() swaps $CODEX_EXE for the shim, which by design
+# never consults the pin (PIN_SKIPPED_EXE_OVERRIDDEN); these tests also point $REAL_CODEX_EXE at the
+# shim -- exactly as test_real_lane_launch_refuses_non_high_effort does for claude -- so the launcher
+# treats the shim as its genuine global codex, and drop prepare()'s -ReasoningEffort low, which that
+# same real-launch rule refuses.
+PIN_VERSION = "9.9.9-fixture"
+
+
+def _real_codex_is_shim(fixture_tree):
+    def mutation(text):
+        old = "$REAL_CODEX_EXE  = Join-Path $env:APPDATA 'npm\\codex.cmd'"
+        assert text.count(old) == 1, "REAL_CODEX_EXE declaration has moved; update this fixture mutation"
+        return text.replace(old, "$REAL_CODEX_EXE = '" + str(fixture_tree["shim"]).replace("'", "''") + "'")
+    return mutation
+
+
+def _pin_case(fixture_tree, pin=None, exe_version=PIN_VERSION, create_exe=True, real_is_shim=True,
+              editing=False, keep_low_effort=False):
+    root = fixture_tree["root"]; pin_root = root / "codex-pin"
+    pinned = pin_root / PIN_VERSION / "node_modules" / ".bin" / "codex.cmd"
+    if create_exe:
+        pinned.parent.mkdir(parents=True)
+        pinned.write_text("@echo off\r\n"
+                          f'if "%~1"=="--version" (echo codex-cli {exe_version}& exit /b 0)\r\n'
+                          'echo pinned> "%MLV_FIXTURE_VIA%"\r\n'
+                          f'"{PWSH}" -NoProfile -NonInteractive -File "{fixture_tree["child"]}" %*\r\n', encoding="ascii")
+    if pin is None:
+        pin = {"schema": "mlv-app/codex-pin/v1", "version": PIN_VERSION, "windowsSandbox": "elevated"}
+    mutations = []
+    if real_is_shim: mutations.append(_real_codex_is_shim(fixture_tree))
+    if editing: mutations.append(_bypass_codex_never_edits)
+    def mutation(text):
+        for m in mutations: text = m(text)
+        return text
+    cmd, env, receipt = prepare(fixture_tree, "normal", lane="sol", mutation=mutation, editing=editing,
+                                allowed_tools="Read,Write" if editing else "")
+    if pin is not False:
+        (root / "codex-pin.json").write_text(pin if isinstance(pin, str) else json.dumps(pin), encoding="utf-8")
+    if not keep_low_effort:
+        i = cmd.index("-ReasoningEffort"); del cmd[i:i+2]
+    cmd += ["-CodexPinRoot", str(pin_root)]
+    env = dict(env); env["MLV_FIXTURE_VIA"] = str(root / "via.txt")
+    return cmd, env, receipt, pinned
+
+
+def _run_pin_case(cmd, env, receipt):
+    r = subprocess.run(cmd, env=env, text=True, capture_output=True, timeout=40)
+    return r, json.loads(receipt.read_text(encoding="utf-8"))
+
+
+def test_codex_pin_present_and_matching_runs_the_pinned_exe_on_its_promoted_sandbox(fixture_tree):
+    cmd, env, receipt, pinned = _pin_case(fixture_tree)
+    r, q = _run_pin_case(cmd, env, receipt)
+    assert r.returncode == 0, (r.stdout, r.stderr)
+    assert (fixture_tree["root"] / "via.txt").exists(), "the lane must have been launched through the pinned exe"
+    assert q["codexExe"]["pinState"] == "PINNED"
+    assert q["codexExe"]["path"] == str(pinned)
+    assert q["codexExe"]["version"] == PIN_VERSION and q["codexExe"]["pinVersion"] == PIN_VERSION
+    assert q["codexExe"]["pinWindowsSandbox"] == "elevated"
+    argv = json.loads((fixture_tree["root"] / "args.json").read_text(encoding="utf-8-sig"))
+    assert _windows_sandbox_overrides(argv) in (['windows.sandbox="elevated"'], ["windows.sandbox=elevated"]), argv
+    assert q["authority"]["windowsSandbox"] == "elevated"
+    assert q["authority"]["mcpServers"] == "disabled", "the MCP probe must still run, on the pinned exe"
+    assert r.stdout.count("[codex-pin]") == 1 and "[codex-pin] PINNED" in r.stdout, r.stdout
+
+
+@pytest.mark.parametrize("case,state", [
+    ("no-pin", "PIN_ABSENT"),
+    ("exe-missing", "PIN_EXE_MISSING"),
+    ("version-mismatch", "PIN_VERSION_MISMATCH"),
+    ("unparseable-pin", "PIN_INVALID"),
+    ("path-in-version", "PIN_INVALID"),
+    ("bad-sandbox", "PIN_INVALID"),
+])
+def test_codex_pin_unusable_falls_back_to_the_global_codex_with_the_named_reason(fixture_tree, case, state):
+    kw = {"no-pin": dict(pin=False), "exe-missing": dict(create_exe=False),
+          "version-mismatch": dict(exe_version="9.9.8-fixture"), "unparseable-pin": dict(pin="{not json"),
+          "path-in-version": dict(pin={"version": "..\\..\\evil", "windowsSandbox": "elevated"}),
+          "bad-sandbox": dict(pin={"version": PIN_VERSION, "windowsSandbox": "danger-full-access"})}[case]
+    cmd, env, receipt, pinned = _pin_case(fixture_tree, **kw)
+    env["MLV_FIXTURE_CODEX_VERSION"] = "1.2.3"
+    r, q = _run_pin_case(cmd, env, receipt)
+    assert r.returncode == 0, (r.stdout, r.stderr)
+    assert not (fixture_tree["root"] / "via.txt").exists(), "the pinned exe must not run"
+    assert q["codexExe"]["pinState"] == state, q["codexExe"]
+    assert q["codexExe"]["path"] == str(fixture_tree["shim"])
+    assert q["codexExe"]["version"] == "1.2.3", "the global codex's own version is stamped on a fallback"
+    assert q["authority"]["windowsSandbox"] == "unelevated", "a fallback keeps #329's unelevated sandbox"
+    lines = [l for l in r.stdout.splitlines() if "[codex-pin]" in l]
+    assert len(lines) == 1 and state in lines[0], r.stdout
+
+
+def test_codex_pin_keeps_the_high_effort_refusal_for_the_pinned_exe(fixture_tree):
+    # The pinned exe IS a real CLI: $REAL_CODEX_EXE follows it, so a non-high effort is refused
+    # exactly as for the global codex, before the ledger row or any provider process.
+    cmd, env, receipt, pinned = _pin_case(fixture_tree, keep_low_effort=True)
+    r, q = _run_pin_case(cmd, env, receipt)
+    assert r.returncode != 0, (r.stdout, r.stderr)
+    assert q["state"] == "failed" and "lane-effort-must-be-high" in (q["failure"] or ""), q["failure"]
+    assert q["codexExe"]["pinState"] == "PINNED"
+    assert q["dispatchLedger"]["state"] is None
+    assert not (fixture_tree["root"] / "args.json").exists()
+
+
+def test_codex_pin_is_never_consulted_by_a_launcher_whose_exe_was_swapped(fixture_tree):
+    # A valid pin is present, but $CODEX_EXE no longer equals $REAL_CODEX_EXE (prepare()'s own shim
+    # swap): the swapped exe runs, the pin is not promoted over it, and the low-effort launch is
+    # still allowed only because the swapped exe provably cannot be a real CLI.
+    cmd, env, receipt, pinned = _pin_case(fixture_tree, real_is_shim=False, keep_low_effort=True)
+    r, q = _run_pin_case(cmd, env, receipt)
+    assert r.returncode == 0, (r.stdout, r.stderr)
+    assert not (fixture_tree["root"] / "via.txt").exists()
+    assert q["codexExe"]["pinState"] == "PIN_SKIPPED_EXE_OVERRIDDEN"
+    assert q["codexExe"]["path"] == str(fixture_tree["shim"])
+
+
+def test_codex_pin_does_not_apply_to_a_producer_lane(fixture_tree):
+    cmd, env, receipt, pinned = _pin_case(fixture_tree, editing=True)
+    r, q = _run_pin_case(cmd, env, receipt)
+    assert r.returncode == 0, (r.stdout, r.stderr)
+    assert not (fixture_tree["root"] / "via.txt").exists()
+    assert q["codexExe"]["pinState"] == "PIN_NOT_APPLICABLE"
+    assert q["authority"]["windowsSandbox"] == "default"
+
+
+def test_codex_pin_rule_is_shared_by_the_promoter_and_the_tracked_pin_is_well_formed():
+    # Promote-CodexPin.ps1 installs where Invoke-Lane.ps1 looks: both derive the exe from the same
+    # two literals. The tracked pin, when present, must pass the launcher's own validation.
+    promoter = (ROOT / "tools" / "coordination" / "Promote-CodexPin.ps1").read_text(encoding="utf-8")
+    launcher = CANDIDATE.read_text(encoding="utf-8")
+    for name in ("$CODEX_PIN_EXE_RELATIVE", "$CODEX_PIN_VERSION_PATTERN"):
+        decl = [l.strip() for l in launcher.splitlines() if l.startswith(name + " =")]
+        assert len(decl) == 1, name
+        assert decl[0] in [l.strip() for l in promoter.splitlines()], (name, decl[0])
+    pin_path = ROOT / "tools" / "coordination" / "codex-pin.json"
+    if pin_path.exists():
+        pin = json.loads(pin_path.read_text(encoding="utf-8"))
+        assert re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?", pin["version"]), pin
+        assert pin["windowsSandbox"] in ("elevated", "unelevated"), pin
+
+
+def test_claude_lane_receipt_carries_a_null_codex_exe(fixture_tree):
+    cmd, env, receipt = prepare(fixture_tree, "normal")
+    r = subprocess.run(cmd, env=env, text=True, capture_output=True, timeout=20)
+    assert r.returncode == 0, (r.stdout, r.stderr)
+    q = json.loads(receipt.read_text(encoding="utf-8"))
+    assert "codexExe" in q and q["codexExe"] is None
+    assert "[codex-pin]" not in r.stdout
 
 
 def test_startup_consumes_same_deadline_without_starting_provider(fixture_tree):

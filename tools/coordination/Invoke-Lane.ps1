@@ -125,6 +125,11 @@ param(
     # MLV root. The run's own scratch dir is removed when the lane exits unless -KeepScratch;
     # its size is recorded in the receipt either way.
     [string]$ScratchRoot = 'C:\mlvtmp\lane-scratch',
+    # CODEX-KEY-PRIVATE-PIN-1: root of the private codex installs a read-only codex lane may run
+    # (one npm --prefix install per version, <CodexPinRoot>\<version>, written only by
+    # Promote-CodexPin.ps1). Which version is chosen by the tracked codex-pin.json beside this
+    # script, never by this parameter, PATH or env. See Resolve-CodexExe.
+    [string]$CodexPinRoot = 'C:\mlvtmp\codex-pin',
     # Set only by Invoke-Workstream.ps1, which has already written the 'reserved' row for this
     # launch. This lane then writes a 'linked' row naming its receipt instead of a second
     # 'reserved' row, so the product-ratio guard counts the launch once.
@@ -358,6 +363,113 @@ function Get-CodexMcpDisableArgs {
     $serverArgs = @()
     foreach ($n in $names) { $serverArgs += @('-c', "mcp_servers.$n.enabled=false") }
     return [pscustomobject]@{ Args = @($featureArgs + $serverArgs); Servers = @($names) }
+}
+
+# CODEX-KEY-PRIVATE-PIN-1 (queued 2026-10-09T01:40:00Z after the codex 0.162 EXEC_BLIND incident):
+# read-only codex lanes (review keys) ran the SHARED global npm codex above, which CLI-Currency
+# reinstalls every ~6 h and other projects hold open -- so a key could change binary between
+# rounds, npm could race EBUSY, and no receipt named the binary a verdict ran on. A read-only lane
+# now runs a PRIVATE install pinned by the tracked codex-pin.json beside this script:
+#   exe = <CodexPinRoot>\<pin.version>\node_modules\.bin\codex.cmd   (derived, never hand-typed)
+# used only when the pin file parses, its version is a plain semver, that exe exists, and its own
+# `--version` reports the pinned version. Otherwise the lane falls back to the global codex with
+# ONE logged line naming why: PIN_ABSENT | PIN_INVALID | PIN_EXE_MISSING | PIN_VERSION_MISMATCH.
+# Two further states never consult the pin: PIN_NOT_APPLICABLE (a producer lane, -AllowEdits:
+# promotion only measures the read-only sandbox, and producers carry no verdict) and
+# PIN_SKIPPED_EXE_OVERRIDDEN ($CODEX_EXE no longer equals $REAL_CODEX_EXE, i.e. the containment
+# fixture's shim swap -- a patched launcher must stay provably unable to reach a real CLI, so it
+# never promotes itself onto a pinned one). Never throws; the caller stamps the result into the
+# receipt as `codexExe`. Promote-CodexPin.ps1 derives the same exe path from the same rule.
+$CODEX_PIN_FILE = Join-Path $PSScriptRoot 'codex-pin.json'
+$CODEX_PIN_EXE_RELATIVE = 'node_modules\.bin\codex.cmd'
+$CODEX_PIN_VERSION_PATTERN = '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'
+$CODEX_PIN_WINDOWS_SANDBOXES = @('elevated', 'unelevated')
+
+# `<exe> --version` -> the version string ('codex-cli 0.160.1' -> '0.160.1'), or $null on any
+# failure (missing exe, non-zero exit, timeout, unparseable output). Bounded; never throws.
+function Get-CodexCliVersion {
+    param(
+        [Parameter(Mandatory = $true)][string]$CodexExe,
+        [int]$TimeoutMs = 15000
+    )
+    try {
+        if (-not (Test-Path -LiteralPath $CodexExe -PathType Leaf)) { return $null }
+        $vPsi = [System.Diagnostics.ProcessStartInfo]::new()
+        $vPsi.FileName = $CodexExe
+        [void]$vPsi.ArgumentList.Add('--version')
+        $vPsi.UseShellExecute = $false
+        $vPsi.CreateNoWindow = $true
+        $vPsi.RedirectStandardInput = $true
+        $vPsi.RedirectStandardOutput = $true
+        $vPsi.RedirectStandardError = $true
+        $vProc = [System.Diagnostics.Process]::Start($vPsi)
+        $vProc.StandardInput.Close()
+        $vOut = $vProc.StandardOutput.ReadToEndAsync()
+        $vErr = $vProc.StandardError.ReadToEndAsync()
+        if (-not $vProc.WaitForExit($TimeoutMs)) {
+            try { $vProc.Kill($true) } catch { }
+            return $null
+        }
+        $vProc.WaitForExit()
+        if ($vProc.ExitCode -ne 0) { return $null }
+        if ($vOut.Result -match '(?m)^codex-cli\s+(\S+)\s*$') { return $Matches[1] }
+        return $null
+    } catch {
+        return $null
+    }
+}
+
+function Resolve-CodexExe {
+    param(
+        [Parameter(Mandatory = $true)][string]$ConfiguredExe,
+        [Parameter(Mandatory = $true)][string]$RealExe,
+        [Parameter(Mandatory = $true)][bool]$ReadLane,
+        [Parameter(Mandatory = $true)][string]$PinFile,
+        [Parameter(Mandatory = $true)][string]$PinRoot
+    )
+    $r = [ordered]@{
+        path = $ConfiguredExe; version = $null; pinState = $null; pinVersion = $null
+        pinWindowsSandbox = $null; pinFile = $PinFile; detail = ''
+    }
+    $pinnedExe = $null
+    if (-not $ReadLane) {
+        $r.pinState = 'PIN_NOT_APPLICABLE'; $r.detail = 'producer lane (-AllowEdits) keeps the global codex'
+    } elseif ($ConfiguredExe -ne $RealExe) {
+        $r.pinState = 'PIN_SKIPPED_EXE_OVERRIDDEN'; $r.detail = "configured exe '$ConfiguredExe' is not the launcher's own '$RealExe'"
+    } elseif (-not (Test-Path -LiteralPath $PinFile -PathType Leaf)) {
+        $r.pinState = 'PIN_ABSENT'; $r.detail = "no pin file at $PinFile"
+    } else {
+        $pin = $null
+        try { $pin = Get-Content -LiteralPath $PinFile -Raw | ConvertFrom-Json } catch { $pin = $null }
+        $versionProp = if ($null -ne $pin -and $pin -is [System.Management.Automation.PSCustomObject]) { $pin.PSObject.Properties['version'] } else { $null }
+        $sandboxProp = if ($null -ne $pin -and $pin -is [System.Management.Automation.PSCustomObject]) { $pin.PSObject.Properties['windowsSandbox'] } else { $null }
+        $pinVersion = if ($null -ne $versionProp) { [string]$versionProp.Value } else { '' }
+        $pinSandbox = if ($null -ne $sandboxProp) { [string]$sandboxProp.Value } else { '' }
+        if ($pinVersion -notmatch $CODEX_PIN_VERSION_PATTERN) {
+            $r.pinState = 'PIN_INVALID'; $r.detail = "pin file $PinFile has no plain semver 'version' (got '$pinVersion')"
+        } elseif ($CODEX_PIN_WINDOWS_SANDBOXES -notcontains $pinSandbox) {
+            $r.pinState = 'PIN_INVALID'; $r.detail = "pin file $PinFile 'windowsSandbox' must be one of $($CODEX_PIN_WINDOWS_SANDBOXES -join '|') (got '$pinSandbox')"
+        } else {
+            $r.pinVersion = $pinVersion
+            # [IO.Path]::Combine, not Join-Path: Join-Path throws for a drive PowerShell does not
+            # know, and this function must never throw.
+            $candidate = [System.IO.Path]::Combine($PinRoot, $pinVersion, $CODEX_PIN_EXE_RELATIVE)
+            if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+                $r.pinState = 'PIN_EXE_MISSING'; $r.detail = "pinned exe absent: $candidate"
+            } else {
+                $actual = Get-CodexCliVersion -CodexExe $candidate
+                if ($actual -ne $pinVersion) {
+                    $r.pinState = 'PIN_VERSION_MISMATCH'; $r.detail = "pinned exe $candidate reports '$actual', pin says '$pinVersion'"
+                } else {
+                    $pinnedExe = $candidate
+                    $r.pinState = 'PINNED'; $r.path = $candidate; $r.version = $actual
+                    $r.pinWindowsSandbox = $pinSandbox; $r.detail = "pinned codex $actual ($pinSandbox sandbox)"
+                }
+            }
+        }
+    }
+    if ($null -eq $pinnedExe) { $r.version = Get-CodexCliVersion -CodexExe $ConfiguredExe }
+    return $r
 }
 
 # Every tool that either fans out to another agent (Agent, Task, Workflow, TaskCreate) or
@@ -755,7 +867,24 @@ $SelectedModel = $null
 # construction can never reach a real model regardless of what effort value is requested. The
 # actual `throw` is deferred to just inside the main try below, so a refusal still produces a
 # normal 'failed' receipt and non-zero exit rather than a silent pre-reservation script error.
-$RealExeForLane = if ($cfg.engine -eq 'claude') { $REAL_CLAUDE_EXE } else { $REAL_CODEX_EXE }
+# CODEX-KEY-PRIVATE-PIN-1: a codex lane resolves its exe FIRST, so this check -- and every later
+# use of $exe (the MCP list probe, the launch) -- sees the binary that will actually run. A PINNED
+# private install IS a real CLI, so $REAL_CODEX_EXE follows it and the high-effort refusal still
+# applies to it; a fallback leaves both variables exactly as declared above.
+$CodexExeStamp = $null
+if ($cfg.engine -eq 'codex') {
+    $CodexExeStamp = Resolve-CodexExe -ConfiguredExe $CODEX_EXE -RealExe $REAL_CODEX_EXE `
+        -ReadLane (-not $AllowEdits) -PinFile $CODEX_PIN_FILE -PinRoot $CodexPinRoot
+    if ($CodexExeStamp.pinState -eq 'PINNED') {
+        $CODEX_EXE = $CodexExeStamp.path
+        $REAL_CODEX_EXE = $CodexExeStamp.path
+        Write-Host ("[codex-pin] PINNED: {0}" -f $CodexExeStamp.detail)
+    } else {
+        Write-Host ("[codex-pin] {0}: {1}; using {2} (codex {3})" -f $CodexExeStamp.pinState, $CodexExeStamp.detail,
+            $CodexExeStamp.path, $(if ($CodexExeStamp.version) { $CodexExeStamp.version } else { 'version unknown' }))
+    }
+}
+$RealExeForLane =if ($cfg.engine -eq 'claude') { $REAL_CLAUDE_EXE } else { $REAL_CODEX_EXE }
 $ConfiguredExeForLane = if ($cfg.engine -eq 'claude') { $CLAUDE_EXE } else { $CODEX_EXE }
 $LaneEffortMustBeHighRefusal = $null
 if ($ConfiguredExeForLane -eq $RealExeForLane -and $cfg.effort -ne 'high') {
@@ -1190,8 +1319,13 @@ if ($cfg.engine -eq 'claude') {
     # read-only lane reviews nothing while still exiting 0. A read-only lane therefore runs the
     # UNELEVATED Windows sandbox, set per call here and never in the user-global config.toml.
     # workspace-write is untouched. Recorded as authority.windowsSandbox.
-    $windowsSandbox = if ($sandbox -eq 'read-only' -and [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) { 'unelevated' } else { 'default' }
-    $windowsSandboxArgs = if ($windowsSandbox -eq 'unelevated') { @('-c', 'windows.sandbox="unelevated"') } else { @() }
+    # CODEX-KEY-PRIVATE-PIN-1: a PINNED read-only lane runs the sandbox its pin was promoted on
+    # (elevated where that version's elevated setup measured working, which enforces deny-read);
+    # every fallback keeps #329's unelevated choice. Always explicit, never left to config.toml.
+    $windowsSandbox = if ($sandbox -eq 'read-only' -and [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+        if ($CodexExeStamp -and $CodexExeStamp.pinState -eq 'PINNED') { $CodexExeStamp.pinWindowsSandbox } else { 'unelevated' }
+    } else { 'default' }
+    $windowsSandboxArgs = if ($windowsSandbox -ne 'default') { @('-c', ('windows.sandbox="{0}"' -f $windowsSandbox)) } else { @() }
     # CODEX-KEY-MCP-ESCAPE-1 (HUB RULING wf_d36c1040-11d): a read-only lane gets NO MCP tool,
     # since every MCP server runs outside the sandbox (see Get-CodexMcpDisableArgs). Throws, so
     # the launch is refused, when the server list cannot be read. workspace-write is untouched.
@@ -1864,6 +1998,9 @@ $receipt = [ordered]@{
     resolvedModel    = $ResolvedModel
     auxiliaryModels  = $AuxiliaryModels
     pinnedByOverride = $PinnedByOverride
+    # CODEX-KEY-PRIVATE-PIN-1: the codex binary this lane ran on -- {path, version, pinState,
+    # pinVersion, pinWindowsSandbox, pinFile, detail} (see Resolve-CodexExe); null for claude.
+    codexExe     = $CodexExeStamp
     effort       = $cfg.effort
     card         = $Card
     workDir      = $WorkDir
