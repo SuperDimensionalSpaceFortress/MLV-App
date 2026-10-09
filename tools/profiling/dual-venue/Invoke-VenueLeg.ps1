@@ -341,6 +341,18 @@ try {
         $committedSpec = Find-DvCommittedLegSpec -RepoRoot $RepoRoot -Commit ([string]$sources.headCommit) -LegSpecSha256 $legSpecSha256
         if (-not $committedSpec.ok) { Stop-Refused 'LEG_SPEC_NOT_COMMITTED' }
     }
+    # LOOK-ASSIST-FILM-FLAVOR-2 r2: a look leg's optional receipt (the GUI smoke applies it before playback). Its bytes are the blob COMMITTED at the admission
+    # head (offline test mode: the repo's HEAD), never the working copy, and must hash to look.receiptSha256, which legSpecSha256 binds.
+    $lookReceiptPath = $null
+    if ($isLook) {
+        $receiptCommit = if ($OfflineTestMode) { [string](& git -C $RepoRoot rev-parse --verify HEAD 2>$null) } else { [string]$sources.headCommit }
+        $lookReceipt = Read-DvCommittedLookReceipt -RepoRoot $RepoRoot -Commit $receiptCommit.Trim() -Look $spec.look
+        if (-not $lookReceipt.ok) { Stop-Refused 'LOOK_RECEIPT_UNBOUND' }
+        if ($lookReceipt.present) {
+            $lookReceiptPath = Join-Path $workDirResolved "$jobStem.look-receipt.marxml"
+            [IO.File]::WriteAllBytes($lookReceiptPath, $lookReceipt.bytes)
+        }
+    }
 
     # --- 3. generate the job (local, no I/O on the venue) ----------------------------------------------
     # The generator resolves the clip by ID (it refuses a path, a fixture under 20 s, an unknown or unconsented id).
@@ -370,6 +382,7 @@ try {
     if ($isLook) {
         $gen['ContactSheet'] = $true; $gen['ContactSheetFrames'] = [int]$spec.look.contactSheetFrames
         $gen['ForceLookAssist'] = $true; $gen['LookFlavor'] = $lookFlavor
+        if ($null -ne $lookReceiptPath) { $gen['LookReceiptPath'] = $lookReceiptPath }
     }
     try {
         $genOut = @(& $GeneratorScript @gen)

@@ -267,7 +267,7 @@ class FlavorDiffComposeTests(FlavorDiffHarness):
 
 
 # LOOK-ASSIST-FILM-FLAVOR-1: the three-side mode (Classic | Cinematic | Film) ------------------------------------------------------------
-FILM = dict(CINEMATIC, presetGrade="film-v1")
+FILM = dict(CINEMATIC, presetGrade="film-v2")
 BASE_COMMIT = "1581f29e57d5a636fc84656400f778f63ec9a406"
 
 
@@ -361,7 +361,7 @@ class FlavorTrioComposeTests(FlavorTrioHarness):
         self.assertEqual(m["schema"], "mlv-app/look-flavor-diff-metrics/v2")
         self.assertIs(m["flavorLive"], True)
         self.assertIs(m["filmLive"], True)
-        self.assertEqual(m["presetGrade"], {"classic": "none", "cinematic": "none", "film": "film-v1"})
+        self.assertEqual(m["presetGrade"], {"classic": "none", "cinematic": "none", "film": "film-v2"})
         want = {"MAD": {"cinematic_classic": [], "film_classic": [], "film_cinematic": []}, "dS": {"cinematic": [], "film": []},
                 "dGA": {"cinematic": [], "film": []}}
         for t, i in zip(m["tiles"], (0, 1)):
@@ -387,7 +387,7 @@ class FlavorTrioComposeTests(FlavorTrioHarness):
         self.assertAlmostEqual(m["means"]["dSGapFilmMinusCinematic"], float(np.mean(want["dS"]["film"]) - np.mean(want["dS"]["cinematic"])), delta=1e-6)
         # The synthetic grade really is a split (blue up in the shadows, red up in the highlights), so S rises.
         self.assertGreater(m["means"]["dSGapFilmMinusCinematic"], 4.0)
-        self.assertIn("| presetGrade | none | none | film-v1 |", (out / "table.md").read_text(encoding="utf-8"))
+        self.assertIn("| presetGrade | none | none | film-v2 |", (out / "table.md").read_text(encoding="utf-8"))
 
     def test_a_trio_into_an_occupied_out_dir_is_refused(self) -> None:
         for name in ("sheet-classic-cinematic-film.png", "heat-film-vs-cinematic-01.png", "metrics.json"):
@@ -457,6 +457,212 @@ class FlavorTrioComposeTests(FlavorTrioHarness):
             outputs.append((proc.stdout.replace(str(out), "<OUT>"), FlavorDiffComposeTests.tree_hashes(out)))
         self.assertEqual(outputs[0][1], outputs[1][1], "every two-side output file is byte-identical to the base commit's tool")
         self.assertEqual(outputs[0][0], outputs[1][0])
+
+    def test_the_two_side_and_trio_outputs_are_byte_identical_to_the_film_v1_merge_tool(self) -> None:
+        """LOOK-ASSIST-FILM-FLAVOR-2 adds the regrade mode and renames the grade id; the two-side and trio outputs are otherwise the tool's at the
+        #319 merge (758e978e), byte for byte. The base tool's FILM_GRADE_ID is set to film-v2 in memory (the one intended change), so both
+        accept the same Film side."""
+        base_dir = self.tmp / "v1-merge-tool"
+        base_dir.mkdir()
+        for rel in ("tools/profiling/look-flavor-diff.py", "tools/profiling/make-contact-sheet.py"):
+            show = subprocess.run(["git", "-C", str(ROOT), "show", f"{FILM_V1_MERGE}:{rel}"], capture_output=True, timeout=60)
+            if show.returncode != 0:
+                self.skipTest(f"base commit {FILM_V1_MERGE[:12]} is not in this clone (shallow checkout)")
+            data = show.stdout
+            if rel.endswith("look-flavor-diff.py"):
+                self.assertEqual(data.count(b'FILM_GRADE_ID = "film-v1"'), 1)
+                data = data.replace(b'FILM_GRADE_ID = "film-v1"', b'FILM_GRADE_ID = "film-v2"')
+            (base_dir / Path(rel).name).write_bytes(data)
+        tiles = {"classic": {0: tile(70), 1: tile(71, letterbox=4)}, "cinematic": {0: tile(72), 1: tile(73, letterbox=4)}}
+        tiles["film"] = {i: graded(a) for i, a in tiles["cinematic"].items()}
+        frames = {"classic": {0: 30, 1: 75}, "cinematic": {0: 31, 1: 70}, "film": {0: 33, 1: 90}}
+        trio, pair = [], []
+        for tool in (TOOL, base_dir / "look-flavor-diff.py"):
+            proc, out = self.run_trio(tiles, tool=tool, frames=frames)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            trio.append((proc.stdout.replace(str(out), "<OUT>"), FlavorDiffComposeTests.tree_hashes(out)))
+            self.runs += 1
+            run = self.tmp / f"twoside-v1merge{self.runs}"
+            stage = run / ".claude-state" / "stage"
+            cla_dir, cla_list = self.make_side(stage, "classic", tiles["classic"], frames["classic"])
+            cin_dir, cin_list = self.make_side(stage, "cinematic", tiles["cinematic"], frames["cinematic"])
+            sliders = {}
+            for side, doc in (("classic", CLASSIC), ("cinematic", CINEMATIC)):
+                sliders[side] = stage / f"sliders-{side}.json"
+                sliders[side].write_text(json.dumps(doc), encoding="utf-8")
+            pout = run / ".claude-state" / "pair"
+            proc = subprocess.run([sys.executable, str(tool),
+                                   "--classic-frames", str(cla_dir), "--classic-listed", str(cla_list), "--classic-sliders", str(sliders["classic"]),
+                                   "--classic-flavor-reported", "classic", "--classic-receipt-id", "r-classic",
+                                   "--cinematic-frames", str(cin_dir), "--cinematic-listed", str(cin_list), "--cinematic-sliders", str(sliders["cinematic"]),
+                                   "--cinematic-flavor-reported", "cinematic", "--cinematic-receipt-id", "r-cinematic",
+                                   "--clip-id", "M16-1243", "--venue", "bachelor", "--build-sha", "0123456789ab", "--out-dir", str(pout)],
+                                  capture_output=True, text=True, timeout=300)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            pair.append((proc.stdout.replace(str(pout), "<OUT>"), FlavorDiffComposeTests.tree_hashes(pout)))
+        self.assertEqual(trio[0][1], trio[1][1], "every trio output file is byte-identical to the #319 merge's tool")
+        self.assertEqual(trio[0][0], trio[1][0])
+        self.assertEqual(pair[0][1], pair[1][1], "every two-side output file is byte-identical to the #319 merge's tool")
+        self.assertEqual(pair[0][0], pair[1][0])
+
+
+# LOOK-ASSIST-FILM-FLAVOR-2: the regrade mode (Cinematic | v1 re-grade | v2 re-grade, frame-locked) --------------------------------------
+FILM_V1_MERGE = "758e978e8c1488c5f0e6dafc941b8de30c2ed839"
+STATE_OFF = {"agx": False, "lut": False, "filter": False, "source": "synthetic"}
+
+
+def table_bytes(y, r, g, b):
+    """Four 65536-entry tables as the pipeline test dumps them: uint16 little-endian, Y R G B."""
+    import numpy as np
+    return b"".join(np.asarray(t, dtype="<u2").tobytes() for t in (y, r, g, b))
+
+
+def identity_tables():
+    import numpy as np
+    ident = np.arange(65536)
+    return table_bytes(ident, ident, ident, ident)
+
+
+def known_tables(lift, split):
+    """A Y lift and a split (R down / B up below mid-grey, the reverse above), different per channel, so a swap or a skipped Y is visible."""
+    import numpy as np
+    v = np.arange(65536, dtype=np.float64)
+    sign = np.where(v < 32768, -1.0, 1.0)
+    y = np.clip(lift + v * (65535.0 - lift) / 65535.0, 0, 65535).astype(np.int64)
+    r = np.clip(v + sign * split, 0, 65535).astype(np.int64)
+    g = np.clip(v + 0.15 * split, 0, 65535).astype(np.int64)
+    b = np.clip(v - sign * split, 0, 65535).astype(np.int64)
+    return table_bytes(y, r, g, b)
+
+
+def independent_regrade(arr, data):
+    """The re-grade, computed independently: Y then the channel table at index c * 257, back by round(v / 257)."""
+    import numpy as np
+    t = np.frombuffer(data, dtype="<u2").reshape(4, 65536).astype(np.int64)
+    out = np.empty(arr.shape, dtype=np.uint8)
+    for c in range(3):
+        v = t[c + 1][t[0][arr[..., c].astype(np.int64) * 257]]
+        out[..., c] = np.floor(v / 257.0 + 0.5).astype(np.uint8)
+    return out
+
+
+class FlavorRegradeHarness(FlavorDiffHarness):
+    def run_regrade(self, tiles: dict, v1: bytes | None, v2: bytes | None, *, state=STATE_OFF, film: dict | None = None,
+                    frames: dict | None = None, extra=(), out_dir: Path | None = None):
+        self.runs += 1
+        run = self.tmp / f"regrade{self.runs}"
+        stage = run / ".claude-state" / "stage"
+        cin_dir, cin_list = self.make_side(stage, "cinematic", tiles, (frames or {}).get("cinematic"))
+        state_path = stage / "cinematic-state.json"
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        paths = {}
+        for name, data in (("v1", v1), ("v2", v2)):
+            paths[name] = stage / f"film-{name}-shade.u16"
+            if data is not None:
+                paths[name].write_bytes(data)
+        args = [sys.executable, str(TOOL), "regrade", "--cinematic-frames", str(cin_dir), "--cinematic-listed", str(cin_list),
+                "--cinematic-state", str(state_path), "--v1-table", str(paths["v1"]), "--v2-table", str(paths["v2"]),
+                "--cinematic-receipt-id", "r-cinematic", "--clip-id", "M16-1243", "--venue", "bachelor", "--build-sha", "0123456789ab"]
+        if film is not None:
+            fd, fl = self.make_side(stage, "film", film, (frames or {}).get("film"))
+            args += ["--film-frames", str(fd), "--film-listed", str(fl), "--film-receipt-id", "r-film"]
+        out = out_dir if out_dir is not None else run / ".claude-state" / "regrade"
+        args += ["--out-dir", str(out), *extra]
+        return subprocess.run(args, capture_output=True, text=True, timeout=300), out
+
+
+class FlavorRegradeRefusalTests(FlavorRegradeHarness):
+    def test_a_missing_or_short_table_is_a_typed_refusal_not_a_traceback(self) -> None:
+        for v1, v2, missing in ((None, b"\0" * (4 * 65536 * 2), "v1"), (b"\0" * (4 * 65536 * 2), None, "v2"), (b"\0" * 100, b"\0" * (4 * 65536 * 2), "v1")):
+            with self.subTest(missing=missing, short=v1 is not None and len(v1) == 100):
+                proc, out = self.run_regrade({0: None}, v1, v2)
+                self.assertEqual(proc.returncode, 19, proc.stdout + proc.stderr)
+                self.assertTrue(proc.stderr.startswith("REGRADE_TABLE_INVALID"), proc.stderr)
+                self.assertIn(f"the {missing} table", proc.stderr)
+                self.assertNotIn("Traceback", proc.stderr)
+                self.assertEqual(self.pngs(out), [])
+
+    def test_a_cinematic_render_with_agx_lut_or_filter_on_is_regrade_invalid_and_writes_nothing(self) -> None:
+        for state in (dict(STATE_OFF, agx=True), dict(STATE_OFF, lut=True), dict(STATE_OFF, filter=True), {"source": "nothing said"}):
+            with self.subTest(state=state):
+                proc, out = self.run_regrade({0: None}, b"\0" * (4 * 65536 * 2), b"\0" * (4 * 65536 * 2), state=state)
+                self.assertEqual(proc.returncode, 18, proc.stdout + proc.stderr)
+                self.assertTrue(proc.stderr.startswith("REGRADE_INVALID"), proc.stderr)
+                self.assertFalse(out.exists() and any(out.iterdir()))
+
+    def test_an_out_dir_outside_claude_state_is_refused(self) -> None:
+        proc, out = self.run_regrade({0: None}, None, None, out_dir=self.tmp / "public" / "regrade")
+        self.assertEqual(proc.returncode, 13, proc.stdout + proc.stderr)
+        self.assertFalse(out.exists())
+
+
+@requires_imaging
+class FlavorRegradeComposeTests(FlavorRegradeHarness):
+    def test_identity_tables_reproduce_the_cinematic_capture_byte_for_byte(self) -> None:
+        import numpy as np
+        from PIL import Image
+        cin = {0: tile(80), 1: tile(81, letterbox=4)}
+        proc, out = self.run_regrade(cin, identity_tables(), identity_tables())
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("LOOK_FLAVOR_REGRADE_OK", proc.stdout)
+        for i, arr in cin.items():
+            for v in ("v1", "v2"):
+                with Image.open(out / f"regrade-{v}-{i:02d}.png") as im:
+                    self.assertTrue(np.array_equal(np.asarray(im.convert("RGB")), arr), f"{v} tile {i}")
+        m = json.loads((out / "regrade-metrics.json").read_text(encoding="utf-8"))
+        self.assertIs(m["valid"], True)
+        for t in m["tiles"]:
+            self.assertEqual((t["MAD"]["v1"], t["MAD"]["v2"]), (0.0, 0.0))
+            self.assertEqual((t["dS"]["v1"], t["dS"]["v2"]), (0.0, 0.0))
+
+    def test_known_tables_give_the_independently_computed_regrade_and_metrics(self) -> None:
+        import numpy as np
+        from PIL import Image
+        cin = {0: tile(82), 1: tile(83, letterbox=3)}
+        film = {i: graded(a) for i, a in cin.items()}
+        v1 = known_tables(lift=300, split=900)
+        v2 = known_tables(lift=1300, split=2300)
+        proc, out = self.run_regrade(cin, v1, v2, film=film, frames={"cinematic": {0: 30, 1: 70}, "film": {0: 34, 1: 99}})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        m = json.loads((out / "regrade-metrics.json").read_text(encoding="utf-8"))
+        with Image.open(out / "regrade-cinematic-v1-v2.png") as sheet:
+            self.assertEqual(sheet.size, (3840, 220 + 2 * (44 + round(1280 * H / W))))
+        ds = {"v1": [], "v2": []}
+        for t, i in zip(m["tiles"], (0, 1)):
+            keep = ~(independent_luma(cin[i]).max(axis=1) <= 2.0)
+            expected = {"v1": independent_regrade(cin[i], v1), "v2": independent_regrade(cin[i], v2)}
+            s_c, ga_c = independent_split_and_green(cin[i][keep])
+            for v in ("v1", "v2"):
+                with Image.open(out / f"regrade-{v}-{i:02d}.png") as im:
+                    self.assertTrue(np.array_equal(np.asarray(im.convert("RGB")), expected[v]), f"{v} tile {i} pixels")
+                s_v, ga_v = independent_split_and_green(expected[v][keep])
+                self.assertAlmostEqual(t[v]["S"], s_v, delta=1e-6, msg=f"S {v}")
+                self.assertAlmostEqual(t[v]["GA"], ga_v, delta=1e-6, msg=f"GA {v}")
+                self.assertAlmostEqual(t["dS"][v], s_v - s_c, delta=1e-6)
+                self.assertAlmostEqual(t["MAD"][v], independent_mad(expected[v][keep], cin[i][keep]), delta=1e-6)
+                ds[v].append(s_v - s_c)
+            self.assertAlmostEqual(t["film"]["MAD_v2_vs_film"], independent_mad(expected["v2"][keep], film[i][keep]), delta=1e-6)
+        self.assertEqual([t["film"]["frame_matched"] for t in m["tiles"]], [True, False])
+        self.assertAlmostEqual(m["dSRatioV2OverV1"], float(np.mean(ds["v2"]) / np.mean(ds["v1"])), delta=1e-6)
+        # the known v2 table is the stronger split, as built
+        self.assertGreater(m["means"]["dS"]["v2"], m["means"]["dS"]["v1"])
+
+    def test_illustrative_composes_an_invalid_regrade_marked_invalid(self) -> None:
+        cin = {0: tile(84)}
+        proc, out = self.run_regrade(cin, identity_tables(), identity_tables(), state=dict(STATE_OFF, agx=True), extra=("--illustrative",))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("valid=false", proc.stdout)
+        m = json.loads((out / "regrade-metrics.json").read_text(encoding="utf-8"))
+        self.assertIs(m["valid"], False)
+        self.assertTrue(any("agx" in r for r in m["invalidReasons"]))
+
+    def test_a_regrade_into_an_occupied_out_dir_is_refused(self) -> None:
+        shared = self.tmp / "occupied" / ".claude-state" / "regrade"
+        shared.mkdir(parents=True)
+        (shared / "regrade-metrics.json").write_bytes(b"earlier evidence")
+        proc, out = self.run_regrade({0: tile(85)}, identity_tables(), identity_tables(), out_dir=shared)
+        self.assertEqual(proc.returncode, 16, proc.stdout + proc.stderr)
+        self.assertEqual(sorted(p.name for p in out.iterdir()), ["regrade-metrics.json"])
 
 
 # the pair driver and the cooldown gate (pwsh) ----------------------------------------------------------------------------------------------
