@@ -75,7 +75,20 @@ param([string]$Venue, [string]$LegSpec, [string]$SourceCommit, [string]$BuildMan
 $leaf = Split-Path -Leaf $LegSpec
 if ($env:FAKE_LEG_LOG) { Add-Content -LiteralPath $env:FAKE_LEG_LOG -Value ("START {0} {1} {2}" -f [DateTime]::UtcNow.Ticks, $leaf, $PID) }
 if ($env:FAKE_LEG_SLEEP) { Start-Sleep -Milliseconds ([int]([double]$env:FAKE_LEG_SLEEP * 1000)) }
-'DVE_OUTCOME=PASS'
+# r1 (VENUE-CHAIN-UNHEALTHY-STREAK-STOP-1): FAKE_LEG_OUTCOMES = comma list of OUTCOME or OUTCOME:DETAIL, one per call (the last repeats), counted in FAKE_LEG_ROOT;
+# the leg prints DVE_OUTCOME / DVE_DETAIL / DVE_RECEIPT_PATH (<root>\receipts\CARD-1\<leg>\<venue>\rcpt-<n>.json) as Invoke-VenueLeg does. FAKE_LEG_DELETE_PATH is
+# removed by the leg (a file vanishing under a live chain).
+if ($env:FAKE_LEG_DELETE_PATH) { Remove-Item -LiteralPath $env:FAKE_LEG_DELETE_PATH -Force -ErrorAction SilentlyContinue }
+if ($env:FAKE_LEG_OUTCOMES) {
+    $oc = Join-Path $env:FAKE_LEG_ROOT 'fake-leg-outcome-count.txt'
+    $k = $(if (Test-Path -LiteralPath $oc) { [int](Get-Content -LiteralPath $oc) } else { 0 })
+    Set-Content -LiteralPath $oc -Value ($k + 1)
+    $items = @($env:FAKE_LEG_OUTCOMES -split ',')
+    $parts = ($items[[Math]::Min($k, $items.Count - 1)] -split ':', 2)
+    "DVE_OUTCOME=$($parts[0])"
+    if ($parts.Count -gt 1) { "DVE_DETAIL=$($parts[1])" }
+    "DVE_RECEIPT_PATH=$(Join-Path $env:FAKE_LEG_ROOT ('receipts\CARD-1\' + [IO.Path]::GetFileNameWithoutExtension($leaf) + '\' + $Venue + '\rcpt-' + ($k + 1) + '.json'))"
+} else { 'DVE_OUTCOME=PASS' }
 if ($env:FAKE_LEG_PRELOADS) {
     $root = $env:FAKE_LEG_ROOT
     $countFile = Join-Path $root 'fake-leg-count.txt'
@@ -217,14 +230,14 @@ class VenueChainRunnerTests(unittest.TestCase):
         e.update(extra)
         return e
 
-    def chain_args(self, run_dir: Path, specs: list[Path], *extra: str, runner: Path = RUNNER, deadline_sec: int = 120) -> list[str]:
+    def chain_args(self, run_dir: Path, specs: list[Path], *extra: str, runner: Path = RUNNER, deadline_sec: int = 120, quiet: Path | None = None) -> list[str]:
         return [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(runner), "-Venue", "bachelor",
                 "-LegSpec", ",".join(str(s) for s in specs), "-RunDir", str(run_dir), "-SourceCommit", SHA, "-BuildManifestSha256", MANIFEST,
-                "-ClaimDir", str(self.claims), "-QuietScript", str(self.fake_quiet), "-LegScript", str(self.fake_leg),
+                "-ClaimDir", str(self.claims), "-QuietScript", str(quiet or self.fake_quiet), "-LegScript", str(self.fake_leg),
                 "-CooldownSec", "0", "-ClaimPollSec", "1", "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=deadline_sec)), *extra]
 
-    def run_chain(self, run_dir: Path, specs: list[Path], *extra: str, env: dict | None = None, runner: Path = RUNNER, deadline_sec: int = 120) -> subprocess.CompletedProcess:
-        return subprocess.run(self.chain_args(run_dir, specs, *extra, runner=runner, deadline_sec=deadline_sec), capture_output=True, text=True, timeout=300, env=env or self.env())
+    def run_chain(self, run_dir: Path, specs: list[Path], *extra: str, env: dict | None = None, runner: Path = RUNNER, deadline_sec: int = 120, quiet: Path | None = None) -> subprocess.CompletedProcess:
+        return subprocess.run(self.chain_args(run_dir, specs, *extra, runner=runner, deadline_sec=deadline_sec, quiet=quiet), capture_output=True, text=True, timeout=300, env=env or self.env())
 
     def leg_calls(self) -> list[str]:
         return self.leg_log.read_text(encoding="utf-8").splitlines() if self.leg_log.exists() else []
@@ -556,6 +569,145 @@ class VenueChainRunnerTests(unittest.TestCase):
         win = [l for l in self.chain_log(rd) if " WINDOW " in l]
         self.assertTrue(win and "action=RUN_NOW reason=window-after-deadline" in win[0], win)
 
+    # ---------------------------------------------------------------- r1: VENUE-CHAIN-UNHEALTHY-STREAK-STOP-1 (+ folded VENUE-CHAIN-PROBE-SCRIPT-MISSING-NAMED-1)
+    K = "VENUE_UNHEALTHY:KEEPALIVE_FAILED"
+
+    def streak_chain(self, name: str, outcomes: list[str], *extra: str, specs: list[Path] | None = None, **env: str) -> tuple[subprocess.CompletedProcess, dict, list[str], Path]:
+        rd = self.case / name
+        legs = specs or self.specs
+        reps = ["-Repeats", str(max(1, -(-len(outcomes) // len(legs))))] if len(outcomes) > len(legs) else []
+        r = self.run_chain(rd, legs, *reps, *extra, env=self.env(FAKE_LEG_OUTCOMES=",".join(outcomes), **env))
+        return r, chain_result(r.stdout), self.chain_log(rd), rd
+
+    def started(self) -> int:
+        return len([c for c in self.leg_calls() if c.startswith("START")])
+
+    def test_three_identical_unhealthy_details_stop_the_chain_after_leg_3_with_exit_8(self) -> None:
+        r, res, log, _ = self.streak_chain("lane-K3", [self.K] * 6)
+        self.assertEqual(r.returncode, 8, r.stdout + r.stderr)
+        self.assertEqual((res["exitCode"], res["stopReason"], res["ran"], res["notRun"]), (8, "VENUE_UNHEALTHY_STREAK", 3, 3))
+        self.assertEqual([l["status"] for l in res["legs"]], ["RAN"] * 3 + ["NOT_RUN"] * 3)
+        self.assertEqual([l["outcomeDetail"] for l in res["legs"][:3]], ["KEEPALIVE_FAILED"] * 3)
+        self.assertTrue(all((l["verdict"], l["reason"]) == ("VENUE_UNHEALTHY_STREAK", "chain-stopped") for l in res["legs"][3:]), res["legs"])
+        self.assertEqual(self.started(), 3, "a leg ran after the streak stop")
+        self.assertTrue(any(re.search(r" LEG 01-fx-a-spec RAN .* detail=KEEPALIVE_FAILED$", l) for l in log), log)
+        stop = [l for l in log if " CHAIN_STOP " in l]
+        self.assertEqual(len(stop), 1, stop)
+        self.assertRegex(stop[0], r"CHAIN_STOP VENUE_UNHEALTHY_STREAK detail=KEEPALIVE_FAILED n=3 threshold=3 receipts=rcpt-1,rcpt-2,rcpt-3$")
+        for n in (4, 5, 6):
+            self.assertTrue(any(re.search(rf" LEG 0{n}-fx-\w-spec NOT_RUN VENUE_UNHEALTHY_STREAK reason=chain-stopped$", l) for l in log), log)
+        self.assertFalse(self.claim_path.exists())
+
+    def test_the_streak_threshold_is_the_parameter(self) -> None:
+        r, res, log, _ = self.streak_chain("lane-K2", [self.K] * 4, "-UnhealthyStreakStop", "2")
+        self.assertEqual((r.returncode, [l["status"] for l in res["legs"]]), (8, ["RAN", "RAN"] + ["NOT_RUN"] * 4), r.stdout)
+        self.assertEqual(self.started(), 2)
+        self.assertTrue(any("CHAIN_STOP VENUE_UNHEALTHY_STREAK detail=KEEPALIVE_FAILED n=2 threshold=2 receipts=rcpt-1,rcpt-2" in l for l in log), log)
+
+    def test_alternating_details_never_stop(self) -> None:
+        d = ["VENUE_UNHEALTHY:KEEPALIVE_FAILED", "VENUE_UNHEALTHY:DISPLAY_ASLEEP"] * 3
+        r, res, log, _ = self.streak_chain("lane-ALT", d)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(([l["status"] for l in res["legs"]], res["stopReason"]), (["RAN"] * 6, None))
+        self.assertEqual([l["outcomeDetail"] for l in res["legs"]], ["KEEPALIVE_FAILED", "DISPLAY_ASLEEP"] * 3)
+        self.assertFalse([l for l in log if " CHAIN_STOP " in l])
+
+    def test_a_different_detail_restarts_the_count_at_one(self) -> None:
+        d = ["VENUE_UNHEALTHY:KEEPALIVE_FAILED"] * 2 + ["VENUE_UNHEALTHY:DISPLAY_ASLEEP"] * 4
+        r, res, log, _ = self.streak_chain("lane-RST", d)
+        self.assertEqual(r.returncode, 8, r.stdout + r.stderr)
+        self.assertEqual(self.started(), 5)   # 2 x K, then 3 x DISPLAY_ASLEEP
+        self.assertTrue(any("detail=DISPLAY_ASLEEP n=3 threshold=3 receipts=rcpt-3,rcpt-4,rcpt-5" in l for l in log), log)
+
+    def test_an_intervening_pass_resets_the_count(self) -> None:
+        r, res, log, _ = self.streak_chain("lane-PASS", [self.K, self.K, "PASS", self.K, self.K, "PASS"])
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual([l["status"] for l in res["legs"]], ["RAN"] * 6)
+        self.assertEqual(res["stopReason"], None)
+        self.assertEqual([l.get("outcomeDetail") for l in res["legs"]], ["KEEPALIVE_FAILED", "KEEPALIVE_FAILED", None, "KEEPALIVE_FAILED", "KEEPALIVE_FAILED", None])
+        self.assertFalse([l for l in log if " CHAIN_STOP " in l])
+
+    def test_owner_only_details_stop_at_the_first_occurrence_whatever_the_threshold(self) -> None:
+        for detail in ("SCREENSAVER_SECURE_OWNER_ONLY", "SESSION_LOCKED", "SESSION_LOCKED_OWNER_ONLY"):
+            for extra in ((), ("-UnhealthyStreakStop", "50")):
+                with self.subTest(detail=detail, extra=extra):
+                    self.leg_log.unlink(missing_ok=True)
+                    (self.case / "fake-leg-outcome-count.txt").unlink(missing_ok=True)
+                    r, res, log, _ = self.streak_chain(f"lane-O-{detail}-{len(extra)}", [f"VENUE_UNHEALTHY:{detail}"] * 3, *extra)
+                    self.assertEqual(r.returncode, 8, r.stdout + r.stderr)
+                    self.assertEqual(([l["status"] for l in res["legs"]], self.started()), (["RAN", "NOT_RUN", "NOT_RUN"], 1))
+                    stop = [l for l in log if " CHAIN_STOP " in l]
+                    self.assertEqual(len(stop), 1, stop)
+                    self.assertIn(f"CHAIN_STOP VENUE_UNHEALTHY_STREAK detail={detail} n=1 ", stop[0])
+                    self.assertIn("receipts=rcpt-1 ownerOnly=1", stop[0])
+
+    def test_unhealthy_streak_stop_0_never_stops(self) -> None:
+        r, res, log, _ = self.streak_chain("lane-OFF", [self.K] * 6, "-UnhealthyStreakStop", "0")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(([l["status"] for l in res["legs"]], res["stopReason"], self.started()), (["RAN"] * 6, None, 6))
+        self.assertFalse([l for l in log if " CHAIN_STOP " in l])
+        # 0 is off for the owner-only details too
+        self.leg_log.unlink(missing_ok=True)
+        (self.case / "fake-leg-outcome-count.txt").unlink(missing_ok=True)
+        r, res, _, _ = self.streak_chain("lane-OFF-O", ["VENUE_UNHEALTHY:SESSION_LOCKED"] * 3, "-UnhealthyStreakStop", "0")
+        self.assertEqual((r.returncode, [l["status"] for l in res["legs"]]), (0, ["RAN"] * 3), r.stdout)
+
+    def test_leg_failed_and_not_run_legs_neither_count_nor_reset(self) -> None:
+        extra_spec = self.case / "fx-d.json"
+        extra_spec.write_text(json.dumps({"legId": "fx-d"}), encoding="utf-8")
+        four = [*self.specs, extra_spec]
+        # K, K, [fx-c exits 3: LEG_FAILED], K -> the third K is the third in a row, so the chain stops at leg 4 and exit 8 replaces 7
+        r, res, log, _ = self.streak_chain("lane-LF", [self.K, self.K, "PASS", self.K], specs=four, FAKE_LEG_FAIL_LEAF="fx-c.json", FAKE_LEG_FAIL_CODE="3")
+        self.assertEqual(r.returncode, 8, r.stdout + r.stderr)
+        self.assertEqual([l["status"] for l in res["legs"]], ["RAN", "RAN", "LEG_FAILED", "RAN"])
+        self.assertEqual(res["stopReason"], "VENUE_UNHEALTHY_STREAK")
+        self.assertTrue(any("detail=KEEPALIVE_FAILED n=3 threshold=3 receipts=rcpt-1,rcpt-2,rcpt-4" in l for l in log), log)
+        # K, K, [NOT_RUN: the venue was not measured, -OnUnknown Continue], K -> stops at leg 4; the higher-priority exit 6 is kept
+        self.leg_log.unlink(missing_ok=True)
+        (self.case / "fake-leg-outcome-count.txt").unlink(missing_ok=True)
+        r, res, log, _ = self.streak_chain("lane-NR", [self.K], "-OnUnknown", "Continue", specs=four, FAKE_QUIET_MODES="QUIET,QUIET,QUIET,QUIET,UNKNOWN,QUIET,QUIET")
+        self.assertEqual(r.returncode, 6, r.stdout + r.stderr)
+        self.assertEqual([l["status"] for l in res["legs"]], ["RAN", "RAN", "NOT_RUN", "RAN"])
+        self.assertEqual((res["exitCode"], res["stopReason"]), (6, "VENUE_UNHEALTHY_STREAK"))
+        self.assertTrue(any("n=3 threshold=3 receipts=rcpt-1,rcpt-2,rcpt-3" in l for l in log), log)
+
+    def test_unhealthy_without_a_detail_is_not_comparable_and_resets(self) -> None:
+        r, res, _, _ = self.streak_chain("lane-ND", ["VENUE_UNHEALTHY"] * 4, specs=[*self.specs, self.specs[0]])
+        self.assertEqual((r.returncode, [l["status"] for l in res["legs"]]), (0, ["RAN"] * 4), r.stdout)
+        self.assertTrue(all("outcomeDetail" not in l for l in res["legs"]))
+
+    def test_chains_with_no_unhealthy_legs_are_unchanged(self) -> None:
+        rd = self.case / "lane-PLAIN"
+        r = self.run_chain(rd, self.specs)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        res = chain_result(r.stdout)
+        self.assertEqual(([l["status"] for l in res["legs"]], res["stopReason"]), (["RAN"] * 3, None))
+        self.assertTrue(all("outcomeDetail" not in l for l in res["legs"]))
+        log = self.chain_log(rd)
+        self.assertFalse([l for l in log if " CHAIN_STOP " in l or " detail=" in l])
+
+    def test_mutation_streak_threshold_off_by_one_is_caught(self) -> None:
+        mut = self.mutated_runner("$streakIds.Count -ge $UnhealthyStreakStop", "$streakIds.Count -gt $UnhealthyStreakStop", count=1)
+        r = self.run_chain(self.case / "lane-KM", self.specs, env=self.env(FAKE_LEG_OUTCOMES=self.K), runner=mut)
+        self.assertEqual(r.returncode, 0, "the mutant must reproduce the defect: three identical unhealthy legs and no stop")
+        self.assertEqual(self.started(), 3)
+
+    def test_probe_script_vanishing_under_a_live_chain_is_named_not_undocumented_exit_64(self) -> None:
+        quiet = self.case / "vanishing-quiet.ps1"
+        shutil.copy2(self.fake_quiet, quiet)
+        rd = self.case / "lane-GONE"
+        # leg 1 runs, and deletes the probe script as it exits (the worktree was removed under the chain); leg 2's probe cannot launch
+        r = self.run_chain(rd, self.specs, quiet=quiet, env=self.env(FAKE_LEG_DELETE_PATH=str(quiet)))
+        self.assertEqual(r.returncode, 6, r.stdout + r.stderr)
+        res = chain_result(r.stdout)
+        self.assertEqual([l["status"] for l in res["legs"]], ["RAN", "NOT_RUN", "NOT_RUN"])
+        self.assertEqual((res["legs"][1]["verdict"], res["legs"][1]["reason"]), ("VENUE_QUIET_UNKNOWN", "PROBE_SCRIPT_MISSING"))
+        self.assertEqual(res["stopReason"], "VENUE_QUIET_UNKNOWN")
+        log = self.chain_log(rd)
+        self.assertTrue(any(re.search(r"LEG 02-fx-b-spec NOT_RUN VENUE_QUIET_UNKNOWN reason=PROBE_SCRIPT_MISSING phase=pre-claim", l) for l in log), log)
+        self.assertFalse([l for l in log if "undocumented-exit" in l], log)
+        self.assertEqual(self.started(), 1, "no leg and no retry after the probe script vanished")
+
     # ---------------------------------------------------------------- the contract stays in the file
     def test_runner_has_no_process_or_lane_scan_and_documents_its_exit_codes(self) -> None:
         text = RUNNER.read_text(encoding="utf-8")
@@ -563,8 +715,9 @@ class VenueChainRunnerTests(unittest.TestCase):
         for needle in ("Get-CimInstance", "Win32_Process", "receipt.json", "prompt.md"):
             self.assertNotIn(needle, text + mod, f"{needle}: a waiter must never treat another chain's WAITING as venue use; only a live claim blocks")
         header = "\n".join(l for l in text.splitlines() if l.startswith("#"))
-        for token in ("0 every leg ran", "2 usage", "3 DEADLINE", "4 GATE_UNREADABLE", "5 HOST_MISMATCH", "6 at least one leg was NOT_RUN VENUE_QUIET_UNKNOWN", "7 (r2) at least one leg process exited", "CHAIN_RESULT=<json>"):
+        for token in ("0 every leg ran", "2 usage", "3 DEADLINE", "4 GATE_UNREADABLE", "5 HOST_MISMATCH", "6 at least one leg was NOT_RUN VENUE_QUIET_UNKNOWN", "7 (r2) at least one leg process exited", "8 (r1, VENUE-CHAIN-UNHEALTHY-STREAK-STOP-1)", "CHAIN_RESULT=<json>"):
             self.assertIn(token, header)
+        self.assertIn("[ValidateRange(0, 50)][int]$UnhealthyStreakStop = 3", text)
         self.assertIn("IO.FileMode]::CreateNew", mod)
 
     def test_new_powershell_files_parse_and_are_ascii(self) -> None:

@@ -28,7 +28,9 @@
 # Exit codes (a leg's OUTCOME is never the exit code: read CHAIN_RESULT and the receipts): 0 every leg ran (Invoke-VenueLeg exited 0 for each); 2 usage (including a Wait-VenueQuiet usage
 # error); 3 DEADLINE (-DeadlineUtc passed before every leg ran: queue busy, a live claim, or a window; the rest are NOT_RUN DEADLINE); 4 GATE_UNREADABLE
 # and 5 HOST_MISMATCH from Wait-VenueQuiet (the chain stops); 6 at least one leg was NOT_RUN VENUE_QUIET_UNKNOWN; 7 (r2) at least one leg process exited
-# non-zero, so it is LEG_FAILED / outcome INVALID in CHAIN_RESULT whatever DVE_OUTCOME it printed (a higher-priority code above is kept).
+# non-zero, so it is LEG_FAILED / outcome INVALID in CHAIN_RESULT whatever DVE_OUTCOME it printed (a higher-priority code above is kept); 8 (r1, VENUE-CHAIN-UNHEALTHY-STREAK-STOP-1)
+# the chain stopped on a deterministic venue fault: -UnhealthyStreakStop consecutive RAN legs were VENUE_UNHEALTHY with the same DVE_DETAIL, or the first one carried an
+# owner-only detail; the rest are NOT_RUN VENUE_UNHEALTHY_STREAK. 8 replaces 0 or 7 (it stops the chain, 7 does not); codes 2-6 above are kept. 0 = the streak rule is off.
 # -QuietScript / -LegScript / -ClaimDir / -NowUtc are seams for the offline tests (tools/repo_hygiene/test_venue_chain_runner.py); production passes none.
 [CmdletBinding(DefaultParameterSetName = 'Chain')]
 param(
@@ -53,6 +55,7 @@ param(
     [Parameter(ParameterSetName = 'Chain')][ValidateRange(1, 3600)][int]$ClaimPollSec = 30,
     [Parameter(ParameterSetName = 'Chain')][string]$ChainLog = '',
     [Parameter(ParameterSetName = 'Chain')][switch]$PreferQuietWindows,
+    [Parameter(ParameterSetName = 'Chain')][ValidateRange(0, 50)][int]$UnhealthyStreakStop = 3,
     [Parameter(ParameterSetName = 'Table', Mandatory = $true)][switch]$QuietRateTable,
     [string]$ClaimDir = '',
     [string[]]$GateLogPath = @(),
@@ -146,10 +149,19 @@ if ($LegSet) {
 $results = [System.Collections.Generic.List[object]]::new()
 $exitCode = 0
 $stopReason = $null
+# VENUE-CHAIN-UNHEALTHY-STREAK-STOP-1: the running count of consecutive RAN legs that were VENUE_UNHEALTHY with the SAME DVE_DETAIL (and the receipts that formed it).
+# These details are owner-only (a retry cannot clear them): the first occurrence stops the chain whatever -UnhealthyStreakStop is (unless it is 0 = off).
+$ownerOnlyDetails = @('SCREENSAVER_SECURE_OWNER_ONLY', 'SESSION_LOCKED', 'SESSION_LOCKED_OWNER_ONLY')
+$streakDetail = $null
+$streakIds = [System.Collections.Generic.List[string]]::new()
 
 function Invoke-QuietProbe([string]$Name, [string]$Phase, [int]$MaxWaitSec) {
     # One Wait-VenueQuiet run. verdict: QUIET | COOLDOWN_UNMET | GATE_BUSY | GATE_UNREADABLE | HOST_MISMATCH | USAGE | VENUE_QUIET_UNKNOWN (not measured).
     $out = Join-Path $RunDir "quiet-$Name-$Phase.out.txt"
+    # VENUE-CHAIN-PROBE-SCRIPT-MISSING-NAMED-1: the probe script vanished after the start-up check (a worktree removed under a live chain): name it, do not launch.
+    if (-not (Test-Path -LiteralPath $QuietScript -PathType Leaf)) {
+        return [pscustomobject]@{ verdict = 'VENUE_QUIET_UNKNOWN'; code = 'none'; mean = $null; reason = 'PROBE_SCRIPT_MISSING'; waitedSec = $null; out = $out }
+    }
     $qArgs = @('-NoProfile', '-NonInteractive', '-File', $QuietScript, '-Venue', $Venue, '-WorkDir', (Join-Path $RunDir 'quiet'), '-GateLog', (Join-Path $RunDir 'gate.log'),
         '-ThresholdPercent', [string]$ThresholdPercent, '-MaxWaitSec', [string]$MaxWaitSec, '-RecheckSec', [string]$RecheckSec)
     & $pwshExe @qArgs *> $out
@@ -165,7 +177,7 @@ function Invoke-QuietProbe([string]$Name, [string]$Phase, [int]$MaxWaitSec) {
         4 { 'GATE_UNREADABLE' }
         5 { 'HOST_MISMATCH' }
         6 { $reason = $(if ($u -and $u -match '\breason=(\S+)') { $Matches[1] } else { 'exit6' }); 'VENUE_QUIET_UNKNOWN' }
-        default { $reason = "undocumented-exit-$code"; 'VENUE_QUIET_UNKNOWN' }
+        default { $reason = $(if ($code -eq 64 -and -not (Test-Path -LiteralPath $QuietScript -PathType Leaf)) { 'PROBE_SCRIPT_MISSING' } else { "undocumented-exit-$code" }); 'VENUE_QUIET_UNKNOWN' }
     }
     if ($v -and $v -match '\bmean=([0-9.]+)%') { $mean = [double]$Matches[1] }
     $waited = $(if (($v, $u | Where-Object { $_ }) -join ' ' -match '\bwaitedSec=(\d+)') { [int]$Matches[1] } else { $null })
@@ -274,6 +286,8 @@ foreach ($leg in $plan) {
             $outcome = $(if ($o -and $o -match '^DVE_OUTCOME=(\S+)') { $Matches[1] } else { 'NONE' })
             $p = $legLines | Where-Object { $_ -match '^DVE_RECEIPT_PATH=(.+)$' } | Select-Object -Last 1
             $receipt = $(if ($p -and $p -match '^DVE_RECEIPT_PATH=(.+)$') { $Matches[1].Trim() } else { $null })
+            $dl = $legLines | Where-Object { $_ -match '^DVE_DETAIL=' } | Select-Object -Last 1
+            $detail = $(if ($dl) { ($dl -replace '^DVE_DETAIL=', '').Trim() } else { '' })
             if ($legCode -ne 0) {
                 # Invoke-VenueLeg exits 0 whenever it wrote a receipt (any outcome, INVALID included); non-zero means it died without one. Whatever
                 # DVE_OUTCOME it printed before dying is not evidence: the leg is LEG_FAILED / INVALID, never RAN, and the chain exits 7. It goes on to the next leg.
@@ -283,8 +297,25 @@ foreach ($leg in $plan) {
             } else {
                 $preLoad = Get-LegPreLoadMean $receipt
                 $class = $(if ($re.verdict -ceq 'COOLDOWN_UNMET') { 'COOLDOWN_UNMET' } elseif ($null -eq $preLoad) { 'QUIET_PRELOAD_UNKNOWN' } elseif ($preLoad -le 30.0) { 'QUIET_PRELOAD_OK' } else { 'QUIET_PRELOAD_HIGH' })
-                Add-Result $leg 'RAN' @{ verdict = $re.verdict; quietMean = $re.mean; preClaimVerdict = $pre.verdict; preClaimMean = $pre.mean; preLoadMean = $preLoad; class = $class; outcome = $outcome; legExit = $legCode; receipt = $receipt }
-                L "LEG $($leg.name) RAN exit=$legCode outcome=$outcome verdict=$($re.verdict) quietMean=$(Format-Mean $re.mean) preLoadMean=$(Format-Mean $preLoad) class=$class receipt=$receipt"
+                $ranExtra = @{ verdict = $re.verdict; quietMean = $re.mean; preClaimVerdict = $pre.verdict; preClaimMean = $pre.mean; preLoadMean = $preLoad; class = $class; outcome = $outcome; legExit = $legCode; receipt = $receipt }
+                if ($detail) { $ranExtra['outcomeDetail'] = $detail }
+                Add-Result $leg 'RAN' $ranExtra
+                L "LEG $($leg.name) RAN exit=$legCode outcome=$outcome verdict=$($re.verdict) quietMean=$(Format-Mean $re.mean) preLoadMean=$(Format-Mean $preLoad) class=$class receipt=$receipt$(if ($detail) { " detail=$detail" })"
+                # VENUE-CHAIN-UNHEALTHY-STREAK-STOP-1: only a RAN leg counts or resets (LEG_FAILED / NOT_RUN never reach here). VENUE_UNHEALTHY with a detail extends the
+                # streak when the detail is the same, otherwise starts it at 1; anything else (a different outcome, or no detail to compare) resets it.
+                if ($UnhealthyStreakStop -gt 0) {
+                    $rid = $(if ($receipt) { [IO.Path]::GetFileNameWithoutExtension($receipt) } else { "leg:$($leg.name)" })
+                    if ($outcome -ceq 'VENUE_UNHEALTHY' -and $detail) {
+                        if ($detail -cne $streakDetail) { $streakDetail = $detail; $streakIds.Clear() }
+                        $streakIds.Add($rid)
+                    } else { $streakDetail = $null; $streakIds.Clear() }
+                    $ownerOnly = ($null -ne $streakDetail) -and ($ownerOnlyDetails -ccontains $streakDetail)
+                    if ($null -ne $streakDetail -and ($ownerOnly -or $streakIds.Count -ge $UnhealthyStreakStop)) {
+                        $stopReason = 'VENUE_UNHEALTHY_STREAK'
+                        if ($exitCode -eq 0 -or $exitCode -eq 7) { $exitCode = 8 }
+                        L "CHAIN_STOP VENUE_UNHEALTHY_STREAK detail=$streakDetail n=$($streakIds.Count) threshold=$UnhealthyStreakStop receipts=$($streakIds -join ',')$(if ($ownerOnly) { ' ownerOnly=1 (a retry cannot clear it)' })"
+                    }
+                }
             }
             $ran = $true
         } finally {
