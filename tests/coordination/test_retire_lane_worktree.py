@@ -929,7 +929,7 @@ def test_service_sid_owned_unreadable_cwd_process_created_after_the_worktree_is_
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-svc")
     prelude = CWD_UNREADABLE_FOR_EVERY_PID + _svc_rows(("$PID", "BITS", start, "Share Process", SVCHOST),
-                                                       ("$PID", "gpsvc", start, "Share Process", SVCHOST))
+                                                       ("$PID", "gpsvc", start, "Share Process", SVCHOST)) + _key_written(wt, -60)
     d = _gate_with_snapshot(wt, _svchost_row(wt), prelude=prelude)
     assert (d["action"], d["reason"]) == ("would-retire", "ok"), d
     assert d["cwdUnknown"] == [] and d["cwdOwnerProbe"] == "scm", d
