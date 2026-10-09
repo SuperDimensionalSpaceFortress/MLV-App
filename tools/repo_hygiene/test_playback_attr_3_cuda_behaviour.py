@@ -7094,16 +7094,26 @@ namespace MLVAppAttrCudaDisplayWake
         public string OpenInputDesktopError; public string SetThreadDesktopError; public string SendInputError; public string CloseDesktopError;
         public bool ThreadJoined; public string DesktopName; public bool DesktopNameRefused;
         public bool? ScreensaverRunningAtInject; public bool? ScreensaverSecureAtInject; public bool SecureRefused;
+        public bool? SessionLockedAtInject; public bool SessionLockRefused;
     }
     public static class InputDesktopNudge
     {
         public static int RunCalls;
+        // r2: what the real thread's last lock read (just before SendInput) found. 0 = unlocked (the
+        // fake "sends"), 1 = locked, 2 = unreadable; 1 and 2 refuse the way the real Run does.
+        public static int LockAtInject;
         public static InputDesktopNudgeResult Run(int joinTimeoutMilliseconds)
         {
             System.Threading.Interlocked.Increment(ref RunCalls);
             InputDesktopNudgeResult r = new InputDesktopNudgeResult();
             r.ThreadJoined = true;
             r.DesktopName = "Default";
+            if (LockAtInject != 0)
+            {
+                r.SessionLockRefused = true;
+                r.SessionLockedAtInject = LockAtInject == 1 ? (bool?)true : null;
+                r.SendInputError = "ATTRCUDA_SESSION_LOCKED_OWNER_ONLY reason=" + (LockAtInject == 1 ? "session_locked" : "session_lock_unknown") + " (fake)";
+            }
             return r;
         }
     }
@@ -7363,10 +7373,15 @@ class SessionLockedJobAndLoopShapeTests(unittest.TestCase):
         self.assertIn("exit 30", block)
 
     def test_exit_30_is_named_in_the_header_and_used_once(self) -> None:
+        # "Used once" = used for one result only. r2 (sol blocker 2): the claim gate plus the three
+        # keep-alive checkpoints, and every one of the four is a SESSION_LOCKED_OWNER_ONLY exit.
         header = self.job[:self.job.index("[CmdletBinding()]")]
         self.assertIn("exit 30 = SESSION_LOCKED_OWNER_ONLY", header)
         exits = re.findall(r"(?m)^\s*exit\s+(\d+)\s*$", self.job)
-        self.assertEqual(exits.count("30"), 1, "exit 30 is SESSION_LOCKED_OWNER_ONLY only")
+        self.assertEqual(exits.count("30"), 4, "exit 30: the claim gate and the three keep-alive checkpoints")
+        for m in re.finditer(r"(?m)^\s*exit\s+30\s*$", self.job):
+            preceding = self.job[:m.start()].rstrip().rsplit("\n", 1)[-1]
+            self.assertIn('Write-Output "RESULT=SESSION_LOCKED_OWNER_ONLY ', preceding, "exit 30 is SESSION_LOCKED_OWNER_ONLY only")
 
     def test_the_job_embeds_the_lock_read(self) -> None:
         # Spliced inside its own sentinel brackets (test_dual_venue_evidence's byte-identity strip removes it).
@@ -7399,6 +7414,394 @@ class SessionLockedJobAndLoopShapeTests(unittest.TestCase):
                        "if ($sessionFlags -eq 0) { return $true }", "if ($sessionFlags -eq 1) { return $false }",
                        "WTSFreeMemory($buffer)"):
             self.assertIn(needle, fn)
+
+
+# --------------------------------------------------------------------------------------------
+# VENUE-SESSION-LOCKED-REFUSAL-1 r2 (sol r1b blockers 1 and 2). Blocker 1: the lock read was taken
+# before the screen-saver probes, so a lock arriving during them still reached SendInput. Blocker 2:
+# a lock refused by the keep-alive ended the job KEEPALIVE_FAILED (exit 26), not owner-only.
+# The lock state lives in a static field so a fake probe can flip it, and so it survives the fresh
+# Runspace every bounded keep-alive probe runs in.
+# --------------------------------------------------------------------------------------------
+
+_LATE_LOCK_STATE = (
+    "Add-Type -TypeDefinition 'namespace MLVAppTestLateLock { public static class State "
+    "{ public static int Value; public static int Reads; public static int RunningNull; } }'\n"
+    # 0 = unlocked, 1 = locked, anything else = unknown
+    "function Get-AttrCudaSessionLocked { [MLVAppTestLateLock.State]::Reads++; "
+    "switch ([MLVAppTestLateLock.State]::Value) { 0 { $false } 1 { $true } default { $null } } }\n"
+    "function Wait-Until([scriptblock]$Condition, [int]$Seconds = 45) { "
+    "$deadline = [DateTime]::UtcNow.AddSeconds($Seconds); "
+    "while (-not (& $Condition) -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 50 }; [bool](& $Condition) }\n"
+)
+
+
+def _extract_then_append(case: unittest.TestCase, tmp: Path, functions: list[str], body: str, timeout: int | None = None):
+    extract_script = tmp / "extract.ps1"
+    extract_script.write_text(
+        "$ErrorActionPreference = 'Stop'\n"
+        "Import-Module '" + str(MODULE) + "' -Force\n"
+        "$src = Get-AttrCudaEmbeddedFunctionSource -Name @(" + ",".join(f"'{n}'" for n in functions) + ")\n"
+        f"Set-Content -LiteralPath '{(tmp / 'extracted.ps1')}' -Value $src -Encoding utf8\n",
+        encoding="utf-8",
+    )
+    extract_proc = _run_pwsh_file(extract_script)
+    case.assertEqual(extract_proc.returncode, 0, extract_proc.stdout + extract_proc.stderr)
+    probe_script = tmp / "extracted.ps1"
+    with probe_script.open("a", encoding="utf-8") as f:
+        f.write("\n$ErrorActionPreference = 'Stop'\n" + _FAKE_WAKE_NATIVE_SURFACE + _LATE_LOCK_STATE + body)
+    if timeout is None:
+        return _run_pwsh_file(probe_script)
+    return _run_pwsh_file(probe_script, timeout=timeout)
+
+
+@requires_pwsh
+class SessionLockedLateLockWakeTests(unittest.TestCase):
+    """r2 blocker 1, claim wake: the lock is read again after every probe, again as the statement before
+    the plain SendInput, and the dedicated thread's own last read is honoured. A lock that arrives after
+    the first read sends nothing."""
+
+    _FUNCTIONS = ["Register-AttrCudaDisplayWakeNativeMethods", "Get-AttrCudaScreensaverRunning",
+                  "Get-AttrCudaScreensaverTimeoutSeconds", "Get-AttrCudaScreensaverActive",
+                  "Get-AttrCudaScreensaverSecure", "Wait-AttrCudaScreensaverDismissed",
+                  "Invoke-AttrCudaInputDesktopNudge", "Start-AttrCudaDisplayWake"]
+
+    def setUp(self) -> None:
+        if os.name != "nt":
+            self.skipTest("the ATTR-3 display wake is Windows-only (P/Invoke)")
+        self._tmp = tempfile.TemporaryDirectory(prefix="attr3-late-lock-wake-")
+        self.tmp = _long_path(Path(self._tmp.name))
+        self.addCleanup(self._tmp.cleanup)
+
+    def _wake(self, overrides: str) -> dict:
+        proc = _extract_then_append(self, self.tmp, self._FUNCTIONS, overrides + (
+            "$w = Start-AttrCudaDisplayWake\n"
+            "$out = [ordered]@{ wake = $w; "
+            "sendInputCalls = [MLVAppAttrCudaDisplayWake.NativeMethods]::SendInputCalls; "
+            "nudgeRunCalls = [MLVAppAttrCudaDisplayWake.InputDesktopNudge]::RunCalls; "
+            "lockReads = [MLVAppTestLateLock.State]::Reads }\n"
+            f"[IO.File]::WriteAllText('{(self.tmp / 'w.json')}', ($out | ConvertTo-Json -Depth 6))\n"))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return json.loads((self.tmp / "w.json").read_text(encoding="utf-8"))
+
+    def _assert_owner_only_locked(self, out: dict) -> None:
+        wake = out["wake"]
+        self.assertIs(wake["sessionLocked"], True, out)
+        self.assertTrue(wake["sendInputError"].startswith("ATTRCUDA_SESSION_LOCKED_OWNER_ONLY this session is locked"), wake)
+        self.assertIn("SessionLockedNoInputAttempted(sessionLocked=true)", wake["method"])
+        self.assertIs(wake["dismissFailed"], False)
+        self.assertIsNone(wake["dismissWait"])
+
+    def test_a_lock_arriving_during_the_screensaver_probe_sends_no_input(self) -> None:
+        # Sol's repro: the first read is unlocked, then the running probe flips the console to locked.
+        out = self._wake(
+            "function Get-AttrCudaScreensaverRunning { [MLVAppTestLateLock.State]::Value = 1; $false }\n"
+            "function Get-AttrCudaScreensaverSecure { $false }\n")
+        self.assertEqual(out["sendInputCalls"], 0, out)
+        self.assertEqual(out["nudgeRunCalls"], 0, out)
+        self._assert_owner_only_locked(out)
+
+    def test_a_lock_arriving_during_the_secure_probe_skips_the_dedicated_thread_nudge(self) -> None:
+        # Running screen saver (the dismiss path); the console locks while the secure state is read.
+        out = self._wake(
+            "function Get-AttrCudaScreensaverRunning { $true }\n"
+            "function Get-AttrCudaScreensaverSecure { [MLVAppTestLateLock.State]::Value = 1; $false }\n")
+        self.assertEqual(out["nudgeRunCalls"], 0, out)
+        self.assertEqual(out["sendInputCalls"], 0, out)
+        self._assert_owner_only_locked(out)
+        self.assertIsNone(out["wake"]["inputDesktopNudge"])
+
+    def test_the_plain_nudge_reads_the_lock_as_the_statement_before_send_input(self) -> None:
+        # The first two reads (claim, then after the probes) are unlocked; the third -- the read right
+        # before the plain SendInput -- is locked. Only that last read can stop this injection.
+        out = self._wake(
+            "function Get-AttrCudaSessionLocked { [MLVAppTestLateLock.State]::Reads++; "
+            "if ([MLVAppTestLateLock.State]::Reads -ge 3) { $true } else { $false } }\n"
+            "function Get-AttrCudaScreensaverRunning { $false }\n"
+            "function Get-AttrCudaScreensaverSecure { $false }\n")
+        self.assertEqual(out["sendInputCalls"], 0, out)
+        self.assertEqual(out["lockReads"], 3, out)
+        self._assert_owner_only_locked(out)
+
+    def test_a_refusal_by_the_dedicated_threads_own_lock_read_is_owner_only(self) -> None:
+        for lock_at_inject, expected_locked, text in ((1, True, "this session is locked"),
+                                                      (2, None, "could not be read; treated as locked")):
+            with self.subTest(lock_at_inject=lock_at_inject):
+                out = self._wake(
+                    f"[MLVAppAttrCudaDisplayWake.InputDesktopNudge]::LockAtInject = {lock_at_inject}\n"
+                    "$script:__r = 0\n"
+                    "function Get-AttrCudaScreensaverRunning { $script:__r++; $script:__r -le 1 }\n"
+                    "function Get-AttrCudaScreensaverSecure { $false }\n")
+                self.assertEqual(out["nudgeRunCalls"], 1, out)
+                self.assertEqual(out["sendInputCalls"], 0, out)
+                wake = out["wake"]
+                self.assertIs(wake["sessionLocked"], expected_locked, out)
+                self.assertTrue(wake["sendInputError"].startswith("ATTRCUDA_SESSION_LOCKED_OWNER_ONLY "), wake)
+                self.assertIn(text, wake["sendInputError"])
+                self.assertIs(wake["inputDesktopNudge"]["sessionLockRefused"], True)
+                self.assertIs(wake["dismissFailed"], False)
+                self.assertIsNone(wake["dismissWait"])
+
+
+@requires_pwsh
+class SessionLockedLateLockKeepAliveTests(unittest.TestCase):
+    """r2 blocker 1, keep-alive: a tick that would inject reads the lock again as its last step before
+    InputDesktopNudge.Run, and a refusal by that thread's own read is the same typed, sticky failure."""
+
+    _FUNCTIONS = ["Register-AttrCudaDisplayWakeNativeMethods", "Get-AttrCudaScreensaverRunning",
+                  "Get-AttrCudaScreensaverSecure", "Invoke-AttrCudaBoundedProbe",
+                  "Start-AttrCudaDisplayWakeKeepAlive", "Stop-AttrCudaDisplayWakeKeepAlive"]
+
+    def setUp(self) -> None:
+        if os.name != "nt":
+            self.skipTest("the ATTR-3 keep-alive is Windows-only (P/Invoke, drive-letter paths)")
+        self._tmp = tempfile.TemporaryDirectory(prefix="attr3-late-lock-keepalive-")
+        self.tmp = _long_path(Path(self._tmp.name))
+        self.addCleanup(self._tmp.cleanup)
+
+    def _run(self, body: str) -> dict:
+        proc = _extract_then_append(self, self.tmp, self._FUNCTIONS, body + (
+            "$out['runCalls'] = [MLVAppAttrCudaDisplayWake.InputDesktopNudge]::RunCalls\n"
+            "$out['sendInputCalls'] = [MLVAppAttrCudaDisplayWake.NativeMethods]::SendInputCalls\n"
+            f"[IO.File]::WriteAllText('{(self.tmp / 'r.json')}', ($out | ConvertTo-Json -Depth 5))\n"),
+            timeout=_KEEPALIVE_TEST_TIMEOUT_SECONDS)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return json.loads((self.tmp / "r.json").read_text(encoding="utf-8"))
+
+    def test_a_lock_arriving_during_the_tick_probes_gets_no_nudge(self) -> None:
+        # Sol's repro: the tick's first lock read is unlocked, then the running probe locks the console.
+        out = self._run(
+            "function Get-AttrCudaScreensaverRunning { [MLVAppTestLateLock.State]::Value = 1; $false }\n"
+            "function Get-AttrCudaScreensaverSecure { $false }\n"
+            "$h = Start-AttrCudaDisplayWakeKeepAlive -IntervalSeconds 1\n"
+            "$blocked = Wait-Until { [int]$h.nudgeState.failureCount -ge 2 }\n"
+            "$reason = $h.nudgeState.sessionLockReason\n"
+            "$r = Stop-AttrCudaDisplayWakeKeepAlive -Handle $h\n"
+            "$out = [ordered]@{ blocked = $blocked; reason = $reason; stop = $r }\n")
+        self.assertTrue(out["blocked"], out)
+        self.assertEqual(out["runCalls"], 0, out)
+        self.assertEqual(out["sendInputCalls"], 0, out)
+        self.assertEqual(out["stop"]["successCount"], 0, out)
+        self.assertIn("ATTRCUDA_KEEPALIVE_BLOCKED reason=session_locked ", out["stop"]["lastError"])
+        self.assertEqual(out["reason"], "session_locked")
+
+    def test_a_refusal_by_the_nudge_threads_own_lock_read_is_a_typed_sticky_failure(self) -> None:
+        out = self._run(
+            "[MLVAppAttrCudaDisplayWake.InputDesktopNudge]::LockAtInject = 2\n"
+            "function Get-AttrCudaScreensaverRunning { $false }\n"
+            "function Get-AttrCudaScreensaverSecure { $false }\n"
+            "$h = Start-AttrCudaDisplayWakeKeepAlive -IntervalSeconds 1\n"
+            "$blocked = Wait-Until { [int]$h.nudgeState.failureCount -ge 2 }\n"
+            "$reason = $h.nudgeState.sessionLockReason\n"
+            "$r = Stop-AttrCudaDisplayWakeKeepAlive -Handle $h\n"
+            "$out = [ordered]@{ blocked = $blocked; reason = $reason; stop = $r }\n")
+        self.assertTrue(out["blocked"], out)
+        self.assertGreaterEqual(out["runCalls"], 2, out)
+        self.assertEqual(out["sendInputCalls"], 0, out)
+        self.assertEqual(out["stop"]["successCount"], 0, out)
+        self.assertIn("ATTRCUDA_KEEPALIVE_BLOCKED reason=session_lock_unknown ", out["stop"]["lastError"])
+        self.assertEqual(out["reason"], "session_lock_unknown")
+
+    def test_a_hung_lock_probe_blocks_every_tick_as_unknown_and_stop_returns_promptly(self) -> None:
+        # Fable r1b hardening 2 (KEEPALIVE-HUNG-LOCK-PROBE-TEST-1): the bounded probe turns a lock read
+        # that never returns into unknown, every tick, and Stop is not held up by it.
+        out = self._run(
+            "function Get-AttrCudaSessionLocked { Start-Sleep -Seconds 60; $false }\n"
+            "function Get-AttrCudaScreensaverRunning { $false }\n"
+            "function Get-AttrCudaScreensaverSecure { $false }\n"
+            "$h = Start-AttrCudaDisplayWakeKeepAlive -IntervalSeconds 1 -ProbeTimeoutMilliseconds 500\n"
+            "$blocked = Wait-Until { [int]$h.nudgeState.failureCount -ge 2 }\n"
+            "$reason = $h.nudgeState.sessionLockReason\n"
+            "$sw = [System.Diagnostics.Stopwatch]::StartNew()\n"
+            "$r = Stop-AttrCudaDisplayWakeKeepAlive -Handle $h -TimeoutMilliseconds 3000\n"
+            "$sw.Stop()\n"
+            "$out = [ordered]@{ blocked = $blocked; reason = $reason; stop = $r; stopElapsedMs = $sw.ElapsedMilliseconds }\n")
+        self.assertTrue(out["blocked"], out)
+        self.assertEqual(out["runCalls"], 0, out)
+        self.assertEqual(out["sendInputCalls"], 0, out)
+        self.assertEqual(out["stop"]["successCount"], 0, out)
+        self.assertIn("ATTRCUDA_KEEPALIVE_BLOCKED reason=session_lock_unknown ", out["stop"]["lastError"])
+        self.assertLess(out["stopElapsedMs"], 10000, out)
+
+
+@requires_pwsh
+class SessionLockedKeepAliveCheckpointTests(unittest.TestCase):
+    """r2 blocker 2 (= fable r1b hardening 1): a lock refused by the keep-alive ends the job at its next
+    keep-alive checkpoint as SESSION_LOCKED_OWNER_ONLY with exit 30. Any other keep-alive failure keeps
+    KEEPALIVE_FAILED / exit 26. Runs the real keep-alive (fake native surface) and then the job's own
+    checkpoint text, lifted verbatim from the template, with Save-Json replaced by a recorder."""
+
+    _FUNCTIONS = ["Register-AttrCudaDisplayWakeNativeMethods", "Get-AttrCudaScreensaverRunning",
+                  "Get-AttrCudaScreensaverSecure", "Invoke-AttrCudaBoundedProbe",
+                  "Start-AttrCudaDisplayWakeKeepAlive", "Stop-AttrCudaDisplayWakeKeepAlive",
+                  "Get-AttrCudaDisplayWakeKeepAliveHealth"]
+    # (first line of the checkpoint, the text that follows its block)
+    _CHECKPOINTS = {
+        "start_of_measured_interval": ("$keepAliveHealthAtMeasurementStart = Get-AttrCudaDisplayWakeKeepAliveHealth",
+                                       "# OWNER-FOOTAGE-NO-HARDLINK-1"),
+        "before_smoke_launch": ("$keepAliveHealthBeforeSmokeLaunch = Get-AttrCudaDisplayWakeKeepAliveHealth", "$smokeRc = $null"),
+        "after_measured_interval": ("$keepAliveHealthAfterMeasuredInterval = Get-AttrCudaDisplayWakeKeepAliveHealth",
+                                    "# Backend-availability gate"),
+    }
+
+    def setUp(self) -> None:
+        if os.name != "nt":
+            self.skipTest("the ATTR-3 keep-alive is Windows-only (P/Invoke, drive-letter paths)")
+        self._tmp = tempfile.TemporaryDirectory(prefix="attr3-lock-checkpoint-")
+        self.tmp = _long_path(Path(self._tmp.name))
+        self.addCleanup(self._tmp.cleanup)
+
+    def _checkpoint(self, name: str, *, lock_value: int | None = None, running_null: bool = False):
+        job = ATTRIBUTION_GENERATOR.read_text(encoding="utf-8")
+        first, after = self._CHECKPOINTS[name]
+        start = job.index(first)
+        block = job[start:job.index(after, start)]
+        flip = (f"[MLVAppTestLateLock.State]::Value = {lock_value}\n" if lock_value is not None else "") + \
+               ("[MLVAppTestLateLock.State]::RunningNull = 1\n" if running_null else "")
+        saved = self.tmp / "saved.json"
+        body = (
+            "function Get-AttrCudaScreensaverRunning { if ([MLVAppTestLateLock.State]::RunningNull -eq 1) { $null } else { $false } }\n"
+            "function Get-AttrCudaScreensaverSecure { $false }\n"
+            "[MLVAppTestLateLock.State]::Value = 0\n"
+            "$h = Start-AttrCudaDisplayWakeKeepAlive -IntervalSeconds 1\n"
+            "if (-not (Wait-Until { [int]$h.nudgeState.successCount -ge 1 })) { throw 'no unlocked tick succeeded' }\n"
+            + flip +
+            "if (-not (Wait-Until { [int]$h.nudgeState.failureCount -ge 3 })) { throw 'three failed ticks never arrived' }\n"
+            "[void](Stop-AttrCudaDisplayWakeKeepAlive -Handle $h)\n"
+            "$displayWakeKeepAlive = $h\n"
+            "$displayWake = [ordered]@{ attempted = $true }\n"
+            f"$FixtureRehearsal = $true; $SourceCommit = 'r2test'; $ClipId = 'clip'; $Pub = '{(self.tmp / 'pub')}'\n"
+            "$presentMonProc = $null; $PresentMonSessionName = 'r2test'\n"
+            f"$presentMonPath = '{(self.tmp / 'absent-presentmon.csv')}'\n"
+            f"function Save-Json($Object, $Path) {{ [IO.File]::WriteAllText('{saved}', ($Object | ConvertTo-Json -Depth 8)) }}\n"
+            "function Write-JobTrace { param($Message) }\n"
+            "function Stop-PresentMonCapture { param($Proc, $SessionName) "
+            "[ordered]@{ confirmedExited = $true; killError = $null; waitError = $null; postKillSessionTerminate = $null } }\n"
+            "function Format-PresentMonSessionTerminateText { param($Value) 'none' }\n"
+            "function Publish-AttrCudaFileCopy { param($Source, $Destination) $true }\n"
+            + block +
+            "\nWrite-Output 'CHECKPOINT_FELL_THROUGH'\nexit 0\n"
+        )
+        proc = _extract_then_append(self, self.tmp, self._FUNCTIONS, body, timeout=_KEEPALIVE_TEST_TIMEOUT_SECONDS)
+        summary = json.loads(saved.read_text(encoding="utf-8")) if saved.exists() else None
+        return proc, summary
+
+    def _assert_owner_only(self, name: str, proc, summary, reason: str) -> None:
+        self.assertEqual(proc.returncode, 30, proc.stdout + proc.stderr)
+        self.assertIn(f"RESULT=SESSION_LOCKED_OWNER_ONLY CHECKPOINT={name} REASON={reason} ", proc.stdout)
+        self.assertNotIn("KEEPALIVE_FAILED", proc.stdout)
+        self.assertEqual(summary["result"], "SESSION_LOCKED_OWNER_ONLY", summary)
+        self.assertEqual(summary["keepAliveCheckpoint"], name)
+        self.assertEqual(summary["sessionLockReason"], reason)
+        self.assertGreaterEqual(summary["displayWake"]["keepAliveHealth"]["successCount"], 1)
+
+    def test_a_mid_leg_lock_at_the_measurement_start_checkpoint_is_owner_only_exit_30(self) -> None:
+        # Sol's repro: one unlocked success, then three ticks refused reason=session_locked.
+        proc, summary = self._checkpoint("start_of_measured_interval", lock_value=1)
+        self._assert_owner_only("start_of_measured_interval", proc, summary, "session_locked")
+
+    def test_an_unknown_lock_mid_leg_is_owner_only_exit_30(self) -> None:
+        proc, summary = self._checkpoint("start_of_measured_interval", lock_value=2)
+        self._assert_owner_only("start_of_measured_interval", proc, summary, "session_lock_unknown")
+
+    def test_a_non_lock_keepalive_failure_stays_keepalive_failed_exit_26(self) -> None:
+        # Unchanged: an unreadable screen-saver state (state_unknown) on an unlocked console.
+        proc, summary = self._checkpoint("start_of_measured_interval", running_null=True)
+        self.assertEqual(proc.returncode, 26, proc.stdout + proc.stderr)
+        self.assertIn("RESULT=KEEPALIVE_FAILED CHECKPOINT=start_of_measured_interval ", proc.stdout)
+        self.assertEqual(summary["result"], "KEEPALIVE_FAILED", summary)
+        self.assertIn("reason=state_unknown", summary["displayWake"]["keepAliveHealth"]["lastError"])
+        self.assertIsNone(summary["displayWake"]["keepAliveHealth"]["sessionLockReason"])
+
+    def test_the_before_smoke_launch_checkpoint_is_owner_only_exit_30(self) -> None:
+        proc, summary = self._checkpoint("before_smoke_launch", lock_value=1)
+        self._assert_owner_only("before_smoke_launch", proc, summary, "session_locked")
+        self.assertIs(summary["presentMonConfirmedExited"], True, "PresentMon is stopped first, as on KEEPALIVE_FAILED")
+
+    def test_the_after_measured_interval_checkpoint_is_owner_only_exit_30(self) -> None:
+        proc, summary = self._checkpoint("after_measured_interval", lock_value=1)
+        self._assert_owner_only("after_measured_interval", proc, summary, "session_locked")
+
+    def test_every_checkpoint_tests_the_lock_before_the_generic_keepalive_failure(self) -> None:
+        job = ATTRIBUTION_GENERATOR.read_text(encoding="utf-8")
+        for name, (first, after) in self._CHECKPOINTS.items():
+            with self.subTest(checkpoint=name):
+                start = job.index(first)
+                block = job[start:job.index(after, start)]
+                variable = first.split(" = ", 1)[0]
+                lock_at = block.index(f"if ({variable}.sessionLockReason) {{")
+                generic_at = block.index(f"if (-not {variable}.healthy) {{")
+                self.assertLess(lock_at, generic_at)
+                lock_block = block[lock_at:generic_at]
+                self.assertIn("result='SESSION_LOCKED_OWNER_ONLY'", lock_block)
+                self.assertIn(f"keepAliveCheckpoint='{name}'", lock_block)
+                self.assertIn("exit 30", lock_block)
+                self.assertNotIn("exit 26", lock_block)
+
+
+class SessionLockedNativeLastReadShapeTests(unittest.TestCase):
+    """r2 blocker 1: InputDesktopNudge.Run reads the console lock on its own thread as the last step
+    before SendInput, refuses with no SendInput on locked or unknown, and the keep-alive tick re-reads
+    the lock after its screen-saver probes. Static, since a real locked console cannot be produced here."""
+
+    def setUp(self) -> None:
+        self.module = MODULE.read_text(encoding="utf-8")
+        start = self.module.index("public static InputDesktopNudgeResult Run(int joinTimeoutMilliseconds)")
+        self.run_body = self.module[start:self.module.index("'@ -ErrorAction Stop", start)]
+
+    def test_the_lock_read_is_the_last_read_before_send_input_and_refuses_before_it(self) -> None:
+        nudge_at = self.run_body.index("INPUT[] nudge = new INPUT[]")
+        read_at = self.run_body.index("bool? sessionLockedNow = NativeMethods.ReadSessionLocked();", nudge_at)
+        refuse_at = self.run_body.index("if (sessionLockedNow != false)", read_at)
+        return_at = self.run_body.index("return;", refuse_at)
+        send_at = self.run_body.index("NativeMethods.SendInput(", read_at)
+        self.assertLess(read_at, refuse_at)
+        self.assertLess(return_at, send_at)
+        # Nothing but the refusal sits between the read and SendInput: no other native call.
+        between = self.run_body[read_at:send_at]
+        self.assertEqual(between.count("NativeMethods."), 1, between)
+        self.assertIn("result.SessionLockRefused = true;", between)
+
+    def test_the_native_read_uses_the_measured_wtsinfoex_layout(self) -> None:
+        start = self.module.index("public static bool? ReadSessionLocked()")
+        fn = self.module[start:self.module.index("// VENUE-SESSION-LOCKED-REFUSAL-1 <<<", start)]
+        for needle in ("ProcessIdToSessionId(GetCurrentProcessId(), out sessionId)",
+                       "WTSQuerySessionInformationW(IntPtr.Zero, sessionId, 25, out buffer, out bytes)",
+                       "Marshal.ReadInt32(buffer, 0)", "Marshal.ReadInt32(buffer, 8)", "Marshal.ReadInt32(buffer, 16)",
+                       "if (level != 1 || (long)reportedSessionId != (long)sessionId) { return null; }",
+                       "if (sessionFlags == 0) { return true; }", "if (sessionFlags == 1) { return false; }",
+                       "WTSFreeMemory(buffer)"):
+            self.assertIn(needle, fn)
+
+    def test_the_tick_rereads_the_lock_after_its_probes_and_before_the_nudge(self) -> None:
+        loop_start = self.module.index("$loopScript = {")
+        loop = self.module[loop_start:self.module.index(
+            "# CUDA-PERF-DISPLAY-WAKE-3 round 1 (fable hardening): CreateRunspace/Open/BeginInvoke", loop_start)]
+        secure_at = loop.index("$tickSecure = Invoke-AttrCudaBoundedProbe")
+        reread_at = loop.index("$tickSessionLocked = Invoke-AttrCudaBoundedProbe -FunctionName 'Get-AttrCudaSessionLocked'", secure_at)
+        gate_at = loop.index("if ($tickSessionLocked -ne $false) {", reread_at)
+        run_at = loop.index("[MLVAppAttrCudaDisplayWake.InputDesktopNudge]::Run(", gate_at)
+        self.assertLess(secure_at, reread_at)
+        self.assertLess(reread_at, gate_at)
+        self.assertLess(gate_at, run_at)
+
+
+@requires_pwsh
+class SessionLockedNativeReadAgreesTests(_PwshCase):
+    """r2: the native in-thread read and Get-AttrCudaSessionLocked agree on this host. Read-only; nothing
+    is sent (Run is never called)."""
+
+    def test_the_native_read_matches_the_powershell_read(self) -> None:
+        proc = self.run_with_module(
+            "[void](Register-AttrCudaDisplayWakeNativeMethods)\n"
+            "$n = [MLVAppAttrCudaDisplayWake.NativeMethods]::ReadSessionLocked()\n"
+            "$p = Get-AttrCudaSessionLocked\n"
+            "Write-Output \"NATIVE=$($null -eq $n ? 'NULL' : $n) PS=$($null -eq $p ? 'NULL' : $p)\"\n"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        m = re.search(r"NATIVE=(\w+) PS=(\w+)", proc.stdout)
+        self.assertIsNotNone(m, proc.stdout)
+        self.assertEqual(m.group(1), m.group(2), proc.stdout)
 
 
 # --------------------------------------------------------------------------------------------

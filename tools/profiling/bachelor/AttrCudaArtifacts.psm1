@@ -4702,6 +4702,58 @@ function Register-AttrCudaDisplayWakeNativeMethods {
             // the PowerShell tick's own probe read and this thread's SendInput.
             [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Auto)]
             public static extern bool GetUserObjectInformation(IntPtr hObj, int nIndex, StringBuilder pvInfo, int nLength, out int lpnLengthNeeded);
+            // VENUE-SESSION-LOCKED-REFUSAL-1 >>>
+            // r2 (sol blocker 1): the console-lock read InputDesktopNudge.Run makes from inside its
+            // dedicated thread, immediately before SendInput -- the same WTSSessionInfoEx read
+            // Get-AttrCudaSessionLocked makes, on the thread that injects.
+            [DllImport("kernel32.dll")]
+            public static extern uint GetCurrentProcessId();
+
+            [DllImport("kernel32.dll", SetLastError = true)]
+            public static extern bool ProcessIdToSessionId(uint dwProcessId, out uint pSessionId);
+
+            [DllImport("wtsapi32.dll", SetLastError = true)]
+            public static extern bool WTSQuerySessionInformationW(IntPtr hServer, uint sessionId, int wtsInfoClass, out IntPtr ppBuffer, out uint pBytesReturned);
+
+            [DllImport("wtsapi32.dll")]
+            public static extern void WTSFreeMemory(IntPtr pMemory);
+
+            // true = locked, false = unlocked, null = could not be read. Same WTSINFOEXW layout and
+            // checks as Get-AttrCudaSessionLocked: Level 1 at 0, SessionId at 8, SessionFlags at 16
+            // (0 = WTS_SESSIONSTATE_LOCK, 1 = WTS_SESSIONSTATE_UNLOCK, anything else unknown).
+            public static bool? ReadSessionLocked()
+            {
+                try
+                {
+                    uint sessionId;
+                    if (!ProcessIdToSessionId(GetCurrentProcessId(), out sessionId)) { return null; }
+                    IntPtr buffer;
+                    uint bytes;
+                    // WTS_CURRENT_SERVER_HANDLE = 0; WTSSessionInfoEx = 25.
+                    if (!WTSQuerySessionInformationW(IntPtr.Zero, sessionId, 25, out buffer, out bytes)) { return null; }
+                    if (buffer == IntPtr.Zero) { return null; }
+                    try
+                    {
+                        if (bytes < 20) { return null; }
+                        int level = Marshal.ReadInt32(buffer, 0);
+                        int reportedSessionId = Marshal.ReadInt32(buffer, 8);
+                        int sessionFlags = Marshal.ReadInt32(buffer, 16);
+                        if (level != 1 || (long)reportedSessionId != (long)sessionId) { return null; }
+                        if (sessionFlags == 0) { return true; }
+                        if (sessionFlags == 1) { return false; }
+                        return null;
+                    }
+                    finally
+                    {
+                        WTSFreeMemory(buffer);
+                    }
+                }
+                catch
+                {
+                    return null;
+                }
+            }
+            // VENUE-SESSION-LOCKED-REFUSAL-1 <<<
         }
 
         // CUDA-PERF-DISPLAY-WAKE-2 round 1c. Invoking a PowerShell scriptblock on a raw
@@ -4739,6 +4791,12 @@ function Register-AttrCudaDisplayWakeNativeMethods {
             public bool? ScreensaverRunningAtInject;
             public bool? ScreensaverSecureAtInject;
             public bool SecureRefused;
+            // VENUE-SESSION-LOCKED-REFUSAL-1 >>>
+            // r2 (sol blocker 1): the console-lock state this thread read immediately before
+            // SendInput (null when unreadable), and whether that read refused the injection.
+            public bool? SessionLockedAtInject;
+            public bool SessionLockRefused;
+            // VENUE-SESSION-LOCKED-REFUSAL-1 <<<
         }
 
         public static class InputDesktopNudge
@@ -4910,6 +4968,25 @@ function Register-AttrCudaDisplayWakeNativeMethods {
                             new INPUT { type = (int)INPUT_KEYBOARD, ki = new KEYBDINPUT { wVk = VK_F15, wScan = 0, dwFlags = 0, time = 0, dwExtraInfo = IntPtr.Zero } },
                             new INPUT { type = (int)INPUT_KEYBOARD, ki = new KEYBDINPUT { wVk = VK_F15, wScan = 0, dwFlags = KEYEVENTF_KEYUP, time = 0, dwExtraInfo = IntPtr.Zero } }
                         };
+                        // VENUE-SESSION-LOCKED-REFUSAL-1 >>>
+                        // r2 (sol blocker 1): the console lock is read LAST, on this thread, as the
+                        // statement before SendInput. A lock that arrives after the caller's own read
+                        // (the PowerShell tick or claim) is caught here; a locked console's input
+                        // desktop still reads "Default", so the name gate above cannot see it. Only a
+                        // CONFIRMED unlocked session reaches SendInput. The window left is this one
+                        // WTS read to the SendInput call on the same thread; Windows has no atomic
+                        // check-and-inject, so it cannot be closed further from user mode.
+                        bool? sessionLockedNow = NativeMethods.ReadSessionLocked();
+                        result.SessionLockedAtInject = sessionLockedNow;
+                        if (sessionLockedNow != false)
+                        {
+                            result.SessionLockRefused = true;
+                            result.SendInputError = "ATTRCUDA_SESSION_LOCKED_OWNER_ONLY reason=" +
+                                (sessionLockedNow == null ? "session_lock_unknown" : "session_locked") +
+                                " console session lock state at inject time forbids SendInput; no SendInput attempted";
+                            return;
+                        }
+                        // VENUE-SESSION-LOCKED-REFUSAL-1 <<<
                         uint sent = NativeMethods.SendInput((uint)nudge.Length, nudge, Marshal.SizeOf(typeof(INPUT)));
                         if (sent != nudge.Length)
                         {
@@ -5231,6 +5308,10 @@ function Invoke-AttrCudaInputDesktopNudge {
             screensaverRunningAtInject = $null
             screensaverSecureAtInject = $null
             secureRefused = $false
+            # VENUE-SESSION-LOCKED-REFUSAL-1 >>>
+            sessionLockedAtInject = $null
+            sessionLockRefused = $false
+            # VENUE-SESSION-LOCKED-REFUSAL-1 <<<
         }
     }
 
@@ -5256,6 +5337,12 @@ function Invoke-AttrCudaInputDesktopNudge {
             screensaverRunningAtInject = $result.ScreensaverRunningAtInject
             screensaverSecureAtInject = $result.ScreensaverSecureAtInject
             secureRefused = [bool]$result.SecureRefused
+            # VENUE-SESSION-LOCKED-REFUSAL-1 >>>
+            # r2 (sol blocker 1): the lock state the dedicated thread read right before SendInput,
+            # and whether it refused on it. Read defensively: an older result shape has no such field.
+            sessionLockedAtInject = $(try { $result.SessionLockedAtInject } catch { $null })
+            sessionLockRefused = $(try { [bool]$result.SessionLockRefused } catch { $false })
+            # VENUE-SESSION-LOCKED-REFUSAL-1 <<<
         }
     } catch {
         [ordered]@{
@@ -5270,6 +5357,10 @@ function Invoke-AttrCudaInputDesktopNudge {
             screensaverRunningAtInject = $null
             screensaverSecureAtInject = $null
             secureRefused = $false
+            # VENUE-SESSION-LOCKED-REFUSAL-1 >>>
+            sessionLockedAtInject = $null
+            sessionLockRefused = $false
+            # VENUE-SESSION-LOCKED-REFUSAL-1 <<<
         }
     }
 }
@@ -5408,6 +5499,10 @@ function Start-AttrCudaDisplayWake {
     carries ATTRCUDA_SESSION_LOCKED_OWNER_ONLY, .dismissFailed stays $false, and the caller stops
     the leg with a typed SESSION_LOCKED_OWNER_ONLY result. Signing in is an owner action. An
     unlocked session behaves exactly as before; the only difference is the added .sessionLocked.
+    r2 (sol blocker 1): the first read is not the last. The lock is read again after every
+    screen-saver probe, again as the statement before the plain SendInput, and by the dedicated
+    nudge thread as its last step before its own SendInput. A lock found by any of them refuses the
+    same way, and .sessionLocked carries the read that refused.
     VENUE-SESSION-LOCKED-REFUSAL-1 <<<
     #>
     [CmdletBinding()]
@@ -5458,13 +5553,15 @@ function Start-AttrCudaDisplayWake {
     # A locked (or unprovably-unlocked) console: no input of any kind. A key or mouse event raises
     # the sign-in screen, and the secure desktop then takes the input desktop. The unchanged
     # screen-saver branches below run only for a CONFIRMED unlocked session.
-    if ($sessionLockedOwnerOnly) {
-        $sendInputError = if ($null -eq $sessionLocked) {
-            'ATTRCUDA_SESSION_LOCKED_OWNER_ONLY whether this session is locked could not be read; treated as locked -- no input sent -- signing in is an owner action'
-        } else {
-            'ATTRCUDA_SESSION_LOCKED_OWNER_ONLY this session is locked; no input sent -- signing in is an owner action'
-        }
-    } else {
+    # r2 (sol blocker 1): the first read above can be stale by now -- the console can lock while the
+    # screen-saver probes run. So the lock is read again here, after every probe and immediately
+    # before the branch that injects; the plain nudge reads it once more as the statement before
+    # SendInput, and the dedicated thread reads it as its last step before its own SendInput.
+    if (-not $sessionLockedOwnerOnly) {
+        try { $sessionLocked = Get-AttrCudaSessionLocked } catch { $sessionLocked = $null }
+        $sessionLockedOwnerOnly = ($sessionLocked -ne $false)
+    }
+    if (-not $sessionLockedOwnerOnly) {
     # VENUE-SESSION-LOCKED-REFUSAL-1 <<<
     if ($screensaverSecureOwnerOnly) {
         # A password-protected (or unprovably-not-password-protected) screen saver is a security
@@ -5482,6 +5579,13 @@ function Start-AttrCudaDisplayWake {
         $inputDesktopNudge = Invoke-AttrCudaInputDesktopNudge
         $sendInputError = @($inputDesktopNudge.openInputDesktopError, $inputDesktopNudge.setThreadDesktopError, $inputDesktopNudge.sendInputError) |
             Where-Object { $_ } | Select-Object -First 1
+        # VENUE-SESSION-LOCKED-REFUSAL-1 >>>
+        # r2: the dedicated thread found the console locked (or unreadable) at its last read and sent nothing.
+        if ($inputDesktopNudge.sessionLockRefused) {
+            $sessionLocked = $inputDesktopNudge.sessionLockedAtInject
+            $sessionLockedOwnerOnly = $true
+        }
+        # VENUE-SESSION-LOCKED-REFUSAL-1 <<<
     } elseif ($nativeAvailable) {
         try {
             $INPUT_MOUSE = 0
@@ -5491,6 +5595,17 @@ function Start-AttrCudaDisplayWake {
                 [MLVAppAttrCudaDisplayWake.INPUT]@{ type = $INPUT_MOUSE; mi = [MLVAppAttrCudaDisplayWake.MOUSEINPUT]@{ dx = -1; dy = 0; mouseData = 0; dwFlags = $MOUSEEVENTF_MOVE; time = 0; dwExtraInfo = [IntPtr]::Zero } }
             )
             $structSize = [System.Runtime.InteropServices.Marshal]::SizeOf([type][MLVAppAttrCudaDisplayWake.INPUT])
+            # VENUE-SESSION-LOCKED-REFUSAL-1 >>>
+            # r2: this nudge runs on this thread, so the lock is read here, as the statement before
+            # SendInput. Locked or unknown: no SendInput (the throw lands in the catch below).
+            $sessionLockedAtInject = $null
+            try { $sessionLockedAtInject = Get-AttrCudaSessionLocked } catch { $sessionLockedAtInject = $null }
+            if ($sessionLockedAtInject -ne $false) {
+                $sessionLocked = $sessionLockedAtInject
+                $sessionLockedOwnerOnly = $true
+                throw 'ATTRCUDA_SESSION_LOCKED_OWNER_ONLY no SendInput attempted'
+            }
+            # VENUE-SESSION-LOCKED-REFUSAL-1 <<<
             $sent = [MLVAppAttrCudaDisplayWake.NativeMethods]::SendInput([uint32]$nudge.Count, $nudge, $structSize)
             if ($sent -ne $nudge.Count) {
                 $sendInputError = "SendInput sent $sent of $($nudge.Count) events (lastError=$([System.Runtime.InteropServices.Marshal]::GetLastWin32Error()))"
@@ -5502,6 +5617,15 @@ function Start-AttrCudaDisplayWake {
         $sendInputError = 'ATTRCUDA_DISPLAY_WAKE_NATIVE_UNAVAILABLE native P/Invoke type could not be loaded'
     }
     # VENUE-SESSION-LOCKED-REFUSAL-1 >>>
+    }
+    # Every lock refusal -- at the first read, at the re-read after the probes, before the plain
+    # SendInput, or inside the dedicated thread -- reports the same typed reason.
+    if ($sessionLockedOwnerOnly) {
+        $sendInputError = if ($null -eq $sessionLocked) {
+            'ATTRCUDA_SESSION_LOCKED_OWNER_ONLY whether this session is locked could not be read; treated as locked -- no input sent -- signing in is an owner action'
+        } else {
+            'ATTRCUDA_SESSION_LOCKED_OWNER_ONLY this session is locked; no input sent -- signing in is an owner action'
+        }
     }
     # VENUE-SESSION-LOCKED-REFUSAL-1 <<<
 
@@ -5685,6 +5809,10 @@ function Start-AttrCudaDisplayWakeKeepAlive {
     VENUE-SESSION-LOCKED-REFUSAL-1: every tick reads Get-AttrCudaSessionLocked FIRST (bounded, like
     the probes above). Anything but a CONFIRMED $false is a typed failure with no injection:
     ATTRCUDA_KEEPALIVE_BLOCKED reason=session_locked, or reason=session_lock_unknown.
+    r2: a tick that would inject reads the lock again after the screen-saver probes, as its last
+    step before InputDesktopNudge.Run, and that thread reads it once more before SendInput. Any lock
+    refusal also sets .nudgeState.sessionLockReason (sticky), which
+    Get-AttrCudaDisplayWakeKeepAliveHealth reports so the job ends the leg SESSION_LOCKED_OWNER_ONLY.
     VENUE-SESSION-LOCKED-REFUSAL-1 <<<
     .setupError is $null when the background pipeline started; non-$null means either
     CreateRunspace/Open/BeginInvoke itself failed (recorded, never thrown -- CUDA-PERF-
@@ -5725,6 +5853,9 @@ function Start-AttrCudaDisplayWakeKeepAlive {
                 lastError = $null
                 lastFailureUtc = $null
                 lastDesktopName = $null
+                # VENUE-SESSION-LOCKED-REFUSAL-1 >>>
+                sessionLockReason = $null
+                # VENUE-SESSION-LOCKED-REFUSAL-1 <<<
             })
             intervalSeconds = $IntervalSeconds
             nudgeJoinTimeoutMilliseconds = $NudgeJoinTimeoutMilliseconds
@@ -5744,6 +5875,10 @@ function Start-AttrCudaDisplayWakeKeepAlive {
         lastError = $null
         lastFailureUtc = $null
         lastDesktopName = $null
+        # VENUE-SESSION-LOCKED-REFUSAL-1 >>>
+        # r2: set (sticky) by any tick refused for a locked or unreadable console lock.
+        sessionLockReason = $null
+        # VENUE-SESSION-LOCKED-REFUSAL-1 <<<
     })
     $loopScript = {
         param($StopEvent, $IntervalSeconds, $NudgeState, $JoinTimeoutMilliseconds, $ProbeTimeoutMilliseconds)
@@ -5784,10 +5919,19 @@ function Start-AttrCudaDisplayWakeKeepAlive {
                 # Recorded as a typed failure like the screen-saver block below, so the job's next
                 # keep-alive checkpoint stops the leg. The unchanged branches below run only for a
                 # CONFIRMED unlocked session.
+                # r2 (sol blocker 1): the read at the top of the tick can be stale once the screen-saver
+                # probes have run, so a tick that would inject reads the lock again here, as its last
+                # step before InputDesktopNudge.Run (whose thread reads it once more before SendInput).
+                if ($tickSessionLocked -eq $false -and -not $tickSecureOwnerOnly) {
+                    $tickSessionLocked = Invoke-AttrCudaBoundedProbe -FunctionName 'Get-AttrCudaSessionLocked' -TimeoutMilliseconds $ProbeTimeoutMilliseconds
+                }
                 if ($tickSessionLocked -ne $false) {
                     $NudgeState.count = [int]$NudgeState.count + 1
                     $NudgeState.failureCount = [int]$NudgeState.failureCount + 1
                     $sessionBlockedReason = if ($null -eq $tickSessionLocked) { 'session_lock_unknown' } else { 'session_locked' }
+                    # r2 (sol blocker 2): sticky, so the job's checkpoint ends the leg owner-only even
+                    # when a later failure overwrites .lastError.
+                    $NudgeState.sessionLockReason = $sessionBlockedReason
                     $NudgeState.lastError = "ATTRCUDA_KEEPALIVE_BLOCKED reason=$sessionBlockedReason no injection attempted (a locked console is owner-only; signing in is an owner action)"
                     $NudgeState.lastFailureUtc = (Get-Date).ToUniversalTime().ToString('o')
                 } else {
@@ -5829,6 +5973,17 @@ function Start-AttrCudaDisplayWakeKeepAlive {
                     # ever selected here.
                     $tickError = @($result.OpenInputDesktopError, $result.SetThreadDesktopError, $result.SendInputError, $result.CloseDesktopError) |
                         Where-Object { $_ } | Select-Object -First 1
+                    # VENUE-SESSION-LOCKED-REFUSAL-1 >>>
+                    # r2 (sol blocker 1): the dedicated thread's own last read found the console locked
+                    # (or unreadable) and sent nothing -- the same typed, sticky refusal as above.
+                    $tickSessionLockRefused = $false
+                    try { $tickSessionLockRefused = [bool]$result.SessionLockRefused } catch { $tickSessionLockRefused = $false }
+                    if ($tickSessionLockRefused) {
+                        $sessionBlockedReason = if ($null -eq $result.SessionLockedAtInject) { 'session_lock_unknown' } else { 'session_locked' }
+                        $NudgeState.sessionLockReason = $sessionBlockedReason
+                        $tickError = "ATTRCUDA_KEEPALIVE_BLOCKED reason=$sessionBlockedReason no SendInput attempted (the console locked before the nudge thread's SendInput; signing in is an owner action)"
+                    }
+                    # VENUE-SESSION-LOCKED-REFUSAL-1 <<<
                     if (-not $tickError -and -not [bool]$result.ThreadJoined) {
                         $tickError = "InputDesktopNudge dedicated thread did not join within ${JoinTimeoutMilliseconds}ms"
                     }
@@ -6005,6 +6160,9 @@ function Get-AttrCudaDisplayWakeKeepAliveHealth {
             lastFailureUtc = $null
             setupError = $null
             runspaceStopped = $null
+            # VENUE-SESSION-LOCKED-REFUSAL-1 >>>
+            sessionLockReason = $null
+            # VENUE-SESSION-LOCKED-REFUSAL-1 <<<
         }
     }
 
@@ -6029,6 +6187,15 @@ function Get-AttrCudaDisplayWakeKeepAliveHealth {
             $lastError = $Handle.nudgeState.lastError
             $lastFailureUtc = $Handle.nudgeState.lastFailureUtc
         }
+        # VENUE-SESSION-LOCKED-REFUSAL-1 >>>
+        # r2 (sol blocker 2): the keep-alive's own sticky classification of a lock refusal
+        # ('session_locked' or 'session_lock_unknown', set by the tick that refused), read as written
+        # -- never re-derived from .lastError text. Read defensively, like .successCount above.
+        $sessionLockReason = $null
+        if ($Handle.nudgeState) {
+            try { $sessionLockReason = $Handle.nudgeState.sessionLockReason } catch { $sessionLockReason = $null }
+        }
+        # VENUE-SESSION-LOCKED-REFUSAL-1 <<<
         $runspaceStopped = $false
         if ($Handle.asyncResult -and $Handle.stopEvent -and [bool]$Handle.asyncResult.IsCompleted -and -not [bool]$Handle.stopEvent.IsSet) {
             $runspaceStopped = $true
@@ -6053,6 +6220,9 @@ function Get-AttrCudaDisplayWakeKeepAliveHealth {
             lastFailureUtc = $lastFailureUtc
             setupError = $setupError
             runspaceStopped = $runspaceStopped
+            # VENUE-SESSION-LOCKED-REFUSAL-1 >>>
+            sessionLockReason = $sessionLockReason
+            # VENUE-SESSION-LOCKED-REFUSAL-1 <<<
         }
     } catch {
         [ordered]@{
@@ -6064,6 +6234,9 @@ function Get-AttrCudaDisplayWakeKeepAliveHealth {
             lastFailureUtc = $null
             setupError = $null
             runspaceStopped = $null
+            # VENUE-SESSION-LOCKED-REFUSAL-1 >>>
+            sessionLockReason = $null
+            # VENUE-SESSION-LOCKED-REFUSAL-1 <<<
         }
     }
 }

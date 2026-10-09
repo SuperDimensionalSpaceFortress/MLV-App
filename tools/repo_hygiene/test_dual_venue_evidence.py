@@ -218,9 +218,13 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
     # the lock read, the open and the close of the wrapper around the unchanged nudge branches, the dismissAttempted override, the method/dismissFailed
     # override and the sessionLocked field (7); in the keep-alive the help text, the per-tick read, the wrapper's open and close, and the runspace entry (5);
     # and the job's exit-30 gate (1). Every baseline line stays verbatim outside them.
+    # r2 (sol r1b blockers) adds 18: the native in-thread lock read (P/Invokes, result fields, the read before SendInput: 3); the two result fields on
+    # Invoke-AttrCudaInputDesktopNudge's three branches (3); in Start-AttrCudaDisplayWake the dedicated-thread refusal and the read before the plain
+    # SendInput (2); in the keep-alive the two nudgeState declarations and the in-thread refusal (3); sessionLockReason in the health read's three
+    # shapes and its computation (4); and the owner-only branch at the job's three keep-alive checkpoints (3).
     SESSION_LOCKED_OPEN = "VENUE-SESSION-LOCKED-REFUSAL-1 >>>"
     SESSION_LOCKED_CLOSE = "VENUE-SESSION-LOCKED-REFUSAL-1 <<<"
-    SESSION_LOCKED_REGIONS = 14
+    SESSION_LOCKED_REGIONS = 32
 
     @classmethod
     def strip_regions(cls, text: str) -> tuple[str, dict[str, int]]:

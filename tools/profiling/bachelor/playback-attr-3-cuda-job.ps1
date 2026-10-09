@@ -91,6 +91,8 @@
 # first action after claim reads whether its own console session is locked
 # (Get-AttrCudaSessionLocked). Locked or unknown stops the leg before any input is sent; signing in
 # is an owner action. 30 is the next free code: this job's other exits are 0 and 12-29.
+# r2: a keep-alive tick refused for a lock that arrives mid-leg ends the leg the same way at each
+# of the three keep-alive checkpoints (SESSION_LOCKED_OWNER_ONLY, exit 30, not KEEPALIVE_FAILED/26).
 #
 # Usage (owner clip, id-only -- no -ClipPath, no -FixtureSha256):
 #   pwsh -NoProfile -File tools\profiling\bachelor\playback-attr-3-cuda-job.ps1 `
@@ -2669,6 +2671,26 @@ if ($ContactSheetEnabled) {
 # CUDA-PERF-DISPLAY-WAKE-3 round 1b: -RequireSuccessSoFar only at this FIRST checkpoint -- see
 # Get-AttrCudaDisplayWakeKeepAliveHealth's own .PARAMETER doc for why only here.
 $keepAliveHealthAtMeasurementStart = Get-AttrCudaDisplayWakeKeepAliveHealth -Handle $displayWakeKeepAlive -RequireSuccessSoFar
+# VENUE-SESSION-LOCKED-REFUSAL-1 >>>
+# r2 (sol blocker 2): a keep-alive tick refused because the console locked mid-leg (or its lock
+# state could not be read) is the same owner-only condition as a lock at claim time: the leg ends
+# SESSION_LOCKED_OWNER_ONLY with exit 30, never the generic KEEPALIVE_FAILED. .sessionLockReason is
+# the keep-alive's own classification; any other keep-alive failure still exits 26 below.
+if ($keepAliveHealthAtMeasurementStart.sessionLockReason) {
+    $displayWake['keepAliveHealth'] = $keepAliveHealthAtMeasurementStart
+    $sessionLockedRefusal = [ordered]@{
+        schema='playback-attr-3-cuda-venue.v1'; result='SESSION_LOCKED_OWNER_ONLY'
+        fixtureRehearsal=$FixtureRehearsal
+        displayWake=$displayWake
+        keepAliveCheckpoint='start_of_measured_interval'
+        sessionLockReason=$keepAliveHealthAtMeasurementStart.sessionLockReason
+        sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
+    }
+    Save-Json $sessionLockedRefusal (Join-Path $Pub 'summary.json')
+    Write-Output "RESULT=SESSION_LOCKED_OWNER_ONLY CHECKPOINT=start_of_measured_interval REASON=$($keepAliveHealthAtMeasurementStart.sessionLockReason) ARTIFACTS=$Pub"
+    exit 30
+}
+# VENUE-SESSION-LOCKED-REFUSAL-1 <<<
 if (-not $keepAliveHealthAtMeasurementStart.healthy) {
     $displayWake['keepAliveHealth'] = $keepAliveHealthAtMeasurementStart
     $keepAliveRefusal = [ordered]@{
@@ -2783,6 +2805,30 @@ $presentMonCaptureStartUncertaintyMs = ($presentMonPostSpawnUtc - $presentMonCap
 # already running at this point, so it is stopped (never left orphaned) before this exits, the
 # same way SMOKE_RUN_FAILED already does below.
 $keepAliveHealthBeforeSmokeLaunch = Get-AttrCudaDisplayWakeKeepAliveHealth -Handle $displayWakeKeepAlive
+# VENUE-SESSION-LOCKED-REFUSAL-1 >>>
+# r2 (sol blocker 2): a lock refusal is owner-only here too; PresentMon is already running, so it
+# is stopped first, exactly as the KEEPALIVE_FAILED branch below does.
+if ($keepAliveHealthBeforeSmokeLaunch.sessionLockReason) {
+    $displayWake['keepAliveHealth'] = $keepAliveHealthBeforeSmokeLaunch
+    $presentMonStopOnSessionLocked = Stop-PresentMonCapture -Proc $presentMonProc -SessionName $PresentMonSessionName
+    Write-JobTrace "step presentmon-stop site=session-locked confirmedExited=$($presentMonStopOnSessionLocked.confirmedExited) postKillTerminate=$(Format-PresentMonSessionTerminateText $presentMonStopOnSessionLocked.postKillSessionTerminate)"
+    $sessionLockedRefusal = [ordered]@{
+        schema='playback-attr-3-cuda-venue.v1'; result='SESSION_LOCKED_OWNER_ONLY'
+        fixtureRehearsal=$FixtureRehearsal
+        displayWake=$displayWake
+        keepAliveCheckpoint='before_smoke_launch'
+        sessionLockReason=$keepAliveHealthBeforeSmokeLaunch.sessionLockReason
+        presentMonConfirmedExited=$presentMonStopOnSessionLocked.confirmedExited
+        presentMonKillError=$presentMonStopOnSessionLocked.killError
+        presentMonWaitError=$presentMonStopOnSessionLocked.waitError
+        presentMonPostKillSessionTerminate=$presentMonStopOnSessionLocked.postKillSessionTerminate
+        sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
+    }
+    Save-Json $sessionLockedRefusal (Join-Path $Pub 'summary.json')
+    Write-Output "RESULT=SESSION_LOCKED_OWNER_ONLY CHECKPOINT=before_smoke_launch REASON=$($keepAliveHealthBeforeSmokeLaunch.sessionLockReason) ARTIFACTS=$Pub"
+    exit 30
+}
+# VENUE-SESSION-LOCKED-REFUSAL-1 <<<
 if (-not $keepAliveHealthBeforeSmokeLaunch.healthy) {
     $displayWake['keepAliveHealth'] = $keepAliveHealthBeforeSmokeLaunch
     $presentMonStopOnKeepAliveFailure = Stop-PresentMonCapture -Proc $presentMonProc -SessionName $PresentMonSessionName
@@ -3220,6 +3266,27 @@ if ($null -ne $presentMonWaitError) {
 # the leg the same typed way the earlier two checkpoints already do (never silently, and never
 # read as a clean measurement), rather than continuing on to a report that would call it OK.
 $keepAliveHealthAfterMeasuredInterval = Get-AttrCudaDisplayWakeKeepAliveHealth -Handle $displayWakeKeepAlive
+# VENUE-SESSION-LOCKED-REFUSAL-1 >>>
+# r2 (sol blocker 2): a lock refusal during the measured interval is owner-only, never a
+# measurement and never KEEPALIVE_FAILED. The PresentMon CSV is kept as evidence, as below.
+if ($keepAliveHealthAfterMeasuredInterval.sessionLockReason) {
+    $displayWake['keepAliveHealth'] = $keepAliveHealthAfterMeasuredInterval
+    if (Test-Path -LiteralPath $presentMonPath -PathType Leaf) {
+        [void](Publish-AttrCudaFileCopy -Source $presentMonPath -Destination (Join-Path $Pub 'presentmon.csv'))
+    }
+    $sessionLockedRefusal = [ordered]@{
+        schema='playback-attr-3-cuda-venue.v1'; result='SESSION_LOCKED_OWNER_ONLY'
+        fixtureRehearsal=$FixtureRehearsal
+        displayWake=$displayWake
+        keepAliveCheckpoint='after_measured_interval'
+        sessionLockReason=$keepAliveHealthAfterMeasuredInterval.sessionLockReason
+        sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
+    }
+    Save-Json $sessionLockedRefusal (Join-Path $Pub 'summary.json')
+    Write-Output "RESULT=SESSION_LOCKED_OWNER_ONLY CHECKPOINT=after_measured_interval REASON=$($keepAliveHealthAfterMeasuredInterval.sessionLockReason) ARTIFACTS=$Pub"
+    exit 30
+}
+# VENUE-SESSION-LOCKED-REFUSAL-1 <<<
 if (-not $keepAliveHealthAfterMeasuredInterval.healthy) {
     $displayWake['keepAliveHealth'] = $keepAliveHealthAfterMeasuredInterval
     if (Test-Path -LiteralPath $presentMonPath -PathType Leaf) {
