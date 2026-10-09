@@ -311,8 +311,8 @@ path; the pair is its own record (`mlv-app/dual-venue-sheet-pair/v1`) because re
 * **Optional look receipt** (LOOK-ASSIST-FILM-FLAVOR-2 r2). A look leg may name `look.receipt` (a file under
   `tools/profiling/dual-venue/look-receipts/`) with its `look.receiptSha256`; the schema requires both or neither. The runner reads the
   receipt's bytes as **committed** at the admission head, never from the working copy, and refuses the leg `LOOK_RECEIPT_UNBOUND`
-  (nothing generated or submitted) unless they hash to `receiptSha256`. Because the spec carries `receiptSha256`, a run receipt's
-  `legSpecSha256` also binds the look receipt's bytes. The job carries the bytes inline (base64 + sha256), re-verifies them in its work dir
+  (nothing generated or submitted) unless they hash to `receiptSha256`. Because the spec holds `receiptSha256`, a run receipt's
+  `legSpecSha256` also binds the look receipt's bytes. The job embeds the bytes inline (base64 + sha256), re-verifies them in its work dir
   (`LOOK_RECEIPT_SHA_MISMATCH`, exit 30, before the app launches), and passes them to the GUI smoke as `-Receipt`, so the app applies
   them before playback. The success summary records `lookReceiptSha256`, and the receipt validator accepts it only when the committed
   spec names the same hash. It is a **measurement instrument, not a product setting**. `look-receipts/agx-off.marxml` (Look Assist on,
