@@ -1258,6 +1258,10 @@ def test_law4_refusal_does_not_echo_a_home_path_or_a_token():
 # Named mutations for this block (each turns the named test red, then is reverted):
 #   M6  make card_validator_on_bus() always return False  -> test_r14_trap_to_traps_md_is_refused_once_the_bus_carries_the_validator
 #   M7  skip validate_cards_file() in drain                -> test_r14_card_the_validator_rejects_is_never_pushed
+#   M8  re-raise the CARD_INVALID instead of refusing per card -> test_r14_one_invalid_card_is_refused_alone_and_the_rest_of_the_drain_publishes
+#   M9  judge each card alone (title + card) instead of tip + kept cards + card -> the two duplicate-id tests (M9 pending/pending, M10 pending/tip)
+#   M11 the tip's own cards file is invalid / the per-card pass names nobody -> CARD_INVALID_UNATTRIBUTED for the set, never a raise
+#   M12 delete the `candidates = [...]` filter after a per-card refusal -> CARD_PASS_NOT_SHRINKING (a Refusal, never a hang)
 
 CARDS = "specs/mlv-app/cards.md"
 FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures" / "bus-validate-cards"
@@ -1399,11 +1403,233 @@ def test_r14_card_the_validator_rejects_is_never_pushed(tmp_path):
     add_item(src, "20261007-bad-card.md", target=CARDS, body=CARD_BODY.replace("evidence: measured\n", ""))
     before = git(bare, "rev-parse", "master")
 
+    report = ob.drain(src, clone, "HEAD", tmp_path / "sent.jsonl", [], push=True)
+
+    assert [r["code"] for r in report["refused"]] == ["CARD_INVALID"]
+    assert "missing field 'evidence'" in report["refused"][0]["detail"]
+    assert report["published"] == [] and report["pushed"] is False
+    assert git(bare, "rev-parse", "master") == before
+
+
+OVERSIZED_CARD_BODY = CARD_BODY.replace("example-card", "oversized-card").replace("rule: the rule", "rule: " + "x" * 2100)
+
+
+@needs_node
+def test_r14_one_invalid_card_is_refused_alone_and_the_rest_of_the_drain_publishes(tmp_path, capsys):
+    """M8. The cards file is validated for the whole batch; a rejection used to raise out of drain()
+    and hold every other pending item. Now each card is judged on its own: the bad one is refused
+    (CARD_INVALID, with the validator's message) and the valid card and the receipt still land."""
+    bare, clone = init_bus(tmp_path)
+    add_validator(clone)
+    src = init_source(tmp_path)
+    add_item(src, "20261007-a-oversized.md", target=CARDS, body=OVERSIZED_CARD_BODY)
+    add_item(src, "20261007-b-good-card.md", target=CARDS, body=CARD_BODY)
+    add_item(src, "20261007-c-receipt.md", target="RECEIPTS.md", kind="receipt", body="### A receipt\nbody\n")
+    ledger = tmp_path / "sent.jsonl"
+
+    report = ob.drain(src, clone, "HEAD", ledger, [], push=True)
+
+    assert [(r["path"], r["code"]) for r in report["refused"]] == [("doctrine-outbox/20261007-a-oversized.md", "CARD_INVALID")]
+    assert "oversized-card" in report["refused"][0]["detail"] and "bytes" in report["refused"][0]["detail"]
+    assert sorted((p["path"], p["target"]) for p in report["published"]) == [
+        ("doctrine-outbox/20261007-b-good-card.md", CARDS), ("doctrine-outbox/20261007-c-receipt.md", "RECEIPTS.md")]
+    assert report["pushed"] is True
+    cards = git_raw(clone, "show", f"{report['commit']}:{CARDS}").decode("utf-8")
+    assert "## mlv-app/example-card" in cards and "oversized-card" not in cards
+    assert b"A receipt" in git_raw(clone, "show", f"{report['commit']}:RECEIPTS.md")
+    check = tmp_path / "check"
+    subprocess.run(["git", "clone", "-q", str(bare), str(check)], check=True, capture_output=True, text=True)
+    result = run_validator(check)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "1 card(s), 0 no-card line(s), 0 problem(s)" in result.stdout
+    assert len(ledger.read_text(encoding="utf-8").splitlines()) == 2, "only what landed is ledgered"
+
+    # The refused card is never retried by this ledger, and the CLI exit stays non-zero while it is pending.
+    rc = ob.main(["--repo", str(src), "drain", "--bus", str(clone), "--ref", "HEAD", "--ledger", str(ledger), "--push"])
+    captured = capsys.readouterr()
+    assert rc == 1 and "REFUSED doctrine-outbox/20261007-a-oversized.md: CARD_INVALID" in captured.err
+    assert json.loads(captured.out)["published"] == []
+
+
+@needs_node
+def test_r14_dry_run_also_reports_the_invalid_card_and_would_push_the_rest(tmp_path):
+    bare, clone = init_bus(tmp_path)
+    add_validator(clone)
+    src = init_source(tmp_path)
+    add_item(src, "20261007-a-oversized.md", target=CARDS, body=OVERSIZED_CARD_BODY)
+    add_item(src, "20261007-b-good-card.md", target=CARDS, body=CARD_BODY)
+    before = git(bare, "rev-parse", "master")
+
+    report = ob.drain(src, clone, "HEAD", tmp_path / "sent.jsonl", [], push=False)
+
+    assert [r["code"] for r in report["refused"]] == ["CARD_INVALID"]
+    assert [w["path"] for w in report["would_push"]] == ["doctrine-outbox/20261007-b-good-card.md"]
+    assert report["pushed"] is False and git(bare, "rev-parse", "master") == before
+
+
+def add_tip_cards(clone: Path, text: str) -> None:
+    """Put a cards file on the fixture bus's tip (the cards that are already published)."""
+    git(clone, "fetch", "-q", "origin")
+    git(clone, "checkout", "-q", "--detach", "origin/master")
+    (clone / "specs" / "mlv-app").mkdir(parents=True, exist_ok=True)
+    (clone / CARDS).write_text(ob.CARDS_TITLE + text, encoding="utf-8", newline="\n")
+    git(clone, "add", CARDS)
+    git(clone, "commit", "-m", "tip cards")
+    git(clone, "push", "origin", "HEAD:refs/heads/master")
+
+
+SECOND_CARD_BODY = CARD_BODY.replace("example-card", "second-card")
+
+
+@needs_node
+def test_r14_a_pending_card_that_duplicates_a_pending_card_refuses_the_later_one_only(tmp_path):
+    """M9. Two pending cards that pass alone but clash (duplicate id): the later-sorted is the one
+    judged against (tip + the earlier pending card) and refused CARD_INVALID; the first, a third
+    card and the receipt still publish. Nothing raises and nothing waits."""
+    bare, clone = init_bus(tmp_path)
+    add_validator(clone)
+    src = init_source(tmp_path)
+    add_item(src, "20261007-a-card.md", target=CARDS, body=CARD_BODY)
+    add_item(src, "20261007-b-card.md", target=CARDS, body=CARD_BODY.replace("the mechanism", "another mechanism"))
+    add_item(src, "20261007-c-card.md", target=CARDS, body=SECOND_CARD_BODY)
+    add_item(src, "20261007-d-receipt.md", target="RECEIPTS.md", kind="receipt", body="### A receipt\nbody\n")
+
+    report = ob.drain(src, clone, "HEAD", tmp_path / "sent.jsonl", [], push=True)
+
+    assert [(r["path"], r["code"]) for r in report["refused"]] == [("doctrine-outbox/20261007-b-card.md", "CARD_INVALID")]
+    assert "duplicate card id" in report["refused"][0]["detail"]
+    assert sorted(p["path"] for p in report["published"]) == [
+        "doctrine-outbox/20261007-a-card.md", "doctrine-outbox/20261007-c-card.md", "doctrine-outbox/20261007-d-receipt.md"]
+    cards = git_raw(clone, "show", f"{report['commit']}:{CARDS}").decode("utf-8")
+    assert "the mechanism" in cards and "another mechanism" not in cards
+
+
+@needs_node
+def test_r14_a_pending_card_that_duplicates_a_card_already_on_the_tip_is_refused_alone(tmp_path, capsys):
+    """M10. Sol's row: card X is already in the bus cards file; a pending card with the same id (a
+    different body) passes a title-plus-card check but not tip-plus-card. It is refused per card,
+    CARD_INVALID 'duplicate card id'; the valid card Y and the receipt publish; the exit stays 1."""
+    bare, clone = init_bus(tmp_path)
+    add_validator(clone)
+    add_tip_cards(clone, CARD_BODY)
+    src = init_source(tmp_path)
+    add_item(src, "20261007-a-dup-of-tip.md", target=CARDS, body=CARD_BODY.replace("the mechanism", "another mechanism"))
+    add_item(src, "20261007-b-good-card.md", target=CARDS, body=SECOND_CARD_BODY)
+    add_item(src, "20261007-c-receipt.md", target="RECEIPTS.md", kind="receipt", body="### A receipt\nbody\n")
+    ledger = tmp_path / "sent.jsonl"
+
+    report = ob.drain(src, clone, "HEAD", ledger, [], push=True)
+
+    assert [(r["path"], r["code"]) for r in report["refused"]] == [("doctrine-outbox/20261007-a-dup-of-tip.md", "CARD_INVALID")]
+    assert "duplicate card id" in report["refused"][0]["detail"]
+    assert sorted((p["path"], p["target"]) for p in report["published"]) == [
+        ("doctrine-outbox/20261007-b-good-card.md", CARDS), ("doctrine-outbox/20261007-c-receipt.md", "RECEIPTS.md")]
+    assert report["pushed"] is True
+    cards = git_raw(clone, "show", f"{report['commit']}:{CARDS}").decode("utf-8")
+    assert cards.count("## mlv-app/example-card") == 1 and "another mechanism" not in cards and "## mlv-app/second-card" in cards
+    assert b"A receipt" in git_raw(clone, "show", f"{report['commit']}:RECEIPTS.md")
+    assert len(ledger.read_text(encoding="utf-8").splitlines()) == 2, "only what landed is ledgered"
+    check = tmp_path / "check"
+    subprocess.run(["git", "clone", "-q", str(bare), str(check)], check=True, capture_output=True, text=True)
+    result = run_validator(check)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    rc = ob.main(["--repo", str(src), "drain", "--bus", str(clone), "--ref", "HEAD", "--ledger", str(ledger), "--push"])
+    assert rc == 1 and "REFUSED doctrine-outbox/20261007-a-dup-of-tip.md: CARD_INVALID" in capsys.readouterr().err
+
+
+@needs_node
+def test_r14_a_cards_file_the_tip_already_fails_refuses_every_card_unattributed_and_still_ships_the_rest(tmp_path, capsys):
+    """M11 (ruling B). The bus's own cards file is invalid, so no pending card can be blamed: every
+    pending card is refused CARD_INVALID_UNATTRIBUTED (nothing is published into a file the
+    validator rejects), the receipt still publishes, and the exit is non-zero."""
+    bare, clone = init_bus(tmp_path)
+    add_validator(clone)
+    add_tip_cards(clone, CARD_BODY.replace("evidence: measured\n", ""))
+    src = init_source(tmp_path)
+    add_item(src, "20261007-a-good-card.md", target=CARDS, body=SECOND_CARD_BODY)
+    add_item(src, "20261007-b-receipt.md", target="RECEIPTS.md", kind="receipt", body="### A receipt\nbody\n")
+    cards_before = git_raw(clone, "show", "origin/master:" + CARDS)
+
+    report = ob.drain(src, clone, "HEAD", tmp_path / "sent.jsonl", [], push=True)
+
+    assert [(r["path"], r["code"]) for r in report["refused"]] == [("doctrine-outbox/20261007-a-good-card.md", "CARD_INVALID_UNATTRIBUTED")]
+    assert "missing field 'evidence'" in report["refused"][0]["detail"]
+    assert [p["path"] for p in report["published"]] == ["doctrine-outbox/20261007-b-receipt.md"]
+    git(clone, "fetch", "-q", "origin")
+    assert git_raw(clone, "show", "origin/master:" + CARDS) == cards_before
+    rc = ob.main(["--repo", str(src), "drain", "--bus", str(clone), "--ref", "HEAD", "--ledger", str(tmp_path / "sent2.jsonl"), "--push"])
+    assert rc == 1 and "CARD_INVALID_UNATTRIBUTED" in capsys.readouterr().err
+
+
+@needs_node
+def test_r14_an_invalid_set_no_single_card_explains_refuses_all_of_it_unattributed(tmp_path, monkeypatch):
+    """M11 (ruling B). The batch fails and the per-card pass can name nobody (forced here): every card
+    of the set is refused CARD_INVALID_UNATTRIBUTED instead of raising, and the receipt still ships."""
+    bare, clone = init_bus(tmp_path)
+    add_validator(clone)
+    src = init_source(tmp_path)
+    add_item(src, "20261007-a-card.md", target=CARDS, body=CARD_BODY)
+    add_item(src, "20261007-b-card.md", target=CARDS, body=CARD_BODY.replace("the mechanism", "another mechanism"))
+    add_item(src, "20261007-c-receipt.md", target="RECEIPTS.md", kind="receipt", body="### A receipt\nbody\n")
+    monkeypatch.setattr(ob, "invalid_cards", lambda wt, tip, cards: [])
+
+    report = ob.drain(src, clone, "HEAD", tmp_path / "sent.jsonl", [], push=True)
+
+    assert [(r["path"], r["code"]) for r in report["refused"]] == [
+        ("doctrine-outbox/20261007-a-card.md", "CARD_INVALID_UNATTRIBUTED"),
+        ("doctrine-outbox/20261007-b-card.md", "CARD_INVALID_UNATTRIBUTED")]
+    assert "duplicate card id" in report["refused"][0]["detail"]
+    assert [p["path"] for p in report["published"]] == ["doctrine-outbox/20261007-c-receipt.md"]
+    assert CARDS not in git(clone, "ls-tree", "-r", "--name-only", report["commit"])
+
+
+@needs_node
+def test_r14_a_per_card_pass_that_removes_nothing_raises_instead_of_looping(tmp_path, monkeypatch):
+    """M12. Each re-validation pass must remove at least one candidate. Here the per-card pass names a
+    card that is not a candidate, so nothing shrinks: a typed Refusal, not a loop (the call counter
+    bounds the test itself)."""
+    bare, clone = init_bus(tmp_path)
+    add_validator(clone)
+    src = init_source(tmp_path)
+    add_item(src, "20261007-a-oversized.md", target=CARDS, body=OVERSIZED_CARD_BODY)
+    before = git(bare, "rev-parse", "master")
+    calls = []
+
+    def stuck(wt, tip, cards):
+        calls.append(1)
+        assert len(calls) < 5, "the drain looped"
+        return [(dict(cards[0], key="not-a-candidate"), "CARD_INVALID", "x")]
+    monkeypatch.setattr(ob, "invalid_cards", stuck)
+
     with pytest.raises(ob.Refusal) as excinfo:
         ob.drain(src, clone, "HEAD", tmp_path / "sent.jsonl", [], push=True)
 
-    assert excinfo.value.code == "CARD_INVALID"
-    assert "missing field 'evidence'" in excinfo.value.detail
+    assert excinfo.value.code == "CARD_PASS_NOT_SHRINKING" and len(calls) == 1
+    assert git(bare, "rev-parse", "master") == before
+
+
+@needs_node
+def test_r14_a_validator_failure_is_not_a_card_verdict_and_refuses_the_whole_set(tmp_path, monkeypatch):
+    """Only exit 1 (INVALID) is a per-card verdict. Any other validator outcome publishes nothing."""
+    bare, clone = init_bus(tmp_path)
+    add_validator(clone)
+    src = init_source(tmp_path)
+    add_item(src, "20261007-a-good-card.md", target=CARDS, body=CARD_BODY)
+    add_item(src, "20261007-b-receipt.md", target="RECEIPTS.md", kind="receipt", body="### A receipt\nbody\n")
+    before = git(bare, "rev-parse", "master")
+    real_run, node = subprocess.run, ob.find_node()
+
+    def run(cmd, *a, **kw):
+        if cmd[0] == node:
+            return subprocess.CompletedProcess(cmd, 2, "", "boom")
+        return real_run(cmd, *a, **kw)
+    monkeypatch.setattr(ob.subprocess, "run", run)
+
+    with pytest.raises(ob.Refusal) as excinfo:
+        ob.drain(src, clone, "HEAD", tmp_path / "sent.jsonl", [], push=True)
+
+    assert excinfo.value.code == "CARD_VALIDATOR_FAILED"
     assert git(bare, "rev-parse", "master") == before
 
 
