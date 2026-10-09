@@ -4772,6 +4772,51 @@ class LookReceiptRunnerTests(RunnerHarness, unittest.TestCase):
 
 
 @requires_windows_pwsh
+class LookReceiptValidatorTests(EvidenceFactory, ModuleMutationMixin, unittest.TestCase):
+    """(f) Test-DvReceiptValid accepts a hashed summary.json's lookReceiptSha256 only when the committed leg spec names a look receipt with that hash;
+    a summary without one is accepted only for a spec without one (both absent is every leg before this round)."""
+
+    def setUp(self) -> None:
+        self.make_harness()
+        self.sha = hashlib.sha256(AGXOFF_RECEIPT.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
+
+    def receipt_spec(self) -> Path:
+        spec = json.loads(self.write_spec(leg_type="look").read_text(encoding="utf-8"))
+        spec["look"].update(receipt="look-receipts/agx-off.marxml", receiptSha256=self.sha)
+        path = self.tmp / "spec-look-receipt.json"
+        path.write_text(json.dumps(spec), encoding="utf-8")
+        return path
+
+    def cases(self, module: Path | None = None) -> tuple[list, list]:
+        plain_repo = self.prod_repo(leg_type="look")
+        plain_spec = self.spec_path
+        receipt_repo = self.prod_repo(leg_type="look", spec=self.receipt_spec())
+        receipt_spec = self.spec_path
+        bound = self.evidence("lr-bound", sheet=True, backend="cpu", leg_type="look", summary={"lookReceiptSha256": self.sha})
+        foreign = self.evidence("lr-foreign", sheet=True, backend="cpu", leg_type="look", summary={"lookReceiptSha256": "0" * 64})
+        none = self.evidence("lr-none", sheet=True, backend="cpu", leg_type="look")
+        rc = self.status_batch(receipt_repo, [(self.receipt_for(receipt_repo, ev, backend="cpu", leg_type="look", spec_path=receipt_spec), None)
+                                              for ev in (bound, foreign, none)], module=module)
+        pl = self.status_batch(plain_repo, [(self.receipt_for(plain_repo, ev, backend="cpu", leg_type="look", spec_path=plain_spec), None)
+                                            for ev in (none, bound)], module=module)
+        return rc, pl
+
+    def test_a_run_look_receipt_hash_is_accepted_only_where_the_committed_spec_names_it(self) -> None:
+        rc, pl = self.cases()
+        self.expect(rc[0], "ADVISORY", "the spec's receipt, bound in the hashed summary")
+        self.expect(rc[1], "INVALID", "another receipt hash", "LOOK_RECEIPT_MISMATCH")
+        self.expect(rc[2], "INVALID", "a receipt leg whose run recorded none", "LOOK_RECEIPT_MISMATCH")
+        self.expect(pl[0], "ADVISORY", "no receipt on either side (every earlier leg)")
+        self.expect(pl[1], "INVALID", "a receipt hash on a leg whose spec names none", "LOOK_RECEIPT_MISMATCH")
+
+    def test_mutation_without_the_rule_a_foreign_receipt_hash_is_advisory(self) -> None:
+        mutated = self.mutated_module([("if ([string](Get-DvProp $ev.summary 'lookReceiptSha256') -cne", "if ($false -and [string](Get-DvProp $ev.summary 'lookReceiptSha256') -cne")])
+        rc, pl = self.cases(module=mutated)
+        self.expect(rc[1], "ADVISORY", "with the rule removed a foreign receipt hash is believed -- so the rule is what refuses it")
+        self.expect(pl[1], "ADVISORY", "with the rule removed a receipt hash on a plain leg is believed")
+
+
+@requires_windows_pwsh
 class LookReceiptGeneratorTests(unittest.TestCase):
     """(d) The generator's -LookReceiptPath: without it the emitted job is byte-identical to the base (#328 head) generator's for the same arguments;
     with it the job embeds the receipt base64 + sha256, passes -Receipt exactly once and records lookReceiptSha256 in its summary; off a look leg it throws."""
