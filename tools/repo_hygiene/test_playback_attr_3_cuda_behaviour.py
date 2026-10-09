@@ -5680,9 +5680,10 @@ class DisplayWakeJobOrderingTests(unittest.TestCase):
         # PLAYBACK-CLIP-LENGTH-ENFORCE-3 adds a 23rd: SOURCE_FRAMES_INVALID (exit 29), the receipt oracle that ends the
         # leg when the measured session did not advance its required source frames (or wrapped, or was override-paced).
         # VENUE-SESSION-LOCKED-REFUSAL-1 adds a 24th: SESSION_LOCKED_OWNER_ONLY (exit 30), the locked-console refusal.
+        # r2 adds 25-27: SESSION_LOCKED_OWNER_ONLY at the three keep-alive checkpoints (start_of_measured_interval, before_smoke_launch, after_measured_interval).
         summary_writes = body.count("(Join-Path $Pub 'summary.json')")
         display_wake_fields = body.count("displayWake=$displayWake") + body.count("displayWake = $displayWake")
-        self.assertEqual(24, summary_writes, "a summary.json write site was added/removed after the wake")
+        self.assertEqual(27, summary_writes, "a summary.json write site was added/removed after the wake")
         # +1: the success path also stamps displayWake into evidence-manifest.json, a second file.
         self.assertEqual(summary_writes + 1, display_wake_fields)
 
