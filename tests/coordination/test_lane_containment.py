@@ -127,6 +127,13 @@ if($args.Count -ge 2 -and $args[0] -eq 'mcp' -and $args[1] -eq 'list'){
   else{[Console]::Out.Write('[{"name":"agent_bridge","enabled":true},{"name":"node_repl","enabled":true}]')}
   exit ([int]$env:MLV_FIXTURE_MCP_LIST_EXIT)
 }
+# CODEX-KEY-PRIVATE-PIN-1: answers the launcher's `codex --version` stamp the same way (version
+# from MLV_FIXTURE_CODEX_VERSION, unset = 0.0.0-fixture) and exits before any lane-side write.
+if($args.Count -ge 1 -and $args[0] -eq '--version'){
+  $v=if($env:MLV_FIXTURE_CODEX_VERSION){$env:MLV_FIXTURE_CODEX_VERSION}else{'0.0.0-fixture'}
+  [Console]::Out.Write("codex-cli $v`n")
+  exit 0
+}
 $me=Get-Process -Id $PID
 $t=$env:MLV_FIXTURE_CHILD+'.tmp';@{pid=$PID;createdUtc=$me.StartTime.ToUniversalTime().ToString('o')}|ConvertTo-Json|Set-Content -Encoding utf8NoBOM $t;Move-Item -LiteralPath $t -Destination $env:MLV_FIXTURE_CHILD
 $args|ConvertTo-Json|Set-Content -Encoding utf8NoBOM $env:MLV_FIXTURE_ARGS
@@ -1417,6 +1424,299 @@ def test_codex_read_only_lane_refuses_launch_when_mcp_list_is_unreadable(fixture
     assert q["state"]=="failed"
     assert "codex-mcp-list-unreadable" in (q["failure"] or ""), q["failure"]
     assert not (fixture_tree["root"]/"args.json").exists(), "the codex exec lane must never start"
+
+
+# CODEX-KEY-PRIVATE-PIN-1: a read-only codex lane runs the private install named by the tracked
+# codex-pin.json (beside the launcher, i.e. the fixture root here) under -CodexPinRoot, falling back
+# to the global codex with a named reason. prepare() swaps $CODEX_EXE for the shim, which by design
+# never consults the pin (PIN_SKIPPED_EXE_OVERRIDDEN); these tests also point $REAL_CODEX_EXE at the
+# shim -- exactly as test_real_lane_launch_refuses_non_high_effort does for claude -- so the launcher
+# treats the shim as its genuine global codex, and drop prepare()'s -ReasoningEffort low, which that
+# same real-launch rule refuses.
+PIN_VERSION = "9.9.9-fixture"
+
+
+def _real_codex_is_shim(fixture_tree):
+    def mutation(text):
+        old = "$REAL_CODEX_EXE  = Join-Path $env:APPDATA 'npm\\codex.cmd'"
+        assert text.count(old) == 1, "REAL_CODEX_EXE declaration has moved; update this fixture mutation"
+        return text.replace(old, "$REAL_CODEX_EXE = '" + str(fixture_tree["shim"]).replace("'", "''") + "'")
+    return mutation
+
+
+def _pin_case(fixture_tree, pin=None, exe_version=PIN_VERSION, create_exe=True, real_is_shim=True,
+              editing=False, keep_low_effort=False):
+    root = fixture_tree["root"]; pin_root = root / "codex-pin"
+    pinned = pin_root / PIN_VERSION / "node_modules" / ".bin" / "codex.cmd"
+    if create_exe:
+        pinned.parent.mkdir(parents=True)
+        pinned.write_text("@echo off\r\n"
+                          f'if "%~1"=="--version" (echo codex-cli {exe_version}& exit /b 0)\r\n'
+                          'echo pinned> "%MLV_FIXTURE_VIA%"\r\n'
+                          f'"{PWSH}" -NoProfile -NonInteractive -File "{fixture_tree["child"]}" %*\r\n', encoding="ascii")
+    if pin is None:
+        pin = {"schema": "mlv-app/codex-pin/v1", "version": PIN_VERSION, "windowsSandbox": "elevated"}
+    mutations = []
+    if real_is_shim: mutations.append(_real_codex_is_shim(fixture_tree))
+    if editing: mutations.append(_bypass_codex_never_edits)
+    def mutation(text):
+        for m in mutations: text = m(text)
+        return text
+    cmd, env, receipt = prepare(fixture_tree, "normal", lane="sol", mutation=mutation, editing=editing,
+                                allowed_tools="Read,Write" if editing else "")
+    if pin is not False:
+        (root / "codex-pin.json").write_text(pin if isinstance(pin, str) else json.dumps(pin), encoding="utf-8")
+    if not keep_low_effort:
+        i = cmd.index("-ReasoningEffort"); del cmd[i:i+2]
+    cmd += ["-CodexPinRoot", str(pin_root)]
+    env = dict(env); env["MLV_FIXTURE_VIA"] = str(root / "via.txt")
+    return cmd, env, receipt, pinned
+
+
+def _run_pin_case(cmd, env, receipt):
+    r = subprocess.run(cmd, env=env, text=True, capture_output=True, timeout=40)
+    return r, json.loads(receipt.read_text(encoding="utf-8"))
+
+
+def test_codex_pin_present_and_matching_runs_the_pinned_exe_on_its_promoted_sandbox(fixture_tree):
+    cmd, env, receipt, pinned = _pin_case(fixture_tree)
+    r, q = _run_pin_case(cmd, env, receipt)
+    assert r.returncode == 0, (r.stdout, r.stderr)
+    assert (fixture_tree["root"] / "via.txt").exists(), "the lane must have been launched through the pinned exe"
+    assert q["codexExe"]["pinState"] == "PINNED"
+    assert q["codexExe"]["path"] == str(pinned)
+    assert q["codexExe"]["version"] == PIN_VERSION and q["codexExe"]["pinVersion"] == PIN_VERSION
+    assert q["codexExe"]["pinWindowsSandbox"] == "elevated"
+    argv = json.loads((fixture_tree["root"] / "args.json").read_text(encoding="utf-8-sig"))
+    assert _windows_sandbox_overrides(argv) in (['windows.sandbox="elevated"'], ["windows.sandbox=elevated"]), argv
+    assert q["authority"]["windowsSandbox"] == "elevated"
+    assert q["authority"]["mcpServers"] == "disabled", "the MCP probe must still run, on the pinned exe"
+    assert r.stdout.count("[codex-pin]") == 1 and "[codex-pin] PINNED" in r.stdout, r.stdout
+
+
+@pytest.mark.parametrize("case,state", [
+    ("no-pin", "PIN_ABSENT"),
+    ("exe-missing", "PIN_EXE_MISSING"),
+    ("version-mismatch", "PIN_VERSION_MISMATCH"),
+    ("unparseable-pin", "PIN_INVALID"),
+    ("path-in-version", "PIN_INVALID"),
+    ("bad-sandbox", "PIN_INVALID"),
+    # PR #339 r2 (CODEX-PIN-CASE-EXACT-1): pin validation is case-exact.
+    ("sandbox-case", "PIN_INVALID"),
+    ("version-case", "PIN_INVALID"),
+])
+def test_codex_pin_unusable_falls_back_to_the_global_codex_with_the_named_reason(fixture_tree, case, state):
+    kw = {"no-pin": dict(pin=False), "exe-missing": dict(create_exe=False),
+          "version-mismatch": dict(exe_version="9.9.8-fixture"), "unparseable-pin": dict(pin="{not json"),
+          "path-in-version": dict(pin={"version": "..\\..\\evil", "windowsSandbox": "elevated"}),
+          "bad-sandbox": dict(pin={"version": PIN_VERSION, "windowsSandbox": "danger-full-access"}),
+          "sandbox-case": dict(pin={"version": PIN_VERSION, "windowsSandbox": "Elevated"}),
+          # the exe directory is found case-insensitively and reports PIN_VERSION's own spelling
+          "version-case": dict(pin={"version": PIN_VERSION.upper(), "windowsSandbox": "elevated"})}[case]
+    cmd, env, receipt, pinned = _pin_case(fixture_tree, **kw)
+    env["MLV_FIXTURE_CODEX_VERSION"] = "1.2.3"
+    r, q = _run_pin_case(cmd, env, receipt)
+    assert r.returncode == 0, (r.stdout, r.stderr)
+    assert not (fixture_tree["root"] / "via.txt").exists(), "the pinned exe must not run"
+    assert q["codexExe"]["pinState"] == state, q["codexExe"]
+    assert q["codexExe"]["path"] == str(fixture_tree["shim"])
+    assert q["codexExe"]["version"] == "1.2.3", "the global codex's own version is stamped on a fallback"
+    assert q["authority"]["windowsSandbox"] == "unelevated", "a fallback keeps #329's unelevated sandbox"
+    lines = [l for l in r.stdout.splitlines() if "[codex-pin]" in l]
+    assert len(lines) == 1 and state in lines[0], r.stdout
+
+
+def test_codex_pin_keeps_the_high_effort_refusal_for_the_pinned_exe(fixture_tree):
+    # The pinned exe IS a real CLI: $REAL_CODEX_EXE follows it, so a non-high effort is refused
+    # exactly as for the global codex, before the ledger row or any provider process.
+    cmd, env, receipt, pinned = _pin_case(fixture_tree, keep_low_effort=True)
+    r, q = _run_pin_case(cmd, env, receipt)
+    assert r.returncode != 0, (r.stdout, r.stderr)
+    assert q["state"] == "failed" and "lane-effort-must-be-high" in (q["failure"] or ""), q["failure"]
+    assert q["codexExe"]["pinState"] == "PINNED"
+    assert q["dispatchLedger"]["state"] is None
+    assert not (fixture_tree["root"] / "args.json").exists()
+
+
+def test_codex_pin_is_never_consulted_by_a_launcher_whose_exe_was_swapped(fixture_tree):
+    # A valid pin is present, but $CODEX_EXE no longer equals $REAL_CODEX_EXE (prepare()'s own shim
+    # swap): the swapped exe runs, the pin is not promoted over it, and the low-effort launch is
+    # still allowed only because the swapped exe provably cannot be a real CLI.
+    cmd, env, receipt, pinned = _pin_case(fixture_tree, real_is_shim=False, keep_low_effort=True)
+    r, q = _run_pin_case(cmd, env, receipt)
+    assert r.returncode == 0, (r.stdout, r.stderr)
+    assert not (fixture_tree["root"] / "via.txt").exists()
+    assert q["codexExe"]["pinState"] == "PIN_SKIPPED_EXE_OVERRIDDEN"
+    assert q["codexExe"]["path"] == str(fixture_tree["shim"])
+
+
+def test_codex_pin_does_not_apply_to_a_producer_lane(fixture_tree):
+    cmd, env, receipt, pinned = _pin_case(fixture_tree, editing=True)
+    r, q = _run_pin_case(cmd, env, receipt)
+    assert r.returncode == 0, (r.stdout, r.stderr)
+    assert not (fixture_tree["root"] / "via.txt").exists()
+    assert q["codexExe"]["pinState"] == "PIN_NOT_APPLICABLE"
+    assert q["authority"]["windowsSandbox"] == "default"
+
+
+def test_codex_pin_rule_is_shared_by_the_promoter_and_the_tracked_pin_is_well_formed():
+    # Promote-CodexPin.ps1 installs where Invoke-Lane.ps1 looks: both derive the exe from the same
+    # two literals. The tracked pin, when present, must pass the launcher's own validation.
+    promoter = (ROOT / "tools" / "coordination" / "Promote-CodexPin.ps1").read_text(encoding="utf-8")
+    launcher = CANDIDATE.read_text(encoding="utf-8")
+    for name in ("$CODEX_PIN_EXE_RELATIVE", "$CODEX_PIN_VERSION_PATTERN"):
+        decl = [l.strip() for l in launcher.splitlines() if l.startswith(name + " =")]
+        assert len(decl) == 1, name
+        assert decl[0] in [l.strip() for l in promoter.splitlines()], (name, decl[0])
+    pin_path = ROOT / "tools" / "coordination" / "codex-pin.json"
+    if pin_path.exists():
+        pin = json.loads(pin_path.read_text(encoding="utf-8"))
+        assert re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?", pin["version"]), pin
+        assert pin["windowsSandbox"] in ("elevated", "unelevated"), pin
+
+
+# PR #339 r2: Promote-CodexPin.ps1 against a fake private codex (no npm, no tokens). The fake
+# answers --version, `sandbox ... -- git ...`, `mcp list` and `exec` (an EXEC_OK transcript); the
+# sandboxed write probe's behaviour comes from MLV_FAKE_CODEX_WRITE. The promoter's positive
+# control is the REAL git on PATH, run in the same environment.
+PROMOTER = ROOT / "tools" / "coordination" / "Promote-CodexPin.ps1"
+FAKE_CODEX_PS1 = r'''$ErrorActionPreference='Stop'
+$a=@($args)
+if($a.Count -ge 1 -and $a[0] -eq '--version'){[Console]::Out.Write("codex-cli $env:MLV_FAKE_CODEX_VERSION`n"); exit 0}
+if($a[0] -eq 'sandbox'){
+  $i=[array]::IndexOf($a,'--'); $cmd=@($a[($i+1)..($a.Count-1)])
+  if($cmd[1] -eq '--version'){ & git --version; exit $LASTEXITCODE }
+  switch($env:MLV_FAKE_CODEX_WRITE){
+    'passthrough' { & $cmd[0] @($cmd[1..($cmd.Count-1)]); exit $LASTEXITCODE }
+    'deny' { [Console]::Error.WriteLine("fatal: cannot mkdir $($cmd[-1]): Permission denied"); exit 128 }
+    'nosig' { [Console]::Error.WriteLine('fatal: the sandboxed process could not be started'); exit 1 }
+    'hang' { exit 77 }
+    'orphan-hang' {
+      # a grandchild that inherits the stdout/stderr pipes and outlives this process, so the
+      # promoter's Kill(true) of the shim's tree cannot reach it
+      $psi=[System.Diagnostics.ProcessStartInfo]::new('pwsh.exe'); $psi.UseShellExecute=$false
+      foreach($x in @('-NoProfile','-NonInteractive','-Command',"Set-Content -LiteralPath '$env:MLV_FAKE_CODEX_ORPHAN_PID' -Value `$PID; Start-Sleep -Seconds 120")){[void]$psi.ArgumentList.Add($x)}
+      [void][System.Diagnostics.Process]::Start($psi)
+      $end=(Get-Date).AddSeconds(30); while(-not (Test-Path -LiteralPath $env:MLV_FAKE_CODEX_ORPHAN_PID) -and (Get-Date) -lt $end){Start-Sleep -Milliseconds 100}
+      exit 77
+    }
+  }
+  exit 98
+}
+if($a[0] -eq 'mcp'){[Console]::Out.Write('[]'); exit 0}
+if($a[0] -eq 'exec'){
+  $nonce=[regex]::Match([Console]::In.ReadToEnd(),'PINPROBE[0-9a-f]+').Value
+  Set-Content -LiteralPath $a[[array]::IndexOf($a,'-o')+1] -Value $nonce
+  [Console]::Error.WriteLine('exec'); [Console]::Error.WriteLine(' succeeded in 5ms:'); [Console]::Out.Write("$nonce`n"); exit 0
+}
+exit 99
+'''
+
+
+def _promote(tmp_path, write_mode, extra_env=None, probe_timeout=60, timeout=120):
+    pin_root = tmp_path / "pin-root"; bin_dir = pin_root / PIN_VERSION / "node_modules" / ".bin"
+    bin_dir.mkdir(parents=True)
+    fake = tmp_path / "fake-codex.ps1"; fake.write_text(FAKE_CODEX_PS1, encoding="ascii")
+    # exit 77 = "stay alive": the shim then sleeps so the promoter's probe timeout fires
+    (bin_dir / "codex.cmd").write_text(
+        "@echo off\r\n"
+        f'"{PWSH}" -NoProfile -NonInteractive -File "{fake}" %*\r\n'
+        f'if errorlevel 77 if not errorlevel 78 "{PWSH}" -NoProfile -NonInteractive -Command "Start-Sleep -Seconds 120"\r\n'
+        "exit /b %errorlevel%\r\n", encoding="ascii")
+    work = tmp_path / "work"; work.mkdir(); ev = tmp_path / "evidence"; pin_file = tmp_path / "codex-pin.json"
+    env = dict(os.environ); env.update(extra_env or {})
+    env.update(MLV_FAKE_CODEX_VERSION=PIN_VERSION, MLV_FAKE_CODEX_WRITE=write_mode,
+               MLV_FAKE_CODEX_ORPHAN_PID=str(tmp_path / "orphan.pid"))
+    cmd = [PWSH, "-NoProfile", "-NonInteractive", "-File", str(PROMOTER), "-Version", PIN_VERSION,
+           "-PinRoot", str(pin_root), "-PinFile", str(pin_file), "-WorkDir", str(work), "-EvidenceDir", str(ev),
+           "-WindowsSandbox", "elevated", "-Model", "fake-model", "-ProbeTimeoutSec", str(probe_timeout)]
+    # Files, not pipes: an orphan that inherited the promoter's handles must not hold the test's own
+    # capture open (only the promoter's exit is under test).
+    out = tmp_path / "promote.out.txt"; orphan = tmp_path / "orphan.pid"
+    started = time.monotonic()
+    try:
+        with open(out, "wb") as f:
+            r = subprocess.run(cmd, env=env, stdout=f, stderr=subprocess.STDOUT, timeout=timeout)
+    finally:
+        if orphan.exists():
+            subprocess.run(["taskkill", "/F", "/PID", orphan.read_text(encoding="utf-8-sig").strip()],
+                           capture_output=True, check=False)
+    elapsed = time.monotonic() - started
+    evidence = json.loads((ev / "promotion.json").read_text(encoding="utf-8"))
+    step = {s["name"]: s for s in evidence["steps"]}
+    return r.returncode, out.read_text(encoding="utf-8", errors="replace"), evidence, step, pin_file, elapsed
+
+
+def _assert_unproven(code, log, evidence, step, pin_file, reasons):
+    assert code == 19, log
+    wp = step["write-probe"]
+    assert wp["outcome"].startswith("UNPROVEN"), wp["outcome"]
+    assert "DENIED" not in wp["outcome"], wp["outcome"]
+    assert sorted(wp["unprovenReasons"]) == sorted(reasons), wp
+    assert evidence["exitCode"] == 19 and "exec-probe" not in step, "promotion must stop at the write probe"
+    assert not pin_file.exists(), "no pin may be written"
+
+
+def test_codex_pin_promoter_config_failure_is_not_a_denial(tmp_path):
+    # sol's repro: GIT_CONFIG_COUNT=bogus -> `git --version` rc 0 but `git init` rc 128 on a config
+    # parse error, nothing created. Both the signature and the control refuse DENIED.
+    code, log, ev, step, pin, _ = _promote(tmp_path, "passthrough", {"GIT_CONFIG_COUNT": "bogus"})
+    assert step["write-probe"]["exit"] == 128 and "GIT_CONFIG_COUNT" in step["write-probe"]["stderrTail"], step["write-probe"]
+    _assert_unproven(code, log, ev, step, pin, ["control-failed", "no-denial-signature"])
+
+
+def test_codex_pin_promoter_denial_without_a_working_control_is_unproven(tmp_path):
+    # a denial-shaped stderr, but the un-sandboxed control cannot `git init` in this environment
+    code, log, ev, step, pin, _ = _promote(tmp_path, "deny", {"GIT_CONFIG_COUNT": "bogus"})
+    assert step["write-probe"]["denialSignature"] == "Permission denied"
+    assert step["write-probe"]["control"]["exit"] == 128 and step["write-probe"]["control"]["created"] is False
+    _assert_unproven(code, log, ev, step, pin, ["control-failed"])
+
+
+def test_codex_pin_promoter_refusal_without_a_denial_signature_is_unproven(tmp_path):
+    code, log, ev, step, pin, _ = _promote(tmp_path, "nosig")
+    assert step["write-probe"]["control"]["exit"] == 0 and step["write-probe"]["control"]["created"] is True
+    _assert_unproven(code, log, ev, step, pin, ["no-denial-signature"])
+
+
+def test_codex_pin_promoter_timed_out_write_probe_is_unproven(tmp_path):
+    code, log, ev, step, pin, _ = _promote(tmp_path, "hang", probe_timeout=8)
+    assert step["write-probe"]["timedOut"] is True
+    _assert_unproven(code, log, ev, step, pin, ["timed-out", "no-denial-signature"])
+
+
+def test_codex_pin_promoter_genuine_denial_with_control_promotes(tmp_path):
+    code, log, ev, step, pin, _ = _promote(tmp_path, "deny")
+    assert code == 0, log
+    wp = step["write-probe"]
+    assert wp["outcome"].startswith("DENIED") and wp["unprovenReasons"] == [], wp
+    assert wp["denialSignature"] == "Permission denied"
+    assert wp["control"]["exit"] == 0 and wp["control"]["created"] is True and wp["control"]["timedOut"] is False
+    written = json.loads(pin.read_text(encoding="utf-8"))
+    assert written["windowsSandbox"] == "elevated" and written["version"] == PIN_VERSION
+    assert "Permission denied" in written["gate"]["writeProbe"] and "control" in written["gate"]["writeProbe"]
+
+
+def test_codex_pin_promoter_child_holding_the_pipes_after_timeout_fails_within_budget(tmp_path):
+    # CODEX-PIN-PROMOTION-BOUNDS-1: after the write probe times out, Kill(true) cannot reach a
+    # grandchild that escaped the tree and holds the stdout/stderr pipes. The drain must give up
+    # within the cleanup budget (10 s) with a named reason, never hang.
+    code, log, ev, step, pin, elapsed = _promote(tmp_path, "orphan-hang", probe_timeout=8, timeout=90)
+    assert code == 20, log
+    wp = step["write-probe"]
+    assert wp["outcome"] == "FAILED: cleanup stream-drain-expired", wp
+    assert wp["cleanupFailure"] == "stream-drain-expired" and wp["timedOut"] is True
+    assert "stream-drain-expired" in ev["result"] and not pin.exists()
+    assert elapsed < 60, elapsed
+
+
+def test_claude_lane_receipt_carries_a_null_codex_exe(fixture_tree):
+    cmd, env, receipt = prepare(fixture_tree, "normal")
+    r = subprocess.run(cmd, env=env, text=True, capture_output=True, timeout=20)
+    assert r.returncode == 0, (r.stdout, r.stderr)
+    q = json.loads(receipt.read_text(encoding="utf-8"))
+    assert "codexExe" in q and q["codexExe"] is None
+    assert "[codex-pin]" not in r.stdout
 
 
 def test_startup_consumes_same_deadline_without_starting_provider(fixture_tree):
