@@ -14,6 +14,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -2196,3 +2197,113 @@ def test_kernel_filing_same_date_block_revision_replaces_the_block(tmp_path):
     spec = git_raw(bare, "show", f"{new_tip}:specs/mlv-app.md").decode("utf-8")
     assert spec.startswith(KF_SPEC_SEED + "\n" + revised)
     assert "A block for" not in spec and spec.count("<!-- outbox:") == 1
+
+
+# ---------- validate / check-commits judge the card the drain will actually append ----------
+#
+# Named mutations for this block (each turns the named tests red, then is reverted):
+#   M13 drop the rendered-card check from cmd_validate        -> the over-limit validate tests
+#   M14 drop the rendered-card check from check_commit        -> test_check_commits_lists_an_item_whose_rendered_card_is_over_the_limit
+#   M15 count the bare body instead of the rendered block     -> test_validate_accepts_a_card_exactly_at_the_rendered_limits (the +1 case passes)
+
+def _vendored_card_limits() -> tuple[int, int]:
+    text = (FIXTURE_DIR / "validate-cards.mjs").read_text(encoding="utf-8")
+    lines = int(re.search(r"export const MAX_CARD_LINES = (\d+);", text).group(1))
+    size = int(re.search(r"export const MAX_CARD_BYTES = (\d+);", text).group(1))
+    return lines, size
+
+
+def _rendered_card_size(body: str) -> tuple[int, int]:
+    """(lines, bytes) of the block the drain appends, counted the way the bus validator counts a card."""
+    _key, block = ob.render_block({"meta": {"target": CARDS}, "body": body}, "0" * 40)
+    rows = block.strip("\n").split("\n")
+    return len(rows), len("\n".join(rows).encode("utf-8"))
+
+
+def _card_with_rendered_bytes(target_bytes: int) -> str:
+    """A card whose RENDERED size is exactly target_bytes (one padded note line)."""
+    base = CARD_BODY + "- **Note:** "
+    pad = target_bytes - _rendered_card_size(base)[1]
+    assert pad >= 0
+    return base + "x" * pad + "\n"
+
+
+def _card_with_rendered_lines(n_lines: int) -> str:
+    body = CARD_BODY
+    while _rendered_card_size(body)[0] < n_lines:
+        body += f"- **Note:** line {_rendered_card_size(body)[0]}\n"
+    assert _rendered_card_size(body)[0] == n_lines
+    return body
+
+
+def _write_card_item(directory: Path, body: str, name: str = "20261009-a-card.md") -> Path:
+    path = directory / name
+    path.write_text(item_text(target=CARDS, body=body), encoding="utf-8")
+    return path
+
+
+def test_card_limits_are_the_vendored_bus_validators():
+    assert (ob.MAX_CARD_LINES, ob.MAX_CARD_BYTES) == _vendored_card_limits()
+
+
+def test_validate_refuses_a_card_in_limits_bare_but_over_in_bytes_once_rendered(tmp_path, capsys):
+    _max_lines, max_bytes = _vendored_card_limits()
+    body = _card_with_rendered_bytes(max_bytes + 1)
+    assert len(body.rstrip("\n").encode("utf-8")) <= max_bytes < _rendered_card_size(body)[1]
+    item = _write_card_item(tmp_path, body)
+    assert ob.main(["--repo", str(tmp_path), "validate", str(item)]) == 1
+    err = capsys.readouterr().err
+    assert "CARD_INVALID" in err and f"{max_bytes + 1} bytes" in err and f"limit is {max_bytes}" in err
+
+
+def test_validate_refuses_a_card_in_limits_bare_but_over_in_lines_once_rendered(tmp_path, capsys):
+    max_lines, _max_bytes = _vendored_card_limits()
+    body = _card_with_rendered_lines(max_lines + 1)
+    assert len(body.rstrip("\n").split("\n")) == max_lines
+    item = _write_card_item(tmp_path, body)
+    assert ob.main(["--repo", str(tmp_path), "validate", str(item)]) == 1
+    err = capsys.readouterr().err
+    assert "CARD_INVALID" in err and f"{max_lines + 1} lines" in err and f"limit is {max_lines}" in err
+
+
+def test_validate_accepts_a_card_exactly_at_the_rendered_limits(tmp_path, capsys):
+    """No false refusal: the boundary is the rendered size, computed from render_block's real overhead."""
+    max_lines, max_bytes = _vendored_card_limits()
+    at_bytes = _write_card_item(tmp_path, _card_with_rendered_bytes(max_bytes), "20261009-at-bytes.md")
+    at_lines = _write_card_item(tmp_path, _card_with_rendered_lines(max_lines), "20261009-at-lines.md")
+    assert ob.main(["--repo", str(tmp_path), "validate", str(at_bytes), str(at_lines)]) == 0
+    over = _write_card_item(tmp_path, _card_with_rendered_bytes(max_bytes + 1), "20261009-over-by-one.md")
+    assert ob.main(["--repo", str(tmp_path), "validate", str(over)]) == 1
+    assert capsys.readouterr().err.count("REFUSED") == 1
+
+
+def test_validate_does_not_apply_the_card_limit_to_other_targets(tmp_path):
+    long_trap = tmp_path / "20261009-long-trap.md"
+    long_trap.write_text(item_text(body="### heading\n" + "x" * 5000 + "\n"), encoding="utf-8")
+    assert ob.main(["--repo", str(tmp_path), "validate", str(long_trap)]) == 0
+
+
+def test_validate_judges_a_pending_card_at_the_full_width_source_commit(tmp_path):
+    """PENDING resolves to a full commit at drain time; validate renders a 40-hex placeholder, so the
+    marker width is the drain's worst case and a card at the limit under it is accepted."""
+    _max_lines, max_bytes = _vendored_card_limits()
+    item = tmp_path / "20261009-pending-card.md"
+    item.write_text(item_text(target=CARDS, body=_card_with_rendered_bytes(max_bytes), source_commit="PENDING"),
+                    encoding="utf-8")
+    assert ob.main(["--repo", str(tmp_path), "validate", str(item)]) == 0
+
+
+def test_check_commits_lists_an_item_whose_rendered_card_is_over_the_limit(tmp_path):
+    _max_lines, max_bytes = _vendored_card_limits()
+    src, base = _range_repo(tmp_path)
+    over_name, ok_name = "20261009-over-card.md", "20261009-ok-card.md"
+    _commit(src, {f"doctrine-outbox/{over_name}": item_text(target=CARDS, body=_card_with_rendered_bytes(max_bytes + 1))},
+            f"add an over-limit card\n\nDoctrine-Export: outbox {over_name}")
+    _commit(src, {f"doctrine-outbox/{ok_name}": item_text(target=CARDS, body=_card_with_rendered_bytes(max_bytes))},
+            f"add an in-limit card\n\nDoctrine-Export: outbox {ok_name}")
+    failures = ob.check_commits(src, f"{base}..HEAD", [])
+    assert len(failures) == 1
+    (problems,) = failures.values()
+    assert len(problems) == 1
+    assert problems[0].startswith(f"DOCTRINE_EXPORT_OUTBOX_ITEM_INVALID: doctrine-outbox/{over_name}")
+    assert "CARD_INVALID" in problems[0] and f"{max_bytes + 1} bytes" in problems[0]

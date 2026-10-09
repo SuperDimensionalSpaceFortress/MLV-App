@@ -88,6 +88,10 @@ CARDS_TARGET = f"specs/{PROJECT}/cards.md"
 TARGETS = ("RECEIPTS.md", "TRAPS.md", "RULINGS.md", CARDS_TARGET)
 KINDS = ("receipt", "trap", "ruling")
 CARD_VALIDATOR_REL = "tools/validate-cards.mjs"
+# R14.1 card limits, mirrored from the bus's tools/validate-cards.mjs (MAX_CARD_LINES/MAX_CARD_BYTES);
+# a test pins them to the vendored copy. The drain's authority is still that validator.
+MAX_CARD_LINES = 15
+MAX_CARD_BYTES = 2000
 CARD_HEADING_RE = re.compile(r"^## " + re.escape(PROJECT) + r"/[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 CARDS_TITLE = f"# {PROJECT} cards (R14.1; written only by {PROJECT})\n\n"
 WORD_CAP = 450
@@ -344,6 +348,22 @@ def render_block(item: dict, source_commit: str, project: str = PROJECT) -> tupl
 def item_heading(item: dict) -> str:
     """The `### ` line an item opens with -- how a published_as claim is looked up."""
     return item["body"].lstrip().splitlines()[0].rstrip()
+
+
+def screen_rendered_card(item: dict) -> None:
+    """Refuse a card whose RENDERED block (what the drain appends: body plus the Outbox note) is over
+    the validator's limits, so it fails at authoring time and not after it merges. The drain renders
+    with the resolved 40-hex source commit, so PENDING is judged at that full width."""
+    if item["meta"]["target"] != CARDS_TARGET:
+        return
+    src = item["meta"]["source_commit"]
+    _key, block = render_block(item, "0" * 40 if src == "PENDING" else src)
+    rows = block.replace("\r\n", "\n").strip("\n").split("\n")
+    size = len("\n".join(rows).encode("utf-8"))
+    if len(rows) > MAX_CARD_LINES:
+        raise Refusal("CARD_INVALID", f"rendered card is {len(rows)} lines; the limit is {MAX_CARD_LINES}")
+    if size > MAX_CARD_BYTES:
+        raise Refusal("CARD_INVALID", f"rendered card is {size} bytes; the limit is {MAX_CARD_BYTES}")
 
 
 # ---------- repository queries (committed bytes only, never the worktree) ----------
@@ -1336,6 +1356,7 @@ def check_commit(repo: pathlib.Path, sha: str, added_items: set[str],
         try:
             parsed = parse_item(text + "\n")
             screen_law4(parsed["body"], deny_terms)
+            screen_rendered_card(parsed)
         except Refusal as e:
             problems.append(f"DOCTRINE_EXPORT_OUTBOX_ITEM_INVALID: {norm}: {e}")
     return problems
@@ -1373,6 +1394,7 @@ def cmd_validate(paths: list[pathlib.Path], deny_terms: list[tuple[str, str]]) -
                 text += "\n"
             item = parse_item(text)
             screen_law4(item["body"], deny_terms)
+            screen_rendered_card(item)
         except Refusal as e:
             print(f"[doctrine-outbox] REFUSED {p}: {e}", file=sys.stderr)
             ok = False
