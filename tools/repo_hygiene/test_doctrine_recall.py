@@ -318,6 +318,198 @@ class CliTests(unittest.TestCase):
         self.assertIn("corpus unavailable", err)
 
 
+SIBLING_CARD = """# other cards (R14.1; written only by other)
+
+## other/read-only-sandbox-hides-the-repo
+rule: a reviewer launched in a read-only sandbox on Windows cannot read the repo, so its verdict is blind.
+mechanism: the sandbox setup refresh fails and every shell read returns an error the reviewer reads as a finding.
+check: run one read in the same sandbox before trusting the verdict.
+supersedes: none
+evidence: reported
+
+## other/second-card-about-quartz
+rule: an unrelated lesson about quartz crystals.
+"""
+
+OWN_CARD = """# mlv-app cards (R14.1; written only by mlv-app)
+
+## mlv-app/own-card-about-zebrafish
+rule: the zebrafish lesson that only this project wrote and must not echo back to itself.
+"""
+
+
+OTHER_CARDS = "specs/other/cards.md"
+OWN_CARDS = "specs/mlv-app/cards.md"
+
+
+def make_bus(directory: Path, cards: dict[str, str]) -> Path:
+    bus = directory / "bus"
+    for project, text in cards.items():
+        (bus / "specs" / project).mkdir(parents=True, exist_ok=True)
+        write(bus / "specs" / project, "cards.md", text)
+    return bus
+
+
+class CardsCorpusTests(unittest.TestCase):
+    """DOCTRINE-RECALL-READS-CARDS-1: the cards channel (R14) is part of the corpus."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+        self.bus = make_bus(self.dir, {"other": SIBLING_CARD, "mlv-app": OWN_CARD})
+
+    def search(self, query):
+        return recall.search(query, self.bus, None, today=TODAY, blame_budget_s=0)
+
+    def test_a_query_hits_a_sibling_card_and_names_its_file_line_and_project(self):
+        result = self.search("read-only sandbox reviewer blind verdict")
+        hit = result["hits"][0]
+        self.assertEqual((hit["file"], hit["project"], hit["source"]), ("specs/other/cards.md", "other", "bus"))
+        self.assertEqual(hit["line"], SIBLING_CARD.splitlines().index("## other/read-only-sandbox-hides-the-repo") + 1)
+        self.assertIn("run one read in the same sandbox", " ".join(hit["extracts"]))
+        self.assertRegex(recall.render(result), r"#1 score [\d.]+  specs/other/cards\.md:\d+  undated \[other\]")
+
+    def test_this_projects_own_cards_are_excluded(self):
+        result = self.search("zebrafish")
+        self.assertEqual(result["hits"], [])
+        self.assertFalse(any(h["file"] == OWN_CARDS for h in self.search("cards lesson rule")["hits"]))
+
+    def test_own_project_is_derived_from_the_consumer_doc(self):
+        self.assertEqual(recall.own_project(), "mlv-app")
+        doc = write(self.dir, "consumer.md", "hashes of `specs/some-project.md` and `specs/other.md`\n")
+        self.assertEqual(recall.own_project(doc), "some-project")
+        self.assertEqual(recall.own_project(self.dir / "missing.md"), recall.DEFAULT_OWN_PROJECT)
+        result = recall.search("zebrafish", self.bus, None, today=TODAY, blame_budget_s=0, own="other")
+        self.assertEqual(result["hits"][0]["project"], "mlv-app")
+
+    def test_entry_project_reports_the_owning_directory_for_card_entries(self):
+        entries = recall.split_entries(SIBLING_CARD, "bus", "specs/other/cards.md")
+        self.assertEqual({recall.entry_project(e) for e in entries}, {"other"})
+        self.assertEqual(recall.card_project("specs\\adobe-ingester\\cards.md"), "adobe-ingester")
+        self.assertEqual(recall.card_project("TRAPS.md"), "")
+        self.assertEqual(recall.card_project("specs/a/b/cards.md"), "")
+
+    def test_a_cards_only_bus_is_a_corpus_not_a_refusal(self):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = recall.main(["--bus", str(self.bus), "--project-memory", str(self.dir / "none"),
+                                "--blame-timeout", "0", "quartz crystals"])
+        self.assertEqual(code, 0, err.getvalue())
+        self.assertIn("specs/other/cards.md", out.getvalue())
+
+    def test_a_bus_with_only_its_own_cards_is_still_the_refusal(self):
+        bus = make_bus(self.dir / "solo", {"mlv-app": OWN_CARD})
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = recall.main(["--bus", str(bus), "--blame-timeout", "0", "zebrafish"])
+        self.assertEqual((code, out.getvalue()), (2, ""))
+        self.assertIn(f"corpus unavailable at {bus} (no TRAPS.md/RECEIPTS.md/RULINGS.md)", err.getvalue())
+
+    def test_cards_join_the_traps_corpus_without_displacing_it(self):
+        write(self.bus, "TRAPS.md", TRAPS_FIXTURE)
+        result = recall.search("powershell ssh session pagefile leak", self.bus, None, today=TODAY, blame_budget_s=0)
+        self.assertEqual(result["hits"][0]["file"], "TRAPS.md")
+        self.assertTrue(any(e for e in recall.load_entries(self.bus, None) if e.file == "specs/other/cards.md"))
+
+
+@unittest.skipUnless(shutil.which("git"), "git is not installed")
+class FoldDebtTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+        self.bus = self.dir / "bus"
+        self.bus.mkdir()
+        self.git("init", "-q")
+
+    def git(self, *args):
+        done = subprocess.run(
+            ["git", "-C", str(self.bus), "-c", "user.name=t", "-c", "user.email=t@example.invalid",
+             "-c", "commit.gpgsign=false", *args],
+            check=True, capture_output=True, text=True,
+        )
+        return done.stdout.strip()
+
+    def commit(self, subject, files):
+        for rel, text in files.items():
+            path = self.bus / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
+            self.git("add", "--", str(path.relative_to(self.bus)))
+        self.git("commit", "-q", "-m", subject)
+        return self.git("rev-parse", "HEAD")
+
+    def run_main(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                code = recall.main(list(argv))
+            except SystemExit as exc:
+                code = exc.code
+        return code, out.getvalue(), err.getvalue()
+
+    def build(self):
+        base_trap = "- 2026-10-01 (fleet): base trap\n"
+        before = self.commit("old sibling card", {OTHER_CARDS: "## other/old\nrule: old.\n"})
+        cursor = self.commit("cursor", {"TRAPS.md": base_trap})
+        card = self.commit(
+            "sibling card after the cursor", {OTHER_CARDS: "## other/old\nrule: old.\n\n## other/new\nrule: new.\n"}
+        )
+        trap = self.commit("trap after the cursor", {"TRAPS.md": base_trap + "- 2026-10-09 (fleet): new trap\n"})
+        own = self.commit("own card after the cursor", {OWN_CARDS: OWN_CARD})
+        self.commit("unrelated file", {"README.md": "x\n"})
+        return before, cursor, card, trap, own
+
+    def test_counts_card_and_traps_commits_after_the_cursor_and_ignores_the_rest(self):
+        before, cursor, card, trap, own = self.build()
+        code, out, err = self.run_main("--bus", str(self.bus), "--fold-debt", "--since", cursor[:7])
+        self.assertEqual((code, err), (0, ""))
+        data = json.loads(out)
+        self.assertEqual(data["count"], 2)
+        self.assertEqual([c["sha"] for c in data["commits"]], [trap, card])  # newest first
+        self.assertEqual(data["commits"][0]["files"], ["TRAPS.md"])
+        self.assertEqual(data["commits"][1]["files"], ["specs/other/cards.md"])
+        self.assertEqual(data["commits"][1]["subject"], "sibling card after the cursor")
+        self.assertRegex(data["commits"][1]["date"], r"^\d{4}-\d\d-\d\dT")
+        self.assertEqual((data["since_commit"], data["own_project"]), (cursor, "mlv-app"))
+        self.assertNotIn(own, [c["sha"] for c in data["commits"]])
+        self.assertNotIn(before, [c["sha"] for c in data["commits"]])
+
+    def test_a_commit_touching_own_and_sibling_cards_counts_only_the_sibling_file(self):
+        cursor = self.commit("cursor", {"README.md": "x\n"})
+        both = self.commit("both", {OTHER_CARDS: "## other/a\nrule: a.\n", OWN_CARDS: OWN_CARD})
+        result, code, _ = recall.fold_debt(self.bus, cursor, "mlv-app")
+        self.assertEqual(code, 0)
+        self.assertEqual([(c["sha"], c["files"]) for c in result["commits"]], [(both, ["specs/other/cards.md"])])
+
+    def test_an_unknown_sha_is_a_typed_refusal(self):
+        self.build()
+        for bad in ("deadbeef", "not-a-sha", "--output=x"):
+            with self.subTest(bad=bad):
+                code, out, err = self.run_main("--bus", str(self.bus), "--fold-debt", f"--since={bad}")
+                self.assertEqual((code, out), (recall.EXIT_UNKNOWN_SHA, ""))
+                self.assertIn("unknown sha", err)
+
+    def test_a_bus_that_is_not_a_git_checkout_is_a_typed_git_failure(self):
+        plain = self.dir / "plain"
+        plain.mkdir()
+        code, out, err = self.run_main("--bus", str(plain), "--fold-debt", "--since", "abc1234")
+        self.assertEqual((code, out), (recall.EXIT_FOLD_DEBT_GIT, ""))
+        self.assertIn("not a git checkout", err)
+
+    def test_a_git_timeout_is_a_typed_git_failure_not_unknown_sha(self):
+        cursor = self.build()[1]
+        with mock.patch.object(recall, "_git_output", return_value=(None, "timeout")):
+            _, code, _ = recall.fold_debt(self.bus, cursor, "mlv-app")
+        self.assertEqual(code, recall.EXIT_FOLD_DEBT_GIT)
+
+    def test_usage_errors_exit_2(self):
+        self.assertEqual(self.run_main("--bus", str(self.bus), "--fold-debt")[0], 2)
+        self.assertEqual(self.run_main("--bus", str(self.bus), "--since", "abc1234", "words")[0], 2)
+        self.assertEqual(self.run_main("--bus", str(self.bus), "--fold-debt", "--since", "abc1234", "words")[0], 2)
+
+
 class _HungGit:
     """A Popen stand-in whose pipe never closes: every communicate() times out, wait() must not be used."""
 

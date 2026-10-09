@@ -12,12 +12,27 @@ Read-only, offline, stdlib only. It never writes to the bus and never injects bu
 lane prompt (R15.2: lanes still get doctrine only through the Compose brief). It is a hub and
 diagnosis tool.
 
+CORPUS. TRAPS.md, RECEIPTS.md and RULINGS.md, plus the cards channel (bus ruling R14): every
+specs/<project>/cards.md of every OTHER project (this project's own cards are its own words, so
+they are skipped). One `## <project>/<slug>` card is one entry; its hit names the cards file and
+line and reports the owning project (the directory name). A bus with only cards files is a
+corpus; a bus with none of the four kinds is still refused.
+
+FOLD DEBT. `--fold-debt --since SHA` is the input of the DOCTRINE-FOLD-CADENCE-1 cadence: it lists,
+as JSON, the bus content commits after SHA (SHA..HEAD) that touched TRAPS.md, RECEIPTS.md,
+RULINGS.md or another project's specs/<project>/cards.md: sha, date, subject and the counted
+files, plus a count. A commit that only touched this project's own cards is not debt. Bounded git
+calls under the same deadline helper as blame.
+
 Usage:
     py -3 tools/doctrine/doctrine_recall.py [--bus PATH] [--project-memory PATH] [--top N]
         [--json] "<symptom words or a pasted log tail>"      (use - to read the query from stdin)
+    py -3 tools/doctrine/doctrine_recall.py [--bus PATH] [--git-timeout S] --fold-debt --since SHA
 
-Exit codes: 0 for every search (hits or none); 2 for a usage error, a missing bus, or a bus
-directory with no corpus (none of TRAPS.md / RECEIPTS.md / RULINGS.md, or no entries parsed).
+Exit codes: 0 for every search (hits or none) and for a fold-debt listing; 2 for a usage error, a
+missing bus, or a bus directory with no corpus (none of TRAPS.md / RECEIPTS.md / RULINGS.md /
+another project's cards, or no entries parsed); 3 for --fold-debt with a SHA the bus does not
+know; 4 for --fold-debt when the bus is not a git checkout or git fails or times out.
 Writes nothing to disk: bus commit lookups read git blame through a pipe under one deadline.
 """
 
@@ -40,6 +55,14 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_BUS = Path(r"C:\!Layi Wkspc\softwarefactory-fleet-doctrine")
 CONSUMER_DOC = REPO_ROOT / "agents" / "doctrine-consumer.md"
 BUS_FILES = ("TRAPS.md", "RECEIPTS.md", "RULINGS.md")
+CARDS_GLOB = "specs/*/cards.md"
+CARDS_PATH_RE = re.compile(r"^specs/([^/]+)/cards\.md$")
+DEFAULT_OWN_PROJECT = "mlv-app"
+OWN_PROJECT_RE = re.compile(r"`specs/([a-z0-9][a-z0-9-]*)\.md`")
+FOLD_DEBT_BUDGET_S = 10.0
+EXIT_UNKNOWN_SHA = 3
+EXIT_FOLD_DEBT_GIT = 4
+SHA_RE = re.compile(r"[0-9a-fA-F]{4,40}")
 DEFAULT_TOP = 5
 MAX_QUERY_TERMS = 30
 # The brief allows 5 s for blame. Blame's worst case is this budget plus KILL_GRACE_S of cleanup
@@ -224,8 +247,14 @@ def _tag_from(text: str) -> str:
     return ""
 
 
+def card_project(path: str) -> str:
+    """The owning project of a specs/<project>/cards.md path, or "" for any other file."""
+    match = CARDS_PATH_RE.match(path.replace("\\", "/"))
+    return match.group(1) if match else ""
+
+
 def entry_project(entry: Entry) -> str:
-    return _tag_from(entry.heading) or _tag_from(entry.section)
+    return card_project(entry.file) or _tag_from(entry.heading) or _tag_from(entry.section)
 
 
 def tokenize(text: str) -> list[str]:
@@ -253,13 +282,35 @@ def _truncate(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 3].rstrip() + "..."
 
 
-def load_entries(bus: Path | None, project_memory: Path | None) -> list[Entry]:
+def own_project(consumer_doc: Path | None = None) -> str:
+    """This project's id on the bus: the `specs/<id>.md` spec the consumer doc names."""
+    try:
+        text = (consumer_doc or CONSUMER_DOC).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return DEFAULT_OWN_PROJECT
+    named = OWN_PROJECT_RE.search(text)
+    return named.group(1) if named else DEFAULT_OWN_PROJECT
+
+
+def card_files(bus: Path, own: str) -> list[Path]:
+    """Every other project's cards file in the bus checkout, sorted, this project's own excluded."""
+    return [
+        path
+        for path in sorted(bus.glob(CARDS_GLOB))
+        if path.is_file() and path.parent.name.lower() != own.lower()
+    ]
+
+
+def load_entries(bus: Path | None, project_memory: Path | None, own: str | None = None) -> list[Entry]:
     entries: list[Entry] = []
     if bus is not None:
         for name in BUS_FILES:
             path = bus / name
             if path.is_file():
                 entries += split_entries(path.read_text(encoding="utf-8", errors="replace"), "bus", name)
+        for path in card_files(bus, own if own is not None else own_project()):
+            rel = f"specs/{path.parent.name}/cards.md"
+            entries += split_entries(path.read_text(encoding="utf-8", errors="replace"), "bus", rel)
     if project_memory is not None and project_memory.is_dir():
         for path in sorted(project_memory.glob("*.md")):
             entries += split_entries(
@@ -452,10 +503,11 @@ def search(
     top: int = DEFAULT_TOP,
     today: date | None = None,
     blame_budget_s: float = BLAME_BUDGET_S,
+    own: str | None = None,
 ) -> dict:
     started = time.monotonic()
     today = today or date.today()
-    entries = load_entries(bus, project_memory)
+    entries = load_entries(bus, project_memory, own)
     if bus is not None and not any(entry.source == "bus" for entry in entries):
         raise CorpusUnavailable(bus)
     terms, ranked = rank(entries, query, today, top)
@@ -495,6 +547,64 @@ def render(result: dict) -> str:
     return "\n".join(lines)
 
 
+def _fold_debt_files(files: list[str], own: str) -> list[str]:
+    """The files of one commit that count as bus content debt (this project's own cards excluded)."""
+    counted = []
+    for name in files:
+        owner = card_project(name)
+        if name in BUS_FILES or (owner and owner.lower() != own.lower()):
+            counted.append(name)
+    return counted
+
+
+def fold_debt(bus: Path, since: str, own: str, budget_s: float = FOLD_DEBT_BUDGET_S) -> tuple[dict | None, int, str]:
+    """Bus content commits in since..HEAD touching TRAPS/RECEIPTS/RULINGS or another project's cards.
+
+    Returns (result, exit_code, message). Read-only: three bounded git calls on one shared deadline.
+    """
+    if not (bus / ".git").exists():
+        return None, EXIT_FOLD_DEBT_GIT, f"bus is not a git checkout: {bus}"
+    deadline = time.monotonic() + budget_s
+    resolved = None
+    if SHA_RE.fullmatch(since):
+        out, status = _git_output(["-C", str(bus), "rev-parse", "--verify", "--quiet", f"{since}^{{commit}}"], deadline)
+        if status == "timeout":
+            return None, EXIT_FOLD_DEBT_GIT, "git timed out resolving the cursor sha"
+        resolved = out.strip() if status == "ok" and out else None
+    if not resolved:
+        return None, EXIT_UNKNOWN_SHA, f"unknown sha {since!r}: not a commit in {bus}"
+    head_out, head_status = _git_output(["-C", str(bus), "rev-parse", "HEAD"], deadline)
+    log_out, log_status = _git_output(
+        [
+            "-C", str(bus), "log", "--name-only", "--no-renames", "--format=%x1e%H%x1f%cI%x1f%s",
+            f"{resolved}..HEAD", "--", *BUS_FILES, CARDS_GLOB,
+        ],
+        deadline,
+    )
+    if head_status != "ok" or log_status != "ok" or log_out is None:
+        return None, EXIT_FOLD_DEBT_GIT, f"git log failed ({log_status if log_status != 'ok' else head_status})"
+    commits = []
+    for record in log_out.split("\x1e"):
+        if not record.strip():
+            continue
+        header, _, names = record.partition("\n")
+        parts = header.split("\x1f")
+        if len(parts) != 3:
+            continue
+        counted = _fold_debt_files([n.strip() for n in names.splitlines() if n.strip()], own)
+        if counted:
+            commits.append({"sha": parts[0], "date": parts[1], "files": counted, "subject": parts[2]})
+    return {
+        "bus": str(bus),
+        "since": since,
+        "since_commit": resolved,
+        "head": (head_out or "").strip(),
+        "own_project": own,
+        "count": len(commits),
+        "commits": commits,
+    }, 0, ""
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Rank fleet-doctrine bus entries against a symptom (read-only, offline). "
@@ -507,7 +617,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--blame-timeout", type=float, default=BLAME_BUDGET_S, help="total seconds for bus commit lookups; 0 disables"
     )
-    parser.add_argument("query", nargs="+", help="symptom words or a pasted log tail; '-' reads stdin")
+    parser.add_argument(
+        "--fold-debt", action="store_true",
+        help="print, as JSON, the bus content commits since --since that touch TRAPS/RECEIPTS/RULINGS or another project's cards",
+    )
+    parser.add_argument("--since", help="with --fold-debt: the cursor commit; commits after it count")
+    parser.add_argument(
+        "--git-timeout", type=float, default=FOLD_DEBT_BUDGET_S, help="with --fold-debt: total seconds for the git calls"
+    )
+    parser.add_argument("query", nargs="*", help="symptom words or a pasted log tail; '-' reads stdin")
     return parser
 
 
@@ -518,19 +636,35 @@ def main(argv: list[str] | None = None) -> int:
         except (AttributeError, ValueError):
             pass
     args = build_parser().parse_args(argv)  # argparse exits 2 on a usage error
-    query = sys.stdin.read() if args.query == ["-"] else " ".join(args.query)
-    if not query.strip() or args.top < 1:
-        print("doctrine-recall: need a non-empty query and --top >= 1", file=sys.stderr)
-        return 2
+    if args.fold_debt:
+        if not args.since or args.query or args.git_timeout <= 0:
+            print("doctrine-recall: --fold-debt needs --since SHA, --git-timeout > 0 and no query", file=sys.stderr)
+            return 2
+    else:
+        if args.since:
+            print("doctrine-recall: --since only applies with --fold-debt", file=sys.stderr)
+            return 2
+        query = sys.stdin.read() if args.query == ["-"] else " ".join(args.query)
+        if not query.strip() or args.top < 1:
+            print("doctrine-recall: need a non-empty query and --top >= 1", file=sys.stderr)
+            return 2
     bus = resolve_bus(args.bus)
     if not bus.is_dir():
         print(f"doctrine-recall: bus not found: {bus} (pass --bus PATH)", file=sys.stderr)
         return 2
+    if args.fold_debt:
+        result, code, message = fold_debt(bus, args.since, own_project(), args.git_timeout)
+        if result is None:
+            print(f"doctrine-recall: fold-debt: {message}", file=sys.stderr)
+            return code
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
     memory = Path(args.project_memory) if args.project_memory else REPO_ROOT / ".claude-state" / "project-memory"
     try:
         result = search(query, bus, memory if memory.is_dir() else None, args.top, blame_budget_s=args.blame_timeout)
     except CorpusUnavailable:
         found = [name for name in BUS_FILES if (bus / name).is_file()]
+        found += [f"specs/{path.parent.name}/cards.md" for path in card_files(bus, own_project())]
         reason = "no TRAPS.md/RECEIPTS.md/RULINGS.md" if not found else f"no entries parsed from {', '.join(found)}"
         print(f"doctrine-recall: corpus unavailable at {bus} ({reason})", file=sys.stderr)
         return 2
