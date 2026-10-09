@@ -10,6 +10,19 @@
 #      Process _Total / Idle / System values, \Processor(_Total) privileged / user / DPC / interrupt time, and per-core \Processor Information(*) load with
 #      P-cores and E-cores apart (core_class unknown where the topology cannot be derived). A counter the host lacks is null with a reason under `notes`.
 #      The v1 `samples` and `top` fields are unchanged, and a v1 probe line still parses.
+#      ONE AGGREGATION RULE for every per-process and per-core figure (r2, hub ruling):
+#        VALID-SAMPLE MEAN: a figure is the mean over the samples whose counter status is valid for THAT instance; an invalid or missing sample is never zero-filled.
+#          Every row carries validSamples and totalSamples (the probe's sample sets); validSamples < totalSamples sets `incomplete: true` and a note names the count of
+#          incomplete rows; a row with validSamples = 0 is omitted from the attributed sum and the core list and counted in a note.
+#        PID-KEYED: process rows are keyed on (instance name, ID Process), never the PDH instance name alone, because "name#n" is reassigned when a process exits. One name
+#          under two pids is TWO rows, each with its own valid-sample mean (and, covering only part of the window, each incomplete); a sample whose ID Process cannot be
+#          read cannot be keyed and is counted in a note. (Rejected: flag the name pidUnstable and drop it from the sum -- that hides real load from the gap. Known limit: two
+#          lives of one name cover disjoint parts of the window, so their means add to more than the window mean of that slot; both rows are flagged incomplete.)
+#        GAP: processorTotal (\Processor(_Total)), processActive (Process(_Total) minus Process(Idle), paired within a sample), attributed (sum of the top-10 rows), and
+#          unattributedKernel = processorTotal - processActive (kernel time that no process is charged for). The acceptance gap is |processActive - attributed|
+#          (`attribution_gap_points`); the 5-point bound is unchanged. All four figures are printed on the `attr gap` line.
+#        RAW RETENTION: the raw VENUE_QUIET line is written verbatim (unrounded) to <WorkDir>\<jobId>.json, beside the job file, and its path is printed as `  raw <path>`.
+#      None of this feeds the QUIET decision: its threshold, v1 fields and the offline -SamplesJson output are byte-identical to before.
 #   3. decides: QUIET when the UNROUNDED mean of the 3 samples is <= -ThresholdPercent (the printed mean is rounded to 0.1 for display only). A
 #      failed counter read makes the check UNKNOWN, never quiet.
 #   4. re-probes every -RecheckSec until QUIET or -MaxWaitSec, then prints `QUIET mean=<x>` or `COOLDOWN_UNMET mean=<x>` (a MEASURED busy venue) and the top
@@ -192,7 +205,7 @@ function Wait-QueueGate([string]$Name) {
 # Each of the 3 probe samples is ONE Get-Counter call over every counter, so the extra counters cost one read, not one per counter; a counter the host lacks
 # is recorded as null with a reason in `notes` and never fails the probe (if the combined call throws, each counter group is read on its own).
 # PERCENT BASIS: every \Process(*) percent below is the counter value divided by cpu_count (logical processors), i.e. percent of the WHOLE machine, so it is
-# comparable with \Processor(_Total)\% Processor Time (which the gate decides on). All v2 values are means over the sample sets that read cleanly.
+# comparable with \Processor(_Total)\% Processor Time (which the gate decides on). All v2 values are means over the samples that are VALID for that instance (see the gate header).
 $probeText = @'
 $ErrorActionPreference = 'Stop'
 $cpuCount = [Environment]::ProcessorCount
@@ -227,11 +240,11 @@ function Read-CounterSet {
         if ($lp -notmatch '^\\\\[^\\]*\\([^\\(]+)\(') { continue }
         $obj = $Matches[1]; $leaf = $lp.Substring($lp.LastIndexOf('\') + 1)
         $inst = $(if ($lp -match '\((.*)\)\\[^\\]*$') { $Matches[1] } else { '' })
+        # an instance whose status is invalid is RECORDED with a $null value (seen, not valid): the aggregation counts valid samples per instance and never zero-fills
         $val = Get-GoodValue $s
-        if ($null -eq $val) { continue }
-        if ($obj -eq 'processor') { if ($inst -eq '_total') { $set.cpu[$leaf] = $val } }
+        if ($obj -eq 'processor') { if ($inst -eq '_total' -and $null -ne $val) { $set.cpu[$leaf] = $val } }
         elseif ($obj -eq 'process') {
-            if ($leaf -eq '% processor time') { $set.proc[$inst] = $val } elseif ($leaf -eq 'id process') { $set.pids[$inst] = [int64]$val }
+            if ($leaf -eq '% processor time') { $set.proc[$inst] = $val } elseif ($leaf -eq 'id process' -and $null -ne $val) { $set.pids[$inst] = [int64]$val }
         }
         elseif ($obj -eq 'processor information') { if ($leaf -eq '% processor time' -and $inst -notmatch '_total') { $set.core[$inst] = $val } }
     }
@@ -307,47 +320,87 @@ foreach ($k in $cpuNames.Keys) {
     $processor[$k] = Get-Mean @($sets | Where-Object { $_.cpu.ContainsKey($cpuNames[$k]) } | ForEach-Object { $_.cpu[$cpuNames[$k]] })
     if ($null -eq $processor[$k]) { $notes["processor.$k"] = Get-GroupWhy 'processor' }
 }
-# per-process, as percent of the whole machine (counter / cpuCount); an instance absent from a clean set counts as 0 in that set
-$procSets = @($sets | Where-Object { $_.proc.Count -gt 0 })
-$procPct = @{}; $pidOf = @{}
-foreach ($set in $procSets) {
-    foreach ($k in $set.proc.Keys) { $procPct[$k] = [double]$procPct[$k] + $set.proc[$k] }
-    foreach ($k in $set.pids.Keys) { if (-not $pidOf.ContainsKey($k)) { $pidOf[$k] = $set.pids[$k] } elseif ($pidOf[$k] -ne $set.pids[$k]) { $pidOf[$k] = -1 } }
+# per-process: VALID-SAMPLE MEAN keyed on (instance, ID Process), as percent of the whole machine (counter / cpuCount); see the gate's header for the rule
+$nSets = $sets.Count
+$acc = @{}; $seen = @{}; $keyed = @{}; $noPid = @{}
+$specialSum = @{}; $specialN = @{}
+$activeSum = 0.0; $activeN = 0
+foreach ($set in $sets) {
+    foreach ($k in $set.proc.Keys) {
+        $v = $set.proc[$k]
+        if ($k -ceq '_total' -or $k -ceq 'idle') {
+            if ($null -ne $v) { $specialSum[$k] = [double]$specialSum[$k] + $v; $specialN[$k] = 1 + [int]$specialN[$k] }
+            continue
+        }
+        $seen[$k] = $true
+        if ($null -eq $v) { continue }
+        $pidv = $set.pids[$k]
+        if ($null -eq $pidv) { $noPid[$k] = $true; continue }
+        $key = "$k|$pidv"
+        if (-not $acc.ContainsKey($key)) { $acc[$key] = @{ instance = $k; pid = [int64]$pidv; sum = 0.0; n = 0 } }
+        $acc[$key].sum += $v; $acc[$key].n++
+        $keyed[$k] = $true
+    }
+    if ($null -ne $set.proc['_total'] -and $null -ne $set.proc['idle']) { $activeSum += $set.proc['_total'] - $set.proc['idle']; $activeN++ }
 }
-foreach ($k in @($procPct.Keys)) { $procPct[$k] = $procPct[$k] / $procSets.Count / $cpuCount }
-$pTotal = $null; $pIdle = $null; $pSystem = $null; $ranked = @(); $attributed = $null; $gap = $null
-if ($procSets.Count -gt 0) {
-    if ($procPct.ContainsKey('_total')) { $pTotal = [math]::Round($procPct['_total'], 2) }
-    if ($procPct.ContainsKey('idle')) { $pIdle = [math]::Round($procPct['idle'], 2) }
-    if ($procPct.ContainsKey('system')) { $pSystem = [math]::Round($procPct['system'], 2) }
-    $ranked = @($procPct.Keys | Where-Object { $_ -ne '_total' -and $_ -ne 'idle' } | Sort-Object { $procPct[$_] } -Descending | Select-Object -First 10 | ForEach-Object {
-        [pscustomobject]@{ instance = $_; pid = $(if ($pidOf.ContainsKey($_) -and $pidOf[$_] -ge 0) { $pidOf[$_] } else { $null }); percent = [math]::Round($procPct[$_], 2) } })
-    # attributed = the top 10 plus System (counted once if System is already among them)
-    $attributed = [math]::Round((@($ranked | ForEach-Object { $_.percent }) + $(if ($null -ne $pSystem -and @($ranked | Where-Object { $_.instance -eq 'system' }).Count -eq 0) { $pSystem } else { @() }) | Measure-Object -Sum).Sum, 2)
-    if ($null -ne $processor.total_percent) { $gap = [math]::Round($processor.total_percent - $attributed, 2) }
+function Get-SpecialMean([string]$Name) { if ($specialN.ContainsKey($Name)) { $specialSum[$Name] / $specialN[$Name] / $cpuCount } else { $null } }
+$rows = @($acc.Values | ForEach-Object { [pscustomobject]@{ instance = $_.instance; pid = $_.pid; mean = $_.sum / $_.n / $cpuCount; validSamples = $_.n; totalSamples = $nSets; incomplete = ($_.n -lt $nSets) } } |
+    Sort-Object @{ Expression = 'mean'; Descending = $true }, instance, pid)
+$pTotal = $null; $pIdle = $null; $pSystem = $null; $pActive = $null; $ranked = @(); $attributed = $null; $gap = $null; $unattrKernel = $null
+if ($specialN.Count -gt 0 -or $rows.Count -gt 0) {
+    $m = Get-SpecialMean '_total'; if ($null -ne $m) { $pTotal = [math]::Round($m, 2) }
+    $m = Get-SpecialMean 'idle'; if ($null -ne $m) { $pIdle = [math]::Round($m, 2) }
+    $sysRow = @($rows | Where-Object { $_.instance -ceq 'system' } | Sort-Object validSamples -Descending | Select-Object -First 1)
+    if ($sysRow.Count -gt 0) { $pSystem = [math]::Round($sysRow[0].mean, 2) }
+    $topRows = @($rows | Select-Object -First 10)
+    $ranked = @($topRows | ForEach-Object { [pscustomobject]@{ instance = $_.instance; pid = $_.pid; percent = [math]::Round($_.mean, 2); validSamples = $_.validSamples; totalSamples = $_.totalSamples; incomplete = $_.incomplete } })
+    $attrRaw = $null; $activeRaw = $null
+    if ($topRows.Count -gt 0) { $attrRaw = ($topRows | ForEach-Object { $_.mean } | Measure-Object -Sum).Sum; $attributed = [math]::Round($attrRaw, 2) }
+    if ($activeN -gt 0) { $activeRaw = $activeSum / $activeN / $cpuCount; $pActive = [math]::Round($activeRaw, 2) }
+    if ($null -ne $activeRaw -and $null -ne $attrRaw) { $gap = [math]::Round([math]::Abs($activeRaw - $attrRaw), 2) }
+    if ($null -ne $activeRaw -and $null -ne $processor.total_percent) { $unattrKernel = [math]::Round($processor.total_percent - $activeRaw, 2) }
+    $incAll = @($rows | Where-Object { $_.incomplete }).Count
+    if ($incAll -gt 0) { $notes['process_incomplete_rows'] = "$incAll of $($rows.Count) process rows have fewer valid samples than the $nSets sample sets (ranked: $(@($topRows | Where-Object { $_.incomplete }).Count) of $($topRows.Count)); each is the mean of its valid samples" }
+    $omitted = @($seen.Keys | Where-Object { -not $keyed.ContainsKey($_) -and -not $noPid.ContainsKey($_) }).Count
+    if ($omitted -gt 0) { $notes['process_rows_omitted'] = "$omitted process instance(s) had no valid sample and are omitted from the attributed sum" }
+    $unkeyed = @($noPid.Keys | Where-Object { -not $keyed.ContainsKey($_) }).Count
+    if ($unkeyed -gt 0) { $notes['process_rows_unkeyed'] = "$unkeyed process instance(s) had a valid percent but no readable ID Process and are omitted from the attributed sum" }
+    if ($null -eq $pTotal) { $notes['process_total_percent'] = 'no valid _total sample in the process counters' }
+    if ($null -eq $pIdle) { $notes['idle_percent'] = 'no valid idle sample in the process counters' }
+    if ($null -eq $pSystem) { $notes['system_percent'] = 'no valid system sample in the process counters' }
+    if ($null -eq $attributed) { $notes['attributed_percent'] = 'no process row had a valid sample' }
+    if ($null -eq $pActive) { $notes['process_active_percent'] = 'no sample had a valid Process(_Total) and Process(Idle) together' }
+    if ($null -eq $gap) { $notes['attribution_gap_points'] = 'needs both process_active_percent and attributed_percent' }
+    if ($null -eq $unattrKernel) { $notes['unattributed_kernel_percent'] = 'needs both process_active_percent and processor.total_percent' }
 } else {
-    foreach ($f in 'process_total_percent', 'idle_percent', 'system_percent', 'top_processes', 'attributed_percent') { $notes[$f] = Get-GroupWhy 'process' }
+    foreach ($f in 'process_total_percent', 'idle_percent', 'system_percent', 'top_processes', 'attributed_percent', 'process_active_percent', 'attribution_gap_points', 'unattributed_kernel_percent') { $notes[$f] = Get-GroupWhy 'process' }
 }
-if ($procSets.Count -gt 0) {
-    if ($null -eq $pTotal) { $notes['process_total_percent'] = 'no _total instance in the process counters' }
-    if ($null -eq $pIdle) { $notes['idle_percent'] = 'no idle instance in the process counters' }
-    if ($null -eq $pSystem) { $notes['system_percent'] = 'no system instance in the process counters' }
-}
-# per-core, P-cores and E-cores apart
+# per-core, P-cores and E-cores apart: the same valid-sample mean per instance
 $topo = Get-CoreTopology
-$coreSets = @($sets | Where-Object { $_.core.Count -gt 0 })
-$coreSum = @{}
-foreach ($set in $coreSets) { foreach ($k in $set.core.Keys) { $coreSum[$k] = [double]$coreSum[$k] + $set.core[$k] } }
+$coreAcc = @{}; $coreSeen = @{}
+foreach ($set in $sets) {
+    foreach ($k in $set.core.Keys) {
+        $coreSeen[$k] = $true
+        $v = $set.core[$k]
+        if ($null -eq $v) { continue }
+        if (-not $coreAcc.ContainsKey($k)) { $coreAcc[$k] = @{ sum = 0.0; n = 0 } }
+        $coreAcc[$k].sum += $v; $coreAcc[$k].n++
+    }
+}
 $classes = @($topo.map.Values | Sort-Object -Unique)
 $cores = @(); $classAgg = [ordered]@{}
-if ($coreSets.Count -eq 0) { $notes['cores'] = Get-GroupWhy 'cores' }
+if ($coreAcc.Count -eq 0) { $notes['cores'] = Get-GroupWhy 'cores' }
 if ($topo.map.Count -eq 0 -and $topo.reason) { $notes['core_class'] = "core_class unknown: $($topo.reason)" }
-foreach ($k in @($coreSum.Keys | Sort-Object { $a = $_ -split ','; ([int]$a[0]) * 100000 + ([int]$a[1]) })) {
+foreach ($k in @($coreAcc.Keys | Sort-Object { $a = $_ -split ','; ([int]$a[0]) * 100000 + ([int]$a[1]) })) {
     $eff = $(if ($topo.map.ContainsKey($k)) { [int]$topo.map[$k] } else { $null })
     $cls = $(if ($null -eq $eff) { 'unknown' } elseif ($classes.Count -le 1) { 'uniform' } elseif ($eff -eq ($classes | Measure-Object -Maximum).Maximum) { 'P' } else { 'E' })
-    $pct = [math]::Round($coreSum[$k] / $coreSets.Count, 2)
-    $cores += [pscustomobject]@{ instance = $k; core_class = $cls; efficiency_class = $eff; percent = $pct }
+    $pct = [math]::Round($coreAcc[$k].sum / $coreAcc[$k].n, 2)
+    $cores += [pscustomobject]@{ instance = $k; core_class = $cls; efficiency_class = $eff; percent = $pct; validSamples = $coreAcc[$k].n; totalSamples = $nSets; incomplete = ($coreAcc[$k].n -lt $nSets) }
 }
+$coreInc = @($cores | Where-Object { $_.incomplete }).Count
+if ($coreInc -gt 0) { $notes['cores_incomplete'] = "$coreInc of $($cores.Count) core rows have fewer valid samples than the $nSets sample sets; each is the mean of its valid samples" }
+$coreOmitted = @($coreSeen.Keys | Where-Object { -not $coreAcc.ContainsKey($_) }).Count
+if ($coreOmitted -gt 0) { $notes['cores_omitted'] = "$coreOmitted core(s) had no valid sample and are omitted" }
 foreach ($c in ($cores | Group-Object core_class)) {
     $vals = @($c.Group | ForEach-Object { $_.percent })
     $classAgg[$c.Name] = [ordered]@{ count = $vals.Count; mean_percent = Get-Mean $vals; max_percent = ($vals | Measure-Object -Maximum).Maximum }
@@ -356,8 +409,10 @@ Write-Output ('VENUE_QUIET=' + ([ordered]@{
     schema = 'mlv-app/venue-quiet-probe/v2'; host = $env:COMPUTERNAME; samples = $samples; top = $top
     cpu_count = $cpuCount
     percent_basis = 'per-process percents are percent of the whole machine (counter / cpu_count)'
+    aggregation = 'valid-sample mean per instance; process rows keyed on (instance, pid); gap = |process_active - attributed|; unattributed_kernel = processor.total - process_active'
     processor = $processor
     process_total_percent = $pTotal; idle_percent = $pIdle; system_percent = $pSystem
+    process_active_percent = $pActive; unattributed_kernel_percent = $unattrKernel
     top_processes = $ranked; attributed_percent = $attributed; attribution_gap_points = $gap
     core_topology = $(if ($topo.map.Count -gt 0) { 'logical-processor-information-ex' } else { 'unknown' })
     core_classes = $classAgg; cores = $cores
@@ -373,8 +428,9 @@ function Write-AttributionLines($Probe) {
     try {
         $pr = $Probe.processor
         Write-Gate ("  attr cpus={0} processor total={1} privileged={2} user={3} dpc={4} interrupt={5}" -f $Probe.cpu_count, (Format-Pct $pr.total_percent), (Format-Pct $pr.privileged_percent), (Format-Pct $pr.user_percent), (Format-Pct $pr.dpc_percent), (Format-Pct $pr.interrupt_percent))
-        Write-Gate ("  attr process total={0} idle={1} system={2} attributed={3} gapVsProcessorTotal={4}" -f (Format-Pct $Probe.process_total_percent), (Format-Pct $Probe.idle_percent), (Format-Pct $Probe.system_percent), (Format-Pct $Probe.attributed_percent), $(if ($null -eq $Probe.attribution_gap_points) { 'n/a' } else { '{0:0.0} points' -f [double]$Probe.attribution_gap_points }))
-        foreach ($p in @($Probe.top_processes)) { Write-Gate ("  attr proc {0} pid={1} pct={2}" -f $p.instance, $(if ($null -eq $p.pid) { 'n/a' } else { $p.pid }), (Format-Pct $p.percent)) }
+        Write-Gate ("  attr process total={0} idle={1} system={2} attributed={3}" -f (Format-Pct $Probe.process_total_percent), (Format-Pct $Probe.idle_percent), (Format-Pct $Probe.system_percent), (Format-Pct $Probe.attributed_percent))
+        Write-Gate ("  attr gap processorTotal={0} processActive={1} attributed={2} unattributedKernel={3} gap={4}" -f (Format-Pct $pr.total_percent), (Format-Pct $Probe.process_active_percent), (Format-Pct $Probe.attributed_percent), (Format-Pct $Probe.unattributed_kernel_percent), $(if ($null -eq $Probe.attribution_gap_points) { 'n/a' } else { '{0:0.0} points' -f [double]$Probe.attribution_gap_points }))
+        foreach ($p in @($Probe.top_processes)) { Write-Gate ("  attr proc {0} pid={1} pct={2}{3}" -f $p.instance, $(if ($null -eq $p.pid) { 'n/a' } else { $p.pid }), (Format-Pct $p.percent), $(if ($p.incomplete -eq $true) { " valid=$($p.validSamples)/$($p.totalSamples) incomplete" } else { '' })) }
         $cls = @($Probe.core_classes.PSObject.Properties | ForEach-Object { "{0} n={1} mean={2} max={3}" -f $_.Name, $_.Value.count, (Format-Pct $_.Value.mean_percent), (Format-Pct $_.Value.max_percent) })
         Write-Gate ("  attr cores topology={0} {1}" -f $Probe.core_topology, $(if ($cls.Count) { $cls -join ' | ' } else { 'none' }))
         foreach ($n in @($Probe.notes.PSObject.Properties)) { Write-Gate ("  attr note {0}: {1}" -f $n.Name, $n.Value) }
@@ -389,12 +445,16 @@ while ($true) {
     $jobId = 'venue-quiet-probe-' + [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfffZ')
     $jobFile = Join-Path $WorkDir "$jobId.job.ps1"
     [IO.File]::WriteAllText($jobFile, $probeText, [Text.UTF8Encoding]::new($false))
-    $probe = $null; $why = $null; $whyKind = $null
+    $probe = $null; $why = $null; $whyKind = $null; $rawPath = $null; $rawErr = $null
     try {
         $out = @(& $umRun -ScriptPath $jobFile -JobId $jobId -AgentShare $agentShare -TimeoutSec 120 -MaxQueueWaitSec 300 -MaxClaimedWaitSec 120 6>$null)
         $r = if ($out.Count -gt 0) { $out[-1] } else { $null }
         $line = @(([string]$r.stdout) -split "`r?`n" | Where-Object { $_ -like 'VENUE_QUIET=*' }) | Select-Object -Last 1
-        if ($line) { $probe = $line.Substring('VENUE_QUIET='.Length) | ConvertFrom-Json } else { $why = "no VENUE_QUIET line (exit $($r.exitCode))"; $whyKind = 'no-VENUE_QUIET-line' }
+        if ($line) {
+            # RAW RETENTION: the probe's line, verbatim, before it is parsed (an unparseable line is evidence too); a write failure never changes the verdict
+            try { $rawPath = Join-Path $WorkDir "$jobId.json"; [IO.File]::WriteAllText($rawPath, $line.Substring('VENUE_QUIET='.Length), [Text.UTF8Encoding]::new($false)) } catch { $rawErr = [string]$_.Exception.Message; $rawPath = $null }
+            $probe = $line.Substring('VENUE_QUIET='.Length) | ConvertFrom-Json
+        } else { $why = "no VENUE_QUIET line (exit $($r.exitCode))"; $whyKind = 'no-VENUE_QUIET-line' }
     } catch { $why = [string]$_.Exception.Message; $whyKind = 'probe-failed' }
     # HOST ECHO: the probe reports the machine it ran on. An acknowledged alias of ANOTHER host's share (or any share that is not this venue's) would measure that
     # host, so the answer must come from this venue's expectedHost (case-insensitive) before any verdict is printed for it.
@@ -407,6 +467,7 @@ while ($true) {
     $last = [pscustomobject]@{ decision = $d; probe = $probe; why = $why; whyKind = $(if ($whyKind) { $whyKind } else { 'invalid-samples' }) }
     $sampleText = $(if ($samples.Count) { ($samples | ForEach-Object { if ($null -eq $_) { 'null' } else { '{0:0.0}' -f [double]$_ } }) -join '/' } else { 'none' })
     Write-Gate "PROBE $jobId $Venue samples=$sampleText mean=$(Format-Mean $d.mean) state=$($d.state)$(if ($why) { " note=$why" }) $([DateTime]::UtcNow.ToString('HH:mm:ssZ'))"
+    if ($rawPath) { Write-Gate "  raw $rawPath" } elseif ($rawErr) { Write-Gate "  raw UNWRITABLE $rawErr" }
     if ($d.state -ceq 'QUIET') { break }
     if ((Get-Date).AddSeconds($RecheckSec) -gt $deadline) { break }
     Start-Sleep -Seconds $RecheckSec

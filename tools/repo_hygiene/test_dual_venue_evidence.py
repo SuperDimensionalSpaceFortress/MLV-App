@@ -4442,7 +4442,8 @@ V2_PROBE = {"schema": "mlv-app/venue-quiet-probe/v2", "host": "BACHELOR", "sampl
             "processor": {"total_percent": 50.0, "privileged_percent": 30.0, "user_percent": 20.0, "dpc_percent": 0.5, "interrupt_percent": 1.0},
             "process_total_percent": 70.0, "idle_percent": 50.0, "system_percent": 2.5,
             "top_processes": [{"instance": "aws", "pid": 43644, "percent": 4.79}, {"instance": "system", "pid": 4, "percent": 2.5}, {"instance": "pwsh#3", "pid": None, "percent": 1.2}],
-            "attributed_percent": 8.49, "attribution_gap_points": 41.51,
+            "process_active_percent": 20.0, "unattributed_kernel_percent": 30.0,
+            "attributed_percent": 8.49, "attribution_gap_points": 11.51,
             "core_topology": "logical-processor-information-ex",
             "core_classes": {"P": {"count": 8, "mean_percent": 60.0, "max_percent": 80.0}, "E": {"count": 16, "mean_percent": 40.0, "max_percent": 55.5}},
             "cores": [{"instance": "0,0", "core_class": "P", "efficiency_class": 1, "percent": 60.0}, {"instance": "0,8", "core_class": "E", "efficiency_class": 0, "percent": 40.0}],
@@ -4481,7 +4482,8 @@ class VenueQuietAttributionTests(unittest.TestCase):
         self.assertRegex(out, r"(?m)^COOLDOWN_UNMET mean=50\.0% threshold=20(\.0)?% waitedSec=\d+$")
         self.assertRegex(out, r"(?m)^  top pwsh pid=4242 cpuSeconds=12\.5$", "the v1 top lines are still printed")
         self.assertRegex(out, r"(?m)^  attr cpus=16 processor total=50\.0% privileged=30\.0% user=20\.0% dpc=0\.5% interrupt=1\.0%$")
-        self.assertRegex(out, r"(?m)^  attr process total=70\.0% idle=50\.0% system=2\.5% attributed=8\.5% gapVsProcessorTotal=41\.5 points$")
+        self.assertRegex(out, r"(?m)^  attr process total=70\.0% idle=50\.0% system=2\.5% attributed=8\.5%$")
+        self.assertRegex(out, r"(?m)^  attr gap processorTotal=50\.0% processActive=20\.0% attributed=8\.5% unattributedKernel=30\.0% gap=11\.5 points$")
         self.assertRegex(out, r"(?m)^  attr proc aws pid=43644 pct=4\.8%$")
         self.assertRegex(out, r"(?m)^  attr proc pwsh#3 pid=n/a pct=1\.2%$", "a process with no stable pid prints n/a, not a guess")
         self.assertRegex(out, r"(?m)^  attr cores topology=logical-processor-information-ex P n=8 mean=60\.0% max=80\.0% \| E n=16 mean=40\.0% max=55\.5%$")
@@ -4514,7 +4516,7 @@ class VenueQuietAttributionTests(unittest.TestCase):
         self.assertRegex(proc.stdout, r"(?m)^COOLDOWN_UNMET mean=50\.0% ")
         self.assertIn("dpc=n/a", proc.stdout)
         self.assertIn("idle=n/a", proc.stdout)
-        self.assertIn("gapVsProcessorTotal=n/a", proc.stdout)
+        self.assertIn("gap=n/a", proc.stdout)
         self.assertRegex(proc.stdout, r"(?m)^  attr note processor\.dpc_percent: counter group 'processor' returned no valid sample$")
         self.assertRegex(proc.stdout, r"(?m)^  attr cores topology=unknown unknown n=2 mean=50\.0% max=60\.0%$")
 
@@ -4535,6 +4537,31 @@ class VenueQuietAttributionTests(unittest.TestCase):
         self.assertIn("percent of the WHOLE machine: counter / logical processors", header)
         self.assertIn("core_class unknown", header)
         self.assertIn("The v1 `samples` and `top` fields are unchanged", header)
+
+    def test_the_raw_v2_line_is_retained_verbatim_and_unrounded_beside_the_gate_log(self) -> None:
+        probe = json.loads(json.dumps(V2_PROBE))
+        probe["attributed_percent"] = 8.4912345
+        probe["top_processes"][0]["percent"] = 4.7912345
+        probe["top_processes"][0].update({"validSamples": 2, "totalSamples": 3, "incomplete": True})
+        proc = self.gate(probe)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        files = sorted(self.work.glob("venue-quiet-probe-*.json"))
+        self.assertEqual(len(files), 1, [f.name for f in self.work.iterdir()])
+        raw = files[0].read_text(encoding="utf-8")
+        self.assertEqual(raw, json.dumps(probe), "the raw line is retained verbatim, not re-serialized or rounded")
+        self.assertEqual(json.loads(raw)["top_processes"][0]["percent"], 4.7912345)
+        self.assertIn(f"  raw {files[0]}", proc.stdout.splitlines(), "the path of the raw file is printed")
+        self.assertIn("  attr proc aws pid=43644 pct=4.8% valid=2/3 incomplete", proc.stdout)
+
+    def test_the_raw_line_is_retained_for_an_unmeasured_venue_too(self) -> None:
+        proc = self.gate(dict(V2_PROBE, samples=[5.0, None, 5.0]))
+        self.assertEqual(proc.returncode, 6, proc.stdout + proc.stderr)
+        self.assertEqual(len(list(self.work.glob("venue-quiet-probe-*.json"))), 1)
+
+    def test_the_gap_figures_are_printed_on_one_attr_line(self) -> None:
+        probe = dict(V2_PROBE, process_active_percent=20.0, unattributed_kernel_percent=10.0, attribution_gap_points=5.0, attributed_percent=15.0)
+        proc = self.gate(probe)
+        self.assertRegex(proc.stdout, r"(?m)^  attr gap processorTotal=50\.0% processActive=20\.0% attributed=15\.0% unattributedKernel=10\.0% gap=5\.0 points$")
 
     def test_the_real_probe_job_emits_v2_with_every_field_typed_or_null_with_a_reason(self) -> None:
         text = (DV / "Wait-VenueQuiet.ps1").read_text(encoding="utf-8")
@@ -4573,7 +4600,7 @@ class VenueQuietAttributionTests(unittest.TestCase):
         self.assertEqual(set(p["processor"]), {"total_percent", "privileged_percent", "user_percent", "dpc_percent", "interrupt_percent"})
         for k in p["processor"]:
             number_or_noted(p["processor"], k, f"processor.{k}")
-        for k in ("process_total_percent", "idle_percent", "system_percent"):
+        for k in ("process_total_percent", "idle_percent", "system_percent", "process_active_percent", "unattributed_kernel_percent", "attribution_gap_points"):
             number_or_noted(p, k, k)
         self.assertIsInstance(p["top_processes"], list)
         self.assertLessEqual(len(p["top_processes"]), 10)
@@ -4584,6 +4611,8 @@ class VenueQuietAttributionTests(unittest.TestCase):
             self.assertNotIn(t["instance"], ("_total", "idle"), "_Total and Idle are never ranked")
             self.assertTrue(t["pid"] is None or isinstance(t["pid"], int))
             self.assertTrue(number(t["percent"]) and t["percent"] >= 0)
+            self.assertTrue(1 <= t["validSamples"] <= t["totalSamples"] == 3, t)
+            self.assertIs(t["incomplete"], t["validSamples"] < t["totalSamples"])
         if p["top_processes"]:
             self.assertTrue(number(p["attributed_percent"]))
         self.assertTrue(p["attributed_percent"] is None or number(p["attributed_percent"]))
@@ -4603,6 +4632,150 @@ class VenueQuietAttributionTests(unittest.TestCase):
         if p["core_topology"] == "unknown":
             self.assertIn("core_class", p["notes"])
         self.assertTrue(all(isinstance(k, str) and isinstance(v, str) and v for k, v in p["notes"].items()))
+
+
+# ---------------------------------------------------------------------------------------------------
+# VENUE-QUIET-ATTRIBUTION-1 r2 (hub ruling): every per-process and per-core figure is the mean over the samples whose counter status is VALID for that instance (never
+# zero-filled), rows carry validSamples / totalSamples and an incomplete flag, process rows are keyed on (instance, ID Process), the gap is |processActive - attributed|
+# with unattributedKernel reported beside it, and the raw v2 JSON line is retained unrounded in -WorkDir. The real probe job runs here against a canned Get-Counter
+# (a function shadowing the cmdlet), so the aggregation is proved on exact numbers, not on whatever the test host is doing.
+INVALID_STATUS = 3221228474  # PDH_CSTATUS_INVALID_DATA 0xC0000BBA
+
+
+def _cs(obj: str, inst: str, leaf: str, value: float, status: int = 0) -> dict:
+    return {"Path": f"\\\\TESTHOST\\{obj}({inst})\\{leaf}", "CookedValue": value, "Status": status}
+
+
+def _proc(inst: str, pid: int, raw: float, valid: bool = True) -> list:
+    return [_cs("process", inst, "% processor time", raw, 0 if valid else INVALID_STATUS), _cs("process", inst, "id process", pid)]
+
+
+def _core(inst: str, value: float, valid: bool = True) -> list:
+    return [_cs("processor information", inst, "% processor time", value, 0 if valid else INVALID_STATUS)]
+
+
+def _flat(*parts) -> list:
+    return [s for part in parts for s in part]
+
+
+GET_COUNTER_PRELUDE = r"""$script:Canned = @(ConvertFrom-Json -InputObject @'
+__CANNED__
+'@)
+$script:CallNo = 0
+function Get-Counter {
+    [CmdletBinding()] param($Counter)
+    $set = $script:Canned[$script:CallNo]; $script:CallNo++
+    [pscustomobject]@{ CounterSamples = @($set.s | ForEach-Object { [pscustomobject]@{ Path = $_.Path; CookedValue = [double]$_.CookedValue; Status = [uint32]$_.Status } }) }
+}
+"""
+
+
+@requires_windows_pwsh
+class VenueQuietValidSampleTests(unittest.TestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory(prefix="venue-quiet-valid-")
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+
+    def probe(self, sets: list, cpus: int = 4) -> dict:
+        text = (DV / "Wait-VenueQuiet.ps1").read_text(encoding="utf-8")
+        body = re.search(r"\$probeText = @'\r?\n(.*?)\r?\n'@", text, re.S).group(1)
+        self.assertIn("[Environment]::ProcessorCount", body)
+        body = body.replace("[Environment]::ProcessorCount", str(cpus)).replace("Start-Sleep -Seconds 12", "Start-Sleep -Seconds 0")
+        canned = json.dumps([{"s": s} for s in sets])
+        job = self.tmp / "canned-probe-job.ps1"
+        job.write_text(GET_COUNTER_PRELUDE.replace("__CANNED__", canned) + body, encoding="utf-8")
+        proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(job)], capture_output=True, text=True, timeout=180)
+        lines = [ln for ln in proc.stdout.splitlines() if ln.startswith("VENUE_QUIET=")]
+        self.assertEqual(len(lines), 1, proc.stdout + proc.stderr)
+        return json.loads(lines[0][len("VENUE_QUIET="):])
+
+    @staticmethod
+    def by_instance(rows: list, instance: str) -> list:
+        return [r for r in rows if r["instance"] == instance]
+
+    def test_a_process_invalid_in_the_middle_sample_is_the_mean_of_its_valid_samples_not_zero_filled(self) -> None:
+        # sol's repro: 4 CPUs, worker pid 123 raw 200 in all three samples, the middle one's status invalid, Idle valid throughout -> 50.0 (not 33.33)
+        sets = [_flat(_proc("worker", 123, 200), _proc("idle", 0, 100)),
+                _flat(_proc("worker", 123, 200, valid=False), _proc("idle", 0, 100)),
+                _flat(_proc("worker", 123, 200), _proc("idle", 0, 100))]
+        p = self.probe(sets)
+        rows = self.by_instance(p["top_processes"], "worker")
+        self.assertEqual(len(rows), 1, p["top_processes"])
+        self.assertEqual(rows[0]["percent"], 50.0, "the valid-sample mean is 50.0; 33.33 means the invalid sample was zero-filled")
+        self.assertEqual((rows[0]["pid"], rows[0]["validSamples"], rows[0]["totalSamples"]), (123, 2, 3))
+        self.assertIs(rows[0]["incomplete"], True)
+        self.assertEqual(p["attributed_percent"], 50.0)
+        self.assertTrue([k for k in p["notes"] if "incomplete" in k], p["notes"])
+        self.assertRegex(" ".join(v for k, v in p["notes"].items() if "incomplete" in k), r"\b1\b")
+
+    def test_a_complete_row_is_not_flagged_and_adds_no_incomplete_note(self) -> None:
+        sets = [_flat(_proc("worker", 123, 200), _proc("idle", 0, 100)) for _ in range(3)]
+        p = self.probe(sets)
+        row = self.by_instance(p["top_processes"], "worker")[0]
+        self.assertEqual((row["percent"], row["validSamples"], row["totalSamples"], row["incomplete"]), (50.0, 3, 3, False))
+        self.assertFalse([k for k in p["notes"] if "process_incomplete" in k], p["notes"])
+
+    def test_a_core_invalid_in_the_middle_sample_is_the_mean_of_its_valid_samples_not_zero_filled(self) -> None:
+        sets = [_flat(_core("0,0", 40), _proc("idle", 0, 100)),
+                _flat(_core("0,0", 40, valid=False), _proc("idle", 0, 100)),
+                _flat(_core("0,0", 40), _proc("idle", 0, 100))]
+        p = self.probe(sets)
+        self.assertEqual(len(p["cores"]), 1, p["cores"])
+        core = p["cores"][0]
+        self.assertEqual(core["percent"], 40.0, "26.67 means the invalid core sample was zero-filled")
+        self.assertEqual((core["validSamples"], core["totalSamples"]), (2, 3))
+        self.assertIs(core["incomplete"], True)
+        self.assertTrue([k for k in p["notes"] if "cores_incomplete" in k], p["notes"])
+        self.assertEqual(p["core_classes"][core["core_class"]]["mean_percent"], 40.0)
+
+    def test_a_row_with_no_valid_sample_is_omitted_from_the_sum_and_counted_in_a_note(self) -> None:
+        sets = [_flat(_proc("worker", 123, 200), _proc("ghost", 9, 400, valid=False), _core("0,0", 40), _core("0,1", 99, valid=False)) for _ in range(3)]
+        p = self.probe(sets)
+        self.assertEqual(self.by_instance(p["top_processes"], "ghost"), [], "an all-invalid row must not be ranked")
+        self.assertEqual(p["attributed_percent"], 50.0, "the all-invalid row contributes nothing to the attributed sum")
+        self.assertEqual([c["instance"] for c in p["cores"]], ["0,0"], "an all-invalid core is omitted, not reported as 0")
+        omitted = " ".join(v for k, v in p["notes"].items() if "omitted" in k)
+        self.assertIn("process", " ".join(k for k in p["notes"] if "omitted" in k))
+        self.assertIn("cores", " ".join(k for k in p["notes"] if "omitted" in k))
+        self.assertGreaterEqual(len(re.findall(r"\b1\b", omitted)), 2, p["notes"])
+
+    def test_one_instance_name_under_two_pids_is_two_rows_never_blended(self) -> None:
+        # bash#21 is pid 10 (raw 40 = 10%) in samples 1-2, then #21 is reassigned to pid 20 (raw 80 = 20%) in sample 3
+        sets = [_flat(_proc("bash#21", 10, 40), _proc("idle", 0, 100)),
+                _flat(_proc("bash#21", 10, 40), _proc("idle", 0, 100)),
+                _flat(_proc("bash#21", 20, 80), _proc("idle", 0, 100))]
+        p = self.probe(sets)
+        rows = {r["pid"]: r for r in self.by_instance(p["top_processes"], "bash#21")}
+        self.assertEqual(set(rows), {10, 20}, p["top_processes"])
+        self.assertEqual((rows[10]["percent"], rows[10]["validSamples"], rows[10]["totalSamples"]), (10.0, 2, 3))
+        self.assertEqual((rows[20]["percent"], rows[20]["validSamples"], rows[20]["totalSamples"]), (20.0, 1, 3))
+        self.assertTrue(rows[10]["incomplete"] and rows[20]["incomplete"])
+        self.assertNotIn(13.33, [r["percent"] for r in p["top_processes"]], "13.33 is the two processes blended under one name")
+
+    def test_the_gap_is_process_active_minus_attributed_with_unattributed_kernel_beside_it(self) -> None:
+        # 4 CPUs: Processor(_Total)=30; Process(_Total) raw 160 = 40, Idle raw 80 = 20 -> processActive 20; a=10 + b=5 -> attributed 15; gap 5; unattributedKernel 30-20=10
+        sets = [_flat([_cs("processor", "_total", "% processor time", 30)],_proc("_total", 0, 160), _proc("idle", 0, 80), _proc("a", 1, 40), _proc("b", 2, 20)) for _ in range(3)]
+        p = self.probe(sets)
+        self.assertEqual(p["processor"]["total_percent"], 30.0)
+        self.assertEqual(p["process_active_percent"], 20.0)
+        self.assertEqual(p["attributed_percent"], 15.0)
+        self.assertEqual(p["unattributed_kernel_percent"], 10.0)
+        self.assertEqual(p["attribution_gap_points"], 5.0)
+        self.assertEqual((p["process_total_percent"], p["idle_percent"]), (40.0, 20.0))
+
+    def test_the_gap_is_absolute_when_attribution_overshoots_process_active(self) -> None:
+        sets = [_flat([_cs("processor", "_total", "% processor time", 30)],_proc("_total", 0, 160), _proc("idle", 0, 120), _proc("a", 1, 40), _proc("b", 2, 20)) for _ in range(3)]
+        p = self.probe(sets)
+        self.assertEqual(p["process_active_percent"], 10.0)
+        self.assertEqual(p["attributed_percent"], 15.0)
+        self.assertEqual(p["attribution_gap_points"], 5.0, "the gap is |processActive - attributed|")
+        self.assertEqual(p["unattributed_kernel_percent"], 20.0)
+
+    def test_the_header_documents_the_valid_sample_mean_the_pid_keying_and_the_gap(self) -> None:
+        header = (DV / "Wait-VenueQuiet.ps1").read_text(encoding="utf-8").split("[CmdletBinding", 1)[0]
+        for needle in ("VALID-SAMPLE MEAN", "never zero-filled", "PID-KEYED", "(instance name, ID Process)", "processActive", "unattributedKernel", "|processActive - attributed|", "RAW RETENTION"):
+            self.assertIn(needle, header)
 
 
 # ---------------------------------------------------------------------------------------------------
