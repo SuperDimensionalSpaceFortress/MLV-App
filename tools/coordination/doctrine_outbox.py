@@ -210,14 +210,22 @@ def git_paths(repo: pathlib.Path, *args: str) -> list[str]:
 
 def cat_file_blob(repo: pathlib.Path, ref: str, path: str) -> bytes:
     """The raw bytes of `path` at `ref`, or b"" if it does not exist there (a target
-    missing at the tip counts as empty)."""
+    missing at the tip counts as empty). A failed read is NOT absence: `git cat-file` exits 128 both
+    for a missing path and for a bad ref, a non-blob or an unreadable object, so when it fails the
+    path is looked up with `git ls-tree`, which exits 0 with no output only when `ref` is readable
+    and carries no such path. Anything else raises Refusal TIP_BLOB_READ_FAILED, so a read failure
+    is never mistaken for an empty file."""
     proc = subprocess.run(
         ["git", "-C", str(repo), "cat-file", "blob", f"{ref}:{path}"],
         capture_output=True, timeout=120,
     )
-    if proc.returncode != 0:
+    if proc.returncode == 0:
+        return proc.stdout
+    listing = _run_git(repo, ["ls-tree", "-z", "--name-only", ref, "--", path])
+    if listing.returncode == 0 and not listing.stdout:
         return b""
-    return proc.stdout
+    why = proc.stderr.decode("utf-8", errors="replace").strip() or listing.stderr.strip() or "the path is listed but did not read as a blob"
+    raise Refusal("TIP_BLOB_READ_FAILED", f"{ref[:12]}:{path}: {why[:300]}")
 
 
 # ---------- items: parse, screen, key, render ----------

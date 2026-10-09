@@ -1259,7 +1259,7 @@ def test_law4_refusal_does_not_echo_a_home_path_or_a_token():
 # Named mutations for this block (each turns the named test red, then is reverted):
 #   M6  make card_validator_on_bus() always return False  -> test_r14_trap_to_traps_md_is_refused_once_the_bus_carries_the_validator
 #   M7  skip validate_cards_file() in drain                -> test_r14_card_the_validator_rejects_is_never_pushed
-#   M8  re-raise the CARD_INVALID instead of refusing per card -> test_r14_one_invalid_card_is_refused_alone_and_the_rest_of_the_drain_publishes
+#   M8  re-raise the CARD_INVALID instead of refusing per card -> test_r14_card_the_validator_rejects_is_never_pushed, test_r14_one_invalid_card_is_refused_alone_and_the_rest_of_the_drain_publishes (the one whose docstring is M8) and test_r14_dry_run_also_reports_the_invalid_card_and_would_push_the_rest; the M9, M10, M11 and M12 tests below go red under it too
 #   M9  judge each card alone (title + card) instead of tip + kept cards + card -> the two duplicate-id tests (M9 pending/pending, M10 pending/tip)
 #   M11 the tip's own cards file is invalid / the per-card pass names nobody -> CARD_INVALID_UNATTRIBUTED for the set, never a raise
 #   M12 delete the `candidates = [...]` filter after a per-card refusal -> CARD_PASS_NOT_SHRINKING (a Refusal, never a hang)
@@ -1632,6 +1632,107 @@ def test_r14_a_validator_failure_is_not_a_card_verdict_and_refuses_the_whole_set
 
     assert excinfo.value.code == "CARD_VALIDATOR_FAILED"
     assert git(bare, "rev-parse", "master") == before
+
+
+def fail_cards_blob_reads(monkeypatch, fails):
+    """Make `git cat-file blob <ref>:<cards file>` exit 128 (what git prints for a transient read
+    failure, and also for a missing path) whenever fails(n, ref) holds, n counting these reads from 1.
+    Every other git call, including the `ls-tree` that shows the file IS there, runs for real."""
+    real_run, seen = subprocess.run, []
+
+    def run(cmd, *a, **kw):
+        if isinstance(cmd, list) and cmd[3:5] == ["cat-file", "blob"] and cmd[5].endswith(":" + CARDS):
+            seen.append(cmd[5])
+            if fails(len(seen), cmd[5].rsplit(":", 1)[0]):
+                return subprocess.CompletedProcess(cmd, 128, b"", b"fatal: unable to read blob object (simulated)")
+        return real_run(cmd, *a, **kw)
+    monkeypatch.setattr(ob.subprocess, "run", run)
+    return seen
+
+
+@needs_node
+@pytest.mark.parametrize("fails", [
+    pytest.param(lambda n, ref: True, id="every-read"),
+    pytest.param(lambda n, ref: ref == "HEAD", id="the-committed-copy-only"),
+    pytest.param(lambda n, ref: n >= 3, id="the-per-card-trial-only"),
+])
+def test_r14_a_cards_blob_that_is_present_at_the_tip_but_unreadable_is_a_typed_refusal_not_unattributed(tmp_path, monkeypatch, fails):
+    """The tip carries example-card and a pending card duplicates it, so the batch is invalid and the
+    per-card trial must start from the tip's cards file. When that read fails (transiently, here
+    simulated at the git call) it used to come back as b"": the trial started from a bare title and
+    every card was refused CARD_INVALID_UNATTRIBUTED, blaming the cards for a read error. Now the drain
+    stops on TIP_BLOB_READ_FAILED naming the ref and path, whichever of the three reads failed, and
+    publishes nothing."""
+    bare, clone = init_bus(tmp_path)
+    add_validator(clone)
+    add_tip_cards(clone, CARD_BODY)
+    src = init_source(tmp_path)
+    add_item(src, "20261007-a-dup-of-tip.md", target=CARDS, body=CARD_BODY.replace("the mechanism", "another mechanism"))
+    add_item(src, "20261007-b-second-card.md", target=CARDS, body=SECOND_CARD_BODY)
+    add_item(src, "20261007-c-receipt.md", target="RECEIPTS.md", kind="receipt", body="### A receipt\nbody\n")
+    before = git(bare, "rev-parse", "master")
+    ledger = tmp_path / "sent.jsonl"
+    seen = fail_cards_blob_reads(monkeypatch, fails)
+
+    with pytest.raises(ob.Refusal) as excinfo:
+        ob.drain(src, clone, "HEAD", ledger, [], push=True)
+
+    assert excinfo.value.code == "TIP_BLOB_READ_FAILED" and excinfo.value.code != "CARD_INVALID_UNATTRIBUTED"
+    assert CARDS in excinfo.value.detail and "unable to read blob object" in excinfo.value.detail
+    assert seen, "the cards file was never read through git cat-file"
+    assert git(bare, "rev-parse", "master") == before
+    assert not ledger.exists()
+
+
+@needs_node
+def test_r14_the_cli_exits_1_naming_the_tip_blob_read_failure(tmp_path, monkeypatch, capsys):
+    bare, clone = init_bus(tmp_path)
+    add_validator(clone)
+    add_tip_cards(clone, CARD_BODY)
+    src = init_source(tmp_path)
+    add_item(src, "20261007-a-dup-of-tip.md", target=CARDS, body=CARD_BODY.replace("the mechanism", "another mechanism"))
+    fail_cards_blob_reads(monkeypatch, lambda n, ref: True)
+
+    rc = ob.main(["--repo", str(src), "drain", "--bus", str(clone), "--ref", "HEAD", "--ledger", str(tmp_path / "sent.jsonl"), "--push"])
+
+    err = capsys.readouterr().err
+    assert rc == 1 and "TIP_BLOB_READ_FAILED" in err and "CARD_INVALID_UNATTRIBUTED" not in err
+
+
+def test_cat_file_blob_tells_an_absent_path_from_a_failed_read(tmp_path):
+    """Absent at a readable ref is b"" (a target missing at the tip counts as empty); everything else
+    git cannot read as a blob raises TIP_BLOB_READ_FAILED instead of passing for an empty file."""
+    bare, clone = init_bus(tmp_path)
+    add_validator(clone)  # gives the tip a `tools` directory: a tree is present but is not a blob
+    tip = git(clone, "rev-parse", "origin/master")
+    assert ob.cat_file_blob(clone, tip, "TRAPS.md") == git_raw(clone, "show", f"{tip}:TRAPS.md") != b""
+    assert ob.cat_file_blob(clone, tip, "specs/mlv-app/cards.md") == b""
+    assert ob.cat_file_blob(clone, tip, "TRAPS.md/under-a-file") == b""
+    for ref, path in ((tip, "tools"), ("0" * 40, "TRAPS.md"), ("no-such-ref", "TRAPS.md")):
+        with pytest.raises(ob.Refusal) as excinfo:
+            ob.cat_file_blob(clone, ref, path)
+        assert excinfo.value.code == "TIP_BLOB_READ_FAILED" and path in excinfo.value.detail
+
+
+@needs_node
+def test_r14_a_cards_file_that_is_genuinely_absent_at_the_tip_still_starts_the_trial_from_a_bare_title(tmp_path, monkeypatch):
+    """The other half of the split: no cards file at the tip is still b"" and the per-card trial still
+    runs from the title, so two clashing first cards are judged CARD_INVALID per card exactly as before
+    (never TIP_BLOB_READ_FAILED) and the receipt still ships."""
+    bare, clone = init_bus(tmp_path)
+    add_validator(clone)
+    assert ob.cat_file_blob(clone, git(clone, "rev-parse", "origin/master"), CARDS) == b""
+    src = init_source(tmp_path)
+    add_item(src, "20261007-a-card.md", target=CARDS, body=CARD_BODY)
+    add_item(src, "20261007-b-card.md", target=CARDS, body=CARD_BODY.replace("the mechanism", "another mechanism"))
+    add_item(src, "20261007-c-receipt.md", target="RECEIPTS.md", kind="receipt", body="### A receipt\nbody\n")
+
+    report = ob.drain(src, clone, "HEAD", tmp_path / "sent.jsonl", [], push=True)
+
+    assert [(r["path"], r["code"]) for r in report["refused"]] == [("doctrine-outbox/20261007-b-card.md", "CARD_INVALID")]
+    assert "duplicate card id" in report["refused"][0]["detail"]
+    assert sorted(p["path"] for p in report["published"]) == ["doctrine-outbox/20261007-a-card.md", "doctrine-outbox/20261007-c-receipt.md"]
+    assert report["pushed"] is True
 
 
 def test_r14_card_without_a_validator_on_the_bus_is_refused_fail_closed(tmp_path):
