@@ -17,11 +17,13 @@ only the first element binds (export-release-cuda-dogfood-kit.ps1 and invoke-ult
 this shape). Fix the caller with ``($arr -join ',')`` and split in the script. A variable counts as an array
 when the caller's file declares it ``[string[]]`` / ``[array]``, assigns it ``@(...)`` / a cast / a comma list /
 a ``-split`` / a ``Verb-...Array...`` helper (never a name that merely contains "array", like ``$arrayCount``),
-a collection (``New-Object [-TypeName] System.Collections.ArrayList`` / ``...Generic.List[T]``, a
-``[System.Collections.ArrayList]`` / ``[Collections.Generic.List[T]]`` declaration, cast or ``::new()``, with or
-without the ``System.Collections.`` prefix; ``New-Object System.Text.StringBuilder`` is not one), or aliases one of
-those. A split clears the parameter only in one of two whitelisted forms (``is_normalised``), and only when it splits ON A COMMA, and the credit is a whitelist of exact shapes: the ``-split`` delimiter must be ``','``
-or ``','`` padded by ``\\s*`` / `` *`` on either side, with a limit that is absent or the literal 0; a ``.Split(...)``
+a collection (``New-Object [-T|-Type|-TypeName] System.Collections.ArrayList`` / ``...Generic.List[T]``, also
+inside ``( )`` or ``$( )``; a ``[System.Collections.ArrayList]`` / ``[Collections.Generic.List[T]]`` declaration,
+cast or ``::new()``, where ``T`` may carry one level of brackets such as ``string[]``, with or without the
+``System.Collections.`` prefix; ``New-Object System.Text.StringBuilder`` is not one), or aliases one of those.
+A split clears the parameter only in one of two whitelisted forms (``is_normalised``), and only when it splits
+ON A COMMA, and the credit is a whitelist of exact shapes: the ``-split`` delimiter must be ``','`` or ``','``
+padded by ``\\s*`` / `` *`` on either side, with a limit that is absent or the literal 0; a ``.Split(...)``
 must take exactly one comma (``','``, ``[char]','``, ``@(',')``, ``[char[]]','``) and no count, option or second
 separator. A ``';'``, newline, ``', '``, empty or interpolated delimiter, a lookaround, alternation, class or
 escape, or any positive limit leaves ``-P a,b`` (or ``-P a,b,c``) whole or partly joined and is flagged
@@ -61,6 +63,7 @@ from __future__ import annotations
 import functools
 import re
 import subprocess
+import time
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
@@ -537,7 +540,14 @@ def _logical_commands(text: str) -> list[tuple[int, str]]:
 
 
 # A growable collection type name, with or without its namespace: ArrayList, List[string], Generic.List[string[]].
-_COLLECTION = r"(?:System\.)?(?:Collections\.)?(?:Generic\.)?(?:ArrayList\b|List\[[^\]]*\])"
+# The List[...] argument allows ONE level of nested brackets (string[]); every class excludes brackets, so each
+# character belongs to exactly one alternative and an unterminated ``[List[List[...`` run cannot backtrack.
+_COLLECTION = (
+    r"(?:System\.)?(?:Collections\.)?(?:Generic\.)?"
+    r"(?:ArrayList\b|List\[[^\[\]\r\n]*(?:\[[^\[\]\r\n]*\][^\[\]\r\n]*)*\])"
+)
+# New-Object's type parameter, as PowerShell accepts it: -T, -Ty, -Typ, -Type, -TypeN ... -TypeName.
+_NEW_OBJECT_TYPE_PARAM = r"-T(?:y(?:p(?:e(?:N(?:a(?:m(?:e)?)?)?)?)?)?)?"
 
 
 def _array_variable_names(text: str) -> frozenset[str]:
@@ -552,7 +562,7 @@ def _array_variable_names(text: str) -> frozenset[str]:
     arrayish = re.compile(
         r"^(?:@\(|\[(?:string\[\]|object\[\]|array|" + _COLLECTION + r")\]|.*-split\b|.*\.Split\s*\([^)]*\)(?!\s*\[)"
         r"|&?\s*[A-Za-z]+-[\w-]*Array[\w-]*(?:\s|$)"
-        r"|\(?\s*New-Object\s+(?:-TypeName[\s:]+)?['\"]?" + _COLLECTION +
+        r"|(?:\$?\(\s*)?New-Object\s+(?:" + _NEW_OBJECT_TYPE_PARAM + r"[\s:]+)?['\"]?" + _COLLECTION +
         r"|(?:'[^']*'|\"[^\"]*\"|`?\$\w+)\s*,)",
         re.I,
     )
@@ -1238,6 +1248,65 @@ class PwshStringArrayFileParams(unittest.TestCase):
         # An alias of a collection is a collection.
         alias = "$list = New-Object System.Collections.ArrayList\n$n = $list\n"
         self.assertEqual([("tools/x/trace.ps1", "Dirs")], self._flagged({**script, "tools/x/run.ps1": alias + call}), alias)
+
+    def test_red_nested_generic_argument_callers_are_flagged(self):
+        script = {"tools/x/trace.ps1": self._split_fixed()}
+        call = "& pwsh -File tools/x/trace.ps1 -Dirs $n\n"
+        # sol r1 blocker: the type argument is itself bracketed (string[]), so List\[[^\]]*\] stopped at the first ].
+        for text in (
+            "param([System.Collections.Generic.List[string[]]]$n)\n",
+            "param(\n    [System.Collections.Generic.List[int[]]]$n\n)\n",
+            "param([Collections.Generic.List[System.String[]]]$n)\n",
+            "[Collections.Generic.List[string[]]]$n = $null\n",
+            "[System.Collections.Generic.List[string[]]] $n = [System.Collections.Generic.List[string[]]]::new()\n",
+            "$n = [Collections.Generic.List[string[]]]::new()\n",
+            "$n = New-Object System.Collections.Generic.List[int[]]\n",
+        ):
+            self.assertEqual([("tools/x/trace.ps1", "Dirs")], self._flagged({**script, "tools/x/run.ps1": text + call}), text)
+
+    def test_red_subexpression_and_abbreviated_type_parameter_new_object_are_flagged(self):
+        script = {"tools/x/trace.ps1": self._split_fixed()}
+        call = "& pwsh -File tools\\x\\trace.ps1 -Dirs $n\n"
+        for assign in (
+            "$n = $(New-Object System.Collections.ArrayList)\n",
+            "$n = $( New-Object -TypeName System.Collections.Generic.List[string[]] )\n",
+            "$n = New-Object -Type System.Collections.ArrayList\n",
+            "$n = New-Object -T System.Collections.ArrayList\n",
+            "$n = New-Object -Ty System.Collections.ArrayList\n",
+            "$n = New-Object -Typ System.Collections.ArrayList\n",
+            "$n = New-Object -TypeN System.Collections.ArrayList\n",
+            "$n = New-Object -TypeNa System.Collections.ArrayList\n",
+            "$n = new-object -TYPENAME:System.Collections.ArrayList\n",
+            "$n = (New-Object -Type 'System.Collections.Generic.List[string]')\n",
+        ):
+            self.assertEqual([("tools/x/trace.ps1", "Dirs")], self._flagged({**script, "tools/x/run.ps1": assign + call}), assign)
+
+    def test_green_new_forms_keep_non_arrays_non_array(self):
+        script = {"tools/x/trace.ps1": self._split_fixed()}
+        call = "& pwsh -File tools\\x\\trace.ps1 -Dirs $n\n"
+        for assign in (
+            "$n = $(New-Object System.Text.StringBuilder)\n",
+            "$n = New-Object -Type System.Text.StringBuilder\n",
+            "$n = New-Object -T System.Collections.Hashtable\n",
+            "$n = New-Object -Type System.Collections.Generic.Dictionary[string,string[]]\n",
+            "[System.Collections.Generic.Dictionary[string,string[]]]$n = $null\n",
+            "$n = $(New-Object System.Collections.Generic.HashSet[string])\n",
+        ):
+            self.assertEqual([], self._flagged({**script, "tools/x/run.ps1": assign + call}), assign)
+        self.assertEqual([], self._flagged({**script, "tools/x/run.ps1": "$arrayCount = $(New-Object -Type System.Text.StringBuilder)\n" + call.replace("$n", "$arrayCount")}))
+
+    def test_unterminated_generic_input_is_linear_not_quadratic(self):
+        # sol r1 hardening: ``[List[`` * N + ``string`` made List\[[^\]]*\] rescan to the end from every start.
+        # Structural: the type argument class excludes brackets, so no ``[^\]]*``-style open scan remains.
+        self.assertNotIn(r"[^\]]*", _COLLECTION)
+        timings = {}
+        for n in (1000, 4000):
+            text = "[List[" * n + "string"
+            started = time.perf_counter()
+            self.assertEqual(frozenset(), _array_variable_names(text))
+            timings[n] = time.perf_counter() - started
+        # Generous absolute bound (about 0.05 s at N=4000 before the fix; milliseconds after).
+        self.assertLess(timings[4000], 1.0, timings)
 
     def test_green_array_named_and_non_collection_objects_are_not_arrays(self):
         script = {"tools/x/trace.ps1": self._split_fixed()}
