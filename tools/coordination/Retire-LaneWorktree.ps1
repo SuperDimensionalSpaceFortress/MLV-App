@@ -22,8 +22,10 @@
       kept     cwd-probe-unavailable   (r2) the current-directory probe cannot run here (Add-Type failed, ConstrainedLanguage,
                                        32-bit host), so a holder whose only link is its cwd cannot be seen. Fail closed.
       kept     cwd-unknown             (r2) a live process that could hold the path has a current directory the probe could
-                                       not read (other user, elevated, protected), or runs a relative script path with
-                                       an unknown cwd. Fail closed. Fields: disposition.cwdProbe, disposition.cwdUnknown.
+                                       not read (other user, elevated, protected) and that was created at/after the worktree
+                                       or has no readable creation time (r3), or runs a relative script path with an
+                                       unknown cwd. Fail closed. Fields: disposition.cwdProbe, cwdUnknown, cwdExempt,
+                                       worktreeCreatedUtc.
       kept     dirty                  `git status --porcelain -uall` is non-empty
       kept     unpushed                HEAD has commits not on any remote
       kept     unmerged                HEAD is on a remote but not an ancestor of -MergeTarget
@@ -39,9 +41,26 @@
     folded into "not a holder". Order: a positive hit (live-process) is reported first; otherwise, if the probe cannot
     run, the result is kept / cwd-probe-unavailable; if it runs but cannot read a candidate holder, kept / cwd-unknown
     naming the pids. A would-retire (-WhatIf) is therefore a verdict the probe actually backed. Candidate holder = any
-    live process outside this caller's own chain, except a Windows session-0 service/system process (SessionId 0), whose
-    cwd is not a lane's; a session-0 process still counts when it runs a relative script path (next rule). 64-bit and
-    32-bit (WOW64) processes of the caller's user are both read; a pid that exited since the snapshot is not a candidate.
+    live process outside this caller's own chain, whatever its command line or session id. 64-bit and 32-bit (WOW64)
+    processes of the caller's user are both read; a pid that exited since the snapshot is not a candidate, and neither
+    are pids 0 and 4 (System Idle, System: kernel pseudo-processes with no user-mode current directory).
+
+    NULL COMMAND LINE, CREATION TIME (r3, 2026-10-09, hub ruling HUB-TICK 20261009T1004Z, sol blockers on PR #340 at 2d261a18):
+      A. A process whose CommandLine reads null is a LIVE process, not an absent one. The snapshot keeps every live non-self
+         process; a null command line only means the cmdline check cannot match, and the process still goes through the cwd
+         index (a readable cwd inside the worktree is via=cwd). Prior art: fleet doctrine TRAPS.md:15808 "a NULL command
+         line is not an absent process" (dng-auto-processor 2026-09-24) and TRAPS.md:15482-15492 (12 live pids read null).
+      B. A session id is NOT evidence; creation time is. The r2 session-0 exemption is removed (a service or scheduled
+         holder with an unreadable cwd was waved through). The ONE exemption left: a candidate whose cwd is unreadable is
+         exempt only when its process CreationDate is strictly EARLIER than the worktree root's CreationTimeUtc (the
+         timestamp used, recorded as disposition.worktreeCreatedUtc; disposition.cwdExempt counts the exempted pids), because
+         a process that started before the directory existed cannot have had it as its startup cwd. It fails closed
+         everywhere else: process creation date unreadable, worktree creation time unreadable, or created at/after the
+         worktree -> kept / cwd-unknown naming the pids. It is not applied when the probe itself is unavailable, and never to
+         relative-script-unresolved. RESIDUAL RISK, accepted: a process that pre-dates the worktree, later changes
+         directory into it, and whose cwd is unreadable to us is not caught (a cmdline or script hit still is).
+         A deleted-and-recreated directory of the same name inside the Windows 15 s file-system tunnelling window can keep
+         its old CreationTime; the same blind spot, same acceptance.
 
     RELATIVE SCRIPT PATHS (r2): a script path on a holder's command line (-File, dot-source in -Command, positional)
     is resolved against THAT holder's current directory, taken from the cwd index, when it is relative or quoted-relative,
@@ -175,7 +194,9 @@ function Get-LaneProcessSnapshot {
         $pp = if ($node) { $node.ParentProcessId } else { 0 }
     }
     [pscustomobject]@{
-        Procs       = @($all | Where-Object { $_.CommandLine -and $self -notcontains $_.ProcessId })
+        # r3: a NULL command line is not an absent process (fleet doctrine TRAPS.md:15808; 12 live pids read it null at
+        # TRAPS.md:15482-15492). Every live non-self process stays; the cmdline check simply cannot match it.
+        Procs       = @($all | Where-Object { $self -notcontains $_.ProcessId })
         SelfPids    = $self
         CapturedUtc = (Get-Date).ToUniversalTime()
     }
@@ -252,6 +273,7 @@ function Get-LaneHolderIndex {
     $scriptRunner = '(?i)^(pwsh|powershell|python|pythonw|py|node|cmd|cscript|wscript)(\.exe)?$'
     $probeOk = [bool](Test-CwdProbeAvailable)
     $selfPids = @($Snapshot.SelfPids)
+    $livePids = $null
     foreach ($proc in @($Snapshot.Procs)) {
         $procId = [int]$proc.ProcessId
         if ($selfPids -contains $procId) { continue }   # the caller's own chain legitimately sits in the worktree
@@ -268,14 +290,21 @@ function Get-LaneHolderIndex {
             }
         }
         if ($c) { continue }
-        # cwd unknown. A pid that exited since the snapshot holds nothing; a session-0 (service/system) process is not a
-        # lane's cwd unless it runs a relative script path it could not be followed from. Everything else is a candidate.
-        if (-not (Get-Process -Id $procId -ErrorAction SilentlyContinue)) { continue }
-        $sess = $proc.PSObject.Properties['SessionId']
-        $isSystem = [bool]($sess -and $null -ne $sess.Value -and [int]$sess.Value -eq 0)
-        $why = if (-not $isSystem) { if ($probeOk) { 'cwd-unreadable' } else { 'cwd-probe-unavailable' } }
-               elseif ($relUnresolved) { 'relative-script-unresolved' } else { $null }
-        if ($why) { $unknown.Add([pscustomobject]@{ ProcessId = $procId; Name = [string]$proc.Name; Why = $why }) }
+        # cwd unknown. Only a pid that exited since the snapshot holds nothing, and pids 0 and 4 (System Idle, System) are
+        # kernel pseudo-processes with no user-mode current directory. Every other process is a candidate whatever its
+        # session id (r3: a session id is not evidence); Get-CwdUnknownRefusal applies the one creation-time exemption.
+        if ($procId -le 4) { continue }
+        # One process listing for the whole index, not one Get-Process per candidate (measured: 172 candidates = ~11 s).
+        if ($null -eq $livePids) {
+            $livePids = @{}
+            try { foreach ($q in [Diagnostics.Process]::GetProcesses()) { $livePids[[int]$q.Id] = $true; $q.Dispose() } } catch { $livePids = $null }
+        }
+        $alive = if ($null -ne $livePids) { $livePids.ContainsKey($procId) } else { [bool](Get-Process -Id $procId -ErrorAction SilentlyContinue) }
+        if (-not $alive) { continue }
+        $why = if ($relUnresolved) { 'relative-script-unresolved' } elseif ($probeOk) { 'cwd-unreadable' } else { 'cwd-probe-unavailable' }
+        $cdp = $proc.PSObject.Properties['CreationDate']
+        $created = if ($cdp -and $cdp.Value -is [datetime]) { ([datetime]$cdp.Value).ToUniversalTime() } else { $null }
+        $unknown.Add([pscustomobject]@{ ProcessId = $procId; Name = [string]$proc.Name; Why = $why; CreatedUtc = $created })
     }
     $byPid = @{}
     foreach ($s in $scripts) {
@@ -295,20 +324,22 @@ function Find-WorktreeHolders {
     #   cmdline  the path is on the process command line (either slash spelling, case-insensitive)
     #   cwd      the process current directory is the worktree or inside it
     #   script   a script the process runs, or one it loads from its directory, names the path
-    # Returns one row per pid {ProcessId; Name; Via}. Unreadable cwd / script is not a hit (system and other-user
-    # processes cannot be opened); the three probes together are what a command-line-only check missed.
+    # Returns one row per pid {ProcessId; Name; Via}. Unreadable cwd / script is not a hit here (system and other-user
+    # processes cannot be opened) - Get-CwdUnknownRefusal turns it into a refusal; the three probes together are what a
+    # command-line-only check missed. A null command line cannot match 'cmdline' but is still checked by cwd and script.
     param([string]$WorktreePath, [object]$Snapshot)
     $wd = $WorktreePath.TrimEnd('\')
     $slash = $wd -replace '\\', '/'
     $self = @($Snapshot.SelfPids)
-    $procs = @($Snapshot.Procs | Where-Object { $_.CommandLine -and $self -notcontains $_.ProcessId })
+    $procs = @($Snapshot.Procs | Where-Object { $self -notcontains $_.ProcessId })
     $idx = Get-LaneHolderIndex -Snapshot $Snapshot
     $names = @($wd, $slash, ($wd -replace '\\', '\\')) | ForEach-Object { [regex]::Escape($_) + '(?![A-Za-z0-9_.\-])' }
     $rows = New-Object System.Collections.Generic.List[object]
     foreach ($p in $procs) {
         $procId = [int]$p.ProcessId
         $via = $null
-        if ($p.CommandLine.IndexOf($wd, [StringComparison]::OrdinalIgnoreCase) -ge 0 -or $p.CommandLine.IndexOf($slash, [StringComparison]::OrdinalIgnoreCase) -ge 0) { $via = 'cmdline' }
+        $cl = [string]$p.CommandLine   # null when the command line is unreadable: nothing to match, but the cwd probe still runs
+        if ($cl.IndexOf($wd, [StringComparison]::OrdinalIgnoreCase) -ge 0 -or $cl.IndexOf($slash, [StringComparison]::OrdinalIgnoreCase) -ge 0) { $via = 'cmdline' }
         if (-not $via -and $idx.Cwd.ContainsKey($procId)) {
             $c = [string]$idx.Cwd[$procId]
             if ($c -ieq $wd -or $c.StartsWith($wd + '\', [StringComparison]::OrdinalIgnoreCase)) { $via = 'cwd' }
@@ -328,18 +359,31 @@ function Find-WorktreeHolders {
 }
 
 function Get-CwdUnknownRefusal {
-    # r2: the cwd probe's own verdict for this snapshot. $null when every candidate holder's cwd was read; otherwise
-    # {Probe; Reason; Rows} for a kept / cwd-probe-unavailable | cwd-unknown result. Never a would-retire.
-    param([object]$Snapshot)
+    # r2: the cwd probe's own verdict for this snapshot and worktree. Unknown is empty when every candidate holder's cwd was
+    # read or exempted; otherwise Reason/Rows/Unknown describe a kept / cwd-probe-unavailable | cwd-unknown result. Never a
+    # would-retire. r3: the ONE exemption is creation time - a candidate whose cwd is unreadable is exempt only when its
+    # CreationDate is strictly EARLIER than the worktree root's CreationTimeUtc (a process that started before the directory
+    # existed cannot have had it as its startup cwd). It needs a working probe (an unavailable probe is a host fault, not a
+    # per-process blind spot) and never applies to relative-script-unresolved. Creation date or worktree time unreadable,
+    # or created at/after the worktree: refused.
+    param([object]$Snapshot, [string]$WorktreePath)
     $idx = Get-LaneHolderIndex -Snapshot $Snapshot
-    $unk = @($idx.CwdUnknown)
-    if (-not $unk.Count) { return $null }
+    $wtCreated = try { (Get-Item -LiteralPath $WorktreePath -ErrorAction Stop).CreationTimeUtc } catch { $null }
+    $unk = @(); $exempt = 0
+    foreach ($u in @($idx.CwdUnknown)) {
+        if ($idx.CwdProbe -eq 'ok' -and $u.Why -eq 'cwd-unreadable' -and $null -ne $wtCreated -and $null -ne $u.CreatedUtc -and $u.CreatedUtc -lt $wtCreated) { $exempt++; continue }
+        $unk += $u
+    }
+    $made = if ($null -ne $wtCreated) { ([datetime]$wtCreated).ToString('o') } else { $null }
+    $res = [pscustomobject]@{ Probe = [string]$idx.CwdProbe; Reason = $null; Rows = @(); Unknown = @(); Exempt = $exempt; WorktreeCreatedUtc = $made }
+    if (-not $unk.Count) { return $res }
     $first = ($unk | Select-Object -First 5 | ForEach-Object { "$($_.ProcessId) $($_.Name) ($($_.Why))" }) -join ', '
-    $reason = if ($idx.CwdProbe -ne 'ok') { "cwd-probe-unavailable: the current-directory probe cannot run, so $($unk.Count) process(es) cannot be ruled out as holders, first: $first" }
-              else { "cwd-unknown: $($unk.Count) process(es) with an unreadable current directory cannot be ruled out as holders, first: $first" }
+    $res.Reason = if ($idx.CwdProbe -ne 'ok') { "cwd-probe-unavailable: the current-directory probe cannot run, so $($unk.Count) process(es) cannot be ruled out as holders, first: $first" }
+                  else { "cwd-unknown: $($unk.Count) process(es) with an unreadable current directory, created at/after the worktree or with no readable creation time, cannot be ruled out as holders, first: $first" }
     $via = if ($idx.CwdProbe -ne 'ok') { 'cwd-probe-unavailable' } else { 'cwd-unknown' }
-    $rows = @($unk | Select-Object -First 20 | ForEach-Object { [pscustomobject]@{ ProcessId = $_.ProcessId; Name = $_.Name; Via = $via } })
-    return [pscustomobject]@{ Probe = [string]$idx.CwdProbe; Reason = $reason; Rows = $rows; Unknown = @($unk | ForEach-Object { "$($_.ProcessId) $($_.Name) $($_.Why)" }) }
+    $res.Rows = @($unk | Select-Object -First 20 | ForEach-Object { [pscustomobject]@{ ProcessId = $_.ProcessId; Name = $_.Name; Via = $via } })
+    $res.Unknown = @($unk | ForEach-Object { $t = if ($_.CreatedUtc) { ([datetime]$_.CreatedUtc).ToString('o') } else { 'unreadable' }; "$($_.ProcessId) $($_.Name) $($_.Why) created=$t" })
+    return $res
 }
 
 function Write-RefusedHolders {
@@ -366,13 +410,16 @@ function Invoke-RetireLaneWorktree {
     $d = [ordered]@{
         schema = 'mlv-app/lane-worktree-disposition/v1'; workDir = $WorkDir; action = 'kept'; reason = $null
         head = $null; branch = $null; quarantined = @(); holders = @(); cwdProbe = $null; cwdUnknown = @()
+        cwdExempt = 0; worktreeCreatedUtc = $null
         utc = (Get-Date).ToUniversalTime().ToString('o')
     }
     # Fail closed on the cwd probe's own blind spots (see CWD PROBE IS LOUD): true = refused, disposition filled in.
     function Test-CwdRefusal([object]$Sn) {
-        $r = Get-CwdUnknownRefusal -Snapshot $Sn
-        $d.cwdProbe = [string](Get-LaneHolderIndex -Snapshot $Sn).CwdProbe
-        if ($null -eq $r) { return $false }
+        $r = Get-CwdUnknownRefusal -Snapshot $Sn -WorktreePath $wd
+        $d.cwdProbe = [string]$r.Probe
+        $d.cwdExempt = [int]$r.Exempt
+        $d.worktreeCreatedUtc = $r.WorktreeCreatedUtc
+        if (-not @($r.Unknown).Count) { return $false }
         $d.cwdUnknown = $r.Unknown
         Write-RefusedHolders -WorktreePath $wd -Holders $r.Rows
         $d.reason = $r.Reason

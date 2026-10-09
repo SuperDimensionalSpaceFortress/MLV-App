@@ -4,6 +4,7 @@ Each case builds a throwaway repository with a bare remote, so nothing depends o
 checkout's refs. Every case asserts both the action AND the reason prefix, so a gate that
 passes for the wrong reason fails the test.
 """
+import datetime
 import json
 import os
 import shutil
@@ -18,6 +19,22 @@ PWSH = shutil.which("pwsh")
 GIT = shutil.which("git")
 
 pytestmark = pytest.mark.skipif(not (PWSH and GIT), reason="requires pwsh and git")
+
+
+# r3: with the session-0 exemption gone, ANY process the host starts after a test worktree exists and whose cwd we cannot read
+# (a svchost or SearchProtocolHost spawned mid-run) refuses a removal, by design. These cases test git/quarantine/sweep logic and
+# real HOLDERS the test itself spawns, not the host's service churn, so their real snapshot is limited to (a) processes that
+# started before this pytest session (a stable population, always older than any test worktree) and (b) children of pytest.
+SESSION_START_UTC = datetime.datetime.now(datetime.timezone.utc).isoformat()
+PYTEST_PID = os.getpid()
+HOST_SNAPSHOT_FILTER = (
+    "$origSnapshot = ${function:Get-LaneProcessSnapshot}; "
+    "function Get-LaneProcessSnapshot { $s = & $origSnapshot; "
+    f"$t0 = [datetime]::Parse('{SESSION_START_UTC}').ToUniversalTime(); "
+    "$keep = @($s.Procs | Where-Object { $_.ParentProcessId -eq " + str(PYTEST_PID) + " -or -not $_.CreationDate -or "
+    "([datetime]$_.CreationDate).ToUniversalTime() -lt $t0 }); "
+    "[pscustomobject]@{ Procs = $keep; SelfPids = $s.SelfPids; CapturedUtc = $s.CapturedUtc } }; "
+)
 
 
 def _git(cwd, *args):
@@ -49,7 +66,7 @@ def _retire(workdir, **kw):
         # Invoke-Lane.ps1 dot-sources the helper under StrictMode Latest; test under the same
         # mode (an unset $LASTEXITCODE read only throws there).
         "$ErrorActionPreference='Stop'; Set-StrictMode -Version Latest; "
-        f". '{HELPER}'; "
+        f". '{HELPER}'; {HOST_SNAPSHOT_FILTER}"
         f"Invoke-RetireLaneWorktree {' '.join(args)} | ConvertTo-Json -Depth 4"
     )
     out = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", script],
@@ -171,7 +188,7 @@ def _sweep(main, **kw):
         args.append(f"-{k}" if v is True else f"-{k} {_ps_arg(v)}")
     script = (
         "$ErrorActionPreference='Stop'; Set-StrictMode -Version Latest; "
-        f". '{HELPER}'; "
+        f". '{HELPER}'; {HOST_SNAPSHOT_FILTER}"
         f"Invoke-SweepMergedLaneWorktrees {' '.join(args)} | ConvertTo-Json -Depth 5"
     )
     out = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", script],
@@ -472,7 +489,7 @@ def _gate_real(workdir, *, whatif=True, prelude=""):
     quarantine = Path(workdir).parent / "q"
     script = (
         "$ErrorActionPreference='Stop'; Set-StrictMode -Version Latest; "
-        f". '{HELPER}'; {prelude} "
+        f". '{HELPER}'; {HOST_SNAPSHOT_FILTER}{prelude} "
         f"Invoke-RetireLaneWorktree -WorkDir '{workdir}' -MergeTarget 'origin/master' -QuarantineRoot '{quarantine}'"
         f"{' -WhatIf' if whatif else ''} | ConvertTo-Json -Depth 4"
     )
@@ -617,9 +634,18 @@ def _cwd_unreadable_for(*pids):
             f"if (@({ids}) -contains $ProcessId) {{ return $null }}; & $orig -ProcessId $ProcessId }};")
 
 
-def _fake_row(pid_expr, cmd="shell.exe", session=1, name="shell.exe", self_pids="@(1)"):
+def _fake_row(pid_expr, cmd="shell.exe", session=1, name="shell.exe", self_pids="@(1)", created=None, cwd=None):
+    """One live process row. cmd=None -> CommandLine is $null; created = a PowerShell [datetime] expression for
+    CreationDate (omitted = the row has no CreationDate at all); cwd = a CurrentDirectory the gate takes as read."""
+    cmd_expr = "$null" if cmd is None else "'" + cmd + "'"
+    extra = (f"; CreationDate = {created}" if created else "") + (f"; CurrentDirectory = '{cwd}'" if cwd else "")
     return ("[pscustomobject]@{ Procs = @([pscustomobject]@{ ProcessId = " + pid_expr + "; Name = '" + name + "'; "
-            "CommandLine = '" + cmd + "'; SessionId = " + str(session) + " }); SelfPids = " + self_pids + " }")
+            "CommandLine = " + cmd_expr + "; SessionId = " + str(session) + extra + " }); SelfPids = " + self_pids + " }")
+
+
+def _wt_created(wt, minutes):
+    """PowerShell expression: the worktree root's CreationTimeUtc shifted by `minutes` (negative = before the worktree existed)."""
+    return f"(Get-Item -LiteralPath '{wt}').CreationTimeUtc.AddMinutes({minutes})"
 
 
 def test_healthy_cwd_probe_is_reported_ok_and_backs_the_would_retire(repo):
@@ -694,11 +720,114 @@ def test_snapshot_user_session_process_with_unreadable_cwd_is_cwd_unknown(repo):
     assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown"), d
 
 
-def test_snapshot_session0_process_with_unreadable_cwd_is_not_a_candidate(repo):
+def test_snapshot_session0_process_with_unreadable_cwd_is_no_longer_exempt_by_session_id(repo):
+    """The one sanctioned expectation change (r3, hub ruling B): this was would-retire on 2d261a18; a session-0 row with an
+    unreadable cwd and no readable creation time is now cwd-unknown."""
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-sess0")
     d = _gate_with_snapshot(wt, _fake_row("$PID", session=0), prelude=CWD_UNREADABLE_FOR_EVERY_PID)
+    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown"), d
+
+
+# --- r3 (WORKTREE-REMOVED-UNDER-LIVE-CHAIN-1 hub ruling HUB-TICK 20261009T1004Z, sol blockers on 2d261a18) ---
+# A: a null command line is a LIVE process.  B: a session id is not evidence; creation time before the worktree is.
+
+@pytest.mark.parametrize("cmd", ["pwsh.exe -File C:\\\\elsewhere\\\\quiet.ps1", "svchost.exe -k netsvcs"], ids=["absolute-script", "native-command"])
+def test_snapshot_session0_process_with_unreadable_cwd_created_after_the_worktree_is_cwd_unknown(repo, cmd):
+    """Sol r2 row 2. REPLACES the r2 expectation (session 0 + unreadable cwd = would-retire): a session id proves nothing."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-sess0")
+    row = _fake_row("$PID", cmd=cmd, session=0, name=cmd.split()[0], created=_wt_created(wt, 5))
+    d = _gate_with_snapshot(wt, row, prelude=CWD_UNREADABLE_FOR_EVERY_PID)
+    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown"), d
+    assert any("cwd-unreadable" in u for u in d["cwdUnknown"]) and d["cwdExempt"] == 0, d
+
+
+def test_snapshot_process_with_null_command_line_and_unreadable_cwd_is_cwd_unknown(repo):
+    """Sol r2 row 1: CommandLine = $null used to be filtered out of the snapshot before any cwd check."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-nullcmd")
+    row = _fake_row("$PID", cmd=None, created=_wt_created(wt, 5))
+    d = _gate_with_snapshot(wt, row, prelude=CWD_UNREADABLE_FOR_EVERY_PID)
+    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown"), d
+    assert any(" cwd-unreadable created=" in u for u in d["cwdUnknown"]), d
+
+
+def test_snapshot_process_with_null_command_line_and_cwd_inside_the_worktree_is_a_cwd_holder(repo):
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-nullcmd-cwd")
+    d = _gate_with_snapshot(wt, _fake_row("$PID", cmd=None, cwd=str(wt / "sub")))
+    assert d["action"] == "kept" and d["reason"].startswith("live-process: ") and "[cwd]" in d["reason"], d
+
+
+@pytest.mark.parametrize("session", [0, 1])
+def test_snapshot_unreadable_cwd_created_before_the_worktree_is_exempt(repo, session):
+    """Hub ruling B: the one exemption. A process older than the directory cannot have had it as its startup cwd."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-older")
+    row = _fake_row("$PID", cmd=None, session=session, created=_wt_created(wt, -60))
+    d = _gate_with_snapshot(wt, row, prelude=CWD_UNREADABLE_FOR_EVERY_PID)
     assert (d["action"], d["reason"]) == ("would-retire", "ok"), d
+    assert d["cwdExempt"] == 1 and d["worktreeCreatedUtc"], d
+
+
+def test_snapshot_exempt_process_whose_command_line_names_the_worktree_is_still_refused(repo):
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-older-named")
+    row = _fake_row("$PID", cmd=f"svc.exe --root {wt}", session=0, name="svc.exe", created=_wt_created(wt, -60))
+    d = _gate_with_snapshot(wt, row, prelude=CWD_UNREADABLE_FOR_EVERY_PID)
+    assert d["action"] == "kept" and d["reason"].startswith("live-process: ") and "[cmdline]" in d["reason"], d
+
+
+@pytest.mark.parametrize("created", [None, "$null", "'not a date'"], ids=["no-property", "null", "not-a-datetime"])
+def test_snapshot_unreadable_cwd_with_unreadable_creation_date_is_refused(repo, created):
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-nodate")
+    d = _gate_with_snapshot(wt, _fake_row("$PID", created=created), prelude=CWD_UNREADABLE_FOR_EVERY_PID)
+    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown"), d
+    assert any("created=unreadable" in u for u in d["cwdUnknown"]), d
+
+
+def test_snapshot_unreadable_cwd_created_exactly_when_the_worktree_was_is_refused(repo):
+    """Strictly earlier is required: equal is not earlier."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-same-instant")
+    d = _gate_with_snapshot(wt, _fake_row("$PID", created=_wt_created(wt, 0)), prelude=CWD_UNREADABLE_FOR_EVERY_PID)
+    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown"), d
+
+
+def test_creation_time_does_not_exempt_a_relative_script_whose_cwd_is_unknown(repo):
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-rel-older")
+    row = _fake_row("$PID", cmd="pwsh.exe -File tools\\quiet.ps1", name="pwsh.exe", created=_wt_created(wt, -60))
+    d = _gate_with_snapshot(wt, row, prelude=CWD_UNREADABLE_FOR_EVERY_PID)
+    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown"), d
+    assert any("relative-script-unresolved" in u for u in d["cwdUnknown"]) and d["cwdExempt"] == 0, d
+
+
+def test_creation_time_does_not_exempt_when_the_cwd_probe_is_unavailable(repo):
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-probe-off-older")
+    d = _gate_with_snapshot(wt, _fake_row("$PID", created=_wt_created(wt, -60)), prelude=FORCE_PROBE_UNAVAILABLE)
+    assert d["action"] == "kept" and d["reason"].startswith("cwd-probe-unavailable"), d
+
+
+def test_kernel_pseudo_processes_are_not_candidate_holders(repo):
+    """Pids 0 (System Idle) and 4 (System) have no user-mode cwd and no creation date worth reading."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-kernel")
+    for pid in ("0", "4"):
+        d = _gate_with_snapshot(wt, _fake_row(pid, cmd=None), prelude=CWD_UNREADABLE_FOR_EVERY_PID)
+        assert (d["action"], d["reason"]) == ("would-retire", "ok"), (pid, d)
+
+
+def test_real_process_snapshot_keeps_processes_whose_command_line_is_null():
+    """The Win32_Process row for System (pid 4) has a null CommandLine; the snapshot used to drop every such row."""
+    script = (f"$ErrorActionPreference='Stop'; . '{HELPER}'; $s = Get-LaneProcessSnapshot; "
+              "@($s.Procs | Where-Object { -not $_.CommandLine }).Count")
+    out = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", script],
+                         check=True, capture_output=True, text=True).stdout
+    assert int(out.strip()) > 0
 
 
 def test_snapshot_self_chain_with_unreadable_cwd_is_not_cwd_unknown(repo):
@@ -727,9 +856,10 @@ def test_session0_process_running_a_relative_script_with_unknown_cwd_is_cwd_unkn
     d = _gate_with_snapshot(wt, row, prelude=CWD_UNREADABLE_FOR_EVERY_PID)
     assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown"), d
     assert any("relative-script-unresolved" in u for u in d["cwdUnknown"]), d
-    # control: the same session-0 process without a relative script path is not a candidate
-    ctl = _gate_with_snapshot(wt, _fake_row("$PID", cmd="pwsh.exe -Command Start-Sleep", session=0, name="pwsh.exe"),
-                              prelude=CWD_UNREADABLE_FOR_EVERY_PID)
+    # control (r3: a session id no longer exempts; creation before the worktree does): the same process without a relative
+    # script path, created before the worktree existed, is not a candidate
+    ctl = _gate_with_snapshot(wt, _fake_row("$PID", cmd="pwsh.exe -Command Start-Sleep", session=0, name="pwsh.exe",
+                                            created=_wt_created(wt, -60)), prelude=CWD_UNREADABLE_FOR_EVERY_PID)
     assert (ctl["action"], ctl["reason"]) == ("would-retire", "ok"), ctl
 
 
