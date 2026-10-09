@@ -20,6 +20,28 @@
 #define MLV_PROCESSED_16BIT_CACHE_SLOTS 2
 #define MLV_RAW_UINT16_PREFETCH_SLOTS 4
 
+/* PLAYBACK-LJ92-DECODE-THROUGHPUT-1: object-scoped raw-uint16 prefetch counters, kept under
+ * raw_uint16_prefetch_mutex so any thread can read them (getMlvRawUint16PrefetchStats). */
+typedef struct
+{
+    uint32_t decoders;
+    uint64_t admitted_requests;
+    uint32_t lookahead_max;
+    uint64_t worker_decodes;
+    double worker_lj92_ms_sum;
+    double worker_lj92_ms_max;
+    uint64_t worker_lj92_over_41_7;
+    uint64_t fg_hits;
+    uint64_t fg_inflight_waits;
+    double fg_inflight_wait_ms_sum;
+    uint64_t fg_inflight_wait_timeouts;
+    uint64_t fg_direct_decodes;
+    double fg_direct_lj92_ms_sum;
+    uint64_t fg_unclaimed_decodes;
+    uint64_t evicted_unconsumed;
+    uint64_t duplicate_publishes;
+} mlvRawUint16PrefetchStats_t;
+
 /* Struct of index of video and audio frames for quick access */
 typedef struct
 {
@@ -292,6 +314,7 @@ typedef struct {
     uint32_t raw_uint16_prefetch_slot_generation[MLV_RAW_UINT16_PREFETCH_SLOTS];
     uint32_t raw_uint16_prefetch_next_slot;
     uint64_t raw_uint16_prefetch_decode_failures;
+    mlvRawUint16PrefetchStats_t raw_uint16_prefetch_stats;
 
     /* How many cores, will not neccesarily determine number of threads made in any case, but helps */
     int cpu_cores; /* Default 4 */

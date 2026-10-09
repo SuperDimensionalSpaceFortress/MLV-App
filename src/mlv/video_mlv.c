@@ -1289,6 +1289,37 @@ static uint16_t * mlv_ensure_thread_scaled_input_buffer(uint64_t required_words)
 
 static int getMlvRawFrameUint16Direct(mlvObject_t * video, uint64_t frameIndex, uint16_t * unpackedFrame);
 
+/* Test override of the decoder count (mlvSetRawUint16PrefetchDecodersForTesting): < 0 none, 0 = prefetch off. */
+static int g_mlv_raw_uint16_prefetch_test_decoders = -1;
+
+static int mlv_raw_uint16_prefetch_test_override(void)
+{
+#if defined(__GNUC__)
+    return __atomic_load_n(&g_mlv_raw_uint16_prefetch_test_decoders, __ATOMIC_ACQUIRE);
+#else
+    return g_mlv_raw_uint16_prefetch_test_decoders;
+#endif
+}
+
+/* Test hook: per-frame count of getMlvRawFrameUint16Direct calls, only while enabled. */
+#define MLV_RAW_UINT16_DECODE_COUNT_FRAMES 4096
+static pthread_mutex_t g_mlv_raw_uint16_decode_count_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int g_mlv_raw_uint16_decode_count_enabled = 0;
+static uint32_t g_mlv_raw_uint16_decode_counts[MLV_RAW_UINT16_DECODE_COUNT_FRAMES];
+
+static void mlv_raw_uint16_count_decode_for_testing(uint64_t frameIndex)
+{
+#if defined(__GNUC__)
+    if (!__atomic_load_n(&g_mlv_raw_uint16_decode_count_enabled, __ATOMIC_ACQUIRE)) return;
+#endif
+    pthread_mutex_lock(&g_mlv_raw_uint16_decode_count_mutex);
+    if (g_mlv_raw_uint16_decode_count_enabled && frameIndex < MLV_RAW_UINT16_DECODE_COUNT_FRAMES)
+    {
+        ++g_mlv_raw_uint16_decode_counts[frameIndex];
+    }
+    pthread_mutex_unlock(&g_mlv_raw_uint16_decode_count_mutex);
+}
+
 /* LOOK-ASSIST-DUALISO-DETERMINISM-1: the worker decodes into its claimed slot OUTSIDE the mutex, so a DECODING
  * slot stays reserved until the worker finishes it: a reset keeps it (the worker then sees the stale generation
  * and marks it EMPTY), and a foreground store never reuses it. Reusing it let the worker's late write of another
@@ -1385,6 +1416,10 @@ static void mlv_raw_uint16_prefetch_store_frame(mlvObject_t * video,
     }
 
     int slot = mlv_raw_uint16_prefetch_find_slot_locked(video, frameIndex);
+    if (slot >= 0)
+    {
+        ++video->raw_uint16_prefetch_stats.duplicate_publishes;
+    }
     for (uint32_t tries = 0; slot < 0 && tries < MLV_RAW_UINT16_PREFETCH_SLOTS; ++tries)
     {
         const uint32_t candidate = video->raw_uint16_prefetch_next_slot;
@@ -1482,6 +1517,7 @@ static int mlv_raw_uint16_prefetch_try_copy(mlvObject_t * video,
                    slotBuffer,
                    (size_t)video->raw_uint16_prefetch_slot_words * sizeof(uint16_t));
             hit = 1;
+            ++video->raw_uint16_prefetch_stats.fg_hits;
         }
     }
     pthread_mutex_unlock(&video->raw_uint16_prefetch_mutex);
@@ -1533,22 +1569,40 @@ static void mlv_raw_uint16_prefetch_note_request(mlvObject_t * video, uint64_t f
     pthread_mutex_unlock(&video->raw_uint16_prefetch_mutex);
 }
 
-/* Test hook: the worker parks here holding a claimed (DECODING) slot until the hold is released. */
+/* Test hooks: a worker parks at mlv_raw_uint16_prefetch_test_hold_point holding a claimed (DECODING) slot, and a
+ * foreground reader parks at mlv_raw_uint16_fg_test_hold_point right before its own decode, until released. The
+ * held values are counts (several decoders can park at once). */
 static pthread_mutex_t g_mlv_raw_uint16_prefetch_test_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_mlv_raw_uint16_prefetch_test_cond = PTHREAD_COND_INITIALIZER;
 static int g_mlv_raw_uint16_prefetch_test_hold = 0;
 static int g_mlv_raw_uint16_prefetch_test_held = 0;
+static int g_mlv_raw_uint16_fg_test_hold = 0;
+static int g_mlv_raw_uint16_fg_test_held = 0;
 
 static void mlv_raw_uint16_prefetch_test_hold_point(void)
 {
     pthread_mutex_lock(&g_mlv_raw_uint16_prefetch_test_mutex);
     if (g_mlv_raw_uint16_prefetch_test_hold)
     {
-        g_mlv_raw_uint16_prefetch_test_held = 1;
+        ++g_mlv_raw_uint16_prefetch_test_held;
         pthread_cond_broadcast(&g_mlv_raw_uint16_prefetch_test_cond);
         while (g_mlv_raw_uint16_prefetch_test_hold)
             pthread_cond_wait(&g_mlv_raw_uint16_prefetch_test_cond, &g_mlv_raw_uint16_prefetch_test_mutex);
-        g_mlv_raw_uint16_prefetch_test_held = 0;
+        --g_mlv_raw_uint16_prefetch_test_held;
+    }
+    pthread_mutex_unlock(&g_mlv_raw_uint16_prefetch_test_mutex);
+}
+
+static void mlv_raw_uint16_fg_test_hold_point(void)
+{
+    pthread_mutex_lock(&g_mlv_raw_uint16_prefetch_test_mutex);
+    if (g_mlv_raw_uint16_fg_test_hold)
+    {
+        ++g_mlv_raw_uint16_fg_test_held;
+        pthread_cond_broadcast(&g_mlv_raw_uint16_prefetch_test_cond);
+        while (g_mlv_raw_uint16_fg_test_hold)
+            pthread_cond_wait(&g_mlv_raw_uint16_prefetch_test_cond, &g_mlv_raw_uint16_prefetch_test_mutex);
+        --g_mlv_raw_uint16_fg_test_held;
     }
     pthread_mutex_unlock(&g_mlv_raw_uint16_prefetch_test_mutex);
 }
@@ -1593,6 +1647,12 @@ static void * mlv_raw_uint16_prefetch_thread_main(void * opaque)
 
         const uint32_t lookahead =
             mlv_raw_uint16_prefetch_lookahead_for_request(video);
+        pthread_mutex_lock(&video->raw_uint16_prefetch_mutex);
+        if (lookahead > video->raw_uint16_prefetch_stats.lookahead_max)
+        {
+            video->raw_uint16_prefetch_stats.lookahead_max = lookahead;
+        }
+        pthread_mutex_unlock(&video->raw_uint16_prefetch_mutex);
 
         for (uint32_t offset = 1; offset <= lookahead; ++offset)
         {
@@ -1642,11 +1702,25 @@ static void * mlv_raw_uint16_prefetch_thread_main(void * opaque)
 
             mlv_raw_uint16_prefetch_test_hold_point();
             int decodeOk = (getMlvRawFrameUint16Direct(video, targetFrame, slotBuffer) == 0);
+            const double workerLj92Ms = g_mlv_last_raw_uint16_decompress_ms;   /* this worker's own thread-local */
 
             pthread_mutex_lock(&video->raw_uint16_prefetch_mutex);
             if (!decodeOk)
             {
                 ++video->raw_uint16_prefetch_decode_failures;
+            }
+            else
+            {
+                mlvRawUint16PrefetchStats_t * stats = &video->raw_uint16_prefetch_stats;
+                ++stats->worker_decodes;
+                stats->worker_lj92_ms_sum += workerLj92Ms;
+                if (workerLj92Ms > stats->worker_lj92_ms_max) stats->worker_lj92_ms_max = workerLj92Ms;
+                if (workerLj92Ms > 41.7) ++stats->worker_lj92_over_41_7;
+                const int readySlot = mlv_raw_uint16_prefetch_find_slot_locked(video, targetFrame);
+                if (generation == video->raw_uint16_prefetch_generation && readySlot >= 0 && readySlot != (int)slot)
+                {
+                    ++stats->duplicate_publishes;
+                }
             }
             if (slot < MLV_RAW_UINT16_PREFETCH_SLOTS
                 && video->raw_uint16_prefetch_slot_frame[slot] == targetFrame
@@ -3299,6 +3373,8 @@ static int getMlvRawFrameUint16Direct(mlvObject_t * video, uint64_t frameIndex, 
     size_t packed_frame_size = 0;
     size_t raw_frame_capacity = 0;
 
+    mlv_raw_uint16_count_decode_for_testing(frameIndex);
+
     /* CinemaDNG folder source: there is no MLV/mcraw file[chunk] container.
      * Each frame is its own .dng file. Decode the requested frame's bayer
      * payload directly into unpackedFrame (uncompressed bit-unpack OR LJ92,
@@ -3869,9 +3945,17 @@ int getMlvRawFrameUint16(mlvObject_t * video, uint64_t frameIndex, uint16_t * un
 {
     const int compressedRaw = isMcrawLoaded(video)
         || (video->MLVI.videoClass & MLV_VIDEO_CLASS_FLAG_LJ92);
-    const int prefetchEnabled = compressedRaw && mlv_raw_uint16_prefetch_allowed_for_request(video);
+    const int prefetchEnabled = compressedRaw && mlv_raw_uint16_prefetch_allowed_for_request(video)
+        && mlv_raw_uint16_prefetch_test_override() != 0;
 
     g_mlv_last_raw_uint16_prefetch_hit = 0;
+
+    if (prefetchEnabled)
+    {
+        pthread_mutex_lock(&video->raw_uint16_prefetch_mutex);
+        ++video->raw_uint16_prefetch_stats.admitted_requests;
+        pthread_mutex_unlock(&video->raw_uint16_prefetch_mutex);
+    }
 
     if (prefetchEnabled && mlv_raw_uint16_prefetch_try_copy(video, frameIndex, unpackedFrame))
     {
@@ -3910,7 +3994,15 @@ int getMlvRawFrameUint16(mlvObject_t * video, uint64_t frameIndex, uint16_t * un
         return 0;
     }
 
+    mlv_raw_uint16_fg_test_hold_point();
     int result = getMlvRawFrameUint16Direct(video, frameIndex, unpackedFrame);
+    if (compressedRaw)
+    {
+        pthread_mutex_lock(&video->raw_uint16_prefetch_mutex);
+        ++video->raw_uint16_prefetch_stats.fg_direct_decodes;
+        video->raw_uint16_prefetch_stats.fg_direct_lj92_ms_sum += g_mlv_last_raw_uint16_decompress_ms;
+        pthread_mutex_unlock(&video->raw_uint16_prefetch_mutex);
+    }
     if (result == 0 && prefetchEnabled)
     {
         mlv_raw_uint16_prefetch_store_frame(video, frameIndex, unpackedFrame);
@@ -8857,6 +8949,114 @@ uint64_t getMlvRawUint16PrefetchDecodeFailures(mlvObject_t * video)
     uint64_t value = video->raw_uint16_prefetch_decode_failures;
     pthread_mutex_unlock(&video->raw_uint16_prefetch_mutex);
     return value;
+}
+
+void getMlvRawUint16PrefetchStats(mlvObject_t * video, mlvRawUint16PrefetchStats_t * stats)
+{
+    if (!stats) return;
+    memset(stats, 0, sizeof(*stats));
+    if (!video) return;
+    pthread_mutex_lock(&video->raw_uint16_prefetch_mutex);
+    *stats = video->raw_uint16_prefetch_stats;
+    stats->decoders = (mlv_raw_uint16_prefetch_enabled() && mlv_raw_uint16_prefetch_test_override() != 0) ? 1u : 0u;
+    pthread_mutex_unlock(&video->raw_uint16_prefetch_mutex);
+}
+
+void mlvResetRawUint16PrefetchStats(mlvObject_t * video)
+{
+    if (!video) return;
+    pthread_mutex_lock(&video->raw_uint16_prefetch_mutex);
+    memset(&video->raw_uint16_prefetch_stats, 0, sizeof(video->raw_uint16_prefetch_stats));
+    pthread_mutex_unlock(&video->raw_uint16_prefetch_mutex);
+}
+
+void mlvSetRawUint16PrefetchDecodersForTesting(int k)
+{
+#if defined(__GNUC__)
+    __atomic_store_n(&g_mlv_raw_uint16_prefetch_test_decoders, k < 0 ? -1 : k, __ATOMIC_RELEASE);
+#else
+    g_mlv_raw_uint16_prefetch_test_decoders = k < 0 ? -1 : k;
+#endif
+}
+
+int mlvRawUint16PrefetchDecodersFromEnvValueForTesting(const char * value)
+{
+    (void)value;
+    return 1;   /* one prefetch thread; there is no decoder-count knob */
+}
+
+int mlvRawUint16PrefetchClaimsForTesting(mlvObject_t * video, int foreground, uint64_t * frames, int capacity)
+{
+    if (!video) return 0;
+    int count = 0;
+    pthread_mutex_lock(&video->raw_uint16_prefetch_mutex);
+    if (!foreground)
+    {
+        for (uint32_t slot = 0; slot < MLV_RAW_UINT16_PREFETCH_SLOTS; ++slot)
+        {
+            if (video->raw_uint16_prefetch_slot_state[slot] != MLV_RAW_UINT16_PREFETCH_DECODING) continue;
+            if (frames && count < capacity) frames[count] = video->raw_uint16_prefetch_slot_frame[slot];
+            ++count;
+        }
+    }
+    pthread_mutex_unlock(&video->raw_uint16_prefetch_mutex);
+    if (frames)
+    {
+        const int filled = count < capacity ? count : capacity;
+        for (int i = 1; i < filled; ++i)
+            for (int j = i; j > 0 && frames[j - 1] > frames[j]; --j)
+            {
+                const uint64_t swap = frames[j];
+                frames[j] = frames[j - 1];
+                frames[j - 1] = swap;
+            }
+    }
+    return count;
+}
+
+int mlvRawUint16PrefetchHeldCountForTesting(void)
+{
+    pthread_mutex_lock(&g_mlv_raw_uint16_prefetch_test_mutex);
+    const int held = g_mlv_raw_uint16_prefetch_test_held;
+    pthread_mutex_unlock(&g_mlv_raw_uint16_prefetch_test_mutex);
+    return held;
+}
+
+void mlvSetRawUint16ForegroundHoldBeforeDecodeForTesting(int enabled)
+{
+    pthread_mutex_lock(&g_mlv_raw_uint16_prefetch_test_mutex);
+    g_mlv_raw_uint16_fg_test_hold = enabled ? 1 : 0;
+    pthread_cond_broadcast(&g_mlv_raw_uint16_prefetch_test_cond);
+    pthread_mutex_unlock(&g_mlv_raw_uint16_prefetch_test_mutex);
+}
+
+int mlvRawUint16ForegroundHeldCountForTesting(void)
+{
+    pthread_mutex_lock(&g_mlv_raw_uint16_prefetch_test_mutex);
+    const int held = g_mlv_raw_uint16_fg_test_held;
+    pthread_mutex_unlock(&g_mlv_raw_uint16_prefetch_test_mutex);
+    return held;
+}
+
+void mlvResetRawUint16DecodeCountsForTesting(int enabled)
+{
+    pthread_mutex_lock(&g_mlv_raw_uint16_decode_count_mutex);
+    memset(g_mlv_raw_uint16_decode_counts, 0, sizeof(g_mlv_raw_uint16_decode_counts));
+#if defined(__GNUC__)
+    __atomic_store_n(&g_mlv_raw_uint16_decode_count_enabled, enabled ? 1 : 0, __ATOMIC_RELEASE);
+#else
+    g_mlv_raw_uint16_decode_count_enabled = enabled ? 1 : 0;
+#endif
+    pthread_mutex_unlock(&g_mlv_raw_uint16_decode_count_mutex);
+}
+
+uint32_t mlvRawUint16DecodeCountForTesting(uint64_t frameIndex)
+{
+    if (frameIndex >= MLV_RAW_UINT16_DECODE_COUNT_FRAMES) return 0;
+    pthread_mutex_lock(&g_mlv_raw_uint16_decode_count_mutex);
+    const uint32_t count = g_mlv_raw_uint16_decode_counts[frameIndex];
+    pthread_mutex_unlock(&g_mlv_raw_uint16_decode_count_mutex);
+    return count;
 }
 
 double getMlvLastLlrawprocMilliseconds(void)
