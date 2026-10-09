@@ -856,9 +856,12 @@ class FailurePathStopExecutedTests(_ProbeCase):
 
     def test_every_failure_path_stop_call_in_the_job_passes_the_session_name(self) -> None:
         template = _template()
-        for name in ("$presentMonStopOnKeepAliveFailure", "$presentMonStop"):
+        for name in ("$presentMonStopOnSessionLocked", "$presentMonStopOnKeepAliveFailure", "$presentMonStop"):
             self.assertIn(f"{name} = Stop-PresentMonCapture -Proc $presentMonProc -SessionName $PresentMonSessionName", template)
-        self.assertEqual(template.count("Stop-PresentMonCapture -Proc $presentMonProc -SessionName $PresentMonSessionName"), 3)
+        # VENUE-SESSION-LOCKED-REFUSAL-1 r2 adds the 4th: $presentMonStopOnSessionLocked (SESSION_LOCKED_OWNER_ONLY before the smoke launch).
+        self.assertEqual(template.count("Stop-PresentMonCapture -Proc $presentMonProc -SessionName $PresentMonSessionName"), 4)
+        self.assertEqual(template.count("Stop-PresentMonCapture -Proc"),
+                         template.count("Stop-PresentMonCapture -Proc $presentMonProc -SessionName $PresentMonSessionName"))
         self.assertNotIn("Stop-PresentMonCapture -Proc $presentMonProc\n", template)
 
 

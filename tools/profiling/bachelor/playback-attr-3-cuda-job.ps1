@@ -87,6 +87,15 @@
 # the call. A log that is absent, unbound or outside this job's work tree exits 16
 # (SMOKE_LOG_UNAVAILABLE) -- a missing gate is never a passed gate.
 #
+# SESSION LOCK (VENUE-SESSION-LOCKED-REFUSAL-1): exit 30 = SESSION_LOCKED_OWNER_ONLY. The job's
+# first action after claim reads whether its own console session is locked
+# (Get-AttrCudaSessionLocked). Locked or unknown stops the leg before any input is sent; signing in
+# is an owner action. 30 is the next free code: this job's other exits are 0 and 12-29.
+# r2: a keep-alive tick refused for a lock that arrives mid-leg ends the leg the same way at each
+# of the three keep-alive checkpoints (SESSION_LOCKED_OWNER_ONLY, exit 30, not KEEPALIVE_FAILED/26).
+# r4: exit 31 = LOOK_RECEIPT_SHA_MISMATCH (LOOK-ASSIST-FILM-FLAVOR-2 r2 had also taken 30; moved so
+# each exit code names one result).
+#
 # Usage (owner clip, id-only -- no -ClipPath, no -FixtureSha256):
 #   pwsh -NoProfile -File tools\profiling\bachelor\playback-attr-3-cuda-job.ps1 `
 #       -SourceCommit <40-hex> -BuildManifestSha256 <64-lowercase-hex> `
@@ -871,6 +880,11 @@ $embeddedFunctions = $embeddedFunctions + "`r`n# UM-PRESENTMON-ORPHAN-SWEEP-1 >>
     'Add-AttrCudaPresentMonEventsLostDetail',
     'Add-AttrCudaPresentMonEventsLostDetailToReport'
 )) +"`r`n# UM-PRESENTMON-ORPHAN-SWEEP-1 <<<"
+# VENUE-SESSION-LOCKED-REFUSAL-1: the console-lock read Start-AttrCudaDisplayWake makes first and the keep-alive loop re-reads every
+# tick, spliced inside its own sentinel brackets for the same byte-identity reason as the splice above.
+$embeddedFunctions = $embeddedFunctions + "`r`n# VENUE-SESSION-LOCKED-REFUSAL-1 >>>`r`n" + (Get-AttrCudaEmbeddedFunctionSource -Name @(
+    'Get-AttrCudaSessionLocked'
+)) +"`r`n# VENUE-SESSION-LOCKED-REFUSAL-1 <<<"
 $smokeRunnerClosureDigest = Get-AttrCudaClosureDigestHex -Closure $smokeRunnerClosure
 if ($smokeRunnerClosureDigest -notmatch '^[0-9a-f]{64}$') {
     throw "ATTRCUDA_BLOB_SHA_MALFORMED smoke-runner closure digest is not 64 lowercase hex: '$smokeRunnerClosureDigest'"
@@ -1104,6 +1118,24 @@ Write-JobTrace 'step display-wake start'
 try {
 $displayWake = Start-AttrCudaDisplayWake
 Write-JobTrace 'step display-wake done'
+# VENUE-SESSION-LOCKED-REFUSAL-1 >>>
+# VENUE-SESSION-LOCKED-REFUSAL-1: a locked console (or one whose lock state could not be read) is
+# owner-only. Start-AttrCudaDisplayWake read the lock FIRST and sent no input; the leg stops here,
+# before the keep-alive is armed, so nothing is ever injected into a locked console.
+if ($displayWake.sessionLocked -ne $false) {
+    [void](New-AttrCudaDirectory -Path (Join-Path $Root 'outbox'))
+    [void](New-AttrCudaDirectory -Path $Pub)
+    $sessionLockedRefusal = [ordered]@{
+        schema='playback-attr-3-cuda-venue.v1'; result='SESSION_LOCKED_OWNER_ONLY'
+        fixtureRehearsal=$FixtureRehearsal
+        displayWake=$displayWake
+        sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
+    }
+    Save-Json $sessionLockedRefusal (Join-Path $Pub 'summary.json')
+    Write-Output "RESULT=SESSION_LOCKED_OWNER_ONLY ARTIFACTS=$Pub"
+    exit 30
+}
+# VENUE-SESSION-LOCKED-REFUSAL-1 <<<
 if ($displayWake.screensaverSecureOwnerOnly) {
     [void](New-AttrCudaDirectory -Path (Join-Path $Root 'outbox'))
     [void](New-AttrCudaDirectory -Path $Pub)
@@ -2646,6 +2678,26 @@ if ($ContactSheetEnabled) {
 # CUDA-PERF-DISPLAY-WAKE-3 round 1b: -RequireSuccessSoFar only at this FIRST checkpoint -- see
 # Get-AttrCudaDisplayWakeKeepAliveHealth's own .PARAMETER doc for why only here.
 $keepAliveHealthAtMeasurementStart = Get-AttrCudaDisplayWakeKeepAliveHealth -Handle $displayWakeKeepAlive -RequireSuccessSoFar
+# VENUE-SESSION-LOCKED-REFUSAL-1 >>>
+# r2 (sol blocker 2): a keep-alive tick refused because the console locked mid-leg (or its lock
+# state could not be read) is the same owner-only condition as a lock at claim time: the leg ends
+# SESSION_LOCKED_OWNER_ONLY with exit 30, never the generic KEEPALIVE_FAILED. .sessionLockReason is
+# the keep-alive's own classification; any other keep-alive failure still exits 26 below.
+if ($keepAliveHealthAtMeasurementStart.sessionLockReason) {
+    $displayWake['keepAliveHealth'] = $keepAliveHealthAtMeasurementStart
+    $sessionLockedRefusal = [ordered]@{
+        schema='playback-attr-3-cuda-venue.v1'; result='SESSION_LOCKED_OWNER_ONLY'
+        fixtureRehearsal=$FixtureRehearsal
+        displayWake=$displayWake
+        keepAliveCheckpoint='start_of_measured_interval'
+        sessionLockReason=$keepAliveHealthAtMeasurementStart.sessionLockReason
+        sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
+    }
+    Save-Json $sessionLockedRefusal (Join-Path $Pub 'summary.json')
+    Write-Output "RESULT=SESSION_LOCKED_OWNER_ONLY CHECKPOINT=start_of_measured_interval REASON=$($keepAliveHealthAtMeasurementStart.sessionLockReason) ARTIFACTS=$Pub"
+    exit 30
+}
+# VENUE-SESSION-LOCKED-REFUSAL-1 <<<
 if (-not $keepAliveHealthAtMeasurementStart.healthy) {
     $displayWake['keepAliveHealth'] = $keepAliveHealthAtMeasurementStart
     $keepAliveRefusal = [ordered]@{
@@ -2760,6 +2812,30 @@ $presentMonCaptureStartUncertaintyMs = ($presentMonPostSpawnUtc - $presentMonCap
 # already running at this point, so it is stopped (never left orphaned) before this exits, the
 # same way SMOKE_RUN_FAILED already does below.
 $keepAliveHealthBeforeSmokeLaunch = Get-AttrCudaDisplayWakeKeepAliveHealth -Handle $displayWakeKeepAlive
+# VENUE-SESSION-LOCKED-REFUSAL-1 >>>
+# r2 (sol blocker 2): a lock refusal is owner-only here too; PresentMon is already running, so it
+# is stopped first, exactly as the KEEPALIVE_FAILED branch below does.
+if ($keepAliveHealthBeforeSmokeLaunch.sessionLockReason) {
+    $displayWake['keepAliveHealth'] = $keepAliveHealthBeforeSmokeLaunch
+    $presentMonStopOnSessionLocked = Stop-PresentMonCapture -Proc $presentMonProc -SessionName $PresentMonSessionName
+    Write-JobTrace "step presentmon-stop site=session-locked confirmedExited=$($presentMonStopOnSessionLocked.confirmedExited) postKillTerminate=$(Format-PresentMonSessionTerminateText $presentMonStopOnSessionLocked.postKillSessionTerminate)"
+    $sessionLockedRefusal = [ordered]@{
+        schema='playback-attr-3-cuda-venue.v1'; result='SESSION_LOCKED_OWNER_ONLY'
+        fixtureRehearsal=$FixtureRehearsal
+        displayWake=$displayWake
+        keepAliveCheckpoint='before_smoke_launch'
+        sessionLockReason=$keepAliveHealthBeforeSmokeLaunch.sessionLockReason
+        presentMonConfirmedExited=$presentMonStopOnSessionLocked.confirmedExited
+        presentMonKillError=$presentMonStopOnSessionLocked.killError
+        presentMonWaitError=$presentMonStopOnSessionLocked.waitError
+        presentMonPostKillSessionTerminate=$presentMonStopOnSessionLocked.postKillSessionTerminate
+        sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
+    }
+    Save-Json $sessionLockedRefusal (Join-Path $Pub 'summary.json')
+    Write-Output "RESULT=SESSION_LOCKED_OWNER_ONLY CHECKPOINT=before_smoke_launch REASON=$($keepAliveHealthBeforeSmokeLaunch.sessionLockReason) ARTIFACTS=$Pub"
+    exit 30
+}
+# VENUE-SESSION-LOCKED-REFUSAL-1 <<<
 if (-not $keepAliveHealthBeforeSmokeLaunch.healthy) {
     $displayWake['keepAliveHealth'] = $keepAliveHealthBeforeSmokeLaunch
     $presentMonStopOnKeepAliveFailure = Stop-PresentMonCapture -Proc $presentMonProc -SessionName $PresentMonSessionName
@@ -3197,6 +3273,27 @@ if ($null -ne $presentMonWaitError) {
 # the leg the same typed way the earlier two checkpoints already do (never silently, and never
 # read as a clean measurement), rather than continuing on to a report that would call it OK.
 $keepAliveHealthAfterMeasuredInterval = Get-AttrCudaDisplayWakeKeepAliveHealth -Handle $displayWakeKeepAlive
+# VENUE-SESSION-LOCKED-REFUSAL-1 >>>
+# r2 (sol blocker 2): a lock refusal during the measured interval is owner-only, never a
+# measurement and never KEEPALIVE_FAILED. The PresentMon CSV is kept as evidence, as below.
+if ($keepAliveHealthAfterMeasuredInterval.sessionLockReason) {
+    $displayWake['keepAliveHealth'] = $keepAliveHealthAfterMeasuredInterval
+    if (Test-Path -LiteralPath $presentMonPath -PathType Leaf) {
+        [void](Publish-AttrCudaFileCopy -Source $presentMonPath -Destination (Join-Path $Pub 'presentmon.csv'))
+    }
+    $sessionLockedRefusal = [ordered]@{
+        schema='playback-attr-3-cuda-venue.v1'; result='SESSION_LOCKED_OWNER_ONLY'
+        fixtureRehearsal=$FixtureRehearsal
+        displayWake=$displayWake
+        keepAliveCheckpoint='after_measured_interval'
+        sessionLockReason=$keepAliveHealthAfterMeasuredInterval.sessionLockReason
+        sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
+    }
+    Save-Json $sessionLockedRefusal (Join-Path $Pub 'summary.json')
+    Write-Output "RESULT=SESSION_LOCKED_OWNER_ONLY CHECKPOINT=after_measured_interval REASON=$($keepAliveHealthAfterMeasuredInterval.sessionLockReason) ARTIFACTS=$Pub"
+    exit 30
+}
+# VENUE-SESSION-LOCKED-REFUSAL-1 <<<
 if (-not $keepAliveHealthAfterMeasuredInterval.healthy) {
     $displayWake['keepAliveHealth'] = $keepAliveHealthAfterMeasuredInterval
     if (Test-Path -LiteralPath $presentMonPath -PathType Leaf) {
@@ -4097,7 +4194,8 @@ if ($ForceLookAssist) {
     $template = Edit-DualVenueTemplate $template '-RequireLookAssist:`$false -Scope none' '-RequireLookAssist:`$true -Scope none'
     if ($hasLookReceipt) {
         # LOOK-ASSIST-FILM-FLAVOR-2 r2: the receipt ships inline (base64 + sha256), is written into the work dir and re-verified before anything plays, and
-        # reaches the smoke runner as -Receipt, exactly once. A mismatch ends the job typed (LOOK_RECEIPT_SHA_MISMATCH, exit 30) before the app launches.
+        # reaches the smoke runner as -Receipt, exactly once. A mismatch ends the job typed (LOOK_RECEIPT_SHA_MISMATCH, exit 31) before the app launches.
+        # VENUE-SESSION-LOCKED-REFUSAL-1 r4: was exit 30, which this job's header already gives to SESSION_LOCKED_OWNER_ONLY (the two landed concurrently).
         $template = Edit-DualVenueTemplate $template "`$TelemetryArm = '__TELEMETRY_ARM__'
 " ("`$LookReceiptBase64 = '$lookReceiptBase64'
 `$LookReceiptSha256 = '$lookReceiptSha256'
@@ -4113,7 +4211,7 @@ if ($lookReceiptPayload.sha256 -cne $LookReceiptSha256 -or -not (Test-Path -Lite
     [void](New-AttrCudaDirectory -Path $Pub)
     Save-Json ([ordered]@{ schema='playback-attr-3-cuda-venue.v1'; result='LOOK_RECEIPT_SHA_MISMATCH'; fixtureRehearsal=$FixtureRehearsal; lookReceiptSha256=$LookReceiptSha256; sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub }) (Join-Path $Pub 'summary.json')
     Write-Output "RESULT=LOOK_RECEIPT_SHA_MISMATCH ARTIFACTS=$Pub"
-    exit 30
+    exit 31
 }
 $envList = "'" + ($envs -join "','") + "'"
 '@
