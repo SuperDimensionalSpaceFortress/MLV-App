@@ -23,9 +23,10 @@
                                        32-bit host), so a holder whose only link is its cwd cannot be seen. Fail closed.
       kept     cwd-unknown             (r2) a live process that could hold the path has a current directory the probe could
                                        not read (other user, elevated, protected) and that was created at/after the worktree
-                                       or has no readable creation time (r3), or runs a relative script path with an
+                                       or has no readable creation time (r3), and whose owner the SCM cannot name as a
+                                       well-known service identity (r4), or runs a relative script path with an
                                        unknown cwd. Fail closed. Fields: disposition.cwdProbe, cwdUnknown, cwdExempt,
-                                       worktreeCreatedUtc.
+                                       worktreeCreatedUtc, cwdExemptOwner, cwdOwnerProbe.
       kept     dirty                  `git status --porcelain -uall` is non-empty
       kept     unpushed                HEAD has commits not on any remote
       kept     unmerged                HEAD is on a remote but not an ancestor of -MergeTarget
@@ -61,6 +62,21 @@
          directory into it, and whose cwd is unreadable to us is not caught (a cmdline or script hit still is).
          A deleted-and-recreated directory of the same name inside the Windows 15 s file-system tunnelling window can keep
          its old CreationTime; the same blind spot, same acceptance.
+
+    SERVICE-OWNER EXEMPTION (r4, 2026-10-09, RETIRE-CWD-UNKNOWN-STARVES-SWEEP-1): with r3 alone the sweep never retired:
+      some service host started after every worktree is always alive (HUB-TICK 20261009T1632Z: 4 of 4 merged, clean
+      worktrees refused). Census on this host, non-elevated caller: of the unreadable-cwd candidates created after a
+      worktree, NONE had a readable owner by token, WMI GetOwnerSid or WTS (access denied / null SID), but the svchost
+      ones are named by the SCM. So a candidate whose cwd is unreadable is ALSO exempt when the SCM started that pid as
+      LocalSystem, LocalService or NetworkService (S-1-5-18/19/20; Get-ServiceAccountByPid) and the snapshot image matches
+      the service binary. Each such pid is listed in disposition.cwdExemptOwner as
+      `<pid> <name> exempt=service-sid:<sid> via=scm:<services>`; disposition.cwdOwnerProbe is scm | scm-failed.
+      Why it cannot exempt a lane: a lane runs as THIS user (often a Scheduled Task in session 0); no SCM entry names it,
+      and a service configured to run as a user, a per-user service instance or an NT Service\ account is not exempt.
+      A session id is still not evidence. Fails closed when the SCM query fails, the probe is unavailable, the pid hosts
+      services under mixed accounts, the image differs (pid reuse) or the script path is relative-unresolved. Not exempt
+      and still refusing: non-service SYSTEM children such as SearchProtocolHost / SearchFilterHost (owner unreadable).
+      RESIDUAL RISK, accepted: a SYSTEM service that changes its own cwd into a worktree is not caught by cwd.
 
     RELATIVE SCRIPT PATHS (r2): a script path on a holder's command line (-File, dot-source in -Command, positional)
     is resolved against THAT holder's current directory, taken from the cwd index, when it is relative or quoted-relative,
@@ -358,24 +374,67 @@ function Find-WorktreeHolders {
     return $rows.ToArray()
 }
 
+function Get-RunningServiceRows {
+    # Win32_Service rows of running services. A seam: a test redefines this function to feed fixed rows.
+    return @(Get-CimInstance Win32_Service -Filter "State='Running'" -Property ProcessId, Name, StartName, ServiceType, PathName -ErrorAction Stop)
+}
+
+function Get-ServiceAccountByPid {
+    # r4: pid -> {Sid; Services; Image} for processes the SCM started as a well-known service identity. Every service the
+    # SCM lists at that pid must be an own/share-process service whose configured account is LocalSystem (S-1-5-18),
+    # LocalService (S-1-5-19) or NetworkService (S-1-5-20), all naming the same image; any other account (a user, a
+    # per-user service instance, an NT Service\ virtual account) drops the pid. Throws when the SCM query fails.
+    $map = @{}; $bad = @{}
+    foreach ($s in @(Get-RunningServiceRows)) {
+        $procId = [int]$s.ProcessId
+        if ($procId -le 4) { continue }
+        $sid = switch -Regex ([string]$s.StartName) {
+            '^(\.\\)?LocalSystem$|^NT AUTHORITY\\SYSTEM$' { 'S-1-5-18'; break }
+            '^NT AUTHORITY\\(LocalService|LOCAL SERVICE)$' { 'S-1-5-19'; break }
+            '^NT AUTHORITY\\(NetworkService|NETWORK SERVICE)$' { 'S-1-5-20'; break }
+            default { $null }
+        }
+        $m = [regex]::Match([string]$s.PathName, '^\s*"?([^"]*?\.exe)', 'IgnoreCase')
+        $img = if ($m.Success) { Split-Path -Leaf $m.Groups[1].Value } else { $null }
+        if (-not $sid -or -not $img -or [string]$s.ServiceType -notin @('Own Process', 'Share Process')) { $bad[$procId] = $true; continue }
+        if (-not $map.ContainsKey($procId)) { $map[$procId] = [pscustomobject]@{ Sid = $sid; Services = [string]$s.Name; Image = $img }; continue }
+        if ($map[$procId].Sid -ne $sid -or $map[$procId].Image -ine $img) { $bad[$procId] = $true; continue }
+        $map[$procId].Services += ',' + [string]$s.Name
+    }
+    foreach ($k in @($bad.Keys)) { $map.Remove($k) }
+    return $map
+}
+
 function Get-CwdUnknownRefusal {
     # r2: the cwd probe's own verdict for this snapshot and worktree. Unknown is empty when every candidate holder's cwd was
     # read or exempted; otherwise Reason/Rows/Unknown describe a kept / cwd-probe-unavailable | cwd-unknown result. Never a
-    # would-retire. r3: the ONE exemption is creation time - a candidate whose cwd is unreadable is exempt only when its
+    # would-retire. r3: the first exemption is creation time - a candidate whose cwd is unreadable is exempt only when its
     # CreationDate is strictly EARLIER than the worktree root's CreationTimeUtc (a process that started before the directory
     # existed cannot have had it as its startup cwd). It needs a working probe (an unavailable probe is a host fault, not a
     # per-process blind spot) and never applies to relative-script-unresolved. Creation date or worktree time unreadable,
-    # or created at/after the worktree: refused.
+    # or created at/after the worktree: refused. r4: the second exemption is the owner, under the same two conditions -
+    # a pid the SCM started as S-1-5-18/19/20 (Get-ServiceAccountByPid) whose snapshot image matches; listed in ExemptOwner.
     param([object]$Snapshot, [string]$WorktreePath)
     $idx = Get-LaneHolderIndex -Snapshot $Snapshot
     $wtCreated = try { (Get-Item -LiteralPath $WorktreePath -ErrorAction Stop).CreationTimeUtc } catch { $null }
-    $unk = @(); $exempt = 0
+    $unk = @(); $exempt = 0; $owner = @(); $ownerProbe = $null
     foreach ($u in @($idx.CwdUnknown)) {
         if ($idx.CwdProbe -eq 'ok' -and $u.Why -eq 'cwd-unreadable' -and $null -ne $wtCreated -and $null -ne $u.CreatedUtc -and $u.CreatedUtc -lt $wtCreated) { $exempt++; continue }
+        if ($idx.CwdProbe -eq 'ok' -and $u.Why -eq 'cwd-unreadable') {
+            # One SCM query per snapshot, cached on the index; a failed query exempts nothing.
+            if (-not $idx.PSObject.Properties['ServiceOwners']) {
+                $so = try { [pscustomobject]@{ Probe = 'scm'; ByPid = (Get-ServiceAccountByPid) } } catch { [pscustomobject]@{ Probe = 'scm-failed'; ByPid = @{} } }
+                $idx | Add-Member -NotePropertyName ServiceOwners -NotePropertyValue $so -Force
+            }
+            $ownerProbe = $idx.ServiceOwners.Probe
+            $o = $idx.ServiceOwners.ByPid[[int]$u.ProcessId]
+            if ($o -and [string]$o.Image -ieq [string]$u.Name) { $owner += "$($u.ProcessId) $($u.Name) exempt=service-sid:$($o.Sid) via=scm:$($o.Services)"; continue }
+        }
         $unk += $u
     }
     $made = if ($null -ne $wtCreated) { ([datetime]$wtCreated).ToString('o') } else { $null }
-    $res = [pscustomobject]@{ Probe = [string]$idx.CwdProbe; Reason = $null; Rows = @(); Unknown = @(); Exempt = $exempt; WorktreeCreatedUtc = $made }
+    $res = [pscustomobject]@{ Probe = [string]$idx.CwdProbe; Reason = $null; Rows = @(); Unknown = @(); Exempt = $exempt; WorktreeCreatedUtc = $made
+                              ExemptOwner = $owner; OwnerProbe = $ownerProbe }
     if (-not $unk.Count) { return $res }
     $first = ($unk | Select-Object -First 5 | ForEach-Object { "$($_.ProcessId) $($_.Name) ($($_.Why))" }) -join ', '
     $res.Reason = if ($idx.CwdProbe -ne 'ok') { "cwd-probe-unavailable: the current-directory probe cannot run, so $($unk.Count) process(es) cannot be ruled out as holders, first: $first" }
@@ -410,7 +469,7 @@ function Invoke-RetireLaneWorktree {
     $d = [ordered]@{
         schema = 'mlv-app/lane-worktree-disposition/v1'; workDir = $WorkDir; action = 'kept'; reason = $null
         head = $null; branch = $null; quarantined = @(); holders = @(); cwdProbe = $null; cwdUnknown = @()
-        cwdExempt = 0; worktreeCreatedUtc = $null
+        cwdExempt = 0; worktreeCreatedUtc = $null; cwdExemptOwner = @(); cwdOwnerProbe = $null
         utc = (Get-Date).ToUniversalTime().ToString('o')
     }
     # Fail closed on the cwd probe's own blind spots (see CWD PROBE IS LOUD): true = refused, disposition filled in.
@@ -419,6 +478,8 @@ function Invoke-RetireLaneWorktree {
         $d.cwdProbe = [string]$r.Probe
         $d.cwdExempt = [int]$r.Exempt
         $d.worktreeCreatedUtc = $r.WorktreeCreatedUtc
+        $d.cwdExemptOwner = @($r.ExemptOwner)
+        $d.cwdOwnerProbe = $r.OwnerProbe
         if (-not @($r.Unknown).Count) { return $false }
         $d.cwdUnknown = $r.Unknown
         Write-RefusedHolders -WorktreePath $wd -Holders $r.Rows
