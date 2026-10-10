@@ -2408,3 +2408,88 @@ def test_check_commits_lists_an_item_whose_rendered_card_is_over_the_limit(tmp_p
     assert len(problems) == 1
     assert problems[0].startswith(f"DOCTRINE_EXPORT_OUTBOX_ITEM_INVALID: doctrine-outbox/{over_name}")
     assert "CARD_INVALID" in problems[0] and f"{max_bytes + 1} bytes" in problems[0]
+
+
+# ---------- every committed outbox item must survive the drain's card validation ----------
+#
+# The drain refuses a card the bus validator rejects (size over 2,000 bytes, an `applies` value that
+# is not a fleet member, ...) only AFTER the item has merged, so the lesson silently never ships.
+# This renders every tracked doctrine-outbox item at HEAD exactly as drain() does (load_outbox_items
+# + render_block) and runs each card through the vendored validator, so CI refuses it before merge.
+#
+# Named mutation for this block (turns the named test red, then is reverted):
+#   M16 skip the validator run in _validator_refusals()   -> test_a_card_the_validator_rejects_is_named_with_its_reason
+
+# The roster `applies` is judged against: the validator's own fleet-membership.mjs run over the bus's
+# top-level specs/*.md. A snapshot (CI has no bus clone); a card legitimately naming a newer member
+# fails here until this list is refreshed from the bus.
+FLEET_MEMBERS_SNAPSHOT = (
+    "account-rotation-and-project-continuity", "account-rotation-automation", "adobe-ingester",
+    "adversarial-swarms-and-doctrine-publishing-standard", "adversarialllm", "agent-bridge", "airmypc",
+    "autonomous-decision-making-with-adversarial-swarms", "autonomous-swarm-adjudication",
+    "cli-credential-rotation-automation", "cli-credential-rotation-coexistence",
+    "cli-credential-synchronization", "cli-orchestration-standard", "cloudvore", "conjugal",
+    "context-ultra-salesforce", "design-loop-protocol", "dispatch-trigger-standard", "dng-auto-processor",
+    "doctrine-guard-conflict-prevention", "machine-inventory-schema", "mlv-app",
+    "multi-provider-failover-pattern", "parallel-consensus-swarm", "phased-concurrent-review-pattern",
+    "posture-templates-conjugal-standard", "pre-rotation-proof-and-resume-dispatcher", "salesforce-tools",
+    "spec-adoption-pipeline", "spec-continuous-sync-for-floors",
+)
+
+
+def _validator_refusals(loaded: list[dict], tmp_path: Path) -> list[str]:
+    """One line per loaded outbox item the drain would refuse: a parse/name error, or a card the
+    vendored validator rejects (judged as title + that card, as the drain's per-card pass does)."""
+    bus = tmp_path / "bus"
+    (bus / "specs").mkdir(parents=True)
+    (bus / "RULINGS.md").write_text("# RULINGS\n", encoding="utf-8")
+    for member in FLEET_MEMBERS_SNAPSHOT:
+        (bus / "specs" / f"{member}.md").write_text(f"# {member}\n", encoding="utf-8")
+    refusals = []
+    for it in loaded:
+        if "error" in it:
+            refusals.append(f"{it['path']}: OUTBOX_ITEM_INVALID: {it['error']}")
+            continue
+        item = it["item"]
+        if item["meta"]["target"] != CARDS:
+            continue
+        src = it["source_commit"]
+        _key, block = ob.render_block(item, "0" * 40 if src == "PENDING" else src)
+        cards = tmp_path / f"cards-{it['name']}"
+        cards.write_bytes(ob.CARDS_TITLE.encode("utf-8") + block.encode("utf-8"))
+        proc = subprocess.run(["node", str(FIXTURE_DIR / "validate-cards.mjs"), "--bus", str(bus),
+                               "--file", str(cards), "--project", "mlv-app"],
+                              capture_output=True, text=True, encoding="utf-8", timeout=60)
+        if proc.returncode != 0:
+            reasons = "; ".join(line.split("] ", 1)[-1] for line in proc.stdout.splitlines() if line.startswith("INVALID"))
+            refusals.append(f"{it['path']}: validator exit {proc.returncode}: {reasons or (proc.stdout + proc.stderr).strip()}")
+    return refusals
+
+
+@needs_node
+def test_every_committed_outbox_item_passes_the_card_validator(tmp_path):
+    loaded = ob.load_outbox_items(REPO_ROOT, "HEAD")
+    assert loaded, "no doctrine-outbox items at HEAD: the enumeration itself is broken"
+    refusals = _validator_refusals(loaded, tmp_path)
+    assert not refusals, "the drain would refuse these committed outbox items:\n" + "\n".join(refusals)
+
+
+@needs_node
+def test_a_card_the_validator_rejects_is_named_with_its_reason(tmp_path):
+    """The guard test above cannot pass vacuously: an over-size card whose `applies` is not a member
+    comes back named, with both validator reasons; an in-limit member card does not."""
+    _max_lines, max_bytes = _vendored_card_limits()
+    bad_body = _card_with_rendered_bytes(max_bytes + 1).replace(
+        "check:", "applies: every board that retires worktrees\ncheck:", 1)
+    sha = "a" * 40
+    good = {"path": "doctrine-outbox/20261009-good.md", "name": "20261009-good.md", "source_commit": sha,
+            "item": ob.parse_item(item_text(target=CARDS, source_commit=sha, body=CARD_BODY))}
+    bad = {"path": "doctrine-outbox/20261009-bad.md", "name": "20261009-bad.md", "source_commit": sha,
+           "item": ob.parse_item(item_text(target=CARDS, source_commit=sha, body=bad_body))}
+    broken = {"path": "doctrine-outbox/Bad Name.md", "name": "Bad Name.md", "error": "ITEM_BAD_FILENAME: Bad Name.md"}
+    refusals = _validator_refusals([good, bad, broken], tmp_path)
+    assert len(refusals) == 2
+    assert refusals[0].startswith("doctrine-outbox/20261009-bad.md: validator exit 1:")
+    assert re.search(rf"card is \d+ bytes; the limit is {max_bytes}", refusals[0])
+    assert "applies names 'every board that retires worktrees', which is not a fleet member" in refusals[0]
+    assert refusals[1] == "doctrine-outbox/Bad Name.md: OUTBOX_ITEM_INVALID: ITEM_BAD_FILENAME: Bad Name.md"
