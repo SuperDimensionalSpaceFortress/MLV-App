@@ -88,10 +88,13 @@ LOOKAHEAD_LEGS = ("legs/m16-1243-pace-cinematic-fullscreen-s4-la3.json",)
 # ... and (r2) the stall-stage diagnostic: the owner-shape pace leg at telemetryArm HEAVY, which keeps the per-frame playback_smoke.frame log
 # (LIGHT disables it), so the present that ends a >= 250 ms interval shows its own stage times. Diagnostic only: never a pace number.
 HEAVY_LEGS = ("legs/m16-1243-pace-cinematic-fullscreen-s4-heavy.json",)
+# CPU-DUALISO-REDUCED-ISO-NOTCH-1: cpu-only cinematic look legs at playbackProcessing receipt, the only legs that reach the CPU reduced dual-ISO recon.
+CPU_REDUCED_LEGS = tuple(f"legs/m16-1243-cpu-reduced-{mode}-s{scale}.json" for scale in (2, 4) for mode in ("fullscreen", "windowed"))
 # LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1 added the scale-2 Cinematic twin of the scale-2 look leg (the Bachelor CPU Classic | Cinematic look pair).
 SHIPPED_LEGS = ("legs/m16-1243-speed.json", "legs/m16-1243-look.json", "legs/m16-1243-look-scale2.json", "legs/m16-1243-look-cinematic.json", *DISPLAY_MATRIX_LEGS, *PACE_LEGS,
                 *LOOKAHEAD_LEGS, *HEAVY_LEGS, "legs/m16-1243-look-scale2-cinematic.json", "legs/m16-1243-look-film.json",
-                "legs/m16-1243-look-scale2-film.json", *(f"legs/m16-1243-look-scale2-{flavor}-agxoff.json" for flavor in ("cinematic", "film")))
+                "legs/m16-1243-look-scale2-film.json", *(f"legs/m16-1243-look-scale2-{flavor}-agxoff.json" for flavor in ("cinematic", "film")),
+                *CPU_REDUCED_LEGS)
 # LOOK-ASSIST-FILM-FLAVOR-2 r2: the AgX-off twins of the scale-2 Cinematic and Film legs carry a committed look receipt (look-receipts/agx-off.marxml).
 AGXOFF_LEGS = {f"m16-1243-look-scale2-{flavor}-agxoff": f"m16-1243-look-scale2-{flavor}" for flavor in ("cinematic", "film")}
 LOOK_RECEIPT_BASE = "6b6f66f52d5344a97de5068b2e7cae1a61edf295"   # the #328 head whose generator, legs and runner this round extends
@@ -458,6 +461,23 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         self.assertIn("$gen['ForceLookAssist'] = $true; $gen['LookPaceLeg'] = $true", runner)
         self.assertIn("if ($spec.generatorArgs.PSObject.Properties['lookFlavor']) { $gen['LookFlavor'] = [string]$spec.generatorArgs.lookFlavor }", runner)
         self.assertIn("if ($spec.generatorArgs.PSObject.Properties['playbackRenderLookaheadFrames']) { $gen['PlaybackRenderLookaheadFrames'] = [int]$spec.generatorArgs.playbackRenderLookaheadFrames }", runner)
+        # CPU-DUALISO-REDUCED-ISO-NOTCH-1: a leg's playbackProcessing reaches the generator as -PlaybackProcessing.
+        self.assertIn("if ($spec.generatorArgs.PSObject.Properties['playbackProcessing']) { $gen['PlaybackProcessing'] = [string]$spec.generatorArgs.playbackProcessing }", runner)
+
+    def test_playback_processing_reaches_the_smoke_command_and_absent_changes_nothing(self) -> None:
+        """CPU-DUALISO-REDUCED-ISO-NOTCH-1: -PlaybackProcessing receipt adds exactly '-PlaybackProcessing receipt' to the smoke runner's command (it forwards
+        --playback-processing, so a cpu leg renders processed8 and reaches the CPU reduced dual-ISO recon); an absent argument emits the default job byte for byte."""
+        default = self.generate(GENERATOR, "pp-default.job.ps1", ["-Backend", "cpu", "-ContactSheet", "-ContactSheetFrames", "4"])
+        receipt = self.generate(GENERATOR, "pp-receipt.job.ps1", ["-Backend", "cpu", "-ContactSheet", "-ContactSheetFrames", "4", "-PlaybackProcessing", "receipt"])
+        self.assertEqual(self.parse_errors(receipt), 0)
+        self.assertNotIn("-PlaybackProcessing", default.read_text(encoding="utf-8"))
+        text = receipt.read_text(encoding="utf-8")
+        self.assertEqual(text.count("-UsePersistedPlaybackSettings -PlaybackProcessing receipt -RequireLookAssist:"), 1)
+        self.assertEqual(text.replace("-PlaybackProcessing receipt ", ""), default.read_text(encoding="utf-8"))
+        explicit_empty = self.generate(GENERATOR, "pp-empty.job.ps1", ["-Backend", "cpu", "-ContactSheet", "-ContactSheetFrames", "4", "-PlaybackProcessing", ""])
+        self.assertEqual(explicit_empty.read_bytes(), default.read_bytes(), "an empty -PlaybackProcessing is the default job, byte for byte")
+        schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
+        self.assertEqual(schema["properties"]["generatorArgs"]["properties"]["playbackProcessing"]["enum"], ["receipt", "subset"])
 
     def test_scale_and_quiescence_parameters_reach_the_job(self) -> None:
         text = self.generate(GENERATOR, "scale.job.ps1", ["-ScaleFactor", "1", "-CpuQuiescenceThresholdPercent", "35.5"]).read_text(encoding="utf-8")
@@ -5080,6 +5100,11 @@ class LegSpecSchemaTests(unittest.TestCase):
             elif spec["card"] == "PLAYBACK-BACHELOR-PRESENT-JITTER-1":   # the capture-free pace legs, named by flavor and cell
                 self.assertEqual(spec["legId"], path.stem, path.name)
                 self.assertRegex(spec["legId"], rf"^m16-1243-pace-{flavor}-(fullscreen|windowed)-s[124](-la[0-3]|-heavy)?$", path.name)
+            elif spec["card"] == "CPU-DUALISO-REDUCED-ISO-NOTCH-1":   # the cpu-only legs that engage the CPU reduced recon, named by their cell
+                self.assertEqual(spec["legId"], path.stem, path.name)
+                self.assertRegex(spec["legId"], r"^m16-1243-cpu-reduced-(fullscreen|windowed)-s[24]$", path.name)
+                self.assertEqual(spec["backends"], ["cpu"], path.name)
+                self.assertEqual(spec["generatorArgs"]["playbackProcessing"], "receipt", path.name)
             else:   # the scale-4 flavored look leg, or its scale-2 twin (LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1), or that twin's AgX-off copy (LOOK-ASSIST-FILM-FLAVOR-2 r2)
                 self.assertIn(spec["legId"], (f"m16-1243-look-{flavor}", f"m16-1243-look-scale2-{flavor}", f"m16-1243-look-scale2-{flavor}-agxoff"), path.name)
                 self.assertEqual(spec["legId"], path.stem, path.name)

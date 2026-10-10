@@ -24429,6 +24429,8 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     m_playbackSmokeCpuDualIsoReconFallbackReasonLast.clear();
     m_playbackSmokeCpuDualIsoReconFullResFixesSumMs = 0.0;
     m_playbackSmokeCpuDualIsoReconDownsampleSumMs = 0.0;
+    m_playbackSmokeReducedIsoNotchFramesAtBegin = mlvDualIsoReducedIsoNotchFrames();
+    m_playbackSmokeReducedIsoNotchMicrosAtBegin = mlvDualIsoReducedIsoNotchMicros();
     m_playbackSmokeGpuDualIsoReducedReconFrames = 0;
     m_playbackSmokeGpuDualIsoFullReconFrames = 0;
     m_playbackSmokeGpuDualIsoReconScaleLast = 0;
@@ -27979,19 +27981,29 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
 
     /* CPU-DUALISO-AT-PREVIEW-SCALE-1: which recon scale the phase-3 worker ran
      * for the presented frames (avg_llrawproc_* in cpu_summary is the recon at
-     * that scale; the full-res fixes and the shrink are reported here). */
+     * that scale; the full-res fixes and the shrink are reported here).
+     * CPU-DUALISO-REDUCED-ISO-NOTCH-1: notch_frames / avg_notch_ms are the reduced
+     * ISO notch's process-wide counters over the session (every reduced recon the
+     * workers ran, presented or not). */
+    const quint64 notchFrames =
+        mlvDualIsoReducedIsoNotchFrames() - m_playbackSmokeReducedIsoNotchFramesAtBegin;
+    const quint64 notchMicros =
+        mlvDualIsoReducedIsoNotchMicros() - m_playbackSmokeReducedIsoNotchMicrosAtBegin;
     qInfo().noquote()
         << QStringLiteral(
                "playback_smoke.cpu_dualiso_recon_scale_summary session=%1 "
                "reduced_recon_frames=%2 full_recon_frames=%3 recon_scale_last=%4 "
-               "avg_fullres_fixes_ms=%5 avg_downsample_ms=%6 fallback_reason_last=\"%7\"" )
+               "avg_fullres_fixes_ms=%5 avg_downsample_ms=%6 fallback_reason_last=\"%7\" "
+               "notch_frames=%8 avg_notch_ms=%9" )
                .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
                .arg( m_playbackSmokeCpuDualIsoReducedReconFrames )
                .arg( m_playbackSmokeCpuDualIsoFullReconFrames )
                .arg( m_playbackSmokeCpuDualIsoReconScaleLast )
                .arg( avgSmokeMs( m_playbackSmokeCpuDualIsoReconFullResFixesSumMs ), 0, 'f', 3 )
                .arg( avgSmokeMs( m_playbackSmokeCpuDualIsoReconDownsampleSumMs ), 0, 'f', 3 )
-               .arg( m_playbackSmokeCpuDualIsoReconFallbackReasonLast );
+               .arg( m_playbackSmokeCpuDualIsoReconFallbackReasonLast )
+               .arg( static_cast<qulonglong>( notchFrames ) )
+               .arg( notchFrames ? double( notchMicros ) / 1000.0 / double( notchFrames ) : 0.0, 0, 'f', 3 );
 
     /* PLAYBACK-CUDA-HONOUR-SCALE-1: the CUDA texture route at preview scale.
      * session_scale/session_reason are the once-per-session decision;

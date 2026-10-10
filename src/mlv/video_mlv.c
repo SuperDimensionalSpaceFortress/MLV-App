@@ -8483,7 +8483,8 @@ int mlvDualIsoPreviewScaleReconRun(mlvObject_t * video,
 {
     return mlv_dualiso_preview_scale_recon_run_internal(video, plan, fullRaw, reducedOut,
                                                         worker, threads,
-                                                        fullResFixesMs, downsampleMs, 0);
+                                                        fullResFixesMs, downsampleMs,
+                                                        LLRP_WITH_DIMS_REDUCED_ISO_NOTCH);
 }
 
 int mlvDualIsoGpuPreviewScaleReconRun(mlvObject_t * video,

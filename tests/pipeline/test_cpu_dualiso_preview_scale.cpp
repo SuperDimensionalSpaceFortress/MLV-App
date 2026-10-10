@@ -16,10 +16,17 @@
 #include "../common/minitest.h"
 #include "../common/repo_paths.h"
 #include "mlv_pipeline_fixture.h"
+#include "dualiso_mesh_metrics.h"
 #include "../../src/mlv/llrawproc/llrawproc.h"
+#include "../../src/mlv/llrawproc/dualiso.h"
 #include "../../src/processing/raw_processing.h"
 #include "../../src/processing/playback_downsample.h"
 
+#include <QDir>
+#include <QImage>
+
+#include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -112,7 +119,8 @@ size_t outputBytes(MlvPipelineFixture & fixture, int scale)
 // any step declines, i.e. whenever the frame would have been reconstructed at full
 // resolution instead. outPlan/outFrame are filled on success.
 bool reducedPathTaken(MlvPipelineFixture & fixture, uint64_t frame, int scale,
-                      mlvDualIsoPreviewScaleRecon_t * outPlan, std::vector<uint8_t> * outFrame)
+                      mlvDualIsoPreviewScaleRecon_t * outPlan, std::vector<uint8_t> * outFrame,
+                      std::vector<uint16_t> * outReducedBayer = nullptr)
 {
     mlvDualIsoPreviewScaleRecon_t plan;
     if (!mlvDualIsoPreviewScaleReconPlan(fixture.video(), scale, &plan) || plan.scale != scale)
@@ -144,6 +152,7 @@ bool reducedPathTaken(MlvPipelineFixture & fixture, uint64_t frame, int scale,
     }
     if (outPlan) *outPlan = plan;
     if (outFrame) *outFrame = out;
+    if (outReducedBayer) *outReducedBayer = reduced;
     return true;
 }
 
@@ -426,4 +435,158 @@ TEST(CpuDualIsoPreviewScale, ReducedReconUsesDistinctProcessedFrameSignature)
     std::vector<uint8_t> freshFrame(outputBytes(fresh, 4));
     getMlvProcessedFrame8Scaled(fresh.video(), 1, freshFrame.data(), 1, 4);
     ASSERT_TRUE(afterReduced == freshFrame);
+}
+
+// CPU-DUALISO-REDUCED-ISO-NOTCH-1: the CPU reduced route (the recon worker's plan + run,
+// then the process stage, at playback hint 0 as the worker runs it) applies the reduced
+// ISO-period notch (dualiso_reduced_iso_period_notch16) to its reduced recon, as the CUDA
+// reduced route does in its last kernel. Large fixture, frame 2, x2 and x4; ref_box is the
+// full-res recon's preview at the same scale (fullReconPreview). Gates, pre-registered:
+//  B1 the route's reduced Bayer == the notch of the same recon without it, exactly;
+//  L1 rowPeriod4Energy <= 0.02;  L2 columnPeriod4Energy <= 3 x ref_box + 0.02;
+//  L4 per-channel mean route / ref_box within 0.02;  L3 lag-4 detail >= 0.55 x ref_box.
+// Reported only: the same metrics without the notch, and the notch's cost (scratch notch
+// plus copy-back, median of 50) at the M16-1243 reduced sizes. MLVAPP_NOTCH_EYEBALL_DIR
+// writes the 8-bit route, unnotched and ref_box previews as PNGs.
+// Mutations: notch never applied, applied twice, in place, applied for flags 0 (the
+// helper then notches too) all fail B1.
+TEST(CpuDualIsoPreviewScale, ReducedRouteNotchesTheIsoPeriod)
+{
+    using namespace dualiso_mesh_metrics;
+    KillSwitchGuard guard;
+    MlvPipelineFixture fixture;
+    ASSERT_TRUE(openHqFixture(fixture, true));
+    ASSERT_FALSE(fixture.renderFrame8(0).empty());
+    mlvObject_t * video = fixture.video();
+    const char * eyeballDir = std::getenv("MLVAPP_NOTCH_EYEBALL_DIR");
+    bool pass = true;
+    for (const int scale : { 2, 4 })
+    {
+        mlvDualIsoPreviewScaleRecon_t plan;
+        std::vector<uint8_t> route;
+        std::vector<uint16_t> routeBayer;
+        const uint64_t notchFrames = mlvDualIsoReducedIsoNotchFrames();
+        ASSERT_TRUE(reducedPathTaken(fixture, 2, scale, &plan, &route, &routeBayer));
+        ASSERT_EQ(notchFrames + 1, mlvDualIsoReducedIsoNotchFrames());
+        const int rw = plan.reducedWidth;
+        const int rh = plan.reducedHeight;
+        int w = 0, h = 0;
+        mlvFrameOutputDimensions(video, scale, &w, &h);
+        ASSERT_EQ(rw, w);
+
+        const std::vector<uint16_t> unnotched = unnotchedCpuReducedRecon(video, plan, decodeRaw(fixture, 2));
+        ASSERT_EQ(routeBayer.size(), unnotched.size());
+        ASSERT_EQ(notchFrames + 1, mlvDualIsoReducedIsoNotchFrames());
+        std::vector<uint16_t> expected(unnotched.size());
+        dualiso_reduced_iso_period_notch16(expected.data(), unnotched.data(), rw, rh);
+        const bool b1 = routeBayer == expected;
+
+        std::vector<uint8_t> off(outputBytes(fixture, scale));
+        {
+            PreviewEnvelope envelope(scale);
+            ASSERT_EQ(1, getMlvProcessedFrame8ScaledFromReducedReconnedRaw16(video, 2, unnotched.data(), rw, rh,
+                                                                             plan.scale, off.data(), 1, scale));
+        }
+        std::vector<uint8_t> refBox;
+        ASSERT_TRUE(fullReconPreview(fixture, 2, scale, &refBox));
+        ASSERT_EQ(route.size(), refBox.size());
+
+        const double l1 = rowPeriod4Energy(route, w, rh);
+        const double l1Off = rowPeriod4Energy(off, w, rh);
+        const double l1Box = rowPeriod4Energy(refBox, w, rh);
+        const double l2 = columnPeriod4Energy(route, w, rh);
+        const double l2Off = columnPeriod4Energy(off, w, rh);
+        const double l2Box = columnPeriod4Energy(refBox, w, rh);
+        const double l3 = lag4VerticalLumaDetail(route, w, rh);
+        const double l3Off = lag4VerticalLumaDetail(off, w, rh);
+        const double l3Box = lag4VerticalLumaDetail(refBox, w, rh);
+        std::printf("[cpu-dualiso-preview-scale] notch x%d %dx%d: B1 route == notch(unnotched) %s "
+                    "(route == unnotched %s) | L1 row-p4 %.4f <= 0.02 (unnotched %.4f, ref_box %.4f) | "
+                    "L2 col-p4 %.4f (unnotched %.4f, ref_box %.4f, bound %.4f) | L3 lag4 %.4f / ref_box %.4f = %.4f "
+                    "(tripwire >= 0.55; unnotched %.4f)\n",
+                    scale, rw, rh, b1 ? "yes" : "NO", routeBayer == unnotched ? "yes" : "no",
+                    l1, l1Off, l1Box, l2, l2Off, l2Box, 3.0 * l2Box + 0.02, l3, l3Box, l3 / l3Box, l3Off / l3Box);
+        pass = pass && b1;
+        pass = pass && l1 <= 0.02;
+        pass = pass && l2 <= 3.0 * l2Box + 0.02;
+        pass = pass && l3 >= 0.55 * l3Box;
+        for (int c = 0; c < 3; ++c)
+        {
+            const double ratio = channelMean(route, w, rh, c) / channelMean(refBox, w, rh, c);
+            const double ratioOff = channelMean(off, w, rh, c) / channelMean(refBox, w, rh, c);
+            std::printf("[cpu-dualiso-preview-scale] notch x%d L4 channel %d route/ref_box %.4f (within 0.02; "
+                        "unnotched %.4f)\n", scale, c, ratio, ratioOff);
+            pass = pass && std::fabs(ratio - 1.0) <= 0.02;
+        }
+
+        if (eyeballDir && *eyeballDir)
+        {
+            QDir().mkpath(QString::fromLocal8Bit(eyeballDir));
+            auto save = [&](const std::vector<uint8_t> & rgb, const char * label) {
+                const QString path = QString::fromLocal8Bit(eyeballDir)
+                                   + QStringLiteral("/x%1-%2.png").arg(scale).arg(QLatin1String(label));
+                QImage(rgb.data(), w, rh, w * 3, QImage::Format_RGB888).copy().save(path);
+            };
+            save(route, "route");
+            save(off, "unnotched");
+            save(refBox, "ref_box");
+        }
+    }
+
+    // Cost: the notch into a scratch plus the copy back, as the route runs it, at the
+    // M16-1243 reduced sizes (x4 452x564, x2 904x1132). Report only; the gate is read
+    // on the build host (<= 0.6 ms at x4, <= 2.0 ms at x2).
+    for (const int scale : { 4, 2 })
+    {
+        const int cw = scale == 4 ? 452 : 904;
+        const int ch = scale == 4 ? 564 : 1132;
+        std::vector<uint16_t> src(static_cast<size_t>(cw) * ch), scratch(src.size());
+        uint32_t seed = 12345u;
+        for (uint16_t & v : src)
+        {
+            seed = seed * 1664525u + 1013904223u;
+            v = static_cast<uint16_t>(2048u + (seed >> 20));
+        }
+        std::vector<double> ms;
+        for (int rep = 0; rep < 50; ++rep)
+        {
+            const auto t0 = std::chrono::steady_clock::now();
+            dualiso_reduced_iso_period_notch16(scratch.data(), src.data(), cw, ch);
+            std::memcpy(src.data(), scratch.data(), src.size() * sizeof(uint16_t));
+            const auto t1 = std::chrono::steady_clock::now();
+            ms.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        }
+        std::nth_element(ms.begin(), ms.begin() + ms.size() / 2, ms.end());
+        std::printf("[cpu-dualiso-preview-scale] notch cost x%d %dx%d: median %.3f ms of 50 (gate <= %.1f ms)\n",
+                    scale, cw, ch, ms[ms.size() / 2], scale == 4 ? 0.6 : 2.0);
+    }
+    ASSERT_TRUE(pass);
+}
+
+// CPU-DUALISO-REDUCED-ISO-NOTCH-1: a notch that cannot get its scratch fails the reduced
+// run like a failed recon, so the worker reconstructs that frame at full resolution and
+// nothing is published or counted. Mutation: presenting the unnotched recon instead.
+TEST(CpuDualIsoPreviewScale, ReducedIsoNotchScratchFailureFallsBackToFullRes)
+{
+    KillSwitchGuard guard;
+    MlvPipelineFixture fixture;
+    ASSERT_TRUE(openHqFixture(fixture, false));
+    ASSERT_FALSE(fixture.renderFrame8(0).empty());
+    const SharedDualIsoState settled = sharedState(fixture);
+    const uint64_t notchFrames = mlvDualIsoReducedIsoNotchFrames();
+    for (const int scale : { 2, 4 })
+    {
+        llrpFailReducedIsoNotchScratchForTesting(1);
+        const bool taken = reducedPathTaken(fixture, 1, scale, nullptr, nullptr);
+        llrpFailReducedIsoNotchScratchForTesting(0);
+        ASSERT_FALSE(taken);
+    }
+    ASSERT_EQ(notchFrames, mlvDualIsoReducedIsoNotchFrames());
+    const SharedDualIsoState after = sharedState(fixture);
+    ASSERT_EQ(settled.pattern, after.pattern);
+    ASSERT_EQ(settled.autoCorrection, after.autoCorrection);
+    ASSERT_EQ(settled.evCorrection, after.evCorrection);
+    ASSERT_EQ(settled.blackDelta, after.blackDelta);
+    ASSERT_TRUE(reducedPathTaken(fixture, 1, 4, nullptr, nullptr));
+    ASSERT_EQ(notchFrames + 1, mlvDualIsoReducedIsoNotchFrames());
 }

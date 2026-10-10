@@ -372,7 +372,14 @@ param(
     # (a normal maximized window with chrome; PR #248) to the smoke runner's -AdditionalArgs. 'fullscreen' (the default) adds nothing: the emitted job is the
     # text it was before this parameter (the windowed statements are added to the expanded text below, only for a windowed leg).
     [ValidateSet('fullscreen', 'windowed')]
-    [string]$DisplayMode = 'fullscreen'
+    [string]$DisplayMode = 'fullscreen',
+
+    # CPU-DUALISO-REDUCED-ISO-NOTCH-1: the app's playback processing for the run, passed to the smoke runner as
+    # -PlaybackProcessing (it forwards --playback-processing). 'receipt' unchecks fast playback processing, so a cpu
+    # leg renders processed8 and the CPU reduced dual-ISO recon can engage; the smoke default is 'subset'. Empty (the
+    # default) adds nothing: the emitted job is the text it was before this parameter.
+    [ValidateSet('', 'receipt', 'subset')]
+    [string]$PlaybackProcessing = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -4082,6 +4089,10 @@ if ($hasLookReceipt) {
     $lookReceiptHasher = [System.Security.Cryptography.SHA256]::Create()
     try { $lookReceiptSha256 = ([BitConverter]::ToString($lookReceiptHasher.ComputeHash($lookReceiptBytes)) -replace '-', '').ToLowerInvariant() } finally { $lookReceiptHasher.Dispose() }
     $lookReceiptBase64 = [Convert]::ToBase64String($lookReceiptBytes)
+}
+if (-not [string]::IsNullOrWhiteSpace($PlaybackProcessing)) {
+    # CPU-DUALISO-REDUCED-ISO-NOTCH-1: only a job that asks for a playback processing mode carries it; every other job is unchanged.
+    $template = Edit-DualVenueTemplate $template '-UsePersistedPlaybackSettings ' ("-UsePersistedPlaybackSettings -PlaybackProcessing $PlaybackProcessing ")
 }
 $isCpuBackend = ($Backend -eq 'cpu')
 if ($isCpuBackend -and $DisablePaintPerSubmit) {
