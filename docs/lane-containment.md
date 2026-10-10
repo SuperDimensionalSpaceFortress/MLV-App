@@ -264,41 +264,59 @@ applicable updated execution-control receipt before resuming editing
 dispatch. This change does not enable the workstream loop or rewrite
 historical receipts.
 
-### Network egress under the unelevated read-only codex sandbox
+### Network egress under the read-only codex sandbox (pinned elevated, unelevated fallback)
 
-Measured 2026-10-10 (CODEX-UNELEVATED-EGRESS-PROBE-1), codex-cli 0.160.1, one
-Windows host, unelevated mode (`-c windows.sandbox="unelevated"`, the mode
-`Invoke-Lane.ps1` gives read-only codex key lanes, PR #329). Before this the
-risk was only inferred. **Verdict: EGRESS_OPEN.** The sandbox restricts file
-writes; it does not firewall the network.
+Which mode a read-only codex key lane really runs is decided in
+`Invoke-Lane.ps1` (`$windowsSandbox`): when the codex pin is in force
+(`pinState=PINNED`) it is the pin's mode, `windowsSandbox` in
+`tools/coordination/codex-pin.json` (`elevated` for 0.160.1); the
+**unelevated** mode (PR #329) is only the fallback for a lane that is not
+pinned. Both were measured on codex-cli 0.160.1, one Windows host, example.com
+only, nothing uploaded, through `codex sandbox -c 'windows.sandbox="<mode>"' -P
+':read-only' -- pwsh ...` with the same script run outside any sandbox as the
+control. Before this the risk was only inferred.
 
-Probe, run through `codex sandbox -c 'windows.sandbox="unelevated"' -P
-':read-only' -- pwsh ...` and, as a control, the same script outside any
-sandbox; example.com only, nothing uploaded:
+Verdicts: the **elevated** mode (CODEX-ELEVATED-EGRESS-PROBE-1, 2026-10-10,
+the live mode for pinned lanes) is **EGRESS_BLOCKED for TCP and HTTP(S)**; the
+**unelevated** mode (CODEX-UNELEVATED-EGRESS-PROBE-1, 2026-10-10, the
+fallback) is **EGRESS_OPEN**.
 
-| Probe | Unsandboxed control | Unelevated read-only sandbox |
-|---|---|---|
-| DNS resolve | OK | OK (A records returned) |
-| TCP 443 connect | OK | OK (`TcpTestSucceeded=True`) |
-| HTTPS GET, default client | 200 | fails: `HTTP(S)_PROXY`/`ALL_PROXY` are set to `http://127.0.0.1:9` inside the sandbox (control: empty) and nothing listens there |
-| HTTP GET :80, proxy bypassed (`curl --noproxy "*"`) | 200 | 200 |
-| HTTPS GET, proxy bypassed | 200 | fails locally: schannel `SEC_E_NO_CREDENTIALS` under the restricted token, not a network block |
+| Probe | Unsandboxed control | Elevated read-only (pin mode) | Unelevated read-only (fallback) |
+|---|---|---|---|
+| DNS resolve | OK | OK (A records returned) | OK (A records returned) |
+| TCP 443 connect | OK | BLOCKED (`TcpTestSucceeded=False`; connect fails in about 23 ms with "Bad access") | OK (`TcpTestSucceeded=True`) |
+| HTTPS GET, default client | 200 | BLOCKED (curl exit 7); no proxy variables are injected | fails: `HTTP(S)_PROXY`/`ALL_PROXY` are set to `http://127.0.0.1:9` inside the sandbox (control: empty) and nothing listens there |
+| HTTPS GET, proxy bypassed (`curl --noproxy "*"`) | 200 | BLOCKED (curl exit 7) | fails locally: schannel `SEC_E_NO_CREDENTIALS` under the restricted token, not a network block |
+| HTTP GET :80, proxy bypassed | 200 | BLOCKED (curl exit 7) | 200 |
 
-Reading: the only network brake is the injected dead-proxy environment, which
-stops clients that honour proxy variables and nothing else. A raw socket or a
-client that ignores them reaches the internet, in cleartext at least; do not
-treat a read-only codex lane as network-isolated, and do not put a secret in
-its prompt, environment or readable files on the expectation that it cannot
-leave the host. Also measured: the sandboxed PowerShell runs in
-ConstrainedLanguage mode, so .NET method calls inside a lane shell are
-refused (cmdlets and native executables still run). Elevated mode was not
-measured (it fails exec on this host, PR #329). Receipts, local only:
-`.claude-state/fleet-runs/lane-CODEX-UNELEVATED-EGRESS-PROBE-1-r1-20261010T0915Z/egress-*.txt`.
+Reading, elevated: the child runs as the local account
+`codexsandboxoffline` and every TCP connect (IPv4 and IPv6, port 80 and 443)
+is refused at the network layer, with no injected proxy, in the same minute
+the unsandboxed control got 200. DNS resolution still works, so a DNS-query
+side channel is not excluded; only example.com was queried, so whether
+arbitrary names resolve is not measured. The elevated sandbox also runs
+PowerShell in FullLanguage mode.
 
-Guard: none yet (measurement card). A follow-up card should decide whether a
-real egress block (an elevated-mode firewall rule, or a deny-by-default
-launch wrapper) is worth its cost; this measurement is the input to that
-decision, not a fix.
+Reading, unelevated: the only network brake is the injected dead-proxy
+environment, which stops clients that honour proxy variables and nothing
+else. A raw socket or a client that ignores them reaches the internet, in
+cleartext at least; do not treat an unelevated read-only codex lane as
+network-isolated, and do not put a secret in its prompt, environment or
+readable files on the expectation that it cannot leave the host. The
+sandboxed PowerShell runs in ConstrainedLanguage mode, so .NET method calls
+inside such a lane shell are refused (cmdlets and native executables still
+run). The elevated sandbox failed exec on this host when #329 was written
+(os error 32); it started and ran both probes on 2026-10-10.
+
+Receipts, local only: `.claude-state/fleet-runs/lane-CODEX-ELEVATED-EGRESS-PROBE-1-r1-20261010T1315Z/egress-sandbox-elevated-read-only.txt`
+and `.claude-state/fleet-runs/lane-CODEX-UNELEVATED-EGRESS-PROBE-1-r1-20261010T0915Z/egress-*.txt`.
+
+Guard: none yet (measurement card; D-02 catalogue row). Any sentence here
+that names the live sandbox mode must match `windowsSandbox` in
+`tools/coordination/codex-pin.json` and the pin branch in `Invoke-Lane.ps1`
+at the same revision. A follow-up card should decide whether the unelevated
+fallback and the open DNS channel justify a real block; these measurements are
+the input to that decision, not a fix.
 
 ## Lane worktree retirement at lane exit
 
