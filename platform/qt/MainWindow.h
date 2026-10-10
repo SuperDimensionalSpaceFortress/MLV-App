@@ -1459,6 +1459,8 @@ private:
     QString m_playbackSmokeCpuDualIsoReconFallbackReasonLast;
     double m_playbackSmokeCpuDualIsoReconFullResFixesSumMs = 0.0;
     double m_playbackSmokeCpuDualIsoReconDownsampleSumMs = 0.0;
+    quint64 m_playbackSmokeReducedIsoNotchFramesAtBegin = 0;
+    quint64 m_playbackSmokeReducedIsoNotchMicrosAtBegin = 0;
     int m_playbackSmokeDebayered16ReconConsumedFrames = 0;
     int m_playbackSmokeDebayered16OwnReconFrames = 0;
     QString m_playbackSmokeDebayered16ReconFallbackReasonLast;

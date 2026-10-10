@@ -411,6 +411,19 @@ int applyLLRawProcObject_with_dims(mlvObject_t * video,
  * playback recon, texture-present and prepare-only opt-ins; returns 0 whenever
  * any step refuses (the buffer is then no longer a clean decode). */
 #define LLRP_WITH_DIMS_GPU_PLAYBACK_TEXTURE 0x4
+/* CPU-DUALISO-REDUCED-ISO-NOTCH-1: after a successful CPU dual-ISO recon, apply
+ * the reduced ISO-period notch (dualiso_reduced_iso_period_notch16) to the
+ * reduced Bayer, as the CUDA reduced route's last kernel does. Only the CPU
+ * reduced route (mlvDualIsoPreviewScaleReconRun) passes it; ignored with
+ * GPU_PLAYBACK_TEXTURE (the backend notches). If the notch scratch cannot be
+ * grown the call fails like a failed recon (returns 0). */
+#define LLRP_WITH_DIMS_REDUCED_ISO_NOTCH 0x8
+/* Process-wide counters of that notch (notched frames, summed notch time in
+ * microseconds), for the play-stop summary. */
+uint64_t mlvDualIsoReducedIsoNotchFrames(void);
+uint64_t mlvDualIsoReducedIsoNotchMicros(void);
+/* Tests only: 1 makes the notch's scratch allocation fail. */
+void llrpFailReducedIsoNotchScratchForTesting(int fail);
 int applyLLRawProcObjectWorker_with_dims(mlvObject_t * video,
                                          uint16_t * raw_image_buff,
                                          size_t raw_image_size,

@@ -255,7 +255,9 @@ uint64_t getMlvLlrawprocSettingsFingerprint(mlvObject_t * video);
  * playback preview scale. The recon worker reconstructs a Bayer shrunk by the
  * Phase 4B kernels (pl_downsample_bayer_to_bayer_{2,4,8}x keep whole 4-row ISO
  * blocks) instead of the full sensor, and the process stage debayers it at that
- * size. Playback only: export and full-quality entries never call these. */
+ * size. Playback only: export and full-quality entries never call these.
+ * CPU-DUALISO-REDUCED-ISO-NOTCH-1: the CPU reduced recon ends with the reduced
+ * ISO-period notch (LLRP_WITH_DIMS_REDUCED_ISO_NOTCH), as the CUDA one does. */
 typedef struct
 {
     int scale;              /* reduced recon scale (2/4/8); 1 = full resolution */
@@ -285,7 +287,9 @@ int mlvDualIsoPreviewScaleReconPlan(mlvObject_t * video,
 /* Run the planned reduced recon: seed the ISO pattern from `fullRaw`, apply the
  * full-res fixes in place when planned, shrink into `reducedOut` (capacity
  * reducedWidth*reducedHeight words) and reconstruct it on `worker` without
- * publishing estimates to the shared llrawproc state. Returns 1 on success,
+ * publishing estimates to the shared llrawproc state, then apply the reduced
+ * ISO-period notch to it (LLRP_WITH_DIMS_REDUCED_ISO_NOTCH; a notch that cannot
+ * get its scratch fails the run like a failed recon). Returns 1 on success,
  * 0 if it failed before touching `fullRaw` (reconstruct it at full res), -1 if
  * it failed after the full-res fixes changed `fullRaw` (decode it again). */
 int mlvDualIsoPreviewScaleReconRun(mlvObject_t * video,

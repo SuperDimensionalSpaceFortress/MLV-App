@@ -35,7 +35,8 @@
         "cpuQuiescenceThresholdPercent": { "type": "number", "exclusiveMinimum": 0, "maximum": 100 },
         "forceLookAssist": { "type": "boolean", "description": "SPEED legs only (PLAYBACK-BACHELOR-PRESENT-JITTER-1): force Look Assist on WITHOUT a contact sheet (generator -ForceLookAssist -LookPaceLeg), so no GUI-thread framebuffer grab lands inside the timed Play. A look leg ignores it (its look block forces Look Assist)." },
         "lookFlavor": { "enum": ["classic", "cinematic", "film"], "description": "With forceLookAssist on a SPEED leg: the Look Assist flavor (generator -LookFlavor)." },
-        "playbackRenderLookaheadFrames": { "type": "integer", "minimum": 0, "maximum": 3, "description": "With forceLookAssist on a SPEED leg: the playback render lookahead depth the app runs at (MLVAPP_PLAYBACK_RENDER_LOOKAHEAD_FRAMES; generator -PlaybackRenderLookaheadFrames). Absent: the app's default." }
+        "playbackRenderLookaheadFrames": { "type": "integer", "minimum": 0, "maximum": 3, "description": "With forceLookAssist on a SPEED leg: the playback render lookahead depth the app runs at (MLVAPP_PLAYBACK_RENDER_LOOKAHEAD_FRAMES; generator -PlaybackRenderLookaheadFrames). Absent: the app's default." },
+        "playbackProcessing": { "enum": ["receipt", "subset"], "description": "OPTIONAL (CPU-DUALISO-REDUCED-ISO-NOTCH-1): the app's playback processing (generator -PlaybackProcessing, forwarded by the smoke runner as --playback-processing). 'receipt' turns fast playback processing off, so a cpu leg renders processed8 and the CPU reduced dual-ISO recon can engage; 'subset' is the smoke default. Absent: the job passes nothing (the smoke default)." }
       },
       "description": "Generator arguments other than -Venue/-Backend/-ScaleFactor/-SourceCommit/-BuildManifestSha256/-ClipId (the runner sets those)."
     },

@@ -372,6 +372,8 @@ try {
     if ($null -ne $spec.PSObject.Properties['generatorArgs']) {
         if ($spec.generatorArgs.PSObject.Properties['telemetryArm']) { $gen['TelemetryArm'] = [string]$spec.generatorArgs.telemetryArm }
         if ($spec.generatorArgs.PSObject.Properties['cpuQuiescenceThresholdPercent']) { $gen['CpuQuiescenceThresholdPercent'] = [double]$spec.generatorArgs.cpuQuiescenceThresholdPercent }
+        # CPU-DUALISO-REDUCED-ISO-NOTCH-1: the app's playback processing ('receipt' lets a cpu leg reach the CPU reduced dual-ISO recon).
+        if ($spec.generatorArgs.PSObject.Properties['playbackProcessing']) { $gen['PlaybackProcessing'] = [string]$spec.generatorArgs.playbackProcessing }
         # PLAYBACK-BACHELOR-PRESENT-JITTER-1: a SPEED leg may force Look Assist (a capture-free pace leg: no contact-sheet grab in the timed Play).
         if (-not $isLook -and $spec.generatorArgs.PSObject.Properties['forceLookAssist'] -and [bool]$spec.generatorArgs.forceLookAssist) {
             $gen['ForceLookAssist'] = $true; $gen['LookPaceLeg'] = $true
