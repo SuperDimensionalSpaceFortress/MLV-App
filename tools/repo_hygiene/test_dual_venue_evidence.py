@@ -236,6 +236,11 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
     SESSION_LOCKED_OPEN = "VENUE-SESSION-LOCKED-REFUSAL-1 >>>"
     SESSION_LOCKED_CLOSE = "VENUE-SESSION-LOCKED-REFUSAL-1 <<<"
     SESSION_LOCKED_REGIONS = 32
+    # PLAYBACK-VSYNC-DEFAULT-1: the PresentMon SyncInterval/AllowsTearing counts Get-AttrCudaPresentMonDisplayReport adds (the generator splices the function into the
+    # default job verbatim). Four regions: the column flags, the two parsed-row fields, the per-chain counts and the selected-chain counts. Absent from the baseline.
+    PLAYBACK_VSYNC_OPEN = "PLAYBACK-VSYNC-DEFAULT-1 >>>"
+    PLAYBACK_VSYNC_CLOSE = "PLAYBACK-VSYNC-DEFAULT-1 <<<"
+    PLAYBACK_VSYNC_REGIONS = 4
 
     @classmethod
     def strip_regions(cls, text: str) -> tuple[str, dict[str, int]]:
@@ -244,7 +249,8 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
                     "orphan-sweep": (cls.ORPHAN_SWEEP_OPEN, cls.ORPHAN_SWEEP_CLOSE),
                     "contact-sheet-parity": (cls.CONTACT_SHEET_PARITY_OPEN, cls.CONTACT_SHEET_PARITY_CLOSE),
                     "keepalive-hung-probe": (cls.KEEPALIVE_HUNG_PROBE_OPEN, cls.KEEPALIVE_HUNG_PROBE_CLOSE),
-                    "session-locked": (cls.SESSION_LOCKED_OPEN, cls.SESSION_LOCKED_CLOSE)}
+                    "session-locked": (cls.SESSION_LOCKED_OPEN, cls.SESSION_LOCKED_CLOSE),
+                    "playback-vsync": (cls.PLAYBACK_VSYNC_OPEN, cls.PLAYBACK_VSYNC_CLOSE)}
         kept: list[str] = []
         inside: str | None = None
         counts = {name: 0 for name in families}
@@ -289,6 +295,8 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         self.assertEqual(old_counts["keepalive-hung-probe"], self.KEEPALIVE_HUNG_PROBE_REGIONS, "the baseline (the pinned KEEPALIVE-FAILURE-PUBLISH-LAST-1 generator commit) carries the same bracketed regions")
         self.assertEqual(new_counts["session-locked"], self.SESSION_LOCKED_REGIONS, "the default job carries exactly the pinned number of bracketed VENUE-SESSION-LOCKED-REFUSAL-1 regions")
         self.assertEqual(old_counts["session-locked"], self.SESSION_LOCKED_REGIONS, "the baseline (the pinned KEEPALIVE-FAILURE-PUBLISH-LAST-1 generator commit) carries the same bracketed regions")
+        self.assertEqual(new_counts["playback-vsync"], self.PLAYBACK_VSYNC_REGIONS, "the default job carries exactly the pinned number of bracketed PLAYBACK-VSYNC-DEFAULT-1 regions")
+        self.assertEqual(old_counts["playback-vsync"], 0, "the baseline predates PLAYBACK-VSYNC-DEFAULT-1")
         self.assertEqual(stripped, old_stripped,
                          "the DEFAULT (bachelor/cuda) emitted job changed outside the bracketed regions -- it must stay byte-identical to the pinned baseline")
 
@@ -5654,6 +5662,9 @@ class LookReceiptGeneratorTests(unittest.TestCase):
                 kept, new_counts = GeneratorByteIdentityAndVariantTests.strip_regions(new.decode("utf-8"))
                 old_kept, old_counts = GeneratorByteIdentityAndVariantTests.strip_regions(old.decode("utf-8"))
                 self.assertGreater(new_counts["session-locked"], 0)
+                # PLAYBACK-VSYNC-DEFAULT-1's regions postdate the base generator: present in the new job only, at their pinned count.
+                self.assertEqual((new_counts.pop("playback-vsync"), old_counts.pop("playback-vsync")),
+                                 (GeneratorByteIdentityAndVariantTests.PLAYBACK_VSYNC_REGIONS, 0), name)
                 self.assertEqual(new_counts, old_counts, f"{name}: the job without -LookReceiptPath carries the base generator's bracketed regions")
                 self.assertEqual(kept, old_kept, f"{name}: the job without -LookReceiptPath must be the base generator's bytes")
                 self.assertNotIn(b"LookReceipt", new)

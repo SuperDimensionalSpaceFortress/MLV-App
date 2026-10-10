@@ -3823,10 +3823,12 @@ function Get-AttrCudaPresentMonDisplayReport {
     # first pass only parses each row once, independent of either bracket endpoint; windowing
     # (which depends on the endpoint) happens separately below, per endpoint.
     $parsedRows = [System.Collections.Generic.List[object]]::new()
-    # PLAYBACK-VSYNC-DEFAULT-1: SyncInterval and AllowsTearing are real PresentMon 2.5.1 columns, but
-    # not required ones (an older capture or a fixture may lack them): a missing column reads 'absent'.
+    # PLAYBACK-VSYNC-DEFAULT-1 >>>
+    # SyncInterval and AllowsTearing are real PresentMon 2.5.1 columns, but not required ones (an older
+    # capture or a fixture may lack them): a missing column reads 'absent'.
     $hasSyncIntervalColumn = $columns -contains 'SyncInterval'
     $hasAllowsTearingColumn = $columns -contains 'AllowsTearing'
+    # PLAYBACK-VSYNC-DEFAULT-1 <<<
     $ordinal = 0
     foreach ($row in $rawRows) {
         [double]$timeInMs = 0.0
@@ -3850,8 +3852,10 @@ function Get-AttrCudaPresentMonDisplayReport {
             processId = $rowPid
             swapChainAddress = [string]$row.SwapChainAddress
             presentMode = [string]$row.PresentMode
+            # PLAYBACK-VSYNC-DEFAULT-1 >>>
             syncInterval = if ($hasSyncIntervalColumn) { [string]$row.SyncInterval } else { 'absent' }
             allowsTearing = if ($hasAllowsTearingColumn) { [string]$row.AllowsTearing } else { 'absent' }
+            # PLAYBACK-VSYNC-DEFAULT-1 <<<
             timeInMs = $timeInMs
             msBetweenPresents = if ($hasBetweenPresents) { $betweenPresents } else { $null }
             msBetweenDisplayChange = if ($hasDisplayChange) { $displayChange } else { $null }
@@ -3904,9 +3908,10 @@ function Get-AttrCudaPresentMonDisplayReport {
                         [pscustomobject]@{ presentMode = $_.Name; count = $_.Count }
                     }
                 )
-                # PLAYBACK-VSYNC-DEFAULT-1: the interval each present asked for and whether it was
-                # allowed to tear, as PresentMon saw them -- the app's own swap-interval log is
-                # not proof of either. Same per-value counts as presentModes.
+                # PLAYBACK-VSYNC-DEFAULT-1 >>>
+                # The interval each present asked for and whether it was allowed to tear, as
+                # PresentMon saw them -- the app's own swap-interval log is not proof of either.
+                # Same per-value counts as presentModes.
                 syncIntervals = @(
                     $groupRows | Group-Object -Property syncInterval | ForEach-Object {
                         [pscustomobject]@{ syncInterval = $_.Name; count = $_.Count }
@@ -3917,6 +3922,7 @@ function Get-AttrCudaPresentMonDisplayReport {
                         [pscustomobject]@{ allowsTearing = $_.Name; count = $_.Count }
                     }
                 )
+                # PLAYBACK-VSYNC-DEFAULT-1 <<<
             })
         }
         $mlvAppChains = @($chains | Where-Object { $_.isMlvAppChain } | Sort-Object -Property presentedCount -Descending)
@@ -3951,7 +3957,8 @@ function Get-AttrCudaPresentMonDisplayReport {
                     [pscustomobject]@{ presentMode = $_.Name; count = $_.Count }
                 }
             )
-            # PLAYBACK-VSYNC-DEFAULT-1: see the per-chain syncIntervals/allowsTearing above.
+            # PLAYBACK-VSYNC-DEFAULT-1 >>>
+            # See the per-chain syncIntervals/allowsTearing above.
             syncIntervals = @(
                 $mlvAppRows | Group-Object -Property syncInterval | ForEach-Object {
                     [pscustomobject]@{ syncInterval = $_.Name; count = $_.Count }
@@ -3962,6 +3969,7 @@ function Get-AttrCudaPresentMonDisplayReport {
                     [pscustomobject]@{ allowsTearing = $_.Name; count = $_.Count }
                 }
             )
+            # PLAYBACK-VSYNC-DEFAULT-1 <<<
         }
         $selectedChainRows = @(
             $mlvAppDisplayedRows |
