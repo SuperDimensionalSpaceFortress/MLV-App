@@ -7,22 +7,29 @@ that the job passed" (cos-feedback agent-bridge pr-221, adversarialllm pr-262).
 
 A tracked ``test_*.py`` passes when ANY of these holds:
 
-* a workflow step names the file, or names it as a ``python -m unittest`` dotted module;
+* a ``run:`` body EXECUTES it: ``pytest`` / ``python -m pytest`` / ``python -m unittest`` /
+  ``python FILE`` names the file (or a unittest dotted module). The command head must be the
+  runner, so ``echo``, ``cat``, ``Copy-Item`` or an ``on.*.paths`` filter naming it is not a run;
 * a workflow step runs ``pytest`` on a directory above it and no ``--ignore`` /
   ``--ignore-glob`` of THAT command excludes it;
 * it sits under a ``unittest discover`` root (``-s DIR -p PATTERN``), or under the root
   that ``ci_unittest_shard`` discovers (``START_DIR`` / ``PATTERN`` are read from that
-  script, not assumed), and the workflow actually runs ``--shard`` of it;
+  script, not assumed), and the workflow actually runs ``--shard`` of it (a ``--list``,
+  ``--list-tests``, ``--help`` or ``--verify-partition`` command runs no test);
 * it is on ``LOCAL_ONLY_OR_UNCOLLECTED`` below, with a non-empty reason.
 
 No YAML parser is used (PyYAML is pinned in no hash-locked requirements file here), so
-this is a bounded TEXT scan: full-line and trailing ``#`` comments are dropped, shell and
-PowerShell line continuations are joined, backslashes become slashes, and each logical
-line is split on whitespace. Limits, stated so nobody reads more into a pass than it
-proves: a step's ``if:`` condition, a ``continue-on-error``, a ``-k`` / ``-m`` selection,
-and a method-level dotted unittest name are NOT evaluated -- naming a file counts as
-running it. This guard proves "some step is pointed at the file", the failure that
-actually recurred, not "every test in it passed".
+this is a bounded TEXT scan: only the value of a ``run:`` key is read, full-line and
+trailing ``#`` comments are dropped, shell and PowerShell line continuations are joined,
+backslashes become slashes, each logical line is split into simple commands on ``&&``,
+``||``, ``|`` and ``;``, and each command into whitespace tokens. An option that needs a
+value but has none (``pytest tools/a --ignore``) raises ``WorkflowParseError`` naming the
+workflow, step and option; no parser loop can run without advancing. Limits, stated so
+nobody reads more into a pass than it proves: a step's ``if:`` condition, a
+``continue-on-error``, a ``-k`` / ``-m`` selection, and a method-level dotted unittest name
+are NOT evaluated -- a runner command pointed at a file counts as running it. This guard
+proves "some step runs the file", the failure that actually recurred, not "every test in
+it passed".
 
 Run the table:  ``py -3 -m tools.repo_hygiene.test_ci_collects_every_test --table``
 """
@@ -35,6 +42,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -78,25 +86,62 @@ _PYTEST_OPTIONS_WITH_VALUE = frozenset(
     {"-k", "-m", "-p", "-c", "-o", "-W", "--rootdir", "--junitxml", "--maxfail", "--tb",
      "--basetemp", "--confcutdir", "--import-mode", "--durations", "--timeout"}
 )
-_IGNORE_OPTIONS = ("--ignore", "--ignore-glob")
+# A command line that mentions a test but executes none of it.
+_NO_EXECUTION_FLAGS = frozenset(
+    {"-h", "--help", "--list", "--list-tests", "--collect-only", "--co", "--version",
+     "--fixtures", "--markers", "--verify-partition", "--dry-run"}
+)
 _STEP_NAME = re.compile(r"^\s*-\s+name:\s*(.+?)\s*$")
+_RUN_KEY = re.compile(r"^(\s*)(-\s+)?run:[ \t]*(.*)$")
+_BLOCK_SCALAR = re.compile(r"^[|>][+-]?\d*\s*(#.*)?$")
+_COMMAND_SEPARATORS = re.compile(r"\s*(?:&&|\|\||\||;|\{|\})\s*")
+_ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_PYTHON_NAME = re.compile(r"^(?:python|python3|py)(?:\d+(?:\.\d+)*)?(?:\.exe)?$")
+_WRAPPERS = frozenset({"&", "env", "sudo", "time", "call", "nohup"})
+
+
+class WorkflowParseError(ValueError):
+    """A workflow command this guard cannot read; the message names the workflow and option."""
 
 
 # --------------------------------------------------------------------------- scanning
 
 
 def logical_lines(text: str) -> list[tuple[str, str]]:
-    """``(step_name, command_line)`` for every non-comment logical line of a workflow."""
+    """``(step_name, command_line)`` for every non-comment logical line of a ``run:`` body.
+
+    Only text a shell would execute is returned: the value of a ``run:`` key, inline or block
+    scalar. ``on.*.paths``, ``with:``, ``if:``, ``env:`` and every other YAML key are never a
+    command, so a test path written there is not "run".
+    """
     out: list[tuple[str, str]] = []
     step = "(no step)"
     pending = ""
+    body_indent: int | None = None  # indent of the open run: key; None outside a run body
     for raw in text.splitlines():
-        if raw.lstrip().startswith("#"):
+        stripped = raw.strip()
+        indent = len(raw) - len(raw.lstrip())
+        if body_indent is not None and stripped and indent <= body_indent:
+            if pending:
+                out.append((step, pending.strip().replace("\\", "/")))
+                pending = ""
+            body_indent = None
+        if body_indent is None:
+            found = _STEP_NAME.match(raw)
+            if found:
+                step = found.group(1).strip("\"'")
+            key = _RUN_KEY.match(raw)
+            if not key or stripped.startswith("#"):
+                continue
+            body_indent = len(key.group(1)) + (len(key.group(2)) if key.group(2) else 0)
+            text_line = key.group(3)
+            if not text_line or _BLOCK_SCALAR.match(text_line):
+                continue
+        else:
+            text_line = raw
+        if stripped.startswith("#"):
             continue
-        found = _STEP_NAME.match(raw)
-        if found:
-            step = found.group(1).strip("\"'")
-        line = re.sub(r"\s+#.*$", "", raw).rstrip()
+        line = re.sub(r"\s+#.*$", "", text_line).rstrip()
         if line.endswith("`") or re.search(r"\s\\$", line):
             pending += " " + line[:-1].strip()
             continue
@@ -107,9 +152,15 @@ def logical_lines(text: str) -> list[tuple[str, str]]:
     return out
 
 
-def _tokens(line: str) -> list[str]:
-    cleaned = (tok.strip("\"'(),;") for tok in line.split())
-    return [tok[2:] if tok.startswith("./") else tok for tok in cleaned if tok]
+def _commands(line: str) -> list[list[str]]:
+    """One token list per simple command; ``&&``, ``||``, ``|``, ``;`` and braces split."""
+    commands = []
+    for part in _COMMAND_SEPARATORS.split(line):
+        cleaned = (tok.strip("\"'(),;") for tok in part.split())
+        tokens = [tok[2:] if tok.startswith("./") else tok for tok in cleaned if tok]
+        if tokens:
+            commands.append(tokens)
+    return commands
 
 
 def _is_test_file(path: str) -> bool:
@@ -149,13 +200,30 @@ def shard_discovery(shard_script_text: str | None) -> tuple[str, str] | None:
     return (start.group(1), pattern.group(1)) if start and pattern else None
 
 
-def _option_value(tokens: list[str], index: int, name: str) -> tuple[str | None, int]:
+def _is_option(tok: str, *names: str) -> str | None:
+    """The option name ``tok`` spells (``--name`` or ``--name=value``), else None."""
+    for name in names:
+        if tok == name or tok.startswith(name + "="):
+            return name
+    return None
+
+
+def _option_value(tokens: list[str], index: int, name: str) -> tuple[str, int]:
+    """Value of the option at ``tokens[index]`` and the NEXT index (always ``> index``).
+
+    A missing or empty value raises: skipping it silently would either loop on the same
+    token or read the following option as a path.
+    """
     tok = tokens[index]
     if tok.startswith(name + "="):
-        return tok[len(name) + 1:].strip("\"'"), index + 1
-    if tok == name and index + 1 < len(tokens):
-        return tokens[index + 1], index + 2
-    return None, index
+        value, step = tok[len(name) + 1:].strip("\"'"), 1
+    elif index + 1 < len(tokens):
+        value, step = tokens[index + 1], 2
+    else:
+        value, step = "", 1
+    if not value or value.startswith("-"):
+        raise WorkflowParseError(f"option {name} has no value in: {' '.join(tokens)}")
+    return value, index + step
 
 
 def _pytest_invocation(tokens: list[str], start: int) -> tuple[list[str], list[str], list[str]]:
@@ -165,25 +233,22 @@ def _pytest_invocation(tokens: list[str], start: int) -> tuple[list[str], list[s
     globs: list[str] = []
     i = start
     while i < len(tokens):
-        tok = tokens[i]
-        if tok.startswith("--ignore-glob"):
+        before, tok = i, tokens[i]
+        if _is_option(tok, "--ignore-glob"):
             value, i = _option_value(tokens, i, "--ignore-glob")
-            if value is not None:
-                globs.append(value)
-            continue
-        if tok.startswith("--ignore"):
+            globs.append(value)
+        elif _is_option(tok, "--ignore"):
             value, i = _option_value(tokens, i, "--ignore")
-            if value is not None:
-                ignores.append(value.rstrip("/"))
-            continue
-        if tok in _PYTEST_OPTIONS_WITH_VALUE:
+            ignores.append(value.rstrip("/"))
+        elif tok in _PYTEST_OPTIONS_WITH_VALUE:
             i += 2
-            continue
-        if tok.startswith("-"):
+        elif tok.startswith("-"):
             i += 1
-            continue
-        targets.append(tok.split("::", 1)[0].rstrip("/"))
-        i += 1
+        else:
+            targets.append(tok.split("::", 1)[0].rstrip("/"))
+            i += 1
+        if i <= before:
+            raise WorkflowParseError(f"option parsing made no progress at {tok!r}")
     return targets, ignores, globs
 
 
@@ -191,20 +256,57 @@ def _discover_args(tokens: list[str], start: int) -> tuple[str, str]:
     root, pattern = ".", "test*.py"
     i = start
     while i < len(tokens):
-        for name in ("-s", "--start-directory"):
-            value, nxt = _option_value(tokens, i, name)
-            if value is not None:
-                root, i = value, nxt
-                break
+        before, tok = i, tokens[i]
+        name = _is_option(tok, "-s", "--start-directory")
+        if name:
+            root, i = _option_value(tokens, i, name)
         else:
-            for name in ("-p", "--pattern"):
-                value, nxt = _option_value(tokens, i, name)
-                if value is not None:
-                    pattern, i = value, nxt
-                    break
+            name = _is_option(tok, "-p", "--pattern")
+            if name:
+                pattern, i = _option_value(tokens, i, name)
             else:
                 i += 1
+        if i <= before:
+            raise WorkflowParseError(f"option parsing made no progress at {tok!r}")
     return root, pattern
+
+
+def _runner(tokens: list[str]) -> tuple[str, int] | None:
+    """``(kind, index_of_first_argument)`` when the command EXECUTES a test runner.
+
+    ``kind`` is ``pytest``, ``unittest``, ``shard`` or ``script`` (a ``python FILE`` run).
+    Only the command HEAD counts, so ``echo python tests/test_x.py`` and ``cat test_x.py``
+    are not a run; neither is a command that only lists, collects or prints help.
+    """
+    i = 0
+    while i < len(tokens) and (tokens[i] in _WRAPPERS or _ENV_ASSIGNMENT.match(tokens[i])):
+        i += 1
+    if i >= len(tokens) or any(t in _NO_EXECUTION_FLAGS for t in tokens):
+        return None
+    head = tokens[i].rsplit("/", 1)[-1]
+    if head in ("pytest", "pytest.exe", "py.test"):
+        return "pytest", i + 1
+    if not _PYTHON_NAME.match(head):
+        return None
+    i += 1
+    while i < len(tokens) and tokens[i].startswith("-"):
+        if tokens[i] == "-c":
+            return None
+        if tokens[i] == "-m":
+            module = tokens[i + 1] if i + 1 < len(tokens) else ""
+            if module == "pytest":
+                return "pytest", i + 2
+            if module == "unittest":
+                return "unittest", i + 2
+            if module.rsplit(".", 1)[-1] == SHARD_MODULE:
+                return "shard", i + 2
+            return None
+        i += 1
+    if i < len(tokens):
+        if tokens[i].rsplit("/", 1)[-1] == SHARD_MODULE + ".py":
+            return "shard", i + 1
+        return "script", i
+    return None
 
 
 def collect(
@@ -212,68 +314,72 @@ def collect(
     workflows: dict[str, str],
     shard_script_text: str | None = None,
 ) -> dict[str, list[tuple[str, str, str]]]:
-    """Tracked ``test_*.py`` -> ``[(workflow, step, mechanism)]``; empty list means NONE."""
+    """Tracked ``test_*.py`` -> ``[(workflow, step, mechanism)]``; empty list means NONE.
+
+    Raises ``WorkflowParseError`` (naming the workflow and step) on a command it cannot read.
+    """
     files = set(paths)
     tests = sorted(p for p in files if _is_test_file(p))
     result: dict[str, list[tuple[str, str, str]]] = {t: [] for t in tests}
     shard_root = shard_discovery(shard_script_text)
 
-    def hit(test: str, workflow: str, step: str, mechanism: str) -> None:
-        if (workflow, step, mechanism) not in result[test]:
-            result[test].append((workflow, step, mechanism))
-
     for workflow, text in sorted(workflows.items()):
         for step, line in logical_lines(text):
-            tokens = _tokens(line)
-            if not tokens:
-                continue
-            for index, tok in enumerate(tokens):
-                if tok == "pytest" or tok.endswith("/pytest"):
-                    targets, ignores, globs = _pytest_invocation(tokens, index + 1)
-                    for test in tests:
-                        if any(test == i or test.startswith(i + "/") for i in ignores):
-                            continue
-                        if any(fnmatch.fnmatch(test, g) for g in globs):
-                            continue
-                        for target in targets:
-                            if test == target and not target.endswith("/"):
-                                hit(test, workflow, step, "pytest-file")
-                            elif _under(test, target) and target != test and _pytest_collects(test):
-                                hit(test, workflow, step, "pytest-dir")
-                elif tok == "unittest" and index > 0 and tokens[index - 1] == "-m":
-                    rest = tokens[index + 1:]
-                    if rest and rest[0] == "discover":
-                        root, pattern = _discover_args(tokens, index + 2)
-                        for test in tests:
-                            if _discover_collects(test, root, pattern, files):
-                                hit(test, workflow, step, "unittest-discover")
-                        continue
-                    for name in rest:
-                        if name.startswith("-"):
-                            continue
-                        parts = name.split(".")
-                        for end in range(len(parts), 0, -1):
-                            module = "/".join(parts[:end]) + ".py"
-                            if module in result:
-                                hit(module, workflow, step, "unittest-module")
-                                break
-            if shard_root and "--shard" in tokens and any(SHARD_MODULE in t for t in tokens):
-                for test in tests:
-                    if _discover_collects(test, shard_root[0], shard_root[1], files):
-                        hit(test, workflow, step, "shard-discover")
-            skip_next = False
-            for tok in tokens:
-                if skip_next:
-                    skip_next = False
-                    continue
-                if tok in _IGNORE_OPTIONS or tok == "--deselect":
-                    skip_next = True
-                    continue
-                if tok.startswith("-"):
-                    continue
-                if tok in result:
-                    hit(tok, workflow, step, "named-file")
+            for tokens in _commands(line):
+
+                def hit(test: str, mechanism: str) -> None:
+                    if (workflow, step, mechanism) not in result[test]:
+                        result[test].append((workflow, step, mechanism))
+
+                try:
+                    _credit(tokens, tests, files, result, shard_root, hit)
+                except WorkflowParseError as exc:
+                    raise WorkflowParseError(f"{workflow}: step {step!r}: {exc}") from None
     return result
+
+
+def _credit(tokens, tests, files, result, shard_root, hit) -> None:
+    """Credit every test the ONE command ``tokens`` executes; a non-runner command credits none."""
+    found = _runner(tokens)
+    if found is None:
+        return
+    kind, first = found
+    if kind == "pytest":
+        targets, ignores, globs = _pytest_invocation(tokens, first)
+        for test in tests:
+            if any(test == i or test.startswith(i + "/") for i in ignores):
+                continue
+            if any(fnmatch.fnmatch(test, g) for g in globs):
+                continue
+            for target in targets:
+                if test == target:
+                    hit(test, "pytest-file")
+                elif _under(test, target) and _pytest_collects(test):
+                    hit(test, "pytest-dir")
+    elif kind == "unittest":
+        rest = tokens[first:]
+        if rest and rest[0] == "discover":
+            root, pattern = _discover_args(tokens, first + 1)
+            for test in tests:
+                if _discover_collects(test, root, pattern, files):
+                    hit(test, "unittest-discover")
+            return
+        for name in rest:
+            if name.startswith("-"):
+                continue
+            parts = name.split(".")
+            for end in range(len(parts), 0, -1):
+                module = "/".join(parts[:end]) + ".py"
+                if module in result:
+                    hit(module, "unittest-module")
+                    break
+    elif kind == "shard":
+        if shard_root and any(t == "--shard" or t.startswith("--shard=") for t in tokens):
+            for test in tests:
+                if _discover_collects(test, shard_root[0], shard_root[1], files):
+                    hit(test, "shard-discover")
+    elif tokens[first] in result:
+        hit(tokens[first], "named-file")
 
 
 def evaluate(
@@ -367,6 +473,26 @@ def _workflow(*bodies: str) -> str:
 def _step(name: str, run: str) -> str:
     indented = "".join(f"          {line}\n" for line in run.splitlines())
     return f"      - name: {name}\n        run: |\n{indented}"
+
+
+def _bounded(call, seconds: float = 10.0):
+    """Run ``call()`` on a daemon thread; a parser that never advances fails, not hangs."""
+    box: dict = {}
+
+    def target() -> None:
+        try:
+            box["value"] = call()
+        except BaseException as exc:  # re-raised on the caller's thread
+            box["error"] = exc
+
+    worker = threading.Thread(target=target, daemon=True)
+    worker.start()
+    worker.join(seconds)
+    if worker.is_alive():
+        raise AssertionError(f"did not finish within {seconds}s: a parser loop without progress")
+    if "error" in box:
+        raise box["error"]
+    return box["value"]
 
 
 class FixtureTreeTests(unittest.TestCase):
@@ -522,6 +648,106 @@ class FixtureTreeTests(unittest.TestCase):
             ),
         }
         self.assertEqual(self._problems(files), [])
+
+    def _orphan_problems(self, workflow: str) -> list[str]:
+        return self._problems({"tools/a/test_orphan.py": "", ".github/workflows/t.yml": workflow})
+
+    def test_a_path_filter_naming_a_test_does_not_run_it(self) -> None:
+        problems = self._orphan_problems(
+            "on:\n  push:\n    paths:\n      - tools/a/test_orphan.py\n"
+            "jobs:\n  j:\n    steps:\n      - run: echo done\n"
+        )
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("tools/a/test_orphan.py", problems[0])
+
+    def test_a_yaml_key_other_than_run_naming_a_test_does_not_run_it(self) -> None:
+        problems = self._orphan_problems(
+            "jobs:\n  j:\n    steps:\n"
+            "      - uses: actions/github-script@v7\n        with:\n          script: tools/a/test_orphan.py\n"
+            "      - name: Env\n        env:\n          TARGET: tools/a/test_orphan.py\n        run: echo $TARGET\n"
+        )
+        self.assertEqual(len(problems), 1, problems)
+
+    def test_a_command_that_only_names_a_test_does_not_run_it(self) -> None:
+        for command in (
+            "echo python tools/a/test_orphan.py",
+            "echo pytest tools/a",
+            "cat tools/a/test_orphan.py",
+            "ls tools/a/test_orphan.py",
+            "grep -n x tools/a/test_orphan.py",
+            "printf '%s' tools/a/test_orphan.py",
+            "Copy-Item tools/a/test_orphan.py $env:TEMP",
+            "git diff -- tools/a/test_orphan.py",
+            'python -c "print(1)" tools/a/test_orphan.py',
+            "python -m pip install tools/a/test_orphan.py",
+        ):
+            problems = self._orphan_problems(_workflow(_step("Names only", command)))
+            self.assertEqual(len(problems), 1, (command, problems))
+
+    def test_a_listing_or_help_command_runs_no_test(self) -> None:
+        files = {
+            "tools/repo_hygiene/__init__.py": "",
+            "tools/repo_hygiene/test_in_root.py": "",
+            "tools/repo_hygiene/ci_unittest_shard.py": _SHARD_SCRIPT,
+        }
+        shard = "python -m tools.repo_hygiene.ci_unittest_shard --profile ubuntu --of 3 --shard 1"
+        for command in (
+            shard + " --list",
+            shard + " --list-tests",
+            shard + " --help",
+            shard + " -h",
+            "python -m pytest tools/repo_hygiene --collect-only",
+            "python -m pytest tools/repo_hygiene --help",
+        ):
+            problems = self._problems({**files, ".github/workflows/t.yml": _workflow(_step("List", command))})
+            self.assertEqual(len(problems), 1, (command, problems))
+
+    def test_an_executing_runner_is_still_credited_in_every_command_shape(self) -> None:
+        for command in (
+            "cd tools/a && python tools/a/test_orphan.py",
+            "echo start; python -m pytest tools/a/test_orphan.py",
+            "echo start || python -m unittest tools.a.test_orphan -v",
+            "FOO=1 python -m pytest tools/a",
+            "& python -m pytest tools\\a\\test_orphan.py -q",
+            "py -3 -m pytest tools/a",
+            "pytest tools/a -q",
+            "python -u -m unittest tools.a.test_orphan",
+            "if ($true) { python -m pytest tools/a }",
+        ):
+            self.assertEqual(self._orphan_problems(_workflow(_step("Run", command))), [], command)
+        self.assertEqual(
+            self._orphan_problems("jobs:\n  j:\n    steps:\n      - run: python -m pytest tools/a -q\n"), []
+        )
+
+    def test_an_option_without_a_value_fails_fast_naming_the_workflow_and_option(self) -> None:
+        for command, option in (
+            ("python -m pytest tools/a --ignore", "--ignore"),
+            ("python -m pytest tools/a --ignore-glob", "--ignore-glob"),
+            ("python -m pytest tools/a --ignore=", "--ignore"),
+            ("python -m pytest tools/a --ignore -q", "--ignore"),
+            ("python -m unittest discover -s", "-s"),
+        ):
+            with self.assertRaises(ValueError, msg=command) as caught:
+                _bounded(lambda: collect(["tools/a/test_orphan.py"], {"t.yml": f"run: {command}"}, None))
+            self.assertIn("t.yml", str(caught.exception), command)
+            self.assertIn(option, str(caught.exception), command)
+
+    def test_an_option_that_only_starts_like_ignore_is_a_plain_flag_and_terminates(self) -> None:
+        table = _bounded(
+            lambda: collect(
+                ["tools/a/test_orphan.py"], {"t.yml": "run: python -m pytest tools/a --ignored-thing"}, None
+            )
+        )
+        self.assertTrue(table["tools/a/test_orphan.py"])
+
+    def test_option_value_always_advances_or_raises(self) -> None:
+        for tokens in (["--ignore", "x"], ["--ignore=x"], ["--ignore"], ["--ignore", "-q"], ["--ignore="]):
+            try:
+                value, index = _bounded(lambda: _option_value(tokens, 0, "--ignore"))
+            except ValueError:
+                continue
+            self.assertGreater(index, 0, tokens)
+            self.assertEqual(value, "x", tokens)
 
     def test_an_allowlisted_file_with_a_reason_passes(self) -> None:
         self.assertEqual(
