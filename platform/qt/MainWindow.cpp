@@ -24472,7 +24472,8 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
                "preview_mode=%26 env_aggressive_preview=%27 env_preview_mode=%28 "
                "env_quality_mode=%29 env_gpu_playback_recon=%30 "
                "env_gpu_playback_recon_texture_present=%31 "
-               "auto_target_fps=%32 auto_reason_start=%33" )
+               "auto_target_fps=%32 auto_reason_start=%33 "
+               "env_raw_uint16_prefetch_decoders=%34" )
                .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
                .arg( m_playbackSmokeStartPosition )
                .arg( m_playbackSmokeStartCutIn )
@@ -24509,7 +24510,8 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
                .arg( m_playbackAutoTargetFps )
                .arg( QString::fromLatin1(
                    playbackQualityAutoDecisionReasonName(
-                       m_playbackQualityAutoDecisionReason ) ) );
+                       m_playbackQualityAutoDecisionReason ) ) )
+               .arg( envValueForLog( "MLVAPP_RAW_UINT16_PREFETCH_DECODERS" ) );
 
     // CUDA-PERF-DISPLAY-WAKE-1: once per playback session, reporting the display-required
     // request this same play-start already made above (setPlaybackDisplayRequiredExecutionState
@@ -26454,6 +26456,14 @@ void MainWindow::notePlaybackSmokePresentedFrame(
                            "playback_timeline_early_advance_yield_elapsed_ms" ),
                            0, 'f', 3 );
         }
+        // PLAYBACK-LJ92-DECODE-THROUGHPUT-1: how this frame's raw-uint16 arrived and the LJ92 ms that produced it on
+        // whichever thread decoded it (a hit's raw_decompress_ms is 0). Appended to gpu_frame and cpu_frame alike, not
+        // positional, so the CUDA texture route carries the per-frame series on its own record.
+        const QString rawUint16FrameKeys =
+            QStringLiteral( " raw_uint16_source=%1 raw_uint16_frame_lj92_ms=%2 raw_uint16_inflight_wait_ms=%3" )
+                .arg( timing.value( QStringLiteral("raw_uint16_source") ).toString( QStringLiteral("none") ) )
+                .arg( telemetryDoubleValue( timing, "raw_uint16_frame_lj92_ms" ), 0, 'f', 3 )
+                .arg( telemetryDoubleValue( timing, "raw_uint16_inflight_wait_ms" ), 0, 'f', 3 );
         qInfo().noquote()
             << QStringLiteral(
                    "playback_smoke.gpu_frame session=%1 index=%2 status=%3 "
@@ -26670,7 +26680,8 @@ void MainWindow::notePlaybackSmokePresentedFrame(
                         0, 'f', 3 )
                     .arg( telemetryDoubleValue(
                         timing, "gpu_playback_recon_texture_present_setup_sampling_ms" ),
-                        0, 'f', 3 );
+                        0, 'f', 3 )
+            + rawUint16FrameKeys;
         qInfo().noquote()
             << QStringLiteral(
                    "playback_smoke.cpu_frame session=%1 index=%2 raw_uint16_ms=%3 "
@@ -26729,12 +26740,8 @@ void MainWindow::notePlaybackSmokePresentedFrame(
                     .arg( bool01( skippedScaledBadPixels ) )
                     .arg( bool01( skippedScaledVerticalStripes ) )
                     .arg( bool01( skippedScaledPatternNoise ) )
-            // PLAYBACK-LJ92-DECODE-THROUGHPUT-1: how this frame's raw-uint16 arrived and the LJ92 ms that produced it on
-            // whichever thread decoded it (a hit's raw_decompress_ms is 0). Appended, not positional: the line is at 38 args.
-            + QStringLiteral( " raw_uint16_source=%1 raw_uint16_frame_lj92_ms=%2 raw_uint16_inflight_wait_ms=%3" )
-                  .arg( timing.value( QStringLiteral("raw_uint16_source") ).toString( QStringLiteral("none") ) )
-                  .arg( telemetryDoubleValue( timing, "raw_uint16_frame_lj92_ms" ), 0, 'f', 3 )
-                  .arg( telemetryDoubleValue( timing, "raw_uint16_inflight_wait_ms" ), 0, 'f', 3 );
+            // Appended, not positional: the line is at 38 args.
+            + rawUint16FrameKeys;
         /* Phase A3 (image-pipeline-hardening): ONE canonical, machine-parsable
          * render manifest per presented frame. key=value (QStringList join), NOT
          * positional %N -- the cpu_frame line above is already at 38 args and the
