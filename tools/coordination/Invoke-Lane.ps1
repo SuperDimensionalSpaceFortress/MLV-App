@@ -1038,6 +1038,7 @@ $hostPid = $null
 $OWNER_ABSENT_NO_HOST_BUDGET = 'launch-budget-exhausted'  # unchanged text: line ~471's throw message, asserted verbatim since PR #105 round 3
 $LAUNCH_NO_CHILD = 'launch-no-child'                      # receipt.failure when the claude child was never created (LANE-LAUNCH-NO-CHILD-TYPED-1)
 $launchNoChild = $null
+$awaitingChild = $false   # true only from the launch-frame write until the child control file is seen (r2: phase, not message, decides "no child")
 $OWNER_ABSENT_NO_HOST_START_THREW = 'start-threw'        # Process::Start itself threw; no host was ever created
 $OWNER_ABSENT_POST_START_UNRECORDED = 'post-start-unrecorded'  # Start returned (a host EXISTS) but $containedHost's own construction threw -- the genuinely ambiguous state
 # Outcome of the PRE-ASSIGNMENT kill at line ~677 (host started but never
@@ -1536,6 +1537,7 @@ if ($cfg.engine -eq 'claude') {
     $controlPath = "$base.child.json"
     if (Test-Path -LiteralPath $controlPath) { throw "control-path-exists: $controlPath" }
     $launchFrame = [ordered]@{ schema='mlv-lane-launch/v1'; exe=$exe; argv=$argv; cwd=$WorkDir; controlPath=$controlPath } | ConvertTo-Json -Compress -Depth 5
+    $awaitingChild = $true
     $proc.StandardInput.WriteLine($launchFrame); $proc.StandardInput.Flush()
     $controlDeadlineMs = [math]::Min($sw.Elapsed.TotalMilliseconds + 10000.0, $TimeoutSec * 1000.0)
     while (-not (Test-Path -LiteralPath $controlPath)) {
@@ -1543,6 +1545,7 @@ if ($cfg.engine -eq 'claude') {
         if ($sw.Elapsed.TotalMilliseconds -ge $controlDeadlineMs) { throw [TimeoutException]::new('contained-child-start-timeout') }
         Start-Sleep -Milliseconds 25
     }
+    $awaitingChild = $false
     # ConvertFrom-Json can turn ISO strings into DateTime values on newer pwsh;
     # casting back to string then loses precision and uses the current culture.
     # Keep the exact UTC creation identity emitted by the contained host.
@@ -1714,6 +1717,9 @@ if ($cfg.engine -eq 'claude') {
 
 }
 catch {
+    $noChildCause = $_.Exception.Message
+    $noChildCauseType = $_.Exception.GetType().Name
+    $noChildIsTimeout = $_.Exception -is [TimeoutException]
     if ($_.Exception -is [TimeoutException]) {
         $timedOut = $true
         $exitCode = -1
@@ -1813,21 +1819,25 @@ catch {
             promptDelivered=$promptDelivered; assignmentErrorCode=$native
         }
     }
-    # LANE-LAUNCH-NO-CHILD-TYPED-1: the claude child was never created and no prompt reached it,
-    # yet the 10 s control-file wait (contained-child-start-timeout) is a TimeoutException, which
-    # the branch above books as timedOut=true / failure=null -- so a lane that did NOTHING (5
-    # receipts in 3 days, 11-48 s into a 2400-7200 s budget, childPid null, promptDelivered false)
-    # read as 'ended-incomplete' and was indistinguishable from a round that ran and stopped.
-    # Type it. Only when the lane's own deadline had NOT passed: a budget that really ran out
-    # (launch-budget-exhausted, a 1 s -TimeoutSec) stays timedOut exactly as before.
+    # LANE-LAUNCH-NO-CHILD-TYPED-1: the claude child was never created and no prompt reached it.
+    # Two catch paths used to leave that untyped: the 10 s control-file wait
+    # (contained-child-start-timeout, a TimeoutException, booked as timedOut=true / failure=null ->
+    # 'ended-incomplete', 5 receipts in 3 days, 11-48 s into a 2400-7200 s budget) and a host that
+    # exited before creating the child (failure='contained-host-exited-before-child: <code>', seen on
+    # PLAYBACK-LJ92-DECODE-THROUGHPUT-1 r3, 2.2 s in, host stderr never captured -- r2). Both, and any
+    # other throw while the runner waits for the child (e.g. the launch-frame write hitting a dead
+    # host), are classified by PHASE ($awaitingChild), never by message text.
+    # Only when the lane's own deadline had NOT passed for the timeout path: a budget that really ran
+    # out (launch-budget-exhausted, a 1 s -TimeoutSec) stays timedOut exactly as before.
     # exitCode returns to the -999 sentinel (propagated as 127, like any other launch failure)
-    # rather than -1 (124, "timed out"), because nothing timed out.
-    if ($cfg.engine -eq 'claude' -and $null -ne $containment -and $null -eq $containment.childPid -and
-        -not $promptDelivered -and $timedOut -and $null -eq $failure -and
-        $sw.Elapsed.TotalSeconds -lt $TimeoutSec) {
+    # rather than -1 (124, "timed out"), because nothing timed out. The original exception text is
+    # kept in launchNoChild.cause so the pre-r2 detail is not lost.
+    if ($cfg.engine -eq 'claude' -and $awaitingChild -and $null -ne $containment -and $null -eq $containment.childPid -and
+        -not $promptDelivered -and (-not $noChildIsTimeout -or $sw.Elapsed.TotalSeconds -lt $TimeoutSec)) {
         $launchNoChild = [ordered]@{
             hostPid=$containment.ownerPid; hostExitedBeforeRunnerAction=$null; hostExitCode=$null
             hostStderrHead=$null; elapsedSec=[math]::Round($sw.Elapsed.TotalSeconds, 1); captureError=$null
+            cause=$noChildCause; causeType=$noChildCauseType
         }
         try {
             if ($null -ne $proc) {

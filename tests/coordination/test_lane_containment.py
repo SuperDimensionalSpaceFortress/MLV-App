@@ -2526,3 +2526,33 @@ def test_exhausted_budget_before_child_stays_a_timeout_not_launch_no_child(fixtu
     assert r.returncode==124,(r.stdout,r.stderr)
     q=json.loads(receipt.read_text(encoding="utf-8"))
     assert q["timedOut"] is True and q["failure"] is None and "launchNoChild" not in q
+
+
+# LANE-LAUNCH-NO-CHILD-TYPED-1 r2 (catalogue row C-01, sol r1 BLOCKER): the OTHER no-child path. A contained
+# host that EXITS before creating the child (live: PLAYBACK-LJ92-DECODE-THROUGHPUT-1 r3, 2.2 s in, exit 1,
+# stderr never captured) was receipted as failure='contained-host-exited-before-child: 1', untyped.
+def _host_startup_failure_mutation(text):
+    # Real host failure: the host reads the launch frame, then dies while starting the child, exactly as
+    # a missing/unstartable claude executable would (ErrorActionPreference=Stop -> stderr + exit 1).
+    old = "$child=[Diagnostics.Process]::Start($p);"
+    assert text.count(old) == 1
+    return text.replace(old, "throw 'fixture-startup-failure: claude executable could not start';" + old)
+
+
+def test_host_exiting_before_child_is_typed_launch_no_child_with_exit_and_stderr(fixture_tree):
+    cmd,env,receipt=prepare(fixture_tree,"normal",mutation=_host_startup_failure_mutation)
+    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=40)
+    assert r.returncode==127,(r.stdout,r.stderr)
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert q["failure"]=="launch-no-child",q["failure"]
+    assert q["state"]=="failed" and q["complete"] is False and q["timedOut"] is False
+    c=q["containment"]
+    assert c["childPid"] is None and c["promptDelivered"] is False
+    assert not (fixture_tree["root"]/"child.json").exists()
+    cap=q["launchNoChild"]
+    assert cap["hostPid"]==c["ownerPid"] and cap["captureError"] is None
+    assert cap["hostExitedBeforeRunnerAction"] is True and cap["hostExitCode"]==1
+    assert "fixture-startup-failure" in cap["hostStderrHead"]
+    # nothing is lost: the pre-r2 failure text survives as the cause
+    assert cap["cause"]=="contained-host-exited-before-child: 1"
+    assert cap["causeType"]=="RuntimeException"
