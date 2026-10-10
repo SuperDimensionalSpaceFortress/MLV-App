@@ -762,6 +762,107 @@ class WarmCoolMetricTests(WarmCoolHarness):
         self.assertEqual(cap["tiles"][0]["rows_used"], H - 8)
 
 
+# LOOK-FLAVOR-DIFF-WARMCOOL-INPUT-REFUSALS-1: a zero-sized staged tile and a malformed standalone-warmcool sidecar are typed refusals --------
+# PIL can neither write nor open a zero-width or zero-height image, so the empty tile is injected the one way it can arise in the tool: read_rgb()
+# returns an empty array. The wrapper below patches that one function and then runs the real main().
+EMPTY_TILE_WRAPPER = """import importlib.util, sys
+import numpy as np
+spec = importlib.util.spec_from_file_location("lfd_empty", {tool!r})
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+_real = module.read_rgb
+def read_rgb(staged, sidecar, side):
+    if sidecar.get("index") == {index}:
+        return np.zeros(({h}, {w}, 3), dtype=np.uint8)
+    return _real(staged, sidecar, side)
+module.read_rgb = read_rgb
+sys.exit(module.main(sys.argv[1:]))
+"""
+
+
+def list_dir(frames: Path, listing: Path) -> None:
+    listing.write_text(json.dumps({"files": [{"name": p.name, "sha256": hashlib.sha256(p.read_bytes()).hexdigest()}
+                                              for p in sorted(frames.iterdir())]}), encoding="utf-8")
+
+
+@requires_imaging
+class WarmCoolInputRefusalTests(FlavorRegradeHarness):
+    EMPTY_SHAPES = ((0, H), (W, 0))     # (width, height) of the empty tile
+
+    def empty_tile_tool(self, w, h, index=1) -> Path:
+        path = self.tmp / f"empty-{w}x{h}-{self.runs}.py"
+        path.write_text(EMPTY_TILE_WRAPPER.format(tool=str(TOOL), index=index, w=w, h=h), encoding="utf-8")
+        return path
+
+    def run_capture(self, tiles: dict, *, sidecars: dict | None = None, tool: Path = TOOL):
+        """Standalone warmcool over a staged capture. `sidecars` {name: text} replaces a sidecar BEFORE the listing is hashed, so the
+        listing still verifies and only the sidecar's own content is wrong."""
+        self.runs += 1
+        stage = self.tmp / f"capture{self.runs}" / ".claude-state" / "stage"
+        frames, listing = self.make_side(stage, "capture", tiles, None)
+        for name, text in (sidecars or {}).items():
+            (frames / name).write_text(text, encoding="utf-8")
+        list_dir(frames, listing)
+        proc = subprocess.run([sys.executable, str(tool), "warmcool", "--frames", str(frames), "--listed", str(listing)],
+                              capture_output=True, text=True, timeout=300)
+        return proc, frames
+
+    def test_warmcool_refuses_a_zero_sized_tile_with_a_named_token_and_no_measurement(self) -> None:
+        for w, h in self.EMPTY_SHAPES:
+            with self.subTest(size=f"{w}x{h}"):
+                proc, _ = self.run_capture({0: tile(90), 1: tile(91)}, tool=self.empty_tile_tool(w, h))
+                self.assertEqual(proc.returncode, 14, proc.stdout + proc.stderr)
+                self.assertTrue(proc.stderr.startswith(f"WARMCOOL_TILE_EMPTY 1 {w}x{h}"), proc.stderr)
+                self.assertNotIn("Traceback", proc.stderr)
+                self.assertEqual(proc.stdout, "", "no measurement JSON, and so no NaN lean, may be printed")
+
+    def test_warmcool_regrade_refuses_a_zero_sized_tile_with_a_named_token_and_writes_nothing(self) -> None:
+        for w, h in self.EMPTY_SHAPES:
+            for v3 in (False, True):
+                with self.subTest(size=f"{w}x{h}", v3=v3):
+                    proc, out = self.run_regrade({0: tile(92), 1: tile(93)}, identity_tables(), identity_tables(), tool=self.empty_tile_tool(w, h),
+                                                 v3=identity_tables() if v3 else None)
+                    self.assertEqual(proc.returncode, 14, proc.stdout + proc.stderr)
+                    self.assertTrue(proc.stderr.startswith(f"REGRADE_TILE_EMPTY 1 {w}x{h}"), proc.stderr)
+                    self.assertNotIn("Traceback", proc.stderr)
+                    self.assertFalse(out.exists() and any(out.iterdir()), "a refused regrade leaves no sheet, no tile and no metrics.json")
+
+    def test_warmcool_refuses_a_malformed_sidecar_instead_of_measuring_the_rest(self) -> None:
+        for label, text in (("truncated", '{"index": 1, "saved": tr'), ("not json", "not json at all"), ("a list", "[1, 2, 3]"), ("empty", "")):
+            with self.subTest(sidecar=label):
+                proc, frames = self.run_capture({0: tile(94), 1: tile(95), 2: tile(96)}, sidecars={"frame-01.json": text})
+                self.assertEqual(proc.returncode, 14, proc.stdout + proc.stderr)
+                self.assertTrue(proc.stderr.startswith("WARMCOOL_SIDECAR_MALFORMED " + str(frames / "frame-01.json")), proc.stderr)
+                self.assertNotIn("Traceback", proc.stderr)
+                self.assertEqual(proc.stdout, "", "a partial capture is never reported as the whole one")
+
+    def test_warmcool_still_skips_a_sidecar_that_says_saved_false(self) -> None:
+        unsaved = json.dumps({"index": 1, "saved": False, "path": "frame-01.png"})
+        proc, _ = self.run_capture({0: tile(97), 1: tile(98), 2: tile(99)}, sidecars={"frame-01.json": unsaved})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual([t["index"] for t in json.loads(proc.stdout)["capture"]["tiles"]], [0, 2])
+
+    def test_warmcool_shared_loader_keeps_warn_and_skip_for_its_other_callers(self) -> None:
+        spec = importlib.util.spec_from_file_location("mcs_loader", ROOT / "tools" / "profiling" / "make-contact-sheet.py")
+        mcs = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mcs)
+        stage = self.tmp / "loader" / ".claude-state" / "stage"
+        frames, listing = self.make_side(stage, "capture", {0: tile(100), 1: tile(101)}, None)
+        (frames / "frame-01.json").write_text("{broken", encoding="utf-8")
+        list_dir(frames, listing)
+        staged = mcs.StagedFrames(frames, mcs.load_listing(listing))
+        self.assertEqual([f["index"] for f in mcs.load_staged_frames(staged)], [0])
+        self.assertEqual([f["index"] for f in mcs.load_frames(frames)], [0])
+
+    def test_warmcool_usage_says_the_lean_is_not_the_probe_scripts_r_minus_b(self) -> None:
+        proc = subprocess.run([sys.executable, str(TOOL), "warmcool", "--help"], capture_output=True, text=True, timeout=60)
+        text = " ".join(proc.stdout.split())
+        self.assertIn("warmCool = R - B", text)
+        self.assertIn("code values", text)
+        self.assertIn("WARMCOOL_TILE_EMPTY", text)
+        self.assertIn("WARMCOOL_SIDECAR_MALFORMED", text)
+
+
 # LOOK-ASSIST-FILM-FLAVOR-3: the optional v3 column of the regrade mode, and the warm-cool guard --------------------------------------------
 WARMTH_MEASURE_MERGE = "5757fc6674ac022dcc95d86b2b1a0417a72629be"   # #358: the tool as it was before this card
 

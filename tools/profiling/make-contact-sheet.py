@@ -151,6 +151,14 @@ class FrameConfinementError(ValueError):
     starts with a typed token: PAIR_SIDECAR_PATH_OUTSIDE_STAGING, PAIR_FRAME_NOT_LISTED, PAIR_FRAME_HASH_MISMATCH or PAIR_LISTING_INVALID."""
 
 
+class SidecarMalformed(ValueError):
+    """A staged sidecar is unreadable, not JSON, or not a JSON object. Raised only by load_staged_frames(strict=True); the default stays warn-and-skip."""
+
+    def __init__(self, name, reason):
+        super().__init__(f"{name}: {reason}")
+        self.name = name
+
+
 class FrameMissing(FrameConfinementError):
     """The named plain file is simply not in the staging directory (rendered as an UNPAIRED / image-missing tile, as before)."""
 
@@ -213,8 +221,10 @@ class StagedFrames:
         return own
 
 
-def load_staged_frames(staged):
-    """load_frames() for a pair-mode side: sidecars are read through the staged (hash-verified) reader, and each saved sidecar's image reference is confined."""
+def load_staged_frames(staged, strict=False):
+    """load_frames() for a pair-mode side: sidecars are read through the staged (hash-verified) reader, and each saved sidecar's image reference is confined.
+    A malformed sidecar is warned about and skipped; with strict=True it raises SidecarMalformed instead, so a caller that reports a whole capture
+    never reports the remainder of one as the whole."""
     frames = []
     for name in sorted(p.name for p in staged.dir.glob("frame-*.json")):
         try:
@@ -222,8 +232,12 @@ def load_staged_frames(staged):
         except FrameConfinementError:
             raise
         except (ValueError, OSError) as exc:
+            if strict:
+                raise SidecarMalformed(name, str(exc)) from exc
             print(f"[make-contact-sheet] WARNING: failed to read {name}: {exc}", file=sys.stderr)
             continue
+        if strict and not isinstance(data, dict):
+            raise SidecarMalformed(name, "not a JSON object")
         if not isinstance(data, dict) or not data.get("saved", False):
             continue
         data["_stem"] = name[:-len(".json")]
