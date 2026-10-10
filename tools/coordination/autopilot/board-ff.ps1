@@ -39,7 +39,10 @@ foreach ($d in @($ScratchDir, (Split-Path -Parent $StateFile))) {
 }
 
 function Invoke-BoardGit([string[]]$GitArgs) {
-    $o = & git -C $Board @GitArgs 2>&1
+    # git writes paths as UTF-8; decode them as UTF-8 whatever the console code page is.
+    $oldEnc = [Console]::OutputEncoding
+    try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) } catch {}
+    try { $o = & git -C $Board @GitArgs 2>&1 } finally { try { [Console]::OutputEncoding = $oldEnc } catch {} }
     [pscustomobject]@{ Code = $LASTEXITCODE; Out = (@($o) | ForEach-Object { "$_" }) -join "`n" }
 }
 function Get-Sha8([string]$Rev) {
@@ -84,13 +87,13 @@ if ($to -eq '?') { return (New-Result 'refused' "no-target-ref ($target)" $from 
 # 2. Local-drift and board-owned-path refusals.
 $br = (Invoke-BoardGit @('branch', '--show-current')).Out.Trim()
 if ($br -ne $Branch) { return (New-Result 'refused' "wrong-branch (on '$br', need $Branch)" $from $to) }
-$st = Invoke-BoardGit @('status', '--porcelain', '--untracked-files=no')
+$st = Invoke-BoardGit @('status', '--porcelain', '-z', '--untracked-files=no')
 if ($st.Code -ne 0) { return (New-Result 'refused' 'status-failed' $from $to) }
-if ($st.Out.Trim()) { $n = @($st.Out -split "`n" | Where-Object { $_.Trim() }).Count; return (New-Result 'refused' "dirty-tracked ($n path(s))" $from $to) }
+if ($st.Out.Trim("`0", ' ', "`r", "`n")) { $n = @($st.Out -split "`0" | Where-Object { $_ -match '^[ MADRCTU?!]{2} ' }).Count; return (New-Result 'refused' "dirty-tracked ($n path(s))" $from $to) }
 if ((Invoke-BoardGit @('merge-base', '--is-ancestor', 'HEAD', $target)).Code -ne 0) { return (New-Result 'refused' "diverged (HEAD is not an ancestor of $target)" $from $to) }
-$hk = Invoke-BoardGit (@('diff', '--name-only', 'HEAD', $target, '--') + @($prof.boardOwnedPaths))
+$hk = Invoke-BoardGit (@('diff', '--name-only', '-z', 'HEAD', $target, '--') + @($prof.boardOwnedPaths))
 if ($hk.Code -ne 0) { return (New-Result 'refused' 'hook-diff-failed' $from $to) }
-$hkFiles = @($hk.Out -split "`n" | Where-Object { $_.Trim() })
+$hkFiles = @($hk.Out -split "`0" | Where-Object { $_.Trim() })
 if ($hkFiles.Count -gt 0) {
     $shown = ($hkFiles | Select-Object -First 5) -join ','
     return (New-Result 'refused' "hook-change-pending (left to refresh-hook-receipt.ps1; $($hkFiles.Count) file(s): $shown$(if ($hkFiles.Count -gt 5) { ',...' }))" $from $to)

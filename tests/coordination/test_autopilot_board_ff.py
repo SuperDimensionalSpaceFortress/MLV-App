@@ -92,7 +92,7 @@ class TempWorld(unittest.TestCase):
     def run_ff(self, *extra, **kw):
         """Run board-ff.ps1 against the board clone; returns the result object or None."""
         line = self.invoke_ff(self.ff_params(*extra, **kw),
-                              "if ($null -eq $r) { 'null' } else { $r | ConvertTo-Json -Compress }")
+                              "if ($null -eq $r) { 'null' } else { $r | ConvertTo-Json -Compress -EscapeHandling EscapeNonAscii }")
         return None if line == 'null' else json.loads(line)
 
     def assert_refused_unless_mover(self, res):
@@ -168,6 +168,33 @@ class BoardFfScenarioTests(TempWorld):
                 self.assertEqual(self.head(self.board), before)
                 # Reset the world for the next path: the board catches up out of band.
                 self.git(self.board, 'pull', '-q', '--ff-only', 'origin', 'master')
+
+    def test_board_owned_path_with_space_and_non_ascii_is_reported_verbatim(self):
+        # DG-GIT-PATHLIST: a plain diff --name-only quotes this path as octal escapes, which
+        # would then reach the refusal reason.
+        rel = 'tools/hooks/h é x.ps1'
+        self.commit(self.upstream, rel, 'changed\n', 'touch spaced non-ascii hook')
+        before = self.head(self.board)
+        res = self.run_ff()
+        self.assert_refused_unless_mover(res)
+        self.assertEqual(res['Result'], 'refused')
+        self.assertTrue(res['Reason'].startswith('hook-change-pending'), res['Reason'])
+        self.assertIn('1 file(s)', res['Reason'])
+        self.assertIn(rel, res['Reason'])
+        self.assertNotIn('\\', res['Reason'])
+        self.assertEqual(self.head(self.board), before)
+
+    def test_dirty_tracked_path_with_space_and_non_ascii_counts_once(self):
+        rel = 'docs/n é x.md'
+        self.commit(self.upstream, rel, 'one\n', 'add spaced non-ascii file')
+        self.git(self.board, 'pull', '-q', '--ff-only', 'origin', 'master')
+        self.commit(self.upstream, 'src/a.cpp', 'x\n', 'second')
+        (self.board / rel).write_text('local edit\n', encoding='utf-8')
+        before = self.head(self.board)
+        res = self.run_ff()
+        self.assertEqual(res['Result'], 'refused')
+        self.assertTrue(res['Reason'].startswith('dirty-tracked (1 path(s))'), res['Reason'])
+        self.assertEqual(self.head(self.board), before)
 
     def test_interval_skips_without_force(self):
         first = self.run_ff()
