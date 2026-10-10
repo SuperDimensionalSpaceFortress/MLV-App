@@ -66,7 +66,12 @@ COMPOSER = ROOT / "tools" / "profiling" / "make-contact-sheet.py"
 # master's text was needed: the DEFAULT job outside the brackets is byte-identical to master's, DVE-LEG-TERMINALS-1 and DVE-PRESENTMON-EVIDENCE-1 included (their regions
 # exist in the baseline now, so both sides are stripped of all three families). The baseline moved from 2f91486c only because master's own DVE-PRESENTMON-EVIDENCE-1
 # items 2-3 (merged since, bracketed) now sit in it.
-BASELINE_COMMIT = "a29a1ee4325423c156c5bde13581a5de233851ae"
+# KEEPALIVE-FAILURE-PUBLISH-LAST-1 r2 moves it again, on purpose: that card REORDERS three baseline lines of the keep-alive body (Start-AttrCudaDisplayWakeKeepAlive,
+# spliced into the default job verbatim): `$NudgeState.failureCount = ... + 1` moves from before to after the lastError / lastFailureUtc writes in the secure-screensaver,
+# tick-error and catch branches. A reorder edits baseline lines IN PLACE, which no bracketed region can express (the baseline line would have to stay verbatim outside it),
+# so the pin is that card's own generator commit (fc12fe8c: master e72dcdb6 plus the reorder and nothing else). That commit already carries every bracketed family, so the
+# baseline counts below equal the pinned counts (they were 0 against a29a1ee4). The reorder is pinned by its own tests (test_playback_attr_3_cuda_behaviour.py), not by byte identity.
+BASELINE_COMMIT = "fc12fe8c63f78e5436c11902b3aa0140e271320d"
 
 PWSH = shutil.which("pwsh")
 requires_windows_pwsh = unittest.skipIf(PWSH is None or sys.platform != "win32", "needs pwsh on Windows")
@@ -274,13 +279,13 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         self.assertEqual(new_counts["presentmon-evidence"], self.PRESENTMON_EVIDENCE_REGIONS, "the default job carries exactly the pinned number of bracketed DVE-PRESENTMON-EVIDENCE-1 regions")
         self.assertEqual(old_counts["presentmon-evidence"], self.PRESENTMON_EVIDENCE_REGIONS, "the baseline (master) carries the same bracketed DVE-PRESENTMON-EVIDENCE-1 region")
         self.assertEqual(new_counts["orphan-sweep"], self.ORPHAN_SWEEP_REGIONS, "the default job carries exactly the pinned number of bracketed UM-PRESENTMON-ORPHAN-SWEEP-1 regions")
-        self.assertEqual(old_counts["orphan-sweep"], 0, "the baseline has none")
+        self.assertEqual(old_counts["orphan-sweep"], self.ORPHAN_SWEEP_REGIONS, "the baseline (the pinned KEEPALIVE-FAILURE-PUBLISH-LAST-1 generator commit) carries the same bracketed regions")
         self.assertEqual(new_counts["contact-sheet-parity"], self.CONTACT_SHEET_PARITY_REGIONS, "the default job carries exactly the pinned number of bracketed CONTACT-SHEET-PLAYBACK-PARITY-1 regions")
-        self.assertEqual(old_counts["contact-sheet-parity"], 0, "the baseline has none")
+        self.assertEqual(old_counts["contact-sheet-parity"], self.CONTACT_SHEET_PARITY_REGIONS, "the baseline (the pinned KEEPALIVE-FAILURE-PUBLISH-LAST-1 generator commit) carries the same bracketed regions")
         self.assertEqual(new_counts["keepalive-hung-probe"], self.KEEPALIVE_HUNG_PROBE_REGIONS, "the default job carries exactly the pinned number of bracketed CI-FLAKE-KEEPALIVE-HUNG-PROBE-SLEEP-1 regions")
-        self.assertEqual(old_counts["keepalive-hung-probe"], 0, "the baseline has none")
+        self.assertEqual(old_counts["keepalive-hung-probe"], self.KEEPALIVE_HUNG_PROBE_REGIONS, "the baseline (the pinned KEEPALIVE-FAILURE-PUBLISH-LAST-1 generator commit) carries the same bracketed regions")
         self.assertEqual(new_counts["session-locked"], self.SESSION_LOCKED_REGIONS, "the default job carries exactly the pinned number of bracketed VENUE-SESSION-LOCKED-REFUSAL-1 regions")
-        self.assertEqual(old_counts["session-locked"], 0, "the baseline has none")
+        self.assertEqual(old_counts["session-locked"], self.SESSION_LOCKED_REGIONS, "the baseline (the pinned KEEPALIVE-FAILURE-PUBLISH-LAST-1 generator commit) carries the same bracketed regions")
         self.assertEqual(stripped, old_stripped,
                          "the DEFAULT (bachelor/cuda) emitted job changed outside the bracketed regions -- it must stay byte-identical to the pinned baseline")
 
@@ -5566,9 +5571,12 @@ class LookReceiptGeneratorTests(unittest.TestCase):
         for stem in FIXTURE_IDS:
             write_synthetic_mlv(cls.repo / "tests" / "fixtures" / "clips" / (stem + MLV_EXT), FRAMES_30S_AT_23976)
         cls.base_root = cls.tmp / "base"
-        if _base_commit_available():
+        # KEEPALIVE-FAILURE-PUBLISH-LAST-1 r2: the generator base is the dual-venue byte-identity pin (BASELINE_COMMIT), the same generator the default-job tests compare against,
+        # so the keep-alive reorder (an in-place edit of baseline lines) is pinned in ONE place; LOOK_RECEIPT_BASE still anchors the legs diff.
+        cls.base_available = subprocess.run(["git", "-C", str(ROOT), "cat-file", "-e", f"{BASELINE_COMMIT}^{{commit}}"], capture_output=True).returncode == 0
+        if cls.base_available:
             tar = cls.tmp / "base.tar"
-            subprocess.run(["git", "-C", str(ROOT), "archive", LOOK_RECEIPT_BASE, "--format=tar", "-o", str(tar), "tools/profiling", "tools/gates"], check=True)
+            subprocess.run(["git", "-C", str(ROOT), "archive", BASELINE_COMMIT, "--format=tar", "-o", str(tar), "tools/profiling", "tools/gates"], check=True)
             cls.base_root.mkdir()
             subprocess.run(["tar", "-xf", str(tar), "-C", str(cls.base_root)], check=True)
         cls.receipt = cls.tmp / "look-receipt.marxml"
@@ -5590,8 +5598,8 @@ class LookReceiptGeneratorTests(unittest.TestCase):
         return out
 
     def test_without_a_receipt_the_job_is_byte_identical_to_the_base_generators(self) -> None:
-        if not _base_commit_available():
-            self.skipTest(f"base commit {LOOK_RECEIPT_BASE[:12]} is not in this clone")
+        if not self.base_available:
+            self.skipTest(f"baseline commit {BASELINE_COMMIT[:12]} is not in this clone")
         base_gen = self.base_root / "tools" / "profiling" / "bachelor" / "playback-attr-3-cuda-job.ps1"
         for name, extra in (("default", []), ("cpu-look-film", [*self.LOOK_ARGS, "-LookFlavor", "film"]),
                             ("cpu-look-cinematic", [*self.LOOK_ARGS, "-LookFlavor", "cinematic"]),
@@ -5599,23 +5607,13 @@ class LookReceiptGeneratorTests(unittest.TestCase):
             with self.subTest(variant=name):
                 new = self.generate(GENERATOR, f"new-{name}.job.ps1", extra).read_bytes()
                 old = self.generate(base_gen, f"base-{name}.job.ps1", extra).read_bytes()
-                # VENUE-SESSION-LOCKED-REFUSAL-1 r4: that card's lines all sit inside its own sentinel regions (pinned by
-                # GeneratorByteIdentityAndVariantTests); outside them the job is still the base generator's bytes.
-                opener, closer = GeneratorByteIdentityAndVariantTests.SESSION_LOCKED_OPEN, GeneratorByteIdentityAndVariantTests.SESSION_LOCKED_CLOSE
-                kept, inside, regions = [], False, 0
-                for line in lf(new.decode("utf-8")).split("\n"):
-                    if opener in line:
-                        self.assertFalse(inside, "nested session-lock region")
-                        inside, regions = True, regions + 1
-                    elif closer in line:
-                        self.assertTrue(inside, "unopened session-lock region")
-                        inside = False
-                    elif not inside:
-                        kept.append(line)
-                self.assertFalse(inside, "unclosed session-lock region")
-                self.assertGreater(regions, 0)
-                self.assertNotIn(opener, old.decode("utf-8"), "the base predates the session-lock regions")
-                self.assertEqual("\n".join(kept), lf(old.decode("utf-8")), f"{name}: the job without -LookReceiptPath must be the base generator's bytes")
+                # Every card's lines sit inside its own sentinel regions (pinned by GeneratorByteIdentityAndVariantTests); outside them the job is still the
+                # base generator's bytes, and the base carries the same regions as the new job (it is the pinned KEEPALIVE-FAILURE-PUBLISH-LAST-1 generator).
+                kept, new_counts = GeneratorByteIdentityAndVariantTests.strip_regions(new.decode("utf-8"))
+                old_kept, old_counts = GeneratorByteIdentityAndVariantTests.strip_regions(old.decode("utf-8"))
+                self.assertGreater(new_counts["session-locked"], 0)
+                self.assertEqual(new_counts, old_counts, f"{name}: the job without -LookReceiptPath carries the base generator's bracketed regions")
+                self.assertEqual(kept, old_kept, f"{name}: the job without -LookReceiptPath must be the base generator's bytes")
                 self.assertNotIn(b"LookReceipt", new)
 
     def test_with_a_receipt_the_job_embeds_its_bytes_passes_minus_receipt_once_and_records_its_hash(self) -> None:
