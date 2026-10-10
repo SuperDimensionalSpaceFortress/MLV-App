@@ -100,7 +100,10 @@ _NO_EXECUTION_FLAGS = frozenset(
 )
 _STEP_NAME = re.compile(r"^\s*-\s+name:\s*(.+?)\s*$")
 _RUN_KEY = re.compile(r"^(\s*)(-\s+)?run:[ \t]*(.*)$")
-_BLOCK_SCALAR = re.compile(r"^[|>][+-]?\d*\s*(#.*)?$")
+_LITERAL_BLOCK = re.compile(r"^\|(?:[+-]\d?|\d[+-]?)?\s*(#.*)?$")
+# A value that opens with a block indicator but is not a literal ``|`` one: a folded ``>`` body joins
+# its lines into one, so this line-wise reader cannot say what executes. It gets no credit.
+_UNREADABLE_BLOCK = re.compile(r"^[>|]")
 _ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 _PYTHON_NAME = re.compile(r"^(?:python|python3|py)(?:\d+(?:\.\d+)*)?(?:\.exe)?$")
 _WRAPPERS = frozenset({"&", "env", "sudo", "time", "call", "nohup"})
@@ -126,13 +129,14 @@ def run_bodies(text: str) -> list[tuple[str, list[str]]]:
     lines: list[str] = []
     pending = ""
     body_indent: int | None = None  # indent of the open run: key; None outside a run body
+    unreadable = False  # the open body is a folded (or unrecognised) block: it earns no credit
 
     def close() -> None:
-        nonlocal pending, lines, body_indent
+        nonlocal pending, lines, body_indent, unreadable
         if pending:
             lines.append(pending.strip())
-        out.append((step, lines))
-        pending, lines, body_indent = "", [], None
+        out.append((step, [] if unreadable else lines))
+        pending, lines, body_indent, unreadable = "", [], None, False
 
     for raw in text.splitlines():
         stripped = raw.strip()
@@ -148,7 +152,10 @@ def run_bodies(text: str) -> list[tuple[str, list[str]]]:
                 continue
             body_indent = len(key.group(1)) + (len(key.group(2)) if key.group(2) else 0)
             text_line = key.group(3)
-            if not text_line or _BLOCK_SCALAR.match(text_line):
+            if not text_line or _LITERAL_BLOCK.match(text_line):
+                continue
+            if _UNREADABLE_BLOCK.match(text_line):
+                unreadable = True
                 continue
         else:
             text_line = raw
@@ -969,6 +976,41 @@ class FixtureTreeTests(unittest.TestCase):
     def test_an_exit_in_one_step_does_not_cut_the_next_step(self) -> None:
         workflow = _workflow(_step("First", "exit 0"), _step("Second", "python tools/a/test_orphan.py"))
         self.assertEqual(self._orphan_problems(workflow), [])
+
+    def test_a_folded_run_scalar_credits_nothing(self) -> None:
+        # YAML folds the body to ONE line ("echo scheduled python tools/a/test_orphan.py"), which
+        # prints and runs nothing; this reader is line-wise, so a folded body earns no credit.
+        for indicator in (">", ">-", ">+", ">2", ">-2", ">2-", "> # folded"):
+            workflow = (
+                "jobs:\n  j:\n    steps:\n      - run: " + indicator + "\n"
+                "          echo scheduled\n          python tools/a/test_orphan.py\n"
+            )
+            problems = self._orphan_problems(workflow)
+            self.assertEqual(len(problems), 1, (indicator, problems))
+            self.assertIn("tools/a/test_orphan.py", problems[0])
+
+    def test_a_folded_body_does_not_hide_or_poison_the_next_step(self) -> None:
+        workflow = (
+            "jobs:\n  j:\n    steps:\n      - name: Folded\n        run: >-\n"
+            "          python tools/a/test_orphan.py\n"
+            "      - name: Literal\n        run: |\n          python tools/a/test_other.py\n"
+        )
+        files = {"tools/a/test_orphan.py": "", "tools/a/test_other.py": "", ".github/workflows/t.yml": workflow}
+        problems = self._problems(files)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("tools/a/test_orphan.py", problems[0])
+
+    def test_every_literal_block_indicator_still_credits(self) -> None:
+        for indicator in ("|", "|-", "|+", "|2", "|-2", "|2-", "| # literal"):
+            workflow = (
+                "jobs:\n  j:\n    steps:\n      - run: " + indicator + "\n"
+                "          python tools/a/test_orphan.py\n"
+            )
+            self.assertEqual(self._orphan_problems(workflow), [], indicator)
+
+    def test_an_unrecognised_block_indicator_credits_nothing(self) -> None:
+        workflow = "jobs:\n  j:\n    steps:\n      - run: |x\n          python tools/a/test_orphan.py\n"
+        self.assertEqual(len(self._orphan_problems(workflow)), 1)
 
     def test_an_option_without_a_value_fails_fast_naming_the_workflow_and_option(self) -> None:
         for command, option in (
