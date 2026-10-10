@@ -48,6 +48,16 @@
 # is not already this script's own well-formed RETRACTED:/UNRESOLVED: throw is remapped to
 # UNRESOLVED (after one last recheck for a receipt that may have landed despite the error), never
 # left to escape raw. This is the boundary, not a per-call patch on each individual share read.
+#
+# MLV-AGENT-HEAVY-SLOT-GATE-2: an agent with a heavy-slot admission gate HOLDS a job before launching
+# it, and writes running\<id>.started.json with phase=admission-wait (childPid null) before it waits,
+# then rewrites it with phase=launched at launch. Such a job is neither unclaimed (it is never
+# RETRACTED: the agent owns it) nor claimed (the claimed clock starts only at phase=launched); this
+# client waits for it under its own -MaxAdmissionWaitSec, logging the agent heartbeat's gate-wait
+# state, and stops UNRESOLVED at that ceiling. Each poll reads the marker as exactly one of none |
+# admission-wait | launched | unknown; unknown (present but unreadable) is cannot-tell and is never
+# folded into none. A marker with no phase field (an agent older than GATE-2) reads as launched, so
+# such an agent sees exactly the behaviour it always did.
 
 [CmdletBinding(DefaultParameterSetName = 'Script')]
 param(
@@ -78,6 +88,11 @@ param(
     # -MaxQueueWaitSec's own reasoning (a bound sized to outlast a lot of legitimate extra work, not
     # a guessed round number).
     [int]$MaxClaimedWaitSec = 86400,
+    # MLV-AGENT-HEAVY-SLOT-GATE-2: how long this client waits while the agent holds the job in its
+    # heavy-slot admission gate (marker phase=admission-wait), measured from when this client first
+    # sees that hold. Well above the gate's 600 s hot cap, and a bound on its uncapped slots-full and
+    # unknown-feed waits.
+    [int]$MaxAdmissionWaitSec = 7200,
     # Test-only: invoked with no arguments the instant the queue deadline is judged reached and no
     # claim has been seen yet, immediately BEFORE the recheck that follows it -- lets a test land a
     # claim marker deterministically inside what is otherwise a sub-millisecond window between
@@ -181,6 +196,11 @@ $submittedAt    = [DateTimeOffset]::Now
 $queueDeadline  = $submittedAt.AddSeconds($MaxQueueWaitSec)
 $claimedAt      = $null
 $budgetDeadline = $null
+# MLV-AGENT-HEAVY-SLOT-GATE-2: set when this client first sees the agent holding the job in its
+# admission gate (see this file's header); the claimed clock above still starts only at launch.
+$admissionAt    = $null
+$admissionLogKey = $null
+$admissionLogAt = [DateTimeOffset]::MinValue
 
 function Get-UmRunResultIfPresent {
     param([string]$Path)
@@ -191,15 +211,60 @@ function Get-UmRunResultIfPresent {
     return $null
 }
 
+function Get-UmRunClaimState {
+    # MLV-AGENT-HEAVY-SLOT-GATE-2: one read of running\<id>.started.json, as exactly one of
+    #   none           - no marker: unclaimed
+    #   admission-wait - the agent holds the job in its admission gate; no child has been launched
+    #   launched       - phase=launched, NO phase field (an agent older than GATE-2), or a child pid
+    #   unknown        - present but unreadable, unparseable or an unrecognised phase: CANNOT-TELL,
+    #                    never folded into none (a marker exists, so the job is never retracted on it)
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return 'none' }
+    try {
+        $marker = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        return 'unknown'
+    }
+    if ($marker -isnot [System.Management.Automation.PSCustomObject]) { return 'unknown' }
+    $phase = $marker.PSObject.Properties['phase']
+    if ($null -eq $phase -or $phase.Value -eq 'launched') { return 'launched' }
+    if ($phase.Value -eq 'admission-wait') {
+        if ($null -ne $marker.childPid) { return 'launched' }
+        return 'admission-wait'
+    }
+    return 'unknown'
+}
+
+function Get-UmRunGateWaitState {
+    # The gate's own reason, from the agent heartbeat ("gate-wait job=<id> state=<s> waited=<n>s").
+    # A heartbeat that cannot be read, or carries no gate-wait tag for this job, is state=? -- never clear.
+    param([string]$HeartbeatPath, [string]$JobId)
+    $state = '?'
+    $agentWaited = '?'
+    try {
+        $line = Get-Content -LiteralPath $HeartbeatPath -Raw -ErrorAction Stop
+        if ($line -match ('(?:^|\s)gate-wait job=' + [regex]::Escape($JobId) + ' state=(\S*) waited=(\d+)s')) {
+            if ($Matches[1]) { $state = $Matches[1] }
+            $agentWaited = "$($Matches[2])s"
+        }
+    } catch { }
+    return [pscustomobject]@{ State = $state; AgentWaited = $agentWaited }
+}
+
 try {
 while ($true) {
     if ($TestHookAtLoopTop) { & $TestHookAtLoopTop }
     $r = Get-UmRunResultIfPresent -Path $resultFile
     if ($null -ne $r) { return $r }
 
-    if ($null -eq $claimedAt -and (Test-Path -LiteralPath $startedMarker)) {
-        $claimedAt      = [DateTimeOffset]::Now
-        $budgetDeadline = $claimedAt.AddSeconds($TimeoutSec)
+    if ($null -eq $claimedAt) {
+        $claimState = Get-UmRunClaimState -Path $startedMarker
+        if ($claimState -eq 'launched') {
+            $claimedAt      = [DateTimeOffset]::Now
+            $budgetDeadline = $claimedAt.AddSeconds($TimeoutSec)
+        } elseif ($claimState -eq 'admission-wait' -and $null -eq $admissionAt) {
+            $admissionAt = [DateTimeOffset]::Now
+        }
     }
 
     if ($null -ne $claimedAt) {
@@ -243,6 +308,29 @@ while ($true) {
                 }
             }
         }
+    } elseif ($null -ne $admissionAt) {
+        # ADMISSION phase (MLV-AGENT-HEAVY-SLOT-GATE-2): held by the agent's gate, not launched. Per
+        # poll: admitted (launched -> CLAIMED above, next iteration), still waiting (admission-wait),
+        # or cannot-tell (unknown / none: no transition, this phase's own ceiling still applies).
+        $now = [DateTimeOffset]::Now
+        $gate = Get-UmRunGateWaitState -HeartbeatPath $hb -JobId $jobId
+        $logKey = "$($gate.State)|$claimState"
+        if ($logKey -ne $admissionLogKey -or ($now - $admissionLogAt).TotalSeconds -ge 60) {
+            Write-Host "UMRUN_ADMISSION_WAIT job=$jobId state=$($gate.State) agentWaited=$($gate.AgentWaited) marker=$claimState clientWaited=$([int]($now - $admissionAt).TotalSeconds)s ceiling=${MaxAdmissionWaitSec}s"
+            $admissionLogKey = $logKey
+            $admissionLogAt = $now
+        }
+        if ($now -ge $admissionAt.AddSeconds($MaxAdmissionWaitSec)) {
+            $r = Get-UmRunResultIfPresent -Path $resultFile
+            if ($null -ne $r) { return $r }
+            $ceilingClaim = Get-UmRunClaimState -Path $startedMarker
+            if ($ceilingClaim -eq 'launched') {
+                $claimedAt      = [DateTimeOffset]::Now
+                $budgetDeadline = $claimedAt.AddSeconds($TimeoutSec)
+                continue
+            }
+            throw "UNRESOLVED: $jobId was held unlaunched in the agent's heavy-slot admission gate ($startedMarker last read as $ceilingClaim, never launched; last gate state=$($gate.State)) for the full -MaxAdmissionWaitSec (${MaxAdmissionWaitSec}s) -- this client is stopping, not failing, and did not withdraw it: the agent still holds $jobId and may launch it and publish $resultFile after this; not retryable on this evidence alone"
+        }
     } else {
         # QUEUED phase.
         if ([DateTimeOffset]::Now -ge $queueDeadline) {
@@ -254,9 +342,17 @@ while ($true) {
             # now appeared, switch onto the CLAIMED phase (one more loop iteration) instead of
             # ending the loop.
             if ($TestHookAtQueueDeadline) { & $TestHookAtQueueDeadline }
-            if (Test-Path -LiteralPath $startedMarker) {
+            $deadlineClaim = Get-UmRunClaimState -Path $startedMarker
+            if ($deadlineClaim -eq 'launched') {
                 $claimedAt      = [DateTimeOffset]::Now
                 $budgetDeadline = $claimedAt.AddSeconds($TimeoutSec)
+                continue
+            }
+            if ($deadlineClaim -ne 'none') {
+                # MLV-AGENT-HEAVY-SLOT-GATE-2: held in the agent's admission gate, or a marker that
+                # cannot be read this instant -- either way the agent has claimed it, so it is never
+                # retracted; wait under -MaxAdmissionWaitSec, re-reading the marker every poll.
+                $admissionAt = [DateTimeOffset]::Now
                 continue
             }
 
@@ -346,7 +442,12 @@ while ($true) {
             # claimed it in the very same instant; this client's own rename may now make the
             # agent's own launch fail, but that becomes the agent's own honestly-reported receipt,
             # never this client's assertion). Either way: never declare retraction or failure while
-            # the job might already be running -- switch to the claimed wait.
+            # the job might already be running -- switch to the claimed wait (or, GATE-2, to the
+            # admission wait when the late marker says the agent is holding it in its gate).
+            if ((Get-UmRunClaimState -Path $startedMarker) -eq 'admission-wait') {
+                $admissionAt = [DateTimeOffset]::Now
+                continue
+            }
             $claimedAt      = [DateTimeOffset]::Now
             $budgetDeadline = $claimedAt.AddSeconds($TimeoutSec)
             continue
