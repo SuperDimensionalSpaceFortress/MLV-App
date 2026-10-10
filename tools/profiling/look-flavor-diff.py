@@ -754,6 +754,9 @@ INPUT
     --clip-id --venue --build-sha --cinematic-receipt-id --film-receipt-id   header text only
     --out-dir             must contain a `.claude-state` path segment (owner footage)
     --illustrative        with an invalid state, compose anyway: valid=false in the metrics and a banner on the strip (never evidence)
+    --expect-table-sha256 HEX   optional (L-04): the sha256 the NEWEST table graded must have (v3 with --v3-table, else v2), e.g. the
+                          subject's FilmCurveIsPinned pin. Any other table is refused (21) before a frame is read; with a match the
+                          metrics carry tableBinding and the strip names the bound table. Without it the outputs are unchanged.
 
 RE-GRADE (per 8-bit pixel value c, per channel)
     v = T_ch[ T_Y[ round(c * 257) ] ];  out = round(v / 257)   -- Y first, then the channel's own table, as every kernel applies them.
@@ -761,8 +764,11 @@ RE-GRADE (per 8-bit pixel value c, per channel)
 REFUSALS: 12, 13, 14, 16 as above, and
     18  REGRADE_INVALID         the state says AgX, LUT or filter was on, or does not say all three: the re-grade is not the engine's picture.
     19  REGRADE_TABLE_INVALID   a table file is missing, unreadable or not 4 x 65536 uint16.
+    21  TABLE_UNBOUND           with --expect-table-sha256: the newest table's sha256 is not the expected one (a stale candidate table
+                                must never be graded under the shipped grade's name). Nothing is written.
 
 OUTPUT (in --out-dir; created exclusively, never overwritten)
+    stdout: LOOK_FLAVOR_REGRADE_OK ... ending in tableSha256=v1:<hex>,v2:<hex>[,v3:<hex>], the sha256 of every table graded.
     regrade-cinematic-v1-v2.png   3840 px wide: a header, then per tile a label band over [Cinematic | v1 re-grade | v2 re-grade] at 1280 px;
                                   every re-graded column is labelled "re-graded from the Cinematic capture".
     regrade-v1-NN.png / regrade-v2-NN.png   the full-resolution re-graded tiles.
@@ -774,6 +780,7 @@ OUTPUT (in --out-dir; created exclusively, never overwritten)
 """
 EXIT_REGRADE_INVALID = 18
 EXIT_REGRADE_TABLE = 19
+EXIT_TABLE_UNBOUND = 21
 REGRADE_SHEET_NAME = "regrade-cinematic-v1-v2.png"
 REGRADE_V3_SHEET_NAME = "regrade-cinematic-v1-v2-v3.png"
 REGRADE_V3_COLUMN = 960
@@ -835,6 +842,12 @@ def compose_regrade(args):
     sheet_name = REGRADE_V3_SHEET_NAME if with_v3 else REGRADE_SHEET_NAME
     column = REGRADE_V3_COLUMN if with_v3 else SHEET_COLUMN
     table_bytes = {v: read_regrade_table(getattr(args, f"{v}_table"), v) for v in versions}
+    table_sha = {v: hashlib.sha256(table_bytes[v]).hexdigest() for v in versions}
+    expected = getattr(args, "expect_table_sha256", None)
+    if expected is not None and table_sha[versions[-1]] != expected:
+        raise Refusal(EXIT_TABLE_UNBOUND, f"TABLE_UNBOUND the {versions[-1]} table {getattr(args, f'{versions[-1]}_table')} has sha256 "
+                                          f"{table_sha[versions[-1]]}, not the expected {expected}: a table other than the bound one is never "
+                                          "graded under its name. Nothing is written.")
     _load_imaging()
     tables = {v: regrade_tables(table_bytes[v]) for v in versions}
     staged, frames = load_side(args.cinematic_frames, args.cinematic_listed, "Cinematic")
@@ -908,6 +921,8 @@ def compose_regrade(args):
         "(Y then R/G/B tables, round(c*257), /257, round)",
         "  |  ".join(column_labels),
     ]
+    if expected is not None:
+        header.append(f"table bound: {versions[-1]} sha256={expected} (--expect-table-sha256)")
     for i, text in enumerate(header):
         draw.text((10, 8 + i * 34), text, fill=(255, 255, 255) if valid else (255, 120, 120), font=font)
     for n, (tile, cols) in enumerate(panels):
@@ -934,7 +949,7 @@ def compose_regrade(args):
         "clipId": args.clip_id, "venue": args.venue, "buildSha12": args.build_sha,
         "receiptIds": {"cinematic": args.cinematic_receipt_id, "film": args.film_receipt_id},
         "valid": valid, "invalidReasons": reasons, "state": state,
-        "tables": {v: {"path": str(getattr(args, f"{v}_table")), "sha256": hashlib.sha256(table_bytes[v]).hexdigest()} for v in versions},
+        "tables": {v: {"path": str(getattr(args, f"{v}_table")), "sha256": table_sha[v]} for v in versions},
         "letterboxMaxLuma": LETTERBOX_MAX_LUMA, "frameMatchTolerance": FRAME_MATCH_TOLERANCE,
         "metricDefinitions": {
             "S": "BA(luma in [p05,p30]) - BA(luma in [p70,p95]), BA = mean(B - R), BT.601 luma ranked per image",
@@ -951,6 +966,8 @@ def compose_regrade(args):
         doc["dSRatioV3OverV2"] = ratio3
         doc["metricDefinitions"]["MAD_v3_vs_film"] = "mean over channels of mean |v3(C) - Film|"
         doc["metricDefinitions"]["dLean"] = "lean(v(C)) - lean(C), lean = " + WARMCOOL_DEFINITION + " (the warmcool metric)"
+    if expected is not None:
+        doc["tableBinding"] = {"table": versions[-1], "expectedSha256": expected, "bound": True}
     out.mkdir(parents=True, exist_ok=True)
     write_new(out / sheet_name, png_bytes(sheet))
     for index in indices:
@@ -959,7 +976,8 @@ def compose_regrade(args):
     write_new(out / REGRADE_METRICS_NAME, json.dumps(doc, indent=2).encode("utf-8"))
     v3_tail = (f" dSv3={means['dS']['v3']:.3f} ratioV3OverV2={'None' if ratio3 is None else f'{ratio3:.3f}'}" if with_v3 else "")
     print(f"LOOK_FLAVOR_REGRADE_OK sheet={out / sheet_name} tiles={len(tiles)} valid={str(valid).lower()} "
-          f"dSv1={means['dS']['v1']:.3f} dSv2={means['dS']['v2']:.3f} ratio={'None' if ratio is None else f'{ratio:.3f}'}{v3_tail}")
+          f"dSv1={means['dS']['v1']:.3f} dSv2={means['dS']['v2']:.3f} ratio={'None' if ratio is None else f'{ratio:.3f}'}{v3_tail}"
+          f" tableSha256={','.join(f'{v}:{table_sha[v]}' for v in versions)}")
     return 0
 
 
@@ -980,9 +998,14 @@ def regrade_main(argv):
     p.add_argument("--build-sha", default="")
     p.add_argument("--out-dir", required=True, type=Path)
     p.add_argument("--illustrative", action="store_true")
+    p.add_argument("--expect-table-sha256", default=None, metavar="HEX")
     args = p.parse_args(argv)
     if (args.film_frames is None) != (args.film_listed is None):
         p.error("the Film side needs both --film-frames and --film-listed, or neither")
+    if args.expect_table_sha256 is not None:
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", args.expect_table_sha256):
+            p.error("--expect-table-sha256 wants a sha256: 64 hex digits")
+        args.expect_table_sha256 = args.expect_table_sha256.lower()
     try:
         return compose_regrade(args)
     except Refusal as exc:

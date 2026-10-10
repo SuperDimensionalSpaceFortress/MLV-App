@@ -845,8 +845,61 @@ class RegradeV3Tests(FlavorRegradeHarness):
             runs.append((proc.stdout.replace(str(out), "<OUT>"), hashes, metrics))
         self.assertEqual(runs[0][1], runs[1][1], "every PNG is byte-identical to the #358 merge's tool")
         self.assertEqual(runs[0][2], runs[1][2], "the metrics are the #358 merge's tool's")
-        self.assertEqual(runs[0][0], runs[1][0])
+        # L-04 adds one field to the OK line, the sha256 of every table graded; the rest of the line is the #358 merge's tool's
+        added = f" tableSha256=v1:{hashlib.sha256(v1).hexdigest()},v2:{hashlib.sha256(v2).hexdigest()}"
+        self.assertIn(added, runs[0][0])
+        self.assertEqual(runs[0][0].replace(added, ""), runs[1][0])
         self.assertNotIn("dLean", json.dumps(runs[0][2]))
+
+
+# LOOK-ASSIST-FILM-FLAVOR-3 r2 (catalogue L-04): a stale candidate table was graded and labelled as the shipped grade ---------------------------
+class RegradeTableBindingRefusalTests(FlavorRegradeHarness):
+    TABLE = 4 * 65536 * 2
+
+    def test_a_table_other_than_the_expected_sha256_is_table_unbound_before_any_frame_is_read(self) -> None:
+        v1, v2, v3 = b"\0" * self.TABLE, b"\2" * self.TABLE, b"\3" * self.TABLE
+        sha = {name: hashlib.sha256(data).hexdigest() for name, data in (("v1", v1), ("v2", v2), ("v3", v3))}
+        # with --v3-table the option binds v3; without it, v2 (the newest table graded). Another table's sha does not bind it.
+        for bound, v3_data, expected in (("v3", v3, sha["v2"]), ("v3", v3, "0" * 64), ("v2", None, sha["v1"])):
+            with self.subTest(bound=bound, expected=expected[:8]):
+                proc, out = self.run_regrade({0: None}, v1, v2, v3=v3_data, extra=("--expect-table-sha256", expected))
+                self.assertEqual(proc.returncode, 21, proc.stdout + proc.stderr)
+                self.assertTrue(proc.stderr.startswith("TABLE_UNBOUND"), proc.stderr)
+                self.assertIn(f"the {bound} table", proc.stderr)
+                self.assertIn(sha[bound], proc.stderr)
+                self.assertIn(expected, proc.stderr)
+                self.assertNotIn("Traceback", proc.stderr)
+                self.assertFalse(out.exists() and any(out.iterdir()), "nothing is written")
+
+    def test_an_expected_sha256_that_is_not_64_hex_digits_is_a_usage_error(self) -> None:
+        for bad in ("913cbec9", "g" * 64, "0" * 65, ""):
+            with self.subTest(bad=bad):
+                proc, out = self.run_regrade({0: None}, b"\0" * self.TABLE, b"\0" * self.TABLE, extra=("--expect-table-sha256", bad))
+                self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+                self.assertFalse(out.exists())
+
+
+@requires_imaging
+class RegradeTableBindingComposeTests(FlavorRegradeHarness):
+    def test_the_expected_sha256_grades_and_every_output_names_the_bound_table(self) -> None:
+        cin = {0: tile(90)}
+        tables = {"v1": known_tables(lift=300, split=900), "v2": known_tables(lift=1300, split=2300), "v3": known_tables(lift=1300, split=1600)}
+        sha = {v: hashlib.sha256(d).hexdigest() for v, d in tables.items()}
+        proc, out = self.run_regrade(cin, tables["v1"], tables["v2"], v3=tables["v3"], extra=("--expect-table-sha256", sha["v3"].upper()))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn(f" tableSha256=v1:{sha['v1']},v2:{sha['v2']},v3:{sha['v3']}", proc.stdout)
+        m = json.loads((out / "regrade-metrics.json").read_text(encoding="utf-8"))
+        self.assertEqual(m["tableBinding"], {"table": "v3", "expectedSha256": sha["v3"], "bound": True})
+        self.assertEqual({v: d["sha256"] for v, d in m["tables"].items()}, sha)
+        self.assertTrue((out / "regrade-cinematic-v1-v2-v3.png").exists())
+
+    def test_without_the_option_the_ok_line_still_names_every_table_and_no_binding_is_claimed(self) -> None:
+        v1, v2 = identity_tables(), known_tables(lift=1300, split=2300)
+        proc, out = self.run_regrade({0: tile(91)}, v1, v2)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertTrue(proc.stdout.rstrip().endswith(f" tableSha256=v1:{hashlib.sha256(v1).hexdigest()},v2:{hashlib.sha256(v2).hexdigest()}"),
+                        proc.stdout)
+        self.assertNotIn("tableBinding", json.loads((out / "regrade-metrics.json").read_text(encoding="utf-8")))
 
 
 class WarmCoolBoundTests(WarmCoolHarness):
