@@ -91,7 +91,10 @@ HEAVY_LEGS = ("legs/m16-1243-pace-cinematic-fullscreen-s4-heavy.json",)
 # LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1 added the scale-2 Cinematic twin of the scale-2 look leg (the Bachelor CPU Classic | Cinematic look pair).
 SHIPPED_LEGS = ("legs/m16-1243-speed.json", "legs/m16-1243-look.json", "legs/m16-1243-look-scale2.json", "legs/m16-1243-look-cinematic.json", *DISPLAY_MATRIX_LEGS, *PACE_LEGS,
                 *LOOKAHEAD_LEGS, *HEAVY_LEGS, "legs/m16-1243-look-scale2-cinematic.json", "legs/m16-1243-look-film.json",
-                "legs/m16-1243-look-scale2-film.json", *(f"legs/m16-1243-look-scale2-{flavor}-agxoff.json" for flavor in ("cinematic", "film")))
+                "legs/m16-1243-look-scale2-film.json", *(f"legs/m16-1243-look-scale2-{flavor}-agxoff.json" for flavor in ("cinematic", "film")),
+                *(f"legs/m16-1243-display-{mode}-s{scale}-vsync1.json" for scale in (1, 2, 4) for mode in ("fullscreen", "windowed")))
+# PLAYBACK-VSYNC-DEFAULT-1: the swap-interval-1 twins of the six display-matrix legs (the vsync A/B; the originals stay at the app's default 0).
+VSYNC1_LEGS = tuple(rel.replace(".json", "-vsync1.json") for rel in DISPLAY_MATRIX_LEGS)
 # LOOK-ASSIST-FILM-FLAVOR-2 r2: the AgX-off twins of the scale-2 Cinematic and Film legs carry a committed look receipt (look-receipts/agx-off.marxml).
 AGXOFF_LEGS = {f"m16-1243-look-scale2-{flavor}-agxoff": f"m16-1243-look-scale2-{flavor}" for flavor in ("cinematic", "film")}
 LOOK_RECEIPT_BASE = "6b6f66f52d5344a97de5068b2e7cae1a61edf295"   # the #328 head whose generator, legs and runner this round extends
@@ -233,6 +236,11 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
     SESSION_LOCKED_OPEN = "VENUE-SESSION-LOCKED-REFUSAL-1 >>>"
     SESSION_LOCKED_CLOSE = "VENUE-SESSION-LOCKED-REFUSAL-1 <<<"
     SESSION_LOCKED_REGIONS = 32
+    # PLAYBACK-VSYNC-DEFAULT-1: the PresentMon SyncInterval/AllowsTearing counts Get-AttrCudaPresentMonDisplayReport adds (the generator splices the function into the
+    # default job verbatim). Four regions: the column flags, the two parsed-row fields, the per-chain counts and the selected-chain counts. Absent from the baseline.
+    PLAYBACK_VSYNC_OPEN = "PLAYBACK-VSYNC-DEFAULT-1 >>>"
+    PLAYBACK_VSYNC_CLOSE = "PLAYBACK-VSYNC-DEFAULT-1 <<<"
+    PLAYBACK_VSYNC_REGIONS = 4
 
     @classmethod
     def strip_regions(cls, text: str) -> tuple[str, dict[str, int]]:
@@ -241,7 +249,8 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
                     "orphan-sweep": (cls.ORPHAN_SWEEP_OPEN, cls.ORPHAN_SWEEP_CLOSE),
                     "contact-sheet-parity": (cls.CONTACT_SHEET_PARITY_OPEN, cls.CONTACT_SHEET_PARITY_CLOSE),
                     "keepalive-hung-probe": (cls.KEEPALIVE_HUNG_PROBE_OPEN, cls.KEEPALIVE_HUNG_PROBE_CLOSE),
-                    "session-locked": (cls.SESSION_LOCKED_OPEN, cls.SESSION_LOCKED_CLOSE)}
+                    "session-locked": (cls.SESSION_LOCKED_OPEN, cls.SESSION_LOCKED_CLOSE),
+                    "playback-vsync": (cls.PLAYBACK_VSYNC_OPEN, cls.PLAYBACK_VSYNC_CLOSE)}
         kept: list[str] = []
         inside: str | None = None
         counts = {name: 0 for name in families}
@@ -286,6 +295,8 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         self.assertEqual(old_counts["keepalive-hung-probe"], self.KEEPALIVE_HUNG_PROBE_REGIONS, "the baseline (the pinned KEEPALIVE-FAILURE-PUBLISH-LAST-1 generator commit) carries the same bracketed regions")
         self.assertEqual(new_counts["session-locked"], self.SESSION_LOCKED_REGIONS, "the default job carries exactly the pinned number of bracketed VENUE-SESSION-LOCKED-REFUSAL-1 regions")
         self.assertEqual(old_counts["session-locked"], self.SESSION_LOCKED_REGIONS, "the baseline (the pinned KEEPALIVE-FAILURE-PUBLISH-LAST-1 generator commit) carries the same bracketed regions")
+        self.assertEqual(new_counts["playback-vsync"], self.PLAYBACK_VSYNC_REGIONS, "the default job carries exactly the pinned number of bracketed PLAYBACK-VSYNC-DEFAULT-1 regions")
+        self.assertEqual(old_counts["playback-vsync"], 0, "the baseline predates PLAYBACK-VSYNC-DEFAULT-1")
         self.assertEqual(stripped, old_stripped,
                          "the DEFAULT (bachelor/cuda) emitted job changed outside the bracketed regions -- it must stay byte-identical to the pinned baseline")
 
@@ -451,6 +462,26 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
                                                             "-PlaybackRenderLookaheadFrames", "3"])
         self.assertEqual(self.parse_errors(la3), 0)
         self.assertIn("'MLVAPP_PLAYBACK_RENDER_LOOKAHEAD_FRAMES=3',", la3.read_text(encoding="utf-8"))
+
+    def test_a_swap_interval_reaches_the_apps_env_only_when_asked(self) -> None:
+        """PLAYBACK-VSYNC-DEFAULT-1: -SwapInterval 0|1 adds MLVAPP_SWAP_INTERVAL to the app's env list, for a look leg and the default job alike;
+        without it the job sets nothing (the app keeps its default 0)."""
+        plain = self.generate(GENERATOR, "plain.job.ps1", []).read_text(encoding="utf-8")
+        self.assertNotIn("MLVAPP_SWAP_INTERVAL", plain)
+        for interval in ("0", "1"):
+            for name, extra in (("default", []), ("look", ["-ForceLookAssist", "-ContactSheet", "-LookFlavor", "cinematic"]),
+                                ("windowed", ["-ForceLookAssist", "-ContactSheet", "-LookFlavor", "cinematic", "-DisplayMode", "windowed"])):
+                job = self.generate(GENERATOR, f"swap{interval}-{name}.job.ps1", [*extra, "-SwapInterval", interval])
+                self.assertEqual(self.parse_errors(job), 0, name)
+                text = job.read_text(encoding="utf-8")
+                self.assertEqual(text.count(f"'MLVAPP_SWAP_INTERVAL={interval}',"), 1, name)
+                self.assertIn(f"'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',\n    'MLVAPP_SWAP_INTERVAL={interval}',", text.replace("\r\n", "\n"), name)
+
+    def test_the_runner_passes_a_legs_swap_interval_to_the_generator(self) -> None:
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        self.assertIn("if ($spec.generatorArgs.PSObject.Properties['swapInterval']) { $gen['SwapInterval'] = [int]$spec.generatorArgs.swapInterval }", runner)
+        # not nested under the speed-leg forced-look branch: a look leg's swapInterval reaches the generator too
+        self.assertLess(runner.index("$gen['SwapInterval']"), runner.index("if (-not $isLook -and $spec.generatorArgs.PSObject.Properties['forceLookAssist']"))
 
     def test_the_runner_passes_a_speed_legs_forced_look_to_the_generator(self) -> None:
         runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
@@ -5044,6 +5075,25 @@ class LegSpecSchemaTests(unittest.TestCase):
             self.assertEqual(arm["generatorArgs"].pop("playbackRenderLookaheadFrames"), 3, rel)
             self.assertEqual(dict(arm, legId=base["legId"]), base, rel)
 
+    def test_each_vsync1_leg_is_its_display_matrix_cell_at_swap_interval_1(self) -> None:
+        """PLAYBACK-VSYNC-DEFAULT-1: a vsync1 twin differs from its display-matrix cell only in its legId, its card and
+        generatorArgs.swapInterval 1; the cell itself sets no swap interval (the app's default 0)."""
+        self.assertEqual(self.schema["properties"]["generatorArgs"]["properties"]["swapInterval"]["enum"], [0, 1])
+        for rel, base_rel in zip(VSYNC1_LEGS, DISPLAY_MATRIX_LEGS):
+            arm = json.loads((DV / rel).read_text(encoding="utf-8"))
+            self.jsonschema.validate(arm, self.schema)
+            base = json.loads((DV / base_rel).read_text(encoding="utf-8"))
+            self.assertNotIn("swapInterval", base["generatorArgs"], base_rel)
+            self.assertEqual(arm["generatorArgs"].pop("swapInterval"), 1, rel)
+            self.assertEqual(arm["legId"], Path(rel).stem, rel)
+            self.assertEqual(arm["card"], "PLAYBACK-VSYNC-DEFAULT-1", rel)
+            self.assertEqual(dict(arm, legId=base["legId"], card=base["card"]), base, rel)
+        for value in (2, -1, "1"):
+            bad = json.loads((DV / VSYNC1_LEGS[0]).read_text(encoding="utf-8"))
+            bad["generatorArgs"]["swapInterval"] = value
+            with self.assertRaises(self.jsonschema.ValidationError, msg=repr(value)):
+                self.jsonschema.validate(bad, self.schema)
+
     def test_the_heavy_leg_is_the_owner_shape_pace_leg_with_the_frame_log_kept(self) -> None:
         """PLAYBACK-BACHELOR-PRESENT-JITTER-1 r2: the stall-stage diagnostic differs from the owner-shape pace leg only in its legId and
         generatorArgs.telemetryArm HEAVY (the per-frame log a LIGHT leg disables)."""
@@ -5612,6 +5662,9 @@ class LookReceiptGeneratorTests(unittest.TestCase):
                 kept, new_counts = GeneratorByteIdentityAndVariantTests.strip_regions(new.decode("utf-8"))
                 old_kept, old_counts = GeneratorByteIdentityAndVariantTests.strip_regions(old.decode("utf-8"))
                 self.assertGreater(new_counts["session-locked"], 0)
+                # PLAYBACK-VSYNC-DEFAULT-1's regions postdate the base generator: present in the new job only, at their pinned count.
+                self.assertEqual((new_counts.pop("playback-vsync"), old_counts.pop("playback-vsync")),
+                                 (GeneratorByteIdentityAndVariantTests.PLAYBACK_VSYNC_REGIONS, 0), name)
                 self.assertEqual(new_counts, old_counts, f"{name}: the job without -LookReceiptPath carries the base generator's bracketed regions")
                 self.assertEqual(kept, old_kept, f"{name}: the job without -LookReceiptPath must be the base generator's bytes")
                 self.assertNotIn(b"LookReceipt", new)

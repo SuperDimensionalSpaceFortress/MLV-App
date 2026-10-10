@@ -1,0 +1,38 @@
+{
+  "schema": "mlv-app/dual-venue-leg/v1",
+  "legId": "m16-1243-display-windowed-s2-vsync1",
+  "card": "PLAYBACK-VSYNC-DEFAULT-1",
+  "legType": "look",
+  "clipId": "M16-1243",
+  "playSeconds": 25,
+  "backends": ["cuda", "cpu"],
+  "scaleFactor": 2,
+  "displayMode": "windowed",
+  "generatorArgs": { "telemetryArm": "LIGHT", "cpuQuiescenceThresholdPercent": 95, "swapInterval": 1 },
+  "timeouts": { "queueWaitSec": 900, "extraClaimedWaitSec": 600 },
+  "look": { "contactSheetFrames": 6, "lookFlavor": "cinematic" },
+  "criteria": {
+    "acceptance": {
+      "cuda": [
+        { "metric": "lookAssistForced", "op": "eq", "value": true },
+        { "metric": "gpuFramesTotal", "op": "gt", "value": 0 },
+        { "metric": "lookFlavorReported", "op": "eq", "value": "cinematic" }
+      ],
+      "cpu": [
+        { "metric": "lookAssistForced", "op": "eq", "value": true },
+        { "metric": "lookFlavorReported", "op": "eq", "value": "cinematic" }
+      ]
+    },
+    "supplementary": {
+      "cuda": [
+        { "metric": "lookAssistForced", "op": "eq", "value": true },
+        { "metric": "gpuFramesTotal", "op": "gt", "value": 0 },
+        { "metric": "lookFlavorReported", "op": "eq", "value": "cinematic" }
+      ],
+      "cpu": [
+        { "metric": "lookAssistForced", "op": "eq", "value": true },
+        { "metric": "lookFlavorReported", "op": "eq", "value": "cinematic" }
+      ]
+    }
+  }
+}

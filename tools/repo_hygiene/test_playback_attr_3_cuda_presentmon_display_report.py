@@ -704,6 +704,46 @@ class PresentModeBreakdownFixtureTests(_ReportCase):
 
 
 @requires_pwsh
+class SyncIntervalTearingBreakdownFixtureTests(_ReportCase):
+    """PLAYBACK-VSYNC-DEFAULT-1: every chain (and the PID-level selected chain) also carries
+    per-value counts of PresentMon's own SyncInterval and AllowsTearing columns, so a vsync A/B
+    leg names what the present REALLY asked for -- the app's swap-interval log is not proof."""
+
+    def test_the_mlvapp_chain_counts_sync_interval_and_allows_tearing_per_value(self) -> None:
+        rows = []
+        for i in range(5):
+            row = _real_csv_row(time_in_ms=5000 + i * 100)
+            row["SyncInterval"] = "0" if i < 3 else "1"
+            row["AllowsTearing"] = "1" if i < 3 else "0"
+            rows.append(row)
+        foreign = _real_csv_row(process_id=999, swap_chain="0xBBB", time_in_ms=6000)
+        foreign["Application"] = "dwm.exe"
+        rows.append(foreign)
+        path = self._write_csv(rows)
+
+        report = self.call(path, _result_json())
+
+        self.assertEqual(report["status"], "OK", report)
+        selected = report["selectedChain"]
+        self.assertEqual({m["syncInterval"]: m["count"] for m in selected["syncIntervals"]}, {"0": 3, "1": 2})
+        self.assertEqual({m["allowsTearing"]: m["count"] for m in selected["allowsTearing"]}, {"1": 3, "0": 2})
+        mlvapp_chain = next(c for c in report["chains"] if c["isMlvAppChain"])
+        self.assertEqual({m["syncInterval"]: m["count"] for m in mlvapp_chain["syncIntervals"]}, {"0": 3, "1": 2})
+        other = next(c for c in report["chains"] if not c["isMlvAppChain"])
+        self.assertEqual(other["syncIntervals"], [{"syncInterval": "0", "count": 1}])
+        self.assertEqual(other["allowsTearing"], [{"allowsTearing": "0", "count": 1}])
+
+    def test_a_capture_without_the_columns_reads_absent_not_a_failure(self) -> None:
+        path = self._write_csv([_csv_row(time_in_ms=5000 + i * 1000) for i in range(2)])
+
+        report = self.call(path, _result_json())
+
+        self.assertEqual(report["status"], "OK", report)
+        self.assertEqual(report["selectedChain"]["syncIntervals"], [{"syncInterval": "absent", "count": 2}])
+        self.assertEqual(report["selectedChain"]["allowsTearing"], [{"allowsTearing": "absent", "count": 2}])
+
+
+@requires_pwsh
 class PresentMonStatusFixtureTests(_ReportCase):
     """PRESENTMON-HARNESS-ROBUSTNESS-1/2(r1)/2(r1b): the job's own presentMonStatus/-Reason
     assignment, EXECUTED verbatim from playback-attr-3-cuda-job.ps1 (never hand-reimplemented)

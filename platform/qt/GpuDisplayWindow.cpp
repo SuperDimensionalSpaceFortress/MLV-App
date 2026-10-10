@@ -8,6 +8,7 @@
 #include "GpuDisplayWindow.h"
 #include "GpuDebayer.h"
 #include "PlaybackScaling.h"
+#include "PlaybackSwapInterval.h"
 #include "debug/StageTiming.h"
 #include "../../src/mlv_include.h"
 
@@ -320,6 +321,18 @@ void GpuDisplayWindow::noteRealSwap()
     }
 }
 
+void GpuDisplayWindow::noteSwapCall(double swapCallMs)
+{
+    if ( !swapTelemetryEnabled() ) return;
+    if ( !g_swapTelemetrySessionActive ) return;
+    if ( m_swapTelemetryCounters.swapCallSamplesMs.empty() )
+    {
+        m_swapTelemetryCounters.wglSwapIntervalAtFirstTimedSwap =
+            wglSwapIntervalActual(m_wglGetSwapIntervalExt);
+    }
+    m_swapTelemetryCounters.swapCallSamplesMs.push_back(swapCallMs);
+}
+
 void GpuDisplayWindow::noteSupersededBeforePaint(quint64 supersedingSerial)
 {
     if ( !swapTelemetryEnabled() ) return;
@@ -551,7 +564,7 @@ GpuDisplayWindow::GpuDisplayWindow(QWindow *parent)
     , m_loggedSetGpuTexture(false)
 {
     QSurfaceFormat fmt = format();
-    fmt.setSwapInterval(0);
+    fmt.setSwapInterval(playbackSwapInterval());
     setFormat(fmt);
 
     // Real swap path 1 of 3: Qt's own automatic swap after paintGL() returns, in its
@@ -1069,11 +1082,17 @@ bool GpuDisplayWindow::setPresentedGpuPlaybackReconAmazePostWbTexture(
     if ( paintPerSubmitEnabled() && isExposed() && isValid() )
     {
         paintGL();
+        const double swapCallStartMs = elapsedMs();
         glContext->swapBuffers(this);
+        const double swapCallMs = elapsedMs() - swapCallStartMs;
         // Real swap path 3 of 3: like grabPresentedFramebufferIfActive's manual swap (path 2),
         // this runs outside Qt's own paint-event cycle, so frameSwapped() (path 1) does
         // NOT fire for it -- record it explicitly so swap telemetry covers every real swap.
-        if ( swapTelemetryEnabled() ) noteRealSwap();
+        if ( swapTelemetryEnabled() )
+        {
+            noteSwapCall(swapCallMs);
+            noteRealSwap();
+        }
         paintedSynchronously = true;
     }
     if ( madeCurrent ) doneCurrent();
@@ -1283,6 +1302,8 @@ void GpuDisplayWindow::initializeGL()
             cleanupGLResources();
         }, Qt::UniqueConnection);
     }
+    // PLAYBACK-VSYNC-DEFAULT-1: refreshed on every (re)initialization, read with the context current.
+    m_wglGetSwapIntervalExt = context() ? context()->getProcAddress("wglGetSwapIntervalEXT") : nullptr;
 
     if ( m_loggedContext ) return;
 
@@ -1301,6 +1322,7 @@ void GpuDisplayWindow::initializeGL()
         << ", version=" << (version ? reinterpret_cast<const char *>(version) : "unknown")
         << ", requested_swap_interval=" << requestedSwapInterval
         << ", realized_swap_interval=" << realizedFormat.swapInterval()
+        << ", wgl_swap_interval_actual=" << wglSwapIntervalActual(m_wglGetSwapIntervalExt)
         << ").";
     m_loggedContext = true;
 }
