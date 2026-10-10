@@ -51,13 +51,14 @@
 #
 # MLV-AGENT-HEAVY-SLOT-GATE-2: an agent with a heavy-slot admission gate HOLDS a job before launching
 # it, and writes running\<id>.started.json with phase=admission-wait (childPid null) before it waits,
-# then rewrites it with phase=launched at launch. Such a job is neither unclaimed (it is never
-# RETRACTED: the agent owns it) nor claimed (the claimed clock starts only at phase=launched); this
-# client waits for it under its own -MaxAdmissionWaitSec, logging the agent heartbeat's gate-wait
-# state, and stops UNRESOLVED at that ceiling. Each poll reads the marker as exactly one of none |
-# admission-wait | launched | unknown; unknown (present but unreadable) is cannot-tell and is never
-# folded into none. A marker with no phase field (an agent older than GATE-2) reads as launched, so
-# such an agent sees exactly the behaviour it always did.
+# then phase=launching (childPid null) just before it creates the child, then phase=launched together
+# with the child's pid. Such a job is neither unclaimed (it is never RETRACTED: the agent owns it) nor
+# claimed (the claimed clock starts only at phase=launched); this client waits for it under its own
+# -MaxAdmissionWaitSec, logging the agent heartbeat's gate-wait state, and stops UNRESOLVED at that
+# ceiling. Each poll reads the marker as exactly one of none | admission-wait | launching | launched |
+# unknown; launching is handled exactly like admission-wait (claimed, not launched); unknown (present
+# but unreadable) is cannot-tell and is never folded into none. A marker with no phase field (an agent
+# older than GATE-2) reads as launched, so such an agent sees exactly the behaviour it always did.
 
 [CmdletBinding(DefaultParameterSetName = 'Script')]
 param(
@@ -215,6 +216,8 @@ function Get-UmRunClaimState {
     # MLV-AGENT-HEAVY-SLOT-GATE-2: one read of running\<id>.started.json, as exactly one of
     #   none           - no marker: unclaimed
     #   admission-wait - the agent holds the job in its admission gate; no child has been launched
+    #   launching      - the agent is about to create the child (agent r2b); not launched yet, so it is
+    #                    handled exactly like admission-wait and never starts the claimed clock
     #   launched       - phase=launched, NO phase field (an agent older than GATE-2), or a child pid
     #   unknown        - present but unreadable, unparseable or an unrecognised phase: CANNOT-TELL,
     #                    never folded into none (a marker exists, so the job is never retracted on it)
@@ -228,9 +231,9 @@ function Get-UmRunClaimState {
     if ($marker -isnot [System.Management.Automation.PSCustomObject]) { return 'unknown' }
     $phase = $marker.PSObject.Properties['phase']
     if ($null -eq $phase -or $phase.Value -eq 'launched') { return 'launched' }
-    if ($phase.Value -eq 'admission-wait') {
+    if ($phase.Value -eq 'admission-wait' -or $phase.Value -eq 'launching') {
         if ($null -ne $marker.childPid) { return 'launched' }
-        return 'admission-wait'
+        return $phase.Value
     }
     return 'unknown'
 }
@@ -262,7 +265,7 @@ while ($true) {
         if ($claimState -eq 'launched') {
             $claimedAt      = [DateTimeOffset]::Now
             $budgetDeadline = $claimedAt.AddSeconds($TimeoutSec)
-        } elseif ($claimState -eq 'admission-wait' -and $null -eq $admissionAt) {
+        } elseif ($claimState -in @('admission-wait', 'launching') -and $null -eq $admissionAt) {
             $admissionAt = [DateTimeOffset]::Now
         }
     }
@@ -310,7 +313,7 @@ while ($true) {
         }
     } elseif ($null -ne $admissionAt) {
         # ADMISSION phase (MLV-AGENT-HEAVY-SLOT-GATE-2): held by the agent's gate, not launched. Per
-        # poll: admitted (launched -> CLAIMED above, next iteration), still waiting (admission-wait),
+        # poll: admitted (launched -> CLAIMED above, next iteration), still waiting (admission-wait or launching),
         # or cannot-tell (unknown / none: no transition, this phase's own ceiling still applies).
         $now = [DateTimeOffset]::Now
         $gate = Get-UmRunGateWaitState -HeartbeatPath $hb -JobId $jobId
@@ -444,7 +447,7 @@ while ($true) {
             # never this client's assertion). Either way: never declare retraction or failure while
             # the job might already be running -- switch to the claimed wait (or, GATE-2, to the
             # admission wait when the late marker says the agent is holding it in its gate).
-            if ((Get-UmRunClaimState -Path $startedMarker) -eq 'admission-wait') {
+            if ((Get-UmRunClaimState -Path $startedMarker) -in @('admission-wait', 'launching')) {
                 $admissionAt = [DateTimeOffset]::Now
                 continue
             }

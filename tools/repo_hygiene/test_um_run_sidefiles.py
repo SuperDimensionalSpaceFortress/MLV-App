@@ -1731,6 +1731,35 @@ class UmRunAdmissionWaitTests(_Share):
         self.assertNotIn("RETRACTED", combined, combined)
         self.assertTrue((self.inbox / "demo.job.ps1").exists(), "the admission ceiling must not withdraw the job")
 
+    def test_a_launching_marker_is_claimed_not_launched_and_resolves_on_launch(self) -> None:
+        # Agent r2b writes phase=launching (childPid null) just before it creates the child. The client
+        # reads it as its own state (logged marker=launching, never cannot-tell) and handles it exactly
+        # like admission-wait: never retracted at the queue ceiling, and it never starts the claimed
+        # clock, so a launching marker held past -TimeoutSec + -MaxClaimedWaitSec does not stop the
+        # client at its outer ceiling. Once phase=launched (with a pid) lands, the receipt is returned.
+        proc = self.start("-TimeoutSec", "3", "-MaxClaimedWaitSec", "3", "-MaxQueueWaitSec", "2",
+                          "-MaxAdmissionWaitSec", "120")
+        try:
+            self.wait_for_drop(proc)
+            self.write_marker(json.dumps({"schema": "mlvapp.agent.started.v1", "jobId": "demo",
+                                          "phase": "launching", "status": "launching", "childPid": None}))
+            self.hold(proc, 9.0, state="clear")
+            self.assertIsNone(proc.poll(), "a launching marker must outlive the queue and claimed ceilings")
+            self.assertTrue((self.inbox / "demo.job.ps1").exists(), "a launching job must never be withdrawn")
+            self.write_marker(self.launched_marker())
+            self.touch_heartbeat(job_id="demo")
+            time.sleep(1.5)
+            self.publish_result()
+        except BaseException:
+            proc.kill()
+            raise
+        combined = self.finish(proc)
+        self.assertEqual(proc.returncode, 0, combined)
+        self.assertNotIn("RETRACTED", combined, combined)
+        self.assertNotIn("UNRESOLVED", combined, combined)
+        self.assertIn("marker=launching", combined, combined)
+        self.assertNotIn("marker=unknown", combined, combined)
+
     def test_a_marker_that_cannot_be_read_is_cannot_tell_never_retracted(self) -> None:
         # Cannot-tell is its own outcome: a present but unparseable marker past the queue ceiling is
         # never folded into "unclaimed". Once it reads as launched, the receipt is returned.
