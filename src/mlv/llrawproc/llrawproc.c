@@ -5522,7 +5522,7 @@ static int llrawproc_apply_with_dims_internal(mlvObject_t * video,
 
         publish_auto_correction = !has_explicit_auto_match;
 
-        int dual_iso_recon_ok =
+        const int dual_iso_recon_core_ok =
             (flags & LLRP_WITH_DIMS_GPU_PLAYBACK_TEXTURE)
             ? (!isolated_analysis
                && llrawproc_with_dims_gpu_playback_texture(video,
@@ -5570,24 +5570,26 @@ static int llrawproc_apply_with_dims_internal(mlvObject_t * video,
         /* CPU-DUALISO-REDUCED-ISO-NOTCH-1: the CPU reduced route's recon takes the
          * reduced ISO-period notch the CUDA reduced route runs as its last kernel.
          * A scratch that cannot be grown fails the call like a failed recon. */
-        if (dual_iso_recon_ok
+        int reduced_iso_notch_ok = 1;
+        if (dual_iso_recon_core_ok
             && (flags & LLRP_WITH_DIMS_REDUCED_ISO_NOTCH)
             && !(flags & LLRP_WITH_DIMS_GPU_PLAYBACK_TEXTURE))
         {
             const double notch_start = mlv_stage_timing_now();
-            dual_iso_recon_ok = llrawproc_worker_reduced_iso_notch(worker,
-                                                                   raw_image_buff,
-                                                                   override_w,
-                                                                   override_h);
+            reduced_iso_notch_ok = llrawproc_worker_reduced_iso_notch(worker,
+                                                                      raw_image_buff,
+                                                                      override_w,
+                                                                      override_h);
             const double notch_ms = (mlv_stage_timing_now() - notch_start) * 1000.0;
             dual_iso_ms += notch_ms;
-            if (dual_iso_recon_ok)
+            if (reduced_iso_notch_ok)
             {
                 __atomic_fetch_add(&g_llrawproc_reduced_iso_notch_frames, 1, __ATOMIC_RELAXED);
                 __atomic_fetch_add(&g_llrawproc_reduced_iso_notch_micros,
                                    (uint64_t)(notch_ms * 1000.0 + 0.5), __ATOMIC_RELAXED);
             }
         }
+        const int dual_iso_recon_ok = dual_iso_recon_core_ok && reduced_iso_notch_ok;
 
         if (!dual_iso_recon_ok)
         {
