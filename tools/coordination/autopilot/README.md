@@ -14,6 +14,14 @@ the same loop by supplying its own `board-profile.json`.
 
 Tests: `tests/coordination/test_autopilot_board_ff.py` (throwaway local repos only).
 
+## Tracked now (PRODUCT-SHARE-BIND-1)
+
+| File | What it is |
+|---|---|
+| `product-share.ps1` | Hub-tick step that binds `Test-ProductRatioGuard.ps1`: runs it under a hard deadline, caches a `mlv-app/product-share-verdict/v1` verdict (GREEN, RED or UNKNOWN), and exposes `Get-ProductSlotPlan` (RED with a product card due reserves a product slot and caps incident/hub-tooling lanes at one). Always exits 0: the verdict never changes a caller's exit code. `-Detach` refreshes a stale cache with a hidden worker, because the guard was measured at 529 s on the board. |
+
+Tests: `tests/coordination/test_autopilot_product_share.py` (fake guards only). Not yet wired into the live beat; the staged patch is in the PR.
+
 ## Profile schema (`board-profile.v1`)
 
 All keys are required; a string or array must be non-empty.
