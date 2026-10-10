@@ -81,18 +81,21 @@ class TempWorld(unittest.TestCase):
             params[name] = True
         return params
 
-    def invoke_ff(self, params, tail):
-        """Run board-ff.ps1 with a hashtable splat; tail is a pwsh snippet that prints the result."""
+    def invoke_ff(self, params, tail, prelude=''):
+        """Run board-ff.ps1 with a hashtable splat; tail is a pwsh snippet that prints the result.
+
+        prelude is a pwsh snippet run first (a seam: it may define a global git function)."""
         env = dict(self.env, BFF_SCRIPT=str(BOARD_FF), BFF_ARGS=json.dumps(params))
-        cmd = '$p = ConvertFrom-Json $env:BFF_ARGS -AsHashtable; $r = & $env:BFF_SCRIPT @p; ' + tail
+        cmd = prelude + '; $p = ConvertFrom-Json $env:BFF_ARGS -AsHashtable; $r = & $env:BFF_SCRIPT @p; ' + tail
         r = subprocess.run(PWSH + ['-Command', cmd], text=True, capture_output=True, env=env)
         self.assertEqual(r.returncode, 0, f'pwsh failed: {r.stderr}\n{r.stdout}')
         return r.stdout.strip().splitlines()[-1]
 
-    def run_ff(self, *extra, **kw):
+    def run_ff(self, *extra, prelude='', **kw):
         """Run board-ff.ps1 against the board clone; returns the result object or None."""
         line = self.invoke_ff(self.ff_params(*extra, **kw),
-                              "if ($null -eq $r) { 'null' } else { $r | ConvertTo-Json -Compress -EscapeHandling EscapeNonAscii }")
+                              "if ($null -eq $r) { 'null' } else { $r | ConvertTo-Json -Compress -EscapeHandling EscapeNonAscii }",
+                              prelude=prelude)
         return None if line == 'null' else json.loads(line)
 
     def assert_refused_unless_mover(self, res):
@@ -195,6 +198,34 @@ class BoardFfScenarioTests(TempWorld):
         self.assertEqual(res['Result'], 'refused')
         self.assertTrue(res['Reason'].startswith('dirty-tracked (1 path(s))'), res['Reason'])
         self.assertEqual(self.head(self.board), before)
+
+    def test_target_is_pinned_to_the_checked_commit_against_a_concurrent_fetch(self):
+        # Catalogue row: safe target A is checked, then a concurrent fetch advances origin/master to B,
+        # which changes an owned hook. The merge must land A only (or refuse), never B.
+        self.commit(self.upstream, 'src/a.cpp', 'x\n', 'A: safe change')
+        a_sha = self.head(self.upstream)
+        self.git(self.upstream, 'checkout', '-q', '-b', 'race')
+        self.commit(self.upstream, 'tools/hooks/h.ps1', 'changed\n', 'B: owned hook change')
+        self.git(self.upstream, 'checkout', '-q', 'master')
+        self.git(self.board, 'fetch', '-q', 'origin', 'race:refs/heads/race-b')
+        b_sha = self.git(self.board, 'rev-parse', 'refs/heads/race-b')
+        self.assertNotEqual(a_sha, b_sha)
+        before = self.head(self.board)
+        # Seam: the instant the script starts its merge, the remote ref is moved to B, as a
+        # concurrent fetch would. A merge by ref name then lands B; a merge by pinned SHA lands A.
+        self.env['BFF_RACE_SHA'] = b_sha
+        prelude = ("function global:git { if ($args.Count -ge 3 -and $args[2] -eq 'merge') "
+                   "{ & git.exe -C $args[1] update-ref refs/remotes/origin/master $env:BFF_RACE_SHA }; & git.exe @args }")
+        res = self.run_ff(prelude=prelude)
+        self.assert_refused_unless_mover(res)
+        after = self.head(self.board)
+        self.assertNotEqual(after, b_sha, f'the board was moved to the unchecked commit B: {res}')
+        self.assertEqual(self.git(self.board, 'rev-parse', 'refs/remotes/origin/master'), b_sha,
+                         'the seam did not advance the remote ref; the test proves nothing')
+        self.assertEqual(res['Result'], 'ok', res)
+        self.assertEqual(after, a_sha)
+        self.assertEqual(res['Sha'], a_sha, 'the result must report the pinned SHA')
+        self.assertNotEqual(after, before)
 
     def test_interval_skips_without_force(self):
         first = self.run_ff()

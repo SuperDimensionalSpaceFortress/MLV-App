@@ -4,7 +4,9 @@
 # parameter always wins. StateFile and ScratchDir never default to a tracked path: they default to <ScratchDir> =
 # $env:BOARD_FF_SCRATCH, else <temp>\board-ff-<project>, and StateFile = <ScratchDir>\board-ff-state.json.
 # Called by a scheduler at most once per MinIntervalSec (own state file). Returns one object:
-#   Result (ok|current|refused), Reason, From, To, Line = "BOARD-FF <result> <reason> from=<sha8> to=<sha8>"   ($null when skipped by the interval)
+#   Result (ok|current|refused), Reason, From, To, Sha, Line = "BOARD-FF <result> <reason> from=<sha8> to=<sha8>"   ($null when skipped by the interval)
+# The target ref is resolved once, right after the fetch, to a full commit SHA (Sha); every check, the merge and the final
+# verification use that SHA, so a concurrent fetch that moves the ref cannot change what is merged.
 # Refuses (never moves the board) when: fetch fails or exceeds FetchTimeoutSec (the git child is killed); not on <branch>; tracked changes;
 # HEAD is not an ancestor of <remote>/<branch> (diverged); the ff would change a profile boardOwnedPaths entry (tools/hooks, .claude or
 # CLAUDE.md for MLV; that stays with refresh-hook-receipt.ps1, which re-pins the hook receipt); a merge-enqueue.ps1 / refresh-hook-receipt.ps1
@@ -43,14 +45,20 @@ function Invoke-BoardGit([string[]]$GitArgs) {
     $oldEnc = [Console]::OutputEncoding
     try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) } catch {}
     try { $o = & git -C $Board @GitArgs 2>&1 } finally { try { [Console]::OutputEncoding = $oldEnc } catch {} }
-    [pscustomobject]@{ Code = $LASTEXITCODE; Out = (@($o) | ForEach-Object { "$_" }) -join "`n" }
+    $code = $LASTEXITCODE
+    # stderr stays out of Out: a warning at exit 0 must never be read as a path or a status line.
+    [pscustomobject]@{
+        Code = $code
+        Out  = (@($o | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] }) | ForEach-Object { "$_" }) -join "`n"
+        Err  = (@($o | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] }) | ForEach-Object { "$_" }) -join "`n"
+    }
 }
 function Get-Sha8([string]$Rev) {
     $r = Invoke-BoardGit @('rev-parse', '--short=8', '--verify', '--quiet', "$Rev^{commit}")
     if ($r.Code -eq 0) { $r.Out.Trim() } else { '?' }
 }
-function New-Result([string]$Result, [string]$Reason, [string]$From, [string]$To) {
-    [pscustomobject]@{ Result = $Result; Reason = $Reason; From = $From; To = $To; Line = "BOARD-FF $Result $Reason from=$From to=$To" }
+function New-Result([string]$Result, [string]$Reason, [string]$From, [string]$To, [string]$Sha = '') {
+    [pscustomobject]@{ Result = $Result; Reason = $Reason; From = $From; To = $To; Sha = $Sha; Line = "BOARD-FF $Result $Reason from=$From to=$To" }
 }
 
 $target = "$Remote/$Branch"
@@ -81,38 +89,43 @@ try {
     }
 } finally { $env:GIT_TERMINAL_PROMPT = $oldPrompt }
 
-$to = Get-Sha8 $target
-if ($to -eq '?') { return (New-Result 'refused' "no-target-ref ($target)" $from $to) }
+# Pin the target ONCE, to a full commit SHA. The ref name is mutable (a concurrent fetch can move it), so every check below, the merge
+# and the verification use this SHA and never the name.
+$pinR = Invoke-BoardGit @('rev-parse', '--verify', '--quiet', "$target^{commit}")
+$pin = $pinR.Out.Trim()
+if ($pinR.Code -ne 0 -or -not $pin) { return (New-Result 'refused' "no-target-ref ($target)" $from '?') }
+if ($pin -notmatch '^[0-9a-f]{40}$') { return (New-Result 'refused' "target-sha-invalid ($target resolved to '$pin')" $from '?') }
+$to = $pin.Substring(0, 8)
 
 # 2. Local-drift and board-owned-path refusals.
 $br = (Invoke-BoardGit @('branch', '--show-current')).Out.Trim()
-if ($br -ne $Branch) { return (New-Result 'refused' "wrong-branch (on '$br', need $Branch)" $from $to) }
+if ($br -ne $Branch) { return (New-Result 'refused' "wrong-branch (on '$br', need $Branch)" $from $to $pin) }
 $st = Invoke-BoardGit @('status', '--porcelain', '-z', '--untracked-files=no')
-if ($st.Code -ne 0) { return (New-Result 'refused' 'status-failed' $from $to) }
-if ($st.Out.Trim("`0", ' ', "`r", "`n")) { $n = @($st.Out -split "`0" | Where-Object { $_ -match '^[ MADRCTU?!]{2} ' }).Count; return (New-Result 'refused' "dirty-tracked ($n path(s))" $from $to) }
-if ((Invoke-BoardGit @('merge-base', '--is-ancestor', 'HEAD', $target)).Code -ne 0) { return (New-Result 'refused' "diverged (HEAD is not an ancestor of $target)" $from $to) }
-$hk = Invoke-BoardGit (@('diff', '--name-only', '-z', 'HEAD', $target, '--') + @($prof.boardOwnedPaths))
-if ($hk.Code -ne 0) { return (New-Result 'refused' 'hook-diff-failed' $from $to) }
+if ($st.Code -ne 0) { return (New-Result 'refused' 'status-failed' $from $to $pin) }
+if ($st.Out.Trim("`0", ' ', "`r", "`n")) { $n = @($st.Out -split "`0" | Where-Object { $_ -match '^[ MADRCTU?!]{2} ' }).Count; return (New-Result 'refused' "dirty-tracked ($n path(s))" $from $to $pin) }
+if ((Invoke-BoardGit @('merge-base', '--is-ancestor', 'HEAD', $pin)).Code -ne 0) { return (New-Result 'refused' "diverged (HEAD is not an ancestor of $target)" $from $to $pin) }
+$hk = Invoke-BoardGit (@('diff', '--name-only', '-z', 'HEAD', $pin, '--') + @($prof.boardOwnedPaths))
+if ($hk.Code -ne 0) { return (New-Result 'refused' 'hook-diff-failed' $from $to $pin) }
 $hkFiles = @($hk.Out -split "`0" | Where-Object { $_.Trim() })
 if ($hkFiles.Count -gt 0) {
     $shown = ($hkFiles | Select-Object -First 5) -join ','
-    return (New-Result 'refused' "hook-change-pending (left to refresh-hook-receipt.ps1; $($hkFiles.Count) file(s): $shown$(if ($hkFiles.Count -gt 5) { ',...' }))" $from $to)
+    return (New-Result 'refused' "hook-change-pending (left to refresh-hook-receipt.ps1; $($hkFiles.Count) file(s): $shown$(if ($hkFiles.Count -gt 5) { ',...' }))" $from $to $pin)
 }
-if ((Invoke-BoardGit @('rev-parse', 'HEAD')).Out.Trim() -eq (Invoke-BoardGit @('rev-parse', $target)).Out.Trim()) { return (New-Result 'current' 'HEAD == target' $from $to) }
+if ((Invoke-BoardGit @('rev-parse', 'HEAD')).Out.Trim() -eq $pin) { return (New-Result 'current' 'HEAD == target' $from $to $pin) }
 
 # 3. Another board mover is alive: do nothing, so two actors never move the board at once.
 $movers = @(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object {
         $_.ProcessId -ne $PID -and $_.Name -match '^(pwsh|powershell)\.exe$' -and $_.CommandLine -match '(?i)[\\/''"\s](merge-enqueue|refresh-hook-receipt)\.ps1'
     })
-if ($movers.Count -gt 0) { return (New-Result 'refused' "mover-alive (pid $(($movers | ForEach-Object ProcessId) -join ','))" $from $to) }
+if ($movers.Count -gt 0) { return (New-Result 'refused' "mover-alive (pid $(($movers | ForEach-Object ProcessId) -join ','))" $from $to $pin) }
 
-# 4. Fast-forward and verify.
-if ($WhatIf) { return (New-Result 'ok' 'would-ff (WhatIf, board untouched)' $from $to) }
-$mg = Invoke-BoardGit @('merge', '--ff-only', $target)
+# 4. Fast-forward to the pinned SHA and verify HEAD is exactly there.
+if ($WhatIf) { return (New-Result 'ok' 'would-ff (WhatIf, board untouched)' $from $to $pin) }
+$mg = Invoke-BoardGit @('merge', '--ff-only', $pin)
 $after = Get-Sha8 'HEAD'
-$same = (Invoke-BoardGit @('rev-parse', 'HEAD')).Out.Trim() -eq (Invoke-BoardGit @('rev-parse', $target)).Out.Trim()
+$same = (Invoke-BoardGit @('rev-parse', 'HEAD')).Out.Trim() -eq $pin
 if ($mg.Code -ne 0 -or -not $same) {
-    $why = ($mg.Out -replace '\s+', ' '); if ($why.Length -gt 120) { $why = $why.Substring(0, 120) }
-    return (New-Result 'refused' "merge-failed exit=$($mg.Code) head-not-at-target $why" $from $after)
+    $why = ((@($mg.Out, $mg.Err) -join ' ') -replace '\s+', ' '); if ($why.Length -gt 120) { $why = $why.Substring(0, 120) }
+    return (New-Result 'refused' "merge-failed exit=$($mg.Code) head-not-at-target $why" $from $after $pin)
 }
-New-Result 'ok' "fast-forwarded to $target" $from $after
+New-Result 'ok' "fast-forwarded to $target" $from $after $pin

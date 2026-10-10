@@ -10,7 +10,7 @@ the same loop by supplying its own `board-profile.json`.
 |---|---|
 | `board-profile.json` | The MLV profile (schema below). |
 | `BoardProfile.psm1` | `Get-BoardProfile [-Path]`: loads the profile, throws `BoardProfileMissingKeyException` (key absent or empty) or `BoardProfileUnreadableException` (file absent or not JSON). |
-| `board-ff.ps1` | Fast-forward of the board checkout to `<remote>/<branch>`. Same behaviour and result object as the live copy. |
+| `board-ff.ps1` | Fast-forward of the board checkout to `<remote>/<branch>`. Same behaviour as the live copy, plus a pinned target SHA (result field `Sha`) that the live copy lacks until the cutover. |
 
 Tests: `tests/coordination/test_autopilot_board_ff.py` (throwaway local repos only).
 
