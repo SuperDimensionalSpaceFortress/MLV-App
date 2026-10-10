@@ -372,7 +372,11 @@ param(
     # (a normal maximized window with chrome; PR #248) to the smoke runner's -AdditionalArgs. 'fullscreen' (the default) adds nothing: the emitted job is the
     # text it was before this parameter (the windowed statements are added to the expanded text below, only for a windowed leg).
     [ValidateSet('fullscreen', 'windowed')]
-    [string]$DisplayMode = 'fullscreen'
+    [string]$DisplayMode = 'fullscreen',
+
+    # PLAYBACK-VSYNC-DEFAULT-1: the GL swap interval every playback surface requests (passed to the app as MLVAPP_SWAP_INTERVAL, the
+    # vsync A/B), any leg type. -1 (the default) sets nothing: the emitted job is the text it was before this parameter.
+    [ValidateRange(-1, 1)][int]$SwapInterval = -1
 )
 
 $ErrorActionPreference = 'Stop'
@@ -4329,6 +4333,17 @@ if ($DisplayMode -eq 'windowed') {
     })
 }
 
+# PLAYBACK-VSYNC-DEFAULT-1: a swap-interval leg adds MLVAPP_SWAP_INTERVAL to the app's env list, on the expanded text and only when asked
+# (like --windowed above), so every other job is the text it always was. The anchor must match exactly once, or the generator throws.
+if ($SwapInterval -ge 0) {
+    $swapAnchor = [regex]"(?<ind>[ \t]*)'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',(?<nl>\r?\n)"
+    if ($swapAnchor.Matches($text).Count -ne 1) { throw 'DUAL_VENUE_SWAP_INTERVAL_ANCHOR_MISSING the job template has no single env-list site to add MLVAPP_SWAP_INTERVAL to' }
+    $text = $swapAnchor.Replace($text, [System.Text.RegularExpressions.MatchEvaluator]{
+        param($m)
+        $m.Value + $m.Groups['ind'].Value + "'MLVAPP_SWAP_INTERVAL=$SwapInterval'," + $m.Groups['nl'].Value
+    })
+}
+
 $outDir = Split-Path -Parent $OutFile
 if ($outDir -and -not (Test-Path -LiteralPath $outDir)) { New-Item -ItemType Directory -Path $outDir -Force | Out-Null }
 [IO.File]::WriteAllText($OutFile, $text, [Text.UTF8Encoding]::new($false))
@@ -4356,6 +4371,7 @@ $clipContentSha256 = if ($isFixtureRehearsal) {
     playSeconds = $PlaySeconds
     fixtureRehearsal = $isFixtureRehearsal
     displayMode = $DisplayMode
+    swapInterval = $(if ($SwapInterval -ge 0) { $SwapInterval } else { $null })
     # DUAL-VENUE-EVIDENCE-1: what this generation was authored for (not part of the emitted job's bytes).
     venue = $Venue
     backend = $Backend

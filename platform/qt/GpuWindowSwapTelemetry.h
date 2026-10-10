@@ -63,6 +63,15 @@ struct GpuWindowSwapTelemetryCounters
     // running scalar as each sample arrives. Reset along with every other counter here
     // (GpuDisplayWindow::resetSwapTelemetry() replaces the whole counters struct).
     std::vector<double> newFrameGapSamplesMs;
+
+    // PLAYBACK-VSYNC-DEFAULT-1: wall time of the paint-per-submit swapBuffers() call itself
+    // (real swap path 3, the playback path), one sample per timed swap -- where a vsync wait
+    // is paid at swap interval 1, and what returns at once at interval 0. Qt's own automatic
+    // swap (path 1) and the capture swap (path 2) are not timed.
+    std::vector<double> swapCallSamplesMs;
+    // wglGetSwapIntervalEXT read with the context current at the session's first timed swap:
+    // -1 = the entry point is unavailable, -2 = no timed swap happened.
+    int wglSwapIntervalAtFirstTimedSwap = -2;
 };
 
 /*! \brief Derived, report-ready swap-cadence numbers for one playback smoke session's
@@ -103,6 +112,13 @@ struct GpuWindowSwapTelemetrySummary
     quint64 newFrameMaxGapBeforePresentedSerial = 0;
     quint64 newFrameMaxGapAfterPresentedSerial = 0;
     double newFrameP95GapMs = 0.0;
+
+    // See GpuWindowSwapTelemetryCounters::swapCallSamplesMs. All 0 when no swap was timed.
+    quint64 swapCallCount = 0;
+    double swapCallAvgMs = 0.0;
+    double swapCallP95Ms = 0.0;
+    double swapCallMaxMs = 0.0;
+    int wglSwapIntervalAtFirstTimedSwap = -2;
 };
 
 /*! \brief What GpuDisplayWindow::swapTelemetrySnapshot() hands back to a caller (e.g. the
@@ -212,20 +228,37 @@ public:
         {
             gapSamplesMs.push_back( newFrameTailGapMs );
         }
-        if ( !gapSamplesMs.empty() )
+        summary.newFrameP95GapMs = nearestRankP95( gapSamplesMs );
+
+        summary.swapCallCount = counters.swapCallSamplesMs.size();
+        summary.wglSwapIntervalAtFirstTimedSwap = counters.wglSwapIntervalAtFirstTimedSwap;
+        if ( !counters.swapCallSamplesMs.empty() )
         {
-            // Nearest-rank p95: sort ascending, take the ceil(0.95 * N)-th sample
-            // (1-based), clamped so a 1-sample vector returns that sample rather than
-            // reading past the end.
-            std::sort( gapSamplesMs.begin(), gapSamplesMs.end() );
-            const std::size_t rank = static_cast<std::size_t>(
-                std::ceil( 0.95 * static_cast<double>( gapSamplesMs.size() ) ) );
-            const std::size_t index = std::min(
-                gapSamplesMs.size() - 1,
-                rank == 0 ? static_cast<std::size_t>( 0 ) : rank - 1 );
-            summary.newFrameP95GapMs = gapSamplesMs[index];
+            double totalMs = 0.0;
+            for ( const double ms : counters.swapCallSamplesMs )
+            {
+                totalMs += ms;
+                summary.swapCallMaxMs = qMax( summary.swapCallMaxMs, ms );
+            }
+            summary.swapCallAvgMs = totalMs / static_cast<double>( counters.swapCallSamplesMs.size() );
+            summary.swapCallP95Ms = nearestRankP95( counters.swapCallSamplesMs );
         }
         return summary;
+    }
+
+    /*! \brief Nearest-rank p95: sort ascending, take the ceil(0.95 * N)-th sample (1-based),
+     *  clamped so a 1-sample vector returns that sample rather than reading past the end.
+     *  0 for an empty vector. */
+    static double nearestRankP95( std::vector<double> samples )
+    {
+        if ( samples.empty() ) return 0.0;
+        std::sort( samples.begin(), samples.end() );
+        const std::size_t rank = static_cast<std::size_t>(
+            std::ceil( 0.95 * static_cast<double>( samples.size() ) ) );
+        const std::size_t index = std::min(
+            samples.size() - 1,
+            rank == 0 ? static_cast<std::size_t>( 0 ) : rank - 1 );
+        return samples[index];
     }
 
     /*! \brief Pure predicate, extracted so the invariant itself (not just its accumulated
