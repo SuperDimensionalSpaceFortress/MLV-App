@@ -267,7 +267,7 @@ class FlavorDiffComposeTests(FlavorDiffHarness):
 
 
 # LOOK-ASSIST-FILM-FLAVOR-1: the three-side mode (Classic | Cinematic | Film) ------------------------------------------------------------
-FILM = dict(CINEMATIC, presetGrade="film-v2")
+FILM = dict(CINEMATIC, presetGrade="film-v3")
 BASE_COMMIT = "1581f29e57d5a636fc84656400f778f63ec9a406"
 
 
@@ -361,7 +361,7 @@ class FlavorTrioComposeTests(FlavorTrioHarness):
         self.assertEqual(m["schema"], "mlv-app/look-flavor-diff-metrics/v2")
         self.assertIs(m["flavorLive"], True)
         self.assertIs(m["filmLive"], True)
-        self.assertEqual(m["presetGrade"], {"classic": "none", "cinematic": "none", "film": "film-v2"})
+        self.assertEqual(m["presetGrade"], {"classic": "none", "cinematic": "none", "film": "film-v3"})
         want = {"MAD": {"cinematic_classic": [], "film_classic": [], "film_cinematic": []}, "dS": {"cinematic": [], "film": []},
                 "dGA": {"cinematic": [], "film": []}}
         for t, i in zip(m["tiles"], (0, 1)):
@@ -387,7 +387,7 @@ class FlavorTrioComposeTests(FlavorTrioHarness):
         self.assertAlmostEqual(m["means"]["dSGapFilmMinusCinematic"], float(np.mean(want["dS"]["film"]) - np.mean(want["dS"]["cinematic"])), delta=1e-6)
         # The synthetic grade really is a split (blue up in the shadows, red up in the highlights), so S rises.
         self.assertGreater(m["means"]["dSGapFilmMinusCinematic"], 4.0)
-        self.assertIn("| presetGrade | none | none | film-v2 |", (out / "table.md").read_text(encoding="utf-8"))
+        self.assertIn("| presetGrade | none | none | film-v3 |", (out / "table.md").read_text(encoding="utf-8"))
 
     def test_a_trio_into_an_occupied_out_dir_is_refused(self) -> None:
         for name in ("sheet-classic-cinematic-film.png", "heat-film-vs-cinematic-01.png", "metrics.json"):
@@ -459,9 +459,9 @@ class FlavorTrioComposeTests(FlavorTrioHarness):
         self.assertEqual(outputs[0][0], outputs[1][0])
 
     def test_the_two_side_and_trio_outputs_are_byte_identical_to_the_film_v1_merge_tool(self) -> None:
-        """LOOK-ASSIST-FILM-FLAVOR-2 adds the regrade mode and renames the grade id; the two-side and trio outputs are otherwise the tool's at the
-        #319 merge (758e978e), byte for byte. The base tool's FILM_GRADE_ID is set to film-v2 in memory (the one intended change), so both
-        accept the same Film side."""
+        """LOOK-ASSIST-FILM-FLAVOR-2 and -3 add the regrade mode and rename the grade id; the two-side and trio outputs are otherwise the tool's
+        at the #319 merge (758e978e), byte for byte. The base tool's FILM_GRADE_ID is set to film-v3 in memory (the one intended change), so
+        both accept the same Film side."""
         base_dir = self.tmp / "v1-merge-tool"
         base_dir.mkdir()
         for rel in ("tools/profiling/look-flavor-diff.py", "tools/profiling/make-contact-sheet.py"):
@@ -471,7 +471,7 @@ class FlavorTrioComposeTests(FlavorTrioHarness):
             data = show.stdout
             if rel.endswith("look-flavor-diff.py"):
                 self.assertEqual(data.count(b'FILM_GRADE_ID = "film-v1"'), 1)
-                data = data.replace(b'FILM_GRADE_ID = "film-v1"', b'FILM_GRADE_ID = "film-v2"')
+                data = data.replace(b'FILM_GRADE_ID = "film-v1"', b'FILM_GRADE_ID = "film-v3"')
             (base_dir / Path(rel).name).write_bytes(data)
         tiles = {"classic": {0: tile(70), 1: tile(71, letterbox=4)}, "cinematic": {0: tile(72), 1: tile(73, letterbox=4)}}
         tiles["film"] = {i: graded(a) for i, a in tiles["cinematic"].items()}
@@ -548,7 +548,7 @@ def independent_regrade(arr, data):
 
 class FlavorRegradeHarness(FlavorDiffHarness):
     def run_regrade(self, tiles: dict, v1: bytes | None, v2: bytes | None, *, state=STATE_OFF, film: dict | None = None,
-                    frames: dict | None = None, extra=(), out_dir: Path | None = None):
+                    frames: dict | None = None, extra=(), out_dir: Path | None = None, v3: bytes | None = None, tool: Path = TOOL):
         self.runs += 1
         run = self.tmp / f"regrade{self.runs}"
         stage = run / ".claude-state" / "stage"
@@ -560,9 +560,13 @@ class FlavorRegradeHarness(FlavorDiffHarness):
             paths[name] = stage / f"film-{name}-shade.u16"
             if data is not None:
                 paths[name].write_bytes(data)
-        args = [sys.executable, str(TOOL), "regrade", "--cinematic-frames", str(cin_dir), "--cinematic-listed", str(cin_list),
+        args = [sys.executable, str(tool), "regrade", "--cinematic-frames", str(cin_dir), "--cinematic-listed", str(cin_list),
                 "--cinematic-state", str(state_path), "--v1-table", str(paths["v1"]), "--v2-table", str(paths["v2"]),
                 "--cinematic-receipt-id", "r-cinematic", "--clip-id", "M16-1243", "--venue", "bachelor", "--build-sha", "0123456789ab"]
+        if v3 is not None:
+            paths["v3"] = stage / "film-v3-shade.u16"
+            paths["v3"].write_bytes(v3)
+            args += ["--v3-table", str(paths["v3"])]
         if film is not None:
             fd, fl = self.make_side(stage, "film", film, (frames or {}).get("film"))
             args += ["--film-frames", str(fd), "--film-listed", str(fl), "--film-receipt-id", "r-film"]
@@ -756,6 +760,230 @@ class WarmCoolMetricTests(WarmCoolHarness):
         cap = self.lean_doc({}, {0: tile0})["capture"]
         self.assertAlmostEqual(cap["meanLean"], 50 / 255, delta=1e-12)
         self.assertEqual(cap["tiles"][0]["rows_used"], H - 8)
+
+
+# LOOK-ASSIST-FILM-FLAVOR-3: the optional v3 column of the regrade mode, and the warm-cool guard --------------------------------------------
+WARMTH_MEASURE_MERGE = "5757fc6674ac022dcc95d86b2b1a0417a72629be"   # #358: the tool as it was before this card
+
+
+def independent_lean(arr):
+    """mean((R + G) / 2 - B) / 255, computed independently."""
+    import numpy as np
+    f = arr.reshape(-1, 3).astype(np.float64) / 255.0
+    return float(((f[:, 0] + f[:, 1]) / 2.0 - f[:, 2]).mean())
+
+
+def merged_tool(test, tmp: Path, name: str) -> Path:
+    """The look-flavor-diff.py (and its make-contact-sheet.py) as #358 merged them, written under `tmp`; skips on a shallow clone."""
+    base_dir = tmp / name
+    base_dir.mkdir()
+    for rel in ("tools/profiling/look-flavor-diff.py", "tools/profiling/make-contact-sheet.py"):
+        show = subprocess.run(["git", "-C", str(ROOT), "show", f"{WARMTH_MEASURE_MERGE}:{rel}"], capture_output=True, timeout=60)
+        if show.returncode != 0:
+            test.skipTest(f"base commit {WARMTH_MEASURE_MERGE[:12]} is not in this clone (shallow checkout)")
+        (base_dir / Path(rel).name).write_bytes(show.stdout)
+    return base_dir / "look-flavor-diff.py"
+
+
+@requires_imaging
+class RegradeV3Tests(FlavorRegradeHarness):
+    def test_the_v3_column_gives_the_independently_computed_regrade_metrics_ratio_and_dlean(self) -> None:
+        import numpy as np
+        from PIL import Image
+        cin = {0: tile(86), 1: tile(87, letterbox=3)}
+        film = {i: graded(a) for i, a in cin.items()}
+        tables = {"v1": known_tables(lift=300, split=900), "v2": known_tables(lift=1300, split=2300), "v3": known_tables(lift=1300, split=1600)}
+        proc, out = self.run_regrade(cin, tables["v1"], tables["v2"], v3=tables["v3"], film=film,
+                                     frames={"cinematic": {0: 30, 1: 70}, "film": {0: 30, 1: 99}})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("dSv3=", proc.stdout)
+        self.assertFalse((out / "regrade-cinematic-v1-v2.png").exists())
+        with Image.open(out / "regrade-cinematic-v1-v2-v3.png") as sheet:
+            self.assertEqual(sheet.size, (3840, 220 + 2 * (44 + round(960 * H / W))))
+        m = json.loads((out / "regrade-metrics.json").read_text(encoding="utf-8"))
+        self.assertEqual(m["sheet"], "regrade-cinematic-v1-v2-v3.png")
+        self.assertEqual(sorted(m["tables"]), ["v1", "v2", "v3"])
+        ds, dlean = {v: [] for v in tables}, {v: [] for v in tables}
+        for t, i in zip(m["tiles"], (0, 1)):
+            keep = ~(independent_luma(cin[i]).max(axis=1) <= 2.0)
+            s_c, _ = independent_split_and_green(cin[i][keep])
+            for v, data in tables.items():
+                expected = independent_regrade(cin[i], data)
+                with Image.open(out / f"regrade-{v}-{i:02d}.png") as im:
+                    self.assertTrue(np.array_equal(np.asarray(im.convert("RGB")), expected), f"{v} tile {i} pixels")
+                s_v, ga_v = independent_split_and_green(expected[keep])
+                self.assertAlmostEqual(t[v]["S"], s_v, delta=1e-6, msg=f"S {v}")
+                self.assertAlmostEqual(t[v]["GA"], ga_v, delta=1e-6, msg=f"GA {v}")
+                self.assertAlmostEqual(t["dS"][v], s_v - s_c, delta=1e-6)
+                self.assertAlmostEqual(t["MAD"][v], independent_mad(expected[keep], cin[i][keep]), delta=1e-6)
+                d = independent_lean(expected[keep]) - independent_lean(cin[i][keep])
+                self.assertAlmostEqual(t["dLean"][v], d, delta=1e-9, msg=f"dLean {v}")
+                ds[v].append(s_v - s_c)
+                dlean[v].append(d)
+            self.assertAlmostEqual(t["film"]["MAD_v3_vs_film"], independent_mad(independent_regrade(cin[i], tables["v3"])[keep], film[i][keep]),
+                                   delta=1e-6)
+        for v in tables:
+            self.assertAlmostEqual(m["means"]["dLean"][v], float(np.mean(dlean[v])), delta=1e-9)
+            self.assertAlmostEqual(m["means"]["dS"][v], float(np.mean(ds[v])), delta=1e-6)
+        self.assertAlmostEqual(m["dSRatioV3OverV2"], float(np.mean(ds["v3"]) / np.mean(ds["v2"])), delta=1e-6)
+        self.assertAlmostEqual(m["dSRatioV2OverV1"], float(np.mean(ds["v2"]) / np.mean(ds["v1"])), delta=1e-6)
+
+    def test_without_v3_every_output_is_byte_identical_to_the_merged_tool(self) -> None:
+        base = merged_tool(self, self.tmp, "warmth-merge-tool")
+        cin = {0: tile(88), 1: tile(89, letterbox=4)}
+        film = {i: graded(a) for i, a in cin.items()}
+        v1, v2 = known_tables(lift=300, split=900), known_tables(lift=1300, split=2300)
+        runs = []
+        for tool in (TOOL, base):
+            proc, out = self.run_regrade(cin, v1, v2, film=film, frames={"cinematic": {0: 30, 1: 70}, "film": {0: 34, 1: 99}}, tool=tool)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            metrics = json.loads((out / "regrade-metrics.json").read_text(encoding="utf-8"))
+            # the table paths name each run's own stage directory; everything else must match byte for byte
+            for doc in metrics["tables"].values():
+                doc["path"] = Path(doc["path"]).name
+            hashes = {k: v for k, v in FlavorDiffComposeTests.tree_hashes(out).items() if k != "regrade-metrics.json"}
+            runs.append((proc.stdout.replace(str(out), "<OUT>"), hashes, metrics))
+        self.assertEqual(runs[0][1], runs[1][1], "every PNG is byte-identical to the #358 merge's tool")
+        self.assertEqual(runs[0][2], runs[1][2], "the metrics are the #358 merge's tool's")
+        # L-04 adds one field to the OK line, the sha256 of every table graded; the rest of the line is the #358 merge's tool's
+        added = f" tableSha256=v1:{hashlib.sha256(v1).hexdigest()},v2:{hashlib.sha256(v2).hexdigest()}"
+        self.assertIn(added, runs[0][0])
+        self.assertEqual(runs[0][0].replace(added, ""), runs[1][0])
+        self.assertNotIn("dLean", json.dumps(runs[0][2]))
+
+
+# LOOK-ASSIST-FILM-FLAVOR-3 r2 (catalogue L-04): a stale candidate table was graded and labelled as the shipped grade ---------------------------
+class RegradeTableBindingRefusalTests(FlavorRegradeHarness):
+    TABLE = 4 * 65536 * 2
+
+    def test_a_table_other_than_the_expected_sha256_is_table_unbound_before_any_frame_is_read(self) -> None:
+        v1, v2, v3 = b"\0" * self.TABLE, b"\2" * self.TABLE, b"\3" * self.TABLE
+        sha = {name: hashlib.sha256(data).hexdigest() for name, data in (("v1", v1), ("v2", v2), ("v3", v3))}
+        # with --v3-table the option binds v3; without it, v2 (the newest table graded). Another table's sha does not bind it.
+        for bound, v3_data, expected in (("v3", v3, sha["v2"]), ("v3", v3, "0" * 64), ("v2", None, sha["v1"])):
+            with self.subTest(bound=bound, expected=expected[:8]):
+                proc, out = self.run_regrade({0: None}, v1, v2, v3=v3_data, extra=("--expect-table-sha256", expected))
+                self.assertEqual(proc.returncode, 21, proc.stdout + proc.stderr)
+                self.assertTrue(proc.stderr.startswith("TABLE_UNBOUND"), proc.stderr)
+                self.assertIn(f"the {bound} table", proc.stderr)
+                self.assertIn(sha[bound], proc.stderr)
+                self.assertIn(expected, proc.stderr)
+                self.assertNotIn("Traceback", proc.stderr)
+                self.assertFalse(out.exists() and any(out.iterdir()), "nothing is written")
+
+    def test_an_expected_sha256_that_is_not_64_hex_digits_is_a_usage_error(self) -> None:
+        for bad in ("913cbec9", "g" * 64, "0" * 65, ""):
+            with self.subTest(bad=bad):
+                proc, out = self.run_regrade({0: None}, b"\0" * self.TABLE, b"\0" * self.TABLE, extra=("--expect-table-sha256", bad))
+                self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+                self.assertFalse(out.exists())
+
+
+@requires_imaging
+class RegradeTableBindingComposeTests(FlavorRegradeHarness):
+    def test_the_expected_sha256_grades_and_every_output_names_the_bound_table(self) -> None:
+        cin = {0: tile(90)}
+        tables = {"v1": known_tables(lift=300, split=900), "v2": known_tables(lift=1300, split=2300), "v3": known_tables(lift=1300, split=1600)}
+        sha = {v: hashlib.sha256(d).hexdigest() for v, d in tables.items()}
+        proc, out = self.run_regrade(cin, tables["v1"], tables["v2"], v3=tables["v3"], extra=("--expect-table-sha256", sha["v3"].upper()))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn(f" tableSha256=v1:{sha['v1']},v2:{sha['v2']},v3:{sha['v3']}", proc.stdout)
+        m = json.loads((out / "regrade-metrics.json").read_text(encoding="utf-8"))
+        self.assertEqual(m["tableBinding"], {"table": "v3", "expectedSha256": sha["v3"], "bound": True})
+        self.assertEqual({v: d["sha256"] for v, d in m["tables"].items()}, sha)
+        self.assertTrue((out / "regrade-cinematic-v1-v2-v3.png").exists())
+
+    def test_without_the_option_the_ok_line_still_names_every_table_and_no_binding_is_claimed(self) -> None:
+        v1, v2 = identity_tables(), known_tables(lift=1300, split=2300)
+        proc, out = self.run_regrade({0: tile(91)}, v1, v2)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertTrue(proc.stdout.rstrip().endswith(f" tableSha256=v1:{hashlib.sha256(v1).hexdigest()},v2:{hashlib.sha256(v2).hexdigest()}"),
+                        proc.stdout)
+        self.assertNotIn("tableBinding", json.loads((out / "regrade-metrics.json").read_text(encoding="utf-8")))
+
+
+class WarmCoolBoundTests(WarmCoolHarness):
+    BOUND = "0.0058823529411764705"   # WC_NEUTRAL_BOUND = 1.5 / 255
+
+    def run_bound(self, tables: dict, tiles: dict | None = None, bound: str | None = BOUND, tool: Path = TOOL):
+        self.runs += 1
+        stage = self.tmp / f"warmbound{self.runs}" / ".claude-state" / "stage"
+        stage.mkdir(parents=True)
+        args = [sys.executable, str(tool), "warmcool"]
+        for name, data in tables.items():
+            path = stage / f"{name}.u16"
+            path.write_bytes(data)
+            args += ["--table", f"{name}={path}"]
+        if tiles is not None:
+            frames, listing = self.make_side(stage, "capture", tiles, None)
+            args += ["--frames", str(frames), "--listed", str(listing)]
+        if bound is not None:
+            args += ["--max-abs-lean", bound]
+        proc = subprocess.run(args, capture_output=True, text=True, timeout=300)
+        return proc, stage
+
+    def breaches(self, proc):
+        return [line.split()[1:3] for line in proc.stderr.splitlines() if line.startswith("WARMCOOL_BOUND_EXCEEDED")]
+
+    @requires_imaging
+    def test_the_module_bound_is_the_apps_neutrality_bar(self) -> None:
+        spec = importlib.util.spec_from_file_location("lfd_bound", TOOL)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self.assertEqual(module.WC_NEUTRAL_BOUND, 1.5 / 255)
+        self.assertEqual(module.EXIT_WARMCOOL_BOUND, 20)
+        self.assertEqual(repr(module.WC_NEUTRAL_BOUND), self.BOUND)
+
+    @requires_imaging
+    def test_a_ramp_lean_beyond_the_bound_either_way_is_refused_and_inside_it_passes(self) -> None:
+        # constant_y_tables: lean ((dr + dg) / 2 - db) / 65535; 514 / 65535 = 2 / 255, 257 / 65535 = 1 / 255
+        for name, data, code in (("amber2", constant_y_tables(257, 257, -257), 20), ("blue2", constant_y_tables(-257, -257, 257), 20),
+                                 ("amber1", constant_y_tables(0, 0, -257), 0), ("blue1", constant_y_tables(0, 0, 257), 0)):
+            with self.subTest(table=name):
+                proc, _ = self.run_bound({name: data})
+                self.assertEqual(proc.returncode, code, proc.stdout + proc.stderr)
+                self.assertNotIn("Traceback", proc.stderr)
+                doc = json.loads(proc.stdout)   # the measurement is printed either way
+                self.assertIn("rampLean", doc["tables"][name])
+                self.assertEqual(self.breaches(proc), [[name, "rampLean"]] if code else [])
+                if code:
+                    self.assertTrue(proc.stderr.startswith(f"WARMCOOL_BOUND_EXCEEDED {name} rampLean "), proc.stderr)
+
+    @requires_imaging
+    def test_a_histogram_breach_and_a_regrade_breach_are_each_refused_on_their_own(self) -> None:
+        import numpy as np
+        # A flat (200, 200, 50) capture: BT.601 luma 182.9 -> level 183; the channels sit at 200 and 50.
+        v = np.arange(65536)
+        band = lambda c: np.abs(v - c * 257) <= 128
+        # R up by 2570 on the level-183 band only: the neutral curve there leans +5 / 255, the pixels (R = 200) never touch it.
+        hist_only = table_bytes(v, np.clip(v + np.where(band(183), 2570, 0), 0, 65535), v, v)
+        # B down by 2570 on the code-50 band only: the luma histogram never reaches it, the pixels' B does (lean +10 / 255).
+        regrade_only = table_bytes(v, v, v, np.clip(v - np.where(band(50), 2570, 0), 0, 65535))
+        cap = {0: flat((200, 200, 50)), 1: flat((200, 200, 50))}
+        for name, data, which in (("histonly", hist_only, "histogramLean"), ("regradeonly", regrade_only, "meanDLean")):
+            with self.subTest(table=name):
+                proc, _ = self.run_bound({name: data}, cap)
+                self.assertEqual(proc.returncode, 20, proc.stdout + proc.stderr)
+                self.assertEqual(self.breaches(proc), [[name, which]])
+                doc = json.loads(proc.stdout)
+                self.assertLessEqual(abs(doc["tables"][name]["rampLean"]), 1.5 / 255)
+
+    @requires_imaging
+    def test_without_the_bound_the_output_and_exit_are_the_merged_tools(self) -> None:
+        base = merged_tool(self, self.tmp, "warmth-merge-tool-wc")
+        cap = {0: flat((200, 200, 50)), 1: flat((120, 110, 90))}
+        tables = {"amber2": constant_y_tables(257, 257, -257), "split": split_tables(2570)}
+        outs = []
+        for tool in (TOOL, base):
+            proc, stage = self.run_bound(tables, cap, bound=None, tool=tool)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(proc.stderr, "")
+            outs.append(proc.stdout.replace(json.dumps(str(stage))[1:-1], "<STAGE>"))   # the path as JSON escapes it
+        self.assertEqual(outs[0], outs[1])
+
+    def test_a_negative_bound_is_a_usage_error(self) -> None:
+        proc, _ = self.run_bound({"ident": b"\0" * (4 * 65536 * 2)}, bound="-1")
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
 
 
 # the pair driver and the cooldown gate (pwsh) ----------------------------------------------------------------------------------------------

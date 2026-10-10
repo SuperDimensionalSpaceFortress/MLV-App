@@ -73,9 +73,9 @@ METRICS (on the full-resolution tiles)
 
     Requires Pillow + numpy, loaded only after the input refusals (out dir, sliders, flavor), so those refuse on any host.
 
-RE-GRADE MODE (LOOK-ASSIST-FILM-FLAVOR-2)
-    `look-flavor-diff.py regrade ...` lays two engine-built Film tables (film-v1, film-v2) over ONE Cinematic capture: a frame-locked
-    Cinematic | v1 | v2 strip. See `look-flavor-diff.py regrade --help`.
+RE-GRADE MODE (LOOK-ASSIST-FILM-FLAVOR-2, -3)
+    `look-flavor-diff.py regrade ...` lays two engine-built Film tables (film-v1, film-v2), and optionally a third (film-v3), over ONE
+    Cinematic capture: a frame-locked Cinematic | v1 | v2 (| v3) strip. See `look-flavor-diff.py regrade --help`.
 
 WARM-COOL MODE (LOOK-ASSIST-WARMTH-MEASURE-1)
     `look-flavor-diff.py warmcool ...` measures the blue-amber lean, mean((R + G) / 2 - B) on [0, 1] code values, of engine grade tables
@@ -462,12 +462,12 @@ def compose(args):
 
 TRIO_SHEET_NAME = "sheet-classic-cinematic-film.png"
 SCHEMA_METRICS_TRIO = "mlv-app/look-flavor-diff-metrics/v2"
-FILM_GRADE_ID = "film-v2"
+FILM_GRADE_ID = "film-v3"
 TRIO_SIDES = ("classic", "cinematic", "film")
 
 
 def film_live(film_sliders, film_reported):
-    """(live, reasons). The Film side must report `film` AND carry presetGrade film-v2 (its colour grade was laid)."""
+    """(live, reasons). The Film side must report `film` AND carry presetGrade FILM_GRADE_ID (its colour grade was laid)."""
     reasons = []
     if film_reported != "film":
         reasons.append(f"the Film side reported lookFlavorReported={film_reported!r}, not 'film' (the app fell back)")
@@ -748,10 +748,15 @@ INPUT
     --cinematic-frames / --cinematic-listed   the staged Cinematic capture (hash-verified, as above)
     --cinematic-state     JSON object {"agx": bool, "lut": bool, "filter": bool, "source": "<where these were read>"}
     --v1-table / --v2-table   4 x 65536 uint16 little-endian, Y R G B (pipeline test LookAssistFilmGrade.DumpTablesWhenAsked)
+    --v3-table            optional (LOOK-ASSIST-FILM-FLAVOR-3): a third table, film-v3; adds a v3 column and the v3 metrics (below).
+                          Without it every output is byte-identical to the two-table mode.
     --film-frames / --film-listed   optional: the real Film capture, for MAD(v2(C), Film) on tiles frame-matched with Cinematic
     --clip-id --venue --build-sha --cinematic-receipt-id --film-receipt-id   header text only
     --out-dir             must contain a `.claude-state` path segment (owner footage)
     --illustrative        with an invalid state, compose anyway: valid=false in the metrics and a banner on the strip (never evidence)
+    --expect-table-sha256 HEX   optional (L-04): the sha256 the NEWEST table graded must have (v3 with --v3-table, else v2), e.g. the
+                          subject's FilmCurveIsPinned pin. Any other table is refused (21) before a frame is read; with a match the
+                          metrics carry tableBinding and the strip names the bound table. Without it the outputs are unchanged.
 
 RE-GRADE (per 8-bit pixel value c, per channel)
     v = T_ch[ T_Y[ round(c * 257) ] ];  out = round(v / 257)   -- Y first, then the channel's own table, as every kernel applies them.
@@ -759,17 +764,26 @@ RE-GRADE (per 8-bit pixel value c, per channel)
 REFUSALS: 12, 13, 14, 16 as above, and
     18  REGRADE_INVALID         the state says AgX, LUT or filter was on, or does not say all three: the re-grade is not the engine's picture.
     19  REGRADE_TABLE_INVALID   a table file is missing, unreadable or not 4 x 65536 uint16.
+    21  TABLE_UNBOUND           with --expect-table-sha256: the newest table's sha256 is not the expected one (a stale candidate table
+                                must never be graded under the shipped grade's name). Nothing is written.
 
 OUTPUT (in --out-dir; created exclusively, never overwritten)
+    stdout: LOOK_FLAVOR_REGRADE_OK ... ending in tableSha256=v1:<hex>,v2:<hex>[,v3:<hex>], the sha256 of every table graded.
     regrade-cinematic-v1-v2.png   3840 px wide: a header, then per tile a label band over [Cinematic | v1 re-grade | v2 re-grade] at 1280 px;
                                   every re-graded column is labelled "re-graded from the Cinematic capture".
     regrade-v1-NN.png / regrade-v2-NN.png   the full-resolution re-graded tiles.
     regrade-metrics.json          per tile S, GA (as the trio defines them) for C, v1(C), v2(C); MAD(v(C), C); dS_v = S(v(C)) - S(C); means;
                                   dSRatioV2OverV1; with --film-*: MAD(v2(C), Film) and frame matching; valid and the state.
+    With --v3-table: regrade-cinematic-v1-v2-v3.png instead (four 960 px columns), regrade-v3-NN.png, the v3 entries of every per-tile
+    and mean S / GA / dS / dGA / MAD, dSRatioV3OverV2, per tile and as a mean dLean = lean(v(C)) - lean(C) for v1, v2 and v3 (the warmcool
+    metric), and with --film-*: MAD(v3(C), Film) too.
 """
 EXIT_REGRADE_INVALID = 18
 EXIT_REGRADE_TABLE = 19
+EXIT_TABLE_UNBOUND = 21
 REGRADE_SHEET_NAME = "regrade-cinematic-v1-v2.png"
+REGRADE_V3_SHEET_NAME = "regrade-cinematic-v1-v2-v3.png"
+REGRADE_V3_COLUMN = 960
 REGRADE_METRICS_NAME = "regrade-metrics.json"
 SCHEMA_METRICS_REGRADE = "mlv-app/look-flavor-regrade-metrics/v1"
 REGRADE_TABLE_BYTES = 4 * 65536 * 2
@@ -822,9 +836,20 @@ def compose_regrade(args):
     if not valid and not args.illustrative:
         raise Refusal(EXIT_REGRADE_INVALID, "REGRADE_INVALID " + "; ".join(reasons) + ". Nothing is written; FILM-STRONGER falls back to the trio means "
                                             "(or re-run with --illustrative for an eyeball-only strip, valid=false)")
-    table_bytes = {v: read_regrade_table(getattr(args, f"{v}_table"), v) for v in ("v1", "v2")}
+    with_v3 = getattr(args, "v3_table", None) is not None
+    versions = ("v1", "v2", "v3") if with_v3 else ("v1", "v2")
+    sides = ("cinematic",) + versions
+    sheet_name = REGRADE_V3_SHEET_NAME if with_v3 else REGRADE_SHEET_NAME
+    column = REGRADE_V3_COLUMN if with_v3 else SHEET_COLUMN
+    table_bytes = {v: read_regrade_table(getattr(args, f"{v}_table"), v) for v in versions}
+    table_sha = {v: hashlib.sha256(table_bytes[v]).hexdigest() for v in versions}
+    expected = getattr(args, "expect_table_sha256", None)
+    if expected is not None and table_sha[versions[-1]] != expected:
+        raise Refusal(EXIT_TABLE_UNBOUND, f"TABLE_UNBOUND the {versions[-1]} table {getattr(args, f'{versions[-1]}_table')} has sha256 "
+                                          f"{table_sha[versions[-1]]}, not the expected {expected}: a table other than the bound one is never "
+                                          "graded under its name. Nothing is written.")
     _load_imaging()
-    tables = {v: regrade_tables(table_bytes[v]) for v in ("v1", "v2")}
+    tables = {v: regrade_tables(table_bytes[v]) for v in versions}
     staged, frames = load_side(args.cinematic_frames, args.cinematic_listed, "Cinematic")
     by = {f.get("index"): f for f in frames}
     film_staged = film_by = None
@@ -835,7 +860,7 @@ def compose_regrade(args):
             raise Refusal(EXIT_TILE_COUNT, f"PAIR_TILE_COUNT_DIFFERS Cinematic holds tiles {sorted(by)}, Film {sorted(film_by)}")
     indices = sorted(by)
     out = Path(args.out_dir)
-    names = [REGRADE_SHEET_NAME, REGRADE_METRICS_NAME] + [f"regrade-{v}-{i:02d}.png" for i in indices for v in ("v1", "v2")]
+    names = [sheet_name, REGRADE_METRICS_NAME] + [f"regrade-{v}-{i:02d}.png" for i in indices for v in versions]
     existing = [n for n in names if (out / n).exists()]
     if existing:
         raise Refusal(EXIT_OUTPUT_EXISTS, "PAIR_OUTPUT_EXISTS " + ", ".join(existing) + f" already in {out}: earlier evidence is never overwritten; "
@@ -844,22 +869,25 @@ def compose_regrade(args):
     tiles, panels, full = [], [], {}
     for index in indices:
         c = read_rgb(staged, by[index], "Cinematic")
-        arr = {"cinematic": c, "v1": regrade(c, tables["v1"]), "v2": regrade(c, tables["v2"])}
+        arr = {"cinematic": c, **{v: regrade(c, tables[v]) for v in versions}}
         keep = ~(luma_of(c).max(axis=1) <= LETTERBOX_MAX_LUMA)
         if not keep.any():
             keep = np.ones_like(keep)
-        kept = {s: arr[s][keep] for s in REGRADE_SIDES}
-        sg = {s: split_and_green(kept[s]) for s in REGRADE_SIDES}
+        kept = {s: arr[s][keep] for s in sides}
+        sg = {s: split_and_green(kept[s]) for s in sides}
         tile = {
             "index": index,
             "display_frame": by[index].get("display_frame"),
-            **{s: sg[s] for s in REGRADE_SIDES},
-            "MAD": {v: mad(kept[v], kept["cinematic"]) for v in ("v1", "v2")},
-            "dS": {v: sg[v]["S"] - sg["cinematic"]["S"] for v in ("v1", "v2")},
-            "dGA": {v: sg[v]["GA"] - sg["cinematic"]["GA"] for v in ("v1", "v2")},
+            **{s: sg[s] for s in sides},
+            "MAD": {v: mad(kept[v], kept["cinematic"]) for v in versions},
+            "dS": {v: sg[v]["S"] - sg["cinematic"]["S"] for v in versions},
+            "dGA": {v: sg[v]["GA"] - sg["cinematic"]["GA"] for v in versions},
             "rows_used": int(keep.sum()),
             "size": [int(c.shape[1]), int(c.shape[0])],
         }
+        if with_v3:
+            base_lean = warmcool_lean(kept["cinematic"], 255)
+            tile["dLean"] = {v: warmcool_lean(kept[v], 255) - base_lean for v in versions}
         if film_by is not None:
             f = read_rgb(film_staged, film_by[index], "Film")
             if f.shape != c.shape:
@@ -869,48 +897,59 @@ def compose_regrade(args):
             tile["film"] = {"display_frame": df, "display_frame_delta": delta,
                             "frame_matched": delta is not None and abs(delta) <= FRAME_MATCH_TOLERANCE,
                             "MAD_v2_vs_film": mad(kept["v2"], f[keep])}
+            if with_v3:
+                tile["film"]["MAD_v3_vs_film"] = mad(kept["v3"], f[keep])
         tiles.append(tile)
         full[index] = arr
-        panels.append((tile, [fit(arr[s], SHEET_COLUMN) for s in REGRADE_SIDES]))
+        panels.append((tile, [fit(arr[s], column) for s in sides]))
 
     banner = "" if valid else "  REGRADE-INVALID (" + "; ".join(reasons) + "): ILLUSTRATIVE ONLY, NOT EVIDENCE"
     column_labels = ("CINEMATIC (the Cinematic capture)", "FILM-V1 re-graded from the Cinematic capture", "FILM-V2 re-graded from the Cinematic capture")
+    if with_v3:
+        column_labels = ("CINEMATIC (capture)", "FILM-V1 re-graded", "FILM-V2 re-graded", "FILM-V3 re-graded")
+    layout = ("LEFT=Cinematic  then v1, v2, v3 re-grades" if with_v3 else "LEFT=Cinematic  MIDDLE=v1 re-grade  RIGHT=v2 re-grade")
     tile_h = panels[0][1][0].height
     sheet = Image.new("RGB", (SHEET_WIDTH, HEADER_HEIGHT + len(panels) * (ROW_LABEL_HEIGHT + tile_h)), (8, 8, 8))
     draw = ImageDraw.Draw(sheet)
     header = [
-        f"clip={args.clip_id}  venue={args.venue}  build={args.build_sha}  LEFT=Cinematic  MIDDLE=v1 re-grade  RIGHT=v2 re-grade{banner}",
+        f"clip={args.clip_id}  venue={args.venue}  build={args.build_sha}  {layout}{banner}",
         f"receipts: cinematic={args.cinematic_receipt_id}  film={args.film_receipt_id}  state: agx={state.get('agx')} lut={state.get('lut')} "
         f"filter={state.get('filter')} ({state.get('source', '')})",
         "frame-locked: every column is the SAME captured frame; the v1 / v2 columns are re-graded from the Cinematic capture "
+        "(Y then R/G/B tables, round(c*257), /257, round)" if not with_v3 else
+        "frame-locked: every column is the SAME captured frame; the v1 / v2 / v3 columns are re-graded from the Cinematic capture "
         "(Y then R/G/B tables, round(c*257), /257, round)",
         "  |  ".join(column_labels),
     ]
+    if expected is not None:
+        header.append(f"table bound: {versions[-1]} sha256={expected} (--expect-table-sha256)")
     for i, text in enumerate(header):
         draw.text((10, 8 + i * 34), text, fill=(255, 255, 255) if valid else (255, 120, 120), font=font)
     for n, (tile, cols) in enumerate(panels):
         y = HEADER_HEIGHT + n * (ROW_LABEL_HEIGHT + tile_h)
         for col, panel in enumerate(cols):
-            sheet.paste(panel.crop((0, 0, SHEET_COLUMN, tile_h)), (col * SHEET_COLUMN, y + ROW_LABEL_HEIGHT))
-            draw.text((col * SHEET_COLUMN + 10, y + 10), f"tile {tile['index']:02d} disp {tile['display_frame']}  {column_labels[col]}",
+            sheet.paste(panel.crop((0, 0, column, tile_h)), (col * column, y + ROW_LABEL_HEIGHT))
+            draw.text((col * column + 10, y + 10), f"tile {tile['index']:02d} disp {tile['display_frame']}  {column_labels[col]}",
                       fill=(255, 255, 255), font=font)
 
     def mean_of(get):
         return float(np.mean([get(t) for t in tiles]))
     means = {
-        "S": {s: mean_of(lambda t, s=s: t[s]["S"]) for s in REGRADE_SIDES},
-        "GA": {s: mean_of(lambda t, s=s: t[s]["GA"]) for s in REGRADE_SIDES},
-        "dS": {v: mean_of(lambda t, v=v: t["dS"][v]) for v in ("v1", "v2")},
-        "dGA": {v: mean_of(lambda t, v=v: t["dGA"][v]) for v in ("v1", "v2")},
-        "MAD": {v: mean_of(lambda t, v=v: t["MAD"][v]) for v in ("v1", "v2")},
+        "S": {s: mean_of(lambda t, s=s: t[s]["S"]) for s in sides},
+        "GA": {s: mean_of(lambda t, s=s: t[s]["GA"]) for s in sides},
+        "dS": {v: mean_of(lambda t, v=v: t["dS"][v]) for v in versions},
+        "dGA": {v: mean_of(lambda t, v=v: t["dGA"][v]) for v in versions},
+        "MAD": {v: mean_of(lambda t, v=v: t["MAD"][v]) for v in versions},
     }
+    if with_v3:
+        means["dLean"] = {v: mean_of(lambda t, v=v: t["dLean"][v]) for v in versions}
     ratio = means["dS"]["v2"] / means["dS"]["v1"] if means["dS"]["v1"] != 0 else None
     doc = {
         "schema": SCHEMA_METRICS_REGRADE,
         "clipId": args.clip_id, "venue": args.venue, "buildSha12": args.build_sha,
         "receiptIds": {"cinematic": args.cinematic_receipt_id, "film": args.film_receipt_id},
         "valid": valid, "invalidReasons": reasons, "state": state,
-        "tables": {v: {"path": str(getattr(args, f"{v}_table")), "sha256": hashlib.sha256(table_bytes[v]).hexdigest()} for v in ("v1", "v2")},
+        "tables": {v: {"path": str(getattr(args, f"{v}_table")), "sha256": table_sha[v]} for v in versions},
         "letterboxMaxLuma": LETTERBOX_MAX_LUMA, "frameMatchTolerance": FRAME_MATCH_TOLERANCE,
         "metricDefinitions": {
             "S": "BA(luma in [p05,p30]) - BA(luma in [p70,p95]), BA = mean(B - R), BT.601 luma ranked per image",
@@ -919,16 +958,26 @@ def compose_regrade(args):
             "MAD": "mean over channels of mean |v(C) - C|", "MAD_v2_vs_film": "mean over channels of mean |v2(C) - Film|",
         },
         "tiles": tiles, "means": means, "dSRatioV2OverV1": ratio,
-        "sheet": REGRADE_SHEET_NAME,
+        "sheet": sheet_name,
     }
+    ratio3 = None
+    if with_v3:
+        ratio3 = means["dS"]["v3"] / means["dS"]["v2"] if means["dS"]["v2"] != 0 else None
+        doc["dSRatioV3OverV2"] = ratio3
+        doc["metricDefinitions"]["MAD_v3_vs_film"] = "mean over channels of mean |v3(C) - Film|"
+        doc["metricDefinitions"]["dLean"] = "lean(v(C)) - lean(C), lean = " + WARMCOOL_DEFINITION + " (the warmcool metric)"
+    if expected is not None:
+        doc["tableBinding"] = {"table": versions[-1], "expectedSha256": expected, "bound": True}
     out.mkdir(parents=True, exist_ok=True)
-    write_new(out / REGRADE_SHEET_NAME, png_bytes(sheet))
+    write_new(out / sheet_name, png_bytes(sheet))
     for index in indices:
-        for v in ("v1", "v2"):
+        for v in versions:
             write_new(out / f"regrade-{v}-{index:02d}.png", png_bytes(Image.fromarray(full[index][v])))
     write_new(out / REGRADE_METRICS_NAME, json.dumps(doc, indent=2).encode("utf-8"))
-    print(f"LOOK_FLAVOR_REGRADE_OK sheet={out / REGRADE_SHEET_NAME} tiles={len(tiles)} valid={str(valid).lower()} "
-          f"dSv1={means['dS']['v1']:.3f} dSv2={means['dS']['v2']:.3f} ratio={'None' if ratio is None else f'{ratio:.3f}'}")
+    v3_tail = (f" dSv3={means['dS']['v3']:.3f} ratioV3OverV2={'None' if ratio3 is None else f'{ratio3:.3f}'}" if with_v3 else "")
+    print(f"LOOK_FLAVOR_REGRADE_OK sheet={out / sheet_name} tiles={len(tiles)} valid={str(valid).lower()} "
+          f"dSv1={means['dS']['v1']:.3f} dSv2={means['dS']['v2']:.3f} ratio={'None' if ratio is None else f'{ratio:.3f}'}{v3_tail}"
+          f" tableSha256={','.join(f'{v}:{table_sha[v]}' for v in versions)}")
     return 0
 
 
@@ -939,6 +988,7 @@ def regrade_main(argv):
     p.add_argument("--cinematic-state", required=True, type=Path)
     p.add_argument("--v1-table", required=True, type=Path)
     p.add_argument("--v2-table", required=True, type=Path)
+    p.add_argument("--v3-table", type=Path, default=None)
     p.add_argument("--film-frames", type=Path, default=None)
     p.add_argument("--film-listed", type=Path, default=None)
     p.add_argument("--cinematic-receipt-id", default="")
@@ -948,9 +998,14 @@ def regrade_main(argv):
     p.add_argument("--build-sha", default="")
     p.add_argument("--out-dir", required=True, type=Path)
     p.add_argument("--illustrative", action="store_true")
+    p.add_argument("--expect-table-sha256", default=None, metavar="HEX")
     args = p.parse_args(argv)
     if (args.film_frames is None) != (args.film_listed is None):
         p.error("the Film side needs both --film-frames and --film-listed, or neither")
+    if args.expect_table_sha256 is not None:
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", args.expect_table_sha256):
+            p.error("--expect-table-sha256 wants a sha256: 64 hex digits")
+        args.expect_table_sha256 = args.expect_table_sha256.lower()
     try:
         return compose_regrade(args)
     except Refusal as exc:
@@ -982,9 +1037,18 @@ OUTPUT (stdout, JSON; nothing is written)
                   mode re-grades), and dLean = the re-graded lean minus the capture's. Letterbox rows are excluded, as everywhere here.
 
 REFUSALS: 12, 14 as above, and 19 REGRADE_TABLE_INVALID (a table is missing, unreadable or not 4 x 65536 uint16).
+
+GUARD (LOOK-ASSIST-FILM-FLAVOR-3)
+    --max-abs-lean X      after printing the JSON, exit 20 WARMCOOL_BOUND_EXCEEDED (one stderr line per breach:
+                          `WARMCOOL_BOUND_EXCEEDED <name> <rampLean|histogramLean|meanDLean> <value>`) when |rampLean|, |histogramLean| or
+                          |meanDLean| of any table exceeds X, either way (amber or blue). The neutral bound film-v3 was held to is
+                          WC_NEUTRAL_BOUND = 1.5 / 255: the app's white-balance search calls a surface neutral at |B - R| < 2 codes, and a pure
+                          R - B offset of 2 is a lean of 1.5 codes. Without --max-abs-lean the output and exit code are unchanged.
 """
 SCHEMA_WARMCOOL = "mlv-app/look-flavor-warmcool/v1"
 WARMCOOL_DEFINITION = "mean((R + G) / 2 - B) on code values normalized to [0, 1]; positive = amber, negative = blue, 0 on neutral grey"
+EXIT_WARMCOOL_BOUND = 20
+WC_NEUTRAL_BOUND = 1.5 / 255
 
 
 def warmcool_lean(pixels, full_scale):
@@ -1037,14 +1101,28 @@ def compose_warmcool(named, frames_dir, listed):
     return doc
 
 
+def warmcool_breaches(doc, bound):
+    """(name, which, value) for every table lean whose magnitude exceeds `bound`, in table order: rampLean, histogramLean, meanDLean."""
+    breaches = []
+    dlean = doc.get("capture", {}).get("meanDLean", {})
+    for name, t in doc["tables"].items():
+        for which, value in (("rampLean", t.get("rampLean")), ("histogramLean", t.get("histogramLean")), ("meanDLean", dlean.get(name))):
+            if value is not None and abs(value) > bound:
+                breaches.append((name, which, value))
+    return breaches
+
+
 def warmcool_main(argv):
     p = argparse.ArgumentParser(prog="look-flavor-diff.py warmcool", description=WARMCOOL_USAGE, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--table", action="append", default=[], metavar="NAME=PATH")
     p.add_argument("--frames", type=Path, default=None)
     p.add_argument("--listed", type=Path, default=None)
+    p.add_argument("--max-abs-lean", type=float, default=None, metavar="X")
     args = p.parse_args(argv)
     if (args.frames is None) != (args.listed is None):
         p.error("a capture needs both --frames and --listed, or neither")
+    if args.max_abs_lean is not None and not args.max_abs_lean >= 0:
+        p.error("--max-abs-lean wants a non-negative number")
     named = []
     for spec in args.table:
         name, sep, path = spec.partition("=")
@@ -1056,8 +1134,14 @@ def warmcool_main(argv):
     if len({name for name, _ in named}) != len(named):
         p.error("--table names must be unique")
     try:
-        print(json.dumps(compose_warmcool(named, args.frames, args.listed), indent=2))
-        return 0
+        doc = compose_warmcool(named, args.frames, args.listed)
+        print(json.dumps(doc, indent=2))
+        if args.max_abs_lean is None:
+            return 0
+        breaches = warmcool_breaches(doc, args.max_abs_lean)
+        for name, which, value in breaches:
+            print(f"WARMCOOL_BOUND_EXCEEDED {name} {which} {value:+.6f} (|{which}| > {args.max_abs_lean:.6f})", file=sys.stderr)
+        return EXIT_WARMCOOL_BOUND if breaches else 0
     except Refusal as exc:
         print(str(exc), file=sys.stderr)
         return exc.code

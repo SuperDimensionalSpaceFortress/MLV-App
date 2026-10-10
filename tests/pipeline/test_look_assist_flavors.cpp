@@ -383,7 +383,8 @@ TEST(LookAssistFlavorsFixture, ContactSheets)
     stream << manifest.join( QLatin1Char('\n') ) << "\n";
 }
 
-// ---- LOOK-ASSIST-FILM-FLAVOR-1/-2: the Film grade (Cinematic's tone + film-v2: a teal / warm split in R, G, B and a Y tone line) ----
+// ---- LOOK-ASSIST-FILM-FLAVOR-1/-2/-3: the Film grade (Cinematic's tone + film-v3: a teal / warm split in R, G, B with a
+// neutral blue-amber lean, and a Y tone line) ----
 
 namespace
 {
@@ -481,6 +482,97 @@ double gradedHue( const GradationTables &t, double r, double g, double b )
     return hsv[0];
 }
 
+// LOOK-ASSIST-FILM-FLAVOR-3: the blue-amber lean of the neutral ramp through the stage, as look-flavor-diff.py warmcool
+// defines it (rampLean): mean over every 16-bit code v of ((R + G) / 2 - B) / 65535, each channel through Y then its own
+// table. Positive = amber; the default curve's is 0.
+double rampLean( const GradationTables &t )
+{
+    double sum = 0.0;
+    for( int v = 0; v < 65536; ++v )
+    {
+        const int y = t.y[v];
+        sum += ( ( static_cast<double>( t.r[y] ) + static_cast<double>( t.g[y] ) ) / 2.0 - static_cast<double>( t.b[y] ) ) / 65535.0;
+    }
+    return sum / 65536.0;
+}
+
+// The warm-cool bound every lean is held to: the app's own neutrality bar (the white-balance search calls a surface
+// neutral at |B - R| < 2 codes, kRefineDeadBand; a pure R - B offset of 2 is a lean of 1.5 codes).
+const double kWarmCoolNeutralBound = 1.5 / 255.0;
+
+// The pre-registered film-v3 candidate grid (t, w per unit strength; LOOK-ASSIST-FILM-FLAVOR-3), fixed before any table was
+// built. The shipped constants are the first candidate, in this order, that passed every table gate.
+struct FilmCandidate { const char *id; double teal; double warm; };
+const FilmCandidate kFilmV3Grid[] = { { "C1", 0.042, 0.024 }, { "C2", 0.042, 0.020 }, { "C3", 0.038, 0.024 }, { "C4", 0.046, 0.027 } };
+
+LookAssistFilmGrade filmCandidateGrade( LookAssistScene scene, const FilmCandidate &c )
+{
+    LookAssistFilmGrade g = lookAssistFilmGradeForScene( scene );
+    g.tealOffset = c.teal * g.strength;
+    g.warmOffset = c.warm * g.strength;
+    return g;
+}
+
+// The green-magenta axis of a grade against the default curve's stage, in 8-bit codes: the neutral range (R = G = B) and
+// the per-channel any-pixel bound [min dG - (max dR + max dB)/2, max dG - (min dR + min dB)/2].
+struct GreenAxis
+{
+    double neutralLo = 1e9, neutralHi = -1e9, lo = 0.0, hi = 0.0;
+};
+GreenAxis greenAxis( const GradationTables &film, const GradationTables &def )
+{
+    GreenAxis a;
+    const StageDeltas d = stageDeltas( film, def );
+    for( int v = 0; v < 65536; ++v )
+    {
+        const double dGA = ( d.g[v] - ( d.r[v] + d.b[v] ) / 2.0 ) / 257.0;
+        a.neutralLo = std::min( a.neutralLo, dGA );
+        a.neutralHi = std::max( a.neutralHi, dGA );
+    }
+    const auto mm = []( const std::vector<int> &v ) { return std::minmax_element( v.begin(), v.end() ); };
+    const auto r = mm( d.r ), g = mm( d.g ), b = mm( d.b );
+    a.lo = ( *g.first - ( *r.second + *b.second ) / 2.0 ) / 257.0;
+    a.hi = ( *g.second - ( *r.first + *b.first ) / 2.0 ) / 257.0;
+    return a;
+}
+
+// #319's coloured set and the direction each moves on the green-magenta axis (+1 toward green).
+struct Coloured { const char *name; double r, g, b; int sign; };
+const Coloured kColouredSet[] = {
+    { "amber", 0.72, 0.45, 0.18, -1 },
+    { "teal", 0.18, 0.45, 0.72, +1 },
+    { "skin", 0.80, 0.55, 0.35, +1 },
+    { "sky", 0.30, 0.55, 0.85, +1 },
+    { "sodium", 0.90, 0.50, 0.10, -1 },
+    { "cyan", 0.10, 0.50, 0.90, +1 },
+};
+
+// The skin patches R:G:B = 1:0.72:0.56 and 1:0.80:0.68 at several levels (the #319 guard's set).
+struct Patch { double g, b, r; };
+const Patch kSkinPatches[] = { { 0.72, 0.56, 0.35 }, { 0.72, 0.56, 0.50 }, { 0.72, 0.56, 0.65 }, { 0.72, 0.56, 0.80 },
+                               { 0.80, 0.68, 0.55 }, { 0.80, 0.68, 0.75 }, { 0.80, 0.68, 0.90 } };
+
+// Over the skin patches through one grade's stage, against the default's: the graded hue range, the most negative dh and
+// the largest magenta-ward move (max of h_default - h_graded, 0 when none moves that way).
+struct SkinHue
+{
+    double hueLo = 1e9, hueHi = -1e9, dhLo = 1e9, magentaWard = 0.0;
+};
+SkinHue skinHue( const GradationTables &film, const GradationTables &def )
+{
+    SkinHue s;
+    for( const Patch &p : kSkinPatches )
+    {
+        const double r = p.r, g = p.g * p.r, b = p.b * p.r;
+        const double h0 = gradedHue( def, r, g, b ), h = gradedHue( film, r, g, b );
+        s.hueLo = std::min( s.hueLo, h );
+        s.hueHi = std::max( s.hueHi, h );
+        s.dhLo = std::min( s.dhLo, h - h0 );
+        s.magentaWard = std::max( s.magentaWard, h0 - h );
+    }
+    return s;
+}
+
 // The receipt elements the Look Assist path can touch, serialised with the GUI writer's rules (writeXmlElementsToFile:
 // "%1" numbers, lookAssistFlavor only when non-empty and not "classic", lookAssistBaselineGradationCurve only when
 // non-empty). MainWindow is not linked into this binary; LookAssistFlavors.TheFilmBaselineElementIsWrittenOnlyWhileSet
@@ -562,9 +654,9 @@ bool openFirstFixture( MlvPipelineFixture &fixture )
 
 } // namespace
 
-TEST(LookAssistFilmGrade, FilmV2CurveIsTealGoldWithANeutralLean)
+TEST(LookAssistFilmGrade, FilmV3CurveIsTealGoldWithANeutralLean)
 {
-    // film-v2's four tables, against the default receipt's. R and B move by equal and opposite amounts at every knot and
+    // film-v3's four tables, against the default receipt's. R and B move by equal and opposite amounts at every knot and
     // the spline is linear in y, so r + b == 2 def on every entry the stage can reach (only rounding is left); the
     // engine's 0.0001 floor clamps R's dip below the teal knot on a few entries under Y[0], which the Y line never
     // indexes. G takes the share k of each offset; between knots the natural spline dips it below the default by a
@@ -589,7 +681,7 @@ TEST(LookAssistFilmGrade, FilmV2CurveIsTealGoldWithANeutralLean)
             const int dg = static_cast<int>( film.g[v] ) - static_cast<int>( def.g[v] );
             if( dg < greenDip ) { greenDip = dg; greenDipAt = v; }
         }
-        std::fprintf( stderr, "FILM-V2-CURVE scene=%s max|r+b-2def|=%d floor_clamped_entries<=%d Y[0]=%d Y[32768]=%d Y[65535]=%d"
+        std::fprintf( stderr, "FILM-V3-CURVE scene=%s max|r+b-2def|=%d floor_clamped_entries<=%d Y[0]=%d Y[32768]=%d Y[65535]=%d"
                       " min(G-def)=%d at x=%.4f\n", qPrintable( lookAssistSceneName( scene ) ), worstMirror, clampedAbove,
                       film.y[0], film.y[32768], film.y[65535], greenDip, greenDipAt / 65535.0 );
         ASSERT_TRUE( worstMirror <= 2 );
@@ -603,7 +695,55 @@ TEST(LookAssistFilmGrade, FilmV2CurveIsTealGoldWithANeutralLean)
     }
 }
 
-TEST(LookAssistFilmGrade, FilmV2NeutralLeansGreenNeverMagenta)
+TEST(LookAssistFilmGrade, FilmV3RampLeanIsNeutral)
+{
+    // The owner's question (2026-10-09): Film is warm. v2's warm half covered three quarters of the tonal range, so an
+    // evenly exposed picture leaned amber by construction. v3's blue-amber lean on the neutral ramp, through the engine's
+    // stage over all 65536 codes, is within the app's own neutrality bar (1.5 / 255) at every scene, both ways. v2 must
+    // read above the bar at Shade: the test can see the lean it exists to remove.
+    for( LookAssistScene scene : kFilmScenes )
+    {
+        const double v3 = rampLean( gradationTables( lookAssistFilmGradationCurve( scene ) ) );
+        const double v2 = rampLean( gradationTables( lookAssistFilmGradationCurveV2( scene ) ) );
+        const double v1 = rampLean( gradationTables( lookAssistFilmGradationCurveV1( scene ) ) );
+        std::fprintf( stderr, "FILM-V3-RAMP-LEAN scene=%s v3=%+.6f (%+.3f/255) v2=%+.6f (%+.3f/255) v1=%+.6f (%+.3f/255) bound=%.6f\n",
+                      qPrintable( lookAssistSceneName( scene ) ), v3, v3 * 255.0, v2, v2 * 255.0, v1, v1 * 255.0, kWarmCoolNeutralBound );
+        ASSERT_TRUE( std::fabs( v3 ) <= kWarmCoolNeutralBound );
+        if( scene == LookAssistScene::Shade ) ASSERT_TRUE( v2 > kWarmCoolNeutralBound );
+    }
+    ASSERT_TRUE( std::fabs( rampLean( gradationTables( defaultCurve() ) ) ) < 1e-12 );
+}
+
+TEST(LookAssistFilmGrade, FilmV3IsNotV2)
+{
+    // At every scene v3, the legacy v2 and the legacy v1 are three different curves and three different table sets, and
+    // none of them is the default. v3 is not v2's recipe either: its warm knot, its neutral zone's end and its warm offset
+    // are not v2's (the R line's knots, as the widget parses them).
+    const GradationTables def = gradationTables( defaultCurve() );
+    const auto same = []( const GradationTables &a, const GradationTables &b ) { return a.y == b.y && a.r == b.r && a.g == b.g && a.b == b.b; };
+    for( LookAssistScene scene : kFilmScenes )
+    {
+        const QString c3 = lookAssistFilmGradationCurve( scene ), c2 = lookAssistFilmGradationCurveV2( scene ),
+                      c1 = lookAssistFilmGradationCurveV1( scene );
+        ASSERT_TRUE( c3 != c2 && c2 != c1 && c3 != c1 );
+        std::vector<LookAssistGradationPoint> l3[4], l2[4];
+        ASSERT_EQ( 4, lookAssistParseGradationCurve( c3, l3 ) );
+        ASSERT_EQ( 4, lookAssistParseGradationCurve( c2, l2 ) );
+        ASSERT_EQ( 7, static_cast<int>( l3[1].size() ) );
+        ASSERT_EQ( 7, static_cast<int>( l2[1].size() ) );
+        ASSERT_TRUE( std::fabs( l3[1][3].x - l2[1][3].x ) > 1e-3 );                                  // neutral end 0.28 vs 0.26
+        ASSERT_TRUE( std::fabs( l3[1][4].x - l2[1][4].x ) > 1e-3 );                                  // warm knot 0.48 vs 0.52
+        ASSERT_TRUE( std::fabs( ( l3[1][4].y - l3[1][4].x ) - ( l2[1][4].y - l2[1][4].x ) ) > 1e-3 );  // w: v3's vs v2's
+        const GradationTables t3 = gradationTables( c3 ), t2 = gradationTables( c2 ), t1 = gradationTables( c1 );
+        ASSERT_FALSE( same( t3, t2 ) );
+        ASSERT_FALSE( same( t2, t1 ) );
+        ASSERT_FALSE( same( t3, t1 ) );
+        for( const QString &c : { c3, c2, c1 } ) ASSERT_FALSE( lookAssistIsDefaultGradationCurve( c ) );
+        for( const GradationTables *t : { &t3, &t2, &t1 } ) ASSERT_FALSE( same( *t, def ) );
+    }
+}
+
+TEST(LookAssistFilmGrade, FilmV3NeutralLeansGreenNeverMagenta)
 {
     // Per pixel, through the engine's own stage (Y, then each channel's table) at each Film strength, against the default
     // curve's stage. Any pixel's green-magenta move is dG(g) - (dR(r) + dB(b)) / 2 with each term a function of one
@@ -614,64 +754,39 @@ TEST(LookAssistFilmGrade, FilmV2NeutralLeansGreenNeverMagenta)
     //     printed with the share the Y line alone takes (the Y line is a tone curve: it moves chroma on every route).
     // (c) #319's coloured set: within the bound and in the documented direction.
     const GradationTables def = gradationTables( defaultCurve() );
-    struct Coloured { const char *name; double r, g, b; int sign; };
-    const Coloured coloured[] = {
-        { "amber", 0.72, 0.45, 0.18, -1 },
-        { "teal", 0.18, 0.45, 0.72, +1 },
-        { "skin", 0.80, 0.55, 0.35, +1 },
-        { "sky", 0.30, 0.55, 0.85, +1 },
-        { "sodium", 0.90, 0.50, 0.10, -1 },
-        { "cyan", 0.10, 0.50, 0.90, +1 },
-    };
-    // The documented any-pixel bounds (8-bit codes, rounded outward), Night / ArtificialLights / Shade / BrightSun.
-    const double documentedLower[] = { -10.2, -15.2, -20.3, -18.3 };
-    const double documentedUpper[] = { 8.0, 11.9, 15.8, 14.2 };
+    // The documented any-pixel bounds (8-bit codes, rounded outward to 0.1 from the film-v3 values this test printed),
+    // Night / ArtificialLights / Shade / BrightSun.
+    const double documentedLower[] = { -9.0, -13.4, -17.9, -16.1 };
+    const double documentedUpper[] = { 6.7, 10.1, 13.5, 12.1 };
     for( LookAssistScene scene : kFilmScenes )
     {
         const int s = static_cast<int>( scene );
         const LookAssistFilmGrade grade = lookAssistFilmGradeForScene( scene );
         const GradationTables film = gradationTables( lookAssistFilmGradationCurve( scene ) );
-        const StageDeltas d = stageDeltas( film, def );
-
-        // (a) Neutral.
-        double neutralLo = 1e9, neutralHi = -1e9;
-        for( int v = 0; v < 65536; ++v )
-        {
-            const double dGA = ( d.g[v] - ( d.r[v] + d.b[v] ) / 2.0 ) / 257.0;
-            neutralLo = std::min( neutralLo, dGA );
-            neutralHi = std::max( neutralHi, dGA );
-        }
+        const GreenAxis a = greenAxis( film, def );
         const double lean = 0.6 * 0.15 * grade.warmOffset * 255.0;   // the documented k, not the code's (a k of 0 must fail here)
-
-        // (b) Any pixel, and the share of the Y line alone (Film's Y with default R, G, B).
-        const auto bound = []( const StageDeltas &x, double *lo, double *hi ) {
-            const auto mm = []( const std::vector<int> &v ) { return std::minmax_element( v.begin(), v.end() ); };
-            const auto r = mm( x.r ), g = mm( x.g ), b = mm( x.b );
-            *lo = ( *g.first - ( *r.second + *b.second ) / 2.0 ) / 257.0;
-            *hi = ( *g.second - ( *r.first + *b.first ) / 2.0 ) / 257.0;
-        };
-        double lo = 0.0, hi = 0.0, toneLo = 0.0, toneHi = 0.0;
-        bound( d, &lo, &hi );
         GradationTables toneOnly = def;
         toneOnly.y = film.y;
-        bound( stageDeltas( toneOnly, def ), &toneLo, &toneHi );
+        const GreenAxis tone = greenAxis( toneOnly, def );
 
-        std::fprintf( stderr, "FILM-V2-GREEN-AXIS scene=%s s=%.2f neutral dGA=[%+.4f,%+.4f] lean_floor=%.4f any_pixel=[%+.4f,%+.4f]"
+        std::fprintf( stderr, "FILM-V3-GREEN-AXIS scene=%s s=%.2f neutral dGA=[%+.4f,%+.4f] lean_floor=%.4f any_pixel=[%+.4f,%+.4f]"
                       " y_line_alone=[%+.4f,%+.4f] documented=[%+.1f,%+.1f]\n", qPrintable( lookAssistSceneName( scene ) ),
-                      grade.strength, neutralLo, neutralHi, lean, lo, hi, toneLo, toneHi, documentedLower[s], documentedUpper[s] );
-        ASSERT_TRUE( neutralLo >= -0.5 );
-        ASSERT_TRUE( neutralHi <= 2.5 );
-        ASSERT_TRUE( neutralHi >= lean );
-        ASSERT_TRUE( lo >= documentedLower[s] );
-        ASSERT_TRUE( hi <= documentedUpper[s] );
-
-        // (c) The coloured set.
-        for( const Coloured &c : coloured )
+                      grade.strength, a.neutralLo, a.neutralHi, lean, a.lo, a.hi, tone.lo, tone.hi, documentedLower[s], documentedUpper[s] );
+        for( const Coloured &c : kColouredSet )
         {
             const double dGA = gradedGreenAxis8( film, c.r, c.g, c.b ) - gradedGreenAxis8( def, c.r, c.g, c.b );
-            std::fprintf( stderr, "FILM-V2-GREEN-AXIS scene=%s input=%s rgb=%.2f/%.2f/%.2f dGA=%+.4f\n",
+            std::fprintf( stderr, "FILM-V3-GREEN-AXIS scene=%s input=%s rgb=%.2f/%.2f/%.2f dGA=%+.4f\n",
                           qPrintable( lookAssistSceneName( scene ) ), c.name, c.r, c.g, c.b, dGA );
-            ASSERT_TRUE( dGA >= lo - 1e-9 && dGA <= hi + 1e-9 );
+        }
+        ASSERT_TRUE( a.neutralLo >= -0.5 );
+        ASSERT_TRUE( a.neutralHi <= 2.5 );
+        ASSERT_TRUE( a.neutralHi >= lean );
+        ASSERT_TRUE( a.lo >= documentedLower[s] );
+        ASSERT_TRUE( a.hi <= documentedUpper[s] );
+        for( const Coloured &c : kColouredSet )
+        {
+            const double dGA = gradedGreenAxis8( film, c.r, c.g, c.b ) - gradedGreenAxis8( def, c.r, c.g, c.b );
+            ASSERT_TRUE( dGA >= a.lo - 1e-9 && dGA <= a.hi + 1e-9 );
             ASSERT_TRUE( dGA * c.sign > 0.0 );
         }
     }
@@ -679,19 +794,19 @@ TEST(LookAssistFilmGrade, FilmV2NeutralLeansGreenNeverMagenta)
 
 TEST(LookAssistFilmGrade, FilmCurveIsPinned)
 {
-    // film-v2: the four 65536-entry tables per scene by sha256, and sampled values, as the engine built them at this commit.
+    // film-v3: the four 65536-entry tables per scene by sha256, and sampled values, as the engine built them at this commit.
     struct Pin { LookAssistScene scene; const char *sha256; int y[5]; int r[5]; int g[5]; int b[5]; };
     const Pin pins[] = {
-        { LookAssistScene::Night, "e04eda3fcf58a45d8600d4810ae3d62232591d3999c0e35f2a760097b5eb3d92",
-          { 654, 7049, 15373, 34063, 55243 }, { 6, 5407, 15129, 35551, 56146 }, { 6, 6725, 15059, 34298, 55770 }, { 6, 7700, 15015, 32602, 55261 } },
-        { LookAssistScene::ArtificialLights, "248f691bb96e48ac4a572b9a61a76af30c9218ca6fa3765e8e19427e387efb79",
-          { 982, 7298, 15524, 34056, 55013 }, { 6, 4833, 15158, 36289, 56367 }, { 6, 6811, 15053, 34409, 55803 }, { 6, 8274, 14987, 31865, 55040 } },
-        { LookAssistScene::Shade, "d0ab4bac7494ac3d66b3a151e295051585b0855e561ab78a8647abf151021ba0",
-          { 1310, 7546, 15675, 34049, 54783 }, { 6, 4260, 15187, 37026, 56588 }, { 6, 6897, 15046, 34519, 55836 }, { 6, 8847, 14958, 31128, 54819 } },
-        { LookAssistScene::BrightSun, "21b04857fe8d03508850f9c689268dbfd4f50ebc729dcd38400539691aa6ec29",
-          { 1179, 7447, 15615, 34052, 54875 }, { 6, 4489, 15175, 36731, 56500 }, { 6, 6863, 15049, 34475, 55823 }, { 6, 8618, 14969, 31423, 54907 } },
+        { LookAssistScene::Night, "cfdb9f5ca22e2b83b15c30d13d7a75e9811dcceca6f60f6fbefa6198ccc7ae5b",
+          { 654, 7049, 16014, 31471, 55243 }, { 6, 5308, 15824, 32242, 55553 }, { 6, 6740, 15707, 31574, 55685 }, { 6, 7799, 15631, 30670, 55855 } },
+        { LookAssistScene::ArtificialLights, "b4998eb039808cdb3e41649e28b798eec1d96313bf846034e78c15b85aff2b0e",
+          { 982, 7298, 16158, 31479, 55013 }, { 6, 4686, 15872, 32636, 55477 }, { 6, 6834, 15696, 31633, 55675 }, { 6, 8421, 15583, 30276, 55930 } },
+        { LookAssistScene::Shade, "913cbec93de9e935263e009d7361182bab2e4636858c1171ea2a4a72d2977a91",
+          { 1310, 7546, 16302, 31487, 54783 }, { 6, 4063, 15920, 33029, 55402 }, { 6, 6927, 15686, 31692, 55666 }, { 6, 9044, 15534, 29883, 56006 } },
+        { LookAssistScene::BrightSun, "904d7d4bc041fdaa49daa124aa462926a5f92ab8e9c26a1af70e0005f838eb5e",
+          { 1179, 7447, 16244, 31484, 54875 }, { 6, 4312, 15901, 32872, 55432 }, { 6, 6890, 15690, 31668, 55670 }, { 6, 8795, 15554, 30040, 55975 } },
     };
-    const double xs[5] = { 0.0, 0.10, 0.23, 0.52, 0.85 };
+    const double xs[5] = { 0.0, 0.10, 0.24, 0.48, 0.85 };
     for( const Pin &pin : pins )   // every scene's line first, so a re-pin reads all four from one run
     {
         const GradationTables film = gradationTables( lookAssistFilmGradationCurve( pin.scene ) );
@@ -709,6 +824,36 @@ TEST(LookAssistFilmGrade, FilmCurveIsPinned)
         const GradationTables film = gradationTables( lookAssistFilmGradationCurve( pin.scene ) );
         const QString sha = tablesSha256( film );
         ASSERT_TRUE( sha == QLatin1String( pin.sha256 ) );
+        for( int i = 0; i < 5; ++i )
+        {
+            const int v = tableIndex( xs[i] );
+            ASSERT_EQ( pin.y[i], static_cast<int>( film.y[v] ) );
+            ASSERT_EQ( pin.r[i], static_cast<int>( film.r[v] ) );
+            ASSERT_EQ( pin.g[i], static_cast<int>( film.g[v] ) );
+            ASSERT_EQ( pin.b[i], static_cast<int>( film.b[v] ) );
+        }
+    }
+}
+
+TEST(LookAssistFilmGrade, FilmV2CurveIsPinned)
+{
+    // The legacy film-v2 builder (#328), byte for byte: the pins FilmCurveIsPinned held at b2cbe893, unchanged.
+    struct Pin { LookAssistScene scene; const char *sha256; int y[5]; int r[5]; int g[5]; int b[5]; };
+    const Pin pins[] = {
+        { LookAssistScene::Night, "e04eda3fcf58a45d8600d4810ae3d62232591d3999c0e35f2a760097b5eb3d92",
+          { 654, 7049, 15373, 34063, 55243 }, { 6, 5407, 15129, 35551, 56146 }, { 6, 6725, 15059, 34298, 55770 }, { 6, 7700, 15015, 32602, 55261 } },
+        { LookAssistScene::ArtificialLights, "248f691bb96e48ac4a572b9a61a76af30c9218ca6fa3765e8e19427e387efb79",
+          { 982, 7298, 15524, 34056, 55013 }, { 6, 4833, 15158, 36289, 56367 }, { 6, 6811, 15053, 34409, 55803 }, { 6, 8274, 14987, 31865, 55040 } },
+        { LookAssistScene::Shade, "d0ab4bac7494ac3d66b3a151e295051585b0855e561ab78a8647abf151021ba0",
+          { 1310, 7546, 15675, 34049, 54783 }, { 6, 4260, 15187, 37026, 56588 }, { 6, 6897, 15046, 34519, 55836 }, { 6, 8847, 14958, 31128, 54819 } },
+        { LookAssistScene::BrightSun, "21b04857fe8d03508850f9c689268dbfd4f50ebc729dcd38400539691aa6ec29",
+          { 1179, 7447, 15615, 34052, 54875 }, { 6, 4489, 15175, 36731, 56500 }, { 6, 6863, 15049, 34475, 55823 }, { 6, 8618, 14969, 31423, 54907 } },
+    };
+    const double xs[5] = { 0.0, 0.10, 0.23, 0.52, 0.85 };
+    for( const Pin &pin : pins )
+    {
+        const GradationTables film = gradationTables( lookAssistFilmGradationCurveV2( pin.scene ) );
+        ASSERT_TRUE( tablesSha256( film ) == QLatin1String( pin.sha256 ) );
         for( int i = 0; i < 5; ++i )
         {
             const int v = tableIndex( xs[i] );
@@ -751,14 +896,14 @@ TEST(LookAssistFilmGrade, FilmV1CurveIsPinned)
 
 TEST(LookAssistFilmGrade, FilmIsAGradeNotATone)
 {
-    // The inert kill, at film-v2's knots: at Shade every channel leaves the default by at least 60% of its knot offset,
-    // the right way round (teal at 0.10: R down, B and G up; warm at 0.52: R and G up, B down).
+    // The inert kill, at film-v3's knots: at Shade every channel leaves the default by at least 60% of its knot offset,
+    // the right way round (teal at 0.10: R down, B and G up; warm at 0.48: R and G up, B down).
     const GradationTables def = gradationTables( defaultCurve() );
     const LookAssistFilmGrade g = lookAssistFilmGradeForScene( LookAssistScene::Shade );
     const GradationTables film = gradationTables( lookAssistFilmGradationCurve( LookAssistScene::Shade ) );
     const auto off = [&def]( const std::vector<uint16_t> &t, int v ) { return static_cast<int>( t[v] ) - static_cast<int>( def.g[v] ); };
     const int lo = tableIndex( 0.10 );
-    const int hi = tableIndex( 0.52 );
+    const int hi = tableIndex( 0.48 );
     const double t = g.tealOffset * 65535.0, w = g.warmOffset * 65535.0, k = g.greenShare;
     ASSERT_TRUE( off( film.r, lo ) <= -0.6 * t );
     ASSERT_TRUE( off( film.b, lo ) >= 0.6 * t );
@@ -770,70 +915,71 @@ TEST(LookAssistFilmGrade, FilmIsAGradeNotATone)
     ASSERT_FALSE( lookAssistIsDefaultGradationCurve( lookAssistFilmGradationCurve( LookAssistScene::Shade ) ) );
 }
 
-TEST(LookAssistFilmGrade, FilmV2IsMateriallyStrongerThanV1)
+TEST(LookAssistFilmGrade, FilmV3IsMateriallyStrongerThanV1)
 {
-    // The owner's complaint was that v1 is too subtle. Through the engine's stage, on a neutral 8-bit ramp, the split S
-    // (mean B-R over input codes [8,40] minus over [85,140], the #319 trio's tile bands, less the default curve's) at Shade
-    // must be at least 3x v1's. v2 is never v1, and never the default, at any scene.
+    // The owner's complaint about v1 was that it is too subtle; v3 takes v2's amber lean out without going back there.
+    // Through the engine's stage, on a neutral 8-bit ramp, the split S (mean B-R over input codes [8,40] minus over
+    // [85,140], the #319 trio's tile bands, less the default curve's) at Shade must be at least 3x v1's AND at least 0.70x
+    // v2's. v3 is never v1, and never the default, at any scene.
     const GradationTables def = gradationTables( defaultCurve() );
     const double sDefault = neutralSplit8( def );
-    double v1Shade = 0.0, v2Shade = 0.0;
+    double v1Shade = 0.0, v2Shade = 0.0, v3Shade = 0.0;
     for( LookAssistScene scene : kFilmScenes )
     {
-        const GradationTables v2 = gradationTables( lookAssistFilmGradationCurve( scene ) );
+        const GradationTables v3 = gradationTables( lookAssistFilmGradationCurve( scene ) );
+        const GradationTables v2 = gradationTables( lookAssistFilmGradationCurveV2( scene ) );
         const GradationTables v1 = gradationTables( lookAssistFilmGradationCurveV1( scene ) );
+        const double s3 = neutralSplit8( v3 ) - sDefault;
         const double s2 = neutralSplit8( v2 ) - sDefault;
         const double s1 = neutralSplit8( v1 ) - sDefault;
-        std::fprintf( stderr, "FILM-V2-AMPLITUDE scene=%s S_table(v1)=%.3f S_table(v2)=%.3f ratio=%.3f\n",
-                      qPrintable( lookAssistSceneName( scene ) ), s1, s2, s1 != 0.0 ? s2 / s1 : 0.0 );
-        if( scene == LookAssistScene::Shade ) { v1Shade = s1; v2Shade = s2; }
+        std::fprintf( stderr, "FILM-V3-AMPLITUDE scene=%s S_table(v1)=%.3f S_table(v2)=%.3f S_table(v3)=%.3f v3/v1=%.3f v3/v2=%.3f\n",
+                      qPrintable( lookAssistSceneName( scene ) ), s1, s2, s3, s1 != 0.0 ? s3 / s1 : 0.0, s2 != 0.0 ? s3 / s2 : 0.0 );
+        if( scene == LookAssistScene::Shade ) { v1Shade = s1; v2Shade = s2; v3Shade = s3; }
         ASSERT_TRUE( lookAssistFilmGradationCurve( scene ) != lookAssistFilmGradationCurveV1( scene ) );
         ASSERT_FALSE( lookAssistIsDefaultGradationCurve( lookAssistFilmGradationCurve( scene ) ) );
-        ASSERT_FALSE( v2.y == def.y && v2.r == def.r && v2.g == def.g && v2.b == def.b );
-        ASSERT_TRUE( s2 > s1 );
+        ASSERT_FALSE( v3.y == def.y && v3.r == def.r && v3.g == def.g && v3.b == def.b );
+        ASSERT_TRUE( s3 > s1 );
     }
     ASSERT_TRUE( v1Shade > 0.0 );
-    ASSERT_TRUE( v2Shade >= 3.0 * v1Shade );
+    ASSERT_TRUE( v3Shade >= 3.0 * v1Shade );
+    ASSERT_TRUE( v3Shade >= 0.70 * v2Shade );
 }
 
-TEST(LookAssistFilmGrade, FilmV2SkinPatchesKeepTheirHue)
+TEST(LookAssistFilmGrade, FilmV3SkinPatchesKeepTheirHue)
 {
-    // The skin-hue guard, by construction (the teal lift ends at 0.20; 0.20..0.26 is neutral; G takes a share of the warm
+    // The skin-hue guard, by construction (the teal lift ends at 0.20; 0.20..0.28 is neutral; G takes a share of the warm
     // push). HSV hue as the engine's fromRGBtoHSV computes it, through the stage, against the default curve's, on skin
     // patches R:G:B = 1:0.72:0.56 and 1:0.80:0.68 at several levels, every scene:
     //   (G1) the graded hue stays in [12, 32] degrees;
     //   (G2) no patch moves more than 3.5 degrees toward magenta (dh < 0);
-    //   (G3) at Shade, v2's largest magenta-ward move is no larger than v1's over the same patches.
+    //   (G3) at Shade, v3's largest magenta-ward move is no larger than v2's over the same patches.
     const GradationTables def = gradationTables( defaultCurve() );
-    struct Patch { double g, b, r; };
-    const Patch patches[] = { { 0.72, 0.56, 0.35 }, { 0.72, 0.56, 0.50 }, { 0.72, 0.56, 0.65 }, { 0.72, 0.56, 0.80 },
-                              { 0.80, 0.68, 0.55 }, { 0.80, 0.68, 0.75 }, { 0.80, 0.68, 0.90 } };
     // Every value first (printed), then the guard's kill (G3), then G1 and G2, so a guard regression reads as G3.
-    double v2MagentaShade = 0.0, v1MagentaShade = 0.0;
-    std::vector<std::pair<double, double>> graded;   // (hue_v2, dh_v2) for G1 / G2
+    double v3MagentaShade = 0.0, v2MagentaShade = 0.0;
+    std::vector<std::pair<double, double>> graded;   // (hue_v3, dh_v3) for G1 / G2
     for( LookAssistScene scene : kFilmScenes )
     {
-        const GradationTables v2 = gradationTables( lookAssistFilmGradationCurve( scene ) );
-        const GradationTables v1 = gradationTables( lookAssistFilmGradationCurveV1( scene ) );
-        for( const Patch &p : patches )
+        const GradationTables v3 = gradationTables( lookAssistFilmGradationCurve( scene ) );
+        const GradationTables v2 = gradationTables( lookAssistFilmGradationCurveV2( scene ) );
+        for( const Patch &p : kSkinPatches )
         {
             const double r = p.r, g = p.g * p.r, b = p.b * p.r;
             const double h0 = gradedHue( def, r, g, b );
+            const double h3 = gradedHue( v3, r, g, b );
             const double h2 = gradedHue( v2, r, g, b );
-            const double h1 = gradedHue( v1, r, g, b );
-            std::fprintf( stderr, "FILM-V2-SKIN scene=%s patch=1:%.2f:%.2f R=%.2f hue_default=%.3f hue_v2=%.3f dh_v2=%+.3f"
-                          " hue_v1=%.3f dh_v1=%+.3f\n", qPrintable( lookAssistSceneName( scene ) ), p.g, p.b, p.r, h0, h2,
-                          h2 - h0, h1, h1 - h0 );
-            graded.push_back( std::make_pair( h2, h2 - h0 ) );
-            if( scene == LookAssistScene::Shade )
-            {
-                v2MagentaShade = std::max( v2MagentaShade, h0 - h2 );
-                v1MagentaShade = std::max( v1MagentaShade, h0 - h1 );
-            }
+            std::fprintf( stderr, "FILM-V3-SKIN scene=%s patch=1:%.2f:%.2f R=%.2f hue_default=%.3f hue_v3=%.3f dh_v3=%+.3f"
+                          " hue_v2=%.3f dh_v2=%+.3f\n", qPrintable( lookAssistSceneName( scene ) ), p.g, p.b, p.r, h0, h3,
+                          h3 - h0, h2, h2 - h0 );
+            graded.push_back( std::make_pair( h3, h3 - h0 ) );
+        }
+        if( scene == LookAssistScene::Shade )
+        {
+            v3MagentaShade = skinHue( v3, def ).magentaWard;
+            v2MagentaShade = skinHue( v2, def ).magentaWard;
         }
     }
-    std::fprintf( stderr, "FILM-V2-SKIN Shade max magenta-ward v2=%.3f v1=%.3f\n", v2MagentaShade, v1MagentaShade );
-    ASSERT_TRUE( v2MagentaShade <= v1MagentaShade );                // G3
+    std::fprintf( stderr, "FILM-V3-SKIN Shade max magenta-ward v3=%.3f v2=%.3f\n", v3MagentaShade, v2MagentaShade );
+    ASSERT_TRUE( v3MagentaShade <= v2MagentaShade );                // G3
     for( const std::pair<double, double> &h : graded )
     {
         ASSERT_TRUE( h.first >= 12.0 && h.first <= 32.0 );          // G1
@@ -841,10 +987,10 @@ TEST(LookAssistFilmGrade, FilmV2SkinPatchesKeepTheirHue)
     }
 }
 
-TEST(LookAssistFilmGrade, FilmV2LiftsBlacksAndRollsWhites)
+TEST(LookAssistFilmGrade, FilmV3LiftsBlacksAndRollsWhites)
 {
     // The gentle black lift and the soft shoulder, at every scene: Y[0] >= 0.015 s and Y[65535] <= 1 - 0.02 s (of 65535),
-    // and every one of the four tables is monotonic non-decreasing (no tone reversal anywhere).
+    // and every one of the four tables is monotonic non-decreasing (no tone reversal anywhere). v3's Y line is v2's.
     for( LookAssistScene scene : kFilmScenes )
     {
         const LookAssistFilmGrade g = lookAssistFilmGradeForScene( scene );
@@ -853,42 +999,93 @@ TEST(LookAssistFilmGrade, FilmV2LiftsBlacksAndRollsWhites)
         for( const std::vector<uint16_t> *table : { &film.y, &film.r, &film.g, &film.b } )
             for( int v = 1; v < 65536; ++v )
                 if( ( *table )[v] < ( *table )[v - 1] ) monotonic = false;
-        std::fprintf( stderr, "FILM-V2-TONE scene=%s Y[0]=%d (floor %.1f) Y[65535]=%d (ceiling %.1f) monotonic=%d\n",
+        std::fprintf( stderr, "FILM-V3-TONE scene=%s Y[0]=%d (floor %.1f) Y[65535]=%d (ceiling %.1f) monotonic=%d\n",
                       qPrintable( lookAssistSceneName( scene ) ), film.y[0], 0.015 * g.strength * 65535.0, film.y[65535],
                       ( 1.0 - 0.02 * g.strength ) * 65535.0, monotonic ? 1 : 0 );
         ASSERT_TRUE( film.y[0] >= 0.015 * g.strength * 65535.0 );
         ASSERT_TRUE( film.y[65535] <= ( 1.0 - 0.02 * g.strength ) * 65535.0 );
         ASSERT_TRUE( monotonic );
+        ASSERT_TRUE( film.y == gradationTables( lookAssistFilmGradationCurveV2( scene ) ).y );
     }
 }
 
 TEST(LookAssistFilmGrade, DumpTablesWhenAsked)
 {
-    // Frame-locked comparison tooling (tools/profiling/look-flavor-diff.py regrade): with MLVAPP_FILM_TABLE_DUMP_DIR set,
-    // writes the engine-built tables of film-v1 and film-v2 for every scene, each file 4 x 65536 uint16 little-endian in
-    // Y, R, G, B order (film-<v1|v2>-<scene>.u16). Unset: a pass with no output. No binary is tracked.
+    // Frame-locked comparison tooling (tools/profiling/look-flavor-diff.py regrade / warmcool): with
+    // MLVAPP_FILM_TABLE_DUMP_DIR set, writes the engine-built tables of film-v1, film-v2 and film-v3 for every scene
+    // (film-<v1|v2|v3>-<scene>.u16), and of the four pre-registered v3 candidates (film-v3-<C1..C4>-<scene>.u16), each
+    // file 4 x 65536 uint16 little-endian in Y, R, G, B order. For each candidate it also prints the C++ table gates
+    // (FILM-V3-GRID lines: ramp lean, S_table against v1 / v2, the neutral green axis and the coloured set, skin G1..G3).
+    // Unset: a pass with no output. No binary is tracked.
     const QString dirPath = QString::fromLocal8Bit( qgetenv( "MLVAPP_FILM_TABLE_DUMP_DIR" ) );
     if( dirPath.isEmpty() ) return;
     QDir dir( dirPath );
     ASSERT_TRUE( dir.mkpath( QStringLiteral(".") ) );
+    const auto writeTable = [&dir]( const GradationTables &t, const QString &name ) {
+        QByteArray bytes;
+        for( const std::vector<uint16_t> *table : { &t.y, &t.r, &t.g, &t.b } )
+            for( uint16_t value : *table )
+            {
+                bytes.append( static_cast<char>( value & 0xff ) );
+                bytes.append( static_cast<char>( value >> 8 ) );
+            }
+        if( static_cast<int>( bytes.size() ) != 4 * 65536 * 2 ) return false;
+        QFile out( dir.filePath( name ) );
+        if( !out.open( QIODevice::WriteOnly ) || out.write( bytes ) != static_cast<qint64>( bytes.size() ) ) return false;
+        std::fprintf( stderr, "FILM-TABLE-DUMP %s sha256=%s\n", qPrintable( out.fileName() ), qPrintable( tablesSha256( t ) ) );
+        return true;
+    };
     for( LookAssistScene scene : kFilmScenes )
-        for( int version = 1; version <= 2; ++version )
+        for( int version = 1; version <= 3; ++version )
         {
-            const GradationTables t = gradationTables( version == 2 ? lookAssistFilmGradationCurve( scene )
-                                                                    : lookAssistFilmGradationCurveV1( scene ) );
-            QByteArray bytes;
-            for( const std::vector<uint16_t> *table : { &t.y, &t.r, &t.g, &t.b } )
-                for( uint16_t value : *table )
-                {
-                    bytes.append( static_cast<char>( value & 0xff ) );
-                    bytes.append( static_cast<char>( value >> 8 ) );
-                }
-            ASSERT_EQ( 4 * 65536 * 2, static_cast<int>( bytes.size() ) );
-            QFile out( dir.filePath( QStringLiteral("film-v%1-%2.u16").arg( version ).arg( lookAssistSceneName( scene ) ) ) );
-            ASSERT_TRUE( out.open( QIODevice::WriteOnly ) );
-            ASSERT_EQ( static_cast<qint64>( bytes.size() ), out.write( bytes ) );
-            std::fprintf( stderr, "FILM-TABLE-DUMP %s sha256=%s\n", qPrintable( out.fileName() ), qPrintable( tablesSha256( t ) ) );
+            const GradationTables t = gradationTables( version == 3 ? lookAssistFilmGradationCurve( scene )
+                                                       : version == 2 ? lookAssistFilmGradationCurveV2( scene )
+                                                                      : lookAssistFilmGradationCurveV1( scene ) );
+            ASSERT_TRUE( writeTable( t, QStringLiteral("film-v%1-%2.u16").arg( version ).arg( lookAssistSceneName( scene ) ) ) );
         }
+
+    const GradationTables def = gradationTables( defaultCurve() );
+    const double sDefault = neutralSplit8( def );
+    const double sV1Shade = neutralSplit8( gradationTables( lookAssistFilmGradationCurveV1( LookAssistScene::Shade ) ) ) - sDefault;
+    const GradationTables v2Shade = gradationTables( lookAssistFilmGradationCurveV2( LookAssistScene::Shade ) );
+    const double sV2Shade = neutralSplit8( v2Shade ) - sDefault;
+    const double v2MagentaShade = skinHue( v2Shade, def ).magentaWard;
+    for( const FilmCandidate &c : kFilmV3Grid )
+    {
+        bool ramp = true, neutral = true, coloured = true, g1 = true, g2 = true;
+        double sShade = 0.0, magentaShade = 0.0;
+        for( LookAssistScene scene : kFilmScenes )
+        {
+            const GradationTables t = gradationTables( lookAssistFilmGradationCurve( filmCandidateGrade( scene, c ) ) );
+            ASSERT_TRUE( writeTable( t, QStringLiteral("film-v3-%1-%2.u16").arg( QLatin1String( c.id ) ).arg( lookAssistSceneName( scene ) ) ) );
+            const double lean = rampLean( t );
+            const GreenAxis a = greenAxis( t, def );
+            QString signs;
+            for( const Coloured &col : kColouredSet )
+            {
+                const double dGA = gradedGreenAxis8( t, col.r, col.g, col.b ) - gradedGreenAxis8( def, col.r, col.g, col.b );
+                signs += QStringLiteral(" %1=%2").arg( QLatin1String( col.name ) ).arg( dGA, 0, 'f', 4 );
+                if( !( dGA * col.sign > 0.0 ) ) coloured = false;
+            }
+            const SkinHue skin = skinHue( t, def );
+            const double s = neutralSplit8( t ) - sDefault;
+            if( scene == LookAssistScene::Shade ) { sShade = s; magentaShade = skin.magentaWard; }
+            ramp = ramp && std::fabs( lean ) <= kWarmCoolNeutralBound;
+            neutral = neutral && a.neutralLo >= -0.5 && a.neutralHi <= 2.5;
+            g1 = g1 && skin.hueLo >= 12.0 && skin.hueHi <= 32.0;
+            g2 = g2 && skin.dhLo >= -3.5;
+            std::fprintf( stderr, "FILM-V3-GRID %s t=%.3f w=%.3f scene=%s rampLean=%+.6f (%+.3f/255) S_table=%.3f neutral_dGA=[%+.4f,%+.4f]"
+                          " any_pixel=[%+.4f,%+.4f] skin_hue=[%.3f,%.3f] skin_dh_min=%+.3f skin_magenta_ward=%.3f coloured:%s\n",
+                          c.id, c.teal, c.warm, qPrintable( lookAssistSceneName( scene ) ), lean, lean * 255.0, s,
+                          a.neutralLo, a.neutralHi, a.lo, a.hi, skin.hueLo, skin.hueHi, skin.dhLo, skin.magentaWard, qPrintable( signs ) );
+        }
+        const bool strongerV1 = sShade >= 3.0 * sV1Shade, strongerV2 = sShade >= 0.70 * sV2Shade, g3 = magentaShade <= v2MagentaShade;
+        std::fprintf( stderr, "FILM-V3-GRID-GATES %s WC-RAMP=%s FILM-STRONGER(C++ S_table %.3f >= 3.0 x v1 %.3f: %s; >= 0.70 x v2 %.3f: %s)"
+                      " NO-MAGENTA(C++ neutral in [-0.5,+2.5]: %s; coloured signs: %s) SKIN(G1: %s; G2: %s; G3 %.3f <= v2 %.3f: %s)\n",
+                      c.id, ramp ? "PASS" : "FAIL", sShade, sV1Shade, strongerV1 ? "PASS" : "FAIL", sV2Shade, strongerV2 ? "PASS" : "FAIL",
+                      neutral ? "PASS" : "FAIL", coloured ? "PASS" : "FAIL", g1 ? "PASS" : "FAIL", g2 ? "PASS" : "FAIL",
+                      magentaShade, v2MagentaShade, g3 ? "PASS" : "FAIL" );
+    }
 }
 
 TEST(LookAssistFilmGrade, FilmKeepsTheBalanceAndCinematicsToneOnTheFixtures)
@@ -905,7 +1102,7 @@ TEST(LookAssistFilmGrade, FilmKeepsTheBalanceAndCinematicsToneOnTheFixtures)
         ASSERT_TRUE( baselineRow( r.key, &master ) );
         const QMap<QString, int> classic = receiptFields( master.receipt );
         const QMap<QString, int> film = receiptFields( r.receipt );
-        ASSERT_TRUE( r.appliedLine.endsWith( QStringLiteral(" flavor=film grade=film-v2") ) );
+        ASSERT_TRUE( r.appliedLine.endsWith( QStringLiteral(" flavor=film grade=film-v3") ) );
         ASSERT_TRUE( r.flavorOnReceipt == QLatin1String( "film" ) );
         const QString scene = appliedField( r.appliedLine, QStringLiteral("scene") );
         ASSERT_TRUE( scene == appliedField( master.applied, QStringLiteral("scene") ) );
@@ -960,7 +1157,7 @@ TEST(LookAssistFilmGrade, TheBaselineRoundTripLeavesNoTraceOfTheGrade)
             ASSERT_TRUE( applyCapturingLine( fixture, receipt, &line ) );
         }
         filmScene = appliedField( line, QStringLiteral("scene") );
-        ASSERT_TRUE( line.endsWith( QStringLiteral(" flavor=film grade=film-v2") ) );
+        ASSERT_TRUE( line.endsWith( QStringLiteral(" flavor=film grade=film-v3") ) );
         ASSERT_TRUE( receipt.gradationCurve() == lookAssistFilmGradationCurve( sceneByName( filmScene ) ) );
         ASSERT_TRUE( receipt.lookAssistBaselineGradationCurve() == before );   // the default it replaced
         filmXml = lookAssistReceiptXml( receipt );
@@ -1036,7 +1233,7 @@ TEST(LookAssistFilmGrade, AUserEditAfterTheFilmGradeIsKeptByAClassicReRunAndByLo
             FlavorEnv env( "film" );
             ASSERT_TRUE( applyCapturingLine( fixture, receipt, &line ) );
         }
-        ASSERT_TRUE( line.endsWith( QStringLiteral(" flavor=film grade=film-v2") ) );
+        ASSERT_TRUE( line.endsWith( QStringLiteral(" flavor=film grade=film-v3") ) );
         ASSERT_FALSE( receipt.lookAssistBaselineGradationCurve().isEmpty() );
         const QString edited = userEdit( receipt.gradationCurve() );
         ASSERT_FALSE( lookAssistIsDefaultGradationCurve( edited ) );
@@ -1066,11 +1263,11 @@ TEST(LookAssistFilmGrade, AUserEditAfterTheFilmGradeIsKeptByAClassicReRunAndByLo
     }
 }
 
-TEST(LookAssistFilmGrade, AV1ReceiptReRunAsFilmLaysV2)
+TEST(LookAssistFilmGrade, AV1ReceiptReRunAsFilmLaysV3)
 {
     // A receipt saved under #319: the film-v1 Shade curve laid over the default, the default on record as the baseline.
-    // Re-run as Film, the v1 curve is recognised as Film's own (not the user's), put back, and film-v2 is laid in its place
-    // over the same default baseline -- never skipped_user_curve, never v2 stacked on v1.
+    // Re-run as Film, the v1 curve is recognised as Film's own (not the user's), put back, and film-v3 is laid in its place
+    // over the same default baseline -- never skipped_user_curve, never v3 stacked on v1.
     MlvPipelineFixture fixture;
     ASSERT_TRUE( openFirstFixture( fixture ) );
     ReceiptSettings &receipt = fixture.receipt();
@@ -1083,9 +1280,42 @@ TEST(LookAssistFilmGrade, AV1ReceiptReRunAsFilmLaysV2)
         FlavorEnv env( "film" );
         ASSERT_TRUE( applyCapturingLine( fixture, receipt, &line ) );
     }
-    ASSERT_TRUE( line.endsWith( QStringLiteral(" flavor=film grade=film-v2") ) );
+    ASSERT_TRUE( line.endsWith( QStringLiteral(" flavor=film grade=film-v3") ) );
     ASSERT_TRUE( receipt.gradationCurve() == lookAssistFilmGradationCurve( sceneByName( appliedField( line, QStringLiteral("scene") ) ) ) );
     ASSERT_TRUE( receipt.lookAssistBaselineGradationCurve() == base );
+}
+
+TEST(LookAssistFilmGrade, AV2ReceiptReRunAsFilmLaysV3)
+{
+    // A receipt saved under #328: the film-v2 Shade curve laid over the default, the default on record as the baseline.
+    // (a) Look Assist off: the v2 curve is Film's own, so the default comes back and the element goes.
+    // (b) Re-run as Film: the v2 curve is put back and film-v3 is laid in its place over the same default baseline --
+    //     never skipped_user_curve, never v3 stacked on v2.
+    for( int off = 1; off >= 0; --off )
+    {
+        MlvPipelineFixture fixture;
+        ASSERT_TRUE( openFirstFixture( fixture ) );
+        ReceiptSettings &receipt = fixture.receipt();
+        const QString base = receipt.gradationCurve();
+        ASSERT_TRUE( lookAssistIsDefaultGradationCurve( base ) );
+        receipt.setGradationCurve( lookAssistFilmGradationCurveV2( LookAssistScene::Shade ) );
+        receipt.setLookAssistBaselineGradationCurve( base );
+        QString line;
+        FlavorEnv env( "film" );
+        if( off )
+        {
+            receipt.setLookAssistEnabled( false );
+            ASSERT_FALSE( applyCapturingLine( fixture, receipt, nullptr ) );
+            ASSERT_TRUE( receipt.gradationCurve() == base );
+            ASSERT_TRUE( receipt.lookAssistBaselineGradationCurve().isEmpty() );
+            continue;
+        }
+        ASSERT_TRUE( applyCapturingLine( fixture, receipt, &line ) );
+        ASSERT_TRUE( line.endsWith( QStringLiteral(" flavor=film grade=film-v3") ) );
+        ASSERT_TRUE( receipt.gradationCurve() == lookAssistFilmGradationCurve( sceneByName( appliedField( line, QStringLiteral("scene") ) ) ) );
+        ASSERT_TRUE( receipt.gradationCurve() != lookAssistFilmGradationCurveV2( LookAssistScene::Shade ) );
+        ASSERT_TRUE( receipt.lookAssistBaselineGradationCurve() == base );
+    }
 }
 
 TEST(LookAssistFilmGrade, FilmIsADifferentGradedPictureFromCinematic)
