@@ -372,6 +372,8 @@ try {
     if ($null -ne $spec.PSObject.Properties['generatorArgs']) {
         if ($spec.generatorArgs.PSObject.Properties['telemetryArm']) { $gen['TelemetryArm'] = [string]$spec.generatorArgs.telemetryArm }
         if ($spec.generatorArgs.PSObject.Properties['cpuQuiescenceThresholdPercent']) { $gen['CpuQuiescenceThresholdPercent'] = [double]$spec.generatorArgs.cpuQuiescenceThresholdPercent }
+        # PLAYBACK-LJ92-DECODE-THROUGHPUT-1: the raw-uint16 prefetch decoder count, for any leg (not only a forced-look pace leg).
+        if ($spec.generatorArgs.PSObject.Properties['rawPrefetchDecoders']) { $gen['RawPrefetchDecoders'] = [int]$spec.generatorArgs.rawPrefetchDecoders }
         # PLAYBACK-BACHELOR-PRESENT-JITTER-1: a SPEED leg may force Look Assist (a capture-free pace leg: no contact-sheet grab in the timed Play).
         if (-not $isLook -and $spec.generatorArgs.PSObject.Properties['forceLookAssist'] -and [bool]$spec.generatorArgs.forceLookAssist) {
             $gen['ForceLookAssist'] = $true; $gen['LookPaceLeg'] = $true

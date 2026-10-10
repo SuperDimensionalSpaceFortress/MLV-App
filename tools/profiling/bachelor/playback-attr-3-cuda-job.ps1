@@ -352,6 +352,11 @@ param(
     # app as MLVAPP_PLAYBACK_RENDER_LOOKAHEAD_FRAMES, the lookahead A/B). -1 sets nothing, so every other job is unchanged.
     [ValidateRange(-1, 3)][int]$PlaybackRenderLookaheadFrames = -1,
 
+    # PLAYBACK-LJ92-DECODE-THROUGHPUT-1: the raw-uint16 prefetch decoder count for the K A/B on ONE exe. 0 passes
+    # MLVAPP_DISABLE_RAW_UINT16_PREFETCH=1 (no prefetch), 1..4 passes MLVAPP_RAW_UINT16_PREFETCH_DECODERS=<k>. -1 sets
+    # nothing, so every other job is the text it was.
+    [ValidateRange(-1, 4)][int]$RawPrefetchDecoders = -1,
+
     # LOOK-ASSIST-FILM-FLAVOR-2 r2: a LOOK leg's receipt file (Invoke-VenueLeg writes the bytes COMMITTED for the leg spec's look.receipt). The job
     # embeds it base64 with its sha256, writes it into its work dir, re-verifies the hash and passes it to the smoke runner as -Receipt, so the app
     # applies it before playback. Only with -ForceLookAssist -ContactSheet. Empty (the default) adds nothing: the job is the text it was before.
@@ -4229,6 +4234,14 @@ $envList = "'" + ($envs -join "','") + "'"
     'MLVAPP_PLAYBACK_RENDER_LOOKAHEAD_FRAMES=$PlaybackRenderLookaheadFrames',
 "
     }
+}
+# PLAYBACK-LJ92-DECODE-THROUGHPUT-1: any leg (speed, look, cuda or cpu) may pin the raw-uint16 prefetch decoder count.
+if ($RawPrefetchDecoders -ge 0) {
+    $rawPrefetchEnv = if ($RawPrefetchDecoders -eq 0) { 'MLVAPP_DISABLE_RAW_UINT16_PREFETCH=1' } else { "MLVAPP_RAW_UINT16_PREFETCH_DECODERS=$RawPrefetchDecoders" }
+    $template = Edit-DualVenueTemplate $template "    'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',
+" "    'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',
+    '$rawPrefetchEnv',
+"
 }
 if ($isVariant) {
     # DVE-LEG-TERMINALS-1 item 1: a variant's PresentMon wait-failure summary states its backend like every other variant summary (a cpu run's backend is read from

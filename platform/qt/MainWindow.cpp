@@ -24447,6 +24447,7 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     }
     m_playbackSmokeProcessed8PrefetchHits = 0;
     m_playbackSmokeRawPrefetchHits = 0;
+    if( m_pMlvObject ) mlvResetRawUint16PrefetchStats( m_pMlvObject );   // overlap_summary raw_* counters
     m_playbackSmokeQueuedPlaybackDropSum = 0;
     m_playbackSmokeQueuedPlaybackDropMax = 0;
     m_playbackSmokeLastWorkerThreads = m_playbackSmokeStartWorkerThreads;
@@ -24471,7 +24472,8 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
                "preview_mode=%26 env_aggressive_preview=%27 env_preview_mode=%28 "
                "env_quality_mode=%29 env_gpu_playback_recon=%30 "
                "env_gpu_playback_recon_texture_present=%31 "
-               "auto_target_fps=%32 auto_reason_start=%33" )
+               "auto_target_fps=%32 auto_reason_start=%33 "
+               "env_raw_uint16_prefetch_decoders=%34" )
                .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
                .arg( m_playbackSmokeStartPosition )
                .arg( m_playbackSmokeStartCutIn )
@@ -24508,7 +24510,8 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
                .arg( m_playbackAutoTargetFps )
                .arg( QString::fromLatin1(
                    playbackQualityAutoDecisionReasonName(
-                       m_playbackQualityAutoDecisionReason ) ) );
+                       m_playbackQualityAutoDecisionReason ) ) )
+               .arg( envValueForLog( "MLVAPP_RAW_UINT16_PREFETCH_DECODERS" ) );
 
     // CUDA-PERF-DISPLAY-WAKE-1: once per playback session, reporting the display-required
     // request this same play-start already made above (setPlaybackDisplayRequiredExecutionState
@@ -26453,6 +26456,14 @@ void MainWindow::notePlaybackSmokePresentedFrame(
                            "playback_timeline_early_advance_yield_elapsed_ms" ),
                            0, 'f', 3 );
         }
+        // PLAYBACK-LJ92-DECODE-THROUGHPUT-1: how this frame's raw-uint16 arrived and the LJ92 ms that produced it on
+        // whichever thread decoded it (a hit's raw_decompress_ms is 0). Appended to gpu_frame and cpu_frame alike, not
+        // positional, so the CUDA texture route carries the per-frame series on its own record.
+        const QString rawUint16FrameKeys =
+            QStringLiteral( " raw_uint16_source=%1 raw_uint16_frame_lj92_ms=%2 raw_uint16_inflight_wait_ms=%3" )
+                .arg( timing.value( QStringLiteral("raw_uint16_source") ).toString( QStringLiteral("none") ) )
+                .arg( telemetryDoubleValue( timing, "raw_uint16_frame_lj92_ms" ), 0, 'f', 3 )
+                .arg( telemetryDoubleValue( timing, "raw_uint16_inflight_wait_ms" ), 0, 'f', 3 );
         qInfo().noquote()
             << QStringLiteral(
                    "playback_smoke.gpu_frame session=%1 index=%2 status=%3 "
@@ -26669,7 +26680,8 @@ void MainWindow::notePlaybackSmokePresentedFrame(
                         0, 'f', 3 )
                     .arg( telemetryDoubleValue(
                         timing, "gpu_playback_recon_texture_present_setup_sampling_ms" ),
-                        0, 'f', 3 );
+                        0, 'f', 3 )
+            + rawUint16FrameKeys;
         qInfo().noquote()
             << QStringLiteral(
                    "playback_smoke.cpu_frame session=%1 index=%2 raw_uint16_ms=%3 "
@@ -26727,7 +26739,9 @@ void MainWindow::notePlaybackSmokePresentedFrame(
                     .arg( bool01( skippedScaledFocusPixels ) )
                     .arg( bool01( skippedScaledBadPixels ) )
                     .arg( bool01( skippedScaledVerticalStripes ) )
-                    .arg( bool01( skippedScaledPatternNoise ) );
+                    .arg( bool01( skippedScaledPatternNoise ) )
+            // Appended, not positional: the line is at 38 args.
+            + rawUint16FrameKeys;
         /* Phase A3 (image-pipeline-hardening): ONE canonical, machine-parsable
          * render manifest per presented frame. key=value (QStringList join), NOT
          * positional %N -- the cpu_frame line above is already at 38 args and the
@@ -27419,6 +27433,35 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
         const playback_overlap::OverlapSnapshot overlap =
             m_pRenderThread ? m_pRenderThread->pipelineOverlapSnapshot()
                             : playback_overlap::OverlapSnapshot();
+        // PLAYBACK-LJ92-DECODE-THROUGHPUT-1: the raw-uint16 prefetch counters are object-scoped (any thread decodes),
+        // so they reach this line on every route. Appended at the end; no tools/ parser anchors on the line's end.
+        mlvRawUint16PrefetchStats_t raw = {};
+        if( m_pMlvObject ) getMlvRawUint16PrefetchStats( m_pMlvObject, &raw );
+        const auto perDecode = []( double sumMs, quint64 count ) { return count ? sumMs / static_cast<double>( count ) : 0.0; };
+        const QString rawPrefetchFields =
+            QStringLiteral( " raw_prefetch_decoders=%1 raw_prefetch_admitted=%2 raw_prefetch_lookahead_max=%3 "
+                            "raw_prefetch_worker_decodes=%4 raw_prefetch_worker_lj92_ms_avg=%5 "
+                            "raw_prefetch_worker_lj92_ms_max=%6 raw_prefetch_worker_lj92_ms_over_budget=%7 "
+                            "raw_fg_hits=%8 raw_fg_inflight_waits=%9 raw_fg_inflight_wait_ms=%10 "
+                            "raw_fg_inflight_wait_timeouts=%11 raw_fg_direct_decodes=%12 raw_fg_direct_lj92_ms_avg=%13 "
+                            "raw_fg_unclaimed_decodes=%14 raw_prefetch_evicted_unconsumed=%15 "
+                            "raw_prefetch_duplicate_publishes=%16" )
+                .arg( raw.decoders )
+                .arg( static_cast<qulonglong>( raw.admitted_requests ) )
+                .arg( raw.lookahead_max )
+                .arg( static_cast<qulonglong>( raw.worker_decodes ) )
+                .arg( perDecode( raw.worker_lj92_ms_sum, raw.worker_decodes ), 0, 'f', 3 )
+                .arg( raw.worker_lj92_ms_max, 0, 'f', 3 )
+                .arg( static_cast<qulonglong>( raw.worker_lj92_over_41_7 ) )
+                .arg( static_cast<qulonglong>( raw.fg_hits ) )
+                .arg( static_cast<qulonglong>( raw.fg_inflight_waits ) )
+                .arg( raw.fg_inflight_wait_ms_sum, 0, 'f', 3 )
+                .arg( static_cast<qulonglong>( raw.fg_inflight_wait_timeouts ) )
+                .arg( static_cast<qulonglong>( raw.fg_direct_decodes ) )
+                .arg( perDecode( raw.fg_direct_lj92_ms_sum, raw.fg_direct_decodes ), 0, 'f', 3 )
+                .arg( static_cast<qulonglong>( raw.fg_unclaimed_decodes ) )
+                .arg( static_cast<qulonglong>( raw.evicted_unconsumed ) )
+                .arg( static_cast<qulonglong>( raw.duplicate_publishes ) );
         qInfo().noquote()
             << QStringLiteral(
                    "playback_smoke.overlap_summary session=%1 lookahead_depth=%2 "
@@ -27446,7 +27489,8 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                    .arg( overlap.windowMs, 0, 'f', 3 )
                    .arg( overlap.decodeBusyMs, 0, 'f', 3 )
                    .arg( overlap.reconBusyMs, 0, 'f', 3 )
-                   .arg( static_cast<qulonglong>( overlap.reconStartsHeldForRender ) );
+                   .arg( static_cast<qulonglong>( overlap.reconStartsHeldForRender ) )
+            + rawPrefetchFields;
     }
 
     // PLAYBACK-BACHELOR-PRESENT-JITTER-1: where the lost frames went (PlaybackSlipHistogram.h). Slips and class

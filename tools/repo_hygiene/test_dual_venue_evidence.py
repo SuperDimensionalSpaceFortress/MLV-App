@@ -88,9 +88,13 @@ LOOKAHEAD_LEGS = ("legs/m16-1243-pace-cinematic-fullscreen-s4-la3.json",)
 # ... and (r2) the stall-stage diagnostic: the owner-shape pace leg at telemetryArm HEAVY, which keeps the per-frame playback_smoke.frame log
 # (LIGHT disables it), so the present that ends a >= 250 ms interval shows its own stage times. Diagnostic only: never a pace number.
 HEAVY_LEGS = ("legs/m16-1243-pace-cinematic-fullscreen-s4-heavy.json",)
+# PLAYBACK-LJ92-DECODE-THROUGHPUT-1: the K=1 arm of the raw-uint16 prefetch decoder A/B, one twin per leg it pairs with (the other arm is the leg
+# itself at the app's default K=2). Each differs from its twin only in its legId and generatorArgs.rawPrefetchDecoders 1.
+DECODER_LEGS = {"legs/m16-1243-pace-cinematic-fullscreen-s4-dec1.json": "legs/m16-1243-pace-cinematic-fullscreen-s4.json",
+                "legs/m16-1243-pace-cinematic-fullscreen-s4-heavy-dec1.json": "legs/m16-1243-pace-cinematic-fullscreen-s4-heavy.json"}
 # LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1 added the scale-2 Cinematic twin of the scale-2 look leg (the Bachelor CPU Classic | Cinematic look pair).
 SHIPPED_LEGS = ("legs/m16-1243-speed.json", "legs/m16-1243-look.json", "legs/m16-1243-look-scale2.json", "legs/m16-1243-look-cinematic.json", *DISPLAY_MATRIX_LEGS, *PACE_LEGS,
-                *LOOKAHEAD_LEGS, *HEAVY_LEGS, "legs/m16-1243-look-scale2-cinematic.json", "legs/m16-1243-look-film.json",
+                *LOOKAHEAD_LEGS, *HEAVY_LEGS, *DECODER_LEGS, "legs/m16-1243-look-scale2-cinematic.json", "legs/m16-1243-look-film.json",
                 "legs/m16-1243-look-scale2-film.json", *(f"legs/m16-1243-look-scale2-{flavor}-agxoff.json" for flavor in ("cinematic", "film")))
 # LOOK-ASSIST-FILM-FLAVOR-2 r2: the AgX-off twins of the scale-2 Cinematic and Film legs carry a committed look receipt (look-receipts/agx-off.marxml).
 AGXOFF_LEGS = {f"m16-1243-look-scale2-{flavor}-agxoff": f"m16-1243-look-scale2-{flavor}" for flavor in ("cinematic", "film")}
@@ -458,6 +462,32 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         self.assertIn("$gen['ForceLookAssist'] = $true; $gen['LookPaceLeg'] = $true", runner)
         self.assertIn("if ($spec.generatorArgs.PSObject.Properties['lookFlavor']) { $gen['LookFlavor'] = [string]$spec.generatorArgs.lookFlavor }", runner)
         self.assertIn("if ($spec.generatorArgs.PSObject.Properties['playbackRenderLookaheadFrames']) { $gen['PlaybackRenderLookaheadFrames'] = [int]$spec.generatorArgs.playbackRenderLookaheadFrames }", runner)
+
+    def test_the_raw_prefetch_decoder_count_reaches_the_job_only_when_asked(self) -> None:
+        """PLAYBACK-LJ92-DECODE-THROUGHPUT-1: generatorArgs.rawPrefetchDecoders maps to -RawPrefetchDecoders for any leg (not only a forced-look
+        pace leg); 0 is the no-prefetch arm, k the decoder count, and absent leaves the job's text exactly as it was."""
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        mapping = "if ($spec.generatorArgs.PSObject.Properties['rawPrefetchDecoders']) { $gen['RawPrefetchDecoders'] = [int]$spec.generatorArgs.rawPrefetchDecoders }"
+        self.assertIn(mapping, runner)
+        forced = runner.index("if (-not $isLook -and $spec.generatorArgs.PSObject.Properties['forceLookAssist']")
+        self.assertLess(runner.index(mapping), forced, "the mapping must sit outside the forceLookAssist branch")
+        absent = self.generate(GENERATOR, "rawpf-absent.job.ps1", []).read_text(encoding="utf-8")
+        self.assertNotIn("MLVAPP_RAW_UINT16_PREFETCH_DECODERS", absent)
+        self.assertNotIn("MLVAPP_DISABLE_RAW_UINT16_PREFETCH", absent)
+        off = self.generate(GENERATOR, "rawpf-0.job.ps1", ["-RawPrefetchDecoders", "0"])
+        self.assertEqual(self.parse_errors(off), 0)
+        off_text = off.read_text(encoding="utf-8")
+        self.assertIn("'MLVAPP_DISABLE_RAW_UINT16_PREFETCH=1',", off_text)
+        self.assertNotIn("MLVAPP_RAW_UINT16_PREFETCH_DECODERS", off_text)
+        two = self.generate(GENERATOR, "rawpf-2.job.ps1", ["-RawPrefetchDecoders", "2"])
+        self.assertEqual(self.parse_errors(two), 0)
+        two_text = two.read_text(encoding="utf-8")
+        self.assertIn("'MLVAPP_RAW_UINT16_PREFETCH_DECODERS=2',", two_text)
+        self.assertNotIn("MLVAPP_DISABLE_RAW_UINT16_PREFETCH", two_text)
+        pace = self.generate(GENERATOR, "rawpf-pace-1.job.ps1", ["-ForceLookAssist", "-LookPaceLeg", "-LookFlavor", "cinematic", "-RawPrefetchDecoders", "1"])
+        self.assertIn("'MLVAPP_RAW_UINT16_PREFETCH_DECODERS=1',", pace.read_text(encoding="utf-8"))
+        # The smoke launcher clears the variable unless the job passes it, so a stray value never leaks into a leg.
+        self.assertIn('"MLVAPP_RAW_UINT16_PREFETCH_DECODERS",', LAUNCHER.read_text(encoding="utf-8"))
 
     def test_scale_and_quiescence_parameters_reach_the_job(self) -> None:
         text = self.generate(GENERATOR, "scale.job.ps1", ["-ScaleFactor", "1", "-CpuQuiescenceThresholdPercent", "35.5"]).read_text(encoding="utf-8")
@@ -5056,6 +5086,17 @@ class LegSpecSchemaTests(unittest.TestCase):
             base["generatorArgs"].pop("telemetryArm")
             self.assertEqual(dict(arm, legId=base["legId"]), base, rel)
 
+    def test_the_decoder_legs_are_their_twins_at_one_raw_prefetch_decoder(self) -> None:
+        """PLAYBACK-LJ92-DECODE-THROUGHPUT-1: the K=1 arm differs from the leg it pairs with only in its legId and generatorArgs.rawPrefetchDecoders 1."""
+        for rel, twin_rel in DECODER_LEGS.items():
+            arm = json.loads((DV / rel).read_text(encoding="utf-8"))
+            self.jsonschema.validate(arm, self.schema)
+            twin = json.loads((DV / twin_rel).read_text(encoding="utf-8"))
+            self.assertNotIn("rawPrefetchDecoders", twin["generatorArgs"], twin_rel)
+            self.assertEqual(arm["legId"], twin["legId"] + "-dec1", rel)
+            self.assertEqual(arm["generatorArgs"].pop("rawPrefetchDecoders"), 1, rel)
+            self.assertEqual(dict(arm, legId=twin["legId"]), twin, rel)
+
     def test_the_hand_listed_shipped_legs_are_exactly_the_legs_directory(self) -> None:
         self.assertEqual(sorted(SHIPPED_LEGS), sorted("legs/" + p.name for p in (DV / "legs").glob("*.json")), "SHIPPED_LEGS drifted from the legs/ directory")
 
@@ -5079,7 +5120,7 @@ class LegSpecSchemaTests(unittest.TestCase):
                 self.assertRegex(spec["legId"], r"^m16-1243-display-(fullscreen|windowed)-s[124]$", path.name)
             elif spec["card"] == "PLAYBACK-BACHELOR-PRESENT-JITTER-1":   # the capture-free pace legs, named by flavor and cell
                 self.assertEqual(spec["legId"], path.stem, path.name)
-                self.assertRegex(spec["legId"], rf"^m16-1243-pace-{flavor}-(fullscreen|windowed)-s[124](-la[0-3]|-heavy)?$", path.name)
+                self.assertRegex(spec["legId"], rf"^m16-1243-pace-{flavor}-(fullscreen|windowed)-s[124](-la[0-3]|-heavy)?(-dec[0-4])?$", path.name)
             else:   # the scale-4 flavored look leg, or its scale-2 twin (LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1), or that twin's AgX-off copy (LOOK-ASSIST-FILM-FLAVOR-2 r2)
                 self.assertIn(spec["legId"], (f"m16-1243-look-{flavor}", f"m16-1243-look-scale2-{flavor}", f"m16-1243-look-scale2-{flavor}-agxoff"), path.name)
                 self.assertEqual(spec["legId"], path.stem, path.name)
