@@ -22,6 +22,14 @@ Tests: `tests/coordination/test_autopilot_board_ff.py` (throwaway local repos on
 
 Tests: `tests/coordination/test_autopilot_fold_cadence.py` (fake recall script; no real bus). Not wired into the live beat by this folder.
 
+## Tracked now (PRODUCT-SHARE-BIND-1)
+
+| File | What it is |
+|---|---|
+| `product-share.ps1` | Hub-tick step that binds `Test-ProductRatioGuard.ps1`: runs it under a hard deadline, caches a `mlv-app/product-share-verdict/v1` verdict (GREEN, RED or UNKNOWN), and exposes `Get-ProductSlotPlan` (RED with a product card due reserves a product slot and caps incident/hub-tooling lanes at one). Always exits 0: the verdict never changes a caller's exit code. `-Detach` refreshes a stale cache with a hidden worker, because the guard was measured at 529 s on the board. |
+
+Tests: `tests/coordination/test_autopilot_product_share.py` (fake guards only). Not yet wired into the live beat; the live-wiring patch is staged by the hub outside the tree (`live-wiring.patch.md` in the r1 run dir, `C:\!Layi Wkspc\MLV-App\.claude-state\fleet-runs\lane-PRODUCT-SHARE-BIND-1-r1-20261010T1045Z\live-wiring.patch.md`) and applied by the hub after merge.
+
 ## Profile schema (`board-profile.v1`)
 
 All keys are required; a string or array must be non-empty.
