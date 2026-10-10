@@ -21,8 +21,15 @@ A tracked ``test_*.py`` passes when ANY of these holds:
 No YAML parser is used (PyYAML is pinned in no hash-locked requirements file here), so
 this is a bounded TEXT scan: only the value of a ``run:`` key is read, full-line and
 trailing ``#`` comments are dropped, shell and PowerShell line continuations are joined,
-backslashes become slashes, each logical line is split into simple commands on ``&&``,
-``||``, ``|`` and ``;``, and each command into whitespace tokens. An option that needs a
+and a character scanner with a quote state splits each ``run:`` body into simple commands on
+``&&``, ``||``, ``|``, ``;``, braces, parentheses and line ends, OUTSIDE quotes only (text
+inside quotes is one word, never a command), and into words on whitespace. Backslashes outside
+an escape become slashes. The scan FAILS CLOSED rather than modelling a shell: a command inside
+a ``function`` body (bash ``name() {``, ``function name {``; PowerShell ``function Name {``) and
+every command after a top-level bare ``exit`` / ``return`` credit nothing, even when the
+function is called later (name the file outside the function, or allowlist it). Not modelled:
+a function call graph, ``$f = { ... }`` script blocks, a ``(subshell)`` function, here-doc
+bodies, ``then`` / ``do`` as a command head. An option that needs a
 value but has none (``pytest tools/a --ignore``) raises ``WorkflowParseError`` naming the
 workflow, step and option; no parser loop can run without advancing. Limits, stated so
 nobody reads more into a pass than it proves: a step's ``if:`` condition, a
@@ -94,7 +101,6 @@ _NO_EXECUTION_FLAGS = frozenset(
 _STEP_NAME = re.compile(r"^\s*-\s+name:\s*(.+?)\s*$")
 _RUN_KEY = re.compile(r"^(\s*)(-\s+)?run:[ \t]*(.*)$")
 _BLOCK_SCALAR = re.compile(r"^[|>][+-]?\d*\s*(#.*)?$")
-_COMMAND_SEPARATORS = re.compile(r"\s*(?:&&|\|\||\||;|\{|\})\s*")
 _ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 _PYTHON_NAME = re.compile(r"^(?:python|python3|py)(?:\d+(?:\.\d+)*)?(?:\.exe)?$")
 _WRAPPERS = frozenset({"&", "env", "sudo", "time", "call", "nohup"})
@@ -107,25 +113,32 @@ class WorkflowParseError(ValueError):
 # --------------------------------------------------------------------------- scanning
 
 
-def logical_lines(text: str) -> list[tuple[str, str]]:
-    """``(step_name, command_line)`` for every non-comment logical line of a ``run:`` body.
+def run_bodies(text: str) -> list[tuple[str, list[str]]]:
+    """``(step_name, logical_lines)`` for every ``run:`` body, comments and continuations resolved.
 
     Only text a shell would execute is returned: the value of a ``run:`` key, inline or block
     scalar. ``on.*.paths``, ``with:``, ``if:``, ``env:`` and every other YAML key are never a
-    command, so a test path written there is not "run".
+    command, so a test path written there is not "run". Backslashes are left for the tokenizer,
+    which must tell an escaped quote from a Windows path separator.
     """
-    out: list[tuple[str, str]] = []
+    out: list[tuple[str, list[str]]] = []
     step = "(no step)"
+    lines: list[str] = []
     pending = ""
     body_indent: int | None = None  # indent of the open run: key; None outside a run body
+
+    def close() -> None:
+        nonlocal pending, lines, body_indent
+        if pending:
+            lines.append(pending.strip())
+        out.append((step, lines))
+        pending, lines, body_indent = "", [], None
+
     for raw in text.splitlines():
         stripped = raw.strip()
         indent = len(raw) - len(raw.lstrip())
         if body_indent is not None and stripped and indent <= body_indent:
-            if pending:
-                out.append((step, pending.strip().replace("\\", "/")))
-                pending = ""
-            body_indent = None
+            close()
         if body_indent is None:
             found = _STEP_NAME.match(raw)
             if found:
@@ -145,22 +158,168 @@ def logical_lines(text: str) -> list[tuple[str, str]]:
         if line.endswith("`") or re.search(r"\s\\$", line):
             pending += " " + line[:-1].strip()
             continue
-        out.append((step, (pending + " " + line).strip().replace("\\", "/")))
+        lines.append((pending + " " + line).strip())
         pending = ""
-    if pending:
-        out.append((step, pending.strip().replace("\\", "/")))
+    if body_indent is not None:
+        close()
     return out
 
 
-def _commands(line: str) -> list[list[str]]:
-    """One token list per simple command; ``&&``, ``||``, ``|``, ``;`` and braces split."""
-    commands = []
-    for part in _COMMAND_SEPARATORS.split(line):
-        cleaned = (tok.strip("\"'(),;") for tok in part.split())
-        tokens = [tok[2:] if tok.startswith("./") else tok for tok in cleaned if tok]
-        if tokens:
-            commands.append(tokens)
-    return commands
+_SEPARATORS = ("&&", "||", ";", "|", "{", "}", "(", ")")
+_NEWLINE = "NL"
+_QUOTES = "\"'"
+
+
+def _tokenize(lines: list[str]) -> list[tuple[str, str]]:
+    """``("word", text)`` / ``("sep", op)`` items of one run body, scanned with a quote state.
+
+    A separator (``&&`` ``||`` ``;`` ``|``, braces, parentheses, end of line) splits commands only
+    OUTSIDE single and double quotes, so a quoted string is one word and never yields a runner
+    invocation. Escapes: a backtick (PowerShell) outside single quotes; a backslash before a
+    quote or backslash inside double quotes, and before a quote outside quotes (bash). Any other
+    backslash is a Windows path separator and becomes ``/``. A quote still open at the end of a
+    line continues on the next (a multi-line string). A GitHub ``${{ ... }}`` expression and a
+    shell ``${...}`` are one opaque word part.
+    """
+    items: list[tuple[str, str]] = []
+    word: list[str] = []
+    quote: str | None = None
+
+    def flush() -> None:
+        if word:
+            items.append(("word", "".join(word)))
+            word.clear()
+
+    for line in lines:
+        i, n = 0, len(line)
+        while i < n:
+            ch = line[i]
+            nxt = line[i + 1] if i + 1 < n else ""
+            if quote == "'":
+                if ch == "'":
+                    quote = None
+                else:
+                    word.append(ch)
+            elif quote == '"':
+                if ch == "`" and nxt:
+                    word.append(nxt)
+                    i += 1
+                elif ch == "\\" and nxt in ('"', "\\"):
+                    word.append(nxt)
+                    i += 1
+                elif ch == '"':
+                    quote = None
+                else:
+                    word.append("/" if ch == "\\" else ch)
+            elif ch in _QUOTES:
+                quote = ch
+            elif ch == "`" and nxt:
+                word.append(nxt)
+                i += 1
+            elif ch == "\\":
+                if nxt in _QUOTES:
+                    word.append(nxt)
+                    i += 1
+                else:
+                    word.append("/")
+            elif line.startswith("${", i):
+                close = "}}" if line.startswith("${{", i) else "}"
+                end = line.find(close, i)
+                word.append("$X")
+                i = end + len(close) - 1 if end >= 0 else n
+            elif ch.isspace():
+                flush()
+            else:
+                op = next((s for s in _SEPARATORS if line.startswith(s, i)), None)
+                if op is None:
+                    word.append(ch)
+                else:
+                    flush()
+                    items.append(("sep", op))
+                    i += len(op) - 1
+            i += 1
+        if quote is None:
+            flush()
+            items.append(("sep", _NEWLINE))
+        else:
+            word.append("\n")
+    flush()
+    return items
+
+
+_BLOCK_OPEN = frozenset({"if", "case", "for", "while", "until", "select"})
+_BLOCK_CLOSE = frozenset({"fi", "esac", "done"})
+_FUNCTION_KEYWORDS = frozenset({"function", "filter"})
+_UNCONDITIONAL_LEAD = (";", _NEWLINE)
+
+
+def _opens_function(items: list[tuple[str, str]], at: int) -> bool:
+    """True when the ``{`` at ``items[at]`` opens a function body.
+
+    The shapes: ``function NAME {``, ``function NAME ($p) {``, ``filter NAME {``, ``NAME() {``,
+    and either with the ``{`` on the next line. A brace after any other command is a group or a
+    script block, which runs.
+    """
+
+    def back(j: int) -> int:
+        while j >= 0 and items[j] == ("sep", _NEWLINE):
+            j -= 1
+        return j
+
+    j = back(at - 1)
+    empty_parens = False
+    if j >= 0 and items[j] == ("sep", ")"):
+        k = j - 1
+        while k >= 0 and items[k] != ("sep", "("):
+            k -= 1
+        if k < 0:
+            return False
+        empty_parens = k == j - 1
+        j = back(k - 1)
+    if j < 0 or items[j][0] != "word":
+        return False
+    if empty_parens:
+        return True
+    return j > 0 and items[j - 1][0] == "word" and items[j - 1][1].lower() in _FUNCTION_KEYWORDS
+
+
+def _executed_commands(items: list[tuple[str, str]]) -> list[list[str]]:
+    """Token lists of the commands a run body can reach: not in a function body, not after an exit.
+
+    FAIL CLOSED, not a shell model. A command inside ``function NAME { ... }`` (bash or
+    PowerShell) credits nothing, even when the function is called later. A bare ``exit`` or
+    ``return`` at the top level (outside any brace and any ``if`` / ``for`` / ``while`` / ``case``
+    block, and not the right side of ``&&`` / ``||`` / ``|``) ends the body, so nothing after it
+    credits. A body that really calls its function therefore loses credit: name the file in a
+    command outside the function, or allowlist it with a reason.
+    """
+    out: list[list[str]] = []
+    braces: list[bool] = []  # one entry per open "{"; True = a function body
+    blocks = 0
+    dead = False
+    cur: list[str] = []
+    lead = _NEWLINE  # the separator that introduced the command being read
+    for at, (kind, text) in enumerate(items + [("sep", _NEWLINE)]):
+        if kind == "word":
+            cur.append(text)
+            continue
+        if cur:
+            head = cur[0].lower()
+            if head in _BLOCK_OPEN and not (len(cur) == 1 and text == "("):
+                blocks += 1  # a PowerShell ``if (`` opens a brace, which is tracked on its own
+            elif head in _BLOCK_CLOSE:
+                blocks = max(0, blocks - 1)
+            elif head in ("exit", "return") and not braces and not blocks and lead in _UNCONDITIONAL_LEAD:
+                dead = True
+            if not dead and not any(braces):
+                out.append([t[2:] if t.startswith("./") else t for t in cur])
+            cur = []
+        if text == "{":
+            braces.append(_opens_function(items, at))
+        elif text == "}" and braces:
+            braces.pop()
+        lead = text
+    return out
 
 
 def _is_test_file(path: str) -> bool:
@@ -324,8 +483,8 @@ def collect(
     shard_root = shard_discovery(shard_script_text)
 
     for workflow, text in sorted(workflows.items()):
-        for step, line in logical_lines(text):
-            for tokens in _commands(line):
+        for step, lines in run_bodies(text):
+            for tokens in _executed_commands(_tokenize(lines)):
 
                 def hit(test: str, mechanism: str) -> None:
                     if (workflow, step, mechanism) not in result[test]:
@@ -718,6 +877,98 @@ class FixtureTreeTests(unittest.TestCase):
         self.assertEqual(
             self._orphan_problems("jobs:\n  j:\n    steps:\n      - run: python -m pytest tools/a -q\n"), []
         )
+
+    def test_text_inside_quotes_is_never_a_runner_invocation(self) -> None:
+        for command in (
+            'echo "scheduled; python tools/a/test_orphan.py"',
+            'echo "x | python tools/a/test_orphan.py"',
+            "echo 'a && pytest tools/a'",
+            'echo "a || python -m unittest tools.a.test_orphan"',
+            'echo "say \\"hi\\"; python tools/a/test_orphan.py"',
+            'Write-Host "ran; python tools/a/test_orphan.py"',
+            'echo "line one\npython tools/a/test_orphan.py"',
+        ):
+            problems = self._orphan_problems(_workflow(_step("Quoted", command)))
+            self.assertEqual(len(problems), 1, (command, problems))
+
+    def test_a_runner_after_or_around_quoted_text_is_still_credited(self) -> None:
+        for command in (
+            'echo "ok"; python tools/a/test_orphan.py',
+            'echo "a; b" && python -m pytest tools/a',
+            'python "tools/a/test_orphan.py"',
+            "python -m pytest 'tools/a' -k 'x or y'",
+            'echo "done" | python -m unittest tools.a.test_orphan',
+        ):
+            self.assertEqual(self._orphan_problems(_workflow(_step("Run", command))), [], command)
+
+    def test_a_function_body_that_is_never_a_command_credits_nothing(self) -> None:
+        for command in (
+            "function Invoke-Tests { python tools/a/test_orphan.py }; Write-Host scheduled",
+            "function Invoke-Tests {\n  python tools/a/test_orphan.py\n}\nWrite-Host scheduled",
+            "function Invoke-Tests\n{\n  python -m pytest tools/a\n}",
+            "function Invoke-Tests ($a) {\n  if ($a) { python tools/a/test_orphan.py }\n}",
+            "run_tests() {\n  python tools/a/test_orphan.py\n}\necho scheduled",
+            "run_tests ()\n{\n  python -m pytest tools/a\n}",
+            "function run_tests {\n  python tools/a/test_orphan.py\n}",
+            "function run_tests() { python tools/a/test_orphan.py; }",
+            "filter F { python tools/a/test_orphan.py }",
+        ):
+            problems = self._orphan_problems(_workflow(_step("Defined", command)))
+            self.assertEqual(len(problems), 1, (command, problems))
+        inline = "jobs:\n  j:\n    steps:\n      - run: function Invoke-Tests { python tools/a/test_orphan.py }; Write-Host scheduled\n"
+        self.assertEqual(len(self._orphan_problems(inline)), 1)
+
+    def test_a_command_outside_the_function_body_is_still_credited(self) -> None:
+        for command in (
+            "function F { echo x }\npython tools/a/test_orphan.py",
+            "function F { if ($x) { echo y }; echo z }\npython -m pytest tools/a",
+            "f() {\n  echo x\n}\nf\npython tools/a/test_orphan.py",
+            "function F { exit 1 }\npython tools/a/test_orphan.py",
+            "foreach ($t in $tests) { python tools/a/test_orphan.py }",
+            "echo '${{ matrix.x }}'; python -m pytest ${{ matrix.y }} tools/a",
+        ):
+            self.assertEqual(self._orphan_problems(_workflow(_step("Run", command))), [], command)
+
+    def test_nothing_after_an_unconditional_top_level_exit_is_credited(self) -> None:
+        for command in (
+            "exit 0\npython tools/a/test_orphan.py",
+            "echo hi; exit\npython -m pytest tools/a",
+            "exit $LASTEXITCODE\npython tools/a/test_orphan.py",
+            "echo hi\nExit 0\npython tools/a/test_orphan.py",
+            "return\npython tools/a/test_orphan.py",
+            "exit 0; python tools/a/test_orphan.py",
+        ):
+            problems = self._orphan_problems(_workflow(_step("Exits", command)))
+            self.assertEqual(len(problems), 1, (command, problems))
+        files = {
+            "tools/repo_hygiene/__init__.py": "",
+            "tools/repo_hygiene/test_probe.py": "",
+            "tools/repo_hygiene/ci_unittest_shard.py": _SHARD_SCRIPT,
+        }
+        early = _workflow(
+            _step("Shard", "exit 0\npython -m tools.repo_hygiene.ci_unittest_shard --profile ubuntu --of 3 --shard 1")
+        )
+        problems = self._problems({**files, ".github/workflows/t.yml": early})
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("test_probe.py", problems[0])
+
+    def test_an_exit_that_is_conditional_or_after_the_runner_cuts_nothing(self) -> None:
+        for command in (
+            "python tools/a/test_orphan.py\nexit 0",
+            "test -f x || exit 1\npython tools/a/test_orphan.py",
+            "test -f x && exit 0\npython tools/a/test_orphan.py",
+            "if ($x) { exit 1 }\npython tools/a/test_orphan.py",
+            'if [ -z "$X" ]; then\n  exit 1\nfi\npython tools/a/test_orphan.py',
+            "for f in a b; do\n  exit 1\ndone\npython tools/a/test_orphan.py",
+            "python -m pytest tools/a\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+            "python tools/a/test_orphan.py || exit 1",
+            "echo 'exit 0'\npython tools/a/test_orphan.py",
+        ):
+            self.assertEqual(self._orphan_problems(_workflow(_step("Run", command))), [], command)
+
+    def test_an_exit_in_one_step_does_not_cut_the_next_step(self) -> None:
+        workflow = _workflow(_step("First", "exit 0"), _step("Second", "python tools/a/test_orphan.py"))
+        self.assertEqual(self._orphan_problems(workflow), [])
 
     def test_an_option_without_a_value_fails_fast_naming_the_workflow_and_option(self) -> None:
         for command, option in (
