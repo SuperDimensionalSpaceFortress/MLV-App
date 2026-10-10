@@ -200,7 +200,7 @@ function Resolve-ProductShare {
     param([string]$Guard, [string]$Repo, [string]$Ref, [string]$VerdictFile, [int]$Deadline, [int]$WorkerDeadline,
           [int]$CacheMin, [int]$UnknownCacheMin, [int]$MaxStaleMin, [bool]$DetachMode, [bool]$ForceRun, [string]$ProfileFile)
     $def = Read-JsonFile $VerdictFile
-    if ($null -ne $def -and ($def.PSObject.Properties['schema'] -eq $null -or $def.schema -ne $script:VerdictSchema)) { $def = $null }
+    if ($null -ne $def -and ($null -eq $def.PSObject.Properties['schema'] -or $def.schema -ne $script:VerdictSchema)) { $def = $null }
     $defAge = if ($null -ne $def) { Get-AgeSec ([string]$def.evaluatedAtUtc) } else { [int64]::MaxValue }
     $note = { param($rec, [string]$cache, [bool]$stale, [int64]$age)
         $o = [ordered]@{}
