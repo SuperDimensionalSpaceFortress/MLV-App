@@ -1938,6 +1938,16 @@
       "lines": [
         27707
       ]
+    },
+    {
+      "path": "tests/console/test_playback_source_advance_tracker.cpp",
+      "anchor": "ASSERT_EQ ( 0.0 , t . spanSeconds ( ) ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYBACK-HFR-CONFORM-DEFAULT-1 (re-land of #188): synthetic-input verification of PlaybackSourceAdvanceTracker: with fewer than two presented frames the measured span is defined to be 0 (no rate reported). The input is hand-built; nothing is inferred from a real run's timer.",
+      "lines": [
+        79
+      ]
     }
   ]
 }
