@@ -143,6 +143,21 @@ class ComposerAttemptMarkerTests(base.FlavorDiffHarness):
         self.assertEqual(tree_hashes(out), before, "nothing was moved, written or removed")
         self.assertEqual([p.name for p in out.iterdir() if p.is_dir()], [], "no incomplete-<utc> directory was made")
 
+    def test_recover_incomplete_refuses_a_directory_that_holds_a_trio_record_and_moves_nothing(self) -> None:
+        # FLAVOR-TRIO-RECOVERY-PROTECT-1: a completed trio's record names its sheet / metrics / table / rows; pair-mode recovery must not move them.
+        out = self.out_dir()
+        out.mkdir(parents=True)
+        for name, data in (("flavor-trio-leg-a-leg-b-leg-c-bachelor.json", b'{"schema": "mlv-app/dual-venue-flavor-trio/v1"}\n'),
+                           ("sheet-classic-cinematic-film.png", b"trio sheet"), ("metrics.json", b"trio metrics"), ("table.md", b"trio table"),
+                           ("row-00.png", b"trio row"), (MARKER, b'{"schema": "stale"}')):
+            (out / name).write_bytes(data)
+        before = tree_hashes(out)
+        proc = self.compose(out, "--recover-incomplete", seed=51)
+        self.assertEqual(proc.returncode, 16, proc.stdout + proc.stderr)
+        self.assertIn("PAIR_RECORD_EXISTS flavor-trio-leg-a-leg-b-leg-c-bachelor.json", proc.stderr)
+        self.assertEqual(tree_hashes(out), before, "every file kept its path and bytes")
+        self.assertEqual([p.name for p in out.iterdir() if p.is_dir()], [], "no incomplete-<utc> directory was made")
+
     def test_a_crash_between_the_sheet_and_the_metrics_leaves_a_marker_and_the_next_retry_is_refused_with_it(self) -> None:
         mod = load_tool()
         real = mod.write_new
@@ -403,6 +418,19 @@ class DriverStagingAndMarkerTests(unittest.TestCase):
                 if content is not None:
                     self.assertIn(self.TRIO_RECORD_NAME, text, "the diagnosis names the half record")
                 self.assertEqual(tree_hashes(self.out), before, "the dead trio's bytes are preserved")
+
+    def test_recover_incomplete_never_moves_a_completed_trios_evidence_trio(self) -> None:
+        # FLAVOR-TRIO-RECOVERY-PROTECT-1: pair mode (no -FilmReceipt) with -RecoverIncomplete into a finished trio's directory plus a stale marker.
+        proc = self.trio()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        (self.out / MARKER).write_text('{"schema": "stale"}', encoding="utf-8")
+        before = tree_hashes(self.out)
+        self.assertIn(self.TRIO_RECORD_NAME, before)
+        proc = self.pair("-RecoverIncomplete")
+        self.assertEqual(proc.returncode, 16, proc.stdout + proc.stderr)
+        self.assertIn("PAIR_RECORD_EXISTS " + self.TRIO_RECORD_NAME, proc.stdout + proc.stderr)
+        self.assertEqual(tree_hashes(self.out), before, "every file kept its path and bytes")
+        self.assertEqual([p.name for p in self.out.iterdir() if p.is_dir()], [], "no incomplete-<utc> directory was made")
 
     # r3 blocker 1: the marker-delete exception never runs inside an owner-footage root --------------------------------------------------------
     def test_an_out_dir_that_holds_or_sits_under_owner_footage_is_refused_before_anything_is_written_or_deleted(self) -> None:
