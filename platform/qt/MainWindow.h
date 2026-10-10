@@ -53,6 +53,8 @@
 #include "ReceiptCopyMaskDialog.h"
 #include "QRecentFilesMenu.h"
 #include "PlaybackQualityPolicy.h"
+#include "PlaybackConformPolicy.h"
+#include "PlaybackSourceAdvanceTracker.h"
 #include "batch/BatchTypes.h"
 #include <atomic>
 #include <deque>
@@ -1052,6 +1054,15 @@ private:
     uint64_t m_playbackAudioSyncRequestCount = 0;
     uint64_t m_playbackAudioSyncAppliedCount = 0;
     uint64_t m_playbackAudioSyncSkippedCount = 0;
+    /* PLAYBACK-HFR-CONFORM-DEFAULT-1: high-frame-rate clips play at a lower conform rate. */
+    bool m_conformEnabled = playback_conform::kDefaultEnabled;
+    double m_conformTargetFps = playback_conform::kDefaultTargetFps;
+    double m_conformThresholdFps = playback_conform::kDefaultThresholdFps;
+    QActionGroup *m_conformTargetGroup = nullptr;
+    QActionGroup *m_conformThresholdGroup = nullptr;
+    // PRESENTED-frame timeline advance (source fps, max jump) for playback_smoke.conform. m_sourceAdvance counts
+    // ENGINE ticks and has no clock, so it cannot say whether every source frame reached the screen.
+    PlaybackSourceAdvanceTracker m_playbackSmokeSourceAdvance;
     int m_lastPlaybackAudioSyncFrame = -1;
     double m_lastPlaybackAudioSyncTime = 0.0;
     bool m_playbackSmokeActive = false;
@@ -1772,6 +1783,13 @@ private:
     void previewPicture( int row );
     void setPreviewMode( void );
     double getFramerate( void );
+    double getPlaybackFramerate( void );
+    bool playbackConformActive( void );
+    int effectivePlaybackAutoTargetFps( void );
+    void requestPlaybackAudioSync( void );
+    void setupPlaybackConformMenu( void );
+    void applyPlaybackConformSettings( bool persist );
+    void refreshPlaybackFpsStatus( void );
     void paintAudioTrack( void );
     uint8_t drawZebras( QImage *image );
     void drawFrameNumberLabel( int frameIndex = -1 );
