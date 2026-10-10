@@ -1617,6 +1617,213 @@ class UmRunEndToEndTests(_Share):
         self.assertEqual(self.names(), ["demo-build.json", "demo-source.zip"], combined)
 
 
+class UmRunAdmissionWaitTests(_Share):
+    """MLV-AGENT-HEAVY-SLOT-GATE-2: an agent with a heavy-slot admission gate holds a job before it
+    launches it, and writes running\\<id>.started.json with phase=admission-wait (childPid null) before
+    that wait. um-run.ps1 must treat that as neither unclaimed (never RETRACTED) nor claimed (the
+    claimed clock starts only at phase=launched), wait under -MaxAdmissionWaitSec, and log the
+    heartbeat's gate-wait reason. A marker with no phase field (any older agent) means launched."""
+
+    def start(self, *extra: str) -> subprocess.Popen:
+        return subprocess.Popen(
+            [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(UM_RUN),
+             "-ScriptPath", str(self.job), "-AgentShare", str(self.share), "-PollSeconds", "1",
+             "-JobId", "demo", *extra],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    def wait_for_drop(self, proc: subprocess.Popen) -> None:
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline and not (self.inbox / "demo.job.ps1").exists():
+            self.assertIsNone(proc.poll(), "um-run exited before its job was dropped")
+            time.sleep(0.1)
+        self.assertTrue((self.inbox / "demo.job.ps1").exists(), "the job was never dropped")
+
+    def write_marker(self, body: str) -> None:
+        running_dir = self.share / "running"
+        running_dir.mkdir(parents=True, exist_ok=True)
+        tmp = running_dir / "demo.started.json.tmp"
+        tmp.write_text(body, encoding="ascii")
+        tmp.replace(running_dir / "demo.started.json")   # atomic, as the agent's Write-JsonFileAtomic
+
+    def admission_marker(self) -> str:
+        return json.dumps({"schema": "mlvapp.agent.started.v1", "jobId": "demo", "phase": "admission-wait",
+                           "status": "admission-wait", "childPid": None,
+                           "gateReason": "waiting for heavy-slot admission"})
+
+    def launched_marker(self) -> str:
+        return json.dumps({"schema": "mlvapp.agent.started.v1", "jobId": "demo", "phase": "launched",
+                           "status": "started", "childPid": 4242,
+                           "startedUtc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
+
+    def gate_heartbeat(self, state: str, waited: int) -> None:
+        # The shape agent r1i/r2 writes while it holds a job: "... gate-wait job=<id> state=<s> waited=<n>s".
+        now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        (self.share / "heartbeat.txt").write_text(
+            f'alive {now} pid=1 host=TESTHOST generation=1 processStartUtc={now} imagePath="x" agentScript="y" '
+            f"gate-wait job=demo state={state} waited={waited}s", encoding="utf-8")
+
+    def hold(self, proc: subprocess.Popen, seconds: float, state: str = "hot") -> None:
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < seconds and proc.poll() is None:
+            self.gate_heartbeat(state, int(time.monotonic() - t0))
+            time.sleep(0.4)
+
+    def publish_result(self) -> None:
+        result = {"jobId": "demo", "exitCode": 0, "stdout": "ran after admission", "stderr": "",
+                  "timeoutSec": 3, "timedOut": False}
+        tmp = self.outbox / "demo.result.tmp"
+        tmp.write_text(json.dumps(result), encoding="ascii")
+        tmp.replace(self.outbox / "demo.result.json")
+
+    def finish(self, proc: subprocess.Popen, timeout: float = 30) -> str:
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.communicate()
+        return " ".join(_ANSI_ESCAPE.sub("", (stdout or "") + (stderr or "")).replace("|", " ").split())
+
+    def test_an_admission_wait_hold_past_every_ceiling_is_not_retracted_and_resolves_on_launch(self) -> None:
+        # RED/GREEN guard. The hold (9 s) outlasts -MaxQueueWaitSec (2 s) AND -TimeoutSec +
+        # -MaxClaimedWaitSec (3 + 3 s): a client that read the hold as unclaimed retracts it, and one
+        # that read it as claimed stops UNRESOLVED at its outer ceiling. Only a client that starts the
+        # claimed clock at phase=launched is still waiting, and then returns the receipt.
+        proc = self.start("-TimeoutSec", "3", "-MaxClaimedWaitSec", "3", "-MaxQueueWaitSec", "2",
+                          "-MaxAdmissionWaitSec", "120")
+        try:
+            self.wait_for_drop(proc)
+            self.write_marker(self.admission_marker())
+            self.hold(proc, 9.0)
+            self.assertIsNone(proc.poll(), "a job held in the admission gate must outlive the queue and claimed ceilings")
+            self.assertTrue((self.inbox / "demo.job.ps1").exists(), "a held job must never be withdrawn")
+            self.write_marker(self.launched_marker())
+            self.touch_heartbeat(job_id="demo")
+            time.sleep(1.5)
+            self.publish_result()
+        except BaseException:
+            proc.kill()
+            raise
+        combined = self.finish(proc)
+        self.assertEqual(proc.returncode, 0, combined)
+        self.assertNotIn("RETRACTED", combined, combined)
+        self.assertNotIn("UNRESOLVED", combined, combined)
+        self.assertIn("UMRUN_ADMISSION_WAIT job=demo state=hot", combined, combined)
+        self.assertIn("marker=admission-wait", combined, combined)
+
+    def test_the_admission_ceiling_stops_unresolved_and_never_withdraws_the_job(self) -> None:
+        # Slots-full and unknown-feed holds are uncapped in the agent; -MaxAdmissionWaitSec bounds them
+        # here. The outcome is UNRESOLVED (the agent still holds the job), never RETRACTED.
+        proc = self.start("-TimeoutSec", "60", "-MaxQueueWaitSec", "1", "-MaxAdmissionWaitSec", "3")
+        try:
+            self.wait_for_drop(proc)
+            self.write_marker(self.admission_marker())
+            self.hold(proc, 20.0, state="slots-full")
+        except BaseException:
+            proc.kill()
+            raise
+        combined = self.finish(proc)
+        self.assertNotEqual(proc.returncode, 0, combined)
+        self.assertIn("UNRESOLVED:", combined, combined)
+        self.assertIn("held unlaunched in the agent's heavy-slot admission gate", combined, combined)
+        self.assertIn("MaxAdmissionWaitSec (3s)", combined, combined)
+        self.assertIn("last gate state=slots-full", combined, combined)
+        self.assertNotIn("RETRACTED", combined, combined)
+        self.assertTrue((self.inbox / "demo.job.ps1").exists(), "the admission ceiling must not withdraw the job")
+
+    def test_a_launching_marker_is_claimed_not_launched_and_resolves_on_launch(self) -> None:
+        # Agent r2b writes phase=launching (childPid null) just before it creates the child. The client
+        # reads it as its own state (logged marker=launching, never cannot-tell) and handles it exactly
+        # like admission-wait: never retracted at the queue ceiling, and it never starts the claimed
+        # clock, so a launching marker held past -TimeoutSec + -MaxClaimedWaitSec does not stop the
+        # client at its outer ceiling. Once phase=launched (with a pid) lands, the receipt is returned.
+        proc = self.start("-TimeoutSec", "3", "-MaxClaimedWaitSec", "3", "-MaxQueueWaitSec", "2",
+                          "-MaxAdmissionWaitSec", "120")
+        try:
+            self.wait_for_drop(proc)
+            self.write_marker(json.dumps({"schema": "mlvapp.agent.started.v1", "jobId": "demo",
+                                          "phase": "launching", "status": "launching", "childPid": None}))
+            self.hold(proc, 9.0, state="clear")
+            self.assertIsNone(proc.poll(), "a launching marker must outlive the queue and claimed ceilings")
+            self.assertTrue((self.inbox / "demo.job.ps1").exists(), "a launching job must never be withdrawn")
+            self.write_marker(self.launched_marker())
+            self.touch_heartbeat(job_id="demo")
+            time.sleep(1.5)
+            self.publish_result()
+        except BaseException:
+            proc.kill()
+            raise
+        combined = self.finish(proc)
+        self.assertEqual(proc.returncode, 0, combined)
+        self.assertNotIn("RETRACTED", combined, combined)
+        self.assertNotIn("UNRESOLVED", combined, combined)
+        self.assertIn("marker=launching", combined, combined)
+        self.assertNotIn("marker=unknown", combined, combined)
+
+    def test_a_marker_that_cannot_be_read_is_cannot_tell_never_retracted(self) -> None:
+        # Cannot-tell is its own outcome: a present but unparseable marker past the queue ceiling is
+        # never folded into "unclaimed". Once it reads as launched, the receipt is returned.
+        proc = self.start("-TimeoutSec", "5", "-MaxQueueWaitSec", "2", "-MaxAdmissionWaitSec", "120")
+        try:
+            self.wait_for_drop(proc)
+            self.write_marker('{"jobId": "demo", "phase": "admiss')   # torn
+            self.hold(proc, 5.0)
+            self.assertIsNone(proc.poll(), "an unreadable marker must not be retracted at the queue ceiling")
+            self.assertTrue((self.inbox / "demo.job.ps1").exists(), "an unreadable marker must not be withdrawn")
+            self.write_marker(self.launched_marker())
+            self.touch_heartbeat(job_id="demo")
+            self.publish_result()
+        except BaseException:
+            proc.kill()
+            raise
+        combined = self.finish(proc)
+        self.assertEqual(proc.returncode, 0, combined)
+        self.assertNotIn("RETRACTED", combined, combined)
+        self.assertIn("marker=unknown", combined, combined)
+
+    def test_falsifier_the_same_job_with_no_marker_is_retracted_at_the_queue_ceiling(self) -> None:
+        # The same parameters and the same gate-wait heartbeat, with no marker (what agent r1i
+        # presents): the heartbeat alone is not a claim, so the queue ceiling still retracts the job.
+        proc = self.start("-TimeoutSec", "3", "-MaxClaimedWaitSec", "3", "-MaxQueueWaitSec", "2",
+                          "-MaxAdmissionWaitSec", "120")
+        try:
+            self.wait_for_drop(proc)
+            self.hold(proc, 20.0)
+        except BaseException:
+            proc.kill()
+            raise
+        combined = self.finish(proc)
+        self.assertNotEqual(proc.returncode, 0, combined)
+        self.assertIn("RETRACTED:", combined, combined)
+        self.assertNotIn("UMRUN_ADMISSION_WAIT", combined, combined)
+        self.assertEqual(self.names(), [], "a retracted job leaves nothing in the inbox")
+
+    def test_a_marker_without_phase_is_launched_as_before(self) -> None:
+        # Backward compatibility: a marker with no phase field (every agent before GATE-2) starts the
+        # claimed clock at once, so a continuously fresh heartbeat still ends at the absolute outer
+        # ceiling (-TimeoutSec + -MaxClaimedWaitSec), never in the admission wait.
+        proc = self.start("-TimeoutSec", "1", "-MaxClaimedWaitSec", "2", "-MaxQueueWaitSec", "30",
+                          "-MaxAdmissionWaitSec", "120")
+        try:
+            self.wait_for_drop(proc)
+            self.write_marker(json.dumps({"jobId": "demo",
+                                          "startedUtc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}))
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline and proc.poll() is None:
+                self.touch_heartbeat(job_id="demo")
+                time.sleep(0.4)
+        except BaseException:
+            proc.kill()
+            raise
+        combined = self.finish(proc)
+        self.assertNotEqual(proc.returncode, 0, combined)
+        self.assertIn("UNRESOLVED:", combined, combined)
+        self.assertIn("absolute outer ceiling", combined, combined)
+        self.assertIn("MaxClaimedWaitSec (2s)", combined, combined)
+        self.assertNotIn("UMRUN_ADMISSION_WAIT", combined, combined)
+        self.assertNotIn("RETRACTED", combined, combined)
+
+
 class UmRunDeadlineTypeTests(unittest.TestCase):
     """ATTR3-FOOTAGE-STAGE-SUBMIT-RETRY-1 round 12 (sol MINOR, item 6): every wait-loop deadline is
     built from [DateTimeOffset]::Now specifically so a comparison against another DateTimeOffset is
@@ -1643,7 +1850,7 @@ class UmRunDeadlineTypeTests(unittest.TestCase):
                 "$ast = [System.Management.Automation.Language.Parser]::ParseInput($text, [ref]$t, [ref]$e)\n"
                 "$assignments = @($ast.FindAll({ param($n) $n -is "
                 "[System.Management.Automation.Language.AssignmentStatementAst] -and "
-                "$n.Left.Extent.Text -in @('$submittedAt', '$claimedAt') -and "
+                "$n.Left.Extent.Text -in @('$submittedAt', '$claimedAt', '$admissionAt') -and "
                 "$n.Right.Extent.Text -eq '[DateTimeOffset]::Now' }, $true))\n"
                 "if ($assignments.Count -eq 0) { throw 'NO_ROOT_ASSIGNMENTS_FOUND' }\n"
                 "$types = @($assignments | ForEach-Object { (Invoke-Expression $_.Right.Extent.Text).GetType().Name })\n"
@@ -1658,7 +1865,10 @@ class UmRunDeadlineTypeTests(unittest.TestCase):
         # CLAIMED transition, the marker-appears-at-the-queue-deadline transition, and the
         # retraction-race fallback). A future edit that adds or removes a root assignment must
         # update this count deliberately, not silently pass with fewer sites checked.
-        self.assertEqual(result["count"], 4, result)
+        # MLV-AGENT-HEAVY-SLOT-GATE-2: +1 $claimedAt (launched seen at the admission ceiling) and
+        # 3 $admissionAt roots (first admission-wait read, marker present at the queue deadline, and
+        # the retraction-race fallback when the late marker is an admission-wait claim).
+        self.assertEqual(result["count"], 8, result)
         types = result["types"] if isinstance(result["types"], list) else [result["types"]]
         for type_name in types:
             self.assertEqual(
