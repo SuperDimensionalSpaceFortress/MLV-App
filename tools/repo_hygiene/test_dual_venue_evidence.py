@@ -88,10 +88,13 @@ LOOKAHEAD_LEGS = ("legs/m16-1243-pace-cinematic-fullscreen-s4-la3.json",)
 # ... and (r2) the stall-stage diagnostic: the owner-shape pace leg at telemetryArm HEAVY, which keeps the per-frame playback_smoke.frame log
 # (LIGHT disables it), so the present that ends a >= 250 ms interval shows its own stage times. Diagnostic only: never a pace number.
 HEAVY_LEGS = ("legs/m16-1243-pace-cinematic-fullscreen-s4-heavy.json",)
+# PLAYBACK-HFR-CONFORM-DEFAULT-1 added the conform legs on the 59.94 fps clip: the scale-1 display cells, cuda only (legsets/hfr-conform.json names them).
+HFR_CONFORM_LEGS = tuple(f"legs/m16-1456-conform-{mode}-s1.json" for mode in ("windowed", "fullscreen"))
 # LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1 added the scale-2 Cinematic twin of the scale-2 look leg (the Bachelor CPU Classic | Cinematic look pair).
 SHIPPED_LEGS = ("legs/m16-1243-speed.json", "legs/m16-1243-look.json", "legs/m16-1243-look-scale2.json", "legs/m16-1243-look-cinematic.json", *DISPLAY_MATRIX_LEGS, *PACE_LEGS,
                 *LOOKAHEAD_LEGS, *HEAVY_LEGS, "legs/m16-1243-look-scale2-cinematic.json", "legs/m16-1243-look-film.json",
-                "legs/m16-1243-look-scale2-film.json", *(f"legs/m16-1243-look-scale2-{flavor}-agxoff.json" for flavor in ("cinematic", "film")))
+                "legs/m16-1243-look-scale2-film.json", *(f"legs/m16-1243-look-scale2-{flavor}-agxoff.json" for flavor in ("cinematic", "film")),
+                *HFR_CONFORM_LEGS)
 # LOOK-ASSIST-FILM-FLAVOR-2 r2: the AgX-off twins of the scale-2 Cinematic and Film legs carry a committed look receipt (look-receipts/agx-off.marxml).
 AGXOFF_LEGS = {f"m16-1243-look-scale2-{flavor}-agxoff": f"m16-1243-look-scale2-{flavor}" for flavor in ("cinematic", "film")}
 LOOK_RECEIPT_BASE = "6b6f66f52d5344a97de5068b2e7cae1a61edf295"   # the #328 head whose generator, legs and runner this round extends
@@ -5056,6 +5059,22 @@ class LegSpecSchemaTests(unittest.TestCase):
             base["generatorArgs"].pop("telemetryArm")
             self.assertEqual(dict(arm, legId=base["legId"]), base, rel)
 
+    def test_each_hfr_conform_leg_is_its_display_cell_on_the_hfr_clip_on_cuda(self) -> None:
+        """PLAYBACK-HFR-CONFORM-DEFAULT-1: a conform leg is its scale-1 display-matrix cell with only the legId, card, clip and backends (cuda) changed, so its
+        numbers compare with the matrix cell's; the leg set names exactly these legs and the card's roles are declared."""
+        for rel in HFR_CONFORM_LEGS:
+            leg = json.loads((DV / rel).read_text(encoding="utf-8"))
+            self.jsonschema.validate(leg, self.schema)
+            cell = json.loads((DV / "legs" / f"m16-1243-display-{leg['displayMode']}-s1.json").read_text(encoding="utf-8"))
+            self.assertEqual((leg["legId"], leg["card"], leg["clipId"], leg["backends"]),
+                             (Path(rel).stem, "PLAYBACK-HFR-CONFORM-DEFAULT-1", "M16-1456", ["cuda"]), rel)
+            cell_cuda = dict(cell, criteria={role: {"cuda": per["cuda"]} for role, per in cell["criteria"].items()})
+            self.assertEqual(dict(leg, legId=cell["legId"], card=cell["card"], clipId=cell["clipId"], backends=cell["backends"]), cell_cuda, rel)
+        doc = json.loads((DV / "legsets" / "hfr-conform.json").read_text(encoding="utf-8"))
+        self.assertEqual((doc["card"], doc["clipId"], sorted(doc["legs"])), ("PLAYBACK-HFR-CONFORM-DEFAULT-1", "M16-1456", sorted(HFR_CONFORM_LEGS)))
+        roles = json.loads((DV / "venues.json").read_text(encoding="utf-8"))["roles"]
+        self.assertEqual(roles["PLAYBACK-HFR-CONFORM-DEFAULT-1"], {"bachelor": "acceptance", "ultra-magnus": "supplementary"})
+
     def test_the_hand_listed_shipped_legs_are_exactly_the_legs_directory(self) -> None:
         self.assertEqual(sorted(SHIPPED_LEGS), sorted("legs/" + p.name for p in (DV / "legs").glob("*.json")), "SHIPPED_LEGS drifted from the legs/ directory")
 
@@ -5080,6 +5099,9 @@ class LegSpecSchemaTests(unittest.TestCase):
             elif spec["card"] == "PLAYBACK-BACHELOR-PRESENT-JITTER-1":   # the capture-free pace legs, named by flavor and cell
                 self.assertEqual(spec["legId"], path.stem, path.name)
                 self.assertRegex(spec["legId"], rf"^m16-1243-pace-{flavor}-(fullscreen|windowed)-s[124](-la[0-3]|-heavy)?$", path.name)
+            elif spec["card"] == "PLAYBACK-HFR-CONFORM-DEFAULT-1":   # the HFR conform legs: a scale-1 display cell on the 59.94 fps clip
+                self.assertEqual(spec["legId"], path.stem, path.name)
+                self.assertRegex(spec["legId"], r"^m16-1456-conform-(fullscreen|windowed)-s1$", path.name)
             else:   # the scale-4 flavored look leg, or its scale-2 twin (LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1), or that twin's AgX-off copy (LOOK-ASSIST-FILM-FLAVOR-2 r2)
                 self.assertIn(spec["legId"], (f"m16-1243-look-{flavor}", f"m16-1243-look-scale2-{flavor}", f"m16-1243-look-scale2-{flavor}-agxoff"), path.name)
                 self.assertEqual(spec["legId"], path.stem, path.name)
