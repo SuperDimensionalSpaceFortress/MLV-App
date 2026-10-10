@@ -2556,3 +2556,28 @@ def test_host_exiting_before_child_is_typed_launch_no_child_with_exit_and_stderr
     # nothing is lost: the pre-r2 failure text survives as the cause
     assert cap["cause"]=="contained-host-exited-before-child: 1"
     assert cap["causeType"]=="RuntimeException"
+
+
+# LANE-LAUNCH-NO-CHILD-TYPED-1 r3 (catalogue row C-02, sol r2 BLOCKER): the deadline exclusion must hold on EVERY
+# no-child path, not only TimeoutException. Absent control file + an exited host (code 1) + elapsed >= TimeoutSec:
+# the host-exit branch used to be evaluated before the deadline and the RuntimeException bypassed the elapsed guard.
+def _host_exit_after_deadline_mutation(text):
+    text = _host_startup_failure_mutation(text)
+    # The runner is held (deterministically, no race) past the lane's own deadline while the host dies, so the
+    # loop sees HasExited=true, control file absent, elapsed >= TimeoutSec -- the exact state sol reproduced.
+    old = "        if ($proc.HasExited) { throw \"contained-host-exited-before-child: $($proc.ExitCode)\" }"
+    assert text.count(old) == 1
+    return text.replace(old, "        Start-Sleep -Seconds 6\n" + old)
+
+
+def test_host_exit_after_the_lane_deadline_stays_a_timeout_not_launch_no_child(fixture_tree):
+    cmd,env,receipt=prepare(fixture_tree,"normal",mutation=_host_exit_after_deadline_mutation)
+    cmd[cmd.index("-TimeoutSec")+1]="5"
+    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=60)
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert q["durationSec"]>=5, "precondition: the lane's own deadline must have passed"
+    assert q["failure"]!="launch-no-child",q["failure"]
+    assert "launchNoChild" not in q
+    assert q["timedOut"] is True
+    assert r.returncode==124,(r.returncode,r.stdout,r.stderr)
+    assert q["containment"]["childPid"] is None and q["containment"]["promptDelivered"] is False

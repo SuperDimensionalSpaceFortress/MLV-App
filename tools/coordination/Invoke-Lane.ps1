@@ -1719,13 +1719,21 @@ if ($cfg.engine -eq 'claude') {
 catch {
     $noChildCause = $_.Exception.Message
     $noChildCauseType = $_.Exception.GetType().Name
-    $noChildIsTimeout = $_.Exception -is [TimeoutException]
+    # r3: the lane's own deadline is read ONCE, here, before any cleanup spends time, and applies to
+    # every exception type the child-wait phase can raise (a host that exits at the deadline raises a
+    # RuntimeException, not a TimeoutException).
+    $noChildDeadlineExpired = ($cfg.engine -eq 'claude' -and $awaitingChild -and $sw.Elapsed.TotalSeconds -ge $TimeoutSec)
     if ($_.Exception -is [TimeoutException]) {
         $timedOut = $true
         $exitCode = -1
         $failure = $null
     } else {
         $failure = $_.Exception.Message
+        if ($noChildDeadlineExpired) {
+            # A budget that ran out is a timeout whatever carried the host exit; keep the pre-card failure text.
+            $timedOut = $true
+            $exitCode = -1
+        }
     }
     # Before assignment the inert host is outside the job. Terminate only the exact
     # Process object created by this invocation; it has received no launch frame.
@@ -1827,13 +1835,14 @@ catch {
     # PLAYBACK-LJ92-DECODE-THROUGHPUT-1 r3, 2.2 s in, host stderr never captured -- r2). Both, and any
     # other throw while the runner waits for the child (e.g. the launch-frame write hitting a dead
     # host), are classified by PHASE ($awaitingChild), never by message text.
-    # Only when the lane's own deadline had NOT passed for the timeout path: a budget that really ran
-    # out (launch-budget-exhausted, a 1 s -TimeoutSec) stays timedOut exactly as before.
+    # Only when the lane's own deadline had NOT passed, whatever exception type carried it (r3): a budget
+    # that really ran out (launch-budget-exhausted, a 1 s -TimeoutSec, a host exiting at the deadline)
+    # stays timedOut exactly as before.
     # exitCode returns to the -999 sentinel (propagated as 127, like any other launch failure)
     # rather than -1 (124, "timed out"), because nothing timed out. The original exception text is
     # kept in launchNoChild.cause so the pre-r2 detail is not lost.
     if ($cfg.engine -eq 'claude' -and $awaitingChild -and $null -ne $containment -and $null -eq $containment.childPid -and
-        -not $promptDelivered -and (-not $noChildIsTimeout -or $sw.Elapsed.TotalSeconds -lt $TimeoutSec)) {
+        -not $promptDelivered -and -not $noChildDeadlineExpired) {
         $launchNoChild = [ordered]@{
             hostPid=$containment.ownerPid; hostExitedBeforeRunnerAction=$null; hostExitCode=$null
             hostStderrHead=$null; elapsedSec=[math]::Round($sw.Elapsed.TotalSeconds, 1); captureError=$null
