@@ -1,7 +1,7 @@
 project: mlv-app
 kernel: fleet-factory-kernel r5
 profile: code@r10
-instance: MLV-App agents/factory-kernel-instance.md, refiled on MLV-App PR #297 (https://github.com/SuperDimensionalSpaceFortress/MLV-App/pull/297, head 6c8a19c1, docs only, open). The r1 map is on MLV-App fork/master 4614674b; verify with `git cat-file -e 4614674b:agents/factory-kernel-instance.md`. KERNEL: DOGFOOD fleet-factory-kernel r5 · profile code@r10 · instance agents/factory-kernel-instance.md · since 2026-09-14.
+instance: MLV-App agents/factory-kernel-instance.md, refiled on MLV-App PR #299 (https://github.com/SuperDimensionalSpaceFortress/MLV-App/pull/299, head 7712c5b3, docs only, merged as df353652; it supersedes the closed PR #297). The refiled map is on MLV-App fork/master from df353652; verify with `git cat-file -e df353652:agents/factory-kernel-instance.md`. The r1 map was on 4614674b. KERNEL: DOGFOOD fleet-factory-kernel r5 · profile code@r10 · instance agents/factory-kernel-instance.md · since 2026-09-14.
 subjects: 2 run end-to-end in this window. S1 = MLV-App card OUTBOX-R14-CARDS-TARGET-1, PR #296. Reviewed head 7ebb3aba (tree 5ce44b6c752f1cf8...; recompute: `git rev-parse 7ebb3aba^{tree}`); delivered as MLV-App fork/master merge commit 4614674b, tree 5c6b6c752f1cf88751908991bc758fac6f320b62. S2 = MLV-App card DOCTRINE-GUARDS-MLV-1, PR #294. Reviewed head c17aaa7a (tree 83fd0bed56a8ec70b3dfbae212d5a7a71ea13243); delivered as fork/master 03d8b79b, tree f13e3e633ddb574e74ae1f66cbaf21507e4293e2.
 window: 2026-09-15T05:22:22Z .. 2026-10-07T12:45:00Z
 health: assurance=UNSATISFIED operability=PRESSURED
