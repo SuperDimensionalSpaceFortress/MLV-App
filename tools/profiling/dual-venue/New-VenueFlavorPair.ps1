@@ -30,7 +30,7 @@
 # ATTEMPT MARKER: look-flavor-diff.py creates OutDir\.pair-in-progress.json before its first output and (--keep-marker) leaves it until this script has
 # written the record. An attempt that dies in between leaves a marker, and a retry into that directory exits 17 (PAIR_INCOMPLETE_ATTEMPT) with the
 # diagnosis instead of the silent PAIR_OUTPUT_EXISTS block. -RecoverIncomplete moves the dead attempt's marker and unrecorded outputs into
-# OutDir\incomplete-<utc>\ (nothing is deleted) and pairs again; a directory that holds a pair record is never recovered (16). The record is created
+# OutDir\incomplete-<utc>\ (nothing is deleted) and pairs again; a directory that holds a pair OR a trio record is never recovered (16). The record is created
 # exclusively and then written, so a crash can leave a marker beside an empty / truncated record: that is the same incomplete attempt (17, the half record
 # named and its bytes untouched; -RecoverIncomplete does not move a record), never PAIR_RECORD_EXISTS. (The record is not written under a temporary name and
 # renamed into place: the owner-footage route guards allow no move primitive in this script, so the half record is detected instead.)
@@ -100,7 +100,8 @@ function Test-PairRecordComplete([string]$Path) {
 }
 if (Test-Path -LiteralPath $outFull -PathType Container) {
     $recordsHere = @(Get-ChildItem -LiteralPath $outFull -Filter 'flavor-pair-*.json' -File -ErrorAction Stop)
-    if ($trio) { $recordsHere += @(Get-ChildItem -LiteralPath $outFull -Filter 'flavor-trio-*.json' -File -ErrorAction Stop) }
+    # FLAVOR-TRIO-RECOVERY-PROTECT-1: a completed trio's record names the trio's sheet / metrics / table / rows, so pair-mode -RecoverIncomplete must see it too.
+    if ($trio -or $RecoverIncomplete) { $recordsHere += @(Get-ChildItem -LiteralPath $outFull -Filter 'flavor-trio-*.json' -File -ErrorAction Stop) }
     if ($recordsHere.Count -gt 0) {
         # A marker beside a record that does not parse as a JSON object is an attempt that died while the record was being written (it is created
         # exclusively, then filled): the incomplete diagnosis, with the half record's bytes untouched. -RecoverIncomplete does not apply to it -- a record

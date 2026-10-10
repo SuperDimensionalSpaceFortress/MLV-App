@@ -283,10 +283,11 @@ def refuse_if_incomplete(out, recover):
     if not marker.exists():
         return False
     if recover:
-        # FLAVOR-DIFF-RECOVER-RECORD-GUARD-1: a pair record names the sheet by hash, so a directory that holds one is never recovered (nothing is moved).
-        records = sorted(p.name for p in out.glob("flavor-pair-*.json") if p.is_file())
+        # FLAVOR-DIFF-RECOVER-RECORD-GUARD-1 / FLAVOR-TRIO-RECOVERY-PROTECT-1: a pair OR trio record names its outputs (the pair's sheet by hash), so a directory
+        # that holds either is never recovered (nothing is moved).
+        records = sorted(p.name for pattern in ("flavor-pair-*.json", "flavor-trio-*.json") for p in out.glob(pattern) if p.is_file())
         if records:
-            raise Refusal(EXIT_OUTPUT_EXISTS, f"PAIR_RECORD_EXISTS {records[0]} is already in {out}: its sheet is named by hash, so --recover-incomplete "
+            raise Refusal(EXIT_OUTPUT_EXISTS, f"PAIR_RECORD_EXISTS {records[0]} is already in {out}: its outputs are named by that record, so --recover-incomplete "
                                               "will not move anything here; compose into a new directory")
         return True
     try:
@@ -301,7 +302,7 @@ def refuse_if_incomplete(out, recover):
 
 
 def quarantine_incomplete(out):
-    """Move the dead attempt's marker and unrecorded outputs into incomplete-<utc>/ beside them. Moves only; a pair record is never touched."""
+    """Move the dead attempt's marker and unrecorded outputs into incomplete-<utc>/ beside them. Moves only; a pair or trio record is never touched."""
     dest = out / ("incomplete-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ"))
     dest.mkdir()
     for path in sorted(out.iterdir()):
