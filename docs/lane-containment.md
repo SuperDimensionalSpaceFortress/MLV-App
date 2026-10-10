@@ -264,6 +264,42 @@ applicable updated execution-control receipt before resuming editing
 dispatch. This change does not enable the workstream loop or rewrite
 historical receipts.
 
+### Network egress under the unelevated read-only codex sandbox
+
+Measured 2026-10-10 (CODEX-UNELEVATED-EGRESS-PROBE-1), codex-cli 0.160.1, one
+Windows host, unelevated mode (`-c windows.sandbox="unelevated"`, the mode
+`Invoke-Lane.ps1` gives read-only codex key lanes, PR #329). Before this the
+risk was only inferred. **Verdict: EGRESS_OPEN.** The sandbox restricts file
+writes; it does not firewall the network.
+
+Probe, run through `codex sandbox -c 'windows.sandbox="unelevated"' -P
+':read-only' -- pwsh ...` and, as a control, the same script outside any
+sandbox; example.com only, nothing uploaded:
+
+| Probe | Unsandboxed control | Unelevated read-only sandbox |
+|---|---|---|
+| DNS resolve | OK | OK (A records returned) |
+| TCP 443 connect | OK | OK (`TcpTestSucceeded=True`) |
+| HTTPS GET, default client | 200 | fails: `HTTP(S)_PROXY`/`ALL_PROXY` are set to `http://127.0.0.1:9` inside the sandbox (control: empty) and nothing listens there |
+| HTTP GET :80, proxy bypassed (`curl --noproxy "*"`) | 200 | 200 |
+| HTTPS GET, proxy bypassed | 200 | fails locally: schannel `SEC_E_NO_CREDENTIALS` under the restricted token, not a network block |
+
+Reading: the only network brake is the injected dead-proxy environment, which
+stops clients that honour proxy variables and nothing else. A raw socket or a
+client that ignores them reaches the internet, in cleartext at least; do not
+treat a read-only codex lane as network-isolated, and do not put a secret in
+its prompt, environment or readable files on the expectation that it cannot
+leave the host. Also measured: the sandboxed PowerShell runs in
+ConstrainedLanguage mode, so .NET method calls inside a lane shell are
+refused (cmdlets and native executables still run). Elevated mode was not
+measured (it fails exec on this host, PR #329). Receipts, local only:
+`.claude-state/fleet-runs/lane-CODEX-UNELEVATED-EGRESS-PROBE-1-r1-20261010T0915Z/egress-*.txt`.
+
+Guard: none yet (measurement card). A follow-up card should decide whether a
+real egress block (an elevated-mode firewall rule, or a deny-by-default
+launch wrapper) is worth its cost; this measurement is the input to that
+decision, not a fix.
+
 ## Lane worktree retirement at lane exit
 
 `-RetireWorktree` retires the lane's own worktree through the SAFE gate in

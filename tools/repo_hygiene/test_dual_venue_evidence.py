@@ -5154,7 +5154,7 @@ class LegSpecSchemaTests(unittest.TestCase):
         self.jsonschema.validate(dict(look, look=dict(look["look"], lookFlavor="film")), self.schema)
         pace = json.loads((DV / "legs" / "m16-1243-pace-cinematic-fullscreen-s4.json").read_text(encoding="utf-8"))
         self.jsonschema.validate(dict(pace, generatorArgs=dict(pace["generatorArgs"], lookFlavor="film")), self.schema)
-        for bad in ("filmm", "Film", "film-v1", "film-v2"):
+        for bad in ("filmm", "Film", "film-v1", "film-v2", "film-v3"):
             with self.assertRaises(self.jsonschema.ValidationError, msg=bad):
                 self.jsonschema.validate(dict(look, look=dict(look["look"], lookFlavor=bad)), self.schema)
             with self.assertRaises(self.jsonschema.ValidationError, msg=bad):

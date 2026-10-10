@@ -14,13 +14,21 @@ the same loop by supplying its own `board-profile.json`.
 
 Tests: `tests/coordination/test_autopilot_board_ff.py` (throwaway local repos only).
 
+## Fold cadence (DOCTRINE-FOLD-CADENCE-1)
+
+| File | What it is |
+|---|---|
+| `fold-cadence.ps1` | Read-only verdict step. Reads the acked bus commit from a `last-seen.json` (`-LastSeenPath`), runs `doctrine_recall.py --fold-debt --since <acked sha>` under a hard deadline (`-DeadlineSec`, default 60), and returns/writes a `mlv-app/fold-cadence/v1` verdict (`owedCount`, `oldestOwedAgeHours`, `ackedSha`, `lastFoldUtc`, `dueFold`, `reason`, ...). `dueFold = owedCount > 0 AND UsageLevel == 'ok' AND no fold in the last 6 h` (`Get-FoldCadenceDecision`, callable by dot-sourcing). It queues nothing and writes nothing to the bus; the caller turns `dueFold` into a card-queue row. Every failure (timeout, missing or unreadable last-seen, recall failure) is a typed `reason` with `dueFold` false and exit code 0. |
+
+Tests: `tests/coordination/test_autopilot_fold_cadence.py` (fake recall script; no real bus). Not wired into the live beat by this folder.
+
 ## Tracked now (PRODUCT-SHARE-BIND-1)
 
 | File | What it is |
 |---|---|
 | `product-share.ps1` | Hub-tick step that binds `Test-ProductRatioGuard.ps1`: runs it under a hard deadline, caches a `mlv-app/product-share-verdict/v1` verdict (GREEN, RED or UNKNOWN), and exposes `Get-ProductSlotPlan` (RED with a product card due reserves a product slot and caps incident/hub-tooling lanes at one). Always exits 0: the verdict never changes a caller's exit code. `-Detach` refreshes a stale cache with a hidden worker, because the guard was measured at 529 s on the board. |
 
-Tests: `tests/coordination/test_autopilot_product_share.py` (fake guards only). Not yet wired into the live beat; the staged patch is in the PR.
+Tests: `tests/coordination/test_autopilot_product_share.py` (fake guards only). Not yet wired into the live beat; the live-wiring patch is staged by the hub outside the tree (`live-wiring.patch.md` in the r1 run dir, `C:\!Layi Wkspc\MLV-App\.claude-state\fleet-runs\lane-PRODUCT-SHARE-BIND-1-r1-20261010T1045Z\live-wiring.patch.md`) and applied by the hub after merge.
 
 ## Profile schema (`board-profile.v1`)
 
