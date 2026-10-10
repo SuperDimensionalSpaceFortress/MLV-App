@@ -1036,7 +1036,9 @@ $hostPid = $null
 # place; tests/coordination/test_lane_containment.py pins these as literals
 # since it cannot import a .ps1 file, with a comment pointing back here.
 $OWNER_ABSENT_NO_HOST_BUDGET = 'launch-budget-exhausted'  # unchanged text: line ~471's throw message, asserted verbatim since PR #105 round 3
-$OWNER_ABSENT_NO_HOST_START_THREW = 'start-threw'         # Process::Start itself threw; no host was ever created
+$LAUNCH_NO_CHILD = 'launch-no-child'                      # receipt.failure when the claude child was never created (LANE-LAUNCH-NO-CHILD-TYPED-1)
+$launchNoChild = $null
+$OWNER_ABSENT_NO_HOST_START_THREW = 'start-threw'        # Process::Start itself threw; no host was ever created
 $OWNER_ABSENT_POST_START_UNRECORDED = 'post-start-unrecorded'  # Start returned (a host EXISTS) but $containedHost's own construction threw -- the genuinely ambiguous state
 # Outcome of the PRE-ASSIGNMENT kill at line ~677 (host started but never
 # joined the job, so a swallowed kill failure there is a genuine orphan, unlike
@@ -1811,6 +1813,46 @@ catch {
             promptDelivered=$promptDelivered; assignmentErrorCode=$native
         }
     }
+    # LANE-LAUNCH-NO-CHILD-TYPED-1: the claude child was never created and no prompt reached it,
+    # yet the 10 s control-file wait (contained-child-start-timeout) is a TimeoutException, which
+    # the branch above books as timedOut=true / failure=null -- so a lane that did NOTHING (5
+    # receipts in 3 days, 11-48 s into a 2400-7200 s budget, childPid null, promptDelivered false)
+    # read as 'ended-incomplete' and was indistinguishable from a round that ran and stopped.
+    # Type it. Only when the lane's own deadline had NOT passed: a budget that really ran out
+    # (launch-budget-exhausted, a 1 s -TimeoutSec) stays timedOut exactly as before.
+    # exitCode returns to the -999 sentinel (propagated as 127, like any other launch failure)
+    # rather than -1 (124, "timed out"), because nothing timed out.
+    if ($cfg.engine -eq 'claude' -and $null -ne $containment -and $null -eq $containment.childPid -and
+        -not $promptDelivered -and $timedOut -and $null -eq $failure -and
+        $sw.Elapsed.TotalSeconds -lt $TimeoutSec) {
+        $launchNoChild = [ordered]@{
+            hostPid=$containment.ownerPid; hostExitedBeforeRunnerAction=$null; hostExitCode=$null
+            hostStderrHead=$null; elapsedSec=[math]::Round($sw.Elapsed.TotalSeconds, 1); captureError=$null
+        }
+        try {
+            if ($null -ne $proc) {
+                $launchNoChild.hostExitedBeforeRunnerAction = [bool]$proc.HasExited
+                if ($proc.HasExited) {
+                    $launchNoChild.hostExitCode = [int]$proc.ExitCode
+                } else {
+                    # Same cleanup the finally block performs next (kill-on-close job); done here
+                    # first only so the host's stderr pipe reaches EOF and can be read below.
+                    if ($jobHandle -ne [IntPtr]::Zero) { [void][MlvLaneJob]::CloseHandle($jobHandle); $jobHandle = [IntPtr]::Zero }
+                    try { $proc.Kill($true) } catch { }
+                    [void]$proc.WaitForExit(5000)
+                }
+                if ($errTask.Wait(2000)) {
+                    $errHead = [string]$errTask.Result
+                    $launchNoChild.hostStderrHead = if ($errHead.Length -gt 400) { $errHead.Substring(0, 400) } else { $errHead }
+                }
+            }
+        } catch {
+            $launchNoChild.captureError = $_.Exception.Message
+        }
+        $failure = $LAUNCH_NO_CHILD
+        $timedOut = $false
+        $exitCode = -999
+    }
     # Convert managed failures into the receipt/exit taxonomy below. Rethrowing here
     # bypasses the final `exit $propagated` and turns the documented 127 into shell 1.
 }
@@ -2100,6 +2142,8 @@ $receipt = [ordered]@{
         outputTokens       = $outputTokens
     }
 }
+# Present only on a typed no-child launch, so every other receipt keeps its exact shape.
+if ($null -ne $launchNoChild) { $receipt['launchNoChild'] = $launchNoChild }
 try {
     Write-Utf8NoBomAtomic $rcptPath (($receipt | ConvertTo-Json -Depth 6))
 } finally {

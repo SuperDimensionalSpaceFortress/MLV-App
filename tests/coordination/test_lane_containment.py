@@ -2470,3 +2470,59 @@ def test_read_only_claude_lane_with_dirty_tracked_worktree_is_never_ended_incomp
     q=json.loads(receipt.read_text(encoding="utf-8"))
     assert q["state"]=="complete" and q["complete"] is True
     assert q["workEvidence"]["reason"]!="dirty-worktree-no-commit"
+
+
+# LANE-LAUNCH-NO-CHILD-TYPED-1: a claude lane whose child is never created (the contained host does not
+# produce the child control file inside the 10 s control window) used to be receipted as
+# state=ended-incomplete, timedOut=true, failure=null -- indistinguishable from a round that ran and
+# stopped (5 receipts in 3 days, 11-48 s into a 2400-7200 s budget). It is now failure=launch-no-child.
+def _no_child_launch_mutation(text):
+    # The host's pwsh cold start stands in for the loaded machine; the 10 s control window is shortened
+    # so the real code path (contained-child-start-timeout) is reached inside a test budget.
+    old = "$line=[Console]::In.ReadLine(); if([string]::IsNullOrWhiteSpace($line)){throw 'launch-frame-missing'}"
+    assert text.count(old) == 1
+    text = text.replace(old, "Start-Sleep -Seconds 6\n" + old)
+    win = "$sw.Elapsed.TotalMilliseconds + 10000.0"
+    assert text.count(win) == 1
+    return text.replace(win, "$sw.Elapsed.TotalMilliseconds + 1500.0")
+
+
+def test_child_never_created_is_typed_launch_no_child_not_a_timeout(fixture_tree):
+    cmd,env,receipt=prepare(fixture_tree,"normal",mutation=_no_child_launch_mutation)
+    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=40)
+    assert r.returncode==127,(r.stdout,r.stderr)   # launch failure, not 124 (timed out)
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert q["timeoutSec"]==30 and q["durationSec"]<30, "the lane's own deadline must NOT have passed"
+    assert q["failure"]=="launch-no-child"
+    assert q["state"]=="failed" and q["complete"] is False
+    assert q["timedOut"] is False and q["processEnded"] is False
+    c=q["containment"]
+    assert c["childPid"] is None and c["promptDelivered"] is False and c["jobAssigned"] is True
+    assert not (fixture_tree["root"]/"child.json").exists()
+    cap=q["launchNoChild"]
+    assert cap["hostPid"]==c["ownerPid"]
+    assert cap["hostExitedBeforeRunnerAction"] is False   # the host was alive and silent, then reaped by the runner
+    assert cap["captureError"] is None and "hostStderrHead" in cap and "hostExitCode" in cap
+    wait_absent({"pid":c["ownerPid"],"createdUtc":c["ownerCreatedUtc"]})
+
+
+def test_ran_and_timed_out_lane_keeps_ended_incomplete_unchanged(fixture_tree):
+    # CONTROL for the test above: a lane whose child DID run and then hit its deadline is still
+    # ended-incomplete / timedOut / exit 124 with failure null and no launchNoChild block.
+    cmd,env,receipt=prepare_timeout_after_ready(fixture_tree)
+    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    assert r.returncode==124,(r.stdout,r.stderr)
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert q["state"]=="ended-incomplete" and q["timedOut"] is True and q["failure"] is None
+    assert q["containment"]["childPid"] is not None
+    assert "launchNoChild" not in q
+
+
+def test_exhausted_budget_before_child_stays_a_timeout_not_launch_no_child(fixture_tree):
+    # CONTROL: the lane's OWN deadline really passed (-TimeoutSec 0): that is a timeout and must not be retyped.
+    cmd,env,receipt=prepare(fixture_tree,"normal")
+    cmd[cmd.index("-TimeoutSec")+1]="0"
+    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=15)
+    assert r.returncode==124,(r.stdout,r.stderr)
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert q["timedOut"] is True and q["failure"] is None and "launchNoChild" not in q
