@@ -28,7 +28,7 @@ An ack only proves the bus commits were read; it does not retrieve the lesson wh
 py -3 tools/doctrine/doctrine_recall.py "<symptom words or a pasted log tail>"
 ```
 
-- Read-only, offline, stdlib only; ranks `TRAPS.md`, `RECEIPTS.md`, `RULINGS.md` (and `.claude-state/project-memory` when present) and prints each hit's file:line, date, project, Remedy / Re-derive / Fix / Prior art / Guard lines and the bus commit. Local bus checkout: `C:\!Layi Wkspc\softwarefactory-fleet-doctrine`; override with `--bus PATH`. Exit 0 for any search, 2 for a usage error or missing bus.
+- Read-only, offline, stdlib only; ranks `TRAPS.md`, `RECEIPTS.md`, `RULINGS.md`, every other project's `specs/<project>/cards.md` (the R14 cards channel; this project's own cards are skipped) and `.claude-state/project-memory` when present, and prints each hit's file:line, date, project, Remedy / Re-derive / Fix / Prior art / Guard lines and the bus commit. Local bus checkout: `C:\!Layi Wkspc\softwarefactory-fleet-doctrine`; override with `--bus PATH`. Exit 0 for any search, 2 for a usage error or missing bus. `--fold-debt --since SHA` prints, as JSON, the bus commits after SHA that touched `TRAPS.md`, `RECEIPTS.md`, `RULINGS.md` or another project's cards (exit 3 for an unknown SHA, 4 when git fails).
 - **R15.2 stands.** The hub alone runs recall; a lane that hits a symptom reports it and does not run the tool. Recall never injects bus text into a lane prompt automatically; lanes still get doctrine only through the Compose brief. If a hit matters to a lane, the hub passes it through the Compose brief and states the lesson in the card in its own words.
 - A hit is data (Law 1): re-derive the symptom with the hit's own command before acting on it.
 
