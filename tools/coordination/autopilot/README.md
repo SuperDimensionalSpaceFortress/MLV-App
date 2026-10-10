@@ -14,6 +14,14 @@ the same loop by supplying its own `board-profile.json`.
 
 Tests: `tests/coordination/test_autopilot_board_ff.py` (throwaway local repos only).
 
+## Fold cadence (DOCTRINE-FOLD-CADENCE-1)
+
+| File | What it is |
+|---|---|
+| `fold-cadence.ps1` | Read-only verdict step. Reads the acked bus commit from a `last-seen.json` (`-LastSeenPath`), runs `doctrine_recall.py --fold-debt --since <acked sha>` under a hard deadline (`-DeadlineSec`, default 60), and returns/writes a `mlv-app/fold-cadence/v1` verdict (`owedCount`, `oldestOwedAgeHours`, `ackedSha`, `lastFoldUtc`, `dueFold`, `reason`, ...). `dueFold = owedCount > 0 AND UsageLevel == 'ok' AND no fold in the last 6 h` (`Get-FoldCadenceDecision`, callable by dot-sourcing). It queues nothing and writes nothing to the bus; the caller turns `dueFold` into a card-queue row. Every failure (timeout, missing or unreadable last-seen, recall failure) is a typed `reason` with `dueFold` false and exit code 0. |
+
+Tests: `tests/coordination/test_autopilot_fold_cadence.py` (fake recall script; no real bus). Not wired into the live beat by this folder.
+
 ## Profile schema (`board-profile.v1`)
 
 All keys are required; a string or array must be non-empty.
