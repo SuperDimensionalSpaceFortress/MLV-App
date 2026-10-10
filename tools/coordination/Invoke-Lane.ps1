@@ -1036,7 +1036,10 @@ $hostPid = $null
 # place; tests/coordination/test_lane_containment.py pins these as literals
 # since it cannot import a .ps1 file, with a comment pointing back here.
 $OWNER_ABSENT_NO_HOST_BUDGET = 'launch-budget-exhausted'  # unchanged text: line ~471's throw message, asserted verbatim since PR #105 round 3
-$OWNER_ABSENT_NO_HOST_START_THREW = 'start-threw'         # Process::Start itself threw; no host was ever created
+$LAUNCH_NO_CHILD = 'launch-no-child'                      # receipt.failure when the claude child was never created (LANE-LAUNCH-NO-CHILD-TYPED-1)
+$launchNoChild = $null
+$awaitingChild = $false   # true only from the launch-frame write until the child control file is seen (r2: phase, not message, decides "no child")
+$OWNER_ABSENT_NO_HOST_START_THREW = 'start-threw'        # Process::Start itself threw; no host was ever created
 $OWNER_ABSENT_POST_START_UNRECORDED = 'post-start-unrecorded'  # Start returned (a host EXISTS) but $containedHost's own construction threw -- the genuinely ambiguous state
 # Outcome of the PRE-ASSIGNMENT kill at line ~677 (host started but never
 # joined the job, so a swallowed kill failure there is a genuine orphan, unlike
@@ -1534,6 +1537,7 @@ if ($cfg.engine -eq 'claude') {
     $controlPath = "$base.child.json"
     if (Test-Path -LiteralPath $controlPath) { throw "control-path-exists: $controlPath" }
     $launchFrame = [ordered]@{ schema='mlv-lane-launch/v1'; exe=$exe; argv=$argv; cwd=$WorkDir; controlPath=$controlPath } | ConvertTo-Json -Compress -Depth 5
+    $awaitingChild = $true
     $proc.StandardInput.WriteLine($launchFrame); $proc.StandardInput.Flush()
     $controlDeadlineMs = [math]::Min($sw.Elapsed.TotalMilliseconds + 10000.0, $TimeoutSec * 1000.0)
     while (-not (Test-Path -LiteralPath $controlPath)) {
@@ -1541,6 +1545,7 @@ if ($cfg.engine -eq 'claude') {
         if ($sw.Elapsed.TotalMilliseconds -ge $controlDeadlineMs) { throw [TimeoutException]::new('contained-child-start-timeout') }
         Start-Sleep -Milliseconds 25
     }
+    $awaitingChild = $false
     # ConvertFrom-Json can turn ISO strings into DateTime values on newer pwsh;
     # casting back to string then loses precision and uses the current culture.
     # Keep the exact UTC creation identity emitted by the contained host.
@@ -1712,12 +1717,23 @@ if ($cfg.engine -eq 'claude') {
 
 }
 catch {
+    $noChildCause = $_.Exception.Message
+    $noChildCauseType = $_.Exception.GetType().Name
+    # r3: the lane's own deadline is read ONCE, here, before any cleanup spends time, and applies to
+    # every exception type the child-wait phase can raise (a host that exits at the deadline raises a
+    # RuntimeException, not a TimeoutException).
+    $noChildDeadlineExpired = ($cfg.engine -eq 'claude' -and $awaitingChild -and $sw.Elapsed.TotalSeconds -ge $TimeoutSec)
     if ($_.Exception -is [TimeoutException]) {
         $timedOut = $true
         $exitCode = -1
         $failure = $null
     } else {
         $failure = $_.Exception.Message
+        if ($noChildDeadlineExpired) {
+            # A budget that ran out is a timeout whatever carried the host exit; keep the pre-card failure text.
+            $timedOut = $true
+            $exitCode = -1
+        }
     }
     # Before assignment the inert host is outside the job. Terminate only the exact
     # Process object created by this invocation; it has received no launch frame.
@@ -1810,6 +1826,51 @@ catch {
             childPid=$null; childCreatedUtc=$null; deadlineUtc=$deadlineUtc.ToString('o')
             promptDelivered=$promptDelivered; assignmentErrorCode=$native
         }
+    }
+    # LANE-LAUNCH-NO-CHILD-TYPED-1: the claude child was never created and no prompt reached it.
+    # Two catch paths used to leave that untyped: the 10 s control-file wait
+    # (contained-child-start-timeout, a TimeoutException, booked as timedOut=true / failure=null ->
+    # 'ended-incomplete', 5 receipts in 3 days, 11-48 s into a 2400-7200 s budget) and a host that
+    # exited before creating the child (failure='contained-host-exited-before-child: <code>', seen on
+    # PLAYBACK-LJ92-DECODE-THROUGHPUT-1 r3, 2.2 s in, host stderr never captured -- r2). Both, and any
+    # other throw while the runner waits for the child (e.g. the launch-frame write hitting a dead
+    # host), are classified by PHASE ($awaitingChild), never by message text.
+    # Only when the lane's own deadline had NOT passed, whatever exception type carried it (r3): a budget
+    # that really ran out (launch-budget-exhausted, a 1 s -TimeoutSec, a host exiting at the deadline)
+    # stays timedOut exactly as before.
+    # exitCode returns to the -999 sentinel (propagated as 127, like any other launch failure)
+    # rather than -1 (124, "timed out"), because nothing timed out. The original exception text is
+    # kept in launchNoChild.cause so the pre-r2 detail is not lost.
+    if ($cfg.engine -eq 'claude' -and $awaitingChild -and $null -ne $containment -and $null -eq $containment.childPid -and
+        -not $promptDelivered -and -not $noChildDeadlineExpired) {
+        $launchNoChild = [ordered]@{
+            hostPid=$containment.ownerPid; hostExitedBeforeRunnerAction=$null; hostExitCode=$null
+            hostStderrHead=$null; elapsedSec=[math]::Round($sw.Elapsed.TotalSeconds, 1); captureError=$null
+            cause=$noChildCause; causeType=$noChildCauseType
+        }
+        try {
+            if ($null -ne $proc) {
+                $launchNoChild.hostExitedBeforeRunnerAction = [bool]$proc.HasExited
+                if ($proc.HasExited) {
+                    $launchNoChild.hostExitCode = [int]$proc.ExitCode
+                } else {
+                    # Same cleanup the finally block performs next (kill-on-close job); done here
+                    # first only so the host's stderr pipe reaches EOF and can be read below.
+                    if ($jobHandle -ne [IntPtr]::Zero) { [void][MlvLaneJob]::CloseHandle($jobHandle); $jobHandle = [IntPtr]::Zero }
+                    try { $proc.Kill($true) } catch { }
+                    [void]$proc.WaitForExit(5000)
+                }
+                if ($errTask.Wait(2000)) {
+                    $errHead = [string]$errTask.Result
+                    $launchNoChild.hostStderrHead = if ($errHead.Length -gt 400) { $errHead.Substring(0, 400) } else { $errHead }
+                }
+            }
+        } catch {
+            $launchNoChild.captureError = $_.Exception.Message
+        }
+        $failure = $LAUNCH_NO_CHILD
+        $timedOut = $false
+        $exitCode = -999
     }
     # Convert managed failures into the receipt/exit taxonomy below. Rethrowing here
     # bypasses the final `exit $propagated` and turns the documented 127 into shell 1.
@@ -2100,6 +2161,8 @@ $receipt = [ordered]@{
         outputTokens       = $outputTokens
     }
 }
+# Present only on a typed no-child launch, so every other receipt keeps its exact shape.
+if ($null -ne $launchNoChild) { $receipt['launchNoChild'] = $launchNoChild }
 try {
     Write-Utf8NoBomAtomic $rcptPath (($receipt | ConvertTo-Json -Depth 6))
 } finally {
