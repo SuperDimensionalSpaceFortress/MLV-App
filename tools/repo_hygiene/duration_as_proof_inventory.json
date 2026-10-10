@@ -1938,6 +1938,49 @@
       "lines": [
         27707
       ]
+    },
+    {
+      "path": "src/mlv/video_mlv.c",
+      "anchor": "g_mlv_last_raw_uint16_source = inflightWaitMs >= 0.0",
+      "class": "value_fallback_select",
+      "clock": "qpc_stage_clock",
+      "justification": "inflightWaitMs is a sentinel, not an elapsed-time inference: mlv_raw_uint16_prefetch_try_copy() and the caller both initialise it to -1.0 (\"the reader did not wait\") and only the in-flight-wait branch overwrites it with a mlv_stage_timing_now() delta, so a wait that measured 0.0 ms under clock resolution still reads >= 0.0 and is still counted as a wait. Selects the per-frame raw source label (INFLIGHT_WAIT_HIT vs HIT) for a frame the prefetch slot already served (the try_copy return value is the run-proof); the comparison filters the -1.0 sentinel, it never infers that a stage ran from a nonzero duration (PLAYBACK-LJ92-DECODE-THROUGHPUT-1).",
+      "lines": [
+        4124
+      ]
+    },
+    {
+      "path": "src/mlv/video_mlv.c",
+      "anchor": "g_mlv_last_raw_uint16_inflight_wait_ms = inflightWaitMs >= 0.0 ? inflightWaitMs : 0.0 ;",
+      "class": "value_fallback_select",
+      "clock": "qpc_stage_clock",
+      "justification": "inflightWaitMs is a sentinel, not an elapsed-time inference: mlv_raw_uint16_prefetch_try_copy() and the caller both initialise it to -1.0 (\"the reader did not wait\") and only the in-flight-wait branch overwrites it with a mlv_stage_timing_now() delta, so a wait that measured 0.0 ms under clock resolution still reads >= 0.0 and is still counted as a wait. Both copies (hit path and direct/miss path) only clamp the -1.0 sentinel to 0.0 before publishing the per-frame wait telemetry for cpu_frame; the source label (set on the line above each) carries what happened (PLAYBACK-LJ92-DECODE-THROUGHPUT-1).",
+      "lines": [
+        4127,
+        4169
+      ]
+    },
+    {
+      "path": "tests/pipeline/test_raw_uint16_prefetch_parallel.cpp",
+      "anchor": "ASSERT_TRUE ( getMlvLastRawUint16FrameLj92Milliseconds ( ) > 0.0 ) ;",
+      "class": "run_proof",
+      "clock": "qpc_stage_clock",
+      "flag": "getMlvLastRawUint16Source() != MLV_RAW_UINT16_SOURCE_NONE (asserted on the line above, per frame)",
+      "justification": "Test-only value-propagation check in RawUint16PrefetchParallel.StatsCountWorkerLj92Time: that the per-frame LJ92 time reaches the CALLER thread whichever thread decoded the frame. Whether a decode ran is proven by the source flag on the preceding line (and by stats.worker_decodes); the duration compare is kept only because a propagated value has no flag equivalent, and the frame is a full-size dual-ISO LJ92 decode timed by mlv_stage_timing_now() (tens of ms, far above QPC resolution).",
+      "lines": [
+        307
+      ]
+    },
+    {
+      "path": "tests/pipeline/test_raw_uint16_prefetch_parallel.cpp",
+      "anchor": "ASSERT_TRUE ( stats . worker_lj92_ms_sum > 0.0 ) ;",
+      "class": "run_proof",
+      "clock": "qpc_stage_clock",
+      "flag": "stats.worker_decodes >= 1u (asserted on the line above)",
+      "justification": "Test-only check that the object-scoped prefetch stats accumulate the worker thread's own LJ92 time (the thread-locals of the decode thread never see it). That a worker decode ran is proven by the worker_decodes counter on the preceding line; the duration compare pins the accumulation, on full-size dual-ISO LJ92 decodes timed by mlv_stage_timing_now() (tens of ms each, far above QPC resolution).",
+      "lines": [
+        312
+      ]
     }
   ]
 }
