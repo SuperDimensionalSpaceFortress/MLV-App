@@ -254,6 +254,12 @@ void gpuPreviewProcessingApplyCpuRoute(GpuPreviewProcessingConfig * config,
 /* Attaches the current S/H frame state: the quarter-res blur when the engine's
  * last refresh was the quarter-only one for this width x height
  * (processingGetShadowsHighlightsQuarterBlurData), else the full-res blur. */
+/* PLAYBACK-GPU-EPISODIC-STALL-1 r2: the blur is copied into a per-thread buffer
+ * that no live config shares, instead of a fresh 2 MB allocation per frame.
+ * MLVAPP_GPU_SH_FRAME_STATE_BUFFER_REUSE=0 (exactly "0", read on every call)
+ * allocates per call as before. Same bytes either way. */
+const char * gpuPreviewProcessingShFrameStateBufferReuseSwitchName(void);
+bool gpuPreviewProcessingShFrameStateBufferReuseEnabled(void);
 bool gpuPreviewProcessingAttachFrameState(GpuPreviewProcessingConfig * config,
                                           const processingObject_t * processing,
                                           int width,

@@ -2275,6 +2275,62 @@ TEST(GpuPreviewProcessing, MarkShadowsHighlightsBlurStaleClearsOnlyTheReadyFlag)
     gpuPreviewProcessingMarkShadowsHighlightsBlurStale(nullptr); /* tolerated */
 }
 
+TEST(GpuPreviewProcessing, ShadowsHighlightsFrameStateBlurReusesAnUnsharedBuffer)
+{
+    /* PLAYBACK-GPU-EPISODIC-STALL-1 r2: the per-frame blur copy goes into a buffer
+     * the attaching thread already owns (shared with its pool, so no 2 MB
+     * allocation per frame), never into one a live config still shares, and is
+     * reused once every config sharing it is gone. MLVAPP_GPU_SH_FRAME_STATE_BUFFER_REUSE=0
+     * allocates per call. The bytes are the engine's blur in every case. */
+    MlvPipelineFixture fixture;
+    assert_gpu_preview_fixture_ready(fixture);
+    const GpuPreviewProcessingConfig config = build_shadows_highlights_config_with_frame_state(fixture);
+    processingObject_t * processing = fixture.processing();
+    const QByteArray expected(config.shadowsHighlightsBlur.constData(), config.shadowsHighlightsBlur.size());
+    ASSERT_TRUE(!expected.isEmpty());
+
+    const QByteArray saved = qgetenv("MLVAPP_GPU_SH_FRAME_STATE_BUFFER_REUSE");
+    const bool hadSaved = qEnvironmentVariableIsSet("MLVAPP_GPU_SH_FRAME_STATE_BUFFER_REUSE");
+    qunsetenv("MLVAPP_GPU_SH_FRAME_STATE_BUFFER_REUSE");
+    ASSERT_TRUE(gpuPreviewProcessingShFrameStateBufferReuseEnabled());
+
+    auto attach = [&](GpuPreviewProcessingConfig * target) {
+        *target = config;
+        target->shadowsHighlightsBlur = QByteArray();
+        QString reason;
+        ASSERT_TRUE(gpuPreviewProcessingAttachFrameState(
+            target, processing, fixture.width(), fixture.height(), &reason));
+    };
+
+    GpuPreviewProcessingConfig a;
+    attach(&a);
+    ASSERT_TRUE(a.shadowsHighlightsBlur == expected);
+    ASSERT_TRUE(!a.shadowsHighlightsBlur.isDetached());   /* the pool shares it */
+    const char * aData = a.shadowsHighlightsBlur.constData();
+
+    GpuPreviewProcessingConfig b;
+    attach(&b);
+    ASSERT_TRUE(b.shadowsHighlightsBlur == expected);
+    ASSERT_TRUE(b.shadowsHighlightsBlur.constData() != aData);   /* a is alive: not overwritten */
+    ASSERT_TRUE(a.shadowsHighlightsBlur == expected);
+
+    a = GpuPreviewProcessingConfig();
+    GpuPreviewProcessingConfig c;
+    attach(&c);
+    ASSERT_TRUE(c.shadowsHighlightsBlur == expected);
+    ASSERT_TRUE(c.shadowsHighlightsBlur.constData() == aData);   /* a's buffer, now unshared, is reused */
+
+    qputenv("MLVAPP_GPU_SH_FRAME_STATE_BUFFER_REUSE", "0");
+    ASSERT_TRUE(!gpuPreviewProcessingShFrameStateBufferReuseEnabled());
+    GpuPreviewProcessingConfig d;
+    attach(&d);
+    ASSERT_TRUE(d.shadowsHighlightsBlur == expected);
+    ASSERT_TRUE(d.shadowsHighlightsBlur.isDetached());   /* its own allocation */
+
+    if ( hadSaved ) qputenv("MLVAPP_GPU_SH_FRAME_STATE_BUFFER_REUSE", saved);
+    else qunsetenv("MLVAPP_GPU_SH_FRAME_STATE_BUFFER_REUSE");
+}
+
 TEST(GpuPreviewProcessing, ShadowsHighlightsKillSwitchForcesDisplayBypass)
 {
     /* Round 1 lost the MLVAPP_GPU_TEX_NR_DISPLAY_LUT_ONLY_SKIP_SH_STATE kill

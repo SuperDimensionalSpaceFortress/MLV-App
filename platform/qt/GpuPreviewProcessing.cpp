@@ -4144,6 +4144,52 @@ void gpuPreviewProcessingApplyCpuRoute(GpuPreviewProcessingConfig * config,
         processingCpuRoutePreCameraClamps(processing, direct8Route ? 1 : 0) != 0;
 }
 
+const char * gpuPreviewProcessingShFrameStateBufferReuseSwitchName(void)
+{
+    return "MLVAPP_GPU_SH_FRAME_STATE_BUFFER_REUSE";
+}
+
+bool gpuPreviewProcessingShFrameStateBufferReuseEnabled(void)
+{
+    return qgetenv( gpuPreviewProcessingShFrameStateBufferReuseSwitchName() ) != QByteArrayLiteral("0");
+}
+
+namespace
+{
+/* PLAYBACK-GPU-EPISODIC-STALL-1 r2: the blur copy the frame state carries to the
+ * presenter. A fresh QByteArray per frame was a 2 MB allocation and release every
+ * frame (452x564 RGB16). Each calling thread keeps a few buffers; one is
+ * overwritten only while this pool holds its only reference, i.e. no config that
+ * a presenter or an in-flight frame still reads shares it. When every buffer is
+ * still shared, a fresh one is allocated as before. Same bytes either way. */
+QByteArray frameStateBlurCopy(const uint16_t * data, int byteCount)
+{
+    const char * bytes = reinterpret_cast<const char *>(data);
+    if ( !gpuPreviewProcessingShFrameStateBufferReuseEnabled() )
+    {
+        return QByteArray(bytes, byteCount);
+    }
+    static thread_local QByteArray pool[4];
+    for ( QByteArray & buffer : pool )
+    {
+        if ( buffer.size() == byteCount && buffer.isDetached() )
+        {
+            std::memcpy(buffer.data(), bytes, static_cast<size_t>(byteCount));
+            return buffer;
+        }
+    }
+    for ( QByteArray & buffer : pool )
+    {
+        if ( buffer.isNull() || buffer.isDetached() )
+        {
+            buffer = QByteArray(bytes, byteCount);
+            return buffer;
+        }
+    }
+    return QByteArray(bytes, byteCount);
+}
+}
+
 bool gpuPreviewProcessingAttachFrameState(GpuPreviewProcessingConfig * config,
                                           const processingObject_t * processing,
                                           int width,
@@ -4206,9 +4252,9 @@ bool gpuPreviewProcessingAttachFrameState(GpuPreviewProcessingConfig * config,
         config->shadowsHighlightsFrameHeight = height;
         config->shadowsHighlightsBlurQuarter = true;
         config->shadowsHighlightsBlur =
-            QByteArray(reinterpret_cast<const char *>(quarterData),
-                       static_cast<int>(static_cast<size_t>(quarterWidth) * quarterHeight
-                                        * 3u * sizeof(uint16_t)));
+            frameStateBlurCopy(quarterData,
+                               static_cast<int>(static_cast<size_t>(quarterWidth) * quarterHeight
+                                                * 3u * sizeof(uint16_t)));
         config->shadowsHighlightsFrameStateReady = true;
         if ( reason ) reason->clear();
         return true;
@@ -4246,8 +4292,7 @@ bool gpuPreviewProcessingAttachFrameState(GpuPreviewProcessingConfig * config,
     config->shadowsHighlightsFrameHeight = height;
     config->shadowsHighlightsBlurQuarter = false;
     config->shadowsHighlightsBlur =
-        QByteArray(reinterpret_cast<const char *>(blurData),
-                   static_cast<int>(byteCount));
+        frameStateBlurCopy(blurData, static_cast<int>(byteCount));
     config->shadowsHighlightsFrameStateReady = true;
     if ( reason ) reason->clear();
     return true;
