@@ -575,6 +575,7 @@ function Invoke-GitCaptureUtf8([string]$WorkDir, [string[]]$GitArgs) {
     $psi.FileName = 'git'
     foreach ($a in (@('-C', $WorkDir) + $GitArgs)) { [void]$psi.ArgumentList.Add($a) }
     $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
     $psi.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false)
@@ -1479,11 +1480,13 @@ if ($cfg.engine -eq 'claude') {
     # before frame one is sent, so the provider and every descendant inherit the job.
     $hostSource = @'
 $ErrorActionPreference='Stop'; Set-StrictMode -Version Latest
+[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
 $line=[Console]::In.ReadLine(); if([string]::IsNullOrWhiteSpace($line)){throw 'launch-frame-missing'}
 $launch=$line|ConvertFrom-Json; if([string]$launch.schema -ne 'mlv-lane-launch/v1'){throw 'launch-frame-schema'}
 $p=[Diagnostics.ProcessStartInfo]::new(); $p.FileName=[string]$launch.exe
 foreach($a in @($launch.argv)){[void]$p.ArgumentList.Add([string]$a)}
 $p.WorkingDirectory=[string]$launch.cwd; $p.UseShellExecute=$false
+$p.CreateNoWindow=$true
 $p.RedirectStandardInput=$true; $p.RedirectStandardOutput=$true; $p.RedirectStandardError=$true
 $p.StandardOutputEncoding=[Text.UTF8Encoding]::new($false); $p.StandardErrorEncoding=[Text.UTF8Encoding]::new($false)
 $child=[Diagnostics.Process]::Start($p); $ot=$child.StandardOutput.ReadToEndAsync(); $et=$child.StandardError.ReadToEndAsync()

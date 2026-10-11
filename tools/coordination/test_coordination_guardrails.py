@@ -693,6 +693,21 @@ def test_invoke_lane_marks_only_the_claude_child_as_a_fleet_lane():
     assert not "MLV_FLEET_LANE".startswith(("ANTHROPIC_", "OPENAI_", "CLAUDE_CODE_"))
 
 
+def test_invoke_lane_child_processes_open_no_console_window_and_read_utf8():
+    # INVOKE-LANE-CREATENOWINDOW-1. These three lines lived only as an uncommitted edit in the canonical
+    # checkout, so a checkout or rotation would have silently reverted them.
+    body = LANE_RUNNER.read_text(encoding="utf-8").replace("\r\n", "\n")
+    start = body.index("function Invoke-GitCaptureUtf8(")
+    git = body[start:body.index("\n}\n", start)]
+    assert "$psi.CreateNoWindow = $true" in git, "each git capture must not flash a console window"
+    start = body.index("$hostSource = @'")
+    host = body[start:body.index("\n'@", start)]
+    assert "$p.CreateNoWindow=$true" in host, "the claude child must not open a console window"
+    assert "[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)" in host, (
+        "the host must write UTF-8 without a BOM to the pipe the lane reads"
+    )
+
+
 def test_the_timeout_code_matches_the_taxonomy_the_repo_already_uses():
     # boundedRunnerExitCodes already fixes timeout=124; a second private meaning for the same
     # condition is how two tools end up disagreeing about one event.
