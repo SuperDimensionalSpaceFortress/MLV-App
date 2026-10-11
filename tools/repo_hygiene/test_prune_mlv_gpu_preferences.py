@@ -23,7 +23,11 @@ SCRIPT = VENUE_DIR / "Prune-MlvGpuPreferences.ps1"
 VENUES_JSON = REPO_ROOT / "tools" / "profiling" / "dual-venue" / "venues.json"
 PWSH = shutil.which("pwsh")
 
-ROOTS = [r"C:\mlvtmp\mlv-agent", r"G:\Temp\mlv-gpu-profile\agent", r"G:\Temp\mlv-gpu-profile", r"C:\mlvtmp"]
+ROOTS = [
+    r"C:\mlvtmp\mlv-agent", r"G:\Temp\mlv-gpu-profile\agent", r"G:\Temp\mlv-gpu-profile",
+    r"C:\mlvtmp", r"C:\dell-bench", r"C:\temp",
+]
+ALL_MOUNTED = (r"C:\mlvtmp", r"C:\mlvtmp\mlv-agent", r"C:\dell-bench", r"C:\temp")
 
 
 def _quote(path: Path) -> str:
@@ -37,7 +41,8 @@ class SelectionLogic(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.tmp = Path(self._tmp.name)
 
-    def judge(self, names, *, existing=(), mounted=(r"C:\mlvtmp", r"C:\mlvtmp\mlv-agent"), roots=ROOTS):
+    def judge(self, names, *, existing=(), mounted=(r"C:\mlvtmp", r"C:\mlvtmp\mlv-agent"), roots=ROOTS,
+              include_existing=False):
         payload = {"names": list(names), "existing": list(existing), "mounted": list(mounted), "roots": list(roots)}
         data = self.tmp / "in.json"
         data.write_text(json.dumps(payload), encoding="utf-8")
@@ -46,7 +51,8 @@ class SelectionLogic(unittest.TestCase):
             f"$in = Get-Content -LiteralPath {_quote(data)} -Raw | ConvertFrom-Json; "
             "$existing = @($in.existing); $mounted = @($in.mounted); "
             "$r = @(Select-MlvStaleGpuPreferenceValue -Names @($in.names) -Roots @($in.roots) "
-            "-FileExists { param($p) $existing -contains $p } -RootExists { param($r) $mounted -contains $r }); "
+            "-FileExists { param($p) $existing -contains $p } -RootExists { param($r) $mounted -contains $r }"
+            + (" -IncludeExisting" if include_existing else "") + "); "
             "ConvertTo-Json -InputObject @($r | Select-Object Name, Verdict, Root) -Depth 4"
         )
         proc = subprocess.run(
@@ -109,7 +115,42 @@ class SelectionLogic(unittest.TestCase):
     def test_an_empty_value_list_selects_nothing(self) -> None:
         self.assertEqual(self.judge([]), {})
 
-    def test_roots_come_from_venues_json_plus_the_lane_worktree_root(self) -> None:
+    def test_absent_exes_under_each_owner_named_root_are_pruned(self) -> None:
+        under_mlvtmp = r"C:\mlvtmp\lane-A\MLVApp.exe"
+        under_dell = r"C:\dell-bench\build\MLVApp.exe"
+        under_temp = r"C:\temp\build\MLVApp-1.2.3.exe"
+        verdicts = self.judge([under_mlvtmp, under_dell, under_temp], mounted=ALL_MOUNTED)
+        self.assertEqual(verdicts, {under_mlvtmp: "prune", under_dell: "prune", under_temp: "prune"})
+
+    def test_a_dell_bench_or_temp_root_that_is_not_mounted_keeps_its_values(self) -> None:
+        under_dell = r"C:\dell-bench\build\MLVApp.exe"
+        under_temp = r"C:\temp\build\MLVApp.exe"
+        verdicts = self.judge([under_dell, under_temp], mounted=[r"C:\mlvtmp"])
+        self.assertEqual(verdicts, {under_dell: "keep-root-unavailable", under_temp: "keep-root-unavailable"})
+
+    def test_an_existing_mlvapp_build_is_kept_without_include_existing_and_pruned_with_it(self) -> None:
+        build = r"C:\dell-bench\builds\MLVApp-20261011.exe"
+        other = r"C:\temp\tools\Helper.exe"
+        names = [build, other]
+        kept = self.judge(names, existing=names, mounted=ALL_MOUNTED)
+        self.assertEqual(kept, {build: "keep-file-exists", other: "keep-file-exists"})
+        pruned = self.judge(names, existing=names, mounted=ALL_MOUNTED, include_existing=True)
+        # only the MLVApp-*.exe shape is relaxed; an existing exe of any other name is still kept
+        self.assertEqual(pruned, {build: "prune", other: "keep-file-exists"})
+
+    def test_include_existing_never_reaches_an_exe_outside_the_roots(self) -> None:
+        outside = r"C:\Program Files\MLV\MLVApp-9.exe"
+        sibling = r"C:\temporary\MLVApp-9.exe"
+        names = [outside, sibling]
+        verdicts = self.judge(names, existing=names, mounted=ALL_MOUNTED, include_existing=True)
+        self.assertEqual(verdicts, {outside: "keep-outside-roots", sibling: "keep-outside-roots"})
+
+    def test_include_existing_does_not_reach_a_root_that_is_not_mounted(self) -> None:
+        build = r"C:\dell-bench\MLVApp-1.exe"
+        verdicts = self.judge([build], existing=[build], mounted=[r"C:\mlvtmp"], include_existing=True)
+        self.assertEqual(verdicts, {build: "keep-root-unavailable"})
+
+    def test_roots_come_from_venues_json_plus_the_always_included_build_roots(self) -> None:
         script = (
             f"Import-Module {_quote(MODULE)} -Force; "
             f"ConvertTo-Json -InputObject @(Get-MlvGpuPreferenceRoots -VenuesJsonPath {_quote(VENUES_JSON)}) -Depth 3"
@@ -121,7 +162,7 @@ class SelectionLogic(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         roots = {r.lower() for r in json.loads(proc.stdout)}
         venues = json.loads(VENUES_JSON.read_text(encoding="utf-8"))["venues"]
-        expected = {r"c:\mlvtmp"}
+        expected = {r"c:\mlvtmp", r"c:\dell-bench", r"c:\temp"}
         for venue in venues.values():
             expected.add(venue["agentRoot"].rstrip("\\").lower())
             expected.add(venue["scratchRoot"].rstrip("\\").lower())
@@ -146,6 +187,13 @@ class ScriptContract(unittest.TestCase):
         self.assertIsNotNone(branch, "the removal block must be guarded by -Apply")
         self.assertEqual(self.text.count("DeleteValue("), 1)
         self.assertIn("DeleteValue(", branch.group(1))
+
+    def test_include_existing_is_an_explicit_switch_forwarded_to_the_selection(self) -> None:
+        self.assertRegex(self.text, r"\[switch\]\$IncludeExisting")
+        self.assertIn("-IncludeExisting:$IncludeExisting", self.text)
+        header = self.text.split("[CmdletBinding()]")[0]
+        for root in (r"C:\mlvtmp", r"C:\dell-bench", r"C:\temp"):
+            self.assertIn(root, header, f"the header must name the {root} root")
 
     def test_it_removes_only_the_values_it_judged_prunable(self) -> None:
         self.assertIn("foreach ($c in $candidates)", self.text)
