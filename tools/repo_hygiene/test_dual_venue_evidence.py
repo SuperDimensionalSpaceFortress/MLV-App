@@ -253,6 +253,11 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
     PLAYBACK_VSYNC_OPEN = "PLAYBACK-VSYNC-DEFAULT-1 >>>"
     PLAYBACK_VSYNC_CLOSE = "PLAYBACK-VSYNC-DEFAULT-1 <<<"
     PLAYBACK_VSYNC_REGIONS = 4
+    # HFR-CONFORM-AWARE-RECEIPT-ORACLES-1: the conform-aware source-frame verdict (Get-AttrCudaConformAwareSourceFramesVerdict, a wrapper that calls the unchanged baseline
+    # oracle). Three regions: the module-helper splice, the job's conform-line pick and its override call, and the three receipt fields. Absent from the baseline.
+    HFR_CONFORM_OPEN = "HFR-CONFORM-AWARE-RECEIPT-ORACLES-1 >>>"
+    HFR_CONFORM_CLOSE = "HFR-CONFORM-AWARE-RECEIPT-ORACLES-1 <<<"
+    HFR_CONFORM_REGIONS = 3
 
     @classmethod
     def strip_regions(cls, text: str) -> tuple[str, dict[str, int]]:
@@ -262,7 +267,8 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
                     "contact-sheet-parity": (cls.CONTACT_SHEET_PARITY_OPEN, cls.CONTACT_SHEET_PARITY_CLOSE),
                     "keepalive-hung-probe": (cls.KEEPALIVE_HUNG_PROBE_OPEN, cls.KEEPALIVE_HUNG_PROBE_CLOSE),
                     "session-locked": (cls.SESSION_LOCKED_OPEN, cls.SESSION_LOCKED_CLOSE),
-                    "playback-vsync": (cls.PLAYBACK_VSYNC_OPEN, cls.PLAYBACK_VSYNC_CLOSE)}
+                    "playback-vsync": (cls.PLAYBACK_VSYNC_OPEN, cls.PLAYBACK_VSYNC_CLOSE),
+                    "hfr-conform-oracles": (cls.HFR_CONFORM_OPEN, cls.HFR_CONFORM_CLOSE)}
         kept: list[str] = []
         inside: str | None = None
         counts = {name: 0 for name in families}
@@ -309,6 +315,8 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         self.assertEqual(old_counts["session-locked"], self.SESSION_LOCKED_REGIONS, "the baseline (the pinned KEEPALIVE-FAILURE-PUBLISH-LAST-1 generator commit) carries the same bracketed regions")
         self.assertEqual(new_counts["playback-vsync"], self.PLAYBACK_VSYNC_REGIONS, "the default job carries exactly the pinned number of bracketed PLAYBACK-VSYNC-DEFAULT-1 regions")
         self.assertEqual(old_counts["playback-vsync"], 0, "the baseline predates PLAYBACK-VSYNC-DEFAULT-1")
+        self.assertEqual(new_counts["hfr-conform-oracles"], self.HFR_CONFORM_REGIONS, "the default job carries exactly the pinned number of bracketed HFR-CONFORM-AWARE-RECEIPT-ORACLES-1 regions")
+        self.assertEqual(old_counts["hfr-conform-oracles"], 0, "the baseline predates HFR-CONFORM-AWARE-RECEIPT-ORACLES-1")
         self.assertEqual(stripped, old_stripped,
                          "the DEFAULT (bachelor/cuda) emitted job changed outside the bracketed regions -- it must stay byte-identical to the pinned baseline")
 
@@ -1706,8 +1714,9 @@ class ReceiptRederivesTheTwentySecondFloorTests(ModuleMutationMixin, unittest.Te
         self.assertEqual(ps_problems(good_block()), [])
 
     def test_mutation_without_the_pace_check_a_fast_paced_run_is_valid(self) -> None:
-        anchor = "elseif ($null -ne $native -and $native -gt 0 -and [Math]::Abs($pace - $native) -gt (0.005 * $native)) {"
-        mutated = self.mutated_module([(anchor, "elseif ($false) {")])
+        # HFR-CONFORM-AWARE-RECEIPT-ORACLES-1: the native-pace arm now sits under the conform proof (the else of "a proven conform judges the pace").
+        anchor = "} elseif ([Math]::Abs($pace - $native) -gt (0.005 * $native)) {"
+        mutated = self.mutated_module([(anchor, "} elseif ($false) {")])
         self.assertEqual([p for p in ps_problems(good_block(paceFps=30.0), module=mutated) if "paced at" in p], [])
         self.assertNotEqual([p for p in ps_problems(good_block(paceFps=30.0)) if "paced at" in p], [])
 
@@ -5739,6 +5748,9 @@ class LookReceiptGeneratorTests(unittest.TestCase):
                 # PLAYBACK-VSYNC-DEFAULT-1's regions postdate the base generator: present in the new job only, at their pinned count.
                 self.assertEqual((new_counts.pop("playback-vsync"), old_counts.pop("playback-vsync")),
                                  (GeneratorByteIdentityAndVariantTests.PLAYBACK_VSYNC_REGIONS, 0), name)
+                # HFR-CONFORM-AWARE-RECEIPT-ORACLES-1's regions postdate the base generator too: present in the new job only, at their pinned count.
+                self.assertEqual((new_counts.pop("hfr-conform-oracles"), old_counts.pop("hfr-conform-oracles")),
+                                 (GeneratorByteIdentityAndVariantTests.HFR_CONFORM_REGIONS, 0), name)
                 self.assertEqual(new_counts, old_counts, f"{name}: the job without -LookReceiptPath carries the base generator's bracketed regions")
                 self.assertEqual(kept, old_kept, f"{name}: the job without -LookReceiptPath must be the base generator's bytes")
                 self.assertNotIn(b"LookReceipt", new)
