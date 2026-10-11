@@ -660,18 +660,19 @@ class RuntimeBackstopBehaviourTests(unittest.TestCase):
         end = text.index("if ($LaunchOnlyProbe -and ($playbackStartLine -or $summaryLine)) {", start)
         return text[start:end]
 
-    def _run_application_block(self, block: str, **summary_fields: object) -> dict:
+    def _run_application_block(self, block: str, recent_lines: tuple = (), **summary_fields: object) -> dict:
         proc = _pwsh(
             f". {_q(GATE)}\n"
             "function Get-ObjectPropertyValue { param($Object, $Name) "
             "if ($null -ne $Object -and $Object.PSObject.Properties[$Name]) { $Object.$Name } else { $null } }\n"
             f"$playbackSummary = Convert-PlaybackLogLineToObject {_q(_summary_line(**summary_fields))}\n"
+            f"$recentLines = @({', '.join(_q(line) for line in recent_lines)})\n"
             f"$runNonce = {_q(RUN_NONCE)}; "
             "$Seconds = 24; $LaunchOnlyProbe = $false; $validationFailures = @(); $validationWarnings = @(); "
             "$clipLengthGate = [pscustomobject]@{ frames = 720 }\n"
             f"{block}\n"
             "[pscustomobject]@{ invalidLooped = [bool]$invalidLooped; invalidSourceFrames = [bool]$invalidSourceFrames; "
-            "failures = @($validationFailures).Count } | ConvertTo-Json -Compress")
+            "failures = @($validationFailures).Count; paceRule = $loopVerdict.paceRule } | ConvertTo-Json -Compress")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         return json.loads(proc.stdout)
 
@@ -719,6 +720,27 @@ class RuntimeBackstopBehaviourTests(unittest.TestCase):
                             (fields is short and not outcome["invalidSourceFrames"]):
                         survived = False
                 self.assertFalse(survived, f"guard mutation '{name}' survived the application test")
+
+    def test_the_runner_hands_the_summarys_own_session_conform_line_to_the_verdict(self) -> None:
+        """HFR-CONFORM-AWARE-RECEIPT-ORACLES-1: the runner picks the playback_smoke.conform line of the summary's session out of the run log and
+        the loop verdict relaxes the native-pace rule only on a line it can prove; the block is executed and its wiring mutated."""
+        block = self._application_block(RUNNER.read_text(encoding="utf-8"))
+        hfr = dict(wrapped=0, wrap_count=0, total_frames=1500, clip_seconds=25.0, presented_frames=500, session=7, source_advanced=1200,
+                   required_source_frames=1199, native_fps="59.940", pace_fps="24.000", fps_override=0)
+        own, other = _conform_line("7"), _conform_line("8")
+        got = self._run_application_block(block, recent_lines=("noise", own), **hfr)
+        self.assertEqual((got["invalidSourceFrames"], got["failures"], got["paceRule"]), (False, 0, "conform"), got)
+        self.assertEqual(self._run_application_block(block, recent_lines=(own, other), **hfr)["paceRule"], "conform")   # another session's line is never picked
+        for lines in ((), (other,), ("playback_smoke.conform session=70 clip_fps=59.940 playback_fps=24.000 conform_active=1",)):
+            got = self._run_application_block(block, recent_lines=lines, **hfr)
+            self.assertTrue(got["invalidSourceFrames"], (lines, got))
+            self.assertEqual(got["paceRule"], "native", got)
+        # the conform line must actually reach the verdict: without it the conformed run is judged on the native pace and is INVALID
+        needle = " -ConformLine $loopConformLine"
+        self.assertIn(needle, block, "mutation anchor vanished: conform line not passed on")
+        mutated = block.replace(needle, "", 1)
+        self.assertTrue(self._run_application_block(mutated, recent_lines=(own,), **hfr)["invalidSourceFrames"],
+                        "runner conform-wiring mutation 'conform line not passed on' survived")
 
     def test_the_runner_source_never_spells_loop_as_an_argument(self) -> None:
         text = "\n".join(_code_lines(RUNNER))
@@ -852,7 +874,7 @@ class SourceFramesOracleParityTests(unittest.TestCase):
             "guard disabled": ("if ($sourceFramesVerdict.invalid) {", "if ($false -and $sourceFramesVerdict.invalid) {"),
             "guard inverted": ("if ($sourceFramesVerdict.invalid) {", "if (-not $sourceFramesVerdict.invalid) {"),
             "any session's line accepted": ("[regex]::Escape([string]$measuredSmokeSessionId)", "''"),
-            "verdict ignored": ("$sourceFramesVerdict = Get-AttrCudaSourceFramesVerdict -SummaryLine $sourceFramesSummaryLine -ExpectedRunNonce $runLog.runNonce",
+            "verdict ignored": ("$sourceFramesVerdict = Get-AttrCudaConformAwareSourceFramesVerdict -SummaryLine $sourceFramesSummaryLine -ExpectedRunNonce $runLog.runNonce -ConformLine $sourceFramesConformLine",
                                 "$sourceFramesVerdict = [pscustomobject]@{ invalid = $false; wrapped = $false; failures = @(); sourceAdvanced = 0; requiredSourceFrames = 0 }"),
         }
         for name, (needle, replacement) in mutations.items():
@@ -865,6 +887,29 @@ class SourceFramesOracleParityTests(unittest.TestCase):
                 ]
                 self.assertFalse(all(verdicts), f"job oracle mutation '{name}' survived")
 
+    def test_the_jobs_block_hands_the_measured_sessions_conform_line_to_the_oracle(self) -> None:
+        """HFR-CONFORM-AWARE-RECEIPT-ORACLES-1: the job picks the playback_smoke.conform line of the MEASURED session (the last one wins) and the
+        oracle relaxes the native-pace rule only on a line it can prove; the block is executed, its verdict recorded on the receipt, its wiring mutated."""
+        block = self._job_oracle_block()
+        hfr = {**GOOD_SOURCE, "wrapped": 0, "wrap_count": 0, "source_advanced": 1200, "required_source_frames": 1199,
+               "native_fps": "59.940", "pace_fps": "24.000"}
+        summary = _summary_line(**hfr).replace("session=0", "session=7", 1)
+        own, other = _conform_line("7"), _conform_line("8")
+        code, _ = self._run_job_block(block, summary + "\n" + own)
+        self.assertEqual(code, 0)
+        code, _ = self._run_job_block(block, summary + "\n" + own + "\n" + other)      # another session's line never replaces the measured one
+        self.assertEqual(code, 0)
+        for name, raw in (("no conform line", summary), ("another session's line only", summary + "\n" + other),
+                          ("inactive", summary + "\n" + _conform_line("7", conform_active=0))):
+            with self.subTest(name):
+                code, receipt = self._run_job_block(block, raw)
+                self.assertEqual(code, 29, name)
+                self.assertEqual(receipt["sourceFrames"]["paceRule"], "native", name)
+        needle = "-ConformLine $sourceFramesConformLine"
+        self.assertIn(needle, block, "mutation anchor vanished: conform line not passed on")
+        self.assertEqual(self._run_job_block(block.replace(needle, "", 1), summary + "\n" + own)[0], 29,
+                         "job conform-wiring mutation 'conform line not passed on' survived")
+
     def test_the_job_calls_the_embedded_oracle_before_any_backend_verdict(self) -> None:
         job = JOB_GENERATOR.read_text(encoding="utf-8")
         self.assertIn("'Get-AttrCudaSourceFramesVerdict'", job)       # embedded into the emitted job
@@ -873,9 +918,203 @@ class SourceFramesOracleParityTests(unittest.TestCase):
         self.assertGreater(oracle_at, job.index("$verdict = Get-AttrCudaEligibilityVerdict"))
         self.assertLess(oracle_at, job.index("$gpuSummary = Get-LastGpuSummary $rawLog $measuredSmokeSessionId"))
         self.assertLess(oracle_at, job.index("RESULT=$resultVerb"))
-        self.assertIn("exit 29", job[oracle_at:oracle_at + 2500])
+        # HFR-CONFORM-AWARE-RECEIPT-ORACLES-1: the bracketed conform-line pick and the receipt fields sit between the call and its refusal (+~1500 chars)
+        self.assertIn("exit 29", job[oracle_at:oracle_at + 4000])
         self.assertIn("result='SOURCE_FRAMES_INVALID'", job)
         self.assertEqual(job.count("sourceFrames = $sourceFramesBlock"), 2)   # evidence manifest and summary.json
+
+
+# ---------------------------------------------------------------------------------------------------
+# HFR-CONFORM-AWARE-RECEIPT-ORACLES-1. PLAYBACK-HFR-CONFORM-DEFAULT-1 plays a clip above 30 fps as slow motion at a conform rate (24 fps by
+# default), so the engine's pace_fps is that rate, not the clip's native fps, and the three receipt oracles' native-pace rule rejected every
+# conformed run. Hub ruling: the owner's rule is 20 s of REAL FOOTAGE (the floor is never relaxed); the PACE rule is relaxed ONLY when the run
+# PROVES it was conformed -- a present playback_smoke.conform line for the measured session with conform_active=1, clip_fps within 0.5 % of
+# native_fps, playback_fps within 0.5 % of pace_fps. Absence never helps. The three oracles (gui-smoke gate, AttrCuda job module, dual-venue
+# receipt reader) are carriers of ONE rule, so one case table is executed through all three.
+def _conform_line(session: str = "7", **over: object) -> str:
+    """The app's playback_smoke.conform line (PLAYBACK-HFR-CONFORM-DEFAULT-1, platform/qt/MainWindow.cpp); a key given as None is left out."""
+    fields = dict(clip_fps="59.940", playback_fps="24.000", conform_active=1, conform_enabled=1, conform_target="24.000", conform_threshold="30.000",
+                  export_fps_override=0, export_frame_rate=0, audio_sync_requests=0, presented=574, source_advanced=1200)
+    fields.update(over)
+    return " ".join(["playback_smoke.conform", f"session={session}"] + [f"{k}={v}" for k, v in fields.items() if v is not None])
+
+
+DV_NONCE = "ab" * 16
+HFR_RUN = dict(session=7, wrapped=0, wrap_count=0, source_advanced=1200, required_source_frames=1199, native_fps="59.940", pace_fps="24.000", fps_override=0)
+PACE_TEXT = "the engine paced at pace_fps="
+FLOOR_TEXT = "ceil(20 s x native_fps"
+
+# (name, summary fields, conform line or None, expected invalid, texts every oracle's failures must contain, texts none may contain, paceRule)
+CONFORM_CASES = [
+    ("a: the real ab404cff shape (600/600 on a 59.94 clip, conformed) stays INVALID on the floor alone",
+     dict(HFR_RUN, source_advanced=600, required_source_frames=600), _conform_line(), True, [FLOOR_TEXT], [PACE_TEXT], "conform"),
+    ("b: a conformed run with 1199+ source frames is valid", HFR_RUN, _conform_line(), False, [], [PACE_TEXT, FLOOR_TEXT], "conform"),
+    ("b2: exactly the floor (1199 = ceil(20 s x 59.94 - 0.02)) is valid", dict(HFR_RUN, source_advanced=1199), _conform_line(), False, [], [], "conform"),
+    ("b3: the floor is not relaxed: required 1198 is under ceil(20 s x 59.94)", dict(HFR_RUN, source_advanced=1198, required_source_frames=1198),
+     _conform_line(), True, [FLOOR_TEXT], [PACE_TEXT], "conform"),
+    ("c: the same run without a conform line is INVALID native-pace (absence never helps)", HFR_RUN, None, True, [PACE_TEXT], ["conform"], "native"),
+    ("d: conform_active=0 -> INVALID", HFR_RUN, _conform_line(conform_active=0), True, [PACE_TEXT, "conform_active=0"], [], "native"),
+    ("e: playback_fps disagreeing with pace_fps -> INVALID", HFR_RUN, _conform_line(playback_fps="30.000"), True, [PACE_TEXT, "does not match pace_fps"], [], "native"),
+    ("f: a conform line for another session -> INVALID", HFR_RUN, _conform_line("8"), True, [PACE_TEXT, "not the measured session"], [], "native"),
+    ("g1: a non-HFR 23.976 run with no conform line is valid on the native pace",
+     dict(HFR_RUN, source_advanced=480, required_source_frames=480, native_fps="23.976", pace_fps="23.976"), None, False, [], [], "native"),
+    ("g2: a non-HFR 23.976 run paced at 30 with no conform line is INVALID native-pace",
+     dict(HFR_RUN, source_advanced=480, required_source_frames=480, native_fps="23.976", pace_fps="30.000"), None, True, [PACE_TEXT + "30"], ["conform"], "native"),
+    ("h1: a malformed conform line (no playback_fps) -> INVALID", HFR_RUN, _conform_line(playback_fps=None), True, [PACE_TEXT, "malformed"], [], "native"),
+    ("h2: conform clip_fps off the native fps -> INVALID", HFR_RUN, _conform_line(clip_fps="29.970"), True, [PACE_TEXT, "does not match native_fps"], [], "native"),
+    ("h3: conform never speeds a clip up (playback above clip) -> INVALID",
+     dict(HFR_RUN, source_advanced=480, required_source_frames=480, native_fps="23.976", pace_fps="30.000"),
+     _conform_line(clip_fps="23.976", playback_fps="30.000"), True, [PACE_TEXT, "never speeds"], [], "native"),
+    ("h4: an fps override is still INVALID under a proven conform", dict(HFR_RUN, fps_override=1), _conform_line(), True, ["override"], [PACE_TEXT], "conform"),
+]
+
+
+def _run_oracle_table(script_body: str, cases: list[dict]) -> list[dict]:
+    with tempfile.TemporaryDirectory(prefix="conform-oracle-") as tmp:
+        table = Path(tmp) / "cases.json"
+        table.write_text(json.dumps(cases), encoding="utf-8")
+        proc = _pwsh(f"$cases = @(Get-Content -Raw -LiteralPath {_q(table)} | ConvertFrom-Json)\n{script_body}\n"
+                     "ConvertTo-Json -Compress -Depth 4 -InputObject @($out)")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    return json.loads(proc.stdout)
+
+
+def _dv_block(summary: dict, conform: str | None) -> dict:
+    """The receipt `playback` block Get-DvPlaybackEvidence would record from these run-log lines (the conform fields mirror the log line)."""
+    block = dict(sourceAdvanced=int(summary["source_advanced"]), requiredSourceFrames=int(summary["required_source_frames"]),
+                 nativeFps=float(summary["native_fps"]), paceFps=float(summary["pace_fps"]), fpsOverride=int(summary["fps_override"]),
+                 wrapped=False, wrapCount=0, expectedRunNonce=DV_NONCE, observedRunNonce=DV_NONCE, manifestRunNonce=DV_NONCE,
+                 logShaBound=True, settingsIsolated=True, jobFailures=[], fixtureRehearsal=False, clipId="CLIP",
+                 summarySession=str(summary["session"]), conformLinePresent=conform is not None)
+    if conform is not None:
+        f = dict(re.findall(r"(\w+)=(\S+)", conform))
+        block.update(conformSession=f.get("session"), conformActive=int(f["conform_active"]) if "conform_active" in f else None,
+                     conformClipFps=float(f["clip_fps"]) if "clip_fps" in f else None,
+                     conformPlaybackFps=float(f["playback_fps"]) if "playback_fps" in f else None)
+    return block
+
+
+@requires_pwsh
+class ConformAwareReceiptOracleTests(unittest.TestCase):
+    """HFR-CONFORM-AWARE-RECEIPT-ORACLES-1: one case table, executed through all three receipt oracles."""
+
+    MODULE = SourceFramesOracleParityTests.MODULE
+    DV_MODULE = PROFILING / "dual-venue" / "DualVenueRunner.psm1"
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        rows = [{"summary": _summary_line(**summary), "conform": conform, "block": _dv_block(summary, conform)} for _n, summary, conform, *_r in CONFORM_CASES]
+        cls.gate = _run_oracle_table(
+            f". {_q(GATE)}\n$out = foreach ($c in $cases) {{ $s = Convert-PlaybackLogLineToObject $c.summary; "
+            f"$v = Get-GuiSmokeSourceFramesVerdict -Summary $s -ExpectedRunNonce {_q(RUN_NONCE)} -ConformLine $c.conform; "
+            "[pscustomobject]@{ invalid = [bool]$v.invalid; failures = @($v.failures); paceRule = $v.paceRule } }", rows)
+        cls.attr = _run_oracle_table(
+            f"Import-Module {_q(cls.MODULE)} -Force -DisableNameChecking\n$out = foreach ($c in $cases) {{ "
+            f"$v = Get-AttrCudaConformAwareSourceFramesVerdict -SummaryLine $c.summary -ExpectedRunNonce {_q(RUN_NONCE)} -ConformLine $c.conform; "
+            "[pscustomobject]@{ invalid = [bool]$v.invalid; failures = @($v.failures); paceRule = $v.paceRule } }", rows)
+        cls.dv = _run_oracle_table(
+            f"Import-Module {_q(cls.DV_MODULE)} -Force -DisableNameChecking\n$out = foreach ($c in $cases) {{ "
+            "$p = @(Get-DvPlaybackProblems -Playback $c.block -ExpectedClipId 'CLIP'); $proof = Get-DvConformPaceProof -Playback $c.block; "
+            "[pscustomobject]@{ invalid = ($p.Count -gt 0); failures = $p; paceRule = $(if ($proof.proven) { 'conform' } else { 'native' }) } }", rows)
+
+    def test_every_case_is_judged_as_the_hub_ruling_says_by_each_of_the_three_oracles(self) -> None:
+        for index, (name, _summary, _conform, invalid, must, must_not, _rule) in enumerate(CONFORM_CASES):
+            for carrier, results in (("gui-smoke gate", self.gate), ("AttrCuda module", self.attr), ("dual-venue reader", self.dv)):
+                with self.subTest(case=name, oracle=carrier):
+                    got = results[index]
+                    text = " | ".join(got["failures"])
+                    self.assertEqual(got["invalid"], invalid, text)
+                    for needle in must:
+                        self.assertIn(needle, text)
+                    for needle in must_not:
+                        self.assertNotIn(needle, text)
+
+    def test_parity_the_three_oracles_agree_on_valid_invalid_and_the_pace_rule_in_every_case(self) -> None:
+        for index, (name, *_rest, rule) in enumerate(CONFORM_CASES):
+            with self.subTest(case=name):
+                got = [r[index] for r in (self.gate, self.attr, self.dv)]
+                self.assertEqual({g["invalid"] for g in got}, {CONFORM_CASES[index][3]}, got)
+                self.assertEqual([g["paceRule"] for g in got], [rule] * 3, got)
+
+    def test_the_real_ab404cff_receipt_keeps_reason_one_and_loses_reason_two(self) -> None:
+        """The receipt PLAYBACK-HFR-CONFORM-DEFAULT-1's Bachelor leg wrote: 600/600, native 59.94, pace 24, conformed."""
+        for results in (self.gate, self.attr, self.dv):
+            got = results[0]
+            self.assertEqual(len(got["failures"]), 1, got)
+            self.assertIn("required_source_frames=600 is under ceil(20 s x native_fps=59.94)", got["failures"][0])
+
+    def test_an_unproven_conform_line_says_why_the_relaxation_was_not_applied(self) -> None:
+        for results in (self.gate, self.attr, self.dv):
+            self.assertIn("conform relaxation not applied", " | ".join(results[5]["failures"]))      # d: inactive
+            self.assertNotIn("conform relaxation", " | ".join(results[4]["failures"]))               # c: no line at all keeps the native text unchanged
+
+    def test_the_dual_venue_evidence_block_records_the_conform_fields_and_which_rule_judged_the_pace(self) -> None:
+        """Get-DvPlaybackEvidence end to end, from the run log: the conform line's values and paceRule land on the block and a key can re-derive them."""
+        import hashlib
+
+        def evidence(log_lines: list[str]) -> dict:
+            log = "\n".join(log_lines) + "\n"
+            result = {"evidence": {"runNonce": DV_NONCE, "runLogSnapshot": {"sha256": hashlib.sha256(log.encode()).hexdigest()}}}
+            proc = _pwsh(
+                f"Import-Module {_q(self.DV_MODULE)} -Force -DisableNameChecking\n"
+                f"$res = {_q(json.dumps(result))} | ConvertFrom-Json\n"
+                f"$sum = [pscustomobject]@{{ clipId = 'CLIP'; fixtureRehearsal = $false }}\n"
+                f"Get-DvPlaybackEvidence -Summary $sum -EvidenceManifest $null -ResultJson $res -LogText {_q(log)} "
+                f"-LogSha256 {_q(hashlib.sha256(log.encode()).hexdigest())} -ExpectedClipId 'CLIP' | ConvertTo-Json -Compress -Depth 6")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            return json.loads(proc.stdout)
+
+        summary = _summary_line(**dict(HFR_RUN, run_nonce=DV_NONCE))
+        base = ["playback_smoke.measured_session id=7", "interaction_trace event=automation.pacing_isolated settings_store=run_scoped", summary]
+        conformed = evidence(base + [_conform_line("7"), _conform_line("8", conform_active=0)])
+        self.assertTrue(conformed["valid"], conformed["invalidReasons"])
+        self.assertEqual((conformed["paceRule"], conformed["conformPlaybackFps"], conformed["conformClipFps"], conformed["conformActive"],
+                          conformed["conformSession"], conformed["summarySession"]), ("conform", 24.0, 59.94, 1, "7", "7"))
+        bare = evidence(base)
+        self.assertFalse(bare["valid"])
+        self.assertEqual((bare["paceRule"], bare["conformLinePresent"]), ("native", False))
+        self.assertTrue(any(PACE_TEXT in r for r in bare["invalidReasons"]), bare["invalidReasons"])
+        short = evidence([base[0], base[1], _summary_line(**dict(HFR_RUN, run_nonce=DV_NONCE, source_advanced=600, required_source_frames=600)), _conform_line("7")])
+        self.assertEqual(len(short["invalidReasons"]), 1, short["invalidReasons"])         # the ab404cff shape end to end: reason (1) only
+        self.assertIn(FLOOR_TEXT, short["invalidReasons"][0])
+
+    def test_mutation_a_conform_blind_pace_rule_or_a_relaxed_floor_is_caught(self) -> None:
+        """Each oracle's relaxation switch is mutated; the case table must flag it (a green mutant means the table does not pin that arm)."""
+        mutants = {
+            "gate: conform never relaxes": (GATE, "if ($conformProof.proven) {", "if ($false) {"),
+            "gate: conform always relaxes": (GATE, "if ($conformProof.proven) {", "if ($true) {"),
+            "gate: inactive line accepted": (GATE, "} elseif ($active -ne 1) {", "} elseif ($false) {"),
+            "gate: session not checked": (GATE, "$out.session -cne [string]$SummarySession", "$false"),
+            "attr: conform never relaxes": (self.MODULE, "if ($conformProven) { $judged =", "if ($false) { $judged ="),
+            "attr: inactive line accepted": (self.MODULE, "} elseif ($cn['conform_active'] -ne 1) {", "} elseif ($false) {"),
+            "dv: conform never relaxes": (self.DV_MODULE, "if ($conformProof.proven) {\n            $conformPlayback", "if ($false) {\n            $conformPlayback"),
+            "dv: inactive line accepted": (self.DV_MODULE, "if ($active -ne 1) {", "if ($false) {"),
+            "attr: session not checked": (self.MODULE, "[string]$cf['session'] -cne $summarySession", "$false"),
+            "dv: session not checked": (self.DV_MODULE, "$conformSession -cne $summarySession", "$false"),
+        }
+        rows = [{"summary": _summary_line(**summary), "conform": conform, "block": _dv_block(summary, conform)} for _n, summary, conform, *_r in CONFORM_CASES]
+        with tempfile.TemporaryDirectory(prefix="conform-mutant-") as tmp:
+            for name, (path, needle, replacement) in mutants.items():
+                with self.subTest(name):
+                    text = path.read_text(encoding="utf-8").replace("\r\n", "\n")
+                    self.assertIn(needle, text, f"mutation anchor vanished: {name}")
+                    mutant = Path(tmp) / f"{abs(hash(name))}{path.suffix}"
+                    mutant.write_text(text.replace(needle, replacement, 1), encoding="utf-8")
+                    if name.startswith("gate"):
+                        body = (f". {_q(mutant)}\n$out = foreach ($c in $cases) {{ $s = Convert-PlaybackLogLineToObject $c.summary; "
+                                f"$v = Get-GuiSmokeSourceFramesVerdict -Summary $s -ExpectedRunNonce {_q(RUN_NONCE)} -ConformLine $c.conform; "
+                                "[pscustomobject]@{ invalid = [bool]$v.invalid; paceRule = $v.paceRule } }")
+                    elif name.startswith("attr"):
+                        body = (f"Import-Module {_q(mutant)} -Force -DisableNameChecking\n$out = foreach ($c in $cases) {{ "
+                                f"$v = Get-AttrCudaConformAwareSourceFramesVerdict -SummaryLine $c.summary -ExpectedRunNonce {_q(RUN_NONCE)} -ConformLine $c.conform; "
+                                "[pscustomobject]@{ invalid = [bool]$v.invalid; paceRule = $v.paceRule } }")
+                    else:
+                        body = (f"Import-Module {_q(mutant)} -Force -DisableNameChecking\n$out = foreach ($c in $cases) {{ "
+                                "$p = @(Get-DvPlaybackProblems -Playback $c.block -ExpectedClipId 'CLIP'); $proof = Get-DvConformPaceProof -Playback $c.block; "
+                                "[pscustomobject]@{ invalid = ($p.Count -gt 0); paceRule = $(if ($proof.proven) { 'conform' } else { 'native' }) } }")
+                    got = _run_oracle_table(body, rows)
+                    wanted = [(c[3], c[6]) for c in CONFORM_CASES]
+                    self.assertNotEqual([(g["invalid"], g["paceRule"]) for g in got], wanted, f"mutant '{name}' survived the case table")
 
 
 class JobGeneratorContractTests(unittest.TestCase):

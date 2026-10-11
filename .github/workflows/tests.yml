@@ -436,12 +436,20 @@ jobs:
           # Every other window keeps its membership, minus those tests.
           # LookAssistFlavorsFixture (LOOK-ASSIST-FLAVORS-1) renders the same fixtures, 20-75 s each locally, so it runs alone too.
           # LookAssistAnalysisRenderRace (LOOK-ASSIST-ANALYSIS-RENDER-RACE-1) renders the HQ dual-ISO fixture before and after a level sync, 20-101 s each locally (229 s for the 4), so it runs alone too.
+          # CI-FLAKE-PIPELINE-SHARD-EXACT32-BUDGET-1: the 240 s bound stays. Over 11 green runs (2026-10-11)
+          # the Film window (exact-32) took 92-163 s (median 155) and the Debayered16ReconReuse window
+          # (exact-03) 100-183 s (median 177), which is 68-76 % of the bound: merge_group run 38107966169
+          # killed exact-32 at 240 s (exit 124). Their cost is the tests that open a fixture clip
+          # (7 of 19 LookAssistFilmGrade; Debayered16ReconReuse, 17 tests that mostly render the large
+          # dual-ISO clip); the curve-only Film tests are near-free. The whole Debayered16ReconReuse
+          # class runs alone, so does each of those 7 Film tests, like the renders above, so a window's budget no longer depends
+          # on how many of them sort into it when a test is added.
           # EXACT08-SHARD-BUDGET-1: two single tests dominate their windows. Measured on the same
           # build, one process per test, so only the ratios carry: GpuExportParityMatrixMissingDllFallback
           # IsByteInertAcrossConfigs is about 70 % of exact-08 (101 of 143 s), and DngFramePayloadMatchesSave
           # DngFrameForPipelinePrep about 27 % of exact-05 (34 of 127 s). Each runs alone, like the fixture
           # renders above, so the shared remainder of its window stops inheriting that cost.
-          $soloPattern = '^(LookAssistFixtureScene|LookAssistFlavorsFixture|LookAssistAnalysisRenderRace)\.|^DualIsoPipeline\.(GpuExportParityMatrixMissingDllFallbackIsByteInertAcrossConfigs|DngFramePayloadMatchesSaveDngFrameForPipelinePrep)$'
+          $soloPattern = '^(LookAssistFixtureScene|LookAssistFlavorsFixture|LookAssistAnalysisRenderRace)\.|^DualIsoPipeline\.(GpuExportParityMatrixMissingDllFallbackIsByteInertAcrossConfigs|DngFramePayloadMatchesSaveDngFrameForPipelinePrep)$|^Debayered16ReconReuse\.|^LookAssistFilmGrade\.(AUserCurveIsKeptAndReported|TheBaselineRoundTripLeavesNoTraceOfTheGrade|AUserEditAfterTheFilmGradeIsKeptByAClassicReRunAndByLookAssistOff|AV1ReceiptReRunAsFilmLaysV3|AV2ReceiptReRunAsFilmLaysV3|FilmKeepsTheBalanceAndCinematicsToneOnTheFixtures|FilmIsADifferentGradedPictureFromCinematic)$'
           $shards = @()
           for ($offset = 0; $offset -lt $testNames.Count; $offset += $testsPerShard) {
             $end = [Math]::Min($offset + $testsPerShard, $testNames.Count)

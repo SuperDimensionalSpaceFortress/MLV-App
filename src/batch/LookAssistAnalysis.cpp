@@ -925,6 +925,7 @@ static void refineDaylightFromRenderedPicture( const LookAssistWhiteBalanceReque
 // near-neutral at the solution and no more cast than where it was found. Anything else, including "cannot be
 // asked" (no renderer, the narrowing switch off, no as-shot balance, a patch that is not a pixel of that picture),
 // is NOT believed: the clip takes MASTER's path. Returns true only for a verified surface.
+static bool lookAssistSurfaceIsNeutral( const LookAssistAutoWhiteBalancePatch &surface );
 static bool initialDaylightPatchIsVerified( const LookAssistWhiteBalanceRequest &request,
                                             const LookAssistPreset &preset,
                                             int solvedTemperature,
@@ -977,9 +978,12 @@ static bool initialDaylightPatchIsVerified( const LookAssistWhiteBalanceRequest 
         return false;
     const LookAssistAutoWhiteBalancePatch solutionSurface = lookAssistSurfaceAt( verify, patch.thumbnailX, patch.thumbnailY );
     out->initialPatchFinalChroma = solutionSurface.valid ? solutionSurface.chroma : 0.0;
+    // Chroma is whole 8-bit steps, so a sub-unit slack forbids any rise; a surface inside the dead band at the solution
+    // carries no added cast.
     return solutionSurface.valid
         && lookAssistDaylightPatchIsNeutralEnough( solutionSurface )
-        && solutionSurface.chroma <= patch.chroma + kRefineVerifyChromaSlack;
+        && ( solutionSurface.chroma <= patch.chroma + kRefineVerifyChromaSlack
+          || lookAssistSurfaceIsNeutral( solutionSurface ) );
 }
 
 LookAssistWhiteBalanceResolution resolveLookAssistWhiteBalance( const LookAssistWhiteBalanceRequest &request,

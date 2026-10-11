@@ -8,9 +8,19 @@ PowerShell 5.1 SSH memory leak for about 3 hours although the fleet had publishe
 and it prints the bus entries that already describe it, with their Remedy / Re-derive / Fix /
 Prior art / Guard lines.
 
-Read-only, offline, stdlib only. It never writes to the bus and never injects bus text into a
-lane prompt (R15.2: lanes still get doctrine only through the Compose brief). It is a hub and
-diagnosis tool.
+Read-only, stdlib only. It never writes bus content and never injects bus text into a lane prompt
+(R15.2: lanes still get doctrine only through the Compose brief). It is a hub and diagnosis tool.
+The one thing it touches is the bus clone's remote-tracking ref origin/master, through a bounded
+`git fetch` (see STALE CLONE); it never pulls, rebases, commits or checks out in the shared clone.
+
+STALE CLONE. The local bus clone's HEAD only moves when a heartbeat writer runs `pull --rebase`, so
+HEAD can trail origin/master by days and both recall and fold debt would read a bus that is
+missing the newest entries. Both therefore do a bounded `git fetch origin` first (--fetch-timeout,
+at most 30 s; --no-fetch skips it). A failed fetch is never silent: a `FETCH_FAILED <reason>` line
+is printed (stderr for --fold-debt, the first line of the text output for a search) and the tool
+falls back to what it has. Fold debt prices `since..HEAD` plus `since..origin/master`. Recall reads
+the corpus files at origin/master (`git show`) while HEAD is strictly behind it, and prints
+`BEHIND=<n>` so the reader knows the working tree is not what was searched.
 
 CORPUS. TRAPS.md, RECEIPTS.md and RULINGS.md, plus the cards channel (bus ruling R14): every
 specs/<project>/cards.md of every OTHER project (this project's own cards are its own words, so
@@ -26,8 +36,9 @@ calls under the same deadline helper as blame.
 
 Usage:
     py -3 tools/doctrine/doctrine_recall.py [--bus PATH] [--project-memory PATH] [--top N]
-        [--json] "<symptom words or a pasted log tail>"      (use - to read the query from stdin)
-    py -3 tools/doctrine/doctrine_recall.py [--bus PATH] [--git-timeout S] --fold-debt --since SHA
+        [--fetch-timeout S | --no-fetch] [--json] "<symptom words or a pasted log tail>"  (- reads stdin)
+    py -3 tools/doctrine/doctrine_recall.py [--bus PATH] [--git-timeout S] [--fetch-timeout S | --no-fetch]
+        --fold-debt --since SHA
 
 Exit codes: 0 for every search (hits or none) and for a fold-debt listing; 2 for a usage error, a
 missing bus, or a bus directory with no corpus (none of TRAPS.md / RECEIPTS.md / RULINGS.md /
@@ -41,6 +52,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import re
 import subprocess
 import sys
@@ -60,6 +72,12 @@ CARDS_PATH_RE = re.compile(r"^specs/([^/]+)/cards\.md$")
 DEFAULT_OWN_PROJECT = "mlv-app"
 OWN_PROJECT_RE = re.compile(r"`specs/([a-z0-9][a-z0-9-]*)\.md`")
 FOLD_DEBT_BUDGET_S = 10.0
+BUS_REF = "origin/master"
+BUS_FETCH_REFSPEC = "+refs/heads/master:refs/remotes/origin/master"  # forced: a plain fetch can leave the ref stale
+FETCH_MAX_S = 30.0
+FETCH_BUDGET_FOLD_DEBT_S = 30.0
+FETCH_BUDGET_SEARCH_S = 8.0
+READ_AT_REF_BUDGET_S = 10.0
 EXIT_UNKNOWN_SHA = 3
 EXIT_FOLD_DEBT_GIT = 4
 SHA_RE = re.compile(r"[0-9a-fA-F]{4,40}")
@@ -301,9 +319,21 @@ def card_files(bus: Path, own: str) -> list[Path]:
     ]
 
 
-def load_entries(bus: Path | None, project_memory: Path | None, own: str | None = None) -> list[Entry]:
+def load_entries(
+    bus: Path | None, project_memory: Path | None, own: str | None = None, ref_texts: dict[str, str] | None = None
+) -> list[Entry]:
+    """Bus entries from the working tree, or from ref_texts (read_bus_at_ref) when the clone trails origin."""
     entries: list[Entry] = []
-    if bus is not None:
+    if bus is not None and ref_texts is not None:
+        own_id = (own if own is not None else own_project()).lower()
+        for name in BUS_FILES:
+            if name in ref_texts:
+                entries += split_entries(ref_texts[name], "bus", name)
+        for rel in sorted(ref_texts):
+            owner = card_project(rel)
+            if owner and owner.lower() != own_id:
+                entries += split_entries(ref_texts[rel], "bus", rel)
+    elif bus is not None:
         for name in BUS_FILES:
             path = bus / name
             if path.is_file():
@@ -380,8 +410,12 @@ def _kill_tree(proc: subprocess.Popen) -> None:
         pass
 
 
-def _git_output(args: list[str], deadline: float) -> tuple[str | None, str]:
-    """Run git with stdout on a pipe; return (stdout, status), status "ok" | "timeout" | "error".
+def _git_run(
+    args: list[str], deadline: float, capture_stderr: bool = False, env: dict | None = None
+) -> tuple[str | None, str, str]:
+    """Run git with stdout on a pipe; return (stdout, status, stderr), status "ok" | "timeout" | "error".
+
+    stderr is "" unless capture_stderr is set.
 
     No filesystem writes. Everything is bounded by ONE shared monotonic deadline: communicate()
     waits at most until it; on expiry the process tree is killed and one more communicate() waits
@@ -392,33 +426,113 @@ def _git_output(args: list[str], deadline: float) -> tuple[str | None, str]:
     """
     remaining = deadline - time.monotonic()
     if remaining <= 0:
-        return None, "timeout"
+        return None, "timeout", ""
+    extra = {"env": {**os.environ, **env}} if env else {}
     try:
         proc = subprocess.Popen(
-            ["git", *args], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL
+            ["git", *args],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE if capture_stderr else subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            **extra,
         )
-    except OSError:
-        return None, "error"
+    except OSError as exc:
+        return None, "error", str(exc)
     try:
-        stdout, _ = proc.communicate(timeout=remaining)
+        stdout, stderr = proc.communicate(timeout=remaining)
     except subprocess.TimeoutExpired:
         _kill_tree(proc)
         try:
             proc.communicate(timeout=max(deadline + KILL_GRACE_S - time.monotonic(), 0.05))
         except subprocess.TimeoutExpired:
             pass
-        return None, "timeout"
+        return None, "timeout", ""
+    text = stderr.decode("utf-8", errors="replace") if stderr else ""
     if proc.returncode != 0:
-        return None, "error"
-    return stdout.decode("utf-8", errors="replace"), "ok"
+        return None, "error", text
+    return stdout.decode("utf-8", errors="replace"), "ok", text
+
+
+def _git_output(args: list[str], deadline: float) -> tuple[str | None, str]:
+    """(stdout, status) of _git_run, status "ok" | "timeout" | "error"; stderr is discarded."""
+    out, status, _ = _git_run(args, deadline)
+    return out, status
 
 
 def _run_git(args: list[str], deadline: float) -> str | None:
     return _git_output(args, deadline)[0]
 
 
-def blame_lookup(bus: Path, file: str, line: int, deadline: float) -> tuple[dict | None, str]:
-    out, status = _git_output(["-C", str(bus), "blame", "--porcelain", "-L", f"{line},{line}", "--", file], deadline)
+def _fetch_failed(reason: str) -> str:
+    return "FETCH_FAILED " + (" ".join(reason.split())[:200] or "unknown")
+
+
+def sync_bus(bus: Path, fetch_budget_s: float) -> dict:
+    """Bounded `git fetch origin` of master, then how far HEAD sits from origin/master.
+
+    Returns {"fetch", "behind", "ahead", "ref"}. fetch is "ok", "skipped" (budget 0), "no-git",
+    "no-origin" (a local-only bus cannot lag) or "FETCH_FAILED <reason>". behind/ahead count the commits
+    HEAD lacks / origin/master lacks, from the origin/master ref as it stands after the fetch (the last
+    successful fetch when this one failed); ref is BUS_REF when that ref resolves, else None. Writes only
+    refs/remotes/origin/master: no pull, rebase, checkout, FETCH_HEAD, tags or auto-gc in the shared clone.
+    """
+    state = {"fetch": "skipped", "behind": 0, "ahead": 0, "ref": None}
+    if not (bus / ".git").exists():
+        state["fetch"] = "no-git"
+        return state
+    deadline = time.monotonic() + min(max(fetch_budget_s, 0.0), FETCH_MAX_S)
+    _, status = _git_output(["-C", str(bus), "config", "--get", "remote.origin.url"], deadline + 5.0)
+    if status == "error":
+        state["fetch"] = "no-origin"
+        return state
+    if status == "timeout":
+        state["fetch"] = _fetch_failed("timeout reading remote.origin.url")
+    elif fetch_budget_s > 0:
+        _, status, err = _git_run(
+            ["-C", str(bus), "-c", "gc.auto=0", "fetch", "--no-tags", "--no-write-fetch-head", "origin", BUS_FETCH_REFSPEC],
+            deadline,
+            capture_stderr=True,
+            env={"GIT_TERMINAL_PROMPT": "0"},
+        )
+        if status == "ok":
+            state["fetch"] = "ok"
+        elif status == "timeout":
+            state["fetch"] = _fetch_failed(f"timeout after {fetch_budget_s:g} s")
+        else:
+            lines = [ln.strip() for ln in err.splitlines() if ln.strip()]
+            state["fetch"] = _fetch_failed(lines[-1] if lines else "git fetch exited non-zero")
+    counts, status = _git_output(
+        ["-C", str(bus), "rev-list", "--left-right", "--count", f"HEAD...{BUS_REF}"], time.monotonic() + 5.0
+    )
+    parts = counts.split() if status == "ok" and counts else []
+    if len(parts) == 2 and all(p.isdigit() for p in parts):
+        state["ahead"], state["behind"], state["ref"] = int(parts[0]), int(parts[1]), BUS_REF
+    elif state["fetch"] == "ok":
+        state["fetch"] = _fetch_failed(f"{BUS_REF} does not resolve after the fetch")
+    return state
+
+
+def read_bus_at_ref(bus: Path, ref: str, budget_s: float = READ_AT_REF_BUDGET_S) -> dict[str, str] | None:
+    """The bus corpus files (TRAPS/RECEIPTS/RULINGS and specs/*/cards.md) as committed at ref, or None."""
+    deadline = time.monotonic() + budget_s
+    listing, status = _git_output(
+        ["-C", str(bus), "ls-tree", "-r", "-z", "--name-only", ref, "--", *BUS_FILES, "specs"], deadline
+    )
+    if status != "ok" or listing is None:
+        return None
+    texts: dict[str, str] = {}
+    for name in sorted(n for n in listing.split("\0") if n in BUS_FILES or card_project(n)):
+        text, status = _git_output(["-C", str(bus), "show", f"{ref}:{name}"], deadline)
+        if status != "ok" or text is None:
+            return None
+        texts[name] = text
+    return texts
+
+
+def blame_lookup(bus: Path, file: str, line: int, deadline: float, rev: str | None = None) -> tuple[dict | None, str]:
+    out, status = _git_output(
+        ["-C", str(bus), "blame", "--porcelain", "-L", f"{line},{line}", *([rev] if rev else []), "--", file], deadline
+    )
     if status != "ok":
         return None, status
     first = out.splitlines()[0].split() if out else []
@@ -432,7 +546,7 @@ def blame_commit(bus: Path, file: str, line: int, deadline: float) -> dict | Non
     return blame_lookup(bus, file, line, deadline)[0]
 
 
-def attach_commits(bus: Path, hits: list[dict], budget_s: float) -> None:
+def attach_commits(bus: Path, hits: list[dict], budget_s: float, rev: str | None = None) -> None:
     """One blame call per bus hit, in parallel, all sharing one deadline; every outcome is labelled.
 
     commit_status is "ok", "timeout", "error" or "no-git" (the bus is not a git checkout), so a
@@ -447,7 +561,7 @@ def attach_commits(bus: Path, hits: list[dict], budget_s: float) -> None:
         return
     deadline = time.monotonic() + budget_s
     with ThreadPoolExecutor(max_workers=len(targets)) as pool:
-        futures = [pool.submit(blame_lookup, bus, hit["file"], hit["line"], deadline) for hit in targets]
+        futures = [pool.submit(blame_lookup, bus, hit["file"], hit["line"], deadline, rev) for hit in targets]
         for hit, future in zip(targets, futures):
             try:
                 hit["commit"], hit["commit_status"] = future.result()
@@ -504,28 +618,57 @@ def search(
     today: date | None = None,
     blame_budget_s: float = BLAME_BUDGET_S,
     own: str | None = None,
+    sync: dict | None = None,
 ) -> dict:
+    """Rank the corpus against query. sync (from sync_bus) says whether the clone trails origin/master."""
     started = time.monotonic()
     today = today or date.today()
-    entries = load_entries(bus, project_memory, own)
+    ref_texts = None
+    if bus is not None and sync and sync["ref"] and sync["behind"] > 0 and sync["ahead"] == 0:
+        ref_texts = read_bus_at_ref(bus, sync["ref"])
+    read_ref = sync["ref"] if ref_texts is not None and sync else None
+    entries = load_entries(bus, project_memory, own, ref_texts)
     if bus is not None and not any(entry.source == "bus" for entry in entries):
         raise CorpusUnavailable(bus)
     terms, ranked = rank(entries, query, today, top)
     hits = [hit_record(i, score, entry, today) for i, (score, entry) in enumerate(ranked, 1)]
     if bus is not None and hits and blame_budget_s > 0:
-        attach_commits(bus, hits, blame_budget_s)
+        attach_commits(bus, hits, blame_budget_s, read_ref)
     return {
         "query": query if len(query) <= 500 else query[:497] + "...",
         "terms": terms,
         "bus": str(bus) if bus is not None else None,
         "entries_searched": len(entries),
         "elapsed_s": round(time.monotonic() - started, 2),
+        "bus_state": {**sync, "read": read_ref or "HEAD"} if sync else None,
         "hits": hits,
     }
 
 
+def _bus_state_lines(state: dict | None) -> list[str]:
+    """FETCH_FAILED / BEHIND lines for the head of a text report; empty when the clone is current."""
+    if not state:
+        return []
+    lines = []
+    failed = state["fetch"].startswith("FETCH_FAILED")
+    if failed:
+        lines.append(state["fetch"])
+    if state["behind"] > 0:
+        if state["ahead"] > 0:
+            note = f"AHEAD={state['ahead']}: diverged from {BUS_REF}, entries read at HEAD"
+        elif state["read"] == BUS_REF:
+            note = f"bus HEAD trails {BUS_REF}; entries read at {BUS_REF}"
+        else:
+            note = f"bus HEAD trails {BUS_REF} and it could not be read; entries read at HEAD"
+        if failed:
+            note += f"; {BUS_REF} is as of the last good fetch"
+        lines.append(f"BEHIND={state['behind']} ({note})")
+    return lines
+
+
 def render(result: dict) -> str:
-    lines = [
+    lines = _bus_state_lines(result.get("bus_state"))
+    lines += [
         f"doctrine-recall: {len(result['hits'])} hit(s) over {result['entries_searched']} entries "
         f"in {result['elapsed_s']} s; terms: {', '.join(result['terms']) or '(none)'}"
     ]
@@ -557,13 +700,20 @@ def _fold_debt_files(files: list[str], own: str) -> list[str]:
     return counted
 
 
-def fold_debt(bus: Path, since: str, own: str, budget_s: float = FOLD_DEBT_BUDGET_S) -> tuple[dict | None, int, str]:
-    """Bus content commits in since..HEAD touching TRAPS/RECEIPTS/RULINGS or another project's cards.
+def fold_debt(
+    bus: Path, since: str, own: str, budget_s: float = FOLD_DEBT_BUDGET_S, fetch_budget_s: float = FETCH_BUDGET_FOLD_DEBT_S
+) -> tuple[dict | None, int, str]:
+    """Bus content commits after since, on HEAD and on origin/master, touching TRAPS/RECEIPTS/RULINGS or another project's cards.
 
-    Returns (result, exit_code, message). Read-only: three bounded git calls on one shared deadline.
+    A bounded fetch comes first (sync_bus). When it succeeds, origin/master is priced alongside HEAD,
+    so commits the clone has not pulled still count; when it fails, only HEAD is priced and the result's
+    "fetch" field says FETCH_FAILED <reason>. Returns (result, exit_code, message). Never pulls or
+    checks out: a bounded fetch plus three bounded git calls on one shared deadline.
     """
     if not (bus / ".git").exists():
         return None, EXIT_FOLD_DEBT_GIT, f"bus is not a git checkout: {bus}"
+    sync = sync_bus(bus, fetch_budget_s)
+    priced = ["HEAD", BUS_REF] if sync["fetch"] == "ok" and sync["ref"] else ["HEAD"]
     deadline = time.monotonic() + budget_s
     resolved = None
     if SHA_RE.fullmatch(since):
@@ -577,7 +727,7 @@ def fold_debt(bus: Path, since: str, own: str, budget_s: float = FOLD_DEBT_BUDGE
     log_out, log_status = _git_output(
         [
             "-C", str(bus), "log", "-z", "--name-only", "--no-renames", "--format=%x1e%H%x1f%cI%x1f%s",
-            f"{resolved}..HEAD", "--", *BUS_FILES, CARDS_GLOB,
+            *priced, f"^{resolved}", "--", *BUS_FILES, CARDS_GLOB,
         ],
         deadline,
     )
@@ -600,6 +750,10 @@ def fold_debt(bus: Path, since: str, own: str, budget_s: float = FOLD_DEBT_BUDGE
         "since": since,
         "since_commit": resolved,
         "head": (head_out or "").strip(),
+        "priced": priced,
+        "fetch": sync["fetch"],
+        "behind": sync["behind"],
+        "ahead": sync["ahead"],
         "own_project": own,
         "count": len(commits),
         "commits": commits,
@@ -626,6 +780,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--git-timeout", type=float, default=FOLD_DEBT_BUDGET_S, help="with --fold-debt: total seconds for the git calls"
     )
+    parser.add_argument(
+        "--fetch-timeout", type=float, default=None,
+        help=f"seconds for the bounded `git fetch origin` that runs first (max {FETCH_MAX_S:g}; default "
+        f"{FETCH_BUDGET_FOLD_DEBT_S:g} with --fold-debt, {FETCH_BUDGET_SEARCH_S:g} for a search)",
+    )
+    parser.add_argument("--no-fetch", action="store_true", help="skip the fetch; work from the last fetched origin/master")
     parser.add_argument("query", nargs="*", help="symptom words or a pasted log tail; '-' reads stdin")
     return parser
 
@@ -637,6 +797,9 @@ def main(argv: list[str] | None = None) -> int:
         except (AttributeError, ValueError):
             pass
     args = build_parser().parse_args(argv)  # argparse exits 2 on a usage error
+    if args.fetch_timeout is not None and not 0 < args.fetch_timeout <= FETCH_MAX_S:
+        print(f"doctrine-recall: --fetch-timeout must be > 0 and <= {FETCH_MAX_S:g} (use --no-fetch to skip)", file=sys.stderr)
+        return 2
     if args.fold_debt:
         if not args.since or args.query or args.git_timeout <= 0:
             print("doctrine-recall: --fold-debt needs --since SHA, --git-timeout > 0 and no query", file=sys.stderr)
@@ -654,15 +817,22 @@ def main(argv: list[str] | None = None) -> int:
         print(f"doctrine-recall: bus not found: {bus} (pass --bus PATH)", file=sys.stderr)
         return 2
     if args.fold_debt:
-        result, code, message = fold_debt(bus, args.since, own_project(), args.git_timeout)
+        fetch_s = 0.0 if args.no_fetch else args.fetch_timeout or FETCH_BUDGET_FOLD_DEBT_S
+        result, code, message = fold_debt(bus, args.since, own_project(), args.git_timeout, fetch_s)
         if result is None:
             print(f"doctrine-recall: fold-debt: {message}", file=sys.stderr)
             return code
+        if result["fetch"].startswith("FETCH_FAILED"):
+            print(f"{result['fetch']} (priced against HEAD only)", file=sys.stderr)
         print(json.dumps(result, indent=2, ensure_ascii=False))
         return 0
     memory = Path(args.project_memory) if args.project_memory else REPO_ROOT / ".claude-state" / "project-memory"
+    fetch_s = 0.0 if args.no_fetch else args.fetch_timeout or FETCH_BUDGET_SEARCH_S
     try:
-        result = search(query, bus, memory if memory.is_dir() else None, args.top, blame_budget_s=args.blame_timeout)
+        result = search(
+            query, bus, memory if memory.is_dir() else None, args.top, blame_budget_s=args.blame_timeout,
+            sync=sync_bus(bus, fetch_s),
+        )
     except CorpusUnavailable:
         found = [name for name in BUS_FILES if (bus / name).is_file()]
         found += [f"specs/{path.parent.name}/cards.md" for path in card_files(bus, own_project())]

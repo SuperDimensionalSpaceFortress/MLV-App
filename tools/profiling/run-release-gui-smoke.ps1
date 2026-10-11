@@ -2500,7 +2500,14 @@ $loopFpsOverride = Get-ObjectPropertyValue $playbackSummary "fps_override"
 $invalidLooped = $false
 $invalidSourceFrames = $false
 $gateFrames = Get-ObjectPropertyValue $clipLengthGate "frames"
-$loopVerdict = Get-GuiSmokeLoopVerdict -Summary $playbackSummary -WindowSeconds $Seconds -ExpectedRunNonce $runNonce -LaunchOnlyProbe ([bool]$LaunchOnlyProbe) -ClipFrames $(if ($null -ne $gateFrames) { [int64]$gateFrames } else { [int64]0 })
+# HFR-CONFORM-AWARE-RECEIPT-ORACLES-1: the playback_smoke.conform line the app logged for the summary's own session (the last one wins);
+# the source-frame oracle relaxes its native-pace rule only on a conform line it can prove (Get-GuiSmokeConformPaceProof), never on its absence.
+$loopSummarySession = [string](Get-ObjectPropertyValue $playbackSummary "session")
+$loopConformLine = ''
+if ($loopSummarySession -ne '') {
+    $loopConformLine = [string](@($recentLines | Where-Object { $_ -match ('playback_smoke\.conform session=' + [regex]::Escape($loopSummarySession) + '(\s|$)') } | Select-Object -Last 1) -join '')
+}
+$loopVerdict = Get-GuiSmokeLoopVerdict -Summary $playbackSummary -WindowSeconds $Seconds -ExpectedRunNonce $runNonce -LaunchOnlyProbe ([bool]$LaunchOnlyProbe) -ClipFrames $(if ($null -ne $gateFrames) { [int64]$gateFrames } else { [int64]0 }) -ConformLine $loopConformLine
 # PLAYBACK-CLIP-LENGTH-ENFORCE-4: a summary without wrapped / wrap_count (a build that predates the wrap fields) is no
 # longer a WARNING that falls back to the header-based checks: the loop verdict above fails it (RECEIPT_FIELD_ABSENT,
 # INVALID_LOOPED, exit 43). "The app was silent" is never "the app did not wrap".
@@ -2852,6 +2859,10 @@ $result = [pscustomobject]@{
         requiredSourceFrames = $loopRequiredSourceFrames
         runtimeNativeFps = $loopNativeFps
         runtimePaceFps = $loopPaceFps
+        # HFR-CONFORM-AWARE-RECEIPT-ORACLES-1: which rule judged the pace (native | conform) and, under conform, the conform line's own rates.
+        paceRule = $loopVerdict.paceRule
+        conformPlaybackFps = $loopVerdict.conformPlaybackFps
+        conformClipFps = $loopVerdict.conformClipFps
         runtimeFpsOverride = $loopFpsOverride
         invalidSourceFrames = $invalidSourceFrames
     }
