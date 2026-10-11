@@ -67,6 +67,12 @@ suite. The `perf_tests` workflow specifically is documented separately in
   `tests/console/avx_parity_helper.pro` twice (default + `MLVAPP_ENABLE_AVX=1`)
   and asserts both builds render identical frame hashes on the checked-in
   Dual ISO fixtures when Qt/qmake + a make tool are available.
+- `tests/console/diso_phase_harness.pro` is a standalone diagnostic (not run by
+  any suite). Per frame of a dual-ISO clip it prints the camera frame number,
+  the raw mod-4 row-group means and the phase they imply, the resolver's
+  cached and resolved pattern with its probe flags, and a row-banding metric
+  plus a hash of the processed frame. `--synthetic` drives the resolver with a
+  phase-rotating 1920x804 scene at a chosen signal level.
 
 ### `pipeline_tests`
 
