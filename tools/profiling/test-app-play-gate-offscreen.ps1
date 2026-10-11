@@ -33,6 +33,14 @@ param(
     # never into the user's real settings, and the probe checks that the real settings did not change.
     [switch]$PersistedOverrideProbe
 )
+
+# HUB-VM-NO-LOCAL-PLAYBACK-1 guard (tools/profiling/dual-venue/hub-hosts.json; pinned by tools/repo_hygiene/test_hub_vm_no_local_playback.py):
+# no MLVApp playback, smoke or profile run starts on the hub VM, a guest on Ultra-Magnus. Run it as a venue job through the tracked venue chain.
+$hubHostsNoLocalPlayback = @('VIRTUAL-TEN')
+if (($hubHostsNoLocalPlayback -contains ([string]$env:COMPUTERNAME).Trim().ToUpperInvariant()) -and ($env:MLVAPP_HUB_PLAYBACK_CI_FIXTURE -cne 'CI_FIXTURE_ONLY')) {
+    [Console]::Error.WriteLine("HUB_VM_LOCAL_PLAYBACK_REFUSED: host $env:COMPUTERNAME is the hub VM (a guest on Ultra-Magnus); run this as a venue job through the tracked venue chain")
+    exit 17
+}
 $ErrorActionPreference = 'Stop'
 $DllDirs = @($DllDirs | ForEach-Object { $_ -split ',' } | Where-Object { $_ })   # -File passes 'a','b' as one comma-joined string
 if ($DllDirs.Count -gt 0) { $env:PATH = (($DllDirs -join ';') + ';' + $env:PATH) }

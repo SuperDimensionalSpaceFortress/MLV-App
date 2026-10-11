@@ -792,5 +792,25 @@ class OffscreenProbeExitCodeTests(unittest.TestCase):
         self.assertNotRegex(window, r"m_automationVerdict\.fail\(\);\s*if\( autoplayExit \) QTimer::singleShot\( 400, this, \[\]\(\)\{ qApp->quit\(\); \} \);")
 
 
+# HUB-VM-NO-LOCAL-PLAYBACK-1: this module runs the real launcher scripts against a stand-in exe that is never launched. The launchers
+# refuse on the hub VM (tools/profiling/dual-venue/hub-hosts.json) unless the CI-fixture override is set, so set it for this module's
+# own subprocesses only, in the test process (an agent command can never set it: hook rule NA-11 proposal).
+_HUB_FIXTURE_ENV = "MLVAPP_HUB_PLAYBACK_CI_FIXTURE"
+_hub_fixture_env_before = None
+
+
+def setUpModule() -> None:
+    global _hub_fixture_env_before
+    _hub_fixture_env_before = os.environ.get(_HUB_FIXTURE_ENV)
+    os.environ[_HUB_FIXTURE_ENV] = "CI_FIXTURE_ONLY"
+
+
+def tearDownModule() -> None:
+    if _hub_fixture_env_before is None:
+        os.environ.pop(_HUB_FIXTURE_ENV, None)
+    else:
+        os.environ[_HUB_FIXTURE_ENV] = _hub_fixture_env_before
+
+
 if __name__ == "__main__":
     unittest.main()

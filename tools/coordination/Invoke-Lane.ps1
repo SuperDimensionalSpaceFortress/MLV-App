@@ -763,6 +763,18 @@ if ($PromptFile) {
 if (-not $WorkDir) { $WorkDir = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..\..')).Path }
 $WorkDir = (Resolve-Path -LiteralPath $WorkDir).Path
 
+# HUB-VM-NO-LOCAL-PLAYBACK-1 (owner objection 2026-10-11): no lane on the hub VM (Virtual-Ten, a guest on Ultra-Magnus) is told to run MLVApp playback
+# locally -- playback, performance AND exactness, is a venue job. The prompt is linted before any process, run dir or receipt exists, so a prompt that
+# says "run it where a GUI desktop session and the clip exist" never starts a lane there. The same lint runs in dispatch-perf-lane.ps1 (producer prompts).
+. (Join-Path $PSScriptRoot 'lane-local-playback-lint.ps1')
+if (Test-HubHost) {
+    $localPlaybackFindings = @(Get-LocalPlaybackPromptFindings -Text $Prompt)
+    if ($localPlaybackFindings.Count -gt 0) {
+        throw ("local-playback-prompt-refused: HUB_VM_LOCAL_PLAYBACK_REFUSED -- this host is the hub VM; the prompt tells the lane to run MLVApp playback locally " +
+               "(playback runs only as a venue job through the tracked chain): " + (($localPlaybackFindings | Select-Object -First 3) -join " | "))
+    }
+}
+
 # ---------------------------------------------------------------- 0.1 pre-flight (before any process, before any run dir)
 # (a) A codex lane can never be granted write access: no Claude hook is visible to codex exec,
 # so nothing here could enforce NA-1..NA-10 against it. Keyed on ENGINE, not an enumerated list
