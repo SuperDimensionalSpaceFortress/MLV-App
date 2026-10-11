@@ -202,6 +202,14 @@ $script:ConsentSchema = 'mlv-app/dual-venue-clip-consent/v1'
 # A record carries the owner's EXACT typed line ("CLIP <venue>: <clip id>": no path, ever), that line's sha256, when it was
 # recorded and by whom ('owner' only). The line is checked against the record's own venue + clip id and against its hash.
 $script:ConsentRecordKeys = @('venue', 'clipId', 'ownerLine', 'ownerLineSha256', 'recordedUtc', 'recordedBy')
+# VENUE-CLIP-CONSENT-BLANKET-1: ONE blanket record kind (consent file top-level `blanketRecords`). It stores the owner's sentence of
+# 2026-10-11 (ledger stamp below) verbatim and admits any well-formed clip id on any venue in the table. The sentence's sha256 is PINNED
+# here, so only the owner's own words can be a blanket: a record whose sentence does not hash to this value (a one-character edit, a
+# re-hashed forgery) makes the WHOLE file invalid -- it admits nothing and there is no fallback to admit. No path, no footage name.
+$script:BlanketRecordKeys = @('kind', 'ownerSentence', 'ownerSentenceSha256', 'recordedUtc', 'recordedBy', 'writtenBy', 'source', 'scope')
+$script:BlanketOwnerSentenceSha256 = '48dc8dead951aa2eab911db63591b59d238830d2d98c0fd7df346c42b78f9fd6'
+$script:BlanketSource = 'ledger 2026-10-11T03:41:42Z'
+$script:BlanketScope = 'any clip id, any venue'
 $script:ConsentRelativePath = 'tools/profiling/dual-venue/venue-clip-consent.json'
 $script:VenueTableRelativePath = 'tools/profiling/dual-venue/venues.json'
 
@@ -413,10 +421,14 @@ function Read-DvClipConsent {
     so a bare hex string cannot stand in for the owner's words.
     FAIL CLOSED: empty text, bad JSON, a wrong schema, or any record that is not exactly the six reviewed keys (so a path
     cannot ride along in an extra field) makes the WHOLE file invalid -- unknown consent is no consent.
-    Returns [pscustomobject]@{ ok; reason; records }.
+    BLANKET (VENUE-CLIP-CONSENT-BLANKET-1): an optional top-level `blanketRecords` array. Each record is exactly kind='blanket',
+    ownerSentence (the owner's words, verbatim), ownerSentenceSha256, recordedUtc, recordedBy='owner', writtenBy='owner',
+    source (the ledger stamp) and scope; the sentence must hash to its stored sha256 AND to the sha256 pinned in this module.
+    A blanket that fails any check invalidates the WHOLE file (admits nothing, no fallback).
+    Returns [pscustomobject]@{ ok; reason; records; blankets }.
     #>
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Text, [Parameter(Mandatory)]$Table)
-    $bad = { param($why) [pscustomobject]@{ ok = $false; reason = $why; records = @() } }
+    $bad = { param($why) [pscustomobject]@{ ok = $false; reason = $why; records = @(); blankets = @() } }
     if ([string]::IsNullOrWhiteSpace($Text)) { return (& $bad 'the consent file is missing or empty') }
     # A consent record names a clip by ID. A drive path or a footage file name anywhere in the file is refused outright.
     if ($Text -match '(?i)[a-z]:[\\/]|\.mlv\b') { return (& $bad 'the consent file carries a path-shaped value') }
@@ -447,7 +459,30 @@ function Read-DvClipConsent {
         }
         $records += $r
     }
-    [pscustomobject]@{ ok = $true; reason = $null; records = $records }
+    $blankets = @()
+    if ($null -ne $doc.PSObject.Properties['blanketRecords']) {
+        foreach ($b in @($doc.blanketRecords)) {
+            if ($null -eq $b) { return (& $bad 'a blanket consent record is null') }
+            $bkeys = @($b.PSObject.Properties | ForEach-Object { $_.Name })
+            if ($bkeys.Count -ne $script:BlanketRecordKeys.Count -or @($bkeys | Where-Object { $_ -cnotin $script:BlanketRecordKeys }).Count -gt 0) {
+                return (& $bad 'a blanket consent record is not exactly kind, ownerSentence, ownerSentenceSha256, recordedUtc, recordedBy, writtenBy, source, scope')
+            }
+            if ([string]$b.kind -cne 'blanket') { return (& $bad "a blanket consent record's kind is not 'blanket'") }
+            if ([string]$b.ownerSentenceSha256 -cnotmatch '^[0-9a-f]{64}$') { return (& $bad 'a blanket consent record ownerSentenceSha256 is not 64 lowercase hex') }
+            if ((Get-DvSha256OfText ([string]$b.ownerSentence)) -cne [string]$b.ownerSentenceSha256) { return (& $bad "a blanket consent record's ownerSentenceSha256 is not the sha256 of its ownerSentence") }
+            if ([string]$b.ownerSentenceSha256 -cne $script:BlanketOwnerSentenceSha256) { return (& $bad "a blanket consent record's sentence is not the owner's recorded blanket sentence") }
+            if ([string]$b.recordedBy -cne 'owner') { return (& $bad "a blanket consent record's recordedBy is not 'owner'") }
+            if ([string]$b.writtenBy -cne 'owner') { return (& $bad "a blanket consent record's writtenBy is not 'owner'") }
+            if ([string]$b.source -cne $script:BlanketSource) { return (& $bad "a blanket consent record's source is not the owner's ledger stamp") }
+            if ([string]$b.scope -cne $script:BlanketScope) { return (& $bad "a blanket consent record's scope is not '$($script:BlanketScope)'") }
+            $bwhen = [DateTime]::MinValue
+            if (-not [DateTime]::TryParse([string]$b.recordedUtc, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AdjustToUniversal -bor [Globalization.DateTimeStyles]::AssumeUniversal, [ref]$bwhen)) {
+                return (& $bad 'a blanket consent record recordedUtc is not a timestamp')
+            }
+            $blankets += $b
+        }
+    }
+    [pscustomobject]@{ ok = $true; reason = $null; records = $records; blankets = $blankets }
 }
 
 function Get-DvClipAdmission {
@@ -460,15 +495,15 @@ function Get-DvClipAdmission {
                                            is refused by the same gate that refuses a short clip anywhere else, never looped
       CLIP_ID_INVALID                      not a consented clip id
       VENUE_CLIP_CONSENT_INVALID           the per-venue consent file is missing/malformed (fail closed)
-      VENUE_CLIP_CONSENT_ABSENT            no owner-typed record for THIS venue + this clip id (consent on one venue
-                                           never implies the other)
+      VENUE_CLIP_CONSENT_ABSENT            no owner-typed record for THIS venue + this clip id and no blanket record (consent
+                                           on one venue never implies the other; a blanket record admits any clip id on any venue)
       OWNER_CLIP_REFUSED_PENDING_CROSS_VOLUME_2   the reviewed switch venues.json ownerFootage.cleanupClassGone is false
     #>
     param(
         [Parameter(Mandatory)][string]$ClipId, [Parameter(Mandatory)][string]$Venue, [Parameter(Mandatory)]$Table,
         [Parameter(Mandatory)][AllowEmptyString()][string]$ConsentText, [Parameter(Mandatory)][string]$RepoRoot
     )
-    $refuse = { param($token) [pscustomobject]@{ admitted = $false; reason = $token; ownerLineSha256 = $null; recordedUtc = $null } }
+    $refuse = { param($token) [pscustomobject]@{ admitted = $false; reason = $token; ownerLineSha256 = $null; recordedUtc = $null; consentKind = $null; consentSha256Prefix = $null } }
     if ($script:FixtureClipIds -ccontains $ClipId) {
         $verdict = 'NOT_A_CONSENTED_CLIP'
         $gate = Join-Path $PSScriptRoot '..\gui-smoke-length-gate.ps1'
@@ -487,12 +522,20 @@ function Get-DvClipAdmission {
     foreach ($r in $consent.records) {
         if ([string]$r.venue -ceq $Venue -and [string]$r.clipId -ceq $ClipId) { $record = $r; break }
     }
+    # Per-clip records are checked FIRST; the blanket record (the owner's sentence of 2026-10-11) admits any well-formed clip id on any venue in the table.
+    $kind = 'clip'
+    if ($null -eq $record -and @($consent.blankets).Count -gt 0 -and $null -ne $Table.venues.PSObject.Properties[$Venue]) { $kind = 'blanket'; $record = @($consent.blankets)[0] }
     if ($null -eq $record) { return (& $refuse 'VENUE_CLIP_CONSENT_ABSENT') }
     $refusal = 'OWNER_CLIP_REFUSED_PENDING_CROSS_VOLUME_2'
     if ($null -ne $Table.PSObject.Properties['ownerFootage']) { $refusal = [string]$Table.ownerFootage.refusal }
     $cleanupGone = ($null -ne $Table.PSObject.Properties['ownerFootage']) -and [bool]$Table.ownerFootage.cleanupClassGone
     if (-not $cleanupGone) { return (& $refuse $refusal) }
-    [pscustomobject]@{ admitted = $true; reason = $null; ownerLineSha256 = [string](Get-DvProp $record 'ownerLineSha256'); recordedUtc = [string](Get-DvProp $record 'recordedUtc') }
+    if ($kind -ceq 'blanket') {
+        $sha = [string](Get-DvProp $record 'ownerSentenceSha256')
+        return [pscustomobject]@{ admitted = $true; reason = $null; ownerLineSha256 = $sha; recordedUtc = [string](Get-DvProp $record 'recordedUtc'); consentKind = 'blanket'; consentSha256Prefix = $sha.Substring(0, [Math]::Min(12, $sha.Length)) }
+    }
+    $lineSha = [string](Get-DvProp $record 'ownerLineSha256')
+    [pscustomobject]@{ admitted = $true; reason = $null; ownerLineSha256 = $lineSha; recordedUtc = [string](Get-DvProp $record 'recordedUtc'); consentKind = 'clip'; consentSha256Prefix = $lineSha.Substring(0, [Math]::Min(12, $lineSha.Length)) }
 }
 
 # --- the receipt oracle's verdict, carried in the receipt (round 2) and RE-DERIVED from the run's own log (round 3) -------
@@ -1340,8 +1383,16 @@ function Test-DvReceiptValid {
                 $consent = Read-DvClipConsent -Text $cb.text -Table $table
                 if (-not $consent.ok) { $invalid.Add("ADMISSION_UNPROVEN: the committed consent blob is not a valid consent file ($($consent.reason))") }
                 else {
+                    $consentKind = [string](Get-DvProp $admission 'consentKind')
+                    $prefix = [string](Get-DvProp $admission 'consentSha256Prefix')
+                    if ($consentKind -cnotin @('', 'clip', 'blanket')) { $invalid.Add('ADMISSION_UNPROVEN: admission.consentKind is neither clip nor blanket') }
+                    if ($prefix -cne '' -and -not $lineSha.StartsWith($prefix, [StringComparison]::Ordinal)) { $invalid.Add('CONSENT_LINE_MISMATCH: admission.consentSha256Prefix is not the prefix of admission.ownerLineSha256') }
                     $ownRecords = @($consent.records | Where-Object { [string]$_.venue -ceq $venueName -and [string]$_.clipId -ceq $clipId })
-                    if ($ownRecords.Count -eq 0) { $invalid.Add('CONSENT_NOT_IN_BLOB: the committed consent blob holds no owner record for this venue and clip id') }
+                    if ($consentKind -ceq 'blanket') {
+                        $ownBlankets = @(@(Get-DvProp $consent 'blankets') | Where-Object { $null -ne $_ -and [string]$_.ownerSentenceSha256 -ceq $lineSha -and [string]$_.recordedBy -ceq 'owner' -and [string]$_.writtenBy -ceq 'owner' })
+                        if ($ownBlankets.Count -eq 0) { $invalid.Add('CONSENT_NOT_IN_BLOB: the committed consent blob holds no owner blanket record whose sentence sha256 equals admission.ownerLineSha256') }
+                    }
+                    elseif ($ownRecords.Count -eq 0) { $invalid.Add('CONSENT_NOT_IN_BLOB: the committed consent blob holds no owner record for this venue and clip id') }
                     else {
                         $record = $ownRecords[0]
                         if ([string]$record.ownerLineSha256 -cne $lineSha) { $invalid.Add('CONSENT_LINE_MISMATCH: admission.ownerLineSha256 is not the line sha256 of the committed consent record for this venue and clip id') }
@@ -1378,7 +1429,10 @@ function Test-DvReceiptValid {
                     elseif ($null -ne $nowId -and $null -ne $table) {
                         $nowBlob = Get-DvBlobById -RepoRoot $RepoRoot -BlobSha $nowId
                         $now = $(if ($nowBlob.ok) { Read-DvClipConsent -Text $nowBlob.text -Table $table } else { $null })
-                        if ($null -ne $now -and $now.ok) { $stillConsented = (@($now.records | Where-Object { [string]$_.venue -ceq $venueName -and [string]$_.clipId -ceq $clipId -and [string]$_.ownerLineSha256 -ceq $lineSha -and [string]$_.recordedBy -ceq 'owner' }).Count -gt 0) }
+                        if ($null -ne $now -and $now.ok) {
+                            if ([string](Get-DvProp $admission 'consentKind') -ceq 'blanket') { $stillConsented = (@(@(Get-DvProp $now 'blankets') | Where-Object { $null -ne $_ -and [string]$_.ownerSentenceSha256 -ceq $lineSha -and [string]$_.recordedBy -ceq 'owner' }).Count -gt 0) }
+                            else { $stillConsented = (@($now.records | Where-Object { [string]$_.venue -ceq $venueName -and [string]$_.clipId -ceq $clipId -and [string]$_.ownerLineSha256 -ceq $lineSha -and [string]$_.recordedBy -ceq 'owner' }).Count -gt 0) }
+                        }
                     }
                     if (-not $stillConsented) { $invalid.Add('CONSENT_REVOKED: the owner record this receipt was admitted on is no longer committed at HEAD') }
                 }
