@@ -9,13 +9,23 @@
 #   3. Decides with Get-FoldCadenceDecision (pure, callable by dot-sourcing this file):
 #        DueFold = OwedCount > 0 AND UsageLevel == 'ok' AND (now - last fold) >= MinFoldIntervalHours (default 6).
 # Verdict schema mlv-app/fold-cadence/v1:
-#   schema, owedCount (null when unknown), oldestOwedCommitUtc, oldestOwedAgeHours, busFetch (the recall tool's fetch status:
+#   schema, meterState, consecutiveUnknown, recallOutcome, recallAttempts, recallStderr, unknownReason, owedCount (null when
+#   unknown), oldestOwedCommitUtc, oldestOwedAgeHours, busFetch (the recall tool's fetch status:
 #   ok | no-origin | skipped | 'FETCH_FAILED <reason>', in which case the debt was priced against the local HEAD only; null when
 #   the listing never came back), ackedSha, ackedAtUtc, lastFoldUtc,
 #   lastFoldAgeHours, dueFold, reason, evaluatedAtUtc, elapsedSec.
 # Reason (typed): due | no-owed | usage-<level> | fold-recent | timeout | last-seen-missing | last-seen-unreadable |
-#   last-seen-no-sha | recall-unknown-sha | recall-failed-exit-<n> | recall-output-unreadable | error.
-# Every failure is a verdict with DueFold false and exit code 0: a beat step must never fail the beat.
+#   last-seen-no-sha | recall-unknown-sha | recall-failed-exit-<n> | recall-output-unreadable | error | unknown-fail-closed.
+# Every failure is a verdict with exit code 0 (a beat step must never fail the beat), and an UNKNOWN debt is never read as "nothing owed"
+# (FACTORY-METERS-FAIL-CLOSED-1):
+#   - the recall's stderr is kept (verdict recallStderr + the rotating -LogPath log), never deleted unread;
+#   - recallOutcome tells the failures apart: ok | timeout (our deadline killed the tree) | git-failure (recall exit 4: git or the
+#     bus clone failed or timed out) | unknown-sha (exit 3) | failed (any other non-zero exit) | unreadable (exit 0, bad output);
+#   - a timeout or git-failure is retried ONCE with a larger budget (-RetryGitTimeoutSec / -RetryDeadlineSec), because the first
+#     failure usually means a loaded host, not a broken bus;
+#   - meterState is OK | DUE | UNKNOWN. With -StatePath the step counts consecutive UNKNOWN evaluations; from the
+#     -UnknownDueAfter-th one on (default 2) an unknown debt is DUE (reason unknown-fail-closed, unknownReason = what failed)
+#     under the same usage and 6 h rules as a real debt. Without -StatePath the count is 1 and unknown stays not-due.
 # Last fold time: -LastFoldUtc (ISO 8601) wins; else the newest <FoldRunsRoot>\*\fold-*.md write time (a fold lane's fold-report.md);
 # else unknown, which counts as "no fold ran in the interval". Only run dirs whose name contains 'fold' are looked into (the real
 # fleet-runs root holds thousands of dirs).
@@ -31,7 +41,13 @@ param(
     [string]$Bus,
     [string]$RecallScript,
     [string]$PythonCommand = 'py',
-    [string]$NowUtc
+    [string]$NowUtc,
+    [string]$StatePath,
+    [string]$LogPath,
+    [long]$LogMaxBytes = 262144,
+    [int]$RetryGitTimeoutSec = 30,
+    [int]$RetryDeadlineSec = 45,
+    [int]$UnknownDueAfter = 2
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -48,15 +64,26 @@ function ConvertTo-FoldUtc($Value) {
 
 function Get-FoldCadenceDecision {
     # Pure: no clock, no disk. DueFold = owed > 0 AND usage ok AND no fold in the last MinFoldIntervalHours.
+    # An UNKNOWN debt (OwedCount null) fails closed: after UnknownDueAfter consecutive unknowns it is due under the same two gates.
     param(
         $OwedCount,
         [string]$UsageLevel = 'ok',
         $LastFoldUtc,
         [datetime]$NowUtc,
-        [double]$MinFoldIntervalHours = 6
+        [double]$MinFoldIntervalHours = 6,
+        [int]$ConsecutiveUnknown = 0,
+        [int]$UnknownDueAfter = 2
     )
     $level = if ($UsageLevel -and $UsageLevel.Trim()) { $UsageLevel.Trim().ToLowerInvariant() } else { 'unknown' }
-    if ($null -eq $OwedCount) { return [pscustomobject]@{ DueFold = $false; Reason = 'owed-unknown' } }
+    if ($null -eq $OwedCount) {
+        if ($ConsecutiveUnknown -lt $UnknownDueAfter) { return [pscustomobject]@{ DueFold = $false; Reason = 'owed-unknown' } }
+        if ($level -ne 'ok') { return [pscustomobject]@{ DueFold = $false; Reason = "usage-$level" } }
+        $lastU = ConvertTo-FoldUtc $LastFoldUtc
+        if ($null -ne $lastU -and (($NowUtc.ToUniversalTime() - $lastU).TotalHours -lt $MinFoldIntervalHours)) {
+            return [pscustomobject]@{ DueFold = $false; Reason = 'fold-recent' }
+        }
+        return [pscustomobject]@{ DueFold = $true; Reason = 'unknown-fail-closed' }
+    }
     if ([int]$OwedCount -le 0) { return [pscustomobject]@{ DueFold = $false; Reason = 'no-owed' } }
     if ($level -ne 'ok') { return [pscustomobject]@{ DueFold = $false; Reason = "usage-$level" } }
     $last = ConvertTo-FoldUtc $LastFoldUtc
@@ -69,6 +96,12 @@ function Get-FoldCadenceDecision {
 function New-FoldCadenceVerdict([string]$Reason, [datetime]$Now, [double]$ElapsedSec) {
     [ordered]@{
         schema              = 'mlv-app/fold-cadence/v1'
+        meterState          = 'UNKNOWN'
+        consecutiveUnknown  = 0
+        recallOutcome       = $null
+        recallAttempts      = @()
+        recallStderr        = $null
+        unknownReason       = $null
         owedCount           = $null
         oldestOwedCommitUtc = $null
         oldestOwedAgeHours  = $null
@@ -94,12 +127,59 @@ function Get-NewestFoldReportUtc([string]$Root) {
     if ($f) { $f.LastWriteTimeUtc } else { $null }
 }
 
-function Invoke-FoldCadence {
+function Read-SharedText([string]$Path) {
+    # Read a file another process may still hold open (a killed recall tree releases its redirect handles a moment late).
+    try {
+        $fs = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
+        try { $sr = [IO.StreamReader]::new($fs, [Text.Encoding]::UTF8); return $sr.ReadToEnd() } finally { $fs.Dispose() }
+    } catch { return '' }
+}
+
+function Format-StderrTail([string]$Text, [int]$Max = 600) {
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
+    $t = (($Text -replace '\s+', ' ') -replace '[^\x20-\x7E]', '?').Trim()
+    if ($t.Length -gt $Max) { $t = '...' + $t.Substring($t.Length - ($Max - 3)) }
+    $t
+}
+
+function Invoke-RecallAttempt {
+    # One run of `doctrine_recall.py --fold-debt` under a hard deadline; the child tree is killed at the deadline.
+    # outcome: ok (exit 0) | timeout (our deadline) | unknown-sha (exit 3) | git-failure (exit 4) | failed (any other exit).
+    # A launcher that cannot start throws (the caller types that as 'error').
+    param([string]$PythonCommand, [string]$Script, [string]$Sha, [string]$Bus, [int]$DeadlineSec, [double]$GitSec, [double]$FetchSec)
+    $inv = [Globalization.CultureInfo]::InvariantCulture
+    $argList = @('-3', "`"$Script`"", '--fold-debt', '--since', $Sha, '--git-timeout', [string]::Format($inv, '{0}', $GitSec), '--fetch-timeout', [string]::Format($inv, '{0}', $FetchSec))
+    if ($Bus) { $argList += @('--bus', "`"$Bus`"") }
+    $stem = Join-Path ([IO.Path]::GetTempPath()) ('fold-cadence-' + [guid]::NewGuid().ToString('N'))
+    $tmpOut = "$stem.out"; $tmpErr = "$stem.err"
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $r = [ordered]@{ outcome = 'ok'; exitCode = $null; elapsedSec = 0; gitTimeoutSec = $GitSec; stdout = ''; stderr = $null }
+    try {
+        $p = Start-Process -FilePath $PythonCommand -ArgumentList $argList -NoNewWindow -PassThru -RedirectStandardOutput $tmpOut -RedirectStandardError $tmpErr
+        $null = $p.Handle
+        if (-not $p.WaitForExit($DeadlineSec * 1000)) {
+            try { $p.Kill($true) } catch {}
+            $r.outcome = 'timeout'
+        } else {
+            $r.exitCode = $p.ExitCode
+            $r.outcome = switch ($p.ExitCode) { 0 { 'ok' } 3 { 'unknown-sha' } 4 { 'git-failure' } default { 'failed' } }
+        }
+        $r.stderr = Format-StderrTail (Read-SharedText $tmpErr)
+        if ($r.outcome -eq 'ok') { $r.stdout = Read-SharedText $tmpOut }
+    } finally {
+        foreach ($f in @($tmpOut, $tmpErr)) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
+        $r.elapsedSec = [math]::Round($sw.Elapsed.TotalSeconds, 2)
+    }
+    [pscustomobject]$r
+}
+
+function Invoke-FoldCadenceCore {
+    # One evaluation: the typed verdict, owedCount null whenever the debt could not be priced. State, retry bookkeeping and the
+    # fail-closed rule live in Invoke-FoldCadence, which wraps this.
     param($Opts)
     $sw = [Diagnostics.Stopwatch]::StartNew()
     $now = if ($Opts.NowUtc) { ConvertTo-FoldUtc $Opts.NowUtc } else { [datetime]::UtcNow }
     $v = New-FoldCadenceVerdict 'error' $now 0
-    $tmpOut = $null; $tmpErr = $null
     try {
         # Last fold time first: it is known whatever happens to the debt listing.
         $lastFold = if ($Opts.LastFoldUtc) { ConvertTo-FoldUtc $Opts.LastFoldUtc } else { Get-NewestFoldReportUtc $Opts.FoldRunsRoot }
@@ -121,25 +201,29 @@ function Invoke-FoldCadence {
 
         $script = if ($Opts.RecallScript) { $Opts.RecallScript } else { [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..\doctrine\doctrine_recall.py')) }
         $deadline = [math]::Max(1, [int]$Opts.DeadlineSec)
-        $gitBudget = [string]::Format([Globalization.CultureInfo]::InvariantCulture, '{0}', [math]::Min(10.0, [math]::Max(1.0, $deadline * 0.8)))
         # The recall tool fetches the bus first (DOCTRINE-BUS-CLONE-CURRENT-1); give that fetch its own slice of the deadline so
         # a slow remote costs a FETCH_FAILED note in the verdict, not a 'timeout' verdict that hides the debt.
-        $fetchBudget = [string]::Format([Globalization.CultureInfo]::InvariantCulture, '{0}', [math]::Min(30.0, [math]::Max(1.0, $deadline * 0.4)))
-        $argList = @('-3', "`"$script`"", '--fold-debt', '--since', $sha, '--git-timeout', $gitBudget, '--fetch-timeout', $fetchBudget)
-        if ($Opts.Bus) { $argList += @('--bus', "`"$($Opts.Bus)`"") }
-        $stem = Join-Path ([IO.Path]::GetTempPath()) ('fold-cadence-' + [guid]::NewGuid().ToString('N'))
-        $tmpOut = "$stem.out"; $tmpErr = "$stem.err"
-        $p = Start-Process -FilePath $Opts.PythonCommand -ArgumentList $argList -NoNewWindow -PassThru -RedirectStandardOutput $tmpOut -RedirectStandardError $tmpErr
-        $null = $p.Handle
-        if (-not $p.WaitForExit($deadline * 1000)) {
-            try { $p.Kill($true) } catch {}
-            $v.reason = 'timeout'; return $v
+        $gitSec = [math]::Min(10.0, [math]::Max(1.0, $deadline * 0.8))
+        $fetchSec = [math]::Min(30.0, [math]::Max(1.0, $deadline * 0.4))
+        $a = Invoke-RecallAttempt -PythonCommand $Opts.PythonCommand -Script $script -Sha $sha -Bus $Opts.Bus -DeadlineSec $deadline -GitSec $gitSec -FetchSec $fetchSec
+        $attempts = @($a)
+        if ($a.outcome -in 'timeout', 'git-failure') {
+            # A timeout or a git failure usually means a loaded host, not a broken bus: retry ONCE with a larger budget.
+            $rd = [math]::Max(1, [int]$Opts.RetryDeadlineSec)
+            $rg = [math]::Min([double]$Opts.RetryGitTimeoutSec, [math]::Max(1.0, $rd * 0.5))
+            $rf = [math]::Min(30.0, [math]::Max(1.0, $rd * 0.4))
+            $a = Invoke-RecallAttempt -PythonCommand $Opts.PythonCommand -Script $script -Sha $sha -Bus $Opts.Bus -DeadlineSec $rd -GitSec $rg -FetchSec $rf
+            $attempts += $a
         }
-        $code = $p.ExitCode
-        if ($code -eq 3) { $v.reason = 'recall-unknown-sha'; return $v }
-        if ($code -ne 0) { $v.reason = "recall-failed-exit-$code"; return $v }
-        $debt = try { Get-Content -LiteralPath $tmpOut -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $null }
-        if ($null -eq $debt -or -not $debt.PSObject.Properties['count'] -or -not $debt.PSObject.Properties['commits']) { $v.reason = 'recall-output-unreadable'; return $v }
+        $v.recallAttempts = @($attempts | ForEach-Object { [ordered]@{ outcome = $_.outcome; exitCode = $_.exitCode; elapsedSec = $_.elapsedSec; gitTimeoutSec = $_.gitTimeoutSec } })
+        $v.recallOutcome = $a.outcome
+        $withErr = @($attempts | Where-Object { $_.stderr })
+        if ($withErr.Count) { $v.recallStderr = $withErr[-1].stderr }
+        if ($a.outcome -eq 'timeout') { $v.reason = 'timeout'; return $v }
+        if ($a.outcome -eq 'unknown-sha') { $v.reason = 'recall-unknown-sha'; return $v }
+        if ($a.outcome -ne 'ok') { $v.reason = "recall-failed-exit-$($a.exitCode)"; return $v }
+        $debt = try { $a.stdout | ConvertFrom-Json } catch { $null }
+        if ($null -eq $debt -or -not $debt.PSObject.Properties['count'] -or -not $debt.PSObject.Properties['commits']) { $v.recallOutcome = 'unreadable'; $v.reason = 'recall-output-unreadable'; return $v }
         $owed = [int]$debt.count
         $v.owedCount = $owed
         if ($debt.PSObject.Properties['fetch']) { $v.busFetch = [string]$debt.fetch }
@@ -157,9 +241,73 @@ function Invoke-FoldCadence {
         $v.reason = 'error'
         return $v
     } finally {
-        foreach ($f in @($tmpOut, $tmpErr)) { if ($f) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue } }
         $v.elapsedSec = [math]::Round($sw.Elapsed.TotalSeconds, 2)
     }
+}
+
+function Read-FoldCadenceState([string]$Path) {
+    $s = [ordered]@{ consecutiveUnknown = 0; lastHealthyUtc = $null }
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $s }
+    try {
+        $j = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ($j.PSObject.Properties['consecutiveUnknown']) { $s.consecutiveUnknown = [math]::Max(0, [int]$j.consecutiveUnknown) }
+        if ($j.PSObject.Properties['lastHealthyUtc'] -and $j.lastHealthyUtc) { $s.lastHealthyUtc = ([string]$j.lastHealthyUtc) }
+    } catch {}
+    $s
+}
+
+function Write-FoldCadenceLog([string]$Path, [long]$MaxBytes, $Verdict) {
+    # One JSON line per evaluation that was not a clean first-try answer; rotated by rename (keeps .1 .2 .3), never unbounded.
+    if (-not $Path) { return }
+    $failed = @($Verdict.recallAttempts | Where-Object { $_.outcome -ne 'ok' })
+    if ($null -ne $Verdict.owedCount -and -not $failed.Count) { return }
+    try {
+        $dir = Split-Path -Parent $Path
+        if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        if ((Test-Path -LiteralPath $Path) -and (Get-Item -LiteralPath $Path).Length -gt $MaxBytes) {
+            Remove-Item -LiteralPath "$Path.3" -Force -ErrorAction SilentlyContinue
+            foreach ($n in 2, 1) { if (Test-Path -LiteralPath "$Path.$n") { Move-Item -LiteralPath "$Path.$n" -Destination ("$Path." + ($n + 1)) -Force } }
+            Move-Item -LiteralPath $Path -Destination "$Path.1" -Force
+        }
+        $line = [ordered]@{ utc = $Verdict.evaluatedAtUtc; meterState = $Verdict.meterState; reason = $Verdict.reason; recallOutcome = $Verdict.recallOutcome
+            consecutiveUnknown = $Verdict.consecutiveUnknown; dueFold = $Verdict.dueFold; attempts = $Verdict.recallAttempts; stderr = $Verdict.recallStderr }
+        Add-Content -LiteralPath $Path -Value (ConvertTo-Json -InputObject $line -Compress -Depth 5) -Encoding ascii
+    } catch {}
+}
+
+function Invoke-FoldCadence {
+    # The evaluation plus the fail-closed bookkeeping: an unknown debt is counted, kept visible (meterState UNKNOWN) and, from the
+    # UnknownDueAfter-th consecutive unknown on, treated as due. Never throws.
+    param($Opts)
+    $v = Invoke-FoldCadenceCore $Opts
+    try {
+        $now = ConvertTo-FoldUtc $v.evaluatedAtUtc
+        $state = Read-FoldCadenceState $Opts.StatePath
+        $unknown = ($null -eq $v.owedCount)
+        $n = if ($unknown) { [int]$state.consecutiveUnknown + 1 } else { 0 }
+        $v.consecutiveUnknown = $n
+        if ($unknown) {
+            $v.meterState = 'UNKNOWN'
+            $v.unknownReason = $v.reason
+            $after = if ($Opts.UnknownDueAfter -gt 0) { [int]$Opts.UnknownDueAfter } else { 2 }
+            $d = Get-FoldCadenceDecision -OwedCount $null -UsageLevel $Opts.UsageLevel -LastFoldUtc $v.lastFoldUtc -NowUtc $now -MinFoldIntervalHours $Opts.MinFoldIntervalHours -ConsecutiveUnknown $n -UnknownDueAfter $after
+            if ($d.DueFold) { $v.dueFold = $true; $v.reason = $d.Reason }
+        } else {
+            $v.meterState = if ($v.dueFold) { 'DUE' } else { 'OK' }
+        }
+        if ($Opts.StatePath) {
+            $healthy = if ($unknown) { $state.lastHealthyUtc } else { $v.evaluatedAtUtc }
+            $st = [ordered]@{ schema = 'mlv-app/fold-cadence-state/v1'; consecutiveUnknown = $n; lastHealthyUtc = $healthy; lastReason = $(if ($unknown) { $v.unknownReason } else { $v.reason })
+                lastRecallOutcome = $v.recallOutcome; updatedUtc = $v.evaluatedAtUtc }
+            $dir = Split-Path -Parent $Opts.StatePath
+            if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+            $tmp = "$($Opts.StatePath).tmp"
+            (ConvertTo-Json -InputObject $st -Depth 3) | Set-Content -LiteralPath $tmp -Encoding ascii
+            Move-Item -LiteralPath $tmp -Destination $Opts.StatePath -Force
+        }
+        Write-FoldCadenceLog $Opts.LogPath $Opts.LogMaxBytes $v
+    } catch {}
+    $v
 }
 
 # Dot-sourced (by a test or the beat): functions only.
@@ -171,6 +319,8 @@ try {
             LastSeenPath = $LastSeenPath; DeadlineSec = $DeadlineSec; UsageLevel = $UsageLevel
             MinFoldIntervalHours = $MinFoldIntervalHours; FoldRunsRoot = $FoldRunsRoot; LastFoldUtc = $LastFoldUtc
             Bus = $Bus; RecallScript = $RecallScript; PythonCommand = $PythonCommand; NowUtc = $NowUtc
+            StatePath = $StatePath; LogPath = $LogPath; LogMaxBytes = $LogMaxBytes; RetryGitTimeoutSec = $RetryGitTimeoutSec
+            RetryDeadlineSec = $RetryDeadlineSec; UnknownDueAfter = $UnknownDueAfter
         })
 } catch {
     $verdict = New-FoldCadenceVerdict 'error' ([datetime]::UtcNow) 0

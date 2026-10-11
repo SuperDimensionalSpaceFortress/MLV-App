@@ -130,7 +130,8 @@ class FoldCadenceStepTests(CadenceWorld):
         self.assertEqual(v['evaluatedAtUtc'][:19], '2026-10-10T12:00:00')
         self.assertGreaterEqual(v['elapsedSec'], 0)
         self.assertEqual(sorted(v), sorted([
-            'schema', 'owedCount', 'oldestOwedCommitUtc', 'oldestOwedAgeHours', 'busFetch', 'ackedSha', 'ackedAtUtc', 'lastFoldUtc',
+            'schema', 'meterState', 'consecutiveUnknown', 'recallOutcome', 'recallAttempts', 'recallStderr', 'unknownReason',
+            'owedCount', 'oldestOwedCommitUtc', 'oldestOwedAgeHours', 'busFetch', 'ackedSha', 'ackedAtUtc', 'lastFoldUtc',
             'lastFoldAgeHours', 'dueFold', 'reason', 'evaluatedAtUtc', 'elapsedSec']))
         # The step also returns the verdict to its caller.
         self.assertIn('dueFold', stdout)
@@ -186,24 +187,28 @@ class FoldCadenceStepTests(CadenceWorld):
 
     def test_timeout_is_a_typed_verdict_and_the_child_is_killed(self):
         pid_file = self.tmp / 'pid.txt'
-        recall = self.fake_recall(f'import os, time\nopen({str(pid_file)!r}, "w").write(str(os.getpid()))\ntime.sleep(120)\n')
+        recall = self.fake_recall(f'import os, time\nopen({str(pid_file)!r}, "a").write(str(os.getpid()) + "\\n")\ntime.sleep(120)\n')
         started = time.monotonic()
-        code, v, _ = self.step(recall, deadline=5)
+        code, v, _ = self.step(recall, '-RetryDeadlineSec', '3', deadline=5)
         wall = time.monotonic() - started
         self.assertEqual(code, 0)
         self.assertIs(v['dueFold'], False)
         self.assertEqual(v['reason'], 'timeout')
+        self.assertEqual(v['recallOutcome'], 'timeout')
         self.assertIsNone(v['owedCount'])
-        self.assertLess(wall, 30, 'the deadline did not bound the step')
-        self.assertLess(v['elapsedSec'], 15)
-        # The fake's python process must be gone (the tree is killed, not left running to the end of its sleep).
-        pid = pid_file.read_text(encoding='utf-8').strip()
-        for _ in range(20):
-            alive = pid in subprocess.run(['tasklist', '/FI', f'PID eq {pid}', '/NH'], text=True, capture_output=True).stdout
-            if not alive:
-                break
-            time.sleep(0.25)
-        self.assertFalse(alive, f'recall child {pid} survived the deadline')
+        self.assertLess(wall, 40, 'the deadline did not bound the step')
+        self.assertLess(v['elapsedSec'], 25)
+        # A timeout is retried once with the retry budget, and every child tree is killed (none left sleeping to the end).
+        self.assertEqual([a['outcome'] for a in v['recallAttempts']], ['timeout', 'timeout'])
+        pids = pid_file.read_text(encoding='utf-8').split()
+        self.assertGreaterEqual(len(pids), 1)   # a loaded host may not get the second python far enough to record its pid
+        for pid in pids:
+            for _ in range(20):
+                alive = pid in subprocess.run(['tasklist', '/FI', f'PID eq {pid}', '/NH'], text=True, capture_output=True).stdout
+                if not alive:
+                    break
+                time.sleep(0.25)
+            self.assertFalse(alive, f'recall child {pid} survived the deadline')
 
     def test_missing_last_seen_is_typed(self):
         code, v, _ = self.step(self.fake_debt([commit('a' * 40, OLD_COMMIT)]), last_seen=str(self.tmp / 'absent.json'))
@@ -318,6 +323,156 @@ class FoldCadenceStepTests(CadenceWorld):
             self.assertEqual(code, 0)
             self.assertIsNotNone(v, 'the step must have run and written its verdict')
             self.assertEqual(list(self.scratch_tmp.iterdir()), [])
+
+
+class FailClosedTests(CadenceWorld):
+    """FACTORY-METERS-FAIL-CLOSED-1: an unknown debt is never read as 'nothing owed'."""
+
+    def setUp(self):
+        super().setUp()
+        self.state = self.tmp / 'state' / 'fold-cadence-state.json'
+        self.log = self.tmp / 'logs' / 'fold-cadence.log'
+
+    def run_step(self, recall, *extra, **kw):
+        return self.step(recall, '-StatePath', str(self.state), '-LogPath', str(self.log), *extra, **kw)
+
+    def reset_state(self):
+        shutil.rmtree(self.state.parent, True)
+
+    def git_failure(self, text='git timed out resolving the cursor sha'):
+        return self.fake_recall(f'import sys\nprint({text!r}, file=sys.stderr)\nsys.exit(4)\n')
+
+    def test_exit_4_keeps_its_stderr_and_is_typed_git_failure(self):
+        code, v, _ = self.run_step(self.git_failure())
+        self.assertEqual(code, 0)
+        self.assertEqual(v['recallOutcome'], 'git-failure')
+        self.assertEqual(v['reason'], 'recall-failed-exit-4')
+        self.assertIn('git timed out resolving the cursor sha', v['recallStderr'])
+        self.assertEqual([a['exitCode'] for a in v['recallAttempts']], [4, 4])   # one retry, then it stays a failure
+        self.assertEqual(list(self.scratch_tmp.iterdir()), [])
+
+    def test_retry_with_a_larger_budget_rescues_a_loaded_host(self):
+        marker = self.tmp / 'first-attempt-done'
+        payload = {'count': 1, 'commits': [commit('a' * 40, OLD_COMMIT)]}
+        recall = self.fake_recall(
+            'import os, sys\n'
+            f'if not os.path.exists({str(marker)!r}):\n'
+            f'    open({str(marker)!r}, "w").write("x")\n'
+            '    print("git timed out", file=sys.stderr)\n'
+            '    sys.exit(4)\n'
+            f'print({json.dumps(payload)!r})\n')
+        code, v, _ = self.run_step(recall)
+        self.assertEqual(code, 0)
+        self.assertEqual(v['owedCount'], 1)
+        self.assertIs(v['dueFold'], True)
+        self.assertEqual(v['reason'], 'due')
+        self.assertEqual(v['meterState'], 'DUE')
+        self.assertEqual(v['consecutiveUnknown'], 0)
+        self.assertEqual([a['outcome'] for a in v['recallAttempts']], ['git-failure', 'ok'])
+        self.assertGreater(v['recallAttempts'][1]['gitTimeoutSec'], v['recallAttempts'][0]['gitTimeoutSec'])
+
+    def test_unknown_is_due_only_from_the_second_consecutive_beat(self):
+        recall = self.git_failure()
+        code, v1, _ = self.run_step(recall)
+        self.assertEqual((v1['meterState'], v1['consecutiveUnknown'], v1['dueFold'], v1['reason']), ('UNKNOWN', 1, False, 'recall-failed-exit-4'))
+        code, v2, _ = self.run_step(recall)
+        self.assertEqual((v2['meterState'], v2['consecutiveUnknown'], v2['dueFold'], v2['reason']), ('UNKNOWN', 2, True, 'unknown-fail-closed'))
+        self.assertEqual(v2['unknownReason'], 'recall-failed-exit-4')
+        self.assertIsNone(v2['owedCount'])
+        code, v3, _ = self.run_step(recall)
+        self.assertEqual((v3['consecutiveUnknown'], v3['dueFold']), (3, True))
+
+    def test_a_good_answer_resets_the_count(self):
+        self.run_step(self.git_failure())
+        code, v, _ = self.run_step(self.fake_debt([]))
+        self.assertEqual((v['meterState'], v['consecutiveUnknown'], v['dueFold'], v['reason']), ('OK', 0, False, 'no-owed'))
+        state = json.loads(self.state.read_text(encoding='utf-8'))
+        self.assertEqual(state['consecutiveUnknown'], 0)
+        self.assertEqual(state['lastHealthyUtc'][:19], '2026-10-10T12:00:00')
+        code, v, _ = self.run_step(self.git_failure())
+        self.assertEqual((v['consecutiveUnknown'], v['dueFold']), (1, False))
+
+    def test_unknown_due_obeys_the_usage_and_recent_fold_gates(self):
+        recall = self.git_failure()
+        self.run_step(recall, usage='hold')
+        code, v, _ = self.run_step(recall, usage='hold')
+        # Held by the usage gate: still UNKNOWN, still not due, and the reason stays what failed (never a bare 'nothing owed').
+        self.assertEqual((v['meterState'], v['dueFold'], v['reason']), ('UNKNOWN', False, 'recall-failed-exit-4'))
+        self.assertEqual(v['unknownReason'], 'recall-failed-exit-4')
+        code, v, _ = self.run_step(recall, last_fold='2026-10-10T07:00:00Z')
+        self.assertEqual((v['meterState'], v['dueFold'], v['reason']), ('UNKNOWN', False, 'recall-failed-exit-4'))
+        code, v, _ = self.run_step(recall)
+        self.assertEqual((v['dueFold'], v['reason']), (True, 'unknown-fail-closed'))
+
+    def test_every_unknown_reason_counts(self):
+        cases = [self.git_failure(), self.fake_recall('import sys\nsys.exit(3)\n'), self.fake_recall('print("not json")\n')]
+        for recall in cases:
+            with self.subTest(recall=recall.name):
+                self.reset_state()
+                self.run_step(recall)
+                code, v, _ = self.run_step(recall)
+                self.assertEqual((v['dueFold'], v['reason']), (True, 'unknown-fail-closed'), v)
+        self.reset_state()
+        absent = str(self.tmp / 'absent.json')
+        self.run_step(self.fake_debt([]), last_seen=absent)
+        code, v, _ = self.run_step(self.fake_debt([]), last_seen=absent)
+        self.assertEqual((v['unknownReason'], v['dueFold'], v['reason']), ('last-seen-missing', True, 'unknown-fail-closed'))
+
+    def test_timeouts_count_as_unknown_too(self):
+        recall = self.fake_recall('import time\ntime.sleep(120)\n')
+        self.run_step(recall, '-RetryDeadlineSec', '2', deadline=2)
+        code, v, _ = self.run_step(recall, '-RetryDeadlineSec', '2', deadline=2)
+        self.assertEqual((v['recallOutcome'], v['unknownReason'], v['dueFold'], v['reason']), ('timeout', 'timeout', True, 'unknown-fail-closed'))
+
+    def test_without_a_state_path_unknown_stays_not_due(self):
+        for _ in range(3):
+            code, v, _ = self.step(self.git_failure())
+            self.assertEqual((v['meterState'], v['consecutiveUnknown'], v['dueFold']), ('UNKNOWN', 1, False))
+
+    def test_a_corrupt_state_file_counts_as_zero(self):
+        self.state.parent.mkdir(parents=True)
+        self.state.write_text('{not json', encoding='utf-8')
+        code, v, _ = self.run_step(self.git_failure())
+        self.assertEqual((code, v['consecutiveUnknown'], v['dueFold']), (0, 1, False))
+
+    def test_unknown_after_is_a_parameter(self):
+        code, v, _ = self.run_step(self.git_failure(), '-UnknownDueAfter', '1')
+        self.assertEqual((v['dueFold'], v['reason']), (True, 'unknown-fail-closed'))
+
+    def test_failures_are_logged_and_the_log_rotates(self):
+        for _ in range(8):
+            self.run_step(self.git_failure('x' * 300), '-LogMaxBytes', '2000')
+        logs = sorted(p.name for p in self.log.parent.iterdir())
+        self.assertIn('fold-cadence.log', logs)
+        self.assertIn('fold-cadence.log.1', logs)
+        self.assertLessEqual(len([n for n in logs if n.startswith('fold-cadence.log')]), 4)
+        rows = [json.loads(line) for line in self.log.read_text(encoding='ascii').splitlines()]
+        self.assertTrue(rows)
+        self.assertEqual(rows[-1]['recallOutcome'], 'git-failure')
+        self.assertIn('x' * 100, rows[-1]['stderr'])
+
+    def test_a_clean_first_try_is_not_logged(self):
+        self.run_step(self.fake_debt([commit('a' * 40, OLD_COMMIT)]))
+        self.assertFalse(self.log.exists())
+
+
+class UnknownDecisionRuleTests(unittest.TestCase):
+    def decide(self, owed, usage, last, consecutive):
+        cmd = (f". '{SCRIPT}'; $r = Get-FoldCadenceDecision -OwedCount {owed} -UsageLevel '{usage}' -LastFoldUtc {last!r} "
+               f"-NowUtc ([datetime]'{NOW}').ToUniversalTime() -ConsecutiveUnknown {consecutive}; "
+               "ConvertTo-Json -InputObject @($r.DueFold, $r.Reason) -Compress")
+        r = subprocess.run(PWSH + ['-Command', cmd], text=True, capture_output=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return tuple(json.loads(r.stdout.strip().splitlines()[-1]))
+
+    def test_unknown_rule_table(self):
+        n = '$null'
+        self.assertEqual(self.decide(n, 'ok', LONG_AGO, 0), (False, 'owed-unknown'))
+        self.assertEqual(self.decide(n, 'ok', LONG_AGO, 1), (False, 'owed-unknown'))
+        self.assertEqual(self.decide(n, 'ok', LONG_AGO, 2), (True, 'unknown-fail-closed'))
+        self.assertEqual(self.decide(n, 'ok', '', 2), (True, 'unknown-fail-closed'))
+        self.assertEqual(self.decide(n, 'prep', LONG_AGO, 5), (False, 'usage-prep'))
+        self.assertEqual(self.decide(n, 'ok', '2026-10-10T11:00:00Z', 5), (False, 'fold-recent'))
 
 
 class AsciiOnlyTests(unittest.TestCase):
