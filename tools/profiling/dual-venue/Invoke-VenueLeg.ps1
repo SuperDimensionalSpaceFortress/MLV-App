@@ -248,6 +248,8 @@ $receipt.admission = [ordered]@{
     consentLastCommit = $sources.consentLastCommit
     ownerLineSha256 = $null
     ownerRecordedUtc = $null
+    consentKind = $null
+    consentSha256Prefix = $null
 }
 
 function Complete-Receipt([string]$Outcome, [string]$Detail) {
@@ -335,6 +337,9 @@ try {
     if (-not $admission.admitted) { Stop-Refused ([string]$admission.reason) }
     $receipt.admission.ownerLineSha256 = $admission.ownerLineSha256
     $receipt.admission.ownerRecordedUtc = $admission.recordedUtc
+    # VENUE-CLIP-CONSENT-BLANKET-1: which rule admitted the clip (clip = the owner's per-clip CLIP line; blanket = the owner's blanket sentence) and its sha256 prefix.
+    $receipt.admission.consentKind = $admission.consentKind
+    $receipt.admission.consentSha256Prefix = $admission.consentSha256Prefix
     # In production the leg spec (its criteria decide PASS vs FAIL) must be a spec COMMITTED at the revision the consent was read from:
     # Test-DvReceiptValid finds it there by its sha256, so a spec the caller wrote could never validate and is refused up front.
     if (-not $OfflineTestMode) {
