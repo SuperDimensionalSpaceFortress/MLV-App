@@ -2470,7 +2470,11 @@ if ((Get-Sha $exePath 'deployed-exe-hash') -ne $cacheExeSha -or (Get-Sha $reconD
 }
 Write-JobTrace 'step deploy done'
 
-reg add "HKCU\Software\Microsoft\DirectX\UserGpuPreferences" /v "$exePath" /t REG_SZ /d "GpuPreference=2;" /f | Out-Null
+# GPU-PREF-REGISTRY-STOP-AND-PRUNE-1 (NA-8): this job used to write one per-app GPU-preference value per staged exe
+# path into the venue's DirectX user key -- a new value on every build, never pruned, and the owner's graphics
+# state is never an agent's to change. MLVApp.exe requests the discrete GPU itself (NvOptimusEnablement and
+# AmdPowerXpressRequestHighPerformance, platform/qt/main.cpp); the adapter it actually got is recorded from its
+# own GL_RENDERER log lines in the smoke evidence.
 # PLAYBACK-CLIP-LENGTH-ENFORCE-4 (ATTR3-DEAD-REGISTRY-SEED-1): this job used to seed seven app settings under the
 # venue's HKCU app key. An automation run (the smoke the job launches) reads a RUN-SCOPED settings store and never
 # that key, so the seeds changed nothing but the venue's own saved settings. Every value it wrote is what the app

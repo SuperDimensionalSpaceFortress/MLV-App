@@ -55,11 +55,9 @@ New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 $env:QT_OPENGL = "desktop"
 $env:MLVAPP_PLAYBACK_SCALE_FACTOR = "$ScaleFactor"
 
-# On hybrid Intel+NVIDIA hosts the GL context defaults to the iGPU. GpuPreference=2
-# ("High performance") steers MLVApp's OpenGL onto the discrete 4090.
-$prefKey = 'HKCU:\Software\Microsoft\DirectX\UserGpuPreferences'
-New-Item -Path $prefKey -Force | Out-Null
-New-ItemProperty -Path $prefKey -Name $exe -Value 'GpuPreference=2;' -PropertyType String -Force | Out-Null
+# NA-8: the owner's per-app Windows GPU preference is never written. MLVApp.exe requests the discrete GPU
+# itself (NvOptimusEnablement / AmdPowerXpressRequestHighPerformance, platform/qt/main.cpp); the adapter it
+# actually got is recorded below as the GL renderer of the first run.
 
 # Profiling matrix: control (CPU) then the two GPU seams, then both.
 $runs = @(

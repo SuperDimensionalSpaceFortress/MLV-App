@@ -231,31 +231,6 @@ function Get-AverageOrNull {
     [Math]::Round(($Values | Measure-Object -Average).Average, 3)
 }
 
-function Get-GpuPreferenceValue {
-    param([Parameter(Mandatory = $true)][string]$Executable)
-    $prefKey = "HKCU:\Software\Microsoft\DirectX\UserGpuPreferences"
-    if (!(Test-Path -LiteralPath $prefKey)) {
-        return $null
-    }
-    $item = Get-ItemProperty -LiteralPath $prefKey -Name $Executable -ErrorAction SilentlyContinue
-    if ($null -eq $item) {
-        return $null
-    }
-    return [string]$item.$Executable
-}
-
-function Set-GpuPreferenceHighPerformance {
-    param([Parameter(Mandatory = $true)][string]$Executable)
-    $prefKey = "HKCU:\Software\Microsoft\DirectX\UserGpuPreferences"
-    New-Item -Path $prefKey -Force | Out-Null
-    New-ItemProperty `
-        -Path $prefKey `
-        -Name $Executable `
-        -Value "GpuPreference=2;" `
-        -PropertyType String `
-        -Force | Out-Null
-}
-
 function Convert-ToNullableDouble {
     param([object]$Value)
     if ($null -eq $Value) {
@@ -1114,12 +1089,9 @@ else {
 }
 $exe = (Resolve-Path -LiteralPath $ExePath).Path
 $exeDir = Split-Path -Parent $exe
-$gpuPreferenceBefore = Get-GpuPreferenceValue -Executable $exe
-$gpuPreferenceAfter = $gpuPreferenceBefore
-if (!$DryRun -and !$NoHighPerformancePreference) {
-    Set-GpuPreferenceHighPerformance -Executable $exe
-    $gpuPreferenceAfter = Get-GpuPreferenceValue -Executable $exe
-}
+# NA-8: this wrapper never writes the owner's per-app GPU preference. MLVApp.exe requests the discrete GPU
+# itself (NvOptimusEnablement / AmdPowerXpressRequestHighPerformance, platform/qt/main.cpp); the adapter it
+# actually got is recorded from the candidate smoke's GL_RENDERER and asserted below (read-only).
 
 $smokeScript = Join-Path $root "tools\profiling\run-release-gui-smoke.ps1"
 if (-not (Test-Path -LiteralPath $smokeScript -PathType Leaf)) {
@@ -1486,11 +1458,9 @@ $summary = [ordered]@{
     nvidiaSmi = $nvidiaSmi
     preflightFailures = @($preflightFailures)
     gpuPreference = [pscustomobject]@{
-        attemptedHighPerformance = [bool](!$NoHighPerformancePreference)
-        mutated = [bool](!$DryRun -and !$NoHighPerformancePreference)
-        before = $gpuPreferenceBefore
-        after = $gpuPreferenceAfter
-        expected = "GpuPreference=2;"
+        attemptedHighPerformance = $false
+        mutated = $false
+        requestedBy = "app exports (NvOptimusEnablement, AmdPowerXpressRequestHighPerformance)"
     }
     commands = [pscustomobject]@{
         baseline = $baselineCommand
@@ -1512,7 +1482,7 @@ $summary = [ordered]@{
             "This wrapper compares CPU baseline and scoped CUDA no-readback candidate on the same release executable.",
             "By default the CUDA candidate must use the direct-device CUDA AMaZE texture source; pass -AllowLegacyR16TextureCandidate only for legacy bridge investigations.",
             "When separateCandidateSpeedRun is true, candidate proves GL parity without the temporal detector and candidateSpeed measures cadence without heavy GL-vs-oracle readback.",
-            "On Windows hybrid-GPU laptops, the wrapper sets the per-app high-performance GPU preference before real runs unless -NoHighPerformancePreference is passed.",
+            "On Windows hybrid-GPU laptops the wrapper does not touch the per-app GPU preference (NA-8); the app requests the discrete GPU through its own exports and the candidate's GL_RENDERER is asserted. -NoHighPerformancePreference is accepted and ignored.",
             "A speed gain is quotable only for the host, clip, settings, and run duration captured in this summary.",
             "UltraMagnus RTX 4090 results do not prove Dell laptop support; run this wrapper on the Dell laptop for that claim."
         )
@@ -1610,8 +1580,11 @@ if ($candidateResult.exitCode -ne 0) {
 if ($SeparateCandidateSpeedRun -and $candidateSpeedResult.exitCode -ne 0) {
     $proofFailures += "candidate-speed-smoke-exit-code=$($candidateSpeedResult.exitCode)"
 }
-if (-not $NoHighPerformancePreference -and $gpuPreferenceAfter -ne "GpuPreference=2;") {
-    $proofFailures += "windows-high-performance-gpu-preference-not-set actual=$gpuPreferenceAfter"
+$adapterUsed = @($candidateSummary.glProof.renderers | ForEach-Object { [string]$_ } |
+    Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
+$summary["adapterUsed"] = $adapterUsed
+if (@($adapterUsed | Where-Object { $_ -match "NVIDIA|GeForce|RTX|GTX|Quadro" }).Count -eq 0) {
+    $proofFailures += "candidate-gl-renderer-does-not-name-nvidia actual=[$($adapterUsed -join '; ')]"
 }
 if (-not $baselineSummary.validationOk) {
     $proofFailures += "baseline-validation-not-ok"
