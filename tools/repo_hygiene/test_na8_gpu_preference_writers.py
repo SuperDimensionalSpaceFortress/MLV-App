@@ -47,9 +47,11 @@ SET_VERBS = (
     r"\bCopy-ItemProperty\b",
     r"\bMove-ItemProperty\b",
     r"\bRename-ItemProperty\b",
-    r"\breg(?:\.exe)?\s+(?:add|import|copy|restore|load)\b",
+    # an optional quote after the command name catches the call-operator form: & 'reg.exe' add ...
+    r"\breg(?:\.exe)?[\"']?\s+(?:add|import|copy|restore|load)\b",
     r"\bregedit(?:\.exe)?\b",
-    r"\bSetValue\s*\(",
+    # an optional quote after the member name catches the quoted .NET method form: $key.'SetValue'(...)
+    r"\bSetValue[\"']?\s*\(",
     r"\bSetValueEx\w*\b",
     r"\bRegSetValue\w*\b",
     r"\bRegSetKeyValue\w*\b",
@@ -63,10 +65,10 @@ REMOVE_VERBS = (
     r"\bRemove-Item\b",
     r"\bSet-Item\b",
     r"\bNew-Item\b",
-    r"\breg(?:\.exe)?\s+delete\b",
-    r"\bDeleteValue\s*\(",
-    r"\bDeleteSubKey\w*\s*\(",
-    r"\bCreateSubKey\s*\(",
+    r"\breg(?:\.exe)?[\"']?\s+delete\b",
+    r"\bDeleteValue[\"']?\s*\(",
+    r"\bDeleteSubKey\w*[\"']?\s*\(",
+    r"\bCreateSubKey[\"']?\s*\(",
     r"\bRegDeleteValue\w*\b",
     r"\bRegDeleteKey\w*\b",
     r"\bwinreg\.DeleteValue\b",
@@ -201,6 +203,7 @@ class DetectorTable(unittest.TestCase):
     """The detector must flag these and pass those; otherwise the tree test above could be vacuous."""
 
     KEY = r"HKCU:\Software\Microsoft\DirectX\UserGpuPreferences"
+    KEY_NATIVE = r"HKCU\Software\Microsoft\DirectX" + "\\" + "UserGpuPreferences"
 
     POSITIVE = {
         "new-itemproperty literal": "New-ItemProperty -Path '" + KEY + "' -Name $exe -Value 'GpuPreference=2;' -Force",
@@ -215,7 +218,13 @@ class DetectorTable(unittest.TestCase):
         "new-item key": "New-Item -Path '" + KEY + "' -Force | Out-Null",
         "python winreg": 'k = winreg.CreateKey(winreg.HKEY_CURRENT_USER, r"Software\\Microsoft\\DirectX\\UserGpuPreferences")',
         "cpp api": 'RegSetValueExA(h, exe, 0, REG_SZ, v, n); // "UserGpuPreferences"',
-        "case folded": "new-itemproperty -path 'hkcu:\\software\\microsoft\\directx\\usergpupreferences' -name $e -value x",
+        # built from parts so no literal write command for the real key sits in this file's source as one string
+        "quoted executable, call operator, single quotes": "& '" + "reg" + ".exe' " + "add" + " '" + KEY_NATIVE + "' /v $exe /d 'GpuPreference=2;' /f",
+        "quoted executable, call operator, double quotes": '& "' + "reg" + '" ' + "add" + ' "' + KEY_NATIVE + '" /v $exe /d "GpuPreference=2;" /f',
+        "quoted executable with a full path": "& 'C:\\Windows\\System32\\" + "reg" + ".exe' " + "add" + " '" + KEY_NATIVE + "' /v $exe",
+        "quoted dotnet method, key named earlier in the file": "$k = '" + KEY_NATIVE + "'\n$h = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($k, $true)\n$h.'" + "Set" + "Value'($exe, 'v')",
+        "quoted dotnet method, double quotes, same line": "$h.\"" + "Set" + "Value\"($exe, 'v') # " + KEY_NATIVE,
+        "case folded":"new-itemproperty -path 'hkcu:\\software\\microsoft\\directx\\usergpupreferences' -name $e -value x",
     }
 
     NEGATIVE = {
