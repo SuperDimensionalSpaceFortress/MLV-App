@@ -6100,21 +6100,63 @@ static int dualiso_phase_log_enabled(void)
     return g_dualiso_phase_log_enabled_cache;
 }
 
+/* Orders four row-group levels; returns 1 with the iso_patterns index when the two
+ * brightest groups are cyclically adjacent, and the bright/dark levels either side. */
+static int dualiso_phase_probe_pattern(const double g[4],
+                                       int * implied_pattern,
+                                       double * bright_min,
+                                       double * dark_max)
+{
+    int order[4] = {0, 1, 2, 3};
+    for (int i = 0; i < 4; i++)
+        for (int j = i + 1; j < 4; j++)
+            if (g[order[j]] > g[order[i]]) { int t = order[i]; order[i] = order[j]; order[j] = t; }
+
+    const int b0 = order[0];
+    const int b1 = order[1];
+    /* bright pair must be cyclically adjacent: {0,1},{1,2},{2,3},{3,0} */
+    if (!((((b0 + 1) & 3) == b1) || (((b1 + 1) & 3) == b0))) return 0;
+
+    *bright_min = MIN(g[b0], g[b1]);
+    *dark_max   = MAX(g[order[2]], g[order[3]]);
+
+    int probe_bright[4] = {0, 0, 0, 0};
+    probe_bright[b0] = 1;
+    probe_bright[b1] = 1;
+    static const int probe_patterns[4][4] = {{1,1,0,0},{1,0,0,1},{0,0,1,1},{0,1,1,0}};
+    for (int i = 0; i < 4; i++)
+    {
+        if (probe_bright[0] == probe_patterns[i][0] &&
+            probe_bright[1] == probe_patterns[i][1] &&
+            probe_bright[2] == probe_patterns[i][2] &&
+            probe_bright[3] == probe_patterns[i][3])
+        {
+            *implied_pattern = i;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /* Cheap read-only phase probe: subsampled mod-4 green-pixel row-group means.
  * Returns 1 with *implied_pattern set to the iso_patterns index (0..3) when
  * THIS frame shows a DECISIVE 2-line dual-ISO layout; returns 0 otherwise
  * (low signal / non-cyclic top pair / tiny frame -> caller keeps the cache).
  * Cost ~w*h/64 reads (~48K at 1920x804, well under 0.3ms). Domain note: runs
  * BEFORE the 14->20 bit black/white scaling in both callers, so
- * raw_info.black_level / white_level are the raw 14-bit-domain values. */
+ * raw_info.black_level / white_level are the raw 14-bit-domain values.
+ * *dim_path is set to 1 when the decision came from the dim (relative) path. */
 static int dualiso_phase_probe(struct raw_info raw_info,
                                uint16_t * image_data,
-                               int * implied_pattern)
+                               dualiso_full20bit_scratch_t * scratch,
+                               int * implied_pattern,
+                               int * dim_path)
 {
     const int w = raw_info.width;
     const int h = raw_info.height;
     const int y0 = (raw_info.active_area.y1 + 3) & ~3;   /* same convention as identify */
     const int y_end = h / 4 * 4;
+    *dim_path = 0;
     if (y_end - y0 < 16 || w < 16) return 0;
 
     double sum[4] = {0.0, 0.0, 0.0, 0.0};
@@ -6138,43 +6180,59 @@ static int dualiso_phase_probe(struct raw_info raw_info,
         g[i] = sum[i] / (double)cnt[i] - (double)raw_info.black_level;
     }
 
-    int order[4] = {0, 1, 2, 3};
-    for (int i = 0; i < 4; i++)
-        for (int j = i + 1; j < 4; j++)
-            if (g[order[j]] > g[order[i]]) { int t = order[i]; order[i] = order[j]; order[j] = t; }
-
-    const int b0 = order[0];
-    const int b1 = order[1];
-    /* bright pair must be cyclically adjacent: {0,1},{1,2},{2,3},{3,0} */
-    if (!((((b0 + 1) & 3) == b1) || (((b1 + 1) & 3) == b0))) return 0;
-
-    const double bright_min = MIN(g[b0], g[b1]);
-    const double dark_max   = MAX(g[order[2]], g[order[3]]);
+    int implied = -1;
+    double bright_min = 0.0;
+    double dark_max = 0.0;
     const double margin_floor =
         MAX(16.0, (double)(raw_info.white_level - raw_info.black_level) / 64.0);
+    if (dualiso_phase_probe_pattern(g, &implied, &bright_min, &dark_max)
+        && bright_min - dark_max >= margin_floor)
+    {
+        *implied_pattern = implied;
+        return 1;
+    }
+
     /* DUALISO-PATTERN-FLICKER-CHECK-1: a night frame cannot clear the absolute floor, and
      * on a phase-rotating clip an indecisive probe keeps a cache that is wrong 3 frames in 4.
      * A clear relative separation (bright rows at least twice the dark rows, 16 units apart)
-     * is decisive too; a mismatch still goes to the full detector, which decides. */
-    const int dim_decisive = (bright_min - dark_max >= 16.0) && (bright_min >= 2.0 * MAX(dark_max, 1.0));
-    if (bright_min - dark_max < margin_floor && !dim_decisive) return 0;
+     * is decisive too. That decision uses interquartile means of the same samples, so a
+     * handful of highlights on the probe sites cannot carry it, and the resolver installs a
+     * dim-path mismatch only when the full detector agrees with it. */
+    int * hist = ensure_identify_histograms_scratch(scratch);
+    if (!hist) return 0;
+    memset(hist, 0, 4 * 16384 * sizeof(int));
+    for (int y = y0; y < y_end; y++)
+    {
+        if (((y - y0) >> 2) & 3) continue;
+        const uint16_t * row = image_data + (size_t)y * (size_t)w;
+        for (int x = ((y % 2) ? 0 : 1); x < w; x += 8)
+            hist[(y % 4) * 16384 + (row[x] & 16383)]++;
+    }
 
-    int probe_bright[4] = {0, 0, 0, 0};
-    probe_bright[b0] = 1;
-    probe_bright[b1] = 1;
-    static const int probe_patterns[4][4] = {{1,1,0,0},{1,0,0,1},{0,0,1,1},{0,1,1,0}};
+    double q[4];
     for (int i = 0; i < 4; i++)
     {
-        if (probe_bright[0] == probe_patterns[i][0] &&
-            probe_bright[1] == probe_patterns[i][1] &&
-            probe_bright[2] == probe_patterns[i][2] &&
-            probe_bright[3] == probe_patterns[i][3])
+        const long lo = cnt[i] / 4;
+        const long hi = cnt[i] - cnt[i] / 4;
+        const int * bins = hist + i * 16384;
+        long acc = 0;
+        double total = 0.0;
+        for (int v = 0; v < 16384 && acc < hi; v++)
         {
-            *implied_pattern = i;
-            return 1;
+            const long c = bins[v];
+            const long a = MAX(acc, lo);
+            const long e = MIN(acc + c, hi);
+            if (e > a) total += (double)(e - a) * (double)v;
+            acc += c;
         }
+        q[i] = total / (double)(hi - lo) - (double)raw_info.black_level;
     }
-    return 0;
+
+    if (!dualiso_phase_probe_pattern(q, &implied, &bright_min, &dark_max)) return 0;
+    if (!(bright_min - dark_max >= 16.0 && bright_min >= 2.0 * MAX(dark_max, 1.0))) return 0;
+    *implied_pattern = implied;
+    *dim_path = 1;
+    return 1;
 }
 
 /* Factored pattern resolution shared by diso_get_full20bit and
@@ -6238,8 +6296,9 @@ static int dualiso_resolve_iso_pattern(struct raw_info raw_info,
         if (g_dualiso_full20bit_timing.phase_verify_enabled)
         {
             int implied = -1;
+            int dim_path = 0;
             g_dualiso_full20bit_timing.phase_probe_attempted = 1;
-            if (dualiso_phase_probe(raw_info, image_data, &implied))
+            if (dualiso_phase_probe(raw_info, image_data, scratch, &implied, &dim_path))
             {
                 g_dualiso_full20bit_timing.phase_probe_succeeded = 1;
                 if (implied >= 0)
@@ -6270,8 +6329,9 @@ static int dualiso_resolve_iso_pattern(struct raw_info raw_info,
         if (g_dualiso_full20bit_timing.phase_verify_enabled)
         {
             int implied = -1;
+            int dim_path = 0;
             g_dualiso_full20bit_timing.phase_probe_attempted = 1;
-            if (dualiso_phase_probe(raw_info, image_data, &implied))
+            if (dualiso_phase_probe(raw_info, image_data, scratch, &implied, &dim_path))
             {
                 g_dualiso_full20bit_timing.phase_probe_succeeded = 1;
                 if (implied >= 0)
@@ -6289,9 +6349,12 @@ static int dualiso_resolve_iso_pattern(struct raw_info raw_info,
                                 if (dualiso_phase_log_enabled())
                                 {
                                     fprintf(stderr,
-                                            "[DISO_PHASE] per-frame re-detect: cached=%d implied=%d fresh=%d\n",
-                                            cached_idx, implied, i);
+                                            "[DISO_PHASE] per-frame re-detect: cached=%d implied=%d fresh=%d dim=%d\n",
+                                            cached_idx, implied, i, dim_path);
                                 }
+                                /* a dim-path decision is installed only when the full
+                                 * detector agrees with it; otherwise keep the cache */
+                                if (dim_path && i != implied) break;
                                 memcpy(is_bright, fresh, 4 * sizeof(int));
                                 *iso_pattern = -(i + 1);
                                 g_dualiso_full20bit_timing.phase_probe_redetected = 1;
@@ -6303,7 +6366,7 @@ static int dualiso_resolve_iso_pattern(struct raw_info raw_info,
                             }
                         }
                     }
-                    /* identify failed or non-tabular -> fall through to cache */
+                    /* identify failed, non-tabular or disagrees on the dim path -> fall through to cache */
                 }
             }
         }
