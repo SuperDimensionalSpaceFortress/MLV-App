@@ -474,6 +474,25 @@ private:
          * status and settings, the recon-done signal the done stamp;
          * resetMetadata clears it (fail closed: a slot nobody stamped is refused). */
         Debayered16ReconProvenance reconProvenance;
+        /* PLAYBACK-LJ92-DECODE-THROUGHPUT-1: the raw-uint16 thread-locals drawFrame reports, snapshotted on the
+         * DecodeWorker right after its getMlvRawFrameUint16. drawFrame runs on the render thread, where those
+         * thread-locals read 0 for a frame the worker decoded. resetMetadata clears it. */
+        struct RawUint16DecodeTelemetry
+        {
+            bool valid = false;
+            bool prefetchHit = false;
+            int source = 0;
+            double frameLj92Ms = 0.0;
+            double inflightWaitMs = 0.0;
+            double rawUint16Ms = 0.0;
+            double diskReadMs = 0.0;
+            double decompressMs = 0.0;
+            double decompressPrepareMs = 0.0;
+            double decompressExecuteMs = 0.0;
+            double unpackMs = 0.0;
+            double copyMs = 0.0;
+        };
+        RawUint16DecodeTelemetry rawDecodeTelemetry;
         GpuPlaybackReconTextureState gpuPlaybackReconTextureState;
         int gpuPlaybackReconTextureWidth = 0;
         int gpuPlaybackReconTextureHeight = 0;
@@ -535,6 +554,7 @@ private:
              * metadata before it consumes them. The decode and recon stages
              * own them (both set reducedReconScale every frame). */
             reconProvenance = Debayered16ReconProvenance();
+            rawDecodeTelemetry = RawUint16DecodeTelemetry();
             gpuPlaybackReconTextureState = GpuPlaybackReconTextureState();
             gpuPlaybackReconTextureWidth = 0;
             gpuPlaybackReconTextureHeight = 0;

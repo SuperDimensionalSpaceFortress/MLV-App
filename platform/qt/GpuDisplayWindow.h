@@ -222,6 +222,10 @@ private:
      * clock sample, no state change) when telemetry is disabled or no session is active,
      * mirroring noteRealSwap()'s own gating. */
     void noteSupersededBeforePaint(quint64 supersedingSerial);
+    /* PLAYBACK-VSYNC-DEFAULT-1: records one timed paint-per-submit swapBuffers() call (see
+     * GpuWindowSwapTelemetryCounters::swapCallSamplesMs), gated like noteRealSwap(). Reads
+     * wglGetSwapIntervalEXT once per session, at the first timed swap, context current. */
+    void noteSwapCall(double swapCallMs);
 
     void ensureProgram(void);
     void ensurePreviewProcessingProgram(void);
@@ -279,6 +283,8 @@ private:
     bool m_loggedSetImage;
     bool m_loggedSetGpuTexture;
     QString m_rendererDescription;
+    // PLAYBACK-VSYNC-DEFAULT-1: wglGetSwapIntervalEXT, looked up in initializeGL().
+    QFunctionPointer m_wglGetSwapIntervalExt = nullptr;
 
     // Swap telemetry (see resetSwapTelemetry()/swapTelemetrySnapshot()/noteRealSwap()).
     // The session id/active-state live at file scope in the .cpp, not here -- see the

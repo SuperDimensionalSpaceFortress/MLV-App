@@ -82,9 +82,23 @@ big-studio film look. **Film = Cinematic's tone (the same table, reused) + a col
 There is no new engine stage, no LUT, no hue curve, no toning and no profile change. The selector label is *Film grade*,
 not *Film*: the Profile preset *Film* is a different thing.
 
-The grade in force is **film-v2** (LOOK-ASSIST-FILM-FLAVOR-2). It replaced film-v1 (#319), which the owner found too
-subtle. v2 makes a stronger teal-shadow / warm-highlight split through the same per-channel R, G, B curves, plus a
-gentle black lift and a soft highlight shoulder in the Y curve and a skin-hue guard built into the curve shape.
+The grade in force is **film-v3** (LOOK-ASSIST-FILM-FLAVOR-3). It replaced film-v2 (#328), which replaced film-v1
+(#319). The owner found v1 too subtle, so v2 made a stronger teal-shadow / warm-highlight split through the same
+per-channel R, G, B curves, plus a gentle black lift and a soft highlight shoulder in the Y curve and a skin-hue guard
+built into the curve shape. The owner then found Film warm (2026-10-09). v3 keeps v2's split and Y line and takes out
+its blue-amber lean.
+
+### Why v2 was warm
+
+v2's warm half (peak at 0.52, a 0.3 w tail to 0.85) covered about three quarters of the tonal range and its teal half
+a fifth. On a neutral ramp the lean, mean((R + G) / 2 - B), was +5.9 / 255 amber at Shade: an evenly exposed picture
+went amber by construction (LOOK-ASSIST-WARMTH-MEASURE-1). v3 moves the warm peak down to 0.48, onto M16-1243's
+highlight band (p70..p95, about 0.41..0.585), and drops the upper tail: the split is back to identity at 0.75. The
+upper tail added about 3.2 / 255 of v2's ramp lean and nothing to its split on M16-1243.
+
+**The white balance is not this.** Look Assist's exposure and white-balance solve are flavor-blind and unchanged; the
+amber of the M16-1243 picture common to every flavor is mostly the scene, AgX and the white balance, not Film. That is
+a separate card.
 
 ### Why v1 was subtle
 
@@ -95,58 +109,74 @@ shadow knot, about 6 codes of B-R. v2 moves the knots onto the tonal bands real 
 
 ### The recipe
 
-Control points, display-referred 0..1, per scene strength `s`. With `t = 0.035 s` (teal), `w = 0.045 s` (warm),
+Control points, display-referred 0..1, per scene strength `s`. With `t = 0.038 s` (teal), `w = 0.024 s` (warm),
 `k = 0.15` (G's share, not scaled), `L = 0.020 s` (black lift), `h = 0.010 s` (shoulder), `c = 0.030 s` (white roll):
 
 * Y: (1e-5, L) (0.50, 0.50) (0.80, 0.80 - h) (1, 1 - c). This gives a gentle black lift (about 5 codes at Shade) and
-  a soft shoulder that rolls white to about 0.97.
-* R: (1e-5,1e-5) (0.10, 0.10 - t) (0.20, 0.20) (0.26, 0.26) (0.52, 0.52 + w) (0.85, 0.85 + 0.3 w) (1,1)
-* B: R's mirror, (0.10, 0.10 + t) .. (0.52, 0.52 - w) (0.85, 0.85 - 0.3 w)
-* G: the same x, (0.10, 0.10 + k t) .. (0.52, 0.52 + k w) (0.85, 0.85 + 0.3 k w)
+  a soft shoulder that rolls white to about 0.97. It is v2's line, unchanged.
+* R: (1e-5,1e-5) (0.10, 0.10 - t) (0.20, 0.20) (0.28, 0.28) (0.48, 0.48 + w) (0.75, 0.75) (1,1)
+* B: R's mirror, (0.10, 0.10 + t) .. (0.48, 0.48 - w)
+* G: the same x, (0.10, 0.10 + k t) .. (0.48, 0.48 + k w)
 
-On a neutral, that gives teal shadows (about 205 degrees HSV) and gold-orange highlights (about 35 degrees). The code is
-`kFilmGradeStrength` (the one strength table) and the v2 constants in `src/batch/LookAssistAnalysis.cpp`, read through
-`lookAssistFilmGradeForScene()`. `lookAssistFilmGradationCurve()` writes the receipt's `gradationCurve` string in the
-Curves widget's own format, so a widget round trip is byte-stable. A console test pins this table against the code
-(`LookAssistFlavors.TheDocumentedFilmTableIsTheCodeTable`).
+On a neutral, that gives teal shadows and gold highlights, with 0.20..0.28 neutral and the split back at identity from
+0.75. The code is `kFilmGradeStrength` (the one strength table) and the v3 constants in
+`src/batch/LookAssistAnalysis.cpp`, read through `lookAssistFilmGradeForScene()`. `lookAssistFilmGradationCurve()` writes
+the receipt's `gradationCurve` string in the Curves widget's own format, so a widget round trip is byte-stable. A console
+test pins this table against the code (`LookAssistFlavors.TheDocumentedFilmTableIsTheCodeTable`).
 
 <!-- film-table:begin -->
-| Scene | s | R@0.10 | G@0.10 | B@0.10 | R@0.52 | G@0.52 | B@0.52 | Y@0 | Y@0.80 | Y@1 |
+| Scene | s | R@0.10 | G@0.10 | B@0.10 | R@0.48 | G@0.48 | B@0.48 | Y@0 | Y@0.80 | Y@1 |
 |---|---|---|---|---|---|---|---|---|---|---|
-| Night | 0.5 | 0.0825 | 0.102625 | 0.1175 | 0.5425 | 0.523375 | 0.4975 | 0.01 | 0.795 | 0.985 |
-| ArtificialLights | 0.75 | 0.07375 | 0.1039375 | 0.12625 | 0.55375 | 0.5250625 | 0.48625 | 0.015 | 0.7925 | 0.9775 |
-| Shade | 1.0 | 0.065 | 0.10525 | 0.135 | 0.565 | 0.52675 | 0.475 | 0.02 | 0.79 | 0.97 |
-| BrightSun | 0.9 | 0.0685 | 0.104725 | 0.1315 | 0.5605 | 0.526075 | 0.4795 | 0.018 | 0.791 | 0.973 |
+| Night | 0.5 | 0.081 | 0.10285 | 0.119 | 0.492 | 0.4818 | 0.468 | 0.01 | 0.795 | 0.985 |
+| ArtificialLights | 0.75 | 0.0715 | 0.104275 | 0.1285 | 0.498 | 0.4827 | 0.462 | 0.015 | 0.7925 | 0.9775 |
+| Shade | 1.0 | 0.062 | 0.1057 | 0.138 | 0.504 | 0.4836 | 0.456 | 0.02 | 0.79 | 0.97 |
+| BrightSun | 0.9 | 0.0658 | 0.10513 | 0.1342 | 0.5016 | 0.48324 | 0.4584 | 0.018 | 0.791 | 0.973 |
 <!-- film-table:end -->
 
+**How t and w were chosen (pre-registered, no retune).** The bound and four (t, w) candidates were fixed before any
+table was built: C1 (0.042, 0.024), C2 (0.042, 0.020), C3 (0.038, 0.024), C4 (0.046, 0.027). The first one, in that
+order, that passed every table gate ships. The gates: the neutral-ramp lean within 1.5 / 255 at every scene; on the
+M16-1243 AgX-off Cinematic capture, the histogram-weighted lean and the frame-locked re-grade's lean within 1.5 / 255;
+the re-grade's split at least 0.70x v2's and 2x v1's; dS at most 40 and MAD at most 6; the re-grade's green axis at
+least -1; and the skin and green-axis guards below. C1, C2 and C4 leaned the M16-1243 re-grade blue by 1.89, 2.35 and
+1.98 / 255 (M16-1243's histogram is dark, so it sits on the teal half); C3, at -1.47 / 255, passed every gate.
+
+**Lean, measured** (`look-flavor-diff.py warmcool`, in 8-bit codes). Neutral ramp, v3 / v2: Night +0.32 / +2.89,
+ArtificialLights +0.48 / +4.39, Shade +0.66 / +5.92, BrightSun +0.59 / +5.30 (`FilmV3RampLeanIsNeutral` asserts
+|v3| <= 1.5 at every scene and v2 > 1.5 at Shade). On M16-1243 at Shade: histogram-weighted -0.53 (v2 +2.38) and
+frame-locked re-grade -1.47 (v2 +1.32). The guard for any later grade is `warmcool --max-abs-lean`, which exits 20
+(`WARMCOOL_BOUND_EXCEEDED`) when any of the three leans of any table is beyond the bound; the bound used here is the
+tool's `WC_NEUTRAL_BOUND`.
+
 **Strength, measured.** Through the engine's tables on a neutral 8-bit ramp, the split S (mean B-R over input codes
-[8, 40] minus mean B-R over [85, 140], the #319 trio's tile bands, less the default curve's) is, for v1 / v2:
-Night 3.24 / 14.48, ArtificialLights 4.86 / 21.68, Shade 6.49 / 28.80, BrightSun 5.84 / 25.97. That is about 4.4x at
-every scene (`FilmV2IsMateriallyStrongerThanV1` asserts at least 3x at Shade).
+[8, 40] minus mean B-R over [85, 140], the #319 trio's tile bands, less the default curve's) is, for v1 / v2 / v3:
+Night 3.24 / 14.48 / 12.16, ArtificialLights 4.86 / 21.68 / 18.19, Shade 6.49 / 28.80 / 24.14, BrightSun
+5.84 / 25.97 / 21.77. v3 is about 3.7x v1 and 0.84x v2 at every scene (`FilmV3IsMateriallyStrongerThanV1` asserts at
+least 3x v1 and 0.70x v2 at Shade). On the M16-1243 re-grade, dS is 9.28 / 30.29 / 23.32.
 
 ### The skin-hue guard
 
 The guard is built into the curve shape. There is no hue curve and no extra stage.
 
 * The teal lift ends at 0.20 (v1's ended at 0.45), so the B channel of a dark skin patch (about 0.2) is not lifted.
-* 0.20..0.26 is a neutral zone.
+* 0.20..0.28 is a neutral zone (v2: 0.20..0.26).
 * G takes the share `k`, which partly matches skin's R push.
 
 Measured through the engine's stage (Y then the channel table, hue as `fromRGBtoHSV` computes it, against the default
 curve). The patches are R:G:B = 1:0.72:0.56 at R in {0.35, 0.50, 0.65, 0.80} and 1:0.80:0.68 at R in {0.55, 0.75, 0.90}:
 
-| Scene | dh v2, 1:0.72:0.56 (R 0.35 / 0.50 / 0.65 / 0.80) | dh v2, 1:0.80:0.68 (R 0.55 / 0.75 / 0.90) | largest magenta-ward v2 / v1 |
+| Scene | dh v3, 1:0.72:0.56 (R 0.35 / 0.50 / 0.65 / 0.80) | dh v3, 1:0.80:0.68 (R 0.55 / 0.75 / 0.90) | largest magenta-ward v3 / v2 |
 |---|---|---|---|
-| Night | -0.63 / -1.64 / -0.33 / +1.64 | -0.64 / +2.58 / +3.34 | 1.64 / 2.23 |
-| ArtificialLights | -0.88 / -2.35 / -0.46 / +2.37 | -0.87 / +3.63 / +4.83 | 2.35 / 3.39 |
-| Shade | -1.08 / -3.01 / -0.57 / +3.06 | -1.05 / +4.55 / +6.21 | 3.01 / 4.74 |
-| BrightSun | -1.00 / -2.76 / -0.53 / +2.79 | -0.98 / +4.20 / +5.67 | 2.76 / 4.13 |
+| Night | -0.39 / -1.02 / +0.23 / +1.56 | -0.18 / +2.29 / +1.74 | 1.02 / 1.64 |
+| ArtificialLights | -0.49 / -1.51 / +0.35 / +2.32 | -0.25 / +3.36 / +2.62 | 1.51 / 2.35 |
+| Shade | -0.53 / -1.97 / +0.47 / +3.08 | -0.29 / +4.38 / +3.53 | 1.97 / 3.01 |
+| BrightSun | -0.52 / -1.79 / +0.42 / +2.78 | -0.27 / +3.98 / +3.17 | 1.79 / 2.76 |
 
-Every graded skin hue stays in [18.8, 28.7] degrees. No patch moves more than 3.01 degrees toward magenta (dh < 0),
-and at every scene v2's largest magenta-ward move is smaller than v1's: the split is stronger, with less pinking. Bright,
-light skin yellows by up to about 6 degrees at Shade. `FilmV2SkinPatchesKeepTheirHue` asserts hue in [12, 32], a
-magenta-ward move of at most 3.5, and v2 <= v1 at Shade. These numbers hold for these patches through the gradation
-stage alone; they say nothing about other inputs.
+Every graded skin hue stays in [19.8, 26.9] degrees. No patch moves more than 1.97 degrees toward magenta (dh < 0),
+and at every scene v3's largest magenta-ward move is smaller than v2's (and so than v1's). Light skin yellows by up to
+about 4.4 degrees at Shade (v2: 6.2). `FilmV3SkinPatchesKeepTheirHue` asserts hue in [12, 32], a magenta-ward move of
+at most 3.5, and v3 <= v2 at Shade. These numbers hold for these patches through the gradation stage alone; they say
+nothing about other inputs.
 
 ### What it does to the green-magenta axis
 
@@ -154,24 +184,24 @@ R and B move by equal and opposite amounts at every knot, and the engine's splin
 `src/processing/interpolation/spline_helper.cpp`) is linear in y. So `gcurve_r[v] + gcurve_b[v] == 2 * default[v]` to
 within one table step on every entry the stage can reach. The engine's 0.0001 floor clamps R's dip on a few entries
 below `Y[0]`, which the Y line never indexes. G takes `k` of each offset; between knots the natural spline dips it
-below the default by at most 26 table steps (0.1 of an 8-bit code, at Shade, near 0.22).
+below the default by at most 42 table steps (0.16 of an 8-bit code, at Shade, near 0.23).
 
 A pixel's green-magenta move through the stage is `dG(g) - (dR(r) + dB(b)) / 2`. Each term depends on one channel
 only, so the tables bound it for every pixel. All numbers are in 8-bit codes, measured by
-`FilmV2NeutralLeansGreenNeverMagenta`:
+`FilmV3NeutralLeansGreenNeverMagenta`:
 
 * **Neutral (R = G = B):** the move is G's share, so a neutral leans **toward green, never toward magenta**: every
-  grey level stays within [-0.05, +0.89] Night, [-0.08, +1.34] ArtificialLights, [-0.10, +1.78] Shade and
-  [-0.10, +1.60] BrightSun. The test asserts [-0.5, +2.5], with the lean at least 60% of `k w`.
-* **Any pixel at all:** [-10.1, +7.8] Night, [-15.1, +11.7] ArtificialLights, [-20.1, +15.7] Shade and
-  [-18.1, +14.1] BrightSun. The extremes need channels sitting on opposite ends of the tone line, for example G near
+  grey level stays within [-0.08, +0.73] Night, [-0.13, +1.10] ArtificialLights, [-0.17, +1.47] Shade and
+  [-0.15, +1.32] BrightSun. The test asserts [-0.5, +2.5], with the lean at least 60% of `k w`.
+* **Any pixel at all:** [-8.9, +6.7] Night, [-13.4, +10.0] ArtificialLights, [-17.9, +13.4] Shade and
+  [-16.1, +12.1] BrightSun. The extremes need channels sitting on opposite ends of the tone line, for example G near
   white with R and B in the lifted shadows. Most of the bound is the Y line alone, which, like any tone curve, moves
   chroma: Film's Y line with default R, G, B gives ±6.4 / ±9.6 / ±12.7 / ±11.5. The test pins the bound below
-  [-10.2, +8.0], [-15.2, +11.9], [-20.3, +15.8] and [-18.3, +14.2].
-* **#319's coloured set, at Shade:** amber (0.72, 0.45, 0.18) -3.82 and sodium (0.90, 0.50, 0.10) -3.21 move toward
-  magenta. Teal (0.18, 0.45, 0.72) +5.73, sky (0.30, 0.55, 0.85) +4.26 and cyan (0.10, 0.50, 0.90) +7.48 move toward
-  green, and skin (0.80, 0.55, 0.35) moves +0.51, also toward green (v1 moved skin toward magenta). The other scenes
-  scale with `s`, and the test pins each direction at every scene.
+  [-9.0, +6.7], [-13.4, +10.1], [-17.9, +13.5] and [-16.1, +12.1].
+* **#319's coloured set, at Shade:** amber (0.72, 0.45, 0.18) -0.40 and sodium (0.90, 0.50, 0.10) -2.51 move toward
+  magenta. Teal (0.18, 0.45, 0.72) +1.27, sky (0.30, 0.55, 0.85) +1.00 and cyan (0.10, 0.50, 0.90) +5.32 move toward
+  green, and skin (0.80, 0.55, 0.35) moves +2.27, also toward green (v1 moved skin toward magenta). Each direction is
+  v2's; the other scenes scale with `s`, and the test pins each direction at every scene.
 
 The card's no-magenta tolerance is judged on the **venue picture mean** (over the mid-luma band of real footage), plus
 an eyeball check for any magenta, purple, mauve, mint or olive cast. It is not judged per saturated pixel.
@@ -193,11 +223,12 @@ baseline does the same first. Switching Look Assist off, or re-running as Classi
 trace of the grade.
 
 The curve goes back only while Film still **owns** it (`lookAssistFilmOwnsGradationCurve`): while it is, point for
-point (within 1e-6), a curve Film lays for one of the scenes. That covers the v2 curves and the **legacy v1 curves**
-(8 curves in all). A receipt saved under #319 with a v1 curve is still put back by Look Assist off, and a Film re-run
-over it lays v2 (`AV1LaidCurveIsStillRestoredByLookAssistOff`, `AV1ReceiptReRunAsFilmLaysV2`). The v1 builder,
-`lookAssistFilmGradationCurveV1()`, is kept byte for byte for that reason and for the frame-locked comparison below. It
-is not selectable anywhere.
+point (within 1e-6), a curve Film lays for one of the scenes. That covers the v3 curves and the **legacy v2 and v1
+curves** (12 curves in all). A receipt saved under #328 with a v2 curve, or under #319 with a v1 curve, is still put
+back by Look Assist off, and a Film re-run over it lays v3 (`AV2LaidCurveIsStillRestoredByLookAssistOff`,
+`AV2ReceiptReRunAsFilmLaysV3`, `AV1LaidCurveIsStillRestoredByLookAssistOff`, `AV1ReceiptReRunAsFilmLaysV3`). The v2 and
+v1 builders, `lookAssistFilmGradationCurveV2()` and `lookAssistFilmGradationCurveV1()`, are kept byte for byte for that
+reason and for the frame-locked comparison below. Neither is selectable anywhere.
 
 If the user edited the laid curve (say, added a Y point), the edit is the user's curve. The restore keeps it and still
 clears the element, which retires Film's ownership, and a later Film run reports `grade=skipped_user_curve` over it.
@@ -205,16 +236,19 @@ The GUI judges ownership on the curve the widget shows, headless on the receipt'
 by construction, as for Cinematic. Headless batch exports CDNG (raw), so the grade never reaches a CDNG; headless only
 keeps the receipt consistent.
 
-### Frame-locked v1 / v2 comparison
+### Frame-locked v1 / v2 / v3 comparison
 
 On CPU, the venue's flavor legs present different frames at a tile, so a v1 column from another run is not
 like-for-like. Instead, `LookAssistFilmGrade.DumpTablesWhenAsked` (pipeline tests, only when
-`MLVAPP_FILM_TABLE_DUMP_DIR` is set) writes the engine-built tables of v1 and v2 for every scene. Each table is
-`film-<v1|v2>-<scene>.u16`, 4 x 65536 uint16 LE, in Y, R, G, B order.
+`MLVAPP_FILM_TABLE_DUMP_DIR` is set) writes the engine-built tables of v1, v2 and v3 for every scene, and of the four
+pre-registered v3 candidates (with their C++ table gates printed). Each table is `film-<v1|v2|v3>-<scene>.u16` (or
+`film-v3-<C1..C4>-<scene>.u16`), 4 x 65536 uint16 LE, in Y, R, G, B order.
 
-`tools/profiling/look-flavor-diff.py regrade` lays both over ONE Cinematic capture. For each 8-bit value `c` it
+`tools/profiling/look-flavor-diff.py regrade` lays them over ONE Cinematic capture. For each 8-bit value `c` it
 computes `T_ch[T_Y[c * 257]]` and divides by 257, rounding, and writes a Cinematic | v1 re-grade | v2 re-grade strip
-plus `regrade-metrics.json` with S, GA and MAD per tile. Gradation is the last stage before AgX, LUT and filter, so the
+plus `regrade-metrics.json` with S, GA and MAD per tile. With `--v3-table` it adds a v3 column (four 960 px columns,
+`regrade-cinematic-v1-v2-v3.png`), the v3 metrics, `dSRatioV3OverV2` and the warm-cool lean change `dLean` of each
+re-grade; without it the outputs are byte-identical to before. Gradation is the last stage before AgX, LUT and filter, so the
 re-grade is the engine's picture only when the Cinematic render had all three **off**; otherwise the tool refuses
 (`REGRADE_INVALID`). The app's default receipt has AgX on (`ReceiptSettings`), so a venue capture without a receipt is
 invalid for this. `--illustrative` still composes an eyeball-only strip, marked `valid=false`.
@@ -248,7 +282,7 @@ The flavor applied is always reported, appended to the end of the existing lines
 * GUI `look_assist.apply.result`: `... next_serial=<n> <decision trace fields> flavor=<classic|cinematic|film>` (the trace is LOOK-ASSIST-DIAG-LOGGING-1's, `has_ev100=` .. `playback_scale=`; flavor comes after it).
 * GUI `look_assist.apply.async_dispatch`: `... floor_lifted=<0|1> flavor=<...>`.
 * Headless `[BATCH] LOOK_ASSIST applied ...`: `... initialPatchFinalChroma=<x> <decision trace fields> flavor=<...>`.
-* On those three lines a Film apply appends ` grade=<film-v2|skipped_user_curve|none>` after `flavor=`; Classic and
+* On those three lines a Film apply appends ` grade=<film-v3|skipped_user_curve|none>` after `flavor=`; Classic and
   Cinematic lines carry no `grade=` field (they stay byte-identical), and a reader takes its absence as `none`. The
   venue's GUI-smoke result carries it as `visualQuality.lookAssist.presetGrade`.
 * `gui_smoke.visual_state`: `... gpu_preview_processing_reject_reason=<r> look_assist_flavor=<...|none>`. It
@@ -286,18 +320,20 @@ The flavor applied is always reported, appended to the end of the existing lines
   environment. With `MLVAPP_FLAVOR_SHEET_DIR` set, `LookAssistFlavorsFixture.ContactSheets` writes raw | classic |
   cinematic renders of the tracked fixtures (fixture renders only) for model judging. A Film column there was
   deferred (not shipped); Film's fixture picture is covered by `FilmIsADifferentGradedPictureFromCinematic` instead.
-* Film grade (film-v2): the documented table is the code's and Film's tone is Cinematic's; the selector accepts `film`;
+* Film grade (film-v3): the documented table is the code's and Film's tone is Cinematic's; the selector accepts `film`;
   the curve built through `processingSetGCurve` keeps `|r + b - 2 default| <= 2` on every reachable entry, G never a
-  whole code below the default, and Y the lift / shoulder line (`FilmV2CurveIsTealGoldWithANeutralLean`); a neutral
-  leans toward green, never magenta, and every pixel moves within the documented bound
-  (`FilmV2NeutralLeansGreenNeverMagenta`); v2's split is at least 3x v1's (`FilmV2IsMateriallyStrongerThanV1`); skin
-  keeps its hue (`FilmV2SkinPatchesKeepTheirHue`); blacks lift and whites roll, every table monotonic
-  (`FilmV2LiftsBlacksAndRollsWhites`); the v2 tables and the legacy v1 tables are pinned by sha256 and sampled values
-  (`FilmCurveIsPinned`, `FilmV1CurveIsPinned`); a v1 curve on an old receipt is still Film's own
-  (`AV1LaidCurveIsStillRestoredByLookAssistOff`, `AV1ReceiptReRunAsFilmLaysV2`); a user curve is kept and reported; the baseline
+  whole code below the default, and Y the lift / shoulder line (`FilmV3CurveIsTealGoldWithANeutralLean`); the neutral
+  ramp's blue-amber lean is within 1.5 / 255 at every scene (`FilmV3RampLeanIsNeutral`); v3, v2 and v1 are three
+  different curves (`FilmV3IsNotV2`); a neutral leans toward green, never magenta, and every pixel moves within the
+  documented bound (`FilmV3NeutralLeansGreenNeverMagenta`); v3's split is at least 3x v1's and 0.70x v2's
+  (`FilmV3IsMateriallyStrongerThanV1`); skin keeps its hue (`FilmV3SkinPatchesKeepTheirHue`); blacks lift and whites
+  roll, every table monotonic (`FilmV3LiftsBlacksAndRollsWhites`); the v3 tables and the legacy v2 and v1 tables are
+  pinned by sha256 and sampled values (`FilmCurveIsPinned`, `FilmV2CurveIsPinned`, `FilmV1CurveIsPinned`); a v2 or v1
+  curve on an old receipt is still Film's own (`AV2LaidCurveIsStillRestoredByLookAssistOff`, `AV2ReceiptReRunAsFilmLaysV3`,
+  `AV1LaidCurveIsStillRestoredByLookAssistOff`, `AV1ReceiptReRunAsFilmLaysV3`); a user curve is kept and reported; the baseline
   round trip leaves a re-run-as-Classic receipt identical to a Classic-only one; a user's edit of the laid curve
   survives a Classic re-run and Look Assist off, with the element gone (`AUserEditOfTheFilmCurveIsKeptAndRetiresFilmsOwnership`,
   `AUserEditAfterTheFilmGradeIsKeptByAClassicReRunAndByLookAssistOff`); Look Assist off changes nothing;
   the white balance is Classic's on the fixtures; the CUDA display shader and the CPU direct8 route both take the
   Film curves, Y line included (`EngineAnchoredLookAssistFlavorsMatchEngineWithReceiptSCurve`, cases
-  `look_assist_film_v2_night_real_frame` and `look_assist_film_v2_shade_real_frame`).
+  `look_assist_film_v3_night_real_frame` and `look_assist_film_v3_shade_real_frame`).

@@ -393,6 +393,16 @@ double getMlvLastRawUint16Lj92Pred1FastPathPredictorMilliseconds(void);
 double getMlvLastRawUint16UnpackMilliseconds(void);
 double getMlvLastRawUint16CopyMilliseconds(void);
 int getMlvLastRawUint16PrefetchHit(void);
+/* PLAYBACK-LJ92-DECODE-THROUGHPUT-1: how the caller's last getMlvRawFrameUint16 got its frame (thread-local to the
+ * caller), the LJ92 ms that produced the frame (on whichever thread decoded it) and the in-flight wait ms. */
+#define MLV_RAW_UINT16_SOURCE_NONE 0
+#define MLV_RAW_UINT16_SOURCE_HIT 1
+#define MLV_RAW_UINT16_SOURCE_INFLIGHT_WAIT_HIT 2
+#define MLV_RAW_UINT16_SOURCE_DIRECT 3
+int getMlvLastRawUint16Source(void);
+const char * mlvRawUint16SourceName(int source);
+double getMlvLastRawUint16FrameLj92Milliseconds(void);
+double getMlvLastRawUint16InflightWaitMilliseconds(void);
 uint32_t mlvRawUint16PrefetchLookaheadForTesting(const mlvObject_t * video);
 int mlvRawUint16PrefetchAllowedForTesting(const mlvObject_t * video);
 /* Parks the prefetch worker after it claims a slot, before it decodes into it (process-wide). */
@@ -400,6 +410,23 @@ void mlvSetRawUint16PrefetchHoldBeforeDecodeForTesting(int enabled);
 int mlvWaitForRawUint16PrefetchHeldBeforeDecodeForTesting(uint32_t timeout_ms);
 int mlvWaitForRawUint16PrefetchIdleForTesting(mlvObject_t * video, uint32_t timeout_ms);
 uint64_t getMlvRawUint16PrefetchDecodeFailures(mlvObject_t * video);
+/* PLAYBACK-LJ92-DECODE-THROUGHPUT-1: object-scoped prefetch counters (any thread). */
+void getMlvRawUint16PrefetchStats(mlvObject_t * video, mlvRawUint16PrefetchStats_t * stats);
+void mlvResetRawUint16PrefetchStats(mlvObject_t * video);
+/* Test hooks. k < 0 clears the override (the env knob decides), k = 0 turns prefetch off (every read decodes on the
+ * caller), k > 0 is the decoder count. Call it before the request that starts an object's decoders. */
+void mlvSetRawUint16PrefetchDecodersForTesting(int k);
+int mlvRawUint16PrefetchDecodersFromEnvValueForTesting(const char * value);
+/* Fills frames (ascending) with the frames claimed by prefetch workers (foreground = 0) or by foreground readers
+ * (foreground = 1); returns the claim count. */
+int mlvRawUint16PrefetchClaimsForTesting(mlvObject_t * video, int foreground, uint64_t * frames, int capacity);
+int mlvRawUint16PrefetchHeldCountForTesting(void);
+/* Parks a foreground reader's miss path right before its own decode (process-wide). */
+void mlvSetRawUint16ForegroundHoldBeforeDecodeForTesting(int enabled);
+int mlvRawUint16ForegroundHeldCountForTesting(void);
+/* Per-frame count of getMlvRawFrameUint16Direct calls; counts only while enabled. Resetting clears every count. */
+void mlvResetRawUint16DecodeCountsForTesting(int enabled);
+uint32_t mlvRawUint16DecodeCountForTesting(uint64_t frameIndex);
 double getMlvLastLlrawprocMilliseconds(void);
 double getMlvLastRawFloatConvertMilliseconds(void);
 double getMlvLastDebayeredFrameMilliseconds(void);

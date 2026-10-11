@@ -10,6 +10,7 @@
 #include "CrashForensics.h"
 #include "Phase3Mode.h"
 #include "PlaybackFrameRange.h"
+#include "PlaybackSwapInterval.h"
 #include "AutomationSettings.h"
 #include "../../src/batch/BatchContext.h"
 #include "../../src/batch/BatchRunner.h"
@@ -1803,7 +1804,7 @@ int main(int argc, char *argv[])
     if (abAlpha || viewportAbEnvFlag("MLVAPP_VIEWPORT_AB_DEFAULTFORMAT"))
     {
         QSurfaceFormat abFormat = QSurfaceFormat::defaultFormat();
-        abFormat.setSwapInterval(0);
+        abFormat.setSwapInterval(playbackSwapInterval());
         const QByteArray swap = qgetenv("MLVAPP_VIEWPORT_AB_SWAP").trimmed().toLower();
         if (swap == "single") abFormat.setSwapBehavior(QSurfaceFormat::SingleBuffer);
         else if (swap == "triple") abFormat.setSwapBehavior(QSurfaceFormat::TripleBuffer);
@@ -1817,7 +1818,8 @@ int main(int argc, char *argv[])
         QSurfaceFormat::setDefaultFormat(abFormat);
         qInfo().nospace() << "viewport_ab: global default QSurfaceFormat set before "
                              "QApplication (alpha=" << (abAlpha ? 1 : 0)
-                          << ", swap=" << swap.constData() << ", swapInterval 0).";
+                          << ", swap=" << swap.constData() << ", swapInterval "
+                          << playbackSwapInterval() << ").";
     }
     if (abNoShareContexts)
     {

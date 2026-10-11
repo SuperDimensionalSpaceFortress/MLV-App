@@ -2055,12 +2055,28 @@ void RenderFrameThread::decodeFrameForWorker( const DecodeQueueEntry &entry )
     slot.reconProvenance.acquisitionSucceeded = false;
     slot.reconProvenance.settingsAtDecode =
         m_pMlvObject ? getMlvLlrawprocSettingsFingerprint( m_pMlvObject ) : 0;
+    slot.rawDecodeTelemetry = FrameSlot::RawUint16DecodeTelemetry();
     if( rawPixelCount > 0 && m_pMlvObject )
     {
+        const double rawStart = mlv_stage_timing_now();
         slot.reconProvenance.acquisitionSucceeded =
             getMlvRawFrameUint16( m_pMlvObject,
                                   entry.request.frameNumber,
                                   slot.rawImage16.data() ) == 0;
+        /* PLAYBACK-LJ92-DECODE-THROUGHPUT-1: these thread-locals live on THIS thread; drawFrame reads the snapshot. */
+        FrameSlot::RawUint16DecodeTelemetry &raw = slot.rawDecodeTelemetry;
+        raw.valid = true;
+        raw.rawUint16Ms = ( mlv_stage_timing_now() - rawStart ) * 1000.0;
+        raw.prefetchHit = getMlvLastRawUint16PrefetchHit() != 0;
+        raw.source = getMlvLastRawUint16Source();
+        raw.frameLj92Ms = getMlvLastRawUint16FrameLj92Milliseconds();
+        raw.inflightWaitMs = getMlvLastRawUint16InflightWaitMilliseconds();
+        raw.diskReadMs = getMlvLastRawUint16DiskReadMilliseconds();
+        raw.decompressMs = getMlvLastRawUint16DecompressMilliseconds();
+        raw.decompressPrepareMs = getMlvLastRawUint16DecompressPrepareMilliseconds();
+        raw.decompressExecuteMs = getMlvLastRawUint16DecompressExecuteMilliseconds();
+        raw.unpackMs = getMlvLastRawUint16UnpackMilliseconds();
+        raw.copyMs = getMlvLastRawUint16CopyMilliseconds();
     }
     const double decodeEndStageTime = mlv_stage_timing_now();
     if( playbackSmokeTimelineTelemetryEnabled() )
@@ -3808,6 +3824,10 @@ void RenderFrameThread::drawFrame( int slotIndex,
     const uint32_t reconQueuedFrameNumber = slot.queuedRequest.frameNumber;
     const uint64_t reconQueuedRequestSerial = slot.queuedRequest.requestSerial;
     const Debayered16ReconProvenance reconProvenance = slot.reconProvenance;
+    /* PLAYBACK-LJ92-DECODE-THROUGHPUT-1: a frame the DecodeWorker decoded reports the worker's snapshot; the
+     * render-thread thread-locals describe it only when this thread decoded the frame itself (runSerial). */
+    const FrameSlot::RawUint16DecodeTelemetry workerRawTelemetry =
+        decodedRawFrame ? slot.rawDecodeTelemetry : FrameSlot::RawUint16DecodeTelemetry();
     slot.resetMetadata();
     const double prologueAfterResetMetadataStageTime =
         detailedTimelineTelemetry ? mlv_stage_timing_now() : 0.0;
@@ -5853,13 +5873,23 @@ void RenderFrameThread::drawFrame( int slotIndex,
                                           0.0 );
     }
 
-    const double rawUint16Ms = getMlvLastRawUint16Milliseconds();
-    const double rawUint16DiskReadMs = getMlvLastRawUint16DiskReadMilliseconds();
-    const double rawUint16DecompressMs = getMlvLastRawUint16DecompressMilliseconds();
-    const double rawUint16DecompressPrepareMs =
-        getMlvLastRawUint16DecompressPrepareMilliseconds();
-    const double rawUint16DecompressExecuteMs =
-        getMlvLastRawUint16DecompressExecuteMilliseconds();
+    const bool rawFromWorker = workerRawTelemetry.valid;
+    /* The render thread's own raw_uint16 ms is what its debayered-frame total contains. */
+    const double renderThreadRawUint16Ms = getMlvLastRawUint16Milliseconds();
+    const double rawUint16Ms = rawFromWorker ? workerRawTelemetry.rawUint16Ms : renderThreadRawUint16Ms;
+    const double rawUint16DiskReadMs = rawFromWorker
+        ? workerRawTelemetry.diskReadMs : getMlvLastRawUint16DiskReadMilliseconds();
+    const double rawUint16DecompressMs = rawFromWorker
+        ? workerRawTelemetry.decompressMs : getMlvLastRawUint16DecompressMilliseconds();
+    const double rawUint16DecompressPrepareMs = rawFromWorker
+        ? workerRawTelemetry.decompressPrepareMs : getMlvLastRawUint16DecompressPrepareMilliseconds();
+    const double rawUint16DecompressExecuteMs = rawFromWorker
+        ? workerRawTelemetry.decompressExecuteMs : getMlvLastRawUint16DecompressExecuteMilliseconds();
+    const int rawUint16Source = rawFromWorker ? workerRawTelemetry.source : getMlvLastRawUint16Source();
+    const double rawUint16FrameLj92Ms = rawFromWorker
+        ? workerRawTelemetry.frameLj92Ms : getMlvLastRawUint16FrameLj92Milliseconds();
+    const double rawUint16InflightWaitMs = rawFromWorker
+        ? workerRawTelemetry.inflightWaitMs : getMlvLastRawUint16InflightWaitMilliseconds();
     const int rawUint16Lj92Pred6SplitActive =
         getMlvLastRawUint16Lj92Pred6SplitActive();
     const int rawUint16Lj92Pred6SplitRequested =
@@ -5908,9 +5938,12 @@ void RenderFrameThread::drawFrame( int slotIndex,
         getMlvLastRawUint16Lj92Pred1FastPathBitstreamMilliseconds();
     const double rawUint16Lj92Pred1FastPathPredictorMs =
         getMlvLastRawUint16Lj92Pred1FastPathPredictorMilliseconds();
-    const double rawUint16UnpackMs = getMlvLastRawUint16UnpackMilliseconds();
-    const double rawUint16CopyMs = getMlvLastRawUint16CopyMilliseconds();
-    const int rawUint16PrefetchHit = getMlvLastRawUint16PrefetchHit();
+    const double rawUint16UnpackMs = rawFromWorker
+        ? workerRawTelemetry.unpackMs : getMlvLastRawUint16UnpackMilliseconds();
+    const double rawUint16CopyMs = rawFromWorker
+        ? workerRawTelemetry.copyMs : getMlvLastRawUint16CopyMilliseconds();
+    const int rawUint16PrefetchHit = rawFromWorker
+        ? ( workerRawTelemetry.prefetchHit ? 1 : 0 ) : getMlvLastRawUint16PrefetchHit();
     const quint64 rawUint16PrefetchDecodeFailures =
         static_cast<quint64>( getMlvRawUint16PrefetchDecodeFailures( m_pMlvObject ) );
     const double llrawprocMs = getMlvLastLlrawprocMilliseconds();
@@ -5943,7 +5976,7 @@ void RenderFrameThread::drawFrame( int slotIndex,
     const double debayerWbUndoMs = getMlvLastDebayerWbUndoMilliseconds();
     const double debayerExclusiveMs = qMax( 0.0,
                                             getMlvLastDebayeredFrameMilliseconds()
-                                                - rawUint16Ms
+                                                - renderThreadRawUint16Ms
                                                 - llrawprocMs );
     const double debayerKnownMs =
         rawFloatConvertMs +
@@ -6148,6 +6181,12 @@ void RenderFrameThread::drawFrame( int slotIndex,
                                       rawUint16CopyMs );
     slot.stageTimingTelemetry.insert( QStringLiteral("raw_uint16_prefetch_hit"),
                                       rawUint16PrefetchHit != 0 );
+    slot.stageTimingTelemetry.insert( QStringLiteral("raw_uint16_source"),
+                                      QString::fromLatin1( mlvRawUint16SourceName( rawUint16Source ) ) );
+    slot.stageTimingTelemetry.insert( QStringLiteral("raw_uint16_frame_lj92_ms"),
+                                      rawUint16FrameLj92Ms );
+    slot.stageTimingTelemetry.insert( QStringLiteral("raw_uint16_inflight_wait_ms"),
+                                      rawUint16InflightWaitMs );
     slot.stageTimingTelemetry.insert( QStringLiteral("raw_uint16_prefetch_decode_failures"),
                                       static_cast<qint64>( rawUint16PrefetchDecodeFailures ) );
     slot.stageTimingTelemetry.insert( QStringLiteral("raw_uint16_other_ms"),

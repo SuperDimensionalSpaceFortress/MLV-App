@@ -352,6 +352,11 @@ param(
     # app as MLVAPP_PLAYBACK_RENDER_LOOKAHEAD_FRAMES, the lookahead A/B). -1 sets nothing, so every other job is unchanged.
     [ValidateRange(-1, 3)][int]$PlaybackRenderLookaheadFrames = -1,
 
+    # PLAYBACK-LJ92-DECODE-THROUGHPUT-1: the raw-uint16 prefetch decoder count for the K A/B on ONE exe. 0 passes
+    # MLVAPP_DISABLE_RAW_UINT16_PREFETCH=1 (no prefetch), 1..4 passes MLVAPP_RAW_UINT16_PREFETCH_DECODERS=<k>. -1 sets
+    # nothing, so every other job is the text it was.
+    [ValidateRange(-1, 4)][int]$RawPrefetchDecoders = -1,
+
     # LOOK-ASSIST-FILM-FLAVOR-2 r2: a LOOK leg's receipt file (Invoke-VenueLeg writes the bytes COMMITTED for the leg spec's look.receipt). The job
     # embeds it base64 with its sha256, writes it into its work dir, re-verifies the hash and passes it to the smoke runner as -Receipt, so the app
     # applies it before playback. Only with -ForceLookAssist -ContactSheet. Empty (the default) adds nothing: the job is the text it was before.
@@ -372,7 +377,11 @@ param(
     # (a normal maximized window with chrome; PR #248) to the smoke runner's -AdditionalArgs. 'fullscreen' (the default) adds nothing: the emitted job is the
     # text it was before this parameter (the windowed statements are added to the expanded text below, only for a windowed leg).
     [ValidateSet('fullscreen', 'windowed')]
-    [string]$DisplayMode = 'fullscreen'
+    [string]$DisplayMode = 'fullscreen',
+
+    # PLAYBACK-VSYNC-DEFAULT-1: the GL swap interval every playback surface requests (passed to the app as MLVAPP_SWAP_INTERVAL, the
+    # vsync A/B), any leg type. -1 (the default) sets nothing: the emitted job is the text it was before this parameter.
+    [ValidateRange(-1, 1)][int]$SwapInterval = -1
 )
 
 $ErrorActionPreference = 'Stop'
@@ -1033,6 +1042,24 @@ $Stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $JobId = "playback-attr-3-cuda-$($SourceCommit.Substring(0,12))-$ClipId-$Stamp"
 $Work = Join-Path '__SCRATCH_ROOT__' $JobId
 $Pub = Join-Path $Root "outbox\$JobId.artifacts"
+# ATTR3-ROOT-GUARD-BEFORE-LOCK-READ-1: every job-owned path guard runs and refuses (throw, exit 1) BEFORE
+# any host-state read. This job's first host-state read is Start-AttrCudaDisplayWake's session-lock probe
+# (the console-lock read, below); when that probe answered locked or unknown the leg exited 30
+# (SESSION_LOCKED_OWNER_ONLY) and even created $Root\outbox for the refusal, for a $Root the guard would
+# have refused -- so the verdict for an outside root depended on the machine's session state (hosted
+# runner: test_the_default_agent_root_guard_still_refuses_a_root_outside_mlvtmp read 30, not 1).
+# A valid root is unaffected: the lock probe and its exit 30 are unchanged, just reached after this.
+function Assert-UnderMlvTmp([string]$Path, [string]$Label) {
+    $full = [IO.Path]::GetFullPath($Path)
+    if ($full -ne '__SCRATCH_ROOT__' -and $full -notlike '__SCRATCH_ROOT__\*') {
+        throw "job-owned path '$Label' resolves outside __SCRATCH_ROOT__: $full"
+    }
+}
+foreach ($check in @(
+    @{ path = $Root; label = 'Root' },
+    @{ path = $Work; label = 'Work' },
+    @{ path = $Pub; label = 'Pub' }
+)) { Assert-UnderMlvTmp $check.path $check.label }
 # BACHELOR-OWNER-CLIP-STAGE-STALL-1: every pre-launch step appends a timestamped line here as it
 # starts and ends, flushed immediately, so a job the agent kills at its cap (which returns NO
 # stdout) still leaves the last step it reached. Fetch it with attr3-trace-fetch-job.ps1.
@@ -1186,17 +1213,9 @@ $displayWake['keepAliveSetupError'] = $displayWakeKeepAlive.setupError
 # Mirrors tools/profiling/bachelor/playback-attr-3-cuda-assemble.ps1's $Scratch
 # pattern. $Work is created here (not later) precisely so the scratch dir it hosts is
 # never wiped out from under a live $env:TEMP by a later "recreate $Work" step.
-function Assert-UnderMlvTmp([string]$Path, [string]$Label) {
-    $full = [IO.Path]::GetFullPath($Path)
-    if ($full -ne '__SCRATCH_ROOT__' -and $full -notlike '__SCRATCH_ROOT__\*') {
-        throw "job-owned path '$Label' resolves outside __SCRATCH_ROOT__: $full"
-    }
-}
-foreach ($check in @(
-    @{ path = $Root; label = 'Root' },
-    @{ path = $Work; label = 'Work' },
-    @{ path = $Pub; label = 'Pub' }
-)) { Assert-UnderMlvTmp $check.path $check.label }
+# ATTR3-ROOT-GUARD-BEFORE-LOCK-READ-1: Assert-UnderMlvTmp on Root/Work/Pub now runs right after
+# $Pub is named, before the first trace line, the display wake and the session-lock probe (see the
+# guard where $Pub is defined above); it used to sit here, after the lock refusal's exit 30.
 
 # OWNER-FOOTAGE-NO-HARDLINK-1: an earlier run of this job that was killed before its `finally` leaves
 # view entries (symbolic links or copies) under $Work\owner-clip. Each is removed first, through the
@@ -4230,6 +4249,14 @@ $envList = "'" + ($envs -join "','") + "'"
 "
     }
 }
+# PLAYBACK-LJ92-DECODE-THROUGHPUT-1: any leg (speed, look, cuda or cpu) may pin the raw-uint16 prefetch decoder count.
+if ($RawPrefetchDecoders -ge 0) {
+    $rawPrefetchEnv = if ($RawPrefetchDecoders -eq 0) { 'MLVAPP_DISABLE_RAW_UINT16_PREFETCH=1' } else { "MLVAPP_RAW_UINT16_PREFETCH_DECODERS=$RawPrefetchDecoders" }
+    $template = Edit-DualVenueTemplate $template "    'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',
+" "    'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',
+    '$rawPrefetchEnv',
+"
+}
 if ($isVariant) {
     # DVE-LEG-TERMINALS-1 item 1: a variant's PresentMon wait-failure summary states its backend like every other variant summary (a cpu run's backend is read from
     # it); the counters themselves are in the default template.
@@ -4329,6 +4356,17 @@ if ($DisplayMode -eq 'windowed') {
     })
 }
 
+# PLAYBACK-VSYNC-DEFAULT-1: a swap-interval leg adds MLVAPP_SWAP_INTERVAL to the app's env list, on the expanded text and only when asked
+# (like --windowed above), so every other job is the text it always was. The anchor must match exactly once, or the generator throws.
+if ($SwapInterval -ge 0) {
+    $swapAnchor = [regex]"(?<ind>[ \t]*)'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',(?<nl>\r?\n)"
+    if ($swapAnchor.Matches($text).Count -ne 1) { throw 'DUAL_VENUE_SWAP_INTERVAL_ANCHOR_MISSING the job template has no single env-list site to add MLVAPP_SWAP_INTERVAL to' }
+    $text = $swapAnchor.Replace($text, [System.Text.RegularExpressions.MatchEvaluator]{
+        param($m)
+        $m.Value + $m.Groups['ind'].Value + "'MLVAPP_SWAP_INTERVAL=$SwapInterval'," + $m.Groups['nl'].Value
+    })
+}
+
 $outDir = Split-Path -Parent $OutFile
 if ($outDir -and -not (Test-Path -LiteralPath $outDir)) { New-Item -ItemType Directory -Path $outDir -Force | Out-Null }
 [IO.File]::WriteAllText($OutFile, $text, [Text.UTF8Encoding]::new($false))
@@ -4356,6 +4394,7 @@ $clipContentSha256 = if ($isFixtureRehearsal) {
     playSeconds = $PlaySeconds
     fixtureRehearsal = $isFixtureRehearsal
     displayMode = $DisplayMode
+    swapInterval = $(if ($SwapInterval -ge 0) { $SwapInterval } else { $null })
     # DUAL-VENUE-EVIDENCE-1: what this generation was authored for (not part of the emitted job's bytes).
     venue = $Venue
     backend = $Backend

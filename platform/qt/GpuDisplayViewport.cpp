@@ -7,6 +7,7 @@
 
 #include "GpuDisplayViewport.h"
 #include "GpuDisplayWindow.h"
+#include "PlaybackSwapInterval.h"
 
 #include <algorithm>
 #include <cmath>
@@ -384,7 +385,7 @@ GpuDisplayViewport::GpuDisplayViewport(QWidget *parent)
     , m_gpuReconSourceTexture(nullptr)
 {
     QSurfaceFormat requestedFormat = format();
-    requestedFormat.setSwapInterval(0);
+    requestedFormat.setSwapInterval(playbackSwapInterval());
     bool abSwapSet = false;
     const QSurfaceFormat::SwapBehavior abSwap = viewportAbSwapBehavior(&abSwapSet);
     if ( abSwapSet )
@@ -999,6 +1000,8 @@ void GpuDisplayViewport::initializeGL()
         << ", version=" << (version ? reinterpret_cast<const char *>(version) : "unknown")
         << ", requested_swap_interval=" << requestedSwapInterval
         << ", realized_swap_interval=" << realizedFormat.swapInterval()
+        << ", wgl_swap_interval_actual="
+        << wglSwapIntervalActual(glContext->getProcAddress("wglGetSwapIntervalEXT"))
         << ").";
 
     m_loggedContext = true;
