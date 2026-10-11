@@ -3162,27 +3162,21 @@ bool gpuPreviewProcessingUpdateShadowsHighlightsBlurTexture(
         // PLAYBACK-GPU-EPISODIC-STALL-1 r2: the ~250 ms GUI-thread block sits inside this
         // client-memory upload (Bachelor r1 attribution); the mode picks how it is done.
         // Client keeps the pre-r2 span (the setData call alone); Pbo's span is the whole
-        // steady upload (map, pack, unmap, glTexSubImage2D); Skip adds nothing.
+        // steady upload (map, pack, unmap, glTexSubImage2D); Skip adds nothing. The one
+        // client-memory setData below serves Client and a Pbo that could not be set up.
         const GpuShBlurUploadMode mode = gpuPreviewProcessingShBlurUploadMode();
         noteShBlurUploadMode(mode);
-        if ( mode == GpuShBlurUploadPbo )
-        {
-            const double steadyUploadStartMs = spanMs();
-            if ( !uploadShBlurThroughPbo(set, blurRgb16, blurWidth, blurHeight) )
-            {
-                const QByteArray packed = packRgb16Texture(blurRgb16, blurWidth * blurHeight);
-                set.shadowsHighlightsBlur->setData(QOpenGLTexture::RGBA, QOpenGLTexture::UInt16, packed.constData());
-            }
-            if ( setupTiming ) setupTiming->blur_upload_ms += spanMs() - steadyUploadStartMs;
-        }
-        else if ( mode == GpuShBlurUploadClient )
+        double steadyUploadStartMs = spanMs();
+        const bool uploadedThroughPbo = mode == GpuShBlurUploadPbo
+            && uploadShBlurThroughPbo(set, blurRgb16, blurWidth, blurHeight);
+        // GpuShBlurUploadSkip: MEASUREMENT ONLY, the texture keeps its allocation-time blur.
+        if ( mode != GpuShBlurUploadSkip && !uploadedThroughPbo )
         {
             const QByteArray packed = packRgb16Texture(blurRgb16, blurWidth * blurHeight);
-            const double steadyUploadStartMs = spanMs();
+            if ( mode == GpuShBlurUploadClient ) steadyUploadStartMs = spanMs();
             set.shadowsHighlightsBlur->setData(QOpenGLTexture::RGBA, QOpenGLTexture::UInt16, packed.constData());
-            if ( setupTiming ) setupTiming->blur_upload_ms += spanMs() - steadyUploadStartMs;
         }
-        // GpuShBlurUploadSkip: MEASUREMENT ONLY, the texture keeps its allocation-time blur.
+        if ( mode != GpuShBlurUploadSkip && setupTiming ) setupTiming->blur_upload_ms += spanMs() - steadyUploadStartMs;
         set.shadowsHighlightsBlurReady = true;
         return true;
     }
