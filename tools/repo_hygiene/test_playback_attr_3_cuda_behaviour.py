@@ -1584,17 +1584,14 @@ class AttributionJobFixtureContentAuthenticationTests(_PwshCase):
         self.assertNotEqual(proc.returncode, 17, f"{proc.stdout}\n{proc.stderr}")
         self.assertIn("RESULT=NO_MISMATCH", proc.stdout, f"{proc.stdout}\n{proc.stderr}")
 
-    def test_the_default_agent_root_guard_still_refuses_a_root_outside_mlvtmp(self) -> None:
-        # Proves the check above does not paper over a real regression: with NO override,
-        # the emitted job's Assert-UnderMlvTmp guard still refuses an -AgentRoot that
-        # resolves outside C:\mlvtmp, before it ever looks at the cache. A LITERAL path is
-        # used here rather than self.tmp/self.agent: self.tmp can itself land under the real
-        # C:\mlvtmp (e.g. a fleet lane whose own scratch root is
+    def _generate_outside_root_job(self, name: str) -> Path:
+        # A LITERAL path is used for the outside root rather than self.tmp/self.agent: self.tmp
+        # can itself land under the real C:\mlvtmp (e.g. a fleet lane whose own scratch root is
         # C:\mlvtmp\lane-scratch\...), which would make self.agent the wrong fixture for an
         # "outside mlvtmp" assertion and is exactly how this bug went unnoticed before.
         outside_root = "C:\\attr3-guard-check-outside-mlvtmp"
-        out_file = self.tmp / "outside-root-job.ps1"
-        script = self.tmp / "generate-outside-root.ps1"
+        out_file = self.tmp / f"{name}-job.ps1"
+        script = self.tmp / f"generate-{name}.ps1"
         script.write_text(
             "$ErrorActionPreference = 'Stop'\n"
             f"& '{ATTRIBUTION_GENERATOR}' -SourceCommit '{self.shas[1]}' "
@@ -1605,11 +1602,45 @@ class AttributionJobFixtureContentAuthenticationTests(_PwshCase):
         )
         proc = _run_pwsh_file(script)
         self.assertEqual(proc.returncode, 0, f"{proc.stdout}\n{proc.stderr}")
+        return out_file
+
+    def test_the_default_agent_root_guard_still_refuses_a_root_outside_mlvtmp(self) -> None:
+        # Proves the check above does not paper over a real regression: with NO override,
+        # the emitted job's Assert-UnderMlvTmp guard still refuses an -AgentRoot that
+        # resolves outside C:\mlvtmp, before it ever looks at the cache.
+        out_file = self._generate_outside_root_job("outside-root")
 
         proc = _run_job(out_file)
 
         self.assertEqual(proc.returncode, 1, f"{proc.stdout}\n{proc.stderr}")
         combined = normalize_pwsh_message_text(proc.stdout + proc.stderr)
+        self.assertIn("job-owned path 'Root' resolves outside", combined)
+        self.assertIn("C:\\mlvtmp", combined)
+
+    def test_the_root_guard_refuses_an_outside_root_before_the_session_lock_probe(self) -> None:
+        # CI-FLAKE-ATTR3-ROOT-GUARD-BEFORE-LOCK-READ-1: when the job reads the session lock first,
+        # the test above passes or fails on the RUNNER'S session state -- a hosted runner that
+        # answers locked/unknown makes an outside root exit 30 (SESSION_LOCKED_OWNER_ONLY), not 1.
+        # Here the lock probe is forced to report LOCKED (the generated job's one
+        # Start-AttrCudaDisplayWake call is replaced by a stub carrying sessionLocked=$true), so the
+        # verdict can no longer depend on the machine: every job-owned path guard must refuse
+        # (exit 1) before that read.
+        out_file = self._generate_outside_root_job("outside-root-locked")
+        job_text = out_file.read_text(encoding="utf-8")
+        probe_call = "$displayWake = Start-AttrCudaDisplayWake"
+        self.assertEqual(
+            job_text.count(probe_call), 1, "the lock probe call moved in the generator")
+        locked_stub = (
+            "$displayWake = [ordered]@{ sessionLocked = $true; "
+            "screensaverSecureOwnerOnly = $false; dismissFailed = $false }"
+        )
+        out_file.write_text(job_text.replace(probe_call, locked_stub), encoding="utf-8")
+
+        proc = _run_job(out_file)
+
+        combined = normalize_pwsh_message_text(proc.stdout + proc.stderr)
+        self.assertNotIn("RESULT=SESSION_LOCKED_OWNER_ONLY", combined)
+        self.assertEqual(proc.returncode, 1, f"{proc.stdout}\n{proc.stderr}")
         self.assertIn("job-owned path 'Root' resolves outside", combined)
         self.assertIn("C:\\mlvtmp", combined)
 

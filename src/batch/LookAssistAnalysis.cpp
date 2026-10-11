@@ -1691,17 +1691,29 @@ static const double kFilmGradeStrength[] =
 };
 static const int kFilmGradeScenes = static_cast<int>( sizeof( kFilmGradeStrength ) / sizeof( kFilmGradeStrength[0] ) );
 
-// film-v2, per unit strength. The split's knots sit on the tonal bands real footage grades in (teal peaks at 0.10 and
-// ends at 0.20, 0.20..0.26 is neutral, warm peaks at 0.52); v1's 0.45 pivot sat inside M16-1243's highlight band, so its
-// warm half netted about zero there.
-static const double kFilmTealOffsetAtFullStrength = 0.035;       // t / s: R down, B up at 0.10
-static const double kFilmWarmOffsetAtFullStrength = 0.045;       // w / s: R up, B down at 0.52 (0.3 w at 0.85)
+// film-v3, per unit strength (LOOK-ASSIST-FILM-FLAVOR-3). v2's split with its blue-amber lean taken out: the warm peak
+// moves down to 0.48, onto M16-1243's highlight band, and v2's upper warm tail (0.85, 0.3 w) is gone, so the split ends at
+// 0.75. On a neutral ramp the teal half and the warm half now cancel to within 1.5 / 255 at every scene; v2 leaned
+// +5.9 / 255 amber at Shade. t and w are the first of the four pre-registered (t, w) candidates to pass every table gate
+// (C3; C1, C2 and C4 leaned the M16-1243 re-grade more than 1.5 / 255 blue).
+static const double kFilmTealOffsetAtFullStrength = 0.038;       // t / s: R down, B up at 0.10
+static const double kFilmWarmOffsetAtFullStrength = 0.024;       // w / s: R up, B down at 0.48
 static const double kFilmGreenShare = 0.15;                      // k: G's share of each offset (not scaled by s)
 static const double kFilmBlackLiftAtFullStrength = 0.020;        // L / s: Y at 0
 static const double kFilmShoulderOffsetAtFullStrength = 0.010;   // h / s: Y down at 0.80
 static const double kFilmWhiteRollAtFullStrength = 0.030;        // c / s: Y at 1 is 1 - c
-static const double kFilmTealZero = 0.20;                        // the teal lift ends here; 0.20..0.26 is neutral
-static const double kFilmNeutralEnd = 0.26;
+static const double kFilmTealZero = 0.20;                        // the teal lift ends here; 0.20..0.28 is neutral
+static const double kFilmNeutralEnd = 0.28;
+static const double kFilmWarmKnot = 0.48;                        // the warm peak
+static const double kFilmWarmEnd = 0.75;                         // identity again from here to 1
+
+// film-v2 (LOOK-ASSIST-FILM-FLAVOR-2, #328): legacy, not selectable. Kept so a receipt saved under it is still recognised
+// and for the frame-locked comparison. Its knots: teal peaks at 0.10 and ends at 0.20, 0.20..0.26 is neutral, warm peaks
+// at 0.52 with a 0.3 w tail at 0.85. k and the Y line are v3's (unchanged).
+static const double kFilmV2TealOffsetAtFullStrength = 0.035;     // t / s: R down, B up at 0.10
+static const double kFilmV2WarmOffsetAtFullStrength = 0.045;     // w / s: R up, B down at 0.52 (0.3 w at 0.85)
+static const double kFilmV2TealZero = 0.20;
+static const double kFilmV2NeutralEnd = 0.26;
 
 // film-v1 (LOOK-ASSIST-FILM-FLAVOR-1, #319): legacy, kept so a receipt saved under it is still recognised and for the
 // frame-locked comparison. Not selectable anywhere.
@@ -1723,6 +1735,14 @@ LookAssistFilmGrade lookAssistFilmGradeForScene( LookAssistScene scene )
     return grade;
 }
 
+LookAssistFilmGrade lookAssistFilmGradeV2ForScene( LookAssistScene scene )
+{
+    LookAssistFilmGrade grade = lookAssistFilmGradeForScene( scene );
+    grade.tealOffset = kFilmV2TealOffsetAtFullStrength * grade.strength;
+    grade.warmOffset = kFilmV2WarmOffsetAtFullStrength * grade.strength;
+    return grade;
+}
+
 LookAssistFilmGradeV1 lookAssistFilmGradeV1ForScene( LookAssistScene scene )
 {
     LookAssistFilmGradeV1 grade;
@@ -1736,7 +1756,7 @@ LookAssistFilmGradeV1 lookAssistFilmGradeV1ForScene( LookAssistScene scene )
 
 QString lookAssistFilmGradeId()
 {
-    return QStringLiteral("film-v2");
+    return QStringLiteral("film-v3");
 }
 
 namespace
@@ -1753,14 +1773,32 @@ QString filmCurveLine( const double *xs, const double *ys, int count )
 
 QString lookAssistFilmGradationCurve( LookAssistScene scene )
 {
-    const LookAssistFilmGrade g = lookAssistFilmGradeForScene( scene );
+    return lookAssistFilmGradationCurve( lookAssistFilmGradeForScene( scene ) );
+}
+
+QString lookAssistFilmGradationCurve( const LookAssistFilmGrade &g )
+{
     const double t = g.tealOffset, w = g.warmOffset, k = g.greenShare;
     const double toneX[] = { 1e-5, 0.50, 0.80, 1.0 };
     const double toneY[] = { g.blackLift, 0.50, 0.80 - g.shoulderOffset, 1.0 - g.whiteRoll };
-    const double knotX[] = { 1e-5, 0.10, kFilmTealZero, kFilmNeutralEnd, 0.52, 0.85, 1.0 };
-    const double redY[] = { 1e-5, 0.10 - t, kFilmTealZero, kFilmNeutralEnd, 0.52 + w, 0.85 + 0.3 * w, 1.0 };
-    const double greenY[] = { 1e-5, 0.10 + k * t, kFilmTealZero, kFilmNeutralEnd, 0.52 + k * w, 0.85 + 0.3 * k * w, 1.0 };
-    const double blueY[] = { 1e-5, 0.10 + t, kFilmTealZero, kFilmNeutralEnd, 0.52 - w, 0.85 - 0.3 * w, 1.0 };
+    const double knotX[] = { 1e-5, 0.10, kFilmTealZero, kFilmNeutralEnd, kFilmWarmKnot, kFilmWarmEnd, 1.0 };
+    const double redY[] = { 1e-5, 0.10 - t, kFilmTealZero, kFilmNeutralEnd, kFilmWarmKnot + w, kFilmWarmEnd, 1.0 };
+    const double greenY[] = { 1e-5, 0.10 + k * t, kFilmTealZero, kFilmNeutralEnd, kFilmWarmKnot + k * w, kFilmWarmEnd, 1.0 };
+    const double blueY[] = { 1e-5, 0.10 + t, kFilmTealZero, kFilmNeutralEnd, kFilmWarmKnot - w, kFilmWarmEnd, 1.0 };
+    return filmCurveLine( toneX, toneY, 4 ) + QStringLiteral("?") + filmCurveLine( knotX, redY, 7 ) + QStringLiteral("?")
+         + filmCurveLine( knotX, greenY, 7 ) + QStringLiteral("?") + filmCurveLine( knotX, blueY, 7 );
+}
+
+QString lookAssistFilmGradationCurveV2( LookAssistScene scene )
+{
+    const LookAssistFilmGrade g = lookAssistFilmGradeV2ForScene( scene );
+    const double t = g.tealOffset, w = g.warmOffset, k = g.greenShare;
+    const double toneX[] = { 1e-5, 0.50, 0.80, 1.0 };
+    const double toneY[] = { g.blackLift, 0.50, 0.80 - g.shoulderOffset, 1.0 - g.whiteRoll };
+    const double knotX[] = { 1e-5, 0.10, kFilmV2TealZero, kFilmV2NeutralEnd, 0.52, 0.85, 1.0 };
+    const double redY[] = { 1e-5, 0.10 - t, kFilmV2TealZero, kFilmV2NeutralEnd, 0.52 + w, 0.85 + 0.3 * w, 1.0 };
+    const double greenY[] = { 1e-5, 0.10 + k * t, kFilmV2TealZero, kFilmV2NeutralEnd, 0.52 + k * w, 0.85 + 0.3 * k * w, 1.0 };
+    const double blueY[] = { 1e-5, 0.10 + t, kFilmV2TealZero, kFilmV2NeutralEnd, 0.52 - w, 0.85 - 0.3 * w, 1.0 };
     return filmCurveLine( toneX, toneY, 4 ) + QStringLiteral("?") + filmCurveLine( knotX, redY, 7 ) + QStringLiteral("?")
          + filmCurveLine( knotX, greenY, 7 ) + QStringLiteral("?") + filmCurveLine( knotX, blueY, 7 );
 }
@@ -1829,14 +1867,15 @@ bool lookAssistFilmOwnsGradationCurve( const QString &curve )
 {
     std::vector<LookAssistGradationPoint> current[4];
     if( lookAssistParseGradationCurve( curve, current ) != 4 ) return false;
-    // Every curve a Film grade ever laid: v2's and the legacy v1's (a receipt saved under #319), for every scene.
-    for( int version = 1; version <= 2; ++version )
+    // Every curve a Film grade ever laid: v3's and the legacy v2's (#328) and v1's (#319), for every scene.
+    for( int version = 1; version <= 3; ++version )
         for( int s = 0; s < kFilmGradeScenes; ++s )
         {
             const LookAssistScene scene = static_cast<LookAssistScene>( s );
             std::vector<LookAssistGradationPoint> film[4];
-            lookAssistParseGradationCurve( version == 2 ? lookAssistFilmGradationCurve( scene )
-                                                        : lookAssistFilmGradationCurveV1( scene ), film );
+            lookAssistParseGradationCurve( version == 3 ? lookAssistFilmGradationCurve( scene )
+                                           : version == 2 ? lookAssistFilmGradationCurveV2( scene )
+                                                          : lookAssistFilmGradationCurveV1( scene ), film );
             bool same = true;
             for( int i = 0; i < 4 && same; ++i )
             {

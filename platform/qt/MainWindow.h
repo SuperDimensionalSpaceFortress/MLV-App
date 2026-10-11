@@ -395,6 +395,7 @@ private slots:
     void on_actionPlaybackPreviewResHalf_triggered();
     void on_actionPlaybackPreviewResQuarter_triggered();
     void on_actionPlaybackShowQualityIndicator_triggered();
+    void on_actionPlaybackVSync_triggered();
     void on_actionPlaybackAutoTarget24_triggered();
     void on_actionPlaybackAutoTarget30_triggered();
     void on_actionPlaybackAutoTarget60_triggered();

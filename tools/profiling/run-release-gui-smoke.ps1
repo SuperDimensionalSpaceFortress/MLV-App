@@ -1698,6 +1698,7 @@ $experimentalEnvironment = @(
     "MLVAPP_PROCESSING_CORE_CREATIVE_PROBE",
     "MLVAPP_PLAYBACK_SCOPE_INTERVAL_MS",
     "MLVAPP_DISABLE_RAW_UINT16_PREFETCH",
+    "MLVAPP_RAW_UINT16_PREFETCH_DECODERS",
     "MLVAPP_DISABLE_PLAY_START_PREROLL"
 )
 $experimentalEnvironmentToClear = @(
@@ -2818,7 +2819,7 @@ $result = [pscustomobject]@{
             presetTintDelta = Get-ObjectPropertyValue $lookAssistApply "preset_tint_delta"
             finalTemperature = Get-ObjectPropertyValue $lookAssistApply "final_temp"
             finalTint = Get-ObjectPropertyValue $lookAssistApply "final_tint"
-            # LOOK-ASSIST-FILM-FLAVOR-1/-2: the Film grade the apply laid (grade=film-v2|skipped_user_curve). Classic and
+            # LOOK-ASSIST-FILM-FLAVOR-1/-2/-3: the Film grade the apply laid (grade=film-v3|skipped_user_curve). Classic and
             # Cinematic lines carry no grade= field: absent is "none".
             presetGrade = $(if ($null -eq $lookAssistApply) { $null } else { $laGrade = [string](Get-ObjectPropertyValue $lookAssistApply "grade"); if ([string]::IsNullOrEmpty($laGrade)) { 'none' } else { $laGrade } })
         }

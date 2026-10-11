@@ -71,7 +71,12 @@ COMPOSER = ROOT / "tools" / "profiling" / "make-contact-sheet.py"
 # tick-error and catch branches. A reorder edits baseline lines IN PLACE, which no bracketed region can express (the baseline line would have to stay verbatim outside it),
 # so the pin is that card's own generator commit (fc12fe8c: master e72dcdb6 plus the reorder and nothing else). That commit already carries every bracketed family, so the
 # baseline counts below equal the pinned counts (they were 0 against a29a1ee4). The reorder is pinned by its own tests (test_playback_attr_3_cuda_behaviour.py), not by byte identity.
-BASELINE_COMMIT = "fc12fe8c63f78e5436c11902b3aa0140e271320d"
+# CI-FLAKE-ATTR3-ROOT-GUARD-BEFORE-LOCK-READ-1 r2 moves it again, on purpose: that card MOVES the job's Assert-UnderMlvTmp definition and its Root/Work/Pub check from after the
+# session-lock refusal (exit 30) to right after $Pub is named, before the first trace line, the display wake and the lock probe, so an outside -AgentRoot is refused (exit 1)
+# whatever the host's console-lock state. A move edits baseline lines IN PLACE, which no bracketed region can express, so the pin is that card's own generator commit
+# (cb795f9e: fork/master 6723cd5b plus the move and its comment, nothing else). It already carries every bracketed family, so the baseline counts below are unchanged. The move is
+# pinned by its own test (test_the_root_guard_refuses_an_outside_root_before_the_session_lock_probe in test_playback_attr_3_cuda_behaviour.py), not by byte identity.
+BASELINE_COMMIT = "cb795f9e69dea722996cb366096aa44f4344cc67"
 
 PWSH = shutil.which("pwsh")
 requires_windows_pwsh = unittest.skipIf(PWSH is None or sys.platform != "win32", "needs pwsh on Windows")
@@ -90,11 +95,18 @@ LOOKAHEAD_LEGS = ("legs/m16-1243-pace-cinematic-fullscreen-s4-la3.json",)
 HEAVY_LEGS = ("legs/m16-1243-pace-cinematic-fullscreen-s4-heavy.json",)
 # CPU-DUALISO-REDUCED-ISO-NOTCH-1: cpu-only cinematic look legs at playbackProcessing receipt, the only legs that reach the CPU reduced dual-ISO recon.
 CPU_REDUCED_LEGS = tuple(f"legs/m16-1243-cpu-reduced-{mode}-s{scale}.json" for scale in (2, 4) for mode in ("fullscreen", "windowed"))
+# PLAYBACK-LJ92-DECODE-THROUGHPUT-1: the K=1 arm of the raw-uint16 prefetch decoder A/B, one twin per leg it pairs with (the other arm is the leg
+# itself at the app's default K=2). Each differs from its twin only in its legId and generatorArgs.rawPrefetchDecoders 1.
+DECODER_LEGS = {"legs/m16-1243-pace-cinematic-fullscreen-s4-dec1.json": "legs/m16-1243-pace-cinematic-fullscreen-s4.json",
+                "legs/m16-1243-pace-cinematic-fullscreen-s4-heavy-dec1.json": "legs/m16-1243-pace-cinematic-fullscreen-s4-heavy.json"}
 # LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1 added the scale-2 Cinematic twin of the scale-2 look leg (the Bachelor CPU Classic | Cinematic look pair).
 SHIPPED_LEGS = ("legs/m16-1243-speed.json", "legs/m16-1243-look.json", "legs/m16-1243-look-scale2.json", "legs/m16-1243-look-cinematic.json", *DISPLAY_MATRIX_LEGS, *PACE_LEGS,
-                *LOOKAHEAD_LEGS, *HEAVY_LEGS, "legs/m16-1243-look-scale2-cinematic.json", "legs/m16-1243-look-film.json",
+                *LOOKAHEAD_LEGS, *HEAVY_LEGS, *DECODER_LEGS, "legs/m16-1243-look-scale2-cinematic.json", "legs/m16-1243-look-film.json",
                 "legs/m16-1243-look-scale2-film.json", *(f"legs/m16-1243-look-scale2-{flavor}-agxoff.json" for flavor in ("cinematic", "film")),
+                *(f"legs/m16-1243-display-{mode}-s{scale}-vsync1.json" for scale in (1, 2, 4) for mode in ("fullscreen", "windowed")),
                 *CPU_REDUCED_LEGS)
+# PLAYBACK-VSYNC-DEFAULT-1: the swap-interval-1 twins of the six display-matrix legs (the vsync A/B; the originals stay at the app's default 0).
+VSYNC1_LEGS = tuple(rel.replace(".json", "-vsync1.json") for rel in DISPLAY_MATRIX_LEGS)
 # LOOK-ASSIST-FILM-FLAVOR-2 r2: the AgX-off twins of the scale-2 Cinematic and Film legs carry a committed look receipt (look-receipts/agx-off.marxml).
 AGXOFF_LEGS = {f"m16-1243-look-scale2-{flavor}-agxoff": f"m16-1243-look-scale2-{flavor}" for flavor in ("cinematic", "film")}
 LOOK_RECEIPT_BASE = "6b6f66f52d5344a97de5068b2e7cae1a61edf295"   # the #328 head whose generator, legs and runner this round extends
@@ -236,6 +248,11 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
     SESSION_LOCKED_OPEN = "VENUE-SESSION-LOCKED-REFUSAL-1 >>>"
     SESSION_LOCKED_CLOSE = "VENUE-SESSION-LOCKED-REFUSAL-1 <<<"
     SESSION_LOCKED_REGIONS = 32
+    # PLAYBACK-VSYNC-DEFAULT-1: the PresentMon SyncInterval/AllowsTearing counts Get-AttrCudaPresentMonDisplayReport adds (the generator splices the function into the
+    # default job verbatim). Four regions: the column flags, the two parsed-row fields, the per-chain counts and the selected-chain counts. Absent from the baseline.
+    PLAYBACK_VSYNC_OPEN = "PLAYBACK-VSYNC-DEFAULT-1 >>>"
+    PLAYBACK_VSYNC_CLOSE = "PLAYBACK-VSYNC-DEFAULT-1 <<<"
+    PLAYBACK_VSYNC_REGIONS = 4
 
     @classmethod
     def strip_regions(cls, text: str) -> tuple[str, dict[str, int]]:
@@ -244,7 +261,8 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
                     "orphan-sweep": (cls.ORPHAN_SWEEP_OPEN, cls.ORPHAN_SWEEP_CLOSE),
                     "contact-sheet-parity": (cls.CONTACT_SHEET_PARITY_OPEN, cls.CONTACT_SHEET_PARITY_CLOSE),
                     "keepalive-hung-probe": (cls.KEEPALIVE_HUNG_PROBE_OPEN, cls.KEEPALIVE_HUNG_PROBE_CLOSE),
-                    "session-locked": (cls.SESSION_LOCKED_OPEN, cls.SESSION_LOCKED_CLOSE)}
+                    "session-locked": (cls.SESSION_LOCKED_OPEN, cls.SESSION_LOCKED_CLOSE),
+                    "playback-vsync": (cls.PLAYBACK_VSYNC_OPEN, cls.PLAYBACK_VSYNC_CLOSE)}
         kept: list[str] = []
         inside: str | None = None
         counts = {name: 0 for name in families}
@@ -289,6 +307,8 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         self.assertEqual(old_counts["keepalive-hung-probe"], self.KEEPALIVE_HUNG_PROBE_REGIONS, "the baseline (the pinned KEEPALIVE-FAILURE-PUBLISH-LAST-1 generator commit) carries the same bracketed regions")
         self.assertEqual(new_counts["session-locked"], self.SESSION_LOCKED_REGIONS, "the default job carries exactly the pinned number of bracketed VENUE-SESSION-LOCKED-REFUSAL-1 regions")
         self.assertEqual(old_counts["session-locked"], self.SESSION_LOCKED_REGIONS, "the baseline (the pinned KEEPALIVE-FAILURE-PUBLISH-LAST-1 generator commit) carries the same bracketed regions")
+        self.assertEqual(new_counts["playback-vsync"], self.PLAYBACK_VSYNC_REGIONS, "the default job carries exactly the pinned number of bracketed PLAYBACK-VSYNC-DEFAULT-1 regions")
+        self.assertEqual(old_counts["playback-vsync"], 0, "the baseline predates PLAYBACK-VSYNC-DEFAULT-1")
         self.assertEqual(stripped, old_stripped,
                          "the DEFAULT (bachelor/cuda) emitted job changed outside the bracketed regions -- it must stay byte-identical to the pinned baseline")
 
@@ -455,6 +475,26 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         self.assertEqual(self.parse_errors(la3), 0)
         self.assertIn("'MLVAPP_PLAYBACK_RENDER_LOOKAHEAD_FRAMES=3',", la3.read_text(encoding="utf-8"))
 
+    def test_a_swap_interval_reaches_the_apps_env_only_when_asked(self) -> None:
+        """PLAYBACK-VSYNC-DEFAULT-1: -SwapInterval 0|1 adds MLVAPP_SWAP_INTERVAL to the app's env list, for a look leg and the default job alike;
+        without it the job sets nothing (the app keeps its default 1)."""
+        plain = self.generate(GENERATOR, "plain.job.ps1", []).read_text(encoding="utf-8")
+        self.assertNotIn("MLVAPP_SWAP_INTERVAL", plain)
+        for interval in ("0", "1"):
+            for name, extra in (("default", []), ("look", ["-ForceLookAssist", "-ContactSheet", "-LookFlavor", "cinematic"]),
+                                ("windowed", ["-ForceLookAssist", "-ContactSheet", "-LookFlavor", "cinematic", "-DisplayMode", "windowed"])):
+                job = self.generate(GENERATOR, f"swap{interval}-{name}.job.ps1", [*extra, "-SwapInterval", interval])
+                self.assertEqual(self.parse_errors(job), 0, name)
+                text = job.read_text(encoding="utf-8")
+                self.assertEqual(text.count(f"'MLVAPP_SWAP_INTERVAL={interval}',"), 1, name)
+                self.assertIn(f"'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',\n    'MLVAPP_SWAP_INTERVAL={interval}',", text.replace("\r\n", "\n"), name)
+
+    def test_the_runner_passes_a_legs_swap_interval_to_the_generator(self) -> None:
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        self.assertIn("if ($spec.generatorArgs.PSObject.Properties['swapInterval']) { $gen['SwapInterval'] = [int]$spec.generatorArgs.swapInterval }", runner)
+        # not nested under the speed-leg forced-look branch: a look leg's swapInterval reaches the generator too
+        self.assertLess(runner.index("$gen['SwapInterval']"), runner.index("if (-not $isLook -and $spec.generatorArgs.PSObject.Properties['forceLookAssist']"))
+
     def test_the_runner_passes_a_speed_legs_forced_look_to_the_generator(self) -> None:
         runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
         self.assertIn("if (-not $isLook -and $spec.generatorArgs.PSObject.Properties['forceLookAssist'] -and [bool]$spec.generatorArgs.forceLookAssist) {", runner)
@@ -478,6 +518,32 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         self.assertEqual(explicit_empty.read_bytes(), default.read_bytes(), "an empty -PlaybackProcessing is the default job, byte for byte")
         schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
         self.assertEqual(schema["properties"]["generatorArgs"]["properties"]["playbackProcessing"]["enum"], ["receipt", "subset"])
+
+    def test_the_raw_prefetch_decoder_count_reaches_the_job_only_when_asked(self) -> None:
+        """PLAYBACK-LJ92-DECODE-THROUGHPUT-1: generatorArgs.rawPrefetchDecoders maps to -RawPrefetchDecoders for any leg (not only a forced-look
+        pace leg); 0 is the no-prefetch arm, k the decoder count, and absent leaves the job's text exactly as it was."""
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        mapping = "if ($spec.generatorArgs.PSObject.Properties['rawPrefetchDecoders']) { $gen['RawPrefetchDecoders'] = [int]$spec.generatorArgs.rawPrefetchDecoders }"
+        self.assertIn(mapping, runner)
+        forced = runner.index("if (-not $isLook -and $spec.generatorArgs.PSObject.Properties['forceLookAssist']")
+        self.assertLess(runner.index(mapping), forced, "the mapping must sit outside the forceLookAssist branch")
+        absent = self.generate(GENERATOR, "rawpf-absent.job.ps1", []).read_text(encoding="utf-8")
+        self.assertNotIn("MLVAPP_RAW_UINT16_PREFETCH_DECODERS", absent)
+        self.assertNotIn("MLVAPP_DISABLE_RAW_UINT16_PREFETCH", absent)
+        off = self.generate(GENERATOR, "rawpf-0.job.ps1", ["-RawPrefetchDecoders", "0"])
+        self.assertEqual(self.parse_errors(off), 0)
+        off_text = off.read_text(encoding="utf-8")
+        self.assertIn("'MLVAPP_DISABLE_RAW_UINT16_PREFETCH=1',", off_text)
+        self.assertNotIn("MLVAPP_RAW_UINT16_PREFETCH_DECODERS", off_text)
+        two = self.generate(GENERATOR, "rawpf-2.job.ps1", ["-RawPrefetchDecoders", "2"])
+        self.assertEqual(self.parse_errors(two), 0)
+        two_text = two.read_text(encoding="utf-8")
+        self.assertIn("'MLVAPP_RAW_UINT16_PREFETCH_DECODERS=2',", two_text)
+        self.assertNotIn("MLVAPP_DISABLE_RAW_UINT16_PREFETCH", two_text)
+        pace = self.generate(GENERATOR, "rawpf-pace-1.job.ps1", ["-ForceLookAssist", "-LookPaceLeg", "-LookFlavor", "cinematic", "-RawPrefetchDecoders", "1"])
+        self.assertIn("'MLVAPP_RAW_UINT16_PREFETCH_DECODERS=1',", pace.read_text(encoding="utf-8"))
+        # The smoke launcher clears the variable unless the job passes it, so a stray value never leaks into a leg.
+        self.assertIn('"MLVAPP_RAW_UINT16_PREFETCH_DECODERS",', LAUNCHER.read_text(encoding="utf-8"))
 
     def test_scale_and_quiescence_parameters_reach_the_job(self) -> None:
         text = self.generate(GENERATOR, "scale.job.ps1", ["-ScaleFactor", "1", "-CpuQuiescenceThresholdPercent", "35.5"]).read_text(encoding="utf-8")
@@ -5064,6 +5130,25 @@ class LegSpecSchemaTests(unittest.TestCase):
             self.assertEqual(arm["generatorArgs"].pop("playbackRenderLookaheadFrames"), 3, rel)
             self.assertEqual(dict(arm, legId=base["legId"]), base, rel)
 
+    def test_each_vsync1_leg_is_its_display_matrix_cell_at_swap_interval_1(self) -> None:
+        """PLAYBACK-VSYNC-DEFAULT-1: a vsync1 twin differs from its display-matrix cell only in its legId, its card and
+        generatorArgs.swapInterval 1; the cell itself sets no swap interval (the app's default 0)."""
+        self.assertEqual(self.schema["properties"]["generatorArgs"]["properties"]["swapInterval"]["enum"], [0, 1])
+        for rel, base_rel in zip(VSYNC1_LEGS, DISPLAY_MATRIX_LEGS):
+            arm = json.loads((DV / rel).read_text(encoding="utf-8"))
+            self.jsonschema.validate(arm, self.schema)
+            base = json.loads((DV / base_rel).read_text(encoding="utf-8"))
+            self.assertNotIn("swapInterval", base["generatorArgs"], base_rel)
+            self.assertEqual(arm["generatorArgs"].pop("swapInterval"), 1, rel)
+            self.assertEqual(arm["legId"], Path(rel).stem, rel)
+            self.assertEqual(arm["card"], "PLAYBACK-VSYNC-DEFAULT-1", rel)
+            self.assertEqual(dict(arm, legId=base["legId"], card=base["card"]), base, rel)
+        for value in (2, -1, "1"):
+            bad = json.loads((DV / VSYNC1_LEGS[0]).read_text(encoding="utf-8"))
+            bad["generatorArgs"]["swapInterval"] = value
+            with self.assertRaises(self.jsonschema.ValidationError, msg=repr(value)):
+                self.jsonschema.validate(bad, self.schema)
+
     def test_the_heavy_leg_is_the_owner_shape_pace_leg_with_the_frame_log_kept(self) -> None:
         """PLAYBACK-BACHELOR-PRESENT-JITTER-1 r2: the stall-stage diagnostic differs from the owner-shape pace leg only in its legId and
         generatorArgs.telemetryArm HEAVY (the per-frame log a LIGHT leg disables)."""
@@ -5075,6 +5160,17 @@ class LegSpecSchemaTests(unittest.TestCase):
             self.assertEqual(arm["generatorArgs"].pop("telemetryArm"), "HEAVY", rel)
             base["generatorArgs"].pop("telemetryArm")
             self.assertEqual(dict(arm, legId=base["legId"]), base, rel)
+
+    def test_the_decoder_legs_are_their_twins_at_one_raw_prefetch_decoder(self) -> None:
+        """PLAYBACK-LJ92-DECODE-THROUGHPUT-1: the K=1 arm differs from the leg it pairs with only in its legId and generatorArgs.rawPrefetchDecoders 1."""
+        for rel, twin_rel in DECODER_LEGS.items():
+            arm = json.loads((DV / rel).read_text(encoding="utf-8"))
+            self.jsonschema.validate(arm, self.schema)
+            twin = json.loads((DV / twin_rel).read_text(encoding="utf-8"))
+            self.assertNotIn("rawPrefetchDecoders", twin["generatorArgs"], twin_rel)
+            self.assertEqual(arm["legId"], twin["legId"] + "-dec1", rel)
+            self.assertEqual(arm["generatorArgs"].pop("rawPrefetchDecoders"), 1, rel)
+            self.assertEqual(dict(arm, legId=twin["legId"]), twin, rel)
 
     def test_the_hand_listed_shipped_legs_are_exactly_the_legs_directory(self) -> None:
         self.assertEqual(sorted(SHIPPED_LEGS), sorted("legs/" + p.name for p in (DV / "legs").glob("*.json")), "SHIPPED_LEGS drifted from the legs/ directory")
@@ -5097,9 +5193,12 @@ class LegSpecSchemaTests(unittest.TestCase):
             if spec["card"] == "DUAL-VENUE-DISPLAY-MATRIX-1":   # the display-matrix legs are cinematic look legs named by their cell (display mode and scale)
                 self.assertEqual(spec["legId"], path.stem, path.name)
                 self.assertRegex(spec["legId"], r"^m16-1243-display-(fullscreen|windowed)-s[124]$", path.name)
+            elif spec["card"] == "PLAYBACK-VSYNC-DEFAULT-1":   # the swap-interval-1 twins of the display-matrix legs, named by their cell
+                self.assertEqual(spec["legId"], path.stem, path.name)
+                self.assertRegex(spec["legId"], r"^m16-1243-display-(fullscreen|windowed)-s[124]-vsync1$", path.name)
             elif spec["card"] == "PLAYBACK-BACHELOR-PRESENT-JITTER-1":   # the capture-free pace legs, named by flavor and cell
                 self.assertEqual(spec["legId"], path.stem, path.name)
-                self.assertRegex(spec["legId"], rf"^m16-1243-pace-{flavor}-(fullscreen|windowed)-s[124](-la[0-3]|-heavy)?$", path.name)
+                self.assertRegex(spec["legId"], rf"^m16-1243-pace-{flavor}-(fullscreen|windowed)-s[124](-la[0-3]|-heavy)?(-dec[0-4])?$", path.name)
             elif spec["card"] == "CPU-DUALISO-REDUCED-ISO-NOTCH-1":   # the cpu-only legs that engage the CPU reduced recon, named by their cell
                 self.assertEqual(spec["legId"], path.stem, path.name)
                 self.assertRegex(spec["legId"], r"^m16-1243-cpu-reduced-(fullscreen|windowed)-s[24]$", path.name)
@@ -5179,7 +5278,7 @@ class LegSpecSchemaTests(unittest.TestCase):
         self.jsonschema.validate(dict(look, look=dict(look["look"], lookFlavor="film")), self.schema)
         pace = json.loads((DV / "legs" / "m16-1243-pace-cinematic-fullscreen-s4.json").read_text(encoding="utf-8"))
         self.jsonschema.validate(dict(pace, generatorArgs=dict(pace["generatorArgs"], lookFlavor="film")), self.schema)
-        for bad in ("filmm", "Film", "film-v1", "film-v2"):
+        for bad in ("filmm", "Film", "film-v1", "film-v2", "film-v3"):
             with self.assertRaises(self.jsonschema.ValidationError, msg=bad):
                 self.jsonschema.validate(dict(look, look=dict(look["look"], lookFlavor=bad)), self.schema)
             with self.assertRaises(self.jsonschema.ValidationError, msg=bad):
@@ -5637,6 +5736,9 @@ class LookReceiptGeneratorTests(unittest.TestCase):
                 kept, new_counts = GeneratorByteIdentityAndVariantTests.strip_regions(new.decode("utf-8"))
                 old_kept, old_counts = GeneratorByteIdentityAndVariantTests.strip_regions(old.decode("utf-8"))
                 self.assertGreater(new_counts["session-locked"], 0)
+                # PLAYBACK-VSYNC-DEFAULT-1's regions postdate the base generator: present in the new job only, at their pinned count.
+                self.assertEqual((new_counts.pop("playback-vsync"), old_counts.pop("playback-vsync")),
+                                 (GeneratorByteIdentityAndVariantTests.PLAYBACK_VSYNC_REGIONS, 0), name)
                 self.assertEqual(new_counts, old_counts, f"{name}: the job without -LookReceiptPath carries the base generator's bracketed regions")
                 self.assertEqual(kept, old_kept, f"{name}: the job without -LookReceiptPath must be the base generator's bytes")
                 self.assertNotIn(b"LookReceipt", new)

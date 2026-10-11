@@ -1,6 +1,6 @@
 ## 2026-10-07 KERNEL REFILE r5: conformance, R14 and R15 records, K12 refile, proposals for the steward
 
-KERNEL: DOGFOOD fleet-factory-kernel r5 · profile code@r10 · instance agents/factory-kernel-instance.md (MLV-App PR #297, head 6c8a19c1) · since 2026-09-14
+KERNEL: DOGFOOD fleet-factory-kernel r5 · profile code@r10 · instance agents/factory-kernel-instance.md (MLV-App PR #299, merged df353652; supersedes #297) · since 2026-09-14
 
 The 2026-09-14 block for this section was pushed on `review/mlv-app-kernel-2026-09-14` and never reached master. This
 block replaces it. The clause-by-clause filing, in kernel §4 grammar, is `adjudications/factory-kernel/mlv-app.md` on this

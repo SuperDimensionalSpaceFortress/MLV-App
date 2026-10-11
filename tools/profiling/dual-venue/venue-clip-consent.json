@@ -4,6 +4,8 @@
   "recordShape": { "venue": "bachelor | ultra-magnus", "clipId": "M16-1243", "ownerLine": "CLIP <venue>: <clipId>  (e.g. CLIP bachelor: M16-1243; <venue> may also be the table name with its hyphens removed; the owner's exact words, no path)", "ownerLineSha256": "<sha256 (64 lowercase hex) of ownerLine as UTF-8>", "recordedUtc": "<ISO-8601>", "recordedBy": "owner" },
   "records": [
     {"venue":"bachelor","clipId":"M16-1243","ownerLine":"CLIP bachelor: M16-1243","ownerLineSha256":"0167d5d9714f33dfec786dcfb97f1e9c55a1735e12d9ce62695075045493156d","recordedUtc":"2026-10-01T22:20:00Z","recordedBy":"owner"},
-    {"venue":"ultra-magnus","clipId":"M16-1243","ownerLine":"CLIP ultramagnus: M16-1243","ownerLineSha256":"a9f43abacc75697155400913cd35791eab348c1cc94e0407ac8dd583692a38af","recordedUtc":"2026-10-01T22:20:00Z","recordedBy":"owner"}
+    {"venue":"ultra-magnus","clipId":"M16-1243","ownerLine":"CLIP ultramagnus: M16-1243","ownerLineSha256":"a9f43abacc75697155400913cd35791eab348c1cc94e0407ac8dd583692a38af","recordedUtc":"2026-10-01T22:20:00Z","recordedBy":"owner"},
+    {"venue":"bachelor","clipId":"M16-1456","ownerLine":"CLIP bachelor: M16-1456","ownerLineSha256":"419b83429a9a74161eb61bbf60391b295ce998b5bc74ea869967abd46375fdee","recordedUtc":"2026-10-11T03:20:00Z","recordedBy":"owner"},
+    {"venue":"ultra-magnus","clipId":"M16-1456","ownerLine":"CLIP ultramagnus: M16-1456","ownerLineSha256":"caffd4c6bf9e9c6c1da52884c58780d0e4cff6e587ca28c93038c65810dbc26e","recordedUtc":"2026-10-11T03:20:00Z","recordedBy":"owner"}
   ]
 }

@@ -1,0 +1,12 @@
+{
+  "schema": "board-profile.v1",
+  "project": "mlv-app",
+  "boardRoot": "C:\\!Layi Wkspc\\MLV-App",
+  "remote": "fork",
+  "branch": "master",
+  "productPaths": ["src/", "platform/"],
+  "roadmap": "docs/roadmap.md",
+  "doctrineOutboxTarget": "specs/mlv-app/cards.md",
+  "venues": ["windows-latest", "ubuntu-latest", "4090"],
+  "boardOwnedPaths": ["tools/hooks", ".claude", "CLAUDE.md"]
+}
