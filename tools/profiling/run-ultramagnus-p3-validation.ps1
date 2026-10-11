@@ -179,6 +179,36 @@ function Add-Failure {
     [void]$Failures.Add($Message)
 }
 
+function Get-AdapterCheckVerdict {
+    # Decides the "adapter actually used" assertion from the renderer names the app itself reported (read-only).
+    #   matched  -- some renderer matches the required pattern.
+    #   mismatch -- failed: renderers were reported and none matches, or a non-speed run reported none (fails closed).
+    #   skipped-speedleg-no-renderer-evidence -- NOT a failure: -SpeedLeg sets MLVAPP_GPU_PLAYBACK_RECON_VALIDATE_OUTPUT=0,
+    #       and the GL_RENDERER the wrapper collects comes only from the gl_probe lines the app emits inside output
+    #       validation, so a successful speed run legitimately has an empty renderer list. The skip is recorded, never silent.
+    param(
+        [AllowEmptyCollection()][AllowNull()][string[]]$AdapterUsed = @(),
+        [Parameter(Mandatory = $true)][string]$RequiredGpuNamePattern,
+        [bool]$SpeedLeg = $false
+    )
+    $used = @($AdapterUsed | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if (@($used | Where-Object { $_ -match $RequiredGpuNamePattern }).Count -gt 0) {
+        return [pscustomobject]@{ adapterCheck = "matched"; failed = $false; reason = $null }
+    }
+    if ($SpeedLeg -and $used.Count -eq 0) {
+        return [pscustomobject]@{
+            adapterCheck = "skipped-speedleg-no-renderer-evidence"
+            failed = $false
+            reason = "-SpeedLeg disables output validation, the only source of the app's GL_RENDERER probe lines; no read-only renderer evidence exists for this run, so the adapter assertion was skipped."
+        }
+    }
+    return [pscustomobject]@{
+        adapterCheck = "mismatch"
+        failed = $true
+        reason = "Adapter actually used (GL_RENDERER from the app's own log) did not match '$RequiredGpuNamePattern': [$($used -join '; ')]. The app requests the discrete GPU through its own exports; this script no longer pins it in the registry."
+    }
+}
+
 function Get-SmokeSummaryHostLoadFields {
     # PLAYBACK-MEASURE-HOST-LOAD-GATE-1 round 3: this script invokes run-release-gui-smoke.ps1
     # per clip and already parses its JSON output ($result below) for presentedFps etc; that JSON
@@ -1415,10 +1445,17 @@ exit `$LASTEXITCODE
 
 $adapterUsed = @($clipResults | ForEach-Object { @($_.glRendererDescriptions) } | ForEach-Object { [string]$_ } |
     Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
+$adapterCheck = "not-run"
+$adapterCheckReason = $null
 if (!$DryRun -and @($clipResults).Count -gt 0) {
-    $adapterMatched = @($adapterUsed | Where-Object { $_ -match $RequiredGpuNamePattern }).Count -gt 0
-    if (!$adapterMatched) {
-        Add-Failure $failures "Adapter actually used (GL_RENDERER from the app's own log) did not match '$RequiredGpuNamePattern': [$($adapterUsed -join '; ')]. The app requests the discrete GPU through its own exports; this script no longer pins it in the registry."
+    $adapterVerdict = Get-AdapterCheckVerdict -AdapterUsed $adapterUsed -RequiredGpuNamePattern $RequiredGpuNamePattern -SpeedLeg ([bool]$SpeedLeg)
+    $adapterCheck = $adapterVerdict.adapterCheck
+    $adapterCheckReason = $adapterVerdict.reason
+    if ($adapterVerdict.failed) {
+        Add-Failure $failures $adapterVerdict.reason
+    }
+    elseif ($adapterCheck -ne "matched") {
+        [void]$warnings.Add($adapterVerdict.reason)
     }
 }
 
@@ -1495,6 +1532,8 @@ $summary = [pscustomobject]@{
         buildSkipped = [bool]$SkipBuild
         adapterUsed = $adapterUsed
         adapterRequiredPattern = $RequiredGpuNamePattern
+        adapterCheck = $adapterCheck
+        adapterCheckReason = $adapterCheckReason
     }
     inputs = [pscustomobject]@{
         clipRoot = $ClipRoot
