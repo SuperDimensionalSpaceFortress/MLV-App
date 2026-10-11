@@ -259,7 +259,8 @@ class CliTests(unittest.TestCase):
         )
         self.assertEqual(code, 0)
         data = json.loads(out)
-        self.assertEqual(set(data), {"query", "terms", "bus", "entries_searched", "elapsed_s", "hits"})
+        self.assertEqual(set(data), {"query", "terms", "bus", "entries_searched", "elapsed_s", "bus_state", "hits"})
+        self.assertEqual(data["bus_state"]["fetch"], "no-git")  # the fixture bus is a plain directory
         self.assertEqual(data["query"], "powershell ssh session leak")
         self.assertLessEqual(len(data["hits"]), 2)
         hit = data["hits"][0]
