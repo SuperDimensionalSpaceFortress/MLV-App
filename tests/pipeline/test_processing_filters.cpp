@@ -30,6 +30,13 @@ extern "C" {
 #include <omp.h>
 #endif
 
+#if defined(_WIN32)
+#include <set>
+#include <utility>
+#include <windows.h>
+#include <tlhelp32.h>
+#endif
+
 namespace {
 
 std::vector<uint16_t> make_rgb_pattern(int width, int height)
@@ -563,6 +570,102 @@ std::size_t count_differing(const std::vector<T> & a, const std::vector<T> & b)
 }
 
 } // namespace
+
+#if defined(_WIN32) && defined(_OPENMP)
+namespace {
+/* Every live thread of this process, as (thread id, creation time): an id Windows
+ * recycled for a new thread still counts as new. */
+std::set<std::pair<DWORD, unsigned long long>> process_thread_snapshot()
+{
+    std::set<std::pair<DWORD, unsigned long long>> threads;
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if( snapshot == INVALID_HANDLE_VALUE ) return threads;
+    THREADENTRY32 entry;
+    entry.dwSize = sizeof(entry);
+    const DWORD pid = GetCurrentProcessId();
+    for( BOOL ok = Thread32First(snapshot, &entry); ok; ok = Thread32Next(snapshot, &entry) )
+    {
+        if( entry.th32OwnerProcessID != pid ) continue;
+        unsigned long long created = 0;
+        HANDLE thread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, entry.th32ThreadID);
+        if( thread )
+        {
+            FILETIME creation, exit_time, kernel, user;
+            if( GetThreadTimes(thread, &creation, &exit_time, &kernel, &user) )
+                created = (static_cast<unsigned long long>(creation.dwHighDateTime) << 32) | creation.dwLowDateTime;
+            CloseHandle(thread);
+        }
+        threads.insert(std::make_pair(entry.th32ThreadID, created));
+    }
+    CloseHandle(snapshot);
+    return threads;
+}
+
+int threads_created_by_rbf_calls(const std::vector<uint16_t> & input, int width, int height, int calls)
+{
+    std::vector<uint16_t> output(input.size());
+    std::vector<uint16_t> source = input;
+    /* warm-up: the pool reaches its steady size */
+    recursive_bf_wrap(source.data(), output.data(), 0.0025f, 0.09f, width, height, 3);
+    recursive_bf_wrap(source.data(), output.data(), 0.0025f, 0.09f, width, height, 3);
+    const auto before = process_thread_snapshot();
+    for( int call = 0; call < calls; ++call )
+        recursive_bf_wrap(source.data(), output.data(), 0.0025f, 0.09f, width, height, 3);
+    const auto after = process_thread_snapshot();
+    int created = 0;
+    for( const auto & thread : after )
+        if( !before.count(thread) ) ++created;
+    return created;
+}
+} // namespace
+
+TEST(ProcessingFilters, RbfFilterLegacyPassesKeepTheOpenMpTeamAlive)
+{
+    /* PLAYBACK-GPU-EPISODIC-STALL-1 r2: the legacy passes (the playback default)
+     * must not make libgomp retire and re-create threads on every call. The
+     * pre-r2 num_threads(2) vertical team between two default-size teams did,
+     * every frame, on the render thread. The two-thread team is run too, to
+     * prove the probe sees churn where there is churn. */
+    OpenMpThreadCountScope threads(6);
+    recursive_bf_set_parallel_vertical_override(0);
+    const int width = 64;
+    const int height = 48;
+    const std::vector<uint16_t> input = make_rgb_pattern(width, height);
+
+    recursive_bf_set_two_thread_vertical_team_override(-1);
+    unset_env_for_test("MLVAPP_RBF_VERTICAL_TWO_THREAD_TEAM");
+    ASSERT_EQ(0, recursive_bf_two_thread_vertical_team_enabled());
+    ASSERT_EQ(0, threads_created_by_rbf_calls(input, width, height, 12));
+
+    recursive_bf_set_two_thread_vertical_team_override(1);
+    ASSERT_EQ(1, recursive_bf_two_thread_vertical_team_enabled());
+    ASSERT_TRUE(threads_created_by_rbf_calls(input, width, height, 12) > 0);
+
+    recursive_bf_set_two_thread_vertical_team_override(-1);
+    recursive_bf_set_parallel_vertical_override(-1);
+}
+#endif
+
+#ifdef _OPENMP
+TEST(ProcessingFilters, RbfFilterVerticalTeamDoesNotChangeTheResult)
+{
+    /* The two vertical-team shapes run the same serial passes: bit-identical. */
+    OpenMpThreadCountScope threads(6);
+    recursive_bf_set_parallel_vertical_override(0);
+    const int width = 452;
+    const int height = 564;
+    std::vector<uint16_t> input = make_rgb_pattern(width, height);
+    std::vector<uint16_t> keep(input.size());
+    std::vector<uint16_t> two(input.size());
+    recursive_bf_set_two_thread_vertical_team_override(0);
+    recursive_bf_wrap(input.data(), keep.data(), 0.0005f, 0.165f, width, height, 3);
+    recursive_bf_set_two_thread_vertical_team_override(1);
+    recursive_bf_wrap(input.data(), two.data(), 0.0005f, 0.165f, width, height, 3);
+    recursive_bf_set_two_thread_vertical_team_override(-1);
+    recursive_bf_set_parallel_vertical_override(-1);
+    ASSERT_EQ(hash_image(two), hash_image(keep));
+}
+#endif
 
 TEST(ProcessingFilters, RbfFilterParallelVerticalMatchesSerialBitExact)
 {

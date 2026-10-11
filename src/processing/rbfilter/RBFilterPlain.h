@@ -78,6 +78,7 @@ class CRBFilterPlain
 	bool		m_range_table_valid = false;
     bool        m_timing_enabled = false;
     bool        m_parallel_vertical = false;
+    bool        m_two_thread_vertical_team = false;
     bool        m_last_filter_parallel = false;
     int         m_max_threads = 0;
     RBFilterPlainTiming m_last_timing;
@@ -134,6 +135,12 @@ public:
     // false (the default, so a caller that never opts in runs legacy): the
     // legacy passes with the serial vertical pair.
     void setParallelVertical(bool enabled) { m_parallel_vertical = enabled; }
+    // PLAYBACK-GPU-EPISODIC-STALL-1 r2: the legacy passes run the serial vertical
+    // pair as two OpenMP sections. false (the default): sections of a team the
+    // same size as the regions before and after it, so libgomp keeps its threads.
+    // true: the pre-r2 num_threads(2) team, which makes libgomp retire the
+    // surplus threads and create them again on every call. Same result either way.
+    void setTwoThreadVerticalTeam(bool enabled) { m_two_thread_vertical_team = enabled; }
     // Whether the last filter() call ran the parallel path (tests).
     bool lastFilterParallel() const { return m_last_filter_parallel; }
     // Team size cap of the parallel path (0: OpenMP's default). The result
