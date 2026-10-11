@@ -66,6 +66,10 @@ typedef struct
     dualiso_full20bit_scratch_t diso_full20bit_scratch;
     uint16_t * dual_iso_failure_backup;
     size_t dual_iso_failure_backup_capacity_bytes;
+    /* CPU-DUALISO-REDUCED-ISO-NOTCH-1: the reduced ISO notch's output (it cannot
+     * run in place), grown on demand; capacity in samples. */
+    uint16_t * reduced_iso_notch_scratch;
+    size_t reduced_iso_notch_scratch_capacity;
 
     int diso_pattern;
     int diso_auto_correction;

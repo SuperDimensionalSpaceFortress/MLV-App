@@ -379,6 +379,13 @@ param(
     [ValidateSet('fullscreen', 'windowed')]
     [string]$DisplayMode = 'fullscreen',
 
+    # CPU-DUALISO-REDUCED-ISO-NOTCH-1: the app's playback processing for the run, passed to the smoke runner as
+    # -PlaybackProcessing (it forwards --playback-processing). 'receipt' unchecks fast playback processing, so a cpu
+    # leg renders processed8 and the CPU reduced dual-ISO recon can engage; the smoke default is 'subset'. Empty (the
+    # default) adds nothing: the emitted job is the text it was before this parameter.
+    [ValidateSet('', 'receipt', 'subset')]
+    [string]$PlaybackProcessing = '',
+
     # PLAYBACK-VSYNC-DEFAULT-1: the GL swap interval every playback surface requests (passed to the app as MLVAPP_SWAP_INTERVAL, the
     # vsync A/B), any leg type. -1 (the default) sets nothing: the emitted job is the text it was before this parameter.
     [ValidateRange(-1, 1)][int]$SwapInterval = -1
@@ -4101,6 +4108,10 @@ if ($hasLookReceipt) {
     $lookReceiptHasher = [System.Security.Cryptography.SHA256]::Create()
     try { $lookReceiptSha256 = ([BitConverter]::ToString($lookReceiptHasher.ComputeHash($lookReceiptBytes)) -replace '-', '').ToLowerInvariant() } finally { $lookReceiptHasher.Dispose() }
     $lookReceiptBase64 = [Convert]::ToBase64String($lookReceiptBytes)
+}
+if (-not [string]::IsNullOrWhiteSpace($PlaybackProcessing)) {
+    # CPU-DUALISO-REDUCED-ISO-NOTCH-1: only a job that asks for a playback processing mode carries it; every other job is unchanged.
+    $template = Edit-DualVenueTemplate $template '-UsePersistedPlaybackSettings ' ("-UsePersistedPlaybackSettings -PlaybackProcessing $PlaybackProcessing ")
 }
 $isCpuBackend = ($Backend -eq 'cpu')
 if ($isCpuBackend -and $DisablePaintPerSubmit) {

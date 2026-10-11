@@ -35,6 +35,7 @@
 #include "../common/hash_helpers.h"
 #include "../common/repo_paths.h"
 #include "mlv_pipeline_fixture.h"
+#include "dualiso_mesh_metrics.h"
 #include "../../src/mlv/llrawproc/llrawproc.h"
 #include "../../src/mlv/llrawproc/dualiso.h"
 #include "../../src/mlv/pipeline_stage_capture.h"
@@ -421,89 +422,19 @@ TEST(GpuDualIsoPreviewScale, ReducedTextureRouteReconstructsTheReducedBayer)
 // recon by the preview scale, which averages that residual away (0.0003 on this
 // fixture); a reduced recon presented as-is shows it magnified (0.19 at x2, 0.17 at
 // x4), the visible ISO-period mesh of the r1b x2/x4 CUDA venue contact frames. r2
-// removes it with the same-colour [1,2,1]/4 notch on the reduced Bayer16, before
-// debayer. The reduced recon here is the CPU one plus the C reference notch; the
-// CUDA reduced route runs the same recon and the notch as its last kernel, and
-// their byte parity is the venue proof (c1, tools/gpu/cuda_recon_parity.cu).
+// removes it with the same-colour 7-tap notch (dualiso_reduced_iso_period_notch16) on
+// the reduced Bayer16, before debayer. The CPU reduced route
+// (mlvDualIsoPreviewScaleReconRun) applies it itself since CPU-DUALISO-REDUCED-ISO-NOTCH-1
+// (LLRP_WITH_DIMS_REDUCED_ISO_NOTCH); unnotchedCpuReducedRecon is that recon without it.
+// The CUDA reduced route runs the same recon and the notch as its last kernel, and
+// their byte parity is the venue proof (c1, tools/gpu/cuda_recon_parity.cu). The
+// metrics live in dualiso_mesh_metrics.h, shared with test_cpu_dualiso_preview_scale.cpp.
 namespace {
-double rowPeriod4Energy(const std::vector<uint8_t> & rgb, int w, int h)
-{
-    std::vector<double> rows(static_cast<size_t>(h), 0.0);
-    for (int y = 0; y < h; ++y)
-    {
-        double s = 0.0;
-        for (int x = 0; x < w * 3; ++x) s += rgb[static_cast<size_t>(y) * w * 3 + x];
-        rows[static_cast<size_t>(y)] = s / (w * 3.0);
-    }
-    // Remove the local mean (5-row box), then correlate with the period-4 basis.
-    double re = 0.0, im = 0.0;
-    int n = 0;
-    for (int y = 2; y < h - 2; ++y)
-    {
-        const double local = (rows[y - 2] + rows[y - 1] + rows[y] + rows[y + 1] + rows[y + 2]) / 5.0;
-        const double v = rows[static_cast<size_t>(y)] - local;
-        re += v * std::cos(2.0 * 3.14159265358979 * y / 4.0);
-        im += v * std::sin(2.0 * 3.14159265358979 * y / 4.0);
-        ++n;
-    }
-    return n > 0 ? std::sqrt(re * re + im * im) / n : 0.0;
-}
-
-// L2: the same estimator per column on the per-pixel channel mean, averaged
-// across columns (catches the 2-D dots a row average would hide).
-double columnPeriod4Energy(const std::vector<uint8_t> & rgb, int w, int h)
-{
-    double sum = 0.0;
-    std::vector<double> col(static_cast<size_t>(h), 0.0);
-    for (int x = 0; x < w; ++x)
-    {
-        for (int y = 0; y < h; ++y)
-        {
-            const size_t i = (static_cast<size_t>(y) * w + x) * 3;
-            col[static_cast<size_t>(y)] = (rgb[i] + rgb[i + 1] + rgb[i + 2]) / 3.0;
-        }
-        double re = 0.0, im = 0.0;
-        int n = 0;
-        for (int y = 2; y < h - 2; ++y)
-        {
-            const double local = (col[y - 2] + col[y - 1] + col[y] + col[y + 1] + col[y + 2]) / 5.0;
-            const double v = col[static_cast<size_t>(y)] - local;
-            re += v * std::cos(2.0 * 3.14159265358979 * y / 4.0);
-            im += v * std::sin(2.0 * 3.14159265358979 * y / 4.0);
-            ++n;
-        }
-        sum += n > 0 ? std::sqrt(re * re + im * im) / n : 0.0;
-    }
-    return w > 0 ? sum / w : 0.0;
-}
-
-// L3: lag-4 vertical luma detail, mean |L(x,y+4) - L(x,y)| (blind to period 4).
-double lag4VerticalLumaDetail(const std::vector<uint8_t> & rgb, int w, int h)
-{
-    double sum = 0.0;
-    size_t n = 0;
-    auto luma = [&](int x, int y) {
-        const size_t i = (static_cast<size_t>(y) * w + x) * 3;
-        return 0.299 * rgb[i] + 0.587 * rgb[i + 1] + 0.114 * rgb[i + 2];
-    };
-    for (int y = 0; y + 4 < h; ++y)
-    {
-        for (int x = 0; x < w; ++x)
-        {
-            sum += std::fabs(luma(x, y + 4) - luma(x, y));
-            ++n;
-        }
-    }
-    return n ? sum / static_cast<double>(n) : 0.0;
-}
-
-double channelMean(const std::vector<uint8_t> & rgb, int w, int h, int c)
-{
-    double sum = 0.0;
-    for (int y = 0; y < h; ++y)
-        for (int x = 0; x < w; ++x) sum += rgb[(static_cast<size_t>(y) * w + x) * 3 + c];
-    return sum / (static_cast<double>(w) * h);
-}
+using dualiso_mesh_metrics::rowPeriod4Energy;
+using dualiso_mesh_metrics::columnPeriod4Energy;
+using dualiso_mesh_metrics::lag4VerticalLumaDetail;
+using dualiso_mesh_metrics::channelMean;
+using dualiso_mesh_metrics::unnotchedCpuReducedRecon;
 
 // The full-res route's preview: its 8-bit frame box-downsampled by `scale`.
 std::vector<uint8_t> boxDownsample(const std::vector<uint8_t> & full, int fullW, int scale,
@@ -846,7 +777,9 @@ TEST(GpuDualIsoPreviewScale, ReducedReconWithNotchMatchesReference)
             ASSERT_TRUE(viaPlan == direct);
         }
 
-        std::vector<uint16_t> tentRecon(static_cast<size_t>(rw) * rh), oldRecon(tentRecon.size());
+        // The CPU route notches its reduced recon itself; the "notch off" arm is the
+        // same recon without it.
+        std::vector<uint16_t> bayer(static_cast<size_t>(rw) * rh), oldBayer(bayer.size()), tentRecon;
         {
             const X1PlaybackHint hint(video);
             for (int pass = 0; pass < 2; ++pass)
@@ -855,13 +788,12 @@ TEST(GpuDualIsoPreviewScale, ReducedReconWithNotchMatchesReference)
                 ASSERT_FALSE(raw.empty());
                 WorkerState worker;
                 ASSERT_EQ(1, mlvDualIsoPreviewScaleReconRun(video, pass ? &plan : &tentPlan, raw.data(),
-                                                            pass ? oldRecon.data() : tentRecon.data(),
+                                                            pass ? oldBayer.data() : bayer.data(),
                                                             &worker.state, 1, nullptr, nullptr));
             }
+            tentRecon = unnotchedCpuReducedRecon(video, tentPlan, decodeRaw(fixture, 2));
+            ASSERT_EQ(bayer.size(), tentRecon.size());
         }
-        std::vector<uint16_t> bayer(tentRecon.size()), oldBayer(oldRecon.size());
-        dualiso_reduced_iso_period_notch16(bayer.data(), tentRecon.data(), rw, rh);
-        dualiso_reduced_iso_period_notch16(oldBayer.data(), oldRecon.data(), rw, rh);
         const std::vector<uint16_t> binned =
             sameColourTentBin(fullRecon, fixture.width(), fixture.height(), scale, rw, rh);
 
@@ -1634,14 +1566,13 @@ TEST(GpuDualIsoPreviewScale, C1DumpDllParityVectors)
             ASSERT_EQ(1, mlvDualIsoPreviewScaleReconPlan(video, scale, &plan));
             std::vector<uint16_t> raw = decodeRaw(fixture, 2);
             ASSERT_FALSE(raw.empty());
-            std::vector<uint16_t> recon(static_cast<size_t>(plan.reducedWidth) * plan.reducedHeight);
+            std::vector<uint16_t> notched(static_cast<size_t>(plan.reducedWidth) * plan.reducedHeight);
             WorkerState worker;
-            ASSERT_EQ(1, mlvDualIsoPreviewScaleReconRun(video, &plan, raw.data(), recon.data(),
+            ASSERT_EQ(1, mlvDualIsoPreviewScaleReconRun(video, &plan, raw.data(), notched.data(),
                                                         &worker.state, 1, nullptr, nullptr));
+            const std::vector<uint16_t> recon = unnotchedCpuReducedRecon(video, plan, decodeRaw(fixture, 2));
+            ASSERT_EQ(notched.size(), recon.size());
             GPU_DUALISO_TEST_SETENV("MLVAPP_GPU_PLAYBACK_RECON", "1");
-            std::vector<uint16_t> notched(recon.size());
-            dualiso_reduced_iso_period_notch16(notched.data(), recon.data(),
-                                               plan.reducedWidth, plan.reducedHeight);
             ASSERT_TRUE(writeBlob(dir + "/out.u16", notched));
             ASSERT_TRUE(writeBlob(dir + "/out_without_notch.u16", recon));
             std::printf("[gpu-dualiso-preview-scale] c1 vectors %s %dx%d\n", dir.c_str(),
@@ -1866,15 +1797,16 @@ TEST(GpuDualIsoPreviewScale, C1ReceiptConfigReconParity)
                                 cell.c_str(), inMismatches, n);
                     std::vector<uint16_t> raw = decodeRaw(fixture, src.frame);
                     ASSERT_FALSE(raw.empty());
-                    std::vector<uint16_t> recon(n, 0u);
+                    std::vector<uint16_t> notched(n, 0u);
                     {
                         WorkerState worker;
-                        ASSERT_EQ(1, mlvDualIsoPreviewScaleReconRun(video, &plan, raw.data(), recon.data(),
+                        ASSERT_EQ(1, mlvDualIsoPreviewScaleReconRun(video, &plan, raw.data(), notched.data(),
                                                                     &worker.state, 1, nullptr, nullptr));
                     }
+                    const std::vector<uint16_t> recon =
+                        unnotchedCpuReducedRecon(video, plan, decodeRaw(fixture, src.frame));
+                    ASSERT_EQ(n, recon.size());
                     GPU_DUALISO_TEST_SETENV("MLVAPP_GPU_PLAYBACK_RECON", "1");
-                    std::vector<uint16_t> notched(n, 0u);
-                    dualiso_reduced_iso_period_notch16(notched.data(), recon.data(), w, h);
                     ASSERT_TRUE(writeU16(dir + "/out.u16", notched));
                     ASSERT_TRUE(writeU16(dir + "/out_without_notch.u16", recon));
                     std::printf("[gpu-dualiso-preview-scale] receipt parity %s %dx%d vectors written\n",
@@ -2201,4 +2133,95 @@ TEST(GpuDualIsoPreviewScale, ExportAfterReducedGpuPlaybackEqualsFreshExport)
     ASSERT_TRUE(played8 == fresh8);
     ASSERT_FALSE(fresh16.empty());
     ASSERT_TRUE(played16 == fresh16);
+}
+
+// CPU-DUALISO-REDUCED-ISO-NOTCH-1: LLRP_WITH_DIMS_REDUCED_ISO_NOTCH is passed by the CPU
+// reduced route only. (1) The GPU texture reduced run is not notched on the host: the
+// buffer ends as the prepared recon input and the retained output is the backend's recon
+// of exactly it, notched once by the backend. (2) A flags-0 with-dims call (the Phase 4B
+// callers) is the CPU route's recon without the notch, at the x2/x4 dims of the large
+// fixture. (3) The full-resolution worker recon is untouched. The sha256 lines are the
+// cross-build byte-identity record (compare them between builds).
+// Mutations: notch on GPU_TEXTURE runs fails (1); notch for flags 0 fails (2).
+TEST(CpuDualIsoPreviewScale, ReducedIsoNotchFlagOnlyOnTheCpuRoute)
+{
+    {
+        GpuReconEnv env(true);
+        MlvPipelineFixture fixture;
+        ASSERT_TRUE(openGpuEligibleFixture(fixture));
+        ASSERT_FALSE(fixture.renderFrame8(0).empty());
+        const FakeGpuBackendScope fake;
+        for (const int scale : { 4, 2 })
+        {
+            GpuReducedFrame frame;
+            ASSERT_TRUE(gpuReducedFrame(fixture, 1, scale, &frame));
+            std::vector<uint16_t> fakeRecon(frame.preparedInput.size());
+            for (size_t i = 0; i < fakeRecon.size(); ++i)
+                fakeRecon[i] = static_cast<uint16_t>(frame.preparedInput[i] + 1u);
+            std::vector<uint16_t> expected(fakeRecon.size());
+            dualiso_reduced_iso_period_notch16(expected.data(), fakeRecon.data(),
+                                               frame.plan.reducedWidth, frame.plan.reducedHeight);
+            std::printf("[gpu-dualiso-preview-scale] notch flag: GPU texture x%d prepared sha256 %s\n", scale,
+                        sha256_bytes(frame.preparedInput.data(), frame.preparedInput.size() * sizeof(uint16_t)).c_str());
+            ASSERT_TRUE(expected == frame.retained);
+        }
+        ASSERT_EQ(0, llrpGpuPlaybackReconRetainedOutstandingCount());
+    }
+
+    GpuReconEnv env(false);
+    for (const int scale : { 2, 4 })
+    {
+        MlvPipelineFixture fixture;
+        QString error;
+        ASSERT_TRUE(fixture.openClipFile(repo_file_path(QStringLiteral("tests/fixtures/clips/large_dual_iso.mlv")), &error));
+        ASSERT_TRUE(fixture.loadReceipt(QStringLiteral("tests/fixtures/receipts/large_dual_iso_hq.marxml"), &error));
+        ASSERT_TRUE(fixture.applyReceipt(&error));
+        // Without the coordinate-sensitive fixes, so the flags-0 call reconstructs
+        // (with them on, it refuses at reduced size and leaves the buffer alone).
+        fixture.video()->llrawproc->focus_pixels = 0;
+        fixture.video()->llrawproc->bad_pixels = 0;
+        fixture.video()->llrawproc->vertical_stripes = 0;
+        fixture.video()->llrawproc->pattern_noise = 0;
+        ASSERT_FALSE(fixture.renderFrame8(0).empty());
+        mlvObject_t * video = fixture.video();
+        mlvDualIsoPreviewScaleRecon_t plan;
+        ASSERT_EQ(1, mlvDualIsoPreviewScaleReconPlan(video, scale, &plan));
+        ASSERT_EQ(0, plan.fullResFixes);
+        const std::vector<uint16_t> unnotched = unnotchedCpuReducedRecon(video, plan, decodeRaw(fixture, 2));
+        ASSERT_FALSE(unnotched.empty());
+
+        std::vector<uint16_t> raw = decodeRaw(fixture, 2);
+        ASSERT_FALSE(raw.empty());
+        std::vector<uint16_t> phase4b(static_cast<size_t>(plan.reducedWidth) * plan.reducedHeight);
+        int ow = 0, oh = 0;
+        ASSERT_EQ(0, scale == 2
+            ? pl_downsample_bayer_to_bayer_2x(raw.data(), fixture.width(), plan.sourceHeight,
+                                              phase4b.data(), &ow, &oh, 1)
+            : pl_downsample_bayer_to_bayer_4x(raw.data(), fixture.width(), plan.sourceHeight,
+                                              phase4b.data(), &ow, &oh, 1));
+        ASSERT_EQ(plan.reducedWidth, ow);
+        ASSERT_EQ(plan.reducedHeight, oh);
+        const int rc = applyLLRawProcObject_with_dims(video, phase4b.data(), phase4b.size() * sizeof(uint16_t),
+                                                      ow, oh);
+        std::printf("[gpu-dualiso-preview-scale] notch flag: flags-0 with_dims x%d %dx%d rc=%d fullResFixes=%d "
+                    "sha256 %s (== CPU route recon without the notch: %s)\n",
+                    scale, ow, oh, rc, plan.fullResFixes,
+                    sha256_bytes(phase4b.data(), phase4b.size() * sizeof(uint16_t)).c_str(),
+                    phase4b == unnotched ? "yes" : "no");
+        ASSERT_EQ(1, rc);
+        ASSERT_TRUE(phase4b == unnotched);
+    }
+
+    MlvPipelineFixture fixture;
+    QString error;
+    ASSERT_TRUE(fixture.openClipFile(repo_file_path(QStringLiteral("tests/fixtures/clips/large_dual_iso.mlv")), &error));
+    ASSERT_TRUE(fixture.loadReceipt(QStringLiteral("tests/fixtures/receipts/large_dual_iso_hq.marxml"), &error));
+    ASSERT_TRUE(fixture.applyReceipt(&error));
+    ASSERT_FALSE(fixture.renderFrame8(0).empty());
+    std::vector<uint16_t> full = decodeRaw(fixture, 2);
+    ASSERT_FALSE(full.empty());
+    WorkerState worker;
+    applyLLRawProcObjectWorker(fixture.video(), full.data(), full.size() * sizeof(uint16_t), &worker.state, 0);
+    std::printf("[gpu-dualiso-preview-scale] notch flag: full-res worker recon sha256 %s\n",
+                sha256_bytes(full.data(), full.size() * sizeof(uint16_t)).c_str());
 }
