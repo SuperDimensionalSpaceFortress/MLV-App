@@ -1,3 +1,6 @@
+# PWSH-FILE-ARRAY-PASSTHRU-1: under `pwsh -File` an array arrives as separate tokens, and the extras used to bind to
+# a positional parameter or fall silently into $args. PositionalBinding off: a stray token is refused at bind time.
+[CmdletBinding(PositionalBinding = $false)]
 param(
     [string]$RepoRoot = ".",
     [string]$ExePath = "",

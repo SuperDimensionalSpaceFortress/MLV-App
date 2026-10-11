@@ -399,7 +399,34 @@ struct GpuPreviewProcessingLutTextureSet
     int shadowsHighlightsBlurHeight = 0;
     bool shadowsHighlightsBlurReady = false;
     bool shadowsHighlightsBlurQuarter = false;   /* texture holds the quarter-res blur */
+    /* PLAYBACK-GPU-EPISODIC-STALL-1 r2: the GL_PIXEL_UNPACK_BUFFER the steady blur
+     * upload goes through in GpuShBlurUploadPbo mode (0 = not created yet). */
+    unsigned int shadowsHighlightsBlurPbo = 0;
 };
+
+/* PLAYBACK-GPU-EPISODIC-STALL-1 r2: how the STEADY (same-size, already-allocated)
+ * shadows/highlights blur upload reaches its texture. The allocation upload is never
+ * affected. Client = glTexSubImage2D from client memory (the pre-r2 path); Skip = no
+ * steady upload at all, the texture keeps what it last held, in a skip-only session the
+ * allocation-time blur (MEASUREMENT ONLY, the picture is wrong); Pbo = the app maps a GL_PIXEL_UNPACK_BUFFER, packs the blur
+ * into it, and glTexSubImage2D reads from offset 0 (pixel-identical to Client, and no
+ * driver call reads client memory). A context that cannot map a buffer range falls
+ * back to Client for that call. */
+enum GpuShBlurUploadMode
+{
+    GpuShBlurUploadClient = 0,
+    GpuShBlurUploadSkip = 1,
+    GpuShBlurUploadPbo = 2
+};
+/* "MLVAPP_GPU_SH_BLUR_UPLOAD_MODE". */
+const char * gpuPreviewProcessingShBlurUploadModeSwitchName(void);
+/* value = qEnvironmentVariable(switch name). Exactly "client", "skip" or "pbo"
+ * (case-insensitive, surrounding whitespace ignored) select that mode; null, empty
+ * and every other value select the default, Client. */
+GpuShBlurUploadMode gpuPreviewProcessingShBlurUploadModeFromValue(const QString & value);
+const char * gpuPreviewProcessingShBlurUploadModeName(GpuShBlurUploadMode mode);
+/* The mode from the environment, read on every call. */
+GpuShBlurUploadMode gpuPreviewProcessingShBlurUploadMode(void);
 
 /* A presenter route that does NOT upload a fresh per-frame shadows/highlights
  * blur must call this, so the display shader binds S/H off for that frame

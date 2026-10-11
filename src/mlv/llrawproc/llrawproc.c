@@ -1007,8 +1007,9 @@ static const char * llrawproc_fake_gpu_backend_describe(igpu_recon_backend * b)
     return "fake-test-backend (no GPU, C-seam only)";
 }
 
-/* Mirrors igpu_recon_cuda.cu's retained slots: set_clip frees every retained
- * output whether or not it is in use, which is the hazard the C seam guards. */
+/* Mirrors igpu_recon_cuda.cu's retained slots: a set_clip at new dims frees
+ * every retained output whether or not it is in use, which is the hazard the
+ * C seam guards; at unchanged dims (levels or ISO pattern moved) it keeps them. */
 static uint64_t g_llrawproc_fake_gpu_backend_next_token = 1;
 static int g_llrawproc_fake_gpu_backend_in_use_count = 0;
 static int g_llrawproc_fake_gpu_backend_freed_in_use = 0;
@@ -1018,8 +1019,12 @@ static int llrawproc_fake_gpu_backend_set_clip(igpu_recon_backend * b,
 {
     (void)b;
     if(!clip) return -1;
-    g_llrawproc_fake_gpu_backend_freed_in_use += g_llrawproc_fake_gpu_backend_in_use_count;
-    g_llrawproc_fake_gpu_backend_in_use_count = 0;
+    if(clip->width != g_llrawproc_fake_gpu_backend_clip.width
+    || clip->height != g_llrawproc_fake_gpu_backend_clip.height)
+    {
+        g_llrawproc_fake_gpu_backend_freed_in_use += g_llrawproc_fake_gpu_backend_in_use_count;
+        g_llrawproc_fake_gpu_backend_in_use_count = 0;
+    }
     g_llrawproc_fake_gpu_backend_clip = *clip;
     return 0;
 }
@@ -1664,6 +1669,7 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
     int set_clip_rc = 0;
     int set_luts_rc = 0;
     int set_clip_called = 0;
+    const char * set_clip_changed = "none";
     int set_luts_called = 0;
     double set_clip_start_s = 0.0;
     double set_clip_ms = 0.0;
@@ -1757,6 +1763,12 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
     }
     if(need_set_clip)
     {
+        if(!g->clip_configured) set_clip_changed = "first";
+        else if(g->configured_clip.width != clip.width
+             || g->configured_clip.height != clip.height) set_clip_changed = "dims";
+        else if(memcmp(g->configured_clip.is_bright, clip.is_bright, sizeof(clip.is_bright)) != 0)
+            set_clip_changed = "pattern";
+        else set_clip_changed = "levels";
         set_clip_start_s = mlv_stage_timing_now();
         rc = g->set_clip(g->backend, &clip);
         set_clip_ms = (mlv_stage_timing_now() - set_clip_start_s) * 1000.0;
@@ -1964,10 +1976,11 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
         {
             snprintf(line, sizeof(line),
                      "gpu_recon_event kind=set_clip frame=%llu wall_ms=%.3f dur_ms=%.3f "
-                     "width=%d height=%d rc=%d count=%lld",
+                     "width=%d height=%d rc=%d count=%lld changed=%s black=%d white=%d",
                      (unsigned long long)frame_id, set_clip_start_s * 1000.0, set_clip_ms,
                      clip.width, clip.height, set_clip_rc,
-                     (long long)g_llrawproc_gpu_set_clip_count);
+                     (long long)g_llrawproc_gpu_set_clip_count, set_clip_changed,
+                     clip.black_level, clip.white_level);
             g_llrawproc_gpu_recon_event_logger(line);
         }
         if(set_luts_called)
@@ -2934,6 +2947,10 @@ static void llrawproc_free_worker_state(llrawprocWorkerState_t * worker)
     worker->dual_iso_failure_backup = NULL;
     worker->dual_iso_failure_backup_capacity_bytes = 0;
 
+    free(worker->reduced_iso_notch_scratch);
+    worker->reduced_iso_notch_scratch = NULL;
+    worker->reduced_iso_notch_scratch_capacity = 0;
+
     worker->dng_bit_depth = 0;
     worker->dng_black_level = 0;
     worker->dng_white_level = 0;
@@ -3112,6 +3129,50 @@ static void llrawproc_restore_worker_runtime_state(
     worker->dng_black_level = state->dng_black_level;
     worker->dng_white_level = state->dng_white_level;
     worker->prev_black_level = -1;
+}
+
+/* CPU-DUALISO-REDUCED-ISO-NOTCH-1: process-wide counters of the reduced ISO notch on
+ * the CPU reduced route (notched frames and their summed notch time in microseconds),
+ * for the play-stop summary. */
+static uint64_t g_llrawproc_reduced_iso_notch_frames = 0;
+static uint64_t g_llrawproc_reduced_iso_notch_micros = 0;
+static int g_llrawproc_reduced_iso_notch_scratch_fail_for_testing = 0;
+
+uint64_t mlvDualIsoReducedIsoNotchFrames(void)
+{
+    return __atomic_load_n(&g_llrawproc_reduced_iso_notch_frames, __ATOMIC_RELAXED);
+}
+
+uint64_t mlvDualIsoReducedIsoNotchMicros(void)
+{
+    return __atomic_load_n(&g_llrawproc_reduced_iso_notch_micros, __ATOMIC_RELAXED);
+}
+
+void llrpFailReducedIsoNotchScratchForTesting(int fail)
+{
+    g_llrawproc_reduced_iso_notch_scratch_fail_for_testing = fail ? 1 : 0;
+}
+
+/* The reduced ISO notch on a reduced recon, through the worker's scratch, then
+ * copied back. Returns 0 when the scratch cannot be grown (buffer untouched). */
+static int llrawproc_worker_reduced_iso_notch(llrawprocWorkerState_t * worker,
+                                              uint16_t * buffer,
+                                              int width,
+                                              int height)
+{
+    const size_t samples = (size_t)width * (size_t)height;
+    if (g_llrawproc_reduced_iso_notch_scratch_fail_for_testing) return 0;
+    if (worker->reduced_iso_notch_scratch_capacity < samples)
+    {
+        uint16_t * resized = (uint16_t *)realloc(worker->reduced_iso_notch_scratch,
+                                                 samples * sizeof(uint16_t));
+        if (!resized) return 0;
+        worker->reduced_iso_notch_scratch = resized;
+        worker->reduced_iso_notch_scratch_capacity = samples;
+    }
+    dualiso_reduced_iso_period_notch16(worker->reduced_iso_notch_scratch, buffer, width, height);
+    memcpy(buffer, worker->reduced_iso_notch_scratch, samples * sizeof(uint16_t));
+    return 1;
 }
 
 static uint16_t * llrawproc_worker_capture_dual_iso_failure_backup(
@@ -5474,7 +5535,7 @@ static int llrawproc_apply_with_dims_internal(mlvObject_t * video,
 
         publish_auto_correction = !has_explicit_auto_match;
 
-        const int dual_iso_recon_ok =
+        const int dual_iso_recon_core_ok =
             (flags & LLRP_WITH_DIMS_GPU_PLAYBACK_TEXTURE)
             ? (!isolated_analysis
                && llrawproc_with_dims_gpu_playback_texture(video,
@@ -5518,6 +5579,30 @@ static int llrawproc_apply_with_dims_internal(mlvObject_t * video,
         dualiso_debug_get_full20bit_timing(
             &g_llrawproc_last_dual_iso_full20bit_timing);
         dual_iso_ms += (mlv_stage_timing_now() - dual_iso_start) * 1000.0;
+
+        /* CPU-DUALISO-REDUCED-ISO-NOTCH-1: the CPU reduced route's recon takes the
+         * reduced ISO-period notch the CUDA reduced route runs as its last kernel.
+         * A scratch that cannot be grown fails the call like a failed recon. */
+        int reduced_iso_notch_ok = 1;
+        if (dual_iso_recon_core_ok
+            && (flags & LLRP_WITH_DIMS_REDUCED_ISO_NOTCH)
+            && !(flags & LLRP_WITH_DIMS_GPU_PLAYBACK_TEXTURE))
+        {
+            const double notch_start = mlv_stage_timing_now();
+            reduced_iso_notch_ok = llrawproc_worker_reduced_iso_notch(worker,
+                                                                      raw_image_buff,
+                                                                      override_w,
+                                                                      override_h);
+            const double notch_ms = (mlv_stage_timing_now() - notch_start) * 1000.0;
+            dual_iso_ms += notch_ms;
+            if (reduced_iso_notch_ok)
+            {
+                __atomic_fetch_add(&g_llrawproc_reduced_iso_notch_frames, 1, __ATOMIC_RELAXED);
+                __atomic_fetch_add(&g_llrawproc_reduced_iso_notch_micros,
+                                   (uint64_t)(notch_ms * 1000.0 + 0.5), __ATOMIC_RELAXED);
+            }
+        }
+        const int dual_iso_recon_ok = dual_iso_recon_core_ok && reduced_iso_notch_ok;
 
         if (!dual_iso_recon_ok)
         {

@@ -655,6 +655,8 @@ private slots:
     void gpuPreviewProcessingLutReadinessReflectsSignatureNotJustPointers();
     void gpuPreviewProcessingLutTextureSetFailsClosedOnMissingUploadAndContextLoss();
     void gpuPreviewProcessingLutSetReportsRebuildsAndBlurUploadsKeepTheirBytes();
+    void gpuPreviewProcessingShBlurUploadModeParsesOnlyItsThreeValues();
+    void gpuPreviewProcessingShBlurPboUploadKeepsBytesAndSkipKeepsAllocation();
     void gpuPreviewProcessingReconRefusalMatchesForBothPresentersOnInjectedUploadFailure();
     void gpuViewportRefusesReconTextureDrawWhenLutReadinessIsFalse();
     void gpuDisplayWindowRecoversRetainedQImageAfterContextLossTeardown();
@@ -2756,6 +2758,126 @@ void GuiSmokeTest::gpuPreviewProcessingLutSetReportsRebuildsAndBlurUploadsKeepTh
     QCOMPARE(gl->glGetError(), static_cast<GLenum>(GL_NO_ERROR));
 
     gpuPreviewProcessingDestroyLutTextureSet(set);
+    context.doneCurrent();
+}
+
+void GuiSmokeTest::gpuPreviewProcessingShBlurUploadModeParsesOnlyItsThreeValues()
+{
+    // PLAYBACK-GPU-EPISODIC-STALL-1 r2: MLVAPP_GPU_SH_BLUR_UPLOAD_MODE. Unset, empty and
+    // unknown values keep the pre-r2 client upload; only the three names select a mode.
+    QCOMPARE(QString::fromLatin1(gpuPreviewProcessingShBlurUploadModeSwitchName()),
+             QStringLiteral("MLVAPP_GPU_SH_BLUR_UPLOAD_MODE"));
+    QCOMPARE(gpuPreviewProcessingShBlurUploadModeFromValue(QString()), GpuShBlurUploadClient);
+    QCOMPARE(gpuPreviewProcessingShBlurUploadModeFromValue(QStringLiteral("")), GpuShBlurUploadClient);
+    QCOMPARE(gpuPreviewProcessingShBlurUploadModeFromValue(QStringLiteral("client")), GpuShBlurUploadClient);
+    QCOMPARE(gpuPreviewProcessingShBlurUploadModeFromValue(QStringLiteral("skip")), GpuShBlurUploadSkip);
+    QCOMPARE(gpuPreviewProcessingShBlurUploadModeFromValue(QStringLiteral("pbo")), GpuShBlurUploadPbo);
+    QCOMPARE(gpuPreviewProcessingShBlurUploadModeFromValue(QStringLiteral(" PBO ")), GpuShBlurUploadPbo);
+    QCOMPARE(gpuPreviewProcessingShBlurUploadModeFromValue(QStringLiteral("Skip")), GpuShBlurUploadSkip);
+    QCOMPARE(gpuPreviewProcessingShBlurUploadModeFromValue(QStringLiteral("1")), GpuShBlurUploadClient);
+    QCOMPARE(gpuPreviewProcessingShBlurUploadModeFromValue(QStringLiteral("pbo2")), GpuShBlurUploadClient);
+    QCOMPARE(gpuPreviewProcessingShBlurUploadModeFromValue(QStringLiteral("skipx")), GpuShBlurUploadClient);
+    QCOMPARE(QString::fromLatin1(gpuPreviewProcessingShBlurUploadModeName(GpuShBlurUploadClient)), QStringLiteral("client"));
+    QCOMPARE(QString::fromLatin1(gpuPreviewProcessingShBlurUploadModeName(GpuShBlurUploadSkip)), QStringLiteral("skip"));
+    QCOMPARE(QString::fromLatin1(gpuPreviewProcessingShBlurUploadModeName(GpuShBlurUploadPbo)), QStringLiteral("pbo"));
+
+    // The production reader is the environment, read on every call.
+    const QByteArray saved = qgetenv("MLVAPP_GPU_SH_BLUR_UPLOAD_MODE");
+    const bool hadSaved = qEnvironmentVariableIsSet("MLVAPP_GPU_SH_BLUR_UPLOAD_MODE");
+    auto restore = qScopeGuard([&] {
+        if (hadSaved) qputenv("MLVAPP_GPU_SH_BLUR_UPLOAD_MODE", saved);
+        else qunsetenv("MLVAPP_GPU_SH_BLUR_UPLOAD_MODE");
+    });
+    qunsetenv("MLVAPP_GPU_SH_BLUR_UPLOAD_MODE");
+    QCOMPARE(gpuPreviewProcessingShBlurUploadMode(), GpuShBlurUploadClient);
+    qputenv("MLVAPP_GPU_SH_BLUR_UPLOAD_MODE", "pbo");
+    QCOMPARE(gpuPreviewProcessingShBlurUploadMode(), GpuShBlurUploadPbo);
+    qputenv("MLVAPP_GPU_SH_BLUR_UPLOAD_MODE", "skip");
+    QCOMPARE(gpuPreviewProcessingShBlurUploadMode(), GpuShBlurUploadSkip);
+}
+
+void GuiSmokeTest::gpuPreviewProcessingShBlurPboUploadKeepsBytesAndSkipKeepsAllocation()
+{
+    // PLAYBACK-GPU-EPISODIC-STALL-1 r2, against a live GL context: (1) in pbo mode every
+    // steady-state upload goes through the set's pixel unpack buffer and the texture holds
+    // exactly the bytes the client upload would have put there (pixel-identical), with no
+    // buffer left bound; (2) in skip mode a steady call uploads nothing, so the texture
+    // keeps the allocation-time blur; (3) destroying the set releases the buffer.
+    MLV_SKIP_OR_FAIL_IF_OFFSCREEN("GPU blur PBO upload needs a platform plugin that can create an OpenGL context");
+
+    QOffscreenSurface surface;
+    surface.setFormat(QSurfaceFormat::defaultFormat());
+    surface.create();
+    if (!surface.isValid()) {
+        MLV_SKIP_OR_FAIL_IF_READBACK_FAILED("QOffscreenSurface creation failed in this environment");
+    }
+    QOpenGLContext context;
+    context.setFormat(surface.requestedFormat());
+    if (!context.create() || !context.makeCurrent(&surface)) {
+        MLV_SKIP_OR_FAIL_IF_READBACK_FAILED("QOpenGLContext creation/makeCurrent failed in this environment");
+    }
+    if (context.format().version() < qMakePair(3, 0) && !context.hasExtension(QByteArrayLiteral("GL_ARB_map_buffer_range"))) {
+        MLV_SKIP_OR_FAIL_IF_READBACK_FAILED("this GL context cannot map a buffer range (the PBO path falls back to client)");
+    }
+    QOpenGLFunctions *gl = context.functions();
+
+    const QByteArray saved = qgetenv("MLVAPP_GPU_SH_BLUR_UPLOAD_MODE");
+    const bool hadSaved = qEnvironmentVariableIsSet("MLVAPP_GPU_SH_BLUR_UPLOAD_MODE");
+    auto restore = qScopeGuard([&] {
+        if (hadSaved) qputenv("MLVAPP_GPU_SH_BLUR_UPLOAD_MODE", saved);
+        else qunsetenv("MLVAPP_GPU_SH_BLUR_UPLOAD_MODE");
+    });
+
+    GpuPreviewProcessingLutTextureSet set;
+    GpuPreviewProcessingConfig blurConfig = make_synthetic_preview_processing_config();
+    gpuPreviewProcessingUpdateLutTextureSet(set, blurConfig);
+    QVERIFY(gpuPreviewProcessingLutTextureSetReady(set, blurConfig));
+    const int width = 16;
+    const int height = 8;
+    blurConfig.applyShadowsHighlights = true;
+    blurConfig.shadowsHighlightsFrameStateReady = true;
+    blurConfig.shadowsHighlightsFrameWidth = width;
+    blurConfig.shadowsHighlightsFrameHeight = height;
+    blurConfig.shadowsHighlightsCurve = QByteArray(static_cast<int>(65536u * sizeof(float)), '\0');
+
+    qputenv("MLVAPP_GPU_SH_BLUR_UPLOAD_MODE", "pbo");
+    const uint16_t seeds[3] = { 7, 2053, 40009 };
+    GLuint allocatedId = 0;
+    for (int round = 0; round < 3; ++round) {
+        blurConfig.shadowsHighlightsBlur = make_rgb16_blur_bytes(width, height, seeds[round]);
+        GpuPresentSetupTiming timing;
+        QVERIFY(gpuPreviewProcessingUpdateShadowsHighlightsBlurTexture(set, blurConfig, width, height, &timing));
+        QVERIFY(set.shadowsHighlightsBlurReady);
+        if (round == 0) {
+            // The allocation upload is never routed through the buffer.
+            allocatedId = set.shadowsHighlightsBlur->textureId();
+            QCOMPARE(set.shadowsHighlightsBlurPbo, 0u);
+        } else {
+            QCOMPARE(set.shadowsHighlightsBlur->textureId(), allocatedId);
+            QVERIFY(set.shadowsHighlightsBlurPbo != 0u);
+            GLint boundUnpack = -1;
+            gl->glGetIntegerv(0x88EF /* GL_PIXEL_UNPACK_BUFFER_BINDING */, &boundUnpack);
+            QCOMPARE(boundUnpack, 0);
+        }
+        const QByteArray readback = read_rgba16_texture(gl, set.shadowsHighlightsBlur->textureId(), width, height);
+        if (readback.isEmpty()) {
+            MLV_SKIP_OR_FAIL_IF_READBACK_FAILED("RGBA16 framebuffer attachment readback is not supported here");
+        }
+        QCOMPARE(readback, expected_rgba16(blurConfig.shadowsHighlightsBlur, width * height));
+    }
+    const QByteArray lastUploaded = blurConfig.shadowsHighlightsBlur;
+
+    // skip: a steady call reports ready but leaves the texture as it was.
+    qputenv("MLVAPP_GPU_SH_BLUR_UPLOAD_MODE", "skip");
+    blurConfig.shadowsHighlightsBlur = make_rgb16_blur_bytes(width, height, 12345);
+    QVERIFY(gpuPreviewProcessingUpdateShadowsHighlightsBlurTexture(set, blurConfig, width, height));
+    QVERIFY(set.shadowsHighlightsBlurReady);
+    QCOMPARE(read_rgba16_texture(gl, set.shadowsHighlightsBlur->textureId(), width, height),
+             expected_rgba16(lastUploaded, width * height));
+    QCOMPARE(gl->glGetError(), static_cast<GLenum>(GL_NO_ERROR));
+
+    gpuPreviewProcessingDestroyLutTextureSet(set);
+    QCOMPARE(set.shadowsHighlightsBlurPbo, 0u);
     context.doneCurrent();
 }
 
