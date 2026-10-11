@@ -1,7 +1,7 @@
 # lane-local-playback-lint.ps1 -- HUB-VM-NO-LOCAL-PLAYBACK-1 (owner objection 2026-10-11). Dot-source it; it defines three functions and runs nothing.
 #
 #   Get-HubHostConfig                       the tracked host list (tools/profiling/dual-venue/hub-hosts.json)
-#   Test-HubHost [-ComputerName <name>]     $true when this host is a hub host and the CI-fixture override is NOT set
+#   Test-HubHost [-ComputerName <name>]     $true when this host (COMPUTERNAME, else the runtime host name) is a hub host and the CI-fixture override is NOT set
 #   Get-LocalPlaybackPromptFindings -Text   one string per sentence that tells a lane to run MLVApp playback locally (wrap the call in @())
 #
 # Why: the 2026-10-11 incident. A producer prompt said to run the exactness arms "where a GUI desktop session and the clip exist"; the lane found
@@ -28,7 +28,8 @@ function Get-HubHostConfig {
 
 function Test-HubHost {
     [CmdletBinding()]
-    param([string]$ComputerName = $env:COMPUTERNAME, [string]$HostsFile)
+    # COMPUTERNAME is Windows-only; pwsh on Linux/macOS leaves it unset, so fall back to the runtime's own host name there.
+    param([string]$ComputerName = $(if ($env:COMPUTERNAME) { $env:COMPUTERNAME } else { [Environment]::MachineName }), [string]$HostsFile)
     $cfg = if ($HostsFile) { Get-HubHostConfig -Path $HostsFile } else { Get-HubHostConfig }
     $overrideNow = [Environment]::GetEnvironmentVariable([string]$cfg.ciFixtureOverrideEnv)
     if ($overrideNow -and $overrideNow.Trim() -ceq [string]$cfg.ciFixtureOverrideValue) { return $false }

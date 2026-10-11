@@ -277,14 +277,41 @@ class PromptLintTests(unittest.TestCase):
 class InvokeLaneRefusalTests(unittest.TestCase):
     """A lane on the hub host whose prompt asks for local playback is refused before any process, run dir or receipt exists."""
 
-    def _run(self, host: str, prompt: str, run_dir: Path):
+    def _run(self, host: str, prompt: str, run_dir: Path, script: Path = INVOKE_LANE):
         env = dict(os.environ, COMPUTERNAME=host)
         env.pop("MLVAPP_HUB_PLAYBACK_CI_FIXTURE", None)
         return subprocess.run(
-            [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(INVOKE_LANE), "-Lane", "sonnet", "-Prompt", prompt,
+            [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(script), "-Lane", "sonnet", "-Prompt", prompt,
              "-WorkDir", str(ROOT), "-RunDir", str(run_dir), "-TimeoutSec", "60"],
             capture_output=True, text=True, timeout=180, env=env,
         )
+
+    def test_a_copy_without_its_lint_refuses_every_lane_fail_closed(self):
+        """Without the lint the host cannot be checked, so even a venue host with a harmless prompt is refused -- never run unchecked."""
+        with tempfile.TemporaryDirectory(prefix="hubvm-nolint-") as tmp:
+            script = Path(tmp) / "Invoke-Lane.ps1"
+            script.write_bytes(INVOKE_LANE.read_bytes())
+            run_dir = Path(tmp) / "run"
+            done = self._run("BACHELOR", "Build and run the console tests.\n", run_dir, script)
+            out = done.stdout + done.stderr
+            self.assertNotEqual(0, done.returncode, out)
+            self.assertIn("local-playback-lint-missing", out)
+            self.assertIn("HUB_VM_LOCAL_PLAYBACK_REFUSED", out)
+            self.assertFalse(run_dir.exists(), "the refusal must come before any run dir exists")
+
+    def test_a_lint_without_the_host_list_refuses_every_lane_fail_closed(self):
+        with tempfile.TemporaryDirectory(prefix="hubvm-nohosts-") as tmp:
+            coord = Path(tmp) / "coordination"
+            coord.mkdir()
+            script = coord / "Invoke-Lane.ps1"
+            script.write_bytes(INVOKE_LANE.read_bytes())
+            (coord / LINT_PS1.name).write_bytes(LINT_PS1.read_bytes())
+            run_dir = Path(tmp) / "run"
+            done = self._run("BACHELOR", "Build and run the console tests.\n", run_dir, script)
+            out = done.stdout + done.stderr
+            self.assertNotEqual(0, done.returncode, out)
+            self.assertIn("hub-hosts.json not found", out)
+            self.assertFalse(run_dir.exists(), "the refusal must come before any run dir exists")
 
     def test_red_hub_host_with_the_incident_prompt_is_refused_before_anything_starts(self):
         with tempfile.TemporaryDirectory(prefix="hubvm-lane-") as tmp:
@@ -300,7 +327,9 @@ class InvokeLaneRefusalTests(unittest.TestCase):
         text = INVOKE_LANE.read_text(encoding="utf-8")
         gate = text.index("local-playback-prompt-refused")
         # Call sites only (a function DEFINITION that mentions New-Item sits earlier in the file and runs nothing).
-        for later in ("Write-Utf8NoBom $promptPath", "$hookCopyPath = ", "# ---------------------------------------------------------------- 0.1 pre-flight"):
+        # The Windows-only paths (%APPDATA% launchers, the job object type) come after it too, so the refusal runs on every OS (hosted ubuntu CI).
+        for later in ("Write-Utf8NoBom $promptPath", "$hookCopyPath = ", "# ---------------------------------------------------------------- 0.1 pre-flight",
+                      "Join-Path $env:APPDATA", "Add-Type -TypeDefinition"):
             at = text.find(later)
             if at != -1:
                 self.assertLess(gate, at, f"gate must precede {later!r}")

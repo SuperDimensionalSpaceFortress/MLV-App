@@ -245,6 +245,14 @@ def prepare(tree, mode, assignment_failure=False, editing=False, allowed_tools="
     (root/"lane-provider-refusal.ps1").write_bytes((ROOT/"tools"/"coordination"/"lane-provider-refusal.ps1").read_bytes())
     (root/"lane-no-background.py").write_bytes((ROOT/"tools"/"coordination"/"lane-no-background.py").read_bytes())
     (root/"resolve-codex-tier.py").write_bytes((ROOT/"tools"/"coordination"/"resolve-codex-tier.py").read_bytes())
+    # HUB-VM-NO-LOCAL-PLAYBACK-1: Invoke-Lane.ps1 dot-sources lane-local-playback-lint.ps1 from its own folder and REFUSES every lane
+    # when it is missing (fail closed), so the copy carries the real lint and the real tracked host list. The lint finds the host list
+    # at ..\profiling\dual-venue\ beside itself, which would sit outside this fixture root; that one path is rebased into the root.
+    lint_text=(ROOT/"tools"/"coordination"/"lane-local-playback-lint.ps1").read_text(encoding="utf-8")
+    hosts_needle="(Join-Path $PSScriptRoot '..\\profiling\\dual-venue\\hub-hosts.json')"
+    assert hosts_needle in lint_text, "lane-local-playback-lint.ps1's hub-hosts.json default path changed shape; update this fixture's rebase to match"
+    (root/"lane-local-playback-lint.ps1").write_text(lint_text.replace(hosts_needle,"(Join-Path $PSScriptRoot 'hub-hosts.json')"),encoding="utf-8")
+    (root/"hub-hosts.json").write_bytes((ROOT/"tools"/"profiling"/"dual-venue"/"hub-hosts.json").read_bytes())
     if editing:
         hook=root/"tools"/"hooks"/"mlv-never-authorized.py"; hook.parent.mkdir(parents=True); hook.write_text("# fixture hook\n",encoding="ascii")
         rec=root/".claude-state"/"coordination"/"dual-lane"/"receipts"/"0.05-hook-enforced.json"; rec.parent.mkdir(parents=True)
