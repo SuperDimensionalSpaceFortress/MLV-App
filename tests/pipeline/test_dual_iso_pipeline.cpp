@@ -7773,6 +7773,213 @@ TEST(DualIsoPipeline, DualIsoPerFramePhaseVerificationHandlesRotatingStaticAndKi
     }
 }
 
+/* DUALISO-PATTERN-FLICKER-CHECK-1: a night frame. The bright rows sit ~150 raw units over
+ * black and the dark rows 1/16 of that, under a textured scene with sparse highlights, so the
+ * row-group separation is clear but below the probe's absolute margin floor
+ * ((white - black) / 64 = 218 here). */
+static std::vector<uint16_t> synthetic_dual_iso_dim_phase_frame(const struct raw_info & raw,
+                                                               int pattern_index)
+{
+    static const int kPatterns[4][4] = {
+        {1, 1, 0, 0},
+        {1, 0, 0, 1},
+        {0, 0, 1, 1},
+        {0, 1, 1, 0},
+    };
+    std::vector<uint16_t> frame(static_cast<size_t>(raw.width) * static_cast<size_t>(raw.height));
+    for (int y = 0; y < raw.height; y++)
+    {
+        const int signal = kPatterns[pattern_index][y & 3] ? 150 : 9;
+        for (int x = 0; x < raw.width; x++)
+        {
+            double scene = 0.1 + 1.8 * static_cast<double>((x / 8 + y / 8) % 16) / 15.0;
+            if (((x * 7 + y * 13) % 97) == 0)
+                scene *= 12.0;
+            const int noise = ((x * 3 + y * 5) & 7) - 4;
+            frame[static_cast<size_t>(y) * static_cast<size_t>(raw.width) + static_cast<size_t>(x)] =
+                static_cast<uint16_t>(raw.black_level + static_cast<int>(signal * scene) + noise);
+        }
+    }
+    return frame;
+}
+
+TEST(DualIsoPipeline, DualIsoPerFramePhaseVerificationFollowsDimRotatingFrames)
+{
+    ScopedDualIsoPhaseEnv phase_env;
+    phase_env.unset();
+    const struct raw_info raw = synthetic_dual_iso_phase_raw_info();
+
+    {
+        dualiso_full20bit_scratch_t scratch = {};
+        int iso_pattern = 0;
+        std::vector<int> observed_patterns;
+        const int sequence[] = {0, 1, 2, 3, 0};
+        for (int pattern_index : sequence)
+        {
+            std::vector<uint16_t> frame = synthetic_dual_iso_dim_phase_frame(raw, pattern_index);
+            dualiso_gpu_recon_state_t state = {};
+            ASSERT_TRUE(synthetic_dual_iso_prepare_state(raw, frame, &iso_pattern, &scratch, &state) != 0);
+            ASSERT_EQ(1, state.valid);
+            observed_patterns.push_back(iso_pattern);
+            ASSERT_EQ(-(pattern_index + 1), iso_pattern);
+            assert_dual_iso_pattern(state, pattern_index);
+        }
+        test_artifacts::record("dual_iso.per_frame_phase.dim_rotating.patterns",
+                               synthetic_phase_pattern_list(observed_patterns));
+        free_dualiso_full20bit_scratch(&scratch);
+    }
+
+    /* A static dim clip keeps its pattern and never pays the full re-detect. */
+    {
+        dualiso_full20bit_scratch_t scratch = {};
+        int iso_pattern = 0;
+        for (int i = 0; i < 3; i++)
+        {
+            std::vector<uint16_t> frame = synthetic_dual_iso_dim_phase_frame(raw, 1);
+            dualiso_gpu_recon_state_t state = {};
+            ASSERT_TRUE(synthetic_dual_iso_prepare_state(raw, frame, &iso_pattern, &scratch, &state) != 0);
+            ASSERT_EQ(-2, iso_pattern);
+            assert_dual_iso_pattern(state, 1);
+            if (i > 0)
+            {
+                dualiso_full20bit_timing_t timing = {};
+                dualiso_debug_get_full20bit_timing(&timing);
+                ASSERT_EQ(1, timing.phase_probe_succeeded);
+                ASSERT_EQ(0, timing.phase_probe_decisive);
+                ASSERT_EQ(0, timing.phase_probe_redetected);
+            }
+        }
+        free_dualiso_full20bit_scratch(&scratch);
+    }
+}
+
+/* DUALISO-PATTERN-FLICKER-CHECK-1 r2: a dim HHLL frame (bright rows ~33 units over black,
+ * dark rows ~3) whose dark rows carry 776 sparse highlights (0.05 % of the image) placed on
+ * the probe's sample sites. The full-frame green means still say HHLL, the probe-sample
+ * means say LLHH, and the identifier's 99.8th-percentile walk lands on the highlights. */
+static struct raw_info synthetic_dual_iso_sparse_highlight_raw_info()
+{
+    struct raw_info raw = {};
+    raw.width = 1920;
+    raw.height = 804;
+    raw.pitch = raw.width * static_cast<int>(sizeof(uint16_t));
+    raw.frame_size = raw.pitch * raw.height;
+    raw.bits_per_pixel = 14;
+    raw.black_level = 2047;
+    raw.white_level = 16200;
+    raw.active_area.x1 = 0;
+    raw.active_area.y1 = 0;
+    raw.active_area.x2 = raw.width;
+    raw.active_area.y2 = raw.height;
+    raw.cfa_pattern = 0x02010100;
+    return raw;
+}
+
+static std::vector<uint16_t> synthetic_dual_iso_sparse_highlight_frame(const struct raw_info & raw)
+{
+    std::vector<uint16_t> frame(static_cast<size_t>(raw.width) * static_cast<size_t>(raw.height));
+    auto at = [&](int x, int y) -> uint16_t & {
+        return frame[static_cast<size_t>(y) * static_cast<size_t>(raw.width) + static_cast<size_t>(x)];
+    };
+    for (int y = 0; y < raw.height; y++)
+        for (int x = 0; x < raw.width; x++)
+            at(x, y) = static_cast<uint16_t>((y & 3) < 2 ? raw.black_level + 30 + (x % 8)
+                                                         : raw.black_level + 2 + (x % 4));
+    for (int g = 2; g <= 3; g++)
+    {
+        const int xg = (g == 2) ? 1 : 0;
+        for (int k = 0; k <= 93; k++)
+            at(xg + 8 * k, g) = 10000;
+        for (int k = 0; k <= 293; k++)
+            at(xg + 2 * k, g + 4) = 10000;
+    }
+    return frame;
+}
+
+/* Catalogue row: dim cached HHLL + sparse highlights biased toward probe samples -> preserve
+ * HHLL, never install its inverse. */
+TEST(DualIsoPipeline, DualIsoDimPhaseProbeKeepsCachedPatternAgainstSparseProbeSiteHighlights)
+{
+    ScopedDualIsoPhaseEnv phase_env;
+    phase_env.unset();
+    const struct raw_info raw = synthetic_dual_iso_sparse_highlight_raw_info();
+    std::vector<uint16_t> frame = synthetic_dual_iso_sparse_highlight_frame(raw);
+
+    {
+        dualiso_full20bit_scratch_t scratch = {};
+        int iso_pattern = -1;
+        dualiso_gpu_recon_state_t state = {};
+        synthetic_dual_iso_prepare_state(raw, frame, &iso_pattern, &scratch, &state);
+        ASSERT_EQ(-1, iso_pattern);
+        dualiso_full20bit_timing_t timing = {};
+        dualiso_debug_get_full20bit_timing(&timing);
+        ASSERT_EQ(0, timing.phase_probe_redetected);
+        free_dualiso_full20bit_scratch(&scratch);
+    }
+
+    /* A wrong cache (HLLH) on the same frame: the highlight-led LLHH answer of the full
+     * identifier is still never installed. */
+    {
+        dualiso_full20bit_scratch_t scratch = {};
+        int iso_pattern = -2;
+        dualiso_gpu_recon_state_t state = {};
+        synthetic_dual_iso_prepare_state(raw, frame, &iso_pattern, &scratch, &state);
+        ASSERT_NE(-3, iso_pattern);
+        dualiso_full20bit_timing_t timing = {};
+        dualiso_debug_get_full20bit_timing(&timing);
+        ASSERT_EQ(0, timing.phase_probe_redetected);
+        free_dualiso_full20bit_scratch(&scratch);
+    }
+}
+
+/* Flat dim HHLL frame: bright rows `bright` and dark rows `dark` units over black, with a
+ * +/-1 texture that cancels exactly in every probe statistic. */
+static std::vector<uint16_t> synthetic_dual_iso_flat_dim_frame(const struct raw_info & raw,
+                                                               int bright,
+                                                               int dark)
+{
+    std::vector<uint16_t> frame(static_cast<size_t>(raw.width) * static_cast<size_t>(raw.height));
+    for (int y = 0; y < raw.height; y++)
+        for (int x = 0; x < raw.width; x++)
+            frame[static_cast<size_t>(y) * static_cast<size_t>(raw.width) + static_cast<size_t>(x)] =
+                static_cast<uint16_t>(raw.black_level + ((y & 3) < 2 ? bright : dark)
+                                      + (((x >> 3) & 1) ? 1 : -1));
+    return frame;
+}
+
+/* Pins each dim-path threshold on its own: bright >= 2x dark AND bright - dark >= 16. */
+TEST(DualIsoPipeline, DualIsoDimPhaseProbeThresholdsArePinnedIndividually)
+{
+    ScopedDualIsoPhaseEnv phase_env;
+    phase_env.unset();
+    const struct raw_info raw = synthetic_dual_iso_phase_raw_info();
+    const struct
+    {
+        int bright;
+        int dark;
+        int expect_succeeded;
+    } cases[] = {
+        {39, 20, 0},   /* 19 apart, but 1 under twice the dark rows: the ratio fails */
+        {20, 5, 0},    /* four times the dark rows, but 15 apart: the gap fails */
+        {32, 16, 1},   /* exactly twice and exactly 16 apart: decisive */
+    };
+    for (const auto & c : cases)
+    {
+        std::vector<uint16_t> frame = synthetic_dual_iso_flat_dim_frame(raw, c.bright, c.dark);
+        dualiso_full20bit_scratch_t scratch = {};
+        int iso_pattern = -1;
+        dualiso_gpu_recon_state_t state = {};
+        synthetic_dual_iso_prepare_state(raw, frame, &iso_pattern, &scratch, &state);
+        dualiso_full20bit_timing_t timing = {};
+        dualiso_debug_get_full20bit_timing(&timing);
+        ASSERT_EQ(1, timing.phase_probe_attempted);
+        ASSERT_EQ(c.expect_succeeded, timing.phase_probe_succeeded);
+        ASSERT_EQ(0, timing.phase_probe_decisive);
+        ASSERT_EQ(-1, iso_pattern);
+        free_dualiso_full20bit_scratch(&scratch);
+    }
+}
+
 TEST(DualIsoPipeline, HeadlessDualIsoPreviewReusesLeastSquaresScratchAcrossFrames)
 {
     MlvPipelineFixture fixture;

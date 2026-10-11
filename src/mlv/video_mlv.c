@@ -8569,8 +8569,13 @@ static int mlv_dualiso_preview_scale_recon_plan_internal(mlvObject_t * video,
     llrawprocObject_t * shared = video->llrawproc;
     pthread_mutex_lock(&video->llrawproc_mutex);
     const int dark_frame = shared->dark_frame;
+    /* DUALISO-VSTRIPES-PLAN-SKIP-FULLRES-1: vertical stripes and pattern noise
+     * are skipped on a dual-ISO frame (applyLLRawProcObjectWorker's diso_validity
+     * guards), so on their own they never call for the full-res pass. Keep this
+     * in step with those guards. */
     const int fixes = shared->focus_pixels || shared->bad_pixels
-                   || shared->vertical_stripes || shared->pattern_noise;
+                   || (!shared->diso_validity
+                       && (shared->vertical_stripes || shared->pattern_noise));
     /* Histogram exposure matching (auto -2) estimates ev/black delta from the
      * pixels it is handed. Until a full-resolution recon has settled them the
      * estimate would depend on the preview scale, so those frames stay full. */

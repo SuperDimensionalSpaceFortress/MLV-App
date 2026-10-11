@@ -266,7 +266,7 @@ typedef struct
     int sourceHeight;       /* rows the kernel reads (height cropped to its block) */
     int reducedWidth;
     int reducedHeight;
-    int fullResFixes;       /* focus/bad pixel/stripes/pattern run at full res first */
+    int fullResFixes;       /* focus/bad pixel fixes run at full res first (stripes/pattern noise are inert on dual ISO) */
     const char * reason;    /* "none" when reduced, otherwise why full resolution */
     int phaseTentShrink;    /* 1: shrink with pl_downsample_bayer_to_bayer_phase_tent (GPU
                              * plan only); 0: the Phase 4B decimators (CPU plan) */
