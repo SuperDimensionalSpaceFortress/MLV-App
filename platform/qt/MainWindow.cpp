@@ -8572,9 +8572,12 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
     // PLAYBACK-CLIP-LENGTH-ENFORCE-1 round 2 (owner rule 2026-09-30): the app's own length gate, for a
     // launch that bypassed tools/profiling/run-release-gui-smoke.ps1 (a direct exe launch). The clip must
     // be at least 20 s and must outlast the play window measured from --start-frame; path-free message.
+    // PLAYBACK-HFR-CONFORM-DEFAULT-1: measured at the PLAYBACK rate (getPlaybackFramerate(): the clip's own rate, or the
+    // conform rate for a clip above the threshold), the same unit checkPlayableWindow() uses for the Play itself -- a 59.94 fps
+    // clip of 971 frames conformed to 24 is 40.5 s of playback, not 16.2 s.
     {
         const int guardFrames = static_cast<int>( getMlvFrames( m_pMlvObject ) );
-        const double guardFps = static_cast<double>( getMlvFramerate( m_pMlvObject ) );
+        const double guardFps = static_cast<double>( getPlaybackFramerate() );
         const double guardClipSeconds =
             ( guardFrames > 0 && guardFps > 0.0 ) ? guardFrames / guardFps : 0.0;
         const double guardWindowSeconds = qMax( 100, options.durationMs ) / 1000.0;

@@ -178,6 +178,15 @@ TEST(PlaybackConformWiring, PlayableWindowIsMeasuredAndPacedAtPlaybackRate)
     ASSERT_FALSE(body.contains(QStringLiteral("= getFramerate();")));
 }
 
+TEST(PlaybackConformWiring, GuiSmokeClipLengthGuardIsMeasuredAtPlaybackRate)
+{
+    const QString source = mainWindowSource();
+    ASSERT_TRUE(source.contains(QStringLiteral(
+        "const double guardFps = static_cast<double>( getPlaybackFramerate() );")));
+    ASSERT_FALSE(source.contains(QStringLiteral(
+        "const double guardFps = static_cast<double>( getMlvFramerate( m_pMlvObject ) );")));
+}
+
 TEST(PlaybackConformWiring, ContactSheetTimeAxisUsesPlaybackRate)
 {
     const QString source = mainWindowSource();
