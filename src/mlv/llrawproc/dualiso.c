@@ -6152,7 +6152,12 @@ static int dualiso_phase_probe(struct raw_info raw_info,
     const double dark_max   = MAX(g[order[2]], g[order[3]]);
     const double margin_floor =
         MAX(16.0, (double)(raw_info.white_level - raw_info.black_level) / 64.0);
-    if (bright_min - dark_max < margin_floor) return 0;
+    /* DUALISO-PATTERN-FLICKER-CHECK-1: a night frame cannot clear the absolute floor, and
+     * on a phase-rotating clip an indecisive probe keeps a cache that is wrong 3 frames in 4.
+     * A clear relative separation (bright rows at least twice the dark rows, 16 units apart)
+     * is decisive too; a mismatch still goes to the full detector, which decides. */
+    const int dim_decisive = (bright_min - dark_max >= 16.0) && (bright_min >= 2.0 * MAX(dark_max, 1.0));
+    if (bright_min - dark_max < margin_floor && !dim_decisive) return 0;
 
     int probe_bright[4] = {0, 0, 0, 0};
     probe_bright[b0] = 1;

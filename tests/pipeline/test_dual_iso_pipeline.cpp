@@ -7773,6 +7773,86 @@ TEST(DualIsoPipeline, DualIsoPerFramePhaseVerificationHandlesRotatingStaticAndKi
     }
 }
 
+/* DUALISO-PATTERN-FLICKER-CHECK-1: a night frame. The bright rows sit ~150 raw units over
+ * black and the dark rows 1/16 of that, under a textured scene with sparse highlights, so the
+ * row-group separation is clear but below the probe's absolute margin floor
+ * ((white - black) / 64 = 218 here). */
+static std::vector<uint16_t> synthetic_dual_iso_dim_phase_frame(const struct raw_info & raw,
+                                                               int pattern_index)
+{
+    static const int kPatterns[4][4] = {
+        {1, 1, 0, 0},
+        {1, 0, 0, 1},
+        {0, 0, 1, 1},
+        {0, 1, 1, 0},
+    };
+    std::vector<uint16_t> frame(static_cast<size_t>(raw.width) * static_cast<size_t>(raw.height));
+    for (int y = 0; y < raw.height; y++)
+    {
+        const int signal = kPatterns[pattern_index][y & 3] ? 150 : 9;
+        for (int x = 0; x < raw.width; x++)
+        {
+            double scene = 0.1 + 1.8 * static_cast<double>((x / 8 + y / 8) % 16) / 15.0;
+            if (((x * 7 + y * 13) % 97) == 0)
+                scene *= 12.0;
+            const int noise = ((x * 3 + y * 5) & 7) - 4;
+            frame[static_cast<size_t>(y) * static_cast<size_t>(raw.width) + static_cast<size_t>(x)] =
+                static_cast<uint16_t>(raw.black_level + static_cast<int>(signal * scene) + noise);
+        }
+    }
+    return frame;
+}
+
+TEST(DualIsoPipeline, DualIsoPerFramePhaseVerificationFollowsDimRotatingFrames)
+{
+    ScopedDualIsoPhaseEnv phase_env;
+    phase_env.unset();
+    const struct raw_info raw = synthetic_dual_iso_phase_raw_info();
+
+    {
+        dualiso_full20bit_scratch_t scratch = {};
+        int iso_pattern = 0;
+        std::vector<int> observed_patterns;
+        const int sequence[] = {0, 1, 2, 3, 0};
+        for (int pattern_index : sequence)
+        {
+            std::vector<uint16_t> frame = synthetic_dual_iso_dim_phase_frame(raw, pattern_index);
+            dualiso_gpu_recon_state_t state = {};
+            ASSERT_TRUE(synthetic_dual_iso_prepare_state(raw, frame, &iso_pattern, &scratch, &state) != 0);
+            ASSERT_EQ(1, state.valid);
+            observed_patterns.push_back(iso_pattern);
+            ASSERT_EQ(-(pattern_index + 1), iso_pattern);
+            assert_dual_iso_pattern(state, pattern_index);
+        }
+        test_artifacts::record("dual_iso.per_frame_phase.dim_rotating.patterns",
+                               synthetic_phase_pattern_list(observed_patterns));
+        free_dualiso_full20bit_scratch(&scratch);
+    }
+
+    /* A static dim clip keeps its pattern and never pays the full re-detect. */
+    {
+        dualiso_full20bit_scratch_t scratch = {};
+        int iso_pattern = 0;
+        for (int i = 0; i < 3; i++)
+        {
+            std::vector<uint16_t> frame = synthetic_dual_iso_dim_phase_frame(raw, 1);
+            dualiso_gpu_recon_state_t state = {};
+            ASSERT_TRUE(synthetic_dual_iso_prepare_state(raw, frame, &iso_pattern, &scratch, &state) != 0);
+            ASSERT_EQ(-2, iso_pattern);
+            assert_dual_iso_pattern(state, 1);
+            if (i > 0)
+            {
+                dualiso_full20bit_timing_t timing = {};
+                dualiso_debug_get_full20bit_timing(&timing);
+                ASSERT_EQ(1, timing.phase_probe_succeeded);
+                ASSERT_EQ(0, timing.phase_probe_decisive);
+                ASSERT_EQ(0, timing.phase_probe_redetected);
+            }
+        }
+        free_dualiso_full20bit_scratch(&scratch);
+    }
+}
+
 TEST(DualIsoPipeline, HeadlessDualIsoPreviewReusesLeastSquaresScratchAcrossFrames)
 {
     MlvPipelineFixture fixture;
