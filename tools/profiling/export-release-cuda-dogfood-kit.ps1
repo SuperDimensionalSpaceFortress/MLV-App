@@ -209,7 +209,7 @@ function Write-DogfoodReadme {
     [void]$lines.Add("## Proof Boundaries")
     [void]$lines.Add('- Dell RTX 3060 Laptop support requires a Dell-local `QUOTABLE_PASS` packet.')
     [void]$lines.Add("- UltraMagnus RTX 4090 proof does not prove the Dell laptop, and Dell proof does not prove UltraMagnus.")
-    [void]$lines.Add("- `MLVApp.exe` carries NVIDIA/AMD high-performance GPU request exports, and the proof wrappers also set Windows per-app `GpuPreference=2;` unless disabled.")
+    [void]$lines.Add("- `MLVApp.exe` carries NVIDIA/AMD high-performance GPU request exports, and the proof wrappers do not change the Windows per-app GPU preference (that is the owner's machine state); they record the GL renderer the app actually used.")
     [void]$lines.Add("- Backend architecture is a preflight gate. Dell RTX 3060 Laptop requires reliable `sm_86` proof from a hash-matched sidecar or `cuobjdump`; UltraMagnus RTX 4090 requires `sm_89` or compatible PTX. Runtime support still needs the proof packet.")
     [void]$lines.Add("- On the Dell hybrid-GPU path, CUDA discovery alone is insufficient. The packet must show GL renderer/probe evidence, no-readback frames, zero fallback frames, clean GL parity, DNG hash PASS, and playback/DNG speed metrics.")
     [void]$lines.Add('- `NOT_QUOTABLE` packets are still useful diagnostics. Read `diagnosticSummary`, `diagnostics`, and `actionPlan` in `proof-report.json` or imported `import-summary.json`.')
