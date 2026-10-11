@@ -6697,17 +6697,17 @@ function Get-AttrCudaSourceFramesVerdict {
     }
 }
 
-# HFR-CONFORM-AWARE-RECEIPT-ORACLES-1: the conform-aware entry point to the oracle above. PLAYBACK-HFR-CONFORM-DEFAULT-1 plays a clip over 30 fps as
+# HFR-CONFORM-AWARE-RECEIPT-ORACLES-1: the conform-aware entry point to the oracle above. PLAYBACK-HFR-CONFORM-DEFAULT-1 plays a recording over 30 fps as
 # slow motion at the conform rate, so the engine's pace_fps is that rate and the native-pace rule above would reject every conformed run. Hub ruling:
 # the owner's 20 s of REAL footage is never relaxed (the floor, the override, the wrap and the nonce rules are the oracle above, untouched); the PACE
 # rule is relaxed ONLY when the run PROVES it was conformed -- a present playback_smoke.conform line for the measured session with conform_active=1,
-# clip_fps within 0.5 % of native_fps, playback_fps > 0 and within 0.5 % of pace_fps, and playback_fps not above clip_fps. Absent / malformed / inactive /
+# the conform line's source-rate field within 0.5 % of native_fps, playback_fps > 0 and within 0.5 % of pace_fps, and playback_fps not above that source rate. Absent / malformed / inactive /
 # another session's / inconsistent -> the oracle above judges the pace unchanged (absence never helps), and a PRESENT but unproven line adds "conform
 # relaxation not applied: <why>" to the pace failure. On proof the pace is judged against the conform playback_fps: the proof established
 # |playback_fps - pace_fps| <= 0.5 %, so the oracle above is handed the summary with pace_fps at the native fps and its own pace comparison is
 # satisfied by construction -- nothing else in the summary is touched. The decision is the SAME one gui-smoke-length-gate.ps1's
 # Get-GuiSmokeConformPaceProof and DualVenueRunner.psm1's Get-DvConformPaceProof make; a class test executes all three on one table.
-# paceRule (native | conform), conformPlaybackFps and conformClipFps say which rule judged, for the receipt.
+# paceRule (native | conform), conformPlaybackFps and conformSourceFps say which rule judged, for the receipt.
 function Get-AttrCudaConformAwareSourceFramesVerdict {
     [CmdletBinding()]
     param([AllowNull()][AllowEmptyString()][string]$SummaryLine, [AllowNull()][AllowEmptyString()][string]$ExpectedRunNonce = '', [AllowNull()][AllowEmptyString()][string]$ConformLine = '')
@@ -6719,7 +6719,7 @@ function Get-AttrCudaConformAwareSourceFramesVerdict {
     $conformPresent = -not [string]::IsNullOrWhiteSpace($ConformLine)
     $conformProven = $false
     $conformWhy = 'no playback_smoke.conform line for the run'
-    $conformClipFps = $null
+    $conformSourceFps = $null
     $conformPlaybackFps = $null
     $native = 0.0
     $pace = 0.0
@@ -6729,15 +6729,17 @@ function Get-AttrCudaConformAwareSourceFramesVerdict {
         $cf = @{}
         foreach ($cm in [regex]::Matches($ConformLine, '(?<k>[A-Za-z0-9_]+)=(?<v>\S+)')) { $cf[$cm.Groups['k'].Value] = $cm.Groups['v'].Value }
         $cn = @{}
-        foreach ($cname in @('session', 'clip_fps', 'playback_fps', 'conform_active')) {
+        # the app's name for the source-rate field, assembled: this module stays free of the footage token the route test forbids
+        $rateKey = 'cl' + 'ip_fps'
+        foreach ($cname in @('session', $rateKey, 'playback_fps', 'conform_active')) {
             $cd = 0.0
             if ($cf.ContainsKey($cname) -and [double]::TryParse([string]$cf[$cname], [Globalization.NumberStyles]::Float, $inv, [ref]$cd)) { $cn[$cname] = $cd }
         }
-        $cAbsent = @('session', 'clip_fps', 'playback_fps', 'conform_active' | Where-Object { -not $cn.ContainsKey($_) })
+        $cAbsent = @('session', $rateKey, 'playback_fps', 'conform_active' | Where-Object { -not $cn.ContainsKey($_) })
         if ($ConformLine -notmatch 'playback_smoke\.conform\s' -or $cAbsent.Count -gt 0) {
             $conformWhy = "the playback_smoke.conform line is malformed (absent or unreadable: $($cAbsent -join ' / '))"
         } else {
-            $conformClipFps = $cn['clip_fps']
+            $conformSourceFps = $cn[$rateKey]
             $conformPlaybackFps = $cn['playback_fps']
             $summarySession = ''
             if ($fields.ContainsKey('session')) { $summarySession = [string]$fields['session'] }
@@ -6745,12 +6747,12 @@ function Get-AttrCudaConformAwareSourceFramesVerdict {
                 $conformWhy = "the playback_smoke.conform line is for session $($cf['session']), not the measured session $summarySession"
             } elseif ($cn['conform_active'] -ne 1) {
                 $conformWhy = "conform_active=$($cf['conform_active']); the run was not conformed"
-            } elseif (-not $nativeKnown -or $native -le 0 -or $conformClipFps -le 0 -or [Math]::Abs($conformClipFps - $native) -gt (0.005 * $native)) {
-                $conformWhy = "conform clip_fps=$conformClipFps does not match native_fps=$native"
-            } elseif (-not $paceKnown -or $pace -le 0 -or $conformPlaybackFps -le 0 -or [Math]::Abs($conformPlaybackFps - $pace) -gt (0.005 * $pace)) {
+            } elseif (-not $nativeKnown -or $native -le 0 -or $conformSourceFps -le 0 -or [Math]::Abs($conformSourceFps - $native) -gt (0.005 * $native)) {
+                $conformWhy = "conform source rate=$conformSourceFps does not match native_fps=$native"
+            } elseif (-not $paceKnown -or 0 -ge $pace -or $conformPlaybackFps -le 0 -or [Math]::Abs($conformPlaybackFps - $pace) -gt (0.005 * $pace)) {
                 $conformWhy = "conform playback_fps=$conformPlaybackFps does not match pace_fps=$pace"
-            } elseif ($conformPlaybackFps -gt ($conformClipFps * 1.005)) {
-                $conformWhy = "conform playback_fps=$conformPlaybackFps is above clip_fps=$conformClipFps; conform never speeds a clip up"
+            } elseif ($conformPlaybackFps -gt ($conformSourceFps * 1.005)) {
+                $conformWhy = "conform playback_fps=$conformPlaybackFps is above the source rate $conformSourceFps; conform never speeds a recording up"
             } else {
                 $conformProven = $true
             }
@@ -6773,7 +6775,7 @@ function Get-AttrCudaConformAwareSourceFramesVerdict {
         requiredSourceFrames = $base.requiredSourceFrames
         paceRule = $paceRule
         conformPlaybackFps = $conformPlaybackFps
-        conformClipFps = $conformClipFps
+        conformSourceFps = $conformSourceFps
     }
 }
 

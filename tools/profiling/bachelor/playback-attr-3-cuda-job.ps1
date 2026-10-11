@@ -3407,7 +3407,7 @@ $sourceFramesBlock = [ordered]@{
     # which rule judged the pace (native | conform: the oracle above is native-pace UNLESS the run proved it was conformed) and the conform line's rates
     paceRule = $sourceFramesVerdict.paceRule
     conformPlaybackFps = $sourceFramesVerdict.conformPlaybackFps
-    conformClipFps = $sourceFramesVerdict.conformClipFps
+    conformClipFps = $sourceFramesVerdict.conformSourceFps
     # HFR-CONFORM-AWARE-RECEIPT-ORACLES-1 <<<
     wrapped = $sourceFramesWrapped
     failures = @($sourceFramesVerdict.failures)
