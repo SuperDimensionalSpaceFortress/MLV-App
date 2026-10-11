@@ -133,15 +133,15 @@ TEST(CudaLaunchTiming, EnvNamesAreTheDocumentedOnes)
 
 TEST(CudaLaunchTiming, MinMsFallsBackToZero)
 {
-    ASSERT_NEAR(0.0, igpu_lt_parse_min_ms(nullptr), 1e-12);
-    ASSERT_NEAR(0.0, igpu_lt_parse_min_ms(""), 1e-12);
-    ASSERT_NEAR(0.0, igpu_lt_parse_min_ms("abc"), 1e-12);
-    ASSERT_NEAR(0.0, igpu_lt_parse_min_ms("-5"), 1e-12);
-    ASSERT_NEAR(0.0, igpu_lt_parse_min_ms("2ms"), 1e-12);
-    ASSERT_NEAR(0.0, igpu_lt_parse_min_ms("nan"), 1e-12);
-    ASSERT_NEAR(0.0, igpu_lt_parse_min_ms("inf"), 1e-12);
-    ASSERT_NEAR(2.0, igpu_lt_parse_min_ms("2"), 1e-12);
-    ASSERT_NEAR(0.5, igpu_lt_parse_min_ms("0.5 "), 1e-12);
+    // A parser value table, not a timing claim: the threshold is a config value, and anything
+    // unset or unparseable means "no threshold" (0).
+    struct Case { const char * text; double want; };
+    const Case cases[] = {
+        {nullptr, 0.0}, {"", 0.0}, {"abc", 0.0}, {"-5", 0.0}, {"2ms", 0.0}, {"nan", 0.0},
+        {"inf", 0.0}, {"2", 2.0}, {"0.5 ", 0.5},
+    };
+    for (const Case & c : cases)
+        ASSERT_NEAR(c.want, igpu_lt_parse_min_ms(c.text), 1e-12);
 }
 
 TEST(CudaLaunchTiming, KernelLineFormat)
