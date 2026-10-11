@@ -9,7 +9,9 @@
 #   3. Decides with Get-FoldCadenceDecision (pure, callable by dot-sourcing this file):
 #        DueFold = OwedCount > 0 AND UsageLevel == 'ok' AND (now - last fold) >= MinFoldIntervalHours (default 6).
 # Verdict schema mlv-app/fold-cadence/v1:
-#   schema, owedCount (null when unknown), oldestOwedCommitUtc, oldestOwedAgeHours, ackedSha, ackedAtUtc, lastFoldUtc,
+#   schema, owedCount (null when unknown), oldestOwedCommitUtc, oldestOwedAgeHours, busFetch (the recall tool's fetch status:
+#   ok | no-origin | skipped | 'FETCH_FAILED <reason>', in which case the debt was priced against the local HEAD only; null when
+#   the listing never came back), ackedSha, ackedAtUtc, lastFoldUtc,
 #   lastFoldAgeHours, dueFold, reason, evaluatedAtUtc, elapsedSec.
 # Reason (typed): due | no-owed | usage-<level> | fold-recent | timeout | last-seen-missing | last-seen-unreadable |
 #   last-seen-no-sha | recall-unknown-sha | recall-failed-exit-<n> | recall-output-unreadable | error.
@@ -70,6 +72,7 @@ function New-FoldCadenceVerdict([string]$Reason, [datetime]$Now, [double]$Elapse
         owedCount           = $null
         oldestOwedCommitUtc = $null
         oldestOwedAgeHours  = $null
+        busFetch            = $null
         ackedSha            = $null
         ackedAtUtc          = $null
         lastFoldUtc         = $null
@@ -119,7 +122,10 @@ function Invoke-FoldCadence {
         $script = if ($Opts.RecallScript) { $Opts.RecallScript } else { [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..\doctrine\doctrine_recall.py')) }
         $deadline = [math]::Max(1, [int]$Opts.DeadlineSec)
         $gitBudget = [string]::Format([Globalization.CultureInfo]::InvariantCulture, '{0}', [math]::Min(10.0, [math]::Max(1.0, $deadline * 0.8)))
-        $argList = @('-3', "`"$script`"", '--fold-debt', '--since', $sha, '--git-timeout', $gitBudget)
+        # The recall tool fetches the bus first (DOCTRINE-BUS-CLONE-CURRENT-1); give that fetch its own slice of the deadline so
+        # a slow remote costs a FETCH_FAILED note in the verdict, not a 'timeout' verdict that hides the debt.
+        $fetchBudget = [string]::Format([Globalization.CultureInfo]::InvariantCulture, '{0}', [math]::Min(30.0, [math]::Max(1.0, $deadline * 0.4)))
+        $argList = @('-3', "`"$script`"", '--fold-debt', '--since', $sha, '--git-timeout', $gitBudget, '--fetch-timeout', $fetchBudget)
         if ($Opts.Bus) { $argList += @('--bus', "`"$($Opts.Bus)`"") }
         $stem = Join-Path ([IO.Path]::GetTempPath()) ('fold-cadence-' + [guid]::NewGuid().ToString('N'))
         $tmpOut = "$stem.out"; $tmpErr = "$stem.err"
@@ -136,6 +142,7 @@ function Invoke-FoldCadence {
         if ($null -eq $debt -or -not $debt.PSObject.Properties['count'] -or -not $debt.PSObject.Properties['commits']) { $v.reason = 'recall-output-unreadable'; return $v }
         $owed = [int]$debt.count
         $v.owedCount = $owed
+        if ($debt.PSObject.Properties['fetch']) { $v.busFetch = [string]$debt.fetch }
         $dates = @(@($debt.commits) | ForEach-Object { ConvertTo-FoldUtc $_.date } | Where-Object { $null -ne $_ } | Sort-Object)
         if ($dates.Count -gt 0) {
             $v.oldestOwedCommitUtc = $dates[0].ToString('o')
