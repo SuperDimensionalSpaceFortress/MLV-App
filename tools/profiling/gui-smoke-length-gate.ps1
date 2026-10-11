@@ -107,12 +107,29 @@ function Get-GuiSmokeClipLength {
     return [pscustomobject]@{ known = $true; reason = ''; frames = $frames; fps = $fps; seconds = ([double]$frames / $fps) }
 }
 
+function Get-GuiSmokePlaybackFps {
+    <#
+    .SYNOPSIS
+    The rate a clip PLAYS at in the app, in source frames per second. PLAYBACK-HFR-CONFORM-DEFAULT-1: a clip above the
+    conform threshold plays as slow motion at the conform target, so a play window consumes frames at THAT rate, not at the
+    clip's own. Mirrors playback_conform::playbackFps (platform/qt/PlaybackConformPolicy.h) at its defaults (enabled,
+    target 24, threshold 30), which is what a smoke run sees: the app reads its settings from the automation-isolated store.
+    Conform never speeds a clip up, so a clip at or below the threshold (or at or below the target) plays at its own rate.
+    #>
+    param([Parameter(Mandatory = $true)][double]$ClipFps)
+    $conformTargetFps = 24.0
+    $conformThresholdFps = 30.0
+    if ($ClipFps -gt $conformThresholdFps -and $conformTargetFps -lt $ClipFps) { return $conformTargetFps }
+    return $ClipFps
+}
+
 function Test-GuiSmokeClipLength {
     <#
     .SYNOPSIS
     The length gate. Returns [pscustomobject]@{ verdict; message; clipSeconds; windowSeconds;
     requiredSeconds; frames; fps }. verdict is OK | CLIP_TOO_SHORT | PLAY_WINDOW_TOO_SHORT | CLIP_LENGTH_UNKNOWN.
-    A play window may never exceed the footage that remains after -StartFrame.
+    A play window may never exceed the footage that remains after -StartFrame. For a caller that plays, clipSeconds and fps are
+    PLAYBACK seconds and rate (a conformed high-frame-rate clip: frames / 24); -ClipOnly keeps the native figures.
     #>
     param(
         [Parameter(Mandatory = $true)][string]$Path,
@@ -130,6 +147,12 @@ function Test-GuiSmokeClipLength {
     $inv = [System.Globalization.CultureInfo]::InvariantCulture
     $fmt = { param($v) ([double]$v).ToString('0.###', $inv) }
     $len = Get-GuiSmokeClipLength -Path $Path
+    # A caller that plays measures the footage at the rate the app plays it (Get-GuiSmokePlaybackFps); a -ClipOnly caller
+    # plays nothing, so its floor stays the clip's native length.
+    if ($len.known -and -not $ClipOnly) {
+        $playFps = Get-GuiSmokePlaybackFps -ClipFps $len.fps
+        $len = [pscustomobject]@{ known = $true; reason = ''; frames = $len.frames; fps = $playFps; seconds = ([double]$len.frames / $playFps) }
+    }
     $required = [Math]::Max($MinSeconds, $WindowSeconds)
     $out = [pscustomobject]@{
         verdict = 'OK'; message = 'OK'; clipSeconds = $len.seconds; windowSeconds = $WindowSeconds
