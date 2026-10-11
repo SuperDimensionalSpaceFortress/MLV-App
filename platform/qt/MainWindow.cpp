@@ -2542,12 +2542,25 @@ static int mlvappPlaybackRenderLookaheadEnvFrames()
     return lookaheadFrames;
 }
 
-// PLAYBACK-DECODE-RENDER-OVERLAP-1: the lookahead is on by default on the CUDA texture route only, so the
+// PLAYBACK-CPU-PACE-GAP-1: MLVAPP_DISABLE_CPU_PLAYBACK_LOOKAHEAD set and not "0" turns the CPU-route lookahead
+// off (default and explicit env alike); MLVAPP_PLAYBACK_RENDER_LOOKAHEAD_FRAMES=0 still turns off every route.
+static bool mlvappCpuPlaybackLookaheadDisabled()
+{
+    static const bool disabled = []() {
+        if( !qEnvironmentVariableIsSet( "MLVAPP_DISABLE_CPU_PLAYBACK_LOOKAHEAD" ) ) return false;
+        return qEnvironmentVariable( "MLVAPP_DISABLE_CPU_PLAYBACK_LOOKAHEAD" ).trimmed() != QStringLiteral("0");
+    }();
+    return disabled;
+}
+
+// PLAYBACK-DECODE-RENDER-OVERLAP-1: the lookahead is on by default on the CUDA texture route, so the
 // decode + dual-ISO of N+1 runs while N renders and presents (two frames in flight, not one).
+// PLAYBACK-CPU-PACE-GAP-1: and at depth 1 on the CPU route when its default is admitted (s2/s4).
 int MainWindow::playbackRenderLookaheadFrames() const
 {
     return playback_overlap::effectiveLookaheadFrames( mlvappPlaybackRenderLookaheadEnvFrames(),
-                                                       m_playbackLookaheadTextureRouteAdmitted );
+                                                       m_playbackLookaheadTextureRouteAdmitted,
+                                                       m_playbackLookaheadCpuRouteDefaultAdmitted );
 }
 
 int MainWindow::currentPlaybackAdvanceTarget()
@@ -3504,10 +3517,12 @@ void MainWindow::queuePlaybackLookaheadRequests(
     if( depth <= 0 ) return;
     if( !m_pRenderThread || !m_pMlvObject || !m_fileLoaded ) return;
     if( !ui->actionPlay->isChecked() || !baseContext.playbackActive ) return;
-    if( !baseContext.gpuPlaybackReconTexturePresentRequested
-     || !baseContext.gpuPlaybackReconAmazeTexturePresentAdmitted ) return;
-    if( !mainWindowGpuTextureRouteAdmitsPlaybackScale(
-            baseContext.playbackScaleFactor, gpuReducedReconHonouredSessionScale() ) ) return;
+    const bool textureRouteAdmitsLookahead =
+        baseContext.gpuPlaybackReconTexturePresentRequested
+        && baseContext.gpuPlaybackReconAmazeTexturePresentAdmitted
+        && mainWindowGpuTextureRouteAdmitsPlaybackScale(
+               baseContext.playbackScaleFactor, gpuReducedReconHonouredSessionScale() );
+    if( !textureRouteAdmitsLookahead && !m_playbackLookaheadCpuRouteEligible ) return;
 
     const int totalFrames = getMlvFrames( m_pMlvObject );
     if( totalFrames <= 1 ) return;
@@ -6131,6 +6146,11 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
         "drawFrameReady.present_to_finish",
         display_frame,
         ( mlv_stage_timing_now() - presentEndStageTime ) * 1000.0 );
+    if( task.cpuPreviewProcessingActive && useScopeSourceImage )
+    {
+        dumpPresentedFrameIfRequested( display_frame, task, scopeSourceImage,
+                                       scopeSourceWidth, scopeSourceHeight, displayImage );
+    }
     finishPresentedFrame( display_frame,
                           readyFrame,
                           task.requestContext,
@@ -6598,6 +6618,26 @@ void MainWindow::drawFrame( bool updateTimecodeLabel )
         && requestContext.gpuPlaybackReconAmazeTexturePresentAdmitted
         && mainWindowGpuTextureRouteAdmitsPlaybackScale(
                requestContext.playbackScaleFactor, gpuReducedReconHonouredSessionScale() );
+    // PLAYBACK-CPU-PACE-GAP-1: the CPU-route admission, recomputed every request. The Phase 3 predicate is the
+    // one the render thread routes on (RenderFrameThread::signalDecodeDoneFromWorker sends a slot to the recon
+    // worker iff request.phase3Mode == Phase3Mode::DecodeReconProcess).
+    {
+        const playback_overlap::CpuLookaheadDecision cpuLookahead =
+            playback_overlap::cpuRouteLookaheadDecision(
+                mlvappCpuPlaybackLookaheadDisabled(),
+                ui->actionPlay->isChecked() && requestContext.playbackActive,
+                m_playbackLookaheadTextureRouteAdmitted,
+                phase3ModeFor( playbackQualityModeFromInt( m_playbackQualityMode ) )
+                    == Phase3Mode::DecodeReconProcess,
+                m_renderThreadUsingGpuPreviewProcessing || m_renderThreadUsing16BitPreview,
+                requestContext.playbackScaleFactor,
+                mlvappPlaybackRenderLookaheadEnvFrames() >= 0 );
+        m_playbackLookaheadCpuRouteEligible = cpuLookahead.eligible;
+        m_playbackLookaheadCpuRouteDefaultAdmitted = cpuLookahead.defaultAdmitted;
+        m_playbackLookaheadCpuRouteRefusalLast = cpuLookahead.refusal;
+        if( m_playbackSmokeActive )
+            ++m_playbackLookaheadCpuRouteRefusalCounts[static_cast<int>( cpuLookahead.refusal )];
+    }
     if( playbackRenderLookaheadFrames() > 0
      && ui->actionPlay->isChecked()
      && m_pRenderThread
@@ -6619,6 +6659,8 @@ void MainWindow::drawFrame( bool updateTimecodeLabel )
                     cutOutFrame,
                     playbackRenderLookaheadFrames(),
                     ui->actionLoop->isChecked() );
+            if( prunedPlaybackLookahead > 0 )
+                m_playbackLookaheadPruned += static_cast<uint64_t>( prunedPlaybackLookahead );
             if( prunedPlaybackLookahead > 0 && interactiveTraceEnabled() )
             {
                 logInteractionEvent(
@@ -24171,6 +24213,9 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
 
     m_playbackLookaheadRequestsIssued = 0;
     m_playbackLookaheadCoveredRequests = 0;
+    m_playbackLookaheadDroppedReady = 0;
+    m_playbackLookaheadPruned = 0;
+    for( uint64_t &count : m_playbackLookaheadCpuRouteRefusalCounts ) count = 0;
     if( m_pRenderThread ) m_pRenderThread->resetPipelineOverlapMeter();
     m_playbackSmokeActive = true;
     m_playbackSmokeFrameTelemetry = playbackSmokeFrameTelemetryEnabled();
@@ -26967,6 +27012,121 @@ void MainWindow::notePlaybackSmokePresentedFrame(
     }
 }
 
+namespace
+{
+struct PresentedDumpConfig
+{
+    bool enabled = false;
+    QString dir;
+    qint64 first = 0;
+    qint64 last = -1;
+};
+
+// PLAYBACK-CPU-PACE-GAP-1: MLVAPP_PLAYBACK_PRESENTED_DUMP_DIR + MLVAPP_PLAYBACK_PRESENTED_DUMP_FRAMES=<first>-<last>,
+// read once. Both must be set and the range valid, and the volume must keep >= 51 GiB free, or nothing is dumped.
+const PresentedDumpConfig &presentedDumpConfig()
+{
+    static const PresentedDumpConfig config = []() {
+        PresentedDumpConfig c;
+        const QString dir = qEnvironmentVariable( "MLVAPP_PLAYBACK_PRESENTED_DUMP_DIR" ).trimmed();
+        const QString range = qEnvironmentVariable( "MLVAPP_PLAYBACK_PRESENTED_DUMP_FRAMES" ).trimmed();
+        if( dir.isEmpty() || range.isEmpty() ) return c;
+        const QStringList parts = range.split( QLatin1Char('-') );
+        bool okFirst = false;
+        bool okLast = false;
+        const qint64 first = parts.size() == 2 ? parts.at( 0 ).toLongLong( &okFirst ) : -1;
+        const qint64 last = parts.size() == 2 ? parts.at( 1 ).toLongLong( &okLast ) : -1;
+        if( !okFirst || !okLast || first < 0 || last < first )
+        {
+            qWarning().noquote() << QStringLiteral("playback_presented_dump.refused reason=bad_range range=\"%1\"")
+                                        .arg( range );
+            return c;
+        }
+        if( !QDir().mkpath( dir ) )
+        {
+            qWarning().noquote() << QStringLiteral("playback_presented_dump.refused reason=mkpath_failed dir=\"%1\"")
+                                        .arg( dir );
+            return c;
+        }
+        const qint64 kFloorBytes = 51LL * 1024 * 1024 * 1024;
+        const QStorageInfo storage( dir );
+        if( storage.isValid() && storage.bytesAvailable() < kFloorBytes )
+        {
+            qWarning().noquote() << QStringLiteral("playback_presented_dump.refused reason=low_disk free_bytes=%1 floor_bytes=%2")
+                                        .arg( storage.bytesAvailable() ).arg( kFloorBytes );
+            return c;
+        }
+        c.enabled = true;
+        c.dir = dir;
+        c.first = first;
+        c.last = last;
+        qInfo().noquote() << QStringLiteral("playback_presented_dump.armed dir=\"%1\" first=%2 last=%3")
+                                 .arg( dir ).arg( first ).arg( last );
+        return c;
+    }();
+    return config;
+}
+} // namespace
+
+void MainWindow::dumpPresentedFrameIfRequested( uint64_t displayFrame,
+                                                const PlaybackPrepTask &task,
+                                                const uint8_t *processedRgb8,
+                                                int processedWidth,
+                                                int processedHeight,
+                                                const QImage &displayImage )
+{
+    const PresentedDumpConfig &config = presentedDumpConfig();
+    if( !config.enabled ) return;
+    if( !ui->actionPlay->isChecked() ) return;
+    const qint64 frame = static_cast<qint64>( displayFrame );
+    if( frame < config.first || frame > config.last ) return;
+    if( !processedRgb8 || processedWidth <= 0 || processedHeight <= 0 ) return;
+
+    const QString base = QDir( config.dir ).filePath( QString::number( frame ) );
+    const qint64 bytes = static_cast<qint64>( processedWidth ) * processedHeight * 3;
+    QFile rgb( base + QStringLiteral(".rgb8") );
+    const bool rgbOk = rgb.open( QIODevice::WriteOnly | QIODevice::Truncate )
+        && rgb.write( reinterpret_cast<const char *>( processedRgb8 ), bytes ) == bytes;
+    rgb.close();
+
+    QJsonObject meta;
+    meta.insert( QStringLiteral("frame"), frame );
+    meta.insert( QStringLiteral("width"), processedWidth );
+    meta.insert( QStringLiteral("height"), processedHeight );
+    meta.insert( QStringLiteral("scale"), task.requestContext.playbackScaleFactor );
+    meta.insert( QStringLiteral("lookahead_request"), task.requestContext.playbackLookaheadRequest );
+    QFile json( base + QStringLiteral(".json") );
+    const bool jsonOk = json.open( QIODevice::WriteOnly | QIODevice::Truncate )
+        && json.write( QJsonDocument( meta ).toJson( QJsonDocument::Compact ) ) > 0;
+    json.close();
+
+    // The final display image, row by row without scanline padding.
+    QString displaySha = QStringLiteral("none");
+    if( !displayImage.isNull() )
+    {
+        QCryptographicHash hash( QCryptographicHash::Sha256 );
+        const int rowBytes = displayImage.width() * displayImage.depth() / 8;
+        for( int y = 0; y < displayImage.height(); ++y )
+        {
+            hash.addData( reinterpret_cast<const char *>( displayImage.constScanLine( y ) ), rowBytes );
+        }
+        displaySha = QString::fromLatin1( hash.result().toHex() );
+    }
+    qInfo().noquote()
+        << QStringLiteral("playback_presented_dump.frame frame=%1 width=%2 height=%3 scale=%4 lookahead_request=%5 "
+                          "rgb8_written=%6 json_written=%7 display=%8x%9 display_sha256=%10")
+               .arg( frame )
+               .arg( processedWidth )
+               .arg( processedHeight )
+               .arg( task.requestContext.playbackScaleFactor )
+               .arg( bool01( task.requestContext.playbackLookaheadRequest ) )
+               .arg( bool01( rgbOk ) )
+               .arg( bool01( jsonOk ) )
+               .arg( displayImage.width() )
+               .arg( displayImage.height() )
+               .arg( displaySha );
+}
+
 void MainWindow::noteContactSheetPresentedFrame(
     uint64_t displayFrame,
     const RenderFrameThread::ReadyFrame &readyFrame,
@@ -27475,6 +27635,26 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                 .arg( static_cast<qulonglong>( raw.fg_unclaimed_decodes ) )
                 .arg( static_cast<qulonglong>( raw.evicted_unconsumed ) )
                 .arg( static_cast<qulonglong>( raw.duplicate_publishes ) );
+        // PLAYBACK-CPU-PACE-GAP-1: the CPU-route admission and where its lookahead frames went. Every refusal
+        // reason is counted per drawFrame() request of the session, so none is silent.
+        QStringList cpuRefusalCounts;
+        for( int r = 0; r < static_cast<int>( playback_overlap::CpuLookaheadRefusal::Count ); ++r )
+        {
+            cpuRefusalCounts << QStringLiteral("%1:%2")
+                .arg( QString::fromLatin1( playback_overlap::cpuLookaheadRefusalName(
+                    static_cast<playback_overlap::CpuLookaheadRefusal>( r ) ) ) )
+                .arg( static_cast<qulonglong>( m_playbackLookaheadCpuRouteRefusalCounts[r] ) );
+        }
+        const QString cpuRouteFields =
+            QStringLiteral( " cpu_route_eligible=%1 cpu_route_default_admitted=%2 cpu_route_refusal_last=%3 "
+                            "cpu_route_refusal_counts=%4 lookahead_dropped_ready=%5 lookahead_pruned=%6" )
+                .arg( bool01( m_playbackLookaheadCpuRouteEligible ) )
+                .arg( bool01( m_playbackLookaheadCpuRouteDefaultAdmitted ) )
+                .arg( QString::fromLatin1( playback_overlap::cpuLookaheadRefusalName(
+                    m_playbackLookaheadCpuRouteRefusalLast ) ) )
+                .arg( cpuRefusalCounts.join( QLatin1Char(',') ) )
+                .arg( static_cast<qulonglong>( m_playbackLookaheadDroppedReady ) )
+                .arg( static_cast<qulonglong>( m_playbackLookaheadPruned ) );
         qInfo().noquote()
             << QStringLiteral(
                    "playback_smoke.overlap_summary session=%1 lookahead_depth=%2 "
@@ -27503,7 +27683,7 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                    .arg( overlap.decodeBusyMs, 0, 'f', 3 )
                    .arg( overlap.reconBusyMs, 0, 'f', 3 )
                    .arg( static_cast<qulonglong>( overlap.reconStartsHeldForRender ) )
-            + rawPrefetchFields;
+            + rawPrefetchFields + cpuRouteFields;
     }
 
     // PLAYBACK-BACHELOR-PRESENT-JITTER-1: where the lost frames went (PlaybackSlipHistogram.h). Slips and class
@@ -30727,6 +30907,8 @@ void MainWindow::drawFrameReady()
                     cutOutFrame,
                     playbackRenderLookaheadFrames(),
                     ui->actionLoop->isChecked() );
+            if( prunedPlaybackLookaheadBeforeAcquire > 0 )
+                m_playbackLookaheadPruned += static_cast<uint64_t>( prunedPlaybackLookaheadBeforeAcquire );
             if( prunedPlaybackLookaheadBeforeAcquire > 0 && interactiveTraceEnabled() )
             {
                 logInteractionEvent(
@@ -30896,6 +31078,7 @@ void MainWindow::drawFrameReady()
         if( !targetReached )
         {
             m_playbackPrepStaleDropCount.fetch_add( 1, std::memory_order_acq_rel );
+            ++m_playbackLookaheadDroppedReady;
             if( interactiveTraceEnabled() )
             {
                 logInteractionEvent(

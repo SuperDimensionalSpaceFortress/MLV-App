@@ -1148,6 +1148,16 @@ private:
     // present requested and admitted, scale 1), where the playback lookahead is on by default
     // (playback_overlap::effectiveLookaheadFrames). The counters feed playback_smoke.overlap_summary.
     bool m_playbackLookaheadTextureRouteAdmitted = false;
+    // PLAYBACK-CPU-PACE-GAP-1: the last drawFrame() request's CPU-route admission
+    // (playback_overlap::cpuRouteLookaheadDecision) and the per-reason refusal counts for the smoke session.
+    bool m_playbackLookaheadCpuRouteEligible = false;
+    bool m_playbackLookaheadCpuRouteDefaultAdmitted = false;
+    playback_overlap::CpuLookaheadRefusal m_playbackLookaheadCpuRouteRefusalLast =
+        playback_overlap::CpuLookaheadRefusal::None;
+    uint64_t m_playbackLookaheadCpuRouteRefusalCounts[
+        static_cast<int>( playback_overlap::CpuLookaheadRefusal::Count )] = {};
+    uint64_t m_playbackLookaheadDroppedReady = 0;
+    uint64_t m_playbackLookaheadPruned = 0;
     uint64_t m_playbackLookaheadRequestsIssued = 0;
     uint64_t m_playbackLookaheadCoveredRequests = 0;
     int playbackRenderLookaheadFrames() const;
@@ -1634,6 +1644,14 @@ private:
     void noteContactSheetPresentedFrame( uint64_t displayFrame,
                                         const RenderFrameThread::ReadyFrame &readyFrame,
                                         const PresentationRequestContext &requestContext );
+    // PLAYBACK-CPU-PACE-GAP-1 exactness hook (MLVAPP_PLAYBACK_PRESENTED_DUMP_DIR / _FRAMES, read once; a no-op
+    // when unset): writes the CPU prep route's processed RGB8 for each presented frame in range.
+    void dumpPresentedFrameIfRequested( uint64_t displayFrame,
+                                        const PlaybackPrepTask &task,
+                                        const uint8_t *processedRgb8,
+                                        int processedWidth,
+                                        int processedHeight,
+                                        const QImage &displayImage );
     // --gui-smoke-playback only (CUDA-PERF-PLAYBACK-FOREGROUND-1): forces the main window
     // and the GPU display window to the OS foreground and verifies with
     // GetForegroundWindow(); never called from normal (non-smoke) startup or from the

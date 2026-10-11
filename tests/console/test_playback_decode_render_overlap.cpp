@@ -20,8 +20,10 @@
 #include <QString>
 #include <QTextStream>
 
+#include <algorithm>
 #include <deque>
 #include <map>
+#include <set>
 #include <vector>
 
 using playback_native_pace::NativePaceGuard;
@@ -59,6 +61,7 @@ struct PipelineRun
     double firstPresentMs = 0.0;
     double lastPresentMs = 0.0;
     int maxInFlight = 0;
+    int wastedUpstream = 0; // frames whose decode + recon finished but that were never presented (skipped targets)
     OverlapSnapshot overlap;
     double presentedFpsAfterFirst() const
     {
@@ -70,9 +73,17 @@ struct PipelineRun
 
 // Every-frame mode (grantWholeFrame), Loop off, wallMs of playback. While the upstream and the render run at once each
 // progresses at 1/contention of its speed (both are OpenMP teams over every core); exclusiveRecon is reconMayStart().
+// targetStride > 1 models drop-frame playback that falls behind: each advance moves the target by the stride (an
+// average; 2.5 alternates +2/+3) as soon as the GUI is free, and queued lookahead frames the target passed are pruned
+// (prunePlaybackLookaheadOutsideForwardWindow); ones already in a worker run to completion and are wasted.
 PipelineRun simulatePipeline( int lookaheadDepth, Gate gate, double upstreamMs, double renderMs, double hopMs,
-                              double contention = 1.0, bool exclusiveRecon = false, double wallMs = 25000.0 )
+                              double contention = 1.0, bool exclusiveRecon = false, double wallMs = 25000.0,
+                              double targetStride = 1.0 )
 {
+    const bool dropFrameTimeline = targetStride > 1.0;
+    double timelinePos = 0.0;
+    std::set<int> upstreamDone;
+    std::set<int> presentedFrames;
     PipelineRun run;
     NativePaceGuard guard;
     OverlapMeter meter;
@@ -132,6 +143,18 @@ PipelineRun simulatePipeline( int lookaheadDepth, Gate gate, double upstreamMs, 
     {
         target = frame;
         stillDrawing = true;
+        for( auto it = upstreamQueue.begin(); it != upstreamQueue.end(); )
+        {
+            if( *it < frame && frames[*it].lookahead )
+            {
+                frames.erase( *it );
+                it = upstreamQueue.erase( it );
+            }
+            else
+            {
+                ++it;
+            }
+        }
         auto it = frames.find( frame );
         if( it == frames.end() ) request( frame, false );
         for( int offset = 1; offset <= lookaheadDepth; ++offset ) request( frame + offset, true );
@@ -145,6 +168,7 @@ PipelineRun simulatePipeline( int lookaheadDepth, Gate gate, double upstreamMs, 
         // Upstream worker (decode + dual-ISO), one frame at a time, in request order.
         if( upstreamBusy >= 0 && upstreamLeft <= 1e-9 )
         {
+            upstreamDone.insert( upstreamBusy );
             frames[upstreamBusy].stage = 2;
             renderQueue.push_back( upstreamBusy );
             upstreamBusy = -1;
@@ -197,6 +221,13 @@ PipelineRun simulatePipeline( int lookaheadDepth, Gate gate, double upstreamMs, 
             if( lastPresented >= 0 && target != lastPresented + 1 ) run.inOrder = false;
             lastPresented = target;
             frames.erase( target );
+            presentedFrames.insert( target );
+            for( auto it = frames.begin(); it != frames.end(); )
+            {
+                // Ready frames the target passed are released (the prune's ready-slot half).
+                if( it->first < target && it->second.stage == 4 ) it = frames.erase( it );
+                else ++it;
+            }
             ++run.presented;
             if( !run.presentedAny ) run.firstPresentMs = now;
             run.presentedAny = true;
@@ -210,9 +241,15 @@ PipelineRun simulatePipeline( int lookaheadDepth, Gate gate, double upstreamMs, 
             nextPollMs += kPollMs;
             if( !stillDrawing )
             {
-                if( target < 0 || guard.grantWholeFrame( now, kNativeFps ) )
+                if( target < 0 || dropFrameTimeline || guard.grantWholeFrame( now, kNativeFps ) )
                 {
-                    requestTarget( target + 1 );
+                    int next = target + 1;
+                    if( dropFrameTimeline && target >= 0 )
+                    {
+                        timelinePos += targetStride;
+                        next = std::max( next, static_cast<int>( timelinePos ) );
+                    }
+                    requestTarget( next );
                     if( frames[target].stage == 4 && !presentScheduled )
                     {
                         presentScheduled = true; // covered and already rendered
@@ -221,6 +258,10 @@ PipelineRun simulatePipeline( int lookaheadDepth, Gate gate, double upstreamMs, 
                 }
             }
         }
+    }
+    for( const int frame : upstreamDone )
+    {
+        if( frame < lastPresented && !presentedFrames.count( frame ) ) ++run.wastedUpstream;
     }
     run.overlap = meter.snapshot( wallMs );
     return run;
@@ -236,6 +277,78 @@ TEST(PlaybackDecodeRenderOverlapPolicy, LookaheadIsOnByDefaultOnlyOnTheTextureRo
     ASSERT_EQ( effectiveLookaheadFrames( 1, false ), 1 );
     ASSERT_EQ( effectiveLookaheadFrames( 1, true ), 1 );
     ASSERT_EQ( effectiveLookaheadFrames( 9, true ), 3 );
+}
+
+// PLAYBACK-CPU-PACE-GAP-1: the CPU route gets depth 1 by default when cpuRouteLookaheadDecision() admits it; the
+// texture-route default and the env override are unchanged.
+TEST(PlaybackDecodeRenderOverlapPolicy, TheCpuRouteDefaultIsDepthOneAndNeverOutranksTheEnvOrTheTextureRoute)
+{
+    ASSERT_EQ( effectiveLookaheadFrames( -1, false, true ), 1 );
+    ASSERT_EQ( effectiveLookaheadFrames( -1, true, true ), 2 );
+    ASSERT_EQ( effectiveLookaheadFrames( 0, false, true ), 0 );  // MLVAPP_PLAYBACK_RENDER_LOOKAHEAD_FRAMES=0
+    ASSERT_EQ( effectiveLookaheadFrames( 2, false, false ), 2 );
+    ASSERT_EQ( effectiveLookaheadFrames( -1, false, false ), 0 );
+    ASSERT_EQ( playback_overlap::kDefaultCpuRouteLookaheadFrames, 1 );
+    ASSERT_EQ( playback_overlap::kDefaultTextureRouteLookaheadFrames, 2 );
+}
+
+TEST(PlaybackDecodeRenderOverlapPolicy, EveryCpuRouteRefusalHasItsOwnReason)
+{
+    using playback_overlap::CpuLookaheadDecision;
+    using playback_overlap::CpuLookaheadRefusal;
+    using playback_overlap::cpuRouteLookaheadDecision;
+    // (killSwitch, playing, textureRoute, phase3ReconWorker, gpuPreviewRoute, scale, explicitEnv)
+    CpuLookaheadDecision d = cpuRouteLookaheadDecision( false, true, false, true, false, 2, false );
+    ASSERT_TRUE( d.eligible );
+    ASSERT_TRUE( d.defaultAdmitted );
+    ASSERT_TRUE( d.refusal == CpuLookaheadRefusal::None );
+    d = cpuRouteLookaheadDecision( false, true, false, true, false, 4, false );
+    ASSERT_TRUE( d.defaultAdmitted );
+
+    // The kill switch beats everything, including an explicit env and an otherwise admitted s2.
+    d = cpuRouteLookaheadDecision( true, true, false, true, false, 2, true );
+    ASSERT_FALSE( d.eligible );
+    ASSERT_FALSE( d.defaultAdmitted );
+    ASSERT_TRUE( d.refusal == CpuLookaheadRefusal::KillSwitch );
+    d = cpuRouteLookaheadDecision( true, false, true, false, true, 1, false );
+    ASSERT_TRUE( d.refusal == CpuLookaheadRefusal::KillSwitch );
+
+    d = cpuRouteLookaheadDecision( false, false, false, true, false, 2, false );
+    ASSERT_FALSE( d.eligible );
+    ASSERT_TRUE( d.refusal == CpuLookaheadRefusal::NotPlaying );
+    d = cpuRouteLookaheadDecision( false, true, true, true, false, 2, false );
+    ASSERT_FALSE( d.eligible );
+    ASSERT_TRUE( d.refusal == CpuLookaheadRefusal::TextureRoute );
+    d = cpuRouteLookaheadDecision( false, true, false, false, false, 2, false );
+    ASSERT_FALSE( d.eligible );
+    ASSERT_TRUE( d.refusal == CpuLookaheadRefusal::NotPhase3 );
+    d = cpuRouteLookaheadDecision( false, true, false, true, true, 2, false );
+    ASSERT_FALSE( d.eligible );
+    ASSERT_TRUE( d.refusal == CpuLookaheadRefusal::GpuPreviewRoute );
+
+    // s1 refuses only the default: without an env it is refused, with an explicit env it still runs.
+    d = cpuRouteLookaheadDecision( false, true, false, true, false, 1, false );
+    ASSERT_TRUE( d.eligible );
+    ASSERT_FALSE( d.defaultAdmitted );
+    ASSERT_TRUE( d.refusal == CpuLookaheadRefusal::ScaleOneDefault );
+    ASSERT_EQ( effectiveLookaheadFrames( -1, false, d.defaultAdmitted ), 0 );
+    d = cpuRouteLookaheadDecision( false, true, false, true, false, 1, true );
+    ASSERT_TRUE( d.eligible );
+    ASSERT_FALSE( d.defaultAdmitted );
+    ASSERT_TRUE( d.refusal == CpuLookaheadRefusal::None );
+    ASSERT_EQ( effectiveLookaheadFrames( 1, false, d.defaultAdmitted ), 1 );
+
+    // Every reason prints a distinct name (the overlap_summary counts are keyed by it).
+    for( int a = 0; a < static_cast<int>( CpuLookaheadRefusal::Count ); ++a )
+    {
+        for( int b = a + 1; b < static_cast<int>( CpuLookaheadRefusal::Count ); ++b )
+        {
+            ASSERT_TRUE( QString::fromLatin1( playback_overlap::cpuLookaheadRefusalName(
+                             static_cast<CpuLookaheadRefusal>( a ) ) )
+                         != QString::fromLatin1( playback_overlap::cpuLookaheadRefusalName(
+                             static_cast<CpuLookaheadRefusal>( b ) ) ) );
+        }
+    }
 }
 
 TEST(PlaybackDecodeRenderOverlapPolicy, OnlySpeculativeWorkForAnotherFrameRunsBehindTheTimer)
@@ -382,6 +495,38 @@ TEST(PlaybackDecodeRenderOverlapPipeline, TheExclusiveReconStartRemovesContentio
     ASSERT_TRUE( exclusive.presentedFpsAfterFirst() > 23.8 );
     ASSERT_TRUE( exclusive.presentedFpsAfterFirst() <= kNativeFps + 0.05 );
 }
+TEST(PlaybackDecodeRenderOverlapPipeline, OneCpuLookaheadFramePipelinesTheReconWorker)
+{
+    // PLAYBACK-CPU-PACE-GAP-1, the Bachelor CPU display shape: recon 41 ms, render 3 ms, ~20 ms tick + GUI hop,
+    // native 41.7 ms. In series a frame costs ~64 ms (s2 measured 67.2); with the CPU default (depth 1) the recon of
+    // N+1 runs while N renders and hops, so the period approaches the recon itself.
+    const int cpuDepth = effectiveLookaheadFrames( -1, false, true );
+    ASSERT_EQ( cpuDepth, 1 );
+    const PipelineRun serial = simulatePipeline( 0, Gate::ExceptLookahead, 41.0, 3.0, 20.0 );
+    const PipelineRun pipelined = simulatePipeline( cpuDepth, Gate::ExceptLookahead, 41.0, 3.0, 20.0 );
+    ASSERT_TRUE( serial.inOrder );
+    ASSERT_TRUE( pipelined.inOrder );                    // every-frame playback still presents N, N+1, ... exactly
+    ASSERT_TRUE( serial.presentedFpsAfterFirst() < 16.5 );
+    ASSERT_TRUE( pipelined.presentedFpsAfterFirst() > 1.25 * serial.presentedFpsAfterFirst() );
+    ASSERT_TRUE( pipelined.presentedFpsAfterFirst() <= kNativeFps + 0.05 ); // never faster than native (#261)
+    ASSERT_EQ( pipelined.wastedUpstream, 0 );
+}
+
+TEST(PlaybackDecodeRenderOverlapPipeline, AtAStrideOfTwoAndAHalfTheLookaheadFrameIsWastedWhichIsWhyS1RefusesIt)
+{
+    // s1 is prep-bound (~100 ms a frame) and drop-frame skips ~2.5 frames per present, so the frame after the target
+    // is almost never the next one shown: its recon is pure waste, and it holds the worker the next target needs.
+    const double kWallMs = 25000.0;
+    const PipelineRun serial =
+        simulatePipeline( 0, Gate::ExceptLookahead, 41.0, 3.0, 56.0, 1.0, false, kWallMs, 2.5 );
+    const PipelineRun lookahead =
+        simulatePipeline( 1, Gate::ExceptLookahead, 41.0, 3.0, 56.0, 1.0, false, kWallMs, 2.5 );
+    ASSERT_TRUE( serial.presented > 50 );
+    ASSERT_EQ( serial.wastedUpstream, 0 );
+    ASSERT_TRUE( lookahead.wastedUpstream * 2 >= lookahead.presented ); // at least every other present wasted a recon
+    ASSERT_TRUE( lookahead.presentedFpsAfterFirst() <= serial.presentedFpsAfterFirst() * 1.02 ); // and bought nothing
+}
+
 // ---- wiring: MainWindow.cpp needs a full GUI build, so its source is read as text --------------------------
 namespace
 {
@@ -410,6 +555,27 @@ TEST(PlaybackDecodeRenderOverlapWiring, ThePresentPathsRecomputeStillDrawingWith
     ASSERT_TRUE( mw.contains( QStringLiteral("playback_overlap::effectiveLookaheadFrames(") ) );
     ASSERT_TRUE( mw.contains( QStringLiteral("playback_smoke.overlap_summary") ) );
     ASSERT_FALSE( mw.contains( QStringLiteral("mlvappPlaybackRenderLookaheadFrames()") ) );
+}
+
+TEST(PlaybackDecodeRenderOverlapWiring, TheLookaheadQueueAdmitsTheCpuRouteAndTheSummaryNamesEveryRefusal)
+{
+    const QString mw = readRepoText( "platform/qt/MainWindow.cpp" );
+    ASSERT_FALSE( mw.isEmpty() );
+    const int queueFn = mw.indexOf( QStringLiteral("void MainWindow::queuePlaybackLookaheadRequests(") );
+    ASSERT_TRUE( queueFn > 0 );
+    const int queueFnEnd = mw.indexOf( QStringLiteral("\nvoid MainWindow::"), queueFn + 10 );
+    const QString queueBody = mw.mid( queueFn, queueFnEnd - queueFn );
+    ASSERT_TRUE( queueBody.contains(
+        QStringLiteral("if( !textureRouteAdmitsLookahead && !m_playbackLookaheadCpuRouteEligible ) return;") ) );
+    // The decision is recomputed every drawFrame() request from the pure policy, and the CPU default reaches the depth.
+    ASSERT_TRUE( mw.contains( QStringLiteral("playback_overlap::cpuRouteLookaheadDecision(") ) );
+    ASSERT_TRUE( mw.contains( QStringLiteral("m_playbackLookaheadCpuRouteDefaultAdmitted );") ) );
+    ASSERT_TRUE( mw.contains( QStringLiteral("MLVAPP_DISABLE_CPU_PLAYBACK_LOOKAHEAD") ) );
+    for( const char *field : { "cpu_route_eligible=", "cpu_route_default_admitted=", "cpu_route_refusal_last=",
+                               "cpu_route_refusal_counts=", "lookahead_dropped_ready=", "lookahead_pruned=" } )
+    {
+        ASSERT_TRUE( mw.contains( QString::fromLatin1( field ) ) );
+    }
 }
 
 TEST(PlaybackDecodeRenderOverlapWiring, TheRenderThreadReportsEveryStageToTheMeter)
