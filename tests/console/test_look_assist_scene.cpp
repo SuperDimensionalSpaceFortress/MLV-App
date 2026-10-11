@@ -1290,6 +1290,95 @@ TEST(LookAssistScene, AnInitialPatchWhoseSolutionLeavesTheSameSurfaceCastIsRefus
     ASSERT_FALSE( r.refineAttempted );
     ASSERT_TRUE( r.temperature != 9990 );
     expectMastersBalance( r, day, 6000, 0 );
+    // ... and it is NOT strictly neutral there (outside the 2.0 dead band), so the strict-neutral acceptance does not apply.
+    LookAssistRenderedPicture atSolution;
+    ASSERT_TRUE( scene.renderer()( 0.0, 9990, -20, &atSolution ) );
+    const unsigned char *deck =
+        &atSolution.rgb[( static_cast<size_t>( request.patch.thumbnailY ) * atSolution.width + request.patch.thumbnailX ) * 3];
+    const double blueAmber = static_cast<double>( deck[2] ) - deck[0];
+    const double green = deck[1] - ( static_cast<double>( deck[0] ) + deck[2] ) * 0.5;
+    ASSERT_TRUE( std::fabs( blueAmber ) >= 2.0 || std::fabs( green ) >= 2.0 );
+}
+
+// LOOK-ASSIST-LARGE-F5-PATCH-UNVERIFIED-1: on the de-striped large fixture (f5 / f10) the initial patch is chroma 0 at the
+// as-shot balance and chroma 1 at the solution, strictly inside the dead band. Chroma is whole 8-bit steps, so the 0.75
+// slack alone refused it for one step; a strictly neutral surface at the solution carries no added cast and is believed.
+// One surface fills the picture: grey at every balance but the solution, where it takes the colour under test.
+namespace
+{
+
+struct OneSurfaceRun
+{
+    LookAssistWhiteBalanceResolution r;
+    int renders = 0;
+};
+
+OneSurfaceRun resolveOneSurface( const LookAssistStats &day, int red, int green, int blue )
+{
+    const int width = 80, height = 60, downscale = 4;
+    const int solvedTemperature = 6600, solvedTint = -10;
+    OneSurfaceRun run;
+    auto render = [&]( int temperature, int tint, LookAssistRenderedPicture *out )
+    {
+        const bool atSolution = temperature == solvedTemperature && tint == solvedTint;
+        paintPicture( out, width, height, downscale, [&]( int, int ) {
+            return atSolution ? std::vector<int>{ red, green, blue } : std::vector<int>{ 140, 140, 140 }; } );
+    };
+    LookAssistWhiteBalanceRequest request;
+    request.stats = &day;
+    request.scene = LookAssistScene::Shade;
+    request.solvedOnProcessedPicture = true;
+    request.baseTemperature = 6000;
+    request.baseTint = 0;
+    request.rawWidth = width * downscale;
+    request.rawHeight = height * downscale;
+    request.renderBalance = [&]( double, int temperature, int tint, LookAssistRenderedPicture *out ) -> bool
+    {
+        ++run.renders;
+        render( temperature, tint, out );
+        return true;
+    };
+    LookAssistRenderedPicture existing;   // the consumer's picture at the existing balance
+    render( 7000, -5, &existing );
+    request.patch = findLookAssistAutoWhiteBalancePatch( existing.rgb.data(), width, height, downscale,
+                                                         request.rawWidth, request.rawHeight );
+    LookAssistPreset preset = presetForLookAssistScene( LookAssistScene::Shade, day );
+    run.r = resolveLookAssistWhiteBalance(
+        request, [&]( int, int, int *t, int *tint ) { *t = solvedTemperature; *tint = solvedTint; }, &preset );
+    return run;
+}
+
+} // namespace
+
+TEST(LookAssistScene, AnInitialPatchStrictlyNeutralAtTheSolutionIsNotRefusedForOneChromaStep)
+{
+    const LookAssistStats day = daylightWithPrior( 6300, -15 );
+    // (a) chroma 0 at base, 140/141/140 at the solution: chroma 1 (> 0 + 0.75), B-R 0, G +1 -- strictly neutral.
+    {
+        const OneSurfaceRun run = resolveOneSurface( day, 140, 141, 140 );
+        ASSERT_TRUE( run.r.initialPatchChecked );
+        ASSERT_FALSE( run.r.initialPatchRefused );
+        ASSERT_NEAR( 0.0, run.r.initialPatchBaseChroma, 1e-9 );
+        ASSERT_NEAR( 1.0, run.r.initialPatchFinalChroma, 1e-9 );
+        ASSERT_TRUE( run.r.autoValid );
+        ASSERT_FALSE( run.r.legacyBalance );
+        ASSERT_TRUE( run.r.source == QStringLiteral("processed-neutral-patch") );
+        ASSERT_TRUE( run.r.decision == QStringLiteral("accepted") );
+        ASSERT_NEAR( 1.0, run.r.damping, 1e-9 );   // the undamped solve is kept
+        ASSERT_EQ( 6600, run.r.temperature );
+        ASSERT_EQ( -10, run.r.tint );
+        ASSERT_EQ( 2, run.renders );                // the base picture and the verification
+    }
+    // (b) the same, but 140/140/143 at the solution: chroma 3, B-R +3 -- outside the dead band, still refused.
+    {
+        const OneSurfaceRun run = resolveOneSurface( day, 140, 140, 143 );
+        ASSERT_TRUE( run.r.initialPatchChecked );
+        ASSERT_TRUE( run.r.initialPatchRefused );
+        ASSERT_FALSE( run.r.initialPatchRefusedAtBase );
+        ASSERT_NEAR( 3.0, run.r.initialPatchFinalChroma, 1e-9 );
+        ASSERT_FALSE( run.r.autoValid );
+        expectMastersBalance( run.r, day, 6000, 0 );
+    }
 }
 
 TEST(LookAssistScene, AnInitialPatchThatCannotBeVerifiedIsMastersNotBelieved)

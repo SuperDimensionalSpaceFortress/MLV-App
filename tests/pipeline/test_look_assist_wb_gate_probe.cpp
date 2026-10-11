@@ -57,6 +57,14 @@ const char *const kLargeClip = "tests/fixtures/clips/large_dual_iso.mlv";
 // kRefineVerifyChromaSlack, LookAssistAnalysis.cpp:692 (file-static there): the surface at the solution may be this much
 // more cast than where it was found.
 const double kVerifyChromaSlack = 0.75;
+// kRefineDeadBand, LookAssistAnalysis.cpp:686 (file-static there).
+const double kSurfaceDeadBand = 2.0;
+// lookAssistSurfaceIsNeutral, LookAssistAnalysis.cpp:1128 (file-static there): strictly inside the dead band on both axes.
+// The solution check accepts such a surface whatever its chroma rise (LOOK-ASSIST-LARGE-F5-PATCH-UNVERIFIED-1).
+bool surfaceIsNeutral( const LookAssistAutoWhiteBalancePatch &surface )
+{
+    return surface.valid && std::fabs( surface.blueAmberAxis ) < kSurfaceDeadBand && std::fabs( surface.greenAxis ) < kSurfaceDeadBand;
+}
 // The solver's own tint rails, LookAssistAnalysis.cpp:1011.
 const int kSolverMinTint = -35;
 const int kSolverMaxTint = 18;
@@ -265,7 +273,7 @@ VerificationReplica replicateVerification( const DecisionInputs &in, int solvedT
         patchAt( verify.rgb, verify.width, verify.height, patch.thumbnailX, patch.thumbnailY, base.downscaleFactor, in.rawW, in.rawH );
     v.finalChroma = atSolution.valid ? atSolution.chroma : 0.0;
     v.verified = atSolution.valid && lookAssistDaylightPatchIsNeutralEnough( atSolution )
-              && atSolution.chroma <= patch.chroma + kVerifyChromaSlack;
+              && ( atSolution.chroma <= patch.chroma + kVerifyChromaSlack || surfaceIsNeutral( atSolution ) );
     v.exit = v.verified ? QStringLiteral( "verified" ) : QStringLiteral( "unverified-at-solution" );
     return v;
 }
@@ -528,7 +536,8 @@ struct GateTrace
     bool g3 = false;
     int appliedT = 0, appliedTint = 0;            // the window-clamped solution (:973-974)
     double finalChroma = -1.0;
-    bool g4Neutral = false, g4 = false;
+    double finalBlueAmber = 0.0, finalGreen = 0.0;   // the solution surface's axes (the strict-neutral test)
+    bool g4Neutral = false, g4Strict = false, g4 = false;
     bool g5T = false, g5Tint = false;
     DecisionReplica decision;                     // what the product decides for this surface, and what the applier logs
     QString firstRefusing;                        // g1 | g2 | g3 | g4 | none
@@ -624,8 +633,11 @@ GateTrace traceGates( const Analysis &a, const DecisionInputs &in )
         const LookAssistAutoWhiteBalancePatch s =
             patchAt( verify.rgb, verify.width, verify.height, p.thumbnailX, p.thumbnailY, a.colorDownscale, a.rawW, a.rawH );
         t.finalChroma = s.valid ? s.chroma : 0.0;
+        t.finalBlueAmber = s.blueAmberAxis;
+        t.finalGreen = s.greenAxis;
         t.g4Neutral = s.valid && lookAssistDaylightPatchIsNeutralEnough( s );
-        t.g4 = t.g4Neutral && s.chroma <= p.chroma + kVerifyChromaSlack;
+        t.g4Strict = surfaceIsNeutral( s );
+        t.g4 = t.g4Neutral && ( s.chroma <= p.chroma + kVerifyChromaSlack || t.g4Strict );
     }
 
     // The decision (:1003-1090), every branch, as the applier logs it.
@@ -649,9 +661,10 @@ void printTrace( const char *tag, const char *which, const GateTrace &t )
                  t.g2NeutralEnough ? 1 : 0, std::max( 10.0, p.luma * 0.09 ) );
     std::printf( "WB_GATE %s %s g3 pass=%d prior=%d/%d asked=%d baseChroma=%.1f baseBlueAmber=%.1f\n", tag, which,
                  t.g3 ? 1 : 0, t.priorT, t.priorTint, t.priorAsked ? 1 : 0, t.baseChroma, t.baseBlueAmber );
-    std::printf( "WB_GATE %s %s g4 pass=%d at=%d/%d foundChroma=%.1f finalChroma=%.1f margin=%.2f slack=%.2f neutralEnough=%d\n",
+    std::printf( "WB_GATE %s %s g4 pass=%d at=%d/%d foundChroma=%.1f finalChroma=%.1f margin=%.2f slack=%.2f neutralEnough=%d "
+                 "finalBlueAmber=%.1f finalGreen=%.1f strictNeutral=%d\n",
                  tag, which, t.g4 ? 1 : 0, t.appliedT, t.appliedTint, p.chroma, t.finalChroma, t.finalChroma - p.chroma,
-                 kVerifyChromaSlack, t.g4Neutral ? 1 : 0 );
+                 kVerifyChromaSlack, t.g4Neutral ? 1 : 0, t.finalBlueAmber, t.finalGreen, t.g4Strict ? 1 : 0 );
     std::printf( "WB_GATE %s %s g5 binds=%d temperature=%d tint=%d\n", tag, which, ( t.g5T || t.g5Tint ) ? 1 : 0,
                  t.g5T ? 1 : 0, t.g5Tint ? 1 : 0 );
     std::printf( "WB_GATE %s %s decision=%s first_refusing=%s branch=%s undamped=%d verification=%s walk_unmodelled=%d\n", tag,
