@@ -8,6 +8,11 @@
 
 #include "igpu_amaze_debayer.h"
 
+/* GPU-EVENT153-ROOTCAUSE-2: env-gated per-launch timing (default OFF); the
+ * stage probe included below pulls in the same header for its launch helpers. */
+#define IGPU_LT_DLL_NAME "amaze"
+#include "igpu_launch_timing.cuh"
+
 #define CUDA_AMAZE_DEBAYER_STAGE_PROBE_LIBRARY 1
 #define CUDA_AMAZE_DEBAYER_STAGE_PROBE_NO_MAIN 1
 #include "../cuda_amaze_debayer_stage_probe.cu"
@@ -305,7 +310,8 @@ void launch_reduced_hnyquist121(const uint16_t * in, uint16_t * out, int w, int 
 {
     const dim3 block(32, 8);
     const dim3 grid((w + block.x - 1) / block.x, (h + block.y - 1) / block.y);
-    k_reduced_hnyquist121<<<grid, block>>>(in, out, w, h);
+    IGPU_LT_LAUNCH("k_reduced_hnyquist121", grid, block, 0,
+                   k_reduced_hnyquist121<<<grid, block>>>(in, out, w, h));
 }
 
 __device__ __forceinline__ uint16_t clamp_double_to_u16(double value)
@@ -570,7 +576,7 @@ int copy_gl_r16_texture_to_bayer16(unsigned int glTexture,
         }
     }
 
-    cudaError_t rc = cudaGraphicsMapResources(1, &resource, 0);
+    cudaError_t rc = IGPU_LT_SYNC_CALL("gl_r16_in:map", cudaGraphicsMapResources(1, &resource, 0));
     if (rc != cudaSuccess)
     {
         std::fprintf(stderr,
@@ -586,17 +592,19 @@ int copy_gl_r16_texture_to_bayer16(unsigned int glTexture,
     if (rc == cudaSuccess)
     {
         const std::size_t rowBytes = static_cast<std::size_t>(width) * sizeof(uint16_t);
-        rc = cudaMemcpy2DFromArray(dBayer16,
-                                   rowBytes,
-                                   mappedArray,
-                                   0,
-                                   0,
-                                   rowBytes,
-                                   static_cast<std::size_t>(height),
-                                   cudaMemcpyDeviceToDevice);
+        rc = IGPU_LT_SYNC_CALL("gl_r16_in:copy_from_array",
+                               cudaMemcpy2DFromArray(dBayer16,
+                                                     rowBytes,
+                                                     mappedArray,
+                                                     0,
+                                                     0,
+                                                     rowBytes,
+                                                     static_cast<std::size_t>(height),
+                                                     cudaMemcpyDeviceToDevice));
     }
 
-    const cudaError_t unmapRc = cudaGraphicsUnmapResources(1, &resource, 0);
+    const cudaError_t unmapRc =
+        IGPU_LT_SYNC_CALL("gl_r16_in:unmap", cudaGraphicsUnmapResources(1, &resource, 0));
     const cudaError_t unregisterRc =
         cached ? cudaSuccess : cudaGraphicsUnregisterResource(resource);
     if (rc != cudaSuccess)
@@ -643,54 +651,63 @@ void run_tile(const float * dRaw,
     const int cc1 = right - left;
 
     clear_device_stages(d);
+    igpu_lt::TileScope lt_tile(top, left);
 
     const dim3 block(16, 16);
     const dim3 grid((kTileSize + block.x - 1) / block.x,
                     (kTileSize + block.y - 1) / block.y);
 
-    k_tile_load_float<<<grid, block, 0, stream>>>(dRaw,
-                                                  d.cfa,
-                                                  d.rgbgreen,
-                                                  width,
-                                                  height,
-                                                  top,
-                                                  left,
-                                                  rr1,
-                                                  cc1);
+    IGPU_LT_LAUNCH("k_tile_load_float", grid, block, stream,
+                   k_tile_load_float<<<grid, block, 0, stream>>>(dRaw,
+                                                                 d.cfa,
+                                                                 d.rgbgreen,
+                                                                 width,
+                                                                 height,
+                                                                 top,
+                                                                 left,
+                                                                 rr1,
+                                                                 cc1));
     CK(cudaGetLastError());
-    k_gradients<<<grid, block, 0, stream>>>(d.cfa, d.dirwts0, d.dirwts1, d.delhvsqsum, rr1, cc1);
+    IGPU_LT_LAUNCH("k_gradients", grid, block, stream,
+                   k_gradients<<<grid, block, 0, stream>>>(d.cfa, d.dirwts0, d.dirwts1, d.delhvsqsum, rr1, cc1));
     CK(cudaGetLastError());
-    k_diagonal_precursors<<<grid, block, 0, stream>>>(d.cfa, d.delp, d.delm, d.dgrbsq1p, d.dgrbsq1m, rr1, cc1);
+    IGPU_LT_LAUNCH("k_diagonal_precursors", grid, block, stream,
+                   k_diagonal_precursors<<<grid, block, 0, stream>>>(d.cfa, d.delp, d.delm, d.dgrbsq1p, d.dgrbsq1m, rr1, cc1));
     CK(cudaGetLastError());
-    k_green_interpolation<<<grid, block, 0, stream>>>(d.cfa,
-                                                      d.dirwts0,
-                                                      d.dirwts1,
-                                                      d.vcd,
-                                                      d.hcd,
-                                                      d.vcdalt,
-                                                      d.hcdalt,
-                                                      d.dgintv,
-                                                      d.dginth,
-                                                      rr1,
-                                                      cc1);
+    IGPU_LT_LAUNCH("k_green_interpolation", grid, block, stream,
+                   k_green_interpolation<<<grid, block, 0, stream>>>(d.cfa,
+                                                                     d.dirwts0,
+                                                                     d.dirwts1,
+                                                                     d.vcd,
+                                                                     d.hcd,
+                                                                     d.vcdalt,
+                                                                     d.hcdalt,
+                                                                     d.dgintv,
+                                                                     d.dginth,
+                                                                     rr1,
+                                                                     cc1));
     CK(cudaGetLastError());
     launch_variance_selection_prefix(d, rr1, cc1, stream);
-    k_hvwt_adaptive_weights<<<grid, block, 0, stream>>>(d.dirwts0,
-                                                        d.dirwts1,
-                                                        d.vcd,
-                                                        d.hcd,
-                                                        d.dgintv,
-                                                        d.dginth,
-                                                        d.hvwt,
-                                                        rr1,
-                                                        cc1);
+    IGPU_LT_LAUNCH("k_hvwt_adaptive_weights", grid, block, stream,
+                   k_hvwt_adaptive_weights<<<grid, block, 0, stream>>>(d.dirwts0,
+                                                                       d.dirwts1,
+                                                                       d.vcd,
+                                                                       d.hcd,
+                                                                       d.dgintv,
+                                                                       d.dginth,
+                                                                       d.hvwt,
+                                                                       rr1,
+                                                                       cc1));
     CK(cudaGetLastError());
     clear_nyquist_dependent_scratch(d, stream);
-    k_nyquist_test<<<grid, block, 0, stream>>>(d.cddiffsq, d.delhvsqsum, d.nyquist, rr1, cc1);
+    IGPU_LT_LAUNCH("k_nyquist_test", grid, block, stream,
+                   k_nyquist_test<<<grid, block, 0, stream>>>(d.cddiffsq, d.delhvsqsum, d.nyquist, rr1, cc1));
     CK(cudaGetLastError());
-    k_nyquist_refine_row_prefix<<<1, kNyquistPrefixThreads, 0, stream>>>(d.nyquist, rr1, cc1);
+    IGPU_LT_LAUNCH("k_nyquist_refine_row_prefix", 1, kNyquistPrefixThreads, stream,
+                   k_nyquist_refine_row_prefix<<<1, kNyquistPrefixThreads, 0, stream>>>(d.nyquist, rr1, cc1));
     CK(cudaGetLastError());
-    k_nyquist_area_interpolation<<<grid, block, 0, stream>>>(d.cfa, d.nyquist, d.hvwt, rr1, cc1);
+    IGPU_LT_LAUNCH("k_nyquist_area_interpolation", grid, block, stream,
+                   k_nyquist_area_interpolation<<<grid, block, 0, stream>>>(d.cfa, d.nyquist, d.hvwt, rr1, cc1));
     CK(cudaGetLastError());
     launch_green_plane_assembly(grid,
                                 block,
@@ -706,27 +723,29 @@ void run_tile(const float * dRaw,
                                 rr1,
                                 cc1,
                                 stream);
-    k_nyquist_green_refinement<<<grid, block, 0, stream>>>(d.cfa,
-                                                           d.vcd,
-                                                           d.hcd,
-                                                           d.nyquist,
-                                                           d.dgrb2h,
-                                                           d.dgrb2v,
-                                                           d.dgrb0,
-                                                           d.rgbgreen,
-                                                           rr1,
-                                                           cc1);
+    IGPU_LT_LAUNCH("k_nyquist_green_refinement", grid, block, stream,
+                   k_nyquist_green_refinement<<<grid, block, 0, stream>>>(d.cfa,
+                                                                          d.vcd,
+                                                                          d.hcd,
+                                                                          d.nyquist,
+                                                                          d.dgrb2h,
+                                                                          d.dgrb2v,
+                                                                          d.dgrb0,
+                                                                          d.rgbgreen,
+                                                                          rr1,
+                                                                          cc1));
     CK(cudaGetLastError());
-    k_diagonal_rb_interpolation<<<grid, block, 0, stream>>>(d.cfa,
-                                                            d.delp,
-                                                            d.delm,
-                                                            d.dgrbsq1p,
-                                                            d.dgrbsq1m,
-                                                            d.rbm,
-                                                            d.rbp,
-                                                            d.pmwt,
-                                                            rr1,
-                                                            cc1);
+    IGPU_LT_LAUNCH("k_diagonal_rb_interpolation", grid, block, stream,
+                   k_diagonal_rb_interpolation<<<grid, block, 0, stream>>>(d.cfa,
+                                                                           d.delp,
+                                                                           d.delm,
+                                                                           d.dgrbsq1p,
+                                                                           d.dgrbsq1m,
+                                                                           d.rbm,
+                                                                           d.rbp,
+                                                                           d.pmwt,
+                                                                           rr1,
+                                                                           cc1));
     CK(cudaGetLastError());
     launch_pmwt_refinement_and_rbint(grid,
                                      block,
@@ -739,41 +758,46 @@ void run_tile(const float * dRaw,
                                      rr1,
                                      cc1,
                                      stream);
-    k_diagonal_green_correction<<<grid, block, 0, stream>>>(d.cfa,
-                                                            d.dirwts0,
-                                                            d.dirwts1,
-                                                            d.hvwt,
-                                                            d.pmwt,
-                                                            d.rbint,
-                                                            d.dgrb0,
-                                                            d.rgbgreen,
-                                                            rr1,
-                                                            cc1);
+    IGPU_LT_LAUNCH("k_diagonal_green_correction", grid, block, stream,
+                   k_diagonal_green_correction<<<grid, block, 0, stream>>>(d.cfa,
+                                                                           d.dirwts0,
+                                                                           d.dirwts1,
+                                                                           d.hvwt,
+                                                                           d.pmwt,
+                                                                           d.rbint,
+                                                                           d.dgrb0,
+                                                                           d.rgbgreen,
+                                                                           rr1,
+                                                                           cc1));
     CK(cudaGetLastError());
-    k_chrominance_coset_split<<<grid, block, 0, stream>>>(d.dgrb0, d.dgrb1, rr1, cc1);
+    IGPU_LT_LAUNCH("k_chrominance_coset_split", grid, block, stream,
+                   k_chrominance_coset_split<<<grid, block, 0, stream>>>(d.dgrb0, d.dgrb1, rr1, cc1));
     CK(cudaGetLastError());
-    k_fancy_chrominance_interpolation<<<grid, block, 0, stream>>>(d.dgrb0, d.dgrb1, rr1, cc1);
+    IGPU_LT_LAUNCH("k_fancy_chrominance_interpolation", grid, block, stream,
+                   k_fancy_chrominance_interpolation<<<grid, block, 0, stream>>>(d.dgrb0, d.dgrb1, rr1, cc1));
     CK(cudaGetLastError());
-    k_final_output_planes<<<grid, block, 0, stream>>>(d.rgbgreen,
-                                                      d.hvwt,
-                                                      d.dgrb0,
-                                                      d.dgrb1,
-                                                      d.red,
-                                                      d.green,
-                                                      d.blue,
-                                                      rr1,
-                                                      cc1);
+    IGPU_LT_LAUNCH("k_final_output_planes", grid, block, stream,
+                   k_final_output_planes<<<grid, block, 0, stream>>>(d.rgbgreen,
+                                                                     d.hvwt,
+                                                                     d.dgrb0,
+                                                                     d.dgrb1,
+                                                                     d.red,
+                                                                     d.green,
+                                                                     d.blue,
+                                                                     rr1,
+                                                                     cc1));
     CK(cudaGetLastError());
-    k_store_tile_rgb16<<<grid, block, 0, stream>>>(d.red,
-                                                   d.green,
-                                                   d.blue,
-                                                   dRgb16,
-                                                   width,
-                                                   height,
-                                                   top,
-                                                   left,
-                                                   rr1,
-                                                   cc1);
+    IGPU_LT_LAUNCH("k_store_tile_rgb16", grid, block, stream,
+                   k_store_tile_rgb16<<<grid, block, 0, stream>>>(d.red,
+                                                                  d.green,
+                                                                  d.blue,
+                                                                  dRgb16,
+                                                                  width,
+                                                                  height,
+                                                                  top,
+                                                                  left,
+                                                                  rr1,
+                                                                  cc1));
     CK(cudaGetLastError());
 }
 
@@ -798,6 +822,7 @@ void run_tile_bayer16_post_wb(const uint16_t * dBayer16,
     const int cc1 = right - left;
 
     clear_device_stages(d);
+    igpu_lt::TileScope lt_tile(top, left);
 
     const dim3 block(16, 16);
     const dim3 grid((kTileSize + block.x - 1) / block.x,
@@ -808,54 +833,62 @@ void run_tile_bayer16_post_wb(const uint16_t * dBayer16,
         if (!fastLaunchChecks) CK(cudaGetLastError()); \
     } while (0)
 
-    k_tile_load_bayer16_post_wb<<<grid, block, 0, stream>>>(dBayer16,
-                                                            d.cfa,
-                                                            d.rgbgreen,
-                                                            width,
-                                                            height,
-                                                            top,
-                                                            left,
-                                                            rr1,
-                                                            cc1,
-                                                            blackLevel,
-                                                            wbMultiplierR,
-                                                            wbMultiplierG,
-                                                            wbMultiplierB);
+    IGPU_LT_LAUNCH("k_tile_load_bayer16_post_wb", grid, block, stream,
+                   k_tile_load_bayer16_post_wb<<<grid, block, 0, stream>>>(dBayer16,
+                                                                           d.cfa,
+                                                                           d.rgbgreen,
+                                                                           width,
+                                                                           height,
+                                                                           top,
+                                                                           left,
+                                                                           rr1,
+                                                                           cc1,
+                                                                           blackLevel,
+                                                                           wbMultiplierR,
+                                                                           wbMultiplierG,
+                                                                           wbMultiplierB));
     CHECK_LIVE_TILE_LAUNCH();
-    k_gradients<<<grid, block, 0, stream>>>(d.cfa, d.dirwts0, d.dirwts1, d.delhvsqsum, rr1, cc1);
+    IGPU_LT_LAUNCH("k_gradients", grid, block, stream,
+                   k_gradients<<<grid, block, 0, stream>>>(d.cfa, d.dirwts0, d.dirwts1, d.delhvsqsum, rr1, cc1));
     CHECK_LIVE_TILE_LAUNCH();
-    k_diagonal_precursors<<<grid, block, 0, stream>>>(d.cfa, d.delp, d.delm, d.dgrbsq1p, d.dgrbsq1m, rr1, cc1);
+    IGPU_LT_LAUNCH("k_diagonal_precursors", grid, block, stream,
+                   k_diagonal_precursors<<<grid, block, 0, stream>>>(d.cfa, d.delp, d.delm, d.dgrbsq1p, d.dgrbsq1m, rr1, cc1));
     CHECK_LIVE_TILE_LAUNCH();
-    k_green_interpolation<<<grid, block, 0, stream>>>(d.cfa,
-                                                      d.dirwts0,
-                                                      d.dirwts1,
-                                                      d.vcd,
-                                                      d.hcd,
-                                                      d.vcdalt,
-                                                      d.hcdalt,
-                                                      d.dgintv,
-                                                      d.dginth,
-                                                      rr1,
-                                                      cc1);
+    IGPU_LT_LAUNCH("k_green_interpolation", grid, block, stream,
+                   k_green_interpolation<<<grid, block, 0, stream>>>(d.cfa,
+                                                                     d.dirwts0,
+                                                                     d.dirwts1,
+                                                                     d.vcd,
+                                                                     d.hcd,
+                                                                     d.vcdalt,
+                                                                     d.hcdalt,
+                                                                     d.dgintv,
+                                                                     d.dginth,
+                                                                     rr1,
+                                                                     cc1));
     CHECK_LIVE_TILE_LAUNCH();
     launch_variance_selection_prefix(d, rr1, cc1, stream, !fastLaunchChecks);
     CHECK_LIVE_TILE_LAUNCH();
-    k_hvwt_adaptive_weights<<<grid, block, 0, stream>>>(d.dirwts0,
-                                                        d.dirwts1,
-                                                        d.vcd,
-                                                        d.hcd,
-                                                        d.dgintv,
-                                                        d.dginth,
-                                                        d.hvwt,
-                                                        rr1,
-                                                        cc1);
+    IGPU_LT_LAUNCH("k_hvwt_adaptive_weights", grid, block, stream,
+                   k_hvwt_adaptive_weights<<<grid, block, 0, stream>>>(d.dirwts0,
+                                                                       d.dirwts1,
+                                                                       d.vcd,
+                                                                       d.hcd,
+                                                                       d.dgintv,
+                                                                       d.dginth,
+                                                                       d.hvwt,
+                                                                       rr1,
+                                                                       cc1));
     CHECK_LIVE_TILE_LAUNCH();
     clear_nyquist_dependent_scratch(d, stream);
-    k_nyquist_test<<<grid, block, 0, stream>>>(d.cddiffsq, d.delhvsqsum, d.nyquist, rr1, cc1);
+    IGPU_LT_LAUNCH("k_nyquist_test", grid, block, stream,
+                   k_nyquist_test<<<grid, block, 0, stream>>>(d.cddiffsq, d.delhvsqsum, d.nyquist, rr1, cc1));
     CHECK_LIVE_TILE_LAUNCH();
-    k_nyquist_refine_row_prefix<<<1, kNyquistPrefixThreads, 0, stream>>>(d.nyquist, rr1, cc1);
+    IGPU_LT_LAUNCH("k_nyquist_refine_row_prefix", 1, kNyquistPrefixThreads, stream,
+                   k_nyquist_refine_row_prefix<<<1, kNyquistPrefixThreads, 0, stream>>>(d.nyquist, rr1, cc1));
     CHECK_LIVE_TILE_LAUNCH();
-    k_nyquist_area_interpolation<<<grid, block, 0, stream>>>(d.cfa, d.nyquist, d.hvwt, rr1, cc1);
+    IGPU_LT_LAUNCH("k_nyquist_area_interpolation", grid, block, stream,
+                   k_nyquist_area_interpolation<<<grid, block, 0, stream>>>(d.cfa, d.nyquist, d.hvwt, rr1, cc1));
     CHECK_LIVE_TILE_LAUNCH();
     launch_green_plane_assembly(grid,
                                 block,
@@ -873,27 +906,29 @@ void run_tile_bayer16_post_wb(const uint16_t * dBayer16,
                                 stream,
                                 !fastLaunchChecks);
     CHECK_LIVE_TILE_LAUNCH();
-    k_nyquist_green_refinement<<<grid, block, 0, stream>>>(d.cfa,
-                                                           d.vcd,
-                                                           d.hcd,
-                                                           d.nyquist,
-                                                           d.dgrb2h,
-                                                           d.dgrb2v,
-                                                           d.dgrb0,
-                                                           d.rgbgreen,
-                                                           rr1,
-                                                           cc1);
+    IGPU_LT_LAUNCH("k_nyquist_green_refinement", grid, block, stream,
+                   k_nyquist_green_refinement<<<grid, block, 0, stream>>>(d.cfa,
+                                                                          d.vcd,
+                                                                          d.hcd,
+                                                                          d.nyquist,
+                                                                          d.dgrb2h,
+                                                                          d.dgrb2v,
+                                                                          d.dgrb0,
+                                                                          d.rgbgreen,
+                                                                          rr1,
+                                                                          cc1));
     CHECK_LIVE_TILE_LAUNCH();
-    k_diagonal_rb_interpolation<<<grid, block, 0, stream>>>(d.cfa,
-                                                            d.delp,
-                                                            d.delm,
-                                                            d.dgrbsq1p,
-                                                            d.dgrbsq1m,
-                                                            d.rbm,
-                                                            d.rbp,
-                                                            d.pmwt,
-                                                            rr1,
-                                                            cc1);
+    IGPU_LT_LAUNCH("k_diagonal_rb_interpolation", grid, block, stream,
+                   k_diagonal_rb_interpolation<<<grid, block, 0, stream>>>(d.cfa,
+                                                                           d.delp,
+                                                                           d.delm,
+                                                                           d.dgrbsq1p,
+                                                                           d.dgrbsq1m,
+                                                                           d.rbm,
+                                                                           d.rbp,
+                                                                           d.pmwt,
+                                                                           rr1,
+                                                                           cc1));
     CHECK_LIVE_TILE_LAUNCH();
     launch_pmwt_refinement_and_rbint(grid,
                                      block,
@@ -908,61 +943,67 @@ void run_tile_bayer16_post_wb(const uint16_t * dBayer16,
                                      stream,
                                      !fastLaunchChecks);
     CHECK_LIVE_TILE_LAUNCH();
-    k_diagonal_green_correction<<<grid, block, 0, stream>>>(d.cfa,
-                                                            d.dirwts0,
-                                                            d.dirwts1,
-                                                            d.hvwt,
-                                                            d.pmwt,
-                                                            d.rbint,
-                                                            d.dgrb0,
-                                                            d.rgbgreen,
-                                                            rr1,
-                                                            cc1);
+    IGPU_LT_LAUNCH("k_diagonal_green_correction", grid, block, stream,
+                   k_diagonal_green_correction<<<grid, block, 0, stream>>>(d.cfa,
+                                                                           d.dirwts0,
+                                                                           d.dirwts1,
+                                                                           d.hvwt,
+                                                                           d.pmwt,
+                                                                           d.rbint,
+                                                                           d.dgrb0,
+                                                                           d.rgbgreen,
+                                                                           rr1,
+                                                                           cc1));
     CHECK_LIVE_TILE_LAUNCH();
-    k_chrominance_coset_split<<<grid, block, 0, stream>>>(d.dgrb0, d.dgrb1, rr1, cc1);
+    IGPU_LT_LAUNCH("k_chrominance_coset_split", grid, block, stream,
+                   k_chrominance_coset_split<<<grid, block, 0, stream>>>(d.dgrb0, d.dgrb1, rr1, cc1));
     CHECK_LIVE_TILE_LAUNCH();
-    k_fancy_chrominance_interpolation<<<grid, block, 0, stream>>>(d.dgrb0, d.dgrb1, rr1, cc1);
+    IGPU_LT_LAUNCH("k_fancy_chrominance_interpolation", grid, block, stream,
+                   k_fancy_chrominance_interpolation<<<grid, block, 0, stream>>>(d.dgrb0, d.dgrb1, rr1, cc1));
     CHECK_LIVE_TILE_LAUNCH();
-    k_final_output_planes<<<grid, block, 0, stream>>>(d.rgbgreen,
-                                                      d.hvwt,
-                                                      d.dgrb0,
-                                                      d.dgrb1,
-                                                      d.red,
-                                                      d.green,
-                                                      d.blue,
-                                                      rr1,
-                                                      cc1);
+    IGPU_LT_LAUNCH("k_final_output_planes", grid, block, stream,
+                   k_final_output_planes<<<grid, block, 0, stream>>>(d.rgbgreen,
+                                                                     d.hvwt,
+                                                                     d.dgrb0,
+                                                                     d.dgrb1,
+                                                                     d.red,
+                                                                     d.green,
+                                                                     d.blue,
+                                                                     rr1,
+                                                                     cc1));
     CHECK_LIVE_TILE_LAUNCH();
     if (dRgba16)
     {
-        k_store_tile_rgba16_post_wb_undo<<<grid, block, 0, stream>>>(
-            d.red,
-            d.green,
-            d.blue,
-            dRgba16,
-            width,
-            height,
-            top,
-            left,
-            rr1,
-            cc1,
-            blackLevel,
-            wbMultiplierR,
-            wbMultiplierG,
-            wbMultiplierB);
+        IGPU_LT_LAUNCH("k_store_tile_rgba16_post_wb_undo", grid, block, stream,
+                       k_store_tile_rgba16_post_wb_undo<<<grid, block, 0, stream>>>(
+                           d.red,
+                           d.green,
+                           d.blue,
+                           dRgba16,
+                           width,
+                           height,
+                           top,
+                           left,
+                           rr1,
+                           cc1,
+                           blackLevel,
+                           wbMultiplierR,
+                           wbMultiplierG,
+                           wbMultiplierB));
     }
     else
     {
-        k_store_tile_rgb16<<<grid, block, 0, stream>>>(d.red,
-                                                       d.green,
-                                                       d.blue,
-                                                       dRgb16,
-                                                       width,
-                                                       height,
-                                                       top,
-                                                       left,
-                                                       rr1,
-                                                       cc1);
+        IGPU_LT_LAUNCH("k_store_tile_rgb16", grid, block, stream,
+                       k_store_tile_rgb16<<<grid, block, 0, stream>>>(d.red,
+                                                                      d.green,
+                                                                      d.blue,
+                                                                      dRgb16,
+                                                                      width,
+                                                                      height,
+                                                                      top,
+                                                                      left,
+                                                                      rr1,
+                                                                      cc1));
     }
     CK(cudaGetLastError());
 #undef CHECK_LIVE_TILE_LAUNCH
@@ -1028,7 +1069,7 @@ void run_frame_to_device_rgb16_bayer16_post_wb_batched(
             const std::size_t slot = inFlight % batchSize;
             if (inFlight >= batchSize)
             {
-                CK(cudaStreamSynchronize(streams[slot]));
+                CK(IGPU_LT_SYNC_CALL("tiles:slot_reuse_sync", cudaStreamSynchronize(streams[slot])));
             }
             run_tile_bayer16_post_wb(dBayer16,
                                      dRgb16,
@@ -1051,7 +1092,7 @@ void run_frame_to_device_rgb16_bayer16_post_wb_batched(
     const std::size_t active = std::min(inFlight, batchSize);
     for (std::size_t slot = 0; slot < active; ++slot)
     {
-        CK(cudaStreamSynchronize(streams[slot]));
+        CK(IGPU_LT_SYNC_CALL("tiles:drain_sync", cudaStreamSynchronize(streams[slot])));
     }
 }
 
@@ -1076,7 +1117,7 @@ void run_frame_to_device_rgb16_batched(const float * dRaw,
             const std::size_t slot = inFlight % batchSize;
             if (inFlight >= batchSize)
             {
-                CK(cudaStreamSynchronize(streams[slot]));
+                CK(IGPU_LT_SYNC_CALL("tiles:slot_reuse_sync", cudaStreamSynchronize(streams[slot])));
             }
             run_tile(dRaw,
                      dRgb16,
@@ -1093,7 +1134,7 @@ void run_frame_to_device_rgb16_batched(const float * dRaw,
     const std::size_t active = std::min(inFlight, batchSize);
     for (std::size_t slot = 0; slot < active; ++slot)
     {
-        CK(cudaStreamSynchronize(streams[slot]));
+        CK(IGPU_LT_SYNC_CALL("tiles:drain_sync", cudaStreamSynchronize(streams[slot])));
     }
 }
 
@@ -1115,7 +1156,8 @@ int copy_rgb16_to_gl_rgba16_texture(const uint16_t * dRgb16,
         CK(cudaMalloc(&dRgba16, rgbaBytes));
         const int threads = 256;
         const int blocks = static_cast<int>((pixelCount + threads - 1u) / threads);
-        k_pack_rgb16_to_rgba16<<<blocks, threads>>>(dRgb16, dRgba16, pixelCount);
+        IGPU_LT_LAUNCH("k_pack_rgb16_to_rgba16", blocks, threads, 0,
+                       k_pack_rgb16_to_rgba16<<<blocks, threads>>>(dRgb16, dRgba16, pixelCount));
         CK(cudaGetLastError());
 
         cudaError_t rc = cudaGraphicsGLRegisterImage(&resource,
@@ -1131,7 +1173,7 @@ int copy_rgb16_to_gl_rgba16_texture(const uint16_t * dRgb16,
             return 2;
         }
 
-        rc = cudaGraphicsMapResources(1, &resource, 0);
+        rc = IGPU_LT_SYNC_CALL("gl_rgba16:map", cudaGraphicsMapResources(1, &resource, 0));
         if (rc != cudaSuccess)
         {
             std::fprintf(stderr,
@@ -1147,17 +1189,19 @@ int copy_rgb16_to_gl_rgba16_texture(const uint16_t * dRgb16,
         if (rc == cudaSuccess)
         {
             const std::size_t rowBytes = static_cast<std::size_t>(width) * 4u * sizeof(uint16_t);
-            rc = cudaMemcpy2DToArray(mappedArray,
-                                     0,
-                                     0,
-                                     dRgba16,
-                                     rowBytes,
-                                     rowBytes,
-                                     static_cast<std::size_t>(height),
-                                     cudaMemcpyDeviceToDevice);
+            rc = IGPU_LT_SYNC_CALL("gl_rgba16:copy_to_array",
+                                   cudaMemcpy2DToArray(mappedArray,
+                                                       0,
+                                                       0,
+                                                       dRgba16,
+                                                       rowBytes,
+                                                       rowBytes,
+                                                       static_cast<std::size_t>(height),
+                                                       cudaMemcpyDeviceToDevice));
         }
 
-        const cudaError_t unmapRc = cudaGraphicsUnmapResources(1, &resource, 0);
+        const cudaError_t unmapRc =
+            IGPU_LT_SYNC_CALL("gl_rgba16:unmap", cudaGraphicsUnmapResources(1, &resource, 0));
         const cudaError_t unregisterRc = cudaGraphicsUnregisterResource(resource);
         cudaFree(dRgba16);
         if (rc != cudaSuccess)
@@ -1235,7 +1279,7 @@ int copy_rgba16_to_gl_rgba16_texture(const uint16_t * dRgba16,
             }
         }
 
-        cudaError_t rc = cudaGraphicsMapResources(1, &resource, 0);
+        cudaError_t rc = IGPU_LT_SYNC_CALL("gl_rgba16_direct:map", cudaGraphicsMapResources(1, &resource, 0));
         if (rc != cudaSuccess)
         {
             std::fprintf(stderr,
@@ -1252,17 +1296,19 @@ int copy_rgba16_to_gl_rgba16_texture(const uint16_t * dRgba16,
         {
             const std::size_t rowBytes =
                 static_cast<std::size_t>(width) * 4u * sizeof(uint16_t);
-            rc = cudaMemcpy2DToArray(mappedArray,
-                                     0,
-                                     0,
-                                     dRgba16,
-                                     rowBytes,
-                                     rowBytes,
-                                     static_cast<std::size_t>(height),
-                                     cudaMemcpyDeviceToDevice);
+            rc = IGPU_LT_SYNC_CALL("gl_rgba16_direct:copy_to_array",
+                                   cudaMemcpy2DToArray(mappedArray,
+                                                       0,
+                                                       0,
+                                                       dRgba16,
+                                                       rowBytes,
+                                                       rowBytes,
+                                                       static_cast<std::size_t>(height),
+                                                       cudaMemcpyDeviceToDevice));
         }
 
-        const cudaError_t unmapRc = cudaGraphicsUnmapResources(1, &resource, 0);
+        const cudaError_t unmapRc =
+            IGPU_LT_SYNC_CALL("gl_rgba16_direct:unmap", cudaGraphicsUnmapResources(1, &resource, 0));
         const cudaError_t unregisterRc =
             cached ? cudaSuccess : cudaGraphicsUnregisterResource(resource);
         if (rc != cudaSuccess)
@@ -1362,13 +1408,14 @@ int copy_rgb16_to_gl_rgba16_texture_post_wb_undo(const uint16_t * dRgb16,
         if (ownsScratch) CK(cudaMalloc(&dRgba16, rgbaBytes));
         const int threads = 256;
         const int blocks = static_cast<int>((pixelCount + threads - 1u) / threads);
-        k_pack_rgb16_to_rgba16_post_wb_undo<<<blocks, threads>>>(dRgb16,
-                                                                 dRgba16,
-                                                                 pixelCount,
-                                                                 blackLevel,
-                                                                 wbMultiplierR,
-                                                                 wbMultiplierG,
-                                                                 wbMultiplierB);
+        IGPU_LT_LAUNCH("k_pack_rgb16_to_rgba16_post_wb_undo", blocks, threads, 0,
+                       k_pack_rgb16_to_rgba16_post_wb_undo<<<blocks, threads>>>(dRgb16,
+                                                                                dRgba16,
+                                                                                pixelCount,
+                                                                                blackLevel,
+                                                                                wbMultiplierR,
+                                                                                wbMultiplierG,
+                                                                                wbMultiplierB));
         CK(cudaGetLastError());
 
         if (cached)
@@ -1402,7 +1449,7 @@ int copy_rgb16_to_gl_rgba16_texture_post_wb_undo(const uint16_t * dRgb16,
             }
         }
 
-        cudaError_t rc = cudaGraphicsMapResources(1, &resource, 0);
+        cudaError_t rc = IGPU_LT_SYNC_CALL("gl_rgba16_post_wb:map", cudaGraphicsMapResources(1, &resource, 0));
         if (rc != cudaSuccess)
         {
             std::fprintf(stderr,
@@ -1419,17 +1466,19 @@ int copy_rgb16_to_gl_rgba16_texture_post_wb_undo(const uint16_t * dRgb16,
         if (rc == cudaSuccess)
         {
             const std::size_t rowBytes = static_cast<std::size_t>(width) * 4u * sizeof(uint16_t);
-            rc = cudaMemcpy2DToArray(mappedArray,
-                                     0,
-                                     0,
-                                     dRgba16,
-                                     rowBytes,
-                                     rowBytes,
-                                     static_cast<std::size_t>(height),
-                                     cudaMemcpyDeviceToDevice);
+            rc = IGPU_LT_SYNC_CALL("gl_rgba16_post_wb:copy_to_array",
+                                   cudaMemcpy2DToArray(mappedArray,
+                                                       0,
+                                                       0,
+                                                       dRgba16,
+                                                       rowBytes,
+                                                       rowBytes,
+                                                       static_cast<std::size_t>(height),
+                                                       cudaMemcpyDeviceToDevice));
         }
 
-        const cudaError_t unmapRc = cudaGraphicsUnmapResources(1, &resource, 0);
+        const cudaError_t unmapRc =
+            IGPU_LT_SYNC_CALL("gl_rgba16_post_wb:unmap", cudaGraphicsUnmapResources(1, &resource, 0));
         const cudaError_t unregisterRc =
             cached ? cudaSuccess : cudaGraphicsUnregisterResource(resource);
         releaseScratch();
@@ -1470,6 +1519,11 @@ int copy_rgb16_to_gl_rgba16_texture_post_wb_undo(const uint16_t * dRgb16,
 
 extern "C" void igpu_amaze_debayer_destroy(igpu_amaze_debayer_backend * backend)
 {
+    if (igpu_lt::enabled())
+    {
+        (void)IGPU_LT_SYNC_CALL("destroy:device_sync", cudaDeviceSynchronize());
+        igpu_lt::poll("destroy");
+    }
     free_live_texture_buffers(backend);
     delete backend;
 }
@@ -1506,6 +1560,7 @@ extern "C" int igpu_amaze_debayer_run(igpu_amaze_debayer_backend * backend,
     std::memset(&backend->lastTiming, 0, sizeof(backend->lastTiming));
 
     const double totalStart = now_ms();
+    igpu_lt::FrameScope lt_frame(width, height);
     try
     {
         CK(cudaMalloc(&dRaw, rawBytes));
@@ -1513,8 +1568,8 @@ extern "C" int igpu_amaze_debayer_run(igpu_amaze_debayer_backend * backend,
         if (backend->reducedHnyquist) CK(cudaMalloc(&dRgb16Hnyquist, rgbBytes));
         allocate_device(&d, 1);
         const double uploadStart = now_ms();
-        CK(cudaMemcpy(dRaw, in_raw_float, rawBytes, cudaMemcpyHostToDevice));
-        CK(cudaDeviceSynchronize());
+        CK(IGPU_LT_SYNC_CALL("offline:upload_h2d", cudaMemcpy(dRaw, in_raw_float, rawBytes, cudaMemcpyHostToDevice)));
+        CK(IGPU_LT_SYNC_CALL("offline:upload_sync", cudaDeviceSynchronize()));
         backend->lastTiming.upload_ms = now_ms() - uploadStart;
 
         const double kernelStart = now_ms();
@@ -1525,14 +1580,15 @@ extern "C" int igpu_amaze_debayer_run(igpu_amaze_debayer_backend * backend,
             CK(cudaGetLastError());
             std::swap(dRgb16, dRgb16Hnyquist);
         }
-        CK(cudaDeviceSynchronize());
+        CK(IGPU_LT_SYNC_CALL("offline:kernel_sync", cudaDeviceSynchronize()));
         backend->lastTiming.kernel_ms = now_ms() - kernelStart;
 
         const double downloadStart = now_ms();
-        CK(cudaMemcpy(out_rgb16, dRgb16, rgbBytes, cudaMemcpyDeviceToHost));
-        CK(cudaDeviceSynchronize());
+        CK(IGPU_LT_SYNC_CALL("offline:download_d2h", cudaMemcpy(out_rgb16, dRgb16, rgbBytes, cudaMemcpyDeviceToHost)));
+        CK(IGPU_LT_SYNC_CALL("offline:download_sync", cudaDeviceSynchronize()));
         backend->lastTiming.download_ms = now_ms() - downloadStart;
         backend->lastTiming.total_ms = now_ms() - totalStart;
+        igpu_lt::poll();
 
         free_device(&d);
         cudaFree(dRaw);
@@ -1574,6 +1630,7 @@ extern "C" int igpu_amaze_debayer_run_gl_texture(igpu_amaze_debayer_backend * ba
     std::memset(&backend->lastTiming, 0, sizeof(backend->lastTiming));
 
     const double totalStart = now_ms();
+    igpu_lt::FrameScope lt_frame(width, height);
     try
     {
         CK(cudaMalloc(&dRaw, rawBytes));
@@ -1581,8 +1638,8 @@ extern "C" int igpu_amaze_debayer_run_gl_texture(igpu_amaze_debayer_backend * ba
         if (backend->reducedHnyquist) CK(cudaMalloc(&dRgb16Hnyquist, rgbBytes));
         allocate_device(&d, 1);
         const double uploadStart = now_ms();
-        CK(cudaMemcpy(dRaw, in_raw_float, rawBytes, cudaMemcpyHostToDevice));
-        CK(cudaDeviceSynchronize());
+        CK(IGPU_LT_SYNC_CALL("offline:upload_h2d", cudaMemcpy(dRaw, in_raw_float, rawBytes, cudaMemcpyHostToDevice)));
+        CK(IGPU_LT_SYNC_CALL("offline:upload_sync", cudaDeviceSynchronize()));
         backend->lastTiming.upload_ms = now_ms() - uploadStart;
 
         const double kernelStart = now_ms();
@@ -1593,14 +1650,15 @@ extern "C" int igpu_amaze_debayer_run_gl_texture(igpu_amaze_debayer_backend * ba
             CK(cudaGetLastError());
             std::swap(dRgb16, dRgb16Hnyquist);
         }
-        CK(cudaDeviceSynchronize());
+        CK(IGPU_LT_SYNC_CALL("offline:kernel_sync", cudaDeviceSynchronize()));
         backend->lastTiming.kernel_ms = now_ms() - kernelStart;
 
         const double handoffStart = now_ms();
         const int rc = copy_rgb16_to_gl_rgba16_texture(dRgb16, width, height, gl_texture);
-        CK(cudaDeviceSynchronize());
+        CK(IGPU_LT_SYNC_CALL("offline:handoff_sync", cudaDeviceSynchronize()));
         backend->lastTiming.download_ms = now_ms() - handoffStart;
         backend->lastTiming.total_ms = now_ms() - totalStart;
+        igpu_lt::poll();
 
         free_device(&d);
         cudaFree(dRaw);
@@ -1647,6 +1705,7 @@ extern "C" int igpu_amaze_debayer_run_post_wb_gl_texture(igpu_amaze_debayer_back
     std::memset(&backend->lastTiming, 0, sizeof(backend->lastTiming));
 
     const double totalStart = now_ms();
+    igpu_lt::FrameScope lt_frame(width, height);
     try
     {
         CK(cudaMalloc(&dRaw, rawBytes));
@@ -1654,8 +1713,8 @@ extern "C" int igpu_amaze_debayer_run_post_wb_gl_texture(igpu_amaze_debayer_back
         if (backend->reducedHnyquist) CK(cudaMalloc(&dRgb16Hnyquist, rgbBytes));
         allocate_device(&d, 1);
         const double uploadStart = now_ms();
-        CK(cudaMemcpy(dRaw, in_raw_float, rawBytes, cudaMemcpyHostToDevice));
-        CK(cudaDeviceSynchronize());
+        CK(IGPU_LT_SYNC_CALL("offline:upload_h2d", cudaMemcpy(dRaw, in_raw_float, rawBytes, cudaMemcpyHostToDevice)));
+        CK(IGPU_LT_SYNC_CALL("offline:upload_sync", cudaDeviceSynchronize()));
         backend->lastTiming.upload_ms = now_ms() - uploadStart;
 
         const double kernelStart = now_ms();
@@ -1666,7 +1725,7 @@ extern "C" int igpu_amaze_debayer_run_post_wb_gl_texture(igpu_amaze_debayer_back
             CK(cudaGetLastError());
             std::swap(dRgb16, dRgb16Hnyquist);
         }
-        CK(cudaDeviceSynchronize());
+        CK(IGPU_LT_SYNC_CALL("offline:kernel_sync", cudaDeviceSynchronize()));
         backend->lastTiming.kernel_ms = now_ms() - kernelStart;
 
         const double handoffStart = now_ms();
@@ -1679,9 +1738,10 @@ extern "C" int igpu_amaze_debayer_run_post_wb_gl_texture(igpu_amaze_debayer_back
                                                          wb_multiplier_r,
                                                          wb_multiplier_g,
                                                          wb_multiplier_b);
-        CK(cudaDeviceSynchronize());
+        CK(IGPU_LT_SYNC_CALL("offline:handoff_sync", cudaDeviceSynchronize()));
         backend->lastTiming.download_ms = now_ms() - handoffStart;
         backend->lastTiming.total_ms = now_ms() - totalStart;
+        igpu_lt::poll();
 
         free_device(&d);
         cudaFree(dRaw);
@@ -1724,6 +1784,7 @@ extern "C" int igpu_amaze_debayer_run_post_wb_gl_texture_from_r16_gl_texture(
     std::memset(&backend->lastTiming, 0, sizeof(backend->lastTiming));
 
     const double totalStart = now_ms();
+    igpu_lt::FrameScope lt_frame(width, height);
     try
     {
         ensure_live_texture_buffers(backend, width, height);
@@ -1788,6 +1849,7 @@ extern "C" int igpu_amaze_debayer_run_post_wb_gl_texture_from_r16_gl_texture(
                     &backend->liveOutputRgba16Resource);
         backend->lastTiming.download_ms = now_ms() - handoffStart;
         backend->lastTiming.total_ms = now_ms() - totalStart;
+        igpu_lt::poll();
         return rc;
     }
     catch (const CudaStageProbeError & error)
@@ -1821,6 +1883,7 @@ extern "C" int igpu_amaze_debayer_run_post_wb_gl_texture_from_device_bayer16(
     std::memset(&backend->lastTiming, 0, sizeof(backend->lastTiming));
 
     const double totalStart = now_ms();
+    igpu_lt::FrameScope lt_frame(width, height);
     try
     {
         ensure_live_texture_buffers(backend, width, height);
@@ -1878,6 +1941,7 @@ extern "C" int igpu_amaze_debayer_run_post_wb_gl_texture_from_device_bayer16(
                     &backend->liveOutputRgba16Resource);
         backend->lastTiming.download_ms = now_ms() - handoffStart;
         backend->lastTiming.total_ms = now_ms() - totalStart;
+        igpu_lt::poll();
         return rc;
     }
     catch (const CudaStageProbeError & error)

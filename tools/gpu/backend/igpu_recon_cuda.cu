@@ -46,6 +46,10 @@
 
 #include "igpu_recon.h"
 
+/* GPU-EVENT153-ROOTCAUSE-2: env-gated per-launch timing (default OFF). */
+#define IGPU_LT_DLL_NAME "recon"
+#include "igpu_launch_timing.cuh"
+
 /* Export mechanism note:
  *   The canonical igpu_recon.h declares the ABI prototypes WITHOUT any export
  *   attribute (it is the cross-compiler contract, deliberately attribute-free,
@@ -1329,7 +1333,7 @@ static int copy_bayer16_to_gl_r16_texture(igpu_recon_backend* b, unsigned int gl
     if (cache_rc != 0) return cache_rc;
 
     cudaGraphicsResource* resource = b->gl_r16_resource.resource;
-    cudaError_t e = cudaGraphicsMapResources(1, &resource, 0);
+    cudaError_t e = IGPU_LT_SYNC_CALL("gl_r16:map", cudaGraphicsMapResources(1, &resource, 0));
 
     if (e != cudaSuccess) {
         fprintf(stderr,
@@ -1343,17 +1347,19 @@ static int copy_bayer16_to_gl_r16_texture(igpu_recon_backend* b, unsigned int gl
     e = cudaGraphicsSubResourceGetMappedArray(&mapped_array, resource, 0, 0);
     if (e == cudaSuccess) {
         const size_t row_bytes = (size_t)b->width * sizeof(uint16_t);
-        e = cudaMemcpy2DToArray(mapped_array,
-                                0,
-                                0,
-                                b->d_out,
-                                row_bytes,
-                                row_bytes,
-                                (size_t)b->height,
-                                cudaMemcpyDeviceToDevice);
+        e = IGPU_LT_SYNC_CALL("gl_r16:copy_to_array",
+                              cudaMemcpy2DToArray(mapped_array,
+                                                  0,
+                                                  0,
+                                                  b->d_out,
+                                                  row_bytes,
+                                                  row_bytes,
+                                                  (size_t)b->height,
+                                                  cudaMemcpyDeviceToDevice));
     }
 
-    const cudaError_t unmap_error = cudaGraphicsUnmapResources(1, &resource, 0);
+    const cudaError_t unmap_error =
+        IGPU_LT_SYNC_CALL("gl_r16:unmap", cudaGraphicsUnmapResources(1, &resource, 0));
     if (e != cudaSuccess) {
         fprintf(stderr,
                 "[igpu_recon_cuda] device-to-GL texture copy failed: %s\n",
@@ -1399,7 +1405,8 @@ static void free_clip_buffers(igpu_recon_backend* b) {
 static void reset_preupload_slots(igpu_recon_backend* b, int release_storage)
 {
     if (!b) return;
-    if (b->preupload_stream) cudaStreamSynchronize(b->preupload_stream);
+    if (b->preupload_stream)
+        (void)IGPU_LT_SYNC_CALL("preupload:stream_sync", cudaStreamSynchronize(b->preupload_stream));
     if (b->preupload_lock_initialized) EnterCriticalSection(&b->preupload_lock);
     for (int i = 0; i < PREUPLOAD_SLOTS; ++i) {
         PreuploadSlot* slot = &b->preupload[i];
@@ -1528,6 +1535,10 @@ void igpu_recon_destroy(igpu_recon_backend* b)
 {
     if (!b) return;
     cudaSetDevice(b->device);
+    if (igpu_lt::enabled()) {
+        (void)IGPU_LT_SYNC_CALL("destroy:device_sync", cudaDeviceSynchronize());
+        igpu_lt::poll("destroy");
+    }
     reset_preupload_slots(b, 1);
     for (int i = 0; i < PREUPLOAD_SLOTS; ++i) {
         if (b->preupload[i].upload_start)
@@ -1586,6 +1597,7 @@ int igpu_recon_set_clip(igpu_recon_backend* b, const igpu_recon_clip_t* clip)
     if (clip->width <= 0 || clip->height <= 0) return -1;
 
     CK(cudaSetDevice(b->device));
+    igpu_lt::FrameScope lt_frame(clip->width, clip->height);
 
     /* The dual-ISO prepare re-derives black/white and the ISO pattern per
      * frame, so the host calls set_clip at unchanged dims (M16-1456: every
@@ -1596,6 +1608,7 @@ int igpu_recon_set_clip(igpu_recon_backend* b, const igpu_recon_clip_t* clip)
     const int same_dims = b->have_clip && b->d_out &&
                           b->width == clip->width && b->height == clip->height;
     if (!same_dims) {
+        igpu_lt::SyncScope lt_free("set_clip:free_buffers");
         b->have_clip = 0;
         reset_preupload_slots(b, 1);
         free_retained_device_outputs(b);
@@ -1609,6 +1622,7 @@ int igpu_recon_set_clip(igpu_recon_backend* b, const igpu_recon_clip_t* clip)
 
     const size_t n = (size_t)b->width * (size_t)b->height;
     if (!same_dims) {
+        igpu_lt::SyncScope lt_alloc("set_clip:alloc_buffers");
         CK(cudaMalloc(&b->d_in,      n*sizeof(uint16_t)));
         CK(cudaMalloc(&b->d_out,     n*sizeof(uint16_t)));
         CK(cudaMalloc(&b->d_alias,   n*sizeof(uint16_t)));
@@ -1649,13 +1663,17 @@ int igpu_recon_set_clip(igpu_recon_backend* b, const igpu_recon_clip_t* clip)
     int dark_noise20 = 512;
     double factor = HOST_FACTOR;
 
-    CK(cudaMemcpyToSymbol(d_black,          &black20,        sizeof(int)));
-    CK(cudaMemcpyToSymbol(d_white,          &white20,        sizeof(int)));
-    CK(cudaMemcpyToSymbol(d_white_darkened, &white_darkened, sizeof(int)));
-    CK(cudaMemcpyToSymbol(d_dark_noise,     &dark_noise20,   sizeof(int)));
-    CK(cudaMemcpyToSymbol(d_factor,         &factor,         sizeof(double)));
-    CK(cudaMemcpyToSymbol(d_black_delta20,  &black_delta20,  sizeof(int)));
-    CK(cudaMemcpyToSymbol(d_is_bright,      b->is_bright,    sizeof(int)*4));
+    {
+        /* cudaMemcpyToSymbol from pageable host memory waits for the copy. */
+        igpu_lt::SyncScope lt_constants("set_clip:constants");
+        CK(cudaMemcpyToSymbol(d_black,          &black20,        sizeof(int)));
+        CK(cudaMemcpyToSymbol(d_white,          &white20,        sizeof(int)));
+        CK(cudaMemcpyToSymbol(d_white_darkened, &white_darkened, sizeof(int)));
+        CK(cudaMemcpyToSymbol(d_dark_noise,     &dark_noise20,   sizeof(int)));
+        CK(cudaMemcpyToSymbol(d_factor,         &factor,         sizeof(double)));
+        CK(cudaMemcpyToSymbol(d_black_delta20,  &black_delta20,  sizeof(int)));
+        CK(cudaMemcpyToSymbol(d_is_bright,      b->is_bright,    sizeof(int)*4));
+    }
 
     b->have_clip = 1;
     return 0;
@@ -1666,6 +1684,8 @@ int igpu_recon_set_luts(igpu_recon_backend* b, const igpu_recon_luts_t* luts)
 {
     if (!b || !luts) return -1;
     CK(cudaSetDevice(b->device));
+    /* The blocking H2D LUT uploads below (tens of MB) wait for the copies. */
+    igpu_lt::SyncScope lt_luts("set_luts:upload");
 
     /* allocate LUT buffers if not already present */
     if (!b->dd_raw2ev) CK(cudaMalloc(&b->dd_raw2ev, (size_t)RAW2EV_COUNT*sizeof(int)));
@@ -1849,7 +1869,8 @@ static int take_exact_preupload(igpu_recon_backend* b,
     const cudaError_t query = cudaEventQuery(slot->upload_ready);
     status->ready_before_run = query == cudaSuccess;
     const double wait_start_ms = qpc_now_ms();
-    const cudaError_t sync = cudaEventSynchronize(slot->upload_ready);
+    const cudaError_t sync =
+        IGPU_LT_SYNC_CALL("run:preupload_wait", cudaEventSynchronize(slot->upload_ready));
     status->upload_wait_ms = qpc_now_ms() - wait_start_ms;
     if (sync == cudaSuccess) {
         float upload_ms = 0.0f;
@@ -1925,6 +1946,7 @@ static int igpu_recon_run_internal(igpu_recon_backend* b,
     CK(cudaSetDevice(b->device));
 
     const int W = b->width, H = b->height;
+    igpu_lt::FrameScope lt_frame(W, H);
     const size_t n = (size_t)W * (size_t)H;
     const size_t input_bytes = n * sizeof(uint16_t);
     int* dd_ev2raw_origin = b->dd_ev2raw + EV2RAW_ORIGIN;
@@ -1948,13 +1970,17 @@ static int igpu_recon_run_internal(igpu_recon_backend* b,
         return 3;
     }
 
-    CK(cudaMemcpyToSymbol(d_black,          &black20,        sizeof(int)));
-    CK(cudaMemcpyToSymbol(d_white,          &white20,        sizeof(int)));
-    CK(cudaMemcpyToSymbol(d_white_darkened, &white_darkened, sizeof(int)));
-    CK(cudaMemcpyToSymbol(d_dark_noise,     &dark_noise20,   sizeof(int)));
-    CK(cudaMemcpyToSymbol(d_factor,         &factor,         sizeof(double)));
-    CK(cudaMemcpyToSymbol(d_black_delta20,  &black_delta20,  sizeof(int)));
-    CK(cudaMemcpyToSymbol(d_is_bright,      b->is_bright,    sizeof(int)*4));
+    {
+        /* cudaMemcpyToSymbol from pageable host memory waits for the copy. */
+        igpu_lt::SyncScope lt_constants("run:constants");
+        CK(cudaMemcpyToSymbol(d_black,          &black20,        sizeof(int)));
+        CK(cudaMemcpyToSymbol(d_white,          &white20,        sizeof(int)));
+        CK(cudaMemcpyToSymbol(d_white_darkened, &white_darkened, sizeof(int)));
+        CK(cudaMemcpyToSymbol(d_dark_noise,     &dark_noise20,   sizeof(int)));
+        CK(cudaMemcpyToSymbol(d_factor,         &factor,         sizeof(double)));
+        CK(cudaMemcpyToSymbol(d_black_delta20,  &black_delta20,  sizeof(int)));
+        CK(cudaMemcpyToSymbol(d_is_bright,      b->is_bright,    sizeof(int)*4));
+    }
 
     dim3 bt(16,16);
     dim3 gt((W+15)/16,(H+15)/16);
@@ -1980,29 +2006,32 @@ static int igpu_recon_run_internal(igpu_recon_backend* b,
     }
     CK(cudaEventRecord(b->ev_start, 0));
     if (!kernel_input) {
-        CK(cudaMemcpy(b->d_in,
-                      in_bayer14,
-                      input_bytes,
-                      cudaMemcpyHostToDevice));
+        CK(IGPU_LT_SYNC_CALL("run:upload_h2d",
+                             cudaMemcpy(b->d_in,
+                                        in_bayer14,
+                                        input_bytes,
+                                        cudaMemcpyHostToDevice)));
         kernel_input = b->d_in;
     }
     CK(cudaEventRecord(b->ev_after_up, 0));
 
     /* ---- timed: kernel chain ---- */
     /* STAGE 1+2 */
-    k_promote_match<<<gt,bt>>>(kernel_input, b->d_raw32, W, H);
+    IGPU_LT_LAUNCH("k_promote_match", gt, bt, 0,
+                   k_promote_match<<<gt,bt>>>(kernel_input, b->d_raw32, W, H));
 
     /* STAGE 3: mean23 over even-x indices */
     {
         int nx = (W-3-2+1)/2 + 1;
         dim3 g((nx+15)/16,(H+15)/16);
-        k_mean23<<<g,bt>>>(b->d_raw32, b->d_dark, b->d_bright,
-                           b->dd_raw2ev, dd_ev2raw_origin, W, H);
+        IGPU_LT_LAUNCH("k_mean23", g, bt, 0,
+                       k_mean23<<<g,bt>>>(b->d_raw32, b->d_dark, b->d_bright,
+                                          b->dd_raw2ev, dd_ev2raw_origin, W, H));
     }
     /* STAGE 4: border (top, bottom, then cols - scalar order) */
-    { dim3 g((W+15)/16,(3+15)/16); k_border_toprows<<<g,bt>>>(b->d_raw32,b->d_dark,b->d_bright,W,H); }
-    { dim3 g((W+15)/16,(4+15)/16); k_border_botrows<<<g,bt>>>(b->d_raw32,b->d_dark,b->d_bright,W,H); }
-    { int t=256; dim3 g((H+t-1)/t); k_border_cols<<<g,t>>>(b->d_raw32,b->d_dark,b->d_bright,W,H); }
+    { dim3 g((W+15)/16,(3+15)/16); IGPU_LT_LAUNCH("k_border_toprows", g, bt, 0, k_border_toprows<<<g,bt>>>(b->d_raw32,b->d_dark,b->d_bright,W,H)); }
+    { dim3 g((W+15)/16,(4+15)/16); IGPU_LT_LAUNCH("k_border_botrows", g, bt, 0, k_border_botrows<<<g,bt>>>(b->d_raw32,b->d_dark,b->d_bright,W,H)); }
+    { int t=256; dim3 g((H+t-1)/t); IGPU_LT_LAUNCH("k_border_cols", g, t, 0, k_border_cols<<<g,t>>>(b->d_raw32,b->d_dark,b->d_bright,W,H)); }
 
     const int apply_chroma_smooth = (frame->chroma_smooth_method == 1);
     if (apply_chroma_smooth && !b->d_chroma_tmp) {
@@ -2017,10 +2046,12 @@ static int igpu_recon_run_internal(igpu_recon_backend* b,
         dim3 gcs(((W / 2) + 15) / 16, ((H / 2) + 15) / 16);
         CK(cudaMemcpy(b->d_fullres_smooth,b->d_bright,n*sizeof(uint32_t),cudaMemcpyDeviceToDevice));
         CK(cudaMemcpy(b->d_halfres_smooth,b->d_dark,n*sizeof(uint32_t),cudaMemcpyDeviceToDevice));
-        k_chroma_smooth_2x2<<<gcs,bt>>>(b->d_bright,b->d_fullres_smooth,
-                                        b->dd_raw2ev,dd_ev2raw_origin,white_darkened,W,H);
-        k_chroma_smooth_2x2<<<gcs,bt>>>(b->d_dark,b->d_halfres_smooth,
-                                        b->dd_raw2ev,dd_ev2raw_origin,white20,W,H);
+        IGPU_LT_LAUNCH("k_chroma_smooth_2x2:bright", gcs, bt, 0,
+                       k_chroma_smooth_2x2<<<gcs,bt>>>(b->d_bright,b->d_fullres_smooth,
+                                                       b->dd_raw2ev,dd_ev2raw_origin,white_darkened,W,H));
+        IGPU_LT_LAUNCH("k_chroma_smooth_2x2:dark", gcs, bt, 0,
+                       k_chroma_smooth_2x2<<<gcs,bt>>>(b->d_dark,b->d_halfres_smooth,
+                                                       b->dd_raw2ev,dd_ev2raw_origin,white20,W,H));
         bright_for_mix = b->d_fullres_smooth;
         dark_for_mix = b->d_halfres_smooth;
     }
@@ -2029,19 +2060,23 @@ static int igpu_recon_run_internal(igpu_recon_backend* b,
      * reconstruction on the original matched planes; smoothed source planes
      * feed the halfres mix and secondary fullres_smooth reconstruction. */
     if (apply_chroma_smooth) {
-        k_fullres_phase_balance<<<gt,bt>>>(b->d_fullres,b->d_dark,b->d_bright,
-                                           b->dd_raw2ev,dd_ev2raw_origin,W,H);
+        IGPU_LT_LAUNCH("k_fullres_phase_balance", gt, bt, 0,
+                       k_fullres_phase_balance<<<gt,bt>>>(b->d_fullres,b->d_dark,b->d_bright,
+                                                          b->dd_raw2ev,dd_ev2raw_origin,W,H));
     } else {
-        k_fullres<<<gt,bt>>>(b->d_fullres,b->d_dark,b->d_bright,W,H);
+        IGPU_LT_LAUNCH("k_fullres", gt, bt, 0,
+                       k_fullres<<<gt,bt>>>(b->d_fullres,b->d_dark,b->d_bright,W,H));
     }
 
     /* STAGE 6: mix halfres */
     if (frame->apply_dither) {
-        k_mix_halfres_avx2<<<gt,bt>>>(b->d_halfres,bright_for_mix,dark_for_mix,
-                                      b->dd_raw2ev,dd_ev2raw_origin,b->dd_mix,W,H);
+        IGPU_LT_LAUNCH("k_mix_halfres_avx2", gt, bt, 0,
+                       k_mix_halfres_avx2<<<gt,bt>>>(b->d_halfres,bright_for_mix,dark_for_mix,
+                                                     b->dd_raw2ev,dd_ev2raw_origin,b->dd_mix,W,H));
     } else {
-        k_mix_halfres<<<gt,bt>>>(b->d_halfres,bright_for_mix,dark_for_mix,
-                                 b->dd_raw2ev,dd_ev2raw_origin,b->dd_mix,W,H);
+        IGPU_LT_LAUNCH("k_mix_halfres", gt, bt, 0,
+                       k_mix_halfres<<<gt,bt>>>(b->d_halfres,bright_for_mix,dark_for_mix,
+                                                b->dd_raw2ev,dd_ev2raw_origin,b->dd_mix,W,H));
     }
 
     uint32_t* fullres_for_final = b->d_fullres;
@@ -2051,7 +2086,8 @@ static int igpu_recon_run_internal(igpu_recon_backend* b,
         /* CPU diso_get_full20bit calls mix_images(..., chroma_smooth_method=0)
          * after source-plane smoothing. The only post-mix chroma input is the
          * secondary fullres reconstruction from the smoothed source planes. */
-        k_fullres<<<gt,bt>>>(b->d_chroma_tmp,dark_for_mix,bright_for_mix,W,H);
+        IGPU_LT_LAUNCH("k_fullres:smooth", gt, bt, 0,
+                       k_fullres<<<gt,bt>>>(b->d_chroma_tmp,dark_for_mix,bright_for_mix,W,H));
         fullres_smooth = b->d_chroma_tmp;
     }
 
@@ -2062,20 +2098,23 @@ static int igpu_recon_run_internal(igpu_recon_backend* b,
          * smoothing enabled, the alias-map fullres-threshold gates are therefore
          * keyed from the smoothed bright plane, while final_blend still uses the
          * original bright/dark planes below. */
-        k_alias_init<<<gt,bt>>>(b->d_alias,fullres_for_final,halfres_smooth,bright_for_mix,
-                                b->dd_raw2ev,b->dd_frc_d,W,H);
+        IGPU_LT_LAUNCH("k_alias_init", gt, bt, 0,
+                       k_alias_init<<<gt,bt>>>(b->d_alias,fullres_for_final,halfres_smooth,bright_for_mix,
+                                               b->dd_raw2ev,b->dd_frc_d,W,H));
         CK(cudaMemcpy(b->d_aliasaux,b->d_alias,n*sizeof(uint16_t),cudaMemcpyDeviceToDevice));
-        { dim3 g((W-12+15)/16,(H-12+15)/16); k_alias_rank<<<g,bt>>>(b->d_alias,b->d_aliasaux,bright_for_mix,b->dd_frc_d,W,H); }
-        { dim3 g((W-12+15)/16,(H-12+15)/16); k_alias_gauss<<<g,bt>>>(b->d_alias,b->d_aliasaux,bright_for_mix,b->dd_frc_d,W,H); }
-        { int nx=(W-2-2)/2+1, ny=(H-2-2)/2+1; dim3 g((nx+15)/16,(ny+15)/16); k_alias_gray<<<g,bt>>>(b->d_alias,W,H); }
+        { dim3 g((W-12+15)/16,(H-12+15)/16); IGPU_LT_LAUNCH("k_alias_rank", g, bt, 0, k_alias_rank<<<g,bt>>>(b->d_alias,b->d_aliasaux,bright_for_mix,b->dd_frc_d,W,H)); }
+        { dim3 g((W-12+15)/16,(H-12+15)/16); IGPU_LT_LAUNCH("k_alias_gauss", g, bt, 0, k_alias_gauss<<<g,bt>>>(b->d_alias,b->d_aliasaux,bright_for_mix,b->dd_frc_d,W,H)); }
+        { int nx=(W-2-2)/2+1, ny=(H-2-2)/2+1; dim3 g((nx+15)/16,(ny+15)/16); IGPU_LT_LAUNCH("k_alias_gray", g, bt, 0, k_alias_gray<<<g,bt>>>(b->d_alias,W,H)); }
     }
 
     /* STAGE 8: overexposed. CPU mix_images marks from the same dark/bright
      * planes passed into the halfres mix; with source chroma smoothing those
      * are the smoothed source planes, not the original split planes. */
-    k_over_mark<<<gt,bt>>>(b->d_overaux,bright_for_mix,dark_for_mix,W,H);
-    k_over_bordercopy<<<gt,bt>>>(b->d_over,b->d_overaux,W,H);
-    { dim3 g((W-6+15)/16,(H-6+15)/16); k_over_blur<<<g,bt>>>(b->d_over,b->d_overaux,W,H); }
+    IGPU_LT_LAUNCH("k_over_mark", gt, bt, 0,
+                   k_over_mark<<<gt,bt>>>(b->d_overaux,bright_for_mix,dark_for_mix,W,H));
+    IGPU_LT_LAUNCH("k_over_bordercopy", gt, bt, 0,
+                   k_over_bordercopy<<<gt,bt>>>(b->d_over,b->d_overaux,W,H));
+    { dim3 g((W-6+15)/16,(H-6+15)/16); IGPU_LT_LAUNCH("k_over_blur", g, bt, 0, k_over_blur<<<g,bt>>>(b->d_over,b->d_overaux,W,H)); }
 
     const int apply_fullres_mesh_guard =
         frame->playback_preview_scale_factor == 1 &&
@@ -2084,39 +2123,49 @@ static int igpu_recon_run_internal(igpu_recon_backend* b,
         apply_chroma_smooth;
 
     if (apply_fullres_mesh_guard) {
-        k_final_blend_mesh_guard<<<gt,bt>>>(b->d_raw32,b->d_bright,halfres_smooth,
-                                            fullres_for_final,fullres_smooth,
-                                            b->d_dark,b->d_over,b->d_alias,
-                                            b->dd_raw2ev,dd_ev2raw_origin,b->dd_frc_f,W,H);
+        IGPU_LT_LAUNCH("k_final_blend_mesh_guard", gt, bt, 0,
+                       k_final_blend_mesh_guard<<<gt,bt>>>(b->d_raw32,b->d_bright,halfres_smooth,
+                                                           fullres_for_final,fullres_smooth,
+                                                           b->d_dark,b->d_over,b->d_alias,
+                                                           b->dd_raw2ev,dd_ev2raw_origin,b->dd_frc_f,W,H));
         CK(cudaMemcpy(b->d_fullres,b->d_raw32,n*sizeof(uint32_t),cudaMemcpyDeviceToDevice));
-        k_output_vertical_mesh_stabilize<<<gt,bt>>>(b->d_raw32,b->d_fullres,
-                                                    b->dd_raw2ev,dd_ev2raw_origin,W,H);
+        IGPU_LT_LAUNCH("k_output_vertical_mesh_stabilize", gt, bt, 0,
+                       k_output_vertical_mesh_stabilize<<<gt,bt>>>(b->d_raw32,b->d_fullres,
+                                                                   b->dd_raw2ev,dd_ev2raw_origin,W,H));
         CK(cudaMemcpy(b->d_fullres,b->d_raw32,n*sizeof(uint32_t),cudaMemcpyDeviceToDevice));
-        k_source_mesh_stabilize<<<gt,bt>>>(b->d_raw32,b->d_fullres,
-                                           b->dd_raw2ev,dd_ev2raw_origin,W,H);
-        k_flat_green_cell_balance<<<gt,bt>>>(b->d_raw32,b->dd_raw2ev,dd_ev2raw_origin,W,H);
-        k_flat_chroma_guard<<<gt,bt>>>(b->d_raw32,b->dd_raw2ev,dd_ev2raw_origin,W,H);
-        k_convert16<<<gt,bt>>>(b->d_out,b->d_raw32,W,H);
+        IGPU_LT_LAUNCH("k_source_mesh_stabilize", gt, bt, 0,
+                       k_source_mesh_stabilize<<<gt,bt>>>(b->d_raw32,b->d_fullres,
+                                                          b->dd_raw2ev,dd_ev2raw_origin,W,H));
+        IGPU_LT_LAUNCH("k_flat_green_cell_balance", gt, bt, 0,
+                       k_flat_green_cell_balance<<<gt,bt>>>(b->d_raw32,b->dd_raw2ev,dd_ev2raw_origin,W,H));
+        IGPU_LT_LAUNCH("k_flat_chroma_guard", gt, bt, 0,
+                       k_flat_chroma_guard<<<gt,bt>>>(b->d_raw32,b->dd_raw2ev,dd_ev2raw_origin,W,H));
+        IGPU_LT_LAUNCH("k_convert16", gt, bt, 0,
+                       k_convert16<<<gt,bt>>>(b->d_out,b->d_raw32,W,H));
     } else if (frame->apply_dither) {
         /* STAGE 9+10: default AVX2 export shape, fused to 16-bit with row dither. */
-        k_final_blend16_avx2<<<gt,bt>>>(b->d_out,b->d_bright,halfres_smooth,fullres_for_final,fullres_smooth,
-                                        b->d_dark,b->d_over,b->d_alias,
-                                        b->dd_raw2ev,dd_ev2raw_origin,b->dd_frc_f,b->df_randn05,W,H);
+        IGPU_LT_LAUNCH("k_final_blend16_avx2", gt, bt, 0,
+                       k_final_blend16_avx2<<<gt,bt>>>(b->d_out,b->d_bright,halfres_smooth,fullres_for_final,fullres_smooth,
+                                                       b->d_dark,b->d_over,b->d_alias,
+                                                       b->dd_raw2ev,dd_ev2raw_origin,b->dd_frc_f,b->df_randn05,W,H));
     } else {
         /* STAGE 9: scalar export shape, final blend to raw32. */
-        k_final_blend<<<gt,bt>>>(b->d_raw32,b->d_bright,halfres_smooth,fullres_for_final,fullres_smooth,
-                                 b->d_dark,b->d_over,b->d_alias,
-                                 b->dd_raw2ev,dd_ev2raw_origin,b->dd_frc_f,W,H);
+        IGPU_LT_LAUNCH("k_final_blend", gt, bt, 0,
+                       k_final_blend<<<gt,bt>>>(b->d_raw32,b->d_bright,halfres_smooth,fullres_for_final,fullres_smooth,
+                                                b->d_dark,b->d_over,b->d_alias,
+                                                b->dd_raw2ev,dd_ev2raw_origin,b->dd_frc_f,W,H));
 
         /* STAGE 10: convert 20->16 without AVX2 row dither. */
-        k_convert16<<<gt,bt>>>(b->d_out,b->d_raw32,W,H);
+        IGPU_LT_LAUNCH("k_convert16", gt, bt, 0,
+                       k_convert16<<<gt,bt>>>(b->d_out,b->d_raw32,W,H));
     }
 
     if (b->reduced_iso_notch == 1) {
         /* d_aliasaux is dead here: only k_alias_rank/k_alias_gauss read it
          * (STAGE 7), and the next run rewrites it from d_alias before reading. */
         CK(cudaMemcpy(b->d_aliasaux,b->d_out,n*sizeof(uint16_t),cudaMemcpyDeviceToDevice));
-        k_reduced_iso_period_notch<<<gt,bt>>>(b->d_out,b->d_aliasaux,W,H);
+        IGPU_LT_LAUNCH("k_reduced_iso_period_notch", gt, bt, 0,
+                       k_reduced_iso_period_notch<<<gt,bt>>>(b->d_out,b->d_aliasaux,W,H));
     }
 
     debug_dump_recon_stages(b, frame, fullres_smooth, halfres_smooth);
@@ -2129,10 +2178,12 @@ static int igpu_recon_run_internal(igpu_recon_backend* b,
         const int rc = copy_bayer16_to_gl_r16_texture(b, gl_texture);
         if (rc != 0) return rc;
     } else if (out_kind == IGPU_OUT_CPU16) {
-        CK(cudaMemcpy(out_bayer16, b->d_out, n*sizeof(uint16_t), cudaMemcpyDeviceToHost));
+        CK(IGPU_LT_SYNC_CALL("run:download_d2h",
+                             cudaMemcpy(out_bayer16, b->d_out, n*sizeof(uint16_t), cudaMemcpyDeviceToHost)));
     }
     CK(cudaEventRecord(b->ev_after_dl, 0));
-    CK(cudaEventSynchronize(b->ev_after_dl));
+    CK(IGPU_LT_SYNC_CALL("run:ev_after_dl", cudaEventSynchronize(b->ev_after_dl)));
+    igpu_lt::poll();
 
     /* collect timings */
     float up=0, kern=0, dl=0, tot=0;

@@ -388,7 +388,12 @@ param(
 
     # PLAYBACK-VSYNC-DEFAULT-1: the GL swap interval every playback surface requests (passed to the app as MLVAPP_SWAP_INTERVAL, the
     # vsync A/B), any leg type. -1 (the default) sets nothing: the emitted job is the text it was before this parameter.
-    [ValidateRange(-1, 1)][int]$SwapInterval = -1
+    [ValidateRange(-1, 1)][int]$SwapInterval = -1,
+
+    # GPU-EVENT153-ROOTCAUSE-2: turns the CUDA backends' per-launch timer on (MLVAPP_CUDA_LAUNCH_TIMING=1) with this
+    # per-launch line threshold in ms (MLVAPP_CUDA_LAUNCH_TIMING_MIN_MS). -1 (the default) sets nothing: the timer stays
+    # OFF and the emitted job is the text it was before this parameter.
+    [ValidateRange(-1, 10000)][double]$CudaLaunchTimingMinMs = -1
 )
 
 $ErrorActionPreference = 'Stop'
@@ -4400,6 +4405,19 @@ if ($SwapInterval -ge 0) {
     })
 }
 
+# GPU-EVENT153-ROOTCAUSE-2: the same env-list site gains the launch-timer pair, only when asked. The threshold is written in
+# invariant culture so a comma-decimal host never emits '2,5' (which the DLL would read as 2).
+if ($CudaLaunchTimingMinMs -ge 0) {
+    $timingAnchor = [regex]"(?<ind>[ \t]*)'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',(?<nl>\r?\n)"
+    if ($timingAnchor.Matches($text).Count -ne 1) { throw 'DUAL_VENUE_CUDA_LAUNCH_TIMING_ANCHOR_MISSING the job template has no single env-list site to add MLVAPP_CUDA_LAUNCH_TIMING to' }
+    $timingMinMs = $CudaLaunchTimingMinMs.ToString('0.###', [Globalization.CultureInfo]::InvariantCulture)
+    $text = $timingAnchor.Replace($text, [System.Text.RegularExpressions.MatchEvaluator]{
+        param($m)
+        $m.Value + $m.Groups['ind'].Value + "'MLVAPP_CUDA_LAUNCH_TIMING=1'," + $m.Groups['nl'].Value +
+            $m.Groups['ind'].Value + "'MLVAPP_CUDA_LAUNCH_TIMING_MIN_MS=$timingMinMs'," + $m.Groups['nl'].Value
+    })
+}
+
 $outDir = Split-Path -Parent $OutFile
 if ($outDir -and -not (Test-Path -LiteralPath $outDir)) { New-Item -ItemType Directory -Path $outDir -Force | Out-Null }
 [IO.File]::WriteAllText($OutFile, $text, [Text.UTF8Encoding]::new($false))
@@ -4428,6 +4446,7 @@ $clipContentSha256 = if ($isFixtureRehearsal) {
     fixtureRehearsal = $isFixtureRehearsal
     displayMode = $DisplayMode
     swapInterval = $(if ($SwapInterval -ge 0) { $SwapInterval } else { $null })
+    cudaLaunchTimingMinMs = $(if ($CudaLaunchTimingMinMs -ge 0) { $CudaLaunchTimingMinMs } else { $null })
     # DUAL-VENUE-EVIDENCE-1: what this generation was authored for (not part of the emitted job's bytes).
     venue = $Venue
     backend = $Backend
