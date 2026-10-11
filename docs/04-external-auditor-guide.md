@@ -501,10 +501,11 @@ pwsh.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
   -PlaybackProcessing subset -GpuPreviewProcessing gpu -GpuAmazeDebayer gpu `
   -GpuAmazeTexturePresent `
   -StageLog .claude-state\profiling\gpu-amaze-present-proof\texture-present-stage.log `
-  -ExtraEnvironment @(
-    'MLVAPP_GPU_AMAZE_DEBAYER_DLL=C:\path\to\igpu_amaze_debayer_cuda.dll'
-  )
+  -ExtraEnvironment 'MLVAPP_GPU_AMAZE_DEBAYER_DLL=C:\path\to\igpu_amaze_debayer_cuda.dll'
 ```
+
+Under `pwsh -File` pass one `-ExtraEnvironment` string; join several as `'KEY1=a,KEY2=b'` (every part must be `KEY=VALUE`).
+A second separate token is refused rather than bound to another parameter.
 
 The resulting JSON includes `visualQuality.playbackPolicy`, which records the
 forced debayer/processing/GPU selector state. A passing selector smoke does not
