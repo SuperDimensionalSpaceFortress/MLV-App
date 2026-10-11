@@ -76,6 +76,14 @@ extern void recursive_bf_reset_parallel_env_cache_for_testing(void);
 /* Tests: nonzero when this thread's last wrapped filter call ran the
  * parallel filter (the dispatch taken, not the predicate). */
 extern int recursive_bf_last_filter_was_parallel(void);
+/* PLAYBACK-GPU-EPISODIC-STALL-1 r2: the legacy passes run their serial vertical
+ * pair as sections of a default-size OpenMP team, so libgomp keeps its threads
+ * from call to call. MLVAPP_RBF_VERTICAL_TWO_THREAD_TEAM=1 (1/true/yes/on, read
+ * once) restores the pre-r2 num_threads(2) team, which retires and re-creates the
+ * surplus threads on every call. The picture is the same either way. mode -1
+ * follows the env var, 0 forces the default-size team, 1 the two-thread team. */
+extern void recursive_bf_set_two_thread_vertical_team_override(int mode);
+extern int recursive_bf_two_thread_vertical_team_enabled(void);
 
 #ifdef __cplusplus
 }

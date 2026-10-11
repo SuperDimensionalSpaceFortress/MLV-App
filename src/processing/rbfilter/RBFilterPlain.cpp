@@ -1284,15 +1284,42 @@ void CRBFilterPlain::filter(uint16_t* __restrict img_src, uint16_t* __restrict i
         }
     };
 
-    #pragma omp parallel sections num_threads(2)
+    // PLAYBACK-GPU-EPISODIC-STALL-1 r2: a num_threads(2) team between the two
+    // default-size teams around it makes libgomp retire every surplus thread here
+    // and create it again for the next region, on every call; at playback rate
+    // that is hundreds of thread exits and starts a second, each through every
+    // DLL's thread attach/detach under the loader lock. Running the two sections
+    // inside a default-size team keeps the threads (the idle ones wait at the
+    // barrier).
+    if (m_two_thread_vertical_team)
     {
-        #pragma omp section
+        #pragma omp parallel sections num_threads(2)
         {
-            runVerticalDown();
+            #pragma omp section
+            {
+                runVerticalDown();
+            }
+            #pragma omp section
+            {
+                runVerticalUp();
+            }
         }
-        #pragma omp section
+    }
+    else
+    {
+        #pragma omp parallel
         {
-            runVerticalUp();
+            #pragma omp sections
+            {
+                #pragma omp section
+                {
+                    runVerticalDown();
+                }
+                #pragma omp section
+                {
+                    runVerticalUp();
+                }
+            }
         }
     }
 
