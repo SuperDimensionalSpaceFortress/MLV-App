@@ -1007,8 +1007,9 @@ static const char * llrawproc_fake_gpu_backend_describe(igpu_recon_backend * b)
     return "fake-test-backend (no GPU, C-seam only)";
 }
 
-/* Mirrors igpu_recon_cuda.cu's retained slots: set_clip frees every retained
- * output whether or not it is in use, which is the hazard the C seam guards. */
+/* Mirrors igpu_recon_cuda.cu's retained slots: a set_clip at new dims frees
+ * every retained output whether or not it is in use, which is the hazard the
+ * C seam guards; at unchanged dims (levels or ISO pattern moved) it keeps them. */
 static uint64_t g_llrawproc_fake_gpu_backend_next_token = 1;
 static int g_llrawproc_fake_gpu_backend_in_use_count = 0;
 static int g_llrawproc_fake_gpu_backend_freed_in_use = 0;
@@ -1018,8 +1019,12 @@ static int llrawproc_fake_gpu_backend_set_clip(igpu_recon_backend * b,
 {
     (void)b;
     if(!clip) return -1;
-    g_llrawproc_fake_gpu_backend_freed_in_use += g_llrawproc_fake_gpu_backend_in_use_count;
-    g_llrawproc_fake_gpu_backend_in_use_count = 0;
+    if(clip->width != g_llrawproc_fake_gpu_backend_clip.width
+    || clip->height != g_llrawproc_fake_gpu_backend_clip.height)
+    {
+        g_llrawproc_fake_gpu_backend_freed_in_use += g_llrawproc_fake_gpu_backend_in_use_count;
+        g_llrawproc_fake_gpu_backend_in_use_count = 0;
+    }
     g_llrawproc_fake_gpu_backend_clip = *clip;
     return 0;
 }
@@ -1664,6 +1669,7 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
     int set_clip_rc = 0;
     int set_luts_rc = 0;
     int set_clip_called = 0;
+    const char * set_clip_changed = "none";
     int set_luts_called = 0;
     double set_clip_start_s = 0.0;
     double set_clip_ms = 0.0;
@@ -1757,6 +1763,12 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
     }
     if(need_set_clip)
     {
+        if(!g->clip_configured) set_clip_changed = "first";
+        else if(g->configured_clip.width != clip.width
+             || g->configured_clip.height != clip.height) set_clip_changed = "dims";
+        else if(memcmp(g->configured_clip.is_bright, clip.is_bright, sizeof(clip.is_bright)) != 0)
+            set_clip_changed = "pattern";
+        else set_clip_changed = "levels";
         set_clip_start_s = mlv_stage_timing_now();
         rc = g->set_clip(g->backend, &clip);
         set_clip_ms = (mlv_stage_timing_now() - set_clip_start_s) * 1000.0;
@@ -1964,10 +1976,11 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
         {
             snprintf(line, sizeof(line),
                      "gpu_recon_event kind=set_clip frame=%llu wall_ms=%.3f dur_ms=%.3f "
-                     "width=%d height=%d rc=%d count=%lld",
+                     "width=%d height=%d rc=%d count=%lld changed=%s black=%d white=%d",
                      (unsigned long long)frame_id, set_clip_start_s * 1000.0, set_clip_ms,
                      clip.width, clip.height, set_clip_rc,
-                     (long long)g_llrawproc_gpu_set_clip_count);
+                     (long long)g_llrawproc_gpu_set_clip_count, set_clip_changed,
+                     clip.black_level, clip.white_level);
             g_llrawproc_gpu_recon_event_logger(line);
         }
         if(set_luts_called)
