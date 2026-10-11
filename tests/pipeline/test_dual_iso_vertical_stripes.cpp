@@ -462,6 +462,8 @@ TEST(DualIsoVerticalStripes, PreviewScalePlanTreatsStripesAndPatternNoiseAsInert
         { "d focus only (control)", 0, 0, 1, 0, 1 },
         { "e bad only (control)", 0, 0, 0, 1, 1 },
     };
+    // Every plan case is checked and printed before the one assertion, so a RED run shows each failing case.
+    size_t failures = 0;
     const int notch = llrpGpuPlaybackReconReducedIsoNotchAvailable();
     if (notch == 0)
         std::printf("[vstripes] GPU plan half skipped: recon DLL lacks the reduced ISO notch\n");
@@ -474,20 +476,18 @@ TEST(DualIsoVerticalStripes, PreviewScalePlanTreatsStripesAndPatternNoiseAsInert
         {
             mlvDualIsoPreviewScaleRecon_t plan;
             const int cpu = mlvDualIsoPreviewScaleReconPlan(fixture.video(), scale, &plan);
-            std::printf("[vstripes] %s: CPU x%d plan %d fullResFixes %d reason %s\n", c.name, scale, cpu,
-                        plan.fullResFixes, plan.reason);
-            ASSERT_EQ(1, cpu);
-            ASSERT_EQ(scale, plan.scale);
-            ASSERT_EQ(c.fullResFixes, plan.fullResFixes);
+            const bool cpuOk = cpu == 1 && plan.scale == scale && plan.fullResFixes == c.fullResFixes;
+            std::printf("[vstripes] %s: CPU x%d plan %d fullResFixes %d (want %d) reason %s: %s\n", c.name, scale, cpu,
+                        plan.fullResFixes, c.fullResFixes, plan.reason, cpuOk ? "ok" : "WRONG");
+            failures += cpuOk ? 0 : 1;
             if (notch == 0) continue;
             GpuPlanEnv gpuEnv;
             mlvDualIsoPreviewScaleRecon_t gpuPlan;
             const int gpu = mlvDualIsoGpuPreviewScaleReconPlan(fixture.video(), scale, 0, &gpuPlan);
-            std::printf("[vstripes] %s: GPU x%d plan %d fullResFixes %d reason %s\n", c.name, scale, gpu,
-                        gpuPlan.fullResFixes, gpuPlan.reason);
-            ASSERT_EQ(1, gpu);
-            ASSERT_EQ(scale, gpuPlan.scale);
-            ASSERT_EQ(c.fullResFixes, gpuPlan.fullResFixes);
+            const bool gpuOk = gpu == 1 && gpuPlan.scale == scale && gpuPlan.fullResFixes == c.fullResFixes;
+            std::printf("[vstripes] %s: GPU x%d plan %d fullResFixes %d (want %d) reason %s: %s\n", c.name, scale, gpu,
+                        gpuPlan.fullResFixes, c.fullResFixes, gpuPlan.reason, gpuOk ? "ok" : "WRONG");
+            failures += gpuOk ? 0 : 1;
         }
     }
 
@@ -508,20 +508,15 @@ TEST(DualIsoVerticalStripes, PreviewScalePlanTreatsStripesAndPatternNoiseAsInert
             mlvDualIsoPreviewScaleRecon_t plan;
             const int got = mlvDualIsoPreviewScaleReconPlan(video, 2, &plan);
             video->RAWI.raw_info.bits_per_pixel = bpp;
-            std::printf("[vstripes] %s: CPU x2 plan %d scale %d fullResFixes %d reason %s\n", c.name, got, plan.scale,
-                        plan.fullResFixes, plan.reason);
-            ASSERT_EQ(c.admitted, got);
-            if (c.admitted)
-            {
-                ASSERT_EQ(2, plan.scale);
-                ASSERT_EQ(0, plan.fullResFixes);
-            }
-            else
-            {
-                ASSERT_EQ(std::string("full-res raw fixes on a clip below 14 bit"), std::string(plan.reason));
-            }
+            const bool ok = c.admitted
+                ? (got == 1 && plan.scale == 2 && plan.fullResFixes == 0)
+                : (got == 0 && std::string(plan.reason) == "full-res raw fixes on a clip below 14 bit");
+            std::printf("[vstripes] %s: CPU x2 plan %d (want %d) scale %d fullResFixes %d reason %s: %s\n", c.name, got,
+                        c.admitted, plan.scale, plan.fullResFixes, plan.reason, ok ? "ok" : "WRONG");
+            failures += ok ? 0 : 1;
         }
     }
+    ASSERT_EQ(static_cast<size_t>(0), failures);
 
     // Byte identity: the pass the plan now drops leaves the reduced recon unchanged (stripes 2, focus/bad 0, frame 1).
     {
