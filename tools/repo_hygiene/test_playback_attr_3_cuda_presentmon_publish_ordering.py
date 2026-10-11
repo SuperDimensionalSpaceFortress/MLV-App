@@ -500,6 +500,13 @@ class EmbeddedFunctionCoverageTests(unittest.TestCase):
         orphan_list_end = text.index("\n))", orphan_list_start)
         cls.orphan_sweep_names = re.findall(r"'([A-Za-z]+-[A-Za-z]+)'", text[orphan_list_start:orphan_list_end])
 
+        # HFR-CONFORM-AWARE-RECEIPT-ORACLES-1: the conform-aware source-frame verdict is spliced by its own bracketed statement, and the template CALLS it (the job's source-frame
+        # block). Its -Name list is parsed out of the generator here and embedded from the working-tree module, like the orphan-sweep helpers above.
+        hfr_marker = text.index("# HFR-CONFORM-AWARE-RECEIPT-ORACLES-1: the conform-aware entry point", orphan_list_end)
+        hfr_list_start = text.index("-Name @(", hfr_marker)
+        hfr_list_end = text.index("\n))", hfr_list_start)
+        cls.hfr_conform_names = re.findall(r"'([A-Za-z]+-[A-Za-z]+)'", text[hfr_list_start:hfr_list_end])
+
         # The body ONLY -- unlike this file's other classes, which keep the "$template = @'"
         # prefix (harmless there, since they only ever substring-search it) -- because this class
         # feeds the text to PowerShell's own parser, and a bare unterminated "@'" opener with no
@@ -534,6 +541,8 @@ class EmbeddedFunctionCoverageTests(unittest.TestCase):
                 "-Name $sharedParserNames)\n"
                 "$orphanSweepNames = @(" + ",".join(f"'{n}'" for n in self.orphan_sweep_names) + ")\n"
                 "$embeddedFunctions = $embeddedFunctions + \"`r`n`r`n\" + (Get-AttrCudaEmbeddedFunctionSource -Name $orphanSweepNames)\n"
+                "$hfrConformNames = @(" + ",".join(f"'{n}'" for n in self.hfr_conform_names) + ")\n"
+                "$embeddedFunctions = $embeddedFunctions + \"`r`n`r`n\" + (Get-AttrCudaEmbeddedFunctionSource -Name $hfrConformNames)\n"
                 "$definedNames =[System.Collections.Generic.HashSet[string]]::new()\n"
                 "$tokens = $null; $errors = $null\n"
                 "$embeddedAst = [System.Management.Automation.Language.Parser]::ParseInput("
