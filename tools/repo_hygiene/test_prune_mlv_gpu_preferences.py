@@ -1,0 +1,171 @@
+"""Offline test of the OWNER-RUN prune script's selection logic (GPU-PREF-REGISTRY-STOP-AND-PRUNE-1).
+
+``tools/profiling/venue/Prune-MlvGpuPreferences.ps1`` is never executed here (NA-8: no agent or lane runs
+it) and no test touches the registry. What is driven is ``MlvGpuPreferencePrune.psm1``, whose file-system
+questions are injected script blocks, against a FAKE value list. The script itself is only parsed and
+read, to pin that it is a dry run unless ``-Apply`` is passed and that it can only ever remove.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import shutil
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+VENUE_DIR = REPO_ROOT / "tools" / "profiling" / "venue"
+MODULE = VENUE_DIR / "MlvGpuPreferencePrune.psm1"
+SCRIPT = VENUE_DIR / "Prune-MlvGpuPreferences.ps1"
+VENUES_JSON = REPO_ROOT / "tools" / "profiling" / "dual-venue" / "venues.json"
+PWSH = shutil.which("pwsh")
+
+ROOTS = [r"C:\mlvtmp\mlv-agent", r"G:\Temp\mlv-gpu-profile\agent", r"G:\Temp\mlv-gpu-profile", r"C:\mlvtmp"]
+
+
+def _quote(path: Path) -> str:
+    return "'" + str(path).replace("'", "''") + "'"
+
+
+@unittest.skipIf(PWSH is None, "pwsh is not on PATH")
+class SelectionLogic(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="gpuprefprune-")
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = Path(self._tmp.name)
+
+    def judge(self, names, *, existing=(), mounted=(r"C:\mlvtmp", r"C:\mlvtmp\mlv-agent"), roots=ROOTS):
+        payload = {"names": list(names), "existing": list(existing), "mounted": list(mounted), "roots": list(roots)}
+        data = self.tmp / "in.json"
+        data.write_text(json.dumps(payload), encoding="utf-8")
+        script = (
+            f"Import-Module {_quote(MODULE)} -Force; "
+            f"$in = Get-Content -LiteralPath {_quote(data)} -Raw | ConvertFrom-Json; "
+            "$existing = @($in.existing); $mounted = @($in.mounted); "
+            "$r = @(Select-MlvStaleGpuPreferenceValue -Names @($in.names) -Roots @($in.roots) "
+            "-FileExists { param($p) $existing -contains $p } -RootExists { param($r) $mounted -contains $r }); "
+            "ConvertTo-Json -InputObject @($r | Select-Object Name, Verdict, Root) -Depth 4"
+        )
+        proc = subprocess.run(
+            [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        rows = json.loads(proc.stdout)
+        return {row["Name"]: row["Verdict"] for row in rows}
+
+    def test_stale_values_under_the_roots_are_pruned_and_everything_else_is_kept(self) -> None:
+        stale_lane = r"C:\mlvtmp\lane-FOO-20261011\platform\qt\build-release\release\MLVApp.exe"
+        live_lane = r"C:\mlvtmp\lane-LIVE-20261011\MLVApp.exe"
+        stale_agent = r"C:\mlvtmp\mlv-agent\pkg\abc123\MLVApp.exe"
+        installed = r"C:\Program Files\Adobe\Premiere\Adobe Premiere Pro.exe"
+        verdicts = self.judge(
+            [stale_lane, live_lane, stale_agent, installed],
+            existing=[live_lane, installed],
+        )
+        self.assertEqual(
+            verdicts,
+            {
+                stale_lane: "prune",
+                live_lane: "keep-file-exists",
+                stale_agent: "prune",
+                installed: "keep-outside-roots",
+            },
+        )
+
+    def test_matching_is_case_insensitive_and_accepts_forward_slashes(self) -> None:
+        verdicts = self.judge([r"c:/MLVTMP/Lane-X/MLVApp.exe"])
+        self.assertEqual(list(verdicts.values()), ["prune"])
+
+    def test_a_file_that_exists_is_kept_whatever_its_spelling(self) -> None:
+        verdicts = self.judge([r"c:/mlvtmp/lane-x/MLVApp.exe"], existing=[r"C:\mlvtmp\lane-x\MLVApp.exe"])
+        self.assertEqual(list(verdicts.values()), ["keep-file-exists"])
+
+    def test_a_sibling_directory_sharing_the_root_prefix_is_not_under_the_root(self) -> None:
+        sibling = r"C:\mlvtmp-owner-tools\Thing.exe"
+        verdicts = self.judge([sibling])
+        self.assertEqual(verdicts, {sibling: "keep-outside-roots"})
+
+    def test_the_root_itself_and_its_direct_trailing_separator_are_not_values_under_it(self) -> None:
+        verdicts = self.judge([r"C:\mlvtmp", "C:\\mlvtmp\\"])
+        self.assertEqual(set(verdicts.values()), {"keep-outside-roots"})
+
+    def test_traversal_relative_and_empty_names_are_never_judged(self) -> None:
+        names = [r"C:\mlvtmp\..\Windows\System32\evil.exe", r"C:\mlvtmp\.\x.exe", r"relative\MLVApp.exe", r"MLVApp.exe"]
+        verdicts = self.judge(names)
+        self.assertEqual(set(verdicts.values()), {"keep-unjudged-path"})
+        self.assertEqual(set(verdicts), set(names))
+
+    def test_a_root_that_is_not_mounted_keeps_its_values(self) -> None:
+        on_g = r"G:\Temp\mlv-gpu-profile\agent\pkg\x\MLVApp.exe"
+        verdicts = self.judge([on_g], mounted=[r"C:\mlvtmp"])
+        self.assertEqual(verdicts, {on_g: "keep-root-unavailable"})
+        verdicts = self.judge([on_g], mounted=[r"G:\Temp\mlv-gpu-profile\agent"])
+        self.assertEqual(verdicts, {on_g: "prune"})
+
+    def test_an_empty_value_list_selects_nothing(self) -> None:
+        self.assertEqual(self.judge([]), {})
+
+    def test_roots_come_from_venues_json_plus_the_lane_worktree_root(self) -> None:
+        script = (
+            f"Import-Module {_quote(MODULE)} -Force; "
+            f"ConvertTo-Json -InputObject @(Get-MlvGpuPreferenceRoots -VenuesJsonPath {_quote(VENUES_JSON)}) -Depth 3"
+        )
+        proc = subprocess.run(
+            [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        roots = {r.lower() for r in json.loads(proc.stdout)}
+        venues = json.loads(VENUES_JSON.read_text(encoding="utf-8"))["venues"]
+        expected = {r"c:\mlvtmp"}
+        for venue in venues.values():
+            expected.add(venue["agentRoot"].rstrip("\\").lower())
+            expected.add(venue["scratchRoot"].rstrip("\\").lower())
+        self.assertEqual(roots, expected)
+        self.assertEqual(len(roots), len(json.loads(proc.stdout)), "roots must be distinct")
+
+
+class ScriptContract(unittest.TestCase):
+    """Reads the script as text; nothing here runs it."""
+
+    def setUp(self) -> None:
+        self.text = SCRIPT.read_text(encoding="utf-8")
+
+    def test_files_are_ascii_only(self) -> None:
+        for path in (SCRIPT, MODULE):
+            path.read_bytes().decode("ascii")
+
+    def test_apply_is_an_explicit_switch_and_the_default_changes_nothing(self) -> None:
+        self.assertRegex(self.text, r"\[switch\]\$Apply")
+        # the one removal call sits inside the -Apply branch
+        branch = re.search(r"if \(\$Apply -and \$candidates\.Count -gt 0\) \{(.*?)\n\}\n", self.text, re.DOTALL)
+        self.assertIsNotNone(branch, "the removal block must be guarded by -Apply")
+        self.assertEqual(self.text.count("DeleteValue("), 1)
+        self.assertIn("DeleteValue(", branch.group(1))
+
+    def test_it_removes_only_the_values_it_judged_prunable(self) -> None:
+        self.assertIn("foreach ($c in $candidates)", self.text)
+        self.assertIn("$_.Verdict -eq 'prune'", self.text)
+        self.assertIn("$key.DeleteValue($c.Name, $true)", self.text)
+
+    def test_it_prints_counts_before_and_after_and_writes_a_json_receipt(self) -> None:
+        for needle in ("values before", "values after", "countBefore", "countAfter", "ConvertTo-Json", "WriteAllText"):
+            self.assertIn(needle, self.text)
+
+    @unittest.skipIf(PWSH is None, "pwsh is not on PATH")
+    def test_the_script_parses_without_errors(self) -> None:
+        probe = (
+            "$e = $null; $t = $null; "
+            f"[System.Management.Automation.Language.Parser]::ParseFile({_quote(SCRIPT)}, [ref]$t, [ref]$e) | Out-Null; "
+            "if ($e -and $e.Count) { $e | ForEach-Object { $_.Message }; exit 1 }"
+        )
+        proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", probe], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+
+if __name__ == "__main__":
+    unittest.main()

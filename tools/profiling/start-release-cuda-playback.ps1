@@ -84,31 +84,6 @@ function Get-FileArtifact {
     }
 }
 
-function Get-GpuPreferenceValue {
-    param([Parameter(Mandatory = $true)][string]$Executable)
-    $prefKey = "HKCU:\Software\Microsoft\DirectX\UserGpuPreferences"
-    if (!(Test-Path -LiteralPath $prefKey)) {
-        return $null
-    }
-    $item = Get-ItemProperty -LiteralPath $prefKey -Name $Executable -ErrorAction SilentlyContinue
-    if ($null -eq $item) {
-        return $null
-    }
-    return [string]$item.$Executable
-}
-
-function Set-GpuPreferenceHighPerformance {
-    param([Parameter(Mandatory = $true)][string]$Executable)
-    $prefKey = "HKCU:\Software\Microsoft\DirectX\UserGpuPreferences"
-    New-Item -Path $prefKey -Force | Out-Null
-    New-ItemProperty `
-        -Path $prefKey `
-        -Name $Executable `
-        -Value "GpuPreference=2;" `
-        -PropertyType String `
-        -Force | Out-Null
-}
-
 function Resolve-NvidiaSmiCommand {
     $cmd = Get-Command nvidia-smi -ErrorAction SilentlyContinue
     if ($cmd) {
@@ -231,12 +206,8 @@ if ($ValidateOutput) {
     $environment["MLVAPP_GPU_PLAYBACK_RECON_VALIDATE_OUTPUT_SAMPLE_EVERY"] = [string]$ValidationSampleEvery
 }
 
-$gpuPreferenceBefore = Get-GpuPreferenceValue -Executable $exe
-$gpuPreferenceAfter = $gpuPreferenceBefore
-if (!$DryRun -and !$NoHighPerformancePreference) {
-    Set-GpuPreferenceHighPerformance -Executable $exe
-    $gpuPreferenceAfter = Get-GpuPreferenceValue -Executable $exe
-}
+# NA-8: this launcher never writes the owner's per-app GPU preference; MLVApp.exe requests the discrete GPU
+# itself (NvOptimusEnablement / AmdPowerXpressRequestHighPerformance, platform/qt/main.cpp).
 
 $manifest = [ordered]@{
     schema = "mlvapp-cuda-playback-launch.v1"
@@ -254,9 +225,8 @@ $manifest = [ordered]@{
     environment = $environment
     nvidiaSmi = Get-NvidiaSmiSnapshot
     gpuPreference = [pscustomobject]@{
-        attemptedHighPerformance = [bool](!$NoHighPerformancePreference)
-        before = $gpuPreferenceBefore
-        after = $gpuPreferenceAfter
+        attemptedHighPerformance = $false
+        requestedBy = "app exports (NvOptimusEnablement, AmdPowerXpressRequestHighPerformance)"
     }
     proofBoundary = [pscustomobject]@{
         launchOnly = $true

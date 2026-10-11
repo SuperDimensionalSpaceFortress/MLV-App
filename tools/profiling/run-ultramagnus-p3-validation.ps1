@@ -338,31 +338,6 @@ function Resolve-GitExecutable {
     return $null
 }
 
-function Get-GpuPreferenceValue {
-    param([Parameter(Mandatory = $true)][string]$Executable)
-    $prefKey = "HKCU:\Software\Microsoft\DirectX\UserGpuPreferences"
-    if (!(Test-Path -LiteralPath $prefKey)) {
-        return $null
-    }
-    $item = Get-ItemProperty -LiteralPath $prefKey -Name $Executable -ErrorAction SilentlyContinue
-    if ($null -eq $item) {
-        return $null
-    }
-    return [string]$item.$Executable
-}
-
-function Set-GpuPreferenceHighPerformance {
-    param([Parameter(Mandatory = $true)][string]$Executable)
-    $prefKey = "HKCU:\Software\Microsoft\DirectX\UserGpuPreferences"
-    New-Item -Path $prefKey -Force | Out-Null
-    New-ItemProperty `
-        -Path $prefKey `
-        -Name $Executable `
-        -Value "GpuPreference=2;" `
-        -PropertyType String `
-        -Force | Out-Null
-}
-
 function Get-RelativeArtifactPath {
     param(
         [Parameter(Mandatory = $true)][string]$Root,
@@ -907,8 +882,7 @@ foreach ($clip in $resolvedClips) {
 
 $releaseInfo = $null
 $releaseHash = $null
-$gpuPreferenceBefore = $null
-$gpuPreferenceAfter = $null
+$adapterUsed = @()
 $qtBinResolution = $null
 $mingwBinResolution = $null
 
@@ -951,14 +925,9 @@ if (Test-Path -LiteralPath $releaseExe) {
         length = $item.Length
     }
     $releaseHash = (Get-FileHash -LiteralPath $releaseExe -Algorithm SHA256).Hash
-    $gpuPreferenceBefore = Get-GpuPreferenceValue -Executable $item.FullName
-    if (!$DryRun) {
-        Set-GpuPreferenceHighPerformance -Executable $item.FullName
-    }
-    $gpuPreferenceAfter = Get-GpuPreferenceValue -Executable $item.FullName
-    if (!$DryRun -and $gpuPreferenceAfter -ne "GpuPreference=2;") {
-        Add-Failure $failures "Windows per-app GPU preference for '$($item.FullName)' was '$gpuPreferenceAfter'; expected 'GpuPreference=2;'."
-    }
+    # NA-8: this script never writes the owner's per-app GPU preference. MLVApp.exe requests the discrete
+    # GPU itself (NvOptimusEnablement / AmdPowerXpressRequestHighPerformance in platform/qt/main.cpp); the
+    # adapter it actually got is asserted after the clip loop from the app's own GL_RENDERER (read-only).
 }
 else {
     $exeMessage = "Missing release executable: $releaseExe"
@@ -1444,6 +1413,15 @@ exit `$LASTEXITCODE
     }
 }
 
+$adapterUsed = @($clipResults | ForEach-Object { @($_.glRendererDescriptions) } | ForEach-Object { [string]$_ } |
+    Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
+if (!$DryRun -and @($clipResults).Count -gt 0) {
+    $adapterMatched = @($adapterUsed | Where-Object { $_ -match $RequiredGpuNamePattern }).Count -gt 0
+    if (!$adapterMatched) {
+        Add-Failure $failures "Adapter actually used (GL_RENDERER from the app's own log) did not match '$RequiredGpuNamePattern': [$($adapterUsed -join '; ')]. The app requests the discrete GPU through its own exports; this script no longer pins it in the registry."
+    }
+}
+
 $status =
     if ($failures.Count -eq 0) {
         if ($DryRun) { "planned" } else { "success" }
@@ -1515,8 +1493,8 @@ $summary = [pscustomobject]@{
         exe = $releaseInfo
         sha256 = $releaseHash
         buildSkipped = [bool]$SkipBuild
-        gpuPreferenceBefore = $gpuPreferenceBefore
-        gpuPreferenceAfter = $gpuPreferenceAfter
+        adapterUsed = $adapterUsed
+        adapterRequiredPattern = $RequiredGpuNamePattern
     }
     inputs = [pscustomobject]@{
         clipRoot = $ClipRoot

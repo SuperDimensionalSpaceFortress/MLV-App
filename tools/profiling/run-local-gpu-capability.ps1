@@ -4,8 +4,8 @@
 #
 # Run this on the physical machine you want to measure, not inside a VM and not
 # from an RDP session. It inventories visible display adapters, records common
-# GPU tool availability, optionally compares Windows' current GPU choice against
-# the "High performance" per-app GPU preference, then runs the same playback
+# GPU tool availability (read-only; the Windows per-app GPU preference is never
+# changed, NA-8), then runs the same playback
 # profiling matrix used for the Ultra-Magnus smoke:
 #
 #   cpu_baseline, gpu_preview_processing, gpu_bilinear_debayer, gpu_both
@@ -22,7 +22,7 @@ param(
     [int]$Frames = 16,
     [int]$ScaleFactor = 1,
     [ValidateSet("Current", "HighPerformance", "Compare")]
-    [string]$GpuPreferenceMode = "Compare",
+    [string]$GpuPreferenceMode = "Current",
     [switch]$KeepGpuPreference,
     [switch]$InventoryOnly,
     [string]$OutputRoot = ""
@@ -100,25 +100,6 @@ function Get-GpuPreferenceValue {
     $prop = $props.PSObject.Properties | Where-Object { $_.Name -eq $Executable } | Select-Object -First 1
     if ($prop) { return [string]$prop.Value }
     return $null
-}
-
-function Set-GpuPreferenceValue {
-    param([string]$Executable, [string]$Value)
-    $prefKey = "HKCU:\Software\Microsoft\DirectX\UserGpuPreferences"
-    New-Item -Path $prefKey -Force | Out-Null
-    New-ItemProperty -Path $prefKey -Name $Executable -Value $Value -PropertyType String -Force | Out-Null
-}
-
-function Restore-GpuPreferenceValue {
-    param([string]$Executable, [AllowNull()][string]$OriginalValue)
-    $prefKey = "HKCU:\Software\Microsoft\DirectX\UserGpuPreferences"
-    if ($null -eq $OriginalValue) {
-        if (Test-Path -LiteralPath $prefKey) {
-            Remove-ItemProperty -Path $prefKey -Name $Executable -ErrorAction SilentlyContinue
-        }
-    } else {
-        Set-GpuPreferenceValue -Executable $Executable -Value $OriginalValue
-    }
 }
 
 function Get-RendererVerdict {
@@ -354,28 +335,17 @@ if (-not $exeExists -or -not $clipExists -or -not $receiptExists) {
     throw "Profile runs require existing -Exe, -Clip, and -Receipt paths. Use -InventoryOnly for zero-install hardware triage."
 }
 
-$allRows = @()
-$restoreNeeded = $false
-try {
-    if ($GpuPreferenceMode -eq "Current" -or $GpuPreferenceMode -eq "Compare") {
-        $allRows += Run-ProfileMatrix -Label "current" -Executable $Exe -ClipPath $Clip -ReceiptPath $Receipt `
-            -ResultDir (Join-Path $OutputRoot "current") -FrameCount $Frames -Scale $ScaleFactor
-    }
-
-    if ($GpuPreferenceMode -eq "HighPerformance" -or $GpuPreferenceMode -eq "Compare") {
-        Write-Host ""
-        Write-Host "Setting per-app Windows GPU preference to High performance for this exe."
-        Set-GpuPreferenceValue -Executable $Exe -Value "GpuPreference=2;"
-        $restoreNeeded = -not $KeepGpuPreference
-        $allRows += Run-ProfileMatrix -Label "highperf" -Executable $Exe -ClipPath $Clip -ReceiptPath $Receipt `
-            -ResultDir (Join-Path $OutputRoot "highperf") -FrameCount $Frames -Scale $ScaleFactor
-    }
-} finally {
-    if ($restoreNeeded) {
-        Restore-GpuPreferenceValue -Executable $Exe -OriginalValue $originalPref
-        Write-Host "Restored original per-app GPU preference."
-    }
+# NA-8: the owner's per-app Windows GPU preference is never written. -GpuPreferenceMode and
+# -KeepGpuPreference are accepted for compatibility and ignored; there is one run, under whatever the
+# machine already has. MLVApp.exe requests the discrete GPU itself (NvOptimusEnablement /
+# AmdPowerXpressRequestHighPerformance, platform/qt/main.cpp); the adapter it actually got is the
+# renderer(s) listed below.
+if ($GpuPreferenceMode -ne "Current") {
+    Write-Warning "GpuPreferenceMode '$GpuPreferenceMode' is ignored: this script no longer changes the Windows GPU preference (NA-8). Running the current configuration only."
 }
+$allRows = @()
+$allRows += Run-ProfileMatrix -Label "current" -Executable $Exe -ClipPath $Clip -ReceiptPath $Receipt `
+    -ResultDir (Join-Path $OutputRoot "current") -FrameCount $Frames -Scale $ScaleFactor
 
 $summary = [pscustomobject]@{
     inventory = $inventory
@@ -420,7 +390,7 @@ if ($allRows.renderer_verdict -contains "software-gl") {
 }
 if (($allRows.renderer_verdict -contains "intel-hardware-gl") -and ($adapters.name -match "NVIDIA|GeForce|RTX|GTX|AMD|Radeon")) {
     Write-Host ""
-    Write-Warning "A discrete GPU appears to exist, but at least one run used Intel GL. Use the highperf rows as the dGPU-selection check."
+    Write-Warning "A discrete GPU appears to exist, but at least one run used Intel GL. The app requests the discrete GPU through its own exports, so this is a finding about the machine; this script does not change the Windows GPU preference (NA-8)."
 }
 
 exit 0
