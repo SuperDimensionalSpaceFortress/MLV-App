@@ -13,6 +13,9 @@
 //      row 1 was exp=154 temp=6540 tint=-35, 81b7eafc...; stripes no longer run on dual-ISO frames.
 //      row 2 was exp=163 temp=6540 tint=-35, 81b7eafc...; stripes no longer run on dual-ISO frames.
 //      row 3 was shade exp=163 temp=6310 tint=-21, d7544133... (now night); stripes no longer run on dual-ISO frames.
+//    LOOK-ASSIST-LARGE-F5-PATCH-UNVERIFIED-1 re-dumps row 3 only (large f10) from this tree with the same helper:
+//      row 3 was night exp=119 temp=5810 tint=9, 5e5d6826... (initial patch refused for one chroma step); the initial patch
+//      strictly neutral at the solution is now verified, so it is shade exp=178 temp=5870 tint=7. Rows 1-2 are unchanged.
 //  - Cinematic changes only the documented sliders, by the one table, deterministically, never the white
 //    balance, and is always reported.
 //  - An unknown environment value is Classic, with a logged warning.
