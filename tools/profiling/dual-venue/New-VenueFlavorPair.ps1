@@ -100,8 +100,9 @@ function Test-PairRecordComplete([string]$Path) {
 }
 if (Test-Path -LiteralPath $outFull -PathType Container) {
     $recordsHere = @(Get-ChildItem -LiteralPath $outFull -Filter 'flavor-pair-*.json' -File -ErrorAction Stop)
-    # FLAVOR-TRIO-RECOVERY-PROTECT-1: a completed trio's record names the trio's sheet / metrics / table / rows, so pair-mode -RecoverIncomplete must see it too.
-    if ($trio -or $RecoverIncomplete) { $recordsHere += @(Get-ChildItem -LiteralPath $outFull -Filter 'flavor-trio-*.json' -File -ErrorAction Stop) }
+    # FLAVOR-TRIO-RECOVERY-PROTECT-1 / FLAVOR-PAIR-TRIO-RECORD-COUNTED-ALWAYS-1: a completed trio's record names the trio's sheet / metrics / table / rows, so every
+    # mode counts it -- pair mode without -RecoverIncomplete too, else a finished trio plus a stale marker is told to re-run with a switch that is then refused (16).
+    $recordsHere += @(Get-ChildItem -LiteralPath $outFull -Filter 'flavor-trio-*.json' -File -ErrorAction Stop)
     if ($recordsHere.Count -gt 0) {
         # A marker beside a record that does not parse as a JSON object is an attempt that died while the record was being written (it is created
         # exclusively, then filled): the incomplete diagnosis, with the half record's bytes untouched. -RecoverIncomplete does not apply to it -- a record

@@ -248,6 +248,8 @@ $receipt.admission = [ordered]@{
     consentLastCommit = $sources.consentLastCommit
     ownerLineSha256 = $null
     ownerRecordedUtc = $null
+    consentKind = $null
+    consentSha256Prefix = $null
 }
 
 function Complete-Receipt([string]$Outcome, [string]$Detail) {
@@ -335,6 +337,9 @@ try {
     if (-not $admission.admitted) { Stop-Refused ([string]$admission.reason) }
     $receipt.admission.ownerLineSha256 = $admission.ownerLineSha256
     $receipt.admission.ownerRecordedUtc = $admission.recordedUtc
+    # VENUE-CLIP-CONSENT-BLANKET-1: which rule admitted the clip (clip = the owner's per-clip CLIP line; blanket = the owner's blanket sentence) and its sha256 prefix.
+    $receipt.admission.consentKind = $admission.consentKind
+    $receipt.admission.consentSha256Prefix = $admission.consentSha256Prefix
     # In production the leg spec (its criteria decide PASS vs FAIL) must be a spec COMMITTED at the revision the consent was read from:
     # Test-DvReceiptValid finds it there by its sha256, so a spec the caller wrote could never validate and is refused up front.
     if (-not $OfflineTestMode) {
@@ -372,6 +377,10 @@ try {
     if ($null -ne $spec.PSObject.Properties['generatorArgs']) {
         if ($spec.generatorArgs.PSObject.Properties['telemetryArm']) { $gen['TelemetryArm'] = [string]$spec.generatorArgs.telemetryArm }
         if ($spec.generatorArgs.PSObject.Properties['cpuQuiescenceThresholdPercent']) { $gen['CpuQuiescenceThresholdPercent'] = [double]$spec.generatorArgs.cpuQuiescenceThresholdPercent }
+        # CPU-DUALISO-REDUCED-ISO-NOTCH-1: the app's playback processing ('receipt' lets a cpu leg reach the CPU reduced dual-ISO recon).
+        if ($spec.generatorArgs.PSObject.Properties['playbackProcessing']) { $gen['PlaybackProcessing'] = [string]$spec.generatorArgs.playbackProcessing }
+        # PLAYBACK-VSYNC-DEFAULT-1: the vsync A/B arm, any leg type (the app reads MLVAPP_SWAP_INTERVAL).
+        if ($spec.generatorArgs.PSObject.Properties['swapInterval']) { $gen['SwapInterval'] = [int]$spec.generatorArgs.swapInterval }
         # PLAYBACK-LJ92-DECODE-THROUGHPUT-1: the raw-uint16 prefetch decoder count, for any leg (not only a forced-look pace leg).
         if ($spec.generatorArgs.PSObject.Properties['rawPrefetchDecoders']) { $gen['RawPrefetchDecoders'] = [int]$spec.generatorArgs.rawPrefetchDecoders }
         # PLAYBACK-BACHELOR-PRESENT-JITTER-1: a SPEED leg may force Look Assist (a capture-free pace leg: no contact-sheet grab in the timed Play).

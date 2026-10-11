@@ -68,6 +68,7 @@ PLAYBACK_DEFAULTS = {
     "showQualityIndicator": True,
     "showExperimentalPhase3Modes": False,
     "phase3Acknowledged": False,
+    "vsync": True,
     "derived": {
         "proxyLevel": -1,
         "initialScaleRequest": {"nonDualIso": 4, "dualIso": 4},
@@ -157,6 +158,7 @@ def _validate_playback(playback: Any) -> dict[str, Any]:
         "showQualityIndicator",
         "showExperimentalPhase3Modes",
         "phase3Acknowledged",
+        "vsync",
     ):
         _require_bool(result[key], f"playback.{key}")
     derived = _exact_keys(

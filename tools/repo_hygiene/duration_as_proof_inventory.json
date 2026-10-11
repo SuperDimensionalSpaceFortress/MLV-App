@@ -1940,6 +1940,36 @@
       ]
     },
     {
+      "path": "tests/console/test_playback_swap_interval.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , summary . swapCallAvgMs , 1 e - 9 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYBACK-VSYNC-DEFAULT-1: pure-function unit test of GpuWindowSwapTelemetryPolicy::summarize() on a default-constructed counters struct with no timed swaps (swapCallSamplesMs empty, no live clock); asserts the empty-sample summary reports a 0 average rather than NaN/garbage. Verifies the aggregation math on a known empty input, not that any stage ran; the swapCallCount==0 assert on the line above is the counter-based statement of the same fact.",
+      "lines": [
+        98
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_swap_interval.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , summary . swapCallP95Ms , 1 e - 9 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "Same empty-summary pure-function verification as the swapCallAvgMs control above, for the p95 field.",
+      "lines": [
+        99
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_swap_interval.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , summary . swapCallMaxMs , 1 e - 9 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "Same empty-summary pure-function verification as the swapCallAvgMs control above, for the max field.",
+      "lines": [
+        100
+      ]
+    },
+    {
       "path": "src/mlv/video_mlv.c",
       "anchor": "g_mlv_last_raw_uint16_source = inflightWaitMs >= 0.0",
       "class": "value_fallback_select",

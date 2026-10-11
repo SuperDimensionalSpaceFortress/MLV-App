@@ -426,11 +426,33 @@ class DriverStagingAndMarkerTests(unittest.TestCase):
         (self.out / MARKER).write_text('{"schema": "stale"}', encoding="utf-8")
         before = tree_hashes(self.out)
         self.assertIn(self.TRIO_RECORD_NAME, before)
+        staged = len(self.staging_dirs())
+        self.assertEqual(staged, 1, "the finished trio's own staging directory")
         proc = self.pair("-RecoverIncomplete")
         self.assertEqual(proc.returncode, 16, proc.stdout + proc.stderr)
         self.assertIn("PAIR_RECORD_EXISTS " + self.TRIO_RECORD_NAME, proc.stdout + proc.stderr)
         self.assertEqual(tree_hashes(self.out), before, "every file kept its path and bytes")
         self.assertEqual([p.name for p in self.out.iterdir() if p.is_dir()], [], "no incomplete-<utc> directory was made")
+        # FLAVOR-TRIO-RECOVERY-DRIVER-REFUSAL-PINNED-1: the composer refuses with the same text and exit code, so only the staging count tells the DRIVER's
+        # up-front refusal (nothing staged) from the composer's (this attempt staged its frames first).
+        self.assertEqual(len(self.staging_dirs()), staged, "the refusal came from the driver's up-front check, before anything was staged")
+
+    def test_pair_mode_without_a_switch_counts_a_completed_trios_record_up_front_and_advises_no_refused_switch(self) -> None:
+        # FLAVOR-PAIR-TRIO-RECORD-COUNTED-ALWAYS-1: a finished trio plus a stale marker, pair mode, no -RecoverIncomplete: the record-exists diagnosis (16),
+        # not the incomplete-attempt one (17) whose advice names a switch that pair mode then refuses.
+        proc = self.trio()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        (self.out / MARKER).write_text('{"schema": "stale"}', encoding="utf-8")
+        before = tree_hashes(self.out)
+        staged = len(self.staging_dirs())
+        proc = self.pair()
+        text = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 16, text)
+        self.assertIn("PAIR_RECORD_EXISTS " + self.TRIO_RECORD_NAME, text)
+        self.assertNotIn("PAIR_INCOMPLETE_ATTEMPT", text)
+        self.assertNotIn("-RecoverIncomplete", text, "the advice must never name a switch the next run refuses")
+        self.assertEqual(tree_hashes(self.out), before, "every file kept its path and bytes")
+        self.assertEqual(len(self.staging_dirs()), staged, "refused up front: nothing was staged")
 
     # r3 blocker 1: the marker-delete exception never runs inside an owner-footage root --------------------------------------------------------
     def test_an_out_dir_that_holds_or_sits_under_owner_footage_is_refused_before_anything_is_written_or_deleted(self) -> None:

@@ -2,6 +2,7 @@
 #include "../common/repo_paths.h"
 
 #include "../../platform/qt/PlaybackQualityPolicy.h"
+#include "../../platform/qt/PlaybackSwapInterval.h"
 #include "../../platform/qt/ReceiptSettings.h"
 
 #include <QByteArray>
@@ -25,7 +26,7 @@ const std::array<const char *, 6> kPlaybackEnvironment = {
     "MLVAPP_PLAYBACK_SCALE_FACTOR",
 };
 
-const std::array<const char *, 8> kPlaybackKeys = {
+const std::array<const char *, 9> kPlaybackKeys = {
     PlaybackQualitySettings::kKeyQualityMode(),
     PlaybackQualitySettings::kKeyPreviewMode(),
     PlaybackQualitySettings::kKeyScaleFactorOverride(),
@@ -34,6 +35,7 @@ const std::array<const char *, 8> kPlaybackKeys = {
     PlaybackQualitySettings::kKeyShowQualityIndicator(),
     PlaybackQualitySettings::kKeyShowExperimentalPhase3Modes(),
     PlaybackQualitySettings::kKeyPhase3Acknowledged(),
+    PlaybackSwapIntervalSettings::kKeyVSync(),
 };
 
 class ScopedFreshPlaybackState
@@ -130,6 +132,7 @@ QJsonObject actualPlaybackDefaults()
                     playbackQualityShowExperimentalPhase3ModesFromSettings());
     playback.insert(QStringLiteral("phase3Acknowledged"),
                     playbackQualityPhase3AcknowledgedFromSettings());
+    playback.insert(QStringLiteral("vsync"), playbackVSyncFromSettings());
     playback.insert(QStringLiteral("derived"), derived);
     return playback;
 }

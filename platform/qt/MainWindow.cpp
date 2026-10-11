@@ -1516,6 +1516,7 @@ static bool lookAssistProcessedFloorLiftedPostInvalidShouldFailClosed(
 #include "MainWindowGpuPreviewPolicy.h"
 #include "PlaybackQualityPolicy.h"
 #include "PlaybackScaling.h"
+#include "PlaybackSwapInterval.h"
 #include "ZebraThresholds.h"
 #include "batch/WorkerThreadCount.h"
 #include "ExportSettingsDialog.h"
@@ -2162,7 +2163,7 @@ MainWindow::MainWindow(int &argc, char **argv, QWidget *parent) :
 
     //Enable color management for macOS
     auto format = QSurfaceFormat::defaultFormat();
-    format.setSwapInterval(0);
+    format.setSwapInterval(playbackSwapInterval());
     format.setColorSpace( QSurfaceFormat::sRGBColorSpace );
     QSurfaceFormat::setDefaultFormat(format);
 
@@ -11535,6 +11536,7 @@ void MainWindow::initGui( void )
         pScaleFactorSub->addAction( ui->actionPlaybackScale8 );
         m_pPlaybackQualityToolButtonMenu->addMenu( pScaleFactorSub );
         m_pPlaybackQualityToolButtonMenu->addAction( ui->actionPlaybackShowQualityIndicator );
+        m_pPlaybackQualityToolButtonMenu->addAction( ui->actionPlaybackVSync );
         QMenu *pAutoTargetSub = new QMenu( tr( "Auto Target FPS" ),
                                            m_pPlaybackQualityToolButtonMenu );
         pAutoTargetSub->addAction( ui->actionPlaybackAutoTarget24 );
@@ -20826,6 +20828,8 @@ void MainWindow::initPlaybackQualityFromSettings( void )
         ui->actionPlaybackAutoTarget60->setChecked( rawTargetFps == 60 );
     if ( ui->actionPlaybackShowQualityIndicator )
         ui->actionPlaybackShowQualityIndicator->setChecked( indicatorVisible );
+    if ( ui->actionPlaybackVSync )
+        ui->actionPlaybackVSync->setChecked( playbackVSyncFromSettings() );
     updatePhase3PlaybackQualityUi();
 
     if ( envQualityMode >= 0 )
@@ -21975,6 +21979,13 @@ void MainWindow::on_actionPlaybackShowQualityIndicator_triggered()
     const bool checked = ui->actionPlaybackShowQualityIndicator
                        && ui->actionPlaybackShowQualityIndicator->isChecked();
     setPlaybackQualityIndicatorVisible( checked, /*persist*/true );
+}
+
+// PLAYBACK-VSYNC-DEFAULT-1: persisted only. Every playback GL surface is created once per
+// process, so the new interval applies from the next app start.
+void MainWindow::on_actionPlaybackVSync_triggered()
+{
+    playbackVSyncWriteToSettings( ui->actionPlaybackVSync->isChecked() );
 }
 
 void MainWindow::on_actionPlaybackAutoTarget24_triggered()
@@ -24429,6 +24440,8 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     m_playbackSmokeCpuDualIsoReconFallbackReasonLast.clear();
     m_playbackSmokeCpuDualIsoReconFullResFixesSumMs = 0.0;
     m_playbackSmokeCpuDualIsoReconDownsampleSumMs = 0.0;
+    m_playbackSmokeReducedIsoNotchFramesAtBegin = mlvDualIsoReducedIsoNotchFrames();
+    m_playbackSmokeReducedIsoNotchMicrosAtBegin = mlvDualIsoReducedIsoNotchMicros();
     m_playbackSmokeGpuDualIsoReducedReconFrames = 0;
     m_playbackSmokeGpuDualIsoFullReconFrames = 0;
     m_playbackSmokeGpuDualIsoReconScaleLast = 0;
@@ -28023,19 +28036,29 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
 
     /* CPU-DUALISO-AT-PREVIEW-SCALE-1: which recon scale the phase-3 worker ran
      * for the presented frames (avg_llrawproc_* in cpu_summary is the recon at
-     * that scale; the full-res fixes and the shrink are reported here). */
+     * that scale; the full-res fixes and the shrink are reported here).
+     * CPU-DUALISO-REDUCED-ISO-NOTCH-1: notch_frames / avg_notch_ms are the reduced
+     * ISO notch's process-wide counters over the session (every reduced recon the
+     * workers ran, presented or not). */
+    const quint64 notchFrames =
+        mlvDualIsoReducedIsoNotchFrames() - m_playbackSmokeReducedIsoNotchFramesAtBegin;
+    const quint64 notchMicros =
+        mlvDualIsoReducedIsoNotchMicros() - m_playbackSmokeReducedIsoNotchMicrosAtBegin;
     qInfo().noquote()
         << QStringLiteral(
                "playback_smoke.cpu_dualiso_recon_scale_summary session=%1 "
                "reduced_recon_frames=%2 full_recon_frames=%3 recon_scale_last=%4 "
-               "avg_fullres_fixes_ms=%5 avg_downsample_ms=%6 fallback_reason_last=\"%7\"" )
+               "avg_fullres_fixes_ms=%5 avg_downsample_ms=%6 fallback_reason_last=\"%7\" "
+               "notch_frames=%8 avg_notch_ms=%9" )
                .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
                .arg( m_playbackSmokeCpuDualIsoReducedReconFrames )
                .arg( m_playbackSmokeCpuDualIsoFullReconFrames )
                .arg( m_playbackSmokeCpuDualIsoReconScaleLast )
                .arg( avgSmokeMs( m_playbackSmokeCpuDualIsoReconFullResFixesSumMs ), 0, 'f', 3 )
                .arg( avgSmokeMs( m_playbackSmokeCpuDualIsoReconDownsampleSumMs ), 0, 'f', 3 )
-               .arg( m_playbackSmokeCpuDualIsoReconFallbackReasonLast );
+               .arg( m_playbackSmokeCpuDualIsoReconFallbackReasonLast )
+               .arg( static_cast<qulonglong>( notchFrames ) )
+               .arg( notchFrames ? double( notchMicros ) / 1000.0 / double( notchFrames ) : 0.0, 0, 'f', 3 );
 
     /* PLAYBACK-CUDA-HONOUR-SCALE-1: the CUDA texture route at preview scale.
      * session_scale/session_reason are the once-per-session decision;
@@ -28522,6 +28545,20 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                    .arg( swapSnapshot.summary.newFrameSwapFps, 0, 'f', 3 )
                    .arg( swapSnapshot.summary.newFrameMaxGapMs, 0, 'f', 3 )
                    .arg( swapSnapshot.summary.newFrameP95GapMs, 0, 'f', 3 );
+        // PLAYBACK-VSYNC-DEFAULT-1: a line of its own, so no parsed format string changes.
+        // How long the playback swap call itself blocked, and the interval the driver held.
+        qInfo().noquote()
+            << QStringLiteral(
+                   "playback_smoke.gpu_window_swap_calls session=%1 swap_interval_requested=%2 "
+                   "wgl_swap_interval_actual=%3 timed_swap_calls=%4 swap_call_avg_ms=%5 "
+                   "swap_call_p95_ms=%6 swap_call_max_ms=%7" )
+                   .arg( static_cast<qulonglong>( swapSnapshot.sessionId ) )
+                   .arg( playbackSwapInterval() )
+                   .arg( swapSnapshot.summary.wglSwapIntervalAtFirstTimedSwap )
+                   .arg( static_cast<qulonglong>( swapSnapshot.summary.swapCallCount ) )
+                   .arg( swapSnapshot.summary.swapCallAvgMs, 0, 'f', 3 )
+                   .arg( swapSnapshot.summary.swapCallP95Ms, 0, 'f', 3 )
+                   .arg( swapSnapshot.summary.swapCallMaxMs, 0, 'f', 3 );
     }
 
     // CUDA-PLAYBACK-CONTACT-SHEET-1 r1d (sol HARDENING): cleared LAST, after every summary

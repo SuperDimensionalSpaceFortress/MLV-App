@@ -541,8 +541,8 @@ not force `offscreen` unless you have explicitly deployed an offscreen platform
 plugin:
 
 ```powershell
-pwsh.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
-  -File tools\profiling\run-release-playback-profile.ps1 `
+# In-process, not `pwsh -File`: -File hands an array over as separate tokens and the wrapper refuses the extras.
+& tools\profiling\run-release-playback-profile.ps1 `
   -RepoRoot . `
   -Input tests\fixtures\clips\large_dual_iso.mlv `
   -Receipt tests\fixtures\receipts\large_dual_iso_hq.marxml `

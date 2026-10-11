@@ -252,6 +252,7 @@
      <addaction name="actionPlaybackQualityPhase3HQ"/>
      <addaction name="separator"/>
      <addaction name="actionPlaybackShowQualityIndicator"/>
+     <addaction name="actionPlaybackVSync"/>
      <addaction name="menuPlaybackPreviewMode"/>
      <addaction name="menuPlaybackPreviewResolution"/>
      <addaction name="menuPlaybackScaleFactor"/>
@@ -11320,6 +11321,20 @@ QGroupBox::indicator:checked:disabled {
    </property>
    <property name="toolTip">
     <string>Show a small status bar indicator with the active playback quality mode.</string>
+   </property>
+  </action>
+  <action name="actionPlaybackVSync">
+   <property name="checkable">
+    <bool>true</bool>
+   </property>
+   <property name="checked">
+    <bool>true</bool>
+   </property>
+   <property name="text">
+    <string>VSync (prevent tearing)</string>
+   </property>
+   <property name="toolTip">
+    <string>Wait for the display's refresh before showing each playback frame, so the picture does not tear. Takes effect the next time MLV App starts.</string>
    </property>
   </action>
   <action name="actionPlaybackAutoTarget24">

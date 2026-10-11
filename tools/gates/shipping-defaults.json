@@ -10,6 +10,7 @@
     "showQualityIndicator": true,
     "showExperimentalPhase3Modes": false,
     "phase3Acknowledged": false,
+    "vsync": true,
     "derived": {
       "proxyLevel": -1,
       "initialScaleRequest": { "nonDualIso": 4, "dualIso": 4 },
