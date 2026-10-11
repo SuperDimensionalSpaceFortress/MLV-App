@@ -202,6 +202,14 @@ $script:ConsentSchema = 'mlv-app/dual-venue-clip-consent/v1'
 # A record carries the owner's EXACT typed line ("CLIP <venue>: <clip id>": no path, ever), that line's sha256, when it was
 # recorded and by whom ('owner' only). The line is checked against the record's own venue + clip id and against its hash.
 $script:ConsentRecordKeys = @('venue', 'clipId', 'ownerLine', 'ownerLineSha256', 'recordedUtc', 'recordedBy')
+# VENUE-CLIP-CONSENT-BLANKET-1: ONE blanket record kind (consent file top-level `blanketRecords`). It stores the owner's sentence of
+# 2026-10-11 (ledger stamp below) verbatim and admits any well-formed clip id on any venue in the table. The sentence's sha256 is PINNED
+# here, so only the owner's own words can be a blanket: a record whose sentence does not hash to this value (a one-character edit, a
+# re-hashed forgery) makes the WHOLE file invalid -- it admits nothing and there is no fallback to admit. No path, no footage name.
+$script:BlanketRecordKeys = @('kind', 'ownerSentence', 'ownerSentenceSha256', 'recordedUtc', 'recordedBy', 'writtenBy', 'source', 'scope')
+$script:BlanketOwnerSentenceSha256 = '48dc8dead951aa2eab911db63591b59d238830d2d98c0fd7df346c42b78f9fd6'
+$script:BlanketSource = 'ledger 2026-10-11T03:41:42Z'
+$script:BlanketScope = 'any clip id, any venue'
 $script:ConsentRelativePath = 'tools/profiling/dual-venue/venue-clip-consent.json'
 $script:VenueTableRelativePath = 'tools/profiling/dual-venue/venues.json'
 
@@ -413,10 +421,14 @@ function Read-DvClipConsent {
     so a bare hex string cannot stand in for the owner's words.
     FAIL CLOSED: empty text, bad JSON, a wrong schema, or any record that is not exactly the six reviewed keys (so a path
     cannot ride along in an extra field) makes the WHOLE file invalid -- unknown consent is no consent.
-    Returns [pscustomobject]@{ ok; reason; records }.
+    BLANKET (VENUE-CLIP-CONSENT-BLANKET-1): an optional top-level `blanketRecords` array. Each record is exactly kind='blanket',
+    ownerSentence (the owner's words, verbatim), ownerSentenceSha256, recordedUtc, recordedBy='owner', writtenBy='owner',
+    source (the ledger stamp) and scope; the sentence must hash to its stored sha256 AND to the sha256 pinned in this module.
+    A blanket that fails any check invalidates the WHOLE file (admits nothing, no fallback).
+    Returns [pscustomobject]@{ ok; reason; records; blankets }.
     #>
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Text, [Parameter(Mandatory)]$Table)
-    $bad = { param($why) [pscustomobject]@{ ok = $false; reason = $why; records = @() } }
+    $bad = { param($why) [pscustomobject]@{ ok = $false; reason = $why; records = @(); blankets = @() } }
     if ([string]::IsNullOrWhiteSpace($Text)) { return (& $bad 'the consent file is missing or empty') }
     # A consent record names a clip by ID. A drive path or a footage file name anywhere in the file is refused outright.
     if ($Text -match '(?i)[a-z]:[\\/]|\.mlv\b') { return (& $bad 'the consent file carries a path-shaped value') }
@@ -447,7 +459,30 @@ function Read-DvClipConsent {
         }
         $records += $r
     }
-    [pscustomobject]@{ ok = $true; reason = $null; records = $records }
+    $blankets = @()
+    if ($null -ne $doc.PSObject.Properties['blanketRecords']) {
+        foreach ($b in @($doc.blanketRecords)) {
+            if ($null -eq $b) { return (& $bad 'a blanket consent record is null') }
+            $bkeys = @($b.PSObject.Properties | ForEach-Object { $_.Name })
+            if ($bkeys.Count -ne $script:BlanketRecordKeys.Count -or @($bkeys | Where-Object { $_ -cnotin $script:BlanketRecordKeys }).Count -gt 0) {
+                return (& $bad 'a blanket consent record is not exactly kind, ownerSentence, ownerSentenceSha256, recordedUtc, recordedBy, writtenBy, source, scope')
+            }
+            if ([string]$b.kind -cne 'blanket') { return (& $bad "a blanket consent record's kind is not 'blanket'") }
+            if ([string]$b.ownerSentenceSha256 -cnotmatch '^[0-9a-f]{64}$') { return (& $bad 'a blanket consent record ownerSentenceSha256 is not 64 lowercase hex') }
+            if ((Get-DvSha256OfText ([string]$b.ownerSentence)) -cne [string]$b.ownerSentenceSha256) { return (& $bad "a blanket consent record's ownerSentenceSha256 is not the sha256 of its ownerSentence") }
+            if ([string]$b.ownerSentenceSha256 -cne $script:BlanketOwnerSentenceSha256) { return (& $bad "a blanket consent record's sentence is not the owner's recorded blanket sentence") }
+            if ([string]$b.recordedBy -cne 'owner') { return (& $bad "a blanket consent record's recordedBy is not 'owner'") }
+            if ([string]$b.writtenBy -cne 'owner') { return (& $bad "a blanket consent record's writtenBy is not 'owner'") }
+            if ([string]$b.source -cne $script:BlanketSource) { return (& $bad "a blanket consent record's source is not the owner's ledger stamp") }
+            if ([string]$b.scope -cne $script:BlanketScope) { return (& $bad "a blanket consent record's scope is not '$($script:BlanketScope)'") }
+            $bwhen = [DateTime]::MinValue
+            if (-not [DateTime]::TryParse([string]$b.recordedUtc, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AdjustToUniversal -bor [Globalization.DateTimeStyles]::AssumeUniversal, [ref]$bwhen)) {
+                return (& $bad 'a blanket consent record recordedUtc is not a timestamp')
+            }
+            $blankets += $b
+        }
+    }
+    [pscustomobject]@{ ok = $true; reason = $null; records = $records; blankets = $blankets }
 }
 
 function Get-DvClipAdmission {
@@ -460,15 +495,15 @@ function Get-DvClipAdmission {
                                            is refused by the same gate that refuses a short clip anywhere else, never looped
       CLIP_ID_INVALID                      not a consented clip id
       VENUE_CLIP_CONSENT_INVALID           the per-venue consent file is missing/malformed (fail closed)
-      VENUE_CLIP_CONSENT_ABSENT            no owner-typed record for THIS venue + this clip id (consent on one venue
-                                           never implies the other)
+      VENUE_CLIP_CONSENT_ABSENT            no owner-typed record for THIS venue + this clip id and no blanket record (consent
+                                           on one venue never implies the other; a blanket record admits any clip id on any venue)
       OWNER_CLIP_REFUSED_PENDING_CROSS_VOLUME_2   the reviewed switch venues.json ownerFootage.cleanupClassGone is false
     #>
     param(
         [Parameter(Mandatory)][string]$ClipId, [Parameter(Mandatory)][string]$Venue, [Parameter(Mandatory)]$Table,
         [Parameter(Mandatory)][AllowEmptyString()][string]$ConsentText, [Parameter(Mandatory)][string]$RepoRoot
     )
-    $refuse = { param($token) [pscustomobject]@{ admitted = $false; reason = $token; ownerLineSha256 = $null; recordedUtc = $null } }
+    $refuse = { param($token) [pscustomobject]@{ admitted = $false; reason = $token; ownerLineSha256 = $null; recordedUtc = $null; consentKind = $null; consentSha256Prefix = $null } }
     if ($script:FixtureClipIds -ccontains $ClipId) {
         $verdict = 'NOT_A_CONSENTED_CLIP'
         $gate = Join-Path $PSScriptRoot '..\gui-smoke-length-gate.ps1'
@@ -487,12 +522,20 @@ function Get-DvClipAdmission {
     foreach ($r in $consent.records) {
         if ([string]$r.venue -ceq $Venue -and [string]$r.clipId -ceq $ClipId) { $record = $r; break }
     }
+    # Per-clip records are checked FIRST; the blanket record (the owner's sentence of 2026-10-11) admits any well-formed clip id on any venue in the table.
+    $kind = 'clip'
+    if ($null -eq $record -and @($consent.blankets).Count -gt 0 -and $null -ne $Table.venues.PSObject.Properties[$Venue]) { $kind = 'blanket'; $record = @($consent.blankets)[0] }
     if ($null -eq $record) { return (& $refuse 'VENUE_CLIP_CONSENT_ABSENT') }
     $refusal = 'OWNER_CLIP_REFUSED_PENDING_CROSS_VOLUME_2'
     if ($null -ne $Table.PSObject.Properties['ownerFootage']) { $refusal = [string]$Table.ownerFootage.refusal }
     $cleanupGone = ($null -ne $Table.PSObject.Properties['ownerFootage']) -and [bool]$Table.ownerFootage.cleanupClassGone
     if (-not $cleanupGone) { return (& $refuse $refusal) }
-    [pscustomobject]@{ admitted = $true; reason = $null; ownerLineSha256 = [string](Get-DvProp $record 'ownerLineSha256'); recordedUtc = [string](Get-DvProp $record 'recordedUtc') }
+    if ($kind -ceq 'blanket') {
+        $sha = [string](Get-DvProp $record 'ownerSentenceSha256')
+        return [pscustomobject]@{ admitted = $true; reason = $null; ownerLineSha256 = $sha; recordedUtc = [string](Get-DvProp $record 'recordedUtc'); consentKind = 'blanket'; consentSha256Prefix = $sha.Substring(0, [Math]::Min(12, $sha.Length)) }
+    }
+    $lineSha = [string](Get-DvProp $record 'ownerLineSha256')
+    [pscustomobject]@{ admitted = $true; reason = $null; ownerLineSha256 = $lineSha; recordedUtc = [string](Get-DvProp $record 'recordedUtc'); consentKind = 'clip'; consentSha256Prefix = $lineSha.Substring(0, [Math]::Min(12, $lineSha.Length)) }
 }
 
 # --- the receipt oracle's verdict, carried in the receipt (round 2) and RE-DERIVED from the run's own log (round 3) -------
@@ -523,12 +566,14 @@ function Get-DvSmokeSummaryFields {
     The measured session's `playback_smoke.summary` line out of the app's own run log, as a key/value hashtable, plus whether
     every `automation.pacing_isolated` line says the run used its run-scoped settings store. The session is chosen exactly the
     way the job chooses it (the `playback_smoke.measured_session` marker, else the first summary line); the LAST summary line
-    of that session wins.
+    of that session wins. HFR-CONFORM-AWARE-RECEIPT-ORACLES-1: `conformLine` is the LAST `playback_smoke.conform` line of the same
+    session ($null when the log has none), for the conform proof (Get-DvConformPaceProof).
     #>
     param([AllowNull()][AllowEmptyString()][string]$LogText)
     $fields = @{}
     $session = $null
     $isolated = $false
+    $conformLine = $null
     if (-not [string]::IsNullOrEmpty($LogText)) {
         $lines = $LogText -split "`r?`n"
         foreach ($line in $lines) { if ($line -match 'playback_smoke\.measured_session id=(?<s>\d+)') { $session = $Matches['s']; break } }
@@ -539,13 +584,48 @@ function Get-DvSmokeSummaryFields {
             if ($null -ne $summaryLine) {
                 foreach ($m in [regex]::Matches($summaryLine, '(?<k>[A-Za-z0-9_]+)=(?<v>\S+)')) { $fields[$m.Groups['k'].Value] = $m.Groups['v'].Value }
             }
+            foreach ($line in $lines) { if ($line -match ('playback_smoke\.conform session=' + [regex]::Escape($session) + '(\s|$)')) { $conformLine = $line } }
         }
         # Master isolates an automation run's settings store (the venue's persisted settings are never read or rewritten).
         # A build that predates that, or a line that says otherwise, leaves the venue's QSettings exposed: not evidence.
         $iso = @($lines | Where-Object { $_ -match 'interaction_trace event=automation\.pacing_isolated(\s|$)' })
         $isolated = ($iso.Count -gt 0) -and (@($iso | Where-Object { $_ -notmatch 'settings_store=run_scoped(\s|$)' }).Count -eq 0)
     }
-    [pscustomobject]@{ session = $session; fields = $fields; settingsIsolated = $isolated }
+    [pscustomobject]@{ session = $session; fields = $fields; settingsIsolated = $isolated; conformLine = $conformLine }
+}
+
+function Get-DvConformPaceProof {
+    <#
+    .SYNOPSIS
+    HFR-CONFORM-AWARE-RECEIPT-ORACLES-1. Did the run PROVE it was conformed? Judged from the receipt `playback` block's own fields (the
+    conform line's values, recorded from the run log by Get-DvPlaybackEvidence), so a reader re-derives it without the log. Proven only
+    when the conform line was PRESENT for the measured session (conformSession == summarySession), conformActive == 1, conformClipFps is
+    within 0.5 % of nativeFps, conformPlaybackFps is > 0 and within 0.5 % of paceFps, and conformPlaybackFps is not above conformClipFps.
+    Absent / malformed / inactive / another session's / inconsistent -> proven=$false and `reason` says why (absence never helps).
+    The same decision as Get-GuiSmokeConformPaceProof (gui-smoke-length-gate.ps1) and Get-AttrCudaConformAwareSourceFramesVerdict (AttrCudaArtifacts.psm1);
+    a parity test executes all three on one table.
+    #>
+    param($Playback)
+    $out = [pscustomobject]@{ proven = $false; reason = 'no playback_smoke.conform line for the run'; present = $false }
+    if ((Get-DvProp $Playback 'conformLinePresent') -ne $true) { return $out }
+    $out.present = $true
+    $summarySession = [string](Get-DvProp $Playback 'summarySession')
+    $conformSession = [string](Get-DvProp $Playback 'conformSession')
+    $active = ConvertTo-DvInt64 (Get-DvProp $Playback 'conformActive')
+    $clip = ConvertTo-DvDouble (Get-DvProp $Playback 'conformClipFps')
+    $play = ConvertTo-DvDouble (Get-DvProp $Playback 'conformPlaybackFps')
+    $native = ConvertTo-DvDouble (Get-DvProp $Playback 'nativeFps')
+    $pace = ConvertTo-DvDouble (Get-DvProp $Playback 'paceFps')
+    $absent = @(@('session', $conformSession), @('conform_active', $active), @('clip_fps', $clip), @('playback_fps', $play) | Where-Object { $null -eq $_[1] -or "$($_[1])" -eq '' } | ForEach-Object { $_[0] })
+    if ($absent.Count -gt 0) { $out.reason = "the playback_smoke.conform line is malformed (absent or unreadable: $($absent -join ' / '))"; return $out }
+    if ($summarySession -eq '' -or $conformSession -cne $summarySession) { $out.reason = "the playback_smoke.conform line is for session $conformSession, not the measured session $summarySession"; return $out }
+    if ($active -ne 1) { $out.reason = "conform_active=$active; the run was not conformed"; return $out }
+    if ($null -eq $native -or $native -le 0 -or $clip -le 0 -or [Math]::Abs($clip - $native) -gt (0.005 * $native)) { $out.reason = "conform clip_fps=$clip does not match native_fps=$native"; return $out }
+    if ($null -eq $pace -or $pace -le 0 -or $play -le 0 -or [Math]::Abs($play - $pace) -gt (0.005 * $pace)) { $out.reason = "conform playback_fps=$play does not match pace_fps=$pace"; return $out }
+    if ($play -gt ($clip * 1.005)) { $out.reason = "conform playback_fps=$play is above clip_fps=$clip; conform never speeds a clip up"; return $out }
+    $out.proven = $true
+    $out.reason = ''
+    $out
 }
 
 function Get-DvPlaybackProblems {
@@ -555,7 +635,8 @@ function Get-DvPlaybackProblems {
     "pace unchecked"); the verdict is re-derived from the fields, never taken from a stored `valid`. Returns the list of
     problems (empty = valid). This repeats, at the receipt and from the fields the receipt carries, the rules master's job
     oracle (Get-AttrCudaSourceFramesVerdict) applies: source_advanced >= required_source_frames >= ceil(20 s x native fps),
-    paced at the native fps with no fps override, no wrap, and the nonce the app echoed on its summary line IS the nonce the
+    paced at the native fps (or, only on a PROVEN conform line, the conform playback fps; Get-DvConformPaceProof) with no fps override,
+    no wrap, and the nonce the app echoed on its summary line IS the nonce the
     launcher generated for this run (both the real launcher's 32-hex format).
     #>
     param($Playback, [string]$ExpectedClipId)
@@ -581,8 +662,19 @@ function Get-DvPlaybackProblems {
     }
     if ($null -eq $pace) { $reasons.Add('RECEIPT_FIELD_ABSENT: pace_fps') }
     elseif ($pace -le 0) { $reasons.Add("INVALID_SOURCE_FRAMES: pace_fps=$pace; a present engine pace that is not positive is unknown") }
-    elseif ($null -ne $native -and $native -gt 0 -and [Math]::Abs($pace - $native) -gt (0.005 * $native)) {
-        $reasons.Add("INVALID_SOURCE_FRAMES: the engine paced at pace_fps=$pace but the footage native fps is $native; 20 s of wall clock is not 20 s of footage")
+    elseif ($null -ne $native -and $native -gt 0) {
+        # HFR-CONFORM-AWARE-RECEIPT-ORACLES-1: only a PROVEN conform (Get-DvConformPaceProof) moves the pace comparison off the native fps.
+        $conformProof = Get-DvConformPaceProof -Playback $Playback
+        if ($conformProof.proven) {
+            $conformPlayback = ConvertTo-DvDouble (Get-DvProp $Playback 'conformPlaybackFps')
+            if ([Math]::Abs($pace - $conformPlayback) -gt (0.005 * $conformPlayback)) {
+                $reasons.Add("INVALID_SOURCE_FRAMES: the engine paced at pace_fps=$pace but the conformed playback_fps is $conformPlayback; 20 s of wall clock is not 20 s of footage")
+            }
+        } elseif ([Math]::Abs($pace - $native) -gt (0.005 * $native)) {
+            $why = ''
+            if ($conformProof.present) { $why = " (conform relaxation not applied: $($conformProof.reason))" }
+            $reasons.Add("INVALID_SOURCE_FRAMES: the engine paced at pace_fps=$pace but the footage native fps is $native; 20 s of wall clock is not 20 s of footage$why")
+        }
     }
     if ($null -eq $override) { $reasons.Add('RECEIPT_FIELD_ABSENT: fps_override') }
     elseif ($override -ne 0) { $reasons.Add('INVALID_SOURCE_FRAMES: the run was paced by a persisted fps override; evidence is paced at the footage native fps') }
@@ -636,14 +728,25 @@ function Get-DvPlaybackEvidence {
     $manifestSha = [string](Get-DvProp $manifestLog 'sha256')
     $parsed = Get-DvSmokeSummaryFields -LogText $LogText
     $f = $parsed.fields
+    $conformFields = @{}
+    if ($null -ne $parsed.conformLine) { foreach ($m in [regex]::Matches([string]$parsed.conformLine, '(?<k>[A-Za-z0-9_]+)=(?<v>\S+)')) { $conformFields[$m.Groups['k'].Value] = $m.Groups['v'].Value } }
+    $conformPlaybackField = ConvertTo-DvDouble $conformFields['playback_fps']
+    $conformClipField = ConvertTo-DvDouble $conformFields['clip_fps']
     $wrappedField = ConvertTo-DvInt64 $f['wrapped']
     $bound = (-not [string]::IsNullOrEmpty($LogSha256)) -and ($declaredSha.ToLowerInvariant() -ceq $LogSha256) -and ([string]::IsNullOrEmpty($manifestSha) -or $manifestSha.ToLowerInvariant() -ceq $LogSha256)
     $pb = [ordered]@{
-        oracle = 'source_advanced >= required_source_frames >= ceil(20 s x native fps), paced at native fps, no fps override, no wrap, the app echoed the nonce the launcher generated; all re-derived from the run log'
+        oracle = 'source_advanced >= required_source_frames >= ceil(20 s x native fps), paced at native fps (or the proven conform playback fps), no fps override, no wrap, the app echoed the nonce the launcher generated; all re-derived from the run log'
         sourceAdvanced = (ConvertTo-DvInt64 $f['source_advanced'])
         requiredSourceFrames = (ConvertTo-DvInt64 $f['required_source_frames'])
         nativeFps = (ConvertTo-DvDouble $f['native_fps'])
         paceFps = (ConvertTo-DvDouble $f['pace_fps'])
+        paceRule = 'native'
+        conformPlaybackFps = $conformPlaybackField
+        conformClipFps = $conformClipField
+        conformLinePresent = ($null -ne $parsed.conformLine)
+        summarySession = $(if ($null -ne $parsed.session) { [string]$parsed.session } else { $null })
+        conformSession = $(if ($conformFields.ContainsKey('session')) { [string]$conformFields['session'] } else { $null })
+        conformActive = (ConvertTo-DvInt64 $conformFields['conform_active'])
         fpsOverride = (ConvertTo-DvInt64 $f['fps_override'])
         wrapped = $(if ($null -eq $wrappedField) { $null } else { $wrappedField -ne 0 })
         wrapCount = (ConvertTo-DvInt64 $f['wrap_count'])
@@ -662,6 +765,8 @@ function Get-DvPlaybackEvidence {
         valid = $false
         invalidReasons = @()
     }
+    # Which rule judged the pace, for a key to see (re-derived by Get-DvPlaybackProblems from the same recorded fields, never trusted).
+    if ((Get-DvConformPaceProof -Playback $pb).proven) { $pb['paceRule'] = 'conform' }
     $problems = @(Get-DvPlaybackProblems -Playback $pb -ExpectedClipId $ExpectedClipId)
     $pb['valid'] = ($problems.Count -eq 0)
     $pb['invalidReasons'] = $problems
@@ -1278,8 +1383,16 @@ function Test-DvReceiptValid {
                 $consent = Read-DvClipConsent -Text $cb.text -Table $table
                 if (-not $consent.ok) { $invalid.Add("ADMISSION_UNPROVEN: the committed consent blob is not a valid consent file ($($consent.reason))") }
                 else {
+                    $consentKind = [string](Get-DvProp $admission 'consentKind')
+                    $prefix = [string](Get-DvProp $admission 'consentSha256Prefix')
+                    if ($consentKind -cnotin @('', 'clip', 'blanket')) { $invalid.Add('ADMISSION_UNPROVEN: admission.consentKind is neither clip nor blanket') }
+                    if ($prefix -cne '' -and -not $lineSha.StartsWith($prefix, [StringComparison]::Ordinal)) { $invalid.Add('CONSENT_LINE_MISMATCH: admission.consentSha256Prefix is not the prefix of admission.ownerLineSha256') }
                     $ownRecords = @($consent.records | Where-Object { [string]$_.venue -ceq $venueName -and [string]$_.clipId -ceq $clipId })
-                    if ($ownRecords.Count -eq 0) { $invalid.Add('CONSENT_NOT_IN_BLOB: the committed consent blob holds no owner record for this venue and clip id') }
+                    if ($consentKind -ceq 'blanket') {
+                        $ownBlankets = @(@(Get-DvProp $consent 'blankets') | Where-Object { $null -ne $_ -and [string]$_.ownerSentenceSha256 -ceq $lineSha -and [string]$_.recordedBy -ceq 'owner' -and [string]$_.writtenBy -ceq 'owner' })
+                        if ($ownBlankets.Count -eq 0) { $invalid.Add('CONSENT_NOT_IN_BLOB: the committed consent blob holds no owner blanket record whose sentence sha256 equals admission.ownerLineSha256') }
+                    }
+                    elseif ($ownRecords.Count -eq 0) { $invalid.Add('CONSENT_NOT_IN_BLOB: the committed consent blob holds no owner record for this venue and clip id') }
                     else {
                         $record = $ownRecords[0]
                         if ([string]$record.ownerLineSha256 -cne $lineSha) { $invalid.Add('CONSENT_LINE_MISMATCH: admission.ownerLineSha256 is not the line sha256 of the committed consent record for this venue and clip id') }
@@ -1316,7 +1429,10 @@ function Test-DvReceiptValid {
                     elseif ($null -ne $nowId -and $null -ne $table) {
                         $nowBlob = Get-DvBlobById -RepoRoot $RepoRoot -BlobSha $nowId
                         $now = $(if ($nowBlob.ok) { Read-DvClipConsent -Text $nowBlob.text -Table $table } else { $null })
-                        if ($null -ne $now -and $now.ok) { $stillConsented = (@($now.records | Where-Object { [string]$_.venue -ceq $venueName -and [string]$_.clipId -ceq $clipId -and [string]$_.ownerLineSha256 -ceq $lineSha -and [string]$_.recordedBy -ceq 'owner' }).Count -gt 0) }
+                        if ($null -ne $now -and $now.ok) {
+                            if ([string](Get-DvProp $admission 'consentKind') -ceq 'blanket') { $stillConsented = (@(@(Get-DvProp $now 'blankets') | Where-Object { $null -ne $_ -and [string]$_.ownerSentenceSha256 -ceq $lineSha -and [string]$_.recordedBy -ceq 'owner' }).Count -gt 0) }
+                            else { $stillConsented = (@($now.records | Where-Object { [string]$_.venue -ceq $venueName -and [string]$_.clipId -ceq $clipId -and [string]$_.ownerLineSha256 -ceq $lineSha -and [string]$_.recordedBy -ceq 'owner' }).Count -gt 0) }
+                        }
                     }
                     if (-not $stillConsented) { $invalid.Add('CONSENT_REVOKED: the owner record this receipt was admitted on is no longer committed at HEAD') }
                 }
@@ -1773,7 +1889,7 @@ function Write-DvReceipt {
 
 Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-DvSha256OfBytes, Get-DvSha256OfText, Get-DvSha256OfFile,
     ConvertTo-DvLfBytes, Get-DvLegSpecSha256, Get-DvDerivedBackend, Get-DvBackendNotDerivable, Read-DvContactFrames, Get-DvSubjectDigest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
-    Test-DvUnderClaudeState, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvPlaybackProblems,
+    Test-DvUnderClaudeState, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvPlaybackProblems,
     Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvDisplayEvidence, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvHealthVerdict,
     New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout,
     Get-DvResultToken, Resolve-DvJobOutcome, Test-DvCriteria, Get-DvVerbatimMetrics, New-DvReceipt, Write-DvReceipt

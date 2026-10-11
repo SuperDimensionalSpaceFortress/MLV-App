@@ -7,6 +7,7 @@
 #include <QGuiApplication>
 #include <QOffscreenSurface>
 #include <QOpenGLContext>
+#include <QOpenGLExtraFunctions>
 #include <QOpenGLFramebufferObject>
 #include <QOpenGLFramebufferObjectFormat>
 #include <QOpenGLFunctions>
@@ -1405,10 +1406,8 @@ QOpenGLTexture * createFrameTexture(int width, int height)
     return texture;
 }
 
-QByteArray packRgb16Texture(const uint16_t * inputRgb16, int pixelCount)
+void packRgb16Into(uint16_t * packedValues, const uint16_t * inputRgb16, int pixelCount)
 {
-    QByteArray packed(static_cast<int>(pixelCount * 4u * sizeof(uint16_t)), Qt::Uninitialized);
-    uint16_t * packedValues = reinterpret_cast<uint16_t *>(packed.data());
     for (int pixelIndex = 0; pixelIndex < pixelCount; ++pixelIndex)
     {
         packedValues[pixelIndex * 4 + 0] = inputRgb16[pixelIndex * 3 + 0];
@@ -1416,6 +1415,12 @@ QByteArray packRgb16Texture(const uint16_t * inputRgb16, int pixelCount)
         packedValues[pixelIndex * 4 + 2] = inputRgb16[pixelIndex * 3 + 2];
         packedValues[pixelIndex * 4 + 3] = 65535;
     }
+}
+
+QByteArray packRgb16Texture(const uint16_t * inputRgb16, int pixelCount)
+{
+    QByteArray packed(static_cast<int>(pixelCount * 4u * sizeof(uint16_t)), Qt::Uninitialized);
+    packRgb16Into(reinterpret_cast<uint16_t *>(packed.data()), inputRgb16, pixelCount);
     return packed;
 }
 
@@ -2696,6 +2701,16 @@ void gpuPreviewProcessingDestroyLutTextureSet(GpuPreviewProcessingLutTextureSet 
     set.shadowsHighlightsBlurWidth = 0;
     set.shadowsHighlightsBlurHeight = 0;
     set.shadowsHighlightsBlurReady = false;
+    if ( set.shadowsHighlightsBlurPbo )
+    {
+        QOpenGLContext * currentContext = QOpenGLContext::currentContext();
+        if ( currentContext )
+        {
+            const GLuint pbo = set.shadowsHighlightsBlurPbo;
+            currentContext->functions()->glDeleteBuffers(1, &pbo);
+        }
+        set.shadowsHighlightsBlurPbo = 0;
+    }
 }
 
 void gpuPreviewProcessingMarkShadowsHighlightsBlurStale(GpuPreviewProcessingLutTextureSet * set)
@@ -2954,6 +2969,123 @@ void gpuPresentEventLogReconLine(const char * line)
                .arg( g_gpuPresentEventLastPresentedFrame.load( std::memory_order_relaxed ) );
 }
 
+const char * gpuPreviewProcessingShBlurUploadModeSwitchName(void)
+{
+    return "MLVAPP_GPU_SH_BLUR_UPLOAD_MODE";
+}
+
+GpuShBlurUploadMode gpuPreviewProcessingShBlurUploadModeFromValue(const QString & value)
+{
+    const QString mode = value.trimmed().toLower();
+    if ( mode == QLatin1String("pbo") ) return GpuShBlurUploadPbo;
+    if ( mode == QLatin1String("skip") ) return GpuShBlurUploadSkip;
+    return GpuShBlurUploadClient;
+}
+
+const char * gpuPreviewProcessingShBlurUploadModeName(GpuShBlurUploadMode mode)
+{
+    switch ( mode )
+    {
+    case GpuShBlurUploadSkip: return "skip";
+    case GpuShBlurUploadPbo: return "pbo";
+    case GpuShBlurUploadClient: break;
+    }
+    return "client";
+}
+
+GpuShBlurUploadMode gpuPreviewProcessingShBlurUploadMode(void)
+{
+    return gpuPreviewProcessingShBlurUploadModeFromValue(
+        qEnvironmentVariable(gpuPreviewProcessingShBlurUploadModeSwitchName()));
+}
+
+namespace
+{
+/* One gpu_present_event line whenever the steady upload mode differs from the last one
+ * logged, so a leg's records name the mode it ran (bench arms are env-only). */
+void noteShBlurUploadMode(GpuShBlurUploadMode mode)
+{
+    static std::atomic<int> lastLogged{-1};
+    if ( lastLogged.exchange(static_cast<int>(mode), std::memory_order_relaxed) == static_cast<int>(mode) ) return;
+    gpuPresentEventLogReconLine(
+        QStringLiteral("gpu_present_event kind=sh_blur_upload_mode mode=%1")
+            .arg(QString::fromLatin1(gpuPreviewProcessingShBlurUploadModeName(mode)))
+            .toLatin1().constData());
+}
+
+bool noteShBlurPboFallback(const char * why)
+{
+    static std::atomic<bool> logged{false};
+    if ( !logged.exchange(true, std::memory_order_relaxed) )
+    {
+        gpuPresentEventLogReconLine(
+            QStringLiteral("gpu_present_event kind=sh_blur_pbo_fallback reason=%1")
+                .arg(QString::fromLatin1(why)).toLatin1().constData());
+    }
+    return false;
+}
+
+/* PLAYBACK-GPU-EPISODIC-STALL-1 r2: the steady blur upload through a pixel unpack
+ * buffer. The buffer is orphaned (glBufferData with no data) before every map, so
+ * the map never waits for the previous frame's transfer; the blur is packed straight
+ * into the mapping (no 2 MB QByteArray), and glTexSubImage2D sources offset 0 of the
+ * bound buffer. Returns false, with nothing uploaded and no buffer left bound, when
+ * the context cannot do it; the caller then uploads from client memory. */
+bool uploadShBlurThroughPbo(GpuPreviewProcessingLutTextureSet & set,
+                            const uint16_t * blurRgb16,
+                            int blurWidth,
+                            int blurHeight)
+{
+#ifndef GL_PIXEL_UNPACK_BUFFER
+#define GL_PIXEL_UNPACK_BUFFER 0x88EC
+#endif
+#ifndef GL_STREAM_DRAW
+#define GL_STREAM_DRAW 0x88E0
+#endif
+#ifndef GL_MAP_WRITE_BIT
+#define GL_MAP_WRITE_BIT 0x0002
+#endif
+#ifndef GL_MAP_INVALIDATE_BUFFER_BIT
+#define GL_MAP_INVALIDATE_BUFFER_BIT 0x0008
+#endif
+    QOpenGLContext * context = QOpenGLContext::currentContext();
+    if ( !context ) return noteShBlurPboFallback("no_context");
+    const bool canMapRange = context->format().version() >= qMakePair(3, 0)
+        || ( !context->isOpenGLES() && context->hasExtension(QByteArrayLiteral("GL_ARB_map_buffer_range")) );
+    if ( !canMapRange ) return noteShBlurPboFallback("no_map_buffer_range");
+    QOpenGLExtraFunctions * gl = context->extraFunctions();
+    if ( !set.shadowsHighlightsBlurPbo )
+    {
+        GLuint pbo = 0;
+        gl->glGenBuffers(1, &pbo);
+        if ( !pbo ) return noteShBlurPboFallback("gen_buffers");
+        set.shadowsHighlightsBlurPbo = pbo;
+    }
+    const int pixelCount = blurWidth * blurHeight;
+    const GLsizeiptr bytes = static_cast<GLsizeiptr>(pixelCount) * 4 * static_cast<GLsizeiptr>(sizeof(uint16_t));
+    gl->glBindBuffer(GL_PIXEL_UNPACK_BUFFER, set.shadowsHighlightsBlurPbo);
+    gl->glBufferData(GL_PIXEL_UNPACK_BUFFER, bytes, nullptr, GL_STREAM_DRAW);
+    void * mapped = gl->glMapBufferRange(GL_PIXEL_UNPACK_BUFFER, 0, bytes,
+                                         GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
+    if ( !mapped )
+    {
+        gl->glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+        return noteShBlurPboFallback("map_failed");
+    }
+    packRgb16Into(static_cast<uint16_t *>(mapped), blurRgb16, pixelCount);
+    if ( gl->glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER) != GL_TRUE )
+    {
+        gl->glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+        return noteShBlurPboFallback("unmap_lost");
+    }
+    set.shadowsHighlightsBlur->bind();
+    gl->glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, blurWidth, blurHeight, GL_RGBA, GL_UNSIGNED_SHORT, nullptr);
+    set.shadowsHighlightsBlur->release();
+    gl->glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+    return true;
+}
+}
+
 bool gpuPreviewProcessingUpdateShadowsHighlightsBlurTexture(
     GpuPreviewProcessingLutTextureSet & set,
     const GpuPreviewProcessingConfig & config,
@@ -3013,9 +3145,8 @@ bool gpuPreviewProcessingUpdateShadowsHighlightsBlurTexture(
         return failClosed();
     }
 
-    const QByteArray packed = packRgb16Texture(
-        reinterpret_cast<const uint16_t *>(config.shadowsHighlightsBlur.constData()),
-        blurWidth * blurHeight);
+    const uint16_t * blurRgb16 =
+        reinterpret_cast<const uint16_t *>(config.shadowsHighlightsBlur.constData());
 
     // PLAYBACK-GL-PRESENT-SETUP-STALL-1 (row R3, F-c1): the steady-state upload, into the
     // texture an earlier call created at this exact size and format, takes no glGetError.
@@ -3028,12 +3159,29 @@ bool gpuPreviewProcessingUpdateShadowsHighlightsBlurTexture(
     // upload again (drained and checked below).
     if ( !allocatedThisCall )
     {
-        const double steadyUploadStartMs = spanMs();
-        set.shadowsHighlightsBlur->setData(QOpenGLTexture::RGBA, QOpenGLTexture::UInt16, packed.constData());
-        if ( setupTiming ) setupTiming->blur_upload_ms += spanMs() - steadyUploadStartMs;
+        // PLAYBACK-GPU-EPISODIC-STALL-1 r2: the ~250 ms GUI-thread block sits inside this
+        // client-memory upload (Bachelor r1 attribution); the mode picks how it is done.
+        // Client keeps the pre-r2 span (the setData call alone); Pbo's span is the whole
+        // steady upload (map, pack, unmap, glTexSubImage2D); Skip adds nothing. The one
+        // client-memory setData below serves Client and a Pbo that could not be set up.
+        const GpuShBlurUploadMode mode = gpuPreviewProcessingShBlurUploadMode();
+        noteShBlurUploadMode(mode);
+        double steadyUploadStartMs = spanMs();
+        const bool uploadedThroughPbo = mode == GpuShBlurUploadPbo
+            && uploadShBlurThroughPbo(set, blurRgb16, blurWidth, blurHeight);
+        // GpuShBlurUploadSkip: MEASUREMENT ONLY, the texture keeps its allocation-time blur.
+        if ( mode != GpuShBlurUploadSkip && !uploadedThroughPbo )
+        {
+            const QByteArray packed = packRgb16Texture(blurRgb16, blurWidth * blurHeight);
+            if ( mode == GpuShBlurUploadClient ) steadyUploadStartMs = spanMs();
+            set.shadowsHighlightsBlur->setData(QOpenGLTexture::RGBA, QOpenGLTexture::UInt16, packed.constData());
+        }
+        if ( mode != GpuShBlurUploadSkip && setupTiming ) setupTiming->blur_upload_ms += spanMs() - steadyUploadStartMs;
         set.shadowsHighlightsBlurReady = true;
         return true;
     }
+
+    const QByteArray packed = packRgb16Texture(blurRgb16, blurWidth * blurHeight);
 
     // The (re)allocation upload keeps the FAIL CLOSED discipline of
     // gpuPreviewProcessingUpdateLutTextureSet (GPU-TEXNR-S1-DARK-GREEN-1): drain any

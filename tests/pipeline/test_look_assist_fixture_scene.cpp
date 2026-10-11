@@ -212,9 +212,10 @@ TEST(LookAssistFixtureScene, HeadlessLookAssistSolvesDaylightWhiteBalanceFromThe
             QFile log_file( log_path );
             ASSERT_TRUE( log_file.open( QIODevice::ReadOnly | QIODevice::Text ) );
             const QByteArray log = log_file.readAll();
-            // LOOK-ASSIST-DUALISO-VSTRIPES-1: de-striped large f5/f10/f15 fall back (initial patch unverified); DEBT -> LOOK-ASSIST-LARGE-F5-PATCH-UNVERIFIED-1
-            const bool unverifiedFallbackFrame =
-                &clip == &kTrackedFixtureClips[1] && ( frame == 5 || frame == 10 || frame == 15 );
+            // LOOK-ASSIST-LARGE-F5-PATCH-UNVERIFIED-1: large f5/f10 are verified now (chroma 0 -> 1 at the solution, strictly
+            // neutral there). Large f15 still falls back: its surface at the solution (5930 K / 6) is chroma 2, B-R +2.0, G 0.0,
+            // on the |axis| < 2 dead-band bar, so not strictly neutral; loosening further needs a hub ruling.
+            const bool unverifiedFallbackFrame = &clip == &kTrackedFixtureClips[1] && frame == 15;
             if( unverifiedFallbackFrame )
             {
                 ASSERT_TRUE( log.contains( "daylight_fallback_to_master" ) );
@@ -238,14 +239,18 @@ TEST(LookAssistFixtureScene, HeadlessLookAssistSolvesDaylightWhiteBalanceFromThe
             ASSERT_TRUE( receipt.tint() >= -35 );
             ASSERT_TRUE( receipt.tint() <= 10 );
             // LOOK-ASSIST-DUALISO-VSTRIPES-1: was > 6000 (6540 at the tint clamp); stripes no longer run on dual-ISO frames.
-            ASSERT_TRUE( receipt.temperature() == 5840 );
+            // LOOK-ASSIST-LARGE-F5-PATCH-UNVERIFIED-1: large f5 / f10 measured at HEAD 5810 K / tint 6 and 5870 K / tint 7.
+            const bool largeClip = &clip == &kTrackedFixtureClips[1];
+            const int expectedTemperature = !largeClip || frame == 0 ? 5840 : frame == 5 ? 5810 : 5870;
+            const double expectedRenderTint = largeClip && frame == 10 ? 0.095262411 : 0.072738558;
+            ASSERT_TRUE( receipt.temperature() == expectedTemperature );
             // Not the night rescue (+174): a daylight lift, bounded by the Shade preset.
             ASSERT_TRUE( receipt.exposure() > 0 );
             ASSERT_TRUE( receipt.exposure() <= 180 );
             // The solved balance reached the pipeline (tint is stored through the non-linear render curve).
             ASSERT_NEAR( static_cast<double>( receipt.temperature() ), fixture.processing()->kelvin, 0.0001 );
             // LOOK-ASSIST-DUALISO-VSTRIPES-1: was < 0.0 (tint -35); the solve is tint +6; stripes no longer run on dual-ISO frames.
-            ASSERT_TRUE( std::fabs( fixture.processing()->wb_tint - 0.072738558 ) < 1e-9 );
+            ASSERT_TRUE( std::fabs( fixture.processing()->wb_tint - expectedRenderTint ) < 1e-9 );
 
             // The PICTURE: the deck (a near-neutral surface) is closer to neutral than at the base
             // balance (6000 K, tint 0) and than the damped solve master produced (8594 K, tint -23).

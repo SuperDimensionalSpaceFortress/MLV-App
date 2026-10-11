@@ -130,7 +130,7 @@ class FoldCadenceStepTests(CadenceWorld):
         self.assertEqual(v['evaluatedAtUtc'][:19], '2026-10-10T12:00:00')
         self.assertGreaterEqual(v['elapsedSec'], 0)
         self.assertEqual(sorted(v), sorted([
-            'schema', 'owedCount', 'oldestOwedCommitUtc', 'oldestOwedAgeHours', 'ackedSha', 'ackedAtUtc', 'lastFoldUtc',
+            'schema', 'owedCount', 'oldestOwedCommitUtc', 'oldestOwedAgeHours', 'busFetch', 'ackedSha', 'ackedAtUtc', 'lastFoldUtc',
             'lastFoldAgeHours', 'dueFold', 'reason', 'evaluatedAtUtc', 'elapsedSec']))
         # The step also returns the verdict to its caller.
         self.assertIn('dueFold', stdout)
@@ -142,6 +142,16 @@ class FoldCadenceStepTests(CadenceWorld):
         self.assertEqual(argv[argv.index('--since') + 1], SHA)
         self.assertEqual(argv[argv.index('--bus') + 1], str(self.tmp))
         self.assertLessEqual(float(argv[argv.index('--git-timeout') + 1]), 10.0)
+        # DOCTRINE-BUS-CLONE-CURRENT-1: the recall tool fetches first; its fetch gets a slice of the deadline, never more than 30 s.
+        self.assertLessEqual(float(argv[argv.index('--fetch-timeout') + 1]), 30.0)
+        self.assertLess(float(argv[argv.index('--fetch-timeout') + 1]) + float(argv[argv.index('--git-timeout') + 1]), 30)
+
+    def test_the_recall_tools_fetch_status_is_carried_into_the_verdict(self):
+        payload = {'count': 1, 'commits': [commit('a' * 40, OLD_COMMIT)], 'fetch': 'FETCH_FAILED timeout after 12 s'}
+        code, v, _ = self.step(self.fake_recall(f'print({json.dumps(payload)!r})\n'))
+        self.assertEqual((code, v['busFetch'], v['dueFold']), (0, 'FETCH_FAILED timeout after 12 s', True))
+        code, v, _ = self.step(self.fake_debt([commit('a' * 40, OLD_COMMIT)]))  # a recall that reports nothing: unknown, not ok
+        self.assertIsNone(v['busFetch'])
 
     def test_no_owed_is_not_due(self):
         code, v, _ = self.step(self.fake_debt([]))

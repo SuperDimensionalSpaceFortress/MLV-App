@@ -83,6 +83,29 @@ int recursiveBfMaxThreads()
     }();
     return max_threads;
 }
+
+// PLAYBACK-GPU-EPISODIC-STALL-1 r2: -1 follows MLVAPP_RBF_VERTICAL_TWO_THREAD_TEAM
+// (read once); 0 keeps the default-size team; 1 the pre-r2 two-thread team.
+std::atomic<int> g_two_thread_vertical_team_override(-1);
+
+bool recursiveBfTwoThreadVerticalTeam()
+{
+    const int override_mode = g_two_thread_vertical_team_override.load(std::memory_order_relaxed);
+    if( override_mode >= 0 ) return override_mode != 0;
+    static const bool env_enabled =
+        envFlagEnabled(std::getenv("MLVAPP_RBF_VERTICAL_TWO_THREAD_TEAM"));
+    return env_enabled;
+}
+}
+
+void recursive_bf_set_two_thread_vertical_team_override(int mode)
+{
+    g_two_thread_vertical_team_override.store(mode < 0 ? -1 : (mode ? 1 : 0), std::memory_order_relaxed);
+}
+
+int recursive_bf_two_thread_vertical_team_enabled(void)
+{
+    return recursiveBfTwoThreadVerticalTeam() ? 1 : 0;
 }
 
 void recursive_bf_set_parallel_vertical_override(int mode)
@@ -159,6 +182,7 @@ void recursive_bf_wrap_with_curve_index_lut(uint16_t * img_in,
         g_rbf_filter.reserveMemory( width, height, channel );
         g_rbf_filter.setTimingEnabled( recursiveBfDetailTimingEnabled() );
         g_rbf_filter.setParallelVertical( recursiveBfParallelVerticalEnabled() );
+        g_rbf_filter.setTwoThreadVerticalTeam( recursiveBfTwoThreadVerticalTeam() );
         g_rbf_filter.setMaxThreads( recursiveBfMaxThreads() );
         g_rbf_filter.filter( img_in,
                              img_out,

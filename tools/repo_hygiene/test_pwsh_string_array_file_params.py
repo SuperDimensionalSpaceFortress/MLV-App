@@ -51,8 +51,11 @@ NON-PROMISES (what this does NOT see):
 - Only the first column-0 ``param(`` of a file is read, so a function-level parameter is out of
   scope, and so is a script that nests its real param block in a here-string.
 - Pass-through parameters (``-AdditionalArgs`` and friends) cannot be fixed by splitting on a
-  comma, because their values may legitimately contain commas. They are listed in KNOWN_OPEN with
-  the reason and are asserted to still be violations, so the list cannot go stale.
+  comma, because their values may legitimately contain commas. The two that tracked docs drove through
+  ``-File`` (PWSH-FILE-ARRAY-PASSTHRU-1) now refuse a stray token instead of misbinding it
+  (``PASS_THROUGH_FAIL_LOUD``: ``PositionalBinding = $false``, proved by ``pwsh`` and by a revert), and
+  the docs show a form that binds. A pass-through param still open goes in KNOWN_OPEN, which is asserted
+  to still be violations so the list cannot go stale.
 - tools/hooks/* is out of scope (read-only for this guard).
 
 Collected by ``unittest discover -s tools/repo_hygiene -p "test_*.py" -t .``; no workflow names it.
@@ -62,6 +65,7 @@ from __future__ import annotations
 
 import functools
 import re
+import shutil
 import subprocess
 import time
 import unittest
@@ -80,26 +84,15 @@ MAX_COMMA_JOIN = 60
 
 # (script path, parameter) -> why splitting does not apply and where the follow-up lives.
 # Each entry is asserted to STILL be a violation: fix the script or its caller, then delete it.
-KNOWN_OPEN: dict[tuple[str, str], str] = {
-    ("tools/profiling/run-release-gui-smoke.ps1", "ExtraEnvironment"): (
-        "docs/04-external-auditor-guide.md:504 documents `-ExtraEnvironment @('KEY=VALUE')` with ONE element, which "
-        "expands to one token and binds correctly; the guard flags the `@(...)` literal because it cannot count "
-        "elements. Observed under pwsh 7.6.6 (`pwsh -File`, `@(...)` expanded by the calling shell): with two elements the "
-        "second does NOT reach $UnrecognizedArguments, because ValueFromRemainingArguments only takes tokens no positional "
-        "parameter claims; it binds positionally to ExePath and the unrecognized-arguments gate passes without throwing. "
-        "A third lands on the [double] -Seconds and fails type conversion at bind time. Pass-through values may hold "
-        "commas, so a comma split is not the fix; follow-up PWSH-FILE-ARRAY-PASSTHRU-1 (queued in the hub card queue): "
-        "fail loud or pass base64 JSON."
-    ),
-    ("tools/profiling/run-release-playback-profile.ps1", "AdditionalArgs"): (
-        "docs/14-performance-benchmarking.md:544-551 documents `-AdditionalArgs @('--stage-log', ..., '--raw-cache-mb', "
-        "...)`, six elements. Observed under pwsh 7.6.6 (`pwsh -File`, `@(...)` expanded by the calling shell): the six "
-        "tokens bind as the first to -AdditionalArgs, the second positionally to ExePath (the stage-log path), and the "
-        "other four (`--raw-cache-mb 128 --cache-cpu-cores 4`) land silently in $args (no [CmdletBinding()] and no "
-        "ValueFromRemainingArguments, so nothing throws at bind time); the failure of that example, if any, comes later "
-        "when the script resolves ExePath. A two-element list binds the second element to ExePath the same way. Same "
-        "follow-up PWSH-FILE-ARRAY-PASSTHRU-1."
-    ),
+KNOWN_OPEN: dict[tuple[str, str], str] = {}
+
+# script path -> the pass-through parameters (values may hold commas, so no comma split) it now guards by refusing the
+# extra tokens that `pwsh -File x.ps1 -P 'a','b'` produces. Before PWSH-FILE-ARRAY-PASSTHRU-1 run-release-gui-smoke.ps1 bound
+# the second token positionally to ExePath and run-release-playback-profile.ps1 dropped it into $args (a third landed on
+# the [double] -Seconds and failed type conversion), so a two-element list was silently misread. Observed under pwsh 7.6.
+PASS_THROUGH_FAIL_LOUD: dict[str, tuple[str, ...]] = {
+    "tools/profiling/run-release-gui-smoke.ps1": ("ExtraEnvironment", "AdditionalArgs"),
+    "tools/profiling/run-release-playback-profile.ps1": ("AdditionalArgs", "ExtraEnvironment"),
 }
 
 # (script path, parameter) -> why the parameter is a list that is deliberately NOT comma-joined, so its split is
@@ -588,6 +581,19 @@ def _comma_value(cmd: str, name: str) -> str | None:
 def embedded_launchers(text: str) -> list[str]:
     """Bodies of single-quoted here-strings that are themselves scripts (they start with ``param(``)."""
     return re.findall(r"@'\r?\n(\s*(?:\[CmdletBinding\(\)\]\s*)?param\(.*?)\r?\n'@", text, re.S | re.I)
+
+
+def refuses_stray_tokens(script: str) -> bool:
+    """True when the script's own param block sits under ``[CmdletBinding(PositionalBinding = $false)]``.
+
+    Without it a token no named parameter claims binds to the next free positional parameter (or falls into ``$args``),
+    so ``-File x.ps1 -P 'a','b'`` misreads the second element silently. With it the token is a bind-time error, or
+    lands in a ``ValueFromRemainingArguments`` parameter the script throws on.
+    """
+    clean = _blank_comments(script, literals=True)
+    m = re.search(r"(?im)^param\s*\(", clean)
+    head = clean[: m.start()] if m else ""
+    return re.search(r"\[CmdletBinding\([^)]*\bPositionalBinding\s*=\s*\$false\b[^)]*\)\]", head, re.I) is not None
 
 
 def validateset_string_arrays(script: str, params: list[tuple[str, int, int]] | None = None) -> list[str]:
@@ -1344,19 +1350,43 @@ class PwshStringArrayFileParams(unittest.TestCase):
         files = {"tools/x/enc.ps1": plain, "docs/how.md": "pwsh -File tools/x/enc.ps1 -Codecs a,b\n"}
         self.assertEqual([], self._flagged(files))
 
-    def test_known_open_reasons_describe_what_the_callee_really_does(self):
+    def test_pass_through_scripts_refuse_a_stray_token_in_the_tree(self):
         files = _live_files()
-        gui, profile = (KNOWN_OPEN[("tools/profiling/" + n, p)] for n, p in (
-            ("run-release-gui-smoke.ps1", "ExtraEnvironment"), ("run-release-playback-profile.ps1", "AdditionalArgs")))
-        self.assertIn("ONE element", gui)
-        self.assertIn("ValueFromRemainingArguments", files["tools/profiling/run-release-gui-smoke.ps1"])
-        self.assertIn("binds positionally to ExePath", gui)
-        self.assertNotIn("the script throws", gui)
-        self.assertIn("positionally", profile)
-        self.assertIn("$args", profile)
-        self.assertNotIn("CmdletBinding", files["tools/profiling/run-release-playback-profile.ps1"])
-        for reason in KNOWN_OPEN.values():
-            self.assertIn("PWSH-FILE-ARRAY-PASSTHRU-1", reason)
+        for path, params in PASS_THROUGH_FAIL_LOUD.items():
+            with self.subTest(script=path):
+                self.assertTrue(refuses_stray_tokens(files[path]), f"{path} lost [CmdletBinding(PositionalBinding = $false)]")
+                declared = {name for name, _line, _end in script_string_array_params(files[path])}
+                self.assertLessEqual(set(params), declared, f"{path} no longer declares {params}: update PASS_THROUGH_FAIL_LOUD")
+                # They stay uncredited on purpose (a comma split would corrupt a value), so no -File array caller may return.
+                for name in params:
+                    caller = {"docs/how.md": f"pwsh -File {path} -{name} @('a','b')\n"}
+                    self.assertIn((path, name), self._flagged({path: files[path], **caller}))
+
+    def test_red_pass_through_script_without_positional_binding_off_is_not_credited(self):
+        script = "[CmdletBinding()]\nparam(\n    [string]$Exe = '',\n    [string[]]$AdditionalArgs = @()\n)\n"
+        self.assertFalse(refuses_stray_tokens(script))
+        self.assertFalse(refuses_stray_tokens("param(\n    [string[]]$AdditionalArgs\n)\n# [CmdletBinding(PositionalBinding = $false)]\n"))
+        self.assertFalse(refuses_stray_tokens("# [CmdletBinding(PositionalBinding = $false)]\nparam(\n    [string[]]$AdditionalArgs\n)\n"))
+        self.assertTrue(refuses_stray_tokens(script.replace("[CmdletBinding()]", "[CmdletBinding(PositionalBinding = $false)]")))
+        live = _live_files()
+        for path in PASS_THROUGH_FAIL_LOUD:
+            reverted = live[path].replace("[CmdletBinding(PositionalBinding = $false)]", "")
+            self.assertFalse(refuses_stray_tokens(reverted), path)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_pass_through_scripts_refuse_the_second_token_of_an_array_over_pwsh_file(self):
+        # What `pwsh -File x.ps1 -AdditionalArgs @('a','b')` delivers is two tokens. Binding happens before the body
+        # runs, so this starts no app and touches no clip. The refusal is the bind error (profile) or the script's
+        # own UnrecognizedArguments throw (gui-smoke); neither names a path, a clip or an exe.
+        for path in PASS_THROUGH_FAIL_LOUD:
+            with self.subTest(script=path):
+                run = subprocess.run(
+                    ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(REPO_ROOT / path), "-AdditionalArgs", "a", "b"],
+                    capture_output=True, text=True, timeout=120, cwd=str(REPO_ROOT),
+                )
+                out = run.stdout + run.stderr
+                self.assertNotEqual(0, run.returncode, out)
+                self.assertRegex(out, r"positional parameter cannot be found that accepts argument 'b'|Unrecognized or removed argument\(s\): b\b")
 
     def test_live_top_level_validateset_script_is_seen(self):
         path = "tools/profiling/invoke-ultramagnus-cdng-export-evidence.ps1"

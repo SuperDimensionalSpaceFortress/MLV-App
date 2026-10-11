@@ -61,6 +61,16 @@ receipt oracle and refuses to believe a receipt that does not carry the oracle's
   run, and every delete demands a creator-recorded ownership proof; OWNER-FOOTAGE-NO-HARDLINK-1/-2, PR #214, which
   superseded the closed UM-OWNER-FOOTAGE-CROSS-VOLUME-2). Switched off, an owner leg refuses with
   `OWNER_CLIP_REFUSED_PENDING_CROSS_VOLUME_2` (the token is kept for that case).
+  **Blanket consent (VENUE-CLIP-CONSENT-BLANKET-1).** The owner's sentence of 2026-10-11 (ledger stamp
+  `2026-10-11T03:41:42Z`: "You have my blanket permission to use any MLV clip you like going forward. No need to ask for
+  permission", no final period) is recorded as the ONE blanket record in the consent file's top-level `blanketRecords`
+  (exactly `kind`, `ownerSentence`, `ownerSentenceSha256`, `recordedUtc`, `recordedBy: owner`, `writtenBy: owner`, `source`,
+  `scope: "any clip id, any venue"`). It admits any well-formed clip id on any venue in the table, after the per-clip records
+  are checked first; every other rule stands (committed at `HEAD` only, no path, fixtures refused, the cleanup switch). The
+  runner pins the sentence's sha256 (`48dc8dea...9fd6`), so a changed sentence, a non-owner writer or a path makes the WHOLE
+  file invalid (`VENUE_CLIP_CONSENT_INVALID`: it admits nothing, there is no fallback to admit). A blanket-admitted leg's
+  receipt says `admission.consentKind = blanket` and `admission.consentSha256Prefix` (a per-clip admission says `clip`), and
+  `Test-DvReceiptValid` re-derives it from the committed blanket record.
   `tools/repo_hygiene/test_dual_venue_owner_footage_gate.py` binds the switch to the guard tests that justify it (it may read
   true only while each named guard test is still defined and not skipped) and censuses the delete / move primitives of the
   sources an owner leg runs. The file

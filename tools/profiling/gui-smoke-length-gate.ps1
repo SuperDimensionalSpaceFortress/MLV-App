@@ -610,6 +610,54 @@ function Test-GuiSmokeProfileModeAdmitsPlay {
     return $result
 }
 
+function Get-GuiSmokeConformPaceProof {
+    <#
+    .SYNOPSIS
+    HFR-CONFORM-AWARE-RECEIPT-ORACLES-1. Did the run PROVE it was conformed? PLAYBACK-HFR-CONFORM-DEFAULT-1 plays a clip above 30 fps
+    as slow motion at the conform target, so the engine's pace_fps is the conform rate, not the clip's native fps, and the native-pace
+    rule of the source-frame oracle would reject every conformed run. The pace rule is relaxed ONLY on proof; proof is a PRESENT
+    `playback_smoke.conform` line for the MEASURED session (-SummarySession) with conform_active=1, clip_fps within 0.5 % of native_fps,
+    playback_fps > 0 and within 0.5 % of pace_fps, and playback_fps not above clip_fps (conform never speeds a clip up).
+    Absent, malformed, inactive, another session's, or inconsistent -> proven=$false and `reason` says why (absence never helps).
+    The 20 s floor is NOT touched here. Same decision as Get-AttrCudaConformAwareSourceFramesVerdict (AttrCudaArtifacts.psm1) and
+    Get-DvConformPaceProof (DualVenueRunner.psm1); a parity test executes all three on one table.
+    Returns [pscustomobject]@{ proven; reason; present; session; clipFps; playbackFps }.
+    #>
+    param([AllowNull()][AllowEmptyString()][string]$ConformLine, [AllowNull()][string]$SummarySession, $NativeFps, $PaceFps)
+    $out = [pscustomobject]@{ proven = $false; reason = ''; present = $false; session = $null; clipFps = $null; playbackFps = $null }
+    if ([string]::IsNullOrWhiteSpace($ConformLine)) { $out.reason = 'no playback_smoke.conform line for the run'; return $out }
+    $out.present = $true
+    $inv = [System.Globalization.CultureInfo]::InvariantCulture
+    $f = @{}
+    foreach ($m in [regex]::Matches($ConformLine, '(?<k>[A-Za-z0-9_]+)=(?<v>\S+)')) { $f[$m.Groups['k'].Value] = $m.Groups['v'].Value }
+    $num = { param($name) $d = 0.0; if ($f.ContainsKey($name) -and [double]::TryParse([string]$f[$name], [System.Globalization.NumberStyles]::Float, $inv, [ref]$d)) { $d } else { $null } }
+    $absent = @('session', 'clip_fps', 'playback_fps', 'conform_active' | Where-Object { $null -eq (& $num $_) })
+    if ($ConformLine -notmatch 'playback_smoke\.conform\s' -or $absent.Count -gt 0) {
+        $out.reason = "the playback_smoke.conform line is malformed (absent or unreadable: $($absent -join ' / '))"
+        return $out
+    }
+    $out.session = [string]$f['session']
+    $clip = [double](& $num 'clip_fps'); $play = [double](& $num 'playback_fps'); $active = [double](& $num 'conform_active')
+    $out.clipFps = $clip; $out.playbackFps = $play
+    $native = $null; $pace = $null
+    if ($null -ne $NativeFps) { $native = [double]$NativeFps }
+    if ($null -ne $PaceFps) { $pace = [double]$PaceFps }
+    if ([string]::IsNullOrWhiteSpace($SummarySession) -or $out.session -cne [string]$SummarySession) {
+        $out.reason = "the playback_smoke.conform line is for session $($out.session), not the measured session $SummarySession"
+    } elseif ($active -ne 1) {
+        $out.reason = "conform_active=$($f['conform_active']); the run was not conformed"
+    } elseif ($null -eq $native -or $native -le 0 -or $clip -le 0 -or [Math]::Abs($clip - $native) -gt (0.005 * $native)) {
+        $out.reason = "conform clip_fps=$clip does not match native_fps=$native"
+    } elseif ($null -eq $pace -or $pace -le 0 -or $play -le 0 -or [Math]::Abs($play - $pace) -gt (0.005 * $pace)) {
+        $out.reason = "conform playback_fps=$play does not match pace_fps=$pace"
+    } elseif ($play -gt ($clip * 1.005)) {
+        $out.reason = "conform playback_fps=$play is above clip_fps=$clip; conform never speeds a clip up"
+    } else {
+        $out.proven = $true
+    }
+    return $out
+}
+
 function Get-GuiSmokeSourceFramesVerdict {
     <#
     .SYNOPSIS
@@ -622,9 +670,14 @@ function Get-GuiSmokeSourceFramesVerdict {
     native_fps / pace_fps / fps_override is INVALID (RECEIPT_FIELD_ABSENT), not "no override" / "pace unchecked".
     ENFORCE-4 r2: the receipt must also be THIS run's (-ExpectedRunNonce, RECEIPT_NOT_THIS_RUN), and a PRESENT pace_fps <= 0 is
     INVALID (the engine's pace is unknown, so wall clock cannot be tied to footage).
-    Returns [pscustomobject]@{ invalid; failures; sourceAdvanced; requiredSourceFrames }.
+    HFR-CONFORM-AWARE-RECEIPT-ORACLES-1: -ConformLine is the run's `playback_smoke.conform` line. Only a PROVEN conform
+    (Get-GuiSmokeConformPaceProof) changes the pace rule -- pace_fps is then compared to the conform playback_fps instead of native_fps;
+    the 20 s floor (source_advanced >= required_source_frames >= ceil(20 s x native_fps)) is never relaxed. paceRule says which judged.
+    Returns [pscustomobject]@{ invalid; failures; sourceAdvanced; requiredSourceFrames; paceRule; conformPlaybackFps; conformClipFps }.
     #>
-    param([AllowNull()]$Summary, [AllowNull()][string]$ExpectedRunNonce = '')
+    param([AllowNull()]$Summary, [AllowNull()][string]$ExpectedRunNonce = '', [AllowNull()][AllowEmptyString()][string]$ConformLine = '')
+    $paceRule = 'native'
+    $conformProof = [pscustomobject]@{ proven = $false; reason = ''; present = $false; session = $null; clipFps = $null; playbackFps = $null }
     $failures = @()
     $nonceFailure = Get-GuiSmokeRunNonceFailure -Summary $Summary -ExpectedRunNonce $ExpectedRunNonce
     if ($null -ne $nonceFailure) { $failures += $nonceFailure }
@@ -663,14 +716,23 @@ function Get-GuiSmokeSourceFramesVerdict {
     }
     if ($null -ne $Summary -and $null -ne $paceFps -and [double]$paceFps -le 0) {
         $failures += "INVALID_SOURCE_FRAMES: pace_fps=$paceFps; a present engine pace that is not positive is unknown, so wall clock cannot be tied to the footage played."
-    } elseif ($null -ne $Summary -and $null -ne $nativeFps -and $null -ne $paceFps -and
-        [double]$nativeFps -gt 0 -and
-        [Math]::Abs([double]$paceFps - [double]$nativeFps) -gt (0.005 * [double]$nativeFps)) {
-        $failures += "INVALID_SOURCE_FRAMES: the engine paced at pace_fps=$paceFps but the clip's native fps is native_fps=$nativeFps; 20 s of wall clock is not 20 s of footage."
+    } elseif ($null -ne $Summary -and $null -ne $nativeFps -and $null -ne $paceFps -and [double]$nativeFps -gt 0) {
+        # HFR-CONFORM-AWARE-RECEIPT-ORACLES-1: only a PROVEN conform moves the pace comparison off the native fps.
+        $conformProof = Get-GuiSmokeConformPaceProof -ConformLine $ConformLine -SummarySession ([string](& $prop 'session')) -NativeFps $nativeFps -PaceFps $paceFps
+        if ($conformProof.proven) {
+            $paceRule = 'conform'
+            if ([Math]::Abs([double]$paceFps - [double]$conformProof.playbackFps) -gt (0.005 * [double]$conformProof.playbackFps)) {
+                $failures += "INVALID_SOURCE_FRAMES: the engine paced at pace_fps=$paceFps but the conformed playback_fps is $($conformProof.playbackFps); 20 s of wall clock is not 20 s of footage."
+            }
+        } elseif ([Math]::Abs([double]$paceFps - [double]$nativeFps) -gt (0.005 * [double]$nativeFps)) {
+            $why = if ($conformProof.present) { " (conform relaxation not applied: $($conformProof.reason))" } else { '' }
+            $failures += "INVALID_SOURCE_FRAMES: the engine paced at pace_fps=$paceFps but the clip's native fps is native_fps=$nativeFps; 20 s of wall clock is not 20 s of footage.$why"
+        }
     }
     return [pscustomobject]@{
         invalid = ($failures.Count -gt 0); failures = $failures
         sourceAdvanced = $advanced; requiredSourceFrames = $required
+        paceRule = $paceRule; conformPlaybackFps = $conformProof.playbackFps; conformClipFps = $conformProof.clipFps
     }
 }
 
@@ -693,9 +755,12 @@ function Get-GuiSmokeLoopVerdict {
         [bool]$LaunchOnlyProbe = $false,
         [int64]$ClipFrames = 0,
         # ENFORCE-4 r2: the per-run nonce THIS launch handed the app; the receipt must echo it (RECEIPT_NOT_THIS_RUN).
-        [AllowNull()][string]$ExpectedRunNonce = ''
+        [AllowNull()][string]$ExpectedRunNonce = '',
+        # HFR-CONFORM-AWARE-RECEIPT-ORACLES-1: the run's playback_smoke.conform line, handed on to the source-frame oracle.
+        [AllowNull()][AllowEmptyString()][string]$ConformLine = ''
     )
     $failures = @()
+    $paceRule = 'native'; $conformPlaybackFps = $null; $conformClipFps = $null
     $prop = { param($name) if ($null -ne $Summary -and $Summary.PSObject.Properties[$name]) { $Summary.$name } else { $null } }
     $wrapped = & $prop 'wrapped'
     $wrapCount = & $prop 'wrap_count'
@@ -732,10 +797,13 @@ function Get-GuiSmokeLoopVerdict {
             $failures += "INVALID_LOOPED: the app reports clip_seconds=$clipSeconds, under max($($script:GuiSmokeMinClipSeconds), window=$WindowSeconds)."
         }
         # ENFORCE-3: the source-frame oracle (source_advanced >= required_source_frames, native pace, no override).
-        $sourceFramesVerdict = Get-GuiSmokeSourceFramesVerdict -Summary $Summary -ExpectedRunNonce $ExpectedRunNonce
+        $sourceFramesVerdict = Get-GuiSmokeSourceFramesVerdict -Summary $Summary -ExpectedRunNonce $ExpectedRunNonce -ConformLine $ConformLine
         $failures += @($sourceFramesVerdict.failures)
+        $paceRule = $sourceFramesVerdict.paceRule
+        $conformPlaybackFps = $sourceFramesVerdict.conformPlaybackFps
+        $conformClipFps = $sourceFramesVerdict.conformClipFps
     }
-    return [pscustomobject]@{ invalid = ($failures.Count -gt 0); failures = $failures }
+    return [pscustomobject]@{ invalid = ($failures.Count -gt 0); failures = $failures; paceRule = $paceRule; conformPlaybackFps = $conformPlaybackFps; conformClipFps = $conformClipFps }
 }
 
 # ---------------------------------------------------------------------------------------------------
@@ -846,7 +914,9 @@ function Get-GuiSmokeEvidencePlayVerdict {
         # (an empty one is itself INVALID); -ReceiptPath / -LaunchedUtc (a profile receipt FILE) add the freshness layer.
         [AllowNull()][string]$ExpectedRunNonce = '',
         [string]$ReceiptPath = '',
-        [AllowNull()][object]$LaunchedUtc = $null
+        [AllowNull()][object]$LaunchedUtc = $null,
+        # HFR-CONFORM-AWARE-RECEIPT-ORACLES-1: the run's playback_smoke.conform line (absent = the native-pace rule, unchanged).
+        [AllowNull()][AllowEmptyString()][string]$ConformLine = ''
     )
     $failures = @()
     if (-not [string]::IsNullOrWhiteSpace($ReceiptPath)) {
@@ -871,7 +941,7 @@ function Get-GuiSmokeEvidencePlayVerdict {
             $failures += "PLAY_NOT_ADMITTED: programmatic_play_admitted=$($Summary.play_admitted) on a play-capable run; nothing was played, so there is no footage to prove."
         }
     }
-    $loop = Get-GuiSmokeLoopVerdict -Summary $Summary -WindowSeconds $WindowSeconds -ClipFrames $ClipFrames -ExpectedRunNonce $ExpectedRunNonce
+    $loop = Get-GuiSmokeLoopVerdict -Summary $Summary -WindowSeconds $WindowSeconds -ClipFrames $ClipFrames -ExpectedRunNonce $ExpectedRunNonce -ConformLine $ConformLine
     $failures += @($loop.failures)
     return [pscustomobject]@{ invalid = ($failures.Count -gt 0); failures = $failures; exitCode = 43; summary = $Summary }
 }

@@ -95,6 +95,8 @@ LOOKAHEAD_LEGS = ("legs/m16-1243-pace-cinematic-fullscreen-s4-la3.json",)
 HEAVY_LEGS = ("legs/m16-1243-pace-cinematic-fullscreen-s4-heavy.json",)
 # PLAYBACK-HFR-CONFORM-DEFAULT-1 added the conform legs on the 59.94 fps clip: the scale-1 display cells, cuda only (legsets/hfr-conform.json names them).
 HFR_CONFORM_LEGS = tuple(f"legs/m16-1456-conform-{mode}-s1.json" for mode in ("windowed", "fullscreen"))
+# CPU-DUALISO-REDUCED-ISO-NOTCH-1: cpu-only cinematic look legs at playbackProcessing receipt, the only legs that reach the CPU reduced dual-ISO recon.
+CPU_REDUCED_LEGS = tuple(f"legs/m16-1243-cpu-reduced-{mode}-s{scale}.json" for scale in (2, 4) for mode in ("fullscreen", "windowed"))
 # PLAYBACK-LJ92-DECODE-THROUGHPUT-1: the K=1 arm of the raw-uint16 prefetch decoder A/B, one twin per leg it pairs with (the other arm is the leg
 # itself at the app's default K=2). Each differs from its twin only in its legId and generatorArgs.rawPrefetchDecoders 1.
 DECODER_LEGS = {"legs/m16-1243-pace-cinematic-fullscreen-s4-dec1.json": "legs/m16-1243-pace-cinematic-fullscreen-s4.json",
@@ -104,7 +106,7 @@ SHIPPED_LEGS = ("legs/m16-1243-speed.json", "legs/m16-1243-look.json", "legs/m16
                 *LOOKAHEAD_LEGS, *HEAVY_LEGS, *DECODER_LEGS, "legs/m16-1243-look-scale2-cinematic.json", "legs/m16-1243-look-film.json",
                 "legs/m16-1243-look-scale2-film.json", *(f"legs/m16-1243-look-scale2-{flavor}-agxoff.json" for flavor in ("cinematic", "film")),
                 *(f"legs/m16-1243-display-{mode}-s{scale}-vsync1.json" for scale in (1, 2, 4) for mode in ("fullscreen", "windowed")),
-                *HFR_CONFORM_LEGS)
+                *HFR_CONFORM_LEGS, *CPU_REDUCED_LEGS)
 # PLAYBACK-VSYNC-DEFAULT-1: the swap-interval-1 twins of the six display-matrix legs (the vsync A/B; the originals stay at the app's default 0).
 VSYNC1_LEGS = tuple(rel.replace(".json", "-vsync1.json") for rel in DISPLAY_MATRIX_LEGS)
 # LOOK-ASSIST-FILM-FLAVOR-2 r2: the AgX-off twins of the scale-2 Cinematic and Film legs carry a committed look receipt (look-receipts/agx-off.marxml).
@@ -253,6 +255,11 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
     PLAYBACK_VSYNC_OPEN = "PLAYBACK-VSYNC-DEFAULT-1 >>>"
     PLAYBACK_VSYNC_CLOSE = "PLAYBACK-VSYNC-DEFAULT-1 <<<"
     PLAYBACK_VSYNC_REGIONS = 4
+    # HFR-CONFORM-AWARE-RECEIPT-ORACLES-1: the conform-aware source-frame verdict (Get-AttrCudaConformAwareSourceFramesVerdict, a wrapper that calls the unchanged baseline
+    # oracle). Three regions: the module-helper splice, the job's conform-line pick and its override call, and the three receipt fields. Absent from the baseline.
+    HFR_CONFORM_OPEN = "HFR-CONFORM-AWARE-RECEIPT-ORACLES-1 >>>"
+    HFR_CONFORM_CLOSE = "HFR-CONFORM-AWARE-RECEIPT-ORACLES-1 <<<"
+    HFR_CONFORM_REGIONS = 3
 
     @classmethod
     def strip_regions(cls, text: str) -> tuple[str, dict[str, int]]:
@@ -262,7 +269,8 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
                     "contact-sheet-parity": (cls.CONTACT_SHEET_PARITY_OPEN, cls.CONTACT_SHEET_PARITY_CLOSE),
                     "keepalive-hung-probe": (cls.KEEPALIVE_HUNG_PROBE_OPEN, cls.KEEPALIVE_HUNG_PROBE_CLOSE),
                     "session-locked": (cls.SESSION_LOCKED_OPEN, cls.SESSION_LOCKED_CLOSE),
-                    "playback-vsync": (cls.PLAYBACK_VSYNC_OPEN, cls.PLAYBACK_VSYNC_CLOSE)}
+                    "playback-vsync": (cls.PLAYBACK_VSYNC_OPEN, cls.PLAYBACK_VSYNC_CLOSE),
+                    "hfr-conform-oracles": (cls.HFR_CONFORM_OPEN, cls.HFR_CONFORM_CLOSE)}
         kept: list[str] = []
         inside: str | None = None
         counts = {name: 0 for name in families}
@@ -309,6 +317,8 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         self.assertEqual(old_counts["session-locked"], self.SESSION_LOCKED_REGIONS, "the baseline (the pinned KEEPALIVE-FAILURE-PUBLISH-LAST-1 generator commit) carries the same bracketed regions")
         self.assertEqual(new_counts["playback-vsync"], self.PLAYBACK_VSYNC_REGIONS, "the default job carries exactly the pinned number of bracketed PLAYBACK-VSYNC-DEFAULT-1 regions")
         self.assertEqual(old_counts["playback-vsync"], 0, "the baseline predates PLAYBACK-VSYNC-DEFAULT-1")
+        self.assertEqual(new_counts["hfr-conform-oracles"], self.HFR_CONFORM_REGIONS, "the default job carries exactly the pinned number of bracketed HFR-CONFORM-AWARE-RECEIPT-ORACLES-1 regions")
+        self.assertEqual(old_counts["hfr-conform-oracles"], 0, "the baseline predates HFR-CONFORM-AWARE-RECEIPT-ORACLES-1")
         self.assertEqual(stripped, old_stripped,
                          "the DEFAULT (bachelor/cuda) emitted job changed outside the bracketed regions -- it must stay byte-identical to the pinned baseline")
 
@@ -501,6 +511,23 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         self.assertIn("$gen['ForceLookAssist'] = $true; $gen['LookPaceLeg'] = $true", runner)
         self.assertIn("if ($spec.generatorArgs.PSObject.Properties['lookFlavor']) { $gen['LookFlavor'] = [string]$spec.generatorArgs.lookFlavor }", runner)
         self.assertIn("if ($spec.generatorArgs.PSObject.Properties['playbackRenderLookaheadFrames']) { $gen['PlaybackRenderLookaheadFrames'] = [int]$spec.generatorArgs.playbackRenderLookaheadFrames }", runner)
+        # CPU-DUALISO-REDUCED-ISO-NOTCH-1: a leg's playbackProcessing reaches the generator as -PlaybackProcessing.
+        self.assertIn("if ($spec.generatorArgs.PSObject.Properties['playbackProcessing']) { $gen['PlaybackProcessing'] = [string]$spec.generatorArgs.playbackProcessing }", runner)
+
+    def test_playback_processing_reaches_the_smoke_command_and_absent_changes_nothing(self) -> None:
+        """CPU-DUALISO-REDUCED-ISO-NOTCH-1: -PlaybackProcessing receipt adds exactly '-PlaybackProcessing receipt' to the smoke runner's command (it forwards
+        --playback-processing, so a cpu leg renders processed8 and reaches the CPU reduced dual-ISO recon); an absent argument emits the default job byte for byte."""
+        default = self.generate(GENERATOR, "pp-default.job.ps1", ["-Backend", "cpu", "-ContactSheet", "-ContactSheetFrames", "4"])
+        receipt = self.generate(GENERATOR, "pp-receipt.job.ps1", ["-Backend", "cpu", "-ContactSheet", "-ContactSheetFrames", "4", "-PlaybackProcessing", "receipt"])
+        self.assertEqual(self.parse_errors(receipt), 0)
+        self.assertNotIn("-PlaybackProcessing", default.read_text(encoding="utf-8"))
+        text = receipt.read_text(encoding="utf-8")
+        self.assertEqual(text.count("-UsePersistedPlaybackSettings -PlaybackProcessing receipt -RequireLookAssist:"), 1)
+        self.assertEqual(text.replace("-PlaybackProcessing receipt ", ""), default.read_text(encoding="utf-8"))
+        explicit_empty = self.generate(GENERATOR, "pp-empty.job.ps1", ["-Backend", "cpu", "-ContactSheet", "-ContactSheetFrames", "4", "-PlaybackProcessing", ""])
+        self.assertEqual(explicit_empty.read_bytes(), default.read_bytes(), "an empty -PlaybackProcessing is the default job, byte for byte")
+        schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
+        self.assertEqual(schema["properties"]["generatorArgs"]["properties"]["playbackProcessing"]["enum"], ["receipt", "subset"])
 
     def test_the_raw_prefetch_decoder_count_reaches_the_job_only_when_asked(self) -> None:
         """PLAYBACK-LJ92-DECODE-THROUGHPUT-1: generatorArgs.rawPrefetchDecoders maps to -RawPrefetchDecoders for any leg (not only a forced-look
@@ -652,8 +679,23 @@ def consent_record_line(venue: str, clip: str, line: str) -> dict:
     return dict(consent_record(venue, clip), ownerLine=line, ownerLineSha256=hashlib.sha256(line.encode()).hexdigest())
 
 
-def consent_file(*records: dict) -> dict:
-    return {"schema": "mlv-app/dual-venue-clip-consent/v1", "records": list(records)}
+def consent_file(*records: dict, blankets: list[dict] | None = None) -> dict:
+    doc = {"schema": "mlv-app/dual-venue-clip-consent/v1", "records": list(records)}
+    if blankets is not None:
+        doc["blanketRecords"] = list(blankets)
+    return doc
+
+
+# VENUE-CLIP-CONSENT-BLANKET-1: the owner's blanket sentence (ledger stamp 2026-10-11T03:41:42Z), byte-exact -- note: no final period.
+BLANKET_SENTENCE = "You have my blanket permission to use any MLV clip you like going forward. No need to ask for permission"
+BLANKET_SENTENCE_SHA256 = "48dc8dead951aa2eab911db63591b59d238830d2d98c0fd7df346c42b78f9fd6"   # a literal, never recomputed here
+
+
+def blanket_record(**overrides) -> dict:
+    """A blanket consent record exactly as the owner's sentence is recorded; overrides replace fields WITHOUT re-hashing (a forgery stays a forgery)."""
+    return dict({"kind": "blanket", "ownerSentence": BLANKET_SENTENCE, "ownerSentenceSha256": BLANKET_SENTENCE_SHA256,
+                 "recordedUtc": "2026-10-11T03:41:42Z", "recordedBy": "owner", "writtenBy": "owner",
+                 "source": "ledger 2026-10-11T03:41:42Z", "scope": "any clip id, any venue"}, **overrides)
 
 
 class RunnerHarness:
@@ -691,8 +733,8 @@ class RunnerHarness:
         self.stub_cfg = self.tmp / "stub.json"
         self.artifacts = self.share / "outbox" / "unit.artifacts"
 
-    def write_consent(self, *records: dict) -> None:
-        self.consent.write_text(json.dumps(consent_file(*records)), encoding="utf-8")
+    def write_consent(self, *records: dict, blankets: list[dict] | None = None) -> None:
+        self.consent.write_text(json.dumps(consent_file(*records, blankets=blankets)), encoding="utf-8")
 
     def write_spec(self, card: str = "DUAL-VENUE-EVIDENCE-1", clip: str = OWNER_CLIP, leg_type: str = "speed", play_seconds: int | None = 25,
                    flavor: str = "classic", scale: int = 4, accepted: dict | None = None, leg_id: str = "unit-leg", display_mode: str | None = None) -> Path:
@@ -1689,8 +1731,9 @@ class ReceiptRederivesTheTwentySecondFloorTests(ModuleMutationMixin, unittest.Te
         self.assertEqual(ps_problems(good_block()), [])
 
     def test_mutation_without_the_pace_check_a_fast_paced_run_is_valid(self) -> None:
-        anchor = "elseif ($null -ne $native -and $native -gt 0 -and [Math]::Abs($pace - $native) -gt (0.005 * $native)) {"
-        mutated = self.mutated_module([(anchor, "elseif ($false) {")])
+        # HFR-CONFORM-AWARE-RECEIPT-ORACLES-1: the native-pace arm now sits under the conform proof (the else of "a proven conform judges the pace").
+        anchor = "} elseif ([Math]::Abs($pace - $native) -gt (0.005 * $native)) {"
+        mutated = self.mutated_module([(anchor, "} elseif ($false) {")])
         self.assertEqual([p for p in ps_problems(good_block(paceFps=30.0), module=mutated) if "paced at" in p], [])
         self.assertNotEqual([p for p in ps_problems(good_block(paceFps=30.0)) if "paced at" in p], [])
 
@@ -1752,7 +1795,8 @@ class ProductionRepo:
     """A throwaway git repo holding a COPY of the dual-venue tree with the venue table and consent COMMITTED as given, so the
     runner is exercised exactly as production runs it (no test seam), against the committed-revision rule."""
 
-    def __init__(self, test: unittest.TestCase, records: list[dict], cleanup_gone: bool = False, mutations: list[tuple[str, str, str]] | None = None) -> None:
+    def __init__(self, test: unittest.TestCase, records: list[dict], cleanup_gone: bool = False, mutations: list[tuple[str, str, str]] | None = None,
+                 blankets: list[dict] | None = None) -> None:
         self.test = test
         tmp = tempfile.TemporaryDirectory(prefix="dve-prod-")
         test.addCleanup(tmp.cleanup)
@@ -1767,7 +1811,7 @@ class ProductionRepo:
         table = json.loads((self.dv / "venues.json").read_text(encoding="utf-8"))
         table["ownerFootage"]["cleanupClassGone"] = cleanup_gone
         (self.dv / "venues.json").write_text(json.dumps(table, indent=2) + "\n", encoding="utf-8", newline="\n")
-        self.write_consent(*records)
+        self.write_consent(*records, blankets=blankets)
         shutil.copyfile(COMPOSER, self.root / "tools" / "profiling" / "make-contact-sheet.py")   # the pair script's composer (a sibling of dual-venue/)
         shutil.copyfile(ROOT / "tools" / "profiling" / "gui-smoke-display-identity.ps1", self.root / "tools" / "profiling" / "gui-smoke-display-identity.ps1")   # the module's display-placement parser
         self.git("init", "-q")
@@ -1790,8 +1834,8 @@ class ProductionRepo:
     def head(self) -> str:
         return self.git("rev-parse", "HEAD")
 
-    def write_consent(self, *records: dict) -> None:
-        (self.dv / "venue-clip-consent.json").write_text(json.dumps(consent_file(*records), indent=2) + "\n", encoding="utf-8", newline="\n")
+    def write_consent(self, *records: dict, blankets: list[dict] | None = None) -> None:
+        (self.dv / "venue-clip-consent.json").write_text(json.dumps(consent_file(*records, blankets=blankets), indent=2) + "\n", encoding="utf-8", newline="\n")
 
     def blob(self, name: str) -> str:
         return self.git("rev-parse", f"HEAD:tools/profiling/dual-venue/{name}")
@@ -1803,6 +1847,179 @@ class ProductionRepo:
     def run(self, spec: Path, sha: str, build_sha: str, venue: str = "ultra-magnus", extra: list[str] | None = None) -> subprocess.CompletedProcess:
         return run_pwsh(["-File", str(self.dv / "Invoke-VenueLeg.ps1"), "-Venue", venue, "-LegSpec", str(spec), "-SourceCommit", sha,
                          "-BuildManifestSha256", build_sha, *(extra or [])])
+
+
+@requires_windows_pwsh
+class BlanketConsentTests(RunnerHarness, unittest.TestCase):
+    """VENUE-CLIP-CONSENT-BLANKET-1. OWNER RULING (ledger stamp 2026-10-11T03:41:42Z): the owner's blanket sentence admits any clip id on any
+    venue. ONE blanket record kind (consent file top-level `blanketRecords`); per-clip records stay valid and are checked first; the runner pins
+    the sentence's sha256, so a changed sentence, a non-owner writer, a path, or an uncommitted edit admits NOTHING."""
+
+    def setUp(self) -> None:
+        self.make_harness()
+        self.write_artifacts()
+
+    def assertRefusedBeforeSubmitting(self, receipt, submitted, token: str) -> None:
+        self.assertEqual(submitted, [], "a refused leg must not reach the venue at all")
+        self.assertEqual(self.generator_calls(), [], "a refused leg is not generated")
+        self.assertEqual(receipt["refusal"], token)
+        self.assertNotIn(receipt["outcome"], ("PASS", "FAIL"))
+
+    def test_the_verbatim_sentence_hash_is_pinned_as_a_literal_and_the_tracked_record_carries_it(self) -> None:
+        # (a) the literal, the sentence bytes (no final period, ASCII) and the tracked record all agree
+        self.assertEqual(hashlib.sha256(BLANKET_SENTENCE.encode("utf-8")).hexdigest(), BLANKET_SENTENCE_SHA256)
+        self.assertEqual(BLANKET_SENTENCE_SHA256, "48dc8dead951aa2eab911db63591b59d238830d2d98c0fd7df346c42b78f9fd6")
+        self.assertFalse(BLANKET_SENTENCE.endswith("."))
+        self.assertTrue(BLANKET_SENTENCE.isascii())
+        tracked = json.loads((DV / "venue-clip-consent.json").read_text(encoding="utf-8"))
+        self.assertEqual(tracked["blanketRecords"], [blanket_record()])
+        self.assertEqual(hashlib.sha256(tracked["blanketRecords"][0]["ownerSentence"].encode("utf-8")).hexdigest(), BLANKET_SENTENCE_SHA256)
+        # the runner pins the same literal, and the real tracked file parses with the real venue table
+        proc = _ps_json("$t = ConvertFrom-DvVenueTableText ([IO.File]::ReadAllText($env:DVE_TABLE))\n$c = Read-DvClipConsent -Text ([IO.File]::ReadAllText($env:DVE_CONSENT)) -Table $t\n"
+                        "Write-Output ('OK=' + $c.ok + ' ' + $c.reason + ' blankets=' + @($c.blankets).Count + ' records=' + @($c.records).Count)\n"
+                        "Write-Output ('PIN=' + (& (Get-Module DualVenueRunner) { $script:BlanketOwnerSentenceSha256 }))\n",
+                        DV / "DualVenueRunner.psm1", {"DVE_TABLE": str(DV / "venues.json"), "DVE_CONSENT": str(DV / "venue-clip-consent.json")})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn(f"OK=True  blankets=1 records={len(tracked['records'])}", proc.stdout)
+        self.assertIn(f"PIN={BLANKET_SENTENCE_SHA256}", proc.stdout)
+
+    def test_a_blanket_admits_an_unlisted_clip_on_both_venues_and_the_receipt_says_which_rule_admitted_it(self) -> None:
+        # (b)
+        self.write_consent(blankets=[blanket_record()])                   # NO per-clip record at all
+        for venue in ("ultra-magnus", "bachelor"):
+            for clip in (OWNER_CLIP, OTHER_CLIP):                         # (the stub job's own clip id is OWNER_CLIP, so only that one reaches PASS)
+                _, receipt, submitted = self.run_leg(venue, self.write_spec(clip=clip))
+                self.assertIsNone(receipt["refusal"], (venue, clip))
+                if clip == OWNER_CLIP:
+                    self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+                self.assertNotEqual(submitted, [], "an admitted leg reaches the venue")
+                self.assertEqual(receipt["admission"]["consentKind"], "blanket", (venue, clip))
+                self.assertEqual(receipt["admission"]["consentSha256Prefix"], BLANKET_SENTENCE_SHA256[:12])
+                self.assertEqual(receipt["admission"]["ownerLineSha256"], BLANKET_SENTENCE_SHA256)
+
+    def test_a_per_clip_record_is_still_checked_first_and_the_receipt_says_clip(self) -> None:
+        self.write_consent(consent_record("ultra-magnus", OWNER_CLIP), blankets=[blanket_record()])
+        _, receipt, _ = self.run_leg("ultra-magnus", self.write_spec())
+        self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+        self.assertEqual(receipt["admission"]["consentKind"], "clip")
+        self.assertEqual(receipt["admission"]["ownerLineSha256"], hashlib.sha256(f"CLIP ultra-magnus: {OWNER_CLIP}".encode()).hexdigest())
+
+    def test_without_a_blanket_the_unlisted_clip_is_still_refused(self) -> None:
+        self.write_consent(consent_record("ultra-magnus", OWNER_CLIP), blankets=[])
+        _, receipt, submitted = self.run_leg("ultra-magnus", self.write_spec(clip=OTHER_CLIP))
+        self.assertRefusedBeforeSubmitting(receipt, submitted, "VENUE_CLIP_CONSENT_ABSENT")
+
+    def test_a_blanket_never_admits_a_fixture_id_or_a_venue_with_the_cleanup_switch_off(self) -> None:
+        self.write_consent(blankets=[blanket_record()])
+        _, receipt, submitted = self.run_leg("ultra-magnus", self.write_spec(clip=FIXTURE_IDS[1]))
+        self.assertEqual(submitted, [])
+        self.assertTrue(str(receipt["refusal"]).startswith("FIXTURE_REFUSED_"), receipt["refusal"])
+        self.make_harness(cleanup_class_gone=False)
+        self.write_artifacts()
+        self.write_consent(blankets=[blanket_record()])
+        _, receipt, submitted = self.run_leg("ultra-magnus", self.write_spec(clip=OTHER_CLIP))
+        self.assertRefusedBeforeSubmitting(receipt, submitted, "OWNER_CLIP_REFUSED_PENDING_CROSS_VOLUME_2")
+
+    def test_a_one_character_change_to_the_sentence_refuses_and_admits_nothing(self) -> None:
+        # (c) -- with the stored hash left alone, and with the hash recomputed to match
+        changed = {
+            "a letter": BLANKET_SENTENCE.replace("any MLV clip", "any MLV clop"),
+            "a trailing period": BLANKET_SENTENCE + ".",
+            "a dropped word": BLANKET_SENTENCE.replace("blanket ", ""),
+        }
+        for name, sentence in changed.items():
+            for label, record in (("stale sha", blanket_record(ownerSentence=sentence)),
+                                  ("re-hashed", blanket_record(ownerSentence=sentence, ownerSentenceSha256=hashlib.sha256(sentence.encode("utf-8")).hexdigest()))):
+                # even WITH a valid per-clip record for the clip, the file is invalid: it fails loudly, no fallback to admit
+                self.write_consent(consent_record("ultra-magnus", OWNER_CLIP), blankets=[record])
+                _, receipt, submitted = self.run_leg("ultra-magnus", self.write_spec())
+                self.assertRefusedBeforeSubmitting(receipt, submitted, "VENUE_CLIP_CONSENT_INVALID")
+                self.write_consent(blankets=[record])
+                _, receipt, submitted = self.run_leg("bachelor", self.write_spec(clip=OTHER_CLIP))
+                self.assertRefusedBeforeSubmitting(receipt, submitted, "VENUE_CLIP_CONSENT_INVALID")
+
+    def test_a_blanket_written_by_anyone_other_than_the_owner_is_refused(self) -> None:
+        # (d)
+        for name, record in {"writtenBy hub": blanket_record(writtenBy="hub"), "writtenBy producer": blanket_record(writtenBy="producer"),
+                             "recordedBy hub": blanket_record(recordedBy="hub"), "writtenBy Owner": blanket_record(writtenBy="Owner")}.items():
+            self.write_consent(blankets=[record])
+            _, receipt, submitted = self.run_leg("ultra-magnus", self.write_spec(clip=OTHER_CLIP))
+            self.assertRefusedBeforeSubmitting(receipt, submitted, "VENUE_CLIP_CONSENT_INVALID")
+
+    def test_a_blanket_record_that_is_not_exactly_the_reviewed_shape_or_carries_a_path_is_refused(self) -> None:
+        # (e) -- drive-letter paths; the file-name branch of the path rule is pinned by the existing malformed-file test
+        path_sentence = BLANKET_SENTENCE + " C:/ledger/notes.txt"
+        cases = {
+            "an extra field with a path": dict(blanket_record(), note="C:/ledger/notes.txt"),
+            "a path in the sentence even re-hashed": blanket_record(ownerSentence=path_sentence, ownerSentenceSha256=hashlib.sha256(path_sentence.encode("utf-8")).hexdigest()),
+            "a path in the source": blanket_record(source="C:\\ledger"),
+            "a missing field": {k: v for k, v in blanket_record().items() if k != "writtenBy"},
+            "another scope": blanket_record(scope="this clip only"),
+            "another kind": blanket_record(kind="clip"),
+            "another source": blanket_record(source="ledger 2026-10-11T03:41:43Z"),
+            "no timestamp": blanket_record(recordedUtc="whenever"),
+        }
+        for name, record in cases.items():
+            self.write_consent(blankets=[record])
+            _, receipt, submitted = self.run_leg("ultra-magnus", self.write_spec(clip=OTHER_CLIP))
+            self.assertRefusedBeforeSubmitting(receipt, submitted, "VENUE_CLIP_CONSENT_INVALID")
+
+    def test_an_uncommitted_blanket_admits_nothing(self) -> None:
+        # (f) production reads the consent file ONLY as committed at HEAD
+        spec = self.write_spec(clip=OTHER_CLIP)
+        repo = ProductionRepo(self, records=[], cleanup_gone=True)
+        repo.write_consent(blankets=[blanket_record()])                       # a perfectly valid blanket -- but not committed
+        repo.run(spec, self.sha, "ab" * 32)
+        [receipt] = repo.receipts()
+        self.assertEqual(receipt["refusal"], "ADMISSION_SOURCE_DIRTY")
+        self.assertIsNone(receipt["evidence"]["umRunOutcome"], "nothing was submitted")
+        self.assertIsNone(receipt["admission"]["ownerLineSha256"])
+        self.assertIsNone(receipt["admission"]["consentKind"])
+        repo.git("add", "tools")                                              # staged is still not committed
+        repo.run(spec, self.sha, "ab" * 32)
+        self.assertEqual(repo.receipts()[-1]["refusal"], "ADMISSION_SOURCE_DIRTY")
+
+    def test_a_committed_blanket_admits_an_unlisted_clip_on_both_venues_in_production_admission(self) -> None:
+        repo = ProductionRepo(self, records=[], cleanup_gone=True, blankets=[blanket_record()])
+        proc = _ps_json(
+            f"$s = Resolve-DvAdmissionSources -RepoRoot '{repo.root}'\n$t = ConvertFrom-DvVenueTableText $s.tableText\n"
+            f"$a = Get-DvClipAdmission -ClipId '{OTHER_CLIP}' -Venue 'ultra-magnus' -Table $t -ConsentText $s.consentText -RepoRoot '{repo.root}'\n"
+            f"$b = Get-DvClipAdmission -ClipId '{OTHER_CLIP}' -Venue 'bachelor' -Table $t -ConsentText $s.consentText -RepoRoot '{repo.root}'\n"
+            f"$c = Get-DvClipAdmission -ClipId '{OTHER_CLIP}' -Venue 'laptop' -Table $t -ConsentText $s.consentText -RepoRoot '{repo.root}'\n"
+            "Write-Output ('UM=' + $a.admitted + ' ' + $a.consentKind + ' ' + $a.consentSha256Prefix + ' ' + $a.ownerLineSha256)\n"
+            "Write-Output ('B=' + $b.admitted + ' ' + $b.consentKind)\nWrite-Output ('LAPTOP=' + $c.admitted + ' ' + $c.reason)\n",
+            repo.dv / "DualVenueRunner.psm1", {})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn(f"UM=True blanket {BLANKET_SENTENCE_SHA256[:12]} {BLANKET_SENTENCE_SHA256}", proc.stdout)
+        self.assertIn("B=True blanket", proc.stdout)
+        self.assertIn("LAPTOP=False VENUE_CLIP_CONSENT_ABSENT", proc.stdout, "a venue the table does not have is not 'any venue'")
+
+    def test_the_runner_and_leg_script_never_write_the_blanket_record(self) -> None:
+        writers = re.compile(r"(Set-Content|Add-Content|Out-File|WriteAllText|WriteAllBytes|Remove-Item|Move-Item|Copy-Item|New-Item)[^\n]*(blanket|Blanket)", re.I)
+        for name in ("Invoke-VenueLeg.ps1", "DualVenueRunner.psm1"):
+            for line in (DV / name).read_text(encoding="utf-8").splitlines():
+                if not line.lstrip().startswith("#"):
+                    self.assertIsNone(writers.search(line), f"{name} must never write the blanket record: {line.strip()}")
+
+    # -- mutations: each rule's test must be able to fail ----------------------------------------------------------------
+    def test_mutation_without_the_pinned_sentence_hash_a_re_hashed_forgery_would_admit(self) -> None:
+        mutated = self.mutated_runner([("DualVenueRunner.psm1", "if ([string]$b.ownerSentenceSha256 -cne $script:BlanketOwnerSentenceSha256) {", "if ($false) {")])
+        forged = "You have my blanket permission to use any clip at all."
+        self.write_consent(blankets=[blanket_record(ownerSentence=forged, ownerSentenceSha256=hashlib.sha256(forged.encode("utf-8")).hexdigest())])
+        _, receipt, submitted = self.run_leg("ultra-magnus", self.write_spec(clip=OTHER_CLIP), dv=mutated)
+        self.assertNotEqual(submitted, [], "with the pin removed a re-hashed forgery admits -- so the pin is guarded")
+
+    def test_mutation_without_the_owner_check_a_hub_written_blanket_would_admit(self) -> None:
+        mutated = self.mutated_runner([("DualVenueRunner.psm1", "if ([string]$b.writtenBy -cne 'owner') {", "if ($false) {")])
+        self.write_consent(blankets=[blanket_record(writtenBy="hub")])
+        _, receipt, submitted = self.run_leg("ultra-magnus", self.write_spec(clip=OTHER_CLIP), dv=mutated)
+        self.assertNotEqual(submitted, [], "with the writtenBy check removed a hub-written blanket admits -- so the check is guarded")
+
+    def test_mutation_without_the_stored_hash_check_an_edited_sentence_would_admit(self) -> None:
+        mutated = self.mutated_runner([("DualVenueRunner.psm1", "if ((Get-DvSha256OfText ([string]$b.ownerSentence)) -cne [string]$b.ownerSentenceSha256) {", "if ($false) {")])
+        self.write_consent(blankets=[blanket_record(ownerSentence=BLANKET_SENTENCE + ".")])
+        _, receipt, submitted = self.run_leg("ultra-magnus", self.write_spec(clip=OTHER_CLIP), dv=mutated)
+        self.assertNotEqual(submitted, [], "with the sentence-vs-hash check removed an edited sentence admits -- so the check is guarded")
 
 
 @requires_windows_pwsh
@@ -2174,9 +2391,9 @@ class EvidenceFactory(RunnerHarness):
     """Builds evidence-bearing receipts. Mixed into a TestCase whose setUp calls make_harness()."""
 
     def prod_repo(self, venue: str = "ultra-magnus", records: list[dict] | None = None, cleanup_gone: bool = True, leg_type: str = "speed",
-                  spec: Path | None = None, mutations: list[tuple[str, str, str]] | None = None) -> ProductionRepo:
+                  spec: Path | None = None, mutations: list[tuple[str, str, str]] | None = None, blankets: list[dict] | None = None) -> ProductionRepo:
         recs = [consent_record(venue, OWNER_CLIP)] if records is None else records
-        repo = ProductionRepo(self, records=recs, cleanup_gone=cleanup_gone, mutations=mutations)
+        repo = ProductionRepo(self, records=recs, cleanup_gone=cleanup_gone, mutations=mutations, blankets=blankets)
         self.spec_path = spec or self.write_spec(leg_type=leg_type)
         repo.commit_leg(self.spec_path, "unit-leg.json")
         return repo
@@ -3131,6 +3348,29 @@ class NarrowedProductionReceiptsAndBoundBackendTests(EvidenceFactory, ModuleMuta
         self.expect(self.status_batch(other, [(foreign, None)])[0], "ADVISORY", "same history")
         other.git("checkout", "-q", "--detach", "HEAD~1")
         self.expect(self.status_batch(other, [(foreign, None)])[0], "INVALID", "other lane", "ADMISSION_COMMIT_NOT_IN_HISTORY")
+
+    def blanket_receipt(self, repo: ProductionRepo, ev: Path, **admission) -> dict:
+        receipt = self.receipt_for(repo, ev)
+        receipt["admission"].update(dict(ownerLineSha256=BLANKET_SENTENCE_SHA256, consentKind="blanket", consentSha256Prefix=BLANKET_SENTENCE_SHA256[:12]), **admission)
+        return receipt
+
+    def test_a_blanket_admitted_receipt_re_derives_from_the_committed_blanket_and_is_revoked_with_it(self) -> None:
+        repo = self.prod_repo(records=[], blankets=[blanket_record()])
+        ev = self.evidence("blanket")
+        receipt = self.blanket_receipt(repo, ev)
+        self.expect(self.status_batch(repo, [(receipt, None)])[0], "ADVISORY", "blanket in the committed blob")
+        # a kind or prefix that the blob does not back is not valid
+        self.assertNotValid(self.blanket_receipt(repo, ev, consentSha256Prefix="0" * 12), repo, "consentSha256Prefix is not the prefix", "INVALID")
+        self.assertNotValid(self.blanket_receipt(repo, ev, consentKind="whatever"), repo, "consentKind is neither clip nor blanket", "INVALID")
+        # a receipt that claims 'clip' over a blob holding only the blanket is not valid (no per-clip record)
+        self.assertNotValid(self.blanket_receipt(repo, ev, consentKind="clip", ownerLineSha256=hashlib.sha256(b"CLIP ultra-magnus: " + OWNER_CLIP.encode()).hexdigest(),
+                                                 consentSha256Prefix=""), repo, "CONSENT_NOT_IN_BLOB", "INVALID")
+        # once the blanket is gone from HEAD the receipt is stale
+        self.commit_consent(repo)
+        self.expect(self.status_batch(repo, [(receipt, None)])[0], "INVALID", "blanket revoked", "CONSENT_REVOKED")
+        # a repo whose blob has no blanket never backs a blanket receipt
+        empty = self.prod_repo(records=[])
+        self.assertNotValid(self.blanket_receipt(empty, ev), empty, "CONSENT_NOT_IN_BLOB", "INVALID")
 
     def test_mutation_without_the_history_and_revocation_checks_a_stale_receipt_is_advisory(self) -> None:
         mutated = self.mutated_module([("if ($anc.exitCode -ne 0) {", "if ($false) {"), ("if (-not $stillConsented) {", "if ($false) {")])
@@ -5201,6 +5441,11 @@ class LegSpecSchemaTests(unittest.TestCase):
             elif spec["card"] == "PLAYBACK-HFR-CONFORM-DEFAULT-1":   # the HFR conform legs: a scale-1 display cell on the 59.94 fps clip
                 self.assertEqual(spec["legId"], path.stem, path.name)
                 self.assertRegex(spec["legId"], r"^m16-1456-conform-(fullscreen|windowed)-s1$", path.name)
+            elif spec["card"] == "CPU-DUALISO-REDUCED-ISO-NOTCH-1":   # the cpu-only legs that engage the CPU reduced recon, named by their cell
+                self.assertEqual(spec["legId"], path.stem, path.name)
+                self.assertRegex(spec["legId"], r"^m16-1243-cpu-reduced-(fullscreen|windowed)-s[24]$", path.name)
+                self.assertEqual(spec["backends"], ["cpu"], path.name)
+                self.assertEqual(spec["generatorArgs"]["playbackProcessing"], "receipt", path.name)
             else:   # the scale-4 flavored look leg, or its scale-2 twin (LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1), or that twin's AgX-off copy (LOOK-ASSIST-FILM-FLAVOR-2 r2)
                 self.assertIn(spec["legId"], (f"m16-1243-look-{flavor}", f"m16-1243-look-scale2-{flavor}", f"m16-1243-look-scale2-{flavor}-agxoff"), path.name)
                 self.assertEqual(spec["legId"], path.stem, path.name)
@@ -5736,6 +5981,9 @@ class LookReceiptGeneratorTests(unittest.TestCase):
                 # PLAYBACK-VSYNC-DEFAULT-1's regions postdate the base generator: present in the new job only, at their pinned count.
                 self.assertEqual((new_counts.pop("playback-vsync"), old_counts.pop("playback-vsync")),
                                  (GeneratorByteIdentityAndVariantTests.PLAYBACK_VSYNC_REGIONS, 0), name)
+                # HFR-CONFORM-AWARE-RECEIPT-ORACLES-1's regions postdate the base generator too: present in the new job only, at their pinned count.
+                self.assertEqual((new_counts.pop("hfr-conform-oracles"), old_counts.pop("hfr-conform-oracles")),
+                                 (GeneratorByteIdentityAndVariantTests.HFR_CONFORM_REGIONS, 0), name)
                 self.assertEqual(new_counts, old_counts, f"{name}: the job without -LookReceiptPath carries the base generator's bracketed regions")
                 self.assertEqual(kept, old_kept, f"{name}: the job without -LookReceiptPath must be the base generator's bytes")
                 self.assertNotIn(b"LookReceipt", new)

@@ -379,6 +379,13 @@ param(
     [ValidateSet('fullscreen', 'windowed')]
     [string]$DisplayMode = 'fullscreen',
 
+    # CPU-DUALISO-REDUCED-ISO-NOTCH-1: the app's playback processing for the run, passed to the smoke runner as
+    # -PlaybackProcessing (it forwards --playback-processing). 'receipt' unchecks fast playback processing, so a cpu
+    # leg renders processed8 and the CPU reduced dual-ISO recon can engage; the smoke default is 'subset'. Empty (the
+    # default) adds nothing: the emitted job is the text it was before this parameter.
+    [ValidateSet('', 'receipt', 'subset')]
+    [string]$PlaybackProcessing = '',
+
     # PLAYBACK-VSYNC-DEFAULT-1: the GL swap interval every playback surface requests (passed to the app as MLVAPP_SWAP_INTERVAL, the
     # vsync A/B), any leg type. -1 (the default) sets nothing: the emitted job is the text it was before this parameter.
     [ValidateRange(-1, 1)][int]$SwapInterval = -1
@@ -894,6 +901,11 @@ $embeddedFunctions = $embeddedFunctions + "`r`n# UM-PRESENTMON-ORPHAN-SWEEP-1 >>
 $embeddedFunctions = $embeddedFunctions + "`r`n# VENUE-SESSION-LOCKED-REFUSAL-1 >>>`r`n" + (Get-AttrCudaEmbeddedFunctionSource -Name @(
     'Get-AttrCudaSessionLocked'
 )) +"`r`n# VENUE-SESSION-LOCKED-REFUSAL-1 <<<"
+# HFR-CONFORM-AWARE-RECEIPT-ORACLES-1: the conform-aware entry point to the source-frame oracle (it calls the embedded oracle above), spliced inside
+# its own sentinel brackets for the same byte-identity reason as the splices above.
+$embeddedFunctions = $embeddedFunctions + "`r`n# HFR-CONFORM-AWARE-RECEIPT-ORACLES-1 >>>`r`n" + (Get-AttrCudaEmbeddedFunctionSource -Name @(
+    'Get-AttrCudaConformAwareSourceFramesVerdict'
+)) +"`r`n# HFR-CONFORM-AWARE-RECEIPT-ORACLES-1 <<<"
 $smokeRunnerClosureDigest = Get-AttrCudaClosureDigestHex -Closure $smokeRunnerClosure
 if ($smokeRunnerClosureDigest -notmatch '^[0-9a-f]{64}$') {
     throw "ATTRCUDA_BLOB_SHA_MALFORMED smoke-runner closure digest is not 64 lowercase hex: '$smokeRunnerClosureDigest'"
@@ -3375,11 +3387,28 @@ foreach ($candidateLine in ($rawLog -split "`r?`n")) {
     }
 }
 $sourceFramesVerdict = Get-AttrCudaSourceFramesVerdict -SummaryLine $sourceFramesSummaryLine -ExpectedRunNonce $runLog.runNonce
+# HFR-CONFORM-AWARE-RECEIPT-ORACLES-1 >>>
+# The measured session's playback_smoke.conform line (the last one wins). Only a conform line the oracle can PROVE (active, this session, rates
+# consistent with the summary) moves the PACE rule off the native fps; absent = the verdict above stands. The 20 s floor is never relaxed.
+$sourceFramesConformLine = $null
+foreach ($candidateLine in ($rawLog -split "`r?`n")) {
+    if ($candidateLine -match ('playback_smoke\.conform session=' + [regex]::Escape([string]$measuredSmokeSessionId) + '(\s|$)')) {
+        $sourceFramesConformLine = $candidateLine
+    }
+}
+$sourceFramesVerdict = Get-AttrCudaConformAwareSourceFramesVerdict -SummaryLine $sourceFramesSummaryLine -ExpectedRunNonce $runLog.runNonce -ConformLine $sourceFramesConformLine
+# HFR-CONFORM-AWARE-RECEIPT-ORACLES-1 <<<
 $sourceFramesWrapped = [bool]$sourceFramesVerdict.wrapped
 $sourceFramesBlock = [ordered]@{
     oracle = 'source_advanced >= required_source_frames, wrapped=0, native pace, no fps override'
     sourceAdvanced = $sourceFramesVerdict.sourceAdvanced
     requiredSourceFrames = $sourceFramesVerdict.requiredSourceFrames
+    # HFR-CONFORM-AWARE-RECEIPT-ORACLES-1 >>>
+    # which rule judged the pace (native | conform: the oracle above is native-pace UNLESS the run proved it was conformed) and the conform line's rates
+    paceRule = $sourceFramesVerdict.paceRule
+    conformPlaybackFps = $sourceFramesVerdict.conformPlaybackFps
+    conformClipFps = $sourceFramesVerdict.conformSourceFps
+    # HFR-CONFORM-AWARE-RECEIPT-ORACLES-1 <<<
     wrapped = $sourceFramesWrapped
     failures = @($sourceFramesVerdict.failures)
 }
@@ -4101,6 +4130,10 @@ if ($hasLookReceipt) {
     $lookReceiptHasher = [System.Security.Cryptography.SHA256]::Create()
     try { $lookReceiptSha256 = ([BitConverter]::ToString($lookReceiptHasher.ComputeHash($lookReceiptBytes)) -replace '-', '').ToLowerInvariant() } finally { $lookReceiptHasher.Dispose() }
     $lookReceiptBase64 = [Convert]::ToBase64String($lookReceiptBytes)
+}
+if (-not [string]::IsNullOrWhiteSpace($PlaybackProcessing)) {
+    # CPU-DUALISO-REDUCED-ISO-NOTCH-1: only a job that asks for a playback processing mode carries it; every other job is unchanged.
+    $template = Edit-DualVenueTemplate $template '-UsePersistedPlaybackSettings ' ("-UsePersistedPlaybackSettings -PlaybackProcessing $PlaybackProcessing ")
 }
 $isCpuBackend = ($Backend -eq 'cpu')
 if ($isCpuBackend -and $DisablePaintPerSubmit) {
