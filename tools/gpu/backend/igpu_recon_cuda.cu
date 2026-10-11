@@ -1587,10 +1587,20 @@ int igpu_recon_set_clip(igpu_recon_backend* b, const igpu_recon_clip_t* clip)
 
     CK(cudaSetDevice(b->device));
 
-    /* (re)allocate device buffers sized to the clip */
-    reset_preupload_slots(b, 1);
-    free_retained_device_outputs(b);
-    free_clip_buffers(b);
+    /* The dual-ISO prepare re-derives black/white and the ISO pattern per
+     * frame, so the host calls set_clip at unchanged dims (M16-1456: every
+     * frame). Keep the buffers then: a retained output may still be read by
+     * the presenter's AMaZE, and freeing it is a device use-after-free
+     * (sticky 'illegal memory access'). Only new dims (re)allocate, and the
+     * host refuses those while a retained output is outstanding. */
+    const int same_dims = b->have_clip && b->d_out &&
+                          b->width == clip->width && b->height == clip->height;
+    if (!same_dims) {
+        b->have_clip = 0;
+        reset_preupload_slots(b, 1);
+        free_retained_device_outputs(b);
+        free_clip_buffers(b);
+    }
     b->width  = clip->width;
     b->height = clip->height;
     b->black  = clip->black_level;
@@ -1598,22 +1608,24 @@ int igpu_recon_set_clip(igpu_recon_backend* b, const igpu_recon_clip_t* clip)
     for (int i=0;i<4;i++) b->is_bright[i] = clip->is_bright[i];
 
     const size_t n = (size_t)b->width * (size_t)b->height;
-    CK(cudaMalloc(&b->d_in,      n*sizeof(uint16_t)));
-    CK(cudaMalloc(&b->d_out,     n*sizeof(uint16_t)));
-    CK(cudaMalloc(&b->d_alias,   n*sizeof(uint16_t)));
-    CK(cudaMalloc(&b->d_aliasaux,n*sizeof(uint16_t)));
-    CK(cudaMalloc(&b->d_over,    n*sizeof(uint16_t)));
-    CK(cudaMalloc(&b->d_overaux, n*sizeof(uint16_t)));
-    CK(cudaMalloc(&b->d_raw32,   n*sizeof(uint32_t)));
-    CK(cudaMalloc(&b->d_dark,    n*sizeof(uint32_t)));
-    CK(cudaMalloc(&b->d_bright,  n*sizeof(uint32_t)));
-    CK(cudaMalloc(&b->d_fullres, n*sizeof(uint32_t)));
-    CK(cudaMalloc(&b->d_halfres, n*sizeof(uint32_t)));
-    CK(cudaMalloc(&b->d_fullres_smooth, n*sizeof(uint32_t)));
-    CK(cudaMalloc(&b->d_halfres_smooth, n*sizeof(uint32_t)));
-    b->clip_allocated_bytes =
-        (uint64_t)n * (6ull * (uint64_t)sizeof(uint16_t)
-                     + 7ull * (uint64_t)sizeof(uint32_t));
+    if (!same_dims) {
+        CK(cudaMalloc(&b->d_in,      n*sizeof(uint16_t)));
+        CK(cudaMalloc(&b->d_out,     n*sizeof(uint16_t)));
+        CK(cudaMalloc(&b->d_alias,   n*sizeof(uint16_t)));
+        CK(cudaMalloc(&b->d_aliasaux,n*sizeof(uint16_t)));
+        CK(cudaMalloc(&b->d_over,    n*sizeof(uint16_t)));
+        CK(cudaMalloc(&b->d_overaux, n*sizeof(uint16_t)));
+        CK(cudaMalloc(&b->d_raw32,   n*sizeof(uint32_t)));
+        CK(cudaMalloc(&b->d_dark,    n*sizeof(uint32_t)));
+        CK(cudaMalloc(&b->d_bright,  n*sizeof(uint32_t)));
+        CK(cudaMalloc(&b->d_fullres, n*sizeof(uint32_t)));
+        CK(cudaMalloc(&b->d_halfres, n*sizeof(uint32_t)));
+        CK(cudaMalloc(&b->d_fullres_smooth, n*sizeof(uint32_t)));
+        CK(cudaMalloc(&b->d_halfres_smooth, n*sizeof(uint32_t)));
+        b->clip_allocated_bytes =
+            (uint64_t)n * (6ull * (uint64_t)sizeof(uint16_t)
+                         + 7ull * (uint64_t)sizeof(uint32_t));
+    }
 
     /* push the static per-clip constants to __constant__.
      * white_darkened is recomputed in set_clip exactly as the engine does,

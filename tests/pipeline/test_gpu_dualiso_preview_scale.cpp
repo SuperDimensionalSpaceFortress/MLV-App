@@ -8,8 +8,9 @@
 //      every CPU-plan refusal on full resolution, and the CPU plan's own
 //      "GPU playback recon requested" refusal is unchanged;
 //  (g) a recon at new dimensions while a retained device output is still in use is
-//      refused by the C seam, so set_clip (which frees EVERY retained output) never
-//      frees one a presenter may be reading; once released, the new size proceeds;
+//      refused by the C seam, so set_clip (which at new dims frees EVERY retained
+//      output) never frees one a presenter may be reading; once released, the new
+//      size proceeds; a same-dims set_clip (levels/pattern moved) keeps them (r1f);
 //  the route itself: the retained output is the backend's recon of exactly the
 //      reduced prepared Bayer, at the reduced dims, and nothing is published;
 //  (f) an export in the same process after a reduced CUDA playback equals a fresh
@@ -301,7 +302,7 @@ TEST(GpuDualIsoPreviewScale, PlanAdmitsX2AndX4OnlyForGpuPlaybackRecon)
     ASSERT_EQ(4, plan.scale);
 }
 
-// (g) igpu_recon_set_clip frees every retained output, in use or not. The C seam
+// (g) igpu_recon_set_clip at new dims frees every retained output, in use or not. The C seam
 // refuses a run that needs new clip dimensions while any is outstanding.
 // Mutation: drop the guard in llrawproc_gpu_recon_run_backend and the fake's
 // freed-in-use counter becomes 1 here.
@@ -352,6 +353,45 @@ TEST(GpuDualIsoPreviewScale, DimsChangeNeverFreesAnInUseRetainedToken)
     ASSERT_EQ(reducedH, resized.height);
     ASSERT_EQ(0, llrpFakeGpuBackendFreedInUseRetainedForTesting());
     ASSERT_NE(0, llrpGpuPlaybackReconReleaseRetainedDeviceBayer16(resized.token));
+}
+
+// PRODUCT-PR-STRANDED-SWEEP-1 r1f: the dual-ISO prepare re-derives black/white and the
+// ISO pattern every frame, so the clip key can change at the SAME dims (M16-1456 called
+// set_clip on every frame). The dims guard above does not apply, so set_clip must keep
+// in-use retained outputs at unchanged dims; freeing them handed the presenter's CUDA
+// AMaZE a freed buffer (sticky 'illegal memory access', igpu_recon_cuda.cu:2123).
+// Mutation: make the fake (or igpu_recon_set_clip) free on every call and the
+// freed-in-use counter becomes 1 here.
+TEST(GpuDualIsoPreviewScale, SameDimsClipChangeKeepsAnInUseRetainedToken)
+{
+    GpuReconEnv env(true);
+    const FakeGpuBackendScope fake;
+    const int w = 16, h = 16;
+    std::vector<uint16_t> input(static_cast<size_t>(w) * h, 100u);
+    llrpGpuPlaybackReconState_t first = validatedState(1, w, h);
+    llrpGpuPlaybackReconState_t levelsMoved = validatedState(2, w, h);
+    levelsMoved.black_level = 64;
+    llrpGpuPlaybackReconTiming_t timing = {};
+    int rc = -1;
+
+    llrpGpuPlaybackRetainedDeviceBayer16_t inFlight = {};
+    ASSERT_NE(0, llrpGpuPlaybackReconRunRetainedDeviceBayer16(&first, input.data(),
+        input.size() * sizeof(uint16_t), &inFlight, &rc, &timing));
+    ASSERT_NE(0, inFlight.valid);
+    const uint64_t setClipsBefore = llrpGpuPlaybackReconSetClipCount();
+
+    // A presenter still holds `inFlight`; the next frame's levels moved at the same dims.
+    llrpGpuPlaybackRetainedDeviceBayer16_t next = {};
+    ASSERT_NE(0, llrpGpuPlaybackReconRunRetainedDeviceBayer16(&levelsMoved, input.data(),
+        input.size() * sizeof(uint16_t), &next, &rc, &timing));
+    ASSERT_EQ(setClipsBefore + 1, llrpGpuPlaybackReconSetClipCount());
+    ASSERT_NE(0, next.valid);
+    ASSERT_EQ(0, llrpFakeGpuBackendFreedInUseRetainedForTesting());
+    ASSERT_EQ(2, llrpGpuPlaybackReconRetainedOutstandingCount());
+    for (size_t i = 0; i < input.size(); ++i) ASSERT_EQ(101u, inFlight.device_bayer16[i]);
+
+    ASSERT_NE(0, llrpGpuPlaybackReconReleaseRetainedDeviceBayer16(inFlight.token));
+    ASSERT_NE(0, llrpGpuPlaybackReconReleaseRetainedDeviceBayer16(next.token));
 }
 
 // The route: x2 and x4 reconstruct exactly the reduced prepared Bayer on the
