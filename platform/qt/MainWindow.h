@@ -1210,6 +1210,7 @@ private:
     double m_playbackSmokeLastPresentedTime = 0.0;
     double m_playbackSmokeFirstPresentMs = 0.0;
     int m_playbackSmokeFirstPresentTimelineDeltaAbs = 0; // slider travel from Play, sampled at the first present
+    int m_playbackSmokeStartupSkippedFrames = 0;         // timeline frames jumped past in the first 2 s after Play
     double m_playbackSmokePresentedIntervalSumMs = 0.0;
     double m_playbackSmokePresentedIntervalMaxMs = 0.0;
     // PLAYBACK-CUDA-HONOUR-SCALE-1 r2: present-gap attribution (present_gap_summary).

@@ -192,6 +192,14 @@ static bool gpuTexNrOverlapTraceEnabled()
     return environmentFlagEnabled( "MLVAPP_GPU_TEX_NR_OVERLAP_TRACE" );
 }
 
+// PLAYBACK-STARTUP-CATCHUP-BURST-1 kill switch, read once: the pace clock banks the whole wait for a Play's first
+// frame again, and drop-frame mode repays it with one timeline jump (NativePaceGuard::setStartupCatchupLegacy).
+static bool mlvappPlaybackStartupCatchupLegacyRequested()
+{
+    static const bool requested = environmentFlagEnabled( "MLVAPP_PLAYBACK_STARTUP_CATCHUP_LEGACY" );
+    return requested;
+}
+
 static bool f3CutRangeRepairDisabledByEnvironment()
 {
     return environmentFlagEnabled( "MLVAPP_F3_DISABLE_CUT_RANGE_REPAIR" );
@@ -2192,6 +2200,7 @@ MainWindow::MainWindow(int &argc, char **argv, QWidget *parent) :
     m_zoomModeChanged = false;
     m_tryToSyncAudio = false;
     m_newPosDropMode = 0.0;
+    m_playbackPaceGuard.setStartupCatchupLegacy( mlvappPlaybackStartupCatchupLegacyRequested() );
     m_playbackStopped = false;
     m_dualIsoPlaybackPreviewActive = false;
     m_inClipDeleteProcess = false;
@@ -10954,12 +10963,19 @@ void MainWindow::playbackHandling(int timeDiff)
                 ui->horizontalSliderPosition->setValue( m_newPosDropMode );
                 ui->horizontalSliderPosition->blockSignals( false );
                 if( m_playbackSmokeActive )
+                {
                     m_playbackSlipHistogram.noteTimelineMove(
                         dropFrameTick.wrapped ? playback_slip::AdvancePath::LoopWrap
                                               : playback_slip::AdvancePath::DropTick,
                         ui->horizontalSliderPosition->value(), paceNowMs,
                         grantedDropFrames, m_playbackPaceGuard.creditFrames(),
                         getFramerate(), !paceGuardArmedBeforeTick );
+                    // PLAYBACK-STARTUP-CATCHUP-BURST-1: startup_catchup_frames, the skips of the first 2 s after Play.
+                    if( !dropFrameTick.wrapped
+                     && paceNowMs - m_playbackSmokeStartTime * 1000.0 <= playback_native_pace::kStartupCatchupWindowMs )
+                        m_playbackSmokeStartupSkippedFrames += playback_native_pace::skippedFrames(
+                            sourcePositionBeforeDropTick, dropFrameTick.position );
+                }
                 m_frameChanged = true;
             }
         }
@@ -24227,10 +24243,14 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     m_playbackSmokeStartAudioSyncSkipped = m_playbackAudioSyncSkippedCount;
     m_playbackSmokeStartTime = mlv_stage_timing_now();
     m_playbackSlipHistogram.reset( m_playbackSmokeStartPosition, getFramerate() );
-    m_playbackSlipHistogram.setPlayStart( m_playbackSmokeStartTime * 1000.0 );
+    // PLAYBACK-STARTUP-CATCHUP-BURST-1: the timeline owes the wall time since Play only when the legacy startup banks
+    // it; otherwise paced playback starts at the first present, and a later skip is a slip, never startup catch-up.
+    if( mlvappPlaybackStartupCatchupLegacyRequested() )
+        m_playbackSlipHistogram.setPlayStart( m_playbackSmokeStartTime * 1000.0 );
     m_playbackSmokeLastPresentedTime = 0.0;
     m_playbackSmokeFirstPresentMs = 0.0;
     m_playbackSmokeFirstPresentTimelineDeltaAbs = 0;
+    m_playbackSmokeStartupSkippedFrames = 0;
     m_playbackSmokePresentedIntervalSumMs = 0.0;
     m_playbackSmokePresentedIntervalMaxMs = 0.0;
     m_playbackSmokeRenderTotalSumMs = 0.0;
@@ -27427,6 +27447,18 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                          elapsedMs, m_playbackSmokeFirstPresentMs, m_playbackSmokePresentedFrames ), 0, 'f', 3 )
                .arg( m_playPaceFps, 0, 'f', 3 )
                .arg( m_playbackSmokeFirstPresentTimelineDeltaAbs );
+
+    // PLAYBACK-STARTUP-CATCHUP-BURST-1: Play -> first present, and what the first 2 s skipped for it.
+    qInfo().noquote()
+        << QStringLiteral(
+               "playback_smoke.startup_catchup session=%1 startup_wait_ms=%2 startup_catchup_frames=%3 "
+               "startup_mode=%4" )
+               .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
+               .arg( m_playbackSmokePresentedFrames > 0 ? QString::number( m_playbackSmokeFirstPresentMs, 'f', 3 )
+                                                        : QStringLiteral( "na" ) )
+               .arg( m_playbackSmokeStartupSkippedFrames )
+               .arg( mlvappPlaybackStartupCatchupLegacyRequested() ? QStringLiteral( "legacy" )
+                                                                   : QStringLiteral( "first_present" ) );
 
     qInfo().noquote()
         << QStringLiteral(
@@ -30972,6 +31004,10 @@ void MainWindow::drawFrameReady()
         return;
     }
     m_lastPresentedPlaybackFrame = static_cast<long long>( display_frame );
+    // PLAYBACK-STARTUP-CATCHUP-BURST-1: this Play's first present starts the pace clock, BEFORE the early advance
+    // below asks for the next frame -- the wait for this frame is not repaid as a drop-frame jump.
+    if( ui->actionPlay->isChecked() )
+        m_playbackPaceGuard.notePresent( mlv_stage_timing_now() * 1000.0, getFramerate() );
 
     /* Round-4 item 3: dispatch the NEXT frame render BEFORE the present work
      * below. The present span runs on this (GUI) thread, so the render
