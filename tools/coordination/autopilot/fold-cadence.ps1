@@ -21,8 +21,11 @@
 #   - the recall's stderr is kept (verdict recallStderr + the rotating -LogPath log), never deleted unread;
 #   - recallOutcome tells the failures apart: ok | timeout (our deadline killed the tree) | git-failure (recall exit 4: git or the
 #     bus clone failed or timed out) | unknown-sha (exit 3) | failed (any other non-zero exit) | unreadable (exit 0, bad output);
-#   - a timeout or git-failure is retried ONCE with a larger budget (-RetryGitTimeoutSec / -RetryDeadlineSec), because the first
-#     failure usually means a loaded host, not a broken bus;
+#   - a timeout or git-failure is retried ONCE with a larger budget (-RetryDeadlineSec, default 45 s; git budget = the smaller of
+#     -RetryGitTimeoutSec, default 30 s, and HALF the retry deadline, so 22.5 s by default), because the first failure usually
+#     means a loaded host, not a broken bus;
+#   - exit-0 output is trusted only if count is a non-negative integer and commits parses; anything else (null or non-integer
+#     count, an unparseable commit date) is `unreadable` with owedCount null, i.e. UNKNOWN, never a healthy answer;
 #   - meterState is OK | DUE | UNKNOWN. With -StatePath the step counts consecutive UNKNOWN evaluations; from the
 #     -UnknownDueAfter-th one on (default 2) an unknown debt is DUE (reason unknown-fail-closed, unknownReason = what failed)
 #     under the same usage and 6 h rules as a real debt. Without -StatePath the count is 1 and unknown stays not-due.
@@ -180,6 +183,7 @@ function Invoke-FoldCadenceCore {
     $sw = [Diagnostics.Stopwatch]::StartNew()
     $now = if ($Opts.NowUtc) { ConvertTo-FoldUtc $Opts.NowUtc } else { [datetime]::UtcNow }
     $v = New-FoldCadenceVerdict 'error' $now 0
+    $parsing = $false
     try {
         # Last fold time first: it is known whatever happens to the debt listing.
         $lastFold = if ($Opts.LastFoldUtc) { ConvertTo-FoldUtc $Opts.LastFoldUtc } else { Get-NewestFoldReportUtc $Opts.FoldRunsRoot }
@@ -222,23 +226,36 @@ function Invoke-FoldCadenceCore {
         if ($a.outcome -eq 'timeout') { $v.reason = 'timeout'; return $v }
         if ($a.outcome -eq 'unknown-sha') { $v.reason = 'recall-unknown-sha'; return $v }
         if ($a.outcome -ne 'ok') { $v.reason = "recall-failed-exit-$($a.exitCode)"; return $v }
+        $parsing = $true
         $debt = try { $a.stdout | ConvertFrom-Json } catch { $null }
-        if ($null -eq $debt -or -not $debt.PSObject.Properties['count'] -or -not $debt.PSObject.Properties['commits']) { $v.recallOutcome = 'unreadable'; $v.reason = 'recall-output-unreadable'; return $v }
+        # The count is TYPE-checked, not presence-checked: {"count":null} casts to 0 and would read as "nothing owed".
+        $shapeOk = ($debt -is [pscustomobject]) -and $debt.PSObject.Properties['count'] -and $debt.PSObject.Properties['commits'] -and
+            (($debt.count -is [int]) -or ($debt.count -is [long])) -and ($debt.count -ge 0)
+        if (-not $shapeOk) { $v.recallOutcome = 'unreadable'; $v.reason = 'recall-output-unreadable'; return $v }
+        # Everything is parsed into locals first; the verdict takes owedCount only after the whole parse and decision succeeded,
+        # so an exception half way leaves the debt UNKNOWN (null), never a retained count read as a healthy answer.
         $owed = [int]$debt.count
-        $v.owedCount = $owed
-        if ($debt.PSObject.Properties['fetch']) { $v.busFetch = [string]$debt.fetch }
+        $fetch = if ($debt.PSObject.Properties['fetch']) { [string]$debt.fetch } else { $null }
         $dates = @(@($debt.commits) | ForEach-Object { ConvertTo-FoldUtc $_.date } | Where-Object { $null -ne $_ } | Sort-Object)
+        $oldest = $null; $oldestAge = $null
         if ($dates.Count -gt 0) {
-            $v.oldestOwedCommitUtc = $dates[0].ToString('o')
-            $v.oldestOwedAgeHours = [math]::Round(($now - $dates[0]).TotalHours, 2)
+            $oldest = $dates[0].ToString('o')
+            $oldestAge = [math]::Round(($now - $dates[0]).TotalHours, 2)
         }
         $d = Get-FoldCadenceDecision -OwedCount $owed -UsageLevel $Opts.UsageLevel -LastFoldUtc $lastFold -NowUtc $now -MinFoldIntervalHours $Opts.MinFoldIntervalHours
+        $v.busFetch = $fetch
+        $v.oldestOwedCommitUtc = $oldest
+        $v.oldestOwedAgeHours = $oldestAge
+        $v.owedCount = $owed
         $v.dueFold = [bool]$d.DueFold
         $v.reason = $d.Reason
         return $v
     } catch {
+        $v.owedCount = $null
         $v.dueFold = $false
         $v.reason = 'error'
+        # A throw while reading the recall's own output is an unreadable answer, typed as such.
+        if ($parsing) { $v.recallOutcome = 'unreadable'; $v.reason = 'recall-output-unreadable' }
         return $v
     } finally {
         $v.elapsedSec = [math]::Round($sw.Elapsed.TotalSeconds, 2)

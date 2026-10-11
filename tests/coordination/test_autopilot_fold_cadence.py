@@ -339,8 +339,8 @@ class FailClosedTests(CadenceWorld):
     def reset_state(self):
         shutil.rmtree(self.state.parent, True)
 
-    def git_failure(self, text='git timed out resolving the cursor sha'):
-        return self.fake_recall(f'import sys\nprint({text!r}, file=sys.stderr)\nsys.exit(4)\n')
+    def git_failure(self, text='git timed out resolving the cursor sha', name='fake_recall.py'):
+        return self.fake_recall(f'import sys\nprint({text!r}, file=sys.stderr)\nsys.exit(4)\n', name)
 
     def test_exit_4_keeps_its_stderr_and_is_typed_git_failure(self):
         code, v, _ = self.run_step(self.git_failure())
@@ -350,6 +350,10 @@ class FailClosedTests(CadenceWorld):
         self.assertIn('git timed out resolving the cursor sha', v['recallStderr'])
         self.assertEqual([a['exitCode'] for a in v['recallAttempts']], [4, 4])   # one retry, then it stays a failure
         self.assertEqual(list(self.scratch_tmp.iterdir()), [])
+        self.assertEqual((v['meterState'], v['consecutiveUnknown'], v['dueFold']), ('UNKNOWN', 1, False))
+        code, v2, _ = self.run_step(self.git_failure())
+        self.assertEqual((v2['meterState'], v2['consecutiveUnknown'], v2['dueFold'], v2['reason']), ('UNKNOWN', 2, True, 'unknown-fail-closed'))
+        self.assertIn('git timed out resolving the cursor sha', v2['recallStderr'])
 
     def test_retry_with_a_larger_budget_rescues_a_loaded_host(self):
         marker = self.tmp / 'first-attempt-done'
@@ -361,6 +365,12 @@ class FailClosedTests(CadenceWorld):
             '    print("git timed out", file=sys.stderr)\n'
             '    sys.exit(4)\n'
             f'print({json.dumps(payload)!r})\n')
+        # Two unknown beats first: the second escalates (the escalation the rescue must then clear).
+        failing = self.git_failure(name='failing_recall.py')
+        code, u1, _ = self.run_step(failing)
+        self.assertEqual((u1['consecutiveUnknown'], u1['dueFold']), (1, False))
+        code, u2, _ = self.run_step(failing)
+        self.assertEqual((u2['consecutiveUnknown'], u2['dueFold'], u2['reason']), (2, True, 'unknown-fail-closed'))
         code, v, _ = self.run_step(recall)
         self.assertEqual(code, 0)
         self.assertEqual(v['owedCount'], 1)
@@ -368,8 +378,11 @@ class FailClosedTests(CadenceWorld):
         self.assertEqual(v['reason'], 'due')
         self.assertEqual(v['meterState'], 'DUE')
         self.assertEqual(v['consecutiveUnknown'], 0)
+        self.assertEqual(json.loads(self.state.read_text(encoding='utf-8'))['consecutiveUnknown'], 0)
         self.assertEqual([a['outcome'] for a in v['recallAttempts']], ['git-failure', 'ok'])
         self.assertGreater(v['recallAttempts'][1]['gitTimeoutSec'], v['recallAttempts'][0]['gitTimeoutSec'])
+        # FOLD-RETRY-BUDGET-MATCH-1: the retry git budget is min(-RetryGitTimeoutSec 30, half the 45 s retry deadline) = 22.5.
+        self.assertEqual([a['gitTimeoutSec'] for a in v['recallAttempts']], [10, 22.5])
 
     def test_unknown_is_due_only_from_the_second_consecutive_beat(self):
         recall = self.git_failure()
@@ -384,6 +397,8 @@ class FailClosedTests(CadenceWorld):
 
     def test_a_good_answer_resets_the_count(self):
         self.run_step(self.git_failure())
+        code, esc, _ = self.run_step(self.git_failure())
+        self.assertEqual((esc['consecutiveUnknown'], esc['dueFold']), (2, True))
         code, v, _ = self.run_step(self.fake_debt([]))
         self.assertEqual((v['meterState'], v['consecutiveUnknown'], v['dueFold'], v['reason']), ('OK', 0, False, 'no-owed'))
         state = json.loads(self.state.read_text(encoding='utf-8'))
@@ -391,6 +406,8 @@ class FailClosedTests(CadenceWorld):
         self.assertEqual(state['lastHealthyUtc'][:19], '2026-10-10T12:00:00')
         code, v, _ = self.run_step(self.git_failure())
         self.assertEqual((v['consecutiveUnknown'], v['dueFold']), (1, False))
+        code, v, _ = self.run_step(self.git_failure())
+        self.assertEqual((v['consecutiveUnknown'], v['dueFold'], v['reason']), (2, True, 'unknown-fail-closed'))
 
     def test_unknown_due_obeys_the_usage_and_recent_fold_gates(self):
         recall = self.git_failure()
@@ -428,12 +445,16 @@ class FailClosedTests(CadenceWorld):
         for _ in range(3):
             code, v, _ = self.step(self.git_failure())
             self.assertEqual((v['meterState'], v['consecutiveUnknown'], v['dueFold']), ('UNKNOWN', 1, False))
+        code, v, _ = self.step(self.git_failure(), '-UnknownDueAfter', '1')
+        self.assertEqual((v['consecutiveUnknown'], v['dueFold'], v['reason']), (1, True, 'unknown-fail-closed'))
 
     def test_a_corrupt_state_file_counts_as_zero(self):
         self.state.parent.mkdir(parents=True)
         self.state.write_text('{not json', encoding='utf-8')
         code, v, _ = self.run_step(self.git_failure())
         self.assertEqual((code, v['consecutiveUnknown'], v['dueFold']), (0, 1, False))
+        code, v, _ = self.run_step(self.git_failure())
+        self.assertEqual((v['consecutiveUnknown'], v['dueFold'], v['reason']), (2, True, 'unknown-fail-closed'))
 
     def test_unknown_after_is_a_parameter(self):
         code, v, _ = self.run_step(self.git_failure(), '-UnknownDueAfter', '1')
@@ -450,10 +471,64 @@ class FailClosedTests(CadenceWorld):
         self.assertTrue(rows)
         self.assertEqual(rows[-1]['recallOutcome'], 'git-failure')
         self.assertIn('x' * 100, rows[-1]['stderr'])
+        self.assertEqual((rows[-1]['consecutiveUnknown'], rows[-1]['dueFold'], rows[-1]['reason']), (8, True, 'unknown-fail-closed'))
 
     def test_a_clean_first_try_is_not_logged(self):
         self.run_step(self.fake_debt([commit('a' * 40, OLD_COMMIT)]))
         self.assertFalse(self.log.exists())
+        self.run_step(self.git_failure())
+        code, v, _ = self.run_step(self.git_failure())
+        self.assertEqual((v['consecutiveUnknown'], v['dueFold']), (2, True))
+        rows = [json.loads(line) for line in self.log.read_text(encoding='ascii').splitlines()]
+        self.assertEqual([(r['consecutiveUnknown'], r['dueFold']) for r in rows], [(1, False), (2, True)])
+
+    # sol r1 BLOCKER: exit-0 output that is malformed must be UNKNOWN, never a healthy verdict.
+    MALFORMED = {
+        'null-count': '{"count": null, "commits": []}',
+        'bad-commit-date': '{"count": 1, "commits": [{"date": "garbage"}]}',
+        'string-count': '{"count": "1", "commits": []}',
+        'negative-count': '{"count": -1, "commits": []}',
+        'fractional-count': '{"count": 1.5, "commits": []}',
+        'bool-count': '{"count": true, "commits": []}',
+        'missing-commits': '{"count": 0}',
+        'not-an-object': '[1, 2]',
+    }
+
+    def malformed(self, name):
+        return self.fake_recall(f'print({self.MALFORMED[name]!r})\n')
+
+    def test_malformed_exit_0_output_is_unknown_not_healthy(self):
+        for name in self.MALFORMED:
+            recall = self.malformed(name)
+            with self.subTest(shape=name):
+                self.reset_state()
+                code, v1, _ = self.run_step(recall)
+                self.assertEqual(code, 0)
+                self.assertEqual((v1['meterState'], v1['owedCount'], v1['consecutiveUnknown'], v1['dueFold']), ('UNKNOWN', None, 1, False), v1)
+                self.assertEqual((v1['recallOutcome'], v1['reason'], v1['unknownReason']), ('unreadable', 'recall-output-unreadable', 'recall-output-unreadable'))
+                self.assertIsNone(v1['oldestOwedCommitUtc'])
+                code, v2, _ = self.run_step(recall)
+                self.assertEqual((v2['meterState'], v2['owedCount'], v2['consecutiveUnknown'], v2['dueFold'], v2['reason']),
+                                 ('UNKNOWN', None, 2, True, 'unknown-fail-closed'), v2)
+                self.assertEqual(v2['unknownReason'], 'recall-output-unreadable')
+
+    def test_malformed_exit_0_output_does_not_reset_a_prior_unknown_beat(self):
+        for name in ('null-count', 'bad-commit-date'):
+            with self.subTest(shape=name):
+                self.reset_state()
+                self.run_step(self.git_failure())    # one injected unknown beat
+                code, v, _ = self.run_step(self.malformed(name))
+                self.assertEqual((v['meterState'], v['owedCount'], v['consecutiveUnknown'], v['dueFold'], v['reason']),
+                                 ('UNKNOWN', None, 2, True, 'unknown-fail-closed'), v)
+                self.assertEqual(json.loads(self.state.read_text(encoding='utf-8'))['consecutiveUnknown'], 2)
+
+    def test_well_formed_output_still_reads_healthy(self):
+        cases = (('{"count": 0, "commits": []}', ('OK', 0, False, 'no-owed')),
+                 ('{"count": 2, "commits": [{"date": "2026-10-09T17:44:31-05:00"}], "fetch": "ok"}', ('DUE', 2, True, 'due')))
+        for body, want in cases:
+            code, v, _ = self.run_step(self.fake_recall(f'print({body!r})\n'))
+            self.assertEqual((v['meterState'], v['owedCount'], v['dueFold'], v['reason']), want)
+            self.assertEqual(v['consecutiveUnknown'], 0)
 
 
 class UnknownDecisionRuleTests(unittest.TestCase):
