@@ -32,7 +32,8 @@ function Test-HubHost {
     param([string]$ComputerName = $(if ($env:COMPUTERNAME) { $env:COMPUTERNAME } else { [Environment]::MachineName }), [string]$HostsFile)
     $cfg = if ($HostsFile) { Get-HubHostConfig -Path $HostsFile } else { Get-HubHostConfig }
     $overrideNow = [Environment]::GetEnvironmentVariable([string]$cfg.ciFixtureOverrideEnv)
-    if ($overrideNow -and $overrideNow.Trim() -ceq [string]$cfg.ciFixtureOverrideValue) { return $false }
+    # Exact and untrimmed, the same compare as the app header and the launcher guards (-cne): a padded value is not the override.
+    if ($overrideNow -ceq [string]$cfg.ciFixtureOverrideValue) { return $false }
     $name = ([string]$ComputerName).Trim()
     if (-not $name) { return $false }
     foreach ($h in @($cfg.hubHosts)) { if ($name -ieq [string]$h) { return $true } }

@@ -76,9 +76,9 @@ static bool hasGuiPlaybackSmokeFlag(int argc, char *argv[])
     return false;
 }
 
-/* HUB-VM-NO-LOCAL-PLAYBACK-1 (owner objection 2026-10-11): no automation playback entry starts on the hub VM (a guest on
- * Ultra-Magnus). Typed refusal, non-zero exit, before any window or settings store exists. Normal interactive use never
- * reaches this. See HubHostPlaybackGuard.h. */
+/* HUB-VM-NO-LOCAL-PLAYBACK-1 (owner objection 2026-10-11): no MLVApp GUI or playback start on the hub VM (a guest on
+ * Ultra-Magnus) -- the ordinary interactive launch included (r3). Typed refusal, non-zero exit, before any window or
+ * settings store exists. Only --batch and --trim-mlv skip it. See HubHostPlaybackGuard.h. */
 static bool hubHostPlaybackRefused()
 {
     const QString host = hub_host_playback_guard::currentHostName(qgetenv("COMPUTERNAME"));
@@ -1750,7 +1750,10 @@ int main(int argc, char *argv[])
     const bool automationRun = hasPlaybackProfileFlag(argc, argv) || hasGuiPlaybackSmokeFlag(argc, argv)
         || qEnvironmentVariableIntValue("MLVAPP_AUTOPLAY_SECONDS") > 0;
     // HUB-VM-NO-LOCAL-PLAYBACK-1: refused before the run-scoped settings store, CrashForensics or any window exists.
-    if (automationRun && hubHostPlaybackRefused())
+    // r3: every start that constructs a MainWindow is guarded, the ordinary GUI launch included; only the headless
+    // --batch / --trim-mlv entries (with no automation request) skip the check.
+    if (hub_host_playback_guard::startIsGuarded(hasBatchFlag(argc, argv), hasTrimMlvFlag(argc, argv), automationRun)
+        && hubHostPlaybackRefused())
     {
         return hub_host_playback_guard::kRefusalExitCode;
     }

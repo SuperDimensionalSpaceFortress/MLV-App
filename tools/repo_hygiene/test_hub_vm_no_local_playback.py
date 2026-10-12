@@ -116,6 +116,16 @@ class CopiesArePinnedToTheFileTests(unittest.TestCase):
                 self.assertRegex(text, rf"exit {cfg['refusalExitCode']}\b", name)
                 self.assertIn(cfg["refusalToken"], text, name)
 
+    def test_all_three_layers_compare_the_override_exactly_and_untrimmed(self):
+        # The launchers compare -cne with no Trim (pinned above); the header and the lint must open on the same set.
+        header = GUARD_HEADER.read_text(encoding="utf-8")
+        body = re.search(r"inline bool overrideActive\([^)]*\)\s*\{(.*?)\}", header, re.DOTALL)
+        self.assertIsNotNone(body, "overrideActive() not found")
+        self.assertNotIn("trimmed", body.group(1))
+        lint_line = next(ln for ln in _code_lines(LINT_PS1) if "$overrideNow" in ln and "ciFixtureOverrideValue" in ln)
+        self.assertIn("-ceq", lint_line)
+        self.assertNotIn("Trim", lint_line)
+
     def test_guard_is_the_first_statement_after_the_param_block(self):
         for name in GUARDED_LAUNCHERS:
             with self.subTest(launcher=name):
@@ -259,6 +269,8 @@ class PromptLintTests(unittest.TestCase):
             "$o.empty = Test-HubHost -ComputerName ''\n"
             "$env:MLVAPP_HUB_PLAYBACK_CI_FIXTURE = '1'\n"
             "$o.truthy = Test-HubHost -ComputerName 'VIRTUAL-TEN'\n"
+            "$env:MLVAPP_HUB_PLAYBACK_CI_FIXTURE = ' CI_FIXTURE_ONLY '\n"
+            "$o.padded = Test-HubHost -ComputerName 'VIRTUAL-TEN'\n"
             "$env:MLVAPP_HUB_PLAYBACK_CI_FIXTURE = 'CI_FIXTURE_ONLY'\n"
             "$o.override = Test-HubHost -ComputerName 'VIRTUAL-TEN'\n"
             "$o | ConvertTo-Json -Compress\n",
@@ -268,7 +280,7 @@ class PromptLintTests(unittest.TestCase):
         done = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(probe)], capture_output=True, text=True, timeout=120, env=env)
         self.assertEqual(0, done.returncode, done.stderr)
         self.assertEqual(
-            {"hub": True, "hubLower": True, "bachelor": False, "um": False, "partial": False, "empty": False, "truthy": True, "override": False},
+            {"hub": True, "hubLower": True, "bachelor": False, "um": False, "partial": False, "empty": False, "truthy": True, "padded": True, "override": False},
             json.loads(done.stdout.strip()),
         )
 
@@ -331,8 +343,9 @@ class InvokeLaneRefusalTests(unittest.TestCase):
         for later in ("Write-Utf8NoBom $promptPath", "$hookCopyPath = ", "# ---------------------------------------------------------------- 0.1 pre-flight",
                       "Join-Path $env:APPDATA", "Add-Type -TypeDefinition"):
             at = text.find(later)
-            if at != -1:
-                self.assertLess(gate, at, f"gate must precede {later!r}")
+            # A renamed needle must fail here, not silently drop its ordering guarantee.
+            self.assertNotEqual(-1, at, f"needle {later!r} no longer in Invoke-Lane.ps1; re-pin the ordering test")
+            self.assertLess(gate, at, f"gate must precede {later!r}")
 
 
 @requires_pwsh
@@ -369,6 +382,8 @@ class LauncherGuardBlockTests(unittest.TestCase):
                 self.assertIn(cfg["refusalToken"], out)
                 self.assertNotIn("GUARD-PASSED", out)
                 self.assertEqual(cfg["refusalExitCode"], self._run_block(name, "virtual-ten", "1").returncode, "a truthy value is not the override")
+                padded = " " + cfg["ciFixtureOverrideValue"] + " "
+                self.assertEqual(cfg["refusalExitCode"], self._run_block(name, "VIRTUAL-TEN", padded).returncode, "a padded value is not the override")
 
     def test_each_launcher_guard_lets_a_venue_and_the_fixture_override_through(self):
         cfg = _config()

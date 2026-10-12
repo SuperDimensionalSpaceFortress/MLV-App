@@ -4,12 +4,14 @@
 // HUB-VM-NO-LOCAL-PLAYBACK-1 (owner objection 2026-10-11): the hub VM (Virtual-Ten) is a VMware guest on Ultra-Magnus, so
 // an automation playback run there shows a window on the owner's machine and contaminates the Ultra-Magnus venue legs.
 // No MLVApp GUI or playback run of any kind starts on a hub host: playback, performance AND exactness, runs on a venue
-// through the tracked venue chain. The refusal is placed where the action happens -- the app's own automation entries
-// (--gui-smoke-playback, --profile-playback and the MLVAPP_AUTOPLAY_* hook) -- so a lane that writes its own launcher
-// script is stopped as well as one that uses the tracked ones.
+// through the tracked venue chain. The refusal is placed where the action happens -- main(), before any window exists --
+// so a lane that writes its own launcher script, or starts the app with no flag at all, is stopped as well as one that
+// uses the tracked launchers.
 //
-// Only the automation entries refuse. Normal interactive use of the app is untouched, and so are local builds and unit,
-// console and pipeline tests.
+// Refused on a hub host (r3, hub ruling 2026-10-11): every start that constructs a MainWindow -- the ordinary interactive
+// GUI (manual Play would be reachable), --gui-smoke-playback, --profile-playback -- and any start carrying the
+// MLVAPP_AUTOPLAY_* hook. Not refused: the headless entries that never construct a MainWindow and never play (--batch,
+// including --batch --help, and --trim-mlv), local builds, and unit, console and pipeline tests.
 //
 // The host list and the three constants below are copies of tools/profiling/dual-venue/hub-hosts.json (the app cannot
 // read a repo file at run time); tools/repo_hygiene/test_hub_vm_no_local_playback.py fails when a copy drifts.
@@ -42,10 +44,11 @@ inline bool isHubHost( const QString &computerName )
     return false;
 }
 
-// The exact value only: "1", "true" or any other spelling is not the override.
+// The exact value only, untrimmed: "1", "true", " CI_FIXTURE_ONLY " or any other spelling is not the override. The
+// launcher guards (-cne) and the lane lint (-ceq) compare the same way, so the three layers open on the same set.
 inline bool overrideActive( const QByteArray &overrideValue )
 {
-    return overrideValue.trimmed() == QByteArray( kOverrideValue );
+    return overrideValue == QByteArray( kOverrideValue );
 }
 
 // COMPUTERNAME first (what the venue table and every script key on), the OS host name as the fallback.
@@ -55,17 +58,25 @@ inline QString currentHostName( const QByteArray &computerNameEnv )
     return fromEnv.isEmpty() ? QSysInfo::machineHostName() : fromEnv;
 }
 
-// True when an automation playback entry must refuse to start on this host.
+// True when a guarded start must refuse on this host.
 inline bool refuses( const QString &computerName, const QByteArray &overrideValue )
 {
     return isHubHost( computerName ) && !overrideActive( overrideValue );
+}
+
+// True when main() must consult the hub-host guard for this start: anything that constructs a MainWindow (every start
+// that is neither --batch nor --trim-mlv, the ordinary GUI included) or carries an automation flag / the autoplay hook.
+// Only the headless entries with no automation request skip it.
+inline bool startIsGuarded( bool batch, bool trimMlv, bool automationRun )
+{
+    return automationRun || ( !batch && !trimMlv );
 }
 
 inline QString refusalMessage( const QString &computerName )
 {
     return QStringLiteral( "[GUI-SMOKE] ERROR: " ) + QString::fromLatin1( kRefusalToken )
         + QStringLiteral( " (host " ) + computerName.trimmed()
-        + QStringLiteral( " is the hub VM, a guest on Ultra-Magnus: no MLVApp playback, smoke or profile run starts here. "
+        + QStringLiteral( " is the hub VM, a guest on Ultra-Magnus: no MLVApp GUI, playback, smoke or profile run starts here. "
                           "Run it as a venue job (Bachelor / Ultra-Magnus) through the tracked venue chain.)" );
 }
 

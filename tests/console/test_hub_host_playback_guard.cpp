@@ -1,10 +1,12 @@
-// HUB-VM-NO-LOCAL-PLAYBACK-1 (owner objection 2026-10-11): the app's automation playback entries refuse to start on the hub
-// VM (Virtual-Ten, a guest on Ultra-Magnus). RED fixtures per surface:
+// HUB-VM-NO-LOCAL-PLAYBACK-1 (owner objection 2026-10-11): no MLVApp GUI or playback start on the hub VM (Virtual-Ten, a
+// guest on Ultra-Magnus) -- since r3 the ordinary interactive launch included. RED fixtures per surface:
 //   1. the pure decision (HubHostPlaybackGuard.h): hub host refused, venue host / developer machine allowed, the CI-fixture
-//      override honoured only in its exact spelling;
+//      override honoured only in its exact, untrimmed spelling; every start that constructs a MainWindow is guarded, only
+//      --batch / --trim-mlv without an automation request are not;
 //   2. the wiring in main.cpp (needs a full GUI build, so the source is read as text, as the other *_wiring tests do): the
-//      refusal sits in main() BEFORE the run-scoped settings store and before any window, at the top of both automation
-//      entry functions, and never in the normal-GUI path.
+//      refusal sits in main() BEFORE the run-scoped settings store and before any window, covers the ordinary launch, and
+//      sits at the top of both automation entry functions.
+// Nothing here launches the app.
 // The host list is pinned to tools/profiling/dual-venue/hub-hosts.json by tools/repo_hygiene/test_hub_vm_no_local_playback.py.
 #include "../common/minitest.h"
 #include "../common/repo_paths.h"
@@ -56,7 +58,9 @@ TEST(HubHostPlaybackGuard, VenuesAndOtherMachinesAreNotRefused)
 TEST(HubHostPlaybackGuard, OnlyTheExactFixtureOverrideLiftsTheRefusal)
 {
     ASSERT_FALSE(hub_host_playback_guard::refuses(QStringLiteral("VIRTUAL-TEN"), fixtureOverride()));
-    ASSERT_FALSE(hub_host_playback_guard::refuses(QStringLiteral("VIRTUAL-TEN"), QByteArray(" CI_FIXTURE_ONLY ")));
+    // Untrimmed, as the launcher guards (-cne) and the lane lint (-ceq) compare: a padded value is not the override.
+    ASSERT_TRUE(hub_host_playback_guard::refuses(QStringLiteral("VIRTUAL-TEN"), QByteArray(" CI_FIXTURE_ONLY ")));
+    ASSERT_TRUE(hub_host_playback_guard::refuses(QStringLiteral("VIRTUAL-TEN"), QByteArray("CI_FIXTURE_ONLY\n")));
     // A truthy-looking value is NOT the override (an inherited MLVAPP_*=1 habit must not open the guard).
     ASSERT_TRUE(hub_host_playback_guard::refuses(QStringLiteral("VIRTUAL-TEN"), QByteArray("1")));
     ASSERT_TRUE(hub_host_playback_guard::refuses(QStringLiteral("VIRTUAL-TEN"), QByteArray("true")));
@@ -79,7 +83,8 @@ TEST(HubHostPlaybackGuard, MainRefusesBeforeTheSettingsStoreAndBeforeAnyWindow)
     ASSERT_TRUE(mainAt >= 0);
     const QString mainBody = source.mid(mainAt);
 
-    const int refuseAt = mainBody.indexOf(QStringLiteral("if (automationRun && hubHostPlaybackRefused())"));
+    const int refuseAt = mainBody.indexOf(QStringLiteral(
+        "if (hub_host_playback_guard::startIsGuarded(hasBatchFlag(argc, argv), hasTrimMlvFlag(argc, argv), automationRun)"));
     const int isolateAt = mainBody.indexOf(QStringLiteral("automation_settings::isolate("));
     const int appAt = mainBody.indexOf(QStringLiteral("MyApplication a(argc, argv);"));
     const int normalGuiAt = mainBody.indexOf(QStringLiteral("/* Normal GUI mode"));
@@ -92,7 +97,9 @@ TEST(HubHostPlaybackGuard, MainRefusesBeforeTheSettingsStoreAndBeforeAnyWindow)
     ASSERT_TRUE(definition.contains(QStringLiteral("hasGuiPlaybackSmokeFlag(argc, argv)")));
     ASSERT_TRUE(definition.contains(QStringLiteral("hasPlaybackProfileFlag(argc, argv)")));
     ASSERT_TRUE(definition.contains(QStringLiteral("MLVAPP_AUTOPLAY_SECONDS")));
-    ASSERT_TRUE(mainBody.mid(refuseAt, 220).contains(QStringLiteral("kRefusalExitCode")));
+    const QString condition = mainBody.mid(refuseAt, 260);
+    ASSERT_TRUE(condition.contains(QStringLiteral("&& hubHostPlaybackRefused())")));
+    ASSERT_TRUE(condition.contains(QStringLiteral("kRefusalExitCode")));
 }
 
 TEST(HubHostPlaybackGuard, EachAutomationEntryFunctionRefusesFirst)
@@ -114,13 +121,49 @@ TEST(HubHostPlaybackGuard, EachAutomationEntryFunctionRefusesFirst)
     }
 }
 
-TEST(HubHostPlaybackGuard, TheNormalInteractivePathNeverTouchesTheGuard)
+// r3 (hub ruling on sol's r1 BLOCKER): an ordinary launch -- no flag, no MLVAPP_AUTOPLAY_SECONDS -- on a hub host is
+// refused; the headless entries that never construct a MainWindow are not guarded. RED on b3d9dd8c, whose decision was
+// "automationRun && refused", so the ordinary launch skipped the check and reached MainWindow w / w.show().
+TEST(HubHostPlaybackGuard, TheOrdinaryHubLaunchIsRefused)
+{
+    using hub_host_playback_guard::refuses;
+    using hub_host_playback_guard::startIsGuarded;
+    const bool batch = true, trimMlv = true, automation = true;
+
+    // The ordinary GUI start (the bare executable, with or without a file argument): guarded, and refused on the hub.
+    ASSERT_TRUE(startIsGuarded(!batch, !trimMlv, !automation));
+    ASSERT_TRUE(startIsGuarded(!batch, !trimMlv, !automation) && refuses(QStringLiteral("VIRTUAL-TEN"), noOverride()));
+    // The same start on a venue or a user machine is not refused.
+    ASSERT_FALSE(startIsGuarded(!batch, !trimMlv, !automation) && refuses(QStringLiteral("BACHELOR"), noOverride()));
+    ASSERT_FALSE(startIsGuarded(!batch, !trimMlv, !automation) && refuses(QStringLiteral("ULTRA-MAGNUS"), noOverride()));
+    ASSERT_FALSE(startIsGuarded(!batch, !trimMlv, !automation) && refuses(QStringLiteral("DESKTOP-ABC123"), noOverride()));
+    // The automation entries stay guarded.
+    ASSERT_TRUE(startIsGuarded(!batch, !trimMlv, automation));
+    // Headless entries that never construct a MainWindow are not guarded (batch CDNG CLI incl. --batch --help, --trim-mlv)...
+    ASSERT_FALSE(startIsGuarded(batch, !trimMlv, !automation));
+    ASSERT_FALSE(startIsGuarded(!batch, trimMlv, !automation));
+    // ...unless they carry an automation request, which stays refused on the hub exactly as in r1/r2.
+    ASSERT_TRUE(startIsGuarded(batch, !trimMlv, automation));
+    ASSERT_TRUE(startIsGuarded(!batch, trimMlv, automation));
+
+    // Wiring: main() no longer gates the check on automationRun alone, and the guarded check precedes the normal-GUI window.
+    const QString source = readRepoFile(QStringLiteral("platform/qt/main.cpp"));
+    const int mainAt = source.indexOf(QStringLiteral("int main(int argc, char *argv[])"));
+    ASSERT_TRUE(mainAt >= 0);
+    const QString mainBody = source.mid(mainAt);
+    ASSERT_FALSE(mainBody.contains(QStringLiteral("if (automationRun && hubHostPlaybackRefused())")));
+    const int guardAt = mainBody.indexOf(QStringLiteral("startIsGuarded(hasBatchFlag(argc, argv), hasTrimMlvFlag(argc, argv), automationRun)"));
+    const int windowAt = mainBody.indexOf(QStringLiteral("MainWindow w(argc, argv);"));
+    const int showAt = mainBody.indexOf(QStringLiteral("w.show();"));
+    ASSERT_TRUE(guardAt >= 0);
+    ASSERT_TRUE(windowAt > guardAt);
+    ASSERT_TRUE(showAt > windowAt);
+}
+
+TEST(HubHostPlaybackGuard, TheGuardHasExactlyThreeCallSites)
 {
     const QString source = readRepoFile(QStringLiteral("platform/qt/main.cpp"));
-    const int normalGuiAt = source.indexOf(QStringLiteral("/* Normal GUI mode"));
-    ASSERT_TRUE(normalGuiAt >= 0);
-    ASSERT_FALSE(source.mid(normalGuiAt).contains(QStringLiteral("hubHostPlaybackRefused")));
-    // And only the three call sites exist: main(), runPlaybackProfile(), runGuiPlaybackSmoke().
+    // Only the three call sites exist: main() (covers the normal GUI too), runPlaybackProfile(), runGuiPlaybackSmoke().
     int calls = 0;
     int from = 0;
     const QString needle = QStringLiteral("hubHostPlaybackRefused()");
