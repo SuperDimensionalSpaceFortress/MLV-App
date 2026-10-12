@@ -12,6 +12,7 @@
 #include "PlaybackFrameRange.h"
 #include "PlaybackSwapInterval.h"
 #include "AutomationSettings.h"
+#include "HubHostPlaybackGuard.h"
 #include "../../src/batch/BatchContext.h"
 #include "../../src/batch/BatchRunner.h"
 #include "../../src/batch/BatchLogger.h"
@@ -73,6 +74,20 @@ static bool hasGuiPlaybackSmokeFlag(int argc, char *argv[])
         if (std::strcmp(argv[i], "--gui-smoke-playback") == 0) return true;
     }
     return false;
+}
+
+/* HUB-VM-NO-LOCAL-PLAYBACK-1 (owner objection 2026-10-11): no MLVApp GUI or playback start on the hub VM (a guest on
+ * Ultra-Magnus) -- the ordinary interactive launch included (r3). Typed refusal, non-zero exit, before any window or
+ * settings store exists. Only --batch and --trim-mlv skip it. See HubHostPlaybackGuard.h. */
+static bool hubHostPlaybackRefused()
+{
+    const QString host = hub_host_playback_guard::currentHostName(qgetenv("COMPUTERNAME"));
+    if (!hub_host_playback_guard::refuses(host, qgetenv(hub_host_playback_guard::kOverrideEnv)))
+    {
+        return false;
+    }
+    QTextStream(stderr) << hub_host_playback_guard::refusalMessage(host) << "\n";
+    return true;
 }
 
 static bool envFlagEnabled(const char *name)
@@ -754,6 +769,7 @@ static int runBatch(QCoreApplication &app)
 
 static int runPlaybackProfile(QApplication &app)
 {
+    if (hubHostPlaybackRefused()) return hub_host_playback_guard::kRefusalExitCode;
     QCommandLineParser parser;
     parser.setApplicationDescription(
         QStringLiteral("MLVApp headless playback profiler - steps frames through the real Qt playback path and writes JSON timings."));
@@ -1150,6 +1166,7 @@ static int runPlaybackProfile(QApplication &app)
 
 static int runGuiPlaybackSmoke(QApplication &app)
 {
+    if (hubHostPlaybackRefused()) return hub_host_playback_guard::kRefusalExitCode;
     QCommandLineParser parser;
     parser.setApplicationDescription(
         QStringLiteral("MLVApp visible GUI playback smoke test - opens a clip, lets the normal GUI settle, then toggles the real Play action."));
@@ -1732,6 +1749,14 @@ int main(int argc, char *argv[])
     // Fail closed: an automation run that cannot get its own store does not start.
     const bool automationRun = hasPlaybackProfileFlag(argc, argv) || hasGuiPlaybackSmokeFlag(argc, argv)
         || qEnvironmentVariableIntValue("MLVAPP_AUTOPLAY_SECONDS") > 0;
+    // HUB-VM-NO-LOCAL-PLAYBACK-1: refused before the run-scoped settings store, CrashForensics or any window exists.
+    // r3: every start that constructs a MainWindow is guarded, the ordinary GUI launch included; only the headless
+    // --batch / --trim-mlv entries (with no automation request) skip the check.
+    if (hub_host_playback_guard::startIsGuarded(hasBatchFlag(argc, argv), hasTrimMlvFlag(argc, argv), automationRun)
+        && hubHostPlaybackRefused())
+    {
+        return hub_host_playback_guard::kRefusalExitCode;
+    }
     bool automationSettingsDirCreated = false;
     QString automationSettingsDir;
     if (automationRun)

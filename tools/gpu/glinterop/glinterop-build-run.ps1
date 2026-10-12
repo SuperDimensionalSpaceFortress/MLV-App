@@ -4,9 +4,9 @@
 # Unlike build-cuda.ps1 (generic), this links the Win32/GL libs the probe needs:
 #   opengl32.lib gdi32.lib user32.lib   (+ CUDA's cudart, auto via nvcc)
 #
-# It also pins the 4090 for this exe via the per-app DirectX GpuPreference so a
-# created GL context targets the discrete GPU, not the Intel iGPU:
-#   HKCU\Software\Microsoft\DirectX\UserGpuPreferences  <exe path> = "GpuPreference=2;"
+# The probe exports the NvOptimus/AmdPowerXpress discrete-GPU request itself (no
+# per-app Windows GPU preference is written -- that is the owner's state, NA-8),
+# and prints the GL_RENDERER it actually got.
 #
 # Usage (on host):
 #   pwsh -NoProfile -ExecutionPolicy Bypass -File glinterop-build-run.ps1 [-W 1808] [-H 2268] [-Iters 60]
@@ -48,11 +48,9 @@ Write-Host "build: $src -> $out (arch=$Arch) +opengl32/gdi32/user32"
 if ($LASTEXITCODE -ne 0) { Write-Host "BUILD FAILED (nvcc exit=$LASTEXITCODE)"; exit 1 }
 Write-Host "build OK"
 
-# --- pin the 4090 for this exe (per-app DirectX GPU preference; GpuPreference=2 = High performance / discrete) ---
-$prefKey = 'HKCU:\Software\Microsoft\DirectX\UserGpuPreferences'
-if (-not (Test-Path $prefKey)) { New-Item -Path $prefKey -Force | Out-Null }
-New-ItemProperty -Path $prefKey -Name $out -Value 'GpuPreference=2;' -PropertyType String -Force | Out-Null
-Write-Host "GpuPreference=2 pinned for $out"
+# NA-8: the owner's per-app Windows GPU preference is never written. The probe exports
+# NvOptimusEnablement / AmdPowerXpressRequestHighPerformance itself; the GL_RENDERER it prints
+# (and its VERDICT) record the adapter it actually got.
 
 # also nudge NVIDIA driver to prefer the high-perf GPU for OpenGL in this process
 $env:DXGI_ADAPTER_PREFERENCE = 'High'
