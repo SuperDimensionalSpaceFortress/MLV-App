@@ -3,7 +3,8 @@
 // (input, expected) value tables rather than timing claims; (2) rotation at the cap: .1/.2/.3 shift,
 // the oldest dropped, the live file reopened; (3) the line text and its privacy: no path separator,
 // no path/user/host field; (4) the env gate (ON unless 0|off|false|no) and the device-loss codes;
-// (5) text censuses: every telemetry call in GpuDebayer.cpp / GpuDisplayViewport.cpp / MainWindow.cpp
+// (5) text censuses: every telemetry call in GpuDebayer.cpp / GpuDisplayViewport.cpp /
+// GpuDisplayWindow.cpp / MainWindow.cpp
 // sits under GpuFieldTelemetry::enabled(), enabled() is a function-local static, no NVML /
 // nvidia-smi / machine fingerprint anywhere in telemetry, the CK / CKN / check_cuda failure branches
 // note the code inside the failure branch only, and igpu_launch_timing.cuh is byte-identical to the
@@ -358,7 +359,8 @@ TEST(GpuFieldTelemetry, EveryCallSiteIsGuardedByEnabled)
     struct Site { const char * file; const char * helper; int guarded; };
     const Site sites[] = {
         {"platform/qt/GpuDebayer.cpp", "noteAmazeStageTelemetry", 4},
-        {"platform/qt/GpuDisplayViewport.cpp", "noteViewportGlIdentity", 1},
+        {"platform/qt/GpuDisplayViewport.cpp", "", 1},
+        {"platform/qt/GpuDisplayWindow.cpp", "", 1},
         {"platform/qt/MainWindow.cpp", "", 1},
     };
     for (const Site & site : sites)
@@ -395,7 +397,8 @@ TEST(GpuFieldTelemetry, GateIsAFunctionLocalStaticAndOffReturnsFirst)
                                "void noteStage(const char * dll, const char * stage, double ms)\n{\n    if (!enabled()) return;",
                                "void noteFault(const CudaFault & fault)\n{\n    if (!enabled()) return;",
                                "void noteRecovery(const char * what, const char * outcome)\n{\n    if (!enabled()) return;",
-                               "void flush(const char * reason)\n{\n    if (!enabled()) return;"})
+                               "void flush(const char * reason)\n{\n    if (!enabled()) return;",
+                               "void noteGlContext(QOpenGLContext * context)\n{\n    if (!enabled() || !context) return;"})
     {
         ASSERT_TRUE(source.contains(QString::fromLatin1(entry)));
     }

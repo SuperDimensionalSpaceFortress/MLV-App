@@ -8,7 +8,6 @@
 #include "GpuDisplayViewport.h"
 #include "GpuDisplayWindow.h"
 #include "GpuFieldTelemetry.h"
-#include "GpuFieldTelemetryCore.h"
 #include "PlaybackSwapInterval.h"
 
 #include <algorithm>
@@ -55,47 +54,6 @@ bool envFlagEnabled(const QByteArray &value)
         || normalized == "true"
         || normalized == "yes"
         || normalized == "on";
-}
-
-/* GPU-FIELD-TELEMETRY-1: the GL identity and robustness reset state, once per
- * process (the call site guards it with GpuFieldTelemetry::enabled()). No
- * context or format is changed: the strategy is only read, and only on a
- * context that has KHR/ARB robustness; the reset status only when the strategy
- * is lose-context. Creating a robust context is GPU-DEVICE-LOSS-SELF-HEAL-1's. */
-void noteViewportGlIdentity(QOpenGLContext *glContext,
-                            QOpenGLFunctions *functions,
-                            const GLubyte *renderer,
-                            const GLubyte *vendor,
-                            const GLubyte *version)
-{
-    constexpr GLenum kGlResetNotificationStrategy = 0x8256;
-    const bool robust = glContext
-        && ( glContext->hasExtension(QByteArrayLiteral("GL_KHR_robustness"))
-          || glContext->hasExtension(QByteArrayLiteral("GL_ARB_robustness")) );
-    GLint strategy = 0;
-    if ( robust && functions ) functions->glGetIntegerv(kGlResetNotificationStrategy, &strategy);
-    QString resetStatus = QStringLiteral("not_queried");
-    if ( robust && strategy == GpuFieldTelemetryCore::kGlLoseContextOnReset )
-    {
-        typedef GLenum (QOPENGLF_APIENTRY *GetGraphicsResetStatusFn)();
-        GetGraphicsResetStatusFn getStatus = reinterpret_cast<GetGraphicsResetStatusFn>(
-            glContext->getProcAddress("glGetGraphicsResetStatus"));
-        if ( !getStatus ) getStatus = reinterpret_cast<GetGraphicsResetStatusFn>(
-            glContext->getProcAddress("glGetGraphicsResetStatusKHR"));
-        if ( !getStatus ) getStatus = reinterpret_cast<GetGraphicsResetStatusFn>(
-            glContext->getProcAddress("glGetGraphicsResetStatusARB"));
-        if ( getStatus )
-        {
-            resetStatus = QString::fromStdString(
-                GpuFieldTelemetryCore::glResetStatusName(static_cast<int>(getStatus())));
-        }
-    }
-    auto text = [](const GLubyte *s) {
-        return s ? QString::fromLatin1(reinterpret_cast<const char *>(s)) : QString();
-    };
-    GpuFieldTelemetry::noteGlIdentity(text(renderer), text(vendor), text(version),
-        QString::fromStdString(GpuFieldTelemetryCore::glResetStrategyName(robust, strategy)),
-        resetStatus);
 }
 
 /* Bug A diagnostic: env-gated (MLVAPP_VIEWPORT_PRESENT_DIAG=1) per-frame trace of
@@ -1046,7 +1004,7 @@ void GpuDisplayViewport::initializeGL()
         << ", wgl_swap_interval_actual="
         << wglSwapIntervalActual(glContext->getProcAddress("wglGetSwapIntervalEXT"))
         << ").";
-    if ( GpuFieldTelemetry::enabled() ) noteViewportGlIdentity(glContext, functions, renderer, vendor, version);
+    if ( GpuFieldTelemetry::enabled() ) GpuFieldTelemetry::noteGlContext(glContext);
 
     m_loggedContext = true;
 }

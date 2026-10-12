@@ -18,6 +18,8 @@
 #include <QFileInfo>
 #include <QMutex>
 #include <QMutexLocker>
+#include <QOpenGLContext>
+#include <QOpenGLFunctions>
 #include <QRandomGenerator>
 #include <QSysInfo>
 #include <QThreadPool>
@@ -37,6 +39,13 @@
 #include <windows.h>
 #endif
 
+// app_build provenance as MainWindow's window title: the build-time build_buildinfo.h (venue
+// assembles inject it into a .git-less archive) wins over the qmake-time -DMLVAPP_GIT_SHA.
+#if defined(__has_include)
+#  if __has_include("build_buildinfo.h")
+#    include "build_buildinfo.h"
+#  endif
+#endif
 #ifndef MLVAPP_GIT_SHA
 #  define MLVAPP_GIT_SHA "unknown"
 #endif
@@ -551,6 +560,40 @@ void noteGlIdentity(const QString & renderer, const QString & vendor,
         s.session.glResetStatus = core::sanitize(resetStatus.toStdString(), 32);
     }
     connectAboutToQuitOnce();
+}
+
+void noteGlContext(QOpenGLContext * context)
+{
+    if (!enabled() || !context) return;
+    {
+        QMutexLocker locker(&state().mutex);
+        if (state().glIdentitySet) return;
+    }
+    QOpenGLFunctions * functions = context->functions();
+    if (!functions) return;
+    constexpr GLenum kGlResetNotificationStrategy = 0x8256;
+    const bool robust = context->hasExtension(QByteArrayLiteral("GL_KHR_robustness"))
+        || context->hasExtension(QByteArrayLiteral("GL_ARB_robustness"));
+    GLint strategy = 0;
+    if (robust) functions->glGetIntegerv(kGlResetNotificationStrategy, &strategy);
+    QString resetStatus = QStringLiteral("not_queried");
+    if (robust && strategy == core::kGlLoseContextOnReset)
+    {
+        typedef GLenum (QOPENGLF_APIENTRY * GetGraphicsResetStatusFn)();
+        GetGraphicsResetStatusFn getStatus = nullptr;
+        for (const char * name : {"glGetGraphicsResetStatus", "glGetGraphicsResetStatusKHR", "glGetGraphicsResetStatusARB"})
+        {
+            getStatus = reinterpret_cast<GetGraphicsResetStatusFn>(context->getProcAddress(name));
+            if (getStatus) break;
+        }
+        if (getStatus) resetStatus = QString::fromStdString(core::glResetStatusName(static_cast<int>(getStatus())));
+    }
+    auto text = [functions](GLenum name) {
+        const GLubyte * s = functions->glGetString(name);
+        return s ? QString::fromLatin1(reinterpret_cast<const char *>(s)) : QString();
+    };
+    noteGlIdentity(text(GL_RENDERER), text(GL_VENDOR), text(GL_VERSION),
+                   QString::fromStdString(core::glResetStrategyName(robust, strategy)), resetStatus);
 }
 
 void flush(const char * reason)

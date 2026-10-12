@@ -30,6 +30,8 @@
 
 #include <functional>
 
+class QOpenGLContext;
+
 namespace GpuFieldTelemetry {
 
 /*! MLVAPP_GPU_TELEMETRY read once (a function-local static); unset = ON. */
@@ -77,6 +79,15 @@ void noteClip(int width, int height, int bitsPerPixel, bool compressed,
 void noteGlIdentity(const QString & renderer, const QString & vendor,
                     const QString & version, const QString & resetStrategy,
                     const QString & resetStatus);
+
+/*! Reads the identity from `context`, which must be current (call it from
+ *  initializeGL), and records it with noteGlIdentity. No context or format is
+ *  changed: GL_RESET_NOTIFICATION_STRATEGY is read only on a context with
+ *  GL_KHR_robustness or GL_ARB_robustness ("unsupported" otherwise), and
+ *  glGetGraphicsResetStatus only when the strategy is lose-context. Creating a
+ *  robust context is GPU-DEVICE-LOSS-SELF-HEAL-1's. Used by both GL present
+ *  surfaces (GpuDisplayViewport and GpuDisplayWindow). */
+void noteGlContext(QOpenGLContext * context);
 
 /*! Writes the session snapshot (stage lines, unwritten faults, ...). */
 void flush(const char * reason);

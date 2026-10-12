@@ -7,6 +7,7 @@
 
 #include "GpuDisplayWindow.h"
 #include "GpuDebayer.h"
+#include "GpuFieldTelemetry.h"
 #include "PlaybackScaling.h"
 #include "PlaybackSwapInterval.h"
 #include "debug/StageTiming.h"
@@ -1324,6 +1325,8 @@ void GpuDisplayWindow::initializeGL()
         << ", realized_swap_interval=" << realizedFormat.swapInterval()
         << ", wgl_swap_interval_actual=" << wglSwapIntervalActual(m_wglGetSwapIntervalExt)
         << ").";
+    // GPU-FIELD-TELEMETRY-1: the GL identity for the field log (once per process; reads only).
+    if ( GpuFieldTelemetry::enabled() ) GpuFieldTelemetry::noteGlContext(glContext);
     m_loggedContext = true;
 }
 

@@ -14,6 +14,7 @@ void setFaultListener(std::function<void(const CudaFault &)>) {}
 void noteRecovery(const char *, const char *) {}
 void noteClip(int, int, int, bool, bool, const QString &) {}
 void noteGlIdentity(const QString &, const QString &, const QString &, const QString &, const QString &) {}
+void noteGlContext(QOpenGLContext *) {}
 void flush(const char *) {}
 QString clipHash(const QString &) { return QString(); }
 
