@@ -3,7 +3,7 @@
 
 Every path lives under a pytest tmp root; nothing here touches the real C:\\mlvtmp.
 """
-import importlib.util, json, os, shutil, subprocess, sys
+import importlib.util, json, os, shutil, subprocess, sys, time
 from pathlib import Path
 
 import pytest
@@ -11,6 +11,8 @@ import pytest
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 HELPER = ROOT / "tools" / "coordination" / "Remove-LaneBulkScratch.ps1"
+REGISTER = ROOT / "tools" / "coordination" / "Register-LaneBulkScratch.ps1"
+RETIRE = ROOT / "tools" / "coordination" / "Retire-LaneWorktree.ps1"
 pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="Windows junctions / pwsh")
 PWSH = "pwsh.exe"
 
@@ -47,17 +49,20 @@ def world(tmp_path):
     return w
 
 
-def call_helper(w, paths, pr="none", keep=False, work=None, workdir_in=None):
-    """Dot-source the helper in a fresh pwsh and return its disposition as a dict."""
+def call_helper(w, paths, pr="none", keep=False, work=None, workdir_in=None, extra="", timeout=120):
+    """Dot-source the helper in a fresh pwsh and return its disposition as a dict.
+
+    pr=None leaves the PR probe at its default (real `gh`, or the -GhPath seam in `extra`)."""
     (w["run"] / "scratch-paths.txt").write_text("\n".join(str(p) for p in paths) + "\n", encoding="utf-8")
     driver = w["tmp"] / "driver.ps1"
+    probe = "-PrProbe { '%s' } " % pr if pr is not None else ""
     driver.write_text(
         ". '%s'\n$d = Invoke-RemoveLaneBulkScratch -RunDir '%s' -WorkDir '%s' -Root '%s' -LaneScratchRoot '%s' "
-        "-PrProbe { '%s' } %s\n$d | ConvertTo-Json -Depth 6\n"
-        % (HELPER, w["run"], work or w["work"], w["bulk"], w["scratch"], pr, "-Keep" if keep else ""),
+        "%s%s %s\n$d | ConvertTo-Json -Depth 6\n"
+        % (HELPER, w["run"], work or w["work"], w["bulk"], w["scratch"], probe, "-Keep" if keep else "", extra),
         encoding="ascii")
     r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(driver)],
-                       capture_output=True, text=True, timeout=120)
+                       capture_output=True, text=True, timeout=timeout)
     assert r.returncode == 0, (r.stdout, r.stderr)
     return json.loads(r.stdout)
 
@@ -163,15 +168,18 @@ def test_opt_out_keeps_everything_and_says_so(world):
 # ---- through Invoke-Lane.ps1: the receipt carries the outcome and the lane's exit/state never change ----
 
 def lane(fixture_tree, tmp_path, paths, extra=(), with_helper=True, mutate=None):
+    """paths=None: the manifest is NOT pre-written (the fake agent registers through the helper itself)."""
     root = fixture_tree["root"]
     cmd, env, receipt = prepare(fixture_tree, "normal")
     make_repo(root)
     bulk = tmp_path.with_name(tmp_path.name + "-bulk"); bulk.mkdir()
-    for p in paths(bulk):
-        p.mkdir(parents=True, exist_ok=True); (p / "n.txt").write_text("note")
-    (root / "run" / "scratch-paths.txt").write_text("\n".join(str(p) for p in paths(bulk)) + "\n", encoding="utf-8")
+    if paths is not None:
+        for p in paths(bulk):
+            p.mkdir(parents=True, exist_ok=True); (p / "n.txt").write_text("note")
+        (root / "run" / "scratch-paths.txt").write_text("\n".join(str(p) for p in paths(bulk)) + "\n", encoding="utf-8")
     if with_helper:
         (root / "Remove-LaneBulkScratch.ps1").write_bytes(HELPER.read_bytes())
+        (root / "Retire-LaneWorktree.ps1").write_bytes(RETIRE.read_bytes())
     cmd += ["-BulkScratchRoot", str(bulk), "-ScratchRoot", str(bulk / "lane-scratch"), *extra]
     if mutate: mutate(bulk)
     return cmd, env, receipt, bulk
@@ -240,3 +248,131 @@ def test_missing_helper_is_recorded_and_never_blocks_the_receipt(fixture_tree, t
         assert (bulk / "asm").exists()
     finally:
         shutil.rmtree(bulk, ignore_errors=True)
+
+
+# ---- r2: registration, live-holder guard, bounds ----
+
+def register(w, path, root=None, run=None):
+    r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(REGISTER), "-RunDir",
+                        str(run if run is not None else w["run"]), "-Path", str(path), "-Root", str(root or w["bulk"])],
+                       capture_output=True, text=True, timeout=60)
+    return r.returncode, r.stdout.strip()
+
+
+def manifest_lines(w):
+    f = w["run"] / "scratch-paths.txt"
+    return [x for x in f.read_text(encoding="utf-8").splitlines() if x] if f.exists() else []
+
+
+def test_register_helper_appends_and_dedupes(world):
+    a = world["bulk"] / "cpg1-a-asm"
+    assert register(world, a) == (0, "REGISTERED path=%s" % a)
+    assert register(world, str(a) + "\\")[0] == 0 and register(world, str(a).upper())[1].startswith("ALREADY-REGISTERED")
+    assert register(world, world["bulk"] / "b")[1].startswith("REGISTERED")
+    assert manifest_lines(world) == [str(a), str(world["bulk"] / "b")]
+
+
+def test_register_helper_refuses_unsafe_paths_and_leaves_the_manifest_alone(world):
+    outside = world["tmp"] / "outside"
+    for path, reason in [("relative\\dir", "relative-path"), (outside, "outside-root"), (world["bulk"], "outside-root"),
+                         ("%s\\a\\..\\x" % world["bulk"], "dotdot")]:
+        code, out = register(world, path)
+        assert code == 2 and out.startswith("REFUSED reason=%s " % reason), (path, code, out)
+    code, out = register(world, world["bulk"] / "ok", run=world["tmp"] / "no-such-run")
+    assert code == 2 and out.startswith("REFUSED reason=run-dir-missing"), out
+    assert manifest_lines(world) == []
+
+
+def test_register_helper_defaults_to_the_real_mlvtmp_root(world):
+    # No -Root: the default is C:\mlvtmp, so a path elsewhere on the disk is refused (the pytest tmp itself may sit under it).
+    r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(REGISTER), "-RunDir", str(world["run"]),
+                        "-Path", "C:\\Users\\Public\\not-mlvtmp"], capture_output=True, text=True, timeout=60)
+    assert r.returncode == 2 and "reason=outside-root" in r.stdout
+    assert manifest_lines(world) == []
+
+
+def test_invoke_lane_exports_the_manifest_and_a_registered_dir_is_cleaned_at_exit(fixture_tree, tmp_path):
+    root = fixture_tree["root"]
+    cmd, env, receipt, bulk = lane(fixture_tree, tmp_path, None)
+    try:
+        (root / "Register-LaneBulkScratch.ps1").write_bytes(REGISTER.read_bytes())
+        pre = root / "pre.ps1"
+        pre.write_text(
+            "if($env:MLV_LANE_SCRATCH_MANIFEST){\n"
+            "  $d='%s\\reg-asm'; New-Item -ItemType Directory -Force -Path $d | Out-Null; 'note' | Set-Content \"$d\\n.txt\"\n"
+            "  \"$env:MLV_LANE_RUN_DIR|$env:MLV_LANE_SCRATCH_MANIFEST\" | Set-Content '%s\\seen-env.txt'\n"
+            "  & '%s' -RunDir $env:MLV_LANE_RUN_DIR -Path $d -Root '%s' | Set-Content '%s\\register-out.txt'\n}\n"
+            % (bulk, root, root / "Register-LaneBulkScratch.ps1", bulk, root), encoding="ascii")
+        fixture_tree["shim"].write_text('@echo off\r\n"%s" -NoProfile -NonInteractive -File "%s"\r\n"%s" -NoProfile -NonInteractive -File "%s" %%*\r\n'
+                                        % (PWSH, pre, PWSH, fixture_tree["child"]), encoding="ascii")
+        r = subprocess.run(cmd, env=env, text=True, capture_output=True, timeout=180)
+        assert r.returncode == 0, (r.stdout, r.stderr)
+        seen = (root / "seen-env.txt").read_text().strip()
+        assert seen == "%s|%s" % (root / "run", root / "run" / "scratch-paths.txt"), seen
+        q = json.loads(receipt.read_text(encoding="utf-8"))
+        assert [e["action"] for e in q["bulkScratch"]["entries"]] == ["removed"], q["bulkScratch"]
+        assert not (bulk / "reg-asm").exists()
+        assert (root / "run" / "scratch-receipts" / "1-reg-asm" / "n.txt").read_text().strip() == "note"
+    finally:
+        shutil.rmtree(bulk, ignore_errors=True)
+
+
+def test_a_live_process_holding_the_dir_keeps_it(world):
+    asm = world["bulk"] / "cpg1-held-asm"; asm.mkdir(); (asm / "a.txt").write_text("a")
+    ready = world["tmp"] / "ready.txt"
+    p = subprocess.Popen([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
+                          "Set-Content -LiteralPath '%s' -Value up; Start-Sleep -Seconds 300" % ready], cwd=str(asm))
+    try:
+        for _ in range(300):
+            if ready.exists(): break
+            time.sleep(0.1)
+        assert ready.exists()
+        d = call_helper(world, [asm])
+        e = entry(d)
+        assert e["action"] == "kept" and e["reason"] == "live-process", e
+        assert any("via=cwd" in h for h in e["holders"]), e
+        assert (asm / "a.txt").exists() and not (world["run"] / "scratch-receipts").exists()
+    finally:
+        p.kill(); p.wait()
+
+
+def test_a_holder_probe_that_cannot_answer_refuses(world):
+    asm = world["bulk"] / "asm"; asm.mkdir(); (asm / "a.txt").write_text("a")
+    d = call_helper(world, [asm], extra="-SnapshotProvider { throw 'scan-failed' }")
+    e = entry(d)
+    assert e["action"] == "refused" and e["reason"] == "holder-probe-failed" and "scan-failed" in e["error"], e
+    assert (asm / "a.txt").exists()
+
+
+def test_a_stalled_pr_probe_is_bounded_and_refuses(world):
+    git("checkout", "-q", "-B", "feat", cwd=world["work"])   # a branch, so the probe really asks gh
+    fake = world["tmp"] / "fake-gh.cmd"
+    fake.write_text("@echo off\r\nping -n 60 127.0.0.1 >nul\r\n", encoding="ascii")
+    asm = world["bulk"] / "asm"; asm.mkdir(); (asm / "a.txt").write_text("a")
+    t0 = time.time()
+    d = call_helper(world, [asm], pr=None, extra="-GhPath '%s' -PrTimeoutSeconds 2" % fake, timeout=50)
+    assert time.time() - t0 < 40
+    e = entry(d)
+    assert e["action"] == "refused" and e["reason"] == "pr-state-unknown" and e["error"] == "gh-timeout", e
+    assert d["error"] is None and (asm / "a.txt").exists()
+
+
+def test_more_than_200_entries_report_the_dropped_count(world):
+    d = call_helper(world, [world["bulk"] / ("p%03d" % i) for i in range(201)])
+    assert len(d["entries"]) == 200 and d["truncated"] == 1
+    d = call_helper(world, [world["bulk"] / ("p%03d" % i) for i in range(5)])
+    assert d["truncated"] == 0
+
+
+def test_a_failing_size_walk_is_walk_failed_not_remove_failed(world):
+    asm = world["bulk"] / "asm"; sub = asm / "sub"; sub.mkdir(parents=True); (asm / "a.txt").write_text("a")
+    user = os.environ.get("USERNAME", "")
+    r = subprocess.run(["icacls", str(sub), "/deny", "%s:(RD)" % user], capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout + r.stderr
+    try:
+        d = call_helper(world, [asm])
+        e = entry(d)
+        assert e["action"] == "failed" and e["reason"] == "walk-failed", e
+        assert asm.exists()
+    finally:
+        subprocess.run(["icacls", str(sub), "/reset"], capture_output=True, text=True)

@@ -12,8 +12,8 @@
     one day) were never removed by anything.
 
     CONTRACT: a lane lists each bulk path it creates, one absolute path per line, in
-    <RunDir>\scratch-paths.txt (blank lines and lines starting with # are ignored; the launcher
-    hands the path to the child as MLV_LANE_SCRATCH_PATHS). After the lane exits, each listed path
+    <RunDir>\scratch-paths.txt (blank lines and lines starting with # are ignored). Register-LaneBulkScratch.ps1
+    appends to it; the launcher gives the child MLV_LANE_RUN_DIR and MLV_LANE_SCRATCH_MANIFEST. After the lane exits, each listed path
     gets its small text files (*.txt, *.json, *.log, under 1 MiB) copied to
     <RunDir>\scratch-receipts\<n>-<leaf>\ and is then removed.
 
@@ -25,10 +25,25 @@
       git-worktree                                is or contains a git worktree (registered, or a .git marker)
       worktree-list-unavailable                   `git worktree list` could not be read
       reparse-point                               the path, an ancestor below -Root, or anything inside it
+      live-process (action kept)                  a live process other than the caller's own chain holds the path or one
+                                                  under it: as its cwd, on its command line, or named by a script it runs
+      holder-probe-failed                         the process scan or the cwd probe could not answer
       producer-pr-open / pr-state-unknown         the lane's branch has an open PR, or that could not be learned
+                                                  (`gh` gets -PrTimeoutSeconds, default 60; a stall is unknown, never a hang)
+      walk-failed (action failed)                 the size / reparse walk of the path threw; nothing was removed
       copy-failed                                 a small file could not be copied out, so nothing is removed
     A path that is already gone is recorded `absent`. -Keep records `kept` / `opt-out` for every path.
+    More than 200 distinct manifest lines: the first 200 are processed and `truncated` is the count dropped (0 = none).
 #>
+
+# LANE-RECEIPT-SCRATCH-CLEANUP-1 r2: the live-holder probe is the worktree-retirement probe, not a copy of it.
+# A load failure is remembered and turns into `holder-probe-failed` per path (a probe that cannot answer refuses).
+$script:LaneBulkHolderLoadError = $null
+if (-not (Get-Command Find-WorktreeHolders -ErrorAction SilentlyContinue)) {
+    try { . (Join-Path $PSScriptRoot 'Retire-LaneWorktree.ps1') }
+    catch { $script:LaneBulkHolderLoadError = $_.Exception.Message }
+    if (-not (Get-Command Find-WorktreeHolders -ErrorAction SilentlyContinue) -and -not $script:LaneBulkHolderLoadError) { $script:LaneBulkHolderLoadError = 'Find-WorktreeHolders not defined' }
+}
 
 function Test-LaneScratchSame([string]$A, [string]$B) {
     return ($A.TrimEnd('\') -ieq $B.TrimEnd('\'))
@@ -51,15 +66,27 @@ function Get-LaneScratchWorktreePath([string]$RepoDir) {
     } catch { return $null }
 }
 
-function Get-LaneScratchPrState([string]$WorkDir) {
-    # 'open' | 'none' | 'unknown'
+function Get-LaneScratchPrState([string]$WorkDir, [string]$GhPath = 'gh', [int]$TimeoutSeconds = 60) {
+    # 'open' | 'none' | 'unknown' | 'unknown:<detail>'. gh gets a deadline and is killed (with its children) past it.
     try {
         $branch = @(& git -C $WorkDir branch --show-current 2>$null)
         if ($LASTEXITCODE -ne 0 -or -not $branch.Count -or -not [string]$branch[0]) { return 'none' }   # detached / no branch: no PR to protect
-        $json = & gh pr list --repo SuperDimensionalSpaceFortress/MLV-App --head ([string]$branch[0]) --state open --json number 2>$null
-        if ($LASTEXITCODE -ne 0) { return 'unknown' }
-        $rows = @($json | ConvertFrom-Json)
-        if ($rows.Count -gt 0) { return 'open' } else { return 'none' }
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $GhPath
+        foreach ($a in @('pr', 'list', '--repo', 'SuperDimensionalSpaceFortress/MLV-App', '--head', [string]$branch[0], '--state', 'open', '--json', 'number')) { [void]$psi.ArgumentList.Add($a) }
+        $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.CreateNoWindow = $true
+        $p = [System.Diagnostics.Process]::Start($psi)
+        try {
+            $outTask = $p.StandardOutput.ReadToEndAsync(); $errTask = $p.StandardError.ReadToEndAsync()
+            if (-not $p.WaitForExit([Math]::Max(1, $TimeoutSeconds) * 1000)) {
+                try { $p.Kill($true) } catch { }
+                return 'unknown:gh-timeout'
+            }
+            $p.WaitForExit()
+            if ($p.ExitCode -ne 0) { return 'unknown:gh-exit-' + $p.ExitCode }
+            $rows = @(([string]$outTask.GetAwaiter().GetResult()) | ConvertFrom-Json)
+            if ($rows.Count -gt 0) { return 'open' } else { return 'none' }
+        } finally { $p.Dispose() }
     } catch { return 'unknown' }
 }
 
@@ -88,24 +115,31 @@ function Invoke-RemoveLaneBulkScratch {
         [string]$ManifestName = 'scratch-paths.txt',
         # Test seam: a scriptblock returning 'open' | 'none' | 'unknown'. Default asks gh about the lane's branch.
         [scriptblock]$PrProbe = $null,
+        # Test seams: the gh executable, its deadline, a scriptblock returning a process snapshot, and the entry cap.
+        [string]$GhPath = 'gh',
+        [int]$PrTimeoutSeconds = 60,
+        [scriptblock]$SnapshotProvider = $null,
+        [int]$MaxEntries = 200,
         [switch]$Keep
     )
     $manifest = Join-Path $RunDir $ManifestName
-    $result = [ordered]@{ manifest = $manifest; optOut = [bool]$Keep; entries = @(); error = $null }
+    $result = [ordered]@{ manifest = $manifest; optOut = [bool]$Keep; truncated = 0; entries = @(); error = $null }
     try {
         if (-not (Test-Path -LiteralPath $manifest -PathType Leaf)) { return $null }
-        $lines = @(Get-Content -LiteralPath $manifest -Encoding utf8 -ErrorAction Stop |
-                   ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ -and -not $_.StartsWith('#') } | Select-Object -Unique -First 200)
+        $all = @(Get-Content -LiteralPath $manifest -Encoding utf8 -ErrorAction Stop |
+                 ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ -and -not $_.StartsWith('#') } | Select-Object -Unique)
+        $lines = @($all | Select-Object -First $MaxEntries)
+        $result['truncated'] = [Math]::Max(0, $all.Count - $lines.Count)
         $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd('\')
         $workFull = [IO.Path]::GetFullPath($WorkDir).TrimEnd('\')
         $laneScratchFull = if ($LaneScratchRoot) { [IO.Path]::GetFullPath($LaneScratchRoot).TrimEnd('\') } else { $null }
-        $worktrees = $null; $worktreesRead = $false; $pr = $null
+        $worktrees = $null; $worktreesRead = $false; $pr = $null; $snap = $null
         $receiptsRoot = Join-Path $RunDir 'scratch-receipts'
         $entries = New-Object System.Collections.Generic.List[object]
         $n = 0
         foreach ($raw in $lines) {
             $n++
-            $e = [ordered]@{ path = $raw; action = 'refused'; reason = $null; bytes = $null; copiedFiles = $null; copyTruncated = $null; error = $null }
+            $e = [ordered]@{ path = $raw; action = 'refused'; reason = $null; bytes = $null; copiedFiles = $null; copyTruncated = $null; holders = $null; error = $null }
             $entries.Add($e)
             try {
                 if (-not [IO.Path]::IsPathRooted($raw) -or $raw -notmatch '^[A-Za-z]:\\') { $e.reason = 'relative-path'; continue }
@@ -130,17 +164,34 @@ function Invoke-RemoveLaneBulkScratch {
                 if ($isWt) { $e.reason = 'git-worktree'; continue }
                 # One walk: size, reparse points anywhere inside, and nested .git markers. Nothing is followed.
                 $bytes = [int64]0; $bad = $null
-                foreach ($it in Get-ChildItem -LiteralPath $full -Recurse -Force -ErrorAction Stop) {
-                    if ($it.Attributes -band [IO.FileAttributes]::ReparsePoint) { $bad = 'reparse-point'; break }
-                    if ($it.Name -eq '.git') { $bad = 'git-worktree'; break }
-                    if (-not $it.PSIsContainer) { $bytes += $it.Length }
-                }
+                try {
+                    foreach ($it in Get-ChildItem -LiteralPath $full -Recurse -Force -ErrorAction Stop) {
+                        if ($it.Attributes -band [IO.FileAttributes]::ReparsePoint) { $bad = 'reparse-point'; break }
+                        if ($it.Name -eq '.git') { $bad = 'git-worktree'; break }
+                        if (-not $it.PSIsContainer) { $bytes += $it.Length }
+                    }
+                } catch { $e.action = 'failed'; $e.reason = 'walk-failed'; $e.error = $_.Exception.Message; continue }
                 $e.bytes = $bytes
                 if ($bad) { $e.reason = $bad; continue }
                 if ($Keep) { $e.action = 'kept'; $e.reason = 'opt-out'; continue }
-                if ($null -eq $pr) { $pr = if ($PrProbe) { [string](& $PrProbe) } else { Get-LaneScratchPrState $WorkDir } }
+                # Live-holder guard: a detached chain may still be writing here after its lane exited. Every probe that cannot answer refuses.
+                $hold = $null
+                try {
+                    if ($script:LaneBulkHolderLoadError) { throw "holder probe unavailable: $($script:LaneBulkHolderLoadError)" }
+                    if ($null -eq $snap -or ((Get-Date).ToUniversalTime() - $snap.CapturedUtc).TotalSeconds -ge 10) {
+                        $snap = if ($SnapshotProvider) { & $SnapshotProvider } else { Get-LaneProcessSnapshot }
+                    }
+                    if ([string](Get-LaneHolderIndex -Snapshot $snap).CwdProbe -ne 'ok') { throw 'current-directory probe unavailable' }
+                    $hold = @(Find-WorktreeHolders -WorktreePath $full -Snapshot $snap)
+                } catch { $e.reason = 'holder-probe-failed'; $e.error = $_.Exception.Message; $snap = $null; continue }
+                if ($hold.Count) {
+                    $e.action = 'kept'; $e.reason = 'live-process'
+                    $e.holders = @($hold | Select-Object -First 5 | ForEach-Object { "$($_.ProcessId) $($_.Name) via=$($_.Via)" })
+                    continue
+                }
+                if ($null -eq $pr) { $pr = if ($PrProbe) { [string](& $PrProbe) } else { Get-LaneScratchPrState $WorkDir $GhPath $PrTimeoutSeconds } }
                 if ($pr -eq 'open') { $e.reason = 'producer-pr-open'; continue }
-                if ($pr -ne 'none') { $e.reason = 'pr-state-unknown'; continue }
+                if ($pr -ne 'none') { $e.reason = 'pr-state-unknown'; if ($pr -like 'unknown:*') { $e.error = $pr.Substring(8) }; continue }
                 $dest = Join-Path $receiptsRoot ('{0}-{1}' -f $n, (Split-Path -Leaf $full))
                 try {
                     $c = Copy-LaneScratchReceipts $full $dest

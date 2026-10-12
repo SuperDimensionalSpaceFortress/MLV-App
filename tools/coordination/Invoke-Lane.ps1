@@ -126,8 +126,9 @@ param(
     # its size is recorded in the receipt either way.
     [string]$ScratchRoot = 'C:\mlvtmp\lane-scratch',
     # LANE-RECEIPT-SCRATCH-CLEANUP-1: bulk scratch a lane creates OUTSIDE -ScratchRoot (asm, shadow-build,
-    # probe dirs) is listed one absolute path per line in <RunDir>\scratch-paths.txt (the child gets that
-    # path as MLV_LANE_SCRATCH_PATHS). When the lane exits, each path strictly inside -BulkScratchRoot has
+    # probe dirs) is listed one absolute path per line in <RunDir>\scratch-paths.txt, normally through
+    # Register-LaneBulkScratch.ps1 (the child gets MLV_LANE_RUN_DIR and MLV_LANE_SCRATCH_MANIFEST).
+    # When the lane exits, each path strictly inside -BulkScratchRoot has
     # its small text files copied to <RunDir>\scratch-receipts and is removed, unless -KeepBulkScratch.
     # Hard refusals and the receipt's `bulkScratch` field: Remove-LaneBulkScratch.ps1. Fail open.
     [string]$BulkScratchRoot = 'C:\mlvtmp',
@@ -1546,7 +1547,8 @@ if ($ScratchRoot) {
     New-Item -ItemType Directory -Force -Path $scratchDir | Out-Null
     foreach ($v in 'TEMP', 'TMP', 'TMPDIR') { $psi.Environment[$v] = $scratchDir }
 }
-$psi.Environment['MLV_LANE_SCRATCH_PATHS'] = (Join-Path $RunDir 'scratch-paths.txt')
+$psi.Environment['MLV_LANE_RUN_DIR'] = $RunDir
+$psi.Environment['MLV_LANE_SCRATCH_MANIFEST'] = (Join-Path $RunDir 'scratch-paths.txt')
 $psi.RedirectStandardInput  = $true
 $psi.RedirectStandardOutput = $true
 $psi.RedirectStandardError  = $true

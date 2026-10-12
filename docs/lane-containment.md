@@ -371,13 +371,24 @@ minus `examined` minus `young` is what the budget left unvisited.
 The per-run `-ScratchRoot` dir (TEMP/TMP) is removed at lane exit, but asm, shadow-build and probe dirs a
 lane names by hand under `C:\mlvtmp` were never removed by anything (the retention timer files them as
 `kind=other` / keep; 7 GiB across 73 dirs on 2026-10-12). A lane now lists each one, absolute path per
-line, in `<RunDir>\scratch-paths.txt` (the child sees that path as `MLV_LANE_SCRATCH_PATHS`). At exit,
-before the receipt is written, `tools/coordination/Remove-LaneBulkScratch.ps1` copies each path's small
-text files (`*.txt`, `*.json`, `*.log` under 1 MiB, at most 200 files / 20 MiB) to
-`<RunDir>\scratch-receipts\<n>-<leaf>\` and removes the path. It refuses, and records why in the
-receipt's `bulkScratch.entries`, any path that is not plain absolute and strictly inside
-`-BulkScratchRoot` (default `C:\mlvtmp`), is or sits beside `-ScratchRoot` or `-WorkDir`, is or contains a
-git worktree, is or contains a reparse point (never followed), or whose lane branch has an open PR (or
-whose PR state cannot be read). It never throws and never changes the lane's exit code or receipt state;
-`-KeepBulkScratch` records `kept` / `opt-out` and removes nothing. A lane without a manifest gets
-`bulkScratch: null`. Guard: `tests/coordination/test_lane_bulk_scratch.py`.
+line, in `<RunDir>\scratch-paths.txt`. At exit, before the receipt is written,
+`tools/coordination/Remove-LaneBulkScratch.ps1` copies each path's small text files (`*.txt`, `*.json`,
+`*.log` under 1 MiB, at most 200 files / 20 MiB) to `<RunDir>\scratch-receipts\<n>-<leaf>\` and removes the
+path. It refuses, and records why in the receipt's `bulkScratch.entries`, any path that is not plain
+absolute and strictly inside `-BulkScratchRoot` (default `C:\mlvtmp`), is, contains or lies inside
+`-ScratchRoot` or `-WorkDir` (a sibling is not refused), is or contains a git worktree, is or contains a
+reparse point (never followed), is held by a live process (`kept` / `live-process`: the path or one under it
+is a cwd, is on a command line, or is named by a script that process runs; a probe that cannot answer is
+`holder-probe-failed`), or whose lane branch has an open PR (or whose PR state cannot be read; `gh` gets 60 s
+and is killed past it). A failure in the size or reparse walk is `walk-failed`, not `remove-failed`. It
+never throws and never changes the lane's exit code or receipt state; `-KeepBulkScratch` records `kept` /
+`opt-out` and removes nothing. More than 200 distinct manifest lines: the receipt's `bulkScratch.truncated`
+is the count dropped. A lane without a manifest gets `bulkScratch: null`.
+
+**Registering a path.** Call `tools/coordination/Register-LaneBulkScratch.ps1 -RunDir <dir> -Path <abs>`: it
+appends one absolute path to `<RunDir>\scratch-paths.txt`, dedupes, and refuses (exit 2, one line
+`REFUSED reason=...`) a relative path, a path outside `C:\mlvtmp` and a run dir that does not exist.
+`Invoke-Lane.ps1` exports `MLV_LANE_RUN_DIR` and `MLV_LANE_SCRATCH_MANIFEST` to the agent process, so a lane
+passes `-RunDir $env:MLV_LANE_RUN_DIR` with no hand-built path; a detached WMI chain script does not inherit
+environment variables, so its launcher puts the run dir on the chain's command line and the chain passes
+`-RunDir` explicitly. Guard: `tests/coordination/test_lane_bulk_scratch.py`.
