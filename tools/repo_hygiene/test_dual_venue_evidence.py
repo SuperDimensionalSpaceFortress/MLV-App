@@ -76,7 +76,12 @@ COMPOSER = ROOT / "tools" / "profiling" / "make-contact-sheet.py"
 # whatever the host's console-lock state. A move edits baseline lines IN PLACE, which no bracketed region can express, so the pin is that card's own generator commit
 # (cb795f9e: fork/master 6723cd5b plus the move and its comment, nothing else). It already carries every bracketed family, so the baseline counts below are unchanged. The move is
 # pinned by its own test (test_the_root_guard_refuses_an_outside_root_before_the_session_lock_probe in test_playback_attr_3_cuda_behaviour.py), not by byte identity.
-BASELINE_COMMIT = "cb795f9e69dea722996cb366096aa44f4344cc67"
+# GPU-PREF-REGISTRY-STOP-AND-PRUNE-1 r1b moves it again, on purpose: that card DELETES the job's per-exe DirectX GPU-preference registry-write line (NA-8: the owner's graphics
+# state) and puts a comment block in its place. A deletion edits a baseline line IN PLACE, which no bracketed region can express, so the pin is that card's own generator commit
+# (e2e4c148: master b1a4da5a plus that one edit, nothing else -- the generator's diff is exactly that hunk). It already carries every bracketed family, so the baseline counts
+# for PLAYBACK-VSYNC-DEFAULT-1 and HFR-CONFORM-AWARE-RECEIPT-ORACLES-1 below now equal the pinned counts (they were 0 against cb795f9e). The absence of the registry write is
+# pinned by its own test (test_na8_gpu_preference_writers), not by byte identity.
+BASELINE_COMMIT = "e2e4c14830e498b98fdd0e012afb97f6fa41ba1f"
 
 PWSH = shutil.which("pwsh")
 requires_windows_pwsh = unittest.skipIf(PWSH is None or sys.platform != "win32", "needs pwsh on Windows")
@@ -314,9 +319,9 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         self.assertEqual(new_counts["session-locked"], self.SESSION_LOCKED_REGIONS, "the default job carries exactly the pinned number of bracketed VENUE-SESSION-LOCKED-REFUSAL-1 regions")
         self.assertEqual(old_counts["session-locked"], self.SESSION_LOCKED_REGIONS, "the baseline (the pinned KEEPALIVE-FAILURE-PUBLISH-LAST-1 generator commit) carries the same bracketed regions")
         self.assertEqual(new_counts["playback-vsync"], self.PLAYBACK_VSYNC_REGIONS, "the default job carries exactly the pinned number of bracketed PLAYBACK-VSYNC-DEFAULT-1 regions")
-        self.assertEqual(old_counts["playback-vsync"], 0, "the baseline predates PLAYBACK-VSYNC-DEFAULT-1")
+        self.assertEqual(old_counts["playback-vsync"], self.PLAYBACK_VSYNC_REGIONS, "the baseline (the pinned GPU-PREF-REGISTRY-STOP-AND-PRUNE-1 generator commit) carries the same bracketed regions")
         self.assertEqual(new_counts["hfr-conform-oracles"], self.HFR_CONFORM_REGIONS, "the default job carries exactly the pinned number of bracketed HFR-CONFORM-AWARE-RECEIPT-ORACLES-1 regions")
-        self.assertEqual(old_counts["hfr-conform-oracles"], 0, "the baseline predates HFR-CONFORM-AWARE-RECEIPT-ORACLES-1")
+        self.assertEqual(old_counts["hfr-conform-oracles"], self.HFR_CONFORM_REGIONS, "the baseline (the pinned GPU-PREF-REGISTRY-STOP-AND-PRUNE-1 generator commit) carries the same bracketed regions")
         self.assertEqual(stripped, old_stripped,
                          "the DEFAULT (bachelor/cuda) emitted job changed outside the bracketed regions -- it must stay byte-identical to the pinned baseline")
 
@@ -5957,12 +5962,12 @@ class LookReceiptGeneratorTests(unittest.TestCase):
                 kept, new_counts = GeneratorByteIdentityAndVariantTests.strip_regions(new.decode("utf-8"))
                 old_kept, old_counts = GeneratorByteIdentityAndVariantTests.strip_regions(old.decode("utf-8"))
                 self.assertGreater(new_counts["session-locked"], 0)
-                # PLAYBACK-VSYNC-DEFAULT-1's regions postdate the base generator: present in the new job only, at their pinned count.
+                # PLAYBACK-VSYNC-DEFAULT-1's regions: present in the new job and in the base generator (the pinned GPU-PREF-REGISTRY-STOP-AND-PRUNE-1 commit), at their pinned count.
                 self.assertEqual((new_counts.pop("playback-vsync"), old_counts.pop("playback-vsync")),
-                                 (GeneratorByteIdentityAndVariantTests.PLAYBACK_VSYNC_REGIONS, 0), name)
-                # HFR-CONFORM-AWARE-RECEIPT-ORACLES-1's regions postdate the base generator too: present in the new job only, at their pinned count.
+                                 (GeneratorByteIdentityAndVariantTests.PLAYBACK_VSYNC_REGIONS, GeneratorByteIdentityAndVariantTests.PLAYBACK_VSYNC_REGIONS), name)
+                # HFR-CONFORM-AWARE-RECEIPT-ORACLES-1's regions: present in both too, at their pinned count.
                 self.assertEqual((new_counts.pop("hfr-conform-oracles"), old_counts.pop("hfr-conform-oracles")),
-                                 (GeneratorByteIdentityAndVariantTests.HFR_CONFORM_REGIONS, 0), name)
+                                 (GeneratorByteIdentityAndVariantTests.HFR_CONFORM_REGIONS, GeneratorByteIdentityAndVariantTests.HFR_CONFORM_REGIONS), name)
                 self.assertEqual(new_counts, old_counts, f"{name}: the job without -LookReceiptPath carries the base generator's bracketed regions")
                 self.assertEqual(kept, old_kept, f"{name}: the job without -LookReceiptPath must be the base generator's bytes")
                 self.assertNotIn(b"LookReceipt", new)

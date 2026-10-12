@@ -24,13 +24,9 @@ try {
     $json = "$bundle\results\ssh-gpu-probe.json"
     New-Item -ItemType Directory -Force -Path "$bundle\results" | Out-Null
 
-    # Force MLVApp onto the high-performance GPU (the 4090) for OpenGL. On hybrid
-    # Intel+NVIDIA systems the GL context defaults to the iGPU; GpuPreference=2 =
-    # "High performance" in Windows graphics settings, which also steers GL/Vulkan.
-    $prefKey = 'HKCU:\Software\Microsoft\DirectX\UserGpuPreferences'
-    New-Item -Path $prefKey -Force | Out-Null
-    New-ItemProperty -Path $prefKey -Name $exe -Value 'GpuPreference=2;' -PropertyType String -Force | Out-Null
-    "set GpuPreference=2 (high-perf) for $exe"
+    # NA-8: the owner's per-app Windows GPU preference is never written. MLVApp.exe requests the
+    # discrete GPU itself (NvOptimusEnablement / AmdPowerXpressRequestHighPerformance); the VERDICT
+    # below reports the renderer it actually got.
 
     "host: $env:COMPUTERNAME   session GPU check:"
     & nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader 2>&1 | ForEach-Object { "  $_" }
