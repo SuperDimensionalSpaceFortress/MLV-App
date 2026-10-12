@@ -2395,7 +2395,7 @@ MainWindow::~MainWindow()
     {
         std::lock_guard<std::mutex> lk( m_playbackPrepMutex );
         m_playbackPrepStop.store( true, std::memory_order_release );
-        m_playbackPrepPendingValid = false;
+        m_playbackPrepPending.clear();
     }
     m_playbackPrepCv.notify_all();
     if( m_playbackPrepThread.joinable() ) m_playbackPrepThread.join();
@@ -2575,6 +2575,24 @@ int MainWindow::currentPlaybackAdvanceTarget()
 bool MainWindow::renderThreadBusyForPlaybackAdvance( int activePlaybackTarget )
 {
     if( !m_pRenderThread ) return false;
+    // PLAYBACK-CPU-PACE-GAP-1 r3: with drop-frame off every frame is presented, so the advance also waits for a
+    // full prep stage and for a rendered target drawFrameReady has not taken yet (bounded, see AdvanceHold).
+    if( playbackPrepLosslessActive( ui->actionPlay->isChecked(), ui->actionDropFrameMode->isChecked() ) )
+    {
+        const uint64_t activeGeneration =
+            m_playbackPresentationGeneration.load( std::memory_order_acquire );
+        const bool held = playback_drop_off::advanceHeld(
+            true,
+            playbackPrepBacklog(),
+            activePlaybackTarget >= 0
+                && m_pRenderThread->hasReadyPlaybackFrame( static_cast<uint32_t>( activePlaybackTarget ),
+                                                           activeGeneration ) );
+        if( m_playbackDropOffAdvanceHold.hold( held, mlv_stage_timing_now() * 1000.0 ) ) return true;
+    }
+    else
+    {
+        m_playbackDropOffAdvanceHold.hold( false, 0.0 );
+    }
     if( ui->actionPlay->isChecked() && playbackRenderLookaheadFrames() > 0 )
     {
         return !m_pRenderThread->isIdleExceptPlaybackLookahead(
@@ -2582,6 +2600,14 @@ bool MainWindow::renderThreadBusyForPlaybackAdvance( int activePlaybackTarget )
             m_playbackPresentationGeneration.load( std::memory_order_acquire ) );
     }
     return !m_pRenderThread->isIdle();
+}
+
+// Frames the prep stage holds that are not presented yet: queued, computing, or finished and waiting for the GUI.
+int MainWindow::playbackPrepBacklog()
+{
+    std::lock_guard<std::mutex> lk( m_playbackPrepMutex );
+    return static_cast<int>( m_playbackPrepPending.size() + m_playbackPrepResults.size() )
+         + ( m_playbackPrepComputing ? 1 : 0 );
 }
 
 static int mlvappStartPlaybackTimer( QObject *owner, double framerate )
@@ -2622,6 +2648,12 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
         }
     };
 
+    // PLAYBACK-CPU-PACE-GAP-1 r3: with drop-frame off a cached "not busy" from before the last request (a lookahead
+    // hit leaves it unset) let the poll step past frames the GUI had not taken yet, so ask the gate afresh.
+    if( playbackPrepLosslessActive( ui->actionPlay->isChecked(), ui->actionDropFrameMode->isChecked() ) )
+    {
+        m_frameStillDrawing = renderThreadBusyForPlaybackAdvance( currentPlaybackAdvanceTarget() );
+    }
     if( m_frameStillDrawing )
     {
         const bool allowPredictiveBusyAdvance =
@@ -3629,16 +3661,18 @@ void MainWindow::enqueuePlaybackPrepTask( const PlaybackPrepTask &task )
     m_latestRequestedSerial.store( ownedTask.requestSerial, std::memory_order_release );
     {
         std::lock_guard<std::mutex> lk( m_playbackPrepMutex );
-        if( m_playbackPrepPendingValid )
+        if( playbackPrepConflatesOlderWork( ownedTask.losslessPresent ) )
         {
-            ++m_playbackPrepReplacedBeforeComputeCount;
-            if( m_pRenderThread )
-                m_pRenderThread->releasePresentedFrameForRequestSerial(
-                    m_playbackPrepPending.requestSerial );
+            for( const PlaybackPrepTask &replaced : m_playbackPrepPending )
+            {
+                ++m_playbackPrepReplacedBeforeComputeCount;
+                if( m_pRenderThread )
+                    m_pRenderThread->releasePresentedFrameForRequestSerial( replaced.requestSerial );
+            }
+            m_playbackPrepPending.clear();
         }
-        m_playbackPrepPending = ownedTask;
-        m_playbackPrepPending.rebindOwnedImagePointers();
-        m_playbackPrepPendingValid = true;
+        m_playbackPrepPending.push_back( ownedTask );
+        m_playbackPrepPending.back().rebindOwnedImagePointers();
     }
     m_playbackPrepCv.notify_one();
 }
@@ -3653,19 +3687,18 @@ void MainWindow::invalidatePlaybackPrepForDisplayChange( const char *reason )
     // guard so the next (correct) frame is shown regardless of the previous run.
     m_lastPresentedPlaybackFrame = -1;
     std::vector<uint64_t> serialsToRelease;
-    bool droppedPending = false;
+    size_t droppedPendingCount = 0;
     size_t droppedResults = 0;
     int cancelledRenderRequests = 0;
 
     {
         std::lock_guard<std::mutex> lk( m_playbackPrepMutex );
-        if( m_playbackPrepPendingValid )
+        droppedPendingCount = m_playbackPrepPending.size();
+        for( const PlaybackPrepTask &pending : m_playbackPrepPending )
         {
-            droppedPending = true;
-            serialsToRelease.push_back( m_playbackPrepPending.requestSerial );
-            m_playbackPrepPendingValid = false;
-            m_playbackPrepPending = PlaybackPrepTask();
+            serialsToRelease.push_back( pending.requestSerial );
         }
+        m_playbackPrepPending.clear();
         droppedResults = m_playbackPrepResults.size();
         for( const PlaybackPrepResult &result : m_playbackPrepResults )
         {
@@ -3675,7 +3708,7 @@ void MainWindow::invalidatePlaybackPrepForDisplayChange( const char *reason )
     }
 
     const uint64_t droppedCount =
-        static_cast<uint64_t>( droppedResults + ( droppedPending ? 1 : 0 ) );
+        static_cast<uint64_t>( droppedResults + droppedPendingCount );
     if( droppedCount > 0 )
     {
         m_playbackPrepStaleDropCount.fetch_add( droppedCount, std::memory_order_acq_rel );
@@ -3702,7 +3735,7 @@ void MainWindow::invalidatePlaybackPrepForDisplayChange( const char *reason )
         QStringLiteral("reason=%1 new_generation=%2 dropped_pending=%3 dropped_results=%4 released_serials=%5 cancelled_render=%6 latest_serial=%7 still_drawing=%8")
             .arg( reason && *reason ? QString::fromLatin1( reason ) : QStringLiteral("unspecified") )
             .arg( static_cast<qulonglong>( newGeneration ) )
-            .arg( bool01( droppedPending ) )
+            .arg( bool01( droppedPendingCount > 0 ) )
             .arg( static_cast<qulonglong>( droppedResults ) )
             .arg( static_cast<qulonglong>( serialsToRelease.size() ) )
             .arg( cancelledRenderRequests )
@@ -4377,12 +4410,13 @@ void MainWindow::playbackPrepThreadLoop( void )
             std::unique_lock<std::mutex> lk( m_playbackPrepMutex );
             m_playbackPrepCv.wait( lk, [this]{
                 return m_playbackPrepStop.load( std::memory_order_acquire )
-                    || m_playbackPrepPendingValid;
+                    || !m_playbackPrepPending.empty();
             } );
             if( m_playbackPrepStop.load( std::memory_order_acquire ) ) return;
-            task = m_playbackPrepPending;
+            task = m_playbackPrepPending.front();
             task.rebindOwnedImagePointers();
-            m_playbackPrepPendingValid = false;
+            m_playbackPrepPending.pop_front();
+            m_playbackPrepComputing = true;
         }
 
         const double workerStart = mlv_stage_timing_now();
@@ -4398,9 +4432,11 @@ void MainWindow::playbackPrepThreadLoop( void )
         if( !playbackPrepTaskShouldCompute( task.requestSerial,
                                             latestBeforeCompute,
                                             task.presentationGeneration,
-                                            activeGenerationBeforeCompute ) )
+                                            activeGenerationBeforeCompute,
+                                            task.losslessPresent ) )
         {
             std::lock_guard<std::mutex> lk( m_playbackPrepMutex );
+            m_playbackPrepComputing = false;
             ++m_playbackPrepStaleDropCount;
             if( task.presentationGeneration != activeGenerationBeforeCompute )
                 ++m_playbackPrepGenerationDropCount;
@@ -4422,6 +4458,7 @@ void MainWindow::playbackPrepThreadLoop( void )
                 result.task.presentationGeneration, activeGeneration ) )
         {
             std::lock_guard<std::mutex> lk( m_playbackPrepMutex );
+            m_playbackPrepComputing = false;
             ++m_playbackPrepStaleDropCount;
             ++m_playbackPrepGenerationDropCount;
             if( m_pRenderThread )
@@ -4430,6 +4467,10 @@ void MainWindow::playbackPrepThreadLoop( void )
         }
         if( m_playbackPrepStop.load( std::memory_order_acquire ) )
         {
+            {
+                std::lock_guard<std::mutex> lk( m_playbackPrepMutex );
+                m_playbackPrepComputing = false;
+            }
             if( m_pRenderThread )
                 m_pRenderThread->releasePresentedFrameForRequestSerial( result.task.requestSerial );
             continue;
@@ -4438,7 +4479,9 @@ void MainWindow::playbackPrepThreadLoop( void )
         result.resultReadyTime = mlv_stage_timing_now();
         {
             std::lock_guard<std::mutex> lk( m_playbackPrepMutex );
-            if( !m_playbackPrepResults.empty() )
+            m_playbackPrepComputing = false;
+            if( !m_playbackPrepResults.empty()
+             && playbackPrepConflatesOlderWork( result.task.losslessPresent ) )
             {
                 for( const PlaybackPrepResult &staleResult : m_playbackPrepResults )
                 {
@@ -24215,6 +24258,7 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     m_playbackLookaheadCoveredRequests = 0;
     m_playbackLookaheadDroppedReady = 0;
     m_playbackLookaheadPruned = 0;
+    m_playbackDropOffAdvanceHold.resetCounters();
     for( uint64_t &count : m_playbackLookaheadCpuRouteRefusalCounts ) count = 0;
     if( m_pRenderThread ) m_pRenderThread->resetPipelineOverlapMeter();
     m_playbackSmokeActive = true;
@@ -27654,7 +27698,12 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                     m_playbackLookaheadCpuRouteRefusalLast ) ) )
                 .arg( cpuRefusalCounts.join( QLatin1Char(',') ) )
                 .arg( static_cast<qulonglong>( m_playbackLookaheadDroppedReady ) )
-                .arg( static_cast<qulonglong>( m_playbackLookaheadPruned ) );
+                .arg( static_cast<qulonglong>( m_playbackLookaheadPruned ) )
+            // PLAYBACK-CPU-PACE-GAP-1 r3: drop-frame off holds the advance for the prep stage (PlaybackPrepPresentationPolicy.h).
+            + QStringLiteral( " drop_off_lossless=%1 drop_off_advance_holds=%2 drop_off_hold_timeouts=%3" )
+                .arg( bool01( playbackPrepLosslessActive( true, ui->actionDropFrameMode->isChecked() ) ) )
+                .arg( static_cast<qulonglong>( m_playbackDropOffAdvanceHold.holds ) )
+                .arg( static_cast<qulonglong>( m_playbackDropOffAdvanceHold.timeouts ) );
         qInfo().noquote()
             << QStringLiteral(
                    "playback_smoke.overlap_summary session=%1 lookahead_depth=%2 "
@@ -31537,6 +31586,8 @@ void MainWindow::drawFrameReady()
     task.requestContext = requestContext;
     task.requestSerial = readyFrame.requestSerial;
     task.presentationGeneration = requestContext.presentationGeneration;
+    task.losslessPresent =
+        playbackPrepLosslessActive( ui->actionPlay->isChecked(), ui->actionDropFrameMode->isChecked() );
     task.displayStart = display_start;
     task.displayFrame = display_frame;
     task.stretchX = stretchX;

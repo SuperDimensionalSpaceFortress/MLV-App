@@ -33,6 +33,7 @@
 #include "SessionModel.h"
 #include "PlaybackFrameRange.h"
 #include "PlaybackNativePaceGuard.h"
+#include "PlaybackPrepPresentationPolicy.h"
 #include "PlaybackSlipHistogram.h"
 #include "../../src/mlv_include.h"
 #include "InfoDialog.h"
@@ -656,6 +657,7 @@ private:
         PresentationRequestContext requestContext;
         uint64_t requestSerial = 0;
         uint64_t presentationGeneration = 0;
+        bool losslessPresent = false; // drop-frame off: never conflated away (PlaybackPrepPresentationPolicy.h)
         double displayStart = 0.0;
         double enqueueTime = 0.0;
         double preEnqueueMs = 0.0;
@@ -1163,6 +1165,7 @@ private:
     int playbackRenderLookaheadFrames() const;
     int currentPlaybackAdvanceTarget();
     bool renderThreadBusyForPlaybackAdvance( int activePlaybackTarget );
+    int playbackPrepBacklog();
     bool m_automationPacingIsolated = false;
     // ENFORCE-4: the autoplay hook's verdict is a fail-closed LATCH (PlaybackFrameRange.h): armed failing (14) when the hook
     // is installed, cleared only by consumption (Reached). Closing the app before the poll resolves exits 14, never 0.
@@ -1562,15 +1565,18 @@ private:
     //   underneath it, such as Playback Scale x2/x4 -> x1.
     // - Conflation queue semantics: at most one in-flight task ("current") and
     //   at most one queued task ("pending"). New enqueues replace pending.
+    //   With drop-frame off (losslessPresent) pending and results are FIFO
+    //   instead, bounded by the drop-off advance hold.
     std::atomic<uint64_t> m_latestRequestedSerial{0};
     std::atomic<uint64_t> m_playbackPresentationGeneration{1};
     std::thread m_playbackPrepThread;
     std::mutex m_playbackPrepMutex;
     std::condition_variable m_playbackPrepCv;
     std::atomic<bool> m_playbackPrepStop{false};
-    bool m_playbackPrepPendingValid = false;
-    PlaybackPrepTask m_playbackPrepPending;
+    std::deque<PlaybackPrepTask> m_playbackPrepPending;
+    bool m_playbackPrepComputing = false; // guarded by m_playbackPrepMutex
     std::deque<PlaybackPrepResult> m_playbackPrepResults;
+    playback_drop_off::AdvanceHold m_playbackDropOffAdvanceHold;
     std::atomic<uint64_t> m_playbackPrepStaleDropCount{0};
     std::atomic<uint64_t> m_playbackPrepGenerationDropCount{0};
     std::atomic<uint64_t> m_playbackPrepReplacedBeforeComputeCount{0};

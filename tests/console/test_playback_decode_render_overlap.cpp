@@ -15,6 +15,7 @@
 
 #include "../../platform/qt/PlaybackDecodeRenderOverlap.h"
 #include "../../platform/qt/PlaybackNativePaceGuard.h"
+#include "../../platform/qt/PlaybackPrepPresentationPolicy.h"
 
 #include <QFile>
 #include <QString>
@@ -527,6 +528,146 @@ TEST(PlaybackDecodeRenderOverlapPipeline, AtAStrideOfTwoAndAHalfTheLookaheadFram
     ASSERT_TRUE( lookahead.presentedFpsAfterFirst() <= serial.presentedFpsAfterFirst() * 1.02 ); // and bought nothing
 }
 
+// ---- PLAYBACK-CPU-PACE-GAP-1 r3: drop-frame off presents every frame, lookahead or not ----------------------------
+// r2 on Bachelor, drop-frame off: with the CPU lookahead the render side outran prep + present, and the prep queue
+// conflated by serial (a new task replaced the pending one, a finished result discarded the unpresented one), so arm A
+// showed 399 of 599 frames at s2 (prep_replaced_after=123). The fake pipeline below has the same four stages -- render
+// (one lookahead frame), the prep worker, the GUI present and the native-paced advance -- and runs them on the policy
+// MainWindow uses.
+namespace
+{
+
+struct DropOffRun
+{
+    int presented = 0;
+    bool inOrder = true;
+    int maxPrepBacklog = 0;
+    double elapsedMs = 0.0;
+    uint64_t holdTimeouts = 0;
+};
+
+DropOffRun simulateDropOffPlayback( bool r3Policy, int frames, double renderMs, double prepMs, double presentMs )
+{
+    using namespace playback_drop_off;
+    DropOffRun run;
+    const double periodMs = 1000.0 / kNativeFps;
+    int target = 0, nextRender = 0, rendering = -1, computing = -1, presenting = -1, lastPresented = -1;
+    double renderUntil = 0.0, prepUntil = 0.0, presentUntil = 0.0, lastAdvanceMs = -1.0e9;
+    bool targetTaken = false;
+    std::set<int> ready;
+    std::deque<int> pending, results;
+    AdvanceHold hold;
+    double now = 0.0;
+    for( ; now < 120000.0; now += kStepMs )
+    {
+        if( rendering >= 0 && now >= renderUntil ) { ready.insert( rendering ); rendering = -1; }
+        if( rendering < 0 && nextRender < frames && nextRender <= target + 1 )
+        {
+            rendering = nextRender++;
+            renderUntil = now + renderMs;
+        }
+        if( computing >= 0 && now >= prepUntil )
+        {
+            if( playbackPrepConflatesOlderWork( r3Policy ) ) results.clear();
+            results.push_back( computing );
+            computing = -1;
+        }
+        if( computing < 0 && !pending.empty() )
+        {
+            computing = pending.front();
+            pending.pop_front();
+            prepUntil = now + prepMs;
+        }
+        if( presenting >= 0 && now >= presentUntil ) presenting = -1;
+        if( presenting < 0 && !results.empty() )
+        {
+            presenting = results.front();
+            results.pop_front();
+            presentUntil = now + presentMs;
+            if( presenting != lastPresented + 1 ) run.inOrder = false;
+            lastPresented = presenting;
+            ++run.presented;
+        }
+        if( !targetTaken && ready.count( target ) ) // drawFrameReady takes the target into prep
+        {
+            ready.erase( target );
+            targetTaken = true;
+            if( playbackPrepConflatesOlderWork( r3Policy ) ) pending.clear();
+            pending.push_back( target );
+        }
+        const int backlog = static_cast<int>( pending.size() + results.size() ) + ( computing >= 0 ? 1 : 0 );
+        run.maxPrepBacklog = std::max( run.maxPrepBacklog, backlog );
+        if( target + 1 < frames && targetTaken && now - lastAdvanceMs >= periodMs )
+        {
+            if( !hold.hold( advanceHeld( r3Policy, backlog, false ), now ) )
+            {
+                ++target;
+                targetTaken = false;
+                lastAdvanceMs = now;
+            }
+        }
+        if( target + 1 == frames && targetTaken && backlog == 0 && presenting < 0 ) break;
+    }
+    run.elapsedMs = now;
+    run.holdTimeouts = hold.timeouts;
+    return run;
+}
+
+} // namespace
+
+TEST(PlaybackDropOffPrepPolicy, LosslessWorkIsNeverConflatedOrSkippedBySerial)
+{
+    ASSERT_TRUE( playbackPrepLosslessActive( true, false ) );
+    ASSERT_FALSE( playbackPrepLosslessActive( true, true ) );   // drop-frame on keeps the latest-wins queue
+    ASSERT_FALSE( playbackPrepLosslessActive( false, false ) ); // paused/scrub too
+    ASSERT_FALSE( playbackPrepTaskShouldCompute( 41, 42, 7, 7 ) );        // unchanged default
+    ASSERT_TRUE( playbackPrepTaskShouldCompute( 41, 42, 7, 7, true ) );   // an older drop-off frame still computes
+    ASSERT_FALSE( playbackPrepTaskShouldCompute( 41, 42, 7, 8, true ) );  // a display change still drops it
+    ASSERT_TRUE( playbackPrepConflatesOlderWork( false ) );
+    ASSERT_FALSE( playbackPrepConflatesOlderWork( true ) );
+}
+
+TEST(PlaybackDropOffPrepPolicy, TheAdvanceHoldsForAFullPrepStageOrAnUntakenTargetAndNeverForever)
+{
+    using namespace playback_drop_off;
+    ASSERT_FALSE( advanceHeld( false, 9, true ) );                 // drop-frame on: never held
+    ASSERT_FALSE( advanceHeld( true, kPrepMaxInFlight - 1, false ) );
+    ASSERT_TRUE( advanceHeld( true, kPrepMaxInFlight, false ) );
+    ASSERT_TRUE( advanceHeld( true, 0, true ) );
+    AdvanceHold hold;
+    ASSERT_FALSE( hold.hold( false, 0.0 ) );
+    ASSERT_TRUE( hold.hold( true, 10.0 ) );
+    ASSERT_TRUE( hold.hold( true, 10.0 + kAdvanceHoldMaxMs - 1.0 ) );
+    ASSERT_FALSE( hold.hold( true, 10.0 + kAdvanceHoldMaxMs ) );  // the liveness backstop lets one advance through
+    ASSERT_EQ( hold.timeouts, 1u );
+    ASSERT_TRUE( hold.hold( true, 10.0 + kAdvanceHoldMaxMs + 1.0 ) ); // and a new hold starts
+    ASSERT_EQ( hold.holds, 2u );
+    ASSERT_FALSE( hold.hold( false, 2000.0 ) );
+    hold.resetCounters();
+    ASSERT_EQ( hold.holds, 0u );
+    ASSERT_EQ( hold.timeouts, 0u );
+}
+
+TEST(PlaybackDropOffPrepPolicy, DropFrameOffPresentsEveryFrameInOrderWhenRenderOutrunsPresent)
+{
+    // The r2 s2 shape: render 41 ms with one lookahead frame, prep 30 ms, present 60 ms (arm A presented ~81 ms apart).
+    const int kFrames = 240;
+    const DropOffRun lossy = simulateDropOffPlayback( false, kFrames, 41.0, 30.0, 60.0 );
+    const DropOffRun fixed = simulateDropOffPlayback( true, kFrames, 41.0, 30.0, 60.0 );
+    ASSERT_TRUE( lossy.presented < kFrames * 9 / 10 );   // the old conflation loses frames
+    ASSERT_FALSE( lossy.inOrder );
+    ASSERT_EQ( fixed.presented, kFrames );               // r3: every frame
+    ASSERT_TRUE( fixed.inOrder );                        // in order
+    ASSERT_TRUE( fixed.maxPrepBacklog <= playback_drop_off::kPrepMaxInFlight + 1 ); // the queue stays bounded
+    ASSERT_EQ( fixed.holdTimeouts, 0u );                 // the backstop never fires on a healthy pipeline
+    ASSERT_TRUE( fixed.elapsedMs < kFrames * 60.0 * 1.10 ); // and it runs at the present stage's own pace
+    // When present keeps up, the hold costs nothing: native pace, every frame.
+    const DropOffRun fast = simulateDropOffPlayback( true, kFrames, 30.0, 20.0, 25.0 );
+    ASSERT_EQ( fast.presented, kFrames );
+    ASSERT_TRUE( fast.inOrder );
+    ASSERT_TRUE( fast.elapsedMs < kFrames * ( 1000.0 / kNativeFps ) * 1.05 );
+}
+
 // ---- wiring: MainWindow.cpp needs a full GUI build, so its source is read as text --------------------------
 namespace
 {
@@ -576,6 +717,31 @@ TEST(PlaybackDecodeRenderOverlapWiring, TheLookaheadQueueAdmitsTheCpuRouteAndThe
     {
         ASSERT_TRUE( mw.contains( QString::fromLatin1( field ) ) );
     }
+}
+
+TEST(PlaybackDecodeRenderOverlapWiring, DropFrameOffMakesThePrepQueueLosslessAndHoldsTheAdvance)
+{
+    const QString mw = readRepoText( "platform/qt/MainWindow.cpp" );
+    ASSERT_FALSE( mw.isEmpty() );
+    const int gateFn = mw.indexOf( QStringLiteral("bool MainWindow::renderThreadBusyForPlaybackAdvance(") );
+    ASSERT_TRUE( gateFn > 0 );
+    const QString gateBody = mw.mid( gateFn, mw.indexOf( QStringLiteral("\n}\n"), gateFn ) - gateFn );
+    ASSERT_TRUE( gateBody.contains( QStringLiteral("playback_drop_off::advanceHeld(") ) );
+    ASSERT_TRUE( gateBody.contains( QStringLiteral("playbackPrepBacklog()") ) );
+    ASSERT_TRUE( gateBody.contains( QStringLiteral("hasReadyPlaybackFrame(") ) );
+    ASSERT_TRUE( gateBody.contains( QStringLiteral("m_playbackDropOffAdvanceHold.hold(") ) );
+    // The poll asks the gate afresh with drop-frame off instead of trusting a cached "not busy".
+    const int timerFn = mw.indexOf( QStringLiteral("void MainWindow::timerFrameEvent(") );
+    ASSERT_TRUE( timerFn > 0 );
+    const QString timerHead = mw.mid( timerFn, mw.indexOf( QStringLiteral("if( m_frameStillDrawing )"), timerFn ) - timerFn );
+    ASSERT_TRUE( timerHead.contains(
+        QStringLiteral("m_frameStillDrawing = renderThreadBusyForPlaybackAdvance( currentPlaybackAdvanceTarget() );") ) );
+    // The task carries the mode; the enqueue and the publish conflate only lossy work; the worker never skips it.
+    ASSERT_TRUE( mw.contains( QStringLiteral("task.losslessPresent =\n        playbackPrepLosslessActive(") ) );
+    ASSERT_EQ( mw.count( QStringLiteral("playbackPrepConflatesOlderWork(") ), 2 );
+    ASSERT_TRUE( mw.contains( QStringLiteral("activeGenerationBeforeCompute,\n                                            task.losslessPresent ) )") ) );
+    ASSERT_TRUE( mw.contains( QStringLiteral("drop_off_advance_holds=") ) );
+    ASSERT_TRUE( mw.contains( QStringLiteral("drop_off_hold_timeouts=") ) );
 }
 
 TEST(PlaybackDecodeRenderOverlapWiring, TheRenderThreadReportsEveryStageToTheMeter)

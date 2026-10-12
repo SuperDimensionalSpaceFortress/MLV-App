@@ -1462,6 +1462,27 @@ bool RenderFrameThread::hasReadyPlaybackLookaheadFrame( uint32_t frameNumber,
     return false;
 }
 
+// PLAYBACK-CPU-PACE-GAP-1 r3: rendered but not yet taken by drawFrameReady, lookahead or not. With drop-frame off
+// the playback advance holds on it, because moving the target past it prunes a frame that was never shown.
+bool RenderFrameThread::hasReadyPlaybackFrame( uint32_t frameNumber,
+                                               uint64_t activeGeneration )
+{
+    QMutexLocker locker(&m_mutex);
+    for( int i = 0; i < static_cast<int>( m_frameSlots.size() ); ++i )
+    {
+        const FrameSlot &slot = m_frameSlots[i];
+        if( !slot.ready ) continue;
+        if( slot.state.load( std::memory_order_acquire ) != SlotState::Ready )
+            continue;
+        if( slot.frameNumber == frameNumber
+         && slot.presentationContext.presentationGeneration == activeGeneration )
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 int RenderFrameThread::prunePlaybackLookaheadOutsideForwardWindow(
     int activePlaybackTarget,
     uint64_t activeGeneration,
