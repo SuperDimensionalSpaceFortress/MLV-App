@@ -1017,6 +1017,62 @@ TEST(GpuFieldTelemetry, CapturesTakeFromTheirOwnChannelOnce)
     ASSERT_EQ(4, (int)llrawproc.count(QStringLiteral("llrawproc_gpu_stage_telemetry_capture(g, ")));
 }
 
+// r5 B1/B2/H1 wiring (sol r3 blocker, fable r3 uncaptured sites, both keys' drop visibility): the
+// recon DLL exports the drain and the pending word; llrawproc resolves both, each of the 4 captured
+// calls is entered (orphans drained) before its backend call, the entry check is one relaxed load
+// before any drain, and a capture drains every note rather than taking one. The fault line carries
+// role and dropped. Runtime proof: pipeline_tests GpuFieldTelemetryCapture.* (r5 tests).
+TEST(GpuFieldTelemetry, CapturesDrainEveryNoteAndOrphansAtEntry)
+{
+    const QString def = readRepoFile(QStringLiteral("tools/gpu/backend/igpu_recon_cuda.def"));
+    ASSERT_TRUE(def.contains(QStringLiteral("    igpu_recon_drain_cuda_errors\n")));
+    ASSERT_TRUE(def.contains(QStringLiteral("    igpu_recon_cuda_error_pending_word\n")));
+    const QString recon = readRepoFile(QStringLiteral("tools/gpu/backend/igpu_recon_cuda.cu"));
+    ASSERT_TRUE(recon.contains(QStringLiteral("    return igpu_cuda_error_slot::drain(channel, out, capacity, dropped);\n}")));
+    ASSERT_TRUE(recon.contains(QStringLiteral("    return igpu_cuda_error_slot::pending_word(channel);\n}")));
+    const QString slot = readRepoFile(QStringLiteral("tools/gpu/backend/igpu_cuda_error_slot.h"));
+    ASSERT_TRUE(slot.contains(QStringLiteral("        ++r.dropped;\n")));
+    ASSERT_EQ(3, (int)slot.count(QStringLiteral("s.pending_size[channel].store(")));
+
+    const QString llrawproc = readRepoFile(QStringLiteral("src/mlv/llrawproc/llrawproc.c"));
+    ASSERT_TRUE(llrawproc.contains(QStringLiteral("GetProcAddress(g->dll, \"igpu_recon_drain_cuda_errors\")")));
+    ASSERT_TRUE(llrawproc.contains(QStringLiteral("GetProcAddress(g->dll, \"igpu_recon_cuda_error_pending_word\")")));
+    ASSERT_EQ(4, (int)llrawproc.count(QStringLiteral("llrawproc_gpu_stage_telemetry_enter(g, ")));
+    // The entry: one relaxed load decides; the drain (its lock) only when something is pending.
+    ASSERT_TRUE(llrawproc.contains(QStringLiteral(
+        "    if(g->cuda_error_pending[channel]\n"
+        "     && __atomic_load_n(g->cuda_error_pending[channel], __ATOMIC_RELAXED) != 0)\n"
+        "    {\n"
+        "        llrawproc_gpu_stage_telemetry_drain(g, channel, &ev->orphans);\n")));
+    // The capture drains every note of a failed call (no single take).
+    ASSERT_TRUE(llrawproc.contains(QStringLiteral(
+        "    if(rc != 0) llrawproc_gpu_stage_telemetry_drain(g, channel, &ev->noted);\n")));
+    // Each entry precedes its backend call.
+    const int enterClip = llrawproc.indexOf(QStringLiteral("llrawproc_gpu_stage_telemetry_enter(g, set_clip_event,"));
+    const int enterLuts = llrawproc.indexOf(QStringLiteral("llrawproc_gpu_stage_telemetry_enter(g, set_luts_event,"));
+    const int enterRun = llrawproc.indexOf(QStringLiteral("llrawproc_gpu_stage_telemetry_enter(g, run_event,"));
+    const int enterPre = llrawproc.indexOf(QStringLiteral("llrawproc_gpu_stage_telemetry_enter(g, &telemetry_event,"));
+    ASSERT_TRUE(enterClip > 0 && enterClip < llrawproc.indexOf(QStringLiteral("rc = g->set_clip(g->backend, &clip);")));
+    ASSERT_TRUE(enterLuts > 0 && enterLuts < llrawproc.indexOf(QStringLiteral("rc = g->set_luts(g->backend, &luts);")));
+    ASSERT_TRUE(enterRun > 0 && enterRun < llrawproc.indexOf(QStringLiteral("rc = g->run_preuploaded(g->backend,")));
+    ASSERT_TRUE(enterPre > 0 && enterPre < llrawproc.indexOf(QStringLiteral("rc = g->preupload_frame(g->backend,")));
+
+    core::Fault f;
+    f.dll = "recon";
+    f.stage = "recon:uncaptured";
+    f.cudaCode = 700;
+    f.site = "gl_r16:map";
+    f.role = "orphan";
+    f.dropped = 3;
+    const QJsonObject o = parseLine(core::formatFault("s", "utc", f));
+    ASSERT_EQ(std::string("orphan"), o.value(QStringLiteral("role")).toString().toStdString());
+    ASSERT_EQ(3, o.value(QStringLiteral("dropped")).toInt());
+    ASSERT_EQ(std::string("gl_r16:map"), o.value(QStringLiteral("site")).toString().toStdString());
+    const QJsonObject d = parseLine(core::formatFault("s", "utc", core::Fault()));
+    ASSERT_EQ(std::string("primary"), d.value(QStringLiteral("role")).toString().toStdString());
+    ASSERT_EQ(0, d.value(QStringLiteral("dropped")).toInt());
+}
+
 // r3 H4 (both keys, exit join): the System-log read ends inside the session-end wait, quit is held
 // for at most ~2 s, the worker stops before each step, and State outlives a worker session end
 // gave up on. EvtNext waits are a value table, not a timing claim.

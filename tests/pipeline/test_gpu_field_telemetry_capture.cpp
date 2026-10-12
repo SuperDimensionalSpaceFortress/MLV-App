@@ -7,7 +7,11 @@
 // function-local gate latches OFF before anything can read it; the ON-path line text, aggregate and
 // rotation are pinned in tests/console/test_gpu_field_telemetry.cpp. (3) r4: the recon DLL's
 // per-channel slot (igpu_cuda_error_slot.h, host-only, driven directly) and llrawproc's captures
-// keep a preupload fault and an overlapping render fault apart, each reported once.
+// keep a preupload fault and an overlapping render fault apart, each reported once. (4) r5: a failed
+// call reports EVERY code it noted (primary, then secondary), a code noted by a call nothing
+// captures is emitted as an orphan against its own site and never credited to the next call, and
+// queue drops are counted (dropped=N). In-call notes are armed so the fake notes them inside its
+// call, as a real failure branch does; NoteCudaErrorForTesting notes at once, between calls.
 #include "../common/minitest.h"
 #include "../../src/mlv/llrawproc/llrawproc.h"
 #include "../../platform/qt/GpuFieldTelemetry.h"
@@ -26,6 +30,8 @@ extern "C" int llrpResetGpuExportBackendForTesting(void);
 extern "C" void llrpFakeGpuBackendInjectRunFailureForTesting(int rc, int cuda_code, const char * name);
 extern "C" void llrpFakeGpuBackendInjectPreuploadFailureForTesting(int rc, int cuda_code, const char * name);
 extern "C" void llrpFakeGpuBackendNoteCudaErrorForTesting(int channel, int cuda_code, const char * name, const char * site);
+extern "C" void llrpFakeGpuBackendArmCudaNoteForTesting(int channel, int cuda_code, const char * name, const char * site);
+extern "C" long llrpFakeGpuBackendCudaErrorsPendingForTesting(int channel, unsigned long long * dropped_total);
 
 namespace
 {
@@ -57,13 +63,17 @@ struct SinkCall
     int cudaCode;
     std::string cudaName;
     std::string site;
+    std::string role; // "" = a success record (role NULL)
+    unsigned long long dropped;
 };
 
 std::vector<SinkCall> g_calls;
 
-void recordingSink(const char * stage, int rc, double ms, int cudaCode, const char * cudaName, const char * site)
+void recordingSink(const char * stage, int rc, double ms, int cudaCode, const char * cudaName, const char * site,
+                   const char * role, unsigned long long dropped)
 {
-    g_calls.push_back({stage ? stage : "", rc, ms, cudaCode, cudaName ? cudaName : "", site ? site : ""});
+    g_calls.push_back({stage ? stage : "", rc, ms, cudaCode, cudaName ? cudaName : "", site ? site : "",
+                       role ? role : "", dropped});
 }
 
 struct SinkScope
@@ -141,6 +151,9 @@ void drainSlot()
     {
         for (int i = 0; i < cuda_slot::kPending; ++i) take(channel);
         ASSERT_EQ(0, take(channel).code);
+        // r5: and absorb any drop count an earlier test left unreported.
+        igpu_cuda_error_t out[cuda_slot::kPending];
+        ASSERT_EQ(0, cuda_slot::drain(channel, out, cuda_slot::kPending, nullptr));
     }
 }
 } // namespace
@@ -346,7 +359,8 @@ TEST(GpuFieldTelemetryCapture, PreuploadSetDeviceFailureCarriesItsCode)
     ASSERT_NE(0, runOnce(1, &rc));
     ASSERT_EQ(0, rc);
     g_calls.clear();
-    llrpFakeGpuBackendNoteCudaErrorForTesting(kPreupload, 101, "cudaErrorInvalidDevice", "preupload:set_device");
+    // r5: armed, so the fake notes it inside the preupload call, as the DLL's branch does.
+    llrpFakeGpuBackendArmCudaNoteForTesting(kPreupload, 101, "cudaErrorInvalidDevice", "preupload:set_device");
     llrpFakeGpuBackendInjectPreuploadFailureForTesting(-1, 0, nullptr);
     ASSERT_EQ(0, preuploadOnce(2));
     ASSERT_EQ(1, (int)g_calls.size());
@@ -465,8 +479,10 @@ TEST(GpuFieldTelemetryCapture, OverlappingPreuploadAndRenderFaultsKeepBothCodesO
     ASSERT_EQ(0, rc);
     g_calls.clear();
 
-    llrpFakeGpuBackendNoteCudaErrorForTesting(kPreupload, 2, "cudaErrorMemoryAllocation", "preupload:malloc_device");
-    llrpFakeGpuBackendNoteCudaErrorForTesting(kRender, 700, "cudaErrorIllegalAddress", "run:kernel");
+    // r5: each note is armed into its own call (a single thread cannot interleave the two calls;
+    // the channels keep them apart whatever the order).
+    llrpFakeGpuBackendArmCudaNoteForTesting(kPreupload, 2, "cudaErrorMemoryAllocation", "preupload:malloc_device");
+    llrpFakeGpuBackendArmCudaNoteForTesting(kRender, 700, "cudaErrorIllegalAddress", "run:kernel");
     llrpFakeGpuBackendInjectPreuploadFailureForTesting(-1, 0, nullptr);
     ASSERT_EQ(0, preuploadOnce(2));
     llrpFakeGpuBackendInjectRunFailureForTesting(-1, 0, nullptr);
@@ -510,7 +526,7 @@ TEST(GpuFieldTelemetryCapture, InterleavedCapturesKeepTheirStageAndNeverRepeat)
     ASSERT_NE(0, runOnce(1, &rc));
     g_calls.clear();
 
-    llrpFakeGpuBackendNoteCudaErrorForTesting(kPreupload, 2, "cudaErrorMemoryAllocation", "preupload:submit"); // A
+    llrpFakeGpuBackendArmCudaNoteForTesting(kPreupload, 2, "cudaErrorMemoryAllocation", "preupload:submit");  // A (r5: in its call)
     llrpFakeGpuBackendInjectRunFailureForTesting(-1, 700, "cudaErrorIllegalAddress");                         // B
     ASSERT_EQ(0, runOnce(2, &rc));
     llrpFakeGpuBackendInjectPreuploadFailureForTesting(-1, 0, nullptr);                                       // A resumes
@@ -527,4 +543,243 @@ TEST(GpuFieldTelemetryCapture, InterleavedCapturesKeepTheirStageAndNeverRepeat)
     ASSERT_EQ(std::string("recon:run"), g_calls[2].stage);
     ASSERT_EQ(3, g_calls[2].rc);
     ASSERT_EQ(0, g_calls[2].cudaCode);
+}
+
+// r5 B1 (sol r3 blocker), at the DLL slot: one failing call notes A (GL map) and then B (its cleanup
+// unregister). drain() hands out both, oldest first, and leaves the channel empty, so a later
+// validation-only failure finds nothing and a later timeout C is C. On 042c2787 the capture took
+// one note: B stayed queued and was the next failure's code.
+TEST(GpuFieldTelemetryCapture, SlotDrainHandsOutEveryNoteOfAFailedCallOnce)
+{
+    drainSlot();
+    const volatile long * pendingRender = cuda_slot::pending_word(kRender);
+    ASSERT_TRUE(pendingRender != nullptr);
+    ASSERT_TRUE(cuda_slot::pending_word(2) == nullptr);
+    ASSERT_EQ(0L, (long)*pendingRender);
+    cuda_slot::note(999, "cudaErrorUnknown", "gl_r16:map");                // A
+    cuda_slot::note(709, "cudaErrorContextIsDestroyed", "gl_cache:unregister"); // B, the cleanup
+    ASSERT_EQ(2L, (long)*pendingRender);
+    igpu_cuda_error_t out[cuda_slot::kPending];
+    unsigned long long dropped = 99;
+    ASSERT_EQ(2, cuda_slot::drain(kRender, out, cuda_slot::kPending, &dropped));
+    ASSERT_EQ(999, out[0].code);
+    ASSERT_EQ(std::string("gl_r16:map"), std::string(out[0].site));
+    ASSERT_EQ(709, out[1].code);
+    ASSERT_EQ(std::string("cudaErrorContextIsDestroyed"), std::string(out[1].name));
+    ASSERT_EQ(std::string("gl_cache:unregister"), std::string(out[1].site));
+    ASSERT_TRUE(out[1].count == out[0].count + 1);
+    ASSERT_EQ(0ull, dropped);
+    ASSERT_EQ(0L, (long)*pendingRender);
+    // A later validation-only failure: nothing pending.
+    ASSERT_EQ(0, cuda_slot::drain(kRender, out, cuda_slot::kPending, &dropped));
+    ASSERT_EQ(0, take(kRender).code);
+    // A later genuine timeout C is C, and nothing stays pending behind it.
+    cuda_slot::note(702, "cudaErrorLaunchTimeout", "run:ev_after_dl");
+    ASSERT_EQ(1, cuda_slot::drain(kRender, out, cuda_slot::kPending, &dropped));
+    ASSERT_EQ(702, out[0].code);
+    ASSERT_EQ(0L, (long)*pendingRender);
+    ASSERT_EQ(0, take(kRender).code);
+    // The preupload channel was never touched; bad arguments are refused.
+    ASSERT_EQ(0L, (long)*cuda_slot::pending_word(kPreupload));
+    ASSERT_EQ(-1, cuda_slot::drain(kRender, out, cuda_slot::kPending - 1, &dropped));
+    ASSERT_EQ(-1, cuda_slot::drain(2, out, cuda_slot::kPending, &dropped));
+    ASSERT_EQ(-1, cuda_slot::drain(kRender, nullptr, cuda_slot::kPending, &dropped));
+}
+
+// r5 B1 (sol r3 blocker), through llrawproc: the run notes A (map) then B (cleanup) and fails. The
+// sink gets two recon:run records for that one call, A primary and B secondary, each with its own
+// site. Then a validation-only failure reports cuda_code 0, and a genuine timeout C reports C with
+// nothing left pending. On 042c2787 the run record carried A only, the validation record B, and
+// the timeout record B again behind which C stayed pending.
+TEST(GpuFieldTelemetryCapture, FailedCallReportsEveryCodeItNotedAndLeavesNothingBehind)
+{
+    const FakeGpuBackendScope fake;
+    const SinkScope sink;
+    int rc = -99;
+    ASSERT_NE(0, runOnce(1, &rc));
+    ASSERT_EQ(0, rc);
+    g_calls.clear();
+
+    llrpFakeGpuBackendArmCudaNoteForTesting(kRender, 999, "cudaErrorUnknown", "gl_r16:map");                    // A
+    llrpFakeGpuBackendArmCudaNoteForTesting(kRender, 709, "cudaErrorContextIsDestroyed", "gl_cache:unregister"); // B
+    llrpFakeGpuBackendInjectRunFailureForTesting(-1, 0, nullptr);
+    ASSERT_EQ(0, runOnce(2, &rc));
+    ASSERT_EQ(-1, rc);
+    ASSERT_EQ(2, (int)g_calls.size());
+    ASSERT_EQ(std::string("recon:run"), g_calls[0].stage);
+    ASSERT_EQ(-1, g_calls[0].rc);
+    ASSERT_EQ(999, g_calls[0].cudaCode);
+    ASSERT_EQ(std::string("gl_r16:map"), g_calls[0].site);
+    ASSERT_EQ(std::string("primary"), g_calls[0].role);
+    ASSERT_EQ(std::string("recon:run"), g_calls[1].stage);
+    ASSERT_EQ(-1, g_calls[1].rc);
+    ASSERT_NEAR(-1.0, g_calls[1].ms, 1e-12);
+    ASSERT_EQ(709, g_calls[1].cudaCode);
+    ASSERT_EQ(std::string("cudaErrorContextIsDestroyed"), g_calls[1].cudaName);
+    ASSERT_EQ(std::string("gl_cache:unregister"), g_calls[1].site);
+    ASSERT_EQ(std::string("secondary"), g_calls[1].role);
+    ASSERT_EQ(0L, llrpFakeGpuBackendCudaErrorsPendingForTesting(kRender, nullptr));
+
+    // A later validation-only failure: cuda_code 0.
+    g_calls.clear();
+    llrpFakeGpuBackendInjectRunFailureForTesting(3, 0, nullptr);
+    ASSERT_EQ(0, runOnce(3, &rc));
+    ASSERT_EQ(3, rc);
+    ASSERT_EQ(1, (int)g_calls.size());
+    ASSERT_EQ(std::string("recon:run"), g_calls[0].stage);
+    ASSERT_EQ(0, g_calls[0].cudaCode);
+    ASSERT_EQ(std::string(), g_calls[0].site);
+    ASSERT_EQ(std::string("primary"), g_calls[0].role);
+
+    // A later genuine timeout C: reported as C, nothing pending after it.
+    g_calls.clear();
+    llrpFakeGpuBackendInjectRunFailureForTesting(-1, 702, "cudaErrorLaunchTimeout");
+    ASSERT_EQ(0, runOnce(4, &rc));
+    ASSERT_EQ(1, (int)g_calls.size());
+    ASSERT_EQ(702, g_calls[0].cudaCode);
+    ASSERT_EQ(std::string("fake:run"), g_calls[0].site);
+    ASSERT_EQ(std::string("primary"), g_calls[0].role);
+    ASSERT_EQ(0L, llrpFakeGpuBackendCudaErrorsPendingForTesting(kRender, nullptr));
+
+    // A healthy frame after it: one success record, role NULL.
+    g_calls.clear();
+    ASSERT_NE(0, runOnce(5, &rc));
+    ASSERT_EQ(1, (int)g_calls.size());
+    ASSERT_EQ(0, g_calls[0].rc);
+    ASSERT_EQ(std::string(), g_calls[0].role);
+}
+
+// r5 B2 (fable r3 UNCAPTURED-RENDER-SITES-1): a GL copy (copy_last_device_output_to_gl_texture has
+// no capture) notes gl_r16:map between calls. The next captured call drains it at its entry and
+// emits it as stage recon:uncaptured, role orphan, with its own site; that call's validation-only
+// failure then reports cuda_code 0. The same on the preupload channel, and an orphan is emitted
+// even when the next call succeeds. On 042c2787 the run record read 700 at gl_r16:map.
+TEST(GpuFieldTelemetryCapture, UncapturedSiteNoteIsEmittedAsAnOrphanNotCreditedToTheNextCall)
+{
+    const FakeGpuBackendScope fake;
+    const AsyncH2dOnScope asyncH2d;
+    const SinkScope sink;
+    int rc = -99;
+    ASSERT_NE(0, runOnce(1, &rc));
+    ASSERT_EQ(0, rc);
+    g_calls.clear();
+
+    llrpFakeGpuBackendNoteCudaErrorForTesting(kRender, 700, "cudaErrorIllegalAddress", "gl_r16:map");
+    llrpFakeGpuBackendInjectRunFailureForTesting(3, 0, nullptr);
+    ASSERT_EQ(0, runOnce(2, &rc));
+    ASSERT_EQ(3, rc);
+    ASSERT_EQ(2, (int)g_calls.size());
+    ASSERT_EQ(std::string("recon:uncaptured"), g_calls[0].stage);
+    ASSERT_EQ(0, g_calls[0].rc);
+    ASSERT_EQ(700, g_calls[0].cudaCode);
+    ASSERT_EQ(std::string("cudaErrorIllegalAddress"), g_calls[0].cudaName);
+    ASSERT_EQ(std::string("gl_r16:map"), g_calls[0].site);
+    ASSERT_EQ(std::string("orphan"), g_calls[0].role);
+    ASSERT_EQ(std::string("recon:run"), g_calls[1].stage);
+    ASSERT_EQ(3, g_calls[1].rc);
+    ASSERT_EQ(0, g_calls[1].cudaCode);
+    ASSERT_EQ(std::string(), g_calls[1].site);
+    ASSERT_EQ(std::string("primary"), g_calls[1].role);
+
+    // Preupload channel: a leftover preupload note, then a validation-only preupload failure.
+    g_calls.clear();
+    llrpFakeGpuBackendNoteCudaErrorForTesting(kPreupload, 2, "cudaErrorMemoryAllocation", "preupload:malloc_host");
+    llrpFakeGpuBackendInjectPreuploadFailureForTesting(-1, 0, nullptr);
+    ASSERT_EQ(0, preuploadOnce(3));
+    ASSERT_EQ(2, (int)g_calls.size());
+    ASSERT_EQ(std::string("recon:uncaptured"), g_calls[0].stage);
+    ASSERT_EQ(2, g_calls[0].cudaCode);
+    ASSERT_EQ(std::string("preupload:malloc_host"), g_calls[0].site);
+    ASSERT_EQ(std::string("orphan"), g_calls[0].role);
+    ASSERT_EQ(std::string("recon:preupload"), g_calls[1].stage);
+    ASSERT_EQ(-1, g_calls[1].rc);
+    ASSERT_EQ(0, g_calls[1].cudaCode);
+
+    // An orphan ahead of a call that succeeds is still emitted, and the success stays a success.
+    g_calls.clear();
+    llrpFakeGpuBackendNoteCudaErrorForTesting(kRender, 719, "cudaErrorLaunchFailure", "reset_gl:set_device");
+    ASSERT_NE(0, runOnce(4, &rc));
+    ASSERT_EQ(0, rc);
+    ASSERT_EQ(2, (int)g_calls.size());
+    ASSERT_EQ(std::string("orphan"), g_calls[0].role);
+    ASSERT_EQ(719, g_calls[0].cudaCode);
+    ASSERT_EQ(std::string("reset_gl:set_device"), g_calls[0].site);
+    ASSERT_EQ(std::string("recon:run"), g_calls[1].stage);
+    ASSERT_EQ(0, g_calls[1].rc);
+    ASSERT_EQ(0, g_calls[1].cudaCode);
+    ASSERT_EQ(std::string(), g_calls[1].role);
+    ASSERT_EQ(0L, llrpFakeGpuBackendCudaErrorsPendingForTesting(kRender, nullptr));
+    ASSERT_EQ(0L, llrpFakeGpuBackendCudaErrorsPendingForTesting(kPreupload, nullptr));
+
+    // With no sink installed nothing is drained or emitted: the note waits for an installed sink.
+    llrpSetGpuStageTelemetrySink(nullptr);
+    g_calls.clear();
+    llrpFakeGpuBackendNoteCudaErrorForTesting(kRender, 700, "cudaErrorIllegalAddress", "gl_r16:map");
+    ASSERT_NE(0, runOnce(5, &rc));
+    ASSERT_EQ(0, (int)g_calls.size());
+    ASSERT_EQ(1L, llrpFakeGpuBackendCudaErrorsPendingForTesting(kRender, nullptr));
+}
+
+// r5 H1 (both keys, RING-DROP-VISIBLE-1), at the DLL slot: nine notes with no capture drop the
+// oldest; the monotonic dropped count is 1 and the next drain reports dropped=1, the one after 0.
+TEST(GpuFieldTelemetryCapture, SlotCountsDropsAndReportsThemOnTheNextDrain)
+{
+    drainSlot();
+    const unsigned long long before = cuda_slot::dropped_total(kRender);
+    const unsigned long long preuploadBefore = cuda_slot::dropped_total(kPreupload);
+    for (int i = 1; i <= cuda_slot::kPending + 1; ++i)
+        cuda_slot::note(1000 + i, "cudaErrorUnknown", "gl_r16:map");
+    ASSERT_EQ(before + 1, cuda_slot::dropped_total(kRender));
+    ASSERT_EQ((long)cuda_slot::kPending, (long)*cuda_slot::pending_word(kRender));
+    igpu_cuda_error_t out[cuda_slot::kPending];
+    unsigned long long dropped = 0;
+    ASSERT_EQ(cuda_slot::kPending, cuda_slot::drain(kRender, out, cuda_slot::kPending, &dropped));
+    ASSERT_EQ(1ull, dropped);
+    ASSERT_EQ(1002, out[0].code); // the oldest (1001) was the one dropped
+    ASSERT_EQ(1000 + cuda_slot::kPending + 1, out[cuda_slot::kPending - 1].code);
+    cuda_slot::note(702, "cudaErrorLaunchTimeout", "run:ev_after_dl");
+    ASSERT_EQ(1, cuda_slot::drain(kRender, out, cuda_slot::kPending, &dropped));
+    ASSERT_EQ(0ull, dropped);
+    ASSERT_EQ(before + 1, cuda_slot::dropped_total(kRender)); // monotonic, never reset
+    ASSERT_EQ(preuploadBefore, cuda_slot::dropped_total(kPreupload)); // per channel
+}
+
+// r5 H1, through llrawproc: nine uncaptured notes before the next call. That call emits the eight
+// survivors as orphans; the first record carries dropped=1, the rest 0, and a later fault carries
+// dropped=0. On 042c2787 no record carried a drop count.
+TEST(GpuFieldTelemetryCapture, NineUncapturedNotesReportDroppedOneOnTheNextRecord)
+{
+    const FakeGpuBackendScope fake;
+    const SinkScope sink;
+    int rc = -99;
+    ASSERT_NE(0, runOnce(1, &rc));
+    g_calls.clear();
+
+    for (int i = 1; i <= IGPU_CUDA_ERROR_PENDING_MAX + 1; ++i)
+        llrpFakeGpuBackendNoteCudaErrorForTesting(kRender, 1000 + i, "cudaErrorUnknown", "gl_r16:map");
+    unsigned long long droppedTotal = 0;
+    ASSERT_EQ((long)IGPU_CUDA_ERROR_PENDING_MAX, llrpFakeGpuBackendCudaErrorsPendingForTesting(kRender, &droppedTotal));
+    ASSERT_EQ(1ull, droppedTotal);
+    llrpFakeGpuBackendInjectRunFailureForTesting(-1, 702, "cudaErrorLaunchTimeout");
+    ASSERT_EQ(0, runOnce(2, &rc));
+    ASSERT_EQ(IGPU_CUDA_ERROR_PENDING_MAX + 1, (int)g_calls.size());
+    for (int i = 0; i < IGPU_CUDA_ERROR_PENDING_MAX; ++i)
+    {
+        ASSERT_EQ(std::string("orphan"), g_calls[i].role);
+        ASSERT_EQ(1002 + i, g_calls[i].cudaCode);
+        ASSERT_EQ(i == 0 ? 1ull : 0ull, g_calls[i].dropped);
+    }
+    const SinkCall & run = g_calls[IGPU_CUDA_ERROR_PENDING_MAX];
+    ASSERT_EQ(std::string("recon:run"), run.stage);
+    ASSERT_EQ(702, run.cudaCode);
+    ASSERT_EQ(std::string("primary"), run.role);
+    ASSERT_EQ(0ull, run.dropped);
+
+    g_calls.clear();
+    llrpFakeGpuBackendInjectRunFailureForTesting(-1, 702, "cudaErrorLaunchTimeout");
+    ASSERT_EQ(0, runOnce(3, &rc));
+    ASSERT_EQ(1, (int)g_calls.size());
+    ASSERT_EQ(0ull, g_calls[0].dropped);
+    ASSERT_EQ(0L, llrpFakeGpuBackendCudaErrorsPendingForTesting(kRender, &droppedTotal));
+    ASSERT_EQ(1ull, droppedTotal); // monotonic
 }

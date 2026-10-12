@@ -52,7 +52,8 @@
 
 /* GPU-FIELD-TELEMETRY-1: the last non-success CUDA code any failure branch saw
  * (igpu_recon_last_cuda_error), and r4's per-channel queue of notes not yet
- * taken (igpu_recon_take_cuda_error). Written only on failure. */
+ * taken (igpu_recon_take_cuda_error; r5: igpu_recon_drain_cuda_errors and
+ * igpu_recon_cuda_error_pending_word). Written only on failure. */
 #include "igpu_cuda_error_slot.h"
 
 /* Export mechanism note:
@@ -2301,6 +2302,19 @@ IGPU_API
 int igpu_recon_take_cuda_error(int channel, igpu_cuda_error_t* out)
 {
     return igpu_cuda_error_slot::take(channel, out);
+}
+
+IGPU_API
+int igpu_recon_drain_cuda_errors(int channel, igpu_cuda_error_t* out, int capacity,
+                                 unsigned long long* dropped)
+{
+    return igpu_cuda_error_slot::drain(channel, out, capacity, dropped);
+}
+
+IGPU_API
+const volatile long* igpu_recon_cuda_error_pending_word(int channel)
+{
+    return igpu_cuda_error_slot::pending_word(channel);
 }
 
 IGPU_API

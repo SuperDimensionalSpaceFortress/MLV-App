@@ -426,9 +426,10 @@ void scheduleAfterFaultFlush()
 }
 
 void reconStageSink(const char * stage, int rc, double ms, int cudaCode,
-                    const char * cudaName, const char * site)
+                    const char * cudaName, const char * site, const char * role,
+                    unsigned long long dropped)
 {
-    if (rc == 0)
+    if (rc == 0 && !role)
     {
         noteStage("recon", stage, ms);
         return;
@@ -440,6 +441,8 @@ void reconStageSink(const char * stage, int rc, double ms, int cudaCode,
     fault.cudaCode = cudaCode;
     fault.cudaName = cudaName;
     fault.site = site;
+    fault.role = role;
+    fault.dropped = dropped;
     noteFault(fault);
 }
 
@@ -497,6 +500,8 @@ void noteFault(const CudaFault & fault)
     f.cudaCode = fault.cudaCode;
     f.cudaName = core::sanitize(fault.cudaName, 47);
     f.site = core::sanitize(fault.site, 95);
+    f.role = core::sanitize(fault.role ? fault.role : "primary", 16);
+    f.dropped = fault.dropped;
     f.utcMs = nowUtcMs();
 
     State & s = state();
@@ -504,8 +509,10 @@ void noteFault(const CudaFault & fault)
     bool installed = false;
     {
         QMutexLocker locker(&s.mutex);
-        s.stages.add(fault.dll, fault.stage, -1.0,
-                     fault.cudaCode != 0 ? fault.cudaCode : (fault.rc != 0 ? fault.rc : -1));
+        /* r5: a secondary code belongs to a call already counted as failed. */
+        if (f.role != "secondary")
+            s.stages.add(fault.dll, fault.stage, -1.0,
+                         fault.cudaCode != 0 ? fault.cudaCode : (fault.rc != 0 ? fault.rc : -1));
         s.unwritten.addFault(f);
         listener = s.listener;
         installed = s.installed;

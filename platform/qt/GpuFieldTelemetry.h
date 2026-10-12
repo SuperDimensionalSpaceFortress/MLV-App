@@ -54,6 +54,11 @@ struct CudaFault
     const char * cudaName = nullptr; /* cudaGetErrorName, or NULL */
     const char * site = nullptr;     /* failing call site text, or NULL */
     double utcMs = 0.0;              /* set by noteFault (wall clock, Unix epoch ms) */
+    /* r5: "primary" (NULL means primary), "secondary" (another code the same
+     * failed call noted, e.g. its cleanup's) or "orphan" (noted by a call
+     * nothing captured; stage "recon:uncaptured"). */
+    const char * role = nullptr;
+    unsigned long long dropped = 0;  /* notes the DLL queue dropped before this one */
 };
 
 /*! A failed backend stage call (rc != 0). Recorded at once, written by the

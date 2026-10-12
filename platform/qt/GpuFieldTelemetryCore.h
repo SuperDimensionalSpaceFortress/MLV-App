@@ -248,6 +248,8 @@ struct Fault
     std::string cudaName;
     std::string site;
     double utcMs = 0.0;
+    std::string role = "primary";  /* r5: primary | secondary | orphan */
+    unsigned long long dropped = 0; /* r5: DLL queue drops reported with this record */
 };
 
 struct SessionInfo
@@ -361,7 +363,9 @@ inline std::string formatFault(const std::string & sessionId, const std::string 
         + ",\"cuda_name\":" + quoted(f.cudaName)
         + ",\"site\":" + quoted(f.site)
         + ",\"fault_utc_ms\":" + number(f.utcMs)
-        + ",\"device_loss\":" + (isDeviceLossCode(f.cudaCode) ? "true" : "false") + "}";
+        + ",\"device_loss\":" + (isDeviceLossCode(f.cudaCode) ? "true" : "false")
+        + ",\"role\":" + quoted(f.role)
+        + ",\"dropped\":" + number(f.dropped) + "}";
 }
 
 inline std::string formatSystemLogEvents(const SystemLogEvents & e)

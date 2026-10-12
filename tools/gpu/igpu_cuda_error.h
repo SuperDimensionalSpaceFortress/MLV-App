@@ -42,6 +42,22 @@ int igpu_amaze_debayer_last_cuda_error(igpu_cuda_error_t * out);
 #define IGPU_CUDA_ERROR_CHANNEL_PREUPLOAD 1
 int igpu_recon_take_cuda_error(int channel, igpu_cuda_error_t * out);
 
+/* r5: notes a channel holds before it drops its oldest. */
+#define IGPU_CUDA_ERROR_PENDING_MAX 8
+
+/* r5, optional exports. igpu_recon_drain_cuda_errors copies EVERY note pending
+ * on `channel`, oldest first, into out[0..n) and empties the channel in one
+ * step; capacity must be at least IGPU_CUDA_ERROR_PENDING_MAX. *dropped
+ * (optional) receives the notes the channel dropped since the previous drain.
+ * Returns n (0 = none pending), or -1 for a bad argument.
+ * igpu_recon_cuda_error_pending_word returns the address of the channel's
+ * pending-note count (stable while the DLL is loaded; NULL for an unknown
+ * channel). A caller reads it with one relaxed atomic load to skip the drain,
+ * and its lock, when the channel is empty. */
+int igpu_recon_drain_cuda_errors(int channel, igpu_cuda_error_t * out, int capacity,
+                                 unsigned long long * dropped);
+const volatile long * igpu_recon_cuda_error_pending_word(int channel);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

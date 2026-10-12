@@ -320,17 +320,26 @@ void llrpSetGpuReconEventLogger(llrpGpuReconEventLogger_t logger);
  * "recon:set_luts", "recon:run"), emitted after the backend mutex is released.
  * rc is the backend's return code. On success ms is the stage time (host-timed
  * for set_clip/set_luts, the backend's own total_ms for run) and the CUDA fields
- * are 0/NULL. On rc != 0, ms is -1 and cuda_code/cuda_name/site come from the
- * DLL's optional igpu_recon_take_cuda_error: the oldest code noted on the
- * call's channel (preupload or render) and not yet taken, each handed out once
- * (none pending: 0/NULL, a validation failure, not a CUDA fault).
+ * are 0/NULL, role NULL. On rc != 0, ms is -1 and cuda_code/cuda_name/site come
+ * from the DLL's optional igpu_recon_drain_cuda_errors (r5): EVERY code noted on
+ * the call's channel (preupload or render) during the call, one call per code,
+ * oldest first: role "primary" for the first, "secondary" for the rest (e.g. a
+ * cleanup's code after a failed map). None noted: one "primary" call with
+ * 0/NULL, a validation failure, not a CUDA fault. Codes still pending when a
+ * call starts were noted by a call nothing captures (GL copy, GL reset, a
+ * retain after a successful run): each is emitted first, as stage
+ * "recon:uncaptured", rc 0, role "orphan", with its own site, never as the new
+ * call's. dropped (r5) is the number of notes the channel's queue dropped
+ * since the previous drain, carried by the first record of that drain.
  * A failed async preupload (llrpGpuPlaybackReconPreuploadFrame) is reported as
  * "recon:preupload" on the preupload's own thread, failure only; its "no free
  * slot" back-pressure return is not reported unless a CUDA code was noted.
- * NULL uninstalls; with no sink the cost is one pointer test per call. */
+ * NULL uninstalls; with no sink the cost is one pointer test per call, and with
+ * a sink one relaxed load per call while no code is pending. */
 typedef void (*llrpGpuStageTelemetrySink_t)(const char * stage, int rc, double ms,
                                             int cuda_code, const char * cuda_name,
-                                            const char * site);
+                                            const char * site, const char * role,
+                                            unsigned long long dropped);
 void llrpSetGpuStageTelemetrySink(llrpGpuStageTelemetrySink_t sink);
 llrpGpuStageTelemetrySink_t llrpGetGpuStageTelemetrySinkForTesting(void);
 int llrpGpuPlaybackReconCopyLastDeviceBayer16ToGlTexture(unsigned int gl_texture_id,
