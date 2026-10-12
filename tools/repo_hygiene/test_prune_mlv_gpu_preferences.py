@@ -215,5 +215,54 @@ class ScriptContract(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
 
 
+class ReceiptBuild(unittest.TestCase):
+    """Executes the script's own receipt literal (sliced from the file, never the whole script) with a NON-EMPTY
+    removed/failed list. The receipt is built after the -Apply deletions, so a throw here means values are gone
+    and no receipt exists. Bachelor review 2026-10-11: @(List[object]) threw "Argument types do not match"."""
+
+    def receipt_block(self) -> str:
+        text = SCRIPT.read_text(encoding="utf-8")
+        lists = re.search(r"^\$removed = New-Object.*?\n\$failed = New-Object[^\n]*\n", text, re.MULTILINE | re.DOTALL)
+        block = re.search(r"^\$receipt = \[ordered\]@\{\n.*?^\}\n", text, re.MULTILINE | re.DOTALL)
+        self.assertIsNotNone(lists, "the removed/failed list declarations moved; update this test")
+        self.assertIsNotNone(block, "the receipt literal moved; update this test")
+        return lists.group(0) + block.group(0)
+
+    def build(self, shell: str) -> dict:
+        stubs = (
+            "$subKeyPath = 'Software\\Example'; "
+            f"$VenuesJson = {_quote(VENUES_JSON)}; "
+            "$roots = @('C:\\mlvtmp'); $namesBefore = @('a', 'b', 'c'); $namesAfter = @('c'); "
+            "$candidates = @([pscustomobject]@{ Name = 'a' }, [pscustomobject]@{ Name = 'b' }); "
+            "$Apply = $true; $IncludeExisting = $true; "
+        )
+        fill = (
+            "$removed.Add([pscustomobject]@{ name = 'a'; data = 'GpuPreference=2;' }); "
+            "$removed.Add([pscustomobject]@{ name = 'b'; data = 'GpuPreference=2;' }); "
+            "$failed.Add([pscustomobject]@{ name = 'x'; error = 'denied' }); "
+        )
+        lists, receipt = self.receipt_block().split("$receipt = ", 1)
+        script = stubs + lists + fill + "$receipt = " + receipt + "$receipt | ConvertTo-Json -Depth 6"
+        proc = subprocess.run([shell, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+                              capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return json.loads(proc.stdout)
+
+    def check(self, shell: str) -> None:
+        receipt = self.build(shell)
+        self.assertEqual([r["name"] for r in receipt["removed"]], ["a", "b"])
+        self.assertEqual(receipt["removed"][0]["data"], "GpuPreference=2;")
+        self.assertEqual([r["name"] for r in receipt["failed"]], ["x"])
+        self.assertEqual(receipt["toRemove"], ["a", "b"])
+
+    @unittest.skipIf(PWSH is None, "pwsh is not on PATH")
+    def test_the_receipt_builds_with_removed_values_under_pwsh(self) -> None:
+        self.check(PWSH)
+
+    @unittest.skipIf(shutil.which("powershell") is None, "Windows PowerShell 5.1 is not on PATH")
+    def test_the_receipt_builds_with_removed_values_under_windows_powershell(self) -> None:
+        self.check(shutil.which("powershell"))
+
+
 if __name__ == "__main__":
     unittest.main()
