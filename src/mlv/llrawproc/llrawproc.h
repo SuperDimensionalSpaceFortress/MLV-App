@@ -321,8 +321,9 @@ void llrpSetGpuReconEventLogger(llrpGpuReconEventLogger_t logger);
  * rc is the backend's return code. On success ms is the stage time (host-timed
  * for set_clip/set_luts, the backend's own total_ms for run) and the CUDA fields
  * are 0/NULL. On rc != 0, ms is -1 and cuda_code/cuda_name/site come from the
- * DLL's optional igpu_recon_last_cuda_error, only when it noted a code since the
- * previous query (otherwise 0/NULL: a validation failure, not a CUDA fault).
+ * DLL's optional igpu_recon_take_cuda_error: the oldest code noted on the
+ * call's channel (preupload or render) and not yet taken, each handed out once
+ * (none pending: 0/NULL, a validation failure, not a CUDA fault).
  * A failed async preupload (llrpGpuPlaybackReconPreuploadFrame) is reported as
  * "recon:preupload" on the preupload's own thread, failure only; its "no free
  * slot" back-pressure return is not reported unless a CUDA code was noted.

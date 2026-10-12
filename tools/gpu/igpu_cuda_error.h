@@ -31,6 +31,17 @@ typedef struct {
 int igpu_recon_last_cuda_error(igpu_cuda_error_t * out);
 int igpu_amaze_debayer_last_cuda_error(igpu_cuda_error_t * out);
 
+/* r4: the recon DLL also queues each note on one of two channels, picked by its
+ * site: "preupload:" sites (igpu_recon_preupload_frame and its helpers, which
+ * run on the async H2D caller's thread and can overlap a render call) go to
+ * PREUPLOAD, every other site to RENDER. igpu_recon_take_cuda_error hands out
+ * the oldest note of a channel not yet taken, exactly once (code 0 = none
+ * pending); count is the note's sequence number. Optional export, like the
+ * reader above. Returns 0, or -1 for a NULL out pointer or an unknown channel. */
+#define IGPU_CUDA_ERROR_CHANNEL_RENDER 0
+#define IGPU_CUDA_ERROR_CHANNEL_PREUPLOAD 1
+int igpu_recon_take_cuda_error(int channel, igpu_cuda_error_t * out);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

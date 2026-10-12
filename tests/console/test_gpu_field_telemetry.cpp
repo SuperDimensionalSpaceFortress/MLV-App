@@ -250,9 +250,10 @@ QStringList notesOutsideFailureBranch(const QString & source, const QString & la
     return bad;
 }
 
-// The whole failure census over the recon and AMaZE sources: exact note counts (15 recon: CK,
-// CKN and 13 explicit branches; 22 AMaZE) and every note inside a failure branch.
-constexpr int kReconNotes = 15;
+// The whole failure census over the recon and AMaZE sources: exact note counts (16 recon: CK,
+// CKN and 14 explicit branches, r4 adding preupload:set_device; 22 AMaZE) and every note inside a
+// failure branch.
+constexpr int kReconNotes = 16;
 constexpr int kAmazeNotes = 22;
 
 QStringList failureCensus(const QString & recon, const QString & amaze)
@@ -275,6 +276,64 @@ QString replacedOnce(const QString & source, const QString & from, const QString
     QString out = source;
     out.replace(at, from.size(), to);
     return out;
+}
+
+// r4: the text of the one function whose definition starts with `signature`, to its closing brace.
+QString functionText(const QString & source, const QString & signature)
+{
+    const int at = source.indexOf(signature);
+    ASSERT_TRUE(at >= 0);
+    ASSERT_EQ(-1, source.indexOf(signature, at + 1));
+    const QString code = codeOnly(source);
+    const int open = code.indexOf(QLatin1Char('{'), at);
+    ASSERT_TRUE(open > at);
+    int depth = 0;
+    for (int i = open; i < code.size(); ++i)
+    {
+        if (code[i] == QLatin1Char('{')) ++depth;
+        else if (code[i] == QLatin1Char('}') && --depth == 0) return source.mid(at, i + 1 - at);
+    }
+    ASSERT_TRUE(false);
+    return QString();
+}
+
+// r4 (sol r2 blockers 1 and 2): the preupload-channel census. The slot routes a note by its site,
+// "preupload:" to the preupload channel. Every note in the preupload entry and its two helpers must
+// name such a site, every such site must sit in one of them (5: malloc_host, malloc_device,
+// runtime_create, submit, set_device), and no CUDA failure there may return without a note.
+constexpr int kPreuploadNotes = 5;
+
+QStringList preuploadChannelCensus(const QString & recon)
+{
+    QStringList problems;
+    const QRegularExpression note(QStringLiteral("IGPU_CUDA_ERROR_NOTE\\(\\s*\\w+\\s*,\\s*\"([^\"]*)\"\\s*\\)"));
+    const QRegularExpression bareReturn(QStringLiteral("!=\\s*cudaSuccess\\s*\\)\\s*return\\b"));
+    int inPreuploadCode = 0;
+    for (const char * signature : {"static int ensure_preupload_slot_storage(", "static int ensure_preupload_runtime(",
+                                   "int igpu_recon_preupload_frame("})
+    {
+        const QString body = functionText(recon, QString::fromLatin1(signature));
+        int literal = 0;
+        for (QRegularExpressionMatchIterator it = note.globalMatch(body); it.hasNext();)
+        {
+            const QString site = it.next().captured(1);
+            ++literal;
+            if (site.startsWith(QStringLiteral("preupload:"))) ++inPreuploadCode;
+            else problems << QStringLiteral("render-channel site in preupload code: %1").arg(site);
+        }
+        if (literal != (int)body.count(QStringLiteral("IGPU_CUDA_ERROR_NOTE(")))
+            problems << QStringLiteral("preupload note without a literal site");
+        if (bareReturn.match(body).hasMatch())
+            problems << QStringLiteral("preupload CUDA failure returns without a note");
+    }
+    int preuploadSites = 0;
+    for (QRegularExpressionMatchIterator it = note.globalMatch(recon); it.hasNext();)
+        if (it.next().captured(1).startsWith(QStringLiteral("preupload:"))) ++preuploadSites;
+    if (preuploadSites != kPreuploadNotes)
+        problems << QStringLiteral("preupload notes %1 != %2").arg(preuploadSites).arg(kPreuploadNotes);
+    if (inPreuploadCode != preuploadSites)
+        problems << QStringLiteral("preupload sites outside preupload code: %1").arg(preuploadSites - inPreuploadCode);
+    return problems;
 }
 
 std::uintmax_t bytesUnder(const std::filesystem::path & dir)
@@ -861,7 +920,7 @@ TEST(GpuFieldTelemetry, FailureCensusIsExactAndBraceScoped)
 
     // Mutation 1 (sol's replay): drop the preupload:submit note -> recon count 14.
     const QString noSubmit = replacedOnce(recon, QStringLiteral("        IGPU_CUDA_ERROR_NOTE(e, \"preupload:submit\");\n"), QString());
-    ASSERT_EQ(std::string("recon notes 14 != 15"), failureCensus(noSubmit, amaze).join(QStringLiteral("; ")).toStdString());
+    ASSERT_EQ(std::string("recon notes 15 != 16"), failureCensus(noSubmit, amaze).join(QStringLiteral("; ")).toStdString());
     // Mutation 2: drop one AMaZE note -> 21.
     const QString noMap = replacedOnce(amaze, QStringLiteral("        IGPU_CUDA_ERROR_NOTE(rc, \"gl_r16_in:map\");\n"), QString());
     ASSERT_EQ(std::string("amaze notes 21 != 22"), failureCensus(recon, noMap).join(QStringLiteral("; ")).toStdString());
@@ -887,8 +946,75 @@ TEST(GpuFieldTelemetry, FailureCensusIsExactAndBraceScoped)
     const QString successArm = replacedOnce(recon,
         QStringLiteral("    if (e == cudaSuccess) {\n        slot->bytes = input_bytes;\n"),
         QStringLiteral("    if (e == cudaSuccess) {\n        IGPU_CUDA_ERROR_NOTE(e, \"preupload:success_arm\");\n        slot->bytes = input_bytes;\n"));
-    ASSERT_TRUE(failureCensus(successArm, amaze).join(QStringLiteral("; ")).contains(QStringLiteral("recon notes 16 != 15")));
+    ASSERT_TRUE(failureCensus(successArm, amaze).join(QStringLiteral("; ")).contains(QStringLiteral("recon notes 17 != 16")));
     ASSERT_EQ(2, (int)failureCensus(successArm, amaze).size());
+}
+
+// r4 B1 (sol r2 blocker 1 = fable PREUPLOAD-SETDEVICE-NOTE-1): igpu_recon_preupload_frame's
+// cudaSetDevice failure notes its code (site preupload:set_device) before it returns -1, so the
+// recon:preupload record carries the real code and site instead of cuda_code 0. The census counts
+// it, and the r3 line (a bare return) turns both censuses red.
+TEST(GpuFieldTelemetry, PreuploadSetDeviceFailureIsNotedOnThePreuploadChannel)
+{
+    const QString recon = readRepoFile(QStringLiteral("tools/gpu/backend/igpu_recon_cuda.cu"));
+    const QString amaze = readRepoFile(QStringLiteral("tools/gpu/backend/igpu_amaze_debayer_cuda.cu"));
+    const QString noted = QStringLiteral(
+        "    const cudaError_t set_device = cudaSetDevice(b->device);\n"
+        "    if (set_device != cudaSuccess) {\n"
+        "        IGPU_CUDA_ERROR_NOTE(set_device, \"preupload:set_device\");\n"
+        "        return -1;\n"
+        "    }\n");
+    ASSERT_TRUE(functionText(recon, QStringLiteral("int igpu_recon_preupload_frame(")).contains(noted));
+    ASSERT_EQ(std::string(), preuploadChannelCensus(recon).join(QStringLiteral("; ")).toStdString());
+    ASSERT_EQ(std::string(), failureCensus(recon, amaze).join(QStringLiteral("; ")).toStdString());
+
+    // Mutation: the r3 line, a bare return with no note.
+    const QString r3 = replacedOnce(recon, noted, QStringLiteral("    if (cudaSetDevice(b->device) != cudaSuccess) return -1;\n"));
+    ASSERT_EQ(std::string("recon notes 15 != 16"), failureCensus(r3, amaze).join(QStringLiteral("; ")).toStdString());
+    ASSERT_EQ(std::string("preupload CUDA failure returns without a note; preupload notes 4 != 5"),
+              preuploadChannelCensus(r3).join(QStringLiteral("; ")).toStdString());
+    // Mutation: a preupload note under a site the slot would route to the render channel.
+    const QString misrouted = replacedOnce(recon, QStringLiteral("IGPU_CUDA_ERROR_NOTE(e, \"preupload:submit\");"),
+                                           QStringLiteral("IGPU_CUDA_ERROR_NOTE(e, \"submit\");"));
+    ASSERT_EQ(std::string("render-channel site in preupload code: submit; preupload notes 4 != 5"),
+              preuploadChannelCensus(misrouted).join(QStringLiteral("; ")).toStdString());
+    // Mutation: a "preupload:" site outside preupload code (here the render's preupload wait).
+    const QString stray = replacedOnce(recon, QStringLiteral("IGPU_CUDA_ERROR_NOTE(sync, \"run:preupload_wait\");"),
+                                       QStringLiteral("IGPU_CUDA_ERROR_NOTE(sync, \"preupload:wait\");"));
+    ASSERT_EQ(std::string("preupload notes 6 != 5; preupload sites outside preupload code: 1"),
+              preuploadChannelCensus(stray).join(QStringLiteral("; ")).toStdString());
+}
+
+// r4 B2 (sol r2 blocker 2): preupload and render no longer share one slot and one seen count. The
+// slot routes each note by its site prefix onto a channel and take() hands it out once under the
+// slot mutex; the recon DLL exports the taker; llrawproc resolves it, the preupload capture takes
+// from the preupload channel and the three render captures from the render channel, and the
+// shared exchanged count is gone. The runtime proof is pipeline_tests GpuFieldTelemetryCapture.*.
+TEST(GpuFieldTelemetry, CapturesTakeFromTheirOwnChannelOnce)
+{
+    const QString slot = readRepoFile(QStringLiteral("tools/gpu/backend/igpu_cuda_error_slot.h"));
+    ASSERT_TRUE(slot.contains(QStringLiteral("return site && std::strncmp(site, \"preupload:\", 10) == 0")));
+    ASSERT_TRUE(slot.contains(QStringLiteral("inline int take(int channel, igpu_cuda_error_t * out)")));
+    const QString def = readRepoFile(QStringLiteral("tools/gpu/backend/igpu_recon_cuda.def"));
+    ASSERT_TRUE(def.contains(QStringLiteral("    igpu_recon_take_cuda_error\n")));
+    const QString recon = readRepoFile(QStringLiteral("tools/gpu/backend/igpu_recon_cuda.cu"));
+    ASSERT_TRUE(recon.contains(QStringLiteral(
+        "int igpu_recon_take_cuda_error(int channel, igpu_cuda_error_t* out)\n{\n"
+        "    return igpu_cuda_error_slot::take(channel, out);\n}")));
+    const QString llrawproc = readRepoFile(QStringLiteral("src/mlv/llrawproc/llrawproc.c"));
+    ASSERT_TRUE(llrawproc.contains(QStringLiteral("GetProcAddress(g->dll, \"igpu_recon_take_cuda_error\")")));
+    ASSERT_FALSE(llrawproc.contains(QStringLiteral("last_cuda_error_seen_count")));
+    ASSERT_FALSE(llrawproc.contains(QStringLiteral("InterlockedExchange64(&g->last_cuda_error")));
+    const auto matches = [&](const char * pattern) {
+        int n = 0;
+        for (QRegularExpressionMatchIterator it = QRegularExpression(QString::fromLatin1(pattern)).globalMatch(llrawproc);
+             it.hasNext(); it.next())
+            ++n;
+        return n;
+    };
+    ASSERT_EQ(1, matches("\"recon:preupload\",\\s*IGPU_CUDA_ERROR_CHANNEL_PREUPLOAD,"));
+    ASSERT_EQ(3, matches("\"recon:(set_clip|set_luts|run)\",\\s*IGPU_CUDA_ERROR_CHANNEL_RENDER,"));
+    ASSERT_EQ(4, (int)llrawproc.count(QStringLiteral("llrawproc_gpu_stage_telemetry_capture(g, ")));
 }
 
 // r3 H4 (both keys, exit join): the System-log read ends inside the session-end wait, quit is held

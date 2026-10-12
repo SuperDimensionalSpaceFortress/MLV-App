@@ -51,7 +51,8 @@
 #include "igpu_launch_timing.cuh"
 
 /* GPU-FIELD-TELEMETRY-1: the last non-success CUDA code any failure branch saw
- * (igpu_recon_last_cuda_error). Written only on failure. */
+ * (igpu_recon_last_cuda_error), and r4's per-channel queue of notes not yet
+ * taken (igpu_recon_take_cuda_error). Written only on failure. */
 #include "igpu_cuda_error_slot.h"
 
 /* Export mechanism note:
@@ -1785,7 +1786,11 @@ int igpu_recon_preupload_frame(igpu_recon_backend* b,
     const size_t expected_bytes =
         (size_t)b->width * (size_t)b->height * sizeof(uint16_t);
     if (input_bytes != expected_bytes) return -1;
-    if (cudaSetDevice(b->device) != cudaSuccess) return -1;
+    const cudaError_t set_device = cudaSetDevice(b->device);
+    if (set_device != cudaSuccess) {
+        IGPU_CUDA_ERROR_NOTE(set_device, "preupload:set_device");
+        return -1;
+    }
     if (ensure_preupload_runtime(b) != 0) return -1;
 
     int selected = -1;
@@ -2290,6 +2295,12 @@ IGPU_API
 int igpu_recon_last_cuda_error(igpu_cuda_error_t* out)
 {
     return igpu_cuda_error_slot::copy_last(out);
+}
+
+IGPU_API
+int igpu_recon_take_cuda_error(int channel, igpu_cuda_error_t* out)
+{
+    return igpu_cuda_error_slot::take(channel, out);
 }
 
 IGPU_API

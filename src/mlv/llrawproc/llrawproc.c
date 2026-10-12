@@ -754,7 +754,7 @@ typedef int (*llrawproc_gpu_copy_last_device_output_to_gl_texture_fn)(
 typedef int (*llrawproc_gpu_allocated_bytes_fn)(igpu_recon_backend*, uint64_t*);
 typedef int (*llrawproc_gpu_reset_gl_texture_resources_fn)(igpu_recon_backend*);
 typedef int (*llrawproc_gpu_set_reduced_iso_notch_fn)(igpu_recon_backend*, int);
-typedef int (*llrawproc_gpu_last_cuda_error_fn)(igpu_cuda_error_t*);
+typedef int (*llrawproc_gpu_take_cuda_error_fn)(int, igpu_cuda_error_t*);
 
 typedef struct
 {
@@ -797,11 +797,10 @@ typedef struct
     llrawproc_gpu_allocated_bytes_fn allocated_bytes;
     llrawproc_gpu_reset_gl_texture_resources_fn reset_gl_texture_resources;
     llrawproc_gpu_set_reduced_iso_notch_fn set_reduced_iso_notch;
-    /* GPU-FIELD-TELEMETRY-1: optional; read only on a failed stage call.
-     * The seen count is exchanged atomically: a bypass preupload reads it
-     * without the backend mutex. */
-    llrawproc_gpu_last_cuda_error_fn last_cuda_error;
-    volatile LONG64 last_cuda_error_seen_count;
+    /* GPU-FIELD-TELEMETRY-1: optional; called only on a failed stage call.
+     * r4: the DLL hands each noted code out once, per channel, under its own
+     * mutex, so a bypass preupload and a render never share a cursor. */
+    llrawproc_gpu_take_cuda_error_fn take_cuda_error;
     int clip_configured;
     igpu_recon_clip_t configured_clip;
     int luts_configured;
@@ -964,15 +963,49 @@ static int g_llrawproc_fake_gpu_backend_last_run_reduced_iso_notch = -1;
 static uint64_t g_llrawproc_fake_gpu_backend_runs_with_notch = 0;
 static uint64_t g_llrawproc_fake_gpu_backend_runs_without_notch = 0;
 static uint64_t g_llrawproc_fake_gpu_backend_notch_set_calls = 0;
-/* GPU-FIELD-TELEMETRY-1: the fake's igpu_recon_last_cuda_error slot, and a
+/* GPU-FIELD-TELEMETRY-1: the fake's igpu_recon_take_cuda_error queues (one per
+ * channel, each code handed out once, as igpu_cuda_error_slot.h does), and a
  * one-shot run failure a test injects (rc 0 = none armed). */
-static igpu_cuda_error_t g_llrawproc_fake_gpu_backend_cuda_error = {0};
+#define LLRAWPROC_FAKE_GPU_CUDA_ERROR_PENDING 8
+typedef struct
+{
+    igpu_cuda_error_t note[LLRAWPROC_FAKE_GPU_CUDA_ERROR_PENDING];
+    int oldest;
+    int size;
+} llrawprocFakeGpuCudaErrorRing_t;
+static llrawprocFakeGpuCudaErrorRing_t g_llrawproc_fake_gpu_backend_cuda_errors[2];
+static unsigned long long g_llrawproc_fake_gpu_backend_cuda_error_count = 0;
 static int g_llrawproc_fake_gpu_backend_inject_run_rc = 0;
 static int g_llrawproc_fake_gpu_backend_inject_cuda_code = 0;
 static char g_llrawproc_fake_gpu_backend_inject_cuda_name[48] = {0};
 static int g_llrawproc_fake_gpu_backend_inject_preupload_rc = 0;
 static int g_llrawproc_fake_gpu_backend_inject_preupload_cuda_code = 0;
 static char g_llrawproc_fake_gpu_backend_inject_preupload_cuda_name[48] = {0};
+
+/* As a real backend's failure branch: queue the code on its channel (a full
+ * queue drops its oldest); code 0 notes nothing. */
+static void llrawproc_fake_gpu_backend_note_cuda_error(int channel,
+                                                       int code,
+                                                       const char * name,
+                                                       const char * site)
+{
+    llrawprocFakeGpuCudaErrorRing_t * r;
+    igpu_cuda_error_t * e;
+    if(code == 0 || channel < 0 || channel > 1) return;
+    r = &g_llrawproc_fake_gpu_backend_cuda_errors[channel];
+    if(r->size == LLRAWPROC_FAKE_GPU_CUDA_ERROR_PENDING)
+    {
+        r->oldest = (r->oldest + 1) % LLRAWPROC_FAKE_GPU_CUDA_ERROR_PENDING;
+        --r->size;
+    }
+    e = &r->note[(r->oldest + r->size) % LLRAWPROC_FAKE_GPU_CUDA_ERROR_PENDING];
+    memset(e, 0, sizeof(*e));
+    e->code = code;
+    snprintf(e->name, sizeof(e->name), "%s", name ? name : "");
+    snprintf(e->site, sizeof(e->site), "%s", site ? site : "");
+    e->count = ++g_llrawproc_fake_gpu_backend_cuda_error_count;
+    ++r->size;
+}
 
 /* Deterministic, invertible-by-inspection stand-in for real reconstruction:
  * output[i] = input[i] + 1. Its ONLY job is to let a test tell "the fake ran
@@ -1143,15 +1176,10 @@ static int llrawproc_fake_gpu_backend_run(igpu_recon_backend * b,
          * into the slot, then return the failing rc. One-shot. */
         const int injected_rc = g_llrawproc_fake_gpu_backend_inject_run_rc;
         g_llrawproc_fake_gpu_backend_inject_run_rc = 0;
-        if(g_llrawproc_fake_gpu_backend_inject_cuda_code != 0)
-        {
-            igpu_cuda_error_t * e = &g_llrawproc_fake_gpu_backend_cuda_error;
-            e->code = g_llrawproc_fake_gpu_backend_inject_cuda_code;
-            snprintf(e->name, sizeof(e->name), "%s", g_llrawproc_fake_gpu_backend_inject_cuda_name);
-            snprintf(e->site, sizeof(e->site), "%s", "fake:run");
-            e->utc_ms = 0.0;
-            e->count += 1;
-        }
+        llrawproc_fake_gpu_backend_note_cuda_error(IGPU_CUDA_ERROR_CHANNEL_RENDER,
+                                                   g_llrawproc_fake_gpu_backend_inject_cuda_code,
+                                                   g_llrawproc_fake_gpu_backend_inject_cuda_name,
+                                                   "fake:run");
         return injected_rc;
     }
     llrawproc_fake_gpu_backend_dump_vectors(frame, in_bayer14, pixel_count);
@@ -1202,15 +1230,10 @@ static int llrawproc_fake_gpu_backend_preupload_frame(igpu_recon_backend * b,
          * note the code, return the failing rc, stage nothing. One-shot. */
         const int injected_rc = g_llrawproc_fake_gpu_backend_inject_preupload_rc;
         g_llrawproc_fake_gpu_backend_inject_preupload_rc = 0;
-        if(g_llrawproc_fake_gpu_backend_inject_preupload_cuda_code != 0)
-        {
-            igpu_cuda_error_t * e = &g_llrawproc_fake_gpu_backend_cuda_error;
-            e->code = g_llrawproc_fake_gpu_backend_inject_preupload_cuda_code;
-            snprintf(e->name, sizeof(e->name), "%s", g_llrawproc_fake_gpu_backend_inject_preupload_cuda_name);
-            snprintf(e->site, sizeof(e->site), "%s", "fake:preupload");
-            e->utc_ms = 0.0;
-            e->count += 1;
-        }
+        llrawproc_fake_gpu_backend_note_cuda_error(IGPU_CUDA_ERROR_CHANNEL_PREUPLOAD,
+                                                   g_llrawproc_fake_gpu_backend_inject_preupload_cuda_code,
+                                                   g_llrawproc_fake_gpu_backend_inject_preupload_cuda_name,
+                                                   "fake:preupload");
         return injected_rc;
     }
     copy = (uint16_t *)malloc(input_bytes);
@@ -1291,16 +1314,22 @@ static int llrawproc_fake_gpu_backend_last_timing(igpu_recon_backend * b,
     return 0;
 }
 
-static int llrawproc_fake_gpu_backend_last_cuda_error(igpu_cuda_error_t * out)
+static int llrawproc_fake_gpu_backend_take_cuda_error(int channel, igpu_cuda_error_t * out)
 {
-    if(!out) return -1;
-    *out = g_llrawproc_fake_gpu_backend_cuda_error;
+    llrawprocFakeGpuCudaErrorRing_t * r;
+    if(!out || channel < 0 || channel > 1) return -1;
+    r = &g_llrawproc_fake_gpu_backend_cuda_errors[channel];
+    memset(out, 0, sizeof(*out));
+    if(r->size == 0) return 0;
+    *out = r->note[r->oldest];
+    r->oldest = (r->oldest + 1) % LLRAWPROC_FAKE_GPU_CUDA_ERROR_PENDING;
+    --r->size;
     return 0;
 }
 
 /* Test-only: the fake's next run returns rc (non-zero) and, when cuda_code is
- * non-zero, first notes (cuda_code, name) into its last-CUDA-error slot, as a
- * real backend's CK failure branch does. */
+ * non-zero, first notes (cuda_code, name) on the RENDER channel, as a real
+ * backend's CK failure branch does. */
 void llrpFakeGpuBackendInjectRunFailureForTesting(int rc, int cuda_code, const char * name);
 void llrpFakeGpuBackendInjectRunFailureForTesting(int rc, int cuda_code, const char * name)
 {
@@ -1312,7 +1341,8 @@ void llrpFakeGpuBackendInjectRunFailureForTesting(int rc, int cuda_code, const c
 }
 
 /* Test-only: the fake's next preupload_frame returns rc (non-zero) and, when
- * cuda_code is non-zero, first notes it into the slot (site fake:preupload). */
+ * cuda_code is non-zero, first notes it on the PREUPLOAD channel (site
+ * fake:preupload). */
 void llrpFakeGpuBackendInjectPreuploadFailureForTesting(int rc, int cuda_code, const char * name);
 void llrpFakeGpuBackendInjectPreuploadFailureForTesting(int rc, int cuda_code, const char * name)
 {
@@ -1321,6 +1351,15 @@ void llrpFakeGpuBackendInjectPreuploadFailureForTesting(int rc, int cuda_code, c
     snprintf(g_llrawproc_fake_gpu_backend_inject_preupload_cuda_name,
              sizeof(g_llrawproc_fake_gpu_backend_inject_preupload_cuda_name),
              "%s", name ? name : "");
+}
+
+/* Test-only (r4): note a code on a channel without failing any call, as a
+ * failure branch on another thread does between a call's note and its
+ * capture. */
+void llrpFakeGpuBackendNoteCudaErrorForTesting(int channel, int cuda_code, const char * name, const char * site);
+void llrpFakeGpuBackendNoteCudaErrorForTesting(int channel, int cuda_code, const char * name, const char * site)
+{
+    llrawproc_fake_gpu_backend_note_cuda_error(channel, cuda_code, name, site);
 }
 
 static int llrawproc_fake_gpu_backend_last_device_output(
@@ -1393,7 +1432,8 @@ int llrpInstallFakeGpuPlaybackReconBackendForTesting(int install)
     g_llrawproc_fake_gpu_backend_runs_with_notch = 0;
     g_llrawproc_fake_gpu_backend_runs_without_notch = 0;
     g_llrawproc_fake_gpu_backend_notch_set_calls = 0;
-    memset(&g_llrawproc_fake_gpu_backend_cuda_error, 0, sizeof(g_llrawproc_fake_gpu_backend_cuda_error));
+    memset(g_llrawproc_fake_gpu_backend_cuda_errors, 0, sizeof(g_llrawproc_fake_gpu_backend_cuda_errors));
+    g_llrawproc_fake_gpu_backend_cuda_error_count = 0;
     g_llrawproc_fake_gpu_backend_inject_run_rc = 0;
     g_llrawproc_fake_gpu_backend_inject_cuda_code = 0;
     g_llrawproc_fake_gpu_backend_inject_cuda_name[0] = '\0';
@@ -1421,7 +1461,7 @@ int llrpInstallFakeGpuPlaybackReconBackendForTesting(int install)
         g->retain_last_device_output = llrawproc_fake_gpu_backend_retain_last_device_output;
         g->release_retained_device_output = llrawproc_fake_gpu_backend_release_retained_device_output;
         g->set_reduced_iso_notch = llrawproc_fake_gpu_backend_set_reduced_iso_notch;
-        g->last_cuda_error = llrawproc_fake_gpu_backend_last_cuda_error;
+        g->take_cuda_error = llrawproc_fake_gpu_backend_take_cuda_error;
         g_llrawproc_fake_gpu_backend_installed = 1;
     }
     else
@@ -1615,9 +1655,9 @@ static int llrawproc_gpu_export_backend_available(int prefer_playback_dll)
         g->set_reduced_iso_notch = resolved.typed;
     }
     {
-        union { FARPROC raw; llrawproc_gpu_last_cuda_error_fn typed; } resolved;
-        resolved.raw = GetProcAddress(g->dll, "igpu_recon_last_cuda_error");
-        g->last_cuda_error = resolved.typed;
+        union { FARPROC raw; llrawproc_gpu_take_cuda_error_fn typed; } resolved;
+        resolved.raw = GetProcAddress(g->dll, "igpu_recon_take_cuda_error");
+        g->take_cuda_error = resolved.typed;
     }
 
 #undef LLRAWPROC_GPU_RESOLVE_TYPED
@@ -1667,14 +1707,15 @@ typedef struct
 } llrawprocGpuStageTelemetryEvent_t;
 
 /* Caller holds g_llrawproc_gpu_recon_backend_mutex or the preupload bypass
- * claim (either keeps g->last_cuda_error alive). On rc != 0 the DLL's
- * last-CUDA-error slot is read; its code is attributed to this stage only when
- * the slot's count moved since the previous read (otherwise the failure was a
- * validation return, not a CUDA fault, and cuda_code stays 0). The seen count
- * is swapped atomically, so a code is attributed to exactly one stage. */
+ * claim (either keeps g->take_cuda_error alive). On rc != 0 the oldest code
+ * the DLL noted on `channel` and nobody has taken yet is taken (r4: the DLL
+ * hands each one out exactly once, so a preupload fault and an overlapping
+ * render fault each keep their own stage, and nothing is reported twice). With
+ * none pending the failure was a validation return and cuda_code stays 0. */
 static void llrawproc_gpu_stage_telemetry_capture(llrawprocGpuExportBackend_t * g,
                                                   llrawprocGpuStageTelemetryEvent_t * ev,
                                                   const char * stage,
+                                                  int channel,
                                                   int rc,
                                                   double ms)
 {
@@ -1682,19 +1723,15 @@ static void llrawproc_gpu_stage_telemetry_capture(llrawprocGpuExportBackend_t * 
     ev->stage = stage;
     ev->rc = rc;
     ev->ms = rc == 0 ? ms : -1.0;
-    if(rc != 0 && g->last_cuda_error)
+    if(rc != 0 && g->take_cuda_error)
     {
         igpu_cuda_error_t e;
         memset(&e, 0, sizeof(e));
-        if(g->last_cuda_error(&e) == 0
-         && InterlockedExchange64(&g->last_cuda_error_seen_count, (LONG64)e.count) != (LONG64)e.count)
+        if(g->take_cuda_error(channel, &e) == 0 && e.code != 0)
         {
-            if(e.code != 0)
-            {
-                ev->cuda_code = e.code;
-                snprintf(ev->cuda_name, sizeof(ev->cuda_name), "%.*s", (int)sizeof(e.name) - 1, e.name);
-                snprintf(ev->site, sizeof(ev->site), "%.*s", (int)sizeof(e.site) - 1, e.site);
-            }
+            ev->cuda_code = e.code;
+            snprintf(ev->cuda_name, sizeof(ev->cuda_name), "%.*s", (int)sizeof(e.name) - 1, e.name);
+            snprintf(ev->site, sizeof(ev->site), "%.*s", (int)sizeof(e.site) - 1, e.site);
         }
     }
 }
@@ -1772,7 +1809,9 @@ int llrpGpuPlaybackReconPreuploadFrame(uint64_t frame_id,
             if(telemetry_sink)
             {
                 llrawproc_gpu_stage_telemetry_capture(g, &telemetry_event,
-                                                      "recon:preupload", rc, 0.0);
+                                                      "recon:preupload",
+                                                      IGPU_CUDA_ERROR_CHANNEL_PREUPLOAD,
+                                                      rc, 0.0);
                 telemetry_pending = rc != LLRAWPROC_GPU_PREUPLOAD_NO_FREE_SLOT_RC
                     || telemetry_event.cuda_code != 0;
             }
@@ -1952,7 +1991,8 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
         InterlockedIncrement64(&g_llrawproc_gpu_set_clip_count);
         if(telemetry_sink)
             llrawproc_gpu_stage_telemetry_capture(g, &telemetry_events[telemetry_event_count++],
-                                                  "recon:set_clip", rc, set_clip_ms);
+                                                  "recon:set_clip",
+                                                  IGPU_CUDA_ERROR_CHANNEL_RENDER, rc, set_clip_ms);
         if(rc == 0)
         {
             g->configured_clip = clip;
@@ -1975,7 +2015,8 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
         InterlockedIncrement64(&g_llrawproc_gpu_set_luts_count);
         if(telemetry_sink)
             llrawproc_gpu_stage_telemetry_capture(g, &telemetry_events[telemetry_event_count++],
-                                                  "recon:set_luts", rc, set_luts_ms);
+                                                  "recon:set_luts",
+                                                  IGPU_CUDA_ERROR_CHANNEL_RENDER, rc, set_luts_ms);
         if(rc == 0)
         {
             g->configured_luts_key = luts_key;
@@ -2167,7 +2208,8 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
             }
         }
         llrawproc_gpu_stage_telemetry_capture(g, &telemetry_events[telemetry_event_count++],
-                                              "recon:run", run_rc, run_ms);
+                                              "recon:run",
+                                              IGPU_CUDA_ERROR_CHANNEL_RENDER, run_rc, run_ms);
     }
     pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
 
