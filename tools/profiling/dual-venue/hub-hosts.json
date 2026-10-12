@@ -1,0 +1,11 @@
+{
+  "schema": "mlv-app/hub-hosts/v1",
+  "rule": "HUB-VM-NO-LOCAL-PLAYBACK-1 (owner 2026-10-11): no MLVApp GUI or playback run of any kind on a hub host. A hub host is a VMware guest on Ultra-Magnus, so a local playback shows a window on the owner's machine and contaminates the Ultra-Magnus venue legs. Playback runs only on a venue (bachelor / ultra-magnus) through the tracked venue chain. Local builds and unit, console and pipeline tests stay allowed.",
+  "hubHosts": ["VIRTUAL-TEN"],
+  "matchedAgainst": "COMPUTERNAME, case-insensitive, whole name",
+  "refusalToken": "HUB_VM_LOCAL_PLAYBACK_REFUSED",
+  "refusalExitCode": 17,
+  "ciFixtureOverrideEnv": "MLVAPP_HUB_PLAYBACK_CI_FIXTURE",
+  "ciFixtureOverrideValue": "CI_FIXTURE_ONLY",
+  "ciFixtureOverrideNote": "For a CI fixture or a unit test that must exercise a guarded surface WITHOUT playing anything. Never set it to run a real playback on the hub; a lane or chat command that assigns it is a hook-blocked act (see HUB-REQUEST.md of HUB-VM-NO-LOCAL-PLAYBACK-1 r1). The C++ header, the inline PowerShell guards and the lane lint carry copies of the three values above; tools/repo_hygiene/test_hub_vm_no_local_playback.py pins every copy to this file."
+}

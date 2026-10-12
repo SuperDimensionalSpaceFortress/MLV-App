@@ -38,6 +38,7 @@ SOURCES += \
     $$REPO_ROOT/tests/console/test_export_process.cpp \
     $$REPO_ROOT/tests/console/test_playback_frame_range.cpp \
     $$REPO_ROOT/tests/console/test_automation_settings.cpp \
+    $$REPO_ROOT/tests/console/test_hub_host_playback_guard.cpp \
     $$REPO_ROOT/tests/console/test_playback_quality_settings.cpp \
     $$REPO_ROOT/tests/console/test_shipping_defaults.cpp \
     $$REPO_ROOT/tests/console/test_playback_quality_auto_mode.cpp \
@@ -95,6 +96,7 @@ HEADERS += \
     $$REPO_ROOT/platform/qt/DualIsoLevelSyncPolicy.h \
     $$REPO_ROOT/platform/qt/PlaybackFrameRange.h \
     $$REPO_ROOT/platform/qt/AutomationSettings.h \
+    $$REPO_ROOT/platform/qt/HubHostPlaybackGuard.h \
     $$REPO_ROOT/platform/qt/PlaybackPrepPresentationPolicy.h \
     $$REPO_ROOT/platform/qt/PlaybackGatePolicy.h \
     $$REPO_ROOT/platform/qt/AsyncH2dCounterContract.h \

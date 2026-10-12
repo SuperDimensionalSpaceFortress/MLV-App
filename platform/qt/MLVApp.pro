@@ -369,6 +369,7 @@ HEADERS += MainWindow.h \
            ClipLifecycleBarrier.h \
            CrashForensics.h \
            AutomationSettings.h \
+           HubHostPlaybackGuard.h \
            PlaybackFrameRange.h \
            PlaybackFpsMeterPolicy.h \
            Debayered16ReconReusePolicy.h \

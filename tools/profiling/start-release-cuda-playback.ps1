@@ -16,6 +16,14 @@ param(
     [switch]$DryRun
 )
 
+# HUB-VM-NO-LOCAL-PLAYBACK-1 guard (tools/profiling/dual-venue/hub-hosts.json; pinned by tools/repo_hygiene/test_hub_vm_no_local_playback.py):
+# no MLVApp playback, smoke or profile run starts on the hub VM, a guest on Ultra-Magnus. Run it as a venue job through the tracked venue chain.
+$hubHostsNoLocalPlayback = @('VIRTUAL-TEN')
+if (($hubHostsNoLocalPlayback -contains ([string]$env:COMPUTERNAME).Trim().ToUpperInvariant()) -and ($env:MLVAPP_HUB_PLAYBACK_CI_FIXTURE -cne 'CI_FIXTURE_ONLY')) {
+    [Console]::Error.WriteLine("HUB_VM_LOCAL_PLAYBACK_REFUSED: host $env:COMPUTERNAME is the hub VM (a guest on Ultra-Magnus); run this as a venue job through the tracked venue chain")
+    exit 17
+}
+
 $ErrorActionPreference = "Stop"
 
 # PLAYBACK-CLIP-LENGTH-ENFORCE-1 round 2 (sol B3): this launcher forwards -AdditionalArgs to the app, so
