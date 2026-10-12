@@ -109,8 +109,10 @@ $receipt = [ordered]@{
     countAfter = $namesAfter.Count
     verdictCounts = [ordered]@{}
     toRemove = @($candidates | ForEach-Object { $_.Name })
-    removed = @($removed)
-    failed = @($failed)
+    # ToArray(), never @(): @() over a non-empty List[object] throws "Argument types do not match" (pwsh 7 and
+    # 5.1), and the receipt is built AFTER the deletions, so -Apply would remove the values and write no receipt.
+    removed = $removed.ToArray()
+    failed = $failed.ToArray()
 }
 foreach ($group in @($judged | Group-Object Verdict | Sort-Object Name)) { $receipt.verdictCounts[$group.Name] = $group.Count }
 $receiptDir = Split-Path -Parent $ReceiptPath
