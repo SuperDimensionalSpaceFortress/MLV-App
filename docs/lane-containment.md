@@ -339,3 +339,19 @@ budget and starve the tail. The gate takes one process snapshot per sweep (re-ta
 after 30 s) instead of two CIM scans per worktree. The receipt's `worktreeSweep`
 carries `examined` (gate calls), `elapsedMs` and `stampWriteFailed`; `considered`
 minus `examined` minus `young` is what the budget left unvisited.
+
+## Lane bulk scratch (LANE-RECEIPT-SCRATCH-CLEANUP-1)
+
+The per-run `-ScratchRoot` dir (TEMP/TMP) is removed at lane exit, but asm, shadow-build and probe dirs a
+lane names by hand under `C:\mlvtmp` were never removed by anything (the retention timer files them as
+`kind=other` / keep; 7 GiB across 73 dirs on 2026-10-12). A lane now lists each one, absolute path per
+line, in `<RunDir>\scratch-paths.txt` (the child sees that path as `MLV_LANE_SCRATCH_PATHS`). At exit,
+before the receipt is written, `tools/coordination/Remove-LaneBulkScratch.ps1` copies each path's small
+text files (`*.txt`, `*.json`, `*.log` under 1 MiB, at most 200 files / 20 MiB) to
+`<RunDir>\scratch-receipts\<n>-<leaf>\` and removes the path. It refuses, and records why in the
+receipt's `bulkScratch.entries`, any path that is not plain absolute and strictly inside
+`-BulkScratchRoot` (default `C:\mlvtmp`), is or sits beside `-ScratchRoot` or `-WorkDir`, is or contains a
+git worktree, is or contains a reparse point (never followed), or whose lane branch has an open PR (or
+whose PR state cannot be read). It never throws and never changes the lane's exit code or receipt state;
+`-KeepBulkScratch` records `kept` / `opt-out` and removes nothing. A lane without a manifest gets
+`bulkScratch: null`. Guard: `tests/coordination/test_lane_bulk_scratch.py`.
