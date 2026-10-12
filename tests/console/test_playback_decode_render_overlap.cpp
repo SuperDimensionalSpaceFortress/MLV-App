@@ -280,16 +280,18 @@ TEST(PlaybackDecodeRenderOverlapPolicy, LookaheadIsOnByDefaultOnlyOnTheTextureRo
     ASSERT_EQ( effectiveLookaheadFrames( 9, true ), 3 );
 }
 
-// PLAYBACK-CPU-PACE-GAP-1: the CPU route gets depth 1 by default when cpuRouteLookaheadDecision() admits it; the
-// texture-route default and the env override are unchanged.
-TEST(PlaybackDecodeRenderOverlapPolicy, TheCpuRouteDefaultIsDepthOneAndNeverOutranksTheEnvOrTheTextureRoute)
+// PLAYBACK-CPU-PACE-GAP-1: the CPU route's admitted default depth is kDefaultCpuRouteLookaheadFrames. r3 measured
+// depth 1 under drop-frame on (14.1 -> 10.3 fps at s2, lookahead_pruned 201 of 399) and set it to 0: the CPU
+// lookahead is an env opt-in. The texture-route default and the env override are unchanged.
+TEST(PlaybackDecodeRenderOverlapPolicy, TheCpuRouteDefaultIsOffAndNeverOutranksTheEnvOrTheTextureRoute)
 {
-    ASSERT_EQ( effectiveLookaheadFrames( -1, false, true ), 1 );
+    ASSERT_EQ( effectiveLookaheadFrames( -1, false, true ), 0 );
+    ASSERT_EQ( effectiveLookaheadFrames( 1, false, true ), 1 );  // the explicit opt-in still runs
     ASSERT_EQ( effectiveLookaheadFrames( -1, true, true ), 2 );
     ASSERT_EQ( effectiveLookaheadFrames( 0, false, true ), 0 );  // MLVAPP_PLAYBACK_RENDER_LOOKAHEAD_FRAMES=0
     ASSERT_EQ( effectiveLookaheadFrames( 2, false, false ), 2 );
     ASSERT_EQ( effectiveLookaheadFrames( -1, false, false ), 0 );
-    ASSERT_EQ( playback_overlap::kDefaultCpuRouteLookaheadFrames, 1 );
+    ASSERT_EQ( playback_overlap::kDefaultCpuRouteLookaheadFrames, 0 );
     ASSERT_EQ( playback_overlap::kDefaultTextureRouteLookaheadFrames, 2 );
 }
 
@@ -500,8 +502,9 @@ TEST(PlaybackDecodeRenderOverlapPipeline, OneCpuLookaheadFramePipelinesTheReconW
 {
     // PLAYBACK-CPU-PACE-GAP-1, the Bachelor CPU display shape: recon 41 ms, render 3 ms, ~20 ms tick + GUI hop,
     // native 41.7 ms. In series a frame costs ~64 ms (s2 measured 67.2); with the CPU default (depth 1) the recon of
-    // N+1 runs while N renders and hops, so the period approaches the recon itself.
-    const int cpuDepth = effectiveLookaheadFrames( -1, false, true );
+    // N+1 runs while N renders and hops, so the period approaches the recon itself. (Every-frame model: under
+    // drop-frame on the venue measured the opposite, see TheCpuRouteDefaultIsOff..., so depth 1 is an env opt-in.)
+    const int cpuDepth = effectiveLookaheadFrames( 1, false, true );
     ASSERT_EQ( cpuDepth, 1 );
     const PipelineRun serial = simulatePipeline( 0, Gate::ExceptLookahead, 41.0, 3.0, 20.0 );
     const PipelineRun pipelined = simulatePipeline( cpuDepth, Gate::ExceptLookahead, 41.0, 3.0, 20.0 );

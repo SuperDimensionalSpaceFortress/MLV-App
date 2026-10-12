@@ -14,9 +14,9 @@
  *
  * This header holds the three pieces that fix and prove it:
  *  - effectiveLookaheadFrames(): the lookahead is on by default at depth 2 on the
- *    CUDA texture route and (PLAYBACK-CPU-PACE-GAP-1) at depth 1 on the CPU route
- *    when cpuRouteLookaheadDecision() admits its default (Phase 3 recon worker,
- *    scale 2 or 4); MLVAPP_PLAYBACK_RENDER_LOOKAHEAD_FRAMES=0 is the kill switch
+ *    CUDA texture route and (PLAYBACK-CPU-PACE-GAP-1) at kDefaultCpuRouteLookaheadFrames
+ *    (0 since r3, so env opt-in only) on the CPU route when cpuRouteLookaheadDecision()
+ *    admits its default (Phase 3 recon worker, scale 2 or 4); MLVAPP_PLAYBACK_RENDER_LOOKAHEAD_FRAMES=0 is the kill switch
  *    for every route, any explicit value wins, and every other route keeps depth 0.
  *    MLVAPP_DISABLE_CPU_PLAYBACK_LOOKAHEAD=1 turns the CPU route off on its own.
  *  - WorkItem / blocksPlaybackAdvance(): speculative lookahead work for a frame
@@ -42,8 +42,12 @@ namespace playback_overlap
 inline constexpr int kDefaultTextureRouteLookaheadFrames = 2;
 /*! The default lookahead depth on the CPU route (PLAYBACK-CPU-PACE-GAP-1). One frame ahead lets the recon
  *  worker start N+1 while N renders and hops to the GUI, which is where the serial CPU display legs lost
- *  ~23-26 ms a frame. */
-inline constexpr int kDefaultCpuRouteLookaheadFrames = 1;
+ *  ~23-26 ms a frame. r3 measured it on Bachelor with drop-frame on (the default) and it MISSED: at s2 the
+ *  drop target strides past N+1, so the lookahead frame is pruned unshown (lookahead_pruned 201 of 399) and its
+ *  recon contends with the frame that is shown (14.1 -> 10.3 fps). So the default is 0: the CPU route runs a
+ *  lookahead only on an explicit MLVAPP_PLAYBACK_RENDER_LOOKAHEAD_FRAMES, and the admission, telemetry and kill
+ *  switch stay. A pace-aware offset (look ahead to the predicted next drop target) is the successor. */
+inline constexpr int kDefaultCpuRouteLookaheadFrames = 0;
 /*! RenderFrameThread's queuePlaybackLookaheadRequests() bound (qBound( 0, env, 3 )). */
 inline constexpr int kMaxLookaheadFrames = 3;
 
