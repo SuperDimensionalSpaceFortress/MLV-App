@@ -187,6 +187,13 @@ public:
             QString gpuPlaybackReconAmazeTexturePresentRenderer;
             QString gpuPlaybackReconTexturePresentFallbackReason;
             bool renderThreadUsingCpuPreviewProcessing = false;
+            /* CPU-DEBAYERED16-HONOUR-SCALE-1: MainWindow::drawFrame's admission
+             * (debayered16HonourScaleRefusal) of this request's OutputDebayered16
+             * frame to the reduced dual-ISO recon at playbackScaleFactor. */
+            bool cpuDebayered16HonourScaleAdmitted = false;
+            Debayered16HonourScaleRefusal cpuDebayered16HonourScaleRefusal =
+                Debayered16HonourScaleRefusal::NotPlaying;
+            QString cpuDebayered16HonourScaleReason;
             bool renderThreadUsingPlaybackPreviewProcessing = false;
             bool playbackLookaheadRequest = false;
             uint32_t playbackLookaheadOriginFrame = 0;
@@ -629,6 +636,8 @@ private:
     QString m_lastGpuAmazeFallbackReason;
     QString m_lastGpuAmazeRendererDescription;
     QString m_lastDebayered16ReconReuseFallbackReason;
+    /* CPU-DEBAYERED16-HONOUR-SCALE-1: the last logged admission (name and scale). */
+    QString m_lastDebayered16HonourScaleLogKey;
     double m_lastDualIsoPreviewHistogramMs;
     double m_lastDualIsoPreviewRegressionMs;
     double m_lastDualIsoPreviewRowscaleMs;

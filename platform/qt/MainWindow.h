@@ -1470,6 +1470,11 @@ private:
     /* r2: presented debayered-16 frames by outcome name, and the render
      * thread's all-attempts counters at session begin. */
     QMap<QString, int> m_playbackSmokeDebayered16OutcomeFrames;
+    /* CPU-DEBAYERED16-HONOUR-SCALE-1: presented debayered-16 frames debayered from
+     * the reduced recon, and each frame's request admission by name. */
+    int m_playbackSmokeDebayered16ReducedConsumedFrames = 0;
+    QString m_playbackSmokeDebayered16HonourScaleRefusalLast;
+    QMap<QString, quint64> m_playbackSmokeDebayered16HonourScaleRefusalCounts;
     std::array<uint64_t, static_cast<size_t>( Debayered16ReconRefusal::Count )>
         m_playbackSmokeDebayered16AttemptsAtBegin{};
     int m_playbackSmokeProcessed8PrefetchHits = 0;
