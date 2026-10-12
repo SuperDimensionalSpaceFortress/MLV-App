@@ -21,6 +21,15 @@
  * since it are refused, so the frame takes today's path (and its failure
  * handling) byte-for-byte. renderDebayered16FromSlot is the render's whole
  * OutputDebayered16 CPU branch, shared by RenderFrameThread and the tests.
+ *
+ * CPU-DEBAYERED16-HONOUR-SCALE-1: at preview scale 2/4 the recon worker may
+ * reconstruct this route's frame at the reduced scale too, when the request was
+ * admitted (debayered16HonourScaleRefusal, decided on the GUI thread and carried
+ * in the request's PresentationContext). The render then debayers the reduced
+ * recon (getMlvRawFrameDebayeredFromReducedReconnedRaw16) at the dims the
+ * playback prep would have box-reduced the full frame to. A reduced slot whose
+ * request was not admitted keeps the ReducedScale refusal: its rawImage16 is not
+ * a recon, so today's getMlvRawFrameDebayered renders it at full size.
  */
 
 #ifndef DEBAYERED16RECONREUSEPOLICY_H
@@ -39,6 +48,119 @@
 
 /*! Kill switch: any non-empty value other than "0" forces today's path. */
 #define MLVAPP_DISABLE_DEBAYERED16_RECON_REUSE_ENV "MLVAPP_DISABLE_DEBAYERED16_RECON_REUSE"
+
+/*! CPU-DEBAYERED16-HONOUR-SCALE-1 switch: exactly "0" disables the reduced recon on
+ *  the debayered-16 route (today's full-resolution route); unset, empty or any
+ *  other value enables it. */
+#define MLVAPP_CPU_DEBAYERED16_HONOUR_SCALE_ENV "MLVAPP_CPU_DEBAYERED16_HONOUR_SCALE"
+
+/*! Why a debayered-16 request does not ask the recon worker for the reduced
+ *  recon. None = it does. */
+enum class Debayered16HonourScaleRefusal : int
+{
+    None = 0,
+    KillSwitch,
+    NotPlaying,
+    NotCpuPreviewRoute,
+    GpuPreviewRoute,
+    GpuDebayer,
+    GpuReconTextureRoute,
+    AmazeDebayer,
+    ScaleUnsupported,
+    PrepWouldNotReduce,
+    Count
+};
+
+/*! Stable telemetry name of each admission outcome. */
+inline const char * debayered16HonourScaleRefusalName( Debayered16HonourScaleRefusal refusal )
+{
+    switch( refusal )
+    {
+    case Debayered16HonourScaleRefusal::None: return "admitted";
+    case Debayered16HonourScaleRefusal::KillSwitch: return "kill_switch";
+    case Debayered16HonourScaleRefusal::NotPlaying: return "not_playing";
+    case Debayered16HonourScaleRefusal::NotCpuPreviewRoute: return "not_cpu_preview_route";
+    case Debayered16HonourScaleRefusal::GpuPreviewRoute: return "gpu_preview_route";
+    case Debayered16HonourScaleRefusal::GpuDebayer: return "gpu_debayer";
+    case Debayered16HonourScaleRefusal::GpuReconTextureRoute: return "gpu_recon_texture_route";
+    case Debayered16HonourScaleRefusal::AmazeDebayer: return "amaze_debayer";
+    case Debayered16HonourScaleRefusal::ScaleUnsupported: return "scale_unsupported";
+    case Debayered16HonourScaleRefusal::PrepWouldNotReduce: return "prep_would_not_reduce";
+    case Debayered16HonourScaleRefusal::Count: break;
+    }
+    return "unknown";
+}
+
+/*! Human-readable reason, for the log line and cpu_dualiso_recon_fallback_reason. */
+inline const char * debayered16HonourScaleRefusalReason( Debayered16HonourScaleRefusal refusal )
+{
+    switch( refusal )
+    {
+    case Debayered16HonourScaleRefusal::None: return "";
+    case Debayered16HonourScaleRefusal::KillSwitch:
+        return "debayered16 reduced recon disabled by " MLVAPP_CPU_DEBAYERED16_HONOUR_SCALE_ENV "=0";
+    case Debayered16HonourScaleRefusal::NotPlaying: return "debayered16 reduced recon: not playing";
+    case Debayered16HonourScaleRefusal::NotCpuPreviewRoute:
+        return "debayered16 reduced recon: not the CPU preview-processing route";
+    case Debayered16HonourScaleRefusal::GpuPreviewRoute:
+        return "debayered16 reduced recon: GPU preview-processing route";
+    case Debayered16HonourScaleRefusal::GpuDebayer: return "debayered16 reduced recon: GPU debayer route";
+    case Debayered16HonourScaleRefusal::GpuReconTextureRoute:
+        return "debayered16 reduced recon: GPU playback recon texture route";
+    case Debayered16HonourScaleRefusal::AmazeDebayer:
+        return "debayered16 reduced recon: the debayer is not bilinear";
+    case Debayered16HonourScaleRefusal::ScaleUnsupported:
+        return "debayered16 reduced recon: preview scale is not 2 or 4";
+    case Debayered16HonourScaleRefusal::PrepWouldNotReduce:
+        return "debayered16 reduced recon: the playback prep would not box-reduce this frame to the preview scale";
+    case Debayered16HonourScaleRefusal::Count: break;
+    }
+    return "unknown";
+}
+
+/*! What MainWindow::drawFrame knows about the request when it decides. */
+struct Debayered16HonourScaleInputs
+{
+    bool playbackActive = false;
+    /*! PresentationContext::renderThreadUsingCpuPreviewProcessing / ...GpuPreviewProcessing. */
+    bool cpuPreviewRoute = false;
+    bool gpuPreviewRoute = false;
+    /*! PresentationContext::renderThreadUsingGpuAmazeDebayer / ...GpuBilinearDebayer, the
+     *  fields that drive the render's useGpuAmazeDebayer / useGpuBilinearDebayer. */
+    bool gpuAmazeDebayer = false;
+    bool gpuBilinearDebayer = false;
+    /*! PresentationContext::gpuPlaybackReconTexturePresentRequested. */
+    bool gpuReconTextureRoute = false;
+    /*! doesMlvAlwaysUseAmaze != 0: the route's CPU debayer is not bilinear. */
+    bool amazeDebayer = false;
+    /*! PresentationContext::playbackScaleFactor. */
+    int requestedScale = 1;
+    /*! playbackPrepDecideReduced(...).factor with the prep's own inputs but the
+     *  full-resolution clip dims as the source: what the prep would box-reduce the
+     *  full frame by. */
+    int prepFactor = 1;
+};
+
+inline bool debayered16HonourScaleKillSwitchSet( void )
+{
+    const char * value = std::getenv( MLVAPP_CPU_DEBAYERED16_HONOUR_SCALE_ENV );
+    return value && value[0] == '0' && value[1] == '\0';
+}
+
+/*! \return None when the request may ask for the reduced recon, else why not. */
+inline Debayered16HonourScaleRefusal debayered16HonourScaleRefusal( const Debayered16HonourScaleInputs & in )
+{
+    if( debayered16HonourScaleKillSwitchSet() ) return Debayered16HonourScaleRefusal::KillSwitch;
+    if( !in.playbackActive ) return Debayered16HonourScaleRefusal::NotPlaying;
+    if( !in.cpuPreviewRoute ) return Debayered16HonourScaleRefusal::NotCpuPreviewRoute;
+    if( in.gpuPreviewRoute ) return Debayered16HonourScaleRefusal::GpuPreviewRoute;
+    if( in.gpuAmazeDebayer || in.gpuBilinearDebayer ) return Debayered16HonourScaleRefusal::GpuDebayer;
+    if( in.gpuReconTextureRoute ) return Debayered16HonourScaleRefusal::GpuReconTextureRoute;
+    if( in.amazeDebayer ) return Debayered16HonourScaleRefusal::AmazeDebayer;
+    if( in.requestedScale != 2 && in.requestedScale != 4 ) return Debayered16HonourScaleRefusal::ScaleUnsupported;
+    if( in.prepFactor != in.requestedScale ) return Debayered16HonourScaleRefusal::PrepWouldNotReduce;
+    return Debayered16HonourScaleRefusal::None;
+}
 
 /*! Why a debayered-16 render did not consume the recon. None = it did. */
 enum class Debayered16ReconRefusal : int
@@ -137,6 +259,13 @@ struct Debayered16ReconReuseInputs
     bool reconUsedGpuPlaybackRecon = false;
     /*! The slot's reducedReconScale: 1 means rawImage16 holds the full-resolution recon. */
     int reducedReconScale = 1;
+    /*! CPU-DEBAYERED16-HONOUR-SCALE-1: the request admitted the reduced recon at the
+     *  slot's scale, and the slot's reduced Bayer (reducedReconWidth x
+     *  reducedReconHeight words; nullptr when the slot's buffer is shorter). */
+    bool honourScaleAdmitted = false;
+    const uint16_t * reducedReconBayer = nullptr;
+    int reducedReconWidth = 0;
+    int reducedReconHeight = 0;
     /*! Frame number and request serial the recon worker reconstructed, and the ones being rendered. */
     uint32_t reconFrameNumber = 0;
     uint32_t renderFrameNumber = 0;
@@ -215,7 +344,14 @@ public:
         if( in.gpuPlaybackReconTexturePresentRequested ) return Debayered16ReconRefusal::GpuReconTextureRoute;
         if( in.reconUsedGpuPlaybackRecon ) return Debayered16ReconRefusal::GpuPlaybackRecon;
         if( in.frameCacheMayServe ) return Debayered16ReconRefusal::FrameCacheMayServe;
-        if( in.reducedReconScale > 1 ) return Debayered16ReconRefusal::ReducedScale;
+        if( in.reducedReconScale > 1
+         && ( !in.honourScaleAdmitted
+           || !in.reducedReconBayer
+           || in.reducedReconWidth <= 0
+           || in.reducedReconHeight <= 0 ) )
+        {
+            return Debayered16ReconRefusal::ReducedScale;
+        }
         if( in.reconFrameNumber != in.renderFrameNumber
          || in.reconRequestSerial != in.renderRequestSerial )
         {
@@ -267,6 +403,15 @@ struct Debayered16ReconReuseCounters
  *  debayer, the window sol r2 B1 names. Production passes none. */
 typedef void (*Debayered16AfterAdmissionHook)( mlvObject_t * video, void * context );
 
+/*! The dims of the frame renderDebayered16FromSlot wrote: the clip's on every
+ *  path except the reduced recon, which writes Width/scale x Height/scale. */
+struct Debayered16RenderedDims
+{
+    int width = 0;
+    int height = 0;
+    int reducedScale = 1;
+};
+
 /*! The render's OutputDebayered16 CPU branch for one frame. On entry the first
  *  pixelCount words of slotRawImage16 hold the slot's recon (when there is one);
  *  on return it holds the debayered frame (pixelCount * 3 words), from the recon
@@ -274,7 +419,9 @@ typedef void (*Debayered16AfterAdmissionHook)( mlvObject_t * video, void * conte
  *  caller fills every input except frameCacheMayServe and renderSettings, which
  *  are read here from the live object at the moment of the decision. After the
  *  decision nothing here re-reads a setting the fingerprint covers: the bit shift
- *  comes from the slot's reconHqDualIso (r3). */
+ *  comes from the slot's reconHqDualIso (r3).
+ *  CPU-DEBAYERED16-HONOUR-SCALE-1: an admitted reduced slot is debayered from its
+ *  reduced Bayer instead (fewer words; renderedDims says how many). */
 inline Debayered16ReconRefusal renderDebayered16FromSlot( mlvObject_t * video,
                                                           uint32_t frameNumber,
                                                           Debayered16ReconReuseInputs reuse,
@@ -283,13 +430,37 @@ inline Debayered16ReconRefusal renderDebayered16FromSlot( mlvObject_t * video,
                                                           std::vector<float> & scratch,
                                                           Debayered16ReconReuseCounters * counters,
                                                           Debayered16AfterAdmissionHook afterAdmissionForTesting = nullptr,
-                                                          void * afterAdmissionContext = nullptr )
+                                                          void * afterAdmissionContext = nullptr,
+                                                          Debayered16RenderedDims * renderedDims = nullptr )
 {
     reuse.frameCacheMayServe =
         !video || mlvRawDebayerCacheMayServeFrame( video, frameNumber ) != 0;
     reuse.renderSettings = video ? getMlvLlrawprocSettingsFingerprint( video ) : 0;
     Debayered16ReconRefusal outcome = Debayered16ReconReusePolicy::refusal( reuse );
-    if( outcome == Debayered16ReconRefusal::None )
+    Debayered16RenderedDims dims;
+    dims.width = video ? static_cast<int>( getMlvWidth( video ) ) : 0;
+    dims.height = video ? static_cast<int>( getMlvHeight( video ) ) : 0;
+    if( outcome == Debayered16ReconRefusal::None && reuse.reducedReconScale > 1 )
+    {
+        if( afterAdmissionForTesting ) afterAdmissionForTesting( video, afterAdmissionContext );
+        int reducedWidth = 0;
+        int reducedHeight = 0;
+        if( getMlvRawFrameDebayeredFromReducedReconnedRaw16( video, frameNumber, reuse.reducedReconBayer,
+                                                             reuse.reducedReconWidth, reuse.reducedReconHeight,
+                                                             reuse.reducedReconScale, slotRawImage16,
+                                                             reuse.reconHqDualIso ? 1 : 0,
+                                                             &reducedWidth, &reducedHeight ) )
+        {
+            dims.width = reducedWidth;
+            dims.height = reducedHeight;
+            dims.reducedScale = reuse.reducedReconScale;
+        }
+        else
+        {
+            outcome = Debayered16ReconRefusal::DebayerDeclined;
+        }
+    }
+    else if( outcome == Debayered16ReconRefusal::None )
     {
         try
         {
@@ -300,7 +471,7 @@ inline Debayered16ReconRefusal renderDebayered16FromSlot( mlvObject_t * video,
             outcome = Debayered16ReconRefusal::ScratchAllocationFailed;
         }
     }
-    if( outcome == Debayered16ReconRefusal::None )
+    if( outcome == Debayered16ReconRefusal::None && dims.reducedScale == 1 )
     {
         if( afterAdmissionForTesting ) afterAdmissionForTesting( video, afterAdmissionContext );
         /* The debayer writes pixelCount * 3 words over slotRawImage16. */
@@ -313,9 +484,13 @@ inline Debayered16ReconRefusal renderDebayered16FromSlot( mlvObject_t * video,
     }
     if( outcome != Debayered16ReconRefusal::None )
     {
+        /* On a reduced slot rawImage16 is the decoded frame, not a recon: today's
+         * path decodes and reconstructs the full frame on its own. */
         getMlvRawFrameDebayered( video, frameNumber, slotRawImage16 );
+        dims.reducedScale = 1;
     }
     if( counters ) counters->note( outcome );
+    if( renderedDims ) *renderedDims = dims;
     return outcome;
 }
 

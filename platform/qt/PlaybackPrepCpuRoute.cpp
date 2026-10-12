@@ -311,6 +311,29 @@ bool playbackPrepBuildReducedConfig(PlaybackPrepCpuWorkspace & workspace,
     return true;
 }
 
+bool playbackPrepReducedSourceConfig(PlaybackPrepCpuWorkspace & workspace,
+                                     const GpuPreviewProcessingConfig & config,
+                                     uint64_t configGeneration,
+                                     const PlaybackPrepReducedDecision & decision,
+                                     int sourceWidth,
+                                     int sourceHeight,
+                                     int mlvWidth,
+                                     int mlvHeight,
+                                     GpuPreviewProcessingConfig * reduced)
+{
+    const int scale = decision.achievedScale;
+    if ( !reduced
+      || decision.refusal != PlaybackPrepReducedRefusal::SourceAlreadyReduced
+      || (scale != 2 && scale != 4)
+      || sourceWidth <= 0 || sourceHeight <= 0
+      || sourceWidth * scale != mlvWidth || sourceHeight * scale != mlvHeight )
+    {
+        return false;
+    }
+    return playbackPrepBuildReducedConfig(workspace, config, configGeneration,
+                                          mlvWidth, mlvHeight, scale, reduced);
+}
+
 PlaybackPrepCpuRouteResult playbackPrepCpuRouteRun(PlaybackPrepCpuWorkspace & workspace,
                                                    const GpuPreviewProcessingConfig & config,
                                                    uint64_t configGeneration,

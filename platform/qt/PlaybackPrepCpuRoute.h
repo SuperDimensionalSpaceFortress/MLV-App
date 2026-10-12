@@ -191,4 +191,21 @@ bool playbackPrepBuildReducedConfig(PlaybackPrepCpuWorkspace & workspace,
                                     int factor,
                                     GpuPreviewProcessingConfig * reduced);
 
+/* CPU-DEBAYERED16-HONOUR-SCALE-1: the render thread debayered a reduced dual-ISO
+ * recon, so the source arrives at mlvWidth/s x mlvHeight/s (the decision refused
+ * with SourceAlreadyReduced at achievedScale s = 2 or 4) while the config's masks
+ * and shadows/highlights frame state describe the full frame. Builds the config
+ * the prep's own box-reduce to that size would process with
+ * (playbackPrepBuildReducedConfig at the full dims and factor s). Returns false,
+ * reduced untouched, for any other source. */
+bool playbackPrepReducedSourceConfig(PlaybackPrepCpuWorkspace & workspace,
+                                     const GpuPreviewProcessingConfig & config,
+                                     uint64_t configGeneration,
+                                     const PlaybackPrepReducedDecision & decision,
+                                     int sourceWidth,
+                                     int sourceHeight,
+                                     int mlvWidth,
+                                     int mlvHeight,
+                                     GpuPreviewProcessingConfig * reduced);
+
 #endif // PLAYBACKPREPCPUROUTE_H

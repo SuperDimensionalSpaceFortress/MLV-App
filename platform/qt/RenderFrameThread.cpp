@@ -2359,11 +2359,27 @@ void RenderFrameThread::reconFrameForWorker( const ReconQueueEntry &entry,
         {
             reducedReconFallbackReason = QStringLiteral("not playing");
         }
-        else if( entry.request.outputMode != OutputProcessed8 )
+        else if( entry.request.outputMode != OutputProcessed8
+              && !( entry.request.outputMode == OutputDebayered16
+                    && reconContext.cpuDebayered16HonourScaleAdmitted ) )
         {
-            /* Only the processed8 reconned-raw consumer takes a reduced Bayer. */
-            reducedReconFallbackReason =
-                QStringLiteral("process stage is not processed8");
+            /* Only the processed8 reconned-raw consumer takes a reduced Bayer, and
+             * (CPU-DEBAYERED16-HONOUR-SCALE-1) a debayered-16 request MainWindow
+             * admitted (debayered16HonourScaleRefusal); any other debayered-16
+             * request records why it was not admitted. */
+            if( entry.request.outputMode == OutputDebayered16 )
+            {
+                reducedReconFallbackReason =
+                    reconContext.cpuDebayered16HonourScaleReason.isEmpty()
+                        ? QString::fromLatin1( debayered16HonourScaleRefusalReason(
+                              reconContext.cpuDebayered16HonourScaleRefusal ) )
+                        : reconContext.cpuDebayered16HonourScaleReason;
+            }
+            else
+            {
+                reducedReconFallbackReason =
+                    QStringLiteral("process stage is not processed8");
+            }
         }
         else if( wantsGpuPlaybackReconTextureNoReadback )
         {
@@ -4486,6 +4502,10 @@ void RenderFrameThread::drawFrame( int slotIndex,
         QStringLiteral("render_thread_frame_slot_count"),
         m_frameSlots.size() );
 
+    /* CPU-DEBAYERED16-HONOUR-SCALE-1: the OutputDebayered16 CPU branch debayered
+     * the slot's reduced recon (renderedImageWidth/Height are then reduced). */
+    bool debayered16ReducedReconConsumed = false;
+
     GpuAmazeDebayerBackendAvailability r16AmazeTextureAvailability;
     r16AmazeTextureAvailability.available =
         m_activePresentationContext.gpuPlaybackReconAmazeTexturePresentAdmitted;
@@ -5063,6 +5083,7 @@ void RenderFrameThread::drawFrame( int slotIndex,
          * with the tests). */
         Debayered16ReconRefusal phase3ReconReuseOutcome =
             Debayered16ReconRefusal::GpuDebayerRendered;
+        Debayered16RenderedDims debayered16Dims;
         if ( !renderedDebayeredFrame )
         {
             const size_t reconPixelCount =
@@ -5078,6 +5099,23 @@ void RenderFrameThread::drawFrame( int slotIndex,
             reuse.gpuPlaybackReconTexturePresentRequested =
                 m_activePresentationContext.gpuPlaybackReconTexturePresentRequested;
             reuse.reducedReconScale = slot.reducedReconScale;
+            /* CPU-DEBAYERED16-HONOUR-SCALE-1: a reduced slot is consumed only when
+             * its request was admitted at the scale it was reconstructed at. */
+            reuse.honourScaleAdmitted =
+                m_activePresentationContext.cpuDebayered16HonourScaleAdmitted
+                && slot.reducedReconScale == playbackScaleFactor
+                && !slot.reducedReconOnGpu;
+            const size_t reducedReconWords =
+                static_cast<size_t>( qMax( 0, slot.reducedReconWidth ) )
+                * static_cast<size_t>( qMax( 0, slot.reducedReconHeight ) );
+            if( slot.reducedReconScale > 1
+             && reducedReconWords > 0
+             && slot.reducedReconBayer.size() >= reducedReconWords )
+            {
+                reuse.reducedReconBayer = slot.reducedReconBayer.data();
+                reuse.reducedReconWidth = slot.reducedReconWidth;
+                reuse.reducedReconHeight = slot.reducedReconHeight;
+            }
             reuse.reconFrameNumber = reconQueuedFrameNumber;
             reuse.renderFrameNumber = frameNumber;
             reuse.reconRequestSerial = reconQueuedRequestSerial;
@@ -5095,7 +5133,10 @@ void RenderFrameThread::drawFrame( int slotIndex,
                                            slot.rawImage16.data(),
                                            reconPixelCount,
                                            m_debayered16ReconScratch,
-                                           &m_debayered16ReconReuseCounters );
+                                           &m_debayered16ReconReuseCounters,
+                                           nullptr,
+                                           nullptr,
+                                           &debayered16Dims );
         }
         else
         {
@@ -5103,6 +5144,75 @@ void RenderFrameThread::drawFrame( int slotIndex,
         }
         const bool consumedPhase3Recon =
             phase3ReconReuseOutcome == Debayered16ReconRefusal::None;
+        /* CPU-DEBAYERED16-HONOUR-SCALE-1: only a reduced debayer that actually ran
+         * changes the frame's dims (the gpuReducedReconSlot precedent above); the
+         * prep worker sees them through slot.renderedImageWidth/Height. */
+        debayered16ReducedReconConsumed =
+            consumedPhase3Recon && debayered16Dims.reducedScale > 1;
+        if( debayered16ReducedReconConsumed )
+        {
+            renderedImageWidth = debayered16Dims.width;
+            renderedImageHeight = debayered16Dims.height;
+            slot.renderedImageWidth = renderedImageWidth;
+            slot.renderedImageHeight = renderedImageHeight;
+            slot.stageTimingTelemetry.insert(
+                QStringLiteral("render_thread_rendered_width"),
+                renderedImageWidth );
+            slot.stageTimingTelemetry.insert(
+                QStringLiteral("render_thread_rendered_height"),
+                renderedImageHeight );
+        }
+        const Debayered16HonourScaleRefusal honourScaleRefusal =
+            m_activePresentationContext.cpuDebayered16HonourScaleRefusal;
+        const QString honourScaleLogKey =
+            QStringLiteral("%1 x%2 reduced_slot=%3 consumed=%4")
+                .arg( QString::fromLatin1( debayered16HonourScaleRefusalName( honourScaleRefusal ) ) )
+                .arg( playbackScaleFactor )
+                .arg( slot.reducedReconScale )
+                .arg( debayered16ReducedReconConsumed ? 1 : 0 );
+        if ( m_activePresentationContext.playbackActive
+          && honourScaleLogKey != m_lastDebayered16HonourScaleLogKey )
+        {
+            qInfo().nospace()
+                << "Debayered-16 reduced recon at x" << playbackScaleFactor << ": "
+                << ( debayered16ReducedReconConsumed
+                         ? QStringLiteral("consumed (%1x%2)")
+                               .arg( renderedImageWidth ).arg( renderedImageHeight )
+                     : honourScaleRefusal != Debayered16HonourScaleRefusal::None
+                         ? QStringLiteral("not requested: %1")
+                               .arg( QString::fromLatin1(
+                                   debayered16HonourScaleRefusalReason( honourScaleRefusal ) ) )
+                     : slot.reducedReconScale > 1
+                         ? QStringLiteral("admitted, reduced recon refused by the render: %1")
+                               .arg( QString::fromLatin1(
+                                   debayered16ReconRefusalReason( phase3ReconReuseOutcome ) ) )
+                         : QStringLiteral("admitted, the recon worker reconstructed full resolution (see cpu_dualiso_recon_fallback_reason)") )
+                << ".";
+            m_lastDebayered16HonourScaleLogKey = honourScaleLogKey;
+        }
+        slot.stageTimingTelemetry.insert(
+            QStringLiteral("debayered16_reduced_recon_consumed"),
+            debayered16ReducedReconConsumed );
+        slot.stageTimingTelemetry.insert(
+            QStringLiteral("debayered16_recon_scale"),
+            debayered16ReducedReconConsumed ? debayered16Dims.reducedScale : 1 );
+        slot.stageTimingTelemetry.insert(
+            QStringLiteral("debayered16_honour_scale_refusal"),
+            QString::fromLatin1( debayered16HonourScaleRefusalName( honourScaleRefusal ) ) );
+        if( debayered16ReducedReconConsumed )
+        {
+            /* The recon-stage summary counts a reduced frame only when its process
+             * stage consumed it (cpu_dualiso_recon_scale_summary). */
+            slot.stageTimingTelemetry.insert(
+                QStringLiteral("cpu_dualiso_reduced_recon_consumed"),
+                true );
+        }
+        else if( slot.reducedReconScale > 1 )
+        {
+            slot.stageTimingTelemetry.insert(
+                QStringLiteral("cpu_dualiso_recon_fallback_reason"),
+                QString::fromLatin1( debayered16ReconRefusalReason( phase3ReconReuseOutcome ) ) );
+        }
         const QString phase3ReconReuseFallbackReason =
             QString::fromLatin1( debayered16ReconRefusalReason( phase3ReconReuseOutcome ) );
         if ( phase3ReconReuseFallbackReason != m_lastDebayered16ReconReuseFallbackReason )
@@ -5301,12 +5411,15 @@ void RenderFrameThread::drawFrame( int slotIndex,
         else if ( shadowsHighlightsFrameStateRequested )
         {
             QString shadowsHighlightsFrameStateReason;
+            /* CPU-DEBAYERED16-HONOUR-SCALE-1: a reduced debayered-16 frame keeps the
+             * full-resolution frame state; the prep reduces the config to the frame
+             * (playbackPrepReducedSourceConfig), as it does for its own box-reduce. */
             const bool shadowsHighlightsFrameStateReady =
                 gpuPreviewProcessingAttachFrameState(
                     &previewConfig,
                     m_pMlvObject ? m_pMlvObject->processing : nullptr,
-                    renderedImageWidth,
-                    renderedImageHeight,
+                    debayered16ReducedReconConsumed ? m_imageWidth : renderedImageWidth,
+                    debayered16ReducedReconConsumed ? m_imageHeight : renderedImageHeight,
                     &shadowsHighlightsFrameStateReason);
             slot.stageTimingTelemetry.insert(
                 QStringLiteral("gpu_preview_processing_shadows_highlights_frame_state_ready"),
@@ -5437,6 +5550,13 @@ void RenderFrameThread::drawFrame( int slotIndex,
             ( gpuReducedReconSlot && skipCpuDebayerForGpuTextureNoReadback )
                 ? slot.reducedReconScale
                 : 1;
+    }
+    if( debayered16ReducedReconConsumed )
+    {
+        /* CPU-DEBAYERED16-HONOUR-SCALE-1: the scale the frame was reconstructed
+         * at. A refused frame keeps the requested scale: the prep box-reduces it
+         * to that scale, as before this card. */
+        playbackScaleFactorActive = slot.reducedReconScale;
     }
     slot.playbackScaleFactorActive = playbackScaleFactorActive;
     slot.stageTimingTelemetry.insert(

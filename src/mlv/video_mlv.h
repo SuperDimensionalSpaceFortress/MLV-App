@@ -236,6 +236,29 @@ int getMlvRawFrameDebayeredFromReconnedRaw16(mlvObject_t * video,
                                              float * reconnedRawScratch,
                                              uint16_t * outputFrame,
                                              int reconHqDualIso);
+/* CPU-DEBAYERED16-HONOUR-SCALE-1: the debayered-16 render of a frame the phase-3
+ * recon worker reconstructed at preview scale 2 or 4
+ * (mlvDualIsoPreviewScaleReconRun). Debayers reducedReconnedRaw (reducedWidth x
+ * reducedHeight) bilinear into outputFrame and repeats the last row up to
+ * Height / reconScale rows, so outputFrame holds (Width / reconScale) x
+ * (Height / reconScale) RGB16 pixels, returned in outWidth / outHeight. No
+ * decode, no llrawproc, no cache read or publish. A nonzero bit shift is applied
+ * to reducedReconnedRaw in place. Returns 1 on success, 0 (nothing written) unless
+ * reconScale is 2 or 4, reducedWidth == Width / reconScale, 0 < reducedHeight <=
+ * Height / reconScale and the debayer is bilinear (doesMlvAlwaysUseAmaze == 0).
+ * reconHqDualIso selects the bit shift as in ...FromReconnedRaw16. */
+int getMlvRawFrameDebayeredFromReducedReconnedRaw16(mlvObject_t * video,
+                                                    uint64_t frameIndex,
+                                                    const uint16_t * reducedReconnedRaw,
+                                                    int reducedWidth,
+                                                    int reducedHeight,
+                                                    int reconScale,
+                                                    uint16_t * outputFrame,
+                                                    int reconHqDualIso,
+                                                    int * outWidth,
+                                                    int * outHeight);
+/* Test-only: an error added to the reduced entry's bit shift (0 in production). */
+void mlvSetDebayered16ReducedReconBitShiftErrorForTesting(int error);
 /* Nonzero when getMlvRawFrameDebayered could serve frameIndex from the AMaZE
  * frame cache: the cache is running, or this frame is already cached. */
 int mlvRawDebayerCacheMayServeFrame(mlvObject_t * video, uint64_t frameIndex);

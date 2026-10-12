@@ -918,3 +918,152 @@ TEST(Debayered16ReconReuse, CudaReconProvenanceIsCarriedToThePolicyAndRefused)
     ASSERT_FALSE(c.reuse.provenanceK.done.usedGpuPlaybackRecon);
     ASSERT_EQ(static_cast<size_t>(0), c.mismatched);
 }
+
+// CPU-DEBAYERED16-HONOUR-SCALE-1 guard: the reduced-scale refusal reason. A reduced
+// slot whose request was not admitted keeps today's ReducedScale refusal (its
+// rawImage16 is not a recon); an admitted one with its reduced Bayer is consumed.
+TEST(Debayered16ReconReuse, ReducedScaleRefusalReasonUnlessHonourScaleAdmitted)
+{
+    KillSwitchGuard guard;
+    static const uint16_t reducedBayer[4] = { 1, 2, 3, 4 };
+    Debayered16ReconReuseInputs ok;
+    ok.consumeReconnedRaw = true;
+    ok.reconAcquisitionSucceeded = true;
+    ok.playbackActive = true;
+    ok.reconFrameNumber = ok.renderFrameNumber = 42;
+    ok.reconRequestSerial = ok.renderRequestSerial = 9;
+    ok.reconSettingsAtDecode = ok.reconSettingsAtReconDone = ok.renderSettings = 0x1234u;
+    ok.reconBufferComplete = true;
+    ok.reducedReconScale = 2;
+    ok.reducedReconBayer = reducedBayer;
+    ok.reducedReconWidth = 2;
+    ok.reducedReconHeight = 2;
+
+    Debayered16ReconReuseInputs in = ok;
+    in.honourScaleAdmitted = false;
+    ASSERT_TRUE(Debayered16ReconReusePolicy::refusal(in) == Debayered16ReconRefusal::ReducedScale);
+    ASSERT_EQ(std::string("recon is at reduced scale"), std::string(Debayered16ReconReusePolicy::ineligibleReason(in)));
+    ASSERT_EQ(std::string("reduced_scale"), std::string(debayered16ReconRefusalName(Debayered16ReconRefusal::ReducedScale)));
+
+    in.honourScaleAdmitted = true;
+    ASSERT_TRUE(Debayered16ReconReusePolicy::refusal(in) == Debayered16ReconRefusal::None);
+    in.reducedReconScale = 4;
+    ASSERT_TRUE(Debayered16ReconReusePolicy::refusal(in) == Debayered16ReconRefusal::None);
+
+    // Admitted, but no reduced Bayer to consume: still the reduced-scale refusal.
+    in = ok; in.honourScaleAdmitted = true; in.reducedReconBayer = nullptr;
+    ASSERT_TRUE(Debayered16ReconReusePolicy::refusal(in) == Debayered16ReconRefusal::ReducedScale);
+    in = ok; in.honourScaleAdmitted = true; in.reducedReconHeight = 0;
+    ASSERT_TRUE(Debayered16ReconReusePolicy::refusal(in) == Debayered16ReconRefusal::ReducedScale);
+    // Every earlier check still wins over the admission.
+    in = ok; in.honourScaleAdmitted = true; in.frameCacheMayServe = true;
+    ASSERT_TRUE(Debayered16ReconReusePolicy::refusal(in) == Debayered16ReconRefusal::FrameCacheMayServe);
+    in = ok; in.honourScaleAdmitted = true; in.reconFrameNumber = 41;
+    ASSERT_TRUE(Debayered16ReconReusePolicy::refusal(in) == Debayered16ReconRefusal::FrameIdentity);
+    in = ok; in.honourScaleAdmitted = true; in.renderSettings = 0x9999u;
+    ASSERT_TRUE(Debayered16ReconReusePolicy::refusal(in) == Debayered16ReconRefusal::SettingsChangedSinceRecon);
+    // A full-resolution slot ignores the admission.
+    in = ok; in.reducedReconScale = 1; in.honourScaleAdmitted = true;
+    ASSERT_TRUE(Debayered16ReconReusePolicy::refusal(in) == Debayered16ReconRefusal::None);
+    setKillSwitch(true);
+    in = ok; in.honourScaleAdmitted = true;
+    ASSERT_TRUE(Debayered16ReconReusePolicy::refusal(in) == Debayered16ReconRefusal::KillSwitch);
+}
+
+namespace {
+
+struct HonourScaleSwitchGuard
+{
+    HonourScaleSwitchGuard() { DEBAYERED16_REUSE_TEST_UNSETENV(MLVAPP_CPU_DEBAYERED16_HONOUR_SCALE_ENV); }
+    ~HonourScaleSwitchGuard() { DEBAYERED16_REUSE_TEST_UNSETENV(MLVAPP_CPU_DEBAYERED16_HONOUR_SCALE_ENV); }
+};
+
+Debayered16HonourScaleInputs admittedHonourScaleInputs(int scale)
+{
+    Debayered16HonourScaleInputs in;
+    in.playbackActive = true;
+    in.cpuPreviewRoute = true;
+    in.requestedScale = scale;
+    in.prepFactor = scale;
+    return in;
+}
+
+} // namespace
+
+// CPU-DEBAYERED16-HONOUR-SCALE-1 guard: the request admission, one case per refusal,
+// and the switch: exactly "0" refuses before any other input is read (the recon
+// worker consults the reduced plan only for an admitted request; the console test
+// Debayered16HonourScaleWiring pins that), while "1", unset and "" all enable.
+TEST(Debayered16ReconReuse, HonourScaleAdmissionNamesEveryRefusal)
+{
+    HonourScaleSwitchGuard guard;
+    const auto why = [](const Debayered16HonourScaleInputs & in) { return debayered16HonourScaleRefusal(in); };
+    for (const int scale : { 2, 4 })
+        ASSERT_TRUE(why(admittedHonourScaleInputs(scale)) == Debayered16HonourScaleRefusal::None);
+
+    std::set<int> seen;
+    const auto expect = [&](const Debayered16HonourScaleInputs & in, Debayered16HonourScaleRefusal expected) {
+        const Debayered16HonourScaleRefusal got = why(in);
+        std::printf("[debayered16-honour-scale] admission %s: '%s'\n", debayered16HonourScaleRefusalName(got),
+                    debayered16HonourScaleRefusalReason(got));
+        ASSERT_TRUE(got == expected);
+        seen.insert(static_cast<int>(got));
+    };
+    expect(admittedHonourScaleInputs(2), Debayered16HonourScaleRefusal::None);
+    Debayered16HonourScaleInputs in = admittedHonourScaleInputs(2);
+    in.playbackActive = false; expect(in, Debayered16HonourScaleRefusal::NotPlaying);
+    in = admittedHonourScaleInputs(2); in.cpuPreviewRoute = false;
+    expect(in, Debayered16HonourScaleRefusal::NotCpuPreviewRoute);
+    in = admittedHonourScaleInputs(2); in.gpuPreviewRoute = true;
+    expect(in, Debayered16HonourScaleRefusal::GpuPreviewRoute);
+    in = admittedHonourScaleInputs(2); in.gpuAmazeDebayer = true;
+    expect(in, Debayered16HonourScaleRefusal::GpuDebayer);
+    in = admittedHonourScaleInputs(2); in.gpuBilinearDebayer = true;
+    expect(in, Debayered16HonourScaleRefusal::GpuDebayer);
+    in = admittedHonourScaleInputs(2); in.gpuReconTextureRoute = true;
+    expect(in, Debayered16HonourScaleRefusal::GpuReconTextureRoute);
+    in = admittedHonourScaleInputs(2); in.amazeDebayer = true;
+    expect(in, Debayered16HonourScaleRefusal::AmazeDebayer);
+    for (const int scale : { 1, 8, 3, 0 })
+    {
+        in = admittedHonourScaleInputs(scale);
+        expect(in, Debayered16HonourScaleRefusal::ScaleUnsupported);
+    }
+    in = admittedHonourScaleInputs(4); in.prepFactor = 1;
+    expect(in, Debayered16HonourScaleRefusal::PrepWouldNotReduce);
+    in = admittedHonourScaleInputs(4); in.prepFactor = 2;
+    expect(in, Debayered16HonourScaleRefusal::PrepWouldNotReduce);
+
+    DEBAYERED16_REUSE_TEST_SETENV(MLVAPP_CPU_DEBAYERED16_HONOUR_SCALE_ENV, "0");
+    // Every other input admits, and an input that would refuse is never reached.
+    expect(admittedHonourScaleInputs(2), Debayered16HonourScaleRefusal::KillSwitch);
+    in = admittedHonourScaleInputs(4); in.playbackActive = false; in.prepFactor = 1;
+    expect(in, Debayered16HonourScaleRefusal::KillSwitch);
+    ASSERT_EQ(std::string("debayered16 reduced recon disabled by MLVAPP_CPU_DEBAYERED16_HONOUR_SCALE=0"),
+              std::string(debayered16HonourScaleRefusalReason(Debayered16HonourScaleRefusal::KillSwitch)));
+
+    for (const char * enabled : { "1", "", "00", "yes" })
+    {
+        DEBAYERED16_REUSE_TEST_SETENV(MLVAPP_CPU_DEBAYERED16_HONOUR_SCALE_ENV, enabled);
+        ASSERT_TRUE(why(admittedHonourScaleInputs(2)) == Debayered16HonourScaleRefusal::None);
+    }
+    DEBAYERED16_REUSE_TEST_UNSETENV(MLVAPP_CPU_DEBAYERED16_HONOUR_SCALE_ENV);
+    ASSERT_TRUE(why(admittedHonourScaleInputs(4)) == Debayered16HonourScaleRefusal::None);
+
+    ASSERT_EQ(static_cast<size_t>(Debayered16HonourScaleRefusal::Count), seen.size());
+    std::set<std::string> names;
+    std::set<std::string> reasons;
+    for (int i = 0; i < static_cast<int>(Debayered16HonourScaleRefusal::Count); ++i)
+    {
+        const Debayered16HonourScaleRefusal r = static_cast<Debayered16HonourScaleRefusal>(i);
+        const std::string name = debayered16HonourScaleRefusalName(r);
+        const std::string reason = debayered16HonourScaleRefusalReason(r);
+        ASSERT_TRUE(name != "unknown");
+        ASSERT_TRUE(reason != "unknown");
+        ASSERT_TRUE(r == Debayered16HonourScaleRefusal::None ? reason.empty() : !reason.empty());
+        names.insert(name);
+        reasons.insert(reason);
+    }
+    ASSERT_EQ(static_cast<size_t>(Debayered16HonourScaleRefusal::Count), names.size());
+    ASSERT_EQ(static_cast<size_t>(Debayered16HonourScaleRefusal::Count), reasons.size());
+}
