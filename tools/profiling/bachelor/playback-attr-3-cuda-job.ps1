@@ -386,6 +386,12 @@ param(
     [ValidateSet('', 'receipt', 'subset')]
     [string]$PlaybackProcessing = '',
 
+    # UPSTREAM-CPU-BASELINE-1: run the app with Look Assist OFF (the smoke runner's existing -DisableLookAssist, which passes
+    # --no-look-assist and fails the run closed if the app still reports Look Assist enabled). The fork turns Look Assist on for
+    # every clip by default (ReceiptSettings.cpp), so a no-look leg must ask. Refused with -ForceLookAssist. Absent (the default)
+    # adds nothing: the emitted job is the text it was before this parameter.
+    [switch]$DisableLookAssist,
+
     # PLAYBACK-VSYNC-DEFAULT-1: the GL swap interval every playback surface requests (passed to the app as MLVAPP_SWAP_INTERVAL, the
     # vsync A/B), any leg type. -1 (the default) sets nothing: the emitted job is the text it was before this parameter.
     [ValidateRange(-1, 1)][int]$SwapInterval = -1,
@@ -4143,6 +4149,11 @@ if ($hasLookReceipt) {
 if (-not [string]::IsNullOrWhiteSpace($PlaybackProcessing)) {
     # CPU-DUALISO-REDUCED-ISO-NOTCH-1: only a job that asks for a playback processing mode carries it; every other job is unchanged.
     $template = Edit-DualVenueTemplate $template '-UsePersistedPlaybackSettings ' ("-UsePersistedPlaybackSettings -PlaybackProcessing $PlaybackProcessing ")
+}
+if ($DisableLookAssist) {
+    # UPSTREAM-CPU-BASELINE-1: only a job that asks for Look Assist off carries -DisableLookAssist; every other job is unchanged.
+    if ($ForceLookAssist) { throw 'DUAL_VENUE_LOOK_ASSIST_CONFLICT -DisableLookAssist cannot be combined with -ForceLookAssist (a look or pace leg forces Look Assist on)' }
+    $template = Edit-DualVenueTemplate $template '-RequireLookAssist:`$false -Scope none' '-RequireLookAssist:`$false -DisableLookAssist -Scope none'
 }
 $isCpuBackend = ($Backend -eq 'cpu')
 if ($isCpuBackend -and $DisablePaintPerSubmit) {
