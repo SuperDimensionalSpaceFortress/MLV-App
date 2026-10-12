@@ -187,6 +187,13 @@ static bool environmentFlagEnabled( const char *name )
         && value != QByteArrayLiteral("no");
 }
 
+// PLAYBACK-STARTUP-CATCHUP-BURST-1 r7: the opt-in per-present playback trace (PlaybackPresentTrace.h), read once.
+static bool mlvappPlaybackPresentTraceRequested()
+{
+    static const bool requested = environmentFlagEnabled( "MLVAPP_PLAYBACK_PRESENT_TRACE" );
+    return requested;
+}
+
 static bool gpuTexNrOverlapTraceEnabled()
 {
     return environmentFlagEnabled( "MLVAPP_GPU_TEX_NR_OVERLAP_TRACE" );
@@ -2265,6 +2272,7 @@ MainWindow::MainWindow(int &argc, char **argv, QWidget *parent) :
     //Set timers
     m_timerId = startTimer( 40, Qt::PreciseTimer ); //25fps initially only, is set after import
     m_timerCacheId = startTimer( 1000 ); //1fps
+    m_playbackPresentTrace.setEnabled( mlvappPlaybackPresentTraceRequested() );
 
     //Connect Export Handler
     connect( this, SIGNAL(exportReady()), this, SLOT(exportHandler()) );
@@ -2618,6 +2626,10 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
         }
     };
 
+    // PLAYBACK-STARTUP-CATCHUP-BURST-1 r7: the opt-in present trace counts every tick (no-op when off).
+    if( m_playbackPresentTrace.active() )
+        m_playbackPresentTrace.noteTick( mlv_stage_timing_now() * 1000.0, m_frameStillDrawing, predictivePlaybackAdvance );
+
     if( m_frameStillDrawing )
     {
         const bool allowPredictiveBusyAdvance =
@@ -2667,7 +2679,10 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
     //Playback
     const bool frameChangedBeforePlayback = m_frameChanged;
     const int positionBeforePlayback = ui->horizontalSliderPosition->value();
+    const double tracePositionBefore = m_newPosDropMode;
     playbackHandling( timeDiff );
+    if( m_playbackPresentTrace.active() )
+        m_playbackPresentTrace.noteAdvance( mlv_stage_timing_now() * 1000.0, tracePositionBefore, m_newPosDropMode, timeDiff );
     if( frameChangedBeforePlayback )
     {
         invalidateGpuPreviewProcessingConfigCache();
@@ -6159,6 +6174,8 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
     if( ui->actionPlay->isChecked() )
         m_playbackPaceGuard.notePresent( mlv_stage_timing_now() * 1000.0, getFramerate() );
     m_frameStillDrawing = renderThreadBusyForPlaybackAdvance( currentPlaybackAdvanceTarget() );
+    if( m_playbackPresentTrace.active() )
+        m_playbackPresentTrace.notePresentEnd( mlv_stage_timing_now() * 1000.0 );   // r7 present trace
 }
 
 void MainWindow::computeDisplaySceneGeometry( int sourceWidth,
@@ -24249,6 +24266,7 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     m_playbackSmokeStartAudioSyncApplied = m_playbackAudioSyncAppliedCount;
     m_playbackSmokeStartAudioSyncSkipped = m_playbackAudioSyncSkippedCount;
     m_playbackSmokeStartTime = mlv_stage_timing_now();
+    m_playbackPresentTrace.begin( m_playbackSmokeStartTime * 1000.0, 4096 );   // r7 present trace (no-op when off)
     m_playbackSlipHistogram.reset( m_playbackSmokeStartPosition, getFramerate() );
     // PLAYBACK-STARTUP-CATCHUP-BURST-1: the timeline owes the wall time since Play only when the legacy startup banks
     // it; otherwise paced playback starts at the first present, and a later skip is a slip, never startup catch-up.
@@ -25005,6 +25023,20 @@ void MainWindow::notePlaybackSmokePresentedFrame(
         slipSample.timelinePosition = ui->horizontalSliderPosition->value();
         slipSample.lookaheadCovered = requestContext.playbackLookaheadDepth > 0;
         m_playbackSlipHistogram.notePresent( slipSample );
+        if( m_playbackPresentTrace.active() )
+        {
+            playback_present_trace::Row traceRow;
+            traceRow.frame = slipSample.displayFrame;
+            traceRow.position = slipSample.timelinePosition;
+            traceRow.presentMs = slipSample.presentMs;
+            traceRow.readyMs = slipSample.readyKnown ? slipSample.readyMs : -1.0;
+            traceRow.uiLatencyMs = presentUiSignalLatencyMs;
+            traceRow.drawMs = drawTotalMs;
+            traceRow.renderMs = renderWorkMs;
+            traceRow.queueMs = queueWaitMs;
+            traceRow.creditFrames = m_playbackPaceGuard.creditFrames();
+            m_playbackPresentTrace.notePresent( traceRow );
+        }
         // PLAYBACK-GL-PRESENT-SETUP-STALL-1: the texture-present setup split, only for a present a presenter ran.
         if( timing.contains( QStringLiteral("gpu_playback_recon_texture_present_setup_program_ms") ) )
         {
@@ -27090,6 +27122,7 @@ void MainWindow::noteContactSheetPresentedFrame(
 
     const double grabMs = static_cast<double>( grabTimer.nsecsElapsed() ) / 1000000.0;
     m_playbackSlipHistogram.noteGrab( grabMs );   // slip_summary: this grab lands in the next present's interval
+    m_playbackPresentTrace.noteGrab( grabMs );
     const bool frameOk = !gpuWindowGrabFailedClosed
         && !contactFrameImage.isNull();
 
@@ -27271,6 +27304,7 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
     }
 
     m_playbackSmokeActive = false;
+    m_playbackPresentTrace.end();
 
     // PLAYBACK-CLIP-LENGTH-ENFORCE-1: the loaded clip's own length, printed on the summary and
     // gate lines so a receipt carries the footage length the measured window actually played.
@@ -27671,6 +27705,22 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                        .arg( r.timelineAdvancedInInterval )
                        .arg( bool01( r.afterGap ) );
         }
+    }
+
+    // PLAYBACK-STARTUP-CATCHUP-BURST-1 r7: the opt-in per-present trace, written only now that the Play has stopped.
+    if( m_playbackPresentTrace.enabled() )
+    {
+        const qulonglong traceSession = static_cast<qulonglong>( m_playbackSmokeSessionId );
+        qInfo().noquote() << QStringLiteral( "playback_smoke.present_trace_header session=%1 rows=%2 cols=%3" )
+                                 .arg( traceSession )
+                                 .arg( static_cast<qulonglong>( m_playbackPresentTrace.rows().size() ) )
+                                 .arg( QLatin1String( playback_present_trace::Recorder::header() ) );
+        const std::vector<playback_present_trace::Row> &traceRows = m_playbackPresentTrace.rows();
+        for( size_t i = 0; i < traceRows.size(); ++i )
+            qInfo().noquote() << QStringLiteral( "playback_smoke.present_trace session=%1 row=%2" )
+                                     .arg( traceSession )
+                                     .arg( QString::fromStdString(
+                                         playback_present_trace::Recorder::formatRow( i, traceRows[i] ) ) );
     }
 
     if( perfFieldLogEnabled() )
@@ -30303,6 +30353,7 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
             m_lastPlaybackAudioSyncFrame = syncFrame;
             m_lastPlaybackAudioSyncTime = syncNow;
             ++m_playbackAudioSyncAppliedCount;
+            m_playbackPresentTrace.noteAudioSync();
             m_pAudioPlayback->stop();
             m_pAudioPlayback->jumpToPos( syncFrame );
             m_pAudioPlayback->play();
