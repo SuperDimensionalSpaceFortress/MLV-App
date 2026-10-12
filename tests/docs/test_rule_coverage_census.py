@@ -269,3 +269,307 @@ def test_tracked_map_resolves_at_head():
     assert res["total"] > 0
     assert res["mapped"] > 0
     assert res["mapped"] + res["prose_only"] + res["unmapped"] == res["total"]
+
+
+# ---------------------------------------------------------------------------------------------
+# RULE-COVERAGE-CENSUS-HARDENING-1: five hardening items from the #412 keys. Each group below is
+# RED on 997d6013 (the #412 merge) and green after the change.
+#   H1  pin vs behaviour split in the printed report   RULE-COVERAGE-PIN-VS-BEHAVIOUR-SPLIT-1
+#   H2  a mapping must name a test case, not a file    RULE-COVERAGE-CHECK-GRANULARITY-1
+#   H3  exists-not-enforced-in-CI is its own label     RULE-COVERAGE-CI-STATUS-1
+#   H4  fence delimiter type and length are tracked    RULE-COVERAGE-MARKDOWN-FENCES-1
+#   H5  resolved-path containment for tests and --map  RULE-COVERAGE-PATH-CONTAINMENT-1
+# ---------------------------------------------------------------------------------------------
+
+TOKEN_CLAUDE_MD = """# Title
+
+## Rules
+
+- Rule one stays prose.
+- Rule two has a behavioural check.
+- Rule three has a behavioural check.
+- Rule four stays prose.
+
+### Pinned contract tokens
+
+- `token-a` -- detail in somewhere.md
+- `token-b` -- detail in somewhere.md
+- `token-c` -- detail in somewhere.md
+"""
+
+PIN = "token-presence-pin"
+
+
+def _line_with(out: str, label: str) -> str:
+    hits = [ln for ln in out.splitlines() if label in ln]
+    assert hits, "no report line carries %r in:\n%s" % (label, out)
+    return hits[0]
+
+
+def _add_file(root: Path, rel: str, body: str) -> None:
+    p = root / rel
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(body, encoding="utf-8")
+
+
+# ----- H1: pin vs behaviour ------------------------------------------------------------------
+
+def test_report_splits_token_pins_from_behavioural_checks(tmp_path, capsys):
+    make_repo(tmp_path, claude=TOKEN_CLAUDE_MD, agent="")
+    t = ids_by_text(tmp_path)
+    write_map(tmp_path, {
+        t["Rule two has a behavioural check."]: {"check": "test:tests/test_x.py::test_ok"},
+        t["`token-a` -- detail in somewhere.md"]: {
+            "check": "test:tests/test_x.py::test_ok", "strength": PIN},
+        t["`token-b` -- detail in somewhere.md"]: {
+            "check": "test:tests/test_x.py::test_ok", "strength": PIN},
+    })
+    res = run(tmp_path)
+    assert res["errors"] == []
+    assert res["mapped"] == 3, "mapped keeps counting every resolving check"
+    assert res["behavioural_mapped"] == 1 and res["pin_mapped"] == 2
+    assert res["token_inventory"] == 3 and res["rule_bullets"] == 4
+    assert res["behavioural_percent"] == 25.0          # 1 of the 4 rule bullets
+    assert res["coverage_percent"] == round(100 * 3 / 7, 2)  # pre-existing meaning, unchanged
+
+    assert rcc.main(["--repo-root", str(tmp_path), "--no-list"]) == 0
+    out = capsys.readouterr().out
+    head = _line_with(out, "behavioural coverage")
+    assert "25.00%" in head and "1 of 4" in head
+    assert "42.86%" not in head, "the headline must not be the pin-inflated number"
+    assert "2" in _line_with(out, "token-presence pins")
+    assert out.index("behavioural coverage") < out.index("all mapped")
+    assert "42.86%" in _line_with(out, "all mapped")
+
+
+def test_unknown_strength_value_is_a_mapping_error(tmp_path):
+    make_repo(tmp_path)
+    bid = ids_by_text(tmp_path)["Never launch the thing bare."]
+    write_map(tmp_path, {bid: {"check": "test:tests/test_x.py::test_ok", "strength": "strong"}})
+    res = run(tmp_path)
+    assert len(res["errors"]) == 1 and "strength" in res["errors"][0]["why"]
+    assert res["mapped"] == 0
+
+
+def test_json_carries_the_split_numbers(tmp_path, capsys):
+    make_repo(tmp_path, claude=TOKEN_CLAUDE_MD, agent="")
+    t = ids_by_text(tmp_path)
+    write_map(tmp_path, {t["`token-a` -- detail in somewhere.md"]: {
+        "check": "test:tests/test_x.py::test_ok", "strength": PIN}})
+    assert rcc.main(["--repo-root", str(tmp_path), "--json"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["pin_mapped"] == 1 and data["behavioural_mapped"] == 0
+    assert data["behavioural_percent"] == 0.0
+
+
+# ----- H2: a mapping names a test case -------------------------------------------------------
+
+TWO_CLASSES = ("class TestA:\n    def test_a(self):\n        pass\n\n"
+               "class TestB:\n    def test_b(self):\n        pass\n\n"
+               "def test_top():\n    pass\n")
+
+
+def test_file_level_mapping_is_refused(tmp_path):
+    make_repo(tmp_path)
+    bid = ids_by_text(tmp_path)["Never launch the thing bare."]
+    write_map(tmp_path, {bid: {"check": "test:tests/test_x.py"}})
+    res = run(tmp_path)
+    assert res["mapped"] == 0
+    assert len(res["errors"]) == 1 and "name a test case" in res["errors"][0]["why"]
+
+
+def test_a_class_name_alone_is_not_a_test_case(tmp_path):
+    make_repo(tmp_path)
+    bid = ids_by_text(tmp_path)["Never launch the thing bare."]
+    write_map(tmp_path, {bid: {"check": "test:tests/test_x.py::TestX"}})
+    res = run(tmp_path)
+    assert res["mapped"] == 0
+    assert len(res["errors"]) == 1 and "test case" in res["errors"][0]["why"]
+
+
+def test_method_must_live_in_the_class_the_mapping_names(tmp_path):
+    make_repo(tmp_path)
+    _add_file(tmp_path, "tests/test_two.py", TWO_CLASSES)
+    t = ids_by_text(tmp_path)
+    write_map(tmp_path, {
+        t["Never launch the thing bare."]: {"check": "test:tests/test_two.py::TestA::test_b"},
+        t["numbered rule one"]: {"check": "test:tests/test_two.py::TestB::test_b"},
+        t["numbered rule two"]: {"check": "test:tests/test_two.py::test_top"},
+    })
+    res = run(tmp_path)
+    assert [e["id"] for e in res["errors"]] == [t["Never launch the thing bare."]]
+    assert "no definition named" in res["errors"][0]["why"]
+    assert res["mapped"] == 2
+
+
+def test_deleting_the_asserting_case_turns_the_mapping_stale(tmp_path, capsys):
+    make_repo(tmp_path)
+    bid = ids_by_text(tmp_path)["Never launch the thing bare."]
+    write_map(tmp_path, {bid: {"check": "test:tests/test_x.py::TestX::test_ok"}})
+    assert run(tmp_path)["mapped"] == 1
+    _add_file(tmp_path, "tests/test_x.py", "class TestX:\n    def test_other(self):\n        pass\n")
+    res = run(tmp_path)
+    assert res["mapped"] == 0
+    assert len(res["errors"]) == 1 and "stale" in res["errors"][0]["why"]
+    assert rcc.main(["--repo-root", str(tmp_path), "--no-list"]) == 1
+    assert "stale" in capsys.readouterr().out
+
+
+def test_a_commented_out_or_stringified_def_is_not_a_case(tmp_path):
+    make_repo(tmp_path)
+    _add_file(tmp_path, "tests/test_ghost.py",
+              "# def test_ghost(): pass\nTEXT = '''\ndef test_ghost2(self):\n'''\n")
+    t = ids_by_text(tmp_path)
+    write_map(tmp_path, {
+        t["Never launch the thing bare."]: {"check": "test:tests/test_ghost.py::test_ghost"},
+        t["numbered rule one"]: {"check": "test:tests/test_ghost.py::test_ghost2"},
+    })
+    res = run(tmp_path)
+    assert res["mapped"] == 0 and len(res["errors"]) == 2
+
+
+def test_powershell_cases_are_named_by_their_dash_name_argument(tmp_path):
+    make_repo(tmp_path)
+    _add_file(tmp_path, "tools/p.ps1",
+              'Assert-Rejected -Name "case one" `\n    -Arguments @("-X")\n')
+    t = ids_by_text(tmp_path)
+    write_map(tmp_path, {
+        t["Never launch the thing bare."]: {"check": "test:tools/p.ps1::case one"},
+        t["numbered rule one"]: {"check": "test:tools/p.ps1"},
+        t["numbered rule two"]: {"check": "test:tools/p.ps1::case two"},
+    })
+    res = run(tmp_path)
+    assert {e["id"] for e in res["errors"]} == {t["numbered rule one"], t["numbered rule two"]}
+    assert res["mapped"] == 1
+
+
+# ----- H3: exists vs enforced in CI ----------------------------------------------------------
+
+def _write_ci_allowlist(root: Path, paths) -> None:
+    body = "LOCAL_ONLY_OR_UNCOLLECTED: dict[str, str] = {\n"
+    for p in paths:
+        body += ('    "%s": (\n        "UNCOLLECTED at abc, follow-up X: "\n'
+                 '        "tests.yml names only others"\n    ),\n' % p)
+    body += "}\n"
+    _add_file(root, "tools/repo_hygiene/test_ci_collects_every_test.py", body)
+
+
+def test_uncollected_tests_are_labelled_exists_not_enforced(tmp_path, capsys):
+    make_repo(tmp_path)
+    _add_file(tmp_path, "tests/test_unc.py", "def test_u():\n    pass\n")
+    _write_ci_allowlist(tmp_path, ["tests/test_unc.py"])
+    t = ids_by_text(tmp_path)
+    write_map(tmp_path, {
+        t["numbered rule one"]: {"check": "test:tests/test_x.py::test_ok"},
+        t["numbered rule two"]: {"check": "test:tests/test_unc.py::test_u"},
+        t["Never launch the thing bare."]: {"check": "guard:NA-1"},
+    })
+    res = run(tmp_path)
+    assert res["errors"] == []
+    assert res["mapped"] == 3, "existence still counts as mapped"
+    assert res["exists_not_enforced"] == 1
+    assert res["behavioural_ci_enforced"] == 1, "only the collected test is CI-enforced here"
+    status = {b["text"]: b.get("ci_status") for b in res["bullets"]}
+    assert status["numbered rule one"] == "enforced"
+    assert status["numbered rule two"] == "exists-not-enforced"
+    assert rcc.main(["--repo-root", str(tmp_path), "--no-list"]) == 0
+    line = _line_with(capsys.readouterr().out, "exists, not enforced in CI")
+    assert "1" in line
+
+
+def test_ci_status_is_unknown_not_enforced_when_the_allowlist_is_unreadable(tmp_path):
+    make_repo(tmp_path)
+    bid = ids_by_text(tmp_path)["numbered rule one"]
+    write_map(tmp_path, {bid: {"check": "test:tests/test_x.py::test_ok"}})
+    res = run(tmp_path)
+    assert res["behavioural_ci_enforced"] == 0
+    assert [b["ci_status"] for b in res["bullets"] if b["status"] == "mapped"] == ["unknown"]
+
+
+# ----- H4: fence delimiters ------------------------------------------------------------------
+
+def test_nested_and_tilde_fences_do_not_flip_the_in_fence_state():
+    body = "\n".join([
+        "````", "```", "- hidden one", "````", "- actual one",
+        "~~~", "```", "- hidden two", "~~~", "- actual two",
+        "```", "~~~", "- hidden three", "```", "- actual three",
+    ]) + "\n"
+    assert [raw for _, raw in rcc.extract_bullets(body)] == [
+        "actual one", "actual two", "actual three"]
+
+
+def test_a_fence_closer_needs_the_same_char_enough_length_and_no_info_string():
+    body = "\n".join([
+        "````", "```python", "- hidden one", "``` ", "- hidden two", "~~~~", "- hidden three",
+        "````", "- actual one", "```", "- hidden four", "```x", "- hidden five", "```",
+        "- actual two",
+    ]) + "\n"
+    assert [raw for _, raw in rcc.extract_bullets(body)] == ["actual one", "actual two"]
+
+
+def test_a_longer_fence_after_continuation_lines_still_ends_the_bullet():
+    body = "- first rule\n  wrapped\n````\n- hidden\n````\n"
+    assert [raw for _, raw in rcc.extract_bullets(body)] == ["first rule\n  wrapped"]
+
+
+# ----- H5: path containment ------------------------------------------------------------------
+
+def _link_dir(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=True)
+        return
+    except (OSError, NotImplementedError):
+        pass
+    if sys.platform == "win32":
+        import subprocess
+        r = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)],
+                           capture_output=True, text=True)
+        if r.returncode == 0:
+            return
+    pytest.skip("cannot create a symlink or junction on this host")
+
+
+def test_map_argument_outside_the_repo_root_is_rejected(tmp_path, capsys):
+    repo = make_repo(tmp_path / "repo")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    bid = ids_by_text(repo)["numbered rule one"]
+    (outside / "map.json").write_text(json.dumps({"schema": rcc.MAP_SCHEMA, "mappings": {
+        bid: {"check": "test:tests/test_x.py::test_ok"}}}), encoding="utf-8")
+    assert rcc.main(["--repo-root", str(repo), "--map", str(outside / "map.json"),
+                     "--no-list"]) == 2
+    assert "outside the repo root" in capsys.readouterr().err
+
+
+def test_relative_map_argument_that_climbs_out_is_rejected(tmp_path, monkeypatch, capsys):
+    repo = make_repo(tmp_path / "repo")
+    (tmp_path / "outside.json").write_text(
+        json.dumps({"schema": rcc.MAP_SCHEMA, "mappings": {}}), encoding="utf-8")
+    monkeypatch.chdir(repo)
+    assert rcc.main(["--repo-root", str(repo), "--map", "../outside.json", "--no-list"]) == 2
+    assert "outside the repo root" in capsys.readouterr().err
+
+
+def test_map_argument_inside_the_repo_root_is_accepted(tmp_path, monkeypatch):
+    repo = make_repo(tmp_path / "repo")
+    _add_file(repo, "alt/map.json", json.dumps({"schema": rcc.MAP_SCHEMA, "mappings": {}}))
+    monkeypatch.chdir(repo)
+    assert rcc.main(["--repo-root", str(repo), "--map", "alt/map.json", "--no-list"]) == 0
+    assert rcc.main(["--repo-root", str(repo), "--map", str(repo / "alt" / "map.json"),
+                     "--no-list"]) == 0
+
+
+def test_a_link_inside_the_repo_that_points_outside_is_not_a_test_file(tmp_path):
+    repo = make_repo(tmp_path / "repo")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "test_o.py").write_text("def test_o():\n    pass\n", encoding="utf-8")
+    _link_dir(repo / "tests" / "linked", outside)
+    t = ids_by_text(repo)
+    write_map(repo, {
+        t["numbered rule one"]: {"check": "test:tests/linked/test_o.py::test_o"},
+        t["numbered rule two"]: {"check": "hook:tests/linked/test_o.py"},
+    })
+    res = run(repo)
+    assert res["mapped"] == 0 and len(res["errors"]) == 2
+    assert all("outside the repo root" in e["why"] for e in res["errors"])
