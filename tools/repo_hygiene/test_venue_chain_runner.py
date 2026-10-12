@@ -324,7 +324,7 @@ class VenueChainRunnerTests(unittest.TestCase):
         log = self.chain_log(rd)
         order = [l.split(" ", 2)[1] for l in log if not l.startswith("CHAIN_RESULT=")]
         first_leg = order[order.index("QUIET"):order.index("CLAIM_RELEASED") + 1]
-        self.assertEqual(first_leg, ["QUIET", "CLAIM_TAKEN", "QUIET", "LEG", "LEG", "CLAIM_RELEASED"], order)
+        self.assertEqual(first_leg, ["QUIET", "TICKET_TAKEN", "CLAIM_TAKEN", "QUIET", "TICKET_ENDED", "LEG", "LEG", "CLAIM_RELEASED"], order)   # VENUE-CLAIM-FIFO-1: the ticket brackets the claim
 
     def test_mutation_claim_taken_before_the_quiet_wait_is_caught(self) -> None:
         mut = self.mutated_runner("        # (b) the quiet wait, WITHOUT the claim\n",
