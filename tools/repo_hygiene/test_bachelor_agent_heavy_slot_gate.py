@@ -87,6 +87,31 @@ class BachelorAgentHeavySlotGatePins(unittest.TestCase):
         # Anything else with the slot in hand releases it before re-queueing.
         self.assertRegex(self.code, r'\$why = "acquired slot .*released, re-joining the FIFO"\s*\n\s*Stop-HeavySlotHolder')
 
+    def test_own_slot_is_excluded_only_for_the_verified_live_holder(self) -> None:
+        # r2 (sol r1 BLOCKER): r1c excluded the slot NUMBER without checking its owner, so a holder that exited
+        # during the status probe let another suite's slot be excluded and a heavy job was admitted beside it.
+        self.assertIn("-OwnSlot $hs.slot -OwnPid $hs.ownerPid -Label $label", self.code)
+        self.assertIn("$Matches[1] -eq $Label -and [int]$Matches[2] -eq $OwnPid) { $ownSeen = $true; continue }", self.code)
+        self.assertIn('elseif ($occ.ownLost) { $v.state = "holder-lost"', self.code)
+        # The holder must still hold the slot AFTER the probe: checked after Invoke-HeavySlotStatus, before any admit.
+        acquired = self.code[self.code.index("$status = Invoke-HeavySlotStatus -HeartbeatActivity \"gate-wait job=$JobId state=acquired"):]
+        live = acquired.index("$live = Test-HeavySlotHolderHeld -Holder $holder -Acquired $hs")
+        self.assertLess(live, acquired.index('if ($v.state -eq "clear") {'))
+        self.assertIn('if (-not $live.ok) { $v.state = "holder-lost"; $v.why = $live.why }', acquired)
+
+    def test_pre_launch_revalidation_precedes_the_child_launch(self) -> None:
+        body = self.code[self.code.index("function Invoke-QueuedJob"):]
+        body = body[:body.index("\n}\n")]
+        confirm = body.index("$pre = Confirm-HeavySlotHeldForLaunch -JobId $jobId")
+        launch = body.index("$launch = Start-WindowlessRedirectedProcess -FilePath $psExe")
+        self.assertLess(body.index("$marker = New-LaunchingMarker"), confirm)
+        self.assertLess(confirm, launch)
+        refusal = body[confirm:launch]
+        self.assertIn("Exit-HeavySlot", refusal)
+        self.assertIn('-Phase "pre-launch"', refusal)
+        self.assertRegex(refusal, r"\breturn\b")
+        self.assertIn("Add-HeavySlotHolderLossToAdmission -JobId $jobId -Admission $script:Admission", body)
+
     def test_light_probes_stay_exempt_and_deploy_gate_string_matches(self) -> None:
         self.assertIn("[string]$GateExemptJobPattern = '^(venue-quiet-probe|agent-swap)-|^dve-[A-Za-z0-9._-]+-health$'", self.text)
         m = re.search(r'^\$script:GateVersion = "([^"]+)"', self.text, re.M)
@@ -111,6 +136,14 @@ class BachelorAgentHeavySlotGateUnit(unittest.TestCase):
         self.assertEqual(out["status"], "PASS")
         self.assertEqual(out["results"]["unit"]["thresholds"]["t7"], "hot")
         self.assertEqual(out["results"]["unit"]["verdicts"]["ownSlotExcluded"], "clear")
+        # r2: sol's r1 repro, owner mismatch and the pre-launch revalidation.
+        unit = out["results"]["unit"]
+        self.assertEqual(unit["ownerCheck"]["foreignOwner"], "holder-lost")
+        self.assertEqual(unit["holderLost"]["solRepro"], "holder-lost")
+        self.assertEqual(unit["holderLost"]["label"], "queue-expired")
+        self.assertEqual(unit["holderLost"]["ownerMismatch"], "holder-lost")
+        self.assertEqual(unit["holderLost"]["preLaunch"]["exitDuringProbe"], "holder-lost")
+        self.assertEqual(unit["holderLost"]["preLaunch"]["ownerMismatch"], "holder-lost")
 
 
 if __name__ == "__main__":

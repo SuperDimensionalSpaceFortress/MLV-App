@@ -16,6 +16,9 @@ param(
 # (tools/profiling/bachelor/ultra-magnus-agent.ps1).
 #   unit  - the SUSTAINED heat rule (spikes with 0 throttled rows do not block; > 6/60 throttled or a 60-row mean
 #           >= 88 C does), occupancy with the job's own slot excluded, and the verdict precedence.
+#           r2: the own slot is excluded only when held by this job's label AND owner pid; a holder lost before,
+#           during or after the status probe (sol's r1 repro) is holder-lost, never clear; and the pre-launch
+#           revalidation refuses a launch whose slot is no longer proven this job's.
 #   e2e   - the real agent and the real heavy-slot.py: a WAITING job holds no slot (only heavy-slot.py's FIFO
 #           ticket); a heavy job runs only through `heavy-slot.py run --exclusive --label "mlv <jobId>"` and only when
 #           no other slot is held (busy == 0); a live ticket ahead is served first; a dead one is reclaimed by
@@ -87,21 +90,131 @@ $unit.thresholds = [ordered]@{ t6 = $t6.state; t7 = $t7.state; mean88 = $m88.sta
 $clearFeed = @{ metrics = (ConvertFrom-HeavySlotFeedRows -Lines (New-FeedRows -Temps (1..60 | % { 60 }) -Throttled (1..60 | % { $false }))); why = $null }
 $hotFeed = @{ metrics = (ConvertFrom-HeavySlotFeedRows -Lines (New-FeedRows -Temps (1..60 | % { 70 }) -Throttled (1..60 | % { $_ -le 7 }))); why = $null }
 $statusOwn = @{ ok = $true; error = $null; lines = @('slot 1: mlv j1 (pid 4242, since 2026-10-11 18:00:00) [exclusive]', 'slot 2: free', 'thermal: max 99 C, throttled 0/15, 40 W over ~30 s', 'queue 1: suite x (pid 77, since 2026-10-11 18:00:01)', 'queue 2: mlv j2 (pid 78, since 2026-10-11 18:00:02)') }
-$vOwn = Get-HeavySlotVerdict -Status $statusOwn -Feed $clearFeed -OwnSlot 1 -Label 'mlv j1'
+$vOwn = Get-HeavySlotVerdict -Status $statusOwn -Feed $clearFeed -OwnSlot 1 -OwnPid 4242 -Label 'mlv j1'
 Assert-True ($vOwn.state -eq 'clear' -and $vOwn.busy -eq 0) "the job's OWN slot is not counted as busy (r1k counted its own reservation): $($vOwn.state) busy=$($vOwn.busy)"
 $vOther = Get-HeavySlotVerdict -Status $statusOwn -Feed $clearFeed -OwnSlot 0
 Assert-True ($vOther.state -eq 'busy' -and $vOther.busy -eq 1) "another holder is busy: $($vOther.state)"
 $vGone = Get-HeavySlotVerdict -Status $statusOwn -Feed $clearFeed -OwnSlot 2
 Assert-True ($vGone.state -eq 'status-unknown') "an own slot shown free is unknown, never clear: $($vGone.why)"
-$vHot = Get-HeavySlotVerdict -Status $statusOwn -Feed $hotFeed -OwnSlot 1
+$vHot = Get-HeavySlotVerdict -Status $statusOwn -Feed $hotFeed -OwnSlot 1 -OwnPid 4242 -Label 'mlv j1'
 Assert-True ($vHot.state -eq 'hot') "sustained heat blocks a job alone on the machine"
 $vQ = Get-HeavySlotVerdict -Status $statusOwn -Feed $clearFeed -Label 'mlv j2'
 Assert-True ($vQ.queuePos -eq 2 -and $vQ.queueLen -eq 2) "FIFO position read from status queue lines: $($vQ.queuePos)/$($vQ.queueLen)"
 $vUnk = Get-HeavySlotVerdict -Status @{ ok = $false; lines = @(); error = 'status timed out after 30 s' } -Feed $clearFeed
 Assert-True ($vUnk.state -eq 'status-unknown') "a failed status probe is unknown, never empty"
-$vFeed = Get-HeavySlotVerdict -Status $statusOwn -Feed @{ metrics = $null; why = 'feed stale (300 s > 120 s)' } -OwnSlot 1
+$vFeed = Get-HeavySlotVerdict -Status $statusOwn -Feed @{ metrics = $null; why = 'feed stale (300 s > 120 s)' } -OwnSlot 1 -OwnPid 4242 -Label 'mlv j1'
 Assert-True ($vFeed.state -eq 'feed-unknown') "an unknown feed is never clear"
 $unit.verdicts = [ordered]@{ ownSlotExcluded = $vOwn.state; otherHolder = $vOther.state; ownSlotFree = $vGone.state; hotAlone = $vHot.state; queuePos = "$($vQ.queuePos)/$($vQ.queueLen)"; statusFailed = $vUnk.state; feedUnknown = $vFeed.state }
+
+# r2 (sol r1 BLOCKER): the own slot is excluded ONLY when status shows it held by this job's label AND owner pid.
+# Anyone else in it means the holder lost it: holder-lost, that run counts as busy, never clear.
+$statusTaken = @{ ok = $true; error = $null; lines = @('slot 1: suite X (pid 77, since 2026-10-11 18:00:00) [exclusive]', 'slot 2: free', 'thermal: max 60 C, throttled 0/15, 40 W over ~30 s') }
+$vTaken = Get-HeavySlotVerdict -Status $statusTaken -Feed $clearFeed -OwnSlot 1 -OwnPid 4242 -Label 'mlv j1'
+Assert-True ($vTaken.state -eq 'holder-lost' -and $vTaken.busy -eq 1) "owner mismatch (suite X pid 77 in the own slot) is holder-lost with busy 1, never excluded: $($vTaken.state) busy=$($vTaken.busy) $($vTaken.why)"
+$statusPid = @{ ok = $true; error = $null; lines = @('slot 1: mlv j1 (pid 99, since 2026-10-11 18:00:00) [exclusive]', 'slot 2: free') }
+$vPid = Get-HeavySlotVerdict -Status $statusPid -Feed $clearFeed -OwnSlot 1 -OwnPid 4242 -Label 'mlv j1'
+Assert-True ($vPid.state -eq 'holder-lost' -and $vPid.busy -eq 1) "same label, other owner pid is holder-lost: $($vPid.state)"
+$vLabel = Get-HeavySlotVerdict -Status $statusOwn -Feed $clearFeed -OwnSlot 1 -OwnPid 4242 -Label 'mlv j9'
+Assert-True ($vLabel.state -eq 'holder-lost') "same owner pid, other label is holder-lost: $($vLabel.state)"
+$vBare = Get-HeavySlotVerdict -Status $statusOwn -Feed $clearFeed -OwnSlot 1
+Assert-True ($vBare.state -eq 'holder-lost' -and $vBare.busy -eq 1) "an own slot with no owner identity to verify is never excluded: $($vBare.state)"
+$unit.ownerCheck = [ordered]@{ foreignOwner = $vTaken.state; otherPid = $vPid.state; otherLabel = $vLabel.state; noIdentity = $vBare.state }
+
+# r2: sol's exact repro, through the agent's REAL Wait-HeavySlotAdmission / Get-HeavySlotHolderState /
+# Test-HeavySlotHolderHeld / Confirm-HeavySlotHeldForLaunch, with the holder process, status and feed mocked.
+foreach ($name in @('Read-JsonFile', 'Get-HeavySlotHolderState', 'Test-HeavySlotHolderHeld', 'Add-HeavySlotHolderLoss', 'Add-HeavySlotHolderLossToAdmission', 'Wait-HeavySlotAdmission', 'Confirm-HeavySlotHeldForLaunch')) {
+    $fn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $true)
+    Assert-True ($null -ne $fn) "agent defines $name"
+    . ([scriptblock]::Create($fn.Extent.Text))
+}
+$mockDir = Join-Path ([IO.Path]::GetTempPath()) ("um-agent-holder-lost-{0}-{1}" -f $PID, [guid]::NewGuid().ToString('N').Substring(0, 8))
+New-Item -ItemType Directory -Force -Path $mockDir | Out-Null
+$cancel = $mockDir
+$HeavySlotDir = $mockDir
+$GateProbeSec = 15
+$script:GateVersion = 'unit'
+$script:GateHour = @{ admitted = 0; waitSecTotal = 0; requeued = 0 }
+$script:HolderLossByJob = @{}
+$script:Mock = @{}
+function Add-AgentLogLine([string]$Line) { $script:Mock.log += @($Line) }
+function Write-AgentHeartbeat([string]$Activity) { }
+function Add-GateProbeRecord { param([string]$JobId, $Verdict, [double]$WaitedSec, [string]$Phase, [string]$WaitState) $script:Mock.probes += @($Verdict.state) }
+function Get-QueueAgeSeconds { param($Job, $Metadata) if ($script:Mock.expire) { 999 } else { 0 } }
+function Read-HeavySlotFeedMetrics { return $clearFeed }
+function New-MockHolder([string]$Held) {
+    $acq = Join-Path $mockDir ("{0}.acquired.json" -f [guid]::NewGuid().ToString('N'))
+    [IO.File]::WriteAllText($acq, (@{ held = $Held; sentinelPid = 1 } | ConvertTo-Json -Compress))
+    return [pscustomobject]@{ ok = $true; id = 'j1.x'; jobId = 'j1'; label = 'mlv j1'; pid = [int]($Held -split ':')[1]; acquiredFile = $acq; releaseFile = "$acq.release"; recordFile = "$acq.holder.json"
+        launch = [pscustomobject]@{ Process = [pscustomobject]@{ HasExited = $false; ExitCode = 0 } } }
+}
+function Start-HeavySlotHolder { param([string]$JobId) $script:Mock.starts++; return $script:Mock.holder }
+function Stop-HeavySlotHolder { param($Holder, [string]$Why) $script:Mock.stops += @($Why); $script:Mock.expire = $true }
+function Exit-HeavySlot { $h = $script:HeavySlotHolder; $script:HeavySlotHolder = $null; if ($null -ne $h) { Stop-HeavySlotHolder -Holder $h -Why 'job done' } }
+function Invoke-HeavySlotStatus {
+    param([string]$HeartbeatActivity = '')
+    if ($script:Mock.exitDuringStatus) { $script:Mock.holder.launch.Process.HasExited = $true; $script:Mock.holder.launch.Process.ExitCode = 1 }
+    return $script:Mock.status
+}
+function Reset-Mock([string]$Held, $StatusLines, [bool]$ExitDuringStatus) {
+    $script:Mock = @{ log = @(); probes = @(); stops = @(); starts = 0; expire = $false; exitDuringStatus = $ExitDuringStatus
+        holder = (New-MockHolder $Held); status = @{ ok = $true; error = $null; lines = @($StatusLines) } }
+    $script:HolderLossByJob = @{}
+}
+$takenLines = @('slot 1: suite X (pid 77, since 2026-10-11 18:00:00) [exclusive]', 'slot 2: free')
+try {
+    # 1. sol's repro: acquired HEAVY_SLOT_HELD=1:4242, the holder exits DURING the status probe, suite X (pid 77) now
+    #    holds slot 1, 60 cool unthrottled feed rows. r1c returned clear / busy=0 / exclusive. Now: holder-lost, never clear.
+    Reset-Mock '1:4242' $takenLines $true
+    $adm = Wait-HeavySlotAdmission -JobId 'j1' -Job ([pscustomobject]@{}) -Metadata ([pscustomobject]@{ maxQueueAgeSec = 1 })
+    Assert-True ($adm.label -ne 'clear' -and $adm.label -eq 'queue-expired') "sol repro: never admitted (label $($adm.label))"
+    Assert-True ($null -eq $script:HeavySlotHolder) "sol repro: no admitted holder is left"
+    Assert-True (@($script:Mock.probes) -contains 'holder-lost' -and @($script:Mock.probes) -notcontains 'clear') "sol repro: the acquired probe is holder-lost, never clear: $($script:Mock.probes -join ',')"
+    $loss = @($script:HolderLossByJob['j1'])
+    Assert-True ($loss.Count -eq 1 -and $loss[0].reason -eq 'holder-lost' -and $loss[0].phase -eq 'acquired' -and $loss[0].held -eq '1:4242') "sol repro: one typed holder-lost event recorded: $($loss | ConvertTo-Json -Compress)"
+    Assert-True (@($script:Mock.stops).Count -ge 1 -and $script:Mock.stops[0] -match 'holder-lost') "sol repro: the holder is ended with the typed reason: $($script:Mock.stops -join ' | ')"
+    Assert-True (@($script:Mock.log | Where-Object { $_ -match '^heavy-slot-gate: holder-lost job=j1 phase=acquired' }).Count -eq 1) "sol repro: holder-lost is logged"
+    Add-HeavySlotHolderLossToAdmission -JobId 'j1' -Admission $adm
+    Assert-True (@($adm.holderLost).Count -eq 1 -and $adm.holderLost[0].reason -eq 'holder-lost') "sol repro: the event reaches the job's admission record (and so its result)"
+    $unit.holderLost = [ordered]@{ solRepro = $script:Mock.probes[0]; label = $adm.label; event = $loss[0].why }
+
+    # 2. owner mismatch with the holder still alive: suite X sits in the slot HEAVY_SLOT_HELD names -> holder-lost.
+    Reset-Mock "1:$PID" $takenLines $false
+    $adm = Wait-HeavySlotAdmission -JobId 'j1' -Job ([pscustomobject]@{}) -Metadata ([pscustomobject]@{ maxQueueAgeSec = 1 })
+    Assert-True ($adm.label -eq 'queue-expired' -and $script:Mock.probes[0] -eq 'holder-lost') "owner mismatch: holder-lost, not admitted: $($script:Mock.probes -join ',')"
+    $unit.holderLost.ownerMismatch = $script:Mock.probes[0]
+
+    # Positive control: the own slot shown held by 'mlv j1' with the live owner pid is admitted (clear, busy 0).
+    Reset-Mock "1:$PID" @("slot 1: mlv j1 (pid $PID, since 2026-10-11 18:00:00) [exclusive]", 'slot 2: free') $false
+    $adm = Wait-HeavySlotAdmission -JobId 'j1' -Job ([pscustomobject]@{}) -Metadata ([pscustomobject]@{ maxQueueAgeSec = 1 })
+    Assert-True ($adm.label -eq 'clear' -and [int]$adm.busy -eq 0 -and $null -ne $script:HeavySlotHolder) "control: a verified own slot admits: $($adm.label)"
+    $script:Admission = $adm
+
+    # 3. pre-launch revalidation (TOCTOU). Verified slot -> ok; holder exits during the pre-launch probe and suite X
+    #    takes the slot -> refused, holder-lost; holder alive but another owner pid in the slot -> refused.
+    $pre = Confirm-HeavySlotHeldForLaunch -JobId 'j1'
+    Assert-True ($pre.ok) "pre-launch: a still-held, verified slot passes: $($pre.why)"
+    $script:Mock.status = @{ ok = $true; error = $null; lines = $takenLines }
+    $script:Mock.exitDuringStatus = $true
+    $pre = Confirm-HeavySlotHeldForLaunch -JobId 'j1'
+    Assert-True (-not $pre.ok -and $pre.reason -eq 'holder-lost') "pre-launch: holder exits during the probe -> refused holder-lost: $($pre.reason) $($pre.why)"
+    $script:Mock.holder.launch.Process.HasExited = $false
+    $script:Mock.exitDuringStatus = $false
+    $script:Mock.status = @{ ok = $true; error = $null; lines = @('slot 1: mlv j1 (pid 99, since 2026-10-11 18:00:00) [exclusive]', 'slot 2: free') }
+    $preMismatch = Confirm-HeavySlotHeldForLaunch -JobId 'j1'
+    Assert-True (-not $preMismatch.ok -and $preMismatch.reason -eq 'holder-lost') "pre-launch: another owner pid in the slot -> refused holder-lost: $($preMismatch.why)"
+    $script:Mock.status = @{ ok = $false; error = 'status timed out after 30 s'; lines = @() }
+    $preUnknown = Confirm-HeavySlotHeldForLaunch -JobId 'j1'
+    Assert-True (-not $preUnknown.ok -and $preUnknown.reason -eq 'holder-lost') "pre-launch: ownership that cannot be confirmed is refused: $($preUnknown.why)"
+    $script:HeavySlotHolder = $null
+    $preNone = Confirm-HeavySlotHeldForLaunch -JobId 'j1'
+    Assert-True (-not $preNone.ok -and $preNone.reason -eq 'holder-lost') "pre-launch: no admitted holder is refused"
+    $unit.holderLost.preLaunch = [ordered]@{ exitDuringProbe = $pre.reason; ownerMismatch = $preMismatch.reason; statusUnknown = $preUnknown.reason }
+}
+finally {
+    $script:HeavySlotHolder = $null
+    $script:Admission = $null
+    Remove-Item -LiteralPath $mockDir -Recurse -Force -ErrorAction SilentlyContinue
+}
 $results.unit = $unit
 
 if ($UnitOnly) {

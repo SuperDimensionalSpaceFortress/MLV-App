@@ -1338,6 +1338,14 @@ function Resolve-StartedMarkers {
 # and the job re-joins the FIFO: a job that is not running never keeps a slot. Light probes
 # (GateExemptJobPattern) are not gated and take no slot.
 #
+# r2 (sol r1 BLOCKER, HOLDER LOSS): a holder can exit after acquiring, and heavy-slot.py then gives its slot to
+# another run. So the agent's own slot is excluded from busy ONLY when `status` shows it held by this job's label
+# AND the owner pid in HEAVY_SLOT_HELD, and the holder must still hold it after every status probe. Otherwise the
+# verdict is holder-lost: never clear, the slot's real holder counts as busy, the holder is ended and the job
+# re-joins the FIFO. Immediately before the child is created the same proof is re-run (Confirm-HeavySlotHeldForLaunch);
+# a failure there launches nothing and leaves the job queued. Every such event is typed in agent.log and kept in
+# the job's admission.holderLost.
+#
 # Every probe goes to logs\heavy-slot-gate.jsonl (also sampled every GateIdleSampleSec while idle), with an
 # hourly summary in agent.log and logs\heavy-slot-gate-hourly.jsonl. The heartbeat carries
 # "gate-wait job=<id> state=<s> waited=<n>s", which um-run.ps1 reads.
@@ -1351,9 +1359,10 @@ function Resolve-StartedMarkers {
 # that finds launching adopts a live child found by command line, re-queues only on proof nothing launched (no
 # live child and no out file), and otherwise orphans (Resolve-LaunchingMarker).
 # ---------------------------------------------------------------------------
-$script:GateVersion = "heavy-slot-gate-1 r1k + heavy-slot-gate-2 r2e + wait-release r1c fifo-holder sustained-heat (2026-10-11)"
+$script:GateVersion = "heavy-slot-gate-1 r1k + heavy-slot-gate-2 r2e + wait-release r1c fifo-holder sustained-heat + r2 holder-owner-check (2026-10-12)"
 $script:HeavySlotHolder = $null
 $script:Admission = $null
+$script:HolderLossByJob = @{}
 $script:GateHourKey = $null
 $script:GateHour = $null
 $script:GateLastIdleSampleUtc = [DateTime]::MinValue
@@ -1484,18 +1493,31 @@ function Get-HeavySlotOccupancy {
     # Pure: who holds a slot, from `heavy-slot.py status`. $OwnSlot (this job's holder slot) counts as neither busy
     # nor free, so busy is about everyone ELSE. Also reads this job's position in heavy-slot.py's FIFO (queue lines).
     # ok=$false is UNKNOWN, never empty.
-    param($Status, [int]$OwnSlot = 0, [string]$Label = "")
-    $o = [ordered]@{ ok = $false; busy = 0; holders = @(); queuePos = 0; queueLen = 0; why = $null }
+    # r2 (sol r1 BLOCKER): $OwnSlot is excluded ONLY when status shows it held by this job's own holder: label $Label
+    # AND owner pid $OwnPid (the pid in HEAVY_SLOT_HELD). Held by anyone else, the holder lost it (it exited and
+    # heavy-slot.py gave the slot to another run): that holder counts as BUSY and ownLost is set -- never excluded.
+    param($Status, [int]$OwnSlot = 0, [int]$OwnPid = 0, [string]$Label = "")
+    $o = [ordered]@{ ok = $false; busy = 0; holders = @(); queuePos = 0; queueLen = 0; ownLost = $false; why = $null }
     if (-not $Status.ok) { $o.why = $Status.error; return [pscustomobject]$o }
     $slotLines = @($Status.lines | Where-Object { $_ -match '^slot \d+: ' })
     if ($slotLines.Count -lt 1) { $o.why = "status output unrecognised"; return [pscustomobject]$o }
     $ownSeen = $false
+    $ownWho = $null
     foreach ($l in $slotLines) {
         if ($l -notmatch '^slot (\d+): (.*)$') { continue }
         $n = [int]$Matches[1]
         $who = $Matches[2]
-        if ($OwnSlot -gt 0 -and $n -eq $OwnSlot) { $ownSeen = $who -ne "free"; continue }
+        if ($OwnSlot -gt 0 -and $n -eq $OwnSlot -and $who -ne "free") {
+            if ($Label -and $OwnPid -gt 0 -and $who -match '^(.*?) \(pid (\d+)[,)]' -and $Matches[1] -eq $Label -and [int]$Matches[2] -eq $OwnPid) { $ownSeen = $true; continue }
+            $ownWho = $who
+            $o.ownLost = $true
+        }
         if ($who -ne "free") { $o.busy++; $o.holders += $who }
+    }
+    if ($o.ownLost) {
+        $o.ok = $true
+        $o.why = "own slot $OwnSlot is held by '$ownWho', not by '$Label' pid ${OwnPid}: this job's holder lost it"
+        return [pscustomobject]$o
     }
     foreach ($l in @($Status.lines | Where-Object { $_ -match '^queue \d+: ' })) {
         if ($l -match '^queue (\d+): (.*) \(pid ') {
@@ -1510,9 +1532,10 @@ function Get-HeavySlotOccupancy {
 
 function Get-HeavySlotVerdict {
     # Pure: one admission verdict from a status probe and a feed read. State, first match wins:
-    #   status-unknown (occupancy unreadable) | busy (another run holds a slot) | feed-unknown | hot | clear
-    param($Status, $Feed, [int]$OwnSlot = 0, [string]$Label = "")
-    $occ = Get-HeavySlotOccupancy -Status $Status -OwnSlot $OwnSlot -Label $Label
+    #   status-unknown (occupancy unreadable) | holder-lost (own slot held by another run) | busy (another run holds
+    #   a slot) | feed-unknown | hot | clear
+    param($Status, $Feed, [int]$OwnSlot = 0, [int]$OwnPid = 0, [string]$Label = "")
+    $occ = Get-HeavySlotOccupancy -Status $Status -OwnSlot $OwnSlot -OwnPid $OwnPid -Label $Label
     $heat = Get-SustainedHeatVerdict -Metrics $Feed.metrics -UnknownWhy ([string]$Feed.why)
     $m = $Feed.metrics
     $v = [ordered]@{
@@ -1524,6 +1547,7 @@ function Get-HeavySlotVerdict {
         $v.throttled = $m.throttled; $v.window = $m.window; $v.meanC = [Math]::Round($m.meanC, 1); $v.max15C = $m.max15C; $v.watts = $m.watts30
     }
     if (-not $occ.ok) { $v.state = "status-unknown"; $v.why = $occ.why }
+    elseif ($occ.ownLost) { $v.state = "holder-lost"; $v.why = $occ.why }
     elseif ($occ.busy -gt 0) { $v.state = "busy"; $v.why = "busy: $($occ.busy) other heavy run(s): $($occ.holders -join '; ')" }
     elseif ($heat.state -ne "clear") { $v.state = $heat.state; $v.why = $heat.why }
     else { $v.state = "clear"; $v.why = "clear: $($heat.why)" }
@@ -1665,6 +1689,56 @@ function Get-HeavySlotHolderState {
     return [pscustomobject]@{ state = "waiting"; why = $null }
 }
 
+function Test-HeavySlotHolderHeld {
+    # r2 (sol r1 BLOCKER): is the holder that acquired $Acquired (a Get-HeavySlotHolderState result) STILL holding it?
+    # Called AFTER each status probe, so a holder that exits before, during or after the probe is never read as
+    # holding. Returns @{ ok; why }: the holder process is alive, it still reports the same HEAVY_SLOT_HELD, and the
+    # owner pid in it is a live process.
+    param([Parameter(Mandatory = $true)]$Holder, [Parameter(Mandatory = $true)]$Acquired)
+    $now = Get-HeavySlotHolderState -Holder $Holder
+    if ($now.state -ne "acquired") { return [pscustomobject]@{ ok = $false; why = "holder pid=$($Holder.pid) no longer holds slot $($Acquired.slot): $($now.state) ($($now.why))" } }
+    if ($now.held -ne $Acquired.held) { return [pscustomobject]@{ ok = $false; why = "holder pid=$($Holder.pid) HEAVY_SLOT_HELD changed from $($Acquired.held) to $($now.held)" } }
+    if ($null -eq (Get-Process -Id $now.ownerPid -ErrorAction SilentlyContinue)) { return [pscustomobject]@{ ok = $false; why = "slot $($now.slot) owner pid $($now.ownerPid) (HEAVY_SLOT_HELD=$($now.held)) is not running" } }
+    return [pscustomobject]@{ ok = $true; why = $null }
+}
+
+function Add-HeavySlotHolderLoss {
+    # r2: a typed 'holder-lost' event for this job, logged, and kept for its result (admission.holderLost) across a
+    # pre-launch refusal that leaves the job queued for the next poll.
+    param([Parameter(Mandatory = $true)][string]$JobId, [Parameter(Mandatory = $true)][string]$Phase, [string]$Why, [string]$Held, [string]$Reason = "holder-lost")
+    if (-not $script:HolderLossByJob.ContainsKey($JobId)) { $script:HolderLossByJob[$JobId] = [System.Collections.Generic.List[object]]::new() }
+    $script:HolderLossByJob[$JobId].Add([pscustomobject]@{ reason = $Reason; phase = $Phase; utc = (Get-Date).ToUniversalTime().ToString("o"); held = $Held; why = $Why })
+    Add-AgentLogLine "heavy-slot-gate: $Reason job=$JobId phase=$Phase held=$Held why=[$Why]; the job is NOT launched on that slot"
+}
+
+function Add-HeavySlotHolderLossToAdmission {
+    # r2: copies this job's holder-lost events into its admission record (and so into its result).
+    param([Parameter(Mandatory = $true)][string]$JobId, $Admission)
+    if ($null -eq $Admission -or -not $script:HolderLossByJob.ContainsKey($JobId)) { return }
+    $Admission | Add-Member -NotePropertyName holderLost -NotePropertyValue @($script:HolderLossByJob[$JobId].ToArray()) -Force
+}
+
+function Confirm-HeavySlotHeldForLaunch {
+    # r2 (sol r1 BLOCKER, TOCTOU): the LAST check before the child is created. Admission was decided a moment ago;
+    # this re-proves it now: the admitted holder still holds the same slot, `heavy-slot.py status` shows that slot
+    # held by this job's label and owner pid, no other slot is held, and the holder is still holding after that
+    # probe. Returns @{ ok; reason (holder-lost | busy); why }. Anything not proven is a refusal: no launch.
+    param([Parameter(Mandatory = $true)][string]$JobId)
+    $h = $script:HeavySlotHolder
+    if ($null -eq $h) { return [pscustomobject]@{ ok = $false; reason = "holder-lost"; why = "no admitted holder" } }
+    $hs = Get-HeavySlotHolderState -Holder $h
+    if ($hs.state -ne "acquired" -or $hs.held -ne [string]$script:Admission.heavySlotHeld) {
+        return [pscustomobject]@{ ok = $false; reason = "holder-lost"; why = "holder pid=$($h.pid) $($hs.state) ($($hs.why)); admitted with HEAVY_SLOT_HELD=$($script:Admission.heavySlotHeld)" }
+    }
+    $occ = Get-HeavySlotOccupancy -Status (Invoke-HeavySlotStatus -HeartbeatActivity "pre-launch job=$JobId") -OwnSlot $hs.slot -OwnPid $hs.ownerPid -Label $h.label
+    $live = Test-HeavySlotHolderHeld -Holder $h -Acquired $hs
+    if (-not $live.ok) { return [pscustomobject]@{ ok = $false; reason = "holder-lost"; why = $live.why } }
+    if (-not $occ.ok) { return [pscustomobject]@{ ok = $false; reason = "holder-lost"; why = "slot $($hs.slot) ownership not confirmed: $($occ.why)" } }
+    if ($occ.ownLost) { return [pscustomobject]@{ ok = $false; reason = "holder-lost"; why = $occ.why } }
+    if ($occ.busy -gt 0) { return [pscustomobject]@{ ok = $false; reason = "busy"; why = "busy: $($occ.busy) other heavy run(s): $($occ.holders -join '; ')" } }
+    return [pscustomobject]@{ ok = $true; reason = $null; why = "slot $($hs.slot) held by '$($h.label)' pid $($hs.ownerPid), busy 0" }
+}
+
 function Stop-HeavySlotHolder {
     # Ends a holder. Acquired: write the release file; the sentinel exits and heavy-slot.py frees the slot itself
     # (its own release()). Still queued, or not gone within 15 s: stop the holder's process tree, and heavy-slot.py
@@ -1772,8 +1846,13 @@ function Wait-HeavySlotAdmission {
             }
             elseif ($null -ne $hs -and $hs.state -eq "acquired") {
                 # heavy-slot.py served this job's ticket and holds an EXCLUSIVE slot for it. Re-check with that slot excluded.
+                # r2 (sol r1 BLOCKER): the slot is excluded only when status shows it held by THIS holder (label and
+                # owner pid), and the holder must still hold it AFTER the probe; otherwise holder-lost, never clear.
                 $status = Invoke-HeavySlotStatus -HeartbeatActivity "gate-wait job=$JobId state=acquired waited=$([int]$waited)s"
-                $v = Get-HeavySlotVerdict -Status $status -Feed (Read-HeavySlotFeedMetrics) -OwnSlot $hs.slot -Label $label
+                $v = Get-HeavySlotVerdict -Status $status -Feed (Read-HeavySlotFeedMetrics) -OwnSlot $hs.slot -OwnPid $hs.ownerPid -Label $label
+                $live = Test-HeavySlotHolderHeld -Holder $holder -Acquired $hs
+                if (-not $live.ok) { $v.state = "holder-lost"; $v.why = $live.why }
+                if ($v.state -eq "holder-lost") { Add-HeavySlotHolderLoss -JobId $JobId -Phase "acquired" -Why $v.why -Held $hs.held }
                 $probes++
                 Add-GateProbeRecord -JobId $JobId -Verdict $v -WaitedSec $waited -Phase "acquired" -WaitState "acquired"
                 if ($v.state -eq "clear") {
@@ -1874,6 +1953,7 @@ function Invoke-QueuedJob {
         # GATE-2: claim the job (phase=admission-wait, no child) BEFORE the gate holds it.
         [void](New-AdmissionWaitMarker -JobId $jobId -Job $Job -Metadata $metadata)
         $script:Admission = Wait-HeavySlotAdmission -JobId $jobId -Job $Job -Metadata $metadata
+        Add-HeavySlotHolderLossToAdmission -JobId $jobId -Admission $script:Admission
     }
     if ($script:Admission.label -eq "queue-expired") {
         Invoke-QueueExpiredJob -Job $Job -Metadata $metadata -QueueAgeSec ([int]$script:Admission.queueAgeSec)
@@ -1939,6 +2019,22 @@ function Invoke-QueuedJob {
         Add-AgentLogLine "launch refused job=${jobId}: the launching marker did not verify, so the job was NOT launched; left queued in inbox\ for the next poll, no result published"
         Write-AgentHeartbeat -Activity "launch-refused job=$jobId marker-unverified"
         return
+    }
+    # r2 (sol r1 BLOCKER, TOCTOU): re-prove the admitted slot is still this job's, immediately before the child is
+    # created. On failure NOTHING launches: the holder is ended, the refusal is typed and kept for the job's result
+    # (admission.holderLost), and the job is LEFT QUEUED in inbox\ exactly as a marker-unverified refusal is (its
+    # launching marker is this agent's own, childPid null, out file absent), so the next poll gates it again.
+    # A holder lost after this point is caught mid-job (admission.slotContinuity=lost).
+    if ($script:Admission.label -eq "clear") {
+        $pre = Confirm-HeavySlotHeldForLaunch -JobId $jobId
+        if (-not $pre.ok) {
+            $held = [string]$script:Admission.heavySlotHeld
+            Exit-HeavySlot
+            Add-HeavySlotHolderLoss -JobId $jobId -Phase "pre-launch" -Why $pre.why -Held $held -Reason $pre.reason
+            Add-AgentLogLine "launch refused job=${jobId} reason=$($pre.reason): NOT launched; left queued in inbox\ for the next poll, no result published"
+            Write-AgentHeartbeat -Activity "launch-refused job=$jobId $($pre.reason)"
+            return
+        }
     }
     $launchedPersisted = $false
     try {
@@ -2102,6 +2198,8 @@ try {
             finally {
                 Exit-HeavySlot
                 Remove-Item Env:\MLV_AGENT_ADMISSION, Env:\MLV_AGENT_ADMISSION_THERMAL, Env:\MLV_AGENT_ADMISSION_WAIT_SEC, Env:\HEAVY_SLOT_HELD -ErrorAction SilentlyContinue
+                # r2: a job that left inbox\ is finished; one refused before launch keeps its holder-lost record.
+                if (-not (Test-Path -LiteralPath $job.FullName)) { $script:HolderLossByJob.Remove($qid) }
             }
         }
 
