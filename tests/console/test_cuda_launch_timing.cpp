@@ -4,7 +4,8 @@
 // writes, which the bench lane parses out of result.json process.stderr; (3) the census: every
 // kernel launch in both backend DLLs (and the stage-probe launch helpers the AMaZE DLL compiles
 // in) sits inside IGPU_LT_LAUNCH, and every synchronising call inside IGPU_LT_SYNC_CALL, so a new
-// launch cannot silently escape the timer; (4) OFF costs one cached-bool test per site.
+// launch cannot silently escape the timer; (4) OFF costs one cached-bool test per site; (5) backend
+// teardown adds no synchronisation when ON, and the recorder destroys every event it created.
 // The .cu files need nvcc, which console_tests does not have, so (3) and (4) read them as text,
 // like test_contact_sheet_capture_wiring.cpp does for MainWindow.cpp.
 #include "../common/minitest.h"
@@ -59,10 +60,18 @@ std::string formatRecord(const IgpuLtRecord & r)
     return std::string(line);
 }
 
-// Each `<<<` / sync call that is not wrapped, as "file:line what".
-QStringList unwrappedSites(const QString & relativePath, const QString & from = QString(), const QString & to = QString())
+// A synchronising runtime call; C++ allows whitespace before the parenthesis.
+const QRegularExpression & syncCallPattern()
 {
-    const QString source = readRepoFile(relativePath);
+    static const QRegularExpression re(QStringLiteral(
+        "\\b(cuda\\w*Synchronize|cudaGraphicsMapResources|cudaGraphicsUnmapResources)\\s*\\("));
+    return re;
+}
+
+// Each `<<<` / sync call in `source` that is not wrapped, as "label:line what".
+QStringList unwrappedSitesIn(const QString & source, const QString & relativePath,
+                             const QString & from = QString(), const QString & to = QString())
+{
     int begin = 0;
     int end = source.size();
     if (!from.isEmpty())
@@ -90,9 +99,7 @@ QStringList unwrappedSites(const QString & relativePath, const QString & from = 
         if (!statementPrefix(at).contains(QStringLiteral("IGPU_LT_LAUNCH(")))
             bad << QStringLiteral("%1:%2 launch").arg(relativePath).arg(lineOf(at));
     }
-    const QRegularExpression syncCall(
-        QStringLiteral("\\b(cuda\\w*Synchronize|cudaGraphicsMapResources|cudaGraphicsUnmapResources)\\("));
-    auto it = syncCall.globalMatch(source, begin);
+    auto it = syncCallPattern().globalMatch(source, begin);
     while (it.hasNext())
     {
         const QRegularExpressionMatch m = it.next();
@@ -105,6 +112,35 @@ QStringList unwrappedSites(const QString & relativePath, const QString & from = 
     }
     return bad;
 }
+
+QStringList unwrappedSites(const QString & relativePath, const QString & from = QString(), const QString & to = QString())
+{
+    return unwrappedSitesIn(readRepoFile(relativePath), relativePath, from, to);
+}
+
+// The body of the function whose definition starts with `signature`, up to its closing "\n}".
+QString functionBody(const QString & source, const QString & signature)
+{
+    const int start = source.indexOf(signature);
+    ASSERT_TRUE(start >= 0);
+    const int end = source.indexOf(QStringLiteral("\n}"), start);
+    ASSERT_TRUE(end > start);
+    return source.mid(start, end - start);
+}
+
+// Every synchronising call written directly in a backend destructor, wrapped or not. Neither
+// baseline destructor has one: the only waits at teardown are inside the helpers it already
+// called (recon's preupload stream wait in reset_preupload_slots), so any hit is an addition.
+QStringList destructorSyncs(const QString & body)
+{
+    QStringList hits;
+    auto it = syncCallPattern().globalMatch(body);
+    while (it.hasNext()) hits << it.next().captured(1);
+    return hits;
+}
+
+const char * const kReconDestroy = "void igpu_recon_destroy(igpu_recon_backend* b)";
+const char * const kAmazeDestroy = "extern \"C\" void igpu_amaze_debayer_destroy(igpu_amaze_debayer_backend * backend)";
 
 } // namespace
 
@@ -294,6 +330,75 @@ TEST(CudaLaunchTiming, CensusSeesTheSitesItGuards)
     ASSERT_TRUE(amaze.contains(QStringLiteral("IGPU_LT_SYNC_CALL(\"tiles:drain_sync\", cudaStreamSynchronize(streams[slot]))")));
 }
 
+TEST(CudaLaunchTiming, CensusSeesASyncWithWhitespaceBeforeItsParenthesis)
+{
+    // sol r1: `cudaEventSynchronize (b->ev_after_dl)` used to pass the census.
+    const QString recon = readRepoFile(QStringLiteral("tools/gpu/backend/igpu_recon_cuda.cu"));
+    const QString label = QStringLiteral("recon-mutant");
+    ASSERT_EQ(std::string(), unwrappedSitesIn(recon, label).join(QStringLiteral("; ")).toStdString());
+    for (const char * mutant : {"\nstatic void mutant(igpu_recon_backend* b) { cudaEventSynchronize (b->ev_after_dl); }\n",
+                                "\nstatic void mutant(igpu_recon_backend* b) { cudaStreamSynchronize\t(b->preupload_stream); }\n",
+                                "\nstatic void mutant() { cudaDeviceSynchronize\n(); }\n"})
+    {
+        const QStringList bad = unwrappedSitesIn(recon + QString::fromLatin1(mutant), label);
+        ASSERT_EQ(1, (int)bad.size());
+    }
+}
+
+TEST(CudaLaunchTiming, TimingOnAddsNoSynchronisationAtBackendTeardown)
+{
+    // Catalogue row (sol r1 blocker): timing enabled, outstanding CUDA work, backend teardown ->
+    // no additional synchronisation. Neither destructor may call a synchronising API itself, under
+    // the timing flag or not; the recorder is torn down as the destructor's last step, after the
+    // completion points the baseline destructor already has, and teardown() never waits.
+    const QString recon = readRepoFile(QStringLiteral("tools/gpu/backend/igpu_recon_cuda.cu"));
+    const QString amaze = readRepoFile(QStringLiteral("tools/gpu/backend/igpu_amaze_debayer_cuda.cu"));
+    const QString reconBody = functionBody(recon, QString::fromLatin1(kReconDestroy));
+    const QString amazeBody = functionBody(amaze, QString::fromLatin1(kAmazeDestroy));
+    ASSERT_EQ(std::string(), destructorSyncs(reconBody).join(QStringLiteral(", ")).toStdString());
+    ASSERT_EQ(std::string(), destructorSyncs(amazeBody).join(QStringLiteral(", ")).toStdString());
+    ASSERT_FALSE(reconBody.contains(QStringLiteral("igpu_lt::enabled()")));
+    ASSERT_FALSE(amazeBody.contains(QStringLiteral("igpu_lt::enabled()")));
+    ASSERT_TRUE(reconBody.endsWith(QStringLiteral("    free(b);\n    igpu_lt::teardown(\"destroy\");")));
+    ASSERT_TRUE(amazeBody.endsWith(QStringLiteral("    delete backend;\n    igpu_lt::teardown(\"destroy\");")));
+    // The recon preupload stream wait is the baseline's own completion point, and comes first.
+    ASSERT_TRUE(reconBody.indexOf(QStringLiteral("reset_preupload_slots(b, 1);"))
+                < reconBody.indexOf(QStringLiteral("igpu_lt::teardown(")));
+
+    // RED on the r1 shape, and on a spelling with whitespace before the parenthesis.
+    for (const char * added : {"    if (igpu_lt::enabled()) {\n"
+                               "        (void)IGPU_LT_SYNC_CALL(\"destroy:device_sync\", cudaDeviceSynchronize());\n"
+                               "    }\n",
+                               "    if (igpu_lt::enabled()) cudaDeviceSynchronize ();\n"})
+    {
+        QString mutant = reconBody;
+        mutant.insert(mutant.indexOf(QStringLiteral("    reset_preupload_slots(b, 1);")), QString::fromLatin1(added));
+        ASSERT_EQ(std::string("cudaDeviceSynchronize"), destructorSyncs(mutant).join(QStringLiteral(", ")).toStdString());
+    }
+}
+
+TEST(CudaLaunchTiming, RecorderDestroysEveryEventItCreates)
+{
+    // sol r1 hardening: teardown destroys the pool (and, for the last backend, the pairs still
+    // pending), and the record/query/elapsed error branches destroy their handles instead of
+    // dropping them. Each backend attaches on create and tears down on destroy.
+    const QString header = readRepoFile(QStringLiteral("tools/gpu/backend/igpu_launch_timing.cuh"));
+    ASSERT_TRUE(header.contains(QStringLiteral("inline void teardown(const char * at)\n{\n    if (!enabled()) return;")));
+    ASSERT_TRUE(header.contains(QStringLiteral("inline void attach()\n{\n    if (!enabled()) return;")));
+    ASSERT_TRUE(header.contains(QStringLiteral("for (cudaEvent_t ev : pool_) cudaEventDestroy(ev);")));
+    ASSERT_TRUE(header.contains(QStringLiteral("for (Pending & p : pending_) destroy_events_locked(p);")));
+    // begin_kernel record failure, end_kernel record/launch failure, poll query/elapsed failure.
+    ASSERT_TRUE(header.count(QStringLiteral("destroy_events_locked(p);")) >= 3);
+    ASSERT_TRUE(header.contains(QStringLiteral("destroy_events_locked(*it);")));
+    ASSERT_FALSE(header.contains(QStringLiteral("p.start = p.stop = nullptr;\n            return;")));
+    for (const char * dll : {"tools/gpu/backend/igpu_recon_cuda.cu", "tools/gpu/backend/igpu_amaze_debayer_cuda.cu"})
+    {
+        const QString source = readRepoFile(QString::fromLatin1(dll));
+        ASSERT_EQ(1, (int)source.count(QStringLiteral("igpu_lt::attach();")));
+        ASSERT_EQ(1, (int)source.count(QStringLiteral("igpu_lt::teardown(\"destroy\");")));
+    }
+}
+
 TEST(CudaLaunchTiming, EachDllNamesItselfAndPollsAfterItsOwnSync)
 {
     const QString recon = readRepoFile(QStringLiteral("tools/gpu/backend/igpu_recon_cuda.cu"));
@@ -317,5 +422,5 @@ TEST(CudaLaunchTiming, OffCostsOneCachedTestPerSite)
     ASSERT_TRUE(header.contains(QStringLiteral("if (!enabled()) return call();")));
     ASSERT_TRUE(header.contains(QStringLiteral("inline void poll(const char * at = nullptr)\n{\n    if (!enabled()) return;")));
     // The launch timer never synchronises: no Synchronize call anywhere in the recorder.
-    ASSERT_FALSE(header.contains(QRegularExpression(QStringLiteral("cuda\\w*Synchronize\\("))));
+    ASSERT_FALSE(header.contains(syncCallPattern()));
 }

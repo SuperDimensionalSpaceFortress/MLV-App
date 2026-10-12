@@ -1527,6 +1527,7 @@ igpu_recon_backend* igpu_recon_create(const char* backend_name)
         free(b);
         return NULL;
     }
+    igpu_lt::attach();
     return b;
 }
 
@@ -1535,10 +1536,6 @@ void igpu_recon_destroy(igpu_recon_backend* b)
 {
     if (!b) return;
     cudaSetDevice(b->device);
-    if (igpu_lt::enabled()) {
-        (void)IGPU_LT_SYNC_CALL("destroy:device_sync", cudaDeviceSynchronize());
-        igpu_lt::poll("destroy");
-    }
     reset_preupload_slots(b, 1);
     for (int i = 0; i < PREUPLOAD_SLOTS; ++i) {
         if (b->preupload[i].upload_start)
@@ -1560,6 +1557,7 @@ void igpu_recon_destroy(igpu_recon_backend* b)
     if (b->ev_after_kernel) cudaEventDestroy(b->ev_after_kernel);
     if (b->ev_after_dl)     cudaEventDestroy(b->ev_after_dl);
     free(b);
+    igpu_lt::teardown("destroy");
 }
 
 IGPU_API

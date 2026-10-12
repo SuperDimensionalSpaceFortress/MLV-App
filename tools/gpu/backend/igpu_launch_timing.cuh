@@ -16,6 +16,9 @@
  *       host time around a statement (e.g. a free of every clip buffer).
  *   igpu_lt::FrameScope f(width, height);   igpu_lt::TileScope t(top, left);
  *       the frame dims / tile origin stamped on every record on this thread.
+ *   igpu_lt::attach();   igpu_lt::teardown("destroy");
+ *       backend create / the last step of backend destroy: teardown destroys
+ *       every event the recorder created, without waiting on the device.
  *
  * OFF: every site above tests one cached bool and does nothing else.
  * Each DLL is one translation unit, so each has its own recorder; define
@@ -189,7 +192,8 @@ public:
         p.rec.block = to_dim(block);
         if (cudaEventRecord(p.start, stream) != cudaSuccess)
         {
-            discard_events(p);
+            std::lock_guard<std::mutex> lock(mu_);
+            destroy_events_locked(p);
             return false;
         }
         return true;
@@ -208,7 +212,7 @@ public:
             p.rec.err_name = cudaGetErrorName(e);
             finish_locked(p.rec);
             /* Events touched by a faulted context are not reused. */
-            p.start = p.stop = nullptr;
+            destroy_events_locked(p);
             return;
         }
         if (pending_.size() >= kMaxPending)
@@ -236,6 +240,46 @@ public:
     void poll(const char * at)
     {
         std::lock_guard<std::mutex> lock(mu_);
+        resolve_locked();
+        const double now = steady_ms();
+        if (at || now - last_summary_ms_ >= kSummaryIntervalMs)
+        {
+            write_summaries_locked(at ? at : "periodic");
+            last_summary_ms_ = now;
+        }
+    }
+
+    void attach()
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        live_backends_ += 1;
+    }
+
+    /* Backend teardown, called after the destructor's own completion points:
+     * resolves what has completed (never blocks), writes the summaries, and
+     * destroys the idle pool. The last live backend also destroys the pairs
+     * still pending; cudaEventDestroy on an unfinished event returns at once
+     * and the runtime frees it when the device reaches it. */
+    void teardown(const char * at)
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        resolve_locked();
+        if (live_backends_ > 0) live_backends_ -= 1;
+        for (cudaEvent_t ev : pool_) cudaEventDestroy(ev);
+        pool_.clear();
+        if (live_backends_ == 0)
+        {
+            abandoned_ += pending_.size();
+            for (Pending & p : pending_) destroy_events_locked(p);
+            pending_.clear();
+        }
+        write_summaries_locked(at);
+        last_summary_ms_ = steady_ms();
+    }
+
+private:
+    void resolve_locked()
+    {
         for (auto it = pending_.begin(); it != pending_.end();)
         {
             const cudaError_t q = cudaEventQuery(it->stop);
@@ -253,6 +297,7 @@ public:
                     it->rec.ms = (double)elapsed;
                     pool_.push_back(it->start);
                     pool_.push_back(it->stop);
+                    it->start = it->stop = nullptr;
                 }
                 else
                 {
@@ -268,17 +313,11 @@ public:
                 it->rec.err_name = cudaGetErrorName(q);
             }
             finish_locked(it->rec);
+            destroy_events_locked(*it); /* no-op when the pair went back to the pool */
             it = pending_.erase(it);
-        }
-        const double now = steady_ms();
-        if (at || now - last_summary_ms_ >= kSummaryIntervalMs)
-        {
-            write_summaries_locked(at ? at : "periodic");
-            last_summary_ms_ = now;
         }
     }
 
-private:
     Recorder() : min_ms_(min_ms()), last_summary_ms_(steady_ms())
     {
         char line[160];
@@ -297,16 +336,18 @@ private:
         return cudaEventCreate(ev) == cudaSuccess;
     }
 
-    void discard_events(Pending & p)
-    {
-        std::lock_guard<std::mutex> lock(mu_);
-        discard_events_locked(p);
-    }
-
     void discard_events_locked(Pending & p)
     {
         if (p.start) pool_.push_back(p.start);
         if (p.stop) pool_.push_back(p.stop);
+        p.start = p.stop = nullptr;
+    }
+
+    /* Error branches and teardown: the handles are destroyed, never just dropped. */
+    void destroy_events_locked(Pending & p)
+    {
+        if (p.start) cudaEventDestroy(p.start);
+        if (p.stop) cudaEventDestroy(p.stop);
         p.start = p.stop = nullptr;
     }
 
@@ -356,11 +397,12 @@ private:
                                    kv.second);
             std::fprintf(stderr, "%s\n", line);
         }
-        if (dropped_ || error_lines_ > kMaxErrorLines)
+        if (dropped_ || abandoned_ || error_lines_ > kMaxErrorLines)
         {
             std::fprintf(stderr,
-                         "igpu_launch_timing_drops dll=%s at=%s pending=%zu dropped=%llu error_lines_suppressed=%llu\n",
-                         IGPU_LT_DLL_NAME, at, pending_.size(), dropped_,
+                         "igpu_launch_timing_drops dll=%s at=%s pending=%zu dropped=%llu abandoned=%llu "
+                         "error_lines_suppressed=%llu\n",
+                         IGPU_LT_DLL_NAME, at, pending_.size(), dropped_, abandoned_,
                          error_lines_ > kMaxErrorLines ? error_lines_ - kMaxErrorLines : 0ull);
         }
     }
@@ -371,7 +413,9 @@ private:
     std::map<std::string, IgpuLtStats> stats_;
     unsigned long long seq_ = 0;
     unsigned long long dropped_ = 0;
+    unsigned long long abandoned_ = 0;
     unsigned long long error_lines_ = 0;
+    unsigned long long live_backends_ = 0;
     const double min_ms_;
     double last_summary_ms_;
 };
@@ -437,6 +481,21 @@ inline void poll(const char * at = nullptr)
 {
     if (!enabled()) return;
     Recorder::get().poll(at);
+}
+
+/* Pair with teardown(): attach() when a backend is created, teardown() as the
+ * last step of its destructor, after the destructor's existing completion
+ * points. Adds no synchronisation; a no-op when OFF. */
+inline void attach()
+{
+    if (!enabled()) return;
+    Recorder::get().attach();
+}
+
+inline void teardown(const char * at)
+{
+    if (!enabled()) return;
+    Recorder::get().teardown(at);
 }
 
 } // namespace igpu_lt

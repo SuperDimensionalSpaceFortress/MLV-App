@@ -1363,6 +1363,7 @@ extern "C" igpu_amaze_debayer_backend * igpu_amaze_debayer_create(const char * b
         igpu_amaze_debayer_backend * backend = new igpu_amaze_debayer_backend();
         backend->description = std::string("CUDA AMaZE / ") + prop.name;
         std::memset(&backend->lastTiming, 0, sizeof(backend->lastTiming));
+        igpu_lt::attach();
         return backend;
     }
     catch (const CudaStageProbeError &)
@@ -1519,13 +1520,9 @@ int copy_rgb16_to_gl_rgba16_texture_post_wb_undo(const uint16_t * dRgb16,
 
 extern "C" void igpu_amaze_debayer_destroy(igpu_amaze_debayer_backend * backend)
 {
-    if (igpu_lt::enabled())
-    {
-        (void)IGPU_LT_SYNC_CALL("destroy:device_sync", cudaDeviceSynchronize());
-        igpu_lt::poll("destroy");
-    }
     free_live_texture_buffers(backend);
     delete backend;
+    igpu_lt::teardown("destroy");
 }
 
 extern "C" int igpu_amaze_debayer_abi_version(igpu_amaze_debayer_backend *)
