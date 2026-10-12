@@ -6140,6 +6140,11 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
         "drawFrameReady.present_to_finish",
         display_frame,
         ( mlv_stage_timing_now() - presentEndStageTime ) * 1000.0 );
+    // PLAYBACK-STARTUP-CATCHUP-BURST-1: this Play's first present has ended -- the pace clock starts now, so the
+    // wait for the first frame (render, first draw, audio start) is never repaid as a drop-frame jump. Until
+    // here the guard banks no more than the carry, which the early advance (drawFrameReady) already relied on.
+    if( ui->actionPlay->isChecked() )
+        m_playbackPaceGuard.notePresent( mlv_stage_timing_now() * 1000.0, getFramerate() );
     finishPresentedFrame( display_frame,
                           readyFrame,
                           task.requestContext,
@@ -31004,10 +31009,9 @@ void MainWindow::drawFrameReady()
         return;
     }
     m_lastPresentedPlaybackFrame = static_cast<long long>( display_frame );
-    // PLAYBACK-STARTUP-CATCHUP-BURST-1: this Play's first present starts the pace clock, BEFORE the early advance
-    // below asks for the next frame -- the wait for this frame is not repaid as a drop-frame jump.
-    if( ui->actionPlay->isChecked() )
-        m_playbackPaceGuard.notePresent( mlv_stage_timing_now() * 1000.0, getFramerate() );
+    // PLAYBACK-STARTUP-CATCHUP-BURST-1: the pace clock starts when this Play's first present ENDS
+    // (presentPlaybackPreparedFrame), not here: the first draw blocks the GUI thread for ~1 s on Bachelor CUDA,
+    // and a clock started before it banked that stall and repaid it as one 23-frame jump (r3 venue legs).
 
     /* Round-4 item 3: dispatch the NEXT frame render BEFORE the present work
      * below. The present span runs on this (GUI) thread, so the render

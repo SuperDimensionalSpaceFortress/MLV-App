@@ -642,6 +642,28 @@ TEST(PlaybackStartupCatchup, ALongFirstWaitBanksNoMoreThanOneFrame)
     ASSERT_TRUE(guard.grant(90.0, 3753.0, kNativeFps) <= kMaxCarryFrames + 1e-12);
 }
 
+TEST(PlaybackStartupCatchup, AStallInsideTheFirstPresentIsNotOwedEither)
+{
+    // r3 venue legs (Bachelor CUDA fullscreen-s4): Play at 0, the early advance on frame 0's ready at 300 ms, then
+    // the first draw (render-thread present setup + audio start) blocks the GUI thread until 1073 ms; the next
+    // tick follows at 1081 ms and asks for the whole 1.08 s (25.9 frames).
+    const double earlyAdvanceMs = 300.0, presentEndMs = 1073.0, nextTickMs = 1081.0, askedFrames = 25.9;
+    NativePaceGuard atPresentEnd;
+    atPresentEnd.reset();
+    atPresentEnd.grant(1.0, 0.0, kNativeFps);
+    ASSERT_TRUE(atPresentEnd.grant(7.0, earlyAdvanceMs, kNativeFps) <= kMaxCarryFrames + 1e-12);
+    atPresentEnd.notePresent(presentEndMs, kNativeFps);
+    ASSERT_FALSE(atPresentEnd.awaitingFirstPresent());
+    // the clock starts at the end of the present: the next tick advances the carried frame plus 8 ms, no jump
+    ASSERT_TRUE(atPresentEnd.grant(askedFrames, nextTickMs, kNativeFps) < kMaxCarryFrames + 0.2);
+    // started before the draw instead (the first r1 wiring), the stall is banked and repaid as one jump
+    NativePaceGuard beforeDraw;
+    beforeDraw.reset();
+    beforeDraw.grant(1.0, 0.0, kNativeFps);
+    beforeDraw.notePresent(earlyAdvanceMs, kNativeFps);
+    ASSERT_TRUE(beforeDraw.grant(askedFrames, nextTickMs, kNativeFps) > 18.0);
+}
+
 TEST(PlaybackStartupCatchup, TheFirstPresentNoLongerRepaysTheWaitWithAJump)
 {
     const std::vector<StartupStep> steps = c79b80c8Steps();
@@ -846,21 +868,23 @@ TEST(PlaybackNativePaceWiring, TheSmokeReportsThePacedRatesBesideTheWholeRun)
         "               .arg( m_playbackSmokeFirstPresentTimelineDeltaAbs );")));
 }
 
-TEST(PlaybackNativePaceWiring, TheFirstPresentStartsThePaceClockBeforeItsEarlyAdvance)
+TEST(PlaybackNativePaceWiring, TheFirstPresentStartsThePaceClockWhenItsPresentEnds)
 {
     const QString source = mainWindowSource();
-    const QString draw = bodyBetween(source, QStringLiteral("void MainWindow::drawFrameReady()"),
-                                     QStringLiteral("timerFrameEvent( predictiveGpuTexNrEarlyAdvance );"));
-    ASSERT_FALSE(draw.isEmpty());
-    // after every drop (stale generation, lookahead off target, backward frame), before the early advance
-    const int presented = draw.indexOf(QStringLiteral(
-        "m_lastPresentedPlaybackFrame = static_cast<long long>( display_frame );"));
-    const int note = draw.indexOf(QStringLiteral(
-        "m_playbackPaceGuard.notePresent( mlv_stage_timing_now() * 1000.0, getFramerate() );"));
-    ASSERT_TRUE(presented >= 0);
-    ASSERT_TRUE(note > presented);
-    ASSERT_TRUE(note > draw.indexOf(QStringLiteral("draw_frame_ready.drop_generation")));
-    ASSERT_TRUE(note > draw.indexOf(QStringLiteral("draw_frame_ready.drop_lookahead")));
+    const QString note = QStringLiteral(
+        "m_playbackPaceGuard.notePresent( mlv_stage_timing_now() * 1000.0, getFramerate() );");
+    // r3 venue legs (Bachelor CUDA): the first draw blocks the GUI thread ~1 s, so a clock started at the top of
+    // drawFrameReady banked the stall and repaid it as one 23-frame jump. It starts where the present ends.
+    ASSERT_EQ(1, source.count(note));
+    const QString present = bodyBetween(source, QStringLiteral("void MainWindow::presentPlaybackPreparedFrame("),
+                                        QStringLiteral("void MainWindow::computeDisplaySceneGeometry("));
+    ASSERT_FALSE(present.isEmpty());
+    const int presentToFinish = present.indexOf(QStringLiteral("\"drawFrameReady.present_to_finish\""));
+    const int noteAt = present.indexOf(note);
+    const int finish = present.indexOf(QStringLiteral("    finishPresentedFrame( display_frame,"));
+    ASSERT_TRUE(presentToFinish >= 0);
+    ASSERT_TRUE(noteAt > presentToFinish);
+    ASSERT_TRUE(finish > noteAt);
     // the kill switch is read once and handed to the guard; the slip histogram owes the time since Play only then
     ASSERT_TRUE(source.contains(QStringLiteral(
         "static const bool requested = environmentFlagEnabled( \"MLVAPP_PLAYBACK_STARTUP_CATCHUP_LEGACY\" );")));
