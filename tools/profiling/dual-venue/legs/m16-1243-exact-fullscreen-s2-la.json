@@ -8,7 +8,7 @@
   "backends": ["cpu"],
   "scaleFactor": 2,
   "displayMode": "fullscreen",
-  "generatorArgs": { "telemetryArm": "LIGHT", "cpuQuiescenceThresholdPercent": 95, "dropFrameMode": "off", "presentedDumpFrames": "40-79" },
+  "generatorArgs": { "telemetryArm": "LIGHT", "cpuQuiescenceThresholdPercent": 95, "dropFrameMode": "off", "presentedDumpFrames": "40-79", "playbackRenderLookaheadFrames": 1 },
   "timeouts": { "queueWaitSec": 900, "extraClaimedWaitSec": 600 },
   "look": { "contactSheetFrames": 6, "lookFlavor": "cinematic" },
   "criteria": {

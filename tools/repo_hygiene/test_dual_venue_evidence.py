@@ -5477,7 +5477,7 @@ class LegSpecSchemaTests(unittest.TestCase):
 
     def test_each_exactness_leg_is_its_fullscreen_display_cell_on_cpu_with_its_arm(self) -> None:
         """PLAYBACK-CPU-PACE-GAP-1: an exactness leg is its full-screen display-matrix cell, cpu only, at --drop-frame-mode off with the presented-frame dump on;
-        the two arms of a scale differ only in legId and the arm switch (A: lookahead, explicit depth 1 at s1 where the default refuses; B: the kill switch)."""
+        the two arms of a scale differ only in legId and the arm switch (A: lookahead at an explicit depth 1 at every scale, since the CPU-route default is 0 and opt-in; B: the kill switch)."""
         for scale, (la_rel, ctl_rel) in EXACT_LEGS.items():
             cell = json.loads((DV / "legs" / f"m16-1243-display-fullscreen-s{scale}.json").read_text(encoding="utf-8"))
             arms = {}
@@ -5492,7 +5492,7 @@ class LegSpecSchemaTests(unittest.TestCase):
                 arms[rel] = dict(arm["generatorArgs"])
             common = dict(cell["generatorArgs"], dropFrameMode="off", presentedDumpFrames="40-79")
             self.assertEqual(arms[ctl_rel], dict(common, disableCpuPlaybackLookahead=True), ctl_rel)
-            self.assertEqual(arms[la_rel], dict(common, playbackRenderLookaheadFrames=1) if scale == 1 else common, la_rel)
+            self.assertEqual(arms[la_rel], dict(common, playbackRenderLookaheadFrames=1), la_rel)
         bad = json.loads((DV / EXACT_LEGS[2][0]).read_text(encoding="utf-8"))
         for key, value in (("dropFrameMode", "persisted"), ("presentedDumpFrames", "40"), ("disableCpuPlaybackLookahead", "1")):
             broken = json.loads(json.dumps(bad))
