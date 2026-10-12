@@ -559,6 +559,61 @@ function Resolve-CodexExe {
 $DENIED_TOOLS_DISPLAY = @('Agent', 'Task', 'Monitor', 'ScheduleWakeup', 'CronCreate', 'CronDelete', 'RemoteTrigger', 'Workflow', 'TaskCreate')
 $DENIED_TOOLS = @($DENIED_TOOLS_DISPLAY | ForEach-Object { $_.ToLowerInvariant() })
 
+# CODEX-UNELEVATED-OVERRIDE-ACK-1: a codex build that does not know the `windows.sandbox` key
+# accepts `-c windows.sandbox="<mode>"` with exit 0 (sol, #329 r1, 0.162.0), prints a config
+# warning to stderr and keeps running on its default sandbox. Returns the stderr line that says
+# the key was ignored, else $null. The documented shape (sol-001.err.txt, #329 r1) is a header
+#   warning: Codex is ignoring 1 unrecognized configuration setting. Check for typos ...
+# followed by one indented line per key:   <source>: `<key>` is ignored.
+# Only codex's own preamble is read: the scan stops at the first bare `codex` line (the
+# assistant's first turn), because a transcript can quote the same block from a nested codex
+# run, and the echoed prompt is skipped, because a prompt can quote it too. A build that drops
+# the whole [windows] table may name the key `windows`, so that spelling matches as well.
+# r2 (sol r1 blocker, fable r1 hardening): the echo is skipped BY POSITION, never by substring
+# removal. codex 0.162.x prints the prompt verbatim right after its `user` marker line and
+# before the warning block (sol-001.err.txt, #329 r1, lines 12-91 and 552-558), so exactly that
+# span is cut once. r1's global .Replace(prompt, '') also erased every copy of the prompt text
+# inside the genuine warning, so a prompt of `windows.sandbox`, `windows` or the warning block
+# itself hid the evidence. When the echo is not at that position (no marker, or not verbatim),
+# a line-aligned copy of the whole prompt is cut once, and only when it occurs at least twice:
+# a single copy may be codex's own warning, and keeping it can only under-claim containment.
+function Get-CodexIgnoredWindowsSandboxLine([string]$StderrText, [string]$Prompt) {
+    if ([string]::IsNullOrEmpty($StderrText)) { return $null }
+    $scan = $StderrText.Replace("`r`n", "`n")
+    if (-not [string]::IsNullOrWhiteSpace($Prompt)) {
+        $echo = $Prompt.Replace("`r`n", "`n").Trim()
+        $cut = $null
+        $marker = [regex]::Match($scan, '(?m)^user[ \t]*\n')
+        if ($marker.Success) {
+            $at = $marker.Index + $marker.Length
+            while ($at -lt $scan.Length -and [char]::IsWhiteSpace($scan[$at])) { $at++ }
+            if ($scan.Length - $at -ge $echo.Length -and [string]::CompareOrdinal($scan, $at, $echo, 0, $echo.Length) -eq 0) {
+                $cut = @(($marker.Index + $marker.Length), ($at + $echo.Length - $marker.Index - $marker.Length))
+            }
+        }
+        if ($null -eq $cut) {
+            $copies = [regex]::Matches($scan, '(?m)^[ \t]*' + [regex]::Escape($echo) + '[ \t]*$')
+            if ($copies.Count -ge 2) { $cut = @($copies[0].Index, $copies[0].Length) }
+        }
+        if ($null -ne $cut) { $scan = $scan.Remove($cut[0], $cut[1]) }
+    }
+    $inWarning = $false
+    foreach ($line in ($scan -split '\r?\n')) {
+        if ($line -match '^codex\s*$') { break }
+        if ($line -match '^warning:') {
+            $inWarning = $true
+            if ($line -match 'windows\.sandbox' -and $line -match 'ignor|unrecognized|unknown') { return $line.Trim() }
+            continue
+        }
+        if ($inWarning -and $line -match '^\s+\S') {
+            if ($line -match '`windows(\.sandbox)?`' -and $line -match 'ignor|unrecognized|unknown') { return $line.Trim() }
+            continue
+        }
+        $inWarning = $false
+    }
+    return $null
+}
+
 function Get-Sha256([string]$Text) {
     $sha = [System.Security.Cryptography.SHA256]::Create()
     try {
@@ -1742,6 +1797,17 @@ if ($cfg.engine -eq 'claude') {
     # discipline as the claude branch's family-matched modelUsage check.
     if (-not $timedOut -and $exitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($final)) {
         $ResolvedModel = $SelectedModel
+    }
+    # CODEX-UNELEVATED-OVERRIDE-ACK-1: authority.windowsSandbox was set at launch to the REQUESTED
+    # mode. A codex build that ignored the key ran on its own default sandbox, so the receipt must
+    # not keep claiming the requested one. Same post-run overwrite shape as
+    # 'background-gate-tampered': a typed value plus a detail field quoting the matched line.
+    if ($windowsSandbox -ne 'default') {
+        $windowsSandboxIgnoredLine = Get-CodexIgnoredWindowsSandboxLine -StderrText $stderrText -Prompt $stdinContent
+        if ($windowsSandboxIgnoredLine) {
+            $authority.windowsSandbox = "requested-$windowsSandbox-ignored-by-codex"
+            $authority.windowsSandboxIgnoredDetail = $windowsSandboxIgnoredLine
+        }
     }
 }
 
