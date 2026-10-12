@@ -398,6 +398,10 @@ param(
     [ValidateSet('', 'on', 'off')][string]$DropFrameMode = '',
     [switch]$DisableCpuPlaybackLookahead,
     [ValidatePattern('^(\d{1,6}-\d{1,6})?$')][string]$PresentedDumpFrames = '',
+    # PLAYBACK-CPU-PACE-AWARE-LOOKAHEAD-1 (bisect arms, cpu backend only; unset emits the job's text unchanged):
+    # -CpuLookaheadPredictOff sets MLVAPP_CPU_LOOKAHEAD_PREDICT=0 (the lookahead renders N+1), -CpuLookaheadYieldOff sets MLVAPP_CPU_LOOKAHEAD_YIELD=0.
+    [switch]$CpuLookaheadPredictOff,
+    [switch]$CpuLookaheadYieldOff,
 
     # GPU-EVENT153-ROOTCAUSE-2: turns the CUDA backends' per-launch timer on (MLVAPP_CUDA_LAUNCH_TIMING=1) with this
     # per-launch line threshold in ms (MLVAPP_CUDA_LAUNCH_TIMING_MIN_MS). -1 (the default) sets nothing: the timer stays
@@ -4136,6 +4140,9 @@ if ($PlaybackRenderLookaheadFrames -ge 0 -and -not $LookPaceLeg -and $Backend -n
 if (($DisableCpuPlaybackLookahead -or $PresentedDumpFrames) -and $Backend -ne 'cpu') {
     throw 'DUAL_VENUE_CPU_EXACTNESS_NEEDS_CPU_BACKEND -DisableCpuPlaybackLookahead and -PresentedDumpFrames are CPU-route only (-Backend cpu)'
 }
+if (($CpuLookaheadPredictOff -or $CpuLookaheadYieldOff) -and $Backend -ne 'cpu') {
+    throw 'DUAL_VENUE_CPU_LOOKAHEAD_BISECT_NEEDS_CPU_BACKEND -CpuLookaheadPredictOff and -CpuLookaheadYieldOff are CPU-route only (-Backend cpu)'
+}
 if ($LookPaceLeg -and ($ContactSheet -or -not $ForceLookAssist)) {
     throw 'DUAL_VENUE_LOOK_PACE_LEG_SHAPE -LookPaceLeg is -ForceLookAssist WITHOUT -ContactSheet (a capture-free pace leg)'
 }
@@ -4430,6 +4437,8 @@ if ($SwapInterval -ge 0) {
 $cpuExactnessEnvs = @()
 if ($PlaybackRenderLookaheadFrames -ge 0 -and -not $LookPaceLeg) { $cpuExactnessEnvs += "'MLVAPP_PLAYBACK_RENDER_LOOKAHEAD_FRAMES=$PlaybackRenderLookaheadFrames'," }
 if ($DisableCpuPlaybackLookahead) { $cpuExactnessEnvs += "'MLVAPP_DISABLE_CPU_PLAYBACK_LOOKAHEAD=1'," }
+if ($CpuLookaheadPredictOff) { $cpuExactnessEnvs += "'MLVAPP_CPU_LOOKAHEAD_PREDICT=0'," }
+if ($CpuLookaheadYieldOff) { $cpuExactnessEnvs += "'MLVAPP_CPU_LOOKAHEAD_YIELD=0'," }
 if ($PresentedDumpFrames) {
     $cpuExactnessEnvs += "('MLVAPP_PLAYBACK_PRESENTED_DUMP_DIR=' + (Join-Path `$Work 'presented-dumps')),"
     $cpuExactnessEnvs += "'MLVAPP_PLAYBACK_PRESENTED_DUMP_FRAMES=$PresentedDumpFrames',"

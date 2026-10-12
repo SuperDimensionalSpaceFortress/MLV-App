@@ -109,7 +109,11 @@ SHIPPED_LEGS = ("legs/m16-1243-speed.json", "legs/m16-1243-look.json", "legs/m16
                 *LOOKAHEAD_LEGS, *HEAVY_LEGS, *DECODER_LEGS, "legs/m16-1243-look-scale2-cinematic.json", "legs/m16-1243-look-film.json",
                 "legs/m16-1243-look-scale2-film.json", *(f"legs/m16-1243-look-scale2-{flavor}-agxoff.json" for flavor in ("cinematic", "film")),
                 *(f"legs/m16-1243-display-{mode}-s{scale}-vsync1.json" for scale in (1, 2, 4) for mode in ("fullscreen", "windowed")),
-                *CPU_REDUCED_LEGS, *(f"legs/m16-1243-exact-fullscreen-s{scale}-{arm}.json" for scale in (1, 2, 4) for arm in ("la", "ctl")))
+                *CPU_REDUCED_LEGS, *(f"legs/m16-1243-exact-fullscreen-s{scale}-{arm}.json" for scale in (1, 2, 4) for arm in ("la", "ctl")),
+                *(f"legs/m16-1243-cpula-fullscreen-s{scale}{arm}.json" for scale in (2, 4) for arm in ("", "-noyield", "-nopredict")))
+# PLAYBACK-CPU-PACE-AWARE-LOOKAHEAD-1: the drop-frame-on head arm of the CPU-route lookahead A/B at an explicit depth 1 (the control is the display cell itself,
+# whose CPU-route default is 0), and its two bisect twins (the prediction off, the yield off). Each is its full-screen display cell on cpu plus those args.
+CPULA_LEGS = {(scale, arm): f"legs/m16-1243-cpula-fullscreen-s{scale}{arm}.json" for scale in (2, 4) for arm in ("", "-noyield", "-nopredict")}
 # PLAYBACK-CPU-PACE-GAP-1: the D1 exactness pairs, one per scale: arm A (la) runs the CPU-route lookahead (s1 by explicit depth 1), arm B (ctl) the
 # kill switch; both cpu-only at --drop-frame-mode off with the presented-frame dump on.
 EXACT_LEGS = {scale: (f"legs/m16-1243-exact-fullscreen-s{scale}-la.json", f"legs/m16-1243-exact-fullscreen-s{scale}-ctl.json") for scale in (1, 2, 4)}
@@ -633,6 +637,26 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         self.assertIn("$dumpShare = Join-Path $artifactsShare 'presented-dumps'", runner)
         self.assertIn("Copy-Item -LiteralPath $dumpShare -Destination (Join-Path $evidenceDir 'presented-dumps') -Recurse", runner)
 
+    def test_the_cpu_lookahead_bisect_arms_reach_the_job_only_when_asked(self) -> None:
+        """PLAYBACK-CPU-PACE-AWARE-LOOKAHEAD-1: -CpuLookaheadPredictOff / -CpuLookaheadYieldOff add exactly their own env line to a cpu look job; absent,
+        the job is the text it was, byte for byte; a cuda run refuses them; the runner passes a cpu leg's false switches."""
+        look = ["-Backend", "cpu", "-ForceLookAssist", "-ContactSheet", "-LookFlavor", "cinematic"]
+        default = self.generate(GENERATOR, "bisect-default.job.ps1", look).read_text(encoding="utf-8")
+        self.assertNotIn("MLVAPP_CPU_LOOKAHEAD_", default)
+        for switch, line in (("-CpuLookaheadPredictOff", "    'MLVAPP_CPU_LOOKAHEAD_PREDICT=0',"), ("-CpuLookaheadYieldOff", "    'MLVAPP_CPU_LOOKAHEAD_YIELD=0',")):
+            job = self.generate(GENERATOR, f"bisect{switch}.job.ps1", [*look, switch])
+            self.assertEqual(self.parse_errors(job), 0, job.name)
+            text = job.read_text(encoding="utf-8")
+            eol = "\r\n" if "\r\n" in text else "\n"
+            self.assertEqual(text.count(line + eol), 1, switch)
+            self.assertEqual(text.replace(line + eol, "", 1), default, switch)
+        # (a cuda run refuses both: test_refused_combinations_throw_before_emitting)
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        block = runner[runner.index("if ($Backend -ceq 'cpu') {"):]
+        for line in ("if ($spec.generatorArgs.PSObject.Properties['cpuLookaheadPredict'] -and -not [bool]$spec.generatorArgs.cpuLookaheadPredict) { $gen['CpuLookaheadPredictOff'] = $true }",
+                     "if ($spec.generatorArgs.PSObject.Properties['cpuLookaheadYield'] -and -not [bool]$spec.generatorArgs.cpuLookaheadYield) { $gen['CpuLookaheadYieldOff'] = $true }"):
+            self.assertIn(line, block[:block.index("if ($isLook) {")])
+
     def test_scale_and_quiescence_parameters_reach_the_job(self) -> None:
         text = self.generate(GENERATOR, "scale.job.ps1", ["-ScaleFactor", "1", "-CpuQuiescenceThresholdPercent", "35.5"]).read_text(encoding="utf-8")
         self.assertIn("-ScaleFactor 1 -UsePersistedPlaybackSettings", text)
@@ -650,7 +674,9 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
                              (["-ForceLookAssist", "-ContactSheet", "-LookPaceLeg"], "DUAL_VENUE_LOOK_PACE_LEG_SHAPE"),
                              (["-PlaybackRenderLookaheadFrames", "3"], "DUAL_VENUE_LOOKAHEAD_NEEDS_LOOK_PACE_LEG"),
                              (["-DisableCpuPlaybackLookahead"], "DUAL_VENUE_CPU_EXACTNESS_NEEDS_CPU_BACKEND"),
-                             (["-PresentedDumpFrames", "40-79"], "DUAL_VENUE_CPU_EXACTNESS_NEEDS_CPU_BACKEND")):
+                             (["-PresentedDumpFrames", "40-79"], "DUAL_VENUE_CPU_EXACTNESS_NEEDS_CPU_BACKEND"),
+                             (["-CpuLookaheadPredictOff"], "DUAL_VENUE_CPU_LOOKAHEAD_BISECT_NEEDS_CPU_BACKEND"),
+                             (["-CpuLookaheadYieldOff"], "DUAL_VENUE_CPU_LOOKAHEAD_BISECT_NEEDS_CPU_BACKEND")):
             out = self.tmp / "refused.job.ps1"
             proc = run_pwsh(["-File", str(GENERATOR), "-SourceCommit", self.head, "-BuildManifestSha256", "ab" * 32,
                              "-ClipId", FIXTURE_IDS[0], "-FixtureSha256", "cd" * 32, "-RepoRoot", str(self.repo), "-OutFile", str(out), *extra])
@@ -5500,6 +5526,28 @@ class LegSpecSchemaTests(unittest.TestCase):
             with self.assertRaises(self.jsonschema.ValidationError, msg=key):
                 self.jsonschema.validate(broken, self.schema)
 
+    def test_each_cpu_lookahead_leg_is_its_fullscreen_display_cell_on_cpu_at_depth_1(self) -> None:
+        """PLAYBACK-CPU-PACE-AWARE-LOOKAHEAD-1: the head arm is its full-screen display-matrix cell, cpu only, at an explicit lookahead depth 1 (drop-frame left at
+        the runner's default, on); each bisect twin adds exactly one switch, false."""
+        for (scale, arm), rel in CPULA_LEGS.items():
+            cell = json.loads((DV / "legs" / f"m16-1243-display-fullscreen-s{scale}.json").read_text(encoding="utf-8"))
+            leg = json.loads((DV / rel).read_text(encoding="utf-8"))
+            self.jsonschema.validate(leg, self.schema)
+            self.assertEqual(leg["legId"], Path(rel).stem, rel)
+            self.assertEqual((leg["card"], leg["backends"]), ("PLAYBACK-CPU-PACE-AWARE-LOOKAHEAD-1", ["cpu"]), rel)
+            for key in ("legType", "clipId", "playSeconds", "scaleFactor", "displayMode", "timeouts", "look"):
+                self.assertEqual(leg[key], cell[key], f"{rel}: {key}")
+            self.assertEqual(leg["criteria"], {role: {"cpu": lists["cpu"]} for role, lists in cell["criteria"].items()}, rel)
+            switch = {"": {}, "-noyield": {"cpuLookaheadYield": False}, "-nopredict": {"cpuLookaheadPredict": False}}[arm]
+            self.assertEqual(leg["generatorArgs"], dict(cell["generatorArgs"], playbackRenderLookaheadFrames=1, **switch), rel)
+            self.assertNotIn("dropFrameMode", leg["generatorArgs"], rel)
+        bad = json.loads((DV / CPULA_LEGS[(2, "-noyield")]).read_text(encoding="utf-8"))
+        for key in ("cpuLookaheadYield", "cpuLookaheadPredict"):
+            broken = json.loads(json.dumps(bad))
+            broken["generatorArgs"][key] = True   # the switches only turn things off
+            with self.assertRaises(self.jsonschema.ValidationError, msg=key):
+                self.jsonschema.validate(broken, self.schema)
+
     def test_the_hand_listed_shipped_legs_are_exactly_the_legs_directory(self) -> None:
         self.assertEqual(sorted(SHIPPED_LEGS), sorted("legs/" + p.name for p in (DV / "legs").glob("*.json")), "SHIPPED_LEGS drifted from the legs/ directory")
 
@@ -5535,6 +5583,10 @@ class LegSpecSchemaTests(unittest.TestCase):
             elif spec["card"] == "PLAYBACK-CPU-PACE-GAP-1":   # the cpu-only D1 exactness arms of the full-screen display cells, named by cell and arm
                 self.assertEqual(spec["legId"], path.stem, path.name)
                 self.assertRegex(spec["legId"], r"^m16-1243-exact-fullscreen-s[124]-(la|ctl)$", path.name)
+                self.assertEqual(spec["backends"], ["cpu"], path.name)
+            elif spec["card"] == "PLAYBACK-CPU-PACE-AWARE-LOOKAHEAD-1":   # the cpu-only drop-frame-on lookahead arm and its bisect twins, named by cell and arm
+                self.assertEqual(spec["legId"], path.stem, path.name)
+                self.assertRegex(spec["legId"], r"^m16-1243-cpula-fullscreen-s[24](-noyield|-nopredict)?$", path.name)
                 self.assertEqual(spec["backends"], ["cpu"], path.name)
             else:   # the scale-4 flavored look leg, or its scale-2 twin (LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1), or that twin's AgX-off copy (LOOK-ASSIST-FILM-FLAVOR-2 r2)
                 self.assertIn(spec["legId"], (f"m16-1243-look-{flavor}", f"m16-1243-look-scale2-{flavor}", f"m16-1243-look-scale2-{flavor}-agxoff"), path.name)

@@ -397,6 +397,9 @@ try {
             if ($spec.generatorArgs.PSObject.Properties['disableCpuPlaybackLookahead'] -and [bool]$spec.generatorArgs.disableCpuPlaybackLookahead) { $gen['DisableCpuPlaybackLookahead'] = $true }
             if ($spec.generatorArgs.PSObject.Properties['presentedDumpFrames']) { $gen['PresentedDumpFrames'] = [string]$spec.generatorArgs.presentedDumpFrames }
             if (-not $gen.ContainsKey('PlaybackRenderLookaheadFrames') -and $spec.generatorArgs.PSObject.Properties['playbackRenderLookaheadFrames']) { $gen['PlaybackRenderLookaheadFrames'] = [int]$spec.generatorArgs.playbackRenderLookaheadFrames }
+            # PLAYBACK-CPU-PACE-AWARE-LOOKAHEAD-1: the bisect arms (false turns the prediction or the yield off; the schema admits only false).
+            if ($spec.generatorArgs.PSObject.Properties['cpuLookaheadPredict'] -and -not [bool]$spec.generatorArgs.cpuLookaheadPredict) { $gen['CpuLookaheadPredictOff'] = $true }
+            if ($spec.generatorArgs.PSObject.Properties['cpuLookaheadYield'] -and -not [bool]$spec.generatorArgs.cpuLookaheadYield) { $gen['CpuLookaheadYieldOff'] = $true }
         }
     }
     if ($isLook) {
