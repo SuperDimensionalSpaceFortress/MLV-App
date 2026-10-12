@@ -1634,6 +1634,197 @@ def test_r14_a_validator_failure_is_not_a_card_verdict_and_refuses_the_whole_set
     assert git(bare, "rev-parse", "master") == before
 
 
+# Positive verdict, link guard, child env (card DOCTRINE-OUTBOX-VALIDATOR-POSITIVE-VERDICT-1). Guards for:
+#   a  validate_cards_file accepts any exit 0                    -> the two stub-node tests
+#   b  no mode/link guard on the cards path before the write      -> the 120000 / 160000 / 100755 tip test, the link-in-path tests
+#   c  the validator child inherits NODE_OPTIONS / NODE_PATH      -> test_r14_the_validator_child_env_has_no_node_options_or_node_path
+# Not adopted: vendoring and pinning the validator. MLV runs the fetched tip's own validator on purpose (R14.6).
+
+def _stub_node(monkeypatch, stdout: str, returncode: int = 0, stderr: str = ""):
+    real_run, node = subprocess.run, ob.find_node()
+
+    def run(cmd, *a, **kw):
+        if cmd[0] == node:
+            return subprocess.CompletedProcess(cmd, returncode, stdout, stderr)
+        return real_run(cmd, *a, **kw)
+    monkeypatch.setattr(ob.subprocess, "run", run)
+
+
+@needs_node
+@pytest.mark.parametrize("stdout", [
+    "",
+    "[validate-cards] 1 file(s), 1 card(s), 0 no-card line(s), 1 problem(s).\n",
+    "[validate-cards] 1 file(s), 1 card(s), 0 no-card line(s), 10 problem(s).\n",
+    "all good, 0 problem(s)\n",
+], ids=["silent", "one-problem", "ten-problems", "not-the-summary-line"])
+def test_r14_an_exit_zero_without_the_zero_problem_summary_is_a_validator_failure_not_a_pass(tmp_path, monkeypatch, stdout):
+    """A node that exits 0 without running the validator's main prints nothing; a pass is exit 0 AND
+    '[validate-cards] N file(s), ..., 0 problem(s).'. Anything else is CARD_VALIDATOR_FAILED, never
+    CARD_INVALID (it is no verdict on any card) and nothing is pushed."""
+    bare, clone = init_bus(tmp_path)
+    add_validator(clone)
+    src = init_source(tmp_path)
+    add_item(src, "20261007-a-good-card.md", target=CARDS, body=CARD_BODY)
+    before = git(bare, "rev-parse", "master")
+    _stub_node(monkeypatch, stdout)
+
+    with pytest.raises(ob.Refusal) as excinfo:
+        ob.drain(src, clone, "HEAD", tmp_path / "sent.jsonl", [], push=True)
+
+    assert excinfo.value.code == "CARD_VALIDATOR_FAILED" and excinfo.value.code != "CARD_INVALID"
+    assert git(bare, "rev-parse", "master") == before
+    assert not (tmp_path / "sent.jsonl").exists()
+
+
+@needs_node
+def test_r14_the_stub_pass_shape_is_what_the_real_validator_prints(tmp_path):
+    """The positive-verdict pattern is pinned to the vendored validator's real output."""
+    bare, clone = init_bus(tmp_path)
+    add_validator(clone)
+    cards = tmp_path / "cards.md"
+    cards.write_bytes((ob.CARDS_TITLE + CARD_BODY).encode("utf-8"))
+    result = subprocess.run(["node", str(FIXTURE_DIR / "validate-cards.mjs"), "--bus", str(clone),
+                             "--file", str(cards), "--project", "mlv-app"], capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert ob.CARD_VALIDATOR_PASS_RE.search(result.stdout), result.stdout
+
+
+def _tip_cards_entry(clone: Path, mode: str, content: str) -> None:
+    """Land `specs/mlv-app/cards.md` on the fixture bus tip as an entry of the given git mode."""
+    git(clone, "fetch", "-q", "origin")
+    git(clone, "checkout", "-q", "--detach", "origin/master")
+    blob = subprocess.run(["git", "-C", str(clone), "hash-object", "-w", "--stdin"], input=content, check=True,
+                          capture_output=True, text=True).stdout.strip()
+    git(clone, "update-index", "--add", "--cacheinfo", f"{mode},{blob},{CARDS}")
+    git(clone, "commit", "-m", f"tip cards entry {mode}")
+    git(clone, "push", "origin", "HEAD:refs/heads/master")
+
+
+@needs_node
+@pytest.mark.parametrize("mode", ["120000", "100755"])
+def test_r14_a_cards_path_that_is_not_a_regular_100644_blob_at_the_tip_is_refused_and_nothing_is_written(tmp_path, mode):
+    bare, clone = init_bus(tmp_path)
+    add_validator(clone)
+    _tip_cards_entry(clone, mode, "../../elsewhere.md" if mode == "120000" else ob.CARDS_TITLE)
+    src = init_source(tmp_path)
+    add_item(src, "20261007-a-good-card.md", target=CARDS, body=CARD_BODY)
+    add_item(src, "20261007-b-receipt.md", target="RECEIPTS.md", kind="receipt", body="### A receipt\nbody\n")
+    ledger = tmp_path / "sent.jsonl"
+
+    report = ob.drain(src, clone, "HEAD", ledger, [], push=True)
+
+    assert [(r["path"], r["code"]) for r in report["refused"]] == [("doctrine-outbox/20261007-a-good-card.md", "CARDS_PATH_NOT_REGULAR_FILE")]
+    assert mode in report["refused"][0]["detail"]
+    assert [p["target"] for p in report["published"]] == ["RECEIPTS.md"], "the receipt is not held by the refused card"
+    assert git(bare, "ls-tree", "master", "--", CARDS).startswith(f"{mode} "), "the cards entry itself is untouched"
+    assert b"example-card" not in git_raw(bare, "show", f"master:{CARDS}")
+
+
+@needs_node
+def test_r14_a_gitlink_cards_entry_at_the_tip_is_refused(tmp_path):
+    bare, clone = init_bus(tmp_path)
+    add_validator(clone)
+    git(clone, "fetch", "-q", "origin")
+    git(clone, "checkout", "-q", "--detach", "origin/master")
+    git(clone, "update-index", "--add", "--cacheinfo", f"160000,{git(clone, 'rev-parse', 'HEAD')},{CARDS}")
+    git(clone, "commit", "-m", "tip cards gitlink")
+    git(clone, "push", "origin", "HEAD:refs/heads/master")
+    src = init_source(tmp_path)
+    add_item(src, "20261007-a-good-card.md", target=CARDS, body=CARD_BODY)
+
+    report = ob.drain(src, clone, "HEAD", tmp_path / "sent.jsonl", [], push=True)
+
+    assert [r["code"] for r in report["refused"]] == ["CARDS_PATH_NOT_REGULAR_FILE"] and report["published"] == []
+    assert report["pushed"] is False
+
+
+def _make_dir_link(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        if sys.platform != "win32":
+            raise
+        made = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)], capture_output=True, text=True)
+        if made.returncode != 0:
+            pytest.skip(f"cannot create a symlink or a junction here: {made.stderr or made.stdout}")
+
+
+def test_r14_a_link_or_junction_on_the_way_to_the_cards_file_is_refused_never_followed(tmp_path):
+    root, elsewhere = tmp_path / "wt", tmp_path / "elsewhere"
+    (root / "specs").mkdir(parents=True)
+    elsewhere.mkdir()
+    ob.assert_no_link_in_path(root, CARDS)  # nothing there yet: fine
+    _make_dir_link(root / "specs" / "mlv-app", elsewhere)
+
+    with pytest.raises(ob.Refusal) as excinfo:
+        ob.assert_no_link_in_path(root, CARDS)
+
+    assert excinfo.value.code == "CARDS_PATH_IS_LINK" and "specs/mlv-app" in excinfo.value.detail
+    assert list(elsewhere.iterdir()) == []
+
+
+def test_r14_a_regular_cards_path_passes_the_link_check(tmp_path):
+    (tmp_path / "specs" / "mlv-app").mkdir(parents=True)
+    (tmp_path / CARDS).write_text("x", encoding="utf-8")
+    ob.assert_no_link_in_path(tmp_path, CARDS)
+
+
+@needs_node
+def test_r14_the_drain_refuses_when_the_bus_worktree_cards_path_is_a_link(tmp_path, monkeypatch):
+    """Even with a regular tip entry, a link in the drain's temp worktree is never written through."""
+    bare, clone = init_bus(tmp_path)
+    add_validator(clone)
+    src = init_source(tmp_path)
+    add_item(src, "20261007-a-good-card.md", target=CARDS, body=CARD_BODY)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    real_make = ob.make_temp_worktree
+
+    def make(bus_repo, tip):
+        wt = real_make(bus_repo, tip)
+        (wt / "specs").mkdir(exist_ok=True)
+        _make_dir_link(wt / "specs" / "mlv-app", elsewhere)
+        return wt
+    monkeypatch.setattr(ob, "make_temp_worktree", make)
+    before = git(bare, "rev-parse", "master")
+
+    with pytest.raises(ob.Refusal) as excinfo:
+        ob.drain(src, clone, "HEAD", tmp_path / "sent.jsonl", [], push=True)
+
+    assert excinfo.value.code == "CARDS_PATH_IS_LINK"
+    assert list(elsewhere.iterdir()) == [] and git(bare, "rev-parse", "master") == before
+
+
+@needs_node
+def test_r14_the_validator_child_env_has_no_node_options_or_node_path(tmp_path, monkeypatch):
+    """The validator runs with the parent env minus NODE_OPTIONS and NODE_PATH, and a named timeout;
+    a real card still validates and publishes."""
+    bare, clone = init_bus(tmp_path)
+    add_validator(clone)
+    src = init_source(tmp_path)
+    add_item(src, "20261007-a-good-card.md", target=CARDS, body=CARD_BODY)
+    monkeypatch.setenv("NODE_OPTIONS", "--require=./poison.js")
+    monkeypatch.setenv("NODE_PATH", str(tmp_path / "poison"))
+    monkeypatch.setenv("MLV_ENV_KEEP_PROBE", "kept")
+    real_run, node, seen = subprocess.run, ob.find_node(), []
+
+    def run(cmd, *a, **kw):
+        if cmd[0] == node:
+            seen.append(kw)
+        return real_run(cmd, *a, **kw)
+    monkeypatch.setattr(ob.subprocess, "run", run)
+
+    report = ob.drain(src, clone, "HEAD", tmp_path / "sent.jsonl", [], push=True)
+
+    assert report["refused"] == [] and [p["target"] for p in report["published"]] == [CARDS]
+    assert seen, "the validator child never ran"
+    for kw in seen:
+        assert kw["env"] is not None
+        assert not {k.upper() for k in kw["env"]} & {"NODE_OPTIONS", "NODE_PATH"}
+        assert kw["env"]["MLV_ENV_KEEP_PROBE"] == "kept"
+        assert kw["timeout"] == ob.CARD_VALIDATOR_TIMEOUT_S == 120
+
+
 def fail_cards_blob_reads(monkeypatch, fails):
     """Make `git cat-file blob <ref>:<cards file>` exit 128 (what git prints for a transient read
     failure, and also for a missing path) whenever fails(n, ref) holds, n counting these reads from 1.
