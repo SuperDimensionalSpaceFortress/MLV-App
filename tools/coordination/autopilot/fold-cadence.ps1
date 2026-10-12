@@ -227,10 +227,13 @@ function Invoke-FoldCadenceCore {
         if ($a.outcome -eq 'unknown-sha') { $v.reason = 'recall-unknown-sha'; return $v }
         if ($a.outcome -ne 'ok') { $v.reason = "recall-failed-exit-$($a.exitCode)"; return $v }
         $parsing = $true
-        $debt = try { $a.stdout | ConvertFrom-Json } catch { $null }
-        # The count is TYPE-checked, not presence-checked: {"count":null} casts to 0 and would read as "nothing owed".
+        # -NoEnumerate: pipeline enumeration unwraps a SINGLETON array root, so [{"count":0,"commits":[]}] would pass as the object inside it.
+        $debt = try { ConvertFrom-Json -InputObject ([string]$a.stdout) -NoEnumerate } catch { $null }
+        # The count is TYPE-checked, not presence-checked: {"count":null} casts to 0 and would read as "nothing owed". The commit list
+        # must be a real array whose length IS the count; any disagreement is an unreadable answer, never a healthy or a due one.
         $shapeOk = ($debt -is [pscustomobject]) -and $debt.PSObject.Properties['count'] -and $debt.PSObject.Properties['commits'] -and
-            (($debt.count -is [int]) -or ($debt.count -is [long])) -and ($debt.count -ge 0)
+            (($debt.count -is [int]) -or ($debt.count -is [long])) -and ($debt.count -ge 0) -and
+            ($debt.commits -is [array]) -and (@($debt.commits).Count -eq [int]$debt.count)
         if (-not $shapeOk) { $v.recallOutcome = 'unreadable'; $v.reason = 'recall-output-unreadable'; return $v }
         # Everything is parsed into locals first; the verdict takes owedCount only after the whole parse and decision succeeded,
         # so an exception half way leaves the debt UNKNOWN (null), never a retained count read as a healthy answer.

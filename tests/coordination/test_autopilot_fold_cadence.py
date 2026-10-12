@@ -492,6 +492,11 @@ class FailClosedTests(CadenceWorld):
         'bool-count': '{"count": true, "commits": []}',
         'missing-commits': '{"count": 0}',
         'not-an-object': '[1, 2]',
+        # sol r2 BLOCKER: a SINGLETON array root is unwrapped by pipeline enumeration and used to pass the object check.
+        'singleton-array-root': '[{"count": 0, "commits": []}]',
+        # sol r2 BLOCKER + FOLD-DEBT-COMMIT-LIST-CONSISTENCY-1: count and commits must agree, in both directions.
+        'count-zero-commits-listed': '{"count": 0, "commits": [{"date": "2026-10-09T00:00:00Z"}]}',
+        'count-positive-commits-empty': '{"count": 3, "commits": []}',
     }
 
     def malformed(self, name):
@@ -513,7 +518,7 @@ class FailClosedTests(CadenceWorld):
                 self.assertEqual(v2['unknownReason'], 'recall-output-unreadable')
 
     def test_malformed_exit_0_output_does_not_reset_a_prior_unknown_beat(self):
-        for name in ('null-count', 'bad-commit-date'):
+        for name in ('null-count', 'bad-commit-date', 'singleton-array-root', 'count-zero-commits-listed', 'count-positive-commits-empty'):
             with self.subTest(shape=name):
                 self.reset_state()
                 self.run_step(self.git_failure())    # one injected unknown beat
@@ -524,7 +529,8 @@ class FailClosedTests(CadenceWorld):
 
     def test_well_formed_output_still_reads_healthy(self):
         cases = (('{"count": 0, "commits": []}', ('OK', 0, False, 'no-owed')),
-                 ('{"count": 2, "commits": [{"date": "2026-10-09T17:44:31-05:00"}], "fetch": "ok"}', ('DUE', 2, True, 'due')))
+                 ('{"count": 2, "commits": [{"date": "2026-10-09T17:44:31-05:00"}, {"date": "2026-10-09T18:00:00-05:00"}], "fetch": "ok"}', ('DUE', 2, True, 'due')),
+                 ('{"count": 1, "commits": [{"date": "2026-10-09T17:44:31-05:00"}]}', ('DUE', 1, True, 'due')))
         for body, want in cases:
             code, v, _ = self.run_step(self.fake_recall(f'print({body!r})\n'))
             self.assertEqual((v['meterState'], v['owedCount'], v['dueFold'], v['reason']), want)
