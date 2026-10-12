@@ -24,6 +24,8 @@
 
 #include "../../tools/gpu/backend/igpu_launch_timing_format.h"
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -44,6 +46,23 @@ constexpr double kWarnMs = 500.0;
 constexpr std::uintmax_t kRotateBytes = 1024u * 1024u;
 constexpr int kRotateKeep = 3;
 constexpr std::size_t kMaxFaults = 64;
+
+/* Exit join: session end waits at most kSessionEndWaitMs for the after-fault
+ * worker, and any System-log query (the worker's or session end's own) has a
+ * total deadline shorter than that wait, so a worker woken at session end has
+ * finished before the wait expires. */
+constexpr long long kSessionEndWaitMs = 2000;
+constexpr long long kSystemLogDeadlineMs = 1500;
+constexpr long long kEvtNextMaxWaitMs = 1000;
+static_assert(kSystemLogDeadlineMs < kSessionEndWaitMs, "the System-log query must end inside the session-end wait");
+
+/* The EvtNext wait for the next batch: at most kEvtNextMaxWaitMs and never past
+ * the query's total deadline. 0 means the deadline has passed: stop. */
+inline unsigned long evtNextWaitMs(long long remainingMs)
+{
+    if (remainingMs <= 0) return 0;
+    return static_cast<unsigned long>(remainingMs < kEvtNextMaxWaitMs ? remainingMs : kEvtNextMaxWaitMs);
+}
 
 /* ON unless the value is 0|off|false|no (case-insensitive, trimmed); unset or
  * empty is ON (the log is local-first and on by default). */
@@ -267,7 +286,7 @@ struct SystemLogEvents
 
 struct SystemLogResult
 {
-    std::string status; /* ok | access_denied | unavailable | timeout */
+    std::string status; /* ok | access_denied | unavailable | timeout | interrupted */
     SystemLogEvents nvlddmkm153;
     SystemLogEvents display4101;
 };
@@ -295,14 +314,18 @@ inline std::string formatHeader(const SessionInfo & s, const std::string & utc)
         + ",\"upload\":\"none\"}";
 }
 
+/* dropped_rotation_failed: lines this session did not write because the live
+ * file was at the cap and rotation failed (writeBounded). */
 inline std::string formatFlush(const std::string & sessionId, const std::string & utc,
                                const char * reason, unsigned long long seq,
-                               unsigned long long faultsDropped)
+                               unsigned long long faultsDropped,
+                               unsigned long long droppedRotationFailed = 0)
 {
     return linePrefix("flush", sessionId, utc)
         + ",\"reason\":" + quoted(reason ? reason : "")
         + ",\"seq\":" + number(seq)
-        + ",\"faults_dropped\":" + number(faultsDropped) + "}";
+        + ",\"faults_dropped\":" + number(faultsDropped)
+        + ",\"dropped_rotation_failed\":" + number(droppedRotationFailed) + "}";
 }
 
 inline std::string formatClip(const std::string & sessionId, const std::string & utc, const ClipInfo & c)
@@ -375,16 +398,16 @@ inline std::filesystem::path rotatedPath(const std::filesystem::path & live, int
     return p;
 }
 
-/* Called before each flush's append. When the live file is over capBytes it
- * shifts .1 -> .2 -> ... -> .keep (dropping the oldest) and moves the live file
- * to .1; the next append then opens a fresh live file. Returns true if it
+/* Called before each flush's append. When the live file is at or over capBytes
+ * it shifts .1 -> .2 -> ... -> .keep (dropping the oldest) and moves the live
+ * file to .1; the next append then opens a fresh live file. Returns true if it
  * rotated. */
 inline bool rotateIfNeeded(const std::filesystem::path & live, std::uintmax_t capBytes, int keep)
 {
     std::error_code ec;
     if (keep < 1) return false;
     const std::uintmax_t size = std::filesystem::file_size(live, ec);
-    if (ec || size <= capBytes) return false;
+    if (ec || size < capBytes) return false;
     std::filesystem::remove(rotatedPath(live, keep), ec);
     for (int i = keep - 1; i >= 1; --i)
     {
@@ -403,6 +426,101 @@ inline bool appendLines(const std::filesystem::path & live, const std::vector<st
     for (const std::string & line : lines) out << line << '\n';
     out.flush();
     return (bool)out;
+}
+
+enum class WriteOutcome
+{
+    Written,
+    DroppedRotationFailed, /* the live file is still at the cap: nothing appended */
+    WriteFailed            /* open or write failed (unwritable dir, full disk) */
+};
+
+/* One flush's write. Rotates first; if the live file is still at or over the
+ * cap (a rotation that failed, e.g. a generation held open without
+ * FILE_SHARE_DELETE) it appends nothing, so the live file never exceeds
+ * cap + one flush and the on-disk total stays under (keep + 1) x (cap + one
+ * flush) however often rotation fails. */
+inline WriteOutcome writeBounded(const std::filesystem::path & live, const std::vector<std::string> & lines,
+                                 std::uintmax_t capBytes, int keep)
+{
+    rotateIfNeeded(live, capBytes, keep);
+    std::error_code ec;
+    const std::uintmax_t size = std::filesystem::file_size(live, ec);
+    if (!ec && size >= capBytes) return WriteOutcome::DroppedRotationFailed;
+    return appendLines(live, lines) ? WriteOutcome::Written : WriteOutcome::WriteFailed;
+}
+
+constexpr std::size_t kMaxPendingLines = 64;
+
+/* What the log has not persisted yet: faults (at most kMaxFaults), extra lines
+ * such as recovery (at most kMaxPendingLines) and the current clip. A flush
+ * copies them into its lines (takeInto) and removes them only once the write
+ * succeeded (commit); a dropped or failed write keeps them for the next flush.
+ * The caller serialises flushes, so only appends happen between take and
+ * commit. */
+struct Unwritten
+{
+    std::vector<Fault> faults;
+    unsigned long long faultsDropped = 0;
+    std::vector<std::string> lines;
+    bool haveClip = false;
+    ClipInfo clip;
+    unsigned long long clipSeq = 0;
+    unsigned long long clipWrittenSeq = 0;
+    unsigned long long droppedRotationFailed = 0;
+
+    void addFault(const Fault & f)
+    {
+        if (faults.size() < kMaxFaults) faults.push_back(f);
+        else ++faultsDropped;
+    }
+    void addLine(std::string line)
+    {
+        if (lines.size() < kMaxPendingLines) lines.push_back(std::move(line));
+    }
+    void setClip(const ClipInfo & c)
+    {
+        clip = c;
+        haveClip = true;
+        ++clipSeq;
+    }
+};
+
+struct Taken
+{
+    std::size_t faults = 0;
+    std::size_t lines = 0;
+    unsigned long long clipSeq = 0;
+};
+
+inline Taken takeInto(const Unwritten & u, const std::string & sessionId, const std::string & utc,
+                      std::vector<std::string> & out)
+{
+    Taken t;
+    t.clipSeq = u.clipWrittenSeq;
+    if (u.haveClip && u.clipSeq != u.clipWrittenSeq)
+    {
+        out.push_back(formatClip(sessionId, utc, u.clip));
+        t.clipSeq = u.clipSeq;
+    }
+    for (const Fault & f : u.faults) out.push_back(formatFault(sessionId, utc, f));
+    t.faults = u.faults.size();
+    out.insert(out.end(), u.lines.begin(), u.lines.end());
+    t.lines = u.lines.size();
+    return t;
+}
+
+/* lineCount: the lines this flush tried to write (counted when dropped). */
+inline void commit(Unwritten & u, const Taken & t, WriteOutcome outcome, std::size_t lineCount)
+{
+    if (outcome != WriteOutcome::Written)
+    {
+        if (outcome == WriteOutcome::DroppedRotationFailed) u.droppedRotationFailed += lineCount;
+        return;
+    }
+    u.faults.erase(u.faults.begin(), u.faults.begin() + static_cast<std::ptrdiff_t>(std::min(t.faults, u.faults.size())));
+    u.lines.erase(u.lines.begin(), u.lines.begin() + static_cast<std::ptrdiff_t>(std::min(t.lines, u.lines.size())));
+    if (t.clipSeq > u.clipWrittenSeq) u.clipWrittenSeq = t.clipSeq;
 }
 
 } // namespace GpuFieldTelemetryCore

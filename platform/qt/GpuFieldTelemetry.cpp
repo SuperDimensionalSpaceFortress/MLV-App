@@ -58,8 +58,6 @@ namespace core = GpuFieldTelemetryCore;
 
 constexpr qint64 kAfterFaultWaitMs = 5000;
 constexpr qint64 kAfterFaultDebounceMs = 10000;
-constexpr qint64 kSessionEndWorkerWaitMs = 2000;
-constexpr std::size_t kMaxPendingLines = 64;
 
 struct State
 {
@@ -70,12 +68,7 @@ struct State
     std::string cudaModel;
     bool glIdentitySet = false;
     core::StageMap stages;
-    std::vector<core::Fault> unwrittenFaults;
-    unsigned long long faultsDropped = 0;
-    bool haveClip = false;
-    bool clipWritten = true;
-    core::ClipInfo clip;
-    std::vector<std::string> pendingLines;
+    core::Unwritten unwritten;
     unsigned long long flushSeq = 0;
     std::function<void(const CudaFault &)> listener;
     bool afterFaultPending = false;
@@ -84,23 +77,33 @@ struct State
     bool sessionEnded = false;
 };
 
+/* Heap-allocated and never destroyed: a worker still inside a step when
+ * session end gives up waiting never touches a destroyed static. */
 State & state()
 {
-    static State s;
-    return s;
+    static State * s = new State();
+    return *s;
 }
 
-/* Serialises the append + rotation of concurrent flushes (GUI and worker). */
+/* Serialises whole flushes (take, write, commit) between the GUI and the worker. */
 QMutex & writeMutex()
 {
-    static QMutex m;
-    return m;
+    static QMutex * m = new QMutex();
+    return *m;
 }
 
 /* The after-fault worker waits here; session end wakes it so exit is not held. */
 QMutex g_waitMutex;
 QWaitCondition g_waitCondition;
 bool g_shuttingDown = false;
+
+/* Set at session end; the worker checks it before each step. */
+std::atomic<bool> g_workerStop{false};
+
+bool workerStopped(bool onWorker)
+{
+    return onWorker && g_workerStop.load();
+}
 
 std::atomic<bool> g_sessionEndDone{false};
 std::atomic<bool> g_aboutToQuitConnected{false};
@@ -168,7 +171,6 @@ typedef BOOL (WINAPI * EvtRenderFn)(EvtHandle, EvtHandle, DWORD, DWORD, PVOID, P
 constexpr DWORD kEvtQueryChannelPath = 0x1;
 constexpr DWORD kEvtQueryForwardDirection = 0x100;
 constexpr DWORD kEvtRenderEventXml = 1;
-constexpr DWORD kEvtNextTimeoutMs = 1000;
 constexpr int kMaxSystemLogEvents = 4096;
 
 /* The value of attribute `name` (single- or double-quoted) after `from`. */
@@ -214,12 +216,14 @@ void noteEvent(core::SystemLogEvents & e, const std::string & utc)
 }
 
 /* nvlddmkm 153 / Display 4101 in the System log since session start. Non-admin
- * read; never polled; at most one EvtNext wait of kEvtNextTimeoutMs per batch. */
-core::SystemLogResult querySystemLog(const std::string & sinceUtc)
+ * read; never polled; each EvtNext wait is capped by core::evtNextWaitMs, so
+ * the whole read ends by `deadline`. On the worker it also stops at session end.
+ * wevtapi comes from System32 only, never the application directory. */
+core::SystemLogResult querySystemLog(const std::string & sinceUtc, const QDeadlineTimer & deadline, bool onWorker)
 {
     core::SystemLogResult r;
     r.status = "unavailable";
-    HMODULE dll = LoadLibraryW(L"wevtapi.dll");
+    HMODULE dll = LoadLibraryExW(L"wevtapi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (!dll) return r;
     const EvtQueryFn evtQuery = reinterpret_cast<EvtQueryFn>(reinterpret_cast<void *>(GetProcAddress(dll, "EvtQuery")));
     const EvtNextFn evtNext = reinterpret_cast<EvtNextFn>(reinterpret_cast<void *>(GetProcAddress(dll, "EvtNext")));
@@ -248,9 +252,20 @@ core::SystemLogResult querySystemLog(const std::string & sinceUtc)
     int seen = 0;
     while (seen < kMaxSystemLogEvents)
     {
+        const DWORD waitMs = core::evtNextWaitMs(deadline.remainingTime());
+        if (waitMs == 0)
+        {
+            r.status = "timeout";
+            break;
+        }
+        if (workerStopped(onWorker))
+        {
+            r.status = "interrupted";
+            break;
+        }
         EvtHandle events[16];
         DWORD returned = 0;
-        if (!evtNext(results, 16, events, kEvtNextTimeoutMs, 0, &returned))
+        if (!evtNext(results, 16, events, waitMs, 0, &returned))
         {
             const DWORD e = GetLastError();
             if (e != ERROR_NO_MORE_ITEMS)
@@ -286,7 +301,7 @@ core::SystemLogResult querySystemLog(const std::string & sinceUtc)
     return r;
 }
 #else
-core::SystemLogResult querySystemLog(const std::string &)
+core::SystemLogResult querySystemLog(const std::string &, const QDeadlineTimer &, bool)
 {
     core::SystemLogResult r;
     r.status = "unavailable";
@@ -294,7 +309,10 @@ core::SystemLogResult querySystemLog(const std::string &)
 }
 #endif
 
-void flushImpl(const char * reason, bool withSystemLog)
+/* onWorker: the after-fault / recovery worker, which stops before each step
+ * once session end has begun. systemLogDeadlineMs bounds the System-log read. */
+void flushImpl(const char * reason, bool withSystemLog, bool onWorker = false,
+               qint64 systemLogDeadlineMs = core::kSystemLogDeadlineMs)
 {
     State & s = state();
     QString dir;
@@ -305,11 +323,18 @@ void flushImpl(const char * reason, bool withSystemLog)
         dir = s.logsDir;
         since = s.session.startUtc;
     }
+    if (workerStopped(onWorker)) return;
     core::SystemLogResult systemLog;
-    if (withSystemLog) systemLog = querySystemLog(since);
+    if (withSystemLog) systemLog = querySystemLog(since, QDeadlineTimer(systemLogDeadlineMs), onWorker);
+    if (workerStopped(onWorker)) return;
     const std::string cudaModel = reconDescribe();
+    if (workerStopped(onWorker)) return;
 
+    // Faults, recovery lines and the clip leave Unwritten only once the write
+    // succeeded; writeMutex keeps a second flush from taking them meanwhile.
+    QMutexLocker writeLocker(&writeMutex());
     std::vector<std::string> lines;
+    core::Taken taken;
     {
         QMutexLocker locker(&s.mutex);
         if (!cudaModel.empty()) s.cudaModel = cudaModel;
@@ -317,45 +342,43 @@ void flushImpl(const char * reason, bool withSystemLog)
         const std::string utc = nowIsoUtc();
         const std::string & id = s.session.sessionId;
         lines.push_back(core::formatHeader(s.session, utc));
-        lines.push_back(core::formatFlush(id, utc, reason, ++s.flushSeq, s.faultsDropped));
-        if (s.haveClip && !s.clipWritten)
-        {
-            lines.push_back(core::formatClip(id, utc, s.clip));
-            s.clipWritten = true;
-        }
+        lines.push_back(core::formatFlush(id, utc, reason, ++s.flushSeq, s.unwritten.faultsDropped,
+                                          s.unwritten.droppedRotationFailed));
         for (const auto & entry : s.stages.entries())
             lines.push_back(core::formatStage(id, utc, entry.second));
-        for (const core::Fault & f : s.unwrittenFaults)
-            lines.push_back(core::formatFault(id, utc, f));
-        s.unwrittenFaults.clear();
-        for (std::string & line : s.pendingLines)
-            lines.push_back(std::move(line));
-        s.pendingLines.clear();
+        taken = core::takeInto(s.unwritten, id, utc, lines);
         if (withSystemLog) lines.push_back(core::formatSystemLog(id, utc, reason, systemLog));
     }
 
-    QMutexLocker writeLocker(&writeMutex());
     const std::filesystem::path live =
         QDir(dir).filePath(QString::fromLatin1(core::kLogFileName)).toStdWString();
-    core::rotateIfNeeded(live, core::kRotateBytes, core::kRotateKeep);
-    core::appendLines(live, lines);
+    const core::WriteOutcome outcome = core::writeBounded(live, lines, core::kRotateBytes, core::kRotateKeep);
+    QMutexLocker locker(&s.mutex);
+    core::commit(s.unwritten, taken, outcome, lines.size());
 }
 
 void sessionEnd()
 {
     bool expected = false;
     if (!g_sessionEndDone.compare_exchange_strong(expected, true)) return;
+    const QDeadlineTimer budget(core::kSessionEndWaitMs);
     {
         QMutexLocker locker(&state().mutex);
         state().sessionEnded = true;
     }
+    g_workerStop.store(true);
     {
         QMutexLocker locker(&g_waitMutex);
         g_shuttingDown = true;
         g_waitCondition.wakeAll();
     }
-    if (g_workerPoolCreated.load()) workerPool()->waitForDone(kSessionEndWorkerWaitMs);
-    flushImpl("session_end", true);
+    // A worker still inside a step after the wait: skip the final write and
+    // leave State to it (State is never destroyed).
+    if (g_workerPoolCreated.load() && !workerPool()->waitForDone(static_cast<int>(core::kSessionEndWaitMs)))
+        return;
+    const qint64 remainingMs = budget.remainingTime();
+    flushImpl("session_end", true, false,
+              remainingMs < core::kSystemLogDeadlineMs ? remainingMs : core::kSystemLogDeadlineMs);
 }
 
 void sessionEndPostRoutine()
@@ -393,11 +416,12 @@ void scheduleAfterFaultFlush()
     }
     startedWorkerPool()->start([delayMs]() {
         if (!waitUnlessShuttingDown(delayMs)) return; // session_end writes it instead
+        if (workerStopped(true)) return;
         {
             QMutexLocker locker(&state().mutex);
             state().afterFaultPending = false;
         }
-        flushImpl("after_fault", true);
+        flushImpl("after_fault", true, true);
     });
 }
 
@@ -482,8 +506,7 @@ void noteFault(const CudaFault & fault)
         QMutexLocker locker(&s.mutex);
         s.stages.add(fault.dll, fault.stage, -1.0,
                      fault.cudaCode != 0 ? fault.cudaCode : (fault.rc != 0 ? fault.rc : -1));
-        if (s.unwrittenFaults.size() < core::kMaxFaults) s.unwrittenFaults.push_back(f);
-        else ++s.faultsDropped;
+        s.unwritten.addFault(f);
         listener = s.listener;
         installed = s.installed;
     }
@@ -515,10 +538,9 @@ void noteRecovery(const char * what, const char * outcome)
     {
         QMutexLocker locker(&s.mutex);
         if (!s.installed || s.sessionEnded) return;
-        if (s.pendingLines.size() < kMaxPendingLines)
-            s.pendingLines.push_back(core::formatRecovery(s.session.sessionId, nowIsoUtc(), what, outcome));
+        s.unwritten.addLine(core::formatRecovery(s.session.sessionId, nowIsoUtc(), what, outcome));
     }
-    startedWorkerPool()->start([]() { flushImpl("recovery", false); });
+    startedWorkerPool()->start([]() { flushImpl("recovery", false, true); });
 }
 
 void noteClip(int width, int height, int bitsPerPixel, bool compressed,
@@ -529,14 +551,14 @@ void noteClip(int width, int height, int bitsPerPixel, bool compressed,
     {
         QMutexLocker locker(&s.mutex);
         if (!s.installed) return;
-        s.clip.width = width;
-        s.clip.height = height;
-        s.clip.bitsPerPixel = bitsPerPixel;
-        s.clip.compressed = compressed;
-        s.clip.dualIsoGpu = dualIsoGpu;
-        s.clip.clipHash = clipHash(basename).toStdString();
-        s.haveClip = true;
-        s.clipWritten = false;
+        core::ClipInfo clip;
+        clip.width = width;
+        clip.height = height;
+        clip.bitsPerPixel = bitsPerPixel;
+        clip.compressed = compressed;
+        clip.dualIsoGpu = dualIsoGpu;
+        clip.clipHash = clipHash(basename).toStdString();
+        s.unwritten.setClip(clip);
     }
     connectAboutToQuitOnce();
     flushImpl("clip_open", false);

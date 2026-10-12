@@ -28,6 +28,26 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+
+namespace GpuFieldTelemetryCore
+{
+// For minitest's failure message.
+inline std::ostream & operator<<(std::ostream & os, WriteOutcome outcome)
+{
+    return os << (outcome == WriteOutcome::Written ? "Written"
+                  : outcome == WriteOutcome::DroppedRotationFailed ? "DroppedRotationFailed" : "WriteFailed");
+}
+} // namespace GpuFieldTelemetryCore
+
 namespace
 {
 namespace core = GpuFieldTelemetryCore;
@@ -101,6 +121,169 @@ QStringList unguardedTelemetryCallsIn(const QString & source, const QString & re
 QStringList unguardedTelemetryCalls(const QString & relativePath, const QString & helper, int * guardedOut)
 {
     return unguardedTelemetryCallsIn(readRepoFile(relativePath), relativePath, helper, guardedOut);
+}
+
+// `source` with comments and string / char literals blanked to spaces (offsets kept), so brace
+// matching sees code only.
+QString codeOnly(const QString & source)
+{
+    QString code = source;
+    const int n = code.size();
+    int i = 0;
+    while (i < n)
+    {
+        const QChar c = code[i];
+        const QChar next = i + 1 < n ? code[i + 1] : QChar();
+        if (c == QLatin1Char('/') && next == QLatin1Char('/'))
+        {
+            while (i < n && code[i] != QLatin1Char('\n')) code[i++] = QLatin1Char(' ');
+        }
+        else if (c == QLatin1Char('/') && next == QLatin1Char('*'))
+        {
+            while (i < n && !(code[i] == QLatin1Char('*') && i + 1 < n && code[i + 1] == QLatin1Char('/')))
+            {
+                if (code[i] != QLatin1Char('\n')) code[i] = QLatin1Char(' ');
+                ++i;
+            }
+            if (i < n) code[i++] = QLatin1Char(' ');
+            if (i < n) code[i++] = QLatin1Char(' ');
+        }
+        else if (c == QLatin1Char('"') || c == QLatin1Char('\''))
+        {
+            ++i;
+            while (i < n && code[i] != c && code[i] != QLatin1Char('\n'))
+            {
+                if (code[i] == QLatin1Char('\\') && i + 1 < n) code[i++] = QLatin1Char(' ');
+                code[i++] = QLatin1Char(' ');
+            }
+            ++i;
+        }
+        else
+        {
+            ++i;
+        }
+    }
+    return code;
+}
+
+// The innermost '{' still open at `pos`, or -1.
+int enclosingOpen(const QString & code, int pos)
+{
+    int depth = 0;
+    for (int i = pos - 1; i >= 0; --i)
+    {
+        if (code[i] == QLatin1Char('}')) ++depth;
+        else if (code[i] == QLatin1Char('{'))
+        {
+            if (depth == 0) return i;
+            --depth;
+        }
+    }
+    return -1;
+}
+
+int matchingOpen(const QString & code, int close)
+{
+    return enclosingOpen(code, close);
+}
+
+// The statement head that opens the block at `open`: the code back to the previous ';', '{' or
+// '}' (that position is returned in *stopOut), whitespace and macro line continuations folded.
+QString blockHeader(const QString & code, int open, int * stopOut)
+{
+    int i = open - 1;
+    while (i >= 0 && code[i] != QLatin1Char(';') && code[i] != QLatin1Char('{') && code[i] != QLatin1Char('}')) --i;
+    if (stopOut) *stopOut = i;
+    QString head = code.mid(i + 1, open - i - 1);
+    head.replace(QLatin1Char('\\'), QLatin1Char(' '));
+    return head.simplified();
+}
+
+bool isFailureTest(const QString & head)
+{
+    return (head.startsWith(QStringLiteral("if")) || head.startsWith(QStringLiteral("else if")))
+        && (head.contains(QStringLiteral("!= cudaSuccess")) || head.contains(QStringLiteral("!=cudaSuccess")));
+}
+
+// GPU-FIELD-TELEMETRY-1 r3 (CENSUS-BRACE-SCOPE): a note is in a failure branch only when the block
+// that holds it is opened by an rc != cudaSuccess test (directly, or through nested if-blocks), or
+// is the else arm of an rc == cudaSuccess test, or the note is the body of a braceless
+// `if (x != cudaSuccess)` on its own line. A note after an early-return check
+// (`if (e != cudaSuccess) return ...; IGPU_CUDA_ERROR_NOTE(...)`) sits in the enclosing success
+// path and is reported.
+bool noteIsInFailureBranch(const QString & source, const QString & code, int pos)
+{
+    const int lineStart = source.lastIndexOf(QLatin1Char('\n'), pos) + 1;
+    const QString before = code.mid(lineStart, pos - lineStart).trimmed();
+    if (QRegularExpression(QStringLiteral("^if\\s*\\(.*!=\\s*cudaSuccess\\s*\\)$")).match(before).hasMatch()) return true;
+    if (!before.isEmpty()) return false; // anything else before it on its line is not a branch head
+    int open = enclosingOpen(code, pos);
+    while (open >= 0)
+    {
+        int stop = -1;
+        const QString head = blockHeader(code, open, &stop);
+        if (head == QStringLiteral("else"))
+        {
+            if (stop < 0 || code[stop] != QLatin1Char('}')) return false;
+            int ifStop = -1;
+            const QString ifHead = blockHeader(code, matchingOpen(code, stop), &ifStop);
+            return ifHead.startsWith(QStringLiteral("if")) && ifHead.contains(QStringLiteral("== cudaSuccess"));
+        }
+        if (isFailureTest(head)) return true;
+        if (!head.startsWith(QStringLiteral("if")) && !head.startsWith(QStringLiteral("else if"))) return false;
+        open = enclosingOpen(code, open);
+    }
+    return false;
+}
+
+// Every IGPU_CUDA_ERROR_NOTE( in `source` outside a failure branch, as label:line.
+QStringList notesOutsideFailureBranch(const QString & source, const QString & label)
+{
+    const QString code = codeOnly(source);
+    QStringList bad;
+    const QString needle = QStringLiteral("IGPU_CUDA_ERROR_NOTE(");
+    for (int pos = source.indexOf(needle); pos >= 0; pos = source.indexOf(needle, pos + 1))
+    {
+        if (!noteIsInFailureBranch(source, code, pos))
+            bad << QStringLiteral("%1:%2").arg(label).arg(source.left(pos).count(QLatin1Char('\n')) + 1);
+    }
+    return bad;
+}
+
+// The whole failure census over the recon and AMaZE sources: exact note counts (15 recon: CK,
+// CKN and 13 explicit branches; 22 AMaZE) and every note inside a failure branch.
+constexpr int kReconNotes = 15;
+constexpr int kAmazeNotes = 22;
+
+QStringList failureCensus(const QString & recon, const QString & amaze)
+{
+    QStringList problems;
+    const int reconNotes = (int)recon.count(QStringLiteral("IGPU_CUDA_ERROR_NOTE("));
+    const int amazeNotes = (int)amaze.count(QStringLiteral("IGPU_CUDA_ERROR_NOTE("));
+    if (reconNotes != kReconNotes) problems << QStringLiteral("recon notes %1 != %2").arg(reconNotes).arg(kReconNotes);
+    if (amazeNotes != kAmazeNotes) problems << QStringLiteral("amaze notes %1 != %2").arg(amazeNotes).arg(kAmazeNotes);
+    problems << notesOutsideFailureBranch(recon, QStringLiteral("recon"));
+    problems << notesOutsideFailureBranch(amaze, QStringLiteral("amaze"));
+    return problems;
+}
+
+QString replacedOnce(const QString & source, const QString & from, const QString & to)
+{
+    const int at = source.indexOf(from);
+    ASSERT_TRUE(at >= 0);
+    ASSERT_EQ(-1, source.indexOf(from, at + 1));
+    QString out = source;
+    out.replace(at, from.size(), to);
+    return out;
+}
+
+std::uintmax_t bytesUnder(const std::filesystem::path & dir)
+{
+    std::uintmax_t total = 0;
+    std::error_code ec;
+    for (const auto & entry : std::filesystem::recursive_directory_iterator(dir, ec))
+        if (entry.is_regular_file(ec)) total += entry.file_size(ec);
+    return total;
 }
 
 core::StageEntry stageFrom(const std::vector<double> & ms, int errorsWithCode702)
@@ -402,8 +585,9 @@ TEST(GpuFieldTelemetry, GateIsAFunctionLocalStaticAndOffReturnsFirst)
     {
         ASSERT_TRUE(source.contains(QString::fromLatin1(entry)));
     }
-    // The worker pool exists only once a fault or recovery asks for it; wevtapi is loaded at runtime.
-    ASSERT_TRUE(source.contains(QStringLiteral("LoadLibraryW(L\"wevtapi.dll\")")));
+    // The worker pool exists only once a fault or recovery asks for it; wevtapi is loaded at runtime,
+    // from System32 only (r3 H2: never the application directory; WevtapiLoadsFromSystem32Only).
+    ASSERT_TRUE(source.contains(QStringLiteral("LoadLibraryExW(L\"wevtapi.dll\", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32)")));
     ASSERT_FALSE(readRepoFile(QStringLiteral("platform/qt/MLVApp.pro")).contains(QStringLiteral("wevtapi")));
 }
 
@@ -446,6 +630,8 @@ TEST(GpuFieldTelemetry, CudaFailureBranchesNoteTheCodeAndAddNoSync)
         ASSERT_TRUE(amaze.contains(QString::fromLatin1(note)));
     ASSERT_EQ(22, (int)amaze.count(QStringLiteral("IGPU_CUDA_ERROR_NOTE(")));
     ASSERT_TRUE(recon.count(QStringLiteral("IGPU_CUDA_ERROR_NOTE(")) >= 14);
+    // r3: the exact counts and the brace-scope check (FailureCensusIsExactAndBraceScoped).
+    ASSERT_EQ(std::string(), failureCensus(recon, amaze).join(QStringLiteral("; ")).toStdString());
     // Every note is in a failure branch: the line before it opens an rc/e != cudaSuccess branch,
     // or is one of the CK/CKN macro heads, or is the sync failure test itself.
     for (const QString * src : {&recon, &amaze})
@@ -482,4 +668,282 @@ TEST(GpuFieldTelemetry, LaunchTimingRecorderIsUntouched)
     bytes.replace("\r", "");
     ASSERT_EQ(std::string("b5e89abf94802e68893ef21462b50c378289fe2c2260ad329e9b0a7ddf316291"),
               QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex().toStdString());
+}
+
+// r3 B1 (sol): a failed rotation must not let the live file grow. Every generation slot is a
+// non-empty directory, so the remove and every rename fail on any platform; writeBounded then
+// appends nothing once the live file is at the cap, and the dropped flushes are reported.
+TEST(GpuFieldTelemetry, FailedRotationNeverGrowsTheLiveFilePastTheCap)
+{
+    QTemporaryDir dir;
+    ASSERT_TRUE(dir.isValid());
+    const std::filesystem::path root(dir.path().toStdWString());
+    const std::filesystem::path live = root / core::kLogFileName;
+    const std::uintmax_t cap = 256;
+    const int keep = 3;
+    for (int g = 1; g <= keep; ++g)
+    {
+        std::error_code ec;
+        std::filesystem::create_directory(core::rotatedPath(live, g), ec);
+        ASSERT_FALSE((bool)ec);
+        ASSERT_TRUE(core::appendLines(core::rotatedPath(live, g) / "pin", {"x"}));
+    }
+    const std::vector<std::string> flush(4, std::string(39, 'f')); // 160 bytes per flush
+    const std::uintmax_t flushBytes = 160;
+    const std::uintmax_t pinned = bytesUnder(root);
+
+    int written = 0;
+    int dropped = 0;
+    for (int i = 0; i < 200; ++i)
+    {
+        const core::WriteOutcome outcome = core::writeBounded(live, flush, cap, keep);
+        if (outcome == core::WriteOutcome::Written) ++written;
+        else if (outcome == core::WriteOutcome::DroppedRotationFailed) ++dropped;
+        std::error_code ec;
+        ASSERT_TRUE(std::filesystem::file_size(live, ec) < cap + flushBytes);
+        ASSERT_TRUE(bytesUnder(root) - pinned < cap + flushBytes);
+    }
+    ASSERT_EQ(2, written);  // 0 -> 160 -> 320 bytes, then the cap holds
+    ASSERT_EQ(198, dropped);
+    ASSERT_EQ(320ull, (unsigned long long)std::filesystem::file_size(live));
+
+    // The dropped lines are counted and reported by the next flush line that is written.
+    core::Unwritten u;
+    core::Taken t;
+    core::commit(u, t, core::WriteOutcome::DroppedRotationFailed, 7);
+    core::commit(u, t, core::WriteOutcome::DroppedRotationFailed, 5);
+    core::commit(u, t, core::WriteOutcome::WriteFailed, 9); // a failed write is not a rotation drop
+    ASSERT_EQ(12ull, u.droppedRotationFailed);
+    const QJsonObject line = parseLine(core::formatFlush("s1", "2026-10-12T12:00:00.000Z", "after_fault", 3, 0,
+                                                         u.droppedRotationFailed));
+    ASSERT_EQ(12, line.value(QStringLiteral("dropped_rotation_failed")).toInt());
+
+    // Once a generation can move again, the next flush rotates and writes a fresh live file.
+    std::error_code ec;
+    std::filesystem::remove_all(core::rotatedPath(live, keep), ec);
+    std::filesystem::remove_all(core::rotatedPath(live, keep - 1), ec);
+    std::filesystem::remove_all(core::rotatedPath(live, 1), ec);
+    ASSERT_EQ(core::WriteOutcome::Written, core::writeBounded(live, flush, cap, keep));
+    ASSERT_EQ((unsigned long long)flushBytes, (unsigned long long)std::filesystem::file_size(live));
+    ASSERT_EQ(320ull, (unsigned long long)std::filesystem::file_size(core::rotatedPath(live, 1)));
+}
+
+#ifdef _WIN32
+// r3 B1, sol's own repro: generation .1 held open without FILE_SHARE_DELETE (an antivirus or a
+// log viewer). The shift and the live rename fail; the live file still never passes the cap.
+TEST(GpuFieldTelemetry, GenerationHeldWithoutShareDeleteKeepsTheLiveFileBounded)
+{
+    QTemporaryDir dir;
+    ASSERT_TRUE(dir.isValid());
+    const std::filesystem::path root(dir.path().toStdWString());
+    const std::filesystem::path live = root / core::kLogFileName;
+    const std::uintmax_t cap = 256;
+    ASSERT_TRUE(core::appendLines(core::rotatedPath(live, 1), {"held"}));
+    HANDLE held = CreateFileW(core::rotatedPath(live, 1).wstring().c_str(), GENERIC_READ,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                              FILE_ATTRIBUTE_NORMAL, nullptr);
+    ASSERT_TRUE(held != INVALID_HANDLE_VALUE);
+    const std::vector<std::string> flush(4, std::string(39, 'f'));
+    int dropped = 0;
+    for (int i = 0; i < 100; ++i)
+    {
+        if (core::writeBounded(live, flush, cap, 3) == core::WriteOutcome::DroppedRotationFailed) ++dropped;
+        ASSERT_TRUE(std::filesystem::file_size(live) < cap + 160);
+    }
+    ASSERT_EQ(98, dropped);
+    CloseHandle(held);
+    ASSERT_EQ(core::WriteOutcome::Written, core::writeBounded(live, flush, cap, 3));
+    ASSERT_EQ(160ull, (unsigned long long)std::filesystem::file_size(live));
+}
+#endif
+
+// r3 H1 (sol PERSISTENCE-FAILURE + B1): a dropped or failed write keeps the faults, the extra lines
+// and the clip for the next flush (still capped at 64 each); a successful write removes exactly
+// what it took, so a fault noted between take and commit survives.
+TEST(GpuFieldTelemetry, FailedWriteKeepsFaultsLinesAndClipForTheNextFlush)
+{
+    QTemporaryDir dir;
+    ASSERT_TRUE(dir.isValid());
+    const std::filesystem::path good = std::filesystem::path(dir.path().toStdWString()) / core::kLogFileName;
+    const std::filesystem::path unwritable =
+        std::filesystem::path(dir.path().toStdWString()) / "missing-dir" / core::kLogFileName;
+
+    core::Unwritten u;
+    core::ClipInfo clip;
+    clip.width = 1808;
+    clip.height = 2268;
+    clip.clipHash = "a3d03684e47a";
+    u.setClip(clip);
+    for (int i = 0; i < 3; ++i)
+    {
+        core::Fault f;
+        f.dll = "recon";
+        f.stage = "recon:preupload";
+        f.rc = -1;
+        f.cudaCode = 2;
+        u.addFault(f);
+    }
+    u.addLine("recovery-1");
+
+    std::vector<std::string> lines;
+    core::Taken t = core::takeInto(u, "s1", "utc", lines);
+    ASSERT_EQ(5, (int)lines.size()); // clip, 3 faults, 1 recovery line
+    ASSERT_EQ(core::WriteOutcome::WriteFailed, core::writeBounded(unwritable, lines, core::kRotateBytes, 3));
+    core::commit(u, t, core::WriteOutcome::WriteFailed, lines.size());
+    ASSERT_EQ(3, (int)u.faults.size());
+    ASSERT_EQ(1, (int)u.lines.size());
+    ASSERT_TRUE(u.clipSeq != u.clipWrittenSeq);
+
+    // A rotation drop keeps them too.
+    core::commit(u, t, core::WriteOutcome::DroppedRotationFailed, lines.size());
+    ASSERT_EQ(3, (int)u.faults.size());
+    ASSERT_EQ(5ull, u.droppedRotationFailed);
+
+    // Still bounded while the disk stays bad: 64 kept, the rest counted.
+    core::Unwritten capped = u;
+    for (int i = 0; i < 70; ++i) capped.addFault(core::Fault());
+    for (int i = 0; i < 70; ++i) capped.addLine("recovery-n");
+    ASSERT_EQ(64, (int)capped.faults.size());
+    ASSERT_EQ(9ull, capped.faultsDropped);
+    ASSERT_EQ(64, (int)capped.lines.size());
+
+    // The retry writes them; one fault noted between take and commit stays for the next flush.
+    lines.clear();
+    t = core::takeInto(u, "s1", "utc", lines);
+    ASSERT_EQ(5, (int)lines.size());
+    core::Fault late;
+    late.stage = "recon:run";
+    u.addFault(late);
+    ASSERT_EQ(core::WriteOutcome::Written, core::writeBounded(good, lines, core::kRotateBytes, 3));
+    core::commit(u, t, core::WriteOutcome::Written, lines.size());
+    ASSERT_EQ(1, (int)u.faults.size());
+    ASSERT_EQ(std::string("recon:run"), u.faults[0].stage);
+    ASSERT_EQ(0, (int)u.lines.size());
+    ASSERT_EQ(u.clipSeq, u.clipWrittenSeq);
+    lines.clear();
+    core::takeInto(u, "s1", "utc", lines);
+    ASSERT_EQ(1, (int)lines.size()); // only the late fault: the clip is not written twice
+    ASSERT_TRUE(readFile(good).find("\"clip_hash\":\"a3d03684e47a\"") != std::string::npos);
+}
+
+// r3 H1, product wiring: flushImpl takes before the write and commits the outcome after it.
+TEST(GpuFieldTelemetry, FlushCommitsOnlyWhatTheWriteKept)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/GpuFieldTelemetry.cpp"));
+    ASSERT_TRUE(source.contains(QStringLiteral("taken = core::takeInto(s.unwritten, id, utc, lines);")));
+    ASSERT_TRUE(source.contains(QStringLiteral(
+        "const core::WriteOutcome outcome = core::writeBounded(live, lines, core::kRotateBytes, core::kRotateKeep);\n"
+        "    QMutexLocker locker(&s.mutex);\n"
+        "    core::commit(s.unwritten, taken, outcome, lines.size());")));
+    ASSERT_FALSE(source.contains(QStringLiteral("core::rotateIfNeeded(")));
+    ASSERT_FALSE(source.contains(QStringLiteral("core::appendLines(")));
+    ASSERT_FALSE(source.contains(QStringLiteral(".clear();")));
+}
+
+// r3 H2 (fable WEVTAPI-SYSTEM32): wevtapi.dll only from System32, never the default search order.
+TEST(GpuFieldTelemetry, WevtapiLoadsFromSystem32Only)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/GpuFieldTelemetry.cpp"));
+    ASSERT_EQ(1, (int)source.count(QStringLiteral("LoadLibraryExW(L\"wevtapi.dll\", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32)")));
+    ASSERT_FALSE(source.contains(QStringLiteral("LoadLibraryW(")));
+    ASSERT_FALSE(source.contains(QStringLiteral("LoadLibraryA(")));
+}
+
+// r3 H3 (sol CENSUS + fable CENSUS-BRACE-SCOPE): the census pins the exact counts and the brace
+// scope, and each check turns red on its mutation.
+TEST(GpuFieldTelemetry, FailureCensusIsExactAndBraceScoped)
+{
+    const QString recon = readRepoFile(QStringLiteral("tools/gpu/backend/igpu_recon_cuda.cu"));
+    const QString amaze = readRepoFile(QStringLiteral("tools/gpu/backend/igpu_amaze_debayer_cuda.cu"));
+    ASSERT_EQ(kReconNotes, (int)recon.count(QStringLiteral("IGPU_CUDA_ERROR_NOTE(")));
+    ASSERT_EQ(kAmazeNotes, (int)amaze.count(QStringLiteral("IGPU_CUDA_ERROR_NOTE(")));
+    ASSERT_EQ(std::string(), failureCensus(recon, amaze).join(QStringLiteral("; ")).toStdString());
+
+    // Mutation 1 (sol's replay): drop the preupload:submit note -> recon count 14.
+    const QString noSubmit = replacedOnce(recon, QStringLiteral("        IGPU_CUDA_ERROR_NOTE(e, \"preupload:submit\");\n"), QString());
+    ASSERT_EQ(std::string("recon notes 14 != 15"), failureCensus(noSubmit, amaze).join(QStringLiteral("; ")).toStdString());
+    // Mutation 2: drop one AMaZE note -> 21.
+    const QString noMap = replacedOnce(amaze, QStringLiteral("        IGPU_CUDA_ERROR_NOTE(rc, \"gl_r16_in:map\");\n"), QString());
+    ASSERT_EQ(std::string("amaze notes 21 != 22"), failureCensus(recon, noMap).join(QStringLiteral("; ")).toStdString());
+    // Mutation 3 (fable's repro): the note moved after an early-return failure check, into the
+    // success path. Same count; the old 4-line context check accepted it.
+    const QString earlyReturn = replacedOnce(recon,
+        QStringLiteral("    if (e != cudaSuccess) {\n        IGPU_CUDA_ERROR_NOTE(e, \"preupload:malloc_host\");\n        return -1;\n    }\n"),
+        QStringLiteral("    if (e != cudaSuccess) return -1;\n    IGPU_CUDA_ERROR_NOTE(e, \"preupload:malloc_host\");\n"));
+    const QStringList earlyProblems = failureCensus(earlyReturn, amaze);
+    ASSERT_EQ(1, (int)earlyProblems.size());
+    ASSERT_TRUE(earlyProblems[0].startsWith(QStringLiteral("recon:")));
+    // Mutation 4: the same on one line.
+    const QString oneLine = replacedOnce(recon,
+        QStringLiteral("    if (e != cudaSuccess) {\n        IGPU_CUDA_ERROR_NOTE(e, \"preupload:malloc_host\");\n        return -1;\n    }\n"),
+        QStringLiteral("    if (e != cudaSuccess) return -1; IGPU_CUDA_ERROR_NOTE(e, \"preupload:malloc_host\");\n"));
+    ASSERT_EQ(1, (int)failureCensus(oneLine, amaze).size());
+    // Mutation 5: an AMaZE note after its block closes.
+    const QString amazeAfter = replacedOnce(amaze,
+        QStringLiteral("    if (rc != cudaSuccess)\n    {\n        IGPU_CUDA_ERROR_NOTE(rc, \"gl_r16_in:map\");\n"),
+        QStringLiteral("    IGPU_CUDA_ERROR_NOTE(rc, \"gl_r16_in:map\");\n    if (rc != cudaSuccess)\n    {\n"));
+    ASSERT_EQ(1, (int)failureCensus(recon, amazeAfter).size());
+    // Mutation 6: a success-arm note (the if tests == cudaSuccess, the note is not in its else).
+    const QString successArm = replacedOnce(recon,
+        QStringLiteral("    if (e == cudaSuccess) {\n        slot->bytes = input_bytes;\n"),
+        QStringLiteral("    if (e == cudaSuccess) {\n        IGPU_CUDA_ERROR_NOTE(e, \"preupload:success_arm\");\n        slot->bytes = input_bytes;\n"));
+    ASSERT_TRUE(failureCensus(successArm, amaze).join(QStringLiteral("; ")).contains(QStringLiteral("recon notes 16 != 15")));
+    ASSERT_EQ(2, (int)failureCensus(successArm, amaze).size());
+}
+
+// r3 H4 (both keys, exit join): the System-log read ends inside the session-end wait, quit is held
+// for at most ~2 s, the worker stops before each step, and State outlives a worker session end
+// gave up on. EvtNext waits are a value table, not a timing claim.
+TEST(GpuFieldTelemetry, SystemLogDeadlineEndsInsideTheSessionEndWait)
+{
+    ASSERT_TRUE(core::kSystemLogDeadlineMs < core::kSessionEndWaitMs);
+    ASSERT_TRUE(core::kSessionEndWaitMs <= 2000);
+    struct Case { long long remaining; unsigned long wait; };
+    const Case cases[] = {{-1, 0}, {0, 0}, {1, 1}, {999, 999}, {1000, 1000}, {1500, 1000}, {60000, 1000}};
+    for (const Case & c : cases) ASSERT_EQ(c.wait, core::evtNextWaitMs(c.remaining));
+}
+
+QStringList exitJoinCensus(const QString & source)
+{
+    QStringList missing;
+    const char * required[] = {
+        // State and the write mutex are never destroyed.
+        "State & state()\n{\n    static State * s = new State();\n    return *s;\n}",
+        "    static QMutex * m = new QMutex();",
+        // Session end sets the stop flag, waits once, and skips the final write if the wait expired.
+        "    g_workerStop.store(true);",
+        "    if (g_workerPoolCreated.load() && !workerPool()->waitForDone(static_cast<int>(core::kSessionEndWaitMs)))\n        return;",
+        "    flushImpl(\"session_end\", true, false,\n              remainingMs < core::kSystemLogDeadlineMs ? remainingMs : core::kSystemLogDeadlineMs);",
+        // The worker checks the flag before each step.
+        "        if (!waitUnlessShuttingDown(delayMs)) return; // session_end writes it instead\n        if (workerStopped(true)) return;",
+        "        flushImpl(\"after_fault\", true, true);",
+        "[]() { flushImpl(\"recovery\", false, true); }",
+        // The System-log read is bounded by its deadline and stops at session end.
+        "        const DWORD waitMs = core::evtNextWaitMs(deadline.remainingTime());",
+        "        if (workerStopped(onWorker))\n        {\n            r.status = \"interrupted\";",
+    };
+    for (const char * r : required)
+        if (!source.contains(QString::fromLatin1(r))) missing << QString::fromLatin1(r).left(60);
+    if (source.count(QStringLiteral("    if (workerStopped(onWorker)) return;")) != 3)
+        missing << QStringLiteral("flushImpl stop checks != 3");
+    if (source.contains(QStringLiteral("static State s;"))) missing << QStringLiteral("function-static State");
+    return missing;
+}
+
+TEST(GpuFieldTelemetry, SessionEndJoinsTheWorkerOrSkipsTheFinalWrite)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/GpuFieldTelemetry.cpp"));
+    ASSERT_EQ(std::string(), exitJoinCensus(source).join(QStringLiteral("; ")).toStdString());
+    // Mutations: the r1 shape of each piece is reported.
+    const QString ignoredWait = replacedOnce(source,
+        QStringLiteral("    if (g_workerPoolCreated.load() && !workerPool()->waitForDone(static_cast<int>(core::kSessionEndWaitMs)))\n        return;"),
+        QStringLiteral("    if (g_workerPoolCreated.load()) workerPool()->waitForDone(static_cast<int>(core::kSessionEndWaitMs));"));
+    ASSERT_EQ(1, (int)exitJoinCensus(ignoredWait).size());
+    const QString staticState = replacedOnce(source,
+        QStringLiteral("    static State * s = new State();\n    return *s;"), QStringLiteral("    static State s;\n    return s;"));
+    ASSERT_EQ(2, (int)exitJoinCensus(staticState).size());
+    const QString noStepCheck = replacedOnce(source,
+        QStringLiteral("    const std::string cudaModel = reconDescribe();\n    if (workerStopped(onWorker)) return;\n"),
+        QStringLiteral("    const std::string cudaModel = reconDescribe();\n"));
+    ASSERT_EQ(1, (int)exitJoinCensus(noStepCheck).size());
 }

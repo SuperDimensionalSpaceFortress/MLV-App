@@ -323,6 +323,9 @@ void llrpSetGpuReconEventLogger(llrpGpuReconEventLogger_t logger);
  * are 0/NULL. On rc != 0, ms is -1 and cuda_code/cuda_name/site come from the
  * DLL's optional igpu_recon_last_cuda_error, only when it noted a code since the
  * previous query (otherwise 0/NULL: a validation failure, not a CUDA fault).
+ * A failed async preupload (llrpGpuPlaybackReconPreuploadFrame) is reported as
+ * "recon:preupload" on the preupload's own thread, failure only; its "no free
+ * slot" back-pressure return is not reported unless a CUDA code was noted.
  * NULL uninstalls; with no sink the cost is one pointer test per call. */
 typedef void (*llrpGpuStageTelemetrySink_t)(const char * stage, int rc, double ms,
                                             int cuda_code, const char * cuda_name,

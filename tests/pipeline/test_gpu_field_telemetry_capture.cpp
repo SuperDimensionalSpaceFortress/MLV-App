@@ -19,10 +19,29 @@
 extern "C" int llrpInstallFakeGpuPlaybackReconBackendForTesting(int install);
 extern "C" int llrpResetGpuExportBackendForTesting(void);
 extern "C" void llrpFakeGpuBackendInjectRunFailureForTesting(int rc, int cuda_code, const char * name);
+extern "C" void llrpFakeGpuBackendInjectPreuploadFailureForTesting(int rc, int cuda_code, const char * name);
 
 namespace
 {
 const bool kTelemetryOffForThisBinary = qputenv("MLVAPP_GPU_TELEMETRY", QByteArrayLiteral("0"));
+
+class AsyncH2dOnScope
+{
+    QByteArray saved;
+    bool hadSaved;
+public:
+    AsyncH2dOnScope()
+    {
+        hadSaved = qEnvironmentVariableIsSet("MLVAPP_GPU_PLAYBACK_RECON_ASYNC_H2D");
+        if (hadSaved) saved = qgetenv("MLVAPP_GPU_PLAYBACK_RECON_ASYNC_H2D");
+        qputenv("MLVAPP_GPU_PLAYBACK_RECON_ASYNC_H2D", "1");
+    }
+    ~AsyncH2dOnScope()
+    {
+        if (hadSaved) qputenv("MLVAPP_GPU_PLAYBACK_RECON_ASYNC_H2D", saved);
+        else qunsetenv("MLVAPP_GPU_PLAYBACK_RECON_ASYNC_H2D");
+    }
+};
 
 struct SinkCall
 {
@@ -88,7 +107,95 @@ int runOnce(uint64_t frameId, int * rcOut)
     return llrpGpuPlaybackReconRunCpu16Probe(&state, input.data(), input.size() * sizeof(uint16_t),
                                              output.data(), rcOut, &timing);
 }
+
+// The async H2D preupload of the bytes runOnce renders (non-zero = accepted).
+int preuploadOnce(uint64_t frameId)
+{
+    const std::vector<uint16_t> input(16, 100);
+    return llrpGpuPlaybackReconPreuploadFrame(frameId, input.data(), input.size() * sizeof(uint16_t));
+}
 } // namespace
+
+// r3 B2 (sol): an async preupload that fails with a CUDA code (here cudaErrorMemoryAllocation,
+// as preupload:malloc_device would) reaches the sink from the preupload call itself, attributed to
+// "recon:preupload", even though the render that follows succeeds on the synchronous path and never
+// reads the slot as a failure. The code is attributed once: the render does not repeat it.
+TEST(GpuFieldTelemetryCapture, PreuploadFailureReachesTheSinkWhileRenderSucceeds)
+{
+    const FakeGpuBackendScope fake;
+    const AsyncH2dOnScope asyncH2d;
+    const SinkScope sink;
+    int rc = -99;
+    ASSERT_NE(0, runOnce(1, &rc)); // configures the clip, as the first played frame does
+    ASSERT_EQ(0, rc);
+
+    // A successful preupload emits nothing (no new work on the success path).
+    g_calls.clear();
+    ASSERT_NE(0, preuploadOnce(2));
+    ASSERT_EQ(0, (int)g_calls.size());
+    ASSERT_NE(0, runOnce(2, &rc));
+    ASSERT_EQ(0, rc);
+
+    g_calls.clear();
+    llrpFakeGpuBackendInjectPreuploadFailureForTesting(-1, 2, "cudaErrorMemoryAllocation");
+    ASSERT_EQ(0, preuploadOnce(3));
+    ASSERT_EQ(1, (int)g_calls.size());
+    ASSERT_EQ(std::string("recon:preupload"), g_calls[0].stage);
+    ASSERT_EQ(-1, g_calls[0].rc);
+    ASSERT_NEAR(-1.0, g_calls[0].ms, 1e-12);
+    ASSERT_EQ(2, g_calls[0].cudaCode);
+    ASSERT_EQ(std::string("cudaErrorMemoryAllocation"), g_calls[0].cudaName);
+    ASSERT_EQ(std::string("fake:preupload"), g_calls[0].site);
+
+    // The render of that frame succeeds (the preupload was not taken) and reports success only.
+    g_calls.clear();
+    ASSERT_NE(0, runOnce(3, &rc));
+    ASSERT_EQ(0, rc);
+    ASSERT_EQ(1, (int)g_calls.size());
+    ASSERT_EQ(std::string("recon:run"), g_calls[0].stage);
+    ASSERT_EQ(0, g_calls[0].rc);
+    ASSERT_EQ(0, g_calls[0].cudaCode);
+
+    // A later failed render does not inherit the preupload's code: the slot did not move again.
+    g_calls.clear();
+    llrpFakeGpuBackendInjectRunFailureForTesting(3, 0, nullptr);
+    ASSERT_EQ(0, runOnce(4, &rc));
+    ASSERT_EQ(1, (int)g_calls.size());
+    ASSERT_EQ(3, g_calls[0].rc);
+    ASSERT_EQ(0, g_calls[0].cudaCode);
+
+    // A validation failure (rc -1, no CUDA code) is still reported, with cuda_code 0.
+    g_calls.clear();
+    llrpFakeGpuBackendInjectPreuploadFailureForTesting(-1, 0, nullptr);
+    ASSERT_EQ(0, preuploadOnce(5));
+    ASSERT_EQ(1, (int)g_calls.size());
+    ASSERT_EQ(std::string("recon:preupload"), g_calls[0].stage);
+    ASSERT_EQ(0, g_calls[0].cudaCode);
+
+    // "No free slot" (rc 4) is back-pressure, not a fault: nothing, unless a CUDA code was noted.
+    g_calls.clear();
+    llrpFakeGpuBackendInjectPreuploadFailureForTesting(4, 0, nullptr);
+    ASSERT_EQ(0, preuploadOnce(6));
+    ASSERT_EQ(0, (int)g_calls.size());
+    llrpFakeGpuBackendInjectPreuploadFailureForTesting(4, 709, "cudaErrorContextIsDestroyed");
+    ASSERT_EQ(0, preuploadOnce(7));
+    ASSERT_EQ(1, (int)g_calls.size());
+    ASSERT_EQ(709, g_calls[0].cudaCode);
+}
+
+// With no sink installed a failed preupload is unchanged and calls nothing.
+TEST(GpuFieldTelemetryCapture, PreuploadFailureWithNoSinkCallsNothing)
+{
+    const FakeGpuBackendScope fake;
+    const AsyncH2dOnScope asyncH2d;
+    llrpSetGpuStageTelemetrySink(nullptr);
+    g_calls.clear();
+    int rc = -99;
+    ASSERT_NE(0, runOnce(1, &rc));
+    llrpFakeGpuBackendInjectPreuploadFailureForTesting(-1, 2, "cudaErrorMemoryAllocation");
+    ASSERT_EQ(0, preuploadOnce(2));
+    ASSERT_EQ(0, (int)g_calls.size());
+}
 
 TEST(GpuFieldTelemetryCapture, InjectedLaunchTimeoutReachesTheSinkWithItsCode)
 {
