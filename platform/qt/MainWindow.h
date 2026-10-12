@@ -33,6 +33,7 @@
 #include "SessionModel.h"
 #include "PlaybackFrameRange.h"
 #include "PlaybackNativePaceGuard.h"
+#include "PlaybackPaceAwareLookahead.h"
 #include "PlaybackPrepPresentationPolicy.h"
 #include "PlaybackSlipHistogram.h"
 #include "../../src/mlv_include.h"
@@ -1162,6 +1163,18 @@ private:
     uint64_t m_playbackLookaheadPruned = 0;
     uint64_t m_playbackLookaheadRequestsIssued = 0;
     uint64_t m_playbackLookaheadCoveredRequests = 0;
+    // PLAYBACK-CPU-PACE-AWARE-LOOKAHEAD-1: how far ahead offset 1 was queued (the prune span grows with it), the frame
+    // it rendered and the request it came from (resolved as a hit or a miss at the next target), and the smoke
+    // session's prediction counters (CPU route, drop-frame on; with MLVAPP_CPU_LOOKAHEAD_PREDICT=0 they score N+1).
+    int m_playbackLookaheadLeadDistance = 1;
+    int m_playbackLookaheadPredictedFrame = -1;
+    int m_playbackLookaheadPredictedOrigin = -1;
+    uint64_t m_playbackLookaheadPredictions = 0;
+    uint64_t m_playbackLookaheadPredictedHits = 0;
+    uint64_t m_playbackLookaheadPredictFallbacks = 0;
+    uint64_t m_playbackLookaheadPredictedOffsetHist[playback_overlap::kMaxLookaheadFrames] = {};
+    playback_pace_lookahead::LookaheadPlan cpuPlaybackLookaheadPlan() const;
+    int playbackLookaheadPruneSpan() const;
     int playbackRenderLookaheadFrames() const;
     int currentPlaybackAdvanceTarget();
     bool renderThreadBusyForPlaybackAdvance( int activePlaybackTarget );
@@ -1628,7 +1641,8 @@ private:
         bool useGpuBilinearDebayer,
         bool useGpuAmazeDebayer,
         const RenderFrameThread::PresentationPreparationOptions &presentationPreparation,
-        int requestedFrame );
+        int requestedFrame,
+        bool expectPendingAdvance );
     void computeDisplaySceneGeometry( int sourceWidth,
                                       int sourceHeight,
                                       bool zoomFitEnabled,

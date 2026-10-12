@@ -124,47 +124,9 @@ qint64 stagePixelCount( int width, int height )
     return static_cast<qint64>( width ) * static_cast<qint64>( height );
 }
 
-bool playbackFrameWithinLookaheadWindow( uint32_t frameNumber,
-                                         int activePlaybackTarget,
-                                         int cutInFrame,
-                                         int cutOutFrame,
-                                         int lookaheadDepth,
-                                         bool loopEnabled )
-{
-    if( activePlaybackTarget < 0 || lookaheadDepth < 0 ) return true;
-
-    const int frame = static_cast<int>( frameNumber );
-    const int depth = std::max( 0, lookaheadDepth );
-    if( frame == activePlaybackTarget ) return true;
-
-    if( cutOutFrame < cutInFrame )
-    {
-        return frame >= activePlaybackTarget
-            && frame <= activePlaybackTarget + depth;
-    }
-
-    const int cutIn = std::max( 0, cutInFrame );
-    const int cutOut = std::max( cutIn, cutOutFrame );
-    if( activePlaybackTarget < cutIn || activePlaybackTarget > cutOut
-     || frame < cutIn || frame > cutOut )
-    {
-        return frame >= activePlaybackTarget
-            && frame <= activePlaybackTarget + depth;
-    }
-
-    if( !loopEnabled )
-    {
-        return frame >= activePlaybackTarget
-            && frame <= std::min( cutOut, activePlaybackTarget + depth );
-    }
-
-    const int loopSpan = cutOut - cutIn + 1;
-    if( loopSpan <= 0 ) return frame == activePlaybackTarget;
-
-    int distance = frame - activePlaybackTarget;
-    if( distance < 0 ) distance += loopSpan;
-    return distance >= 0 && distance <= depth;
-}
+// Moved to PlaybackPaceAwareLookahead.h (PLAYBACK-CPU-PACE-AWARE-LOOKAHEAD-1), where the yield's in-flight release
+// decision reuses it.
+using playback_pace_lookahead::playbackFrameWithinLookaheadWindow;
 
 bool isGpuPlaybackReconTimingTelemetryKey( const QString &key )
 {
@@ -959,6 +921,7 @@ void RenderFrameThread::init(mlvObject_t *pMlvObject, int imageWidth, int imageH
     m_reconRequests.clear();
     m_decodeReadySlots.clear();
     m_processReadySlots.clear();
+    m_lookaheadYieldWindow = playback_pace_lookahead::ForwardWindow();
     m_decodeWorkerStop = false;
     m_reconWorkerStop = false;
     m_pMlvObject = pMlvObject;
@@ -1216,6 +1179,60 @@ bool RenderFrameThread::isIdleExceptPlaybackLookahead( int activePlaybackTarget,
 void RenderFrameThread::resetPipelineOverlapMeter( void )
 {
     m_overlapMeter.reset( mlv_stage_timing_now() * 1000.0 );
+    m_lookaheadAbandonedInflight.store( 0, std::memory_order_relaxed );
+}
+
+uint64_t RenderFrameThread::playbackLookaheadAbandonedInflightCount( void ) const
+{
+    return m_lookaheadAbandonedInflight.load( std::memory_order_relaxed );
+}
+
+// PLAYBACK-CPU-PACE-AWARE-LOOKAHEAD-1 yield (b): a lookahead the GUI's forward window has left (or of an older
+// generation) is released at a stage hand-off, its slot back to Idle, so it never takes the recon worker or the
+// render thread from the frame that is shown. Only when the yield is on; the target is always inside the window.
+bool RenderFrameThread::abandonStaleLookaheadSlotLocked( int slotIndex )
+{
+    if( !m_lookaheadYieldWindow.active ) return false;
+    if( slotIndex < 0 || slotIndex >= static_cast<int>( m_frameSlots.size() ) ) return false;
+    const FrameSlot &slot = m_frameSlots[slotIndex];
+    if( !playback_pace_lookahead::abandonInFlightLookahead( m_lookaheadYieldWindow,
+                                                            slot.presentationContext.playbackLookaheadRequest,
+                                                            slot.presentationContext.presentationGeneration,
+                                                            slot.frameNumber ) )
+    {
+        return false;
+    }
+    releaseSlotLocked( slotIndex );
+    m_lookaheadAbandonedInflight.fetch_add( 1, std::memory_order_relaxed );
+    m_reconWaitCondition.wakeAll();   // a gated lookahead recon may start now that less render work is pending
+    m_waitCondition.wakeAll();        // a slot is free
+    return true;
+}
+
+void RenderFrameThread::abandonStaleLookaheadsInQueueLocked( std::deque<int> &slotQueue )
+{
+    for( auto it = slotQueue.begin(); it != slotQueue.end(); )
+    {
+        if( abandonStaleLookaheadSlotLocked( *it ) ) it = slotQueue.erase( it );
+        else ++it;
+    }
+}
+
+// The yield's recon pick: stale lookaheads released, then the first non-lookahead entry under today's gate, else
+// the first lookahead entry under the exclusive start. -1 waits.
+int RenderFrameThread::yieldReconTakeIndexLocked( bool exclusive )
+{
+    for( auto it = m_reconRequests.begin(); it != m_reconRequests.end(); )
+    {
+        if( abandonStaleLookaheadSlotLocked( it->slotIndex ) ) it = m_reconRequests.erase( it );
+        else ++it;
+    }
+    const bool renderWorkPending = !m_processReadySlots.empty();
+    return playback_pace_lookahead::targetFirstIndex(
+        m_reconRequests,
+        []( const ReconQueueEntry &entry ) { return entry.request.presentationContext.playbackLookaheadRequest; },
+        playback_pace_lookahead::reconMayStartFor( false, true, exclusive, m_renderingFrame, renderWorkPending ),
+        playback_pace_lookahead::reconMayStartFor( true, true, exclusive, m_renderingFrame, renderWorkPending ) );
 }
 
 playback_overlap::OverlapSnapshot RenderFrameThread::pipelineOverlapSnapshot( void )
@@ -1489,9 +1506,21 @@ int RenderFrameThread::prunePlaybackLookaheadOutsideForwardWindow(
     int cutInFrame,
     int cutOutFrame,
     int lookaheadDepth,
-    bool loopEnabled )
+    bool loopEnabled,
+    bool cpuRouteYield )
 {
     QMutexLocker locker(&m_mutex);
+    // PLAYBACK-CPU-PACE-AWARE-LOOKAHEAD-1: the hand-offs judge in-flight lookaheads against this window.
+    const bool yieldWasActive = m_lookaheadYieldWindow.active;
+    m_lookaheadYieldWindow.active = cpuRouteYield;
+    m_lookaheadYieldWindow.generation = activeGeneration;
+    m_lookaheadYieldWindow.target = activePlaybackTarget;
+    m_lookaheadYieldWindow.cutInFrame = cutInFrame;
+    m_lookaheadYieldWindow.cutOutFrame = cutOutFrame;
+    m_lookaheadYieldWindow.span = lookaheadDepth;
+    m_lookaheadYieldWindow.loop = loopEnabled;
+    // A recon worker waiting on a lookahead re-reads the window (it may now be stale, or the gate may have changed).
+    if( cpuRouteYield || yieldWasActive ) m_reconWaitCondition.wakeAll();
     int pruned = 0;
     for( auto it = m_renderRequests.begin(); it != m_renderRequests.end(); )
     {
@@ -2143,7 +2172,11 @@ void RenderFrameThread::signalDecodeDoneFromWorker( int slotIndex )
                 mlv_stage_timing_now() );
         }
         const RenderRequest request = m_frameSlots[slotIndex].queuedRequest;
-        if( request.phase3Mode == Phase3Mode::DecodeReconProcess )
+        if( m_lookaheadYieldWindow.active && abandonStaleLookaheadSlotLocked( slotIndex ) )
+        {
+            // PLAYBACK-CPU-PACE-AWARE-LOOKAHEAD-1: the decode -> recon hand-off releases a stale lookahead.
+        }
+        else if( request.phase3Mode == Phase3Mode::DecodeReconProcess )
         {
             m_reconRequests.push_back( { slotIndex, request } );
             m_reconWaitCondition.wakeOne();
@@ -2161,20 +2194,27 @@ bool RenderFrameThread::takeReconRequestForWorker( ReconQueueEntry *entry )
     QMutexLocker locker( &m_mutex );
     const bool exclusive = playbackOverlapReconExclusiveEnabled();
     bool heldForRender = false;
+    // PLAYBACK-CPU-PACE-AWARE-LOOKAHEAD-1: with the yield on, the pick is target-first (yieldReconTakeIndexLocked);
+    // otherwise the FIFO front under today's gate.
+    int takeIndex = 0;
     while( !m_reconWorkerStop && !m_stop
         && ( m_reconRequests.empty()
-          || !playback_overlap::reconMayStart( exclusive,
-                                               m_renderingFrame,
-                                               !m_processReadySlots.empty() ) ) )
+          || ( m_lookaheadYieldWindow.active
+                 ? ( takeIndex = yieldReconTakeIndexLocked( exclusive ) ) < 0
+                 : !playback_overlap::reconMayStart( exclusive,
+                                                     m_renderingFrame,
+                                                     !m_processReadySlots.empty() ) ) ) )
     {
         if( !m_reconRequests.empty() ) heldForRender = true;
+        takeIndex = 0;
         m_reconWaitCondition.wait( &m_mutex );
     }
     if( m_reconWorkerStop || m_stop ) return false;
     if( m_reconRequests.empty() ) return false;
-    const int takenSlotIndex = m_reconRequests.front().slotIndex;
-    if( entry ) *entry = m_reconRequests.front();
-    m_reconRequests.pop_front();
+    const auto taken = m_reconRequests.begin() + takeIndex;
+    const int takenSlotIndex = taken->slotIndex;
+    if( entry ) *entry = *taken;
+    m_reconRequests.erase( taken );
     if( heldForRender ) m_overlapMeter.noteReconHeldForRender();
     m_overlapMeter.upstreamBegin( mlv_stage_timing_now() * 1000.0,
                                   downstreamFrameInFlightLocked( takenSlotIndex ),
@@ -2843,7 +2883,9 @@ void RenderFrameThread::signalReconDoneFromWorker( int slotIndex )
                 QStringLiteral("phase3_process_ready_signal_stage_time"),
                 mlv_stage_timing_now() );
         }
-        m_processReadySlots.push_back( slotIndex );
+        // PLAYBACK-CPU-PACE-AWARE-LOOKAHEAD-1: the recon -> process hand-off releases a stale lookahead.
+        if( !( m_lookaheadYieldWindow.active && abandonStaleLookaheadSlotLocked( slotIndex ) ) )
+            m_processReadySlots.push_back( slotIndex );
     }
     m_waitCondition.wakeAll();
 }
@@ -2876,8 +2918,17 @@ int RenderFrameThread::waitForProcessReadySlotLocked( void )
         m_waitCondition.wait( &m_mutex );
     }
     if( m_stop ) return -1;
-    const int slotIndex = m_processReadySlots.front();
-    m_processReadySlots.pop_front();
+    // PLAYBACK-CPU-PACE-AWARE-LOOKAHEAD-1 yield (a): the shown frame is processed before any lookahead.
+    int takeIndex = 0;
+    if( m_lookaheadYieldWindow.active )
+    {
+        takeIndex = playback_pace_lookahead::targetFirstIndex(
+            m_processReadySlots,
+            [this]( int queued ) { return m_frameSlots[queued].presentationContext.playbackLookaheadRequest; },
+            true, true );
+    }
+    const int slotIndex = m_processReadySlots[takeIndex];
+    m_processReadySlots.erase( m_processReadySlots.begin() + takeIndex );
     if( slotIndex >= 0 && slotIndex < static_cast<int>( m_frameSlots.size() ) )
     {
         if( playbackSmokeTimelineTelemetryEnabled() )
@@ -3134,6 +3185,8 @@ void RenderFrameThread::runPhase3( void )
         int slotIndex = -1;
         RenderRequest request;
         Phase3Mode activePhase3Mode = Phase3Mode::Disabled;
+        // PLAYBACK-CPU-PACE-AWARE-LOOKAHEAD-1: a process-ready lookahead the window has left never takes the thread.
+        if( m_lookaheadYieldWindow.active ) abandonStaleLookaheadsInQueueLocked( m_processReadySlots );
         if( !m_processReadySlots.empty() )
         {
             slotIndex = waitForProcessReadySlotLocked();
@@ -3724,6 +3777,17 @@ void RenderFrameThread::releaseSlotLocked( int slotIndex )
                              slot.frameNumber,
                              slot.requestSerial,
                              "phase3-released-ready" );
+    }
+    else if( state == SlotState::Decoded || state == SlotState::ProcessReady )
+    {
+        // PLAYBACK-CPU-PACE-AWARE-LOOKAHEAD-1: a stale lookahead released at a stage hand-off (abandonStaleLookaheadSlotLocked).
+        transitionSlotState( slotIndex,
+                             state,
+                             SlotState::Idle,
+                             slot.phase3Mode,
+                             slot.frameNumber,
+                             slot.requestSerial,
+                             "phase3-abandoned-lookahead" );
     }
     else if( state != SlotState::Idle )
     {

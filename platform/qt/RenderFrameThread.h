@@ -18,6 +18,7 @@
 #include "Debayered16ReconReusePolicy.h"
 #include "Phase3Mode.h"
 #include "PlaybackDecodeRenderOverlap.h"
+#include "PlaybackPaceAwareLookahead.h"
 #include "PlaybackScaling.h"
 
 #include <array>
@@ -384,12 +385,18 @@ public:
                                          uint64_t activeGeneration );
     bool hasReadyPlaybackFrame( uint32_t frameNumber,
                                 uint64_t activeGeneration );
+    /* PLAYBACK-CPU-PACE-AWARE-LOOKAHEAD-1: \a cpuRouteYield turns on the yield rules for this window (target-first
+     * recon and process picks, stale in-flight lookaheads released at the stage hand-offs, lookahead-only exclusive
+     * recon start); the window is kept for those hand-offs. */
     int prunePlaybackLookaheadOutsideForwardWindow( int activePlaybackTarget,
                                                     uint64_t activeGeneration,
                                                     int cutInFrame,
                                                     int cutOutFrame,
                                                     int lookaheadDepth,
-                                                    bool loopEnabled );
+                                                    bool loopEnabled,
+                                                    bool cpuRouteYield = false );
+    /* In-flight lookaheads released by the yield since resetPipelineOverlapMeter(). */
+    uint64_t playbackLookaheadAbandonedInflightCount( void ) const;
     int cancelPlaybackPresentationRequests( uint64_t presentationGeneration );
     void releasePresentedFrame( void );
     void releasePresentedFrameForRequestSerial( uint64_t requestSerial );
@@ -689,6 +696,12 @@ private:
     std::deque<ReconQueueEntry> m_reconRequests;
     std::deque<int> m_decodeReadySlots;
     std::deque<int> m_processReadySlots;
+    // PLAYBACK-CPU-PACE-AWARE-LOOKAHEAD-1: the GUI's last forward window (under m_mutex); active = the yield is on.
+    playback_pace_lookahead::ForwardWindow m_lookaheadYieldWindow;
+    std::atomic<uint64_t> m_lookaheadAbandonedInflight{ 0 };
+    bool abandonStaleLookaheadSlotLocked( int slotIndex );
+    void abandonStaleLookaheadsInQueueLocked( std::deque<int> &slotQueue );
+    int yieldReconTakeIndexLocked( bool exclusive );
     QWaitCondition m_decodeWaitCondition;
     QWaitCondition m_reconWaitCondition;
 

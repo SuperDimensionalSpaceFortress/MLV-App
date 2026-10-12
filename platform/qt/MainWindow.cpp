@@ -2553,6 +2553,25 @@ static bool mlvappCpuPlaybackLookaheadDisabled()
     return disabled;
 }
 
+// PLAYBACK-CPU-PACE-AWARE-LOOKAHEAD-1 bisect switches, on unless set to 0: MLVAPP_CPU_LOOKAHEAD_PREDICT=0 renders N+1
+// again, MLVAPP_CPU_LOOKAHEAD_YIELD=0 turns the render-thread yield off.
+static bool mlvappEnvSwitchOn( const char *name )
+{
+    return !qEnvironmentVariableIsSet( name ) || qEnvironmentVariable( name ).trimmed() != QStringLiteral("0");
+}
+
+static bool mlvappCpuLookaheadPredictEnabled()
+{
+    static const bool enabled = mlvappEnvSwitchOn( "MLVAPP_CPU_LOOKAHEAD_PREDICT" );
+    return enabled;
+}
+
+static bool mlvappCpuLookaheadYieldEnabled()
+{
+    static const bool enabled = mlvappEnvSwitchOn( "MLVAPP_CPU_LOOKAHEAD_YIELD" );
+    return enabled;
+}
+
 // PLAYBACK-DECODE-RENDER-OVERLAP-1: the lookahead is on by default on the CUDA texture route, so the
 // decode + dual-ISO of N+1 runs while N renders and presents (two frames in flight, not one).
 // PLAYBACK-CPU-PACE-GAP-1: and at depth 1 on the CPU route when its default is admitted (s2/s4).
@@ -2561,6 +2580,23 @@ int MainWindow::playbackRenderLookaheadFrames() const
     return playback_overlap::effectiveLookaheadFrames( mlvappPlaybackRenderLookaheadEnvFrames(),
                                                        m_playbackLookaheadTextureRouteAdmitted,
                                                        m_playbackLookaheadCpuRouteDefaultAdmitted );
+}
+
+// PLAYBACK-CPU-PACE-AWARE-LOOKAHEAD-1: the last drawFrame() request's route decides (the texture route keeps N+1 and FIFO).
+playback_pace_lookahead::LookaheadPlan MainWindow::cpuPlaybackLookaheadPlan() const
+{
+    return playback_pace_lookahead::cpuLookaheadPlan(
+        playbackRenderLookaheadFrames(),
+        m_playbackLookaheadTextureRouteAdmitted || !m_playbackLookaheadCpuRouteEligible,
+        ui->actionDropFrameMode->isChecked(),
+        mlvappCpuLookaheadPredictEnabled(),
+        mlvappCpuLookaheadYieldEnabled() );
+}
+
+// The forward window keeps every lookahead queued: offset 1 is m_playbackLookaheadLeadDistance ahead (1 unless predicted).
+int MainWindow::playbackLookaheadPruneSpan() const
+{
+    return playbackRenderLookaheadFrames() + m_playbackLookaheadLeadDistance - 1;
 }
 
 int MainWindow::currentPlaybackAdvanceTarget()
@@ -3543,7 +3579,8 @@ void MainWindow::queuePlaybackLookaheadRequests(
     bool useGpuBilinearDebayer,
     bool useGpuAmazeDebayer,
     const RenderFrameThread::PresentationPreparationOptions &presentationPreparation,
-    int requestedFrame )
+    int requestedFrame,
+    bool expectPendingAdvance )
 {
     const int depth = playbackRenderLookaheadFrames();
     if( depth <= 0 ) return;
@@ -3565,9 +3602,43 @@ void MainWindow::queuePlaybackLookaheadRequests(
         qBound( cutInFrame, ui->spinBoxCutOut->value() - 1, totalFrames - 1 );
     const int loopSpan = cutOutFrame - cutInFrame + 1;
 
+    // PLAYBACK-CPU-PACE-AWARE-LOOKAHEAD-1: on the CPU route with drop-frame on, offset 1 renders the drop target the
+    // pace clock picks next (predicted on a COPY of m_playbackPaceGuard; playbackHandling() is never run ahead) and
+    // offsets 2..depth follow it. The texture route and drop-frame off keep N+1..N+depth.
+    const playback_pace_lookahead::LookaheadPlan lookaheadPlan = cpuPlaybackLookaheadPlan();
+    const bool cpuRouteDropFrame = !textureRouteAdmitsLookahead && ui->actionDropFrameMode->isChecked();
+    if( cpuRouteDropFrame && m_playbackLookaheadPredictedFrame >= 0
+     && requestedFrame != m_playbackLookaheadPredictedOrigin )
+    {
+        if( requestedFrame == m_playbackLookaheadPredictedFrame ) ++m_playbackLookaheadPredictedHits;
+        m_playbackLookaheadPredictedFrame = -1;
+    }
+    int leadFrame = requestedFrame + 1;
+    bool leadFallback = true;
+    if( lookaheadPlan.predict )
+    {
+        const playback_pace_lookahead::Prediction prediction = playback_pace_lookahead::predictNextDropTarget(
+            m_newPosDropMode, m_playbackPaceGuard, mlv_stage_timing_now() * 1000.0, m_playbackFpsEmaFrameMs,
+            getFramerate(), expectPendingAdvance, cutInFrame + 1, cutOutFrame + 1, ui->actionLoop->isChecked(),
+            requestedFrame );
+        leadFrame = prediction.frame;
+        leadFallback = prediction.fallback;
+    }
+    const int leadDistance = playback_pace_lookahead::lookaheadDistance(
+        requestedFrame, leadFrame, cutInFrame, cutOutFrame, ui->actionLoop->isChecked() );
+    m_playbackLookaheadLeadDistance = qBound( 1, leadDistance, playback_overlap::kMaxLookaheadFrames );
+    if( cpuRouteDropFrame )
+    {
+        m_playbackLookaheadPredictedFrame = leadFrame;
+        m_playbackLookaheadPredictedOrigin = requestedFrame;
+        ++m_playbackLookaheadPredictions;
+        ++m_playbackLookaheadPredictedOffsetHist[m_playbackLookaheadLeadDistance - 1];
+        if( lookaheadPlan.predict && leadFallback ) ++m_playbackLookaheadPredictFallbacks;
+    }
+
     for( int offset = 1; offset <= depth; ++offset )
     {
-        int lookaheadFrame = requestedFrame + offset;
+        int lookaheadFrame = leadFrame + offset - 1;
         if( lookaheadFrame > cutOutFrame )
         {
             if( !ui->actionLoop->isChecked() || loopSpan <= 0 ) break;
@@ -6765,8 +6836,9 @@ void MainWindow::drawFrame( bool updateTimecodeLabel )
                     requestContext.presentationGeneration,
                     cutInFrame,
                     cutOutFrame,
-                    playbackRenderLookaheadFrames(),
-                    ui->actionLoop->isChecked() );
+                    playbackLookaheadPruneSpan(),
+                    ui->actionLoop->isChecked(),
+                    cpuPlaybackLookaheadPlan().yield );
             if( prunedPlaybackLookahead > 0 )
                 m_playbackLookaheadPruned += static_cast<uint64_t>( prunedPlaybackLookahead );
             if( prunedPlaybackLookahead > 0 && interactiveTraceEnabled() )
@@ -6820,12 +6892,14 @@ void MainWindow::drawFrame( bool updateTimecodeLabel )
                         requestContext.presentationGeneration ) ),
                 true );
         }
+        // A READY hit presents without busy ticks, so the next advance is not capped by a pending flag.
         queuePlaybackLookaheadRequests( requestContext,
                                         renderOutputMode,
                                         m_renderThreadUsingGpuBilinearDebayer,
                                         m_renderThreadUsingGpuAmazeDebayer,
                                         presentationPreparation,
-                                        requestedFrame );
+                                        requestedFrame,
+                                        !playbackLookaheadReady );
         if( playbackLookaheadReady )
         {
             QTimer::singleShot( 0, this, &MainWindow::drawFrameReady );
@@ -6909,7 +6983,8 @@ void MainWindow::drawFrame( bool updateTimecodeLabel )
                                         m_renderThreadUsingGpuBilinearDebayer,
                                         m_renderThreadUsingGpuAmazeDebayer,
                                         presentationPreparation,
-                                        requestedFrame );
+                                        requestedFrame,
+                                        true );
 
         //Draw TimeCode
         if( updateTimecodeLabel && !m_tcModeDuration ) updateTimeCodeLabelForFrame( m_newPosDropMode );
@@ -6935,7 +7010,8 @@ void MainWindow::drawFrame( bool updateTimecodeLabel )
                                         m_renderThreadUsingGpuBilinearDebayer,
                                         m_renderThreadUsingGpuAmazeDebayer,
                                         presentationPreparation,
-                                        requestedFrame );
+                                        requestedFrame,
+                                        true );
 
         //Draw TimeCode
         if( updateTimecodeLabel && !m_tcModeDuration ) updateTimeCodeLabelForFrame( ui->horizontalSliderPosition->value() );
@@ -24323,6 +24399,10 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     m_playbackLookaheadCoveredRequests = 0;
     m_playbackLookaheadDroppedReady = 0;
     m_playbackLookaheadPruned = 0;
+    m_playbackLookaheadPredictions = 0;
+    m_playbackLookaheadPredictedHits = 0;
+    m_playbackLookaheadPredictFallbacks = 0;
+    for( uint64_t &count : m_playbackLookaheadPredictedOffsetHist ) count = 0;
     m_playbackDropOffAdvanceHold.resetCounters();
     for( uint64_t &count : m_playbackLookaheadCpuRouteRefusalCounts ) count = 0;
     if( m_pRenderThread ) m_pRenderThread->resetPipelineOverlapMeter();
@@ -27773,6 +27853,26 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                 .arg( cpuRefusalCounts.join( QLatin1Char(',') ) )
                 .arg( static_cast<qulonglong>( m_playbackLookaheadDroppedReady ) )
                 .arg( static_cast<qulonglong>( m_playbackLookaheadPruned ) )
+            // PLAYBACK-CPU-PACE-AWARE-LOOKAHEAD-1: the prediction (hit = the next target was offset 1's frame) and the
+            // yield's in-flight releases. lookahead_predict / _yield are the plan of the last request.
+            + QStringLiteral( " lookahead_predict=%1 lookahead_yield=%2 lookahead_predictions=%3 "
+                              "lookahead_predicted_hits=%4 lookahead_predicted_hit_rate=%5 "
+                              "lookahead_predict_fallbacks=%6 lookahead_predicted_offset_hist=%7/%8/%9 "
+                              "lookahead_abandoned_inflight=%10" )
+                .arg( bool01( cpuPlaybackLookaheadPlan().predict ) )
+                .arg( bool01( cpuPlaybackLookaheadPlan().yield ) )
+                .arg( static_cast<qulonglong>( m_playbackLookaheadPredictions ) )
+                .arg( static_cast<qulonglong>( m_playbackLookaheadPredictedHits ) )
+                .arg( m_playbackLookaheadPredictions > 0
+                          ? static_cast<double>( m_playbackLookaheadPredictedHits )
+                                / static_cast<double>( m_playbackLookaheadPredictions )
+                          : 0.0, 0, 'f', 4 )
+                .arg( static_cast<qulonglong>( m_playbackLookaheadPredictFallbacks ) )
+                .arg( static_cast<qulonglong>( m_playbackLookaheadPredictedOffsetHist[0] ) )
+                .arg( static_cast<qulonglong>( m_playbackLookaheadPredictedOffsetHist[1] ) )
+                .arg( static_cast<qulonglong>( m_playbackLookaheadPredictedOffsetHist[2] ) )
+                .arg( static_cast<qulonglong>(
+                    m_pRenderThread ? m_pRenderThread->playbackLookaheadAbandonedInflightCount() : 0 ) )
             // PLAYBACK-CPU-PACE-GAP-1 r3: drop-frame off holds the advance for the prep stage (PlaybackPrepPresentationPolicy.h).
             + QStringLiteral( " drop_off_lossless=%1 drop_off_advance_holds=%2 drop_off_hold_timeouts=%3" )
                 .arg( bool01( playbackPrepLosslessActive( true, ui->actionDropFrameMode->isChecked() ) ) )
@@ -28931,6 +29031,10 @@ void MainWindow::on_actionPlay_toggled(bool checked)
         checked ? "play-start" : "play-stop" );
     // PLAYBACK-CUDA-NATIVE-PACE-1: the pace clock re-arms at this Play's first engine tick.
     m_playbackPaceGuard.reset();
+    // PLAYBACK-CPU-PACE-AWARE-LOOKAHEAD-1: no prediction carries over from the last Play.
+    m_playbackLookaheadLeadDistance = 1;
+    m_playbackLookaheadPredictedFrame = -1;
+    m_playbackLookaheadPredictedOrigin = -1;
     logInteractionEvent(
         QStringLiteral("play.toggled.begin"),
         QStringLiteral("checked=%1 file_loaded=%2 position=%3 cut_in=%4 cut_out=%5 frame_changed=%6 still_drawing=%7 pending_advance=%8")
@@ -31043,8 +31147,9 @@ void MainWindow::drawFrameReady()
                     activeGeneration,
                     cutInFrame,
                     cutOutFrame,
-                    playbackRenderLookaheadFrames(),
-                    ui->actionLoop->isChecked() );
+                    playbackLookaheadPruneSpan(),
+                    ui->actionLoop->isChecked(),
+                    cpuPlaybackLookaheadPlan().yield );
             if( prunedPlaybackLookaheadBeforeAcquire > 0 )
                 m_playbackLookaheadPruned += static_cast<uint64_t>( prunedPlaybackLookaheadBeforeAcquire );
             if( prunedPlaybackLookaheadBeforeAcquire > 0 && interactiveTraceEnabled() )

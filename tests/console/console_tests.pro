@@ -73,6 +73,7 @@ SOURCES += \
     $$REPO_ROOT/tests/console/test_playback_native_pace_guard.cpp \
     $$REPO_ROOT/tests/console/test_playback_slip_histogram.cpp \
     $$REPO_ROOT/tests/console/test_playback_decode_render_overlap.cpp \
+    $$REPO_ROOT/tests/console/test_playback_pace_aware_lookahead.cpp \
     $$REPO_ROOT/tests/console/test_playback_swap_interval.cpp \
     $$REPO_ROOT/tests/console/test_cuda_launch_timing.cpp
 
@@ -111,6 +112,7 @@ HEADERS += \
     $$REPO_ROOT/platform/qt/PlaybackFpsMeterPolicy.h \
     $$REPO_ROOT/platform/qt/PlaybackDecodeRenderOverlap.h \
     $$REPO_ROOT/platform/qt/PlaybackNativePaceGuard.h \
+    $$REPO_ROOT/platform/qt/PlaybackPaceAwareLookahead.h \
     $$REPO_ROOT/platform/qt/PlaybackSwapInterval.h \
     $$REPO_ROOT/platform/qt/PlaybackSlipHistogram.h \
     $$REPO_ROOT/platform/qt/GpuTexturePresentAvailabilityPolicy.h \
