@@ -6140,11 +6140,6 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
         "drawFrameReady.present_to_finish",
         display_frame,
         ( mlv_stage_timing_now() - presentEndStageTime ) * 1000.0 );
-    // PLAYBACK-STARTUP-CATCHUP-BURST-1: this Play's first present has ended -- the pace clock starts now, so the
-    // wait for the first frame (render, first draw, audio start) is never repaid as a drop-frame jump. Until
-    // here the guard banks no more than the carry, which the early advance (drawFrameReady) already relied on.
-    if( ui->actionPlay->isChecked() )
-        m_playbackPaceGuard.notePresent( mlv_stage_timing_now() * 1000.0, getFramerate() );
     finishPresentedFrame( display_frame,
                           readyFrame,
                           task.requestContext,
@@ -6156,6 +6151,13 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
                           display_start,
                           useScopeSourceImage ? scopeSourceWidth : 0,
                           useScopeSourceImage ? scopeSourceHeight : 0 );
+    // PLAYBACK-STARTUP-CATCHUP-BURST-1: this Play's first present is completely done -- the pace clock starts now,
+    // so the wait for the first frame is never repaid as a drop-frame jump. On Bachelor CUDA the first frame's
+    // finish (first-present stamp, audio start) still blocks the GUI thread ~0.6 s after the texture is handed
+    // over (r3 venue leg: a clock started before finishPresentedFrame repaid 15 frames). Until here the guard
+    // banks no more than the carry, which the early advance (drawFrameReady) already relied on.
+    if( ui->actionPlay->isChecked() )
+        m_playbackPaceGuard.notePresent( mlv_stage_timing_now() * 1000.0, getFramerate() );
     m_frameStillDrawing = renderThreadBusyForPlaybackAdvance( currentPlaybackAdvanceTarget() );
 }
 

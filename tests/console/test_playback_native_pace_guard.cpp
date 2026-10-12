@@ -874,17 +874,20 @@ TEST(PlaybackNativePaceWiring, TheFirstPresentStartsThePaceClockWhenItsPresentEn
     const QString note = QStringLiteral(
         "m_playbackPaceGuard.notePresent( mlv_stage_timing_now() * 1000.0, getFramerate() );");
     // r3 venue legs (Bachelor CUDA): the first draw blocks the GUI thread ~1 s, so a clock started at the top of
-    // drawFrameReady banked the stall and repaid it as one 23-frame jump. It starts where the present ends.
+    // drawFrameReady banked the stall and repaid it as one 23-frame jump. It starts where the present is done.
     ASSERT_EQ(1, source.count(note));
     const QString present = bodyBetween(source, QStringLiteral("void MainWindow::presentPlaybackPreparedFrame("),
                                         QStringLiteral("void MainWindow::computeDisplaySceneGeometry("));
     ASSERT_FALSE(present.isEmpty());
-    const int presentToFinish = present.indexOf(QStringLiteral("\"drawFrameReady.present_to_finish\""));
-    const int noteAt = present.indexOf(note);
+    // after finishPresentedFrame returns: the first frame's finish (first-present stamp, audio start) blocks the
+    // GUI thread ~0.6 s more on Bachelor CUDA, and a clock started before it repaid that as a 15-frame jump
     const int finish = present.indexOf(QStringLiteral("    finishPresentedFrame( display_frame,"));
-    ASSERT_TRUE(presentToFinish >= 0);
-    ASSERT_TRUE(noteAt > presentToFinish);
-    ASSERT_TRUE(finish > noteAt);
+    const int noteAt = present.indexOf(note);
+    const int busy = present.lastIndexOf(QStringLiteral(
+        "    m_frameStillDrawing = renderThreadBusyForPlaybackAdvance( currentPlaybackAdvanceTarget() );"));
+    ASSERT_TRUE(finish >= 0);
+    ASSERT_TRUE(noteAt > finish);
+    ASSERT_TRUE(busy > noteAt);
     // the kill switch is read once and handed to the guard; the slip histogram owes the time since Play only then
     ASSERT_TRUE(source.contains(QStringLiteral(
         "static const bool requested = environmentFlagEnabled( \"MLVAPP_PLAYBACK_STARTUP_CATCHUP_LEGACY\" );")));
