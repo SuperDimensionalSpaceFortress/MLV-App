@@ -51,7 +51,7 @@ struct CudaFault
     int cudaCode = 0;                /* 0 = none noted (validation failure) */
     const char * cudaName = nullptr; /* cudaGetErrorName, or NULL */
     const char * site = nullptr;     /* failing call site text, or NULL */
-    double utcMs = 0.0;              /* when observed; 0 = now */
+    double utcMs = 0.0;              /* set by noteFault (wall clock, Unix epoch ms) */
 };
 
 /*! A failed backend stage call (rc != 0). Recorded at once, written by the

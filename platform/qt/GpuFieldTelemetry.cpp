@@ -70,6 +70,7 @@ struct State
     unsigned long long flushSeq = 0;
     std::function<void(const CudaFault &)> listener;
     bool afterFaultPending = false;
+    bool haveLastAfterFaultRun = false;
     qint64 lastAfterFaultRunAtMs = 0;
     bool sessionEnded = false;
 };
@@ -374,8 +375,9 @@ void scheduleAfterFaultFlush()
         if (!s.installed || s.sessionEnded || s.afterFaultPending) return;
         const qint64 now = QDateTime::currentMSecsSinceEpoch();
         qint64 runAt = now + kAfterFaultWaitMs;
-        if (s.lastAfterFaultRunAtMs > 0 && runAt < s.lastAfterFaultRunAtMs + kAfterFaultDebounceMs)
+        if (s.haveLastAfterFaultRun && runAt < s.lastAfterFaultRunAtMs + kAfterFaultDebounceMs)
             runAt = s.lastAfterFaultRunAtMs + kAfterFaultDebounceMs;
+        s.haveLastAfterFaultRun = true;
         s.lastAfterFaultRunAtMs = runAt;
         s.afterFaultPending = true;
         delayMs = runAt - now;
@@ -462,7 +464,7 @@ void noteFault(const CudaFault & fault)
     f.cudaCode = fault.cudaCode;
     f.cudaName = core::sanitize(fault.cudaName, 47);
     f.site = core::sanitize(fault.site, 95);
-    f.utcMs = fault.utcMs > 0.0 ? fault.utcMs : nowUtcMs();
+    f.utcMs = nowUtcMs();
 
     State & s = state();
     std::function<void(const CudaFault &)> listener;
@@ -480,7 +482,7 @@ void noteFault(const CudaFault & fault)
     if (listener)
     {
         CudaFault copy = fault;
-        if (copy.utcMs <= 0.0) copy.utcMs = f.utcMs;
+        copy.utcMs = f.utcMs;
         listener(copy);
     }
 }

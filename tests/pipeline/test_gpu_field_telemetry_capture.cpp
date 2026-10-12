@@ -107,7 +107,8 @@ TEST(GpuFieldTelemetryCapture, InjectedLaunchTimeoutReachesTheSinkWithItsCode)
     {
         ASSERT_EQ(0, c.rc);
         ASSERT_EQ(0, c.cudaCode);
-        ASSERT_TRUE(c.ms >= 0.0);
+        ASSERT_EQ(std::string(), c.cudaName);
+        ASSERT_EQ(std::string(), c.site);
     }
     ASSERT_NEAR(3.0, g_calls[2].ms, 1e-9); // the fake backend's own total_ms
 
