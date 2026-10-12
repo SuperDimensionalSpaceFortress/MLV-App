@@ -391,6 +391,13 @@ try {
             if ($spec.generatorArgs.PSObject.Properties['lookFlavor']) { $gen['LookFlavor'] = [string]$spec.generatorArgs.lookFlavor }
             if ($spec.generatorArgs.PSObject.Properties['playbackRenderLookaheadFrames']) { $gen['PlaybackRenderLookaheadFrames'] = [int]$spec.generatorArgs.playbackRenderLookaheadFrames }
         }
+        # PLAYBACK-CPU-PACE-GAP-1: the D1 exactness arms, cpu backend only (the generator refuses them on cuda; a cuda run of the same spec passes none).
+        if ($Backend -ceq 'cpu') {
+            if ($spec.generatorArgs.PSObject.Properties['dropFrameMode']) { $gen['DropFrameMode'] = [string]$spec.generatorArgs.dropFrameMode }
+            if ($spec.generatorArgs.PSObject.Properties['disableCpuPlaybackLookahead'] -and [bool]$spec.generatorArgs.disableCpuPlaybackLookahead) { $gen['DisableCpuPlaybackLookahead'] = $true }
+            if ($spec.generatorArgs.PSObject.Properties['presentedDumpFrames']) { $gen['PresentedDumpFrames'] = [string]$spec.generatorArgs.presentedDumpFrames }
+            if (-not $gen.ContainsKey('PlaybackRenderLookaheadFrames') -and $spec.generatorArgs.PSObject.Properties['playbackRenderLookaheadFrames']) { $gen['PlaybackRenderLookaheadFrames'] = [int]$spec.generatorArgs.playbackRenderLookaheadFrames }
+        }
     }
     if ($isLook) {
         $gen['ContactSheet'] = $true; $gen['ContactSheetFrames'] = [int]$spec.look.contactSheetFrames
@@ -528,6 +535,13 @@ if ($artifactsShare -and (Test-Path -LiteralPath $artifactsShare -PathType Conta
     if (Test-Path -LiteralPath $failedAppLogShare -PathType Leaf) {
         New-Item -ItemType Directory -Force -Path (Join-Path $evidenceDir 'logs') | Out-Null
         Copy-Item -LiteralPath $failedAppLogShare -Destination (Join-Path $evidenceDir 'logs\smoke-failed-app.log')
+    }
+    # PLAYBACK-CPU-PACE-GAP-1: a leg with generatorArgs.presentedDumpFrames publishes <artifacts>\presented-dumps; it is fetched back into the local evidence
+    # (under .claude-state: the frames are owner footage) for tools/profiling/compare_presented_dumps.py. Absent on every other leg.
+    $dumpShare = Join-Path $artifactsShare 'presented-dumps'
+    if (Test-Path -LiteralPath $dumpShare -PathType Container) {
+        Copy-Item -LiteralPath $dumpShare -Destination (Join-Path $evidenceDir 'presented-dumps') -Recurse
+        Write-Output "DVE_PRESENTED_DUMPS=$(Join-Path $evidenceDir 'presented-dumps') FILES=$(@(Get-ChildItem -LiteralPath (Join-Path $evidenceDir 'presented-dumps') -File).Count)"
     }
     # The job's exit code and RESULT token are not in any file the job wrote: record them as a hashed file too, so the outcome is
     # re-derivable (a capture that exited non-zero is not evidence).
