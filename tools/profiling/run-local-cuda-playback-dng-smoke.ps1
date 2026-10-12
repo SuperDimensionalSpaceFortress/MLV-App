@@ -121,31 +121,6 @@ function Get-FileArtifact {
     }
 }
 
-function Get-GpuPreferenceValue {
-    param([Parameter(Mandatory = $true)][string]$Executable)
-    $prefKey = "HKCU:\Software\Microsoft\DirectX\UserGpuPreferences"
-    if (!(Test-Path -LiteralPath $prefKey)) {
-        return $null
-    }
-    $item = Get-ItemProperty -LiteralPath $prefKey -Name $Executable -ErrorAction SilentlyContinue
-    if ($null -eq $item) {
-        return $null
-    }
-    return [string]$item.$Executable
-}
-
-function Set-GpuPreferenceHighPerformance {
-    param([Parameter(Mandatory = $true)][string]$Executable)
-    $prefKey = "HKCU:\Software\Microsoft\DirectX\UserGpuPreferences"
-    New-Item -Path $prefKey -Force | Out-Null
-    New-ItemProperty `
-        -Path $prefKey `
-        -Name $Executable `
-        -Value "GpuPreference=2;" `
-        -PropertyType String `
-        -Force | Out-Null
-}
-
 function Normalize-CdngCodecs {
     param([AllowNull()][string[]]$Values)
 
@@ -804,20 +779,10 @@ if (!$DryRun -and [bool]$nvidia.ok -and $backendCompatibility.compatible -ne $tr
         $backendCompatibility.reason)
 }
 
-$gpuPreferenceBefore = $null
-$gpuPreferenceAfter = $null
-$expectedGpuPreference = "GpuPreference=2;"
-if ([bool]$artifacts.exe.exists) {
-    $gpuPreferenceBefore = Get-GpuPreferenceValue -Executable $artifacts.exe.path
-    $gpuPreferenceAfter = $gpuPreferenceBefore
-    if (!$DryRun -and !$NoHighPerformancePreference) {
-        Set-GpuPreferenceHighPerformance -Executable $artifacts.exe.path
-        $gpuPreferenceAfter = Get-GpuPreferenceValue -Executable $artifacts.exe.path
-        if ($gpuPreferenceAfter -ne $expectedGpuPreference) {
-            Add-Failure $failures "Windows per-app GPU preference for '$($artifacts.exe.path)' was '$gpuPreferenceAfter'; expected '$expectedGpuPreference'."
-        }
-    }
-}
+# NA-8: this wrapper never writes the owner's per-app GPU preference. MLVApp.exe requests the discrete GPU
+# itself (NvOptimusEnablement / AmdPowerXpressRequestHighPerformance, platform/qt/main.cpp); the playback A/B
+# step asserts the candidate's GL_RENDERER names the NVIDIA adapter. -NoHighPerformancePreference is
+# accepted and ignored.
 
 $playback = $null
 $playbackChild = $null
@@ -1019,11 +984,9 @@ $summary = [pscustomobject]@{
         machineFingerprint = $machineFingerprint
         nvidiaSmi = $nvidia
         gpuPreference = [pscustomobject]@{
-            attemptedHighPerformance = [bool](!$NoHighPerformancePreference)
-            mutated = [bool](!$DryRun -and !$NoHighPerformancePreference -and [bool]$artifacts.exe.exists)
-            before = $gpuPreferenceBefore
-            after = $gpuPreferenceAfter
-            expected = $expectedGpuPreference
+            attemptedHighPerformance = $false
+            mutated = $false
+            requestedBy = "app exports (NvOptimusEnablement, AmdPowerXpressRequestHighPerformance)"
         }
     }
     artifacts = $artifacts

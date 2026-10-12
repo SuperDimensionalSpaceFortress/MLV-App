@@ -340,9 +340,9 @@ Update 2026-06-20 Dell hybrid-GPU executable hint: `platform/qt/main.cpp` now
 exports the standard `NvOptimusEnablement=1` and
 `AmdPowerXpressRequestHighPerformance=1` symbols from `MLVApp.exe`. This gives
 NVIDIA Optimus / AMD switchable-graphics drivers an app-level high-performance
-GPU request even when the app is launched outside the proof wrappers. It
-complements, but does not replace, the Windows per-app `GpuPreference=2;`
-registry path used by the wrappers. This is a Dell/UltraMagnus launch hardening
+GPU request even when the app is launched outside the proof wrappers. The
+wrappers no longer write the Windows per-app `GpuPreference=2;` registry value
+(NA-8); they record the GL renderer the app actually used. This is a Dell/UltraMagnus launch hardening
 step only: support and speed claims still require a host-local proof packet with
 backend load, GL renderer/probe evidence, no-readback/fallback counts, DNG hash
 PASS, and playback/export timing metrics.

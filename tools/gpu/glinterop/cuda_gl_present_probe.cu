@@ -24,7 +24,7 @@
 // GL_RENDERER reports Intel UHD / GDI / llvmpipe / software, that is the blocker
 // and the probe says so explicitly (and still reports the D2H baseline, which
 // needs no GL). The production app (MLVApp/Qt) already gets a 4090 GL context over
-// SSH with GpuPreference=2, so zero-readback present is viable in production even
+// SSH (it exports the same discrete-GPU request), so zero-readback present is viable in production even
 // if this raw-WGL probe needs an interactive desktop session.
 //
 // Usage: cuda_gl_present_probe.exe [width] [height] [iters]
@@ -41,6 +41,13 @@
 
 #include <cuda_runtime.h>
 #include <cuda_gl_interop.h>
+
+// Ask the hybrid-GPU driver for the discrete GPU the same way MLVApp does (platform/qt/main.cpp), so no
+// per-app Windows GPU preference has to be written (NA-8: that registry state is the owner's).
+extern "C" {
+__declspec(dllexport) unsigned long NvOptimusEnablement = 0x00000001;
+__declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
+}
 
 // ---- GL enums / typedefs not guaranteed in the ancient <GL/gl.h> MS ships ----
 #ifndef GL_BGRA
@@ -219,7 +226,7 @@ int main(int argc,char**argv){
     if(intelGL && !is4090){
         printf("\n[BLOCKER] GL_RENDERER is the Intel iGPU, NOT the RTX 4090.\n");
         printf("[BLOCKER] CUDA (device=%s) and GL would live on different GPUs -> interop register will fail or be slow.\n", p.name);
-        printf("[BLOCKER] Set HKCU\\Software\\Microsoft\\DirectX\\UserGpuPreferences <exe>=\"GpuPreference=2;\" and rerun.\n");
+        printf("[BLOCKER] This probe already exports NvOptimusEnablement/AmdPowerXpressRequestHighPerformance; the session or driver still chose Intel. Run it on the interactive desktop session, or check the driver's hybrid-GPU setting.\n");
         printf("VERDICT: ZERO-READBACK present UNPROVEN (GL bound to Intel iGPU, not 4090).\n");
         fflush(stdout); destroyGL(gl); return 2;
     }

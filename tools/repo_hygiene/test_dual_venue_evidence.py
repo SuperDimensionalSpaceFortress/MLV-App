@@ -76,7 +76,12 @@ COMPOSER = ROOT / "tools" / "profiling" / "make-contact-sheet.py"
 # whatever the host's console-lock state. A move edits baseline lines IN PLACE, which no bracketed region can express, so the pin is that card's own generator commit
 # (cb795f9e: fork/master 6723cd5b plus the move and its comment, nothing else). It already carries every bracketed family, so the baseline counts below are unchanged. The move is
 # pinned by its own test (test_the_root_guard_refuses_an_outside_root_before_the_session_lock_probe in test_playback_attr_3_cuda_behaviour.py), not by byte identity.
-BASELINE_COMMIT = "cb795f9e69dea722996cb366096aa44f4344cc67"
+# GPU-PREF-REGISTRY-STOP-AND-PRUNE-1 r1b moves it again, on purpose: that card DELETES the job's per-exe DirectX GPU-preference registry-write line (NA-8: the owner's graphics
+# state) and puts a comment block in its place. A deletion edits a baseline line IN PLACE, which no bracketed region can express, so the pin is that card's own generator commit
+# (e2e4c148: master b1a4da5a plus that one edit, nothing else -- the generator's diff is exactly that hunk). It already carries every bracketed family, so the baseline counts
+# for PLAYBACK-VSYNC-DEFAULT-1 and HFR-CONFORM-AWARE-RECEIPT-ORACLES-1 below now equal the pinned counts (they were 0 against cb795f9e). The absence of the registry write is
+# pinned by its own test (test_na8_gpu_preference_writers), not by byte identity.
+BASELINE_COMMIT = "e2e4c14830e498b98fdd0e012afb97f6fa41ba1f"
 
 PWSH = shutil.which("pwsh")
 requires_windows_pwsh = unittest.skipIf(PWSH is None or sys.platform != "win32", "needs pwsh on Windows")
@@ -314,9 +319,9 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         self.assertEqual(new_counts["session-locked"], self.SESSION_LOCKED_REGIONS, "the default job carries exactly the pinned number of bracketed VENUE-SESSION-LOCKED-REFUSAL-1 regions")
         self.assertEqual(old_counts["session-locked"], self.SESSION_LOCKED_REGIONS, "the baseline (the pinned KEEPALIVE-FAILURE-PUBLISH-LAST-1 generator commit) carries the same bracketed regions")
         self.assertEqual(new_counts["playback-vsync"], self.PLAYBACK_VSYNC_REGIONS, "the default job carries exactly the pinned number of bracketed PLAYBACK-VSYNC-DEFAULT-1 regions")
-        self.assertEqual(old_counts["playback-vsync"], 0, "the baseline predates PLAYBACK-VSYNC-DEFAULT-1")
+        self.assertEqual(old_counts["playback-vsync"], self.PLAYBACK_VSYNC_REGIONS, "the baseline (the pinned GPU-PREF-REGISTRY-STOP-AND-PRUNE-1 generator commit) carries the same bracketed regions")
         self.assertEqual(new_counts["hfr-conform-oracles"], self.HFR_CONFORM_REGIONS, "the default job carries exactly the pinned number of bracketed HFR-CONFORM-AWARE-RECEIPT-ORACLES-1 regions")
-        self.assertEqual(old_counts["hfr-conform-oracles"], 0, "the baseline predates HFR-CONFORM-AWARE-RECEIPT-ORACLES-1")
+        self.assertEqual(old_counts["hfr-conform-oracles"], self.HFR_CONFORM_REGIONS, "the baseline (the pinned GPU-PREF-REGISTRY-STOP-AND-PRUNE-1 generator commit) carries the same bracketed regions")
         self.assertEqual(stripped, old_stripped,
                          "the DEFAULT (bachelor/cuda) emitted job changed outside the bracketed regions -- it must stay byte-identical to the pinned baseline")
 
@@ -496,6 +501,34 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
                 text = job.read_text(encoding="utf-8")
                 self.assertEqual(text.count(f"'MLVAPP_SWAP_INTERVAL={interval}',"), 1, name)
                 self.assertIn(f"'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',\n    'MLVAPP_SWAP_INTERVAL={interval}',", text.replace("\r\n", "\n"), name)
+
+    def test_the_cuda_launch_timer_reaches_the_apps_env_only_when_asked(self) -> None:
+        """GPU-EVENT153-ROOTCAUSE-2: -CudaLaunchTimingMinMs <ms> adds MLVAPP_CUDA_LAUNCH_TIMING=1 and its line threshold (an
+        invariant-culture decimal) to the app's env list; absent, the job is the text it was. The runner maps the leg's
+        generatorArgs.cudaLaunchTimingMinMs for any leg, and the schema bounds it."""
+        plain = self.generate(GENERATOR, "lt-plain.job.ps1", []).read_text(encoding="utf-8").replace("\r\n", "\n")
+        self.assertNotIn("MLVAPP_CUDA_LAUNCH_TIMING", plain)
+        for ms, rendered in (("0", "0"), ("2", "2"), ("2.5", "2.5")):
+            job = self.generate(GENERATOR, f"lt-{ms}.job.ps1", ["-CudaLaunchTimingMinMs", ms])
+            self.assertEqual(self.parse_errors(job), 0, ms)
+            text = job.read_text(encoding="utf-8").replace("\r\n", "\n")
+            pair = f"    'MLVAPP_CUDA_LAUNCH_TIMING=1',\n    'MLVAPP_CUDA_LAUNCH_TIMING_MIN_MS={rendered}',\n"
+            self.assertEqual(text.count("'MLVAPP_CUDA_LAUNCH_TIMING=1',"), 1, ms)
+            self.assertIn("'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',\n" + pair, text, ms)
+            self.assertEqual(text.replace(pair, ""), plain, f"{ms}: the pair is the only difference from the plain job")
+        both = self.generate(GENERATOR, "lt-swap.job.ps1", ["-SwapInterval", "1", "-CudaLaunchTimingMinMs", "2"])
+        self.assertEqual(self.parse_errors(both), 0)
+        both_text = both.read_text(encoding="utf-8")
+        self.assertEqual(both_text.count("'MLVAPP_SWAP_INTERVAL=1',"), 1)
+        self.assertEqual(both_text.count("'MLVAPP_CUDA_LAUNCH_TIMING_MIN_MS=2',"), 1)
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        mapping = "if ($spec.generatorArgs.PSObject.Properties['cudaLaunchTimingMinMs']) { $gen['CudaLaunchTimingMinMs'] = [double]$spec.generatorArgs.cudaLaunchTimingMinMs }"
+        self.assertIn(mapping, runner)
+        self.assertLess(runner.index(mapping), runner.index("if (-not $isLook -and $spec.generatorArgs.PSObject.Properties['forceLookAssist']"),
+                        "the mapping must sit outside the forceLookAssist branch")
+        schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
+        prop = schema["properties"]["generatorArgs"]["properties"]["cudaLaunchTimingMinMs"]
+        self.assertEqual((prop["type"], prop["minimum"], prop["maximum"]), ("number", 0, 10000))
 
     def test_the_runner_passes_a_legs_swap_interval_to_the_generator(self) -> None:
         runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
@@ -5957,12 +5990,12 @@ class LookReceiptGeneratorTests(unittest.TestCase):
                 kept, new_counts = GeneratorByteIdentityAndVariantTests.strip_regions(new.decode("utf-8"))
                 old_kept, old_counts = GeneratorByteIdentityAndVariantTests.strip_regions(old.decode("utf-8"))
                 self.assertGreater(new_counts["session-locked"], 0)
-                # PLAYBACK-VSYNC-DEFAULT-1's regions postdate the base generator: present in the new job only, at their pinned count.
+                # PLAYBACK-VSYNC-DEFAULT-1's regions: present in the new job and in the base generator (the pinned GPU-PREF-REGISTRY-STOP-AND-PRUNE-1 commit), at their pinned count.
                 self.assertEqual((new_counts.pop("playback-vsync"), old_counts.pop("playback-vsync")),
-                                 (GeneratorByteIdentityAndVariantTests.PLAYBACK_VSYNC_REGIONS, 0), name)
-                # HFR-CONFORM-AWARE-RECEIPT-ORACLES-1's regions postdate the base generator too: present in the new job only, at their pinned count.
+                                 (GeneratorByteIdentityAndVariantTests.PLAYBACK_VSYNC_REGIONS, GeneratorByteIdentityAndVariantTests.PLAYBACK_VSYNC_REGIONS), name)
+                # HFR-CONFORM-AWARE-RECEIPT-ORACLES-1's regions: present in both too, at their pinned count.
                 self.assertEqual((new_counts.pop("hfr-conform-oracles"), old_counts.pop("hfr-conform-oracles")),
-                                 (GeneratorByteIdentityAndVariantTests.HFR_CONFORM_REGIONS, 0), name)
+                                 (GeneratorByteIdentityAndVariantTests.HFR_CONFORM_REGIONS, GeneratorByteIdentityAndVariantTests.HFR_CONFORM_REGIONS), name)
                 self.assertEqual(new_counts, old_counts, f"{name}: the job without -LookReceiptPath carries the base generator's bracketed regions")
                 self.assertEqual(kept, old_kept, f"{name}: the job without -LookReceiptPath must be the base generator's bytes")
                 self.assertNotIn(b"LookReceipt", new)

@@ -8,7 +8,10 @@
 //  4. a non-dual frame (DISO_INVALID) still gets exactly the stripes.c correction (and S-0110 triggers it, so 3
 //     cannot pass on an inert fix);
 //  5. on the real HQ fixture the stripe setting changes nothing on the full-res render, the scale-2 subset and the
-//     DNG frame payload (may be inert on this fixture; 3 and 4 carry the kill power).
+//     DNG frame payload (may be inert on this fixture; 3 and 4 carry the kill power);
+//  6. DUALISO-VSTRIPES-PLAN-SKIP-FULLRES-1: the preview-scale plans (CPU and GPU) do not ask for the full-res fix pass
+//     for stripes or pattern noise alone, a stripes-only clip below 14 bit is admitted, and dropping that pass leaves
+//     the reduced recon byte-equal.
 extern "C" {
 #include "../../src/mlv/llrawproc/stripes.h"
 }
@@ -384,7 +387,8 @@ TEST(DualIsoVerticalStripes, DualIsoPicturesIgnoreTheStripeSettingOnEveryPath)
         }
     }
 
-    // (b) preview scale 2 through the scale-2 subset; with stripes on, the full-res fix pass runs.
+    // (b) preview scale 2 through the scale-2 subset. The receipt keeps focus pixels on, so the full-res fix pass
+    // still runs here; stripes alone no longer call for it (PreviewScalePlanTreatsStripesAndPatternNoiseAsInert).
     {
         MlvPipelineFixture off;
         MlvPipelineFixture forced;
@@ -404,4 +408,153 @@ TEST(DualIsoVerticalStripes, DualIsoPicturesIgnoreTheStripeSettingOnEveryPath)
     // (c) the DNG frame payload.
     for (const int rawState : { UNCOMPRESSED_RAW, COMPRESSED_RAW })
         ASSERT_EQ(dngPayloadHash(0, rawState), dngPayloadHash(2, rawState));
+}
+
+namespace {
+
+// The HQ tiny clip with only the named fixes active (the receipt turns focus pixels on), primed by a frame-0 render
+// so the exposure match has settled at full resolution.
+void openHqTinyFixes(MlvPipelineFixture & fixture, int stripesMode, int patternNoise, int focus, int bad)
+{
+    openHqTiny(fixture, stripesMode);
+    mlvObject_t * video = fixture.video();
+    video->llrawproc->focus_pixels = focus;
+    video->llrawproc->bad_pixels = bad;
+    llrpSetPatternNoiseMode(video, patternNoise);
+    ASSERT_FALSE(fixture.renderFrame8(0).empty());
+    if (stripesMode) llrpComputeStripesOn(video);  // the prime may have claimed the receipt's queued solve
+}
+
+struct GpuPlanEnv
+{
+    GpuPlanEnv() { qputenv("MLVAPP_GPU_PLAYBACK_RECON", "1"); }
+    ~GpuPlanEnv() { qunsetenv("MLVAPP_GPU_PLAYBACK_RECON"); }
+};
+
+std::vector<uint16_t> reducedRun(MlvPipelineFixture & fixture, const mlvDualIsoPreviewScaleRecon_t & plan,
+                                 const std::vector<uint16_t> & raw)
+{
+    std::vector<uint16_t> full = raw;
+    std::vector<uint16_t> reduced(static_cast<size_t>(plan.reducedWidth) * static_cast<size_t>(plan.reducedHeight));
+    WorkerState worker;
+    ASSERT_EQ(1, mlvDualIsoPreviewScaleReconRun(fixture.video(), &plan, full.data(), reduced.data(), &worker.state, 1,
+                                                nullptr, nullptr));
+    return reduced;
+}
+
+} // namespace
+
+// DUALISO-VSTRIPES-PLAN-SKIP-FULLRES-1: applyLLRawProcObjectWorker skips vertical stripes (llrawproc.c
+// `if (diso_validity) vertical_stripes_mode = 0;`) and pattern noise (`if (!diso_validity && pattern_noise_mode)`)
+// on a dual-ISO frame, so on their own they must not send the reduced recon through the full-res fix pass, and must
+// not refuse a clip below 14 bit. Focus and bad pixels still do both.
+TEST(DualIsoVerticalStripes, PreviewScalePlanTreatsStripesAndPatternNoiseAsInert)
+{
+    qunsetenv("MLVAPP_DISABLE_CPU_DUALISO_PREVIEW_SCALE_RECON");
+    qunsetenv("MLVAPP_DISABLE_GPU_DUALISO_PREVIEW_SCALE_RECON");
+    qunsetenv("MLVAPP_GPU_PLAYBACK_RECON");
+
+    struct Case { const char * name; int stripes; int pattern; int focus; int bad; int fullResFixes; };
+    const Case cases[] = {
+        { "a stripes 1, solve queued", 1, 0, 0, 0, 0 },
+        { "b stripes 2 (forced)", 2, 0, 0, 0, 0 },
+        { "c pattern noise only", 0, 1, 0, 0, 0 },
+        { "d focus only (control)", 0, 0, 1, 0, 1 },
+        { "e bad only (control)", 0, 0, 0, 1, 1 },
+    };
+    // Every plan case is checked and printed before the one assertion, so a RED run shows each failing case.
+    size_t failures = 0;
+    const int notch = llrpGpuPlaybackReconReducedIsoNotchAvailable();
+    if (notch == 0)
+        std::printf("[vstripes] GPU plan half skipped: recon DLL lacks the reduced ISO notch\n");
+    for (const Case & c : cases)
+    {
+        MlvPipelineFixture fixture;
+        openHqTinyFixes(fixture, c.stripes, c.pattern, c.focus, c.bad);
+        ASSERT_TRUE(fixture.video()->RAWI.raw_info.bits_per_pixel >= 14);
+        for (const int scale : { 2, 4 })
+        {
+            mlvDualIsoPreviewScaleRecon_t plan;
+            const int cpu = mlvDualIsoPreviewScaleReconPlan(fixture.video(), scale, &plan);
+            const bool cpuOk = cpu == 1 && plan.scale == scale && plan.fullResFixes == c.fullResFixes;
+            std::printf("[vstripes] %s: CPU x%d plan %d fullResFixes %d (want %d) reason %s: %s\n", c.name, scale, cpu,
+                        plan.fullResFixes, c.fullResFixes, plan.reason, cpuOk ? "ok" : "WRONG");
+            failures += cpuOk ? 0 : 1;
+            if (notch == 0) continue;
+            GpuPlanEnv gpuEnv;
+            mlvDualIsoPreviewScaleRecon_t gpuPlan;
+            const int gpu = mlvDualIsoGpuPreviewScaleReconPlan(fixture.video(), scale, 0, &gpuPlan);
+            const bool gpuOk = gpu == 1 && gpuPlan.scale == scale && gpuPlan.fullResFixes == c.fullResFixes;
+            std::printf("[vstripes] %s: GPU x%d plan %d fullResFixes %d (want %d) reason %s: %s\n", c.name, scale, gpu,
+                        gpuPlan.fullResFixes, c.fullResFixes, gpuPlan.reason, gpuOk ? "ok" : "WRONG");
+            failures += gpuOk ? 0 : 1;
+        }
+    }
+
+    // Below 14 bit (plan level): stripes alone are admitted, focus pixels are still refused.
+    {
+        struct SubCase { const char * name; int stripes; int focus; int admitted; };
+        const SubCase subCases[] = {
+            { "stripes-only 12 bit", 1, 0, 1 },
+            { "focus-only 12 bit", 0, 1, 0 },
+        };
+        for (const SubCase & c : subCases)
+        {
+            MlvPipelineFixture fixture;
+            openHqTinyFixes(fixture, c.stripes, 0, c.focus, 0);
+            mlvObject_t * video = fixture.video();
+            const int bpp = video->RAWI.raw_info.bits_per_pixel;
+            video->RAWI.raw_info.bits_per_pixel = 12;
+            mlvDualIsoPreviewScaleRecon_t plan;
+            const int got = mlvDualIsoPreviewScaleReconPlan(video, 2, &plan);
+            video->RAWI.raw_info.bits_per_pixel = bpp;
+            const bool ok = c.admitted
+                ? (got == 1 && plan.scale == 2 && plan.fullResFixes == 0)
+                : (got == 0 && std::string(plan.reason) == "full-res raw fixes on a clip below 14 bit");
+            std::printf("[vstripes] %s: CPU x2 plan %d (want %d) scale %d fullResFixes %d reason %s: %s\n", c.name, got,
+                        c.admitted, plan.scale, plan.fullResFixes, plan.reason, ok ? "ok" : "WRONG");
+            failures += ok ? 0 : 1;
+        }
+    }
+    ASSERT_EQ(static_cast<size_t>(0), failures);
+
+    // Byte identity: the pass the plan now drops leaves the reduced recon unchanged (stripes 2, focus/bad 0, frame 1).
+    {
+        MlvPipelineFixture fixture;
+        openHqTinyFixes(fixture, 2, 0, 0, 0);
+        std::vector<uint16_t> raw(static_cast<size_t>(fixture.width()) * static_cast<size_t>(fixture.height()));
+        ASSERT_EQ(0, getMlvRawFrameUint16(fixture.video(), 1, raw.data()));
+        for (const int scale : { 2, 4 })
+            for (const int tent : { 0, 1 })
+            {
+                mlvDualIsoPreviewScaleRecon_t plan;
+                ASSERT_EQ(1, mlvDualIsoPreviewScaleReconPlan(fixture.video(), scale, &plan));
+                ASSERT_EQ(0, plan.fullResFixes);
+                plan.phaseTentShrink = tent;
+                const std::vector<uint16_t> skipped = reducedRun(fixture, plan, raw);
+                plan.fullResFixes = 1;
+                const std::vector<uint16_t> withPass = reducedRun(fixture, plan, raw);
+                const bool same = skipped == withPass;
+                std::printf("[vstripes] x%d tent %d: reduced recon without vs with the full-res pass %s\n", scale, tent,
+                            same ? "byte-equal" : "DIFFERS");
+                ASSERT_TRUE(same);
+            }
+    }
+
+    // The scale-2 subset's processed8 output, stripes 0 vs stripes 2 (focus/bad 0): neither runs the pass.
+    {
+        MlvPipelineFixture off;
+        MlvPipelineFixture forced;
+        openHqTinyFixes(off, 0, 0, 0, 0);
+        openHqTinyFixes(forced, 2, 0, 0, 0);
+        int offFixes = -1;
+        int forcedFixes = -1;
+        const std::vector<uint8_t> a = scale2SubsetFrame(off, 1, &offFixes);
+        const std::vector<uint8_t> b = scale2SubsetFrame(forced, 1, &forcedFixes);
+        std::printf("[vstripes] scale-2 subset (focus/bad 0) fullResFixes: stripes 0 -> %d, stripes 2 -> %d\n", offFixes,
+                    forcedFixes);
+        ASSERT_EQ(0, offFixes);
+        ASSERT_EQ(0, forcedFixes);
+        ASSERT_EQ(sha256_bytes(a.data(), a.size()), sha256_bytes(b.data(), b.size()));
+    }
 }

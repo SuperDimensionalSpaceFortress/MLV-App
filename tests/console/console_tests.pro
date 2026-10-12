@@ -38,6 +38,7 @@ SOURCES += \
     $$REPO_ROOT/tests/console/test_export_process.cpp \
     $$REPO_ROOT/tests/console/test_playback_frame_range.cpp \
     $$REPO_ROOT/tests/console/test_automation_settings.cpp \
+    $$REPO_ROOT/tests/console/test_hub_host_playback_guard.cpp \
     $$REPO_ROOT/tests/console/test_playback_quality_settings.cpp \
     $$REPO_ROOT/tests/console/test_shipping_defaults.cpp \
     $$REPO_ROOT/tests/console/test_playback_quality_auto_mode.cpp \
@@ -71,7 +72,8 @@ SOURCES += \
     $$REPO_ROOT/tests/console/test_playback_native_pace_guard.cpp \
     $$REPO_ROOT/tests/console/test_playback_slip_histogram.cpp \
     $$REPO_ROOT/tests/console/test_playback_decode_render_overlap.cpp \
-    $$REPO_ROOT/tests/console/test_playback_swap_interval.cpp
+    $$REPO_ROOT/tests/console/test_playback_swap_interval.cpp \
+    $$REPO_ROOT/tests/console/test_cuda_launch_timing.cpp
 
 HEADERS += \
     $$REPO_ROOT/platform/qt/FpmNameValidator.h \
@@ -95,6 +97,7 @@ HEADERS += \
     $$REPO_ROOT/platform/qt/DualIsoLevelSyncPolicy.h \
     $$REPO_ROOT/platform/qt/PlaybackFrameRange.h \
     $$REPO_ROOT/platform/qt/AutomationSettings.h \
+    $$REPO_ROOT/platform/qt/HubHostPlaybackGuard.h \
     $$REPO_ROOT/platform/qt/PlaybackPrepPresentationPolicy.h \
     $$REPO_ROOT/platform/qt/PlaybackGatePolicy.h \
     $$REPO_ROOT/platform/qt/AsyncH2dCounterContract.h \
@@ -110,7 +113,8 @@ HEADERS += \
     $$REPO_ROOT/platform/qt/PlaybackSwapInterval.h \
     $$REPO_ROOT/platform/qt/PlaybackSlipHistogram.h \
     $$REPO_ROOT/platform/qt/GpuTexturePresentAvailabilityPolicy.h \
-    $$REPO_ROOT/platform/qt/DisplayDeviceMapping.h
+    $$REPO_ROOT/platform/qt/DisplayDeviceMapping.h \
+    $$REPO_ROOT/tools/gpu/backend/igpu_launch_timing_format.h
 
 win32{
     WINDOWS_TEST_RUNTIME_DEPLOY = $$relative_path($$REPO_ROOT/tools/testing/deploy-windows-test-runtime.ps1, $$OUT_PWD)

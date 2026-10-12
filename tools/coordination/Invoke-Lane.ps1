@@ -140,6 +140,31 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
+# ---------------------------------------------------------------- prompt + hub-host local-playback gate
+if (-not $Prompt -and -not $PromptFile) { throw 'Supply -Prompt or -PromptFile.' }
+if ($PromptFile) {
+    if (-not (Test-Path -LiteralPath $PromptFile)) { throw "PromptFile not found: $PromptFile" }
+    $Prompt = Get-Content -LiteralPath $PromptFile -Raw
+}
+
+# HUB-VM-NO-LOCAL-PLAYBACK-1 (owner objection 2026-10-11): no lane on the hub VM (Virtual-Ten, a guest on Ultra-Magnus) is told to run MLVApp playback
+# locally -- playback, performance AND exactness, is a venue job. The prompt is linted before any process, run dir or receipt exists, so a prompt that
+# says "run it where a GUI desktop session and the clip exist" never starts a lane there. The same lint runs in dispatch-perf-lane.ps1 (producer prompts).
+# It sits ahead of every Windows-only path below (the %APPDATA% launcher paths, the job object), so the refusal reads only this script's own folder,
+# the tracked host list and the host name on every OS. A missing lint (or host list) refuses every lane: without it the host cannot be checked.
+$localPlaybackLint = Join-Path $PSScriptRoot 'lane-local-playback-lint.ps1'
+if (-not (Test-Path -LiteralPath $localPlaybackLint -PathType Leaf)) {
+    throw "local-playback-lint-missing: HUB_VM_LOCAL_PLAYBACK_REFUSED -- $localPlaybackLint is missing, so the hub-host local-playback check cannot run; refusing the lane (fail closed)"
+}
+. $localPlaybackLint
+if (Test-HubHost) {
+    $localPlaybackFindings = @(Get-LocalPlaybackPromptFindings -Text $Prompt)
+    if ($localPlaybackFindings.Count -gt 0) {
+        throw ("local-playback-prompt-refused: HUB_VM_LOCAL_PLAYBACK_REFUSED -- this host is the hub VM; the prompt tells the lane to run MLVApp playback locally " +
+               "(playback runs only as a venue job through the tracked chain): " + (($localPlaybackFindings | Select-Object -First 3) -join " | "))
+    }
+}
+
 # ---------------------------------------------------------------- lane table
 # Engine, model and effort per lane. This table IS the topology; there is no
 # other place a lane's model is decided, so a lane cannot silently drift onto
@@ -754,12 +779,6 @@ public static class MlvLaneJob {
 }
 
 # ---------------------------------------------------------------- resolve inputs
-if (-not $Prompt -and -not $PromptFile) { throw 'Supply -Prompt or -PromptFile.' }
-if ($PromptFile) {
-    if (-not (Test-Path -LiteralPath $PromptFile)) { throw "PromptFile not found: $PromptFile" }
-    $Prompt = Get-Content -LiteralPath $PromptFile -Raw
-}
-
 if (-not $WorkDir) { $WorkDir = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..\..')).Path }
 $WorkDir = (Resolve-Path -LiteralPath $WorkDir).Path
 

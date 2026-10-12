@@ -16,6 +16,14 @@ param(
     [switch]$DryRun
 )
 
+# HUB-VM-NO-LOCAL-PLAYBACK-1 guard (tools/profiling/dual-venue/hub-hosts.json; pinned by tools/repo_hygiene/test_hub_vm_no_local_playback.py):
+# no MLVApp playback, smoke or profile run starts on the hub VM, a guest on Ultra-Magnus. Run it as a venue job through the tracked venue chain.
+$hubHostsNoLocalPlayback = @('VIRTUAL-TEN')
+if (($hubHostsNoLocalPlayback -contains ([string]$env:COMPUTERNAME).Trim().ToUpperInvariant()) -and ($env:MLVAPP_HUB_PLAYBACK_CI_FIXTURE -cne 'CI_FIXTURE_ONLY')) {
+    [Console]::Error.WriteLine("HUB_VM_LOCAL_PLAYBACK_REFUSED: host $env:COMPUTERNAME is the hub VM (a guest on Ultra-Magnus); run this as a venue job through the tracked venue chain")
+    exit 17
+}
+
 $ErrorActionPreference = "Stop"
 
 # PLAYBACK-CLIP-LENGTH-ENFORCE-1 round 2 (sol B3): this launcher forwards -AdditionalArgs to the app, so
@@ -82,31 +90,6 @@ function Get-FileArtifact {
         lastWriteTime = $item.LastWriteTime
         sha256 = (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash
     }
-}
-
-function Get-GpuPreferenceValue {
-    param([Parameter(Mandatory = $true)][string]$Executable)
-    $prefKey = "HKCU:\Software\Microsoft\DirectX\UserGpuPreferences"
-    if (!(Test-Path -LiteralPath $prefKey)) {
-        return $null
-    }
-    $item = Get-ItemProperty -LiteralPath $prefKey -Name $Executable -ErrorAction SilentlyContinue
-    if ($null -eq $item) {
-        return $null
-    }
-    return [string]$item.$Executable
-}
-
-function Set-GpuPreferenceHighPerformance {
-    param([Parameter(Mandatory = $true)][string]$Executable)
-    $prefKey = "HKCU:\Software\Microsoft\DirectX\UserGpuPreferences"
-    New-Item -Path $prefKey -Force | Out-Null
-    New-ItemProperty `
-        -Path $prefKey `
-        -Name $Executable `
-        -Value "GpuPreference=2;" `
-        -PropertyType String `
-        -Force | Out-Null
 }
 
 function Resolve-NvidiaSmiCommand {
@@ -231,12 +214,8 @@ if ($ValidateOutput) {
     $environment["MLVAPP_GPU_PLAYBACK_RECON_VALIDATE_OUTPUT_SAMPLE_EVERY"] = [string]$ValidationSampleEvery
 }
 
-$gpuPreferenceBefore = Get-GpuPreferenceValue -Executable $exe
-$gpuPreferenceAfter = $gpuPreferenceBefore
-if (!$DryRun -and !$NoHighPerformancePreference) {
-    Set-GpuPreferenceHighPerformance -Executable $exe
-    $gpuPreferenceAfter = Get-GpuPreferenceValue -Executable $exe
-}
+# NA-8: this launcher never writes the owner's per-app GPU preference; MLVApp.exe requests the discrete GPU
+# itself (NvOptimusEnablement / AmdPowerXpressRequestHighPerformance, platform/qt/main.cpp).
 
 $manifest = [ordered]@{
     schema = "mlvapp-cuda-playback-launch.v1"
@@ -254,9 +233,8 @@ $manifest = [ordered]@{
     environment = $environment
     nvidiaSmi = Get-NvidiaSmiSnapshot
     gpuPreference = [pscustomobject]@{
-        attemptedHighPerformance = [bool](!$NoHighPerformancePreference)
-        before = $gpuPreferenceBefore
-        after = $gpuPreferenceAfter
+        attemptedHighPerformance = $false
+        requestedBy = "app exports (NvOptimusEnablement, AmdPowerXpressRequestHighPerformance)"
     }
     proofBoundary = [pscustomobject]@{
         launchOnly = $true
