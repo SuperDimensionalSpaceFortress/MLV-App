@@ -116,6 +116,22 @@ both hashes matching, recording no tamper despite the gate being provably
 absent meanwhile. Neither check covers a rewrite of the WORKTREE'S SOURCE
 copy of `lane-no-background.py`, of `Invoke-Lane.ps1` itself, or of the
 interpreter's install location before it is ever resolved and hashed.
+
+**`authority.windowsSandbox` gets the same post-run overwrite for codex
+lanes (CODEX-UNELEVATED-OVERRIDE-ACK-1).** At launch it records the
+REQUESTED Windows sandbox (`elevated`, `unelevated` or `default`; see the
+egress section below). A codex build that does not know the
+`windows.sandbox` key accepts the `-c` override with exit 0, warns
+"Codex is ignoring N unrecognized configuration setting(s)" with an
+indented `` `windows.sandbox` is ignored `` line (or `` `windows` ``), and
+runs on its own default sandbox. When codex's stderr preamble (before its
+first `codex` turn line, with the echoed prompt removed) carries that line,
+the receipt overwrites `authority.windowsSandbox` to
+`'requested-<mode>-ignored-by-codex'` and quotes the line in
+`windowsSandboxIgnoredDetail`. A receipt never claims a mode the binary
+refused. Guard: the `test_codex_receipt_*_windows_sandbox_*` rows in
+`tests/coordination/test_lane_containment.py`.
+
 **Known gap, not yet closed:** NA-10 would be the natural place to guard
 the two script sources as gate tails a lane may write only at the board
 venue, but `mlv-never-authorized.py` is itself one of NA-10's guarded
@@ -271,7 +287,11 @@ Which mode a read-only codex key lane really runs is decided in
 (`pinState=PINNED`) it is the pin's mode, `windowsSandbox` in
 `tools/coordination/codex-pin.json` (`elevated` for 0.160.1); the
 **unelevated** mode (PR #329) is only the fallback for a lane that is not
-pinned. Both were measured on codex-cli 0.160.1, one Windows host, example.com
+pinned. That is the REQUESTED mode; a codex build that ignores the key
+leaves `authority.windowsSandbox` reading
+`requested-<mode>-ignored-by-codex` instead (see the tamper paragraph
+above), and that lane ran codex's default sandbox, which is neither column of
+the table below. Both were measured on codex-cli 0.160.1, one Windows host, example.com
 only, nothing uploaded, through `codex sandbox -c 'windows.sandbox="<mode>"' -P
 ':read-only' -- pwsh ...` with the same script run outside any sandbox as the
 control. Before this the risk was only inferred.

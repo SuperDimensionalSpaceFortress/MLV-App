@@ -221,7 +221,10 @@ if($env:MLV_FIXTURE_RESULT_JSON){
 } else {
 [Console]::Out.Write('{"type":"result","subtype":"success","is_error":false,"terminal_reason":"completed","result":"fixture-result","total_cost_usd":0,"num_turns":1}')
 }
-[Console]::Error.Write('fixture-err')
+# CODEX-UNELEVATED-OVERRIDE-ACK-1: MLV_FIXTURE_STDERR (test-only, unset = 'fixture-err') substitutes
+# the child's stderr, e.g. with codex's own "ignoring ... unrecognized configuration setting" block.
+if($env:MLV_FIXTURE_STDERR){[Console]::Error.Write((Get-Content -LiteralPath $env:MLV_FIXTURE_STDERR -Raw))}
+else{[Console]::Error.Write('fixture-err')}
 exit 0
 ''',encoding="ascii")
     shim.write_text(f'@echo off\r\n"{PWSH}" -NoProfile -NonInteractive -File "{child}" %*\r\n',encoding="ascii")
@@ -1359,6 +1362,63 @@ def test_codex_workspace_write_lane_keeps_default_windows_sandbox(fixture_tree):
     q=json.loads(receipt.read_text(encoding="utf-8"))
     assert q["authority"]["sandbox"]=="workspace-write"
     assert q["authority"]["windowsSandbox"]=="default"
+
+
+# CODEX-UNELEVATED-OVERRIDE-ACK-1 (#329 r1 keys, sol + fable): a codex build that does not know the
+# windows.sandbox key accepts the -c override with exit 0, warns, and keeps its default sandbox, so a
+# receipt that kept the REQUESTED mode claimed a containment that never ran. The warning text is
+# codex's own, copied from review-pr329-sol-r1-20261009T0053Z\sol-001.err.txt (0.162.0); no codex
+# probe short of a model turn prints it (features list, mcp list and an empty-prompt exec all exit
+# before the config warning).
+_CODEX_PREAMBLE = ("OpenAI Codex v0.162.0\n--------\nworkdir: C:\\fixture\nmodel: gpt-6-sol\nprovider: openai\n"
+                   "approval: never\nsandbox: read-only\n--------\nuser\n{prompt}\n")
+_CODEX_IGNORING_HEADER = ("warning: Codex is ignoring 1 unrecognized configuration setting. "
+                          "Check for typos or deprecated settings.\n")
+
+
+def _ignored_key_line(key, source="session flags"):
+    return f"  {source}: `{key}` is ignored.\n"
+
+
+def _codex_lane_with_stderr(fixture_tree, stderr, prompt="fixture prompt"):
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="sol")
+    cmd[cmd.index("-Prompt")+1]=prompt
+    p=fixture_tree["root"]/"fixture-stderr.txt"; p.write_bytes(stderr.encode("utf-8"))
+    env["MLV_FIXTURE_STDERR"]=str(p)
+    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    assert r.returncode==0,(r.stdout,r.stderr)
+    return json.loads(receipt.read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize("key", ["windows.sandbox", "windows"])
+def test_codex_receipt_never_claims_a_windows_sandbox_mode_codex_ignored(fixture_tree, key):
+    # RED on fork/master 29f52739: the receipt said 'unelevated' while codex reported ignoring the key.
+    stderr=(_CODEX_PREAMBLE.format(prompt="fixture prompt")+_CODEX_IGNORING_HEADER+_ignored_key_line(key)
+            +"codex\nfixture narration\n")
+    q=_codex_lane_with_stderr(fixture_tree,stderr)
+    assert q["authority"]["windowsSandbox"]=="requested-unelevated-ignored-by-codex", q["authority"]
+    assert q["authority"]["windowsSandbox"]!="unelevated"
+    assert f"`{key}` is ignored" in q["authority"]["windowsSandboxIgnoredDetail"], q["authority"]
+
+
+def test_codex_receipt_keeps_the_requested_windows_sandbox_when_codex_ignored_another_key(fixture_tree):
+    # The normal run on this host: codex warns about an unrelated user-config key (`cli_auth`, the
+    # exact #329 line). Neither the prompt echo nor a nested codex run quoted in the transcript
+    # (after the bare `codex` line) may flip the receipt, since codex itself never said so.
+    quoted=_CODEX_IGNORING_HEADER+_ignored_key_line("windows.sandbox")
+    prompt="review this stderr:\n"+quoted+"end"
+    stderr=(_CODEX_PREAMBLE.format(prompt=prompt)+_CODEX_IGNORING_HEADER
+            +_ignored_key_line("cli_auth","user (C:\\Users\\fixture\\.codex\\config.toml)")
+            +"codex\nI ran a nested codex:\n"+quoted)
+    q=_codex_lane_with_stderr(fixture_tree,stderr,prompt=prompt)
+    assert q["authority"]["windowsSandbox"]=="unelevated", q["authority"]
+    assert "windowsSandboxIgnoredDetail" not in q["authority"], q["authority"]
+
+
+def test_codex_receipt_keeps_the_requested_windows_sandbox_when_codex_warns_nothing(fixture_tree):
+    q=_codex_lane_with_stderr(fixture_tree,_CODEX_PREAMBLE.format(prompt="fixture prompt")+"codex\nfixture narration\n")
+    assert q["authority"]["windowsSandbox"]=="unelevated", q["authority"]
+    assert "windowsSandboxIgnoredDetail" not in q["authority"], q["authority"]
 
 
 # CODEX-KEY-MCP-ESCAPE-1 (HUB RULING wf_d36c1040-11d): MCP tools (node_repl, ...) run OUTSIDE
