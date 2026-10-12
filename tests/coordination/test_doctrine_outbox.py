@@ -1656,10 +1656,14 @@ def _stub_node(monkeypatch, stdout: str, returncode: int = 0, stderr: str = ""):
     "[validate-cards] 1 file(s), 1 card(s), 0 no-card line(s), 1 problem(s).\n",
     "[validate-cards] 1 file(s), 1 card(s), 0 no-card line(s), 10 problem(s).\n",
     "all good, 0 problem(s)\n",
-], ids=["silent", "one-problem", "ten-problems", "not-the-summary-line"])
+    "[validate-cards] 1 file(s), 1 card(s), 0 no-card line(s), 2 problem(s).\n",
+    "[validate-cards] 1 file(s), not a card-count summary, 0 problem(s).\n",
+    "[validate-cards] 1 file(s), x card(s), 0 no-card line(s), 0 problem(s).\n",
+], ids=["silent", "one-problem", "ten-problems", "not-the-summary-line", "two-problems",
+        "malformed-middle", "non-numeric-card-count"])
 def test_r14_an_exit_zero_without_the_zero_problem_summary_is_a_validator_failure_not_a_pass(tmp_path, monkeypatch, stdout):
     """A node that exits 0 without running the validator's main prints nothing; a pass is exit 0 AND
-    '[validate-cards] N file(s), ..., 0 problem(s).'. Anything else is CARD_VALIDATOR_FAILED, never
+    '[validate-cards] N file(s), N card(s), N no-card line(s), 0 problem(s).'. Anything else is CARD_VALIDATOR_FAILED, never
     CARD_INVALID (it is no verdict on any card) and nothing is pushed."""
     bare, clone = init_bus(tmp_path)
     add_validator(clone)
@@ -1674,6 +1678,22 @@ def test_r14_an_exit_zero_without_the_zero_problem_summary_is_a_validator_failur
     assert excinfo.value.code == "CARD_VALIDATOR_FAILED" and excinfo.value.code != "CARD_INVALID"
     assert git(bare, "rev-parse", "master") == before
     assert not (tmp_path / "sent.jsonl").exists()
+
+
+@needs_node
+def test_r14_the_real_summary_grammar_with_zero_problems_is_a_pass(tmp_path, monkeypatch):
+    """The full summary grammar of validate-cards.mjs, with 0 problems, publishes."""
+    bare, clone = init_bus(tmp_path)
+    add_validator(clone)
+    src = init_source(tmp_path)
+    add_item(src, "20261007-a-good-card.md", target=CARDS, body=CARD_BODY)
+    before = git(bare, "rev-parse", "master")
+    _stub_node(monkeypatch, "[validate-cards] 1 file(s), 1 card(s), 0 no-card line(s), 0 problem(s).\n")
+
+    report = ob.drain(src, clone, "HEAD", tmp_path / "sent.jsonl", [], push=True)
+
+    assert [p["target"] for p in report["published"]] == [CARDS] and not report["refused"]
+    assert git(bare, "rev-parse", "master") != before
 
 
 @needs_node

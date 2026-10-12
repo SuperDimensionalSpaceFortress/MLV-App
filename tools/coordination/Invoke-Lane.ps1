@@ -125,6 +125,14 @@ param(
     # MLV root. The run's own scratch dir is removed when the lane exits unless -KeepScratch;
     # its size is recorded in the receipt either way.
     [string]$ScratchRoot = 'C:\mlvtmp\lane-scratch',
+    # LANE-RECEIPT-SCRATCH-CLEANUP-1: bulk scratch a lane creates OUTSIDE -ScratchRoot (asm, shadow-build,
+    # probe dirs) is listed one absolute path per line in <RunDir>\scratch-paths.txt, normally through
+    # Register-LaneBulkScratch.ps1 (the child gets MLV_LANE_RUN_DIR and MLV_LANE_SCRATCH_MANIFEST).
+    # When the lane exits, each path strictly inside -BulkScratchRoot has
+    # its small text files copied to <RunDir>\scratch-receipts and is removed, unless -KeepBulkScratch.
+    # Hard refusals and the receipt's `bulkScratch` field: Remove-LaneBulkScratch.ps1. Fail open.
+    [string]$BulkScratchRoot = 'C:\mlvtmp',
+    [switch]$KeepBulkScratch,
     # CODEX-KEY-PRIVATE-PIN-1: root of the private codex installs a read-only codex lane may run
     # (one npm --prefix install per version, <CodexPinRoot>\<version>, written only by
     # Promote-CodexPin.ps1). Which version is chosen by the tracked codex-pin.json beside this
@@ -1539,6 +1547,8 @@ if ($ScratchRoot) {
     New-Item -ItemType Directory -Force -Path $scratchDir | Out-Null
     foreach ($v in 'TEMP', 'TMP', 'TMPDIR') { $psi.Environment[$v] = $scratchDir }
 }
+$psi.Environment['MLV_LANE_RUN_DIR'] = $RunDir
+$psi.Environment['MLV_LANE_SCRATCH_MANIFEST'] = (Join-Path $RunDir 'scratch-paths.txt')
 $psi.RedirectStandardInput  = $true
 $psi.RedirectStandardOutput = $true
 $psi.RedirectStandardError  = $true
@@ -1986,6 +1996,18 @@ if ($scratchDir) {
         $scratchDisposition = [ordered]@{ path = $scratchDir; bytes = $null; removed = $false; error = $_.Exception.Message }
     }
 }
+# LANE-RECEIPT-SCRATCH-CLEANUP-1: before the receipt so it can record the outcome; never throws and never
+# changes the exit code or the receipt's state. $null when the lane registered no paths.
+$bulkScratch = $null
+try {
+    if (Test-Path -LiteralPath (Join-Path $RunDir 'scratch-paths.txt') -PathType Leaf) {
+        . (Join-Path $PSScriptRoot 'Remove-LaneBulkScratch.ps1')
+        $bulkScratch = Invoke-RemoveLaneBulkScratch -RunDir $RunDir -WorkDir $WorkDir -Root $BulkScratchRoot `
+            -LaneScratchRoot $ScratchRoot -Keep:$KeepBulkScratch
+    }
+} catch {
+    $bulkScratch = [ordered]@{ manifest = (Join-Path $RunDir 'scratch-paths.txt'); optOut = [bool]$KeepBulkScratch; entries = @(); error = "cannot-determine: $($_.Exception.Message)" }
+}
 $worktreeDisposition = $null
 if ($RetireWorktree) {
     try {
@@ -2223,6 +2245,7 @@ $receipt = [ordered]@{
     providerRefusal = $providerRefusal
     containment  = $containment
     scratch      = $scratchDisposition
+    bulkScratch  = $bulkScratch
     worktreeDisposition = $worktreeDisposition
     worktreeSweep = $worktreeSweep
     processEnded = $processEnded

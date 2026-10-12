@@ -3970,10 +3970,23 @@ MainWindow::PlaybackPrepResult MainWindow::buildPlaybackPrepResult( const Playba
         reducedInputs.mlvHeight = task.mlvHeight;
         const PlaybackPrepReducedDecision reducedDecision =
             playbackPrepDecideReduced( reducedInputs );
+        // CPU-DEBAYERED16-HONOUR-SCALE-1: a frame the render debayered from the
+        // reduced recon is processed at its size with the config reduced to it.
+        GpuPreviewProcessingConfig reducedSourceConfig;
+        const bool reducedSource =
+            playbackPrepReducedSourceConfig( cpuWorkspace,
+                                             gpuPreviewProcessingConfig,
+                                             task.requestContext.gpuPreviewProcessingConfigGeneration,
+                                             reducedDecision,
+                                             sourceWidth,
+                                             sourceHeight,
+                                             task.mlvWidth,
+                                             task.mlvHeight,
+                                             &reducedSourceConfig );
         std::vector<uint8_t> cpuPreviewRgb8;
         const PlaybackPrepCpuRouteResult cpuRoute =
             playbackPrepCpuRouteRun( cpuWorkspace,
-                                     gpuPreviewProcessingConfig,
+                                     reducedSource ? reducedSourceConfig : gpuPreviewProcessingConfig,
                                      task.requestContext.gpuPreviewProcessingConfigGeneration,
                                      rgb16DisplaySource,
                                      sourceWidth,
@@ -6567,6 +6580,56 @@ void MainWindow::drawFrame( bool updateTimecodeLabel )
      * Once Phase 4B lands the dial will start producing smaller buffers
      * without any further plumbing churn. */
     requestContext.playbackScaleFactor = effectivePlaybackScaleFactorForRequest();
+
+    /* CPU-DEBAYERED16-HONOUR-SCALE-1: may the recon worker reconstruct this
+     * request's OutputDebayered16 frame at the preview scale? Only when the prep
+     * would box-reduce the full frame to exactly that scale (its decision with the
+     * inputs buildPlaybackPrepResult uses, the clip's full dims as the source), so
+     * the presented frame keeps the dims it has today. */
+    {
+        const GpuPreviewProcessingConfig &prepConfig = requestContext.gpuPreviewProcessingConfig;
+        PlaybackPrepReducedInputs prepInputs;
+        prepInputs.killSwitch =
+            qEnvironmentVariableIsSet( playbackPrepReducedKillSwitchName() )
+            && qEnvironmentVariable( playbackPrepReducedKillSwitchName() ).trimmed()
+                   != QStringLiteral("0");
+        prepInputs.playbackActive = playbackPolicyActive();
+        prepInputs.scopesVisible = mainWindowHasScopeVisualization( renderPolicy );
+        prepInputs.zebrasEnabled = renderPolicy.zebrasEnabled;
+        prepInputs.pipelineCaptureActive = mlv_pipeline_capture_enabled() != 0;
+        prepInputs.gpuImagePresentation = useGpuImagePresentation;
+        prepInputs.zoomFit = zoomFitEnabled;
+        prepInputs.spatialPostPass = gpuPreviewProcessingCpuHasSpatialPostPass( prepConfig );
+        prepInputs.highlightReconExact =
+            prepConfig.applyHighlightReconstruction && !prepConfig.highlightReconDualIso;
+        // The render attaches the S/H frame state later; assume the quarter blur.
+        prepInputs.shQuarterBlur = prepConfig.applyShadowsHighlights;
+        prepInputs.requestedScale = requestContext.playbackScaleFactor;
+        prepInputs.sourceWidth = sourceWidth;
+        prepInputs.sourceHeight = sourceHeight;
+        prepInputs.mlvWidth = sourceWidth;
+        prepInputs.mlvHeight = sourceHeight;
+
+        Debayered16HonourScaleInputs honourScale;
+        honourScale.playbackActive = requestContext.playbackActive;
+        honourScale.cpuPreviewRoute =
+            requestContext.renderThreadUsingCpuPreviewProcessing
+            && renderOutputMode == RenderFrameThread::OutputDebayered16;
+        honourScale.gpuPreviewRoute = requestContext.renderThreadUsingGpuPreviewProcessing;
+        honourScale.gpuAmazeDebayer = requestContext.renderThreadUsingGpuAmazeDebayer;
+        honourScale.gpuBilinearDebayer = requestContext.renderThreadUsingGpuBilinearDebayer;
+        honourScale.gpuReconTextureRoute = requestContext.gpuPlaybackReconTexturePresentRequested;
+        honourScale.amazeDebayer = m_pMlvObject && doesMlvAlwaysUseAmaze( m_pMlvObject ) != 0;
+        honourScale.requestedScale = requestContext.playbackScaleFactor;
+        honourScale.prepFactor = playbackPrepDecideReduced( prepInputs ).factor;
+        const Debayered16HonourScaleRefusal honourScaleRefusal =
+            debayered16HonourScaleRefusal( honourScale );
+        requestContext.cpuDebayered16HonourScaleRefusal = honourScaleRefusal;
+        requestContext.cpuDebayered16HonourScaleAdmitted =
+            honourScaleRefusal == Debayered16HonourScaleRefusal::None;
+        requestContext.cpuDebayered16HonourScaleReason =
+            QString::fromLatin1( debayered16HonourScaleRefusalReason( honourScaleRefusal ) );
+    }
 
     RenderFrameThread::PresentationPreparationOptions presentationPreparation;
     presentationPreparation.fastPlaybackScale = requestContext.fastPlaybackScaleEligible;
@@ -24455,6 +24518,9 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     m_playbackSmokeDebayered16WorkerLlrawprocSumMs = 0.0;
     m_playbackSmokeDebayered16RenderLlrawprocSumMs = 0.0;
     m_playbackSmokeDebayered16OutcomeFrames.clear();
+    m_playbackSmokeDebayered16ReducedConsumedFrames = 0;
+    m_playbackSmokeDebayered16HonourScaleRefusalLast.clear();
+    m_playbackSmokeDebayered16HonourScaleRefusalCounts.clear();
     for( size_t i = 0; i < m_playbackSmokeDebayered16AttemptsAtBegin.size(); ++i )
     {
         m_playbackSmokeDebayered16AttemptsAtBegin[i] = m_pRenderThread
@@ -25601,6 +25667,12 @@ void MainWindow::notePlaybackSmokePresentedFrame(
         }
         ++m_playbackSmokeDebayered16OutcomeFrames[
             telemetryStringValue( timing, "debayered16_phase3_recon_outcome" )];
+        if( telemetryBoolValue( timing, "debayered16_reduced_recon_consumed" ) )
+            ++m_playbackSmokeDebayered16ReducedConsumedFrames;
+        m_playbackSmokeDebayered16HonourScaleRefusalLast =
+            telemetryStringValue( timing, "debayered16_honour_scale_refusal" );
+        ++m_playbackSmokeDebayered16HonourScaleRefusalCounts[
+            m_playbackSmokeDebayered16HonourScaleRefusalLast];
         m_playbackSmokeDebayered16WorkerLlrawprocSumMs +=
             telemetryDoubleValue( timing, "debayered16_recon_worker_llrawproc_total_ms" );
         m_playbackSmokeDebayered16RenderLlrawprocSumMs +=
@@ -28188,7 +28260,9 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                    "debayered16_fallback_reason_last=\"%6\" "
                    "refused_acquisition_failed=%7 refused_gpu_playback_recon=%8 "
                    "refused_settings_changed_during_recon=%9 "
-                   "refused_settings_changed_since_recon=%10" )
+                   "refused_settings_changed_since_recon=%10 "
+                   "reduced_consumed_frames=%11 honour_scale_refusal_last=%12 "
+                   "honour_scale_refusal_counts=%13" )
                    .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
                    .arg( m_playbackSmokeDebayered16ReconConsumedFrames )
                    .arg( m_playbackSmokeDebayered16OwnReconFrames )
@@ -28198,7 +28272,20 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                    .arg( presentedOutcome( Debayered16ReconRefusal::AcquisitionFailed ) )
                    .arg( presentedOutcome( Debayered16ReconRefusal::GpuPlaybackRecon ) )
                    .arg( presentedOutcome( Debayered16ReconRefusal::SettingsChangedDuringRecon ) )
-                   .arg( presentedOutcome( Debayered16ReconRefusal::SettingsChangedSinceRecon ) );
+                   .arg( presentedOutcome( Debayered16ReconRefusal::SettingsChangedSinceRecon ) )
+                   .arg( m_playbackSmokeDebayered16ReducedConsumedFrames )
+                   .arg( m_playbackSmokeDebayered16HonourScaleRefusalLast.isEmpty()
+                             ? QStringLiteral("unset")
+                             : m_playbackSmokeDebayered16HonourScaleRefusalLast )
+                   .arg( [this]() {
+                             QStringList parts;
+                             for( auto it = m_playbackSmokeDebayered16HonourScaleRefusalCounts.constBegin();
+                                  it != m_playbackSmokeDebayered16HonourScaleRefusalCounts.constEnd(); ++it )
+                                 parts << QStringLiteral("%1:%2")
+                                              .arg( it.key().isEmpty() ? QStringLiteral("unset") : it.key() )
+                                              .arg( it.value() );
+                             return parts.isEmpty() ? QStringLiteral("none") : parts.join( QLatin1Char(',') );
+                         }() );
 
         /* Every render attempt in the session, presented or not (Sol H3): the
          * render thread's counters minus their value at session begin. */
