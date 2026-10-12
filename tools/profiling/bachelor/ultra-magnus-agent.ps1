@@ -18,6 +18,7 @@
 #   processed\                   - consumed job scripts and metadata are moved here
 #   orphaned\                    - abandoned job scripts are preserved here
 #   cancel\<jobId>.cancel        - cooperative cancellation request
+#   slot-holders\                - r1c: each gated job's heavy-slot.py holder (record, acquired, release files)
 #   logs\                        - per-job stdout/stderr capture plus agent.log
 #   heartbeat.txt                - rewritten every poll so the VM can prove liveness
 #
@@ -44,13 +45,19 @@ param(
     [string]$HeavySlotDir = $(if ($env:HEAVY_SLOT_DIR) { $env:HEAVY_SLOT_DIR } else { "C:\t\.heavy-slots" }),
     [ValidateRange(1, 8)]
     [int]$HeavySlotCount = 2,
-    [int]$GateMaxTempC = 95,
-    [int]$GateJoinWatts = 15,
-    [int]$GateJoinClearSec = 300,
+    # r1c: SUSTAINED heat, read from the same feed heavy-slot.py reads (its HEAVY_SLOT_FEED override honoured):
+    # blocked only when > GateMaxThrottledRows of the last GateSustainedRows rows are throttled, or their mean is
+    # >= GateMeanMaxC. These defaults are heavy-slot.py's own first-run rule (thr60 <= 6 and mean60 < 88).
+    [string]$HeavySlotFeed = $(if ($env:HEAVY_SLOT_FEED) { $env:HEAVY_SLOT_FEED } else { "C:\temp\hwinfo-log-adapter.csv" }),
+    [ValidateRange(15, 150)]
+    [int]$GateSustainedRows = 60,
+    [ValidateRange(0, 150)]
+    [int]$GateMaxThrottledRows = 6,
+    [double]$GateMeanMaxC = 88,
+    [ValidateRange(10, 3600)]
+    [int]$GateFeedStaleSec = 120,
     [ValidateRange(2, 120)]
     [int]$GateProbeSec = 15,
-    [ValidateRange(0, 86400)]
-    [int]$GateHotWaitCapSec = 600,   # r1i: < the dual-venue playback legs' queueWaitSec (900 s)
     [ValidateRange(0, 3600)]
     [int]$GateIdleSampleSec = 60,
     # r1g/r1h: job ids the gate does not hold (light: ~1 s load probes, ~5 s venue health probes dve-*-health, agent maintenance). Anchored.
@@ -65,8 +72,9 @@ $logs      = Join-Path $Root "logs"
 $running   = Join-Path $Root "running"
 $orphaned  = Join-Path $Root "orphaned"
 $cancel    = Join-Path $Root "cancel"
+$slotHolders = Join-Path $Root "slot-holders"
 $heartbeat = Join-Path $Root "heartbeat.txt"
-foreach ($d in @($inbox, $outbox, $processed, $logs, $running, $orphaned, $cancel)) {
+foreach ($d in @($inbox, $outbox, $processed, $logs, $running, $orphaned, $cancel, $slotHolders)) {
     New-Item -ItemType Directory -Force -Path $d | Out-Null
 }
 
@@ -430,7 +438,9 @@ function Start-WindowlessRedirectedProcess {
         [Parameter(Mandatory = $true)][string[]]$ArgumentList,
         [Parameter(Mandatory = $true)][string]$OutFile,
         [Parameter(Mandatory = $true)][string]$ErrFile,
-        [string]$WorkingDirectory = $Root
+        [string]$WorkingDirectory = $Root,
+        # r1c: per-child environment overrides; a $null value removes the variable from the child's environment.
+        [hashtable]$Environment = @{}
     )
 
     $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
@@ -442,6 +452,9 @@ function Start-WindowlessRedirectedProcess {
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
     foreach ($argument in $ArgumentList) { [void]$startInfo.ArgumentList.Add($argument) }
+    foreach ($k in $Environment.Keys) {
+        if ($null -eq $Environment[$k]) { [void]$startInfo.Environment.Remove($k) } else { $startInfo.Environment[$k] = [string]$Environment[$k] }
+    }
 
     $outStream = $null
     $errStream = $null
@@ -682,7 +695,7 @@ function New-AdmissionWaitMarker {
         [Parameter(Mandatory = $true)][string]$JobId,
         [Parameter(Mandatory = $true)]$Job,
         [Parameter(Mandatory = $true)]$Metadata,
-        [string]$GateReason = "waiting for heavy-slot admission (a free slot and a clear thermal feed)"
+        [string]$GateReason = "waiting for heavy-slot admission (heavy-slot.py FIFO, an empty machine, sustained heat clear)"
     )
 
     $markerPath = Join-Path $running "$JobId.started.json"
@@ -779,7 +792,7 @@ function New-LaunchingMarker {
         childStartUtc          = $null
         childStartEpochMs      = $null
         childImagePath         = $null
-        # Heavy-slot admission (label clear / loaded-comparable), persisted so a result published by a
+        # Heavy-slot admission (label clear, or exempt-light), persisted so a result published by a
         # RESTARTED agent (adoption / orphan recovery) carries the same load label as a normal one.
         admission              = $script:Admission
     }
@@ -1198,7 +1211,7 @@ function Resolve-StartedMarkerFile {
 
     # GATE-2: a job the previous agent was HOLDING in the admission gate never launched (no child), so it is
     # neither adoptable nor orphaned. Its job file is still in inbox\, so it is re-queued: the main loop below
-    # gates it again. Its slot, if the dead agent had just reserved one, is reclaimed by heavy-slot.py.
+    # gates it again. r1c: a waiting job held no slot; its queued holder is stopped at start (Stop-StaleHeavySlotHolders).
     if ($marker.phase -eq "admission-wait" -and $null -eq $marker.childPid) {
         Invoke-RequeueAdmissionWait -Marker $marker -MarkerPath $MarkerPath
         return
@@ -1288,42 +1301,46 @@ function Resolve-StartedMarkers {
 }
 
 # ---------------------------------------------------------------------------
-# Heavy-slot admission gate (MLV-AGENT-HEAVY-SLOT-GATE-1, 2026-10-10, owner-directed)
+# Heavy-slot admission gate (MLV-AGENT-HEAVY-SLOT-GATE-1, 2026-10-10, owner-directed;
+# reworked by AGENT-HEAVY-SLOT-WAIT-RELEASE-1 r1c, 2026-10-11)
 #
 # WHY: this agent ran CUDA playback-smoke jobs outside the laptop's machine-wide heavy-slot cap
 # (~\.claude\ops\heavy-slot.py, MACHINE.md s0.14) and throttled it at 100 C (2026-10-09 22:15).
-# These jobs are playback-timing attribution, so a job on a throttled package also measures the
-# throttle: the gate protects their data as well as the laptop.
+# These jobs are playback-timing attribution, so a job beside another heavy run also measures that
+# run: every gated job runs ALONE (no other slot held) and EXCLUSIVE (nothing joins it).
 #
-# WHAT: before each job, `heavy-slot.py status` is probed every GateProbeSec seconds and the job
-# waits, heartbeating with its reason, until a slot is free and the feed is clear. The job then
-# HOLDS a slot itself (same C:\t\.heavy-slots\<n>\owner.json format as heavy-slot.py) so no other heavy
-# run joins mid-measurement. The LIVE AGENT's pid owns it for the whole job (r1d): a live owner is never
-# reclaimed by heavy-slot.py, so release is a race-free check-then-delete. If the agent dies mid-job the
-# slot is reclaimed while the child may still run; the restarted agent adopts the child and labels the
-# result loaded-comparable (admission.slotContinuity = lost) instead of claiming a slot it did not hold.
-# Eligibility is re-checked after the reservation (a slot taken by someone else in between turns this
-# job into a joiner). A cancel or a queue-expiry while waiting publishes an unlaunched result; nothing
-# runs. The child launch contract is unchanged (the job is not wrapped in heavy-slot.py run).
+# r1c (design from the Bachelor heat-coordination session, owner-relayed; MACHINE s0.15-s0.28):
+#   1. SUSTAINED HEAT, not spikes. The feed's PackageC is the hottest single core, and few-thread
+#      P-core turbo touches TjMax at 40-65 W by design, so the old 15-row max read turbo spikes as
+#      busy (rows at maxC 93-100 with throttled 0/15 held jobs). A job is blocked on heat only when
+#      more than GateMaxThrottledRows of the last GateSustainedRows feed rows are throttled, OR their
+#      mean is >= GateMeanMaxC: heavy-slot.py's own first-run rule (thr60 <= 6 and mean60 < 88).
+#   2. FAIRNESS, and no wait cap. The long waits (9390 s on 2026-10-11) were starvation: an exclusive
+#      job needs an EMPTY machine and other runs kept refilling it between this agent's polls. So the
+#      agent no longer polls for a gap. It joins heavy-slot.py's own FIFO by running a slot HOLDER:
+#          python heavy-slot.py run --exclusive --label "mlv <jobId>" --slots N -- <psExe> -EncodedCommand <sentinel>
+#      heavy-slot.py files the ticket (<slot dir>\queue\<ns>-<pid>.json), serves the oldest live
+#      ticket first, waits for an empty machine, acquires the slot exclusively, runs the sentinel and
+#      releases the slot when the sentinel exits. Dead waiters' tickets and dead owners' slots are
+#      reclaimed by heavy-slot.py. THIS AGENT NEVER WRITES A SLOT OR A TICKET ITSELF.
+#      The sentinel publishes slot-holders\<id>.acquired.json (with HEAVY_SLOT_HELD="<slot>:<owner
+#      pid>"), then holds until slot-holders\<id>.release exists or this agent (pid + start time) is
+#      gone. The job itself is NOT wrapped: the launch handoff, timeout, adoption and child-identity
+#      contracts are unchanged. The job inherits HEAVY_SLOT_HELD, so a heavy-slot.py run nested in it
+#      passes straight through (heavy-slot.py NESTING). There is no wait cap and no admitted-after-cap
+#      label: starting CUDA playback beside a running suite is the pairing this gate exists to prevent.
+#   3. A WAITING JOB HOLDS NO SLOT. r1j-r1k reserved a slot while waiting and then counted that
+#      reservation as busy ("all 2 slot(s) held" with no MLVApp running). Now only the holder holds a
+#      slot, and only from acquisition to the end of the job.
 #
-# THREE OUTCOMES per probe, never merged:
-#   clear        - slot free, last ~30 s show no throttling and nothing >= GateMaxTempC (a JOINER,
-#                  i.e. one slot already held, also needs < GateJoinWatts and GateJoinClearSec of
-#                  continuous clear probes, mirroring heavy-slot.py's 150-row join rule)
-#   hot          - throttling / too hot / join rule unmet
-#   slots-full   - every slot held by a live owner
-#   feed-unknown - status failed, timed out, or reported the feed stale/unreadable/missing.
-#                  heavy-slot.py itself proceeds on an unknown feed; this gate REFUSES: it waits,
-#                  with no cap, because an unknown package temperature is not a clear one.
+# Once the holder has acquired, the agent re-checks with its own slot excluded: busy == 0 and
+# sustained heat clear. If either fails, or the feed or status cannot be read, the holder is released
+# and the job re-joins the FIFO: a job that is not running never keeps a slot. Light probes
+# (GateExemptJobPattern) are not gated and take no slot.
 #
-# STARVATION (bus card mlv-app/an-absolute-cpu-quiet-gate-starves-on-an-owner-used-host): an
-# absolute thermal wait on a host the owner also uses can starve the queue. So: every probe is logged
-# (logs\heavy-slot-gate.jsonl, also sampled every GateIdleSampleSec while idle), an hourly pass rate
-# goes to agent.log and logs\heavy-slot-gate-hourly.jsonl, and a job that has waited GateHotWaitCapSec
-# on HOT alone is admitted when NO other heavy run holds a slot, labelled loaded-comparable (result
-# field admission.label, child env MLV_AGENT_ADMISSION) instead of being blocked indefinitely. r1i: the cap also admits
-# a JOINER (it takes the free second slot; the 2-slot cap holds) and is 600 s by default. It never admits on feed-unknown
-# or slots-full.
+# Every probe goes to logs\heavy-slot-gate.jsonl (also sampled every GateIdleSampleSec while idle), with an
+# hourly summary in agent.log and logs\heavy-slot-gate-hourly.jsonl. The heartbeat carries
+# "gate-wait job=<id> state=<s> waited=<n>s", which um-run.ps1 reads.
 #
 # CLAIM (MLV-AGENT-HEAVY-SLOT-GATE-2 r2): a held job is CLAIMED before it waits -- running\<id>.started.json with
 # phase=admission-wait and childPid null. Without it the VM client (tools/profiling/um-run.ps1) saw no marker
@@ -1334,27 +1351,12 @@ function Resolve-StartedMarkers {
 # that finds launching adopts a live child found by command line, re-queues only on proof nothing launched (no
 # live child and no out file), and otherwise orphans (Resolve-LaunchingMarker).
 # ---------------------------------------------------------------------------
-$script:GateVersion = "heavy-slot-gate-1 r1k + heavy-slot-gate-2 r2e admission-claim launch-handoff marker-crash-safe (2026-10-10)"
-$script:HeavySlotHeld = $null
-$script:HeavySlotOwnerPid = 0
-$script:PendingSlotReleases = @()
-$script:HeavySlotLabel = $null
-$script:HeavySlotStart = $null
+$script:GateVersion = "heavy-slot-gate-1 r1k + heavy-slot-gate-2 r2e + wait-release r1c fifo-holder sustained-heat (2026-10-11)"
+$script:HeavySlotHolder = $null
 $script:Admission = $null
 $script:GateHourKey = $null
 $script:GateHour = $null
 $script:GateLastIdleSampleUtc = [DateTime]::MinValue
-$script:GateCreateDirApi = $false
-try {
-    Add-Type -Namespace MlvApp.Agent -Name NativeFs -MemberDefinition @"
-[System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
-public static extern bool CreateDirectoryW(string lpPathName, System.IntPtr lpSecurityAttributes);
-"@ -ErrorAction Stop
-    $script:GateCreateDirApi = $true
-}
-catch {
-    Add-AgentLogLine "heavy-slot-gate: CreateDirectoryW unavailable, slots cannot be taken atomically; every job will wait: $($_.Exception.Message)"
-}
 
 function Resolve-HeavySlotPython {
     if (Test-Path -LiteralPath $HeavySlotPython -PathType Leaf) { return $HeavySlotPython }
@@ -1364,7 +1366,7 @@ function Resolve-HeavySlotPython {
 }
 
 function Invoke-HeavySlotStatus {
-    # Returns @{ ok; lines; error }. ok=$false is FEED-UNKNOWN, never clear.
+    # Returns @{ ok; lines; error }. ok=$false is UNKNOWN occupancy, never an empty machine.
     param([string]$HeartbeatActivity = "")
     $py = Resolve-HeavySlotPython
     if (-not $py) { return @{ ok = $false; lines = @(); error = "python not found ($HeavySlotPython)" } }
@@ -1379,6 +1381,7 @@ function Invoke-HeavySlotStatus {
         $si.RedirectStandardOutput = $true
         $si.RedirectStandardError = $true
         $si.Environment["HEAVY_SLOT_DIR"] = $HeavySlotDir
+        $si.Environment["HEAVY_SLOT_FEED"] = $HeavySlotFeed
         $p = [System.Diagnostics.Process]::Start($si)
         $outTask = $p.StandardOutput.ReadToEndAsync()
         $errTask = $p.StandardError.ReadToEndAsync()
@@ -1405,47 +1408,133 @@ function Invoke-HeavySlotStatus {
     }
 }
 
-function Get-HeavySlotVerdict {
-    # Pure: classifies one status probe. $ClearForSec = how long probes have been continuously clear.
-    # $OwnSlot = the slot number this agent already reserved (revalidation after reservation): it counts
-    # as neither busy nor free, so the verdict is about everyone ELSE.
-    param($Status, [double]$ClearForSec = 0, [int]$OwnSlot = 0)
-    $v = [ordered]@{ state = "feed-unknown"; thermal = $null; busy = 0; freeSlots = @(); maxC = $null; throttled = $null; rows = $null; watts = $null; why = $null }
-    if (-not $Status.ok) { $v.why = $Status.error; return [pscustomobject]$v }
-    $slotLines = @($Status.lines | Where-Object { $_ -match '^slot (\d+): (.*)$' })
-    $thermalLine = @($Status.lines | Where-Object { $_ -match '^thermal: ' }) | Select-Object -First 1
-    if ($slotLines.Count -lt 1 -or -not $thermalLine) { $v.why = "status output unrecognised"; return [pscustomobject]$v }
+function ConvertFrom-HeavySlotFeedRows {
+    # Pure: heavy-slot.py's feed_metrics() over feed CSV rows (oldest first; the last 150 are used). Columns:
+    # 3 = PackageC (the hottest core), 4 = package W, 5 / 6 = core / package-ring throttling ("Yes").
+    # Returns $null (feed unknown) when a data row does not parse or fewer than 15 data rows remain.
+    param([AllowEmptyCollection()][AllowNull()][string[]]$Lines)
+    $inv = [System.Globalization.CultureInfo]::InvariantCulture
+    $num = [System.Globalization.NumberStyles]::Float
+    $recs = [System.Collections.Generic.List[object]]::new()
+    foreach ($r in @($Lines | Select-Object -Last 150)) {
+        if ([string]::IsNullOrEmpty($r)) { continue }
+        $c = $r.Split(",")
+        if ($c.Count -lt 7 -or $c[0].Length -lt 1 -or -not [char]::IsDigit($c[0], 0)) { continue }
+        $t = 0.0
+        $w = 0.0
+        if (-not [double]::TryParse($c[3], $num, $inv, [ref]$t)) { return $null }
+        if (-not [double]::TryParse($c[4], $num, $inv, [ref]$w)) { return $null }
+        $recs.Add([pscustomobject]@{ c = $t; w = $w; thr = ($c[5].Trim() -eq "Yes" -or $c[6].Trim() -eq "Yes") })
+    }
+    if ($recs.Count -lt 15) { return $null }
+    $win = @($recs | Select-Object -Last $GateSustainedRows)
+    $last15 = @($recs | Select-Object -Last 15)
+    return [pscustomobject]@{
+        rows      = $recs.Count
+        window    = $win.Count
+        throttled = @($win | Where-Object { $_.thr }).Count
+        meanC     = ($win | Measure-Object -Property c -Average).Average
+        max15C    = ($last15 | Measure-Object -Property c -Maximum).Maximum
+        watts30   = [Math]::Round(($last15 | Measure-Object -Property w -Average).Average, 1)
+    }
+}
+
+function Read-HeavySlotFeedMetrics {
+    # Returns @{ metrics; why }. metrics=$null is FEED UNKNOWN: missing, older than GateFeedStaleSec, unreadable,
+    # or fewer than 15 data rows (heavy-slot.py's own staleness and row rules).
+    try {
+        $fi = [System.IO.FileInfo]::new($HeavySlotFeed)
+        if (-not $fi.Exists) { return @{ metrics = $null; why = "feed missing ($HeavySlotFeed)" } }
+        $age = ([DateTime]::UtcNow - $fi.LastWriteTimeUtc).TotalSeconds
+        if ($age -gt $GateFeedStaleSec) { return @{ metrics = $null; why = "feed stale ($([int]$age) s > $GateFeedStaleSec s)" } }
+        $fs = [System.IO.File]::Open($HeavySlotFeed, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete)
+        $start = [Math]::Max([long]0, $fs.Length - (80 * 150 + 400))
+        try {
+            [void]$fs.Seek($start, [System.IO.SeekOrigin]::Begin)
+            $sr = [System.IO.StreamReader]::new($fs, [System.Text.Encoding]::UTF8)
+            $text = $sr.ReadToEnd()
+        }
+        finally { $fs.Dispose() }
+        $lines = @($text -split "`r?`n")
+        if ($start -gt 0) { $lines = @($lines | Select-Object -Skip 1) }   # the first line read mid-row is partial
+        $m = ConvertFrom-HeavySlotFeedRows -Lines $lines
+        if ($null -eq $m) { return @{ metrics = $null; why = "feed unreadable or fewer than 15 rows" } }
+        return @{ metrics = $m; why = $null }
+    }
+    catch {
+        return @{ metrics = $null; why = "feed read failed: $($_.Exception.Message)" }
+    }
+}
+
+function Get-SustainedHeatVerdict {
+    # Pure. BLOCKED (hot) only when more than GateMaxThrottledRows of the last GateSustainedRows rows are throttled,
+    # or their mean is >= GateMeanMaxC -- heavy-slot.py's first-run rule. A turbo spike (a 100 C max with no
+    # throttled rows and a cool mean) does NOT block. $Metrics=$null is feed-unknown.
+    param($Metrics, [string]$UnknownWhy = "feed unknown")
+    if ($null -eq $Metrics) { return [pscustomobject]@{ state = "feed-unknown"; why = $UnknownWhy } }
+    $inv = [System.Globalization.CultureInfo]::InvariantCulture
+    $s = [string]::Format($inv, "throttled {0}/{1}, mean {2:F1} C, max15 {3:F0} C, {4:F0} W", $Metrics.throttled, $Metrics.window, $Metrics.meanC, $Metrics.max15C, $Metrics.watts30)
+    if ($Metrics.throttled -gt $GateMaxThrottledRows -or $Metrics.meanC -ge $GateMeanMaxC) {
+        return [pscustomobject]@{ state = "hot"; why = "sustained heat: $s (blocks at > $GateMaxThrottledRows throttled or mean >= $GateMeanMaxC C)" }
+    }
+    return [pscustomobject]@{ state = "clear"; why = $s }
+}
+
+function Get-HeavySlotOccupancy {
+    # Pure: who holds a slot, from `heavy-slot.py status`. $OwnSlot (this job's holder slot) counts as neither busy
+    # nor free, so busy is about everyone ELSE. Also reads this job's position in heavy-slot.py's FIFO (queue lines).
+    # ok=$false is UNKNOWN, never empty.
+    param($Status, [int]$OwnSlot = 0, [string]$Label = "")
+    $o = [ordered]@{ ok = $false; busy = 0; holders = @(); queuePos = 0; queueLen = 0; why = $null }
+    if (-not $Status.ok) { $o.why = $Status.error; return [pscustomobject]$o }
+    $slotLines = @($Status.lines | Where-Object { $_ -match '^slot \d+: ' })
+    if ($slotLines.Count -lt 1) { $o.why = "status output unrecognised"; return [pscustomobject]$o }
     $ownSeen = $false
     foreach ($l in $slotLines) {
-        if ($l -match '^slot (\d+): (.*)$') {
-            $n = [int]$Matches[1]
-            if ($OwnSlot -gt 0 -and $n -eq $OwnSlot) { $ownSeen = $Matches[2] -ne "free"; continue }
-            if ($Matches[2] -eq "free") { $v.freeSlots += $n } else { $v.busy++ }
+        if ($l -notmatch '^slot (\d+): (.*)$') { continue }
+        $n = [int]$Matches[1]
+        $who = $Matches[2]
+        if ($OwnSlot -gt 0 -and $n -eq $OwnSlot) { $ownSeen = $who -ne "free"; continue }
+        if ($who -ne "free") { $o.busy++; $o.holders += $who }
+    }
+    foreach ($l in @($Status.lines | Where-Object { $_ -match '^queue \d+: ' })) {
+        if ($l -match '^queue (\d+): (.*) \(pid ') {
+            $o.queueLen++
+            if ($Label -and $o.queuePos -eq 0 -and $Matches[2] -eq $Label) { $o.queuePos = [int]$Matches[1] }
         }
     }
-    if ($OwnSlot -gt 0 -and -not $ownSeen) { $v.why = "own slot $OwnSlot not shown as held"; return [pscustomobject]$v }
-    $v.thermal = ($thermalLine -replace '^thermal: ', '').Trim()
-    if ($v.thermal -notmatch '^max (\d+) C, throttled (\d+)/(\d+), (-?\d+) W') {
-        $v.why = "feed not readable as clear: $($v.thermal)"
-        return [pscustomobject]$v
+    if ($OwnSlot -gt 0 -and -not $ownSeen) { $o.why = "own slot $OwnSlot not shown as held"; return [pscustomobject]$o }
+    $o.ok = $true
+    return [pscustomobject]$o
+}
+
+function Get-HeavySlotVerdict {
+    # Pure: one admission verdict from a status probe and a feed read. State, first match wins:
+    #   status-unknown (occupancy unreadable) | busy (another run holds a slot) | feed-unknown | hot | clear
+    param($Status, $Feed, [int]$OwnSlot = 0, [string]$Label = "")
+    $occ = Get-HeavySlotOccupancy -Status $Status -OwnSlot $OwnSlot -Label $Label
+    $heat = Get-SustainedHeatVerdict -Metrics $Feed.metrics -UnknownWhy ([string]$Feed.why)
+    $m = $Feed.metrics
+    $v = [ordered]@{
+        state = $null; busy = $occ.busy; holders = @($occ.holders); queuePos = $occ.queuePos; queueLen = $occ.queueLen
+        heat = $heat.state; throttled = $null; window = $null; meanC = $null; max15C = $null; watts = $null
+        thermal = $heat.why; why = $null
     }
-    $v.maxC = [int]$Matches[1]; $v.throttled = [int]$Matches[2]; $v.rows = [int]$Matches[3]; $v.watts = [int]$Matches[4]
-    if ($v.rows -lt 1) { $v.why = "no feed rows"; return [pscustomobject]$v }
-    if ($OwnSlot -eq 0 -and $v.freeSlots.Count -eq 0) { $v.state = "slots-full"; $v.why = "all $($v.busy) slot(s) held"; return [pscustomobject]$v }
-    if ($v.throttled -gt 0 -or $v.maxC -ge $GateMaxTempC) { $v.state = "hot"; $v.why = "throttled $($v.throttled)/$($v.rows), max $($v.maxC) C"; return [pscustomobject]$v }
-    if ($v.busy -gt 0) {
-        if ($v.watts -ge $GateJoinWatts) { $v.state = "hot"; $v.why = "joiner: package $($v.watts) W >= $GateJoinWatts W"; return [pscustomobject]$v }
-        if ($ClearForSec -lt $GateJoinClearSec) { $v.state = "hot"; $v.why = "joiner: clear for $([int]$ClearForSec) s < $GateJoinClearSec s"; return [pscustomobject]$v }
+    if ($null -ne $m) {
+        $v.throttled = $m.throttled; $v.window = $m.window; $v.meanC = [Math]::Round($m.meanC, 1); $v.max15C = $m.max15C; $v.watts = $m.watts30
     }
-    $v.state = "clear"; $v.why = "clear"
+    if (-not $occ.ok) { $v.state = "status-unknown"; $v.why = $occ.why }
+    elseif ($occ.busy -gt 0) { $v.state = "busy"; $v.why = "busy: $($occ.busy) other heavy run(s): $($occ.holders -join '; ')" }
+    elseif ($heat.state -ne "clear") { $v.state = $heat.state; $v.why = $heat.why }
+    else { $v.state = "clear"; $v.why = "clear: $($heat.why)" }
     return [pscustomobject]$v
 }
 
 function Add-GateProbeRecord {
-    param([string]$JobId, $Verdict, [double]$WaitedSec, [string]$Phase)
+    param([string]$JobId, $Verdict, [double]$WaitedSec, [string]$Phase, [string]$WaitState = "")
     $now = (Get-Date).ToUniversalTime()
     try {
-        $rec = [ordered]@{ utc = $now.ToString("o"); phase = $Phase; job = $JobId; state = $Verdict.state; busy = $Verdict.busy; maxC = $Verdict.maxC; throttled = $Verdict.throttled; rows = $Verdict.rows; watts = $Verdict.watts; waitedSec = [int]$WaitedSec; why = $Verdict.why }
+        $rec = [ordered]@{ utc = $now.ToString("o"); phase = $Phase; job = $JobId; state = $Verdict.state; wait = $WaitState; busy = $Verdict.busy; queuePos = $Verdict.queuePos; queueLen = $Verdict.queueLen; throttled = $Verdict.throttled; rows = $Verdict.window; meanC = $Verdict.meanC; max15C = $Verdict.max15C; watts = $Verdict.watts; waitedSec = [int]$WaitedSec; why = $Verdict.why }
         [System.IO.File]::AppendAllText((Join-Path $logs "heavy-slot-gate.jsonl"), ($rec | ConvertTo-Json -Compress) + [Environment]::NewLine, [System.Text.Encoding]::ASCII)
     }
     catch { }
@@ -1453,14 +1542,14 @@ function Add-GateProbeRecord {
     if ($script:GateHourKey -ne $key) {
         Write-GateHourSummary
         $script:GateHourKey = $key
-        $script:GateHour = [ordered]@{ hour = "$key`Z"; probes = 0; clear = 0; hot = 0; slotsFull = 0; feedUnknown = 0; admittedClear = 0; admittedLoaded = 0; waitSecTotal = 0 }
+        $script:GateHour = [ordered]@{ hour = "$key`Z"; probes = 0; clear = 0; hot = 0; busy = 0; unknown = 0; admitted = 0; requeued = 0; waitSecTotal = 0 }
     }
     $script:GateHour.probes++
     switch ($Verdict.state) {
         "clear" { $script:GateHour.clear++ }
         "hot" { $script:GateHour.hot++ }
-        "slots-full" { $script:GateHour.slotsFull++ }
-        default { $script:GateHour.feedUnknown++ }
+        "busy" { $script:GateHour.busy++ }
+        default { $script:GateHour.unknown++ }
     }
 }
 
@@ -1468,7 +1557,7 @@ function Write-GateHourSummary {
     if ($null -eq $script:GateHour -or $script:GateHour.probes -eq 0) { return }
     $h = $script:GateHour
     $rate = [Math]::Round($h.clear / $h.probes, 3)
-    Add-AgentLogLine "heavy-slot-gate hour=$($h.hour) probes=$($h.probes) clear=$($h.clear) hot=$($h.hot) slotsFull=$($h.slotsFull) feedUnknown=$($h.feedUnknown) passRate=$rate admittedClear=$($h.admittedClear) admittedLoaded=$($h.admittedLoaded) waitSecTotal=$($h.waitSecTotal)"
+    Add-AgentLogLine "heavy-slot-gate hour=$($h.hour) probes=$($h.probes) clear=$($h.clear) hot=$($h.hot) busy=$($h.busy) unknown=$($h.unknown) passRate=$rate admitted=$($h.admitted) requeued=$($h.requeued) waitSecTotal=$($h.waitSecTotal)"
     try {
         $o = [ordered]@{}; foreach ($k in $h.Keys) { $o[$k] = $h[$k] }; $o.passRate = $rate; $o.gate = $script:GateVersion
         [System.IO.File]::AppendAllText((Join-Path $logs "heavy-slot-gate-hourly.jsonl"), ($o | ConvertTo-Json -Compress) + [Environment]::NewLine, [System.Text.Encoding]::ASCII)
@@ -1481,92 +1570,154 @@ function Invoke-GateIdleSample {
     $now = (Get-Date).ToUniversalTime()
     if (($now - $script:GateLastIdleSampleUtc).TotalSeconds -lt $GateIdleSampleSec) { return }
     $script:GateLastIdleSampleUtc = $now
-    $v = Get-HeavySlotVerdict -Status (Invoke-HeavySlotStatus) -ClearForSec ([double]::MaxValue)
+    $v = Get-HeavySlotVerdict -Status (Invoke-HeavySlotStatus) -Feed (Read-HeavySlotFeedMetrics)
     Add-GateProbeRecord -JobId "" -Verdict $v -WaitedSec 0 -Phase "idle"
 }
 
-function Enter-HeavySlot {
-    param([string]$JobId, [int[]]$FreeSlots)
-    if (-not $script:GateCreateDirApi) { return $null }
-    try { [void][System.IO.Directory]::CreateDirectory($HeavySlotDir) } catch { return $null }
-    foreach ($n in $FreeSlots) {
-        $d = Join-Path $HeavySlotDir "$n"
-        if ([MlvApp.Agent.NativeFs]::CreateDirectoryW($d, [System.IntPtr]::Zero)) {
-            $script:HeavySlotLabel = "mlv-agent $JobId"
-            $script:HeavySlotStart = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-            Write-HeavySlotOwner -Dir $d -OwnerPid $PID
-            return $d
-        }
+function New-HeavySlotSentinelCommand {
+    # The command heavy-slot.py runs once it has acquired the slot (base64 for -EncodedCommand, so no path ever meets
+    # a command-line quoting rule). It publishes HEAVY_SLOT_HELD and its pid to AcquiredFile (unique tmp + rename),
+    # then holds the slot until ReleaseFile exists or this agent (pid AND start time) is gone. Its exit ends
+    # heavy-slot.py's child, and heavy-slot.py frees the slot itself.
+    param([Parameter(Mandatory = $true)][string]$AcquiredFile, [Parameter(Mandatory = $true)][string]$ReleaseFile)
+    $acq = "'" + $AcquiredFile.Replace("'", "''") + "'"
+    $rel = "'" + $ReleaseFile.Replace("'", "''") + "'"
+    $agentStartMs = [DateTimeOffset]::new($script:AgentProcess.StartTime.ToUniversalTime()).ToUnixTimeMilliseconds()
+    $text = @"
+`$ErrorActionPreference = 'Stop'
+`$acq = $acq
+`$rel = $rel
+`$tmp = `$acq + '.' + `$PID + '.tmp'
+`$rec = [ordered]@{ held = [string]`$env:HEAVY_SLOT_HELD; sentinelPid = `$PID; acquiredUtc = [DateTime]::UtcNow.ToString('o') }
+[System.IO.File]::WriteAllText(`$tmp, (`$rec | ConvertTo-Json -Compress), [System.Text.UTF8Encoding]::new(`$false))
+Move-Item -LiteralPath `$tmp -Destination `$acq -Force
+while (-not [System.IO.File]::Exists(`$rel)) {
+    try {
+        `$a = Get-Process -Id $PID -ErrorAction Stop
+        `$ms = [DateTimeOffset]::new(`$a.StartTime.ToUniversalTime()).ToUnixTimeMilliseconds()
+        if ([Math]::Abs(`$ms - $agentStartMs) -gt 1000) { exit 3 }
     }
-    return $null
+    catch { exit 3 }
+    Start-Sleep -Milliseconds 500
+}
+exit 0
+"@
+    return [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($text))
 }
 
-function Write-HeavySlotOwner {
-    # No BOM: heavy-slot.py json.loads()s this, and an unreadable owner.json is reclaimed after 10 min.
-    # Written to a temp file and renamed over, so a reader never sees a half-written owner.
-    param([string]$Dir, [int]$OwnerPid)
-    $owner = [ordered]@{ label = $script:HeavySlotLabel; pid = $OwnerPid; start = $script:HeavySlotStart; exclusive = $true }   # r1j
-    $tmp = Join-Path $Dir "owner.json.$([guid]::NewGuid().ToString('N')).tmp"   # r2d: a unique tmp per write
-    [System.IO.File]::WriteAllText($tmp, ($owner | ConvertTo-Json -Compress), [System.Text.UTF8Encoding]::new($false))
-    $mv = Move-FileChecked -Source $tmp -Destination (Join-Path $Dir "owner.json") -Overwrite $true -Attempts 5 -DelayMs 100   # r2c: one replacing rename; r2d: checked
-    if (-not $mv.ok) { Add-AgentLogLine "PROMOTE FAILED heavy-slot $tmp $($mv.error)" }
+function Start-HeavySlotHolder {
+    # Joins heavy-slot.py's FIFO for this job (see the gate block). Returns the holder (ok=$true), or ok=$false with
+    # why when it cannot start: the job then keeps waiting -- a gated job never runs without a held slot.
+    param([Parameter(Mandatory = $true)][string]$JobId)
+    $py = Resolve-HeavySlotPython
+    if (-not $py) { return [pscustomobject]@{ ok = $false; why = "python not found ($HeavySlotPython)" } }
+    if (-not (Test-Path -LiteralPath $HeavySlotScript -PathType Leaf)) { return [pscustomobject]@{ ok = $false; why = "heavy-slot.py not found ($HeavySlotScript)" } }
+    $id = "$JobId.$([guid]::NewGuid().ToString('N').Substring(0, 12))"
+    $acq = Join-Path $slotHolders "$id.acquired.json"
+    $rel = Join-Path $slotHolders "$id.release"
+    $label = "mlv $JobId"
+    $argv = @($HeavySlotScript, "run", "--exclusive", "--label", $label, "--slots", "$HeavySlotCount", "--",
+        $psExe, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+        "-EncodedCommand", (New-HeavySlotSentinelCommand -AcquiredFile $acq -ReleaseFile $rel))
+    try {
+        # HEAVY_SLOT_HELD is REMOVED: a holder must take its own slot, never pass through as nested.
+        $launch = Start-WindowlessRedirectedProcess -FilePath $py -ArgumentList $argv `
+            -OutFile (Join-Path $logs "$id.heavy-slot.out.txt") -ErrFile (Join-Path $logs "$id.heavy-slot.err.txt") `
+            -Environment @{ HEAVY_SLOT_DIR = $HeavySlotDir; HEAVY_SLOT_FEED = $HeavySlotFeed; HEAVY_SLOT_HELD = $null }
+    }
+    catch {
+        return [pscustomobject]@{ ok = $false; why = "holder launch failed: $($_.Exception.Message)" }
+    }
+    # The record goes down FIRST, from the Process object (no CIM query), so an agent killed right after the start still
+    # leaves a record its successor can stop (Stop-StaleHeavySlotHolders matches pid + start time). A holder orphaned
+    # anyway resolves itself: when its ticket reaches the head, its sentinel finds this agent gone and exits at once.
+    $recordFile = Join-Path $slotHolders "$id.holder.json"
+    $startMs = $null
+    try { $startMs = [DateTimeOffset]::new($launch.Process.StartTime.ToUniversalTime()).ToUnixTimeMilliseconds() } catch { }
+    $rec = [ordered]@{ id = $id; jobId = $JobId; label = $label; pid = $launch.Process.Id; startEpochMs = $startMs; acquiredFile = $acq; releaseFile = $rel; agentPid = $PID; agentProcessStartUtc = $script:AgentProcessStartUtc }
+    $w = Write-JsonFileAtomic -Path $recordFile -InputObject $rec
+    $identity = Get-ProcessIdentity -ProcessId $launch.Process.Id
+    $h = [pscustomobject]@{
+        ok = $true; id = $id; jobId = $JobId; label = $label; launch = $launch; pid = $launch.Process.Id; identity = $identity
+        acquiredFile = $acq; releaseFile = $rel; recordFile = $recordFile; why = $null
+    }
+    Add-AgentLogLine "heavy-slot-gate: holder started job=$JobId pid=$($h.pid) label='$label' (heavy-slot.py run --exclusive; its FIFO ticket) record=$($w.ok)"
+    return $h
+}
+
+function Get-HeavySlotHolderState {
+    # acquired (the sentinel published HEAVY_SLOT_HELD) | waiting (queued in heavy-slot.py) | exited (heavy-slot.py
+    # is gone, or the acquired record has no HEAVY_SLOT_HELD: heavy-slot.py's NESTING contract is broken, fail closed).
+    param([Parameter(Mandatory = $true)]$Holder)
+    $p = $Holder.launch.Process
+    if (Test-Path -LiteralPath $Holder.acquiredFile -PathType Leaf) {
+        $a = Read-JsonFile -Path $Holder.acquiredFile
+        if ($null -ne $a) {
+            $held = [string]$a.held
+            if ($held -notmatch '^(\d+):(\d+)$') { return [pscustomobject]@{ state = "exited"; why = "acquired without HEAVY_SLOT_HELD (got '$held'); heavy-slot.py NESTING contract not met" } }
+            $slot = [int]$Matches[1]
+            $ownerPid = [int]$Matches[2]
+            if ($p.HasExited) { return [pscustomobject]@{ state = "exited"; why = "heavy-slot.py exited rc=$($p.ExitCode) after acquiring slot $slot" } }
+            return [pscustomobject]@{ state = "acquired"; slot = $slot; ownerPid = $ownerPid; held = $held; why = $null }
+        }
+    }
+    if ($p.HasExited) { return [pscustomobject]@{ state = "exited"; why = "heavy-slot.py exited rc=$($p.ExitCode) before acquiring" } }
+    return [pscustomobject]@{ state = "waiting"; why = $null }
+}
+
+function Stop-HeavySlotHolder {
+    # Ends a holder. Acquired: write the release file; the sentinel exits and heavy-slot.py frees the slot itself
+    # (its own release()). Still queued, or not gone within 15 s: stop the holder's process tree, and heavy-slot.py
+    # reclaims the dead waiter's ticket (queue_ahead) and a dead owner's slot (slots_state). This agent touches
+    # neither the ticket nor the slot.
+    param($Holder, [string]$Why)
+    if ($null -eq $Holder -or -not $Holder.ok) { return }
+    $p = $Holder.launch.Process
+    $acquired = Test-Path -LiteralPath $Holder.acquiredFile -PathType Leaf
+    if ($acquired) {
+        try { [System.IO.File]::WriteAllText($Holder.releaseFile, "$Why`r`n", [System.Text.Encoding]::ASCII) } catch { }
+    }
+    $exited = $p.HasExited
+    if (-not $exited -and $acquired) { $exited = $p.WaitForExit(15000) }
+    $killed = @()
+    if (-not $exited) {
+        $killed = @(Stop-ProcessTree -RootProcessId $Holder.pid -RootStartUtc $Holder.identity.startUtc -RootStartEpochMs $Holder.identity.startEpochMs -RootImagePath $Holder.identity.imagePath)
+        $exited = $p.WaitForExit(5000)
+    }
+    $rc = if ($exited) { $p.ExitCode } else { "still-running" }
+    try { [void][System.Threading.Tasks.Task]::WaitAll([System.Threading.Tasks.Task[]]@($Holder.launch.OutCopy, $Holder.launch.ErrCopy), 5000) } catch { }
+    try { $Holder.launch.OutStream.Dispose(); $Holder.launch.ErrStream.Dispose() } catch { }
+    $p.Dispose()
+    Remove-Item -LiteralPath $Holder.acquiredFile, $Holder.releaseFile, $Holder.recordFile -Force -ErrorAction SilentlyContinue
+    Add-AgentLogLine "heavy-slot-gate: holder ended job=$($Holder.jobId) pid=$($Holder.pid) acquired=$acquired rc=$rc killed=$($killed -join ',') why=[$Why]"
+}
+
+function Stop-StaleHeavySlotHolders {
+    # At agent start. A holder outlives a dead agent only while it is still QUEUED (an acquired sentinel exits once
+    # the agent is gone). Each holder record carries its process identity: a live match is stopped, so heavy-slot.py
+    # reclaims its ticket. Records and side files are then removed.
+    foreach ($f in @(Get-ChildItem -LiteralPath $slotHolders -Filter "*.holder.json" -File -ErrorAction SilentlyContinue)) {
+        $r = Read-JsonFile -Path $f.FullName
+        if ($null -ne $r -and $r.pid -and $null -ne $r.startEpochMs -and (Get-ProcessIdentity -ProcessId ([int]$r.pid)).exists) {
+            $killed = @(Stop-ProcessTree -RootProcessId ([int]$r.pid) -RootStartEpochMs $r.startEpochMs)
+            Add-AgentLogLine "heavy-slot-gate: stale holder id=$($r.id) pid=$($r.pid) from agent pid=$($r.agentPid) stopped=$($killed -join ',')"
+        }
+        Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue
+    }
+    Get-ChildItem -LiteralPath $slotHolders -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '\.(acquired\.json|release|tmp)$' } | Remove-Item -Force -ErrorAction SilentlyContinue
 }
 
 function Exit-HeavySlot {
-    # Release the slot this job held. The owner is this live agent, so heavy-slot.py never reclaims it; but once
-    # OUR delete succeeds, another wrapper may mkdir the same number at once, so nothing here ever deletes by path
-    # without first re-reading owner.json and seeing this agent's pid (Invoke-SlotReleaseAttempt).
-    $d = $script:HeavySlotHeld
-    $script:HeavySlotHeld = $null
-    if (-not $d) { return }
-    for ($i = 0; $i -lt 10; $i++) {
-        $r = Invoke-SlotReleaseAttempt -Dir $d
-        if ($r -eq "released") { Add-AgentLogLine "heavy-slot-gate: released $d"; return }
-        if ($r -eq "not-ours" -or $r -eq "gone") { Add-AgentLogLine "heavy-slot-gate: slot $d $r at release; left alone"; return }
-        Start-Sleep -Milliseconds 100      # "busy" (delete threw) or "unreadable": try again, re-reading the owner first
-    }
-    if ($script:PendingSlotReleases -notcontains $d) { $script:PendingSlotReleases += $d }
-    Add-AgentLogLine "heavy-slot-gate: release of $d FAILED ($r); queued for retry (pending=$($script:PendingSlotReleases.Count))"
-}
-
-function Invoke-SlotReleaseAttempt {
-    # ONE ownership-checked delete. Returns released | gone | not-ours | unreadable | busy.
-    #   gone        the directory does not exist (nothing to do)
-    #   not-ours    owner.json names another pid (someone else's reservation: never touched)
-    #   unreadable  owner.json missing/unparseable (could be another wrapper's half-written reservation: not touched)
-    #   busy        it is ours but the delete threw (e.g. a reader held owner.json); nothing was deleted by path after
-    #   released    Directory.Delete returned: the release is COMPLETE. The path is not re-checked, because a directory
-    #               there afterwards is a NEW reservation by someone else.
-    param([string]$Dir)
-    if (-not (Test-Path -LiteralPath $Dir)) { return "gone" }
-    $ownerPid = $null
-    try { $ownerPid = [int]((Get-Content -LiteralPath (Join-Path $Dir "owner.json") -Raw -ErrorAction Stop | ConvertFrom-Json).pid) } catch { return "unreadable" }
-    if ($ownerPid -ne $PID) { return "not-ours" }
-    try { [System.IO.Directory]::Delete($Dir, $true); return "released" }
-    catch { $script:LastSlotReleaseError = $_.Exception.Message; return "busy" }
-}
-
-function Invoke-PendingSlotRelease {
-    # Retries slots whose release failed, through the same ownership-checked primitive. A slot that is gone or now
-    # someone else's is dropped from the list; unreadable/busy stay queued for the next poll.
-    if (@($script:PendingSlotReleases).Count -eq 0) { return }
-    $still = @()
-    foreach ($d in @($script:PendingSlotReleases)) {
-        $r = Invoke-SlotReleaseAttempt -Dir $d
-        switch ($r) {
-            "released" { Add-AgentLogLine "heavy-slot-gate: released $d (retry)" }
-            "gone" { Add-AgentLogLine "heavy-slot-gate: pending slot $d is gone" }
-            "not-ours" { Add-AgentLogLine "heavy-slot-gate: pending slot $d now owned by another pid; dropped" }
-            default { $still += $d }
-        }
-    }
-    $script:PendingSlotReleases = $still
+    # Ends the admitted job's holder, so heavy-slot.py releases the job's slot. Idempotent.
+    $h = $script:HeavySlotHolder
+    $script:HeavySlotHolder = $null
+    if ($null -ne $h) { Stop-HeavySlotHolder -Holder $h -Why "job done" }
 }
 
 function Get-RecoveredAdmission {
-    # A result published by a RESTARTED agent (adoption or orphan recovery): the slot was owned by the dead
-    # agent, so heavy-slot.py reclaimed it while the child may have kept running. Never report that run as
-    # clean: keep the original record and downgrade the label.
+    # A result published by a RESTARTED agent (adoption or orphan recovery): the dead agent's holder exited with it
+    # and heavy-slot.py freed the slot while the child may have kept running. Never report that run as clean: keep
+    # the original record and downgrade the label.
     param($Admission)
     if ($null -eq $Admission) { return $null }
     $o = [ordered]@{}
@@ -1579,104 +1730,95 @@ function Get-RecoveredAdmission {
 }
 
 function Wait-HeavySlotAdmission {
-    # Blocks until the job may start; sets $script:HeavySlotHeld and returns the admission record.
-    # Labels: clear | loaded-comparable (slot held) ; cancelled-in-gate | queue-expired (no slot, never launch).
+    # Blocks until the job may start and returns the admission record. Admitted (label clear): $script:HeavySlotHolder
+    # holds this job's exclusive slot until Exit-HeavySlot. Not admitted (cancelled-in-gate | queue-expired): no holder
+    # is left behind. While waiting the job holds NO slot, only heavy-slot.py's FIFO ticket. No wait cap.
     param([Parameter(Mandatory = $true)][string]$JobId, [Parameter(Mandatory = $true)]$Job, [Parameter(Mandatory = $true)]$Metadata)
     $t0 = Get-Date
-    $hotSec = 0.0          # CONSECUTIVE hot wait: any non-hot probe resets it
-    $clearSince = $null
+    $label = "mlv $JobId"
     $probes = 0
+    $requeues = 0
+    $holderStarts = 0
+    $holder = $null
+    $nextHolderAt = $t0
+    $nextProbeAt = $t0
     $lastLog = [DateTime]::MinValue
-    $lastProbe = $null
-    $lastState = $null
+    $state = "queued"
+    $why = "joining heavy-slot.py's FIFO"
     $maxAge = [int]$Metadata.maxQueueAgeSec
-    while ($true) {
-        Invoke-PendingSlotRelease
-        $waitedNow = [int]((Get-Date) - $t0).TotalSeconds
-        if (Test-Path -LiteralPath (Join-Path $cancel "$JobId.cancel") -PathType Leaf) {
-            return [pscustomobject]@{ gate = $script:GateVersion; label = "cancelled-in-gate"; state = "cancelled"; waitedSec = $waitedNow; hotWaitSec = [int]$hotSec; probes = $probes; slot = $null; thermal = $null; why = "cancel file present before launch" }
-        }
-        $age = Get-QueueAgeSeconds -Job $Job -Metadata $Metadata
-        if ($maxAge -gt 0 -and $age -gt $maxAge) {
-            return [pscustomobject]@{ gate = $script:GateVersion; label = "queue-expired"; state = "expired"; waitedSec = $waitedNow; hotWaitSec = [int]$hotSec; probes = $probes; slot = $null; thermal = $null; why = "queue age ${age}s > ${maxAge}s while waiting"; queueAgeSec = $age }
-        }
-        $activity = "gate-wait job=$JobId state=$lastState waited=${waitedNow}s"
-        $now = Get-Date
-        $status = Invoke-HeavySlotStatus -HeartbeatActivity $activity
-        $clearFor = if ($clearSince) { ($now - $clearSince).TotalSeconds } else { 0 }
-        $v = Get-HeavySlotVerdict -Status $status -ClearForSec $clearFor
-        # A joiner's continuous-clear clock: thermal clear (ignoring the join rule itself) since when?
-        $thermalOk = ($v.state -eq "clear") -or ($v.state -eq "hot" -and $v.why -like "joiner:*")
-        if ($thermalOk) { if (-not $clearSince) { $clearSince = $now } } else { $clearSince = $null }
-        $probes++
-        $waited = ($now - $t0).TotalSeconds
-        if ($v.state -eq "hot") {
-            if ($null -ne $lastProbe -and $lastState -eq "hot") { $hotSec += ($now - $lastProbe).TotalSeconds }
-        }
-        else { $hotSec = 0.0 }
-        $lastProbe = $now
-        $lastState = $v.state
-        Add-GateProbeRecord -JobId $JobId -Verdict $v -WaitedSec $waited -Phase "pre-job"
-
-        # r1j EXCLUSIVE: re-classify against everyone else. With a reservation held, our own slot is excluded.
-        $own = if ($script:HeavySlotHeld) { [int](Split-Path $script:HeavySlotHeld -Leaf) } else { 0 }
-        if ($own -gt 0) {
-            $v = Get-HeavySlotVerdict -Status $status -ClearForSec ([double]::MaxValue) -OwnSlot $own
-            if ($v.state -eq "feed-unknown" -and $v.why -like "own slot*") { $script:HeavySlotHeld = $null; $own = 0; $v.why = "reservation lost (reclaimed?); re-reserving" }
-        }
-        # r1k: an UNKNOWN feed never keeps an exclusive reservation (it would block every other heavy run on the host
-        # while we cannot even tell whether it is safe to run). Give it back; keep waiting; re-reserve once the feed reads.
-        if ($v.state -eq "feed-unknown" -and $script:HeavySlotHeld) {
-            $gone = $script:HeavySlotHeld
-            Exit-HeavySlot
-            $own = 0
-            Add-AgentLogLine "heavy-slot-gate: feed unknown while holding reservation $gone for job=$JobId; released it (job keeps waiting, uncapped)"
-        }
-        $label = $null
-        if ($v.state -ne "feed-unknown" -and $v.busy -gt 0) {
-            # Another run holds a slot: never join. Reserve the free slot (exclusive) so nothing new starts; wait it out.
-            if ($own -eq 0 -and $v.freeSlots.Count -gt 0) {
-                $res = Enter-HeavySlot -JobId $JobId -FreeSlots $v.freeSlots
-                if ($res) { $script:HeavySlotHeld = $res; $own = [int](Split-Path $res -Leaf); Add-AgentLogLine "heavy-slot-gate: exclusive reservation job=$JobId slot=$res (draining: $($v.busy) other holder(s))" }
+    try {
+        while ($true) {
+            $now = Get-Date
+            $waited = ($now - $t0).TotalSeconds
+            if (Test-Path -LiteralPath (Join-Path $cancel "$JobId.cancel") -PathType Leaf) {
+                return [pscustomobject]@{ gate = $script:GateVersion; label = "cancelled-in-gate"; state = "cancelled"; waitedSec = [int]$waited; probes = $probes; requeues = $requeues; slot = $null; thermal = $null; why = "cancel file present before launch" }
             }
-            $v.state = "exclusive-wait"; $v.why = "exclusive: $($v.busy) other heavy run(s) hold a slot" + $(if ($own) { "; reservation slot $own held" } else { "; no free slot to reserve" })
-            $hotSec = 0.0; $lastState = $v.state
-        }
-        elseif ($v.state -eq "clear") { $label = "clear" }
-        elseif ($v.state -eq "hot" -and $GateHotWaitCapSec -gt 0 -and $hotSec -ge $GateHotWaitCapSec -and $v.busy -eq 0) { $label = "loaded-comparable" }   # cap: ALONE only
-
-        if ($label) {
-            $slot = if ($own -gt 0) { $script:HeavySlotHeld } else { Enter-HeavySlot -JobId $JobId -FreeSlots $v.freeSlots }
-            if ($slot) {
-                $script:HeavySlotHeld = $slot
-                # REVALIDATE with our slot excluded: still alone, and clear (or hot past the cap for loaded-comparable).
-                $v2 = Get-HeavySlotVerdict -Status (Invoke-HeavySlotStatus -HeartbeatActivity $activity) -ClearForSec ([double]::MaxValue) -OwnSlot ([int](Split-Path $slot -Leaf))
-                $ok2 = ($v2.busy -eq 0) -and $(if ($label -eq "clear") { $v2.state -eq "clear" } else { $v2.state -eq "clear" -or $v2.state -eq "hot" })
-                if ($ok2) {
-                    if ($label -eq "clear") { $script:GateHour.admittedClear++ } else { $script:GateHour.admittedLoaded++ }
+            $age = Get-QueueAgeSeconds -Job $Job -Metadata $Metadata
+            if ($maxAge -gt 0 -and $age -gt $maxAge) {
+                return [pscustomobject]@{ gate = $script:GateVersion; label = "queue-expired"; state = "expired"; waitedSec = [int]$waited; probes = $probes; requeues = $requeues; slot = $null; thermal = $null; why = "queue age ${age}s > ${maxAge}s while waiting"; queueAgeSec = $age }
+            }
+            if ($null -eq $holder -and $now -ge $nextHolderAt) {
+                $h = Start-HeavySlotHolder -JobId $JobId
+                if ($h.ok) { $holder = $h; $holderStarts++; $state = "queued"; $why = "ticket filed by heavy-slot.py run --exclusive" }
+                else { $state = "holder-unavailable"; $why = $h.why; $nextHolderAt = $now.AddSeconds($GateProbeSec) }
+            }
+            $hs = if ($null -ne $holder) { Get-HeavySlotHolderState -Holder $holder } else { $null }
+            if ($null -ne $hs -and $hs.state -eq "exited") {
+                $state = "holder-exited"
+                $why = $hs.why
+                Stop-HeavySlotHolder -Holder $holder -Why $hs.why
+                $holder = $null
+                $nextHolderAt = $now.AddSeconds($GateProbeSec)
+            }
+            elseif ($null -ne $hs -and $hs.state -eq "acquired") {
+                # heavy-slot.py served this job's ticket and holds an EXCLUSIVE slot for it. Re-check with that slot excluded.
+                $status = Invoke-HeavySlotStatus -HeartbeatActivity "gate-wait job=$JobId state=acquired waited=$([int]$waited)s"
+                $v = Get-HeavySlotVerdict -Status $status -Feed (Read-HeavySlotFeedMetrics) -OwnSlot $hs.slot -Label $label
+                $probes++
+                Add-GateProbeRecord -JobId $JobId -Verdict $v -WaitedSec $waited -Phase "acquired" -WaitState "acquired"
+                if ($v.state -eq "clear") {
+                    $script:HeavySlotHolder = $holder
+                    $holder = $null     # owned by $script:HeavySlotHolder now: the finally below must not end it
+                    $slotDir = Join-Path $HeavySlotDir "$($hs.slot)"
+                    $script:GateHour.admitted++
                     $script:GateHour.waitSecTotal += [int]$waited
-                    $adm = [pscustomobject]@{ gate = $script:GateVersion; label = $label; state = $v2.state; waitedSec = [int]((Get-Date) - $t0).TotalSeconds; hotWaitSec = [int]$hotSec; probes = $probes; slot = $slot; thermal = $v2.thermal; why = $v2.why; exclusive = $true }
-                    Add-AgentLogLine "heavy-slot-gate: admit job=$JobId label=$label slot=$slot exclusive=1 waited=$($adm.waitedSec)s hotWait=$([int]$hotSec)s probes=$probes thermal=[$($v2.thermal)]"
+                    $adm = [pscustomobject]@{
+                        gate = $script:GateVersion; label = "clear"; state = "clear"; waitedSec = [int]((Get-Date) - $t0).TotalSeconds
+                        probes = $probes; requeues = $requeues; holderStarts = $holderStarts; slot = $slotDir; heavySlotHeld = $hs.held
+                        heavySlotLabel = $label; holderPid = $script:HeavySlotHolder.pid; exclusive = $true; busy = $v.busy
+                        thermal = $v.thermal; throttled = $v.throttled; rows = $v.window; meanC = $v.meanC; max15C = $v.max15C; why = $v.why
+                    }
+                    Add-AgentLogLine "heavy-slot-gate: admit job=$JobId label=clear slot=$slotDir held=$($hs.held) holderPid=$($adm.holderPid) exclusive=1 busy=0 waited=$($adm.waitedSec)s requeues=$requeues probes=$probes thermal=[$($v.thermal)]"
                     return $adm
                 }
-                $v.why = "revalidation failed: busy=$($v2.busy) $($v2.state) ($($v2.why))"
-                $lastState = $v2.state
-                if ($v2.state -ne "hot") { $hotSec = 0.0 }
-                if ($v2.busy -eq 0 -and $v2.state -ne "hot" -and $v2.state -ne "clear") { Exit-HeavySlot }   # unknown feed: give the reservation back
+                # Not clear with the slot in hand: give it back and re-join the FIFO. A job that is not running never keeps a slot.
+                $requeues++
+                $script:GateHour.requeued++
+                $state = "requeue-$($v.state)"
+                $why = "acquired slot $($hs.slot), but $($v.state): $($v.why); released, re-joining the FIFO"
+                Stop-HeavySlotHolder -Holder $holder -Why $why
+                $holder = $null
+                $nextHolderAt = $now.AddSeconds($GateProbeSec)
             }
-            else { $v.why = "slot race lost or slot dir unavailable" }
+            elseif ($now -ge $nextProbeAt) {
+                # Queued in heavy-slot.py (or between holders): a probe for the log only. The decision is heavy-slot.py's
+                # FIFO plus the re-check above.
+                $v = Get-HeavySlotVerdict -Status (Invoke-HeavySlotStatus -HeartbeatActivity "gate-wait job=$JobId state=$state waited=$([int]$waited)s") -Feed (Read-HeavySlotFeedMetrics) -Label $label
+                $probes++
+                $nextProbeAt = $now.AddSeconds($GateProbeSec)
+                if ($null -ne $holder) { $state = "queued"; $why = "heavy-slot.py FIFO position $($v.queuePos) of $($v.queueLen); $($v.why)" }
+                Add-GateProbeRecord -JobId $JobId -Verdict $v -WaitedSec $waited -Phase "pre-job" -WaitState $state
+            }
+            if (((Get-Date) - $lastLog).TotalSeconds -ge 60) {
+                Add-AgentLogLine "heavy-slot-gate: waiting job=$JobId state=$state why=[$why] waited=$([int]$waited)s requeues=$requeues holderPid=$(if ($null -ne $holder) { $holder.pid } else { 'none' })"
+                $lastLog = Get-Date
+            }
+            Write-AgentHeartbeat -Activity "gate-wait job=$JobId state=$state waited=$([int]((Get-Date) - $t0).TotalSeconds)s"
+            Start-Sleep -Milliseconds 1000
         }
-        if (((Get-Date) - $lastLog).TotalSeconds -ge 60) {
-            Add-AgentLogLine "heavy-slot-gate: waiting job=$JobId state=$($v.state) why=[$($v.why)] waited=$([int]$waited)s hotWait=$([int]$hotSec)s cap=$GateHotWaitCapSec"
-            $lastLog = Get-Date
-        }
-        # Sleep in <= 5 s slices with a heartbeat each, so no GateProbeSec value can open a heartbeat gap.
-        $wake = (Get-Date).AddSeconds($GateProbeSec)
-        do {
-            Write-AgentHeartbeat -Activity "gate-wait job=$JobId state=$($v.state) waited=$([int]((Get-Date) - $t0).TotalSeconds)s"
-            $left = ($wake - (Get-Date)).TotalSeconds
-            if ($left -gt 0) { Start-Sleep -Milliseconds ([int]([Math]::Min(5, $left) * 1000)) }
-        } while ((Get-Date) -lt $wake)
+    }
+    finally {
+        if ($null -ne $holder) { Stop-HeavySlotHolder -Holder $holder -Why "job left the gate unadmitted" }
     }
 }
 
@@ -1725,7 +1867,7 @@ function Invoke-QueuedJob {
     # Heavy-slot admission: wait (heartbeating) for a slot and a clear thermal feed; see the gate block.
     # r1g: a LIGHT job class is not held (it takes no slot): the venue's own quiet/load probe and agent maintenance.
     if ($jobId -match $GateExemptJobPattern) {
-        $script:Admission = [pscustomobject]@{ gate = $script:GateVersion; label = "exempt-light"; state = "exempt"; waitedSec = 0; hotWaitSec = 0; probes = 0; slot = $null; thermal = $null; why = "job id matches GateExemptJobPattern ($GateExemptJobPattern): light job, not gated, holds no slot" }
+        $script:Admission = [pscustomobject]@{ gate = $script:GateVersion; label = "exempt-light"; state = "exempt"; waitedSec = 0; probes = 0; requeues = 0; slot = $null; thermal = $null; why = "job id matches GateExemptJobPattern ($GateExemptJobPattern): light job, not gated, holds no slot" }
         Add-AgentLogLine "heavy-slot-gate: exempt job=$jobId (light class, no slot)"
     }
     else {
@@ -1762,6 +1904,10 @@ function Invoke-QueuedJob {
     $env:MLV_AGENT_ADMISSION = $script:Admission.label
     $env:MLV_AGENT_ADMISSION_THERMAL = [string]$script:Admission.thermal
     $env:MLV_AGENT_ADMISSION_WAIT_SEC = [string]$script:Admission.waitedSec
+    # r1c: the job runs inside its holder's slot. heavy-slot.py's NESTING contract: a heavy-slot.py run inside the job
+    # sees HEAVY_SLOT_HELD="<slot>:<owner pid>" and passes straight through instead of queueing behind this job.
+    if ($script:Admission.heavySlotHeld) { $env:HEAVY_SLOT_HELD = [string]$script:Admission.heavySlotHeld }
+    $holderLossLogged = $false
 
     $outFile = Join-Path $logs "$jobId.out.txt"
     $errFile = Join-Path $logs "$jobId.err.txt"
@@ -1830,6 +1976,12 @@ function Invoke-QueuedJob {
             if (Test-Path -LiteralPath (Join-Path $cancel "$jobId.cancel") -PathType Leaf) {
                 $cancelled = $true
                 break
+            }
+            # r1c: a holder that dies mid-job has lost the slot (heavy-slot.py frees it); say so in the result.
+            if (-not $holderLossLogged -and $null -ne $script:HeavySlotHolder -and $script:HeavySlotHolder.launch.Process.HasExited) {
+                $holderLossLogged = $true
+                $script:Admission | Add-Member -NotePropertyName slotContinuity -NotePropertyValue "lost" -Force
+                Add-AgentLogLine "heavy-slot-gate: holder pid=$($script:HeavySlotHolder.pid) for job=$jobId exited mid-job; its slot is free, the job keeps running (admission.slotContinuity=lost)"
             }
             Write-AgentHeartbeat -Activity "job=$jobId"
             $remainingMs = [Math]::Max(1, [int][Math]::Min($waitSliceMs, ($deadline - (Get-Date)).TotalMilliseconds))
@@ -1923,7 +2075,8 @@ try {
         Add-AgentLogLine "agent overlap suppressed mutex=$MutexName pid=$PID"
         exit 0
     }
-    Add-AgentLogLine "agent start pid=$PID host=$env:COMPUTERNAME root=$Root shell=$psExe processStartUtc=$script:AgentProcessStartUtc imagePath=$script:AgentImagePath gate=$script:GateVersion slots=$HeavySlotCount slotDir=$HeavySlotDir hotWaitCap=${GateHotWaitCapSec}s"
+    Add-AgentLogLine "agent start pid=$PID host=$env:COMPUTERNAME root=$Root shell=$psExe processStartUtc=$script:AgentProcessStartUtc imagePath=$script:AgentImagePath gate=$script:GateVersion slots=$HeavySlotCount slotDir=$HeavySlotDir feed=$HeavySlotFeed heat=[blocked when > $GateMaxThrottledRows/$GateSustainedRows throttled or mean >= $GateMeanMaxC C] waitCap=none"
+    Stop-StaleHeavySlotHolders
     Resolve-StartedMarkers
 
     while ($true) {
@@ -1933,7 +2086,6 @@ try {
         Invoke-QuarantineReconcile
 
         $jobs = Get-ChildItem $inbox -Filter *.job.ps1 -File -ErrorAction SilentlyContinue | Sort-Object Name
-        Invoke-PendingSlotRelease
         if (@($jobs).Count -eq 0) { Invoke-GateIdleSample }
         foreach ($job in $jobs) {
             # r2d (sol r2c BLOCKER): a job with ANY unresolved marker artifact is never admitted or launched here.
@@ -1949,7 +2101,7 @@ try {
             }
             finally {
                 Exit-HeavySlot
-                Remove-Item Env:\MLV_AGENT_ADMISSION, Env:\MLV_AGENT_ADMISSION_THERMAL, Env:\MLV_AGENT_ADMISSION_WAIT_SEC -ErrorAction SilentlyContinue
+                Remove-Item Env:\MLV_AGENT_ADMISSION, Env:\MLV_AGENT_ADMISSION_THERMAL, Env:\MLV_AGENT_ADMISSION_WAIT_SEC, Env:\HEAVY_SLOT_HELD -ErrorAction SilentlyContinue
             }
         }
 
