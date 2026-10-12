@@ -42,7 +42,7 @@ MANIFEST = "b" * 64
 # Wait-VenueQuiet stand-in. Mode per call from FAKE_QUIET_MODES (comma list, the last repeats), counted per run dir. Records each call with whether
 # THIS run's claim was held at that moment (the claim file exists and names this run dir).
 FAKE_QUIET = r"""
-param([string]$Venue, [string]$WorkDir, [string]$GateLog, [double]$ThresholdPercent = 20, [int]$MaxWaitSec = 1800, [int]$RecheckSec = 90)
+param([string]$Venue, [string]$WorkDir, [string]$GateLog, [double]$ThresholdPercent = 20, [int]$MaxWaitSec = 1800, [int]$RecheckSec = 90, [int]$MaxAdmissionWaitSec = 0)
 $runDir = Split-Path -Parent $WorkDir
 New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
 $countFile = Join-Path $runDir 'fake-quiet-count.txt'

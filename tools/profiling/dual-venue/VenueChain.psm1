@@ -10,11 +10,14 @@
 # TICKET QUEUE (VENUE-CLAIM-FIFO-1). The claim alone is a polling race: every waiter retries CreateNew on its own 30 s phase, so the waiter whose poll lands
 # first after a release wins, and a chain that releases and re-asks within seconds beats every sleeping waiter (q02 of PLAYBACK-CPU-PACE-GAP-1 r5 lost 5
 # handoffs in a row, 60 min). A ticket-aware waiter therefore takes a TICKET first: one file, <ClaimDir>\<venue>.tickets\<utc ticks, 19 digits>-p<pid>-<start
-# ticks>[-n].ticket.json, taken by CreateNew (so names sort in arrival order and two takers can never share one). Only the OLDEST LIVE ticket may try the
+# ticks>.ticket.json, taken by CreateNew (so names sort in arrival order and two takers can never share one; a clash moves to the next tick, so the 19 digits are
+# the arrival tick plus that bump). Equal ticks order by owner pid, then by owner start ticks, never by directory enumeration. Only the OLDEST LIVE ticket may try the
 # claim (Request-VenueClaim -UseTicket); every other ticket holder gets state QUEUED. A ticket is STALE when its owner pid is dead (dead-pid), was reused
-# (pid-reused), has not refreshed its heartbeat for staleAfterSec (heartbeat; default 3 x ClaimPollSec, widened by the owner while it sits in a quiet probe),
+# (pid-reused), has not refreshed its heartbeat for staleAfterSec (heartbeat; default 3 x ClaimPollSec, widened by the owner to the probe's real upper bound
+# while it sits in a quiet probe, Get-VenueTicketProbeStaleSec; a dead or reused pid is still stale at once),
 # or has been unparseable for more than a writer needs (unreadable); the next waiter removes it (Request-VenueClaim reports it in .staleTickets) and the line
-# moves up. A chain that releases its claim on GATE_BUSY keeps its ticket (it does not go to the back of the line); Remove-VenueTicket ends it.
+# moves up. A chain that releases its claim on GATE_BUSY keeps its ticket (it does not go to the back of the line) for a bounded number of cycles
+# (Invoke-VenueChain.ps1 -TicketKeepMax); Remove-VenueTicket ends it.
 # BACK-COMPAT: the claim file, its name and its CreateNew semantics are unchanged, and Request-VenueClaim called WITHOUT -UseTicket / -Ticket is the old
 # one-shot attempt. Ticketing orders ONLY ticket holders: a legacy (ticketless) chain still takes any free claim (it can win a race against the line), and a
 # ticket holder never waits on a legacy waiter (nothing ticketless is ever in the line), so the two kinds cannot deadlock; they only share the claim.
@@ -255,6 +258,19 @@ function Get-VenueTicketStaleReason {
     $null
 }
 
+function Get-VenueTicketProbeStaleSec {
+    <#
+    .SYNOPSIS
+    How long a ticket may go without a heartbeat while its owner sits in ONE Wait-VenueQuiet probe: the probe's real upper bound plus a margin. Wait-VenueQuiet stops
+    re-probing at -MaxWaitSec, but a probe already submitted runs on under um-run.ps1: its queue wait (-MaxQueueWaitSec 300), the agent's admission gate
+    (-MaxAdmissionWaitSec, passed by the chain) and the claimed job (-TimeoutSec 120 + -MaxClaimedWaitSec 120).
+    #>
+    param([Parameter(Mandatory)][ValidateRange(0, 86400)][int]$QuietMaxWaitSec, [Parameter(Mandatory)][ValidateRange(1, 86400)][int]$AdmissionWaitSec,
+        [ValidateRange(0, 86400)][int]$MarginSec = 90)
+    $queueWaitSec = 300; $jobBudgetSec = 120; $claimedGraceSec = 120   # the um-run call in Wait-VenueQuiet.ps1
+    $QuietMaxWaitSec + $queueWaitSec + $AdmissionWaitSec + $jobBudgetSec + $claimedGraceSec + $MarginSec
+}
+
 function Get-VenueTickets {
     <#
     .SYNOPSIS
@@ -271,7 +287,7 @@ function Get-VenueTickets {
             if (-not $m.Success) { continue }
             $f = Read-VenueClaimFile $file.FullName
             if (-not $f.exists) { continue }
-            $row = [ordered]@{ name = $file.Name; path = $file.FullName; key = [int64]$m.Groups[1].Value; state = 'LIVE'; reason = $null; text = $f.text; ticket = $null; position = 0; ageSec = $null; heartbeatAgeSec = $null }
+            $row = [ordered]@{ name = $file.Name; path = $file.FullName; key = [int64]$m.Groups[1].Value; pidKey = [decimal]$m.Groups[2].Value; startKey = [decimal]$m.Groups[3].Value; state = 'LIVE'; reason = $null; text = $f.text; ticket = $null; position = 0; ageSec = $null; heartbeatAgeSec = $null }
             if ($f.busy) { $row.state = 'BUSY' }
             else {
                 $t = $null
@@ -291,7 +307,7 @@ function Get-VenueTickets {
             $rows.Add([pscustomobject]$row)
         }
     }
-    $sorted = @($rows | Sort-Object -Property key)
+    $sorted = @($rows | Sort-Object -Property key, pidKey, startKey, name)   # arrival tick, then owner pid, then owner start ticks: equal ticks never fall back to enumeration order
     $pos = 0
     foreach ($r in $sorted) { if ($r.state -cne 'STALE') { $pos++; $r.position = $pos } }
     $sorted
@@ -515,5 +531,5 @@ function Select-VenueQuietWindow {
 }
 
 Export-ModuleMember -Function Get-VenueMainRoot, Get-VenueClaimPath, Get-VenueClaim, Get-VenueClaimStaleReason, Request-VenueClaim, Release-VenueClaim,
-    Get-VenueTicketDir, New-VenueTicket, Get-VenueTickets, Get-VenueTicketStaleReason, Update-VenueTicket, Remove-VenueTicket, Get-VenueClaimStatus, Format-VenueClaimStatus, Format-VenueTicketQueue,
+    Get-VenueTicketDir, New-VenueTicket, Get-VenueTickets, Get-VenueTicketStaleReason, Get-VenueTicketProbeStaleSec, Update-VenueTicket, Remove-VenueTicket, Get-VenueClaimStatus, Format-VenueClaimStatus, Format-VenueTicketQueue,
     ConvertFrom-VenueGateLog, Get-VenueQuietRateTable, Format-VenueQuietRateTable, Select-VenueQuietWindow

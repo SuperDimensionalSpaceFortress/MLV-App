@@ -7,6 +7,9 @@ WHAT IS PINNED (the claim was a 30 s polling race with no FIFO: PLAYBACK-CPU-PAC
   * (d) BACK-COMPAT: a legacy (ticketless) claimant still takes a free claim; a ticket holder proceeds after it releases and never waits on a legacy waiter.
   * the claim state is visible: -ClaimStatus lists every ticket's owner run dir, pid and age; the chain logs the line on CLAIM_HELD.
   * the chain wires it: first-come-first-served across real chain processes, the ticket kept across a GATE_BUSY under claim, a dead ticket removed and logged.
+  * r2 (keys on d40e8664): (B1) the keep is counted: ONE kept cycle (-TicketKeepMax), then the next GATE_BUSY under the claim drops the ticket so a ready follower
+    takes the claim; (B2) a ticket's probe-phase window is derived from the probe's real upper bound (the chain passes -MaxAdmissionWaitSec to the probe), so a live
+    head 700 s into a long probe is not stale while a dead pid still is at once; equal-tick tickets sort by pid then start ticks, never by enumeration order.
 
 Offline only: the claim and ticket folders live in a temp dir, Wait-VenueQuiet and Invoke-VenueLeg are the fakes of test_venue_chain_runner.py, and the clock of
 the ticket logic is injected (-NowUtc) so no test waits for a real heartbeat to expire. The module tests are deterministic. The chain-process FIFO test races
@@ -96,15 +99,25 @@ class VenueClaimFifoTests(unittest.TestCase):
         e.update(extra)
         return e
 
-    def chain_args(self, run_dir: Path, spec: Path, claim_poll: int = 1, deadline_sec: int = 120) -> list[str]:
-        return [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(RUNNER), "-Venue", "bachelor", "-LegSpec", str(spec), "-RunDir", str(run_dir),
-                "-SourceCommit", base.SHA, "-BuildManifestSha256", base.MANIFEST, "-ClaimDir", str(self.claims), "-QuietScript", str(self.fake_quiet), "-LegScript", str(self.fake_leg),
-                "-CooldownSec", "0", "-ClaimPollSec", str(claim_poll), "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=deadline_sec))]
+    def chain_args(self, run_dir: Path, spec: Path, claim_poll: int = 1, deadline_sec: int = 120, runner: Path | None = None, quiet: Path | None = None, extra: tuple[str, ...] = ()) -> list[str]:
+        return [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(runner or RUNNER), "-Venue", "bachelor", "-LegSpec", str(spec), "-RunDir", str(run_dir),
+                "-SourceCommit", base.SHA, "-BuildManifestSha256", base.MANIFEST, "-ClaimDir", str(self.claims), "-QuietScript", str(quiet or self.fake_quiet), "-LegScript", str(self.fake_leg),
+                "-CooldownSec", "0", "-ClaimPollSec", str(claim_poll), "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=deadline_sec)), *extra]
 
-    def start_chain(self, run_dir: Path, spec: Path, claim_poll: int = 1, **env: str) -> subprocess.Popen:
-        p = subprocess.Popen(self.chain_args(run_dir, spec, claim_poll), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=self.env(**env))
+    def start_chain(self, run_dir: Path, spec: Path, claim_poll: int = 1, runner: Path | None = None, deadline_sec: int = 120, **env: str) -> subprocess.Popen:
+        # stdout goes to a FILE, never a pipe: the chain echoes every log line (long paths, one line per change in the queue) and a chain whose pipe is not being drained
+        # blocks on write once it is full (4 KB on Windows), so it would stall while the test waits on another chain's pipe
+        out_path = self.case / f"stdout-{run_dir.name}.txt"
+        with open(out_path, "w", encoding="utf-8") as out_file:
+            p = subprocess.Popen(self.chain_args(run_dir, spec, claim_poll, deadline_sec=deadline_sec, runner=runner), stdout=out_file, stderr=subprocess.STDOUT, text=True, env=self.env(**env))
+        p.out_path = out_path   # type: ignore[attr-defined]
         self._children.append(p)
         return p
+
+    def finish(self, p: subprocess.Popen, timeout: float) -> str:
+        """Wait for a chain started by start_chain and return everything it printed."""
+        p.wait(timeout=timeout)
+        return Path(p.out_path).read_text(encoding="utf-8", errors="replace")   # type: ignore[attr-defined]
 
     def wait_for(self, predicate, what: str, timeout: float = 60.0) -> None:
         t0 = time.time()
@@ -281,7 +294,7 @@ $plain = Request-VenueClaim -Venue bachelor -RunDir 'run-L2' -ClaimDir $d
         self.wait_for(lambda: self.log_has(rd_a, "CLAIM_HELD"), "A waiting")
         pb = self.start_chain(rd_b, self.specs[1], claim_poll=1)    # arrives second, polls every second
         self.wait_for(lambda: self.log_has(rd_b, "CLAIM_HELD"), "B waiting")
-        outs = [p.communicate(timeout=240)[0] for p in (px, pa, pb)]
+        outs = [self.finish(p, 240) for p in (px, pa, pb)]
         self.assertEqual([p.returncode for p in (px, pa, pb)], [0, 0, 0], "\n----\n".join(outs))
         self.assertEqual(self.leg_starts(), ["fx-c.json", "fx-a.json", "fx-b.json"], "B, the later arrival, polled faster and took the claim first: no FIFO")
         self.assertTrue(any("queue=[#1" in l and "#2" in l for l in self.chain_log(rd_b)), self.chain_log(rd_b))
@@ -341,16 +354,142 @@ $plain = Request-VenueClaim -Venue bachelor -RunDir 'run-L2' -ClaimDir $d
         self.wait_for(lambda: self.log_has(rd, "CLAIM_HELD"), "the ticketed chain waiting on the legacy claim")
         self.assertEqual(self.leg_starts(), [], "the legacy claim is live: no leg may start")
         self.claim_path.unlink()   # the legacy chain releases
-        out = p.communicate(timeout=120)[0]
+        out = self.finish(p, 120)
         self.assertEqual(p.returncode, 0, out)
         self.assertEqual(self.leg_starts(), ["fx-a.json"])
+
+    # ---------------------------------------------------------------- r2: a kept place is bounded, a probe window is derived, equal ticks have a tie-break
+    def mutant_runner(self, old: str, new: str) -> Path:
+        """A copy of the runner + module in a scratch dir with ONE source line replaced (the replaced text must occur exactly once)."""
+        d = Path(tempfile.mkdtemp(prefix="mut-", dir=self.case))
+        text = RUNNER.read_text(encoding="utf-8")
+        self.assertEqual(text.count(old), 1, f"mutation anchor moved: {old}")
+        (d / RUNNER.name).write_text(text.replace(old, new), encoding="utf-8")
+        (d / MODULE.name).write_text(MODULE.read_text(encoding="utf-8"), encoding="utf-8")
+        return d / RUNNER.name
+
+    def run_kept_head_scenario(self, runner: Path | None) -> tuple[list[str], list[str], list[str]]:
+        """X holds the claim; A (head, QUIET/BUSY/QUIET/BUSY/QUIET probes) and a ready follower B queue behind it. Returns (leg starts, A's log, B's log)."""
+        rd_x, rd_a, rd_b = self.case / "lane-X", self.case / "lane-A", self.case / "lane-B"
+        px = self.start_chain(rd_x, self.specs[2], claim_poll=1, runner=runner, deadline_sec=300, FAKE_LEG_SLEEP="12")
+        self.wait_for(lambda: self.claim_path.exists() and self.leg_starts() == ["fx-c.json"], "X holding the claim and running its leg")
+        pa = self.start_chain(rd_a, self.specs[0], claim_poll=1, runner=runner, deadline_sec=300, FAKE_QUIET_MODES="QUIET,BUSY,QUIET,BUSY,QUIET")
+        self.wait_for(lambda: self.log_has(rd_a, "CLAIM_HELD"), "A (the head) waiting")
+        pb = self.start_chain(rd_b, self.specs[1], claim_poll=1, runner=runner, deadline_sec=300)
+        self.wait_for(lambda: self.log_has(rd_b, "CLAIM_HELD"), "B (the follower) waiting behind A")
+        try:
+            outs = [self.finish(p, 240) for p in (px, pa, pb)]
+        except subprocess.TimeoutExpired:
+            logs = {rd.name: (rd / "chain.log").read_text(encoding="utf-8") if (rd / "chain.log").exists() else "(no chain.log)" for rd in (rd_x, rd_a, rd_b)}
+            tickets = sorted(f.name for f in self.ticket_dir.glob("*.ticket.json")) if self.ticket_dir.exists() else []
+            self.fail("a chain did not finish in 240 s\n" + "\n----\n".join(f"{k}:\n{v}" for k, v in logs.items()) + f"\nclaim exists={self.claim_path.exists()} tickets={tickets} legs={self.leg_starts()}")
+        self.assertEqual([p.returncode for p in (px, pa, pb)], [0, 0, 0], "\n----\n".join(outs))
+        return self.leg_starts(), self.chain_log(rd_a), self.chain_log(rd_b)
+
+    def test_r2_b1_a_head_that_keeps_failing_under_the_claim_loses_its_place_to_a_ready_follower(self) -> None:
+        starts, log_a, log_b = self.run_kept_head_scenario(None)
+        kept = [l for l in log_a if " TICKET_KEPT " in l]
+        dropped = [l for l in log_a if " TICKET_DROPPED " in l]
+        self.assertEqual(len(kept), 1, "the ONE allowed keep: " + "\n".join(log_a))
+        self.assertIn("keeps=1/1", kept[0])
+        self.assertEqual(len(dropped), 1, "the next GATE_BUSY under the claim gives the place up: " + "\n".join(log_a))
+        self.assertIn("reason=gate-busy-under-claim-after-kept-cycles keeps=1/1", dropped[0])
+        self.assertEqual(starts, ["fx-c.json", "fx-b.json", "fx-a.json"], "the ready follower B must take the claim once A has used its one keep: " + "\n".join(log_b))
+        self.assertEqual(len([l for l in log_a if " TICKET_TAKEN " in l]), 2, "A rejoins with a new ticket at the back: " + "\n".join(log_a))
+
+    def test_r2_b1_mutation_without_the_keep_counter_the_head_keeps_its_place_forever(self) -> None:
+        mut = self.mutant_runner("if ($ticketKeeps -lt $TicketKeepMax) {", "if ($true) {")
+        starts, log_a, _ = self.run_kept_head_scenario(mut)
+        self.assertEqual(len([l for l in log_a if " TICKET_DROPPED " in l]), 0, "the mutant must never drop: " + "\n".join(log_a))
+        self.assertEqual(starts, ["fx-c.json", "fx-a.json", "fx-b.json"], "the mutant reproduces the starvation: A runs ahead of the ready follower B")
+
+    PROBE_DUMP_FAKE = base.FAKE_QUIET.replace(
+        "$held = $false",
+        "if ($env:FAKE_TICKET_DUMP) { $tk = Join-Path (Split-Path -Parent $env:FAKE_CLAIM_PATH) 'bachelor.tickets'; foreach ($f in @(Get-ChildItem -LiteralPath $tk -Filter '*.ticket.json' -ErrorAction SilentlyContinue)) { "
+        "Add-Content -LiteralPath $env:FAKE_TICKET_DUMP -Value ('{0} {1} {2}' -f $MaxWaitSec, $MaxAdmissionWaitSec, ([IO.File]::ReadAllText($f.FullName).Trim())) } }\n$held = $false", 1)
+
+    def probe_phase_ticket(self, runner: Path | None = None, extra: tuple[str, ...] = ()) -> tuple[int, dict]:
+        """Run one chain whose first under-claim probe is GATE_BUSY (the ticket is kept) and whose second PRE-CLAIM probe is the kept head's probe: returns the
+        admission bound the chain passed to that probe and the ticket file as it stood while the probe ran."""
+        fake = self.case / "fake-quiet-dump.ps1"
+        fake.write_text(self.PROBE_DUMP_FAKE, encoding="utf-8")
+        dump = self.case / "ticket-dump.log"
+        rd = self.case / "lane-P"
+        p = subprocess.run(self.chain_args(rd, self.specs[0], runner=runner, quiet=fake, extra=extra), capture_output=True, text=True, timeout=240,
+                           env=self.env(FAKE_QUIET_MODES="QUIET,BUSY,QUIET,QUIET", FAKE_TICKET_DUMP=str(dump)))
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        rows = [l.split(" ", 2) for l in dump.read_text(encoding="utf-8").splitlines()]
+        pre_claim = [r for r in rows if r[0] == "600"]   # the kept head's pre-claim probe runs with -MaxWaitSec 600 (QuietMaxWaitSec); the under-claim probe runs with 0
+        self.assertEqual(len(pre_claim), 1, rows)
+        return int(pre_claim[0][1]), json.loads(pre_claim[0][2])
+
+    def staleness_scenario(self, stale_after_sec: int, heartbeat_age_sec: int) -> dict:
+        """A head ticket with the given staleAfterSec whose owner is live (a real process, its true start time) and one whose owner is dead, judged heartbeat_age_sec
+        after their last heartbeat."""
+        live, dead = self.sleeper(), self.sleeper()
+        self.ps(f"$L = New-VenueTicket -Venue bachelor -RunDir 'run-live' -ClaimDir $d -OwnerPid {live.pid} -StaleAfterSec {stale_after_sec}\n"
+                f"Start-Sleep -Milliseconds 30\n$D = New-VenueTicket -Venue bachelor -RunDir 'run-dead' -ClaimDir $d -OwnerPid {dead.pid} -StaleAfterSec {stale_after_sec}\n'{{}}'")
+        dead.kill(); dead.wait()
+        return self.ps(f"$rows = @(Get-VenueTickets -Venue bachelor -ClaimDir $d -NowUtc ([DateTime]::UtcNow.AddSeconds({heartbeat_age_sec})).ToString('o'))\n"
+                       "[pscustomobject]@{ rows = @($rows | ForEach-Object { [pscustomobject]@{ run = $_.ticket.runDir; state = $_.state; reason = $_.reason } }) } | ConvertTo-Json -Compress -Depth 4")
+
+    def test_r2_b2_a_live_head_in_a_long_probe_is_not_stale_at_700_s_but_a_dead_one_is_at_once(self) -> None:
+        admission, ticket = self.probe_phase_ticket()
+        self.assertEqual(admission, 7200, "the chain must pass the probe an explicit admission bound")
+        self.assertEqual(ticket["phase"], "probing")
+        self.assertEqual(ticket["staleAfterSec"], 600 + 300 + 7200 + 120 + 120 + 10,
+                         "the window is derived from QuietMaxWaitSec + um-run's waits + the admission bound + a margin (max(10, 3 x ClaimPollSec 1))")
+        r = self.staleness_scenario(int(ticket["staleAfterSec"]), heartbeat_age_sec=700)
+        by_run = {row["run"]: row for row in r["rows"]}
+        self.assertEqual((by_run["run-live"]["state"], by_run["run-live"]["reason"]), ("LIVE", None), "a live head whose probe is still pending 700 s in must keep its place")
+        self.assertEqual((by_run["run-dead"]["state"], by_run["run-dead"]["reason"]), ("STALE", "dead-pid"), "a dead owner is stale at once whatever the window")
+
+    def test_r2_b2_a_tighter_admission_bound_gives_a_proportionally_shorter_window(self) -> None:
+        admission, ticket = self.probe_phase_ticket(extra=("-ProbeAdmissionWaitSec", "100", "-QuietMaxWaitSec", "600"))
+        self.assertEqual(admission, 100)
+        self.assertEqual(ticket["staleAfterSec"], 600 + 300 + 100 + 120 + 120 + 10)
+
+    def test_r2_b2_mutation_with_the_old_derivation_a_live_head_goes_stale_at_700_s(self) -> None:
+        mut = self.mutant_runner("$ticketProbeStaleSec = Get-VenueTicketProbeStaleSec -QuietMaxWaitSec $QuietMaxWaitSec -AdmissionWaitSec $ProbeAdmissionWaitSec -MarginSec $ticketPollStaleSec",
+                                 "$ticketProbeStaleSec = $QuietMaxWaitSec + $ticketPollStaleSec")
+        _, ticket = self.probe_phase_ticket(runner=mut)
+        r = self.staleness_scenario(int(ticket["staleAfterSec"]), heartbeat_age_sec=700)
+        live = [row for row in r["rows"] if row["run"] == "run-live"][0]
+        self.assertEqual((live["state"], live["reason"]), ("STALE", "heartbeat"), "the mutant reproduces sol B2: the live head is removed as heartbeat-stale")
+
+    TIE_BREAK = """
+$dir = Get-VenueTicketDir -Venue bachelor -ClaimDir $d
+New-Item -ItemType Directory -Force -Path $dir | Out-Null
+foreach ($n in @@NAMES@@) { Set-Content -LiteralPath (Join-Path $dir $n) -Value '{}' }
+[pscustomobject]@{ order = @(Get-VenueTickets -Venue bachelor -ClaimDir $d | ForEach-Object { $_.name }) } | ConvertTo-Json -Compress
+"""
+
+    def tie_break_order(self, names: list[str], module: Path | None = None) -> list[str]:
+        """The line's order for ticket files created in the order given (each unparseable and fresh, so it counts as live 'being-written')."""
+        return self.ps(self.TIE_BREAK.replace("@@NAMES@@", "@(" + ",".join(f"'{n}'" for n in names) + ")"), module=module)["order"]
+
+    def test_r2_equal_tick_tickets_order_by_pid_then_start_not_by_enumeration(self) -> None:
+        tick = "0000000000000000100"
+        # string order of the names is NOT numeric order: p10 < p9 and 40 < 5 as text
+        want = [f"{tick}-p9-5.ticket.json", f"{tick}-p9-40.ticket.json", f"{tick}-p10-5.ticket.json", f"{tick}-p10-40.ticket.json", f"0000000000000000101-p1-1.ticket.json"]
+        self.assertEqual(self.tie_break_order(list(reversed(want))), want, "equal ticks order by pid then start ticks as NUMBERS, whatever order the files were created in")
+
+    def test_r2_mutation_without_the_tie_break_equal_ticks_follow_enumeration_order(self) -> None:
+        mut = Path(tempfile.mkdtemp(prefix="mut-", dir=self.case)) / MODULE.name
+        text = MODULE.read_text(encoding="utf-8")
+        anchor = "Sort-Object -Property key, pidKey, startKey, name"
+        self.assertEqual(text.count(anchor), 1, "mutation anchor moved")
+        mut.write_text(text.replace(anchor, "Sort-Object -Property key"), encoding="utf-8")
+        tick = "0000000000000000100"
+        got = self.tie_break_order([f"{tick}-p9-5.ticket.json", f"{tick}-p10-5.ticket.json"], module=mut)
+        self.assertEqual(got, [f"{tick}-p10-5.ticket.json", f"{tick}-p9-5.ticket.json"], "the mutant orders by file name text: p10 before p9")
 
     def test_the_contract_is_documented_in_both_headers(self) -> None:
         mod = MODULE.read_text(encoding="utf-8")
         run = RUNNER.read_text(encoding="utf-8")
         for needle in ("TICKET QUEUE (VENUE-CLAIM-FIFO-1)", "BACK-COMPAT", "Ticketing orders ONLY ticket holders", "IO.FileMode]::CreateNew"):
             self.assertIn(needle, mod)
-        for needle in ("2b. FIFO (VENUE-CLAIM-FIFO-1)", "-NoTicket", "-ClaimStatus", "-TicketPollSec"):
+        for needle in ("2b. FIFO (VENUE-CLAIM-FIFO-1)", "-NoTicket", "-ClaimStatus", "-TicketPollSec", "-TicketKeepMax", "-ProbeAdmissionWaitSec"):
             self.assertIn(needle, run)
         for f in (RUNNER, MODULE):
             self.assertTrue(all(b < 128 for b in f.read_bytes()), f"{f.name} is not ASCII")
