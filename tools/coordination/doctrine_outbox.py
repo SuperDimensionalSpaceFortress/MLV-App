@@ -92,7 +92,10 @@ CARD_VALIDATOR_REL = "tools/validate-cards.mjs"
 CARD_VALIDATOR_TIMEOUT_S = 120
 # The summary line the tip's validator prints on every run that reaches its main(). Only exit 0 AND this
 # line reporting 0 problems is a pass: a node that exits 0 without running the validator prints nothing.
-CARD_VALIDATOR_PASS_RE = re.compile(r"^\[validate-cards\] \d+ file\(s\), .*, 0 problem\(s\)\.$", re.MULTILINE)
+# The grammar is the validator's own summary line (tools/validate-cards.mjs, the last console.log in main():
+# "[validate-cards] <files> file(s), <cards> card(s), <noCards> no-card line(s), <bad> problem(s).").
+CARD_VALIDATOR_PASS_RE = re.compile(
+    r"^\[validate-cards\] \d+ file\(s\), \d+ card\(s\), \d+ no-card line\(s\), 0 problem\(s\)\.$", re.MULTILINE)
 # Node reads these before the validator's first line runs, so an inherited value runs foreign code.
 CARD_VALIDATOR_STRIPPED_ENV = frozenset({"NODE_OPTIONS", "NODE_PATH"})
 REGULAR_FILE_MODE = "100644"
