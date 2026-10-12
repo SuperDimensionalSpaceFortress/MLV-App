@@ -17,6 +17,7 @@ EXPORTS
     igpu_recon_run_preuploaded
     igpu_recon_last_preupload_status
     igpu_recon_last_timing
+    igpu_recon_last_cuda_error
     igpu_recon_last_device_output
     igpu_recon_retain_last_device_output
     igpu_recon_release_retained_device_output

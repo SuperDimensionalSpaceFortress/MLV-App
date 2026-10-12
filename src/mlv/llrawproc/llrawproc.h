@@ -316,6 +316,19 @@ uint64_t llrpGpuPlaybackReconSetLutsCount(void);
  * the backend mutex is released. NULL uninstalls. */
 typedef void (*llrpGpuReconEventLogger_t)(const char * line);
 void llrpSetGpuReconEventLogger(llrpGpuReconEventLogger_t logger);
+/* GPU-FIELD-TELEMETRY-1: one call per recon backend stage call ("recon:set_clip",
+ * "recon:set_luts", "recon:run"), emitted after the backend mutex is released.
+ * rc is the backend's return code. On success ms is the stage time (host-timed
+ * for set_clip/set_luts, the backend's own total_ms for run) and the CUDA fields
+ * are 0/NULL. On rc != 0, ms is -1 and cuda_code/cuda_name/site come from the
+ * DLL's optional igpu_recon_last_cuda_error, only when it noted a code since the
+ * previous query (otherwise 0/NULL: a validation failure, not a CUDA fault).
+ * NULL uninstalls; with no sink the cost is one pointer test per call. */
+typedef void (*llrpGpuStageTelemetrySink_t)(const char * stage, int rc, double ms,
+                                            int cuda_code, const char * cuda_name,
+                                            const char * site);
+void llrpSetGpuStageTelemetrySink(llrpGpuStageTelemetrySink_t sink);
+llrpGpuStageTelemetrySink_t llrpGetGpuStageTelemetrySinkForTesting(void);
 int llrpGpuPlaybackReconCopyLastDeviceBayer16ToGlTexture(unsigned int gl_texture_id,
                                                          int * rc_out);
 int llrpGpuPlaybackReconRunCpu16Probe(const llrpGpuPlaybackReconState_t * state,

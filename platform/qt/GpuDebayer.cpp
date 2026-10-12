@@ -20,6 +20,8 @@
 #include <QVector2D>
 
 #include "../../tools/gpu/igpu_amaze_debayer.h"
+#include "../../tools/gpu/igpu_cuda_error.h"
+#include "GpuFieldTelemetry.h"
 
 #include <atomic>
 #include <cstring>
@@ -325,6 +327,7 @@ typedef int (*GpuAmazeResetLiveGlTextureResourcesFn)(igpu_amaze_debayer_backend 
 typedef int (*GpuAmazeSetReducedHnyquistFn)(igpu_amaze_debayer_backend *, int);
 typedef int (*GpuAmazeLastTimingFn)(igpu_amaze_debayer_backend *,
                                     igpu_amaze_debayer_timing_t *);
+typedef int (*GpuAmazeLastCudaErrorFn)(igpu_cuda_error_t *);
 
 struct GpuAmazeDebayerRuntime
 {
@@ -340,6 +343,8 @@ struct GpuAmazeDebayerRuntime
     GpuAmazeResetLiveGlTextureResourcesFn resetLiveGlTextureResources = nullptr;
     GpuAmazeSetReducedHnyquistFn setReducedHnyquist = nullptr;
     GpuAmazeLastTimingFn lastTiming = nullptr;
+    /* GPU-FIELD-TELEMETRY-1: optional; older DLLs omit it. */
+    GpuAmazeLastCudaErrorFn lastCudaError = nullptr;
 };
 
 template <typename FunctionPointer>
@@ -379,6 +384,8 @@ bool loadAmazeDebayerRuntime(GpuAmazeDebayerRuntime * runtime,
         return false;
     }
 
+    runtime->lastCudaError = reinterpret_cast<GpuAmazeLastCudaErrorFn>(
+        runtime->library.resolve("igpu_amaze_debayer_last_cuda_error"));
     return resolveAmazeDebayerSymbol(&runtime->library,
                                      "igpu_amaze_debayer_create",
                                      &runtime->create,
@@ -472,6 +479,44 @@ void copyAmazeTiming(GpuAmazeDebayerRuntime * runtime,
     {
         *timing = GpuAmazeDebayerBackendTiming();
     }
+}
+
+/* GPU-FIELD-TELEMETRY-1: one stage record per AMaZE run wrapper call. Success
+ * reads the backend's own per-frame timing (no CUDA call); failure reads the
+ * DLL's last-CUDA-error slot, attributed only when it noted a code since the
+ * previous read. Call sites guard it with GpuFieldTelemetry::enabled(). */
+void noteAmazeStageTelemetry(GpuAmazeDebayerRuntime * runtime,
+                             igpu_amaze_debayer_backend * backend,
+                             const char * stage,
+                             int rc)
+{
+    if ( !runtime || !backend ) return;
+    if ( rc == 0 )
+    {
+        igpu_amaze_debayer_timing_t backendTiming;
+        if ( runtime->lastTiming && runtime->lastTiming(backend, &backendTiming) == 0 )
+        {
+            GpuFieldTelemetry::noteStage("amaze", stage, backendTiming.total_ms);
+        }
+        return;
+    }
+    static std::atomic<unsigned long long> seenCudaErrorCount{0};
+    GpuFieldTelemetry::CudaFault fault;
+    fault.dll = "amaze";
+    fault.stage = stage;
+    fault.rc = rc;
+    igpu_cuda_error_t error;
+    std::memset(&error, 0, sizeof(error));
+    if ( runtime->lastCudaError
+      && runtime->lastCudaError(&error) == 0
+      && seenCudaErrorCount.exchange(error.count) != error.count
+      && error.code != 0 )
+    {
+        fault.cudaCode = error.code;
+        fault.cudaName = error.name;
+        fault.site = error.site;
+    }
+    GpuFieldTelemetry::noteFault(fault);
 }
 
 struct GpuAmazeDebayerLiveTextureRuntime
@@ -869,6 +914,7 @@ bool gpuAmazeDebayerApplyGpuOffscreen(const float * inputRawFrame,
     }
 
     const int rc = runtime.run(backend, inputRawFrame, outputRgb16, width, height);
+    if ( GpuFieldTelemetry::enabled() ) noteAmazeStageTelemetry(&runtime, backend, "amaze:offscreen", rc);
     if ( rc != 0 )
     {
         const QString backendDescription = describeAmazeBackend(&runtime, backend);
@@ -958,6 +1004,7 @@ bool gpuAmazeDebayerRenderPostWbGlTexture(const float * inputRawFrame,
                                              wbMultipliers[0],
                                              wbMultipliers[1],
                                              wbMultipliers[2]);
+    if ( GpuFieldTelemetry::enabled() ) noteAmazeStageTelemetry(&runtime, backend, "amaze:post_wb_gl", rc);
     const QString backendDescription = describeAmazeBackend(&runtime, backend);
     if ( rc != 0 )
     {
@@ -1057,6 +1104,7 @@ bool gpuAmazeDebayerRenderPostWbGlTextureFromR16GlTexture(
             wbMultipliers[0],
             wbMultipliers[1],
             wbMultipliers[2]);
+    if ( GpuFieldTelemetry::enabled() ) noteAmazeStageTelemetry(&live.runtime, live.backend, "amaze:r16_gl", rc);
     if ( rc != 0 )
     {
         return fail(QStringLiteral("GPU AMaZE R16 texture-present run failed rc=%1 renderer=%2")
@@ -1132,6 +1180,7 @@ bool gpuAmazeDebayerRenderPostWbGlTextureFromDeviceBayer16(
             wbMultipliers[0],
             wbMultipliers[1],
             wbMultipliers[2]);
+    if ( GpuFieldTelemetry::enabled() ) noteAmazeStageTelemetry(&live.runtime, live.backend, "amaze:device_bayer16", rc);
     if ( rc != 0 )
     {
         return fail(QStringLiteral("GPU AMaZE direct device texture-present run failed rc=%1 renderer=%2")

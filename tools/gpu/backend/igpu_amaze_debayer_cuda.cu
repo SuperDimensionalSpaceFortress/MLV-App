@@ -146,6 +146,7 @@ int reset_cached_gl_resource(CachedGlImageResource * cache, bool tolerateInvalid
         {
             if (!(tolerateInvalidGraphicsContext && rc == cudaErrorInvalidGraphicsContext))
             {
+                IGPU_CUDA_ERROR_NOTE(rc, "gl_cache:unregister");
                 std::fprintf(stderr,
                              "[igpu_amaze_debayer_cuda] cudaGraphicsUnregisterResource(cached GL texture) failed: %s\n",
                              cudaGetErrorString(rc));
@@ -194,6 +195,7 @@ int ensure_cached_gl_resource(CachedGlImageResource * cache,
                                                        flags);
     if (rc != cudaSuccess)
     {
+        IGPU_CUDA_ERROR_NOTE(rc, "gl_cache:register");
         std::fprintf(stderr,
                      "[igpu_amaze_debayer_cuda] cudaGraphicsGLRegisterImage(%s) failed: %s\n",
                      label ? label : "cached GL texture",
@@ -569,6 +571,7 @@ int copy_gl_r16_texture_to_bayer16(unsigned int glTexture,
                                                      cudaGraphicsRegisterFlagsReadOnly);
         if (rc != cudaSuccess)
         {
+            IGPU_CUDA_ERROR_NOTE(rc, "gl_r16_in:register");
             std::fprintf(stderr,
                          "[igpu_amaze_debayer_cuda] cudaGraphicsGLRegisterImage(GL_R16 source texture) failed: %s\n",
                          cudaGetErrorString(rc));
@@ -579,6 +582,7 @@ int copy_gl_r16_texture_to_bayer16(unsigned int glTexture,
     cudaError_t rc = IGPU_LT_SYNC_CALL("gl_r16_in:map", cudaGraphicsMapResources(1, &resource, 0));
     if (rc != cudaSuccess)
     {
+        IGPU_CUDA_ERROR_NOTE(rc, "gl_r16_in:map");
         std::fprintf(stderr,
                      "[igpu_amaze_debayer_cuda] cudaGraphicsMapResources(GL_R16 source texture) failed: %s\n",
                      cudaGetErrorString(rc));
@@ -609,6 +613,7 @@ int copy_gl_r16_texture_to_bayer16(unsigned int glTexture,
         cached ? cudaSuccess : cudaGraphicsUnregisterResource(resource);
     if (rc != cudaSuccess)
     {
+        IGPU_CUDA_ERROR_NOTE(rc, "gl_r16_in:copy_from_array");
         std::fprintf(stderr,
                      "[igpu_amaze_debayer_cuda] GL_R16 source texture device copy failed: %s\n",
                      cudaGetErrorString(rc));
@@ -617,6 +622,7 @@ int copy_gl_r16_texture_to_bayer16(unsigned int glTexture,
     }
     if (unmapRc != cudaSuccess)
     {
+        IGPU_CUDA_ERROR_NOTE(unmapRc, "gl_r16_in:unmap");
         std::fprintf(stderr,
                      "[igpu_amaze_debayer_cuda] cudaGraphicsUnmapResources(GL_R16 source texture) failed: %s\n",
                      cudaGetErrorString(unmapRc));
@@ -625,6 +631,7 @@ int copy_gl_r16_texture_to_bayer16(unsigned int glTexture,
     }
     if (unregisterRc != cudaSuccess)
     {
+        IGPU_CUDA_ERROR_NOTE(unregisterRc, "gl_r16_in:unregister");
         std::fprintf(stderr,
                      "[igpu_amaze_debayer_cuda] cudaGraphicsUnregisterResource(GL_R16 source texture) failed: %s\n",
                      cudaGetErrorString(unregisterRc));
@@ -1166,6 +1173,7 @@ int copy_rgb16_to_gl_rgba16_texture(const uint16_t * dRgb16,
                                                      cudaGraphicsRegisterFlagsWriteDiscard);
         if (rc != cudaSuccess)
         {
+            IGPU_CUDA_ERROR_NOTE(rc, "gl_rgba16:register");
             std::fprintf(stderr,
                          "[igpu_amaze_debayer_cuda] cudaGraphicsGLRegisterImage(GL_RGBA16 texture) failed: %s\n",
                          cudaGetErrorString(rc));
@@ -1176,6 +1184,7 @@ int copy_rgb16_to_gl_rgba16_texture(const uint16_t * dRgb16,
         rc = IGPU_LT_SYNC_CALL("gl_rgba16:map", cudaGraphicsMapResources(1, &resource, 0));
         if (rc != cudaSuccess)
         {
+            IGPU_CUDA_ERROR_NOTE(rc, "gl_rgba16:map");
             std::fprintf(stderr,
                          "[igpu_amaze_debayer_cuda] cudaGraphicsMapResources(GL_RGBA16 texture) failed: %s\n",
                          cudaGetErrorString(rc));
@@ -1206,6 +1215,7 @@ int copy_rgb16_to_gl_rgba16_texture(const uint16_t * dRgb16,
         cudaFree(dRgba16);
         if (rc != cudaSuccess)
         {
+            IGPU_CUDA_ERROR_NOTE(rc, "gl_rgba16:copy_to_array");
             std::fprintf(stderr,
                          "[igpu_amaze_debayer_cuda] device-to-GL texture copy failed: %s\n",
                          cudaGetErrorString(rc));
@@ -1213,6 +1223,7 @@ int copy_rgb16_to_gl_rgba16_texture(const uint16_t * dRgb16,
         }
         if (unmapRc != cudaSuccess)
         {
+            IGPU_CUDA_ERROR_NOTE(unmapRc, "gl_rgba16:unmap");
             std::fprintf(stderr,
                          "[igpu_amaze_debayer_cuda] cudaGraphicsUnmapResources(GL_RGBA16 texture) failed: %s\n",
                          cudaGetErrorString(unmapRc));
@@ -1220,6 +1231,7 @@ int copy_rgb16_to_gl_rgba16_texture(const uint16_t * dRgb16,
         }
         if (unregisterRc != cudaSuccess)
         {
+            IGPU_CUDA_ERROR_NOTE(unregisterRc, "gl_rgba16:unregister");
             std::fprintf(stderr,
                          "[igpu_amaze_debayer_cuda] cudaGraphicsUnregisterResource(GL_RGBA16 texture) failed: %s\n",
                          cudaGetErrorString(unregisterRc));
@@ -1272,6 +1284,7 @@ int copy_rgba16_to_gl_rgba16_texture(const uint16_t * dRgba16,
                                                          cudaGraphicsRegisterFlagsWriteDiscard);
             if (rc != cudaSuccess)
             {
+                IGPU_CUDA_ERROR_NOTE(rc, "gl_rgba16_direct:register");
                 std::fprintf(stderr,
                              "[igpu_amaze_debayer_cuda] cudaGraphicsGLRegisterImage(GL_RGBA16 direct texture) failed: %s\n",
                              cudaGetErrorString(rc));
@@ -1282,6 +1295,7 @@ int copy_rgba16_to_gl_rgba16_texture(const uint16_t * dRgba16,
         cudaError_t rc = IGPU_LT_SYNC_CALL("gl_rgba16_direct:map", cudaGraphicsMapResources(1, &resource, 0));
         if (rc != cudaSuccess)
         {
+            IGPU_CUDA_ERROR_NOTE(rc, "gl_rgba16_direct:map");
             std::fprintf(stderr,
                          "[igpu_amaze_debayer_cuda] cudaGraphicsMapResources(GL_RGBA16 direct texture) failed: %s\n",
                          cudaGetErrorString(rc));
@@ -1313,6 +1327,7 @@ int copy_rgba16_to_gl_rgba16_texture(const uint16_t * dRgba16,
             cached ? cudaSuccess : cudaGraphicsUnregisterResource(resource);
         if (rc != cudaSuccess)
         {
+            IGPU_CUDA_ERROR_NOTE(rc, "gl_rgba16_direct:copy_to_array");
             std::fprintf(stderr,
                          "[igpu_amaze_debayer_cuda] direct RGBA16 device-to-GL texture copy failed: %s\n",
                          cudaGetErrorString(rc));
@@ -1321,6 +1336,7 @@ int copy_rgba16_to_gl_rgba16_texture(const uint16_t * dRgba16,
         }
         if (unmapRc != cudaSuccess)
         {
+            IGPU_CUDA_ERROR_NOTE(unmapRc, "gl_rgba16_direct:unmap");
             std::fprintf(stderr,
                          "[igpu_amaze_debayer_cuda] cudaGraphicsUnmapResources(GL_RGBA16 direct texture) failed: %s\n",
                          cudaGetErrorString(unmapRc));
@@ -1329,6 +1345,7 @@ int copy_rgba16_to_gl_rgba16_texture(const uint16_t * dRgba16,
         }
         if (unregisterRc != cudaSuccess)
         {
+            IGPU_CUDA_ERROR_NOTE(unregisterRc, "gl_rgba16_direct:unregister");
             std::fprintf(stderr,
                          "[igpu_amaze_debayer_cuda] cudaGraphicsUnregisterResource(GL_RGBA16 direct texture) failed: %s\n",
                          cudaGetErrorString(unregisterRc));
@@ -1442,6 +1459,7 @@ int copy_rgb16_to_gl_rgba16_texture_post_wb_undo(const uint16_t * dRgb16,
                                                          cudaGraphicsRegisterFlagsWriteDiscard);
             if (rc != cudaSuccess)
             {
+                IGPU_CUDA_ERROR_NOTE(rc, "gl_rgba16_post_wb:register");
                 std::fprintf(stderr,
                              "[igpu_amaze_debayer_cuda] cudaGraphicsGLRegisterImage(GL_RGBA16 post-WB texture) failed: %s\n",
                              cudaGetErrorString(rc));
@@ -1453,6 +1471,7 @@ int copy_rgb16_to_gl_rgba16_texture_post_wb_undo(const uint16_t * dRgb16,
         cudaError_t rc = IGPU_LT_SYNC_CALL("gl_rgba16_post_wb:map", cudaGraphicsMapResources(1, &resource, 0));
         if (rc != cudaSuccess)
         {
+            IGPU_CUDA_ERROR_NOTE(rc, "gl_rgba16_post_wb:map");
             std::fprintf(stderr,
                          "[igpu_amaze_debayer_cuda] cudaGraphicsMapResources(GL_RGBA16 post-WB texture) failed: %s\n",
                          cudaGetErrorString(rc));
@@ -1485,6 +1504,7 @@ int copy_rgb16_to_gl_rgba16_texture_post_wb_undo(const uint16_t * dRgb16,
         releaseScratch();
         if (rc != cudaSuccess)
         {
+            IGPU_CUDA_ERROR_NOTE(rc, "gl_rgba16_post_wb:copy_to_array");
             std::fprintf(stderr,
                          "[igpu_amaze_debayer_cuda] post-WB device-to-GL texture copy failed: %s\n",
                          cudaGetErrorString(rc));
@@ -1493,6 +1513,7 @@ int copy_rgb16_to_gl_rgba16_texture_post_wb_undo(const uint16_t * dRgb16,
         }
         if (unmapRc != cudaSuccess)
         {
+            IGPU_CUDA_ERROR_NOTE(unmapRc, "gl_rgba16_post_wb:unmap");
             std::fprintf(stderr,
                          "[igpu_amaze_debayer_cuda] cudaGraphicsUnmapResources(GL_RGBA16 post-WB texture) failed: %s\n",
                          cudaGetErrorString(unmapRc));
@@ -1501,6 +1522,7 @@ int copy_rgb16_to_gl_rgba16_texture_post_wb_undo(const uint16_t * dRgb16,
         }
         if (unregisterRc != cudaSuccess)
         {
+            IGPU_CUDA_ERROR_NOTE(unregisterRc, "gl_rgba16_post_wb:unregister");
             std::fprintf(stderr,
                          "[igpu_amaze_debayer_cuda] cudaGraphicsUnregisterResource(GL_RGBA16 post-WB texture) failed: %s\n",
                          cudaGetErrorString(unregisterRc));
@@ -1970,4 +1992,9 @@ extern "C" int igpu_amaze_debayer_last_timing(igpu_amaze_debayer_backend * backe
     if (!backend || !timing) return -1;
     *timing = backend->lastTiming;
     return 0;
+}
+
+extern "C" int igpu_amaze_debayer_last_cuda_error(igpu_cuda_error_t * out)
+{
+    return igpu_cuda_error_slot::copy_last(out);
 }

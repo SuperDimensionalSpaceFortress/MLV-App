@@ -28,6 +28,7 @@ SOURCES += \
     $$REPO_ROOT/src/debug/FrameChecksum.cpp \
     $$REPO_ROOT/src/debug/StageTimingCsvSink.cpp \
     $$REPO_ROOT/platform/qt/GpuDebayer.cpp \
+    $$REPO_ROOT/platform/qt/GpuFieldTelemetry.cpp \
     $$REPO_ROOT/platform/qt/GpuPreviewProcessing.cpp \
     $$REPO_ROOT/platform/qt/PlaybackPrepCpuRoute.cpp \
     $$REPO_ROOT/platform/qt/ReceiptSettings.cpp \
@@ -128,7 +129,8 @@ SOURCES += \
     $$REPO_ROOT/tests/pipeline/test_cpu_dualiso_preview_scale.cpp \
     $$REPO_ROOT/tests/pipeline/test_gpu_dualiso_preview_scale.cpp \
     $$REPO_ROOT/tests/pipeline/test_debayered16_recon_reuse.cpp \
-    $$REPO_ROOT/tests/pipeline/test_playback_prep_worker.cpp
+    $$REPO_ROOT/tests/pipeline/test_playback_prep_worker.cpp \
+    $$REPO_ROOT/tests/pipeline/test_gpu_field_telemetry_capture.cpp
 
 HEADERS += \
     $$REPO_ROOT/platform/qt/Debayered16ReconReusePolicy.h \
@@ -147,6 +149,8 @@ HEADERS += \
     $$REPO_ROOT/src/debug/FrameChecksum.h \
     $$REPO_ROOT/src/debug/StageTimingCsvSink.h \
     $$REPO_ROOT/platform/qt/GpuDebayer.h \
+    $$REPO_ROOT/platform/qt/GpuFieldTelemetry.h \
+    $$REPO_ROOT/platform/qt/GpuFieldTelemetryCore.h \
     $$REPO_ROOT/platform/qt/GpuPreviewProcessing.h \
     $$REPO_ROOT/platform/qt/PlaybackPrepCpuRoute.h \
     $$REPO_ROOT/platform/qt/GpuPreviewHostRoute.h \

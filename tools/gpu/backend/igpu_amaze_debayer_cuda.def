@@ -13,3 +13,4 @@ EXPORTS
     igpu_amaze_debayer_reset_live_gl_texture_resources
     igpu_amaze_debayer_set_reduced_hnyquist
     igpu_amaze_debayer_last_timing
+    igpu_amaze_debayer_last_cuda_error
