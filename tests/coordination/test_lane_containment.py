@@ -1421,6 +1421,52 @@ def test_codex_receipt_keeps_the_requested_windows_sandbox_when_codex_warns_noth
     assert "windowsSandboxIgnoredDetail" not in q["authority"], q["authority"]
 
 
+# r2 (sol r1 blocker on 53b786f5): r1 removed the prompt with a GLOBAL substring replace, so prompt
+# text that also occurs inside codex's genuine warning erased the evidence and the receipt kept
+# 'unelevated'. The echo is now skipped by position (the span right after the `user` marker).
+_IGNORED_BLOCK=_CODEX_IGNORING_HEADER+_ignored_key_line("windows.sandbox")
+
+
+@pytest.mark.parametrize("prompt,key", [
+    ("windows.sandbox", "windows.sandbox"),
+    ("windows", "windows.sandbox"),
+    ("windows", "windows"),
+    (_IGNORED_BLOCK, "windows.sandbox"),
+], ids=["prompt-is-key", "prompt-is-table", "prompt-is-table-key-is-table", "prompt-is-warning-block"])
+def test_codex_receipt_keeps_genuine_ignored_evidence_when_the_prompt_overlaps_it(fixture_tree, prompt, key):
+    stderr=(_CODEX_PREAMBLE.format(prompt=prompt)+_CODEX_IGNORING_HEADER+_ignored_key_line(key)
+            +"codex\nfixture narration\n")
+    q=_codex_lane_with_stderr(fixture_tree,stderr,prompt=prompt)
+    assert q["authority"]["windowsSandbox"]=="requested-unelevated-ignored-by-codex", q["authority"]
+    assert f"`{key}` is ignored" in q["authority"]["windowsSandboxIgnoredDetail"], q["authority"]
+
+
+# Without a `user` marker the echo has no known position: a line-aligned copy of the whole prompt is
+# cut once, and only when there are at least two, so a lone copy (possibly codex's own) is still read.
+@pytest.mark.parametrize("stderr", [
+    _IGNORED_BLOCK+_IGNORED_BLOCK+"codex\nfixture narration\n",
+    _IGNORED_BLOCK+"codex\nfixture narration\n",
+], ids=["echo-then-genuine", "genuine-only"])
+def test_codex_receipt_keeps_genuine_ignored_evidence_without_a_user_marker(fixture_tree, stderr):
+    q=_codex_lane_with_stderr(fixture_tree,stderr,prompt=_IGNORED_BLOCK)
+    assert q["authority"]["windowsSandbox"]=="requested-unelevated-ignored-by-codex", q["authority"]
+    assert "`windows.sandbox` is ignored" in q["authority"]["windowsSandboxIgnoredDetail"], q["authority"]
+
+
+def test_codex_receipt_keeps_the_requested_windows_sandbox_when_a_warning_names_it_without_ignoring_it(fixture_tree):
+    # fable r1 (test strength): an indented line inside a warning block that names `windows.sandbox`
+    # but does not say ignored/unrecognized/unknown is not evidence; dropping that clause from the
+    # indented-line branch of Get-CodexIgnoredWindowsSandboxLine turns this row RED.
+    stderr=(_CODEX_PREAMBLE.format(prompt="fixture prompt")
+            +"warning: Codex loaded 2 configuration settings from session flags.\n"
+            +"  session flags: `windows.sandbox` = \"unelevated\" applied.\n"
+            +"  session flags: `sandbox_mode` = \"read-only\" applied.\n"
+            +"codex\nfixture narration\n")
+    q=_codex_lane_with_stderr(fixture_tree,stderr)
+    assert q["authority"]["windowsSandbox"]=="unelevated", q["authority"]
+    assert "windowsSandboxIgnoredDetail" not in q["authority"], q["authority"]
+
+
 # CODEX-KEY-MCP-ESCAPE-1 (HUB RULING wf_d36c1040-11d): MCP tools (node_repl, ...) run OUTSIDE
 # the codex sandbox, so a read-only codex lane gets none. Measured on codex-cli 0.160.1:
 # -c features.plugins=false drops plugin-provided servers, -c features.apps=false drops the

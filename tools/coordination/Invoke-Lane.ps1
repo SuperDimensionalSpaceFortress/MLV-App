@@ -560,14 +560,35 @@ $DENIED_TOOLS = @($DENIED_TOOLS_DISPLAY | ForEach-Object { $_.ToLowerInvariant()
 # followed by one indented line per key:   <source>: `<key>` is ignored.
 # Only codex's own preamble is read: the scan stops at the first bare `codex` line (the
 # assistant's first turn), because a transcript can quote the same block from a nested codex
-# run, and the echoed prompt is removed first, because a prompt can quote it too. A build that
-# drops the whole [windows] table may name the key `windows`, so that spelling matches as well.
+# run, and the echoed prompt is skipped, because a prompt can quote it too. A build that drops
+# the whole [windows] table may name the key `windows`, so that spelling matches as well.
+# r2 (sol r1 blocker, fable r1 hardening): the echo is skipped BY POSITION, never by substring
+# removal. codex 0.162.x prints the prompt verbatim right after its `user` marker line and
+# before the warning block (sol-001.err.txt, #329 r1, lines 12-91 and 552-558), so exactly that
+# span is cut once. r1's global .Replace(prompt, '') also erased every copy of the prompt text
+# inside the genuine warning, so a prompt of `windows.sandbox`, `windows` or the warning block
+# itself hid the evidence. When the echo is not at that position (no marker, or not verbatim),
+# a line-aligned copy of the whole prompt is cut once, and only when it occurs at least twice:
+# a single copy may be codex's own warning, and keeping it can only under-claim containment.
 function Get-CodexIgnoredWindowsSandboxLine([string]$StderrText, [string]$Prompt) {
     if ([string]::IsNullOrEmpty($StderrText)) { return $null }
     $scan = $StderrText.Replace("`r`n", "`n")
     if (-not [string]::IsNullOrWhiteSpace($Prompt)) {
-        $echo = $Prompt.Replace("`r`n", "`n")
-        $scan = $scan.Replace($echo, '').Replace($echo.Trim(), '')
+        $echo = $Prompt.Replace("`r`n", "`n").Trim()
+        $cut = $null
+        $marker = [regex]::Match($scan, '(?m)^user[ \t]*\n')
+        if ($marker.Success) {
+            $at = $marker.Index + $marker.Length
+            while ($at -lt $scan.Length -and [char]::IsWhiteSpace($scan[$at])) { $at++ }
+            if ($scan.Length - $at -ge $echo.Length -and [string]::CompareOrdinal($scan, $at, $echo, 0, $echo.Length) -eq 0) {
+                $cut = @(($marker.Index + $marker.Length), ($at + $echo.Length - $marker.Index - $marker.Length))
+            }
+        }
+        if ($null -eq $cut) {
+            $copies = [regex]::Matches($scan, '(?m)^[ \t]*' + [regex]::Escape($echo) + '[ \t]*$')
+            if ($copies.Count -ge 2) { $cut = @($copies[0].Index, $copies[0].Length) }
+        }
+        if ($null -ne $cut) { $scan = $scan.Remove($cut[0], $cut[1]) }
     }
     $inWarning = $false
     foreach ($line in ($scan -split '\r?\n')) {

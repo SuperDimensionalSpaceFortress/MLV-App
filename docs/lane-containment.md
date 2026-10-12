@@ -125,11 +125,17 @@ egress section below). A codex build that does not know the
 "Codex is ignoring N unrecognized configuration setting(s)" with an
 indented `` `windows.sandbox` is ignored `` line (or `` `windows` ``), and
 runs on its own default sandbox. When codex's stderr preamble (before its
-first `codex` turn line, with the echoed prompt removed) carries that line,
-the receipt overwrites `authority.windowsSandbox` to
+first `codex` turn line, with the echoed prompt skipped by position)
+carries that line, the receipt overwrites `authority.windowsSandbox` to
 `'requested-<mode>-ignored-by-codex'` and quotes the line in
 `windowsSandboxIgnoredDetail`. A receipt never claims a mode the binary
-refused. Guard: the `test_codex_receipt_*_windows_sandbox_*` rows in
+refused. The echo is the span right after codex's `user` marker line, cut
+once; it is never removed as a substring, because prompt text such as
+`windows.sandbox` also occurs inside the genuine warning (r2, sol r1).
+Without a `user` marker, a line-aligned copy of the whole prompt is cut
+only when two copies exist, so a lone copy is still read as evidence.
+Guard: the `test_codex_receipt_*_windows_sandbox_*` and
+`test_codex_receipt_keeps_genuine_ignored_evidence_*` rows in
 `tests/coordination/test_lane_containment.py`.
 
 **Known gap, not yet closed:** NA-10 would be the natural place to guard
