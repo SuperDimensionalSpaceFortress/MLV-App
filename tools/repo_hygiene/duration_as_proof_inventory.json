@@ -1890,6 +1890,16 @@
       ]
     },
     {
+      "path": "platform/qt/PlaybackPrepPresentationPolicy.h",
+      "anchor": "if ( sinceMs < 0.0 )",
+      "class": "value_fallback_select",
+      "clock": "qpc_stage_clock",
+      "justification": "PLAYBACK-CPU-PACE-GAP-1: AdvanceHold::hold() tests the -1.0 'no hold in progress' sentinel; a negative sinceMs means the hold is just starting, so it stamps sinceMs = nowMs (mlv_stage_timing_now()*1000 at MainWindow.cpp's caller) and counts one hold. sinceMs is a start timestamp, not a duration, and the comparison only selects 'start the clock' vs 'keep the existing start'. It is part of the kAdvanceHoldMaxMs (1 s) liveness backstop that releases a drop-frame-off advance hold so a frame that never arrives cannot stall playback; it never proves that any stage ran. Holds and timeouts are counted (holds/timeouts) for the smoke summary.",
+      "lines": [
+        67
+      ]
+    },
+    {
       "path": "platform/qt/PlaybackFrameRange.h",
       "anchor": "if ( consumed < 2 || elapsedMs <= 0 ) return 0.0 ;",
       "class": "division_guard",
