@@ -131,6 +131,24 @@ PATHNAME_DELETE_ALLOWED = {
         "generator side: the source archive about to be recreated under the generator's own -OutDir.",
     ("um-display-mapping-probe-job.ps1", "Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue"):
         "recursive: see RECURSIVE_DELETE_ALLOWED (a GUID temp directory extracted from the probe zip).",
+    # The Bachelor bench agent itself (tracked from AGENT-HEAVY-SLOT-WAIT-RELEASE-1 r1c). Every target is a file the
+    # agent names inside its OWN mailbox root (logs\, running\, slot-holders\) or an environment variable.
+    ("ultra-magnus-agent.ps1", "Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue"):
+        "Write-JsonFileAtomic: its own '<target>.<guid>.tmp' whose write just failed (incomplete, records nothing).",
+    ("ultra-magnus-agent.ps1", "if ($old -and $old -ne $Tmp) { Remove-Item -LiteralPath $old -Force -ErrorAction SilentlyContinue }"):
+        "Set-OwnPendingMarkerTmp: this live agent's own older running\\<id>.started.json.<guid>.tmp, superseded.",
+    ("ultra-magnus-agent.ps1", "Remove-Item -LiteralPath $old -Force -ErrorAction SilentlyContinue"):
+        "Clear-OwnPendingMarkerTmp: this live agent's own running\\<id>.started.json.<guid>.tmp, superseded.",
+    ("ultra-magnus-agent.ps1", "Remove-Item -LiteralPath $outFile, $errFile -Force -ErrorAction SilentlyContinue"):
+        "logs\\<jobId>.out.txt / .err.txt: the job's capture files, cleared before the launch that recreates them.",
+    ("ultra-magnus-agent.ps1", "Remove-Item -LiteralPath $Holder.acquiredFile, $Holder.releaseFile, $Holder.recordFile -Force -ErrorAction SilentlyContinue"):
+        "slot-holders\\<jobId>.<guid>.acquired.json / .release / .holder.json: the ended holder's own side files.",
+    ("ultra-magnus-agent.ps1", "Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue"):
+        "Stop-StaleHeavySlotHolders: a slot-holders\\*.holder.json record (Get-ChildItem -Filter '*.holder.json').",
+    ("ultra-magnus-agent.ps1", "Get-ChildItem -LiteralPath $slotHolders -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '\\.(acquired\\.json|release|tmp)$' } | Remove-Item -Force -ErrorAction SilentlyContinue"):
+        "slot-holders\\ side files only (*.acquired.json, *.release, *.tmp) left by a dead agent's holders.",
+    ("ultra-magnus-agent.ps1", "Remove-Item Env:\\MLV_AGENT_ADMISSION, Env:\\MLV_AGENT_ADMISSION_THERMAL, Env:\\MLV_AGENT_ADMISSION_WAIT_SEC, Env:\\HEAVY_SLOT_HELD -ErrorAction SilentlyContinue"):
+        "environment variables (Env: drive), not files.",
 }
 
 # ---- 5. every RECURSIVE delete under tools/profiling -----------------------------------------------------
