@@ -57,11 +57,10 @@ constexpr long long kEvtNextMaxWaitMs = 1000;
 static_assert(kSystemLogDeadlineMs < kSessionEndWaitMs, "the System-log query must end inside the session-end wait");
 
 /* The EvtNext wait for the next batch: at most kEvtNextMaxWaitMs and never past
- * the query's total deadline. 0 means the deadline has passed: stop. */
+ * the query's total deadline (a passed deadline clamps to no wait). */
 inline unsigned long evtNextWaitMs(long long remainingMs)
 {
-    if (remainingMs <= 0) return 0;
-    return static_cast<unsigned long>(remainingMs < kEvtNextMaxWaitMs ? remainingMs : kEvtNextMaxWaitMs);
+    return static_cast<unsigned long>(std::clamp(remainingMs, 0LL, kEvtNextMaxWaitMs));
 }
 
 /* ON unless the value is 0|off|false|no (case-insensitive, trimmed); unset or

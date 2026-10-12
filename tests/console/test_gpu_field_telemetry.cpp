@@ -919,6 +919,7 @@ QStringList exitJoinCensus(const QString & source)
         "        flushImpl(\"after_fault\", true, true);",
         "[]() { flushImpl(\"recovery\", false, true); }",
         // The System-log read is bounded by its deadline and stops at session end.
+        "        if (deadline.hasExpired())\n        {\n            r.status = \"timeout\";\n            break;\n        }\n"
         "        const DWORD waitMs = core::evtNextWaitMs(deadline.remainingTime());",
         "        if (workerStopped(onWorker))\n        {\n            r.status = \"interrupted\";",
     };

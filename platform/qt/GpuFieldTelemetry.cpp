@@ -252,12 +252,12 @@ core::SystemLogResult querySystemLog(const std::string & sinceUtc, const QDeadli
     int seen = 0;
     while (seen < kMaxSystemLogEvents)
     {
-        const DWORD waitMs = core::evtNextWaitMs(deadline.remainingTime());
-        if (waitMs == 0)
+        if (deadline.hasExpired())
         {
             r.status = "timeout";
             break;
         }
+        const DWORD waitMs = core::evtNextWaitMs(deadline.remainingTime());
         if (workerStopped(onWorker))
         {
             r.status = "interrupted";
