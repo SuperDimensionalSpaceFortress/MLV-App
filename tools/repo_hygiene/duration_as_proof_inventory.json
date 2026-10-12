@@ -262,6 +262,16 @@
       ]
     },
     {
+      "path": "platform/qt/PlaybackPaceAwareLookahead.h",
+      "anchor": "if ( ! guardCopy . armed ( ) || guardAwaitingFirstPresent ( guardCopy , 0 ) || ! ( expectedIntervalMs > 0.0 ) )",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "PLAYBACK-CPU-PACE-AWARE-LOOKAHEAD-1 predictNextDropTarget: expectedIntervalMs is the GUI's smoothed draw-to-draw EMA (m_playbackFpsEmaFrameMs, a QTime delta), 0 while paused, stalled or before the first draw; a non-positive value means the interval is unknown, so the lookahead falls back to N+1 instead of predicting. A data-validity fallback for which frame to render ahead, never proof that a stage ran.",
+      "lines": [
+        110
+      ]
+    },
+    {
       "path": "platform/qt/PlaybackQualityPolicy.h",
       "anchor": "return frameMs > 0.0 ? 1000.0 / frameMs : 0.0 ;",
       "class": "division_guard",
