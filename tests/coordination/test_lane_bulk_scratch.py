@@ -49,10 +49,14 @@ def world(tmp_path):
     return w
 
 
-def call_helper(w, paths, pr="none", keep=False, work=None, workdir_in=None, extra="", timeout=120):
+def call_helper(w, paths, pr="none", keep=False, work=None, workdir_in=None, extra="", timeout=120, real_snapshot=False):
     """Dot-source the helper in a fresh pwsh and return its disposition as a dict.
 
-    pr=None leaves the PR probe at its default (real `gh`, or the -GhPath seam in `extra`)."""
+    pr=None leaves the PR probe at its default (real `gh`, or the -GhPath seam in `extra`).
+    The process snapshot is an empty injected one unless `extra` brings its own or real_snapshot=True: a real scan on a busy
+    host sees other lanes' short-lived compilers with unreadable cwds, which the fail-closed guard (rightly) cannot rule out."""
+    if not real_snapshot and "-SnapshotProvider" not in extra:
+        extra = (extra + " " + provider()).strip()
     (w["run"] / "scratch-paths.txt").write_text("\n".join(str(p) for p in paths) + "\n", encoding="utf-8")
     driver = w["tmp"] / "driver.ps1"
     probe = "-PrProbe { '%s' } " % pr if pr is not None else ""
@@ -179,7 +183,10 @@ def lane(fixture_tree, tmp_path, paths, extra=(), with_helper=True, mutate=None)
         (root / "run" / "scratch-paths.txt").write_text("\n".join(str(p) for p in paths(bulk)) + "\n", encoding="utf-8")
     if with_helper:
         (root / "Remove-LaneBulkScratch.ps1").write_bytes(HELPER.read_bytes())
-        (root / "Retire-LaneWorktree.ps1").write_bytes(RETIRE.read_bytes())
+        # The fixture copy only: a real Win32_Process scan on a busy host sees other lanes' short-lived compilers with
+        # unreadable cwds, which the fail-closed holder guard cannot rule out. The real scan is exercised by the live-cwd row.
+        (root / "Retire-LaneWorktree.ps1").write_bytes(RETIRE.read_bytes() +
+            b"\r\nfunction Get-LaneProcessSnapshot { [pscustomobject]@{ Procs = @(); SelfPids = @($PID); CapturedUtc = (Get-Date).ToUniversalTime() } }\r\n")
     cmd += ["-BulkScratchRoot", str(bulk), "-ScratchRoot", str(bulk / "lane-scratch"), *extra]
     if mutate: mutate(bulk)
     return cmd, env, receipt, bulk
@@ -327,7 +334,7 @@ def test_a_live_process_holding_the_dir_keeps_it(world):
             if ready.exists(): break
             time.sleep(0.1)
         assert ready.exists()
-        d = call_helper(world, [asm])
+        d = call_helper(world, [asm], real_snapshot=True)
         e = entry(d)
         assert e["action"] == "kept" and e["reason"] == "live-process", e
         assert any("via=cwd" in h for h in e["holders"]), e
@@ -376,3 +383,92 @@ def test_a_failing_size_walk_is_walk_failed_not_remove_failed(world):
         assert asm.exists()
     finally:
         subprocess.run(["icacls", str(sub), "/reset"], capture_output=True, text=True)
+
+
+# ---- r3: the holder guard fails closed on unresolved or stale process evidence ----
+
+def provider(procs="@()", unknown="@()", pre=""):
+    """A -SnapshotProvider scriptblock argument: a snapshot with fixed rows and a pre-built holder index (no real scan)."""
+    return ("-SnapshotProvider { " + pre + " $idx = [pscustomobject]@{ Cwd = @{}; Scripts = @(); ScriptsByPid = @{}; CwdProbe = 'ok'; "
+            "CwdUnknown = " + unknown + " }; [pscustomobject]@{ Procs = " + procs + "; SelfPids = @($PID); "
+            "CapturedUtc = (Get-Date).ToUniversalTime(); HolderIndex = $idx } }")
+
+
+def proc_row(pid, cmdline, name="pwsh.exe"):
+    return "[pscustomobject]@{ ProcessId = %d; Name = '%s'; CommandLine = '%s'; CreationDate = (Get-Date) }" % (pid, name, cmdline)
+
+
+def unknown_row(pid, created):
+    return "[pscustomobject]@{ ProcessId = %d; Name = 'mystery.exe'; Why = 'cwd-unreadable'; CreatedUtc = %s }" % (pid, created)
+
+
+def make_asm(w, name="cpg1-r3-asm"):
+    asm = w["bulk"] / name; asm.mkdir(); (asm / "a.txt").write_text("a")
+    return asm
+
+
+def test_a_live_process_with_an_unreadable_cwd_keeps_the_dir(world):
+    asm = make_asm(world)
+    later = "(Get-Date).ToUniversalTime().AddHours(1)"
+    d = call_helper(world, [asm], extra=provider(unknown="@(%s)" % unknown_row(999001, later)))
+    e = entry(d)
+    assert e["action"] == "kept" and e["reason"] == "holder-cwd-unknown", e
+    assert any("999001" in h and "cwd-unknown" in h for h in e["holders"]), e
+    assert (asm / "a.txt").exists() and not (world["run"] / "scratch-receipts").exists()
+
+
+def test_an_unreadable_cwd_of_a_process_older_than_the_dir_is_exempt_as_in_worktree_retirement(world):
+    asm = make_asm(world)
+    earlier = "(Get-Date).ToUniversalTime().AddDays(-1)"
+    d = call_helper(world, [asm], extra=provider(unknown="@(%s)" % unknown_row(999001, earlier)))
+    assert entry(d)["action"] == "removed", entry(d)
+
+
+def test_a_holder_that_starts_during_the_pr_probe_is_seen(world):
+    asm = make_asm(world)
+    flag = world["tmp"] / "pr-probe-ran.flag"
+    late = proc_row(999002, "pwsh -File build.ps1 -Out %s" % asm)
+    extra = ("-PrProbe { Set-Content -LiteralPath '%s' -Value up; 'none' } " % flag +
+             provider(procs="@(if (Test-Path -LiteralPath '%s') { %s })" % (flag, late)))
+    d = call_helper(world, [asm], pr=None, extra=extra)
+    e = entry(d)
+    assert e["action"] == "kept" and e["reason"] == "live-process", e
+    assert any("999002" in h and "via=cmdline" in h for h in e["holders"]), e
+    assert (asm / "a.txt").exists()
+
+
+def test_a_live_process_naming_the_run_dir_holds_every_registered_path(world):
+    asm = make_asm(world)
+    chain = proc_row(999003, "pwsh -File %s\\tools\\run-chain.ps1 -HeadManifest abc" % world["run"])
+    d = call_helper(world, [asm], extra=provider(procs="@(%s)" % chain))
+    e = entry(d)
+    assert e["action"] == "kept" and e["reason"] == "run-dir-active", e
+    assert any("999003" in h for h in e["holders"]), e
+    assert (asm / "a.txt").exists() and not (world["run"] / "scratch-receipts").exists()
+
+
+def test_a_probe_that_failed_once_is_not_retried_for_the_remaining_entries(world):
+    dirs = [make_asm(world, "asm%02d" % i) for i in range(50)]
+    count = world["tmp"] / "probe-attempts.txt"
+    d = call_helper(world, dirs, extra=provider(pre="Add-Content -LiteralPath '%s' -Value x; throw 'scan-failed';" % count))
+    assert len(d["entries"]) == 50
+    assert {(e["action"], e["reason"]) for e in d["entries"]} == {("refused", "holder-probe-failed")}
+    assert all("scan-failed" in e["error"] for e in d["entries"])
+    assert len(count.read_text().split()) == 1
+    assert all((x / "a.txt").exists() for x in dirs)
+
+
+def test_a_failed_git_branch_lookup_is_unknown_not_no_pr(world):
+    driver = world["tmp"] / "branch-driver.ps1"
+    driver.write_text(". '%s'\nGet-LaneScratchPrState '%s' 'gh-never-called' 5\n" % (HELPER, world["work"]), encoding="ascii")
+    env = dict(os.environ, GIT_DIR=str(world["tmp"] / "no-such-git-dir"))   # every git call exits 128
+    r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(driver)], capture_output=True, text=True,
+                       timeout=60, env=env)
+    assert r.stdout.strip() == "unknown:branch-lookup-failed", (r.stdout, r.stderr)
+
+
+def test_two_case_spellings_of_one_path_are_one_entry(world):
+    asm = make_asm(world, "cpg1-case-asm")
+    d = call_helper(world, [asm, str(asm).upper(), str(asm).lower() + "\\"])
+    assert len(d["entries"]) == 1 and entry(d)["action"] == "removed", d["entries"]
+    assert d["truncated"] == 0

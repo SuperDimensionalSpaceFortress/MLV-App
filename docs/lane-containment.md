@@ -378,9 +378,13 @@ path. It refuses, and records why in the receipt's `bulkScratch.entries`, any pa
 absolute and strictly inside `-BulkScratchRoot` (default `C:\mlvtmp`), is, contains or lies inside
 `-ScratchRoot` or `-WorkDir` (a sibling is not refused), is or contains a git worktree, is or contains a
 reparse point (never followed), is held by a live process (`kept` / `live-process`: the path or one under it
-is a cwd, is on a command line, or is named by a script that process runs; a probe that cannot answer is
-`holder-probe-failed`), or whose lane branch has an open PR (or whose PR state cannot be read; `gh` gets 60 s
-and is killed past it). A failure in the size or reparse walk is `walk-failed`, not `remove-failed`. It
+is a cwd, is on a command line, or is named by a script that process runs; a live process that names the
+run's own dir holds everything the run registered, `kept` / `run-dir-active`; a live process whose cwd
+cannot be read and is not exempted by the worktree-retirement rule is `kept` / `holder-cwd-unknown`; a probe
+that cannot answer is `holder-probe-failed`, and it is not retried: every remaining entry gets the same
+refusal), or whose lane branch has an open PR (or whose PR state cannot be read, including a failed branch
+lookup; `gh` gets 60 s and is killed past it). The PR state is asked before the process snapshot is taken, so
+a holder that starts during the probe is seen. A failure in the size or reparse walk is `walk-failed`, not `remove-failed`. It
 never throws and never changes the lane's exit code or receipt state; `-KeepBulkScratch` records `kept` /
 `opt-out` and removes nothing. More than 200 distinct manifest lines: the receipt's `bulkScratch.truncated`
 is the count dropped. A lane without a manifest gets `bulkScratch: null`.

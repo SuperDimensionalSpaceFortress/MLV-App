@@ -27,9 +27,15 @@
       reparse-point                               the path, an ancestor below -Root, or anything inside it
       live-process (action kept)                  a live process other than the caller's own chain holds the path or one
                                                   under it: as its cwd, on its command line, or named by a script it runs
-      holder-probe-failed                         the process scan or the cwd probe could not answer
-      producer-pr-open / pr-state-unknown         the lane's branch has an open PR, or that could not be learned
-                                                  (`gh` gets -PrTimeoutSeconds, default 60; a stall is unknown, never a hang)
+      run-dir-active (action kept)                a live process names this run's own dir (command line, cwd or script text):
+                                                  the detached chain that registered the path is still running
+      holder-cwd-unknown (action kept)            a live process's current directory could not be read and Retire-LaneWorktree.ps1's
+                                                  Get-CwdUnknownRefusal does not exempt it, so it cannot be ruled out as a holder
+      holder-probe-failed                         the process scan or the cwd probe could not answer; remembered for the run, so
+                                                  every remaining entry gets the same refusal with no new scan
+      producer-pr-open / pr-state-unknown         the lane's branch has an open PR, or that could not be learned (`gh` gets
+                                                  -PrTimeoutSeconds, default 60; a stall or a failed branch lookup is unknown)
+      The PR state is asked first and the process snapshot is taken after it, so a holder that starts during the probe is seen.
       walk-failed (action failed)                 the size / reparse walk of the path threw; nothing was removed
       copy-failed                                 a small file could not be copied out, so nothing is removed
     A path that is already gone is recorded `absent`. -Keep records `kept` / `opt-out` for every path.
@@ -44,6 +50,10 @@ if (-not (Get-Command Find-WorktreeHolders -ErrorAction SilentlyContinue)) {
     catch { $script:LaneBulkHolderLoadError = $_.Exception.Message }
     if (-not (Get-Command Find-WorktreeHolders -ErrorAction SilentlyContinue) -and -not $script:LaneBulkHolderLoadError) { $script:LaneBulkHolderLoadError = 'Find-WorktreeHolders not defined' }
 }
+
+# The repository the PR probe asks about: the same literal Export-PrReviewEvidence.ps1, landing-probe.ps1 and the other
+# tools/coordination callers use (`gh repo view` resolves it, and SuperDimensionalSpaceFortress/MLV-App, to one repository).
+$script:LaneBulkRepo = 'layibabalola/MLV-App'
 
 function Test-LaneScratchSame([string]$A, [string]$B) {
     return ($A.TrimEnd('\') -ieq $B.TrimEnd('\'))
@@ -70,10 +80,11 @@ function Get-LaneScratchPrState([string]$WorkDir, [string]$GhPath = 'gh', [int]$
     # 'open' | 'none' | 'unknown' | 'unknown:<detail>'. gh gets a deadline and is killed (with its children) past it.
     try {
         $branch = @(& git -C $WorkDir branch --show-current 2>$null)
-        if ($LASTEXITCODE -ne 0 -or -not $branch.Count -or -not [string]$branch[0]) { return 'none' }   # detached / no branch: no PR to protect
+        if ($LASTEXITCODE -ne 0) { return 'unknown:branch-lookup-failed' }   # git could not answer: never read that as "no PR"
+        if (-not $branch.Count -or -not [string]$branch[0]) { return 'none' }   # detached / no branch (git answered, exit 0): no PR to protect
         $psi = New-Object System.Diagnostics.ProcessStartInfo
         $psi.FileName = $GhPath
-        foreach ($a in @('pr', 'list', '--repo', 'SuperDimensionalSpaceFortress/MLV-App', '--head', [string]$branch[0], '--state', 'open', '--json', 'number')) { [void]$psi.ArgumentList.Add($a) }
+        foreach ($a in @('pr', 'list', '--repo', $script:LaneBulkRepo, '--head', [string]$branch[0], '--state', 'open', '--json', 'number')) { [void]$psi.ArgumentList.Add($a) }
         $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.CreateNoWindow = $true
         $p = [System.Diagnostics.Process]::Start($psi)
         try {
@@ -127,13 +138,15 @@ function Invoke-RemoveLaneBulkScratch {
     try {
         if (-not (Test-Path -LiteralPath $manifest -PathType Leaf)) { return $null }
         $all = @(Get-Content -LiteralPath $manifest -Encoding utf8 -ErrorAction Stop |
-                 ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ -and -not $_.StartsWith('#') } | Select-Object -Unique)
+                 ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ -and -not $_.StartsWith('#') } |
+                 Group-Object { $_.TrimEnd('\').ToLowerInvariant() } | ForEach-Object { $_.Group[0] })   # case- and trailing-backslash-insensitive, as Register-LaneBulkScratch.ps1 dedupes
         $lines = @($all | Select-Object -First $MaxEntries)
         $result['truncated'] = [Math]::Max(0, $all.Count - $lines.Count)
         $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd('\')
         $workFull = [IO.Path]::GetFullPath($WorkDir).TrimEnd('\')
         $laneScratchFull = if ($LaneScratchRoot) { [IO.Path]::GetFullPath($LaneScratchRoot).TrimEnd('\') } else { $null }
-        $worktrees = $null; $worktreesRead = $false; $pr = $null; $snap = $null
+        $worktrees = $null; $worktreesRead = $false; $pr = $null; $prDoneUtc = $null; $snap = $null; $runHold = $null; $probeFailure = $null
+        $runDirFull = [IO.Path]::GetFullPath($RunDir).TrimEnd('\')
         $receiptsRoot = Join-Path $RunDir 'scratch-receipts'
         $entries = New-Object System.Collections.Generic.List[object]
         $n = 0
@@ -174,24 +187,50 @@ function Invoke-RemoveLaneBulkScratch {
                 $e.bytes = $bytes
                 if ($bad) { $e.reason = $bad; continue }
                 if ($Keep) { $e.action = 'kept'; $e.reason = 'opt-out'; continue }
-                # Live-holder guard: a detached chain may still be writing here after its lane exited. Every probe that cannot answer refuses.
-                $hold = $null
+                # PR state first (asked once per run): the process snapshot below must be taken AFTER it, so a holder that
+                # starts while the probe runs is seen. A snapshot older than the PR probe never authorizes a removal.
+                if ($null -eq $pr) {
+                    $pr = if ($PrProbe) { [string](& $PrProbe) } else { Get-LaneScratchPrState $WorkDir $GhPath $PrTimeoutSeconds }
+                    $prDoneUtc = (Get-Date).ToUniversalTime()
+                }
+                if ($pr -eq 'open') { $e.reason = 'producer-pr-open'; continue }
+                if ($pr -ne 'none') { $e.reason = 'pr-state-unknown'; if ($pr -like 'unknown:*') { $e.error = $pr.Substring(8) }; continue }
+                # Live-holder guard: a detached chain may still be writing here after its lane exited. Every probe that cannot
+                # answer refuses, and a probe that failed once is not retried: every remaining entry gets the same refusal.
+                if ($probeFailure) { $e.reason = 'holder-probe-failed'; $e.error = $probeFailure; continue }
+                $hold = $null; $unk = $null
                 try {
                     if ($script:LaneBulkHolderLoadError) { throw "holder probe unavailable: $($script:LaneBulkHolderLoadError)" }
-                    if ($null -eq $snap -or ((Get-Date).ToUniversalTime() - $snap.CapturedUtc).TotalSeconds -ge 10) {
+                    $stale = $null -eq $snap -or $null -eq $snap.CapturedUtc -or $snap.CapturedUtc -lt $prDoneUtc -or
+                             ((Get-Date).ToUniversalTime() - $snap.CapturedUtc).TotalSeconds -ge 10
+                    if ($stale) {
                         $snap = if ($SnapshotProvider) { & $SnapshotProvider } else { Get-LaneProcessSnapshot }
+                        $runHold = $null
                     }
                     if ([string](Get-LaneHolderIndex -Snapshot $snap).CwdProbe -ne 'ok') { throw 'current-directory probe unavailable' }
                     $hold = @(Find-WorktreeHolders -WorktreePath $full -Snapshot $snap)
-                } catch { $e.reason = 'holder-probe-failed'; $e.error = $_.Exception.Message; $snap = $null; continue }
+                    # The run dir is where the detached chain scripts live and are launched from: a live process that names it
+                    # (command line, cwd or script text) holds every path this run registered, even one built at run time.
+                    if ($null -eq $runHold) { $runHold = @(Find-WorktreeHolders -WorktreePath $runDirFull -Snapshot $snap) }
+                    $unk = Get-CwdUnknownRefusal -Snapshot $snap -WorktreePath $full
+                } catch { $probeFailure = $_.Exception.Message; $snap = $null; $e.reason = 'holder-probe-failed'; $e.error = $probeFailure; continue }
                 if ($hold.Count) {
                     $e.action = 'kept'; $e.reason = 'live-process'
                     $e.holders = @($hold | Select-Object -First 5 | ForEach-Object { "$($_.ProcessId) $($_.Name) via=$($_.Via)" })
                     continue
                 }
-                if ($null -eq $pr) { $pr = if ($PrProbe) { [string](& $PrProbe) } else { Get-LaneScratchPrState $WorkDir $GhPath $PrTimeoutSeconds } }
-                if ($pr -eq 'open') { $e.reason = 'producer-pr-open'; continue }
-                if ($pr -ne 'none') { $e.reason = 'pr-state-unknown'; if ($pr -like 'unknown:*') { $e.error = $pr.Substring(8) }; continue }
+                if ($runHold.Count) {
+                    $e.action = 'kept'; $e.reason = 'run-dir-active'
+                    $e.holders = @($runHold | Select-Object -First 5 | ForEach-Object { "$($_.ProcessId) $($_.Name) via=$($_.Via)" })
+                    continue
+                }
+                # A live process whose current directory could not be read cannot be ruled out as a holder (the retirement
+                # path's own rule, with its exemptions: started before the dir existed, or a service-account process).
+                if ($unk.Reason) {
+                    $e.action = 'kept'; $e.reason = 'holder-cwd-unknown'; $e.error = [string]$unk.Reason
+                    $e.holders = @($unk.Rows | Select-Object -First 5 | ForEach-Object { "$($_.ProcessId) $($_.Name) via=$($_.Via)" })
+                    continue
+                }
                 $dest = Join-Path $receiptsRoot ('{0}-{1}' -f $n, (Split-Path -Leaf $full))
                 try {
                     $c = Copy-LaneScratchReceipts $full $dest
