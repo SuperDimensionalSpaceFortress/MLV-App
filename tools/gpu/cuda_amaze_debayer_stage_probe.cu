@@ -31,6 +31,10 @@
 
 #include <cuda_runtime.h>
 
+/* GPU-EVENT153-ROOTCAUSE-2: the launch helpers below are compiled into the
+ * AMaZE backend DLL, which times every launch (env-gated, default OFF). */
+#include "backend/igpu_launch_timing.cuh"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -2959,54 +2963,59 @@ void launch_variance_selection_prefix(const DeviceBuffers & d,
         if (checkLaunch) CK(cudaGetLastError()); \
     } while (0)
 
-    k_variance_selection_candidate_finals<<<grid, block, 0, stream>>>(d.cfa,
-                                                                      d.vcd,
-                                                                      d.hcd,
-                                                                      d.vcdalt,
-                                                                      d.hcdalt,
-                                                                      d.variance_h0,
-                                                                      d.variance_h1,
-                                                                      d.variance_v0,
-                                                                      d.variance_v1,
-                                                                      rr1,
-                                                                      cc1);
+    IGPU_LT_LAUNCH("k_variance_selection_candidate_finals", grid, block, stream,
+                   k_variance_selection_candidate_finals<<<grid, block, 0, stream>>>(d.cfa,
+                                                                                     d.vcd,
+                                                                                     d.hcd,
+                                                                                     d.vcdalt,
+                                                                                     d.hcdalt,
+                                                                                     d.variance_h0,
+                                                                                     d.variance_h1,
+                                                                                     d.variance_v0,
+                                                                                     d.variance_v1,
+                                                                                     rr1,
+                                                                                     cc1));
     CHECK_VARIANCE_PREFIX_LAUNCH();
-    k_variance_selection_build_maps<<<grid, block, 0, stream>>>(d.vcd,
-                                                               d.hcd,
-                                                               d.vcdalt,
-                                                               d.hcdalt,
-                                                               d.variance_h0,
-                                                               d.variance_h1,
-                                                               d.variance_v0,
-                                                               d.variance_v1,
-                                                               d.variance_h_map,
-                                                               d.variance_v_map,
-                                                               rr1,
-                                                               cc1);
+    IGPU_LT_LAUNCH("k_variance_selection_build_maps", grid, block, stream,
+                   k_variance_selection_build_maps<<<grid, block, 0, stream>>>(d.vcd,
+                                                                              d.hcd,
+                                                                              d.vcdalt,
+                                                                              d.hcdalt,
+                                                                              d.variance_h0,
+                                                                              d.variance_h1,
+                                                                              d.variance_v0,
+                                                                              d.variance_v1,
+                                                                              d.variance_h_map,
+                                                                              d.variance_v_map,
+                                                                              rr1,
+                                                                              cc1));
     CHECK_VARIANCE_PREFIX_LAUNCH();
-    k_variance_selection_h_row_prefix<<<prefixGrid, kVariancePrefixThreads, 0, stream>>>(
-        d.variance_h_map,
-        d.variance_h_choice,
-        rr1,
-        cc1);
+    IGPU_LT_LAUNCH("k_variance_selection_h_row_prefix", prefixGrid, kVariancePrefixThreads, stream,
+                   k_variance_selection_h_row_prefix<<<prefixGrid, kVariancePrefixThreads, 0, stream>>>(
+                       d.variance_h_map,
+                       d.variance_h_choice,
+                       rr1,
+                       cc1));
     CHECK_VARIANCE_PREFIX_LAUNCH();
-    k_variance_selection_v_column_prefix<<<prefixGrid, kVariancePrefixThreads, 0, stream>>>(
-        d.variance_v_map,
-        d.variance_v_choice,
-        rr1,
-        cc1);
+    IGPU_LT_LAUNCH("k_variance_selection_v_column_prefix", prefixGrid, kVariancePrefixThreads, stream,
+                   k_variance_selection_v_column_prefix<<<prefixGrid, kVariancePrefixThreads, 0, stream>>>(
+                       d.variance_v_map,
+                       d.variance_v_choice,
+                       rr1,
+                       cc1));
     CHECK_VARIANCE_PREFIX_LAUNCH();
-    k_variance_selection_finalize_prefix<<<grid, block, 0, stream>>>(d.vcd,
-                                                                    d.hcd,
-                                                                    d.cddiffsq,
-                                                                    d.variance_h0,
-                                                                    d.variance_h1,
-                                                                    d.variance_v0,
-                                                                    d.variance_v1,
-                                                                    d.variance_h_choice,
-                                                                    d.variance_v_choice,
-                                                                    rr1,
-                                                                    cc1);
+    IGPU_LT_LAUNCH("k_variance_selection_finalize_prefix", grid, block, stream,
+                   k_variance_selection_finalize_prefix<<<grid, block, 0, stream>>>(d.vcd,
+                                                                                   d.hcd,
+                                                                                   d.cddiffsq,
+                                                                                   d.variance_h0,
+                                                                                   d.variance_h1,
+                                                                                   d.variance_v0,
+                                                                                   d.variance_v1,
+                                                                                   d.variance_h_choice,
+                                                                                   d.variance_v_choice,
+                                                                                   rr1,
+                                                                                   cc1));
     CHECK_VARIANCE_PREFIX_LAUNCH();
 
 #undef CHECK_VARIANCE_PREFIX_LAUNCH
@@ -3015,7 +3024,7 @@ void launch_variance_selection_prefix(const DeviceBuffers & d,
 void add_elapsed_ms(cudaEvent_t start, cudaEvent_t stop, double * total)
 {
     CK(cudaEventRecord(stop));
-    CK(cudaEventSynchronize(stop));
+    CK(IGPU_LT_SYNC_CALL("probe:elapsed_sync", cudaEventSynchronize(stop)));
     float elapsed = 0.0f;
     CK(cudaEventElapsedTime(&elapsed, start, stop));
     *total += static_cast<double>(elapsed);
@@ -3037,23 +3046,25 @@ void launch_green_plane_assembly(const dim3 & grid,
                                  cudaStream_t stream = 0,
                                  bool checkLaunch = true)
 {
-    k_green_plane_hvwt_refinement_row_parallel<<<1, kGreenPlaneThreads, 0, stream>>>(
-        hvwt,
-        rr1,
-        cc1);
+    IGPU_LT_LAUNCH("k_green_plane_hvwt_refinement_row_parallel", 1, kGreenPlaneThreads, stream,
+                   k_green_plane_hvwt_refinement_row_parallel<<<1, kGreenPlaneThreads, 0, stream>>>(
+                       hvwt,
+                       rr1,
+                       cc1));
     if (checkLaunch) CK(cudaGetLastError());
 
-    k_green_plane_assembly_grid<<<grid, block, 0, stream>>>(cfa,
-                                                            vcd,
-                                                            hcd,
-                                                            nyquist,
-                                                            hvwt,
-                                                            dgrb0,
-                                                            rgbgreen,
-                                                            dgrb2h,
-                                                            dgrb2v,
-                                                            rr1,
-                                                            cc1);
+    IGPU_LT_LAUNCH("k_green_plane_assembly_grid", grid, block, stream,
+                   k_green_plane_assembly_grid<<<grid, block, 0, stream>>>(cfa,
+                                                                           vcd,
+                                                                           hcd,
+                                                                           nyquist,
+                                                                           hvwt,
+                                                                           dgrb0,
+                                                                           rgbgreen,
+                                                                           dgrb2h,
+                                                                           dgrb2v,
+                                                                           rr1,
+                                                                           cc1));
     if (checkLaunch) CK(cudaGetLastError());
 }
 
@@ -3070,19 +3081,21 @@ void launch_pmwt_refinement_and_rbint(const dim3 & grid,
                                       cudaStream_t stream = 0,
                                       bool checkLaunch = true)
 {
-    k_pmwt_refinement_row_parallel<<<1, kPmwtRowThreads, 0, stream>>>(pmwt,
-                                                                      pmwtalt,
-                                                                      rr1,
-                                                                      cc1);
+    IGPU_LT_LAUNCH("k_pmwt_refinement_row_parallel", 1, kPmwtRowThreads, stream,
+                   k_pmwt_refinement_row_parallel<<<1, kPmwtRowThreads, 0, stream>>>(pmwt,
+                                                                                     pmwtalt,
+                                                                                     rr1,
+                                                                                     cc1));
     if (checkLaunch) CK(cudaGetLastError());
 
-    k_rbint_assembly_grid<<<grid, block, 0, stream>>>(cfa,
-                                                      rbm,
-                                                      rbp,
-                                                      pmwt,
-                                                      rbint,
-                                                      rr1,
-                                                      cc1);
+    IGPU_LT_LAUNCH("k_rbint_assembly_grid", grid, block, stream,
+                   k_rbint_assembly_grid<<<grid, block, 0, stream>>>(cfa,
+                                                                     rbm,
+                                                                     rbp,
+                                                                     pmwt,
+                                                                     rbint,
+                                                                     rr1,
+                                                                     cc1));
     if (checkLaunch) CK(cudaGetLastError());
 }
 

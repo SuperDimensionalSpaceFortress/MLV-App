@@ -2162,8 +2162,19 @@ class RepoHygieneTests(unittest.TestCase):
             for mode, expected in (("good", 0), ("missing", 1), ("error", 2)):
                 with self.subTest(mode=mode):
                     env["MLV_TEST_LDD_MODE"] = mode
-                    result = subprocess.run([bash, script.as_posix()], env=env, text=True,
-                                            capture_output=True, timeout=15)
+                    # The fixture is not what is under test, so a healthy slow host must not
+                    # fail it: wait for the script's own exit and keep this only as a hang
+                    # ceiling. Measured over 44 hosted shard logs (runs 38153636205..38192197085,
+                    # 2026-10-11/12): windows n=22 median 0.9 s, max 3.2 s; ubuntu n=22 median
+                    # 0.02 s, max 0.02 s. The former fixed 15 s cut a cold first Git Bash start
+                    # on a windows runner (job 114345530850, windows shard 3/8, run 38097218260).
+                    # 300 s is about 90x the worst healthy duration.
+                    try:
+                        result = subprocess.run([bash, script.as_posix()], env=env, text=True,
+                                                capture_output=True, timeout=300)
+                    except subprocess.TimeoutExpired as exc:
+                        self.fail(f"Qt preflight fixture (mode={mode}) did not exit within "
+                                  f"{exc.timeout:g} s; bash is hung, not slow")
                     self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
                     if mode == "missing":
                         self.assertIn("libpulse.so.0 => not found", result.stdout)

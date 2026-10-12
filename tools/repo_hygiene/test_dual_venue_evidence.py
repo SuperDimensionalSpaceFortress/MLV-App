@@ -505,6 +505,34 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
                 self.assertEqual(text.count(f"'MLVAPP_SWAP_INTERVAL={interval}',"), 1, name)
                 self.assertIn(f"'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',\n    'MLVAPP_SWAP_INTERVAL={interval}',", text.replace("\r\n", "\n"), name)
 
+    def test_the_cuda_launch_timer_reaches_the_apps_env_only_when_asked(self) -> None:
+        """GPU-EVENT153-ROOTCAUSE-2: -CudaLaunchTimingMinMs <ms> adds MLVAPP_CUDA_LAUNCH_TIMING=1 and its line threshold (an
+        invariant-culture decimal) to the app's env list; absent, the job is the text it was. The runner maps the leg's
+        generatorArgs.cudaLaunchTimingMinMs for any leg, and the schema bounds it."""
+        plain = self.generate(GENERATOR, "lt-plain.job.ps1", []).read_text(encoding="utf-8").replace("\r\n", "\n")
+        self.assertNotIn("MLVAPP_CUDA_LAUNCH_TIMING", plain)
+        for ms, rendered in (("0", "0"), ("2", "2"), ("2.5", "2.5")):
+            job = self.generate(GENERATOR, f"lt-{ms}.job.ps1", ["-CudaLaunchTimingMinMs", ms])
+            self.assertEqual(self.parse_errors(job), 0, ms)
+            text = job.read_text(encoding="utf-8").replace("\r\n", "\n")
+            pair = f"    'MLVAPP_CUDA_LAUNCH_TIMING=1',\n    'MLVAPP_CUDA_LAUNCH_TIMING_MIN_MS={rendered}',\n"
+            self.assertEqual(text.count("'MLVAPP_CUDA_LAUNCH_TIMING=1',"), 1, ms)
+            self.assertIn("'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',\n" + pair, text, ms)
+            self.assertEqual(text.replace(pair, ""), plain, f"{ms}: the pair is the only difference from the plain job")
+        both = self.generate(GENERATOR, "lt-swap.job.ps1", ["-SwapInterval", "1", "-CudaLaunchTimingMinMs", "2"])
+        self.assertEqual(self.parse_errors(both), 0)
+        both_text = both.read_text(encoding="utf-8")
+        self.assertEqual(both_text.count("'MLVAPP_SWAP_INTERVAL=1',"), 1)
+        self.assertEqual(both_text.count("'MLVAPP_CUDA_LAUNCH_TIMING_MIN_MS=2',"), 1)
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        mapping = "if ($spec.generatorArgs.PSObject.Properties['cudaLaunchTimingMinMs']) { $gen['CudaLaunchTimingMinMs'] = [double]$spec.generatorArgs.cudaLaunchTimingMinMs }"
+        self.assertIn(mapping, runner)
+        self.assertLess(runner.index(mapping), runner.index("if (-not $isLook -and $spec.generatorArgs.PSObject.Properties['forceLookAssist']"),
+                        "the mapping must sit outside the forceLookAssist branch")
+        schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
+        prop = schema["properties"]["generatorArgs"]["properties"]["cudaLaunchTimingMinMs"]
+        self.assertEqual((prop["type"], prop["minimum"], prop["maximum"]), ("number", 0, 10000))
+
     def test_the_runner_passes_a_legs_swap_interval_to_the_generator(self) -> None:
         runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
         self.assertIn("if ($spec.generatorArgs.PSObject.Properties['swapInterval']) { $gen['SwapInterval'] = [int]$spec.generatorArgs.swapInterval }", runner)
