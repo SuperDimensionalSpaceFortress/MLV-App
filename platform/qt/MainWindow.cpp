@@ -3633,9 +3633,11 @@ void MainWindow::queuePlaybackLookaheadRequests(
 // Playback-prep worker queue. drawFrameReady now dispatches work to a background
 // thread, then marshals completion back to the UI thread for final presentation.
 // Conflation is by request serial: only the latest requested serial can present.
-void MainWindow::enqueuePlaybackPrepTask( const PlaybackPrepTask &task )
+// PLAYBACK-CPU-PACE-GAP-1 r5: the task is MOVED into the queue and out of it. Its owned RGB16 copy is a full frame on
+// the CPU preview route; copying it into a freshly allocated deque element cost a cold allocation per frame on the GUI
+// thread (and a free under the prep mutex), where the old single pending slot reused its storage.
+void MainWindow::enqueuePlaybackPrepTask( PlaybackPrepTask ownedTask )
 {
-    PlaybackPrepTask ownedTask = task;
     ownedTask.rebindOwnedImagePointers();
 
     const uint64_t activeGeneration =
@@ -3671,7 +3673,7 @@ void MainWindow::enqueuePlaybackPrepTask( const PlaybackPrepTask &task )
             }
             m_playbackPrepPending.clear();
         }
-        m_playbackPrepPending.push_back( ownedTask );
+        m_playbackPrepPending.push_back( std::move( ownedTask ) );
         m_playbackPrepPending.back().rebindOwnedImagePointers();
     }
     m_playbackPrepCv.notify_one();
@@ -4413,7 +4415,7 @@ void MainWindow::playbackPrepThreadLoop( void )
                     || !m_playbackPrepPending.empty();
             } );
             if( m_playbackPrepStop.load( std::memory_order_acquire ) ) return;
-            task = m_playbackPrepPending.front();
+            task = std::move( m_playbackPrepPending.front() );
             task.rebindOwnedImagePointers();
             m_playbackPrepPending.pop_front();
             m_playbackPrepComputing = true;
@@ -31825,7 +31827,7 @@ void MainWindow::drawFrameReady()
     task.rebindOwnedImagePointers();
     notePlaybackPrepOwnershipTelemetry();
 
-    enqueuePlaybackPrepTask( task );
+    enqueuePlaybackPrepTask( std::move( task ) );
     return;
 
 }

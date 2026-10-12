@@ -747,6 +747,19 @@ TEST(PlaybackDecodeRenderOverlapWiring, DropFrameOffMakesThePrepQueueLosslessAnd
     ASSERT_TRUE( mw.contains( QStringLiteral("drop_off_hold_timeouts=") ) );
 }
 
+// PLAYBACK-CPU-PACE-GAP-1 r5: the prep task (its owned RGB16 frame copy) is moved into and out of the deque, never
+// copied into a freshly allocated element per frame on the GUI thread.
+TEST(PlaybackDecodeRenderOverlapWiring, ThePrepTaskIsMovedThroughTheQueueNotCopied)
+{
+    const QString mw = readRepoText( "platform/qt/MainWindow.cpp" );
+    ASSERT_FALSE( mw.isEmpty() );
+    ASSERT_TRUE( mw.contains( QStringLiteral("void MainWindow::enqueuePlaybackPrepTask( PlaybackPrepTask ownedTask )") ) );
+    ASSERT_TRUE( mw.contains( QStringLiteral("m_playbackPrepPending.push_back( std::move( ownedTask ) );") ) );
+    ASSERT_TRUE( mw.contains( QStringLiteral("task = std::move( m_playbackPrepPending.front() );") ) );
+    ASSERT_TRUE( mw.contains( QStringLiteral("enqueuePlaybackPrepTask( std::move( task ) );") ) );
+    ASSERT_FALSE( mw.contains( QStringLiteral("PlaybackPrepTask ownedTask = task;") ) );
+}
+
 TEST(PlaybackDecodeRenderOverlapWiring, TheRenderThreadReportsEveryStageToTheMeter)
 {
     const QString rft = readRepoText( "platform/qt/RenderFrameThread.cpp" );

@@ -1692,7 +1692,7 @@ private:
                                            QRect *outGeometry,
                                            QSize *outPreviewSize );
     void onPlaybackSmokeApplicationStateChanged( Qt::ApplicationState state );
-    void enqueuePlaybackPrepTask( const PlaybackPrepTask &task );
+    void enqueuePlaybackPrepTask( PlaybackPrepTask ownedTask );
     void invalidatePlaybackPrepForDisplayChange( const char *reason );
     void waitForRenderThreadIdleBeforeCoreMutation( const char *reason );
     struct PlaybackPrepThreadState;
