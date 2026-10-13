@@ -22,6 +22,9 @@
 #include "../../tools/gpu/backend/igpu_cuda_error_slot.h"
 
 #include <QByteArray>
+#include <QDir>
+#include <QFile>
+#include <QTemporaryDir>
 
 #include <cstdint>
 #include <set>
@@ -1066,4 +1069,241 @@ TEST(GpuFieldTelemetryCapture, TerminalDrainNeedsASinkAndTakesACodeOnce)
     ASSERT_EQ(1, (int)g_calls.size());
     ASSERT_EQ(0, llrpGpuPlaybackReconDrainCudaErrorsAtTeardown(0));
     ASSERT_EQ(1, (int)g_calls.size());
+}
+
+namespace
+{
+// r7: the lines of the telemetry log appCloseForTesting wrote in `dir`.
+std::vector<std::string> logLines(const QTemporaryDir & dir)
+{
+    std::vector<std::string> lines;
+    QFile file(QDir(dir.path()).filePath(QStringLiteral("gpu-field-telemetry.jsonl")));
+    if (!file.open(QIODevice::ReadOnly)) return lines;
+    for (const QByteArray & line : file.readAll().split('\n'))
+        if (!line.isEmpty()) lines.push_back(line.toStdString());
+    return lines;
+}
+
+bool has(const std::string & line, const char * text)
+{
+    return line.find(text) != std::string::npos;
+}
+
+// Index of every line holding all of `texts`.
+std::vector<int> linesWith(const std::vector<std::string> & lines, std::initializer_list<const char *> texts)
+{
+    std::vector<int> out;
+    for (int i = 0; i < (int)lines.size(); ++i)
+    {
+        bool all = true;
+        for (const char * t : texts) all = all && has(lines[i], t);
+        if (all) out.push_back(i);
+    }
+    return out;
+}
+} // namespace
+
+// r7 B1 (opus r6 blocker): the normal GUI close. aboutToQuit runs session end (terminal drain and the
+// final flush) BEFORE ~MainWindow destroys the GPU views; the view's destroyTexture then runs both GL
+// resets, and the recon reset's cudaSetDevice notes 702 (reset_gl:set_device) and the AMaZE reset's
+// cleanup 709 (gl_cache:unregister). Their r6 view-release drains hand both to the real sinks after
+// the final flush. The post routine ~QApplication runs afterwards writes them: the jsonl holds
+// exactly one fault line for each, after the session_end flush, in one post_session flush. On
+// b7fef9b3 the post routine returned because session end had run: zero fault lines.
+TEST(GpuFieldTelemetryCapture, GlResetCodeAfterSessionEndReachesTheLogOnce)
+{
+    const FakeGpuBackendScope fake;
+    const AmazeSinkScope amaze;
+    int rc = -99;
+    ASSERT_NE(0, runOnce(1, &rc)); // the last render
+    QTemporaryDir dir;
+    ASSERT_TRUE(dir.isValid());
+    GpuFieldTelemetry::appCloseForTesting(dir.path(), nullptr, []() {
+        llrpFakeGpuBackendArmCudaNoteForTesting(kRender, 702, "cudaErrorLaunchTimeout", "reset_gl:set_device");
+        cuda_slot::note(709, "cudaErrorContextIsDestroyed", "gl_cache:unregister");
+        gpuAmazeDebayerResetR16TextureBackendResources();
+        ASSERT_EQ(1, llrpGpuPlaybackReconResetGlTextureResources());
+    });
+    const std::vector<std::string> lines = logLines(dir);
+    const std::vector<int> recon = linesWith(lines, {"\"kind\":\"fault\"", "\"site\":\"reset_gl:set_device\""});
+    ASSERT_EQ(1, (int)recon.size());
+    ASSERT_TRUE(has(lines[recon[0]], "\"dll\":\"recon\""));
+    ASSERT_TRUE(has(lines[recon[0]], "\"cuda_code\":702"));
+    ASSERT_TRUE(has(lines[recon[0]], "\"role\":\"orphan\""));
+    const std::vector<int> amazeFault = linesWith(lines, {"\"kind\":\"fault\"", "\"site\":\"gl_cache:unregister\""});
+    ASSERT_EQ(1, (int)amazeFault.size());
+    ASSERT_TRUE(has(lines[amazeFault[0]], "\"dll\":\"amaze\""));
+    ASSERT_TRUE(has(lines[amazeFault[0]], "\"cuda_code\":709"));
+    ASSERT_EQ(2, (int)linesWith(lines, {"\"kind\":\"fault\""}).size());
+    const std::vector<int> sessionEnd = linesWith(lines, {"\"kind\":\"flush\"", "\"reason\":\"session_end\""});
+    const std::vector<int> post = linesWith(lines, {"\"kind\":\"flush\"", "\"reason\":\"post_session\""});
+    ASSERT_EQ(1, (int)sessionEnd.size());
+    ASSERT_EQ(1, (int)post.size());
+    ASSERT_TRUE(sessionEnd[0] < post[0]);
+    ASSERT_TRUE(post[0] < recon[0]);
+    ASSERT_EQ(0L, llrpFakeGpuBackendCudaErrorsPendingForTesting(kRender, nullptr));
+    ASSERT_EQ(0L, (long)*cuda_slot::pending_word(kRender));
+}
+
+// r7 class sweep, teardown orders after session end with no view-release drain: a code left in the
+// recon DLL (noted with no call around it) and a code the backend release keeps before FreeLibrary
+// (a backend unloaded after session end). The post routine's own drain takes both: one fault line
+// each. On b7fef9b3 neither was ever drained or written.
+TEST(GpuFieldTelemetryCapture, CodesLeftAfterSessionEndAreDrainedByThePostRoutineOnce)
+{
+    QTemporaryDir dir;
+    ASSERT_TRUE(dir.isValid());
+    {
+        const FakeGpuBackendScope fake;
+        int rc = -99;
+        ASSERT_NE(0, runOnce(1, &rc));
+        GpuFieldTelemetry::appCloseForTesting(dir.path(), nullptr, []() {
+            llrpFakeGpuBackendNoteCudaErrorForTesting(kRender, 719, "cudaErrorLaunchFailure", "reset_gl:set_device");
+        });
+    }
+    std::vector<std::string> lines = logLines(dir);
+    ASSERT_EQ(1, (int)linesWith(lines, {"\"kind\":\"fault\"", "\"site\":\"reset_gl:set_device\"", "\"cuda_code\":719"}).size());
+    ASSERT_EQ(1, (int)linesWith(lines, {"\"kind\":\"fault\""}).size());
+
+    QTemporaryDir unloadDir;
+    ASSERT_TRUE(unloadDir.isValid());
+    {
+        FakeGpuBackendScope * fake = new FakeGpuBackendScope();
+        int rc = -99;
+        ASSERT_NE(0, runOnce(1, &rc));
+        GpuFieldTelemetry::appCloseForTesting(unloadDir.path(), nullptr, [&fake]() {
+            llrpFakeGpuBackendArmCudaNoteForTesting(kRender, 999, "cudaErrorUnknown", "gl_cache:unregister");
+            delete fake; // the release: destroy notes 999, kept before FreeLibrary
+            fake = nullptr;
+        });
+        ASSERT_TRUE(fake == nullptr);
+    }
+    lines = logLines(unloadDir);
+    ASSERT_EQ(1, (int)linesWith(lines, {"\"kind\":\"fault\"", "\"site\":\"gl_cache:unregister\"", "\"cuda_code\":999"}).size());
+    ASSERT_EQ(1, (int)linesWith(lines, {"\"kind\":\"fault\""}).size());
+    const SinkScope sink; // nothing kept is left for a later drain
+    ASSERT_EQ(0, llrpGpuPlaybackReconDrainCudaErrorsAtTeardown(0));
+    ASSERT_EQ(0, (int)g_calls.size());
+}
+
+// r7 class sweep, the earlier orders stay exactly once: a fault noted before session end (the view
+// released while the app runs) is written by the session_end flush, and the post routine then
+// writes nothing (no post_session flush, no second fault line). A close with no fault at all writes
+// no post_session flush either.
+TEST(GpuFieldTelemetryCapture, FaultBeforeSessionEndIsWrittenOnceAndThePostRoutineAddsNothing)
+{
+    QTemporaryDir dir;
+    ASSERT_TRUE(dir.isValid());
+    {
+        const FakeGpuBackendScope fake;
+        int rc = -99;
+        ASSERT_NE(0, runOnce(1, &rc));
+        GpuFieldTelemetry::appCloseForTesting(dir.path(), []() {
+            llrpFakeGpuBackendArmCudaNoteForTesting(kRender, 702, "cudaErrorLaunchTimeout", "reset_gl:set_device");
+            ASSERT_EQ(1, llrpGpuPlaybackReconResetGlTextureResources());
+        }, nullptr);
+    }
+    std::vector<std::string> lines = logLines(dir);
+    const std::vector<int> fault = linesWith(lines, {"\"kind\":\"fault\"", "\"site\":\"reset_gl:set_device\""});
+    ASSERT_EQ(1, (int)fault.size());
+    ASSERT_EQ(1, (int)linesWith(lines, {"\"kind\":\"fault\""}).size());
+    const std::vector<int> sessionEnd = linesWith(lines, {"\"kind\":\"flush\"", "\"reason\":\"session_end\""});
+    ASSERT_EQ(1, (int)sessionEnd.size());
+    ASSERT_TRUE(sessionEnd[0] < fault[0]);
+    ASSERT_EQ(0, (int)linesWith(lines, {"\"reason\":\"post_session\""}).size());
+
+    QTemporaryDir quietDir;
+    ASSERT_TRUE(quietDir.isValid());
+    GpuFieldTelemetry::appCloseForTesting(quietDir.path(), nullptr, nullptr);
+    lines = logLines(quietDir);
+    ASSERT_EQ(1, (int)linesWith(lines, {"\"kind\":\"flush\"", "\"reason\":\"session_end\""}).size());
+    ASSERT_EQ(0, (int)linesWith(lines, {"\"kind\":\"fault\""}).size());
+    ASSERT_EQ(0, (int)linesWith(lines, {"\"reason\":\"post_session\""}).size());
+}
+
+namespace
+{
+// r7 B2: the name lookup the DLLs pass (cudaGetErrorName); counts its calls.
+int g_nameLookups = 0;
+const char * fakeCudaErrorName(int code)
+{
+    ++g_nameLookups;
+    return code == 700 ? "cudaErrorIllegalAddress" : (code == 709 ? "cudaErrorContextIsDestroyed" : "cudaErrorUnknown");
+}
+
+struct GlCopySites
+{
+    const char * copy;
+    const char * unmap;
+    const char * unregister; // nullptr: recon's cached copy has no unregister
+};
+
+const GlCopySites kGlCopies[] = {
+    {"gl_r16:copy_to_array", "gl_r16:unmap", nullptr},
+    {"gl_r16_in:copy_from_array", "gl_r16_in:unmap", "gl_r16_in:unregister"},
+    {"gl_rgba16:copy_to_array", "gl_rgba16:unmap", "gl_rgba16:unregister"},
+    {"gl_rgba16_direct:copy_to_array", "gl_rgba16_direct:unmap", "gl_rgba16_direct:unregister"},
+    {"gl_rgba16_post_wb:copy_to_array", "gl_rgba16_post_wb:unmap", "gl_rgba16_post_wb:unregister"},
+};
+} // namespace
+
+// r7 B2 (sol r6 blocker): each of the five GL copies (recon copy_bayer16_to_gl_r16_texture and the
+// four AMaZE copies) hands its evaluated copy, unmap and unregister codes to the slot's
+// note_evaluated (IGPU_CUDA_ERROR_NOTE_EVALUATED; the console census
+// GlCopiesNoteEveryEvaluatedCodeBeforeAnyReturn pins that each copy calls it with these sites before
+// any return). Copy 700 with unmap 709 leaves two notes at their own sites, and the failure capture
+// reports them as two records: 700 primary at the copy site, 709 secondary at the unmap site. The
+// AMaZE unregister case (copy 700, unmap ok, unregister 709) is the same at the unregister site. All
+// success notes nothing and looks no name up. On b7fef9b3 the copy failure returned first: one note,
+// 709 lost.
+TEST(GpuFieldTelemetryCapture, GlCopyNotesEveryEvaluatedCleanupCodeAtItsOwnSite)
+{
+    for (const GlCopySites & copy : kGlCopies)
+    {
+        const AmazeSinkScope amaze;
+        const bool amazeCopy = copy.unregister != nullptr;
+        const cuda_slot::Evaluated unmapFails[] = {{700, copy.copy}, {709, copy.unmap}, {0, copy.unregister}};
+        g_nameLookups = 0;
+        ASSERT_EQ(0, cuda_slot::note_evaluated(unmapFails, amazeCopy ? 3 : 2, &fakeCudaErrorName));
+        ASSERT_EQ(2, g_nameLookups);
+        ASSERT_EQ(2L, (long)*cuda_slot::pending_word(kRender));
+        ASSERT_EQ(2, gpuAmazeCudaErrorsEmitFailure(amaze.source, "amaze:r16_gl", 2, &amazeRecordingSink));
+        ASSERT_EQ(2, (int)g_amazeCalls.size());
+        ASSERT_EQ(700, g_amazeCalls[0].cudaCode);
+        ASSERT_EQ(std::string("cudaErrorIllegalAddress"), g_amazeCalls[0].cudaName);
+        ASSERT_EQ(std::string(copy.copy), g_amazeCalls[0].site);
+        ASSERT_EQ(std::string("primary"), g_amazeCalls[0].role);
+        ASSERT_EQ(709, g_amazeCalls[1].cudaCode);
+        ASSERT_EQ(std::string("cudaErrorContextIsDestroyed"), g_amazeCalls[1].cudaName);
+        ASSERT_EQ(std::string(copy.unmap), g_amazeCalls[1].site);
+        ASSERT_EQ(std::string("secondary"), g_amazeCalls[1].role);
+        ASSERT_EQ(0L, (long)*cuda_slot::pending_word(kRender));
+
+        if (amazeCopy)
+        {
+            g_amazeCalls.clear();
+            const cuda_slot::Evaluated unregisterFails[] = {{700, copy.copy}, {0, copy.unmap}, {709, copy.unregister}};
+            ASSERT_EQ(0, cuda_slot::note_evaluated(unregisterFails, 3, &fakeCudaErrorName));
+            ASSERT_EQ(2, gpuAmazeCudaErrorsEmitFailure(amaze.source, "amaze:r16_gl", 2, &amazeRecordingSink));
+            ASSERT_EQ(2, (int)g_amazeCalls.size());
+            ASSERT_EQ(std::string(copy.copy), g_amazeCalls[0].site);
+            ASSERT_EQ(709, g_amazeCalls[1].cudaCode);
+            ASSERT_EQ(std::string(copy.unregister), g_amazeCalls[1].site);
+            ASSERT_EQ(std::string("secondary"), g_amazeCalls[1].role);
+
+            // A cleanup failure alone (the copy succeeded): its code is the call's primary.
+            g_amazeCalls.clear();
+            const cuda_slot::Evaluated onlyUnmap[] = {{0, copy.copy}, {709, copy.unmap}, {0, copy.unregister}};
+            ASSERT_EQ(1, cuda_slot::note_evaluated(onlyUnmap, 3, &fakeCudaErrorName));
+            ASSERT_EQ(1, gpuAmazeCudaErrorsEmitFailure(amaze.source, "amaze:r16_gl", 2, &amazeRecordingSink));
+            ASSERT_EQ(std::string(copy.unmap), g_amazeCalls[0].site);
+            ASSERT_EQ(std::string("primary"), g_amazeCalls[0].role);
+        }
+
+        const cuda_slot::Evaluated allOk[] = {{0, copy.copy}, {0, copy.unmap}, {0, copy.unregister}};
+        g_nameLookups = 0;
+        ASSERT_EQ(-1, cuda_slot::note_evaluated(allOk, amazeCopy ? 3 : 2, &fakeCudaErrorName));
+        ASSERT_EQ(0, g_nameLookups);
+        ASSERT_EQ(0L, (long)*cuda_slot::pending_word(kRender));
+    }
 }

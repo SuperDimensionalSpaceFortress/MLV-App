@@ -311,9 +311,11 @@ core::SystemLogResult querySystemLog(const std::string &, const QDeadlineTimer &
 #endif
 
 /* onWorker: the after-fault / recovery worker, which stops before each step
- * once session end has begun. systemLogDeadlineMs bounds the System-log read. */
+ * once session end has begun. systemLogDeadlineMs bounds the System-log read.
+ * describe = false keeps the cached GPU model (r7 post routine: no backend
+ * lock). */
 void flushImpl(const char * reason, bool withSystemLog, bool onWorker = false,
-               qint64 systemLogDeadlineMs = core::kSystemLogDeadlineMs)
+               qint64 systemLogDeadlineMs = core::kSystemLogDeadlineMs, bool describe = true)
 {
     State & s = state();
     QString dir;
@@ -328,7 +330,7 @@ void flushImpl(const char * reason, bool withSystemLog, bool onWorker = false,
     core::SystemLogResult systemLog;
     if (withSystemLog) systemLog = querySystemLog(since, QDeadlineTimer(systemLogDeadlineMs), onWorker);
     if (workerStopped(onWorker)) return;
-    const std::string cudaModel = reconDescribe();
+    const std::string cudaModel = describe ? reconDescribe() : std::string();
     if (workerStopped(onWorker)) return;
 
     // Faults, recovery lines and the clip leave Unwritten only once the write
@@ -396,9 +398,33 @@ void sessionEnd()
               remainingMs < core::kSystemLogDeadlineMs ? remainingMs : core::kSystemLogDeadlineMs);
 }
 
+/* r7 (opus r6 blocker): aboutToQuit runs session end before ~MainWindow
+ * destroys the GPU views, whose GL resets can still note a code after the
+ * final flush (the r6 view-release drain hands it to noteFault, which keeps it:
+ * nothing is scheduled once the session has ended). ~QApplication runs this
+ * after the views are gone: drain both DLLs once more and write any fault
+ * still unwritten with one more flush. Bounded: the drain waits at most
+ * kTerminalDrainWaitMs per lock, the flush reads neither the System log nor
+ * the backend description, and a worker session end gave up on keeps the
+ * write. A close with nothing new writes nothing. */
+void postSessionFlush()
+{
+    if (g_workerPoolCreated.load() && !workerPool()->waitForDone(0)) return;
+    drainBackendCudaErrors(static_cast<int>(core::kTerminalDrainWaitMs));
+    {
+        QMutexLocker locker(&state().mutex);
+        if (!state().installed || state().unwritten.faults.empty()) return;
+    }
+    flushImpl("post_session", false, false, 0, false);
+}
+
+/* Both run on the GUI thread: aboutToQuit's session end has run iff the flag
+ * is set here. */
 void sessionEndPostRoutine()
 {
+    const bool endedAtAboutToQuit = g_sessionEndDone.load();
     sessionEnd();
+    if (endedAtAboutToQuit) postSessionFlush();
 }
 
 /* QApplication does not exist yet when main() calls install(); the first
@@ -440,6 +466,43 @@ void scheduleAfterFaultFlush()
     });
 }
 
+/* noteFault past its enabled() gate. The backend sinks call it directly: they
+ * are installed only by install(), which is gated already. */
+void recordFault(const CudaFault & fault)
+{
+    core::Fault f;
+    f.dll = core::sanitize(fault.dll ? fault.dll : "?", 16);
+    f.stage = core::sanitize(fault.stage ? fault.stage : "?", 48);
+    f.rc = fault.rc;
+    f.cudaCode = fault.cudaCode;
+    f.cudaName = core::sanitize(fault.cudaName, 47);
+    f.site = core::sanitize(fault.site, 95);
+    f.role = core::sanitize(fault.role ? fault.role : "primary", 16);
+    f.dropped = fault.dropped;
+    f.utcMs = nowUtcMs();
+
+    State & s = state();
+    std::function<void(const CudaFault &)> listener;
+    bool installed = false;
+    {
+        QMutexLocker locker(&s.mutex);
+        /* r5: a secondary code belongs to a call already counted as failed. */
+        if (f.role != "secondary")
+            s.stages.add(fault.dll, fault.stage, -1.0,
+                         fault.cudaCode != 0 ? fault.cudaCode : (fault.rc != 0 ? fault.rc : -1));
+        s.unwritten.addFault(f);
+        listener = s.listener;
+        installed = s.installed;
+    }
+    if (installed) scheduleAfterFaultFlush();
+    if (listener)
+    {
+        CudaFault copy = fault;
+        copy.utcMs = f.utcMs;
+        listener(copy);
+    }
+}
+
 void stageSink(const char * dll, const char * stage, int rc, double ms, int cudaCode,
                const char * cudaName, const char * site, const char * role,
                unsigned long long dropped)
@@ -458,7 +521,7 @@ void stageSink(const char * dll, const char * stage, int rc, double ms, int cuda
     fault.site = site;
     fault.role = role;
     fault.dropped = dropped;
-    noteFault(fault);
+    recordFault(fault);
 }
 
 void reconStageSink(const char * stage, int rc, double ms, int cudaCode,
@@ -524,37 +587,7 @@ void noteStage(const char * dll, const char * stage, double ms)
 void noteFault(const CudaFault & fault)
 {
     if (!enabled()) return;
-    core::Fault f;
-    f.dll = core::sanitize(fault.dll ? fault.dll : "?", 16);
-    f.stage = core::sanitize(fault.stage ? fault.stage : "?", 48);
-    f.rc = fault.rc;
-    f.cudaCode = fault.cudaCode;
-    f.cudaName = core::sanitize(fault.cudaName, 47);
-    f.site = core::sanitize(fault.site, 95);
-    f.role = core::sanitize(fault.role ? fault.role : "primary", 16);
-    f.dropped = fault.dropped;
-    f.utcMs = nowUtcMs();
-
-    State & s = state();
-    std::function<void(const CudaFault &)> listener;
-    bool installed = false;
-    {
-        QMutexLocker locker(&s.mutex);
-        /* r5: a secondary code belongs to a call already counted as failed. */
-        if (f.role != "secondary")
-            s.stages.add(fault.dll, fault.stage, -1.0,
-                         fault.cudaCode != 0 ? fault.cudaCode : (fault.rc != 0 ? fault.rc : -1));
-        s.unwritten.addFault(f);
-        listener = s.listener;
-        installed = s.installed;
-    }
-    if (installed) scheduleAfterFaultFlush();
-    if (listener)
-    {
-        CudaFault copy = fault;
-        copy.utcMs = f.utcMs;
-        listener(copy);
-    }
+    recordFault(fault);
 }
 
 bool isDeviceLossCode(int cudaCode)
@@ -672,6 +705,42 @@ QString clipHash(const QString & basenameOrPath)
     const QString name = QFileInfo(basenameOrPath).fileName();
     return QString::fromLatin1(
         QCryptographicHash::hash(name.toUtf8(), QCryptographicHash::Sha256).toHex().left(12));
+}
+
+void appCloseForTesting(const QString & logsDir, const std::function<void()> & beforeSessionEnd,
+                        const std::function<void()> & afterSessionEnd)
+{
+    State & s = state();
+    {
+        QMutexLocker locker(&s.mutex);
+        if (s.installed) return;
+        s.installed = true;
+        s.logsDir = logsDir;
+        s.session = core::SessionInfo();
+        s.session.sessionId = "appclosetest";
+        s.session.startUtc = nowIsoUtc();
+    }
+    llrpSetGpuStageTelemetrySink(&reconStageSink);
+    gpuAmazeDebayerSetStageTelemetrySink(&amazeStageSink);
+    if (beforeSessionEnd) beforeSessionEnd();
+    sessionEnd();                            // aboutToQuit
+    if (afterSessionEnd) afterSessionEnd();  // ~MainWindow: the GPU views' destroyTexture
+    sessionEndPostRoutine();                 // ~QApplication
+    llrpSetGpuStageTelemetrySink(nullptr);
+    gpuAmazeDebayerSetStageTelemetrySink(nullptr);
+    {
+        QMutexLocker locker(&s.mutex);
+        s.installed = false;
+        s.logsDir = QString();
+        s.session = core::SessionInfo();
+        s.cudaModel = std::string();
+        s.stages = core::StageMap();
+        s.unwritten = core::Unwritten();
+        s.flushSeq = 0;
+        s.afterFaultPending = false;
+        s.haveLastAfterFaultRun = false;
+    }
+    sessionEndForTesting(); // re-arm (session end already ran: it writes nothing)
 }
 
 void sessionEndForTesting()

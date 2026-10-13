@@ -1372,19 +1372,21 @@ static int copy_bayer16_to_gl_r16_texture(igpu_recon_backend* b, unsigned int gl
 
     const cudaError_t unmap_error =
         IGPU_LT_SYNC_CALL("gl_r16:unmap", cudaGraphicsUnmapResources(1, &resource, 0));
-    if (e != cudaSuccess) {
-        IGPU_CUDA_ERROR_NOTE(e, "gl_r16:copy_to_array");
-        fprintf(stderr,
-                "[igpu_recon_cuda] device-to-GL texture copy failed: %s\n",
-                cudaGetErrorString(e));
-        reset_cached_gl_resource(&b->gl_r16_resource, 0);
-        return 2;
-    }
-    if (unmap_error != cudaSuccess) {
-        IGPU_CUDA_ERROR_NOTE(unmap_error, "gl_r16:unmap");
-        fprintf(stderr,
-                "[igpu_recon_cuda] cudaGraphicsUnmapResources(GL_R16 texture) failed: %s\n",
-                cudaGetErrorString(unmap_error));
+    if (e != cudaSuccess || unmap_error != cudaSuccess) {
+        /* r7: both codes are already evaluated: note each before the return. */
+        const igpu_cuda_error_slot::Evaluated evaluated[] = {
+            {(int)e, "gl_r16:copy_to_array"},
+            {(int)unmap_error, "gl_r16:unmap"},
+        };
+        IGPU_CUDA_ERROR_NOTE_EVALUATED(evaluated);
+        if (e != cudaSuccess)
+            fprintf(stderr,
+                    "[igpu_recon_cuda] device-to-GL texture copy failed: %s\n",
+                    cudaGetErrorString(e));
+        if (unmap_error != cudaSuccess)
+            fprintf(stderr,
+                    "[igpu_recon_cuda] cudaGraphicsUnmapResources(GL_R16 texture) failed: %s\n",
+                    cudaGetErrorString(unmap_error));
         reset_cached_gl_resource(&b->gl_r16_resource, 0);
         return 2;
     }
@@ -1537,11 +1539,13 @@ igpu_recon_backend* igpu_recon_create(const char* backend_name)
     InitializeCriticalSection(&b->preupload_lock);
     b->preupload_lock_initialized = 1;
 
-    /* timing events */
-    if (cudaEventCreate(&b->ev_start)        != cudaSuccess ||
-        cudaEventCreate(&b->ev_after_up)     != cudaSuccess ||
-        cudaEventCreate(&b->ev_after_kernel) != cudaSuccess ||
-        cudaEventCreate(&b->ev_after_dl)     != cudaSuccess) {
+    /* timing events (r7 class sweep: the failing code is noted, not dropped) */
+    cudaError_t ev = cudaEventCreate(&b->ev_start);
+    if (ev == cudaSuccess) ev = cudaEventCreate(&b->ev_after_up);
+    if (ev == cudaSuccess) ev = cudaEventCreate(&b->ev_after_kernel);
+    if (ev == cudaSuccess) ev = cudaEventCreate(&b->ev_after_dl);
+    if (ev != cudaSuccess) {
+        IGPU_CUDA_ERROR_NOTE(ev, "create:event_create");
         fprintf(stderr, "[igpu_recon_cuda] cudaEventCreate failed\n");
         free(b);
         return NULL;

@@ -170,9 +170,39 @@ inline int copy_last(igpu_cuda_error_t * out)
     *out = s.last;
     return 0;
 }
+
+/* r7 (sol r6 blocker): a GL copy evaluates its copy and then its cleanup calls
+ * (unmap; unregister for an uncached resource) before it can return. A return
+ * on the first failure must not drop a cleanup code already evaluated, so its
+ * failure branch hands all of them here: every non-success code is noted at
+ * its own site, in call order. name_of(code) runs for a non-success code only
+ * (cudaGetErrorName in the DLLs). Returns the index of the first non-success
+ * code, or -1 if all succeeded. */
+struct Evaluated
+{
+    int code;
+    const char * site;
+};
+
+inline int note_evaluated(const Evaluated * calls, int n, const char * (*name_of)(int))
+{
+    int first = -1;
+    for (int i = 0; calls && i < n; ++i)
+    {
+        if (calls[i].code == 0) continue;
+        note(calls[i].code, name_of ? name_of(calls[i].code) : nullptr, calls[i].site);
+        if (first < 0) first = i;
+    }
+    return first;
+}
 } // namespace igpu_cuda_error_slot
 
 #define IGPU_CUDA_ERROR_NOTE(e, site) \
     igpu_cuda_error_slot::note((int)(e), cudaGetErrorName(e), (site))
+
+/* r7: `calls` is a local igpu_cuda_error_slot::Evaluated array. */
+#define IGPU_CUDA_ERROR_NOTE_EVALUATED(calls) \
+    igpu_cuda_error_slot::note_evaluated((calls), (int)(sizeof(calls) / sizeof((calls)[0])), \
+        [](int c) -> const char * { return cudaGetErrorName((cudaError_t)c); })
 
 #endif /* IGPU_CUDA_ERROR_SLOT_H */
