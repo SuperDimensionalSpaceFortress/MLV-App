@@ -4,6 +4,7 @@ Each case builds a throwaway repository with a bare remote, so nothing depends o
 checkout's refs. Every case asserts both the action AND the reason prefix, so a gate that
 passes for the wrong reason fails the test.
 """
+import base64
 import datetime
 import json
 import os
@@ -1197,3 +1198,156 @@ def test_merged_clean_worktree_whose_only_unreadable_pids_are_live_bound_service
     assert len(owners) == 2, d
     assert any("exempt=service-sid:S-1-5-18 via=scm:BITS,gpsvc bound=config-older-than-process" in o for o in owners), d
     assert any("exempt=service-sid:S-1-5-20 via=scm:Dnscache bound=config-older-than-process" in o for o in owners), d
+
+
+# --- RETIRE-HOLDER-ENCODEDCOMMAND-DECODE-1 (r6): a holder whose ONLY link to the worktree is a pwsh -EncodedCommand ---
+# Fleet doctrine specs/dng-auto-processor.md section 10: agent tools launch a shell as `pwsh -EncodedCommand <base64>`, so a
+# command line must be read WITH the encoded argument decoded (UTF-16LE); a raw match misses a path that sits only in base64.
+# A snapshot row carries its own CurrentDirectory (a readable cwd elsewhere), so the encoded argument is the only link.
+
+def _b64(text):
+    return base64.b64encode(text.encode("utf-16-le")).decode("ascii")
+
+
+def _enc_row(wt_cwd_home, cmd, name="pwsh.exe"):
+    """A live pwsh row (pid = the gate's own, so it is alive) with a readable cwd that is NOT the worktree."""
+    return _fake_row("$PID", cmd=cmd, name=name, cwd=str(wt_cwd_home))
+
+
+def _enc_gate(repo, tag, cmd_for):
+    tmp, main = repo
+    wt = _add_wt(main, tmp / ("wt-enc-" + tag))
+    return wt, _gate_with_snapshot(wt, _enc_row(tmp, cmd_for(wt)))
+
+
+ENCODED_SWITCHES = ["-EncodedCommand", "-encodedcommand", "-EnCodedCommand", "-enc", "-e", "-ec", "-en", "-encodedc",
+                    "/e", "/enc", "-ENC"]
+
+
+@pytest.mark.parametrize("switch", ENCODED_SWITCHES, ids=lambda s: s.replace("/", "slash").replace("-", "dash"))
+def test_holder_whose_only_link_is_an_encoded_command_argument_is_refused_as_live_process(repo, switch):
+    wt, d = _enc_gate(repo, "named", lambda wt: f"pwsh.exe -NoProfile {switch} " + _b64(f"Set-Location '{wt}'; Start-Sleep 60"))
+    assert d["action"] == "kept" and d["reason"].startswith("live-process: "), d
+    assert "[cmdline-encoded]" in d["reason"], d
+    assert wt.exists()
+
+
+@pytest.mark.parametrize("shape", ["colon", "quoted"])
+def test_encoded_command_argument_in_colon_or_quoted_form_is_decoded_too(repo, shape):
+    def cmd(wt):
+        b = _b64(f"Get-ChildItem {wt}")
+        return f"pwsh.exe -NoProfile -enc:{b}" if shape == "colon" else f'"C:\\Program Files\\PowerShell\\7\\pwsh.exe" -NoProfile -EncodedCommand "{b}"'
+    _, d = _enc_gate(repo, "shape-" + shape, cmd)
+    assert d["action"] == "kept" and d["reason"].startswith("live-process: ") and "[cmdline-encoded]" in d["reason"], d
+
+
+def test_encoded_command_naming_the_worktree_with_forward_slashes_is_refused(repo):
+    _, d = _enc_gate(repo, "fwd", lambda wt: "powershell.exe -NoProfile -EncodedCommand " + _b64("git -C " + str(wt).replace("\\", "/") + " status"))
+    assert d["action"] == "kept" and d["reason"].startswith("live-process: "), d
+
+
+def test_encoded_command_that_dot_sources_a_script_naming_the_worktree_is_followed_into_the_corpus(repo):
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-enc-corpus")
+    sd = _chain_scripts(tmp, str(wt))                                # only arms.ps1 names the worktree
+    row = _enc_row(tmp, "pwsh.exe -NoProfile -EncodedCommand " + _b64(f". '{sd / 'quiet.ps1'}'"))
+    d = _gate_with_snapshot(wt, row)
+    assert d["action"] == "kept" and d["reason"].startswith("live-process: ") and "script:arms.ps1" in d["reason"], d
+
+
+def test_encoded_command_naming_another_path_does_not_block_retirement(repo):
+    _, d = _enc_gate(repo, "other", lambda wt: "pwsh.exe -NoProfile -EncodedCommand " + _b64("Get-ChildItem C:\\somewhere\\else"))
+    assert (d["action"], d["reason"]) == ("would-retire", "ok") and d["cwdUnknown"] == [], d
+
+
+def test_encoded_command_naming_a_sibling_prefix_of_another_worktree_is_matched_like_the_raw_line(repo):
+    """The decoded text gets the SAME path test as the raw command line (a plain case-insensitive substring), nothing wider."""
+    _, d = _enc_gate(repo, "case", lambda wt: "pwsh.exe -EncodedCommand " + _b64("cd " + str(wt).upper()))
+    assert d["action"] == "kept" and d["reason"].startswith("live-process: "), d
+
+
+UNDECODABLE = {
+    "not-base64": "this-is-not-base64!!",
+    "odd-byte-count": base64.b64encode(b"A\x00B").decode("ascii"),
+    "lone-surrogate": base64.b64encode(b"\x00\xd8A\x00").decode("ascii"),
+    "single-byte": base64.b64encode(b"\x00").decode("ascii"),
+    "whitespace-only": _b64("   "),
+}
+
+
+@pytest.mark.parametrize("case", sorted(UNDECODABLE))
+def test_undecodable_encoded_command_argument_is_kept_not_retired(repo, case):
+    arg = UNDECODABLE[case]
+    wt, d = _enc_gate(repo, "bad-" + case, lambda wt: f"pwsh.exe -NoProfile -EncodedCommand {arg}")
+    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown"), d
+    assert any(" encoded-command-undecodable created=" in u for u in d["cwdUnknown"]), d
+    assert d["cwdExempt"] == 0 and wt.exists(), d
+
+
+def test_encoded_command_switch_with_no_value_is_kept_not_retired(repo):
+    _, d = _enc_gate(repo, "noval", lambda wt: "pwsh.exe -NoProfile -EncodedCommand")
+    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown"), d
+
+
+def test_undecodable_encoded_command_is_not_waved_through_by_creation_time(repo):
+    """The r3 creation-time exemption is for an unreadable CWD; it must not excuse a command line the gate cannot read."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-enc-old")
+    row = _fake_row("$PID", cmd="pwsh.exe -EncodedCommand ###", name="pwsh.exe", cwd=str(tmp), created=_wt_created(wt, -5))
+    d = _gate_with_snapshot(wt, row)
+    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown") and d["cwdExempt"] == 0, d
+
+
+def test_undecodable_encoded_command_of_a_pid_that_has_exited_is_not_a_candidate(repo):
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-enc-gone")
+    d = _gate_with_snapshot(wt, _fake_row("999992", cmd="pwsh.exe -EncodedCommand ###", name="pwsh.exe", cwd=str(tmp)))
+    assert (d["action"], d["reason"]) == ("would-retire", "ok"), d
+
+
+def test_the_same_holder_without_an_encoded_command_is_unchanged(repo):
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-enc-regress")
+    plain = _gate_with_snapshot(wt, _enc_row(tmp, "pwsh.exe -NoProfile -Command Start-Sleep"))
+    assert (plain["action"], plain["reason"]) == ("would-retire", "ok") and plain["cwdUnknown"] == [], plain
+    raw = _gate_with_snapshot(wt, _enc_row(tmp, f"pwsh.exe -NoProfile -File {wt}\\x.ps1"))
+    assert raw["action"] == "kept" and raw["reason"].startswith("live-process: ") and "[cmdline]" in raw["reason"], raw
+
+
+@pytest.mark.parametrize("switch", ["-ExecutionPolicy", "-executionpolicy", "-ex", "-exec", "-EX"])
+def test_execution_policy_is_not_read_as_encoded_command(repo, switch):
+    """-ex / -exec are -ExecutionPolicy. Neither the plain value nor a base64-looking value is decoded or refused."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-enc-ex")
+    bypass = _gate_with_snapshot(wt, _enc_row(tmp, f"pwsh.exe -NoProfile {switch} Bypass -File C:\\x\\y.ps1"))
+    assert (bypass["action"], bypass["reason"]) == ("would-retire", "ok") and bypass["cwdUnknown"] == [], bypass
+    named = _gate_with_snapshot(wt, _enc_row(tmp, f"pwsh.exe -NoProfile {switch} " + _b64(f"cd '{wt}'")))
+    assert (named["action"], named["reason"]) == ("would-retire", "ok"), named   # base64 after -ex is NOT decoded
+
+
+def test_non_powershell_process_with_an_e_switch_is_not_decoded(repo):
+    """python -e / node -e take code or a path, not UTF-16LE base64; only pwsh and powershell are read."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-enc-node")
+    d = _gate_with_snapshot(wt, _enc_row(tmp, "node.exe -e ###", name="node.exe"))
+    assert (d["action"], d["reason"]) == ("would-retire", "ok"), d
+
+
+@pytest.mark.skipif(not (PWSH and GIT), reason="requires pwsh and git")
+def test_encoded_command_switch_table_matches_pwsh_own_parameter_resolution():
+    ok, bad = _b64("Get-Date"), "not-base64!!"
+    table = [
+        ("pwsh.exe -NoProfile -e " + ok, True, False), ("pwsh.exe -ec " + ok, True, False), ("pwsh.exe -en " + ok, True, False),
+        ("pwsh.exe -EnCodedCommand " + ok, True, False), ("pwsh.exe /enc " + ok, True, False),
+        ("pwsh.exe -enc:" + ok, True, False), ("pwsh.exe -enc " + bad, True, True), ("pwsh.exe -enc", True, True),
+        ("pwsh.exe -ex Bypass", False, False), ("pwsh.exe -exec " + ok, False, False), ("pwsh.exe -ea " + ok, False, False),
+        ("pwsh.exe -File C:\\a.ps1", False, False), ("pwsh.exe -NoProfile -Command Get-Date", False, False),
+        ("powershell.exe -ec " + ok, True, False), ("node.exe -e " + bad, False, False),
+    ]
+    items = ", ".join("@('" + c.split(" ")[0] + "', '" + c + "')" for c, _, _ in table)
+    script = ("$ErrorActionPreference='Stop'; Set-StrictMode -Version Latest; " f". '{HELPER}'; "
+              f"@({items}) | ForEach-Object {{ $r = Get-EncodedCommandText -Name $_[0] -CommandLine $_[1]; "
+              "[pscustomobject]@{ Present = $r.Present; Failed = $r.Failed } } | ConvertTo-Json -AsArray")
+    out = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", script], check=True, capture_output=True, text=True).stdout
+    got = [(r["Present"], r["Failed"]) for r in json.loads(out)]
+    assert got == [(p, f) for _, p, f in table]

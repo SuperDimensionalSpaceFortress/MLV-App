@@ -96,6 +96,16 @@
     then followed into the transitive corpus exactly like an absolute one. If the holder's cwd is unknown the path cannot
     be followed, so the holder is treated as possibly naming the worktree (cwd-unknown), not skipped.
 
+    ENCODED COMMAND (r6, RETIRE-HOLDER-ENCODEDCOMMAND-DECODE-1; adopts fleet doctrine specs/dng-auto-processor.md section 10
+    "Task worktrees"): agent tools launch a shell as `pwsh -EncodedCommand <base64>`, so a path that sits only in the base64
+    is invisible to a raw command-line match. A pwsh / powershell holder's command line is therefore ALSO read with every
+    -EncodedCommand argument decoded (UTF-16LE): the decoded text gets the same worktree-path test (via=cmdline-encoded) and is
+    followed into the script corpus like the raw line. Switch spelling is pwsh's own: -e, -ec, -en ... -encodedcommand, any
+    case, `-` or `/`, optional `:value`; -ExecutionPolicy (-ex, -exec) and -EncodedArguments (-ea) are NOT read. An argument
+    that is not base64 of UTF-16LE text (or a switch with no value) is a holder the gate cannot read, so it is kept like an
+    unreadable cwd (kept / cwd-unknown, Why=encoded-command-undecodable, no creation-time or service-owner exemption).
+    NOT adopted from dng: its seat-ancestry exemption and report-leftovers-only reclaim (retire refuses on ANY live holder).
+
     Branch refs are NEVER deleted, so every retirement is undoable with `git worktree add`.
     ASCII-only by project convention.
 
@@ -267,6 +277,39 @@ function Resolve-HolderScriptPath {
     return [IO.Path]::GetFullPath([IO.Path]::Combine($HolderCwd, $p))
 }
 
+function Get-EncodedCommandText {
+    # r6 (RETIRE-HOLDER-ENCODEDCOMMAND-DECODE-1, fleet doctrine specs/dng-auto-processor.md section 10): a PowerShell holder
+    # started as `pwsh -EncodedCommand <base64>` carries its code as UTF-16LE base64, so its raw command line never names the
+    # worktree. Returns {Present; Failed; Text}: Text is every decoded argument joined by newlines. Present = the line carries
+    # the switch; Failed = a switch had no value, or its value is not base64 of UTF-16LE text (odd byte count, a lone
+    # surrogate, or empty), so the caller must treat the holder as unknown (kept), never as "not a holder".
+    # Only pwsh / powershell are read. Switch spelling follows pwsh itself (measured, pwsh 7 and Windows PowerShell 5.1):
+    # -e, -ec and every prefix of -EncodedCommand from -en up, any case, a leading '/' as well as '-', and a `:value` suffix.
+    # -ExecutionPolicy (-ex, -exec) and -EncodedArguments (-ea, -encodeda ...) are other parameters and are not read.
+    param([string]$Name, [string]$CommandLine)
+    $res = [pscustomobject]@{ Present = $false; Failed = $false; Text = '' }
+    if ([string]$Name -notmatch '(?i)^(pwsh|pwsh-preview|powershell)(\.exe)?$' -or [string]::IsNullOrEmpty($CommandLine)) { return $res }
+    $tokens = @([regex]::Matches($CommandLine, '"[^"]*"|\S+') | ForEach-Object { $_.Value })
+    $texts = New-Object System.Collections.Generic.List[string]
+    $strict = New-Object System.Text.UnicodeEncoding($false, $false, $true)   # little-endian, no BOM, throw on invalid
+    for ($i = 1; $i -lt $tokens.Count; $i++) {   # token 0 is the executable
+        $m = [regex]::Match($tokens[$i].Trim('"'), '^[-/]([A-Za-z]+)(?::(.*))?$')
+        if (-not $m.Success) { continue }
+        $sw = $m.Groups[1].Value.ToLowerInvariant()
+        if (-not ($sw -eq 'ec' -or $sw -eq 'e' -or ($sw.Length -ge 2 -and 'encodedcommand'.StartsWith($sw)))) { continue }
+        $res.Present = $true
+        $arg = if ($m.Groups[2].Success -and $m.Groups[2].Value) { $m.Groups[2].Value } elseif ($i + 1 -lt $tokens.Count) { $i++; $tokens[$i] } else { $null }
+        try {
+            if ($null -eq $arg) { throw 'no value' }
+            $txt = $strict.GetString([Convert]::FromBase64String($arg.Trim('"').Trim()))
+            if ([string]::IsNullOrWhiteSpace($txt)) { throw 'empty' }
+            $texts.Add($txt)
+        } catch { $res.Failed = $true }
+    }
+    $res.Text = $texts -join "`n"
+    return $res
+}
+
 function Get-ScriptCorpus {
     # The text a live script process can load: the script on its command line plus, transitively (same directory,
     # or an absolute path written in the text), the scripts it names. A chain whose command line names only its RUN
@@ -320,6 +363,7 @@ function Get-LaneHolderIndex {
     $prop = $Snapshot.PSObject.Properties['HolderIndex']
     if ($prop -and $null -ne $prop.Value) { return $prop.Value }
     $cwd = @{}
+    $decoded = @{}
     $scripts = New-Object System.Collections.Generic.List[object]
     $unknown = New-Object System.Collections.Generic.List[object]
     $fileCache = @{}
@@ -335,15 +379,19 @@ function Get-LaneHolderIndex {
         $c = if ($c) { (([string]$c -replace '/', '\').TrimEnd('\')) } else { $null }
         if ($c) { $cwd[$procId] = $c }
         $relUnresolved = $false
+        # r6: the command line read WITH any -EncodedCommand argument decoded. The decoded text is matched like the raw line
+        # and followed into the script corpus; an argument that does not decode makes the holder unknown (kept) below.
+        $enc = Get-EncodedCommandText -Name ([string]$proc.Name) -CommandLine ([string]$proc.CommandLine)
+        if ($enc.Text) { $decoded[$procId] = [string]$enc.Text }
         if ([string]$proc.Name -match $scriptRunner) {
-            $corpus = Get-ScriptCorpus -CommandLine ([string]$proc.CommandLine) -FileCache $fileCache -HolderCwd ([string]$c)
+            $corpus = Get-ScriptCorpus -CommandLine (([string]$proc.CommandLine) + "`n" + $enc.Text) -FileCache $fileCache -HolderCwd ([string]$c)
             $relUnresolved = [bool]$corpus.RelativeUnresolved
             foreach ($f in @($corpus.Files)) {
                 $scripts.Add([pscustomobject]@{ ProcessId = $procId; File = $f.File; Text = $f.Text })
             }
         }
-        if ($c) { continue }
-        # cwd unknown. Only a pid that exited since the snapshot holds nothing, and pids 0 and 4 (System Idle, System) are
+        if ($c -and -not $enc.Failed) { continue }
+        # cwd unknown (or, r6, an -EncodedCommand argument that does not decode). Only a pid that exited since the snapshot holds nothing, and pids 0 and 4 (System Idle, System) are
         # kernel pseudo-processes with no user-mode current directory. Every other process is a candidate whatever its
         # session id (r3: a session id is not evidence); Get-CwdUnknownRefusal applies the one creation-time exemption.
         if ($procId -le 4) { continue }
@@ -354,7 +402,7 @@ function Get-LaneHolderIndex {
         }
         $alive = if ($null -ne $livePids) { $livePids.ContainsKey($procId) } else { [bool](Get-Process -Id $procId -ErrorAction SilentlyContinue) }
         if (-not $alive) { continue }
-        $why = if ($relUnresolved) { 'relative-script-unresolved' } elseif ($probeOk) { 'cwd-unreadable' } else { 'cwd-probe-unavailable' }
+        $why = if ($enc.Failed) { 'encoded-command-undecodable' } elseif ($relUnresolved) { 'relative-script-unresolved' } elseif ($probeOk) { 'cwd-unreadable' } else { 'cwd-probe-unavailable' }
         $cdp = $proc.PSObject.Properties['CreationDate']
         $created = if ($cdp -and $cdp.Value -is [datetime]) { ([datetime]$cdp.Value).ToUniversalTime() } else { $null }
         $unknown.Add([pscustomobject]@{ ProcessId = $procId; Name = [string]$proc.Name; Why = $why; CreatedUtc = $created })
@@ -365,7 +413,7 @@ function Get-LaneHolderIndex {
         $byPid[$s.ProcessId].Add($s)
     }
     $idx = [pscustomobject]@{
-        Cwd = $cwd; Scripts = $scripts.ToArray(); ScriptsByPid = $byPid
+        Cwd = $cwd; Decoded = $decoded; Scripts = $scripts.ToArray(); ScriptsByPid = $byPid
         CwdProbe = $(if ($probeOk) { 'ok' } else { 'unavailable' }); CwdUnknown = $unknown.ToArray()
     }
     $Snapshot | Add-Member -NotePropertyName HolderIndex -NotePropertyValue $idx -Force
@@ -393,6 +441,11 @@ function Find-WorktreeHolders {
         $via = $null
         $cl = [string]$p.CommandLine   # null when the command line is unreadable: nothing to match, but the cwd probe still runs
         if ($cl.IndexOf($wd, [StringComparison]::OrdinalIgnoreCase) -ge 0 -or $cl.IndexOf($slash, [StringComparison]::OrdinalIgnoreCase) -ge 0) { $via = 'cmdline' }
+        # A holder index built by a caller (a -SnapshotProvider) predates Decoded: read it only when present (StrictMode throws on a missing property).
+        if (-not $via -and $idx.PSObject.Properties['Decoded'] -and $idx.Decoded.ContainsKey($procId)) {
+            $dt = [string]$idx.Decoded[$procId]   # r6: the same path test over the decoded -EncodedCommand text
+            if ($dt.IndexOf($wd, [StringComparison]::OrdinalIgnoreCase) -ge 0 -or $dt.IndexOf($slash, [StringComparison]::OrdinalIgnoreCase) -ge 0) { $via = 'cmdline-encoded' }
+        }
         if (-not $via -and $idx.Cwd.ContainsKey($procId)) {
             $c = [string]$idx.Cwd[$procId]
             if ($c -ieq $wd -or $c.StartsWith($wd + '\', [StringComparison]::OrdinalIgnoreCase)) { $via = 'cwd' }
@@ -516,7 +569,10 @@ function Get-CwdUnknownRefusal {
     $res.Reason = if ($idx.CwdProbe -ne 'ok') { "cwd-probe-unavailable: the current-directory probe cannot run, so $($unk.Count) process(es) cannot be ruled out as holders, first: $first" }
                   else { "cwd-unknown: $($unk.Count) process(es) with an unreadable current directory, created at/after the worktree or with no readable creation time, cannot be ruled out as holders, first: $first" }
     $via = if ($idx.CwdProbe -ne 'ok') { 'cwd-probe-unavailable' } else { 'cwd-unknown' }
-    $res.Rows = @($unk | Select-Object -First 20 | ForEach-Object { [pscustomobject]@{ ProcessId = $_.ProcessId; Name = $_.Name; Via = $via } })
+    if (@($unk | Where-Object { $_.Why -eq 'encoded-command-undecodable' }).Count) {
+        $res.Reason += ' (encoded-command-undecodable: an -EncodedCommand argument that does not decode as UTF-16LE base64 is never treated as "not a holder")'
+    }
+    $res.Rows = @($unk | Select-Object -First 20 | ForEach-Object { [pscustomobject]@{ ProcessId = $_.ProcessId; Name = $_.Name; Via = $(if ($_.Why -eq 'encoded-command-undecodable') { 'encoded-command-undecodable' } else { $via }) } })
     $res.Unknown = @($unk | ForEach-Object { $t = if ($_.CreatedUtc) { ([datetime]$_.CreatedUtc).ToString('o') } else { 'unreadable' }; "$($_.ProcessId) $($_.Name) $($_.Why) created=$t" })
     return $res
 }
