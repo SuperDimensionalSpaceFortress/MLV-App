@@ -10,6 +10,9 @@ WHAT IS PINNED (the claim was a 30 s polling race with no FIFO: PLAYBACK-CPU-PAC
   * r2 (keys on d40e8664): (B1) the keep is counted: ONE kept cycle (-TicketKeepMax), then the next GATE_BUSY under the claim drops the ticket so a ready follower
     takes the claim; (B2) a ticket's probe-phase window is derived from the probe's real upper bound (the chain passes -MaxAdmissionWaitSec to the probe), so a live
     head 700 s into a long probe is not stale while a dead pid still is at once; equal-tick tickets sort by pid then start ticks, never by enumeration order.
+  * r3 (hub-found blocker on 65f46ac2, r8v on Bachelor): the chain's -MaxAdmissionWaitSec reached only the FAKE probe; the real Wait-VenueQuiet.ps1 declared no such parameter, so
+    every quiet probe failed binding. Now: every -Name the chain passes is a declared Live parameter of the real probe (PowerShell AST on both sides), the probe forwards the
+    bound to um-run.ps1 (AST over the call), and the real script binds it (and range-checks it) when run against a nonexistent scratch share.
 
 Offline only: the claim and ticket folders live in a temp dir, Wait-VenueQuiet and Invoke-VenueLeg are the fakes of test_venue_chain_runner.py, and the clock of
 the ticket logic is injected (-NowUtc) so no test waits for a real heartbeat to expire. The module tests are deterministic. The chain-process FIFO test races
@@ -34,6 +37,8 @@ from tools.repo_hygiene import test_venue_chain_runner as base
 DV = Path(os.environ["VENUE_CLAIM_FIFO_DV_DIR"]) if os.environ.get("VENUE_CLAIM_FIFO_DV_DIR") else base.DV
 RUNNER = DV / "Invoke-VenueChain.ps1"
 MODULE = DV / "VenueChain.psm1"
+QUIET = DV / "Wait-VenueQuiet.ps1"
+UM_RUN = DV.parent / "um-run.ps1"
 PWSH = base.PWSH
 requires_windows_pwsh = base.requires_windows_pwsh
 
@@ -483,6 +488,131 @@ foreach ($n in @@NAMES@@) { Set-Content -LiteralPath (Join-Path $dir $n) -Value 
         tick = "0000000000000000100"
         got = self.tie_break_order([f"{tick}-p9-5.ticket.json", f"{tick}-p10-5.ticket.json"], module=mut)
         self.assertEqual(got, [f"{tick}-p10-5.ticket.json", f"{tick}-p9-5.ticket.json"], "the mutant orders by file name text: p10 before p9")
+
+    # ---------------------------------------------------------------- r3: the chain's argument list is bound against the REAL probe (hub-found blocker, PR #416)
+    # r2 passed the chain's -MaxAdmissionWaitSec only to the FAKE probe, which declares it; the real Wait-VenueQuiet.ps1 did not, so pwsh failed parameter binding and
+    # every quiet probe launched through the chain was VENUE_QUIET_UNKNOWN (r8v on Bachelor, "FIFO DEFECT"). Nothing compared the two sides; these tests do.
+    AST_PRELUDE = r"""
+$ErrorActionPreference = 'Stop'
+function Get-Ast([string]$Path) {
+    $t = $null; $e = $null
+    $a = [System.Management.Automation.Language.Parser]::ParseFile($Path, [ref]$t, [ref]$e)
+    if ($e.Count) { throw "parse errors in ${Path}: $($e[0].Message)" }
+    $a
+}
+function Get-ParamNames($Ast, [string]$Set) {
+    # the parameters bound in parameter set $Set: those with no ParameterSetName at all (every set) and those naming it ('*' = every declared parameter)
+    $names = @()
+    foreach ($p in $Ast.ParamBlock.Parameters) {
+        $sets = @()
+        foreach ($attr in $p.Attributes) {
+            if ($attr -is [System.Management.Automation.Language.AttributeAst] -and $attr.TypeName.Name -ceq 'Parameter') {
+                foreach ($na in $attr.NamedArguments) { if ($na.ArgumentName -ceq 'ParameterSetName') { $sets += [string]$na.Argument.Value } }
+            }
+        }
+        if ($Set -ceq '*' -or $sets.Count -eq 0 -or $sets -contains $Set) { $names += $p.Name.VariablePath.UserPath }
+    }
+    $names
+}
+"""
+    CHAIN_ARGS_PS = r"param([string]$Runner, [string]$Quiet)" + AST_PRELUDE + r"""
+$r = Get-Ast $Runner
+$fn = $r.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -ceq 'Invoke-QuietProbe' }, $true)
+if ($null -eq $fn) { throw 'Invoke-QuietProbe not found' }
+$asg = $fn.Body.Find({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -ceq '$qArgs' }, $true)
+if ($null -eq $asg) { throw '$qArgs assignment not found' }
+$consts = @($asg.Right.FindAll({ param($n) $n -is [System.Management.Automation.Language.StringConstantExpressionAst] }, $true) | Sort-Object { $_.Extent.StartOffset } | ForEach-Object { [string]$_.Value })
+$i = [array]::IndexOf($consts, '-File')
+if ($i -lt 0) { throw '-File not found in $qArgs' }
+$passed = @($consts[($i + 1)..($consts.Count - 1)] | Where-Object { $_ -cmatch '^-[A-Za-z]' })
+$live = @(Get-ParamNames (Get-Ast $Quiet) 'Live')
+[ordered]@{ passed = $passed; live = $live; missing = @($passed | Where-Object { $live -notcontains $_.TrimStart('-') }) } | ConvertTo-Json -Compress
+"""
+    UMRUN_CALL_PS = r"param([string]$Quiet, [string]$UmRun)" + AST_PRELUDE + r"""
+$q = Get-Ast $Quiet
+$calls = @($q.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.InvocationOperator -eq 'Ampersand' -and $n.CommandElements[0] -is [System.Management.Automation.Language.VariableExpressionAst] -and $n.CommandElements[0].VariablePath.UserPath -ceq 'umRun' }, $true))
+if ($calls.Count -ne 1) { throw "expected exactly one & `$umRun call, found $($calls.Count)" }
+$els = @($calls[0].CommandElements)
+$pairs = @()
+for ($k = 1; $k -lt $els.Count; $k++) {
+    if ($els[$k] -is [System.Management.Automation.Language.CommandParameterAst]) {
+        $v = $(if ($null -ne $els[$k].Argument) { $els[$k].Argument.Extent.Text } elseif ($k + 1 -lt $els.Count -and $els[$k + 1] -isnot [System.Management.Automation.Language.CommandParameterAst]) { $els[$k + 1].Extent.Text } else { '' })
+        $pairs += "$($els[$k].ParameterName)=$v"
+    }
+}
+$declared = @(Get-ParamNames (Get-Ast $UmRun) '*')
+[ordered]@{ pairs = $pairs; declared = $declared; missing = @($pairs | ForEach-Object { ($_ -split '=')[0] } | Where-Object { $declared -notcontains $_ }) } | ConvertTo-Json -Compress
+"""
+
+    def ast_json(self, script: str, *args: str) -> dict:
+        f = self.case / f"ast-{len(list(self.case.glob('ast-*.ps1')))}.ps1"
+        f.write_text(script, encoding="utf-8")
+        r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(f), *args], capture_output=True, text=True, timeout=120)
+        if r.returncode != 0:
+            raise AssertionError(f"AST scenario failed ({r.returncode}):\n{r.stdout}\n{r.stderr}")
+        return json.loads([l for l in r.stdout.splitlines() if l.strip()][-1])
+
+    def mutant_copy(self, src: Path, old: str, new: str) -> Path:
+        text = src.read_text(encoding="utf-8")
+        self.assertEqual(text.count(old), 1, f"mutation anchor moved in {src.name}")
+        out = self.case / f"mutant-{src.name}"
+        out.write_text(text.replace(old, new), encoding="utf-8")
+        return out
+
+    def test_r3_every_argument_the_chain_passes_the_probe_is_a_declared_live_parameter(self) -> None:
+        r = self.ast_json(self.CHAIN_ARGS_PS, str(RUNNER), str(QUIET))
+        self.assertIn("-MaxAdmissionWaitSec", r["passed"], "the AST walk must see the admission bound the chain passes (else this guard is blind)")
+        self.assertIn("-Venue", r["passed"])
+        self.assertGreaterEqual(len(r["passed"]), 7)
+        self.assertEqual(r["missing"], [], "the chain passes parameters Wait-VenueQuiet.ps1 does not declare in its Live set: pwsh fails binding and every probe is NOT_RUN")
+
+    def test_r3_mutation_a_probe_without_the_admission_parameter_is_caught(self) -> None:
+        mut = self.mutant_copy(QUIET, "    [Parameter(ParameterSetName = 'Live')][ValidateRange(1, 86400)][int]$MaxAdmissionWaitSec = 7200,\n", "")
+        r = self.ast_json(self.CHAIN_ARGS_PS, str(RUNNER), str(mut))
+        self.assertEqual(r["missing"], ["-MaxAdmissionWaitSec"], "the r2 state: the chain passes a parameter the probe lacks")
+
+    def test_r3_mutation_a_chain_that_passes_an_unknown_parameter_is_caught(self) -> None:
+        mut = self.mutant_copy(RUNNER, "'-MaxAdmissionWaitSec', [string]$ProbeAdmissionWaitSec)", "'-MaxAdmissionWaitSec', [string]$ProbeAdmissionWaitSec, '-NoSuchProbeParameter', '1')")
+        r = self.ast_json(self.CHAIN_ARGS_PS, str(mut), str(QUIET))
+        self.assertEqual(r["missing"], ["-NoSuchProbeParameter"])
+
+    def test_r3_the_probe_forwards_its_admission_bound_to_um_run(self) -> None:
+        r = self.ast_json(self.UMRUN_CALL_PS, str(QUIET), str(UM_RUN))
+        self.assertIn("MaxAdmissionWaitSec=$MaxAdmissionWaitSec", r["pairs"], "the um-run call must pass the probe's own -MaxAdmissionWaitSec through (um-run's default is 7200 s)")
+        self.assertIn("MaxAdmissionWaitSec", r["declared"])
+        self.assertEqual(r["missing"], [], "the um-run call passes a parameter um-run.ps1 does not declare")
+
+    def test_r3_mutation_a_probe_that_does_not_forward_the_bound_is_caught(self) -> None:
+        call = "-MaxClaimedWaitSec 120 -MaxAdmissionWaitSec $MaxAdmissionWaitSec 6>$null)"
+        for new in ("-MaxClaimedWaitSec 120 6>$null)", "-MaxClaimedWaitSec 120 -MaxAdmissionWaitSec 7200 6>$null)"):
+            mut = self.mutant_copy(QUIET, call, new)
+            r = self.ast_json(self.UMRUN_CALL_PS, str(mut), str(UM_RUN))
+            self.assertNotIn("MaxAdmissionWaitSec=$MaxAdmissionWaitSec", r["pairs"], f"mutant {new!r} must not look like a forward")
+
+    def run_real_probe(self, *extra: str) -> subprocess.CompletedProcess:
+        """The REAL Wait-VenueQuiet.ps1, Live set, against a share that does not exist: it stops at GATE_UNREADABLE (exit 4) before any probe job is written or
+        submitted, so no venue, no claim and no um-run is involved. WorkDir and share are scratch paths under the test's temp dir."""
+        share = self.case / "no-such-agent-share"
+        r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(QUIET), "-Venue", "bachelor", "-WorkDir", str(self.case / "quiet-work"),
+                            "-AgentShare", str(share), "-AllowShareOverride", "-MaxWaitSec", "5", "-MaxGateSec", "5", "-ReadAttempts", "1", "-ReadBackoffSec", "0", *extra],
+                           capture_output=True, text=True, timeout=120)
+        self.assertFalse(share.exists(), "the probe must not create the share")
+        return r
+
+    def test_r3_the_real_probe_binds_the_admission_parameter_the_chain_passes(self) -> None:
+        r = self.run_real_probe("-ThresholdPercent", "20", "-RecheckSec", "90", "-MaxAdmissionWaitSec", "7200")
+        text = r.stdout + r.stderr
+        self.assertNotIn("parameter cannot be found", text, text)
+        self.assertNotIn("Cannot validate argument", text, text)
+        self.assertEqual(r.returncode, 4, text)
+        self.assertIn("GATE_UNREADABLE", text)
+
+    def test_r3_the_real_probe_validates_the_admission_range_so_the_binding_is_the_declared_one(self) -> None:
+        for bad in ("0", "86401"):
+            r = self.run_real_probe("-MaxAdmissionWaitSec", bad)
+            text = r.stdout + r.stderr
+            self.assertNotEqual(r.returncode, 4, text)
+            self.assertIn("Cannot validate argument on parameter 'MaxAdmissionWaitSec'", text)
 
     def test_the_contract_is_documented_in_both_headers(self) -> None:
         mod = MODULE.read_text(encoding="utf-8")
