@@ -6035,7 +6035,7 @@ class LookReceiptRunnerTests(RunnerHarness, unittest.TestCase):
             subprocess.run(["git", "-C", str(self.repo), *args], capture_output=True, text=True, check=True)
         self.working = self.committed.replace(b"<agx>0</agx>", b"<agx>1</agx>")
         target.write_bytes(self.working)   # the working copy now differs from the committed blob
-        self.gen.write_text(STUB_GENERATOR.replace("$DisplayMode)", "$DisplayMode,$LookReceiptPath)", 1), encoding="utf-8")
+        self.gen.write_text(STUB_GENERATOR.replace("$PlaybackConform)", "$PlaybackConform,$LookReceiptPath)", 1), encoding="utf-8")
         self.work = self.tmp / "work"
 
     def spec(self, **look) -> Path:
