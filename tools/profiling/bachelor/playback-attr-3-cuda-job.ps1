@@ -403,7 +403,16 @@ param(
 
     # PLAYBACK-STARTUP-CATCHUP-BURST-1 r7: the app's opt-in per-present playback trace (MLVAPP_PLAYBACK_PRESENT_TRACE=1; its rows
     # land in the run log after the Play stops). Absent: nothing is set and the emitted job is the text it was before this parameter.
-    [switch]$PresentTrace
+    [switch]$PresentTrace,
+
+    # PLAYBACK-SCOPES-OPTION-1: the live scope the smoke forces on (the smoke runner's -Scope -> the app's --scope, which also shows the
+    # edit area). '' or 'none' (the default) keeps -Scope none: the emitted job is the text it was before this parameter.
+    [ValidateSet('', 'none', 'histogram', 'waveform', 'parade', 'vectorscope')]
+    [string]$Scope = '',
+
+    # PLAYBACK-SCOPES-OPTION-1: the app's playback scope throttle base interval (MLVAPP_PLAYBACK_SCOPE_INTERVAL_MS; 0 = every presented
+    # frame when the render is fast). -1 (the default) sets nothing: the emitted job is the text it was before this parameter.
+    [ValidateRange(-1, 1000)][int]$ScopeIntervalMs = -1
 )
 
 $ErrorActionPreference = 'Stop'
@@ -4447,6 +4456,24 @@ if ($PresentTrace) {
     })
 }
 
+# PLAYBACK-SCOPES-OPTION-1: a scope leg swaps the smoke command's ONE '-Scope none' for the named scope, on the expanded text and only when asked
+# (like --windowed above), so every other job is the text it always was. The anchor must match exactly once, or the generator throws.
+if (-not [string]::IsNullOrEmpty($Scope) -and $Scope -cne 'none') {
+    $scopeAnchor = [regex]' -Scope none '
+    if ($scopeAnchor.Matches($text).Count -ne 1) { throw 'DUAL_VENUE_SCOPE_ANCHOR_MISSING the job template has no single -Scope none site to replace' }
+    $text = $scopeAnchor.Replace($text, " -Scope $Scope ")
+}
+
+# PLAYBACK-SCOPES-OPTION-1: the same env-list site gains the scope throttle interval, only when asked.
+if ($ScopeIntervalMs -ge 0) {
+    $scopeIntervalAnchor = [regex]"(?<ind>[ \t]*)'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',(?<nl>\r?\n)"
+    if ($scopeIntervalAnchor.Matches($text).Count -ne 1) { throw 'DUAL_VENUE_SCOPE_INTERVAL_ANCHOR_MISSING the job template has no single env-list site to add MLVAPP_PLAYBACK_SCOPE_INTERVAL_MS to' }
+    $text = $scopeIntervalAnchor.Replace($text, [System.Text.RegularExpressions.MatchEvaluator]{
+        param($m)
+        $m.Value + $m.Groups['ind'].Value + "'MLVAPP_PLAYBACK_SCOPE_INTERVAL_MS=$ScopeIntervalMs'," + $m.Groups['nl'].Value
+    })
+}
+
 $outDir = Split-Path -Parent $OutFile
 if ($outDir -and -not (Test-Path -LiteralPath $outDir)) { New-Item -ItemType Directory -Path $outDir -Force | Out-Null }
 [IO.File]::WriteAllText($OutFile, $text, [Text.UTF8Encoding]::new($false))
@@ -4477,6 +4504,8 @@ $clipContentSha256 = if ($isFixtureRehearsal) {
     swapInterval = $(if ($SwapInterval -ge 0) { $SwapInterval } else { $null })
     cudaLaunchTimingMinMs = $(if ($CudaLaunchTimingMinMs -ge 0) { $CudaLaunchTimingMinMs } else { $null })
     presentTrace = [bool]$PresentTrace
+    scope = $(if ([string]::IsNullOrEmpty($Scope)) { 'none' } else { $Scope })
+    scopeIntervalMs = $(if ($ScopeIntervalMs -ge 0) { $ScopeIntervalMs } else { $null })
     # DUAL-VENUE-EVIDENCE-1: what this generation was authored for (not part of the emitted job's bytes).
     venue = $Venue
     backend = $Backend
