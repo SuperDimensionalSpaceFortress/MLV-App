@@ -2883,9 +2883,30 @@ def test_repo_slug_literals_agree_across_tools_coordination():
     shared = re.search(r"return '([^']+/[^']+)'", (ROOT / "tools" / "coordination" / "repo-slug.ps1").read_text(encoding="utf-8"))
     assert shared, "repo-slug.ps1 no longer returns a slug literal"
     assert shared.group(1) == FAKE_GH_REPO_STRING
-    for name in ("Export-PrReviewEvidence.ps1", "set-required-checks.ps1"):
+    # The EFFECTIVE literal each script talks to, read from its assigning statement (a comment or
+    # SYNOPSIS line naming the slug proves nothing: the endpoint itself is what gets called).
+    effective = {
+        "Export-PrReviewEvidence.ps1": r"^\$Repo = '([^']+)'\s*$",
+        "set-required-checks.ps1": r"^\$endpoint = 'repos/([^']+)/branches/master/protection/required_status_checks'\s*$",
+    }
+    for name, pattern in effective.items():
         text = (ROOT / "tools" / "coordination" / name).read_text(encoding="utf-8")
-        assert shared.group(1) in text, "%s no longer carries the shared slug" % name
+        found = re.findall(pattern, text, re.M)
+        assert found == [shared.group(1)], "%s effective repository literal %r != shared slug" % (name, found)
+
+
+def test_lane_prompt_template_contract_names_the_shared_slug():
+    """product-card-TEMPLATE.md is the text every implementer prompt is composed from, and its
+    COMPOSER CONTRACT is where compose-lane-prompt-core.ps1 says the PR_STEP literal comes from
+    verbatim: the contract, the remote line and the composer must all carry the shared slug."""
+    shared = re.search(r"return '([^']+/[^']+)'", (ROOT / "tools" / "coordination" / "repo-slug.ps1").read_text(encoding="utf-8")).group(1)
+    template = (ROOT / "docs" / "lane-prompts" / "v2" / "product-card-TEMPLATE.md").read_text(encoding="utf-8")
+    assert "gh pr create -R %s --head {{BRANCH}}" % shared in template
+    assert "Remote `fork` = `https://github.com/%s.git`" % shared in template
+    hub = (ROOT / "docs" / "lane-prompts" / "v2" / "hub-procedure.md").read_text(encoding="utf-8")
+    assert "`-R %s`" % shared in hub and "repos/%s/" % shared in hub
+    composer = (ROOT / "tools" / "coordination" / "compose-lane-prompt-core.ps1").read_text(encoding="utf-8")
+    assert "'gh pr create -R ' + (Get-MlvRepoSlug) + ' --head {{BRANCH}}" in composer
 
 
 def extract_json_array_bytes(raw, key):

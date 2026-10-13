@@ -11,6 +11,8 @@ import sys
 from pathlib import Path, PurePosixPath
 from typing import Any, Protocol
 
+from .repository_identity import alias_urls, is_repository_alias
+
 
 DEFAULT_MANIFEST = Path("tests/fixtures/golden/pipeline_hashes.provenance.json")
 EXPECTED_FULL16_KEYS = {
@@ -306,8 +308,9 @@ def _validate_approval_witness(
              f"{label} source must contain the exact GitHub authority fields")
     _require(source.get("kind") == "github_issue_comment",
              f"{label} source kind must be github_issue_comment")
-    _require(source.get("repository") == "layibabalola/MLV-App",
-             f"{label} source repository must be layibabalola/MLV-App")
+    # The record may spell the repository either way (2026-10 transfer; repository id 1169162800).
+    _require(is_repository_alias(source.get("repository")),
+             f"{label} source repository must be a known name of this repository")
     pull_request = source.get("pull_request")
     comment_id = source.get("comment_id")
     _require(isinstance(pull_request, int) and not isinstance(pull_request, bool) and pull_request > 0,
@@ -315,7 +318,7 @@ def _validate_approval_witness(
     _require(isinstance(comment_id, int) and not isinstance(comment_id, bool) and comment_id > 0,
              f"{label} source comment_id must be a positive integer")
     expected_url = (
-        f"https://github.com/layibabalola/MLV-App/pull/{pull_request}"
+        f"https://github.com/{source['repository']}/pull/{pull_request}"
         f"#issuecomment-{comment_id}"
     )
     _require(source.get("url") == expected_url,
@@ -371,8 +374,8 @@ def _validate_history(
             f"pipeline external_observations[{index}] head_sha",
         )
         run_id = observation["run_id"]
-        expected_url = f"https://github.com/layibabalola/MLV-App/actions/runs/{run_id}"
-        _require(observation.get("url") == expected_url,
+        expected_urls = alias_urls(f"https://github.com/{{repository}}/actions/runs/{run_id}")
+        _require(observation.get("url") in expected_urls,
                  f"pipeline external_observations[{index}] URL must exactly match its hosted run_id")
         observed_artifact_hash = _hash_bytes(git.blob(head, artifact_path), artifact["hash_mode"])
         _require(observed_artifact_hash == artifact["sha256"],
