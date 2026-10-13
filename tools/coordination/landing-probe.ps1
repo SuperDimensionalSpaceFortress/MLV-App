@@ -36,6 +36,8 @@
 # changed the semantics of an unrelated script that merely consulted it. A library imposes no
 # strictness on its callers; Invoke-Workstream.ps1 sets its own, before dot-sourcing this.
 
+. (Join-Path $PSScriptRoot 'repo-slug.ps1')
+
 # The landing vocabulary. ONE definition; both the title and body matchers consume it, so they can
 # never drift apart either. Tolerates markdown emphasis around the id, and the optional 'card' /
 # 'queue item' connector that real PR bodies use ("Closes queue item OWN-1-PRECEDENCE", PR #52).
@@ -75,7 +77,7 @@ function Get-CardLandingEvidence {
     #>
     param(
         [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$CardId,
-        [string]$Repo = 'layibabalola/MLV-App',
+        [string]$Repo = (Get-MlvRepoSlug),
         [int]$Limit = 100
     )
 
