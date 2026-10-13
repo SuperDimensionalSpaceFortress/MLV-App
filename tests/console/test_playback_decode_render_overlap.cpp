@@ -630,6 +630,16 @@ TEST(PlaybackDropOffPrepPolicy, LosslessWorkIsNeverConflatedOrSkippedBySerial)
     ASSERT_FALSE( playbackPrepConflatesOlderWork( true ) );
 }
 
+// PLAYBACK-CPU-PACE-GAP-1 r7 FR1: drop-frame-on work takes master's single conflated slot unless the bisect opt-in
+// (MLVAPP_PLAYBACK_PREP_CONFLATED_MOVE) asks for the r5 move deque; lossless work always takes the deque.
+TEST(PlaybackDropOffPrepPolicy, OnlyDropFrameOnWorkWithoutTheOptInTakesTheConflatedSlot)
+{
+    ASSERT_TRUE( playbackPrepUsesConflatedSlot( false, false ) );  // drop-frame on, default: master's slot
+    ASSERT_FALSE( playbackPrepUsesConflatedSlot( false, true ) );  // drop-frame on, opt-in: the r5 move deque
+    ASSERT_FALSE( playbackPrepUsesConflatedSlot( true, false ) );  // drop-frame off: the lossless deque
+    ASSERT_FALSE( playbackPrepUsesConflatedSlot( true, true ) );   // the opt-in never reaches the lossless path
+}
+
 TEST(PlaybackDropOffPrepPolicy, TheAdvanceHoldsForAFullPrepStageOrAnUntakenTargetAndNeverForever)
 {
     using namespace playback_drop_off;
@@ -748,16 +758,41 @@ TEST(PlaybackDecodeRenderOverlapWiring, DropFrameOffMakesThePrepQueueLosslessAnd
 }
 
 // PLAYBACK-CPU-PACE-GAP-1 r5: the prep task (its owned RGB16 frame copy) is moved into and out of the deque, never
-// copied into a freshly allocated element per frame on the GUI thread.
+// copied into a freshly allocated element per frame on the GUI thread. r7: that holds for the deque path (lossless work,
+// and drop-frame-on work under the bisect opt-in); the default drop-frame-on path copies into master's slot instead
+// (DropFrameOnPrepQueueIsTheMasterConflatedSlot).
 TEST(PlaybackDecodeRenderOverlapWiring, ThePrepTaskIsMovedThroughTheQueueNotCopied)
 {
     const QString mw = readRepoText( "platform/qt/MainWindow.cpp" );
     ASSERT_FALSE( mw.isEmpty() );
-    ASSERT_TRUE( mw.contains( QStringLiteral("void MainWindow::enqueuePlaybackPrepTask( PlaybackPrepTask ownedTask )") ) );
-    ASSERT_TRUE( mw.contains( QStringLiteral("m_playbackPrepPending.push_back( std::move( ownedTask ) );") ) );
+    const int moveFn = mw.indexOf( QStringLiteral("void MainWindow::enqueuePlaybackPrepTaskLossless( PlaybackPrepTask ownedTask )") );
+    ASSERT_TRUE( moveFn > 0 );
+    const QString moveBody = mw.mid( moveFn, mw.indexOf( QStringLiteral("\nvoid MainWindow::"), moveFn + 10 ) - moveFn );
+    ASSERT_TRUE( moveBody.contains( QStringLiteral("m_playbackPrepPending.push_back( std::move( ownedTask ) );") ) );
+    ASSERT_FALSE( moveBody.contains( QStringLiteral("PlaybackPrepTask ownedTask = task;") ) );
     ASSERT_TRUE( mw.contains( QStringLiteral("task = std::move( m_playbackPrepPending.front() );") ) );
-    ASSERT_TRUE( mw.contains( QStringLiteral("enqueuePlaybackPrepTask( std::move( task ) );") ) );
-    ASSERT_FALSE( mw.contains( QStringLiteral("PlaybackPrepTask ownedTask = task;") ) );
+    ASSERT_TRUE( mw.contains( QStringLiteral("enqueuePlaybackPrepTaskLossless( std::move( task ) );") ) );
+}
+
+// PLAYBACK-CPU-PACE-GAP-1 r7 FR1: with drop-frame on (and no bisect opt-in) the prep queue is the cb23f62b master code:
+// one conflated slot, the task copied in on the GUI thread and copied out by the worker, as before #397.
+TEST(PlaybackDecodeRenderOverlapWiring, DropFrameOnPrepQueueIsTheMasterConflatedSlot)
+{
+    const QString mw = readRepoText( "platform/qt/MainWindow.cpp" );
+    ASSERT_FALSE( mw.isEmpty() );
+    const int slotFn = mw.indexOf( QStringLiteral("void MainWindow::enqueuePlaybackPrepTask( const PlaybackPrepTask &task )") );
+    ASSERT_TRUE( slotFn > 0 );
+    const QString slotBody = mw.mid( slotFn, mw.indexOf( QStringLiteral("\nvoid MainWindow::"), slotFn + 10 ) - slotFn );
+    ASSERT_TRUE( slotBody.contains( QStringLiteral("PlaybackPrepTask ownedTask = task;") ) );
+    ASSERT_TRUE( slotBody.contains( QStringLiteral("m_playbackPrepConflatedSlot = ownedTask;") ) );
+    ASSERT_TRUE( slotBody.contains( QStringLiteral("m_playbackPrepConflatedSlotValid = true;") ) );
+    ASSERT_FALSE( slotBody.contains( QStringLiteral("std::move( ownedTask )") ) );
+    ASSERT_TRUE( mw.contains( QStringLiteral("task = m_playbackPrepConflatedSlot;") ) );
+    const int drawReady = mw.indexOf( QStringLiteral("void MainWindow::drawFrameReady()") );
+    ASSERT_TRUE( drawReady > 0 );
+    const QString drawReadyBody = mw.mid( drawReady, mw.indexOf( QStringLiteral("\nvoid MainWindow::"), drawReady + 10 ) - drawReady );
+    ASSERT_TRUE( drawReadyBody.contains( QStringLiteral("playbackPrepUsesConflatedSlot(") ) );
+    ASSERT_TRUE( drawReadyBody.contains( QStringLiteral("enqueuePlaybackPrepTask( task );") ) );
 }
 
 TEST(PlaybackDecodeRenderOverlapWiring, TheRenderThreadReportsEveryStageToTheMeter)

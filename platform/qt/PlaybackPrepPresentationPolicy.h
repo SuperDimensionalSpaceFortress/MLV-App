@@ -26,6 +26,14 @@ inline bool playbackPrepConflatesOlderWork( bool lossless )
     return !lossless;
 }
 
+// PLAYBACK-CPU-PACE-GAP-1 r7 FR1: drop-frame-on work goes through master's single conflated slot (copy in, copy out),
+// exactly the pre-#397 code, so the default path times as it did before. The deque (moved in and out) serves lossless
+// work, and drop-frame-on work only under the MLVAPP_PLAYBACK_PREP_CONFLATED_MOVE bisect opt-in.
+inline bool playbackPrepUsesConflatedSlot( bool lossless, bool conflatedMoveOptIn )
+{
+    return !lossless && !conflatedMoveOptIn;
+}
+
 inline bool playbackPrepCompletedResultShouldPresent( uint64_t taskGeneration,
                                                        uint64_t activeGeneration )
 {

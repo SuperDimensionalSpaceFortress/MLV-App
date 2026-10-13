@@ -2413,6 +2413,8 @@ MainWindow::~MainWindow()
         std::lock_guard<std::mutex> lk( m_playbackPrepMutex );
         m_playbackPrepStop.store( true, std::memory_order_release );
         m_playbackPrepPending.clear();
+        m_playbackPrepConflatedSlotValid = false;
+        m_playbackPrepConflatedSlot = PlaybackPrepTask();
     }
     m_playbackPrepCv.notify_all();
     if( m_playbackPrepThread.joinable() ) m_playbackPrepThread.join();
@@ -2624,6 +2626,7 @@ int MainWindow::playbackPrepBacklog()
 {
     std::lock_guard<std::mutex> lk( m_playbackPrepMutex );
     return static_cast<int>( m_playbackPrepPending.size() + m_playbackPrepResults.size() )
+         + ( m_playbackPrepConflatedSlotValid ? 1 : 0 )
          + ( m_playbackPrepComputing ? 1 : 0 );
 }
 
@@ -3657,10 +3660,63 @@ void MainWindow::queuePlaybackLookaheadRequests(
 // Playback-prep worker queue. drawFrameReady now dispatches work to a background
 // thread, then marshals completion back to the UI thread for final presentation.
 // Conflation is by request serial: only the latest requested serial can present.
+// PLAYBACK-CPU-PACE-GAP-1 r7 FR1: drop-frame-on work (the default) takes this single conflated slot, the cb23f62b
+// master code, so the default path keeps master's timing. The one addition: a deque left non-empty by a mid-play
+// switch from drop-frame off is released and counted exactly as a replaced slot is.
+void MainWindow::enqueuePlaybackPrepTask( const PlaybackPrepTask &task )
+{
+    PlaybackPrepTask ownedTask = task;
+    ownedTask.rebindOwnedImagePointers();
+
+    const uint64_t activeGeneration =
+        m_playbackPresentationGeneration.load( std::memory_order_acquire );
+    if( ownedTask.presentationGeneration != activeGeneration )
+    {
+        m_playbackPrepStaleDropCount.fetch_add( 1, std::memory_order_acq_rel );
+        m_playbackPrepGenerationDropCount.fetch_add( 1, std::memory_order_acq_rel );
+        logInteractionEvent(
+            QStringLiteral("playback_prep.drop_enqueue_generation"),
+            QStringLiteral("serial=%1 task_generation=%2 active_generation=%3 requested_scale=%4 active_scale=%5")
+                .arg( static_cast<qulonglong>( ownedTask.requestSerial ) )
+                .arg( static_cast<qulonglong>( ownedTask.presentationGeneration ) )
+                .arg( static_cast<qulonglong>( activeGeneration ) )
+                .arg( ownedTask.requestContext.playbackScaleFactor )
+                .arg( ownedTask.readyFrame.playbackScaleFactorActive ),
+            true );
+        if( m_pRenderThread )
+            m_pRenderThread->releasePresentedFrameForRequestSerial( ownedTask.requestSerial );
+        return;
+    }
+
+    m_latestRequestedSerial.store( ownedTask.requestSerial, std::memory_order_release );
+    {
+        std::lock_guard<std::mutex> lk( m_playbackPrepMutex );
+        for( const PlaybackPrepTask &replaced : m_playbackPrepPending )
+        {
+            ++m_playbackPrepReplacedBeforeComputeCount;
+            if( m_pRenderThread )
+                m_pRenderThread->releasePresentedFrameForRequestSerial( replaced.requestSerial );
+        }
+        m_playbackPrepPending.clear();
+        if( m_playbackPrepConflatedSlotValid )
+        {
+            ++m_playbackPrepReplacedBeforeComputeCount;
+            if( m_pRenderThread )
+                m_pRenderThread->releasePresentedFrameForRequestSerial(
+                    m_playbackPrepConflatedSlot.requestSerial );
+        }
+        m_playbackPrepConflatedSlot = ownedTask;
+        m_playbackPrepConflatedSlot.rebindOwnedImagePointers();
+        m_playbackPrepConflatedSlotValid = true;
+    }
+    m_playbackPrepCv.notify_one();
+}
+
 // PLAYBACK-CPU-PACE-GAP-1 r5: the task is MOVED into the queue and out of it. Its owned RGB16 copy is a full frame on
 // the CPU preview route; copying it into a freshly allocated deque element cost a cold allocation per frame on the GUI
 // thread (and a free under the prep mutex), where the old single pending slot reused its storage.
-void MainWindow::enqueuePlaybackPrepTask( PlaybackPrepTask ownedTask )
+// r7: this deque path serves lossless (drop-frame off) work, and drop-frame-on work only under the bisect opt-in.
+void MainWindow::enqueuePlaybackPrepTaskLossless( PlaybackPrepTask ownedTask )
 {
     ownedTask.rebindOwnedImagePointers();
 
@@ -3725,6 +3781,13 @@ void MainWindow::invalidatePlaybackPrepForDisplayChange( const char *reason )
             serialsToRelease.push_back( pending.requestSerial );
         }
         m_playbackPrepPending.clear();
+        if( m_playbackPrepConflatedSlotValid )
+        {
+            ++droppedPendingCount;
+            serialsToRelease.push_back( m_playbackPrepConflatedSlot.requestSerial );
+            m_playbackPrepConflatedSlotValid = false;
+            m_playbackPrepConflatedSlot = PlaybackPrepTask();
+        }
         droppedResults = m_playbackPrepResults.size();
         for( const PlaybackPrepResult &result : m_playbackPrepResults )
         {
@@ -4449,12 +4512,23 @@ void MainWindow::playbackPrepThreadLoop( void )
             std::unique_lock<std::mutex> lk( m_playbackPrepMutex );
             m_playbackPrepCv.wait( lk, [this]{
                 return m_playbackPrepStop.load( std::memory_order_acquire )
+                    || m_playbackPrepConflatedSlotValid
                     || !m_playbackPrepPending.empty();
             } );
             if( m_playbackPrepStop.load( std::memory_order_acquire ) ) return;
-            task = std::move( m_playbackPrepPending.front() );
-            task.rebindOwnedImagePointers();
-            m_playbackPrepPending.pop_front();
+            if( m_playbackPrepConflatedSlotValid )
+            {
+                // PLAYBACK-CPU-PACE-GAP-1 r7 FR1: master's copy out of the slot, under the lock.
+                task = m_playbackPrepConflatedSlot;
+                task.rebindOwnedImagePointers();
+                m_playbackPrepConflatedSlotValid = false;
+            }
+            else
+            {
+                task = std::move( m_playbackPrepPending.front() );
+                task.rebindOwnedImagePointers();
+                m_playbackPrepPending.pop_front();
+            }
             m_playbackPrepComputing = true;
         }
 
@@ -32007,7 +32081,10 @@ void MainWindow::drawFrameReady()
     task.rebindOwnedImagePointers();
     notePlaybackPrepOwnershipTelemetry();
 
-    enqueuePlaybackPrepTask( std::move( task ) );
+    if( playbackPrepUsesConflatedSlot( task.losslessPresent, false ) )
+        enqueuePlaybackPrepTask( task );
+    else
+        enqueuePlaybackPrepTaskLossless( std::move( task ) );
     return;
 
 }

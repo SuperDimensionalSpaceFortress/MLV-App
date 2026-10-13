@@ -1575,12 +1575,17 @@ private:
     //   at most one queued task ("pending"). New enqueues replace pending.
     //   With drop-frame off (losslessPresent) pending and results are FIFO
     //   instead, bounded by the drop-off advance hold.
+    //   PLAYBACK-CPU-PACE-GAP-1 r7: drop-frame-on work uses the single slot
+    //   (master's code); the deque serves lossless work and the
+    //   MLVAPP_PLAYBACK_PREP_CONFLATED_MOVE bisect opt-in.
     std::atomic<uint64_t> m_latestRequestedSerial{0};
     std::atomic<uint64_t> m_playbackPresentationGeneration{1};
     std::thread m_playbackPrepThread;
     std::mutex m_playbackPrepMutex;
     std::condition_variable m_playbackPrepCv;
     std::atomic<bool> m_playbackPrepStop{false};
+    PlaybackPrepTask m_playbackPrepConflatedSlot;      // guarded by m_playbackPrepMutex
+    bool m_playbackPrepConflatedSlotValid = false;     // guarded by m_playbackPrepMutex
     std::deque<PlaybackPrepTask> m_playbackPrepPending;
     bool m_playbackPrepComputing = false; // guarded by m_playbackPrepMutex
     std::deque<PlaybackPrepResult> m_playbackPrepResults;
@@ -1700,7 +1705,8 @@ private:
                                            QRect *outGeometry,
                                            QSize *outPreviewSize );
     void onPlaybackSmokeApplicationStateChanged( Qt::ApplicationState state );
-    void enqueuePlaybackPrepTask( PlaybackPrepTask ownedTask );
+    void enqueuePlaybackPrepTask( const PlaybackPrepTask &task );
+    void enqueuePlaybackPrepTaskLossless( PlaybackPrepTask ownedTask );
     void invalidatePlaybackPrepForDisplayChange( const char *reason );
     void waitForRenderThreadIdleBeforeCoreMutation( const char *reason );
     struct PlaybackPrepThreadState;
