@@ -79,6 +79,16 @@ LOCAL_ONLY_OR_UNCOLLECTED: dict[str, str] = {
         "UNCOLLECTED at acc811f8, follow-up CI-COLLECT-COORDINATION-TOOLS: tests.yml names only "
         "tools/coordination/test_coordination_guardrails.py and test_demote_factory_bridge.py"
     ),
+    "tools/coordination/test_check_lane_model_currency.py": (
+        "UNCOLLECTED at e1fd3bb4 (MODEL-POSTURE-R16-1), same gap as test_resolve_codex_tier.py, "
+        "follow-up CI-COLLECT-COORDINATION-TOOLS: tests.yml names only "
+        "tools/coordination/test_coordination_guardrails.py and test_demote_factory_bridge.py"
+    ),
+    "tools/coordination/test_select_review_key_b.py": (
+        "UNCOLLECTED at e1fd3bb4 (MODEL-POSTURE-R16-1), same gap as test_resolve_codex_tier.py, "
+        "follow-up CI-COLLECT-COORDINATION-TOOLS: tests.yml names only "
+        "tools/coordination/test_coordination_guardrails.py and test_demote_factory_bridge.py"
+    ),
     "tools/profiling/test_frame_colour_spatial_metrics.py": (
         "UNCOLLECTED at acc811f8, follow-up CI-COLLECT-PROFILING-NUMPY-PILLOW: factory-bridge.yml "
         "passes it to --ignore because numpy and Pillow are pinned in no hash-locked requirements file"

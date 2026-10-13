@@ -293,7 +293,8 @@ Which mode a read-only codex key lane really runs is decided in
 (`pinState=PINNED`) it is the pin's mode, `windowsSandbox` in
 `tools/coordination/codex-pin.json` (`elevated` for 0.160.1); the
 **unelevated** mode (PR #329) is only the fallback for a lane that is not
-pinned. That is the REQUESTED mode; a codex build that ignores the key
+pinned (including `PIN_MODEL_UNPROBED`: the pin's `probedModels` do not list
+the lane's resolved model, so the global CLI runs it). That is the REQUESTED mode; a codex build that ignores the key
 leaves `authority.windowsSandbox` reading
 `requested-<mode>-ignored-by-codex` instead (see the tamper paragraph
 above), and that lane ran codex's default sandbox, which is neither column of

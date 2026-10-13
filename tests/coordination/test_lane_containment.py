@@ -306,10 +306,23 @@ def prepare(tree, mode, assignment_failure=False, editing=False, allowed_tools="
 # the_cache_is_unavailable and test_codex_lane_resolves_tier_to_the_highest_version_slug_in_the_
 # cache, both of which already do this).
 DEFAULT_CODEX_MODELS_CACHE_SLUGS = ("gpt-6-sol", "gpt-6-luna", "gpt-6-astra")
+CODEX_MODELS_CACHE_CLIENT_VERSION = "0.0.1-fixture-cache-writer"
 
 
-def write_codex_models_cache(path, slugs=DEFAULT_CODEX_MODELS_CACHE_SLUGS):
-    path.write_text(json.dumps({"models": [{"slug": slug} for slug in slugs]}), encoding="utf-8")
+def codex_models_cache_text(slugs=DEFAULT_CODEX_MODELS_CACHE_SLUGS, fetched_at=None):
+    # MODEL-POSTURE-R16-1: resolve-codex-tier.py only accepts a FRESH catalogue (fetched_at within
+    # 7 days) and only models whose visibility is 'list' with a 'high' reasoning level, so the
+    # fixture carries exactly those fields, stamped now.
+    import datetime
+    stamp = fetched_at or (datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "000Z")
+    models = [{"slug": slug, "visibility": "list",
+               "supported_reasoning_levels": [{"effort": "low"}, {"effort": "medium"}, {"effort": "high"}]}
+              for slug in slugs]
+    return json.dumps({"fetched_at": stamp, "client_version": CODEX_MODELS_CACHE_CLIENT_VERSION, "models": models})
+
+
+def write_codex_models_cache(path, slugs=DEFAULT_CODEX_MODELS_CACHE_SLUGS, fetched_at=None):
+    path.write_text(codex_models_cache_text(slugs, fetched_at), encoding="utf-8")
 
 
 def settings_path_for(receipt):
@@ -516,7 +529,7 @@ def test_codex_lane_resolves_tier_to_the_highest_version_slug_in_the_cache(fixtu
     # this hermetic: it proves the launch resolves the tier to the CACHE's highest version, not
     # that it merely passes the tier name straight through to `-m`.
     cache=fixture_tree["root"]/"models_cache.json"
-    cache.write_text(json.dumps({"models":[{"slug":"gpt-5.6-sol"},{"slug":"gpt-6-sol"},{"slug":"gpt-6-solar"}]}),encoding="utf-8")
+    cache.write_text(codex_models_cache_text(("gpt-5.6-sol","gpt-6-sol","gpt-6-solar")),encoding="utf-8")
     cmd,env,receipt=prepare(fixture_tree,"normal",lane="sol")
     env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
     r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
@@ -527,6 +540,10 @@ def test_codex_lane_resolves_tier_to_the_highest_version_slug_in_the_cache(fixtu
     assert q["requestedModel"]=="sol"
     assert q["resolvedModel"]=="gpt-6-sol"
     assert q["pinnedByOverride"] is False
+    # MODEL-POSTURE-R16-1: the receipt records the catalogue's own fetched_at beside the model.
+    assert json.loads(cache.read_text(encoding="utf-8"))["fetched_at"]==q["codexModelsFetchedAt"]
+    # ...and the version of the CLI that wrote that shared cache (it can differ from codexExe.version).
+    assert q["codexModelsClientVersion"]==CODEX_MODELS_CACHE_CLIENT_VERSION
 
 
 def test_model_override_bypasses_tier_resolution_and_is_recorded(fixture_tree):
@@ -1620,7 +1637,10 @@ def _pin_case(fixture_tree, pin=None, exe_version=PIN_VERSION, create_exe=True, 
                           'echo pinned> "%MLV_FIXTURE_VIA%"\r\n'
                           f'"{PWSH}" -NoProfile -NonInteractive -File "{fixture_tree["child"]}" %*\r\n', encoding="ascii")
     if pin is None:
-        pin = {"schema": "mlv-app/codex-pin/v1", "version": PIN_VERSION, "windowsSandbox": "elevated"}
+        # probedModels: the fixture cache's highest sol (gpt-6-sol) is what a sol lane resolves to
+        # (MODEL-POSTURE-R16-1: a pin only covers the models its promotion exec-probed).
+        pin = {"schema": "mlv-app/codex-pin/v1", "version": PIN_VERSION, "windowsSandbox": "elevated",
+               "probedModels": ["gpt-6-sol"]}
     mutations = []
     if real_is_shim: mutations.append(_real_codex_is_shim(fixture_tree))
     if editing: mutations.append(_bypass_codex_never_edits)
@@ -1691,6 +1711,64 @@ def test_codex_pin_unusable_falls_back_to_the_global_codex_with_the_named_reason
     assert len(lines) == 1 and state in lines[0], r.stdout
 
 
+@pytest.mark.parametrize("case,pin,override", [
+    # resolved model (gpt-6-sol) was never probed: the pin probed only luna
+    ("other-slug-probed", {"version": PIN_VERSION, "windowsSandbox": "elevated", "probedModels": ["gpt-6-luna"]}, None),
+    # a pin promoted before probedModels existed probed nothing recorded
+    ("no-probed-list", {"version": PIN_VERSION, "windowsSandbox": "elevated"}, None),
+    ("empty-probed-list", {"version": PIN_VERSION, "windowsSandbox": "elevated", "probedModels": []}, None),
+    # slugs match whole and case-exactly: a near name is not a probed model
+    ("near-slug-probed", {"version": PIN_VERSION, "windowsSandbox": "elevated", "probedModels": ["gpt-6-sol-mini", "GPT-6-SOL"]}, None),
+    # an explicit -ModelOverride is checked against the probed slugs the same way
+    ("override-unprobed", {"version": PIN_VERSION, "windowsSandbox": "elevated", "probedModels": ["gpt-6-sol"]}, "gpt-7-sol-experimental"),
+])
+def test_codex_pin_runs_the_global_cli_when_the_resolved_model_was_never_probed(fixture_tree, case, pin, override):
+    # MODEL-POSTURE-R16-1: a newer catalogue model may be one the pinned CLI silently cannot run, so a
+    # pinned read-only lane whose model is not among the pin's probed slugs runs on the global CLI
+    # with the typed state PIN_MODEL_UNPROBED and exactly one log line.
+    cmd, env, receipt, pinned = _pin_case(fixture_tree, pin=pin)
+    if override:
+        cmd += ["-ModelOverride", override]
+    env["MLV_FIXTURE_CODEX_VERSION"] = "1.2.3"
+    r, q = _run_pin_case(cmd, env, receipt)
+    assert r.returncode == 0, (r.stdout, r.stderr)
+    assert not (fixture_tree["root"] / "via.txt").exists(), "the pinned exe must not run an unprobed model"
+    stamp = q["codexExe"]
+    assert stamp["pinState"] == "PIN_MODEL_UNPROBED", stamp
+    assert stamp["path"] == str(fixture_tree["shim"]) and stamp["version"] == "1.2.3", stamp
+    assert stamp["pinVersion"] == PIN_VERSION and stamp["pinWindowsSandbox"] is None
+    assert stamp["probedModels"] == pin.get("probedModels", [])
+    assert override or q["resolvedModel"] == "gpt-6-sol"
+    assert q["authority"]["windowsSandbox"] == "unelevated", "a fallback keeps #329's unelevated sandbox"
+    assert q["authority"]["mcpServers"] == "disabled", "the MCP probe still runs, on the global exe"
+    lines = [l for l in r.stdout.splitlines() if "[codex-pin]" in l]
+    assert len(lines) == 1 and "PIN_MODEL_UNPROBED" in lines[0], r.stdout
+
+
+def test_codex_pin_keeps_the_pinned_exe_for_a_probed_model_among_several(fixture_tree):
+    pin = {"version": PIN_VERSION, "windowsSandbox": "elevated", "probedModels": ["gpt-6-luna", "gpt-6-sol", "gpt-6-astra"]}
+    cmd, env, receipt, pinned = _pin_case(fixture_tree, pin=pin)
+    r, q = _run_pin_case(cmd, env, receipt)
+    assert r.returncode == 0, (r.stdout, r.stderr)
+    assert (fixture_tree["root"] / "via.txt").exists()
+    assert q["codexExe"]["pinState"] == "PINNED" and q["codexExe"]["probedModels"] == pin["probedModels"]
+
+
+def test_codex_tier_resolution_refuses_a_stale_models_cache(fixture_tree):
+    # MODEL-POSTURE-R16-1: a catalogue fetched more than 7 days ago would silently name a
+    # superseded model, so resolution fails closed with the typed cache-stale reason in the receipt.
+    cache = fixture_tree["root"] / "stale-models-cache.json"
+    write_codex_models_cache(cache, fetched_at="2020-01-01T00:00:00.000000000Z")
+    cmd, env, receipt = prepare(fixture_tree, "normal", lane="sol")
+    env = dict(env); env["MLV_CODEX_MODELS_CACHE"] = str(cache)
+    r = subprocess.run(cmd, env=env, text=True, capture_output=True, timeout=20)
+    assert r.returncode != 0, (r.stdout, r.stderr)
+    q = json.loads(receipt.read_text(encoding="utf-8"))
+    assert q["state"] == "failed" and "codex-tier-resolution-failed" in (q["failure"] or "")
+    assert "cache-stale:" in q["failure"], q["failure"]
+    assert q["resolvedModel"] == "unknown" and q["codexModelsFetchedAt"] is None
+
+
 def test_codex_pin_keeps_the_high_effort_refusal_for_the_pinned_exe(fixture_tree):
     # The pinned exe IS a real CLI: $REAL_CODEX_EXE follows it, so a non-high effort is refused
     # exactly as for the global codex, before the ledger row or any provider process.
@@ -1738,6 +1816,9 @@ def test_codex_pin_rule_is_shared_by_the_promoter_and_the_tracked_pin_is_well_fo
         pin = json.loads(pin_path.read_text(encoding="utf-8"))
         assert re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?", pin["version"]), pin
         assert pin["windowsSandbox"] in ("elevated", "unelevated"), pin
+        # MODEL-POSTURE-R16-1: the models the pin proved, as plain slugs, one per probed tier.
+        probed = pin.get("probedModels", [])
+        assert isinstance(probed, list) and all(isinstance(m, str) and m for m in probed), pin
 
 
 # PR #339 r2: Promote-CodexPin.ps1 against a fake private codex (no npm, no tokens). The fake
@@ -1772,13 +1853,17 @@ if($a[0] -eq 'mcp'){[Console]::Out.Write('[]'); exit 0}
 if($a[0] -eq 'exec'){
   $nonce=[regex]::Match([Console]::In.ReadToEnd(),'PINPROBE[0-9a-f]+').Value
   Set-Content -LiteralPath $a[[array]::IndexOf($a,'-o')+1] -Value $nonce
+  if($env:MLV_FAKE_CODEX_BLIND_MODEL -and $a[[array]::IndexOf($a,'-m')+1] -ceq $env:MLV_FAKE_CODEX_BLIND_MODEL){
+    # a pinned CLI that cannot run this model: the exec is rejected, no shell command ever succeeds
+    [Console]::Error.WriteLine('Failed to create unified exec process'); exit 0
+  }
   [Console]::Error.WriteLine('exec'); [Console]::Error.WriteLine(' succeeded in 5ms:'); [Console]::Out.Write("$nonce`n"); exit 0
 }
 exit 99
 '''
 
 
-def _promote(tmp_path, write_mode, extra_env=None, probe_timeout=60, timeout=120):
+def _promote(tmp_path, write_mode, extra_env=None, probe_timeout=60, timeout=120, model="fake-model", extra_args=()):
     pin_root = tmp_path / "pin-root"; bin_dir = pin_root / PIN_VERSION / "node_modules" / ".bin"
     bin_dir.mkdir(parents=True)
     fake = tmp_path / "fake-codex.ps1"; fake.write_text(FAKE_CODEX_PS1, encoding="ascii")
@@ -1794,7 +1879,10 @@ def _promote(tmp_path, write_mode, extra_env=None, probe_timeout=60, timeout=120
                MLV_FAKE_CODEX_ORPHAN_PID=str(tmp_path / "orphan.pid"))
     cmd = [PWSH, "-NoProfile", "-NonInteractive", "-File", str(PROMOTER), "-Version", PIN_VERSION,
            "-PinRoot", str(pin_root), "-PinFile", str(pin_file), "-WorkDir", str(work), "-EvidenceDir", str(ev),
-           "-WindowsSandbox", "elevated", "-Model", "fake-model", "-ProbeTimeoutSec", str(probe_timeout)]
+           "-WindowsSandbox", "elevated", "-ProbeTimeoutSec", str(probe_timeout)]
+    if model:
+        cmd += ["-Model", model]
+    cmd += list(extra_args)
     # Files, not pipes: an orphan that inherited the promoter's handles must not hold the test's own
     # capture open (only the promoter's exit is under test).
     out = tmp_path / "promote.out.txt"; orphan = tmp_path / "orphan.pid"
@@ -1860,6 +1948,74 @@ def test_codex_pin_promoter_genuine_denial_with_control_promotes(tmp_path):
     written = json.loads(pin.read_text(encoding="utf-8"))
     assert written["windowsSandbox"] == "elevated" and written["version"] == PIN_VERSION
     assert "Permission denied" in written["gate"]["writeProbe"] and "control" in written["gate"]["writeProbe"]
+    # MODEL-POSTURE-R16-1: the pin records the model(s) its exec probe proved.
+    assert written["probedModels"] == ["fake-model"], written
+    assert step["exec-probe:fake-model"]["execClass"] == "EXEC_OK"
+    assert "model=fake-model" in written["gate"]["execProbe"]
+
+
+def _models_cache_for_promoter(tmp_path, slugs):
+    cache = tmp_path / "promoter-models-cache.json"
+    write_codex_models_cache(cache, slugs)
+    return cache
+
+
+def test_codex_pin_promoter_probes_every_lane_tier_and_records_each_model(tmp_path):
+    # MODEL-POSTURE-R16-1: with no -Model, the promoter resolves sol, luna and astra exactly as a lane
+    # does (newest listed model per tier, here sol -> gpt-6.1-sol) and exec-probes each one.
+    cache = _models_cache_for_promoter(tmp_path, ("gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna", "gpt-6-astra", "gpt-5.6-luna"))
+    code, log, ev, step, pin, _ = _promote(tmp_path, "deny", model=None, extra_args=["-ModelsCache", str(cache)])
+    assert code == 0, log
+    written = json.loads(pin.read_text(encoding="utf-8"))
+    assert written["probedModels"] == ["gpt-6.1-sol", "gpt-6-luna", "gpt-6-astra"], written
+    assert written["probedTiers"] == {"gpt-6.1-sol": ["sol"], "gpt-6-luna": ["luna"], "gpt-6-astra": ["astra"]}, written
+    assert written["modelsFetchedAt"] == json.loads(cache.read_text(encoding="utf-8"))["fetched_at"]
+    for m in written["probedModels"]:
+        assert step["exec-probe:" + m]["execClass"] == "EXEC_OK", m
+    assert not any(n.startswith("exec-probe:") and n.split(":", 1)[1] not in written["probedModels"] for n in step)
+    for m in written["probedModels"]:
+        assert "model=" + m in written["gate"]["execProbe"], written["gate"]
+
+
+def test_codex_pin_promoter_probes_one_model_once_when_two_tiers_resolve_to_it(tmp_path):
+    cache = _models_cache_for_promoter(tmp_path, ("gpt-6-sol", "gpt-6-luna"))
+    code, log, ev, step, pin, _ = _promote(tmp_path, "deny", model=None,
+                                           extra_args=["-ModelsCache", str(cache), "-Tiers", "sol,sol,luna"])
+    assert code == 0, log
+    written = json.loads(pin.read_text(encoding="utf-8"))
+    assert written["probedModels"] == ["gpt-6-sol", "gpt-6-luna"], written
+    assert len([n for n in step if n.startswith("exec-probe:")]) == 2
+
+
+def test_codex_pin_promoter_refuses_the_whole_pin_when_one_tier_model_cannot_exec(tmp_path):
+    # The pinned CLI runs luna but silently cannot run the newer sol: promotion stops at exit 14
+    # naming the model, and NO pin is written -- a partial pin must never claim the other tiers.
+    cache = _models_cache_for_promoter(tmp_path, ("gpt-6.1-sol", "gpt-6-luna", "gpt-6-astra"))
+    code, log, ev, step, pin, _ = _promote(tmp_path, "deny", {"MLV_FAKE_CODEX_BLIND_MODEL": "gpt-6.1-sol"}, model=None,
+                                           extra_args=["-ModelsCache", str(cache)])
+    assert code == 14, log
+    assert step["exec-probe:gpt-6.1-sol"]["outcome"] == "FAILED: EXEC_BLIND", step["exec-probe:gpt-6.1-sol"]
+    assert "gpt-6.1-sol" in ev["result"] and "no pin written" in ev["result"], ev["result"]
+    assert "exec-probe:gpt-6-luna" not in step, "promotion stops at the first model that cannot exec"
+    assert not pin.exists()
+
+
+def test_codex_pin_promoter_refuses_when_a_tier_does_not_resolve(tmp_path):
+    cache = _models_cache_for_promoter(tmp_path, ("gpt-6-sol", "gpt-6-luna"))   # no astra at all
+    code, log, ev, step, pin, _ = _promote(tmp_path, "deny", model=None, extra_args=["-ModelsCache", str(cache)])
+    assert code == 18, log
+    assert step["model-astra"]["outcome"] == "FAILED: no-tier-match:astra", step["model-astra"]
+    assert not any(n.startswith("exec-probe:") for n in step), "no token is spent before every tier resolves"
+    assert not pin.exists()
+
+
+def test_codex_pin_promoter_refuses_when_the_models_cache_is_stale(tmp_path):
+    cache = tmp_path / "promoter-models-cache.json"
+    write_codex_models_cache(cache, ("gpt-6-sol", "gpt-6-luna", "gpt-6-astra"), fetched_at="2020-01-01T00:00:00.000000000Z")
+    code, log, ev, step, pin, _ = _promote(tmp_path, "deny", model=None, extra_args=["-ModelsCache", str(cache)])
+    assert code == 18, log
+    assert step["model-sol"]["outcome"].startswith("FAILED: cache-stale:"), step["model-sol"]
+    assert not pin.exists()
 
 
 def test_codex_pin_promoter_child_holding_the_pipes_after_timeout_fails_within_budget(tmp_path):
