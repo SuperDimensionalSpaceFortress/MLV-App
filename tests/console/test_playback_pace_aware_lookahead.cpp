@@ -372,6 +372,9 @@ TEST(PlaybackPaceAwareLookaheadWiring, ThePredictorRunsOnlyAfterTheDepthZeroRetu
     {
         ASSERT_TRUE( mw.contains( QString::fromLatin1( field ) ) );
     }
+    // r2b venue ruling: the prediction stays on by default, the yield is opt-in
+    ASSERT_TRUE( mw.contains( QStringLiteral("mlvappEnvSwitchOn( \"MLVAPP_CPU_LOOKAHEAD_PREDICT\" )") ) );
+    ASSERT_TRUE( mw.contains( QStringLiteral("mlvappEnvSwitchOptIn( \"MLVAPP_CPU_LOOKAHEAD_YIELD\" )") ) );
 }
 
 TEST(PlaybackPaceAwareLookaheadWiring, EveryYieldBranchIsBehindTheWindowFlagThatOnlyThePruneSets)

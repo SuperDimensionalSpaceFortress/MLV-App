@@ -42,8 +42,8 @@ struct LookaheadPlan
 
 /*! The CPU route only: the texture route keeps N+1..N+depth and FIFO. Drop-frame off keeps N+1 because every frame
  *  is presented there (PLAYBACK-CPU-PACE-GAP-1 D1, the lossless path). Depth 0 engages nothing, so it never reaches
- *  the predictor or a yield branch. \a predictEnabled / \a yieldEnabled are MLVAPP_CPU_LOOKAHEAD_PREDICT and
- *  MLVAPP_CPU_LOOKAHEAD_YIELD (unset = on, 0 = off). */
+ *  the predictor or a yield branch. \a predictEnabled is MLVAPP_CPU_LOOKAHEAD_PREDICT (unset = on, 0 = off);
+ *  \a yieldEnabled is MLVAPP_CPU_LOOKAHEAD_YIELD, opt-in (unset or 0 = off). */
 inline LookaheadPlan cpuLookaheadPlan( int depth, bool textureRoute, bool dropFrame,
                                        bool predictEnabled, bool yieldEnabled )
 {
