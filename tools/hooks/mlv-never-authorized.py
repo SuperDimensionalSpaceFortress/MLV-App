@@ -3442,6 +3442,18 @@ OWNER_CONSENTED_FOOTAGE = types.MappingProxyType(
                         "5cea2134ff623b9710a2897debc0147229bb559c18a277f38d168bbea42bcb99",
                     ),
                 ),
+                "M16-1457": (
+                    (
+                        2431795200,
+                        "a3ed9b15d1036c89ac0de91fec95f12a9042ba785dd0067cf79d27a326d76203",
+                        "e782e62a1dfe06c1c6b40b7f3bdc76df9384d5809e0616e0303d35b51c0094d4",
+                    ),
+                    (
+                        1724845568,
+                        "9204497ebc2eb366095390fc1fa7077737c6bcaa09c3f968f2272fc564570728",
+                        "0b3d27610790cc211a2953014d7d5b8fc0c356bdde6e13f2ae4be4f686ad468d",
+                    ),
+                ),
             }
         ),
         "purposes": ("#72b delta-baseline gate", "PLAYBACK-ATTR-3-CUDA"),
@@ -3463,6 +3475,22 @@ OWNER_CONSENTED_FOOTAGE = types.MappingProxyType(
                             "1dbbe30eeedac971861110a3dc47822ea33f2de26d8ea51164c15a497196f5d0"
                         ),
                         "recordedUtc": "2026-09-28T16:13:33Z",
+                    }
+                ),
+                "M16-1457": types.MappingProxyType(
+                    {
+                        "card": "FOOTAGE-ADMIT-HFR-2",
+                        "purposes": (
+                            "PLAYBACK-HFR-CONFORM-DEFAULT-1",
+                            "CUDA playback measurement",
+                        ),
+                        "consent_kind": "blanket",
+                        "consent_record": "tools/profiling/dual-venue/venue-clip-consent.json"
+                        " blanketRecords[0]",
+                        "consent_owner_sentence_sha256": (
+                            "48dc8dead951aa2eab911db63591b59d238830d2d98c0fd7df346c42b78f9fd6"
+                        ),
+                        "recordedUtc": "2026-10-11T03:41:42Z",
                     }
                 ),
             }

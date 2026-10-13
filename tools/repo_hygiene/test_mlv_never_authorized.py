@@ -7655,8 +7655,13 @@ CONSENTED_IDS_PINNED = (
     # FOOTAGE-ADMIT-HFR-1 (2026-09-28): a later, separately consented admission; its citation
     # lives in the table's "admissions" mapping, not in the original "authority".
     "M16-1456",
+    # FOOTAGE-ADMIT-HFR-2 (2026-10-11): admitted under the owner's BLANKET consent sentence
+    # (venue-clip-consent.json blanketRecords[0]); no per-clip receipt file exists for it.
+    "M16-1457",
 )
-# Later admissions, pinned: id -> (card, purposes, consent receipt sha256, recordedUtc).
+# Later admissions, pinned: id -> (card, purposes, consent sha256, recordedUtc).  The consent
+# sha256 is the receipt file's sha256 for a receipt admission, and the owner sentence's sha256
+# for a blanket admission (consent_kind == "blanket").
 CONSENT_ADMISSIONS_PINNED = {
     "M16-1456": (
         "FOOTAGE-ADMIT-HFR-1",
@@ -7664,7 +7669,17 @@ CONSENT_ADMISSIONS_PINNED = {
         "1dbbe30eeedac971861110a3dc47822ea33f2de26d8ea51164c15a497196f5d0",
         "2026-09-28T16:13:33Z",
     ),
+    "M16-1457": (
+        "FOOTAGE-ADMIT-HFR-2",
+        ("PLAYBACK-HFR-CONFORM-DEFAULT-1", "CUDA playback measurement"),
+        "48dc8dead951aa2eab911db63591b59d238830d2d98c0fd7df346c42b78f9fd6",
+        "2026-10-11T03:41:42Z",
+    ),
 }
+VENUE_CLIP_CONSENT_DOC = os.path.join(
+    REPO_ROOT, "tools", "profiling", "dual-venue", "venue-clip-consent.json"
+)
+BLANKET_CONSENT_RECORD = "tools/profiling/dual-venue/venue-clip-consent.json blanketRecords[0]"
 # sha256 of the raw JSONL line bytes EXCLUDING the line terminator.
 OWNER_CONSENT_LINE = 1739
 OWNER_CONSENT_LINE_SHA256 = "461af7a5291099e009230a8abcfe547e064435287a23f40cf93e5ba4ddb0a066"
@@ -7681,7 +7696,9 @@ REGISTER_DOC = os.path.join(REPO_ROOT, "docs", "never-authorized.json")
 # in-place hash swap or an appended part row changes the digest; the latter also a count.
 # FOOTAGE-ADMIT-HFR-1 re-pinned this digest (was 38a4e60b...c860a) when M16-1456 and the
 # "admissions" citation were added; every earlier entry is byte-identical.
-OWNER_CONSENT_TABLE_SHA256 = "60578c52c682a88d0cef9159b378b0ccd235f5bcf9c71f87ada7475f58a8b4f8"
+# FOOTAGE-ADMIT-HFR-2 re-pinned it again (was 60578c52...8b4f8) for M16-1457's two part rows and
+# its blanket-consent admission; every earlier entry is byte-identical.
+OWNER_CONSENT_TABLE_SHA256 = "ff9c97a11342a63824488ea160983fc23f211f1dea811f380a753184cd572013"
 OWNER_CONSENT_PART_COUNTS = {
     "M16-1243": 2,
     "M16-1327": 2,
@@ -7690,7 +7707,38 @@ OWNER_CONSENT_PART_COUNTS = {
     "M15-1320": 2,
     "M16-1210": 2,
     "M16-1456": 1,
+    "M16-1457": 2,
 }
+
+
+def _admission_consent_is_valid(entry, pinned_sha, consent_doc):
+    """True iff an admissions entry's consent citation holds.
+
+    Blanket admissions (consent_kind == "blanket") carry no receipt: the cited owner sentence's
+    sha256 must equal the pinned value, the committed record's ownerSentenceSha256, and the
+    sha256 of that record's ownerSentence as UTF-8.  Every other admission keeps the receipt
+    rule unchanged: the receipt sha256 is pinned and the path names an owner-footage-consent
+    receipt.
+    """
+    if entry.get("consent_kind") == "blanket":
+        if "consent_receipt" in entry or "consent_receipt_sha256" in entry:
+            return False
+        if entry.get("consent_record") != BLANKET_CONSENT_RECORD:
+            return False
+        sentence_sha = entry.get("consent_owner_sentence_sha256")
+        records = consent_doc.get("blanketRecords") or []
+        if not records:
+            return False
+        record = records[0]
+        return (
+            sentence_sha == pinned_sha
+            and sentence_sha == record.get("ownerSentenceSha256")
+            and sentence_sha
+            == hashlib.sha256(record.get("ownerSentence", "").encode("utf-8")).hexdigest()
+        )
+    return entry.get("consent_receipt_sha256") == pinned_sha and (
+        r"\receipts\owner-footage-consent-" in entry.get("consent_receipt", "")
+    )
 
 
 def _plain_consent_value(value):
@@ -8549,7 +8597,8 @@ class OwnerConsentedFootageTests(unittest.TestCase):
 
     def test_the_frozen_consent_table_is_exactly_the_six_consented_ids(self):
         table = self.module.OWNER_CONSENTED_FOOTAGE
-        self.assertEqual(len(table["clips"]), 7)  # the six plus FOOTAGE-ADMIT-HFR-1's M16-1456
+        # the six plus FOOTAGE-ADMIT-HFR-1's M16-1456 and FOOTAGE-ADMIT-HFR-2's M16-1457
+        self.assertEqual(len(table["clips"]), 8)
         self.assertEqual(sorted(table["clips"]), sorted(CONSENTED_IDS_PINNED))
         self.assertNotIn("M02-1344", table["clips"])
         path_hashes = []
@@ -8599,17 +8648,43 @@ class OwnerConsentedFootageTests(unittest.TestCase):
             sorted(set(table["clips"]) - set(admissions)),
             sorted(set(CONSENTED_IDS_PINNED) - set(CONSENT_ADMISSIONS_PINNED)),
         )
-        for clip_id, (card, purposes, receipt_sha, recorded) in CONSENT_ADMISSIONS_PINNED.items():
+        with open(VENUE_CLIP_CONSENT_DOC, "r", encoding="utf-8") as handle:
+            consent_doc = json.load(handle)
+        for clip_id, (card, purposes, consent_sha, recorded) in CONSENT_ADMISSIONS_PINNED.items():
             with self.subTest(clip_id=clip_id):
                 self.assertIn(clip_id, table["clips"])
                 entry = admissions[clip_id]
                 self.assertEqual(entry["card"], card)
                 self.assertEqual(tuple(entry["purposes"]), purposes)
-                self.assertEqual(entry["consent_receipt_sha256"], receipt_sha)
                 self.assertEqual(entry["recordedUtc"], recorded)
-                self.assertIn(r"\receipts\owner-footage-consent-", entry["consent_receipt"])
+                self.assertTrue(
+                    _admission_consent_is_valid(entry, consent_sha, consent_doc),
+                    "%s: consent citation does not hold" % clip_id,
+                )
+        # FOOTAGE-ADMIT-HFR-2's admission is the blanket kind, with no receipt key.
+        self.assertEqual(admissions["M16-1457"]["consent_kind"], "blanket")
+        self.assertNotIn("consent_receipt", admissions["M16-1457"])
+        self.assertNotIn("consent_kind", admissions["M16-1456"])
         with self.assertRaises(TypeError):
             admissions["M02-1344"] = {}  # frozen: a mapping proxy refuses assignment
+
+    def test_a_blanket_admission_with_a_wrong_sentence_hash_is_refused(self):
+        # FOOTAGE-ADMIT-HFR-2 negative: the blanket branch must discriminate, not pass anything
+        # that says "blanket".
+        with open(VENUE_CLIP_CONSENT_DOC, "r", encoding="utf-8") as handle:
+            consent_doc = json.load(handle)
+        good = dict(self.module.OWNER_CONSENTED_FOOTAGE["admissions"]["M16-1457"])
+        pinned = CONSENT_ADMISSIONS_PINNED["M16-1457"][2]
+        self.assertTrue(_admission_consent_is_valid(good, pinned, consent_doc))
+        wrong = "0" * 64
+        bad = dict(good, consent_owner_sentence_sha256=wrong)
+        self.assertFalse(_admission_consent_is_valid(bad, pinned, consent_doc))
+        self.assertFalse(_admission_consent_is_valid(bad, wrong, consent_doc))
+        tampered_doc = json.loads(json.dumps(consent_doc))
+        tampered_doc["blanketRecords"][0]["ownerSentence"] += " (edited)"
+        self.assertFalse(_admission_consent_is_valid(good, pinned, tampered_doc))
+        with_receipt = dict(good, consent_receipt="x")
+        self.assertFalse(_admission_consent_is_valid(with_receipt, pinned, consent_doc))
 
     def test_the_frozen_consent_table_matches_the_register_text(self):
         with open(REGISTER_DOC, "r", encoding="utf-8") as handle:
