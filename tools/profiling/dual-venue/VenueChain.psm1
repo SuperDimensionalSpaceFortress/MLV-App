@@ -7,6 +7,21 @@
 # (unreadable). A stale claim may be broken. Breaking and releasing both open the file exclusively, re-read it and delete it only when it still holds
 # the bytes that were judged (release: the owner's nonce), so a breaker can never delete a claim that another chain took a moment earlier.
 #
+# TICKET QUEUE (VENUE-CLAIM-FIFO-1). The claim alone is a polling race: every waiter retries CreateNew on its own 30 s phase, so the waiter whose poll lands
+# first after a release wins, and a chain that releases and re-asks within seconds beats every sleeping waiter (q02 of PLAYBACK-CPU-PACE-GAP-1 r5 lost 5
+# handoffs in a row, 60 min). A ticket-aware waiter therefore takes a TICKET first: one file, <ClaimDir>\<venue>.tickets\<utc ticks, 19 digits>-p<pid>-<start
+# ticks>.ticket.json, taken by CreateNew (so names sort in arrival order and two takers can never share one; a clash moves to the next tick, so the 19 digits are
+# the arrival tick plus that bump). Equal ticks order by owner pid, then by owner start ticks, never by directory enumeration. Only the OLDEST LIVE ticket may try the
+# claim (Request-VenueClaim -UseTicket); every other ticket holder gets state QUEUED. A ticket is STALE when its owner pid is dead (dead-pid), was reused
+# (pid-reused), has not refreshed its heartbeat for staleAfterSec (heartbeat; default 3 x ClaimPollSec, widened by the owner to the probe's real upper bound
+# while it sits in a quiet probe, Get-VenueTicketProbeStaleSec; a dead or reused pid is still stale at once),
+# or has been unparseable for more than a writer needs (unreadable); the next waiter removes it (Request-VenueClaim reports it in .staleTickets) and the line
+# moves up. A chain that releases its claim on GATE_BUSY keeps its ticket (it does not go to the back of the line) for a bounded number of cycles
+# (Invoke-VenueChain.ps1 -TicketKeepMax); Remove-VenueTicket ends it.
+# BACK-COMPAT: the claim file, its name and its CreateNew semantics are unchanged, and Request-VenueClaim called WITHOUT -UseTicket / -Ticket is the old
+# one-shot attempt. Ticketing orders ONLY ticket holders: a legacy (ticketless) chain still takes any free claim (it can win a race against the line), and a
+# ticket holder never waits on a legacy waiter (nothing ticketless is ever in the line), so the two kinds cannot deadlock; they only share the claim.
+#
 # A claim is held ONLY around a leg: a chain that is waiting for quiet holds nothing, and nothing but a LIVE claim blocks another chain (no process
 # scan, no lane-prompt scan: the 2026-10-09 mutual wait came from two waiters each treating the other's WAITING as venue use). Hand-written chains
 # adopt it the same way:
@@ -141,14 +156,9 @@ function Remove-VenueClaimIfUnchanged {
     'BUSY'
 }
 
-function Request-VenueClaim {
-    <#
-    .SYNOPSIS
-    Try ONCE to take the venue's claim (it never waits; the caller decides whether to poll). Stale claims found on the way are broken (each once).
-    .OUTPUTS
-    [pscustomobject]@{ granted; state (TAKEN | LIVE | BUSY); claim (ours when granted, the holder's when LIVE); path; broken (one {reason; claim} per stale claim broken) }
-    #>
-    param([Parameter(Mandatory)][string]$Venue, [Parameter(Mandatory)][string]$RunDir, [string]$Purpose = '', [ValidateRange(60, 86400)][int]$TtlSec = 10800,
+function Invoke-VenueClaimAttempt {
+    # The one-shot, ticketless attempt: the pre-VENUE-CLAIM-FIFO-1 Request-VenueClaim, unchanged.
+    param([Parameter(Mandatory)][string]$Venue, [Parameter(Mandatory)][string]$RunDir, [string]$Purpose = '', [int]$TtlSec = 10800,
         [string]$ClaimDir = '', [int]$OwnerPid = $PID)
     $path = Get-VenueClaimPath -Venue $Venue -ClaimDir $ClaimDir
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $path) | Out-Null
@@ -182,6 +192,241 @@ function Request-VenueClaim {
         }
     }
     [pscustomobject]@{ granted = $false; state = 'BUSY'; claim = $null; path = $path; broken = @($broken) }
+}
+
+$script:TicketSchema = 'mlv-app/venue-ticket/v1'
+$script:TicketNameRx = [regex]'^(\d{19})-p(\d+)-(\d+)\.ticket\.json$'
+
+function Resolve-VenueNow($Value) { if ($null -eq $Value) { [DateTime]::UtcNow } else { ConvertTo-VenueUtc $Value } }
+
+function Get-VenueTicketDir {
+    param([Parameter(Mandatory)][string]$Venue, [string]$ClaimDir = '')
+    Join-Path (Split-Path -Parent (Get-VenueClaimPath -Venue $Venue -ClaimDir $ClaimDir)) "$Venue.tickets"
+}
+
+function ConvertTo-VenueTicketBytes($Fields) { [Text.UTF8Encoding]::new($false).GetBytes(($Fields | ConvertTo-Json -Compress) + "`n") }
+
+function New-VenueTicket {
+    <#
+    .SYNOPSIS
+    Take a place in the venue's line: one ticket file, created with CreateNew, named by the UTC ticks it was taken at (a clash moves to the next tick).
+    .OUTPUTS
+    [pscustomobject]@{ name; path; nonce; venue; runDir; ownerPid; createdUtc }
+    #>
+    param([Parameter(Mandatory)][string]$Venue, [Parameter(Mandatory)][string]$RunDir, [string]$Purpose = '', [ValidateRange(1, 86400)][int]$StaleAfterSec = 90,
+        [string]$ClaimDir = '', [int]$OwnerPid = $PID, $NowUtc = $null)
+    $dir = Get-VenueTicketDir -Venue $Venue -ClaimDir $ClaimDir
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $ownerStart = Get-VenueProcessStartUtc $OwnerPid
+    if ($null -eq $ownerStart -or $ownerStart -eq [DateTime]::MinValue) { throw "VENUE_CLAIM_USAGE the owner pid $OwnerPid has no readable start time: a ticket must be checkable for pid reuse" }
+    $now = Resolve-VenueNow $NowUtc
+    for ($n = 0; $n -lt 500; $n++) {
+        $name = '{0:D19}-p{1}-{2}.ticket.json' -f ($now.Ticks + $n), $OwnerPid, $ownerStart.Ticks
+        $path = Join-Path $dir $name
+        $fields = [ordered]@{
+            schema = $script:TicketSchema; venue = $Venue; ownerPid = $OwnerPid; ownerCreatedUtc = $ownerStart.ToString('o'); host = $env:COMPUTERNAME
+            runDir = $RunDir; purpose = $Purpose; createdUtc = $now.ToString('o'); heartbeatUtc = $now.ToString('o'); staleAfterSec = $StaleAfterSec
+            phase = 'waiting'; nonce = [guid]::NewGuid().ToString('N')
+        }
+        $bytes = ConvertTo-VenueTicketBytes $fields
+        try {
+            $fs = [IO.File]::Open($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)   # the only way a ticket is taken
+            try { $fs.Write($bytes, 0, $bytes.Length); $fs.Flush($true) } finally { $fs.Dispose() }
+        } catch { continue }
+        return [pscustomobject]@{ name = $name; path = $path; nonce = $fields.nonce; venue = $Venue; runDir = $RunDir; ownerPid = $OwnerPid; createdUtc = $now.ToString('o') }
+    }
+    throw "VENUE_CLAIM_USAGE could not create a ticket in '$dir'"
+}
+
+function Get-VenueTicketStaleReason {
+    <#
+    .SYNOPSIS
+    Why a parsed ticket is stale ('dead-pid', 'pid-reused', 'heartbeat', 'unreadable'), or $null when it is live.
+    #>
+    param([Parameter(Mandatory)]$Ticket, $NowUtc = $null)
+    $now = Resolve-VenueNow $NowUtc
+    $pidValue = 0
+    if (-not [int]::TryParse([string]$Ticket.ownerPid, [ref]$pidValue) -or $pidValue -le 0) { return 'unreadable' }
+    $created = ConvertTo-VenueUtc $Ticket.ownerCreatedUtc
+    $beat = ConvertTo-VenueUtc $Ticket.heartbeatUtc
+    $after = 0.0
+    if ($null -eq $created -or $null -eq $beat -or -not [double]::TryParse([string]$Ticket.staleAfterSec, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$after)) { return 'unreadable' }
+    $started = Get-VenueProcessStartUtc $pidValue
+    if ($null -eq $started) { return 'dead-pid' }
+    if ($started -ne [DateTime]::MinValue -and [Math]::Abs(($started - $created).TotalSeconds) -gt $script:PidStartToleranceSec) { return 'pid-reused' }
+    if (($now - $beat).TotalSeconds -gt $after) { return 'heartbeat' }
+    $null
+}
+
+function Get-VenueTicketProbeStaleSec {
+    <#
+    .SYNOPSIS
+    How long a ticket may go without a heartbeat while its owner sits in ONE Wait-VenueQuiet probe: the probe's real upper bound plus a margin. Wait-VenueQuiet stops
+    re-probing at -MaxWaitSec, but a probe already submitted runs on under um-run.ps1: its queue wait (-MaxQueueWaitSec 300), the agent's admission gate
+    (-MaxAdmissionWaitSec, passed by the chain) and the claimed job (-TimeoutSec 120 + -MaxClaimedWaitSec 120).
+    #>
+    param([Parameter(Mandatory)][ValidateRange(0, 86400)][int]$QuietMaxWaitSec, [Parameter(Mandatory)][ValidateRange(1, 86400)][int]$AdmissionWaitSec,
+        [ValidateRange(0, 86400)][int]$MarginSec = 90)
+    $queueWaitSec = 300; $jobBudgetSec = 120; $claimedGraceSec = 120   # the um-run call in Wait-VenueQuiet.ps1
+    $QuietMaxWaitSec + $queueWaitSec + $AdmissionWaitSec + $jobBudgetSec + $claimedGraceSec + $MarginSec
+}
+
+function Get-VenueTickets {
+    <#
+    .SYNOPSIS
+    The venue's line, oldest ticket first. One row per ticket: name, path, state (LIVE | STALE | BUSY = being rewritten, counts as live), reason, text, ticket (parsed),
+    position (1-based among the non-stale tickets; 0 for a stale one), ageSec and heartbeatAgeSec ($null when unreadable).
+    #>
+    param([Parameter(Mandatory)][string]$Venue, [string]$ClaimDir = '', $NowUtc = $null)
+    $now = Resolve-VenueNow $NowUtc
+    $dir = Get-VenueTicketDir -Venue $Venue -ClaimDir $ClaimDir
+    $rows = [System.Collections.Generic.List[object]]::new()
+    if (Test-Path -LiteralPath $dir -PathType Container) {
+        foreach ($file in @(Get-ChildItem -LiteralPath $dir -Filter '*.ticket.json' -File -ErrorAction SilentlyContinue)) {
+            $m = $script:TicketNameRx.Match($file.Name)
+            if (-not $m.Success) { continue }
+            $f = Read-VenueClaimFile $file.FullName
+            if (-not $f.exists) { continue }
+            $row = [ordered]@{ name = $file.Name; path = $file.FullName; key = [int64]$m.Groups[1].Value; pidKey = [decimal]$m.Groups[2].Value; startKey = [decimal]$m.Groups[3].Value; state = 'LIVE'; reason = $null; text = $f.text; ticket = $null; position = 0; ageSec = $null; heartbeatAgeSec = $null }
+            if ($f.busy) { $row.state = 'BUSY' }
+            else {
+                $t = $null
+                try { $t = $f.text | ConvertFrom-Json -ErrorAction Stop } catch { $t = $null }
+                if ($null -eq $t -or [string]$t.schema -cne $script:TicketSchema -or [string]$t.venue -cne $Venue) {
+                    if ($null -ne $f.lastWriteUtc -and ($now - $f.lastWriteUtc).TotalSeconds -lt $script:UnreadableGraceSec) { $row.reason = 'being-written' }
+                    else { $row.state = 'STALE'; $row.reason = 'unreadable' }
+                } else {
+                    $row.ticket = $t
+                    $why = Get-VenueTicketStaleReason -Ticket $t -NowUtc $now
+                    if ($why) { $row.state = 'STALE'; $row.reason = $why }
+                    $c = ConvertTo-VenueUtc $t.createdUtc; $b = ConvertTo-VenueUtc $t.heartbeatUtc
+                    if ($null -ne $c) { $row.ageSec = [int][Math]::Max(0, ($now - $c).TotalSeconds) }
+                    if ($null -ne $b) { $row.heartbeatAgeSec = [int][Math]::Max(0, ($now - $b).TotalSeconds) }
+                }
+            }
+            $rows.Add([pscustomobject]$row)
+        }
+    }
+    $sorted = @($rows | Sort-Object -Property key, pidKey, startKey, name)   # arrival tick, then owner pid, then owner start ticks: equal ticks never fall back to enumeration order
+    $pos = 0
+    foreach ($r in $sorted) { if ($r.state -cne 'STALE') { $pos++; $r.position = $pos } }
+    $sorted
+}
+
+function Update-VenueTicket {
+    <#
+    .SYNOPSIS
+    Heartbeat: rewrite the ticket's heartbeat (and, when given, its phase and staleAfterSec). Returns OK | LOST (the ticket is gone or is not ours) | BUSY (a reader held it; try again).
+    #>
+    param([Parameter(Mandatory)]$Ticket, [string]$Phase = '', [int]$StaleAfterSec = 0, $NowUtc = $null)
+    $now = Resolve-VenueNow $NowUtc
+    for ($attempt = 1; $attempt -le 5; $attempt++) {
+        if (-not (Test-Path -LiteralPath $Ticket.path -PathType Leaf)) { return 'LOST' }
+        $fs = $null
+        try { $fs = [IO.File]::Open($Ticket.path, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::Read) } catch { Start-Sleep -Milliseconds (40 * $attempt); continue }
+        try {
+            $sr = [IO.StreamReader]::new($fs, [Text.UTF8Encoding]::new($false), $false, 4096, $true)
+            $text = $sr.ReadToEnd(); $sr.Dispose()
+            $j = $null; try { $j = $text | ConvertFrom-Json -ErrorAction Stop } catch { $j = $null }
+            if ($null -eq $j -or [string]$j.nonce -cne [string]$Ticket.nonce) { return 'LOST' }
+            $fields = [ordered]@{
+                schema = [string]$j.schema; venue = [string]$j.venue; ownerPid = [int]$j.ownerPid; ownerCreatedUtc = (ConvertTo-VenueUtc $j.ownerCreatedUtc).ToString('o'); host = [string]$j.host
+                runDir = [string]$j.runDir; purpose = [string]$j.purpose; createdUtc = (ConvertTo-VenueUtc $j.createdUtc).ToString('o'); heartbeatUtc = $now.ToString('o')
+                staleAfterSec = $(if ($StaleAfterSec -gt 0) { $StaleAfterSec } else { [int]$j.staleAfterSec }); phase = $(if ($Phase) { $Phase } else { [string]$j.phase }); nonce = [string]$j.nonce
+            }
+            $bytes = ConvertTo-VenueTicketBytes $fields
+            $fs.SetLength(0); $fs.Position = 0; $fs.Write($bytes, 0, $bytes.Length); $fs.Flush($true)
+            return 'OK'
+        } finally { $fs.Dispose() }
+    }
+    'BUSY'
+}
+
+function Remove-VenueTicket {
+    <#
+    .SYNOPSIS
+    End the caller's place in the line (only when the file still carries the ticket's nonce). Returns REMOVED | CHANGED | ABSENT | BUSY.
+    #>
+    param([Parameter(Mandatory)]$Ticket)
+    Remove-VenueClaimIfUnchanged -Path $Ticket.path -ExpectedNonce ([string]$Ticket.nonce)
+}
+
+function Request-VenueClaim {
+    <#
+    .SYNOPSIS
+    Try ONCE to take the venue's claim (it never waits; the caller decides whether to poll). Stale claims found on the way are broken (each once).
+    With -UseTicket (or a -Ticket from an earlier call) the caller first takes / refreshes its place in the line, removes stale tickets, and only the OLDEST LIVE
+    ticket may try the claim; any other gets state QUEUED. Without either it is the old ticketless attempt.
+    .OUTPUTS
+    [pscustomobject]@{ granted; state (TAKEN | LIVE | BUSY | QUEUED); claim (ours when granted, the holder's when LIVE or QUEUED); path; broken (one {reason; claim} per stale claim broken);
+    ticket (the caller's, keep it and pass it back; $null when ticketless); queue (the live tickets, oldest first); position (the caller's place, 0 when ticketless); staleTickets (one {reason; name; ticket} per stale ticket removed) }
+    -NowUtc is the clock for tickets only (a test seam); the claim's own expiry always uses the real clock.
+    #>
+    param([Parameter(Mandatory)][string]$Venue, [Parameter(Mandatory)][string]$RunDir, [string]$Purpose = '', [ValidateRange(60, 86400)][int]$TtlSec = 10800,
+        [string]$ClaimDir = '', [int]$OwnerPid = $PID, [switch]$UseTicket, $Ticket = $null, [ValidateRange(1, 86400)][int]$TicketStaleAfterSec = 90, $NowUtc = $null)
+    $attemptArgs = @{ Venue = $Venue; RunDir = $RunDir; Purpose = $Purpose; TtlSec = $TtlSec; ClaimDir = $ClaimDir; OwnerPid = $OwnerPid }
+    if (-not $UseTicket -and $null -eq $Ticket) {
+        return (Invoke-VenueClaimAttempt @attemptArgs | Add-Member -NotePropertyName ticket -NotePropertyValue $null -PassThru | Add-Member -NotePropertyName queue -NotePropertyValue @() -PassThru |
+            Add-Member -NotePropertyName position -NotePropertyValue 0 -PassThru | Add-Member -NotePropertyName staleTickets -NotePropertyValue @() -PassThru)
+    }
+    $now = Resolve-VenueNow $NowUtc
+    $t = $Ticket
+    if ($null -ne $t -and (Update-VenueTicket -Ticket $t -Phase 'waiting' -StaleAfterSec $TicketStaleAfterSec -NowUtc $now) -ceq 'LOST') { $t = $null }   # taken out from under us: back of the line
+    if ($null -eq $t) { $t = New-VenueTicket -Venue $Venue -RunDir $RunDir -Purpose $Purpose -StaleAfterSec $TicketStaleAfterSec -ClaimDir $ClaimDir -OwnerPid $OwnerPid -NowUtc $now }
+    $removed = [System.Collections.Generic.List[object]]::new()
+    $line = Get-VenueTickets -Venue $Venue -ClaimDir $ClaimDir -NowUtc $now
+    $stale = @($line | Where-Object { $_.state -ceq 'STALE' })
+    foreach ($s in $stale) {
+        if ((Remove-VenueClaimIfUnchanged -Path $s.path -ExpectedText $s.text) -ceq 'REMOVED') { $removed.Add([pscustomobject]@{ reason = $s.reason; name = $s.name; ticket = $s.ticket }) }
+    }
+    if ($stale.Count -gt 0) { $line = Get-VenueTickets -Venue $Venue -ClaimDir $ClaimDir -NowUtc $now }
+    $live = @($line | Where-Object { $_.state -cne 'STALE' })
+    $mine = @($live | Where-Object { $_.name -ceq $t.name })
+    $position = $(if ($mine.Count -gt 0) { [int]$mine[0].position } else { 0 })
+    if ($position -ne 1) {
+        $seen = Get-VenueClaim -Venue $Venue -ClaimDir $ClaimDir
+        return [pscustomobject]@{ granted = $false; state = 'QUEUED'; claim = $seen.claim; path = $seen.path; broken = @(); ticket = $t; queue = $live; position = $position; staleTickets = @($removed) }
+    }
+    $r = Invoke-VenueClaimAttempt @attemptArgs
+    $r | Add-Member -NotePropertyName ticket -NotePropertyValue $t -PassThru | Add-Member -NotePropertyName queue -NotePropertyValue $live -PassThru |
+        Add-Member -NotePropertyName position -NotePropertyValue $position -PassThru | Add-Member -NotePropertyName staleTickets -NotePropertyValue @($removed) -PassThru
+}
+
+function Get-VenueClaimStatus {
+    <#
+    .SYNOPSIS
+    The venue's claim and its whole line in one object: venue, claim (Get-VenueClaim), tickets (Get-VenueTickets, stale ones included, oldest first).
+    #>
+    param([Parameter(Mandatory)][string]$Venue, [string]$ClaimDir = '', $NowUtc = $null)
+    $now = Resolve-VenueNow $NowUtc
+    [pscustomobject]@{ venue = $Venue; claim = (Get-VenueClaim -Venue $Venue -ClaimDir $ClaimDir -NowUtc $now); tickets = (Get-VenueTickets -Venue $Venue -ClaimDir $ClaimDir -NowUtc $now); nowUtc = $now.ToString('o') }
+}
+
+function Format-VenueClaimStatus {
+    # One CLAIM_STATUS line, one TICKET_QUEUE line, then one TICKET / TICKET_STALE line per ticket with its owner run dir, pid and age.
+    param([Parameter(Mandatory)]$Status)
+    $c = $Status.claim
+    $held = ''
+    if ($c.claim) {
+        $claimed = ConvertTo-VenueUtc $c.claim.claimedUtc
+        $age = $(if ($null -ne $claimed) { [int][Math]::Max(0, ((ConvertTo-VenueUtc $Status.nowUtc) - $claimed).TotalSeconds) } else { 'UNKNOWN' })
+        $held = " holderPid=$($c.claim.ownerPid) runDir=$($c.claim.runDir) purpose=$($c.claim.purpose) ageSec=$age expiresUtc=$((ConvertTo-VenueUtc $c.claim.expiresUtc).ToString('o'))"
+    }
+    "CLAIM_STATUS venue=$($Status.venue) state=$($c.state)$(if ($c.reason) { " reason=$($c.reason)" })$held"
+    $live = @($Status.tickets | Where-Object { $_.state -cne 'STALE' })
+    "TICKET_QUEUE venue=$($Status.venue) live=$($live.Count) stale=$(@($Status.tickets).Count - $live.Count)"
+    foreach ($r in $Status.tickets) {
+        $t = $r.ticket
+        $who = $(if ($t) { "pid=$($t.ownerPid) runDir=$($t.runDir) purpose=$($t.purpose) ageSec=$($r.ageSec) heartbeatAgeSec=$($r.heartbeatAgeSec) phase=$($t.phase) staleAfterSec=$($t.staleAfterSec)" } else { "state=$($r.state) (unparsed)" })
+        if ($r.state -ceq 'STALE') { "TICKET_STALE reason=$($r.reason) $who name=$($r.name)" } else { "TICKET position=$($r.position) $who name=$($r.name)" }
+    }
+}
+
+function Format-VenueTicketQueue {
+    # The line on one short string for a log line: "#1 pid=.. age=..s run=..; #2 ...".
+    param([AllowEmptyCollection()][object[]]$Queue = @())
+    if (@($Queue).Count -eq 0) { return 'empty' }
+    (@($Queue | ForEach-Object { "#$($_.position) pid=$($_.ticket.ownerPid) age=$($_.ageSec)s run=$($_.ticket.runDir)" })) -join '; '
 }
 
 function Release-VenueClaim {
@@ -286,4 +531,5 @@ function Select-VenueQuietWindow {
 }
 
 Export-ModuleMember -Function Get-VenueMainRoot, Get-VenueClaimPath, Get-VenueClaim, Get-VenueClaimStaleReason, Request-VenueClaim, Release-VenueClaim,
+    Get-VenueTicketDir, New-VenueTicket, Get-VenueTickets, Get-VenueTicketStaleReason, Get-VenueTicketProbeStaleSec, Update-VenueTicket, Remove-VenueTicket, Get-VenueClaimStatus, Format-VenueClaimStatus, Format-VenueTicketQueue,
     ConvertFrom-VenueGateLog, Get-VenueQuietRateTable, Format-VenueQuietRateTable, Select-VenueQuietWindow

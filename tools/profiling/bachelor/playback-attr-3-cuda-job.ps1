@@ -399,7 +399,11 @@ param(
     # GPU-EVENT153-ROOTCAUSE-2: turns the CUDA backends' per-launch timer on (MLVAPP_CUDA_LAUNCH_TIMING=1) with this
     # per-launch line threshold in ms (MLVAPP_CUDA_LAUNCH_TIMING_MIN_MS). -1 (the default) sets nothing: the timer stays
     # OFF and the emitted job is the text it was before this parameter.
-    [ValidateRange(-1, 10000)][double]$CudaLaunchTimingMinMs = -1
+    [ValidateRange(-1, 10000)][double]$CudaLaunchTimingMinMs = -1,
+
+    # PLAYBACK-STARTUP-CATCHUP-BURST-1 r7: the app's opt-in per-present playback trace (MLVAPP_PLAYBACK_PRESENT_TRACE=1; its rows
+    # land in the run log after the Play stops). Absent: nothing is set and the emitted job is the text it was before this parameter.
+    [switch]$PresentTrace
 )
 
 $ErrorActionPreference = 'Stop'
@@ -4433,6 +4437,16 @@ if ($CudaLaunchTimingMinMs -ge 0) {
     })
 }
 
+# PLAYBACK-STARTUP-CATCHUP-BURST-1 r7: the same env-list site gains the present-trace flag, only when asked.
+if ($PresentTrace) {
+    $traceAnchor = [regex]"(?<ind>[ \t]*)'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',(?<nl>\r?\n)"
+    if ($traceAnchor.Matches($text).Count -ne 1) { throw 'DUAL_VENUE_PRESENT_TRACE_ANCHOR_MISSING the job template has no single env-list site to add MLVAPP_PLAYBACK_PRESENT_TRACE to' }
+    $text = $traceAnchor.Replace($text, [System.Text.RegularExpressions.MatchEvaluator]{
+        param($m)
+        $m.Value + $m.Groups['ind'].Value + "'MLVAPP_PLAYBACK_PRESENT_TRACE=1'," + $m.Groups['nl'].Value
+    })
+}
+
 $outDir = Split-Path -Parent $OutFile
 if ($outDir -and -not (Test-Path -LiteralPath $outDir)) { New-Item -ItemType Directory -Path $outDir -Force | Out-Null }
 [IO.File]::WriteAllText($OutFile, $text, [Text.UTF8Encoding]::new($false))
@@ -4462,6 +4476,7 @@ $clipContentSha256 = if ($isFixtureRehearsal) {
     displayMode = $DisplayMode
     swapInterval = $(if ($SwapInterval -ge 0) { $SwapInterval } else { $null })
     cudaLaunchTimingMinMs = $(if ($CudaLaunchTimingMinMs -ge 0) { $CudaLaunchTimingMinMs } else { $null })
+    presentTrace = [bool]$PresentTrace
     # DUAL-VENUE-EVIDENCE-1: what this generation was authored for (not part of the emitted job's bytes).
     venue = $Venue
     backend = $Backend
