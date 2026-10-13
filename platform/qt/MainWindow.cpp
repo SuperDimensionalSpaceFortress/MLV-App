@@ -8808,7 +8808,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
             "playback_processing_selected=%5 gpu_preview_processing_request=%6 "
             "gpu_bilinear_debayer_request=%7 gpu_amaze_debayer_request=%8 "
             "gpu_amaze_texture_present_environment=%9 playback_policy_active=%10 "
-            "drop_frame_forced=%11 drop_frame=%12" )
+            "drop_frame_forced=%11 drop_frame=%12 scopes_during_playback=%13" )
             .arg( bool01( options.forcePlaybackDebayer ) )
             .arg( QString::fromLatin1(
                       playback_profile_debayer_request_name(
@@ -8830,7 +8830,10 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
             .arg( bool01( gpuAmazeTexturePresentRequestedByEnvironment() ) )
             .arg( bool01( m_headlessPlaybackProfileUsePlaybackPolicy ) )
             .arg( bool01( options.forceDropFrame ) )
-            .arg( bool01( ui->actionDropFrameMode->isChecked() ) ) );
+            .arg( bool01( ui->actionDropFrameMode->isChecked() ) )
+            // PLAYBACK-SCOPES-OPTION-1: which "Scopes During Playback" mode the run played under, so a
+            // --scope leg's evidence says whether its scope was computed while playing (Hide: it was not).
+            .arg( QString::fromLatin1( playbackScopesModeToken( m_playbackScopesMode ) ) ) );
 
     const int totalFrames = getMlvFrames( m_pMlvObject );
     if( totalFrames < 2 )

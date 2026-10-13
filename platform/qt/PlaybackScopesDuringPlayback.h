@@ -22,12 +22,15 @@ enum class PlaybackScopesMode
     Live
 };
 
-/*! \brief The persisted "Scopes During Playback" setting. The default is chosen from the
- *  PLAYBACK-SCOPES-OPTION-1 Bachelor A/B (see that PR for the rule and the numbers). */
+/*! \brief The persisted "Scopes During Playback" setting. Hide by default, from the
+ *  PLAYBACK-SCOPES-OPTION-1 Bachelor A/B (windowed s1, M16-1243). On the default GPU playback
+ *  route a visible throttled histogram vetoed the GPU recon texture-present path (every frame
+ *  fell to GPU recon readback) and roughly halved presented fps. The rule was: Throttled only
+ *  if it cost under ~5 % on both routes, else Hide. */
 namespace PlaybackScopesSettings
 {
     inline constexpr const char * kKeyScopesDuringPlayback() { return "Playback/ScopesDuringPlayback"; }
-    inline constexpr PlaybackScopesMode kDefaultMode() { return PlaybackScopesMode::Throttled; }
+    inline constexpr PlaybackScopesMode kDefaultMode() { return PlaybackScopesMode::Hide; }
 }
 
 inline const char * playbackScopesModeToken(PlaybackScopesMode mode)

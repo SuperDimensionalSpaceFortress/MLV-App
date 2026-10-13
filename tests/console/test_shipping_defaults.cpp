@@ -2,6 +2,7 @@
 #include "../common/repo_paths.h"
 
 #include "../../platform/qt/PlaybackQualityPolicy.h"
+#include "../../platform/qt/PlaybackScopesDuringPlayback.h"
 #include "../../platform/qt/PlaybackSwapInterval.h"
 #include "../../platform/qt/ReceiptSettings.h"
 
@@ -26,7 +27,7 @@ const std::array<const char *, 6> kPlaybackEnvironment = {
     "MLVAPP_PLAYBACK_SCALE_FACTOR",
 };
 
-const std::array<const char *, 9> kPlaybackKeys = {
+const std::array<const char *, 10> kPlaybackKeys = {
     PlaybackQualitySettings::kKeyQualityMode(),
     PlaybackQualitySettings::kKeyPreviewMode(),
     PlaybackQualitySettings::kKeyScaleFactorOverride(),
@@ -36,6 +37,7 @@ const std::array<const char *, 9> kPlaybackKeys = {
     PlaybackQualitySettings::kKeyShowExperimentalPhase3Modes(),
     PlaybackQualitySettings::kKeyPhase3Acknowledged(),
     PlaybackSwapIntervalSettings::kKeyVSync(),
+    PlaybackScopesSettings::kKeyScopesDuringPlayback(),
 };
 
 class ScopedFreshPlaybackState
@@ -133,6 +135,10 @@ QJsonObject actualPlaybackDefaults()
     playback.insert(QStringLiteral("phase3Acknowledged"),
                     playbackQualityPhase3AcknowledgedFromSettings());
     playback.insert(QStringLiteral("vsync"), playbackVSyncFromSettings());
+    // The setting alone (no env override: this snapshot's scope is fresh install, no env).
+    playback.insert(QStringLiteral("scopesDuringPlayback"),
+                    enumValue("hide", static_cast<int>(playbackScopesModeResolve(
+                        -1, playbackScopesModeSettingValue()))));
     playback.insert(QStringLiteral("derived"), derived);
     return playback;
 }

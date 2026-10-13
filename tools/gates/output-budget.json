@@ -2,7 +2,7 @@
   "schema": "mlvapp.output-budget-spec.v1",
   "shippingDefaults": {
     "path": "tools/gates/shipping-defaults.json",
-    "sha256": "4F66EF8B396CAE222CE199E17C1C6042EDB3D27D6D579346506AC4915E740301"
+    "sha256": "2F3A29641EC8A015543FA4D63557B52FDD2BC00F7A82CB0968C63654900EB9C3"
   },
   "baseline": {
     "status": "pending_instrumented_known_good_bridge",

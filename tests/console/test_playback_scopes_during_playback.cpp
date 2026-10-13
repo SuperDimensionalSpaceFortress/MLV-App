@@ -53,6 +53,14 @@ TEST(PlaybackScopesDuringPlayback, EnvOverridesTheSettingAndNothingFallsBackToTh
     ASSERT_EQ(asInt(PlaybackScopesSettings::kDefaultMode()), asInt(playbackScopesModeResolve(-1, -1)));
 }
 
+TEST(PlaybackScopesDuringPlayback, TheDefaultIsHideWhilePlaying)
+{
+    // PLAYBACK-SCOPES-OPTION-1 r1 Bachelor A/B: a throttled histogram cost about half the presented fps on
+    // the GPU route (texture-present vetoed), far over the ~5 % Throttled bar, so the default is Hide.
+    ASSERT_EQ(asInt(PlaybackScopesMode::Hide), asInt(PlaybackScopesSettings::kDefaultMode()));
+    ASSERT_EQ(asInt(PlaybackScopesMode::Hide), asInt(playbackScopesModeResolve(-1, -1)));
+}
+
 TEST(PlaybackScopesDuringPlayback, HideTurnsAVisibleScopeOffOnlyWhilePlaying)
 {
     for (PlaybackScopesMode mode : { PlaybackScopesMode::Hide, PlaybackScopesMode::Throttled, PlaybackScopesMode::Live })
@@ -118,6 +126,9 @@ TEST(PlaybackScopesDuringPlayback, MainWindowRoutesEveryScopeConsumerThroughTheP
         "playbackScopeUpdateIntervalForMode( m_playbackScopesMode,")));
     ASSERT_TRUE(source.contains(QStringLiteral("requestFrameRefresh( false, \"play-stop-scopes\" );")));
     ASSERT_TRUE(source.contains(QStringLiteral("applyPlaybackScopesMode( playbackScopesMode(), /*persist*/false );")));
+    // The GUI smoke's playback-policy line says which mode the run played under.
+    ASSERT_TRUE(source.contains(QStringLiteral("drop_frame=%12 scopes_during_playback=%13")));
+    ASSERT_TRUE(source.contains(QStringLiteral(".arg( QString::fromLatin1( playbackScopesModeToken( m_playbackScopesMode ) ) ) );")));
 
     const QString ui = readRepoFile(QStringLiteral("platform/qt/MainWindow.ui"));
     for (const char *action : { "actionPlaybackScopesHide", "actionPlaybackScopesThrottled", "actionPlaybackScopesLive" })
