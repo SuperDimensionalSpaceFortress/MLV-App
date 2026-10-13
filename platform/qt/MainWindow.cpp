@@ -2572,7 +2572,7 @@ static bool mlvappCpuPlaybackLookaheadDisabled()
 
 // PLAYBACK-CPU-PACE-AWARE-LOOKAHEAD-1 bisect switches. MLVAPP_CPU_LOOKAHEAD_PREDICT is on unless set to 0 (0 renders
 // N+1 again). MLVAPP_CPU_LOOKAHEAD_YIELD is opt-in (r2b venue ruling): on only when set and not 0, because at s4 the
-// yield cost 6.1 % presented fps against the depth-0 control while the same build with it off held parity.
+// yield cost 4.8 % presented fps against the depth-0 control while the same build with it off held parity.
 static bool mlvappEnvSwitchOn( const char *name )
 {
     return !qEnvironmentVariableIsSet( name ) || qEnvironmentVariable( name ).trimmed() != QStringLiteral("0");
