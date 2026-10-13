@@ -19,8 +19,9 @@ equals the card and whose `allowEdits` is `true` (a review key never edits, so a
 never name the producer), newest by `startedUtc`. It prints the key-B lane name, or with `-Json`:
 `card, keyA, keyB, producerLane, producerKnown, producerReceipt, reason, warnings`.
 
-- No producer receipt (a hand-written PR): `keyB = opus`, `producerKnown = false`, and a warning, so
-  the no-self-review check is visibly not evidence-backed.
+- No readable matching producer receipt (a hand-written PR): `keyB = fable`, `producerKnown = false`,
+  and one warning. An unknown producer fails toward `fable`, because the producer may have been `opus`
+  and key B must stay independent of it (hub ruling, HUB-TICK 20261013T0321Z, r3 blocker B2).
 - Producer `sol`: `keyB = opus` plus a warning that key A would review its own work.
 - Exit 2 on a usage error (unknown `-ProducerLane`, missing runs directory).
 - **Call it as a child process**, as below. Never dot-source it: its `param` block (`-Card`,
@@ -90,6 +91,9 @@ the same change as the patch above**, or `opus` keys are never read, retried or 
 
 `python tools/coordination/check-lane-model-currency.py` reads the lane receipts and reports a lane
 whose two latest runs both used an id older than its family's newest, or any effort but `high`
-(exit 1). `Invoke-Lane.ps1` receipts carry `codexModelsFetchedAt` (age of the model list) and, for a
+(exit 1). Missing evidence is never `CURRENT`: a lane whose newest run proved no model is `NO-DATA`,
+one with a proven model but a run that recorded no effort is `INCOMPLETE` (`unrecordedEffort` in the
+table), and either makes the overall verdict `INCOMPLETE` (exit 3; no lane in the window is `NO-DATA`,
+also exit 3). `Invoke-Lane.ps1` receipts carry `codexModelsFetchedAt` (age of the model list) and, for a
 pinned read-only codex lane, `codexExe.pinState` (`PIN_MODEL_UNPROBED` = the pin never proved the
 resolved model, so the global CLI ran it).

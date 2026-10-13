@@ -13,8 +13,10 @@ The producer is read from the card's NEWEST PRODUCER receipt: every receipt unde
 key never edits, so its receipts can never name the producer), ordered by `startedUtc`. Run
 directories are named after their card by the dispatch convention, so only directories whose name
 contains the card are opened; the receipt's own `card` field still has to match exactly. A card
-with no producer receipt (a PR written by hand outside the lane runner) gets key B = opus with
-producerKnown=false, so the caller can see the "no self-review" check was not evidence-backed.
+with no producer receipt (a PR written by hand outside the lane runner) gets key B = fable with
+producerKnown=false and one warning: the producer may have been opus, so an unknown producer fails
+toward fable (HUB RULING, HUB-TICK 20261013T0321Z) and the caller can see the "no self-review" check
+was not evidence-backed.
 
 Run it as a CHILD PROCESS, never dot-sourced: its param block (-Card, -RunsDir, -ProducerLane,
 -Json) would overwrite the same-named variables of the script that dot-sources it.
@@ -102,10 +104,11 @@ function Select-ReviewKeyB {
             $chosenProducer = $found.lane; $chosenReceipt = $found.path; $reason = 'producer-receipt'
         } else {
             $reason = 'no-producer-receipt'
-            $warnings.Add("no producer receipt (allowEdits=true, card '$Card') under $RunsDir; the no-self-review check had no evidence, key B defaults to opus")
+            $warnings.Add("no producer receipt (allowEdits=true, card '$Card') under $RunsDir; the no-self-review check had no evidence, so key B fails toward fable (the producer may have been opus)")
         }
     }
-    $keyB = if ($chosenProducer -ceq 'opus') { 'fable' } else { 'opus' }
+    # An unknown producer fails toward fable (HUB RULING, HUB-TICK 20261013T0321Z): the producer may have been opus.
+    $keyB = if ($chosenProducer -ceq 'opus' -or $null -eq $chosenProducer) { 'fable' } else { 'opus' }
     if ($chosenProducer -ceq 'opus') { $reason += '; opus implemented, so key B falls back to fable (no self-review)' }
     if ($chosenProducer -ceq $SELECT_KEY_B_KEY_A) { $warnings.Add('producer lane is sol, which is also key A: key A would review its own work; the hub must pick another key A') }
     return [pscustomobject][ordered]@{

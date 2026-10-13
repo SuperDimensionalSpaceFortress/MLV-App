@@ -161,10 +161,11 @@ class EffortTests(CurrencyFixture):
         self.receipt("fable", "claude-fable-5-1", 5)
         self.assertEqual(self.evaluate()["verdict"], "CURRENT")
 
-    def test_an_unrecorded_effort_is_counted_but_not_a_violation(self):
+    def test_an_unrecorded_effort_is_counted_and_is_not_proof_of_high(self):
         self.receipt("sonnet", "claude-sonnet-5-5", 10, effort=None)
         entry = self.evaluate()["lanes"]["sonnet"]
-        self.assertEqual(entry["verdict"], "CURRENT")
+        self.assertEqual(entry["verdict"], "INCOMPLETE")
+        self.assertEqual(entry["reasons"], [])         # not a violation, just unproven
         self.assertEqual(entry["unrecordedEffort"], 1)
 
     def test_the_effort_check_applies_to_runs_with_no_proven_model_too(self):
@@ -172,6 +173,56 @@ class EffortTests(CurrencyFixture):
         entry = self.evaluate()["lanes"]["sol"]
         self.assertEqual(entry["verdict"], "STALE")
         self.assertEqual(entry["reasons"][0]["kind"], "BAD-EFFORT")
+
+
+class MissingEvidenceTests(CurrencyFixture):
+    """Missing evidence is never CURRENT (R3 blocker B1: three sol repros on ad3f1b72)."""
+
+    def test_a_current_model_with_no_recorded_effort_is_incomplete_not_current(self):
+        self.receipt("sol", "gpt-6.1-sol", 5, effort=None)
+        result = self.evaluate()
+        self.assertEqual(result["lanes"]["sol"]["verdict"], "INCOMPLETE")
+        self.assertEqual(result["verdict"], "INCOMPLETE")
+
+    def test_a_proven_current_run_followed_by_an_unresolved_newest_run_is_no_data(self):
+        self.receipt("opus", "claude-opus-5-5", 10)
+        self.receipt("opus", None, 2, state="failed")
+        result = self.evaluate()
+        self.assertEqual(result["lanes"]["opus"]["verdict"], "NO-DATA")
+        self.assertEqual(result["verdict"], "INCOMPLETE")
+
+    def test_a_lone_unresolved_receipt_cannot_leave_the_overall_verdict_current(self):
+        self.receipt("fable", None, 3, state="failed")
+        result = self.evaluate()
+        self.assertEqual(result["lanes"]["fable"]["verdict"], "NO-DATA")
+        self.assertNotEqual(result["verdict"], "CURRENT")
+
+    def test_one_unproven_lane_taints_the_overall_verdict_beside_a_current_lane(self):
+        self.receipt("sol", "gpt-6.1-sol", 5)
+        self.receipt("luna", "gpt-6-luna", 5, effort=None)
+        result = self.evaluate()
+        self.assertEqual(result["lanes"]["sol"]["verdict"], "CURRENT")
+        self.assertEqual(result["verdict"], "INCOMPLETE")
+
+    def test_stale_still_outranks_incomplete(self):
+        self.receipt("sol", "gpt-6.1-sol", 5, effort="low")
+        self.receipt("luna", "gpt-6-luna", 5, effort=None)
+        self.assertEqual(self.evaluate()["verdict"], "STALE")
+
+    def test_an_empty_window_is_no_data_not_current(self):
+        self.receipt("sol", "gpt-6.1-sol", 500)
+        self.assertEqual(self.evaluate(since_hours=72)["verdict"], "NO-DATA")
+
+    def test_the_table_shows_unrecorded_effort_so_no_lane_prints_a_bare_current(self):
+        self.receipt("sonnet", "claude-sonnet-5-5", 5, effort=None)
+        self.receipt("fable", "claude-fable-5-1", 5)
+        lines = check.render(self.evaluate()).splitlines()
+        sonnet = next(line for line in lines if line.strip().startswith("sonnet"))
+        fable = next(line for line in lines if line.strip().startswith("fable"))
+        self.assertIn("INCOMPLETE", sonnet)
+        self.assertIn("unrecordedEffort=1", sonnet)
+        self.assertNotIn("unrecordedEffort", fable)
+        self.assertIn("INCOMPLETE", lines[0])
 
 
 class WindowTests(CurrencyFixture):
@@ -233,6 +284,12 @@ class LoadAndCliTests(CurrencyFixture):
         result = self._run("--since-hours", "0")
         self.assertEqual(result.returncode, 1, result.stdout)
         self.assertIn("BAD-EFFORT", result.stdout)
+
+    def test_cli_exit_three_when_the_evidence_is_incomplete(self):
+        self.receipt("sol", "gpt-6.1-sol", 1, effort=None)
+        result = self._run("--json", "--since-hours", "0")
+        self.assertEqual(result.returncode, 3, result.stdout)
+        self.assertEqual(json.loads(result.stdout)["verdict"], "INCOMPLETE")
 
     def test_cli_exit_two_for_a_missing_runs_dir_with_a_typed_error(self):
         result = subprocess.run([sys.executable, str(SCRIPT), "--runs-dir", str(self.runs / "nope")],

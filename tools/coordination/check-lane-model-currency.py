@@ -21,8 +21,21 @@ The newest id per family is the highest version among the receipts read, raised 
 any lane has run it). Only receipts that proved a model (a parseable resolvedModel; 'unknown' and
 null never count) take part in the model rule.
 
-Exit code: 0 every lane CURRENT (or NO-DATA), 1 at least one STALE-MODEL or BAD-EFFORT, 2 the
-runs directory is unreadable. One JSON object with --json, else a short table.
+Missing evidence is never CURRENT (r3 blocker B1). A lane's verdict is, in order:
+
+  STALE       a STALE-MODEL or BAD-EFFORT reason above.
+  NO-DATA     the lane has no proven model, or its NEWEST run in the window has none (a failed or
+              still-running run, resolvedModel null/'unknown'): what the lane runs now is unproven.
+  INCOMPLETE  the model is proven but at least one run in the window recorded no effort, so
+              'high' is unproven; counted in `unrecordedEffort` and shown in the table.
+  CURRENT     a proven model, every effort recorded and 'high'.
+
+The overall verdict is STALE if any lane is, else INCOMPLETE if any lane is NO-DATA or INCOMPLETE,
+else NO-DATA when no lane ran in the window, else CURRENT.
+
+Exit code: 0 overall CURRENT, 1 at least one STALE-MODEL or BAD-EFFORT, 2 the runs directory is
+unreadable, 3 overall INCOMPLETE or NO-DATA (evidence missing, not a violation). One JSON object with
+--json, else a short table.
 
 Usage: python check-lane-model-currency.py [--runs-dir DIR] [--since-hours N] [--newest FAMILY=ID]... [--json]
 """
@@ -166,18 +179,32 @@ def evaluate(receipts, since_hours=DEFAULT_SINCE_HOURS, now=None, overrides=None
                 "receipts": [r["path"] for r in bad[-5:]], "count": len(bad)})
         unrecorded = [r for r in runs if not (isinstance(r["effort"], str) and r["effort"].strip())]
         latest = proven[-1] if proven else None
+        if reasons:
+            verdict = "STALE"
+        elif not proven or not runs[-1]["parsed"]:
+            verdict = "NO-DATA"
+        elif unrecorded:
+            verdict = "INCOMPLETE"
+        else:
+            verdict = "CURRENT"
         report[lane] = {
-            "verdict": "STALE" if reasons else ("CURRENT" if proven else "NO-DATA"),
+            "verdict": verdict,
             "runsInWindow": len(runs), "provenModelRuns": len(proven),
             "latestModel": latest["resolvedModel"] if latest else None,
             "familyNewest": newest[latest["parsed"][0]][1] if latest else None,
             "reasons": reasons, "unrecordedEffort": len(unrecorded),
         }
+    verdicts = {entry["verdict"] for entry in report.values()}
+    if "STALE" in verdicts:
+        overall = "STALE"
+    elif verdicts - {"CURRENT"}:
+        overall = "INCOMPLETE"
+    else:
+        overall = "CURRENT" if report else "NO-DATA"
     return {
         "sinceHours": since_hours, "receiptsRead": len(receipts), "receiptsInWindow": len(window),
         "familyNewest": {family: pair[1] for family, pair in sorted(newest.items())},
-        "lanes": report,
-        "verdict": "STALE" if any(entry["verdict"] == "STALE" for entry in report.values()) else "CURRENT",
+        "lanes": report, "verdict": overall,
     }
 
 
@@ -197,8 +224,9 @@ def render(result):
     lines = ["lane model currency (window %sh, %d of %d receipts) -> %s" % (
         result["sinceHours"], result["receiptsInWindow"], result["receiptsRead"], result["verdict"])]
     for lane, entry in result["lanes"].items():
-        lines.append("  %-7s %-8s latest=%s family-newest=%s runs=%d" % (
-            lane, entry["verdict"], entry["latestModel"], entry["familyNewest"], entry["runsInWindow"]))
+        lines.append("  %-7s %-10s latest=%s family-newest=%s runs=%d%s" % (
+            lane, entry["verdict"], entry["latestModel"], entry["familyNewest"], entry["runsInWindow"],
+            " unrecordedEffort=%d" % entry["unrecordedEffort"] if entry["unrecordedEffort"] else ""))
         for reason in entry["reasons"]:
             if reason["kind"] == "STALE-MODEL":
                 lines.append("          STALE-MODEL: ran %s, newest %s %s" % (
@@ -231,7 +259,7 @@ def main(argv=None):
     result["runsDir"] = runs_dir
     result["unreadableReceipts"] = unreadable
     print(json.dumps(result, indent=2, sort_keys=True) if args.json else render(result))
-    return 1 if result["verdict"] == "STALE" else 0
+    return {"CURRENT": 0, "STALE": 1}.get(result["verdict"], 3)
 
 
 if __name__ == "__main__":

@@ -65,12 +65,15 @@ class SelectReviewKeyBTests(unittest.TestCase):
         s = self.select()
         self.assertEqual((s["keyB"], s["producerLane"]), ("opus", "sonnet"))
 
-    def test_a_card_with_no_producer_receipt_defaults_to_opus_and_says_it_was_not_evidence_backed(self):
+    def test_a_card_with_no_producer_receipt_fails_toward_fable_and_says_it_was_not_evidence_backed(self):
+        # HUB RULING HUB-TICK 20261013T0321Z: an unknown producer may have been opus, so opus is not a
+        # safe default; key B is independent of the producer only if it is fable.
         self.receipt("OTHER-CARD", "opus", "2026-10-12T10:00:00.0000000Z")
         s = self.select()
-        self.assertEqual((s["keyB"], s["producerLane"], s["producerKnown"], s["reason"]), ("opus", None, False, "no-producer-receipt"))
+        self.assertEqual((s["keyB"], s["producerLane"], s["producerKnown"], s["reason"]), ("fable", None, False, "no-producer-receipt"))
         self.assertEqual(len(s["warnings"]), 1)
         self.assertIn("no producer receipt", s["warnings"][0])
+        self.assertIn("fable", s["warnings"][0])
 
     def test_a_sol_producer_warns_that_key_a_would_review_itself(self):
         self.receipt("CARD-1", "sol", "2026-10-12T10:00:00.0000000Z")
