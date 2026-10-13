@@ -201,13 +201,13 @@
       ]
     },
     {
-      "path": "platform/qt/MainWindow.cpp",
-      "anchor": "renderTotalMs > 0.0",
+      "path": "platform/qt/PlaybackScopesDuringPlayback.h",
+      "anchor": "return renderTotalMs > 0.0",
       "class": "value_fallback_select",
       "clock": "qpc_stage_clock",
-      "justification": "Chooses between a measured render-thread-total-driven scope-update cadence and the configured base interval when the telemetry field read zero (not yet populated); a UI-update-interval selection, not a run-proof.",
+      "justification": "Chooses between a measured render-thread-total-driven scope-update cadence and the configured base interval when the telemetry field read zero (not yet populated); a UI-update-interval selection, not a run-proof. PLAYBACK-SCOPES-OPTION-1 moved it from MainWindow.cpp's drawFrameReady into playbackScopeUpdateIntervalForMode().",
       "lines": [
-        27347
+        109
       ]
     },
     {
