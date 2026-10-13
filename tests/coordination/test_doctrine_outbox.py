@@ -2122,6 +2122,73 @@ def test_a_normal_path_node_still_resolves(tmp_path, monkeypatch):
     assert ob.find_node() is None  # no node on PATH at all stays None, the existing NODE_ABSENT path
 
 
+def test_a_relative_path_entry_resolves_to_an_absolute_node(tmp_path, monkeypatch):
+    """A PATH entry that leaves the cwd ("../bin") must come back absolute: the child runs under another cwd,
+    where a relative path names a different file than the one identity-checked here."""
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    real = _plant_node(tmp_path / "bin")
+    monkeypatch.chdir(cwd)
+    _only_path(monkeypatch, os.path.join("..", "bin"))
+    found = ob.find_node()
+    assert found is not None and os.path.isabs(found)
+    assert os.path.samefile(found, real)
+
+
+def test_a_relative_path_entry_cannot_reach_a_bus_node_from_the_child_cwd(tmp_path, monkeypatch):
+    """Sol r1 repro: the trusted node and the bus node sit under sibling dirs; "../bus/bin" is judged from the
+    parent cwd and would resolve to the bus node's twin from the child's temp cwd. The value handed to
+    subprocess.run must be absolute and the very file that was identity-checked."""
+    cwd, bus = tmp_path / "project", tmp_path / "bus"
+    cwd.mkdir()
+    _plant_node(bus / "bin")
+    real = _plant_node(tmp_path / "trusted" / "bin")
+    wt = tmp_path / "wt"
+    (wt / "tools").mkdir(parents=True)
+    (wt / ob.CARD_VALIDATOR_REL).write_text("// never run\n", encoding="utf-8")
+    cards = wt / "cards.md"
+    cards.write_text("x\n", encoding="utf-8")
+    monkeypatch.chdir(cwd)
+    _only_path(monkeypatch, os.path.join("..", "trusted", "bin"))
+    seen = []
+
+    def run(cmd, *a, **kw):
+        seen.append((cmd[0], kw.get("cwd")))
+        return subprocess.CompletedProcess(cmd, 0, stdout="[validate-cards] 1 file(s), 1 card(s), 0 no-card line(s), 0 problem(s).\n", stderr="")
+    monkeypatch.setattr(ob.subprocess, "run", run)
+
+    ob.validate_cards_file(wt, cards, bus)
+
+    assert len(seen) == 1
+    handed, child_cwd = seen[0]
+    assert os.path.isabs(handed), f"the validator interpreter was handed over relative: {handed!r}"
+    assert os.path.samefile(handed, real)
+    assert child_cwd is not None and os.path.realpath(child_cwd) != os.path.realpath(cwd)
+    _only_path(monkeypatch, os.path.join("..", "bus", "bin"))  # the bus spelling itself is still refused
+    with pytest.raises(ob.Refusal) as excinfo:
+        ob.find_node(bus)
+    assert excinfo.value.code == "CARD_VALIDATOR_NODE_ABSENT"
+
+
+def test_a_node_file_symlink_into_the_bus_checkout_does_not_launder_it(tmp_path, monkeypatch):
+    """_inside_any judges the realpath: an outside PATH dir whose `node` is a file symlink into the bus is refused."""
+    bus = tmp_path / "bus"
+    target = _plant_node(bus / "bin")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    link = outside / ("node.exe" if sys.platform == "win32" else "node")
+    try:
+        link.symlink_to(target)
+    except (OSError, NotImplementedError) as e:
+        pytest.skip(f"cannot create a file symlink here (no privilege or unsupported): {e}")
+    _quiet_cwd(tmp_path, monkeypatch)
+    _only_path(monkeypatch, outside)
+    with pytest.raises(ob.Refusal) as excinfo:
+        ob.find_node(bus)
+    assert excinfo.value.code == "CARD_VALIDATOR_NODE_ABSENT"
+    assert "cwd or a bus checkout" in excinfo.value.detail
+
+
 @needs_node
 def test_the_validator_child_runs_in_a_fresh_empty_dir(tmp_path, monkeypatch):
     bare, clone = init_bus(tmp_path)
@@ -2132,7 +2199,14 @@ def test_the_validator_child_runs_in_a_fresh_empty_dir(tmp_path, monkeypatch):
 
     def run(cmd, *a, **kw):
         if cmd[0] == node:
-            seen.append((kw.get("cwd"), os.listdir(kw["cwd"]) if kw.get("cwd") else None))
+            cwd = kw.get("cwd")
+            # ancestry, not equality, judged while the dir still exists: the temp dir is nowhere inside the bus
+            # checkout, and the checkout is nowhere inside the temp dir
+            real_child = Path(os.path.realpath(cwd)) if cwd else None
+            real_clone = Path(os.path.realpath(clone))
+            inside_bus = real_child is not None and any(os.path.samefile(p, real_clone) for p in (real_child, *real_child.parents))
+            bus_inside = real_child is not None and any(os.path.samefile(p, real_child) for p in (real_clone, *real_clone.parents))
+            seen.append((cwd, os.listdir(cwd) if cwd else None, inside_bus, bus_inside))
         return real_run(cmd, *a, **kw)
     monkeypatch.setattr(ob.subprocess, "run", run)
 
@@ -2140,9 +2214,12 @@ def test_the_validator_child_runs_in_a_fresh_empty_dir(tmp_path, monkeypatch):
 
     assert report["refused"] == [] and [p["target"] for p in report["published"]] == [CARDS]
     assert seen, "the validator child never ran"
-    for child_cwd, listing in seen:
+    for child_cwd, listing, inside_bus, bus_inside in seen:
         assert child_cwd is not None and listing == []
-        assert os.path.realpath(child_cwd) not in (os.path.realpath(os.getcwd()), os.path.realpath(clone))
+        assert os.path.realpath(child_cwd) != os.path.realpath(os.getcwd())
+        assert not inside_bus, "the child's temp cwd is inside the bus checkout"
+        assert not bus_inside, "the bus checkout is inside the child's temp cwd"
+        assert not os.path.exists(child_cwd), "the child's temp cwd was not removed after the run"
 
 
 def test_r14_receipts_and_rulings_keep_their_targets(tmp_path):

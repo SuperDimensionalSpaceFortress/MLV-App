@@ -592,7 +592,8 @@ def _inside_any(path: str, roots: list[str]) -> bool:
 
 
 def find_node(*bus_roots: pathlib.Path | None) -> str | None:
-    """The `node` the card validator runs under, found by walking PATH entries only: never the cwd
+    """The `node` the card validator runs under, as an ABSOLUTE path (resolved against this process's cwd
+    at lookup time, and identity-checked in that same form), found by walking PATH entries only: never the cwd
     (shutil.which looks there first on win32, so a planted node.exe would win) and never anything
     inside the cwd or a bus checkout, compared by file identity. None means no node on PATH at all.
     Raises Refusal CARD_VALIDATOR_NODE_ABSENT when node exists only at excluded places, and
@@ -604,6 +605,7 @@ def find_node(*bus_roots: pathlib.Path | None) -> str | None:
             entry = entry.strip().strip('"')
             if not entry or not os.path.isdir(entry):
                 continue
+            entry = os.path.abspath(entry)  # absolute now: the child runs under another cwd, so a relative PATH entry would name a different file there
             for cand in _node_candidates(entry):
                 if not (os.path.isfile(cand) and os.access(cand, os.X_OK)):
                     continue
