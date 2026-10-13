@@ -441,7 +441,8 @@ function Find-WorktreeHolders {
         $via = $null
         $cl = [string]$p.CommandLine   # null when the command line is unreadable: nothing to match, but the cwd probe still runs
         if ($cl.IndexOf($wd, [StringComparison]::OrdinalIgnoreCase) -ge 0 -or $cl.IndexOf($slash, [StringComparison]::OrdinalIgnoreCase) -ge 0) { $via = 'cmdline' }
-        if (-not $via -and $idx.Decoded.ContainsKey($procId)) {
+        # A holder index built by a caller (a -SnapshotProvider) predates Decoded: read it only when present (StrictMode throws on a missing property).
+        if (-not $via -and $idx.PSObject.Properties['Decoded'] -and $idx.Decoded.ContainsKey($procId)) {
             $dt = [string]$idx.Decoded[$procId]   # r6: the same path test over the decoded -EncodedCommand text
             if ($dt.IndexOf($wd, [StringComparison]::OrdinalIgnoreCase) -ge 0 -or $dt.IndexOf($slash, [StringComparison]::OrdinalIgnoreCase) -ge 0) { $via = 'cmdline-encoded' }
         }
