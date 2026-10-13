@@ -101,6 +101,10 @@ void flush(const char * reason);
  *  part is dropped first). */
 QString clipHash(const QString & basenameOrPath);
 
+/*! Test-only: runs the real session end once (r6: its terminal drain of both
+ *  backend DLLs, then the final flush), then re-arms it. */
+void sessionEndForTesting();
+
 } // namespace GpuFieldTelemetry
 
 #endif // GPU_FIELD_TELEMETRY_H

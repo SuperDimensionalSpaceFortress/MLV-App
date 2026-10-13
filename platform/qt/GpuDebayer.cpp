@@ -26,6 +26,16 @@
 #include <atomic>
 #include <cstring>
 
+#ifdef Q_OS_WIN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+
 namespace
 {
 constexpr GLfloat kQuadVertices[16] = {
@@ -343,9 +353,51 @@ struct GpuAmazeDebayerRuntime
     GpuAmazeResetLiveGlTextureResourcesFn resetLiveGlTextureResources = nullptr;
     GpuAmazeSetReducedHnyquistFn setReducedHnyquist = nullptr;
     GpuAmazeLastTimingFn lastTiming = nullptr;
-    /* GPU-FIELD-TELEMETRY-1: optional; older DLLs omit it. */
-    GpuAmazeLastCudaErrorFn lastCudaError = nullptr;
+    /* GPU-FIELD-TELEMETRY-1: optional; older DLLs omit them (r6: drain and the
+     * pending words; r4: last only). */
+    GpuAmazeCudaErrorSource cudaErrors;
 };
+
+typedef int (*GpuAmazeDrainCudaErrorsFn)(int, igpu_cuda_error_t *, int, unsigned long long *);
+typedef const volatile long * (*GpuAmazeCudaErrorPendingWordFn)(int);
+
+/* r6: the optional error exports of a loaded AMaZE DLL. pending is set only
+ * with drain, so a non-zero word always has a drain behind it. */
+GpuAmazeCudaErrorSource resolveAmazeCudaErrorSource(GpuAmazeLastCudaErrorFn last,
+                                                    GpuAmazeDrainCudaErrorsFn drain,
+                                                    GpuAmazeCudaErrorPendingWordFn pendingWord)
+{
+    GpuAmazeCudaErrorSource source;
+    source.last = last;
+    if ( drain && pendingWord )
+    {
+        source.drain = drain;
+        source.pending[IGPU_CUDA_ERROR_CHANNEL_RENDER] = pendingWord(IGPU_CUDA_ERROR_CHANNEL_RENDER);
+        source.pending[IGPU_CUDA_ERROR_CHANNEL_PREUPLOAD] = pendingWord(IGPU_CUDA_ERROR_CHANNEL_PREUPLOAD);
+    }
+    return source;
+}
+
+std::atomic<GpuAmazeStageTelemetrySink> g_amazeStageTelemetrySink{nullptr};
+std::atomic<const GpuAmazeCudaErrorSource *> g_amazeCudaErrorSourceForTesting{nullptr};
+
+/* r6: one drain of `channel` (failure / non-empty path only). Returns n. */
+int drainAmazeCudaErrors(const GpuAmazeCudaErrorSource & source, int channel,
+                         igpu_cuda_error_t (&notes)[IGPU_CUDA_ERROR_PENDING_MAX],
+                         unsigned long long * dropped)
+{
+    *dropped = 0;
+    if ( !source.drain ) return 0;
+    int n = source.drain(channel, notes, IGPU_CUDA_ERROR_PENDING_MAX, dropped);
+    if ( n < 0 ) n = 0;
+    if ( n > IGPU_CUDA_ERROR_PENDING_MAX ) n = IGPU_CUDA_ERROR_PENDING_MAX;
+    for ( int i = 0; i < n; ++i )
+    {
+        notes[i].name[sizeof(notes[i].name) - 1] = '\0';
+        notes[i].site[sizeof(notes[i].site) - 1] = '\0';
+    }
+    return n;
+}
 
 template <typename FunctionPointer>
 bool resolveAmazeDebayerSymbol(QLibrary * library,
@@ -384,8 +436,13 @@ bool loadAmazeDebayerRuntime(GpuAmazeDebayerRuntime * runtime,
         return false;
     }
 
-    runtime->lastCudaError = reinterpret_cast<GpuAmazeLastCudaErrorFn>(
-        runtime->library.resolve("igpu_amaze_debayer_last_cuda_error"));
+    runtime->cudaErrors = resolveAmazeCudaErrorSource(
+        reinterpret_cast<GpuAmazeLastCudaErrorFn>(
+            runtime->library.resolve("igpu_amaze_debayer_last_cuda_error")),
+        reinterpret_cast<GpuAmazeDrainCudaErrorsFn>(
+            runtime->library.resolve("igpu_amaze_debayer_drain_cuda_errors")),
+        reinterpret_cast<GpuAmazeCudaErrorPendingWordFn>(
+            runtime->library.resolve("igpu_amaze_debayer_cuda_error_pending_word")));
     return resolveAmazeDebayerSymbol(&runtime->library,
                                      "igpu_amaze_debayer_create",
                                      &runtime->create,
@@ -481,42 +538,41 @@ void copyAmazeTiming(GpuAmazeDebayerRuntime * runtime,
     }
 }
 
+/* r6: before an AMaZE run wrapper's backend call (same lock as the call). Codes
+ * still pending were noted by a call nothing captured (create, destroy, the GL
+ * reset, ...): they are emitted now as orphans with their own site, never as
+ * this call's. While the channel is empty this is one relaxed load. Call sites
+ * guard it with GpuFieldTelemetry::enabled(). */
+void enterAmazeStageTelemetry(GpuAmazeDebayerRuntime * runtime)
+{
+    if ( !runtime || !runtime->cudaErrors.pending[IGPU_CUDA_ERROR_CHANNEL_RENDER] ) return;
+    if ( __atomic_load_n(runtime->cudaErrors.pending[IGPU_CUDA_ERROR_CHANNEL_RENDER], __ATOMIC_RELAXED) == 0 )
+        return;
+    gpuAmazeCudaErrorsEmitOrphans(runtime->cudaErrors, 1, g_amazeStageTelemetrySink.load(std::memory_order_relaxed));
+}
+
 /* GPU-FIELD-TELEMETRY-1: one stage record per AMaZE run wrapper call. Success
- * reads the backend's own per-frame timing (no CUDA call); failure reads the
- * DLL's last-CUDA-error slot, attributed only when it noted a code since the
- * previous read. Call sites guard it with GpuFieldTelemetry::enabled(). */
+ * reads the backend's own per-frame timing (no CUDA call); failure (r6) emits
+ * every code the call noted (gpuAmazeCudaErrorsEmitFailure). Call sites guard
+ * it with GpuFieldTelemetry::enabled(). */
 void noteAmazeStageTelemetry(GpuAmazeDebayerRuntime * runtime,
                              igpu_amaze_debayer_backend * backend,
                              const char * stage,
                              int rc)
 {
     if ( !runtime || !backend ) return;
+    const GpuAmazeStageTelemetrySink sink = g_amazeStageTelemetrySink.load(std::memory_order_relaxed);
+    if ( !sink ) return;
     if ( rc == 0 )
     {
         igpu_amaze_debayer_timing_t backendTiming;
         if ( runtime->lastTiming && runtime->lastTiming(backend, &backendTiming) == 0 )
         {
-            GpuFieldTelemetry::noteStage("amaze", stage, backendTiming.total_ms);
+            sink(stage, 0, backendTiming.total_ms, 0, nullptr, nullptr, nullptr, 0);
         }
         return;
     }
-    static std::atomic<unsigned long long> seenCudaErrorCount{0};
-    GpuFieldTelemetry::CudaFault fault;
-    fault.dll = "amaze";
-    fault.stage = stage;
-    fault.rc = rc;
-    igpu_cuda_error_t error;
-    std::memset(&error, 0, sizeof(error));
-    if ( runtime->lastCudaError
-      && runtime->lastCudaError(&error) == 0
-      && seenCudaErrorCount.exchange(error.count) != error.count
-      && error.code != 0 )
-    {
-        fault.cudaCode = error.code;
-        fault.cudaName = error.name;
-        fault.site = error.site;
-    }
-    GpuFieldTelemetry::noteFault(fault);
+    gpuAmazeCudaErrorsEmitFailure(runtime->cudaErrors, stage, rc, sink);
 }
 
 struct GpuAmazeDebayerLiveTextureRuntime
@@ -913,6 +969,7 @@ bool gpuAmazeDebayerApplyGpuOffscreen(const float * inputRawFrame,
         return fail(mismatch);
     }
 
+    if ( GpuFieldTelemetry::enabled() ) enterAmazeStageTelemetry(&runtime);
     const int rc = runtime.run(backend, inputRawFrame, outputRgb16, width, height);
     if ( GpuFieldTelemetry::enabled() ) noteAmazeStageTelemetry(&runtime, backend, "amaze:offscreen", rc);
     if ( rc != 0 )
@@ -995,6 +1052,7 @@ bool gpuAmazeDebayerRenderPostWbGlTexture(const float * inputRawFrame,
         return fail(mismatch);
     }
 
+    if ( GpuFieldTelemetry::enabled() ) enterAmazeStageTelemetry(&runtime);
     const int rc = runtime.runPostWbGlTexture(backend,
                                              inputRawFrame,
                                              glTexture,
@@ -1047,6 +1105,15 @@ void gpuAmazeDebayerResetR16TextureBackendResources(void)
     {
         live.runtime.resetLiveGlTextureResources(live.backend);
     }
+    /* r6 terminal drain at GL release (teardown only): the reset is not a
+     * captured call, and the view may never render again, so whatever the DLL
+     * still holds (the reset's gl_cache:unregister, ...) is emitted now. */
+    const GpuAmazeStageTelemetrySink sink = g_amazeStageTelemetrySink.load(std::memory_order_relaxed);
+    if ( sink )
+    {
+        const GpuAmazeCudaErrorSource * forTesting = g_amazeCudaErrorSourceForTesting.load();
+        gpuAmazeCudaErrorsEmitOrphans(forTesting ? *forTesting : live.runtime.cudaErrors, 2, sink);
+    }
 }
 
 bool gpuAmazeDebayerRenderPostWbGlTextureFromR16GlTexture(
@@ -1093,6 +1160,7 @@ bool gpuAmazeDebayerRenderPostWbGlTextureFromR16GlTexture(
     {
         return fail(hnyquistReason);
     }
+    if ( GpuFieldTelemetry::enabled() ) enterAmazeStageTelemetry(&live.runtime);
     const int rc =
         live.runtime.runPostWbGlTextureFromR16GlTexture(
             live.backend,
@@ -1169,6 +1237,7 @@ bool gpuAmazeDebayerRenderPostWbGlTextureFromDeviceBayer16(
         return fail(hnyquistReason);
     }
 
+    if ( GpuFieldTelemetry::enabled() ) enterAmazeStageTelemetry(&live.runtime);
     const int rc =
         live.runtime.runPostWbGlTextureFromDeviceBayer16(
             live.backend,
@@ -1225,4 +1294,120 @@ bool gpuAmazeDebayerApplyGpuOffscreenPostWb(const float * inputRawFrame,
 
     applyPostWbUndoToRgb16(outputRgb16, width, height, blackLevel, wbMultipliers);
     return true;
+}
+
+void gpuAmazeDebayerSetStageTelemetrySink(GpuAmazeStageTelemetrySink sink)
+{
+    g_amazeStageTelemetrySink.store(sink);
+}
+
+int gpuAmazeCudaErrorsEmitOrphans(const GpuAmazeCudaErrorSource & source, int channels,
+                                  GpuAmazeStageTelemetrySink sink)
+{
+    if ( !sink || !source.drain ) return 0;
+    int emitted = 0;
+    for ( int channel = 0; channel < channels && channel < 2; ++channel )
+    {
+        if ( source.pending[channel] && __atomic_load_n(source.pending[channel], __ATOMIC_RELAXED) == 0 )
+            continue;
+        igpu_cuda_error_t notes[IGPU_CUDA_ERROR_PENDING_MAX];
+        unsigned long long dropped = 0;
+        const int n = drainAmazeCudaErrors(source, channel, notes, &dropped);
+        for ( int i = 0; i < n; ++i, ++emitted )
+        {
+            sink("amaze:uncaptured", 0, -1.0, notes[i].code, notes[i].name, notes[i].site, "orphan",
+                 i == 0 ? dropped : 0);
+        }
+    }
+    return emitted;
+}
+
+int gpuAmazeCudaErrorsEmitFailure(const GpuAmazeCudaErrorSource & source, const char * stage, int rc,
+                                  GpuAmazeStageTelemetrySink sink)
+{
+    if ( !sink || rc == 0 ) return 0;
+    if ( !source.drain )
+    {
+        /* An r4 DLL: the last code, attributed only when one was noted since
+         * the previous read. */
+        static std::atomic<unsigned long long> seenCudaErrorCount{0};
+        igpu_cuda_error_t error;
+        std::memset(&error, 0, sizeof(error));
+        if ( source.last
+          && source.last(&error) == 0
+          && seenCudaErrorCount.exchange(error.count) != error.count
+          && error.code != 0 )
+        {
+            error.name[sizeof(error.name) - 1] = '\0';
+            error.site[sizeof(error.site) - 1] = '\0';
+            sink(stage, rc, -1.0, error.code, error.name, error.site, "primary", 0);
+        }
+        else
+        {
+            sink(stage, rc, -1.0, 0, nullptr, nullptr, "primary", 0);
+        }
+        return 1;
+    }
+    igpu_cuda_error_t notes[IGPU_CUDA_ERROR_PENDING_MAX];
+    unsigned long long dropped = 0;
+    const int n = drainAmazeCudaErrors(source, IGPU_CUDA_ERROR_CHANNEL_RENDER, notes, &dropped);
+    if ( n == 0 )
+    {
+        sink(stage, rc, -1.0, 0, nullptr, nullptr, "primary", dropped);
+        return 1;
+    }
+    for ( int i = 0; i < n; ++i )
+    {
+        sink(stage, rc, -1.0, notes[i].code, notes[i].name, notes[i].site,
+             i == 0 ? "primary" : "secondary", i == 0 ? dropped : 0);
+    }
+    return n;
+}
+
+int gpuAmazeDebayerDrainCudaErrorsAtTeardown(int waitMs)
+{
+    const GpuAmazeStageTelemetrySink sink = g_amazeStageTelemetrySink.load(std::memory_order_relaxed);
+    if ( !sink ) return 0;
+    GpuAmazeDebayerLiveTextureRuntime & live = liveAmazeTextureRuntime();
+    /* A live run still in flight keeps its own codes: wait for it (bounded). A
+     * run that does not return in time cannot hide a code either: the drain
+     * runs anyway, and the code is reported as an orphan with its own site. */
+    const bool locked = live.mutex.tryLock(waitMs > 0 ? waitMs : 0);
+    GpuAmazeCudaErrorSource source;
+    if ( const GpuAmazeCudaErrorSource * forTesting = g_amazeCudaErrorSourceForTesting.load() )
+    {
+        source = *forTesting;
+    }
+#ifdef Q_OS_WIN
+    else
+    {
+        /* Only a DLL this process already loaded (offscreen runs load it too,
+         * and nothing unloads it); never a fresh load at exit. */
+        const QString path = QDir::toNativeSeparators(gpuAmazeDebayerDllPath());
+        HMODULE module = GetModuleHandleW(reinterpret_cast<const wchar_t *>(path.utf16()));
+        if ( !module )
+        {
+            const QString name = QFileInfo(path).fileName();
+            module = GetModuleHandleW(reinterpret_cast<const wchar_t *>(name.utf16()));
+        }
+        if ( module )
+        {
+            source = resolveAmazeCudaErrorSource(
+                reinterpret_cast<GpuAmazeLastCudaErrorFn>(
+                    reinterpret_cast<void *>(GetProcAddress(module, "igpu_amaze_debayer_last_cuda_error"))),
+                reinterpret_cast<GpuAmazeDrainCudaErrorsFn>(
+                    reinterpret_cast<void *>(GetProcAddress(module, "igpu_amaze_debayer_drain_cuda_errors"))),
+                reinterpret_cast<GpuAmazeCudaErrorPendingWordFn>(
+                    reinterpret_cast<void *>(GetProcAddress(module, "igpu_amaze_debayer_cuda_error_pending_word"))));
+        }
+    }
+#endif
+    const int emitted = gpuAmazeCudaErrorsEmitOrphans(source, 2, sink);
+    if ( locked ) live.mutex.unlock();
+    return emitted;
+}
+
+void gpuAmazeDebayerSetCudaErrorSourceForTesting(const GpuAmazeCudaErrorSource * source)
+{
+    g_amazeCudaErrorSourceForTesting.store(source);
 }

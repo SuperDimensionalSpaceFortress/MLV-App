@@ -342,6 +342,16 @@ typedef void (*llrpGpuStageTelemetrySink_t)(const char * stage, int rc, double m
                                             unsigned long long dropped);
 void llrpSetGpuStageTelemetrySink(llrpGpuStageTelemetrySink_t sink);
 llrpGpuStageTelemetrySink_t llrpGetGpuStageTelemetrySinkForTesting(void);
+/* r6 terminal drain: a code noted after the last captured call has no later
+ * call to drain it at entry. llrpGpuPlaybackReconResetGlTextureResources (the
+ * GPU view releasing its GL resources) drains both channels after its reset,
+ * and session end calls this before the backend is unloaded. Each code still
+ * pending is emitted as a "recon:uncaptured" orphan with its own site, and so
+ * is each code a released backend (a DLL switch) still held before it was
+ * freed (its destroy's gl_cache:unregister, ...), kept until then. Waits
+ * at most wait_ms for the backend mutex (-1 if it stayed busy); with no sink
+ * nothing is drained (0). Returns the records emitted. */
+int llrpGpuPlaybackReconDrainCudaErrorsAtTeardown(int wait_ms);
 int llrpGpuPlaybackReconCopyLastDeviceBayer16ToGlTexture(unsigned int gl_texture_id,
                                                          int * rc_out);
 int llrpGpuPlaybackReconRunCpu16Probe(const llrpGpuPlaybackReconState_t * state,

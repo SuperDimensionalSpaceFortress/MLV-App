@@ -14,3 +14,5 @@ EXPORTS
     igpu_amaze_debayer_set_reduced_hnyquist
     igpu_amaze_debayer_last_timing
     igpu_amaze_debayer_last_cuda_error
+    igpu_amaze_debayer_drain_cuda_errors
+    igpu_amaze_debayer_cuda_error_pending_word

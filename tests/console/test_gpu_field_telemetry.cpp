@@ -1073,6 +1073,129 @@ TEST(GpuFieldTelemetry, CapturesDrainEveryNoteAndOrphansAtEntry)
     ASSERT_EQ(0, d.value(QStringLiteral("dropped")).toInt());
 }
 
+// r6 B1/B2 wiring (sol r5 blockers): the AMaZE DLL exports the r5 drain and pending word over the
+// same slot; GpuDebayer resolves both, enters each of the 4 AMaZE runs (one relaxed load, orphans
+// drained) before its backend call and drains every code of a failed call; both GL resets drain
+// what is left (the view release), and session end drains both DLLs after the worker join and before
+// its final flush. Returns what is missing, so the test can check it against mutants.
+// Runtime proof: pipeline_tests GpuFieldTelemetryCapture.* (r6 tests).
+QString bodyFrom(const QString & source, const QString & signature)
+{
+    const int at = source.indexOf(signature);
+    if (at < 0) return QString();
+    const int end = source.indexOf(QStringLiteral("\n}\n"), at);
+    return end < 0 ? QString() : source.mid(at, end + 3 - at);
+}
+
+QStringList r6WiringCensus(const QString & def, const QString & amaze, const QString & debayer,
+                           const QString & llrawproc, const QString & telemetry)
+{
+    QStringList missing;
+    const auto need = [&](bool ok, const char * what) { if (!ok) missing << QString::fromLatin1(what); };
+    need(def.contains(QStringLiteral("    igpu_amaze_debayer_drain_cuda_errors\n")), "def drain");
+    need(def.contains(QStringLiteral("    igpu_amaze_debayer_cuda_error_pending_word\n")), "def pending word");
+    need(amaze.contains(QStringLiteral("    return igpu_cuda_error_slot::drain(channel, out, capacity, dropped);\n}")),
+         "amaze drain over the slot");
+    need(amaze.contains(QStringLiteral("    return igpu_cuda_error_slot::pending_word(channel);\n}")),
+         "amaze pending word over the slot");
+    need(debayer.contains(QStringLiteral("runtime->library.resolve(\"igpu_amaze_debayer_drain_cuda_errors\")")),
+         "resolve drain");
+    need(debayer.contains(QStringLiteral("runtime->library.resolve(\"igpu_amaze_debayer_cuda_error_pending_word\")")),
+         "resolve pending word");
+    // Each of the 4 runs is entered, under the telemetry gate, before its backend call.
+    const QString enter = QStringLiteral("if ( GpuFieldTelemetry::enabled() ) enterAmazeStageTelemetry(&");
+    need(debayer.count(enter) == 4, "4 AMaZE entries");
+    const char * calls[] = {"const int rc = runtime.run(backend,", "const int rc = runtime.runPostWbGlTexture(backend,",
+                            "live.runtime.runPostWbGlTextureFromR16GlTexture(",
+                            "live.runtime.runPostWbGlTextureFromDeviceBayer16("};
+    for (const char * call : calls)
+    {
+        const int callAt = debayer.indexOf(QString::fromLatin1(call));
+        const int enterAt = debayer.lastIndexOf(enter, callAt);
+        need(callAt > 0 && enterAt > 0 && debayer.indexOf(QStringLiteral("const int rc"), enterAt) <= callAt
+                 && debayer.indexOf(QStringLiteral("noteAmazeStageTelemetry("), enterAt) > callAt,
+             "an entry right before each AMaZE run");
+    }
+    const QString enterBody = bodyFrom(debayer, QStringLiteral("void enterAmazeStageTelemetry("));
+    need(enterBody.contains(QStringLiteral(
+             "__atomic_load_n(runtime->cudaErrors.pending[IGPU_CUDA_ERROR_CHANNEL_RENDER], __ATOMIC_RELAXED) == 0 )\n"
+             "        return;")), "entry: one relaxed load decides");
+    const QString note = bodyFrom(debayer, QStringLiteral("void noteAmazeStageTelemetry("));
+    need(note.contains(QStringLiteral("gpuAmazeCudaErrorsEmitFailure(runtime->cudaErrors, stage, rc, sink);")),
+         "failure drains every code");
+    need(!note.contains(QStringLiteral("seenCudaErrorCount")), "no last-note rule on the r6 path");
+    const QString failure = bodyFrom(debayer, QStringLiteral("int gpuAmazeCudaErrorsEmitFailure("));
+    need(failure.contains(QStringLiteral("drainAmazeCudaErrors(source, IGPU_CUDA_ERROR_CHANNEL_RENDER, notes, &dropped);")),
+         "failure drain");
+    need(failure.contains(QStringLiteral("i == 0 ? \"primary\" : \"secondary\"")), "primary then secondary");
+    // The view release: both GL resets drain what is left.
+    need(bodyFrom(debayer, QStringLiteral("void gpuAmazeDebayerResetR16TextureBackendResources(void)"))
+             .contains(QStringLiteral("gpuAmazeCudaErrorsEmitOrphans(forTesting ? *forTesting : live.runtime.cudaErrors, 2, sink);")),
+         "AMaZE GL reset drain");
+    const QString reset = bodyFrom(llrawproc, QStringLiteral("int llrpGpuPlaybackReconResetGlTextureResources(void)\n{"));
+    need(reset.contains(QStringLiteral("if(telemetry_sink) llrawproc_gpu_stage_telemetry_take_leftovers(g, leftovers);"))
+             && reset.contains(QStringLiteral("if(telemetry_sink) llrawproc_gpu_stage_telemetry_emit_leftovers(telemetry_sink, leftovers);")),
+         "recon GL reset drain");
+    const QString leftovers = bodyFrom(llrawproc, QStringLiteral("static void llrawproc_gpu_stage_telemetry_take_leftovers("));
+    need(leftovers.contains(QStringLiteral("for(channel = 0; channel < 2; ++channel)"))
+             && leftovers.contains(QStringLiteral("llrawproc_gpu_stage_telemetry_drain(g, channel, &ev[channel].orphans);")),
+         "leftovers drain both channels");
+    // Session end: after the worker join, before the final flush.
+    const QString end = bodyFrom(telemetry, QStringLiteral("void sessionEnd()\n{"));
+    const int joinAt = end.indexOf(QStringLiteral("workerPool()->waitForDone("));
+    const int drainAt = end.indexOf(QStringLiteral("    drainBackendCudaErrors("));
+    const int flushAt = end.indexOf(QStringLiteral("flushImpl(\"session_end\""));
+    need(joinAt > 0 && drainAt > joinAt && flushAt > drainAt, "session end drains before its final flush");
+    const QString drain = bodyFrom(telemetry, QStringLiteral("void drainBackendCudaErrors(int waitMs)"));
+    need(drain.contains(QStringLiteral("    llrpGpuPlaybackReconDrainCudaErrorsAtTeardown(waitMs);\n"))
+             && drain.contains(QStringLiteral("    gpuAmazeDebayerDrainCudaErrorsAtTeardown(waitMs);\n")),
+         "session end drains both DLLs");
+    need(telemetry.contains(QStringLiteral("    gpuAmazeDebayerSetStageTelemetrySink(&amazeStageSink);\n")),
+         "install installs the AMaZE sink");
+    return missing;
+}
+
+TEST(GpuFieldTelemetry, AmazeDrainsEveryCodeAndLeftoversAreDrainedAtTeardown)
+{
+    const QString def = readRepoFile(QStringLiteral("tools/gpu/backend/igpu_amaze_debayer_cuda.def"));
+    const QString amaze = readRepoFile(QStringLiteral("tools/gpu/backend/igpu_amaze_debayer_cuda.cu"));
+    const QString debayer = readRepoFile(QStringLiteral("platform/qt/GpuDebayer.cpp"));
+    const QString llrawproc = readRepoFile(QStringLiteral("src/mlv/llrawproc/llrawproc.c"));
+    const QString telemetry = readRepoFile(QStringLiteral("platform/qt/GpuFieldTelemetry.cpp"));
+    ASSERT_EQ(std::string(), r6WiringCensus(def, amaze, debayer, llrawproc, telemetry).join(QStringLiteral("; ")).toStdString());
+    // The GPU views release through both resets (the terminal drain's first leg).
+    for (const char * view : {"platform/qt/GpuDisplayWindow.cpp", "platform/qt/GpuDisplayViewport.cpp"})
+    {
+        const QString source = readRepoFile(QString::fromLatin1(view));
+        ASSERT_TRUE(source.contains(QStringLiteral(
+            "        gpuAmazeDebayerResetR16TextureBackendResources();\n"
+            "        llrpGpuPlaybackReconResetGlTextureResources();\n")));
+    }
+    // Mutants: the 0f199cea shape of each piece is reported.
+    const QString noSessionDrain = replacedOnce(telemetry,
+        QStringLiteral("    llrpGpuPlaybackReconDrainCudaErrorsAtTeardown(waitMs);\n"), QStringLiteral(""));
+    ASSERT_EQ(std::string("session end drains both DLLs"),
+              r6WiringCensus(def, amaze, debayer, llrawproc, noSessionDrain).join(QStringLiteral("; ")).toStdString());
+    const QString lastOnly = replacedOnce(debayer,
+        QStringLiteral("gpuAmazeCudaErrorsEmitFailure(runtime->cudaErrors, stage, rc, sink);"),
+        QStringLiteral("seenCudaErrorCount.exchange(0);"));
+    ASSERT_EQ(std::string("failure drains every code; no last-note rule on the r6 path"),
+              r6WiringCensus(def, amaze, lastOnly, llrawproc, telemetry).join(QStringLiteral("; ")).toStdString());
+    const QString noEntry = replacedOnce(debayer,
+        QStringLiteral("    if ( GpuFieldTelemetry::enabled() ) enterAmazeStageTelemetry(&live.runtime);\n    const int rc =\n"
+                       "        live.runtime.runPostWbGlTextureFromR16GlTexture("),
+        QStringLiteral("    const int rc =\n        live.runtime.runPostWbGlTextureFromR16GlTexture("));
+    ASSERT_EQ(std::string("4 AMaZE entries; an entry right before each AMaZE run"),
+              r6WiringCensus(def, amaze, noEntry, llrawproc, telemetry).join(QStringLiteral("; ")).toStdString());
+    const QString noResetDrain = replacedOnce(llrawproc,
+        QStringLiteral("    if(telemetry_sink) llrawproc_gpu_stage_telemetry_take_leftovers(g, leftovers);\n"), QStringLiteral(""));
+    ASSERT_EQ(std::string("recon GL reset drain"),
+              r6WiringCensus(def, amaze, debayer, noResetDrain, telemetry).join(QStringLiteral("; ")).toStdString());
+    const QString noDefDrain = replacedOnce(def, QStringLiteral("    igpu_amaze_debayer_drain_cuda_errors\n"), QStringLiteral(""));
+    ASSERT_EQ(std::string("def drain"),
+              r6WiringCensus(noDefDrain, amaze, debayer, llrawproc, telemetry).join(QStringLiteral("; ")).toStdString());
+}
+
 // r3 H4 (both keys, exit join): the System-log read ends inside the session-end wait, quit is held
 // for at most ~2 s, the worker stops before each step, and State outlives a worker session end
 // gave up on. EvtNext waits are a value table, not a timing claim.

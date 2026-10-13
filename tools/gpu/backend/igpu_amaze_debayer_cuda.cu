@@ -1998,3 +1998,16 @@ extern "C" int igpu_amaze_debayer_last_cuda_error(igpu_cuda_error_t * out)
 {
     return igpu_cuda_error_slot::copy_last(out);
 }
+
+/* GPU-FIELD-TELEMETRY-1 r6: every code a failed call noted, and a lock-free
+ * "anything pending" word (igpu_cuda_error.h). */
+extern "C" int igpu_amaze_debayer_drain_cuda_errors(int channel, igpu_cuda_error_t * out, int capacity,
+                                                    unsigned long long * dropped)
+{
+    return igpu_cuda_error_slot::drain(channel, out, capacity, dropped);
+}
+
+extern "C" const volatile long * igpu_amaze_debayer_cuda_error_pending_word(int channel)
+{
+    return igpu_cuda_error_slot::pending_word(channel);
+}

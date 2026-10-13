@@ -11,9 +11,13 @@
 // call reports EVERY code it noted (primary, then secondary), a code noted by a call nothing
 // captures is emitted as an orphan against its own site and never credited to the next call, and
 // queue drops are counted (dropped=N). In-call notes are armed so the fake notes them inside its
-// call, as a real failure branch does; NoteCudaErrorForTesting notes at once, between calls.
+// call, as a real failure branch does; NoteCudaErrorForTesting notes at once, between calls. (5) r6:
+// AMaZE gets the same drain-all capture and entry orphans (GpuDebayer.h's seam over this binary's
+// slot), and a code noted after the last captured call is drained by the GL reset (view release)
+// or by session end, once.
 #include "../common/minitest.h"
 #include "../../src/mlv/llrawproc/llrawproc.h"
+#include "../../platform/qt/GpuDebayer.h"
 #include "../../platform/qt/GpuFieldTelemetry.h"
 #include "../../tools/gpu/backend/igpu_cuda_error_slot.h"
 
@@ -32,6 +36,7 @@ extern "C" void llrpFakeGpuBackendInjectPreuploadFailureForTesting(int rc, int c
 extern "C" void llrpFakeGpuBackendNoteCudaErrorForTesting(int channel, int cuda_code, const char * name, const char * site);
 extern "C" void llrpFakeGpuBackendArmCudaNoteForTesting(int channel, int cuda_code, const char * name, const char * site);
 extern "C" long llrpFakeGpuBackendCudaErrorsPendingForTesting(int channel, unsigned long long * dropped_total);
+extern "C" int llrpFakeGpuBackendFailCreateForTesting(void);
 
 namespace
 {
@@ -156,6 +161,55 @@ void drainSlot()
         ASSERT_EQ(0, cuda_slot::drain(channel, out, cuda_slot::kPending, nullptr));
     }
 }
+
+// r6: the AMaZE seam (GpuDebayer.h) driven over this binary's own slot, which is the same
+// igpu_cuda_error_slot.h the AMaZE DLL exports, and a recording AMaZE sink.
+std::vector<SinkCall> g_amazeCalls;
+
+void amazeRecordingSink(const char * stage, int rc, double ms, int cudaCode, const char * cudaName,
+                        const char * site, const char * role, unsigned long long dropped)
+{
+    g_amazeCalls.push_back({stage ? stage : "", rc, ms, cudaCode, cudaName ? cudaName : "", site ? site : "",
+                            role ? role : "", dropped});
+}
+
+int slotDrain(int channel, igpu_cuda_error_t * out, int capacity, unsigned long long * dropped)
+{
+    return cuda_slot::drain(channel, out, capacity, dropped);
+}
+
+int slotLast(igpu_cuda_error_t * out)
+{
+    return cuda_slot::copy_last(out);
+}
+
+GpuAmazeCudaErrorSource slotSource()
+{
+    GpuAmazeCudaErrorSource source;
+    source.drain = &slotDrain;
+    source.pending[kRender] = cuda_slot::pending_word(kRender);
+    source.pending[kPreupload] = cuda_slot::pending_word(kPreupload);
+    source.last = &slotLast;
+    return source;
+}
+
+struct AmazeSinkScope
+{
+    GpuAmazeCudaErrorSource source = slotSource();
+    AmazeSinkScope()
+    {
+        drainSlot();
+        g_amazeCalls.clear();
+        gpuAmazeDebayerSetStageTelemetrySink(&amazeRecordingSink);
+        gpuAmazeDebayerSetCudaErrorSourceForTesting(&source);
+    }
+    ~AmazeSinkScope()
+    {
+        gpuAmazeDebayerSetCudaErrorSourceForTesting(nullptr);
+        gpuAmazeDebayerSetStageTelemetrySink(nullptr);
+        g_amazeCalls.clear();
+    }
+};
 } // namespace
 
 // r3 B2 (sol): an async preupload that fails with a CUDA code (here cudaErrorMemoryAllocation,
@@ -782,4 +836,234 @@ TEST(GpuFieldTelemetryCapture, NineUncapturedNotesReportDroppedOneOnTheNextRecor
     ASSERT_EQ(0ull, g_calls[0].dropped);
     ASSERT_EQ(0L, llrpFakeGpuBackendCudaErrorsPendingForTesting(kRender, &droppedTotal));
     ASSERT_EQ(1ull, droppedTotal); // monotonic
+}
+
+// r6 B1 (sol r5 blocker 1): on the cached direct-RGBA output path, cudaGraphicsMapResources
+// fails with 700 (gl_rgba16_direct:map) and the cleanup's reset_cached_gl_resource then notes 709
+// (gl_cache:unregister), both inside one failing AMaZE call. The capture emits two records for that
+// call: 700 primary at the map site, then 709 secondary at the unregister site, and nothing is
+// left pending. A later validation-only failure reports code 0. On 0f199cea AMaZE read only the
+// last note: one record, 709, and 700 was never delivered.
+TEST(GpuFieldTelemetryCapture, AmazeFailedCallReportsTheMapCodeAndItsCleanupCodeOnce)
+{
+    const AmazeSinkScope amaze;
+    // The call's entry: nothing pending, nothing emitted.
+    ASSERT_EQ(0, gpuAmazeCudaErrorsEmitOrphans(amaze.source, 1, &amazeRecordingSink));
+    ASSERT_EQ(0, (int)g_amazeCalls.size());
+    cuda_slot::note(700, "cudaErrorIllegalAddress", "gl_rgba16_direct:map");
+    cuda_slot::note(709, "cudaErrorContextIsDestroyed", "gl_cache:unregister");
+    ASSERT_EQ(2, gpuAmazeCudaErrorsEmitFailure(amaze.source, "amaze:device_bayer16", 2, &amazeRecordingSink));
+    ASSERT_EQ(2, (int)g_amazeCalls.size());
+    ASSERT_EQ(std::string("amaze:device_bayer16"), g_amazeCalls[0].stage);
+    ASSERT_EQ(2, g_amazeCalls[0].rc);
+    ASSERT_NEAR(-1.0, g_amazeCalls[0].ms, 1e-12);
+    ASSERT_EQ(700, g_amazeCalls[0].cudaCode);
+    ASSERT_EQ(std::string("cudaErrorIllegalAddress"), g_amazeCalls[0].cudaName);
+    ASSERT_EQ(std::string("gl_rgba16_direct:map"), g_amazeCalls[0].site);
+    ASSERT_EQ(std::string("primary"), g_amazeCalls[0].role);
+    ASSERT_EQ(0ull, g_amazeCalls[0].dropped);
+    ASSERT_EQ(std::string("amaze:device_bayer16"), g_amazeCalls[1].stage);
+    ASSERT_EQ(2, g_amazeCalls[1].rc);
+    ASSERT_EQ(709, g_amazeCalls[1].cudaCode);
+    ASSERT_EQ(std::string("cudaErrorContextIsDestroyed"), g_amazeCalls[1].cudaName);
+    ASSERT_EQ(std::string("gl_cache:unregister"), g_amazeCalls[1].site);
+    ASSERT_EQ(std::string("secondary"), g_amazeCalls[1].role);
+    // Nothing pending after the capture.
+    ASSERT_EQ(0L, (long)*cuda_slot::pending_word(kRender));
+    igpu_cuda_error_t out[cuda_slot::kPending];
+    ASSERT_EQ(0, cuda_slot::drain(kRender, out, cuda_slot::kPending, nullptr));
+
+    // A later validation-only failure: one primary record with code 0, never 709 again.
+    g_amazeCalls.clear();
+    ASSERT_EQ(1, gpuAmazeCudaErrorsEmitFailure(amaze.source, "amaze:r16_gl", 3, &amazeRecordingSink));
+    ASSERT_EQ(1, (int)g_amazeCalls.size());
+    ASSERT_EQ(0, g_amazeCalls[0].cudaCode);
+    ASSERT_EQ(std::string(), g_amazeCalls[0].site);
+    ASSERT_EQ(std::string("primary"), g_amazeCalls[0].role);
+
+    // No sink: nothing drained or emitted, the code waits for an installed sink.
+    g_amazeCalls.clear();
+    cuda_slot::note(700, "cudaErrorIllegalAddress", "gl_rgba16_direct:map");
+    ASSERT_EQ(0, gpuAmazeCudaErrorsEmitFailure(amaze.source, "amaze:r16_gl", 2, nullptr));
+    ASSERT_EQ(0, gpuAmazeCudaErrorsEmitOrphans(amaze.source, 2, nullptr));
+    ASSERT_EQ(1L, (long)*cuda_slot::pending_word(kRender));
+}
+
+// r6 B1, the r5 entry rule for AMaZE: a code noted by an AMaZE call nothing captures (the GL reset's
+// gl_cache:unregister, a create's check_cuda) is taken at the next call's entry and emitted as stage
+// amaze:uncaptured, rc 0, role orphan, with its own site; that call's own validation failure then
+// reports code 0, never the orphan. Nine uncaptured notes drop one: the first orphan carries
+// dropped=1. On 0f199cea the next failed call was credited with the leftover 709.
+TEST(GpuFieldTelemetryCapture, AmazeUncapturedCodeIsAnOrphanAtTheNextEntry)
+{
+    const AmazeSinkScope amaze;
+    cuda_slot::note(709, "cudaErrorContextIsDestroyed", "gl_cache:unregister");
+    ASSERT_EQ(1, gpuAmazeCudaErrorsEmitOrphans(amaze.source, 1, &amazeRecordingSink));
+    ASSERT_EQ(1, gpuAmazeCudaErrorsEmitFailure(amaze.source, "amaze:r16_gl", 3, &amazeRecordingSink));
+    ASSERT_EQ(2, (int)g_amazeCalls.size());
+    ASSERT_EQ(std::string("amaze:uncaptured"), g_amazeCalls[0].stage);
+    ASSERT_EQ(0, g_amazeCalls[0].rc);
+    ASSERT_EQ(709, g_amazeCalls[0].cudaCode);
+    ASSERT_EQ(std::string("gl_cache:unregister"), g_amazeCalls[0].site);
+    ASSERT_EQ(std::string("orphan"), g_amazeCalls[0].role);
+    ASSERT_EQ(std::string("amaze:r16_gl"), g_amazeCalls[1].stage);
+    ASSERT_EQ(3, g_amazeCalls[1].rc);
+    ASSERT_EQ(0, g_amazeCalls[1].cudaCode);
+    ASSERT_EQ(std::string("primary"), g_amazeCalls[1].role);
+
+    g_amazeCalls.clear();
+    for (int i = 1; i <= cuda_slot::kPending + 1; ++i)
+        cuda_slot::note(1000 + i, "cudaErrorUnknown", "gl_cache:unregister");
+    ASSERT_EQ(cuda_slot::kPending, gpuAmazeCudaErrorsEmitOrphans(amaze.source, 1, &amazeRecordingSink));
+    ASSERT_EQ(cuda_slot::kPending, (int)g_amazeCalls.size());
+    for (int i = 0; i < cuda_slot::kPending; ++i)
+    {
+        ASSERT_EQ(std::string("orphan"), g_amazeCalls[i].role);
+        ASSERT_EQ(1002 + i, g_amazeCalls[i].cudaCode);
+        ASSERT_EQ(i == 0 ? 1ull : 0ull, g_amazeCalls[i].dropped);
+    }
+    ASSERT_EQ(0L, (long)*cuda_slot::pending_word(kRender));
+}
+
+// r6 B2 (sol r5 blocker 2): the GPU view closes after its last render and the GL reset's
+// cudaSetDevice notes 702 (reset_gl:set_device). No captured call follows. The view-release drain
+// inside llrpGpuPlaybackReconResetGlTextureResources (called by GpuDisplayWindow and
+// GpuDisplayViewport destroyTexture) emits it as one recon:uncaptured orphan with its own site, and
+// session end then emits nothing more: one record, not two. The AMaZE GL reset drains the same way.
+// On 0f199cea the note stayed queued and session end never drained it: zero records.
+TEST(GpuFieldTelemetryCapture, GlResetCodeAfterTheLastRenderIsDrainedAtViewRelease)
+{
+    const FakeGpuBackendScope fake;
+    const SinkScope sink;
+    const AmazeSinkScope amaze;
+    int rc = -99;
+    ASSERT_NE(0, runOnce(1, &rc)); // the last render
+    ASSERT_EQ(0, rc);
+    g_calls.clear();
+
+    llrpFakeGpuBackendArmCudaNoteForTesting(kRender, 702, "cudaErrorLaunchTimeout", "reset_gl:set_device");
+    cuda_slot::note(709, "cudaErrorContextIsDestroyed", "gl_cache:unregister"); // the AMaZE reset's
+    gpuAmazeDebayerResetR16TextureBackendResources();
+    ASSERT_EQ(1, llrpGpuPlaybackReconResetGlTextureResources());
+    ASSERT_EQ(1, (int)g_calls.size());
+    ASSERT_EQ(std::string("recon:uncaptured"), g_calls[0].stage);
+    ASSERT_EQ(0, g_calls[0].rc);
+    ASSERT_EQ(702, g_calls[0].cudaCode);
+    ASSERT_EQ(std::string("cudaErrorLaunchTimeout"), g_calls[0].cudaName);
+    ASSERT_EQ(std::string("reset_gl:set_device"), g_calls[0].site);
+    ASSERT_EQ(std::string("orphan"), g_calls[0].role);
+    ASSERT_EQ(0L, llrpFakeGpuBackendCudaErrorsPendingForTesting(kRender, nullptr));
+    ASSERT_EQ(1, (int)g_amazeCalls.size());
+    ASSERT_EQ(std::string("amaze:uncaptured"), g_amazeCalls[0].stage);
+    ASSERT_EQ(709, g_amazeCalls[0].cudaCode);
+    ASSERT_EQ(std::string("gl_cache:unregister"), g_amazeCalls[0].site);
+    ASSERT_EQ(std::string("orphan"), g_amazeCalls[0].role);
+
+    // Session end after the view release: nothing left, nothing repeated.
+    GpuFieldTelemetry::sessionEndForTesting();
+    ASSERT_EQ(1, (int)g_calls.size());
+    ASSERT_EQ(1, (int)g_amazeCalls.size());
+    ASSERT_EQ(0L, llrpFakeGpuBackendCudaErrorsPendingForTesting(kRender, nullptr));
+}
+
+// r6 B2, the session-end leg: the same 702 at reset_gl:set_device with the view-release drain
+// skipped (the note is queued with no call around it). Session end's terminal drain, which runs
+// before the backend is unloaded, emits exactly one orphan record for it, and one for the AMaZE
+// DLL's leftover; a second session end emits nothing. On 0f199cea sessionEnd flushed app records
+// only and the note was discarded with the DLL: zero records.
+TEST(GpuFieldTelemetryCapture, CodeLeftAfterTheLastCallIsDrainedBySessionEnd)
+{
+    const FakeGpuBackendScope fake;
+    const SinkScope sink;
+    const AmazeSinkScope amaze;
+    int rc = -99;
+    ASSERT_NE(0, runOnce(1, &rc));
+    g_calls.clear();
+
+    llrpFakeGpuBackendNoteCudaErrorForTesting(kRender, 702, "cudaErrorLaunchTimeout", "reset_gl:set_device");
+    cuda_slot::note(999, "cudaErrorUnknown", "cudaGetDeviceCount(&deviceCount)"); // an AMaZE create's
+    GpuFieldTelemetry::sessionEndForTesting();
+    ASSERT_EQ(1, (int)g_calls.size());
+    ASSERT_EQ(std::string("recon:uncaptured"), g_calls[0].stage);
+    ASSERT_EQ(702, g_calls[0].cudaCode);
+    ASSERT_EQ(std::string("reset_gl:set_device"), g_calls[0].site);
+    ASSERT_EQ(std::string("orphan"), g_calls[0].role);
+    ASSERT_EQ(0L, llrpFakeGpuBackendCudaErrorsPendingForTesting(kRender, nullptr));
+    ASSERT_EQ(1, (int)g_amazeCalls.size());
+    ASSERT_EQ(std::string("amaze:uncaptured"), g_amazeCalls[0].stage);
+    ASSERT_EQ(999, g_amazeCalls[0].cudaCode);
+    ASSERT_EQ(std::string("cudaGetDeviceCount(&deviceCount)"), g_amazeCalls[0].site);
+    ASSERT_EQ(std::string("orphan"), g_amazeCalls[0].role);
+    ASSERT_EQ(0L, (long)*cuda_slot::pending_word(kRender));
+
+    GpuFieldTelemetry::sessionEndForTesting();
+    ASSERT_EQ(1, (int)g_calls.size());
+    ASSERT_EQ(1, (int)g_amazeCalls.size());
+}
+
+// r6 class sweep: the backend release (a DLL switch) calls the DLL's destroy, whose GL cache reset can
+// note gl_cache:unregister, and then frees the DLL. The release keeps that code before FreeLibrary;
+// the next terminal drain emits it once as an orphan with its own site, with no backend loaded. On
+// 0f199cea the code was freed with the DLL: zero records.
+TEST(GpuFieldTelemetryCapture, ReleasedBackendCodeIsKeptAndDrainedAtTeardown)
+{
+    const SinkScope sink;
+    {
+        const FakeGpuBackendScope fake;
+        int rc = -99;
+        ASSERT_NE(0, runOnce(1, &rc));
+        g_calls.clear();
+        llrpFakeGpuBackendArmCudaNoteForTesting(kRender, 999, "cudaErrorUnknown", "gl_cache:unregister");
+    } // the release: destroy notes 999, then the DLL is freed
+    ASSERT_EQ(0, (int)g_calls.size());
+    ASSERT_EQ(1, llrpGpuPlaybackReconDrainCudaErrorsAtTeardown(0));
+    ASSERT_EQ(1, (int)g_calls.size());
+    ASSERT_EQ(std::string("recon:uncaptured"), g_calls[0].stage);
+    ASSERT_EQ(0, g_calls[0].rc);
+    ASSERT_EQ(999, g_calls[0].cudaCode);
+    ASSERT_EQ(std::string("gl_cache:unregister"), g_calls[0].site);
+    ASSERT_EQ(std::string("orphan"), g_calls[0].role);
+    ASSERT_EQ(0, llrpGpuPlaybackReconDrainCudaErrorsAtTeardown(0));
+    ASSERT_EQ(1, (int)g_calls.size());
+}
+
+// r6 class sweep (create:device_count): igpu_recon_create notes cudaGetDeviceCount's code and returns
+// NULL, so the backend is marked unavailable and its DLL freed before any call is captured. The
+// release keeps the code although there is no backend; the terminal drain emits it once as an
+// orphan with its own site. Before r6b the release kept codes only with a backend, and on 0f199cea
+// it kept nothing: zero records.
+TEST(GpuFieldTelemetryCapture, CreateFailureCodeIsKeptAndDrainedAtTeardown)
+{
+    const SinkScope sink;
+    const FakeGpuBackendScope fake;
+    llrpFakeGpuBackendArmCudaNoteForTesting(kRender, 100, "cudaErrorNoDevice", "create:device_count");
+    ASSERT_EQ(1, llrpFakeGpuBackendFailCreateForTesting());
+    ASSERT_EQ(0, (int)g_calls.size());
+    ASSERT_EQ(1, llrpGpuPlaybackReconDrainCudaErrorsAtTeardown(0));
+    ASSERT_EQ(1, (int)g_calls.size());
+    ASSERT_EQ(std::string("recon:uncaptured"), g_calls[0].stage);
+    ASSERT_EQ(0, g_calls[0].rc);
+    ASSERT_EQ(100, g_calls[0].cudaCode);
+    ASSERT_EQ(std::string("cudaErrorNoDevice"), g_calls[0].cudaName);
+    ASSERT_EQ(std::string("create:device_count"), g_calls[0].site);
+    ASSERT_EQ(std::string("orphan"), g_calls[0].role);
+    ASSERT_EQ(0, llrpGpuPlaybackReconDrainCudaErrorsAtTeardown(0));
+    ASSERT_EQ(1, (int)g_calls.size());
+}
+
+// r6 B2: the recon terminal drain takes nothing with no sink installed (the code waits), and drains
+// a code exactly once.
+TEST(GpuFieldTelemetryCapture, TerminalDrainNeedsASinkAndTakesACodeOnce)
+{
+    const FakeGpuBackendScope fake;
+    int rc = -99;
+    ASSERT_NE(0, runOnce(1, &rc));
+    llrpFakeGpuBackendNoteCudaErrorForTesting(kRender, 702, "cudaErrorLaunchTimeout", "reset_gl:set_device");
+    ASSERT_EQ(0, llrpGpuPlaybackReconDrainCudaErrorsAtTeardown(0)); // no sink
+    ASSERT_EQ(1L, llrpFakeGpuBackendCudaErrorsPendingForTesting(kRender, nullptr));
+    const SinkScope sink;
+    ASSERT_EQ(1, llrpGpuPlaybackReconDrainCudaErrorsAtTeardown(0));
+    ASSERT_EQ(1, (int)g_calls.size());
+    ASSERT_EQ(0, llrpGpuPlaybackReconDrainCudaErrorsAtTeardown(0));
+    ASSERT_EQ(1, (int)g_calls.size());
 }

@@ -55,6 +55,10 @@ constexpr long long kSessionEndWaitMs = 2000;
 constexpr long long kSystemLogDeadlineMs = 1500;
 constexpr long long kEvtNextMaxWaitMs = 1000;
 static_assert(kSystemLogDeadlineMs < kSessionEndWaitMs, "the System-log query must end inside the session-end wait");
+/* r6: session end's terminal drain waits at most this long for each backend's
+ * lock (a call in flight keeps its own codes), and never past the budget. */
+constexpr long long kTerminalDrainWaitMs = 250;
+static_assert(kTerminalDrainWaitMs < kSessionEndWaitMs, "the terminal drain must fit the session-end budget");
 
 /* The EvtNext wait for the next batch: at most kEvtNextMaxWaitMs and never past
  * the query's total deadline (a passed deadline clamps to no wait). */

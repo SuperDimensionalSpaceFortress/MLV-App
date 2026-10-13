@@ -8,6 +8,7 @@
 #include "CrashForensics.h"
 
 #include "../../src/mlv/llrawproc/llrawproc.h"
+#include "GpuDebayer.h"
 
 #include <QByteArray>
 #include <QCoreApplication>
@@ -357,6 +358,14 @@ void flushImpl(const char * reason, bool withSystemLog, bool onWorker = false,
     core::commit(s.unwritten, taken, outcome, lines.size());
 }
 
+/* r6: both DLLs' leftovers through their installed sinks (none installed:
+ * nothing is drained). Teardown only. */
+void drainBackendCudaErrors(int waitMs)
+{
+    llrpGpuPlaybackReconDrainCudaErrorsAtTeardown(waitMs);
+    gpuAmazeDebayerDrainCudaErrorsAtTeardown(waitMs);
+}
+
 void sessionEnd()
 {
     bool expected = false;
@@ -376,6 +385,12 @@ void sessionEnd()
     // leave State to it (State is never destroyed).
     if (g_workerPoolCreated.load() && !workerPool()->waitForDone(static_cast<int>(core::kSessionEndWaitMs)))
         return;
+    // r6 terminal drain, before the backends are unloaded: a code the DLLs noted
+    // after their last captured call (no later call drains it at entry) is
+    // emitted as an orphan now and written by the flush below.
+    const qint64 drainWaitMs = budget.remainingTime();
+    drainBackendCudaErrors(static_cast<int>(drainWaitMs < core::kTerminalDrainWaitMs ? drainWaitMs
+                                                                                      : core::kTerminalDrainWaitMs));
     const qint64 remainingMs = budget.remainingTime();
     flushImpl("session_end", true, false,
               remainingMs < core::kSystemLogDeadlineMs ? remainingMs : core::kSystemLogDeadlineMs);
@@ -425,17 +440,17 @@ void scheduleAfterFaultFlush()
     });
 }
 
-void reconStageSink(const char * stage, int rc, double ms, int cudaCode,
-                    const char * cudaName, const char * site, const char * role,
-                    unsigned long long dropped)
+void stageSink(const char * dll, const char * stage, int rc, double ms, int cudaCode,
+               const char * cudaName, const char * site, const char * role,
+               unsigned long long dropped)
 {
     if (rc == 0 && !role)
     {
-        noteStage("recon", stage, ms);
+        noteStage(dll, stage, ms);
         return;
     }
     CudaFault fault;
-    fault.dll = "recon";
+    fault.dll = dll;
     fault.stage = stage;
     fault.rc = rc;
     fault.cudaCode = cudaCode;
@@ -444,6 +459,21 @@ void reconStageSink(const char * stage, int rc, double ms, int cudaCode,
     fault.role = role;
     fault.dropped = dropped;
     noteFault(fault);
+}
+
+void reconStageSink(const char * stage, int rc, double ms, int cudaCode,
+                    const char * cudaName, const char * site, const char * role,
+                    unsigned long long dropped)
+{
+    stageSink("recon", stage, rc, ms, cudaCode, cudaName, site, role, dropped);
+}
+
+/* r6: GpuDebayer's AMaZE records, the same shape as recon's. */
+void amazeStageSink(const char * stage, int rc, double ms, int cudaCode,
+                    const char * cudaName, const char * site, const char * role,
+                    unsigned long long dropped)
+{
+    stageSink("amaze", stage, rc, ms, cudaCode, cudaName, site, role, dropped);
 }
 
 } // namespace
@@ -478,6 +508,7 @@ void install()
             + " min_ms=" + envValue("MLVAPP_CUDA_LAUNCH_TIMING_MIN_MS");
     }
     llrpSetGpuStageTelemetrySink(&reconStageSink);
+    gpuAmazeDebayerSetStageTelemetrySink(&amazeStageSink);
     qAddPostRoutine(&sessionEndPostRoutine);
     connectAboutToQuitOnce();
 }
@@ -641,6 +672,21 @@ QString clipHash(const QString & basenameOrPath)
     const QString name = QFileInfo(basenameOrPath).fileName();
     return QString::fromLatin1(
         QCryptographicHash::hash(name.toUtf8(), QCryptographicHash::Sha256).toHex().left(12));
+}
+
+void sessionEndForTesting()
+{
+    sessionEnd();
+    {
+        QMutexLocker locker(&state().mutex);
+        state().sessionEnded = false;
+    }
+    {
+        QMutexLocker locker(&g_waitMutex);
+        g_shuttingDown = false;
+    }
+    g_workerStop.store(false);
+    g_sessionEndDone.store(false);
 }
 
 } // namespace GpuFieldTelemetry

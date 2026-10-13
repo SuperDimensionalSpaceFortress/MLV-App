@@ -906,6 +906,8 @@ static const char * llrawproc_gpu_recon_backend_name(int prefer_playback_dll)
     return (backend_name && *backend_name) ? backend_name : "cuda";
 }
 
+static void llrawproc_gpu_stage_telemetry_keep_released(llrawprocGpuExportBackend_t * g);
+
 static void llrawproc_gpu_export_backend_release(llrawprocGpuExportBackend_t * g)
 {
     /* A decoder may be submitting N+1 while the recon call owns the main
@@ -920,6 +922,9 @@ static void llrawproc_gpu_export_backend_release(llrawprocGpuExportBackend_t * g
     {
         g->destroy(g->backend);
     }
+    /* r6: what the DLL still holds (its destroy's gl_cache:unregister, ...)
+     * would be discarded with it: keep it for the next emit. */
+    llrawproc_gpu_stage_telemetry_keep_released(g);
     if(g->dll)
     {
         FreeLibrary(g->dll);
@@ -939,6 +944,21 @@ static void llrawproc_gpu_export_backend_mark_unavailable(llrawprocGpuExportBack
              "%s",
              backend_name ? backend_name : "");
     snprintf(g->dll_path, sizeof(g->dll_path), "%s", dll_path ? dll_path : "");
+}
+
+/* create returned NULL, or a backend of another ABI (destroyed here). r6: what
+ * create (create:device_count, ...) and this destroy noted is kept by the
+ * release before FreeLibrary, although no call was ever captured. */
+static void llrawproc_gpu_export_backend_create_failed(llrawprocGpuExportBackend_t * g,
+                                                       const char * dll_path,
+                                                       const char * backend_name)
+{
+    if(g->backend)
+    {
+        g->destroy(g->backend);
+    }
+    g->backend = NULL;
+    llrawproc_gpu_export_backend_mark_unavailable(g, dll_path, backend_name);
 }
 
 /* ---- In-process fake backend: an executable, GPU-less consume-side proof ----
@@ -1498,6 +1518,23 @@ static int llrawproc_fake_gpu_backend_release_retained_device_output(
     return 0;
 }
 
+/* r6: as igpu_recon_reset_gl_texture_resources, whose cudaSetDevice failure
+ * notes reset_gl:set_device: it notes what the test armed. */
+static int llrawproc_fake_gpu_backend_reset_gl_texture_resources(igpu_recon_backend * b)
+{
+    (void)b;
+    llrawproc_fake_gpu_backend_note_armed(IGPU_CUDA_ERROR_CHANNEL_RENDER);
+    return 0;
+}
+
+/* r6: as igpu_recon_destroy, whose GL cache reset can note gl_cache:unregister
+ * just before the DLL is freed: it notes what the test armed. */
+static void llrawproc_fake_gpu_backend_destroy(igpu_recon_backend * b)
+{
+    (void)b;
+    llrawproc_fake_gpu_backend_note_armed(IGPU_CUDA_ERROR_CHANNEL_RENDER);
+}
+
 /* Test-only hook: install (1) or remove (0) the fake backend above in place
  * of any real DLL-loaded backend. Installing releases whatever backend is
  * currently configured (real or fake); removing releases the fake and
@@ -1560,6 +1597,8 @@ int llrpInstallFakeGpuPlaybackReconBackendForTesting(int install)
         g->retain_last_device_output = llrawproc_fake_gpu_backend_retain_last_device_output;
         g->release_retained_device_output = llrawproc_fake_gpu_backend_release_retained_device_output;
         g->set_reduced_iso_notch = llrawproc_fake_gpu_backend_set_reduced_iso_notch;
+        g->reset_gl_texture_resources = llrawproc_fake_gpu_backend_reset_gl_texture_resources;
+        g->destroy = llrawproc_fake_gpu_backend_destroy;
         g->take_cuda_error = llrawproc_fake_gpu_backend_take_cuda_error;
         g->drain_cuda_errors = llrawproc_fake_gpu_backend_drain_cuda_errors;
         g->cuda_error_pending[0] = llrawproc_fake_gpu_backend_cuda_error_pending_word(0);
@@ -1570,6 +1609,22 @@ int llrpInstallFakeGpuPlaybackReconBackendForTesting(int install)
     {
         g_llrawproc_fake_gpu_backend_installed = 0;
     }
+    pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
+    return 1;
+}
+
+/* r6 test-only: the create-failure branch on the installed fake, as if create
+ * had noted what the test armed and returned NULL. The fake is released. */
+int llrpFakeGpuBackendFailCreateForTesting(void);
+int llrpFakeGpuBackendFailCreateForTesting(void)
+{
+    llrawprocGpuExportBackend_t * g = &g_llrawproc_gpu_export_backend;
+    if(!g_llrawproc_fake_gpu_backend_installed) return 0;
+    pthread_mutex_lock(&g_llrawproc_gpu_recon_backend_mutex);
+    llrawproc_fake_gpu_backend_note_armed(IGPU_CUDA_ERROR_CHANNEL_RENDER);
+    g->backend = NULL;
+    llrawproc_gpu_export_backend_create_failed(g, "<in-process-fake>", "fake-test-backend");
+    g_llrawproc_fake_gpu_backend_installed = 0;
     pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
     return 1;
 }
@@ -1790,12 +1845,7 @@ static int llrawproc_gpu_export_backend_available(int prefer_playback_dll)
     g->backend = g->create(backend_name);
     if(!g->backend || g->abi_version(g->backend) != IGPU_RECON_ABI_VERSION)
     {
-        if(g->backend)
-        {
-            g->destroy(g->backend);
-        }
-        g->backend = NULL;
-        llrawproc_gpu_export_backend_mark_unavailable(g, dll_path, backend_name);
+        llrawproc_gpu_export_backend_create_failed(g, dll_path, backend_name);
         return 0;
     }
 
@@ -1869,6 +1919,80 @@ static void llrawproc_gpu_stage_telemetry_drain(llrawprocGpuExportBackend_t * g,
     out->notes = notes;
     out->count = n;
     out->dropped = dropped;
+}
+
+/* r6: codes a released backend still held, per channel, taken before its DLL
+ * was freed. Guarded by the backend mutex; emitted as orphans by the next
+ * terminal drain (GL reset or session end), so no captured call's entry pays
+ * for them. */
+static llrawprocGpuCudaNotes_t g_llrawproc_gpu_released_notes[2];
+
+/* r6: appends src's notes (and drops) to dst, oldest first, and empties src. */
+static void llrawproc_gpu_cuda_notes_append(llrawprocGpuCudaNotes_t * dst, llrawprocGpuCudaNotes_t * src)
+{
+    igpu_cuda_error_t * merged;
+    if(src->count == 0 && src->dropped == 0)
+    {
+        free(src->notes);
+        memset(src, 0, sizeof(*src));
+        return;
+    }
+    if(dst->count == 0 && dst->dropped == 0)
+    {
+        free(dst->notes);
+        *dst = *src;
+        memset(src, 0, sizeof(*src));
+        return;
+    }
+    dst->dropped += src->dropped;
+    if(src->count > 0)
+    {
+        merged = (igpu_cuda_error_t *)realloc(dst->notes,
+                                              (size_t)(dst->count + src->count) * sizeof(*merged));
+        if(merged)
+        {
+            memcpy(merged + dst->count, src->notes, (size_t)src->count * sizeof(*merged));
+            dst->notes = merged;
+            dst->count += src->count;
+        }
+        else
+        {
+            dst->dropped += (unsigned long long)src->count;
+        }
+    }
+    free(src->notes);
+    memset(src, 0, sizeof(*src));
+}
+
+/* r6: the released backend's leftovers on `channel` go ahead of `orphans`
+ * (they are older). Caller holds the backend mutex. */
+static void llrawproc_gpu_stage_telemetry_take_released(int channel, llrawprocGpuCudaNotes_t * orphans)
+{
+    llrawprocGpuCudaNotes_t merged = g_llrawproc_gpu_released_notes[channel];
+    memset(&g_llrawproc_gpu_released_notes[channel], 0, sizeof(g_llrawproc_gpu_released_notes[channel]));
+    llrawproc_gpu_cuda_notes_append(&merged, orphans);
+    *orphans = merged;
+}
+
+/* r6: called by the backend release between destroy and FreeLibrary (caller
+ * holds the backend mutex, no preupload in flight). With a sink installed,
+ * every code the DLL still holds is kept for the next emit, also when create
+ * failed and there is no backend (the drain exports are the DLL's, not the
+ * backend's). */
+static void llrawproc_gpu_stage_telemetry_keep_released(llrawprocGpuExportBackend_t * g)
+{
+    int channel;
+    if(!g_llrawproc_gpu_stage_telemetry_sink) return;
+    for(channel = 0; channel < 2; ++channel)
+    {
+        llrawprocGpuCudaNotes_t taken;
+        memset(&taken, 0, sizeof(taken));
+        if(g->cuda_error_pending[channel]
+         && __atomic_load_n(g->cuda_error_pending[channel], __ATOMIC_RELAXED) == 0)
+            continue;
+        llrawproc_gpu_stage_telemetry_drain(g, channel, &taken);
+        llrawproc_gpu_cuda_notes_append(&g_llrawproc_gpu_released_notes[channel], &taken);
+    }
 }
 
 /* r5: at the entry of a captured call (sink installed). Codes still pending on
@@ -1950,6 +2074,62 @@ static void llrawproc_gpu_stage_telemetry_emit(llrpGpuStageTelemetrySink_t sink,
         free(ev->noted.notes);
         ev->noted.notes = NULL;
     }
+}
+
+/* r6 terminal drain (teardown paths only: the GL reset and session end). A
+ * code noted after the last captured call (the GL reset's reset_gl:set_device
+ * when the view closes after its last render, ...) has no later entry drain to
+ * take it, so it is taken here into ev[channel].orphans for emit (emit_call 0).
+ * The preupload channel is left alone while a bypassing preupload is in flight:
+ * that call captures its own codes. A released backend's leftovers (kept by
+ * the release before FreeLibrary) go first. Caller holds the backend mutex. */
+static void llrawproc_gpu_stage_telemetry_take_leftovers(llrawprocGpuExportBackend_t * g,
+                                                         llrawprocGpuStageTelemetryEvent_t ev[2])
+{
+    int channel;
+    memset(ev, 0, 2 * sizeof(*ev));
+    for(channel = 0; channel < 2; ++channel)
+    {
+        const int bypassed = channel == IGPU_CUDA_ERROR_CHANNEL_PREUPLOAD
+            && InterlockedCompareExchange(&g_llrawproc_gpu_preupload_bypass_active, 0, 0) != 0;
+        const int empty = g->cuda_error_pending[channel]
+            && __atomic_load_n(g->cuda_error_pending[channel], __ATOMIC_RELAXED) == 0;
+        if(!bypassed && !empty)
+            llrawproc_gpu_stage_telemetry_drain(g, channel, &ev[channel].orphans);
+        if(g_llrawproc_gpu_released_notes[channel].count != 0
+         || g_llrawproc_gpu_released_notes[channel].dropped != 0)
+            llrawproc_gpu_stage_telemetry_take_released(channel, &ev[channel].orphans);
+    }
+}
+
+/* After the backend mutex is released: the leftovers as orphans. Returns how
+ * many records were emitted. */
+static int llrawproc_gpu_stage_telemetry_emit_leftovers(llrpGpuStageTelemetrySink_t sink,
+                                                        llrawprocGpuStageTelemetryEvent_t ev[2])
+{
+    const int emitted = ev[0].orphans.count + ev[1].orphans.count;
+    llrawproc_gpu_stage_telemetry_emit(sink, &ev[0], 0);
+    llrawproc_gpu_stage_telemetry_emit(sink, &ev[1], 0);
+    return emitted;
+}
+
+int llrpGpuPlaybackReconDrainCudaErrorsAtTeardown(int wait_ms);
+int llrpGpuPlaybackReconDrainCudaErrorsAtTeardown(int wait_ms)
+{
+    llrawprocGpuExportBackend_t * g = &g_llrawproc_gpu_export_backend;
+    const llrpGpuStageTelemetrySink_t sink = g_llrawproc_gpu_stage_telemetry_sink;
+    const ULONGLONG deadline = GetTickCount64() + (ULONGLONG)(wait_ms > 0 ? wait_ms : 0);
+    llrawprocGpuStageTelemetryEvent_t leftovers[2];
+    if(!sink) return 0;
+    /* Bounded: a backend call stuck past the wait must not hold exit. */
+    while(pthread_mutex_trylock(&g_llrawproc_gpu_recon_backend_mutex) != 0)
+    {
+        if(GetTickCount64() >= deadline) return -1;
+        Sleep(1);
+    }
+    llrawproc_gpu_stage_telemetry_take_leftovers(g, leftovers);
+    pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
+    return llrawproc_gpu_stage_telemetry_emit_leftovers(sink, leftovers);
 }
 
 /* igpu_recon_preupload_frame's "no free slot" return: back-pressure, not a
@@ -2504,12 +2684,19 @@ int llrpGpuPlaybackReconResetGlTextureResources(void)
 {
     llrawprocGpuExportBackend_t * g = &g_llrawproc_gpu_export_backend;
     int ok = 1;
+    llrpGpuStageTelemetrySink_t telemetry_sink = NULL;
+    llrawprocGpuStageTelemetryEvent_t leftovers[2];
     pthread_mutex_lock(&g_llrawproc_gpu_recon_backend_mutex);
     if(g->backend && g->reset_gl_texture_resources)
     {
         ok = (g->reset_gl_texture_resources(g->backend) == 0) ? 1 : 0;
     }
+    /* r6: the GPU view releases its GL resources here, possibly after its
+     * last render: the terminal drain, so the reset's own code is kept. */
+    telemetry_sink = g_llrawproc_gpu_stage_telemetry_sink;
+    if(telemetry_sink) llrawproc_gpu_stage_telemetry_take_leftovers(g, leftovers);
     pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
+    if(telemetry_sink) llrawproc_gpu_stage_telemetry_emit_leftovers(telemetry_sink, leftovers);
     return ok;
 }
 
@@ -3354,6 +3541,12 @@ void llrpSetGpuReconEventLogger(llrpGpuReconEventLogger_t logger)
 void llrpSetGpuStageTelemetrySink(llrpGpuStageTelemetrySink_t sink)
 {
     (void)sink;
+}
+
+int llrpGpuPlaybackReconDrainCudaErrorsAtTeardown(int wait_ms)
+{
+    (void)wait_ms;
+    return 0;
 }
 
 llrpGpuStageTelemetrySink_t llrpGetGpuStageTelemetrySinkForTesting(void)

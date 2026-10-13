@@ -58,6 +58,12 @@ int igpu_recon_drain_cuda_errors(int channel, igpu_cuda_error_t * out, int capac
                                  unsigned long long * dropped);
 const volatile long * igpu_recon_cuda_error_pending_word(int channel);
 
+/* r6, optional exports: the same two over the AMaZE DLL's own slot (the same
+ * igpu_cuda_error_slot.h). Every AMaZE site is a render-channel site. */
+int igpu_amaze_debayer_drain_cuda_errors(int channel, igpu_cuda_error_t * out, int capacity,
+                                         unsigned long long * dropped);
+const volatile long * igpu_amaze_debayer_cuda_error_pending_word(int channel);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
