@@ -34,6 +34,7 @@
 #include "PlaybackFrameRange.h"
 #include "PlaybackNativePaceGuard.h"
 #include "PlaybackPrepPresentationPolicy.h"
+#include "PlaybackPresentTrace.h"
 #include "PlaybackSlipHistogram.h"
 #include "../../src/mlv_include.h"
 #include "InfoDialog.h"
@@ -1143,6 +1144,7 @@ private:
     // PLAYBACK-CUDA-NATIVE-PACE-1: the ceiling on every engine advance in playbackHandling() -- the timeline never
     // runs faster than getFramerate() (native, or the explicit fpsOverride). Reset on every Play start and stop.
     playback_native_pace::NativePaceGuard m_playbackPaceGuard;
+    playback_present_trace::Recorder m_playbackPresentTrace;   // PLAYBACK-STARTUP-CATCHUP-BURST-1 r7, opt-in
     // PLAYBACK-BACHELOR-PRESENT-JITTER-1: per-present slip accounting and timeline-path reconciliation for the
     // smoke session (playback_smoke.slip_summary); fed only while m_playbackSmokeActive.
     playback_slip::SlipHistogram m_playbackSlipHistogram;
@@ -1223,6 +1225,7 @@ private:
     double m_playbackSmokeLastPresentedTime = 0.0;
     double m_playbackSmokeFirstPresentMs = 0.0;
     int m_playbackSmokeFirstPresentTimelineDeltaAbs = 0; // slider travel from Play, sampled at the first present
+    int m_playbackSmokeStartupSkippedFrames = 0;         // timeline frames jumped past in the first 2 s after Play
     double m_playbackSmokePresentedIntervalSumMs = 0.0;
     double m_playbackSmokePresentedIntervalMaxMs = 0.0;
     // PLAYBACK-CUDA-HONOUR-SCALE-1 r2: present-gap attribution (present_gap_summary).
@@ -1483,6 +1486,11 @@ private:
     /* r2: presented debayered-16 frames by outcome name, and the render
      * thread's all-attempts counters at session begin. */
     QMap<QString, int> m_playbackSmokeDebayered16OutcomeFrames;
+    /* CPU-DEBAYERED16-HONOUR-SCALE-1: presented debayered-16 frames debayered from
+     * the reduced recon, and each frame's request admission by name. */
+    int m_playbackSmokeDebayered16ReducedConsumedFrames = 0;
+    QString m_playbackSmokeDebayered16HonourScaleRefusalLast;
+    QMap<QString, quint64> m_playbackSmokeDebayered16HonourScaleRefusalCounts;
     std::array<uint64_t, static_cast<size_t>( Debayered16ReconRefusal::Count )>
         m_playbackSmokeDebayered16AttemptsAtBegin{};
     int m_playbackSmokeProcessed8PrefetchHits = 0;

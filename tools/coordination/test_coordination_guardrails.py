@@ -1461,7 +1461,7 @@ def test_astra_lane_row_is_a_read_only_high_effort_codex_judgement_lane():
     # 'high' effort (never max/xhigh), and a codex row names a TIER ('astra'), resolved to the
     # current highest-version slug at launch by Resolve-CodexModelTier, never a pinned slug.
     body = LANE_RUNNER.read_text(encoding="utf-8")
-    assert "astra  = @{ engine = 'codex';  tier = 'astra';   effort = 'high'; role = 'design-arbiter' }" in body
+    assert "astra  = @{ engine = 'codex';  tier = 'astra';   effort = 'high'; role = 'tie-breaker-design-arbiter' }" in body
     assert "ValidateSet('opus', 'sonnet', 'fable', 'sol', 'luna', 'astra')" in body
 
 

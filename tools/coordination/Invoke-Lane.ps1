@@ -125,6 +125,14 @@ param(
     # MLV root. The run's own scratch dir is removed when the lane exits unless -KeepScratch;
     # its size is recorded in the receipt either way.
     [string]$ScratchRoot = 'C:\mlvtmp\lane-scratch',
+    # LANE-RECEIPT-SCRATCH-CLEANUP-1: bulk scratch a lane creates OUTSIDE -ScratchRoot (asm, shadow-build,
+    # probe dirs) is listed one absolute path per line in <RunDir>\scratch-paths.txt, normally through
+    # Register-LaneBulkScratch.ps1 (the child gets MLV_LANE_RUN_DIR and MLV_LANE_SCRATCH_MANIFEST).
+    # When the lane exits, each path strictly inside -BulkScratchRoot has
+    # its small text files copied to <RunDir>\scratch-receipts and is removed, unless -KeepBulkScratch.
+    # Hard refusals and the receipt's `bulkScratch` field: Remove-LaneBulkScratch.ps1. Fail open.
+    [string]$BulkScratchRoot = 'C:\mlvtmp',
+    [switch]$KeepBulkScratch,
     # CODEX-KEY-PRIVATE-PIN-1: root of the private codex installs a read-only codex lane may run
     # (one npm --prefix install per version, <CodexPinRoot>\<version>, written only by
     # Promote-CodexPin.ps1). Which version is chosen by the tracked codex-pin.json beside this
@@ -180,13 +188,24 @@ if (Test-HubHost) {
 # Resolve-CodexModelTier (below), which reads live from ~/.codex/models_cache.json --
 # Codex has no floating alias, so this is the equivalent resolution step. Every effort is
 # 'high': the owner's ruling is high for every lane, sonnet included, never max/xhigh.
+#
+# MODEL-POSTURE-R16-1 (owner directive 2026-10-12, hub ruling): the `role` strings below name the
+# RULED DUTIES; the engine/model/tier/effort columns are unchanged.
+#   opus   -- orchestrator; owns design + implementation plans with sol; implements only hard or
+#             diagnosis rounds; review key B unless it implemented the PR (then fable).
+#   sonnet -- default implementer (83 % DONE at USD 1.37 vs opus 48 % at USD 7.97).
+#   fable  -- planning/guidance lane; fallback review key B (the no-self-review stand-in for opus).
+#   sol    -- review key A (found 51 blockers fable missed vs 1 the other way, 191 paired reviews)
+#             and co-planner with opus.
+#   luna   -- breadth recon.
+#   astra  -- tie-breaker / design arbiter on contested designs; never xhigh.
 $LANES = @{
-    opus   = @{ engine = 'claude'; model = 'opus';   effort = 'high'; role = 'orchestrator' }
-    sonnet = @{ engine = 'claude'; model = 'sonnet'; effort = 'high'; role = 'implementer' }
-    fable  = @{ engine = 'claude'; model = 'fable';  effort = 'high'; role = 'review-guidance-planning' }
-    sol    = @{ engine = 'codex';  tier = 'sol';     effort = 'high'; role = 'adversarial-verifier' }
+    opus   = @{ engine = 'claude'; model = 'opus';   effort = 'high'; role = 'orchestrator-design-planner-review-key-b' }
+    sonnet = @{ engine = 'claude'; model = 'sonnet'; effort = 'high'; role = 'default-implementer' }
+    fable  = @{ engine = 'claude'; model = 'fable';  effort = 'high'; role = 'planning-guidance-fallback-key-b' }
+    sol    = @{ engine = 'codex';  tier = 'sol';     effort = 'high'; role = 'review-key-a-co-planner' }
     luna   = @{ engine = 'codex';  tier = 'luna';    effort = 'high'; role = 'breadth-recon' }
-    astra  = @{ engine = 'codex';  tier = 'astra';   effort = 'high'; role = 'design-arbiter' }
+    astra  = @{ engine = 'codex';  tier = 'astra';   effort = 'high'; role = 'tie-breaker-design-arbiter' }
 }
 
 # Absolute launcher paths. NEITHER is on the Git Bash PATH on this host, and a
@@ -315,7 +334,16 @@ function Resolve-CodexModelTier {
         if ($_.Exception.Message -like 'codex-tier-resolution-failed:*') { throw }
         throw "codex-tier-resolution-failed: tier '$Tier' produced a malformed resolver result: $($_.Exception.Message)"
     }
-    return [string]$resolverParsed.resolvedModel
+    # MODEL-POSTURE-R16-1: the resolver also reports the catalogue's own fetched_at, so the
+    # receipt can show how old the model list was when this lane's model was chosen. A resolver
+    # that predates the field leaves it $null (recorded as such, never invented).
+    $fetchedAtProp = $resolverParsed.PSObject.Properties['fetchedAt']
+    $clientVersionProp = $resolverParsed.PSObject.Properties['clientVersion']
+    return [pscustomobject]@{
+        Model         = [string]$resolverParsed.resolvedModel
+        FetchedAt     = if ($null -ne $fetchedAtProp) { [string]$fetchedAtProp.Value } else { $null }
+        ClientVersion = if ($null -ne $clientVersionProp -and $null -ne $clientVersionProp.Value) { [string]$clientVersionProp.Value } else { $null }
+    }
 }
 
 # CODEX-KEY-MCP-ESCAPE-1 (HUB RULING wf_d36c1040-11d): MCP servers (node_repl, agent_bridge, ...)
@@ -492,7 +520,7 @@ function Resolve-CodexExe {
     )
     $r = [ordered]@{
         path = $ConfiguredExe; version = $null; pinState = $null; pinVersion = $null
-        pinWindowsSandbox = $null; pinFile = $PinFile; detail = ''
+        pinWindowsSandbox = $null; pinFile = $PinFile; detail = ''; probedModels = @()
     }
     $pinnedExe = $null
     if (-not $ReadLane) {
@@ -515,6 +543,12 @@ function Resolve-CodexExe {
             $r.pinState = 'PIN_INVALID'; $r.detail = "pin file $PinFile 'windowsSandbox' must be one of $($CODEX_PIN_WINDOWS_SANDBOXES -join '|') (got '$pinSandbox')"
         } else {
             $r.pinVersion = $pinVersion
+            # MODEL-POSTURE-R16-1: the model slugs Promote-CodexPin actually exec-probed on this
+            # pinned version. Only plain strings count; an absent or malformed list is "none probed".
+            $probedProp = $pin.PSObject.Properties['probedModels']
+            if ($null -ne $probedProp -and $null -ne $probedProp.Value) {
+                $r.probedModels = @($probedProp.Value | Where-Object { $_ -is [string] -and $_ })
+            }
             # [IO.Path]::Combine, not Join-Path: Join-Path throws for a drive PowerShell does not
             # know, and this function must never throw.
             $candidate = [System.IO.Path]::Combine($PinRoot, $pinVersion, $CODEX_PIN_EXE_RELATIVE)
@@ -538,6 +572,36 @@ function Resolve-CodexExe {
     }
     if ($null -eq $pinnedExe) { $r.version = Get-CodexCliVersion -CodexExe $ConfiguredExe }
     return $r
+}
+
+# MODEL-POSTURE-R16-1: true when the pinned CLI never exec-probed $Model. Case-exact, whole-slug
+# match against the pin's probedModels; an empty list (a pin promoted before this field existed)
+# probed nothing, so every model is unprobed and the lane runs on the global CLI until the pin is
+# re-promoted. Pure; never throws.
+function Test-PinModelUnprobed {
+    param(
+        [Parameter(Mandatory = $true)]$ExeStamp,
+        [Parameter(Mandatory = $true)][string]$Model
+    )
+    return (@($ExeStamp.probedModels) -cnotcontains $Model)
+}
+
+# MODEL-POSTURE-R16-1: demote a PINNED stamp to the typed state PIN_MODEL_UNPROBED, pointing it at
+# the global CLI. The stamp keeps pinVersion/probedModels so the receipt shows what the pin did
+# cover; pinWindowsSandbox is cleared so the launch takes the same unelevated sandbox every other
+# fallback takes.
+function Set-CodexExeStampModelUnprobed {
+    param(
+        [Parameter(Mandatory = $true)]$ExeStamp,
+        [Parameter(Mandatory = $true)][string]$Model,
+        [Parameter(Mandatory = $true)][string]$GlobalExe
+    )
+    $probedText = if (@($ExeStamp.probedModels).Count -gt 0) { @($ExeStamp.probedModels) -join ', ' } else { 'none recorded' }
+    $ExeStamp.pinState = 'PIN_MODEL_UNPROBED'
+    $ExeStamp.detail = "resolved model '$Model' is not among the models pinned codex $($ExeStamp.pinVersion) probed ($probedText)"
+    $ExeStamp.path = $GlobalExe
+    $ExeStamp.version = Get-CodexCliVersion -CodexExe $GlobalExe
+    $ExeStamp.pinWindowsSandbox = $null
 }
 
 # Every tool that either fans out to another agent (Agent, Task, Workflow, TaskCreate) or
@@ -974,6 +1038,10 @@ $AuxiliaryModels = @()
 # so a reader can always see what was ASKED to start, but resolvedModel stays 'unknown' -- never
 # copied from selectedModel before the child is proven to have run.
 $SelectedModel = $null
+# MODEL-POSTURE-R16-1: the models catalogue's fetched_at behind a codex tier resolution (null for
+# a claude lane, a -ModelOverride launch, or a resolution that never ran).
+$CodexModelsFetchedAt = $null
+$CodexModelsClientVersion = $null
 
 # LANE-MODEL-CURRENCY-1 round 2 (sol blocker 1): owner ruling 2026-09-26 is that EVERY lane runs
 # at high effort. $cfg.effort is already the fully-resolved effective value at this point (table
@@ -990,13 +1058,17 @@ $SelectedModel = $null
 # private install IS a real CLI, so $REAL_CODEX_EXE follows it and the high-effort refusal still
 # applies to it; a fallback leaves both variables exactly as declared above.
 $CodexExeStamp = $null
+$CODEX_EXE_GLOBAL = $null
 if ($cfg.engine -eq 'codex') {
     $CodexExeStamp = Resolve-CodexExe -ConfiguredExe $CODEX_EXE -RealExe $REAL_CODEX_EXE `
         -ReadLane (-not $AllowEdits) -PinFile $CODEX_PIN_FILE -PinRoot $CodexPinRoot
     if ($CodexExeStamp.pinState -eq 'PINNED') {
+        # MODEL-POSTURE-R16-1: the one [codex-pin] line for a pinned lane is written once the model
+        # is resolved (the codex branch below), because a pinned exe that never probed that model
+        # is demoted to the global CLI first. $CODEX_EXE_GLOBAL is that fallback.
+        $CODEX_EXE_GLOBAL = $CODEX_EXE
         $CODEX_EXE = $CodexExeStamp.path
         $REAL_CODEX_EXE = $CodexExeStamp.path
-        Write-Host ("[codex-pin] PINNED: {0}" -f $CodexExeStamp.detail)
     } else {
         Write-Host ("[codex-pin] {0}: {1}; using {2} (codex {3})" -f $CodexExeStamp.pinState, $CodexExeStamp.detail,
             $CodexExeStamp.path, $(if ($CodexExeStamp.version) { $CodexExeStamp.version } else { 'version unknown' }))
@@ -1421,7 +1493,25 @@ if ($cfg.engine -eq 'claude') {
         if (-not $PYTHON_EXE) {
             throw "codex-tier-resolution-failed: no Python interpreter resolved ($($PYTHON_EXE_RESOLUTION.Source)) to resolve tier '$($cfg.tier)'."
         }
-        Resolve-CodexModelTier -Tier $cfg.tier -PythonExe $PYTHON_EXE
+        $tierResolution = Resolve-CodexModelTier -Tier $cfg.tier -PythonExe $PYTHON_EXE
+        $CodexModelsFetchedAt = $tierResolution.FetchedAt
+        $CodexModelsClientVersion = $tierResolution.ClientVersion
+        $tierResolution.Model
+    }
+    # MODEL-POSTURE-R16-1: a PINNED private codex only ever proved the models Promote-CodexPin
+    # probed. A newer model (e.g. gpt-6.1-sol appearing in the catalogue) may be one the pinned
+    # CLI silently cannot run, so a pinned read-only lane whose resolved model is not among the
+    # pin's probed slugs runs on the global CLI instead, with the typed state PIN_MODEL_UNPROBED.
+    if ($CodexExeStamp -and $CodexExeStamp.pinState -eq 'PINNED') {
+        $unprobed = Test-PinModelUnprobed -ExeStamp $CodexExeStamp -Model $codexLaunchModel
+        if ($unprobed) {
+            Set-CodexExeStampModelUnprobed -ExeStamp $CodexExeStamp -Model $codexLaunchModel -GlobalExe $CODEX_EXE_GLOBAL
+            $CODEX_EXE = $CODEX_EXE_GLOBAL
+            $REAL_CODEX_EXE = $CODEX_EXE_GLOBAL
+            $exe = $CODEX_EXE
+        }
+        Write-Host ("[codex-pin] {0}: {1}{2}" -f $CodexExeStamp.pinState, $CodexExeStamp.detail,
+            $(if ($unprobed) { "; using $($CodexExeStamp.path) (codex $(if ($CodexExeStamp.version) { $CodexExeStamp.version } else { 'version unknown' }))" } else { '' }))
     }
     # LANE-MODEL-CURRENCY-1 round 2 (sol blocker 2): this is the PRE-LAUNCH choice, recorded as
     # selectedModel -- NOT resolvedModel. The previous code assigned this straight to
@@ -1539,6 +1629,8 @@ if ($ScratchRoot) {
     New-Item -ItemType Directory -Force -Path $scratchDir | Out-Null
     foreach ($v in 'TEMP', 'TMP', 'TMPDIR') { $psi.Environment[$v] = $scratchDir }
 }
+$psi.Environment['MLV_LANE_RUN_DIR'] = $RunDir
+$psi.Environment['MLV_LANE_SCRATCH_MANIFEST'] = (Join-Path $RunDir 'scratch-paths.txt')
 $psi.RedirectStandardInput  = $true
 $psi.RedirectStandardOutput = $true
 $psi.RedirectStandardError  = $true
@@ -1986,6 +2078,18 @@ if ($scratchDir) {
         $scratchDisposition = [ordered]@{ path = $scratchDir; bytes = $null; removed = $false; error = $_.Exception.Message }
     }
 }
+# LANE-RECEIPT-SCRATCH-CLEANUP-1: before the receipt so it can record the outcome; never throws and never
+# changes the exit code or the receipt's state. $null when the lane registered no paths.
+$bulkScratch = $null
+try {
+    if (Test-Path -LiteralPath (Join-Path $RunDir 'scratch-paths.txt') -PathType Leaf) {
+        . (Join-Path $PSScriptRoot 'Remove-LaneBulkScratch.ps1')
+        $bulkScratch = Invoke-RemoveLaneBulkScratch -RunDir $RunDir -WorkDir $WorkDir -Root $BulkScratchRoot `
+            -LaneScratchRoot $ScratchRoot -Keep:$KeepBulkScratch
+    }
+} catch {
+    $bulkScratch = [ordered]@{ manifest = (Join-Path $RunDir 'scratch-paths.txt'); optOut = [bool]$KeepBulkScratch; entries = @(); error = "cannot-determine: $($_.Exception.Message)" }
+}
 $worktreeDisposition = $null
 if ($RetireWorktree) {
     try {
@@ -2190,8 +2294,16 @@ $receipt = [ordered]@{
     resolvedModel    = $ResolvedModel
     auxiliaryModels  = $AuxiliaryModels
     pinnedByOverride = $PinnedByOverride
+    # MODEL-POSTURE-R16-1: fetched_at of the ~/.codex/models_cache.json this codex lane's tier was
+    # resolved against (null: claude lane, -ModelOverride, or no resolution) -- the age of the model
+    # list behind resolvedModel, read by check-lane-model-currency.py.
+    codexModelsFetchedAt = $CodexModelsFetchedAt
+    # client_version of the Codex CLI that wrote that cache. The file is shared by every CLI on the
+    # machine, so it can differ from codexExe.version (the CLI that ran the lane).
+    codexModelsClientVersion = $CodexModelsClientVersion
     # CODEX-KEY-PRIVATE-PIN-1: the codex binary this lane ran on -- {path, version, pinState,
-    # pinVersion, pinWindowsSandbox, pinFile, detail} (see Resolve-CodexExe); null for claude.
+    # pinVersion, pinWindowsSandbox, pinFile, detail, probedModels} (see Resolve-CodexExe); null for
+    # claude. pinState PIN_MODEL_UNPROBED: the pin never probed the resolved model, global CLI used.
     codexExe     = $CodexExeStamp
     effort       = $cfg.effort
     card         = $Card
@@ -2223,6 +2335,7 @@ $receipt = [ordered]@{
     providerRefusal = $providerRefusal
     containment  = $containment
     scratch      = $scratchDisposition
+    bulkScratch  = $bulkScratch
     worktreeDisposition = $worktreeDisposition
     worktreeSweep = $worktreeSweep
     processEnded = $processEnded

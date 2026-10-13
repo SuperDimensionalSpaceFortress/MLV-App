@@ -187,9 +187,24 @@ static bool environmentFlagEnabled( const char *name )
         && value != QByteArrayLiteral("no");
 }
 
+// PLAYBACK-STARTUP-CATCHUP-BURST-1 r7: the opt-in per-present playback trace (PlaybackPresentTrace.h), read once.
+static bool mlvappPlaybackPresentTraceRequested()
+{
+    static const bool requested = environmentFlagEnabled( "MLVAPP_PLAYBACK_PRESENT_TRACE" );
+    return requested;
+}
+
 static bool gpuTexNrOverlapTraceEnabled()
 {
     return environmentFlagEnabled( "MLVAPP_GPU_TEX_NR_OVERLAP_TRACE" );
+}
+
+// PLAYBACK-STARTUP-CATCHUP-BURST-1 kill switch, read once: the pace clock banks the whole wait for a Play's first
+// frame again, and drop-frame mode repays it with one timeline jump (NativePaceGuard::setStartupCatchupLegacy).
+static bool mlvappPlaybackStartupCatchupLegacyRequested()
+{
+    static const bool requested = environmentFlagEnabled( "MLVAPP_PLAYBACK_STARTUP_CATCHUP_LEGACY" );
+    return requested;
 }
 
 static bool f3CutRangeRepairDisabledByEnvironment()
@@ -2192,6 +2207,7 @@ MainWindow::MainWindow(int &argc, char **argv, QWidget *parent) :
     m_zoomModeChanged = false;
     m_tryToSyncAudio = false;
     m_newPosDropMode = 0.0;
+    m_playbackPaceGuard.setStartupCatchupLegacy( mlvappPlaybackStartupCatchupLegacyRequested() );
     m_playbackStopped = false;
     m_dualIsoPlaybackPreviewActive = false;
     m_inClipDeleteProcess = false;
@@ -2256,6 +2272,7 @@ MainWindow::MainWindow(int &argc, char **argv, QWidget *parent) :
     //Set timers
     m_timerId = startTimer( 40, Qt::PreciseTimer ); //25fps initially only, is set after import
     m_timerCacheId = startTimer( 1000 ); //1fps
+    m_playbackPresentTrace.setEnabled( mlvappPlaybackPresentTraceRequested() );
 
     //Connect Export Handler
     connect( this, SIGNAL(exportReady()), this, SLOT(exportHandler()) );
@@ -2654,6 +2671,10 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
     {
         m_frameStillDrawing = renderThreadBusyForPlaybackAdvance( currentPlaybackAdvanceTarget() );
     }
+    // PLAYBACK-STARTUP-CATCHUP-BURST-1 r7: the opt-in present trace counts every tick (no-op when off).
+    if( m_playbackPresentTrace.active() )
+        m_playbackPresentTrace.noteTick( mlv_stage_timing_now() * 1000.0, m_frameStillDrawing, predictivePlaybackAdvance );
+
     if( m_frameStillDrawing )
     {
         const bool allowPredictiveBusyAdvance =
@@ -2703,7 +2724,10 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
     //Playback
     const bool frameChangedBeforePlayback = m_frameChanged;
     const int positionBeforePlayback = ui->horizontalSliderPosition->value();
+    const double tracePositionBefore = m_newPosDropMode;
     playbackHandling( timeDiff );
+    if( m_playbackPresentTrace.active() )
+        m_playbackPresentTrace.noteAdvance( mlv_stage_timing_now() * 1000.0, tracePositionBefore, m_newPosDropMode, timeDiff );
     if( frameChangedBeforePlayback )
     {
         invalidateGpuPreviewProcessingConfigCache();
@@ -4019,10 +4043,23 @@ MainWindow::PlaybackPrepResult MainWindow::buildPlaybackPrepResult( const Playba
         reducedInputs.mlvHeight = task.mlvHeight;
         const PlaybackPrepReducedDecision reducedDecision =
             playbackPrepDecideReduced( reducedInputs );
+        // CPU-DEBAYERED16-HONOUR-SCALE-1: a frame the render debayered from the
+        // reduced recon is processed at its size with the config reduced to it.
+        GpuPreviewProcessingConfig reducedSourceConfig;
+        const bool reducedSource =
+            playbackPrepReducedSourceConfig( cpuWorkspace,
+                                             gpuPreviewProcessingConfig,
+                                             task.requestContext.gpuPreviewProcessingConfigGeneration,
+                                             reducedDecision,
+                                             sourceWidth,
+                                             sourceHeight,
+                                             task.mlvWidth,
+                                             task.mlvHeight,
+                                             &reducedSourceConfig );
         std::vector<uint8_t> cpuPreviewRgb8;
         const PlaybackPrepCpuRouteResult cpuRoute =
             playbackPrepCpuRouteRun( cpuWorkspace,
-                                     gpuPreviewProcessingConfig,
+                                     reducedSource ? reducedSourceConfig : gpuPreviewProcessingConfig,
                                      task.requestContext.gpuPreviewProcessingConfigGeneration,
                                      rgb16DisplaySource,
                                      sourceWidth,
@@ -6207,7 +6244,16 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
                           display_start,
                           useScopeSourceImage ? scopeSourceWidth : 0,
                           useScopeSourceImage ? scopeSourceHeight : 0 );
+    // PLAYBACK-STARTUP-CATCHUP-BURST-1: this Play's first present is completely done -- the pace clock starts now,
+    // so the wait for the first frame is never repaid as a drop-frame jump. On Bachelor CUDA the first frame's
+    // finish (first-present stamp, audio start) still blocks the GUI thread ~0.6 s after the texture is handed
+    // over (r3 venue leg: a clock started before finishPresentedFrame repaid 15 frames). Until here the guard
+    // banks no more than the carry, which the early advance (drawFrameReady) already relied on.
+    if( ui->actionPlay->isChecked() )
+        m_playbackPaceGuard.notePresent( mlv_stage_timing_now() * 1000.0, getFramerate() );
     m_frameStillDrawing = renderThreadBusyForPlaybackAdvance( currentPlaybackAdvanceTarget() );
+    if( m_playbackPresentTrace.active() )
+        m_playbackPresentTrace.notePresentEnd( mlv_stage_timing_now() * 1000.0 );   // r7 present trace
 }
 
 void MainWindow::computeDisplaySceneGeometry( int sourceWidth,
@@ -6631,6 +6677,56 @@ void MainWindow::drawFrame( bool updateTimecodeLabel )
      * Once Phase 4B lands the dial will start producing smaller buffers
      * without any further plumbing churn. */
     requestContext.playbackScaleFactor = effectivePlaybackScaleFactorForRequest();
+
+    /* CPU-DEBAYERED16-HONOUR-SCALE-1: may the recon worker reconstruct this
+     * request's OutputDebayered16 frame at the preview scale? Only when the prep
+     * would box-reduce the full frame to exactly that scale (its decision with the
+     * inputs buildPlaybackPrepResult uses, the clip's full dims as the source), so
+     * the presented frame keeps the dims it has today. */
+    {
+        const GpuPreviewProcessingConfig &prepConfig = requestContext.gpuPreviewProcessingConfig;
+        PlaybackPrepReducedInputs prepInputs;
+        prepInputs.killSwitch =
+            qEnvironmentVariableIsSet( playbackPrepReducedKillSwitchName() )
+            && qEnvironmentVariable( playbackPrepReducedKillSwitchName() ).trimmed()
+                   != QStringLiteral("0");
+        prepInputs.playbackActive = playbackPolicyActive();
+        prepInputs.scopesVisible = mainWindowHasScopeVisualization( renderPolicy );
+        prepInputs.zebrasEnabled = renderPolicy.zebrasEnabled;
+        prepInputs.pipelineCaptureActive = mlv_pipeline_capture_enabled() != 0;
+        prepInputs.gpuImagePresentation = useGpuImagePresentation;
+        prepInputs.zoomFit = zoomFitEnabled;
+        prepInputs.spatialPostPass = gpuPreviewProcessingCpuHasSpatialPostPass( prepConfig );
+        prepInputs.highlightReconExact =
+            prepConfig.applyHighlightReconstruction && !prepConfig.highlightReconDualIso;
+        // The render attaches the S/H frame state later; assume the quarter blur.
+        prepInputs.shQuarterBlur = prepConfig.applyShadowsHighlights;
+        prepInputs.requestedScale = requestContext.playbackScaleFactor;
+        prepInputs.sourceWidth = sourceWidth;
+        prepInputs.sourceHeight = sourceHeight;
+        prepInputs.mlvWidth = sourceWidth;
+        prepInputs.mlvHeight = sourceHeight;
+
+        Debayered16HonourScaleInputs honourScale;
+        honourScale.playbackActive = requestContext.playbackActive;
+        honourScale.cpuPreviewRoute =
+            requestContext.renderThreadUsingCpuPreviewProcessing
+            && renderOutputMode == RenderFrameThread::OutputDebayered16;
+        honourScale.gpuPreviewRoute = requestContext.renderThreadUsingGpuPreviewProcessing;
+        honourScale.gpuAmazeDebayer = requestContext.renderThreadUsingGpuAmazeDebayer;
+        honourScale.gpuBilinearDebayer = requestContext.renderThreadUsingGpuBilinearDebayer;
+        honourScale.gpuReconTextureRoute = requestContext.gpuPlaybackReconTexturePresentRequested;
+        honourScale.amazeDebayer = m_pMlvObject && doesMlvAlwaysUseAmaze( m_pMlvObject ) != 0;
+        honourScale.requestedScale = requestContext.playbackScaleFactor;
+        honourScale.prepFactor = playbackPrepDecideReduced( prepInputs ).factor;
+        const Debayered16HonourScaleRefusal honourScaleRefusal =
+            debayered16HonourScaleRefusal( honourScale );
+        requestContext.cpuDebayered16HonourScaleRefusal = honourScaleRefusal;
+        requestContext.cpuDebayered16HonourScaleAdmitted =
+            honourScaleRefusal == Debayered16HonourScaleRefusal::None;
+        requestContext.cpuDebayered16HonourScaleReason =
+            QString::fromLatin1( debayered16HonourScaleRefusalReason( honourScaleRefusal ) );
+    }
 
     RenderFrameThread::PresentationPreparationOptions presentationPreparation;
     presentationPreparation.fastPlaybackScale = requestContext.fastPlaybackScaleEligible;
@@ -11041,12 +11137,19 @@ void MainWindow::playbackHandling(int timeDiff)
                 ui->horizontalSliderPosition->setValue( m_newPosDropMode );
                 ui->horizontalSliderPosition->blockSignals( false );
                 if( m_playbackSmokeActive )
+                {
                     m_playbackSlipHistogram.noteTimelineMove(
                         dropFrameTick.wrapped ? playback_slip::AdvancePath::LoopWrap
                                               : playback_slip::AdvancePath::DropTick,
                         ui->horizontalSliderPosition->value(), paceNowMs,
                         grantedDropFrames, m_playbackPaceGuard.creditFrames(),
                         getFramerate(), !paceGuardArmedBeforeTick );
+                    // PLAYBACK-STARTUP-CATCHUP-BURST-1: startup_catchup_frames, the skips of the first 2 s after Play.
+                    if( !dropFrameTick.wrapped
+                     && paceNowMs - m_playbackSmokeStartTime * 1000.0 <= playback_native_pace::kStartupCatchupWindowMs )
+                        m_playbackSmokeStartupSkippedFrames += playback_native_pace::skippedFrames(
+                            sourcePositionBeforeDropTick, dropFrameTick.position );
+                }
                 m_frameChanged = true;
             }
         }
@@ -24317,11 +24420,16 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     m_playbackSmokeStartAudioSyncApplied = m_playbackAudioSyncAppliedCount;
     m_playbackSmokeStartAudioSyncSkipped = m_playbackAudioSyncSkippedCount;
     m_playbackSmokeStartTime = mlv_stage_timing_now();
+    m_playbackPresentTrace.begin( m_playbackSmokeStartTime * 1000.0, 4096 );   // r7 present trace (no-op when off)
     m_playbackSlipHistogram.reset( m_playbackSmokeStartPosition, getFramerate() );
-    m_playbackSlipHistogram.setPlayStart( m_playbackSmokeStartTime * 1000.0 );
+    // PLAYBACK-STARTUP-CATCHUP-BURST-1: the timeline owes the wall time since Play only when the legacy startup banks
+    // it; otherwise paced playback starts at the first present, and a later skip is a slip, never startup catch-up.
+    if( mlvappPlaybackStartupCatchupLegacyRequested() )
+        m_playbackSlipHistogram.setPlayStart( m_playbackSmokeStartTime * 1000.0 );
     m_playbackSmokeLastPresentedTime = 0.0;
     m_playbackSmokeFirstPresentMs = 0.0;
     m_playbackSmokeFirstPresentTimelineDeltaAbs = 0;
+    m_playbackSmokeStartupSkippedFrames = 0;
     m_playbackSmokePresentedIntervalSumMs = 0.0;
     m_playbackSmokePresentedIntervalMaxMs = 0.0;
     m_playbackSmokeRenderTotalSumMs = 0.0;
@@ -24543,6 +24651,9 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     m_playbackSmokeDebayered16WorkerLlrawprocSumMs = 0.0;
     m_playbackSmokeDebayered16RenderLlrawprocSumMs = 0.0;
     m_playbackSmokeDebayered16OutcomeFrames.clear();
+    m_playbackSmokeDebayered16ReducedConsumedFrames = 0;
+    m_playbackSmokeDebayered16HonourScaleRefusalLast.clear();
+    m_playbackSmokeDebayered16HonourScaleRefusalCounts.clear();
     for( size_t i = 0; i < m_playbackSmokeDebayered16AttemptsAtBegin.size(); ++i )
     {
         m_playbackSmokeDebayered16AttemptsAtBegin[i] = m_pRenderThread
@@ -25069,6 +25180,20 @@ void MainWindow::notePlaybackSmokePresentedFrame(
         slipSample.timelinePosition = ui->horizontalSliderPosition->value();
         slipSample.lookaheadCovered = requestContext.playbackLookaheadDepth > 0;
         m_playbackSlipHistogram.notePresent( slipSample );
+        if( m_playbackPresentTrace.active() )
+        {
+            playback_present_trace::Row traceRow;
+            traceRow.frame = slipSample.displayFrame;
+            traceRow.position = slipSample.timelinePosition;
+            traceRow.presentMs = slipSample.presentMs;
+            traceRow.readyMs = slipSample.readyKnown ? slipSample.readyMs : -1.0;
+            traceRow.uiLatencyMs = presentUiSignalLatencyMs;
+            traceRow.drawMs = drawTotalMs;
+            traceRow.renderMs = renderWorkMs;
+            traceRow.queueMs = queueWaitMs;
+            traceRow.creditFrames = m_playbackPaceGuard.creditFrames();
+            m_playbackPresentTrace.notePresent( traceRow );
+        }
         // PLAYBACK-GL-PRESENT-SETUP-STALL-1: the texture-present setup split, only for a present a presenter ran.
         if( timing.contains( QStringLiteral("gpu_playback_recon_texture_present_setup_program_ms") ) )
         {
@@ -25689,6 +25814,12 @@ void MainWindow::notePlaybackSmokePresentedFrame(
         }
         ++m_playbackSmokeDebayered16OutcomeFrames[
             telemetryStringValue( timing, "debayered16_phase3_recon_outcome" )];
+        if( telemetryBoolValue( timing, "debayered16_reduced_recon_consumed" ) )
+            ++m_playbackSmokeDebayered16ReducedConsumedFrames;
+        m_playbackSmokeDebayered16HonourScaleRefusalLast =
+            telemetryStringValue( timing, "debayered16_honour_scale_refusal" );
+        ++m_playbackSmokeDebayered16HonourScaleRefusalCounts[
+            m_playbackSmokeDebayered16HonourScaleRefusalLast];
         m_playbackSmokeDebayered16WorkerLlrawprocSumMs +=
             telemetryDoubleValue( timing, "debayered16_recon_worker_llrawproc_total_ms" );
         m_playbackSmokeDebayered16RenderLlrawprocSumMs +=
@@ -27269,6 +27400,7 @@ void MainWindow::noteContactSheetPresentedFrame(
 
     const double grabMs = static_cast<double>( grabTimer.nsecsElapsed() ) / 1000000.0;
     m_playbackSlipHistogram.noteGrab( grabMs );   // slip_summary: this grab lands in the next present's interval
+    m_playbackPresentTrace.noteGrab( grabMs );
     const bool frameOk = !gpuWindowGrabFailedClosed
         && !contactFrameImage.isNull();
 
@@ -27450,6 +27582,7 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
     }
 
     m_playbackSmokeActive = false;
+    m_playbackPresentTrace.end();
 
     // PLAYBACK-CLIP-LENGTH-ENFORCE-1: the loaded clip's own length, printed on the summary and
     // gate lines so a receipt carries the footage length the measured window actually played.
@@ -27633,6 +27766,18 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                          elapsedMs, m_playbackSmokeFirstPresentMs, m_playbackSmokePresentedFrames ), 0, 'f', 3 )
                .arg( m_playPaceFps, 0, 'f', 3 )
                .arg( m_playbackSmokeFirstPresentTimelineDeltaAbs );
+
+    // PLAYBACK-STARTUP-CATCHUP-BURST-1: Play -> first present, and what the first 2 s skipped for it.
+    qInfo().noquote()
+        << QStringLiteral(
+               "playback_smoke.startup_catchup session=%1 startup_wait_ms=%2 startup_catchup_frames=%3 "
+               "startup_mode=%4" )
+               .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
+               .arg( m_playbackSmokePresentedFrames > 0 ? QString::number( m_playbackSmokeFirstPresentMs, 'f', 3 )
+                                                        : QStringLiteral( "na" ) )
+               .arg( m_playbackSmokeStartupSkippedFrames )
+               .arg( mlvappPlaybackStartupCatchupLegacyRequested() ? QStringLiteral( "legacy" )
+                                                                   : QStringLiteral( "first_present" ) );
 
     qInfo().noquote()
         << QStringLiteral(
@@ -27863,6 +28008,22 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                        .arg( r.timelineAdvancedInInterval )
                        .arg( bool01( r.afterGap ) );
         }
+    }
+
+    // PLAYBACK-STARTUP-CATCHUP-BURST-1 r7: the opt-in per-present trace, written only now that the Play has stopped.
+    if( m_playbackPresentTrace.enabled() )
+    {
+        const qulonglong traceSession = static_cast<qulonglong>( m_playbackSmokeSessionId );
+        qInfo().noquote() << QStringLiteral( "playback_smoke.present_trace_header session=%1 rows=%2 cols=%3" )
+                                 .arg( traceSession )
+                                 .arg( static_cast<qulonglong>( m_playbackPresentTrace.rows().size() ) )
+                                 .arg( QLatin1String( playback_present_trace::Recorder::header() ) );
+        const std::vector<playback_present_trace::Row> &traceRows = m_playbackPresentTrace.rows();
+        for( size_t i = 0; i < traceRows.size(); ++i )
+            qInfo().noquote() << QStringLiteral( "playback_smoke.present_trace session=%1 row=%2" )
+                                     .arg( traceSession )
+                                     .arg( QString::fromStdString(
+                                         playback_present_trace::Recorder::formatRow( i, traceRows[i] ) ) );
     }
 
     if( perfFieldLogEnabled() )
@@ -28416,7 +28577,9 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                    "debayered16_fallback_reason_last=\"%6\" "
                    "refused_acquisition_failed=%7 refused_gpu_playback_recon=%8 "
                    "refused_settings_changed_during_recon=%9 "
-                   "refused_settings_changed_since_recon=%10" )
+                   "refused_settings_changed_since_recon=%10 "
+                   "reduced_consumed_frames=%11 honour_scale_refusal_last=%12 "
+                   "honour_scale_refusal_counts=%13" )
                    .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
                    .arg( m_playbackSmokeDebayered16ReconConsumedFrames )
                    .arg( m_playbackSmokeDebayered16OwnReconFrames )
@@ -28426,7 +28589,20 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                    .arg( presentedOutcome( Debayered16ReconRefusal::AcquisitionFailed ) )
                    .arg( presentedOutcome( Debayered16ReconRefusal::GpuPlaybackRecon ) )
                    .arg( presentedOutcome( Debayered16ReconRefusal::SettingsChangedDuringRecon ) )
-                   .arg( presentedOutcome( Debayered16ReconRefusal::SettingsChangedSinceRecon ) );
+                   .arg( presentedOutcome( Debayered16ReconRefusal::SettingsChangedSinceRecon ) )
+                   .arg( m_playbackSmokeDebayered16ReducedConsumedFrames )
+                   .arg( m_playbackSmokeDebayered16HonourScaleRefusalLast.isEmpty()
+                             ? QStringLiteral("unset")
+                             : m_playbackSmokeDebayered16HonourScaleRefusalLast )
+                   .arg( [this]() {
+                             QStringList parts;
+                             for( auto it = m_playbackSmokeDebayered16HonourScaleRefusalCounts.constBegin();
+                                  it != m_playbackSmokeDebayered16HonourScaleRefusalCounts.constEnd(); ++it )
+                                 parts << QStringLiteral("%1:%2")
+                                              .arg( it.key().isEmpty() ? QStringLiteral("unset") : it.key() )
+                                              .arg( it.value() );
+                             return parts.isEmpty() ? QStringLiteral("none") : parts.join( QLatin1Char(',') );
+                         }() );
 
         /* Every render attempt in the session, presented or not (Sol H3): the
          * render thread's counters minus their value at session begin. */
@@ -30495,6 +30671,7 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
             m_lastPlaybackAudioSyncFrame = syncFrame;
             m_lastPlaybackAudioSyncTime = syncNow;
             ++m_playbackAudioSyncAppliedCount;
+            m_playbackPresentTrace.noteAudioSync();
             m_pAudioPlayback->stop();
             m_pAudioPlayback->jumpToPos( syncFrame );
             m_pAudioPlayback->play();
@@ -31206,6 +31383,9 @@ void MainWindow::drawFrameReady()
         return;
     }
     m_lastPresentedPlaybackFrame = static_cast<long long>( display_frame );
+    // PLAYBACK-STARTUP-CATCHUP-BURST-1: the pace clock starts when this Play's first present ENDS
+    // (presentPlaybackPreparedFrame), not here: the first draw blocks the GUI thread for ~1 s on Bachelor CUDA,
+    // and a clock started before it banked that stall and repaid it as one 23-frame jump (r3 venue legs).
 
     /* Round-4 item 3: dispatch the NEXT frame render BEFORE the present work
      * below. The present span runs on this (GUI) thread, so the render

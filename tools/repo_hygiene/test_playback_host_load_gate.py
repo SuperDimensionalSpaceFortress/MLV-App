@@ -1017,15 +1017,31 @@ class HostLoadSnapshotProducerAlignmentTests(_ProbeCase):
         # Overrides Get-CimInstance to sleep for 900ms before returning (simulating sol/fable's
         # "slow evidence collection" repro), then calls the REAL, unmodified Get-HostLoadSnapshot
         # (evidence collection enabled, i.e. the before/after BRACKET shape, not the interior-sample
-        # -SkipEvidenceCollection shape). Asserts the returned systemTimesCapturedAtUtc lands close
-        # to when the call STARTED, not close to when it RETURNED -- proving the syscall (and, by
+        # -SkipEvidenceCollection shape). Asserts the returned systemTimesCapturedAtUtc is stamped
+        # BEFORE the first slow evidence call is entered, not after it -- proving the syscall (and, by
         # construction, the subject-CPU read that immediately follows it inside
         # Get-HostLoadSystemTimes) is not waiting on the slow evidence work. Also asserts the call
         # really did take >= 900ms end to end, so a mock that silently never ran cannot make this
         # test pass vacuously.
+        #
+        # De-flake (CI-FLAKE-HOST-LOAD-GATE-SYSCALL-TIMESTAMP-1): the assertion is an ORDERING, not an
+        # elapsed-time bound. The old shape bounded systemTimesCapturedAtUtc - callStartUtc below 1200ms,
+        # but everything between the call start and the syscall that is NOT evidence collection (the
+        # one-time Add-Type JIT in Get-HostLoadSystemTimes, first-use cmdlet resolution, a starved
+        # runner) counts toward that lag too, so a slow runner failed correct production code
+        # (merge_group 38281549555: 5340ms lag of a 7265ms call, of which the two mocked CIM calls were
+        # only 1800ms; PR #208: 1714.8ms). No wall-clock bound can separate "the syscall waited on
+        # evidence" from "the runner was slow before the syscall". The first mocked Get-CimInstance
+        # entry is recorded on the same clock, and the contract -- the syscall precedes ALL evidence
+        # work -- is exactly systemTimesCapturedAtUtc <= first CIM entry, at any load. The round-8
+        # ordering (evidence before the syscall) puts the first CIM entry BEFORE the syscall stamp and
+        # fails it.
         proc = self.run_snippet(
+            "$script:firstCimEntryUtc = $null; $script:cimCalls = 0\n"
             "function Get-CimInstance {\n"
             "    param($ClassName, $Filter, $ErrorAction, $OperationTimeoutSec)\n"
+            "    if ($null -eq $script:firstCimEntryUtc) { $script:firstCimEntryUtc = [datetime]::UtcNow }\n"
+            "    $script:cimCalls++\n"
             "    Start-Sleep -Milliseconds 900\n"
             "    if ($ClassName -eq 'Win32_Processor') { [pscustomobject]@{ LoadPercentage = 5 } }\n"
             "    else { [pscustomobject]@{ FreePhysicalMemory = 1024; TotalVisibleMemorySize = 2048 } }\n"
@@ -1047,33 +1063,32 @@ class HostLoadSnapshotProducerAlignmentTests(_ProbeCase):
             # never notices because it only ever subtracts two such casts from EACH OTHER (any
             # kind-handling quirk cancels out identically on both sides), but comparing against a
             # native [datetime]::UtcNow here needs an explicit RoundtripKind parse to avoid a bogus
-            # multi-hour "offset" masking the real millisecond-scale lag this test measures.
+            # multi-hour "offset" masking the real ordering this test measures.
             "$syscallCapturedAtUtc = [datetime]::Parse($s.systemTimesCapturedAtUtc, "
             "[System.Globalization.CultureInfo]::InvariantCulture, "
             "[System.Globalization.DateTimeStyles]::RoundtripKind)\n"
-            "$syscallLagMs = ($syscallCapturedAtUtc - $callStartUtc).TotalMilliseconds\n"
             "$totalCallMs = ($callEndUtc - $callStartUtc).TotalMilliseconds\n"
             "Write-Host \"SYSTEM_TIMES_COLLECTED=$($s.systemTimesCollected)\"\n"
-            "Write-Host \"SYSCALL_LAG_MS=$syscallLagMs\"\n"
+            "Write-Host \"CIM_CALLS=$script:cimCalls\"\n"
+            # Positive = the syscall stamp precedes the first evidence call (the contract); negative = the
+            # evidence work started first. Exact tick arithmetic on one clock, no tolerance term.
+            "Write-Host \"CIM_ENTRY_MINUS_SYSCALL_TICKS=$($script:firstCimEntryUtc.Ticks - $syscallCapturedAtUtc.Ticks)\"\n"
             "Write-Host \"TOTAL_CALL_MS=$totalCallMs\"\n"
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("SYSTEM_TIMES_COLLECTED=True", proc.stdout)
-        lag_ms = float(next(l for l in proc.stdout.splitlines() if l.startswith("SYSCALL_LAG_MS="))[len("SYSCALL_LAG_MS="):])
+        # Non-vacuity: the ordering check below is meaningless unless the mocked evidence work ran.
+        self.assertIn("CIM_CALLS=2", proc.stdout, "both mocked Get-CimInstance calls must have run")
+        entry_minus_syscall_ticks = int(next(
+            l for l in proc.stdout.splitlines() if l.startswith("CIM_ENTRY_MINUS_SYSCALL_TICKS="))[
+                len("CIM_ENTRY_MINUS_SYSCALL_TICKS="):])
         total_ms = float(next(l for l in proc.stdout.splitlines() if l.startswith("TOTAL_CALL_MS="))[len("TOTAL_CALL_MS="):])
         self.assertGreaterEqual(total_ms, 850.0, "the mocked CIM sleep must actually have run")
-        # round 9: the threshold is deliberately loose (1200ms) rather than tight -- the very first
-        # call in this fresh pwsh process also pays Get-HostLoadSystemTimes' one-time Add-Type JIT
-        # compilation cost, which lands BEFORE the syscall too and can itself run into the hundreds
-        # of milliseconds on a loaded machine, unrelated to evidence-collection ordering. The two
-        # mocked Get-CimInstance calls sleep 900ms each (>= 1800ms total), so a genuine round-8-style
-        # reversion (evidence before the syscall) lags by close to the FULL call duration (observed
-        # 2300-2500ms when deliberately reverted while writing this test) -- comfortably clear of
-        # this threshold in either direction.
-        self.assertLess(
-            lag_ms, 1200.0,
-            f"systemTimesCapturedAtUtc lagged the call start by {lag_ms}ms out of a {total_ms}ms "
-            "call -- the syscall is waiting on slow evidence collection again (round-8 ordering)",
+        self.assertGreaterEqual(
+            entry_minus_syscall_ticks, 0,
+            f"the first slow evidence call began {-entry_minus_syscall_ticks / 10000.0}ms BEFORE "
+            "systemTimesCapturedAtUtc was stamped -- the syscall is waiting on slow evidence collection "
+            "again (round-8 ordering)",
         )
 
     @unittest.skipUnless(os.name == "nt", "exercises the real GetSystemTimes syscall")

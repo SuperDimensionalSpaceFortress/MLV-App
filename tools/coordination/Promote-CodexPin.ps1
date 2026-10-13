@@ -26,10 +26,15 @@ Promotion gate, in order; the first failure refuses with its exit code and write
      identical `git init` WITHOUT the sandbox, same environment, in a scratch dir -- exits 0 and
      creates its target. A write that went through is exit 13; any other outcome is UNPROVEN
      (timed-out / control-failed / no-denial-signature), exit 19, never DENIED
-  5. one real `codex exec` in the read-only sandbox, MCP servers disabled exactly as Invoke-Lane
-     does for a review key, classified EXEC_OK by the codex-exec-health rule (at least one shell
-     exec ran). This step spends tokens: one short call.
-  6. write codex-pin.json (temp file + move) and promotion.json evidence
+  5. one real `codex exec` PER MODEL in the read-only sandbox, MCP servers disabled exactly as
+     Invoke-Lane does for a review key, each classified EXEC_OK by the codex-exec-health rule (at
+     least one shell exec ran). MODEL-POSTURE-R16-1: the models probed are the ones the resolver
+     currently picks for EVERY lane tier (-Tiers, default sol, luna, astra), because a pinned CLI
+     can silently exclude a newer model (the sol tier moved to gpt-6.1-sol while the pin had only
+     ever run luna). Every probed model must pass or nothing is promoted. -Model probes that one
+     explicit slug instead. This step spends tokens: one short call per model.
+  6. write codex-pin.json (temp file + move) -- including `probedModels`, the slugs step 5 proved,
+     which Invoke-Lane checks before running a lane on the pin -- and promotion.json evidence
 
 Exit codes:
   0   promoted (pin written)
@@ -38,11 +43,13 @@ Exit codes:
   11  installed exe missing, or its --version is not <version>
   12  read-only sandbox probe failed in every candidate sandbox mode
   13  write probe NOT denied (the read-only sandbox let a write through)
-  14  exec probe not EXEC_OK (no shell exec ran: blind, timed out, or no exec attempted)
+  14  an exec probe not EXEC_OK (no shell exec ran: blind, timed out, or no exec attempted); the
+      message names the model, and no pin is written even if earlier models passed
   15  a probe reported an auth/login failure -- stopped; this script never runs auth commands
   16  pin or evidence write failed
   17  `codex mcp list --json` unreadable, so MCP could not be disabled for the exec probe
-  18  model resolution failed for the exec probe (pass -Model to skip it)
+  18  model resolution failed for the exec probe: some tier in -Tiers did not resolve (stale or
+      missing models cache, no listed model) (pass -Model to skip it)
   19  write probe UNPROVEN: refused, but not provably by the sandbox (see step 4)
   20  a child's cleanup did not finish within its budget (exit-wait-expired / stream-drain-expired)
 
@@ -60,9 +67,14 @@ param(
     [string]$WindowsSandbox = 'auto',
     # Where promotion.json and probe transcripts go. Default: <PinRoot>\<version>-promotion-<utc>.
     [string]$EvidenceDir = '',
-    # Exec probe model. Default: the luna tier resolved by resolve-codex-tier.py, as a lane would.
+    # Exec probe model. Default: none -- every tier in -Tiers is resolved by resolve-codex-tier.py,
+    # as a lane would, and each resolved model is probed. -Model probes this one slug only.
     [string]$Model = '',
-    [string]$Tier = 'luna',
+    # MODEL-POSTURE-R16-1: the lane tiers whose current model the pin must have proven (Invoke-Lane's
+    # codex lanes: sol, luna, astra).
+    [string[]]$Tiers = @('sol', 'luna', 'astra'),
+    # Models cache the resolver reads (default: ~/.codex/models_cache.json); tests point it at a fixture.
+    [string]$ModelsCache = '',
     [int]$ExecTimeoutSec = 240,
     [int]$ProbeTimeoutSec = 60,
     [int]$InstallTimeoutSec = 600
@@ -319,26 +331,48 @@ if ($unproven.Count -gt 0) {
 Add-Step 'write-probe' "DENIED (exit $($wr.exit), signature '$signature', control exit 0)" $wr $writeExtra
 
 # ------------------------------------------------------------------ 5. exec probe (spends tokens)
-if (-not $Model) {
+# MODEL-POSTURE-R16-1: the models to prove. Each tier resolves exactly as a lane would resolve it
+# (resolve-codex-tier.py), so the pin covers what lanes will actually launch, not only one tier.
+$probeModels = [System.Collections.Generic.List[string]]::new()
+$probeTiersByModel = [ordered]@{}
+$modelsFetchedAt = $null
+if ($Model) {
+    $probeModels.Add($Model)
+    $probeTiersByModel[$Model] = @('(explicit -Model)')
+} else {
     $resolver = Join-Path $PSScriptRoot 'resolve-codex-tier.py'
     $py = $null
     foreach ($n in @('python.exe', 'python3.exe', 'py.exe')) {
         $c = Get-Command -Name $n -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
         if ($c) { $py = $c.Source; break }
     }
-    if (-not $py) { Add-Step 'model' 'FAILED: no python'; Stop-Promotion 18 'no python interpreter to resolve the codex tier (pass -Model)' }
+    if (-not $py) { Add-Step 'model' 'FAILED: no python'; Stop-Promotion 18 'no python interpreter to resolve the codex tiers (pass -Model)' }
     $pyArgs = @()
     if ((Split-Path -Leaf $py) -ieq 'py.exe') { $pyArgs += '-3' }
-    $mr = Invoke-Bounded -Step 'model' -Exe $py -Cwd $WorkDir -TimeoutSec 30 -ArgList ($pyArgs + @($resolver, '--tier', $Tier))
-    try { $mj = $mr.out | ConvertFrom-Json } catch { $mj = $null }
-    $okProp = if ($null -ne $mj) { $mj.PSObject.Properties['ok'] } else { $null }
-    if ($null -eq $okProp -or -not [bool]$okProp.Value) {
-        Add-Step 'model' 'FAILED' $mr
-        Stop-Promotion 18 "tier '$Tier' did not resolve"
+    # `pwsh -File ... -Tiers sol,luna` arrives as ONE string, so each entry is split on commas.
+    $tierList = @($Tiers | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Select-Object -Unique)
+    if ($tierList.Count -eq 0) { Add-Step 'model' 'FAILED: no tiers'; Stop-Promotion 18 '-Tiers is empty and no -Model was given: nothing to probe' }
+    foreach ($tierName in $tierList) {
+        $resolverArgs = $pyArgs + @($resolver, '--tier', $tierName)
+        if ($ModelsCache) { $resolverArgs += @('--cache', $ModelsCache) }
+        $mr = Invoke-Bounded -Step "model-$tierName" -Exe $py -Cwd $WorkDir -TimeoutSec 30 -ArgList $resolverArgs
+        try { $mj = $mr.out | ConvertFrom-Json } catch { $mj = $null }
+        $okProp = if ($null -ne $mj) { $mj.PSObject.Properties['ok'] } else { $null }
+        if ($null -eq $okProp -or -not [bool]$okProp.Value) {
+            $errProp = if ($null -ne $mj) { $mj.PSObject.Properties['error'] } else { $null }
+            $why = if ($null -ne $errProp) { [string]$errProp.Value } else { 'unparseable resolver output' }
+            Add-Step "model-$tierName" "FAILED: $why" $mr
+            Stop-Promotion 18 "tier '$tierName' did not resolve: $why"
+        }
+        $resolved = [string]$mj.resolvedModel
+        $fetchedProp = $mj.PSObject.Properties['fetchedAt']
+        if ($null -ne $fetchedProp) { $modelsFetchedAt = [string]$fetchedProp.Value }
+        if (-not $probeTiersByModel.Contains($resolved)) { $probeModels.Add($resolved); $probeTiersByModel[$resolved] = @() }
+        $probeTiersByModel[$resolved] += $tierName
+        Add-Step "model-$tierName" "OK: $resolved"
     }
-    $Model = [string]$mj.resolvedModel
 }
-Add-Step 'model' "OK: $Model"
+Add-Step 'model' ("OK: " + (($probeModels | ForEach-Object { '{0} ({1})' -f $_, ($probeTiersByModel[$_] -join '+') }) -join ', '))
 
 $lr = Invoke-Bounded -Step 'mcp-list' -Exe $exe -Cwd $WorkDir -TimeoutSec 60 -ArgList @('mcp', 'list', '--json', '-c', 'features.plugins=false')
 Test-AuthFailure $lr 'mcp-list'
@@ -359,31 +393,43 @@ try {
 }
 Add-Step 'mcp-list' 'OK' $lr
 
-$nonce = 'PINPROBE' + [guid]::NewGuid().ToString('N').Substring(0, 8)
-$lastFile = Join-Path $EvidenceDir 'exec-probe.last.txt'
-$execArgs = @('exec', '-m', $Model, '-c', 'model_reasoning_effort="low"', '-s', 'read-only',
-    '-c', ('windows.sandbox="{0}"' -f $chosen)) + $mcpArgs + @('-C', $WorkDir, '-o', $lastFile, '--skip-git-repo-check', '-')
-$er = Invoke-Bounded -Step 'exec-probe' -Exe $exe -Cwd $WorkDir -TimeoutSec $ExecTimeoutSec -ArgList $execArgs `
-    -StdIn ("PIN PROMOTION PROBE. Run exactly one shell command: git --version`nThen reply with exactly this one line and nothing else: $nonce`n")
-try {
-    [System.IO.File]::WriteAllText((Join-Path $EvidenceDir 'exec-probe.stdout.txt'), $er.out, [System.Text.UTF8Encoding]::new($false))
-    [System.IO.File]::WriteAllText((Join-Path $EvidenceDir 'exec-probe.stderr.txt'), $er.err, [System.Text.UTF8Encoding]::new($false))
-} catch { }
-Test-AuthFailure $er 'exec-probe'
-$transcript = $er.err + "`n" + $er.out
-$okCount = [regex]::Matches($transcript, $EXEC_OK_PATTERN).Count
-$rejCount = [regex]::Matches($transcript, $EXEC_REJECTED_PATTERN).Count
-$execClass = if ($okCount -gt 0) { 'EXEC_OK' } elseif ($rejCount -gt 0) { 'EXEC_BLIND' } else { 'UNKNOWN' }
-$nonceEchoed = (Test-Path -LiteralPath $lastFile) -and ((Get-Content -LiteralPath $lastFile -Raw) -match [regex]::Escape($nonce))
-$execExtra = @{ execClass = $execClass; execOkCount = $okCount; execRejectedCount = $rejCount; nonceEchoed = $nonceEchoed }
-if ($execClass -ne 'EXEC_OK') {
-    Add-Step 'exec-probe' "FAILED: $execClass" $er $execExtra
-    Stop-Promotion 14 "exec probe classified $execClass (exit $($er.exit), timedOut=$($er.timedOut), ok=$okCount, rejected=$rejCount)"
+
+# One real exec per model, each in the pinned read-only sandbox with MCP disabled. ALL must be
+# EXEC_OK: a pin that proved only some of the lane tiers must not claim the others.
+$probeResults = [System.Collections.Generic.List[object]]::new()
+foreach ($probeModel in $probeModels) {
+    $safeName = $probeModel -replace '[^A-Za-z0-9._-]', '_'
+    $stepName = "exec-probe:$probeModel"
+    $nonce = 'PINPROBE' + [guid]::NewGuid().ToString('N').Substring(0, 8)
+    $lastFile = Join-Path $EvidenceDir "exec-probe.$safeName.last.txt"
+    # high, the effort every lane runs at (R16.3): a model proven only at another effort is not proven for a lane.
+    $execArgs = @('exec', '-m', $probeModel, '-c', 'model_reasoning_effort="high"', '-s', 'read-only',
+        '-c', ('windows.sandbox="{0}"' -f $chosen)) + $mcpArgs + @('-C', $WorkDir, '-o', $lastFile, '--skip-git-repo-check', '-')
+    $er = Invoke-Bounded -Step $stepName -Exe $exe -Cwd $WorkDir -TimeoutSec $ExecTimeoutSec -ArgList $execArgs `
+        -StdIn ("PIN PROMOTION PROBE. Run exactly one shell command: git --version`nThen reply with exactly this one line and nothing else: $nonce`n")
+    try {
+        [System.IO.File]::WriteAllText((Join-Path $EvidenceDir "exec-probe.$safeName.stdout.txt"), $er.out, [System.Text.UTF8Encoding]::new($false))
+        [System.IO.File]::WriteAllText((Join-Path $EvidenceDir "exec-probe.$safeName.stderr.txt"), $er.err, [System.Text.UTF8Encoding]::new($false))
+    } catch { }
+    Test-AuthFailure $er $stepName
+    $transcript = $er.err + "`n" + $er.out
+    $okCount = [regex]::Matches($transcript, $EXEC_OK_PATTERN).Count
+    $rejCount = [regex]::Matches($transcript, $EXEC_REJECTED_PATTERN).Count
+    $execClass = if ($okCount -gt 0) { 'EXEC_OK' } elseif ($rejCount -gt 0) { 'EXEC_BLIND' } else { 'UNKNOWN' }
+    $nonceEchoed = (Test-Path -LiteralPath $lastFile) -and ((Get-Content -LiteralPath $lastFile -Raw) -match [regex]::Escape($nonce))
+    $execExtra = @{ model = $probeModel; tiers = @($probeTiersByModel[$probeModel]); execClass = $execClass
+                    execOkCount = $okCount; execRejectedCount = $rejCount; nonceEchoed = $nonceEchoed }
+    if ($execClass -ne 'EXEC_OK') {
+        Add-Step $stepName "FAILED: $execClass" $er $execExtra
+        Stop-Promotion 14 "exec probe of model '$probeModel' classified $execClass (exit $($er.exit), timedOut=$($er.timedOut), ok=$okCount, rejected=$rejCount); no pin written"
+    }
+    Add-Step $stepName "EXEC_OK (ok=$okCount rejected=$rejCount nonceEchoed=$nonceEchoed)" $er $execExtra
+    $probeResults.Add([pscustomobject]@{ model = $probeModel; okCount = $okCount; rejCount = $rejCount })
 }
-Add-Step 'exec-probe' "EXEC_OK (ok=$okCount rejected=$rejCount nonceEchoed=$nonceEchoed)" $er $execExtra
 
 # ------------------------------------------------------------------ 6. write the pin
 $evidencePath = Join-Path $EvidenceDir 'promotion.json'
+$execProbeText = (($probeResults | ForEach-Object { "EXEC_OK ok=$($_.okCount) rejected=$($_.rejCount) model=$($_.model)" }) -join '; ')
 $pin = [ordered]@{
     schema            = 'mlv-app/codex-pin/v1'
     version           = $Version
@@ -391,10 +437,17 @@ $pin = [ordered]@{
     installPrefix     = "<Invoke-Lane -CodexPinRoot, default $PinRoot>\$Version (exe $CODEX_PIN_EXE_RELATIVE); written by Promote-CodexPin.ps1"
     promotedAt        = [DateTime]::UtcNow.ToString('o')
     promotionEvidence = $evidencePath
+    # MODEL-POSTURE-R16-1: the slugs exec-probed EXEC_OK on this version. Invoke-Lane runs a pinned
+    # read-only lane on the pin only when its resolved model is listed here; any other model runs on
+    # the global CLI (pinState PIN_MODEL_UNPROBED). probedTiers records which lane tier each slug was
+    # resolved from, modelsFetchedAt the catalogue the tiers were resolved against.
+    probedModels      = @($probeModels)
+    probedTiers       = $probeTiersByModel
+    modelsFetchedAt   = $modelsFetchedAt
     gate              = [ordered]@{
         sandboxProbe = "codex sandbox -P :read-only -- git --version rc 0 ($chosen)"
         writeProbe   = "DENIED (exit $($wr.exit), stderr '$signature'; unsandboxed control git init exit 0)"
-        execProbe    = "$execClass ok=$okCount rejected=$rejCount model=$Model"
+        execProbe    = $execProbeText
     }
 }
 try {
@@ -404,7 +457,7 @@ try {
 } catch {
     Stop-Promotion 16 "pin write failed: $($_.Exception.Message)"
 }
-$evidence.result = "PROMOTED codex $Version ($chosen sandbox) -> $PinFile"; $evidence.exitCode = 0
+$evidence.result = "PROMOTED codex $Version ($chosen sandbox, models: $(@($probeModels) -join ', ')) -> $PinFile"; $evidence.exitCode = 0
 Write-Evidence
-Write-Host "[promote-codex-pin] PROMOTED codex $Version ($chosen sandbox); pin $PinFile; evidence $evidencePath"
+Write-Host "[promote-codex-pin] PROMOTED codex $Version ($chosen sandbox); models $(@($probeModels) -join ', '); pin $PinFile; evidence $evidencePath"
 exit 0

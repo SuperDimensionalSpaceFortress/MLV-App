@@ -3,11 +3,28 @@
   "version": "0.160.1",
   "windowsSandbox": "elevated",
   "installPrefix": "<Invoke-Lane -CodexPinRoot, default C:\\mlvtmp\\codex-pin>\\0.160.1 (exe node_modules\\.bin\\codex.cmd); written by Promote-CodexPin.ps1",
-  "promotedAt": "2026-10-09T06:40:20.4145772Z",
-  "promotionEvidence": "C:\\mlvtmp\\codex-pin\\0.160.1-promotion-20261009T063906Z\\promotion.json",
+  "promotedAt": "2026-10-12T19:42:06.2816204Z",
+  "promotionEvidence": "C:\\mlvtmp\\codex-pin\\0.160.1-promotion-20261012T194125Z\\promotion.json",
+  "probedModels": [
+    "gpt-6.1-sol",
+    "gpt-6-luna",
+    "gpt-6-astra"
+  ],
+  "probedTiers": {
+    "gpt-6.1-sol": [
+      "sol"
+    ],
+    "gpt-6-luna": [
+      "luna"
+    ],
+    "gpt-6-astra": [
+      "astra"
+    ]
+  },
+  "modelsFetchedAt": "2026-10-12T19:40:32.269811800Z",
   "gate": {
     "sandboxProbe": "codex sandbox -P :read-only -- git --version rc 0 (elevated)",
-    "writeProbe": "DENIED (exit 128)",
-    "execProbe": "EXEC_OK ok=1 rejected=0 model=gpt-6-luna"
+    "writeProbe": "DENIED (exit 128, stderr 'Permission denied'; unsandboxed control git init exit 0)",
+    "execProbe": "EXEC_OK ok=1 rejected=0 model=gpt-6.1-sol; EXEC_OK ok=1 rejected=0 model=gpt-6-luna; EXEC_OK ok=1 rejected=0 model=gpt-6-astra"
   }
 }

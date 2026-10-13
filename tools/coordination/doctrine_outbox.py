@@ -73,6 +73,7 @@ import pathlib
 import re
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -88,6 +89,16 @@ CARDS_TARGET = f"specs/{PROJECT}/cards.md"
 TARGETS = ("RECEIPTS.md", "TRAPS.md", "RULINGS.md", CARDS_TARGET)
 KINDS = ("receipt", "trap", "ruling")
 CARD_VALIDATOR_REL = "tools/validate-cards.mjs"
+CARD_VALIDATOR_TIMEOUT_S = 120
+# The summary line the tip's validator prints on every run that reaches its main(). Only exit 0 AND this
+# line reporting 0 problems is a pass: a node that exits 0 without running the validator prints nothing.
+# The grammar is the validator's own summary line (tools/validate-cards.mjs, the last console.log in main():
+# "[validate-cards] <files> file(s), <cards> card(s), <noCards> no-card line(s), <bad> problem(s).").
+CARD_VALIDATOR_PASS_RE = re.compile(
+    r"^\[validate-cards\] \d+ file\(s\), \d+ card\(s\), \d+ no-card line\(s\), 0 problem\(s\)\.$", re.MULTILINE)
+# Node reads these before the validator's first line runs, so an inherited value runs foreign code.
+CARD_VALIDATOR_STRIPPED_ENV = frozenset({"NODE_OPTIONS", "NODE_PATH"})
+REGULAR_FILE_MODE = "100644"
 # R14.1 card limits, mirrored from the bus's tools/validate-cards.mjs (MAX_CARD_LINES/MAX_CARD_BYTES);
 # a test pins them to the vendored copy. The drain's authority is still that validator.
 MAX_CARD_LINES = 15
@@ -574,7 +585,9 @@ def r14_gate(bus_repo: pathlib.Path, tip: str, candidates: list[dict], report: d
     """The candidates that may be appended at `tip`; the rest go to report["refused"]. A key
     already on the tip is kept, so the drain reports it as sent rather than refusing history."""
     validator = card_validator_on_bus(bus_repo, tip)
-    node = find_node() if any(c["target"] == CARDS_TARGET for c in candidates) else None
+    has_cards = any(c["target"] == CARDS_TARGET for c in candidates)
+    node = find_node() if has_cards else None
+    entry_problem = cards_tip_entry_problem(bus_repo, tip) if has_cards and validator else None
     kept = []
     for c in candidates:
         refusal = None
@@ -591,6 +604,8 @@ def r14_gate(bus_repo: pathlib.Path, tip: str, candidates: list[dict], report: d
         elif c["target"] == CARDS_TARGET and node is None:
             refusal = ("CARD_VALIDATOR_NODE_ABSENT",
                        f"node is not on PATH, so {CARD_VALIDATOR_REL} cannot run; a card is never published unvalidated")
+        elif c["target"] == CARDS_TARGET and entry_problem:
+            refusal = ("CARDS_PATH_NOT_REGULAR_FILE", f"{entry_problem}; a card is never written through a link or a non-regular entry")
         if refusal is None:
             kept.append(c)
         else:
@@ -607,16 +622,19 @@ def ensure_cards_file(path: pathlib.Path) -> None:
 
 def validate_cards_file(wt: pathlib.Path, cards_file: pathlib.Path | None = None) -> None:
     """Run the tip's own validator over the would-be cards file in the drain's temp worktree.
-    It only reads; any outcome but exit 0 refuses the publish (fail closed)."""
+    It only reads. A pass is exit 0 AND the validator's summary line reporting 0 problems; exit 1
+    is the one per-card verdict (CARD_INVALID); every other outcome, a silent exit 0 included,
+    refuses the publish as CARD_VALIDATOR_FAILED (fail closed)."""
     node = find_node()
     if node is None:
         raise Refusal("CARD_VALIDATOR_NODE_ABSENT", f"node is not on PATH, so {CARD_VALIDATOR_REL} cannot run")
     if not (wt / CARD_VALIDATOR_REL).is_file():
         raise Refusal("CARD_VALIDATOR_ABSENT", f"{CARD_VALIDATOR_REL} is not in the bus worktree")
+    env = {k: v for k, v in os.environ.items() if k.upper() not in CARD_VALIDATOR_STRIPPED_ENV}
     try:
         proc = subprocess.run(
             [node, str(wt / CARD_VALIDATOR_REL), "--bus", str(wt), "--file", str(cards_file or wt / CARDS_TARGET), "--project", PROJECT],
-            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=CARD_VALIDATOR_TIMEOUT_S, env=env,
         )
     except (OSError, subprocess.TimeoutExpired) as e:
         raise Refusal("CARD_VALIDATOR_FAILED", type(e).__name__) from e
@@ -625,6 +643,39 @@ def validate_cards_file(wt: pathlib.Path, cards_file: pathlib.Path | None = None
         raise Refusal("CARD_INVALID", out[:1000])
     if proc.returncode != 0:
         raise Refusal("CARD_VALIDATOR_FAILED", f"exit {proc.returncode}: {out[:400]}")
+    if not CARD_VALIDATOR_PASS_RE.search(proc.stdout):
+        raise Refusal("CARD_VALIDATOR_FAILED", f"exit 0 without a '0 problem(s)' summary line: {out[:400] or 'no output'}")
+
+
+def cards_tip_entry_problem(bus_repo: pathlib.Path, tip: str) -> str | None:
+    """Why the tip's cards-path entry may not be written through, or None. Only a missing entry
+    (the project's first card) or a regular 100644 blob qualifies: a 120000 link, a 160000 gitlink
+    or a 100755 file is refused, since the drain writes through the checkout of that path."""
+    proc = _run_git(bus_repo, ["ls-tree", "-z", tip, "--", CARDS_TARGET])
+    if proc.returncode != 0:
+        raise Refusal("TIP_BLOB_READ_FAILED", f"{tip[:12]}:{CARDS_TARGET}: ls-tree: {proc.stderr.strip()[:300]}")
+    for entry in proc.stdout.split("\0"):
+        meta, _tab, path = entry.partition("\t")
+        if not entry or path != CARDS_TARGET:
+            continue
+        fields = meta.split()
+        if fields[:2] != [REGULAR_FILE_MODE, "blob"]:
+            return f"{CARDS_TARGET} at {tip[:12]} is mode {fields[0] if fields else '?'}, not a regular {REGULAR_FILE_MODE} blob"
+    return None
+
+
+def assert_no_link_in_path(root: pathlib.Path, rel: str) -> None:
+    """Refuse when `rel` under `root`, or any directory on the way to it, is a symlink or a Windows
+    junction (a reparse point): a write there lands wherever the link points. Never follows one."""
+    cur = root
+    for part in pathlib.PurePosixPath(rel).parts:
+        cur = cur / part
+        try:
+            st = os.lstat(cur)
+        except FileNotFoundError:
+            return
+        if stat.S_ISLNK(st.st_mode) or getattr(st, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400):
+            raise Refusal("CARDS_PATH_IS_LINK", f"{cur.relative_to(root).as_posix()} is a link or junction in the bus worktree")
 
 
 def invalid_cards(wt: pathlib.Path, tip: str, cards: list[dict]) -> list[tuple[dict, str, str]]:
@@ -803,6 +854,7 @@ def drain(repo: pathlib.Path, bus_repo: pathlib.Path, ref: str, ledger: pathlib.
             commits: dict[str, str] = {}
             for c in pending:
                 if c["target"] == CARDS_TARGET:
+                    assert_no_link_in_path(wt, CARDS_TARGET)
                     ensure_cards_file(wt / c["target"])
                 append_block_to_file(wt / c["target"], c["block"])
                 commits[c["key"]] = git_commit(wt, c["message"])

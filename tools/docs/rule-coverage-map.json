@@ -1,0 +1,202 @@
+{
+  "schema": "rule-coverage-map.v1",
+  "about": "Maps a rule bullet id (sha256 of its normalized text; see tools/docs/rule_coverage_census.py) to the one check that fails when the rule is violated. check is guard:<NA-id> | test:<path>::[Class::]<test case> (the scope is spelled exactly; a file or a class alone is refused; a missing case is reported stale; a case a module-level setattr loop generates from a table row is named by its slugged row name and goes stale with the loop or the row) | hook:<path> | 'prose-only: <reason>'. An entry whose check only asserts that a token string is present in the doc carries \"strength\": \"token-presence-pin\" and is reported apart from behavioural checks. Only cited mappings belong here; an unmapped bullet is counted, never guessed. 'bullet' and 'basis' are for humans and are not trusted by the tool.",
+  "mappings": {
+    "54e4993a77c464e18143577c8b9be0a9898e4e5921e40a3bdfc746db67ecc1e2": {
+      "check": "test:tools/repo_hygiene/test_brokered_closeout.py::BrokeredCloseoutTests::test_repo_state_dashboard_and_rollback_contract_required",
+      "strength": "token-presence-pin",
+      "bullet": "CLAUDE.md:52 `/api/closeout/actions` -- detail in claude/session-closeout.md",
+      "basis": "presence pin: tools/repo_hygiene/test_brokered_closeout.py:2125 assertIn(token, CLAUDE.md text)"
+    },
+    "bb299a8b4055f4e7515381ab151ef69803cea9ac1e3b80ef390eee1d4f8115ad": {
+      "check": "test:tools/repo_hygiene/test_brokered_closeout.py::BrokeredCloseoutTests::test_repo_state_dashboard_and_rollback_contract_required",
+      "strength": "token-presence-pin",
+      "bullet": "CLAUDE.md:53 `/api/closeout/actions/preview` -- detail in claude/session-closeout.m",
+      "basis": "presence pin: tools/repo_hygiene/test_brokered_closeout.py:2126 assertIn(token, CLAUDE.md text)"
+    },
+    "8262fa297cb40da12e6189c729641cfb05e7117c7a028a546233a03954124d10": {
+      "check": "test:tools/repo_hygiene/test_brokered_closeout.py::BrokeredCloseoutTests::test_repo_state_dashboard_and_rollback_contract_required",
+      "strength": "token-presence-pin",
+      "bullet": "CLAUDE.md:54 `/api/closeout/actions/requests` -- detail in claude/session-closeout.",
+      "basis": "presence pin: tools/repo_hygiene/test_brokered_closeout.py:2127 assertIn(token, CLAUDE.md text)"
+    },
+    "3d43006ab8c68056e98f2ad2bd48d8a4baec27d971ab28d2e5d67c709d0f78be": {
+      "check": "test:tools/repo_hygiene/test_brokered_closeout.py::BrokeredCloseoutTests::test_repo_state_dashboard_and_rollback_contract_required",
+      "strength": "token-presence-pin",
+      "bullet": "CLAUDE.md:55 `action-request-history` -- detail in claude/session-closeout.md",
+      "basis": "presence pin: tools/repo_hygiene/test_brokered_closeout.py:2128 assertIn(token, CLAUDE.md text)"
+    },
+    "b4920eff21905b4fbe4cbd8e1ca6c1a6100b6fcb119e5e3f368ef7b8dd5c557e": {
+      "check": "test:tools/repo_hygiene/test_brokered_closeout.py::BrokeredCloseoutTests::test_repo_state_dashboard_and_rollback_contract_required",
+      "strength": "token-presence-pin",
+      "bullet": "CLAUDE.md:58 `canonical dashboard contract` -- detail in claude/session-closeout.md",
+      "basis": "presence pin: tools/repo_hygiene/test_brokered_closeout.py:2133 assertIn(token, CLAUDE.md text)"
+    },
+    "a09076ac78d33eadd42ed27a6f0b89a72a093e06b480c8c091bb35baef42c6d4": {
+      "check": "test:tools/repo_hygiene/test_brokered_closeout.py::BrokeredCloseoutTests::test_repo_state_dashboard_and_rollback_contract_required",
+      "strength": "token-presence-pin",
+      "bullet": "CLAUDE.md:62 `dashboard-action-requests` -- detail in claude/session-closeout.md",
+      "basis": "presence pin: tools/repo_hygiene/test_brokered_closeout.py:2129 assertIn(token, CLAUDE.md text)"
+    },
+    "64033719262921675db7caf593350ea38bff455e6f3784550a017f747e20ba94": {
+      "check": "test:tools/repo_hygiene/test_brokered_closeout.py::BrokeredCloseoutTests::test_contract_records_closeout_addendum_persistence_rule",
+      "strength": "token-presence-pin",
+      "bullet": "CLAUDE.md:64 `Hard-clean final responses are blocked unless the repo-closed postcon",
+      "basis": "presence pin: tools/repo_hygiene/test_brokered_closeout.py:2262 assertIn(token, CLAUDE.md text)"
+    },
+    "61751dd0d2982cd1f926b593ac18507d65e83a7ba0a390365727ee99f208a2a3": {
+      "check": "test:tools/repo_hygiene/test_candidate_acceptance.py::CandidateAcceptanceTests::test_agent_doctrine_matches_two_phase_acceptance_authority_boundary",
+      "strength": "token-presence-pin",
+      "bullet": "CLAUDE.md:65 `human content-review gate, which remains mandatory in both phases` --",
+      "basis": "presence pin: tools/repo_hygiene/test_candidate_acceptance.py:1400 assertIn(token, CLAUDE.md text)"
+    },
+    "cddda8a1412867421aef6cd7d3b86b9c2b1270f76a03c36699bfff21b272f11b": {
+      "check": "test:tools/repo_hygiene/test_candidate_acceptance.py::CandidateAcceptanceTests::test_agent_doctrine_matches_two_phase_acceptance_authority_boundary",
+      "strength": "token-presence-pin",
+      "bullet": "CLAUDE.md:66 `is now active (`enabled=true`, `requireReadyForFinalize=true`)` -- de",
+      "basis": "presence pin: tools/repo_hygiene/test_candidate_acceptance.py:1398 assertIn(token, CLAUDE.md text)"
+    },
+    "086a50525c10025095c2d7391ea1477e9cca0e6f34ea80107c70e373394b64ec": {
+      "check": "test:tools/repo_hygiene/test_candidate_acceptance.py::CandidateAcceptanceTests::test_agent_doctrine_matches_two_phase_acceptance_authority_boundary",
+      "strength": "token-presence-pin",
+      "bullet": "CLAUDE.md:68 `non-authenticating process evidence and never replace` -- detail in c",
+      "basis": "presence pin: tools/repo_hygiene/test_candidate_acceptance.py:1399 assertIn(token, CLAUDE.md text)"
+    },
+    "d89bec0f90ee4b27d3885de1d5b3a0dc69d51e450339c4af0d616581f78def75": {
+      "check": "test:tools/repo_hygiene/test_brokered_closeout.py::BrokeredCloseoutTests::test_repo_state_dashboard_and_rollback_contract_required",
+      "strength": "token-presence-pin",
+      "bullet": "CLAUDE.md:72 `repo_closed_for_final_response` -- detail in claude/session-closeout.",
+      "basis": "presence pin: tools/repo_hygiene/test_brokered_closeout.py:2149 assertIn(token, CLAUDE.md text)"
+    },
+    "8bcb38902d9d34190f4feba5335dc2abd4178121afe4fe1f76fdfc97d494754a": {
+      "check": "test:tools/repo_hygiene/test_brokered_closeout.py::BrokeredCloseoutTests::test_repo_state_dashboard_and_rollback_contract_required",
+      "strength": "token-presence-pin",
+      "bullet": "CLAUDE.md:73 `repoClosedAuditHash` -- detail in claude/session-closeout.md",
+      "basis": "presence pin: tools/repo_hygiene/test_brokered_closeout.py:2131 assertIn(token, CLAUDE.md text)"
+    },
+    "5877812c61a196feab7074727cb40ddb4eefbf06e233d4962d8dc9fc34fcb79f": {
+      "check": "test:tools/repo_hygiene/test_brokered_closeout.py::BrokeredCloseoutTests::test_repo_state_dashboard_and_rollback_contract_required",
+      "strength": "token-presence-pin",
+      "bullet": "CLAUDE.md:74 `repoStateLedger` -- detail in claude/session-closeout.md",
+      "basis": "presence pin: tools/repo_hygiene/test_brokered_closeout.py:2120 assertIn(token, CLAUDE.md text)"
+    },
+    "289449bd77069c43a0f0d6076f652238a0bfdbb0397cfb7ff7ae33ae9268891d": {
+      "check": "test:tools/repo_hygiene/test_brokered_closeout.py::BrokeredCloseoutTests::test_repo_state_dashboard_and_rollback_contract_required",
+      "strength": "token-presence-pin",
+      "bullet": "CLAUDE.md:75 `rollbackPolicy` -- detail in claude/session-closeout.md",
+      "basis": "presence pin: tools/repo_hygiene/test_brokered_closeout.py:2122 assertIn(token, CLAUDE.md text)"
+    },
+    "f9598b2f2fdb3e1f9ffedbffa7c52487851eb7c54af46f1ed6215accd55663a8": {
+      "check": "test:tools/repo_hygiene/test_brokered_closeout.py::BrokeredCloseoutTests::test_repo_state_dashboard_and_rollback_contract_required",
+      "strength": "token-presence-pin",
+      "bullet": "CLAUDE.md:76 `round-delta note` -- detail in claude/session-closeout.md",
+      "basis": "presence pin: tools/repo_hygiene/test_brokered_closeout.py:2137 assertIn(token, CLAUDE.md text)"
+    },
+    "534204d703e5cf8d93a01608c72a1cecb9cba4526c5b951f9b03cf50a01314b1": {
+      "check": "test:tools/repo_hygiene/test_brokered_closeout.py::BrokeredCloseoutTests::test_repo_state_dashboard_and_rollback_contract_required",
+      "strength": "token-presence-pin",
+      "bullet": "CLAUDE.md:78 `start-closeout-dashboard.ps1` -- detail in claude/session-closeout.md",
+      "basis": "presence pin: tools/repo_hygiene/test_brokered_closeout.py:2124 assertIn(token, CLAUDE.md text)"
+    },
+    "2b948611ff4e0e95c4be8a7c2f419f4d370385854c0b8c432e623b5507b0da11": {
+      "check": "test:tools/repo_hygiene/test_candidate_acceptance.py::CandidateAcceptanceTests::test_agent_doctrine_matches_two_phase_acceptance_authority_boundary",
+      "strength": "token-presence-pin",
+      "bullet": "CLAUDE.md:79 `tests, and tooling-baseline inventory are already mandatory` -- detai",
+      "basis": "presence pin: tools/repo_hygiene/test_candidate_acceptance.py:1397 assertIn(token, CLAUDE.md text)"
+    },
+    "33265fd0027d86eff4f55b1d798df879fb20d54d40a0d312f0ab098924951196": {
+      "check": "test:tools/repo_hygiene/test_brokered_closeout.py::BrokeredCloseoutTests::test_repo_state_dashboard_and_rollback_contract_required",
+      "strength": "token-presence-pin",
+      "bullet": "CLAUDE.md:81 `validate-rollback-manifest.ps1` -- detail in claude/session-closeout.",
+      "basis": "presence pin: tools/repo_hygiene/test_brokered_closeout.py:2130 assertIn(token, CLAUDE.md text)"
+    },
+    "6962136221429e8c18f77b5ebbc0e8047370af8a91139482939472b6c4fa43f9": {
+      "check": "test:tools/repo_hygiene/test_candidate_acceptance.py::CandidateAcceptanceTests::test_agent_doctrine_matches_two_phase_acceptance_authority_boundary",
+      "strength": "token-presence-pin",
+      "bullet": "CLAUDE.md:82 `was deliberately dormant (`enabled=false`, `requireReadyForFinalize=f",
+      "basis": "presence pin: tools/repo_hygiene/test_candidate_acceptance.py:1396 assertIn(token, CLAUDE.md text)"
+    },
+    "bf1e9160b79accd9bbcfeb515eb0d7a4881f11faa6d68b59751302a29265460f": {
+      "check": "test:tools/repo_hygiene/test_brokered_closeout.py::BrokeredCloseoutTests::test_repo_state_dashboard_and_rollback_contract_required",
+      "strength": "token-presence-pin",
+      "bullet": "CLAUDE.md:83 `webDashboardSpec` -- detail in claude/session-closeout.md",
+      "basis": "presence pin: tools/repo_hygiene/test_brokered_closeout.py:2121 assertIn(token, CLAUDE.md text)"
+    },
+    "c21549c04f84c020f3a50aa778fe03cd3dbb6c09a5333106662cec01dabff604": {
+      "check": "test:tools/repo_hygiene/test_brokered_closeout.py::BrokeredCloseoutTests::test_repo_state_dashboard_and_rollback_contract_required",
+      "strength": "token-presence-pin",
+      "bullet": "CLAUDE.md:86 `worktree-inspection.v1` -- detail in claude/session-closeout.md",
+      "basis": "presence pin: tools/repo_hygiene/test_brokered_closeout.py:2123 assertIn(token, CLAUDE.md text)"
+    },
+    "f559fa785d4610d434fc201dbf8b8bd9b658d410977399f0c86b6ea74d7d55d7": {
+      "check": "test:tools/coordination/test_get_doctrine_brief.py::GetDoctrineBriefTests::test_gh_failure_refuses_when_no_fixture",
+      "bullet": "agents/doctrine-consumer.md:17 On fetch failure when `gh` is required: exit non-zero and print `REFUS",
+      "basis": "asserts stdout starts with REFUSED: when gh fetch fails; compose refusal is test_compose_refuses_when_the_brief_cannot_be_built"
+    },
+    "82f00865406e804ea284714ddb83139a3e29a4a183ef9fb8515115edd799c62b": {
+      "check": "test:tools/coordination/test_get_doctrine_brief.py::NonLiveDoctrineRefusedOutsidePytestTests::test_getter_refuses_a_fixture_outside_the_fixtures_dir_even_under_pytest",
+      "bullet": "agents/doctrine-consumer.md:18 Offline tests: `MLV_DOCTRINE_FIXTURE_ROOT` / `-FixtureRoot` (no `gh`).",
+      "basis": "asserts doctrine-fixture-refused outside tools/coordination/fixtures/; sibling test_getter_refuses_the_in_repo_fixture_outside_pytest covers the pytest-only half"
+    },
+    "881da4ef3a1b6bc867f6a2328f4e34778607402dbf3da63542c291e474eba988": {
+      "check": "test:tools/coordination/test_get_doctrine_brief.py::LiveBriefProvenanceTests::test_live_brief_records_live_provenance",
+      "bullet": "agents/doctrine-consumer.md:19 Every brief records `provenance: live` (repo, ref, busHead sha) or `pr",
+      "basis": "asserts provenance: live with repo/ref; fixture side is test_compose_records_fixture_provenance_in_the_prompt"
+    },
+    "f2535456045f594076113edacf828818438a15a029f2fd3571174d748221d5f5": {
+      "check": "test:tools/coordination/test_get_doctrine_brief.py::GetDoctrineBriefTests::test_fixture_brief_includes_candidate_zero_and_sot_strings",
+      "bullet": "agents/doctrine-consumer.md:20 Brief includes: short `RULINGS.md` digest, MLV-relevant `ruling-candid",
+      "basis": "covers the MUST clause (surface the SoT-suspend candidate labeled CANDIDATE_ZERO_AUTHORITY); the RULINGS digest and specs-hash clauses are not asserted"
+    },
+    "5efb63a6fd99876760f51ea577831b115db50bec5b2a0434573f09071e31194a": {
+      "check": "test:tools/coordination/test_get_doctrine_brief.py::GetDoctrineBriefTests::test_fixture_cos_feedback_included_when_present",
+      "bullet": "agents/doctrine-consumer.md:21 Brief includes `cos-feedback/mlv-app/pr-*.md` when present (Contents A",
+      "basis": "asserts the pr-*.md is included when present; omit-when-missing half is test_fixture_missing_cos_feedback_omits_section_does_not_refuse"
+    },
+    "1d0d7d7a3f3af57e8e1c3606933bf0faf51af41a8587b5926b386dc649d49b10": {
+      "check": "test:tools/repo_hygiene/test_mlv_never_authorized.py::MlvNeverAuthorizedHookTests::test_na11_write_under_tools_agent_bridge_at_lane_venue",
+      "bullet": "agents/doctrine-consumer.md:46 Hook row NA-11 denies Write/Edit/shell truncating (and shell destructi",
+      "basis": "GENERATED case (no def in the file): the row named 'na11 write under tools/agent-bridge at lane venue' (test_mlv_never_authorized.py:4101, expect DENY, na NA-11) is made a test method by the module-level setattr(MlvNeverAuthorizedHookTests, ...) loop (:8976); _run_case runs the real hook and asserts exit 2 with the NA-11 line. The census resolves it only while that setattr loop and the row both exist, so removing either makes this mapping stale"
+    },
+    "7e0ba4a2983b6cb6ce016aebc425c74f18c7717f79658c3b88561d916f7a2021": {
+      "check": "test:tests/coordination/test_lane_health_contract.py::LaneHealthContractTests::test_lane_heartbeat_preserves_degraded_exit_status",
+      "bullet": "agents/lane-health.md:10 Use `tools/coordination/sweep-lane-health.ps1` for machine-readable JS",
+      "basis": "asserts the heartbeat keeps the sweep's non-zero DEGRADED exit; the sweep's own exit 2 is asserted throughout the file"
+    },
+    "997ddb98007c63eedd84f8cb5250a61906319a19ec2981bcc69a8e0c891e9097": {
+      "check": "test:tests/coordination/test_lane_health_contract.py::LaneHealthBoundaryTests::test_dark_boundary_is_capped_and_expired_is_gone",
+      "bullet": "agents/lane-health.md:12 `tools/coordination/lane-health-classes.psd1` is the single authority ",
+      "basis": "asserts darkThresholdFormula == min(leaseMinutes,30)+20 and that EXPIRED is gone"
+    },
+    "16e13a465b2f6d22b6d881737f7f62df05055dc9237009255d9ab95efc3f92a0": {
+      "check": "test:tests/coordination/test_board_health_sweep.py::BoardHealthSweepTests::test_prose_only_dispatch_is_loud_attention_and_not_auto_invented",
+      "bullet": "agents/lane-health.md:13 A dispatch is executable only through a durable dispatch intent. Befor",
+      "basis": "covers the PROSE-ONLY(...) report and no-invention clause only; intent-first submit is tests/coordination/test_dispatch_queue.py"
+    },
+    "83dc5cae8a36aff8486f40657903913e858662e0ec2cccec1ea47c7d7fb95e00": {
+      "check": "test:tests/coordination/test_lane_health_contract.py::LaneHealthContractTests::test_invalid_target_is_degraded_even_when_journals_are_fresh",
+      "bullet": "agents/lane-health.md:6 Journal age is advisory only. A fresh journal cannot override a missin",
+      "basis": "asserts DEGRADED and exit 2 with fresh leases but a mismatched heartbeat target"
+    },
+    "aa873aa238e37b6842028065f6b9a1343643dc10ada02db54ee6271a81ebdcbc": {
+      "check": "test:tests/coordination/test_lane_health_contract.py::LaneHealthContractTests::test_missing_adopted_sol_lease_is_degraded",
+      "bullet": "agents/lane-health.md:7 Codex, Sol, and `claude-review` are adopted lanes and must renew `heal",
+      "basis": "asserts a missing adopted lease is DEGRADED (leaseState MISSING)"
+    },
+    "f0509b9528dd788eb8daa99ca4bd63f62635949b4b3f7985f347ee960eac9b7b": {
+      "check": "test:tests/coordination/test_lane_health_contract.py::LaneHealthContractTests::test_target_validator_accepts_exact_uuid_and_rejects_mismatch",
+      "bullet": "agents/lane-health.md:8 Run `tools/coordination/validate-heartbeat-target.ps1` from CLI before",
+      "basis": "asserts validate-heartbeat-target accepts the exact UUID and exits non-zero on mismatch"
+    },
+    "ab32981159949deee05dfc5be4ac677ca9fea4afb705e8f2eb8474ac7ad1cfcd": {
+      "check": "test:tools/profiling/test-playback-quality-contract.ps1::zero-present requires launch-only declaration",
+      "bullet": "agents/release-and-regression.md:5 Playback-quality evidence is fail-closed. `-AllowZeroPresentedFrames` ",
+      "basis": "asserts -AllowZeroPresentedFrames requires -LaunchOnlyProbe (the case at lines 47-49); the cases that the probe cannot combine with frame telemetry or lifecycle stress (lines 55-61) are not named by this one-check mapping"
+    },
+    "4937f320f4ea68277c0ec0bc0e02114441488840a5469d811892da0b89c33083": {
+      "check": "test:tools/repo_hygiene/test_shipping_defaults.py::ShippingDefaultsTests::test_source_mirror_drift_is_rejected",
+      "bullet": "agents/release-and-regression.md:62 Any change to a playback/processing DEFAULT (e.g. Preview Resolution =",
+      "basis": "asserts a changed default in MainWindow.ui/.cpp no longer matches tools/gates/shipping-defaults.json and fails verify_repository"
+    }
+  }
+}

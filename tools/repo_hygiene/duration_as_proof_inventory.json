@@ -2021,6 +2021,56 @@
       "lines": [
         312
       ]
+    },
+    {
+      "path": "platform/qt/PlaybackPresentTrace.h",
+      "anchor": "const double since = m_lastTickMs >= 0.0 ? m_lastTickMs : m_lastPresentMs ;",
+      "class": "value_fallback_select",
+      "clock": "qpc_stage_clock",
+      "justification": "PLAYBACK-STARTUP-CATCHUP-BURST-1 r7 opt-in present trace: -1 is the 'no tick yet since the last present' sentinel, so the tick-gap baseline falls back to the previous present's time. Picks which timestamp a diagnostic gap is measured from; never decides whether anything ran.",
+      "lines": [
+        82
+      ]
+    },
+    {
+      "path": "platform/qt/PlaybackPresentTrace.h",
+      "anchor": "if ( row . readyMs >= 0.0 ) row . readyMs -= m_originMs ;",
+      "class": "value_fallback_select",
+      "clock": "qpc_stage_clock",
+      "justification": "PLAYBACK-STARTUP-CATCHUP-BURST-1 r7 present trace: a ready time of -1 is the 'unknown' sentinel and is kept as -1 instead of being shifted to the Play origin. A data-validity filter on a diagnostic row, not a run-proof.",
+      "lines": [
+        118
+      ]
+    },
+    {
+      "path": "platform/qt/PlaybackPresentTrace.h",
+      "anchor": "row . intervalMs = m_lastPresentMs >= 0.0 ? row . presentMs - m_lastPresentMs : 0.0 ;",
+      "class": "value_fallback_select",
+      "clock": "qpc_stage_clock",
+      "justification": "PLAYBACK-STARTUP-CATCHUP-BURST-1 r7 present trace: the first row of a Play has no previous present (sentinel -1), so its interval is reported as 0. Which rows exist is decided by the presents themselves; the compare only fills a diagnostic column.",
+      "lines": [
+        119
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_present_trace.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , a . intervalMs , 1 e - 9 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "Test of the present trace's first-row rule on injected times (no clock): the first present of a Play has no previous present, so its interval column is 0. That the row exists is asserted by rows().size() above; the 0 pins the sentinel handling, not that anything ran.",
+      "lines": [
+        92
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_present_trace.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , trace . rows ( ) [ 0 ] . intervalMs , 1 e - 9 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "Test (injected times, no clock) that a new begin() starts clean: the first row after it has no previous present, so its interval column is 0. Row existence is asserted by rows().size() above.",
+      "lines": [
+        128
+      ]
     }
   ]
 }

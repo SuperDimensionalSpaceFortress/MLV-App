@@ -6649,6 +6649,66 @@ int getMlvRawFrameDebayeredFromReconnedRaw16(mlvObject_t * video,
         "get_mlv_raw_frame_debayered_from_reconned_raw16");
 }
 
+/* CPU-DEBAYERED16-HONOUR-SCALE-1: test-only error added to the reduced entry's
+ * bit shift (the look gate's mutation). Production leaves it 0. */
+static int g_mlv_debayered16_reduced_bit_shift_error_for_testing = 0;
+
+void mlvSetDebayered16ReducedReconBitShiftErrorForTesting(int error)
+{
+    g_mlv_debayered16_reduced_bit_shift_error_for_testing = error;
+}
+
+int getMlvRawFrameDebayeredFromReducedReconnedRaw16(mlvObject_t * video,
+                                                    uint64_t frameIndex,
+                                                    const uint16_t * reducedReconnedRaw,
+                                                    int reducedWidth,
+                                                    int reducedHeight,
+                                                    int reconScale,
+                                                    uint16_t * outputFrame,
+                                                    int reconHqDualIso,
+                                                    int * outWidth,
+                                                    int * outHeight)
+{
+    if (!video || !reducedReconnedRaw || !outputFrame) return 0;
+    if (reconScale != 2 && reconScale != 4) return 0;
+    const int full_w = (int)getMlvWidth(video);
+    const int full_h = (int)getMlvHeight(video);
+    if (full_w <= 0 || full_h <= 0 || frameIndex >= getMlvFrames(video)) return 0;
+    const int out_w = full_w / reconScale;
+    const int out_h = full_h / reconScale;
+    if (reducedWidth != out_w || reducedHeight <= 0 || reducedHeight > out_h) return 0;
+    /* The reduced recon is debayered bilinear, the debayer this route runs at
+     * full resolution with type 0; any other debayer stays full resolution. */
+    if (doesMlvAlwaysUseAmaze(video) != 0) return 0;
+
+    /* No decode and no llrawproc run on this thread for this frame (the recon
+     * worker reconstructed it): clear the thread's last-run records, as
+     * getMlvRawFrameDebayeredFromReconnedRaw16 does. */
+    mlv_reset_last_raw_stage_telemetry();
+    resetMlvLastDebayerStageMilliseconds();
+    g_mlv_last_llrawproc_ms = 0.0;
+    g_mlv_last_raw_float_convert_ms = 0.0;
+    llrpResetLastRunTimingForCurrentThread();
+
+    const int bit_shift = (reconHqDualIso ? 0 : (16 - video->RAWI.raw_info.bits_per_pixel))
+                        + g_mlv_debayered16_reduced_bit_shift_error_for_testing;
+    /* debayerBasicU16 applies a nonzero bit shift to its input in place; the
+     * caller's reduced Bayer is not read again after this frame. */
+    debayerBasicU16(outputFrame, (uint16_t *)reducedReconnedRaw, reducedWidth, reducedHeight,
+                    getMlvCpuCores(video), bit_shift);
+    /* Rows the kernel's block crop dropped repeat the last reconstructed row,
+     * as getMlvProcessedFrame8ScaledFromReducedReconnedRaw16 does. */
+    const size_t row_words = (size_t)out_w * 3u;
+    const uint16_t * last_row = outputFrame + (size_t)(reducedHeight - 1) * row_words;
+    for (int y = reducedHeight; y < out_h; ++y)
+    {
+        memcpy(outputFrame + (size_t)y * row_words, last_row, row_words * sizeof(uint16_t));
+    }
+    if (outWidth) *outWidth = out_w;
+    if (outHeight) *outHeight = out_h;
+    return 1;
+}
+
 static void mlv_compute_desired_processing_bw_levels(mlvObject_t * video,
                                                      float * desired_black_level,
                                                      int * desired_white_level,
