@@ -23,8 +23,10 @@
 
 #include <cmath>
 
+#include <QByteArray>
 #include <QSettings>
 #include <QString>
+#include <QtGlobal>
 
 namespace playback_conform
 {
@@ -38,6 +40,32 @@ inline constexpr double kDefaultThresholdFps = 30.0;
 inline constexpr const char * kKeyEnabled()      { return "Playback/ConformEnabled"; }
 inline constexpr const char * kKeyTargetFps()    { return "Playback/ConformTargetFps"; }
 inline constexpr const char * kKeyThresholdFps() { return "Playback/ConformThresholdFps"; }
+
+/*! \brief MLVAPP_PLAYBACK_CONFORM, the measurement override for the native-HFR arm
+ *  (HFR-NATIVE-60FPS-FULLRES-1): "1" or "0" wins over the setting; unset or any other value is -1,
+ *  no override. Mirrors MLVAPP_SWAP_INTERVAL (PlaybackSwapInterval.h). */
+inline int conformEnabledFromEnvValue( const QByteArray & value )
+{
+    const QByteArray trimmed = value.trimmed();
+    if( trimmed == "1" ) return 1;
+    if( trimmed == "0" ) return 0;
+    return -1;
+}
+
+/*! \brief The env override when there is one, else the setting. */
+inline bool resolveConformEnabled( int envOverride, bool setting )
+{
+    if( envOverride >= 0 ) return envOverride != 0;
+    return setting;
+}
+
+/*! \brief The parsed MLVAPP_PLAYBACK_CONFORM, read once per process. It is never written to
+ *  settings: only a user toggle of the menu item persists. */
+inline int conformEnvOverride()
+{
+    static const int envOverride = conformEnabledFromEnvValue( qgetenv( "MLVAPP_PLAYBACK_CONFORM" ) );
+    return envOverride;
+}
 
 inline bool isValidRate( double rate )
 {

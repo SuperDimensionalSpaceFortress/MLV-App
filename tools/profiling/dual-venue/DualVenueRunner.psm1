@@ -628,6 +628,50 @@ function Get-DvConformPaceProof {
     $out
 }
 
+function Get-DvConformArmVerdict {
+    <#
+    .SYNOPSIS
+    HFR-NATIVE-60FPS-FULLRES-1. Did the run honour the conform arm the leg REQUESTED (generatorArgs.playbackConform, passed to the app as
+    MLVAPP_PLAYBACK_CONFORM)? Judged from the receipt `playback` block's conform fields (re-derived from the run log by Get-DvPlaybackEvidence).
+      'off' (the native-HFR arm): the measured session's playback_smoke.conform line is present, conform_active=0, conform_env_override=0 and
+            playback_fps is within 0.5 % of clip_fps.
+      'on':  the measured session's conform line is present and conform_active=1.
+    A leg that requests nothing is never blocked (requested = $null). `blocks` is true when the arm was requested and not proven; `reason`
+    carries the requested and the observed values, for the receipt's outcomeDetail (CONFORM_ARM_NOT_HONOURED). Pure: the runner gates on it
+    and Test-DvReceiptValid re-derives it from the hashed run log and the committed spec.
+    #>
+    param($Spec, $Playback)
+    $requested = Get-DvProp (Get-DvProp $Spec 'generatorArgs') 'playbackConform'
+    $out = [pscustomobject]@{ requested = $(if ($null -ne $requested) { [string]$requested } else { $null }); honoured = $true; blocks = $false; reason = $null }
+    if ($null -eq $requested) { return $out }
+    $present = ((Get-DvProp $Playback 'conformLinePresent') -eq $true)
+    $summarySession = [string](Get-DvProp $Playback 'summarySession')
+    $conformSession = [string](Get-DvProp $Playback 'conformSession')
+    $active = ConvertTo-DvInt64 (Get-DvProp $Playback 'conformActive')
+    $envOverride = ConvertTo-DvInt64 (Get-DvProp $Playback 'conformEnvOverride')
+    $clip = ConvertTo-DvDouble (Get-DvProp $Playback 'conformClipFps')
+    $play = ConvertTo-DvDouble (Get-DvProp $Playback 'conformPlaybackFps')
+    $observed = "conform_line_present=$([int]$present) session=$conformSession measured_session=$summarySession conform_active=$active conform_env_override=$envOverride clip_fps=$clip playback_fps=$play"
+    $why = $null
+    if (-not $present) { $why = 'no playback_smoke.conform line for the run' }
+    elseif ($summarySession -eq '' -or $conformSession -cne $summarySession) { $why = 'the conform line is not the measured session''s' }
+    elseif ([string]$requested -ceq 'off') {
+        if ($active -ne 0) { $why = 'conform was active' }
+        elseif ($envOverride -ne 0) { $why = 'the app did not report MLVAPP_PLAYBACK_CONFORM=0' }
+        elseif ($null -eq $clip -or $null -eq $play -or $clip -le 0 -or [Math]::Abs($play - $clip) -gt (0.005 * $clip)) { $why = 'playback_fps is not within 0.5 % of clip_fps' }
+    }
+    elseif ([string]$requested -ceq 'on') {
+        if ($active -ne 1) { $why = 'conform was not active' }
+    }
+    else { $why = "the requested arm '$requested' is not on/off" }
+    if ($null -ne $why) {
+        $out.honoured = $false
+        $out.blocks = $true
+        $out.reason = "requested playbackConform=$requested; observed $observed ($why)"
+    }
+    $out
+}
+
 function Get-DvPlaybackProblems {
     <#
     .SYNOPSIS
@@ -747,6 +791,7 @@ function Get-DvPlaybackEvidence {
         summarySession = $(if ($null -ne $parsed.session) { [string]$parsed.session } else { $null })
         conformSession = $(if ($conformFields.ContainsKey('session')) { [string]$conformFields['session'] } else { $null })
         conformActive = (ConvertTo-DvInt64 $conformFields['conform_active'])
+        conformEnvOverride = (ConvertTo-DvInt64 $conformFields['conform_env_override'])
         fpsOverride = (ConvertTo-DvInt64 $f['fps_override'])
         wrapped = $(if ($null -eq $wrappedField) { $null } else { $wrappedField -ne 0 })
         wrapCount = (ConvertTo-DvInt64 $f['wrap_count'])
@@ -1546,6 +1591,12 @@ function Test-DvReceiptValid {
             if ($displayVerdict.blocks) { $invalid.Add("DISPLAY_MODE_NOT_HONOURED: $($displayVerdict.reason); a leg that did not run in the display mode it names is not a valid measurement") }
         }
 
+        # ---- the CONFORM ARM the run played under: re-derived from the HASHED run log and the COMMITTED spec (HFR-NATIVE-60FPS-FULLRES-1) ----
+        if ($production -and $null -ne $spec -and $null -ne $derived) {
+            $conformArm = Get-DvConformArmVerdict -Spec $spec -Playback $derived
+            if ($conformArm.blocks) { $invalid.Add("CONFORM_ARM_NOT_HONOURED: $($conformArm.reason); a leg that did not play under the conform arm it names is not a valid measurement") }
+        }
+
         # ---- the OUTCOME: re-derived from the job's result, its exit code, the verbatim metrics and the COMMITTED criteria -----------
         $resolved = $null
         if ($null -ne $exit) {
@@ -1889,7 +1940,7 @@ function Write-DvReceipt {
 
 Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-DvSha256OfBytes, Get-DvSha256OfText, Get-DvSha256OfFile,
     ConvertTo-DvLfBytes, Get-DvLegSpecSha256, Get-DvDerivedBackend, Get-DvBackendNotDerivable, Read-DvContactFrames, Get-DvSubjectDigest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
-    Test-DvUnderClaudeState, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvPlaybackProblems,
+    Test-DvUnderClaudeState, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvConformArmVerdict, Get-DvPlaybackProblems,
     Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvDisplayEvidence, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvHealthVerdict,
     New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout,
     Get-DvResultToken, Resolve-DvJobOutcome, Test-DvCriteria, Get-DvVerbatimMetrics, New-DvReceipt, Write-DvReceipt

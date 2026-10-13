@@ -216,6 +216,42 @@ class ClipLengthGateTests(_TmpCase):
         self.assertEqual(_gate(self.clip("hfr479", 479, **hfr), 20)["verdict"], "CLIP_TOO_SHORT")
         self.assertEqual(_gate(self.clip("hfr480", 480, **hfr), 20)["verdict"], "OK")
 
+    def test_a_native_hfr_run_is_gated_at_the_clips_own_rate(self) -> None:
+        """HFR-NATIVE-60FPS-FULLRES-1: with MLVAPP_PLAYBACK_CONFORM=0 the app plays a 59.94 fps clip at 59.94, so the gate measures it there: 971 frames
+        (M16-1456's shape) are 16.2 s and refused pre-launch; 1667 frames (M16-1457's) are 27.8 s and pass a 25 s window. 1 or unset keeps the conform rate."""
+        hfr = {"fps_nom": 59940, "fps_denom": 1000}
+        short, long_ = self.clip("hfr971", 971, **hfr), self.clip("hfr1667", 1667, **hfr)
+        def gate(path: Path, override: int | None) -> dict:
+            arg = "" if override is None else f" -ConformEnvOverride {override}"
+            proc = _pwsh(f". {_q(GATE)}; Test-GuiSmokeClipLength -Path {_q(path)} -WindowSeconds 25{arg} | ConvertTo-Json -Compress")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            return json.loads(proc.stdout)
+        native_short = gate(short, 0)
+        self.assertEqual(native_short["verdict"], "CLIP_TOO_SHORT", native_short)
+        self.assertAlmostEqual(native_short["clipSeconds"], 971 / 59.94, places=2)
+        native_long = gate(long_, 0)
+        self.assertEqual(native_long["verdict"], "OK", native_long)
+        self.assertAlmostEqual(native_long["fps"], 59.94, places=3)
+        for override in (1, -1, None):
+            self.assertEqual(gate(short, override)["verdict"], "OK", override)   # conformed: 971 / 24 = 40.5 s
+            self.assertEqual(gate(short, override)["fps"], 24, override)
+
+    def test_the_conform_env_override_is_parsed_the_way_the_app_parses_it(self) -> None:
+        """HFR-NATIVE-60FPS-FULLRES-1: Get-GuiSmokeConformEnvOverride mirrors playback_conform::conformEnabledFromEnvValue; the runner's -ExtraEnvironment
+        pairs (last one wins, comma lists expanded) override the inherited environment."""
+        cases = [([], None, -1), ([], "0", 0), ([], " 1 ", 1), ([], "2", -1), ([], "", -1),
+                 (["MLVAPP_PLAYBACK_CONFORM=0"], "1", 0), (["A=1,MLVAPP_PLAYBACK_CONFORM=1"], None, 1),
+                 (["MLVAPP_PLAYBACK_CONFORM=1", "MLVAPP_PLAYBACK_CONFORM=0"], None, 0), (["MLVAPP_PLAYBACK_CONFORM=on"], "0", -1)]
+        script = f". {_q(GATE)}\n" + "\n".join(
+            "Get-GuiSmokeConformEnvOverride -Pairs @(" + ",".join("'" + p + "'" for p in pairs) + ")"
+            + ("" if inherited is None else f" -Inherited '{inherited}'") for pairs, inherited, _ in cases)
+        proc = _pwsh(script)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual([int(v) for v in proc.stdout.split()], [want for _, _, want in cases])
+        runner = (ROOT / "tools" / "profiling" / "run-release-gui-smoke.ps1").read_text(encoding="utf-8")
+        self.assertIn("Get-GuiSmokeConformEnvOverride -Pairs $ExtraEnvironment -Inherited $env:MLVAPP_PLAYBACK_CONFORM", runner)
+        self.assertIn("-ConformEnvOverride $clipConformEnvOverride", runner)
+
     def test_a_clip_at_or_below_the_conform_threshold_keeps_its_own_rate(self) -> None:
         for name, nom in (("f29970", 29970), ("f30000", 30000)):   # at the threshold: conform needs a rate ABOVE it
             clip = self.clip(name, 599, fps_nom=nom, fps_denom=1000)   # 599 frames = 19.99 s at 29.97, 19.97 s at 30

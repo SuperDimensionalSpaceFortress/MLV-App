@@ -18439,7 +18439,10 @@ void MainWindow::setupPlaybackConformMenu( void )
         // Invalid saved values fall back to the defaults (playback_conform::loadSettings).
         auto setStore = automation_settings::openAppSettings(); QSettings &set = *setStore;
         const playback_conform::Settings saved = playback_conform::loadSettings( set );
-        m_conformEnabled = saved.enabled;
+        m_conformEnabledSetting = saved.enabled;
+        // HFR-NATIVE-60FPS-FULLRES-1: MLVAPP_PLAYBACK_CONFORM=0|1 wins for this process and is never persisted.
+        m_conformEnabled = playback_conform::resolveConformEnabled( playback_conform::conformEnvOverride(),
+                                                                    saved.enabled );
         m_conformTargetFps = saved.targetFps;
         m_conformThresholdFps = saved.thresholdFps;
     }
@@ -18455,6 +18458,7 @@ void MainWindow::setupPlaybackConformMenu( void )
     connect( enable, &QAction::toggled, this, [this]( bool on )
     {
         m_conformEnabled = on;
+        m_conformEnabledSetting = on;
         applyPlaybackConformSettings( true );
     } );
 
@@ -18503,7 +18507,7 @@ void MainWindow::applyPlaybackConformSettings( bool persist )
     {
         auto setStore = automation_settings::openAppSettings(); QSettings &set = *setStore;
         playback_conform::Settings s;
-        s.enabled = m_conformEnabled;
+        s.enabled = m_conformEnabledSetting;
         s.targetFps = m_conformTargetFps;
         s.thresholdFps = m_conformThresholdFps;
         playback_conform::saveSettings( set, s );
@@ -24707,7 +24711,7 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
                "env_quality_mode=%29 env_gpu_playback_recon=%30 "
                "env_gpu_playback_recon_texture_present=%31 "
                "auto_target_fps=%32 auto_reason_start=%33 "
-               "env_raw_uint16_prefetch_decoders=%34" )
+               "env_raw_uint16_prefetch_decoders=%34 env_playback_conform=%35" )
                .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
                .arg( m_playbackSmokeStartPosition )
                .arg( m_playbackSmokeStartCutIn )
@@ -24745,7 +24749,8 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
                .arg( QString::fromLatin1(
                    playbackQualityAutoDecisionReasonName(
                        m_playbackQualityAutoDecisionReason ) ) )
-               .arg( envValueForLog( "MLVAPP_RAW_UINT16_PREFETCH_DECODERS" ) );
+               .arg( envValueForLog( "MLVAPP_RAW_UINT16_PREFETCH_DECODERS" ) )
+               .arg( envValueForLog( "MLVAPP_PLAYBACK_CONFORM" ) );
 
     // CUDA-PERF-DISPLAY-WAKE-1: once per playback session, reporting the display-required
     // request this same play-start already made above (setPlaybackDisplayRequiredExecutionState
@@ -28729,7 +28734,7 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                    "conform_enabled=%5 conform_target=%6 conform_threshold=%7 export_fps_override=%8 "
                    "export_frame_rate=%9 audio_sync_requests=%10 presented=%11 source_advanced=%12 "
                    "span_s=%13 source_fps=%14 max_jump=%15 wraps=%16 backward=%17 repeats=%18 "
-                   "auto_target_fps=%19 effective_auto_target_fps=%20" )
+                   "auto_target_fps=%19 effective_auto_target_fps=%20 conform_env_override=%21" )
                    .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
                    .arg( smokeClipFps, 0, 'f', 3 )
                    .arg( m_pMlvObject ? getPlaybackFramerate() : 0.0, 0, 'f', 3 )
@@ -28750,7 +28755,8 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                    .arg( static_cast<qulonglong>( adv.backwardJumps() ) )
                    .arg( static_cast<qulonglong>( adv.repeatedFrames() ) )
                    .arg( m_playbackAutoTargetFps )
-                   .arg( effectivePlaybackAutoTargetFps() );
+                   .arg( effectivePlaybackAutoTargetFps() )
+                   .arg( playback_conform::conformEnvOverride() );
     }
 
     // Window foreground state at session begin and at this gate, plus how many times the

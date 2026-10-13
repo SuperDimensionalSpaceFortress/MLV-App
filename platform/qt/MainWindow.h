@@ -1057,6 +1057,9 @@ private:
     uint64_t m_playbackAudioSyncSkippedCount = 0;
     /* PLAYBACK-HFR-CONFORM-DEFAULT-1: high-frame-rate clips play at a lower conform rate. */
     bool m_conformEnabled = playback_conform::kDefaultEnabled;
+    // The persisted value. m_conformEnabled is the effective one (MLVAPP_PLAYBACK_CONFORM may override
+    // it); only a user toggle changes this, so the env value never reaches settings.
+    bool m_conformEnabledSetting = playback_conform::kDefaultEnabled;
     double m_conformTargetFps = playback_conform::kDefaultTargetFps;
     double m_conformThresholdFps = playback_conform::kDefaultThresholdFps;
     QActionGroup *m_conformTargetGroup = nullptr;

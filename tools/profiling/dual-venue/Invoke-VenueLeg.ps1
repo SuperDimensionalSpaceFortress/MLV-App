@@ -381,6 +381,8 @@ try {
         if ($spec.generatorArgs.PSObject.Properties['playbackProcessing']) { $gen['PlaybackProcessing'] = [string]$spec.generatorArgs.playbackProcessing }
         # PLAYBACK-VSYNC-DEFAULT-1: the vsync A/B arm, any leg type (the app reads MLVAPP_SWAP_INTERVAL).
         if ($spec.generatorArgs.PSObject.Properties['swapInterval']) { $gen['SwapInterval'] = [int]$spec.generatorArgs.swapInterval }
+        # HFR-NATIVE-60FPS-FULLRES-1: the conform arm, any leg type (the app reads MLVAPP_PLAYBACK_CONFORM).
+        if ($spec.generatorArgs.PSObject.Properties['playbackConform']) { $gen['PlaybackConform'] = [string]$spec.generatorArgs.playbackConform }
         # PLAYBACK-LJ92-DECODE-THROUGHPUT-1: the raw-uint16 prefetch decoder count, for any leg (not only a forced-look pace leg).
         if ($spec.generatorArgs.PSObject.Properties['rawPrefetchDecoders']) { $gen['RawPrefetchDecoders'] = [int]$spec.generatorArgs.rawPrefetchDecoders }
         # GPU-EVENT153-ROOTCAUSE-2: the CUDA per-launch timer and its line threshold, for any leg.
@@ -686,6 +688,15 @@ if ($outcome -eq 'CAPTURED') {
 if ($outcome -in @('PASS', 'FAIL') -and $display.blocks) {
     $detail = "INVALID: the job result was $outcome ($detail) but DISPLAY_MODE_NOT_HONOURED: $($display.reason). A run that did not use the display mode the leg names is no measurement under it"
     $outcome = 'INVALID'
+}
+# HFR-NATIVE-60FPS-FULLRES-1, FAIL CLOSED: a leg that names a conform arm (generatorArgs.playbackConform) and whose run log does not prove the app played under it is no
+# measurement under that arm: a typed INVALID, never a PASS or FAIL. The requested and observed values go in the detail. (A leg that names no arm is unchanged.)
+if ($outcome -in @('PASS', 'FAIL')) {
+    $conformArm = Get-DvConformArmVerdict -Spec $spec -Playback $playback
+    if ($conformArm.blocks) {
+        $detail = "INVALID: the job result was $outcome ($detail) but CONFORM_ARM_NOT_HONOURED: $($conformArm.reason). A run that did not play under the conform arm the leg names is no measurement under it"
+        $outcome = 'INVALID'
+    }
 }
 # A signal needs its proof. A PASS or FAIL whose receipt-oracle verdict is not valid (under 20 s of source frames, a wrap,
 # a foreign run, a fixture, or the verdict simply absent) is INVALID: a FAIL on footage that cannot be shown to be long
