@@ -21,16 +21,24 @@ What it does
        id to exactly one check, spelled as one of:
            guard:<NA-id>                a row of docs/never-authorized.json that has a
                                         real enforced_today (not "prose-only")
-           test:<path>::[Class::]name   one test CASE: a def (any nesting, scope-checked)
-                                        in a .py file, or a `-Name "<case>"` / It / function
-                                        in a .ps1. A file alone, or a class alone, is refused:
+           test:<path>::[Class::]name   one test CASE: a def in a .py file at EXACTLY the
+                                        scope spelled (a bare name is a module-level def,
+                                        not any class's method), or a `-Name "<case>"` /
+                                        It / function in a .ps1 (comments and here-strings
+                                        do not count). Any other file type is refused. A
+                                        file alone, or a class alone, is refused:
                                         deleting the asserting case must not leave the
-                                        mapping standing
+                                        mapping standing. A case that a module-level
+                                        `for` loop adds with setattr(<Class>, ...) from a
+                                        table is named Class::test_<slug of the row's
+                                        "name">; it resolves only while that live setattr
+                                        and the row both exist
            hook:<path>                  a hook script that exists
            prose-only: <reason>         an admission that nothing checks it
        An entry may be an object with an optional "strength": "token-presence-pin"
        (the check only asserts that a token string is present in the doc); anything else
-       is behavioural. An unknown strength is a mapping error.
+       is behavioural, except that an entry for a "Pinned contract tokens" bullet with no
+       strength defaults to the pin. An unknown strength is a mapping error.
        Every path (test, hook, and the --map argument) is resolved with symlinks and
        junctions followed and must stay inside the repo root.
     4. Prints the BEHAVIOURAL coverage as the headline: behavioural checks over the rule
@@ -107,6 +115,8 @@ _PS_CASE_RES = (
     re.compile(r"""\b(?:It|Describe|Context)\s+(["'])(.+?)\1"""),
 )
 _PS_FUNCTION_RE = re.compile(r"(?im)^\s*function\s+([\w-]+)")
+_PS_TOKEN_START = " \t\r\n;(){}|,="
+CASE_FILE_TYPES = (".py", ".ps1")
 
 
 def _norm_path(path: str) -> str:
@@ -301,8 +311,102 @@ def _py_defs(body: str):
     return out
 
 
+def _slug(name: str) -> str:
+    """The test-name slug of a generated case: the convention the table-driven suites use
+    (`test_` + the row name lower-cased with every non-alphanumeric run turned into `_`)."""
+    return "test_" + re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+
+
+def _walk_live(stmts):
+    """Every node reachable from these statements WITHOUT entering a def, class or lambda
+    body (those only run when something calls them)."""
+    todo = list(stmts)
+    while todo:
+        node = todo.pop()
+        yield node
+        for child in ast.iter_child_nodes(node):
+            if not isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
+                                      ast.Lambda)):
+                todo.append(child)
+
+
+def _py_generated(tree):
+    """{class name: {generated test name}} for classes that a MODULE-LEVEL loop adds test
+    methods to with setattr(<Class>, ...), the names being `_slug(<row name>)` for every
+    `"name": "<row name>"` entry of a dict literal in the file. A setattr that was removed,
+    commented out, or sits in a def nothing calls contributes nothing, so deleting the
+    generator turns every case it generated stale."""
+    classes = set()
+    for stmt in tree.body:
+        if isinstance(stmt, (ast.For, ast.AsyncFor, ast.While)):
+            for node in _walk_live(stmt.body):
+                if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                        and node.func.id == "setattr" and node.args
+                        and isinstance(node.args[0], ast.Name)):
+                    classes.add(node.args[0].id)
+    if not classes:
+        return {}
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Dict):
+            for k, v in zip(node.keys, node.values):
+                if (isinstance(k, ast.Constant) and k.value == "name"
+                        and isinstance(v, ast.Constant) and isinstance(v.value, str)):
+                    names.add(_slug(v.value))
+    return {c: set(names) for c in classes}
+
+
+def _ps_code_only(body: str) -> str:
+    """The PowerShell source with comments (`# ...`, `<# ... #>`) and here-string bodies
+    blanked, newlines kept. A case name that only appears in a comment or a here-string is
+    not a case: nothing runs it."""
+    out = []
+    i, n = 0, len(body)
+
+    def blank(chunk: str) -> str:
+        return "".join(c if c in "\r\n" else " " for c in chunk)
+
+    while i < n:
+        c = body[i]
+        if body.startswith("<#", i):
+            end = body.find("#>", i + 2)
+            end = n if end < 0 else end + 2
+            out.append(blank(body[i:end]))
+            i = end
+        elif c == "@" and i + 1 < n and body[i + 1] in "'\"" \
+                and re.match(r"[ \t]*\r?\n", body[i + 2:]):
+            m = re.compile(r"(?m)^%s@" % re.escape(body[i + 1])).search(body, i + 2)
+            end = n if not m else m.end()
+            out.append(blank(body[i:end]))
+            i = end
+        elif c in "'\"":
+            j = i + 1
+            while j < n:
+                if c == '"' and body[j] == "`":
+                    j += 2
+                    continue
+                if body[j] == c:
+                    break
+                j += 1
+            out.append(body[i:j + 1])
+            i = j + 1
+        elif c == "`":
+            out.append(body[i:i + 2])
+            i += 2
+        elif c == "#" and (i == 0 or body[i - 1] in _PS_TOKEN_START):
+            j = body.find("\n", i)
+            j = n if j < 0 else j
+            out.append(blank(body[i:j]))
+            i = j
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
 def _ps_cases(body: str):
-    cases = {m.group(2) for rx in _PS_CASE_RES for m in rx.finditer(body)}
+    body = _ps_code_only(body)
+    cases ={m.group(2) for rx in _PS_CASE_RES for m in rx.finditer(body)}
     cases.update(_PS_FUNCTION_RE.findall(body))
     return cases
 
@@ -321,23 +425,24 @@ def _case_error(full: str, rel: str, names):
     if rel.endswith(".py"):
         try:
             defs = _py_defs(body)
+            generated = _py_generated(ast.parse(body))
         except (SyntaxError, ValueError) as exc:
             return "test file %r does not parse: %s" % (rel, exc)
-        want = tuple(names)
-        kinds = set()
-        for scope, kind in defs.items():
-            if scope[-len(want):] == want:
-                kinds |= kind
+        want = tuple(names)  # the scope the map spells, exactly: no suffix matching
+        kinds = defs.get(want, set())
         if "def" in kinds:
             return None
         if kinds:
             return ("test %r names %r, a class, not a test case; name the method or function"
                     % (rel, spelled))
+        if len(want) == 2 and want[1] in generated.get(want[0], ()):
+            return None
     elif rel.endswith(".ps1"):
         if spelled in _ps_cases(body):
             return None
-    elif spelled in body:
-        return None
+    else:
+        return ("test %r is not a %s file, so no test case in it can be named; map a .py or "
+                ".ps1 case" % (rel, " or ".join(CASE_FILE_TYPES)))
     return ("stale: test %r has no definition named %r (the asserting case was renamed or "
             "deleted; re-point or drop the mapping)" % (rel, spelled))
 
@@ -479,7 +584,12 @@ def census(repo_root: str, map_path: str | None = None):
         if why:
             errors.append({"id": mid, "why": why})
             continue
-        strength = entry.get("strength", "behavioural") if isinstance(entry, dict) else "behavioural"
+        # A "Pinned contract tokens" bullet is a token-presence assertion unless the map
+        # says otherwise: an omitted strength there defaults to pin, everywhere else to
+        # behavioural.
+        default = PIN_STRENGTH if any(b["token_inventory"] for b in by_id[mid]) \
+            else "behavioural"
+        strength = entry.get("strength", default) if isinstance(entry, dict) else default
         if strength not in STRENGTHS:
             errors.append({"id": mid, "why": "unknown strength %r (use %s or omit it)"
                            % (strength, " or ".join(repr(s) for s in STRENGTHS[1:]))})
