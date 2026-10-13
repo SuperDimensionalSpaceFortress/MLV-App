@@ -213,6 +213,7 @@ jobs:
           python -m pytest `
             tools\coordination\test_coordination_guardrails.py `
             tests\coordination `
+            tests\docs `
             -q
 
       - name: Run demote-factory-bridge refusal-path tests

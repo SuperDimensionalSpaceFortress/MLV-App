@@ -10,6 +10,14 @@
 #      read-only) -> take the claim (while another chain's LIVE claim stands, wait unclaimed and poll) -> re-probe ONCE under the claim (-MaxWaitSec 0)
 #      -> run the leg -> release -> cooldown unclaimed. Nothing here scans processes or lane prompts: a waiting chain is never a venue user, and the only
 #      thing that blocks a chain is a LIVE claim. (A GATE_BUSY re-probe under the claim releases it and goes back to waiting.)
+#   2b. FIFO (VENUE-CLAIM-FIFO-1). The claim wait is a LINE, not a polling race: a chain that passed its quiet probe takes a TICKET (VenueChain.psm1 header) and
+#      only the oldest LIVE ticket may try the claim; the others log CLAIM_HELD state=QUEUED with the whole line (position, pid, run dir, age). A ticket whose
+#      owner is dead or silent for 3 x -ClaimPollSec is removed by the next waiter (TICKET_STALE_REMOVED); while its owner sits in a quiet probe the window is that
+#      probe's real upper bound (QuietMaxWaitSec + um-run's waits + -ProbeAdmissionWaitSec, which the chain passes to the probe as -MaxAdmissionWaitSec), and a dead pid
+#      is stale at once. A GATE_BUSY under the claim KEEPS the ticket for at most -TicketKeepMax (1) such cycles (TICKET_KEPT keeps=n/max); the next one, or a pre-claim
+#      probe that is not quiet, gives the ticket up (TICKET_DROPPED keeps=n/max), so a waiter that is not ready never blocks one that is. The ticket is removed when the leg starts. A ticket holder polls its own turn every -TicketPollSec (5), faster than -ClaimPollSec; the venue
+#      probe cadence is unchanged. Chains on the OLD code take no ticket: they still take any free claim and are never waited on (the line orders ticket holders
+#      only). -NoTicket reverts a chain to the old race. -ClaimStatus prints the claim and the line (owner run dir, pid, age) and exits.
 #   3. EXIT 6. Wait-VenueQuiet exit 6 (VENUE_QUIET_UNKNOWN), any exit code it does not document, or exit 0 without a QUIET / COOLDOWN_UNMET line means the
 #      venue was NOT MEASURED: the leg is NOT run (`LEG <name> NOT_RUN VENUE_QUIET_UNKNOWN reason=...`) and the chain stops (-OnUnknown Stop, the default)
 #      or goes on to the next leg (-OnUnknown Continue). A measured COOLDOWN_UNMET still runs the leg, as before, but the LEG line carries verdict=,
@@ -24,6 +32,7 @@
 #   pwsh -NoProfile -File tools\profiling\dual-venue\Invoke-VenueChain.ps1 -Venue bachelor -LegSet display-matrix -Backend cpu -RunDir <rd> `
 #       -SourceCommit <40-hex> -BuildManifestSha256 <64-hex> [-PreferQuietWindows] [-OnUnknown Continue] [-DeadlineUtc <iso>]
 #   pwsh -NoProfile -File tools\profiling\dual-venue\Invoke-VenueChain.ps1 -QuietRateTable [-Venue bachelor] [-GateLogPath <gate.log>...]
+#   pwsh -NoProfile -File tools\profiling\dual-venue\Invoke-VenueChain.ps1 -ClaimStatus [-Venue bachelor]
 #
 # Exit codes (a leg's OUTCOME is never the exit code: read CHAIN_RESULT and the receipts): 0 every leg ran (Invoke-VenueLeg exited 0 for each); 2 usage (including a Wait-VenueQuiet usage
 # error); 3 DEADLINE (-DeadlineUtc passed before every leg ran: queue busy, a live claim, or a window; the rest are NOT_RUN DEADLINE); 4 GATE_UNREADABLE
@@ -55,10 +64,15 @@ param(
     [Parameter(ParameterSetName = 'Chain')][ValidateSet('Stop', 'Continue')][string]$OnUnknown = 'Stop',
     [Parameter(ParameterSetName = 'Chain')][ValidateRange(60, 86400)][int]$ClaimTtlSec = 10800,
     [Parameter(ParameterSetName = 'Chain')][ValidateRange(1, 3600)][int]$ClaimPollSec = 30,
+    [Parameter(ParameterSetName = 'Chain')][ValidateRange(1, 3600)][int]$TicketPollSec = 5,
+    [Parameter(ParameterSetName = 'Chain')][ValidateRange(0, 20)][int]$TicketKeepMax = 1,
+    [Parameter(ParameterSetName = 'Chain')][ValidateRange(1, 86400)][int]$ProbeAdmissionWaitSec = 7200,
+    [Parameter(ParameterSetName = 'Chain')][switch]$NoTicket,
     [Parameter(ParameterSetName = 'Chain')][string]$ChainLog = '',
     [Parameter(ParameterSetName = 'Chain')][switch]$PreferQuietWindows,
     [Parameter(ParameterSetName = 'Chain')][ValidateRange(0, 50)][int]$UnhealthyStreakStop = 3,
     [Parameter(ParameterSetName = 'Table', Mandatory = $true)][switch]$QuietRateTable,
+    [Parameter(ParameterSetName = 'Status', Mandatory = $true)][switch]$ClaimStatus,
     [string]$ClaimDir = '',
     [string[]]$GateLogPath = @(),
     [double]$PreferRatePercent = 30.0,
@@ -105,6 +119,11 @@ if ($PSCmdlet.ParameterSetName -eq 'Table') {
     Format-VenueQuietRateTable -Table $rt.table -Venue $Venue
     $w = Select-VenueQuietWindow -Table $rt.table -NowUtc $now -PreferRatePercent $PreferRatePercent -HorizonHours $WindowHorizonHours -MinProbes $MinWindowProbes
     Write-Output ('WINDOW_CHOICE=' + ($w | ConvertTo-Json -Compress))
+    exit 0
+}
+
+if ($PSCmdlet.ParameterSetName -eq 'Status') {
+    Format-VenueClaimStatus -Status (Get-VenueClaimStatus -Venue $Venue -ClaimDir $ClaimDir)
     exit 0
 }
 
@@ -176,7 +195,7 @@ function Invoke-QuietProbe([string]$Name, [string]$Phase, [int]$MaxWaitSec) {
         return [pscustomobject]@{ verdict = 'VENUE_QUIET_UNKNOWN'; code = 'none'; mean = $null; reason = 'PROBE_SCRIPT_MISSING'; waitedSec = $null; out = $out }
     }
     $qArgs = @('-NoProfile', '-NonInteractive', '-File', $QuietScript, '-Venue', $Venue, '-WorkDir', (Join-Path $RunDir 'quiet'), '-GateLog', (Join-Path $RunDir 'gate.log'),
-        '-ThresholdPercent', [string]$ThresholdPercent, '-MaxWaitSec', [string]$MaxWaitSec, '-RecheckSec', [string]$RecheckSec)
+        '-ThresholdPercent', [string]$ThresholdPercent, '-MaxWaitSec', [string]$MaxWaitSec, '-RecheckSec', [string]$RecheckSec, '-MaxAdmissionWaitSec', [string]$ProbeAdmissionWaitSec)
     & $pwshExe @qArgs *> $out
     $code = $LASTEXITCODE
     $lines = @(if (Test-Path -LiteralPath $out) { Get-Content -LiteralPath $out })
@@ -219,6 +238,24 @@ function Add-Result([object]$Leg, [string]$Status, [hashtable]$Extra) {
     $results.Add([pscustomobject]$r)
 }
 
+# VENUE-CLAIM-FIFO-1: this chain's place in the line for the leg being run ($null while it has none). It is taken at the claim wait (after a quiet pre-probe), kept
+# across a GATE_BUSY under the claim for one more probe, and removed when the leg starts or the leg is given up. A ticket must out-live a quiet probe (Wait-VenueQuiet
+# blocks the heartbeat), so the probe phases widen its stale-after to the probe's real upper bound, derived from what the probe can take (-QuietMaxWaitSec plus
+# um-run's waits plus -ProbeAdmissionWaitSec, which is passed to the probe); while merely polling for the claim it is 3 x -ClaimPollSec (10 s floor).
+# $ticketKeeps counts the GATE_BUSY-under-claim cycles this ticket has been kept through (-TicketKeepMax allows that many; the next one drops it).
+$ticket = $null
+$ticketKeeps = 0
+$ticketPollStaleSec = [Math]::Max(10, 3 * $ClaimPollSec)
+$ticketProbeStaleSec = Get-VenueTicketProbeStaleSec -QuietMaxWaitSec $QuietMaxWaitSec -AdmissionWaitSec $ProbeAdmissionWaitSec -MarginSec $ticketPollStaleSec
+
+function Close-LegTicket([string]$LegName, [string]$Event, [string]$Why) {
+    if ($null -eq $script:ticket) { return }
+    $r = Remove-VenueTicket -Ticket $script:ticket
+    L "$Event leg=$LegName ticket=$($script:ticket.name) result=$r reason=$Why keeps=$($script:ticketKeeps)/$TicketKeepMax"
+    $script:ticket = $null
+    $script:ticketKeeps = 0
+}
+
 $rateTable = $null
 if ($PreferQuietWindows) {
     $rt = Get-RateTable
@@ -232,6 +269,7 @@ foreach ($leg in $plan) {
     $legIndex++
     if ($null -ne $stopReason) { Add-Result $leg 'NOT_RUN' @{ verdict = $stopReason; reason = 'chain-stopped' }; L "LEG $($leg.name) NOT_RUN $stopReason reason=chain-stopped"; continue }
     $ran = $false
+    $ticket = $null; $ticketKeeps = 0
     while (-not $ran) {
         if ([DateTime]::UtcNow -ge $deadline) { $stopReason = 'DEADLINE'; $exitCode = 3; Add-Result $leg 'NOT_RUN' @{ verdict = 'DEADLINE'; reason = 'deadline-before-leg' }; L "LEG $($leg.name) NOT_RUN DEADLINE reason=deadline-before-leg"; break }
         # (a) a better quiet window, waited for WITHOUT the claim
@@ -239,12 +277,14 @@ foreach ($leg in $plan) {
             $w = Select-VenueQuietWindow -Table $rateTable -NowUtc ([DateTime]::UtcNow) -PreferRatePercent $PreferRatePercent -HorizonHours $WindowHorizonHours -MinProbes $MinWindowProbes -DeadlineUtc $deadline
             L "WINDOW leg=$($leg.name) action=$($w.action) reason=$($w.reason) currentHour=$('{0:00}' -f $w.currentHour)Z currentRate=$($w.currentRate) currentProbes=$($w.currentProbes)$(if ($w.action -ceq 'WAIT') { " targetHour=$('{0:00}' -f $w.targetHour)Z targetRate=$($w.targetRate) waitSec=$($w.waitSec) (no claim held)" })"
             if ($w.action -ceq 'WAIT') {
+                Close-LegTicket $leg.name 'TICKET_DROPPED' 'waiting-for-a-better-window'
                 $until = [DateTimeOffset]::Parse($w.targetUtc, [Globalization.CultureInfo]::InvariantCulture).UtcDateTime
                 while ([DateTime]::UtcNow -lt $until -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Seconds ([int][Math]::Max(1, [Math]::Min(60, ($until - [DateTime]::UtcNow).TotalSeconds))) }
                 continue
             }
         }
         # (b) the quiet wait, WITHOUT the claim
+        if ($ticket) { [void](Update-VenueTicket -Ticket $ticket -Phase 'probing' -StaleAfterSec $ticketProbeStaleSec) }   # a ticket kept across a GATE_BUSY: held for this ONE probe
         $pre = Invoke-QuietProbe $leg.name 'pre-claim' $QuietMaxWaitSec
         L "QUIET leg=$($leg.name) phase=pre-claim exit=$($pre.code) verdict=$($pre.verdict) mean=$(Format-Mean $pre.mean) waitedSec=$($pre.waitedSec)$(if ($pre.reason) { " reason=$($pre.reason)" }) (no claim held)"
         if ($pre.verdict -ceq 'USAGE') { $stopReason = 'USAGE'; $exitCode = 2; Add-Result $leg 'NOT_RUN' @{ verdict = 'USAGE'; reason = 'wait-venuequiet-usage' }; L "LEG $($leg.name) NOT_RUN USAGE reason=wait-venuequiet-usage"; break }
@@ -255,29 +295,44 @@ foreach ($leg in $plan) {
             $exitCode = 6; if ($OnUnknown -ceq 'Stop') { $stopReason = 'VENUE_QUIET_UNKNOWN' }
             break
         }
-        if ($pre.verdict -ceq 'GATE_BUSY') { if ([DateTime]::UtcNow.AddSeconds($ClaimPollSec) -lt $deadline) { Start-Sleep -Seconds $ClaimPollSec }; continue }
+        if ($pre.verdict -ceq 'GATE_BUSY') { Close-LegTicket $leg.name 'TICKET_DROPPED' 'not-quiet-after-one-probe'; if ([DateTime]::UtcNow.AddSeconds($ClaimPollSec) -lt $deadline) { Start-Sleep -Seconds $ClaimPollSec }; continue }
         # (c) the claim: only now, about to run. A LIVE claim of another chain is waited out unclaimed; stale claims are broken once each.
         $claim = $null; $lastHolder = ''
+        $claimSleepSec = $(if ($NoTicket) { $ClaimPollSec } else { [Math]::Min($ClaimPollSec, $TicketPollSec) })   # a ticket holder polls only its OWN turn faster; the probe cadence is untouched
         while ($true) {
-            $req = Request-VenueClaim -Venue $Venue -RunDir $RunDir -Purpose "$Purpose leg $($leg.name)" -TtlSec $ClaimTtlSec -ClaimDir $ClaimDir
+            $rq = @{ Venue = $Venue; RunDir = $RunDir; Purpose = "$Purpose leg $($leg.name)"; TtlSec = $ClaimTtlSec; ClaimDir = $ClaimDir }
+            if (-not $NoTicket) { $rq['UseTicket'] = $true; $rq['TicketStaleAfterSec'] = $ticketPollStaleSec; if ($ticket) { $rq['Ticket'] = $ticket } }
+            $req = Request-VenueClaim @rq
+            if ($req.ticket -and ($null -eq $ticket -or $req.ticket.name -cne $ticket.name)) { L "TICKET_TAKEN leg=$($leg.name) ticket=$($req.ticket.name) runDir=$RunDir pid=$PID$(if ($ticket) { ' (the earlier ticket was lost: back of the line)' })" }
+            if ($req.ticket) { if ($null -eq $ticket -or $req.ticket.name -cne $ticket.name) { $ticketKeeps = 0 }; $ticket = $req.ticket }   # a new place in the line starts a new keep count
+            foreach ($st in $req.staleTickets) { L "TICKET_STALE_REMOVED venue=$Venue reason=$($st.reason) ownerPid=$($st.ticket.ownerPid) runDir=$($st.ticket.runDir) ticket=$($st.name)" }
             foreach ($b in $req.broken) { L "CLAIM_STALE_BROKEN venue=$Venue reason=$($b.reason) ownerPid=$($b.claim.ownerPid) ownerCreatedUtc=$($b.claim.ownerCreatedUtc) runDir=$($b.claim.runDir) expiresUtc=$($b.claim.expiresUtc)" }
             if ($req.granted) { $claim = $req.claim; break }
             $holder = $(if ($req.claim) { "pid=$($req.claim.ownerPid) runDir=$($req.claim.runDir) purpose=$($req.claim.purpose) expiresUtc=$($req.claim.expiresUtc)" } else { $req.state })
-            if ($holder -cne $lastHolder) { L "CLAIM_HELD leg=$($leg.name) state=$($req.state) holder $holder -> wait (no claim held)"; $lastHolder = $holder }
-            if ([DateTime]::UtcNow.AddSeconds($ClaimPollSec) -ge $deadline) { break }
-            Start-Sleep -Seconds $ClaimPollSec
+            $lineText = $(if ($req.ticket) { " position=$($req.position)/$(@($req.queue).Count) queue=[$(Format-VenueTicketQueue $req.queue)]" } else { '' })
+            $lineKey = "$holder|$(@($req.queue | ForEach-Object { $_.name }) -join ',')"   # ages move every poll: log when the holder or the line changes, not every second
+            if ($lineKey -cne $lastHolder) { L "CLAIM_HELD leg=$($leg.name) state=$($req.state) holder $holder$lineText -> wait (no claim held)"; $lastHolder = $lineKey }
+            if ([DateTime]::UtcNow.AddSeconds($claimSleepSec) -ge $deadline) { break }
+            Start-Sleep -Seconds $claimSleepSec
         }
         if ($null -eq $claim) { $stopReason = 'DEADLINE'; $exitCode = 3; Add-Result $leg 'NOT_RUN' @{ verdict = 'DEADLINE'; reason = 'claim-held' }; L "LEG $($leg.name) NOT_RUN DEADLINE reason=claim-held"; break }
         L "CLAIM_TAKEN leg=$($leg.name) nonce=$($claim.nonce) expiresUtc=$($claim.expiresUtc)"
         $released = $false
         try {
             # (d) ONE re-probe under the claim: the measurement nearest the leg is the one its line carries
+            if ($ticket) { [void](Update-VenueTicket -Ticket $ticket -Phase 'probing' -StaleAfterSec $ticketProbeStaleSec) }
             $re = Invoke-QuietProbe $leg.name 'under-claim' 0
             L "QUIET leg=$($leg.name) phase=under-claim exit=$($re.code) verdict=$($re.verdict) mean=$(Format-Mean $re.mean)$(if ($re.reason) { " reason=$($re.reason)" })"
             if ($re.verdict -ceq 'GATE_BUSY') {
                 L "CLAIM_RELEASED leg=$($leg.name) result=$(Release-VenueClaim -Venue $Venue -Nonce $claim.nonce -ClaimDir $ClaimDir) reason=gate-busy-under-claim (back to waiting)"; $released = $true
+                if ($ticket) {
+                    # the ONE allowed keep (-TicketKeepMax) holds the place for one more quiet probe; the next GATE_BUSY under the claim gives it up and rejoins at the back
+                    if ($ticketKeeps -lt $TicketKeepMax) { $ticketKeeps++; L "TICKET_KEPT leg=$($leg.name) ticket=$($ticket.name) keeps=$ticketKeeps/$TicketKeepMax (keeps its place in the line for one more quiet probe)" }
+                    else { Close-LegTicket $leg.name 'TICKET_DROPPED' 'gate-busy-under-claim-after-kept-cycles' }
+                }
                 continue
             }
+            Close-LegTicket $leg.name 'TICKET_ENDED' 'leg-starting'
             if ($re.verdict -ceq 'USAGE') { $stopReason = 'USAGE'; $exitCode = 2; Add-Result $leg 'NOT_RUN' @{ verdict = 'USAGE'; reason = 'phase=under-claim' }; L "LEG $($leg.name) NOT_RUN USAGE phase=under-claim"; break }
             if ($re.verdict -in @('GATE_UNREADABLE', 'HOST_MISMATCH')) { $stopReason = $re.verdict; $exitCode = $(if ($re.verdict -ceq 'GATE_UNREADABLE') { 4 } else { 5 }); Add-Result $leg 'NOT_RUN' @{ verdict = $re.verdict; reason = 'phase=under-claim' }; L "LEG $($leg.name) NOT_RUN $($re.verdict) phase=under-claim"; break }
             if ($re.verdict -ceq 'VENUE_QUIET_UNKNOWN') {
@@ -338,6 +393,7 @@ foreach ($leg in $plan) {
         }
         if (-not $ran) { break }
     }
+    Close-LegTicket $leg.name 'TICKET_ENDED' 'leg-given-up'
     if ($ran -and $legIndex -lt $plan.Count -and $null -eq $stopReason -and $CooldownSec -gt 0) {
         L "COOLDOWN ${CooldownSec} s (no claim held)"
         Start-Sleep -Seconds $CooldownSec
