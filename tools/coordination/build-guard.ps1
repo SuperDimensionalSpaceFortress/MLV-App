@@ -19,13 +19,16 @@
 #      host. Peers are identified by pid + start time (reported as pid@startUtc).
 #   4. -ExemptReason "<text>" (or env MLV_BUILD_GUARD_EXEMPT) skips ONLY the memory floor, for a hub
 #      ruling, mirroring HOST_COMMIT_EXEMPT. The reason is written to stderr and appended to the
-#      exemption log. The slot and the job count still apply.
+#      exemption log. The slot and the job count still apply. An empty, whitespace or false-y value
+#      ('0', 'false', 'off', 'no') is not a reason and exempts nothing.
 #
 # THREE WAYS TO USE IT:
 #   Command:   pwsh -NoProfile -File tools\coordination\build-guard.ps1 -Command "qmake X.pro; mingw32-make -j{JOBS}"
 #              "{JOBS}" in the text is replaced with the chosen number BEFORE the fragment is parsed, so
 #              "-j{JOBS}" reaches the child as the single token "-j4". The fragment runs in this process;
-#              the exit code of its last native command is returned. (A "--" separator is not used:
+#              the exit code of its last native command is returned. A failure that is not a native exit
+#              code (command not found, an error record, a throw) stops the fragment, prints
+#              BUILD_GUARD_COMMAND_FAILED on stderr and exits 1. (A "--" separator is not used:
 #              PowerShell binds it as a parameter named '' and refuses.)
 #   Print:     pwsh -NoProfile -File tools\coordination\build-guard.ps1 -PrintJobs
 #              runs the memory pre-flight, prints "-jN" as the only stdout line, takes NO slot.
@@ -36,12 +39,14 @@
 # -RequestedJobs N (library/command) caps the choice: jobs = min(chosen, N). A caller can build
 # smaller than the guard allows, never larger.
 #
-# Log lines go to stderr; typed lines (BUILD_MEM_REFUSED, BUILD_SLOT_BUSY) go to stdout.
+# Log lines go to stderr; typed lines (BUILD_MEM_REFUSED, BUILD_SLOT_BUSY) go to stdout, except
+# BUILD_GUARD_COMMAND_FAILED, which goes to stderr beside the error it reports.
 # Test seams (used by tests/coordination/test_build_guard.py, no real probe needed):
 #   -MemoryProbeFile   JSON array of {"freePhysGB":n,"freeCommitGB":n}, one sample per poll, last repeats
 #   -ProcessTableFile  JSON array of {"ProcessId":n,"Name":"cc1plus.exe","CreationDate":"<iso>"}
-#   -LockPath / -PollSeconds / -DeadlineMinutes / -LockExpiryMinutes / -ExemptLogPath
-# Exit codes: 3 = refused (memory or slot), 2 = usage, otherwise the build command's own exit code.
+#   -LockPath / -MutexName / -PollSeconds / -DeadlineMinutes / -LockExpiryMinutes / -ExemptLogPath
+# Exit codes: 3 = refused (memory or slot), 2 = usage, 1 = the command fragment failed without a native
+# exit code, otherwise the build command's own exit code.
 [CmdletBinding()]
 param(
     [switch]$Library,
@@ -55,6 +60,7 @@ param(
     [double]$DeadlineMinutes = 20,
     [double]$LockExpiryMinutes = 90,
     [string]$LockPath = 'C:\mlvtmp\locks\build-slot.lock',
+    [string]$MutexName = 'Global\MLV-BuildGuardSlot',
     [string]$ExemptLogPath = 'C:\mlvtmp\locks\build-guard-exempt.log',
     [string]$MemoryProbeFile = '',
     [string]$ProcessTableFile = '',
@@ -69,10 +75,12 @@ $script:BuildGuardDefaults = @{
     DeadlineMinutes   = 20
     LockExpiryMinutes = 90
     LockPath          = 'C:\mlvtmp\locks\build-slot.lock'
+    MutexName         = 'Global\MLV-BuildGuardSlot'
     ExemptLogPath     = 'C:\mlvtmp\locks\build-guard-exempt.log'
     MemoryProbeFile   = ''
     ProcessTableFile  = ''
 }
+$script:BuildGuardCimTimeoutSec = 30
 
 function Write-BuildGuardLog([string]$Message) {
     [Console]::Error.WriteLine("[build-guard] $Message")
@@ -91,7 +99,7 @@ function Get-BuildGuardMemory([hashtable]$Options) {
         $script:BuildGuardProbeIndex++
         return @{ PhysGB = [double]$samples[$i].freePhysGB; CommitGB = [double]$samples[$i].freeCommitGB }
     }
-    $os = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
+    $os = Get-CimInstance Win32_OperatingSystem -OperationTimeoutSec $script:BuildGuardCimTimeoutSec -ErrorAction SilentlyContinue
     if (-not $os) { return @{ PhysGB = 0.0; CommitGB = 0.0 } }
     return @{
         PhysGB   = [math]::Round($os.FreePhysicalMemory / 1MB, 2)
@@ -104,7 +112,7 @@ function Get-BuildGuardJobs([hashtable]$Options, [int]$SelfPid) {
     if ($Options.ProcessTableFile) {
         $table = @(Get-Content -LiteralPath $Options.ProcessTableFile -Raw | ConvertFrom-Json)
     } else {
-        $table = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+        $table = @(Get-CimInstance Win32_Process -OperationTimeoutSec $script:BuildGuardCimTimeoutSec -ErrorAction SilentlyContinue |
             Select-Object ProcessId, ParentProcessId, Name, CreationDate)
     }
     # This process and its ancestors are not peers (a guard launched from make must not downgrade itself).
@@ -136,7 +144,7 @@ function Invoke-BuildSlotAcquire([hashtable]$Options, [string]$Label) {
     # two reclaimers cannot delete each other's fresh lock.
     $dir = Split-Path -Parent $Options.LockPath
     if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-    $mutex = New-Object System.Threading.Mutex($false, 'Global\MLV-BuildGuardSlot')
+    $mutex = New-Object System.Threading.Mutex($false, $Options.MutexName)
     $got = $false
     try {
         try { $got = $mutex.WaitOne(15000) } catch [System.Threading.AbandonedMutexException] { $got = $true }
@@ -180,7 +188,7 @@ function Invoke-BuildSlotAcquire([hashtable]$Options, [string]$Label) {
         } catch [System.IO.IOException] {
             return @{ Acquired = $false; Held = 'lock-created-by-another-process' }
         }
-        return @{ Acquired = $true; Held = ''; Ticket = @{ Path = $path; OwnerPid = $PID; StartTicks = $startTicks } }
+        return @{ Acquired = $true; Held = ''; Ticket = @{ Path = $path; OwnerPid = $PID; StartTicks = $startTicks; MutexName = $Options.MutexName } }
     } finally {
         if ($got) { $mutex.ReleaseMutex() }
         $mutex.Dispose()
@@ -188,14 +196,32 @@ function Invoke-BuildSlotAcquire([hashtable]$Options, [string]$Label) {
 }
 
 function Remove-BuildSlot($Ticket) {
-    # Release only a lock that is still ours (pid + start time), never a successor's.
+    # Release only a lock that is still ours (pid + start time), never a successor's. The read, compare and
+    # delete run under the same mutex as acquire, so a contender cannot reclaim an expired lock and create its
+    # own between our read and our delete. If the mutex stays busy, the lock is left: once this process exits
+    # it is reclaimable as owner-dead.
     if (-not $Ticket) { return }
+    $mutex = New-Object System.Threading.Mutex($false, $Ticket.MutexName)
+    $got = $false
     try {
+        try { $got = $mutex.WaitOne(15000) } catch [System.Threading.AbandonedMutexException] { $got = $true }
+        if (-not $got) { Write-BuildGuardLog "release-mutex-busy: build slot left for owner-dead reclaim: $($Ticket.Path)"; return }
         $info = Get-Content -LiteralPath $Ticket.Path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
         if ([int]$info.ownerPid -eq $Ticket.OwnerPid -and [long]$info.startTicks -eq $Ticket.StartTicks) {
             Remove-Item -LiteralPath $Ticket.Path -Force
         }
-    } catch { }
+    } catch {
+    } finally {
+        if ($got) { $mutex.ReleaseMutex() }
+        $mutex.Dispose()
+    }
+}
+
+function Get-BuildGuardExemptReason([string]$Reason) {
+    # An empty, whitespace or false-y value ('0', 'false', 'off', 'no') is not an exemption (catalogue P-01).
+    $text = ([string]$Reason).Trim()
+    if ($text -match '^(0|false|off|no)$') { return '' }
+    return $text
 }
 
 function Invoke-BuildGuard {
@@ -210,7 +236,8 @@ function Invoke-BuildGuard {
     $o = @{}
     foreach ($k in $script:BuildGuardDefaults.Keys) { $o[$k] = $script:BuildGuardDefaults[$k] }
     foreach ($k in $Options.Keys) { $o[$k] = $Options[$k] }
-    $exempt = if ($ExemptReason) { $ExemptReason } else { [string]$env:MLV_BUILD_GUARD_EXEMPT }
+    $exempt = Get-BuildGuardExemptReason $ExemptReason
+    if (-not $exempt) { $exempt = Get-BuildGuardExemptReason $env:MLV_BUILD_GUARD_EXEMPT }
     if ($exempt) {
         $line = 'BUILD_GUARD_EXEMPT label={0} reason={1} utc={2} pid={3}' -f $Label, $exempt, [DateTime]::UtcNow.ToString('o'), $PID
         Write-BuildGuardLog $line
@@ -265,6 +292,7 @@ $guardOptions = @{
     DeadlineMinutes   = $DeadlineMinutes
     LockExpiryMinutes = $LockExpiryMinutes
     LockPath          = $LockPath
+    MutexName         = $MutexName
     ExemptLogPath     = $ExemptLogPath
     MemoryProbeFile   = $MemoryProbeFile
     ProcessTableFile  = $ProcessTableFile
@@ -282,10 +310,23 @@ if (-not $Command.Trim()) {
     exit 2
 }
 
+# The fragment runs with ErrorActionPreference Stop, so a command that cannot start, an error record or a
+# throw ends it at once and exits 1 (BUILD-GUARD BG-01: these never touch LASTEXITCODE, so the guard used to
+# exit 0). A native command's own exit code is not an error here and is returned as is.
+$script:BuildGuardCommandExit = 0
 Invoke-BuildGuard -Label $Label -RequestedJobs $RequestedJobs -ExemptReason $ExemptReason -Options $guardOptions -Action {
     param($Jobs)
     $fragment = $Command -replace '\{JOBS\}', [string]$Jobs
     $global:LASTEXITCODE = 0
-    & ([scriptblock]::Create($fragment))
+    $ErrorActionPreference = 'Stop'
+    $PSNativeCommandUseErrorActionPreference = $false
+    try {
+        & ([scriptblock]::Create($fragment))
+        $script:BuildGuardCommandExit = [int]$global:LASTEXITCODE
+    } catch {
+        $reason = ($_.Exception.GetType().Name + ': ' + $_.Exception.Message) -replace '\s+', ' '
+        [Console]::Error.WriteLine(('BUILD_GUARD_COMMAND_FAILED label={0} lastNativeExit={1} reason={2}' -f $Label, [int]$global:LASTEXITCODE, $reason))
+        $script:BuildGuardCommandExit = 1
+    }
 }
-exit $LASTEXITCODE
+exit $script:BuildGuardCommandExit

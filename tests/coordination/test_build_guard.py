@@ -37,19 +37,21 @@ LOW_COMMIT = {"freePhysGB": 10, "freeCommitGB": 7.9}
 FAST = ["-PollSeconds", "0.2"]
 
 
-def _env() -> dict:
+def _env(exempt=None) -> dict:
     env = dict(os.environ)
     env.pop("MLV_BUILD_GUARD_EXEMPT", None)
+    if exempt is not None:
+        env["MLV_BUILD_GUARD_EXEMPT"] = exempt
     return env
 
 
-def _ps(args: list, timeout: int = 90) -> subprocess.CompletedProcess:
+def _ps(args: list, timeout: int = 90, exempt_env=None) -> subprocess.CompletedProcess:
     return subprocess.run(
         [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", *args],
         capture_output=True,
         text=True,
         timeout=timeout,
-        env=_env(),
+        env=_env(exempt_env),
         check=False,
     )
 
@@ -76,7 +78,7 @@ def _write_argv_echo(tmp_path: Path) -> Path:
     return script
 
 
-def _guard(box: dict, memory, table, extra: list, mode: list) -> subprocess.CompletedProcess:
+def _guard(box: dict, memory, table, extra: list, mode: list, exempt_env=None) -> subprocess.CompletedProcess:
     memory_file = _write_json(box["dir"] / "memory.json", memory)
     table_file = _write_json(box["dir"] / "table.json", table)
     return _ps(
@@ -88,7 +90,8 @@ def _guard(box: dict, memory, table, extra: list, mode: list) -> subprocess.Comp
             "-ExemptLogPath", str(box["exempt_log"]),
             *extra,
             *mode,
-        ]
+        ],
+        exempt_env=exempt_env,
     )
 
 
@@ -151,6 +154,58 @@ def test_exempt_reason_skips_the_memory_floor_and_is_logged(box) -> None:
     assert "hub ruling 2026-10-13 test" in box["exempt_log"].read_text(encoding="ascii")
 
 
+def test_real_probes_are_bounded_and_still_answer(box) -> None:
+    # BUILD-GUARD-CIM-TIMEOUT-1: a wedged WMI provider must not hold the guard past its deadline.
+    text = GUARD.read_text(encoding="ascii")
+    assert text.count("Get-CimInstance") == text.count("Get-CimInstance Win32_") == 2
+    assert text.count("-OperationTimeoutSec $script:BuildGuardCimTimeoutSec") == 2
+    # The real probes (no injected files); exempt so the host's live memory cannot refuse the run.
+    done = _ps(
+        [
+            "-File", str(GUARD),
+            "-LockPath", str(box["lock"]),
+            "-ExemptLogPath", str(box["exempt_log"]),
+            "-ExemptReason", "test of the real probes",
+            "-PrintJobs",
+        ]
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert done.stdout.strip() in ("-j2", "-j4"), done.stdout + done.stderr
+
+
+@pytest.mark.parametrize("value", ["0", "false", "OFF", "no", " ", ""], ids=repr)
+def test_false_y_exempt_env_does_not_skip_the_memory_floor(box, value) -> None:
+    done = _guard(
+        box, [LOW_PHYS], [], [*FAST, "-DeadlineMinutes", "0.03"], ["-PrintJobs"], exempt_env=value
+    )
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert "BUILD_MEM_REFUSED" in done.stdout
+    assert "BUILD_GUARD_EXEMPT" not in done.stderr
+    assert not box["exempt_log"].exists()
+
+
+def test_exempt_env_with_a_real_reason_skips_the_memory_floor(box) -> None:
+    done = _guard(
+        box, [LOW_PHYS], [], [*FAST, "-DeadlineMinutes", "0.03"], ["-PrintJobs"], exempt_env="hub ruling env"
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "reason=hub ruling env" in done.stderr
+
+
+def test_exempt_build_still_takes_the_slot(box) -> None:
+    fragment = f"Write-Output \"held=$(Test-Path -LiteralPath '{box['lock']}')\""
+    done = _guard(
+        box,
+        [LOW_PHYS],
+        [],
+        [*FAST, "-DeadlineMinutes", "0.03", "-ExemptReason", "hub ruling slot test"],
+        ["-Command", fragment],
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "held=True" in done.stdout, "an exemption skips only the memory floor, never the slot"
+    assert not box["lock"].exists()
+
+
 # --- job count ---------------------------------------------------------------------------------
 
 
@@ -180,6 +235,39 @@ def test_requested_jobs_can_lower_but_never_raise_the_choice(box) -> None:
     assert _print_jobs(box, OK_MEMORY, peer, ["-RequestedJobs", "8"]).stdout.strip() == "-j2"
 
 
+@pytest.mark.parametrize(
+    "make_parent, expected", [(True, "jobs=4"), (False, "jobs=2")], ids=["ancestor", "unrelated"]
+)
+def test_a_make_that_launched_the_guard_is_not_a_peer(box, make_parent, expected) -> None:
+    # The table is written from inside the guard's own process, so its real $PID is in it.
+    driver = box["dir"] / "ancestor.ps1"
+    driver.write_text(
+        "param([string]$Guard, [string]$Lock, [string]$Mem, [string]$Table, [string]$Parent)\n"
+        "$makeParent = if ($Parent -eq 'yes') { 777 } else { 4 }\n"
+        "$rows = @(\n"
+        "    @{ ProcessId = $PID; ParentProcessId = $makeParent; Name = 'pwsh.exe'; CreationDate = '2026-10-13T20:00:00Z' },\n"
+        "    @{ ProcessId = 777; ParentProcessId = 4; Name = 'mingw32-make.exe'; CreationDate = '2026-10-13T20:00:00Z' }\n"
+        ")\n"
+        "ConvertTo-Json -InputObject $rows | Set-Content -LiteralPath $Table -Encoding ascii\n"
+        ". $Guard -Library\n"
+        "$opts = @{ LockPath = $Lock; MemoryProbeFile = $Mem; ProcessTableFile = $Table; PollSeconds = 0.2 }\n"
+        "Invoke-BuildGuard -Label 'ancestor-test' -NoSlot -Options $opts -Action { param($Jobs) Write-Output \"jobs=$Jobs\" }\n",
+        encoding="ascii",
+    )
+    done = _ps(
+        [
+            "-File", str(driver),
+            "-Guard", str(GUARD),
+            "-Lock", str(box["lock"]),
+            "-Mem", _write_json(box["dir"] / "memory.json", OK_MEMORY),
+            "-Table", str(box["dir"] / "table.json"),
+            "-Parent", "yes" if make_parent else "no",
+        ]
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert expected in done.stdout, done.stdout + done.stderr
+
+
 # --- quoting -----------------------------------------------------------------------------------
 
 
@@ -193,6 +281,45 @@ def test_command_mode_delivers_the_job_count_as_one_quoted_token(box) -> None:
 def test_command_mode_returns_the_childs_exit_code_and_releases_the_slot(box) -> None:
     done = _guard(box, OK_MEMORY, [], [], ["-Command", "cmd /c exit 9"])
     assert done.returncode == 9, done.stdout + done.stderr
+    assert not box["lock"].exists()
+
+
+@pytest.mark.parametrize(
+    "fragment, reason",
+    [
+        ("mingw32-make-BUILD_GUARD_MISSING_TEST -j{JOBS}", "CommandNotFoundException"),
+        ("Write-Error 'BUILD_FAILED'", "BUILD_FAILED"),
+        ("throw 'BUILD_THROWN'", "BUILD_THROWN"),
+    ],
+    ids=["missing-executable", "write-error", "throw"],
+)
+def test_command_mode_fails_when_the_fragment_fails_without_a_native_exit_code(box, fragment, reason) -> None:
+    # BG-01: none of these touch LASTEXITCODE, so the guard used to report a failed build as exit 0.
+    after = f"; Set-Content -LiteralPath '{box['marker']}' -Value ran -Encoding ascii"
+    probe = f"Set-Content -LiteralPath '{box['dir'] / 'held.txt'}' -Value $(Test-Path -LiteralPath '{box['lock']}'); "
+    done = _guard(box, OK_MEMORY, [], [], ["-Command", probe + fragment + after])
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "BUILD_GUARD_COMMAND_FAILED label=build" in done.stderr
+    assert reason in done.stderr
+    assert (box["dir"] / "held.txt").read_text(encoding="ascii").strip() == "True"
+    assert not box["marker"].exists(), "the fragment must stop at its first failure"
+    assert not box["lock"].exists(), "the slot must be released after a failed fragment"
+
+
+@pytest.mark.parametrize(
+    "fragment, code",
+    [
+        ("cmd /c exit 0", 0),
+        ("cmd /c exit 9", 9),
+        ("cmd /c \"echo warn 1>&2 & exit 0\" 2>&1", 0),
+        ("cmd /c \"echo warn 1>&2 & exit 9\" 2>&1", 9),
+    ],
+    ids=["native-0", "native-9", "native-0-stderr-merged", "native-9-stderr-merged"],
+)
+def test_command_mode_returns_native_exit_codes_unchanged(box, fragment, code) -> None:
+    done = _guard(box, OK_MEMORY, [], [], ["-Command", fragment])
+    assert done.returncode == code, done.stdout + done.stderr
+    assert "BUILD_GUARD_COMMAND_FAILED" not in done.stderr
     assert not box["lock"].exists()
 
 
@@ -268,6 +395,54 @@ def test_slot_is_held_while_building_and_gone_afterwards(box) -> None:
     assert done.returncode == 0, done.stdout + done.stderr
     assert "held=True" in done.stdout
     assert not box["lock"].exists()
+
+
+def test_release_leaves_a_successors_lock_alone(box) -> None:
+    # A successor reclaimed the slot while this build ran (for example after expiry): its lock must survive.
+    successor = json.dumps({"ownerPid": 1, "startTicks": 1, "expiresTicks": 1, "label": "successor"})
+    fragment = f"Set-Content -LiteralPath '{box['lock']}' -Value '{successor}' -Encoding ascii -NoNewline"
+    done = _guard(box, OK_MEMORY, [], [], ["-Command", fragment])
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert box["lock"].exists(), "release must never delete another owner's lock"
+    assert json.loads(box["lock"].read_text(encoding="ascii"))["label"] == "successor"
+
+
+def test_release_reads_and_deletes_the_lock_under_the_slot_mutex(box) -> None:
+    # BUILD-GUARD-RELEASE-RACE-1: while another process holds the slot mutex, release must wait, so a
+    # contender reclaiming under the mutex can never have its fresh lock deleted by our late release.
+    mutex = f"Local\\MLV-BuildGuardTest-{os.getpid()}-{time.time_ns()}"
+    go, ready, result = (box["dir"] / n for n in ("go.txt", "ready.txt", "result.txt"))
+    holder_script = box["dir"] / "holder.ps1"
+    holder_script.write_text(
+        "param([string]$Name, [string]$Lock, [string]$Go, [string]$Ready, [string]$Result)\n"
+        "$deadline = (Get-Date).AddSeconds(60)\n"
+        "while (-not (Test-Path -LiteralPath $Go)) { if ((Get-Date) -gt $deadline) { exit 5 }; Start-Sleep -Milliseconds 50 }\n"
+        "$m = [System.Threading.Mutex]::new($false, $Name)\n"
+        "if (-not $m.WaitOne(30000)) { exit 6 }\n"
+        "Set-Content -LiteralPath $Ready -Value ok -Encoding ascii\n"
+        "Start-Sleep -Milliseconds 1500\n"
+        "Set-Content -LiteralPath $Result -Value \"lockWhileHeld=$(Test-Path -LiteralPath $Lock)\" -Encoding ascii\n"
+        "$m.ReleaseMutex(); $m.Dispose()\n",
+        encoding="ascii",
+    )
+    holder = subprocess.Popen(
+        [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(holder_script),
+         "-Name", mutex, "-Lock", str(box["lock"]), "-Go", str(go), "-Ready", str(ready), "-Result", str(result)]
+    )
+    try:
+        fragment = (
+            f"Set-Content -LiteralPath '{go}' -Value go -Encoding ascii; $d = (Get-Date).AddSeconds(30); "
+            f"while (-not (Test-Path -LiteralPath '{ready}') -and (Get-Date) -lt $d) {{ Start-Sleep -Milliseconds 50 }}"
+        )
+        done = _guard(box, OK_MEMORY, [], ["-MutexName", mutex], ["-Command", fragment])
+        assert holder.wait(timeout=60) == 0
+    finally:
+        if holder.poll() is None:
+            holder.kill()
+            holder.wait()
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert result.read_text(encoding="ascii").strip() == "lockWhileHeld=True", "release ran outside the mutex"
+    assert not box["lock"].exists(), "release must still delete our own lock once the mutex is free"
 
 
 def test_stale_lock_with_a_dead_owner_is_reclaimed(box) -> None:
