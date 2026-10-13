@@ -605,14 +605,14 @@ TEST(PlaybackNativePaceWiring, EveryEngineAdvanceGoesThroughThePaceGuard)
     ASSERT_FALSE(handling.isEmpty());
     // every-frame mode holds unless a whole frame is owed, BEFORE it moves the slider
     const int whole = handling.indexOf(QStringLiteral(
-        "if( !m_playbackPaceGuard.grantWholeFrame( paceNowMs, getFramerate() ) ) return;"));
+        "if( !m_playbackPaceGuard.grantWholeFrame( paceNowMs, getPlaybackFramerate() ) ) return;"));
     const int normalAdvance = handling.indexOf(QStringLiteral(
         "ui->horizontalSliderPosition->setValue( ui->horizontalSliderPosition->value() + 1 );"));
     ASSERT_TRUE(whole >= 0);
     ASSERT_TRUE(normalAdvance > whole);
     // the loop wrap to cut-in (either mode) spends a whole frame BEFORE it is counted or moves the slider
     const int wrapGate = handling.indexOf(QStringLiteral(
-        "if( !m_playbackPaceGuard.grantLoopWrap( paceNowMs, getFramerate() ) ) return;"));
+        "if( !m_playbackPaceGuard.grantLoopWrap( paceNowMs, getPlaybackFramerate() ) ) return;"));
     const int wrapCounted = handling.indexOf(QStringLiteral("m_playbackWrapRecorder.noteEngineWrap();"));
     const int wrapMove = handling.indexOf(QStringLiteral("ui->horizontalSliderPosition->setValue( cutInFrame );"));
     const int loopBranch = handling.indexOf(QStringLiteral("if( ui->actionLoop->isChecked() )"));
@@ -623,15 +623,15 @@ TEST(PlaybackNativePaceWiring, EveryEngineAdvanceGoesThroughThePaceGuard)
     ASSERT_TRUE(handling.indexOf(QStringLiteral("const double paceNowMs = mlv_stage_timing_now() * 1000.0;")) < wrapGate);
     // drop-frame mode advances by the GRANTED share, never the raw fps x timeDiff
     ASSERT_TRUE(handling.contains(QStringLiteral(
-        "m_playbackPaceGuard.grant( getFramerate() * (double)timeDiff / 1000.0, paceNowMs, getFramerate() ),")));
-    ASSERT_FALSE(handling.contains(QStringLiteral("m_newPosDropMode, getFramerate() * (double)timeDiff / 1000.0,")));
+        "m_playbackPaceGuard.grant( getPlaybackFramerate() * (double)timeDiff / 1000.0, paceNowMs, getPlaybackFramerate() ),")));
+    ASSERT_FALSE(handling.contains(QStringLiteral("m_newPosDropMode, getPlaybackFramerate() * (double)timeDiff / 1000.0,")));
     ASSERT_TRUE(handling.contains(QStringLiteral("const double paceNowMs = mlv_stage_timing_now() * 1000.0;")));
     ASSERT_TRUE(handling.contains(QStringLiteral("m_playbackPaceGuard.reset();"))); // paused: re-arm at next Play
 
     const QString timer = bodyBetween(source, QStringLiteral("void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )"),
                                       QStringLiteral("void MainWindow::timerEvent(QTimerEvent *t)"));
     ASSERT_FALSE(timer.isEmpty());
-    ASSERT_TRUE(timer.contains(QStringLiteral("playback_native_pace::shapedTickTimeDiffMs( timeDiff, getFramerate(), predictivePlaybackAdvance,")));
+    ASSERT_TRUE(timer.contains(QStringLiteral("playback_native_pace::shapedTickTimeDiffMs( timeDiff, getPlaybackFramerate(), predictivePlaybackAdvance,")));
     ASSERT_FALSE(timer.contains(QStringLiteral("timeDiff = targetFrameMsCeil;"))); // the shaping lives in one place
 
     const QString toggled = bodyBetween(source, QStringLiteral("void MainWindow::on_actionPlay_toggled(bool checked)"),

@@ -98,6 +98,10 @@ LOOKAHEAD_LEGS = ("legs/m16-1243-pace-cinematic-fullscreen-s4-la3.json",)
 # ... and (r2) the stall-stage diagnostic: the owner-shape pace leg at telemetryArm HEAVY, which keeps the per-frame playback_smoke.frame log
 # (LIGHT disables it), so the present that ends a >= 250 ms interval shows its own stage times. Diagnostic only: never a pace number.
 HEAVY_LEGS = ("legs/m16-1243-pace-cinematic-fullscreen-s4-heavy.json",)
+# PLAYBACK-HFR-CONFORM-DEFAULT-1 added the conform legs on the 59.94 fps clip: the scale-1 display cells, cuda only (legsets/hfr-conform.json names them).
+HFR_CONFORM_LEGS = tuple(f"legs/m16-1456-conform-{mode}-s1.json" for mode in ("windowed", "fullscreen"))
+# ... and (PRODUCT-PR-STRANDED-SWEEP-1 r1g) the same two cells on M16-1457, the longer 59.94 fps clip (27.8 s) that meets max(20 s, 25 s window).
+HFR_CONFORM_LEGS_1457 = tuple(f"legs/m16-1457-conform-{mode}-s1.json" for mode in ("windowed", "fullscreen"))
 # CPU-DUALISO-REDUCED-ISO-NOTCH-1: cpu-only cinematic look legs at playbackProcessing receipt, the only legs that reach the CPU reduced dual-ISO recon.
 CPU_REDUCED_LEGS = tuple(f"legs/m16-1243-cpu-reduced-{mode}-s{scale}.json" for scale in (2, 4) for mode in ("fullscreen", "windowed"))
 # PLAYBACK-LJ92-DECODE-THROUGHPUT-1: the K=1 arm of the raw-uint16 prefetch decoder A/B, one twin per leg it pairs with (the other arm is the leg
@@ -109,7 +113,7 @@ SHIPPED_LEGS = ("legs/m16-1243-speed.json", "legs/m16-1243-look.json", "legs/m16
                 *LOOKAHEAD_LEGS, *HEAVY_LEGS, *DECODER_LEGS, "legs/m16-1243-look-scale2-cinematic.json", "legs/m16-1243-look-film.json",
                 "legs/m16-1243-look-scale2-film.json", *(f"legs/m16-1243-look-scale2-{flavor}-agxoff.json" for flavor in ("cinematic", "film")),
                 *(f"legs/m16-1243-display-{mode}-s{scale}-vsync1.json" for scale in (1, 2, 4) for mode in ("fullscreen", "windowed")),
-                *CPU_REDUCED_LEGS)
+                *HFR_CONFORM_LEGS, *HFR_CONFORM_LEGS_1457, *CPU_REDUCED_LEGS)
 # PLAYBACK-VSYNC-DEFAULT-1: the swap-interval-1 twins of the six display-matrix legs (the vsync A/B; the originals stay at the app's default 0).
 VSYNC1_LEGS = tuple(rel.replace(".json", "-vsync1.json") for rel in DISPLAY_MATRIX_LEGS)
 # LOOK-ASSIST-FILM-FLAVOR-2 r2: the AgX-off twins of the scale-2 Cinematic and Film legs carry a committed look receipt (look-receipts/agx-off.marxml).
@@ -5415,6 +5419,23 @@ class LegSpecSchemaTests(unittest.TestCase):
             base["generatorArgs"].pop("telemetryArm")
             self.assertEqual(dict(arm, legId=base["legId"]), base, rel)
 
+    def test_each_hfr_conform_leg_is_its_display_cell_on_the_hfr_clip_on_cuda(self) -> None:
+        """PLAYBACK-HFR-CONFORM-DEFAULT-1: a conform leg is its scale-1 display-matrix cell with only the legId, card, clip and backends (cuda) changed, so its
+        numbers compare with the matrix cell's; the leg set names exactly these legs and the card's roles are declared."""
+        for rel in (*HFR_CONFORM_LEGS, *HFR_CONFORM_LEGS_1457):
+            leg = json.loads((DV / rel).read_text(encoding="utf-8"))
+            self.jsonschema.validate(leg, self.schema)
+            cell = json.loads((DV / "legs" / f"m16-1243-display-{leg['displayMode']}-s1.json").read_text(encoding="utf-8"))
+            self.assertEqual((leg["legId"], leg["card"], leg["clipId"], leg["backends"]),
+                             (Path(rel).stem, "PLAYBACK-HFR-CONFORM-DEFAULT-1", "M16-" + Path(rel).stem[4:8], ["cuda"]), rel)
+            cell_cuda = dict(cell, criteria={role: {"cuda": per["cuda"]} for role, per in cell["criteria"].items()})
+            self.assertEqual(dict(leg, legId=cell["legId"], card=cell["card"], clipId=cell["clipId"], backends=cell["backends"]), cell_cuda, rel)
+        for name, clip, legs in (("hfr-conform", "M16-1456", HFR_CONFORM_LEGS), ("hfr-conform-m16-1457", "M16-1457", HFR_CONFORM_LEGS_1457)):
+            doc = json.loads((DV / "legsets" / f"{name}.json").read_text(encoding="utf-8"))
+            self.assertEqual((doc["legSet"], doc["card"], doc["clipId"], sorted(doc["legs"])), (name, "PLAYBACK-HFR-CONFORM-DEFAULT-1", clip, sorted(legs)))
+        roles = json.loads((DV / "venues.json").read_text(encoding="utf-8"))["roles"]
+        self.assertEqual(roles["PLAYBACK-HFR-CONFORM-DEFAULT-1"], {"bachelor": "acceptance", "ultra-magnus": "supplementary"})
+
     def test_the_decoder_legs_are_their_twins_at_one_raw_prefetch_decoder(self) -> None:
         """PLAYBACK-LJ92-DECODE-THROUGHPUT-1: the K=1 arm differs from the leg it pairs with only in its legId and generatorArgs.rawPrefetchDecoders 1."""
         for rel, twin_rel in DECODER_LEGS.items():
@@ -5453,6 +5474,9 @@ class LegSpecSchemaTests(unittest.TestCase):
             elif spec["card"] == "PLAYBACK-BACHELOR-PRESENT-JITTER-1":   # the capture-free pace legs, named by flavor and cell
                 self.assertEqual(spec["legId"], path.stem, path.name)
                 self.assertRegex(spec["legId"], rf"^m16-1243-pace-{flavor}-(fullscreen|windowed)-s[124](-la[0-3]|-heavy)?(-dec[0-4])?$", path.name)
+            elif spec["card"] == "PLAYBACK-HFR-CONFORM-DEFAULT-1":   # the HFR conform legs: a scale-1 display cell on the 59.94 fps clip
+                self.assertEqual(spec["legId"], path.stem, path.name)
+                self.assertRegex(spec["legId"], r"^m16-145[67]-conform-(fullscreen|windowed)-s1$", path.name)
             elif spec["card"] == "CPU-DUALISO-REDUCED-ISO-NOTCH-1":   # the cpu-only legs that engage the CPU reduced recon, named by their cell
                 self.assertEqual(spec["legId"], path.stem, path.name)
                 self.assertRegex(spec["legId"], r"^m16-1243-cpu-reduced-(fullscreen|windowed)-s[24]$", path.name)

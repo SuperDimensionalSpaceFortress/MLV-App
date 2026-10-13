@@ -1,0 +1,11 @@
+{
+  "schema": "mlv-app/dual-venue-legset/v1",
+  "legSet": "hfr-conform",
+  "card": "PLAYBACK-HFR-CONFORM-DEFAULT-1",
+  "clipId": "M16-1456",
+  "description": "PLAYBACK-HFR-CONFORM-DEFAULT-1: the high-frame-rate conform leg on the consented 59.94 fps clip (by id only), windowed AND full screen, on cuda, scale 1, Look Assist Cinematic: each is its display-matrix cell with the clip changed. The app's playback_smoke.conform line carries the acceptance inputs (conform_active, playback_fps, source_fps, max_jump, audio_sync_requests).",
+  "legs": [
+    "legs/m16-1456-conform-windowed-s1.json",
+    "legs/m16-1456-conform-fullscreen-s1.json"
+  ]
+}
