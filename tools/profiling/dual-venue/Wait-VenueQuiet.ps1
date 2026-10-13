@@ -161,14 +161,18 @@ function Write-Gate([string]$Line) {
 
 # One directory count, or $null when the directory cannot be read: an unreachable share is NOT an empty queue. The inbox must exist; running\ may
 # legitimately be absent while the share itself is readable (nothing has run), so only a read error on an existing running\ is unreadable.
-function Get-GateCount([string]$Dir, [string]$Filter, [bool]$MustExist) {
+# VENUE-QUIET-SETASIDE-RECORD-1: -ExcludePattern drops names the agent has already RESOLVED. The agent sets a superseded marker tmp aside IN running\ as
+# '<name>.stale-<ticks>' or '<name>.corrupt-<ticks>' and never lists it again (ultra-magnus-agent.ps1 Get-MarkerTempFiles), so it is not a running job.
+# Counting it held the gate at running=1 for every lane after the job had ended (2026-10-13 23:00Z). A live '<id>.started.json' and an unresolved tmp still count.
+$setAsideRecordPattern = '\.(stale|corrupt)-\d+$'
+function Get-GateCount([string]$Dir, [string]$Filter, [bool]$MustExist, [string]$ExcludePattern = '') {
     if (-not (Test-Path -LiteralPath $Dir -PathType Container)) {
         if ($MustExist -or -not (Test-Path -LiteralPath $agentShare -PathType Container)) { return $null }
         return 0
     }
     try {
         if ($Filter) { return @(Get-ChildItem -LiteralPath $Dir -Filter $Filter -ErrorAction Stop).Count }
-        return @(Get-ChildItem -LiteralPath $Dir -ErrorAction Stop).Count
+        return @(Get-ChildItem -LiteralPath $Dir -ErrorAction Stop | Where-Object { -not $ExcludePattern -or $_.Name -notmatch $ExcludePattern }).Count
     } catch { return $null }
 }
 
@@ -185,7 +189,7 @@ $gateEnd = $t0.AddSeconds([Math]::Min($MaxGateSec, $MaxWaitSec))
 function Read-GateCounts([string]$Name) {
     for ($attempt = 1; $true; $attempt++) {
         $script:GateQueued = Get-GateCount "$agentShare\inbox" '*.job.ps1' $true
-        $script:GateRunning = Get-GateCount "$agentShare\running" '' $false
+        $script:GateRunning = Get-GateCount "$agentShare\running" '' $false $setAsideRecordPattern
         if (($null -ne $script:GateQueued -and $null -ne $script:GateRunning) -or $attempt -ge $ReadAttempts) { return }
         $delay = $ReadBackoffSec * $attempt
         if ((Get-Date).AddSeconds($delay) -gt $deadline) { return }   # no time left for another try: report what is known

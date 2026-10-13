@@ -4836,6 +4836,54 @@ class VenueQuietUnknownIsNotUnmetTests(unittest.TestCase):
         self.assertNotIn("VENUE_QUIET_UNKNOWN", proc.stdout)
 
 
+# VENUE-QUIET-SETASIDE-RECORD-1: the agent sets a superseded marker tmp aside IN running\ as '<name>.stale-<ticks>' / '<name>.corrupt-<ticks>' and treats it as resolved
+# (ultra-magnus-agent.ps1 Get-MarkerTempFiles). The gate counted it as a running job, so one such record held Bachelor at running=1 for every lane after its job had
+# ended (2026-10-13 23:00Z). A set-aside record is not counted; a live final marker and an unresolved tmp still are.
+@requires_windows_pwsh
+class VenueQuietSetAsideRecordTests(unittest.TestCase):
+    BUSY_EXIT = 3
+    TMP = "dve-x-bachelor-cuda-20261013225031.started.json.d49877b02a3243aa941ee56642f74291.tmp"
+    setUp = VenueQuietUnknownIsNotUnmetTests.setUp
+    gate = VenueQuietUnknownIsNotUnmetTests.gate
+
+    def busy_gate(self) -> subprocess.CompletedProcess:
+        import os
+        (self.tree / "tools" / "profiling" / "um-run.ps1").write_text(STUB_UM_RUN_FOR_QUIET, encoding="utf-8")
+        return subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(self.dv / "Wait-VenueQuiet.ps1"), "-Venue", "bachelor",
+                               "-WorkDir", str(self.work), "-MaxWaitSec", "1", "-RecheckSec", "1", "-MaxGateSec", "1", "-GatePollSec", "1"],
+                              capture_output=True, text=True, timeout=180, env=dict(os.environ, UMSTUB_MODE="samples", UMSTUB_SAMPLES="[5, 5, 5]"))
+
+    def running(self, name: str) -> None:
+        share = Path(json.loads((self.dv / "venues.json").read_text(encoding="utf-8"))["venues"]["bachelor"]["agentShare"])
+        (share / "running" / name).write_text("{}", encoding="utf-8")
+
+    def test_a_stale_set_aside_record_is_not_a_running_job(self) -> None:
+        self.running(self.TMP + ".stale-639275292076772648")
+        proc = self.gate("samples", "[5, 5, 5]")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertRegex(proc.stdout, r"(?m)^GATE quiet-probe bachelor queued=0 running=0 ")
+        self.assertRegex(proc.stdout, r"(?m)^QUIET mean=5\.0% ")
+
+    def test_a_corrupt_set_aside_record_is_not_a_running_job(self) -> None:
+        self.running(self.TMP + ".corrupt-639275292076772648")
+        proc = self.gate("samples", "[5, 5, 5]")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertRegex(proc.stdout, r"(?m)^GATE quiet-probe bachelor queued=0 running=0 ")
+
+    def test_a_live_final_marker_still_holds_the_gate(self) -> None:
+        self.running("dve-x-bachelor-cuda-20261013225031.started.json")
+        self.running(self.TMP + ".stale-639275292076772648")
+        proc = self.busy_gate()
+        self.assertEqual(proc.returncode, self.BUSY_EXIT, proc.stdout + proc.stderr)
+        self.assertRegex(proc.stdout, r"(?m)^GATE quiet-probe bachelor queued=0 running=1 ")
+
+    def test_an_unresolved_marker_tmp_still_holds_the_gate(self) -> None:
+        self.running(self.TMP)
+        proc = self.busy_gate()
+        self.assertEqual(proc.returncode, self.BUSY_EXIT, proc.stdout + proc.stderr)
+        self.assertRegex(proc.stdout, r"(?m)^GATE quiet-probe bachelor queued=0 running=1 ")
+
+
 # ---------------------------------------------------------------------------------------------------
 # VENUE-QUIET-ATTRIBUTION-1: the probe job reports schema v2 -- the v1 fields plus WHAT is using the venue (top 10 \Process(*) instances as percent of the whole machine,
 # Process _Total / Idle / System, privileged / user / DPC / interrupt time, per-core load with P- and E-cores apart). The gate PRINTS the attribution after its verdict and
