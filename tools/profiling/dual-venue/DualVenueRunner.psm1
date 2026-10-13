@@ -1309,6 +1309,286 @@ function Read-DvContactFrames {
     & $done
 }
 
+# --- PLAYBACK-VISUAL-INSPECTION-1: the window captures every speed leg keeps --------------------------------------------------------------
+# The app (--visual-capture-dir) captures the WINDOW with PrintWindow AFTER the measured session has closed: 6 frames across ~3 s of untimed
+# play, the frame on screen the instant Play is paused ('stop'), and that frame re-rendered by the paused full-quality path ('paused'). The
+# runner copies them into the leg's evidence, hashes them, and derives two numbers from the VIDEO VIEWPORT only (the window's timecode and
+# fps chrome change on a frozen picture too): how many distinct pictures the play frames show, and how far the playback-path frame is from
+# its paused full-quality re-render. Both are computed here, from the copied files, so they re-derive from the evidence.
+$script:VisualSchema = 'mlv-app/dual-venue-visual/v1'
+# Per-channel mean absolute difference (0..255, viewport downscaled to 160x90) above which a leg is flagged VISUAL_DIVERGENCE. Calibrated on a
+# known-good leg (PLAYBACK-VISUAL-INSPECTION-1 r1, docs/dual-venue-evidence.md "Window captures"): the measured value there, with headroom.
+$script:VisualDivergenceThreshold = 12.0
+# A viewport whose pixel standard deviation is under this is flat (all black, all one colour): a blank capture, which says nothing about the display.
+$script:VisualFlatViewportStd = 1.0
+$script:VisualHashSize = @(64, 36)
+$script:VisualDiffSize = @(160, 90)
+
+function Get-DvVisualCaptureRequest {
+    <#
+    .SYNOPSIS
+    Does this leg keep window captures? Every SPEED leg does (an absent visualCapture means on) unless its spec says visualCapture false
+    WITH a visualCaptureOptOutReason; a look leg never runs this capture (applies = false: its contact sheet is the look). An opt-out
+    without a reason, or a reason without the opt-out, is a malformed spec: DVE_LEG_SPEC_INVALID.
+    #>
+    param([Parameter(Mandatory)]$Spec)
+    $applies = ([string](Get-DvProp $Spec 'legType') -cne 'look')
+    $flag = $Spec.PSObject.Properties['visualCapture']
+    $reason = $Spec.PSObject.Properties['visualCaptureOptOutReason']
+    if ($null -ne $flag -and $flag.Value -isnot [bool]) { throw 'DVE_LEG_SPEC_INVALID visualCapture must be a boolean' }
+    if ($null -ne $flag -and -not $flag.Value) {
+        if ($null -eq $reason -or [string]::IsNullOrWhiteSpace([string]$reason.Value)) { throw 'DVE_LEG_SPEC_INVALID visualCapture false needs a visualCaptureOptOutReason' }
+        return [pscustomobject]@{ applies = $applies; requested = $false; optOutReason = [string]$reason.Value }
+    }
+    if ($null -ne $reason) { throw 'DVE_LEG_SPEC_INVALID visualCaptureOptOutReason is only for visualCapture false' }
+    [pscustomobject]@{ applies = $applies; requested = $applies; optOutReason = $null }
+}
+
+function ConvertTo-DvVisualUtcText($Value) {
+    # ConvertFrom-Json turns an ISO date string into a DateTime on some pwsh versions and leaves it a string on others: one round-trip UTC text either way.
+    if ($null -eq $Value -or [string]::IsNullOrWhiteSpace([string]$Value)) { return $null }
+    if ($Value -is [datetime]) { return $(if ($Value.Kind -eq [DateTimeKind]::Local) { $Value.ToUniversalTime() } else { [datetime]::SpecifyKind($Value, [DateTimeKind]::Utc) }).ToString('o') }
+    try { return [datetime]::Parse([string]$Value, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime().ToString('o') } catch { return [string]$Value }
+}
+
+function Get-DvVisualViewportPixels {
+    <#
+    .SYNOPSIS
+    The video viewport of one captured window PNG, downscaled (high-quality bilinear) to -Width x -Height, as packed RGB bytes, plus their sha256
+    (the frame's CONTENT hash: equal pictures hash equal whatever the chrome around them shows) and the pixel mean / standard deviation. The
+    viewport rectangle is the app's own (visual.json, in the saved image's pixels); absent or empty, the whole image is used.
+    #>
+    param([Parameter(Mandatory)][string]$Path, $Viewport, [int]$Width = 64, [int]$Height = 36)
+    Add-Type -AssemblyName System.Drawing
+    $src = [System.Drawing.Bitmap]::new($Path)
+    try {
+        $rect = [System.Drawing.Rectangle]::new(0, 0, $src.Width, $src.Height)
+        if ($null -ne $Viewport) {
+            $vx = [int](Get-DvProp $Viewport 'x'); $vy = [int](Get-DvProp $Viewport 'y'); $vw = [int](Get-DvProp $Viewport 'w'); $vh = [int](Get-DvProp $Viewport 'h')
+            if ($vw -gt 0 -and $vh -gt 0) { $rect = [System.Drawing.Rectangle]::Intersect($rect, [System.Drawing.Rectangle]::new($vx, $vy, $vw, $vh)) }
+        }
+        if ($rect.Width -le 0 -or $rect.Height -le 0) { $rect = [System.Drawing.Rectangle]::new(0, 0, $src.Width, $src.Height) }
+        # The viewport is CLONED out first and scaled with edge mirroring: a filtered scale of a sub-rectangle reads the pixels just outside it,
+        # which are the window chrome -- and the chrome (timecode, fps) changes over a frozen picture.
+        $crop = $src.Clone($rect, [System.Drawing.Imaging.PixelFormat]::Format24bppRgb)
+        $small = [System.Drawing.Bitmap]::new($Width, $Height, [System.Drawing.Imaging.PixelFormat]::Format24bppRgb)
+        $attrs = [System.Drawing.Imaging.ImageAttributes]::new()
+        try {
+            $attrs.SetWrapMode([System.Drawing.Drawing2D.WrapMode]::TileFlipXY)
+            $g = [System.Drawing.Graphics]::FromImage($small)
+            try {
+                $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBilinear
+                $g.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::Half
+                $g.DrawImage($crop, [System.Drawing.Rectangle]::new(0, 0, $Width, $Height), 0, 0, $crop.Width, $crop.Height, [System.Drawing.GraphicsUnit]::Pixel, $attrs)
+            } finally { $g.Dispose() }
+            $data = $small.LockBits([System.Drawing.Rectangle]::new(0, 0, $Width, $Height), [System.Drawing.Imaging.ImageLockMode]::ReadOnly, [System.Drawing.Imaging.PixelFormat]::Format24bppRgb)
+            try {
+                $raw = [byte[]]::new($data.Stride * $Height)
+                [System.Runtime.InteropServices.Marshal]::Copy($data.Scan0, $raw, 0, $raw.Length)
+                $stride = $data.Stride
+            } finally { $small.UnlockBits($data) }
+        } finally { $small.Dispose(); $crop.Dispose(); $attrs.Dispose() }
+    } finally { $src.Dispose() }
+    # Packed R,G,B (GDI rows are B,G,R and padded to a 4-byte stride).
+    $rgb = [byte[]]::new($Width * $Height * 3)
+    $sum = 0.0; $sumSq = 0.0
+    for ($y = 0; $y -lt $Height; $y++) {
+        for ($x = 0; $x -lt $Width; $x++) {
+            $s = $y * $stride + $x * 3; $d = ($y * $Width + $x) * 3
+            $rgb[$d] = $raw[$s + 2]; $rgb[$d + 1] = $raw[$s + 1]; $rgb[$d + 2] = $raw[$s]
+        }
+    }
+    foreach ($v in $rgb) { $sum += $v; $sumSq += [double]$v * $v }
+    $n = $rgb.Length
+    $mean = $sum / $n
+    [pscustomobject]@{ rgb = $rgb; contentHash = (Get-DvSha256OfBytes $rgb); mean = [math]::Round($mean, 3); std = [math]::Round([math]::Sqrt([math]::Max(0.0, $sumSq / $n - $mean * $mean)), 3) }
+}
+
+function Get-DvVisualMeanAbsDiff {
+    <# Per-channel (R, G, B) mean absolute difference of two equally sized packed-RGB pixel arrays, on the 0..255 scale. #>
+    param([Parameter(Mandatory)][byte[]]$A, [Parameter(Mandatory)][byte[]]$B)
+    if ($A.Length -ne $B.Length -or $A.Length % 3 -ne 0 -or $A.Length -eq 0) { throw 'DVE_VISUAL_DIFF_SHAPE the two pixel arrays differ in size' }
+    $sums = [double[]]::new(3)
+    for ($i = 0; $i -lt $A.Length; $i++) { $sums[$i % 3] += [math]::Abs([int]$A[$i] - [int]$B[$i]) }
+    $px = $A.Length / 3
+    @([math]::Round($sums[0] / $px, 3), [math]::Round($sums[1] / $px, 3), [math]::Round($sums[2] / $px, 3))
+}
+
+function Get-DvVisualVerdict {
+    <#
+    .SYNOPSIS
+    The visual gate, from numbers only (pure). FROZEN_DISPLAY: every play frame shows ONE picture while the app says it presented more than
+    one frame across them -- the measured trap where every cadence metric reads perfect over a frozen display; such a leg is NOT counted.
+    VISUAL_DIVERGENCE: the playback-path frame is further than the threshold from its paused full-quality re-render; counted for speed and
+    surfaced. CAPTURE_BLANK: every play frame's viewport is flat (a blank capture judges nothing). NOT_CAPTURED / NOT_REQUESTED: no captures.
+    #>
+    param([bool]$Requested, [bool]$Captured, [int]$PlayFrames, [int]$DistinctContentHashes, [int]$AppDistinctDisplayFrames, [int]$FlatPlayFrames,
+          $PlayVsPausedMeanAbsDiff, [bool]$SamePosition, [double]$Threshold = $script:VisualDivergenceThreshold)
+    if (-not $Requested) { return [pscustomobject]@{ verdict = 'NOT_REQUESTED'; counted = $true; reason = 'the leg spec opts out of window captures' } }
+    if (-not $Captured -or $PlayFrames -lt 2) { return [pscustomobject]@{ verdict = 'NOT_CAPTURED'; counted = $true; reason = "only $PlayFrames play frame(s) were captured" } }
+    if ($FlatPlayFrames -ge $PlayFrames) { return [pscustomobject]@{ verdict = 'CAPTURE_BLANK'; counted = $true; reason = 'every play frame''s viewport is flat: the capture shows no picture, so it judges nothing' } }
+    if ($DistinctContentHashes -eq 1 -and $AppDistinctDisplayFrames -gt 1) {
+        return [pscustomobject]@{ verdict = 'FROZEN_DISPLAY'; counted = $false; reason = "the $PlayFrames play frames show ONE picture while the app presented $AppDistinctDisplayFrames distinct frames across them" }
+    }
+    if ($SamePosition -and $null -ne $PlayVsPausedMeanAbsDiff -and [double]$PlayVsPausedMeanAbsDiff -gt $Threshold) {
+        return [pscustomobject]@{ verdict = 'VISUAL_DIVERGENCE'; counted = $true; reason = "the playback-path frame is $PlayVsPausedMeanAbsDiff (per-channel mean absolute difference, 0..255) from its paused full-quality re-render; the threshold is $Threshold" }
+    }
+    [pscustomobject]@{ verdict = 'OK'; counted = $true; reason = $null }
+}
+
+function New-DvVisualStrip {
+    <#
+    .SYNOPSIS
+    One contact strip: the play frames in a row, then the paused-instant frame and its paused full-quality re-render, each tile the frame's
+    video viewport, labelled with its kind and the frame the app says it showed; a header names the leg and the verdict. Returns the path.
+    #>
+    param([Parameter(Mandatory)][object[]]$Tiles, [Parameter(Mandatory)][string]$OutPath, [string]$Header = '', [int]$TileWidth = 480)
+    Add-Type -AssemblyName System.Drawing
+    $tileHeight = [int][math]::Round($TileWidth * 9 / 16)
+    $labelHeight = 26; $headerHeight = 34
+    $width = $TileWidth * [math]::Max(1, $Tiles.Count)
+    $strip = [System.Drawing.Bitmap]::new($width, $headerHeight + $labelHeight + $tileHeight, [System.Drawing.Imaging.PixelFormat]::Format24bppRgb)
+    try {
+        $g = [System.Drawing.Graphics]::FromImage($strip)
+        $font = [System.Drawing.Font]::new('Arial', 12)
+        $headFont = [System.Drawing.Font]::new('Arial', 14, [System.Drawing.FontStyle]::Bold)
+        try {
+            $g.Clear([System.Drawing.Color]::FromArgb(24, 24, 24))
+            $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+            $g.DrawString($Header, $headFont, [System.Drawing.Brushes]::White, 8, 7)
+            for ($i = 0; $i -lt $Tiles.Count; $i++) {
+                $t = $Tiles[$i]
+                $x = $i * $TileWidth
+                $g.DrawString([string]$t.label, $font, [System.Drawing.Brushes]::Gainsboro, $x + 6, $headerHeight + 4)
+                $dest = [System.Drawing.Rectangle]::new($x + 2, $headerHeight + $labelHeight, $TileWidth - 4, $tileHeight - 2)
+                if ($t.path -and (Test-Path -LiteralPath $t.path -PathType Leaf)) {
+                    $img = [System.Drawing.Bitmap]::new([string]$t.path)
+                    try {
+                        $rect = [System.Drawing.Rectangle]::new(0, 0, $img.Width, $img.Height)
+                        $vp = $t.viewport
+                        if ($null -ne $vp -and [int](Get-DvProp $vp 'w') -gt 0 -and [int](Get-DvProp $vp 'h') -gt 0) {
+                            $rect = [System.Drawing.Rectangle]::Intersect($rect, [System.Drawing.Rectangle]::new([int](Get-DvProp $vp 'x'), [int](Get-DvProp $vp 'y'), [int](Get-DvProp $vp 'w'), [int](Get-DvProp $vp 'h')))
+                        }
+                        # letterbox the viewport into the tile, aspect kept
+                        $scale = [math]::Min($dest.Width / [double]$rect.Width, $dest.Height / [double]$rect.Height)
+                        $dw = [int]($rect.Width * $scale); $dh = [int]($rect.Height * $scale)
+                        $fit = [System.Drawing.Rectangle]::new($dest.X + [int](($dest.Width - $dw) / 2), $dest.Y + [int](($dest.Height - $dh) / 2), $dw, $dh)
+                        $g.DrawImage($img, $fit, $rect, [System.Drawing.GraphicsUnit]::Pixel)
+                    } finally { $img.Dispose() }
+                } else {
+                    $g.DrawString('not captured', $font, [System.Drawing.Brushes]::OrangeRed, $x + 6, $headerHeight + $labelHeight + 6)
+                }
+            }
+        } finally { $font.Dispose(); $headFont.Dispose(); $g.Dispose() }
+        $strip.Save($OutPath, [System.Drawing.Imaging.ImageFormat]::Png)
+    } finally { $strip.Dispose() }
+    $OutPath
+}
+
+function Read-DvVisualCaptures {
+    <#
+    .SYNOPSIS
+    The receipt's `visual` block for one leg. Copies the published captures (<artifacts>\visual) into <evidence>\visual under the leg's names
+    (<legId>-play-<k>.png, <legId>-stop.png, <legId>-paused.png; the app's visual.json and the job's request record beside them), hashes every
+    file, derives the content hashes and the play-vs-paused difference from the copies, composes <legId>-strip.png, and applies the gate.
+    Never throws for a missing or broken capture: the block says what is missing (a capture is evidence about the leg, not the leg itself).
+    #>
+    param([bool]$Requested, [string]$OptOutReason, [string]$ArtifactsDir, [string]$EvidenceDir, [Parameter(Mandatory)][string]$LegId, [string]$Header = '')
+    $block = [ordered]@{
+        schema = $script:VisualSchema; requested = $Requested; optOutReason = $(if ($Requested) { $null } else { $OptOutReason })
+        method = $null; forwarded = $null; probe = $null; probeReason = $null; captured = $false
+        frames = @(); playFrames = 0; distinctContentHashes = 0; appDistinctDisplayFrames = 0; flatPlayFrames = 0
+        stopFrame = $null; pausedSettled = $null; pausedFrame = $null; samePosition = $false
+        playVsPausedMeanAbsDiff = $null; playVsPausedMeanAbsDiffPerChannel = $null; divergenceThreshold = $script:VisualDivergenceThreshold
+        tailBeginUtc = $null; tailEndUtc = $null; presentMonWindowEndUtc = $null
+        stripPath = $null; stripSha256 = $null; stripCopyPath = $null
+        verdict = $null; counted = $true; reason = $null; appError = $null
+    }
+    $finish = {
+        $v = Get-DvVisualVerdict -Requested $Requested -Captured ([bool]$block.captured) -PlayFrames ([int]$block.playFrames) -DistinctContentHashes ([int]$block.distinctContentHashes) `
+            -AppDistinctDisplayFrames ([int]$block.appDistinctDisplayFrames) -FlatPlayFrames ([int]$block.flatPlayFrames) -PlayVsPausedMeanAbsDiff $block.playVsPausedMeanAbsDiff -SamePosition ([bool]$block.samePosition)
+        # a gate reason replaces a step's reason, except that a NOT_CAPTURED leg keeps the step that says WHY nothing was captured
+        if ($null -ne $v.reason -and -not ($v.verdict -ceq 'NOT_CAPTURED' -and $null -ne $block.reason)) { $block.reason = $v.reason }
+        $block.verdict = $v.verdict; $block.counted = $v.counted
+        $block
+    }
+    if (-not $Requested) { return (& $finish) }
+    $share = $(if ($ArtifactsDir) { Join-Path $ArtifactsDir 'visual' } else { $null })
+    if (-not $share -or -not (Test-Path -LiteralPath $share -PathType Container)) { $block.reason = 'the job published no visual directory'; return (& $finish) }
+    $dir = Join-Path $EvidenceDir 'visual'
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $requestPath = Join-Path $share 'visual-capture-request.json'
+    if (Test-Path -LiteralPath $requestPath -PathType Leaf) {
+        Copy-Item -LiteralPath $requestPath -Destination (Join-Path $dir 'request.json') -Force
+        try {
+            $request = [IO.File]::ReadAllText((Join-Path $dir 'request.json')) | ConvertFrom-Json -ErrorAction Stop
+            $block.forwarded = [bool](Get-DvProp $request 'forwarded'); $block.probe = [string](Get-DvProp $request 'probe'); $block.probeReason = Get-DvProp $request 'reason'
+            $block.presentMonWindowEndUtc = ConvertTo-DvVisualUtcText (Get-DvProp $request 'presentMonWindowEndUtc')
+        } catch { $block.reason = 'the job''s visual-capture request record is not valid JSON' }
+    }
+    $appJsonShare = Join-Path $share 'visual.json'
+    if (-not (Test-Path -LiteralPath $appJsonShare -PathType Leaf)) {
+        if (-not $block.reason) { $block.reason = $(if ($block.forwarded -eq $false) { "the capture was not forwarded to the app (probe $($block.probe): $($block.probeReason))" } else { 'the app wrote no visual.json' }) }
+        return (& $finish)
+    }
+    Copy-Item -LiteralPath $appJsonShare -Destination (Join-Path $dir 'app-visual.json') -Force
+    try { $app = [IO.File]::ReadAllText((Join-Path $dir 'app-visual.json')) | ConvertFrom-Json -ErrorAction Stop } catch { $block.reason = 'the app''s visual.json is not valid JSON'; return (& $finish) }
+    $block.method = [string](Get-DvProp $app 'method'); $block.appError = [string](Get-DvProp $app 'error')
+    $block.tailBeginUtc = ConvertTo-DvVisualUtcText (Get-DvProp $app 'tail_begin_utc'); $block.tailEndUtc = ConvertTo-DvVisualUtcText (Get-DvProp $app 'tail_end_utc')
+    $frames = [System.Collections.Generic.List[object]]::new()
+    $pixels = @{}
+    $appFrames = Get-DvProp $app 'frames'   # (assigned, then @()-wrapped: see Read-DvContactFrames)
+    foreach ($f in @($appFrames)) {
+        if ($null -eq $f) { continue }
+        $kind = [string](Get-DvProp $f 'kind'); $index = [int](Get-DvProp $f 'index'); $file = [string](Get-DvProp $f 'file')
+        if ($kind -cnotin @('play', 'stop', 'paused') -or $file -cnotmatch '^(play-\d+|stop|paused)\.png$') { continue }
+        $legName = $(if ($kind -ceq 'play') { "$LegId-play-$index.png" } else { "$LegId-$kind.png" })
+        $entry = [ordered]@{ kind = $kind; index = $index; file = $legName; sha256 = $null; contentHash = $null; viewportMean = $null; viewportStd = $null
+                             displayFrame = Get-DvProp $f 'display_frame'; playActive = Get-DvProp $f 'play_active'; tailElapsedMs = Get-DvProp $f 'tail_elapsed_ms'
+                             captureMs = Get-DvProp $f 'capture_ms'; viewport = Get-DvProp $f 'viewport'; saved = [bool](Get-DvProp $f 'saved'); appReason = Get-DvProp $f 'reason' }
+        $src = Join-Path $share $file
+        if ($entry.saved -and (Test-Path -LiteralPath $src -PathType Leaf)) {
+            $local = Join-Path $dir $legName
+            Copy-Item -LiteralPath $src -Destination $local -Force
+            $entry.sha256 = Get-DvSha256OfFile $local
+            try {
+                $hashPx = Get-DvVisualViewportPixels -Path $local -Viewport $entry.viewport -Width $script:VisualHashSize[0] -Height $script:VisualHashSize[1]
+                $entry.contentHash = $hashPx.contentHash; $entry.viewportMean = $hashPx.mean; $entry.viewportStd = $hashPx.std
+                if ($kind -cne 'play') { $pixels[$kind] = (Get-DvVisualViewportPixels -Path $local -Viewport $entry.viewport -Width $script:VisualDiffSize[0] -Height $script:VisualDiffSize[1]).rgb }
+            } catch { $entry.appReason = "the runner could not read the image: $($_.Exception.GetType().Name)" }
+        }
+        if ($kind -ceq 'paused') { $block.pausedSettled = Get-DvProp $f 'settled'; $block.pausedFrame = Get-DvProp $f 'settled_frame' }
+        if ($kind -ceq 'stop') { $block.stopFrame = Get-DvProp $f 'display_frame' }
+        $frames.Add([pscustomobject]$entry)
+    }
+    $block.frames = $frames.ToArray()
+    $play = @($frames | Where-Object { $_.kind -ceq 'play' -and $_.contentHash })
+    $block.playFrames = $play.Count
+    $block.captured = ($play.Count -gt 0)
+    $block.distinctContentHashes = @($play | ForEach-Object { $_.contentHash } | Sort-Object -Unique).Count
+    $block.appDistinctDisplayFrames = @($play | ForEach-Object { $_.displayFrame } | Where-Object { $null -ne $_ -and [int]$_ -ge 0 } | Sort-Object -Unique).Count
+    $block.flatPlayFrames = @($play | Where-Object { $null -ne $_.viewportStd -and [double]$_.viewportStd -lt $script:VisualFlatViewportStd }).Count
+    $block.samePosition = ($null -ne $block.stopFrame -and $null -ne $block.pausedFrame -and [int]$block.stopFrame -ge 0 -and [int]$block.stopFrame -eq [int]$block.pausedFrame -and $block.pausedSettled -eq $true)
+    if ($pixels.ContainsKey('stop') -and $pixels.ContainsKey('paused')) {
+        $mad = Get-DvVisualMeanAbsDiff -A $pixels['stop'] -B $pixels['paused']
+        $block.playVsPausedMeanAbsDiffPerChannel = $mad
+        $block.playVsPausedMeanAbsDiff = ($mad | Measure-Object -Maximum).Maximum
+    }
+    $tiles = @($frames | Sort-Object @{ Expression = { @{ play = 0; stop = 1; paused = 2 }[$_.kind] } }, index | ForEach-Object {
+        $label = $(if ($_.kind -ceq 'play') { "play $($_.index)  f=$($_.displayFrame)" } elseif ($_.kind -ceq 'stop') { "paused instant  f=$($_.displayFrame)" } else { "paused full quality  f=$($block.pausedFrame)" })
+        [pscustomobject]@{ path = $(if ($_.sha256) { Join-Path $dir $_.file } else { $null }); viewport = $_.viewport; label = $label } })
+    if ($tiles.Count -gt 0) {
+        $v = Get-DvVisualVerdict -Requested $true -Captured ([bool]$block.captured) -PlayFrames ([int]$block.playFrames) -DistinctContentHashes ([int]$block.distinctContentHashes) `
+            -AppDistinctDisplayFrames ([int]$block.appDistinctDisplayFrames) -FlatPlayFrames ([int]$block.flatPlayFrames) -PlayVsPausedMeanAbsDiff $block.playVsPausedMeanAbsDiff -SamePosition ([bool]$block.samePosition)
+        $head = "$Header  visual=$($v.verdict)  distinct=$($block.distinctContentHashes)/$($block.playFrames)  play-vs-paused=$($block.playVsPausedMeanAbsDiff)"
+        try {
+            $block.stripPath = New-DvVisualStrip -Tiles $tiles -OutPath (Join-Path $dir "$LegId-strip.png") -Header $head.Trim()
+            $block.stripSha256 = Get-DvSha256OfFile $block.stripPath
+        } catch { $block.reason = "the strip could not be composed: $($_.Exception.GetType().Name)" }
+    }
+    & $finish
+}
+
 function Test-DvReceiptValid {
     <#
     .SYNOPSIS
@@ -1843,6 +2123,9 @@ function New-DvReceipt {
         # Present on EVERY receipt that names a leg spec (observedMode 'UNKNOWN' until a run log says). A leg that requested a mode the app did not run in is never a PASS/FAIL.
         display = $null
         look = $null
+        # PLAYBACK-VISUAL-INSPECTION-1: a speed leg's window captures (Read-DvVisualCaptures): requested / opted out, the frames and their hashes,
+        # the distinct-picture count, the play-vs-paused difference, the strip, and the gate verdict. Null on a look leg (its contact sheet is the look).
+        visual = $null
         # Retired in round 3 (no registry snapshot is taken any more: master isolates an automation run's settings store; the
         # receipt's playback.settingsIsolated is the proof). The key stays null so a reader written against round 2 still parses.
         registry = $null
@@ -1888,7 +2171,8 @@ function Write-DvReceipt {
 }
 
 Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-DvSha256OfBytes, Get-DvSha256OfText, Get-DvSha256OfFile,
-    ConvertTo-DvLfBytes, Get-DvLegSpecSha256, Get-DvDerivedBackend, Get-DvBackendNotDerivable, Read-DvContactFrames, Get-DvSubjectDigest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
+    ConvertTo-DvLfBytes, Get-DvLegSpecSha256, Get-DvDerivedBackend, Get-DvBackendNotDerivable, Read-DvContactFrames, Get-DvSubjectDigest,
+    Get-DvVisualViewportPixels, Get-DvVisualMeanAbsDiff, Get-DvVisualVerdict, New-DvVisualStrip, Read-DvVisualCaptures, Get-DvVisualCaptureRequest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
     Test-DvUnderClaudeState, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvPlaybackProblems,
     Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvDisplayEvidence, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvHealthVerdict,
     New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout,

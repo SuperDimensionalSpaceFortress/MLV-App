@@ -2357,6 +2357,127 @@ function Publish-AttrCudaContactSheetRawCaptures {
     return $rawDir
 }
 
+# PLAYBACK-VISUAL-INSPECTION-1 >>>
+function Test-AttrCudaVisualCaptureSupport {
+    <#
+    .SYNOPSIS
+    Does the TARGET binary declare --visual-capture-dir? Asked the way run-release-gui-smoke.ps1 asks about --display-prefer: the smoke
+    sub-parser's own help (`--gui-smoke-playback --help` prints the option list and returns before any window exists), under a hard
+    timeout, the probe killed by PID (whole tree) when it outlives it. An older build is never handed an option it would refuse.
+    .DESCRIPTION
+    Returns the job's visual-capture request record (an ordered dictionary, published as visual\visual-capture-request.json):
+    probe 'supported' | 'unsupported' | 'unknown', reason, forwarded (true only when supported). Never throws, never plays.
+    #>
+    param([Parameter(Mandatory = $true)][string]$ExePath, [ValidateRange(1, 600)][int]$TimeoutSec = 20)
+    $record = [ordered]@{ schema = 'mlv-app/visual-capture-request/v1'; requested = $true; probe = 'unknown'; reason = $null; forwarded = $false; presentMonWindowEndUtc = $null }
+    $process = $null
+    try {
+        $info = New-Object System.Diagnostics.ProcessStartInfo
+        $info.FileName = $ExePath
+        $info.Arguments = '--gui-smoke-playback --help'
+        $info.UseShellExecute = $false
+        $info.RedirectStandardOutput = $true
+        $info.RedirectStandardError = $true
+        $info.CreateNoWindow = $true
+        $process = [System.Diagnostics.Process]::Start($info)
+        $stdout = $process.StandardOutput.ReadToEndAsync()
+        $stderr = $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit($TimeoutSec * 1000)) {
+            try { & taskkill.exe /PID $process.Id /T /F 2>&1 | Out-Null } catch { }
+            try { if (-not $process.HasExited) { $process.Kill() } } catch { }
+            [void]$process.WaitForExit(5000)
+            $record.reason = "feature probe timed out after $TimeoutSec s and was killed"
+        } elseif ($process.ExitCode -ne 0) {
+            $record.reason = "feature probe exited with exit code $($process.ExitCode); the help text is not trusted"
+        } else {
+            [void]$stdout.Wait(5000); [void]$stderr.Wait(5000)
+            $text = ''
+            if ($stdout.IsCompleted) { $text += [string]$stdout.Result }
+            if ($stderr.IsCompleted) { $text += "`n" + [string]$stderr.Result }
+            if ($text -match '(?m)^\s*--visual-capture-dir\b') { $record.probe = 'supported'; $record.forwarded = $true }
+            else { $record.probe = 'unsupported'; $record.reason = 'the binary does not list --visual-capture-dir in its smoke help (it predates the option)' }
+        }
+    } catch {
+        $record.reason = "feature probe could not run: $($_.Exception.GetType().Name)"
+    } finally {
+        if ($null -ne $process) { $process.Dispose() }
+    }
+    return $record
+}
+
+function Add-AttrCudaVisualCaptureArgument {
+    <#
+    .SYNOPSIS
+    Append --visual-capture-dir <dir> to the smoke command's ONE -AdditionalArgs array (a second -AdditionalArgs is a parameter-binding
+    error): inside the array the contact sheet / --windowed already built when there is one at the end of the command, as an array of
+    its own when there is not. Pure string work.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Command, [Parameter(Mandatory = $true)][string]$VisualCaptureDir)
+    $quoted = "'" + $VisualCaptureDir.Replace("'", "''") + "'"
+    $pair = "'--visual-capture-dir', $quoted"
+    if ($Command -match ' -AdditionalArgs @\(.*\)$') { return $Command.Substring(0, $Command.Length - 1) + ", $pair)" }
+    if ($Command.Contains(' -AdditionalArgs ')) { throw 'ATTRCUDA_VISUAL_CAPTURE_ARGS_NOT_LAST the smoke command has an -AdditionalArgs that is not its final array' }
+    return "$Command -AdditionalArgs @($pair)"
+}
+
+function Get-AttrCudaPresentMonWindowResult {
+    <#
+    .SYNOPSIS
+    The launcher result Get-AttrCudaPresentMonDisplayReport windows PresentMon's rows on (process.startedAtUtc .. process.endedAtUtc),
+    with the window ENDED where the app's untimed visual-capture tail began (visual.json tail_begin_utc): the capture tail, its
+    PrintWindow grabs and the paused re-render never reach a PresentMon number. Without a forwarded capture, or a visual.json that
+    names its tail, the launcher's own result is returned untouched (the same object). The end used is recorded on -Record.
+    #>
+    param($ResultJson, $Record, [string]$VisualCaptureDir)
+    if ($null -eq $Record -or -not $Record['forwarded'] -or $null -eq $ResultJson -or [string]::IsNullOrWhiteSpace($VisualCaptureDir)) { return $ResultJson }
+    $visualJsonPath = Join-Path $VisualCaptureDir 'visual.json'
+    if (-not (Test-Path -LiteralPath $visualJsonPath -PathType Leaf)) { return $ResultJson }
+    # The raw text, not ConvertFrom-Json: whether a JSON date string becomes a DateTime (and of which Kind) differs across pwsh versions.
+    $tailText = $null
+    try { if ((Get-Content -LiteralPath $visualJsonPath -Raw) -match '"tail_begin_utc"\s*:\s*"(?<t>[0-9T:.\-]+Z)"') { $tailText = $Matches['t'] } } catch { $tailText = $null }
+    if ($null -eq $tailText -or $null -eq $ResultJson.PSObject.Properties['process'] -or $null -eq $ResultJson.process) { return $ResultJson }
+    $originalEnd = $ResultJson.process.endedAtUtc
+    $tailUtc = [datetime]::Parse($tailText, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind)
+    # The new end takes the SAME shape as the launcher's own value (a DateTime of its Kind, or a round-trip string), so the report parses
+    # both ends of the window the same way; and it may only SHORTEN the window, never move it.
+    $newEnd = $null
+    $originalEndUtc = $null
+    if ($originalEnd -is [datetime]) {
+        $originalEndUtc = $(if ($originalEnd.Kind -eq [DateTimeKind]::Local) { $originalEnd.ToUniversalTime() } else { [datetime]::SpecifyKind($originalEnd, [DateTimeKind]::Utc) })
+        $newEnd = $(if ($originalEnd.Kind -eq [DateTimeKind]::Local) { $tailUtc.ToLocalTime() } elseif ($originalEnd.Kind -eq [DateTimeKind]::Unspecified) { [datetime]::SpecifyKind($tailUtc, [DateTimeKind]::Unspecified) } else { $tailUtc })
+    } else {
+        try { $originalEndUtc = [datetime]::Parse([string]$originalEnd, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime() } catch { return $ResultJson }
+        $newEnd = $tailUtc.ToString('o')
+    }
+    if ($tailUtc.ToUniversalTime() -ge $originalEndUtc) { return $ResultJson }
+    $clone = $ResultJson.PSObject.Copy()
+    $clone.process = $ResultJson.process.PSObject.Copy()
+    $clone.process.endedAtUtc = $newEnd
+    $Record['presentMonWindowEndUtc'] = $tailText
+    return $clone
+}
+
+function Publish-AttrCudaVisualCaptures {
+    <#
+    .SYNOPSIS
+    Publish the job's visual-capture request record and the app's window captures (play-<k>.png, stop.png, paused.png, visual.json) under
+    $PubRoot\visual -- the record always (it says whether the option was forwarded and why not), the captures only when they exist.
+    Returns the published directory.
+    #>
+    param($Record, [string]$SourceDir, [string]$PubRoot)
+    if ($null -eq $Record) { return $null }
+    $pubDir = Join-Path $PubRoot 'visual'
+    [void](New-AttrCudaDirectory -Path $pubDir)
+    [void](Publish-AttrCudaText -Path (Join-Path $pubDir 'visual-capture-request.json') -Value ($Record | ConvertTo-Json -Depth 4))
+    if ($Record['forwarded'] -and $SourceDir -and (Test-Path -LiteralPath $SourceDir -PathType Container)) {
+        Get-ChildItem -LiteralPath $SourceDir -File | Where-Object { $_.Name -match '^(play-\d+|stop|paused)\.png$' -or $_.Name -ceq 'visual.json' } | ForEach-Object {
+            [void](Publish-AttrCudaFileCopy -Source $_.FullName -Destination (Join-Path $pubDir $_.Name))
+        }
+    }
+    return $pubDir
+}
+# PLAYBACK-VISUAL-INSPECTION-1 <<<
+
 function Publish-AttrCudaFileMove {
     <#
     .SYNOPSIS
@@ -6845,6 +6966,10 @@ Export-ModuleMember -Function `
     Get-AttrCudaEligibilityVerdict, `
     ConvertTo-AttrCudaQuotedProcessArgument, `
     Publish-AttrCudaContactSheetRawCaptures, `
+    Test-AttrCudaVisualCaptureSupport, `
+    Add-AttrCudaVisualCaptureArgument, `
+    Get-AttrCudaPresentMonWindowResult, `
+    Publish-AttrCudaVisualCaptures, `
     Get-AttrCudaPresentMonDisplayReport, `
     Get-AttrCudaAppSwapTelemetry, `
     Get-AttrCudaForegroundVerification, `
