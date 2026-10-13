@@ -795,6 +795,21 @@ TEST(PlaybackDecodeRenderOverlapWiring, DropFrameOnPrepQueueIsTheMasterConflated
     ASSERT_TRUE( drawReadyBody.contains( QStringLiteral("enqueuePlaybackPrepTask( task );") ) );
 }
 
+// PLAYBACK-CPU-PACE-GAP-1 r7 FR1b: MLVAPP_PLAYBACK_PREP_CONFLATED_MOVE is an opt-in bisect switch (on only when set and
+// not "0", read once), and it is what drawFrameReady hands the policy, so one binary can A/B the slot and the move deque.
+TEST(PlaybackDecodeRenderOverlapWiring, TheConflatedMoveBisectSwitchIsOptInAndReadOnce)
+{
+    const QString mw = readRepoText( "platform/qt/MainWindow.cpp" );
+    ASSERT_FALSE( mw.isEmpty() );
+    const int fn = mw.indexOf( QStringLiteral("static bool mlvappPlaybackPrepConflatedMoveOptIn()") );
+    ASSERT_TRUE( fn > 0 );
+    const QString body = mw.mid( fn, mw.indexOf( QStringLiteral("\n}\n"), fn ) - fn );
+    ASSERT_TRUE( body.contains( QStringLiteral("static const bool optIn") ) );
+    ASSERT_TRUE( body.contains( QStringLiteral("if( !qEnvironmentVariableIsSet( \"MLVAPP_PLAYBACK_PREP_CONFLATED_MOVE\" ) ) return false;") ) );
+    ASSERT_TRUE( body.contains( QStringLiteral("!= QStringLiteral(\"0\")") ) );
+    ASSERT_TRUE( mw.contains( QStringLiteral("playbackPrepUsesConflatedSlot( task.losslessPresent, mlvappPlaybackPrepConflatedMoveOptIn() )") ) );
+}
+
 TEST(PlaybackDecodeRenderOverlapWiring, TheRenderThreadReportsEveryStageToTheMeter)
 {
     const QString rft = readRepoText( "platform/qt/RenderFrameThread.cpp" );

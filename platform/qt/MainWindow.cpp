@@ -2572,6 +2572,18 @@ static bool mlvappCpuPlaybackLookaheadDisabled()
     return disabled;
 }
 
+// PLAYBACK-CPU-PACE-GAP-1 r7 FR1b: a BISECT switch, not a product setting. Set (and not "0") it sends drop-frame-on
+// prep work through the r5 move deque instead of master's conflated slot, so one binary can A/B the two queues.
+// Default off: the drop-frame-on default is master's slot. Read once.
+static bool mlvappPlaybackPrepConflatedMoveOptIn()
+{
+    static const bool optIn = []() {
+        if( !qEnvironmentVariableIsSet( "MLVAPP_PLAYBACK_PREP_CONFLATED_MOVE" ) ) return false;
+        return qEnvironmentVariable( "MLVAPP_PLAYBACK_PREP_CONFLATED_MOVE" ).trimmed() != QStringLiteral("0");
+    }();
+    return optIn;
+}
+
 // PLAYBACK-DECODE-RENDER-OVERLAP-1: the lookahead is on by default on the CUDA texture route, so the
 // decode + dual-ISO of N+1 runs while N renders and presents (two frames in flight, not one).
 // PLAYBACK-CPU-PACE-GAP-1: and at depth 1 on the CPU route when its default is admitted (s2/s4).
@@ -32081,7 +32093,7 @@ void MainWindow::drawFrameReady()
     task.rebindOwnedImagePointers();
     notePlaybackPrepOwnershipTelemetry();
 
-    if( playbackPrepUsesConflatedSlot( task.losslessPresent, false ) )
+    if( playbackPrepUsesConflatedSlot( task.losslessPresent, mlvappPlaybackPrepConflatedMoveOptIn() ) )
         enqueuePlaybackPrepTask( task );
     else
         enqueuePlaybackPrepTaskLossless( std::move( task ) );
