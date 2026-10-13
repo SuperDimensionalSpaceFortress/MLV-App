@@ -42,6 +42,8 @@ platform/build-*
 !tools/gen-buildinfo.ps1
 !tools/release/build_stamp.py
 !tools/repo_hygiene/test_build_stamp.py
+!tools/coordination/build-guard.ps1
+!tests/coordination/test_build_guard.py
 .qtcreator
 
 # Docs tree is the canonical documentation set; track it even if filenames
