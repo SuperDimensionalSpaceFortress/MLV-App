@@ -39,7 +39,9 @@
 # it as if the venue had been measured. The probe never kills, stops or changes any process.
 #
 # ONE DEADLINE: -MaxWaitSec runs from the start and bounds every queue-gate wait too (a re-probe does not get a fresh gate clock). A gate wait ends at the
-# earlier of -MaxGateSec and that deadline (GATE_BUSY, exit 3). Only a probe already submitted can run past it, bounded by um-run.ps1's own timeouts.
+# earlier of -MaxGateSec and that deadline (GATE_BUSY, exit 3). Only a probe already submitted can run past it, bounded by um-run.ps1's own timeouts and by
+# -MaxAdmissionWaitSec (default 7200, range 1..86400), which is forwarded to um-run.ps1 as its heavy-slot admission ceiling: the venue chain passes its
+# -ProbeAdmissionWaitSec here, and sizes the claim ticket's probe-phase staleAfterSec from that same value, so the bound the ticket assumes is the bound the probe honours.
 # A read error on the agent share is retried -ReadAttempts times in all, backing off -ReadBackoffSec * attempt, inside the same deadline, before it is
 # GATE_UNREADABLE; each retry prints a `GATE_READ_RETRY` line, never a `queued=0 running=0` line.
 #
@@ -72,6 +74,7 @@ param(
     [Parameter(ParameterSetName = 'Live')][int]$GatePollSec = 30,
     [Parameter(ParameterSetName = 'Live')][int]$ReadAttempts = 3,
     [Parameter(ParameterSetName = 'Live')][int]$ReadBackoffSec = 2,
+    [Parameter(ParameterSetName = 'Live')][ValidateRange(1, 86400)][int]$MaxAdmissionWaitSec = 7200,
     [Parameter(ParameterSetName = 'Offline', Mandatory = $true)][string]$SamplesJson,
     [double]$ThresholdPercent = 20.0
 )
@@ -479,7 +482,7 @@ while ($true) {
     [IO.File]::WriteAllText($jobFile, $probeText, [Text.UTF8Encoding]::new($false))
     $probe = $null; $why = $null; $whyKind = $null; $rawPath = $null; $rawErr = $null
     try {
-        $out = @(& $umRun -ScriptPath $jobFile -JobId $jobId -AgentShare $agentShare -TimeoutSec 120 -MaxQueueWaitSec 300 -MaxClaimedWaitSec 120 6>$null)
+        $out = @(& $umRun -ScriptPath $jobFile -JobId $jobId -AgentShare $agentShare -TimeoutSec 120 -MaxQueueWaitSec 300 -MaxClaimedWaitSec 120 -MaxAdmissionWaitSec $MaxAdmissionWaitSec 6>$null)
         $r = if ($out.Count -gt 0) { $out[-1] } else { $null }
         $line = @(([string]$r.stdout) -split "`r?`n" | Where-Object { $_ -like 'VENUE_QUIET=*' }) | Select-Object -Last 1
         if ($line) {

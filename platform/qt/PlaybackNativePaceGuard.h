@@ -25,6 +25,8 @@
 #ifndef PLAYBACKNATIVEPACEGUARD_H
 #define PLAYBACKNATIVEPACEGUARD_H
 
+#include <cmath>
+
 namespace playback_native_pace
 {
 
@@ -80,18 +82,49 @@ inline int timelineFramesAfterFirstPresent( int timelineDeltaAbs, int timelineDe
     return timelineDeltaAbs > timelineDeltaAbsAtFirstPresent ? timelineDeltaAbs - timelineDeltaAbsAtFirstPresent : 0;
 }
 
+/*! PLAYBACK-STARTUP-CATCHUP-BURST-1: the timeline frames an engine advance from \a fromPosition to \a toPosition
+ *  jumped past (never shown), for startup_catchup_frames. 0 for a one-frame step, a hold or a move back. */
+inline int skippedFrames( double fromPosition, double toPosition )
+{
+    const int skipped = static_cast<int>( std::floor( toPosition + 1e-9 ) )
+                      - static_cast<int>( std::floor( fromPosition + 1e-9 ) ) - 1;
+    return skipped > 0 ? skipped : 0;
+}
+
+/*! PLAYBACK-STARTUP-CATCHUP-BURST-1: startup_catchup_frames counts the skips of the first 2 s after Play. */
+inline constexpr double kStartupCatchupWindowMs = 2000.0;
+
 class NativePaceGuard
 {
 public:
-    /*! Forget the clock: the next grant re-arms it (Play start, Play stop). */
+    /*! Forget the clock: the next grant re-arms it (Play start, Play stop). Unless the legacy startup is set, the
+     *  clock then waits for this Play's first present before it banks more than the carry (see notePresent). */
     void reset()
     {
         m_armed = false;
         m_lastMs = 0.0;
         m_creditFrames = 0.0;
+        m_awaitingFirstPresent = !m_startupCatchupLegacy;
+    }
+
+    /*! PLAYBACK-STARTUP-CATCHUP-BURST-1 kill switch (MLVAPP_PLAYBACK_STARTUP_CATCHUP_LEGACY=1): the clock armed at
+     *  Play banks the whole wait for the first frame, and drop-frame mode repays it with one jump (~20 frames on
+     *  Bachelor CUDA). Takes effect at the next reset(). */
+    void setStartupCatchupLegacy( bool legacy ) { m_startupCatchupLegacy = legacy; }
+
+    /*! PLAYBACK-STARTUP-CATCHUP-BURST-1: a frame of this Play was presented at \a nowMs. The first present after the
+     *  clock armed is where paced playback starts: up to it the guard banked no more than the carry (accrue), so the
+     *  wait for the first frame is never repaid as a timeline jump, and from it credit accrues exactly as before. A
+     *  present before the clock armed is not this Play's first frame and changes nothing. */
+    void notePresent( double nowMs, double paceFps )
+    {
+        if( !m_awaitingFirstPresent || !m_armed ) return;
+        if( paceFps > 0.0 ) accrue( nowMs, paceFps );
+        m_awaitingFirstPresent = false;
     }
 
     bool armed() const { return m_armed; }
+    bool awaitingFirstPresent() const { return m_awaitingFirstPresent; }
     double creditFrames() const { return m_creditFrames; }
 
     /*! Drop-frame mode: the share of \a requestedFrames (a fractional source-frame
@@ -144,6 +177,9 @@ private:
             m_creditFrames += ( nowMs - m_lastMs ) * paceFps / 1000.0;
             m_lastMs = nowMs;
         }
+        // Before this Play's first present the wait is not owed: no grant runs while the first frame renders, and a
+        // bank of the whole wait was spent in one burst right after it (c79b80c8: 1 -> 25 at 1069 ms).
+        if( m_awaitingFirstPresent && m_creditFrames > kMaxCarryFrames ) m_creditFrames = kMaxCarryFrames;
     }
 
     void spend( double frames )
@@ -156,6 +192,8 @@ private:
     bool m_armed = false;
     double m_lastMs = 0.0;
     double m_creditFrames = 0.0;
+    bool m_startupCatchupLegacy = false;
+    bool m_awaitingFirstPresent = false;   // a guard never reset (no Play yet) holds nothing back
 };
 
 } // namespace playback_native_pace
