@@ -572,6 +572,202 @@ TEST(PlaybackNativePaceThroughput, FpsAfterFirstPresentNeedsAPacedInterval)
     ASSERT_TRUE( playback_native_pace::fpsAfterFirstPresent( 240.0, 900.0, 1000.0, 1 ) == 0.0 );
 }
 
+// ---- the play-start catch-up (PLAYBACK-STARTUP-CATCHUP-BURST-1) ---------------------------------------------
+//
+// Bachelor CUDA master c79b80c8 (fullscreen s4): Play armed the clock at its first tick and advanced to frame 1; no
+// grant ran while frame 1 rendered (first_present_ms 1069.102); the next grant asked for the whole wait and the
+// guard had banked it, so the timeline jumped 1 -> 25 (slip frame=25 size=23) and 23 of 599 frames were never shown.
+
+namespace
+{
+
+struct StartupStep
+{
+    double nowMs;
+    double requested;  // drop frame: fps x timeDiff / 1000
+    bool present;      // a present of this Play is noted at nowMs, before the grant (drawFrameReady)
+};
+
+// The grants the drop-frame engine gets for \a steps on a guard that was reset at Play.
+std::vector<double> grantsFor( const std::vector<StartupStep> & steps, bool legacy, double fps = kNativeFps )
+{
+    NativePaceGuard guard;
+    guard.setStartupCatchupLegacy( legacy );
+    guard.reset();
+    std::vector<double> grants;
+    for( const StartupStep & s : steps )
+    {
+        if( s.present ) guard.notePresent( s.nowMs, fps );
+        grants.push_back( guard.grant( s.requested, s.nowMs, fps ) );
+    }
+    return grants;
+}
+
+// c79b80c8's shape: the Play tick at 0, frame 1 presented at firstPresentMs, the early advance on it asking for the
+// whole wait (unshaped), then one present per frame period asking for one period, with a 150 ms mid-play stall.
+std::vector<StartupStep> c79b80c8Steps( double firstPresentMs = 1069.102 )
+{
+    const double periodMs = 1000.0 / kNativeFps;
+    std::vector<StartupStep> steps;
+    steps.push_back( { 0.0, 3.0, false } );
+    steps.push_back( { firstPresentMs, kNativeFps * firstPresentMs / 1000.0, true } );
+    double t = firstPresentMs;
+    for( int i = 0; i < 200; ++i )
+    {
+        const double gapMs = i == 120 ? 150.0 : periodMs;
+        t += gapMs;
+        steps.push_back( { t, kNativeFps * gapMs / 1000.0, true } );
+    }
+    return steps;
+}
+
+} // namespace
+
+TEST(PlaybackStartupCatchup, ALongFirstWaitBanksNoMoreThanOneFrame)
+{
+    NativePaceGuard guard;
+    guard.reset();
+    ASSERT_TRUE(guard.awaitingFirstPresent());
+    ASSERT_TRUE(guard.grant(3.0, 0.0, kNativeFps) == 1.0); // the Play tick arms with one frame, as before
+    // no grant runs while the first frame renders: polling the credit there is what the burst would have spent
+    for (double t : {100.0, 500.0, 1069.102, 3753.0})
+    {
+        ASSERT_TRUE(guard.grant(0.0, t, kNativeFps) == 0.0);
+        ASSERT_TRUE(guard.creditFrames() <= kMaxCarryFrames + 1e-12);
+    }
+    guard.notePresent(3753.0, kNativeFps);
+    ASSERT_FALSE(guard.awaitingFirstPresent());
+    ASSERT_TRUE(guard.creditFrames() <= kMaxCarryFrames + 1e-12);
+    // the early advance on the first present asks for the whole 3.75 s wait (90 frames): it gets the carried frame
+    ASSERT_TRUE(guard.grant(90.0, 3753.0, kNativeFps) <= kMaxCarryFrames + 1e-12);
+}
+
+TEST(PlaybackStartupCatchup, AStallInsideTheFirstPresentIsNotOwedEither)
+{
+    // r3 venue legs (Bachelor CUDA fullscreen-s4): Play at 0, the early advance on frame 0's ready at 300 ms, then
+    // the first draw (render-thread present setup + audio start) blocks the GUI thread until 1073 ms; the next
+    // tick follows at 1081 ms and asks for the whole 1.08 s (25.9 frames).
+    const double earlyAdvanceMs = 300.0, presentEndMs = 1073.0, nextTickMs = 1081.0, askedFrames = 25.9;
+    NativePaceGuard atPresentEnd;
+    atPresentEnd.reset();
+    atPresentEnd.grant(1.0, 0.0, kNativeFps);
+    ASSERT_TRUE(atPresentEnd.grant(7.0, earlyAdvanceMs, kNativeFps) <= kMaxCarryFrames + 1e-12);
+    atPresentEnd.notePresent(presentEndMs, kNativeFps);
+    ASSERT_FALSE(atPresentEnd.awaitingFirstPresent());
+    // the clock starts at the end of the present: the next tick advances the carried frame plus 8 ms, no jump
+    ASSERT_TRUE(atPresentEnd.grant(askedFrames, nextTickMs, kNativeFps) < kMaxCarryFrames + 0.2);
+    // started before the draw instead (the first r1 wiring), the stall is banked and repaid as one jump
+    NativePaceGuard beforeDraw;
+    beforeDraw.reset();
+    beforeDraw.grant(1.0, 0.0, kNativeFps);
+    beforeDraw.notePresent(earlyAdvanceMs, kNativeFps);
+    ASSERT_TRUE(beforeDraw.grant(askedFrames, nextTickMs, kNativeFps) > 18.0);
+}
+
+TEST(PlaybackStartupCatchup, TheFirstPresentNoLongerRepaysTheWaitWithAJump)
+{
+    const std::vector<StartupStep> steps = c79b80c8Steps();
+    const std::vector<double> legacy = grantsFor(steps, true);
+    const std::vector<double> head = grantsFor(steps, false);
+    // legacy: the early advance on the first present jumps the whole wait (25.6 frames: 1 -> 26)
+    ASSERT_TRUE(legacy[1] > 25.0 && legacy[1] < 26.0);
+    // head: it advances at most the carried frame, so nothing is skipped
+    ASSERT_TRUE(head[1] <= kMaxCarryFrames + 1e-12);
+    ASSERT_EQ(0, playback_native_pace::skippedFrames(1.0, 1.0 + head[1]));
+    ASSERT_EQ(24, playback_native_pace::skippedFrames(1.0, 1.0 + legacy[1]));
+}
+
+TEST(PlaybackStartupCatchup, MidPlayLatenessStillGrantsDropsAsBefore)
+{
+    // after the first present the two clocks hold the same credit, so every later grant -- the 150 ms stall's
+    // 3.6-frame drop included -- is legacy's to the bit
+    const std::vector<StartupStep> steps = c79b80c8Steps(30.0); // a first wait under one frame banks nothing extra
+    const std::vector<double> legacy = grantsFor(steps, true);
+    const std::vector<double> head = grantsFor(steps, false);
+    ASSERT_EQ(legacy.size(), head.size());
+    for (size_t i = 0; i < head.size(); ++i) ASSERT_TRUE(head[i] == legacy[i]);
+    // and with c79b80c8's real wait, everything after the first present's own advance matches as well
+    const std::vector<StartupStep> slow = c79b80c8Steps();
+    const std::vector<double> legacySlow = grantsFor(slow, true);
+    const std::vector<double> headSlow = grantsFor(slow, false);
+    for (size_t i = 3; i < headSlow.size(); ++i) ASSERT_TRUE(std::fabs(headSlow[i] - legacySlow[i]) < 1e-9);
+    const double stall = headSlow[2 + 120];
+    ASSERT_TRUE(std::fabs(stall - kNativeFps * 150.0 / 1000.0) < 1e-9); // the mid-play stall drops 3.6 frames
+}
+
+TEST(PlaybackStartupCatchup, TheLegacyKillSwitchReproducesTheOldGuardExactly)
+{
+    // the old guard never waited for a present: a guard never reset holds nothing back, so it IS the old guard
+    const std::vector<StartupStep> steps = c79b80c8Steps();
+    NativePaceGuard old;
+    std::vector<double> oldGrants;
+    for (const StartupStep & s : steps) oldGrants.push_back(old.grant(s.requested, s.nowMs, kNativeFps));
+    const std::vector<double> legacy = grantsFor(steps, true);
+    ASSERT_EQ(oldGrants.size(), legacy.size());
+    for (size_t i = 0; i < legacy.size(); ++i) ASSERT_TRUE(legacy[i] == oldGrants[i]);
+    // every-frame mode never had the burst (spend() keeps one frame after its first grant): head differs from legacy
+    // by at most that one carried frame
+    NativePaceGuard legacyWhole;
+    legacyWhole.setStartupCatchupLegacy(true);
+    legacyWhole.reset();
+    NativePaceGuard headWhole;
+    headWhole.reset();
+    ASSERT_TRUE(legacyWhole.grantWholeFrame(0.0, kNativeFps) && headWhole.grantWholeFrame(0.0, kNativeFps));
+    headWhole.notePresent(1069.102, kNativeFps);
+    legacyWhole.notePresent(1069.102, kNativeFps);
+    int legacyRun = 0, headRun = 0;
+    for (int i = 0; i < 30; ++i) // ticks 8 ms apart right after the present
+    {
+        legacyRun += legacyWhole.grantWholeFrame(1069.102 + 8.0 * i, kNativeFps) ? 1 : 0;
+        headRun += headWhole.grantWholeFrame(1069.102 + 8.0 * i, kNativeFps) ? 1 : 0;
+    }
+    ASSERT_TRUE(legacyRun - headRun >= 0 && legacyRun - headRun <= 1);
+    ASSERT_TRUE(legacyRun <= 8); // ~232 ms at native: 5.6 owed plus the carried frames
+}
+
+TEST(PlaybackStartupCatchup, APresentBeforeTheClockArmsIsNotTheFirstFrame)
+{
+    NativePaceGuard guard;
+    guard.reset();
+    guard.notePresent(0.0, kNativeFps); // a frame from before this Play's first tick
+    ASSERT_TRUE(guard.awaitingFirstPresent());
+    ASSERT_TRUE(guard.grant(1.0, 10.0, kNativeFps) == 1.0);
+    ASSERT_TRUE(guard.grant(30.0, 1010.0, kNativeFps) <= kMaxCarryFrames + 1e-12); // still held back
+    guard.notePresent(1010.0, kNativeFps);
+    ASSERT_FALSE(guard.awaitingFirstPresent());
+    // an unknown pace leaves the request alone and still ends the wait
+    NativePaceGuard unknown;
+    unknown.reset();
+    unknown.grant(1.0, 0.0, 24.0);
+    unknown.notePresent(500.0, 0.0);
+    ASSERT_FALSE(unknown.awaitingFirstPresent());
+}
+
+TEST(PlaybackStartupCatchup, PlayStopAndRestartWaitForTheirOwnFirstPresent)
+{
+    // every Play (and the Play-stop reset) re-arms the same way; a Loop wrap is not a reset, so it never waits
+    NativePaceGuard guard;
+    guard.reset();
+    guard.grant(1.0, 0.0, kNativeFps);
+    guard.notePresent(500.0, kNativeFps);
+    ASSERT_TRUE(guard.grantLoopWrap(600.0, kNativeFps));
+    ASSERT_FALSE(guard.awaitingFirstPresent());
+    guard.reset(); // Play again
+    ASSERT_TRUE(guard.awaitingFirstPresent());
+    ASSERT_TRUE(guard.grant(1.0, 10000.0, kNativeFps) == 1.0);
+    ASSERT_TRUE(guard.grant(40.0, 11000.0, kNativeFps) <= kMaxCarryFrames + 1e-12);
+}
+
+TEST(PlaybackStartupCatchup, SkippedFramesCountsOnlyTheFramesJumpedPast)
+{
+    ASSERT_EQ(0, playback_native_pace::skippedFrames(1.0, 2.0));
+    ASSERT_EQ(0, playback_native_pace::skippedFrames(1.4, 2.3));
+    ASSERT_EQ(0, playback_native_pace::skippedFrames(1.0, 1.9)); // a hold
+    ASSERT_EQ(0, playback_native_pace::skippedFrames(25.0, 3.0)); // back (never a skip)
+    ASSERT_EQ(23, playback_native_pace::skippedFrames(1.0, 25.0)); // c79b80c8's slip
+    ASSERT_EQ(1, playback_native_pace::skippedFrames(2.97, 4.6));
+}
+
 // ---- wiring: MainWindow.cpp needs a full GUI build, so its source is read as text --------------------------
 
 namespace
@@ -670,6 +866,43 @@ TEST(PlaybackNativePaceWiring, TheSmokeReportsThePacedRatesBesideTheWholeRun)
     ASSERT_TRUE(line.contains(QStringLiteral(
         ".arg( m_playPaceFps, 0, 'f', 3 )\n"
         "               .arg( m_playbackSmokeFirstPresentTimelineDeltaAbs );")));
+}
+
+TEST(PlaybackNativePaceWiring, TheFirstPresentStartsThePaceClockWhenItsPresentEnds)
+{
+    const QString source = mainWindowSource();
+    const QString note = QStringLiteral(
+        "m_playbackPaceGuard.notePresent( mlv_stage_timing_now() * 1000.0, getPlaybackFramerate() );");
+    // r3 venue legs (Bachelor CUDA): the first draw blocks the GUI thread ~1 s, so a clock started at the top of
+    // drawFrameReady banked the stall and repaid it as one 23-frame jump. It starts where the present is done.
+    ASSERT_EQ(1, source.count(note));
+    const QString present = bodyBetween(source, QStringLiteral("void MainWindow::presentPlaybackPreparedFrame("),
+                                        QStringLiteral("void MainWindow::computeDisplaySceneGeometry("));
+    ASSERT_FALSE(present.isEmpty());
+    // after finishPresentedFrame returns: the first frame's finish (first-present stamp, audio start) blocks the
+    // GUI thread ~0.6 s more on Bachelor CUDA, and a clock started before it repaid that as a 15-frame jump
+    const int finish = present.indexOf(QStringLiteral("    finishPresentedFrame( display_frame,"));
+    const int noteAt = present.indexOf(note);
+    const int busy = present.lastIndexOf(QStringLiteral(
+        "    m_frameStillDrawing = renderThreadBusyForPlaybackAdvance( currentPlaybackAdvanceTarget() );"));
+    ASSERT_TRUE(finish >= 0);
+    ASSERT_TRUE(noteAt > finish);
+    ASSERT_TRUE(busy > noteAt);
+    // the kill switch is read once and handed to the guard; the slip histogram owes the time since Play only then
+    ASSERT_TRUE(source.contains(QStringLiteral(
+        "static const bool requested = environmentFlagEnabled( \"MLVAPP_PLAYBACK_STARTUP_CATCHUP_LEGACY\" );")));
+    ASSERT_TRUE(source.contains(QStringLiteral(
+        "m_playbackPaceGuard.setStartupCatchupLegacy( mlvappPlaybackStartupCatchupLegacyRequested() );")));
+    ASSERT_TRUE(source.contains(QStringLiteral(
+        "    if( mlvappPlaybackStartupCatchupLegacyRequested() )\n"
+        "        m_playbackSlipHistogram.setPlayStart( m_playbackSmokeStartTime * 1000.0 );")));
+    // one line per play session, after pace_summary
+    const int pace = source.indexOf(QStringLiteral("\"playback_smoke.pace_summary session=%1"));
+    const int startup = source.indexOf(QStringLiteral(
+        "\"playback_smoke.startup_catchup session=%1 startup_wait_ms=%2 startup_catchup_frames=%3 \""));
+    ASSERT_TRUE(pace >= 0);
+    ASSERT_TRUE(startup > pace);
+    ASSERT_TRUE(source.contains(QStringLiteral("    m_playbackSmokeStartupSkippedFrames = 0;\n")));
 }
 
 TEST(PlaybackNativePaceWiring, TheFirstPresentsCatchUpIsSampledAfterItsAdvanceAndNotPaced)

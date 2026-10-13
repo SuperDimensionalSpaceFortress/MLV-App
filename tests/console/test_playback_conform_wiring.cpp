@@ -136,6 +136,16 @@ TEST(PlaybackConformWiring, SlipHistogramMovesUsePlaybackRate)
     ASSERT_EQ(3, countOccurrences(body, QStringLiteral("getPlaybackFramerate(), !paceGuardArmedBeforeTick );")));
 }
 
+// HFR-NATIVE-60FPS-FULLRES-1 (merge of #374 with #402): the first-present pace-clock start accrues at the same
+// rate grant() spends at; the export rate would bank 59.94/24 = 2.5x the credit for a conformed 59.94 clip.
+TEST(PlaybackConformWiring, FirstPresentPaceClockStartUsesPlaybackRate)
+{
+    const QString source = mainWindowSource();
+    ASSERT_TRUE(source.contains(QStringLiteral(
+        "m_playbackPaceGuard.notePresent( mlv_stage_timing_now() * 1000.0, getPlaybackFramerate() );")));
+    ASSERT_FALSE(source.contains(QStringLiteral("m_playbackPaceGuard.notePresent( mlv_stage_timing_now() * 1000.0, getFramerate() );")));
+}
+
 TEST(PlaybackConformWiring, PlaybackHandlingNeverReadsTheExportRate)
 {
     const QString body = playbackHandlingBody(mainWindowSource());

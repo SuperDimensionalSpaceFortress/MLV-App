@@ -387,6 +387,8 @@ try {
         if ($spec.generatorArgs.PSObject.Properties['rawPrefetchDecoders']) { $gen['RawPrefetchDecoders'] = [int]$spec.generatorArgs.rawPrefetchDecoders }
         # GPU-EVENT153-ROOTCAUSE-2: the CUDA per-launch timer and its line threshold, for any leg.
         if ($spec.generatorArgs.PSObject.Properties['cudaLaunchTimingMinMs']) { $gen['CudaLaunchTimingMinMs'] = [double]$spec.generatorArgs.cudaLaunchTimingMinMs }
+        # PLAYBACK-STARTUP-CATCHUP-BURST-1 r7: the app's opt-in per-present playback trace, for any leg.
+        if ($spec.generatorArgs.PSObject.Properties['presentTrace'] -and [bool]$spec.generatorArgs.presentTrace) { $gen['PresentTrace'] = $true }
         # PLAYBACK-BACHELOR-PRESENT-JITTER-1: a SPEED leg may force Look Assist (a capture-free pace leg: no contact-sheet grab in the timed Play).
         if (-not $isLook -and $spec.generatorArgs.PSObject.Properties['forceLookAssist'] -and [bool]$spec.generatorArgs.forceLookAssist) {
             $gen['ForceLookAssist'] = $true; $gen['LookPaceLeg'] = $true

@@ -181,10 +181,12 @@ ROUTE_DELETE_ALLOWED = {
         "name cannot equal it, and the pair's -OutDir holds only derived sheets (never a clip). test_look_flavor_pair_hardening pins that the marker is gone "
         "after a finished pair or trio and kept after a crash.",
     ("VenueChain.psm1", "[IO.File]::Delete($Path)"):
-        "VENUE-CHAIN-RUNNER-1: releases or breaks the venue claim file <ClaimDir>\\<venue>.claim.json (default under the board's "
-        ".claude-state\\dual-venue\\claims, never a venue share). $Path is built only by Get-VenueClaimPath from a venue name matching "
-        "^[a-z0-9][a-z0-9-]{0,62}$ plus the fixed suffix .claim.json, and the delete runs only after the open handle re-read the claim's own JSON "
-        "(its nonce, or the exact stale bytes judged); a footage name cannot equal it. test_venue_chain_runner pins release and stale-break.",
+        "VENUE-CHAIN-RUNNER-1 / VENUE-CLAIM-FIFO-1: releases or breaks the venue claim file <ClaimDir>\\<venue>.claim.json, or ends or sweeps a line ticket "
+        "<ClaimDir>\\<venue>.tickets\\<19 digits>-p<pid>-<start ticks>.ticket.json (default under the board's .claude-state\\dual-venue\\claims, never a venue share). "
+        "$Path is built only by Get-VenueClaimPath (a venue name matching ^[a-z0-9][a-z0-9-]{0,62}$ plus the fixed suffix .claim.json) or taken from Get-VenueTicketDir "
+        "(<claim dir>\\<venue>.tickets) filtered by the ticket-name pattern or the ticket object New-VenueTicket returned, and the delete runs only after the open "
+        "handle re-read the file's own JSON (its nonce, or the exact stale bytes judged); a footage name cannot equal either. test_venue_chain_runner and "
+        "test_venue_claim_fifo pin release, stale-break, ticket end and ticket sweep.",
 }
 
 TRAILING_COMMENT = re.compile(r"\s+#\s.*$")
