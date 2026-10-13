@@ -1670,6 +1670,103 @@ static bool setPlaybackDisplayRequiredExecutionState( bool required )
 #endif
 }
 
+/* PLAYBACK-VISUAL-INSPECTION-1: captures the WHOLE top-level window the way the owner sees it --
+ * PrintWindow( hwnd, dc, PW_RENDERFULLCONTENT ), which asks the compositor for the window's own
+ * content (GL child windows included), so overlapping windows never leak in and nothing is read
+ * back from the app's render path (the measured trap: an in-app readback can look right while
+ * the display is wrong). Also returns where the video viewport sits inside the captured image, in
+ * captured (physical) pixels, so a reader can hash the picture without the timecode/fps chrome.
+ * Only ever called by --visual-capture-dir, after the measured interval has closed. */
+static QImage captureTopLevelWindowByPrintWindow( QWidget *topLevel,
+                                                  QWidget *viewportWidget,
+                                                  QRect *viewportRectOut,
+                                                  QString *reasonOut )
+{
+    if( viewportRectOut ) *viewportRectOut = QRect();
+#ifdef Q_OS_WIN
+    if( !topLevel )
+    {
+        if( reasonOut ) *reasonOut = QStringLiteral( "no_window" );
+        return QImage();
+    }
+    const HWND hwnd = reinterpret_cast<HWND>( topLevel->window()->winId() );
+    RECT windowRect;
+    if( hwnd == nullptr || !GetWindowRect( hwnd, &windowRect ) )
+    {
+        if( reasonOut ) *reasonOut = QStringLiteral( "get_window_rect_failed" );
+        return QImage();
+    }
+    const int width = windowRect.right - windowRect.left;
+    const int height = windowRect.bottom - windowRect.top;
+    if( width <= 0 || height <= 0 )
+    {
+        if( reasonOut ) *reasonOut = QStringLiteral( "empty_window_rect" );
+        return QImage();
+    }
+    POINT clientOrigin = { 0, 0 };
+    ClientToScreen( hwnd, &clientOrigin );
+
+    HDC screenDc = GetDC( nullptr );
+    HDC memoryDc = CreateCompatibleDC( screenDc );
+    BITMAPINFO bitmapInfo;
+    ZeroMemory( &bitmapInfo, sizeof( bitmapInfo ) );
+    bitmapInfo.bmiHeader.biSize = sizeof( BITMAPINFOHEADER );
+    bitmapInfo.bmiHeader.biWidth = width;
+    bitmapInfo.bmiHeader.biHeight = -height;   // top-down rows
+    bitmapInfo.bmiHeader.biPlanes = 1;
+    bitmapInfo.bmiHeader.biBitCount = 32;
+    bitmapInfo.bmiHeader.biCompression = BI_RGB;
+    void *bits = nullptr;
+    HBITMAP dib = CreateDIBSection( screenDc, &bitmapInfo, DIB_RGB_COLORS, &bits, nullptr, 0 );
+    QImage image;
+    if( memoryDc && dib && bits )
+    {
+        const HGDIOBJ previous = SelectObject( memoryDc, dib );
+#ifndef PW_RENDERFULLCONTENT
+#define PW_RENDERFULLCONTENT 0x00000002
+#endif
+        const BOOL printed = PrintWindow( hwnd, memoryDc, PW_RENDERFULLCONTENT );
+        GdiFlush();
+        if( printed )
+        {
+            // 32 bpp rows are always DWORD aligned: the stride is width * 4.
+            image = QImage( static_cast<const uchar *>( bits ), width, height, width * 4,
+                            QImage::Format_RGB32 ).copy();
+        }
+        else if( reasonOut )
+        {
+            *reasonOut = QStringLiteral( "print_window_failed error=%1" ).arg( static_cast<qulonglong>( GetLastError() ) );
+        }
+        SelectObject( memoryDc, previous );
+    }
+    else if( reasonOut )
+    {
+        *reasonOut = QStringLiteral( "dib_section_failed" );
+    }
+    if( dib ) DeleteObject( dib );
+    if( memoryDc ) DeleteDC( memoryDc );
+    if( screenDc ) ReleaseDC( nullptr, screenDc );
+
+    if( !image.isNull() && viewportWidget )
+    {
+        const qreal dpr = topLevel->window()->devicePixelRatioF();
+        const QPoint offset = viewportWidget->mapTo( topLevel->window(), QPoint( 0, 0 ) );
+        const QRect viewport(
+            ( clientOrigin.x - windowRect.left ) + qRound( offset.x() * dpr ),
+            ( clientOrigin.y - windowRect.top ) + qRound( offset.y() * dpr ),
+            qRound( viewportWidget->width() * dpr ),
+            qRound( viewportWidget->height() * dpr ) );
+        if( viewportRectOut ) *viewportRectOut = viewport.intersected( image.rect() );
+    }
+    return image;
+#else
+    Q_UNUSED( topLevel );
+    Q_UNUSED( viewportWidget );
+    if( reasonOut ) *reasonOut = QStringLiteral( "print_window_unavailable_on_this_platform" );
+    return QImage();
+#endif
+}
+
 /* spaceTag argument options: ffmpeg color space tag number compliant */
 #define SPACETAG_REC709   1   /* rec709 color space */
 #define SPACETAG_UNKNOWN  2   /* No color space tag set */
@@ -10026,6 +10123,208 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                 .arg( glWindowReadbackReason )
                 .arg( glWindowPresentedSerial )
                 .arg( bool01( glWindowPresentedSerialValid ) ) );
+    }
+
+    // PLAYBACK-VISUAL-INSPECTION-1 (--visual-capture-dir, default off): every venue playback leg leaves
+    // window captures a reviewer can LOOK at. Measured traps it is built around: a capture DURING a timed
+    // window roughly doubles render cost, and every cadence metric can read perfect while the display is
+    // frozen. So: (1) the measured session is CLOSED first -- finishPlaybackSmokeTelemetry() writes the
+    // playback_smoke summary/gate lines exactly as the stop below would, and every oracle number is read
+    // there -- while Play keeps running (this is the SAME admitted Play continuing, never a new Play: no
+    // programmatic play, no restart, no replay); (2) the window is captured with PrintWindow across an
+    // UNTIMED tail, then the instant Play is paused, then after the paused full-quality path re-renders
+    // that same frame; (3) every PNG encode and file write waits until the Play has stopped. A capture
+    // failure is recorded in visual.json and never changes this run's exit code: the measured numbers are
+    // already written and are not the capture's to judge.
+    if( !options.visualCaptureDir.isEmpty() && ui->actionPlay->isChecked() )
+    {
+        const int visualPlayFrames = 6;
+        const int visualTailMs = 3000;
+        const int visualMaxSavedWidth = 1920;
+        struct VisualGrab
+        {
+            QString kind;
+            int index = 0;
+            QImage image;
+            QRect viewport;
+            QString reason;
+            QString capturedUtc;
+            qint64 tailElapsedMs = 0;
+            int displayFrame = -1;
+            qulonglong serial = 0;
+            bool playActive = false;
+            bool settled = false;
+            double captureMs = 0.0;
+        };
+        QVector<VisualGrab> visualGrabs;
+        QWidget *visualGlContainer = findChild<QWidget *>( QStringLiteral("gpuDisplayWindowContainer") );
+        const bool visualUseGlContainer =
+            GpuDisplayWindow::isActive() && visualGlContainer && visualGlContainer->isVisible();
+        QWidget *visualViewportWidget = visualUseGlContainer
+            ? visualGlContainer
+            : ( ui->graphicsView ? ui->graphicsView->viewport() : nullptr );
+        QElapsedTimer visualTailClock;
+        auto grabVisual = [&]( const QString &kind, int index, bool settled )
+        {
+            VisualGrab grab;
+            grab.kind = kind;
+            grab.index = index;
+            grab.tailElapsedMs = visualTailClock.elapsed();
+            grab.displayFrame = m_lastPresentedRequestContextValid
+                ? static_cast<int>( m_lastPresentedRequestContext.frameNumber ) : -1;
+            grab.serial = static_cast<qulonglong>( m_lastPresentedRequestSerial );
+            grab.playActive = ui->actionPlay->isChecked();
+            grab.settled = settled;
+            QElapsedTimer captureClock;
+            captureClock.start();
+            grab.image = captureTopLevelWindowByPrintWindow( this, visualViewportWidget, &grab.viewport, &grab.reason );
+            grab.captureMs = static_cast<double>( captureClock.nsecsElapsed() ) / 1.0e6;
+            grab.capturedUtc = QDateTime::currentDateTimeUtc().toString( Qt::ISODateWithMs );
+            visualGrabs.append( grab );
+        };
+
+        // (1) the measured interval ends HERE, before the first capture.
+        m_contactSheetCaptureActive = false;   // no in-pass contact-sheet grab can land in the tail
+        const qulonglong visualMeasuredSession = static_cast<qulonglong>( m_playbackSmokeSessionId );
+        finishPlaybackSmokeTelemetry( "visual-capture" );
+        const QString visualTailBeginUtc = QDateTime::currentDateTimeUtc().toString( Qt::ISODateWithMs );
+        logInteractionEvent(
+            QStringLiteral("gui_smoke.visual_capture.begin"),
+            QStringLiteral("measured_session=%1 tail_ms=%2 play_frames=%3 tail_begin_utc=%4")
+                .arg( visualMeasuredSession ).arg( visualTailMs ).arg( visualPlayFrames ).arg( visualTailBeginUtc ) );
+        visualTailClock.start();
+
+        // (2) K play frames, evenly spaced across the untimed tail (the centres of K equal slices).
+        for( int k = 0; k < visualPlayFrames; ++k )
+        {
+            const qint64 targetMs = static_cast<qint64>( ( 2 * k + 1 ) * visualTailMs / ( 2 * visualPlayFrames ) );
+            while( visualTailClock.elapsed() < targetMs )
+            {
+                qApp->processEvents( QEventLoop::AllEvents );
+                QThread::msleep( 2 );
+            }
+            grabVisual( QStringLiteral("play"), k, false );
+        }
+        // The frame on screen the instant Play is paused: captured BEFORE any event is processed, so it
+        // is still the frame the playback path presented (the paused re-render has not landed yet).
+        ui->actionPlay->setChecked( false );
+        grabVisual( QStringLiteral("stop"), 0, false );
+        const QString visualTailEndUtc = QDateTime::currentDateTimeUtc().toString( Qt::ISODateWithMs );
+        const int visualStopFrame = visualGrabs.last().displayFrame;
+        qApp->processEvents( QEventLoop::AllEvents );
+        for( int attempt = 0; attempt < 400 && m_pRenderThread && !m_pRenderThread->isIdle(); ++attempt )
+        {
+            qApp->processEvents( QEventLoop::AllEvents );
+            QThread::msleep( 5 );
+        }
+        // (3) the SAME timeline position through the paused full-quality path.
+        int visualSettledFrame = visualStopFrame;
+        const bool visualSettled = visualStopFrame >= 0
+            && seekAndSettleLoadedClip( visualStopFrame, "gui-smoke-visual-capture-paused", &visualSettledFrame, 20000 );
+        for( int i = 0; i < 10; ++i )
+        {
+            // let the display window present the settled frame before it is captured
+            qApp->processEvents( QEventLoop::AllEvents );
+            QThread::msleep( 10 );
+        }
+        grabVisual( QStringLiteral("paused"), 0, visualSettled );
+
+        // (4) files: Play is stopped, so no encode or write below can touch a played frame.
+        QString visualError;
+        int visualFramesWritten = 0;
+        QJsonArray visualFramesJson;
+        if( !QDir().mkpath( options.visualCaptureDir ) )
+        {
+            visualError = QStringLiteral( "visual capture directory could not be created" );
+        }
+        const QDir visualDir( options.visualCaptureDir );
+        for( const VisualGrab &grab : visualGrabs )
+        {
+            const QString fileName = grab.kind == QStringLiteral("play")
+                ? QStringLiteral("play-%1.png").arg( grab.index )
+                : grab.kind + QStringLiteral(".png");
+            QJsonObject frameJson;
+            frameJson.insert( QStringLiteral("kind"), grab.kind );
+            frameJson.insert( QStringLiteral("index"), grab.index );
+            frameJson.insert( QStringLiteral("file"), fileName );
+            frameJson.insert( QStringLiteral("captured_utc"), grab.capturedUtc );
+            frameJson.insert( QStringLiteral("tail_elapsed_ms"), static_cast<double>( grab.tailElapsedMs ) );
+            frameJson.insert( QStringLiteral("display_frame"), grab.displayFrame );
+            frameJson.insert( QStringLiteral("serial"), static_cast<double>( grab.serial ) );
+            frameJson.insert( QStringLiteral("play_active"), grab.playActive );
+            frameJson.insert( QStringLiteral("capture_ms"), grab.captureMs );
+            if( grab.kind == QStringLiteral("paused") )
+            {
+                frameJson.insert( QStringLiteral("settled"), grab.settled );
+                frameJson.insert( QStringLiteral("settled_frame"), visualSettledFrame );
+            }
+            bool saved = false;
+            if( !grab.image.isNull() && visualError.isEmpty() )
+            {
+                // Saved at most visualMaxSavedWidth wide (a reviewer's view, not a measurement); the
+                // viewport rectangle is scaled with it, so it always names the saved image's pixels.
+                QImage savedImage = grab.image;
+                QRect savedViewport = grab.viewport;
+                if( savedImage.width() > visualMaxSavedWidth )
+                {
+                    const double factor = static_cast<double>( visualMaxSavedWidth ) / savedImage.width();
+                    savedImage = grab.image.scaled( visualMaxSavedWidth, qMax( 1, qRound( grab.image.height() * factor ) ),
+                                                    Qt::IgnoreAspectRatio, Qt::SmoothTransformation );
+                    savedViewport = QRect( qRound( grab.viewport.x() * factor ), qRound( grab.viewport.y() * factor ),
+                                           qRound( grab.viewport.width() * factor ), qRound( grab.viewport.height() * factor ) )
+                                        .intersected( savedImage.rect() );
+                }
+                saved = savedImage.save( visualDir.absoluteFilePath( fileName ), "PNG" );
+                frameJson.insert( QStringLiteral("captured_width"), grab.image.width() );
+                frameJson.insert( QStringLiteral("captured_height"), grab.image.height() );
+                frameJson.insert( QStringLiteral("width"), savedImage.width() );
+                frameJson.insert( QStringLiteral("height"), savedImage.height() );
+                QJsonObject viewportJson;
+                viewportJson.insert( QStringLiteral("x"), savedViewport.x() );
+                viewportJson.insert( QStringLiteral("y"), savedViewport.y() );
+                viewportJson.insert( QStringLiteral("w"), savedViewport.width() );
+                viewportJson.insert( QStringLiteral("h"), savedViewport.height() );
+                frameJson.insert( QStringLiteral("viewport"), viewportJson );
+                if( saved ) ++visualFramesWritten;
+                else if( visualError.isEmpty() ) visualError = QStringLiteral( "%1 could not be written" ).arg( fileName );
+            }
+            frameJson.insert( QStringLiteral("saved"), saved );
+            frameJson.insert( QStringLiteral("reason"), grab.reason );
+            visualFramesJson.append( frameJson );
+        }
+        QJsonObject visualJson;
+        visualJson.insert( QStringLiteral("schema"), QStringLiteral("mlv-app/visual-capture/v1") );
+        visualJson.insert( QStringLiteral("method"), QStringLiteral("PrintWindow(PW_RENDERFULLCONTENT)") );
+        visualJson.insert( QStringLiteral("measured_session"), static_cast<double>( visualMeasuredSession ) );
+        visualJson.insert( QStringLiteral("tail_ms"), visualTailMs );
+        visualJson.insert( QStringLiteral("play_frames_requested"), visualPlayFrames );
+        visualJson.insert( QStringLiteral("tail_begin_utc"), visualTailBeginUtc );
+        visualJson.insert( QStringLiteral("tail_end_utc"), visualTailEndUtc );
+        visualJson.insert( QStringLiteral("viewport_source"), visualUseGlContainer
+            ? QStringLiteral("gpu_display_window_container") : QStringLiteral("graphics_view_viewport") );
+        visualJson.insert( QStringLiteral("frames"), visualFramesJson );
+        visualJson.insert( QStringLiteral("frames_written"), visualFramesWritten );
+        visualJson.insert( QStringLiteral("error"), visualError );
+        if( QDir( options.visualCaptureDir ).exists() )
+        {
+            QFile visualJsonFile( visualDir.absoluteFilePath( QStringLiteral("visual.json") ) );
+            if( visualJsonFile.open( QIODevice::WriteOnly | QIODevice::Truncate ) )
+            {
+                visualJsonFile.write( QJsonDocument( visualJson ).toJson( QJsonDocument::Indented ) );
+                visualJsonFile.close();
+            }
+        }
+        logInteractionEvent(
+            QStringLiteral("gui_smoke.visual_capture"),
+            QStringLiteral("measured_session=%1 requested=%2 written=%3 stop_frame=%4 paused_settled=%5 tail_begin_utc=%6 tail_end_utc=%7 error=\"%8\"")
+                .arg( visualMeasuredSession )
+                .arg( visualGrabs.size() )
+                .arg( visualFramesWritten )
+                .arg( visualStopFrame )
+                .arg( bool01( visualSettled ) )
+                .arg( visualTailBeginUtc )
+                .arg( visualTailEndUtc )
+                .arg( visualError ) );
     }
 
     if( ui->actionPlay->isChecked() )

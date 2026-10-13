@@ -173,6 +173,13 @@ public:
         // paired seek capture of the same N targets here, after the measured Play has stopped
         // (it never plays; its sidecars record playback_path=false).
         QString contactSheetSeekDir;
+        // --visual-capture-dir: opt-in, default empty (off: nothing runs and nothing is logged).
+        // PLAYBACK-VISUAL-INSPECTION-1: AFTER the measured Play's own stop condition, its telemetry
+        // session is closed (the playback_smoke summary is written first), Play keeps running UNTIMED
+        // for a short tail and the WINDOW is captured with PrintWindow(PW_RENDERFULLCONTENT): play
+        // frames across the tail, the frame on screen the instant Play is paused, and the same frame
+        // re-rendered by the paused full-quality path. PNGs + visual.json land in this directory.
+        QString visualCaptureDir;
         PlaybackProfileScope scope = PlaybackProfileScope::None;
         PlaybackProfileDebayerRequest playbackDebayer =
             PlaybackProfileDebayerRequest::Auto;
