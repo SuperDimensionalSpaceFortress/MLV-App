@@ -104,6 +104,9 @@ CPU_REDUCED_LEGS = tuple(f"legs/m16-1243-cpu-reduced-{mode}-s{scale}.json" for s
 # itself at the app's default K=2). Each differs from its twin only in its legId and generatorArgs.rawPrefetchDecoders 1.
 DECODER_LEGS = {"legs/m16-1243-pace-cinematic-fullscreen-s4-dec1.json": "legs/m16-1243-pace-cinematic-fullscreen-s4.json",
                 "legs/m16-1243-pace-cinematic-fullscreen-s4-heavy-dec1.json": "legs/m16-1243-pace-cinematic-fullscreen-s4-heavy.json"}
+# UPSTREAM-CPU-BASELINE-1: the fork arm of the upstream 877dea2c CPU A/B -- cpu-only SPEED legs at scale 1 with Look Assist OFF (generatorArgs.disableLookAssist),
+# one per display mode upstream shares (it has no preview-scale equivalent, so no s2/s4 twin).
+UPSTREAM_BASELINE_LEGS = tuple(f"legs/m16-1243-upstream-baseline-cpu-{mode}-s1.json" for mode in ("fullscreen", "windowed"))
 # PLAYBACK-STARTUP-CATCHUP-BURST-1 r7: the present-trace twin of a display-matrix cell, differing only in its legId and generatorArgs.presentTrace true.
 PTRACE_LEGS = {"legs/m16-1243-display-fullscreen-s4-ptrace.json": "legs/m16-1243-display-fullscreen-s4.json"}
 # LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1 added the scale-2 Cinematic twin of the scale-2 look leg (the Bachelor CPU Classic | Cinematic look pair).
@@ -111,7 +114,7 @@ SHIPPED_LEGS = ("legs/m16-1243-speed.json", "legs/m16-1243-look.json", "legs/m16
                 *LOOKAHEAD_LEGS, *HEAVY_LEGS, *DECODER_LEGS, "legs/m16-1243-look-scale2-cinematic.json", "legs/m16-1243-look-film.json",
                 "legs/m16-1243-look-scale2-film.json", *(f"legs/m16-1243-look-scale2-{flavor}-agxoff.json" for flavor in ("cinematic", "film")),
                 *(f"legs/m16-1243-display-{mode}-s{scale}-vsync1.json" for scale in (1, 2, 4) for mode in ("fullscreen", "windowed")),
-                *CPU_REDUCED_LEGS, *PTRACE_LEGS)
+                *CPU_REDUCED_LEGS, *UPSTREAM_BASELINE_LEGS, *PTRACE_LEGS)
 # PLAYBACK-VSYNC-DEFAULT-1: the swap-interval-1 twins of the six display-matrix legs (the vsync A/B; the originals stay at the app's default 0).
 VSYNC1_LEGS = tuple(rel.replace(".json", "-vsync1.json") for rel in DISPLAY_MATRIX_LEGS)
 # LOOK-ASSIST-FILM-FLAVOR-2 r2: the AgX-off twins of the scale-2 Cinematic and Film legs carry a committed look receipt (look-receipts/agx-off.marxml).
@@ -579,6 +582,28 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
         self.assertEqual(schema["properties"]["generatorArgs"]["properties"]["playbackProcessing"]["enum"], ["receipt", "subset"])
 
+    def test_disable_look_assist_reaches_the_smoke_command_and_absent_changes_nothing(self) -> None:
+        """UPSTREAM-CPU-BASELINE-1: -DisableLookAssist adds exactly '-DisableLookAssist' to the smoke runner's command (it passes --no-look-assist and fails
+        the run closed if the app still reports Look Assist enabled); absent, the job is the default byte for byte. The runner maps the leg's
+        generatorArgs.disableLookAssist for any leg (outside the forced-look branch), and the schema types it boolean."""
+        default = self.generate(GENERATOR, "nola-default.job.ps1", ["-Backend", "cpu", "-ScaleFactor", "1"])
+        nola = self.generate(GENERATOR, "nola.job.ps1", ["-Backend", "cpu", "-ScaleFactor", "1", "-DisableLookAssist"])
+        self.assertEqual(self.parse_errors(nola), 0)
+        self.assertNotIn("-DisableLookAssist", default.read_text(encoding="utf-8"))
+        text = nola.read_text(encoding="utf-8")
+        self.assertEqual(text.count("-RequireLookAssist:`$false -DisableLookAssist -Scope none"), 1)
+        self.assertEqual(text.replace("-DisableLookAssist ", ""), default.read_text(encoding="utf-8"))
+        windowed = self.generate(GENERATOR, "nola-windowed.job.ps1", ["-Backend", "cpu", "-ScaleFactor", "1", "-DisplayMode", "windowed", "-DisableLookAssist"])
+        self.assertEqual(self.parse_errors(windowed), 0)
+        self.assertEqual(windowed.read_text(encoding="utf-8").count("-DisableLookAssist -Scope none"), 1)
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        mapping = "if ($spec.generatorArgs.PSObject.Properties['disableLookAssist'] -and [bool]$spec.generatorArgs.disableLookAssist) { $gen['DisableLookAssist'] = $true }"
+        self.assertIn(mapping, runner)
+        self.assertLess(runner.index(mapping), runner.index("if (-not $isLook -and $spec.generatorArgs.PSObject.Properties['forceLookAssist']"),
+                        "the mapping must sit outside the forceLookAssist branch")
+        schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
+        self.assertEqual(schema["properties"]["generatorArgs"]["properties"]["disableLookAssist"]["type"], "boolean")
+
     def test_the_raw_prefetch_decoder_count_reaches_the_job_only_when_asked(self) -> None:
         """PLAYBACK-LJ92-DECODE-THROUGHPUT-1: generatorArgs.rawPrefetchDecoders maps to -RawPrefetchDecoders for any leg (not only a forced-look
         pace leg); 0 is the no-prefetch arm, k the decoder count, and absent leaves the job's text exactly as it was."""
@@ -620,7 +645,9 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
                              (["-ForceLookAssist"], "DUAL_VENUE_LOOK_REQUIRES_CONTACT_SHEET"),
                              (["-LookPaceLeg"], "DUAL_VENUE_LOOK_PACE_LEG_SHAPE"),
                              (["-ForceLookAssist", "-ContactSheet", "-LookPaceLeg"], "DUAL_VENUE_LOOK_PACE_LEG_SHAPE"),
-                             (["-PlaybackRenderLookaheadFrames", "3"], "DUAL_VENUE_LOOKAHEAD_NEEDS_LOOK_PACE_LEG")):
+                             (["-PlaybackRenderLookaheadFrames", "3"], "DUAL_VENUE_LOOKAHEAD_NEEDS_LOOK_PACE_LEG"),
+                             (["-ForceLookAssist", "-ContactSheet", "-DisableLookAssist"], "DUAL_VENUE_LOOK_ASSIST_CONFLICT"),
+                             (["-ForceLookAssist", "-LookPaceLeg", "-LookFlavor", "cinematic", "-DisableLookAssist"], "DUAL_VENUE_LOOK_ASSIST_CONFLICT")):
             out = self.tmp / "refused.job.ps1"
             proc = run_pwsh(["-File", str(GENERATOR), "-SourceCommit", self.head, "-BuildManifestSha256", "ab" * 32,
                              "-ClipId", FIXTURE_IDS[0], "-FixtureSha256", "cd" * 32, "-RepoRoot", str(self.repo), "-OutFile", str(out), *extra])
@@ -5444,6 +5471,25 @@ class LegSpecSchemaTests(unittest.TestCase):
             self.assertEqual(arm["legId"], twin["legId"] + "-dec1", rel)
             self.assertEqual(arm["generatorArgs"].pop("rawPrefetchDecoders"), 1, rel)
             self.assertEqual(dict(arm, legId=twin["legId"]), twin, rel)
+
+    def test_the_upstream_baseline_legs_are_no_look_cpu_speed_legs_at_scale_1(self) -> None:
+        """UPSTREAM-CPU-BASELINE-1: the fork arm of the upstream CPU A/B. Each leg is a cpu-only SPEED leg at scale 1 in the display mode its name says,
+        LIGHT, the pace legs' 95 % quiescence gate, Look Assist explicitly OFF (never forced), and informational criteria (the A/B is read lane-side)."""
+        for rel in UPSTREAM_BASELINE_LEGS:
+            spec = json.loads((DV / rel).read_text(encoding="utf-8"))
+            self.jsonschema.validate(spec, self.schema)
+            mode = re.match(r"legs/m16-1243-upstream-baseline-cpu-(fullscreen|windowed)-s1\.json$", rel).group(1)
+            self.assertEqual(spec["legId"], Path(rel).stem, rel)
+            self.assertEqual(spec["card"], "UPSTREAM-CPU-BASELINE-1", rel)
+            self.assertEqual((spec["legType"], spec["clipId"], spec["playSeconds"], spec["backends"], spec["scaleFactor"], spec["displayMode"]),
+                             ("speed", "M16-1243", 25, ["cpu"], 1, mode), rel)
+            self.assertEqual(spec["generatorArgs"], {"telemetryArm": "LIGHT", "cpuQuiescenceThresholdPercent": 95, "disableLookAssist": True}, rel)
+            self.assertNotIn("look", spec, rel)
+            self.assertEqual(spec["criteria"], {"acceptance": {"cpu": []}, "supplementary": {"cpu": []}}, rel)
+        bad = json.loads((DV / UPSTREAM_BASELINE_LEGS[0]).read_text(encoding="utf-8"))
+        bad["generatorArgs"]["disableLookAssist"] = "true"
+        with self.assertRaises(self.jsonschema.ValidationError):
+            self.jsonschema.validate(bad, self.schema)
 
     def test_the_present_trace_legs_are_their_twins_with_the_trace_on(self) -> None:
         """PLAYBACK-STARTUP-CATCHUP-BURST-1 r7: a present-trace leg differs from its twin only in its legId and generatorArgs.presentTrace true."""

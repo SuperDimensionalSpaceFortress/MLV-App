@@ -52,8 +52,9 @@ if (-not (Get-Command Find-WorktreeHolders -ErrorAction SilentlyContinue)) {
 }
 
 # The repository the PR probe asks about: the same literal Export-PrReviewEvidence.ps1, landing-probe.ps1 and the other
-# tools/coordination callers use (`gh repo view` resolves it, and SuperDimensionalSpaceFortress/MLV-App, to one repository).
-$script:LaneBulkRepo = 'layibabalola/MLV-App'
+# tools/coordination callers use (repo-slug.ps1; Export-PrReviewEvidence.ps1 and set-required-checks.ps1 keep a pinned literal equal to it).
+if (-not (Get-Command Get-MlvRepoSlug -ErrorAction SilentlyContinue)) { . (Join-Path $PSScriptRoot 'repo-slug.ps1') }
+$script:LaneBulkRepo = Get-MlvRepoSlug
 
 function Test-LaneScratchSame([string]$A, [string]$B) {
     return ($A.TrimEnd('\') -ieq $B.TrimEnd('\'))

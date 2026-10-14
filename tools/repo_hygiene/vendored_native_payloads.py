@@ -26,6 +26,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, Iterable
 
 from .core import is_reparse_point
+from .repository_identity import CANONICAL_REPOSITORY, alias_urls, is_repository_alias
 
 
 DEFAULT_MANIFEST = Path("tools/gates/vendored-native-payloads.json")
@@ -730,7 +731,7 @@ def _canonical_promotion_target_head(repo_root: Path) -> str:
         return live_github_branch_head(
             repo_root,
             load_closeout_config(repo_root),
-            "layibabalola/MLV-App",
+            CANONICAL_REPOSITORY,
             "master",
         )
     except (HygieneError, OSError, ValueError, TypeError) as exc:
@@ -995,7 +996,8 @@ def _validate_registered_promotion_claim(
     }, f"{payload_id} registered promotion source fields are incomplete or unexpected")
     _require(source.get("kind") == "github_issue_comment",
              f"{payload_id} promotion approval source kind is invalid")
-    _require(source.get("repository") == "layibabalola/MLV-App",
+    # Recorded approvals name the repository as it was spelled when written (pre- or post-transfer).
+    _require(is_repository_alias(source.get("repository")),
              f"{payload_id} promotion approval repository is invalid")
     _require(isinstance(source.get("pull_request"), int) and source["pull_request"] > 0,
              f"{payload_id} promotion approval pull_request is invalid")
@@ -1065,14 +1067,18 @@ def _verify_provider_owner_claim(repo_root: Path, claim: dict[str, Any], payload
     _require(isinstance(response, dict),
              f"{payload_id} live promotion approval response is malformed")
     user = response.get("user")
-    expected_issue_url = (
-        f"https://api.github.com/repos/{source['repository']}/issues/{source['pull_request']}"
+    # Live GitHub answers under the repository's CURRENT name; the record may carry either.
+    expected_issue_urls = alias_urls(
+        f"https://api.github.com/repos/{{repository}}/issues/{source['pull_request']}"
+    )
+    expected_html_urls = alias_urls(
+        f"https://github.com/{{repository}}/pull/{source['pull_request']}#issuecomment-{source['comment_id']}"
     )
     _require(response.get("id") == source["comment_id"],
              f"{payload_id} live promotion approval comment id mismatch")
-    _require(response.get("html_url") == source["html_url"],
+    _require(response.get("html_url") in expected_html_urls,
              f"{payload_id} live promotion approval URL mismatch")
-    _require(response.get("issue_url") == expected_issue_url,
+    _require(response.get("issue_url") in expected_issue_urls,
              f"{payload_id} live promotion approval pull request mismatch")
     _require(response.get("created_at") == source["created_at"],
              f"{payload_id} live promotion approval timestamp mismatch")
