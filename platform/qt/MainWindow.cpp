@@ -5869,7 +5869,7 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
             && ( texturePresentHandoffMode == QStringLiteral("direct_device_bayer16")
               || texturePresentHandoffMode == QStringLiteral("retained_device_bayer16") );
         const bool scopeDisplayNeedsPresentedPixels =
-            ui->actionShowEditArea->isChecked()
+            scopeDisplayConsumesPresentedPixels( ui->actionShowEditArea->isChecked() )
             && ( ui->actionShowHistogram->isChecked()
               || ui->actionShowWaveFormMonitor->isChecked()
               || ui->actionShowParade->isChecked()
@@ -6479,7 +6479,8 @@ void MainWindow::drawFrame( bool updateTimecodeLabel )
         m_pMlvObject
         && doesMlvAlwaysUseAmaze( m_pMlvObject ) != 0
         && !ui->actionCaching->isChecked();
-    const bool scopeDisplayVisible = ui->dockWidgetEdit->isVisible();
+    const bool scopeDisplayVisible =
+        scopeDisplayConsumesPresentedPixels( ui->dockWidgetEdit->isVisible() );
     renderPolicy.histogramEnabled = mainWindowScopeActionConsumesPresentedPixels(
         scopeDisplayVisible, ui->actionShowHistogram->isChecked() );
     renderPolicy.waveformEnabled = mainWindowScopeActionConsumesPresentedPixels(
@@ -8981,7 +8982,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
             "playback_processing_selected=%5 gpu_preview_processing_request=%6 "
             "gpu_bilinear_debayer_request=%7 gpu_amaze_debayer_request=%8 "
             "gpu_amaze_texture_present_environment=%9 playback_policy_active=%10 "
-            "drop_frame_forced=%11 drop_frame=%12" )
+            "drop_frame_forced=%11 drop_frame=%12 scopes_during_playback=%13" )
             .arg( bool01( options.forcePlaybackDebayer ) )
             .arg( QString::fromLatin1(
                       playback_profile_debayer_request_name(
@@ -9003,7 +9004,10 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
             .arg( bool01( gpuAmazeTexturePresentRequestedByEnvironment() ) )
             .arg( bool01( m_headlessPlaybackProfileUsePlaybackPolicy ) )
             .arg( bool01( options.forceDropFrame ) )
-            .arg( bool01( ui->actionDropFrameMode->isChecked() ) ) );
+            .arg( bool01( ui->actionDropFrameMode->isChecked() ) )
+            // PLAYBACK-SCOPES-OPTION-1: which "Scopes During Playback" mode the run played under, so a
+            // --scope leg's evidence says whether its scope was computed while playing (Hide: it was not).
+            .arg( QString::fromLatin1( playbackScopesModeToken( m_playbackScopesMode ) ) ) );
 
     const int totalFrames = getMlvFrames( m_pMlvObject );
     if( totalFrames < 2 )
@@ -11604,6 +11608,12 @@ void MainWindow::initGui( void )
     m_playbackAutoTargetFpsGroup->addAction( ui->actionPlaybackAutoTarget30 );
     m_playbackAutoTargetFpsGroup->addAction( ui->actionPlaybackAutoTarget60 );
 
+    m_playbackScopesModeGroup = new QActionGroup( this );
+    m_playbackScopesModeGroup->setExclusive( true );
+    m_playbackScopesModeGroup->addAction( ui->actionPlaybackScopesHide );
+    m_playbackScopesModeGroup->addAction( ui->actionPlaybackScopesThrottled );
+    m_playbackScopesModeGroup->addAction( ui->actionPlaybackScopesLive );
+
     //Keyboard shortcut Q cycles Smoothness -> Quality -> Auto -> Smoothness.
     QShortcut * pQualityCycle = new QShortcut( QKeySequence( Qt::Key_Q ), this );
     pQualityCycle->setContext( Qt::ApplicationShortcut );
@@ -11816,6 +11826,12 @@ void MainWindow::initGui( void )
         m_pPlaybackQualityToolButtonMenu->addMenu( pScaleFactorSub );
         m_pPlaybackQualityToolButtonMenu->addAction( ui->actionPlaybackShowQualityIndicator );
         m_pPlaybackQualityToolButtonMenu->addAction( ui->actionPlaybackVSync );
+        QMenu *pScopesSub = new QMenu( tr( "Scopes During Playback" ),
+                                       m_pPlaybackQualityToolButtonMenu );
+        pScopesSub->addAction( ui->actionPlaybackScopesHide );
+        pScopesSub->addAction( ui->actionPlaybackScopesThrottled );
+        pScopesSub->addAction( ui->actionPlaybackScopesLive );
+        m_pPlaybackQualityToolButtonMenu->addMenu( pScopesSub );
         QMenu *pAutoTargetSub = new QMenu( tr( "Auto Target FPS" ),
                                            m_pPlaybackQualityToolButtonMenu );
         pAutoTargetSub->addAction( ui->actionPlaybackAutoTarget24 );
@@ -18881,7 +18897,8 @@ bool MainWindow::shouldUseGpu16PreviewPath( void ) const
     policyState.gpuViewportInstalled = gpuPreviewSurfaceActive();
     policyState.gpuWidgetViewportInstalled =
         GpuDisplayViewport::isInstalledOn( ui->graphicsView );
-    const bool scopeDisplayVisible = ui->dockWidgetEdit->isVisible();
+    const bool scopeDisplayVisible =
+        scopeDisplayConsumesPresentedPixels( ui->dockWidgetEdit->isVisible() );
     policyState.histogramEnabled = mainWindowScopeActionConsumesPresentedPixels(
         scopeDisplayVisible, ui->actionShowHistogram->isChecked() );
     policyState.waveformEnabled = mainWindowScopeActionConsumesPresentedPixels(
@@ -18903,7 +18920,8 @@ bool MainWindow::shouldUseGpuPreviewProcessingPath( void ) const
     policyState.gpuPreviewProcessingEnvironmentRequested =
         gpuPreviewProcessingRequestedByEnvironment();
     policyState.gpuPreviewProcessingCompatible = gpuPreviewProcessingIsSupported( m_pProcessingObject );
-    const bool scopeDisplayVisible = ui->dockWidgetEdit->isVisible();
+    const bool scopeDisplayVisible =
+        scopeDisplayConsumesPresentedPixels( ui->dockWidgetEdit->isVisible() );
     policyState.histogramEnabled = mainWindowScopeActionConsumesPresentedPixels(
         scopeDisplayVisible, ui->actionShowHistogram->isChecked() );
     policyState.waveformEnabled = mainWindowScopeActionConsumesPresentedPixels(
@@ -18930,7 +18948,8 @@ bool MainWindow::shouldUseGpuBilinearDebayerPath( void ) const
         gpuBilinearDebayerRequestedByEnvironment();
     policyState.gpuBilinearDebayerCompatible =
         m_pMlvObject && doesMlvAlwaysUseAmaze( m_pMlvObject ) == 0;
-    const bool scopeDisplayVisible = ui->dockWidgetEdit->isVisible();
+    const bool scopeDisplayVisible =
+        scopeDisplayConsumesPresentedPixels( ui->dockWidgetEdit->isVisible() );
     policyState.histogramEnabled = mainWindowScopeActionConsumesPresentedPixels(
         scopeDisplayVisible, ui->actionShowHistogram->isChecked() );
     policyState.waveformEnabled = mainWindowScopeActionConsumesPresentedPixels(
@@ -18959,7 +18978,8 @@ bool MainWindow::shouldUseGpuAmazeDebayerPath( void ) const
         m_pMlvObject
         && doesMlvAlwaysUseAmaze( m_pMlvObject ) != 0
         && !ui->actionCaching->isChecked();
-    const bool scopeDisplayVisible = ui->dockWidgetEdit->isVisible();
+    const bool scopeDisplayVisible =
+        scopeDisplayConsumesPresentedPixels( ui->dockWidgetEdit->isVisible() );
     policyState.histogramEnabled = mainWindowScopeActionConsumesPresentedPixels(
         scopeDisplayVisible, ui->actionShowHistogram->isChecked() );
     policyState.waveformEnabled = mainWindowScopeActionConsumesPresentedPixels(
@@ -21109,6 +21129,7 @@ void MainWindow::initPlaybackQualityFromSettings( void )
         ui->actionPlaybackShowQualityIndicator->setChecked( indicatorVisible );
     if ( ui->actionPlaybackVSync )
         ui->actionPlaybackVSync->setChecked( playbackVSyncFromSettings() );
+    applyPlaybackScopesMode( playbackScopesMode(), /*persist*/false );
     updatePhase3PlaybackQualityUi();
 
     if ( envQualityMode >= 0 )
@@ -22001,7 +22022,8 @@ bool MainWindow::gpuPlaybackReconTextureRouteEligibleAtScaleOne( void ) const
      * be evaluated before the library is ready. */
     if( !m_gpuPlaybackReconPolicyLibraryReady ) return false;
 
-    const bool scopeDisplayVisible = ui->dockWidgetEdit->isVisible();
+    const bool scopeDisplayVisible =
+        scopeDisplayConsumesPresentedPixels( ui->dockWidgetEdit->isVisible() );
     const bool hasScopeVisualization =
         mainWindowScopeActionConsumesPresentedPixels(
             scopeDisplayVisible, ui->actionShowHistogram->isChecked() )
@@ -22267,6 +22289,45 @@ void MainWindow::on_actionPlaybackVSync_triggered()
     playbackVSyncWriteToSettings( ui->actionPlaybackVSync->isChecked() );
 }
 
+// PLAYBACK-SCOPES-OPTION-1: "Scopes During Playback". Applies at once (the next presented frame and
+// the next policy read) and persists; in an automation run MLVAPP_PLAYBACK_SCOPES_DURING_PLAYBACK still wins
+// at the next start (PSO-01: an ordinary launch ignores it).
+void MainWindow::on_actionPlaybackScopesHide_triggered()
+{
+    applyPlaybackScopesMode( PlaybackScopesMode::Hide, /*persist*/true );
+}
+
+void MainWindow::on_actionPlaybackScopesThrottled_triggered()
+{
+    applyPlaybackScopesMode( PlaybackScopesMode::Throttled, /*persist*/true );
+}
+
+void MainWindow::on_actionPlaybackScopesLive_triggered()
+{
+    applyPlaybackScopesMode( PlaybackScopesMode::Live, /*persist*/true );
+}
+
+void MainWindow::applyPlaybackScopesMode( PlaybackScopesMode mode, bool persist )
+{
+    if ( persist ) playbackScopesModeWriteToSettings( mode );
+    m_playbackScopesMode = mode;
+    if ( ui->actionPlaybackScopesHide )
+        ui->actionPlaybackScopesHide->setChecked( mode == PlaybackScopesMode::Hide );
+    if ( ui->actionPlaybackScopesThrottled )
+        ui->actionPlaybackScopesThrottled->setChecked( mode == PlaybackScopesMode::Throttled );
+    if ( ui->actionPlaybackScopesLive )
+        ui->actionPlaybackScopesLive->setChecked( mode == PlaybackScopesMode::Live );
+}
+
+// PLAYBACK-SCOPES-OPTION-1: every scope consumer (the GPU preview policy, the slot release and the
+// scope draw itself) asks here, so Hide turns scopes off DURING PLAYBACK ONLY: a paused or stopped
+// frame still draws its scope, and while playing the GPU fast paths stay eligible.
+bool MainWindow::scopeDisplayConsumesPresentedPixels( bool editAreaVisible ) const
+{
+    return playbackScopeDisplayConsumesPresentedPixels(
+        editAreaVisible, ui->actionPlay->isChecked(), m_playbackScopesMode );
+}
+
 void MainWindow::on_actionPlaybackAutoTarget24_triggered()
 {
     applyPlaybackAutoTargetFps( 24, /*persist*/true );
@@ -22324,7 +22385,8 @@ MainWindowGpuPreviewPolicyState MainWindow::gpuPreviewPolicyForCurrentScopeState
         playback_recon_texture_present_requested_by_environment();
 
     const bool scopeDisplayVisible =
-        includeVisibleScopes && ui->dockWidgetEdit->isVisible();
+        includeVisibleScopes
+        && scopeDisplayConsumesPresentedPixels( ui->dockWidgetEdit->isVisible() );
     policyState.histogramEnabled = mainWindowScopeActionConsumesPresentedPixels(
         scopeDisplayVisible, ui->actionShowHistogram->isChecked() );
     policyState.waveformEnabled = mainWindowScopeActionConsumesPresentedPixels(
@@ -29145,6 +29207,14 @@ void MainWindow::on_actionPlay_toggled(bool checked)
     }
     selectDebayerAlgorithm();
     applyEffectiveDualIsoPlaybackSettings();
+    // PLAYBACK-SCOPES-OPTION-1: Hide skipped scope work while playing, so redraw the stopped frame
+    // for its scope (the policy admits the scope again now that Play is off).
+    if( !checked
+     && m_playbackScopesMode == PlaybackScopesMode::Hide
+     && ui->actionShowEditArea->isChecked() )
+    {
+        requestFrameRefresh( false, "play-stop-scopes" );
+    }
     if( checked )
     {
         // PLAYBACK-CLIP-LENGTH-ENFORCE-2: every Play start after the first in this process is a restart,
@@ -30654,7 +30724,13 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
 
     const double scopeDispatchStart = mlv_stage_timing_now();
     m_lastDrawFrameReadyScopesMs = 0.0;
-    if( ui->actionShowEditArea->isChecked() )
+    // PLAYBACK-SCOPES-OPTION-1: in Hide mode no scope work runs while playing; the label keeps the
+    // last paused frame's scope until playback stops. PSO-02: a frame requested under a policy that
+    // admitted an RGB8-less route (no scope consumer then, e.g. Hide before a switch to Live) is not
+    // measured; the next frame, requested under the new policy, supplies the scope.
+    if( playbackScopeFrameFeedsScope(
+            scopeDisplayConsumesPresentedPixels( ui->actionShowEditArea->isChecked() ),
+            mainWindowAllowsGpu16PreviewRender( requestContext.gpuPreviewPolicy ) ) )
     {
         const double scopes_start = mlv_stage_timing_now();
         bool updateScopesNow = true;
@@ -30663,13 +30739,10 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
             const double renderTotalMs =
                 telemetryDoubleValue( readyFrame.stageTimingTelemetry,
                                       "render_thread_total_ms" );
-            const int baseIntervalMs = playbackScopeUpdateIntervalMs();
             const int intervalMs =
-                renderTotalMs > 0.0
-                    ? qBound( baseIntervalMs,
-                              qRound( renderTotalMs * 1.4 ),
-                              500 )
-                    : baseIntervalMs;
+                playbackScopeUpdateIntervalForMode( m_playbackScopesMode,
+                                                    playbackScopeUpdateIntervalMs(),
+                                                    renderTotalMs );
             updateScopesNow =
                 intervalMs <= 0
              || m_playbackScopeLastUpdateTime <= 0.0

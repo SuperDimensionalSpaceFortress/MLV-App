@@ -26,6 +26,7 @@
 #include <QThreadPool>
 #include <QWaitCondition>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
@@ -109,7 +110,8 @@ bool workerStopped(bool onWorker)
 std::atomic<bool> g_sessionEndDone{false};
 std::atomic<bool> g_aboutToQuitConnected{false};
 
-/* Created on the first fault or recovery only: no thread exists otherwise. */
+/* Created on the first fault or recovery, or for the exit writes of an
+ * installed session only: no thread exists otherwise. */
 QThreadPool * workerPool()
 {
     static QThreadPool * pool = []() {
@@ -156,10 +158,14 @@ bool waitUnlessShuttingDown(qint64 ms)
     return !g_shuttingDown;
 }
 
-std::string reconDescribe()
+/* waitMs < 0 waits for the backend lock; otherwise at most waitMs (EXIT-DEADLINE-1:
+ * session end), and "" if the wait ran out. */
+std::string reconDescribe(int waitMs = -1)
 {
     llrpGpuPlaybackReconBackendInfo_t info;
-    if (!llrpGpuPlaybackReconGetBackendInfo(&info) || !info.available) return std::string();
+    const int ok = waitMs < 0 ? llrpGpuPlaybackReconGetBackendInfo(&info)
+                              : llrpGpuPlaybackReconGetBackendInfoWithin(&info, waitMs);
+    if (!ok || !info.available) return std::string();
     return core::gpuModelFromCudaDescribe(info.description);
 }
 
@@ -368,6 +374,17 @@ void drainBackendCudaErrors(int waitMs)
     gpuAmazeDebayerDrainCudaErrorsAtTeardown(waitMs);
 }
 
+/* EXIT-DEADLINE-1 (sol EXIT-JOIN-1): an exit write runs on the worker and the
+ * GUI thread waits for it at most waitMs, so neither EvtQuery / EvtClose (no
+ * timeout of their own) nor the file write can hold the close past its budget.
+ * A write still running is left to finish (State is never destroyed); the post
+ * routine skips its own while it runs. */
+void runExitWriteWithin(std::function<void()> write, qint64 waitMs)
+{
+    startedWorkerPool()->start(std::move(write));
+    workerPool()->waitForDone(static_cast<int>(waitMs > 0 ? waitMs : 0));
+}
+
 void sessionEnd()
 {
     bool expected = false;
@@ -393,9 +410,25 @@ void sessionEnd()
     const qint64 drainWaitMs = budget.remainingTime();
     drainBackendCudaErrors(static_cast<int>(drainWaitMs < core::kTerminalDrainWaitMs ? drainWaitMs
                                                                                       : core::kTerminalDrainWaitMs));
-    const qint64 remainingMs = budget.remainingTime();
-    flushImpl("session_end", true, false,
-              remainingMs < core::kSystemLogDeadlineMs ? remainingMs : core::kSystemLogDeadlineMs);
+    {
+        QMutexLocker locker(&state().mutex);
+        if (!state().installed) return;
+    }
+    // EXIT-DEADLINE-1 (fable DESCRIBE-CACHED-1): a GPU call stuck at close holds
+    // the backend lock the drain may just have given up on, so the model is read
+    // with a bounded wait and the flush itself never describes. If the wait runs
+    // out, the record keeps the model the live session cached, or none.
+    runExitWriteWithin([budget]() {
+        const qint64 describeMs = std::min<qint64>(budget.remainingTime(), core::kTerminalDrainWaitMs);
+        const std::string cudaModel = reconDescribe(static_cast<int>(describeMs));
+        if (!cudaModel.empty())
+        {
+            QMutexLocker locker(&state().mutex);
+            state().cudaModel = cudaModel;
+        }
+        flushImpl("session_end", true, false,
+                  std::min<qint64>(budget.remainingTime(), core::kSystemLogDeadlineMs), false);
+    }, budget.remainingTime());
 }
 
 /* r7 (opus r6 blocker): aboutToQuit runs session end before ~MainWindow
@@ -405,8 +438,9 @@ void sessionEnd()
  * after the views are gone: drain both DLLs once more and write any fault
  * still unwritten with one more flush. Bounded: the drain waits at most
  * kTerminalDrainWaitMs per lock, the flush reads neither the System log nor
- * the backend description, and a worker session end gave up on keeps the
- * write. A close with nothing new writes nothing. */
+ * the backend description, a worker session end gave up on keeps the write,
+ * and the write itself is waited for at most kSessionEndWaitMs. A close with
+ * nothing new writes nothing. */
 void postSessionFlush()
 {
     if (g_workerPoolCreated.load() && !workerPool()->waitForDone(0)) return;
@@ -415,7 +449,7 @@ void postSessionFlush()
         QMutexLocker locker(&state().mutex);
         if (!state().installed || state().unwritten.faults.empty()) return;
     }
-    flushImpl("post_session", false, false, 0, false);
+    runExitWriteWithin([]() { flushImpl("post_session", false, false, 0, false); }, core::kSessionEndWaitMs);
 }
 
 /* Both run on the GUI thread: aboutToQuit's session end has run iff the flag
@@ -726,6 +760,7 @@ void appCloseForTesting(const QString & logsDir, const std::function<void()> & b
     sessionEnd();                            // aboutToQuit
     if (afterSessionEnd) afterSessionEnd();  // ~MainWindow: the GPU views' destroyTexture
     sessionEndPostRoutine();                 // ~QApplication
+    if (g_workerPoolCreated.load()) workerPool()->waitForDone(); // an exit write past its wait
     llrpSetGpuStageTelemetrySink(nullptr);
     gpuAmazeDebayerSetStageTelemetrySink(nullptr);
     {

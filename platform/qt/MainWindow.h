@@ -35,6 +35,7 @@
 #include "PlaybackNativePaceGuard.h"
 #include "PlaybackPrepPresentationPolicy.h"
 #include "PlaybackPresentTrace.h"
+#include "PlaybackScopesDuringPlayback.h"
 #include "PlaybackSlipHistogram.h"
 #include "../../src/mlv_include.h"
 #include "InfoDialog.h"
@@ -398,6 +399,9 @@ private slots:
     void on_actionPlaybackPreviewResQuarter_triggered();
     void on_actionPlaybackShowQualityIndicator_triggered();
     void on_actionPlaybackVSync_triggered();
+    void on_actionPlaybackScopesHide_triggered();
+    void on_actionPlaybackScopesThrottled_triggered();
+    void on_actionPlaybackScopesLive_triggered();
     void on_actionPlaybackAutoTarget24_triggered();
     void on_actionPlaybackAutoTarget30_triggered();
     void on_actionPlaybackAutoTarget60_triggered();
@@ -836,6 +840,7 @@ private:
     QActionGroup *m_playbackPreviewModeGroup = nullptr;   // Phase 4E
     QActionGroup *m_playbackPreviewResolutionGroup = nullptr; // Round-3 item 1
     QActionGroup *m_playbackAutoTargetFpsGroup = nullptr; // Phase 4E
+    QActionGroup *m_playbackScopesModeGroup = nullptr;    // PLAYBACK-SCOPES-OPTION-1
     QActionGroup *m_playbackScaleFactorGroup = nullptr;   // Phase 4E
     DoubleClickLabel *m_pTcLabel;
     bool m_tcModeDuration;
@@ -1051,6 +1056,9 @@ private:
     double m_playbackTimelineSourceFrameReadyEmitStageTime = 0.0;
     double m_playbackTimelineSourceDrawBeginStageTime = 0.0;
     double m_playbackScopeLastUpdateTime = 0.0;
+    // PLAYBACK-SCOPES-OPTION-1: the "Scopes During Playback" mode in effect, cached so the per-frame
+    // policy reads never touch the settings store (refreshed at start and on every menu change).
+    PlaybackScopesMode m_playbackScopesMode = PlaybackScopesSettings::kDefaultMode();
     uint64_t m_playbackScopeUpdateCount = 0;
     uint64_t m_playbackScopeSkipCount = 0;
     uint64_t m_playbackAudioSyncRequestCount = 0;
@@ -1784,6 +1792,8 @@ private:
     int  gpuReducedReconHonouredSessionScale( void ) const;
     int  playbackScaleFactorPolicyDecision( void ) const;
     bool gpuPlaybackReconTextureRouteEligibleAtScaleOne( void ) const;
+    bool scopeDisplayConsumesPresentedPixels( bool editAreaVisible ) const;
+    void applyPlaybackScopesMode( PlaybackScopesMode mode, bool persist );
     MainWindowGpuPreviewPolicyState gpuPreviewPolicyForCurrentScopeState(
         bool includeVisibleScopes ) const;
     bool visibleScopesBlockGpuTexturePlayback( void ) const;
