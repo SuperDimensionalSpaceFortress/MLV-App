@@ -162,7 +162,7 @@ Hardening plan and audit log: `tools/agent-bridge/BRIDGE_HARDENING.md`
 3. **Smallest diff possible** — surgical changes only
 4. **Show full diffs** before applying to any existing file
 5. **One phase per response** — do not jump ahead
-6. **Compile after every change** — `cd platform/qt && qmake && mingw32-make -j8`
+6. **Compile after every change** — `cd platform/qt && qmake && pwsh -NoProfile -File <repo>/tools/coordination/build-guard.ps1 -Command "mingw32-make -j{JOBS}"` (host memory floor, one build slot, -j4/-j2)
 7. **Never use QCoreApplication** — always QApplication
 8. **Never create circular includes** — BatchTypes.h is the shared type header
 9. **Treat CDNG as frame-sequence** — per-frame error handling, subfolder output
