@@ -144,6 +144,9 @@ int reset_cached_gl_resource(CachedGlImageResource * cache, bool tolerateInvalid
         const cudaError_t rc = cudaGraphicsUnregisterResource(cache->resource);
         if (rc != cudaSuccess)
         {
+            /* r8 class sweep: a tolerated code (GL context already gone) is still noted;
+             * only its log line stays quiet. */
+            IGPU_CUDA_ERROR_NOTE(rc, "gl_cache:unregister");
             if (!(tolerateInvalidGraphicsContext && rc == cudaErrorInvalidGraphicsContext))
             {
                 std::fprintf(stderr,
@@ -194,6 +197,7 @@ int ensure_cached_gl_resource(CachedGlImageResource * cache,
                                                        flags);
     if (rc != cudaSuccess)
     {
+        IGPU_CUDA_ERROR_NOTE(rc, "gl_cache:register");
         std::fprintf(stderr,
                      "[igpu_amaze_debayer_cuda] cudaGraphicsGLRegisterImage(%s) failed: %s\n",
                      label ? label : "cached GL texture",
@@ -569,6 +573,7 @@ int copy_gl_r16_texture_to_bayer16(unsigned int glTexture,
                                                      cudaGraphicsRegisterFlagsReadOnly);
         if (rc != cudaSuccess)
         {
+            IGPU_CUDA_ERROR_NOTE(rc, "gl_r16_in:register");
             std::fprintf(stderr,
                          "[igpu_amaze_debayer_cuda] cudaGraphicsGLRegisterImage(GL_R16 source texture) failed: %s\n",
                          cudaGetErrorString(rc));
@@ -579,17 +584,30 @@ int copy_gl_r16_texture_to_bayer16(unsigned int glTexture,
     cudaError_t rc = IGPU_LT_SYNC_CALL("gl_r16_in:map", cudaGraphicsMapResources(1, &resource, 0));
     if (rc != cudaSuccess)
     {
+        /* r8 (sol r7 blocker): an uncached resource's unregister code is noted too, at its own
+         * site, before the return (the cached reset notes its own). */
+        const cudaError_t unregisterRc =
+            cached ? cudaSuccess : cudaGraphicsUnregisterResource(resource);
+        const igpu_cuda_error_slot::Evaluated mapFailure[] = {
+            {(int)rc, "gl_r16_in:map"},
+            {(int)unregisterRc, "gl_r16_in:unregister"},
+        };
+        IGPU_CUDA_ERROR_NOTE_EVALUATED(mapFailure);
         std::fprintf(stderr,
                      "[igpu_amaze_debayer_cuda] cudaGraphicsMapResources(GL_R16 source texture) failed: %s\n",
                      cudaGetErrorString(rc));
+        if (unregisterRc != cudaSuccess)
+            std::fprintf(stderr,
+                         "[igpu_amaze_debayer_cuda] cudaGraphicsUnregisterResource(GL_R16 source texture) failed: %s\n",
+                         cudaGetErrorString(unregisterRc));
         if (cached) reset_cached_gl_resource(cache, false);
-        else cudaGraphicsUnregisterResource(resource);
         return 2;
     }
 
     cudaArray_t mappedArray = nullptr;
-    rc = cudaGraphicsSubResourceGetMappedArray(&mappedArray, resource, 0, 0);
-    if (rc == cudaSuccess)
+    /* r8 class sweep: the mapped-array code keeps its own site (it was noted as the copy's). */
+    const cudaError_t arrayRc = cudaGraphicsSubResourceGetMappedArray(&mappedArray, resource, 0, 0);
+    if (arrayRc == cudaSuccess)
     {
         const std::size_t rowBytes = static_cast<std::size_t>(width) * sizeof(uint16_t);
         rc = IGPU_LT_SYNC_CALL("gl_r16_in:copy_from_array",
@@ -607,27 +625,34 @@ int copy_gl_r16_texture_to_bayer16(unsigned int glTexture,
         IGPU_LT_SYNC_CALL("gl_r16_in:unmap", cudaGraphicsUnmapResources(1, &resource, 0));
     const cudaError_t unregisterRc =
         cached ? cudaSuccess : cudaGraphicsUnregisterResource(resource);
-    if (rc != cudaSuccess)
+    if (arrayRc != cudaSuccess || rc != cudaSuccess || unmapRc != cudaSuccess || unregisterRc != cudaSuccess)
     {
-        std::fprintf(stderr,
-                     "[igpu_amaze_debayer_cuda] GL_R16 source texture device copy failed: %s\n",
-                     cudaGetErrorString(rc));
+        /* r7: all evaluated codes are noted, each at its own site, before the return. */
+        const igpu_cuda_error_slot::Evaluated evaluated[] = {
+            {(int)arrayRc, "gl_r16_in:mapped_array"},
+            {(int)rc, "gl_r16_in:copy_from_array"},
+            {(int)unmapRc, "gl_r16_in:unmap"},
+            {(int)unregisterRc, "gl_r16_in:unregister"},
+        };
+        IGPU_CUDA_ERROR_NOTE_EVALUATED(evaluated);
+        if (arrayRc != cudaSuccess)
+            std::fprintf(stderr,
+                         "[igpu_amaze_debayer_cuda] cudaGraphicsSubResourceGetMappedArray(GL_R16 source texture) failed: %s\n",
+                         cudaGetErrorString(arrayRc));
+        if (rc != cudaSuccess)
+            std::fprintf(stderr,
+                         "[igpu_amaze_debayer_cuda] GL_R16 source texture device copy failed: %s\n",
+                         cudaGetErrorString(rc));
+        if (unmapRc != cudaSuccess)
+            std::fprintf(stderr,
+                         "[igpu_amaze_debayer_cuda] cudaGraphicsUnmapResources(GL_R16 source texture) failed: %s\n",
+                         cudaGetErrorString(unmapRc));
+        if (unregisterRc != cudaSuccess)
+            std::fprintf(stderr,
+                         "[igpu_amaze_debayer_cuda] cudaGraphicsUnregisterResource(GL_R16 source texture) failed: %s\n",
+                         cudaGetErrorString(unregisterRc));
+        /* unregisterRc fails only uncached, so this resets as before. */
         if (cached) reset_cached_gl_resource(cache, false);
-        return 2;
-    }
-    if (unmapRc != cudaSuccess)
-    {
-        std::fprintf(stderr,
-                     "[igpu_amaze_debayer_cuda] cudaGraphicsUnmapResources(GL_R16 source texture) failed: %s\n",
-                     cudaGetErrorString(unmapRc));
-        if (cached) reset_cached_gl_resource(cache, false);
-        return 2;
-    }
-    if (unregisterRc != cudaSuccess)
-    {
-        std::fprintf(stderr,
-                     "[igpu_amaze_debayer_cuda] cudaGraphicsUnregisterResource(GL_R16 source texture) failed: %s\n",
-                     cudaGetErrorString(unregisterRc));
         return 2;
     }
     return 0;
@@ -1166,27 +1191,46 @@ int copy_rgb16_to_gl_rgba16_texture(const uint16_t * dRgb16,
                                                      cudaGraphicsRegisterFlagsWriteDiscard);
         if (rc != cudaSuccess)
         {
+            /* r8 class sweep: the scratch free's code is noted too, at its own site. */
+            const cudaError_t freeRc = cudaFree(dRgba16);
+            const igpu_cuda_error_slot::Evaluated registerFailure[] = {
+                {(int)rc, "gl_rgba16:register"},
+                {(int)freeRc, "gl_rgba16:free"},
+            };
+            IGPU_CUDA_ERROR_NOTE_EVALUATED(registerFailure);
             std::fprintf(stderr,
                          "[igpu_amaze_debayer_cuda] cudaGraphicsGLRegisterImage(GL_RGBA16 texture) failed: %s\n",
                          cudaGetErrorString(rc));
-            cudaFree(dRgba16);
             return 2;
         }
 
         rc = IGPU_LT_SYNC_CALL("gl_rgba16:map", cudaGraphicsMapResources(1, &resource, 0));
         if (rc != cudaSuccess)
         {
+            /* r8 (sol r7 blocker): the unregister and free codes are noted too, each at its own
+             * site, before the return. */
+            const cudaError_t unregisterRc = cudaGraphicsUnregisterResource(resource);
+            const cudaError_t freeRc = cudaFree(dRgba16);
+            const igpu_cuda_error_slot::Evaluated mapFailure[] = {
+                {(int)rc, "gl_rgba16:map"},
+                {(int)unregisterRc, "gl_rgba16:unregister"},
+                {(int)freeRc, "gl_rgba16:free"},
+            };
+            IGPU_CUDA_ERROR_NOTE_EVALUATED(mapFailure);
             std::fprintf(stderr,
                          "[igpu_amaze_debayer_cuda] cudaGraphicsMapResources(GL_RGBA16 texture) failed: %s\n",
                          cudaGetErrorString(rc));
-            cudaGraphicsUnregisterResource(resource);
-            cudaFree(dRgba16);
+            if (unregisterRc != cudaSuccess)
+                std::fprintf(stderr,
+                             "[igpu_amaze_debayer_cuda] cudaGraphicsUnregisterResource(GL_RGBA16 texture) failed: %s\n",
+                             cudaGetErrorString(unregisterRc));
             return 2;
         }
 
         cudaArray_t mappedArray = nullptr;
-        rc = cudaGraphicsSubResourceGetMappedArray(&mappedArray, resource, 0, 0);
-        if (rc == cudaSuccess)
+        /* r8 class sweep: the mapped-array code keeps its own site (it was noted as the copy's). */
+        const cudaError_t arrayRc = cudaGraphicsSubResourceGetMappedArray(&mappedArray, resource, 0, 0);
+        if (arrayRc == cudaSuccess)
         {
             const std::size_t rowBytes = static_cast<std::size_t>(width) * 4u * sizeof(uint16_t);
             rc = IGPU_LT_SYNC_CALL("gl_rgba16:copy_to_array",
@@ -1203,34 +1247,53 @@ int copy_rgb16_to_gl_rgba16_texture(const uint16_t * dRgb16,
         const cudaError_t unmapRc =
             IGPU_LT_SYNC_CALL("gl_rgba16:unmap", cudaGraphicsUnmapResources(1, &resource, 0));
         const cudaError_t unregisterRc = cudaGraphicsUnregisterResource(resource);
-        cudaFree(dRgba16);
-        if (rc != cudaSuccess)
+        const cudaError_t freeRc = cudaFree(dRgba16);
+        if (arrayRc != cudaSuccess || rc != cudaSuccess || unmapRc != cudaSuccess
+            || unregisterRc != cudaSuccess || freeRc != cudaSuccess)
         {
-            std::fprintf(stderr,
-                         "[igpu_amaze_debayer_cuda] device-to-GL texture copy failed: %s\n",
-                         cudaGetErrorString(rc));
-            return 2;
-        }
-        if (unmapRc != cudaSuccess)
-        {
-            std::fprintf(stderr,
-                         "[igpu_amaze_debayer_cuda] cudaGraphicsUnmapResources(GL_RGBA16 texture) failed: %s\n",
-                         cudaGetErrorString(unmapRc));
-            return 2;
-        }
-        if (unregisterRc != cudaSuccess)
-        {
-            std::fprintf(stderr,
-                         "[igpu_amaze_debayer_cuda] cudaGraphicsUnregisterResource(GL_RGBA16 texture) failed: %s\n",
-                         cudaGetErrorString(unregisterRc));
+            /* r7: all evaluated codes are noted, each at its own site, before the return. */
+            const igpu_cuda_error_slot::Evaluated evaluated[] = {
+                {(int)arrayRc, "gl_rgba16:mapped_array"},
+                {(int)rc, "gl_rgba16:copy_to_array"},
+                {(int)unmapRc, "gl_rgba16:unmap"},
+                {(int)unregisterRc, "gl_rgba16:unregister"},
+                {(int)freeRc, "gl_rgba16:free"},
+            };
+            IGPU_CUDA_ERROR_NOTE_EVALUATED(evaluated);
+            if (arrayRc != cudaSuccess)
+                std::fprintf(stderr,
+                             "[igpu_amaze_debayer_cuda] cudaGraphicsSubResourceGetMappedArray(GL_RGBA16 texture) failed: %s\n",
+                             cudaGetErrorString(arrayRc));
+            if (rc != cudaSuccess)
+                std::fprintf(stderr,
+                             "[igpu_amaze_debayer_cuda] device-to-GL texture copy failed: %s\n",
+                             cudaGetErrorString(rc));
+            if (unmapRc != cudaSuccess)
+                std::fprintf(stderr,
+                             "[igpu_amaze_debayer_cuda] cudaGraphicsUnmapResources(GL_RGBA16 texture) failed: %s\n",
+                             cudaGetErrorString(unmapRc));
+            if (unregisterRc != cudaSuccess)
+                std::fprintf(stderr,
+                             "[igpu_amaze_debayer_cuda] cudaGraphicsUnregisterResource(GL_RGBA16 texture) failed: %s\n",
+                             cudaGetErrorString(unregisterRc));
             return 2;
         }
     }
     catch (const CudaStageProbeError & error)
     {
         std::fprintf(stderr, "[igpu_amaze_debayer_cuda] %s\n", error.what());
-        if (resource) cudaGraphicsUnregisterResource(resource);
-        cudaFree(dRgba16);
+        /* r8 class sweep: the cleanup codes are noted too (check_cuda noted the throw's). */
+        const cudaError_t catchUnregisterRc =
+            resource ? cudaGraphicsUnregisterResource(resource) : cudaSuccess;
+        const cudaError_t catchFreeRc = cudaFree(dRgba16);
+        if (catchUnregisterRc != cudaSuccess || catchFreeRc != cudaSuccess)
+        {
+            const igpu_cuda_error_slot::Evaluated catchCleanup[] = {
+                {(int)catchUnregisterRc, "gl_rgba16:unregister"},
+                {(int)catchFreeRc, "gl_rgba16:free"},
+            };
+            IGPU_CUDA_ERROR_NOTE_EVALUATED(catchCleanup);
+        }
         return -2;
     }
 
@@ -1272,6 +1335,7 @@ int copy_rgba16_to_gl_rgba16_texture(const uint16_t * dRgba16,
                                                          cudaGraphicsRegisterFlagsWriteDiscard);
             if (rc != cudaSuccess)
             {
+                IGPU_CUDA_ERROR_NOTE(rc, "gl_rgba16_direct:register");
                 std::fprintf(stderr,
                              "[igpu_amaze_debayer_cuda] cudaGraphicsGLRegisterImage(GL_RGBA16 direct texture) failed: %s\n",
                              cudaGetErrorString(rc));
@@ -1282,17 +1346,30 @@ int copy_rgba16_to_gl_rgba16_texture(const uint16_t * dRgba16,
         cudaError_t rc = IGPU_LT_SYNC_CALL("gl_rgba16_direct:map", cudaGraphicsMapResources(1, &resource, 0));
         if (rc != cudaSuccess)
         {
+            /* r8 (sol r7 blocker): an uncached resource's unregister code is noted too, at its
+             * own site, before the return (the cached reset notes its own). */
+            const cudaError_t unregisterRc =
+                cached ? cudaSuccess : cudaGraphicsUnregisterResource(resource);
+            const igpu_cuda_error_slot::Evaluated mapFailure[] = {
+                {(int)rc, "gl_rgba16_direct:map"},
+                {(int)unregisterRc, "gl_rgba16_direct:unregister"},
+            };
+            IGPU_CUDA_ERROR_NOTE_EVALUATED(mapFailure);
             std::fprintf(stderr,
                          "[igpu_amaze_debayer_cuda] cudaGraphicsMapResources(GL_RGBA16 direct texture) failed: %s\n",
                          cudaGetErrorString(rc));
+            if (unregisterRc != cudaSuccess)
+                std::fprintf(stderr,
+                             "[igpu_amaze_debayer_cuda] cudaGraphicsUnregisterResource(GL_RGBA16 direct texture) failed: %s\n",
+                             cudaGetErrorString(unregisterRc));
             if (cached) reset_cached_gl_resource(cache, false);
-            else cudaGraphicsUnregisterResource(resource);
             return 2;
         }
 
         cudaArray_t mappedArray = nullptr;
-        rc = cudaGraphicsSubResourceGetMappedArray(&mappedArray, resource, 0, 0);
-        if (rc == cudaSuccess)
+        /* r8 class sweep: the mapped-array code keeps its own site (it was noted as the copy's). */
+        const cudaError_t arrayRc = cudaGraphicsSubResourceGetMappedArray(&mappedArray, resource, 0, 0);
+        if (arrayRc == cudaSuccess)
         {
             const std::size_t rowBytes =
                 static_cast<std::size_t>(width) * 4u * sizeof(uint16_t);
@@ -1311,27 +1388,34 @@ int copy_rgba16_to_gl_rgba16_texture(const uint16_t * dRgba16,
             IGPU_LT_SYNC_CALL("gl_rgba16_direct:unmap", cudaGraphicsUnmapResources(1, &resource, 0));
         const cudaError_t unregisterRc =
             cached ? cudaSuccess : cudaGraphicsUnregisterResource(resource);
-        if (rc != cudaSuccess)
+        if (arrayRc != cudaSuccess || rc != cudaSuccess || unmapRc != cudaSuccess || unregisterRc != cudaSuccess)
         {
-            std::fprintf(stderr,
-                         "[igpu_amaze_debayer_cuda] direct RGBA16 device-to-GL texture copy failed: %s\n",
-                         cudaGetErrorString(rc));
+            /* r7: all evaluated codes are noted, each at its own site, before the return. */
+            const igpu_cuda_error_slot::Evaluated evaluated[] = {
+                {(int)arrayRc, "gl_rgba16_direct:mapped_array"},
+                {(int)rc, "gl_rgba16_direct:copy_to_array"},
+                {(int)unmapRc, "gl_rgba16_direct:unmap"},
+                {(int)unregisterRc, "gl_rgba16_direct:unregister"},
+            };
+            IGPU_CUDA_ERROR_NOTE_EVALUATED(evaluated);
+            if (arrayRc != cudaSuccess)
+                std::fprintf(stderr,
+                             "[igpu_amaze_debayer_cuda] cudaGraphicsSubResourceGetMappedArray(GL_RGBA16 direct texture) failed: %s\n",
+                             cudaGetErrorString(arrayRc));
+            if (rc != cudaSuccess)
+                std::fprintf(stderr,
+                             "[igpu_amaze_debayer_cuda] direct RGBA16 device-to-GL texture copy failed: %s\n",
+                             cudaGetErrorString(rc));
+            if (unmapRc != cudaSuccess)
+                std::fprintf(stderr,
+                             "[igpu_amaze_debayer_cuda] cudaGraphicsUnmapResources(GL_RGBA16 direct texture) failed: %s\n",
+                             cudaGetErrorString(unmapRc));
+            if (unregisterRc != cudaSuccess)
+                std::fprintf(stderr,
+                             "[igpu_amaze_debayer_cuda] cudaGraphicsUnregisterResource(GL_RGBA16 direct texture) failed: %s\n",
+                             cudaGetErrorString(unregisterRc));
+            /* unregisterRc fails only uncached, so this resets as before. */
             if (cached) reset_cached_gl_resource(cache, false);
-            return 2;
-        }
-        if (unmapRc != cudaSuccess)
-        {
-            std::fprintf(stderr,
-                         "[igpu_amaze_debayer_cuda] cudaGraphicsUnmapResources(GL_RGBA16 direct texture) failed: %s\n",
-                         cudaGetErrorString(unmapRc));
-            if (cached) reset_cached_gl_resource(cache, false);
-            return 2;
-        }
-        if (unregisterRc != cudaSuccess)
-        {
-            std::fprintf(stderr,
-                         "[igpu_amaze_debayer_cuda] cudaGraphicsUnregisterResource(GL_RGBA16 direct texture) failed: %s\n",
-                         cudaGetErrorString(unregisterRc));
             return 2;
         }
         return 0;
@@ -1340,7 +1424,16 @@ int copy_rgba16_to_gl_rgba16_texture(const uint16_t * dRgba16,
     {
         std::fprintf(stderr, "[igpu_amaze_debayer_cuda] %s\n", error.what());
         if (cached) reset_cached_gl_resource(cache, false);
-        else if (resource) cudaGraphicsUnregisterResource(resource);
+        /* r8 class sweep: an uncached resource's unregister code is noted too. */
+        const cudaError_t catchUnregisterRc =
+            (!cached && resource) ? cudaGraphicsUnregisterResource(resource) : cudaSuccess;
+        if (catchUnregisterRc != cudaSuccess)
+        {
+            const igpu_cuda_error_slot::Evaluated catchCleanup[] = {
+                {(int)catchUnregisterRc, "gl_rgba16_direct:unregister"},
+            };
+            IGPU_CUDA_ERROR_NOTE_EVALUATED(catchCleanup);
+        }
         return 2;
     }
 }
@@ -1399,8 +1492,13 @@ int copy_rgb16_to_gl_rgba16_texture_post_wb_undo(const uint16_t * dRgb16,
     {
         if (ownsScratch && dRgba16)
         {
-            cudaFree(dRgba16);
+            /* r8 class sweep: the free's code is noted at its own site (every caller). */
+            const cudaError_t freeRc = cudaFree(dRgba16);
             dRgba16 = nullptr;
+            if (freeRc != cudaSuccess)
+            {
+                IGPU_CUDA_ERROR_NOTE(freeRc, "gl_rgba16_post_wb:free");
+            }
         }
     };
 
@@ -1442,6 +1540,7 @@ int copy_rgb16_to_gl_rgba16_texture_post_wb_undo(const uint16_t * dRgb16,
                                                          cudaGraphicsRegisterFlagsWriteDiscard);
             if (rc != cudaSuccess)
             {
+                IGPU_CUDA_ERROR_NOTE(rc, "gl_rgba16_post_wb:register");
                 std::fprintf(stderr,
                              "[igpu_amaze_debayer_cuda] cudaGraphicsGLRegisterImage(GL_RGBA16 post-WB texture) failed: %s\n",
                              cudaGetErrorString(rc));
@@ -1453,18 +1552,31 @@ int copy_rgb16_to_gl_rgba16_texture_post_wb_undo(const uint16_t * dRgb16,
         cudaError_t rc = IGPU_LT_SYNC_CALL("gl_rgba16_post_wb:map", cudaGraphicsMapResources(1, &resource, 0));
         if (rc != cudaSuccess)
         {
+            /* r8 (sol r7 blocker): an uncached resource's unregister code is noted too, at its
+             * own site, before the return (the cached reset notes its own). */
+            const cudaError_t unregisterRc =
+                cached ? cudaSuccess : cudaGraphicsUnregisterResource(resource);
+            const igpu_cuda_error_slot::Evaluated mapFailure[] = {
+                {(int)rc, "gl_rgba16_post_wb:map"},
+                {(int)unregisterRc, "gl_rgba16_post_wb:unregister"},
+            };
+            IGPU_CUDA_ERROR_NOTE_EVALUATED(mapFailure);
             std::fprintf(stderr,
                          "[igpu_amaze_debayer_cuda] cudaGraphicsMapResources(GL_RGBA16 post-WB texture) failed: %s\n",
                          cudaGetErrorString(rc));
+            if (unregisterRc != cudaSuccess)
+                std::fprintf(stderr,
+                             "[igpu_amaze_debayer_cuda] cudaGraphicsUnregisterResource(GL_RGBA16 post-WB texture) failed: %s\n",
+                             cudaGetErrorString(unregisterRc));
             if (cached) reset_cached_gl_resource(cache, false);
-            else cudaGraphicsUnregisterResource(resource);
             releaseScratch();
             return 2;
         }
 
         cudaArray_t mappedArray = nullptr;
-        rc = cudaGraphicsSubResourceGetMappedArray(&mappedArray, resource, 0, 0);
-        if (rc == cudaSuccess)
+        /* r8 class sweep: the mapped-array code keeps its own site (it was noted as the copy's). */
+        const cudaError_t arrayRc = cudaGraphicsSubResourceGetMappedArray(&mappedArray, resource, 0, 0);
+        if (arrayRc == cudaSuccess)
         {
             const std::size_t rowBytes = static_cast<std::size_t>(width) * 4u * sizeof(uint16_t);
             rc = IGPU_LT_SYNC_CALL("gl_rgba16_post_wb:copy_to_array",
@@ -1482,37 +1594,55 @@ int copy_rgb16_to_gl_rgba16_texture_post_wb_undo(const uint16_t * dRgb16,
             IGPU_LT_SYNC_CALL("gl_rgba16_post_wb:unmap", cudaGraphicsUnmapResources(1, &resource, 0));
         const cudaError_t unregisterRc =
             cached ? cudaSuccess : cudaGraphicsUnregisterResource(resource);
+        if (arrayRc != cudaSuccess || rc != cudaSuccess || unmapRc != cudaSuccess || unregisterRc != cudaSuccess)
+        {
+            /* r7: all evaluated codes are noted, each at its own site, before the return. */
+            const igpu_cuda_error_slot::Evaluated evaluated[] = {
+                {(int)arrayRc, "gl_rgba16_post_wb:mapped_array"},
+                {(int)rc, "gl_rgba16_post_wb:copy_to_array"},
+                {(int)unmapRc, "gl_rgba16_post_wb:unmap"},
+                {(int)unregisterRc, "gl_rgba16_post_wb:unregister"},
+            };
+            IGPU_CUDA_ERROR_NOTE_EVALUATED(evaluated);
+            /* r8: the scratch free (it notes its own code) now follows these notes. */
+            releaseScratch();
+            if (arrayRc != cudaSuccess)
+                std::fprintf(stderr,
+                             "[igpu_amaze_debayer_cuda] cudaGraphicsSubResourceGetMappedArray(GL_RGBA16 post-WB texture) failed: %s\n",
+                             cudaGetErrorString(arrayRc));
+            if (rc != cudaSuccess)
+                std::fprintf(stderr,
+                             "[igpu_amaze_debayer_cuda] post-WB device-to-GL texture copy failed: %s\n",
+                             cudaGetErrorString(rc));
+            if (unmapRc != cudaSuccess)
+                std::fprintf(stderr,
+                             "[igpu_amaze_debayer_cuda] cudaGraphicsUnmapResources(GL_RGBA16 post-WB texture) failed: %s\n",
+                             cudaGetErrorString(unmapRc));
+            if (unregisterRc != cudaSuccess)
+                std::fprintf(stderr,
+                             "[igpu_amaze_debayer_cuda] cudaGraphicsUnregisterResource(GL_RGBA16 post-WB texture) failed: %s\n",
+                             cudaGetErrorString(unregisterRc));
+            /* unregisterRc fails only uncached, so this resets as before. */
+            if (cached) reset_cached_gl_resource(cache, false);
+            return 2;
+        }
         releaseScratch();
-        if (rc != cudaSuccess)
-        {
-            std::fprintf(stderr,
-                         "[igpu_amaze_debayer_cuda] post-WB device-to-GL texture copy failed: %s\n",
-                         cudaGetErrorString(rc));
-            if (cached) reset_cached_gl_resource(cache, false);
-            return 2;
-        }
-        if (unmapRc != cudaSuccess)
-        {
-            std::fprintf(stderr,
-                         "[igpu_amaze_debayer_cuda] cudaGraphicsUnmapResources(GL_RGBA16 post-WB texture) failed: %s\n",
-                         cudaGetErrorString(unmapRc));
-            if (cached) reset_cached_gl_resource(cache, false);
-            return 2;
-        }
-        if (unregisterRc != cudaSuccess)
-        {
-            std::fprintf(stderr,
-                         "[igpu_amaze_debayer_cuda] cudaGraphicsUnregisterResource(GL_RGBA16 post-WB texture) failed: %s\n",
-                         cudaGetErrorString(unregisterRc));
-            return 2;
-        }
         return 0;
     }
     catch (const CudaStageProbeError & error)
     {
         std::fprintf(stderr, "[igpu_amaze_debayer_cuda] %s\n", error.what());
         if (cached) reset_cached_gl_resource(cache, false);
-        else if (resource) cudaGraphicsUnregisterResource(resource);
+        /* r8 class sweep: an uncached resource's unregister code is noted too. */
+        const cudaError_t catchUnregisterRc =
+            (!cached && resource) ? cudaGraphicsUnregisterResource(resource) : cudaSuccess;
+        if (catchUnregisterRc != cudaSuccess)
+        {
+            const igpu_cuda_error_slot::Evaluated catchCleanup[] = {
+                {(int)catchUnregisterRc, "gl_rgba16_post_wb:unregister"},
+            };
+            IGPU_CUDA_ERROR_NOTE_EVALUATED(catchCleanup);
+        }
         releaseScratch();
         return 2;
     }
@@ -1970,4 +2100,22 @@ extern "C" int igpu_amaze_debayer_last_timing(igpu_amaze_debayer_backend * backe
     if (!backend || !timing) return -1;
     *timing = backend->lastTiming;
     return 0;
+}
+
+extern "C" int igpu_amaze_debayer_last_cuda_error(igpu_cuda_error_t * out)
+{
+    return igpu_cuda_error_slot::copy_last(out);
+}
+
+/* GPU-FIELD-TELEMETRY-1 r6: every code a failed call noted, and a lock-free
+ * "anything pending" word (igpu_cuda_error.h). */
+extern "C" int igpu_amaze_debayer_drain_cuda_errors(int channel, igpu_cuda_error_t * out, int capacity,
+                                                    unsigned long long * dropped)
+{
+    return igpu_cuda_error_slot::drain(channel, out, capacity, dropped);
+}
+
+extern "C" const volatile long * igpu_amaze_debayer_cuda_error_pending_word(int channel)
+{
+    return igpu_cuda_error_slot::pending_word(channel);
 }
