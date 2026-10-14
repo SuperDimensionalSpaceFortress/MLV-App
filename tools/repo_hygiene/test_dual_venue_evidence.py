@@ -116,12 +116,15 @@ SCOPE_ARMS = {"histogram": {"scope": "histogram"}, "histogram-i0": {"scope": "hi
 SCOPE_LEGS = {f"legs/m16-1243-scopes-{backend}-windowed-s1-{arm}.json": (backend, extra)
               for backend in ("cpu", "cuda") for arm, extra in (("none", {}), *SCOPE_ARMS.items())}
 SCOPE_LEGS["legs/m16-1243-scopes-cuda-windowed-s1-waveform-i0.json"] = ("cuda", {"scope": "waveform", "scopeIntervalMs": 0})
+# CPU-SCOPE-LIVE-HEAP-CORRUPTION-1: the live-histogram stop-cycle legs, cpu scale 1 at every-frame histogram, per display mode. Windowed runs Look Assist
+# OFF (the arm that computes the scope); fullscreen leaves Look Assist at the app's default, so it computes no scope and tests the stop with LA on.
+SCOPELIVE_LEGS = {f"legs/m16-1243-scopelive-cpu-{mode}-s1-histogram-i0.json": (mode, look_off) for mode, look_off in (("windowed", True), ("fullscreen", False))}
 # LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1 added the scale-2 Cinematic twin of the scale-2 look leg (the Bachelor CPU Classic | Cinematic look pair).
 SHIPPED_LEGS = ("legs/m16-1243-speed.json", "legs/m16-1243-look.json", "legs/m16-1243-look-scale2.json", "legs/m16-1243-look-cinematic.json", *DISPLAY_MATRIX_LEGS, *PACE_LEGS,
                 *LOOKAHEAD_LEGS, *HEAVY_LEGS, *DECODER_LEGS, "legs/m16-1243-look-scale2-cinematic.json", "legs/m16-1243-look-film.json",
                 "legs/m16-1243-look-scale2-film.json", *(f"legs/m16-1243-look-scale2-{flavor}-agxoff.json" for flavor in ("cinematic", "film")),
                 *(f"legs/m16-1243-display-{mode}-s{scale}-vsync1.json" for scale in (1, 2, 4) for mode in ("fullscreen", "windowed")),
-                *CPU_REDUCED_LEGS, *UPSTREAM_BASELINE_LEGS, *PTRACE_LEGS, *SCOPE_LEGS)
+                *CPU_REDUCED_LEGS, *UPSTREAM_BASELINE_LEGS, *PTRACE_LEGS, *SCOPE_LEGS, *SCOPELIVE_LEGS)
 # PLAYBACK-VSYNC-DEFAULT-1: the swap-interval-1 twins of the six display-matrix legs (the vsync A/B; the originals stay at the app's default 0).
 VSYNC1_LEGS = tuple(rel.replace(".json", "-vsync1.json") for rel in DISPLAY_MATRIX_LEGS)
 # LOOK-ASSIST-FILM-FLAVOR-2 r2: the AgX-off twins of the scale-2 Cinematic and Film legs carry a committed look receipt (look-receipts/agx-off.marxml).
@@ -5643,6 +5646,21 @@ class LegSpecSchemaTests(unittest.TestCase):
             bad["generatorArgs"].update(bad_value)
             with self.assertRaises(self.jsonschema.ValidationError, msg=repr(bad_value)):
                 self.jsonschema.validate(bad, self.schema)
+
+    def test_the_scopelive_legs_are_cpu_s1_speed_legs_at_every_frame_histogram(self) -> None:
+        """CPU-SCOPE-LIVE-HEAP-CORRUPTION-1: each live-scope stop-cycle leg is a cpu-only SPEED leg at scale 1 in the display mode its name says (LIGHT,
+        the 95 % quiescence gate, informational criteria) with the histogram at scopeIntervalMs 0; only the windowed leg turns Look Assist off."""
+        for rel, (mode, look_off) in SCOPELIVE_LEGS.items():
+            spec = json.loads((DV / rel).read_text(encoding="utf-8"))
+            self.jsonschema.validate(spec, self.schema)
+            self.assertEqual(spec["legId"], Path(rel).stem, rel)
+            self.assertEqual(spec["card"], "CPU-SCOPE-LIVE-HEAP-CORRUPTION-1", rel)
+            self.assertEqual((spec["legType"], spec["clipId"], spec["playSeconds"], spec["backends"], spec["scaleFactor"], spec["displayMode"]),
+                             ("speed", "M16-1243", 25, ["cpu"], 1, mode), rel)
+            look = {"disableLookAssist": True} if look_off else {}
+            self.assertEqual(spec["generatorArgs"], {"telemetryArm": "LIGHT", "cpuQuiescenceThresholdPercent": 95, **look, "scope": "histogram", "scopeIntervalMs": 0}, rel)
+            self.assertNotIn("look", spec, rel)
+            self.assertEqual(spec["criteria"], {"acceptance": {"cpu": []}, "supplementary": {"cpu": []}}, rel)
 
     def test_the_hand_listed_shipped_legs_are_exactly_the_legs_directory(self) -> None:
         self.assertEqual(sorted(SHIPPED_LEGS), sorted("legs/" + p.name for p in (DV / "legs").glob("*.json")), "SHIPPED_LEGS drifted from the legs/ directory")

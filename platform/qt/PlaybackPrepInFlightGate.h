@@ -1,6 +1,7 @@
 #ifndef PLAYBACKPREPINFLIGHTGATE_H
 #define PLAYBACKPREPINFLIGHTGATE_H
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -40,7 +41,7 @@ public:
     bool drainLocked( std::unique_lock<std::mutex> &lock, int timeoutMs )
     {
         return m_cv.wait_for( lock,
-                              std::chrono::milliseconds( timeoutMs > 0 ? timeoutMs : 0 ),
+                              std::chrono::milliseconds( std::max( timeoutMs, 0 ) ),
                               [this]{ return !m_inFlight; } );
     }
 
