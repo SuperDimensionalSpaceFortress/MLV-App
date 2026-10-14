@@ -94,6 +94,11 @@ QMutex & writeMutex()
     return *m;
 }
 
+/* Test-only (POST-SESSION-LATE-FAULT-1): runs after a flush took its snapshot
+ * of Unwritten and before it writes, writeMutex held. Never set outside tests. */
+using AfterTakeHook = void (*)(const char * reason);
+std::atomic<AfterTakeHook> g_afterTakeForTesting{nullptr};
+
 /* The after-fault worker waits here; session end wakes it so exit is not held. */
 QMutex g_waitMutex;
 QWaitCondition g_waitCondition;
@@ -358,6 +363,7 @@ void flushImpl(const char * reason, bool withSystemLog, bool onWorker = false,
         taken = core::takeInto(s.unwritten, id, utc, lines);
         if (withSystemLog) lines.push_back(core::formatSystemLog(id, utc, reason, systemLog));
     }
+    if (const AfterTakeHook hook = g_afterTakeForTesting.load()) hook(reason);
 
     const std::filesystem::path live =
         QDir(dir).filePath(QString::fromLatin1(core::kLogFileName)).toStdWString();
@@ -741,8 +747,14 @@ QString clipHash(const QString & basenameOrPath)
         QCryptographicHash::hash(name.toUtf8(), QCryptographicHash::Sha256).toHex().left(12));
 }
 
+void setAfterTakeForTesting(void (*hook)(const char * reason))
+{
+    g_afterTakeForTesting.store(hook);
+}
+
 void appCloseForTesting(const QString & logsDir, const std::function<void()> & beforeSessionEnd,
-                        const std::function<void()> & afterSessionEnd)
+                        const std::function<void()> & afterSessionEnd,
+                        const std::function<void()> & afterPostRoutine)
 {
     State & s = state();
     {
@@ -760,6 +772,7 @@ void appCloseForTesting(const QString & logsDir, const std::function<void()> & b
     sessionEnd();                            // aboutToQuit
     if (afterSessionEnd) afterSessionEnd();  // ~MainWindow: the GPU views' destroyTexture
     sessionEndPostRoutine();                 // ~QApplication
+    if (afterPostRoutine) afterPostRoutine(); // a test releases a stalled write here
     if (g_workerPoolCreated.load()) workerPool()->waitForDone(); // an exit write past its wait
     llrpSetGpuStageTelemetrySink(nullptr);
     gpuAmazeDebayerSetStageTelemetrySink(nullptr);
