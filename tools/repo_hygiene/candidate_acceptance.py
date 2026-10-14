@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from .core import HygieneError, canonical_json, normalize_rel, resolve_repo_root, utc_now
+from .repository_identity import CANONICAL_REPOSITORY, canonical_repository, is_repository_alias
 
 
 SCHEMA = "candidate-acceptance.v1"
@@ -24,7 +25,9 @@ DEFAULT_REQUIRED_SURFACES = (
     "hosted-tests",
     "hosted-codeql",
 )
-CANONICAL_PROVIDER_REPOSITORY = "layibabalola/MLV-App"
+# Transport name for every live GitHub query. Configured and recorded names are matched against
+# repository_identity.REPOSITORY_SLUG_ALIASES (the 2026-10 transfer; repository id 1169162800).
+CANONICAL_PROVIDER_REPOSITORY = CANONICAL_REPOSITORY
 CONTENT_REVIEWERS = {
     "content-self": "root",
     "content-stranger-1": "release_combined_review",
@@ -81,6 +84,7 @@ def candidate_acceptance_enforced(
 
     candidate = _acceptance_config(config)
     target = target_candidate_acceptance_policy(repo_root, detection)
+    # Compared by identity, not spelling: the same repository under either of its two names.
     candidate_active = _activation_state(candidate, "candidate")
     if target is None:
         if not candidate_active:
@@ -91,16 +95,16 @@ def candidate_acceptance_enforced(
     if target_active:
         if not candidate_active:
             raise HygieneError("candidate cannot disable the pinned target candidateAcceptance barrier")
-        if canonical_json(candidate) != canonical_json(target):
+        if canonical_json(_policy_identity(candidate)) != canonical_json(_policy_identity(target)):
             raise HygieneError("candidate candidateAcceptance policy differs from the active pinned target")
         return True
 
     if not candidate_active:
-        if canonical_json(candidate) != canonical_json(target):
+        if canonical_json(_policy_identity(candidate)) != canonical_json(_policy_identity(target)):
             raise HygieneError("dormant candidateAcceptance policy differs from the pinned target")
         return False
-    activation_candidate = dict(candidate)
-    activation_target = dict(target)
+    activation_candidate = _policy_identity(candidate)
+    activation_target = _policy_identity(target)
     for policy in (activation_candidate, activation_target):
         policy.pop("enabled", None)
         policy.pop("requireReadyForFinalize", None)
@@ -213,11 +217,29 @@ def required_surfaces(config: Dict[str, Any]) -> List[str]:
     return result
 
 
+def _transport_repository(repository: Any, what: str) -> str:
+    """Map a configured or recorded repository name to the transport slug; any other name fails closed."""
+
+    if not is_repository_alias(repository):
+        raise HygieneError(f"{what} must equal the canonical repository")
+    return canonical_repository(repository)
+
+
 def provider_repository(config: Dict[str, Any]) -> str:
+    # IDENTITY may be either name (a policy pinned before the transfer still validates); the
+    # returned value is the TRANSPORT name every live query uses.
     repository = str(_acceptance_config(config).get("providerRepository") or "").strip()
-    if repository != CANONICAL_PROVIDER_REPOSITORY:
-        raise HygieneError("candidate acceptance providerRepository must equal the canonical repository")
-    return repository
+    return _transport_repository(repository, "candidate acceptance providerRepository")
+
+
+def _policy_identity(policy: Dict[str, Any]) -> Dict[str, Any]:
+    """Fold a policy's providerRepository alias so a pre-transfer pinned target equals its successor."""
+
+    folded = dict(policy)
+    repository = folded.get("providerRepository")
+    if is_repository_alias(repository):
+        folded["providerRepository"] = canonical_repository(repository)
+    return folded
 
 
 def validation_plan(config: Dict[str, Any]) -> Dict[str, Any]:
@@ -338,7 +360,8 @@ def _provider_payload(path: Path) -> Dict[str, Any]:
 def _selected_github_checks(payload: Dict[str, Any], surface: str, candidate: Dict[str, Any], repository: str) -> List[Dict[str, Any]]:
     if surface not in HOSTED_SURFACES:
         raise HygieneError("GitHub provider evidence may record only hosted surfaces")
-    if payload.get("repository") != repository:
+    # Recorded evidence may carry either name of the repository (pre- or post-transfer).
+    if not is_repository_alias(payload.get("repository")) or not is_repository_alias(repository):
         raise HygieneError("GitHub provider repository does not match the configured repository")
     if payload.get("headSha") != candidate["featureHead"]:
         raise HygieneError("GitHub provider head does not match the candidate feature head")
@@ -675,8 +698,7 @@ def system_curl_github_query_command(
     if not provider_client.is_absolute() or not provider_client.is_file():
         raise HygieneError("candidate acceptance system curl is unavailable")
     head = _require_sha(head_sha, "featureHead")
-    if repository != CANONICAL_PROVIDER_REPOSITORY:
-        raise HygieneError("live GitHub query repository must equal the canonical repository")
+    repository = _transport_repository(repository, "live GitHub query repository")
     url = f"https://api.github.com/repos/{repository}/commits/{head}/check-runs?per_page=100"
     return provider_client, [
         str(provider_client),
@@ -720,8 +742,7 @@ def _live_github_json_payload(
     """Read one GitHub JSON resource through the OS-protected curl trust root."""
 
     repo_root = resolve_repo_root(repo_root)
-    if repository != CANONICAL_PROVIDER_REPOSITORY:
-        raise HygieneError("live GitHub query repository must equal the canonical repository")
+    repository = _transport_repository(repository, "live GitHub query repository")
     api_prefix = f"https://api.github.com/repos/{repository}/"
     if not isinstance(url, str) or not url.startswith(api_prefix):
         raise HygieneError("live GitHub query URL must stay under the canonical repository API")
@@ -802,6 +823,7 @@ def live_github_issue_comment(
 
     if not isinstance(comment_id, int) or isinstance(comment_id, bool) or comment_id <= 0:
         raise HygieneError("live GitHub comment id must be a positive integer")
+    repository = _transport_repository(repository, "live GitHub query repository")
     url = f"https://api.github.com/repos/{repository}/issues/comments/{comment_id}"
     payload = _live_github_json_payload(
         repo_root,
@@ -825,6 +847,7 @@ def live_github_branch_head(
 
     if branch != "master":
         raise HygieneError("live GitHub branch query is restricted to master")
+    repository = _transport_repository(repository, "live GitHub query repository")
     url = f"https://api.github.com/repos/{repository}/git/ref/heads/{branch}"
     payload = _live_github_json_payload(
         repo_root,
@@ -847,6 +870,7 @@ def live_github_branch_head(
 
 def _live_github_provider_payload(repo_root: Path, config: Dict[str, Any], repository: str, head_sha: str) -> Dict[str, Any]:
     head = _require_sha(head_sha, "featureHead")
+    repository = _transport_repository(repository, "live GitHub query repository")
     url = f"https://api.github.com/repos/{repository}/commits/{head}/check-runs?per_page=100"
     raw = _live_github_json_payload(
         repo_root,
@@ -1001,14 +1025,14 @@ def _validate_surface(
             selected = _selected_github_checks(payload, surface_name, candidate, repository)
         except (HygieneError, OSError, json.JSONDecodeError, ValueError):
             return "provider_evidence_invalid"
-        if evidence.get("repository") != repository or evidence.get("headSha") != candidate["featureHead"]:
+        if not is_repository_alias(evidence.get("repository")) or evidence.get("headSha") != candidate["featureHead"]:
             return "provider_evidence_identity_mismatch"
         if evidence.get("selectedChecks") != selected:
             return "provider_selected_checks_mismatch"
         if any(item.get("status") != "completed" for item in selected):
             return "provider_checks_nonterminal"
         expected_verdict = "CHANGES_REQUESTED" if _provider_failures(selected) else "APPROVE"
-        expected_reviewer = f"github:{repository}"
+        expected_reviewer = f"github:{evidence.get('repository')}"
         expected_session = "github-checks:" + candidate["featureHead"] + ":" + ",".join(
             str(item["id"]) for item in selected
         )

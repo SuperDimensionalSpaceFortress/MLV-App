@@ -103,6 +103,17 @@ PYTHON_LOCK_ROOTS = {
 }
 
 
+# Platform-conditional transitives the Windows lock generation carries. A lock
+# regenerated off-platform (for example a Dependabot run on Linux) silently
+# drops these, and CI then fails on the Windows runner. Each must stay pinned
+# with hashes (the parser below rejects unhashed pins).
+PYTHON_LOCK_REQUIRED_WINDOWS_PINS = {
+    ".github/requirements/aqtinstall.txt": {"backports-zstd"},
+    "tools/agent-bridge/requirements.txt": {"colorama", "pywin32"},
+    "tools/agent-bridge/requirements-test.txt": {"colorama", "pywin32"},
+}
+
+
 def parse_hashed_requirement_lock(path: Path) -> dict[str, str]:
     """Return normalized package pins after enforcing the lock-file grammar."""
     logical_lines: list[str] = []
@@ -952,6 +963,14 @@ class RepoHygieneTests(unittest.TestCase):
             pins = parse_hashed_requirement_lock(lock_path)
             self.assertTrue(roots.issubset(pins), f"{relative_path} lost direct roots")
             observed_locks[relative_path] = pins
+
+        for relative_path, required in PYTHON_LOCK_REQUIRED_WINDOWS_PINS.items():
+            self.assertTrue(
+                required.issubset(observed_locks[relative_path]),
+                f"{relative_path} lost Windows-conditional pins "
+                f"{sorted(required - set(observed_locks[relative_path]))}; "
+                "regenerate with tools/dependencies/update-python-locks.ps1 on Windows",
+            )
 
         self.assertEqual(observed_locks[".github/requirements/pip.txt"]["pip"], "26.2.1")
         self.assertEqual(

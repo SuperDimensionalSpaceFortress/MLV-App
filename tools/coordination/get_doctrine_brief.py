@@ -214,7 +214,7 @@ def _is_mlv_relevant(name: str, text: str) -> bool:
     if any(h in low_name for h in MLV_NAME_HINTS):
         return True
     low = text.lower()
-    return any(h in low for h in ("mlv-app", "mlv app", "tools/agent-bridge", "layibabalola/mlv-app"))
+    return any(h in low for h in ("mlv-app", "mlv app", "tools/agent-bridge"))
 
 
 def _rulings_digest(text: str) -> str:

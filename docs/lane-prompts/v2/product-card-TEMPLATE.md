@@ -7,7 +7,7 @@ Everything you need is in this file. Do not go looking for the queue, the pens, 
 - Your worktree: `{{WORKDIR}}` (created from `fork/master` at `{{BASE_SHA}}`, the dispatch-time base recorded in your
   receipt). Work ONLY here. `.claude-state\` does not exist in a worktree; your run directory `{{RUNDIR}}` is readable AND writable:
   it holds the `gh-evidence` and dependency exports, and it is where any receipt this card is told to seal is written (O80).
-- Branch: `git switch -c {{BRANCH}}`. Remote `fork` = `https://github.com/layibabalola/MLV-App.git`.
+- Branch: `git switch -c {{BRANCH}}`. Remote `fork` = `https://github.com/SuperDimensionalSpaceFortress/MLV-App.git`.
 - **All claims about the repo are made at `{{BASE_SHA}}`, never at a moving ref, with `git -C .` in this worktree** (its object
   store holds that commit). Anchor by SYMBOL, never by line number. You never need the board root.
 - CLIP_OR_NONE: {{CLIP_OR_NONE}}
@@ -84,7 +84,7 @@ default none), NOTE (optional; default none), DELIVERABLE, ACCEPTANCE, VERIFY_FI
 ^[A-Z][A-Z0-9_]*: at column 0 is an UNKNOWN FIELD and the composer REFUSES the dispatch. Runtime placeholders WORKDIR,
 BASE_SHA, RUNDIR, TS, BRANCH, PR_STEP, DOCTRINE_BRIEF are supplied by the dispatcher (DOCTRINE_BRIEF from Get-DoctrineBrief; composition REFUSES if the brief is missing/failed on implementer/editing paths); for a card with no fields file BRANCH is a runtime value and defaults to
 product/<CARD_ID> (O168). PR_STEP takes exactly one of two ratified values (plan 0.35, O153): for
-lane-can-open-pr EXACTLY `gh pr create -R layibabalola/MLV-App --head {{BRANCH}} --title "<card id>: <subject>" --body "<what, why, red run,
+lane-can-open-pr EXACTLY `gh pr create -R SuperDimensionalSpaceFortress/MLV-App --head {{BRANCH}} --title "<card id>: <subject>" --body "<what, why, red run,
 green run>"; then print PR-OPENED: <number> as your last line.`; otherwise EXACTLY `Do NOT call gh. Print PUSHED: {{BRANCH}} <head sha> as your
 last line; the dispatcher opens the PR.` — the composer materialises {{BRANCH}} inside PR_STEP before insertion; never a third value, never blank (S122). PR_STEP is injected BEFORE field substitution and its value carries {{BRANCH}}; composition is a fixed
 point — re-substitute every field placeholder after injecting PR_STEP — and the no-{{ assertion runs last (O157). Composition is deterministic; a test asserts every parsed

@@ -37,7 +37,7 @@ sol receipt is still `state: reserved` or `state: running` (every other state --
   through a PR with a green required-check set and a `sol` APPROVE bound to the full 40-character head sha (S113).
 - Absolute paths everywhere (`$D` = `C:\!Layi Wkspc\MLV-App\.claude-state\coordination\dual-lane`). Pin every git call as
   `git -C "C:\!Layi Wkspc\MLV-App"`. `.claude-state\` is gitignored and does not exist inside a worktree.
-- Every `gh` call names the repository: `-R layibabalola/MLV-App`, or the `repos/layibabalola/MLV-App/…` API path. The board has two remotes
+- Every `gh` call names the repository: `-R SuperDimensionalSpaceFortress/MLV-App`, or the `repos/SuperDimensionalSpaceFortress/MLV-App/…` API path. The board has two remotes
   and no default, so an unpinned `gh` addresses the upstream — loudly for `gh pr checks`, silently for `gh workflow list` (O135).
 - Derive, never remember: a sha, a count, a status or a rev is quoted only from a command you just ran.
 

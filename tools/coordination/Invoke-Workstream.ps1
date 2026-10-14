@@ -275,6 +275,7 @@ function Get-LastDispatchAgeHours([string]$id) {
 # queue-derive.ps1 asks GitHub the same question for a different purpose, and two copies of this
 # vocabulary would be widened once and left stale - the single most frequently paid failure on
 # this board. Read that file for the rules and for the measured incident behind each one.
+. (Join-Path $PSScriptRoot 'repo-slug.ps1')
 . (Join-Path $PSScriptRoot 'landing-probe.ps1')
 
 # The permanent composer (plan 0.35). Needs the resolved branch name before an editing
@@ -785,15 +786,16 @@ if ($needsHostedEvidence) {
     # A FIXED, PREDICTABLE SET. Not derived from the card text: a lane must be able to rely on the
     # same filenames every time, and a card-shaped guess would silently omit whatever the card
     # forgot to name. Anything missing is a FINDING the lane reports, not a gap it works around.
+    $ghRepo = Get-MlvRepoSlug
     $ghJobs = [ordered]@{
         'repo-metadata.json' = @(
-            'api','repos/layibabalola/MLV-App','--jq',
+            'api',"repos/$ghRepo",'--jq',
             '{visibility,private,fork,archived,default_branch,pushed_at}')
         'branch-protection-master.json' = @(
-            'api','repos/layibabalola/MLV-App/branches/master/protection')
-        'rulesets.json' = @('api','repos/layibabalola/MLV-App/rulesets')
+            'api',"repos/$ghRepo/branches/master/protection")
+        'rulesets.json' = @('api',"repos/$ghRepo/rulesets")
         'runs-tests-master-push-completed.json' = @(
-            'run','list','--repo','layibabalola/MLV-App','--workflow','tests.yml',
+            'run','list','--repo',$ghRepo,'--workflow','tests.yml',
             '--branch','master','--event','push','--status','completed','--limit','50',
             '--json','databaseId,conclusion,createdAt,headSha,displayTitle')
     }
@@ -843,7 +845,7 @@ if ($needsHostedEvidence) {
                     $newest  = $runs[0].databaseId
                     $jobsOut = Join-Path $ghDir "jobs-latest-$newest.json"
                     $jobsErr = "$jobsOut.err.txt"
-                    & gh api "repos/layibabalola/MLV-App/actions/runs/$newest/jobs" 1>$jobsOut 2>$jobsErr
+                    & gh api "repos/$ghRepo/actions/runs/$newest/jobs" 1>$jobsOut 2>$jobsErr
                     $jcode = $LASTEXITCODE
                     $jlen  = if (Test-Path -LiteralPath $jobsOut) { (Get-Item -LiteralPath $jobsOut).Length } else { 0 }
                     if ($jcode -eq 0 -and $jlen -gt 0) {

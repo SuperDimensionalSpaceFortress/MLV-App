@@ -161,23 +161,20 @@ function Write-Gate([string]$Line) {
 
 # One directory count, or $null when the directory cannot be read: an unreachable share is NOT an empty queue. The inbox must exist; running\ may
 # legitimately be absent while the share itself is readable (nothing has run), so only a read error on an existing running\ is unreadable.
-# -Exclude drops names matching that regex from the count.
-function Get-GateCount([string]$Dir, [string]$Filter, [bool]$MustExist, [string]$Exclude = '') {
+# VENUE-QUIET-SETASIDE-RECORD-1: -ExcludePattern drops names the agent has already RESOLVED. The agent sets a superseded marker tmp aside IN running\ as
+# '<name>.stale-<ticks>' or '<name>.corrupt-<ticks>' and never lists it again (ultra-magnus-agent.ps1 Get-MarkerTempFiles), so it is not a running job.
+# Counting it held the gate at running=1 for every lane after the job had ended (2026-10-13 23:00Z). A live '<id>.started.json' and an unresolved tmp still count.
+$setAsideRecordPattern = '\.(stale|corrupt)-\d+$'
+function Get-GateCount([string]$Dir, [string]$Filter, [bool]$MustExist, [string]$ExcludePattern = '') {
     if (-not (Test-Path -LiteralPath $Dir -PathType Container)) {
         if ($MustExist -or -not (Test-Path -LiteralPath $agentShare -PathType Container)) { return $null }
         return 0
     }
     try {
-        $items = if ($Filter) { @(Get-ChildItem -LiteralPath $Dir -Filter $Filter -ErrorAction Stop) } else { @(Get-ChildItem -LiteralPath $Dir -ErrorAction Stop) }
-        if ($Exclude) { $items = @($items | Where-Object { $_.Name -notmatch $Exclude }) }
-        return $items.Count
+        if ($Filter) { return @(Get-ChildItem -LiteralPath $Dir -Filter $Filter -ErrorAction Stop).Count }
+        return @(Get-ChildItem -LiteralPath $Dir -ErrorAction Stop | Where-Object { -not $ExcludePattern -or $_.Name -notmatch $ExcludePattern }).Count
     } catch { return $null }
 }
-
-# CPU-SCOPE-LIVE-HEAP-CORRUPTION-1: a marker record the agent has SET ASIDE ('<marker>.stale-<ticks>' or '<marker>.corrupt-<ticks>',
-# tools\profiling\bachelor\ultra-magnus-agent.ps1 Resolve-JobMarkerTemps) is resolved: no job runs behind it and the agent itself no longer lists it.
-# It stays in running\ for the record, so counting it held the gate BUSY for every lane for as long as it stayed (Bachelor, from 2026-10-13T22:53Z).
-$setAsideMarkerPattern = '\.(stale|corrupt)-\d+$'
 
 # Sets $script:GateState to 'CLEAR', 'BUSY' (the queue never cleared) or 'UNREADABLE' (the share could not be read: nothing is known, the decision
 # is UNKNOWN). The state is not the function's output: its GATE lines are written to the pipeline and must reach stdout.
@@ -192,7 +189,7 @@ $gateEnd = $t0.AddSeconds([Math]::Min($MaxGateSec, $MaxWaitSec))
 function Read-GateCounts([string]$Name) {
     for ($attempt = 1; $true; $attempt++) {
         $script:GateQueued = Get-GateCount "$agentShare\inbox" '*.job.ps1' $true
-        $script:GateRunning = Get-GateCount "$agentShare\running" '' $false $setAsideMarkerPattern
+        $script:GateRunning = Get-GateCount "$agentShare\running" '' $false $setAsideRecordPattern
         if (($null -ne $script:GateQueued -and $null -ne $script:GateRunning) -or $attempt -ge $ReadAttempts) { return }
         $delay = $ReadBackoffSec * $attempt
         if ((Get-Date).AddSeconds($delay) -gt $deadline) { return }   # no time left for another try: report what is known
