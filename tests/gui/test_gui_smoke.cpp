@@ -635,6 +635,7 @@ private slots:
     void gpuDisplayWindowCaptureIgnoresFailedReconTextureSubmit();
     void gpuDisplayWindowRefusesReconTextureWithoutProcessingOptions();
     void mainWindowGpuPreviewPolicyAllowsExperimentalProcessingOnlyWhenCompatible();
+    void mainWindowGpuPreviewPolicyRoutesCudaSuppressedSessionToCpu();
     void mainWindowGpuPreviewPolicyAllowsExperimentalBilinearDebayerOnlyWhenCompatible();
     void mainWindowGpuPreviewPolicyRoutesFullQualityAmazeThroughAmazeGate();
     void mainWindowGpuPreviewPolicyKeepsAmazeTexturePresentExplicitAndNested();
@@ -897,6 +898,39 @@ void GuiSmokeTest::mainWindowGpuPreviewPolicyAllowsExperimentalProcessingOnlyWhe
     state.gpuPreviewProcessingBackendRequest = GpuPreviewProcessingBackendRequest::Cpu;
     QVERIFY(!mainWindowAllowsGpuPreviewProcessing(state));
     QVERIFY(!mainWindowUsesGpuPreviewProcessing(state));
+}
+
+// GPU-DEVICE-LOSS-SELF-HEAL-1 r3: with MLVAPP_EXPERIMENTAL_GPU_PROCESSING set (the CUDA preset), a
+// CUDA-suppressed session lands on the plain CPU route, not GpuPreview.
+void GuiSmokeTest::mainWindowGpuPreviewPolicyRoutesCudaSuppressedSessionToCpu()
+{
+    QVERIFY(mainWindowGpuPreviewProcessingRequestedForSession(true, false));
+    QVERIFY(!mainWindowGpuPreviewProcessingRequestedForSession(true, true));
+    QVERIFY(!mainWindowGpuPreviewProcessingRequestedForSession(false, false));
+    QVERIFY(!mainWindowGpuPreviewProcessingRequestedForSession(false, true));
+
+    for (const bool suppressed : {false, true})
+    {
+        MainWindowGpuPreviewPolicyState state;
+        state.gpuViewportInstalled = true;
+        state.gpuWidgetViewportInstalled = true;
+        state.gpuPreviewProcessingBackendRequest = GpuPreviewProcessingBackendRequest::Auto;
+        state.gpuPreviewProcessingEnvironmentRequested =
+            mainWindowGpuPreviewProcessingRequestedForSession(true, suppressed);
+        state.gpuPreviewProcessingCompatible = true;
+        state.gpuBilinearDebayerEnvironmentRequested = true;
+        state.gpuBilinearDebayerCompatible = true;
+        state.renderThreadUsing16BitPreview = true;
+        state.renderThreadUsingGpuProcessingPreview = mainWindowAllowsGpuPreviewProcessing(state);
+        state.renderThreadUsingGpuBilinearDebayer = mainWindowAllowsGpuBilinearDebayer(state);
+
+        QCOMPARE(mainWindowAllowsGpuPreviewProcessing(state), !suppressed);
+        QCOMPARE(mainWindowUsesGpuPreviewProcessing(state), !suppressed);
+        QCOMPARE(mainWindowAllowsGpuBilinearDebayer(state), !suppressed);
+        QCOMPARE(static_cast<int>(mainWindowGpuPlaybackPipelineStatus(state, false, false, false)),
+                 static_cast<int>(suppressed ? GpuPlaybackPipelineStatus::Cpu
+                                             : GpuPlaybackPipelineStatus::GpuPreview));
+    }
 }
 
 void GuiSmokeTest::mainWindowGpuPreviewPolicyAllowsExperimentalBilinearDebayerOnlyWhenCompatible()

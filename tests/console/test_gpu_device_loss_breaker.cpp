@@ -274,3 +274,43 @@ TEST(GpuDeviceLossBreaker, EveryCudaAmazeEntryRefusesWhileSuppressed)
         }
     }
 }
+
+// r3: a suppressed session takes the plain CPU route, not GL preview processing (which presented
+// 6.4-10.2 fps on Bachelor against 21.8 fps for the CPU route). Every policy builder in MainWindow.cpp
+// reads MLVAPP_EXPERIMENTAL_GPU_PROCESSING through the suppression-aware helper, and the two sites that
+// force it on are reachable only through playback_recon_requested_by_environment(), which refuses first.
+TEST(GpuDeviceLossBreaker, SuppressedSessionTurnsOffGpuPreviewProcessingAtEveryPolicyBuilder)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString assign = QStringLiteral("gpuPreviewProcessingEnvironmentRequested =");
+    const QString gated = QStringLiteral(
+        "gpuPreviewProcessingEnvironmentRequested =\n"
+        "        mainWindowGpuPreviewProcessingRequestedForSession(\n"
+        "            gpuPreviewProcessingRequestedByEnvironment(), llrpGpuCudaSuppressed() != 0 );");
+    int builders = 0;
+    int forced = 0;
+    for (int at = source.indexOf(assign); at >= 0; at = source.indexOf(assign, at + 1))
+    {
+        if (source.mid(at, assign.size() + 6) == assign + QStringLiteral(" true;"))
+        {
+            // The forced-true site sits under a condition that requires the (suppression-gated) recon request.
+            const int cond = source.lastIndexOf(QStringLiteral("const bool "), at);
+            ASSERT_TRUE(cond >= 0);
+            ASSERT_TRUE(source.mid(cond, at - cond).contains(QStringLiteral("gpuPlaybackReconEnvironmentRequested\n")));
+            ++forced;
+            continue;
+        }
+        ASSERT_TRUE(source.mid(at, gated.size()) == gated);
+        ++builders;
+    }
+    ASSERT_EQ(5, builders);
+    ASSERT_EQ(2, forced);
+    ASSERT_EQ(0, (int)source.count(QStringLiteral("gpuPreviewProcessingEnvironmentRequested =\n"
+                                                  "        gpuPreviewProcessingRequestedByEnvironment();")));
+    ASSERT_TRUE(source.contains(QStringLiteral("static bool playback_recon_requested_by_environment()\n{\n"
+                                               "    // GPU-DEVICE-LOSS-SELF-HEAL-1: no CUDA recon after a device loss or on a safe start.\n"
+                                               "    if( llrpGpuCudaSuppressed() ) return false;")));
+    // Both policy-state recon requests come from that function.
+    ASSERT_EQ(2, (int)source.count(QStringLiteral("gpuPlaybackReconEnvironmentRequested =\n"
+                                                  "        playback_recon_requested_by_environment();")));
+}

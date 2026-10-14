@@ -6316,7 +6316,8 @@ void MainWindow::drawFrame( bool updateTimecodeLabel )
         GpuDisplayViewport::isInstalledOn( ui->graphicsView );
     renderPolicy.gpuPreviewProcessingBackendRequest = m_gpuPreviewProcessingBackendRequest;
     renderPolicy.gpuPreviewProcessingEnvironmentRequested =
-        gpuPreviewProcessingRequestedByEnvironment();
+        mainWindowGpuPreviewProcessingRequestedForSession(
+            gpuPreviewProcessingRequestedByEnvironment(), llrpGpuCudaSuppressed() != 0 );
     renderPolicy.gpuPreviewProcessingCompatible = gpuPreviewProcessingIsSupported( m_pProcessingObject );
     // PLAYBACK-SEEK-RENDER-PARITY-1: the texture-present routes draw through the live
     // display shader, which applies the full per-pixel chain but not these stages.
@@ -18751,7 +18752,8 @@ bool MainWindow::shouldUseGpuPreviewProcessingPath( void ) const
         GpuDisplayViewport::isInstalledOn( ui->graphicsView );
     policyState.gpuPreviewProcessingBackendRequest = m_gpuPreviewProcessingBackendRequest;
     policyState.gpuPreviewProcessingEnvironmentRequested =
-        gpuPreviewProcessingRequestedByEnvironment();
+        mainWindowGpuPreviewProcessingRequestedForSession(
+            gpuPreviewProcessingRequestedByEnvironment(), llrpGpuCudaSuppressed() != 0 );
     policyState.gpuPreviewProcessingCompatible = gpuPreviewProcessingIsSupported( m_pProcessingObject );
     const bool scopeDisplayVisible = ui->dockWidgetEdit->isVisible();
     policyState.histogramEnabled = mainWindowScopeActionConsumesPresentedPixels(
@@ -18773,7 +18775,8 @@ bool MainWindow::shouldUseGpuBilinearDebayerPath( void ) const
         GpuDisplayViewport::isInstalledOn( ui->graphicsView );
     policyState.gpuPreviewProcessingBackendRequest = m_gpuPreviewProcessingBackendRequest;
     policyState.gpuPreviewProcessingEnvironmentRequested =
-        gpuPreviewProcessingRequestedByEnvironment();
+        mainWindowGpuPreviewProcessingRequestedForSession(
+            gpuPreviewProcessingRequestedByEnvironment(), llrpGpuCudaSuppressed() != 0 );
     policyState.gpuPreviewProcessingCompatible = gpuPreviewProcessingIsSupported( m_pProcessingObject );
     policyState.gpuBilinearDebayerBackendRequest = m_gpuBilinearDebayerBackendRequest;
     policyState.gpuBilinearDebayerEnvironmentRequested =
@@ -18800,7 +18803,8 @@ bool MainWindow::shouldUseGpuAmazeDebayerPath( void ) const
         GpuDisplayViewport::isInstalledOn( ui->graphicsView );
     policyState.gpuPreviewProcessingBackendRequest = m_gpuPreviewProcessingBackendRequest;
     policyState.gpuPreviewProcessingEnvironmentRequested =
-        gpuPreviewProcessingRequestedByEnvironment();
+        mainWindowGpuPreviewProcessingRequestedForSession(
+            gpuPreviewProcessingRequestedByEnvironment(), llrpGpuCudaSuppressed() != 0 );
     policyState.gpuPreviewProcessingCompatible = gpuPreviewProcessingIsSupported( m_pProcessingObject );
     policyState.gpuAmazeDebayerBackendRequest = m_gpuAmazeDebayerBackendRequest;
     policyState.gpuAmazeDebayerEnvironmentRequested =
@@ -22154,7 +22158,8 @@ MainWindowGpuPreviewPolicyState MainWindow::gpuPreviewPolicyForCurrentScopeState
     policyState.gpuPreviewProcessingBackendRequest =
         m_gpuPreviewProcessingBackendRequest;
     policyState.gpuPreviewProcessingEnvironmentRequested =
-        gpuPreviewProcessingRequestedByEnvironment();
+        mainWindowGpuPreviewProcessingRequestedForSession(
+            gpuPreviewProcessingRequestedByEnvironment(), llrpGpuCudaSuppressed() != 0 );
     policyState.gpuPreviewProcessingCompatible =
         gpuPreviewProcessingIsSupported( m_pProcessingObject );
     policyState.gpuBilinearDebayerBackendRequest =

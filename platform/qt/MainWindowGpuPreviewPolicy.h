@@ -115,6 +115,16 @@ inline bool mainWindowUsesGpu16PreviewPresentation(
         && state.renderThreadUsing16BitPreview;
 }
 
+// GPU-DEVICE-LOSS-SELF-HEAL-1 r3: a CUDA-suppressed session (a device loss this session, or a safe
+// start) takes the plain CPU route. MLVAPP_EXPERIMENTAL_GPU_PROCESSING left GL preview processing on
+// after suppression, which presented a third of the CPU route's fps on Bachelor (draw 238 vs 40 ms).
+inline bool mainWindowGpuPreviewProcessingRequestedForSession(
+    bool environmentRequested,
+    bool cudaSuppressed)
+{
+    return environmentRequested && !cudaSuppressed;
+}
+
 inline bool mainWindowAllowsGpuPreviewProcessing(
     const MainWindowGpuPreviewPolicyState &state)
 {
