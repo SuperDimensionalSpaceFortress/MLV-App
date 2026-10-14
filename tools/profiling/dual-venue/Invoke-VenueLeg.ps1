@@ -385,6 +385,11 @@ try {
         if ($spec.generatorArgs.PSObject.Properties['rawPrefetchDecoders']) { $gen['RawPrefetchDecoders'] = [int]$spec.generatorArgs.rawPrefetchDecoders }
         # GPU-EVENT153-ROOTCAUSE-2: the CUDA per-launch timer and its line threshold, for any leg.
         if ($spec.generatorArgs.PSObject.Properties['cudaLaunchTimingMinMs']) { $gen['CudaLaunchTimingMinMs'] = [double]$spec.generatorArgs.cudaLaunchTimingMinMs }
+        # GPU-DEVICE-LOSS-SELF-HEAL-1 r2: the injected device loss, the safe-start clear, the shared settings store and the pre-launches of the self-heal proof, for any leg.
+        if ($spec.generatorArgs.PSObject.Properties['gpuFaultInject']) { $gen['GpuFaultInject'] = [string]$spec.generatorArgs.gpuFaultInject }
+        if ($spec.generatorArgs.PSObject.Properties['gpuSafeStart']) { $gen['GpuSafeStart'] = [string]$spec.generatorArgs.gpuSafeStart }
+        if ($spec.generatorArgs.PSObject.Properties['automationSettingsDir']) { $gen['AutomationSettingsDir'] = [string]$spec.generatorArgs.automationSettingsDir }
+        if ($spec.generatorArgs.PSObject.Properties['gpuPreLaunches']) { $gen['GpuPreLaunches'] = [string[]]@($spec.generatorArgs.gpuPreLaunches) }
         # UPSTREAM-CPU-BASELINE-1: a no-look leg runs the app with Look Assist OFF (the fork's default is on); the generator refuses it with a forced look, typed.
         if ($spec.generatorArgs.PSObject.Properties['disableLookAssist'] -and [bool]$spec.generatorArgs.disableLookAssist) { $gen['DisableLookAssist'] = $true }
         # PLAYBACK-STARTUP-CATCHUP-BURST-1 r7: the app's opt-in per-present playback trace, for any leg.
@@ -553,6 +558,13 @@ if ($artifactsShare -and (Test-Path -LiteralPath $artifactsShare -PathType Conta
     }
     $receipt.evidence.artifactIndexPath = $artifactsShare.TrimEnd('\') + '\artifact-index.json'
     $receipt.evidence.localEvidenceDir = $evidenceDir
+    # GPU-DEVICE-LOSS-SELF-HEAL-1 r2: a leg with generatorArgs.automationSettingsDir publishes <artifacts>\self-heal (each pre-launch's result, run log, GPU field
+    # log and INI; the measured run's GPU field log and INI; the store's delete record); it is fetched back into the local evidence. Absent on every other leg.
+    $selfHealShare = Join-Path $artifactsShare 'self-heal'
+    if (Test-Path -LiteralPath $selfHealShare -PathType Container) {
+        Copy-Item -LiteralPath $selfHealShare -Destination (Join-Path $evidenceDir 'self-heal') -Recurse
+        Write-Output "DVE_SELF_HEAL=$(Join-Path $evidenceDir 'self-heal') FILES=$(@(Get-ChildItem -LiteralPath (Join-Path $evidenceDir 'self-heal') -File -Recurse).Count)"
+    }
     # The launcher's result.json (the nonce it generated, the sha256 of the run-log snapshot) and the app's run log (the summary line
     # the proof is re-derived from).
     if (Test-Path -LiteralPath $resultLocal -PathType Leaf) {

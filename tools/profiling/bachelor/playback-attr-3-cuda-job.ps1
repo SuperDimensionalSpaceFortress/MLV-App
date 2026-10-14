@@ -362,6 +362,17 @@ param(
     # applies it before playback. Only with -ForceLookAssist -ContactSheet. Empty (the default) adds nothing: the job is the text it was before.
     [string]$LookReceiptPath = '',
 
+    # GPU-DEVICE-LOSS-SELF-HEAL-1 r2: the device-loss self-heal proof (L1..L4 in ONE job, so two losses land inside the breaker's 10-minute window).
+    # -GpuFaultInject <code>@<n> sets MLVAPP_GPU_FAULT_INJECT (the app's injected device loss; never a real TDR) and -GpuSafeStart clear sets
+    # MLVAPP_GPU_SAFE_START=clear, both for the measured run. -AutomationSettingsDir <name> gives every launch of the job ONE run-scoped settings
+    # store, <work>\<name> (MLVAPP_AUTOMATION_SETTINGS_DIR), created fresh and deleted by proof after the measured run. -GpuPreLaunches runs the
+    # measured run's own smoke command once per entry ('<code>@<n>' injects, 'none' does not) BEFORE PresentMon and the measured run, on that
+    # store; each publishes under <artifacts>\self-heal. Every default adds nothing: the emitted job is the text it was before these parameters.
+    [ValidatePattern('^((700|702|719|999)@[1-9][0-9]*)?$')][string]$GpuFaultInject = '',
+    [ValidateSet('', 'clear')][string]$GpuSafeStart = '',
+    [ValidatePattern('^([A-Za-z0-9][A-Za-z0-9._-]{0,63})?$')][string]$AutomationSettingsDir = '',
+    [string[]]$GpuPreLaunches = @(),
+
     # Test seam: the venue table to read instead of tools/profiling/dual-venue/venues.json.
     [string]$VenueTablePath = '',
 
@@ -4445,6 +4456,110 @@ if ($PresentTrace) {
         param($m)
         $m.Value + $m.Groups['ind'].Value + "'MLVAPP_PLAYBACK_PRESENT_TRACE=1'," + $m.Groups['nl'].Value
     })
+}
+
+# GPU-DEVICE-LOSS-SELF-HEAL-1 r2: the self-heal proof (see the parameters). Everything below is added to the expanded text and only when asked, so
+# every other job is the text it always was. Each anchor must match exactly once, or the generator throws.
+# `pwsh -File` passes an array argument as ONE string, so -GpuPreLaunches a,b is split on commas.
+$GpuPreLaunches = @($GpuPreLaunches | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+if ($GpuPreLaunches.Count -gt 4 -or @($GpuPreLaunches | Where-Object { $_ -cnotmatch '^((700|702|719|999)@[1-9][0-9]*|none)$' }).Count -gt 0) {
+    throw 'DUAL_VENUE_GPU_PRE_LAUNCH_INVALID -GpuPreLaunches takes at most 4 entries, each <700|702|719|999>@<n >= 1> or none'
+}
+if ($GpuPreLaunches.Count -gt 0 -and [string]::IsNullOrEmpty($AutomationSettingsDir)) {
+    throw 'DUAL_VENUE_GPU_PRE_LAUNCH_NEEDS_SETTINGS_DIR -GpuPreLaunches needs -AutomationSettingsDir (the launches prove a persisted flag through ONE shared settings store)'
+}
+if ($GpuPreLaunches.Count -gt 0 -and $ContactSheet) {
+    throw 'DUAL_VENUE_GPU_PRE_LAUNCH_NEEDS_SPEED_LEG -GpuPreLaunches cannot be combined with -ContactSheet (a pre-launch would write into the measured run''s contact sheet)'
+}
+$selfHealEnvs = @()
+if (-not [string]::IsNullOrEmpty($AutomationSettingsDir)) { $selfHealEnvs += "('MLVAPP_AUTOMATION_SETTINGS_DIR=' + (Join-Path `$Work '$AutomationSettingsDir'))," }
+if (-not [string]::IsNullOrEmpty($GpuFaultInject)) { $selfHealEnvs += "'MLVAPP_GPU_FAULT_INJECT=$GpuFaultInject'," }
+if (-not [string]::IsNullOrEmpty($GpuSafeStart)) { $selfHealEnvs += "'MLVAPP_GPU_SAFE_START=$GpuSafeStart'," }
+if ($selfHealEnvs.Count -gt 0) {
+    $selfHealAnchor = [regex]"(?<ind>[ \t]*)'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',(?<nl>\r?\n)"
+    if ($selfHealAnchor.Matches($text).Count -ne 1) { throw 'DUAL_VENUE_GPU_SELF_HEAL_ANCHOR_MISSING the job template has no single env-list site to add the self-heal envs to' }
+    $text = $selfHealAnchor.Replace($text, [System.Text.RegularExpressions.MatchEvaluator]{
+        param($m)
+        $m.Value + (($selfHealEnvs | ForEach-Object { $m.Groups['ind'].Value + $_ + $m.Groups['nl'].Value }) -join '')
+    })
+}
+if (-not [string]::IsNullOrEmpty($AutomationSettingsDir)) {
+    $eol = if ($text.Contains("`r`n")) { "`r`n" } else { "`n" }
+    $scratchLiteral = "'" + $venueScratchRoot.Replace("'", "''") + "'"
+    $preLaunchLiteral = '@(' + (($GpuPreLaunches | ForEach-Object { "'$_'" }) -join ', ') + ')'
+    # The store is created FRESH and journalled (New-AttrCudaOwnedRoot), so the delete after the measured run is by proof. Then the pre-launches, each the
+    # measured run's own $cmd with its own -Output and env list, before the owner-footage check (which then covers them too), PresentMon and the measured run.
+    $preLaunchBlock = @(
+        '# GPU-DEVICE-LOSS-SELF-HEAL-1 r2: the shared run-scoped settings store and the self-heal pre-launches (see the generator''s -GpuPreLaunches).'
+        ((Get-AttrCudaEmbeddedFunctionSource -Name @('New-AttrCudaOwnedRoot')) -replace "\r?\n", $eol)
+        '$selfHealPub = Join-Path $Pub ''self-heal'''
+        '[void](New-AttrCudaDirectory -Path $selfHealPub)'
+        "`$automationSettingsDir = (New-AttrCudaOwnedRoot -TrustedRoot $scratchLiteral -Path (Join-Path `$Work '$AutomationSettingsDir') -OwnedJournal `$OwnerJournal).Path"
+        "`$gpuPreLaunches = $preLaunchLiteral"
+        '$preLaunchViewsIntact = $true'
+        'if ($ownerViews.Count -gt 0) { try { Assert-AttrCudaOwnerFootageViewsIntact -Views @($ownerViews) } catch { $preLaunchViewsIntact = $false } }'
+        'for ($preIndex = 1; $preIndex -le $gpuPreLaunches.Count -and $preLaunchViewsIntact; $preIndex++) {'
+        '    $preInject = $gpuPreLaunches[$preIndex - 1]'
+        '    $preDir = Join-Path (Join-Path $Work ''pre-launches'') ([string]$preIndex)'
+        '    [void](New-Item -ItemType Directory -Path $preDir -Force)'
+        '    $preResult = Join-Path $preDir ''result.json'''
+        '    $preEnvs = @($envs | Where-Object { $_ -notlike ''MLVAPP_GPU_FAULT_INJECT=*'' -and $_ -notlike ''MLVAPP_GPU_SAFE_START=*'' })'
+        '    if ($preInject -cne ''none'') { $preEnvs += "MLVAPP_GPU_FAULT_INJECT=$preInject" }'
+        '    $preEnvList = "''" + ($preEnvs -join "'',''") + "''"'
+        '    $preCmd = $cmd.Replace("-Output $(ConvertTo-PsSingleQuoted $resultPath) ", "-Output $(ConvertTo-PsSingleQuoted $preResult) ").Replace("-ExtraEnvironment @($envList)", "-ExtraEnvironment @($preEnvList)")'
+        '    $preRecord = [ordered]@{ schema = ''mlv-app/gpu-self-heal-pre-launch/v1''; index = $preIndex; faultInject = $preInject; startedUtc = (Get-Date).ToUniversalTime().ToString(''o''); finishedUtc = $null; rc = $null; error = $null }'
+        '    if (-not $preCmd.Contains($preResult) -or -not $preCmd.Contains("-ExtraEnvironment @($preEnvList)")) {'
+        '        $preRecord.error = ''PRE_LAUNCH_COMMAND_UNDERIVABLE'''
+        '    } else {'
+        '        Write-JobTrace "step self-heal-pre-launch $preIndex start inject=$preInject"'
+        '        try {'
+        '            & "$env:ProgramFiles\PowerShell\7\pwsh.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $preCmd 1> (Join-Path $preDir ''smoke-stdout.txt'') 2> (Join-Path $preDir ''smoke-stderr.txt'')'
+        '            $preRecord.rc = $LASTEXITCODE'
+        '        } catch {'
+        '            $preRecord.error = ''PRE_LAUNCH_EXCEPTION '' + [string]$_.CategoryInfo.Reason'
+        '        }'
+        '        Write-JobTrace "step self-heal-pre-launch $preIndex done rc=$($preRecord.rc)"'
+        '    }'
+        '    $preRecord.finishedUtc = (Get-Date).ToUniversalTime().ToString(''o'')'
+        '    $prePub = Join-Path $selfHealPub "pre-$preIndex"'
+        '    [void](New-AttrCudaDirectory -Path $prePub)'
+        '    $preFiles = @(Get-ChildItem -LiteralPath $preDir -File) + @(Get-ChildItem -LiteralPath $preDir -Directory -Filter ''logs-*'' | ForEach-Object { Get-ChildItem -LiteralPath $_.FullName -File | Where-Object { $_.Name -like ''gpu-field-telemetry.jsonl*'' -or $_.Name -like ''mlvapp-*.log'' } })'
+        '    foreach ($preFile in $preFiles) { [void](Publish-AttrCudaFileCopy -Source $preFile.FullName -Destination (Join-Path $prePub $preFile.Name)) }'
+        '    $preIni = Join-Path $automationSettingsDir ''MLVApp.ini'''
+        '    if (Test-Path -LiteralPath $preIni -PathType Leaf) { [void](Publish-AttrCudaFileCopy -Source $preIni -Destination (Join-Path $prePub ''MLVApp.ini'')) }'
+        '    Save-Json $preRecord (Join-Path $prePub ''pre-launch.json'')'
+        '}'
+    ) -join $eol
+    $preAnchor = '# OWNER-FOOTAGE-NO-HARDLINK-1: the last look before the app can read anything.'
+    $preFirst = $text.IndexOf($preAnchor, [StringComparison]::Ordinal)
+    if ($preFirst -lt 0 -or $text.IndexOf($preAnchor, $preFirst + 1, [StringComparison]::Ordinal) -ge 0) { throw 'DUAL_VENUE_GPU_SELF_HEAL_ANCHOR_MISSING the job template has no single owner-footage check site to put the pre-launches before' }
+    $text = $text.Substring(0, $preFirst) + $preLaunchBlock + $eol + $text.Substring($preFirst)
+    # After the measured run: its GPU field log and the store's INI are published under <artifacts>\self-heal\main, then the store is deleted by proof.
+    $postLaunchBlock = @(
+        '# GPU-DEVICE-LOSS-SELF-HEAL-1 r2: publish the measured run''s GPU field log and the shared store''s INI, then delete the store by proof.'
+        'try {'
+        '    $mainPub = Join-Path $selfHealPub ''main'''
+        '    [void](New-AttrCudaDirectory -Path $mainPub)'
+        '    $mainFiles = @(Get-ChildItem -LiteralPath $legOut -Directory -Filter ''logs-*'' | ForEach-Object { Get-ChildItem -LiteralPath $_.FullName -File | Where-Object { $_.Name -like ''gpu-field-telemetry.jsonl*'' } })'
+        '    foreach ($mainFile in $mainFiles) { [void](Publish-AttrCudaFileCopy -Source $mainFile.FullName -Destination (Join-Path $mainPub $mainFile.Name)) }'
+        '    $mainIni = Join-Path $automationSettingsDir ''MLVApp.ini'''
+        '    if (Test-Path -LiteralPath $mainIni -PathType Leaf) { [void](Publish-AttrCudaFileCopy -Source $mainIni -Destination (Join-Path $mainPub ''MLVApp.ini'')) }'
+        "    `$settingsSweep = Remove-AttrCudaTree -TrustedRoot $scratchLiteral -Path `$automationSettingsDir -OwnedJournal `$OwnerJournal"
+        '    Save-Json ([ordered]@{ schema = ''mlv-app/gpu-self-heal-settings-dir/v1''; treeRemoved = [bool]$settingsSweep.TreeRemoved; filesRemoved = [int]$settingsSweep.Removed; left = @($settingsSweep.Left).Count; stillExists = (Test-Path -LiteralPath $automationSettingsDir) }) (Join-Path $mainPub ''settings-dir.json'')'
+        '} catch {'
+        '    Write-JobTrace "step self-heal-post-launch error=$([string]$_.CategoryInfo.Reason)"'
+        '}'
+    ) -join $eol
+    $postAnchor = 'Write-JobTrace "step smoke-launch done rc=$smokeRc"'
+    $postFirst = $text.IndexOf($postAnchor, [StringComparison]::Ordinal)
+    if ($postFirst -lt 0 -or $text.IndexOf($postAnchor, $postFirst + 1, [StringComparison]::Ordinal) -ge 0) { throw 'DUAL_VENUE_GPU_SELF_HEAL_ANCHOR_MISSING the job template has no single smoke-launch-done site to delete the settings store after' }
+    $postAt = $postFirst + $postAnchor.Length
+    $text = $text.Substring(0, $postAt) + $eol + $postLaunchBlock + $text.Substring($postAt)
+    # Each pre-launch is one more smoke run inside the job: the um-run timeout grows by one smoke-process timeout per pre-launch.
+    if ($GpuPreLaunches.Count -gt 0) {
+        $timeBudget['preLaunchSec'] = [int]($GpuPreLaunches.Count * [Math]::Ceiling($timeBudget.smokeProcessTimeoutMs / 1000.0))
+        $timeBudget['jobTimeoutSec'] = [int]($timeBudget.jobTimeoutSec + $timeBudget.preLaunchSec)
+    }
 }
 
 $outDir = Split-Path -Parent $OutFile

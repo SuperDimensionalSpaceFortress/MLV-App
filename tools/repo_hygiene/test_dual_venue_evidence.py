@@ -120,6 +120,9 @@ VSYNC1_LEGS = tuple(rel.replace(".json", "-vsync1.json") for rel in DISPLAY_MATR
 # LOOK-ASSIST-FILM-FLAVOR-2 r2: the AgX-off twins of the scale-2 Cinematic and Film legs carry a committed look receipt (look-receipts/agx-off.marxml).
 AGXOFF_LEGS = {f"m16-1243-look-scale2-{flavor}-agxoff": f"m16-1243-look-scale2-{flavor}" for flavor in ("cinematic", "film")}
 LOOK_RECEIPT_BASE = "6b6f66f52d5344a97de5068b2e7cae1a61edf295"   # the #328 head whose generator, legs and runner this round extends
+# GPU-DEVICE-LOSS-SELF-HEAL-1 r2: the L1..L4 self-heal proof, ONE cuda speed leg whose job runs three pre-launches and the measured run on one settings store.
+SELF_HEAL_LEG = "legs/m16-1243-gpu-self-heal-l1-l4.json"
+SHIPPED_LEGS = (*SHIPPED_LEGS, SELF_HEAL_LEG)
 SHIPPED_LEGS_PS = ", ".join(f"'{rel}'" for rel in SHIPPED_LEGS)
 OTHER_CLIP = "Z99-9999"
 MLV_EXT = "." + "mlv"  # never spelled as one literal token (the NA-4 gate trips on fixture basenames)
@@ -551,6 +554,97 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         self.assertIn(mapping, runner)
         self.assertLess(runner.index(mapping), runner.index("if (-not $isLook -and $spec.generatorArgs.PSObject.Properties['forceLookAssist']"),
                         "the mapping must sit outside the forceLookAssist branch")
+
+    # GPU-DEVICE-LOSS-SELF-HEAL-1 r2: the self-heal proof's job text (the generator's -GpuFaultInject / -GpuSafeStart / -AutomationSettingsDir / -GpuPreLaunches).
+    SELF_HEAL_PRE_OPEN = "# GPU-DEVICE-LOSS-SELF-HEAL-1 r2: the shared run-scoped settings store and the self-heal pre-launches"
+    SELF_HEAL_OWNER_ANCHOR = "# OWNER-FOOTAGE-NO-HARDLINK-1: the last look before the app can read anything."
+    SELF_HEAL_POST_OPEN = "# GPU-DEVICE-LOSS-SELF-HEAL-1 r2: publish the measured run's GPU field log"
+    SELF_HEAL_LAUNCH_DONE = 'Write-JobTrace "step smoke-launch done rc=$smokeRc"\n'
+
+    def test_the_gpu_fault_inject_and_safe_start_reach_the_apps_env_only_when_asked(self) -> None:
+        """GPU-DEVICE-LOSS-SELF-HEAL-1 r2: -GpuFaultInject <code>@<n> and -GpuSafeStart clear each add exactly one line at the env-list site;
+        absent, the job is the text it was. The runner maps the leg's generatorArgs for any leg."""
+        plain = self.generate(GENERATOR, "sh-plain.job.ps1", []).read_text(encoding="utf-8").replace("\r\n", "\n")
+        for token in ("MLVAPP_GPU_FAULT_INJECT", "MLVAPP_GPU_SAFE_START", "MLVAPP_AUTOMATION_SETTINGS_DIR", "self-heal", "function New-AttrCudaOwnedRoot"):
+            self.assertNotIn(token, plain)
+        for name, extra, line in (("inject", ["-GpuFaultInject", "702@120"], "    'MLVAPP_GPU_FAULT_INJECT=702@120',\n"),
+                                  ("clear", ["-GpuSafeStart", "clear"], "    'MLVAPP_GPU_SAFE_START=clear',\n")):
+            job = self.generate(GENERATOR, f"sh-{name}.job.ps1", extra)
+            self.assertEqual(self.parse_errors(job), 0, name)
+            text = job.read_text(encoding="utf-8").replace("\r\n", "\n")
+            self.assertIn("'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',\n" + line, text, name)
+            self.assertEqual(text.replace(line, ""), plain, f"{name}: the line is the only difference from the plain job")
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        branch = runner.index("if (-not $isLook -and $spec.generatorArgs.PSObject.Properties['forceLookAssist']")
+        for mapping in ("if ($spec.generatorArgs.PSObject.Properties['gpuFaultInject']) { $gen['GpuFaultInject'] = [string]$spec.generatorArgs.gpuFaultInject }",
+                        "if ($spec.generatorArgs.PSObject.Properties['gpuSafeStart']) { $gen['GpuSafeStart'] = [string]$spec.generatorArgs.gpuSafeStart }",
+                        "if ($spec.generatorArgs.PSObject.Properties['automationSettingsDir']) { $gen['AutomationSettingsDir'] = [string]$spec.generatorArgs.automationSettingsDir }",
+                        "if ($spec.generatorArgs.PSObject.Properties['gpuPreLaunches']) { $gen['GpuPreLaunches'] = [string[]]@($spec.generatorArgs.gpuPreLaunches) }"):
+            self.assertIn(mapping, runner)
+            self.assertLess(runner.index(mapping), branch, "the mapping must sit outside the forceLookAssist branch")
+        self.assertIn("Copy-Item -LiteralPath $selfHealShare -Destination (Join-Path $evidenceDir 'self-heal') -Recurse", runner)
+
+    def test_the_gpu_self_heal_pre_launches_share_one_store_and_delete_it_after(self) -> None:
+        """GPU-DEVICE-LOSS-SELF-HEAL-1 r2: -AutomationSettingsDir with -GpuPreLaunches adds the store's env line, the pre-launch block just before the
+        owner-footage check and the publish-and-delete block right after the measured smoke launch -- and nothing else: with those three removed the
+        job is the plain one, byte for byte. The pre-launches are refused without the store, on a contact-sheet leg and with a bad entry."""
+        plain = self.generate(GENERATOR, "shp-plain.job.ps1", ["-TelemetryArm", "HEAVY"]).read_text(encoding="utf-8").replace("\r\n", "\n")
+        job = self.generate(GENERATOR, "shp.job.ps1", ["-TelemetryArm", "HEAVY", "-AutomationSettingsDir", "gpu-self-heal-settings",
+                                                       "-GpuPreLaunches", "702@120,702@120,none", "-GpuSafeStart", "clear"])
+        self.assertEqual(self.parse_errors(job), 0)
+        text = job.read_text(encoding="utf-8").replace("\r\n", "\n")
+        env_lines = "    ('MLVAPP_AUTOMATION_SETTINGS_DIR=' + (Join-Path $Work 'gpu-self-heal-settings')),\n    'MLVAPP_GPU_SAFE_START=clear',\n"
+        self.assertIn("'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',\n" + env_lines, text)
+        self.assertEqual(text.count("function New-AttrCudaOwnedRoot"), 1)
+        self.assertEqual(text.count("$gpuPreLaunches = @('702@120', '702@120', 'none')\n"), 1)
+        self.assertIn("-Path (Join-Path $Work 'gpu-self-heal-settings') -OwnedJournal $OwnerJournal).Path\n", text)
+        self.assertIn("Remove-AttrCudaTree -TrustedRoot ", text[text.index(self.SELF_HEAL_POST_OPEN):])
+        pre = text.index(self.SELF_HEAL_PRE_OPEN)
+        self.assertLess(text.index("$cmd = \"& $(ConvertTo-PsSingleQuoted $smoke)"), pre, "the pre-launches reuse the measured run's $cmd")
+        self.assertLess(pre, text.index(self.SELF_HEAL_OWNER_ANCHOR))
+        self.assertLess(text.index(self.SELF_HEAL_OWNER_ANCHOR), text.index("$presentMonProc = Start-PresentMonCapture"))
+        post = text.index(self.SELF_HEAL_POST_OPEN)
+        self.assertEqual(text.index(self.SELF_HEAL_LAUNCH_DONE) + len(self.SELF_HEAL_LAUNCH_DONE), post)
+        stripped = text.replace(env_lines, "", 1)
+        stripped = stripped[:stripped.index(self.SELF_HEAL_PRE_OPEN)] + stripped[stripped.index(self.SELF_HEAL_OWNER_ANCHOR):]
+        post = stripped.index(self.SELF_HEAL_POST_OPEN)
+        post_end = stripped.index("\n}\n", stripped.index("} catch {", post)) + 3
+        self.assertEqual(stripped[:post] + stripped[post_end:], plain)
+        for extra, token in ((["-GpuPreLaunches", "702@120"], "DUAL_VENUE_GPU_PRE_LAUNCH_NEEDS_SETTINGS_DIR"),
+                             (["-AutomationSettingsDir", "s", "-GpuPreLaunches", "702@120", "-ForceLookAssist", "-ContactSheet"], "DUAL_VENUE_GPU_PRE_LAUNCH_NEEDS_SPEED_LEG"),
+                             (["-AutomationSettingsDir", "s", "-GpuPreLaunches", "701@1"], "DUAL_VENUE_GPU_PRE_LAUNCH_INVALID"),
+                             (["-AutomationSettingsDir", "s", "-GpuPreLaunches", "none,none,none,none,none"], "DUAL_VENUE_GPU_PRE_LAUNCH_INVALID"),
+                             (["-GpuFaultInject", "701@1"], "GpuFaultInject"),
+                             (["-AutomationSettingsDir", "..\\x"], "AutomationSettingsDir")):
+            out = self.tmp / "sh-refused.job.ps1"
+            proc = run_pwsh(["-File", str(GENERATOR), "-SourceCommit", self.head, "-BuildManifestSha256", "ab" * 32,
+                             "-ClipId", FIXTURE_IDS[0], "-FixtureSha256", "cd" * 32, "-RepoRoot", str(self.repo), "-OutFile", str(out), *extra])
+            self.assertNotEqual(proc.returncode, 0, token)
+            self.assertIn(token, proc.stdout + proc.stderr)
+            self.assertFalse(out.exists(), token)
+
+    def test_the_gpu_self_heal_leg_is_the_l1_to_l4_proof(self) -> None:
+        """GPU-DEVICE-LOSS-SELF-HEAL-1 r2: the one tracked self-heal leg is a cuda SPEED leg: L1 and L2 inject 702 (two losses inside the breaker's
+        window set the flag), L3 injects nothing (it must start on the CPU), and the measured run L4 clears the flag (it must render on CUDA again)."""
+        schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
+        args = schema["properties"]["generatorArgs"]["properties"]
+        self.assertEqual(args["gpuFaultInject"]["pattern"], "^(700|702|719|999)@[1-9][0-9]*$")
+        self.assertEqual(args["gpuSafeStart"]["enum"], ["clear"])
+        self.assertEqual((args["gpuPreLaunches"]["maxItems"], args["gpuPreLaunches"]["items"]["pattern"]), (4, "^((700|702|719|999)@[1-9][0-9]*|none)$"))
+        leg = json.loads((DV / SELF_HEAL_LEG).read_text(encoding="utf-8"))
+        import jsonschema
+        jsonschema.validate(leg, schema)
+        self.assertEqual((leg["legId"], leg["card"], leg["legType"], leg["backends"]), (Path(SELF_HEAL_LEG).stem, "GPU-DEVICE-LOSS-SELF-HEAL-1", "speed", ["cuda"]))
+        self.assertEqual(leg["generatorArgs"], {"telemetryArm": "HEAVY", "automationSettingsDir": "gpu-self-heal-settings",
+                                                "gpuPreLaunches": ["702@120", "702@120", "none"], "gpuSafeStart": "clear"})
+        for role in ("acceptance", "supplementary"):
+            self.assertIn({"metric": "gpuFramesTotal", "op": "gt", "value": 0}, leg["criteria"][role]["cuda"], role)
+            self.assertIn({"metric": "cpuFrames", "op": "eq", "value": 0}, leg["criteria"][role]["cuda"], role)
+        for bad in ({"gpuFaultInject": "702@0"}, {"gpuSafeStart": "set"}, {"automationSettingsDir": "a/b"}, {"gpuPreLaunches": []}, {"gpuPreLaunches": ["none"] * 5}):
+            broken = json.loads(json.dumps(leg))
+            broken["generatorArgs"].update(bad)
+            with self.assertRaises(jsonschema.ValidationError, msg=str(bad)):
+                jsonschema.validate(broken, schema)
 
     def test_the_runner_passes_a_legs_swap_interval_to_the_generator(self) -> None:
         runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")

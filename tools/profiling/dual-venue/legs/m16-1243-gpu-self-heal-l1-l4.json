@@ -1,0 +1,28 @@
+{
+  "schema": "mlv-app/dual-venue-leg/v1",
+  "legId": "m16-1243-gpu-self-heal-l1-l4",
+  "card": "GPU-DEVICE-LOSS-SELF-HEAL-1",
+  "legType": "speed",
+  "clipId": "M16-1243",
+  "playSeconds": 25,
+  "backends": ["cuda"],
+  "scaleFactor": 4,
+  "generatorArgs": { "telemetryArm": "HEAVY", "automationSettingsDir": "gpu-self-heal-settings", "gpuPreLaunches": ["702@120", "702@120", "none"], "gpuSafeStart": "clear" },
+  "timeouts": { "queueWaitSec": 900, "extraClaimedWaitSec": 600 },
+  "criteria": {
+    "acceptance": {
+      "cuda": [
+        { "metric": "rows", "op": "gt", "value": 0 },
+        { "metric": "gpuFramesTotal", "op": "gt", "value": 0 },
+        { "metric": "cpuFrames", "op": "eq", "value": 0 }
+      ]
+    },
+    "supplementary": {
+      "cuda": [
+        { "metric": "rows", "op": "gt", "value": 0 },
+        { "metric": "gpuFramesTotal", "op": "gt", "value": 0 },
+        { "metric": "cpuFrames", "op": "eq", "value": 0 }
+      ]
+    }
+  }
+}
