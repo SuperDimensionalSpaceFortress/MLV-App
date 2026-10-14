@@ -1840,6 +1840,26 @@
       ]
     },
     {
+      "path": "platform/qt/GpuDebayer.cpp",
+      "anchor": "const bool locked = live . mutex . tryLock ( waitMs > 0 ? waitMs : 0 ) ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "GPU-FIELD-TELEMETRY-1 r6 session-end terminal drain of the AMaZE DLL: clamps the caller's lock-wait budget (a config value from GpuFieldTelemetryCore kTerminalDrainWaitMs, clipped to the session-end deadline) so a negative budget means no wait. Selects how long to wait for a live run's lock; never proof that any stage ran.",
+      "lines": [
+        1375
+      ]
+    },
+    {
+      "path": "src/mlv/llrawproc/llrawproc.c",
+      "anchor": "const ULONGLONG deadline = GetTickCount64 ( ) + ( ULONGLONG ) ( wait_ms > 0 ? wait_ms : 0 ) ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "GPU-FIELD-TELEMETRY-1 r6 session-end terminal drain of the recon DLL: clamps the caller's lock-wait budget (kTerminalDrainWaitMs, clipped to the session-end deadline) to a non-negative deadline for the bounded backend-mutex trylock loop. Selects how long teardown waits; never proof that any stage ran.",
+      "lines": [
+        2121
+      ]
+    },
+    {
       "path": "tests/console/test_gpu_window_swap_telemetry.cpp",
       "anchor": "ASSERT_NEAR ( 0.0 , summary . newFrameMaxGapMs , 1 e - 9 ) ;",
       "class": "not_run_proof_structural",

@@ -1528,6 +1528,7 @@ static bool lookAssistProcessedFloorLiftedPostInvalidShouldFailClosed(
 #include "GpuDebayer.h"
 #include "GpuDisplayViewport.h"
 #include "GpuDisplayWindow.h"
+#include "GpuFieldTelemetry.h"
 #include "MainWindowGpuPreviewPolicy.h"
 #include "PlaybackQualityPolicy.h"
 #include "PlaybackScaling.h"
@@ -10748,6 +10749,8 @@ int MainWindow::openMlv( QString fileName )
         dualIso = QString( "Dual ISO" );
         dualIsoInfo = QString( "%1, %2" ).arg( isoInfo ).arg( dualIso );
     }
+    // GPU-FIELD-TELEMETRY-1: clip identity for the field log (cold; only the basename's hash is kept).
+    if ( GpuFieldTelemetry::enabled() ) GpuFieldTelemetry::noteClip( (int)getMlvWidth( m_pMlvObject ), (int)getMlvHeight( m_pMlvObject ), (int)getMlvBitdepth( m_pMlvObject ), isMlvCompressed( m_pMlvObject ) != 0, llrpGetDualIsoValidity( m_pMlvObject ) == DISO_VALID && qEnvironmentVariableIntValue( "MLVAPP_GPU_PLAYBACK_RECON" ) != 0, QFileInfo( fileName ).fileName() );
 
     QString audioText;
     if( doesMlvHaveAudio( m_pMlvObject ) )
