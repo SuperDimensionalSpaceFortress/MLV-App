@@ -7,16 +7,88 @@
 
 #include "../../platform/qt/PlaybackScopesDuringPlayback.h"
 
+#include <QDir>
 #include <QFile>
 #include <QSettings>
 #include <QString>
+#include <QStringList>
 #include <QTextStream>
+#include <QUuid>
 #include <QVariant>
 
 #include <memory>
 
 namespace
 {
+
+const char kScopesEnv[] = "MLVAPP_PLAYBACK_SCOPES_DURING_PLAYBACK";
+
+QStringList &capturedLog()
+{
+    static QStringList lines;
+    return lines;
+}
+
+void captureLog(QtMsgType, const QMessageLogContext &, const QString &message)
+{
+    capturedLog() << message;
+}
+
+// PSO-01: one launch's environment, settings store and log, restored however the test ends. Starts as an ordinary
+// launch (native store, no automation run) with the setting absent; enterAutomationRun() is main.cpp's automation
+// path (a fresh run-scoped store, so the setting is absent there too).
+class ScopedScopesLaunch
+{
+public:
+    ScopedScopesLaunch()
+        : m_envWasSet(qEnvironmentVariableIsSet(kScopesEnv))
+        , m_env(qgetenv(kScopesEnv))
+    {
+        automation_settings::releaseForTest();
+        std::unique_ptr<QSettings> store = automation_settings::openAppSettings();
+        m_saved = store->value(PlaybackScopesSettings::kKeyScopesDuringPlayback());
+        store->remove(PlaybackScopesSettings::kKeyScopesDuringPlayback());
+        store->sync();
+        capturedLog().clear();
+        m_previousHandler = qInstallMessageHandler(captureLog);
+    }
+
+    ~ScopedScopesLaunch()
+    {
+        qInstallMessageHandler(m_previousHandler);
+        automation_settings::releaseForTest();
+        if (!m_runDir.isEmpty()) QDir(m_runDir).removeRecursively();
+        std::unique_ptr<QSettings> store = automation_settings::openAppSettings();
+        if (m_saved.isValid()) store->setValue(PlaybackScopesSettings::kKeyScopesDuringPlayback(), m_saved);
+        else store->remove(PlaybackScopesSettings::kKeyScopesDuringPlayback());
+        store->sync();
+        if (m_envWasSet) qputenv(kScopesEnv, m_env);
+        else qunsetenv(kScopesEnv);
+    }
+
+    void enterAutomationRun()
+    {
+        m_runDir = QDir::tempPath() + QStringLiteral("/mlvapp-scopes-pso01-")
+                 + QUuid::createUuid().toString(QUuid::WithoutBraces);
+        ASSERT_FALSE(automation_settings::isolate(m_runDir).isEmpty());
+        ASSERT_TRUE(automation_settings::isolated());
+    }
+
+private:
+    bool m_envWasSet = false;
+    QByteArray m_env;
+    QVariant m_saved;
+    QString m_runDir;
+    QtMessageHandler m_previousHandler = nullptr;
+};
+
+int overrideDisclosures()
+{
+    int count = 0;
+    for (const QString &line : capturedLog())
+        if (line.contains(QLatin1String(kScopesEnv))) ++count;
+    return count;
+}
 
 QString readRepoFile(const QString & relativePath)
 {
@@ -109,6 +181,61 @@ TEST(PlaybackScopesDuringPlayback, TheSettingPersistsAsItsToken)
     if (saved.isValid()) restore->setValue(PlaybackScopesSettings::kKeyScopesDuringPlayback(), saved);
     else restore->remove(PlaybackScopesSettings::kKeyScopesDuringPlayback());
     restore->sync();
+}
+
+// PSO-01 (sol r3): an ordinary launch with the setting absent and an inherited MLVAPP_PLAYBACK_SCOPES_DURING_PLAYBACK=live
+// keeps Hide. The override is a measurement input, honoured only in an automation run, and then disclosed on one line.
+// Drives the real resolution path (playbackScopesMode(), which MainWindow's startup applies).
+TEST(PlaybackScopesDuringPlayback, PSO01_TheMeasurementOverrideIsHonouredOnlyInAnAutomationRun)
+{
+    ScopedScopesLaunch launch;
+    qputenv(kScopesEnv, QByteArrayLiteral("live"));
+
+    ASSERT_FALSE(automation_settings::isolated());
+    ASSERT_EQ(asInt(PlaybackScopesMode::Hide), asInt(playbackScopesMode()));
+    ASSERT_EQ(0, overrideDisclosures());
+    // Gate off, the stored setting still wins over the inherited override.
+    playbackScopesModeWriteToSettings(PlaybackScopesMode::Throttled);
+    ASSERT_EQ(asInt(PlaybackScopesMode::Throttled), asInt(playbackScopesMode()));
+    ASSERT_EQ(0, overrideDisclosures());
+
+    launch.enterAutomationRun();
+    ASSERT_EQ(asInt(PlaybackScopesMode::Live), asInt(playbackScopesMode()));
+    ASSERT_EQ(1, overrideDisclosures());
+    ASSERT_TRUE(capturedLog().last().contains(QStringLiteral("= live")));
+    // Gate on, the override beats a stored setting, and with no override the setting is read (composition pin).
+    playbackScopesModeWriteToSettings(PlaybackScopesMode::Hide);
+    ASSERT_EQ(asInt(PlaybackScopesMode::Live), asInt(playbackScopesMode()));
+    qunsetenv(kScopesEnv);
+    playbackScopesModeWriteToSettings(PlaybackScopesMode::Throttled);
+    ASSERT_EQ(asInt(PlaybackScopesMode::Throttled), asInt(playbackScopesMode()));
+    ASSERT_EQ(2, overrideDisclosures());
+}
+
+// PSO-02 (sol r3): a frame requested under a no-scope policy on a GPU surface (which may have skipped its RGB8 on GPU
+// Tex NR) reaches finishPresentedFrame after Hide -> Live or Throttled: no scope is computed from it. The next frame,
+// requested under the new policy, feeds the scope.
+TEST(PlaybackScopesDuringPlayback, PSO02_AFrameRequestedUnderTheNoScopePolicyNeverFeedsTheScope)
+{
+    for (PlaybackScopesMode mode : { PlaybackScopesMode::Throttled, PlaybackScopesMode::Live })
+    {
+        const bool consumesNow = playbackScopeDisplayConsumesPresentedPixels(true, true, mode);
+        ASSERT_TRUE(consumesNow);
+        // Requested under Hide while playing: no scope consumer, GPU route allowed -> not measured.
+        ASSERT_FALSE(playbackScopeFrameFeedsScope(consumesNow, /*allowedRouteWithoutRgb8*/true));
+        // Requested under the new mode: the scope vetoes the RGB8-less routes -> measured.
+        ASSERT_TRUE(playbackScopeFrameFeedsScope(consumesNow, /*allowedRouteWithoutRgb8*/false));
+    }
+    // Hide while playing still computes nothing, whatever the frame.
+    ASSERT_FALSE(playbackScopeFrameFeedsScope(
+        playbackScopeDisplayConsumesPresentedPixels(true, true, PlaybackScopesMode::Hide), false));
+
+    // MainWindow's scope draw asks with the policy the frame was REQUESTED under, not only the current mode.
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    ASSERT_EQ(1, source.count(QStringLiteral(
+        "if( playbackScopeFrameFeedsScope(\n"
+        "            scopeDisplayConsumesPresentedPixels( ui->actionShowEditArea->isChecked() ),\n"
+        "            mainWindowAllowsGpu16PreviewRender( requestContext.gpuPreviewPolicy ) ) )")));
 }
 
 TEST(PlaybackScopesDuringPlayback, MainWindowRoutesEveryScopeConsumerThroughThePolicyHelper)

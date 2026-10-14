@@ -412,7 +412,13 @@ param(
 
     # PLAYBACK-SCOPES-OPTION-1: the app's playback scope throttle base interval (MLVAPP_PLAYBACK_SCOPE_INTERVAL_MS; 0 = every presented
     # frame when the render is fast). -1 (the default) sets nothing: the emitted job is the text it was before this parameter.
-    [ValidateRange(-1, 1000)][int]$ScopeIntervalMs = -1
+    [ValidateRange(-1, 1000)][int]$ScopeIntervalMs = -1,
+
+    # PLAYBACK-SCOPES-OPTION-1 r4 (PSO-01): the app's "Scopes During Playback" mode for the run (MLVAPP_PLAYBACK_SCOPES_DURING_PLAYBACK,
+    # honoured only in an automation run such as this smoke). A scope leg on a Hide-default build must ask, or it measures Hide.
+    # '' (the default) sets nothing: the emitted job is the text it was before this parameter.
+    [ValidateSet('', 'hide', 'throttled', 'live')]
+    [string]$ScopesDuringPlayback = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -4474,6 +4480,16 @@ if ($ScopeIntervalMs -ge 0) {
     })
 }
 
+# PLAYBACK-SCOPES-OPTION-1 r4: the same env-list site gains the playback scopes mode, only when asked.
+if (-not [string]::IsNullOrEmpty($ScopesDuringPlayback)) {
+    $scopesModeAnchor = [regex]"(?<ind>[ \t]*)'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',(?<nl>\r?\n)"
+    if ($scopesModeAnchor.Matches($text).Count -ne 1) { throw 'DUAL_VENUE_SCOPES_MODE_ANCHOR_MISSING the job template has no single env-list site to add MLVAPP_PLAYBACK_SCOPES_DURING_PLAYBACK to' }
+    $text = $scopesModeAnchor.Replace($text, [System.Text.RegularExpressions.MatchEvaluator]{
+        param($m)
+        $m.Value + $m.Groups['ind'].Value + "'MLVAPP_PLAYBACK_SCOPES_DURING_PLAYBACK=$ScopesDuringPlayback'," + $m.Groups['nl'].Value
+    })
+}
+
 $outDir = Split-Path -Parent $OutFile
 if ($outDir -and -not (Test-Path -LiteralPath $outDir)) { New-Item -ItemType Directory -Path $outDir -Force | Out-Null }
 [IO.File]::WriteAllText($OutFile, $text, [Text.UTF8Encoding]::new($false))
@@ -4506,6 +4522,7 @@ $clipContentSha256 = if ($isFixtureRehearsal) {
     presentTrace = [bool]$PresentTrace
     scope = $(if ([string]::IsNullOrEmpty($Scope)) { 'none' } else { $Scope })
     scopeIntervalMs = $(if ($ScopeIntervalMs -ge 0) { $ScopeIntervalMs } else { $null })
+    scopesDuringPlayback = $(if ([string]::IsNullOrEmpty($ScopesDuringPlayback)) { $null } else { $ScopesDuringPlayback })
     # DUAL-VENUE-EVIDENCE-1: what this generation was authored for (not part of the emitted job's bytes).
     venue = $Venue
     backend = $Backend

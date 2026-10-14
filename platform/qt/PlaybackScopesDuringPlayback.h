@@ -12,6 +12,7 @@
 #include "AutomationSettings.h"
 
 #include <QByteArray>
+#include <QDebug>
 #include <QString>
 #include <QtGlobal>
 
@@ -55,9 +56,9 @@ inline int playbackScopesModeFromToken(const QByteArray &value)
     return -1;
 }
 
-/*! \brief MLVAPP_PLAYBACK_SCOPES_DURING_PLAYBACK, the measurement override: a valid token wins
- *  over the setting; unset or anything else is no override. Then the setting; an unreadable
- *  setting is the default. */
+/*! \brief MLVAPP_PLAYBACK_SCOPES_DURING_PLAYBACK, the measurement override (automation runs only,
+ *  see playbackScopesModeEnvOverride): a valid token wins over the setting; unset or anything else
+ *  is no override. Then the setting; an unreadable setting is the default. */
 inline PlaybackScopesMode playbackScopesModeResolve(int envOverride, int setting)
 {
     if ( envOverride >= 0 ) return static_cast<PlaybackScopesMode>( envOverride );
@@ -79,12 +80,28 @@ inline void playbackScopesModeWriteToSettings( PlaybackScopesMode mode )
                   QString::fromLatin1( playbackScopesModeToken( mode ) ) );
 }
 
-/*! \brief The mode in effect: the env override (read once per process) or the setting (read
- *  on every call, so a menu change applies at once). */
+/*! \brief PSO-01 (sol r3): the measurement override is honoured only in an automation run (main.cpp's
+ *  automationRun: --profile-playback, --gui-smoke-playback or MLVAPP_AUTOPLAY_SECONDS, which is what puts
+ *  the app on its run-scoped settings store, automation_settings::isolated()). An ordinary launch that
+ *  inherited the variable ignores it, so the stored setting (or the Hide default) wins. -1 = no override. */
+inline int playbackScopesModeEnvOverride( const QByteArray &envValue, bool automationRun )
+{
+    return automationRun ? playbackScopesModeFromToken( envValue ) : -1;
+}
+
+/*! \brief The mode in effect at startup: the measurement override in an automation run, else the setting,
+ *  else Hide. An honoured override is disclosed on one log line. */
 inline PlaybackScopesMode playbackScopesMode()
 {
-    static const int envOverride =
-        playbackScopesModeFromToken( qgetenv( "MLVAPP_PLAYBACK_SCOPES_DURING_PLAYBACK" ) );
+    const int envOverride = playbackScopesModeEnvOverride(
+        qgetenv( "MLVAPP_PLAYBACK_SCOPES_DURING_PLAYBACK" ), automation_settings::isolated() );
+    if ( envOverride >= 0 )
+    {
+        qInfo().noquote()
+            << "MLVAPP_PLAYBACK_SCOPES_DURING_PLAYBACK ="
+            << playbackScopesModeToken( static_cast<PlaybackScopesMode>( envOverride ) )
+            << "(measurement override, automation run; Playback/ScopesDuringPlayback setting is bypassed).";
+    }
     return playbackScopesModeResolve( envOverride, playbackScopesModeSettingValue() );
 }
 
@@ -98,6 +115,17 @@ inline bool playbackScopeDisplayConsumesPresentedPixels(
 {
     return editAreaVisible
         && !( playbackActive && mode == PlaybackScopesMode::Hide );
+}
+
+/*! \brief PSO-02 (sol r3): may a presented frame feed the scope? Not when the request that rendered it was built
+ *  with no scope consumer on a GPU surface (mainWindowAllowsGpu16PreviewRender of its policy): such a frame may have
+ *  taken a route that never developed its RGB8 (GPU Tex NR), so after a switch from Hide to Throttled or Live (or a
+ *  scope turned on) it is presented but not measured. The next frame, requested under the new policy, supplies it. */
+inline bool playbackScopeFrameFeedsScope(
+    bool scopeDisplayConsumesNow,
+    bool frameRequestAllowedRouteWithoutRgb8)
+{
+    return scopeDisplayConsumesNow && !frameRequestAllowedRouteWithoutRgb8;
 }
 
 /*! \brief The minimum ms between two scope updates while playing. Live: 0, every presented

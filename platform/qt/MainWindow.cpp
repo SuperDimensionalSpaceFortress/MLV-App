@@ -22117,7 +22117,8 @@ void MainWindow::on_actionPlaybackVSync_triggered()
 }
 
 // PLAYBACK-SCOPES-OPTION-1: "Scopes During Playback". Applies at once (the next presented frame and
-// the next policy read) and persists; MLVAPP_PLAYBACK_SCOPES_DURING_PLAYBACK still wins at the next start.
+// the next policy read) and persists; in an automation run MLVAPP_PLAYBACK_SCOPES_DURING_PLAYBACK still wins
+// at the next start (PSO-01: an ordinary launch ignores it).
 void MainWindow::on_actionPlaybackScopesHide_triggered()
 {
     applyPlaybackScopesMode( PlaybackScopesMode::Hide, /*persist*/true );
@@ -30407,8 +30408,12 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
     const double scopeDispatchStart = mlv_stage_timing_now();
     m_lastDrawFrameReadyScopesMs = 0.0;
     // PLAYBACK-SCOPES-OPTION-1: in Hide mode no scope work runs while playing; the label keeps the
-    // last paused frame's scope until playback stops.
-    if( scopeDisplayConsumesPresentedPixels( ui->actionShowEditArea->isChecked() ) )
+    // last paused frame's scope until playback stops. PSO-02: a frame requested under a policy that
+    // admitted an RGB8-less route (no scope consumer then, e.g. Hide before a switch to Live) is not
+    // measured; the next frame, requested under the new policy, supplies the scope.
+    if( playbackScopeFrameFeedsScope(
+            scopeDisplayConsumesPresentedPixels( ui->actionShowEditArea->isChecked() ),
+            mainWindowAllowsGpu16PreviewRender( requestContext.gpuPreviewPolicy ) ) )
     {
         const double scopes_start = mlv_stage_timing_now();
         bool updateScopesNow = true;
