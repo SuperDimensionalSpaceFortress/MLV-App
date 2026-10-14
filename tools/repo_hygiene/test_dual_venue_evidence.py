@@ -116,12 +116,15 @@ SCOPE_ARMS = {"histogram": {"scope": "histogram"}, "histogram-i0": {"scope": "hi
 SCOPE_LEGS = {f"legs/m16-1243-scopes-{backend}-windowed-s1-{arm}.json": (backend, extra)
               for backend in ("cpu", "cuda") for arm, extra in (("none", {}), *SCOPE_ARMS.items())}
 SCOPE_LEGS["legs/m16-1243-scopes-cuda-windowed-s1-waveform-i0.json"] = ("cuda", {"scope": "waveform", "scopeIntervalMs": 0})
+# PLAYBACK-SCOPES-OPTION-1 r3: the Look-Assist-ON twins of the N and T arms (the shipping default is Look Assist on): the no-look twin with
+# generatorArgs.forceLookAssist true (a capture-free pace leg at the default Classic flavor) in place of disableLookAssist true.
+SCOPE_LA_LEGS = tuple(f"legs/m16-1243-scopes-{backend}-windowed-s1-{arm}-la.json" for backend in ("cpu", "cuda") for arm in ("none", "histogram"))
 # LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1 added the scale-2 Cinematic twin of the scale-2 look leg (the Bachelor CPU Classic | Cinematic look pair).
 SHIPPED_LEGS = ("legs/m16-1243-speed.json", "legs/m16-1243-look.json", "legs/m16-1243-look-scale2.json", "legs/m16-1243-look-cinematic.json", *DISPLAY_MATRIX_LEGS, *PACE_LEGS,
                 *LOOKAHEAD_LEGS, *HEAVY_LEGS, *DECODER_LEGS, "legs/m16-1243-look-scale2-cinematic.json", "legs/m16-1243-look-film.json",
                 "legs/m16-1243-look-scale2-film.json", *(f"legs/m16-1243-look-scale2-{flavor}-agxoff.json" for flavor in ("cinematic", "film")),
                 *(f"legs/m16-1243-display-{mode}-s{scale}-vsync1.json" for scale in (1, 2, 4) for mode in ("fullscreen", "windowed")),
-                *CPU_REDUCED_LEGS, *UPSTREAM_BASELINE_LEGS, *PTRACE_LEGS, *SCOPE_LEGS)
+                *CPU_REDUCED_LEGS, *UPSTREAM_BASELINE_LEGS, *PTRACE_LEGS, *SCOPE_LEGS, *SCOPE_LA_LEGS)
 # PLAYBACK-VSYNC-DEFAULT-1: the swap-interval-1 twins of the six display-matrix legs (the vsync A/B; the originals stay at the app's default 0).
 VSYNC1_LEGS = tuple(rel.replace(".json", "-vsync1.json") for rel in DISPLAY_MATRIX_LEGS)
 # LOOK-ASSIST-FILM-FLAVOR-2 r2: the AgX-off twins of the scale-2 Cinematic and Film legs carry a committed look receipt (look-receipts/agx-off.marxml).
@@ -5622,6 +5625,22 @@ class LegSpecSchemaTests(unittest.TestCase):
             bad["generatorArgs"].update(bad_value)
             with self.assertRaises(self.jsonschema.ValidationError, msg=repr(bad_value)):
                 self.jsonschema.validate(bad, self.schema)
+
+    def test_the_scope_la_legs_are_the_no_look_twins_with_look_assist_forced_on(self) -> None:
+        """PLAYBACK-SCOPES-OPTION-1 r3: each -la leg is its no-look twin with only legId, forceLookAssist (not disableLookAssist) and the
+        lookAssistForced criterion changed, so the LA-on and LA-off arms measure the same thing but for Look Assist."""
+        for rel in SCOPE_LA_LEGS:
+            spec = json.loads((DV / rel).read_text(encoding="utf-8"))
+            self.jsonschema.validate(spec, self.schema)
+            self.assertEqual(spec["legId"], Path(rel).stem, rel)
+            backend = spec["backends"][0]
+            twin = json.loads((DV / rel.replace("-la.json", ".json")).read_text(encoding="utf-8"))
+            self.assertIs(spec["generatorArgs"].pop("forceLookAssist"), True, rel)
+            self.assertIs(twin["generatorArgs"].pop("disableLookAssist"), True, rel)
+            self.assertEqual(spec["generatorArgs"], twin["generatorArgs"], rel)
+            gate = {"metric": "lookAssistForced", "op": "eq", "value": True}
+            self.assertEqual(spec["criteria"], {"acceptance": {backend: [gate]}, "supplementary": {backend: [gate]}}, rel)
+            self.assertEqual(dict(spec, legId=twin["legId"], generatorArgs=twin["generatorArgs"], criteria=twin["criteria"]), twin, rel)
 
     def test_the_hand_listed_shipped_legs_are_exactly_the_legs_directory(self) -> None:
         self.assertEqual(sorted(SHIPPED_LEGS), sorted("legs/" + p.name for p in (DV / "legs").glob("*.json")), "SHIPPED_LEGS drifted from the legs/ directory")
