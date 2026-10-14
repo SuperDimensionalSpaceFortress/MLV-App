@@ -3724,6 +3724,8 @@ void MainWindow::invalidatePlaybackPrepForDisplayChange( const char *reason )
 // CPU-SCOPE-LIVE-HEAP-CORRUPTION-1 F2: wait for the prep worker to leave the task it
 // is computing (invalidate cannot see it). Never call this while holding the render
 // mutex: the worker's drop path takes it. On timeout it logs and returns, never hangs.
+// It logs (always, not trace-only) only when a task was in flight: at most once per
+// stop or core mutation.
 void MainWindow::drainPlaybackPrepInFlight( const char *reason, int timeoutMs )
 {
     bool waited = false;
@@ -3744,8 +3746,7 @@ void MainWindow::drainPlaybackPrepInFlight( const char *reason, int timeoutMs )
             .arg( reason && *reason ? QString::fromLatin1( reason ) : QStringLiteral("unspecified") )
             .arg( static_cast<qulonglong>( serial ) )
             .arg( ( mlv_stage_timing_now() - drainStart ) * 1000.0, 0, 'f', 2 )
-            .arg( timeoutMs ),
-        true );
+            .arg( timeoutMs ) );
 }
 
 void MainWindow::waitForRenderThreadIdleBeforeCoreMutation( const char *reason )
