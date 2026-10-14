@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 
 from tools.repo_hygiene import pipeline_golden_provenance as provenance_module
+from tools.repo_hygiene.repository_identity import REPOSITORY_SLUG_ALIASES
 from tools.repo_hygiene.pipeline_golden_provenance import (
     DEFAULT_MANIFEST,
     ProvenanceValidationError,
@@ -461,6 +462,23 @@ class PipelineGoldenProvenanceTests(unittest.TestCase):
         observation["url"] = "https://github.com/layibabalola/MLV-App/actions/runs/1"
         self._write_manifest(manifest)
         self._validate()
+
+    def test_hosted_run_url_may_use_either_name_of_the_repository_but_no_other(self) -> None:
+        for name in sorted(REPOSITORY_SLUG_ALIASES):
+            with self.subTest(name=name):
+                manifest = self._manifest()
+                observation = manifest["artifact"]["external_observations"][0]
+                observation["run_id"] = 1
+                observation["url"] = f"https://github.com/{name}/actions/runs/1"
+                self._write_manifest(manifest)
+                self._validate()
+        manifest = self._manifest()
+        observation = manifest["artifact"]["external_observations"][0]
+        observation["run_id"] = 1
+        observation["url"] = "https://github.com/someone-else/MLV-App/actions/runs/1"
+        self._write_manifest(manifest)
+        with self.assertRaisesRegex(ProvenanceValidationError, "URL must exactly match its hosted run_id"):
+            self._validate()
 
     def test_phase3_external_review_cannot_claim_verified_without_tracked_witness(self) -> None:
         manifest = self._manifest()
