@@ -3895,8 +3895,38 @@ void MainWindow::invalidatePlaybackPrepForDisplayChange( const char *reason )
     m_playbackPrepCv.notify_all();
 }
 
+// CPU-SCOPE-LIVE-HEAP-CORRUPTION-1 F2: wait for the prep worker to leave the task it
+// is computing (invalidate cannot see it). Never call this while holding the render
+// mutex: the worker's drop path takes it. On timeout it logs and returns, never hangs.
+void MainWindow::drainPlaybackPrepInFlight( const char *reason, int timeoutMs )
+{
+    bool waited = false;
+    bool drained = true;
+    uint64_t serial = 0;
+    const double drainStart = mlv_stage_timing_now();
+    {
+        std::unique_lock<std::mutex> lk( m_playbackPrepMutex );
+        waited = m_playbackPrepInFlight.inFlightLocked();
+        serial = m_playbackPrepInFlight.serialLocked();
+        if( waited ) drained = m_playbackPrepInFlight.drainLocked( lk, timeoutMs );
+    }
+    if( !waited ) return;
+    logInteractionEvent(
+        drained ? QStringLiteral("playback_prep.drain")
+                : QStringLiteral("playback_prep.drain_timeout"),
+        QStringLiteral("reason=%1 serial=%2 waited_ms=%3 timeout_ms=%4")
+            .arg( reason && *reason ? QString::fromLatin1( reason ) : QStringLiteral("unspecified") )
+            .arg( static_cast<qulonglong>( serial ) )
+            .arg( ( mlv_stage_timing_now() - drainStart ) * 1000.0, 0, 'f', 2 )
+            .arg( timeoutMs ),
+        true );
+}
+
 void MainWindow::waitForRenderThreadIdleBeforeCoreMutation( const char *reason )
 {
+    // F2: the prep worker reads core processing state too; drain it BEFORE taking
+    // the render mutex below.
+    drainPlaybackPrepInFlight( reason, 2000 );
     const QString reasonText =
         reason && *reason ? QString::fromLatin1( reason ) : QStringLiteral("unspecified");
     const bool renderBusy = m_pRenderThread && !m_pRenderThread->isIdle();
@@ -4579,6 +4609,7 @@ void MainWindow::playbackPrepThreadLoop( void )
             task = m_playbackPrepPending;
             task.rebindOwnedImagePointers();
             m_playbackPrepPendingValid = false;
+            m_playbackPrepInFlight.beginLocked( task.requestSerial );
         }
 
         const double workerStart = mlv_stage_timing_now();
@@ -4602,6 +4633,7 @@ void MainWindow::playbackPrepThreadLoop( void )
                 ++m_playbackPrepGenerationDropCount;
             if( m_pRenderThread )
                 m_pRenderThread->releasePresentedFrameForRequestSerial( task.requestSerial );
+            m_playbackPrepInFlight.endLocked();
             continue;
         }
 
@@ -4622,12 +4654,15 @@ void MainWindow::playbackPrepThreadLoop( void )
             ++m_playbackPrepGenerationDropCount;
             if( m_pRenderThread )
                 m_pRenderThread->releasePresentedFrameForRequestSerial( result.task.requestSerial );
+            m_playbackPrepInFlight.endLocked();
             continue;
         }
         if( m_playbackPrepStop.load( std::memory_order_acquire ) )
         {
+            std::lock_guard<std::mutex> lk( m_playbackPrepMutex );
             if( m_pRenderThread )
                 m_pRenderThread->releasePresentedFrameForRequestSerial( result.task.requestSerial );
+            m_playbackPrepInFlight.endLocked();
             continue;
         }
 
@@ -4648,6 +4683,7 @@ void MainWindow::playbackPrepThreadLoop( void )
             }
             m_playbackPrepResults.push_back( std::move( result ) );
             m_playbackPrepResults.back().task.rebindOwnedImagePointers();
+            m_playbackPrepInFlight.endLocked();
         }
         emit playbackPrepResultReady();
     }
@@ -29434,6 +29470,8 @@ void MainWindow::on_actionPlay_toggled(bool checked)
 {
     invalidatePlaybackPrepForDisplayChange(
         checked ? "play-start" : "play-stop" );
+    // CPU-SCOPE-LIVE-HEAP-CORRUPTION-1 F2: the stop path mutates core state below.
+    if( !checked ) drainPlaybackPrepInFlight( "play-stop", 2000 );
     // PLAYBACK-CUDA-NATIVE-PACE-1: the pace clock re-arms at this Play's first engine tick.
     m_playbackPaceGuard.reset();
     logInteractionEvent(

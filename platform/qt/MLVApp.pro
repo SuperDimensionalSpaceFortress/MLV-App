@@ -389,6 +389,7 @@ HEADERS += MainWindow.h \
            PlaybackAudioGate.h \
            PlaybackEnvFlags.h \
            PlaybackWorkerJoin.h \
+           PlaybackPrepInFlightGate.h \
            PlaybackPresentTrace.h \
            PlaybackSlotRelease.h \
            PlaybackSwapInterval.h \
