@@ -77,7 +77,8 @@ SOURCES += \
     $$REPO_ROOT/tests/console/test_cuda_launch_timing.cpp \
     $$REPO_ROOT/tests/console/test_gpu_field_telemetry.cpp \
     $$REPO_ROOT/tests/console/test_gpu_launch_budget.cpp \
-    $$REPO_ROOT/tests/console/test_playback_present_trace.cpp
+    $$REPO_ROOT/tests/console/test_playback_present_trace.cpp \
+    $$REPO_ROOT/tests/console/test_playback_scopes_during_playback.cpp
 
 HEADERS += \
     $$REPO_ROOT/platform/qt/FpmNameValidator.h \
@@ -116,6 +117,7 @@ HEADERS += \
     $$REPO_ROOT/platform/qt/PlaybackNativePaceGuard.h \
     $$REPO_ROOT/platform/qt/PlaybackPresentTrace.h \
     $$REPO_ROOT/platform/qt/PlaybackSwapInterval.h \
+    $$REPO_ROOT/platform/qt/PlaybackScopesDuringPlayback.h \
     $$REPO_ROOT/platform/qt/PlaybackSlipHistogram.h \
     $$REPO_ROOT/platform/qt/GpuTexturePresentAvailabilityPolicy.h \
     $$REPO_ROOT/platform/qt/DisplayDeviceMapping.h \
