@@ -29,6 +29,7 @@ from .core import (
     utc_now,
     write_json,
 )
+from .repository_identity import REPOSITORY_SLUG_ALIASES
 
 
 BROKER_SCHEMA_VERSION = "1.0"
@@ -1415,7 +1416,7 @@ DEFAULT_CLOSEOUT_CONFIG: Dict[str, Any] = {
         "enabled": True,
         "schema": "candidate-acceptance.v1",
         "stateRoot": ".claude-state/closeout/acceptance",
-        "providerRepository": "layibabalola/MLV-App",
+        "providerRepository": "SuperDimensionalSpaceFortress/MLV-App",
         "requiredSurfaces": [
             "content-self",
             "content-stranger-1",
@@ -3672,10 +3673,12 @@ def repository_has_canonical_acceptance_remote(repo_root: Path) -> bool:
     result = run_git(repo_root, ["config", "--get-regexp", r"^remote\..*\.url$"])
     if result.returncode != 0:
         return False
+    # Either name of the repository (2026-10 transfer): a board whose remote was repointed to the
+    # new name must stay acceptance-bearing, or the tooling baseline could be weakened there.
     canonical_urls = {
-        "https://github.com/layibabalola/mlv-app",
-        "git@github.com:layibabalola/mlv-app",
-        "ssh://git@github.com/layibabalola/mlv-app",
+        template.format(slug.lower())
+        for slug in REPOSITORY_SLUG_ALIASES
+        for template in ("https://github.com/{}", "git@github.com:{}", "ssh://git@github.com/{}")
     }
     for line in result.stdout.splitlines():
         _, _, raw_url = line.partition(" ")

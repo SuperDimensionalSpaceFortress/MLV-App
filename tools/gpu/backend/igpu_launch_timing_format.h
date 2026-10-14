@@ -131,6 +131,69 @@ static inline void igpu_lt_stats_add(IgpuLtStats * s, const IgpuLtRecord & r, do
     }
 }
 
+/* GPU-FIELD-TELEMETRY-1: a fixed log-bucket histogram for p95, host-only.
+ * Bucket 0 holds ms < 0.01; bucket k (1..IGPU_LT_HIST_BUCKETS-2) holds
+ * [edge(k-1), edge(k)) with edge(k) = 0.01 * 2^(k/4) ms; the last bucket holds
+ * everything from edge(IGPU_LT_HIST_BUCKETS-2) (~119 s) up. Each bucket spans a
+ * factor of 2^(1/4) (~1.19), so a quantile read as its bucket's upper edge is
+ * never below the true nearest-rank value and less than 1.19x above it. */
+#define IGPU_LT_HIST_BUCKETS 96
+#define IGPU_LT_HIST_FIRST_EDGE_MS 0.01
+
+struct IgpuLtHistogram
+{
+    unsigned long long counts[IGPU_LT_HIST_BUCKETS];
+    unsigned long long total;
+};
+
+/* Upper edge of bucket k in ms; the overflow bucket has none (returns +inf). */
+static inline double igpu_lt_hist_upper_ms(int k)
+{
+    if (k >= IGPU_LT_HIST_BUCKETS - 1) return HUGE_VAL;
+    return IGPU_LT_HIST_FIRST_EDGE_MS * std::pow(2.0, (double)k / 4.0);
+}
+
+static inline int igpu_lt_hist_bucket(double ms)
+{
+    if (!(ms >= IGPU_LT_HIST_FIRST_EDGE_MS)) return 0;
+    int k = (int)std::floor(4.0 * std::log2(ms / IGPU_LT_HIST_FIRST_EDGE_MS)) + 1;
+    if (k < 1) k = 1;
+    /* log2 rounding: keep the bucket's half-open range exact at its edges. */
+    while (k > 1 && ms < igpu_lt_hist_upper_ms(k - 1)) --k;
+    while (k < IGPU_LT_HIST_BUCKETS - 1 && ms >= igpu_lt_hist_upper_ms(k)) ++k;
+    return k;
+}
+
+/* Negative ms (an error with no duration) is not a sample. */
+static inline void igpu_lt_hist_add(IgpuLtHistogram * h, double ms)
+{
+    if (!h || ms < 0.0) return;
+    h->counts[igpu_lt_hist_bucket(ms)] += 1;
+    h->total += 1;
+}
+
+/* Nearest-rank quantile q in (0, 1]: the upper edge of the bucket holding the
+ * ceil(q * total)-th sample, capped at max_ms (the exact maximum the caller
+ * tracked, so the top bucket reads exactly). 0 with no samples. */
+static inline double igpu_lt_hist_quantile(const IgpuLtHistogram & h, double q, double max_ms)
+{
+    if (h.total == 0) return 0.0;
+    if (q > 1.0) q = 1.0;
+    unsigned long long rank = (unsigned long long)std::ceil(q * (double)h.total);
+    if (rank < 1) rank = 1;
+    unsigned long long seen = 0;
+    for (int k = 0; k < IGPU_LT_HIST_BUCKETS; ++k)
+    {
+        seen += h.counts[k];
+        if (seen >= rank)
+        {
+            const double upper = igpu_lt_hist_upper_ms(k);
+            return upper < max_ms ? upper : max_ms;
+        }
+    }
+    return max_ms;
+}
+
 /* snprintf-style: returns the length the full line needs (excluding the NUL);
  * a return >= cap means the line was truncated. No trailing newline. */
 static inline int igpu_lt_format_record(char * out, std::size_t cap, const IgpuLtRecord & r)

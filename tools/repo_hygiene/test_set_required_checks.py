@@ -58,7 +58,7 @@ param([Parameter(Position=0, ValueFromRemainingArguments=$true)][string[]]$Argv,
       [Parameter(ValueFromPipeline=$true)][string]$InputJson)
 $ErrorActionPreference = 'Stop'
 $dir = $env:MLV_REQUIRED_CHECKS_TEST_DIR
-if ($Argv[0] -cne 'api' -or $Argv[1] -cne 'repos/layibabalola/MLV-App/branches/master/protection/required_status_checks') { exit 77 }
+if ($Argv[0] -cne 'api' -or $Argv[1] -cne 'repos/SuperDimensionalSpaceFortress/MLV-App/branches/master/protection/required_status_checks') { exit 77 }
 $method = $Argv[[array]::IndexOf($Argv, '--method') + 1]
 Add-Content -LiteralPath (Join-Path $dir 'calls.txt') -Value $method
 if (Test-Path (Join-Path $dir 'fail-api')) { exit 42 }

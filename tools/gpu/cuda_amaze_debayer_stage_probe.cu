@@ -35,6 +35,12 @@
  * AMaZE backend DLL, which times every launch (env-gated, default OFF). */
 #include "backend/igpu_launch_timing.cuh"
 
+#ifdef CUDA_AMAZE_DEBAYER_STAGE_PROBE_LIBRARY
+/* GPU-FIELD-TELEMETRY-1: check_cuda notes the failing code into the DLL's
+ * last-CUDA-error slot (igpu_amaze_debayer_last_cuda_error) before it throws. */
+#include "backend/igpu_cuda_error_slot.h"
+#endif
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -2931,6 +2937,7 @@ void check_cuda(cudaError_t rc, const char * call, const char * file, int line)
 {
     if (rc == cudaSuccess) return;
 #ifdef CUDA_AMAZE_DEBAYER_STAGE_PROBE_LIBRARY
+    IGPU_CUDA_ERROR_NOTE(rc, call);
     throw CudaStageProbeError(
         std::string("CUDA error ") + call + " @ " + file + ":" +
         std::to_string(line) + ": " + cudaGetErrorString(rc));

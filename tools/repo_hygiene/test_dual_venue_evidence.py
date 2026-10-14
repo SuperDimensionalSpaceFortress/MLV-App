@@ -104,6 +104,9 @@ CPU_REDUCED_LEGS = tuple(f"legs/m16-1243-cpu-reduced-{mode}-s{scale}.json" for s
 # itself at the app's default K=2). Each differs from its twin only in its legId and generatorArgs.rawPrefetchDecoders 1.
 DECODER_LEGS = {"legs/m16-1243-pace-cinematic-fullscreen-s4-dec1.json": "legs/m16-1243-pace-cinematic-fullscreen-s4.json",
                 "legs/m16-1243-pace-cinematic-fullscreen-s4-heavy-dec1.json": "legs/m16-1243-pace-cinematic-fullscreen-s4-heavy.json"}
+# UPSTREAM-CPU-BASELINE-1: the fork arm of the upstream 877dea2c CPU A/B -- cpu-only SPEED legs at scale 1 with Look Assist OFF (generatorArgs.disableLookAssist),
+# one per display mode upstream shares (it has no preview-scale equivalent, so no s2/s4 twin).
+UPSTREAM_BASELINE_LEGS = tuple(f"legs/m16-1243-upstream-baseline-cpu-{mode}-s1.json" for mode in ("fullscreen", "windowed"))
 # PLAYBACK-STARTUP-CATCHUP-BURST-1 r7: the present-trace twin of a display-matrix cell, differing only in its legId and generatorArgs.presentTrace true.
 PTRACE_LEGS = {"legs/m16-1243-display-fullscreen-s4-ptrace.json": "legs/m16-1243-display-fullscreen-s4.json"}
 # LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1 added the scale-2 Cinematic twin of the scale-2 look leg (the Bachelor CPU Classic | Cinematic look pair).
@@ -111,7 +114,7 @@ SHIPPED_LEGS = ("legs/m16-1243-speed.json", "legs/m16-1243-look.json", "legs/m16
                 *LOOKAHEAD_LEGS, *HEAVY_LEGS, *DECODER_LEGS, "legs/m16-1243-look-scale2-cinematic.json", "legs/m16-1243-look-film.json",
                 "legs/m16-1243-look-scale2-film.json", *(f"legs/m16-1243-look-scale2-{flavor}-agxoff.json" for flavor in ("cinematic", "film")),
                 *(f"legs/m16-1243-display-{mode}-s{scale}-vsync1.json" for scale in (1, 2, 4) for mode in ("fullscreen", "windowed")),
-                *CPU_REDUCED_LEGS, *PTRACE_LEGS, *(f"legs/m16-1243-exact-fullscreen-s{scale}-{arm}.json" for scale in (1, 2, 4) for arm in ("la", "ctl")))
+                *CPU_REDUCED_LEGS, *UPSTREAM_BASELINE_LEGS, *PTRACE_LEGS, *(f"legs/m16-1243-exact-fullscreen-s{scale}-{arm}.json" for scale in (1, 2, 4) for arm in ("la", "ctl")))
 # PLAYBACK-CPU-PACE-GAP-1: the D1 exactness pairs, one per scale: arm A (la) runs the CPU-route lookahead (s1 by explicit depth 1), arm B (ctl) the
 # kill switch; both cpu-only at --drop-frame-mode off with the presented-frame dump on.
 EXACT_LEGS = {scale: (f"legs/m16-1243-exact-fullscreen-s{scale}-la.json", f"legs/m16-1243-exact-fullscreen-s{scale}-ctl.json") for scale in (1, 2, 4)}
@@ -582,6 +585,28 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
         self.assertEqual(schema["properties"]["generatorArgs"]["properties"]["playbackProcessing"]["enum"], ["receipt", "subset"])
 
+    def test_disable_look_assist_reaches_the_smoke_command_and_absent_changes_nothing(self) -> None:
+        """UPSTREAM-CPU-BASELINE-1: -DisableLookAssist adds exactly '-DisableLookAssist' to the smoke runner's command (it passes --no-look-assist and fails
+        the run closed if the app still reports Look Assist enabled); absent, the job is the default byte for byte. The runner maps the leg's
+        generatorArgs.disableLookAssist for any leg (outside the forced-look branch), and the schema types it boolean."""
+        default = self.generate(GENERATOR, "nola-default.job.ps1", ["-Backend", "cpu", "-ScaleFactor", "1"])
+        nola = self.generate(GENERATOR, "nola.job.ps1", ["-Backend", "cpu", "-ScaleFactor", "1", "-DisableLookAssist"])
+        self.assertEqual(self.parse_errors(nola), 0)
+        self.assertNotIn("-DisableLookAssist", default.read_text(encoding="utf-8"))
+        text = nola.read_text(encoding="utf-8")
+        self.assertEqual(text.count("-RequireLookAssist:`$false -DisableLookAssist -Scope none"), 1)
+        self.assertEqual(text.replace("-DisableLookAssist ", ""), default.read_text(encoding="utf-8"))
+        windowed = self.generate(GENERATOR, "nola-windowed.job.ps1", ["-Backend", "cpu", "-ScaleFactor", "1", "-DisplayMode", "windowed", "-DisableLookAssist"])
+        self.assertEqual(self.parse_errors(windowed), 0)
+        self.assertEqual(windowed.read_text(encoding="utf-8").count("-DisableLookAssist -Scope none"), 1)
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        mapping = "if ($spec.generatorArgs.PSObject.Properties['disableLookAssist'] -and [bool]$spec.generatorArgs.disableLookAssist) { $gen['DisableLookAssist'] = $true }"
+        self.assertIn(mapping, runner)
+        self.assertLess(runner.index(mapping), runner.index("if (-not $isLook -and $spec.generatorArgs.PSObject.Properties['forceLookAssist']"),
+                        "the mapping must sit outside the forceLookAssist branch")
+        schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
+        self.assertEqual(schema["properties"]["generatorArgs"]["properties"]["disableLookAssist"]["type"], "boolean")
+
     def test_the_raw_prefetch_decoder_count_reaches_the_job_only_when_asked(self) -> None:
         """PLAYBACK-LJ92-DECODE-THROUGHPUT-1: generatorArgs.rawPrefetchDecoders maps to -RawPrefetchDecoders for any leg (not only a forced-look
         pace leg); 0 is the no-prefetch arm, k the decoder count, and absent leaves the job's text exactly as it was."""
@@ -669,7 +694,9 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
                              (["-ForceLookAssist", "-ContactSheet", "-LookPaceLeg"], "DUAL_VENUE_LOOK_PACE_LEG_SHAPE"),
                              (["-PlaybackRenderLookaheadFrames", "3"], "DUAL_VENUE_LOOKAHEAD_NEEDS_LOOK_PACE_LEG"),
                              (["-DisableCpuPlaybackLookahead"], "DUAL_VENUE_CPU_EXACTNESS_NEEDS_CPU_BACKEND"),
-                             (["-PresentedDumpFrames", "40-79"], "DUAL_VENUE_CPU_EXACTNESS_NEEDS_CPU_BACKEND")):
+                             (["-PresentedDumpFrames", "40-79"], "DUAL_VENUE_CPU_EXACTNESS_NEEDS_CPU_BACKEND"),
+                             (["-ForceLookAssist", "-ContactSheet", "-DisableLookAssist"], "DUAL_VENUE_LOOK_ASSIST_CONFLICT"),
+                             (["-ForceLookAssist", "-LookPaceLeg", "-LookFlavor", "cinematic", "-DisableLookAssist"], "DUAL_VENUE_LOOK_ASSIST_CONFLICT")):
             out = self.tmp / "refused.job.ps1"
             proc = run_pwsh(["-File", str(GENERATOR), "-SourceCommit", self.head, "-BuildManifestSha256", "ab" * 32,
                              "-ClipId", FIXTURE_IDS[0], "-FixtureSha256", "cd" * 32, "-RepoRoot", str(self.repo), "-OutFile", str(out), *extra])
@@ -4858,6 +4885,61 @@ class VenueQuietUnknownIsNotUnmetTests(unittest.TestCase):
         self.assertNotIn("VENUE_QUIET_UNKNOWN", proc.stdout)
 
 
+# VENUE-QUIET-SETASIDE-RECORD-1: the agent sets a superseded marker tmp aside IN running\ as '<name>.stale-<ticks>' / '<name>.corrupt-<ticks>' and treats it as resolved
+# (ultra-magnus-agent.ps1 Get-MarkerTempFiles). The gate counted it as a running job, so one such record held Bachelor at running=1 for every lane after its job had
+# ended (2026-10-13 23:00Z). A set-aside record is not counted; a live final marker and an unresolved tmp still are.
+@requires_windows_pwsh
+class VenueQuietSetAsideRecordTests(unittest.TestCase):
+    BUSY_EXIT = 3
+    TMP = "dve-x-bachelor-cuda-20261013225031.started.json.d49877b02a3243aa941ee56642f74291.tmp"
+    setUp = VenueQuietUnknownIsNotUnmetTests.setUp
+    gate = VenueQuietUnknownIsNotUnmetTests.gate
+
+    def busy_gate(self) -> subprocess.CompletedProcess:
+        import os
+        (self.tree / "tools" / "profiling" / "um-run.ps1").write_text(STUB_UM_RUN_FOR_QUIET, encoding="utf-8")
+        return subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(self.dv / "Wait-VenueQuiet.ps1"), "-Venue", "bachelor",
+                               "-WorkDir", str(self.work), "-MaxWaitSec", "1", "-RecheckSec", "1", "-MaxGateSec", "1", "-GatePollSec", "1"],
+                              capture_output=True, text=True, timeout=180, env=dict(os.environ, UMSTUB_MODE="samples", UMSTUB_SAMPLES="[5, 5, 5]"))
+
+    def running(self, name: str) -> None:
+        share = Path(json.loads((self.dv / "venues.json").read_text(encoding="utf-8"))["venues"]["bachelor"]["agentShare"])
+        (share / "running" / name).write_text("{}", encoding="utf-8")
+
+    def test_a_stale_set_aside_record_is_not_a_running_job(self) -> None:
+        self.running(self.TMP + ".stale-639275292076772648")
+        proc = self.gate("samples", "[5, 5, 5]")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertRegex(proc.stdout, r"(?m)^GATE quiet-probe bachelor queued=0 running=0 ")
+        self.assertRegex(proc.stdout, r"(?m)^QUIET mean=5\.0% ")
+
+    def test_a_corrupt_set_aside_record_is_not_a_running_job(self) -> None:
+        self.running(self.TMP + ".corrupt-639275292076772648")
+        proc = self.gate("samples", "[5, 5, 5]")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertRegex(proc.stdout, r"(?m)^GATE quiet-probe bachelor queued=0 running=0 ")
+
+    def test_a_legacy_shared_tmp_set_aside_record_is_not_a_running_job(self) -> None:
+        # Get-MarkerTempFiles also lists the legacy shared '<id>.started.json.tmp' (r2c and earlier); the agent sets that one aside the same way.
+        self.running("dve-x-bachelor-cuda-20261013225031.started.json.tmp.stale-639275292076772648")
+        proc = self.gate("samples", "[5, 5, 5]")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertRegex(proc.stdout, r"(?m)^GATE quiet-probe bachelor queued=0 running=0 ")
+
+    def test_a_live_final_marker_still_holds_the_gate(self) -> None:
+        self.running("dve-x-bachelor-cuda-20261013225031.started.json")
+        self.running(self.TMP + ".stale-639275292076772648")
+        proc = self.busy_gate()
+        self.assertEqual(proc.returncode, self.BUSY_EXIT, proc.stdout + proc.stderr)
+        self.assertRegex(proc.stdout, r"(?m)^GATE quiet-probe bachelor queued=0 running=1 ")
+
+    def test_an_unresolved_marker_tmp_still_holds_the_gate(self) -> None:
+        self.running(self.TMP)
+        proc = self.busy_gate()
+        self.assertEqual(proc.returncode, self.BUSY_EXIT, proc.stdout + proc.stderr)
+        self.assertRegex(proc.stdout, r"(?m)^GATE quiet-probe bachelor queued=0 running=1 ")
+
+
 # ---------------------------------------------------------------------------------------------------
 # VENUE-QUIET-ATTRIBUTION-1: the probe job reports schema v2 -- the v1 fields plus WHAT is using the venue (top 10 \Process(*) instances as percent of the whole machine,
 # Process _Total / Idle / System, privileged / user / DPC / interrupt time, per-core load with P- and E-cores apart). The gate PRINTS the attribution after its verdict and
@@ -5518,6 +5600,25 @@ class LegSpecSchemaTests(unittest.TestCase):
             broken["generatorArgs"][key] = value
             with self.assertRaises(self.jsonschema.ValidationError, msg=key):
                 self.jsonschema.validate(broken, self.schema)
+
+    def test_the_upstream_baseline_legs_are_no_look_cpu_speed_legs_at_scale_1(self) -> None:
+        """UPSTREAM-CPU-BASELINE-1: the fork arm of the upstream CPU A/B. Each leg is a cpu-only SPEED leg at scale 1 in the display mode its name says,
+        LIGHT, the pace legs' 95 % quiescence gate, Look Assist explicitly OFF (never forced), and informational criteria (the A/B is read lane-side)."""
+        for rel in UPSTREAM_BASELINE_LEGS:
+            spec = json.loads((DV / rel).read_text(encoding="utf-8"))
+            self.jsonschema.validate(spec, self.schema)
+            mode = re.match(r"legs/m16-1243-upstream-baseline-cpu-(fullscreen|windowed)-s1\.json$", rel).group(1)
+            self.assertEqual(spec["legId"], Path(rel).stem, rel)
+            self.assertEqual(spec["card"], "UPSTREAM-CPU-BASELINE-1", rel)
+            self.assertEqual((spec["legType"], spec["clipId"], spec["playSeconds"], spec["backends"], spec["scaleFactor"], spec["displayMode"]),
+                             ("speed", "M16-1243", 25, ["cpu"], 1, mode), rel)
+            self.assertEqual(spec["generatorArgs"], {"telemetryArm": "LIGHT", "cpuQuiescenceThresholdPercent": 95, "disableLookAssist": True}, rel)
+            self.assertNotIn("look", spec, rel)
+            self.assertEqual(spec["criteria"], {"acceptance": {"cpu": []}, "supplementary": {"cpu": []}}, rel)
+        bad = json.loads((DV / UPSTREAM_BASELINE_LEGS[0]).read_text(encoding="utf-8"))
+        bad["generatorArgs"]["disableLookAssist"] = "true"
+        with self.assertRaises(self.jsonschema.ValidationError):
+            self.jsonschema.validate(bad, self.schema)
 
     def test_the_present_trace_legs_are_their_twins_with_the_trace_on(self) -> None:
         """PLAYBACK-STARTUP-CATCHUP-BURST-1 r7: a present-trace leg differs from its twin only in its legId and generatorArgs.presentTrace true."""
