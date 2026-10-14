@@ -845,15 +845,11 @@ int llrpGpuCudaSuppressed(void)
     return g_llrawproc_gpu_cuda_suppressed != 0;
 }
 
-int llrpGpuPlaybackReconGetBackendInfo(llrpGpuPlaybackReconBackendInfo_t * info);
-int llrpGpuPlaybackReconGetBackendInfo(llrpGpuPlaybackReconBackendInfo_t * info)
+/* Caller holds g_llrawproc_gpu_recon_backend_mutex; info is zeroed. */
+static void llrawproc_gpu_recon_fill_backend_info(llrpGpuPlaybackReconBackendInfo_t * info)
 {
     llrawprocGpuExportBackend_t * g = &g_llrawproc_gpu_export_backend;
     const char * description = NULL;
-    if(!info) return 0;
-    memset(info, 0, sizeof(*info));
-
-    pthread_mutex_lock(&g_llrawproc_gpu_recon_backend_mutex);
     info->available = (g->backend && !g->unavailable) ? 1 : 0;
     info->attempted = g->attempted;
     info->unavailable = g->unavailable;
@@ -877,6 +873,34 @@ int llrpGpuPlaybackReconGetBackendInfo(llrpGpuPlaybackReconBackendInfo_t * info)
              sizeof(info->description),
              "%s",
              description ? description : "");
+}
+
+int llrpGpuPlaybackReconGetBackendInfo(llrpGpuPlaybackReconBackendInfo_t * info);
+int llrpGpuPlaybackReconGetBackendInfo(llrpGpuPlaybackReconBackendInfo_t * info)
+{
+    if(!info) return 0;
+    memset(info, 0, sizeof(*info));
+    pthread_mutex_lock(&g_llrawproc_gpu_recon_backend_mutex);
+    llrawproc_gpu_recon_fill_backend_info(info);
+    pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
+    return 1;
+}
+
+/* GPU-FIELD-TELEMETRY-EXIT-DEADLINE-1: as above, but waits at most wait_ms for
+ * the backend mutex (a backend call stuck at app close holds it). Returns 0,
+ * info zeroed, if the wait ran out. */
+int llrpGpuPlaybackReconGetBackendInfoWithin(llrpGpuPlaybackReconBackendInfo_t * info, int wait_ms);
+int llrpGpuPlaybackReconGetBackendInfoWithin(llrpGpuPlaybackReconBackendInfo_t * info, int wait_ms)
+{
+    const ULONGLONG deadline = GetTickCount64() + (ULONGLONG)(wait_ms > 0 ? wait_ms : 0);
+    if(!info) return 0;
+    memset(info, 0, sizeof(*info));
+    while(pthread_mutex_trylock(&g_llrawproc_gpu_recon_backend_mutex) != 0)
+    {
+        if(GetTickCount64() >= deadline) return 0;
+        Sleep(1);
+    }
+    llrawproc_gpu_recon_fill_backend_info(info);
     pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
     return 1;
 }
@@ -1640,6 +1664,16 @@ int llrpFakeGpuBackendFailCreateForTesting(void)
     g_llrawproc_fake_gpu_backend_installed = 0;
     pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
     return 1;
+}
+
+/* GPU-FIELD-TELEMETRY-EXIT-DEADLINE-1 test-only: take (1) or release (0) the
+ * backend mutex, as a backend call stuck at app close holds it. The thread
+ * that took it releases it. */
+void llrpHoldGpuReconBackendMutexForTesting(int hold);
+void llrpHoldGpuReconBackendMutexForTesting(int hold)
+{
+    if(hold) pthread_mutex_lock(&g_llrawproc_gpu_recon_backend_mutex);
+    else pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
 }
 
 /* Test-only: model an older DLL (present=0) that lacks
@@ -3512,6 +3546,13 @@ int llrpGpuPlaybackReconGetBackendInfo(llrpGpuPlaybackReconBackendInfo_t * info)
              "%s",
              "cuda");
     return 1;
+}
+
+int llrpGpuPlaybackReconGetBackendInfoWithin(llrpGpuPlaybackReconBackendInfo_t * info, int wait_ms);
+int llrpGpuPlaybackReconGetBackendInfoWithin(llrpGpuPlaybackReconBackendInfo_t * info, int wait_ms)
+{
+    (void)wait_ms;
+    return llrpGpuPlaybackReconGetBackendInfo(info);
 }
 
 int llrpGpuPlaybackReconResetGlTextureResources(void);

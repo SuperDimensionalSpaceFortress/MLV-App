@@ -379,6 +379,7 @@ HEADERS += MainWindow.h \
            PlaybackNativePaceGuard.h \
            PlaybackPresentTrace.h \
            PlaybackSwapInterval.h \
+           PlaybackScopesDuringPlayback.h \
            DisplayDeviceMapping.h \
            PlaybackGatePolicy.h \
            Phase3Breadcrumbs.h \

@@ -6,6 +6,7 @@
 #include "../../platform/qt/GpuPreviewProcessing.h"
 #include "../../platform/qt/Histogram.h"
 #include "../../platform/qt/MainWindowGpuPreviewPolicy.h"
+#include "../../platform/qt/PlaybackScopesDuringPlayback.h"
 #include "../../platform/qt/ScopesLabel.h"
 #include "../../platform/qt/VectorScope.h"
 #include "../../platform/qt/WaveFormMonitor.h"
@@ -613,6 +614,7 @@ private slots:
     void checkedStateUpdatesPalette();
     void mainWindowGpuPreviewPolicyAllowsGpu16OnlyWithoutScopes();
     void mainWindowGpuPreviewPolicyScopesVetoOnlyWhenDisplayed();
+    void mainWindowGpuPreviewPolicyHideScopesVetoesNothingWhilePlaying();
     void mainWindowGpuPreviewPolicyUsesGpuShaderZebrasWhenViewportInstalled();
     void mainWindowGpuPreviewPolicyBuildsExpectedPresenterOptions();
     void mainWindowGpuTexturePresentDisplaySizeAppliesStretch();
@@ -754,6 +756,50 @@ void GuiSmokeTest::mainWindowGpuPreviewPolicyScopesVetoOnlyWhenDisplayed()
     state.vectorScopeEnabled = mainWindowScopeActionConsumesPresentedPixels(
         true, true);
     QVERIFY(!mainWindowAllowsGpu16PreviewRender(state));
+}
+
+// PLAYBACK-SCOPES-OPTION-1: MainWindow feeds every scope flag through
+// playbackScopeDisplayConsumesPresentedPixels(editArea, playing, mode). In Hide mode a
+// visible histogram vetoes no GPU fast path while playing, and vetoes again once paused.
+void GuiSmokeTest::mainWindowGpuPreviewPolicyHideScopesVetoesNothingWhilePlaying()
+{
+    const auto stateFor = [](bool playing, PlaybackScopesMode mode) {
+        MainWindowGpuPreviewPolicyState state;
+        state.gpuViewportInstalled = true;
+        state.renderThreadUsing16BitPreview = true;
+        state.histogramEnabled = mainWindowScopeActionConsumesPresentedPixels(
+            playbackScopeDisplayConsumesPresentedPixels(true, playing, mode), true);
+        return state;
+    };
+    const auto textureRouteEligible = [](const MainWindowGpuPreviewPolicyState &state) {
+        return mainWindowGpuPlaybackReconTextureRouteEligibleAtScaleOne(
+            true, true, mainWindowHasScopeVisualization(state), true, true, true, false, true, false);
+    };
+
+    const MainWindowGpuPreviewPolicyState hidePlaying = stateFor(true, PlaybackScopesMode::Hide);
+    QVERIFY(!mainWindowHasScopeVisualization(hidePlaying));
+    QVERIFY(mainWindowAllowsGpu16PreviewRender(hidePlaying));
+    QVERIFY(mainWindowUsesGpu16PreviewPresentation(hidePlaying));
+    QVERIFY(textureRouteEligible(hidePlaying));
+
+    const MainWindowGpuPreviewPolicyState hidePaused = stateFor(false, PlaybackScopesMode::Hide);
+    QVERIFY(mainWindowHasScopeVisualization(hidePaused));
+    QVERIFY(!mainWindowAllowsGpu16PreviewRender(hidePaused));
+    QVERIFY(!textureRouteEligible(hidePaused));
+
+    for (PlaybackScopesMode mode : { PlaybackScopesMode::Throttled, PlaybackScopesMode::Live })
+    {
+        const MainWindowGpuPreviewPolicyState playing = stateFor(true, mode);
+        QVERIFY(mainWindowHasScopeVisualization(playing));
+        QVERIFY(!mainWindowAllowsGpu16PreviewRender(playing));
+        QVERIFY(!textureRouteEligible(playing));
+        QCOMPARE(QString::fromLatin1(mainWindowGpuPlaybackPipelineStatusBadgeLabel(
+                     GpuPlaybackPipelineStatus::Cpu, playing, true)),
+                 QStringLiteral("CPU - scopes active"));
+    }
+    QCOMPARE(QString::fromLatin1(mainWindowGpuPlaybackPipelineStatusBadgeLabel(
+                 GpuPlaybackPipelineStatus::Cpu, hidePlaying, true)),
+             QStringLiteral("CPU"));
 }
 
 void GuiSmokeTest::mainWindowGpuPreviewPolicyBuildsExpectedPresenterOptions()

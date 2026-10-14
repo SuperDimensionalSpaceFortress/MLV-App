@@ -69,6 +69,7 @@ PLAYBACK_DEFAULTS = {
     "showExperimentalPhase3Modes": False,
     "phase3Acknowledged": False,
     "vsync": True,
+    "scopesDuringPlayback": {"name": "hide", "value": 0},
     "derived": {
         "proxyLevel": -1,
         "initialScaleRequest": {"nonDualIso": 4, "dualIso": 4},
@@ -151,7 +152,7 @@ def _validate_enum(value: Any, expected: dict[str, Any], path: str) -> None:
 
 def _validate_playback(playback: Any) -> dict[str, Any]:
     result = _exact_keys(playback, set(PLAYBACK_DEFAULTS), "playback")
-    for key in ("qualityMode", "previewMode", "scaleFactorOverride", "previewResolution"):
+    for key in ("qualityMode", "previewMode", "scaleFactorOverride", "previewResolution", "scopesDuringPlayback"):
         _validate_enum(result[key], PLAYBACK_DEFAULTS[key], f"playback.{key}")
     _require_int(result["autoTargetFps"], "playback.autoTargetFps")
     for key in (
