@@ -1274,9 +1274,11 @@ static int reset_cached_gl_resource(CachedGlImageResource* cache,
     if (cache->resource) {
         const cudaError_t rc = cudaGraphicsUnregisterResource(cache->resource);
         if (rc != cudaSuccess) {
+            /* r8 class sweep: a tolerated code (GL context already gone) is still noted;
+             * only its log line stays quiet. */
+            IGPU_CUDA_ERROR_NOTE(rc, "gl_cache:unregister");
             if (!(tolerate_invalid_graphics_context
                   && rc == cudaErrorInvalidGraphicsContext)) {
-                IGPU_CUDA_ERROR_NOTE(rc, "gl_cache:unregister");
                 fprintf(stderr,
                         "[igpu_recon_cuda] cudaGraphicsUnregisterResource(cached GL_R16 texture) failed: %s\n",
                         cudaGetErrorString(rc));
@@ -1356,8 +1358,9 @@ static int copy_bayer16_to_gl_r16_texture(igpu_recon_backend* b, unsigned int gl
     }
 
     cudaArray_t mapped_array = NULL;
-    e = cudaGraphicsSubResourceGetMappedArray(&mapped_array, resource, 0, 0);
-    if (e == cudaSuccess) {
+    /* r8 class sweep: the mapped-array code keeps its own site (it was noted as the copy's). */
+    const cudaError_t array_error = cudaGraphicsSubResourceGetMappedArray(&mapped_array, resource, 0, 0);
+    if (array_error == cudaSuccess) {
         const size_t row_bytes = (size_t)b->width * sizeof(uint16_t);
         e = IGPU_LT_SYNC_CALL("gl_r16:copy_to_array",
                               cudaMemcpy2DToArray(mapped_array,
@@ -1372,13 +1375,18 @@ static int copy_bayer16_to_gl_r16_texture(igpu_recon_backend* b, unsigned int gl
 
     const cudaError_t unmap_error =
         IGPU_LT_SYNC_CALL("gl_r16:unmap", cudaGraphicsUnmapResources(1, &resource, 0));
-    if (e != cudaSuccess || unmap_error != cudaSuccess) {
-        /* r7: both codes are already evaluated: note each before the return. */
+    if (array_error != cudaSuccess || e != cudaSuccess || unmap_error != cudaSuccess) {
+        /* r7: all evaluated codes are noted, each at its own site, before the return. */
         const igpu_cuda_error_slot::Evaluated evaluated[] = {
+            {(int)array_error, "gl_r16:mapped_array"},
             {(int)e, "gl_r16:copy_to_array"},
             {(int)unmap_error, "gl_r16:unmap"},
         };
         IGPU_CUDA_ERROR_NOTE_EVALUATED(evaluated);
+        if (array_error != cudaSuccess)
+            fprintf(stderr,
+                    "[igpu_recon_cuda] cudaGraphicsSubResourceGetMappedArray(GL_R16 texture) failed: %s\n",
+                    cudaGetErrorString(array_error));
         if (e != cudaSuccess)
             fprintf(stderr,
                     "[igpu_recon_cuda] device-to-GL texture copy failed: %s\n",
@@ -1450,9 +1458,18 @@ static int ensure_preupload_slot_storage(igpu_recon_backend* b,
 {
     if (!b || !slot || bytes == 0) return -1;
     if (slot->host_input && slot->device_input && slot->bytes == bytes) return 0;
-    if (slot->host_input) cudaFreeHost(slot->host_input);
+    /* r8 class sweep: the release codes are noted, not dropped. */
+    if (slot->host_input) {
+        const cudaError_t free_host = cudaFreeHost(slot->host_input);
+        if (free_host != cudaSuccess) {
+            IGPU_CUDA_ERROR_NOTE(free_host, "preupload:free_host");
+        }
+    }
     if (slot->device_input) {
-        cudaFree(slot->device_input);
+        const cudaError_t free_device = cudaFree(slot->device_input);
+        if (free_device != cudaSuccess) {
+            IGPU_CUDA_ERROR_NOTE(free_device, "preupload:free_device");
+        }
         if (b->preupload_device_allocated_bytes >= slot->bytes) {
             b->preupload_device_allocated_bytes -= (uint64_t)slot->bytes;
         }
@@ -1468,7 +1485,10 @@ static int ensure_preupload_slot_storage(igpu_recon_backend* b,
     e = cudaMalloc((void**)&slot->device_input, bytes);
     if (e != cudaSuccess) {
         IGPU_CUDA_ERROR_NOTE(e, "preupload:malloc_device");
-        cudaFreeHost(slot->host_input);
+        const cudaError_t free_host = cudaFreeHost(slot->host_input);
+        if (free_host != cudaSuccess) {
+            IGPU_CUDA_ERROR_NOTE(free_host, "preupload:free_host");
+        }
         slot->host_input = NULL;
         return -1;
     }
@@ -1765,15 +1785,29 @@ static int ensure_preupload_runtime(igpu_recon_backend* b)
     }
     if (e != cudaSuccess) {
         IGPU_CUDA_ERROR_NOTE(e, "preupload:runtime_create");
+        /* r8 class sweep: the cleanup codes are noted, not dropped. */
         for (int i = 0; i < PREUPLOAD_SLOTS; ++i) {
-            if (b->preupload[i].upload_start)
-                cudaEventDestroy(b->preupload[i].upload_start);
-            if (b->preupload[i].upload_ready)
-                cudaEventDestroy(b->preupload[i].upload_ready);
+            if (b->preupload[i].upload_start) {
+                const cudaError_t destroyed = cudaEventDestroy(b->preupload[i].upload_start);
+                if (destroyed != cudaSuccess) {
+                    IGPU_CUDA_ERROR_NOTE(destroyed, "preupload:event_destroy");
+                }
+            }
+            if (b->preupload[i].upload_ready) {
+                const cudaError_t destroyed = cudaEventDestroy(b->preupload[i].upload_ready);
+                if (destroyed != cudaSuccess) {
+                    IGPU_CUDA_ERROR_NOTE(destroyed, "preupload:event_destroy");
+                }
+            }
             b->preupload[i].upload_start = NULL;
             b->preupload[i].upload_ready = NULL;
         }
-        if (b->preupload_stream) cudaStreamDestroy(b->preupload_stream);
+        if (b->preupload_stream) {
+            const cudaError_t destroyed = cudaStreamDestroy(b->preupload_stream);
+            if (destroyed != cudaSuccess) {
+                IGPU_CUDA_ERROR_NOTE(destroyed, "preupload:stream_destroy");
+            }
+        }
         b->preupload_stream = NULL;
     }
     LeaveCriticalSection(&b->preupload_lock);
@@ -1813,8 +1847,13 @@ int igpu_recon_preupload_frame(igpu_recon_backend* b,
          * touched.  Oldest-first keeps the newest lookahead candidates. */
         for (int i = 0; i < PREUPLOAD_SLOTS; ++i) {
             PreuploadSlot* candidate = &b->preupload[i];
-            if (candidate->state == 1 &&
-                cudaEventQuery(candidate->upload_ready) == cudaSuccess &&
+            if (candidate->state != 1) continue;
+            /* r8 class sweep: a query code other than not-ready is noted, not dropped. */
+            const cudaError_t ready = cudaEventQuery(candidate->upload_ready);
+            if (ready != cudaErrorNotReady && ready != cudaSuccess) {
+                IGPU_CUDA_ERROR_NOTE(ready, "preupload:reclaim_query");
+            }
+            if (ready == cudaSuccess &&
                 candidate->sequence < oldest_sequence) {
                 oldest_sequence = candidate->sequence;
                 selected = i;
@@ -1896,6 +1935,10 @@ static int take_exact_preupload(igpu_recon_backend* b,
     PreuploadSlot* slot = &b->preupload[*slot_index];
     const cudaError_t query = cudaEventQuery(slot->upload_ready);
     status->ready_before_run = query == cudaSuccess;
+    /* r8 class sweep: a query code other than not-ready is noted, not dropped. */
+    if (query != cudaErrorNotReady && query != cudaSuccess) {
+        IGPU_CUDA_ERROR_NOTE(query, "run:preupload_query");
+    }
     const double wait_start_ms = qpc_now_ms();
     const cudaError_t sync =
         IGPU_LT_SYNC_CALL("run:preupload_wait", cudaEventSynchronize(slot->upload_ready));
@@ -1903,10 +1946,14 @@ static int take_exact_preupload(igpu_recon_backend* b,
     if (sync != cudaSuccess) IGPU_CUDA_ERROR_NOTE(sync, "run:preupload_wait");
     if (sync == cudaSuccess) {
         float upload_ms = 0.0f;
-        if (cudaEventElapsedTime(&upload_ms,
-                                 slot->upload_start,
-                                 slot->upload_ready) == cudaSuccess) {
+        /* r8 class sweep: the elapsed-time code is noted, not dropped. */
+        const cudaError_t elapsed = cudaEventElapsedTime(&upload_ms,
+                                                         slot->upload_start,
+                                                         slot->upload_ready);
+        if (elapsed == cudaSuccess) {
             status->upload_ms = (double)upload_ms;
+        } else {
+            IGPU_CUDA_ERROR_NOTE(elapsed, "run:preupload_elapsed");
         }
     }
     status->exact_match =
