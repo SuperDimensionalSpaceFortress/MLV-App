@@ -734,6 +734,7 @@ private:
                 scopeSourceImage = sourceImage;
                 scopeSourceImageSize = sourceImageSize;
                 readyFrame.rawImage8 = sourceImage;
+                readyFrame.rawImage8Bytes = sourceImageSize;
             }
             if( !ownedSourceImage16.empty() )
             {

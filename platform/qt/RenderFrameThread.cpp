@@ -1675,6 +1675,7 @@ bool RenderFrameThread::acquireReadySlotLocked( ReadyFrame *frame,
     if( frame )
     {
         frame->rawImage8 = slot.rawImage8.empty() ? nullptr : slot.rawImage8.data();
+        frame->rawImage8Bytes = slot.rawImage8.size();
         frame->rawImage16 = slot.rawImage16.empty() ? nullptr : slot.rawImage16.data();
         frame->rawImage16Words = slot.rawImage16.size();
         frame->playbackScaledImage8 =

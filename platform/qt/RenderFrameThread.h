@@ -210,6 +210,7 @@ public:
         };
 
         const uint8_t *rawImage8 = nullptr;
+        size_t rawImage8Bytes = 0;
         const uint16_t *rawImage16 = nullptr;
         size_t rawImage16Words = 0;
         const uint8_t *playbackScaledImage8 = nullptr;
