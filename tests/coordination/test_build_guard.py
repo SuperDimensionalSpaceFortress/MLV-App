@@ -323,6 +323,65 @@ def test_command_mode_returns_native_exit_codes_unchanged(box, fragment, code) -
     assert not box["lock"].exists()
 
 
+@pytest.mark.parametrize(
+    "first, code",
+    [
+        ("cmd /c exit 9", 9),
+        ("cmd /c \"echo warn 1>&2 & exit 7\" 2>&1 | ForEach-Object { $_ }", 7),
+        ("cmd /c exit 0", 0),
+    ],
+    ids=["native-9-then-native-0", "piped-native-7-then-native-0", "native-0-then-native-0"],
+)
+def test_command_mode_stops_at_the_first_failing_native_command(box, first, code) -> None:
+    # BG-02: a failed qmake followed by a make that exits 0 used to read as success. The second command
+    # is native and writes the marker, so the exit-0 row is the control that the marker writer works.
+    assert " " not in str(box["marker"])
+    second = f"cmd /c \"echo ran> {box['marker']} & exit 0\""
+    done = _guard(box, OK_MEMORY, [], [], ["-Command", f"{first}; {second}"])
+    assert done.returncode == code, done.stdout + done.stderr
+    assert "BUILD_GUARD_COMMAND_FAILED" not in done.stderr
+    assert not box["lock"].exists()
+    if code == 0:
+        assert box["marker"].exists(), "a fragment with no failure must run to the end"
+        return
+    assert not box["marker"].exists(), "the command after the failing one must never run"
+    assert f"first failing native command: exit={code}" in done.stderr
+
+
+@pytest.mark.parametrize(
+    "first",
+    [
+        "Write-Error 'BUILD_FAILED_CONTINUE' -ErrorAction Continue",
+        "Get-Item -LiteralPath 'C:\\BUILD_FAILED_CONTINUE-missing' -ErrorAction SilentlyContinue",
+    ],
+    ids=["write-error-continue", "silently-continue"],
+)
+def test_command_mode_fails_on_an_error_record_that_did_not_stop_the_fragment(box, first) -> None:
+    # BG-02: the fragment goes on (the caller asked for that), but the verdict is still a failure.
+    done = _guard(box, OK_MEMORY, [], [], ["-Command", f"{first}; cmd /c exit 0; Write-Output AFTER"])
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "AFTER" in done.stdout
+    assert "BUILD_GUARD_COMMAND_FAILED label=build lastNativeExit=0 errors=1" in done.stderr
+    assert "BUILD_FAILED_CONTINUE" in done.stderr
+    assert not box["lock"].exists()
+
+
+@pytest.mark.parametrize(
+    "fragment",
+    [
+        "Get-Item -LiteralPath 'C:\\BUILD_GUARD_IGNORED-missing' -ErrorAction Ignore; cmd /c exit 0; Write-Output AFTER",
+        "cmd /c \"echo warn 1>&2 & exit 0\"; cmd /c exit 0; Write-Output AFTER",
+    ],
+    ids=["error-action-ignore", "native-stderr-unmerged"],
+)
+def test_command_mode_does_not_invent_a_failure(box, fragment) -> None:
+    done = _guard(box, OK_MEMORY, [], [], ["-Command", fragment])
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "AFTER" in done.stdout
+    assert "BUILD_GUARD_COMMAND_FAILED" not in done.stderr
+    assert not box["lock"].exists()
+
+
 def test_command_mode_without_a_command_is_a_usage_error(box) -> None:
     done = _guard(box, OK_MEMORY, [], [], [])
     assert done.returncode == 2
@@ -443,6 +502,88 @@ def test_release_reads_and_deletes_the_lock_under_the_slot_mutex(box) -> None:
     assert done.returncode == 0, done.stdout + done.stderr
     assert result.read_text(encoding="ascii").strip() == "lockWhileHeld=True", "release ran outside the mutex"
     assert not box["lock"].exists(), "release must still delete our own lock once the mutex is free"
+
+
+def test_reclaim_waits_for_the_slot_mutex(box) -> None:
+    # BUILD-GUARD-TESTS-2-MUTEX-SERIALISATION: the read-check-reclaim-create runs under the slot mutex, so
+    # while another process holds it, a stale lock must stay untouched and no build may start.
+    mutex = f"Local\\MLV-BuildGuardTest-{os.getpid()}-{time.time_ns()}"
+    ready, release, result = (box["dir"] / n for n in ("ready.txt", "release.txt", "result.txt"))
+    _write_lock(box, _dead_pid(), 1, expires_in_minutes=60)
+    holder_script = box["dir"] / "holder.ps1"
+    holder_script.write_text(
+        "param([string]$Name, [string]$Lock, [string]$Marker, [string]$Ready, [string]$Result)\n"
+        "$m = [System.Threading.Mutex]::new($false, $Name)\n"
+        "if (-not $m.WaitOne(30000)) { exit 6 }\n"
+        "Set-Content -LiteralPath $Ready -Value ok -Encoding ascii\n"
+        "Start-Sleep -Milliseconds 2500\n"
+        "$label = (Get-Content -LiteralPath $Lock -Raw | ConvertFrom-Json).label\n"
+        "Set-Content -LiteralPath $Result -Value \"label=$label ran=$(Test-Path -LiteralPath $Marker)\" -Encoding ascii\n"
+        "$m.ReleaseMutex(); $m.Dispose()\n",
+        encoding="ascii",
+    )
+    holder = subprocess.Popen(
+        [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(holder_script), "-Name", mutex,
+         "-Lock", str(box["lock"]), "-Marker", str(box["marker"]), "-Ready", str(ready), "-Result", str(result)]
+    )
+    try:
+        deadline = time.monotonic() + 60
+        while not ready.exists():
+            assert holder.poll() is None and time.monotonic() < deadline, "holder never took the mutex"
+            time.sleep(0.05)
+        done = _run_with_slot(box, ["-MutexName", mutex])
+        assert holder.wait(timeout=60) == 0
+    finally:
+        if holder.poll() is None:
+            holder.kill()
+            holder.wait()
+    assert result.read_text(encoding="ascii").strip() == "label=seeded-test-lock ran=False", "reclaim ran outside the mutex"
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "reclaiming stale build slot (owner-dead)" in done.stderr
+    assert box["marker"].exists()
+    assert not box["lock"].exists()
+
+
+def test_two_contenders_for_one_stale_slot_admit_exactly_one_owner(box) -> None:
+    # BUILD-GUARD-TESTS-2-MUTEX-SERIALISATION: both see the same dead-owner lock; one reclaims it and the
+    # other must find the winner's fresh lock. The winner holds the slot until the loser has given up.
+    _write_lock(box, _dead_pid(), 1, expires_in_minutes=60)
+    release = box["dir"] / "release.txt"
+    memory_file = _write_json(box["dir"] / "memory.json", OK_MEMORY)
+    table_file = _write_json(box["dir"] / "table.json", [])
+    mutex = f"Local\\MLV-BuildGuardTest-{os.getpid()}-{time.time_ns()}"
+    contenders = []
+    for n in (1, 2):
+        fragment = (
+            f"Set-Content -LiteralPath '{box['dir'] / f'admitted-{n}.txt'}' -Value ok -Encoding ascii; "
+            f"$d = (Get-Date).AddSeconds(60); "
+            f"while (-not (Test-Path -LiteralPath '{release}') -and (Get-Date) -lt $d) {{ Start-Sleep -Milliseconds 50 }}"
+        )
+        contenders.append(subprocess.Popen(
+            [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(GUARD),
+             "-MemoryProbeFile", memory_file, "-ProcessTableFile", table_file, "-LockPath", str(box["lock"]),
+             "-ExemptLogPath", str(box["exempt_log"]), "-MutexName", mutex, *FAST, "-DeadlineMinutes", "0.1",
+             "-Command", fragment],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=_env(),
+        ))
+    try:
+        deadline = time.monotonic() + 60
+        while all(c.poll() is None for c in contenders):
+            assert time.monotonic() < deadline, "neither contender gave up"
+            time.sleep(0.05)
+        release.write_text("go", encoding="ascii")
+        outs = [c.communicate(timeout=60) for c in contenders]
+    finally:
+        for c in contenders:
+            if c.poll() is None:
+                c.kill()
+                c.wait()
+    codes = sorted(c.returncode for c in contenders)
+    assert codes == [0, 3], outs
+    admitted = [n for n in (1, 2) if (box["dir"] / f"admitted-{n}.txt").exists()]
+    assert len(admitted) == 1, outs
+    assert sum("BUILD_SLOT_BUSY" in out for out, _ in outs) == 1, outs
+    assert not box["lock"].exists()
 
 
 def test_stale_lock_with_a_dead_owner_is_reclaimed(box) -> None:

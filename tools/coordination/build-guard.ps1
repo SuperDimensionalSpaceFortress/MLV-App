@@ -25,11 +25,14 @@
 # THREE WAYS TO USE IT:
 #   Command:   pwsh -NoProfile -File tools\coordination\build-guard.ps1 -Command "qmake X.pro; mingw32-make -j{JOBS}"
 #              "{JOBS}" in the text is replaced with the chosen number BEFORE the fragment is parsed, so
-#              "-j{JOBS}" reaches the child as the single token "-j4". The fragment runs in this process;
-#              the exit code of its last native command is returned. A failure that is not a native exit
-#              code (command not found, an error record, a throw) stops the fragment, prints
-#              BUILD_GUARD_COMMAND_FAILED on stderr and exits 1. (A "--" separator is not used:
-#              PowerShell binds it as a parameter named '' and refuses.)
+#              "-j{JOBS}" reaches the child as the single token "-j4". The fragment runs in this process
+#              (PowerShell 7.4+) and its verdict is its FIRST failure: a native command that exits non-zero
+#              stops the fragment and its code is returned, so "qmake; make" cannot report a failed qmake
+#              as 0. A command that cannot start, a throw or any error record (even one written with
+#              -ErrorAction Continue or SilentlyContinue, or caught; only -ErrorAction Ignore is exempt)
+#              prints BUILD_GUARD_COMMAND_FAILED on stderr and exits 1. If nothing
+#              failed, the exit code is 0. (A "--" separator is not used: PowerShell binds it as a
+#              parameter named '' and refuses.)
 #   Print:     pwsh -NoProfile -File tools\coordination\build-guard.ps1 -PrintJobs
 #              runs the memory pre-flight, prints "-jN" as the only stdout line, takes NO slot.
 #   Library:   . tools\coordination\build-guard.ps1 -Library
@@ -46,7 +49,7 @@
 #   -ProcessTableFile  JSON array of {"ProcessId":n,"Name":"cc1plus.exe","CreationDate":"<iso>"}
 #   -LockPath / -MutexName / -PollSeconds / -DeadlineMinutes / -LockExpiryMinutes / -ExemptLogPath
 # Exit codes: 3 = refused (memory or slot), 2 = usage, 1 = the command fragment failed without a native
-# exit code, otherwise the build command's own exit code.
+# exit code, otherwise the exit code of the first native command that failed (0 when none did).
 [CmdletBinding()]
 param(
     [switch]$Library,
@@ -310,22 +313,43 @@ if (-not $Command.Trim()) {
     exit 2
 }
 
-# The fragment runs with ErrorActionPreference Stop, so a command that cannot start, an error record or a
-# throw ends it at once and exits 1 (BUILD-GUARD BG-01: these never touch LASTEXITCODE, so the guard used to
-# exit 0). A native command's own exit code is not an error here and is returned as is.
+# The verdict is the FIRST failure in the fragment, which is a sequence (BUILD-GUARD BG-01, BG-02):
+#   - a native command that exits non-zero stops the fragment, and its own code is returned (9 stays 9), so
+#     a failed qmake cannot be hidden by a later make that exits 0 (PSNativeCommandUseErrorActionPreference);
+#   - a command that cannot start, an error record or a throw stops the fragment and exits 1 (these never
+#     touch LASTEXITCODE, so the guard used to exit 0);
+#   - an error record written with an explicit -ErrorAction Continue does not stop the fragment, but it is
+#     collected by -ErrorVariable and still turns the verdict into exit 1. This fails closed: a record that
+#     was silenced (SilentlyContinue) or caught by a try/catch in the fragment is collected too. Only
+#     -ErrorAction Ignore drops a record.
+# Native stderr (compiler warnings, with or without 2>&1) is not an error record here and fails nothing.
+if ($PSVersionTable.PSVersion -lt [version]'7.4') {
+    [Console]::Error.WriteLine("build-guard: command mode needs PowerShell 7.4+ (native exit codes stop the fragment); this is $($PSVersionTable.PSVersion)")
+    exit 2
+}
 $script:BuildGuardCommandExit = 0
 Invoke-BuildGuard -Label $Label -RequestedJobs $RequestedJobs -ExemptReason $ExemptReason -Options $guardOptions -Action {
     param($Jobs)
     $fragment = $Command -replace '\{JOBS\}', [string]$Jobs
     $global:LASTEXITCODE = 0
     $ErrorActionPreference = 'Stop'
-    $PSNativeCommandUseErrorActionPreference = $false
+    $PSNativeCommandUseErrorActionPreference = $true
+    $fragmentErrors = $null
+    $failure = $null
     try {
-        & ([scriptblock]::Create($fragment))
+        & ([scriptblock]::Create("[CmdletBinding()] param()`n" + $fragment)) -ErrorVariable fragmentErrors
         $script:BuildGuardCommandExit = [int]$global:LASTEXITCODE
+        if (@($fragmentErrors).Count -gt 0) { $failure = @($fragmentErrors)[0] }
+    } catch [System.Management.Automation.NativeCommandExitException] {
+        $script:BuildGuardCommandExit = [int]$_.Exception.ExitCode
+        Write-BuildGuardLog ('fragment stopped at its first failing native command: exit={0} {1}' -f $_.Exception.ExitCode, $_.Exception.Message)
     } catch {
-        $reason = ($_.Exception.GetType().Name + ': ' + $_.Exception.Message) -replace '\s+', ' '
-        [Console]::Error.WriteLine(('BUILD_GUARD_COMMAND_FAILED label={0} lastNativeExit={1} reason={2}' -f $Label, [int]$global:LASTEXITCODE, $reason))
+        $failure = $_
+    }
+    if ($failure) {
+        $exception = if ($failure -is [System.Management.Automation.ErrorRecord]) { $failure.Exception } else { $failure }
+        $reason = ($exception.GetType().Name + ': ' + $exception.Message) -replace '\s+', ' '
+        [Console]::Error.WriteLine(('BUILD_GUARD_COMMAND_FAILED label={0} lastNativeExit={1} errors={2} reason={3}' -f $Label, [int]$global:LASTEXITCODE, [math]::Max(1, @($fragmentErrors).Count), $reason))
         $script:BuildGuardCommandExit = 1
     }
 }
