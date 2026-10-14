@@ -313,7 +313,11 @@ TEST(GpuDualIsoPreviewScale, CudaSuppressedSessionTakesTheCpuReducedReconPlan)
     struct SuppressedScope
     {
         SuppressedScope() { llrpSetGpuCudaSuppressed(1); }
-        ~SuppressedScope() { llrpSetGpuCudaSuppressed(0); }
+        ~SuppressedScope()
+        {
+            llrpSetGpuCudaSuppressed(0);
+            llrpSetGpuPlaybackReconLastUsedForTesting(0);
+        }
     };
 
     mlvDualIsoPreviewScaleRecon_t cpuRoute;
@@ -344,6 +348,21 @@ TEST(GpuDualIsoPreviewScale, CudaSuppressedSessionTakesTheCpuReducedReconPlan)
         ASSERT_EQ(std::string("none"), std::string(plan.reason));
         ASSERT_EQ(0, mlvDualIsoGpuPreviewScaleReconPlan(fixture.video(), 4, 0, &plan));
         ASSERT_EQ(std::string("GPU playback recon not requested"), std::string(plan.reason));
+
+        // The recon worker's thread last ran a CUDA recon (the frames before the fault). The CPU
+        // reduced recon must restamp it, or the render refuses every reduced frame as a CUDA recon
+        // (Bachelor 89c82a63 L1: refused_gpu_playback_recon=397, 10.6 fps).
+        // Mutation: drop the reset in applyLLRawProcObjectWorker_with_dims.
+        ASSERT_EQ(1, mlvDualIsoPreviewScaleReconPlan(fixture.video(), 4, &plan));
+        std::vector<uint16_t> raw = decodeRaw(fixture, 0);
+        ASSERT_FALSE(raw.empty());
+        std::vector<uint16_t> reduced(static_cast<size_t>(plan.reducedWidth)
+                                      * static_cast<size_t>(plan.reducedHeight), 0u);
+        WorkerState worker;
+        llrpSetGpuPlaybackReconLastUsedForTesting(1);
+        ASSERT_EQ(1, mlvDualIsoPreviewScaleReconRun(fixture.video(), &plan, raw.data(), reduced.data(),
+                                                    &worker.state, 1, nullptr, nullptr));
+        ASSERT_EQ(0, llrpGpuPlaybackReconLastUsedForTesting());
     }
     // Clear again (L4): back to the CUDA session's refusal.
     ASSERT_EQ(0, mlvDualIsoPreviewScaleReconPlan(fixture.video(), 4, &plan));

@@ -5920,6 +5920,12 @@ int applyLLRawProcObjectWorker_with_dims(mlvObject_t * video,
                                          llrawprocWorkerState_t * worker,
                                          int flags)
 {
+    /* GPU-DEVICE-LOSS-SELF-HEAL-1 r4: this is the recon worker's reduced recon, so
+     * the thread's "last recon used CUDA" state describes THIS recon, as in
+     * applyLLRawProcObjectWorker. Without it, a CPU reduced recon after a device
+     * loss kept the last CUDA frame's flag, and the render refused every one
+     * ("recon ran on the CUDA playback recon"). The GPU texture branch resets it too. */
+    llrawproc_gpu_playback_reset_last_run_state();
     return llrawproc_apply_with_dims_internal(video, raw_image_buff, raw_image_size,
                                               override_w, override_h, worker, flags);
 }
