@@ -5954,7 +5954,7 @@ class LookReceiptRunnerTests(RunnerHarness, unittest.TestCase):
         self.working = self.committed.replace(b"<agx>0</agx>", b"<agx>1</agx>")
         target.write_bytes(self.working)   # the working copy now differs from the committed blob
         param_tail = "$DisplayMode,[switch]$VisualCapture)"
-        assert param_tail in STUB_GENERATOR, "STUB_GENERATOR param list changed; update this replace target"
+        self.assertIn(param_tail, STUB_GENERATOR, "STUB_GENERATOR param list changed; update this replace target")
         self.gen.write_text(STUB_GENERATOR.replace(param_tail, "$DisplayMode,[switch]$VisualCapture,$LookReceiptPath)", 1), encoding="utf-8")
         self.work = self.tmp / "work"
 
@@ -6369,6 +6369,18 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
                                           f"-FlatPlayFrames {flat} -PlayVsPausedMeanAbsDiff {mad} -SamePosition {same} -Threshold 12 | ConvertTo-Json -Compress")
                 self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
                 self.assertEqual((out["verdict"], out["counted"]), (verdict, counted))
+
+    def test_the_default_divergence_threshold_is_six_not_twelve(self) -> None:
+        # The gate table above passes -Threshold explicitly, so it cannot see the module default. These rows pass none: a same-position
+        # mean absolute difference of 8 is a divergence at the calibrated default (6.0) and would read OK if the default were 12.0.
+        for mad, verdict in (("8.0", "VISUAL_DIVERGENCE"), ("6.5", "VISUAL_DIVERGENCE"), ("6.0", "OK"), ("5.9", "OK"), ("2.0", "OK")):
+            with self.subTest(mad=mad):
+                proc, out = run_pwsh_json("Get-DvVisualVerdict -Requested $true -Captured $true -PlayFrames 6 -DistinctContentHashes 6 -AppDistinctDisplayFrames 6 "
+                                          f"-FlatPlayFrames 0 -PlayVsPausedMeanAbsDiff {mad} -SamePosition $true | ConvertTo-Json -Compress")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual((out["verdict"], out["counted"]), (verdict, True))
+                if verdict == "VISUAL_DIVERGENCE":
+                    self.assertIn("threshold is 6", out["reason"])
 
     def test_the_visual_reader_hashes_the_viewport_not_the_chrome_and_composes_one_strip(self) -> None:
         for mode, verdict in (("ok", "OK"), ("frozen", "FROZEN_DISPLAY"), ("blank", "CAPTURE_BLANK"), ("diverge", "VISUAL_DIVERGENCE")):

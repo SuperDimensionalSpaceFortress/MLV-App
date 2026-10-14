@@ -66,4 +66,6 @@ leg never runs this capture (its contact sheet is the look; `visual` is null).
 
 Before approving a playback PR, the review keys AND the hub OPEN (Read) the strip of at least one leg per arm and state in one line
 what they saw (`VISUAL <arm>: <strip> -- <what was seen>`). Reading the receipt's numbers is not opening the strip; an arm without
-a strip is a finding. The key prompt composer carries this as its visual-inspection block (board-only tooling).
+a strip is a finding. The rule is enforced, not merely proposed: the hub's key prompt composer (`hub-tools\new-review-keys.ps1`
+plus `key-prompt-visual.md`, installed 2026-10-14; board-only, untracked tooling) adds a `## VISUAL INSPECTION` block and a
+`visual_inspection` field to every key prompt for a PR touching `platform/qt/`, `src/` or `tools/profiling/`.
