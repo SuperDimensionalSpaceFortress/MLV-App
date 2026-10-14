@@ -1337,6 +1337,10 @@ function Resolve-StartedMarkers {
 # sustained heat clear. If either fails, or the feed or status cannot be read, the holder is released
 # and the job re-joins the FIFO: a job that is not running never keeps a slot. Light probes
 # (GateExemptJobPattern) are not gated and take no slot.
+# maint-dispatch r1: light jobs are also run inline from inside another job's gate-wait (Invoke-ExemptJobsDuringWait),
+# once per GateProbeSec, in Name order, so a job waiting on an unknown feed cannot starve probes, dve health checks or
+# agent-swap. No ordinary job is touched by that scan, so ordinary order is unchanged. A slot the waiting holder
+# acquires during a light job is re-checked as before once the light job returns (bounded by its own timeoutSec).
 #
 # r2 (sol r1 BLOCKER, HOLDER LOSS): a holder can exit after acquiring, and heavy-slot.py then gives its slot to
 # another run. So the agent's own slot is excluded from busy ONLY when `status` shows it held by this job's label
@@ -1359,9 +1363,10 @@ function Resolve-StartedMarkers {
 # that finds launching adopts a live child found by command line, re-queues only on proof nothing launched (no
 # live child and no out file), and otherwise orphans (Resolve-LaunchingMarker).
 # ---------------------------------------------------------------------------
-$script:GateVersion = "heavy-slot-gate-1 r1k + heavy-slot-gate-2 r2e + wait-release r1c fifo-holder sustained-heat + r2 holder-owner-check (2026-10-12)"
+$script:GateVersion = "heavy-slot-gate-1 r1k + heavy-slot-gate-2 r2e + wait-release r1c fifo-holder sustained-heat + r2 holder-owner-check (2026-10-12) + maint-dispatch r1 (2026-10-14)"
 $script:HeavySlotHolder = $null
 $script:Admission = $null
+$script:ExemptDuringWaitOf = $null
 $script:HolderLossByJob = @{}
 $script:GateHourKey = $null
 $script:GateHour = $null
@@ -1803,6 +1808,34 @@ function Get-RecoveredAdmission {
     return [pscustomobject]$o
 }
 
+function Invoke-ExemptJobsDuringWait {
+    # Runs the light (GateExemptJobPattern) jobs waiting in inbox\ while another job sits in its gate-wait. Recovery is
+    # left to the inbox loop (never Resolve-JobRecovery here). Returns the number of jobs run.
+    param([Parameter(Mandatory = $true)][string]$WaitingJobId, [double]$WaitedSec)
+    $ran = 0
+    $exemptJobs = Get-ChildItem $inbox -Filter *.job.ps1 -File -ErrorAction SilentlyContinue | Sort-Object Name
+    foreach ($ej in $exemptJobs) {
+        $eid = $ej.BaseName -replace '\.job$', ''
+        if ($eid -eq $WaitingJobId) { continue }
+        if ($eid -notmatch $GateExemptJobPattern) { continue }
+        if ($script:RecoveryQuarantine.ContainsKey($eid)) { continue }
+        if (Get-JobRecoveryPending -JobId $eid) { continue }
+        Add-AgentLogLine "heavy-slot-gate: maint-dispatch exempt job=$eid during gate-wait of job=$WaitingJobId waited=$([int]$WaitedSec)s"
+        $script:ExemptDuringWaitOf = $WaitingJobId
+        try {
+            $null = Invoke-QueuedJob -Job $ej
+        }
+        finally {
+            # No Exit-HeavySlot: $script:HeavySlotHolder is always $null inside the wait (the waiting job's holder is the local $holder).
+            $script:ExemptDuringWaitOf = $null
+            $script:Admission = $null
+            Remove-Item Env:\MLV_AGENT_ADMISSION, Env:\MLV_AGENT_ADMISSION_THERMAL, Env:\MLV_AGENT_ADMISSION_WAIT_SEC, Env:\HEAVY_SLOT_HELD -ErrorAction SilentlyContinue
+        }
+        $ran++
+    }
+    return $ran
+}
+
 function Wait-HeavySlotAdmission {
     # Blocks until the job may start and returns the admission record. Admitted (label clear): $script:HeavySlotHolder
     # holds this job's exclusive slot until Exit-HeavySlot. Not admitted (cancelled-in-gate | queue-expired): no holder
@@ -1816,6 +1849,7 @@ function Wait-HeavySlotAdmission {
     $holder = $null
     $nextHolderAt = $t0
     $nextProbeAt = $t0
+    $nextExemptScanAt = $t0
     $lastLog = [DateTime]::MinValue
     $state = "queued"
     $why = "joining heavy-slot.py's FIFO"
@@ -1888,6 +1922,11 @@ function Wait-HeavySlotAdmission {
                 if ($null -ne $holder) { $state = "queued"; $why = "heavy-slot.py FIFO position $($v.queuePos) of $($v.queueLen); $($v.why)" }
                 Add-GateProbeRecord -JobId $JobId -Verdict $v -WaitedSec $waited -Phase "pre-job" -WaitState $state
             }
+            # maint-dispatch r1: light jobs are not held behind this wait. Capture with $null = : any output here would join the admission record this function returns.
+            if ((Get-Date) -ge $nextExemptScanAt) {
+                $null = Invoke-ExemptJobsDuringWait -WaitingJobId $JobId -WaitedSec ((Get-Date) - $t0).TotalSeconds
+                $nextExemptScanAt = (Get-Date).AddSeconds($GateProbeSec)
+            }
             if (((Get-Date) - $lastLog).TotalSeconds -ge 60) {
                 Add-AgentLogLine "heavy-slot-gate: waiting job=$JobId state=$state why=[$why] waited=$([int]$waited)s requeues=$requeues holderPid=$(if ($null -ne $holder) { $holder.pid } else { 'none' })"
                 $lastLog = Get-Date
@@ -1947,6 +1986,7 @@ function Invoke-QueuedJob {
     # r1g: a LIGHT job class is not held (it takes no slot): the venue's own quiet/load probe and agent maintenance.
     if ($jobId -match $GateExemptJobPattern) {
         $script:Admission = [pscustomobject]@{ gate = $script:GateVersion; label = "exempt-light"; state = "exempt"; waitedSec = 0; probes = 0; requeues = 0; slot = $null; thermal = $null; why = "job id matches GateExemptJobPattern ($GateExemptJobPattern): light job, not gated, holds no slot" }
+        if ($null -ne $script:ExemptDuringWaitOf) { $script:Admission | Add-Member -NotePropertyName waitingFor -NotePropertyValue $script:ExemptDuringWaitOf -Force }
         Add-AgentLogLine "heavy-slot-gate: exempt job=$jobId (light class, no slot)"
     }
     else {
@@ -2186,6 +2226,7 @@ try {
         foreach ($job in $jobs) {
             # r2d (sol r2c BLOCKER): a job with ANY unresolved marker artifact is never admitted or launched here.
             $qid = $job.BaseName -replace '\.job$', ''
+            if (-not (Test-Path -LiteralPath $job.FullName -PathType Leaf)) { continue }   # run inline during an earlier job's gate-wait (Invoke-ExemptJobsDuringWait); this listing is stale
             if ($script:RecoveryQuarantine.ContainsKey($qid)) { continue }
             if (Get-JobRecoveryPending -JobId $qid) {
                 $null = Resolve-JobRecovery -JobId $qid
