@@ -303,6 +303,53 @@ TEST(GpuDualIsoPreviewScale, PlanAdmitsX2AndX4OnlyForGpuPlaybackRecon)
     ASSERT_EQ(4, plan.scale);
 }
 
+// GPU-DEVICE-LOSS-SELF-HEAL-1 r4: a CUDA-suppressed session (device loss or safe start) keeps
+// MLVAPP_GPU_PLAYBACK_RECON=1 from the CUDA preset but has no GPU recon. Its CPU plan must be
+// the plain CPU route's (reduced x4), not the "GPU playback recon requested" full-res refusal
+// that left the fallback at 5.6-10 fps against 21.5 on Bachelor; the GPU plan must refuse.
+// Mutation: drop the llrpGpuCudaSuppressed() gate in mlv_gpu_playback_recon_requested_via_env.
+TEST(GpuDualIsoPreviewScale, CudaSuppressedSessionTakesTheCpuReducedReconPlan)
+{
+    struct SuppressedScope
+    {
+        SuppressedScope() { llrpSetGpuCudaSuppressed(1); }
+        ~SuppressedScope() { llrpSetGpuCudaSuppressed(0); }
+    };
+
+    mlvDualIsoPreviewScaleRecon_t cpuRoute;
+    {
+        GpuReconEnv env(false);
+        MlvPipelineFixture fixture;
+        ASSERT_TRUE(openGpuEligibleFixture(fixture));
+        ASSERT_FALSE(fixture.renderFrame8(0).empty());
+        ASSERT_EQ(1, mlvDualIsoPreviewScaleReconPlan(fixture.video(), 4, &cpuRoute));
+        ASSERT_EQ(4, cpuRoute.scale);
+    }
+
+    GpuReconEnv env(true);
+    MlvPipelineFixture fixture;
+    ASSERT_TRUE(openGpuEligibleFixture(fixture));
+    ASSERT_FALSE(fixture.renderFrame8(0).empty());
+    ASSERT_EQ(0, llrpGpuCudaSuppressed());
+    mlvDualIsoPreviewScaleRecon_t plan;
+    // No fault: the CUDA session's refusal is unchanged.
+    ASSERT_EQ(0, mlvDualIsoPreviewScaleReconPlan(fixture.video(), 4, &plan));
+    ASSERT_EQ(std::string("GPU playback recon requested"), std::string(plan.reason));
+    {
+        const SuppressedScope suppressed;
+        ASSERT_EQ(1, mlvDualIsoPreviewScaleReconPlan(fixture.video(), 4, &plan));
+        ASSERT_EQ(cpuRoute.scale, plan.scale);
+        ASSERT_EQ(cpuRoute.reducedWidth, plan.reducedWidth);
+        ASSERT_EQ(cpuRoute.reducedHeight, plan.reducedHeight);
+        ASSERT_EQ(std::string("none"), std::string(plan.reason));
+        ASSERT_EQ(0, mlvDualIsoGpuPreviewScaleReconPlan(fixture.video(), 4, 0, &plan));
+        ASSERT_EQ(std::string("GPU playback recon not requested"), std::string(plan.reason));
+    }
+    // Clear again (L4): back to the CUDA session's refusal.
+    ASSERT_EQ(0, mlvDualIsoPreviewScaleReconPlan(fixture.video(), 4, &plan));
+    ASSERT_EQ(std::string("GPU playback recon requested"), std::string(plan.reason));
+}
+
 // (g) igpu_recon_set_clip at new dims frees every retained output, in use or not. The C seam
 // refuses a run that needs new clip dimensions while any is outstanding.
 // Mutation: drop the guard in llrawproc_gpu_recon_run_backend and the fake's

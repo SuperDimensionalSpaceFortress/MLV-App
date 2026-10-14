@@ -314,3 +314,20 @@ TEST(GpuDeviceLossBreaker, SuppressedSessionTurnsOffGpuPreviewProcessingAtEveryP
     ASSERT_EQ(2, (int)source.count(QStringLiteral("gpuPlaybackReconEnvironmentRequested =\n"
                                                   "        playback_recon_requested_by_environment();")));
 }
+
+// r4: the suppressed session's CPU dual-ISO recon refused its reduced plan with "GPU playback recon
+// requested" (the CUDA preset's env), so it reconstructed full res: 5.6-10.0 fps against 21.5 for the
+// CPU route on Bachelor. The core reads that env in one helper, which refuses first when suppressed.
+TEST(GpuDeviceLossBreaker, SuppressedSessionCpuReconIgnoresTheGpuReconEnv)
+{
+    const QString source = readRepoFile(QStringLiteral("src/mlv/video_mlv.c"));
+    const QString read = QStringLiteral("getenv(\"MLVAPP_GPU_PLAYBACK_RECON\")");
+    ASSERT_EQ(1, (int)source.count(read));
+    const int helper = source.indexOf(QStringLiteral("static int mlv_gpu_playback_recon_requested_via_env(void)\n{\n"));
+    ASSERT_TRUE(helper >= 0);
+    const int gate = source.indexOf(QStringLiteral("    if (llrpGpuCudaSuppressed()) return 0;\n"), helper);
+    const int at = source.indexOf(read, helper);
+    ASSERT_TRUE(gate > helper);
+    ASSERT_TRUE(at > gate);
+    ASSERT_EQ(-1, source.mid(helper, at - helper).indexOf(QStringLiteral("\n}\n")));
+}
