@@ -200,6 +200,7 @@ SOURCES += \
     GpuDebayer.cpp \
     GpuDisplayViewport.cpp \
     GpuDisplayWindow.cpp \
+    GpuFieldTelemetry.cpp \
         main.cpp \
         MainWindow.cpp \
     ../../src/debayer/amaze_demosaic.c \
@@ -380,6 +381,7 @@ HEADERS += MainWindow.h \
            PlaybackNativePaceGuard.h \
            PlaybackPresentTrace.h \
            PlaybackSwapInterval.h \
+           PlaybackScopesDuringPlayback.h \
            DisplayDeviceMapping.h \
            PlaybackGatePolicy.h \
            Phase3Breadcrumbs.h \
@@ -396,6 +398,9 @@ HEADERS += MainWindow.h \
            GpuPreviewHostRoute.h \
     GpuDisplayViewport.h \
     GpuDisplayWindow.h \
+    GpuFieldTelemetry.h \
+    GpuFieldTelemetryCore.h \
+    ../../tools/gpu/igpu_cuda_error.h \
     ../../src/debayer/debayer.h \
     ../../src/debayer/helpersse2.h \
     ../../src/debayer/conv.h \

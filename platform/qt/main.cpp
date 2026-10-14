@@ -8,6 +8,7 @@
 #include "MainWindow.h"
 #include "MyApplication.h"
 #include "CrashForensics.h"
+#include "GpuFieldTelemetry.h"
 #include "Phase3Mode.h"
 #include "PlaybackFrameRange.h"
 #include "PlaybackSwapInterval.h"
@@ -1793,6 +1794,8 @@ int main(int argc, char *argv[])
 
     bool batch = hasBatchFlag(argc, argv);
     bool trim_mlv = hasTrimMlvFlag(argc, argv);
+    // GPU-FIELD-TELEMETRY-1: local GPU field log (ON unless MLVAPP_GPU_TELEMETRY=0); never in batch / trim.
+    if (!batch && !trim_mlv) GpuFieldTelemetry::install();
     bool profile_playback = hasPlaybackProfileFlag(argc, argv);
     bool gui_playback_smoke = hasGuiPlaybackSmokeFlag(argc, argv);
     const bool normal_gui =

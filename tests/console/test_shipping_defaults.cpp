@@ -2,6 +2,7 @@
 #include "../common/repo_paths.h"
 
 #include "../../platform/qt/PlaybackQualityPolicy.h"
+#include "../../platform/qt/PlaybackScopesDuringPlayback.h"
 #include "../../platform/qt/PlaybackSwapInterval.h"
 #include "../../platform/qt/ReceiptSettings.h"
 
@@ -17,16 +18,17 @@
 namespace
 {
 
-const std::array<const char *, 6> kPlaybackEnvironment = {
+const std::array<const char *, 7> kPlaybackEnvironment = {
     "MLVAPP_PLAYBACK_AGGRESSIVE_PREVIEW",
     "MLVAPP_PLAYBACK_PHASE3_UNATTENDED",
     "MLVAPP_PLAYBACK_PREFER_HQ_MEAN23",
     "MLVAPP_PLAYBACK_PREVIEW_MODE",
     "MLVAPP_PLAYBACK_QUALITY_MODE",
     "MLVAPP_PLAYBACK_SCALE_FACTOR",
+    "MLVAPP_PLAYBACK_SCOPES_DURING_PLAYBACK",
 };
 
-const std::array<const char *, 9> kPlaybackKeys = {
+const std::array<const char *, 10> kPlaybackKeys = {
     PlaybackQualitySettings::kKeyQualityMode(),
     PlaybackQualitySettings::kKeyPreviewMode(),
     PlaybackQualitySettings::kKeyScaleFactorOverride(),
@@ -36,6 +38,7 @@ const std::array<const char *, 9> kPlaybackKeys = {
     PlaybackQualitySettings::kKeyShowExperimentalPhase3Modes(),
     PlaybackQualitySettings::kKeyPhase3Acknowledged(),
     PlaybackSwapIntervalSettings::kKeyVSync(),
+    PlaybackScopesSettings::kKeyScopesDuringPlayback(),
 };
 
 class ScopedFreshPlaybackState
@@ -133,6 +136,10 @@ QJsonObject actualPlaybackDefaults()
     playback.insert(QStringLiteral("phase3Acknowledged"),
                     playbackQualityPhase3AcknowledgedFromSettings());
     playback.insert(QStringLiteral("vsync"), playbackVSyncFromSettings());
+    // PSO-01: the real startup resolution. The caller sets an inherited measurement override with the automation
+    // gate off (an ordinary launch), which must not move the fresh-install default.
+    playback.insert(QStringLiteral("scopesDuringPlayback"),
+                    enumValue("hide", static_cast<int>(playbackScopesMode())));
     playback.insert(QStringLiteral("derived"), derived);
     return playback;
 }
@@ -229,6 +236,9 @@ QJsonObject actualReceiptDefaults()
 TEST(ShippingDefaults, ManifestMatchesRuntimeDefaults)
 {
     ScopedFreshPlaybackState freshState;
+    // PSO-01: an ordinary launch that inherited the measurement override (restored by freshState).
+    ASSERT_FALSE(automation_settings::isolated());
+    qputenv("MLVAPP_PLAYBACK_SCOPES_DURING_PLAYBACK", QByteArrayLiteral("live"));
     const QJsonObject root = loadManifest();
     ASSERT_EQ(std::string("mlvapp.shipping-defaults.v1"),
               root.value(QStringLiteral("schema")).toString().toStdString());

@@ -1629,7 +1629,7 @@ function Get-AttrCudaLegTimeBudget {
         [ValidateRange(0, 3600)][int]$RunnerSlackSeconds = 30,
         [ValidateRange(0, 7200)][int]$FixedPreLaunchSeconds = $script:AttrCudaMeasuredFixedPreLaunchSeconds,
         [ValidateRange(0, 7200)][int]$PostRunSeconds = $script:AttrCudaAllowancePostRunSeconds,
-        # CPU-LEG-SMOKE-CEILING-1: set ONLY for a CPU-informational leg (its Play may run to 765 s). See the clamp below. Never set for CUDA; a fixture CPU leg passes it but has no input bytes, so it never clamps.
+        # CPU-LEG-SMOKE-CEILING-1 / HFR-NATIVE-M16-1457-TIMEBUDGET-1: the generator sets it for EVERY backend (the job's own margined identity read precedes the runner on all of them). See the clamp below. A fixture leg passes it but has no input bytes, so it never clamps; an input that fits the unshared budget is unchanged.
         [switch]$ShareSmokeCeiling
     )
 

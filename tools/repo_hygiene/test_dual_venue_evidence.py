@@ -111,12 +111,26 @@ UPSTREAM_BASELINE_LEGS = tuple(f"legs/m16-1243-upstream-baseline-cpu-{mode}-s1.j
 PTRACE_LEGS = {"legs/m16-1243-display-fullscreen-s4-ptrace.json": "legs/m16-1243-display-fullscreen-s4.json"}
 # PLAYBACK-VISUAL-INSPECTION-1: the window-capture proof leg, a SPEED leg (windowed, scale 2) that names no visualCapture: absent means on.
 VISUAL_LEGS = ("legs/m16-1243-speed-windowed-s2.json",)
+# PLAYBACK-SCOPES-OPTION-1: the windowed scale-1 no-look scope matrix, per backend: N (no scope), T (histogram at the app's default throttle) and
+# F (histogram at scopeIntervalMs 0, upstream's every frame), plus one optional waveform F arm on cuda. Each scope arm differs from its backend's N
+# leg only in its legId and the scope fields of generatorArgs. r4 (PSO-01): every scope arm pins scopesDuringPlayback throttled, the mode the
+# r1-r3 arms measured on the pre-setting staged build (the fork throttle; i0 is that throttle at base 0), so a Hide-default build cannot turn a
+# T or F arm into N.
+SCOPE_ARMS = {"histogram": {"scope": "histogram", "scopesDuringPlayback": "throttled"},
+              "histogram-i0": {"scope": "histogram", "scopeIntervalMs": 0, "scopesDuringPlayback": "throttled"}}
+SCOPE_LEGS = {f"legs/m16-1243-scopes-{backend}-windowed-s1-{arm}.json": (backend, extra)
+              for backend in ("cpu", "cuda") for arm, extra in (("none", {}), *SCOPE_ARMS.items())}
+SCOPE_LEGS["legs/m16-1243-scopes-cuda-windowed-s1-waveform-i0.json"] = (
+    "cuda", {"scope": "waveform", "scopeIntervalMs": 0, "scopesDuringPlayback": "throttled"})
+# PLAYBACK-SCOPES-OPTION-1 r3: the Look-Assist-ON twins of the N and T arms (the shipping default is Look Assist on): the no-look twin with
+# generatorArgs.forceLookAssist true (a capture-free pace leg at the default Classic flavor) in place of disableLookAssist true.
+SCOPE_LA_LEGS = tuple(f"legs/m16-1243-scopes-{backend}-windowed-s1-{arm}-la.json" for backend in ("cpu", "cuda") for arm in ("none", "histogram"))
 # LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1 added the scale-2 Cinematic twin of the scale-2 look leg (the Bachelor CPU Classic | Cinematic look pair).
 SHIPPED_LEGS = ("legs/m16-1243-speed.json", "legs/m16-1243-look.json", "legs/m16-1243-look-scale2.json", "legs/m16-1243-look-cinematic.json", *DISPLAY_MATRIX_LEGS, *PACE_LEGS,
                 *LOOKAHEAD_LEGS, *HEAVY_LEGS, *DECODER_LEGS, "legs/m16-1243-look-scale2-cinematic.json", "legs/m16-1243-look-film.json",
                 "legs/m16-1243-look-scale2-film.json", *(f"legs/m16-1243-look-scale2-{flavor}-agxoff.json" for flavor in ("cinematic", "film")),
                 *(f"legs/m16-1243-display-{mode}-s{scale}-vsync1.json" for scale in (1, 2, 4) for mode in ("fullscreen", "windowed")),
-                *CPU_REDUCED_LEGS, *UPSTREAM_BASELINE_LEGS, *PTRACE_LEGS, *VISUAL_LEGS)
+                *CPU_REDUCED_LEGS, *UPSTREAM_BASELINE_LEGS, *PTRACE_LEGS, *VISUAL_LEGS, *SCOPE_LEGS, *SCOPE_LA_LEGS)
 # PLAYBACK-VSYNC-DEFAULT-1: the swap-interval-1 twins of the six display-matrix legs (the vsync A/B; the originals stay at the app's default 0).
 VSYNC1_LEGS = tuple(rel.replace(".json", "-vsync1.json") for rel in DISPLAY_MATRIX_LEGS)
 # LOOK-ASSIST-FILM-FLAVOR-2 r2: the AgX-off twins of the scale-2 Cinematic and Film legs carry a committed look receipt (look-receipts/agx-off.marxml).
@@ -605,6 +619,64 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
                         "the mapping must sit outside the forceLookAssist branch")
         schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
         self.assertEqual(schema["properties"]["generatorArgs"]["properties"]["disableLookAssist"]["type"], "boolean")
+
+    def test_the_scope_and_its_interval_reach_the_job_only_when_asked(self) -> None:
+        """PLAYBACK-SCOPES-OPTION-1: -Scope <name> swaps the smoke command's one '-Scope none' for the named scope, and -ScopeIntervalMs <n> adds
+        MLVAPP_PLAYBACK_SCOPE_INTERVAL_MS=<n> to the app's env list; absent (or -Scope none) the job is the default byte for byte. The runner maps a
+        leg's generatorArgs.scope / scopeIntervalMs for any leg, and the schema bounds both."""
+        base = ["-Backend", "cpu", "-ScaleFactor", "1", "-DisplayMode", "windowed", "-DisableLookAssist"]
+        default = self.generate(GENERATOR, "sc-default.job.ps1", base)
+        plain = default.read_text(encoding="utf-8")
+        self.assertEqual(plain.count(" -Scope none "), 1)
+        self.assertNotIn("MLVAPP_PLAYBACK_SCOPE_INTERVAL_MS", plain)
+        explicit_none = self.generate(GENERATOR, "sc-none.job.ps1", [*base, "-Scope", "none"])
+        self.assertEqual(explicit_none.read_bytes(), default.read_bytes(), "-Scope none is the default job, byte for byte")
+        hist = self.generate(GENERATOR, "sc-hist.job.ps1", [*base, "-Scope", "histogram"])
+        self.assertEqual(self.parse_errors(hist), 0)
+        text = hist.read_text(encoding="utf-8")
+        self.assertEqual(text.count("-DisableLookAssist -Scope histogram "), 1)
+        self.assertEqual(text.replace(" -Scope histogram ", " -Scope none "), plain, "the scope is the only difference from the default job")
+        both = self.generate(GENERATOR, "sc-hist-i0.job.ps1", [*base, "-Scope", "histogram", "-ScopeIntervalMs", "0"])
+        self.assertEqual(self.parse_errors(both), 0)
+        both_text = both.read_text(encoding="utf-8").replace("\r\n", "\n")
+        line = "    'MLVAPP_PLAYBACK_SCOPE_INTERVAL_MS=0',\n"
+        self.assertIn("'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',\n" + line, both_text)
+        self.assertEqual(both_text.replace(line, ""), text.replace("\r\n", "\n"), "the interval line is the only difference from the scope-only job")
+        cuda = self.generate(GENERATOR, "sc-cuda.job.ps1", ["-ScaleFactor", "1", "-DisplayMode", "windowed", "-DisableLookAssist", "-Scope", "waveform"])
+        self.assertEqual(self.parse_errors(cuda), 0)
+        self.assertEqual(cuda.read_text(encoding="utf-8").count(" -Scope waveform -FrameTelemetry"), 1)
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        for mapping in ("if ($spec.generatorArgs.PSObject.Properties['scope']) { $gen['Scope'] = [string]$spec.generatorArgs.scope }",
+                        "if ($spec.generatorArgs.PSObject.Properties['scopeIntervalMs']) { $gen['ScopeIntervalMs'] = [int]$spec.generatorArgs.scopeIntervalMs }"):
+            self.assertIn(mapping, runner)
+            self.assertLess(runner.index(mapping), runner.index("if (-not $isLook -and $spec.generatorArgs.PSObject.Properties['forceLookAssist']"),
+                            "the mapping must sit outside the forceLookAssist branch")
+        schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
+        props = schema["properties"]["generatorArgs"]["properties"]
+        self.assertEqual(props["scope"]["enum"], ["none", "histogram", "waveform", "parade", "vectorscope"])
+        self.assertEqual((props["scopeIntervalMs"]["type"], props["scopeIntervalMs"]["minimum"], props["scopeIntervalMs"]["maximum"]), ("integer", 0, 1000))
+
+    def test_the_scopes_mode_reaches_the_job_only_when_asked(self) -> None:
+        """PLAYBACK-SCOPES-OPTION-1 r4 (PSO-01): -ScopesDuringPlayback <mode> adds MLVAPP_PLAYBACK_SCOPES_DURING_PLAYBACK=<mode> to the app's env
+        list (the app honours it only in an automation run, which the smoke is); absent the job is the default byte for byte. The runner maps a
+        leg's generatorArgs.scopesDuringPlayback for any leg, and the schema admits only the three modes."""
+        base = ["-Backend", "cpu", "-ScaleFactor", "1", "-DisplayMode", "windowed", "-DisableLookAssist", "-Scope", "histogram"]
+        scope_only = self.generate(GENERATOR, "sm-scope.job.ps1", base).read_text(encoding="utf-8").replace("\r\n", "\n")
+        self.assertNotIn("MLVAPP_PLAYBACK_SCOPES_DURING_PLAYBACK", scope_only)
+        pinned = self.generate(GENERATOR, "sm-throttled.job.ps1", [*base, "-ScopesDuringPlayback", "throttled"])
+        self.assertEqual(self.parse_errors(pinned), 0)
+        pinned_text = pinned.read_text(encoding="utf-8").replace("\r\n", "\n")
+        line = "    'MLVAPP_PLAYBACK_SCOPES_DURING_PLAYBACK=throttled',\n"
+        self.assertIn("'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',\n" + line, pinned_text)
+        self.assertEqual(pinned_text.replace(line, ""), scope_only, "the mode line is the only difference from the scope-only job")
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        mapping = ("if ($spec.generatorArgs.PSObject.Properties['scopesDuringPlayback']) "
+                   "{ $gen['ScopesDuringPlayback'] = [string]$spec.generatorArgs.scopesDuringPlayback }")
+        self.assertIn(mapping, runner)
+        self.assertLess(runner.index(mapping), runner.index("if (-not $isLook -and $spec.generatorArgs.PSObject.Properties['forceLookAssist']"),
+                        "the mapping must sit outside the forceLookAssist branch")
+        schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
+        self.assertEqual(schema["properties"]["generatorArgs"]["properties"]["scopesDuringPlayback"]["enum"], ["hide", "throttled", "live"])
 
     def test_the_raw_prefetch_decoder_count_reaches_the_job_only_when_asked(self) -> None:
         """PLAYBACK-LJ92-DECODE-THROUGHPUT-1: generatorArgs.rawPrefetchDecoders maps to -RawPrefetchDecoders for any leg (not only a forced-look
@@ -5559,6 +5631,45 @@ class LegSpecSchemaTests(unittest.TestCase):
             self.assertEqual(arm["legId"], twin["legId"] + "-ptrace", rel)
             self.assertIs(arm["generatorArgs"].pop("presentTrace"), True, rel)
             self.assertEqual(dict(arm, legId=twin["legId"]), twin, rel)
+
+    def test_the_scope_legs_are_no_look_windowed_s1_speed_legs_differing_only_in_scope(self) -> None:
+        """PLAYBACK-SCOPES-OPTION-1: every scope leg is a single-backend no-look SPEED leg at windowed scale 1 (LIGHT, the 95 % quiescence gate,
+        informational criteria), and each scope arm is its backend's N leg plus only the scope fields."""
+        for rel, (backend, extra) in SCOPE_LEGS.items():
+            spec = json.loads((DV / rel).read_text(encoding="utf-8"))
+            self.jsonschema.validate(spec, self.schema)
+            self.assertEqual(spec["legId"], Path(rel).stem, rel)
+            self.assertEqual(spec["card"], "PLAYBACK-SCOPES-OPTION-1", rel)
+            self.assertEqual((spec["legType"], spec["clipId"], spec["playSeconds"], spec["backends"], spec["scaleFactor"], spec["displayMode"]),
+                             ("speed", "M16-1243", 25, [backend], 1, "windowed"), rel)
+            self.assertEqual(spec["criteria"], {"acceptance": {backend: []}, "supplementary": {backend: []}}, rel)
+            self.assertNotIn("look", spec, rel)
+            none = json.loads((DV / f"legs/m16-1243-scopes-{backend}-windowed-s1-none.json").read_text(encoding="utf-8"))
+            self.assertEqual(none["generatorArgs"], {"telemetryArm": "LIGHT", "cpuQuiescenceThresholdPercent": 95, "disableLookAssist": True})
+            self.assertEqual(spec["generatorArgs"], {**none["generatorArgs"], **extra}, rel)
+            self.assertEqual(dict(spec, legId=none["legId"], generatorArgs=none["generatorArgs"]), none, rel)
+        for bad_value in ({"scope": "histo"}, {"scopeIntervalMs": -1}, {"scopeIntervalMs": 1001}, {"scopeIntervalMs": "0"},
+                          {"scopesDuringPlayback": "off"}, {"scopesDuringPlayback": "Live"}):
+            bad = json.loads((DV / "legs/m16-1243-scopes-cpu-windowed-s1-none.json").read_text(encoding="utf-8"))
+            bad["generatorArgs"].update(bad_value)
+            with self.assertRaises(self.jsonschema.ValidationError, msg=repr(bad_value)):
+                self.jsonschema.validate(bad, self.schema)
+
+    def test_the_scope_la_legs_are_the_no_look_twins_with_look_assist_forced_on(self) -> None:
+        """PLAYBACK-SCOPES-OPTION-1 r3: each -la leg is its no-look twin with only legId, forceLookAssist (not disableLookAssist) and the
+        lookAssistForced criterion changed, so the LA-on and LA-off arms measure the same thing but for Look Assist."""
+        for rel in SCOPE_LA_LEGS:
+            spec = json.loads((DV / rel).read_text(encoding="utf-8"))
+            self.jsonschema.validate(spec, self.schema)
+            self.assertEqual(spec["legId"], Path(rel).stem, rel)
+            backend = spec["backends"][0]
+            twin = json.loads((DV / rel.replace("-la.json", ".json")).read_text(encoding="utf-8"))
+            self.assertIs(spec["generatorArgs"].pop("forceLookAssist"), True, rel)
+            self.assertIs(twin["generatorArgs"].pop("disableLookAssist"), True, rel)
+            self.assertEqual(spec["generatorArgs"], twin["generatorArgs"], rel)
+            gate = {"metric": "lookAssistForced", "op": "eq", "value": True}
+            self.assertEqual(spec["criteria"], {"acceptance": {backend: [gate]}, "supplementary": {backend: [gate]}}, rel)
+            self.assertEqual(dict(spec, legId=twin["legId"], generatorArgs=twin["generatorArgs"], criteria=twin["criteria"]), twin, rel)
 
     def test_the_hand_listed_shipped_legs_are_exactly_the_legs_directory(self) -> None:
         self.assertEqual(sorted(SHIPPED_LEGS), sorted("legs/" + p.name for p in (DV / "legs").glob("*.json")), "SHIPPED_LEGS drifted from the legs/ directory")
