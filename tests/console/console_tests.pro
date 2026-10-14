@@ -76,6 +76,7 @@ SOURCES += \
     $$REPO_ROOT/tests/console/test_playback_swap_interval.cpp \
     $$REPO_ROOT/tests/console/test_cuda_launch_timing.cpp \
     $$REPO_ROOT/tests/console/test_gpu_field_telemetry.cpp \
+    $$REPO_ROOT/tests/console/test_gpu_launch_budget.cpp \
     $$REPO_ROOT/tests/console/test_playback_present_trace.cpp
 
 HEADERS += \
@@ -119,6 +120,7 @@ HEADERS += \
     $$REPO_ROOT/platform/qt/GpuTexturePresentAvailabilityPolicy.h \
     $$REPO_ROOT/platform/qt/DisplayDeviceMapping.h \
     $$REPO_ROOT/tools/gpu/backend/igpu_launch_timing_format.h \
+    $$REPO_ROOT/tools/gpu/backend/igpu_launch_budget.h \
     $$REPO_ROOT/platform/qt/GpuFieldTelemetryCore.h
 
 win32{
