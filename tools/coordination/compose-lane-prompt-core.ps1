@@ -37,7 +37,8 @@ $script:KnownFieldLabels = @(
 
 # Both literals pinned by plan 0.35 / O153 / S122, verbatim from product-card-TEMPLATE.md's
 # COMPOSER CONTRACT comment. Never retype these from memory - re-derive from the template.
-$script:PrStepLaneCanOpenPr = 'gh pr create -R layibabalola/MLV-App --head {{BRANCH}} --title "<card id>: <subject>" --body "<what, why, red run, green run>"; then print PR-OPENED: <number> as your last line.'
+. (Join-Path $PSScriptRoot 'repo-slug.ps1')
+$script:PrStepLaneCanOpenPr = 'gh pr create -R ' + (Get-MlvRepoSlug) + ' --head {{BRANCH}} --title "<card id>: <subject>" --body "<what, why, red run, green run>"; then print PR-OPENED: <number> as your last line.'
 $script:PrStepOtherwise = 'Do NOT call gh. Print PUSHED: {{BRANCH}} <head sha> as your last line; the dispatcher opens the PR.'
 
 function Get-PrStepLiteral {

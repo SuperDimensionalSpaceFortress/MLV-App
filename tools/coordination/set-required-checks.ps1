@@ -1,7 +1,7 @@
 #requires -Version 7.2
 <#
 .SYNOPSIS
-Preview or apply the receipt-gated Phase 0.4b transition on layibabalola/MLV-App.
+Preview or apply the receipt-gated Phase 0.4b transition on SuperDimensionalSpaceFortress/MLV-App.
 .DESCRIPTION
 Default: validate local prerequisites and print the exact proposed body, with no
 network calls or writes. -Apply additionally requires the merged actor receipt,
@@ -19,7 +19,7 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 if (-not $ReceiptsDir) { $ReceiptsDir = Join-Path $BoardRoot '.claude-state/coordination/dual-lane/receipts' }
-$endpoint = 'repos/layibabalola/MLV-App/branches/master/protection/required_status_checks'
+$endpoint = 'repos/SuperDimensionalSpaceFortress/MLV-App/branches/master/protection/required_status_checks'
 $contexts = @('Repo Hygiene Python (windows-latest)', 'Repo Hygiene Python (ubuntu-latest)',
               'Batch Compile', 'Windows GUI Pilot', 'Windows Product Oracles')
 $legacy = @($contexts | ForEach-Object { if ($_ -ceq 'Batch Compile') { 'Factory Bridge Regressions' } else { $_ } })
