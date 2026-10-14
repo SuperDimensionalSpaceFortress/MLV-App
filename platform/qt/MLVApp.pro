@@ -390,6 +390,7 @@ HEADERS += MainWindow.h \
            PlaybackEnvFlags.h \
            PlaybackWorkerJoin.h \
            PlaybackPresentTrace.h \
+           PlaybackSlotRelease.h \
            PlaybackSwapInterval.h \
            PlaybackScopesDuringPlayback.h \
            DisplayDeviceMapping.h \
