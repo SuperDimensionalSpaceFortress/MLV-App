@@ -4878,6 +4878,27 @@ class VenueQuietUnknownIsNotUnmetTests(unittest.TestCase):
         self.assertRegex(proc.stdout, r"(?m)^COOLDOWN_UNMET mean=50\.0% threshold=20(\.0)?% waitedSec=\d+$")
         self.assertNotIn("VENUE_QUIET_UNKNOWN", proc.stdout)
 
+    # CPU-SCOPE-LIVE-HEAP-CORRUPTION-1: a marker record the agent SET ASIDE ('.stale-<ticks>' / '.corrupt-<ticks>') is not a running job.
+    def test_a_set_aside_marker_record_does_not_hold_the_gate_busy(self) -> None:
+        running = self.tmp / "share-bachelor" / "running"
+        (running / "dve-x.started.json.d49877b02a3243aa941ee56642f74291.tmp.stale-639275292076772648").write_text("{}", encoding="utf-8")
+        (running / "dve-y.started.json.tmp.corrupt-639275292076772649").write_text("{", encoding="utf-8")
+        proc = self.gate("samples", "[5, 5, 5]")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("queued=0 running=0", proc.stdout)
+        self.assertRegex(proc.stdout, r"(?m)^QUIET mean=5\.0% ")
+
+    def test_a_live_marker_or_an_unresolved_tmp_still_holds_the_gate_busy(self) -> None:
+        running = self.tmp / "share-bachelor" / "running"
+        for name in ("dve-x.started.json", "dve-y.started.json.d49877b02a3243aa941ee56642f74291.tmp"):
+            marker = running / name
+            marker.write_text("{}", encoding="utf-8")
+            proc = self.gate("samples", "[5, 5, 5]")
+            self.assertIn("queued=0 running=1", proc.stdout, name)
+            self.assertRegex(proc.stdout, r"(?m)^GATE_BUSY ", name)
+            self.assertNotRegex(proc.stdout, r"(?m)^QUIET ", name)
+            marker.unlink()
+
 
 # ---------------------------------------------------------------------------------------------------
 # VENUE-QUIET-ATTRIBUTION-1: the probe job reports schema v2 -- the v1 fields plus WHAT is using the venue (top 10 \Process(*) instances as percent of the whole machine,
