@@ -9,7 +9,9 @@ param(
     # block, which pins exactly the surface this agent uses. A mismatch is reported in the output, not failed.
     [string]$ExpectHeavySlotSha256Prefix = '113D1F610C90F374',
     [switch]$UnitOnly,
-    [string[]]$Only = @()
+    [string[]]$Only = @(),
+    # Overrides the agent under test (the RED run points this at a copy of the base agent).
+    [string]$AgentScript = ''
 )
 
 # AGENT-HEAVY-SLOT-WAIT-RELEASE-1 r1c: the Bachelor agent's heavy-slot gate
@@ -27,13 +29,13 @@ param(
 # Prints one JSON object with status PASS, or throws. No playback, no venue: everything is local and private.
 
 $ErrorActionPreference = 'Stop'
-$agentScript = Join-Path $RepoRoot 'tools\profiling\bachelor\ultra-magnus-agent.ps1'
+$agentScript = if ($AgentScript) { $AgentScript } else { Join-Path $RepoRoot 'tools\profiling\bachelor\ultra-magnus-agent.ps1' }
 $results = [ordered]@{}
 
 function Assert-True([bool]$Condition, [string]$Message) { if (-not $Condition) { throw "FAIL: $Message" } }
 # Under `pwsh -File`, -Only a,b arrives as ONE string "a,b": split it, and refuse a name that selects nothing, so a
 # typo can never turn into a PASS with no case run.
-$caseNames = @('waiting', 'fifo', 'heat', 'requeue', 'cancel', 'restart', 'exempt')
+$caseNames = @('waiting', 'fifo', 'heat', 'requeue', 'cancel', 'restart', 'exempt', 'maint')
 $Only = @($Only | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 foreach ($n in $Only) { if ($caseNames -notcontains $n) { throw "unknown case '$n' (known: $($caseNames -join ', '))" } }
 function Want([string]$Name) { return ($Only.Count -eq 0 -or $Only -contains $Name) }
@@ -122,7 +124,7 @@ $unit.ownerCheck = [ordered]@{ foreignOwner = $vTaken.state; otherPid = $vPid.st
 
 # r2: sol's exact repro, through the agent's REAL Wait-HeavySlotAdmission / Get-HeavySlotHolderState /
 # Test-HeavySlotHolderHeld / Confirm-HeavySlotHeldForLaunch, with the holder process, status and feed mocked.
-foreach ($name in @('Read-JsonFile', 'Get-HeavySlotHolderState', 'Test-HeavySlotHolderHeld', 'Add-HeavySlotHolderLoss', 'Add-HeavySlotHolderLossToAdmission', 'Wait-HeavySlotAdmission', 'Confirm-HeavySlotHeldForLaunch')) {
+foreach ($name in @('Read-JsonFile', 'Get-HeavySlotHolderState', 'Test-HeavySlotHolderHeld', 'Add-HeavySlotHolderLoss', 'Add-HeavySlotHolderLossToAdmission', 'Wait-HeavySlotAdmission', 'Confirm-HeavySlotHeldForLaunch', 'Invoke-ExemptJobsDuringWait')) {
     $fn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $true)
     Assert-True ($null -ne $fn) "agent defines $name"
     . ([scriptblock]::Create($fn.Extent.Text))
@@ -209,8 +211,36 @@ try {
     $preNone = Confirm-HeavySlotHeldForLaunch -JobId 'j1'
     Assert-True (-not $preNone.ok -and $preNone.reason -eq 'holder-lost') "pre-launch: no admitted holder is refused"
     $unit.holderLost.preLaunch = [ordered]@{ exitDuringProbe = $pre.reason; ownerMismatch = $preMismatch.reason; statusUnknown = $preUnknown.reason }
+
+    # 4. maint-dispatch r1: a job in its gate-wait runs the exempt (light) jobs waiting in inbox\ -- and only those -- in
+    #    Name order, once per scan. The waiting job, an ordinary job, a quarantined job and a recovery-pending job are
+    #    untouched, and the stray output of the dispatched job must not join the admission record the wait returns.
+    $inbox = Join-Path $mockDir 'inbox'
+    $mdProcessed = Join-Path $mockDir 'processed'
+    New-Item -ItemType Directory -Force -Path $inbox, $mdProcessed | Out-Null
+    $GateExemptJobPattern = [string]$paramDefaults['GateExemptJobPattern']
+    $script:RecoveryQuarantine = @{ 'agent-swap-Q' = 'q' }
+    $script:ExemptDuringWaitOf = $null
+    function Get-JobRecoveryPending { param($JobId) if ($JobId -eq 'dve-p-health') { 'pending' } else { $null } }
+    function Invoke-QueuedJob {
+        param($Job)
+        $script:Mock.dispatched += @($Job.BaseName -replace '\.job$', '')
+        Move-Item -LiteralPath $Job.FullName -Destination $mdProcessed
+        Write-Output 'stray'
+    }
+    foreach ($n in @('j1', 'jO', 'agent-swap-U1', 'venue-quiet-probe-U2', 'agent-swap-Q', 'dve-p-health')) { [IO.File]::WriteAllText((Join-Path $inbox "$n.job.ps1"), '# mock') }
+    Reset-Mock "1:$PID" @("slot 1: mlv j1 (pid $PID, since 2026-10-11 18:00:00) [exclusive]", 'slot 2: suite X (pid 77, since 2026-10-11 18:00:01) [exclusive]') $false
+    $adm = Wait-HeavySlotAdmission -JobId 'j1' -Job ([pscustomobject]@{}) -Metadata ([pscustomobject]@{ maxQueueAgeSec = 1 })
+    $dispatched = @($script:Mock.dispatched)
+    Assert-True (($dispatched -join ',') -eq 'agent-swap-U1,venue-quiet-probe-U2') "maint-dispatch: exactly the two eligible light jobs ran, in Name order: [$($dispatched -join ',')]"
+    foreach ($n in @('j1', 'jO', 'agent-swap-Q', 'dve-p-health')) { Assert-True (Test-Path -LiteralPath (Join-Path $inbox "$n.job.ps1") -PathType Leaf) "maint-dispatch: $n was left in inbox\" }
+    Assert-True ($adm -isnot [array] -and $adm.label -eq 'queue-expired') "maint-dispatch: the wait returns ONE admission object (the dispatched job's output is not part of it): $(@($adm).Count) item(s), label $($adm.label)"
+    Assert-True (@($script:Mock.log | Where-Object { $_ -match '^heavy-slot-gate: maint-dispatch exempt job=' }).Count -eq 2) "maint-dispatch: two maint-dispatch log lines"
+    Assert-True ($null -eq $script:ExemptDuringWaitOf) "maint-dispatch: the during-wait marker is cleared"
+    $unit.maintDispatch = [ordered]@{ dispatched = $dispatched; singleObject = ($adm -isnot [array]); label = $adm.label }
 }
 finally {
+    Remove-Item Function:\Invoke-QueuedJob, Function:\Get-JobRecoveryPending -ErrorAction SilentlyContinue
     $script:HeavySlotHolder = $null
     $script:Admission = $null
     Remove-Item -LiteralPath $mockDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -464,6 +494,40 @@ try {
         $r = Wait-Result $c 'venue-quiet-probe-1' 30
         Assert-True ($null -ne $r -and $r.admission.label -eq 'exempt-light' -and $r.stdout -match 'HELD=\r?\n' -and (Get-Tickets $c).Count -eq 0) "G: a light probe runs unheld, with no ticket"
         $results.exempt = [ordered]@{ pass = $true; admission = $r.admission.label }
+        Stop-Agent $c
+    }
+
+    # H. maint-dispatch: while an ordinary job waits (unknown feed: it re-queues forever), the light jobs behind it are
+    #    run from inside its gate-wait; the ordinary jobs keep their order; a stale inbox listing never re-runs a job.
+    if (Want 'maint') {
+        $c = New-Case 'maint'
+        Write-Feed $c.feed (1..10 | % { 60 }) (1..10 | % { $false })
+        Start-Agent $c
+        Submit-Job $c 'jW1' $probeBody
+        $waiting = Wait-Until { (Get-Heartbeat $c) -match 'gate-wait job=jW1 ' } 30
+        Assert-True $waiting "H: jW1 is in its gate-wait (heartbeat)"
+        Submit-Job $c 'jW2' $probeBody
+        Submit-Job $c 'agent-swap-M1' $probeBody
+        Submit-Job $c 'venue-quiet-probe-M2' $probeBody
+        $m1 = Wait-Result $c 'agent-swap-M1' 20
+        Assert-True ($null -ne $m1 -and $m1.admission.label -eq 'exempt-light' -and $m1.admission.waitingFor -eq 'jW1' -and $m1.stdout -match 'HELD=\r?\n') "H1: agent-swap-M1 ran during jW1's gate-wait: $($m1.admission | ConvertTo-Json -Compress)"
+        $m2 = Wait-Result $c 'venue-quiet-probe-M2' 20
+        Assert-True ($null -ne $m2 -and $m2.admission.label -eq 'exempt-light' -and $m2.admission.waitingFor -eq 'jW1' -and $m2.stdout -match 'HELD=\r?\n') "H2: venue-quiet-probe-M2 ran during jW1's gate-wait: $($m2.admission | ConvertTo-Json -Compress)"
+        $m1Sha = (Get-FileHash -LiteralPath (Join-Path $c.root 'outbox\agent-swap-M1.result.json') -Algorithm SHA256).Hash
+        $w1Marker = Get-Content -LiteralPath (Join-Path $c.root 'running\jW1.started.json') -Raw | ConvertFrom-Json
+        Assert-True ($null -eq (Get-Result $c 'jW1') -and $null -eq (Get-Result $c 'jW2')) "H3: neither ordinary job has a result"
+        Assert-True ($w1Marker.phase -eq 'admission-wait' -and $null -eq $w1Marker.childPid) "H3: jW1 is still claimed (admission-wait, no child)"
+        Assert-True (-not (Test-Path -LiteralPath (Join-Path $c.root 'running\jW2.started.json'))) "H3: jW2 was not claimed (ordinary order kept)"
+        Assert-True (@(Get-Tickets $c | Where-Object { $_.label -eq 'mlv jW2' }).Count -eq 0) "H3: jW2 holds no heavy-slot.py ticket"
+        Write-CleanFeed $c.feed
+        $w1 = Wait-Result $c 'jW1' 60
+        $w2 = Wait-Result $c 'jW2' 60
+        Assert-True ($null -ne $w1 -and $null -ne $w2 -and $w1.admission.label -eq 'clear' -and $w2.admission.label -eq 'clear') "H4: jW1 and jW2 both ran, admission clear"
+        Assert-True ([DateTimeOffset]$w1.endedUtc -le [DateTimeOffset]$w2.startedUtc) "H4: jW1 finished before jW2 started (ordinary FIFO order kept): $($w1.endedUtc) vs $($w2.startedUtc)"
+        $m1ShaAfter = (Get-FileHash -LiteralPath (Join-Path $c.root 'outbox\agent-swap-M1.result.json') -Algorithm SHA256).Hash
+        $exemptLines = @(Get-Content -LiteralPath (Join-Path $c.root 'logs\agent.log') | Where-Object { $_ -match 'heavy-slot-gate: exempt job=agent-swap-M1' })
+        Assert-True ($m1Sha -eq $m1ShaAfter -and $exemptLines.Count -eq 1) "H5: agent-swap-M1 ran once and its result was not republished (stale listing guard): sha same=$($m1Sha -eq $m1ShaAfter), exempt lines=$($exemptLines.Count)"
+        $results.maint = [ordered]@{ pass = $true; swapAdmission = $m1.admission; probeAdmission = $m2.admission; jW1Ended = $w1.endedUtc; jW2Started = $w2.startedUtc; swapResultSha256 = $m1Sha; exemptLogLines = $exemptLines.Count }
         Stop-Agent $c
     }
 
