@@ -26,8 +26,13 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "qmake failed (exit $LASTEXITCODE)" }
     # An exe left by an earlier successful build must not satisfy the check below after a failed compile.
     if (Test-Path 'release\qscreen-probe.exe') { Remove-Item -LiteralPath 'release\qscreen-probe.exe' -Force }
-    mingw32-make -j8 release 2>&1 | Where-Object { $_ -match 'error' }
-    if ($LASTEXITCODE -ne 0) { throw "mingw32-make failed (exit $LASTEXITCODE)" }
+    # BUILD-GUARD-1: host-global build gate (memory floor, one slot, -j4 or -j2) instead of a fixed job count.
+    . (Join-Path $here '..\..\coordination\build-guard.ps1') -Library
+    Invoke-BuildGuard -Label 'qscreen-probe' -Action {
+        param($Jobs)
+        mingw32-make "-j$Jobs" release 2>&1 | Where-Object { $_ -match 'error' }
+        if ($LASTEXITCODE -ne 0) { throw "mingw32-make failed (exit $LASTEXITCODE)" }
+    }
     if (-not (Test-Path 'release\qscreen-probe.exe')) { throw 'qscreen-probe.exe was not built' }
     $min = Join-Path $sc 'min'
     New-Item -ItemType Directory (Join-Path $min 'platforms') -Force | Out-Null
