@@ -147,6 +147,8 @@ $t=$env:MLV_FIXTURE_CHILD+'.tmp';@{pid=$PID;createdUtc=$me.StartTime.ToUniversal
 $args|ConvertTo-Json|Set-Content -Encoding utf8NoBOM $env:MLV_FIXTURE_ARGS
 $env:CLAUDE_CODE_EFFORT_LEVEL|Set-Content -Encoding utf8NoBOM $env:MLV_FIXTURE_EFFORT
 $env:CLAUDE_CODE_DISABLE_BACKGROUND_TASKS|Set-Content -Encoding utf8NoBOM $env:MLV_FIXTURE_BGTASKS
+# LANE-PROMPT-ENV-DIRECT-DISPATCH-1: records the MLV_LANE_PROMPT the hook's NA-4 would read in this child (env-gated; no other test reads it).
+if($env:MLV_FIXTURE_LANEPROMPT){[string]$env:MLV_LANE_PROMPT|Set-Content -Encoding utf8NoBOM $env:MLV_FIXTURE_LANEPROMPT}
 # LANE-NO-BACKGROUND-END-TURN-1 round 2: simulate a lane that edits a tracked file WITHOUT
 # committing (env-gated no-op for every other test).
 if($env:MLV_FIXTURE_DIRTY_TRACKED_PATH){
@@ -271,6 +273,7 @@ def prepare(tree, mode, assignment_failure=False, editing=False, allowed_tools="
       "MLV_FIXTURE_GRAND_SCRIPT":str(tree["grand"]),"MLV_FIXTURE_ARGS":str(root/"args.json"),
       "MLV_FIXTURE_PROMPT":str(root/"prompt.txt"),"MLV_FIXTURE_EFFORT":str(root/"effort.txt"),
       "MLV_FIXTURE_BGTASKS":str(root/"bgtasks.txt"),"MLV_FIXTURE_MCP_ARGS":str(root/"mcp-args.json"),
+      "MLV_FIXTURE_LANEPROMPT":str(root/"laneprompt.txt"),
       # Round 10 (sol major 1b): pinned here, not left to whatever Python the launcher's own
       # known-locations/PATH search happens to find on the machine running this suite -- this
       # test process's OWN interpreter is by definition present and working, so every fixture
@@ -365,6 +368,64 @@ def test_read_only_argv_json_stdin_and_tool_denial(fixture_tree):
     # behavior.
     assert (fixture_tree["root"]/"bgtasks.txt").read_text(encoding="utf-8-sig").strip()==""
     assert "backgroundTasks" not in q["authority"]
+
+
+# LANE-PROMPT-ENV-DIRECT-DISPATCH-1: NA-4 (tools/hooks/mlv-never-authorized.py) reads the lane's CLIP_OR_NONE: line from the file named by
+# MLV_LANE_PROMPT. Only docs/Start-EditingLane.ps1 used to export it, so a lane started by dispatch-lane.ps1 or a bare Invoke-Lane call had it
+# unset. Invoke-Lane.ps1 now sets it on the CHILD's environment to the absolute path of the -PromptFile it read.
+def _with_prompt_file(cmd, prompt_file):
+    i=cmd.index("-Prompt"); cmd=list(cmd); cmd[i]="-PromptFile"; cmd[i+1]=str(prompt_file); return cmd
+
+
+def _lane_prompt_seen_by_child(tree):
+    return (tree["root"]/"laneprompt.txt").read_text(encoding="utf-8-sig").strip()
+
+
+def test_prompt_file_path_reaches_the_child_as_mlv_lane_prompt(fixture_tree):
+    # The board's own path shape: a space AND a '!' (C:\!Layi Wkspc\...).
+    prompt_dir=fixture_tree["root"]/"!Layi Wkspc"/"prompts"; prompt_dir.mkdir(parents=True)
+    prompt_file=prompt_dir/"lane prompt!.md"; prompt_file.write_text("- CLIP_OR_NONE: none\nfile prompt body\n",encoding="utf-8")
+    cmd,env,receipt=prepare(fixture_tree,"normal"); env.pop("MLV_LANE_PROMPT",None)
+    r=subprocess.run(_with_prompt_file(cmd,prompt_file),env=env,text=True,capture_output=True,timeout=20)
+    assert r.returncode==0,(r.stdout,r.stderr)
+    assert _lane_prompt_seen_by_child(fixture_tree)==str(prompt_file)
+    assert os.path.isabs(_lane_prompt_seen_by_child(fixture_tree))
+    # the variable names the SAME file the CLI was fed, not a copy that can drift
+    assert (fixture_tree["root"]/"prompt.txt").read_text(encoding="utf-8-sig").strip()==prompt_file.read_text(encoding="utf-8").strip()
+
+
+def test_relative_prompt_file_is_exported_as_an_absolute_path(fixture_tree):
+    # The child's cwd is -WorkDir, so a relative value would not resolve where the hook reads it.
+    prompt_dir=fixture_tree["root"]/"rel dir!"; prompt_dir.mkdir()
+    (prompt_dir/"p.md").write_text("- CLIP_OR_NONE: none\n",encoding="utf-8")
+    cmd,env,receipt=prepare(fixture_tree,"normal"); env.pop("MLV_LANE_PROMPT",None)
+    r=subprocess.run(_with_prompt_file(cmd,"p.md"),env=env,text=True,capture_output=True,timeout=20,cwd=prompt_dir)
+    assert r.returncode==0,(r.stdout,r.stderr)
+    assert _lane_prompt_seen_by_child(fixture_tree)==str((prompt_dir/"p.md").resolve())
+
+
+def test_mlv_lane_prompt_is_scoped_to_the_child_and_never_leaks_into_the_caller(fixture_tree):
+    prompt_file=fixture_tree["root"]/"p.md"; prompt_file.write_text("- CLIP_OR_NONE: none\n",encoding="utf-8")
+    cmd,env,receipt=prepare(fixture_tree,"normal"); env.pop("MLV_LANE_PROMPT",None)
+    cmd=_with_prompt_file(cmd,prompt_file)
+    # In-process call (`&`, not a child pwsh), so an `$env:MLV_LANE_PROMPT = ...` inside Invoke-Lane.ps1 WOULD be visible afterwards.
+    wrapper=fixture_tree["root"]/"caller.ps1"
+    # Parameter NAMES stay bare (a quoted '-Lane' would bind positionally); every value is single-quoted.
+    quoted=" ".join(a if re.fullmatch(r"-[A-Za-z]+",a) else "'"+a.replace("'","''")+"'" for a in cmd[cmd.index("-File")+1:])
+    wrapper.write_text("$env:MLV_LANE_PROMPT=$null\n& "+quoted+"\n"
+                       "'CALLER_AFTER=[' + [string]$env:MLV_LANE_PROMPT + ']'\n",encoding="utf-8")
+    r=subprocess.run([PWSH,"-NoLogo","-NoProfile","-NonInteractive","-ExecutionPolicy","Bypass","-File",str(wrapper)],env=env,text=True,capture_output=True,timeout=40)
+    assert r.returncode==0,(r.stdout,r.stderr)
+    assert _lane_prompt_seen_by_child(fixture_tree)==str(prompt_file)
+    assert "CALLER_AFTER=[]" in r.stdout,r.stdout
+
+
+def test_inline_prompt_drops_an_inherited_mlv_lane_prompt(fixture_tree):
+    # No prompt FILE means nothing for NA-4 to read; a stale path from the caller must not authorize clips for a prompt it never described.
+    cmd,env,receipt=prepare(fixture_tree,"normal"); env["MLV_LANE_PROMPT"]=str(fixture_tree["root"]/"stale-prompt.md")
+    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    assert r.returncode==0,(r.stdout,r.stderr)
+    assert _lane_prompt_seen_by_child(fixture_tree)==""
 
 
 _RESULT_JSON_PREFIX = '{"type":"result","subtype":"success","is_error":false,"terminal_reason":"completed","result":"fixture-result","total_cost_usd":0,"num_turns":1,"modelUsage":'
