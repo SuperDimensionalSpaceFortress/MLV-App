@@ -183,6 +183,7 @@ def lane(fixture_tree, tmp_path, paths, extra=(), with_helper=True, mutate=None)
         (root / "run" / "scratch-paths.txt").write_text("\n".join(str(p) for p in paths(bulk)) + "\n", encoding="utf-8")
     if with_helper:
         (root / "Remove-LaneBulkScratch.ps1").write_bytes(HELPER.read_bytes())
+        (root / "repo-slug.ps1").write_bytes((HELPER.parent / "repo-slug.ps1").read_bytes())
         # The fixture copy only: a real Win32_Process scan on a busy host sees other lanes' short-lived compilers with
         # unreadable cwds, which the fail-closed holder guard cannot rule out. The real scan is exercised by the live-cwd row.
         (root / "Retire-LaneWorktree.ps1").write_bytes(RETIRE.read_bytes() +

@@ -14,6 +14,7 @@ import zipfile
 from pathlib import Path
 from unittest import mock
 
+from .repository_identity import CANONICAL_REPOSITORY
 from .extract_vendored_native_payload import (
     extract_payload_record,
     load_validated_manifest_snapshot,
@@ -913,6 +914,19 @@ class VendoredNativePayloadTests(unittest.TestCase):
         self.assertEqual(result["integrity"], "pass")
         self.assertEqual(result["redistribution_readiness"], "ready")
         self.assertEqual(result["redistribution_enforcement"], "required")
+
+        # After the 2026-10 transfer live GitHub answers under the NEW name while the recorded
+        # approval still carries the old one: same repository, so it must still verify.
+        recorded_name = claim["source"]["repository"]
+        transferred = copy.deepcopy(provider_response)
+        for key in ("html_url", "issue_url"):
+            transferred[key] = transferred[key].replace(recorded_name, CANONICAL_REPOSITORY)
+        self.assertNotEqual(provider_response["html_url"], transferred["html_url"])
+        self.assertEqual(validate_fixture(live_response=transferred)["integrity"], "pass")
+        stranger = copy.deepcopy(provider_response)
+        stranger["issue_url"] = stranger["issue_url"].replace(recorded_name, "someone-else/MLV-App")
+        with self.assertRaisesRegex(PayloadIntegrityError, "pull request mismatch"):
+            validate_fixture(live_response=stranger)
 
     def test_consumer_claims_bind_reference_operation_and_gate_order(self) -> None:
         consumer_path = self.root / ".github" / "workflows" / "Linux.yml"

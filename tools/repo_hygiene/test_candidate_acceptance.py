@@ -44,12 +44,15 @@ from tools.repo_hygiene.candidate_acceptance import (
     write_ledger,
 )
 from tools.repo_hygiene.core import HygieneError
+from tools.repo_hygiene.repository_identity import CANONICAL_REPOSITORY, REPOSITORY_SLUG_ALIASES
 
 
 TARGET = "1" * 40
 FEATURE = "2" * 40
 REQUIRED = ["content-self", "content-stranger-1", "content-stranger-2", "hosted-tests", "hosted-codeql"]
 ROOT = Path(__file__).resolve().parents[2]
+# The name this repository had before the 2026-10 transfer; recorded evidence may still carry it.
+PRE_TRANSFER_REPOSITORY = next(iter(REPOSITORY_SLUG_ALIASES - {CANONICAL_REPOSITORY}))
 
 # The Windows curl-trust tests drive powershell.exe to build an ACL fixture and then to run the
 # production probe against it. A call that does not return means the property under test was NEVER
@@ -188,7 +191,7 @@ class CandidateAcceptanceTests(unittest.TestCase):
             "candidateAcceptance": {
                 "enabled": True,
                 "requireReadyForFinalize": True,
-                "providerRepository": "layibabalola/MLV-App",
+                "providerRepository": CANONICAL_REPOSITORY,
                 "stateRoot": ".claude-state/closeout/acceptance",
                 "requiredSurfaces": REQUIRED,
             },
@@ -232,7 +235,7 @@ class CandidateAcceptanceTests(unittest.TestCase):
             {
                 "schema": "candidate-acceptance-github-checks.v1",
                 "capturedAt": "2026-08-20T00:01:00Z",
-                "repository": "layibabalola/MLV-App",
+                "repository": PRE_TRANSFER_REPOSITORY,
                 "headSha": FEATURE,
                 "response": {"total_count": len(runs), "check_runs": runs},
             }
@@ -532,6 +535,60 @@ class CandidateAcceptanceTests(unittest.TestCase):
                 evidence_path=self.provider_path,
             )
 
+    def test_repository_identity_accepts_both_names_but_transport_uses_the_canonical_one(self) -> None:
+        from tools.repo_hygiene.candidate_acceptance import provider_repository
+
+        # IDENTITY: a policy written before the transfer still validates; TRANSPORT: always canonical.
+        for name in sorted(REPOSITORY_SLUG_ALIASES):
+            with self.subTest(name=name):
+                config = json.loads(json.dumps(self.config))
+                config["candidateAcceptance"]["providerRepository"] = name
+                self.assertEqual(CANONICAL_REPOSITORY, provider_repository(config))
+        for bad in ("someone-else/MLV-App", "", "SuperDimensionalSpaceFortress/other"):
+            with self.subTest(bad=bad), self.assertRaises(HygieneError):
+                config = json.loads(json.dumps(self.config))
+                config["candidateAcceptance"]["providerRepository"] = bad
+                provider_repository(config)
+        with self.assertRaises(HygieneError):
+            system_curl_github_query_command("someone-else/MLV-App", FEATURE, 4096)
+
+    def test_pinned_target_policy_naming_the_other_repository_name_is_the_same_policy(self) -> None:
+        import copy
+
+        candidate_policy = copy.deepcopy(self.config["candidateAcceptance"])
+        target_policy = copy.deepcopy(candidate_policy)
+        target_policy["providerRepository"] = PRE_TRANSFER_REPOSITORY
+        candidate_policy["providerRepository"] = CANONICAL_REPOSITORY
+        config = dict(self.config, candidateAcceptance=candidate_policy)
+        with mock.patch(
+            "tools.repo_hygiene.candidate_acceptance.target_candidate_acceptance_policy",
+            return_value=target_policy,
+        ):
+            self.assertTrue(candidate_acceptance_enforced(self.repo_root, config, {}))
+        # Folding covers the repository spelling only: any other policy difference still blocks.
+        target_policy["requireReadyForFinalize"] = True
+        target_policy["batchUntilAllSurfacesTerminal"] = True
+        candidate_policy["batchUntilAllSurfacesTerminal"] = False
+        with mock.patch(
+            "tools.repo_hygiene.candidate_acceptance.target_candidate_acceptance_policy",
+            return_value=target_policy,
+        ), self.assertRaisesRegex(HygieneError, "differs from the active pinned target"):
+            candidate_acceptance_enforced(self.repo_root, config, {})
+
+    def test_acceptance_bearing_remote_is_recognised_under_either_name_in_any_case(self) -> None:
+        from tools.repo_hygiene.brokered_closeout import repository_has_canonical_acceptance_remote
+
+        forms = ("https://github.com/{}.git", "git@github.com:{}", "ssh://git@github.com/{}/")
+        cases = [(form.format(name), True) for name in sorted(REPOSITORY_SLUG_ALIASES) for form in forms]
+        cases += [(forms[0].format(name.upper()), True) for name in sorted(REPOSITORY_SLUG_ALIASES)]
+        cases += [(forms[0].format("someone-else/MLV-App"), False), ("https://github.com/ilia3101/MLV-App.git", False)]
+        for url, expected in cases:
+            with self.subTest(url=url), tempfile.TemporaryDirectory() as temp:
+                repo = Path(temp)
+                self.git(repo, "init")
+                self.git(repo, "remote", "add", "fork", url)
+                self.assertEqual(expected, repository_has_canonical_acceptance_remote(repo))
+
     def test_provider_record_rejects_mutable_non_addressed_evidence_path(self) -> None:
         candidate, _ = self.candidate()
         mutable = self.provider_path.with_name("check-runs.json")
@@ -643,7 +700,7 @@ class CandidateAcceptanceTests(unittest.TestCase):
                 payload = _live_github_provider_payload(
                     self.repo_root,
                     self.config,
-                    "layibabalola/MLV-App",
+                    PRE_TRANSFER_REPOSITORY,
                     FEATURE,
                 )
         command = bounded.call_args.args[2]
@@ -656,7 +713,7 @@ class CandidateAcceptanceTests(unittest.TestCase):
         self.assertEqual("*", command[command.index("--noproxy") + 1])
         self.assertNotIn("--location", command)
         self.assertEqual(
-            f"https://api.github.com/repos/layibabalola/MLV-App/commits/{FEATURE}/check-runs?per_page=100",
+            f"https://api.github.com/repos/SuperDimensionalSpaceFortress/MLV-App/commits/{FEATURE}/check-runs?per_page=100",
             command[-1],
         )
         for key in (
@@ -685,14 +742,14 @@ class CandidateAcceptanceTests(unittest.TestCase):
                 live_github_branch_head(
                     self.repo_root,
                     self.config,
-                    "layibabalola/MLV-App",
+                    PRE_TRANSFER_REPOSITORY,
                     "master",
                 ),
                 TARGET,
             )
         self.assertEqual(
             live.call_args.args[3],
-            "https://api.github.com/repos/layibabalola/MLV-App/git/ref/heads/master",
+            "https://api.github.com/repos/SuperDimensionalSpaceFortress/MLV-App/git/ref/heads/master",
         )
         for mutation in (
             {"ref": "refs/heads/other", "object": {"type": "commit", "sha": TARGET}},
@@ -706,7 +763,7 @@ class CandidateAcceptanceTests(unittest.TestCase):
                 live_github_branch_head(
                     self.repo_root,
                     self.config,
-                    "layibabalola/MLV-App",
+                    PRE_TRANSFER_REPOSITORY,
                     "master",
                 )
 
@@ -727,7 +784,7 @@ class CandidateAcceptanceTests(unittest.TestCase):
                 return_value=system_curl.resolve(),
             ):
                 client, command = system_curl_github_query_command(
-                    "layibabalola/MLV-App", FEATURE, 4096
+                    PRE_TRANSFER_REPOSITORY, FEATURE, 4096
                 )
             self.assertEqual(system_curl.resolve(), client)
             self.assertEqual(str(client), command[0])
@@ -775,7 +832,7 @@ class CandidateAcceptanceTests(unittest.TestCase):
                     _live_github_provider_payload(
                         self.repo_root,
                         self.config,
-                        "layibabalola/MLV-App",
+                        CANONICAL_REPOSITORY,
                         FEATURE,
                     )
 
@@ -810,7 +867,7 @@ class CandidateAcceptanceTests(unittest.TestCase):
             return_value=completed,
         ):
             with self.assertRaisesRegex(HygieneError, "unexpected HTTP status: 302"):
-                _live_github_provider_payload(self.repo_root, self.config, "layibabalola/MLV-App", FEATURE)
+                _live_github_provider_payload(self.repo_root, self.config, CANONICAL_REPOSITORY, FEATURE)
 
     @unittest.skipUnless(os.name == "nt", "Windows ACL/signature trust shape")
     def test_live_provider_system_curl_rejects_user_writable_or_unsigned_client(self) -> None:
@@ -1376,7 +1433,7 @@ class CandidateAcceptanceTests(unittest.TestCase):
         policy = config["candidateAcceptance"]
         self.assertTrue(policy["enabled"])
         self.assertTrue(policy["requireReadyForFinalize"])
-        self.assertEqual("layibabalola/MLV-App", policy["providerRepository"])
+        self.assertEqual(CANONICAL_REPOSITORY, policy["providerRepository"])
         self.assertTrue(policy["batchUntilAllSurfacesTerminal"])
         self.assertFalse(policy["carryApprovalsAcrossCandidateTuples"])
         self.assertFalse(policy["agentApprovalsGrantHumanAuthority"])
@@ -1558,7 +1615,7 @@ class CandidateAcceptanceTests(unittest.TestCase):
             with self.subTest(label=label), tempfile.TemporaryDirectory() as temp:
                 repo = Path(temp)
                 self.git(repo, "init")
-                self.git(repo, "remote", "add", "fork", "https://github.com/layibabalola/MLV-App.git")
+                self.git(repo, "remote", "add", "fork", "https://github.com/SuperDimensionalSpaceFortress/MLV-App.git")
                 raw = {
                     "toolingBaseline": {
                         "enabled": False,

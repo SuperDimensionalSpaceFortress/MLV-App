@@ -570,8 +570,59 @@ def append_block_to_file(path: pathlib.Path, block: str) -> None:
 
 # ---------- R14.1: cards ----------
 
-def find_node() -> str | None:
-    return shutil.which("node")
+def _node_exclusion_roots(*extra: pathlib.Path | None) -> list[str]:
+    """The directories no validator interpreter may live in or under: this process's cwd (a bare
+    `node` lookup checks it first on win32) and every bus checkout handed in. Fetched bus content
+    is data, never a source of the interpreter that judges it."""
+    return [os.getcwd(), *(str(r) for r in extra if r is not None)]
+
+
+def _node_candidates(entry: str) -> list[str]:
+    if sys.platform != "win32":
+        return [os.path.join(entry, "node")]
+    exts = [e for e in os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(os.pathsep) if e]
+    return [os.path.join(entry, "node" + e) for e in exts]
+
+
+def _inside_any(path: str, roots: list[str]) -> bool:
+    """True if `path` is a root or lies under one, judged by file identity (samefile on every
+    ancestor of the real path), never by comparing spellings. A root that cannot be stat'ed raises."""
+    real = pathlib.Path(os.path.realpath(path))
+    return any(os.path.samefile(a, r) for a in (real, *real.parents) for r in roots)
+
+
+def find_node(*bus_roots: pathlib.Path | None) -> str | None:
+    """The `node` the card validator runs under, as an ABSOLUTE path (resolved against this process's cwd
+    at lookup time, and identity-checked in that same form), found by walking PATH entries only: never the cwd
+    (shutil.which looks there first on win32, so a planted node.exe would win) and never anything
+    inside the cwd or a bus checkout, compared by file identity. None means no node on PATH at all.
+    Raises Refusal CARD_VALIDATOR_NODE_ABSENT when node exists only at excluded places, and
+    CARD_VALIDATOR_NODE_COULD_NOT_CHECK when the exclusions cannot be computed (fail closed)."""
+    try:
+        roots = _node_exclusion_roots(*bus_roots)
+        excluded = None
+        for entry in os.environ.get("PATH", "").split(os.pathsep):
+            entry = entry.strip().strip('"')
+            if not entry or not os.path.isdir(entry):
+                continue
+            entry = os.path.abspath(entry)  # absolute now: the child runs under another cwd, so a relative PATH entry would name a different file there
+            for cand in _node_candidates(entry):
+                if not (os.path.isfile(cand) and os.access(cand, os.X_OK)):
+                    continue
+                if _inside_any(cand, roots):
+                    excluded = excluded or cand
+                    continue
+                return cand
+    except Refusal:
+        raise
+    except Exception as e:  # noqa: BLE001 -- any failure here is "could not check", never a pass
+        raise Refusal("CARD_VALIDATOR_NODE_COULD_NOT_CHECK",
+                      f"{type(e).__name__} while checking which node may run {CARD_VALIDATOR_REL}; a card is never published unvalidated") from e
+    if excluded is not None:
+        raise Refusal("CARD_VALIDATOR_NODE_ABSENT",
+                      f"the only node on PATH is inside the cwd or a bus checkout ({excluded}), which is never run as the "
+                      f"validator interpreter; a card is never published unvalidated")
+    return None
 
 
 def card_validator_on_bus(bus_repo: pathlib.Path, tip: str) -> bool:
@@ -586,7 +637,12 @@ def r14_gate(bus_repo: pathlib.Path, tip: str, candidates: list[dict], report: d
     already on the tip is kept, so the drain reports it as sent rather than refusing history."""
     validator = card_validator_on_bus(bus_repo, tip)
     has_cards = any(c["target"] == CARDS_TARGET for c in candidates)
-    node = find_node() if has_cards else None
+    node, node_refusal = None, None
+    if has_cards:
+        try:
+            node = find_node(bus_repo)
+        except Refusal as e:
+            node_refusal = (e.code, e.detail)
     entry_problem = cards_tip_entry_problem(bus_repo, tip) if has_cards and validator else None
     kept = []
     for c in candidates:
@@ -601,6 +657,8 @@ def r14_gate(bus_repo: pathlib.Path, tip: str, candidates: list[dict], report: d
         elif c["target"] == CARDS_TARGET and not validator:
             refusal = ("CARD_VALIDATOR_ABSENT",
                        f"{CARD_VALIDATOR_REL} is not on the bus at {tip[:12]}; a card is never published unvalidated")
+        elif c["target"] == CARDS_TARGET and node_refusal:
+            refusal = node_refusal
         elif c["target"] == CARDS_TARGET and node is None:
             refusal = ("CARD_VALIDATOR_NODE_ABSENT",
                        f"node is not on PATH, so {CARD_VALIDATOR_REL} cannot run; a card is never published unvalidated")
@@ -620,22 +678,26 @@ def ensure_cards_file(path: pathlib.Path) -> None:
         path.write_bytes(CARDS_TITLE.encode("utf-8"))
 
 
-def validate_cards_file(wt: pathlib.Path, cards_file: pathlib.Path | None = None) -> None:
+def validate_cards_file(wt: pathlib.Path, cards_file: pathlib.Path | None = None,
+                        bus_repo: pathlib.Path | None = None) -> None:
     """Run the tip's own validator over the would-be cards file in the drain's temp worktree.
     It only reads. A pass is exit 0 AND the validator's summary line reporting 0 problems; exit 1
     is the one per-card verdict (CARD_INVALID); every other outcome, a silent exit 0 included,
-    refuses the publish as CARD_VALIDATOR_FAILED (fail closed)."""
-    node = find_node()
+    refuses the publish as CARD_VALIDATOR_FAILED (fail closed). The child runs in a fresh empty
+    directory of its own: not the cwd, not a bus checkout."""
+    node = find_node(wt, bus_repo)
     if node is None:
         raise Refusal("CARD_VALIDATOR_NODE_ABSENT", f"node is not on PATH, so {CARD_VALIDATOR_REL} cannot run")
     if not (wt / CARD_VALIDATOR_REL).is_file():
         raise Refusal("CARD_VALIDATOR_ABSENT", f"{CARD_VALIDATOR_REL} is not in the bus worktree")
     env = {k: v for k, v in os.environ.items() if k.upper() not in CARD_VALIDATOR_STRIPPED_ENV}
     try:
-        proc = subprocess.run(
-            [node, str(wt / CARD_VALIDATOR_REL), "--bus", str(wt), "--file", str(cards_file or wt / CARDS_TARGET), "--project", PROJECT],
-            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=CARD_VALIDATOR_TIMEOUT_S, env=env,
-        )
+        with tempfile.TemporaryDirectory(prefix="doctrine-outbox-node-cwd-") as child_cwd:
+            proc = subprocess.run(
+                [node, str(wt / CARD_VALIDATOR_REL), "--bus", str(wt), "--file", str(cards_file or wt / CARDS_TARGET), "--project", PROJECT],
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=CARD_VALIDATOR_TIMEOUT_S, env=env,
+                cwd=child_cwd,
+            )
     except (OSError, subprocess.TimeoutExpired) as e:
         raise Refusal("CARD_VALIDATOR_FAILED", type(e).__name__) from e
     out = (proc.stdout + proc.stderr).strip()
@@ -678,7 +740,8 @@ def assert_no_link_in_path(root: pathlib.Path, rel: str) -> None:
             raise Refusal("CARDS_PATH_IS_LINK", f"{cur.relative_to(root).as_posix()} is a link or junction in the bus worktree")
 
 
-def invalid_cards(wt: pathlib.Path, tip: str, cards: list[dict]) -> list[tuple[dict, str, str]]:
+def invalid_cards(wt: pathlib.Path, tip: str, cards: list[dict],
+                  bus_repo: pathlib.Path | None = None) -> list[tuple[dict, str, str]]:
     """The cards to refuse, each as (card, code, validator message). Judged by the same tip validator
     on a file outside the repo that starts as the cards file AT THE BUS TIP -- exactly the base the
     batch validation used -- and takes the cards in drain order, keeping each one that passes: a
@@ -694,7 +757,7 @@ def invalid_cards(wt: pathlib.Path, tip: str, cards: list[dict]) -> list[tuple[d
         if tip_bytes:
             trial.write_bytes(tip_bytes)
             try:
-                validate_cards_file(wt, trial)
+                validate_cards_file(wt, trial, bus_repo)
             except Refusal as e:
                 if e.code != "CARD_INVALID":
                     raise
@@ -707,7 +770,7 @@ def invalid_cards(wt: pathlib.Path, tip: str, cards: list[dict]) -> list[tuple[d
             trial.write_bytes(kept)
             append_block_to_file(trial, c["block"])
             try:
-                validate_cards_file(wt, trial)
+                validate_cards_file(wt, trial, bus_repo)
             except Refusal as e:
                 if e.code != "CARD_INVALID":
                     raise
@@ -872,12 +935,12 @@ def drain(repo: pathlib.Path, bus_repo: pathlib.Path, ref: str, ledger: pathlib.
                     raise Refusal("PREFIX_BROKEN", target)
             if any(c["target"] == CARDS_TARGET for c in pending):
                 try:
-                    validate_cards_file(wt)
+                    validate_cards_file(wt, bus_repo=bus_repo)
                 except Refusal as e:
                     if e.code != "CARD_INVALID":
                         raise
                     cards = [c for c in pending if c["target"] == CARDS_TARGET]
-                    bad = invalid_cards(wt, tip, cards)
+                    bad = invalid_cards(wt, tip, cards, bus_repo)
                     if not bad:
                         # Invalid, yet no card can be named: that card set is not published (fail closed).
                         bad = [(c, "CARD_INVALID_UNATTRIBUTED", e.detail) for c in cards]
