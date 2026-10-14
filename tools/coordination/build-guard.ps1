@@ -32,9 +32,11 @@
 #              -ErrorAction Continue or SilentlyContinue, or caught; only -ErrorAction Ignore is exempt)
 #              prints BUILD_GUARD_COMMAND_FAILED on stderr and fails: exit 1, or the non-zero native or
 #              'exit' code when there is one (that code is kept). An 'exit N' in the fragment does not skip
-#              this: it ends the fragment, and N is judged like a native code. If nothing failed, the exit
-#              code is 0. (A "--" separator is not used: PowerShell binds it as a parameter named '' and
-#              refuses.)
+#              this: it ends the fragment, and N is judged like a native code. A native failure the fragment
+#              caught (or ran in a child scope) is remembered: if the fragment then ends with code 0, the
+#              guard exits with the FIRST failing native code (reason=native-failure-overwritten). If
+#              nothing failed, the exit code is 0. (A "--" separator is not used: PowerShell binds it as a
+#              parameter named '' and refuses.)
 #   Print:     pwsh -NoProfile -File tools\coordination\build-guard.ps1 -PrintJobs
 #              runs the memory pre-flight, prints "-jN" as the only stdout line, takes NO slot.
 #   Library:   . tools\coordination\build-guard.ps1 -Library
@@ -51,8 +53,9 @@
 #   -ProcessTableFile  JSON array of {"ProcessId":n,"Name":"cc1plus.exe","CreationDate":"<iso>"}
 #   -LockPath / -MutexName / -PollSeconds / -DeadlineMinutes / -LockExpiryMinutes / -ExemptLogPath
 # Exit codes: 3 = refused (memory or slot), 2 = usage, 1 = the command fragment failed without a non-zero
-# code of its own, otherwise the code of the first native command that failed or of the fragment's own
-# 'exit' (0 when nothing failed).
+# code of its own, otherwise the fragment's non-zero code (its failing native command's or its own 'exit'),
+# or, when the fragment ended with 0 after a native failure, the first failing native code (0 when nothing
+# failed).
 [CmdletBinding()]
 param(
     [switch]$Library,
@@ -325,6 +328,10 @@ if (-not $Command.Trim()) {
 #     collected by -ErrorVariable and still fails the verdict. This fails closed: a record that was
 #     silenced (SilentlyContinue) or caught by a try/catch in the fragment is collected too. Only
 #     -ErrorAction Ignore drops a record.
+#   - a native failure the fragment caught, or ran in a child scope or under SilentlyContinue, is collected
+#     the same way, so a later command that exits 0 cannot overwrite it (BG-04): the verdict is the first
+#     failing native code. A fragment that turns native errors off ($PSNativeCommandUseErrorActionPreference
+#     = $false, or Ignore) leaves no record, and only its final code is judged.
 # Every way out of the fragment reaches Resolve-BuildGuardFragmentVerdict: falling off the end, a failing
 # native command, a terminating error, and an 'exit', 'break' or 'continue' that leaves the fragment. That
 # last group cannot be caught, so the verdict is taken in a finally and replaces the fragment's own exit
@@ -366,31 +373,43 @@ function ConvertTo-BuildGuardFragment([string]$Text) {
 
 function Resolve-BuildGuardFragmentVerdict {
     # The one verdict for every way out of the fragment. $Code is the fragment's own code: the failing native
-    # command's, the one its 'exit' gave, or 0. A non-zero code is kept (9 stays 9). Any collected error
-    # record, or the error that stopped the fragment, prints BUILD_GUARD_COMMAND_FAILED and turns a zero code
-    # into 1. The record of the native failure itself is not an error here (its code already reports it).
+    # command's, the one its 'exit' gave, or 0. Every native failure is observed from its record, even one the
+    # fragment caught or ran in a child scope (BG-04), and the first one is remembered:
+    #   - a non-zero code is kept (9 stays 9, 'exit 5' stays 5);
+    #   - a zero code with a native failure observed becomes that FIRST native code (a later success, a catch,
+    #     'exit $LASTEXITCODE' or 'return' cannot overwrite it), reason native-failure-overwritten;
+    #   - a zero code with only other error records becomes 1.
+    # BUILD_GUARD_COMMAND_FAILED is printed for any record the code does not already report. The code reports
+    # one record only: the last native failure, when its exit code is the code.
     param([string]$Label, [string]$Via, [int]$Code, $Collected, $Failure, [string]$Unrecorded = '')
     $native = [System.Management.Automation.NativeCommandExitException]
     $records = [System.Collections.Generic.List[object]]::new()
-    foreach ($item in @($Collected)) {
-        if ($item -is [System.Management.Automation.ErrorRecord] -and $item.Exception -isnot $native) { $records.Add($item) }
-    }
-    if ($Failure) {
-        $failureException = if ($Failure -is [System.Management.Automation.ErrorRecord]) { $Failure.Exception } else { $Failure }
+    $natives = [System.Collections.Generic.List[object]]::new()
+    $all = @(@($Collected) | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] })
+    if ($Failure) { $all += $Failure }
+    foreach ($item in $all) {
+        $exception = if ($item -is [System.Management.Automation.ErrorRecord]) { $item.Exception } else { $item }
+        $list = $records
+        if ($exception -is $native) { $list = $natives }
         $seen = $false
-        foreach ($r in $records) { if ([object]::ReferenceEquals($r.Exception, $failureException)) { $seen = $true } }
-        if (-not $seen -and $failureException -isnot $native) { $records.Add($Failure) }
+        foreach ($r in $list) { if ([object]::ReferenceEquals($r, $exception)) { $seen = $true } }
+        if (-not $seen) { $list.Add($exception) }
     }
-    if ($records.Count -eq 0 -and -not $Unrecorded) { return $Code }
-    $verdict = if ($Code -ne 0) { $Code } else { 1 }
-    if ($records.Count -gt 0) {
-        $first = $records[0]
-        $exception = if ($first -is [System.Management.Automation.ErrorRecord]) { $first.Exception } else { $first }
-        $reason = ($exception.GetType().Name + ': ' + $exception.Message) -replace '\s+', ' '
+    $unreported = $natives.Count
+    if ($Code -ne 0 -and $natives.Count -gt 0 -and $natives[$natives.Count - 1].ExitCode -eq $Code) { $unreported-- }
+    if ($records.Count -eq 0 -and $unreported -eq 0 -and -not $Unrecorded) { return $Code }
+    $overwritten = $Code -eq 0 -and $natives.Count -gt 0
+    $verdict = if ($Code -ne 0) { $Code } elseif ($overwritten) { [int]$natives[0].ExitCode } else { 1 }
+    if ($overwritten) {
+        $reason = 'native-failure-overwritten: ' + $natives[0].GetType().Name + ': ' + $natives[0].Message
+    } elseif ($records.Count -gt 0) {
+        $reason = $records[0].GetType().Name + ': ' + $records[0].Message
+    } elseif ($unreported -gt 0) {
+        $reason = 'earlier-native-failure: ' + $natives[0].GetType().Name + ': ' + $natives[0].Message
     } else {
         $reason = $Unrecorded
     }
-    [Console]::Error.WriteLine(('BUILD_GUARD_COMMAND_FAILED label={0} lastNativeExit={1} errors={2} exit={3} via={4} reason={5}' -f $Label, [int]$global:LASTEXITCODE, $records.Count, $verdict, $Via, $reason))
+    [Console]::Error.WriteLine(('BUILD_GUARD_COMMAND_FAILED label={0} lastNativeExit={1} errors={2} exit={3} via={4} reason={5}' -f $Label, [int]$global:LASTEXITCODE, ($records.Count + $unreported), $verdict, $Via, ($reason -replace '\s+', ' ')))
     return $verdict
 }
 
@@ -417,6 +436,7 @@ Invoke-BuildGuard -Label $Label -RequestedJobs $RequestedJobs -ExemptReason $Exe
     } catch [System.Management.Automation.NativeCommandExitException] {
         $via = 'native-exit'
         $code = [int]$_.Exception.ExitCode
+        $failure = $_
         Write-BuildGuardLog ('fragment stopped at its first failing native command: exit={0} {1}' -f $_.Exception.ExitCode, $_.Exception.Message)
     } catch {
         $via = 'error'

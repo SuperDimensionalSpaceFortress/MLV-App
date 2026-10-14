@@ -423,6 +423,92 @@ def test_command_mode_adjudicates_every_way_out_of_the_fragment(box, fragment, c
     assert not box["lock"].exists(), "the slot must be released on every way out of the fragment"
 
 
+# BG-04 (sol r5): every way a native failure or error record can be observed and then masked, and where it
+# is pinned. A native failure is observed from its NativeCommandExitException record (-ErrorVariable on the
+# fragment collects it from any scope, caught or not); the verdict keeps a non-zero final code and turns a
+# zero final code into the FIRST failing native code (reason=native-failure-overwritten).
+#
+#   masking shape                                  | pinned by
+#   -----------------------------------------------+---------------------------------------------------------
+#   later success overwrites LASTEXITCODE          | (l) caught-native-9-then-native-0
+#   try/catch around the native command            | (l), (p) caught-native-9-alone (code kept, no typed line)
+#   'exit $LASTEXITCODE' after the overwrite       | (m) caught-native-9-then-native-0-then-exit-lastexitcode
+#   'return' out of the fragment                   | caught-native-9-then-native-0-then-return
+#   pipeline to Out-Null                           | native-9-piped-to-out-null-then-native-0 (stops at 9),
+#                                                  | caught-native-9-then-native-0-piped-to-out-null
+#   '2>$null' on the native command                | (n) native-9-stderr-to-null-then-native-0 (stops at 9)
+#   '& { }' child scope (also '. { }', a function) | caught-native-9-in-child-scope-then-native-0
+#   $ErrorActionPreference = 'SilentlyContinue'    | silently-continue-native-9-then-native-0
+#   $global:LASTEXITCODE reset / $Error.Clear()    | caught-native-9-then-lastexitcode-reset,
+#                                                  | caught-native-9-then-error-clear-then-native-0
+#   trap { continue }                              | trap-continue-native-9-then-native-0
+#   a later failure or 'exit N' with its own code  | caught-native-9-then-native-7, caught-native-9-then-exit-5
+#   no failure at all (no false failure)           | (o) native-0-then-native-0
+#
+# Non-promises (out of scope, one line each):
+#   - '$?' reset: the guard never reads $?; it judges records and codes, which $? cannot change.
+#   - $PSNativeCommandUseErrorActionPreference = $false, $ErrorActionPreference = 'Ignore', -ErrorAction
+#     Ignore: the fragment tells PowerShell to keep no record, so only its final code is judged (the same
+#     documented exemption as -ErrorAction Ignore since r3).
+#   - Start-Job / Start-Process / another runspace: a failure in another process or runspace is not the
+#     fragment's own; the fragment must check it (Receive-Job, -Wait -PassThru) and fail itself.
+#   - a native failure inside dynamically built code that also exits ('[scriptblock]::Create("exit 4")'):
+#     fails closed via=left with exit 1 (pinned by break-out-of-the-fragment in the test above).
+@pytest.mark.parametrize(
+    "fragment, code, reason",
+    [
+        ("try { cmd /c exit 9 } catch { Write-Output CAUGHT }; cmd /c exit 0", 9, "native-failure-overwritten"),
+        ("try { cmd /c exit 9 } catch { Write-Output CAUGHT }; cmd /c exit 0; exit $LASTEXITCODE", 9,
+         "native-failure-overwritten"),
+        ("cmd /c exit 9 2>$null; cmd /c exit 0", 9, None),
+        ("cmd /c exit 0; cmd /c exit 0", 0, None),
+        ("try { cmd /c exit 9 } catch { }", 9, None),
+        ("try { cmd /c exit 9 } catch { }; cmd /c exit 0; return", 9, "native-failure-overwritten"),
+        ("cmd /c exit 9 | Out-Null; cmd /c exit 0", 9, None),
+        ("try { cmd /c exit 9 } catch { }; cmd /c exit 0 | Out-Null", 9, "native-failure-overwritten"),
+        ("& { try { cmd /c exit 9 } catch { } }; cmd /c exit 0", 9, "native-failure-overwritten"),
+        ("$ErrorActionPreference = 'SilentlyContinue'; cmd /c exit 9; cmd /c exit 0", 9, "native-failure-overwritten"),
+        ("try { cmd /c exit 9 } catch { }; $global:LASTEXITCODE = 0", 9, "native-failure-overwritten"),
+        ("try { cmd /c exit 9 } catch { }; $Error.Clear(); cmd /c exit 0", 9, "native-failure-overwritten"),
+        ("trap { continue }; cmd /c exit 9; cmd /c exit 0", 9, "native-failure-overwritten"),
+        ("try { cmd /c exit 9 } catch { }; cmd /c exit 7", 7, "earlier-native-failure"),
+        ("try { cmd /c exit 9 } catch { }; exit 5", 5, "earlier-native-failure"),
+    ],
+    ids=[
+        "l-caught-native-9-then-native-0",
+        "m-caught-native-9-then-native-0-then-exit-lastexitcode",
+        "n-native-9-stderr-to-null-then-native-0",
+        "o-native-0-then-native-0",
+        "p-caught-native-9-alone",
+        "caught-native-9-then-native-0-then-return",
+        "native-9-piped-to-out-null-then-native-0",
+        "caught-native-9-then-native-0-piped-to-out-null",
+        "caught-native-9-in-child-scope-then-native-0",
+        "silently-continue-native-9-then-native-0",
+        "caught-native-9-then-lastexitcode-reset",
+        "caught-native-9-then-error-clear-then-native-0",
+        "trap-continue-native-9-then-native-0",
+        "caught-native-9-then-native-7",
+        "caught-native-9-then-exit-5",
+    ],
+)
+def test_command_mode_never_lets_a_native_failure_be_masked(box, fragment, code, reason) -> None:
+    # BG-04 (sol r5): a caught native failure followed by a native success read as 0. The first failing
+    # native code now survives every masking shape in the table above, and the slot is released on each.
+    probe = f"Set-Content -LiteralPath '{box['dir'] / 'held.txt'}' -Value $(Test-Path -LiteralPath '{box['lock']}'); "
+    done = _guard(box, OK_MEMORY, [], [], ["-Command", probe + fragment])
+    assert done.returncode == code, done.stdout + done.stderr
+    typed_lines = [line for line in done.stderr.splitlines() if line.startswith("BUILD_GUARD_COMMAND_FAILED ")]
+    assert bool(typed_lines) == (reason is not None), done.stderr
+    if reason is not None:
+        assert f"exit={code} " in typed_lines[0] and f"reason={reason}: " in typed_lines[0], typed_lines[0]
+        assert "exit code: 9" in typed_lines[0], "the typed line must name the masked native failure"
+    if "CAUGHT" in fragment:
+        assert "CAUGHT" in done.stdout, "the fragment's own catch still runs"
+    assert (box["dir"] / "held.txt").read_text(encoding="ascii").strip() == "True"
+    assert not box["lock"].exists(), "the slot must be released on every way out of the fragment"
+
+
 def test_command_mode_without_a_command_is_a_usage_error(box) -> None:
     done = _guard(box, OK_MEMORY, [], [], [])
     assert done.returncode == 2
