@@ -48,6 +48,8 @@
       },
       "description": "Generator arguments other than -Venue/-Backend/-ScaleFactor/-SourceCommit/-BuildManifestSha256/-ClipId (the runner sets those)."
     },
+    "visualCapture": { "type": "boolean", "description": "OPTIONAL (PLAYBACK-VISUAL-INSPECTION-1). ABSENT MEANS ON for every speed leg: after the measured Play ends and its numbers are written, the app keeps playing ~3 s UNTIMED and the job keeps window captures (PrintWindow) a reviewer opens -- 6 play frames, the frame on screen the instant Play is paused, and that frame re-rendered by the paused full-quality path -- plus one contact strip. false is the opt-out and needs visualCaptureOptOutReason. A look leg is judged on its contact sheet and never runs this capture." },
+    "visualCaptureOptOutReason": { "type": "string", "minLength": 12, "description": "Why this speed leg keeps no window captures (required with visualCapture false, refused otherwise). Recorded verbatim in the receipt's visual block." },
     "timeouts": {
       "type": "object", "required": ["queueWaitSec", "extraClaimedWaitSec"], "additionalProperties": false,
       "properties": {
@@ -76,7 +78,8 @@
     }
   },
   "allOf": [
-    { "if": { "properties": { "legType": { "const": "look" } } }, "then": { "required": ["look"] } }
+    { "if": { "properties": { "legType": { "const": "look" } } }, "then": { "required": ["look"] } },
+    { "if": { "properties": { "visualCapture": { "const": false } }, "required": ["visualCapture"] }, "then": { "required": ["visualCaptureOptOutReason"] }, "else": { "not": { "required": ["visualCaptureOptOutReason"] } } }
   ],
   "$defs": {
     "perBackend": {
