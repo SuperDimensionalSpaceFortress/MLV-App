@@ -59,11 +59,18 @@ const char *const kLargeClip = "tests/fixtures/clips/large_dual_iso.mlv";
 const double kVerifyChromaSlack = 0.75;
 // kRefineDeadBand, LookAssistAnalysis.cpp:686 (file-static there).
 const double kSurfaceDeadBand = 2.0;
-// lookAssistSurfaceIsNeutral, LookAssistAnalysis.cpp:1128 (file-static there): strictly inside the dead band on both axes.
-// The solution check accepts such a surface whatever its chroma rise (LOOK-ASSIST-LARGE-F5-PATCH-UNVERIFIED-1).
+// lookAssistSurfaceIsNeutral (LookAssistAnalysis.cpp, file-static there): strictly inside the dead band on both axes.
+// The solution check forgives such a surface one chroma step of rise, no more (LOOK-ASSIST-LARGE-F5-PATCH-UNVERIFIED-1,
+// LOOK-ASSIST-STRICT-NEUTRAL-CHROMA2-PIN-1).
 bool surfaceIsNeutral( const LookAssistAutoWhiteBalancePatch &surface )
 {
     return surface.valid && std::fabs( surface.blueAmberAxis ) < kSurfaceDeadBand && std::fabs( surface.greenAxis ) < kSurfaceDeadBand;
+}
+// initialDaylightPatchIsVerified's solution check (LookAssistAnalysis.cpp): no rise beyond the slack, or one step strictly neutral.
+bool solutionChromaIsVerified( const LookAssistAutoWhiteBalancePatch &atSolution, double foundChroma )
+{
+    return atSolution.chroma <= foundChroma + kVerifyChromaSlack
+        || ( surfaceIsNeutral( atSolution ) && atSolution.chroma <= foundChroma + 1.0 );
 }
 // The solver's own tint rails, LookAssistAnalysis.cpp:1011.
 const int kSolverMinTint = -35;
@@ -273,7 +280,7 @@ VerificationReplica replicateVerification( const DecisionInputs &in, int solvedT
         patchAt( verify.rgb, verify.width, verify.height, patch.thumbnailX, patch.thumbnailY, base.downscaleFactor, in.rawW, in.rawH );
     v.finalChroma = atSolution.valid ? atSolution.chroma : 0.0;
     v.verified = atSolution.valid && lookAssistDaylightPatchIsNeutralEnough( atSolution )
-              && ( atSolution.chroma <= patch.chroma + kVerifyChromaSlack || surfaceIsNeutral( atSolution ) );
+              && solutionChromaIsVerified( atSolution, patch.chroma );
     v.exit = v.verified ? QStringLiteral( "verified" ) : QStringLiteral( "unverified-at-solution" );
     return v;
 }
@@ -637,7 +644,7 @@ GateTrace traceGates( const Analysis &a, const DecisionInputs &in )
         t.finalGreen = s.greenAxis;
         t.g4Neutral = s.valid && lookAssistDaylightPatchIsNeutralEnough( s );
         t.g4Strict = surfaceIsNeutral( s );
-        t.g4 = t.g4Neutral && ( s.chroma <= p.chroma + kVerifyChromaSlack || t.g4Strict );
+        t.g4 = t.g4Neutral && solutionChromaIsVerified( s, p.chroma );
     }
 
     // The decision (:1003-1090), every branch, as the applier logs it.
