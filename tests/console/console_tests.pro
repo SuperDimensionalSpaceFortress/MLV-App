@@ -36,6 +36,7 @@ SOURCES += \
     $$REPO_ROOT/tests/console/test_clip_lifecycle_barrier.cpp \
     $$REPO_ROOT/tests/console/test_playback_stop_lifetime.cpp \
     $$REPO_ROOT/tests/console/test_playback_prep_inflight_gate.cpp \
+    $$REPO_ROOT/tests/console/test_playback_rgb8_source.cpp \
     $$REPO_ROOT/tests/console/test_export_dimensions.cpp \
     $$REPO_ROOT/tests/console/test_export_process.cpp \
     $$REPO_ROOT/tests/console/test_playback_frame_range.cpp \

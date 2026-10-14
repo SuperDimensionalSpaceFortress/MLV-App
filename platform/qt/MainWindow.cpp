@@ -3889,10 +3889,11 @@ MainWindow::PlaybackPrepResult MainWindow::buildPlaybackPrepResult( const Playba
                     ? task.readyFrame.rawImage16
                     : nullptr);
     const uint8_t *rgb8DisplaySource =
-        (task.sourceImage != nullptr && task.sourceImageSize > 0
-         && task.sourceImageSize >= sourceImageBytes)
-            ? task.sourceImage
-            : task.readyFrame.rawImage8;
+        playbackSelectRgb8Source( task.sourceImage,
+                                  task.sourceImageSize,
+                                  task.readyFrame.rawImage8,
+                                  task.readyFrame.rawImage8Bytes,
+                                  sourceImageBytes );
     const bool playbackProcessingSubsetActive =
         (gpuPreviewProcessingActive || cpuPreviewProcessingActive)
         && gpuPreviewProcessingConfig.enabled;
@@ -4114,7 +4115,8 @@ MainWindow::PlaybackPrepResult MainWindow::buildPlaybackPrepResult( const Playba
 
     const qint64 downscaleStartNs = prepSpanClock.nsecsElapsed();
     const char *downscaleBranch = preScaledPlaybackImageAvailable ? "prescaled" : "none";
-    if( displayImage.isNull() )
+    // F3: no sized 8-bit source -> no image; the present path drops it as present-nothing.
+    if( displayImage.isNull() && rgb8DisplaySource )
     {
         const bool playbackFastScalingActive =
             playbackPolicyActive
@@ -4296,7 +4298,8 @@ MainWindow::PlaybackPrepResult MainWindow::buildPlaybackPrepResult( const Playba
 
     if( useGpuImagePresentation && useGpuShaderZebras )
     {
-        underOver = scanZebrasRgb8( rgb8DisplaySource, displaySourceWidth, displaySourceHeight );
+        if( rgb8DisplaySource )
+            underOver = scanZebrasRgb8( rgb8DisplaySource, displaySourceWidth, displaySourceHeight );
     }
     else if( zebrasEnabled && !displayImage.isNull() && !displayImageOwnsData )
     {
@@ -4686,10 +4689,11 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
                     ? task.readyFrame.rawImage16
                     : nullptr);
     const uint8_t *rgb8DisplaySource =
-        (task.sourceImage != nullptr && task.sourceImageSize > 0
-         && task.sourceImageSize >= sourceImageBytes)
-            ? task.sourceImage
-            : task.readyFrame.rawImage8;
+        playbackSelectRgb8Source( task.sourceImage,
+                                  task.sourceImageSize,
+                                  task.readyFrame.rawImage8,
+                                  task.readyFrame.rawImage8Bytes,
+                                  sourceImageBytes );
     bool framePresentedByViewport = false;
     const size_t expectedAmazeTextureRawFloats =
         static_cast<size_t>( sourceWidth ) * static_cast<size_t>( sourceHeight );
@@ -30395,7 +30399,8 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
                 >= static_cast<double>( intervalMs );
         }
 
-        if( updateScopesNow )
+        // F3: no sized 8-bit source -> keep the previous scope image.
+        if( updateScopesNow && rgb8DisplaySource )
         {
             bool under = false;
             bool over = false;
@@ -31580,10 +31585,12 @@ void MainWindow::drawFrameReady()
         (sourceWidth > 0 && sourceHeight > 0)
             ? static_cast<size_t>( sourceWidth ) * static_cast<size_t>( sourceHeight ) * 3u
             : 0;
+    // F3: the slot buffer's real size, never the size the dims imply.
     task.sourceImage = readyFrame.rawImage8;
-    task.sourceImageSize = sourceImageBytes;
-    task.scopeSourceImage = task.sourceImage;
-    task.scopeSourceImageSize = sourceImageBytes;
+    task.sourceImageSize = readyFrame.rawImage8 ? readyFrame.rawImage8Bytes : 0;
+    task.scopeSourceImage =
+        task.sourceImageSize >= sourceImageBytes ? task.sourceImage : nullptr;
+    task.scopeSourceImageSize = task.scopeSourceImage ? sourceImageBytes : 0;
     const size_t sourceImage16Bytes =
         (sourceWidth > 0 && sourceHeight > 0)
             ? static_cast<size_t>( sourceWidth ) * static_cast<size_t>( sourceHeight ) * 3u
