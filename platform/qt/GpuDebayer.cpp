@@ -22,6 +22,7 @@
 #include "../../tools/gpu/igpu_amaze_debayer.h"
 #include "../../tools/gpu/igpu_cuda_error.h"
 #include "GpuFieldTelemetry.h"
+#include "../../src/mlv/llrawproc/llrawproc.h"
 
 #include <atomic>
 #include <cstring>
@@ -44,6 +45,13 @@ constexpr GLfloat kQuadVertices[16] = {
     -1.0f, -1.0f, 0.0f, 0.0f,
      1.0f, -1.0f, 1.0f, 0.0f,
 };
+
+/* GPU-DEVICE-LOSS-SELF-HEAL-1: every CUDA AMaZE entry fails with this before
+ * any runtime or backend call while llrpGpuCudaSuppressed() is set. */
+QString cudaSuppressedReason()
+{
+    return QStringLiteral("CUDA suppressed after a GPU device loss");
+}
 
 bool envFlagEnabled(const QByteArray & value)
 {
@@ -699,6 +707,7 @@ QString gpuAmazeDebayerReducedHnyquistMissingReason(void)
 
 bool gpuAmazeDebayerReducedHnyquistAvailable(void)
 {
+    if ( llrpGpuCudaSuppressed() ) return false;
     GpuAmazeDebayerLiveTextureRuntime & live = liveAmazeTextureRuntime();
     if ( !live.ensure() ) return false;
     QMutexLocker locker(&live.mutex);
@@ -888,6 +897,11 @@ bool gpuBilinearDebayerApplyGpuOffscreen(const float * inputRawFrame,
 GpuAmazeDebayerBackendAvailability gpuAmazeDebayerProbeBackend(void)
 {
     GpuAmazeDebayerBackendAvailability availability;
+    if ( llrpGpuCudaSuppressed() )
+    {
+        availability.reason = cudaSuppressedReason();
+        return availability;
+    }
 
     GpuAmazeDebayerRuntime runtime;
     if ( !loadAmazeDebayerRuntime(&runtime, &availability.reason) )
@@ -940,6 +954,7 @@ bool gpuAmazeDebayerApplyGpuOffscreen(const float * inputRawFrame,
         return false;
     };
 
+    if ( llrpGpuCudaSuppressed() ) return fail(cudaSuppressedReason());
     if ( !inputRawFrame || !outputRgb16 || width <= 32 || height <= 32 )
     {
         return fail(QStringLiteral("GPU AMaZE debayer input/output buffers are invalid"));
@@ -1012,6 +1027,7 @@ bool gpuAmazeDebayerRenderPostWbGlTexture(const float * inputRawFrame,
         return false;
     };
 
+    if ( llrpGpuCudaSuppressed() ) return fail(cudaSuppressedReason());
     if ( !inputRawFrame || glTexture == 0 || width <= 32 || height <= 32 )
     {
         return fail(QStringLiteral("GPU AMaZE texture-present input or GL texture is invalid"));
@@ -1082,6 +1098,11 @@ bool gpuAmazeDebayerRenderPostWbGlTexture(const float * inputRawFrame,
 GpuAmazeDebayerBackendAvailability gpuAmazeDebayerProbeR16TextureBackend(void)
 {
     GpuAmazeDebayerBackendAvailability availability;
+    if ( llrpGpuCudaSuppressed() )
+    {
+        availability.reason = cudaSuppressedReason();
+        return availability;
+    }
     QString reason;
     GpuAmazeDebayerLiveTextureRuntime & live = liveAmazeTextureRuntime();
     if ( !live.ensure(&reason) )
@@ -1136,6 +1157,7 @@ bool gpuAmazeDebayerRenderPostWbGlTextureFromR16GlTexture(
         return false;
     };
 
+    if ( llrpGpuCudaSuppressed() ) return fail(cudaSuppressedReason());
     if ( inputR16GlTexture == 0 || outputRgba16GlTexture == 0 || width <= 32 || height <= 32 )
     {
         return fail(QStringLiteral("GPU AMaZE R16 texture-present input/output GL texture is invalid"));
@@ -1208,6 +1230,7 @@ bool gpuAmazeDebayerRenderPostWbGlTextureFromDeviceBayer16(
         return false;
     };
 
+    if ( llrpGpuCudaSuppressed() ) return fail(cudaSuppressedReason());
     if ( !deviceBayer16 || outputRgba16GlTexture == 0 || width <= 32 || height <= 32 )
     {
         return fail(QStringLiteral("GPU AMaZE direct device texture-present input/output is invalid"));
@@ -1275,6 +1298,13 @@ bool gpuAmazeDebayerApplyGpuOffscreenPostWb(const float * inputRawFrame,
                                            QString * rendererDescription,
                                            GpuAmazeDebayerBackendTiming * timing)
 {
+    if ( llrpGpuCudaSuppressed() )
+    {
+        if ( reason ) *reason = cudaSuppressedReason();
+        if ( rendererDescription ) rendererDescription->clear();
+        if ( timing ) *timing = GpuAmazeDebayerBackendTiming();
+        return false;
+    }
     if ( !validWbMultipliers(wbMultipliers) )
     {
         if ( reason ) *reason = QStringLiteral("GPU AMaZE post-WB fallback WB multipliers are invalid");

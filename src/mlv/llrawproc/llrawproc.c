@@ -289,6 +289,7 @@ void llrpSetGpuPlaybackReconTexturePrepareOnlyForCurrentThread(int enabled)
 
 static int llrawproc_gpu_playback_recon_enabled(void)
 {
+    if(llrpGpuCudaSuppressed()) return 0;
     return g_llrawproc_gpu_playback_recon_allowed
         && llrawproc_env_truthy_value(getenv("MLVAPP_GPU_PLAYBACK_RECON"));
 }
@@ -831,6 +832,18 @@ static llrpGpuReconEventLogger_t g_llrawproc_gpu_recon_event_logger = NULL;
 static llrpGpuStageTelemetrySink_t g_llrawproc_gpu_stage_telemetry_sink = NULL;
 static volatile LONG g_llrawproc_gpu_recon_run_active = 0;
 static volatile LONG g_llrawproc_gpu_preupload_bypass_active = 0;
+/* GPU-DEVICE-LOSS-SELF-HEAL-1: see llrpSetGpuCudaSuppressed in llrawproc.h. */
+static volatile LONG g_llrawproc_gpu_cuda_suppressed = 0;
+
+void llrpSetGpuCudaSuppressed(int suppressed)
+{
+    InterlockedExchange(&g_llrawproc_gpu_cuda_suppressed, suppressed ? 1 : 0);
+}
+
+int llrpGpuCudaSuppressed(void)
+{
+    return g_llrawproc_gpu_cuda_suppressed != 0;
+}
 
 int llrpGpuPlaybackReconGetBackendInfo(llrpGpuPlaybackReconBackendInfo_t * info);
 int llrpGpuPlaybackReconGetBackendInfo(llrpGpuPlaybackReconBackendInfo_t * info)
@@ -2153,6 +2166,7 @@ int llrpGpuPlaybackReconPreuploadFrame(uint64_t frame_id,
     int telemetry_entered = 0;
     int telemetry_pending = 0;
     const uint64_t frame_token = llrpGpuPlaybackReconFrameToken(frame_id);
+    if(llrpGpuCudaSuppressed()) return 0;
     if(!llrawproc_env_truthy_value(
            getenv("MLVAPP_GPU_PLAYBACK_RECON_ASYNC_H2D"))
      || !raw_input_bayer14
@@ -2308,6 +2322,13 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
     if(device_width_out) *device_width_out = 0;
     if(device_height_out) *device_height_out = 0;
     if(retained_out) memset(retained_out, 0, sizeof(*retained_out));
+    /* GPU-DEVICE-LOSS-SELF-HEAL-1: after a device loss no CUDA call is made on
+     * any thread; checked before any lock or backend access. */
+    if(llrpGpuCudaSuppressed())
+    {
+        if(rc_out) *rc_out = LLRP_GPU_PLAYBACK_RECON_RC_CUDA_SUPPRESSED;
+        return 0;
+    }
     if(!state || !state->valid || !gpu_input || raw_image_size == 0) return 0;
     if(out_kind == IGPU_OUT_CPU16 && !gpu_output) return 0;
     if(out_kind == IGPU_OUT_GL_TEXTURE && gl_texture_id == 0) return 0;
@@ -3127,6 +3148,11 @@ int llrpGpuPlaybackReconCopyLastDeviceBayer16ToGlTexture(unsigned int gl_texture
     llrawprocGpuExportBackend_t * g = &g_llrawproc_gpu_export_backend;
     int rc = -1;
     if(rc_out) *rc_out = -1;
+    if(llrpGpuCudaSuppressed())
+    {
+        if(rc_out) *rc_out = LLRP_GPU_PLAYBACK_RECON_RC_CUDA_SUPPRESSED;
+        return 0;
+    }
     if(gl_texture_id == 0) return 0;
 
     pthread_mutex_lock(&g_llrawproc_gpu_recon_backend_mutex);
@@ -3541,6 +3567,20 @@ void llrpSetGpuReconEventLogger(llrpGpuReconEventLogger_t logger)
 void llrpSetGpuStageTelemetrySink(llrpGpuStageTelemetrySink_t sink)
 {
     (void)sink;
+}
+
+/* GPU-DEVICE-LOSS-SELF-HEAL-1: no recon backend here, but GpuDebayer.cpp and
+ * the playback gate read the same flag on every platform. */
+static volatile int g_llrawproc_gpu_cuda_suppressed = 0;
+
+void llrpSetGpuCudaSuppressed(int suppressed)
+{
+    __atomic_store_n(&g_llrawproc_gpu_cuda_suppressed, suppressed ? 1 : 0, __ATOMIC_SEQ_CST);
+}
+
+int llrpGpuCudaSuppressed(void)
+{
+    return __atomic_load_n(&g_llrawproc_gpu_cuda_suppressed, __ATOMIC_RELAXED) != 0;
 }
 
 int llrpGpuPlaybackReconDrainCudaErrorsAtTeardown(int wait_ms)

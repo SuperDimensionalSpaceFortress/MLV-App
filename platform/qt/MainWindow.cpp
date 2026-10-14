@@ -1529,6 +1529,7 @@ static bool lookAssistProcessedFloorLiftedPostInvalidShouldFailClosed(
 #include "GpuDisplayViewport.h"
 #include "GpuDisplayWindow.h"
 #include "GpuFieldTelemetry.h"
+#include "GpuDeviceLossBreaker.h"
 #include "MainWindowGpuPreviewPolicy.h"
 #include "PlaybackQualityPolicy.h"
 #include "PlaybackScaling.h"
@@ -1945,6 +1946,8 @@ static bool playback_recon_texture_present_requested_by_environment()
 
 static bool playback_recon_requested_by_environment()
 {
+    // GPU-DEVICE-LOSS-SELF-HEAL-1: no CUDA recon after a device loss or on a safe start.
+    if( llrpGpuCudaSuppressed() ) return false;
     const QString value =
         qEnvironmentVariable("MLVAPP_GPU_PLAYBACK_RECON").trimmed();
     return !value.isEmpty()
@@ -2261,6 +2264,22 @@ MainWindow::MainWindow(int &argc, char **argv, QWidget *parent) :
     initLib();
     // PLAYBACK-CUDA-HONOUR-SCALE-1 r2: set_clip/set_luts events reach the log.
     llrpSetGpuReconEventLogger( gpuPresentEventLogReconLine );
+    // GPU-DEVICE-LOSS-SELF-HEAL-1: the non-modal device-loss notice (a queued startup notice shows now) and the
+    // refresh that moves the next frame onto the CPU route without a clip reload.
+    GpuDeviceLossBreaker::setNoticeSink( [this]( const QString &text )
+    {
+        if( text.isEmpty() )
+        {
+            statusBar()->clearMessage();
+            return;
+        }
+        statusBar()->showMessage( text, 0 );
+        qInfo().noquote() << "gpu_device_loss_notice:" << text;
+    } );
+    GpuDeviceLossBreaker::setRefreshCallback( [this]()
+    {
+        requestFrameRefresh( true, "gpu-device-loss-cpu-route" );
+    } );
 
     resetSliders();
 
@@ -6313,7 +6332,7 @@ void MainWindow::drawFrame( bool updateTimecodeLabel )
         m_pMlvObject && doesMlvAlwaysUseAmaze( m_pMlvObject ) == 0;
     renderPolicy.gpuAmazeDebayerBackendRequest = m_gpuAmazeDebayerBackendRequest;
     renderPolicy.gpuAmazeDebayerEnvironmentRequested =
-        gpuAmazeDebayerRequestedByEnvironment();
+        gpuAmazeDebayerRequestedByEnvironment() && !llrpGpuCudaSuppressed();
     renderPolicy.gpuAmazeTexturePresentationEnvironmentRequested =
         gpuAmazeTexturePresentRequestedByEnvironment();
     renderPolicy.gpuPlaybackReconEnvironmentRequested =
@@ -10747,6 +10766,8 @@ int MainWindow::openMlv( QString fileName )
     }
     // GPU-FIELD-TELEMETRY-1: clip identity for the field log (cold; only the basename's hash is kept).
     if ( GpuFieldTelemetry::enabled() ) GpuFieldTelemetry::noteClip( (int)getMlvWidth( m_pMlvObject ), (int)getMlvHeight( m_pMlvObject ), (int)getMlvBitdepth( m_pMlvObject ), isMlvCompressed( m_pMlvObject ) != 0, llrpGetDualIsoValidity( m_pMlvObject ) == DISO_VALID && qEnvironmentVariableIntValue( "MLVAPP_GPU_PLAYBACK_RECON" ) != 0, QFileInfo( fileName ).fileName() );
+    // GPU-DEVICE-LOSS-SELF-HEAL-1: the clip half of the breaker's profile key.
+    GpuDeviceLossBreaker::noteClipOpened( (int)getMlvWidth( m_pMlvObject ), (int)getMlvHeight( m_pMlvObject ), (int)getMlvBitdepth( m_pMlvObject ), isMlvCompressed( m_pMlvObject ) != 0 );
 
     QString audioText;
     if( doesMlvHaveAudio( m_pMlvObject ) )
@@ -11250,6 +11271,8 @@ void MainWindow::showPerformanceProfilingDialog( void )
     const bool cudaEnabled = cudaPlaybackPreset->isChecked();
     CrashForensics::setCudaPlaybackProfilingSettingsEnabled( cudaEnabled );
     CrashForensics::applyCudaPlaybackProfilingEnvironment( cudaEnabled );
+    // GPU-DEVICE-LOSS-SELF-HEAL-1: turning the preset on is the user's "try the GPU again".
+    if( cudaEnabled ) GpuDeviceLossBreaker::userReenableGpu();
     const bool dngAsyncEnabled = dngAsyncPreset->isChecked();
     const int queueDepth = dngQueueDepth->value();
     const int threadCount = dngThreadCount->value();
@@ -18781,7 +18804,7 @@ bool MainWindow::shouldUseGpuAmazeDebayerPath( void ) const
     policyState.gpuPreviewProcessingCompatible = gpuPreviewProcessingIsSupported( m_pProcessingObject );
     policyState.gpuAmazeDebayerBackendRequest = m_gpuAmazeDebayerBackendRequest;
     policyState.gpuAmazeDebayerEnvironmentRequested =
-        gpuAmazeDebayerRequestedByEnvironment();
+        gpuAmazeDebayerRequestedByEnvironment() && !llrpGpuCudaSuppressed();
     policyState.gpuAmazeDebayerCompatible =
         m_pMlvObject
         && doesMlvAlwaysUseAmaze( m_pMlvObject ) != 0
@@ -22142,7 +22165,7 @@ MainWindowGpuPreviewPolicyState MainWindow::gpuPreviewPolicyForCurrentScopeState
         m_pMlvObject && doesMlvAlwaysUseAmaze( m_pMlvObject ) == 0;
     policyState.gpuAmazeDebayerBackendRequest = m_gpuAmazeDebayerBackendRequest;
     policyState.gpuAmazeDebayerEnvironmentRequested =
-        gpuAmazeDebayerRequestedByEnvironment();
+        gpuAmazeDebayerRequestedByEnvironment() && !llrpGpuCudaSuppressed();
     policyState.gpuAmazeTexturePresentationEnvironmentRequested =
         gpuAmazeTexturePresentRequestedByEnvironment();
     policyState.gpuPlaybackReconEnvironmentRequested =
@@ -23537,6 +23560,9 @@ void MainWindow::on_actionFullscreen_triggered( bool checked )
         if( windowWasMaximized ) this->showMaximized();
         else this->showNormal();
         ui->statusBar->show();
+        // GPU-DEVICE-LOSS-SELF-HEAL-1: the device-loss notice survives fullscreen.
+        if( !GpuDeviceLossBreaker::currentNotice().isEmpty() )
+            statusBar()->showMessage( GpuDeviceLossBreaker::currentNotice(), 0 );
         ui->mainToolBar->show();
         ui->menuBar->show();
         ui->horizontalSliderPosition->show();

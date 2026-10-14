@@ -6,6 +6,7 @@
 #include "GpuFieldTelemetry.h"
 #include "GpuFieldTelemetryCore.h"
 #include "CrashForensics.h"
+#include "GpuDeviceLossBreaker.h"
 
 #include "../../src/mlv/llrawproc/llrawproc.h"
 #include "GpuDebayer.h"
@@ -580,8 +581,11 @@ void noteStage(const char * dll, const char * stage, double ms)
 {
     if (!enabled()) return;
     State & s = state();
-    QMutexLocker locker(&s.mutex);
-    s.stages.add(dll, stage, ms, 0);
+    {
+        QMutexLocker locker(&s.mutex);
+        s.stages.add(dll, stage, ms, 0);
+    }
+    if (GpuDeviceLossBreaker::faultInjectArmed()) GpuDeviceLossBreaker::noteRunStageForInjection(stage);
 }
 
 void noteFault(const CudaFault & fault)
@@ -687,6 +691,16 @@ void noteGlContext(QOpenGLContext * context)
     };
     noteGlIdentity(text(GL_RENDERER), text(GL_VENDOR), text(GL_VERSION),
                    QString::fromStdString(core::glResetStrategyName(robust, strategy)), resetStatus);
+}
+
+GlIdentity glIdentity()
+{
+    State & s = state();
+    QMutexLocker locker(&s.mutex);
+    GlIdentity id;
+    id.renderer = QString::fromStdString(s.session.glRenderer);
+    id.driver = QString::fromStdString(s.session.gpuDriver);
+    return id;
 }
 
 void flush(const char * reason)
