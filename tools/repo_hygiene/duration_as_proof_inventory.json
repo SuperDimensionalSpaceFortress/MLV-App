@@ -2081,6 +2081,16 @@
       "lines": [
         128
       ]
+    },
+    {
+      "path": "tests/console/test_gpu_launch_budget.cpp",
+      "anchor": "ASSERT_TRUE ( records [ 2 ] . ms < 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "GPU-LAUNCH-BUDGET-TILING-1 parser unit test over a synthetic, test-constructed igpu_launch_timing text blob (no live clock, no launch): the third record is the err=700 line whose ms=na field must parse to the negative sentinel, so the assert pins the parser's na-handling on known input. It is not a budget verdict (the 100 ms comparison is igpu_lb_verdict, asserted on the next lines) and not proof that any stage ran.",
+      "lines": [
+        289
+      ]
     }
   ]
 }
