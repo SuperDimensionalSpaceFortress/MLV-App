@@ -52,8 +52,9 @@ Numbers are computed from the VIDEO VIEWPORT only -- the window's timecode and f
 | `NOT_CAPTURED` / `NOT_REQUESTED` | nothing published (an old build, a failed run) / the spec opts out | yes |
 | `OK` | none of the above | yes |
 
-The divergence threshold (`$script:VisualDivergenceThreshold`, DualVenueRunner.psm1) is calibrated on a known-good leg; the value
-and the measurement it came from are in the PR that set it.
+The divergence threshold (`$script:VisualDivergenceThreshold`, DualVenueRunner.psm1) is calibrated on a known-good leg: 6.0. The
+known-good Bachelor leg (M16-1243 windowed-s2, CPU, build `adf6185a`, receipt `a5d3ffbe`) measured 1.099 on its worst channel;
+three times that (3.3) is under the 6.0 floor, so the floor is the threshold.
 
 ## Opting out
 

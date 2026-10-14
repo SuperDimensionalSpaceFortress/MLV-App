@@ -1317,8 +1317,9 @@ function Read-DvContactFrames {
 # its paused full-quality re-render. Both are computed here, from the copied files, so they re-derive from the evidence.
 $script:VisualSchema = 'mlv-app/dual-venue-visual/v1'
 # Per-channel mean absolute difference (0..255, viewport downscaled to 160x90) above which a leg is flagged VISUAL_DIVERGENCE. Calibrated on a
-# known-good leg (PLAYBACK-VISUAL-INSPECTION-1 r1, docs/dual-venue-evidence.md "Window captures"): the measured value there, with headroom.
-$script:VisualDivergenceThreshold = 12.0
+# known-good leg (PLAYBACK-VISUAL-INSPECTION-1 r2, Bachelor M16-1243 windowed-s2 CPU, receipt a5d3ffbe): measured max channel 1.099
+# (R 1.099 G 0.551 B 0.800); x3 is 3.3, under the 6.0 floor, so the floor holds.
+$script:VisualDivergenceThreshold = 6.0
 # A viewport whose pixel standard deviation is under this is flat (all black, all one colour): a blank capture, which says nothing about the display.
 $script:VisualFlatViewportStd = 1.0
 $script:VisualHashSize = @(64, 36)
