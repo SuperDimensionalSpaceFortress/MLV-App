@@ -4870,6 +4870,13 @@ class VenueQuietSetAsideRecordTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertRegex(proc.stdout, r"(?m)^GATE quiet-probe bachelor queued=0 running=0 ")
 
+    def test_a_legacy_shared_tmp_set_aside_record_is_not_a_running_job(self) -> None:
+        # Get-MarkerTempFiles also lists the legacy shared '<id>.started.json.tmp' (r2c and earlier); the agent sets that one aside the same way.
+        self.running("dve-x-bachelor-cuda-20261013225031.started.json.tmp.stale-639275292076772648")
+        proc = self.gate("samples", "[5, 5, 5]")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertRegex(proc.stdout, r"(?m)^GATE quiet-probe bachelor queued=0 running=0 ")
+
     def test_a_live_final_marker_still_holds_the_gate(self) -> None:
         self.running("dve-x-bachelor-cuda-20261013225031.started.json")
         self.running(self.TMP + ".stale-639275292076772648")
