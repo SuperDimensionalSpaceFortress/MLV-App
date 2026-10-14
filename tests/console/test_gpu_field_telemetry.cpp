@@ -1534,7 +1534,17 @@ QStringList exitJoinCensus(const QString & source)
         // Session end sets the stop flag, waits once, and skips the final write if the wait expired.
         "    g_workerStop.store(true);",
         "    if (g_workerPoolCreated.load() && !workerPool()->waitForDone(static_cast<int>(core::kSessionEndWaitMs)))\n        return;",
-        "    flushImpl(\"session_end\", true, false,\n              remainingMs < core::kSystemLogDeadlineMs ? remainingMs : core::kSystemLogDeadlineMs);",
+        // EXIT-DEADLINE-1: the final write runs on the worker, waited for until the budget ends; the
+        // model is read with a bounded wait and the flush itself never describes.
+        "    runExitWriteWithin([budget]() {\n"
+        "        const qint64 describeMs = std::min<qint64>(budget.remainingTime(), core::kTerminalDrainWaitMs);\n"
+        "        const std::string cudaModel = reconDescribe(static_cast<int>(describeMs));",
+        "        flushImpl(\"session_end\", true, false,\n"
+        "                  std::min<qint64>(budget.remainingTime(), core::kSystemLogDeadlineMs), false);\n"
+        "    }, budget.remainingTime());",
+        "    startedWorkerPool()->start(std::move(write));\n"
+        "    workerPool()->waitForDone(static_cast<int>(waitMs > 0 ? waitMs : 0));",
+        "    runExitWriteWithin([]() { flushImpl(\"post_session\", false, false, 0, false); }, core::kSessionEndWaitMs);",
         // The worker checks the flag before each step.
         "        if (!waitUnlessShuttingDown(delayMs)) return; // session_end writes it instead\n        if (workerStopped(true)) return;",
         "        flushImpl(\"after_fault\", true, true);",
@@ -1568,4 +1578,37 @@ TEST(GpuFieldTelemetry, SessionEndJoinsTheWorkerOrSkipsTheFinalWrite)
         QStringLiteral("    const std::string cudaModel = describe ? reconDescribe() : std::string();\n    if (workerStopped(onWorker)) return;\n"),
         QStringLiteral("    const std::string cudaModel = describe ? reconDescribe() : std::string();\n"));
     ASSERT_EQ(1, (int)exitJoinCensus(noStepCheck).size());
+}
+
+// EXIT-DEADLINE-1 (fable DESCRIBE-CACHED-1, sol EXIT-JOIN-1): on e8b04c7f sessionEnd's flush called
+// reconDescribe -> llrpGpuPlaybackReconGetBackendInfo, which locks the backend mutex unconditionally,
+// on the GUI thread, after the terminal drain may have timed out on that same mutex: aboutToQuit had no
+// bound. The runtime pin is tests/pipeline GpuFieldTelemetryCapture.
+// SessionEndReturnsInsideItsBudgetWhileABackendCallHoldsTheLock; this census reports each way back.
+TEST(GpuFieldTelemetry, SessionEndNeverWaitsUnboundedOnTheBackendLockOrTheWrite)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/GpuFieldTelemetry.cpp"));
+    const QString llrawproc = readRepoFile(QStringLiteral("src/mlv/llrawproc/llrawproc.c"));
+    ASSERT_EQ(std::string(), exitJoinCensus(source).join(QStringLiteral("; ")).toStdString());
+    const QString within = bodyFrom(llrawproc,
+        QStringLiteral("int llrpGpuPlaybackReconGetBackendInfoWithin(llrpGpuPlaybackReconBackendInfo_t * info, int wait_ms)\n{"));
+    ASSERT_TRUE(within.contains(QStringLiteral("    while(pthread_mutex_trylock(&g_llrawproc_gpu_recon_backend_mutex) != 0)\n")));
+    ASSERT_TRUE(within.contains(QStringLiteral("        if(GetTickCount64() >= deadline) return 0;\n")));
+    ASSERT_FALSE(within.contains(QStringLiteral("pthread_mutex_lock(")));
+    // Mutations: each e8b04c7f shape is reported.
+    const QString unboundedDescribe = replacedOnce(source,
+        QStringLiteral("reconDescribe(static_cast<int>(describeMs))"), QStringLiteral("reconDescribe()"));
+    ASSERT_EQ(1, (int)exitJoinCensus(unboundedDescribe).size());
+    const QString describingFlush = replacedOnce(source,
+        QStringLiteral("core::kSystemLogDeadlineMs), false);\n    }, budget.remainingTime());"),
+        QStringLiteral("core::kSystemLogDeadlineMs));\n    }, budget.remainingTime());"));
+    ASSERT_EQ(1, (int)exitJoinCensus(describingFlush).size());
+    const QString unboundedWait = replacedOnce(source,
+        QStringLiteral("    workerPool()->waitForDone(static_cast<int>(waitMs > 0 ? waitMs : 0));"),
+        QStringLiteral("    workerPool()->waitForDone();"));
+    ASSERT_EQ(1, (int)exitJoinCensus(unboundedWait).size());
+    const QString guiThreadPostWrite = replacedOnce(source,
+        QStringLiteral("    runExitWriteWithin([]() { flushImpl(\"post_session\", false, false, 0, false); }, core::kSessionEndWaitMs);"),
+        QStringLiteral("    flushImpl(\"post_session\", false, false, 0, false);"));
+    ASSERT_EQ(1, (int)exitJoinCensus(guiThreadPostWrite).size());
 }
