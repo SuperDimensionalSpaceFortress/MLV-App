@@ -30,9 +30,11 @@
 #              stops the fragment and its code is returned, so "qmake; make" cannot report a failed qmake
 #              as 0. A command that cannot start, a throw or any error record (even one written with
 #              -ErrorAction Continue or SilentlyContinue, or caught; only -ErrorAction Ignore is exempt)
-#              prints BUILD_GUARD_COMMAND_FAILED on stderr and exits 1. If nothing
-#              failed, the exit code is 0. (A "--" separator is not used: PowerShell binds it as a
-#              parameter named '' and refuses.)
+#              prints BUILD_GUARD_COMMAND_FAILED on stderr and fails: exit 1, or the non-zero native or
+#              'exit' code when there is one (that code is kept). An 'exit N' in the fragment does not skip
+#              this: it ends the fragment, and N is judged like a native code. If nothing failed, the exit
+#              code is 0. (A "--" separator is not used: PowerShell binds it as a parameter named '' and
+#              refuses.)
 #   Print:     pwsh -NoProfile -File tools\coordination\build-guard.ps1 -PrintJobs
 #              runs the memory pre-flight, prints "-jN" as the only stdout line, takes NO slot.
 #   Library:   . tools\coordination\build-guard.ps1 -Library
@@ -48,8 +50,9 @@
 #   -MemoryProbeFile   JSON array of {"freePhysGB":n,"freeCommitGB":n}, one sample per poll, last repeats
 #   -ProcessTableFile  JSON array of {"ProcessId":n,"Name":"cc1plus.exe","CreationDate":"<iso>"}
 #   -LockPath / -MutexName / -PollSeconds / -DeadlineMinutes / -LockExpiryMinutes / -ExemptLogPath
-# Exit codes: 3 = refused (memory or slot), 2 = usage, 1 = the command fragment failed without a native
-# exit code, otherwise the exit code of the first native command that failed (0 when none did).
+# Exit codes: 3 = refused (memory or slot), 2 = usage, 1 = the command fragment failed without a non-zero
+# code of its own, otherwise the code of the first native command that failed or of the fragment's own
+# 'exit' (0 when nothing failed).
 [CmdletBinding()]
 param(
     [switch]$Library,
@@ -313,16 +316,84 @@ if (-not $Command.Trim()) {
     exit 2
 }
 
-# The verdict is the FIRST failure in the fragment, which is a sequence (BUILD-GUARD BG-01, BG-02):
+# The verdict is the FIRST failure in the fragment, which is a sequence (BUILD-GUARD BG-01, BG-02, BG-03):
 #   - a native command that exits non-zero stops the fragment, and its own code is returned (9 stays 9), so
 #     a failed qmake cannot be hidden by a later make that exits 0 (PSNativeCommandUseErrorActionPreference);
 #   - a command that cannot start, an error record or a throw stops the fragment and exits 1 (these never
 #     touch LASTEXITCODE, so the guard used to exit 0);
 #   - an error record written with an explicit -ErrorAction Continue does not stop the fragment, but it is
-#     collected by -ErrorVariable and still turns the verdict into exit 1. This fails closed: a record that
-#     was silenced (SilentlyContinue) or caught by a try/catch in the fragment is collected too. Only
+#     collected by -ErrorVariable and still fails the verdict. This fails closed: a record that was
+#     silenced (SilentlyContinue) or caught by a try/catch in the fragment is collected too. Only
 #     -ErrorAction Ignore drops a record.
+# Every way out of the fragment reaches Resolve-BuildGuardFragmentVerdict: falling off the end, a failing
+# native command, a terminating error, and an 'exit', 'break' or 'continue' that leaves the fragment. That
+# last group cannot be caught, so the verdict is taken in a finally and replaces the fragment's own exit
+# (the slot is still released by Invoke-BuildGuard's finally). Each 'exit' statement in the fragment is
+# rewritten to record its code first; a fragment that leaves any other way records nothing and fails.
 # Native stderr (compiler warnings, with or without 2>&1) is not an error record here and fails nothing.
+function Set-BuildGuardFragmentExit($Code) {
+    # Records the code of an 'exit' in the fragment, then hands it back to that exit unchanged.
+    $script:BuildGuardFragmentExit = [int]$Code
+    return $script:BuildGuardFragmentExit
+}
+
+function ConvertTo-BuildGuardFragment([string]$Text) {
+    # 'exit X' becomes 'exit (Set-BuildGuardFragmentExit (X))' and a bare 'exit' records 0, which is what
+    # pwsh exits with. Text that does not parse, before or after, is returned as given: it then fails as a
+    # parse error, or leaves unrecorded, and both are failures.
+    $tokens = $null
+    $parseErrors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseInput($Text, [ref]$tokens, [ref]$parseErrors)
+    if (@($parseErrors).Count -gt 0) { return $Text }
+    $edits = @(foreach ($node in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.ExitStatementAst] }, $true)) {
+            if ($node.Pipeline) {
+                [pscustomobject]@{ At = $node.Pipeline.Extent.EndOffset; Order = 0; Text = '))' }
+                [pscustomobject]@{ At = $node.Pipeline.Extent.StartOffset; Order = 1; Text = '(Set-BuildGuardFragmentExit (' }
+            } else {
+                [pscustomobject]@{ At = $node.Extent.EndOffset; Order = 0; Text = ' (Set-BuildGuardFragmentExit 0)' }
+            }
+        })
+    if ($edits.Count -eq 0) { return $Text }
+    $rewritten = $Text
+    foreach ($edit in ($edits | Sort-Object -Property @{ Expression = 'At'; Descending = $true }, Order)) {
+        $rewritten = $rewritten.Insert($edit.At, $edit.Text)
+    }
+    $parseErrors = $null
+    [void][System.Management.Automation.Language.Parser]::ParseInput($rewritten, [ref]$tokens, [ref]$parseErrors)
+    if (@($parseErrors).Count -gt 0) { return $Text }
+    return $rewritten
+}
+
+function Resolve-BuildGuardFragmentVerdict {
+    # The one verdict for every way out of the fragment. $Code is the fragment's own code: the failing native
+    # command's, the one its 'exit' gave, or 0. A non-zero code is kept (9 stays 9). Any collected error
+    # record, or the error that stopped the fragment, prints BUILD_GUARD_COMMAND_FAILED and turns a zero code
+    # into 1. The record of the native failure itself is not an error here (its code already reports it).
+    param([string]$Label, [string]$Via, [int]$Code, $Collected, $Failure, [string]$Unrecorded = '')
+    $native = [System.Management.Automation.NativeCommandExitException]
+    $records = [System.Collections.Generic.List[object]]::new()
+    foreach ($item in @($Collected)) {
+        if ($item -is [System.Management.Automation.ErrorRecord] -and $item.Exception -isnot $native) { $records.Add($item) }
+    }
+    if ($Failure) {
+        $failureException = if ($Failure -is [System.Management.Automation.ErrorRecord]) { $Failure.Exception } else { $Failure }
+        $seen = $false
+        foreach ($r in $records) { if ([object]::ReferenceEquals($r.Exception, $failureException)) { $seen = $true } }
+        if (-not $seen -and $failureException -isnot $native) { $records.Add($Failure) }
+    }
+    if ($records.Count -eq 0 -and -not $Unrecorded) { return $Code }
+    $verdict = if ($Code -ne 0) { $Code } else { 1 }
+    if ($records.Count -gt 0) {
+        $first = $records[0]
+        $exception = if ($first -is [System.Management.Automation.ErrorRecord]) { $first.Exception } else { $first }
+        $reason = ($exception.GetType().Name + ': ' + $exception.Message) -replace '\s+', ' '
+    } else {
+        $reason = $Unrecorded
+    }
+    [Console]::Error.WriteLine(('BUILD_GUARD_COMMAND_FAILED label={0} lastNativeExit={1} errors={2} exit={3} via={4} reason={5}' -f $Label, [int]$global:LASTEXITCODE, $records.Count, $verdict, $Via, $reason))
+    return $verdict
+}
+
 if ($PSVersionTable.PSVersion -lt [version]'7.4') {
     [Console]::Error.WriteLine("build-guard: command mode needs PowerShell 7.4+ (native exit codes stop the fragment); this is $($PSVersionTable.PSVersion)")
     exit 2
@@ -330,27 +401,40 @@ if ($PSVersionTable.PSVersion -lt [version]'7.4') {
 $script:BuildGuardCommandExit = 0
 Invoke-BuildGuard -Label $Label -RequestedJobs $RequestedJobs -ExemptReason $ExemptReason -Options $guardOptions -Action {
     param($Jobs)
-    $fragment = $Command -replace '\{JOBS\}', [string]$Jobs
+    $fragment = ConvertTo-BuildGuardFragment ($Command -replace '\{JOBS\}', [string]$Jobs)
+    $script:BuildGuardFragmentExit = $null
     $global:LASTEXITCODE = 0
     $ErrorActionPreference = 'Stop'
     $PSNativeCommandUseErrorActionPreference = $true
     $fragmentErrors = $null
     $failure = $null
+    $code = 0
+    $via = ''   # stays empty only when the fragment left by exit, break or continue
     try {
         & ([scriptblock]::Create("[CmdletBinding()] param()`n" + $fragment)) -ErrorVariable fragmentErrors
-        $script:BuildGuardCommandExit = [int]$global:LASTEXITCODE
-        if (@($fragmentErrors).Count -gt 0) { $failure = @($fragmentErrors)[0] }
+        $via = 'end'
+        $code = [int]$global:LASTEXITCODE
     } catch [System.Management.Automation.NativeCommandExitException] {
-        $script:BuildGuardCommandExit = [int]$_.Exception.ExitCode
+        $via = 'native-exit'
+        $code = [int]$_.Exception.ExitCode
         Write-BuildGuardLog ('fragment stopped at its first failing native command: exit={0} {1}' -f $_.Exception.ExitCode, $_.Exception.Message)
     } catch {
+        $via = 'error'
         $failure = $_
-    }
-    if ($failure) {
-        $exception = if ($failure -is [System.Management.Automation.ErrorRecord]) { $failure.Exception } else { $failure }
-        $reason = ($exception.GetType().Name + ': ' + $exception.Message) -replace '\s+', ' '
-        [Console]::Error.WriteLine(('BUILD_GUARD_COMMAND_FAILED label={0} lastNativeExit={1} errors={2} reason={3}' -f $Label, [int]$global:LASTEXITCODE, [math]::Max(1, @($fragmentErrors).Count), $reason))
-        $script:BuildGuardCommandExit = 1
+    } finally {
+        $left = -not $via
+        $unrecorded = ''
+        if ($left -and $null -ne $script:BuildGuardFragmentExit) {
+            $via = 'exit'
+            $code = $script:BuildGuardFragmentExit
+        } elseif ($left) {
+            $via = 'left'
+            $unrecorded = 'the fragment left by an exit, break or continue that recorded no code'
+        }
+        $script:BuildGuardCommandExit = Resolve-BuildGuardFragmentVerdict -Label $Label -Via $via -Code $code -Collected $fragmentErrors -Failure $failure -Unrecorded $unrecorded
+        # The fragment's own exit is still unwinding: replace it with the verdict. Invoke-BuildGuard's
+        # finally runs after this and releases the slot.
+        if ($left) { exit $script:BuildGuardCommandExit }
     }
 }
 exit $script:BuildGuardCommandExit

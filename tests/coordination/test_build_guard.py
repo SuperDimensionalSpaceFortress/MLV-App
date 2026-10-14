@@ -382,6 +382,47 @@ def test_command_mode_does_not_invent_a_failure(box, fragment) -> None:
     assert not box["lock"].exists()
 
 
+@pytest.mark.parametrize(
+    "fragment, code, typed",
+    [
+        ("Write-Error 'BUILD_FAILED_EXIT' -ErrorAction Continue; cmd /c exit 0; exit $LASTEXITCODE", 1, True),
+        ("Write-Error 'BUILD_FAILED_EXIT' -ErrorAction Continue; cmd /c exit 9", 9, True),
+        ("cmd /c exit 0; exit 0", 0, False),
+        ("cmd /c exit 7; exit $LASTEXITCODE", 7, False),
+        ("cmd /c exit 0; exit 5", 5, False),
+        ("& { Write-Error 'BUILD_FAILED_EXIT' -ErrorAction Continue; exit 0 }", 1, True),
+        ("cmd /c exit 0; exit", 0, False),
+        ("cmd /c exit 0; break", 1, True),
+    ],
+    ids=[
+        "error-then-exit-lastexitcode",
+        "error-then-native-9",
+        "clean-explicit-exit-0",
+        "native-7-then-exit-lastexitcode",
+        "clean-explicit-exit-5",
+        "error-then-exit-0-in-nested-block",
+        "clean-bare-exit",
+        "break-out-of-the-fragment",
+    ],
+)
+def test_command_mode_adjudicates_every_way_out_of_the_fragment(box, fragment, code, typed) -> None:
+    # BG-03 (sol r4): an 'exit' in the fragment used to end the guard before the collected error records
+    # were judged, so a failed build read as 0. fable r4: an error record before a failing native command
+    # was dropped from the verdict. Every way out now reaches one verdict: a non-zero code is kept, error
+    # records add the typed line (and turn a zero code into 1), and the slot is released on every path.
+    probe = f"Set-Content -LiteralPath '{box['dir'] / 'held.txt'}' -Value $(Test-Path -LiteralPath '{box['lock']}'); "
+    done = _guard(box, OK_MEMORY, [], [], ["-Command", probe + fragment])
+    assert done.returncode == code, done.stdout + done.stderr
+    typed_lines = [line for line in done.stderr.splitlines() if line.startswith("BUILD_GUARD_COMMAND_FAILED ")]
+    assert bool(typed_lines) == typed, done.stderr
+    if typed:
+        assert f"exit={code} " in typed_lines[0]
+        if "BUILD_FAILED_EXIT" in fragment:
+            assert "errors=1 " in typed_lines[0] and "BUILD_FAILED_EXIT" in typed_lines[0]
+    assert (box["dir"] / "held.txt").read_text(encoding="ascii").strip() == "True"
+    assert not box["lock"].exists(), "the slot must be released on every way out of the fragment"
+
+
 def test_command_mode_without_a_command_is_a_usage_error(box) -> None:
     done = _guard(box, OK_MEMORY, [], [], [])
     assert done.returncode == 2
