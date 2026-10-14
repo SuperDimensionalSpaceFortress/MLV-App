@@ -376,6 +376,7 @@ HEADERS += MainWindow.h \
            PlaybackDecodeRenderOverlap.h \
            PlaybackNativePaceGuard.h \
            PlaybackPresentTrace.h \
+           PlaybackSlotRelease.h \
            PlaybackSwapInterval.h \
            DisplayDeviceMapping.h \
            PlaybackGatePolicy.h \

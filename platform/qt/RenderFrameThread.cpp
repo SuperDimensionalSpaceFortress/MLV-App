@@ -14,6 +14,7 @@
 #include "PlaybackFrameRange.h"
 #include "GpuPreviewHostRoute.h"
 #include "PlaybackQualityPolicy.h"
+#include "PlaybackSlotRelease.h"
 #include "ReconWorker.h"
 
 #include "../../src/batch/WorkerThreadCount.h"
@@ -1545,13 +1546,16 @@ int RenderFrameThread::cancelPlaybackPresentationRequests( uint64_t presentation
     for( int i = 0; i < static_cast<int>( m_frameSlots.size() ); ++i )
     {
         FrameSlot &slot = m_frameSlots[i];
-        if( !slot.presentationContext.playbackActive
-         || slot.presentationContext.presentationGeneration != presentationGeneration )
-        {
-            continue;
-        }
         const SlotState state = slot.state.load( std::memory_order_acquire );
-        if( state != SlotState::Ready && state != SlotState::Presenting )
+        const PlaybackSlotHold hold =
+            state == SlotState::Ready ? PlaybackSlotHold::Ready
+          : state == SlotState::Presenting ? PlaybackSlotHold::Presenting
+          : PlaybackSlotHold::Other;
+        // A Presenting slot stays pinned: its borrower releases it by serial.
+        if( !playbackCancelReleasesSlot( hold,
+                                         slot.presentationContext.playbackActive,
+                                         slot.presentationContext.presentationGeneration,
+                                         presentationGeneration ) )
         {
             continue;
         }
