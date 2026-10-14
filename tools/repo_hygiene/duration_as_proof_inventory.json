@@ -1854,9 +1854,10 @@
       "anchor": "const ULONGLONG deadline = GetTickCount64 ( ) + ( ULONGLONG ) ( wait_ms > 0 ? wait_ms : 0 ) ;",
       "class": "value_fallback_select",
       "clock": "other",
-      "justification": "GPU-FIELD-TELEMETRY-1 r6 session-end terminal drain of the recon DLL: clamps the caller's lock-wait budget (kTerminalDrainWaitMs, clipped to the session-end deadline) to a non-negative deadline for the bounded backend-mutex trylock loop. Selects how long teardown waits; never proof that any stage ran.",
+      "justification": "GPU-FIELD-TELEMETRY-1 r6 session-end terminal drain of the recon DLL: clamps the caller's lock-wait budget (kTerminalDrainWaitMs, clipped to the session-end deadline) to a non-negative deadline for the bounded backend-mutex trylock loop. Selects how long teardown waits; never proof that any stage ran. Two occurrences since GPU-FIELD-TELEMETRY-EXIT-DEADLINE-1: the same clamp opens llrpGpuPlaybackReconGetBackendInfoWithin, the bounded backend-mutex wait session end uses to read the backend description; running out returns 0 with info zeroed (an empty model), so the elapsed time decides only when to give up.",
       "lines": [
-        2121
+        882,
+        2155
       ]
     },
     {
@@ -2080,6 +2081,56 @@
       "justification": "Test (injected times, no clock) that a new begin() starts clean: the first row after it has no previous present, so its interval column is 0. Row existence is asserted by rows().size() above.",
       "lines": [
         128
+      ]
+    },
+    {
+      "path": "platform/qt/GpuFieldTelemetry.cpp",
+      "anchor": "const int ok = waitMs < 0 ? llrpGpuPlaybackReconGetBackendInfo ( & info )",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "GPU-FIELD-TELEMETRY-EXIT-DEADLINE-1 reconDescribe: waitMs is a caller-supplied budget, not a measured duration; -1 (the default) is the sentinel for the unbounded backend-lock read used off the exit path, and any other value selects the bounded llrpGpuPlaybackReconGetBackendInfoWithin read that session end uses. Success is the call's own return plus info.available, never elapsed time.",
+      "lines": [
+        166
+      ]
+    },
+    {
+      "path": "platform/qt/GpuFieldTelemetry.cpp",
+      "anchor": "workerPool ( ) -> waitForDone ( static_cast < int > ( waitMs > 0 ? waitMs : 0 ) ) ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "GPU-FIELD-TELEMETRY-EXIT-DEADLINE-1 runExitWriteWithin: clamps the remaining session-end budget (QDeadlineTimer::remainingTime(), or kSessionEndWaitMs) to non-negative before the bounded QThreadPool::waitForDone, so an expired budget (remainingTime 0) waits 0 ms and a negative value can never reach waitForDone as its wait-forever -1. Decides how long the GUI thread waits for the exit write; whether the write finished is not inferred from the wait (a write still running is left to finish).",
+      "lines": [
+        385
+      ]
+    },
+    {
+      "path": "tests/console/test_gpu_field_telemetry.cpp",
+      "anchor": "\"    workerPool()->waitForDone(static_cast<int>(waitMs > 0 ? waitMs : 0));\" ,",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "GPU-FIELD-TELEMETRY-EXIT-DEADLINE-1 exitJoinCensus: a string literal the source census requires verbatim in GpuFieldTelemetry.cpp (the bounded waitForDone of runExitWriteWithin). Source-text data, never evaluated; no duration is read or compared.",
+      "lines": [
+        1546
+      ]
+    },
+    {
+      "path": "tests/console/test_gpu_field_telemetry.cpp",
+      "anchor": "QStringLiteral ( \"    workerPool()->waitForDone(static_cast<int>(waitMs > 0 ? waitMs : 0));\" ) ,",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "GPU-FIELD-TELEMETRY-EXIT-DEADLINE-1 SessionEndNeverWaitsUnboundedOnTheBackendLockOrTheWrite: the search text of a source mutation (bounded waitForDone replaced by the unbounded waitForDone()) that the census must report. Source-text data, never evaluated; no duration is read or compared.",
+      "lines": [
+        1607
+      ]
+    },
+    {
+      "path": "tests/pipeline/test_gpu_field_telemetry_capture.cpp",
+      "anchor": "ASSERT_TRUE ( held . sessionEndMs >= 0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "GPU-FIELD-TELEMETRY-EXIT-DEADLINE-1 SessionEndReturnsInsideItsBudgetWhileABackendCallHoldsTheLock: sessionEndMs is a std::chrono::steady_clock delta with -1 as the 'never returned in time' sentinel; >= 0 is non-negativity (0 ms passes), so it cannot distinguish ran from did not run. That session end returned is proven by ASSERT_TRUE(held.closedInTime) above, and that it wrote its record by the session_end flush and gpu_model line counts below; the duration is only the upper-bound check on the next line.",
+      "lines": [
+        1298
       ]
     }
   ]

@@ -19,6 +19,7 @@
 #include "../../src/mlv/llrawproc/llrawproc.h"
 #include "../../platform/qt/GpuDebayer.h"
 #include "../../platform/qt/GpuFieldTelemetry.h"
+#include "../../platform/qt/GpuFieldTelemetryCore.h"
 #include "../../tools/gpu/backend/igpu_cuda_error_slot.h"
 
 #include <QByteArray>
@@ -26,6 +27,9 @@
 #include <QFile>
 #include <QTemporaryDir>
 
+#include <atomic>
+#include <chrono>
+#include <cstdio>
 #include <cstdint>
 #include <set>
 #include <string>
@@ -40,6 +44,7 @@ extern "C" void llrpFakeGpuBackendNoteCudaErrorForTesting(int channel, int cuda_
 extern "C" void llrpFakeGpuBackendArmCudaNoteForTesting(int channel, int cuda_code, const char * name, const char * site);
 extern "C" long llrpFakeGpuBackendCudaErrorsPendingForTesting(int channel, unsigned long long * dropped_total);
 extern "C" int llrpFakeGpuBackendFailCreateForTesting(void);
+extern "C" void llrpHoldGpuReconBackendMutexForTesting(int hold);
 
 namespace
 {
@@ -1219,6 +1224,92 @@ TEST(GpuFieldTelemetryCapture, FaultBeforeSessionEndIsWrittenOnceAndThePostRouti
     ASSERT_EQ(1, (int)linesWith(lines, {"\"kind\":\"flush\"", "\"reason\":\"session_end\""}).size());
     ASSERT_EQ(0, (int)linesWith(lines, {"\"kind\":\"fault\""}).size());
     ASSERT_EQ(0, (int)linesWith(lines, {"\"reason\":\"post_session\""}).size());
+}
+
+namespace
+{
+// EXIT-DEADLINE-1: appCloseForTesting on another thread, with the backend mutex held by a third (as a
+// backend call stuck at close holds it) when `holdLock`. Waits at most `giveUpMs` for the close, then
+// releases the lock and joins, so a close that blocks on the mutex fails the caller instead of hanging
+// the suite. sessionEndMs: how long session end (aboutToQuit) took; -1 if it never returned in time.
+struct TimedClose
+{
+    bool closedInTime = false;
+    long long sessionEndMs = -1;
+};
+
+TimedClose closeWhileHoldingTheBackendLock(const QTemporaryDir & dir, bool holdLock, long long giveUpMs)
+{
+    using Clock = std::chrono::steady_clock;
+    std::atomic<bool> held{false};
+    std::atomic<bool> release{false};
+    std::thread holder([&]() {
+        if (holdLock) llrpHoldGpuReconBackendMutexForTesting(1);
+        held.store(true);
+        while (!release.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        if (holdLock) llrpHoldGpuReconBackendMutexForTesting(0);
+    });
+    while (!held.load()) std::this_thread::yield();
+
+    std::atomic<long long> sessionEndMs{-1};
+    std::atomic<bool> closed{false};
+    const QString path = dir.path();
+    std::thread closer([&]() {
+        Clock::time_point start;
+        GpuFieldTelemetry::appCloseForTesting(path, [&start]() { start = Clock::now(); }, [&]() {
+            sessionEndMs.store(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start).count());
+        });
+        closed.store(true);
+    });
+    const Clock::time_point giveUp = Clock::now() + std::chrono::milliseconds(giveUpMs);
+    while (!closed.load() && Clock::now() < giveUp) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    TimedClose out;
+    out.closedInTime = closed.load();
+    out.sessionEndMs = out.closedInTime ? sessionEndMs.load() : -1;
+    release.store(true);
+    holder.join();
+    closer.join();
+    return out;
+}
+} // namespace
+
+// EXIT-DEADLINE-1 (fable DESCRIBE-CACHED-1, sol EXIT-JOIN-1): a backend call still inside the recon DLL
+// at app close holds the backend mutex. The terminal drain gives up after kTerminalDrainWaitMs; the
+// session_end flush must not then wait on that same mutex for the backend description. Session end
+// returns inside kSessionEndWaitMs (plus scheduling slack) and still writes its record, without the
+// model it could not read. With the lock free the record is unchanged: it carries the backend's model.
+// On e8b04c7f sessionEnd's flush called reconDescribe -> llrpGpuPlaybackReconGetBackendInfo, which
+// locks the mutex unconditionally: aboutToQuit blocked for as long as the call held it.
+TEST(GpuFieldTelemetryCapture, SessionEndReturnsInsideItsBudgetWhileABackendCallHoldsTheLock)
+{
+    namespace core = GpuFieldTelemetryCore;
+    constexpr long long kSlackMs = 250;
+    const long long giveUpMs = 2 * core::kSessionEndWaitMs + 1000;
+    const FakeGpuBackendScope fake;
+    int rc = -99;
+    ASSERT_NE(0, runOnce(1, &rc));
+
+    QTemporaryDir heldDir;
+    ASSERT_TRUE(heldDir.isValid());
+    const TimedClose held = closeWhileHoldingTheBackendLock(heldDir, true, giveUpMs);
+    std::printf("[exit-deadline] lock held: closed_in_time=%d session_end_ms=%lld budget_ms=%lld\n",
+                held.closedInTime ? 1 : 0, held.sessionEndMs, core::kSessionEndWaitMs + kSlackMs);
+    ASSERT_TRUE(held.closedInTime);
+    ASSERT_TRUE(held.sessionEndMs >= 0);
+    ASSERT_TRUE(held.sessionEndMs <= core::kSessionEndWaitMs + kSlackMs);
+    std::vector<std::string> lines = logLines(heldDir);
+    ASSERT_EQ(1, (int)linesWith(lines, {"\"kind\":\"flush\"", "\"reason\":\"session_end\""}).size());
+    ASSERT_EQ(1, (int)linesWith(lines, {"\"kind\":\"session\"", "\"gpu_model\":\"\""}).size());
+
+    QTemporaryDir freeDir;
+    ASSERT_TRUE(freeDir.isValid());
+    const TimedClose unheld = closeWhileHoldingTheBackendLock(freeDir, false, giveUpMs);
+    ASSERT_TRUE(unheld.closedInTime);
+    ASSERT_TRUE(unheld.sessionEndMs <= core::kSessionEndWaitMs + kSlackMs);
+    lines = logLines(freeDir);
+    ASSERT_EQ(1, (int)linesWith(lines, {"\"kind\":\"flush\"", "\"reason\":\"session_end\""}).size());
+    ASSERT_EQ(1, (int)linesWith(lines, {"\"kind\":\"session\"",
+                                        "\"gpu_model\":\"fake-test-backend (no GPU, C-seam only)\""}).size());
 }
 
 namespace

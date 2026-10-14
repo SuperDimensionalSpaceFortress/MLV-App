@@ -268,6 +268,8 @@ int llrpGpuPlaybackReconGetLastPreparedState(llrpGpuPlaybackReconState_t * state
 size_t llrpGpuPlaybackReconGetLastInputBayer16(uint16_t * output,
                                                size_t output_words);
 int llrpGpuPlaybackReconGetBackendInfo(llrpGpuPlaybackReconBackendInfo_t * info);
+/* As above, waiting at most wait_ms for the backend lock; 0 if it ran out. */
+int llrpGpuPlaybackReconGetBackendInfoWithin(llrpGpuPlaybackReconBackendInfo_t * info, int wait_ms);
 int llrpGpuPlaybackReconPreuploadFrame(uint64_t frame_id,
                                       const uint16_t * raw_input_bayer14,
                                       size_t raw_image_size);
