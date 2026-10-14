@@ -288,6 +288,25 @@ TEST(RawUint16PrefetchParallel, KillSwitchRestoresOneDecoder)
     ASSERT_EQ( 0u, stats.decoders );
 }
 
+// LJ92-K-CORE-CLAMP-1: the default and env K are bounded by the host, K = min(requested, max(1, cores - 2)), leaving
+// a core each for the decode worker and the render thread; a small host never oversubscribes and K never drops below 1.
+TEST(RawUint16PrefetchParallel, DecoderCountIsBoundedByHostCores)
+{
+    const int cores[] = { 1, 2, 3, 4, 8, 16 };
+    const int defaultK[] = { 1, 1, 1, 2, 2, 2 };   // the default K = 2
+    const int maxK[] = { 1, 1, 1, 2, 4, 4 };       // an explicit env K = MLV_RAW_UINT16_PREFETCH_MAX_DECODERS
+    for( size_t i = 0; i < sizeof( cores ) / sizeof( cores[0] ); ++i )
+    {
+        const int defaultRequested = mlvRawUint16PrefetchDecodersFromEnvValueForTesting( nullptr );
+        ASSERT_EQ( defaultK[i], mlvRawUint16PrefetchBoundDecodersForTesting( defaultRequested, cores[i] ) );
+        const int envRequested = mlvRawUint16PrefetchDecodersFromEnvValueForTesting( "4" );
+        ASSERT_EQ( maxK[i], mlvRawUint16PrefetchBoundDecodersForTesting( envRequested, cores[i] ) );
+        ASSERT_EQ( 1, mlvRawUint16PrefetchBoundDecodersForTesting( 1, cores[i] ) );
+    }
+    // An unknown core count (the probe failed) leaves K as requested.
+    ASSERT_EQ( 2, mlvRawUint16PrefetchBoundDecodersForTesting( 2, 0 ) );
+}
+
 // The object-scoped counters carry the worker's own LJ92 time, which the decode thread's thread-locals never see.
 TEST(RawUint16PrefetchParallel, StatsCountWorkerLj92Time)
 {
