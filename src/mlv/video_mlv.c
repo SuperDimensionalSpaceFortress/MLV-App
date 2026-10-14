@@ -1331,7 +1331,10 @@ static void mlv_raw_uint16_count_decode_for_testing(uint64_t frameIndex)
 /* PLAYBACK-LJ92-DECODE-THROUGHPUT-1: one LJ92 frame is a single scan with no restart markers (lj92.c parseImage),
  * so a frame cannot be split across threads; throughput comes from K decoders working on DIFFERENT frames.
  * MLVAPP_RAW_UINT16_PREFETCH_DECODERS sets K (read once, clamped to 1..MLV_RAW_UINT16_PREFETCH_MAX_DECODERS; unset or
- * unparsable means the default). MLVAPP_DISABLE_RAW_UINT16_PREFETCH=1 still means no prefetch at all. */
+ * unparsable means the default). LJ92-K-CORE-CLAMP-1: the env or default K is then bounded by the host's logical cores
+ * (read once), K = min(K, max(1, cores - 2)), leaving a core each for the decode worker and the render thread; an
+ * unknown core count leaves K as is. The test override is not bounded. MLVAPP_DISABLE_RAW_UINT16_PREFETCH=1 still
+ * means no prefetch at all. */
 #define MLV_RAW_UINT16_PREFETCH_DEFAULT_DECODERS 2
 
 static int mlv_raw_uint16_prefetch_decoders_from_env_value(const char * value)
@@ -1346,12 +1349,35 @@ static int mlv_raw_uint16_prefetch_decoders_from_env_value(const char * value)
     return (int)parsed;
 }
 
+/* min(requested, max(1, cpu_cores - 2)); cpu_cores <= 0 (unknown) and requested <= 1 pass through. */
+static int mlv_raw_uint16_prefetch_bound_decoders(int requested, int cpu_cores)
+{
+    if (requested <= 1 || cpu_cores <= 0) return requested;
+    const int cap = cpu_cores > 3 ? cpu_cores - 2 : 1;
+    return requested < cap ? requested : cap;
+}
+
+/* Logical cores available to the process; 0 when unknown. */
+static int mlv_host_logical_cores(void)
+{
+#if defined(_WIN32)
+    const long cores = (long)pthread_num_processors_np();
+#elif defined(_SC_NPROCESSORS_ONLN)
+    const long cores = sysconf(_SC_NPROCESSORS_ONLN);
+#else
+    const long cores = 0;
+#endif
+    return (cores > 0 && cores < INT_MAX) ? (int)cores : 0;
+}
+
 static int mlv_raw_uint16_prefetch_env_decoders(void)
 {
     static int decoders = -1;
     if (decoders < 0)
     {
-        decoders = mlv_raw_uint16_prefetch_decoders_from_env_value(getenv("MLVAPP_RAW_UINT16_PREFETCH_DECODERS"));
+        decoders = mlv_raw_uint16_prefetch_bound_decoders(
+            mlv_raw_uint16_prefetch_decoders_from_env_value(getenv("MLVAPP_RAW_UINT16_PREFETCH_DECODERS")),
+            mlv_host_logical_cores());
     }
     return decoders;
 }
@@ -9259,6 +9285,11 @@ void mlvSetRawUint16PrefetchDecodersForTesting(int k)
 int mlvRawUint16PrefetchDecodersFromEnvValueForTesting(const char * value)
 {
     return mlv_raw_uint16_prefetch_decoders_from_env_value(value);
+}
+
+int mlvRawUint16PrefetchBoundDecodersForTesting(int requestedK, int cpuCores)
+{
+    return mlv_raw_uint16_prefetch_bound_decoders(requestedK, cpuCores);
 }
 
 int mlvRawUint16PrefetchClaimsForTesting(mlvObject_t * video, int foreground, uint64_t * frames, int capacity)

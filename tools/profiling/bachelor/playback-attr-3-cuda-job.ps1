@@ -1014,19 +1014,20 @@ if ($PostRunSeconds -gt 0) { $timeBudgetArgs['PostRunSeconds'] = $PostRunSeconds
 # PLAYBACK-CLIP-LENGTH-ENFORCE-1: the smoke-process timeout keeps the old 40 s play allowance as a
 # floor (extra slack only; the default baked timeout is unchanged) and grows with a longer -PlaySeconds.
 $timeBudgetArgs['PlaySeconds'] = [int][Math]::Max(40, $PlaySeconds)
+# HFR-NATIVE-M16-1457-TIMEBUDGET-1 extends CPU-LEG-SMOKE-CEILING-1 to every backend: the job's own full margined identity read precedes the runner on every backend, so the
+# runner's 3600 s only holds the app's re-read, bounded at the measured cold rate with no margin (see Get-AttrCudaLegTimeBudget). A fixture reads no input and never clamps;
+# an input that fits the unshared budget is unchanged.
+$timeBudgetArgs['ShareSmokeCeiling'] = $true
 # CPU-LOOK-LEG-PACE-ABORT-1: a cpu leg's Play may run to the CPU ceiling (Get-GuiSmokePlaySafetyMs -CpuPaceInformational: requested / (1/30)
 # + 15 s), so the smoke-process timeout, the PresentMon capture ceiling and the um-run -TimeoutSec derived from it must cover that ceiling
 # -- one derivation (the runner's), never a second hard-coded number.
 if ($cpuPlayPaceInformational) {
     $timeBudgetArgs['PlaySeconds'] = [int][Math]::Max($timeBudgetArgs['PlaySeconds'],
         [Math]::Ceiling((Get-GuiSmokePlaySafetyMs -Seconds $PlaySeconds -CpuPaceInformational) / 1000.0))
-    # CPU-LEG-SMOKE-CEILING-1: the runner caps a process timeout at 3600 s, and a ~3.2 GB owner input at the measured read rate plus that 765 s ceiling does not fit it
-    # with the identity read repeated at full margin. The budget shares the 3600 s instead (see Get-AttrCudaLegTimeBudget); CUDA never asks for it (a fixture CPU leg does, but has zero input bytes and so never clamps).
-    $timeBudgetArgs['ShareSmokeCeiling'] = $true
 }
 $timeBudget = Get-AttrCudaLegTimeBudget -InputBytes $clipBytesForBudget @timeBudgetArgs
 if ($timeBudget.smokeCeilingClamped) {
-    Write-Warning ("CPU-LEG-SMOKE-CEILING-1: this cpu leg's smoke timeout is held at the runner's 3600 s ceiling; the app's in-runner re-read allowance is $($timeBudget.appReadAllowanceSec) s " +
+    Write-Warning ("CPU-LEG-SMOKE-CEILING-1: this leg's smoke timeout is held at the runner's 3600 s ceiling; the app's in-runner re-read allowance is $($timeBudget.appReadAllowanceSec) s " +
         "(the job's own identity read keeps $($timeBudget.identityReadSec) s in the um-run timeout of $($timeBudget.jobTimeoutSec) s).")
 }
 
