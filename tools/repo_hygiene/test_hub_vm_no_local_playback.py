@@ -85,6 +85,37 @@ def _baseline_lint_source() -> tuple[str, str] | None:
     return None
 
 
+# PREVIOUS-HEAD DIFFERENTIAL (r7; CoS Prevention on PR #448 a595464f, ruling candidate mlv-safety-lint-exemption-defeater-corpus-r1).
+# The differential against master cannot see a narrowing that undoes the PREVIOUS head's own safety gains: a row the previous head
+# refused and master passes shows as zero flips against master. Every round therefore also runs the corpus against the lint of the PR
+# head the round STARTED from. EACH ROUND MOVES THIS to the head it started from (r7 started from r6 4957fff0). It is checked to be an
+# ancestor of HEAD, so a rebase that drops it fails loudly in CI instead of silently weakening the gate.
+PREVIOUS_PR_HEAD = "4957fff04b81f224840d37efb4e780cde9352ed6"
+
+
+def _previous_head_lint_source() -> tuple[str, str] | None:
+    """(ref, text) of the lint at PREVIOUS_PR_HEAD, or None when that commit is not in this clone."""
+    done = subprocess.run(["git", "-C", str(ROOT), "show", f"{PREVIOUS_PR_HEAD}:{LINT_REL}"], capture_output=True, timeout=60)
+    if done.returncode == 0 and done.stdout:
+        return PREVIOUS_PR_HEAD[:8], done.stdout.decode("utf-8")
+    return None
+
+
+def _require_previous_head_lint() -> tuple[str, str]:
+    """(ref, text) of the lint at PREVIOUS_PR_HEAD. Skips once master already carries this lint (a squash-merged PR head is no longer
+    reachable, and the comparison is moot); a missing commit FAILS in hosted CI (fetch-depth: 0) and skips in a clone without history."""
+    base = _baseline_lint_source()
+    if base is not None and base[1].replace("\r\n", "\n") == LINT_PS1.read_text(encoding="utf-8").replace("\r\n", "\n"):
+        raise unittest.SkipTest(f"{base[0]} already carries this lint; the previous PR head is no longer a baseline")
+    prev = _previous_head_lint_source()
+    if prev is None:
+        message = f"previous PR head {PREVIOUS_PR_HEAD[:8]} is not in this clone; the previous-head differential needs the PR history"
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            raise AssertionError(message + " -- the hygiene jobs check out with fetch-depth: 0, so a missing commit is a stale PREVIOUS_PR_HEAD or a broken checkout")
+        raise unittest.SkipTest(message)
+    return prev
+
+
 def _psq(path: object) -> str:
     """A path as a PowerShell single-quoted literal (an apostrophe in the path is doubled, never ends the string)."""
     return "'" + str(path).replace("'", "''") + "'"
@@ -189,6 +220,18 @@ LATER_LAUNCH_VERBS = ("run", "play", "open", "start", "launch", "execute")
 LATER_OBJECTS = ("the clip", "the build", "this", "it")
 LATER_HOST_TAILS = ("here", "on this host", "on my machine", "locally")
 HOST_MODIFIER_POOL = ("same", "very", "Windows", "physical")
+# r7 axes (CoS review of PR #448 r5 head a595464f, pr-448.md on bus eefcc03): a direct launcher line (Rule 4) carries no local marker,
+# so the venue phrase is the only evidence of where it runs. A host noun introduced by a LOCUS preposition (it says where the work runs)
+# or a host name defeats the venue exemption there; a host noun that is a DESTINATION (to / into / from) does not.
+# (the locus prepositions are read from the lint: Get-LocalPlaybackLintWordLists .HostLocusPrepositions)
+LAUNCH_DESTINATION_PREPOSITIONS = ("to", "into", "from")
+LAUNCH_LINES = (
+    f"pwsh -File tools/profiling/{SMOKE_SCRIPT} -Backend cpu",
+    f"& ./tools/profiling/{SMOKE_SCRIPT} -Backend cpu",
+    f"Run tools/profiling/{SMOKE_SCRIPT} -Backend cpu",
+    f"{APP} clip.mlv {SMOKE_MODE}",
+)
+LAUNCH_VENUE_PHRASES = ("on Bachelor", "through the venue chain")
 
 
 def _list_member_rows(lists: dict[str, list[str]]) -> list[tuple[str, bool, str]]:
@@ -258,6 +301,44 @@ def _list_member_rows(lists: dict[str, list[str]]) -> list[tuple[str, bool, str]
         add("venue-word-possessive", True, f"Run playback locally on {w}'s clip.")
     for c in list(lists["ContrastWords"]) + ["not"]:
         add("contrast-word-then-local-host", True, f"Run playback on Bachelor {c} locally, then here.")
+    # r7 axes (Rule 4, direct launch; CoS Improvement on a595464f). Every launcher form x venue phrase x host reference. The full
+    # determiner x noun x locus-preposition product runs on the first launcher form (the pwsh -File line); the other forms take every
+    # noun with `this` and every host name, so each launcher shape and each list member is on a Rule 4 line at least once.
+    first = LAUNCH_LINES[0]
+    for ven in LAUNCH_VENUE_PHRASES:
+        for prep in lists["HostLocusPrepositions"]:
+            for det in lists["HostDeterminers"]:
+                for noun in lists["HostNouns"]:
+                    add("launch-host-locus-det-noun", True, f"{first} {ven} and {prep} {det} {noun}.")
+            for noun in lists["HostNouns"]:
+                add("launch-host-locus-bare-noun", True, f"{first} {ven} and {prep} {noun}.")
+                add("launch-host-locus-vm-suffix", True, f"{first} {ven} and {prep} the {noun}-VM.")
+                for line in LAUNCH_LINES[1:]:
+                    add("launch-host-locus-other-forms", True, f"{line} {ven} and {prep} this {noun}.")
+        for det in lists["HostDeterminers"]:
+            for noun in lists["HostNouns"]:
+                add("launch-host-locus-same-clause", True, f"{first} {ven} on {det} {noun}.")
+                add("launch-host-locus-possessive", True, f"{first} {ven} using {det} {noun}'s GPU.")
+                add("launch-host-locus-later-clause", True, f"{first} {ven}, then run it on {det} {noun}.")
+            for mod in HOST_MODIFIER_POOL:
+                add("launch-host-locus-modifier", True, f"{first} {ven} and on {det} {mod} {noun}.")
+        for line in LAUNCH_LINES:
+            for name in lists["HostNames"]:
+                add("launch-host-name", True, f"{line} {ven} and on {name}.")
+                add("launch-host-name-bare", True, f"{line} {ven} and {name}.")
+            for word in list(lists["HostNouns"]) + list(lists["HostNames"]):
+                if " " not in word:
+                    continue
+                for variant in (word.replace(" ", "-"), word.replace(" ", ""), word.replace(" ", "-").upper()):
+                    add("launch-host-spelling-variant", True, f"{line} {ven} and on the {variant}.")
+            add("launch-venue-control", False, f"{line} {ven}.")
+            add("launch-venue-control", False, f"The venue job calls {line} {ven}.")
+            add("launch-venue-control", False, f"{line} {ven} and posts the result to the hub.")
+            add("launch-venue-control", False, f"{line} {ven}, then post the log to the hub.")
+        for prep in LAUNCH_DESTINATION_PREPOSITIONS:
+            for det in lists["HostDeterminers"]:
+                for noun in lists["HostNouns"]:
+                    add("launch-host-destination-control", False, f"{first} {ven} and copies the clip {prep} {det} {noun}.")
     return [(g, r, t) for t, (g, r) in rows.items()]
 
 
@@ -331,14 +412,18 @@ def _differential_corpus(seeds: tuple[str, ...], members: tuple = ()) -> dict[st
     return rows
 
 
-def _differential_flips(work: Path, baseline_text: str | None = None) -> tuple[str, list[tuple[str, dict]], list[tuple[str, dict]], int]:
+def _differential_flips(work: Path, baseline_text: str | None = None, previous_head: bool = False) -> tuple[str, list[tuple[str, dict]], list[tuple[str, dict]], int]:
     """Run baseline and candidate lints over the corpus. -> (baseline ref, refuse->pass rows, pass->refuse rows, corpus size).
 
     `baseline_text` replaces the git baseline (the identical-baseline row feeds the candidate's own text, which is the state of master
     right after the change merges). With no baseline ref and no override: a hosted CI job (fetch-depth: 0 in tests.yml) FAILS, because a
-    pin that skips there guards nothing; a local clone without history skips."""
+    pin that skips there guards nothing; a local clone without history skips.
+    `previous_head` takes the baseline from PREVIOUS_PR_HEAD instead of master (r7). That commit is not on master once the PR is
+    squash-merged, so when master's lint already IS the candidate the comparison is moot and the pin skips."""
     if baseline_text is not None:
         ref, text = "candidate-itself", baseline_text
+    elif previous_head:
+        ref, text = _require_previous_head_lint()
     else:
         base = _baseline_lint_source()
         if base is None:
@@ -350,6 +435,7 @@ def _differential_flips(work: Path, baseline_text: str | None = None) -> tuple[s
     baseline = work / "baseline-lint.ps1"
     baseline.write_text(text, encoding="utf-8")
     corpus = _differential_corpus(PromptLintTests.CLAUSE_MUST_REFUSE + PromptLintTests.CLAUSE_MUST_PASS + PromptLintTests.CLAUSE_MUST_PASS_R6
+                                  + PromptLintTests.CLAUSE_MUST_REFUSE_R7 + PromptLintTests.CLAUSE_MUST_PASS_R7
                                   + PromptLintTests.PROBE_ROWS
                                   + tuple(text for _, _, text in PromptLintTests.DEFEATER_AXIS) + PromptLintTests.DEFEATER_AXIS_CONTROLS,
                                   members=tuple(_list_member_rows(_lint_word_lists(LINT_PS1, work))))
@@ -662,6 +748,39 @@ class PromptLintTests(unittest.TestCase):
         "Run playback locally on Bachelor and on hub.",
         "Run playback locally on Bachelor and on 127.0.0.1.",
     )
+    # r7 (CoS review of PR #448 r5 head a595464f, pr-448.md on bus eefcc03, first Improvement; the hub's probe of r6 4957fff0 found 10
+    # of these still passing): Rule 4 (a direct launcher line, no `locally`) with a SECOND, local locus after the venue. r5 eb3d5f81
+    # refused them, r5-follow-up a595464f narrowed Rule 4 to the r4 defeaters to keep a destination (`posts the result to the hub`) green
+    # and gave them back, r6 did not restore them. Master passes every row (its venue exemption is sentence-wide), so each is a
+    # pass -> refuse flip vs master, listed in ALLOWED_PASS_TO_REFUSE ("direct-launch-second-local-locus"). The first ten are the CoS
+    # note's rows verbatim (hub copy: lane-HUB-TICK-20261015T1258Z/cos-448-a595-rule4-rows.txt).
+    CLAUSE_MUST_REFUSE_R7 = (
+        f"pwsh -File tools/profiling/{SMOKE_SCRIPT} -Backend cpu on Bachelor and on my machine.",
+        f"pwsh -File tools/profiling/{SMOKE_SCRIPT} -Backend cpu on Bachelor and on localhost.",
+        f"pwsh -File tools/profiling/{SMOKE_SCRIPT} -Backend cpu on Bachelor and on this workstation.",
+        f"pwsh -File tools/profiling/{SMOKE_SCRIPT} -Backend cpu on Bachelor and on this desktop.",
+        f"pwsh -File tools/profiling/{SMOKE_SCRIPT} -Backend cpu on Bachelor and on my laptop.",
+        f"pwsh -File tools/profiling/{SMOKE_SCRIPT} -Backend cpu on Bachelor and on this PC.",
+        f"pwsh -File tools/profiling/{SMOKE_SCRIPT} -Backend cpu on Bachelor using this host's GPU.",
+        f"pwsh -File tools/profiling/{SMOKE_SCRIPT} -Backend cpu on Bachelor, then run it on my machine.",
+        f"& ./tools/profiling/{SMOKE_SCRIPT} -Backend cpu on Bachelor and on my machine.",
+        f"Run tools/profiling/{SMOKE_SCRIPT} -Backend cpu on Bachelor and on my machine.",
+        # the note's other named rows: the MLVApp launcher form, and the HUB-VM spelling that passed on every version through r6
+        f"{APP} clip.mlv {SMOKE_MODE} on Bachelor and on localhost.",
+        f"pwsh -File tools/profiling/{SMOKE_SCRIPT} -Backend cpu on Bachelor and on the HUB-VM.",
+        # the r6 tip's stated, fail-closed difference (the note's second Improvement): a purpose / destination complement after the
+        # venue name (`via Bachelor to this host`) makes the venue an instrument, not the place the work runs -- refused since r5, kept.
+        f"pwsh -File tools/profiling/{SMOKE_SCRIPT} -Backend cpu via Bachelor to this host.",
+        f"pwsh -File tools/profiling/{SMOKE_SCRIPT} -Backend cpu through the venue chain to this host.",
+    )
+    # r7 CONTROLS: a host noun that is a DESTINATION on a venue launcher line stays passing (both a595464f controls and the copy row).
+    CLAUSE_MUST_PASS_R7 = (
+        f"The venue job calls tools/profiling/{SMOKE_SCRIPT} -Backend cpu on Bachelor and posts the result to the hub.",
+        f"pwsh -File tools/profiling/{SMOKE_SCRIPT} -Backend cpu on Bachelor and copies the clip to this host.",
+        f"pwsh -File tools/profiling/{SMOKE_SCRIPT} -Backend cpu on Bachelor, then post the log to the hub.",
+        f"{APP} clip.mlv {SMOKE_MODE} on Bachelor and posts the result to the hub.",
+        f"& ./tools/profiling/{SMOKE_SCRIPT} -Backend cpu through the venue chain and fetches the log from the hub VM.",
+    )
     # r6 ALLOW list: the venue route still works when no local-host reference appears anywhere in the sentence, across every joiner the
     # r6 rows use. (The exemption is narrowed to "nothing local is named", never removed.)
     CLAUSE_MUST_PASS_R6 = (
@@ -761,8 +880,13 @@ class PromptLintTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertTrue(self._findings(text), text)
 
+    def test_red_direct_launch_lines_with_a_second_local_locus_are_refused(self):
+        for text in self.CLAUSE_MUST_REFUSE_R7:
+            with self.subTest(text=text):
+                self.assertTrue(self._findings(text), text)
+
     def test_green_clause_scope_venue_routed_wordings_pass(self):
-        for text in self.CLAUSE_MUST_PASS + self.CLAUSE_MUST_PASS_R6:
+        for text in self.CLAUSE_MUST_PASS + self.CLAUSE_MUST_PASS_R6 + self.CLAUSE_MUST_PASS_R7:
             with self.subTest(text=text):
                 self.assertEqual([], self._findings(text), text)
 
@@ -830,7 +954,7 @@ class ListMemberDefeaterTests(unittest.TestCase):
 
     def test_the_lint_exposes_every_list_the_exemptions_depend_on(self):
         for key in ("VenueWords", "RoutingPrepositionsLocally", "RoutingPrepositionsVenue", "VenueFollowLocus", "VenueFollowPhrases",
-                    "HostDeterminers", "HostNouns", "HostNames", "HostPrepositions", "ContrastWords"):
+                    "HostDeterminers", "HostNouns", "HostNames", "HostPrepositions", "HostLocusPrepositions", "ContrastWords"):
             self.assertTrue(self.lists.get(key), f"list {key} is missing or empty")
 
     def test_the_lint_builds_its_patterns_from_those_lists(self):
@@ -839,7 +963,7 @@ class ListMemberDefeaterTests(unittest.TestCase):
         text = LINT_PS1.read_text(encoding="utf-8")
         body = text[text.index("function Get-LocalPlaybackPromptFindings"):]
         self.assertIn("Get-LocalPlaybackLintWordLists", body)
-        for key in ("VenueFollowLocus", "VenueFollowPhrases", "HostDeterminers", "HostNouns", "HostNames", "HostPrepositions", "ContrastWords",
+        for key in ("VenueFollowLocus", "VenueFollowPhrases", "HostDeterminers", "HostNouns", "HostNames", "HostPrepositions", "HostLocusPrepositions", "ContrastWords",
                     "RoutingPrepositionsLocally", "RoutingPrepositionsVenue", "VenueWords"):
             self.assertIn(f"$lists.{key}", body, f"the findings function does not read list {key}")
         self.assertNotRegex(body, r"\$venueFollow\s*=\s*'", "a literal follow alternation came back")
@@ -861,11 +985,20 @@ class ListMemberDefeaterTests(unittest.TestCase):
                   "later-clause-then-host", "host-reference-modifier", "host-reference-two-modifiers", "host-reference-vm-suffix",
                   "host-reference-spelling-variant", "host-name-spelling-variant", "host-reference-bare-preposition",
                   "e1-preposition-possessive", "e3-preposition-then-host", "venue-word-control",
-                  "venue-word-then-host", "venue-word-possessive", "contrast-word-then-local-host"):
+                  "venue-word-then-host", "venue-word-possessive", "contrast-word-then-local-host",
+                  "launch-host-locus-det-noun", "launch-host-locus-bare-noun", "launch-host-locus-vm-suffix", "launch-host-locus-other-forms",
+                  "launch-host-locus-same-clause", "launch-host-locus-possessive", "launch-host-locus-later-clause",
+                  "launch-host-locus-modifier", "launch-host-name", "launch-host-name-bare", "launch-host-spelling-variant",
+                  "launch-venue-control", "launch-host-destination-control"):
             self.assertIn(g, groups, f"no rows generated for {g}")
         # preposition x determiner x noun is the full product, not a sample
         product = len(HOST_REF_PREPOSITIONS) * len(self.lists["HostDeterminers"]) * len(self.lists["HostNouns"])
         self.assertGreaterEqual(sum(1 for g, _, _ in self.rows if g == "host-reference-prep-det-noun"), product)
+        # r7: the same on a Rule 4 launcher line -- locus preposition x determiner x noun x venue phrase, every member of the host lists
+        launch = len(self.lists["HostLocusPrepositions"]) * len(self.lists["HostDeterminers"]) * len(self.lists["HostNouns"]) * len(LAUNCH_VENUE_PHRASES)
+        self.assertGreaterEqual(sum(1 for g, _, _ in self.rows if g == "launch-host-locus-det-noun"), launch)
+        for name in self.lists["HostNames"]:
+            self.assertTrue(any(g == "launch-host-name" and name in t for g, _, t in self.rows), f"no Rule 4 row for host name {name}")
 
     def _group(self, group: str, refuse: bool) -> None:
         rows = [t for g, r, t in self.rows if g == group]
@@ -895,6 +1028,19 @@ class ListMemberDefeaterTests(unittest.TestCase):
         for g in ("host-reference-modifier", "host-reference-two-modifiers", "host-reference-vm-suffix", "host-reference-spelling-variant",
                   "host-name-spelling-variant", "host-reference-bare-preposition"):
             self._group(g, True)
+
+    def test_red_every_host_reference_defeats_a_direct_launch_line(self):
+        """r7, Rule 4: the same list members, on a direct launcher line whose only evidence of where it runs is the venue phrase.
+        A host noun introduced by a locus preposition (on / at / in / using), or a host name, defeats the venue exemption."""
+        for g in ("launch-host-locus-det-noun", "launch-host-locus-bare-noun", "launch-host-locus-vm-suffix", "launch-host-locus-other-forms",
+                  "launch-host-locus-same-clause", "launch-host-locus-possessive", "launch-host-locus-later-clause",
+                  "launch-host-locus-modifier", "launch-host-name", "launch-host-name-bare", "launch-host-spelling-variant"):
+            self._group(g, True)
+
+    def test_green_a_destination_on_a_direct_launch_line_still_passes(self):
+        """r7 controls: `to | into | from` + determiner + host noun is a destination, not a locus -- every member, every launcher form."""
+        self._group("launch-host-destination-control", False)
+        self._group("launch-venue-control", False)
 
     def test_red_every_routing_preposition_needs_a_locus(self):
         for g in ("e1-preposition-possessive", "e1-preposition-purpose", "e3-preposition-then-host", "e3-preposition-possessive-then-host"):
@@ -1000,10 +1146,31 @@ class LintDifferentialPinTests(unittest.TestCase):
          lambda text, f: f.get("tpl") in ("contrast-object-marker", "contrast-noun-but-also-marker"),
          "E2, r3: 'without audio on this host', 'not only Bachelor but also on this host' -- the marker is not the head of the "
          "complement, so nothing negates it; the baseline passed on any weak negation or venue word in the sentence."),
+        ("direct-launch-second-local-locus",
+         lambda text, f: (f.get("tpl") == "seed" and text in PromptLintTests.CLAUSE_MUST_REFUSE_R7)
+         or (f.get("tpl") == "list-member" and str(f.get("G", "")).startswith("launch-host-") and f.get("R") is True),
+         "r7, CoS review of #448 a595464f: a direct launcher line (Rule 4) with a SECOND, local locus after the venue ('... -Backend cpu "
+         "on Bachelor and on my machine.', '... on Bachelor using this host's GPU.', '... on Bachelor and on localhost.') is refused. "
+         "Master's venue exemption is sentence-wide and passes them; the host noun is read only as a LOCUS (on / at / in / using + "
+         "determiner + noun) or a host name, so a destination ('... and posts the result to the hub') keeps passing."),
         ("hardening-log-handling-tail",
          lambda text, f: f.get("tpl") == "handling-tail" and f.get("M") in ("on this host", "here"),
          "r1b over-refusal kept on purpose (card HUB-VM-LINT-LOG-COPY-OVERREFUSAL-1): 'copy the log on this host' after a venue run "
          "is refused like its `locally` twin; a handling-verb list would open 'Copy the clip locally and run playback.'"),
+    )
+
+    # r7 PREVIOUS-HEAD gate (CoS Prevention on a595464f). Against the lint of the PR head this round started from, NOTHING may open:
+    # the ceiling for refuse -> pass is EMPTY, so any flip needs an entry here with a reason AND the same reason in the PR body. A
+    # round that narrows an exemption or a defeater (the a595464f Rule 4 narrowing handed back 14 refusals r5 had gained) shows up
+    # here even when master passes the row, which is exactly what the master differential cannot see.
+    ALLOWED_PREVIOUS_HEAD_REFUSE_TO_PASS: tuple = ()
+    ALLOWED_PREVIOUS_HEAD_PASS_TO_REFUSE = (
+        ("r7-direct-launch-second-local-locus",
+         lambda text, f: (f.get("tpl") == "seed" and text in PromptLintTests.CLAUSE_MUST_REFUSE_R7)
+         or (f.get("tpl") == "list-member" and str(f.get("G", "")).startswith("launch-host-") and f.get("R") is True),
+         "r7: a host noun after a LOCUS preposition (on / at / in / using), or a host name, defeats the venue exemption on a direct "
+         "launcher line (Rule 4). The r6 tip passed 'pwsh -File <launcher> -Backend cpu on Bachelor and on my machine.' and its "
+         "relatives; r5 eb3d5f81 refused them. Every row is a Rule 4 line; destinations (to / into / from) stay passing."),
     )
 
     @classmethod
@@ -1025,6 +1192,36 @@ class LintDifferentialPinTests(unittest.TestCase):
         flipped = {text for text, _ in opened}
         for text in PromptLintTests.CLAUSE_MUST_REFUSE:
             self.assertNotIn(text, flipped, text)
+
+    def test_no_refuse_to_pass_flip_against_the_previous_pr_head(self):
+        """r7 (CoS Prevention): the same corpus against the lint of the PR head this round started from. Nothing a previous head refused
+        may pass on this one without an entry (reason) in ALLOWED_PREVIOUS_HEAD_REFUSE_TO_PASS -- and the PR body lists it."""
+        ref, opened, closed, size = _differential_flips(self.tmp, previous_head=True)
+        self.assertEqual(PREVIOUS_PR_HEAD[:8], ref)
+        self.assertGreaterEqual(size, 1000, "the corpus shrank; the pin no longer samples the wording space")
+        problems = _pin_problems(opened, closed, self.ALLOWED_PREVIOUS_HEAD_REFUSE_TO_PASS, self.ALLOWED_PREVIOUS_HEAD_PASS_TO_REFUSE)
+        self.assertEqual(
+            [], problems,
+            f"previous PR head {ref}: this round opened or closed a wording the previous head decided the other way -- fix the lint, or "
+            f"add an allow-list entry with its reason (and list the flip in the PR body).")
+        # every catalogue row that must be refused (this round's and every earlier round's) is refused by the previous head's own
+        # verdict OR is one of this round's listed closures; none may be among the opened flips
+        flipped = {text for text, _ in opened}
+        for text in PromptLintTests.CLAUSE_MUST_REFUSE + PromptLintTests.CLAUSE_MUST_REFUSE_R7:
+            self.assertNotIn(text, flipped, text)
+
+    def test_previous_pr_head_is_an_ancestor_of_head(self):
+        """A rebase or a history rewrite that drops PREVIOUS_PR_HEAD must fail here, not silently leave a baseline nobody can reach."""
+        _require_previous_head_lint()  # skips (or fails in hosted CI) exactly like the differential does
+        done = subprocess.run(["git", "-C", str(ROOT), "merge-base", "--is-ancestor", PREVIOUS_PR_HEAD, "HEAD"], capture_output=True, timeout=60)
+        self.assertEqual(0, done.returncode, f"PREVIOUS_PR_HEAD {PREVIOUS_PR_HEAD[:8]} is not an ancestor of HEAD; move it to the head this round started from")
+
+    def test_the_previous_head_ceiling_is_empty_or_every_entry_has_a_reason(self):
+        for name, _, reason in self.ALLOWED_PREVIOUS_HEAD_REFUSE_TO_PASS + self.ALLOWED_PREVIOUS_HEAD_PASS_TO_REFUSE:
+            self.assertTrue(reason.strip(), name)
+        row = ("Run playback locally since Bachelor is busy.", {"tpl": "marker-connective-noun"})
+        self.assertTrue(_pin_problems([row], [], self.ALLOWED_PREVIOUS_HEAD_REFUSE_TO_PASS, self.ALLOWED_PREVIOUS_HEAD_PASS_TO_REFUSE),
+                        "an unlisted refuse -> pass flip against the previous head must fail the pin")
 
     def test_identical_baseline_passes(self):
         """Once this change is on master the baseline IS the candidate: no flips, and the pin must pass (it failed on r2, whose entries

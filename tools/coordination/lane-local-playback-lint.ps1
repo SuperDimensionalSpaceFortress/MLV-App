@@ -55,6 +55,12 @@
 # a bare preposition + noun (on hub), spelling variants (hub-VM = hub vm = hubvm), names (localhost, 127.0.0.1, ::1) and a later bare
 # `locally`. Accepted over-refusal: a harmless later clause that merely names the local host ("..., then build the app here") refuses --
 # a safety lint reads the sentence, not the intent; a negated clause ("..., not on this host") is skipped, not a stop.
+# Locus-only host reference on a direct launch line (r7). Rule 4 has no `locally`, so a host noun there is either WHERE the work runs
+# ("... on Bachelor and on my machine", "... on Bachelor using this host's GPU") or a destination ("... on Bachelor and posts the result
+# to the hub"). Only the first defeats the venue exemption: a locus preposition (HostLocusPrepositions: on / at / in / using) + determiner
+# + up to two words + host noun (or the bare noun), or a host name (localhost, virtual-ten, 127.0.0.1, hub-vm in every spelling). to /
+# into / from + a host noun is a destination and does not. A purpose or destination complement after the venue name itself ("via
+# Bachelor to this host") is not a locus (r5 closed follow list), so that line is refused as before -- a stated, fail-closed difference.
 # Rules 3, 3b and 4 keep master's weak-negation exemption (not / no / without in the marker's clause, narrowed from the whole sentence to
 # the clause), so they refuse at least what master refuses. Anything that is not E1 / E2 / E3 / a prohibition keeps master's verdict.
 # A contrast word still CUTS the sentence (the head clause is judged without its complement) and the complement ends at its next comma; the
@@ -253,6 +259,7 @@ function Get-LocalPlaybackLintWordLists {
         HostDeterminers            = @('this', 'the', 'my', 'your', 'our', 'that', 'local', 'current', 'same', 'own', 'its', 'their')
         HostNouns                  = @('hub vm', 'hub host', 'hub', 'host', 'vm', 'virtual machine', 'machine', 'box', 'workstation', 'computer', 'pc', 'desktop', 'laptop', 'system', 'device', 'server', 'node', 'guest')
         HostPrepositions           = @('on', 'onto', 'at', 'in', 'into', 'to', 'from', 'inside', 'within', 'via', 'using')
+        HostLocusPrepositions      = @('on', 'at', 'in', 'using')
         HostNames                  = @('localhost', 'virtual-ten', 'hub vm', '127.0.0.1', '::1', 'loopback')
         ContrastWords             = @('instead of', 'rather than', 'without', 'nor', 'skip', 'skips', 'skipping', 'bypass', 'bypasses', 'bypassing')
     }
@@ -330,9 +337,26 @@ function Get-LocalPlaybackPromptFindings {
     $localDefeater = "(?i)${b}locally${e}(?!\s+(?:${routingLocally})\s+(?:(?:the|a|an)\s+)?${venueLocus})"
     $hostDefeaters = @($hostMarker, $hostRef, $hereDefeater, $localDefeater)
     # Rule 4 (a direct launch line) carries NO local marker: the venue phrase is the only evidence of where it runs, and a host noun there is
-    # usually a destination ("... -Backend cpu on Bachelor and posts the result to the hub"), which master and r4 pass. It keeps the r4
-    # defeaters (the on-this-host marker and a bare here); every `locally` and host-marker rule uses the wide set above.
-    $hostDefeatersLaunch = @($hostMarker, $hereDefeater)
+    # often a DESTINATION ("... -Backend cpu on Bachelor and posts the result to the hub"), which master and r4 pass. r7 reads the host
+    # reference there as a LOCUS only: a host noun introduced by a locus preposition (on / at / in / using + determiner + up to two words +
+    # noun, or the bare noun) or a host name says where the work RUNS and defeats the exemption ("... on Bachelor and on my machine",
+    # "... on Bachelor using this host's GPU", "... on Bachelor and on localhost"); to / into / from + a host noun is a destination and
+    # does not. a595464f narrowed this rule to the r4 defeaters (on-this-host marker + bare here) and gave back the refusals r5 had.
+    $hostLocusPreposition = ConvertTo-LintAlternation -Words @($lists.HostLocusPrepositions)
+    # A host NAME that is also a host noun ("hub vm") is a destination after to / into / from + a determiner ("copies the clip to the hub
+    # VM"); every other name (localhost, virtual-ten, an address) defeats wherever it stands, and "hub vm" with no determiner still does.
+    $destinationPreposition = ConvertTo-LintAlternation -Words @('to', 'into', 'from')
+    $nounNames = @($lists.HostNames | Where-Object { @($lists.HostNouns) -contains $_ })
+    $plainNames = @($lists.HostNames | Where-Object { @($lists.HostNouns) -notcontains $_ })
+    # An empty word list would build `(?:)`, which matches everywhere; each name alternative exists only when its list is not empty.
+    $hostLocusRef = "(?i)${b}(?:${hostLocusPreposition})\s+(?:(?:${hostDeterminer})\s+${hostModifier})?(?:${hostNoun})${hostNounEnd}"
+    if ($plainNames.Count -gt 0) {
+        $hostLocusRef += "|${b}(?:$(ConvertTo-LintAlternation -Words $plainNames -Loose))(?!\w)"
+    }
+    if ($nounNames.Count -gt 0) {
+        $hostLocusRef += "|(?<!${b}(?:${destinationPreposition})\s+(?:${hostDeterminer})\s+)${b}(?:$(ConvertTo-LintAlternation -Words $nounNames -Loose))(?!\w)"
+    }
+    $hostDefeatersLaunch = @($hostMarker, $hereDefeater, $hostLocusRef)
     $direct = @(
         "(?i)${b}MLVApp(Release)?\.exe\s+(?:(?!/\s)\S+\s+){0,12}--(gui-smoke-playback|profile-playback)",
         "(?i)(pwsh|powershell)(\.exe)?${e}[^\n]{0,80}-File\s+\S*$scripts",
