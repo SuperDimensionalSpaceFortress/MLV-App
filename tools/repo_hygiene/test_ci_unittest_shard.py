@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -115,6 +116,65 @@ class CoverageTests(unittest.TestCase):
         self.assertEqual(shard.import_failures(_TESTS), [])
 
 
+WORKFLOW = REPO_ROOT / ".github" / "workflows" / "tests.yml"
+WINDOWS_SHARD_JOB = "repo-hygiene-python-windows-shard"
+# Seconds a shard job spends outside its tests (checkout with fetch-depth 0, setup-python,
+# the pip installs, --verify-partition): 90-130 s measured on hosted Windows, run 38710168638.
+SETUP_SECONDS = 150
+# A shard is expected at no more than this share of its job's timeout-minutes, so a runner
+# twice as slow as the table still finishes. Shard 2/8 was expected at 26 % of its 40 min
+# cap by a stale table, took 31 min (78 %), and was cancelled three times on PR #442.
+CAP_SHARE = 0.6
+# Tests of classes the table has no row for are weighted by count, not measured.
+MAX_UNMEASURED_TEST_SHARE = 0.05
+
+
+def _windows_shard_job() -> str:
+    text = WORKFLOW.read_text(encoding="utf-8").replace("\r\n", "\n")
+    start = re.search(rf"(?m)^  {re.escape(WINDOWS_SHARD_JOB)}:$", text)
+    assert start is not None, WINDOWS_SHARD_JOB
+    following = re.search(r"(?m)^  [a-z0-9-]+:$", text[start.end() :])
+    return text[start.start() : start.end() + following.start() if following else len(text)]
+
+
+class ShardDurationBudgetTests(unittest.TestCase):
+    def test_every_windows_unittest_shard_is_expected_within_the_cap_share(self) -> None:
+        job = _windows_shard_job()
+        cap = re.search(r"(?m)^    timeout-minutes: (\d+)$", job)
+        of = re.search(r"ci_unittest_shard --profile windows --of (\d+) --shard", job)
+        self.assertIsNotNone(cap)
+        self.assertIsNotNone(of)
+        budget = int(cap.group(1)) * 60 * CAP_SHARE
+        weights = shard.load_weights("windows")
+        buckets = shard.assign(_COUNTS, int(of.group(1)), weights)
+        expected = [
+            SETUP_SECONDS + sum(shard.unit_weight(key, _COUNTS[key], weights) for key in bucket)
+            for bucket in buckets
+        ]
+        for index, seconds in enumerate(expected, start=1):
+            self.assertLessEqual(
+                seconds,
+                budget,
+                f"windows shard {index}/{of.group(1)} is expected at {seconds:.0f} s, over "
+                f"{CAP_SHARE:.0%} of its {cap.group(1)} min cap ({budget:.0f} s); re-derive "
+                "ci_unittest_shard_weights.json from fresh hosted logs or add shards",
+            )
+
+    def test_the_table_measures_nearly_every_discovered_test(self) -> None:
+        # An unmeasured class costs DEFAULT_TEST_SECONDS per test whatever it really takes;
+        # 101 of them hid that shard 2 was at 31 min while the table claimed 10.6.
+        for profile in ("windows",):
+            weights = shard.load_weights(profile)
+            unmeasured = {key: n for key, n in _COUNTS.items() if key not in weights}
+            share = sum(unmeasured.values()) / sum(_COUNTS.values())
+            self.assertLessEqual(
+                share,
+                MAX_UNMEASURED_TEST_SHARE,
+                f"{profile}: {sum(unmeasured.values())} tests in {len(unmeasured)} classes have no "
+                f"measured weight ({share:.0%}); re-run ci_unittest_shard_timings on hosted logs",
+            )
+
+
 class TimingsTests(unittest.TestCase):
     LOG = (
         "2026-10-04T00:00:00.0000000Z started\n"
@@ -129,6 +189,20 @@ class TimingsTests(unittest.TestCase):
         self.assertEqual(
             timings.class_seconds(self.LOG),
             {"tools.repo_hygiene.test_x.AlphaTests": 12.0, "tools.repo_hygiene.test_x.BetaTests": 8.0},
+        )
+
+    def test_a_test_with_a_docstring_is_counted_to_its_class(self) -> None:
+        # unittest -v prints the id on one line and "<docstring line> ... ok" on the next.
+        log = (
+            "2026-10-04T00:00:00.0000000Z started\n"
+            "2026-10-04T00:00:01.0000000Z test_a (tools.repo_hygiene.test_x.AlphaTests.test_a)\n"
+            "2026-10-04T00:00:04.5000000Z the docstring first line ... ok\n"
+            "2026-10-04T00:00:04.5000000Z test_b (tools.repo_hygiene.test_x.BetaTests.test_b)\n"
+            "2026-10-04T00:00:05.0000000Z another docstring ... FAIL\n"
+        )
+        self.assertEqual(
+            timings.class_seconds(log),
+            {"tools.repo_hygiene.test_x.AlphaTests": 3.5, "tools.repo_hygiene.test_x.BetaTests": 0.5},
         )
 
     def test_average_is_over_the_jobs_that_ran_the_class(self) -> None:
