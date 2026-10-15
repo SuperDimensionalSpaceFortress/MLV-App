@@ -1,6 +1,6 @@
 ## 2026-10-15 KERNEL REFILE code@r11: conformance, answers to the 2026-10-13 harvest, K12 refile
 
-KERNEL: DOGFOOD fleet-factory-kernel r5 · profile code@r11 · instance agents/factory-kernel-instance.md (MLV-App fork/master 5d14b70c) · since 2026-09-14
+KERNEL: DOGFOOD fleet-factory-kernel r5 · profile code@r11 · instance agents/factory-kernel-instance.md (MLV-App, anchored to the PR #444 merge commit) · since 2026-09-14
 
 This block follows the 2026-10-07 block for this section. The clause-by-clause filing, in kernel §4 grammar, is
 `adjudications/factory-kernel/mlv-app.md` on this review branch. It answers each row of the 2026-10-13 harvest
@@ -26,8 +26,8 @@ refile on a revision change and weekly while the kernel is a CANDIDATE. This ref
 | K8 capacity | FIT | FIT | Claude weekly 429 on 2026-10-15 01:19Z: refused work re-dispatched on original prompts after a usage probe |
 | K9 resume | UNEXERCISED | UNEXERCISED | `tools/repo_hygiene/k9_witness.py` in CI; the resume surface is board-local |
 | K10 inventory | GAP | INSTANCE-FAILURE, still failing | inventory dated 2026-09-14; no Codex account identity |
-| K11 honest reports | GAP | INSTANCE-FAILURE, still failing | the instance map header said `code@r10` after the cut-over (fix: PR #443); its K4 line citations drifted |
-| K12 feedback | GAP | INSTANCE-FAILURE, still failing | refile 8 days after the last; nothing schedules it |
+| K11 honest reports | GAP | INSTANCE-FAILURE, still failing | the instance map header said `code@r10` after the cut-over (fixed by PR #443, merge 3f5896d7, after the r1 evidence cut-off); its K4 line citations drifted |
+| K12 feedback | GAP | INSTANCE-FAILURE, still failing | refile 8 days after the last; nothing schedules it; carded as KERNEL-REFILE-SCHEDULE-1, not yet built |
 
 Profile rows: subject-identity GAP (still failing), acceptance-evidence GAP (still failing, partly cured), resource-terminals FIT,
 delivery-target FIT. Harvest INSTANCE-FAILURE rows cured: 1 of 8 (K5).
