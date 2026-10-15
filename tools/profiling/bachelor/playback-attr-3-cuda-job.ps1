@@ -401,6 +401,15 @@ param(
     # vsync A/B), any leg type. -1 (the default) sets nothing: the emitted job is the text it was before this parameter.
     [ValidateRange(-1, 1)][int]$SwapInterval = -1,
 
+    # PLAYBACK-CPU-PACE-GAP-1 (D1 exactness arms, cpu backend only; every default emits the job's text unchanged):
+    # -DropFrameMode off|on passes the smoke runner's own -DropFrameMode (the app's --drop-frame-mode), so both arms present every frame in order;
+    # -DisableCpuPlaybackLookahead sets MLVAPP_DISABLE_CPU_PLAYBACK_LOOKAHEAD=1 (the CPU-route lookahead kill switch, the arm-B control);
+    # -PresentedDumpFrames <first>-<last> sets MLVAPP_PLAYBACK_PRESENTED_DUMP_DIR (<work>\presented-dumps) and MLVAPP_PLAYBACK_PRESENTED_DUMP_FRAMES,
+    # and the job publishes the dumped files under <artifacts>\presented-dumps for tools/profiling/compare_presented_dumps.py.
+    [ValidateSet('', 'on', 'off')][string]$DropFrameMode = '',
+    [switch]$DisableCpuPlaybackLookahead,
+    [ValidatePattern('^(\d{1,6}-\d{1,6})?$')][string]$PresentedDumpFrames = '',
+
     # GPU-EVENT153-ROOTCAUSE-2: turns the CUDA backends' per-launch timer on (MLVAPP_CUDA_LAUNCH_TIMING=1) with this
     # per-launch line threshold in ms (MLVAPP_CUDA_LAUNCH_TIMING_MIN_MS). -1 (the default) sets nothing: the timer stays
     # OFF and the emitted job is the text it was before this parameter.
@@ -4152,8 +4161,11 @@ function Edit-DualVenueTemplate([string]$Text, [string]$Old, [string]$New) {
     $Text.Substring(0, $first) + $newText + $Text.Substring($first + $oldText.Length)
 }
 
-if ($PlaybackRenderLookaheadFrames -ge 0 -and -not $LookPaceLeg) {
-    throw 'DUAL_VENUE_LOOKAHEAD_NEEDS_LOOK_PACE_LEG -PlaybackRenderLookaheadFrames is only for a -LookPaceLeg run (the lookahead A/B)'
+if ($PlaybackRenderLookaheadFrames -ge 0 -and -not $LookPaceLeg -and $Backend -ne 'cpu') {
+    throw 'DUAL_VENUE_LOOKAHEAD_NEEDS_LOOK_PACE_LEG -PlaybackRenderLookaheadFrames is only for a -LookPaceLeg run or a -Backend cpu run (the lookahead A/B)'
+}
+if (($DisableCpuPlaybackLookahead -or $PresentedDumpFrames) -and $Backend -ne 'cpu') {
+    throw 'DUAL_VENUE_CPU_EXACTNESS_NEEDS_CPU_BACKEND -DisableCpuPlaybackLookahead and -PresentedDumpFrames are CPU-route only (-Backend cpu)'
 }
 if ($LookPaceLeg -and ($ContactSheet -or -not $ForceLookAssist)) {
     throw 'DUAL_VENUE_LOOK_PACE_LEG_SHAPE -LookPaceLeg is -ForceLookAssist WITHOUT -ContactSheet (a capture-free pace leg)'
@@ -4174,6 +4186,10 @@ if ($hasLookReceipt) {
 if (-not [string]::IsNullOrWhiteSpace($PlaybackProcessing)) {
     # CPU-DUALISO-REDUCED-ISO-NOTCH-1: only a job that asks for a playback processing mode carries it; every other job is unchanged.
     $template = Edit-DualVenueTemplate $template '-UsePersistedPlaybackSettings ' ("-UsePersistedPlaybackSettings -PlaybackProcessing $PlaybackProcessing ")
+}
+if (-not [string]::IsNullOrWhiteSpace($DropFrameMode)) {
+    # PLAYBACK-CPU-PACE-GAP-1: only a job that asks for a drop-frame mode carries it; every other job is unchanged.
+    $template = Edit-DualVenueTemplate $template '-UsePersistedPlaybackSettings ' ("-DropFrameMode $DropFrameMode -UsePersistedPlaybackSettings ")
 }
 if ($DisableLookAssist) {
     # UPSTREAM-CPU-BASELINE-1: only a job that asks for Look Assist off carries -DisableLookAssist; every other job is unchanged.
@@ -4443,6 +4459,42 @@ if ($SwapInterval -ge 0) {
         param($m)
         $m.Value + $m.Groups['ind'].Value + "'MLVAPP_SWAP_INTERVAL=$SwapInterval'," + $m.Groups['nl'].Value
     })
+}
+
+# PLAYBACK-CPU-PACE-GAP-1: the D1 exactness arms (cpu only, refused above otherwise). Each env is added on the expanded text and only when asked,
+# so every other job is the text it always was; a look pace leg keeps its own lookahead site above. The anchors must match exactly once.
+$cpuExactnessEnvs = @()
+if ($PlaybackRenderLookaheadFrames -ge 0 -and -not $LookPaceLeg) { $cpuExactnessEnvs += "'MLVAPP_PLAYBACK_RENDER_LOOKAHEAD_FRAMES=$PlaybackRenderLookaheadFrames'," }
+if ($DisableCpuPlaybackLookahead) { $cpuExactnessEnvs += "'MLVAPP_DISABLE_CPU_PLAYBACK_LOOKAHEAD=1'," }
+if ($PresentedDumpFrames) {
+    $cpuExactnessEnvs += "('MLVAPP_PLAYBACK_PRESENTED_DUMP_DIR=' + (Join-Path `$Work 'presented-dumps')),"
+    $cpuExactnessEnvs += "'MLVAPP_PLAYBACK_PRESENTED_DUMP_FRAMES=$PresentedDumpFrames',"
+}
+if ($cpuExactnessEnvs.Count -gt 0) {
+    $exactAnchor = [regex]"(?<ind>[ \t]*)'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',(?<nl>\r?\n)"
+    if ($exactAnchor.Matches($text).Count -ne 1) { throw 'DUAL_VENUE_CPU_EXACTNESS_ANCHOR_MISSING the job template has no single env-list site to add the exactness envs to' }
+    $text = $exactAnchor.Replace($text, [System.Text.RegularExpressions.MatchEvaluator]{
+        param($m)
+        $m.Value + (($cpuExactnessEnvs | ForEach-Object { $m.Groups['ind'].Value + $_ + $m.Groups['nl'].Value }) -join '')
+    })
+}
+if ($PresentedDumpFrames) {
+    # The dumped <frame>.rgb8 / <frame>.json pairs are published under <artifacts>\presented-dumps BEFORE the artifact index, so Invoke-VenueLeg.ps1 copies them
+    # into the leg's local evidence. Missing dumps publish nothing: the compare tool refuses too few common frames.
+    $dumpAnchor = "# CUDA-PLAYBACK-CONTACT-SHEET-1: publish the raw per-frame PNG+JSON pairs the app's own"
+    $dumpFirst = $text.IndexOf($dumpAnchor, [StringComparison]::Ordinal)
+    if ($dumpFirst -lt 0 -or $text.IndexOf($dumpAnchor, $dumpFirst + 1, [StringComparison]::Ordinal) -ge 0) { throw 'DUAL_VENUE_PRESENTED_DUMP_ANCHOR_MISSING the job template has no single publish site for the presented dumps' }
+    $eol = if ($text.Contains("`r`n")) { "`r`n" } else { "`n" }
+    $dumpPublish = @(
+        '$presentedDumpDir = Join-Path $Work ''presented-dumps'''
+        'if (Test-Path -LiteralPath $presentedDumpDir -PathType Container) {'
+        '    [void](New-AttrCudaDirectory -Path (Join-Path $Pub ''presented-dumps''))'
+        '    foreach ($dumpFile in @(Get-ChildItem -LiteralPath $presentedDumpDir -File | Where-Object { $_.Name -match ''^\d+\.(rgb8|json)$'' })) {'
+        '        [void](Publish-AttrCudaFileCopy -Source $dumpFile.FullName -Destination (Join-Path (Join-Path $Pub ''presented-dumps'') $dumpFile.Name))'
+        '    }'
+        '}'
+    ) -join $eol
+    $text = $text.Substring(0, $dumpFirst) + $dumpPublish + $eol + $text.Substring($dumpFirst)
 }
 
 # GPU-EVENT153-ROOTCAUSE-2: the same env-list site gains the launch-timer pair, only when asked. The threshold is written in

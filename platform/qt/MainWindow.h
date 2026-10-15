@@ -33,6 +33,7 @@
 #include "SessionModel.h"
 #include "PlaybackFrameRange.h"
 #include "PlaybackNativePaceGuard.h"
+#include "PlaybackPrepPresentationPolicy.h"
 #include "PlaybackPresentTrace.h"
 #include "PlaybackScopesDuringPlayback.h"
 #include "PlaybackSlipHistogram.h"
@@ -668,6 +669,7 @@ private:
         PresentationRequestContext requestContext;
         uint64_t requestSerial = 0;
         uint64_t presentationGeneration = 0;
+        bool losslessPresent = false; // drop-frame off: never conflated away (PlaybackPrepPresentationPolicy.h)
         double displayStart = 0.0;
         double enqueueTime = 0.0;
         double preEnqueueMs = 0.0;
@@ -1165,11 +1167,22 @@ private:
     // present requested and admitted, scale 1), where the playback lookahead is on by default
     // (playback_overlap::effectiveLookaheadFrames). The counters feed playback_smoke.overlap_summary.
     bool m_playbackLookaheadTextureRouteAdmitted = false;
+    // PLAYBACK-CPU-PACE-GAP-1: the last drawFrame() request's CPU-route admission
+    // (playback_overlap::cpuRouteLookaheadDecision) and the per-reason refusal counts for the smoke session.
+    bool m_playbackLookaheadCpuRouteEligible = false;
+    bool m_playbackLookaheadCpuRouteDefaultAdmitted = false;
+    playback_overlap::CpuLookaheadRefusal m_playbackLookaheadCpuRouteRefusalLast =
+        playback_overlap::CpuLookaheadRefusal::None;
+    uint64_t m_playbackLookaheadCpuRouteRefusalCounts[
+        static_cast<int>( playback_overlap::CpuLookaheadRefusal::Count )] = {};
+    uint64_t m_playbackLookaheadDroppedReady = 0;
+    uint64_t m_playbackLookaheadPruned = 0;
     uint64_t m_playbackLookaheadRequestsIssued = 0;
     uint64_t m_playbackLookaheadCoveredRequests = 0;
     int playbackRenderLookaheadFrames() const;
     int currentPlaybackAdvanceTarget();
     bool renderThreadBusyForPlaybackAdvance( int activePlaybackTarget );
+    int playbackPrepBacklog();
     bool m_automationPacingIsolated = false;
     // ENFORCE-4: the autoplay hook's verdict is a fail-closed LATCH (PlaybackFrameRange.h): armed failing (14) when the hook
     // is installed, cleared only by consumption (Reached). Closing the app before the poll resolves exits 14, never 0.
@@ -1575,15 +1588,23 @@ private:
     //   underneath it, such as Playback Scale x2/x4 -> x1.
     // - Conflation queue semantics: at most one in-flight task ("current") and
     //   at most one queued task ("pending"). New enqueues replace pending.
+    //   With drop-frame off (losslessPresent) pending and results are FIFO
+    //   instead, bounded by the drop-off advance hold.
+    //   PLAYBACK-CPU-PACE-GAP-1 r7: drop-frame-on work uses the single slot
+    //   (master's code); the deque serves lossless work and the
+    //   MLVAPP_PLAYBACK_PREP_CONFLATED_MOVE bisect opt-in.
     std::atomic<uint64_t> m_latestRequestedSerial{0};
     std::atomic<uint64_t> m_playbackPresentationGeneration{1};
     std::thread m_playbackPrepThread;
     std::mutex m_playbackPrepMutex;
     std::condition_variable m_playbackPrepCv;
     std::atomic<bool> m_playbackPrepStop{false};
-    bool m_playbackPrepPendingValid = false;
-    PlaybackPrepTask m_playbackPrepPending;
+    PlaybackPrepTask m_playbackPrepConflatedSlot;      // guarded by m_playbackPrepMutex
+    bool m_playbackPrepConflatedSlotValid = false;     // guarded by m_playbackPrepMutex
+    std::deque<PlaybackPrepTask> m_playbackPrepPending;
+    bool m_playbackPrepComputing = false; // guarded by m_playbackPrepMutex
     std::deque<PlaybackPrepResult> m_playbackPrepResults;
+    playback_drop_off::AdvanceHold m_playbackDropOffAdvanceHold;
     std::atomic<uint64_t> m_playbackPrepStaleDropCount{0};
     std::atomic<uint64_t> m_playbackPrepGenerationDropCount{0};
     std::atomic<uint64_t> m_playbackPrepReplacedBeforeComputeCount{0};
@@ -1657,6 +1678,14 @@ private:
     void noteContactSheetPresentedFrame( uint64_t displayFrame,
                                         const RenderFrameThread::ReadyFrame &readyFrame,
                                         const PresentationRequestContext &requestContext );
+    // PLAYBACK-CPU-PACE-GAP-1 exactness hook (MLVAPP_PLAYBACK_PRESENTED_DUMP_DIR / _FRAMES, read once; a no-op
+    // when unset): writes the CPU prep route's processed RGB8 for each presented frame in range.
+    void dumpPresentedFrameIfRequested( uint64_t displayFrame,
+                                        const PlaybackPrepTask &task,
+                                        const uint8_t *processedRgb8,
+                                        int processedWidth,
+                                        int processedHeight,
+                                        const QImage &displayImage );
     // --gui-smoke-playback only (CUDA-PERF-PLAYBACK-FOREGROUND-1): forces the main window
     // and the GPU display window to the OS foreground and verifies with
     // GetForegroundWindow(); never called from normal (non-smoke) startup or from the
@@ -1692,6 +1721,7 @@ private:
                                            QSize *outPreviewSize );
     void onPlaybackSmokeApplicationStateChanged( Qt::ApplicationState state );
     void enqueuePlaybackPrepTask( const PlaybackPrepTask &task );
+    void enqueuePlaybackPrepTaskLossless( PlaybackPrepTask ownedTask );
     void invalidatePlaybackPrepForDisplayChange( const char *reason );
     void waitForRenderThreadIdleBeforeCoreMutation( const char *reason );
     struct PlaybackPrepThreadState;

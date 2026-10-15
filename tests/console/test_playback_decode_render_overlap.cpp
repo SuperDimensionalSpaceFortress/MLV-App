@@ -15,13 +15,16 @@
 
 #include "../../platform/qt/PlaybackDecodeRenderOverlap.h"
 #include "../../platform/qt/PlaybackNativePaceGuard.h"
+#include "../../platform/qt/PlaybackPrepPresentationPolicy.h"
 
 #include <QFile>
 #include <QString>
 #include <QTextStream>
 
+#include <algorithm>
 #include <deque>
 #include <map>
+#include <set>
 #include <vector>
 
 using playback_native_pace::NativePaceGuard;
@@ -59,6 +62,7 @@ struct PipelineRun
     double firstPresentMs = 0.0;
     double lastPresentMs = 0.0;
     int maxInFlight = 0;
+    int wastedUpstream = 0; // frames whose decode + recon finished but that were never presented (skipped targets)
     OverlapSnapshot overlap;
     double presentedFpsAfterFirst() const
     {
@@ -70,9 +74,17 @@ struct PipelineRun
 
 // Every-frame mode (grantWholeFrame), Loop off, wallMs of playback. While the upstream and the render run at once each
 // progresses at 1/contention of its speed (both are OpenMP teams over every core); exclusiveRecon is reconMayStart().
+// targetStride > 1 models drop-frame playback that falls behind: each advance moves the target by the stride (an
+// average; 2.5 alternates +2/+3) as soon as the GUI is free, and queued lookahead frames the target passed are pruned
+// (prunePlaybackLookaheadOutsideForwardWindow); ones already in a worker run to completion and are wasted.
 PipelineRun simulatePipeline( int lookaheadDepth, Gate gate, double upstreamMs, double renderMs, double hopMs,
-                              double contention = 1.0, bool exclusiveRecon = false, double wallMs = 25000.0 )
+                              double contention = 1.0, bool exclusiveRecon = false, double wallMs = 25000.0,
+                              double targetStride = 1.0 )
 {
+    const bool dropFrameTimeline = targetStride > 1.0;
+    double timelinePos = 0.0;
+    std::set<int> upstreamDone;
+    std::set<int> presentedFrames;
     PipelineRun run;
     NativePaceGuard guard;
     OverlapMeter meter;
@@ -132,6 +144,18 @@ PipelineRun simulatePipeline( int lookaheadDepth, Gate gate, double upstreamMs, 
     {
         target = frame;
         stillDrawing = true;
+        for( auto it = upstreamQueue.begin(); it != upstreamQueue.end(); )
+        {
+            if( *it < frame && frames[*it].lookahead )
+            {
+                frames.erase( *it );
+                it = upstreamQueue.erase( it );
+            }
+            else
+            {
+                ++it;
+            }
+        }
         auto it = frames.find( frame );
         if( it == frames.end() ) request( frame, false );
         for( int offset = 1; offset <= lookaheadDepth; ++offset ) request( frame + offset, true );
@@ -145,6 +169,7 @@ PipelineRun simulatePipeline( int lookaheadDepth, Gate gate, double upstreamMs, 
         // Upstream worker (decode + dual-ISO), one frame at a time, in request order.
         if( upstreamBusy >= 0 && upstreamLeft <= 1e-9 )
         {
+            upstreamDone.insert( upstreamBusy );
             frames[upstreamBusy].stage = 2;
             renderQueue.push_back( upstreamBusy );
             upstreamBusy = -1;
@@ -197,6 +222,13 @@ PipelineRun simulatePipeline( int lookaheadDepth, Gate gate, double upstreamMs, 
             if( lastPresented >= 0 && target != lastPresented + 1 ) run.inOrder = false;
             lastPresented = target;
             frames.erase( target );
+            presentedFrames.insert( target );
+            for( auto it = frames.begin(); it != frames.end(); )
+            {
+                // Ready frames the target passed are released (the prune's ready-slot half).
+                if( it->first < target && it->second.stage == 4 ) it = frames.erase( it );
+                else ++it;
+            }
             ++run.presented;
             if( !run.presentedAny ) run.firstPresentMs = now;
             run.presentedAny = true;
@@ -210,9 +242,15 @@ PipelineRun simulatePipeline( int lookaheadDepth, Gate gate, double upstreamMs, 
             nextPollMs += kPollMs;
             if( !stillDrawing )
             {
-                if( target < 0 || guard.grantWholeFrame( now, kNativeFps ) )
+                if( target < 0 || dropFrameTimeline || guard.grantWholeFrame( now, kNativeFps ) )
                 {
-                    requestTarget( target + 1 );
+                    int next = target + 1;
+                    if( dropFrameTimeline && target >= 0 )
+                    {
+                        timelinePos += targetStride;
+                        next = std::max( next, static_cast<int>( timelinePos ) );
+                    }
+                    requestTarget( next );
                     if( frames[target].stage == 4 && !presentScheduled )
                     {
                         presentScheduled = true; // covered and already rendered
@@ -221,6 +259,10 @@ PipelineRun simulatePipeline( int lookaheadDepth, Gate gate, double upstreamMs, 
                 }
             }
         }
+    }
+    for( const int frame : upstreamDone )
+    {
+        if( frame < lastPresented && !presentedFrames.count( frame ) ) ++run.wastedUpstream;
     }
     run.overlap = meter.snapshot( wallMs );
     return run;
@@ -236,6 +278,80 @@ TEST(PlaybackDecodeRenderOverlapPolicy, LookaheadIsOnByDefaultOnlyOnTheTextureRo
     ASSERT_EQ( effectiveLookaheadFrames( 1, false ), 1 );
     ASSERT_EQ( effectiveLookaheadFrames( 1, true ), 1 );
     ASSERT_EQ( effectiveLookaheadFrames( 9, true ), 3 );
+}
+
+// PLAYBACK-CPU-PACE-GAP-1: the CPU route's admitted default depth is kDefaultCpuRouteLookaheadFrames. r3 measured
+// depth 1 under drop-frame on (14.1 -> 10.3 fps at s2, lookahead_pruned 201 of 399) and set it to 0: the CPU
+// lookahead is an env opt-in. The texture-route default and the env override are unchanged.
+TEST(PlaybackDecodeRenderOverlapPolicy, TheCpuRouteDefaultIsOffAndNeverOutranksTheEnvOrTheTextureRoute)
+{
+    ASSERT_EQ( effectiveLookaheadFrames( -1, false, true ), 0 );
+    ASSERT_EQ( effectiveLookaheadFrames( 1, false, true ), 1 );  // the explicit opt-in still runs
+    ASSERT_EQ( effectiveLookaheadFrames( -1, true, true ), 2 );
+    ASSERT_EQ( effectiveLookaheadFrames( 0, false, true ), 0 );  // MLVAPP_PLAYBACK_RENDER_LOOKAHEAD_FRAMES=0
+    ASSERT_EQ( effectiveLookaheadFrames( 2, false, false ), 2 );
+    ASSERT_EQ( effectiveLookaheadFrames( -1, false, false ), 0 );
+    ASSERT_EQ( playback_overlap::kDefaultCpuRouteLookaheadFrames, 0 );
+    ASSERT_EQ( playback_overlap::kDefaultTextureRouteLookaheadFrames, 2 );
+}
+
+TEST(PlaybackDecodeRenderOverlapPolicy, EveryCpuRouteRefusalHasItsOwnReason)
+{
+    using playback_overlap::CpuLookaheadDecision;
+    using playback_overlap::CpuLookaheadRefusal;
+    using playback_overlap::cpuRouteLookaheadDecision;
+    // (killSwitch, playing, textureRoute, phase3ReconWorker, gpuPreviewRoute, scale, explicitEnv)
+    CpuLookaheadDecision d = cpuRouteLookaheadDecision( false, true, false, true, false, 2, false );
+    ASSERT_TRUE( d.eligible );
+    ASSERT_TRUE( d.defaultAdmitted );
+    ASSERT_TRUE( d.refusal == CpuLookaheadRefusal::None );
+    d = cpuRouteLookaheadDecision( false, true, false, true, false, 4, false );
+    ASSERT_TRUE( d.defaultAdmitted );
+
+    // The kill switch beats everything, including an explicit env and an otherwise admitted s2.
+    d = cpuRouteLookaheadDecision( true, true, false, true, false, 2, true );
+    ASSERT_FALSE( d.eligible );
+    ASSERT_FALSE( d.defaultAdmitted );
+    ASSERT_TRUE( d.refusal == CpuLookaheadRefusal::KillSwitch );
+    d = cpuRouteLookaheadDecision( true, false, true, false, true, 1, false );
+    ASSERT_TRUE( d.refusal == CpuLookaheadRefusal::KillSwitch );
+
+    d = cpuRouteLookaheadDecision( false, false, false, true, false, 2, false );
+    ASSERT_FALSE( d.eligible );
+    ASSERT_TRUE( d.refusal == CpuLookaheadRefusal::NotPlaying );
+    d = cpuRouteLookaheadDecision( false, true, true, true, false, 2, false );
+    ASSERT_FALSE( d.eligible );
+    ASSERT_TRUE( d.refusal == CpuLookaheadRefusal::TextureRoute );
+    d = cpuRouteLookaheadDecision( false, true, false, false, false, 2, false );
+    ASSERT_FALSE( d.eligible );
+    ASSERT_TRUE( d.refusal == CpuLookaheadRefusal::NotPhase3 );
+    d = cpuRouteLookaheadDecision( false, true, false, true, true, 2, false );
+    ASSERT_FALSE( d.eligible );
+    ASSERT_TRUE( d.refusal == CpuLookaheadRefusal::GpuPreviewRoute );
+
+    // s1 refuses only the default: without an env it is refused, with an explicit env it still runs.
+    d = cpuRouteLookaheadDecision( false, true, false, true, false, 1, false );
+    ASSERT_TRUE( d.eligible );
+    ASSERT_FALSE( d.defaultAdmitted );
+    ASSERT_TRUE( d.refusal == CpuLookaheadRefusal::ScaleOneDefault );
+    ASSERT_EQ( effectiveLookaheadFrames( -1, false, d.defaultAdmitted ), 0 );
+    d = cpuRouteLookaheadDecision( false, true, false, true, false, 1, true );
+    ASSERT_TRUE( d.eligible );
+    ASSERT_FALSE( d.defaultAdmitted );
+    ASSERT_TRUE( d.refusal == CpuLookaheadRefusal::None );
+    ASSERT_EQ( effectiveLookaheadFrames( 1, false, d.defaultAdmitted ), 1 );
+
+    // Every reason prints a distinct name (the overlap_summary counts are keyed by it).
+    for( int a = 0; a < static_cast<int>( CpuLookaheadRefusal::Count ); ++a )
+    {
+        for( int b = a + 1; b < static_cast<int>( CpuLookaheadRefusal::Count ); ++b )
+        {
+            ASSERT_TRUE( QString::fromLatin1( playback_overlap::cpuLookaheadRefusalName(
+                             static_cast<CpuLookaheadRefusal>( a ) ) )
+                         != QString::fromLatin1( playback_overlap::cpuLookaheadRefusalName(
+                             static_cast<CpuLookaheadRefusal>( b ) ) ) );
+        }
+    }
 }
 
 TEST(PlaybackDecodeRenderOverlapPolicy, OnlySpeculativeWorkForAnotherFrameRunsBehindTheTimer)
@@ -382,6 +498,189 @@ TEST(PlaybackDecodeRenderOverlapPipeline, TheExclusiveReconStartRemovesContentio
     ASSERT_TRUE( exclusive.presentedFpsAfterFirst() > 23.8 );
     ASSERT_TRUE( exclusive.presentedFpsAfterFirst() <= kNativeFps + 0.05 );
 }
+TEST(PlaybackDecodeRenderOverlapPipeline, OneCpuLookaheadFramePipelinesTheReconWorker)
+{
+    // PLAYBACK-CPU-PACE-GAP-1, the Bachelor CPU display shape: recon 41 ms, render 3 ms, ~20 ms tick + GUI hop,
+    // native 41.7 ms. In series a frame costs ~64 ms (s2 measured 67.2); with the CPU default (depth 1) the recon of
+    // N+1 runs while N renders and hops, so the period approaches the recon itself. (Every-frame model: under
+    // drop-frame on the venue measured the opposite, see TheCpuRouteDefaultIsOff..., so depth 1 is an env opt-in.)
+    const int cpuDepth = effectiveLookaheadFrames( 1, false, true );
+    ASSERT_EQ( cpuDepth, 1 );
+    const PipelineRun serial = simulatePipeline( 0, Gate::ExceptLookahead, 41.0, 3.0, 20.0 );
+    const PipelineRun pipelined = simulatePipeline( cpuDepth, Gate::ExceptLookahead, 41.0, 3.0, 20.0 );
+    ASSERT_TRUE( serial.inOrder );
+    ASSERT_TRUE( pipelined.inOrder );                    // every-frame playback still presents N, N+1, ... exactly
+    ASSERT_TRUE( serial.presentedFpsAfterFirst() < 16.5 );
+    ASSERT_TRUE( pipelined.presentedFpsAfterFirst() > 1.25 * serial.presentedFpsAfterFirst() );
+    ASSERT_TRUE( pipelined.presentedFpsAfterFirst() <= kNativeFps + 0.05 ); // never faster than native (#261)
+    ASSERT_EQ( pipelined.wastedUpstream, 0 );
+}
+
+TEST(PlaybackDecodeRenderOverlapPipeline, AtAStrideOfTwoAndAHalfTheLookaheadFrameIsWastedWhichIsWhyS1RefusesIt)
+{
+    // s1 is prep-bound (~100 ms a frame) and drop-frame skips ~2.5 frames per present, so the frame after the target
+    // is almost never the next one shown: its recon is pure waste, and it holds the worker the next target needs.
+    const double kWallMs = 25000.0;
+    const PipelineRun serial =
+        simulatePipeline( 0, Gate::ExceptLookahead, 41.0, 3.0, 56.0, 1.0, false, kWallMs, 2.5 );
+    const PipelineRun lookahead =
+        simulatePipeline( 1, Gate::ExceptLookahead, 41.0, 3.0, 56.0, 1.0, false, kWallMs, 2.5 );
+    ASSERT_TRUE( serial.presented > 50 );
+    ASSERT_EQ( serial.wastedUpstream, 0 );
+    ASSERT_TRUE( lookahead.wastedUpstream * 2 >= lookahead.presented ); // at least every other present wasted a recon
+    ASSERT_TRUE( lookahead.presentedFpsAfterFirst() <= serial.presentedFpsAfterFirst() * 1.02 ); // and bought nothing
+}
+
+// ---- PLAYBACK-CPU-PACE-GAP-1 r3: drop-frame off presents every frame, lookahead or not ----------------------------
+// r2 on Bachelor, drop-frame off: with the CPU lookahead the render side outran prep + present, and the prep queue
+// conflated by serial (a new task replaced the pending one, a finished result discarded the unpresented one), so arm A
+// showed 399 of 599 frames at s2 (prep_replaced_after=123). The fake pipeline below has the same four stages -- render
+// (one lookahead frame), the prep worker, the GUI present and the native-paced advance -- and runs them on the policy
+// MainWindow uses.
+namespace
+{
+
+struct DropOffRun
+{
+    int presented = 0;
+    bool inOrder = true;
+    int maxPrepBacklog = 0;
+    double elapsedMs = 0.0;
+    uint64_t holdTimeouts = 0;
+};
+
+DropOffRun simulateDropOffPlayback( bool r3Policy, int frames, double renderMs, double prepMs, double presentMs )
+{
+    using namespace playback_drop_off;
+    DropOffRun run;
+    const double periodMs = 1000.0 / kNativeFps;
+    int target = 0, nextRender = 0, rendering = -1, computing = -1, presenting = -1, lastPresented = -1;
+    double renderUntil = 0.0, prepUntil = 0.0, presentUntil = 0.0, lastAdvanceMs = -1.0e9;
+    bool targetTaken = false;
+    std::set<int> ready;
+    std::deque<int> pending, results;
+    AdvanceHold hold;
+    double now = 0.0;
+    for( ; now < 120000.0; now += kStepMs )
+    {
+        if( rendering >= 0 && now >= renderUntil ) { ready.insert( rendering ); rendering = -1; }
+        if( rendering < 0 && nextRender < frames && nextRender <= target + 1 )
+        {
+            rendering = nextRender++;
+            renderUntil = now + renderMs;
+        }
+        if( computing >= 0 && now >= prepUntil )
+        {
+            if( playbackPrepConflatesOlderWork( r3Policy ) ) results.clear();
+            results.push_back( computing );
+            computing = -1;
+        }
+        if( computing < 0 && !pending.empty() )
+        {
+            computing = pending.front();
+            pending.pop_front();
+            prepUntil = now + prepMs;
+        }
+        if( presenting >= 0 && now >= presentUntil ) presenting = -1;
+        if( presenting < 0 && !results.empty() )
+        {
+            presenting = results.front();
+            results.pop_front();
+            presentUntil = now + presentMs;
+            if( presenting != lastPresented + 1 ) run.inOrder = false;
+            lastPresented = presenting;
+            ++run.presented;
+        }
+        if( !targetTaken && ready.count( target ) ) // drawFrameReady takes the target into prep
+        {
+            ready.erase( target );
+            targetTaken = true;
+            if( playbackPrepConflatesOlderWork( r3Policy ) ) pending.clear();
+            pending.push_back( target );
+        }
+        const int backlog = static_cast<int>( pending.size() + results.size() ) + ( computing >= 0 ? 1 : 0 );
+        run.maxPrepBacklog = std::max( run.maxPrepBacklog, backlog );
+        if( target + 1 < frames && targetTaken && now - lastAdvanceMs >= periodMs )
+        {
+            if( !hold.hold( advanceHeld( r3Policy, backlog, false ), now ) )
+            {
+                ++target;
+                targetTaken = false;
+                lastAdvanceMs = now;
+            }
+        }
+        if( target + 1 == frames && targetTaken && backlog == 0 && presenting < 0 ) break;
+    }
+    run.elapsedMs = now;
+    run.holdTimeouts = hold.timeouts;
+    return run;
+}
+
+} // namespace
+
+TEST(PlaybackDropOffPrepPolicy, LosslessWorkIsNeverConflatedOrSkippedBySerial)
+{
+    ASSERT_TRUE( playbackPrepLosslessActive( true, false ) );
+    ASSERT_FALSE( playbackPrepLosslessActive( true, true ) );   // drop-frame on keeps the latest-wins queue
+    ASSERT_FALSE( playbackPrepLosslessActive( false, false ) ); // paused/scrub too
+    ASSERT_FALSE( playbackPrepTaskShouldCompute( 41, 42, 7, 7 ) );        // unchanged default
+    ASSERT_TRUE( playbackPrepTaskShouldCompute( 41, 42, 7, 7, true ) );   // an older drop-off frame still computes
+    ASSERT_FALSE( playbackPrepTaskShouldCompute( 41, 42, 7, 8, true ) );  // a display change still drops it
+    ASSERT_TRUE( playbackPrepConflatesOlderWork( false ) );
+    ASSERT_FALSE( playbackPrepConflatesOlderWork( true ) );
+}
+
+// PLAYBACK-CPU-PACE-GAP-1 r7 FR1: drop-frame-on work takes master's single conflated slot unless the bisect opt-in
+// (MLVAPP_PLAYBACK_PREP_CONFLATED_MOVE) asks for the r5 move deque; lossless work always takes the deque.
+TEST(PlaybackDropOffPrepPolicy, OnlyDropFrameOnWorkWithoutTheOptInTakesTheConflatedSlot)
+{
+    ASSERT_TRUE( playbackPrepUsesConflatedSlot( false, false ) );  // drop-frame on, default: master's slot
+    ASSERT_FALSE( playbackPrepUsesConflatedSlot( false, true ) );  // drop-frame on, opt-in: the r5 move deque
+    ASSERT_FALSE( playbackPrepUsesConflatedSlot( true, false ) );  // drop-frame off: the lossless deque
+    ASSERT_FALSE( playbackPrepUsesConflatedSlot( true, true ) );   // the opt-in never reaches the lossless path
+}
+
+TEST(PlaybackDropOffPrepPolicy, TheAdvanceHoldsForAFullPrepStageOrAnUntakenTargetAndNeverForever)
+{
+    using namespace playback_drop_off;
+    ASSERT_FALSE( advanceHeld( false, 9, true ) );                 // drop-frame on: never held
+    ASSERT_FALSE( advanceHeld( true, kPrepMaxInFlight - 1, false ) );
+    ASSERT_TRUE( advanceHeld( true, kPrepMaxInFlight, false ) );
+    ASSERT_TRUE( advanceHeld( true, 0, true ) );
+    AdvanceHold hold;
+    ASSERT_FALSE( hold.hold( false, 0.0 ) );
+    ASSERT_TRUE( hold.hold( true, 10.0 ) );
+    ASSERT_TRUE( hold.hold( true, 10.0 + kAdvanceHoldMaxMs - 1.0 ) );
+    ASSERT_FALSE( hold.hold( true, 10.0 + kAdvanceHoldMaxMs ) );  // the liveness backstop lets one advance through
+    ASSERT_EQ( hold.timeouts, 1u );
+    ASSERT_TRUE( hold.hold( true, 10.0 + kAdvanceHoldMaxMs + 1.0 ) ); // and a new hold starts
+    ASSERT_EQ( hold.holds, 2u );
+    ASSERT_FALSE( hold.hold( false, 2000.0 ) );
+    hold.resetCounters();
+    ASSERT_EQ( hold.holds, 0u );
+    ASSERT_EQ( hold.timeouts, 0u );
+}
+
+TEST(PlaybackDropOffPrepPolicy, DropFrameOffPresentsEveryFrameInOrderWhenRenderOutrunsPresent)
+{
+    // The r2 s2 shape: render 41 ms with one lookahead frame, prep 30 ms, present 60 ms (arm A presented ~81 ms apart).
+    const int kFrames = 240;
+    const DropOffRun lossy = simulateDropOffPlayback( false, kFrames, 41.0, 30.0, 60.0 );
+    const DropOffRun fixed = simulateDropOffPlayback( true, kFrames, 41.0, 30.0, 60.0 );
+    ASSERT_TRUE( lossy.presented < kFrames * 9 / 10 );   // the old conflation loses frames
+    ASSERT_FALSE( lossy.inOrder );
+    ASSERT_EQ( fixed.presented, kFrames );               // r3: every frame
+    ASSERT_TRUE( fixed.inOrder );                        // in order
+    ASSERT_TRUE( fixed.maxPrepBacklog <= playback_drop_off::kPrepMaxInFlight + 1 ); // the queue stays bounded
+    ASSERT_EQ( fixed.holdTimeouts, 0u );                 // the backstop never fires on a healthy pipeline
+    ASSERT_TRUE( fixed.elapsedMs < kFrames * 60.0 * 1.10 ); // and it runs at the present stage's own pace
+    // When present keeps up, the hold costs nothing: native pace, every frame.
+    const DropOffRun fast = simulateDropOffPlayback( true, kFrames, 30.0, 20.0, 25.0 );
+    ASSERT_EQ( fast.presented, kFrames );
+    ASSERT_TRUE( fast.inOrder );
+    ASSERT_TRUE( fast.elapsedMs < kFrames * ( 1000.0 / kNativeFps ) * 1.05 );
+}
+
 // ---- wiring: MainWindow.cpp needs a full GUI build, so its source is read as text --------------------------
 namespace
 {
@@ -410,6 +709,105 @@ TEST(PlaybackDecodeRenderOverlapWiring, ThePresentPathsRecomputeStillDrawingWith
     ASSERT_TRUE( mw.contains( QStringLiteral("playback_overlap::effectiveLookaheadFrames(") ) );
     ASSERT_TRUE( mw.contains( QStringLiteral("playback_smoke.overlap_summary") ) );
     ASSERT_FALSE( mw.contains( QStringLiteral("mlvappPlaybackRenderLookaheadFrames()") ) );
+}
+
+TEST(PlaybackDecodeRenderOverlapWiring, TheLookaheadQueueAdmitsTheCpuRouteAndTheSummaryNamesEveryRefusal)
+{
+    const QString mw = readRepoText( "platform/qt/MainWindow.cpp" );
+    ASSERT_FALSE( mw.isEmpty() );
+    const int queueFn = mw.indexOf( QStringLiteral("void MainWindow::queuePlaybackLookaheadRequests(") );
+    ASSERT_TRUE( queueFn > 0 );
+    const int queueFnEnd = mw.indexOf( QStringLiteral("\nvoid MainWindow::"), queueFn + 10 );
+    const QString queueBody = mw.mid( queueFn, queueFnEnd - queueFn );
+    ASSERT_TRUE( queueBody.contains(
+        QStringLiteral("if( !textureRouteAdmitsLookahead && !m_playbackLookaheadCpuRouteEligible ) return;") ) );
+    // The decision is recomputed every drawFrame() request from the pure policy, and the CPU default reaches the depth.
+    ASSERT_TRUE( mw.contains( QStringLiteral("playback_overlap::cpuRouteLookaheadDecision(") ) );
+    ASSERT_TRUE( mw.contains( QStringLiteral("m_playbackLookaheadCpuRouteDefaultAdmitted );") ) );
+    ASSERT_TRUE( mw.contains( QStringLiteral("MLVAPP_DISABLE_CPU_PLAYBACK_LOOKAHEAD") ) );
+    for( const char *field : { "cpu_route_eligible=", "cpu_route_default_admitted=", "cpu_route_refusal_last=",
+                               "cpu_route_refusal_counts=", "lookahead_dropped_ready=", "lookahead_pruned=" } )
+    {
+        ASSERT_TRUE( mw.contains( QString::fromLatin1( field ) ) );
+    }
+}
+
+TEST(PlaybackDecodeRenderOverlapWiring, DropFrameOffMakesThePrepQueueLosslessAndHoldsTheAdvance)
+{
+    const QString mw = readRepoText( "platform/qt/MainWindow.cpp" );
+    ASSERT_FALSE( mw.isEmpty() );
+    const int gateFn = mw.indexOf( QStringLiteral("bool MainWindow::renderThreadBusyForPlaybackAdvance(") );
+    ASSERT_TRUE( gateFn > 0 );
+    const QString gateBody = mw.mid( gateFn, mw.indexOf( QStringLiteral("\n}\n"), gateFn ) - gateFn );
+    ASSERT_TRUE( gateBody.contains( QStringLiteral("playback_drop_off::advanceHeld(") ) );
+    ASSERT_TRUE( gateBody.contains( QStringLiteral("playbackPrepBacklog()") ) );
+    ASSERT_TRUE( gateBody.contains( QStringLiteral("hasReadyPlaybackFrame(") ) );
+    ASSERT_TRUE( gateBody.contains( QStringLiteral("m_playbackDropOffAdvanceHold.hold(") ) );
+    // The poll asks the gate afresh with drop-frame off instead of trusting a cached "not busy".
+    const int timerFn = mw.indexOf( QStringLiteral("void MainWindow::timerFrameEvent(") );
+    ASSERT_TRUE( timerFn > 0 );
+    const QString timerHead = mw.mid( timerFn, mw.indexOf( QStringLiteral("if( m_frameStillDrawing )"), timerFn ) - timerFn );
+    ASSERT_TRUE( timerHead.contains(
+        QStringLiteral("m_frameStillDrawing = renderThreadBusyForPlaybackAdvance( currentPlaybackAdvanceTarget() );") ) );
+    // The task carries the mode; the enqueue and the publish conflate only lossy work; the worker never skips it.
+    ASSERT_TRUE( mw.contains( QStringLiteral("task.losslessPresent =\n        playbackPrepLosslessActive(") ) );
+    ASSERT_EQ( mw.count( QStringLiteral("playbackPrepConflatesOlderWork(") ), 2 );
+    ASSERT_TRUE( mw.contains( QStringLiteral("activeGenerationBeforeCompute,\n                                            task.losslessPresent ) )") ) );
+    ASSERT_TRUE( mw.contains( QStringLiteral("drop_off_advance_holds=") ) );
+    ASSERT_TRUE( mw.contains( QStringLiteral("drop_off_hold_timeouts=") ) );
+}
+
+// PLAYBACK-CPU-PACE-GAP-1 r5: the prep task (its owned RGB16 frame copy) is moved into and out of the deque, never
+// copied into a freshly allocated element per frame on the GUI thread. r7: that holds for the deque path (lossless work,
+// and drop-frame-on work under the bisect opt-in); the default drop-frame-on path copies into master's slot instead
+// (DropFrameOnPrepQueueIsTheMasterConflatedSlot).
+TEST(PlaybackDecodeRenderOverlapWiring, ThePrepTaskIsMovedThroughTheQueueNotCopied)
+{
+    const QString mw = readRepoText( "platform/qt/MainWindow.cpp" );
+    ASSERT_FALSE( mw.isEmpty() );
+    const int moveFn = mw.indexOf( QStringLiteral("void MainWindow::enqueuePlaybackPrepTaskLossless( PlaybackPrepTask ownedTask )") );
+    ASSERT_TRUE( moveFn > 0 );
+    const QString moveBody = mw.mid( moveFn, mw.indexOf( QStringLiteral("\nvoid MainWindow::"), moveFn + 10 ) - moveFn );
+    ASSERT_TRUE( moveBody.contains( QStringLiteral("m_playbackPrepPending.push_back( std::move( ownedTask ) );") ) );
+    ASSERT_FALSE( moveBody.contains( QStringLiteral("PlaybackPrepTask ownedTask = task;") ) );
+    ASSERT_TRUE( mw.contains( QStringLiteral("task = std::move( m_playbackPrepPending.front() );") ) );
+    ASSERT_TRUE( mw.contains( QStringLiteral("enqueuePlaybackPrepTaskLossless( std::move( task ) );") ) );
+}
+
+// PLAYBACK-CPU-PACE-GAP-1 r7 FR1: with drop-frame on (and no bisect opt-in) the prep queue is the cb23f62b master code:
+// one conflated slot, the task copied in on the GUI thread and copied out by the worker, as before #397.
+TEST(PlaybackDecodeRenderOverlapWiring, DropFrameOnPrepQueueIsTheMasterConflatedSlot)
+{
+    const QString mw = readRepoText( "platform/qt/MainWindow.cpp" );
+    ASSERT_FALSE( mw.isEmpty() );
+    const int slotFn = mw.indexOf( QStringLiteral("void MainWindow::enqueuePlaybackPrepTask( const PlaybackPrepTask &task )") );
+    ASSERT_TRUE( slotFn > 0 );
+    const QString slotBody = mw.mid( slotFn, mw.indexOf( QStringLiteral("\nvoid MainWindow::"), slotFn + 10 ) - slotFn );
+    ASSERT_TRUE( slotBody.contains( QStringLiteral("PlaybackPrepTask ownedTask = task;") ) );
+    ASSERT_TRUE( slotBody.contains( QStringLiteral("m_playbackPrepConflatedSlot = ownedTask;") ) );
+    ASSERT_TRUE( slotBody.contains( QStringLiteral("m_playbackPrepConflatedSlotValid = true;") ) );
+    ASSERT_FALSE( slotBody.contains( QStringLiteral("std::move( ownedTask )") ) );
+    ASSERT_TRUE( mw.contains( QStringLiteral("task = m_playbackPrepConflatedSlot;") ) );
+    const int drawReady = mw.indexOf( QStringLiteral("void MainWindow::drawFrameReady()") );
+    ASSERT_TRUE( drawReady > 0 );
+    const QString drawReadyBody = mw.mid( drawReady, mw.indexOf( QStringLiteral("\nvoid MainWindow::"), drawReady + 10 ) - drawReady );
+    ASSERT_TRUE( drawReadyBody.contains( QStringLiteral("playbackPrepUsesConflatedSlot(") ) );
+    ASSERT_TRUE( drawReadyBody.contains( QStringLiteral("enqueuePlaybackPrepTask( task );") ) );
+}
+
+// PLAYBACK-CPU-PACE-GAP-1 r7 FR1b: MLVAPP_PLAYBACK_PREP_CONFLATED_MOVE is an opt-in bisect switch (on only when set and
+// not "0", read once), and it is what drawFrameReady hands the policy, so one binary can A/B the slot and the move deque.
+TEST(PlaybackDecodeRenderOverlapWiring, TheConflatedMoveBisectSwitchIsOptInAndReadOnce)
+{
+    const QString mw = readRepoText( "platform/qt/MainWindow.cpp" );
+    ASSERT_FALSE( mw.isEmpty() );
+    const int fn = mw.indexOf( QStringLiteral("static bool mlvappPlaybackPrepConflatedMoveOptIn()") );
+    ASSERT_TRUE( fn > 0 );
+    const QString body = mw.mid( fn, mw.indexOf( QStringLiteral("\n}\n"), fn ) - fn );
+    ASSERT_TRUE( body.contains( QStringLiteral("static const bool optIn") ) );
+    ASSERT_TRUE( body.contains( QStringLiteral("if( !qEnvironmentVariableIsSet( \"MLVAPP_PLAYBACK_PREP_CONFLATED_MOVE\" ) ) return false;") ) );
+    ASSERT_TRUE( body.contains( QStringLiteral("!= QStringLiteral(\"0\")") ) );
+    ASSERT_TRUE( mw.contains( QStringLiteral("playbackPrepUsesConflatedSlot( task.losslessPresent, mlvappPlaybackPrepConflatedMoveOptIn() )") ) );
 }
 
 TEST(PlaybackDecodeRenderOverlapWiring, TheRenderThreadReportsEveryStageToTheMeter)

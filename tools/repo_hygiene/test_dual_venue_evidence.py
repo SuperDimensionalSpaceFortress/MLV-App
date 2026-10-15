@@ -130,7 +130,15 @@ SHIPPED_LEGS = ("legs/m16-1243-speed.json", "legs/m16-1243-look.json", "legs/m16
                 *LOOKAHEAD_LEGS, *HEAVY_LEGS, *DECODER_LEGS, "legs/m16-1243-look-scale2-cinematic.json", "legs/m16-1243-look-film.json",
                 "legs/m16-1243-look-scale2-film.json", *(f"legs/m16-1243-look-scale2-{flavor}-agxoff.json" for flavor in ("cinematic", "film")),
                 *(f"legs/m16-1243-display-{mode}-s{scale}-vsync1.json" for scale in (1, 2, 4) for mode in ("fullscreen", "windowed")),
-                *CPU_REDUCED_LEGS, *UPSTREAM_BASELINE_LEGS, *PTRACE_LEGS, *VISUAL_LEGS, *SCOPE_LEGS, *SCOPE_LA_LEGS)
+                *CPU_REDUCED_LEGS, *UPSTREAM_BASELINE_LEGS, *PTRACE_LEGS, *VISUAL_LEGS, *SCOPE_LEGS, *SCOPE_LA_LEGS,
+                *(f"legs/m16-1243-exact-fullscreen-s{scale}-{arm}.json" for scale in (1, 2, 4) for arm in ("la", "ctl")),
+                *(rel.replace(".json", "-vis.json") for rel in DISPLAY_MATRIX_LEGS))
+# PLAYBACK-CPU-PACE-GAP-1 r12: the visual twins of the six display-matrix cells. A look leg keeps window captures only when it opts in, and the cells
+# themselves stay byte-identical (their legSpecSha256 values sit in receipts), so each twin is its cell plus visualCapture true, under its own legId.
+VIS_LEGS = {rel.replace(".json", "-vis.json"): rel for rel in DISPLAY_MATRIX_LEGS}
+# PLAYBACK-CPU-PACE-GAP-1: the D1 exactness pairs, one per scale: arm A (la) runs the CPU-route lookahead (s1 by explicit depth 1), arm B (ctl) the
+# kill switch; both cpu-only at --drop-frame-mode off with the presented-frame dump on.
+EXACT_LEGS = {scale: (f"legs/m16-1243-exact-fullscreen-s{scale}-la.json", f"legs/m16-1243-exact-fullscreen-s{scale}-ctl.json") for scale in (1, 2, 4)}
 # PLAYBACK-VSYNC-DEFAULT-1: the swap-interval-1 twins of the six display-matrix legs (the vsync A/B; the originals stay at the app's default 0).
 VSYNC1_LEGS = tuple(rel.replace(".json", "-vsync1.json") for rel in DISPLAY_MATRIX_LEGS)
 # LOOK-ASSIST-FILM-FLAVOR-2 r2: the AgX-off twins of the scale-2 Cinematic and Film legs carry a committed look receipt (look-receipts/agx-off.marxml).
@@ -704,6 +712,50 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         # The smoke launcher clears the variable unless the job passes it, so a stray value never leaks into a leg.
         self.assertIn('"MLVAPP_RAW_UINT16_PREFETCH_DECODERS",', LAUNCHER.read_text(encoding="utf-8"))
 
+    def test_the_cpu_exactness_arms_reach_the_job_only_when_asked(self) -> None:
+        """PLAYBACK-CPU-PACE-GAP-1: -DropFrameMode, -DisableCpuPlaybackLookahead, -PresentedDumpFrames and a cpu run's -PlaybackRenderLookaheadFrames add
+        exactly their own text to a cpu look job (and the dump publish block); absent, the job is the text it was, byte for byte."""
+        look = ["-Backend", "cpu", "-ForceLookAssist", "-ContactSheet", "-LookFlavor", "cinematic"]
+        default = self.generate(GENERATOR, "exact-default.job.ps1", look).read_text(encoding="utf-8")
+        for token in ("-DropFrameMode", "MLVAPP_DISABLE_CPU_PLAYBACK_LOOKAHEAD", "MLVAPP_PLAYBACK_PRESENTED_DUMP", "MLVAPP_PLAYBACK_RENDER_LOOKAHEAD_FRAMES", "presented-dumps"):
+            self.assertNotIn(token, default)
+        arm_a = self.generate(GENERATOR, "exact-a.job.ps1", [*look, "-DropFrameMode", "off", "-PresentedDumpFrames", "40-79", "-PlaybackRenderLookaheadFrames", "1"])
+        arm_b = self.generate(GENERATOR, "exact-b.job.ps1", [*look, "-DropFrameMode", "off", "-PresentedDumpFrames", "40-79", "-DisableCpuPlaybackLookahead"])
+        for job in (arm_a, arm_b):
+            self.assertEqual(self.parse_errors(job), 0, job.name)
+            text = job.read_text(encoding="utf-8").replace("\r\n", "\n")
+            self.assertEqual(text.count("-DropFrameMode off -UsePersistedPlaybackSettings "), 1, job.name)
+            self.assertEqual(text.count("    ('MLVAPP_PLAYBACK_PRESENTED_DUMP_DIR=' + (Join-Path $Work 'presented-dumps')),\n"), 1, job.name)
+            self.assertEqual(text.count("    'MLVAPP_PLAYBACK_PRESENTED_DUMP_FRAMES=40-79',\n"), 1, job.name)
+            publish = text.index("$presentedDumpDir = Join-Path $Work 'presented-dumps'")
+            self.assertLess(publish, text.index("# CUDA-PLAYBACK-CONTACT-SHEET-1: publish the raw per-frame PNG+JSON pairs the app's own"), job.name)
+            self.assertIn("(Join-Path (Join-Path $Pub 'presented-dumps') $dumpFile.Name)", text, job.name)
+        a_text = arm_a.read_text(encoding="utf-8")
+        b_text = arm_b.read_text(encoding="utf-8")
+        self.assertIn("'MLVAPP_PLAYBACK_RENDER_LOOKAHEAD_FRAMES=1',", a_text)
+        self.assertNotIn("MLVAPP_DISABLE_CPU_PLAYBACK_LOOKAHEAD", a_text)
+        self.assertIn("'MLVAPP_DISABLE_CPU_PLAYBACK_LOOKAHEAD=1',", b_text)
+        self.assertNotIn("MLVAPP_PLAYBACK_RENDER_LOOKAHEAD_FRAMES", b_text)
+        # every addition is removable back to the default job
+        stripped = b_text.replace("-DropFrameMode off ", "")
+        for line in ("    'MLVAPP_DISABLE_CPU_PLAYBACK_LOOKAHEAD=1',", "    ('MLVAPP_PLAYBACK_PRESENTED_DUMP_DIR=' + (Join-Path $Work 'presented-dumps')),",
+                     "    'MLVAPP_PLAYBACK_PRESENTED_DUMP_FRAMES=40-79',"):
+            stripped = stripped.replace(line + ("\r\n" if "\r\n" in stripped else "\n"), "", 1)
+        start = stripped.index("$presentedDumpDir = Join-Path $Work 'presented-dumps'")
+        end = stripped.index("# CUDA-PLAYBACK-CONTACT-SHEET-1: publish the raw per-frame PNG+JSON pairs the app's own")
+        self.assertEqual(stripped[:start] + stripped[end:], default)
+
+    def test_the_runner_passes_a_cpu_legs_exactness_args_to_the_generator_and_fetches_the_dumps(self) -> None:
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        block = runner[runner.index("if ($Backend -ceq 'cpu') {"):]
+        for line in ("if ($spec.generatorArgs.PSObject.Properties['dropFrameMode']) { $gen['DropFrameMode'] = [string]$spec.generatorArgs.dropFrameMode }",
+                     "if ($spec.generatorArgs.PSObject.Properties['disableCpuPlaybackLookahead'] -and [bool]$spec.generatorArgs.disableCpuPlaybackLookahead) { $gen['DisableCpuPlaybackLookahead'] = $true }",
+                     "if ($spec.generatorArgs.PSObject.Properties['presentedDumpFrames']) { $gen['PresentedDumpFrames'] = [string]$spec.generatorArgs.presentedDumpFrames }",
+                     "if (-not $gen.ContainsKey('PlaybackRenderLookaheadFrames') -and $spec.generatorArgs.PSObject.Properties['playbackRenderLookaheadFrames']) { $gen['PlaybackRenderLookaheadFrames'] = [int]$spec.generatorArgs.playbackRenderLookaheadFrames }"):
+            self.assertIn(line, block[:block.index("if ($isLook) {")])
+        self.assertIn("$dumpShare = Join-Path $artifactsShare 'presented-dumps'", runner)
+        self.assertIn("Copy-Item -LiteralPath $dumpShare -Destination (Join-Path $evidenceDir 'presented-dumps') -Recurse", runner)
+
     def test_scale_and_quiescence_parameters_reach_the_job(self) -> None:
         text = self.generate(GENERATOR, "scale.job.ps1", ["-ScaleFactor", "1", "-CpuQuiescenceThresholdPercent", "35.5"]).read_text(encoding="utf-8")
         self.assertIn("-ScaleFactor 1 -UsePersistedPlaybackSettings", text)
@@ -720,6 +772,8 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
                              (["-LookPaceLeg"], "DUAL_VENUE_LOOK_PACE_LEG_SHAPE"),
                              (["-ForceLookAssist", "-ContactSheet", "-LookPaceLeg"], "DUAL_VENUE_LOOK_PACE_LEG_SHAPE"),
                              (["-PlaybackRenderLookaheadFrames", "3"], "DUAL_VENUE_LOOKAHEAD_NEEDS_LOOK_PACE_LEG"),
+                             (["-DisableCpuPlaybackLookahead"], "DUAL_VENUE_CPU_EXACTNESS_NEEDS_CPU_BACKEND"),
+                             (["-PresentedDumpFrames", "40-79"], "DUAL_VENUE_CPU_EXACTNESS_NEEDS_CPU_BACKEND"),
                              (["-ForceLookAssist", "-ContactSheet", "-DisableLookAssist"], "DUAL_VENUE_LOOK_ASSIST_CONFLICT"),
                              (["-ForceLookAssist", "-LookPaceLeg", "-LookFlavor", "cinematic", "-DisableLookAssist"], "DUAL_VENUE_LOOK_ASSIST_CONFLICT")):
             out = self.tmp / "refused.job.ps1"
@@ -5601,6 +5655,31 @@ class LegSpecSchemaTests(unittest.TestCase):
             self.assertEqual(arm["generatorArgs"].pop("rawPrefetchDecoders"), 1, rel)
             self.assertEqual(dict(arm, legId=twin["legId"]), twin, rel)
 
+    def test_each_exactness_leg_is_its_fullscreen_display_cell_on_cpu_with_its_arm(self) -> None:
+        """PLAYBACK-CPU-PACE-GAP-1: an exactness leg is its full-screen display-matrix cell, cpu only, at --drop-frame-mode off with the presented-frame dump on;
+        the two arms of a scale differ only in legId and the arm switch (A: lookahead at an explicit depth 1 at every scale, since the CPU-route default is 0 and opt-in; B: the kill switch)."""
+        for scale, (la_rel, ctl_rel) in EXACT_LEGS.items():
+            cell = json.loads((DV / "legs" / f"m16-1243-display-fullscreen-s{scale}.json").read_text(encoding="utf-8"))
+            arms = {}
+            for rel in (la_rel, ctl_rel):
+                arm = json.loads((DV / rel).read_text(encoding="utf-8"))
+                self.jsonschema.validate(arm, self.schema)
+                self.assertEqual(arm["legId"], Path(rel).stem, rel)
+                self.assertEqual((arm["card"], arm["backends"]), ("PLAYBACK-CPU-PACE-GAP-1", ["cpu"]), rel)
+                for key in ("legType", "clipId", "playSeconds", "scaleFactor", "displayMode", "timeouts", "look"):
+                    self.assertEqual(arm[key], cell[key], f"{rel}: {key}")
+                self.assertEqual(arm["criteria"], {role: {"cpu": lists["cpu"]} for role, lists in cell["criteria"].items()}, rel)
+                arms[rel] = dict(arm["generatorArgs"])
+            common = dict(cell["generatorArgs"], dropFrameMode="off", presentedDumpFrames="40-79")
+            self.assertEqual(arms[ctl_rel], dict(common, disableCpuPlaybackLookahead=True), ctl_rel)
+            self.assertEqual(arms[la_rel], dict(common, playbackRenderLookaheadFrames=1), la_rel)
+        bad = json.loads((DV / EXACT_LEGS[2][0]).read_text(encoding="utf-8"))
+        for key, value in (("dropFrameMode", "persisted"), ("presentedDumpFrames", "40"), ("disableCpuPlaybackLookahead", "1")):
+            broken = json.loads(json.dumps(bad))
+            broken["generatorArgs"][key] = value
+            with self.assertRaises(self.jsonschema.ValidationError, msg=key):
+                self.jsonschema.validate(broken, self.schema)
+
     def test_the_upstream_baseline_legs_are_no_look_cpu_speed_legs_at_scale_1(self) -> None:
         """UPSTREAM-CPU-BASELINE-1: the fork arm of the upstream CPU A/B. Each leg is a cpu-only SPEED leg at scale 1 in the display mode its name says,
         LIGHT, the pace legs' 95 % quiescence gate, Look Assist explicitly OFF (never forced), and informational criteria (the A/B is read lane-side)."""
@@ -5631,6 +5710,29 @@ class LegSpecSchemaTests(unittest.TestCase):
             self.assertEqual(arm["legId"], twin["legId"] + "-ptrace", rel)
             self.assertIs(arm["generatorArgs"].pop("presentTrace"), True, rel)
             self.assertEqual(dict(arm, legId=twin["legId"]), twin, rel)
+
+    def test_each_vis_leg_is_its_display_matrix_cell_with_the_visual_opt_in(self) -> None:
+        """PLAYBACK-CPU-PACE-GAP-1 r12: a visual twin differs from its display-matrix cell only in its legId (cell + -vis) and one added line,
+        visualCapture true right after displayMode; the cell itself names no visualCapture (a look leg is off by default)."""
+        for rel, cell_rel in VIS_LEGS.items():
+            arm = json.loads((DV / rel).read_text(encoding="utf-8"))
+            self.jsonschema.validate(arm, self.schema)
+            cell = json.loads((DV / cell_rel).read_text(encoding="utf-8"))
+            self.assertNotIn("visualCapture", cell, cell_rel)
+            self.assertEqual(arm["legId"], cell["legId"] + "-vis", rel)
+            self.assertEqual(arm["legId"], Path(rel).stem, rel)
+            self.assertIs(arm.pop("visualCapture"), True, rel)
+            self.assertEqual(dict(arm, legId=cell["legId"]), cell, rel)
+            self.assertEqual(list(arm), list(cell), "same keys in the same order")
+            text = lambda r: (DV / r).read_bytes().replace(b"\r\n", b"\n").decode("utf-8").split("\n")
+            arm_lines, cell_lines = text(rel), text(cell_rel)
+            self.assertEqual(arm_lines.count('  "visualCapture": true,'), 1, rel)
+            at = arm_lines.index('  "visualCapture": true,')
+            self.assertTrue(arm_lines[at - 1].startswith('  "displayMode": '), rel)
+            del arm_lines[at]
+            self.assertEqual([(a, b) for a, b in zip(arm_lines, cell_lines) if a != b],
+                             [(f'  "legId": "{cell["legId"]}-vis",', f'  "legId": "{cell["legId"]}",')], "byte copies: only the legId line differs")
+            self.assertEqual(len(arm_lines), len(cell_lines), rel)
 
     def test_the_scope_legs_are_no_look_windowed_s1_speed_legs_differing_only_in_scope(self) -> None:
         """PLAYBACK-SCOPES-OPTION-1: every scope leg is a single-backend no-look SPEED leg at windowed scale 1 (LIGHT, the 95 % quiescence gate,
@@ -5691,7 +5793,7 @@ class LegSpecSchemaTests(unittest.TestCase):
             flavored += 1
             if spec["card"] == "DUAL-VENUE-DISPLAY-MATRIX-1":   # the display-matrix legs are cinematic look legs named by their cell (display mode and scale)
                 self.assertEqual(spec["legId"], path.stem, path.name)   # (-ptrace: the cell with the present trace on, PTRACE_LEGS)
-                self.assertRegex(spec["legId"], r"^m16-1243-display-(fullscreen|windowed)-s[124](-ptrace)?$", path.name)
+                self.assertRegex(spec["legId"], r"^m16-1243-display-(fullscreen|windowed)-s[124](-ptrace|-vis)?$", path.name)   # (-vis: VIS_LEGS)
             elif spec["card"] == "PLAYBACK-VSYNC-DEFAULT-1":   # the swap-interval-1 twins of the display-matrix legs, named by their cell
                 self.assertEqual(spec["legId"], path.stem, path.name)
                 self.assertRegex(spec["legId"], r"^m16-1243-display-(fullscreen|windowed)-s[124]-vsync1$", path.name)
@@ -5703,6 +5805,10 @@ class LegSpecSchemaTests(unittest.TestCase):
                 self.assertRegex(spec["legId"], r"^m16-1243-cpu-reduced-(fullscreen|windowed)-s[24]$", path.name)
                 self.assertEqual(spec["backends"], ["cpu"], path.name)
                 self.assertEqual(spec["generatorArgs"]["playbackProcessing"], "receipt", path.name)
+            elif spec["card"] == "PLAYBACK-CPU-PACE-GAP-1":   # the cpu-only D1 exactness arms of the full-screen display cells, named by cell and arm
+                self.assertEqual(spec["legId"], path.stem, path.name)
+                self.assertRegex(spec["legId"], r"^m16-1243-exact-fullscreen-s[124]-(la|ctl)$", path.name)
+                self.assertEqual(spec["backends"], ["cpu"], path.name)
             else:   # the scale-4 flavored look leg, or its scale-2 twin (LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1), or that twin's AgX-off copy (LOOK-ASSIST-FILM-FLAVOR-2 r2)
                 self.assertIn(spec["legId"], (f"m16-1243-look-{flavor}", f"m16-1243-look-scale2-{flavor}", f"m16-1243-look-scale2-{flavor}-agxoff"), path.name)
                 self.assertEqual(spec["legId"], path.stem, path.name)
@@ -6450,6 +6556,9 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
             "true": ("@{ legType = 'speed'; visualCapture = $true }", "True|True|"),
             "optout": ("@{ legType = 'speed'; visualCapture = $false; visualCaptureOptOutReason = 'a capture-free pace A/B arm' }", "True|False|a capture-free pace A/B arm"),
             "look": ("@{ legType = 'look' }", "False|False|"),
+            # PLAYBACK-CPU-PACE-GAP-1 r11: a look leg opts in with visualCapture true (the D4 display-matrix cells); false stays off.
+            "look-optin": ("@{ legType = 'look'; visualCapture = $true }", "True|True|"),
+            "look-false": ("@{ legType = 'look'; visualCapture = $false }", "False|False|"),
         }
         for name, (spec, expected) in cases.items():
             with self.subTest(name):
@@ -6457,7 +6566,9 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
                 self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
                 self.assertEqual(out[0] if isinstance(out, list) else out, expected)
         for name, spec in (("no-reason", "@{ legType = 'speed'; visualCapture = $false }"), ("reason-only", "@{ legType = 'speed'; visualCaptureOptOutReason = 'why not' }"),
-                           ("not-bool", "@{ legType = 'speed'; visualCapture = 'no' }")):
+                           ("not-bool", "@{ legType = 'speed'; visualCapture = 'no' }"),
+                           ("look-reason", "@{ legType = 'look'; visualCapture = $false; visualCaptureOptOutReason = 'a look leg has its sheet' }"),
+                           ("look-optin-reason", "@{ legType = 'look'; visualCapture = $true; visualCaptureOptOutReason = 'a look leg has its sheet' }")):
             with self.subTest(name):
                 proc = run_pwsh(["-Command", f"Import-Module '{DV / 'DualVenueRunner.psm1'}' -Force; try {{ [void](Get-DvVisualCaptureRequest -Spec ([pscustomobject]{spec})); 'NO_THROW' }} catch {{ $_.Exception.Message }}"])
                 self.assertTrue(proc.stdout.strip().startswith("DVE_LEG_SPEC_INVALID"), proc.stdout + proc.stderr)

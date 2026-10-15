@@ -13,9 +13,12 @@
  * speculative work as busy, so the timer could not advance while it ran.
  *
  * This header holds the three pieces that fix and prove it:
- *  - effectiveLookaheadFrames(): the lookahead is on by default (depth 2) on the
- *    CUDA texture route only; MLVAPP_PLAYBACK_RENDER_LOOKAHEAD_FRAMES=0 is the kill
- *    switch, any explicit value wins, and every other route keeps depth 0.
+ *  - effectiveLookaheadFrames(): the lookahead is on by default at depth 2 on the
+ *    CUDA texture route and (PLAYBACK-CPU-PACE-GAP-1) at kDefaultCpuRouteLookaheadFrames
+ *    (0 since r3, so env opt-in only) on the CPU route when cpuRouteLookaheadDecision()
+ *    admits its default (Phase 3 recon worker, scale 2 or 4); MLVAPP_PLAYBACK_RENDER_LOOKAHEAD_FRAMES=0 is the kill switch
+ *    for every route, any explicit value wins, and every other route keeps depth 0.
+ *    MLVAPP_DISABLE_CPU_PLAYBACK_LOOKAHEAD=1 turns the CPU route off on its own.
  *  - WorkItem / blocksPlaybackAdvance(): speculative lookahead work for a frame
  *    other than the current playback target never holds the timer back; the
  *    target's own work (lookahead or not) and every non-lookahead request still do.
@@ -37,18 +40,82 @@ namespace playback_overlap
 /*! The default lookahead depth on the CUDA texture route. Two frames ahead keeps
  *  the recon worker (the slowest stage) fed through one late tick. */
 inline constexpr int kDefaultTextureRouteLookaheadFrames = 2;
+/*! The default lookahead depth on the CPU route (PLAYBACK-CPU-PACE-GAP-1). One frame ahead lets the recon
+ *  worker start N+1 while N renders and hops to the GUI, which is where the serial CPU display legs lost
+ *  ~23-26 ms a frame. r3 measured it on Bachelor with drop-frame on (the default) and it MISSED: at s2 the
+ *  drop target strides past N+1, so the lookahead frame is pruned unshown (lookahead_pruned 201 of 399) and its
+ *  recon contends with the frame that is shown (14.1 -> 10.3 fps). So the default is 0: the CPU route runs a
+ *  lookahead only on an explicit MLVAPP_PLAYBACK_RENDER_LOOKAHEAD_FRAMES, and the admission, telemetry and kill
+ *  switch stay. A pace-aware offset (look ahead to the predicted next drop target) is the successor. */
+inline constexpr int kDefaultCpuRouteLookaheadFrames = 0;
 /*! RenderFrameThread's queuePlaybackLookaheadRequests() bound (qBound( 0, env, 3 )). */
 inline constexpr int kMaxLookaheadFrames = 3;
 
 /*! \a envFrames is the parsed MLVAPP_PLAYBACK_RENDER_LOOKAHEAD_FRAMES (or its
  *  legacy alias), or -1 when neither is set. */
-inline int effectiveLookaheadFrames( int envFrames, bool textureRouteAdmitted )
+inline int effectiveLookaheadFrames( int envFrames, bool textureRouteAdmitted,
+                                     bool cpuRouteDefaultAdmitted = false )
 {
     if( envFrames >= 0 )
     {
         return envFrames > kMaxLookaheadFrames ? kMaxLookaheadFrames : envFrames;
     }
-    return textureRouteAdmitted ? kDefaultTextureRouteLookaheadFrames : 0;
+    if( textureRouteAdmitted ) return kDefaultTextureRouteLookaheadFrames;
+    return cpuRouteDefaultAdmitted ? kDefaultCpuRouteLookaheadFrames : 0;
+}
+
+/*! Why the CPU route did not get its default lookahead. Count is the array size. */
+enum class CpuLookaheadRefusal
+{
+    None,
+    KillSwitch,      //!< MLVAPP_DISABLE_CPU_PLAYBACK_LOOKAHEAD set and not "0"
+    NotPlaying,
+    TextureRoute,    //!< the CUDA texture route owns this request (its own default applies)
+    NotPhase3,       //!< the playback quality mode is not Phase 3 decode/recon/process
+    GpuPreviewRoute, //!< GPU preview processing or the 16-bit GPU preview renders this request
+    ScaleOneDefault, //!< s1 is prep-bound and skips frames under drop-frame: refuse the default only
+    Count
+};
+
+inline const char *cpuLookaheadRefusalName( CpuLookaheadRefusal refusal )
+{
+    switch( refusal )
+    {
+    case CpuLookaheadRefusal::None: return "none";
+    case CpuLookaheadRefusal::KillSwitch: return "kill_switch";
+    case CpuLookaheadRefusal::NotPlaying: return "not_playing";
+    case CpuLookaheadRefusal::TextureRoute: return "texture_route";
+    case CpuLookaheadRefusal::NotPhase3: return "not_phase3";
+    case CpuLookaheadRefusal::GpuPreviewRoute: return "gpu_preview_route";
+    case CpuLookaheadRefusal::ScaleOneDefault: return "scale_one_default";
+    case CpuLookaheadRefusal::Count: break;
+    }
+    return "unknown";
+}
+
+struct CpuLookaheadDecision
+{
+    bool eligible = false;        //!< queuePlaybackLookaheadRequests() may queue on the CPU route
+    bool defaultAdmitted = false; //!< the depth-1 default applies (no explicit env needed)
+    CpuLookaheadRefusal refusal = CpuLookaheadRefusal::None;
+};
+
+/*! The CPU-route admission. The kill switch beats everything; s1 refuses only the default, so an explicit
+ *  MLVAPP_PLAYBACK_RENDER_LOOKAHEAD_FRAMES still runs it (\a explicitEnv). */
+inline CpuLookaheadDecision cpuRouteLookaheadDecision( bool killSwitch, bool playing, bool textureRoute,
+                                                       bool phase3ReconWorker, bool gpuPreviewRoute,
+                                                       int playbackScaleFactor, bool explicitEnv )
+{
+    CpuLookaheadDecision d;
+    if( killSwitch ) d.refusal = CpuLookaheadRefusal::KillSwitch;
+    else if( !playing ) d.refusal = CpuLookaheadRefusal::NotPlaying;
+    else if( textureRoute ) d.refusal = CpuLookaheadRefusal::TextureRoute;
+    else if( !phase3ReconWorker ) d.refusal = CpuLookaheadRefusal::NotPhase3;
+    else if( gpuPreviewRoute ) d.refusal = CpuLookaheadRefusal::GpuPreviewRoute;
+    d.eligible = d.refusal == CpuLookaheadRefusal::None;
+    d.defaultAdmitted = d.eligible && playbackScaleFactor >= 2;
+    if( d.eligible && !d.defaultAdmitted && !explicitEnv ) d.refusal = CpuLookaheadRefusal::ScaleOneDefault;
+    return d;
 }
 
 /*! One unit of render-thread work as the playback advance sees it: a queued

@@ -382,6 +382,8 @@ public:
                                       uint64_t activeGeneration );
     bool hasReadyPlaybackLookaheadFrame( uint32_t frameNumber,
                                          uint64_t activeGeneration );
+    bool hasReadyPlaybackFrame( uint32_t frameNumber,
+                                uint64_t activeGeneration );
     int prunePlaybackLookaheadOutsideForwardWindow( int activePlaybackTarget,
                                                     uint64_t activeGeneration,
                                                     int cutInFrame,
