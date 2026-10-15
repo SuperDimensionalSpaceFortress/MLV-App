@@ -114,14 +114,20 @@ QString clipHash(const QString & basenameOrPath);
  *  backend DLLs, then the final flush), then re-arms it. */
 void sessionEndForTesting();
 
+/*! Test-only (POST-SESSION-LATE-FAULT-1): `hook` runs inside every flush after
+ *  it took its snapshot and before it writes; nullptr removes it. */
+void setAfterTakeForTesting(void (*hook)(const char * reason));
+
 /*! Test-only (r7): the normal GUI close against a log in `logsDir`, with both
  *  backend sinks installed as install() installs them (it never reads
  *  enabled()): `beforeSessionEnd`, then aboutToQuit's session end, then
  *  `afterSessionEnd` (what ~MainWindow runs: the GPU views' destroyTexture and
- *  its GL resets), then the post routine ~QApplication runs. Then it uninstalls
- *  and re-arms. Does nothing if install() already ran. */
+ *  its GL resets), then the post routine ~QApplication runs, then
+ *  `afterPostRoutine`, then the join of any exit write still running. Then it
+ *  uninstalls and re-arms. Does nothing if install() already ran. */
 void appCloseForTesting(const QString & logsDir, const std::function<void()> & beforeSessionEnd,
-                        const std::function<void()> & afterSessionEnd);
+                        const std::function<void()> & afterSessionEnd,
+                        const std::function<void()> & afterPostRoutine = std::function<void()>());
 
 } // namespace GpuFieldTelemetry
 

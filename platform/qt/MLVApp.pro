@@ -115,6 +115,9 @@ win32{
     # dbghelp: required by CrashForensics' MiniDumpWriteDump-based
     # unhandled-exception filter.
     LIBS += -ldbghelp
+    # gdi32: PLAYBACK-VISUAL-INSPECTION-1's PrintWindow window capture (CreateDIBSection et al.);
+    # MinGW only links it by default under -mwindows, which qmake does not pass.
+    LIBS += -lgdi32
     greaterThan(QT_MAJOR_VERSION, 5){
         QMAKE_CXXFLAGS += -fopenmp -mssse3 -std=c++17 -ftree-vectorize
     }
