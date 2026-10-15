@@ -290,6 +290,13 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
     HFR_CONFORM_OPEN = "HFR-CONFORM-AWARE-RECEIPT-ORACLES-1 >>>"
     HFR_CONFORM_CLOSE = "HFR-CONFORM-AWARE-RECEIPT-ORACLES-1 <<<"
     HFR_CONFORM_REGIONS = 3
+    # PLAYBACK-GPU-SCOPES-NO-VETO-1 r2: the measured-session eligibility verdict (row B). Eight regions: in the spliced module functions,
+    # Get-AttrCudaLastEligibilityLine's help (1) and Get-AttrCudaEligibilityVerdict's help, parameter, measured-session override and result fields (4), plus
+    # the Get-AttrCudaEligibilityLineForSession splice (1); in the job template the measured-session verdict call and the diagnostics fields (2). Every
+    # baseline line stays verbatim outside them. Absent from the baseline.
+    GPU_SCOPES_NO_VETO_OPEN = "PLAYBACK-GPU-SCOPES-NO-VETO-1 >>>"
+    GPU_SCOPES_NO_VETO_CLOSE = "PLAYBACK-GPU-SCOPES-NO-VETO-1 <<<"
+    GPU_SCOPES_NO_VETO_REGIONS = 8
 
     @classmethod
     def strip_regions(cls, text: str) -> tuple[str, dict[str, int]]:
@@ -300,7 +307,8 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
                     "keepalive-hung-probe": (cls.KEEPALIVE_HUNG_PROBE_OPEN, cls.KEEPALIVE_HUNG_PROBE_CLOSE),
                     "session-locked": (cls.SESSION_LOCKED_OPEN, cls.SESSION_LOCKED_CLOSE),
                     "playback-vsync": (cls.PLAYBACK_VSYNC_OPEN, cls.PLAYBACK_VSYNC_CLOSE),
-                    "hfr-conform-oracles": (cls.HFR_CONFORM_OPEN, cls.HFR_CONFORM_CLOSE)}
+                    "hfr-conform-oracles": (cls.HFR_CONFORM_OPEN, cls.HFR_CONFORM_CLOSE),
+                    "gpu-scopes-no-veto": (cls.GPU_SCOPES_NO_VETO_OPEN, cls.GPU_SCOPES_NO_VETO_CLOSE)}
         kept: list[str] = []
         inside: str | None = None
         counts = {name: 0 for name in families}
@@ -349,6 +357,8 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         self.assertEqual(old_counts["playback-vsync"], self.PLAYBACK_VSYNC_REGIONS, "the baseline (the pinned GPU-PREF-REGISTRY-STOP-AND-PRUNE-1 generator commit) carries the same bracketed regions")
         self.assertEqual(new_counts["hfr-conform-oracles"], self.HFR_CONFORM_REGIONS, "the default job carries exactly the pinned number of bracketed HFR-CONFORM-AWARE-RECEIPT-ORACLES-1 regions")
         self.assertEqual(old_counts["hfr-conform-oracles"], self.HFR_CONFORM_REGIONS, "the baseline (the pinned GPU-PREF-REGISTRY-STOP-AND-PRUNE-1 generator commit) carries the same bracketed regions")
+        self.assertEqual(new_counts["gpu-scopes-no-veto"], self.GPU_SCOPES_NO_VETO_REGIONS, "the default job carries exactly the pinned number of bracketed PLAYBACK-GPU-SCOPES-NO-VETO-1 regions")
+        self.assertEqual(old_counts["gpu-scopes-no-veto"], 0, "the baseline predates PLAYBACK-GPU-SCOPES-NO-VETO-1 r2")
         self.assertEqual(stripped, old_stripped,
                          "the DEFAULT (bachelor/cuda) emitted job changed outside the bracketed regions -- it must stay byte-identical to the pinned baseline")
 
@@ -6269,6 +6279,9 @@ class LookReceiptGeneratorTests(unittest.TestCase):
                 # HFR-CONFORM-AWARE-RECEIPT-ORACLES-1's regions: present in both too, at their pinned count.
                 self.assertEqual((new_counts.pop("hfr-conform-oracles"), old_counts.pop("hfr-conform-oracles")),
                                  (GeneratorByteIdentityAndVariantTests.HFR_CONFORM_REGIONS, GeneratorByteIdentityAndVariantTests.HFR_CONFORM_REGIONS), name)
+                # PLAYBACK-GPU-SCOPES-NO-VETO-1 r2's regions: in the new job at their pinned count, absent from the base generator.
+                self.assertEqual((new_counts.pop("gpu-scopes-no-veto"), old_counts.pop("gpu-scopes-no-veto")),
+                                 (GeneratorByteIdentityAndVariantTests.GPU_SCOPES_NO_VETO_REGIONS, 0), name)
                 self.assertEqual(new_counts, old_counts, f"{name}: the job without -LookReceiptPath carries the base generator's bracketed regions")
                 self.assertEqual(kept, old_kept, f"{name}: the job without -LookReceiptPath must be the base generator's bytes")
                 self.assertNotIn(b"LookReceipt", new)

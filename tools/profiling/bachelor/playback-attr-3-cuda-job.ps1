@@ -941,6 +941,11 @@ $embeddedFunctions = $embeddedFunctions + "`r`n# VENUE-SESSION-LOCKED-REFUSAL-1 
 $embeddedFunctions = $embeddedFunctions + "`r`n# HFR-CONFORM-AWARE-RECEIPT-ORACLES-1 >>>`r`n" + (Get-AttrCudaEmbeddedFunctionSource -Name @(
     'Get-AttrCudaConformAwareSourceFramesVerdict'
 )) +"`r`n# HFR-CONFORM-AWARE-RECEIPT-ORACLES-1 <<<"
+# PLAYBACK-GPU-SCOPES-NO-VETO-1 r2: the measured session's eligibility line (the verdict above calls it), spliced inside its own
+# sentinel brackets for the same byte-identity reason as the splices above.
+$embeddedFunctions = $embeddedFunctions + "`r`n# PLAYBACK-GPU-SCOPES-NO-VETO-1 >>>`r`n" + (Get-AttrCudaEmbeddedFunctionSource -Name @(
+    'Get-AttrCudaEligibilityLineForSession'
+)) +"`r`n# PLAYBACK-GPU-SCOPES-NO-VETO-1 <<<"
 $smokeRunnerClosureDigest = Get-AttrCudaClosureDigestHex -Closure $smokeRunnerClosure
 if ($smokeRunnerClosureDigest -notmatch '^[0-9a-f]{64}$') {
     throw "ATTRCUDA_BLOB_SHA_MALFORMED smoke-runner closure digest is not 64 lowercase hex: '$smokeRunnerClosureDigest'"
@@ -3388,6 +3393,11 @@ if (-not $keepAliveHealthAfterMeasuredInterval.healthy) {
 # alone would happily describe some other path. Both fields and r16_reason are recorded
 # either way, so a refusal says WHY.
 $verdict = Get-AttrCudaEligibilityVerdict -LogText $rawLog
+# PLAYBACK-GPU-SCOPES-NO-VETO-1 >>>
+# r2: the line in force for the MEASURED session (the last one at or before its playback_smoke.summary), not the
+# post-measurement visual-capture tail's; the tail is reported, never read. The line above is the baseline call, kept verbatim.
+$verdict = Get-AttrCudaEligibilityVerdict -LogText $rawLog -MeasuredSessionId $measuredSmokeSessionId
+# PLAYBACK-GPU-SCOPES-NO-VETO-1 <<<
 $diagnostics = [ordered]@{
     source = $verdict.source
     linePresent = $verdict.linePresent
@@ -3398,6 +3408,12 @@ $diagnostics = [ordered]@{
     cudaBackendResolved = $verdict.cudaBackendResolved
     r16ProbeRan = $verdict.r16ProbeRan
     admitted = $verdict.admitted
+    # PLAYBACK-GPU-SCOPES-NO-VETO-1 >>>
+    verdictScope = $verdict.verdictScope
+    measuredWindowRefusingLines = $verdict.measuredWindowRefusingLines
+    tailLinesIgnored = $verdict.tailLinesIgnored
+    tailRefused = $verdict.tailRefused
+    # PLAYBACK-GPU-SCOPES-NO-VETO-1 <<<
     # Which bytes the verdict was read from, and the binding that proves they are this run's.
     log = [ordered]@{ path = $runLog.path; sha256 = $runLog.sha256; bytes = $runLog.bytes; runNonce = $runLog.runNonce; source = $runLog.source; aggregateSourcePath = $runLog.aggregateSourcePath }
 }
