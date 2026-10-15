@@ -115,6 +115,9 @@ win32{
     # dbghelp: required by CrashForensics' MiniDumpWriteDump-based
     # unhandled-exception filter.
     LIBS += -ldbghelp
+    # gdi32: PLAYBACK-VISUAL-INSPECTION-1's PrintWindow window capture (CreateDIBSection et al.);
+    # MinGW only links it by default under -mwindows, which qmake does not pass.
+    LIBS += -lgdi32
     greaterThan(QT_MAJOR_VERSION, 5){
         QMAKE_CXXFLAGS += -fopenmp -mssse3 -std=c++17 -ftree-vectorize
     }
@@ -197,6 +200,7 @@ SOURCES += \
     GpuDebayer.cpp \
     GpuDisplayViewport.cpp \
     GpuDisplayWindow.cpp \
+    GpuFieldTelemetry.cpp \
         main.cpp \
         MainWindow.cpp \
     ../../src/debayer/amaze_demosaic.c \
@@ -379,6 +383,7 @@ HEADERS += MainWindow.h \
            PlaybackNativePaceGuard.h \
            PlaybackPresentTrace.h \
            PlaybackSwapInterval.h \
+           PlaybackScopesDuringPlayback.h \
            DisplayDeviceMapping.h \
            PlaybackGatePolicy.h \
            Phase3Breadcrumbs.h \
@@ -395,6 +400,9 @@ HEADERS += MainWindow.h \
            GpuPreviewHostRoute.h \
     GpuDisplayViewport.h \
     GpuDisplayWindow.h \
+    GpuFieldTelemetry.h \
+    GpuFieldTelemetryCore.h \
+    ../../tools/gpu/igpu_cuda_error.h \
     ../../src/debayer/debayer.h \
     ../../src/debayer/helpersse2.h \
     ../../src/debayer/conv.h \

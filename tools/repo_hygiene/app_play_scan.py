@@ -84,7 +84,9 @@ REVIEWED_PLAY_STOPS = {
     "MainWindow::on_actionUseDefaultReceipt_triggered": (1, 0, 0),
     "MainWindow::playbackHandling": (1, 0, 0),                        # the engine reached the last frame (no Loop)
     "MainWindow::notePlaybackSmokePresentedFrame": (1, 0, 0),         # presented-frames target AND programmaticPlayConsumed()
-    "MainWindow::runGuiPlaybackSmoke": (1, 0, 2),                     # post-measurement stop; stress switch; early-end
+    # post-measurement stop + the --visual-capture-dir tail's pause (PLAYBACK-VISUAL-INSPECTION-1: only after the
+    # measured state is Reached and its session is closed); stress switch; early-end
+    "MainWindow::runGuiPlaybackSmoke": (2, 0, 2),
     "MainWindow::runHeadlessPlaybackProfile": (1, 0, 1),              # play-action post-hold stop; settle stop
     "MainWindow::programmaticPlay": (0, 0, 1),                        # a refused already-running Play is stopped
 }

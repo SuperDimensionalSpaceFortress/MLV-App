@@ -245,6 +245,11 @@ param(
     # capture of the same frames after the Play stops (--contact-sheet-seek-dir; it never plays,
     # playback_path=false), published apart under paired-seek\contact-sheet\raw. Off by default.
     [switch]$ContactSheetPairedSeek,
+    # PLAYBACK-VISUAL-INSPECTION-1: the app's post-measurement window capture (--visual-capture-dir: after the measured Play's own
+    # stop and its summary, ~3 s of untimed play is captured with PrintWindow, then the paused frame and its paused full-quality
+    # re-render). Forwarded only when the staged binary's smoke help lists the option; PresentMon's window ends where the tail
+    # begins; the captures publish under visual\. Off by default: without it the job is the text it always was.
+    [switch]$VisualCapture,
 
     # CUDA-PLAYBACK-PRESENT-CADENCE-1 round 2 discriminating legs. HEAVY (default, unchanged
     # behavior for every existing caller) keeps every diagnostic env var PLAYBACK-ATTR-3-CUDA
@@ -386,6 +391,12 @@ param(
     [ValidateSet('', 'receipt', 'subset')]
     [string]$PlaybackProcessing = '',
 
+    # UPSTREAM-CPU-BASELINE-1: run the app with Look Assist OFF (the smoke runner's existing -DisableLookAssist, which passes
+    # --no-look-assist and fails the run closed if the app still reports Look Assist enabled). The fork turns Look Assist on for
+    # every clip by default (ReceiptSettings.cpp), so a no-look leg must ask. Refused with -ForceLookAssist. Absent (the default)
+    # adds nothing: the emitted job is the text it was before this parameter.
+    [switch]$DisableLookAssist,
+
     # PLAYBACK-VSYNC-DEFAULT-1: the GL swap interval every playback surface requests (passed to the app as MLVAPP_SWAP_INTERVAL, the
     # vsync A/B), any leg type. -1 (the default) sets nothing: the emitted job is the text it was before this parameter.
     [ValidateRange(-1, 1)][int]$SwapInterval = -1,
@@ -402,7 +413,22 @@ param(
 
     # PLAYBACK-STARTUP-CATCHUP-BURST-1 r7: the app's opt-in per-present playback trace (MLVAPP_PLAYBACK_PRESENT_TRACE=1; its rows
     # land in the run log after the Play stops). Absent: nothing is set and the emitted job is the text it was before this parameter.
-    [switch]$PresentTrace
+    [switch]$PresentTrace,
+
+    # PLAYBACK-SCOPES-OPTION-1: the live scope the smoke forces on (the smoke runner's -Scope -> the app's --scope, which also shows the
+    # edit area). '' or 'none' (the default) keeps -Scope none: the emitted job is the text it was before this parameter.
+    [ValidateSet('', 'none', 'histogram', 'waveform', 'parade', 'vectorscope')]
+    [string]$Scope = '',
+
+    # PLAYBACK-SCOPES-OPTION-1: the app's playback scope throttle base interval (MLVAPP_PLAYBACK_SCOPE_INTERVAL_MS; 0 = every presented
+    # frame when the render is fast). -1 (the default) sets nothing: the emitted job is the text it was before this parameter.
+    [ValidateRange(-1, 1000)][int]$ScopeIntervalMs = -1,
+
+    # PLAYBACK-SCOPES-OPTION-1 r4 (PSO-01): the app's "Scopes During Playback" mode for the run (MLVAPP_PLAYBACK_SCOPES_DURING_PLAYBACK,
+    # honoured only in an automation run such as this smoke). A scope leg on a Hide-default build must ask, or it measures Hide.
+    # '' (the default) sets nothing: the emitted job is the text it was before this parameter.
+    [ValidateSet('', 'hide', 'throttled', 'live')]
+    [string]$ScopesDuringPlayback = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -1013,19 +1039,20 @@ if ($PostRunSeconds -gt 0) { $timeBudgetArgs['PostRunSeconds'] = $PostRunSeconds
 # PLAYBACK-CLIP-LENGTH-ENFORCE-1: the smoke-process timeout keeps the old 40 s play allowance as a
 # floor (extra slack only; the default baked timeout is unchanged) and grows with a longer -PlaySeconds.
 $timeBudgetArgs['PlaySeconds'] = [int][Math]::Max(40, $PlaySeconds)
+# HFR-NATIVE-M16-1457-TIMEBUDGET-1 extends CPU-LEG-SMOKE-CEILING-1 to every backend: the job's own full margined identity read precedes the runner on every backend, so the
+# runner's 3600 s only holds the app's re-read, bounded at the measured cold rate with no margin (see Get-AttrCudaLegTimeBudget). A fixture reads no input and never clamps;
+# an input that fits the unshared budget is unchanged.
+$timeBudgetArgs['ShareSmokeCeiling'] = $true
 # CPU-LOOK-LEG-PACE-ABORT-1: a cpu leg's Play may run to the CPU ceiling (Get-GuiSmokePlaySafetyMs -CpuPaceInformational: requested / (1/30)
 # + 15 s), so the smoke-process timeout, the PresentMon capture ceiling and the um-run -TimeoutSec derived from it must cover that ceiling
 # -- one derivation (the runner's), never a second hard-coded number.
 if ($cpuPlayPaceInformational) {
     $timeBudgetArgs['PlaySeconds'] = [int][Math]::Max($timeBudgetArgs['PlaySeconds'],
         [Math]::Ceiling((Get-GuiSmokePlaySafetyMs -Seconds $PlaySeconds -CpuPaceInformational) / 1000.0))
-    # CPU-LEG-SMOKE-CEILING-1: the runner caps a process timeout at 3600 s, and a ~3.2 GB owner input at the measured read rate plus that 765 s ceiling does not fit it
-    # with the identity read repeated at full margin. The budget shares the 3600 s instead (see Get-AttrCudaLegTimeBudget); CUDA never asks for it (a fixture CPU leg does, but has zero input bytes and so never clamps).
-    $timeBudgetArgs['ShareSmokeCeiling'] = $true
 }
 $timeBudget = Get-AttrCudaLegTimeBudget -InputBytes $clipBytesForBudget @timeBudgetArgs
 if ($timeBudget.smokeCeilingClamped) {
-    Write-Warning ("CPU-LEG-SMOKE-CEILING-1: this cpu leg's smoke timeout is held at the runner's 3600 s ceiling; the app's in-runner re-read allowance is $($timeBudget.appReadAllowanceSec) s " +
+    Write-Warning ("CPU-LEG-SMOKE-CEILING-1: this leg's smoke timeout is held at the runner's 3600 s ceiling; the app's in-runner re-read allowance is $($timeBudget.appReadAllowanceSec) s " +
         "(the job's own identity read keeps $($timeBudget.identityReadSec) s in the um-run timeout of $($timeBudget.jobTimeoutSec) s).")
 }
 
@@ -4153,6 +4180,11 @@ if (-not [string]::IsNullOrWhiteSpace($PlaybackProcessing)) {
     # CPU-DUALISO-REDUCED-ISO-NOTCH-1: only a job that asks for a playback processing mode carries it; every other job is unchanged.
     $template = Edit-DualVenueTemplate $template '-UsePersistedPlaybackSettings ' ("-UsePersistedPlaybackSettings -PlaybackProcessing $PlaybackProcessing ")
 }
+if ($DisableLookAssist) {
+    # UPSTREAM-CPU-BASELINE-1: only a job that asks for Look Assist off carries -DisableLookAssist; every other job is unchanged.
+    if ($ForceLookAssist) { throw 'DUAL_VENUE_LOOK_ASSIST_CONFLICT -DisableLookAssist cannot be combined with -ForceLookAssist (a look or pace leg forces Look Assist on)' }
+    $template = Edit-DualVenueTemplate $template '-RequireLookAssist:`$false -Scope none' '-RequireLookAssist:`$false -DisableLookAssist -Scope none'
+}
 $isCpuBackend = ($Backend -eq 'cpu')
 if ($isCpuBackend -and $DisablePaintPerSubmit) {
     throw 'DUAL_VENUE_CPU_BACKEND_CONFLICT -DisablePaintPerSubmit sets a GPU-window env (MLVAPP_GPU_WINDOW_PAINT_PER_SUBMIT) and is CUDA-path only; it cannot be combined with -Backend cpu'
@@ -4452,6 +4484,67 @@ if ($PresentTrace) {
     })
 }
 
+# PLAYBACK-VISUAL-INSPECTION-1: a visual-capture leg gains three bracketed regions, on the expanded text and only when asked (like --windowed
+# above), so every other job is the text it always was. Each anchor must match exactly once (Edit-DualVenueTemplate throws otherwise):
+#   1. before PresentMon starts: the four module helpers (spliced here, not into the default embed list) and the feature probe + argument;
+#   2. the PresentMon display report windows on the launcher's result with its end cut at the capture tail's start;
+#   3. before the contact-sheet publish (so both land in the artifact index): the request record and the captures under visual\.
+if ($VisualCapture) {
+    $visualOpen = '# PLAYBACK-VISUAL-INSPECTION-1 >>>'
+    $visualClose = '# PLAYBACK-VISUAL-INSPECTION-1 <<<'
+    $visualFunctions = Get-AttrCudaEmbeddedFunctionSource -Name @('Test-AttrCudaVisualCaptureSupport', 'Add-AttrCudaVisualCaptureArgument', 'Get-AttrCudaPresentMonWindowResult', 'Publish-AttrCudaVisualCaptures')
+    $presentMonAnchor = '# CUDA-PERF-DISPLAY-IDENTITY-HARNESS-1/2/3 (sol BLOCKER 2 / fable HARDENING, direction corrected'
+    $text = Edit-DualVenueTemplate $text $presentMonAnchor ($visualOpen + "`n" + $visualFunctions + "`n" + @'
+# The app's post-measurement window capture: forwarded only when the staged binary's smoke help lists --visual-capture-dir (an older
+# build is never handed an option it would refuse). The probe never plays and runs before PresentMon starts.
+$visualCaptureDir = Join-Path $Work 'visual'
+$visualCaptureRecord = Test-AttrCudaVisualCaptureSupport -ExePath $exePath -TimeoutSec 20
+if ($visualCaptureRecord['forwarded']) {
+    [void](New-AttrCudaDirectory -Path $visualCaptureDir)
+    $cmd = Add-AttrCudaVisualCaptureArgument -Command $cmd -VisualCaptureDir $visualCaptureDir
+}
+Write-JobTrace "step visual-capture probe=$($visualCaptureRecord['probe']) forwarded=$($visualCaptureRecord['forwarded'])"
+'@ + "`n" + $visualClose + "`n" + $presentMonAnchor)
+    $reportLine = '$displayReport = Get-AttrCudaPresentMonDisplayReport -CsvPath $presentMonPath -ResultJson $resultJson -EarliestCaptureStartUtc $presentMonCaptureStartUtc -LatestCaptureStartUtc $presentMonPostSpawnUtc'
+    $text = Edit-DualVenueTemplate $text $reportLine ($visualOpen + "`n" + @'
+# The untimed capture tail (and its PrintWindow grabs and paused re-render) is cut off the PresentMon window: it ends where the tail began.
+$presentMonWindowResult = Get-AttrCudaPresentMonWindowResult -ResultJson $resultJson -Record $visualCaptureRecord -VisualCaptureDir $visualCaptureDir
+$displayReport = Get-AttrCudaPresentMonDisplayReport -CsvPath $presentMonPath -ResultJson $presentMonWindowResult -EarliestCaptureStartUtc $presentMonCaptureStartUtc -LatestCaptureStartUtc $presentMonPostSpawnUtc
+'@ + "`n" + $visualClose)
+    $publishAnchor = "# CUDA-PLAYBACK-CONTACT-SHEET-1: publish the raw per-frame PNG+JSON pairs the app's own"
+    $text = Edit-DualVenueTemplate $text $publishAnchor ($visualOpen + "`n" + @'
+[void](Publish-AttrCudaVisualCaptures -Record $visualCaptureRecord -SourceDir $visualCaptureDir -PubRoot $Pub)
+'@ + "`n" + $visualClose + "`n" + $publishAnchor)
+}
+
+# PLAYBACK-SCOPES-OPTION-1: a scope leg swaps the smoke command's ONE '-Scope none' for the named scope, on the expanded text and only when asked
+# (like --windowed above), so every other job is the text it always was. The anchor must match exactly once, or the generator throws.
+if (-not [string]::IsNullOrEmpty($Scope) -and $Scope -cne 'none') {
+    $scopeAnchor = [regex]' -Scope none '
+    if ($scopeAnchor.Matches($text).Count -ne 1) { throw 'DUAL_VENUE_SCOPE_ANCHOR_MISSING the job template has no single -Scope none site to replace' }
+    $text = $scopeAnchor.Replace($text, " -Scope $Scope ")
+}
+
+# PLAYBACK-SCOPES-OPTION-1: the same env-list site gains the scope throttle interval, only when asked.
+if ($ScopeIntervalMs -ge 0) {
+    $scopeIntervalAnchor = [regex]"(?<ind>[ \t]*)'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',(?<nl>\r?\n)"
+    if ($scopeIntervalAnchor.Matches($text).Count -ne 1) { throw 'DUAL_VENUE_SCOPE_INTERVAL_ANCHOR_MISSING the job template has no single env-list site to add MLVAPP_PLAYBACK_SCOPE_INTERVAL_MS to' }
+    $text = $scopeIntervalAnchor.Replace($text, [System.Text.RegularExpressions.MatchEvaluator]{
+        param($m)
+        $m.Value + $m.Groups['ind'].Value + "'MLVAPP_PLAYBACK_SCOPE_INTERVAL_MS=$ScopeIntervalMs'," + $m.Groups['nl'].Value
+    })
+}
+
+# PLAYBACK-SCOPES-OPTION-1 r4: the same env-list site gains the playback scopes mode, only when asked.
+if (-not [string]::IsNullOrEmpty($ScopesDuringPlayback)) {
+    $scopesModeAnchor = [regex]"(?<ind>[ \t]*)'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',(?<nl>\r?\n)"
+    if ($scopesModeAnchor.Matches($text).Count -ne 1) { throw 'DUAL_VENUE_SCOPES_MODE_ANCHOR_MISSING the job template has no single env-list site to add MLVAPP_PLAYBACK_SCOPES_DURING_PLAYBACK to' }
+    $text = $scopesModeAnchor.Replace($text, [System.Text.RegularExpressions.MatchEvaluator]{
+        param($m)
+        $m.Value + $m.Groups['ind'].Value + "'MLVAPP_PLAYBACK_SCOPES_DURING_PLAYBACK=$ScopesDuringPlayback'," + $m.Groups['nl'].Value
+    })
+}
+
 $outDir = Split-Path -Parent $OutFile
 if ($outDir -and -not (Test-Path -LiteralPath $outDir)) { New-Item -ItemType Directory -Path $outDir -Force | Out-Null }
 [IO.File]::WriteAllText($OutFile, $text, [Text.UTF8Encoding]::new($false))
@@ -4483,6 +4576,9 @@ $clipContentSha256 = if ($isFixtureRehearsal) {
     playbackConform = $(if ($PlaybackConform -ne '') { $PlaybackConform } else { $null })
     cudaLaunchTimingMinMs = $(if ($CudaLaunchTimingMinMs -ge 0) { $CudaLaunchTimingMinMs } else { $null })
     presentTrace = [bool]$PresentTrace
+    scope = $(if ([string]::IsNullOrEmpty($Scope)) { 'none' } else { $Scope })
+    scopeIntervalMs = $(if ($ScopeIntervalMs -ge 0) { $ScopeIntervalMs } else { $null })
+    scopesDuringPlayback = $(if ([string]::IsNullOrEmpty($ScopesDuringPlayback)) { $null } else { $ScopesDuringPlayback })
     # DUAL-VENUE-EVIDENCE-1: what this generation was authored for (not part of the emitted job's bytes).
     venue = $Venue
     backend = $Backend

@@ -141,6 +141,9 @@ class GetDoctrineBriefTests(unittest.TestCase):
             self.assertIn("cos-feedback/mlv-app/pr-99.md", result.stdout)
             self.assertIn("Example blocker", result.stdout)
             self.assertNotIn("README.md", result.stdout.split("CoS feedback")[-1])
+            # COS-RESPONSE-DUTY-1 (owner ruling 2026-10-15): the lane obligations carry the CoS-ask exception and
+            # put the answer on the hub, so a lane never reads "zero authority" as covering a CoS ask.
+            self.assertIn("Exception: a CoS ask for `ACK: <plan or ETA>` is owner-authorized; the hub must answer it", result.stdout)
 
     def test_fixture_missing_cos_feedback_omits_section_does_not_refuse(self):
         with _fixture_tmp() as tmp:

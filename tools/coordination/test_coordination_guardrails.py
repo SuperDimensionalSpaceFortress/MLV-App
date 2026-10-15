@@ -2590,7 +2590,7 @@ def test_invoke_lane_refuses_editing_with_allowedtools_entirely_absent(tmp_path)
 # field echo, unknown-field refusal (deliverable 6)
 
 PR_STEP_LANE_CAN_OPEN_PR = (
-    'gh pr create -R layibabalola/MLV-App --head {branch} --title "<card id>: <subject>" '
+    'gh pr create -R SuperDimensionalSpaceFortress/MLV-App --head {branch} --title "<card id>: <subject>" '
     '--body "<what, why, red run, green run>"; then print PR-OPENED: <number> as your last line.'
 )
 PR_STEP_OTHERWISE = (
@@ -2674,7 +2674,9 @@ def test_compose_cli_refuses_an_unknown_field(tmp_path):
 # --- Export-PrReviewEvidence.ps1: pinned repo, byte-exact exports, drift refusal, missing --
 # required context reported as a failure (deliverable 9)
 
-FAKE_GH_REPO_STRING = "layibabalola/MLV-App"
+FAKE_GH_REPO_STRING = "SuperDimensionalSpaceFortress/MLV-App"
+# The immutable GitHub repository id the exporter pins (gh api repos/<slug> --jq .id).
+FAKE_GH_REPO_ID = "1169162800"
 
 FAKE_GH_SCRIPT = (
     "$stateDir = $env:FAKE_GH_STATE_DIR\n"
@@ -2686,6 +2688,11 @@ FAKE_GH_SCRIPT = (
     "    Set-Content -LiteralPath $CounterPath -Value $n\n"
     "    $lines = @(Get-Content -LiteralPath $Path)\n"
     "    return $lines[$n - 1]\n"
+    "}\n"
+    "if ($args.Count -ge 2 -and $args[0] -eq 'api' -and $args[1] -eq 'repos/" + FAKE_GH_REPO_STRING + "') {\n"
+    "    if ($env:FAKE_GH_REPO_ID -eq 'unreadable') { exit 1 }\n"
+    "    if ($env:FAKE_GH_REPO_ID) { Write-Output $env:FAKE_GH_REPO_ID } else { Write-Output '" + FAKE_GH_REPO_ID + "' }\n"
+    "    exit 0\n"
     "}\n"
     "if ($args.Count -ge 2 -and $args[0] -eq 'pr' -and $args[1] -eq 'view') {\n"
     "    Write-Output (Get-NextLine (Join-Path $stateDir 'pr_view.jsonl') (Join-Path $stateDir 'pr_view.count'))\n"
@@ -2753,9 +2760,11 @@ def pr_evidence_repo(tmp_path, with_fork_remote=True):
     return repo, base_sha, head_sha
 
 
-def run_exporter(repo, run_dir, gh_shim, state_dir, pr_number=99):
+def run_exporter(repo, run_dir, gh_shim, state_dir, pr_number=99, repo_id=None):
     env = dict(os.environ)
     env["FAKE_GH_STATE_DIR"] = str(state_dir)
+    if repo_id is not None:
+        env["FAKE_GH_REPO_ID"] = repo_id
     args = [
         "pwsh.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
         "-File", str(EXPORT_PR_EVIDENCE), "-PrNumber", str(pr_number), "-RunDir", str(run_dir),
@@ -2789,6 +2798,7 @@ def test_exporter_pins_the_repository_on_every_gh_call(tmp_path):
     assert calls, "gh was never invoked"
     saw_pr_call = False
     saw_api_call = False
+    saw_id_call = False
     for line in calls:
         tokens = line.split("|")
         if tokens[:2] in (["pr", "view"], ["pr", "checks"]):
@@ -2798,6 +2808,10 @@ def test_exporter_pins_the_repository_on_every_gh_call(tmp_path):
             assert tokens[idx + 1] == FAKE_GH_REPO_STRING, (
                 "the -R flag does not carry the exact pinned repo (got %r): %s" % (tokens[idx + 1], line)
             )
+        if tokens[0] == "api" and tokens[1] == "repos/%s" % FAKE_GH_REPO_STRING:
+            saw_id_call = True
+            assert tokens[2:] == ["--jq", ".id"], "the repository id call carries unexpected args: %s" % line
+            continue
         if tokens[0] == "api":
             saw_api_call = True
             endpoint = tokens[1]
@@ -2806,6 +2820,7 @@ def test_exporter_pins_the_repository_on_every_gh_call(tmp_path):
             )
     assert saw_pr_call, "no pr view/checks call was observed"
     assert saw_api_call, "no gh api call was observed"
+    assert saw_id_call, "the immutable repository id was never read from the API"
 
 
 def test_exporter_repo_is_a_hardcoded_pin_not_a_caller_supplied_parameter(tmp_path):
@@ -2822,7 +2837,76 @@ def test_exporter_repo_is_a_hardcoded_pin_not_a_caller_supplied_parameter(tmp_pa
     assert not re.search(r"\[string\]\$Repo\b", script_param_block), (
         "the repository is still a caller-settable parameter: %r" % script_param_block
     )
-    assert "'layibabalola/MLV-App'" in text, "the pinned repo is no longer a literal in the source"
+    assert "'%s'" % FAKE_GH_REPO_STRING in text, "the pinned repo is no longer a literal in the source"
+    assert "$RepoId = %s" % FAKE_GH_REPO_ID in text, "the pinned repository id is no longer a literal in the source"
+
+
+def test_exporter_refuses_when_the_repository_id_differs(tmp_path):
+    """ORG-MOVE-TRACKED-SLUG-RESIDUE-1: the pin is the immutable repository id. A slug that now
+    resolves to a DIFFERENT repository (re-created after a transfer) must refuse closed, before
+    any evidence is written and before the first `pr view`."""
+    repo, base_sha, head_sha = pr_evidence_repo(tmp_path)
+    run_dir = tmp_path / "run"
+    shim, state = make_fake_gh(
+        tmp_path,
+        pr_view_sequence=[{"number": 99, "headRefOid": head_sha, "body": "b", "state": "OPEN"}] * 2,
+        protection_sequence=[["build"], ["build"]],
+        checks_payload=[{"name": "build", "state": "SUCCESS", "link": "x"}],
+    )
+    result = run_exporter(repo, run_dir, shim, state, repo_id="42")
+    assert result.returncode == 3, result.stdout + result.stderr
+    assert "REFUSED: repo-id-mismatch" in result.stdout
+    assert "expected=%s actual=42" % FAKE_GH_REPO_ID in result.stdout
+    assert not list(run_dir.glob("pr-*")), "evidence was written for a repository that failed the id pin"
+    calls = (state / "call_log.txt").read_text(encoding="utf-8").splitlines()
+    assert not any(line.startswith("pr|") for line in calls), "a PR call ran before the id pin passed: %r" % calls
+
+
+def test_exporter_refuses_when_the_repository_id_is_unreadable(tmp_path):
+    repo, base_sha, head_sha = pr_evidence_repo(tmp_path)
+    run_dir = tmp_path / "run"
+    shim, state = make_fake_gh(
+        tmp_path,
+        pr_view_sequence=[{"number": 99, "headRefOid": head_sha, "body": "b", "state": "OPEN"}] * 2,
+        protection_sequence=[["build"], ["build"]],
+        checks_payload=[{"name": "build", "state": "SUCCESS", "link": "x"}],
+    )
+    result = run_exporter(repo, run_dir, shim, state, repo_id="unreadable")
+    assert result.returncode == 3, result.stdout + result.stderr
+    assert "REFUSED: repo-id-unreadable" in result.stdout
+    assert not list(run_dir.glob("pr-*"))
+
+
+def test_repo_slug_literals_agree_across_tools_coordination():
+    """repo-slug.ps1 is the one shared definition; the two callers that keep their own literal
+    (see repo-slug.ps1 for why) must carry exactly that value."""
+    shared = re.search(r"return '([^']+/[^']+)'", (ROOT / "tools" / "coordination" / "repo-slug.ps1").read_text(encoding="utf-8"))
+    assert shared, "repo-slug.ps1 no longer returns a slug literal"
+    assert shared.group(1) == FAKE_GH_REPO_STRING
+    # The EFFECTIVE literal each script talks to, read from its assigning statement (a comment or
+    # SYNOPSIS line naming the slug proves nothing: the endpoint itself is what gets called).
+    effective = {
+        "Export-PrReviewEvidence.ps1": r"^\$Repo = '([^']+)'\s*$",
+        "set-required-checks.ps1": r"^\$endpoint = 'repos/([^']+)/branches/master/protection/required_status_checks'\s*$",
+    }
+    for name, pattern in effective.items():
+        text = (ROOT / "tools" / "coordination" / name).read_text(encoding="utf-8")
+        found = re.findall(pattern, text, re.M)
+        assert found == [shared.group(1)], "%s effective repository literal %r != shared slug" % (name, found)
+
+
+def test_lane_prompt_template_contract_names_the_shared_slug():
+    """product-card-TEMPLATE.md is the text every implementer prompt is composed from, and its
+    COMPOSER CONTRACT is where compose-lane-prompt-core.ps1 says the PR_STEP literal comes from
+    verbatim: the contract, the remote line and the composer must all carry the shared slug."""
+    shared = re.search(r"return '([^']+/[^']+)'", (ROOT / "tools" / "coordination" / "repo-slug.ps1").read_text(encoding="utf-8")).group(1)
+    template = (ROOT / "docs" / "lane-prompts" / "v2" / "product-card-TEMPLATE.md").read_text(encoding="utf-8")
+    assert "gh pr create -R %s --head {{BRANCH}}" % shared in template
+    assert "Remote `fork` = `https://github.com/%s.git`" % shared in template
+    hub = (ROOT / "docs" / "lane-prompts" / "v2" / "hub-procedure.md").read_text(encoding="utf-8")
+    assert "`-R %s`" % shared in hub and "repos/%s/" % shared in hub
+    composer = (ROOT / "tools" / "coordination" / "compose-lane-prompt-core.ps1").read_text(encoding="utf-8")
+    assert "'gh pr create -R ' + (Get-MlvRepoSlug) + ' --head {{BRANCH}}" in composer
 
 
 def extract_json_array_bytes(raw, key):
@@ -3423,7 +3507,7 @@ def ratio_full_dispatch_board(tmp_path, guard_payload, use_real_guard=False):
     tool_dir.mkdir(parents=True, exist_ok=True)
     shutil.copy2(RATIO_WORKSTREAM, tool_dir / "Invoke-Workstream.ps1")
     shutil.copy2(RATIO_GUARD if use_real_guard else guard, tool_dir / "Test-ProductRatioGuard.ps1")
-    for dependency in ("landing-probe.ps1", "compose-lane-prompt-core.ps1", "Retire-LaneWorktree.ps1",
+    for dependency in ("landing-probe.ps1", "compose-lane-prompt-core.ps1", "repo-slug.ps1", "Retire-LaneWorktree.ps1",
                        "Get-DoctrineBrief.ps1", "get_doctrine_brief.py"):
         shutil.copy2(RATIO_WORKSTREAM.parent / dependency, tool_dir / dependency)
     # get_doctrine_brief.py honours a fixture only inside the fixtures/ beside itself, so the

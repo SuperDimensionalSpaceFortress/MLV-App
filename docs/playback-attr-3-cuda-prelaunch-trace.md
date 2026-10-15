@@ -46,7 +46,9 @@ measured cold rate `$script:AttrCudaMeasuredColdReadMBps`:
 no allowance for loading the input), and the `um-run -TimeoutSec` to submit with
 (`recommendedJobTimeoutSec` in the generator's output). Re-measure with
 `attr3-footage-read-rate-job.ps1` (bounded 128 MiB regions, never whole-file) and pass
-`-ColdReadMBps` to the generator to override.
+`-ColdReadMBps` to the generator to override. The generator always passes `-ShareSmokeCeiling` (every backend; see
+`docs/dual-venue-evidence.md`): past the runner's 3600 s the in-runner re-read allowance shrinks to the remainder
+and the leg is refused only when that cannot cover the re-read at the measured rate with no margin.
 
 ## Known limits
 

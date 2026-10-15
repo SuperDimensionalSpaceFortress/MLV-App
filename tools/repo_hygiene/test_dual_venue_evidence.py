@@ -112,14 +112,34 @@ CPU_REDUCED_LEGS = tuple(f"legs/m16-1243-cpu-reduced-{mode}-s{scale}.json" for s
 # itself at the app's default K=2). Each differs from its twin only in its legId and generatorArgs.rawPrefetchDecoders 1.
 DECODER_LEGS = {"legs/m16-1243-pace-cinematic-fullscreen-s4-dec1.json": "legs/m16-1243-pace-cinematic-fullscreen-s4.json",
                 "legs/m16-1243-pace-cinematic-fullscreen-s4-heavy-dec1.json": "legs/m16-1243-pace-cinematic-fullscreen-s4-heavy.json"}
+# UPSTREAM-CPU-BASELINE-1: the fork arm of the upstream 877dea2c CPU A/B -- cpu-only SPEED legs at scale 1 with Look Assist OFF (generatorArgs.disableLookAssist),
+# one per display mode upstream shares (it has no preview-scale equivalent, so no s2/s4 twin).
+UPSTREAM_BASELINE_LEGS = tuple(f"legs/m16-1243-upstream-baseline-cpu-{mode}-s1.json" for mode in ("fullscreen", "windowed"))
 # PLAYBACK-STARTUP-CATCHUP-BURST-1 r7: the present-trace twin of a display-matrix cell, differing only in its legId and generatorArgs.presentTrace true.
 PTRACE_LEGS = {"legs/m16-1243-display-fullscreen-s4-ptrace.json": "legs/m16-1243-display-fullscreen-s4.json"}
+# PLAYBACK-VISUAL-INSPECTION-1: the window-capture proof leg, a SPEED leg (windowed, scale 2) that names no visualCapture: absent means on.
+VISUAL_LEGS = ("legs/m16-1243-speed-windowed-s2.json",)
+# PLAYBACK-SCOPES-OPTION-1: the windowed scale-1 no-look scope matrix, per backend: N (no scope), T (histogram at the app's default throttle) and
+# F (histogram at scopeIntervalMs 0, upstream's every frame), plus one optional waveform F arm on cuda. Each scope arm differs from its backend's N
+# leg only in its legId and the scope fields of generatorArgs. r4 (PSO-01): every scope arm pins scopesDuringPlayback throttled, the mode the
+# r1-r3 arms measured on the pre-setting staged build (the fork throttle; i0 is that throttle at base 0), so a Hide-default build cannot turn a
+# T or F arm into N.
+SCOPE_ARMS = {"histogram": {"scope": "histogram", "scopesDuringPlayback": "throttled"},
+              "histogram-i0": {"scope": "histogram", "scopeIntervalMs": 0, "scopesDuringPlayback": "throttled"}}
+SCOPE_LEGS = {f"legs/m16-1243-scopes-{backend}-windowed-s1-{arm}.json": (backend, extra)
+              for backend in ("cpu", "cuda") for arm, extra in (("none", {}), *SCOPE_ARMS.items())}
+SCOPE_LEGS["legs/m16-1243-scopes-cuda-windowed-s1-waveform-i0.json"] = (
+    "cuda", {"scope": "waveform", "scopeIntervalMs": 0, "scopesDuringPlayback": "throttled"})
+# PLAYBACK-SCOPES-OPTION-1 r3: the Look-Assist-ON twins of the N and T arms (the shipping default is Look Assist on): the no-look twin with
+# generatorArgs.forceLookAssist true (a capture-free pace leg at the default Classic flavor) in place of disableLookAssist true.
+SCOPE_LA_LEGS = tuple(f"legs/m16-1243-scopes-{backend}-windowed-s1-{arm}-la.json" for backend in ("cpu", "cuda") for arm in ("none", "histogram"))
 # LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1 added the scale-2 Cinematic twin of the scale-2 look leg (the Bachelor CPU Classic | Cinematic look pair).
 SHIPPED_LEGS = ("legs/m16-1243-speed.json", "legs/m16-1243-look.json", "legs/m16-1243-look-scale2.json", "legs/m16-1243-look-cinematic.json", *DISPLAY_MATRIX_LEGS, *PACE_LEGS,
                 *LOOKAHEAD_LEGS, *HEAVY_LEGS, *DECODER_LEGS, "legs/m16-1243-look-scale2-cinematic.json", "legs/m16-1243-look-film.json",
                 "legs/m16-1243-look-scale2-film.json", *(f"legs/m16-1243-look-scale2-{flavor}-agxoff.json" for flavor in ("cinematic", "film")),
                 *(f"legs/m16-1243-display-{mode}-s{scale}-vsync1.json" for scale in (1, 2, 4) for mode in ("fullscreen", "windowed")),
-                *HFR_CONFORM_LEGS, *HFR_CONFORM_LEGS_1457, *HFR_NATIVE_LEGS, *CPU_REDUCED_LEGS, *PTRACE_LEGS)
+                *HFR_CONFORM_LEGS, *HFR_CONFORM_LEGS_1457, *HFR_NATIVE_LEGS, *CPU_REDUCED_LEGS, *UPSTREAM_BASELINE_LEGS, *PTRACE_LEGS,
+                *VISUAL_LEGS, *SCOPE_LEGS, *SCOPE_LA_LEGS)
 # PLAYBACK-VSYNC-DEFAULT-1: the swap-interval-1 twins of the six display-matrix legs (the vsync A/B; the originals stay at the app's default 0).
 VSYNC1_LEGS = tuple(rel.replace(".json", "-vsync1.json") for rel in DISPLAY_MATRIX_LEGS)
 # LOOK-ASSIST-FILM-FLAVOR-2 r2: the AgX-off twins of the scale-2 Cinematic and Film legs carry a committed look receipt (look-receipts/agx-off.marxml).
@@ -615,6 +635,86 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
         self.assertEqual(schema["properties"]["generatorArgs"]["properties"]["playbackProcessing"]["enum"], ["receipt", "subset"])
 
+    def test_disable_look_assist_reaches_the_smoke_command_and_absent_changes_nothing(self) -> None:
+        """UPSTREAM-CPU-BASELINE-1: -DisableLookAssist adds exactly '-DisableLookAssist' to the smoke runner's command (it passes --no-look-assist and fails
+        the run closed if the app still reports Look Assist enabled); absent, the job is the default byte for byte. The runner maps the leg's
+        generatorArgs.disableLookAssist for any leg (outside the forced-look branch), and the schema types it boolean."""
+        default = self.generate(GENERATOR, "nola-default.job.ps1", ["-Backend", "cpu", "-ScaleFactor", "1"])
+        nola = self.generate(GENERATOR, "nola.job.ps1", ["-Backend", "cpu", "-ScaleFactor", "1", "-DisableLookAssist"])
+        self.assertEqual(self.parse_errors(nola), 0)
+        self.assertNotIn("-DisableLookAssist", default.read_text(encoding="utf-8"))
+        text = nola.read_text(encoding="utf-8")
+        self.assertEqual(text.count("-RequireLookAssist:`$false -DisableLookAssist -Scope none"), 1)
+        self.assertEqual(text.replace("-DisableLookAssist ", ""), default.read_text(encoding="utf-8"))
+        windowed = self.generate(GENERATOR, "nola-windowed.job.ps1", ["-Backend", "cpu", "-ScaleFactor", "1", "-DisplayMode", "windowed", "-DisableLookAssist"])
+        self.assertEqual(self.parse_errors(windowed), 0)
+        self.assertEqual(windowed.read_text(encoding="utf-8").count("-DisableLookAssist -Scope none"), 1)
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        mapping = "if ($spec.generatorArgs.PSObject.Properties['disableLookAssist'] -and [bool]$spec.generatorArgs.disableLookAssist) { $gen['DisableLookAssist'] = $true }"
+        self.assertIn(mapping, runner)
+        self.assertLess(runner.index(mapping), runner.index("if (-not $isLook -and $spec.generatorArgs.PSObject.Properties['forceLookAssist']"),
+                        "the mapping must sit outside the forceLookAssist branch")
+        schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
+        self.assertEqual(schema["properties"]["generatorArgs"]["properties"]["disableLookAssist"]["type"], "boolean")
+
+    def test_the_scope_and_its_interval_reach_the_job_only_when_asked(self) -> None:
+        """PLAYBACK-SCOPES-OPTION-1: -Scope <name> swaps the smoke command's one '-Scope none' for the named scope, and -ScopeIntervalMs <n> adds
+        MLVAPP_PLAYBACK_SCOPE_INTERVAL_MS=<n> to the app's env list; absent (or -Scope none) the job is the default byte for byte. The runner maps a
+        leg's generatorArgs.scope / scopeIntervalMs for any leg, and the schema bounds both."""
+        base = ["-Backend", "cpu", "-ScaleFactor", "1", "-DisplayMode", "windowed", "-DisableLookAssist"]
+        default = self.generate(GENERATOR, "sc-default.job.ps1", base)
+        plain = default.read_text(encoding="utf-8")
+        self.assertEqual(plain.count(" -Scope none "), 1)
+        self.assertNotIn("MLVAPP_PLAYBACK_SCOPE_INTERVAL_MS", plain)
+        explicit_none = self.generate(GENERATOR, "sc-none.job.ps1", [*base, "-Scope", "none"])
+        self.assertEqual(explicit_none.read_bytes(), default.read_bytes(), "-Scope none is the default job, byte for byte")
+        hist = self.generate(GENERATOR, "sc-hist.job.ps1", [*base, "-Scope", "histogram"])
+        self.assertEqual(self.parse_errors(hist), 0)
+        text = hist.read_text(encoding="utf-8")
+        self.assertEqual(text.count("-DisableLookAssist -Scope histogram "), 1)
+        self.assertEqual(text.replace(" -Scope histogram ", " -Scope none "), plain, "the scope is the only difference from the default job")
+        both = self.generate(GENERATOR, "sc-hist-i0.job.ps1", [*base, "-Scope", "histogram", "-ScopeIntervalMs", "0"])
+        self.assertEqual(self.parse_errors(both), 0)
+        both_text = both.read_text(encoding="utf-8").replace("\r\n", "\n")
+        line = "    'MLVAPP_PLAYBACK_SCOPE_INTERVAL_MS=0',\n"
+        self.assertIn("'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',\n" + line, both_text)
+        self.assertEqual(both_text.replace(line, ""), text.replace("\r\n", "\n"), "the interval line is the only difference from the scope-only job")
+        cuda = self.generate(GENERATOR, "sc-cuda.job.ps1", ["-ScaleFactor", "1", "-DisplayMode", "windowed", "-DisableLookAssist", "-Scope", "waveform"])
+        self.assertEqual(self.parse_errors(cuda), 0)
+        self.assertEqual(cuda.read_text(encoding="utf-8").count(" -Scope waveform -FrameTelemetry"), 1)
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        for mapping in ("if ($spec.generatorArgs.PSObject.Properties['scope']) { $gen['Scope'] = [string]$spec.generatorArgs.scope }",
+                        "if ($spec.generatorArgs.PSObject.Properties['scopeIntervalMs']) { $gen['ScopeIntervalMs'] = [int]$spec.generatorArgs.scopeIntervalMs }"):
+            self.assertIn(mapping, runner)
+            self.assertLess(runner.index(mapping), runner.index("if (-not $isLook -and $spec.generatorArgs.PSObject.Properties['forceLookAssist']"),
+                            "the mapping must sit outside the forceLookAssist branch")
+        schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
+        props = schema["properties"]["generatorArgs"]["properties"]
+        self.assertEqual(props["scope"]["enum"], ["none", "histogram", "waveform", "parade", "vectorscope"])
+        self.assertEqual((props["scopeIntervalMs"]["type"], props["scopeIntervalMs"]["minimum"], props["scopeIntervalMs"]["maximum"]), ("integer", 0, 1000))
+
+    def test_the_scopes_mode_reaches_the_job_only_when_asked(self) -> None:
+        """PLAYBACK-SCOPES-OPTION-1 r4 (PSO-01): -ScopesDuringPlayback <mode> adds MLVAPP_PLAYBACK_SCOPES_DURING_PLAYBACK=<mode> to the app's env
+        list (the app honours it only in an automation run, which the smoke is); absent the job is the default byte for byte. The runner maps a
+        leg's generatorArgs.scopesDuringPlayback for any leg, and the schema admits only the three modes."""
+        base = ["-Backend", "cpu", "-ScaleFactor", "1", "-DisplayMode", "windowed", "-DisableLookAssist", "-Scope", "histogram"]
+        scope_only = self.generate(GENERATOR, "sm-scope.job.ps1", base).read_text(encoding="utf-8").replace("\r\n", "\n")
+        self.assertNotIn("MLVAPP_PLAYBACK_SCOPES_DURING_PLAYBACK", scope_only)
+        pinned = self.generate(GENERATOR, "sm-throttled.job.ps1", [*base, "-ScopesDuringPlayback", "throttled"])
+        self.assertEqual(self.parse_errors(pinned), 0)
+        pinned_text = pinned.read_text(encoding="utf-8").replace("\r\n", "\n")
+        line = "    'MLVAPP_PLAYBACK_SCOPES_DURING_PLAYBACK=throttled',\n"
+        self.assertIn("'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',\n" + line, pinned_text)
+        self.assertEqual(pinned_text.replace(line, ""), scope_only, "the mode line is the only difference from the scope-only job")
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        mapping = ("if ($spec.generatorArgs.PSObject.Properties['scopesDuringPlayback']) "
+                   "{ $gen['ScopesDuringPlayback'] = [string]$spec.generatorArgs.scopesDuringPlayback }")
+        self.assertIn(mapping, runner)
+        self.assertLess(runner.index(mapping), runner.index("if (-not $isLook -and $spec.generatorArgs.PSObject.Properties['forceLookAssist']"),
+                        "the mapping must sit outside the forceLookAssist branch")
+        schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
+        self.assertEqual(schema["properties"]["generatorArgs"]["properties"]["scopesDuringPlayback"]["enum"], ["hide", "throttled", "live"])
+
     def test_the_raw_prefetch_decoder_count_reaches_the_job_only_when_asked(self) -> None:
         """PLAYBACK-LJ92-DECODE-THROUGHPUT-1: generatorArgs.rawPrefetchDecoders maps to -RawPrefetchDecoders for any leg (not only a forced-look
         pace leg); 0 is the no-prefetch arm, k the decoder count, and absent leaves the job's text exactly as it was."""
@@ -656,7 +756,9 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
                              (["-ForceLookAssist"], "DUAL_VENUE_LOOK_REQUIRES_CONTACT_SHEET"),
                              (["-LookPaceLeg"], "DUAL_VENUE_LOOK_PACE_LEG_SHAPE"),
                              (["-ForceLookAssist", "-ContactSheet", "-LookPaceLeg"], "DUAL_VENUE_LOOK_PACE_LEG_SHAPE"),
-                             (["-PlaybackRenderLookaheadFrames", "3"], "DUAL_VENUE_LOOKAHEAD_NEEDS_LOOK_PACE_LEG")):
+                             (["-PlaybackRenderLookaheadFrames", "3"], "DUAL_VENUE_LOOKAHEAD_NEEDS_LOOK_PACE_LEG"),
+                             (["-ForceLookAssist", "-ContactSheet", "-DisableLookAssist"], "DUAL_VENUE_LOOK_ASSIST_CONFLICT"),
+                             (["-ForceLookAssist", "-LookPaceLeg", "-LookFlavor", "cinematic", "-DisableLookAssist"], "DUAL_VENUE_LOOK_ASSIST_CONFLICT")):
             out = self.tmp / "refused.job.ps1"
             proc = run_pwsh(["-File", str(GENERATOR), "-SourceCommit", self.head, "-BuildManifestSha256", "ab" * 32,
                              "-ClipId", FIXTURE_IDS[0], "-FixtureSha256", "cd" * 32, "-RepoRoot", str(self.repo), "-OutFile", str(out), *extra])
@@ -735,7 +837,7 @@ switch ($cfg.mainMode) {
 # The stub records every named argument it was handed (so a test can see that the runner passed a clip ID and a play
 # window, and never a path), and can be told to refuse the way the real generator does.
 STUB_GENERATOR = r"""
-param($SourceCommit,$BuildManifestSha256,$ClipId,$FixtureSha256,$OutFile,$RepoRoot,$Venue,$Backend,$ScaleFactor,$TelemetryArm,$CpuQuiescenceThresholdPercent,[switch]$ContactSheet,$ContactSheetFrames,[switch]$ForceLookAssist,$LookFlavor,$VenueTablePath,$PlaySeconds,$ExpectedScaleRequest,$DisplayMode,$PlaybackConform)
+param($SourceCommit,$BuildManifestSha256,$ClipId,$FixtureSha256,$OutFile,$RepoRoot,$Venue,$Backend,$ScaleFactor,$TelemetryArm,$CpuQuiescenceThresholdPercent,[switch]$ContactSheet,$ContactSheetFrames,[switch]$ForceLookAssist,$LookFlavor,$VenueTablePath,$PlaySeconds,$ExpectedScaleRequest,$DisplayMode,$PlaybackConform,[switch]$VisualCapture)
 $cfg = Get-Content -LiteralPath $env:DVE_STUB -Raw | ConvertFrom-Json
 Add-Content -LiteralPath $cfg.genLog -Value (($PSBoundParameters.Keys | Sort-Object | ForEach-Object { $_ + '=' + $PSBoundParameters[$_] }) -join ';')
 if ($cfg.genRefusal) { throw $cfg.genRefusal }
@@ -4967,6 +5069,13 @@ class VenueQuietSetAsideRecordTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertRegex(proc.stdout, r"(?m)^GATE quiet-probe bachelor queued=0 running=0 ")
 
+    def test_a_legacy_shared_tmp_set_aside_record_is_not_a_running_job(self) -> None:
+        # Get-MarkerTempFiles also lists the legacy shared '<id>.started.json.tmp' (r2c and earlier); the agent sets that one aside the same way.
+        self.running("dve-x-bachelor-cuda-20261013225031.started.json.tmp.stale-639275292076772648")
+        proc = self.gate("samples", "[5, 5, 5]")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertRegex(proc.stdout, r"(?m)^GATE quiet-probe bachelor queued=0 running=0 ")
+
     def test_a_live_final_marker_still_holds_the_gate(self) -> None:
         self.running("dve-x-bachelor-cuda-20261013225031.started.json")
         self.running(self.TMP + ".stale-639275292076772648")
@@ -5672,6 +5781,25 @@ class LegSpecSchemaTests(unittest.TestCase):
             self.assertEqual(arm["generatorArgs"].pop("rawPrefetchDecoders"), 1, rel)
             self.assertEqual(dict(arm, legId=twin["legId"]), twin, rel)
 
+    def test_the_upstream_baseline_legs_are_no_look_cpu_speed_legs_at_scale_1(self) -> None:
+        """UPSTREAM-CPU-BASELINE-1: the fork arm of the upstream CPU A/B. Each leg is a cpu-only SPEED leg at scale 1 in the display mode its name says,
+        LIGHT, the pace legs' 95 % quiescence gate, Look Assist explicitly OFF (never forced), and informational criteria (the A/B is read lane-side)."""
+        for rel in UPSTREAM_BASELINE_LEGS:
+            spec = json.loads((DV / rel).read_text(encoding="utf-8"))
+            self.jsonschema.validate(spec, self.schema)
+            mode = re.match(r"legs/m16-1243-upstream-baseline-cpu-(fullscreen|windowed)-s1\.json$", rel).group(1)
+            self.assertEqual(spec["legId"], Path(rel).stem, rel)
+            self.assertEqual(spec["card"], "UPSTREAM-CPU-BASELINE-1", rel)
+            self.assertEqual((spec["legType"], spec["clipId"], spec["playSeconds"], spec["backends"], spec["scaleFactor"], spec["displayMode"]),
+                             ("speed", "M16-1243", 25, ["cpu"], 1, mode), rel)
+            self.assertEqual(spec["generatorArgs"], {"telemetryArm": "LIGHT", "cpuQuiescenceThresholdPercent": 95, "disableLookAssist": True}, rel)
+            self.assertNotIn("look", spec, rel)
+            self.assertEqual(spec["criteria"], {"acceptance": {"cpu": []}, "supplementary": {"cpu": []}}, rel)
+        bad = json.loads((DV / UPSTREAM_BASELINE_LEGS[0]).read_text(encoding="utf-8"))
+        bad["generatorArgs"]["disableLookAssist"] = "true"
+        with self.assertRaises(self.jsonschema.ValidationError):
+            self.jsonschema.validate(bad, self.schema)
+
     def test_the_present_trace_legs_are_their_twins_with_the_trace_on(self) -> None:
         """PLAYBACK-STARTUP-CATCHUP-BURST-1 r7: a present-trace leg differs from its twin only in its legId and generatorArgs.presentTrace true."""
         self.assertEqual(self.schema["properties"]["generatorArgs"]["properties"]["presentTrace"]["type"], "boolean")
@@ -5683,6 +5811,45 @@ class LegSpecSchemaTests(unittest.TestCase):
             self.assertEqual(arm["legId"], twin["legId"] + "-ptrace", rel)
             self.assertIs(arm["generatorArgs"].pop("presentTrace"), True, rel)
             self.assertEqual(dict(arm, legId=twin["legId"]), twin, rel)
+
+    def test_the_scope_legs_are_no_look_windowed_s1_speed_legs_differing_only_in_scope(self) -> None:
+        """PLAYBACK-SCOPES-OPTION-1: every scope leg is a single-backend no-look SPEED leg at windowed scale 1 (LIGHT, the 95 % quiescence gate,
+        informational criteria), and each scope arm is its backend's N leg plus only the scope fields."""
+        for rel, (backend, extra) in SCOPE_LEGS.items():
+            spec = json.loads((DV / rel).read_text(encoding="utf-8"))
+            self.jsonschema.validate(spec, self.schema)
+            self.assertEqual(spec["legId"], Path(rel).stem, rel)
+            self.assertEqual(spec["card"], "PLAYBACK-SCOPES-OPTION-1", rel)
+            self.assertEqual((spec["legType"], spec["clipId"], spec["playSeconds"], spec["backends"], spec["scaleFactor"], spec["displayMode"]),
+                             ("speed", "M16-1243", 25, [backend], 1, "windowed"), rel)
+            self.assertEqual(spec["criteria"], {"acceptance": {backend: []}, "supplementary": {backend: []}}, rel)
+            self.assertNotIn("look", spec, rel)
+            none = json.loads((DV / f"legs/m16-1243-scopes-{backend}-windowed-s1-none.json").read_text(encoding="utf-8"))
+            self.assertEqual(none["generatorArgs"], {"telemetryArm": "LIGHT", "cpuQuiescenceThresholdPercent": 95, "disableLookAssist": True})
+            self.assertEqual(spec["generatorArgs"], {**none["generatorArgs"], **extra}, rel)
+            self.assertEqual(dict(spec, legId=none["legId"], generatorArgs=none["generatorArgs"]), none, rel)
+        for bad_value in ({"scope": "histo"}, {"scopeIntervalMs": -1}, {"scopeIntervalMs": 1001}, {"scopeIntervalMs": "0"},
+                          {"scopesDuringPlayback": "off"}, {"scopesDuringPlayback": "Live"}):
+            bad = json.loads((DV / "legs/m16-1243-scopes-cpu-windowed-s1-none.json").read_text(encoding="utf-8"))
+            bad["generatorArgs"].update(bad_value)
+            with self.assertRaises(self.jsonschema.ValidationError, msg=repr(bad_value)):
+                self.jsonschema.validate(bad, self.schema)
+
+    def test_the_scope_la_legs_are_the_no_look_twins_with_look_assist_forced_on(self) -> None:
+        """PLAYBACK-SCOPES-OPTION-1 r3: each -la leg is its no-look twin with only legId, forceLookAssist (not disableLookAssist) and the
+        lookAssistForced criterion changed, so the LA-on and LA-off arms measure the same thing but for Look Assist."""
+        for rel in SCOPE_LA_LEGS:
+            spec = json.loads((DV / rel).read_text(encoding="utf-8"))
+            self.jsonschema.validate(spec, self.schema)
+            self.assertEqual(spec["legId"], Path(rel).stem, rel)
+            backend = spec["backends"][0]
+            twin = json.loads((DV / rel.replace("-la.json", ".json")).read_text(encoding="utf-8"))
+            self.assertIs(spec["generatorArgs"].pop("forceLookAssist"), True, rel)
+            self.assertIs(twin["generatorArgs"].pop("disableLookAssist"), True, rel)
+            self.assertEqual(spec["generatorArgs"], twin["generatorArgs"], rel)
+            gate = {"metric": "lookAssistForced", "op": "eq", "value": True}
+            self.assertEqual(spec["criteria"], {"acceptance": {backend: [gate]}, "supplementary": {backend: [gate]}}, rel)
+            self.assertEqual(dict(spec, legId=twin["legId"], generatorArgs=twin["generatorArgs"], criteria=twin["criteria"]), twin, rel)
 
     def test_the_hand_listed_shipped_legs_are_exactly_the_legs_directory(self) -> None:
         self.assertEqual(sorted(SHIPPED_LEGS), sorted("legs/" + p.name for p in (DV / "legs").glob("*.json")), "SHIPPED_LEGS drifted from the legs/ directory")
@@ -6083,7 +6250,9 @@ class LookReceiptRunnerTests(RunnerHarness, unittest.TestCase):
             subprocess.run(["git", "-C", str(self.repo), *args], capture_output=True, text=True, check=True)
         self.working = self.committed.replace(b"<agx>0</agx>", b"<agx>1</agx>")
         target.write_bytes(self.working)   # the working copy now differs from the committed blob
-        self.gen.write_text(STUB_GENERATOR.replace("$PlaybackConform)", "$PlaybackConform,$LookReceiptPath)", 1), encoding="utf-8")
+        param_tail = "$PlaybackConform,[switch]$VisualCapture)"
+        self.assertIn(param_tail, STUB_GENERATOR, "STUB_GENERATOR param list changed; update this replace target")
+        self.gen.write_text(STUB_GENERATOR.replace(param_tail, "$PlaybackConform,[switch]$VisualCapture,$LookReceiptPath)", 1), encoding="utf-8")
         self.work = self.tmp / "work"
 
     def spec(self, **look) -> Path:
@@ -6287,6 +6456,386 @@ class LookReceiptGeneratorTests(unittest.TestCase):
                 self.assertNotEqual(proc.returncode, 0)
                 self.assertIn("DUAL_VENUE_LOOK_RECEIPT_REQUIRES_LOOK_LEG", proc.stdout + proc.stderr)
                 self.assertFalse(out.exists())
+
+
+# ---------------------------------------------------------------------------------------------------
+# PLAYBACK-VISUAL-INSPECTION-1: every speed leg keeps window captures a reviewer opens. Owner, 2026-10-13: "you should be inspecting how each
+# run looks. I thought that was being done via screnshots". The capture runs AFTER the measured window (a capture inside it roughly doubles
+# render cost), and its gate catches the measured trap the cadence numbers cannot: a frozen display. All test names carry "visual" (-k visual).
+VISUAL_OPEN = "PLAYBACK-VISUAL-INSPECTION-1 >>>"
+VISUAL_CLOSE = "PLAYBACK-VISUAL-INSPECTION-1 <<<"
+VISUAL_FUNCTIONS = ("Test-AttrCudaVisualCaptureSupport", "Add-AttrCudaVisualCaptureArgument", "Get-AttrCudaPresentMonWindowResult", "Publish-AttrCudaVisualCaptures")
+ATTR_MODULE = ROOT / "tools" / "profiling" / "bachelor" / "AttrCudaArtifacts.psm1"
+VIEWPORT = {"x": 10, "y": 20, "w": 300, "h": 160}
+
+# One synthetic window per capture (never footage): grey "chrome" around a 300x160 viewport holding a gradient and a bar. -Seed moves the bar (a
+# different picture), -Chrome changes only the chrome (a timecode that ticks over a frozen picture), -Bias shifts the red channel (another look),
+# -Blank draws a black window.
+VISUAL_PNG_PS = r"""
+Add-Type -AssemblyName System.Drawing
+function New-VisPng([string]$Path, [int]$Seed, [int]$Chrome, [int]$Bias, [bool]$Blank) {
+    $b = [System.Drawing.Bitmap]::new(320, 200)
+    $g = [System.Drawing.Graphics]::FromImage($b)
+    if ($Blank) { $g.Clear([System.Drawing.Color]::Black) } else {
+        $g.Clear([System.Drawing.Color]::FromArgb($Chrome, $Chrome, $Chrome))
+        for ($x = 0; $x -lt 300; $x += 10) {
+            $br = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb([int][math]::Min(255, 40 + $x / 2 + $Bias), 90, [int](160 - $x / 3)))
+            $g.FillRectangle($br, 10 + $x, 20, 10, 160); $br.Dispose()
+        }
+        $g.FillRectangle([System.Drawing.Brushes]::White, 10 + ($Seed * 40) % 280, 60, 20, 80)
+    }
+    $g.Dispose(); $b.Save($Path, [System.Drawing.Imaging.ImageFormat]::Png); $b.Dispose()
+}
+"""
+
+
+def write_visual_captures(dest: Path, mode: str = "ok") -> None:
+    """The job's published visual\\ directory, as the app and the job write it: play-0..5.png, stop.png, paused.png, visual.json, and the
+    job's visual-capture-request.json. mode: ok | frozen (one picture, ticking chrome, advancing app frames) | blank | diverge (the paused
+    full-quality frame has another red level)."""
+    if dest.exists():
+        shutil.rmtree(dest)
+    dest.mkdir(parents=True)
+    calls = []
+    for k in range(6):
+        seed = 1 if mode == "frozen" else k
+        calls.append(f"New-VisPng '{dest / f'play-{k}.png'}' {seed} {60 + k * 10} 0 ${'true' if mode == 'blank' else 'false'}")
+    calls.append(f"New-VisPng '{dest / 'stop.png'}' 5 120 0 ${'true' if mode == 'blank' else 'false'}")
+    calls.append(f"New-VisPng '{dest / 'paused.png'}' 5 120 {40 if mode == 'diverge' else 0} ${'true' if mode == 'blank' else 'false'}")
+    proc = run_pwsh(["-Command", VISUAL_PNG_PS + "\n".join(calls)])
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    frames = [{"kind": "play", "index": k, "file": f"play-{k}.png", "display_frame": 600 + 2 * k, "serial": 900 + k, "play_active": True,
+               "tail_elapsed_ms": 250 + 500 * k, "capture_ms": 40.0, "viewport": VIEWPORT, "saved": True, "reason": ""} for k in range(6)]
+    frames.append({"kind": "stop", "index": 0, "file": "stop.png", "display_frame": 612, "play_active": False, "viewport": VIEWPORT, "saved": True, "reason": ""})
+    frames.append({"kind": "paused", "index": 0, "file": "paused.png", "display_frame": 612, "settled": True, "settled_frame": 612, "play_active": False,
+                   "viewport": VIEWPORT, "saved": True, "reason": ""})
+    (dest / "visual.json").write_text(json.dumps({"schema": "mlv-app/visual-capture/v1", "method": "PrintWindow(PW_RENDERFULLCONTENT)", "tail_ms": 3000,
+                                                  "tail_begin_utc": "2026-10-13T22:00:00.000Z", "tail_end_utc": "2026-10-13T22:00:03.100Z",
+                                                  "frames": frames, "frames_written": 8, "error": ""}), encoding="utf-8")
+    (dest / "visual-capture-request.json").write_text(json.dumps({"schema": "mlv-app/visual-capture-request/v1", "requested": True, "probe": "supported",
+                                                                  "reason": None, "forwarded": True, "presentMonWindowEndUtc": "2026-10-13T22:00:00.000Z"}), encoding="utf-8")
+
+
+@requires_windows_pwsh
+class VisualCaptureGeneratorTests(unittest.TestCase):
+    """-VisualCapture adds exactly three bracketed regions to the job (helpers + probe + argument; the PresentMon window cut; the publish) and nothing else."""
+
+    setUpClass = classmethod(GeneratorByteIdentityAndVariantTests.setUpClass.__func__)
+    tearDownClass = classmethod(GeneratorByteIdentityAndVariantTests.tearDownClass.__func__)
+    generate = GeneratorByteIdentityAndVariantTests.generate
+    parse_errors = GeneratorByteIdentityAndVariantTests.parse_errors
+
+    @staticmethod
+    def strip_visual(text: str) -> tuple[str, int, list[str]]:
+        kept: list[str] = []
+        regions: list[str] = []
+        inside: list[str] | None = None
+        for line in lf(text).split("\n"):
+            if VISUAL_OPEN in line:
+                assert inside is None, "nested visual region"
+                inside = []
+                continue
+            if VISUAL_CLOSE in line:
+                assert inside is not None, "unopened visual region"
+                regions.append("\n".join(inside))
+                inside = None
+                continue
+            if inside is None:
+                kept.append(line)
+            else:
+                inside.append(line)
+        assert inside is None, "unclosed visual region"
+        return "\n".join(kept), len(regions), regions
+
+    def test_the_visual_capture_job_is_the_default_job_plus_three_bracketed_regions(self) -> None:
+        for name, extra in (("plain", []), ("windowed-sheet", ["-DisplayMode", "windowed", "-ContactSheet", "-ContactSheetFrames", "4"]), ("cpu", ["-Backend", "cpu"])):
+            with self.subTest(name):
+                base = self.generate(GENERATOR, f"vis-base-{name}.job.ps1", extra)
+                on = self.generate(GENERATOR, f"vis-on-{name}.job.ps1", [*extra, "-VisualCapture"])
+                self.assertEqual(self.parse_errors(on), 0)
+                self.assertNotIn("visual-capture", base.read_text(encoding="utf-8"), "without -VisualCapture the job never names the option")
+                kept, count, regions = self.strip_visual(on.read_text(encoding="utf-8"))
+                self.assertEqual(count, 3)
+                # region 2 REPLACES the one display-report call (the cut window is passed instead of the launcher's result); everything else is added
+                report = ("$displayReport = Get-AttrCudaPresentMonDisplayReport -CsvPath $presentMonPath -ResultJson $resultJson "
+                          "-EarliestCaptureStartUtc $presentMonCaptureStartUtc -LatestCaptureStartUtc $presentMonPostSpawnUtc\n")
+                self.assertEqual(lf(base.read_text(encoding="utf-8")).count(report), 1)
+                self.assertEqual(kept, lf(base.read_text(encoding="utf-8")).replace(report, ""),
+                                 "the three regions (and the one report call region 2 replaces) are the ONLY difference from the job without -VisualCapture")
+                for fn in VISUAL_FUNCTIONS:
+                    self.assertIn(f"function {fn}", regions[0], "the helpers are spliced in the first region, never into the default embed list")
+                # the order the job runs them in: probe before PresentMon, the window cut at the report, the publish before the contact sheet
+                text = lf(on.read_text(encoding="utf-8"))
+                self.assertLess(text.index("Test-AttrCudaVisualCaptureSupport -ExePath $exePath"), text.index("$PresentMonSessionName = Get-PresentMonSessionName $JobId"))
+                self.assertIn("-ResultJson $presentMonWindowResult -EarliestCaptureStartUtc", regions[1])
+                self.assertNotIn("Get-AttrCudaPresentMonDisplayReport -CsvPath $presentMonPath -ResultJson $resultJson ", text, "the uncut report call is replaced, not duplicated")
+                self.assertLess(text.index("Publish-AttrCudaVisualCaptures -Record"), text.index("$files = Get-ChildItem -LiteralPath $Pub -Recurse -File"))
+
+    def test_the_runner_maps_a_speed_leg_to_visual_capture_outside_the_forced_look_branch(self) -> None:
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        mapping = "if ($visualRequest.requested) { $gen['VisualCapture'] = $true }"
+        self.assertIn(mapping, runner)
+        self.assertGreater(runner.index(mapping), runner.index("if (-not $isLook -and $spec.generatorArgs.PSObject.Properties['forceLookAssist']"))
+        self.assertLess(runner.index(mapping), runner.index("$gen['ContactSheet'] = $true; $gen['ContactSheetFrames']"))
+
+
+@requires_windows_pwsh
+class VisualCaptureVenueHelperTests(unittest.TestCase):
+    """The venue-side helpers the job splices in (AttrCudaArtifacts.psm1)."""
+
+    def run_module(self, script: str) -> subprocess.CompletedProcess:
+        return run_pwsh(["-Command", f"$ErrorActionPreference = 'Stop'; Import-Module '{ATTR_MODULE}' -Force\n" + script])
+
+    def test_the_visual_capture_argument_joins_the_one_additional_args_array(self) -> None:
+        proc = self.run_module(
+            "Write-Output ('A=' + (Add-AttrCudaVisualCaptureArgument -Command \"& 'smoke.ps1' -Seconds 25\" -VisualCaptureDir 'C:\\w\\visual'))\n"
+            "Write-Output ('B=' + (Add-AttrCudaVisualCaptureArgument -Command \"& 'smoke.ps1' -AdditionalArgs @('--contact-sheet-dir', 'C:\\w\\cs', '--windowed')\" -VisualCaptureDir \"C:\\w'x\\visual\"))\n"
+            "try { [void](Add-AttrCudaVisualCaptureArgument -Command \"& 'smoke.ps1' -AdditionalArgs @('--windowed') -TracePath 't'\" -VisualCaptureDir 'v'); Write-Output 'C=no-throw' } catch { Write-Output ('C=' + $_.Exception.Message) }")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        out = dict(l.split("=", 1) for l in proc.stdout.splitlines() if "=" in l)
+        self.assertEqual(out["A"], "& 'smoke.ps1' -Seconds 25 -AdditionalArgs @('--visual-capture-dir', 'C:\\w\\visual')")
+        self.assertEqual(out["B"], "& 'smoke.ps1' -AdditionalArgs @('--contact-sheet-dir', 'C:\\w\\cs', '--windowed', '--visual-capture-dir', 'C:\\w''x\\visual')")
+        self.assertTrue(out["C"].startswith("ATTRCUDA_VISUAL_CAPTURE_ARGS_NOT_LAST"), out["C"])
+
+    def test_the_visual_tail_is_cut_off_the_presentmon_window_and_never_extends_it(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="vis-pm-") as d:
+            Path(d, "visual.json").write_text(json.dumps({"tail_begin_utc": "2026-10-13T22:00:00.000Z"}), encoding="utf-8")
+            proc = self.run_module(
+                f"$dir = '{d}'\n"
+                "$rec = [ordered]@{ forwarded = $true; presentMonWindowEndUtc = $null }\n"
+                "function Make($end) { [pscustomobject]@{ process = [pscustomobject]@{ id = 7; startedAtUtc = [datetime]::SpecifyKind([datetime]'2026-10-13T21:59:00', 'Utc'); endedAtUtc = $end }; other = 1 } }\n"
+                "$utc = Make ([datetime]::SpecifyKind([datetime]'2026-10-13T22:00:10', 'Utc'))\n"
+                "$r1 = Get-AttrCudaPresentMonWindowResult -ResultJson $utc -Record $rec -VisualCaptureDir $dir\n"
+                "Write-Output ('UTC=' + $r1.process.endedAtUtc.ToString('o') + '|' + $r1.process.endedAtUtc.Kind + '|' + $utc.process.endedAtUtc.ToString('o') + '|' + $rec['presentMonWindowEndUtc'])\n"
+                "$loc = Make ([datetime]::SpecifyKind([datetime]'2026-10-13T22:00:10', 'Utc').ToLocalTime())\n"
+                "$r2 = Get-AttrCudaPresentMonWindowResult -ResultJson $loc -Record $rec -VisualCaptureDir $dir\n"
+                "Write-Output ('LOCAL=' + $r2.process.endedAtUtc.ToUniversalTime().ToString('o') + '|' + $r2.process.endedAtUtc.Kind)\n"
+                "$str = Make '2026-10-13T22:00:10.0000000Z'\n"
+                "$r3 = Get-AttrCudaPresentMonWindowResult -ResultJson $str -Record $rec -VisualCaptureDir $dir\n"
+                "Write-Output ('STRING=' + $r3.process.endedAtUtc)\n"
+                "$early = Make ([datetime]::SpecifyKind([datetime]'2026-10-13T21:59:30', 'Utc'))\n"
+                "Write-Output ('NEVER_LATER=' + [object]::ReferenceEquals((Get-AttrCudaPresentMonWindowResult -ResultJson $early -Record $rec -VisualCaptureDir $dir), $early))\n"
+                "$off = [ordered]@{ forwarded = $false }\n"
+                "Write-Output ('OFF=' + [object]::ReferenceEquals((Get-AttrCudaPresentMonWindowResult -ResultJson $utc -Record $off -VisualCaptureDir $dir), $utc))")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        out = dict(l.split("=", 1) for l in proc.stdout.splitlines() if "=" in l)
+        self.assertEqual(out["UTC"], "2026-10-13T22:00:00.0000000Z|Utc|2026-10-13T22:00:10.0000000Z|2026-10-13T22:00:00.000Z", "a copy is cut; the launcher's own result is untouched")
+        self.assertEqual(out["LOCAL"], "2026-10-13T22:00:00.0000000Z|Local", "the cut end keeps the launcher's own DateTime kind")
+        self.assertEqual(out["STRING"], "2026-10-13T22:00:00.0000000Z")
+        self.assertEqual(out["NEVER_LATER"], "True", "a tail that begins after the process ended never moves the window")
+        self.assertEqual(out["OFF"], "True", "no forwarded capture: the launcher's result, untouched")
+
+
+@requires_windows_pwsh
+class VisualCaptureRunnerModuleTests(unittest.TestCase):
+    """The runner's request, gate and evidence reader (DualVenueRunner.psm1)."""
+
+    def test_visual_capture_is_on_for_every_speed_leg_unless_it_opts_out_with_a_reason(self) -> None:
+        cases = {
+            "absent": ("@{ legType = 'speed' }", "True|True|"),
+            "true": ("@{ legType = 'speed'; visualCapture = $true }", "True|True|"),
+            "optout": ("@{ legType = 'speed'; visualCapture = $false; visualCaptureOptOutReason = 'a capture-free pace A/B arm' }", "True|False|a capture-free pace A/B arm"),
+            "look": ("@{ legType = 'look' }", "False|False|"),
+        }
+        for name, (spec, expected) in cases.items():
+            with self.subTest(name):
+                proc, out = run_pwsh_json(f"$r = Get-DvVisualCaptureRequest -Spec ([pscustomobject]{spec}); ConvertTo-Json @(\"$($r.applies)|$($r.requested)|$($r.optOutReason)\")")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(out[0] if isinstance(out, list) else out, expected)
+        for name, spec in (("no-reason", "@{ legType = 'speed'; visualCapture = $false }"), ("reason-only", "@{ legType = 'speed'; visualCaptureOptOutReason = 'why not' }"),
+                           ("not-bool", "@{ legType = 'speed'; visualCapture = 'no' }")):
+            with self.subTest(name):
+                proc = run_pwsh(["-Command", f"Import-Module '{DV / 'DualVenueRunner.psm1'}' -Force; try {{ [void](Get-DvVisualCaptureRequest -Spec ([pscustomobject]{spec})); 'NO_THROW' }} catch {{ $_.Exception.Message }}"])
+                self.assertTrue(proc.stdout.strip().startswith("DVE_LEG_SPEC_INVALID"), proc.stdout + proc.stderr)
+
+    def test_the_visual_gate_freezes_diverges_and_blanks_only_on_its_own_evidence(self) -> None:
+        rows = [  # requested, captured, play, distinct, appDistinct, flat, mad, samePosition -> verdict, counted
+            ("$true", "$true", 6, 6, 6, 0, "2.0", "$true", "OK", True),
+            ("$true", "$true", 6, 1, 6, 0, "2.0", "$true", "FROZEN_DISPLAY", False),
+            ("$true", "$true", 6, 1, 1, 0, "2.0", "$true", "OK", True),            # the app itself presented one frame: a stall, not a frozen display
+            ("$true", "$true", 6, 1, 6, 6, "$null", "$false", "CAPTURE_BLANK", True),
+            ("$true", "$true", 6, 6, 6, 0, "30.0", "$true", "VISUAL_DIVERGENCE", True),
+            ("$true", "$true", 6, 6, 6, 0, "30.0", "$false", "OK", True),           # not the same timeline position: the difference judges nothing
+            ("$true", "$false", 0, 0, 0, 0, "$null", "$false", "NOT_CAPTURED", True),
+            ("$true", "$true", 1, 1, 1, 0, "$null", "$false", "NOT_CAPTURED", True),
+            ("$false", "$false", 0, 0, 0, 0, "$null", "$false", "NOT_REQUESTED", True),
+        ]
+        for req, cap, play, distinct, app, flat, mad, same, verdict, counted in rows:
+            with self.subTest(verdict=verdict, distinct=distinct, app=app, mad=mad):
+                proc, out = run_pwsh_json(f"Get-DvVisualVerdict -Requested {req} -Captured {cap} -PlayFrames {play} -DistinctContentHashes {distinct} -AppDistinctDisplayFrames {app} "
+                                          f"-FlatPlayFrames {flat} -PlayVsPausedMeanAbsDiff {mad} -SamePosition {same} -Threshold 12 | ConvertTo-Json -Compress")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual((out["verdict"], out["counted"]), (verdict, counted))
+
+    def test_the_default_divergence_threshold_is_six_not_twelve(self) -> None:
+        # The gate table above passes -Threshold explicitly, so it cannot see the module default. These rows pass none: a same-position
+        # mean absolute difference of 8 is a divergence at the calibrated default (6.0) and would read OK if the default were 12.0.
+        for mad, verdict in (("8.0", "VISUAL_DIVERGENCE"), ("6.5", "VISUAL_DIVERGENCE"), ("6.0", "OK"), ("5.9", "OK"), ("2.0", "OK")):
+            with self.subTest(mad=mad):
+                proc, out = run_pwsh_json("Get-DvVisualVerdict -Requested $true -Captured $true -PlayFrames 6 -DistinctContentHashes 6 -AppDistinctDisplayFrames 6 "
+                                          f"-FlatPlayFrames 0 -PlayVsPausedMeanAbsDiff {mad} -SamePosition $true | ConvertTo-Json -Compress")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual((out["verdict"], out["counted"]), (verdict, True))
+                if verdict == "VISUAL_DIVERGENCE":
+                    self.assertIn("threshold is 6", out["reason"])
+
+    def test_the_visual_reader_hashes_the_viewport_not_the_chrome_and_composes_one_strip(self) -> None:
+        for mode, verdict in (("ok", "OK"), ("frozen", "FROZEN_DISPLAY"), ("blank", "CAPTURE_BLANK"), ("diverge", "VISUAL_DIVERGENCE")):
+            with self.subTest(mode), tempfile.TemporaryDirectory(prefix=f"vis-{mode}-") as d:
+                art = Path(d) / "artifacts"
+                write_visual_captures(art / "visual", mode)
+                ev = Path(d) / "evidence"
+                proc, out = run_pwsh_json(f"Read-DvVisualCaptures -Requested $true -ArtifactsDir '{art}' -EvidenceDir '{ev}' -LegId 'unit-leg' -Header 'unit' | ConvertTo-Json -Depth 8 -Compress")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(out["verdict"], verdict, out["reason"])
+                self.assertEqual(out["playFrames"], 6)
+                self.assertEqual(out["appDistinctDisplayFrames"], 6)
+                self.assertEqual(out["distinctContentHashes"], {"ok": 6, "frozen": 1, "blank": 1, "diverge": 6}[mode],
+                                 "the content hash is the VIEWPORT's: a frozen picture under a ticking chrome hashes ONE value")
+                self.assertTrue(out["samePosition"])
+                names = sorted(f["file"] for f in out["frames"])
+                self.assertEqual(names, sorted([f"unit-leg-play-{k}.png" for k in range(6)] + ["unit-leg-stop.png", "unit-leg-paused.png"]))
+                for f in out["frames"]:
+                    local = ev / "visual" / f["file"]
+                    self.assertTrue(local.is_file(), f["file"])
+                    self.assertEqual(f["sha256"], hashlib.sha256(local.read_bytes()).hexdigest())
+                self.assertTrue(Path(out["stripPath"]).is_file())
+                self.assertEqual(Path(out["stripPath"]).name, "unit-leg-strip.png")
+                self.assertEqual(out["stripSha256"], hashlib.sha256(Path(out["stripPath"]).read_bytes()).hexdigest())
+                self.assertEqual(out["presentMonWindowEndUtc"], "2026-10-13T22:00:00.0000000Z")
+                self.assertEqual((out["tailBeginUtc"], out["tailEndUtc"]), ("2026-10-13T22:00:00.0000000Z", "2026-10-13T22:00:03.1000000Z"))
+                mad = out["playVsPausedMeanAbsDiff"]
+                if mode == "diverge":
+                    self.assertGreater(mad, 12.0)
+                    self.assertGreater(out["playVsPausedMeanAbsDiffPerChannel"][0], out["playVsPausedMeanAbsDiffPerChannel"][1], "the red shift shows in R")
+                else:
+                    self.assertLess(mad, 1.0)
+
+    def test_a_visual_reader_without_a_published_directory_says_not_captured(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="vis-none-") as d:
+            proc, out = run_pwsh_json(f"Read-DvVisualCaptures -Requested $true -ArtifactsDir '{d}' -EvidenceDir '{d}' -LegId 'unit-leg' | ConvertTo-Json -Depth 8 -Compress")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual((out["verdict"], out["captured"], out["counted"]), ("NOT_CAPTURED", False, True))
+        self.assertIn("no visual directory", out["reason"])
+
+
+@requires_windows_pwsh
+class VisualCaptureRunnerTests(RunnerHarness, unittest.TestCase):
+    """End to end through Invoke-VenueLeg.ps1 (offline harness): the request reaches the generator, the captures reach the receipt, the gate decides."""
+
+    def setUp(self) -> None:
+        self.make_harness()
+
+    def speed_spec(self, **fields) -> Path:
+        path = self.write_spec()
+        spec = json.loads(path.read_text(encoding="utf-8"))
+        spec.update(fields)
+        out = path.with_name(path.stem + "-" + hashlib.sha1(json.dumps(fields, sort_keys=True).encode()).hexdigest()[:8] + ".json")
+        out.write_text(json.dumps(spec), encoding="utf-8")
+        return out
+
+    def run_visual(self, mode: str | None, spec: Path | None = None):
+        self.write_artifacts()
+        if mode is None:
+            shutil.rmtree(self.artifacts / "visual", ignore_errors=True)
+        else:
+            write_visual_captures(self.artifacts / "visual", mode)
+        return self.run_leg("ultra-magnus", spec or self.write_spec(), extra=["-Backend", "cpu"])
+
+    def test_a_speed_leg_asks_for_visual_capture_and_keeps_its_strip(self) -> None:
+        proc, receipt, _ = self.run_visual("ok")
+        self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+        self.assertIn("VisualCapture=True", self.generator_calls()[-1])
+        visual = receipt["visual"]
+        self.assertEqual((visual["verdict"], visual["requested"], visual["captured"], visual["distinctContentHashes"]), ("OK", True, True, 6))
+        self.assertEqual(Path(visual["stripPath"]).parent, Path(receipt["evidence"]["localEvidenceDir"]) / "visual")
+        copy = Path(visual["stripCopyPath"])
+        self.assertTrue(copy.is_file())
+        self.assertEqual(copy.parent, self.tmp / "dv" / "sheets", "without -SheetCopyDir the strip lands in <receipts>\\..\\sheets")
+        self.assertTrue(copy.name.startswith("strip-unit-leg-ultra-magnus-cpu-"), copy.name)
+        self.assertIn(f"DVE_VISUAL=OK STRIP={copy}", proc.stdout)
+
+    def test_a_frozen_display_leg_is_not_counted_whatever_its_cadence(self) -> None:
+        _, receipt, _ = self.run_visual("frozen")
+        self.assertEqual(receipt["outcome"], "INVALID")
+        self.assertIn("FROZEN_DISPLAY", receipt["outcomeDetail"])
+        self.assertFalse(receipt["visual"]["counted"])
+
+    def test_a_visual_divergence_is_counted_for_speed_and_surfaced(self) -> None:
+        _, receipt, _ = self.run_visual("diverge")
+        self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+        self.assertIn("VISUAL_DIVERGENCE", receipt["outcomeDetail"])
+        self.assertEqual(receipt["visual"]["verdict"], "VISUAL_DIVERGENCE")
+
+    def test_a_blank_visual_capture_judges_nothing(self) -> None:
+        _, receipt, _ = self.run_visual("blank")
+        self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+        self.assertEqual(receipt["visual"]["verdict"], "CAPTURE_BLANK")
+
+    def test_a_speed_leg_whose_job_published_no_visual_capture_says_so(self) -> None:
+        _, receipt, _ = self.run_visual(None)
+        self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+        self.assertEqual(receipt["visual"]["verdict"], "NOT_CAPTURED")
+
+    def test_an_opted_out_speed_leg_asks_for_no_visual_capture(self) -> None:
+        spec = self.speed_spec(visualCapture=False, visualCaptureOptOutReason="a capture-free pace A/B arm")
+        _, receipt, _ = self.run_visual("ok", spec)
+        self.assertNotIn("VisualCapture", self.generator_calls()[-1])
+        self.assertEqual((receipt["visual"]["verdict"], receipt["visual"]["requested"], receipt["visual"]["optOutReason"]),
+                         ("NOT_REQUESTED", False, "a capture-free pace A/B arm"))
+
+    def test_a_look_leg_never_runs_the_visual_capture(self) -> None:
+        self.write_artifacts(sheet=True)
+        write_visual_captures(self.artifacts / "visual", "frozen")
+        _, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(leg_type="look"), extra=["-Backend", "cpu"])
+        self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+        self.assertNotIn("VisualCapture", self.generator_calls()[-1])
+        self.assertIsNone(receipt["visual"])
+
+    def test_a_refused_speed_leg_still_says_visual_capture_was_asked_for(self) -> None:
+        _, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(), gen_refusal="PLAYBACK_ATTR3_OWNER_NOT_CONSENTED stub")
+        self.assertEqual(receipt["outcome"], "DEVICE_UNAVAILABLE")
+        self.assertEqual((receipt["visual"]["requested"], receipt["visual"]["verdict"]), (True, "NOT_CAPTURED"))
+
+
+class VisualCaptureSpecAndAppSourceTests(unittest.TestCase):
+    """The schema's opt-out shape, the proof leg, and the app side of the capture (a source census: the app is built and run on a venue, never here)."""
+
+    def test_the_visual_capture_opt_out_needs_its_reason_and_the_reason_needs_the_opt_out(self) -> None:
+        try:
+            import jsonschema
+        except ImportError:
+            self.skipTest("jsonschema is required")
+        schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
+        leg = json.loads((DV / "legs" / "m16-1243-speed-windowed-s2.json").read_text(encoding="utf-8"))
+        jsonschema.validate(leg, schema)
+        self.assertNotIn("visualCapture", leg, "the proof leg runs the default: absent means on")
+        self.assertEqual((leg["legType"], leg["displayMode"], leg["scaleFactor"], leg["clipId"]), ("speed", "windowed", 2, OWNER_CLIP))
+        jsonschema.validate(dict(leg, visualCapture=False, visualCaptureOptOutReason="a capture-free pace A/B arm"), schema)
+        jsonschema.validate(dict(leg, visualCapture=True), schema)
+        for bad in (dict(leg, visualCapture=False), dict(leg, visualCaptureOptOutReason="a capture-free pace A/B arm"),
+                    dict(leg, visualCapture=True, visualCaptureOptOutReason="a capture-free pace A/B arm"), dict(leg, visualCapture=False, visualCaptureOptOutReason="short")):
+            with self.subTest(bad=sorted(set(bad) - set(leg))), self.assertRaises(jsonschema.ValidationError):
+                jsonschema.validate(bad, schema)
+
+    def test_the_app_visual_capture_runs_after_the_measured_session_closes_and_captures_the_window(self) -> None:
+        main_cpp = (ROOT / "platform" / "qt" / "main.cpp").read_text(encoding="utf-8")
+        self.assertIn('QStringLiteral("visual-capture-dir")', main_cpp)
+        src = (ROOT / "platform" / "qt" / "MainWindow.cpp").read_text(encoding="utf-8")
+        body = src[src.index("int MainWindow::runGuiPlaybackSmoke("):src.index("//Import a MLV, complete procedure")]
+        reached = body.index("if( measuredState != playback_frame_range::PlayStopState::Reached )")
+        block = body[body.index("if( !options.visualCaptureDir.isEmpty() && ui->actionPlay->isChecked() )"):body.index("// Contact-sheet files. Deliberately placed AFTER")]
+        self.assertGreater(body.index("if( !options.visualCaptureDir.isEmpty()"), reached, "the capture only follows a measured Play that REACHED its stop")
+        close = block.index('finishPlaybackSmokeTelemetry( "visual-capture" );')
+        self.assertLess(close, block.index('grabVisual( QStringLiteral("play"), k, false );'), "the measured session closes before the first capture")
+        self.assertLess(block.index('grabVisual( QStringLiteral("play"), k, false );'), block.index("ui->actionPlay->setChecked( false );"))
+        self.assertLess(block.index("ui->actionPlay->setChecked( false );"), block.index('grabVisual( QStringLiteral("stop"), 0, false );'))
+        self.assertLess(block.index('grabVisual( QStringLiteral("stop"), 0, false );'), block.index('seekAndSettleLoadedClip( visualStopFrame, "gui-smoke-visual-capture-paused"'))
+        self.assertLess(block.index("seekAndSettleLoadedClip( visualStopFrame"), block.index('grabVisual( QStringLiteral("paused"), 0, visualSettled );'))
+        self.assertLess(block.index('grabVisual( QStringLiteral("paused")'), block.index('.save( visualDir.absoluteFilePath( fileName ), "PNG" )'), "no PNG is encoded while Play runs")
+        for forbidden in ("programmaticPlay(", "setChecked( true", "->trigger(", "return "):
+            self.assertNotIn(forbidden, block, f"the capture block never starts a Play and never ends the smoke: {forbidden}")
+        self.assertIn("PrintWindow( hwnd, memoryDc, PW_RENDERFULLCONTENT )", src)
 
 
 if __name__ == "__main__":

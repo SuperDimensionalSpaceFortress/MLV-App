@@ -10,16 +10,17 @@ and that cap is not ours to raise. The smoke timeout is  [the app's own re-read 
 (inputMB / ColdReadMBps x 1.5) happens BEFORE the runner and is budgeted separately in the um-run timeout, so it never needed to be repeated at full margin inside the
 runner's 3600 s. A CPU-informational leg now lets the in-runner re-read allowance shrink to whatever is left of the 3600 s once its own fixed parts (launch + the CPU
 play ceiling + settle + slack) are paid, and refuses (same typed token) only when that remainder cannot cover the re-read at the measured rate with NO margin.
-CUDA, fixtures and the interactive app are untouched.
+The interactive app is untouched. HFR-NATIVE-M16-1457-TIMEBUDGET-1 extended the request from the CPU-informational leg to EVERY backend (the job's own margined identity
+read precedes the runner on every backend, so the runner's 3600 s only ever holds the app's re-read); the M16-1457 CUDA leg is pinned in test_hfr_m16_1457_timebudget.py.
 
   1. the derivation: Get-AttrCudaLegTimeBudget -ShareSmokeCeiling (EXECUTED in pwsh) -- 3238 MB fits and stays at the 3600 s ceiling, an input over the new cap refuses;
-  2. the generator passes the switch for the CPU-informational variant ONLY (text, mutation-tested), and the job traces smokeCeilingClamped / appReadAllowanceSec;
-  3. "CUDA is untouched" is a set of STRUCTURAL invariants of the CURRENT generator, never a snapshot of a past master (a frozen snapshot blocks every later
+  2. the generator passes the switch UNCONDITIONALLY, once, before the budget is derived (text, mutation-tested), and the job traces smokeCeilingClamped / appReadAllowanceSec;
+  3. "an input that fits is untouched" is a set of STRUCTURAL invariants of the CURRENT generator, never a snapshot of a past master (a frozen snapshot blocks every later
      legitimate change to the job template; CPU-PACE-BYTE-IDENTITY-BASELINE-1 removed the sibling pin for exactly that reason):
-       (a) every CUDA variant's budget is the UNSHARED derivation for its input (smoke timeout, PresentMon capture and traced allowance equal Get-AttrCudaLegTimeBudget
+       (a) every CUDA fixture variant's budget is the UNSHARED derivation for its input (smoke timeout, PresentMon capture and traced allowance equal Get-AttrCudaLegTimeBudget
            asked without -ShareSmokeCeiling), traces smokeCeilingClamped false and carries no CPU-informational marker;
        (b) a fixture CPU job is identical to itself with and without the clamp path (a fixture has no input to share a read of);
-       (c) the clamp lines (the switch request, the generator warning, a true clamp trace) exist only in the CPU-informational owner variant.
+       (c) no FIXTURE job of any backend carries a clamp line (the generator warning, a true clamp trace): only an owner input over the unshared ceiling can clamp.
 
 Every rule has a mutation test.
 """
@@ -49,7 +50,9 @@ from tools.repo_hygiene.synthetic_mlv import FRAMES_30S_AT_23976, write_syntheti
 from tools.repo_hygiene.test_playback_attr_3_cuda_behaviour import MODULE, _PwshCase, requires_pwsh
 
 CLAMP_REQUEST = "$timeBudgetArgs['ShareSmokeCeiling'] = $true"
-CLAMP_WARNING = "CPU-LEG-SMOKE-CEILING-1: this cpu leg's smoke timeout is held"
+PLAY_SECONDS_LINE = "$timeBudgetArgs['PlaySeconds'] = [int][Math]::Max(40, $PlaySeconds)"
+BUDGET_CALL = "$timeBudget = Get-AttrCudaLegTimeBudget -InputBytes $clipBytesForBudget @timeBudgetArgs"
+CLAMP_WARNING = "CPU-LEG-SMOKE-CEILING-1: this leg's smoke timeout is held"
 CLAMP_TRACE = "smokeCeilingClamped="                      # what a clamped leg's job first trace line carries and no other job does
 CLAMP_TRACE_EXPRESSION = ('SMOKE_CEILING_TRACE = $(if ($timeBudget.smokeCeilingClamped) { " smokeCeilingClamped=True '
                           'appReadAllowanceSec=$([int]$timeBudget.appReadAllowanceSec)" } else { \'\' })')
@@ -65,25 +68,41 @@ def _bytes(mb: float) -> int:
 
 
 # --- the pure check on the generator text (mutation-tested below) -------------------------------------------------------------------------------
+def confine_request_to_cpu_block(text: str) -> str:
+    """The generator as it was on master before HFR-NATIVE-M16-1457-TIMEBUDGET-1: the one request line sits at the end of the CPU-informational block."""
+    text = lf(text)
+    assert text.count(CLAMP_REQUEST + "\n") == 1, "mutation anchor missing or ambiguous: the request line"
+    text = text.replace(CLAMP_REQUEST + "\n", "", 1)
+    anchor = "\n}\n" + BUDGET_CALL
+    assert text.count(anchor) == 1, "mutation anchor missing or ambiguous: the end of the cpu block"
+    return text.replace(anchor, "\n    " + CLAMP_REQUEST + anchor, 1)
+
+
 def check_generator_text(text: str) -> list[str]:
     problems = []
-    if "$timeBudgetArgs['ShareSmokeCeiling'] = $true" not in text:
-        problems.append("the CPU-informational budget does not ask for the shared smoke ceiling")
+    if CLAMP_REQUEST not in text:
+        problems.append("the budget does not ask for the shared smoke ceiling")
     if text.count("$timeBudgetArgs['ShareSmokeCeiling']") != 1:
         problems.append("the shared smoke ceiling is requested in more than one place")
-    # it sits inside the CPU-informational block and nowhere else
+    # it is requested for EVERY backend: unconditional (column 0, straight after the play-seconds line and its comment), outside the CPU-informational block, before the derivation
     block = re.search(r"if \(\$cpuPlayPaceInformational\) \{\n(.*?)\n\}\n\$timeBudget = ", text, re.S)
-    if block is None or "$timeBudgetArgs['ShareSmokeCeiling'] = $true" not in block.group(1):
-        problems.append("the shared smoke ceiling is not inside the CPU-informational block")
-    if "$timeBudget = Get-AttrCudaLegTimeBudget -InputBytes $clipBytesForBudget @timeBudgetArgs" not in text:
+    if block is None or "ShareSmokeCeiling" in block.group(1):
+        problems.append("the shared smoke ceiling is requested inside the CPU-informational block (a CUDA leg would not get it)")
+    if not re.search(r"(?m)^" + re.escape(CLAMP_REQUEST) + r"$", text):
+        problems.append("the shared smoke ceiling request is not an unconditional top-level statement")
+    elif not re.search(re.escape(PLAY_SECONDS_LINE) + r"\n(?:#[^\n]*\n)*" + re.escape(CLAMP_REQUEST) + r"\n", text):
+        problems.append("the shared smoke ceiling request does not directly follow the play-seconds line")
+    if BUDGET_CALL not in text:
         problems.append("the budget is not derived once through Get-AttrCudaLegTimeBudget")
+    elif CLAMP_REQUEST in text and text.index(CLAMP_REQUEST) > text.index(BUDGET_CALL):
+        problems.append("the shared smoke ceiling is requested after the budget was derived")
     if "SMOKE_PROCESS_TIMEOUT_MS = [string]$timeBudget.smokeProcessTimeoutMs" not in text:
         problems.append("the runner's process timeout is not the derived one")
     if "PRESENTMON_TIMED_SECONDS = [string][int][math]::Ceiling($timeBudget.smokeProcessTimeoutMs / 1000.0)" not in text:
         problems.append("the PresentMon capture ceiling is not derived from the smoke timeout")
     if "recommendedJobTimeoutSec = $timeBudget.jobTimeoutSec" not in text:
         problems.append("the um-run timeout is not the derived one")
-    # (c) the clamp lines exist only on the CPU-informational path: the warning fires on the derived flag alone, and the job's trace fields are the derived values
+    # (c) a clamp line appears only where the budget clamped: the warning fires on the derived flag alone, and the job's trace fields are the derived values
     if text.count(CLAMP_WARNING) != 1 or 'if ($timeBudget.smokeCeilingClamped) {\n    Write-Warning ("' + CLAMP_WARNING not in text:
         problems.append("the clamp warning is not guarded by the derived clamp flag alone")
     if CLAMP_TRACE_EXPRESSION not in text or text.count(CLAMP_TRACE) != 1:
@@ -252,8 +271,7 @@ class SharedSmokeCeilingBudget(_PwshCase):
     def test_mutation_generator_text(self) -> None:
         text = (ROOT / "tools" / "profiling" / "bachelor" / "playback-attr-3-cuda-job.ps1").read_text(encoding="utf-8")
         mutants = {
-            "switch not requested": ("$timeBudgetArgs['ShareSmokeCeiling'] = $true", ""),
-            "switch requested for everyone": ("if ($cpuPlayPaceInformational) {\n    $timeBudgetArgs['PlaySeconds']", "$timeBudgetArgs['ShareSmokeCeiling'] = $true\nif ($cpuPlayPaceInformational) {\n    $timeBudgetArgs['PlaySeconds']"),
+            "switch not requested": (CLAMP_REQUEST, ""),
             "smoke timeout not derived": ("SMOKE_PROCESS_TIMEOUT_MS = [string]$timeBudget.smokeProcessTimeoutMs", "SMOKE_PROCESS_TIMEOUT_MS = '3600000'"),
             "presentmon not derived": ("PRESENTMON_TIMED_SECONDS = [string][int][math]::Ceiling($timeBudget.smokeProcessTimeoutMs / 1000.0)", "PRESENTMON_TIMED_SECONDS = '3600'"),
             "um-run timeout not derived": ("recommendedJobTimeoutSec = $timeBudget.jobTimeoutSec", "recommendedJobTimeoutSec = 9000"),
@@ -266,6 +284,14 @@ class SharedSmokeCeilingBudget(_PwshCase):
             with self.subTest(name):
                 self.assertEqual(text.count(old), 1, f"mutation anchor missing or ambiguous: {name}")
                 self.assertTrue(check_generator_text(text.replace(old, new, 1)), f"the check did not go red on: {name}")
+        with self.subTest("switch confined to the cpu block again (the master shape)"):
+            self.assertTrue(check_generator_text(confine_request_to_cpu_block(text)), "the check did not go red on the pre-HFR-NATIVE-M16-1457-TIMEBUDGET-1 shape")
+        with self.subTest("switch requested only for cuda legs"):
+            guarded = text.replace(CLAMP_REQUEST, "if ($Backend -eq 'cuda') { " + CLAMP_REQUEST + " }", 1)
+            self.assertTrue(check_generator_text(guarded), "the check did not go red on a switch guarded by the backend")
+        with self.subTest("switch requested after the budget is derived"):
+            late = text.replace(CLAMP_REQUEST + "\n", "", 1).replace(BUDGET_CALL, BUDGET_CALL + "\n" + CLAMP_REQUEST, 1)
+            self.assertTrue(check_generator_text(late), "the check did not go red on a switch requested too late")
 
     def test_mutation_module_text(self) -> None:
         text = MODULE.read_text(encoding="utf-8")
@@ -281,10 +307,10 @@ class SharedSmokeCeilingBudget(_PwshCase):
 
 
 @requires_windows_pwsh
-class ClampIsConfinedToTheCpuInformationalOwnerLeg(unittest.TestCase):
+class NoFixtureJobOfAnyBackendClamps(unittest.TestCase):
     """STRUCTURAL invariants (a), (b), (c) of the CURRENT generator, run against a sparse clone whose fixture files are header-only ~30 s stand-ins (never real
-    footage). A fixture has zero input bytes, so what is proven here is that the shared-ceiling path is neutral where there is nothing to share and that nothing
-    else in a CUDA / fixture job carries a clamp line; the owner-size arithmetic is the budget function's (SharedSmokeCeilingBudget above)."""
+    footage). A fixture has zero input bytes, so what is proven here is that the shared-ceiling path (requested for every backend) is neutral where there is nothing
+    to share and that no CUDA / CPU fixture job carries a clamp line; the owner-size arithmetic is the budget function's (SharedSmokeCeilingBudget above)."""
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -373,11 +399,11 @@ class ClampIsConfinedToTheCpuInformationalOwnerLeg(unittest.TestCase):
         job, out = self.generate(mutant, "mutant-cuda-clamp.job.ps1", [])
         self.assertTrue(check_unshared_job(job, out, self.unshared_budget(40), cpu_markers_allowed=False), "(a) did not go red on a CUDA job that traces a clamp")
 
-    def test_mutation_requesting_the_switch_for_cuda_is_caught(self) -> None:
-        # the request line moved out of the CPU-informational block so every backend asks for the shared ceiling (a fixture has no read to clamp, so the proof is the text rule)
+    def test_mutation_confining_the_switch_to_the_cpu_block_again_is_caught(self) -> None:
+        # the master shape: the request line back at the end of the CPU-informational block, so a CUDA leg never gets the shared ceiling (M16-1457 is refused again)
         text = lf(GENERATOR.read_text(encoding="utf-8"))
-        mutant = self.replaced_once(text, "if ($cpuPlayPaceInformational) {\n    $timeBudgetArgs['PlaySeconds']", CLAMP_REQUEST + "\nif ($cpuPlayPaceInformational) {\n    $timeBudgetArgs['PlaySeconds']")
-        self.assertTrue(check_generator_text(mutant), "(a) did not go red on a generator that asks for the shared ceiling for every backend")
+        self.assertEqual(check_generator_text(text), [])
+        self.assertTrue(check_generator_text(confine_request_to_cpu_block(text)), "the check did not go red on a generator that asks for the shared ceiling for a cpu leg only")
 
     # --- (b) a fixture CPU job is the same with and without the clamp path -------------------------------------------------------------------------
     def test_a_fixture_cpu_job_is_identical_with_and_without_the_clamp_path(self) -> None:
@@ -400,25 +426,25 @@ class ClampIsConfinedToTheCpuInformationalOwnerLeg(unittest.TestCase):
         without_path, _out = self.generate(self.no_clamp_path_generator(), "without-for-mutant.job.ps1", extra)
         self.assertTrue(check_clamp_neutral(mutated, without_path), "(b) did not go red when the clamp fires on a fixture")
 
-    # --- (c) the clamp lines exist only in the CPU-informational owner variant ---------------------------------------------------------------------
-    def test_the_clamp_lines_are_confined_to_the_cpu_informational_path(self) -> None:
+    # --- (c) no fixture job of any backend carries a clamp line ------------------------------------------------------------------------------------
+    def test_the_request_is_unconditional_and_no_fixture_job_carries_a_clamp_line(self) -> None:
         text = lf(GENERATOR.read_text(encoding="utf-8"))
         self.assertEqual(check_generator_text(text), [])
         self.assertEqual(text.count(CLAMP_REQUEST), 1)
         block = re.search(r"if \(\$cpuPlayPaceInformational\) \{\n(.*?)\n\}\n\$timeBudget = ", text, re.S)
         self.assertIsNotNone(block)
-        self.assertIn(CLAMP_REQUEST, block.group(1))
-        # no generated job (CUDA or fixture CPU) and no generator output carries a clamp line: only an owner CPU leg over the ceiling can
+        self.assertNotIn(CLAMP_REQUEST, block.group(1), "the request is outside the cpu block: it is for every backend")
+        # no generated fixture job (CUDA or CPU) and no generator output carries a clamp line: only an owner input over the unshared ceiling can
         for name, extra in (*CUDA_VARIANTS, ("cpu", ["-Backend", "cpu"])):
             with self.subTest(name):
                 job, out = self.generate(GENERATOR, f"confined-{name}.job.ps1", extra)
                 self.assertNotIn(CLAMP_TRACE, job)
                 self.assertNotIn(CLAMP_WARNING, out)
 
-    def test_mutation_clamp_lines_outside_the_cpu_informational_path_are_caught(self) -> None:
+    def test_mutation_clamp_lines_inside_the_cpu_informational_path_only_are_caught(self) -> None:
         text = lf(GENERATOR.read_text(encoding="utf-8"))
         mutants = {
-            "request outside the cpu block": self.replaced_once(text, CLAMP_REQUEST + "\n}", "}\n" + CLAMP_REQUEST),
+            "request inside the cpu block": confine_request_to_cpu_block(text),
             "request duplicated": self.replaced_once(text, CLAMP_REQUEST, CLAMP_REQUEST + "\n    " + CLAMP_REQUEST),
             "warning unguarded": self.replaced_once(text, "if ($timeBudget.smokeCeilingClamped) {\n    Write-Warning", "if ($true) {\n    Write-Warning"),
         }

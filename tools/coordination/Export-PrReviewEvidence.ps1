@@ -44,10 +44,16 @@ Set-StrictMode -Version Latest
 # HARDCODED, NOT A PARAMETER (sol round-1 review, MAJOR 3). A -Repo parameter is a caller-
 # overridable pin, which is no pin at all - any caller (including a future dispatcher call
 # site) could point this exporter at a different repository and every downstream "-R
-# layibabalola/MLV-App on every call" guarantee would still hold locally while being wrong
+# SuperDimensionalSpaceFortress/MLV-App on every call" guarantee would still hold locally while being wrong
 # globally. Removing the parameter, rather than merely validating it, means there is no argv
 # path that can ever carry a different value in.
-$Repo = 'layibabalola/MLV-App'
+$Repo = 'SuperDimensionalSpaceFortress/MLV-App'
+# The slug is the DISPLAY name; the pin is the immutable repository id (ORG-MOVE-TRACKED-SLUG-RESIDUE-1).
+# A slug can be re-created by another account after a rename or transfer, and the old name's redirect
+# then ends - an id never moves. The id is checked against the API before anything is exported, and
+# a different id (or an unreadable one) refuses closed. repo-slug.ps1 carries the same slug; a test
+# keeps the two equal.
+$RepoId = 1169162800
 
 function Write-Utf8NoBom([string]$Path, [string]$Content) {
     [System.IO.File]::WriteAllText($Path, $Content, [System.Text.UTF8Encoding]::new($false))
@@ -78,6 +84,18 @@ if (-not (Test-Path -LiteralPath $RunDir)) { New-Item -ItemType Directory -Path 
 $fetchOutput = & git -C $RepoRoot fetch fork --quiet 2>&1
 if ($LASTEXITCODE -ne 0) {
     Write-Output "REFUSED: git-fetch-failed pr=$PrNumber exit=$LASTEXITCODE detail=$($fetchOutput -join ' ')"
+    exit 3
+}
+
+# THE IMMUTABLE ID IS CHECKED AFTER THE FETCH (a failed fetch still means gh is never called) and BEFORE
+# the first PR read, so nothing is exported for a repository that is not the pinned one.
+$repoIdOut = (@(& $GhExe api "repos/$Repo" --jq '.id' 2>$null) -join '').Trim()
+if ($LASTEXITCODE -ne 0 -or -not $repoIdOut) {
+    Write-Output "REFUSED: repo-id-unreadable repo=$Repo pr=$PrNumber exit=$LASTEXITCODE"
+    exit 3
+}
+if ($repoIdOut -ne [string]$RepoId) {
+    Write-Output "REFUSED: repo-id-mismatch repo=$Repo expected=$RepoId actual=$repoIdOut pr=$PrNumber"
     exit 3
 }
 

@@ -119,6 +119,24 @@ class BachelorAgentHeavySlotGatePins(unittest.TestCase):
         # Deploy-AgentSwap.ps1's default -ExpectGate.
         self.assertIn("heavy-slot-gate-1", m.group(1))
         self.assertIn("wait-release r1c", m.group(1))
+        self.assertIn("maint-dispatch r1", m.group(1))
+
+    def test_exempt_jobs_run_during_a_gate_wait(self) -> None:
+        # GATE-MAINT-DISPATCH-DURING-WAIT-1: a job waiting on the gate has no cap, and the inbox loop is blocked
+        # inside it, so the light jobs behind it (probes, dve health, agent-swap) are run from inside the wait.
+        wait = self.code[self.code.index("function Wait-HeavySlotAdmission"):]
+        wait = wait[:wait.index("\n}\n")]
+        self.assertIn("$null = Invoke-ExemptJobsDuringWait -WaitingJobId $JobId", wait)
+        helper = self.code[self.code.index("function Invoke-ExemptJobsDuringWait"):]
+        helper = helper[:helper.index("\n}\n")]
+        self.assertIn("$eid -eq $WaitingJobId", helper)
+        self.assertIn("-notmatch $GateExemptJobPattern", helper)
+        self.assertIn("$null = Invoke-QueuedJob -Job $ej", helper)
+        # The waiting job's holder is the wait's local: the helper must never release a slot.
+        self.assertNotIn("Exit-HeavySlot", helper)
+        # The inbox loop's listing is stale after a wait: a job already run inline must not run again.
+        loop = self.code[self.code.index("Invoke-QueuedJob -Job $job") - 1500:self.code.index("Invoke-QueuedJob -Job $job")]
+        self.assertIn("if (-not (Test-Path -LiteralPath $job.FullName -PathType Leaf)) { continue }", loop)
 
     def test_heartbeat_keeps_the_um_run_gate_wait_shape(self) -> None:
         # tools/profiling/um-run.ps1 parses "gate-wait job=<id> state=<\S*> waited=<n>s".
@@ -144,6 +162,10 @@ class BachelorAgentHeavySlotGateUnit(unittest.TestCase):
         self.assertEqual(unit["holderLost"]["ownerMismatch"], "holder-lost")
         self.assertEqual(unit["holderLost"]["preLaunch"]["exitDuringProbe"], "holder-lost")
         self.assertEqual(unit["holderLost"]["preLaunch"]["ownerMismatch"], "holder-lost")
+        # GATE-MAINT-DISPATCH-DURING-WAIT-1: light jobs run from inside a gate-wait, and the wait still returns one record.
+        self.assertEqual(unit["maintDispatch"]["dispatched"], ["agent-swap-U1", "venue-quiet-probe-U2"])
+        self.assertTrue(unit["maintDispatch"]["singleObject"])
+        self.assertEqual(unit["maintDispatch"]["label"], "queue-expired")
 
 
 if __name__ == "__main__":

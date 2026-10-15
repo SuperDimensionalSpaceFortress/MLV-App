@@ -34,6 +34,7 @@
 #include "PlaybackFrameRange.h"
 #include "PlaybackNativePaceGuard.h"
 #include "PlaybackPresentTrace.h"
+#include "PlaybackScopesDuringPlayback.h"
 #include "PlaybackSlipHistogram.h"
 #include "../../src/mlv_include.h"
 #include "InfoDialog.h"
@@ -175,6 +176,13 @@ public:
         // paired seek capture of the same N targets here, after the measured Play has stopped
         // (it never plays; its sidecars record playback_path=false).
         QString contactSheetSeekDir;
+        // --visual-capture-dir: opt-in, default empty (off: nothing runs and nothing is logged).
+        // PLAYBACK-VISUAL-INSPECTION-1: AFTER the measured Play's own stop condition, its telemetry
+        // session is closed (the playback_smoke summary is written first), Play keeps running UNTIMED
+        // for a short tail and the WINDOW is captured with PrintWindow(PW_RENDERFULLCONTENT): play
+        // frames across the tail, the frame on screen the instant Play is paused, and the same frame
+        // re-rendered by the paused full-quality path. PNGs + visual.json land in this directory.
+        QString visualCaptureDir;
         PlaybackProfileScope scope = PlaybackProfileScope::None;
         PlaybackProfileDebayerRequest playbackDebayer =
             PlaybackProfileDebayerRequest::Auto;
@@ -399,6 +407,9 @@ private slots:
     void on_actionPlaybackPreviewResQuarter_triggered();
     void on_actionPlaybackShowQualityIndicator_triggered();
     void on_actionPlaybackVSync_triggered();
+    void on_actionPlaybackScopesHide_triggered();
+    void on_actionPlaybackScopesThrottled_triggered();
+    void on_actionPlaybackScopesLive_triggered();
     void on_actionPlaybackAutoTarget24_triggered();
     void on_actionPlaybackAutoTarget30_triggered();
     void on_actionPlaybackAutoTarget60_triggered();
@@ -836,6 +847,7 @@ private:
     QActionGroup *m_playbackPreviewModeGroup = nullptr;   // Phase 4E
     QActionGroup *m_playbackPreviewResolutionGroup = nullptr; // Round-3 item 1
     QActionGroup *m_playbackAutoTargetFpsGroup = nullptr; // Phase 4E
+    QActionGroup *m_playbackScopesModeGroup = nullptr;    // PLAYBACK-SCOPES-OPTION-1
     QActionGroup *m_playbackScaleFactorGroup = nullptr;   // Phase 4E
     DoubleClickLabel *m_pTcLabel;
     bool m_tcModeDuration;
@@ -1051,6 +1063,9 @@ private:
     double m_playbackTimelineSourceFrameReadyEmitStageTime = 0.0;
     double m_playbackTimelineSourceDrawBeginStageTime = 0.0;
     double m_playbackScopeLastUpdateTime = 0.0;
+    // PLAYBACK-SCOPES-OPTION-1: the "Scopes During Playback" mode in effect, cached so the per-frame
+    // policy reads never touch the settings store (refreshed at start and on every menu change).
+    PlaybackScopesMode m_playbackScopesMode = PlaybackScopesSettings::kDefaultMode();
     uint64_t m_playbackScopeUpdateCount = 0;
     uint64_t m_playbackScopeSkipCount = 0;
     uint64_t m_playbackAudioSyncRequestCount = 0;
@@ -1768,6 +1783,8 @@ private:
     int  gpuReducedReconHonouredSessionScale( void ) const;
     int  playbackScaleFactorPolicyDecision( void ) const;
     bool gpuPlaybackReconTextureRouteEligibleAtScaleOne( void ) const;
+    bool scopeDisplayConsumesPresentedPixels( bool editAreaVisible ) const;
+    void applyPlaybackScopesMode( PlaybackScopesMode mode, bool persist );
     MainWindowGpuPreviewPolicyState gpuPreviewPolicyForCurrentScopeState(
         bool includeVisibleScopes ) const;
     bool visibleScopesBlockGpuTexturePlayback( void ) const;

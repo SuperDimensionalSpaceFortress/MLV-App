@@ -2090,7 +2090,7 @@ class AppPlayGateStaticClassTests(unittest.TestCase):
         restart = "playbackClock.restart();"
         problems = scan_app_play_sources(
             self._mutated(restart, restart + "\n    ui->actionPlay->setChecked( false );"))
-        self.assertTrue(any("MainWindow::runGuiPlaybackSmoke" in p and "(2, 0, 2)" in p for p in problems), problems)
+        self.assertTrue(any("MainWindow::runGuiPlaybackSmoke" in p and "(3, 0, 2)" in p for p in problems), problems)
 
     def test_enforce3_the_reviewed_stop_table_covers_every_stop_in_the_real_sources(self) -> None:
         from tools.repo_hygiene.app_play_scan import REVIEWED_PLAY_STOPS

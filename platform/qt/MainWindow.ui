@@ -219,6 +219,14 @@
       <addaction name="actionPlaybackAutoTarget30"/>
       <addaction name="actionPlaybackAutoTarget60"/>
      </widget>
+     <widget class="QMenu" name="menuPlaybackScopesDuringPlayback">
+      <property name="title">
+       <string>Scopes During Playback</string>
+      </property>
+      <addaction name="actionPlaybackScopesHide"/>
+      <addaction name="actionPlaybackScopesThrottled"/>
+      <addaction name="actionPlaybackScopesLive"/>
+     </widget>
      <widget class="QMenu" name="menuPlaybackScaleFactor">
       <property name="title">
        <string>Scale Factor</string>
@@ -253,6 +261,7 @@
      <addaction name="separator"/>
      <addaction name="actionPlaybackShowQualityIndicator"/>
      <addaction name="actionPlaybackVSync"/>
+     <addaction name="menuPlaybackScopesDuringPlayback"/>
      <addaction name="menuPlaybackPreviewMode"/>
      <addaction name="menuPlaybackPreviewResolution"/>
      <addaction name="menuPlaybackScaleFactor"/>
@@ -11335,6 +11344,39 @@ QGroupBox::indicator:checked:disabled {
    </property>
    <property name="toolTip">
     <string>Wait for the display's refresh before showing each playback frame, so the picture does not tear. Takes effect the next time MLV App starts.</string>
+   </property>
+  </action>
+  <action name="actionPlaybackScopesHide">
+   <property name="checkable">
+    <bool>true</bool>
+   </property>
+   <property name="text">
+    <string>Hide While Playing</string>
+   </property>
+   <property name="toolTip">
+    <string>Scopes keep the last paused frame while playback runs, so the fastest GPU playback path stays available. They update again when playback stops.</string>
+   </property>
+  </action>
+  <action name="actionPlaybackScopesThrottled">
+   <property name="checkable">
+    <bool>true</bool>
+   </property>
+   <property name="text">
+    <string>Throttled</string>
+   </property>
+   <property name="toolTip">
+    <string>Scopes update a few times a second while playback runs. A visible scope still turns off the fastest GPU playback path.</string>
+   </property>
+  </action>
+  <action name="actionPlaybackScopesLive">
+   <property name="checkable">
+    <bool>true</bool>
+   </property>
+   <property name="text">
+    <string>Live (every frame)</string>
+   </property>
+   <property name="toolTip">
+    <string>Scopes update on every played frame, like upstream MLV App. This costs the most playback speed.</string>
    </property>
   </action>
   <action name="actionPlaybackAutoTarget24">

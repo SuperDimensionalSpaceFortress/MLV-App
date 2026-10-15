@@ -1520,6 +1520,7 @@ static bool lookAssistProcessedFloorLiftedPostInvalidShouldFailClosed(
 #include "GpuDebayer.h"
 #include "GpuDisplayViewport.h"
 #include "GpuDisplayWindow.h"
+#include "GpuFieldTelemetry.h"
 #include "MainWindowGpuPreviewPolicy.h"
 #include "PlaybackQualityPolicy.h"
 #include "PlaybackScaling.h"
@@ -1659,6 +1660,103 @@ static bool setPlaybackDisplayRequiredExecutionState( bool required )
 #else
     Q_UNUSED( required );
     return true;
+#endif
+}
+
+/* PLAYBACK-VISUAL-INSPECTION-1: captures the WHOLE top-level window the way the owner sees it --
+ * PrintWindow( hwnd, dc, PW_RENDERFULLCONTENT ), which asks the compositor for the window's own
+ * content (GL child windows included), so overlapping windows never leak in and nothing is read
+ * back from the app's render path (the measured trap: an in-app readback can look right while
+ * the display is wrong). Also returns where the video viewport sits inside the captured image, in
+ * captured (physical) pixels, so a reader can hash the picture without the timecode/fps chrome.
+ * Only ever called by --visual-capture-dir, after the measured interval has closed. */
+static QImage captureTopLevelWindowByPrintWindow( QWidget *topLevel,
+                                                  QWidget *viewportWidget,
+                                                  QRect *viewportRectOut,
+                                                  QString *reasonOut )
+{
+    if( viewportRectOut ) *viewportRectOut = QRect();
+#ifdef Q_OS_WIN
+    if( !topLevel )
+    {
+        if( reasonOut ) *reasonOut = QStringLiteral( "no_window" );
+        return QImage();
+    }
+    const HWND hwnd = reinterpret_cast<HWND>( topLevel->window()->winId() );
+    RECT windowRect;
+    if( hwnd == nullptr || !GetWindowRect( hwnd, &windowRect ) )
+    {
+        if( reasonOut ) *reasonOut = QStringLiteral( "get_window_rect_failed" );
+        return QImage();
+    }
+    const int width = windowRect.right - windowRect.left;
+    const int height = windowRect.bottom - windowRect.top;
+    if( width <= 0 || height <= 0 )
+    {
+        if( reasonOut ) *reasonOut = QStringLiteral( "empty_window_rect" );
+        return QImage();
+    }
+    POINT clientOrigin = { 0, 0 };
+    ClientToScreen( hwnd, &clientOrigin );
+
+    HDC screenDc = GetDC( nullptr );
+    HDC memoryDc = CreateCompatibleDC( screenDc );
+    BITMAPINFO bitmapInfo;
+    ZeroMemory( &bitmapInfo, sizeof( bitmapInfo ) );
+    bitmapInfo.bmiHeader.biSize = sizeof( BITMAPINFOHEADER );
+    bitmapInfo.bmiHeader.biWidth = width;
+    bitmapInfo.bmiHeader.biHeight = -height;   // top-down rows
+    bitmapInfo.bmiHeader.biPlanes = 1;
+    bitmapInfo.bmiHeader.biBitCount = 32;
+    bitmapInfo.bmiHeader.biCompression = BI_RGB;
+    void *bits = nullptr;
+    HBITMAP dib = CreateDIBSection( screenDc, &bitmapInfo, DIB_RGB_COLORS, &bits, nullptr, 0 );
+    QImage image;
+    if( memoryDc && dib && bits )
+    {
+        const HGDIOBJ previous = SelectObject( memoryDc, dib );
+#ifndef PW_RENDERFULLCONTENT
+#define PW_RENDERFULLCONTENT 0x00000002
+#endif
+        const BOOL printed = PrintWindow( hwnd, memoryDc, PW_RENDERFULLCONTENT );
+        GdiFlush();
+        if( printed )
+        {
+            // 32 bpp rows are always DWORD aligned: the stride is width * 4.
+            image = QImage( static_cast<const uchar *>( bits ), width, height, width * 4,
+                            QImage::Format_RGB32 ).copy();
+        }
+        else if( reasonOut )
+        {
+            *reasonOut = QStringLiteral( "print_window_failed error=%1" ).arg( static_cast<qulonglong>( GetLastError() ) );
+        }
+        SelectObject( memoryDc, previous );
+    }
+    else if( reasonOut )
+    {
+        *reasonOut = QStringLiteral( "dib_section_failed" );
+    }
+    if( dib ) DeleteObject( dib );
+    if( memoryDc ) DeleteDC( memoryDc );
+    if( screenDc ) ReleaseDC( nullptr, screenDc );
+
+    if( !image.isNull() && viewportWidget )
+    {
+        const qreal dpr = topLevel->window()->devicePixelRatioF();
+        const QPoint offset = viewportWidget->mapTo( topLevel->window(), QPoint( 0, 0 ) );
+        const QRect viewport(
+            ( clientOrigin.x - windowRect.left ) + qRound( offset.x() * dpr ),
+            ( clientOrigin.y - windowRect.top ) + qRound( offset.y() * dpr ),
+            qRound( viewportWidget->width() * dpr ),
+            qRound( viewportWidget->height() * dpr ) );
+        if( viewportRectOut ) *viewportRectOut = viewport.intersected( image.rect() );
+    }
+    return image;
+#else
+    Q_UNUSED( topLevel );
+    Q_UNUSED( viewportWidget );
+    if( reasonOut ) *reasonOut = QStringLiteral( "print_window_unavailable_on_this_platform" );
+    return QImage();
 #endif
 }
 
@@ -5716,7 +5814,7 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
             && ( texturePresentHandoffMode == QStringLiteral("direct_device_bayer16")
               || texturePresentHandoffMode == QStringLiteral("retained_device_bayer16") );
         const bool scopeDisplayNeedsPresentedPixels =
-            ui->actionShowEditArea->isChecked()
+            scopeDisplayConsumesPresentedPixels( ui->actionShowEditArea->isChecked() )
             && ( ui->actionShowHistogram->isChecked()
               || ui->actionShowWaveFormMonitor->isChecked()
               || ui->actionShowParade->isChecked()
@@ -6321,7 +6419,8 @@ void MainWindow::drawFrame( bool updateTimecodeLabel )
         m_pMlvObject
         && doesMlvAlwaysUseAmaze( m_pMlvObject ) != 0
         && !ui->actionCaching->isChecked();
-    const bool scopeDisplayVisible = ui->dockWidgetEdit->isVisible();
+    const bool scopeDisplayVisible =
+        scopeDisplayConsumesPresentedPixels( ui->dockWidgetEdit->isVisible() );
     renderPolicy.histogramEnabled = mainWindowScopeActionConsumesPresentedPixels(
         scopeDisplayVisible, ui->actionShowHistogram->isChecked() );
     renderPolicy.waveformEnabled = mainWindowScopeActionConsumesPresentedPixels(
@@ -8804,7 +8903,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
             "playback_processing_selected=%5 gpu_preview_processing_request=%6 "
             "gpu_bilinear_debayer_request=%7 gpu_amaze_debayer_request=%8 "
             "gpu_amaze_texture_present_environment=%9 playback_policy_active=%10 "
-            "drop_frame_forced=%11 drop_frame=%12" )
+            "drop_frame_forced=%11 drop_frame=%12 scopes_during_playback=%13" )
             .arg( bool01( options.forcePlaybackDebayer ) )
             .arg( QString::fromLatin1(
                       playback_profile_debayer_request_name(
@@ -8826,7 +8925,10 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
             .arg( bool01( gpuAmazeTexturePresentRequestedByEnvironment() ) )
             .arg( bool01( m_headlessPlaybackProfileUsePlaybackPolicy ) )
             .arg( bool01( options.forceDropFrame ) )
-            .arg( bool01( ui->actionDropFrameMode->isChecked() ) ) );
+            .arg( bool01( ui->actionDropFrameMode->isChecked() ) )
+            // PLAYBACK-SCOPES-OPTION-1: which "Scopes During Playback" mode the run played under, so a
+            // --scope leg's evidence says whether its scope was computed while playing (Hide: it was not).
+            .arg( QString::fromLatin1( playbackScopesModeToken( m_playbackScopesMode ) ) ) );
 
     const int totalFrames = getMlvFrames( m_pMlvObject );
     if( totalFrames < 2 )
@@ -10025,6 +10127,208 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                 .arg( bool01( glWindowPresentedSerialValid ) ) );
     }
 
+    // PLAYBACK-VISUAL-INSPECTION-1 (--visual-capture-dir, default off): every venue playback leg leaves
+    // window captures a reviewer can LOOK at. Measured traps it is built around: a capture DURING a timed
+    // window roughly doubles render cost, and every cadence metric can read perfect while the display is
+    // frozen. So: (1) the measured session is CLOSED first -- finishPlaybackSmokeTelemetry() writes the
+    // playback_smoke summary/gate lines exactly as the stop below would, and every oracle number is read
+    // there -- while Play keeps running (this is the SAME admitted Play continuing, never a new Play: no
+    // programmatic play, no restart, no replay); (2) the window is captured with PrintWindow across an
+    // UNTIMED tail, then the instant Play is paused, then after the paused full-quality path re-renders
+    // that same frame; (3) every PNG encode and file write waits until the Play has stopped. A capture
+    // failure is recorded in visual.json and never changes this run's exit code: the measured numbers are
+    // already written and are not the capture's to judge.
+    if( !options.visualCaptureDir.isEmpty() && ui->actionPlay->isChecked() )
+    {
+        const int visualPlayFrames = 6;
+        const int visualTailMs = 3000;
+        const int visualMaxSavedWidth = 1920;
+        struct VisualGrab
+        {
+            QString kind;
+            int index = 0;
+            QImage image;
+            QRect viewport;
+            QString reason;
+            QString capturedUtc;
+            qint64 tailElapsedMs = 0;
+            int displayFrame = -1;
+            qulonglong serial = 0;
+            bool playActive = false;
+            bool settled = false;
+            double captureMs = 0.0;
+        };
+        QVector<VisualGrab> visualGrabs;
+        QWidget *visualGlContainer = findChild<QWidget *>( QStringLiteral("gpuDisplayWindowContainer") );
+        const bool visualUseGlContainer =
+            GpuDisplayWindow::isActive() && visualGlContainer && visualGlContainer->isVisible();
+        QWidget *visualViewportWidget = visualUseGlContainer
+            ? visualGlContainer
+            : ( ui->graphicsView ? ui->graphicsView->viewport() : nullptr );
+        QElapsedTimer visualTailClock;
+        auto grabVisual = [&]( const QString &kind, int index, bool settled )
+        {
+            VisualGrab grab;
+            grab.kind = kind;
+            grab.index = index;
+            grab.tailElapsedMs = visualTailClock.elapsed();
+            grab.displayFrame = m_lastPresentedRequestContextValid
+                ? static_cast<int>( m_lastPresentedRequestContext.frameNumber ) : -1;
+            grab.serial = static_cast<qulonglong>( m_lastPresentedRequestSerial );
+            grab.playActive = ui->actionPlay->isChecked();
+            grab.settled = settled;
+            QElapsedTimer captureClock;
+            captureClock.start();
+            grab.image = captureTopLevelWindowByPrintWindow( this, visualViewportWidget, &grab.viewport, &grab.reason );
+            grab.captureMs = static_cast<double>( captureClock.nsecsElapsed() ) / 1.0e6;
+            grab.capturedUtc = QDateTime::currentDateTimeUtc().toString( Qt::ISODateWithMs );
+            visualGrabs.append( grab );
+        };
+
+        // (1) the measured interval ends HERE, before the first capture.
+        m_contactSheetCaptureActive = false;   // no in-pass contact-sheet grab can land in the tail
+        const qulonglong visualMeasuredSession = static_cast<qulonglong>( m_playbackSmokeSessionId );
+        finishPlaybackSmokeTelemetry( "visual-capture" );
+        const QString visualTailBeginUtc = QDateTime::currentDateTimeUtc().toString( Qt::ISODateWithMs );
+        logInteractionEvent(
+            QStringLiteral("gui_smoke.visual_capture.begin"),
+            QStringLiteral("measured_session=%1 tail_ms=%2 play_frames=%3 tail_begin_utc=%4")
+                .arg( visualMeasuredSession ).arg( visualTailMs ).arg( visualPlayFrames ).arg( visualTailBeginUtc ) );
+        visualTailClock.start();
+
+        // (2) K play frames, evenly spaced across the untimed tail (the centres of K equal slices).
+        for( int k = 0; k < visualPlayFrames; ++k )
+        {
+            const qint64 targetMs = static_cast<qint64>( ( 2 * k + 1 ) * visualTailMs / ( 2 * visualPlayFrames ) );
+            while( visualTailClock.elapsed() < targetMs )
+            {
+                qApp->processEvents( QEventLoop::AllEvents );
+                QThread::msleep( 2 );
+            }
+            grabVisual( QStringLiteral("play"), k, false );
+        }
+        // The frame on screen the instant Play is paused: captured BEFORE any event is processed, so it
+        // is still the frame the playback path presented (the paused re-render has not landed yet).
+        ui->actionPlay->setChecked( false );
+        grabVisual( QStringLiteral("stop"), 0, false );
+        const QString visualTailEndUtc = QDateTime::currentDateTimeUtc().toString( Qt::ISODateWithMs );
+        const int visualStopFrame = visualGrabs.last().displayFrame;
+        qApp->processEvents( QEventLoop::AllEvents );
+        for( int attempt = 0; attempt < 400 && m_pRenderThread && !m_pRenderThread->isIdle(); ++attempt )
+        {
+            qApp->processEvents( QEventLoop::AllEvents );
+            QThread::msleep( 5 );
+        }
+        // (3) the SAME timeline position through the paused full-quality path.
+        int visualSettledFrame = visualStopFrame;
+        const bool visualSettled = visualStopFrame >= 0
+            && seekAndSettleLoadedClip( visualStopFrame, "gui-smoke-visual-capture-paused", &visualSettledFrame, 20000 );
+        for( int i = 0; i < 10; ++i )
+        {
+            // let the display window present the settled frame before it is captured
+            qApp->processEvents( QEventLoop::AllEvents );
+            QThread::msleep( 10 );
+        }
+        grabVisual( QStringLiteral("paused"), 0, visualSettled );
+
+        // (4) files: Play is stopped, so no encode or write below can touch a played frame.
+        QString visualError;
+        int visualFramesWritten = 0;
+        QJsonArray visualFramesJson;
+        if( !QDir().mkpath( options.visualCaptureDir ) )
+        {
+            visualError = QStringLiteral( "visual capture directory could not be created" );
+        }
+        const QDir visualDir( options.visualCaptureDir );
+        for( const VisualGrab &grab : visualGrabs )
+        {
+            const QString fileName = grab.kind == QStringLiteral("play")
+                ? QStringLiteral("play-%1.png").arg( grab.index )
+                : grab.kind + QStringLiteral(".png");
+            QJsonObject frameJson;
+            frameJson.insert( QStringLiteral("kind"), grab.kind );
+            frameJson.insert( QStringLiteral("index"), grab.index );
+            frameJson.insert( QStringLiteral("file"), fileName );
+            frameJson.insert( QStringLiteral("captured_utc"), grab.capturedUtc );
+            frameJson.insert( QStringLiteral("tail_elapsed_ms"), static_cast<double>( grab.tailElapsedMs ) );
+            frameJson.insert( QStringLiteral("display_frame"), grab.displayFrame );
+            frameJson.insert( QStringLiteral("serial"), static_cast<double>( grab.serial ) );
+            frameJson.insert( QStringLiteral("play_active"), grab.playActive );
+            frameJson.insert( QStringLiteral("capture_ms"), grab.captureMs );
+            if( grab.kind == QStringLiteral("paused") )
+            {
+                frameJson.insert( QStringLiteral("settled"), grab.settled );
+                frameJson.insert( QStringLiteral("settled_frame"), visualSettledFrame );
+            }
+            bool saved = false;
+            if( !grab.image.isNull() && visualError.isEmpty() )
+            {
+                // Saved at most visualMaxSavedWidth wide (a reviewer's view, not a measurement); the
+                // viewport rectangle is scaled with it, so it always names the saved image's pixels.
+                QImage savedImage = grab.image;
+                QRect savedViewport = grab.viewport;
+                if( savedImage.width() > visualMaxSavedWidth )
+                {
+                    const double factor = static_cast<double>( visualMaxSavedWidth ) / savedImage.width();
+                    savedImage = grab.image.scaled( visualMaxSavedWidth, qMax( 1, qRound( grab.image.height() * factor ) ),
+                                                    Qt::IgnoreAspectRatio, Qt::SmoothTransformation );
+                    savedViewport = QRect( qRound( grab.viewport.x() * factor ), qRound( grab.viewport.y() * factor ),
+                                           qRound( grab.viewport.width() * factor ), qRound( grab.viewport.height() * factor ) )
+                                        .intersected( savedImage.rect() );
+                }
+                saved = savedImage.save( visualDir.absoluteFilePath( fileName ), "PNG" );
+                frameJson.insert( QStringLiteral("captured_width"), grab.image.width() );
+                frameJson.insert( QStringLiteral("captured_height"), grab.image.height() );
+                frameJson.insert( QStringLiteral("width"), savedImage.width() );
+                frameJson.insert( QStringLiteral("height"), savedImage.height() );
+                QJsonObject viewportJson;
+                viewportJson.insert( QStringLiteral("x"), savedViewport.x() );
+                viewportJson.insert( QStringLiteral("y"), savedViewport.y() );
+                viewportJson.insert( QStringLiteral("w"), savedViewport.width() );
+                viewportJson.insert( QStringLiteral("h"), savedViewport.height() );
+                frameJson.insert( QStringLiteral("viewport"), viewportJson );
+                if( saved ) ++visualFramesWritten;
+                else if( visualError.isEmpty() ) visualError = QStringLiteral( "%1 could not be written" ).arg( fileName );
+            }
+            frameJson.insert( QStringLiteral("saved"), saved );
+            frameJson.insert( QStringLiteral("reason"), grab.reason );
+            visualFramesJson.append( frameJson );
+        }
+        QJsonObject visualJson;
+        visualJson.insert( QStringLiteral("schema"), QStringLiteral("mlv-app/visual-capture/v1") );
+        visualJson.insert( QStringLiteral("method"), QStringLiteral("PrintWindow(PW_RENDERFULLCONTENT)") );
+        visualJson.insert( QStringLiteral("measured_session"), static_cast<double>( visualMeasuredSession ) );
+        visualJson.insert( QStringLiteral("tail_ms"), visualTailMs );
+        visualJson.insert( QStringLiteral("play_frames_requested"), visualPlayFrames );
+        visualJson.insert( QStringLiteral("tail_begin_utc"), visualTailBeginUtc );
+        visualJson.insert( QStringLiteral("tail_end_utc"), visualTailEndUtc );
+        visualJson.insert( QStringLiteral("viewport_source"), visualUseGlContainer
+            ? QStringLiteral("gpu_display_window_container") : QStringLiteral("graphics_view_viewport") );
+        visualJson.insert( QStringLiteral("frames"), visualFramesJson );
+        visualJson.insert( QStringLiteral("frames_written"), visualFramesWritten );
+        visualJson.insert( QStringLiteral("error"), visualError );
+        if( QDir( options.visualCaptureDir ).exists() )
+        {
+            QFile visualJsonFile( visualDir.absoluteFilePath( QStringLiteral("visual.json") ) );
+            if( visualJsonFile.open( QIODevice::WriteOnly | QIODevice::Truncate ) )
+            {
+                visualJsonFile.write( QJsonDocument( visualJson ).toJson( QJsonDocument::Indented ) );
+                visualJsonFile.close();
+            }
+        }
+        logInteractionEvent(
+            QStringLiteral("gui_smoke.visual_capture"),
+            QStringLiteral("measured_session=%1 requested=%2 written=%3 stop_frame=%4 paused_settled=%5 tail_begin_utc=%6 tail_end_utc=%7 error=\"%8\"")
+                .arg( visualMeasuredSession )
+                .arg( visualGrabs.size() )
+                .arg( visualFramesWritten )
+                .arg( visualStopFrame )
+                .arg( bool01( visualSettled ) )
+                .arg( visualTailBeginUtc )
+                .arg( visualTailEndUtc )
+                .arg( visualError ) );
+    }
+
     if( ui->actionPlay->isChecked() )
     {
         ui->actionPlay->setChecked( false );
@@ -10741,6 +11045,8 @@ int MainWindow::openMlv( QString fileName )
         dualIso = QString( "Dual ISO" );
         dualIsoInfo = QString( "%1, %2" ).arg( isoInfo ).arg( dualIso );
     }
+    // GPU-FIELD-TELEMETRY-1: clip identity for the field log (cold; only the basename's hash is kept).
+    if ( GpuFieldTelemetry::enabled() ) GpuFieldTelemetry::noteClip( (int)getMlvWidth( m_pMlvObject ), (int)getMlvHeight( m_pMlvObject ), (int)getMlvBitdepth( m_pMlvObject ), isMlvCompressed( m_pMlvObject ) != 0, llrpGetDualIsoValidity( m_pMlvObject ) == DISO_VALID && qEnvironmentVariableIntValue( "MLVAPP_GPU_PLAYBACK_RECON" ) != 0, QFileInfo( fileName ).fileName() );
 
     QString audioText;
     if( doesMlvHaveAudio( m_pMlvObject ) )
@@ -11427,6 +11733,12 @@ void MainWindow::initGui( void )
     m_playbackAutoTargetFpsGroup->addAction( ui->actionPlaybackAutoTarget30 );
     m_playbackAutoTargetFpsGroup->addAction( ui->actionPlaybackAutoTarget60 );
 
+    m_playbackScopesModeGroup = new QActionGroup( this );
+    m_playbackScopesModeGroup->setExclusive( true );
+    m_playbackScopesModeGroup->addAction( ui->actionPlaybackScopesHide );
+    m_playbackScopesModeGroup->addAction( ui->actionPlaybackScopesThrottled );
+    m_playbackScopesModeGroup->addAction( ui->actionPlaybackScopesLive );
+
     //Keyboard shortcut Q cycles Smoothness -> Quality -> Auto -> Smoothness.
     QShortcut * pQualityCycle = new QShortcut( QKeySequence( Qt::Key_Q ), this );
     pQualityCycle->setContext( Qt::ApplicationShortcut );
@@ -11640,6 +11952,12 @@ void MainWindow::initGui( void )
         m_pPlaybackQualityToolButtonMenu->addMenu( pScaleFactorSub );
         m_pPlaybackQualityToolButtonMenu->addAction( ui->actionPlaybackShowQualityIndicator );
         m_pPlaybackQualityToolButtonMenu->addAction( ui->actionPlaybackVSync );
+        QMenu *pScopesSub = new QMenu( tr( "Scopes During Playback" ),
+                                       m_pPlaybackQualityToolButtonMenu );
+        pScopesSub->addAction( ui->actionPlaybackScopesHide );
+        pScopesSub->addAction( ui->actionPlaybackScopesThrottled );
+        pScopesSub->addAction( ui->actionPlaybackScopesLive );
+        m_pPlaybackQualityToolButtonMenu->addMenu( pScopesSub );
         QMenu *pAutoTargetSub = new QMenu( tr( "Auto Target FPS" ),
                                            m_pPlaybackQualityToolButtonMenu );
         pAutoTargetSub->addAction( ui->actionPlaybackAutoTarget24 );
@@ -18859,7 +19177,8 @@ bool MainWindow::shouldUseGpu16PreviewPath( void ) const
     policyState.gpuViewportInstalled = gpuPreviewSurfaceActive();
     policyState.gpuWidgetViewportInstalled =
         GpuDisplayViewport::isInstalledOn( ui->graphicsView );
-    const bool scopeDisplayVisible = ui->dockWidgetEdit->isVisible();
+    const bool scopeDisplayVisible =
+        scopeDisplayConsumesPresentedPixels( ui->dockWidgetEdit->isVisible() );
     policyState.histogramEnabled = mainWindowScopeActionConsumesPresentedPixels(
         scopeDisplayVisible, ui->actionShowHistogram->isChecked() );
     policyState.waveformEnabled = mainWindowScopeActionConsumesPresentedPixels(
@@ -18881,7 +19200,8 @@ bool MainWindow::shouldUseGpuPreviewProcessingPath( void ) const
     policyState.gpuPreviewProcessingEnvironmentRequested =
         gpuPreviewProcessingRequestedByEnvironment();
     policyState.gpuPreviewProcessingCompatible = gpuPreviewProcessingIsSupported( m_pProcessingObject );
-    const bool scopeDisplayVisible = ui->dockWidgetEdit->isVisible();
+    const bool scopeDisplayVisible =
+        scopeDisplayConsumesPresentedPixels( ui->dockWidgetEdit->isVisible() );
     policyState.histogramEnabled = mainWindowScopeActionConsumesPresentedPixels(
         scopeDisplayVisible, ui->actionShowHistogram->isChecked() );
     policyState.waveformEnabled = mainWindowScopeActionConsumesPresentedPixels(
@@ -18908,7 +19228,8 @@ bool MainWindow::shouldUseGpuBilinearDebayerPath( void ) const
         gpuBilinearDebayerRequestedByEnvironment();
     policyState.gpuBilinearDebayerCompatible =
         m_pMlvObject && doesMlvAlwaysUseAmaze( m_pMlvObject ) == 0;
-    const bool scopeDisplayVisible = ui->dockWidgetEdit->isVisible();
+    const bool scopeDisplayVisible =
+        scopeDisplayConsumesPresentedPixels( ui->dockWidgetEdit->isVisible() );
     policyState.histogramEnabled = mainWindowScopeActionConsumesPresentedPixels(
         scopeDisplayVisible, ui->actionShowHistogram->isChecked() );
     policyState.waveformEnabled = mainWindowScopeActionConsumesPresentedPixels(
@@ -18937,7 +19258,8 @@ bool MainWindow::shouldUseGpuAmazeDebayerPath( void ) const
         m_pMlvObject
         && doesMlvAlwaysUseAmaze( m_pMlvObject ) != 0
         && !ui->actionCaching->isChecked();
-    const bool scopeDisplayVisible = ui->dockWidgetEdit->isVisible();
+    const bool scopeDisplayVisible =
+        scopeDisplayConsumesPresentedPixels( ui->dockWidgetEdit->isVisible() );
     policyState.histogramEnabled = mainWindowScopeActionConsumesPresentedPixels(
         scopeDisplayVisible, ui->actionShowHistogram->isChecked() );
     policyState.waveformEnabled = mainWindowScopeActionConsumesPresentedPixels(
@@ -21087,6 +21409,7 @@ void MainWindow::initPlaybackQualityFromSettings( void )
         ui->actionPlaybackShowQualityIndicator->setChecked( indicatorVisible );
     if ( ui->actionPlaybackVSync )
         ui->actionPlaybackVSync->setChecked( playbackVSyncFromSettings() );
+    applyPlaybackScopesMode( playbackScopesMode(), /*persist*/false );
     updatePhase3PlaybackQualityUi();
 
     if ( envQualityMode >= 0 )
@@ -21979,7 +22302,8 @@ bool MainWindow::gpuPlaybackReconTextureRouteEligibleAtScaleOne( void ) const
      * be evaluated before the library is ready. */
     if( !m_gpuPlaybackReconPolicyLibraryReady ) return false;
 
-    const bool scopeDisplayVisible = ui->dockWidgetEdit->isVisible();
+    const bool scopeDisplayVisible =
+        scopeDisplayConsumesPresentedPixels( ui->dockWidgetEdit->isVisible() );
     const bool hasScopeVisualization =
         mainWindowScopeActionConsumesPresentedPixels(
             scopeDisplayVisible, ui->actionShowHistogram->isChecked() )
@@ -22245,6 +22569,45 @@ void MainWindow::on_actionPlaybackVSync_triggered()
     playbackVSyncWriteToSettings( ui->actionPlaybackVSync->isChecked() );
 }
 
+// PLAYBACK-SCOPES-OPTION-1: "Scopes During Playback". Applies at once (the next presented frame and
+// the next policy read) and persists; in an automation run MLVAPP_PLAYBACK_SCOPES_DURING_PLAYBACK still wins
+// at the next start (PSO-01: an ordinary launch ignores it).
+void MainWindow::on_actionPlaybackScopesHide_triggered()
+{
+    applyPlaybackScopesMode( PlaybackScopesMode::Hide, /*persist*/true );
+}
+
+void MainWindow::on_actionPlaybackScopesThrottled_triggered()
+{
+    applyPlaybackScopesMode( PlaybackScopesMode::Throttled, /*persist*/true );
+}
+
+void MainWindow::on_actionPlaybackScopesLive_triggered()
+{
+    applyPlaybackScopesMode( PlaybackScopesMode::Live, /*persist*/true );
+}
+
+void MainWindow::applyPlaybackScopesMode( PlaybackScopesMode mode, bool persist )
+{
+    if ( persist ) playbackScopesModeWriteToSettings( mode );
+    m_playbackScopesMode = mode;
+    if ( ui->actionPlaybackScopesHide )
+        ui->actionPlaybackScopesHide->setChecked( mode == PlaybackScopesMode::Hide );
+    if ( ui->actionPlaybackScopesThrottled )
+        ui->actionPlaybackScopesThrottled->setChecked( mode == PlaybackScopesMode::Throttled );
+    if ( ui->actionPlaybackScopesLive )
+        ui->actionPlaybackScopesLive->setChecked( mode == PlaybackScopesMode::Live );
+}
+
+// PLAYBACK-SCOPES-OPTION-1: every scope consumer (the GPU preview policy, the slot release and the
+// scope draw itself) asks here, so Hide turns scopes off DURING PLAYBACK ONLY: a paused or stopped
+// frame still draws its scope, and while playing the GPU fast paths stay eligible.
+bool MainWindow::scopeDisplayConsumesPresentedPixels( bool editAreaVisible ) const
+{
+    return playbackScopeDisplayConsumesPresentedPixels(
+        editAreaVisible, ui->actionPlay->isChecked(), m_playbackScopesMode );
+}
+
 void MainWindow::on_actionPlaybackAutoTarget24_triggered()
 {
     applyPlaybackAutoTargetFps( 24, /*persist*/true );
@@ -22302,7 +22665,8 @@ MainWindowGpuPreviewPolicyState MainWindow::gpuPreviewPolicyForCurrentScopeState
         playback_recon_texture_present_requested_by_environment();
 
     const bool scopeDisplayVisible =
-        includeVisibleScopes && ui->dockWidgetEdit->isVisible();
+        includeVisibleScopes
+        && scopeDisplayConsumesPresentedPixels( ui->dockWidgetEdit->isVisible() );
     policyState.histogramEnabled = mainWindowScopeActionConsumesPresentedPixels(
         scopeDisplayVisible, ui->actionShowHistogram->isChecked() );
     policyState.waveformEnabled = mainWindowScopeActionConsumesPresentedPixels(
@@ -29032,6 +29396,14 @@ void MainWindow::on_actionPlay_toggled(bool checked)
     }
     selectDebayerAlgorithm();
     applyEffectiveDualIsoPlaybackSettings();
+    // PLAYBACK-SCOPES-OPTION-1: Hide skipped scope work while playing, so redraw the stopped frame
+    // for its scope (the policy admits the scope again now that Play is off).
+    if( !checked
+     && m_playbackScopesMode == PlaybackScopesMode::Hide
+     && ui->actionShowEditArea->isChecked() )
+    {
+        requestFrameRefresh( false, "play-stop-scopes" );
+    }
     if( checked )
     {
         // PLAYBACK-CLIP-LENGTH-ENFORCE-2: every Play start after the first in this process is a restart,
@@ -30546,7 +30918,13 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
 
     const double scopeDispatchStart = mlv_stage_timing_now();
     m_lastDrawFrameReadyScopesMs = 0.0;
-    if( ui->actionShowEditArea->isChecked() )
+    // PLAYBACK-SCOPES-OPTION-1: in Hide mode no scope work runs while playing; the label keeps the
+    // last paused frame's scope until playback stops. PSO-02: a frame requested under a policy that
+    // admitted an RGB8-less route (no scope consumer then, e.g. Hide before a switch to Live) is not
+    // measured; the next frame, requested under the new policy, supplies the scope.
+    if( playbackScopeFrameFeedsScope(
+            scopeDisplayConsumesPresentedPixels( ui->actionShowEditArea->isChecked() ),
+            mainWindowAllowsGpu16PreviewRender( requestContext.gpuPreviewPolicy ) ) )
     {
         const double scopes_start = mlv_stage_timing_now();
         bool updateScopesNow = true;
@@ -30555,13 +30933,10 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
             const double renderTotalMs =
                 telemetryDoubleValue( readyFrame.stageTimingTelemetry,
                                       "render_thread_total_ms" );
-            const int baseIntervalMs = playbackScopeUpdateIntervalMs();
             const int intervalMs =
-                renderTotalMs > 0.0
-                    ? qBound( baseIntervalMs,
-                              qRound( renderTotalMs * 1.4 ),
-                              500 )
-                    : baseIntervalMs;
+                playbackScopeUpdateIntervalForMode( m_playbackScopesMode,
+                                                    playbackScopeUpdateIntervalMs(),
+                                                    renderTotalMs );
             updateScopesNow =
                 intervalMs <= 0
              || m_playbackScopeLastUpdateTime <= 0.0

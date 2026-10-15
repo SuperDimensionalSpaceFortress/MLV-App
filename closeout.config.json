@@ -1162,7 +1162,7 @@
     "enabled": true,
     "schema": "candidate-acceptance.v1",
     "stateRoot": ".claude-state/closeout/acceptance",
-    "providerRepository": "layibabalola/MLV-App",
+    "providerRepository": "SuperDimensionalSpaceFortress/MLV-App",
     "requiredSurfaces": [
       "content-self",
       "content-stranger-1",

@@ -223,6 +223,8 @@ $playSeconds = 25
 if ($null -ne $spec.PSObject.Properties['playSeconds']) { $playSeconds = [int]$spec.playSeconds }
 $lookFlavor = $null
 if ($isLook) { $lookFlavor = [string]$spec.look.lookFlavor; if ([string]::IsNullOrWhiteSpace($lookFlavor)) { $lookFlavor = 'classic' } }
+# PLAYBACK-VISUAL-INSPECTION-1: every SPEED leg keeps window captures unless its spec opts out (visualCapture false + a reason); a look leg never.
+$visualRequest = Get-DvVisualCaptureRequest -Spec $spec
 
 $role = $null
 if ($null -ne $table) { $role = Get-DvVenueRole -Table $table -Card ([string]$spec.card) -Venue $Venue }
@@ -239,6 +241,11 @@ $receipt.scale = $scale
 # DUAL-VENUE-DISPLAY-MATRIX-1: EVERY receipt says the display mode the leg asked for (the spec's optional displayMode; none = full screen); the mode the app ran in is UNKNOWN until a run log says (step 7).
 $display = Get-DvDisplayEvidence -Spec $spec -LogText $null
 $receipt.display = $display
+# PLAYBACK-VISUAL-INSPECTION-1: EVERY speed-leg receipt says whether captures were asked for; what they show is filled in once the job has published them (step 7).
+if ($visualRequest.applies) {
+    $receipt.visual = Read-DvVisualCaptures -Requested $visualRequest.requested -OptOutReason $visualRequest.optOutReason -ArtifactsDir '' -EvidenceDir '' -LegId ([string]$spec.legId)
+    if ($visualRequest.requested) { $receipt.visual.reason = 'the leg ended before the job published any capture' }
+}
 # What the leg is admitted ON: the committed consent-file and venue-table blob ids (production) -- recorded even for a refusal.
 $receipt.admission = [ordered]@{
     mode = $sources.mode
@@ -284,6 +291,8 @@ function Complete-Receipt([string]$Outcome, [string]$Detail) {
     # (the writer relabels an advisory production PASS/FAIL in outcomeDetail and stamps receipt.verification: say so here too)
     Write-Output "DVE_DETAIL=$($receipt.outcomeDetail)"
     if ($null -ne $receipt['verification']) { Write-Output "DVE_VERIFICATION=$($receipt['verification'].status)" }
+    # PLAYBACK-VISUAL-INSPECTION-1: the visual verdict and the strip a reviewer opens.
+    if ($null -ne $receipt['visual']) { Write-Output "DVE_VISUAL=$($receipt['visual'].verdict) STRIP=$(if ($receipt['visual'].stripCopyPath) { $receipt['visual'].stripCopyPath } elseif ($receipt['visual'].stripPath) { $receipt['visual'].stripPath } else { 'none' })" }
     Write-Output "DVE_RECEIPT_PATH=$path"
     exit 0
 }
@@ -387,8 +396,15 @@ try {
         if ($spec.generatorArgs.PSObject.Properties['rawPrefetchDecoders']) { $gen['RawPrefetchDecoders'] = [int]$spec.generatorArgs.rawPrefetchDecoders }
         # GPU-EVENT153-ROOTCAUSE-2: the CUDA per-launch timer and its line threshold, for any leg.
         if ($spec.generatorArgs.PSObject.Properties['cudaLaunchTimingMinMs']) { $gen['CudaLaunchTimingMinMs'] = [double]$spec.generatorArgs.cudaLaunchTimingMinMs }
+        # UPSTREAM-CPU-BASELINE-1: a no-look leg runs the app with Look Assist OFF (the fork's default is on); the generator refuses it with a forced look, typed.
+        if ($spec.generatorArgs.PSObject.Properties['disableLookAssist'] -and [bool]$spec.generatorArgs.disableLookAssist) { $gen['DisableLookAssist'] = $true }
         # PLAYBACK-STARTUP-CATCHUP-BURST-1 r7: the app's opt-in per-present playback trace, for any leg.
         if ($spec.generatorArgs.PSObject.Properties['presentTrace'] -and [bool]$spec.generatorArgs.presentTrace) { $gen['PresentTrace'] = $true }
+        # PLAYBACK-SCOPES-OPTION-1: the live scope the smoke forces on, and the app's playback scope throttle interval, for any leg.
+        if ($spec.generatorArgs.PSObject.Properties['scope']) { $gen['Scope'] = [string]$spec.generatorArgs.scope }
+        if ($spec.generatorArgs.PSObject.Properties['scopeIntervalMs']) { $gen['ScopeIntervalMs'] = [int]$spec.generatorArgs.scopeIntervalMs }
+        # PLAYBACK-SCOPES-OPTION-1 r4: the app's playback scopes mode (a scope leg on a Hide-default build must pin it), for any leg.
+        if ($spec.generatorArgs.PSObject.Properties['scopesDuringPlayback']) { $gen['ScopesDuringPlayback'] = [string]$spec.generatorArgs.scopesDuringPlayback }
         # PLAYBACK-BACHELOR-PRESENT-JITTER-1: a SPEED leg may force Look Assist (a capture-free pace leg: no contact-sheet grab in the timed Play).
         if (-not $isLook -and $spec.generatorArgs.PSObject.Properties['forceLookAssist'] -and [bool]$spec.generatorArgs.forceLookAssist) {
             $gen['ForceLookAssist'] = $true; $gen['LookPaceLeg'] = $true
@@ -396,6 +412,8 @@ try {
             if ($spec.generatorArgs.PSObject.Properties['playbackRenderLookaheadFrames']) { $gen['PlaybackRenderLookaheadFrames'] = [int]$spec.generatorArgs.playbackRenderLookaheadFrames }
         }
     }
+    # PLAYBACK-VISUAL-INSPECTION-1: the post-measurement window capture, for every speed leg that does not opt out.
+    if ($visualRequest.requested) { $gen['VisualCapture'] = $true }
     if ($isLook) {
         $gen['ContactSheet'] = $true; $gen['ContactSheetFrames'] = [int]$spec.look.contactSheetFrames
         $gen['ForceLookAssist'] = $true; $gen['LookFlavor'] = $lookFlavor
@@ -667,6 +685,20 @@ if ($isLook -and $artifactsShare) {
     }
 }
 
+# PLAYBACK-VISUAL-INSPECTION-1: the speed leg's window captures, copied into the evidence under the leg's names, hashed, gated and composed into one
+# strip, which is also copied next to the LOOK sheets (-SheetCopyDir, else <receipts>\..\sheets) so the hub can open it. Owner footage: .claude-state only.
+if ($visualRequest.applies -and $visualRequest.requested -and $artifactsShare -and (Test-Path -LiteralPath $artifactsShare -PathType Container)) {
+    $receipt.visual = Read-DvVisualCaptures -Requested $true -ArtifactsDir $artifactsShare -EvidenceDir $evidenceDir -LegId ([string]$spec.legId) `
+        -Header "$($spec.legId)  $Venue  $Backend  $($SourceCommit.Substring(0, 12))"
+    $stripDir = $(if (-not [string]::IsNullOrWhiteSpace($SheetCopyDir)) { $SheetCopyDir } else { Join-Path (Split-Path -Parent $ReceiptRoot) 'sheets' })
+    if ($receipt.visual.stripPath -and ($OfflineTestMode -or (Test-DvUnderClaudeState -Path $stripDir))) {
+        New-Item -ItemType Directory -Force -Path $stripDir | Out-Null
+        $stripCopy = Join-Path $stripDir "strip-$($spec.legId)-$Venue-$Backend-$($SourceCommit.Substring(0, 8))-$runStamp.png"
+        Copy-Item -LiteralPath $receipt.visual.stripPath -Destination $stripCopy -Force
+        $receipt.visual.stripCopyPath = $stripCopy
+    }
+}
+
 $outcome = $resolved.outcome; $detail = $resolved.detail
 if ($outcome -eq 'CAPTURED') {
     $criteria = $spec.criteria.$role.$Backend
@@ -722,5 +754,15 @@ if ($outcome -in @('PASS', 'FAIL') -and $null -ne $summary -and $null -ne $backe
 if ($outcome -in @('PASS', 'FAIL') -and $proofProblems.Count -gt 0) {
     $detail = "INVALID: the job result was $outcome ($detail) but the receipt-oracle verdict is not valid: $($proofProblems -join '; ')"
     $outcome = 'INVALID'
+}
+# PLAYBACK-VISUAL-INSPECTION-1, the visual gate: a FROZEN_DISPLAY leg (one picture across the play frames while the app presented several) is not counted --
+# every cadence number can read perfect over a frozen display; a VISUAL_DIVERGENCE leg stays counted for speed and says so in its detail.
+if ($outcome -in @('PASS', 'FAIL') -and $null -ne $receipt.visual) {
+    if ($receipt.visual.verdict -ceq 'FROZEN_DISPLAY') {
+        $detail = "INVALID: the job result was $outcome ($detail) but FROZEN_DISPLAY: $($receipt.visual.reason). A leg whose display did not change is not counted, whatever its cadence numbers say"
+        $outcome = 'INVALID'
+    } elseif ($receipt.visual.verdict -ceq 'VISUAL_DIVERGENCE') {
+        $detail += "; VISUAL_DIVERGENCE (counted for speed, surfaced for review): $($receipt.visual.reason)"
+    }
 }
 Complete-Receipt $outcome $detail
