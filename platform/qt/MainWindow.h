@@ -36,6 +36,7 @@
 #include "PlaybackPresentTrace.h"
 #include "PlaybackScopesDuringPlayback.h"
 #include "PlaybackSlipHistogram.h"
+#include "PlaybackStartupSplit.h"
 #include "../../src/mlv_include.h"
 #include "InfoDialog.h"
 #include "StatusDialog.h"
@@ -1161,6 +1162,9 @@ private:
     // PLAYBACK-BACHELOR-PRESENT-JITTER-1: per-present slip accounting and timeline-path reconciliation for the
     // smoke session (playback_smoke.slip_summary); fed only while m_playbackSmokeActive.
     playback_slip::SlipHistogram m_playbackSlipHistogram;
+    // PLAYBACK-STARTUP-WAIT-PREWARM-1: where the Play -> first-present wait goes (playback_smoke.startup_split);
+    // fed only while m_playbackSmokeActive, reset at every smoke session start.
+    playback_startup_split::StartupSplit m_playbackStartupSplit;
     // PLAYBACK-DECODE-RENDER-OVERLAP-1: the last drawFrame() request was on the CUDA texture route (play, texture
     // present requested and admitted, scale 1), where the playback lookahead is on by default
     // (playback_overlap::effectiveLookaheadFrames). The counters feed playback_smoke.overlap_summary.

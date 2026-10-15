@@ -6540,6 +6540,8 @@ void MainWindow::drawFrame( bool updateTimecodeLabel )
         mainWindowUsesGpuImagePresentation( renderPolicy );
 
     const uint64_t requestSerial = m_nextRenderRequestSerial++;
+    if( m_playbackSmokeActive && ui->actionPlay->isChecked() )
+        m_playbackStartupSplit.noteRequest( ( mlv_stage_timing_now() - m_playbackSmokeStartTime ) * 1000.0 );
     PresentationRequestContext requestContext;
     requestContext.requestSerial = requestSerial;
     requestContext.sceneWidth = sceneWidth;
@@ -24703,6 +24705,7 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     m_playbackSmokeFirstPresentMs = 0.0;
     m_playbackSmokeFirstPresentTimelineDeltaAbs = 0;
     m_playbackSmokeStartupSkippedFrames = 0;
+    m_playbackStartupSplit.reset();
     m_playbackSmokePresentedIntervalSumMs = 0.0;
     m_playbackSmokePresentedIntervalMaxMs = 0.0;
     m_playbackSmokeRenderTotalSumMs = 0.0;
@@ -27936,6 +27939,8 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                .arg( m_playbackSmokeStartupSkippedFrames )
                .arg( mlvappPlaybackStartupCatchupLegacyRequested() ? QStringLiteral( "legacy" )
                                                                    : QStringLiteral( "first_present" ) );
+    // PLAYBACK-STARTUP-WAIT-PREWARM-1: where that wait went (PlaybackStartupSplit.h).
+    qInfo().noquote() << m_playbackStartupSplit.line( static_cast<qulonglong>( m_playbackSmokeSessionId ) );
 
     qInfo().noquote()
         << QStringLiteral(
@@ -30613,6 +30618,26 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
     const int displaySourceHeight = rgb8DisplaySourceHeight > 0
         ? rgb8DisplaySourceHeight : readyFrame.renderedImageHeight;
     const qint64 prepRegionFinishStartNs = prepRegionClock.nsecsElapsed();
+    // PLAYBACK-STARTUP-WAIT-PREWARM-1: the first Play-present of a smoke session is split into its sub-steps
+    // (playback_smoke.startup_split); later presents feed the session medians.
+    const double splitFinishEntry = mlv_stage_timing_now();
+    const bool splitFirst = m_playbackSmokeActive && ui->actionPlay->isChecked()
+                         && m_playbackSmokePresentedFrames == 0 && !m_playbackStartupSplit.firstCaptured();
+    if( m_playbackSmokeActive && ui->actionPlay->isChecked() )
+    {
+        const double splitRenderMs = telemetryDoubleValue( readyFrame.stageTimingTelemetry, "render_thread_total_ms" );
+        const double splitGuiPresentMs = ( splitFinishEntry - displayStart ) * 1000.0;
+        if( splitFirst ) m_playbackStartupSplit.noteFirstPresent( splitRenderMs, splitGuiPresentMs );
+        else m_playbackStartupSplit.noteLaterPresent( splitRenderMs, splitGuiPresentMs );
+    }
+    double splitMark = splitFinishEntry;
+    const auto splitStep = [&]( int step )
+    {
+        if( !splitFirst ) return;
+        const double t = mlv_stage_timing_now();
+        m_playbackStartupSplit.noteFirstFinishStep( step, ( t - splitMark ) * 1000.0 );
+        splitMark = t;
+    };
     if( dualIsoWarmupInstrumentationEnabled() )
     {
         if( m_dualIsoWarmupTelemetryPresentationGeneration
@@ -30655,6 +30680,7 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
         "drawFrameReady.record",
         displayFrame,
         ( mlv_stage_timing_now() - recordPresentedFrameStart ) * 1000.0 );
+    splitStep( playback_startup_split::StepRecord );
     const double qualityStart = mlv_stage_timing_now();
     m_lastPresentedFrameColorTelemetry = QJsonObject();
     double headlessPresentedColorAnalysisMs = 0.0;
@@ -30703,6 +30729,7 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
         "drawFrameReady.quality",
         displayFrame,
         ( mlv_stage_timing_now() - qualityStart ) * 1000.0 );
+    splitStep( playback_startup_split::StepQuality );
 
     const double scopeDispatchStart = mlv_stage_timing_now();
     m_lastDrawFrameReadyScopesMs = 0.0;
@@ -30794,6 +30821,7 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
         "drawFrameReady.scope_dispatch",
         displayFrame,
         ( mlv_stage_timing_now() - scopeDispatchStart ) * 1000.0 );
+    splitStep( playback_startup_split::StepScopes );
 
     const double overlay_start = mlv_stage_timing_now();
     if( m_tryToSyncAudio && m_pAudioPlayback && ui->actionAudioOutput->isChecked() && ui->actionPlay->isChecked() && ui->actionDropFrameMode->isChecked() )
@@ -30816,10 +30844,23 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
             m_lastPlaybackAudioSyncTime = syncNow;
             ++m_playbackAudioSyncAppliedCount;
             m_playbackPresentTrace.noteAudioSync();
+            const double audioStopStart = mlv_stage_timing_now();
             m_pAudioPlayback->stop();
+            const double audioJumpStart = mlv_stage_timing_now();
             m_pAudioPlayback->jumpToPos( syncFrame );
+            const double audioPlayStart = mlv_stage_timing_now();
             m_pAudioPlayback->play();
+            if( splitFirst )
+                m_playbackStartupSplit.noteFirstAudio( ( audioJumpStart - audioStopStart ) * 1000.0,
+                                                       ( audioPlayStart - audioJumpStart ) * 1000.0,
+                                                       ( mlv_stage_timing_now() - audioPlayStart ) * 1000.0 );
         }
+    }
+    if( splitFirst )
+    {
+        const double t = mlv_stage_timing_now();
+        m_playbackStartupSplit.noteFirstAudioSync( ( t - splitMark ) * 1000.0 );
+        splitMark = t;
     }
 
     drawFrameNumberLabel( static_cast<int>(displayFrame) );
@@ -30868,6 +30909,7 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
     const double overlayEndStageTime = mlv_stage_timing_now();
     m_lastDrawFrameReadyOverlayMs = (overlayEndStageTime - overlay_start) * 1000.0;
     mlv_stage_timing_note_elapsed("drawFrameReady.overlay", displayFrame, m_lastDrawFrameReadyOverlayMs);
+    splitStep( playback_startup_split::StepLabels );
     const double drawTotalEndStageTime = mlv_stage_timing_now();
     m_lastDrawFrameReadyTotalMs = (drawTotalEndStageTime - displayStart) * 1000.0;
     if( m_playbackSmokeTimelineTelemetry )
@@ -31062,6 +31104,7 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
     {
         m_playbackQualityLastPresentedTime = 0.0;
     }
+    splitStep( playback_startup_split::StepAuto );
     notePlayToFirstFramePresentation( displayFrame );
     if( m_pRenderThread && !releasePresentedFrameEarly )
         m_pRenderThread->releasePresentedFrameForRequestSerial( readyFrame.requestSerial );
@@ -31139,6 +31182,7 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
             m_playbackFrameAdvancePending = true;
         }
     }
+    splitStep( playback_startup_split::StepAdvance );
     const qint64 prepRegionFinishEndNs = prepRegionClock.nsecsElapsed();
     const double prepRegionFinishMs =
         static_cast<double>( prepRegionFinishEndNs - prepRegionFinishStartNs ) / 1000000.0;
@@ -31192,6 +31236,9 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
             true );
     }
     emit frameReady();
+    splitStep( playback_startup_split::StepSmoke );
+    if( splitFirst )
+        m_playbackStartupSplit.noteFirstFinish( ( mlv_stage_timing_now() - splitFinishEntry ) * 1000.0 );
     const bool immediateGpuTexNrDrain =
         mlvappGpuTexNrImmediateDrainRequested()
         && !m_gpuTexNrImmediateDrainActive

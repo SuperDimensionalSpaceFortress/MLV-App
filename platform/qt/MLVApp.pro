@@ -379,6 +379,7 @@ HEADERS += MainWindow.h \
            Debayered16ReconReusePolicy.h \
            PlaybackDecodeRenderOverlap.h \
            PlaybackNativePaceGuard.h \
+           PlaybackStartupSplit.h \
            PlaybackPresentTrace.h \
            PlaybackSwapInterval.h \
            PlaybackScopesDuringPlayback.h \
