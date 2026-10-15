@@ -1237,8 +1237,11 @@ def read_json(path):
 
 # ------------------------------------------------------------------------ verbs
 
+# HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (2026-10-15): `(?!=)` -- a bare verb word directly followed by `=`
+# is a shell VARIABLE assignment (`RD="<run dir>"`), not a delete.  Without it, `RD=` read as `rd`
+# and every later mention of `$RD` was refused as a delete of that run dir (three lanes, one day).
 _DELETE_RX = re.compile(
-    r"(?:^|[\s;&|`(])(?:rm|del|rd|rmdir)\b"
+    r"(?:^|[\s;&|`(])(?:rm|del|rd|rmdir)\b(?!=)"
     r"|\bremove-item\b"
     r"|\bgit\s+rm\b"
     r"|\bos\.(?:remove|unlink)\s*\("

@@ -9053,5 +9053,41 @@ for _case in CASES:
         setattr(Na6DifferentialTests, _name, _make_differential(_case))
 
 
+class Na2AssignmentIsNotADeleteTests(unittest.TestCase):
+    """HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (2026-10-15): a shell VARIABLE named like a delete verb
+    (`RD=...`, `RM=...`, `DEL=...`) is an assignment, not a delete.  `_DELETE_RX` matched the bare word
+    `rd` before `=` (`=` is a word boundary), so every later command that MENTIONED `$RD` -- a run dir --
+    was attributed a delete of that run dir and refused by NA-2.  Measured the same day: three headless
+    lanes (STUCK-RECONCILER-1 r1, LOOK-ASSIST-KODAK-VISION-50D-1 r2, HUB-VM-LINT-CLAUSE-SCOPE-1 r11)
+    stopped PARTIAL on their first read-only command.  Real delete verbs must still read as deletes.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.hook = _load_hook_module()
+
+    def _acts(self, command):
+        return self.hook.shell_acts(command)
+
+    def test_assignment_of_rd_is_not_a_delete(self):
+        cmd = 'RD="/c/x/fleet-runs/lane-A-r1"; cat "$RD/sonnet-001.receipt.json" "$RD/arm.ps1"'
+        self.assertNotIn("delete", self._acts(cmd))
+
+    def test_assignment_then_mkdir_is_not_a_delete(self):
+        cmd = 'RD="/c/x/fleet-runs/lane-B-r1"; mkdir -p "$RD"; ls "$RD"'
+        self.assertNotIn("delete", self._acts(cmd))
+
+    def test_other_delete_verb_named_variables_are_not_deletes(self):
+        for cmd in ('RM=/tmp/x; echo "$RM"', 'DEL=1; echo $DEL', 'RMDIR="a b"; ls "$RMDIR"'):
+            with self.subTest(cmd=cmd):
+                self.assertNotIn("delete", self._acts(cmd))
+
+    def test_real_delete_verbs_still_read_as_deletes(self):
+        for cmd in ('rd /s /q C:\\x\\y', 'rm -rf /c/x/y', 'del C:\\x\\y.txt', 'rmdir /c/x/y',
+                    'echo a; rd /s x', 'Remove-Item -Recurse C:\\x', 'git rm x'):
+            with self.subTest(cmd=cmd):
+                self.assertIn("delete", self._acts(cmd))
+
+
 if __name__ == "__main__":
     unittest.main()
