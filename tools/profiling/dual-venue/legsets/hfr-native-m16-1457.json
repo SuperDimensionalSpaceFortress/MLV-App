@@ -1,0 +1,14 @@
+{
+  "schema": "mlv-app/dual-venue-legset/v1",
+  "legSet": "hfr-native-m16-1457",
+  "card": "HFR-NATIVE-60FPS-FULLRES-1",
+  "clipId": "M16-1457",
+  "description": "HFR-NATIVE-60FPS-FULLRES-1: the native-HFR arm (playbackConform off, MLVAPP_PLAYBACK_CONFORM=0) on the 59.94 fps clip M16-1457 (by id only; 1667 frames, 27.8 s at its own rate, so it meets max(20 s, 25 s window); M16-1456 is 16.2 s native and is never a native leg). Capture-free speed legs, cuda, scale 1, Look Assist Cinematic: the full screen and windowed acceptance cells, the Look Assist off lever (-nola), the lookahead 3 lever (-la3) and the HEAVY stage-attribution leg (-heavy, never counted for pacing).",
+  "legs": [
+    "legs/m16-1457-native-fullscreen-s1.json",
+    "legs/m16-1457-native-windowed-s1.json",
+    "legs/m16-1457-native-fullscreen-s1-nola.json",
+    "legs/m16-1457-native-fullscreen-s1-la3.json",
+    "legs/m16-1457-native-fullscreen-s1-heavy.json"
+  ]
+}

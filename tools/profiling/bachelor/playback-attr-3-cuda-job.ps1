@@ -401,6 +401,11 @@ param(
     # vsync A/B), any leg type. -1 (the default) sets nothing: the emitted job is the text it was before this parameter.
     [ValidateRange(-1, 1)][int]$SwapInterval = -1,
 
+    # HFR-NATIVE-60FPS-FULLRES-1: the high-frame-rate conform arm (passed to the app as MLVAPP_PLAYBACK_CONFORM=1 for 'on',
+    # 0 for 'off', the native-HFR arm), any leg type. Empty (the default) sets nothing: the emitted job is the text it was before.
+    [ValidateSet('', 'on', 'off')]
+    [string]$PlaybackConform = '',
+
     # GPU-EVENT153-ROOTCAUSE-2: turns the CUDA backends' per-launch timer on (MLVAPP_CUDA_LAUNCH_TIMING=1) with this
     # per-launch line threshold in ms (MLVAPP_CUDA_LAUNCH_TIMING_MIN_MS). -1 (the default) sets nothing: the timer stays
     # OFF and the emitted job is the text it was before this parameter.
@@ -4445,6 +4450,17 @@ if ($SwapInterval -ge 0) {
     })
 }
 
+# HFR-NATIVE-60FPS-FULLRES-1: a conform-arm leg adds MLVAPP_PLAYBACK_CONFORM to the same env-list site, only when asked.
+if ($PlaybackConform -ne '') {
+    $conformValue = if ($PlaybackConform -ceq 'on') { '1' } else { '0' }
+    $conformAnchor = [regex]"(?<ind>[ \t]*)'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',(?<nl>\r?\n)"
+    if ($conformAnchor.Matches($text).Count -ne 1) { throw 'DUAL_VENUE_PLAYBACK_CONFORM_ANCHOR_MISSING the job template has no single env-list site to add MLVAPP_PLAYBACK_CONFORM to' }
+    $text = $conformAnchor.Replace($text, [System.Text.RegularExpressions.MatchEvaluator]{
+        param($m)
+        $m.Value + $m.Groups['ind'].Value + "'MLVAPP_PLAYBACK_CONFORM=$conformValue'," + $m.Groups['nl'].Value
+    })
+}
+
 # GPU-EVENT153-ROOTCAUSE-2: the same env-list site gains the launch-timer pair, only when asked. The threshold is written in
 # invariant culture so a comma-decimal host never emits '2,5' (which the DLL would read as 2).
 if ($CudaLaunchTimingMinMs -ge 0) {
@@ -4557,6 +4573,7 @@ $clipContentSha256 = if ($isFixtureRehearsal) {
     fixtureRehearsal = $isFixtureRehearsal
     displayMode = $DisplayMode
     swapInterval = $(if ($SwapInterval -ge 0) { $SwapInterval } else { $null })
+    playbackConform = $(if ($PlaybackConform -ne '') { $PlaybackConform } else { $null })
     cudaLaunchTimingMinMs = $(if ($CudaLaunchTimingMinMs -ge 0) { $CudaLaunchTimingMinMs } else { $null })
     presentTrace = [bool]$PresentTrace
     scope = $(if ([string]::IsNullOrEmpty($Scope)) { 'none' } else { $Scope })

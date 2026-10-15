@@ -28,6 +28,7 @@
   },
   "roles": {
     "PLAYBACK-HFR-CONFORM-DEFAULT-1": { "bachelor": "acceptance", "ultra-magnus": "supplementary" },
+    "HFR-NATIVE-60FPS-FULLRES-1": { "bachelor": "acceptance", "ultra-magnus": "supplementary" },
     "DUAL-VENUE-DISPLAY-MATRIX-1": { "bachelor": "acceptance", "ultra-magnus": "supplementary" },
     "CPU-DUALISO-REDUCED-ISO-NOTCH-1": { "bachelor": "acceptance", "ultra-magnus": "supplementary" }
   },

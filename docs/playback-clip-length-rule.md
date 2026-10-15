@@ -110,6 +110,18 @@ FRAME:
   `native_fps`, `pace_fps`, `fps_override`; the receipt oracle turns anything short of the requirement into
   `INVALID_SOURCE_FRAMES`, never a pass.
 
+### High-frame-rate conform (PLAYBACK-HFR-CONFORM-DEFAULT-1): the pre-launch gate measures at the playback rate
+
+A clip above 30 fps plays at the 24 fps conform target by default, so a Play consumes source frames at the PLAYBACK rate. The app's
+own `checkPlayableWindow` already measures the window at `getPlaybackFramerate()`; `Test-GuiSmokeClipLength` (the runner's pre-launch
+gate) now does the same for a caller that plays, through `Get-GuiSmokePlaybackFps` (the `PlaybackConformPolicy.h` defaults: above 30 and
+above the 24 target plays at 24). A `-ClipOnly` caller plays nothing and keeps the native length, and a clip at or below 30 fps is
+unchanged. M16-1456 is 969 frames at 59.94 fps: 16.17 s native, 40.4 s of playback, so a 25 s window is admitted.
+
+**Open (not changed here):** the receipt oracles (`Get-GuiSmokeSourceFramesVerdict`, `Get-DvPlaybackProblems` in
+`DualVenueRunner.psm1` and the job's `Get-AttrCudaSourceFramesVerdict`) still compare `pace_fps` and the 20 s floor with `native_fps`, so a conformed run is
+classified `INVALID_SOURCE_FRAMES` (typed, never a PASS) until they read the playback rate from `playback_smoke.conform`.
+
 ### Typed refusals and exit codes
 
 | Token | Where | Exit |

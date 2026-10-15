@@ -1348,7 +1348,9 @@ $clipLengthGate = [pscustomobject]@{ verdict = 'SKIPPED_LAUNCH_ONLY_PROBE'; mess
 if (-not $LaunchOnlyProbe) {
     # ENFORCE-2: the PLAY WINDOW (-Seconds, and -TargetPresentedFrames as an early stop) must itself be
     # >= 20 s, not only the clip: PLAY_WINDOW_TOO_SHORT.
-    $clipLengthGate = Test-GuiSmokeClipLength -Path $inputPath -WindowSeconds $Seconds -StartFrame $StartFrame -TargetPresentedFrames $TargetPresentedFrames
+    # HFR-NATIVE-60FPS-FULLRES-1: a native-HFR run (MLVAPP_PLAYBACK_CONFORM=0) plays the clip at its own rate, so it is gated at that rate.
+    $clipConformEnvOverride = Get-GuiSmokeConformEnvOverride -Pairs $ExtraEnvironment -Inherited $env:MLVAPP_PLAYBACK_CONFORM
+    $clipLengthGate = Test-GuiSmokeClipLength -Path $inputPath -WindowSeconds $Seconds -StartFrame $StartFrame -TargetPresentedFrames $TargetPresentedFrames -ConformEnvOverride $clipConformEnvOverride
     if ($clipLengthGate.verdict -ne 'OK') {
         [Console]::Error.WriteLine("PLAYBACK-CLIP-LENGTH-ENFORCE-1: $($clipLengthGate.message)")
         exit (Get-GuiSmokeGateExitCode -Verdict $clipLengthGate.verdict)

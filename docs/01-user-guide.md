@@ -666,9 +666,40 @@ Stretch → (Auto Detect)** picks it up automatically.
 <kbd>K</kbd> next clip · <kbd>J</kbd> previous clip ·
 <kbd>Shift</kbd>+<kbd>I</kbd> / <kbd>Shift</kbd>+<kbd>O</kbd> set
 Cut In / Cut Out · drag the timeline handle to scrub.
-**Framerate override** in Export Settings changes both playback and
-export rate. There is no JKL-style reverse playback; previous-frame
-stepping uses <kbd>,</kbd>.
+**Framerate override** in Export Settings changes the export rate only;
+it does not change playback (see
+[High frame rate conform](#high-frame-rate-conform)). There is no
+JKL-style reverse playback; previous-frame stepping uses <kbd>,</kbd>.
+
+### High frame rate conform
+
+<a id="high-frame-rate-conform"></a>Clips recorded faster than 30 fps
+(for example 59.94 fps) play as slow motion at 24 fps by default, so a
+59.94 fps clip plays at about 0.4x speed and every recorded frame is
+shown. Configure it under **Playback → High Frame Rate Conform**:
+
+| Setting | Default | Choices |
+|---|---|---|
+| **Conform high frame rate clips** | on | on / off (off plays every clip at its own rate) |
+| **Conform to** | 24 fps | 24, 25, 30 fps |
+| **For clips above** | 30 fps | 30, 50 fps |
+
+A clip is only ever slowed down, never sped up: a clip at or below the
+threshold, or at or below the target rate, plays at its own rate and is
+paced exactly as before. The status bar shows the conform, for example
+`Playback: 24 fps (59.94 -> 24)`. The settings are saved as
+`Playback/ConformEnabled`, `Playback/ConformTargetFps` and
+`Playback/ConformThresholdFps`; a missing or invalid saved value falls
+back to the default.
+
+Conform is a viewing mode. Timecode, clip info and export keep the
+clip's own rate (or the Export Settings framerate override). **Audio is
+muted while a clip is being conformed** (its native rate cannot follow
+slowed-down picture; the status-bar tooltip says so); your **Audio
+Output** choice is left as it was and applies again to clips that are
+not conformed. While a clip is conformed, **Auto** playback quality
+budgets for the conform rate (for example 24 fps instead of its 30 fps
+target); every other clip keeps the Auto target unchanged.
 
 ### Zoom and fullscreen
 

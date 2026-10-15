@@ -199,6 +199,82 @@ class ClipLengthGateTests(_TmpCase):
         self.assertEqual(gate(thirty, "-ClipOnly")["verdict"], "OK")
         self.assertEqual(gate(self.clip("sixteen", FRAMES_SHORT_FIXTURE), "-ClipOnly")["verdict"], "CLIP_TOO_SHORT")
 
+    def test_a_conformed_high_frame_rate_clip_is_measured_at_the_playback_rate(self) -> None:
+        """PLAYBACK-HFR-CONFORM-DEFAULT-1: a clip above 30 fps plays at the 24 fps conform target, so the footage a play window consumes is frames / 24,
+        as the app's own checkPlayableWindow measures it. 969 frames at 59.94 fps are 16.17 s native but 40.38 s of playback."""
+        hfr = {"fps_nom": 59940, "fps_denom": 1000}
+        clip = self.clip("hfr969", 969, **hfr)
+        verdict = _gate(clip, 25)
+        self.assertEqual(verdict["verdict"], "OK", verdict)
+        self.assertAlmostEqual(verdict["clipSeconds"], 969 / 24, places=2)
+        self.assertEqual(verdict["fps"], 24)
+        # the window may still not exceed the playback seconds that remain, and the 20 s floor is playback seconds too
+        self.assertEqual(_gate(clip, 41)["verdict"], "CLIP_TOO_SHORT")
+        self.assertEqual(_gate(clip, 25, start_frame=480)["verdict"], "CLIP_TOO_SHORT")   # (969 - 480) / 24 = 20.4 s remain
+        self.assertEqual(_gate(clip, 20, start_frame=480)["verdict"], "OK")
+        # conform does not rescue a clip that is short in playback seconds: 479 frames / 24 = 19.96 s, 480 frames = 20 s
+        self.assertEqual(_gate(self.clip("hfr479", 479, **hfr), 20)["verdict"], "CLIP_TOO_SHORT")
+        self.assertEqual(_gate(self.clip("hfr480", 480, **hfr), 20)["verdict"], "OK")
+
+    def test_a_native_hfr_run_is_gated_at_the_clips_own_rate(self) -> None:
+        """HFR-NATIVE-60FPS-FULLRES-1: with MLVAPP_PLAYBACK_CONFORM=0 the app plays a 59.94 fps clip at 59.94, so the gate measures it there: 971 frames
+        (M16-1456's shape) are 16.2 s and refused pre-launch; 1667 frames (M16-1457's) are 27.8 s and pass a 25 s window. 1 or unset keeps the conform rate."""
+        hfr = {"fps_nom": 59940, "fps_denom": 1000}
+        short, long_ = self.clip("hfr971", 971, **hfr), self.clip("hfr1667", 1667, **hfr)
+        def gate(path: Path, override: int | None) -> dict:
+            arg = "" if override is None else f" -ConformEnvOverride {override}"
+            proc = _pwsh(f". {_q(GATE)}; Test-GuiSmokeClipLength -Path {_q(path)} -WindowSeconds 25{arg} | ConvertTo-Json -Compress")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            return json.loads(proc.stdout)
+        native_short = gate(short, 0)
+        self.assertEqual(native_short["verdict"], "CLIP_TOO_SHORT", native_short)
+        self.assertAlmostEqual(native_short["clipSeconds"], 971 / 59.94, places=2)
+        native_long = gate(long_, 0)
+        self.assertEqual(native_long["verdict"], "OK", native_long)
+        self.assertAlmostEqual(native_long["fps"], 59.94, places=3)
+        for override in (1, -1, None):
+            self.assertEqual(gate(short, override)["verdict"], "OK", override)   # conformed: 971 / 24 = 40.5 s
+            self.assertEqual(gate(short, override)["fps"], 24, override)
+
+    def test_the_conform_env_override_is_parsed_the_way_the_app_parses_it(self) -> None:
+        """HFR-NATIVE-60FPS-FULLRES-1: Get-GuiSmokeConformEnvOverride mirrors playback_conform::conformEnabledFromEnvValue; the runner's -ExtraEnvironment
+        pairs (last one wins, comma lists expanded) override the inherited environment."""
+        cases = [([], None, -1), ([], "0", 0), ([], " 1 ", 1), ([], "2", -1), ([], "", -1),
+                 (["MLVAPP_PLAYBACK_CONFORM=0"], "1", 0), (["A=1,MLVAPP_PLAYBACK_CONFORM=1"], None, 1),
+                 (["MLVAPP_PLAYBACK_CONFORM=1", "MLVAPP_PLAYBACK_CONFORM=0"], None, 0), (["MLVAPP_PLAYBACK_CONFORM=on"], "0", -1)]
+        script = f". {_q(GATE)}\n" + "\n".join(
+            "Get-GuiSmokeConformEnvOverride -Pairs @(" + ",".join("'" + p + "'" for p in pairs) + ")"
+            + ("" if inherited is None else f" -Inherited '{inherited}'") for pairs, inherited, _ in cases)
+        proc = _pwsh(script)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual([int(v) for v in proc.stdout.split()], [want for _, _, want in cases])
+        runner = (ROOT / "tools" / "profiling" / "run-release-gui-smoke.ps1").read_text(encoding="utf-8")
+        self.assertIn("Get-GuiSmokeConformEnvOverride -Pairs $ExtraEnvironment -Inherited $env:MLVAPP_PLAYBACK_CONFORM", runner)
+        self.assertIn("-ConformEnvOverride $clipConformEnvOverride", runner)
+
+    def test_a_clip_at_or_below_the_conform_threshold_keeps_its_own_rate(self) -> None:
+        for name, nom in (("f29970", 29970), ("f30000", 30000)):   # at the threshold: conform needs a rate ABOVE it
+            clip = self.clip(name, 599, fps_nom=nom, fps_denom=1000)   # 599 frames = 19.99 s at 29.97, 19.97 s at 30
+            self.assertEqual(_gate(clip, 20)["verdict"], "CLIP_TOO_SHORT", name)
+        self.assertEqual(_gate(self.clip("f30000ok", 600, fps_nom=30000, fps_denom=1000), 20)["verdict"], "OK")
+
+    def test_clip_only_keeps_the_native_length_of_a_high_frame_rate_clip(self) -> None:
+        proc = _pwsh(f". {_q(GATE)}; Test-GuiSmokeClipLength -Path {_q(self.clip('hfr969', 969, fps_nom=59940, fps_denom=1000))} "
+                     "-WindowSeconds 0 -ClipOnly | ConvertTo-Json -Compress")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        verdict = json.loads(proc.stdout)
+        self.assertEqual(verdict["verdict"], "CLIP_TOO_SHORT", verdict)    # a caller that plays nothing is not helped by conform
+        self.assertRegex(verdict["message"], r"^CLIP_TOO_SHORT \(clip=16\.166 window=20\)$")
+
+    def test_a_presented_frames_target_on_a_conformed_clip_is_counted_at_the_playback_rate(self) -> None:
+        clip = self.clip("hfr969", 969, fps_nom=59940, fps_denom=1000)
+        def gate(frames: int) -> dict:
+            proc = _pwsh(f". {_q(GATE)}; Test-GuiSmokeClipLength -Path {_q(clip)} -WindowSeconds 25 -TargetPresentedFrames {frames} | ConvertTo-Json -Compress")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            return json.loads(proc.stdout)
+        self.assertEqual(gate(479)["verdict"], "PLAY_WINDOW_TOO_SHORT")   # 479 / 24 = 19.96 s
+        self.assertEqual(gate(480)["verdict"], "OK")                      # 480 / 24 = 20 s
+
     def test_a_presented_frames_target_is_a_play_window_and_must_reach_the_floor(self) -> None:
         def gate(frames: int) -> dict:
             proc = _pwsh(
