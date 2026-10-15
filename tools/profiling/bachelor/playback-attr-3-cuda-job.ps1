@@ -375,7 +375,10 @@ param(
     # runner refuses, before launching, any clip shorter than max(20, this); a fixture id is refused
     # HERE, at generation, because both tracked fixtures are far under 20 s and are never played on
     # a venue. Floor 20: a play window under the owner's 20 s minimum is not a playback test.
-    [ValidateRange(20, 3600)]
+    # PLAYBACK-CLIP-LENGTH-HFR-10S-1 (owner 2026-10-15): an HFR clip (>= 50 fps native) needs 10 s. The generator never
+    # opens an owner clip, so it admits the lowest floor any clip has; the runner (the clip's header) and the app refuse a
+    # window under that clip's own floor (20 s, or 10 s at >= 50 fps).
+    [ValidateRange(10, 3600)]
     [int]$PlaySeconds = 25,
 
     # DUAL-VENUE-DISPLAY-MATRIX-1 (owner 2026-10-03 and 2026-10-05: playback benchmarks must not be full screen only): 'windowed' appends the app's own --windowed

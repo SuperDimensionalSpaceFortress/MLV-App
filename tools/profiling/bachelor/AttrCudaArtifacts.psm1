@@ -6781,6 +6781,15 @@ function Get-AttrCudaSourceFramesVerdict {
         $nativeForFloor = [double]::Parse($fields['native_fps'], [Globalization.CultureInfo]::InvariantCulture)
         if ($nativeForFloor -le 0) {
             $failures += "INVALID_SOURCE_FRAMES: native_fps=$nativeForFloor; the native frame rate is unknown, so 20 s of footage cannot be measured."
+        # PLAYBACK-CLIP-LENGTH-HFR-10S-1 >>>
+        # Owner amendment 2026-10-15: footage of >= 50 fps native (HFR) needs 10 s, ceil(10 x native fps) source frames; every other
+        # rate keeps the 20 s branch below. Mirrors platform/qt/PlaybackFrameRange.h minPlayWindowSeconds (the emitted job cannot
+        # dot-source gui-smoke-length-gate.ps1's Get-GuiSmokeMinPlaySeconds); a parity test executes all copies on one table.
+        } elseif ($nativeForFloor -ge 50.0 -and -not [double]::IsInfinity($nativeForFloor)) {
+            if ($null -ne $required -and $required -gt 0 -and $required -lt [int64][Math]::Ceiling(10.0 * $nativeForFloor - 0.02)) {
+                $failures += "INVALID_SOURCE_FRAMES: required_source_frames=$required is under ceil(10 s x native_fps=$nativeForFloor); the Play was admitted for less than 10 s of HFR footage."
+            }
+        # PLAYBACK-CLIP-LENGTH-HFR-10S-1 <<<
         } elseif ($null -ne $required -and $required -gt 0 -and $required -lt [int64][Math]::Ceiling(20.0 * $nativeForFloor - 0.02)) {
             $failures += "INVALID_SOURCE_FRAMES: required_source_frames=$required is under ceil(20 s x native_fps=$nativeForFloor); the Play was admitted for less than 20 s of footage."
         }

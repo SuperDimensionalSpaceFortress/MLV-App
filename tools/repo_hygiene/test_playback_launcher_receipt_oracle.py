@@ -126,6 +126,28 @@ class ReceiptOracleFunctionTests(unittest.TestCase):
                 self.assertEqual(verdict["exitCode"], EXIT_INVALID)
                 self.assertIn(token, json.dumps(verdict["failures"]))
 
+    def test_hfr_evidence_needs_ten_seconds_of_source_frames_and_every_other_clip_twenty(self) -> None:
+        # PLAYBACK-CLIP-LENGTH-HFR-10S-1 (owner amendment 2026-10-15): "Amend rule so that hfr 60fps clips are allowed to be 10 seconds".
+        hfr = dict(total_frames=720, clip_seconds=12.012, presented_frames=600, native_fps=59.94, pace_fps=59.94)
+        self.assertFalse(_oracle(_good_line(**hfr, source_advanced=600, required_source_frames=600), window=10)["invalid"])   # 59.94 10 s
+        fifty = dict(total_frames=600, clip_seconds=12.0, presented_frames=500, native_fps=50.0, pace_fps=50.0)
+        self.assertFalse(_oracle(_good_line(**fifty, source_advanced=500, required_source_frames=500), window=10)["invalid"])  # 50 fps 10 s
+        refused = {
+            "59.94 fps admitted for 9.9 s": (_good_line(**hfr, source_advanced=594, required_source_frames=594), "INVALID_SOURCE_FRAMES"),
+            "23.976 fps for 10 s": (_good_line(source_advanced=240, required_source_frames=240), "INVALID_SOURCE_FRAMES"),
+            "native fps unknown": (_good_line(**{**hfr, "native_fps": 0}, source_advanced=600, required_source_frames=600), "INVALID_SOURCE_FRAMES"),
+            "an HFR clip looped to reach 10 s": (_good_line(**{**hfr, "total_frames": 300, "clip_seconds": 5.005}, wrapped=1, wrap_count=2,
+                                                            source_advanced=600, required_source_frames=600), "INVALID_LOOPED"),
+        }
+        for name, (line, token) in refused.items():
+            with self.subTest(name):
+                verdict = _oracle(line, window=10)
+                self.assertTrue(verdict["invalid"], verdict)
+                self.assertEqual(verdict["exitCode"], EXIT_INVALID)
+                self.assertIn(token, json.dumps(verdict["failures"]))
+        # 23.976 fps 20 s stays valid
+        self.assertFalse(_oracle(_good_line(), window=20)["invalid"])
+
     def test_a_non_zero_exit_names_the_apps_typed_reason(self) -> None:
         verdict = _oracle(None, exit_code=14, message="[GUI-SMOKE] ERROR: SOURCE_FRAMES_SHORT (source_advanced=200)")
         self.assertIn("SOURCE_FRAMES_SHORT", json.dumps(verdict["failures"]))
@@ -808,6 +830,22 @@ class OffscreenProbeAndParityTests(unittest.TestCase):
         gate = GATE.read_text(encoding="utf-8")
         self.assertIn(f"$script:GuiSmokeMinSustainedPaceFraction = {fraction}", gate)
         self.assertIn(f"$script:GuiSmokePlaySafetyMarginMs = {margin}", gate)
+
+    def test_the_powershell_play_floor_mirrors_the_cpp_derivation(self) -> None:
+        # PLAYBACK-CLIP-LENGTH-HFR-10S-1: one derivation (minPlayWindowSeconds); every PowerShell carrier mirrors its constants.
+        header = HEADER.read_text(encoding="utf-8")
+        values = {name: re.search(rf"constexpr double {name} = ([0-9.]+);", header).group(1)
+                  for name in ("kStandardMinPlayWindowSeconds", "kHfrMinPlayWindowSeconds", "kHfrNativeFpsThreshold")}
+        self.assertEqual(values, {"kStandardMinPlayWindowSeconds": "20.0", "kHfrMinPlayWindowSeconds": "10.0", "kHfrNativeFpsThreshold": "50.0"})
+        self.assertIn("isHighFrameRate( nativeFps ) ? kHfrMinPlayWindowSeconds : kStandardMinPlayWindowSeconds", header)
+        gate = GATE.read_text(encoding="utf-8")
+        self.assertIn(f"$script:GuiSmokeStandardMinPlaySeconds = {values['kStandardMinPlayWindowSeconds']}", gate)
+        self.assertIn(f"$script:GuiSmokeHfrMinPlaySeconds = {values['kHfrMinPlayWindowSeconds']}", gate)
+        self.assertIn(f"$script:GuiSmokeHfrNativeFpsThreshold = {values['kHfrNativeFpsThreshold']}", gate)
+        attr = (ROOT / "tools" / "profiling" / "bachelor" / "AttrCudaArtifacts.psm1").read_text(encoding="utf-8")
+        self.assertIn("} elseif ($nativeForFloor -ge 50.0 -and -not [double]::IsInfinity($nativeForFloor)) {", attr)
+        self.assertIn("[int64][Math]::Ceiling(10.0 * $nativeForFloor - 0.02)", attr)
+        self.assertIn("[int64][Math]::Ceiling(20.0 * $nativeForFloor - 0.02)", attr)
 
     @requires_pwsh
     def test_the_powershell_safety_budget_is_the_formula_the_app_uses(self) -> None:

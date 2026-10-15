@@ -543,7 +543,22 @@ function Get-DvClipAdmission {
 # `$runNonce = ...`): 32 lowercase hex, no prefix. The rule accepts exactly that and nothing else; test_dual_venue_evidence.py
 # evaluates the launcher's own expression and feeds it to this rule, so a producer-format change turns a test red.
 $script:RunNoncePattern = '^[0-9a-f]{32}$'
-$script:MinPlaySeconds = 20.0
+# PLAYBACK-CLIP-LENGTH-HFR-10S-1 (owner amendment 2026-10-15): the floor is a function of the footage's NATIVE fps -- 10 s at
+# >= 50 fps (HFR), 20 s below, 20 s when unknown (fail closed). Mirrors platform/qt/PlaybackFrameRange.h minPlayWindowSeconds
+# and gui-smoke-length-gate.ps1 Get-GuiSmokeMinPlaySeconds (this module is loaded without that file); a parity test compares them.
+$script:StandardMinPlaySeconds = 20.0
+$script:HfrMinPlaySeconds = 10.0
+$script:HfrNativeFpsThreshold = 50.0
+
+function Get-DvMinPlaySeconds {
+    # The play floor of footage at -NativeFps; -LowestAnyClip: the floor where the footage is not known yet (a leg spec names a
+    # clip id, never its fps), i.e. only what NO clip could admit -- the venue's runner and the app apply the clip's own floor.
+    param([AllowNull()]$NativeFps, [switch]$LowestAnyClip)
+    if ($LowestAnyClip) { return $script:HfrMinPlaySeconds }
+    $fps = ConvertTo-DvDouble $NativeFps
+    if ($null -ne $fps -and -not [double]::IsNaN($fps) -and -not [double]::IsInfinity($fps) -and $fps -ge $script:HfrNativeFpsThreshold) { return $script:HfrMinPlaySeconds }
+    $script:StandardMinPlaySeconds
+}
 
 function ConvertTo-DvInt64 {
     # $null for absent / a bool / not an integer: an unparsable number is ABSENT, never zero.
@@ -654,11 +669,13 @@ function Get-DvPlaybackProblems {
     if ($null -ne $advanced -and $null -ne $required) {
         if ($advanced -lt $required) { $reasons.Add("INVALID_SOURCE_FRAMES: source_advanced=$advanced is under required_source_frames=$required; under 20 s of real footage is never evidence") }
     }
-    # The 20 s floor, derived here from the footage's own frame rate: ceil(20 s x native fps) frames.
+    # The floor, derived here from the footage's own frame rate: ceil(floor x native fps) frames (HFR-10S-1: Get-DvMinPlaySeconds,
+    # 10 s at >= 50 fps, else 20 s).
+    $floorSeconds = Get-DvMinPlaySeconds -NativeFps $native
     if ($null -eq $native) { $reasons.Add('RECEIPT_FIELD_ABSENT: native_fps') }
     elseif ($native -le 0) { $reasons.Add("INVALID_SOURCE_FRAMES: native_fps=$native; the native frame rate is unknown, so 20 s of footage cannot be measured") }
-    elseif ($null -ne $required -and $required -lt [int64][Math]::Ceiling($script:MinPlaySeconds * $native - 0.02)) {
-        $reasons.Add("INVALID_SOURCE_FRAMES: required_source_frames=$required is under ceil(20 s x native_fps=$native); the Play was admitted for less than 20 s of footage")
+    elseif ($null -ne $required -and $required -lt [int64][Math]::Ceiling($floorSeconds * $native - 0.02)) {
+        $reasons.Add("INVALID_SOURCE_FRAMES: required_source_frames=$required is under ceil($floorSeconds s x native_fps=$native); the Play was admitted for less than $floorSeconds s of footage")
     }
     if ($null -eq $pace) { $reasons.Add('RECEIPT_FIELD_ABSENT: pace_fps') }
     elseif ($pace -le 0) { $reasons.Add("INVALID_SOURCE_FRAMES: pace_fps=$pace; a present engine pace that is not positive is unknown") }
@@ -2174,7 +2191,7 @@ function Write-DvReceipt {
 Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-DvSha256OfBytes, Get-DvSha256OfText, Get-DvSha256OfFile,
     ConvertTo-DvLfBytes, Get-DvLegSpecSha256, Get-DvDerivedBackend, Get-DvBackendNotDerivable, Read-DvContactFrames, Get-DvSubjectDigest,
     Get-DvVisualViewportPixels, Get-DvVisualMeanAbsDiff, Get-DvVisualVerdict, New-DvVisualStrip, Read-DvVisualCaptures, Get-DvVisualCaptureRequest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
-    Test-DvUnderClaudeState, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvPlaybackProblems,
+    Test-DvUnderClaudeState, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvMinPlaySeconds, Get-DvPlaybackProblems,
     Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvDisplayEvidence, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvHealthVerdict,
     New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout,
     Get-DvResultToken, Resolve-DvJobOutcome, Test-DvCriteria, Get-DvVerbatimMetrics, New-DvReceipt, Write-DvReceipt
