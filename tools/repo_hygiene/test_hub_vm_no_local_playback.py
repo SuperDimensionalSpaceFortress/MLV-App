@@ -182,6 +182,13 @@ REJECTED_FOLLOW_POOL = (
 # Contexts a host reference is probed in. The defeater reads the reference itself, so a context must never be what makes a row refuse:
 # every row is carried by `and` (a locus-preserving coordinator) or sits in the venue's own clause.
 HOST_REF_PREPOSITIONS = ("on", "to", "onto", "into", "from", "at")
+# r6 axes. The joiners are the ones the clause splitter knows (a comma, a semicolon, a dash, then / and / but / so); each row is
+# "<venue-routed launch><joiner> <verb> <object> <tail>" where the object is a PLAIN noun, never a back-reference word.
+LATER_CLAUSE_JOINERS = (",", ", then", ";", "; then", " - then", " and then", " but", ", so")
+LATER_LAUNCH_VERBS = ("run", "play", "open", "start", "launch", "execute")
+LATER_OBJECTS = ("the clip", "the build", "this", "it")
+LATER_HOST_TAILS = ("here", "on this host", "on my machine", "locally")
+HOST_MODIFIER_POOL = ("same", "very", "Windows", "physical")
 
 
 def _list_member_rows(lists: dict[str, list[str]]) -> list[tuple[str, bool, str]]:
@@ -213,8 +220,31 @@ def _list_member_rows(lists: dict[str, list[str]]) -> list[tuple[str, bool, str]
     for name in lists["HostNames"]:
         add("host-name", True, f"Run playback locally on Bachelor and {name}.")
         add("host-name-same-clause", True, f"Run playback locally on Bachelor on {name}.")
-    for w in lists["BackReferences"]:
-        add("back-reference-follow-up", True, f"Run playback locally on Bachelor, then run {w} here.")
+    # r6 axes (CoS Blocker 1 on r5, fail closed): a later clause with a launch verb that names the local host defeats the exemption
+    # whatever its object is; `;` is a clause boundary like `,`; the host vocabulary takes modifiers, hyphen / space / case variants,
+    # a bare preposition + noun and the loopback names.
+    for j in LATER_CLAUSE_JOINERS:
+        for verb in LATER_LAUNCH_VERBS:
+            for obj in LATER_OBJECTS:
+                for tail in LATER_HOST_TAILS:
+                    add("later-clause-then-host", True, f"Run playback locally on Bachelor{j} {verb} {obj} {tail}.")
+    for det in lists["HostDeterminers"]:
+        for noun in lists["HostNouns"]:
+            for mod in HOST_MODIFIER_POOL:
+                add("host-reference-modifier", True, f"Run playback locally on Bachelor and on {det} {mod} {noun}.")
+    for noun in lists["HostNouns"]:
+        add("host-reference-two-modifiers", True, f"Run playback locally on Bachelor and on this very same {noun}.")
+        for suffix in ("-VM", "-vm", " VM"):
+            add("host-reference-vm-suffix", True, f"Run playback locally on Bachelor and on the {noun}{suffix}.")
+    for word in list(lists["HostNouns"]) + list(lists["HostNames"]):
+        if " " not in word:
+            continue
+        for variant in (word.replace(" ", "-"), word.replace(" ", ""), word.replace(" ", "-").upper(), word.replace(" ", " ").title().replace(" ", "-")):
+            add("host-reference-spelling-variant", True, f"Run playback locally on Bachelor and on the {variant}.")
+            add("host-name-spelling-variant", True, f"Run playback locally on Bachelor and on {variant}.")
+    for prep in lists["HostPrepositions"]:
+        for noun in lists["HostNouns"]:
+            add("host-reference-bare-preposition", True, f"Run playback locally on Bachelor and {prep} {noun}.")
     for p in lists["RoutingPrepositionsLocally"]:
         add("e1-preposition-possessive", True, f"Run playback locally {p} Bachelor's clip.")
         add("e1-preposition-purpose", True, f"Run playback locally {p} Bachelor to fetch the clip.")
@@ -319,7 +349,8 @@ def _differential_flips(work: Path, baseline_text: str | None = None) -> tuple[s
         ref, text = base
     baseline = work / "baseline-lint.ps1"
     baseline.write_text(text, encoding="utf-8")
-    corpus = _differential_corpus(PromptLintTests.CLAUSE_MUST_REFUSE + PromptLintTests.CLAUSE_MUST_PASS + PromptLintTests.PROBE_ROWS
+    corpus = _differential_corpus(PromptLintTests.CLAUSE_MUST_REFUSE + PromptLintTests.CLAUSE_MUST_PASS + PromptLintTests.CLAUSE_MUST_PASS_R6
+                                  + PromptLintTests.PROBE_ROWS
                                   + tuple(text for _, _, text in PromptLintTests.DEFEATER_AXIS) + PromptLintTests.DEFEATER_AXIS_CONTROLS,
                                   members=tuple(_list_member_rows(_lint_word_lists(LINT_PS1, work))))
     texts = list(corpus)
@@ -606,6 +637,44 @@ class PromptLintTests(unittest.TestCase):
         "Run the arms locally using Bachelor from this host.",
         "Run playback locally on Bachelor on my machine.",
         "Run playback locally on Bachelor, then run it here.",
+        # r6 (CoS review of PR #448 r5 head eb3d5f81, pr-448.md on bus ee73df4): master refused every row and r5 passed them. (a) a later
+        # launch clause with a plain object, (b) a semicolon joiner (it was a sentence boundary), (c) host vocabulary the r5 pattern
+        # could not read (modifiers, hub-VM, system, device, a bare `hub`, an address).
+        "Run playback locally on Bachelor, then play the clip here.",
+        "Run playback locally on Bachelor, then run this here.",
+        "Run playback locally on Bachelor, then open the clip here.",
+        "Run playback locally on Bachelor, then run the result here.",
+        "Run playback locally on Bachelor, then start the player here.",
+        "Run playback locally on Bachelor, then run the clip on my machine.",
+        "Run playback locally on Bachelor; run it here.",
+        "Run playback locally on Bachelor; then run it here.",
+        "Run playback locally on Bachelor; run it on this host.",
+        "Run playback locally on Bachelor; play the clip on this host.",
+        "Run playback locally on Bachelor and on the hub-VM.",
+        "Run playback locally on Bachelor and on the HUB-VM.",
+        "Run playback locally on Bachelor and on this same host.",
+        "Run playback locally on Bachelor and on this very machine.",
+        "Run playback locally on Bachelor and on this Windows box.",
+        "Run playback locally on Bachelor and on the current machine.",
+        "Run playback locally on Bachelor and on our own box.",
+        "Run playback locally on Bachelor and on this system.",
+        "Run playback locally on Bachelor and on this device.",
+        "Run playback locally on Bachelor and on hub.",
+        "Run playback locally on Bachelor and on 127.0.0.1.",
+    )
+    # r6 ALLOW list: the venue route still works when no local-host reference appears anywhere in the sentence, across every joiner the
+    # r6 rows use. (The exemption is narrowed to "nothing local is named", never removed.)
+    CLAUSE_MUST_PASS_R6 = (
+        "Run playback locally on Bachelor.",
+        "Run playback locally on Bachelor, then read the log.",
+        "Run playback locally on Bachelor; read the report afterwards.",
+        "Run playback locally on Bachelor; then summarize the result on Ultra-Magnus.",
+        "Run playback locally through the venue chain, then post the result to Bachelor.",
+        "Run playback locally using Ultra-Magnus and then compare the checksum on Bachelor.",
+        "Run playback locally on Bachelor, not on this host; then run the report on Bachelor.",
+        "Run playback locally on Bachelor - then verify the checksum through the venue chain.",
+        "Run playback on Bachelor rather than locally; then read the log.",
+        "Run playback on Bachelor through the venue chain; never locally.",
     )
     CLAUSE_MUST_PASS = (
         "Run playback locally on Bachelor through the venue chain.",
@@ -693,7 +762,7 @@ class PromptLintTests(unittest.TestCase):
                 self.assertTrue(self._findings(text), text)
 
     def test_green_clause_scope_venue_routed_wordings_pass(self):
-        for text in self.CLAUSE_MUST_PASS:
+        for text in self.CLAUSE_MUST_PASS + self.CLAUSE_MUST_PASS_R6:
             with self.subTest(text=text):
                 self.assertEqual([], self._findings(text), text)
 
@@ -761,7 +830,7 @@ class ListMemberDefeaterTests(unittest.TestCase):
 
     def test_the_lint_exposes_every_list_the_exemptions_depend_on(self):
         for key in ("VenueWords", "RoutingPrepositionsLocally", "RoutingPrepositionsVenue", "VenueFollowLocus", "VenueFollowPhrases",
-                    "HostDeterminers", "HostNouns", "HostNames", "BackReferences", "ContrastWords"):
+                    "HostDeterminers", "HostNouns", "HostNames", "HostPrepositions", "ContrastWords"):
             self.assertTrue(self.lists.get(key), f"list {key} is missing or empty")
 
     def test_the_lint_builds_its_patterns_from_those_lists(self):
@@ -770,7 +839,7 @@ class ListMemberDefeaterTests(unittest.TestCase):
         text = LINT_PS1.read_text(encoding="utf-8")
         body = text[text.index("function Get-LocalPlaybackPromptFindings"):]
         self.assertIn("Get-LocalPlaybackLintWordLists", body)
-        for key in ("VenueFollowLocus", "VenueFollowPhrases", "HostDeterminers", "HostNouns", "HostNames", "BackReferences", "ContrastWords",
+        for key in ("VenueFollowLocus", "VenueFollowPhrases", "HostDeterminers", "HostNouns", "HostNames", "HostPrepositions", "ContrastWords",
                     "RoutingPrepositionsLocally", "RoutingPrepositionsVenue", "VenueWords"):
             self.assertIn(f"$lists.{key}", body, f"the findings function does not read list {key}")
         self.assertNotRegex(body, r"\$venueFollow\s*=\s*'", "a literal follow alternation came back")
@@ -789,7 +858,9 @@ class ListMemberDefeaterTests(unittest.TestCase):
         groups = {g for g, _, _ in self.rows}
         for g in ("follow-member-then-host", "rejected-follow-word", "rejected-follow-word-after-comma", "host-reference-bare",
                   "host-reference-possessive", "host-reference-same-clause", "host-reference-prep-det-noun", "host-name",
-                  "back-reference-follow-up", "e1-preposition-possessive", "e3-preposition-then-host", "venue-word-control",
+                  "later-clause-then-host", "host-reference-modifier", "host-reference-two-modifiers", "host-reference-vm-suffix",
+                  "host-reference-spelling-variant", "host-name-spelling-variant", "host-reference-bare-preposition",
+                  "e1-preposition-possessive", "e3-preposition-then-host", "venue-word-control",
                   "venue-word-then-host", "venue-word-possessive", "contrast-word-then-local-host"):
             self.assertIn(g, groups, f"no rows generated for {g}")
         # preposition x determiner x noun is the full product, not a sample
@@ -816,8 +887,14 @@ class ListMemberDefeaterTests(unittest.TestCase):
                   "host-name", "host-name-same-clause"):
             self._group(g, True)
 
-    def test_red_every_back_reference_follow_up_defeats(self):
-        self._group("back-reference-follow-up", True)
+    def test_red_every_later_clause_with_a_launch_verb_and_a_host_defeats(self):
+        """r6, fail closed: whatever the later clause's joiner, verb or (plain) object, it defeats the earlier venue exemption."""
+        self._group("later-clause-then-host", True)
+
+    def test_red_every_host_vocabulary_variant_defeats(self):
+        for g in ("host-reference-modifier", "host-reference-two-modifiers", "host-reference-vm-suffix", "host-reference-spelling-variant",
+                  "host-name-spelling-variant", "host-reference-bare-preposition"):
+            self._group(g, True)
 
     def test_red_every_routing_preposition_needs_a_locus(self):
         for g in ("e1-preposition-possessive", "e1-preposition-purpose", "e3-preposition-then-host", "e3-preposition-possessive-then-host"):
@@ -870,9 +947,17 @@ class LintDifferentialPinTests(unittest.TestCase):
          "r4 design note (CoS), listed in r5: 'Run playback locally on Bachelor from here.' -- `from here` says where a venue job is "
          "STARTED from, not where it runs, so it is a locus-preserving phrase (VenueFollowPhrases). Every defeater of it is refused: "
          "'... from here on this host', '... from here, then run it here' (follow-phrase rows)."),
+        ("E1-venue-routed-then-a-clause-that-names-no-local-host",
+         lambda text, f: f.get("tpl") == "seed" and text in PromptLintTests.CLAUSE_MUST_PASS_R6 and text.startswith("Run playback locally "),
+         "r6 ALLOW list (CLAUSE_MUST_PASS_R6): the E1 shape above followed by a clause or a semicolon group that names NO local host "
+         "('Run playback locally on Bachelor, then read the log.'). Master refuses the `locally` marker in these; the fail-closed "
+         "defeater scan reads every later clause and finds nothing local, so the venue route is still a venue route. Their twins that "
+         "do name the local host (CLAUSE_MUST_REFUSE r6 block, the per-member later-clause rows) are all refused."),
         ("E2-marker-negated-by-the-contrast-word-before-it",
-         lambda text, f: f.get("tpl") == "venue-contrast-marker" and f.get("M") == "locally",
-         "E2, r1b/r2: 'Run playback on Bachelor rather than / instead of / without / nor / , not locally' -- the marker is the first "
+         lambda text, f: (f.get("tpl") == "venue-contrast-marker" and f.get("M") == "locally")
+         or (f.get("tpl") == "seed" and text in PromptLintTests.CLAUSE_MUST_PASS_R6 and text.startswith("Run playback on Bachelor rather than locally")),
+         "E2, r1b/r2 (and the r6 ALLOW row 'Run playback on Bachelor rather than locally; then read the log.', the same E2 shape followed by a "
+         "semicolon group that names no local host): 'Run playback on Bachelor rather than / instead of / without / nor / , not locally' -- the marker is the first "
          "thing of the contrast complement, so it is what the prompt rules out. (Only `locally` flips: the host and 'here' markers were "
          "already passed by the baseline's sentence-wide weak-negation / venue exemption.)"),
     )
