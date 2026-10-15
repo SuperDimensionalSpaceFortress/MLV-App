@@ -10,6 +10,7 @@
 #define PLAYBACKSCOPESDURINGPLAYBACK_H
 
 #include "AutomationSettings.h"
+#include "ZebraThresholds.h"
 
 #include <QByteArray>
 #include <QDebug>
@@ -121,9 +122,11 @@ inline bool playbackScopeGpuTapKillSwitch( const QByteArray &env )
 }
 
 /*! \brief PLAYBACK-GPU-SCOPES-NO-VETO-1: the live state that decides whether the Throttled scope is fed by a
- *  read-back of the picture the GL viewport drew (a small async PBO read, see GpuDisplayViewport::requestScopeTap)
- *  instead of CPU-side presented pixels. textureRouteEligibleIgnoringScopes is the GPU recon texture-route table
- *  asked with no scope (it must never ask the scope funnel itself: that funnel asks this). */
+ *  read-back of the picture the active GL surface drew (a small async PBO read, see GpuScopeTap) instead of
+ *  CPU-side presented pixels. r2: the active surface is the QOpenGLWidget viewport or GpuDisplayWindow, which
+ *  ever presents (MainWindow asks the window when it is active, else the viewport); tapSupported and
+ *  tapRectCapturable come from that surface. textureRouteEligibleIgnoringScopes is the GPU recon texture-route
+ *  table asked with no scope (it must never ask the scope funnel itself: that funnel asks this). */
 struct PlaybackScopeGpuTapInputs
 {
     bool killSwitch = false;
@@ -135,23 +138,25 @@ struct PlaybackScopeGpuTapInputs
     bool gpuDisplayWindowActive = false;
     bool zebrasEnabled = false;
     bool tapSupported = false;
+    bool tapRectCapturable = false;
     bool textureRouteEligibleIgnoringScopes = false;
 };
 
 /*! \brief Does the GPU read-back serve the scope right now? Only Throttled, only while playing with a visible
- *  scope on the QOpenGLWidget viewport (never GpuDisplayWindow), with zebras off (the shader draws them into the
- *  same picture), a context that can do the async read, and a texture route that would be eligible without the
- *  scope. Anything else keeps today's CPU scope and its veto. */
+ *  scope on a GL surface (the QOpenGLWidget viewport or GpuDisplayWindow), with zebras off (the shader draws them
+ *  into the same picture), a context that can do the async read, a drawn picture the read-back can capture
+ *  (zoomed past fit it cannot: CoS #447 blocker 5, the scope would freeze), and a texture route that would be
+ *  eligible without the scope. Anything else keeps today's CPU scope and its veto. */
 inline bool playbackScopeGpuTapServes( const PlaybackScopeGpuTapInputs &in )
 {
     return in.mode == PlaybackScopesMode::Throttled
         && in.playbackActive
         && in.editAreaVisible
         && in.anyScopeChecked
-        && in.gpuWidgetViewportInstalled
-        && !in.gpuDisplayWindowActive
+        && ( in.gpuWidgetViewportInstalled || in.gpuDisplayWindowActive )
         && !in.zebrasEnabled
         && in.tapSupported
+        && in.tapRectCapturable
         && in.textureRouteEligibleIgnoringScopes
         && !in.killSwitch;
 }
@@ -197,14 +202,23 @@ inline bool playbackScopeTapFramebufferRect( double leftPx, double topPx, double
     return true;
 }
 
-/*! \brief glReadPixels RGBA8 rows (bottom-up) to the RGB8 interleaved top-down rows ScopesLabel::setScope takes.
- *  The under/over rule (one rule, pinned by PGT-04): under iff any channel of any pixel is 0, over iff any channel
- *  of any pixel is 255. */
-inline void playbackScopeTapRgbaBottomUpToRgb8( const uint8_t *rgba, int w, int h,
-                                                std::vector<uint8_t> *rgb8, bool *under, bool *over )
+/*! \brief r2 (A4): GpuDisplayWindow's letterboxed picture as the read-back's image rectangle. The window draws the
+ *  frame as an NDC quad of +-sx by +-sy over its whole fbW x fbH framebuffer, so in top-down framebuffer pixels the
+ *  picture runs from (1-sx)/2 to (1+sx)/2 of the width and (1-sy)/2 to (1+sy)/2 of the height. With sx, sy <= 1
+ *  (a fit, never a zoom) it is always inside the framebuffer. */
+inline void playbackScopeTapLetterboxRect( double sx, double sy, int fbW, int fbH,
+                                           double *leftPx, double *topPx, double *rightPx, double *bottomPx )
 {
-    bool anyUnder = false;
-    bool anyOver = false;
+    if ( leftPx ) *leftPx = ( 1.0 - sx ) * 0.5 * fbW;
+    if ( rightPx ) *rightPx = ( 1.0 + sx ) * 0.5 * fbW;
+    if ( topPx ) *topPx = ( 1.0 - sy ) * 0.5 * fbH;
+    if ( bottomPx ) *bottomPx = ( 1.0 + sy ) * 0.5 * fbH;
+}
+
+/*! \brief glReadPixels RGBA8 rows (bottom-up) to the RGB8 interleaved top-down rows ScopesLabel::setScope takes.
+ *  Pixels only: the clip flags come from the scope feed's own rule (playbackScopeFeedUnderOver), never from here. */
+inline void playbackScopeTapRgbaBottomUpToRgb8( const uint8_t *rgba, int w, int h, std::vector<uint8_t> *rgb8 )
+{
     if ( rgb8 ) rgb8->assign( static_cast<size_t>( qMax( 0, w ) ) * static_cast<size_t>( qMax( 0, h ) ) * 3u, 0 );
     if ( rgba && rgb8 && w > 0 && h > 0 )
     {
@@ -214,18 +228,68 @@ inline void playbackScopeTapRgbaBottomUpToRgb8( const uint8_t *rgba, int w, int 
             uint8_t *dst = rgb8->data() + static_cast<size_t>( y ) * static_cast<size_t>( w ) * 3u;
             for ( int x = 0; x < w; ++x )
             {
-                for ( int c = 0; c < 3; ++c )
-                {
-                    const uint8_t v = src[ x * 4 + c ];
-                    dst[ x * 3 + c ] = v;
-                    anyUnder = anyUnder || v == 0;
-                    anyOver = anyOver || v == 255;
-                }
+                for ( int c = 0; c < 3; ++c ) dst[ x * 3 + c ] = src[ x * 4 + c ];
             }
         }
     }
-    if ( under ) *under = anyUnder;
-    if ( over ) *over = anyOver;
+}
+
+/*! \brief The CPU feed's zebra scan (1=under, 2=over, 3=both, 0=neither) over RGB8 interleaved pixels: HSL
+ *  lightness (max+min)/2 against preview_zebra's 8-bit thresholds. MainWindow's scanZebrasRgb8 is this rule (it
+ *  delegates here), and applyZebrasToImage applies the same rule while painting the zebras. */
+inline uint8_t playbackScopeZebraScanRgb8( const uint8_t *rgb8, int w, int h )
+{
+    uint8_t underOver = 0;
+    if ( !rgb8 || w <= 0 || h <= 0 ) return underOver;
+    const int pixelCount = w * h;
+    for ( int i = 0; i < pixelCount; ++i )
+    {
+        const uint8_t red = rgb8[ i * 3 + 0 ];
+        const uint8_t green = rgb8[ i * 3 + 1 ];
+        const uint8_t blue = rgb8[ i * 3 + 2 ];
+        const int maxChannel = qMax( red, qMax( green, blue ) );
+        const int minChannel = qMin( red, qMin( green, blue ) );
+        const int lightness = ( maxChannel + minChannel ) / 2;
+        if ( lightness >= preview_zebra::kOverThreshold8Bit ) underOver |= 0x02;
+        if ( lightness <= preview_zebra::kUnderThreshold8Bit ) underOver |= 0x01;
+    }
+    return underOver;
+}
+
+/*! \brief The draw gate's decode of a frame's underOver into setScope's clip flags. */
+inline void playbackScopeUnderOverFlags( uint8_t underOver, bool *under, bool *over )
+{
+    if ( under ) *under = ( underOver & 0x01 ) == 0x01;
+    if ( over ) *over = ( underOver & 0x02 ) == 0x02;
+}
+
+/*! \brief CoS #447 blocker 1: the clip flags a scope feed passes to ScopesLabel::setScope. ONE rule for every feed,
+ *  the CPU feed's: with zebras off the frame's underOver is 0 (applyZebrasToImage returns early, scanZebrasRgb8 runs
+ *  only under GPU shader zebras), so no clip markers; with zebras on, the zebra scan. The read-back serves only with
+ *  zebras off, so it always passes under=false, over=false -- never a per-channel 0/255 rule. */
+inline void playbackScopeFeedUnderOver( bool zebrasEnabled, const uint8_t *rgb8, int w, int h, bool *under, bool *over )
+{
+    playbackScopeUnderOverFlags( zebrasEnabled ? playbackScopeZebraScanRgb8( rgb8, w, h ) : uint8_t( 0 ), under, over );
+}
+
+/*! \brief Which scope a feed draws, from the View menu checks, in the draw gate's order (histogram, waveform,
+ *  parade, vectorscope). None when no scope is checked. Both feeds ask this (CoS #447 parity). */
+enum class PlaybackScopeKind
+{
+    None = 0,
+    Histogram,
+    WaveForm,
+    RgbParade,
+    VectorScope
+};
+
+inline PlaybackScopeKind playbackScopeKindForChecks( bool histogram, bool waveForm, bool parade, bool vectorScope )
+{
+    return histogram ? PlaybackScopeKind::Histogram
+         : waveForm ? PlaybackScopeKind::WaveForm
+         : parade ? PlaybackScopeKind::RgbParade
+         : vectorScope ? PlaybackScopeKind::VectorScope
+         : PlaybackScopeKind::None;
 }
 
 /*! \brief Redraw the stopped frame for its scope when Play stops? Hide skipped scope work while playing

@@ -649,6 +649,7 @@ private slots:
     void mainWindowGpuPreviewPolicyClassifiesPlaybackPipelineStatus();
     void mainWindowGpuPreviewPolicyLabelsVisibleScopeCpuFallback();
     void playbackScopeGpuTapKeepsTheReconTexturePolicyEligibleOnlyWhenItServes();
+    void gpuScopeTapCountsOnlyDroppedRequestsAndInvalidateDropsStaleReadBacks();
     void dualIsoPlaybackPolicyKeepsExplicitPreviewAndPlaybackOverrideSeparate();
     void dualIsoPatternMappingKeepsUiAndCoreConventionsAligned();
     void gpuViewportRgb888ZebraProcessingMatchesCpuReference();
@@ -1430,6 +1431,7 @@ void GuiSmokeTest::playbackScopeGpuTapKeepsTheReconTexturePolicyEligibleOnlyWhen
         tap.anyScopeChecked = true;
         tap.gpuWidgetViewportInstalled = true;
         tap.tapSupported = true;
+        tap.tapRectCapturable = true;
         tap.textureRouteEligibleIgnoringScopes = true;
         const bool scopeDisplayVisible = playbackScopeDisplayConsumesPresentedPixels(
             /*editAreaVisible*/ true, /*playbackActive*/ true, mode, playbackScopeGpuTapServes(tap));
@@ -1453,6 +1455,77 @@ void GuiSmokeTest::playbackScopeGpuTapKeepsTheReconTexturePolicyEligibleOnlyWhen
                      true, true, mainWindowHasScopeVisualization(state), true, true, true, false, true, false),
                  throttled);
     }
+}
+
+// PLAYBACK-GPU-SCOPES-NO-VETO-1 r2: GpuScopeTap's no-GL state, shared by the viewport and GpuDisplayWindow.
+// C4 (CoS #447): only a request DROPPED because both read-backs are in flight counts as not ready.
+// D3 (CoS #447): invalidate() (stop, seek, clip or mode change) drops the pending request and a finished result,
+// and marks in-flight read-backs stale so poll() frees them unread. No context is needed or used.
+void GuiSmokeTest::gpuScopeTapCountsOnlyDroppedRequestsAndInvalidateDropsStaleReadBacks()
+{
+    GpuScopeTap tap("widget");
+    QVERIFY(!tap.supportedCached(nullptr));
+    QVERIFY(!tap.drawnRectCapturable());
+
+    // Nothing in flight: accepted, not "not ready".
+    tap.request(512);
+    QVERIFY(tap.requested());
+    QCOMPARE(tap.counters().requests, quint64(1));
+    QCOMPARE(tap.counters().notReady, quint64(0));
+
+    // One read-back in flight, one slot free: still accepted, still not "not ready" (r1 counted this one).
+    int fenceToken = 0;
+    tap.clearRequest();
+    tap.m_slots[0].fence = reinterpret_cast<GLsync>(&fenceToken);
+    tap.request(512);
+    QVERIFY(tap.requested());
+    QCOMPARE(tap.counters().notReady, quint64(0));
+
+    // Both in flight: dropped and counted.
+    tap.clearRequest();
+    tap.m_slots[1].fence = reinterpret_cast<GLsync>(&fenceToken);
+    tap.request(512);
+    QVERIFY(!tap.requested());
+    QCOMPARE(tap.counters().requests, quint64(3));
+    QCOMPARE(tap.counters().notReady, quint64(1));
+
+    // A finished result is taken exactly once.
+    tap.m_result = { 1, 2, 3 };
+    tap.m_resultWidth = 1;
+    tap.m_resultHeight = 1;
+    tap.m_resultSerial = 7;
+    tap.m_resultReady = true;
+    std::vector<uint8_t> rgb8;
+    int width = 0;
+    int height = 0;
+    quint64 serial = 0;
+    QVERIFY(tap.take(&rgb8, &width, &height, &serial));
+    QCOMPARE(width, 1);
+    QCOMPARE(serial, quint64(7));
+    QVERIFY(!tap.take(&rgb8, &width, &height, &serial));
+
+    // invalidate(): the request and the finished result are gone, and the in-flight read-backs are stale.
+    tap.m_slots[0].generation = tap.m_generation;
+    tap.m_slots[1].generation = tap.m_generation;
+    tap.m_result = { 4, 5, 6 };
+    tap.m_resultReady = true;
+    tap.m_requested = true;
+    tap.invalidate();
+    QVERIFY(!tap.requested());
+    QVERIFY(!tap.take(&rgb8, &width, &height, &serial));
+    QVERIFY(tap.m_slots[0].generation != tap.m_generation);
+    QVERIFY(tap.m_slots[1].generation != tap.m_generation);
+
+    // destroy(false) never calls GL (no context is current here): the names are only forgotten.
+    tap.destroy(false);
+    QVERIFY(!tap.pending());
+    QVERIFY(!tap.drawnRectCapturable());
+
+    // D2: a drawn picture inside the framebuffer is capturable; zoomed past fit it is not.
+    tap.noteDrawnRect(10.0, 20.0, 2148.0, 1353.0, 2158, 1373);
+    QVERIFY(tap.drawnRectCapturable());
+    tap.noteDrawnRect(-50.0, -30.0, 2400.0, 1500.0, 2158, 1373);
+    QVERIFY(!tap.drawnRectCapturable());
 }
 
 void GuiSmokeTest::dualIsoPlaybackPolicyKeepsExplicitPreviewAndPlaybackOverrideSeparate()

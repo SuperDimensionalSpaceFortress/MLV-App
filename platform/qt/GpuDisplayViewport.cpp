@@ -8,7 +8,6 @@
 #include "GpuDisplayViewport.h"
 #include "GpuDisplayWindow.h"
 #include "GpuFieldTelemetry.h"
-#include "PlaybackScopesDuringPlayback.h"
 #include "PlaybackSwapInterval.h"
 
 #include <algorithm>
@@ -499,23 +498,30 @@ bool GpuDisplayViewport::isTexturePresentationActive(const QGraphicsView *view)
     return viewport && viewport->m_texturePresentationActive;
 }
 
+// The answer paintGL cached for this widget's context (GpuScopeTap::supported evaluates only with it current).
 bool GpuDisplayViewport::scopeTapSupported(const QGraphicsView *view)
 {
     const GpuDisplayViewport *viewport = from(view);
-    return viewport && viewport->scopeTapSupportedNow();
+    return viewport && viewport->m_scopeTap.supportedCached(viewport->context());
+}
+
+bool GpuDisplayViewport::scopeTapRectCapturable(const QGraphicsView *view)
+{
+    const GpuDisplayViewport *viewport = from(view);
+    return viewport && viewport->m_scopeTap.drawnRectCapturable();
 }
 
 void GpuDisplayViewport::requestScopeTap(QGraphicsView *view, int maxWidth)
 {
     GpuDisplayViewport *viewport = from(view);
     if ( !viewport ) return;
-    ++viewport->m_scopeTapCounters.requests;
-    const bool slotFree = !viewport->m_scopeTapSlots[0].fence || !viewport->m_scopeTapSlots[1].fence;
-    if ( viewport->scopeTapPending() ) ++viewport->m_scopeTapCounters.notReady;
-    // Both read-backs still in flight: drop this request rather than queue a third.
-    if ( !slotFree ) return;
-    viewport->m_scopeTapRequested = true;
-    viewport->m_scopeTapMaxWidth = qMax(1, maxWidth);
+    viewport->m_scopeTap.request(maxWidth);
+}
+
+void GpuDisplayViewport::invalidateScopeTap(QGraphicsView *view)
+{
+    GpuDisplayViewport *viewport = from(view);
+    if ( viewport ) viewport->m_scopeTap.invalidate();
 }
 
 bool GpuDisplayViewport::takeScopeTap(QGraphicsView *view,
@@ -528,31 +534,24 @@ bool GpuDisplayViewport::takeScopeTap(QGraphicsView *view,
 {
     GpuDisplayViewport *viewport = from(view);
     if ( !viewport || !rgb8 ) return false;
+    if ( under ) *under = false;
+    if ( over ) *over = false;
     QOpenGLContext *glContext = viewport->context();
-    if ( !viewport->m_scopeTapResultReady && viewport->scopeTapPending() && glContext && glContext->isValid() )
+    if ( viewport->m_scopeTap.pending() && glContext && glContext->isValid() )
     {
         // Poll the fence with a zero timeout; makeCurrent only if this context is not already current.
         const bool needsCurrent = QOpenGLContext::currentContext() != glContext;
         if ( needsCurrent ) viewport->makeCurrent();
-        viewport->pollScopeTap();
+        viewport->m_scopeTap.poll(glContext);
         if ( needsCurrent ) viewport->doneCurrent();
     }
-    if ( !viewport->m_scopeTapResultReady ) return false;
-    rgb8->swap(viewport->m_scopeTapResult);
-    viewport->m_scopeTapResult.clear();
-    if ( width ) *width = viewport->m_scopeTapResultWidth;
-    if ( height ) *height = viewport->m_scopeTapResultHeight;
-    if ( under ) *under = viewport->m_scopeTapResultUnder;
-    if ( over ) *over = viewport->m_scopeTapResultOver;
-    if ( serial ) *serial = viewport->m_scopeTapResultSerial;
-    viewport->m_scopeTapResultReady = false;
-    return true;
+    return viewport->m_scopeTap.take(rgb8, width, height, serial);
 }
 
 GpuDisplayViewport::ScopeTapCounters GpuDisplayViewport::scopeTapCountersFor(const QGraphicsView *view)
 {
     const GpuDisplayViewport *viewport = from(view);
-    return viewport ? viewport->m_scopeTapCounters : ScopeTapCounters();
+    return viewport ? viewport->m_scopeTap.counters() : ScopeTapCounters();
 }
 
 GpuDisplayViewport::SamplingMode GpuDisplayViewport::samplingModeFor(const QGraphicsView *view)
@@ -1071,8 +1070,10 @@ void GpuDisplayViewport::paintGL()
     const QColor clearColor = m_view
         ? m_view->backgroundBrush().color()
         : palette().color(QPalette::Window);
-    // PLAYBACK-GPU-SCOPES-NO-VETO-1: collect a scope read-back whose fence has signalled (zero timeout).
-    pollScopeTap();
+    // PLAYBACK-GPU-SCOPES-NO-VETO-1: collect a scope read-back whose fence has signalled (zero timeout), and
+    // answer (once per context, cached) whether this context can do the read-back at all.
+    m_scopeTap.supported(context(), format());
+    m_scopeTap.poll(context());
 
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_CULL_FACE);
@@ -1180,12 +1181,16 @@ void GpuDisplayViewport::paintGL()
     m_program->release();
     m_texturePresentationActive = true;
 
-    // PLAYBACK-GPU-SCOPES-NO-VETO-1: the Throttled scope's read-back of the picture just drawn.
-    if ( m_scopeTapRequested )
+    // PLAYBACK-GPU-SCOPES-NO-VETO-1: the Throttled scope's read-back of the picture just drawn. Every drawn
+    // picture records whether its rectangle can be read back (zoomed past fit it cannot: the scope then stays
+    // on the CPU feed rather than freezing).
+    const int fbWidthPx = static_cast<int>(std::lround(fbWidth));
+    const int fbHeightPx = static_cast<int>(std::lround(fbHeight));
+    m_scopeTap.noteDrawnRect(leftPx, topPx, rightPx, bottomPx, fbWidthPx, fbHeightPx);
+    if ( m_scopeTap.requested() )
     {
-        m_scopeTapRequested = false;
-        issueScopeTap(leftPx, topPx, rightPx, bottomPx,
-                      static_cast<int>(std::lround(fbWidth)), static_cast<int>(std::lround(fbHeight)));
+        m_scopeTap.clearRequest();
+        m_scopeTap.issue(context(), defaultFramebufferObject(), leftPx, topPx, rightPx, bottomPx, fbWidthPx, fbHeightPx);
     }
 
     // Bug A on-screen present A/B (V4): force the dGPU to flush/complete this frame
@@ -1229,7 +1234,7 @@ void GpuDisplayViewport::cleanupGLResources()
     if ( !glContext )
     {
         // No context: the scope read-back's GL names died with it; forget them, never call GL.
-        destroyScopeTapResources(false);
+        m_scopeTap.destroy(false);
         destroyTexture();
         destroyProcessingTextures();
         if ( m_program )
@@ -1243,7 +1248,7 @@ void GpuDisplayViewport::cleanupGLResources()
     const bool needsCurrent = QOpenGLContext::currentContext() != glContext;
     const bool madeCurrent = needsCurrent ? (makeCurrent(), true) : false;
 
-    destroyScopeTapResources(QOpenGLContext::currentContext() == glContext);
+    m_scopeTap.destroy(QOpenGLContext::currentContext() == glContext);
     destroyTexture();
     destroyProcessingTextures();
     if ( m_program )
@@ -2253,207 +2258,6 @@ int GpuDisplayViewport::pendingWidth() const
 int GpuDisplayViewport::pendingHeight() const
 {
     return (m_pendingTextureIs16Bit || m_pendingTextureIsBayer16) ? m_pendingTextureHeight : m_pendingImage.height();
-}
-
-/* PLAYBACK-GPU-SCOPES-NO-VETO-1: the async read-back needs desktop GL (not ES) at >= 3.2, or ARB_sync plus a
- * framebuffer blit; QOpenGLExtraFunctions; and a single-sample widget framebuffer (a scaled blit cannot resolve
- * multisample). Anything else is unsupported, which keeps the CPU scope and its veto. Cached per context. */
-bool GpuDisplayViewport::scopeTapSupportedNow() const
-{
-    QOpenGLContext *glContext = context();
-    if ( !glContext || !glContext->isValid() ) return false;
-    if ( m_scopeTapSupportContext == glContext ) return m_scopeTapSupportCached;
-
-    const QSurfaceFormat realized = glContext->format();
-    bool supported = !glContext->isOpenGLES()
-        && format().samples() <= 0
-        && realized.samples() <= 0
-        && glContext->extraFunctions() != nullptr;
-    if ( supported )
-    {
-        const bool core32 = realized.version() >= qMakePair(3, 2);
-        const bool extensions = glContext->hasExtension(QByteArrayLiteral("GL_ARB_sync"))
-            && ( glContext->hasExtension(QByteArrayLiteral("GL_ARB_framebuffer_object"))
-                 || glContext->hasExtension(QByteArrayLiteral("GL_EXT_framebuffer_blit")) );
-        supported = core32 || extensions;
-    }
-    m_scopeTapSupportContext = glContext;
-    m_scopeTapSupportCached = supported;
-    qInfo().nospace() << "playback_scope_gpu_tap supported=" << (supported ? 1 : 0)
-                      << " gl=" << realized.majorVersion() << '.' << realized.minorVersion()
-                      << " es=" << (glContext->isOpenGLES() ? 1 : 0)
-                      << " samples=" << realized.samples();
-    return supported;
-}
-
-bool GpuDisplayViewport::scopeTapPending() const
-{
-    return m_scopeTapSlots[0].fence != nullptr || m_scopeTapSlots[1].fence != nullptr;
-}
-
-// Called from paintGL right after the image quad is drawn, so the widget framebuffer holds the presented picture.
-void GpuDisplayViewport::issueScopeTap(float leftPx, float topPx, float rightPx, float bottomPx, int fbWidth, int fbHeight)
-{
-    QOpenGLContext *glContext = context();
-    QOpenGLExtraFunctions *extra = glContext ? glContext->extraFunctions() : nullptr;
-    QRect source;
-    if ( !extra || !scopeTapSupportedNow()
-         || !playbackScopeTapFramebufferRect(leftPx, topPx, rightPx, bottomPx, fbWidth, fbHeight, &source) )
-    {
-        ++m_scopeTapCounters.skipped;
-        return;
-    }
-    int slotIndex = -1;
-    for ( int i = 0; i < 2 && slotIndex < 0; ++i )
-    {
-        const int candidate = static_cast<int>( ( m_scopeTapIssueSerial + static_cast<quint64>(i) ) % 2u );
-        if ( !m_scopeTapSlots[candidate].fence ) slotIndex = candidate;
-    }
-    if ( slotIndex < 0 )
-    {
-        ++m_scopeTapCounters.skipped;
-        return;
-    }
-    const QSize tapSize = playbackScopeTapSize(source.width(), source.height(), m_scopeTapMaxWidth);
-    const GLuint widgetFbo = defaultFramebufferObject();
-
-    if ( !m_scopeTapFbo || m_scopeTapFboWidth != tapSize.width() || m_scopeTapFboHeight != tapSize.height() )
-    {
-        if ( m_scopeTapFbo ) glDeleteFramebuffers(1, &m_scopeTapFbo);
-        if ( m_scopeTapColor ) glDeleteRenderbuffers(1, &m_scopeTapColor);
-        m_scopeTapFbo = 0;
-        m_scopeTapColor = 0;
-        glGenRenderbuffers(1, &m_scopeTapColor);
-        glBindRenderbuffer(GL_RENDERBUFFER, m_scopeTapColor);
-        glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, tapSize.width(), tapSize.height());
-        glBindRenderbuffer(GL_RENDERBUFFER, 0);
-        glGenFramebuffers(1, &m_scopeTapFbo);
-        glBindFramebuffer(GL_FRAMEBUFFER, m_scopeTapFbo);
-        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, m_scopeTapColor);
-        const GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-        glBindFramebuffer(GL_FRAMEBUFFER, widgetFbo);
-        if ( status != GL_FRAMEBUFFER_COMPLETE )
-        {
-            glDeleteFramebuffers(1, &m_scopeTapFbo);
-            glDeleteRenderbuffers(1, &m_scopeTapColor);
-            m_scopeTapFbo = 0;
-            m_scopeTapColor = 0;
-            m_scopeTapFboWidth = 0;
-            m_scopeTapFboHeight = 0;
-            ++m_scopeTapCounters.skipped;
-            return;
-        }
-        m_scopeTapFboWidth = tapSize.width();
-        m_scopeTapFboHeight = tapSize.height();
-    }
-
-    ScopeTapSlot &slot = m_scopeTapSlots[slotIndex];
-    const int bytes = tapSize.width() * tapSize.height() * 4;
-    if ( !slot.pbo ) glGenBuffers(1, &slot.pbo);
-
-    extra->glBindFramebuffer(GL_READ_FRAMEBUFFER, widgetFbo);
-    extra->glBindFramebuffer(GL_DRAW_FRAMEBUFFER, m_scopeTapFbo);
-    extra->glBlitFramebuffer(source.left(), source.top(), source.left() + source.width(), source.top() + source.height(),
-                             0, 0, tapSize.width(), tapSize.height(), GL_COLOR_BUFFER_BIT, GL_LINEAR);
-    extra->glBindFramebuffer(GL_READ_FRAMEBUFFER, m_scopeTapFbo);
-    glBindBuffer(GL_PIXEL_PACK_BUFFER, slot.pbo);
-    if ( slot.capacityBytes < bytes )
-    {
-        glBufferData(GL_PIXEL_PACK_BUFFER, bytes, nullptr, GL_STREAM_READ);
-        slot.capacityBytes = bytes;
-    }
-    glPixelStorei(GL_PACK_ALIGNMENT, 4);
-    // Into the bound PBO (offset 0): the GPU copies asynchronously; nothing reaches client memory here.
-    glReadPixels(0, 0, tapSize.width(), tapSize.height(), GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
-    slot.fence = extra->glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
-    glBindFramebuffer(GL_FRAMEBUFFER, widgetFbo);
-    if ( !slot.fence )
-    {
-        ++m_scopeTapCounters.skipped;
-        return;
-    }
-    slot.width = tapSize.width();
-    slot.height = tapSize.height();
-    slot.serial = ++m_scopeTapIssueSerial;
-    ++m_scopeTapCounters.issued;
-}
-
-// Zero-timeout fence poll with this widget's context current: maps a finished read-back, never waits for one.
-void GpuDisplayViewport::pollScopeTap()
-{
-    if ( !scopeTapPending() ) return;
-    QOpenGLContext *glContext = context();
-    if ( !glContext || QOpenGLContext::currentContext() != glContext ) return;
-    QOpenGLExtraFunctions *extra = glContext->extraFunctions();
-    if ( !extra ) return;
-
-    // Oldest first, so a newer read-back is never overwritten by an older one.
-    int order[2] = { 0, 1 };
-    if ( m_scopeTapSlots[1].fence && ( !m_scopeTapSlots[0].fence || m_scopeTapSlots[1].serial < m_scopeTapSlots[0].serial ) )
-    {
-        order[0] = 1;
-        order[1] = 0;
-    }
-    for ( int i : order )
-    {
-        ScopeTapSlot &slot = m_scopeTapSlots[i];
-        if ( !slot.fence ) continue;
-        const GLenum state = extra->glClientWaitSync(slot.fence, 0, 0);
-        if ( state == GL_TIMEOUT_EXPIRED ) continue;
-        if ( state == GL_ALREADY_SIGNALED || state == GL_CONDITION_SATISFIED )
-        {
-            QElapsedTimer mapClock;
-            mapClock.start();
-            const int bytes = slot.width * slot.height * 4;
-            glBindBuffer(GL_PIXEL_PACK_BUFFER, slot.pbo);
-            const void *mapped = extra->glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, bytes, GL_MAP_READ_BIT);
-            if ( mapped )
-            {
-                playbackScopeTapRgbaBottomUpToRgb8(static_cast<const uint8_t *>(mapped), slot.width, slot.height,
-                                                   &m_scopeTapResult, &m_scopeTapResultUnder, &m_scopeTapResultOver);
-                extra->glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
-                m_scopeTapResultWidth = slot.width;
-                m_scopeTapResultHeight = slot.height;
-                m_scopeTapResultSerial = slot.serial;
-                m_scopeTapResultReady = true;
-                ++m_scopeTapCounters.completed;
-                m_scopeTapCounters.lastWidth = slot.width;
-                m_scopeTapCounters.lastHeight = slot.height;
-                m_scopeTapCounters.mapMsTotal += static_cast<double>(mapClock.nsecsElapsed()) / 1.0e6;
-            }
-            glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
-        }
-        // Signalled (mapped or not) or GL_WAIT_FAILED: this read-back is finished either way.
-        extra->glDeleteSync(slot.fence);
-        slot.fence = nullptr;
-    }
-}
-
-/* contextCurrent: this widget's context is current, so the FBO, renderbuffer, PBOs and fences are deleted.
- * Otherwise (no context, or it could not be made current) the names are only forgotten: a GL call without a
- * current context is never made (CPU-SCOPE-LIVE-HEAP-CORRUPTION-1 is open on teardown). */
-void GpuDisplayViewport::destroyScopeTapResources(bool contextCurrent)
-{
-    QOpenGLContext *glContext = context();
-    QOpenGLExtraFunctions *extra = ( contextCurrent && glContext ) ? glContext->extraFunctions() : nullptr;
-    const bool callGl = contextCurrent && glContext && QOpenGLContext::currentContext() == glContext;
-    for ( ScopeTapSlot &slot : m_scopeTapSlots )
-    {
-        if ( callGl && slot.fence && extra ) extra->glDeleteSync(slot.fence);
-        if ( callGl && slot.pbo ) glDeleteBuffers(1, &slot.pbo);
-        slot = ScopeTapSlot();
-    }
-    if ( callGl && m_scopeTapFbo ) glDeleteFramebuffers(1, &m_scopeTapFbo);
-    if ( callGl && m_scopeTapColor ) glDeleteRenderbuffers(1, &m_scopeTapColor);
-    m_scopeTapFbo = 0;
-    m_scopeTapColor = 0;
-    m_scopeTapFboWidth = 0;
-    m_scopeTapFboHeight = 0;
-    m_scopeTapRequested = false;
-    m_scopeTapResultReady = false;
-    m_scopeTapResult.clear();
-    m_scopeTapSupportContext = nullptr;
 }
 
 bool GpuDisplayViewport::hasPendingFrame() const

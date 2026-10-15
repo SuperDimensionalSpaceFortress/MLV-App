@@ -1783,6 +1783,13 @@ private:
     bool gpuPlaybackReconTextureRouteTableAtScaleOne( bool hasScopeVisualization ) const;
     bool textureRouteEligibleIgnoringScopes( void ) const;
     bool playbackScopeGpuTapServesNow( bool editAreaVisible ) const;
+    // PLAYBACK-GPU-SCOPES-NO-VETO-1 r2: the active GL surface's scope read-back (GpuDisplayWindow, else the viewport).
+    bool playbackScopeTapSupported( void ) const;
+    bool playbackScopeTapRectCapturable( void ) const;
+    void requestPlaybackScopeTap( int maxWidth ) const;
+    bool takePlaybackScopeTap( std::vector<uint8_t> *rgb8, int *width, int *height, quint64 *serial ) const;
+    GpuScopeTap::Counters playbackScopeTapCounters( void ) const;
+    void invalidatePlaybackScopeTap( void ) const;
     bool scopeDisplayConsumesPresentedPixels( bool editAreaVisible ) const;
     void applyPlaybackScopesMode( PlaybackScopesMode mode, bool persist );
     MainWindowGpuPreviewPolicyState gpuPreviewPolicyForCurrentScopeState(

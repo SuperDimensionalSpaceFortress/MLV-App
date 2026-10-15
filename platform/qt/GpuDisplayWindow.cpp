@@ -9,6 +9,7 @@
 #include "GpuDebayer.h"
 #include "GpuFieldTelemetry.h"
 #include "PlaybackScaling.h"
+#include "PlaybackScopesDuringPlayback.h"
 #include "PlaybackSwapInterval.h"
 #include "debug/StageTiming.h"
 #include "../../src/mlv_include.h"
@@ -514,6 +515,60 @@ GpuPresentSetupTiming GpuDisplayWindow::lastPresentSetupTimingIfActive()
     QMutexLocker lock(&g_activeMutex);
     GpuDisplayWindow *win = g_activeWindow.load(std::memory_order_acquire);
     return win ? win->lastPresentSetupTiming() : GpuPresentSetupTiming();
+}
+
+namespace
+{
+// PLAYBACK-GPU-SCOPES-NO-VETO-1 r2: the active window, only on its own (GUI) thread; call with g_activeMutex held.
+GpuDisplayWindow *activeWindowOnItsThreadLocked()
+{
+    GpuDisplayWindow *win = g_activeWindow.load(std::memory_order_acquire);
+    return ( win && QThread::currentThread() == win->thread() ) ? win : nullptr;
+}
+}
+
+bool GpuDisplayWindow::scopeTapSupportedIfActive()
+{
+    QMutexLocker lock(&g_activeMutex);
+    GpuDisplayWindow *win = activeWindowOnItsThreadLocked();
+    // The answer paintGL cached for this window's context (GpuScopeTap::supported evaluates only with it current).
+    return win && win->m_scopeTap.supportedCached(win->context());
+}
+
+bool GpuDisplayWindow::scopeTapRectCapturableIfActive()
+{
+    QMutexLocker lock(&g_activeMutex);
+    GpuDisplayWindow *win = activeWindowOnItsThreadLocked();
+    return win && win->m_scopeTap.drawnRectCapturable();
+}
+
+void GpuDisplayWindow::requestScopeTapIfActive(int maxWidth)
+{
+    QMutexLocker lock(&g_activeMutex);
+    GpuDisplayWindow *win = activeWindowOnItsThreadLocked();
+    if ( win ) win->m_scopeTap.request(maxWidth);
+}
+
+// No GL: paintGL polls the fence at its start, and paint-per-submit paints on every submit.
+bool GpuDisplayWindow::takeScopeTapIfActive(std::vector<uint8_t> *rgb8, int *width, int *height, quint64 *serial)
+{
+    QMutexLocker lock(&g_activeMutex);
+    GpuDisplayWindow *win = activeWindowOnItsThreadLocked();
+    return win && win->m_scopeTap.take(rgb8, width, height, serial);
+}
+
+void GpuDisplayWindow::invalidateScopeTapIfActive()
+{
+    QMutexLocker lock(&g_activeMutex);
+    GpuDisplayWindow *win = activeWindowOnItsThreadLocked();
+    if ( win ) win->m_scopeTap.invalidate();
+}
+
+GpuScopeTap::Counters GpuDisplayWindow::scopeTapCountersIfActive()
+{
+    QMutexLocker lock(&g_activeMutex);
+    GpuDisplayWindow *win = activeWindowOnItsThreadLocked();
+    return win ? win->m_scopeTap.counters() : GpuScopeTap::Counters();
 }
 
 bool GpuDisplayWindow::readGpuReconSourceBayer16TextureIfActive(
@@ -1396,6 +1451,9 @@ void GpuDisplayWindow::cleanupGLResources()
     const bool needsCurrent = glContext && QOpenGLContext::currentContext() != glContext;
     const bool madeCurrent = needsCurrent ? (makeCurrent(), true) : false;
 
+    // PLAYBACK-GPU-SCOPES-NO-VETO-1 r2: the scope read-back's names are deleted only with this context current;
+    // otherwise they are only forgotten (never a GL call without a current context).
+    m_scopeTap.destroy(glContext && QOpenGLContext::currentContext() == glContext);
     destroyTexture();
     gpuPreviewProcessingDestroyLutTextureSet(m_lutSet);
     delete m_program;
@@ -1500,6 +1558,11 @@ void GpuDisplayWindow::updateTextureIfNeeded()
 
 void GpuDisplayWindow::paintGL()
 {
+    // PLAYBACK-GPU-SCOPES-NO-VETO-1 r2: collect a scope read-back whose fence has signalled (zero timeout), and
+    // answer (once per context, cached) whether this context can do the read-back at all.
+    m_scopeTap.supported(context(), format());
+    m_scopeTap.poll(context());
+
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_CULL_FACE);
     glDisable(GL_BLEND);
@@ -1653,6 +1716,23 @@ void GpuDisplayWindow::paintGL()
                 m_captureReadbackSucceeded = true;
                 m_captureReadbackError.clear();
             }
+        }
+    }
+
+    // PLAYBACK-GPU-SCOPES-NO-VETO-1 r2: the Throttled scope's read-back of the letterboxed picture just drawn,
+    // AFTER the synchronous capture block above and never during a capture paint (the capture's glReadPixels
+    // runs first; the tap leaves GL_PIXEL_PACK_BUFFER at 0 and rebinds the default framebuffer).
+    {
+        double tapLeft = 0.0;
+        double tapTop = 0.0;
+        double tapRight = 0.0;
+        double tapBottom = 0.0;
+        playbackScopeTapLetterboxRect(sx, sy, fbw, fbh, &tapLeft, &tapTop, &tapRight, &tapBottom);
+        m_scopeTap.noteDrawnRect(tapLeft, tapTop, tapRight, tapBottom, fbw, fbh);
+        if ( m_scopeTap.requested() && !m_captureReadbackRequested && m_texturePresentationActive )
+        {
+            m_scopeTap.clearRequest();
+            m_scopeTap.issue(context(), defaultFramebufferObject(), tapLeft, tapTop, tapRight, tapBottom, fbw, fbh);
         }
     }
 

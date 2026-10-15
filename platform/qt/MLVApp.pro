@@ -200,6 +200,7 @@ SOURCES += \
     GpuDebayer.cpp \
     GpuDisplayViewport.cpp \
     GpuDisplayWindow.cpp \
+    GpuScopeTap.cpp \
     GpuFieldTelemetry.cpp \
         main.cpp \
         MainWindow.cpp \
@@ -398,6 +399,7 @@ HEADERS += MainWindow.h \
            GpuPreviewHostRoute.h \
     GpuDisplayViewport.h \
     GpuDisplayWindow.h \
+    GpuScopeTap.h \
     GpuFieldTelemetry.h \
     GpuFieldTelemetryCore.h \
     ../../tools/gpu/igpu_cuda_error.h \
