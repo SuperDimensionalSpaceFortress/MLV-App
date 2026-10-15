@@ -9082,6 +9082,14 @@ class Na2AssignmentIsNotADeleteTests(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertNotIn("delete", self._acts(cmd))
 
+    def test_cmd_exe_equals_delimiter_is_still_a_delete(self):
+        # r2 (sol key blocker): cmd.exe treats `=` as a delimiter, so these REALLY delete.
+        for cmd in ('cmd /c rd= /s /q C:/review/board/.claude-state/fleet-runs/lane-A-r1',
+                    'cmd /c rmdir= /s /q C:\\x\\y', 'cmd.exe /c del= C:\\x\\y.txt', 'cmd /k rd=/s /q x',
+                    'echo a && cmd /C "rd= /s /q C:\\x"'):
+            with self.subTest(cmd=cmd):
+                self.assertIn("delete", self._acts(cmd))
+
     def test_real_delete_verbs_still_read_as_deletes(self):
         for cmd in ('rd /s /q C:\\x\\y', 'rm -rf /c/x/y', 'del C:\\x\\y.txt', 'rmdir /c/x/y',
                     'echo a; rd /s x', 'Remove-Item -Recurse C:\\x', 'git rm x'):

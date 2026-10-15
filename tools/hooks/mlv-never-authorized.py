@@ -1237,18 +1237,23 @@ def read_json(path):
 
 # ------------------------------------------------------------------------ verbs
 
-# HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (2026-10-15): `(?!=)` -- a bare verb word directly followed by `=`
-# is a shell VARIABLE assignment (`RD="<run dir>"`), not a delete.  Without it, `RD=` read as `rd`
-# and every later mention of `$RD` was refused as a delete of that run dir (three lanes, one day).
-_DELETE_RX = re.compile(
-    r"(?:^|[\s;&|`(])(?:rm|del|rd|rmdir)\b(?!=)"
+# HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (2026-10-15): a bare verb word directly followed by `=` is a POSIX shell
+# VARIABLE assignment (`RD="<run dir>"`), not a delete.  Without the exemption, `RD=` read as `rd` and every later
+# mention of `$RD` was refused as a delete of that run dir (three lanes, one day).
+# r2 (sol key): cmd.exe treats `=` as an argument DELIMITER, so `cmd /c rd= /s /q <dir>` really is `rd /s /q <dir>`.
+# The exemption therefore applies ONLY when the text has no cmd.exe segment (`cmd /c`, `cmd.exe /k`, ...);
+# with one, `_DELETE_RX_STRICT` (no `(?!=)`) decides, as before this card.
+_DELETE_TAIL = (
     r"|\bremove-item\b"
     r"|\bgit\s+rm\b"
     r"|\bos\.(?:remove|unlink)\s*\("
     r"|\bshutil\.rmtree\s*\("
-    r"|\.unlink\s*\(",
-    re.I,
+    r"|\.unlink\s*\("
 )
+_DELETE_RX = re.compile(r"(?:^|[\s;&|`(])(?:rm|del|rd|rmdir)\b(?!=)" + _DELETE_TAIL, re.I)
+# Inside a cmd.exe segment a quote also starts a command (`cmd /c "rd /s /q x"`), so it counts as a boundary there.
+_DELETE_RX_STRICT = re.compile(r"(?:^|[\s;&|`(\"'])(?:rm|del|rd|rmdir)\b" + _DELETE_TAIL, re.I)
+_CMD_SEGMENT_RX = re.compile(r"\bcmd(?:\.exe)?\b[\"']?\s+/[ckCK]\b", re.I)
 _MOVE_RX = re.compile(
     r"(?:^|[\s;&|`(])(?:mv|move)\b"
     r"|\bmove-item\b"
@@ -1331,7 +1336,8 @@ def shell_acts(command):
     """
     scan = _GIT_RM_CACHED_RX.sub(" gitrmcached ", command or "")
     acts = set()
-    if _DELETE_RX.search(scan):
+    delete_rx = _DELETE_RX_STRICT if _CMD_SEGMENT_RX.search(scan) else _DELETE_RX
+    if delete_rx.search(scan):
         acts.add("delete")
     if _MOVE_RX.search(scan):
         acts.add("move")
