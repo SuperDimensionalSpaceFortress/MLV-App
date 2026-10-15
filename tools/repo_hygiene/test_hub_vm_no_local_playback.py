@@ -252,6 +252,39 @@ class PromptLintTests(unittest.TestCase):
             with self.subTest(text=text[:70]):
                 self.assertEqual([], self._findings(text), text)
 
+    # HUB-VM-LINT-CLAUSE-SCOPE-1 (Sol review of PR #401): a negation or a venue word exempts only the clause it sits in. The first
+    # five rows are the review's probe sentences verbatim; the rest are the same defect with the clauses joined by a comma / "and".
+    CLAUSE_MUST_REFUSE = (
+        "Run playback here.",
+        "Play the clip locally in MLVApp.",
+        "Run playback on this host after the venue job finishes.",
+        "Do not run the venue chain. Run playback locally.",
+        "Do not run the venue chain, run playback locally.",
+        "Do not run the venue chain and run playback locally.",
+        "Do not use the venue chain, run playback here.",
+        "Run the arms on Bachelor and on this host.",
+        "Do not wait for Bachelor, play the clip locally in MLVApp.",
+    )
+    CLAUSE_MUST_PASS = (
+        "Run playback locally on Bachelor through the venue chain.",
+        "Run playback on Bachelor through the venue chain, not on this host.",
+        "Run playback through the venue chain and read the log here.",
+        "Never run playback locally, nor on this host.",
+        "Never run playback locally and on this host.",
+        "Run the arms on Bachelor through the venue chain and never locally.",
+        "Run playback on Bachelor rather than locally.",
+    )
+
+    def test_red_clause_scope_equivalent_wordings_are_refused(self):
+        for text in self.CLAUSE_MUST_REFUSE:
+            with self.subTest(text=text):
+                self.assertTrue(self._findings(text), text)
+
+    def test_green_clause_scope_venue_routed_wordings_pass(self):
+        for text in self.CLAUSE_MUST_PASS:
+            with self.subTest(text=text):
+                self.assertEqual([], self._findings(text), text)
+
     def test_the_binding_block_is_removed_only_up_to_the_next_heading(self):
         text = f"## NO LOCAL PLAYBACK\nNever do it.\n## STEPS\nRun the arms locally with {APP}.\n"
         self.assertTrue(self._findings(text), "a real instruction AFTER the binding block must still be caught")

@@ -11,8 +11,13 @@
 # .claude-state\hub-autopilot\dispatch-perf-lane.ps1 refuses such a producer prompt before any lane is created.
 #
 # The binding "NO LOCAL PLAYBACK" section the dispatch scripts append is excluded from the scan (it names the forbidden flags on purpose), and a
-# sentence that is itself a prohibition (never / do not / must not / forbidden / refuse ...) is not an instruction. A sentence that routes the work
+# clause that is itself a prohibition (never / do not / must not / forbidden / refuse ...) is not an instruction. A clause that routes the work
 # through a venue (Bachelor, Ultra-Magnus, the venue chain) is not a local launch.
+#
+# Scope (HUB-VM-LINT-CLAUSE-SCOPE-1): a negation or a venue word exempts only the CLAUSE it sits in, never a later clause of the same sentence
+# ("Do not run the venue chain, run playback locally" is refused; "Run playback on this host after the venue job finishes" is refused). Within
+# a clause the venue qualification is read before the local-playback match, so "run playback locally on Bachelor through the venue chain" passes.
+# A clause with no launch verb of its own ("... locally and on this host") carries the negation of the clause before it, never its venue words.
 #
 # ASCII only (PowerShell 5.1 reads a BOM-less file as the ANSI code page). No Set-StrictMode here: a dot-sourced file would leak it into the caller.
 
@@ -56,6 +61,47 @@ function Remove-NoLocalPlaybackSection {
     return ($out -join "`n")
 }
 
+# One sentence cut into clauses. A boundary is a connector that opens a new predicate: ", run ...", " and ", " then ", " after ", " but ", " - ".
+# Each clause records the negation / venue words it holds itself; a clause with no launch verb of its own is a coordinated complement and
+# inherits the negation (not the venue qualification) of the clause before it.
+function Get-LintClauses {
+    param([string]$Sentence, [string]$Separator, [string]$LaunchVerb, [string]$StrongNeg, [string]$WeakNeg, [string]$VenueQualified)
+    $spans = New-Object System.Collections.Generic.List[object]
+    $pos = 0
+    foreach ($m in [regex]::Matches($Sentence, $Separator)) {
+        $spans.Add(@($pos, $m.Index))
+        $pos = $m.Index + $m.Length
+    }
+    $spans.Add(@($pos, $Sentence.Length))
+    $clauses = New-Object System.Collections.Generic.List[object]
+    $prev = $null
+    foreach ($sp in $spans) {
+        $start = [int]$sp[0]; $end = [int]$sp[1]
+        if ($end -le $start) { continue }
+        $text = $Sentence.Substring($start, $end - $start)
+        if (-not $text.Trim()) { continue }
+        $hasVerb = [bool]($text -match $LaunchVerb)
+        $strong = [bool]($text -match $StrongNeg)
+        $weak = [bool]($text -match $WeakNeg)
+        if (-not $hasVerb -and $prev) { $strong = $strong -or $prev.Strong; $weak = $weak -or $prev.Weak }
+        $c = [pscustomobject]@{ Start = $start; End = $end; Text = $text; HasVerb = $hasVerb; Strong = $strong; Weak = $weak; Venue = [bool]($text -match $VenueQualified) }
+        $clauses.Add($c)
+        $prev = $c
+    }
+    if ($clauses.Count -eq 0) {
+        $clauses.Add([pscustomobject]@{ Start = 0; End = $Sentence.Length; Text = $Sentence; HasVerb = [bool]($Sentence -match $LaunchVerb); Strong = [bool]($Sentence -match $StrongNeg); Weak = [bool]($Sentence -match $WeakNeg); Venue = [bool]($Sentence -match $VenueQualified) })
+    }
+    return $clauses.ToArray()
+}
+
+# The clause a match starting at $Index sits in (the last clause that starts at or before it).
+function Get-ClauseAt {
+    param([object[]]$Clauses, [int]$Index)
+    $found = $Clauses[0]
+    foreach ($c in $Clauses) { if ($c.Start -le $Index) { $found = $c } }
+    return $found
+}
+
 function Get-LocalPlaybackPromptFindings {
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Text)
@@ -67,29 +113,63 @@ function Get-LocalPlaybackPromptFindings {
     $strongNeg = "(?i)${b}(never|do not|don't|must not|mustn't|may not|no local|not locally|forbidden|forbids|refuse[sd]?|refusal|prohibit\w*|instead of running|rather than running|without running)${e}"
     $weakNeg = "(?i)${b}(not|no|without)${e}"
     $venueQualified = "(?i)${b}(venue|venues|bachelor|ultra-magnus|um-run|Invoke-Venue(Chain|Leg)|chain runner)${e}"
-    $launchVerb = "(?i)${b}(run|runs|running|launch|launches|launching|launched|start|starts|starting|execute|executes|executing|invoke|invokes|invoking|drive|drives|driving|kick off)${e}"
+    $verbs = 'run|runs|running|launch|launches|launching|launched|start|starts|starting|execute|executes|executing|invoke|invokes|invoking|drive|drives|driving|kick off|play|plays|playing|open|opens|opening'
+    $launchVerb = "(?i)${b}(${verbs})${e}"
     $playbackWord = "(?i)(${b}playback${e}|gui-smoke|profile-playback|${b}MLVApp(Release)?(\.exe)?${e}|smoke run|${b}exactness${e}|${b}arms?${e}|${b}GUI${e})"
     $scripts = '(run-release-gui-smoke|start-release-cuda-playback|run-release-playback-profile|validate-visible-playback|capture-reference-frame)\.ps1'
+    # Clause boundaries: a comma that opens a new imperative, a coordinating / subordinating connector, or a spaced dash.
+    $separator = "(?i),\s*(?:(?:then|and|just|also|please|so)\s+)?(?=(?:${verbs}|use|using|do)${e})|${b}(and then|then|and|but|after|before|once|when|whenever|while|until|because|otherwise|unless|except|although|though|whereas)${e}|\s-{1,2}\s"
+    $incident = '(?i)(?<![\w\-"''`])where\s+an?\s+(gui|desktop|display)(\s+desktop)?\s+session' + $e + '[^.\n]{0,100}' + $b + 'exists?' + $e
+    $localMarker = "(?i)${b}locally${e}"
+    $hostMarker = "(?i)${b}on\s+(this|the)\s+(hub|host|vm|machine|box)${e}|${b}on\s+virtual-ten${e}"
+    $hereMarker = "(?i)${b}here(?![\w\-'])"
+    $direct = @(
+        "(?i)${b}MLVApp(Release)?\.exe\s+(?:(?!/\s)\S+\s+){0,12}--(gui-smoke-playback|profile-playback)",
+        "(?i)(pwsh|powershell)(\.exe)?${e}[^\n]{0,80}-File\s+\S*$scripts",
+        "(?i)(^|[\s``&(])(&\s*)?\.{0,2}[\\/]?\S*$scripts\s+-\w+")
     $findings = New-Object System.Collections.Generic.List[string]
     # A "sentence" is a line, cut again at '. ' so one bullet carrying several instructions is judged piece by piece.
     foreach ($line in ($scan -split "\r?\n")) {
         foreach ($sentence in ($line -split '(?<=[.;!?])\s+')) {
             $s = $sentence.Trim()
             if ($s.Length -lt 8) { continue }
-            if ($s -match $strongNeg) { continue }
+            $clauses = @(Get-LintClauses -Sentence $s -Separator $separator -LaunchVerb $launchVerb -StrongNeg $strongNeg -WeakNeg $weakNeg -VenueQualified $venueQualified)
+            $isPlayback = ($s -match $playbackWord) -and ($s -match $launchVerb)
             $hit = $null
-            # (1) the incident phrase: "where a GUI desktop session and the clip exist" and its relatives
-            # A phrase that opens with a quote mark is a QUOTATION of the old wording (an incident report), not an instruction.
-            if ($s -match ('(?i)(?<![\w\-"''`])where\s+an?\s+(gui|desktop|display)(\s+desktop)?\s+session' + $e + '[^.\n]{0,100}' + $b + 'exists?' + $e)) { $hit = 'where-a-gui-session-exists' }
-            # (2) "locally" attached to a playback / smoke / MLVApp / arm instruction
-            elseif ($s -match "(?i)${b}locally${e}" -and $s -match $playbackWord -and $s -match $launchVerb) { $hit = 'run-playback-locally' }
-            elseif ($s -match $weakNeg -or $s -match $venueQualified) { continue }
-            # (3) "on this host / the hub (VM)" attached to a playback launch
-            elseif ($s -match "(?i)${b}on\s+(this|the)\s+(hub|host|vm|machine|box)${e}|${b}on\s+virtual-ten${e}" -and $s -match $playbackWord -and $s -match $launchVerb) { $hit = 'run-playback-on-this-host' }
+            # (1) the incident phrase: "where a GUI desktop session and the clip exist" and its relatives. A phrase that opens with a quote
+            # mark is a QUOTATION of the old wording (an incident report), not an instruction; the clause holding "where" must not be a prohibition.
+            $m1 = [regex]::Match($s, $incident)
+            if ($m1.Success -and -not (Get-ClauseAt -Clauses $clauses -Index $m1.Index).Strong) { $hit = 'where-a-gui-session-exists' }
+            # (2) "locally" attached to a playback / smoke / MLVApp / arm instruction; its own clause must be neither a prohibition nor venue-routed
+            if (-not $hit -and $isPlayback) {
+                foreach ($m in [regex]::Matches($s, $localMarker)) {
+                    $c = Get-ClauseAt -Clauses $clauses -Index $m.Index
+                    if (-not ($c.Strong -or $c.Venue)) { $hit = 'run-playback-locally'; break }
+                }
+            }
+            # (3) "on this host / the hub (VM)" attached to a playback launch; a negation or a venue word in that clause exempts it
+            if (-not $hit -and $isPlayback) {
+                foreach ($m in [regex]::Matches($s, $hostMarker)) {
+                    $c = Get-ClauseAt -Clauses $clauses -Index $m.Index
+                    if (-not ($c.Strong -or $c.Weak -or $c.Venue)) { $hit = 'run-playback-on-this-host'; break }
+                }
+            }
+            # (3b) a bare "here" is weak evidence, so the launch verb and the playback word must sit in the same clause as the word
+            if (-not $hit) {
+                foreach ($m in [regex]::Matches($s, $hereMarker)) {
+                    $c = Get-ClauseAt -Clauses $clauses -Index $m.Index
+                    if ($c.HasVerb -and ($c.Text -match $playbackWord) -and -not ($c.Strong -or $c.Weak -or $c.Venue)) { $hit = 'run-playback-here'; break }
+                }
+            }
             # (4) a direct command line: the app with a playback mode, or a tracked launcher called with a parameter
-            elseif ($s -match "(?i)${b}MLVApp(Release)?\.exe\s+(?:(?!/\s)\S+\s+){0,12}--(gui-smoke-playback|profile-playback)" -or
-                    $s -match "(?i)(pwsh|powershell)(\.exe)?${e}[^\n]{0,80}-File\s+\S*$scripts" -or
-                    $s -match "(?i)(^|[\s``&(])(&\s*)?\.{0,2}[\\/]?\S*$scripts\s+-\w+") { $hit = 'direct-playback-launch' }
+            if (-not $hit) {
+                foreach ($pattern in $direct) {
+                    $m4 = [regex]::Match($s, $pattern)
+                    if (-not $m4.Success) { continue }
+                    $c = Get-ClauseAt -Clauses $clauses -Index $m4.Index
+                    if (-not ($c.Strong -or $c.Weak -or $c.Venue)) { $hit = 'direct-playback-launch'; break }
+                }
+            }
             if ($hit) {
                 $shown = if ($s.Length -gt 220) { $s.Substring(0, 220) + '...' } else { $s }
                 $findings.Add("${hit}: $shown")
