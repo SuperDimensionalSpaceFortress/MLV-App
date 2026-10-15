@@ -745,9 +745,9 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("CLIP_TOO_SHORT", proc.stdout + proc.stderr)
         self.assertFalse(out.exists())
-        # ... and a play window under 20 s never binds.
+        # ... and a play window under the lowest floor (PLAYBACK-CLIP-LENGTH-HFR-10S-1: an HFR clip's 10 s) never binds.
         proc = run_pwsh(["-File", str(GENERATOR), "-SourceCommit", self.head, "-BuildManifestSha256", "ab" * 32, "-ClipId", FIXTURE_IDS[0],
-                         "-FixtureSha256", "cd" * 32, "-RepoRoot", str(self.repo), "-OutFile", str(out), "-PlaySeconds", "19"])
+                         "-FixtureSha256", "cd" * 32, "-RepoRoot", str(self.repo), "-OutFile", str(out), "-PlaySeconds", "9"])
         self.assertNotEqual(proc.returncode, 0)
         self.assertFalse(out.exists())
 
