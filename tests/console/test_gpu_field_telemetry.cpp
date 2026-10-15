@@ -1544,7 +1544,13 @@ QStringList exitJoinCensus(const QString & source)
         "    }, budget.remainingTime());",
         "    startedWorkerPool()->start(std::move(write));\n"
         "    workerPool()->waitForDone(static_cast<int>(waitMs > 0 ? waitMs : 0));",
-        "    runExitWriteWithin([]() { flushImpl(\"post_session\", false, false, 0, false); }, core::kSessionEndWaitMs);",
+        // POST-SESSION-LATE-FAULT-1 (CoS on #435): on a1ab71cbccaeb1748cfc630461edf1db34c65aec the post
+        // routine returned at waitForDone(0) while the session_end write ran, losing a fault noted after
+        // its snapshot. The post write is queued behind a running write and re-checks before it writes,
+        // and a worker flush reads the backend description with a bounded wait.
+        "        flushImpl(\"post_session\", false, false, 0, false);\n    }, core::kSessionEndWaitMs);",
+        "            if (state().unwritten.faults.empty()) return; // a write ahead of it took them",
+        "describe ? reconDescribe(onWorker ? static_cast<int>(core::kTerminalDrainWaitMs) : -1) : std::string();",
         // The worker checks the flag before each step.
         "        if (!waitUnlessShuttingDown(delayMs)) return; // session_end writes it instead\n        if (workerStopped(true)) return;",
         "        flushImpl(\"after_fault\", true, true);",
@@ -1559,6 +1565,8 @@ QStringList exitJoinCensus(const QString & source)
     if (source.count(QStringLiteral("    if (workerStopped(onWorker)) return;")) != 3)
         missing << QStringLiteral("flushImpl stop checks != 3");
     if (source.contains(QStringLiteral("static State s;"))) missing << QStringLiteral("function-static State");
+    if (source.contains(QStringLiteral("!workerPool()->waitForDone(0)) return;")))
+        missing << QStringLiteral("post routine skips while an exit write runs");
     return missing;
 }
 
@@ -1575,8 +1583,11 @@ TEST(GpuFieldTelemetry, SessionEndJoinsTheWorkerOrSkipsTheFinalWrite)
         QStringLiteral("    static State * s = new State();\n    return *s;"), QStringLiteral("    static State s;\n    return s;"));
     ASSERT_EQ(2, (int)exitJoinCensus(staticState).size());
     const QString noStepCheck = replacedOnce(source,
-        QStringLiteral("    const std::string cudaModel = describe ? reconDescribe() : std::string();\n    if (workerStopped(onWorker)) return;\n"),
-        QStringLiteral("    const std::string cudaModel = describe ? reconDescribe() : std::string();\n"));
+        QStringLiteral("    const std::string cudaModel =\n"
+                       "        describe ? reconDescribe(onWorker ? static_cast<int>(core::kTerminalDrainWaitMs) : -1) : std::string();\n"
+                       "    if (workerStopped(onWorker)) return;\n"),
+        QStringLiteral("    const std::string cudaModel =\n"
+                       "        describe ? reconDescribe(onWorker ? static_cast<int>(core::kTerminalDrainWaitMs) : -1) : std::string();\n"));
     ASSERT_EQ(1, (int)exitJoinCensus(noStepCheck).size());
 }
 
@@ -1608,7 +1619,31 @@ TEST(GpuFieldTelemetry, SessionEndNeverWaitsUnboundedOnTheBackendLockOrTheWrite)
         QStringLiteral("    workerPool()->waitForDone();"));
     ASSERT_EQ(1, (int)exitJoinCensus(unboundedWait).size());
     const QString guiThreadPostWrite = replacedOnce(source,
-        QStringLiteral("    runExitWriteWithin([]() { flushImpl(\"post_session\", false, false, 0, false); }, core::kSessionEndWaitMs);"),
+        QStringLiteral("    runExitWriteWithin([]() {\n"
+                       "        {\n"
+                       "            QMutexLocker locker(&state().mutex);\n"
+                       "            if (state().unwritten.faults.empty()) return; // a write ahead of it took them\n"
+                       "        }\n"
+                       "        flushImpl(\"post_session\", false, false, 0, false);\n"
+                       "    }, core::kSessionEndWaitMs);"),
         QStringLiteral("    flushImpl(\"post_session\", false, false, 0, false);"));
-    ASSERT_EQ(1, (int)exitJoinCensus(guiThreadPostWrite).size());
+    // Both post rows go: the queued write on the worker and its re-check.
+    ASSERT_EQ(2, (int)exitJoinCensus(guiThreadPostWrite).size());
+    // POST-SESSION-LATE-FAULT-1 mutations: the a1ab71cbccaeb1748cfc630461edf1db34c65aec skip, an
+    // unbounded worker describe, and a queued post write without its re-check are each reported.
+    const QString skipWhileBusy = replacedOnce(source, QStringLiteral("void postSessionFlush()\n{\n"),
+        QStringLiteral("void postSessionFlush()\n{\n"
+                       "    if (g_workerPoolCreated.load() && !workerPool()->waitForDone(0)) return;\n"));
+    ASSERT_EQ(1, (int)exitJoinCensus(skipWhileBusy).size());
+    const QString unboundedWorkerDescribe = replacedOnce(source,
+        QStringLiteral("reconDescribe(onWorker ? static_cast<int>(core::kTerminalDrainWaitMs) : -1)"),
+        QStringLiteral("reconDescribe()"));
+    ASSERT_EQ(1, (int)exitJoinCensus(unboundedWorkerDescribe).size());
+    const QString noRecheck = replacedOnce(source,
+        QStringLiteral("        {\n"
+                       "            QMutexLocker locker(&state().mutex);\n"
+                       "            if (state().unwritten.faults.empty()) return; // a write ahead of it took them\n"
+                       "        }\n"),
+        QStringLiteral(""));
+    ASSERT_EQ(1, (int)exitJoinCensus(noRecheck).size());
 }
