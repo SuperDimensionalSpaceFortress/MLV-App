@@ -12,17 +12,32 @@
 #
 # The binding "NO LOCAL PLAYBACK" section the dispatch scripts append is excluded from the scan (it names the forbidden flags on purpose), and a
 # clause that is itself a prohibition (never / do not / must not / forbidden / refuse ...) is not an instruction. A clause that routes the work
-# through a venue (Bachelor, Ultra-Magnus, the venue chain) is not a local launch.
+# through a venue (Bachelor, Ultra-Magnus, the venue chain) is not a local launch -- in exactly the shapes enumerated below.
 #
 # Scope (HUB-VM-LINT-CLAUSE-SCOPE-1): a negation or a venue word exempts only the CLAUSE it sits in, never a later clause of the same sentence
 # ("Do not run the venue chain, run playback locally" is refused; "Run playback on this host after the venue job finishes" is refused). Within
 # a clause the venue qualification is read before the local-playback match, so "run playback locally on Bachelor through the venue chain" passes.
 # A clause with no launch verb of its own ("... locally and on this host") carries the negation of the clause before it, never its venue words.
 #
-# Polarity (HUB-VM-LINT-CLAUSE-SCOPE-1 r2): a venue word routes the work only when it is asserted. "without / not / , not / , never / nor /
-# instead of / rather than / skip / bypass" open a CONTRAST complement: the complement is negated (a strong negation, so "run playback on
-# Bachelor rather than locally" passes), it never exempts anything as a venue ("run playback locally, not on Bachelor" is refused), and it
-# ends at its next comma, so a word after that comma is not negated ("... without the venue chain, locally" is refused).
+# Fail closed (HUB-VM-LINT-CLAUSE-SCOPE-1 r3). A clause that holds a local-playback marker (locally, on this host / the hub, here, a direct
+# launch) is REFUSED unless it is a prohibition (its own never / do not / ..., or the prohibition it is coordinated with) or it matches one
+# of the ENUMERATED affirmative shapes below. A venue word or a contrast word somewhere in the clause is NOT an exemption: r1b and r2 each
+# read polarity from a word list and each list missed wordings master refuses ("locally since Bachelor is busy", "without audio locally",
+# "not only on Bachelor but also locally" ...). Extend a SHAPE, in review, with the catalogue row that asks for it -- never a word list:
+#   E1 venue-routed marker (rule 2, `locally` only): the marker is immediately followed by a routing preposition (on / via / through /
+#      using) and a venue word inside the same clause -- "Run playback locally on Bachelor through the venue chain." Row: the probe of the
+#      Sol review of PR #401 (CLAUSE_MUST_PASS in tools/repo_hygiene/test_hub_vm_no_local_playback.py).
+#   E2 negated marker (rules 2, 3, 3b, 4): the marker opens a contrast complement, i.e. it is the first thing after without / not / , not /
+#      , never / nor / instead of / rather than / skip / bypass -- "Run playback on Bachelor rather than locally.", "... through the venue
+#      chain, not on this host." Rows: those two CLAUSE_MUST_PASS entries. A complement that merely CONTAINS the marker later ("without
+#      audio locally") is not negated.
+#   E3 venue-routed clause (rules 3, 3b, 4): a venue word exempts the marker's clause only inside a routing phrase (on / via / through /
+#      using / at, an optional article, then the venue word) -- "The venue job calls <launcher> -Backend cpu on Bachelor." Row: that green
+#      prompt in PromptLintTests.test_green_prompts_that_must_pass. "since Bachelor is busy" is not a routing phrase.
+# Rules 3, 3b and 4 keep master's weak-negation exemption (not / no / without in the marker's clause, narrowed from the whole sentence to
+# the clause), so they refuse at least what master refuses. Anything that is not E1 / E2 / E3 / a prohibition keeps master's verdict.
+# A contrast word still CUTS the sentence (the head clause is judged without its complement) and the complement ends at its next comma; the
+# clause after that comma inherits from the HEAD clause, so a leading "Never run playback ..." still reaches "..., locally or on this host".
 #
 # ASCII only (PowerShell 5.1 reads a BOM-less file as the ANSI code page). No Set-StrictMode here: a dot-sourced file would leak it into the caller.
 
@@ -69,34 +84,37 @@ function Remove-NoLocalPlaybackSection {
 # One sentence cut into clauses. A boundary is a connector that opens a new predicate: ", run ...", " and ", " then ", " after ", " but ", " - ".
 # Each clause records the negation / venue words it holds itself; a clause with no launch verb of its own is a coordinated complement and
 # inherits the negation (not the venue qualification) of the clause before it. A contrast word ("without", ", not", "instead of" ...) cuts
-# too: the complement after it is Contrast = a strong negation that is never Venue, and it runs only to its next comma (the clause after
-# that comma is NoInherit: it carries neither the complement's negation nor the clause before it).
+# too: the complement after it is Contrast = never Venue, and it runs only to its next comma. The clause after that comma (NoInherit) does
+# not inherit from the complement; it inherits from the HEAD clause, the one the contrast word cut. "or" cuts too, and the clause after it
+# inherits the negation of the clause before it even when it has a verb ("NO GUI or playback run ..." is one prohibition).
 function Get-LintClauses {
     param([string]$Sentence, [string]$Separator, [string]$Contrast, [string]$LaunchVerb, [string]$StrongNeg, [string]$WeakNeg, [string]$VenueQualified)
     $cuts = New-Object System.Collections.Generic.List[object]
-    foreach ($m in [regex]::Matches($Sentence, $Separator)) { $cuts.Add([pscustomobject]@{ Index = $m.Index; Length = $m.Length; Contrast = $false }) }
+    foreach ($m in [regex]::Matches($Sentence, $Separator)) { $cuts.Add([pscustomobject]@{ Index = $m.Index; Length = $m.Length; Contrast = $false; Disjunct = ($m.Value.Trim() -ieq 'or') }) }
     if ($Contrast) {
-        foreach ($m in [regex]::Matches($Sentence, $Contrast)) { $cuts.Add([pscustomobject]@{ Index = $m.Index; Length = $m.Length; Contrast = $true }) }
+        foreach ($m in [regex]::Matches($Sentence, $Contrast)) { $cuts.Add([pscustomobject]@{ Index = $m.Index; Length = $m.Length; Contrast = $true; Disjunct = $false }) }
     }
     $ordered = @($cuts | Sort-Object -Property @{ Expression = 'Index'; Descending = $false }, @{ Expression = 'Length'; Descending = $true })
     $spans = New-Object System.Collections.Generic.List[object]
     $pos = 0
     $pendingContrast = $false
+    $pendingDisjunct = $false
     foreach ($cut in $ordered) {
         if ($cut.Index -lt $pos) { continue }
-        $spans.Add([pscustomobject]@{ Start = $pos; End = $cut.Index; Contrast = $pendingContrast; NoInherit = $false })
+        $spans.Add([pscustomobject]@{ Start = $pos; End = $cut.Index; Contrast = $pendingContrast; NoInherit = $false; Disjunct = $pendingDisjunct })
         $pos = $cut.Index + $cut.Length
         $pendingContrast = [bool]$cut.Contrast
+        $pendingDisjunct = [bool]$cut.Disjunct
     }
-    $spans.Add([pscustomobject]@{ Start = $pos; End = $Sentence.Length; Contrast = $pendingContrast; NoInherit = $false })
+    $spans.Add([pscustomobject]@{ Start = $pos; End = $Sentence.Length; Contrast = $pendingContrast; NoInherit = $false; Disjunct = $pendingDisjunct })
     # A contrast complement ends at its first comma; what follows is a fresh, non-inheriting clause.
     $flat = New-Object System.Collections.Generic.List[object]
     foreach ($sp in $spans) {
         if ($sp.Contrast -and $sp.End -gt $sp.Start) {
             $comma = $Sentence.IndexOf(',', $sp.Start, $sp.End - $sp.Start)
             if ($comma -ge 0) {
-                $flat.Add([pscustomobject]@{ Start = $sp.Start; End = $comma; Contrast = $true; NoInherit = $false })
-                $flat.Add([pscustomobject]@{ Start = $comma + 1; End = $sp.End; Contrast = $false; NoInherit = $true })
+                $flat.Add([pscustomobject]@{ Start = $sp.Start; End = $comma; Contrast = $true; NoInherit = $false; Disjunct = $sp.Disjunct })
+                $flat.Add([pscustomobject]@{ Start = $comma + 1; End = $sp.End; Contrast = $false; NoInherit = $true; Disjunct = $false })
                 continue
             }
         }
@@ -104,21 +122,25 @@ function Get-LintClauses {
     }
     $clauses = New-Object System.Collections.Generic.List[object]
     $prev = $null
+    $head = $null
     foreach ($sp in $flat) {
         $start = [int]$sp.Start; $end = [int]$sp.End
         if ($end -le $start) { continue }
         $text = $Sentence.Substring($start, $end - $start)
         if (-not $text.Trim()) { continue }
         $hasVerb = [bool]($text -match $LaunchVerb)
-        $strong = [bool]($text -match $StrongNeg) -or [bool]$sp.Contrast
+        $strong = [bool]($text -match $StrongNeg)
         $weak = [bool]($text -match $WeakNeg)
-        if (-not $hasVerb -and $prev -and -not $sp.NoInherit) { $strong = $strong -or $prev.Strong; $weak = $weak -or $prev.Weak }
-        $c = [pscustomobject]@{ Start = $start; End = $end; Text = $text; HasVerb = $hasVerb; Strong = $strong; Weak = $weak; Venue = (-not $sp.Contrast) -and [bool]($text -match $VenueQualified) }
+        # A complement is judged on its own words: being the object of "without" negates nothing here (only the E2 shape exempts a marker).
+        $from = if ($sp.NoInherit) { $head } else { $prev }
+        if ((-not $hasVerb -or $sp.Disjunct) -and $from) { $strong = $strong -or $from.Strong; $weak = $weak -or $from.Weak }
+        if ($sp.Contrast) { $head = $prev }
+        $c = [pscustomobject]@{ Start = $start; End = $end; Text = $text; HasVerb = $hasVerb; Strong = $strong; Weak = $weak; Contrast = [bool]$sp.Contrast; Venue = (-not $sp.Contrast) -and [bool]($text -match $VenueQualified) }
         $clauses.Add($c)
         $prev = $c
     }
     if ($clauses.Count -eq 0) {
-        $clauses.Add([pscustomobject]@{ Start = 0; End = $Sentence.Length; Text = $Sentence; HasVerb = [bool]($Sentence -match $LaunchVerb); Strong = [bool]($Sentence -match $StrongNeg); Weak = [bool]($Sentence -match $WeakNeg); Venue = [bool]($Sentence -match $VenueQualified) })
+        $clauses.Add([pscustomobject]@{ Start = 0; End = $Sentence.Length; Text = $Sentence; HasVerb = [bool]($Sentence -match $LaunchVerb); Strong = [bool]($Sentence -match $StrongNeg); Weak = [bool]($Sentence -match $WeakNeg); Contrast = $false; Venue = [bool]($Sentence -match $VenueQualified) })
     }
     return $clauses.ToArray()
 }
@@ -131,6 +153,21 @@ function Get-ClauseAt {
     return $found
 }
 
+# E2: the marker at $Index is the first thing of a contrast complement ("rather than locally", ", not on this host").
+function Test-ContrastLead {
+    param([string]$Sentence, [object]$Clause, [int]$Index)
+    if (-not $Clause.Contrast -or $Index -lt $Clause.Start -or $Index -gt $Clause.End) { return $false }
+    return [string]::IsNullOrWhiteSpace($Sentence.Substring($Clause.Start, $Index - $Clause.Start))
+}
+
+# E1: "locally" immediately followed by a routing preposition and a venue word, all inside the marker's own clause.
+function Test-VenueRoutedLocally {
+    param([string]$Sentence, [object]$Clause, [int]$Index, [string]$VenueWords)
+    if ($Index -lt $Clause.Start -or $Index -ge $Clause.End) { return $false }
+    $tail = $Sentence.Substring($Index, $Clause.End - $Index)
+    return [bool]($tail -match "(?i)^locally\s+(?:on|via|through|using)\s+(?:(?:the|a|an)\s+)?(?:${VenueWords})(?![\w\-])")
+}
+
 function Get-LocalPlaybackPromptFindings {
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Text)
@@ -141,13 +178,16 @@ function Get-LocalPlaybackPromptFindings {
     $b = '(?<![\w\-])'; $e = '(?![\w\-])'
     $strongNeg = "(?i)${b}(never|do not|don't|must not|mustn't|may not|no local|not locally|forbidden|forbids|refuse[sd]?|refusal|prohibit\w*|instead of running|rather than running|without running)${e}"
     $weakNeg = "(?i)${b}(not|no|without)${e}"
-    $venueQualified = "(?i)${b}(venue|venues|bachelor|ultra-magnus|um-run|Invoke-Venue(Chain|Leg)|chain runner)${e}"
+    $venueWords = 'venue|venues|bachelor|ultra-magnus|um-run|Invoke-Venue(?:Chain|Leg)|chain runner'
+    # E3: a venue word counts only inside a routing phrase ("on Bachelor", "through the venue chain", "via the chain runner"); "since Bachelor
+    # is busy", "to avoid the venue chain" and "with no venue job" name a venue without routing anything to it.
+    $venueQualified = "(?i)${b}(?:on|via|through|using|at)\s+(?:(?:the|a|an)\s+)?(?:${venueWords})${e}"
     $verbs = 'run|runs|running|launch|launches|launching|launched|start|starts|starting|execute|executes|executing|invoke|invokes|invoking|drive|drives|driving|kick off|play|plays|playing|open|opens|opening'
     $launchVerb = "(?i)${b}(${verbs})${e}"
     $playbackWord = "(?i)(${b}playback${e}|gui-smoke|profile-playback|${b}MLVApp(Release)?(\.exe)?${e}|smoke run|${b}exactness${e}|${b}arms?${e}|${b}GUI${e})"
     $scripts = '(run-release-gui-smoke|start-release-cuda-playback|run-release-playback-profile|validate-visible-playback|capture-reference-frame)\.ps1'
     # Clause boundaries: a comma that opens a new imperative, a coordinating / subordinating connector, or a spaced dash.
-    $separator = "(?i),\s*(?:(?:then|and|just|also|please|so)\s+)?(?=(?:${verbs}|use|using|do)${e})|${b}(and then|then|and|but|after|before|once|when|whenever|while|until|because|otherwise|unless|except|although|though|whereas)${e}|\s-{1,2}\s"
+    $separator = "(?i),\s*(?:(?:then|and|just|also|please|so)\s+)?(?=(?:${verbs}|use|using|do)${e})|${b}(and then|then|and|or|but|after|before|once|when|whenever|while|until|because|otherwise|unless|except|although|though|whereas)${e}|\s-{1,2}\s"
     # Contrast words: the complement after one is negated and never routes. A bare "not" counts unless an auxiliary holds it ("do not", "is not").
     $auxiliary = 'do|does|did|must|may|can|could|should|would|will|shall|is|are|was|were|has|have|had|need|to|if|whether'
     $contrast = "(?i),\s*(?:not|never)${e}|(?:,\s*)?${b}(?:instead of|rather than|without|nor|skips?|skipping|bypass(?:es|ing)?)${e}|(?<!${b}(?:${auxiliary})\s+)${b}not${e}"
@@ -172,25 +212,31 @@ function Get-LocalPlaybackPromptFindings {
             # mark is a QUOTATION of the old wording (an incident report), not an instruction; the clause holding "where" must not be a prohibition.
             $m1 = [regex]::Match($s, $incident)
             if ($m1.Success -and -not (Get-ClauseAt -Clauses $clauses -Index $m1.Index).Strong) { $hit = 'where-a-gui-session-exists' }
-            # (2) "locally" attached to a playback / smoke / MLVApp / arm instruction; its own clause must be neither a prohibition nor venue-routed
+            # (2) "locally" attached to a playback / smoke / MLVApp / arm instruction. FAIL CLOSED: its own clause must be a prohibition, or
+            # match E1 (locally + routing preposition + venue word) or E2 (the marker opens a contrast complement). A venue word elsewhere
+            # in the clause ("locally since Bachelor is busy") exempts nothing.
             if (-not $hit -and $isPlayback) {
                 foreach ($m in [regex]::Matches($s, $localMarker)) {
                     $c = Get-ClauseAt -Clauses $clauses -Index $m.Index
-                    if (-not ($c.Strong -or $c.Venue)) { $hit = 'run-playback-locally'; break }
+                    if ($c.Strong) { continue }
+                    if (Test-ContrastLead -Sentence $s -Clause $c -Index $m.Index) { continue }
+                    if (Test-VenueRoutedLocally -Sentence $s -Clause $c -Index $m.Index -VenueWords $venueWords) { continue }
+                    $hit = 'run-playback-locally'; break
                 }
             }
-            # (3) "on this host / the hub (VM)" attached to a playback launch; a negation or a venue word in that clause exempts it
+            # (3) "on this host / the hub (VM)" attached to a playback launch; a negation or a venue word in that clause exempts it (master's
+            # exemption, clause-scoped), as does E2
             if (-not $hit -and $isPlayback) {
                 foreach ($m in [regex]::Matches($s, $hostMarker)) {
                     $c = Get-ClauseAt -Clauses $clauses -Index $m.Index
-                    if (-not ($c.Strong -or $c.Weak -or $c.Venue)) { $hit = 'run-playback-on-this-host'; break }
+                    if (-not ($c.Strong -or $c.Weak -or $c.Venue -or (Test-ContrastLead -Sentence $s -Clause $c -Index $m.Index))) { $hit = 'run-playback-on-this-host'; break }
                 }
             }
             # (3b) a bare "here" is weak evidence, so the launch verb and the playback word must sit in the same clause as the word
             if (-not $hit) {
                 foreach ($m in [regex]::Matches($s, $hereMarker)) {
                     $c = Get-ClauseAt -Clauses $clauses -Index $m.Index
-                    if ($c.HasVerb -and ($c.Text -match $playbackWord) -and -not ($c.Strong -or $c.Weak -or $c.Venue)) { $hit = 'run-playback-here'; break }
+                    if ($c.HasVerb -and ($c.Text -match $playbackWord) -and -not ($c.Strong -or $c.Weak -or $c.Venue -or (Test-ContrastLead -Sentence $s -Clause $c -Index $m.Index))) { $hit = 'run-playback-here'; break }
                 }
             }
             # (4) a direct command line: the app with a playback mode, or a tracked launcher called with a parameter
@@ -199,7 +245,7 @@ function Get-LocalPlaybackPromptFindings {
                     $m4 = [regex]::Match($s, $pattern)
                     if (-not $m4.Success) { continue }
                     $c = Get-ClauseAt -Clauses $clauses -Index $m4.Index
-                    if (-not ($c.Strong -or $c.Weak -or $c.Venue)) { $hit = 'direct-playback-launch'; break }
+                    if (-not ($c.Strong -or $c.Weak -or $c.Venue -or (Test-ContrastLead -Sentence $s -Clause $c -Index $m4.Index))) { $hit = 'direct-playback-launch'; break }
                 }
             }
             if ($hit) {

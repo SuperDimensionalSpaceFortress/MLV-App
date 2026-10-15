@@ -85,24 +85,48 @@ def _baseline_lint_source() -> tuple[str, str] | None:
     return None
 
 
+def _psq(path: object) -> str:
+    """A path as a PowerShell single-quoted literal (an apostrophe in the path is doubled, never ends the string)."""
+    return "'" + str(path).replace("'", "''") + "'"
+
+
+def _write_probe(path: Path, body: str) -> None:
+    # utf-8-sig, not ascii: a path with a non-ASCII character must reach pwsh intact instead of failing at write time.
+    path.write_text(body, encoding="utf-8-sig")
+
+
 def _lint_finding_counts(lint: Path, texts: list[str], work: Path, tag: str) -> "subprocess.Popen":
     """Start ONE pwsh that dot-sources `lint` and counts the findings of every text (one sentence per line). Returns the Popen."""
     src = work / f"{tag}-in.txt"
     src.write_text("\n".join(texts) + "\n", encoding="utf-8")
     probe = work / f"{tag}-probe.ps1"
-    probe.write_text(
-        ". '" + str(lint) + "'\n"
+    _write_probe(
+        probe,
+        ". " + _psq(lint) + "\n"
         "$out = New-Object System.Collections.Generic.List[int]\n"
-        "foreach ($l in [System.IO.File]::ReadAllLines('" + str(src) + "')) { $out.Add(@(Get-LocalPlaybackPromptFindings -Text $l).Count) }\n"
+        "foreach ($l in [System.IO.File]::ReadAllLines(" + _psq(src) + ")) { $out.Add(@(Get-LocalPlaybackPromptFindings -Text $l).Count) }\n"
         "ConvertTo-Json -InputObject @($out.ToArray()) -Compress\n",
-        encoding="ascii",
     )
     return subprocess.Popen([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(probe)],
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
 
+def _kill(proc: "subprocess.Popen") -> None:
+    """Stop a probe that is still running and reap it (no orphaned pwsh after a timeout or an earlier failure)."""
+    if proc.poll() is None:
+        proc.kill()
+    try:
+        proc.communicate(timeout=30)
+    except Exception:  # noqa: BLE001 - best effort cleanup only
+        pass
+
+
 def _collect_counts(proc: "subprocess.Popen", expected: int) -> list[int]:
-    out, err = proc.communicate(timeout=300)
+    try:
+        out, err = proc.communicate(timeout=300)
+    except subprocess.TimeoutExpired:
+        _kill(proc)
+        raise
     if proc.returncode != 0:
         raise AssertionError(f"lint probe failed: {err}")
     counts = json.loads(out.strip())
@@ -152,27 +176,74 @@ def _differential_corpus(seeds: tuple[str, ...]) -> dict[str, dict]:
         for noun in nouns:
             for c0 in ("Without", "Instead of", "Rather than", "Skip", "Bypass", "Not"):
                 add(f"{c0} {noun}, {v.lower()} {pb} {m}.", tpl="contrast-first", M=m, C=c0, V=noun)
+            # r3: a venue word that is NAMED but routes nothing -- subordinating / alternative / purpose connectives, and a comma clause
+            for conn in ("since", "if", "as", "whenever", "in case", "to avoid", "with no", "or on", "or through", "because of"):
+                add(f"{v} {pb} {m} {conn} {noun} is busy.", tpl="marker-connective-noun", M=m, V=noun, K=conn)
+            add(f"{v} {pb} {m}, {noun} is not needed.", tpl="marker-comma-clause-noun", M=m, V=noun)
+            # r3: a contrast word whose complement is some OTHER object and which only then reaches the marker
+            for c1 in ("without", "not only", "instead of", "rather than", "skipping"):
+                add(f"{v} {pb} {c1} audio {m}.", tpl="contrast-object-marker", M=m, C=c1)
+                add(f"{v} {pb} {c1} {noun} but also {m}.", tpl="contrast-noun-but-also-marker", M=m, C=c1, V=noun)
+            # r3: a leading prohibition reaches the comma clause after a contrast complement
+            for neg in ("Never", "Do not"):
+                add(f"{neg} {v.lower()} {pb} without {noun}, {m} or on this host.", tpl="neg-contrast-comma-marker", M=m, N=neg, V=noun)
     for text in seeds:
         add(text, tpl="seed")
     return rows
 
 
-def _differential_flips(work: Path) -> tuple[str, list[tuple[str, dict]], list[tuple[str, dict]], int]:
-    """Run baseline and candidate lints over the corpus. -> (baseline ref, refuse->pass rows, pass->refuse rows, corpus size)."""
-    base = _baseline_lint_source()
-    if base is None:
-        raise unittest.SkipTest("no baseline ref resolves (fork/master, origin/master, master); the differential pin needs git history")
-    ref, text = base
+def _differential_flips(work: Path, baseline_text: str | None = None) -> tuple[str, list[tuple[str, dict]], list[tuple[str, dict]], int]:
+    """Run baseline and candidate lints over the corpus. -> (baseline ref, refuse->pass rows, pass->refuse rows, corpus size).
+
+    `baseline_text` replaces the git baseline (the identical-baseline row feeds the candidate's own text, which is the state of master
+    right after the change merges). With no baseline ref and no override: a hosted CI job (fetch-depth: 0 in tests.yml) FAILS, because a
+    pin that skips there guards nothing; a local clone without history skips."""
+    if baseline_text is not None:
+        ref, text = "candidate-itself", baseline_text
+    else:
+        base = _baseline_lint_source()
+        if base is None:
+            message = "no baseline ref resolves (fork/master, origin/master, master); the differential pin needs git history"
+            if os.environ.get("GITHUB_ACTIONS") == "true":
+                raise AssertionError(message + " -- the hygiene jobs check out with fetch-depth: 0, so a missing ref is a broken checkout")
+            raise unittest.SkipTest(message)
+        ref, text = base
     baseline = work / "baseline-lint.ps1"
     baseline.write_text(text, encoding="utf-8")
     corpus = _differential_corpus(PromptLintTests.CLAUSE_MUST_REFUSE + PromptLintTests.CLAUSE_MUST_PASS + PromptLintTests.PROBE_ROWS)
     texts = list(corpus)
-    procs = (_lint_finding_counts(baseline, texts, work, "base"), _lint_finding_counts(LINT_PS1, texts, work, "cand"))
-    before = _collect_counts(procs[0], len(texts))
-    after = _collect_counts(procs[1], len(texts))
+    procs = [_lint_finding_counts(baseline, texts, work, "base"), _lint_finding_counts(LINT_PS1, texts, work, "cand")]
+    try:
+        before = _collect_counts(procs[0], len(texts))
+        after = _collect_counts(procs[1], len(texts))
+    finally:
+        for proc in procs:
+            _kill(proc)
     opened = [(t, corpus[t]) for t, b, a in zip(texts, before, after) if b > 0 and a == 0]
     closed = [(t, corpus[t]) for t, b, a in zip(texts, before, after) if b == 0 and a > 0]
     return ref, opened, closed, len(texts)
+
+
+def _flip_summary(flips: list[tuple[str, dict]], limit: int = 3) -> str:
+    """Group flips by template so a failure names the SHAPE that moved, with a few verbatim examples."""
+    groups: dict[str, list[str]] = {}
+    for text, fields in flips:
+        groups.setdefault(str(fields.get("tpl")), []).append(text)
+    return "; ".join(f"{tpl} x{len(rows)} e.g. {rows[:limit]}" for tpl, rows in sorted(groups.items()))
+
+
+def _pin_problems(opened, closed, allow_open, allow_closed) -> list[str]:
+    """What is wrong with a baseline -> candidate flip set. The allow-lists are CEILINGS: an entry that matches nothing is fine (the
+    identical-baseline state, or a shape a later change has since removed); a flip that no entry explains is the failure."""
+    problems = []
+    for what, flips, allow in (("refuse -> PASS (the lint opened)", opened, allow_open), ("pass -> REFUSE (the lint closed)", closed, allow_closed)):
+        for name, pred, reason in allow:
+            if not reason.strip():
+                problems.append(f"allow-list entry {name!r} has no reason")
+        unexplained = [(t, f) for t, f in flips if not any(pred(t, f) for _, pred, _ in allow)]
+        if unexplained:
+            problems.append(f"{len(unexplained)} wording(s) flip {what} that no allow-list entry explains: {_flip_summary(unexplained)}")
+    return problems
 
 
 def _code_lines(path: Path) -> list[str]:
@@ -314,11 +385,11 @@ class PromptLintTests(unittest.TestCase):
         src = self.tmp / "in.txt"
         src.write_text(text, encoding="utf-8")
         probe = self.tmp / "probe.ps1"
-        probe.write_text(
-            ". '" + str(LINT_PS1) + "'\n"
-            "$f = @(Get-LocalPlaybackPromptFindings -Text (Get-Content -LiteralPath '" + str(src) + "' -Raw))\n"
+        _write_probe(
+            probe,
+            ". " + _psq(LINT_PS1) + "\n"
+            "$f = @(Get-LocalPlaybackPromptFindings -Text (Get-Content -LiteralPath " + _psq(src) + " -Raw))\n"
             "ConvertTo-Json -InputObject @($f) -Compress\n",
-            encoding="ascii",
         )
         done = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(probe)], capture_output=True, text=True, timeout=120)
         self.assertEqual(0, done.returncode, done.stderr)
@@ -378,6 +449,24 @@ class PromptLintTests(unittest.TestCase):
         "Run the arms locally rather than on Bachelor.",
         "Launch MLVApp locally instead of using the venue chain.",
         "Run playback on this host without the venue chain.",
+        # r3 (Sol B1 + Opus V-01 on PR #448 r2 head b0b36922): every wording below was refused on master 8bcc2b3e and passed on r2, because
+        # r2 guessed polarity from a word list. A venue word or a contrast word in the same clause is not a routing; only an enumerated
+        # shape (see the lint header) exempts `locally`. The first two are Sol's, the last six are Opus's V-01 connectives.
+        "Run playback without audio locally.",
+        "Run playback not only on Bachelor but also locally.",
+        "Run the arms locally since Bachelor is busy.",
+        "Run playback locally if Bachelor is unreachable.",
+        "Run playback locally to avoid the venue chain.",
+        "Run the arms locally with no venue job.",
+        "Run playback locally or on Bachelor.",
+        "Run playback locally, the venue chain is not needed.",
+        # siblings of the same two classes (a connective the lists never named; a contrast word whose complement is not the marker)
+        "Run playback locally whenever Bachelor is busy.",
+        "Run playback locally as Bachelor is busy.",
+        "Run the arms locally in case the venue chain fails.",
+        "Run playback without the overlay locally.",
+        "Launch MLVApp without scopes locally.",
+        "Run playback on Bachelor but also locally.",
     )
     CLAUSE_MUST_PASS = (
         "Run playback locally on Bachelor through the venue chain.",
@@ -387,6 +476,10 @@ class PromptLintTests(unittest.TestCase):
         "Never run playback locally and on this host.",
         "Run the arms on Bachelor through the venue chain and never locally.",
         "Run playback on Bachelor rather than locally.",
+        # r3 (Opus HUB-VM-LINT-NOINHERIT-PROHIBITION-1): a leading prohibition scopes the comma clause after a contrast complement.
+        "Never run playback without the venue chain, locally or on this host.",
+        "Run playback on Bachelor, never locally.",
+        "Run playback on Bachelor instead of locally.",
     )
 
     # Rows that are in no catalogue tuple above but belong in the differential corpus as seeds.
@@ -418,8 +511,9 @@ class PromptLintTests(unittest.TestCase):
 
     def test_hub_host_decision(self):
         probe = self.tmp / "host.ps1"
-        probe.write_text(
-            ". '" + str(LINT_PS1) + "'\n"
+        _write_probe(
+            probe,
+            ". " + _psq(LINT_PS1) + "\n"
             "$o = [ordered]@{}\n"
             "$o.hub = Test-HubHost -ComputerName 'VIRTUAL-TEN'\n"
             "$o.hubLower = Test-HubHost -ComputerName 'virtual-ten'\n"
@@ -434,7 +528,6 @@ class PromptLintTests(unittest.TestCase):
             "$env:MLVAPP_HUB_PLAYBACK_CI_FIXTURE = 'CI_FIXTURE_ONLY'\n"
             "$o.override = Test-HubHost -ComputerName 'VIRTUAL-TEN'\n"
             "$o | ConvertTo-Json -Compress\n",
-            encoding="ascii",
         )
         env = {k: v for k, v in os.environ.items() if k != "MLVAPP_HUB_PLAYBACK_CI_FIXTURE"}
         done = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(probe)], capture_output=True, text=True, timeout=120, env=env)
@@ -450,28 +543,53 @@ class LintDifferentialPinTests(unittest.TestCase):
     """HUB-VM-LINT-CLAUSE-SCOPE-1 r2 (CoS prevention note). A catalogue only proves the rows somebody thought of; r1b added an exemption
     (a venue word read before `locally`) that silently opened five wordings the baseline refused. This runs the baseline lint (the lint at
     the first of fork/master, origin/master, master that resolves; HUB_VM_LINT_BASELINE_REF overrides) and the candidate over a generated
-    corpus -- launch verb x playback word x local/host/here marker x venue word x negator / contrast word x joiner -- and fails on any
-    refuse -> pass flip that no entry below explains. Every entry carries its reason and must still match at least one flip, so a stale
-    entry cannot linger. A new exemption therefore has to be named here, in review, with a reason.
+    corpus -- launch verb x playback word x local/host/here marker x venue word x negator / contrast word x joiner / connective -- and
+    fails on any flip, in EITHER direction, that no entry below explains. Every entry carries its reason. The lists are ceilings (r3): an
+    entry that matches no flip is fine, so the state right after a merge -- baseline == candidate, zero flips -- passes
+    (test_identical_baseline_passes). A new exemption has to be named here, in review, with a reason.
 
     Once a change has merged the baseline IS the candidate and the pin compares a lint with itself; it earns its keep on the next change,
-    which is then judged against the merged lint.
+    which is then judged against the merged lint. In hosted CI (GITHUB_ACTIONS, fetch-depth: 0) a missing baseline ref FAILS the pin;
+    only a local clone without history skips it.
     """
 
+    # Both lists are CEILINGS: an entry that explains no flip is fine (identical baseline, or a shape removed later); a flip no entry
+    # explains fails. An entry names the lint's enumerated shape (E1 / E2 / E3 in its header) or the review round that required it.
     ALLOWED_REFUSE_TO_PASS = (
-        ("venue-asserted-in-the-local-marker-clause",
-         lambda text, f: f.get("tpl") in ("marker-then-venue", "venue-then-marker", "marker-join-venue", "venue-join-marker")
-         and f.get("J") in (None, ","),
-         "r1b, Sol review of #401: one clause (a bare comma does not open a new clause) holds BOTH the local marker and an ASSERTED "
-         "venue word, e.g. 'Run playback locally on Bachelor'. The work is routed to a venue, so it is not a local launch."),
-        ("local-marker-negated-by-a-contrast-word-after-a-venue",
+        ("E1-locally-routed-onto-a-venue",
+         lambda text, f: (f.get("tpl") == "marker-then-venue" and f.get("M") == "locally")
+         or text == "Run playback locally on Bachelor through the venue chain.",
+         "E1, Sol review of #401: `locally` immediately followed by a routing preposition and a venue word ('Run playback locally on "
+         "Bachelor', 'locally through the venue chain') names the venue the work runs on, so it is not a local launch."),
+        ("E2-marker-negated-by-the-contrast-word-before-it",
          lambda text, f: f.get("tpl") == "venue-contrast-marker" and f.get("M") == "locally",
-         "r1b/r2: 'Run playback on Bachelor rather than / instead of / without / nor locally' -- the contrast complement is a strong "
-         "negation, so `locally` there is the thing the prompt rules out. (Only `locally` flips: the host and 'here' markers were "
+         "E2, r1b/r2: 'Run playback on Bachelor rather than / instead of / without / nor / , not locally' -- the marker is the first "
+         "thing of the contrast complement, so it is what the prompt rules out. (Only `locally` flips: the host and 'here' markers were "
          "already passed by the baseline's sentence-wide weak-negation / venue exemption.)"),
-        ("sol-probe-verbatim",
-         lambda text, f: text == "Run playback locally on Bachelor through the venue chain.",
-         "The probe sentence of the Sol review of #401, kept as an explicit row next to the rule that explains it."),
+    )
+    _CLAUSE_SCOPED_TPLS = ("marker-contrast-venue", "marker-contrast-marker", "contrast-first", "marker-join-venue", "venue-join-marker")
+    ALLOWED_PASS_TO_REFUSE = (
+        ("clause-scope-of-a-negation-or-venue-word",
+         lambda text, f: f.get("tpl") in LintDifferentialPinTests._CLAUSE_SCOPED_TPLS
+         or (f.get("tpl") == "seed" and text in PromptLintTests.CLAUSE_MUST_REFUSE),
+         "r1b + r2, CoS review of #448 and Sol review of #401: a negation or a venue word exempts only the clause it sits in; the "
+         "baseline's sentence-wide exemption passed 'Do not run the venue chain, run playback locally', 'Run playback on Bachelor and on "
+         "this host', 'Run playback locally, never on Bachelor' and the like."),
+        ("bare-here-marker",
+         lambda text, f: f.get("tpl") == "bare" and f.get("M") == "here",
+         "r1b, CoS review of #401: 'Run playback here.' -- the baseline has no `here` rule."),
+        ("venue-named-but-not-routed",
+         lambda text, f: f.get("tpl") == "marker-connective-noun" and f.get("M") in ("on this host", "here"),
+         "E3, r3: a venue word outside a routing phrase ('since Bachelor is busy', 'to avoid the venue chain', 'because of the venue "
+         "chain') exempts nothing; the baseline passed the host / here marker on any venue word in the sentence."),
+        ("contrast-complement-that-is-not-the-marker",
+         lambda text, f: f.get("tpl") in ("contrast-object-marker", "contrast-noun-but-also-marker"),
+         "E2, r3: 'without audio on this host', 'not only Bachelor but also on this host' -- the marker is not the head of the "
+         "complement, so nothing negates it; the baseline passed on any weak negation or venue word in the sentence."),
+        ("hardening-log-handling-tail",
+         lambda text, f: f.get("tpl") == "handling-tail" and f.get("M") in ("on this host", "here"),
+         "r1b over-refusal kept on purpose (card HUB-VM-LINT-LOG-COPY-OVERREFUSAL-1): 'copy the log on this host' after a venue run "
+         "is refused like its `locally` twin; a handling-verb list would open 'Copy the clip locally and run playback.'"),
     )
 
     @classmethod
@@ -482,21 +600,33 @@ class LintDifferentialPinTests(unittest.TestCase):
     def tearDownClass(cls):
         shutil.rmtree(cls.tmp, ignore_errors=True)
 
-    def test_no_refuse_to_pass_flip_against_the_baseline_is_unexplained(self):
+    def test_no_unlisted_flip_against_the_baseline(self):
         ref, opened, closed, size = _differential_flips(self.tmp)
         self.assertGreaterEqual(size, 1000, "the corpus shrank; the pin no longer samples the wording space")
-        unexplained = [text for text, f in opened if not any(pred(text, f) for _, pred, _ in self.ALLOWED_REFUSE_TO_PASS)]
+        problems = _pin_problems(opened, closed, self.ALLOWED_REFUSE_TO_PASS, self.ALLOWED_PASS_TO_REFUSE)
         self.assertEqual(
-            [], unexplained,
-            f"{len(unexplained)} wording(s) the baseline ({ref}) refuses now PASS and no ALLOWED_REFUSE_TO_PASS entry explains them. "
-            "A safety guard may open only on purpose: fix the lint, or add an entry with its reason.")
-        for name, pred, reason in self.ALLOWED_REFUSE_TO_PASS:
-            self.assertTrue(reason.strip(), name)
-            self.assertTrue(any(pred(text, f) for text, f in opened), f"allow-list entry {name!r} matches no flip any more; delete it")
-        # The five regression wordings of the CoS review are corpus seeds and must not be among the flips at all.
+            [], problems,
+            f"baseline {ref}: a safety guard may open or close only on purpose -- fix the lint, or add an allow-list entry with its reason.")
+        # Every catalogue row that must be refused is a corpus seed and must not be among the flips at all.
         flipped = {text for text, _ in opened}
         for text in PromptLintTests.CLAUSE_MUST_REFUSE:
             self.assertNotIn(text, flipped, text)
+
+    def test_identical_baseline_passes(self):
+        """Once this change is on master the baseline IS the candidate: no flips, and the pin must pass (it failed on r2, whose entries
+        were each required to match a flip)."""
+        ref, opened, closed, _ = _differential_flips(self.tmp, baseline_text=LINT_PS1.read_text(encoding="utf-8"))
+        self.assertEqual("candidate-itself", ref)
+        self.assertEqual(([], []), ([t for t, _ in opened], [t for t, _ in closed]))
+        self.assertEqual([], _pin_problems(opened, closed, self.ALLOWED_REFUSE_TO_PASS, self.ALLOWED_PASS_TO_REFUSE))
+
+    def test_the_pin_bites_on_an_unlisted_flip_in_either_direction(self):
+        row = ("Run playback locally since Bachelor is busy.", {"tpl": "marker-connective-noun"})
+        self.assertTrue(_pin_problems([row], [], self.ALLOWED_REFUSE_TO_PASS, self.ALLOWED_PASS_TO_REFUSE))
+        self.assertTrue(_pin_problems([], [row], self.ALLOWED_REFUSE_TO_PASS, self.ALLOWED_PASS_TO_REFUSE))
+        self.assertEqual([], _pin_problems([], [], self.ALLOWED_REFUSE_TO_PASS, self.ALLOWED_PASS_TO_REFUSE),
+                         "allow-list entries are a ceiling, never a required set")
+        self.assertTrue(_pin_problems([], [], (("no-reason", lambda t, f: True, " "),), ()))
 
 
 @requires_pwsh
