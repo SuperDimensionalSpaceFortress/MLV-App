@@ -128,12 +128,14 @@ SCOPE_LA_LEGS = tuple(f"legs/m16-1243-scopes-{backend}-windowed-s1-{arm}-la.json
 # CPU-SCOPE-LIVE-HEAP-CORRUPTION-1: the live-histogram stop-cycle legs, cpu scale 1 at every-frame histogram, per display mode. Windowed runs Look Assist
 # OFF (the arm that computes the scope); fullscreen leaves Look Assist at the app's default, so it computes no scope and tests the stop with LA on.
 SCOPELIVE_LEGS = {f"legs/m16-1243-scopelive-cpu-{mode}-s1-histogram-i0.json": (mode, look_off) for mode, look_off in (("windowed", True), ("fullscreen", False))}
+# CPU-SCOPE-LIVE-HEAP-CORRUPTION-1 r7: the UNATTACHED arm, the windowed scopelive leg without the debugger watch (attached and unattached legs are counted apart).
+SCOPELIVE_NODBG_LEGS = ("legs/m16-1243-scopelive-cpu-windowed-s1-histogram-i0-nodbg.json",)
 # LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1 added the scale-2 Cinematic twin of the scale-2 look leg (the Bachelor CPU Classic | Cinematic look pair).
 SHIPPED_LEGS = ("legs/m16-1243-speed.json", "legs/m16-1243-look.json", "legs/m16-1243-look-scale2.json", "legs/m16-1243-look-cinematic.json", *DISPLAY_MATRIX_LEGS, *PACE_LEGS,
                 *LOOKAHEAD_LEGS, *HEAVY_LEGS, *DECODER_LEGS, "legs/m16-1243-look-scale2-cinematic.json", "legs/m16-1243-look-film.json",
                 "legs/m16-1243-look-scale2-film.json", *(f"legs/m16-1243-look-scale2-{flavor}-agxoff.json" for flavor in ("cinematic", "film")),
                 *(f"legs/m16-1243-display-{mode}-s{scale}-vsync1.json" for scale in (1, 2, 4) for mode in ("fullscreen", "windowed")),
-                *CPU_REDUCED_LEGS, *UPSTREAM_BASELINE_LEGS, *PTRACE_LEGS, *VISUAL_LEGS, *SCOPE_LEGS, *SCOPE_LA_LEGS, *SCOPELIVE_LEGS)
+                *CPU_REDUCED_LEGS, *UPSTREAM_BASELINE_LEGS, *PTRACE_LEGS, *VISUAL_LEGS, *SCOPE_LEGS, *SCOPE_LA_LEGS, *SCOPELIVE_LEGS, *SCOPELIVE_NODBG_LEGS)
 # PLAYBACK-VSYNC-DEFAULT-1: the swap-interval-1 twins of the six display-matrix legs (the vsync A/B; the originals stay at the app's default 0).
 VSYNC1_LEGS = tuple(rel.replace(".json", "-vsync1.json") for rel in DISPLAY_MATRIX_LEGS)
 # LOOK-ASSIST-FILM-FLAVOR-2 r2: the AgX-off twins of the scale-2 Cinematic and Film legs carry a committed look receipt (look-receipts/agx-off.marxml).
@@ -5697,6 +5699,19 @@ class LegSpecSchemaTests(unittest.TestCase):
                                                      "scopesDuringPlayback": "throttled", **dump}, rel)
             self.assertNotIn("look", spec, rel)
             self.assertEqual(spec["criteria"], {"acceptance": {"cpu": []}, "supplementary": {"cpu": []}}, rel)
+
+    def test_the_heap_dump_unattached_scopelive_leg_is_the_windowed_leg_without_the_debugger(self) -> None:
+        """r7 (hub ruling 2026-10-15T14:11:59Z): the UNATTACHED arm runs the windowed scopelive leg with ONLY the debugger watch removed (and its own legId),
+        so its crash count is comparable with the attached arm's and is never pooled with it."""
+        windowed = json.loads((DV / "legs/m16-1243-scopelive-cpu-windowed-s1-histogram-i0.json").read_text(encoding="utf-8"))
+        for rel in SCOPELIVE_NODBG_LEGS:
+            spec = json.loads((DV / rel).read_text(encoding="utf-8"))
+            self.jsonschema.validate(spec, self.schema)
+            self.assertEqual(spec["legId"], Path(rel).stem, rel)
+            self.assertNotIn("heapCorruptionDump", spec["generatorArgs"], rel)
+            args = {k: v for k, v in windowed["generatorArgs"].items() if k != "heapCorruptionDump"}
+            self.assertEqual(dict(spec, legId=windowed["legId"], generatorArgs=windowed["generatorArgs"]), windowed, rel)
+            self.assertEqual(spec["generatorArgs"], args, rel)
 
     def test_the_scope_la_legs_are_the_no_look_twins_with_look_assist_forced_on(self) -> None:
         """PLAYBACK-SCOPES-OPTION-1 r3: each -la leg is its no-look twin with only legId, forceLookAssist (not disableLookAssist) and the
