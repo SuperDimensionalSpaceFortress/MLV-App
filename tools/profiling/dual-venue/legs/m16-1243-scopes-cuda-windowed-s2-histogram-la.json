@@ -1,0 +1,17 @@
+{
+  "schema": "mlv-app/dual-venue-leg/v1",
+  "legId": "m16-1243-scopes-cuda-windowed-s2-histogram-la",
+  "card": "PLAYBACK-GPU-SCOPES-NO-VETO-1",
+  "legType": "speed",
+  "clipId": "M16-1243",
+  "playSeconds": 25,
+  "backends": ["cuda"],
+  "scaleFactor": 2,
+  "displayMode": "windowed",
+  "generatorArgs": { "telemetryArm": "LIGHT", "cpuQuiescenceThresholdPercent": 95, "forceLookAssist": true, "scope": "histogram", "scopesDuringPlayback": "throttled" },
+  "timeouts": { "queueWaitSec": 900, "extraClaimedWaitSec": 600 },
+  "criteria": {
+    "acceptance": { "cuda": [ { "metric": "lookAssistForced", "op": "eq", "value": true }, { "metric": "gpuFramesTotal", "op": "gt", "value": 0 }, { "metric": "cpuFrames", "op": "eq", "value": 0 } ] },
+    "supplementary": { "cuda": [ { "metric": "lookAssistForced", "op": "eq", "value": true }, { "metric": "gpuFramesTotal", "op": "gt", "value": 0 }, { "metric": "cpuFrames", "op": "eq", "value": 0 } ] }
+  }
+}

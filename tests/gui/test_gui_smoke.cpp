@@ -648,6 +648,7 @@ private slots:
     void mainWindowGpuPlaybackReconTextureRouteEligibleAtScaleOneRequiresLibraryReadyFirst();
     void mainWindowGpuPreviewPolicyClassifiesPlaybackPipelineStatus();
     void mainWindowGpuPreviewPolicyLabelsVisibleScopeCpuFallback();
+    void playbackScopeGpuTapKeepsTheReconTexturePolicyEligibleOnlyWhenItServes();
     void dualIsoPlaybackPolicyKeepsExplicitPreviewAndPlaybackOverrideSeparate();
     void dualIsoPatternMappingKeepsUiAndCoreConventionsAligned();
     void gpuViewportRgb888ZebraProcessingMatchesCpuReference();
@@ -1413,6 +1414,45 @@ void GuiSmokeTest::mainWindowGpuPreviewPolicyLabelsVisibleScopeCpuFallback()
               QStringLiteral( "GPU Tex NR" ) );
     QVERIFY( QString::fromLatin1( mainWindowScopePerformanceHintText() )
                  .contains( QStringLiteral( "Hide the edit area with E" ) ) );
+}
+
+// PLAYBACK-GPU-SCOPES-NO-VETO-1 (PGT-02 composition row): the policy state MainWindow builds fills its scope flags through the
+// scope funnel. With the read-back serving a Throttled play the flags are off, so the GPU recon texture route stays allowed;
+// the same state in Live keeps the CPU scope, the flags on, and the route refused (today's veto).
+void GuiSmokeTest::playbackScopeGpuTapKeepsTheReconTexturePolicyEligibleOnlyWhenItServes()
+{
+    for (const PlaybackScopesMode mode : { PlaybackScopesMode::Throttled, PlaybackScopesMode::Live })
+    {
+        PlaybackScopeGpuTapInputs tap;
+        tap.mode = mode;
+        tap.playbackActive = true;
+        tap.editAreaVisible = true;
+        tap.anyScopeChecked = true;
+        tap.gpuWidgetViewportInstalled = true;
+        tap.tapSupported = true;
+        tap.textureRouteEligibleIgnoringScopes = true;
+        const bool scopeDisplayVisible = playbackScopeDisplayConsumesPresentedPixels(
+            /*editAreaVisible*/ true, /*playbackActive*/ true, mode, playbackScopeGpuTapServes(tap));
+
+        MainWindowGpuPreviewPolicyState state;
+        state.gpuViewportInstalled = true;
+        state.gpuWidgetViewportInstalled = true;
+        state.gpuPlaybackReconEnvironmentRequested = true;
+        state.gpuPlaybackReconTexturePresentationEnvironmentRequested = true;
+        state.gpuPlaybackReconTexturePresentationCompatible = true;
+        state.gpuPreviewProcessingDisplayShaderCompatible = true;
+        state.histogramEnabled = mainWindowScopeActionConsumesPresentedPixels(scopeDisplayVisible, /*histogram checked*/ true);
+        state.waveformEnabled = mainWindowScopeActionConsumesPresentedPixels(scopeDisplayVisible, false);
+        state.paradeEnabled = mainWindowScopeActionConsumesPresentedPixels(scopeDisplayVisible, false);
+        state.vectorScopeEnabled = mainWindowScopeActionConsumesPresentedPixels(scopeDisplayVisible, false);
+
+        const bool throttled = mode == PlaybackScopesMode::Throttled;
+        QCOMPARE(mainWindowAllowsGpuPlaybackReconTexturePresentation(state), throttled);
+        QCOMPARE(mainWindowAllowsGpu16PreviewRender(state), throttled);
+        QCOMPARE(mainWindowGpuPlaybackReconTextureRouteEligibleAtScaleOne(
+                     true, true, mainWindowHasScopeVisualization(state), true, true, true, false, true, false),
+                 throttled);
+    }
 }
 
 void GuiSmokeTest::dualIsoPlaybackPolicyKeepsExplicitPreviewAndPlaybackOverrideSeparate()

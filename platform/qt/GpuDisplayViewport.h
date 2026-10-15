@@ -13,10 +13,13 @@
 #include "GpuPreviewProcessing.h"
 #include "../../src/mlv/llrawproc/llrawproc.h"
 #include <QImage>
+#include <QOpenGLExtraFunctions>
 #include <QOpenGLFunctions>
 #include <QOpenGLShaderProgram>
 #include <QOpenGLTexture>
 #include <QOpenGLWidget>
+#include <cstdint>
+#include <vector>
 
 class QGraphicsPixmapItem;
 class QGraphicsView;
@@ -136,6 +139,32 @@ public:
      * the start of every such call). */
     const GpuPresentSetupTiming &lastPresentSetupTiming(void) const { return m_lastPresentSetupTiming; }
 
+    /* PLAYBACK-GPU-SCOPES-NO-VETO-1: the Throttled scope's read-back of the picture paintGL drew. A request
+     * makes the next paint blit the drawn image rectangle into a small FBO and read it into a PBO behind a
+     * fence; a later paint (or takeScopeTap) maps it only once the fence has signalled -- never blocking,
+     * never glFinish. Counters are cumulative for the viewport's life. */
+    struct ScopeTapCounters
+    {
+        quint64 requests = 0;    // requestScopeTap calls
+        quint64 issued = 0;      // read-backs issued in paintGL
+        quint64 completed = 0;   // fences signalled, buffers mapped and converted
+        quint64 notReady = 0;    // a due request found an earlier read-back still pending
+        quint64 skipped = 0;     // a requested read-back paintGL did not issue (rect outside the framebuffer, no FBO)
+        double mapMsTotal = 0.0; // map + convert + unmap, summed over completed
+        int lastWidth = 0;
+        int lastHeight = 0;
+    };
+    static bool scopeTapSupported(const QGraphicsView *view);
+    static void requestScopeTap(QGraphicsView *view, int maxWidth);
+    static bool takeScopeTap(QGraphicsView *view,
+                             std::vector<uint8_t> *rgb8,
+                             int *width,
+                             int *height,
+                             bool *under,
+                             bool *over,
+                             quint64 *serial);
+    static ScopeTapCounters scopeTapCountersFor(const QGraphicsView *view);
+
 protected:
     bool eventFilter(QObject *watched, QEvent *event) override;
     void initializeGL() override;
@@ -192,6 +221,39 @@ private:
     int pendingWidth(void) const;
     int pendingHeight(void) const;
     bool hasPendingFrame(void) const;
+    bool scopeTapSupportedNow(void) const;
+    bool scopeTapPending(void) const;
+    void issueScopeTap(float leftPx, float topPx, float rightPx, float bottomPx, int fbWidth, int fbHeight);
+    void pollScopeTap(void);
+    void destroyScopeTapResources(bool contextCurrent);
+
+    struct ScopeTapSlot
+    {
+        GLuint pbo = 0;
+        GLsync fence = nullptr;
+        int width = 0;
+        int height = 0;
+        int capacityBytes = 0;
+        quint64 serial = 0;
+    };
+    ScopeTapSlot m_scopeTapSlots[2];
+    GLuint m_scopeTapFbo = 0;
+    GLuint m_scopeTapColor = 0;
+    int m_scopeTapFboWidth = 0;
+    int m_scopeTapFboHeight = 0;
+    bool m_scopeTapRequested = false;
+    int m_scopeTapMaxWidth = 512;
+    quint64 m_scopeTapIssueSerial = 0;
+    std::vector<uint8_t> m_scopeTapResult;
+    int m_scopeTapResultWidth = 0;
+    int m_scopeTapResultHeight = 0;
+    bool m_scopeTapResultUnder = false;
+    bool m_scopeTapResultOver = false;
+    quint64 m_scopeTapResultSerial = 0;
+    bool m_scopeTapResultReady = false;
+    ScopeTapCounters m_scopeTapCounters;
+    mutable const QOpenGLContext *m_scopeTapSupportContext = nullptr;
+    mutable bool m_scopeTapSupportCached = false;
 
     bool m_loggedContext;
     bool m_loggedTexturePath;

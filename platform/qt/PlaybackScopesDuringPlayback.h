@@ -13,8 +13,13 @@
 
 #include <QByteArray>
 #include <QDebug>
+#include <QRect>
+#include <QSize>
 #include <QString>
 #include <QtGlobal>
+
+#include <cstdint>
+#include <vector>
 
 enum class PlaybackScopesMode
 {
@@ -105,16 +110,130 @@ inline PlaybackScopesMode playbackScopesMode()
     return playbackScopesModeResolve( envOverride, playbackScopesModeSettingValue() );
 }
 
+/*! \brief PLAYBACK-GPU-SCOPES-NO-VETO-1: MLVAPP_PLAYBACK_SCOPE_GPU_TAP is an ordinary kill switch for the
+ *  GPU scope read-back, honoured in any run: exactly "0" (surrounding space ignored) turns it off. Unset or
+ *  anything else leaves the read-back on. */
+inline const char * playbackScopeGpuTapKillSwitchName() { return "MLVAPP_PLAYBACK_SCOPE_GPU_TAP"; }
+
+inline bool playbackScopeGpuTapKillSwitch( const QByteArray &env )
+{
+    return env.trimmed() == "0";
+}
+
+/*! \brief PLAYBACK-GPU-SCOPES-NO-VETO-1: the live state that decides whether the Throttled scope is fed by a
+ *  read-back of the picture the GL viewport drew (a small async PBO read, see GpuDisplayViewport::requestScopeTap)
+ *  instead of CPU-side presented pixels. textureRouteEligibleIgnoringScopes is the GPU recon texture-route table
+ *  asked with no scope (it must never ask the scope funnel itself: that funnel asks this). */
+struct PlaybackScopeGpuTapInputs
+{
+    bool killSwitch = false;
+    PlaybackScopesMode mode = PlaybackScopesMode::Hide;
+    bool playbackActive = false;
+    bool editAreaVisible = false;
+    bool anyScopeChecked = false;
+    bool gpuWidgetViewportInstalled = false;
+    bool gpuDisplayWindowActive = false;
+    bool zebrasEnabled = false;
+    bool tapSupported = false;
+    bool textureRouteEligibleIgnoringScopes = false;
+};
+
+/*! \brief Does the GPU read-back serve the scope right now? Only Throttled, only while playing with a visible
+ *  scope on the QOpenGLWidget viewport (never GpuDisplayWindow), with zebras off (the shader draws them into the
+ *  same picture), a context that can do the async read, and a texture route that would be eligible without the
+ *  scope. Anything else keeps today's CPU scope and its veto. */
+inline bool playbackScopeGpuTapServes( const PlaybackScopeGpuTapInputs &in )
+{
+    return in.mode == PlaybackScopesMode::Throttled
+        && in.playbackActive
+        && in.editAreaVisible
+        && in.anyScopeChecked
+        && in.gpuWidgetViewportInstalled
+        && !in.gpuDisplayWindowActive
+        && !in.zebrasEnabled
+        && in.tapSupported
+        && in.textureRouteEligibleIgnoringScopes
+        && !in.killSwitch;
+}
+
 /*! \brief Does a visible scope consume presented pixels right now? A scope is shown only with
  *  the edit area visible; while playback runs in Hide mode it does no work, so it neither
- *  computes nor vetoes the GPU fast paths. Paused or stopped, it always draws. */
+ *  computes nor vetoes the GPU fast paths. Paused or stopped, it always draws.
+ *  PLAYBACK-GPU-SCOPES-NO-VETO-1: while playing, a scope the GPU read-back serves (gpuTapServes)
+ *  consumes no presented pixels either, so it does not veto the GPU texture route. */
 inline bool playbackScopeDisplayConsumesPresentedPixels(
     bool editAreaVisible,
     bool playbackActive,
-    PlaybackScopesMode mode)
+    PlaybackScopesMode mode,
+    bool gpuTapServes = false)
 {
     return editAreaVisible
-        && !( playbackActive && mode == PlaybackScopesMode::Hide );
+        && !( playbackActive && ( mode == PlaybackScopesMode::Hide || gpuTapServes ) );
+}
+
+/*! \brief The read-back's size: the drawn image rectangle scaled to at most maxW wide, aspect kept,
+ *  each side at least 1. */
+inline QSize playbackScopeTapSize( int rectW, int rectH, int maxW = 512 )
+{
+    if ( rectW <= 0 || rectH <= 0 ) return QSize( 1, 1 );
+    const int w = qMax( 1, qMin( rectW, qMax( 1, maxW ) ) );
+    const int h = qMax( 1, qRound( static_cast<double>( rectH ) * w / rectW ) );
+    return QSize( w, h );
+}
+
+/*! \brief The drawn image rectangle (widget-top-down framebuffer pixels, edges as drawn) as a GL
+ *  read rectangle (bottom-up rows). False when the rounded rectangle is empty or not wholly inside the
+ *  framebuffer (zoomed past fit): the read-back is then skipped, never clipped. */
+inline bool playbackScopeTapFramebufferRect( double leftPx, double topPx, double rightPx, double bottomPx,
+                                             int fbW, int fbH, QRect *glRectOut )
+{
+    const int x0 = qRound( leftPx );
+    const int x1 = qRound( rightPx );
+    const int yTop = qRound( topPx );
+    const int yBottom = qRound( bottomPx );
+    if ( fbW <= 0 || fbH <= 0 || x1 <= x0 || yBottom <= yTop ) return false;
+    if ( x0 < 0 || yTop < 0 || x1 > fbW || yBottom > fbH ) return false;
+    if ( glRectOut ) *glRectOut = QRect( x0, fbH - yBottom, x1 - x0, yBottom - yTop );
+    return true;
+}
+
+/*! \brief glReadPixels RGBA8 rows (bottom-up) to the RGB8 interleaved top-down rows ScopesLabel::setScope takes.
+ *  The under/over rule (one rule, pinned by PGT-04): under iff any channel of any pixel is 0, over iff any channel
+ *  of any pixel is 255. */
+inline void playbackScopeTapRgbaBottomUpToRgb8( const uint8_t *rgba, int w, int h,
+                                                std::vector<uint8_t> *rgb8, bool *under, bool *over )
+{
+    bool anyUnder = false;
+    bool anyOver = false;
+    if ( rgb8 ) rgb8->assign( static_cast<size_t>( qMax( 0, w ) ) * static_cast<size_t>( qMax( 0, h ) ) * 3u, 0 );
+    if ( rgba && rgb8 && w > 0 && h > 0 )
+    {
+        for ( int y = 0; y < h; ++y )
+        {
+            const uint8_t *src = rgba + static_cast<size_t>( h - 1 - y ) * static_cast<size_t>( w ) * 4u;
+            uint8_t *dst = rgb8->data() + static_cast<size_t>( y ) * static_cast<size_t>( w ) * 3u;
+            for ( int x = 0; x < w; ++x )
+            {
+                for ( int c = 0; c < 3; ++c )
+                {
+                    const uint8_t v = src[ x * 4 + c ];
+                    dst[ x * 3 + c ] = v;
+                    anyUnder = anyUnder || v == 0;
+                    anyOver = anyOver || v == 255;
+                }
+            }
+        }
+    }
+    if ( under ) *under = anyUnder;
+    if ( over ) *over = anyOver;
+}
+
+/*! \brief Redraw the stopped frame for its scope when Play stops? Hide skipped scope work while playing
+ *  (#427), and a play the GPU read-back served showed a downscaled read-back: both redraw the stopped
+ *  frame through the CPU path, which draws the full-resolution scope. Only with the edit area shown. */
+inline bool playbackScopesNeedStopRefresh( PlaybackScopesMode mode, bool tapServedThisPlay, bool editAreaChecked )
+{
+    return editAreaChecked && ( mode == PlaybackScopesMode::Hide || tapServedThisPlay );
 }
 
 /*! \brief PSO-02 (sol r3): may a presented frame feed the scope? Not when the request that rendered it was built

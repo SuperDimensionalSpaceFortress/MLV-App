@@ -247,8 +247,10 @@ TEST(PlaybackScopesDuringPlayback, MainWindowRoutesEveryScopeConsumerThroughTheP
     ASSERT_EQ(7, source.count(QStringLiteral("scopeDisplayConsumesPresentedPixels( ui->dockWidgetEdit->isVisible() )")));
     // The early slot release and the scope draw itself.
     ASSERT_EQ(2, source.count(QStringLiteral("scopeDisplayConsumesPresentedPixels( ui->actionShowEditArea->isChecked() )")));
+    // PLAYBACK-GPU-SCOPES-NO-VETO-1 (PGT-07): the funnel now also passes the GPU read-back's answer (4th argument).
     ASSERT_TRUE(source.contains(QStringLiteral(
-        "editAreaVisible, ui->actionPlay->isChecked(), m_playbackScopesMode );")));
+        "editAreaVisible, ui->actionPlay->isChecked(), m_playbackScopesMode,\n"
+        "        playbackScopeGpuTapServesNow( editAreaVisible ) );")));
     ASSERT_TRUE(source.contains(QStringLiteral(
         "playbackScopeUpdateIntervalForMode( m_playbackScopesMode,")));
     ASSERT_TRUE(source.contains(QStringLiteral("requestFrameRefresh( false, \"play-stop-scopes\" );")));
@@ -263,4 +265,198 @@ TEST(PlaybackScopesDuringPlayback, MainWindowRoutesEveryScopeConsumerThroughTheP
         ASSERT_TRUE(ui.contains(QStringLiteral("<action name=\"%1\">").arg(QLatin1String(action))));
         ASSERT_TRUE(ui.contains(QStringLiteral("<addaction name=\"%1\"/>").arg(QLatin1String(action))));
     }
+}
+
+// ---- PLAYBACK-GPU-SCOPES-NO-VETO-1: the Throttled scope fed by the GL viewport's read-back of the drawn picture ----
+
+namespace
+{
+
+PlaybackScopeGpuTapInputs servingTapInputs()
+{
+    PlaybackScopeGpuTapInputs in;
+    in.killSwitch = false;
+    in.mode = PlaybackScopesMode::Throttled;
+    in.playbackActive = true;
+    in.editAreaVisible = true;
+    in.anyScopeChecked = true;
+    in.gpuWidgetViewportInstalled = true;
+    in.gpuDisplayWindowActive = false;
+    in.zebrasEnabled = false;
+    in.tapSupported = true;
+    in.textureRouteEligibleIgnoringScopes = true;
+    return in;
+}
+
+// The body of one MainWindow member, from its definition line to the first closing brace at column 0.
+QString memberBody(const QString &source, const QString &signature)
+{
+    const int start = source.indexOf(signature);
+    if (start < 0) return QString();
+    const int end = source.indexOf(QStringLiteral("\n}\n"), start);
+    return end < 0 ? QString() : source.mid(start, end - start + 2);
+}
+
+} // namespace
+
+TEST(PlaybackScopesDuringPlayback, PGT01_TheReadBackServesOnlyWhenEveryInputAllowsIt)
+{
+    ASSERT_TRUE(playbackScopeGpuTapServes(servingTapInputs()));
+    // Every input flipped alone turns it off.
+    PlaybackScopeGpuTapInputs in = servingTapInputs(); in.killSwitch = true; ASSERT_FALSE(playbackScopeGpuTapServes(in));
+    in = servingTapInputs(); in.mode = PlaybackScopesMode::Hide; ASSERT_FALSE(playbackScopeGpuTapServes(in));
+    in = servingTapInputs(); in.mode = PlaybackScopesMode::Live; ASSERT_FALSE(playbackScopeGpuTapServes(in));
+    in = servingTapInputs(); in.playbackActive = false; ASSERT_FALSE(playbackScopeGpuTapServes(in));
+    in = servingTapInputs(); in.editAreaVisible = false; ASSERT_FALSE(playbackScopeGpuTapServes(in));
+    in = servingTapInputs(); in.anyScopeChecked = false; ASSERT_FALSE(playbackScopeGpuTapServes(in));
+    in = servingTapInputs(); in.gpuWidgetViewportInstalled = false; ASSERT_FALSE(playbackScopeGpuTapServes(in));
+    in = servingTapInputs(); in.gpuDisplayWindowActive = true; ASSERT_FALSE(playbackScopeGpuTapServes(in));
+    in = servingTapInputs(); in.zebrasEnabled = true; ASSERT_FALSE(playbackScopeGpuTapServes(in));
+    in = servingTapInputs(); in.tapSupported = false; ASSERT_FALSE(playbackScopeGpuTapServes(in));
+    in = servingTapInputs(); in.textureRouteEligibleIgnoringScopes = false; ASSERT_FALSE(playbackScopeGpuTapServes(in));
+    // The default-constructed inputs serve nothing.
+    ASSERT_FALSE(playbackScopeGpuTapServes(PlaybackScopeGpuTapInputs()));
+}
+
+TEST(PlaybackScopesDuringPlayback, PGT02_AScopeTheReadBackServesConsumesNoPresentedPixelsWhilePlaying)
+{
+    // Visible, playing, Throttled, served by the read-back: no presented-pixel consumer, so no GPU-route veto.
+    ASSERT_FALSE(playbackScopeDisplayConsumesPresentedPixels(true, true, PlaybackScopesMode::Throttled, true));
+    // Not served: today's Throttled scope still consumes.
+    ASSERT_TRUE(playbackScopeDisplayConsumesPresentedPixels(true, true, PlaybackScopesMode::Throttled, false));
+    // Hide is unchanged with or without the read-back.
+    ASSERT_FALSE(playbackScopeDisplayConsumesPresentedPixels(true, true, PlaybackScopesMode::Hide, false));
+    ASSERT_FALSE(playbackScopeDisplayConsumesPresentedPixels(true, true, PlaybackScopesMode::Hide, true));
+    // A paused or stopped frame always draws its scope, whatever the read-back says.
+    for (PlaybackScopesMode mode : { PlaybackScopesMode::Hide, PlaybackScopesMode::Throttled, PlaybackScopesMode::Live })
+    {
+        ASSERT_TRUE(playbackScopeDisplayConsumesPresentedPixels(true, false, mode, true));
+        ASSERT_TRUE(playbackScopeDisplayConsumesPresentedPixels(true, false, mode, false));
+        ASSERT_FALSE(playbackScopeDisplayConsumesPresentedPixels(false, true, mode, true));
+    }
+    // Composition with the real gate: Live is never served (PGT-01), so a Live scope keeps consuming.
+    PlaybackScopeGpuTapInputs live = servingTapInputs();
+    live.mode = PlaybackScopesMode::Live;
+    ASSERT_TRUE(playbackScopeDisplayConsumesPresentedPixels(true, true, PlaybackScopesMode::Live, playbackScopeGpuTapServes(live)));
+    ASSERT_FALSE(playbackScopeDisplayConsumesPresentedPixels(
+        true, true, PlaybackScopesMode::Throttled, playbackScopeGpuTapServes(servingTapInputs())));
+    // The 3-argument form every existing caller and test uses is the 4th argument false.
+    ASSERT_TRUE(playbackScopeDisplayConsumesPresentedPixels(true, true, PlaybackScopesMode::Throttled));
+}
+
+TEST(PlaybackScopesDuringPlayback, PGT03_TheTapSizeKeepsTheAspectAndTheRectMustBeInsideTheFramebuffer)
+{
+    ASSERT_TRUE(QSize(512, 326) == playbackScopeTapSize(2158, 1373));          // the owner-shape viewport, capped at 512
+    ASSERT_TRUE(QSize(512, 288) == playbackScopeTapSize(1920, 1080, 512));
+    ASSERT_TRUE(QSize(300, 200) == playbackScopeTapSize(300, 200, 512));        // never upscaled
+    ASSERT_TRUE(QSize(512, 1) == playbackScopeTapSize(4000, 1, 512));           // each side at least 1
+    ASSERT_TRUE(QSize(1, 1) == playbackScopeTapSize(0, 100, 512));
+    ASSERT_TRUE(QSize(1, 1) == playbackScopeTapSize(100, 100, 0));
+
+    QRect gl;
+    // A fitted image inside a 2158x1373 framebuffer: GL rows are bottom-up.
+    ASSERT_TRUE(playbackScopeTapFramebufferRect(10.0, 20.0, 2148.0, 1353.0, 2158, 1373, &gl));
+    ASSERT_TRUE(QRect(10, 20, 2138, 1333) == gl);
+    ASSERT_TRUE(playbackScopeTapFramebufferRect(0.0, 0.0, 2158.0, 1373.0, 2158, 1373, &gl));
+    ASSERT_TRUE(QRect(0, 0, 2158, 1373) == gl);
+    ASSERT_TRUE(playbackScopeTapFramebufferRect(0.0, 100.0, 2158.0, 1273.0, 2158, 1373, &gl));
+    ASSERT_TRUE(QRect(0, 100, 2158, 1173) == gl);
+    // Zoomed past fit (any edge outside), or empty: skip.
+    ASSERT_FALSE(playbackScopeTapFramebufferRect(-50.0, 0.0, 2158.0, 1373.0, 2158, 1373, &gl));
+    ASSERT_FALSE(playbackScopeTapFramebufferRect(0.0, -50.0, 2158.0, 1373.0, 2158, 1373, &gl));
+    ASSERT_FALSE(playbackScopeTapFramebufferRect(0.0, 0.0, 2200.0, 1373.0, 2158, 1373, &gl));
+    ASSERT_FALSE(playbackScopeTapFramebufferRect(0.0, 0.0, 2158.0, 1400.0, 2158, 1373, &gl));
+    ASSERT_FALSE(playbackScopeTapFramebufferRect(10.0, 10.0, 10.2, 500.0, 2158, 1373, &gl));
+    ASSERT_FALSE(playbackScopeTapFramebufferRect(0.0, 0.0, 10.0, 10.0, 0, 0, &gl));
+}
+
+TEST(PlaybackScopesDuringPlayback, PGT04_RgbaBottomUpBecomesRgb8TopDownWithTheUnderOverRule)
+{
+    // 2x2, glReadPixels order: row 0 is the BOTTOM of the picture.
+    const uint8_t rgba[] = {
+        10, 11, 12, 99,   20, 21, 22, 99,     // bottom row
+        30, 31, 32, 99,   40, 41, 42, 99 };   // top row
+    std::vector<uint8_t> rgb8;
+    bool under = true;
+    bool over = true;
+    playbackScopeTapRgbaBottomUpToRgb8(rgba, 2, 2, &rgb8, &under, &over);
+    const std::vector<uint8_t> expected = { 30, 31, 32, 40, 41, 42, 10, 11, 12, 20, 21, 22 };
+    ASSERT_TRUE(expected == rgb8);
+    ASSERT_FALSE(under);   // no channel at 0 (alpha is ignored)
+    ASSERT_FALSE(over);    // no channel at 255
+
+    const uint8_t clipped[] = { 0, 5, 5, 255,   5, 255, 5, 0 };
+    playbackScopeTapRgbaBottomUpToRgb8(clipped, 2, 1, &rgb8, &under, &over);
+    ASSERT_TRUE(under);    // one channel of one pixel at 0
+    ASSERT_TRUE(over);     // one channel of one pixel at 255
+    const uint8_t onlyAlpha[] = { 5, 5, 5, 0,   5, 5, 5, 255 };
+    playbackScopeTapRgbaBottomUpToRgb8(onlyAlpha, 2, 1, &rgb8, &under, &over);
+    ASSERT_FALSE(under);
+    ASSERT_FALSE(over);
+    ASSERT_EQ(6, static_cast<int>(rgb8.size()));
+}
+
+TEST(PlaybackScopesDuringPlayback, PGT05_TheKillSwitchIsExactlyZero)
+{
+    ASSERT_TRUE(QByteArray(playbackScopeGpuTapKillSwitchName()) == QByteArrayLiteral("MLVAPP_PLAYBACK_SCOPE_GPU_TAP"));
+    ASSERT_TRUE(playbackScopeGpuTapKillSwitch(QByteArrayLiteral("0")));
+    ASSERT_TRUE(playbackScopeGpuTapKillSwitch(QByteArrayLiteral(" 0 ")));
+    ASSERT_FALSE(playbackScopeGpuTapKillSwitch(QByteArray()));           // unset: the read-back is on
+    ASSERT_FALSE(playbackScopeGpuTapKillSwitch(QByteArrayLiteral("1")));
+    ASSERT_FALSE(playbackScopeGpuTapKillSwitch(QByteArrayLiteral("off")));
+    ASSERT_FALSE(playbackScopeGpuTapKillSwitch(QByteArrayLiteral("00")));
+    ASSERT_FALSE(playbackScopeGpuTapKillSwitch(QByteArrayLiteral("false")));
+}
+
+TEST(PlaybackScopesDuringPlayback, PGT06_AStoppedPlayTheReadBackServedRedrawsItsFullResolutionScope)
+{
+    // Hide: today's rule, whatever the read-back did.
+    ASSERT_TRUE(playbackScopesNeedStopRefresh(PlaybackScopesMode::Hide, false, true));
+    ASSERT_TRUE(playbackScopesNeedStopRefresh(PlaybackScopesMode::Hide, true, true));
+    // A Throttled play the read-back served redraws; one it did not serve keeps today's no-refresh.
+    ASSERT_TRUE(playbackScopesNeedStopRefresh(PlaybackScopesMode::Throttled, true, true));
+    ASSERT_FALSE(playbackScopesNeedStopRefresh(PlaybackScopesMode::Throttled, false, true));
+    ASSERT_FALSE(playbackScopesNeedStopRefresh(PlaybackScopesMode::Live, false, true));
+    // A hidden edit area never asks.
+    for (PlaybackScopesMode mode : { PlaybackScopesMode::Hide, PlaybackScopesMode::Throttled, PlaybackScopesMode::Live })
+    {
+        ASSERT_FALSE(playbackScopesNeedStopRefresh(mode, true, false));
+        ASSERT_FALSE(playbackScopesNeedStopRefresh(mode, false, false));
+    }
+}
+
+TEST(PlaybackScopesDuringPlayback, PGT07_MainWindowWiresTheReadBackWithoutRecursion)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    // The funnel passes the read-back's answer as its 4th argument.
+    const QString funnel = memberBody(source, QStringLiteral("bool MainWindow::scopeDisplayConsumesPresentedPixels( bool editAreaVisible ) const"));
+    ASSERT_FALSE(funnel.isEmpty());
+    ASSERT_TRUE(funnel.contains(QStringLiteral("playbackScopeGpuTapServesNow( editAreaVisible )")));
+    // The draw gate: the read-back branch comes BEFORE the PSO-02 branch.
+    const int tapBranch = source.indexOf(QStringLiteral("    if( m_playbackScopeGpuTapServing )\n"));
+    const int pso02Branch = source.indexOf(QStringLiteral("    else if( playbackScopeFrameFeedsScope(\n"));
+    ASSERT_TRUE(tapBranch > 0);
+    ASSERT_TRUE(pso02Branch > tapBranch);
+    ASSERT_TRUE(source.mid(tapBranch, pso02Branch - tapBranch).contains(QStringLiteral("GpuDisplayViewport::requestScopeTap( ui->graphicsView, 512 );")));
+    ASSERT_TRUE(source.mid(tapBranch, pso02Branch - tapBranch).contains(QStringLiteral("GpuDisplayViewport::takeScopeTap(")));
+    // NO RECURSION: the funnel -> playbackScopeGpuTapServesNow -> textureRouteEligibleIgnoringScopes -> the table. Neither of
+    // the last two may call the funnel (or the scope-aware route check that calls it), so the call graph has no cycle.
+    const QString ignoring = memberBody(source, QStringLiteral("bool MainWindow::textureRouteEligibleIgnoringScopes( void ) const"));
+    const QString table = memberBody(source, QStringLiteral("bool MainWindow::gpuPlaybackReconTextureRouteTableAtScaleOne( bool hasScopeVisualization ) const"));
+    const QString servesNow = memberBody(source, QStringLiteral("bool MainWindow::playbackScopeGpuTapServesNow( bool editAreaVisible ) const"));
+    ASSERT_FALSE(ignoring.isEmpty());
+    ASSERT_FALSE(table.isEmpty());
+    ASSERT_FALSE(servesNow.isEmpty());
+    for (const QString &body : { ignoring, table, servesNow })
+    {
+        ASSERT_FALSE(body.contains(QStringLiteral("scopeDisplayConsumesPresentedPixels(")));
+        ASSERT_FALSE(body.contains(QStringLiteral("gpuPlaybackReconTextureRouteEligibleAtScaleOne()")));
+        ASSERT_FALSE(body.contains(QStringLiteral("gpuPreviewPolicyForCurrentScopeState(")));
+    }
+    ASSERT_TRUE(ignoring.contains(QStringLiteral("gpuPlaybackReconTextureRouteTableAtScaleOne( /*hasScopeVisualization*/ false )")));
+    ASSERT_TRUE(servesNow.contains(QStringLiteral("textureRouteEligibleIgnoringScopes()")));
+    ASSERT_TRUE(servesNow.contains(QStringLiteral("playbackScopeGpuTapServes( in )")));
+    // The stop refresh asks the pure rule.
+    ASSERT_TRUE(source.contains(QStringLiteral(
+        "playbackScopesNeedStopRefresh( m_playbackScopesMode, m_playbackScopeGpuTapServedThisPlay,")));
 }

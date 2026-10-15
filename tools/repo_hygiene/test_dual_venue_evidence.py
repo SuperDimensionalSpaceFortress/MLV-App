@@ -125,12 +125,18 @@ SCOPE_LEGS["legs/m16-1243-scopes-cuda-windowed-s1-waveform-i0.json"] = (
 # PLAYBACK-SCOPES-OPTION-1 r3: the Look-Assist-ON twins of the N and T arms (the shipping default is Look Assist on): the no-look twin with
 # generatorArgs.forceLookAssist true (a capture-free pace leg at the default Classic flavor) in place of disableLookAssist true.
 SCOPE_LA_LEGS = tuple(f"legs/m16-1243-scopes-{backend}-windowed-s1-{arm}-la.json" for backend in ("cpu", "cuda") for arm in ("none", "histogram"))
+# PLAYBACK-GPU-SCOPES-NO-VETO-1: the GL viewport scope read-back's cuda LA-on legs. CONTROL is the HEAD histogram-la leg at scopesDuringPlayback hide
+# (same scope, same window layout); the D4 matrix cells and the waveform / vectorscope supplements are throttled. Each adds cpuFrames eq 0.
+GPU_TAP_SCOPE_LEGS = ("legs/m16-1243-scopes-cuda-windowed-s1-histogram-la-hide.json",
+                      *(f"legs/m16-1243-scopes-cuda-{mode}-s{scale}-histogram-la.json"
+                        for mode, scale in (("windowed", 2), ("windowed", 4), ("fullscreen", 1), ("fullscreen", 2), ("fullscreen", 4))),
+                      *(f"legs/m16-1243-scopes-cuda-windowed-s1-{scope}-la.json" for scope in ("waveform", "vectorscope")))
 # LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1 added the scale-2 Cinematic twin of the scale-2 look leg (the Bachelor CPU Classic | Cinematic look pair).
 SHIPPED_LEGS = ("legs/m16-1243-speed.json", "legs/m16-1243-look.json", "legs/m16-1243-look-scale2.json", "legs/m16-1243-look-cinematic.json", *DISPLAY_MATRIX_LEGS, *PACE_LEGS,
                 *LOOKAHEAD_LEGS, *HEAVY_LEGS, *DECODER_LEGS, "legs/m16-1243-look-scale2-cinematic.json", "legs/m16-1243-look-film.json",
                 "legs/m16-1243-look-scale2-film.json", *(f"legs/m16-1243-look-scale2-{flavor}-agxoff.json" for flavor in ("cinematic", "film")),
                 *(f"legs/m16-1243-display-{mode}-s{scale}-vsync1.json" for scale in (1, 2, 4) for mode in ("fullscreen", "windowed")),
-                *CPU_REDUCED_LEGS, *UPSTREAM_BASELINE_LEGS, *PTRACE_LEGS, *VISUAL_LEGS, *SCOPE_LEGS, *SCOPE_LA_LEGS)
+                *CPU_REDUCED_LEGS, *UPSTREAM_BASELINE_LEGS, *PTRACE_LEGS, *VISUAL_LEGS, *SCOPE_LEGS, *SCOPE_LA_LEGS, *GPU_TAP_SCOPE_LEGS)
 # PLAYBACK-VSYNC-DEFAULT-1: the swap-interval-1 twins of the six display-matrix legs (the vsync A/B; the originals stay at the app's default 0).
 VSYNC1_LEGS = tuple(rel.replace(".json", "-vsync1.json") for rel in DISPLAY_MATRIX_LEGS)
 # LOOK-ASSIST-FILM-FLAVOR-2 r2: the AgX-off twins of the scale-2 Cinematic and Film legs carry a committed look receipt (look-receipts/agx-off.marxml).
@@ -5670,6 +5676,26 @@ class LegSpecSchemaTests(unittest.TestCase):
             gate = {"metric": "lookAssistForced", "op": "eq", "value": True}
             self.assertEqual(spec["criteria"], {"acceptance": {backend: [gate]}, "supplementary": {backend: [gate]}}, rel)
             self.assertEqual(dict(spec, legId=twin["legId"], generatorArgs=twin["generatorArgs"], criteria=twin["criteria"]), twin, rel)
+
+    def test_the_gpu_tap_scope_legs_are_the_head_histogram_la_leg_with_only_their_cell_changed(self) -> None:
+        """PLAYBACK-GPU-SCOPES-NO-VETO-1: every leg is m16-1243-scopes-cuda-windowed-s1-histogram-la (the HEAD arm) except its legId, card, cell
+        (scaleFactor, displayMode, scope, scopesDuringPlayback) and criteria, which keep lookAssistForced eq true and add gpuFramesTotal gt 0 and
+        cpuFrames eq 0. The CONTROL changes only scopesDuringPlayback to hide: same scope, same window layout and viewport as the HEAD arm."""
+        head = json.loads((DV / "legs/m16-1243-scopes-cuda-windowed-s1-histogram-la.json").read_text(encoding="utf-8"))
+        gates = [{"metric": "lookAssistForced", "op": "eq", "value": True}, {"metric": "gpuFramesTotal", "op": "gt", "value": 0},
+                 {"metric": "cpuFrames", "op": "eq", "value": 0}]
+        for rel in GPU_TAP_SCOPE_LEGS:
+            spec = json.loads((DV / rel).read_text(encoding="utf-8"))
+            self.jsonschema.validate(spec, self.schema)
+            self.assertEqual(spec["legId"], Path(rel).stem, rel)
+            self.assertEqual(spec["card"], "PLAYBACK-GPU-SCOPES-NO-VETO-1", rel)
+            self.assertEqual(spec["criteria"], {"acceptance": {"cuda": gates}, "supplementary": {"cuda": gates}}, rel)
+            expected_mode = "hide" if rel.endswith("-la-hide.json") else "throttled"
+            self.assertEqual(spec["generatorArgs"], dict(head["generatorArgs"], scope=spec["generatorArgs"]["scope"], scopesDuringPlayback=expected_mode), rel)
+            self.assertEqual(dict(spec, legId=head["legId"], card=head["card"], scaleFactor=head["scaleFactor"], displayMode=head["displayMode"],
+                                  generatorArgs=head["generatorArgs"], criteria=head["criteria"]), head, rel)
+        control = json.loads((DV / GPU_TAP_SCOPE_LEGS[0]).read_text(encoding="utf-8"))
+        self.assertEqual((control["scaleFactor"], control["displayMode"], control["generatorArgs"]["scope"]), (1, "windowed", "histogram"))
 
     def test_the_hand_listed_shipped_legs_are_exactly_the_legs_directory(self) -> None:
         self.assertEqual(sorted(SHIPPED_LEGS), sorted("legs/" + p.name for p in (DV / "legs").glob("*.json")), "SHIPPED_LEGS drifted from the legs/ directory")
