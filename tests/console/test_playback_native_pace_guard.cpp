@@ -962,6 +962,15 @@ TEST(PlaybackUnpacedWiring, TheMeasuredLoopChecksItsStopInBoundedSlicesOnlyWhenU
     ASSERT_TRUE(stress > at);
     ASSERT_TRUE(measured > stress);
     ASSERT_TRUE(stress - at < 600);
+    // and the engine holds once the required frames are consumed, before any advance path (the loop wrap included)
+    const QString handling = bodyBetween(source, QStringLiteral("void MainWindow::playbackHandling(int timeDiff)"),
+                                         QStringLiteral("void MainWindow::showPerformanceProfilingDialog"));
+    const QString hold = QStringLiteral(
+        "if( m_automationPacingIsolated && mlvappPlaybackUnpacedRequested() && programmaticPlayConsumed() ) return;");
+    ASSERT_EQ(1, source.count(hold));
+    const int holdAt = handling.indexOf(hold);
+    ASSERT_TRUE(holdAt > handling.indexOf(QStringLiteral("const bool paceGuardArmedBeforeTick = m_playbackPaceGuard.armed();")));
+    ASSERT_TRUE(holdAt < handling.indexOf(QStringLiteral("m_playbackPaceGuard.grantLoopWrap(")));
 }
 
 TEST(PlaybackUnpacedWiring, NoGuardCallIsStillPacedByGetFramerate)

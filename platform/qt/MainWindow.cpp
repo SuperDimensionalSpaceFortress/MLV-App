@@ -11252,6 +11252,10 @@ void MainWindow::playbackHandling(int timeDiff)
         const double paceNowMs = mlv_stage_timing_now() * 1000.0;
         const bool paceGuardArmedBeforeTick = m_playbackPaceGuard.armed();   // slip_summary: a re-arm mid-session
 
+        // CUDA-HEADROOM-1: unpaced, present -> early advance -> render -> present never yields to the smoke's stop check
+        // (r1 venue: Reached at 480 frames, seen at 615). Once the required source frames are consumed, hold.
+        if( m_automationPacingIsolated && mlvappPlaybackUnpacedRequested() && programmaticPlayConsumed() ) return;
+
         //when on last frame
         if( ui->horizontalSliderPosition->value() >= ui->spinBoxCutOut->value() - 1 )
         {
