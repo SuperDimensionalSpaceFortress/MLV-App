@@ -583,16 +583,29 @@ TEST(Debayered16ReconReuse, HonourScaleProductionStepConsumesReducedReconOrRende
 // the frame the CPU route (no CUDA preset) presents. The no-fault CUDA session keeps its own route:
 // its CPU plan refuses ("GPU playback recon requested").
 // RED on 79ecc20b (the plan refuses, so the slot is a full-res recon: reducedScale 1) and on
-// c5ab7d0b (the stale CUDA stamp: outcome gpu_playback_recon).
+// c5ab7d0b (the stale CUDA stamp: outcome gpu_playback_recon). Both arms run with no full-res
+// raw fixes (as M16-1243 at the venue): the fix pass is a full applyLLRawProcObjectWorker, which
+// restamps the flag itself and would hide a missing restamp in the reduced recon.
 TEST(Debayered16ReconReuse, HonourScaleCudaSuppressedSessionPresentsTheCpuRoutesReducedRecon)
 {
     EnvGuard guard;
     const int scale = 4;
     const int frames = 2;
+    const auto openWithoutFullResFixes = [](MlvPipelineFixture & fixture) {
+        if (!openLargeHq(fixture)) return false;
+        fixture.video()->llrawproc->focus_pixels = 0;
+        fixture.video()->llrawproc->bad_pixels = 0;
+        fixture.video()->llrawproc->vertical_stripes = 0;
+        fixture.video()->llrawproc->pattern_noise = 0;
+        return true;
+    };
     std::vector<std::vector<uint16_t>> cpuRoute;
     {
         MlvPipelineFixture fixture;
-        ASSERT_TRUE(openLargeHq(fixture));
+        ASSERT_TRUE(openWithoutFullResFixes(fixture));
+        mlvDualIsoPreviewScaleRecon_t cpuPlan;
+        ASSERT_EQ(1, mlvDualIsoPreviewScaleReconPlan(fixture.video(), scale, &cpuPlan));
+        ASSERT_EQ(0, cpuPlan.fullResFixes);
         WorkerState worker;
         ProductionSlot slot;
         for (int f = 0; f < frames; ++f)
@@ -616,7 +629,7 @@ TEST(Debayered16ReconReuse, HonourScaleCudaSuppressedSessionPresentsTheCpuRoutes
     };
     HONOUR_SCALE_TEST_SETENV("MLVAPP_GPU_PLAYBACK_RECON", "1");
     MlvPipelineFixture fixture;
-    ASSERT_TRUE(openLargeHq(fixture));
+    ASSERT_TRUE(openWithoutFullResFixes(fixture));
     // The GL surface the preset installed stays, presenting the 16-bit frame; the prep reduces that.
     // Presenting the 8-bit image through it instead (r4's F1) is refused (the GUI fixture's prepFactor).
     PlaybackPrepReducedInputs prep = playbackPrepInputs(scale, fixture.width(), fixture.height(), fixture.width(),
