@@ -19,9 +19,12 @@
 #include <QMutex>
 #include <Qt>
 #include <atomic>
+#include <memory>
 #include "../../src/mlv_include.h"
+#include "PlaybackAudioStartPolicy.h"
 
 class QThread;
+class QTimer;
 
 class AudioPlayback : public QObject
 {
@@ -35,29 +38,24 @@ public:
     void play( void );
     void stop( void );
 
-    // PLAYBACK-STARTUP-WAIT-PREWARM-1 Row A: the audio device is opened, seeked and started on its own thread, so the
-    // GUI thread never blocks on it (the first Play-present waited ~0.3-0.65 s on Bachelor). Without
-    // startWorkerThread() (MLVAPP_PLAYBACK_AUDIO_SYNC_LEGACY=1) every call runs synchronously on the caller, as before.
-    struct StartReport
-    {
-        bool valid = false;
-        const char *mode = "none";      // prepared | reopen | legacy
-        double prepareMs = 0.0;         // the silent open at Play (stop, seek, start, suspend)
-        double resumeLagMs = 0.0;       // first present -> audio audible
-        double reopenMs = 0.0;          // the open when the prepared sink could not be used
-        int syncFrame = -1;             // the presented frame the audio is synced to
-        int seekFrame = -1;             // the frame the audio content starts at
-        double avOffsetEstMs = 0.0;     // audio content minus video timeline when audible (app-side estimate)
-    };
+    // PLAYBACK-STARTUP-WAIT-PREWARM-1 Row A: the audio device is opened, held and handed its content on its own thread,
+    // so the GUI thread never blocks on it (the first Play-present waited ~0.3-0.65 s on Bachelor). The policy is
+    // PlaybackAudioStartPolicy.h. Without startWorkerThread() (MLVAPP_PLAYBACK_AUDIO_SYNC_LEGACY=1) every call runs
+    // synchronously on the caller, as before.
+    using StartReport = playback_audio_start::StartReport;
     /*! Moves this (parentless) object to its own thread; every later call is queued there, in order. */
     void startWorkerThread( void );
-    /*! GUI thread: resets the engine on the worker, brings the object back, quits and joins the thread. */
-    void shutdownWorkerThread( void );
+    /*! GUI thread: resets the engine on the worker, brings the object back, quits and joins the thread, each wait
+     *  bounded (PlaybackWorkerJoin.h). False when a wait timed out: the worker may still use this object, so the
+     *  caller must not delete it. */
+    bool shutdownWorkerThread( void );
     bool usesWorkerThread( void ) const { return m_pWorkerThread != nullptr; }
-    /*! At a settled paused frame and at Play: open the sink silently at \a startFrame and keep it suspended (queued;
-     *  coalesced to the newest; a sink already prepared there is kept). No-op without the worker thread. */
+    /*! At a settled paused frame and at Play: hold the sink open, running and silent (queued; coalesced to the
+     *  newest). An open sink is kept whatever \a startFrame is: the handover positions the content. No-op without
+     *  the worker thread. */
     void prepare( int startFrame );
-    /*! At a present: start the audio for \a frame, presented at \a presentWallMs (mlv_stage_timing_now() ms). */
+    /*! At a present: hand the audio over for \a frame, presented at \a presentWallMs (mlv_stage_timing_now() ms).
+     *  Dropped on the audio thread when stop() was called after it was posted. */
     void syncAndPlay( int frame, double presentWallMs );
     /*! The legacy synchronous start just ran (GUI thread): record it for the report. */
     void noteLegacyStart( int syncFrame, int displayFrame );
@@ -70,8 +68,10 @@ private:
     void jumpToPosNow( int frame );
     void playNow( void );
     void stopNow( void );
-    void prepareNow( int startFrame );
-    void syncAndPlayNow( int frame, double presentWallMs );
+    void prepareNow( void );
+    void syncAndPlayNow( int frame, double presentWallMs, quint64 session );
+    void stopHeldNow( void );
+    void armHoldTimer( void );
     void storeReport( const StartReport &report );
     template <typename F> void post( F &&work );
 
@@ -93,13 +93,14 @@ private:
 
     double m_mlvFrameRate = 0.0;
 
-    // Row A (worker thread only, except the report)
+    // Row A (worker thread only, except the report and the session stamp)
+    class HeldSink;
     QThread *m_pWorkerThread = nullptr;
-    bool m_prepared = false;
-    int m_preparedFrame = -1;
-    double m_preparedMs = 0.0;
-    double m_lastOpenMs = 0.0;          // the newest open (warm after the clip's first one): the re-open's seek-ahead
-    std::atomic<quint64> m_prepareTicket { 0 };   // GUI thread bumps it per prepare(); only the newest runs
+    std::unique_ptr<HeldSink> m_pHeldSink;              // QAudioSink + the gate it pulls from, as the engine's SinkPort
+    std::unique_ptr<playback_audio_start::StartEngine> m_pEngine;
+    QTimer *m_pHoldTimer = nullptr;                     // suspends a held sink after kAudioHeldRunningMs
+    std::atomic<quint64> m_prepareTicket { 0 };         // GUI thread bumps it per prepare(); only the newest runs
+    playback_audio_start::SessionStamp m_session;      // stop() invalidates syncs posted before it
     mutable QMutex m_reportMutex;
     StartReport m_report;
 };

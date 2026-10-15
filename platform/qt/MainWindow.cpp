@@ -16,6 +16,7 @@
 #include "DualIsoLevelSyncPolicy.h"
 #include "PlaybackFpsMeterPolicy.h"
 #include "AutomationSettings.h"
+#include "PlaybackEnvFlags.h"
 #include "PlaybackFrameRange.h"
 #include "PlaybackGatePolicy.h"
 #include "PlaybackPrepPresentationPolicy.h"
@@ -207,19 +208,33 @@ static bool mlvappPlaybackStartupCatchupLegacyRequested()
     return requested;
 }
 
+// PLAYBACK-STARTUP-WAIT-PREWARM-1 r2: the exact values (PlaybackEnvFlags.h: on 1/true/on/yes, off 0/false/off/no); unset
+// keeps the default, and anything else keeps it too and is logged once.
+static bool playbackEnvSwitch( const char *name, bool defaultValue )
+{
+    const QByteArray raw = qgetenv( name );
+    const playback_env_flag::Value value = playback_env_flag::parse( raw.constData() );
+    if( value == playback_env_flag::Value::Invalid )
+        qWarning().noquote() << QStringLiteral( "%1=\"%2\" is not one of 1/true/on/yes/0/false/off/no; keeping the default (%3)" )
+                                    .arg( QString::fromLatin1( name ) )
+                                    .arg( QString::fromLocal8Bit( raw ) )
+                                    .arg( defaultValue ? QStringLiteral( "on" ) : QStringLiteral( "off" ) );
+    return playback_env_flag::resolve( value, defaultValue );
+}
+
 // PLAYBACK-STARTUP-WAIT-PREWARM-1 Row A kill switch, read once: the audio device is stopped, seeked and started
-// synchronously on the GUI thread at the first present again (no audio thread, no prepare at Play).
+// synchronously on the GUI thread at the first present again (no audio thread, no prepare at Play). Default off.
 static bool mlvappPlaybackAudioSyncLegacyRequested()
 {
-    static const bool requested = environmentFlagEnabled( "MLVAPP_PLAYBACK_AUDIO_SYNC_LEGACY" );
+    static const bool requested = playbackEnvSwitch( "MLVAPP_PLAYBACK_AUDIO_SYNC_LEGACY", false );
     return requested;
 }
 
-// PLAYBACK-STARTUP-WAIT-PREWARM-1 Row B kill switch, read once: MLVAPP_PLAYBACK_ROUTE_PREWARM=0 never warms the CUDA texture
-// playback route while paused, so the first Play-present pays its one-time setup again.
+// PLAYBACK-STARTUP-WAIT-PREWARM-1 Row B switch, read once: MLVAPP_PLAYBACK_ROUTE_PREWARM=0 (or false/off/no) never warms the
+// CUDA texture playback route while paused, so the first Play-present pays its one-time setup again. Default on.
 static bool mlvappPlaybackRoutePrewarmDisabled()
 {
-    static const bool disabled = qgetenv( "MLVAPP_PLAYBACK_ROUTE_PREWARM" ).trimmed() == QByteArrayLiteral( "0" );
+    static const bool disabled = !playbackEnvSwitch( "MLVAPP_PLAYBACK_ROUTE_PREWARM", true );
     return disabled;
 }
 
@@ -2549,7 +2564,11 @@ MainWindow::~MainWindow()
     delete m_pRenderThread;
     m_pRenderThread = nullptr;
 
-    if( m_pAudioPlayback ) m_pAudioPlayback->shutdownWorkerThread();
+    if( m_pAudioPlayback && !m_pAudioPlayback->shutdownWorkerThread() )
+    {
+        // the audio thread is hung (logged by shutdownWorkerThread): never delete what it may still touch
+        m_pAudioPlayback = nullptr;
+    }
     if( m_pAudioPlayback ) m_pAudioPlayback->stop();
 
     if( m_pMlvObject )
@@ -28093,7 +28112,8 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
         qInfo().noquote()
             << QStringLiteral(
                    "playback_smoke.audio_start session=%1 mode=%2 prepare_ms=%3 resume_lag_ms=%4 reopen_ms=%5 "
-                   "sync_frame=%6 seek_frame=%7 av_offset_est_ms=%8" )
+                   "sync_frame=%6 seek_frame=%7 av_offset_est_ms=%8 av_offset_audible_ms=%9 out_latency_ms=%10 "
+                   "resume_ms=%11 sink=%12 health=%13" )
                    .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
                    .arg( QString::fromLatin1( audioStart.mode ) )
                    .arg( audioStart.prepareMs, 0, 'f', 3 )
@@ -28101,7 +28121,12 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                    .arg( audioStart.reopenMs, 0, 'f', 3 )
                    .arg( audioStart.syncFrame )
                    .arg( audioStart.seekFrame )
-                   .arg( audioStart.avOffsetEstMs, 0, 'f', 3 );
+                   .arg( audioStart.avOffsetEstMs, 0, 'f', 3 )
+                   .arg( audioStart.avOffsetAudibleMs, 0, 'f', 3 )
+                   .arg( audioStart.outLatencyMs, 0, 'f', 3 )
+                   .arg( audioStart.resumeMs, 0, 'f', 3 )
+                   .arg( QString::fromLatin1( audioStart.sink ) )
+                   .arg( QString::fromLatin1( audioStart.health ) );
     }
 
     qInfo().noquote()
@@ -31022,8 +31047,9 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
             }
             else
             {
-                // PLAYBACK-STARTUP-WAIT-PREWARM-1 Row A: the audio thread resumes the sink prepared at Play, or
-                // re-opens it ahead of the video; this present is the sync anchor. The GUI thread never waits on it.
+                // PLAYBACK-STARTUP-WAIT-PREWARM-1 Row A: the audio thread hands the content to the held sink (resumed
+                // or re-opened first when needed) where the video will be when it is audible; this present is the
+                // anchor. The GUI thread never waits on it.
                 m_pAudioPlayback->syncAndPlay( static_cast<int>( displayFrame ), mlv_stage_timing_now() * 1000.0 );
             }
         }
@@ -31419,9 +31445,9 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
     splitStep( playback_startup_split::StepSmoke );
     if( splitFirst )
         m_playbackStartupSplit.noteFirstFinish( ( mlv_stage_timing_now() - splitFinishEntry ) * 1000.0 );
-    // PLAYBACK-STARTUP-WAIT-PREWARM-1 Row A: while paused, keep the audio sink open at the frame on screen (silent and
-    // suspended, on the audio thread; coalesced, and kept when already there). The device open (~0.3-0.6 s on Bachelor)
-    // then never races the first Play-present, which only resumes it.
+    // PLAYBACK-STARTUP-WAIT-PREWARM-1 Row A: while paused, keep the audio sink open (running on silence, on the audio
+    // thread; coalesced, and kept when already open). The device open (~0.3-0.6 s on Bachelor) then never races the
+    // first Play-present, which only hands the content over.
     if( !ui->actionPlay->isChecked()
      && !mlvappPlaybackAudioSyncLegacyRequested()
      && m_pAudioPlayback

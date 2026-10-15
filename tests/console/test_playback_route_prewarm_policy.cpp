@@ -118,7 +118,7 @@ TEST(PlaybackRoutePrewarmWiring, ArmedAtClipLoadRunFromAPausedPresentAndKillSwit
 {
     const QString source = sourceFile("platform/qt/MainWindow.cpp");
     ASSERT_TRUE(source.contains(QStringLiteral(
-        "static const bool disabled = qgetenv( \"MLVAPP_PLAYBACK_ROUTE_PREWARM\" ).trimmed() == QByteArrayLiteral( \"0\" );")));
+        "static const bool disabled = !playbackEnvSwitch( \"MLVAPP_PLAYBACK_ROUTE_PREWARM\", true );")));
     // armed right after the clip's audio engine is set up (the open has settled)
     ASSERT_TRUE(source.contains(QStringLiteral(
         "    m_pAudioPlayback->initAudioEngine( m_pMlvObject );\n"
@@ -149,4 +149,17 @@ TEST(PlaybackRoutePrewarmWiring, ArmedAtClipLoadRunFromAPausedPresentAndKillSwit
     const int freeTextures = prewarm.indexOf(QStringLiteral("delete warmOutput;"));
     ASSERT_TRUE(reset >= 0);
     ASSERT_TRUE(freeTextures > reset); // unregistered from CUDA before the GL textures go
+    // r2 row d: a window already presenting the recon route at this size keeps its live CUDA-GL slot (no warm, no
+    // reset), and every warm says whether it dropped a held slot
+    const int keepSlot = prewarm.indexOf(QStringLiteral("skipped=live_slot_warm"));
+    ASSERT_TRUE(keepSlot >= 0);
+    ASSERT_TRUE(keepSlot < reset);
+    ASSERT_TRUE(prewarm.contains(QStringLiteral("live_slot_evicted=%9")));
+    // and the warm runs without g_activeMutex (r1 held it 133-470 ms against every render-thread present)
+    const QString ifActive = bodyBetween(window, QStringLiteral("bool GpuDisplayWindow::prewarmPlaybackReconRouteIfActive("),
+                                         QStringLiteral("bool GpuDisplayWindow::prewarmPlaybackReconRoute(int texWidth"));
+    const int lockScopeEnd = ifActive.indexOf(QStringLiteral("    }\n    // r2: the warm runs WITHOUT g_activeMutex"));
+    const int warm = ifActive.indexOf(QStringLiteral("return win->prewarmPlaybackReconRoute(texWidth, texHeight, summary);"));
+    ASSERT_TRUE(lockScopeEnd >= 0);
+    ASSERT_TRUE(warm > lockScopeEnd);
 }

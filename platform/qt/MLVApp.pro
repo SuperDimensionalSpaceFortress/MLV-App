@@ -385,6 +385,9 @@ HEADERS += MainWindow.h \
            PlaybackAudioStartPolicy.h \
            PlaybackFirstPresentIdentity.h \
            PlaybackRoutePrewarmPolicy.h \
+           PlaybackAudioGate.h \
+           PlaybackEnvFlags.h \
+           PlaybackWorkerJoin.h \
            PlaybackPresentTrace.h \
            PlaybackSwapInterval.h \
            PlaybackScopesDuringPlayback.h \

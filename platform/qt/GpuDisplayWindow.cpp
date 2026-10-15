@@ -511,18 +511,24 @@ bool GpuDisplayWindow::presentGpuPlaybackReconAmazePostWbTextureIfActive(
 
 bool GpuDisplayWindow::prewarmPlaybackReconRouteIfActive(int texWidth, int texHeight, QString *summary)
 {
-    QMutexLocker lock(&g_activeMutex);
-    GpuDisplayWindow *win = g_activeWindow.load(std::memory_order_acquire);
-    if ( !win )
+    GpuDisplayWindow *win = nullptr;
     {
-        if ( summary ) *summary = QStringLiteral("ok=0 reason=no_active_window");
-        return false;
+        QMutexLocker lock(&g_activeMutex);
+        win = g_activeWindow.load(std::memory_order_acquire);
+        if ( !win )
+        {
+            if ( summary ) *summary = QStringLiteral("ok=0 reason=no_active_window");
+            return false;
+        }
+        if ( QThread::currentThread() != win->thread() )
+        {
+            if ( summary ) *summary = QStringLiteral("ok=0 reason=not_gui_thread");
+            return false;
+        }
     }
-    if ( QThread::currentThread() != win->thread() )
-    {
-        if ( summary ) *summary = QStringLiteral("ok=0 reason=not_gui_thread");
-        return false;
-    }
+    // r2: the warm runs WITHOUT g_activeMutex (r1 held it 133-470 ms, blocking every render-thread present that posts
+    // through it). The window is only destroyed on this (GUI) thread, and the warm never runs the event loop, so it
+    // stays alive for the whole warm.
     return win->prewarmPlaybackReconRoute(texWidth, texHeight, summary);
 }
 
@@ -543,6 +549,21 @@ bool GpuDisplayWindow::prewarmPlaybackReconRoute(int texWidth, int texHeight, QS
     {
         if ( summary ) *summary = QStringLiteral("ok=0 reason=invalid_size");
         return false;
+    }
+    // r2 row d: the warm's last step unregisters the CUDA-GL cache, which holds ONE input/output pair: the live slot.
+    // A window already presenting the recon route at this size is warm, and its slot is kept: no warm at all. Any
+    // other slot (another size, or none) is dropped by the first Play-present's texture re-allocation anyway
+    // (destroyTexture() resets both runtimes' registrations), so clearing it here costs that present nothing.
+    const bool liveSlotHeld = m_texture && m_textureFromGpuRecon && m_gpuReconSourceTexture;
+    if ( liveSlotHeld
+      && m_texture->width() == texWidth && m_texture->height() == texHeight
+      && m_gpuReconSourceTexture->width() == texWidth && m_gpuReconSourceTexture->height() == texHeight )
+    {
+        if ( summary )
+            *summary = QStringLiteral("ok=1 width=%1 height=%2 skipped=live_slot_warm live_slot_held=1 live_slot_evicted=0 total_ms=0.000")
+                .arg(texWidth)
+                .arg(texHeight);
+        return true;
     }
     QElapsedTimer clock;
     clock.start();
@@ -588,7 +609,8 @@ bool GpuDisplayWindow::prewarmPlaybackReconRoute(int texWidth, int texHeight, QS
 
     if ( summary )
     {
-        *summary = QStringLiteral("ok=%1 width=%2 height=%3 program_ms=%4 alloc_ms=%5 amaze_ms=%6 total_ms=%7 reason=\"%8\"")
+        *summary = QStringLiteral("ok=%1 width=%2 height=%3 program_ms=%4 alloc_ms=%5 amaze_ms=%6 total_ms=%7 "
+                                  "live_slot_held=%8 live_slot_evicted=%9 reason=\"%10\"")
             .arg(amazeOk ? 1 : 0)
             .arg(texWidth)
             .arg(texHeight)
@@ -596,6 +618,8 @@ bool GpuDisplayWindow::prewarmPlaybackReconRoute(int texWidth, int texHeight, QS
             .arg(allocMs, 0, 'f', 3)
             .arg(amazeMs, 0, 'f', 3)
             .arg(nowMs(), 0, 'f', 3)
+            .arg(liveSlotHeld ? 1 : 0)
+            .arg(liveSlotHeld ? 1 : 0)
             .arg(amazeReason);
     }
     return amazeOk;
