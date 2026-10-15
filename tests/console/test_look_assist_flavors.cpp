@@ -18,6 +18,7 @@
 #include "../../src/batch/ReceiptApplier.h"
 
 #include <cmath>
+#include <cstdio>
 
 #include <QByteArray>
 #include <QCryptographicHash>
@@ -1022,4 +1023,339 @@ TEST(LookAssistFlavors, TheFilmGradeIsLaidAndPutBackAtEverySite)
     ASSERT_TRUE( ui.contains( QStringLiteral("<string>Film grade</string>") ) );
     ASSERT_TRUE( window.contains( QStringLiteral("setItemData( 2, lookAssistFlavorName( LookAssistFlavor::Film ) );") ) );
     ASSERT_TRUE( window.contains( QStringLiteral("tr( \"Colour-graded look: cool shadows, warm highlights\" ), Qt::ToolTipRole );") ) );
+}
+
+// ---- LOOK-ASSIST-KODAK-VISION-50D-1: the Kodak Vision3 50D grade (vision50d) ----
+
+namespace
+{
+
+LookAssistPreset vision50d( LookAssistScene scene, const LookAssistStats &s,
+                            const LookAssistStats *c, const LookAssistStats *d )
+{
+    return presetForLookAssistScene( scene, s, c, d, LookAssistFlavor::Vision50d );
+}
+
+// The owner's knots (look C), the recipe the docs table and the builder must both carry.
+const double kVision50dOwnerY[5][2] = { { 1e-5, 0.005 }, { 0.18, 0.15 }, { 0.50, 0.51 }, { 0.82, 0.86 }, { 1.0, 0.985 } };
+const double kVision50dOwnerR[3][2] = { { 1e-5, 1e-5 }, { 0.50, 0.505 }, { 1.0, 1.0 } };
+const double kVision50dOwnerG[3][2] = { { 1e-5, 1e-5 }, { 0.50, 0.50 }, { 1.0, 1.0 } };
+const double kVision50dOwnerB[3][2] = { { 1e-5, 1e-5 }, { 0.50, 0.495 }, { 1.0, 1.0 } };
+
+} // namespace
+
+TEST(LookAssistFlavors, Vision50dIsOneMoreSpellingOfTheSameSelector)
+{
+    ASSERT_TRUE( lookAssistFlavorName( LookAssistFlavor::Vision50d ) == QLatin1String( "vision50d" ) );
+    // The three existing spellings are unchanged.
+    ASSERT_TRUE( lookAssistFlavorName( LookAssistFlavor::Classic ) == QLatin1String( "classic" ) );
+    ASSERT_TRUE( lookAssistFlavorName( LookAssistFlavor::Cinematic ) == QLatin1String( "cinematic" ) );
+    ASSERT_TRUE( lookAssistFlavorName( LookAssistFlavor::Film ) == QLatin1String( "film" ) );
+    LookAssistFlavorSelection s = lookAssistSelectFlavor( QStringLiteral("vision50d"), QString(), QString() );
+    ASSERT_TRUE( s.flavor == LookAssistFlavor::Vision50d && s.source == QLatin1String( "env" ) && !s.unknownValue );
+    s = lookAssistSelectFlavor( QString(), QStringLiteral("vision50d"), QString() );
+    ASSERT_TRUE( s.flavor == LookAssistFlavor::Vision50d && s.source == QLatin1String( "receipt" ) );
+    s = lookAssistSelectFlavor( QString(), QString(), QStringLiteral("vision50d") );
+    ASSERT_TRUE( s.flavor == LookAssistFlavor::Vision50d && s.source == QLatin1String( "app" ) );
+    // Case and spacing do not matter; the environment still wins.
+    s = lookAssistSelectFlavor( QStringLiteral("  VISION50D "), QStringLiteral("film"), QStringLiteral("cinematic") );
+    ASSERT_TRUE( s.flavor == LookAssistFlavor::Vision50d && !s.unknownValue && s.source == QLatin1String( "env" ) );
+    s = lookAssistSelectFlavor( QStringLiteral("classic"), QStringLiteral("Vision50D"), QString() );
+    ASSERT_TRUE( s.flavor == LookAssistFlavor::Classic && s.source == QLatin1String( "env" ) );
+    // The label is not a spelling, nor is a near miss: Classic, flagged, never a fall through.
+    for( const char *bad : { "Kodak Vision3 50D", "vision 50d", "vision50", "50d", "film50d" } )
+    {
+        s = lookAssistSelectFlavor( QString(), QLatin1String( bad ), QStringLiteral("vision50d") );
+        ASSERT_TRUE( s.flavor == LookAssistFlavor::Classic && s.unknownValue && s.source == QLatin1String( "receipt" ) );
+        ASSERT_TRUE( s.rejectedValue == QLatin1String( bad ) );
+    }
+    // Receipt -> the GUI selector's value, the same rule.
+    LookAssistFlavorSelection sel;
+    ASSERT_TRUE( lookAssistSelectorValueForReceipt( QStringLiteral(" Vision50D "), &sel ) == QLatin1String( "vision50d" ) );
+    ASSERT_FALSE( sel.unknownValue );
+    ASSERT_TRUE( sel.flavor == LookAssistFlavor::Vision50d );
+    ASSERT_TRUE( lookAssistSelectorValueForReceipt( QStringLiteral("Kodak Vision3 50D"), &sel ) == QLatin1String( "classic" ) );
+    ASSERT_TRUE( sel.unknownValue );
+}
+
+TEST(LookAssistFlavors, TheVision50dReceiptElementIsWrittenAndReadBack)
+{
+    // Written: the GUI writer keeps the element for any non-Classic flavor (its two guards are pinned by
+    // ReceiptElementIsWrittenOnlyForANonClassicFlavor), so vision50d is written. Read back by the loader, it is a layer
+    // of the selector and the GUI selector's value.
+    const QString value = lookAssistFlavorName( LookAssistFlavor::Vision50d );
+    ASSERT_TRUE( !value.isEmpty() && value != QLatin1String( "classic" ) );
+    QTemporaryDir tempDir;
+    ASSERT_TRUE( tempDir.isValid() );
+    const QString path = tempDir.filePath( QStringLiteral("vision50d.marxml") );
+    QFile file( path );
+    ASSERT_TRUE( file.open( QIODevice::WriteOnly | QIODevice::Text ) );
+    QTextStream out( &file );
+    out << "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<receipt version=\"4\" mlvapp=\"test\">\n"
+        << "  <lookAssistEnabled>1</lookAssistEnabled>\n  <lookAssistFlavor>" << value << "</lookAssistFlavor>\n"
+        << "  <gradationCurve>" << lookAssistVision50dGradationCurve( LookAssistScene::Shade ) << "</gradationCurve>\n"
+        << "  <lookAssistBaselineGradationCurve>1e-05;1e-05;1;1;?1e-05;1e-05;1;1;?1e-05;1e-05;1;1;?1e-05;1e-05;1;1;</lookAssistBaselineGradationCurve>\n"
+        << "</receipt>\n";
+    file.close();
+    ReceiptSettings receipt;
+    QString error;
+    ASSERT_TRUE( ReceiptLoader::loadFromFile( path, &receipt, &error ) );
+    ASSERT_TRUE( receipt.lookAssistFlavor() == QLatin1String( "vision50d" ) );
+    ASSERT_TRUE( lookAssistSelectFlavor( QString(), receipt.lookAssistFlavor(), QString() ).flavor == LookAssistFlavor::Vision50d );
+    ASSERT_TRUE( lookAssistSelectorValueForReceipt( receipt.lookAssistFlavor(), nullptr ) == QLatin1String( "vision50d" ) );
+    ASSERT_TRUE( receipt.gradationCurve() == lookAssistVision50dGradationCurve( LookAssistScene::Shade ) );
+    ASSERT_TRUE( lookAssistVision50dOwnsGradationCurve( receipt.gradationCurve() ) );
+    ASSERT_TRUE( lookAssistGradationCurveAfterFilmRestore( receipt.gradationCurve(), receipt.lookAssistBaselineGradationCurve() )
+                 == receipt.lookAssistBaselineGradationCurve() );
+}
+
+TEST(LookAssistFlavors, TheDocumentedVision50dTableIsTheCodeTable)
+{
+    // docs/look-assist-vision50d.md carries the recipe between two markers: one row per scene (s and the vibrance delta)
+    // and one row per curve line (the owner's knots). Every value must be the code's.
+    const QString doc = readSource( QStringLiteral("docs/look-assist-vision50d.md") );
+    const int begin = doc.indexOf( QStringLiteral("<!-- vision50d-table:begin -->") );
+    const int end = doc.indexOf( QStringLiteral("<!-- vision50d-table:end -->") );
+    ASSERT_TRUE( begin >= 0 && end > begin );
+    const QString block = doc.mid( begin, end - begin );
+    int rows = 0;
+    for( const auto &s : kSceneNames )
+    {
+        // | Scene | s | vibrance delta |
+        const QRegularExpression row( QStringLiteral("^\\|\\s*%1\\s*\\|\\s*([0-9.]+)\\s*\\|\\s*([+-]?\\d+)\\s*\\|\\s*$")
+                                      .arg( QLatin1String( s.name ) ), QRegularExpression::MultilineOption );
+        const QRegularExpressionMatch m = row.match( block );
+        ASSERT_TRUE( m.hasMatch() );
+        ASSERT_TRUE( std::fabs( lookAssistVision50dGradeForScene( s.scene ).strength - m.captured( 1 ).toDouble() ) < 1e-12 );
+        ASSERT_EQ( lookAssistVision50dVibranceDelta(), m.captured( 2 ).toInt() );
+        ++rows;
+    }
+    ASSERT_EQ( 4, rows );
+
+    // | Y | (1e-5, 0.005) (0.18, 0.15) ... |: the knots, which at s = 1 are the laid curve's points.
+    std::vector<LookAssistGradationPoint> laid[4];
+    ASSERT_EQ( 4, lookAssistParseGradationCurve( lookAssistVision50dGradationCurve( LookAssistVision50dGrade{ 1.0 } ), laid ) );
+    const struct { const char *name; const double ( *knots )[2]; int count; int line; } lines[] = {
+        { "Y", kVision50dOwnerY, 5, 0 }, { "R", kVision50dOwnerR, 3, 1 }, { "G", kVision50dOwnerG, 3, 2 }, { "B", kVision50dOwnerB, 3, 3 } };
+    const QRegularExpression pair( QStringLiteral("\\(\\s*([0-9.eE+-]+)\\s*,\\s*([0-9.eE+-]+)\\s*\\)") );
+    for( const auto &l : lines )
+    {
+        const QRegularExpression row( QStringLiteral("^\\|\\s*%1\\s*\\|([^|]*)\\|\\s*$").arg( QLatin1String( l.name ) ),
+                                      QRegularExpression::MultilineOption );
+        const QRegularExpressionMatch m = row.match( block );
+        ASSERT_TRUE( m.hasMatch() );
+        QRegularExpressionMatchIterator it = pair.globalMatch( m.captured( 1 ) );
+        int k = 0;
+        while( it.hasNext() )
+        {
+            const QRegularExpressionMatch p = it.next();
+            ASSERT_TRUE( k < l.count );
+            ASSERT_TRUE( std::fabs( p.captured( 1 ).toDouble() - l.knots[k][0] ) < 1e-12 );
+            ASSERT_TRUE( std::fabs( p.captured( 2 ).toDouble() - l.knots[k][1] ) < 1e-12 );
+            ASSERT_TRUE( std::fabs( laid[l.line][k].x - l.knots[k][0] ) < 1e-6 );
+            ASSERT_TRUE( std::fabs( laid[l.line][k].y - l.knots[k][1] ) < 1e-6 );
+            ++k;
+        }
+        ASSERT_EQ( l.count, k );
+        ASSERT_EQ( l.count, static_cast<int>( laid[l.line].size() ) );
+    }
+    ASSERT_TRUE( lookAssistVision50dGradeId() == QLatin1String( "vision50d-v1" ) );
+}
+
+TEST(LookAssistFlavors, Vision50dPresetIsCinematicsPlusTheVibranceDeltaOnTheWholeGrid)
+{
+    // T7 PRESET: on the grid the Cinematic preset tests use, the Vision50d preset is Cinematic's except vibrance ==
+    // qBound(-100, cinematic + D, 100); exposure, temperature and tint identical. The overlay (the GUI's order: the Classic
+    // preset first, the flavor laid over it) is the same preset.
+    const int D = lookAssistVision50dVibranceDelta();
+    std::fprintf( stderr, "VISION50D-T7 D=%d\n", D );
+    ASSERT_EQ( 12, D );   // the shipped ladder rung (docs/look-assist-vision50d.md)
+    LookAssistStats display;
+    display.median = 50.0;
+    display.p99 = 120.0;
+    const std::vector<LookAssistStats> grid = look_assist_flavor_grid::statsGrid();
+    int compared = 0;
+    for( const LookAssistStats &s : grid )
+        for( int sceneIndex = 0; sceneIndex < 4; ++sceneIndex )
+            for( int useColor = 0; useColor < 2; ++useColor )
+                for( int useDisplay = 0; useDisplay < 2; ++useDisplay )
+                {
+                    const LookAssistScene scene = static_cast<LookAssistScene>( sceneIndex );
+                    const LookAssistStats *color = useColor ? &s : nullptr;
+                    const LookAssistStats *disp = useDisplay ? &display : nullptr;
+                    const LookAssistPreset cine = cinematic( scene, s, color, disp );
+                    const LookAssistPreset v = vision50d( scene, s, color, disp );
+                    ASSERT_EQ( cine.exposure, v.exposure );
+                    ASSERT_EQ( cine.temperatureDelta, v.temperatureDelta );
+                    ASSERT_EQ( cine.tintDelta, v.tintDelta );
+                    ASSERT_EQ( cine.contrast, v.contrast );
+                    ASSERT_EQ( cine.pivot, v.pivot );
+                    ASSERT_EQ( cine.shadows, v.shadows );
+                    ASSERT_EQ( cine.highlights, v.highlights );
+                    ASSERT_EQ( clampInt( -100, cine.vibrance + D, 100 ), v.vibrance );
+                    LookAssistPreset overlaid = classicDefault( scene, s, color, disp );
+                    lookAssistApplyFlavorDeltas( &overlaid, scene, LookAssistFlavor::Vision50d );
+                    ASSERT_TRUE( overlaid.exposure == v.exposure && overlaid.contrast == v.contrast && overlaid.pivot == v.pivot
+                              && overlaid.shadows == v.shadows && overlaid.highlights == v.highlights
+                              && overlaid.vibrance == v.vibrance && overlaid.temperatureDelta == v.temperatureDelta
+                              && overlaid.tintDelta == v.tintDelta );
+                    ++compared;
+                }
+    ASSERT_TRUE( compared > 0 );
+}
+
+TEST(LookAssistFlavors, TheVision50dGradeIsLaidOnlyOverADefaultCurveAndFilmsDecisionsAreUnchanged)
+{
+    const QString user = QStringLiteral("1e-05;1e-05;0.5;0.56;1;1;?1e-05;1e-05;1;1;?1e-05;1e-05;1;1;?1e-05;1e-05;1;1;");
+    const QString def = ReceiptSettings().gradationCurve();
+    ASSERT_TRUE( lookAssistGradeDecision( LookAssistFlavor::Vision50d, def ) == QLatin1String( "vision50d-v1" ) );
+    ASSERT_TRUE( lookAssistGradeDecision( LookAssistFlavor::Vision50d, QString() ) == QLatin1String( "vision50d-v1" ) );
+    ASSERT_TRUE( lookAssistGradeDecision( LookAssistFlavor::Vision50d, user ) == QLatin1String( "skipped_user_curve" ) );
+    ASSERT_TRUE( lookAssistGradeDecision( LookAssistFlavor::Vision50d, lookAssistVision50dGradationCurve( LookAssistScene::Night ) )
+                 == QLatin1String( "skipped_user_curve" ) );
+    ASSERT_TRUE( lookAssistGradeDecision( LookAssistFlavor::Vision50d, lookAssistFilmGradationCurve( LookAssistScene::Night ) )
+                 == QLatin1String( "skipped_user_curve" ) );
+    ASSERT_TRUE( lookAssistGradeDecision( LookAssistFlavor::Classic, def ) == QLatin1String( "none" ) );
+    ASSERT_TRUE( lookAssistGradeDecision( LookAssistFlavor::Cinematic, def ) == QLatin1String( "none" ) );
+    // Film through the generic decision is Film's own, unchanged; Film's own decision still says "none" for Vision50d.
+    for( const QString &curve : { def, QString(), user, lookAssistFilmGradationCurve( LookAssistScene::Shade ),
+                                  lookAssistVision50dGradationCurve( LookAssistScene::Shade ) } )
+    {
+        ASSERT_TRUE( lookAssistGradeDecision( LookAssistFlavor::Film, curve ) == lookAssistFilmGradeDecision( LookAssistFlavor::Film, curve ) );
+        ASSERT_TRUE( lookAssistFilmGradeDecision( LookAssistFlavor::Vision50d, curve ) == QLatin1String( "none" ) );
+    }
+    ASSERT_TRUE( lookAssistGradeDecision( LookAssistFlavor::Film, def ) == QLatin1String( "film-v3" ) );
+    // Which flavors lay a curve, their ids and their curves.
+    ASSERT_FALSE( lookAssistFlavorLaysGradationCurve( LookAssistFlavor::Classic ) );
+    ASSERT_FALSE( lookAssistFlavorLaysGradationCurve( LookAssistFlavor::Cinematic ) );
+    ASSERT_TRUE( lookAssistFlavorLaysGradationCurve( LookAssistFlavor::Film ) );
+    ASSERT_TRUE( lookAssistFlavorLaysGradationCurve( LookAssistFlavor::Vision50d ) );
+    ASSERT_TRUE( lookAssistGradeIdForFlavor( LookAssistFlavor::Film ) == QLatin1String( "film-v3" ) );
+    ASSERT_TRUE( lookAssistGradeIdForFlavor( LookAssistFlavor::Vision50d ) == QLatin1String( "vision50d-v1" ) );
+    ASSERT_TRUE( lookAssistGradeIdForFlavor( LookAssistFlavor::Classic ).isEmpty() );
+    ASSERT_TRUE( lookAssistGradeIdForFlavor( LookAssistFlavor::Cinematic ).isEmpty() );
+    for( const auto &s : kSceneNames )
+    {
+        ASSERT_TRUE( lookAssistGradationCurveForFlavor( LookAssistFlavor::Film, s.scene ) == lookAssistFilmGradationCurve( s.scene ) );
+        ASSERT_TRUE( lookAssistGradationCurveForFlavor( LookAssistFlavor::Vision50d, s.scene ) == lookAssistVision50dGradationCurve( s.scene ) );
+        ASSERT_TRUE( lookAssistGradationCurveForFlavor( LookAssistFlavor::Cinematic, s.scene ).isEmpty() );
+        ASSERT_TRUE( lookAssistGradationCurveForFlavor( LookAssistFlavor::Classic, s.scene ).isEmpty() );
+    }
+}
+
+TEST(LookAssistFlavors, TheVision50dCurveIsDistinctAndOwnedOnlyByItsGrade)
+{
+    // T8 DISTINCT: the Vision50d curve is not the default; Film does not own it; Vision50d does not own any of Film's 12
+    // (v3 / v2 / v1 x 4 scenes); the union owns both. The curve string is the pre-registered literal and round-trips
+    // through the widget format.
+    const QString expected = QStringLiteral(
+        "1e-05;0.005;0.18;0.15;0.5;0.51;0.82;0.86;1;0.985;?1e-05;1e-05;0.5;0.505;1;1;?1e-05;1e-05;0.5;0.5;1;1;?1e-05;1e-05;0.5;0.495;1;1;" );
+    const QString base = ReceiptSettings().gradationCurve();
+    for( const auto &s : kSceneNames )
+    {
+        const QString v = lookAssistVision50dGradationCurve( s.scene );
+        ASSERT_TRUE( v == expected );
+        ASSERT_TRUE( widgetConfiguration( v ) == v );
+        ASSERT_FALSE( lookAssistIsDefaultGradationCurve( v ) );
+        ASSERT_FALSE( lookAssistFilmOwnsGradationCurve( v ) );
+        ASSERT_TRUE( lookAssistVision50dOwnsGradationCurve( v ) );
+        ASSERT_TRUE( lookAssistGradeOwnsGradationCurve( v ) );
+        for( const QString &film : { lookAssistFilmGradationCurve( s.scene ), lookAssistFilmGradationCurveV2( s.scene ),
+                                     lookAssistFilmGradationCurveV1( s.scene ) } )
+        {
+            ASSERT_TRUE( film != v );
+            ASSERT_FALSE( lookAssistVision50dOwnsGradationCurve( film ) );
+            ASSERT_TRUE( lookAssistFilmOwnsGradationCurve( film ) );
+            ASSERT_TRUE( lookAssistGradeOwnsGradationCurve( film ) );
+            ASSERT_TRUE( lookAssistGradationCurveAfterFilmRestore( film, base ) == base );   // Film's restore is unchanged
+        }
+        ASSERT_TRUE( lookAssistGradationCurveAfterFilmRestore( v, base ) == base );
+    }
+    ASSERT_FALSE( lookAssistVision50dOwnsGradationCurve( base ) );
+    ASSERT_FALSE( lookAssistVision50dOwnsGradationCurve( QString() ) );
+    ASSERT_FALSE( lookAssistGradeOwnsGradationCurve( base ) );
+
+    // A user's edit of the laid Vision50d curve is the user's: not owned, and kept by the restore (headless and GUI share it).
+    QStringList lines = expected.split( QLatin1Char('?') );
+    lines[0] = QStringLiteral("1e-05;1e-05;0.5;0.56;1;1;");
+    const QString edited = lines.join( QLatin1Char('?') );
+    ASSERT_FALSE( lookAssistVision50dOwnsGradationCurve( edited ) );
+    ASSERT_FALSE( lookAssistGradeOwnsGradationCurve( edited ) );
+    ASSERT_TRUE( lookAssistGradationCurveAfterFilmRestore( edited, base ) == edited );
+    // A one-knot nudge of a channel line is an edit too.
+    QStringList nudged = expected.split( QLatin1Char('?') );
+    nudged[1] = QStringLiteral("1e-05;1e-05;0.5;0.507;1;1;");
+    ASSERT_FALSE( lookAssistGradeOwnsGradationCurve( nudged.join( QLatin1Char('?') ) ) );
+
+    FlavorEnvGuard guard;
+    qputenv( "MLVAPP_LOOK_ASSIST_FLAVOR", "vision50d" );
+    // Look Assist off after a Vision50d grade was laid: the default comes back and the baseline goes.
+    ReceiptSettings graded;
+    graded.setLookAssistEnabled( false );
+    graded.setGradationCurve( expected );
+    graded.setLookAssistBaselineGradationCurve( base );
+    ASSERT_FALSE( ReceiptApplier::applyHeadlessLookAssist( &graded, nullptr, nullptr, 0 ) );
+    ASSERT_TRUE( graded.gradationCurve() == base );
+    ASSERT_TRUE( graded.lookAssistBaselineGradationCurve().isEmpty() );
+    // ... and the user's edit of it is kept.
+    ReceiptSettings user;
+    user.setLookAssistEnabled( false );
+    user.setGradationCurve( edited );
+    user.setLookAssistBaselineGradationCurve( base );
+    ASSERT_FALSE( ReceiptApplier::applyHeadlessLookAssist( &user, nullptr, nullptr, 0 ) );
+    ASSERT_TRUE( user.gradationCurve() == edited );
+    ASSERT_TRUE( user.lookAssistBaselineGradationCurve().isEmpty() );
+}
+
+TEST(LookAssistFlavors, TheGuiSelectorOffersKodakVision3_50D)
+{
+    // The owner's label (2026-10-15): the 4th item is "Kodak Vision3 50D", its data the one spelling, with its tooltip.
+    const QString window = readSource( QStringLiteral("platform/qt/MainWindow.cpp") );
+    const QString ui = readSource( QStringLiteral("platform/qt/MainWindow.ui") );
+    const int comboAt = ui.indexOf( QStringLiteral("name=\"comboBoxLookAssistFlavor\"") );
+    ASSERT_TRUE( comboAt >= 0 );
+    const int comboEnd = ui.indexOf( QStringLiteral("</widget>"), comboAt );
+    ASSERT_TRUE( comboEnd > comboAt );
+    const QString combo = ui.mid( comboAt, comboEnd - comboAt );
+    ASSERT_EQ( 4, static_cast<int>( combo.count( QStringLiteral("<item>") ) ) );
+    const int classicAt = combo.indexOf( QStringLiteral("<string>Classic</string>") );
+    const int cinematicAt = combo.indexOf( QStringLiteral("<string>Cinematic</string>") );
+    const int filmAt = combo.indexOf( QStringLiteral("<string>Film grade</string>") );
+    const int visionAt = combo.indexOf( QStringLiteral("<string>Kodak Vision3 50D</string>") );
+    ASSERT_TRUE( classicAt >= 0 && cinematicAt > classicAt && filmAt > cinematicAt && visionAt > filmAt );
+    // The combo's tooltip names all four.
+    const int tipAt = combo.indexOf( QStringLiteral("<property name=\"toolTip\">") );
+    ASSERT_TRUE( tipAt >= 0 && tipAt < classicAt );
+    const QString tip = combo.mid( tipAt, classicAt - tipAt );
+    for( const char *name : { "Classic", "Cinematic", "Film grade", "Kodak Vision3 50D" } )
+        ASSERT_TRUE( tip.contains( QLatin1String( name ) ) );
+    ASSERT_TRUE( window.contains( QStringLiteral("setItemData( 3, lookAssistFlavorName( LookAssistFlavor::Vision50d ) );") ) );
+    ASSERT_TRUE( window.contains( QStringLiteral(
+        "setItemData( 3, tr( \"Kodak Vision3 50D-style look: crisp contrast, neutral colour balance, richer colour. White balance is the same as Classic's.\" ), Qt::ToolTipRole );") ) );
+}
+
+TEST(LookAssistFlavors, TheVision50dGradeIsReportedOnTheHeadlessAndGuiResultLines)
+{
+    // Both result lines end "flavor=%N" + the grade tail, and the tail is appended for the flavors that lay a curve. For
+    // Vision50d over a default curve that is " flavor=vision50d grade=vision50d-v1"; Classic and Cinematic get no tail.
+    const QString window = readSource( QStringLiteral("platform/qt/MainWindow.cpp") );
+    const QString applier = readSource( QStringLiteral("src/batch/ReceiptApplier.cpp") );
+    ASSERT_TRUE( window.contains( QStringLiteral("flavor=%30\") + filmGradeLogTail )") ) );
+    ASSERT_TRUE( applier.contains( QStringLiteral("flavor=%40\\n\" )\n        .replace( QLatin1Char('\\n'), filmGradeLogTail + QLatin1Char('\\n') )") )
+                 || applier.contains( QStringLiteral("flavor=%40\\n\" )\r\n        .replace( QLatin1Char('\\n'), filmGradeLogTail + QLatin1Char('\\n') )") ) );
+    // The decision the GUI and headless apply report is the generic one, so Vision50d's id reaches grade=.
+    ASSERT_TRUE( window.contains( QStringLiteral("const QString decision = lookAssistGradeDecision( flavor, current );") ) );
+    ASSERT_TRUE( applier.contains( QStringLiteral("const QString decision = lookAssistGradeDecision( flavor, receipt->gradationCurve() );") ) );
+    ASSERT_TRUE( window.contains( QStringLiteral("? QStringLiteral(\" grade=\") + lookAssistGradeDecision( flavor, ui->labelCurves->configuration() )") ) );
+    // The line, composed as the sites compose it.
+    const auto line = []( LookAssistFlavor flavor, const QString &curve ) {
+        const QString filmGrade = lookAssistGradeDecision( flavor, curve );
+        const QString tail = lookAssistFlavorLaysGradationCurve( flavor ) ? QStringLiteral(" grade=") + filmGrade : QString();
+        return ( QStringLiteral("... flavor=%1") + tail ).arg( lookAssistFlavorName( flavor ) );
+    };
+    const QString def = ReceiptSettings().gradationCurve();
+    ASSERT_TRUE( line( LookAssistFlavor::Vision50d, def ).endsWith( QStringLiteral(" flavor=vision50d grade=vision50d-v1") ) );
+    ASSERT_TRUE( line( LookAssistFlavor::Film, def ).endsWith( QStringLiteral(" flavor=film grade=film-v3") ) );
+    ASSERT_TRUE( line( LookAssistFlavor::Cinematic, def ).endsWith( QStringLiteral(" flavor=cinematic") ) );
+    ASSERT_TRUE( line( LookAssistFlavor::Classic, def ).endsWith( QStringLiteral(" flavor=classic") ) );
 }

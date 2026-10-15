@@ -1612,8 +1612,9 @@ LookAssistFlavorDeltas lookAssistCinematicDeltasForScene( LookAssistScene scene 
 }
 
 // Kodak Vision3 50D's "richer colour": vibrance on top of Cinematic's, every scene. The shipped rung of the pre-registered
-// ladder +18 -> +12 -> +8 (LOOK-ASSIST-KODAK-VISION-50D-1; docs/look-assist-vision50d.md, the vision50d-table).
-static const int kVision50dVibranceDelta = 18;
+// ladder +18 -> +12 -> +8 (LOOK-ASSIST-KODAK-VISION-50D-1; docs/look-assist-vision50d.md, the vision50d-table). +18 failed
+// the fixture gate F3's upper bound (saturation +0.37..+0.41 over Cinematic against <= +0.35).
+static const int kVision50dVibranceDelta = 12;
 
 int lookAssistVision50dVibranceDelta()
 {

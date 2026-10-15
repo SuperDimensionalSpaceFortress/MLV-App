@@ -1016,7 +1016,8 @@ TEST(LookAssistFilmGrade, DumpTablesWhenAsked)
 {
     // Frame-locked comparison tooling (tools/profiling/look-flavor-diff.py regrade / warmcool): with
     // MLVAPP_FILM_TABLE_DUMP_DIR set, writes the engine-built tables of film-v1, film-v2 and film-v3 for every scene
-    // (film-<v1|v2|v3>-<scene>.u16), and of the four pre-registered v3 candidates (film-v3-<C1..C4>-<scene>.u16), each
+    // (film-<v1|v2|v3>-<scene>.u16), of the Kodak Vision3 50D grade (vision50d-v1-<scene>.u16), and of the four
+    // pre-registered v3 candidates (film-v3-<C1..C4>-<scene>.u16), each
     // file 4 x 65536 uint16 little-endian in Y, R, G, B order. For each candidate it also prints the C++ table gates
     // (FILM-V3-GRID lines: ramp lean, S_table against v1 / v2, the neutral green axis and the coloured set, skin G1..G3).
     // Unset: a pass with no output. No binary is tracked.
@@ -1046,6 +1047,10 @@ TEST(LookAssistFilmGrade, DumpTablesWhenAsked)
                                                                       : lookAssistFilmGradationCurveV1( scene ) );
             ASSERT_TRUE( writeTable( t, QStringLiteral("film-v%1-%2.u16").arg( version ).arg( lookAssistSceneName( scene ) ) ) );
         }
+    // LOOK-ASSIST-KODAK-VISION-50D-1: the Kodak Vision3 50D grade's tables too (vision50d-v1-<scene>.u16), for the re-grade.
+    for( LookAssistScene scene : kFilmScenes )
+        ASSERT_TRUE( writeTable( gradationTables( lookAssistVision50dGradationCurve( scene ) ),
+                                 QStringLiteral("vision50d-v1-%1.u16").arg( lookAssistSceneName( scene ) ) ) );
 
     const GradationTables def = gradationTables( defaultCurve() );
     const double sDefault = neutralSplit8( def );
@@ -1339,4 +1344,439 @@ TEST(LookAssistFilmGrade, FilmIsADifferentGradedPictureFromCinematic)
     ASSERT_TRUE( film.receipt == cine.receipt );            // the same sliders: the difference is the grade
     ASSERT_TRUE( film.sha256 != cine.sha256 );
     ASSERT_TRUE( film.sha256 == filmAgain.sha256 );
+}
+
+// ---- LOOK-ASSIST-KODAK-VISION-50D-1: the Kodak Vision3 50D grade (vision50d-v1). The table gates T1..T6 are the design's
+// section 4, pre-registered before any table was built; every value is printed before it is asserted. ----
+
+namespace
+{
+
+const char kVision50dCurve[] =
+    "1e-05;0.005;0.18;0.15;0.5;0.51;0.82;0.86;1;0.985;?1e-05;1e-05;0.5;0.505;1;1;?1e-05;1e-05;0.5;0.5;1;1;?1e-05;1e-05;0.5;0.495;1;1;";
+
+bool sameTables( const GradationTables &a, const GradationTables &b )
+{
+    return a.y == b.y && a.r == b.r && a.g == b.g && a.b == b.b;
+}
+
+// numpy.percentile's default (linear) on a sorted copy.
+double percentileLinear( std::vector<double> values, double p )
+{
+    if( values.empty() ) return 0.0;
+    std::sort( values.begin(), values.end() );
+    const double at = p / 100.0 * static_cast<double>( values.size() - 1 );
+    const size_t lo = static_cast<size_t>( std::floor( at ) );
+    const size_t hi = std::min( lo + 1, values.size() - 1 );
+    return values[lo] + ( at - static_cast<double>( lo ) ) * ( values[hi] - values[lo] );
+}
+
+// The venue tools' picture statistics on an 8-bit RGB frame: spread = luma_p95 - luma_p05 (BT.601, look-flavor-diff.py
+// split_and_green) and sat = mean HSV saturation ((max - min) / max, 0 at black; make-contact-sheet.py channel_stats).
+struct PictureStats
+{
+    double spread = 0.0, sat = 0.0, p05 = 0.0, p95 = 0.0;
+};
+PictureStats pictureStats( const Run &r )
+{
+    PictureStats s;
+    const size_t pixels = r.rgb.size() / 3;
+    std::vector<double> luma( pixels );
+    double satSum = 0.0;
+    for( size_t i = 0; i < pixels; ++i )
+    {
+        const double R = r.rgb[3 * i], G = r.rgb[3 * i + 1], B = r.rgb[3 * i + 2];
+        luma[i] = 0.299 * R + 0.587 * G + 0.114 * B;
+        const double hi = std::max( R, std::max( G, B ) ), lo = std::min( R, std::min( G, B ) );
+        satSum += hi > 0.0 ? ( hi - lo ) / hi : 0.0;
+    }
+    s.p05 = percentileLinear( luma, 5.0 );
+    s.p95 = percentileLinear( luma, 95.0 );
+    s.spread = s.p95 - s.p05;
+    s.sat = pixels ? satSum / static_cast<double>( pixels ) : 0.0;
+    return s;
+}
+
+} // namespace
+
+TEST(LookAssistVision50dGrade, T1PinTheCurveStringAndItsTablesArePinned)
+{
+    // T1 PIN: the curve string is the pre-registered literal at every scene (constant strength), the four scenes build
+    // byte-identical tables, and the tables are pinned by sha256 and sampled values as the engine built them at this commit.
+    const double xs[6] = { 0.0, 0.10, 0.18, 0.50, 0.82, 1.0 };
+    const GradationTables shade = gradationTables( lookAssistVision50dGradationCurve( LookAssistScene::Shade ) );
+    for( LookAssistScene scene : kFilmScenes )
+    {
+        const QString curve = lookAssistVision50dGradationCurve( scene );
+        const GradationTables t = gradationTables( curve );
+        QString samples;
+        for( double x : xs )
+        {
+            const int v = tableIndex( x );
+            samples += QStringLiteral(" x=%1 y=%2 r=%3 g=%4 b=%5").arg( x ).arg( t.y[v] ).arg( t.r[v] ).arg( t.g[v] ).arg( t.b[v] );
+        }
+        std::fprintf( stderr, "VISION50D-T1 scene=%s curve=%s sha256=%s same_as_shade=%d%s\n",
+                      qPrintable( lookAssistSceneName( scene ) ), qPrintable( curve ), qPrintable( tablesSha256( t ) ),
+                      sameTables( t, shade ) ? 1 : 0, qPrintable( samples ) );
+    }
+    const char kSha256[] = "b3ace9fc3492b5857dc7cd854fcce4b75da8b207e0e22469830be7305043badb";
+    const int pinY[6] = { 327, 5345, 9829, 33422, 56359, 64551 }, pinR[6] = { 6, 6650, 11965, 33095, 53907, 65534 },
+              pinG[6] = { 6, 6553, 11795, 32767, 53738, 65534 }, pinB[6] = { 6, 6456, 11626, 32439, 53568, 65533 };
+    for( LookAssistScene scene : kFilmScenes )
+    {
+        ASSERT_TRUE( lookAssistVision50dGradationCurve( scene ) == QLatin1String( kVision50dCurve ) );
+        const GradationTables t = gradationTables( lookAssistVision50dGradationCurve( scene ) );
+        ASSERT_TRUE( sameTables( t, shade ) );
+        ASSERT_TRUE( tablesSha256( t ) == QLatin1String( kSha256 ) );
+        for( int i = 0; i < 6; ++i )
+        {
+            const int v = tableIndex( xs[i] );
+            ASSERT_EQ( pinY[i], static_cast<int>( t.y[v] ) );
+            ASSERT_EQ( pinR[i], static_cast<int>( t.r[v] ) );
+            ASSERT_EQ( pinG[i], static_cast<int>( t.g[v] ) );
+            ASSERT_EQ( pinB[i], static_cast<int>( t.b[v] ) );
+        }
+    }
+}
+
+TEST(LookAssistVision50dGrade, T2WcRampLeanIsNeutral)
+{
+    // T2 WC-RAMP: the blue-amber lean of the neutral ramp through the stage (Y then each channel, all 65536 codes), as
+    // look-flavor-diff.py warmcool's rampLean defines it, within the app's neutrality bar B = 1.5 / 255 at every scene.
+    // The design's hand estimate was about +0.0044 (+1.13 / 255).
+    std::vector<double> leans;
+    for( LookAssistScene scene : kFilmScenes )
+    {
+        const double lean = rampLean( gradationTables( lookAssistVision50dGradationCurve( scene ) ) );
+        std::fprintf( stderr, "VISION50D-T2 scene=%s rampLean=%+.6f (%+.3f/255) bound=%.6f\n", qPrintable( lookAssistSceneName( scene ) ),
+                      lean, lean * 255.0, kWarmCoolNeutralBound );
+        leans.push_back( lean );
+    }
+    for( double lean : leans ) ASSERT_TRUE( std::fabs( lean ) <= kWarmCoolNeutralBound );
+}
+
+TEST(LookAssistVision50dGrade, T3NeutralGreyHasNoGreenMagentaLean)
+{
+    // T3 GM-NEUTRAL: at every grey level (R = G = B = v through Y, then each channel's table) |G - (R + B) / 2| <= 128
+    // table steps (half an 8-bit code).
+    for( LookAssistScene scene : kFilmScenes )
+    {
+        const GradationTables t = gradationTables( lookAssistVision50dGradationCurve( scene ) );
+        double worst = 0.0;
+        int worstAt = 0;
+        for( int v = 0; v < 65536; ++v )
+        {
+            const int y = t.y[v];
+            const double d = std::fabs( static_cast<double>( t.g[y] ) - ( static_cast<double>( t.r[y] ) + static_cast<double>( t.b[y] ) ) / 2.0 );
+            if( d > worst ) { worst = d; worstAt = v; }
+        }
+        std::fprintf( stderr, "VISION50D-T3 scene=%s max|G-(R+B)/2|=%.1f steps (%.3f codes) at v=%d bound=128\n",
+                      qPrintable( lookAssistSceneName( scene ) ), worst, worst / 257.0, worstAt );
+        ASSERT_TRUE( worst <= 128.0 );
+    }
+}
+
+TEST(LookAssistVision50dGrade, T4RAndBMirrorTheDefault)
+{
+    // T4 MIRROR: R and B move by equal and opposite amounts at the one knot and the spline is linear in y, so
+    // |r[v] + b[v] - 2 def[v]| <= 2 on every entry above the engine's 0.0001 floor clamp.
+    const GradationTables def = gradationTables( defaultCurve() );
+    const int floor16 = static_cast<int>( 0.0001f * 65535.0 );
+    for( LookAssistScene scene : kFilmScenes )
+    {
+        const GradationTables t = gradationTables( lookAssistVision50dGradationCurve( scene ) );
+        int worst = 0, worstAt = 0, clamped = 0;
+        for( int v = 0; v < 65536; ++v )
+        {
+            if( t.r[v] <= floor16 || t.b[v] <= floor16 ) { ++clamped; continue; }
+            const int mirror = std::abs( static_cast<int>( t.r[v] ) + static_cast<int>( t.b[v] ) - 2 * static_cast<int>( def.g[v] ) );
+            if( mirror > worst ) { worst = mirror; worstAt = v; }
+        }
+        std::fprintf( stderr, "VISION50D-T4 scene=%s max|r+b-2def|=%d at v=%d floor_clamped_entries=%d bound=2\n",
+                      qPrintable( lookAssistSceneName( scene ) ), worst, worstAt, clamped );
+        ASSERT_TRUE( worst <= 2 );
+    }
+}
+
+TEST(LookAssistVision50dGrade, T5ToneShapeIsCrisperWithoutCrush)
+{
+    // T5 TONE-SHAPE: all four tables monotonic; (Y[0.82] - Y[0.18]) / 65535 >= 0.69 (the default's is 0.64; the knots give
+    // 0.71); Y[0] / 65535 in [0.004, 0.006]; Y[65535] / 65535 in [0.983, 0.987]; and no crush: max over v of
+    // (v - Y[v]) / 65535 <= 0.035.
+    const GradationTables def = gradationTables( defaultCurve() );
+    const double defaultCrisp = ( static_cast<double>( def.y[tableIndex( 0.82 )] ) - def.y[tableIndex( 0.18 )] ) / 65535.0;
+    for( LookAssistScene scene : kFilmScenes )
+    {
+        const GradationTables t = gradationTables( lookAssistVision50dGradationCurve( scene ) );
+        bool monotonic = true;
+        for( const std::vector<uint16_t> *table : { &t.y, &t.r, &t.g, &t.b } )
+            for( int v = 1; v < 65536; ++v )
+                if( ( *table )[v] < ( *table )[v - 1] ) monotonic = false;
+        const double crisp = ( static_cast<double>( t.y[tableIndex( 0.82 )] ) - t.y[tableIndex( 0.18 )] ) / 65535.0;
+        const double y0 = t.y[0] / 65535.0, y1 = t.y[65535] / 65535.0;
+        double crush = -1.0;
+        int crushAt = 0;
+        for( int v = 0; v < 65536; ++v )
+        {
+            const double c = ( static_cast<double>( v ) - t.y[v] ) / 65535.0;
+            if( c > crush ) { crush = c; crushAt = v; }
+        }
+        std::fprintf( stderr, "VISION50D-T5 scene=%s monotonic=%d crisp=%.4f (default %.4f, bound >= 0.69) Y[0]=%.5f [0.004,0.006]"
+                      " Y[65535]=%.5f [0.983,0.987] crush=%.5f at x=%.4f (bound <= 0.035)\n", qPrintable( lookAssistSceneName( scene ) ),
+                      monotonic ? 1 : 0, crisp, defaultCrisp, y0, y1, crush, crushAt / 65535.0 );
+        ASSERT_TRUE( monotonic );
+        ASSERT_TRUE( crisp >= 0.69 );
+        ASSERT_TRUE( y0 >= 0.004 && y0 <= 0.006 );
+        ASSERT_TRUE( y1 >= 0.983 && y1 <= 0.987 );
+        ASSERT_TRUE( crush <= 0.035 );
+    }
+}
+
+TEST(LookAssistVision50dGrade, T6SkinPatchesKeepTheirHue)
+{
+    // T6 SKIN: Film's skin patches (kSkinPatches) through the stage: the graded hue stays in [12, 32] degrees and no patch
+    // moves more than 3.5 degrees toward magenta.
+    const GradationTables def = gradationTables( defaultCurve() );
+    std::vector<SkinHue> results;
+    for( LookAssistScene scene : kFilmScenes )
+    {
+        const GradationTables t = gradationTables( lookAssistVision50dGradationCurve( scene ) );
+        for( const Patch &p : kSkinPatches )
+        {
+            const double r = p.r, g = p.g * p.r, b = p.b * p.r;
+            const double h0 = gradedHue( def, r, g, b ), h = gradedHue( t, r, g, b );
+            std::fprintf( stderr, "VISION50D-T6 scene=%s patch=1:%.2f:%.2f R=%.2f hue_default=%.3f hue=%.3f dh=%+.3f\n",
+                          qPrintable( lookAssistSceneName( scene ) ), p.g, p.b, p.r, h0, h, h - h0 );
+        }
+        const SkinHue s = skinHue( t, def );
+        std::fprintf( stderr, "VISION50D-T6 scene=%s hue=[%.3f,%.3f] (bound [12,32]) magenta_ward=%.3f (bound <= 3.5)\n",
+                      qPrintable( lookAssistSceneName( scene ) ), s.hueLo, s.hueHi, s.magentaWard );
+        results.push_back( s );
+    }
+    for( const SkinHue &s : results )
+    {
+        ASSERT_TRUE( s.hueLo >= 12.0 && s.hueHi <= 32.0 );
+        ASSERT_TRUE( s.magentaWard <= 3.5 );
+    }
+}
+
+// The fixture-opening Vision50d tests are LookAssistFlavorsFixture's, so CI's existing soloPattern runs each alone.
+TEST(LookAssistFlavorsFixture, Vision50dIsCrisperAndRicherThanCinematic)
+{
+    // F1 SAME-SOLVE: exposure, temperature and tint are Cinematic's exactly (and the other tone sliders; vibrance is
+    // Cinematic's + D). F2 CRISP: spread_V - spread_C >= +2.0 codes on every fixture frame. F3 RICH / NOT-GARISH:
+    // sat_V / sat_C - 1 in [+0.04, +0.35] on every fixture frame. Sliders and curve applied the way the app applies them.
+    const int D = lookAssistVision50dVibranceDelta();
+    struct Row { QString key; Run cine, vision; PictureStats c, v; };
+    std::vector<Row> rows;
+    for( const FixtureCase &fc : fixtureCases() )
+    {
+        Row row;
+        {
+            FlavorEnv env( "cinematic" );
+            row.cine = run( fc, true, true );
+        }
+        {
+            FlavorEnv env( "vision50d" );
+            row.vision = run( fc, true, true );
+        }
+        ASSERT_TRUE( row.cine.ok && row.cine.applied && row.vision.ok && row.vision.applied );
+        row.key = row.vision.key;
+        row.c = pictureStats( row.cine );
+        row.v = pictureStats( row.vision );
+        std::fprintf( stderr, "VISION50D-F %s cinematic: %s | vision50d: %s | spread_C=%.3f (p05 %.3f p95 %.3f) spread_V=%.3f"
+                      " (p05 %.3f p95 %.3f) dSpread=%+.3f (F2 >= +2.0) sat_C=%.5f sat_V=%.5f ratio-1=%+.4f (F3 in [+0.04,+0.35])\n",
+                      qPrintable( row.key ), qPrintable( row.cine.receipt ), qPrintable( row.vision.receipt ), row.c.spread,
+                      row.c.p05, row.c.p95, row.v.spread, row.v.p05, row.v.p95, row.v.spread - row.c.spread, row.c.sat,
+                      row.v.sat, row.c.sat > 0.0 ? row.v.sat / row.c.sat - 1.0 : 0.0 );
+        std::fprintf( stderr, "VISION50D-F %s applied: %s\n", qPrintable( row.key ), qPrintable( row.vision.appliedLine.right( 60 ) ) );
+        rows.push_back( row );
+    }
+    for( const Row &row : rows )
+    {
+        ASSERT_TRUE( row.vision.appliedLine.endsWith( QStringLiteral(" flavor=vision50d grade=vision50d-v1") ) );
+        ASSERT_TRUE( row.vision.flavorOnReceipt == QLatin1String( "vision50d" ) );
+        ASSERT_TRUE( row.vision.gradationCurve == QLatin1String( kVision50dCurve ) );
+        // F1
+        ASSERT_EQ( row.cine.exposure, row.vision.exposure );
+        ASSERT_EQ( row.cine.temperature, row.vision.temperature );
+        ASSERT_EQ( row.cine.tint, row.vision.tint );
+        ASSERT_EQ( row.cine.contrast, row.vision.contrast );
+        ASSERT_EQ( row.cine.pivot, row.vision.pivot );
+        ASSERT_EQ( row.cine.shadows, row.vision.shadows );
+        ASSERT_EQ( row.cine.highlights, row.vision.highlights );
+        ASSERT_EQ( clampInt( -100, row.cine.vibrance + D, 100 ), row.vision.vibrance );
+        // F2
+        ASSERT_TRUE( row.v.spread - row.c.spread >= 2.0 );
+        // F3
+        ASSERT_TRUE( row.c.sat > 0.0 );
+        const double rich = row.v.sat / row.c.sat - 1.0;
+        ASSERT_TRUE( rich >= 0.04 && rich <= 0.35 );
+    }
+}
+
+TEST(LookAssistFlavorsFixture, AUserCurveIsKeptAndReportedForVision50d)
+{
+    FlavorEnv env( "vision50d" );
+    MlvPipelineFixture fixture;
+    ASSERT_TRUE( openFirstFixture( fixture ) );
+    ReceiptSettings &receipt = fixture.receipt();
+    const QString userCurve = QStringLiteral("1e-05;1e-05;0.5;0.56;1;1;?1e-05;1e-05;1;1;?1e-05;1e-05;1;1;?1e-05;1e-05;1;1;");
+    receipt.setGradationCurve( userCurve );
+    QString line;
+    ASSERT_TRUE( applyCapturingLine( fixture, receipt, &line ) );
+    ASSERT_TRUE( receipt.gradationCurve() == userCurve );
+    ASSERT_TRUE( receipt.lookAssistBaselineGradationCurve().isEmpty() );
+    ASSERT_TRUE( receipt.lookAssistFlavor() == QLatin1String( "vision50d" ) );
+    ASSERT_TRUE( line.endsWith( QStringLiteral(" flavor=vision50d grade=skipped_user_curve") ) );
+}
+
+TEST(LookAssistFlavorsFixture, AFilmReceiptReRunAsVision50dLaysVision50d)
+{
+    // A receipt Film graded: film-v3's Shade curve over the default, the default on record as the baseline. Re-run as
+    // Vision50d, the Film curve is recognised as a grade's (the union), put back, and vision50d-v1 is laid over the same
+    // default baseline -- never skipped_user_curve, never stacked on Film's.
+    MlvPipelineFixture fixture;
+    ASSERT_TRUE( openFirstFixture( fixture ) );
+    ReceiptSettings &receipt = fixture.receipt();
+    const QString base = receipt.gradationCurve();
+    ASSERT_TRUE( lookAssistIsDefaultGradationCurve( base ) );
+    receipt.setGradationCurve( lookAssistFilmGradationCurve( LookAssistScene::Shade ) );
+    receipt.setLookAssistBaselineGradationCurve( base );
+    QString line;
+    {
+        FlavorEnv env( "vision50d" );
+        ASSERT_TRUE( applyCapturingLine( fixture, receipt, &line ) );
+    }
+    ASSERT_TRUE( line.endsWith( QStringLiteral(" flavor=vision50d grade=vision50d-v1") ) );
+    ASSERT_TRUE( receipt.gradationCurve() == lookAssistVision50dGradationCurve( sceneByName( appliedField( line, QStringLiteral("scene") ) ) ) );
+    ASSERT_TRUE( receipt.lookAssistBaselineGradationCurve() == base );
+    ASSERT_TRUE( receipt.lookAssistFlavor() == QLatin1String( "vision50d" ) );
+}
+
+TEST(LookAssistFlavorsFixture, AVision50dReceiptReRunAsFilmLaysFilmV3)
+{
+    // The other way round: a Vision50d-graded receipt re-run as Film lays film-v3 over the same default baseline.
+    MlvPipelineFixture fixture;
+    ASSERT_TRUE( openFirstFixture( fixture ) );
+    ReceiptSettings &receipt = fixture.receipt();
+    const QString base = receipt.gradationCurve();
+    ASSERT_TRUE( lookAssistIsDefaultGradationCurve( base ) );
+    receipt.setGradationCurve( lookAssistVision50dGradationCurve( LookAssistScene::Shade ) );
+    receipt.setLookAssistBaselineGradationCurve( base );
+    QString line;
+    {
+        FlavorEnv env( "film" );
+        ASSERT_TRUE( applyCapturingLine( fixture, receipt, &line ) );
+    }
+    ASSERT_TRUE( line.endsWith( QStringLiteral(" flavor=film grade=film-v3") ) );
+    ASSERT_TRUE( receipt.gradationCurve() == lookAssistFilmGradationCurve( sceneByName( appliedField( line, QStringLiteral("scene") ) ) ) );
+    ASSERT_TRUE( receipt.lookAssistBaselineGradationCurve() == base );
+    ASSERT_TRUE( receipt.lookAssistFlavor() == QLatin1String( "film" ) );
+}
+
+TEST(LookAssistFlavorsFixture, AUserEditOfTheVision50dCurveIsKeptAndRetiresOwnership)
+{
+    // Vision50d laid over the default curve -> the user adds a Y point (0.5,0.56) -> a re-run as Classic, or Look Assist
+    // off. The edit is kept and the baseline goes, so a later Vision50d run reports skipped_user_curve.
+    for( int offAfterEdit = 0; offAfterEdit < 2; ++offAfterEdit )
+    {
+        MlvPipelineFixture fixture;
+        ASSERT_TRUE( openFirstFixture( fixture ) );
+        ReceiptSettings &receipt = fixture.receipt();
+        ASSERT_TRUE( lookAssistIsDefaultGradationCurve( receipt.gradationCurve() ) );
+        QString line;
+        {
+            FlavorEnv env( "vision50d" );
+            ASSERT_TRUE( applyCapturingLine( fixture, receipt, &line ) );
+        }
+        ASSERT_TRUE( line.endsWith( QStringLiteral(" flavor=vision50d grade=vision50d-v1") ) );
+        ASSERT_FALSE( receipt.lookAssistBaselineGradationCurve().isEmpty() );
+        QStringList lines = receipt.gradationCurve().split( QLatin1Char('?') );
+        lines[0] = QStringLiteral("1e-05;1e-05;0.5;0.56;1;1;");
+        const QString edited = lines.join( QLatin1Char('?') );
+        ASSERT_FALSE( lookAssistGradeOwnsGradationCurve( edited ) );
+        receipt.setGradationCurve( edited );
+        if( offAfterEdit )
+        {
+            receipt.setLookAssistEnabled( false );
+            ASSERT_FALSE( applyCapturingLine( fixture, receipt, nullptr ) );
+        }
+        else
+        {
+            FlavorEnv env( "classic" );
+            ASSERT_TRUE( applyCapturingLine( fixture, receipt, &line ) );
+            ASSERT_TRUE( line.endsWith( QStringLiteral(" flavor=classic") ) );
+        }
+        ASSERT_TRUE( receipt.gradationCurve() == edited );
+        ASSERT_TRUE( receipt.lookAssistBaselineGradationCurve().isEmpty() );
+        ASSERT_FALSE( lookAssistReceiptXml( receipt ).contains( "lookAssistBaselineGradationCurve" ) );
+        if( !offAfterEdit )
+        {
+            FlavorEnv env( "vision50d" );
+            ASSERT_TRUE( applyCapturingLine( fixture, receipt, &line ) );
+            ASSERT_TRUE( line.endsWith( QStringLiteral(" flavor=vision50d grade=skipped_user_curve") ) );
+            ASSERT_TRUE( receipt.gradationCurve() == edited );
+            ASSERT_TRUE( receipt.lookAssistBaselineGradationCurve().isEmpty() );
+        }
+    }
+}
+
+TEST(LookAssistFlavorsFixture, TheVision50dBaselineRoundTripLeavesNoTrace)
+{
+    // Vision50d, then a re-run as Classic, on one receipt; against a receipt that only ever ran Classic (twice). And
+    // Vision50d, then Look Assist off: the curve goes back and the element goes away.
+    QByteArray visionThenClassic, classicOnly;
+    {
+        MlvPipelineFixture fixture;
+        ASSERT_TRUE( openFirstFixture( fixture ) );
+        ReceiptSettings &receipt = fixture.receipt();
+        const QString before = receipt.gradationCurve();
+        ASSERT_TRUE( lookAssistIsDefaultGradationCurve( before ) );
+        QString line;
+        {
+            FlavorEnv env( "vision50d" );
+            ASSERT_TRUE( applyCapturingLine( fixture, receipt, &line ) );
+        }
+        ASSERT_TRUE( line.endsWith( QStringLiteral(" flavor=vision50d grade=vision50d-v1") ) );
+        ASSERT_TRUE( receipt.gradationCurve() == QLatin1String( kVision50dCurve ) );
+        ASSERT_TRUE( receipt.lookAssistBaselineGradationCurve() == before );
+        const QByteArray visionXml = lookAssistReceiptXml( receipt );
+        ASSERT_TRUE( visionXml.contains( "<lookAssistBaselineGradationCurve>" ) );
+        ASSERT_TRUE( visionXml.contains( "<lookAssistFlavor>vision50d</lookAssistFlavor>" ) );
+        {
+            FlavorEnv env( "classic" );
+            ASSERT_TRUE( applyCapturingLine( fixture, receipt, &line ) );
+        }
+        ASSERT_TRUE( line.endsWith( QStringLiteral(" flavor=classic") ) );
+        ASSERT_TRUE( receipt.gradationCurve() == before );
+        ASSERT_TRUE( receipt.lookAssistBaselineGradationCurve().isEmpty() );
+        visionThenClassic = lookAssistReceiptXml( receipt );
+    }
+    {
+        FlavorEnv env( "classic" );
+        MlvPipelineFixture fixture;
+        ASSERT_TRUE( openFirstFixture( fixture ) );
+        ReceiptSettings &receipt = fixture.receipt();
+        ASSERT_TRUE( applyCapturingLine( fixture, receipt, nullptr ) );
+        ASSERT_TRUE( applyCapturingLine( fixture, receipt, nullptr ) );
+        classicOnly = lookAssistReceiptXml( receipt );
+    }
+    ASSERT_FALSE( classicOnly.contains( "lookAssistBaselineGradationCurve" ) );
+    ASSERT_TRUE( visionThenClassic == classicOnly );
+    {
+        MlvPipelineFixture fixture;
+        ASSERT_TRUE( openFirstFixture( fixture ) );
+        ReceiptSettings &receipt = fixture.receipt();
+        const QString before = receipt.gradationCurve();
+        {
+            FlavorEnv env( "vision50d" );
+            ASSERT_TRUE( applyCapturingLine( fixture, receipt, nullptr ) );
+        }
+        ASSERT_FALSE( lookAssistIsDefaultGradationCurve( receipt.gradationCurve() ) );
+        receipt.setLookAssistEnabled( false );
+        ASSERT_FALSE( applyCapturingLine( fixture, receipt, nullptr ) );
+        ASSERT_TRUE( receipt.gradationCurve() == before );
+        ASSERT_TRUE( receipt.lookAssistBaselineGradationCurve().isEmpty() );
+    }
 }
