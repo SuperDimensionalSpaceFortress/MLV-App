@@ -9736,7 +9736,13 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
     playback_frame_range::PlayStopState measuredState = playback_frame_range::PlayStopState::Continue;
     for( ;; )
     {
-        qApp->processEvents( QEventLoop::AllEvents );
+        // CUDA-HEADROOM-1: unpaced, the GUI thread never runs dry of present / advance events, so an unbounded
+        // processEvents() returned only at a decode stall (r1 venue: the 480-frame requirement was reached at
+        // ~11.3 s but seen at 14.5 s, 624 frames). A bounded slice keeps the stop check on time; paced runs are unchanged.
+        if( m_automationPacingIsolated && mlvappPlaybackUnpacedRequested() )
+            qApp->processEvents( QEventLoop::AllEvents, 5 );
+        else
+            qApp->processEvents( QEventLoop::AllEvents );
         // ENFORCE-2 round 2 (sol B2) / ENFORCE-3: the switch STOPS Play on the first clip, so it only ever happens
         // once the engine has consumed the required source frames (and not before --stress-switch-at-ms, which the
         // app refuses below 20000 at launch); a Play the engine already ended is attempted too, to fail typed.

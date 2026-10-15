@@ -946,6 +946,24 @@ TEST(PlaybackUnpacedWiring, ReadOnceAndHonouredOnlyInAutomation)
     ASSERT_EQ(1, source.count(QStringLiteral("double MainWindow::playbackPaceGuardFps( void )")));
 }
 
+TEST(PlaybackUnpacedWiring, TheMeasuredLoopChecksItsStopInBoundedSlicesOnlyWhenUnpaced)
+{
+    const QString source = mainWindowSource();
+    const QString sliced = QStringLiteral(
+        "        if( m_automationPacingIsolated && mlvappPlaybackUnpacedRequested() )\n"
+        "            qApp->processEvents( QEventLoop::AllEvents, 5 );\n"
+        "        else\n"
+        "            qApp->processEvents( QEventLoop::AllEvents );\n");
+    ASSERT_EQ(1, source.count(sliced));
+    // it is the measured Play's loop: right before the stress switch and the measured stop check
+    const int at = source.indexOf(sliced);
+    const int stress = source.indexOf(QStringLiteral("        if( options.exerciseClipLifecycleStress\n         && !stressAttempted"), at);
+    const int measured = source.indexOf(QStringLiteral("measuredState = programmaticPlayState( playbackClock.elapsed(), measuredSafetyMs );"), at);
+    ASSERT_TRUE(stress > at);
+    ASSERT_TRUE(measured > stress);
+    ASSERT_TRUE(stress - at < 600);
+}
+
 TEST(PlaybackUnpacedWiring, NoGuardCallIsStillPacedByGetFramerate)
 {
     const QString source = mainWindowSource();
