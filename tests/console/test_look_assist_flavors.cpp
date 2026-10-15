@@ -1008,7 +1008,7 @@ TEST(LookAssistFlavors, TheFilmGradeIsLaidAndPutBackAtEverySite)
     const int captureAt = window.indexOf( QStringLiteral("void MainWindow::captureLookAssistBaseline( ReceiptSettings *receipt )") );
     ASSERT_TRUE( window.mid( captureAt, 400 ).contains( QStringLiteral("restoreLookAssistBaselineGradationCurve( receipt );") ) );
     // grade= is appended only for Film (Classic / Cinematic lines are byte-identical).
-    ASSERT_EQ( 1, window.count( QStringLiteral("flavor == LookAssistFlavor::Film ? QStringLiteral(\" grade=\") + filmGrade : QString();") ) );
+    ASSERT_EQ( 1, window.count( QStringLiteral("lookAssistFlavorLaysGradationCurve( flavor ) ? QStringLiteral(\" grade=\") + filmGrade : QString();") ) );
     ASSERT_TRUE( window.contains( QStringLiteral("flavor=%30\") + filmGradeLogTail )") ) );
     ASSERT_TRUE( window.contains( QStringLiteral("floor_lifted=%4 flavor=%5\") + dispatchFilmGradeLogTail )") ) );
 
@@ -1016,7 +1016,7 @@ TEST(LookAssistFlavors, TheFilmGradeIsLaidAndPutBackAtEverySite)
     ASSERT_TRUE( applier.count( QStringLiteral("restoreHeadlessLookAssistGradationCurve( receipt );") ) >= 3 );
     ASSERT_EQ( 1, applier.count( QStringLiteral("applyHeadlessLookAssistFilmGrade( receipt, scene, flavor );") ) );
     ASSERT_TRUE( applier.contains( QStringLiteral(".replace( QLatin1Char('\\n'), filmGradeLogTail + QLatin1Char('\\n') )") ) );
-    ASSERT_TRUE( applier.contains( QStringLiteral("flavor == LookAssistFlavor::Film ? QStringLiteral(\" grade=\") + filmGrade : QString();") ) );
+    ASSERT_TRUE( applier.contains( QStringLiteral("lookAssistFlavorLaysGradationCurve( flavor ) ? QStringLiteral(\" grade=\") + filmGrade : QString();") ) );
 
     // The selector: item 2 is "Film grade" (not "Film": the Profile preset is a different thing) with its tooltip.
     ASSERT_TRUE( ui.contains( QStringLiteral("<string>Film grade</string>") ) );

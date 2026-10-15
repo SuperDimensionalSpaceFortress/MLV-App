@@ -579,7 +579,7 @@ LookAssistWindowLitCheck resolveLookAssistWindowLitInterior( const LookAssistWhi
 
 int lookAssistDisplayTargetMedianForScene( LookAssistScene scene );
 
-/* ---- Flavors: Classic | Cinematic | Film grade. ----
+/* ---- Flavors: Classic | Cinematic | Film grade | Kodak Vision3 50D. ----
  * Classic is master's Look Assist, untouched: presetForLookAssistScene returns before any flavor code, so
  * every sliders / receipt / picture it produced stays byte-identical. Cinematic is the same analysis, the
  * same scene verdict and the same white-balance decision, with ONE table of additive deltas
@@ -590,16 +590,20 @@ int lookAssistDisplayTargetMedianForScene( LookAssistScene scene );
  * (lookAssistFilmGradationCurve, film-v3): a teal-shadow / warm-highlight split in R, G and B whose blue-amber lean on a
  * neutral ramp is within 1.5 / 255 of zero, a gentle black lift and a soft highlight shoulder in Y. Every route already
  * applies those tables. The preset is Cinematic's; the curve is laid by the consumers (GUI, headless) and only over a
- * default curve. */
+ * default curve.
+ * Vision50d (the GUI's "Kodak Vision3 50D", docs/look-assist-vision50d.md) is Cinematic's tone plus a vibrance delta
+ * (lookAssistVision50dVibranceDelta) and its own gradation curve (lookAssistVision50dGradationCurve, vision50d-v1): a
+ * crisper Y line and a near-neutral R / B mirror. It is laid exactly where and how Film's is. */
 enum class LookAssistFlavor
 {
     Classic,
     Cinematic,
-    Film
+    Film,
+    Vision50d
 };
 
-/* "classic" / "cinematic" / "film": the one spelling used in the environment, the receipt element, the app setting
- * and every log line. */
+/* "classic" / "cinematic" / "film" / "vision50d": the one spelling used in the environment, the receipt element, the app
+ * setting and every log line. */
 QString lookAssistFlavorName( LookAssistFlavor flavor );
 
 /* Where the flavor in force came from, for the log: "env", "receipt", "app" or "default". */
@@ -615,8 +619,8 @@ struct LookAssistFlavorSelection
 
 /* Pure. Layers in priority order: the environment value (MLVAPP_LOOK_ASSIST_FLAVOR, for runs) wins over the
  * receipt's lookAssistFlavor element, which wins over the GUI's app setting; an empty layer is skipped. The
- * first non-empty layer decides, case-insensitively and trimmed; if it is not "classic", "cinematic" or "film" the
- * answer is Classic with unknownValue set -- never a silent fall through to a lower layer. */
+ * first non-empty layer decides, case-insensitively and trimmed; if it is not "classic", "cinematic", "film" or
+ * "vision50d" the answer is Classic with unknownValue set -- never a silent fall through to a lower layer. */
 LookAssistFlavorSelection lookAssistSelectFlavor( const QString &environmentValue,
                                                   const QString &receiptValue,
                                                   const QString &appSettingValue );
@@ -641,8 +645,13 @@ LookAssistFlavorDeltas lookAssistCinematicDeltasForScene( LookAssistScene scene 
  * are NEVER touched, and Classic is a no-op. presetForLookAssistScene ends in this very function, so a caller that
  * must measure pictures on the Classic preset first (the GUI's white-balance walk renders the picture, so the walk
  * must not see the grade) and lay the flavor over afterwards gets exactly the preset the one call would have made.
- * Film lays Cinematic's table (its tone IS Cinematic's); its colour grade is the gradation curve below. */
+ * Film lays Cinematic's table (its tone IS Cinematic's); its colour grade is the gradation curve below. Vision50d lays
+ * Cinematic's table and adds lookAssistVision50dVibranceDelta() to vibrance, before the clamp. */
 void lookAssistApplyFlavorDeltas( LookAssistPreset *preset, LookAssistScene scene, LookAssistFlavor flavor );
+
+/* Vision50d's vibrance on top of Cinematic's, every scene (kVision50dVibranceDelta, the shipped rung of the pre-registered
+ * ladder +18 / +12 / +8; docs/look-assist-vision50d.md). */
+int lookAssistVision50dVibranceDelta();
 
 /* ---- The Film grade, film-v3: a teal / warm split in the R, G, B gradation curves plus a Y tone line
  * (docs/look-assist-flavors.md). ----
@@ -727,12 +736,57 @@ QString lookAssistFilmGradeDecision( LookAssistFlavor flavor, const QString &cur
  * edit of a laid curve is not. */
 bool lookAssistFilmOwnsGradationCurve( const QString &curve );
 
-/* The curve to keep when the Film grade's recorded baseline is put back: the baseline while Film still owns the current
- * curve, otherwise the current curve (the user edited it after the grade was laid; the edit is kept, and the caller
- * clears the baseline either way, so Film's ownership is retired). */
+/* ---- The Kodak Vision3 50D grade, vision50d-v1 (docs/look-assist-vision50d.md, between the vision50d-table markers). ----
+ * The owner's knots, each control point y = x + s * (y_owner - x) at the scene's strength s (kVision50dGradeStrength, the
+ * ONE table; 1.0 at every scene):
+ *   Y: (1e-5, 0.005) (0.18, 0.15) (0.50, 0.51) (0.82, 0.86) (1, 0.985)    crisper mid-tones, a slight toe and shoulder
+ *   R: (1e-5, 1e-5) (0.50, 0.505) (1, 1)
+ *   G: (1e-5, 1e-5) (0.50, 0.50) (1, 1)
+ *   B: (1e-5, 1e-5) (0.50, 0.495) (1, 1)                                   R's mirror: r[v] + b[v] == 2 def[v]
+ * Kodak and Vision3 are trademarks of Eastman Kodak Company; the control points are original (no Kodak LUT or data). */
+struct LookAssistVision50dGrade
+{
+    double strength = 0.0;   // s
+};
+LookAssistVision50dGrade lookAssistVision50dGradeForScene( LookAssistScene scene );
+
+/* The grade's id, reported as grade=... and as the venue's presetGrade. */
+QString lookAssistVision50dGradeId();
+
+/* The vision50d-v1 curve string for an explicit grade, in Curves::configuration's format (the Film builder's line writer).
+ * The scene overload is this one on lookAssistVision50dGradeForScene. */
+QString lookAssistVision50dGradationCurve( const LookAssistVision50dGrade &grade );
+QString lookAssistVision50dGradationCurve( LookAssistScene scene );
+
+/* True while the Vision50d grade still owns the curve: point for point (within 1e-6) the curve it lays for one of the
+ * scenes. A user's edit of a laid curve is not. */
+bool lookAssistVision50dOwnsGradationCurve( const QString &curve );
+
+/* True while a Look Assist grade (Film or Kodak Vision3 50D) owns the curve: lookAssistFilmOwnsGradationCurve or
+ * lookAssistVision50dOwnsGradationCurve. */
+bool lookAssistGradeOwnsGradationCurve( const QString &curve );
+
+/* The curve to keep when a Look Assist grade's (Film's or Kodak Vision3 50D's) recorded baseline is put back: the baseline
+ * while a grade still owns the current curve (lookAssistGradeOwnsGradationCurve), otherwise the current curve (the user
+ * edited it after the grade was laid; the edit is kept, and the caller clears the baseline either way, so the grade's
+ * ownership is retired). The name is Film's, kept for its call sites. */
 QString lookAssistGradationCurveAfterFilmRestore( const QString &currentCurve, const QString &baselineCurve );
 
-/* A receipt's lookAssistFlavor element as the value the GUI's selector takes: "classic" or "cinematic" (trimmed,
+/* True for the flavors that lay a gradation curve (Film, Vision50d); grade= is reported only for them. */
+bool lookAssistFlavorLaysGradationCurve( LookAssistFlavor flavor );
+
+/* The grade id a flavor lays: "film-v3", "vision50d-v1", or "" for Classic and Cinematic. */
+QString lookAssistGradeIdForFlavor( LookAssistFlavor flavor );
+
+/* The grade decision for one apply, as reported in grade=...: Film's is lookAssistFilmGradeDecision, unchanged; Vision50d's
+ * is "vision50d-v1" over a default curve, else "skipped_user_curve"; any other flavor is "none". */
+QString lookAssistGradeDecision( LookAssistFlavor flavor, const QString &currentCurve );
+
+/* The curve the flavor lays for the scene (Film's or Vision50d's), or "" for a flavor that lays none. */
+QString lookAssistGradationCurveForFlavor( LookAssistFlavor flavor, LookAssistScene scene );
+
+/* A receipt's lookAssistFlavor element as the value the GUI's selector takes: "classic", "cinematic", "film" or
+ * "vision50d" (trimmed,
  * case-insensitive), or "" when the receipt declares nothing (the selector is then left alone). An unknown value is
  * "classic" -- never Cinematic, never a silent skip -- and *selection (optional) says so (unknownValue /
  * rejectedValue / source "receipt") so the caller can warn. Same rule as lookAssistSelectFlavor, one place. */

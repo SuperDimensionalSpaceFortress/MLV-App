@@ -1611,9 +1611,19 @@ LookAssistFlavorDeltas lookAssistCinematicDeltasForScene( LookAssistScene scene 
     return kCinematicFlavorDeltas[index];
 }
 
+// Kodak Vision3 50D's "richer colour": vibrance on top of Cinematic's, every scene. The shipped rung of the pre-registered
+// ladder +18 -> +12 -> +8 (LOOK-ASSIST-KODAK-VISION-50D-1; docs/look-assist-vision50d.md, the vision50d-table).
+static const int kVision50dVibranceDelta = 18;
+
+int lookAssistVision50dVibranceDelta()
+{
+    return kVision50dVibranceDelta;
+}
+
 QString lookAssistFlavorName( LookAssistFlavor flavor )
 {
     if( flavor == LookAssistFlavor::Film ) return QStringLiteral("film");
+    if( flavor == LookAssistFlavor::Vision50d ) return QStringLiteral("vision50d");
     return flavor == LookAssistFlavor::Cinematic ? QStringLiteral("cinematic") : QStringLiteral("classic");
 }
 
@@ -1644,6 +1654,8 @@ LookAssistFlavorSelection lookAssistSelectFlavor( const QString &environmentValu
             selection.flavor = LookAssistFlavor::Cinematic;
         else if( value == QLatin1String( "film" ) )
             selection.flavor = LookAssistFlavor::Film;
+        else if( value == QLatin1String( "vision50d" ) )
+            selection.flavor = LookAssistFlavor::Vision50d;
         else
         {
             selection.flavor = LookAssistFlavor::Classic;
@@ -1670,13 +1682,15 @@ void lookAssistApplyFlavorDeltas( LookAssistPreset *preset, LookAssistScene scen
     // Exposure is deliberately absent: the white-balance refinement renders the picture at the preset's exposure,
     // and the scene limits (Night >= 0, BrightSun <= 0) are Classic's own, already applied. Re-clamping here once
     // turned a BrightSun exposure of 114 into 0.
-    // Film's tone is Cinematic's: the same table, reused (its grade is the gradation curve, not a slider).
+    // Film's tone is Cinematic's: the same table, reused (its grade is the gradation curve, not a slider). Vision50d's is
+    // Cinematic's plus its vibrance delta.
     const LookAssistFlavorDeltas d = lookAssistCinematicDeltasForScene( scene );
     preset->contrast += d.contrast;
     preset->pivot += d.pivot;
     preset->shadows += d.shadows;
     preset->highlights += d.highlights;
     preset->vibrance += d.vibrance;
+    if( flavor == LookAssistFlavor::Vision50d ) preset->vibrance += lookAssistVision50dVibranceDelta();
     preset->contrast = qBound( -100, preset->contrast, 100 );
     preset->pivot = qBound( 0, preset->pivot, 100 );
     preset->shadows = qBound( -100, preset->shadows, 100 );
@@ -1893,9 +1907,116 @@ bool lookAssistFilmOwnsGradationCurve( const QString &curve )
     return false;
 }
 
+// The Kodak Vision3 50D grade: the ONE strength table, one row per scene in LookAssistScene order (docs/look-assist-
+// vision50d.md, between the vision50d-table markers). Constant: the owner judged one curve; the table exists so a later
+// card can lower a scene without touching the builder.
+static const double kVision50dGradeStrength[] =
+{
+    1.0,    // Night
+    1.0,    // ArtificialLights
+    1.0,    // Shade
+    1.0,    // BrightSun
+};
+static const int kVision50dGradeScenes =
+    static_cast<int>( sizeof( kVision50dGradeStrength ) / sizeof( kVision50dGradeStrength[0] ) );
+
+LookAssistVision50dGrade lookAssistVision50dGradeForScene( LookAssistScene scene )
+{
+    LookAssistVision50dGrade grade;
+    const int index = static_cast<int>( scene );
+    if( index < 0 || index >= kVision50dGradeScenes ) return grade;
+    grade.strength = kVision50dGradeStrength[index];
+    return grade;
+}
+
+QString lookAssistVision50dGradeId()
+{
+    return QStringLiteral("vision50d-v1");
+}
+
+QString lookAssistVision50dGradationCurve( LookAssistScene scene )
+{
+    return lookAssistVision50dGradationCurve( lookAssistVision50dGradeForScene( scene ) );
+}
+
+QString lookAssistVision50dGradationCurve( const LookAssistVision50dGrade &g )
+{
+    // The owner's knots (look C, "Vision3 50D clean"); each point moves from identity toward them by the strength.
+    const double s = g.strength;
+    const auto at = [s]( double x, double yOwner ) { return x + s * ( yOwner - x ); };
+    const double toneX[] = { 1e-5, 0.18, 0.50, 0.82, 1.0 };
+    const double toneY[] = { at( 1e-5, 0.005 ), at( 0.18, 0.15 ), at( 0.50, 0.51 ), at( 0.82, 0.86 ), at( 1.0, 0.985 ) };
+    const double knotX[] = { 1e-5, 0.50, 1.0 };
+    const double redY[] = { at( 1e-5, 1e-5 ), at( 0.50, 0.505 ), at( 1.0, 1.0 ) };
+    const double greenY[] = { at( 1e-5, 1e-5 ), at( 0.50, 0.50 ), at( 1.0, 1.0 ) };
+    const double blueY[] = { at( 1e-5, 1e-5 ), at( 0.50, 0.495 ), at( 1.0, 1.0 ) };
+    return filmCurveLine( toneX, toneY, 5 ) + QStringLiteral("?") + filmCurveLine( knotX, redY, 3 ) + QStringLiteral("?")
+         + filmCurveLine( knotX, greenY, 3 ) + QStringLiteral("?") + filmCurveLine( knotX, blueY, 3 );
+}
+
+namespace
+{
+// Point for point, within 1e-6 as parsed: the same comparison Film's ownership makes.
+bool sameGradationCurve( const std::vector<LookAssistGradationPoint> a[4], const std::vector<LookAssistGradationPoint> b[4] )
+{
+    for( int i = 0; i < 4; ++i )
+    {
+        if( a[i].size() != b[i].size() ) return false;
+        for( size_t p = 0; p < b[i].size(); ++p )
+            if( fabs( a[i][p].x - b[i][p].x ) > 1e-6 || fabs( a[i][p].y - b[i][p].y ) > 1e-6 ) return false;
+    }
+    return true;
+}
+} // namespace
+
+bool lookAssistVision50dOwnsGradationCurve( const QString &curve )
+{
+    std::vector<LookAssistGradationPoint> current[4];
+    if( lookAssistParseGradationCurve( curve, current ) != 4 ) return false;
+    for( int s = 0; s < kVision50dGradeScenes; ++s )
+    {
+        std::vector<LookAssistGradationPoint> laid[4];
+        lookAssistParseGradationCurve( lookAssistVision50dGradationCurve( static_cast<LookAssistScene>( s ) ), laid );
+        if( sameGradationCurve( current, laid ) ) return true;
+    }
+    return false;
+}
+
+bool lookAssistGradeOwnsGradationCurve( const QString &curve )
+{
+    return lookAssistFilmOwnsGradationCurve( curve ) || lookAssistVision50dOwnsGradationCurve( curve );
+}
+
 QString lookAssistGradationCurveAfterFilmRestore( const QString &currentCurve, const QString &baselineCurve )
 {
-    return lookAssistFilmOwnsGradationCurve( currentCurve ) ? baselineCurve : currentCurve;
+    // Any Look Assist grade's curve (Film's or Kodak Vision3 50D's) goes back to the baseline; a user's edit is kept.
+    return lookAssistGradeOwnsGradationCurve( currentCurve ) ? baselineCurve : currentCurve;
+}
+
+bool lookAssistFlavorLaysGradationCurve( LookAssistFlavor flavor )
+{
+    return flavor == LookAssistFlavor::Film || flavor == LookAssistFlavor::Vision50d;
+}
+
+QString lookAssistGradeIdForFlavor( LookAssistFlavor flavor )
+{
+    if( flavor == LookAssistFlavor::Film ) return lookAssistFilmGradeId();
+    if( flavor == LookAssistFlavor::Vision50d ) return lookAssistVision50dGradeId();
+    return QString();
+}
+
+QString lookAssistGradeDecision( LookAssistFlavor flavor, const QString &currentCurve )
+{
+    if( flavor == LookAssistFlavor::Film ) return lookAssistFilmGradeDecision( flavor, currentCurve );
+    if( flavor != LookAssistFlavor::Vision50d ) return QStringLiteral("none");
+    return lookAssistIsDefaultGradationCurve( currentCurve ) ? lookAssistVision50dGradeId() : QStringLiteral("skipped_user_curve");
+}
+
+QString lookAssistGradationCurveForFlavor( LookAssistFlavor flavor, LookAssistScene scene )
+{
+    if( flavor == LookAssistFlavor::Film ) return lookAssistFilmGradationCurve( scene );
+    if( flavor == LookAssistFlavor::Vision50d ) return lookAssistVision50dGradationCurve( scene );
+    return QString();
 }
 
 LookAssistPreset presetForLookAssistScene( LookAssistScene scene,
