@@ -111,6 +111,10 @@ UPSTREAM_BASELINE_LEGS = tuple(f"legs/m16-1243-upstream-baseline-cpu-{mode}-s1.j
 PTRACE_LEGS = {"legs/m16-1243-display-fullscreen-s4-ptrace.json": "legs/m16-1243-display-fullscreen-s4.json"}
 # PLAYBACK-VISUAL-INSPECTION-1: the window-capture proof leg, a SPEED leg (windowed, scale 2) that names no visualCapture: absent means on.
 VISUAL_LEGS = ("legs/m16-1243-speed-windowed-s2.json",)
+# PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-1: the display matrix cells are LOOK legs, which never capture; these speed twins of the proof leg
+# (only displayMode and scaleFactor differ) carry the window capture to every {fullscreen, windowed} x {s1, s2, s4} cell.
+VISUAL_TWIN_LEGS = tuple(f"legs/m16-1243-speed-{mode}-s{scale}.json" for mode in ("fullscreen", "windowed") for scale in (1, 2, 4)
+                         if (mode, scale) != ("windowed", 2))
 # PLAYBACK-SCOPES-OPTION-1: the windowed scale-1 no-look scope matrix, per backend: N (no scope), T (histogram at the app's default throttle) and
 # F (histogram at scopeIntervalMs 0, upstream's every frame), plus one optional waveform F arm on cuda. Each scope arm differs from its backend's N
 # leg only in its legId and the scope fields of generatorArgs. r4 (PSO-01): every scope arm pins scopesDuringPlayback throttled, the mode the
@@ -130,7 +134,7 @@ SHIPPED_LEGS = ("legs/m16-1243-speed.json", "legs/m16-1243-look.json", "legs/m16
                 *LOOKAHEAD_LEGS, *HEAVY_LEGS, *DECODER_LEGS, "legs/m16-1243-look-scale2-cinematic.json", "legs/m16-1243-look-film.json",
                 "legs/m16-1243-look-scale2-film.json", *(f"legs/m16-1243-look-scale2-{flavor}-agxoff.json" for flavor in ("cinematic", "film")),
                 *(f"legs/m16-1243-display-{mode}-s{scale}-vsync1.json" for scale in (1, 2, 4) for mode in ("fullscreen", "windowed")),
-                *CPU_REDUCED_LEGS, *UPSTREAM_BASELINE_LEGS, *PTRACE_LEGS, *VISUAL_LEGS, *SCOPE_LEGS, *SCOPE_LA_LEGS)
+                *CPU_REDUCED_LEGS, *UPSTREAM_BASELINE_LEGS, *PTRACE_LEGS, *VISUAL_LEGS, *VISUAL_TWIN_LEGS, *SCOPE_LEGS, *SCOPE_LA_LEGS)
 # PLAYBACK-VSYNC-DEFAULT-1: the swap-interval-1 twins of the six display-matrix legs (the vsync A/B; the originals stay at the app's default 0).
 VSYNC1_LEGS = tuple(rel.replace(".json", "-vsync1.json") for rel in DISPLAY_MATRIX_LEGS)
 # LOOK-ASSIST-FILM-FLAVOR-2 r2: the AgX-off twins of the scale-2 Cinematic and Film legs carry a committed look receipt (look-receipts/agx-off.marxml).
@@ -6701,6 +6705,18 @@ class VisualCaptureSpecAndAppSourceTests(unittest.TestCase):
                     dict(leg, visualCapture=True, visualCaptureOptOutReason="a capture-free pace A/B arm"), dict(leg, visualCapture=False, visualCaptureOptOutReason="short")):
             with self.subTest(bad=sorted(set(bad) - set(leg))), self.assertRaises(jsonschema.ValidationError):
                 jsonschema.validate(bad, schema)
+
+    def test_the_visual_speed_twins_differ_from_the_proof_leg_only_in_display_mode_and_scale(self) -> None:
+        proof = json.loads((DV / "legs" / "m16-1243-speed-windowed-s2.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(VISUAL_TWIN_LEGS), 5)
+        for rel in VISUAL_TWIN_LEGS:
+            with self.subTest(rel):
+                twin = json.loads((DV / rel).read_text(encoding="utf-8"))
+                mode, scale = re.fullmatch(r"legs/m16-1243-speed-(fullscreen|windowed)-s(\d)\.json", rel).groups()
+                self.assertEqual((twin["legId"], twin["displayMode"], twin["scaleFactor"], twin["legType"]), (Path(rel).stem, mode, int(scale), "speed"))
+                self.assertNotIn("visualCapture", twin, "absent means on")
+                keep = ("legId", "card", "displayMode", "scaleFactor")
+                self.assertEqual({k: v for k, v in twin.items() if k not in keep}, {k: v for k, v in proof.items() if k not in keep})
 
     def test_the_app_visual_capture_runs_after_the_measured_session_closes_and_captures_the_window(self) -> None:
         main_cpp = (ROOT / "platform" / "qt" / "main.cpp").read_text(encoding="utf-8")
