@@ -92,7 +92,9 @@ OWNER_CLIP = "M16-1243"   # a consented clip ID (an id is not footage); the runn
 DISPLAY_MATRIX_LEGS = tuple(f"legs/m16-1243-display-{mode}-s{scale}.json" for scale in (1, 2, 4) for mode in ("fullscreen", "windowed"))
 # PLAYBACK-BACHELOR-PRESENT-JITTER-1 added three capture-free PACE legs: speed legs that force Look Assist (cinematic) through generatorArgs and take no
 # contact sheet, so no GUI-thread framebuffer grab lands inside the timed Play.
-PACE_LEGS = ("legs/m16-1243-pace-cinematic-fullscreen-s4.json", "legs/m16-1243-pace-cinematic-fullscreen-s2.json", "legs/m16-1243-pace-cinematic-windowed-s4.json")
+PACE_LEGS = ("legs/m16-1243-pace-cinematic-fullscreen-s4.json", "legs/m16-1243-pace-cinematic-fullscreen-s2.json", "legs/m16-1243-pace-cinematic-windowed-s4.json",
+             # HFR-NATIVE-60FPS-FULLRES-1 r5: the other three display-matrix cells as pace legs, so all six cells take the speed leg's visual block.
+             "legs/m16-1243-pace-cinematic-fullscreen-s1.json", "legs/m16-1243-pace-cinematic-windowed-s1.json", "legs/m16-1243-pace-cinematic-windowed-s2.json")
 # ... and the lookahead A/B arm: the owner-shape pace leg at MLVAPP_PLAYBACK_RENDER_LOOKAHEAD_FRAMES=3 (the other arm is the pace leg itself, unset).
 LOOKAHEAD_LEGS = ("legs/m16-1243-pace-cinematic-fullscreen-s4-la3.json",)
 # ... and (r2) the stall-stage diagnostic: the owner-shape pace leg at telemetryArm HEAVY, which keeps the per-frame playback_smoke.frame log
@@ -5672,7 +5674,7 @@ class LegSpecSchemaTests(unittest.TestCase):
                 self.assertEqual(pace[key], cell[key], f"{rel}: {key}")
             self.assertEqual(pace.get("acceptedEffectiveScale"), cell.get("acceptedEffectiveScale"), f"{rel}: declares its cell's CUDA texture-route clamp")
         self.assertEqual(sorted(json.loads((DV / rel).read_text(encoding="utf-8"))["legId"] for rel in PACE_LEGS),
-                         sorted(["m16-1243-pace-cinematic-fullscreen-s4", "m16-1243-pace-cinematic-fullscreen-s2", "m16-1243-pace-cinematic-windowed-s4"]))
+                         sorted(f"m16-1243-pace-cinematic-{mode}-s{scale}" for scale in (1, 2, 4) for mode in ("fullscreen", "windowed")))
 
     def test_the_lookahead_leg_is_the_owner_shape_pace_leg_at_depth_3(self) -> None:
         """PLAYBACK-BACHELOR-PRESENT-JITTER-1: the lookahead A/B's depth-3 arm differs from the owner-shape pace leg only in its legId and

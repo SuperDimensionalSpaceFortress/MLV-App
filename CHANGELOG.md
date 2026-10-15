@@ -26,3 +26,8 @@ maintained in this format.
   timecode keep the clip's own rate. The environment variable
   `MLVAPP_PLAYBACK_CONFORM=0|1` overrides the setting for one process (the
   native-HFR measurement arm) and is never saved.
+- The Export Settings frame rate override now changes the export rate only;
+  interactive playback paces at the clip's own (or conformed) rate.
+- The release GUI smoke's pre-launch clip-length gate assumes the default
+  conform settings (on, 24 fps, clips above 30 fps); a different conform target
+  saved in the interactive settings store is not read by that gate.
