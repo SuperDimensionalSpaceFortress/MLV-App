@@ -8,7 +8,7 @@
   "backends": ["cuda"],
   "scaleFactor": 1,
   "displayMode": "windowed",
-  "generatorArgs": { "telemetryArm": "LIGHT", "cpuQuiescenceThresholdPercent": 95, "disableLookAssist": true, "scope": "histogram", "scopeIntervalMs": 0 },
+  "generatorArgs": { "telemetryArm": "LIGHT", "cpuQuiescenceThresholdPercent": 95, "disableLookAssist": true, "scope": "histogram", "scopeIntervalMs": 0, "scopesDuringPlayback": "throttled" },
   "timeouts": { "queueWaitSec": 900, "extraClaimedWaitSec": 600 },
   "criteria": {
     "acceptance": { "cuda": [] },

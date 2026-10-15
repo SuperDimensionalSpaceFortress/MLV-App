@@ -444,6 +444,8 @@ void mlvResetRawUint16PrefetchStats(mlvObject_t * video);
  * caller), k > 0 is the decoder count. Call it before the request that starts an object's decoders. */
 void mlvSetRawUint16PrefetchDecodersForTesting(int k);
 int mlvRawUint16PrefetchDecodersFromEnvValueForTesting(const char * value);
+/* K bounded by a host of cpuCores logical cores: min(requestedK, max(1, cpuCores - 2)); cpuCores <= 0 is unknown. */
+int mlvRawUint16PrefetchBoundDecodersForTesting(int requestedK, int cpuCores);
 /* Fills frames (ascending) with the frames claimed by prefetch workers (foreground = 0) or by foreground readers
  * (foreground = 1); returns the claim count. */
 int mlvRawUint16PrefetchClaimsForTesting(mlvObject_t * video, int foreground, uint64_t * frames, int capacity);

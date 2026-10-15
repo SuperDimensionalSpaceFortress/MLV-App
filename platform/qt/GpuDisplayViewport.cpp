@@ -7,6 +7,7 @@
 
 #include "GpuDisplayViewport.h"
 #include "GpuDisplayWindow.h"
+#include "GpuFieldTelemetry.h"
 #include "PlaybackSwapInterval.h"
 
 #include <algorithm>
@@ -1003,6 +1004,7 @@ void GpuDisplayViewport::initializeGL()
         << ", wgl_swap_interval_actual="
         << wglSwapIntervalActual(glContext->getProcAddress("wglGetSwapIntervalEXT"))
         << ").";
+    if ( GpuFieldTelemetry::enabled() ) GpuFieldTelemetry::noteGlContext(glContext);
 
     m_loggedContext = true;
 }

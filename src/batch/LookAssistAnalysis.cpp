@@ -978,12 +978,13 @@ static bool initialDaylightPatchIsVerified( const LookAssistWhiteBalanceRequest 
         return false;
     const LookAssistAutoWhiteBalancePatch solutionSurface = lookAssistSurfaceAt( verify, patch.thumbnailX, patch.thumbnailY );
     out->initialPatchFinalChroma = solutionSurface.valid ? solutionSurface.chroma : 0.0;
-    // Chroma is whole 8-bit steps, so a sub-unit slack forbids any rise; a surface inside the dead band at the solution
-    // carries no added cast.
+    // Chroma is whole 8-bit steps, so a sub-unit slack forbids any rise; a surface strictly inside the dead band at the
+    // solution carries no added cast and is forgiven ONE step of rise, no more. The band alone admits chroma 2 (140/142/141:
+    // B-R +1, G +1.5), which from a chroma-0 find is two steps and refused (LOOK-ASSIST-STRICT-NEUTRAL-CHROMA2-PIN-1).
     return solutionSurface.valid
         && lookAssistDaylightPatchIsNeutralEnough( solutionSurface )
         && ( solutionSurface.chroma <= patch.chroma + kRefineVerifyChromaSlack
-          || lookAssistSurfaceIsNeutral( solutionSurface ) );
+          || ( lookAssistSurfaceIsNeutral( solutionSurface ) && solutionSurface.chroma <= patch.chroma + 1.0 ) );
 }
 
 LookAssistWhiteBalanceResolution resolveLookAssistWhiteBalance( const LookAssistWhiteBalanceRequest &request,

@@ -154,6 +154,9 @@ if ($PromptFile) {
     if (-not (Test-Path -LiteralPath $PromptFile)) { throw "PromptFile not found: $PromptFile" }
     $Prompt = Get-Content -LiteralPath $PromptFile -Raw
 }
+# LANE-PROMPT-ENV-DIRECT-DISPATCH-1: the ABSOLUTE path of the exact file read above, for the child's MLV_LANE_PROMPT (set at $psi below). The child's
+# working directory is -WorkDir, so a relative -PromptFile would not resolve there. $null when the prompt came inline (-Prompt).
+$LanePromptPath = if ($PromptFile) { (Resolve-Path -LiteralPath $PromptFile).Path } else { $null }
 
 # HUB-VM-NO-LOCAL-PLAYBACK-1 (owner objection 2026-10-11): no lane on the hub VM (Virtual-Ten, a guest on Ultra-Magnus) is told to run MLVApp playback
 # locally -- playback, performance AND exactness, is a venue job. The prompt is linted before any process, run dir or receipt exists, so a prompt that
@@ -1591,6 +1594,12 @@ $psi.WorkingDirectory       = $WorkDir
 $psi.UseShellExecute        = $false
 $psi.CreateNoWindow         = $true
 [void]$psi.Environment.Remove('MLV_DISPATCH_RESERVATION_ID')
+# LANE-PROMPT-ENV-DIRECT-DISPATCH-1: tools\hooks\mlv-never-authorized.py NA-4 reads the lane's CLIP_OR_NONE: line from the file named by MLV_LANE_PROMPT, and with
+# it unset denies every *.mlv outside the tracked fixtures. Only docs\Start-EditingLane.ps1 exported it (into ITS OWN session), so a lane started by
+# dispatch-lane.ps1 or a bare Invoke-Lane call ran with it unset and could never be authorized for a clip. Setting it HERE, on the child's $psi (not
+# $env:), covers every route, names the same file this launcher read, and never touches the caller's session. An inline -Prompt has no file: drop any
+# inherited value so a stale path from the caller cannot authorize clips for a prompt it never described. (Not an ANTHROPIC_/OPENAI_/CLAUDE_CODE_ name: NA-3.)
+if ($LanePromptPath) { $psi.Environment['MLV_LANE_PROMPT'] = $LanePromptPath } else { [void]$psi.Environment.Remove('MLV_LANE_PROMPT') }
 # $cfg.effort is already the EFFECTIVE value here (table default, overridden by -ReasoningEffort
 # a few lines up), so gating on it -- rather than only on the raw override -- makes a table
 # effort (e.g. fable/opus/sol/luna at 'high') actually reach the child instead of being recorded

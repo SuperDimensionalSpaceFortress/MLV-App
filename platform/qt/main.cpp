@@ -8,6 +8,7 @@
 #include "MainWindow.h"
 #include "MyApplication.h"
 #include "CrashForensics.h"
+#include "GpuFieldTelemetry.h"
 #include "Phase3Mode.h"
 #include "PlaybackFrameRange.h"
 #include "PlaybackSwapInterval.h"
@@ -1284,6 +1285,12 @@ static int runGuiPlaybackSmoke(QApplication &app)
         QStringLiteral("dir"));
     parser.addOption(contactSheetSeekDirOpt);
 
+    const QCommandLineOption visualCaptureDirOpt(
+        QStringLiteral("visual-capture-dir"),
+        QStringLiteral("Optional directory for a post-measurement visual capture: after the measured Play has reached its own stop and its summary is written, Play continues UNTIMED for about 3 s while the window is captured (PrintWindow, PW_RENDERFULLCONTENT) 6 times, then once the instant Play is paused, then once more after the same frame is re-rendered by the paused full-quality path. Writes PNGs and visual.json. Never inside the measured interval."),
+        QStringLiteral("dir"));
+    parser.addOption(visualCaptureDirOpt);
+
     const QCommandLineOption scopeOpt(
         QStringLiteral("scope"),
         QStringLiteral("Force a live scope during the smoke: none, histogram, waveform, parade, vectorscope. If omitted, the user's persisted GUI state is used."),
@@ -1696,6 +1703,9 @@ static int runGuiPlaybackSmoke(QApplication &app)
         }
         options.contactSheetSeekDir = QFileInfo(parser.value(contactSheetSeekDirOpt)).absoluteFilePath();
     }
+    options.visualCaptureDir = parser.value(visualCaptureDirOpt).isEmpty()
+        ? QString()
+        : QFileInfo(parser.value(visualCaptureDirOpt)).absoluteFilePath();
     options.scope = scope;
     options.playbackDebayer = playbackDebayer;
     options.playbackProcessing = playbackProcessing;
@@ -1784,6 +1794,8 @@ int main(int argc, char *argv[])
 
     bool batch = hasBatchFlag(argc, argv);
     bool trim_mlv = hasTrimMlvFlag(argc, argv);
+    // GPU-FIELD-TELEMETRY-1: local GPU field log (ON unless MLVAPP_GPU_TELEMETRY=0); never in batch / trim.
+    if (!batch && !trim_mlv) GpuFieldTelemetry::install();
     bool profile_playback = hasPlaybackProfileFlag(argc, argv);
     bool gui_playback_smoke = hasGuiPlaybackSmokeFlag(argc, argv);
     const bool normal_gui =
