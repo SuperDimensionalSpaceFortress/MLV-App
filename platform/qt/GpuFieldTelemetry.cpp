@@ -94,6 +94,11 @@ QMutex & writeMutex()
     return *m;
 }
 
+/* Test-only (POST-SESSION-LATE-FAULT-1): runs after a flush took its snapshot
+ * of Unwritten and before it writes, writeMutex held. Never set outside tests. */
+using AfterTakeHook = void (*)(const char * reason);
+std::atomic<AfterTakeHook> g_afterTakeForTesting{nullptr};
+
 /* The after-fault worker waits here; session end wakes it so exit is not held. */
 QMutex g_waitMutex;
 QWaitCondition g_waitCondition;
@@ -319,7 +324,9 @@ core::SystemLogResult querySystemLog(const std::string &, const QDeadlineTimer &
 /* onWorker: the after-fault / recovery worker, which stops before each step
  * once session end has begun. systemLogDeadlineMs bounds the System-log read.
  * describe = false keeps the cached GPU model (r7 post routine: no backend
- * lock). */
+ * lock). On the worker the description waits at most kTerminalDrainWaitMs, so
+ * a worker that session end stops returns inside its join instead of holding
+ * the pool behind a stuck GPU call (POST-SESSION-LATE-FAULT-1). */
 void flushImpl(const char * reason, bool withSystemLog, bool onWorker = false,
                qint64 systemLogDeadlineMs = core::kSystemLogDeadlineMs, bool describe = true)
 {
@@ -336,7 +343,8 @@ void flushImpl(const char * reason, bool withSystemLog, bool onWorker = false,
     core::SystemLogResult systemLog;
     if (withSystemLog) systemLog = querySystemLog(since, QDeadlineTimer(systemLogDeadlineMs), onWorker);
     if (workerStopped(onWorker)) return;
-    const std::string cudaModel = describe ? reconDescribe() : std::string();
+    const std::string cudaModel =
+        describe ? reconDescribe(onWorker ? static_cast<int>(core::kTerminalDrainWaitMs) : -1) : std::string();
     if (workerStopped(onWorker)) return;
 
     // Faults, recovery lines and the clip leave Unwritten only once the write
@@ -358,6 +366,7 @@ void flushImpl(const char * reason, bool withSystemLog, bool onWorker = false,
         taken = core::takeInto(s.unwritten, id, utc, lines);
         if (withSystemLog) lines.push_back(core::formatSystemLog(id, utc, reason, systemLog));
     }
+    if (const AfterTakeHook hook = g_afterTakeForTesting.load()) hook(reason);
 
     const std::filesystem::path live =
         QDir(dir).filePath(QString::fromLatin1(core::kLogFileName)).toStdWString();
@@ -378,7 +387,7 @@ void drainBackendCudaErrors(int waitMs)
  * GUI thread waits for it at most waitMs, so neither EvtQuery / EvtClose (no
  * timeout of their own) nor the file write can hold the close past its budget.
  * A write still running is left to finish (State is never destroyed); the post
- * routine skips its own while it runs. */
+ * routine queues its own behind it. */
 void runExitWriteWithin(std::function<void()> write, qint64 waitMs)
 {
     startedWorkerPool()->start(std::move(write));
@@ -438,18 +447,25 @@ void sessionEnd()
  * after the views are gone: drain both DLLs once more and write any fault
  * still unwritten with one more flush. Bounded: the drain waits at most
  * kTerminalDrainWaitMs per lock, the flush reads neither the System log nor
- * the backend description, a worker session end gave up on keeps the write,
- * and the write itself is waited for at most kSessionEndWaitMs. A close with
- * nothing new writes nothing. */
+ * the backend description, and the write itself is waited for at most
+ * kSessionEndWaitMs. POST-SESSION-LATE-FAULT-1: a write still running took its
+ * snapshot before the views noted their last faults, so the post flush is
+ * queued behind it on the one-thread pool, never skipped, and writes only what
+ * that write left unwritten. A close with nothing new writes nothing. */
 void postSessionFlush()
 {
-    if (g_workerPoolCreated.load() && !workerPool()->waitForDone(0)) return;
     drainBackendCudaErrors(static_cast<int>(core::kTerminalDrainWaitMs));
     {
         QMutexLocker locker(&state().mutex);
         if (!state().installed || state().unwritten.faults.empty()) return;
     }
-    runExitWriteWithin([]() { flushImpl("post_session", false, false, 0, false); }, core::kSessionEndWaitMs);
+    runExitWriteWithin([]() {
+        {
+            QMutexLocker locker(&state().mutex);
+            if (state().unwritten.faults.empty()) return; // a write ahead of it took them
+        }
+        flushImpl("post_session", false, false, 0, false);
+    }, core::kSessionEndWaitMs);
 }
 
 /* Both run on the GUI thread: aboutToQuit's session end has run iff the flag
@@ -741,8 +757,14 @@ QString clipHash(const QString & basenameOrPath)
         QCryptographicHash::hash(name.toUtf8(), QCryptographicHash::Sha256).toHex().left(12));
 }
 
+void setAfterTakeForTesting(void (*hook)(const char * reason))
+{
+    g_afterTakeForTesting.store(hook);
+}
+
 void appCloseForTesting(const QString & logsDir, const std::function<void()> & beforeSessionEnd,
-                        const std::function<void()> & afterSessionEnd)
+                        const std::function<void()> & afterSessionEnd,
+                        const std::function<void()> & afterPostRoutine)
 {
     State & s = state();
     {
@@ -760,6 +782,7 @@ void appCloseForTesting(const QString & logsDir, const std::function<void()> & b
     sessionEnd();                            // aboutToQuit
     if (afterSessionEnd) afterSessionEnd();  // ~MainWindow: the GPU views' destroyTexture
     sessionEndPostRoutine();                 // ~QApplication
+    if (afterPostRoutine) afterPostRoutine(); // a test releases a stalled write here
     if (g_workerPoolCreated.load()) workerPool()->waitForDone(); // an exit write past its wait
     llrpSetGpuStageTelemetrySink(nullptr);
     gpuAmazeDebayerSetStageTelemetrySink(nullptr);

@@ -31,6 +31,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdint>
+#include <cstring>
 #include <set>
 #include <string>
 #include <thread>
@@ -1310,6 +1311,164 @@ TEST(GpuFieldTelemetryCapture, SessionEndReturnsInsideItsBudgetWhileABackendCall
     ASSERT_EQ(1, (int)linesWith(lines, {"\"kind\":\"flush\"", "\"reason\":\"session_end\""}).size());
     ASSERT_EQ(1, (int)linesWith(lines, {"\"kind\":\"session\"",
                                         "\"gpu_model\":\"fake-test-backend (no GPU, C-seam only)\""}).size());
+}
+
+namespace
+{
+// POST-SESSION-LATE-FAULT-1: holds the session_end write after it took its snapshot and before it
+// writes (the after-take test hook), as a write stuck in the file system would. It gives up after
+// kStallGiveUpMs, so a regression fails the test instead of hanging the suite.
+constexpr long long kStallGiveUpMs = 4 * GpuFieldTelemetryCore::kSessionEndWaitMs + 2000;
+std::atomic<bool> g_stallEntered{false};
+std::atomic<bool> g_stallRelease{false};
+std::atomic<bool> g_stallGaveUp{false};
+
+void stallSessionEndWrite(const char * reason)
+{
+    if (!reason || std::strcmp(reason, "session_end") != 0) return;
+    g_stallEntered.store(true);
+    const auto giveUp = std::chrono::steady_clock::now() + std::chrono::milliseconds(kStallGiveUpMs);
+    while (!g_stallRelease.load())
+    {
+        if (std::chrono::steady_clock::now() >= giveUp)
+        {
+            g_stallGaveUp.store(true);
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
+struct StallSessionEndWriteScope
+{
+    StallSessionEndWriteScope()
+    {
+        g_stallEntered.store(false);
+        g_stallRelease.store(false);
+        g_stallGaveUp.store(false);
+        GpuFieldTelemetry::setAfterTakeForTesting(&stallSessionEndWrite);
+    }
+    ~StallSessionEndWriteScope()
+    {
+        g_stallRelease.store(true);
+        GpuFieldTelemetry::setAfterTakeForTesting(nullptr);
+    }
+};
+
+// The recon view's GL reset notes 702 at reset_gl:set_device, as ~MainWindow's destroyTexture does.
+void noteTheViewResetFault()
+{
+    llrpFakeGpuBackendArmCudaNoteForTesting(kRender, 702, "cudaErrorLaunchTimeout", "reset_gl:set_device");
+    ASSERT_EQ(1, llrpGpuPlaybackReconResetGlTextureResources());
+}
+
+struct StalledClose
+{
+    bool sessionEndReturned = false;
+    bool postRoutineReturned = false;
+    long long sessionEndMs = 0;
+    long long postRoutineMs = 0;
+};
+
+// The GUI close with the session_end write stalled until the post routine has returned. The fault is
+// noted after session end (faultAfterSessionEnd: after the stalled write's snapshot, as ~MainWindow
+// notes it) or before it (inside that snapshot).
+StalledClose closeWithTheSessionEndWriteStalled(const QTemporaryDir & dir, bool faultAfterSessionEnd)
+{
+    using Clock = std::chrono::steady_clock;
+    StalledClose out;
+    Clock::time_point start;
+    Clock::time_point postStart;
+    GpuFieldTelemetry::appCloseForTesting(dir.path(), [&]() {
+        start = Clock::now();
+        if (!faultAfterSessionEnd) noteTheViewResetFault();
+    }, [&]() {
+        out.sessionEndMs = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start).count();
+        out.sessionEndReturned = true;
+        if (faultAfterSessionEnd) noteTheViewResetFault();
+        postStart = Clock::now();
+    }, [&]() {
+        out.postRoutineMs = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - postStart).count();
+        out.postRoutineReturned = true;
+        g_stallRelease.store(true);
+    });
+    return out;
+}
+} // namespace
+
+// POST-SESSION-LATE-FAULT-1 (CoS post-merge Blocker on #435): session end hands its write to the worker
+// and stops waiting when its budget runs out, while the write is still running on the snapshot it took.
+// ~MainWindow's GL reset then notes 702. The post routine must queue its post_session flush behind the
+// running write and write that fault once, and both exit waits stay inside their budgets. On a1ab71cb
+// the post routine returned at waitForDone(0) while the write ran: zero fault lines, no post_session.
+TEST(GpuFieldTelemetryCapture, FaultNotedWhileTheSessionEndWriteStallsIsWrittenAndTheCloseStaysInsideItsBudget)
+{
+    namespace core = GpuFieldTelemetryCore;
+    constexpr long long kSlackMs = 250;
+    const FakeGpuBackendScope fake;
+    int rc = -99;
+    ASSERT_NE(0, runOnce(1, &rc));
+    QTemporaryDir dir;
+    ASSERT_TRUE(dir.isValid());
+    StalledClose close;
+    {
+        const StallSessionEndWriteScope stall;
+        close = closeWithTheSessionEndWriteStalled(dir, true);
+    }
+    std::printf("[late-fault] session_end_ms=%lld budget_ms=%lld post_routine_ms=%lld budget_ms=%lld\n",
+                close.sessionEndMs, core::kSessionEndWaitMs + kSlackMs, close.postRoutineMs,
+                core::kSessionEndWaitMs + 2 * core::kTerminalDrainWaitMs + kSlackMs);
+    ASSERT_TRUE(g_stallEntered.load());
+    ASSERT_FALSE(g_stallGaveUp.load());
+    ASSERT_TRUE(close.sessionEndReturned);
+    ASSERT_TRUE(close.postRoutineReturned);
+    ASSERT_TRUE(close.sessionEndMs <= core::kSessionEndWaitMs + kSlackMs);
+    ASSERT_TRUE(close.postRoutineMs <= core::kSessionEndWaitMs + 2 * core::kTerminalDrainWaitMs + kSlackMs);
+    const std::vector<std::string> lines = logLines(dir);
+    const std::vector<int> fault =
+        linesWith(lines, {"\"kind\":\"fault\"", "\"site\":\"reset_gl:set_device\"", "\"cuda_code\":702"});
+    ASSERT_EQ(1, (int)fault.size());
+    ASSERT_EQ(1, (int)linesWith(lines, {"\"kind\":\"fault\""}).size());
+    const std::vector<int> sessionEnd = linesWith(lines, {"\"kind\":\"flush\"", "\"reason\":\"session_end\""});
+    const std::vector<int> post = linesWith(lines, {"\"kind\":\"flush\"", "\"reason\":\"post_session\""});
+    ASSERT_EQ(1, (int)sessionEnd.size());
+    ASSERT_EQ(1, (int)post.size());
+    ASSERT_TRUE(sessionEnd[0] < post[0]);
+    ASSERT_TRUE(post[0] < fault[0]);
+}
+
+// POST-SESSION-LATE-FAULT-1 guard: the fault is noted before session end, so the stalled write's
+// snapshot holds it. The post routine still queues behind that write (the fault is not committed
+// yet), and its queued flush re-checks and writes nothing once the write ahead of it took the fault:
+// one fault line after the single session_end flush, and no post_session flush.
+TEST(GpuFieldTelemetryCapture, StalledSessionEndWriteWithNothingNewWritesNoPostSessionFlush)
+{
+    namespace core = GpuFieldTelemetryCore;
+    constexpr long long kSlackMs = 250;
+    const FakeGpuBackendScope fake;
+    int rc = -99;
+    ASSERT_NE(0, runOnce(1, &rc));
+    QTemporaryDir dir;
+    ASSERT_TRUE(dir.isValid());
+    StalledClose close;
+    {
+        const StallSessionEndWriteScope stall;
+        close = closeWithTheSessionEndWriteStalled(dir, false);
+    }
+    ASSERT_TRUE(g_stallEntered.load());
+    ASSERT_FALSE(g_stallGaveUp.load());
+    ASSERT_TRUE(close.sessionEndReturned);
+    ASSERT_TRUE(close.postRoutineReturned);
+    ASSERT_TRUE(close.sessionEndMs <= core::kSessionEndWaitMs + kSlackMs);
+    ASSERT_TRUE(close.postRoutineMs <= core::kSessionEndWaitMs + 2 * core::kTerminalDrainWaitMs + kSlackMs);
+    const std::vector<std::string> lines = logLines(dir);
+    const std::vector<int> fault = linesWith(lines, {"\"kind\":\"fault\""});
+    ASSERT_EQ(1, (int)fault.size());
+    ASSERT_TRUE(has(lines[fault[0]], "\"site\":\"reset_gl:set_device\""));
+    const std::vector<int> sessionEnd = linesWith(lines, {"\"kind\":\"flush\"", "\"reason\":\"session_end\""});
+    ASSERT_EQ(1, (int)sessionEnd.size());
+    ASSERT_TRUE(sessionEnd[0] < fault[0]);
+    ASSERT_EQ(0, (int)linesWith(lines, {"\"reason\":\"post_session\""}).size());
 }
 
 namespace

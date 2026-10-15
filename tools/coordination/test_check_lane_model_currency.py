@@ -1,6 +1,8 @@
 import datetime
 import importlib.util
 import json
+import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -309,6 +311,54 @@ class LoadAndCliTests(CurrencyFixture):
         result = self._run("--newest", "claude-opus=claude-opus-5-6", "--since-hours", "0")
         self.assertEqual(result.returncode, 1, result.stdout)
         self.assertIn("STALE-MODEL", result.stdout)
+
+
+class DefaultRunsDirTests(unittest.TestCase):
+    """default_runs_dir() must not depend on the caller's cwd: git prints a RELATIVE common dir
+    from the main checkout, and abspath() of that resolved against the caller, not the script."""
+
+    def setUp(self):
+        self.addCleanup(os.chdir, os.getcwd())
+        self.addCleanup(os.environ.pop, "MLV_FLEET_RUNS_DIR", None)
+        os.environ.pop("MLV_FLEET_RUNS_DIR", None)
+        self.foreign = os.path.realpath(tempfile.mkdtemp(prefix="lane-currency-cwd-"))
+        self.addCleanup(shutil.rmtree, self.foreign, True)
+
+    @staticmethod
+    def _same(left, right):
+        return os.path.normcase(os.path.realpath(left)) == os.path.normcase(os.path.realpath(right))
+
+    def test_resolves_to_the_checkout_that_owns_the_script_from_a_foreign_cwd(self):
+        common = subprocess.run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                                capture_output=True, text=True, timeout=15, cwd=str(ROOT)).stdout.strip()
+        self.assertTrue(common, "git could not resolve the common dir from %s" % ROOT)
+        expected = os.path.join(os.path.dirname(common), ".claude-state", "fleet-runs")
+        os.chdir(self.foreign)
+        self.assertTrue(self._same(check.default_runs_dir(), expected),
+                        "%s != %s" % (check.default_runs_dir(), expected))
+
+    def test_main_checkout_layout_where_git_prints_a_relative_common_dir(self):
+        repo = os.path.join(self.foreign, "main-checkout")
+        script_dir = os.path.join(repo, "tools", "coordination")
+        os.makedirs(script_dir)
+        subprocess.run(["git", "init", "-q", repo], check=True, capture_output=True, timeout=30)
+        copy = os.path.join(script_dir, "check-lane-model-currency.py")
+        shutil.copy(str(SCRIPT), copy)
+        spec = importlib.util.spec_from_file_location("check_lane_model_currency_main_layout", copy)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        relative = subprocess.run(["git", "rev-parse", "--git-common-dir"], capture_output=True, text=True,
+                                  timeout=15, cwd=script_dir).stdout.strip()
+        self.assertFalse(os.path.isabs(relative), "layout does not reproduce a relative common dir: %r" % relative)
+        elsewhere = os.path.join(self.foreign, "elsewhere")
+        os.mkdir(elsewhere)
+        os.chdir(elsewhere)
+        self.assertTrue(self._same(module.default_runs_dir(), os.path.join(repo, ".claude-state", "fleet-runs")),
+                        module.default_runs_dir())
+
+    def test_env_override_still_wins(self):
+        os.environ["MLV_FLEET_RUNS_DIR"] = self.foreign
+        self.assertEqual(check.default_runs_dir(), self.foreign)
 
 
 if __name__ == "__main__":
