@@ -1353,7 +1353,7 @@ namespace
 {
 
 const char kVision50dCurve[] =
-    "1e-05;0.005;0.18;0.15;0.5;0.51;0.82;0.86;1;0.985;?1e-05;1e-05;0.5;0.505;1;1;?1e-05;1e-05;0.5;0.5;1;1;?1e-05;1e-05;0.5;0.495;1;1;";
+    "1e-05;0.003503;0.18;0.159;0.5;0.507;0.82;0.848;1;0.9895;?1e-05;1e-05;0.5;0.5035;1;1;?1e-05;1e-05;0.5;0.5;1;1;?1e-05;1e-05;0.5;0.4965;1;1;";
 
 bool sameTables( const GradationTables &a, const GradationTables &b )
 {
@@ -1419,9 +1419,9 @@ TEST(LookAssistVision50dGrade, T1PinTheCurveStringAndItsTablesArePinned)
                       qPrintable( lookAssistSceneName( scene ) ), qPrintable( curve ), qPrintable( tablesSha256( t ) ),
                       sameTables( t, shade ) ? 1 : 0, qPrintable( samples ) );
     }
-    const char kSha256[] = "b3ace9fc3492b5857dc7cd854fcce4b75da8b207e0e22469830be7305043badb";
-    const int pinY[6] = { 327, 5345, 9829, 33422, 56359, 64551 }, pinR[6] = { 6, 6650, 11965, 33095, 53907, 65534 },
-              pinG[6] = { 6, 6553, 11795, 32767, 53738, 65534 }, pinB[6] = { 6, 6456, 11626, 32439, 53568, 65533 };
+    const char kSha256[] = "4754740dd1584e3b72f3db26fb93ad135c70ea5761b64847c4d3eb7ee3b231d1";
+    const int pinY[6] = { 229, 5707, 10419, 33226, 55573, 64846 }, pinR[6] = { 6, 6621, 11914, 32996, 53856, 65534 },
+              pinG[6] = { 6, 6553, 11795, 32767, 53738, 65534 }, pinB[6] = { 6, 6486, 11677, 32538, 53619, 65533 };
     for( LookAssistScene scene : kFilmScenes )
     {
         ASSERT_TRUE( lookAssistVision50dGradationCurve( scene ) == QLatin1String( kVision50dCurve ) );
@@ -1500,13 +1500,20 @@ TEST(LookAssistVision50dGrade, T4RAndBMirrorTheDefault)
 
 TEST(LookAssistVision50dGrade, T5ToneShapeIsCrisperWithoutCrush)
 {
-    // T5 TONE-SHAPE: all four tables monotonic; (Y[0.82] - Y[0.18]) / 65535 >= 0.69 (the default's is 0.64; the knots give
-    // 0.71); Y[0] / 65535 in [0.004, 0.006]; Y[65535] / 65535 in [0.983, 0.987]; and no crush: max over v of
-    // (v - Y[v]) / 65535 <= 0.035.
+    // T5 TONE-SHAPE: all four tables monotonic; (Y[0.82] - Y[0.18]) / 65535 >= the knots' crisp - 0.02 (the default's is
+    // 0.64); Y[0] / 65535 within 0.001 of the toe knot; Y[65535] / 65535 within 0.002 of the shoulder knot; and no crush:
+    // max over v of (v - Y[v]) / 65535 <= 0.035. The three knot bounds were pinned on the owner's knots at s = 1
+    // (>= 0.69, [0.004, 0.006], [0.983, 0.987]); they are re-derived at the scene's strength through the builder's own
+    // y = x + s * (y_owner - x), each keeping its width (hub ruling 2026-10-15), so a strength change moves them with it.
     const GradationTables def = gradationTables( defaultCurve() );
     const double defaultCrisp = ( static_cast<double>( def.y[tableIndex( 0.82 )] ) - def.y[tableIndex( 0.18 )] ) / 65535.0;
     for( LookAssistScene scene : kFilmScenes )
     {
+        const double s = lookAssistVision50dGradeForScene( scene ).strength;
+        const auto at = [s]( double x, double yOwner ) { return x + s * ( yOwner - x ); };
+        const double crispMin = at( 0.82, 0.86 ) - at( 0.18, 0.15 ) - 0.02;
+        const double toeLo = at( 1e-5, 0.005 ) - 0.001, toeHi = at( 1e-5, 0.005 ) + 0.001;
+        const double shoulderLo = at( 1.0, 0.985 ) - 0.002, shoulderHi = at( 1.0, 0.985 ) + 0.002;
         const GradationTables t = gradationTables( lookAssistVision50dGradationCurve( scene ) );
         bool monotonic = true;
         for( const std::vector<uint16_t> *table : { &t.y, &t.r, &t.g, &t.b } )
@@ -1521,13 +1528,14 @@ TEST(LookAssistVision50dGrade, T5ToneShapeIsCrisperWithoutCrush)
             const double c = ( static_cast<double>( v ) - t.y[v] ) / 65535.0;
             if( c > crush ) { crush = c; crushAt = v; }
         }
-        std::fprintf( stderr, "VISION50D-T5 scene=%s monotonic=%d crisp=%.4f (default %.4f, bound >= 0.69) Y[0]=%.5f [0.004,0.006]"
-                      " Y[65535]=%.5f [0.983,0.987] crush=%.5f at x=%.4f (bound <= 0.035)\n", qPrintable( lookAssistSceneName( scene ) ),
-                      monotonic ? 1 : 0, crisp, defaultCrisp, y0, y1, crush, crushAt / 65535.0 );
+        std::fprintf( stderr, "VISION50D-T5 scene=%s s=%.4f monotonic=%d crisp=%.4f (default %.4f, bound >= %.4f) Y[0]=%.5f [%.5f,%.5f]"
+                      " Y[65535]=%.5f [%.5f,%.5f] crush=%.5f at x=%.4f (bound <= 0.035)\n", qPrintable( lookAssistSceneName( scene ) ),
+                      s, monotonic ? 1 : 0, crisp, defaultCrisp, crispMin, y0, toeLo, toeHi, y1, shoulderLo, shoulderHi, crush,
+                      crushAt / 65535.0 );
         ASSERT_TRUE( monotonic );
-        ASSERT_TRUE( crisp >= 0.69 );
-        ASSERT_TRUE( y0 >= 0.004 && y0 <= 0.006 );
-        ASSERT_TRUE( y1 >= 0.983 && y1 <= 0.987 );
+        ASSERT_TRUE( crisp >= crispMin );
+        ASSERT_TRUE( y0 >= toeLo && y0 <= toeHi );
+        ASSERT_TRUE( y1 >= shoulderLo && y1 <= shoulderHi );
         ASSERT_TRUE( crush <= 0.035 );
     }
 }

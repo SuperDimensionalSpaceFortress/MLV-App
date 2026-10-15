@@ -738,7 +738,7 @@ bool lookAssistFilmOwnsGradationCurve( const QString &curve );
 
 /* ---- The Kodak Vision3 50D grade, vision50d-v1 (docs/look-assist-vision50d.md, between the vision50d-table markers). ----
  * The owner's knots, each control point y = x + s * (y_owner - x) at the scene's strength s (kVision50dGradeStrength, the
- * ONE table; 1.0 at every scene):
+ * ONE table; 0.70 at every scene):
  *   Y: (1e-5, 0.005) (0.18, 0.15) (0.50, 0.51) (0.82, 0.86) (1, 0.985)    crisper mid-tones, a slight toe and shoulder
  *   R: (1e-5, 1e-5) (0.50, 0.505) (1, 1)
  *   G: (1e-5, 1e-5) (0.50, 0.50) (1, 1)

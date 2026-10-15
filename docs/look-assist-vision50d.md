@@ -31,10 +31,10 @@ construction, exactly as for Cinematic.
 <!-- vision50d-table:begin -->
 | Scene | s | vibrance delta |
 |---|---|---|
-| Night | 1.0 | +12 |
-| ArtificialLights | 1.0 | +12 |
-| Shade | 1.0 | +12 |
-| BrightSun | 1.0 | +12 |
+| Night | 0.70 | +12 |
+| ArtificialLights | 0.70 | +12 |
+| Shade | 0.70 | +12 |
+| BrightSun | 0.70 | +12 |
 
 | Line | knots (x, y_owner), display-referred 0..1 |
 |---|---|
@@ -45,16 +45,20 @@ construction, exactly as for Cinematic.
 <!-- vision50d-table:end -->
 
 A console test pins this table against the code (`LookAssistFlavors.TheDocumentedVision50dTableIsTheCodeTable`). At
-`s = 1` the receipt's `gradationCurve` is:
+the shipped `s = 0.70` the receipt's `gradationCurve` is:
 
-`1e-05;0.005;0.18;0.15;0.5;0.51;0.82;0.86;1;0.985;?1e-05;1e-05;0.5;0.505;1;1;?1e-05;1e-05;0.5;0.5;1;1;?1e-05;1e-05;0.5;0.495;1;1;`
+`1e-05;0.003503;0.18;0.159;0.5;0.507;0.82;0.848;1;0.9895;?1e-05;1e-05;0.5;0.5035;1;1;?1e-05;1e-05;0.5;0.5;1;1;?1e-05;1e-05;0.5;0.4965;1;1;`
+
+At `s = 1` (the owner's knots as judged) it was
+`1e-05;0.005;0.18;0.15;0.5;0.51;0.82;0.86;1;0.985;?1e-05;1e-05;0.5;0.505;1;1;?1e-05;1e-05;0.5;0.5;1;1;?1e-05;1e-05;0.5;0.495;1;1;`.
 
 * **Y** steepens the mid-tones (0.18 -> 0.15 and 0.82 -> 0.86), with a slight toe (0.005) and shoulder (0.985).
 * **R / B** are a mirror about the identity at one knot (+0.005 / -0.005 at 0.5), and **G** is the identity. On a
   neutral that is a faint warm lift in the mid-tones and nothing in the shadows or highlights.
 
 **Strength is constant.** The preview was constant and the owner judged one curve. The table exists so a later card
-can lower one scene (Night, say) without touching the builder.
+can lower one scene (Night, say) without touching the builder. It is **0.70** at every scene (hub ruling 2026-10-15),
+because at `s = 1` the re-grade gate R2 failed (below); the owner's knots are unchanged.
 
 ### The vibrance ladder (pre-registered)
 
@@ -106,12 +110,17 @@ The gates, bounds and ladder are the design's section 4 (`B = 1.5 / 255`), fixed
 <!-- vision50d-gates:table -->
 | ID | Gate | Bound | Measured |
 |---|---|---|---|
-| T1 PIN | curve string = the literal above; tables pinned by sha256 and samples | exact | pass: the four scenes build byte-identical tables, sha256 `b3ace9fc...043badb` |
-| T2 WC-RAMP | neutral-ramp lean, mean((R+G)/2 - B), all 65536 codes | \|lean\| <= B | +0.004320 (+1.102 / 255), every scene |
+| T1 PIN | curve string = the literal above; tables pinned by sha256 and samples | exact | pass: the four scenes build byte-identical tables, sha256 `4754740d...ee3b231d1` (s = 1 was `b3ace9fc...043badb`) |
+| T2 WC-RAMP | neutral-ramp lean, mean((R+G)/2 - B), all 65536 codes | \|lean\| <= B | +0.003103 (+0.791 / 255), every scene |
 | T3 GM-NEUTRAL | every grey level, \|G - (R+B)/2\| | <= 128 table steps | 0.5 steps |
 | T4 MIRROR | \|r + b - 2 def\| above the floor clamp | <= 2 steps | 1 step (8 entries floor-clamped) |
-| T5 TONE-SHAPE | (Y[0.82] - Y[0.18]); Y[0]; Y[1]; max(v - Y[v]); monotonic | >= 0.69; [0.004, 0.006]; [0.983, 0.987]; <= 0.035 | 0.7100 (default 0.6400); 0.00499; 0.98499; 0.0317 at x = 0.224; all four monotonic |
-| T6 SKIN | Film's skin patches: graded hue; magenta-ward move | [12, 32] deg; <= 3.5 deg | [20.46, 26.65]; 1.36 |
+| T5 TONE-SHAPE | (Y[0.82] - Y[0.18]); Y[0]; Y[1]; max(v - Y[v]); monotonic | knots' crisp - 0.02; toe knot +/- 0.001; shoulder knot +/- 0.002; <= 0.035 | 0.6890 >= 0.6690 (default 0.6400); 0.00349 in [0.00250, 0.00450]; 0.98949 in [0.98750, 0.99150]; 0.0222 at x = 0.219; all four monotonic |
+| T6 SKIN | Film's skin patches: graded hue; magenta-ward move | [12, 32] deg; <= 3.5 deg | [20.86, 25.38]; 0.96 |
+
+T5's three knot bounds were pinned on the owner's knots at `s = 1` (>= 0.69, [0.004, 0.006], [0.983, 0.987]). Like
+T1, they are re-derived at the scene's strength through the builder's own `y = x + s * (y_owner - x)`, each keeping
+its width (hub ruling 2026-10-15), so the test moves them with `kVision50dGradeStrength`. No other bound moved. The
+perceptual crispness gates F2 and E1 are unchanged.
 | T7 PRESET | preset = Cinematic's, vibrance = clamp(cin + D) | exact | pass on the whole grid |
 | T8 DISTINCT | not default; Film does not own it; it owns none of Film's 12; the union owns both | exact | pass |
 
@@ -120,11 +129,12 @@ The gates, bounds and ladder are the design's section 4 (`B = 1.5 / 255`), fixed
 | ID | Gate | Bound | Measured |
 |---|---|---|---|
 | F1 SAME-SOLVE | exposure, temperature, tint = Cinematic's | exact | pass (vibrance 11 -> 23) |
-| F2 CRISP | spread_V - spread_C (luma p95 - p05), every fixture frame | >= +2.0 codes | +8.70 / +8.85 / +6.56 |
-| F3 RICH / NOT-GARISH | sat_V / sat_C - 1, every fixture frame | [+0.04, +0.35] | +0.321 / +0.322 / +0.287 |
+| F2 CRISP | spread_V - spread_C (luma p95 - p05), every fixture frame | >= +2.0 codes | +6.14 / +6.25 / +4.53 |
+| F3 RICH / NOT-GARISH | sat_V / sat_C - 1, every fixture frame | [+0.04, +0.35] | +0.268 / +0.269 / +0.243 |
 
 Fixture frames, in order: `tiny_dual_iso.mlv` 0, `large_dual_iso.mlv` 0, `large_dual_iso.mlv` 10. The numbers are at
-rung 2 (+12). At rung 1 (+18) F3 read +0.404 / +0.406 / +0.366.
+rung 2 (+12) and `s = 0.70`. At `s = 1` rung 2 read F2 +8.70 / +8.85 / +6.56 and F3 +0.321 / +0.322 / +0.287; at
+rung 1 (+18) F3 read +0.404 / +0.406 / +0.366.
 
 ### Re-grade and venue gates (M16-1243, Bachelor)
 
@@ -132,17 +142,21 @@ The re-grade gates re-grade a Cinematic AgX-off capture of M16-1243 through `vis
 `look-flavor-diff.py warmcool --max-abs-lean B`. They were measured on the AgX-off Cinematic capture that
 LOOK-ASSIST-FILM-FLAVOR-3 r1b bound with `regrade-binding.txt` (the capture the owner's preview was made from):
 
-| ID | Gate | Bound | Measured |
-|---|---|---|---|
-| R1 WC-HIST | histogram lean of the table | \|.\| <= B | +0.004673 (+1.19 / 255): pass |
-| R2 WC-REGRADE | mean re-grade lean change, 6 frame-locked tiles | \|.\| <= B | **+0.008235 (+2.10 / 255): FAIL** (tiles +0.0055 .. +0.0104) |
-| R3 CRISP-REGRADE | mean luma spread change | reported | +7.95 codes |
+| ID | Gate | Bound | `s = 1` | `s = 0.70` (shipped) |
+|---|---|---|---|---|
+| R1 WC-HIST | histogram lean of the table | \|.\| <= B | +0.004673 (+1.19 / 255): pass | +0.003331 (+0.85 / 255): pass |
+| R2 WC-REGRADE | mean re-grade lean change, 6 frame-locked tiles | \|.\| <= B | **+0.008235 (+2.10 / 255): FAIL** (tiles +0.0055 .. +0.0104) | **+0.005619 (+1.43 / 255): pass**, margin 0.000264 (tiles +0.0038 .. +0.0071) |
+| R3 CRISP-REGRADE | mean luma spread change | reported | +7.95 codes | +5.58 codes |
 
-**R2 fails, so the card stopped (PARTIAL) and this flavor is not cleared to ship.** The design classes an R2 failure
-as a curve problem; the ladder cannot fix it, because vibrance is not in a curve-only re-grade. The owner's curve is
-not retuned here. The R/B mirror alone moves the lean +0.0042 and the Y line +0.0037; the Y line's share grows with
-the scene's own warm cast, so on M16-1243 (tile lean +0.010 .. +0.047) the two add past B. No venue round was run,
-so E0..E8 are unmeasured.
+**At `s = 1`, R2 failed**, and the design classes an R2 failure as a curve problem. The ladder cannot fix it, because
+vibrance is not in a curve-only re-grade. The R/B mirror alone moved the lean by +0.0042 and the Y line by +0.0037.
+The Y line's share grows with the scene's own warm cast, so on M16-1243 (tile lean +0.010 .. +0.047) the two added up
+past B. The hub ruled (2026-10-15) to keep the owner's knots and lower the strength to 0.70. There, the R/B mirror
+moves the lean by +0.0035 and the Y line by +0.0026, and R2 passes with a thin margin (4.5 % of B).
+
+The capture is the same r1b Cinematic capture as before. Its PNGs had been removed from the r1b staging directory, so
+they were restaged from the canonical dual-venue evidence by sha256 against the original `cinematic.listed.json`.
+On the restaged capture, the `s = 1` table reproduces +0.008235 exactly.
 
 ## Tests
 

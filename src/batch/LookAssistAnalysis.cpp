@@ -1910,13 +1910,13 @@ bool lookAssistFilmOwnsGradationCurve( const QString &curve )
 
 // The Kodak Vision3 50D grade: the ONE strength table, one row per scene in LookAssistScene order (docs/look-assist-
 // vision50d.md, between the vision50d-table markers). Constant: the owner judged one curve; the table exists so a later
-// card can lower a scene without touching the builder.
+// card can lower a scene without touching the builder. 0.70 (hub ruling 2026-10-15): at 1.0 the re-grade lean R2 failed.
 static const double kVision50dGradeStrength[] =
 {
-    1.0,    // Night
-    1.0,    // ArtificialLights
-    1.0,    // Shade
-    1.0,    // BrightSun
+    0.70,   // Night
+    0.70,   // ArtificialLights
+    0.70,   // Shade
+    0.70,   // BrightSun
 };
 static const int kVision50dGradeScenes =
     static_cast<int>( sizeof( kVision50dGradeStrength ) / sizeof( kVision50dGradeStrength[0] ) );

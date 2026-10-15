@@ -1249,7 +1249,7 @@ TEST(LookAssistFlavors, TheVision50dCurveIsDistinctAndOwnedOnlyByItsGrade)
     // (v3 / v2 / v1 x 4 scenes); the union owns both. The curve string is the pre-registered literal and round-trips
     // through the widget format.
     const QString expected = QStringLiteral(
-        "1e-05;0.005;0.18;0.15;0.5;0.51;0.82;0.86;1;0.985;?1e-05;1e-05;0.5;0.505;1;1;?1e-05;1e-05;0.5;0.5;1;1;?1e-05;1e-05;0.5;0.495;1;1;" );
+        "1e-05;0.003503;0.18;0.159;0.5;0.507;0.82;0.848;1;0.9895;?1e-05;1e-05;0.5;0.5035;1;1;?1e-05;1e-05;0.5;0.5;1;1;?1e-05;1e-05;0.5;0.4965;1;1;" );
     const QString base = ReceiptSettings().gradationCurve();
     for( const auto &s : kSceneNames )
     {
