@@ -5756,6 +5756,26 @@ class LegSpecSchemaTests(unittest.TestCase):
             self.assertEqual(spec["criteria"], {"acceptance": {backend: [gate]}, "supplementary": {backend: [gate]}}, rel)
             self.assertEqual(dict(spec, legId=twin["legId"], generatorArgs=twin["generatorArgs"], criteria=twin["criteria"]), twin, rel)
 
+    def test_only_an_unpaced_swap_interval_0_leg_may_declare_its_tearing_expected(self) -> None:
+        """CUDA-HEADROOM-1 r2: an unpaced leg at swap interval 0 presents with SyncInterval 0, so PresentMon reports AllowsTearing=1 (the hub's
+        TEARING flag). Every headroom leg says so in presentTearingExpectedReason; no other leg carries it, and the schema refuses it on any leg
+        that is not unpaced at swap interval 0, so the exemption can never reach a paced or vsync leg."""
+        for rel in HEADROOM_LEGS:
+            spec = json.loads((DV / rel).read_text(encoding="utf-8"))
+            self.jsonschema.validate(spec, self.schema)
+            self.assertGreaterEqual(len(spec.get("presentTearingExpectedReason", "")), 12, rel)
+        for path in sorted((DV / "legs").glob("*.json")):
+            if "legs/" + path.name not in HEADROOM_LEGS:
+                self.assertNotIn("presentTearingExpectedReason", json.loads(path.read_text(encoding="utf-8")), path.name)
+        leg = json.loads((DV / HEADROOM_LEGS[0]).read_text(encoding="utf-8"))
+        paced = {k: v for k, v in leg["generatorArgs"].items() if k != "unpaced"}
+        no_swap = {k: v for k, v in leg["generatorArgs"].items() if k != "swapInterval"}
+        for name, bad in (("paced", dict(leg, generatorArgs=paced)), ("unpaced false", dict(leg, generatorArgs=dict(leg["generatorArgs"], unpaced=False))),
+                          ("vsync", dict(leg, generatorArgs=dict(leg["generatorArgs"], swapInterval=1))), ("app-default swap", dict(leg, generatorArgs=no_swap)),
+                          ("short reason", dict(leg, presentTearingExpectedReason="tearing"))):
+            with self.assertRaises(self.jsonschema.ValidationError, msg=name):
+                self.jsonschema.validate(bad, self.schema)
+
     def test_the_hand_listed_shipped_legs_are_exactly_the_legs_directory(self) -> None:
         self.assertEqual(sorted(SHIPPED_LEGS), sorted("legs/" + p.name for p in (DV / "legs").glob("*.json")), "SHIPPED_LEGS drifted from the legs/ directory")
 

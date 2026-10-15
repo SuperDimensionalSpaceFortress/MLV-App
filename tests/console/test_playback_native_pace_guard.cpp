@@ -996,10 +996,15 @@ TEST(PlaybackUnpacedWiring, OneDisclosureLineAfterTheSummaryAndOnlyWhenRequested
     const int gateAt = source.lastIndexOf(gate, line);
     ASSERT_TRUE(gateAt > summary);
     ASSERT_TRUE(line - gateAt < 200);
+    ASSERT_TRUE(source.mid(gateAt, line - gateAt).contains(QStringLiteral(
+        "const QString unpacedRunNonce = automationRunNonce();")));
     ASSERT_TRUE(source.mid(line, 600).contains(QStringLiteral(
         ".arg( bool01( m_automationPacingIsolated ) )\n"
         "                   .arg( bool01( ui->actionDropFrameMode->isChecked() ) )\n"
-        "                   .arg( automationRunNonce() );")));
+        "                   .arg( unpacedRunNonce );")));
+    // the summary's run-nonce .arg is a pinned stop statement (tools/repo_hygiene/app_play_scan.py): it must stay the
+    // only one in finishPlaybackSmokeTelemetry, so this line never repeats it (the count includes comments)
+    ASSERT_EQ(1, source.count(QStringLiteral(".arg( automationRunNonce() );")));
 }
 
 TEST(PlaybackNativePaceWiring, TheFirstPresentsCatchUpIsSampledAfterItsAdvanceAndNotPaced)

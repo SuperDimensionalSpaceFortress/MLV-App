@@ -27923,13 +27923,17 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                .arg( automationRunNonce() );
 
     // CUDA-HEADROOM-1: an unpaced run says so (the summary format string is pinned); nothing when it is not asked.
+    // The nonce goes through a local: the summary's run-nonce .arg is a stop statement pinned to occur exactly once.
     if( mlvappPlaybackUnpacedRequested() )
+    {
+        const QString unpacedRunNonce = automationRunNonce();
         qInfo().noquote()
             << QStringLiteral( "playback_smoke.pace_unpaced session=%1 active=%2 drop_frame=%3 run_nonce=%4" )
                    .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
                    .arg( bool01( m_automationPacingIsolated ) )
                    .arg( bool01( ui->actionDropFrameMode->isChecked() ) )
-                   .arg( automationRunNonce() );
+                   .arg( unpacedRunNonce );
+    }
 
     // PLAYBACK-BACHELOR-PRESENT-JITTER-1: the slip summary is taken here, before pace_summary, because the wait for the
     // first frame is mostly repaid AFTER the first present: no grant runs while the render thread is busy, so the

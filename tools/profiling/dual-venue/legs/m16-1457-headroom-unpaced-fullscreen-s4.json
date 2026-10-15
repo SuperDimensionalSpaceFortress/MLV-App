@@ -22,6 +22,7 @@
   },
   "visualCapture": false,
   "visualCaptureOptOutReason": "unpaced throughput/stage leg: the untimed capture tail keeps playing unpaced past the measured window, so its presents count against the header-frame loop check and blur the measured rate",
+  "presentTearingExpectedReason": "unpaced headroom leg at swap interval 0: every present goes out with SyncInterval 0, so PresentMon reports AllowsTearing=1 on its Independent Flip presents by design; a measurement-only mode (MLVAPP_PLAYBACK_UNPACED is honoured only in an automation run) that no user playback path reaches",
   "timeouts": {
     "queueWaitSec": 900,
     "extraClaimedWaitSec": 600
