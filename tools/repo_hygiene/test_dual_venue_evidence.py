@@ -6425,6 +6425,21 @@ class VisualCaptureVenueHelperTests(unittest.TestCase):
         self.assertEqual(out["B"], "& 'smoke.ps1' -AdditionalArgs @('--contact-sheet-dir', 'C:\\w\\cs', '--windowed', '--visual-capture-dir', 'C:\\w''x\\visual')")
         self.assertTrue(out["C"].startswith("ATTRCUDA_VISUAL_CAPTURE_ARGS_NOT_LAST"), out["C"])
 
+    def test_the_visual_publish_carries_the_unbound_stop_capture(self) -> None:
+        # PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-1: the first venue leg of a binding build wrote stop-unbound.png, and this publish filter
+        # dropped it, so the runner could not compute stopUnboundVsPausedMeanAbsDiff. Every capture the app names is published; nothing else.
+        with tempfile.TemporaryDirectory(prefix="vis-pub-") as d:
+            src = Path(d, "src")
+            src.mkdir()
+            Path(d, "pub").mkdir()
+            for name in ("play-0.png", "stop-unbound.png", "stop.png", "paused.png", "visual.json", "stray.png", "stop-unbound.png.tmp"):
+                Path(src, name).write_bytes(b"x")
+            proc = self.run_module(f"$pub = Publish-AttrCudaVisualCaptures -Record ([ordered]@{{ forwarded = $true }}) -SourceDir '{src}' -PubRoot '{Path(d, 'pub')}'; "
+                                   "(Get-ChildItem -LiteralPath $pub -File | ForEach-Object Name | Sort-Object) -join ','")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(proc.stdout.strip().splitlines()[-1],
+                             "paused.png,play-0.png,stop-unbound.png,stop.png,visual-capture-request.json,visual.json")
+
     def test_the_visual_tail_is_cut_off_the_presentmon_window_and_never_extends_it(self) -> None:
         with tempfile.TemporaryDirectory(prefix="vis-pm-") as d:
             Path(d, "visual.json").write_text(json.dumps({"tail_begin_utc": "2026-10-13T22:00:00.000Z"}), encoding="utf-8")
