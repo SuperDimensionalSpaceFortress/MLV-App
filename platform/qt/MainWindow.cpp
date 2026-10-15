@@ -194,6 +194,14 @@ static bool mlvappPlaybackPresentTraceRequested()
     return requested;
 }
 
+// CUDA-HEADROOM-1: unpaced automation playback, read once. Honoured only once an automation run has isolated its
+// pacing (playbackPaceGuardFps); it lifts the pace guard and nothing else, and discloses itself after the summary.
+static bool mlvappPlaybackUnpacedRequested()
+{
+    static const bool requested = environmentFlagEnabled( "MLVAPP_PLAYBACK_UNPACED" );
+    return requested;
+}
+
 static bool gpuTexNrOverlapTraceEnabled()
 {
     return environmentFlagEnabled( "MLVAPP_GPU_TEX_NR_OVERLAP_TRACE" );
@@ -6283,7 +6291,7 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
     // over (r3 venue leg: a clock started before finishPresentedFrame repaid 15 frames). Until here the guard
     // banks no more than the carry, which the early advance (drawFrameReady) already relied on.
     if( ui->actionPlay->isChecked() )
-        m_playbackPaceGuard.notePresent( mlv_stage_timing_now() * 1000.0, getFramerate() );
+        m_playbackPaceGuard.notePresent( mlv_stage_timing_now() * 1000.0, playbackPaceGuardFps() );
     m_frameStillDrawing = renderThreadBusyForPlaybackAdvance( currentPlaybackAdvanceTarget() );
     if( m_playbackPresentTrace.active() )
         m_playbackPresentTrace.notePresentEnd( mlv_stage_timing_now() * 1000.0 );   // r7 present trace
@@ -11244,7 +11252,7 @@ void MainWindow::playbackHandling(int timeDiff)
             if( ui->actionLoop->isChecked() )
             {
                 // The wrap to cut-in is a frame transition too: it waits for a whole frame of credit (held last frame).
-                if( !m_playbackPaceGuard.grantLoopWrap( paceNowMs, getFramerate() ) ) return;
+                if( !m_playbackPaceGuard.grantLoopWrap( paceNowMs, playbackPaceGuardFps() ) ) return;
                 const int requestedCutInFrame = ui->spinBoxCutIn->value() - 1;
                 bool cutInFrameChanged = false;
                 const int clampedCutInFrame = playback_frame_range::clampFrameIndex(
@@ -11306,7 +11314,7 @@ void MainWindow::playbackHandling(int timeDiff)
                 //Normal mode: next frame (held while the wall clock owes no whole frame)
                 if( !ui->actionDropFrameMode->isChecked() )
                 {
-                    if( !m_playbackPaceGuard.grantWholeFrame( paceNowMs, getFramerate() ) ) return;
+                    if( !m_playbackPaceGuard.grantWholeFrame( paceNowMs, playbackPaceGuardFps() ) ) return;
                     // PLAYBACK-CLIP-LENGTH-ENFORCE-3: every source frame the engine advances is counted (the
                     // slider value AFTER setValue, so a clamp at the slider maximum is not counted as footage).
                     const double sourcePositionBeforeTick = ui->horizontalSliderPosition->value();
@@ -11333,7 +11341,7 @@ void MainWindow::playbackHandling(int timeDiff)
                 const playback_frame_range::DropFrameTickResult dropFrameTick =
                     playback_frame_range::advanceDropFrameTick(
                         m_newPosDropMode,
-                        m_playbackPaceGuard.grant( getFramerate() * (double)timeDiff / 1000.0, paceNowMs, getFramerate() ),
+                        m_playbackPaceGuard.grant( getFramerate() * (double)timeDiff / 1000.0, paceNowMs, playbackPaceGuardFps() ),
                         ui->spinBoxCutIn->value(), ui->spinBoxCutOut->value(),
                         ui->actionLoop->isChecked() );
                 // slip_summary: the granted share, read back from the tick (a wrap subtracted the cut range width;
@@ -18732,6 +18740,14 @@ double MainWindow::getFramerate( void )
     // stay untouched (m_fpsOverride is still what the export settings dialog shows and writes back).
     if( m_fpsOverride && !m_automationPacingIsolated ) return m_frameRate;
     else return getMlvFramerate( m_pMlvObject );
+}
+
+// CUDA-HEADROOM-1: the pace the NativePaceGuard is handed, and nothing else. An automation run that asked for
+// unpaced playback (mlvappPlaybackUnpacedRequested) hands it 0 (no limit) to measure throughput; the interactive
+// app never does.
+double MainWindow::playbackPaceGuardFps( void )
+{
+    return playback_native_pace::guardPaceFps( getFramerate(), m_automationPacingIsolated && mlvappPlaybackUnpacedRequested() );
 }
 
 //Paint the Audio Track Wave to GUI
@@ -27895,6 +27911,15 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                .arg( static_cast<qlonglong>( m_sourceAdvance.startFrame ) )
                // ENFORCE-4 r2: binds this receipt to the invocation that wrote it (see automationRunNonce()).
                .arg( automationRunNonce() );
+
+    // CUDA-HEADROOM-1: an unpaced run says so (the summary format string is pinned); nothing when it is not asked.
+    if( mlvappPlaybackUnpacedRequested() )
+        qInfo().noquote()
+            << QStringLiteral( "playback_smoke.pace_unpaced session=%1 active=%2 drop_frame=%3 run_nonce=%4" )
+                   .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
+                   .arg( bool01( m_automationPacingIsolated ) )
+                   .arg( bool01( ui->actionDropFrameMode->isChecked() ) )
+                   .arg( automationRunNonce() );
 
     // PLAYBACK-BACHELOR-PRESENT-JITTER-1: the slip summary is taken here, before pace_summary, because the wait for the
     // first frame is mostly repaid AFTER the first present: no grant runs while the render thread is busy, so the
