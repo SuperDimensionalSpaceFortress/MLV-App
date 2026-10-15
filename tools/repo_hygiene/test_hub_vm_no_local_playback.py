@@ -18,6 +18,7 @@ Launch command lines in the fixtures are assembled at run time so this file itse
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import re
@@ -65,8 +66,113 @@ INCIDENT_LINE = ("  - Run it where a GUI desktop session and the M16-1243 clip e
                  "If the clip is not on this host, run the two arms as venue jobs through the chain runner.")
 
 
+LINT_REL = "tools/coordination/lane-local-playback-lint.ps1"
+# Where the differential pin takes the baseline lint from: the first ref that resolves (HUB_VM_LINT_BASELINE_REF overrides).
+BASELINE_REFS = ("fork/master", "origin/master", "master")
+
+
 def _config() -> dict:
     return json.loads(HOSTS_JSON.read_text(encoding="utf-8"))
+
+
+def _baseline_lint_source() -> tuple[str, str] | None:
+    """(ref, text) of the lint at the first baseline ref that resolves, or None when no ref does (e.g. a shallow CI clone)."""
+    refs = ((os.environ["HUB_VM_LINT_BASELINE_REF"],) if os.environ.get("HUB_VM_LINT_BASELINE_REF") else BASELINE_REFS)
+    for ref in refs:
+        done = subprocess.run(["git", "-C", str(ROOT), "show", f"{ref}:{LINT_REL}"], capture_output=True, timeout=60)
+        if done.returncode == 0 and done.stdout:
+            return ref, done.stdout.decode("utf-8")
+    return None
+
+
+def _lint_finding_counts(lint: Path, texts: list[str], work: Path, tag: str) -> "subprocess.Popen":
+    """Start ONE pwsh that dot-sources `lint` and counts the findings of every text (one sentence per line). Returns the Popen."""
+    src = work / f"{tag}-in.txt"
+    src.write_text("\n".join(texts) + "\n", encoding="utf-8")
+    probe = work / f"{tag}-probe.ps1"
+    probe.write_text(
+        ". '" + str(lint) + "'\n"
+        "$out = New-Object System.Collections.Generic.List[int]\n"
+        "foreach ($l in [System.IO.File]::ReadAllLines('" + str(src) + "')) { $out.Add(@(Get-LocalPlaybackPromptFindings -Text $l).Count) }\n"
+        "ConvertTo-Json -InputObject @($out.ToArray()) -Compress\n",
+        encoding="ascii",
+    )
+    return subprocess.Popen([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(probe)],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+
+def _collect_counts(proc: "subprocess.Popen", expected: int) -> list[int]:
+    out, err = proc.communicate(timeout=300)
+    if proc.returncode != 0:
+        raise AssertionError(f"lint probe failed: {err}")
+    counts = json.loads(out.strip())
+    if len(counts) != expected:
+        raise AssertionError(f"lint probe returned {len(counts)} verdicts for {expected} sentences")
+    return counts
+
+
+def _differential_corpus(seeds: tuple[str, ...]) -> dict[str, dict]:
+    """text -> the fields it was built from: launch verb x playback word x local/host/here marker x venue word x negator / contrast word x joiner."""
+    rows: dict[str, dict] = {}
+
+    def add(text: str, **fields) -> None:
+        rows.setdefault(text, fields)
+
+    def join(head: str, word: str, tail: str) -> str:
+        return f"{head}{word} {tail}" if word.startswith(",") else f"{head} {word} {tail}"
+
+    verbs = ("Run", "Launch")
+    pbs = ("playback", "the arms")
+    markers = ("locally", "on this host", "here")
+    venues = ("on Bachelor", "through the venue chain")
+    nouns = ("Bachelor", "the venue chain")
+    contrasts = ("not", ", not", "without", "instead of", "rather than", "nor", ", nor", ", never")
+    joiners = (" and", ",", " then", " but")
+    for v, pb, m in itertools.product(verbs, pbs, markers):
+        add(f"{v} {pb} {m}.", tpl="bare", M=m)
+        for ven in venues:
+            add(f"{v} {pb} {m} {ven}.", tpl="marker-then-venue", M=m, V=ven)
+            add(f"{v} {pb} {ven} {m}.", tpl="venue-then-marker", M=m, V=ven)
+            for c in contrasts:
+                add(join(f"{v} {pb} {m}", c, ven) + ".", tpl="marker-contrast-venue", M=m, V=ven, C=c)
+                add(join(f"{v} {pb} {ven}", c, m) + ".", tpl="venue-contrast-marker", M=m, V=ven, C=c)
+                for neg in ("Do not", "Never"):
+                    add(join(f"{neg} {v.lower()} {pb} {m}", c, ven) + ".", tpl="neg-marker-contrast-venue", M=m, V=ven, C=c, N=neg)
+            for j in joiners:
+                add(f"{v} {pb} {m}{j} {ven}.", tpl="marker-join-venue", M=m, V=ven, J=j)
+                add(f"{v} {pb} {ven}{j} {m}.", tpl="venue-join-marker", M=m, V=ven, J=j)
+        for m2 in markers:
+            if m2 == m:
+                continue
+            for c in contrasts:
+                add(join(f"{v} {pb} {m}", c, m2) + ".", tpl="marker-contrast-marker", M=m, M2=m2, C=c)
+        for ven in venues:
+            for verb in ("copy", "read"):
+                add(f"{v} {pb} {ven} and {verb} the log {m}.", tpl="handling-tail", M=m, V=ven)
+        for noun in nouns:
+            for c0 in ("Without", "Instead of", "Rather than", "Skip", "Bypass", "Not"):
+                add(f"{c0} {noun}, {v.lower()} {pb} {m}.", tpl="contrast-first", M=m, C=c0, V=noun)
+    for text in seeds:
+        add(text, tpl="seed")
+    return rows
+
+
+def _differential_flips(work: Path) -> tuple[str, list[tuple[str, dict]], list[tuple[str, dict]], int]:
+    """Run baseline and candidate lints over the corpus. -> (baseline ref, refuse->pass rows, pass->refuse rows, corpus size)."""
+    base = _baseline_lint_source()
+    if base is None:
+        raise unittest.SkipTest("no baseline ref resolves (fork/master, origin/master, master); the differential pin needs git history")
+    ref, text = base
+    baseline = work / "baseline-lint.ps1"
+    baseline.write_text(text, encoding="utf-8")
+    corpus = _differential_corpus(PromptLintTests.CLAUSE_MUST_REFUSE + PromptLintTests.CLAUSE_MUST_PASS + PromptLintTests.PROBE_ROWS)
+    texts = list(corpus)
+    procs = (_lint_finding_counts(baseline, texts, work, "base"), _lint_finding_counts(LINT_PS1, texts, work, "cand"))
+    before = _collect_counts(procs[0], len(texts))
+    after = _collect_counts(procs[1], len(texts))
+    opened = [(t, corpus[t]) for t, b, a in zip(texts, before, after) if b > 0 and a == 0]
+    closed = [(t, corpus[t]) for t, b, a in zip(texts, before, after) if b == 0 and a > 0]
+    return ref, opened, closed, len(texts)
 
 
 def _code_lines(path: Path) -> list[str]:
@@ -264,6 +370,14 @@ class PromptLintTests(unittest.TestCase):
         "Do not use the venue chain, run playback here.",
         "Run the arms on Bachelor and on this host.",
         "Do not wait for Bachelor, play the clip locally in MLVApp.",
+        # r2 (CoS review of PR #448, r1b head 6702288e): a NEGATED venue word is not a routing. The first five were refused on master and
+        # passed on r1b; the last is a soft pre-existing under-refusal (the "without" negates the venue chain, not the launch).
+        "Run playback locally without the venue chain.",
+        "Run playback locally, not on Bachelor.",
+        "Run playback locally instead of on Bachelor.",
+        "Run the arms locally rather than on Bachelor.",
+        "Launch MLVApp locally instead of using the venue chain.",
+        "Run playback on this host without the venue chain.",
     )
     CLAUSE_MUST_PASS = (
         "Run playback locally on Bachelor through the venue chain.",
@@ -275,6 +389,11 @@ class PromptLintTests(unittest.TestCase):
         "Run playback on Bachelor rather than locally.",
     )
 
+    # Rows that are in no catalogue tuple above but belong in the differential corpus as seeds.
+    PROBE_ROWS = (
+        "Run playback through the venue chain and copy the log locally.",
+    )
+
     def test_red_clause_scope_equivalent_wordings_are_refused(self):
         for text in self.CLAUSE_MUST_REFUSE:
             with self.subTest(text=text):
@@ -284,6 +403,14 @@ class PromptLintTests(unittest.TestCase):
         for text in self.CLAUSE_MUST_PASS:
             with self.subTest(text=text):
                 self.assertEqual([], self._findings(text), text)
+
+    # Soft, pre-existing over-refusal (refused on master and on r1b): `locally` sits in a clause that copies a log, not in the clause that
+    # launches playback. Exempting it needs a handling-verb list, and a list opens "Copy the clip locally and run playback." (the incident
+    # shape), so r2 records it as a hardening row. Marked expectedFailure: fixing it flips this to an unexpected success and the suite
+    # then asks for the decorator to be removed and the row moved into CLAUSE_MUST_PASS.
+    @unittest.expectedFailure
+    def test_hardening_a_log_copied_locally_after_a_venue_run_is_not_a_launch(self):
+        self.assertEqual([], self._findings("Run playback through the venue chain and copy the log locally."))
 
     def test_the_binding_block_is_removed_only_up_to_the_next_heading(self):
         text = f"## NO LOCAL PLAYBACK\nNever do it.\n## STEPS\nRun the arms locally with {APP}.\n"
@@ -316,6 +443,60 @@ class PromptLintTests(unittest.TestCase):
             {"hub": True, "hubLower": True, "bachelor": False, "um": False, "partial": False, "empty": False, "truthy": True, "padded": True, "override": False},
             json.loads(done.stdout.strip()),
         )
+
+
+@requires_pwsh
+class LintDifferentialPinTests(unittest.TestCase):
+    """HUB-VM-LINT-CLAUSE-SCOPE-1 r2 (CoS prevention note). A catalogue only proves the rows somebody thought of; r1b added an exemption
+    (a venue word read before `locally`) that silently opened five wordings the baseline refused. This runs the baseline lint (the lint at
+    the first of fork/master, origin/master, master that resolves; HUB_VM_LINT_BASELINE_REF overrides) and the candidate over a generated
+    corpus -- launch verb x playback word x local/host/here marker x venue word x negator / contrast word x joiner -- and fails on any
+    refuse -> pass flip that no entry below explains. Every entry carries its reason and must still match at least one flip, so a stale
+    entry cannot linger. A new exemption therefore has to be named here, in review, with a reason.
+
+    Once a change has merged the baseline IS the candidate and the pin compares a lint with itself; it earns its keep on the next change,
+    which is then judged against the merged lint.
+    """
+
+    ALLOWED_REFUSE_TO_PASS = (
+        ("venue-asserted-in-the-local-marker-clause",
+         lambda text, f: f.get("tpl") in ("marker-then-venue", "venue-then-marker", "marker-join-venue", "venue-join-marker")
+         and f.get("J") in (None, ","),
+         "r1b, Sol review of #401: one clause (a bare comma does not open a new clause) holds BOTH the local marker and an ASSERTED "
+         "venue word, e.g. 'Run playback locally on Bachelor'. The work is routed to a venue, so it is not a local launch."),
+        ("local-marker-negated-by-a-contrast-word-after-a-venue",
+         lambda text, f: f.get("tpl") == "venue-contrast-marker" and f.get("M") == "locally",
+         "r1b/r2: 'Run playback on Bachelor rather than / instead of / without / nor locally' -- the contrast complement is a strong "
+         "negation, so `locally` there is the thing the prompt rules out. (Only `locally` flips: the host and 'here' markers were "
+         "already passed by the baseline's sentence-wide weak-negation / venue exemption.)"),
+        ("sol-probe-verbatim",
+         lambda text, f: text == "Run playback locally on Bachelor through the venue chain.",
+         "The probe sentence of the Sol review of #401, kept as an explicit row next to the rule that explains it."),
+    )
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = Path(tempfile.mkdtemp(prefix="hubvm-diff-"))
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def test_no_refuse_to_pass_flip_against_the_baseline_is_unexplained(self):
+        ref, opened, closed, size = _differential_flips(self.tmp)
+        self.assertGreaterEqual(size, 1000, "the corpus shrank; the pin no longer samples the wording space")
+        unexplained = [text for text, f in opened if not any(pred(text, f) for _, pred, _ in self.ALLOWED_REFUSE_TO_PASS)]
+        self.assertEqual(
+            [], unexplained,
+            f"{len(unexplained)} wording(s) the baseline ({ref}) refuses now PASS and no ALLOWED_REFUSE_TO_PASS entry explains them. "
+            "A safety guard may open only on purpose: fix the lint, or add an entry with its reason.")
+        for name, pred, reason in self.ALLOWED_REFUSE_TO_PASS:
+            self.assertTrue(reason.strip(), name)
+            self.assertTrue(any(pred(text, f) for text, f in opened), f"allow-list entry {name!r} matches no flip any more; delete it")
+        # The five regression wordings of the CoS review are corpus seeds and must not be among the flips at all.
+        flipped = {text for text, _ in opened}
+        for text in PromptLintTests.CLAUSE_MUST_REFUSE:
+            self.assertNotIn(text, flipped, text)
 
 
 @requires_pwsh
