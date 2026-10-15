@@ -5,7 +5,7 @@ v2.x) is the deprecated legacy software factory; its mechanisms stay only as the
 clause has its own enforcement. Product ships as kernel subjects, and every gap it exposes is fixed here and filed to the bus.
 
 MLV-App runs `specs/fleet-factory-kernel.md` on the fleet doctrine bus as **DOGFOOD, not ADOPT** (bus
-`bootstrap/PROMPT-K-dogfood-kernel.md`). Kernel r5. Profile: `code@r10` primary, with a proposed `measured-objective@r3`
+`bootstrap/PROMPT-K-dogfood-kernel.md`). Kernel r5. Profile: `code@r11` primary since the 2026-10-13T19:10:00Z cut-over (previously `code@r10`), with a proposed `measured-objective@r3`
 sub-instance for render/export parity and playback measurement. Since 2026-09-14; refiled against kernel r5 on 2026-10-07
 (bus `50ee077`, card KERNEL-REFILE-R5-MLV-1; filing re-based on bus `9ac7b1c` by KERNEL-REFILE-R5-MLV-PUBLISH-1). That refile re-verified the K4 and K12 rows and added the R14 and R15 rows below;
 the other rows are unchanged from the r1 map, and the bus filing re-judges them clause by clause.
