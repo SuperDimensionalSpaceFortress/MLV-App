@@ -60,8 +60,8 @@ can lower one scene (Night, say) without touching the builder.
 
 The rungs were fixed before any measurement: **D = +18 -> +12 -> +8**. The curve never changes. Rung 1 (+18) is built
 first. A rung fails only on a decisive gate. A failure that comes from vibrance (F3's upper bound, a safety fallback,
-too garish, a cast) steps to the next rung. A curve or table failure stops the card. The rung shipped is the one in the
-table above.
+too garish, a cast) steps to the next rung. A curve or table failure stops the card. The rung in the table above is
+the one the code carries; whether it ships is decided by the re-grade and venue gates below.
 
 **Rung 1 (+18) failed F3's upper bound** on the tracked fixtures: saturation rose +0.404, +0.406 and +0.366 over
 Cinematic, against a ceiling of +0.35. F1 and F2 passed. That failure comes from vibrance, so the ladder stepped to
@@ -128,8 +128,21 @@ rung 2 (+12). At rung 1 (+18) F3 read +0.404 / +0.406 / +0.366.
 
 ### Re-grade and venue gates (M16-1243, Bachelor)
 
-The re-grade gates (R1 histogram lean, R2 frame-locked re-grade lean, R3 crispness) and the engine gates on the venue
-trio (E0..E8) are recorded in the card's PR. Engine metrics are taken only on frame-matched tiles.
+The re-grade gates re-grade a Cinematic AgX-off capture of M16-1243 through `vision50d-v1-shade.u16` with
+`look-flavor-diff.py warmcool --max-abs-lean B`. They were measured on the AgX-off Cinematic capture that
+LOOK-ASSIST-FILM-FLAVOR-3 r1b bound with `regrade-binding.txt` (the capture the owner's preview was made from):
+
+| ID | Gate | Bound | Measured |
+|---|---|---|---|
+| R1 WC-HIST | histogram lean of the table | \|.\| <= B | +0.004673 (+1.19 / 255): pass |
+| R2 WC-REGRADE | mean re-grade lean change, 6 frame-locked tiles | \|.\| <= B | **+0.008235 (+2.10 / 255): FAIL** (tiles +0.0055 .. +0.0104) |
+| R3 CRISP-REGRADE | mean luma spread change | reported | +7.95 codes |
+
+**R2 fails, so the card stopped (PARTIAL) and this flavor is not cleared to ship.** The design classes an R2 failure
+as a curve problem; the ladder cannot fix it, because vibrance is not in a curve-only re-grade. The owner's curve is
+not retuned here. The R/B mirror alone moves the lean +0.0042 and the Y line +0.0037; the Y line's share grows with
+the scene's own warm cast, so on M16-1243 (tile lean +0.010 .. +0.047) the two add past B. No venue round was run,
+so E0..E8 are unmeasured.
 
 ## Tests
 

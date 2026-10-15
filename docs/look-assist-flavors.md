@@ -267,7 +267,8 @@ balance, richer colour. **Kodak Vision3 50D = Cinematic's tone + a vibrance delt
 GUI label is *Kodak Vision3 50D*. The curve is laid exactly where and how Film's is (only over a default curve, the same
 baseline element), and the restore puts either grade's curve back (`lookAssistGradeOwnsGradationCurve`). The recipe, its
 table, the vibrance ladder, the gates and the measured numbers are in
-[look-assist-vision50d.md](look-assist-vision50d.md).
+[look-assist-vision50d.md](look-assist-vision50d.md). It is not cleared to ship: the M16-1243 re-grade lean gate (R2)
+fails with this curve.
 
 ## Choosing the flavor
 
