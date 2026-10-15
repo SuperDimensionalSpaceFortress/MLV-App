@@ -3951,6 +3951,19 @@ $manifest = [ordered]@{
     capturedUtc = (Get-Date).ToUniversalTime().ToString('o')
 }
 Save-Json $manifest (Join-Path $Pub 'evidence-manifest.json')
+# PLAYBACK-GPU-SCOPES-NO-VETO-1 >>>
+# r2 (CoS #447): where the MEASURED session's scope updates came from (cpu | gpu_tap | mixed | none) and how many GL read-backs
+# completed, from that session's own playback_smoke.cpu_summary_ext line (the last one wins), so a leg spec can assert the read-back
+# served. Absent from a build that predates the fields: both stay $null, and a criterion on them fails (an absent metric never passes).
+$scopeSource = $null
+$scopeTapCompleted = $null
+foreach ($candidateLine in ($rawLog -split "`r?`n")) {
+    if ($candidateLine -match ('playback_smoke\.cpu_summary_ext session=' + [regex]::Escape([string]$measuredSmokeSessionId) + '(\s|$)')) {
+        $scopeSource = if ($candidateLine -match '\sscope_source=(?<v>\S+)') { $Matches['v'] } else { $null }
+        $scopeTapCompleted = if ($candidateLine -match '\sscope_tap_completed=(?<v>\d+)') { [int64]$Matches['v'] } else { $null }
+    }
+}
+# PLAYBACK-GPU-SCOPES-NO-VETO-1 <<<
 # A SUCCESS summary.json, which the failure paths above all write but the success path did not:
 # summary.json is the first file a reader opens, and its absence on the one path that produces
 # numbers is exactly where a rehearsal could be mistaken for a measurement (sol, PR #137 r1).
@@ -3965,6 +3978,10 @@ Save-Json ([ordered]@{
     sourceFrames = $sourceFramesBlock
     gpuFramesTotal = $gpuFramesTotal
     cpuFrames = $gpuSummary.cpuFrames
+    # PLAYBACK-GPU-SCOPES-NO-VETO-1 >>>
+    scopeSource = $scopeSource
+    scopeTapCompleted = $scopeTapCompleted
+    # PLAYBACK-GPU-SCOPES-NO-VETO-1 <<<
     presentMonSamples = $pmRows.Count
     presentMonSelectedChain = $displayReport.selectedChain
     presentMonStatus = $presentMonStatus

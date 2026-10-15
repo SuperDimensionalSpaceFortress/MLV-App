@@ -130,13 +130,22 @@ SCOPE_LA_LEGS = tuple(f"legs/m16-1243-scopes-{backend}-windowed-s1-{arm}-la.json
 GPU_TAP_SCOPE_LEGS = ("legs/m16-1243-scopes-cuda-windowed-s1-histogram-la-hide.json",
                       *(f"legs/m16-1243-scopes-cuda-{mode}-s{scale}-histogram-la.json"
                         for mode, scale in (("windowed", 2), ("windowed", 4), ("fullscreen", 1), ("fullscreen", 2), ("fullscreen", 4))),
-                      *(f"legs/m16-1243-scopes-cuda-windowed-s1-{scope}-la.json" for scope in ("waveform", "vectorscope")))
+                      *(f"legs/m16-1243-scopes-cuda-windowed-s1-{scope}-la.json" for scope in ("waveform", "vectorscope")),
+                      # r2: the A/B HEAD arm's own leg (the HEAD histogram-la leg exists on master and is never mutated), which proves the read-back served.
+                      "legs/m16-1243-scopes-cuda-windowed-s1-histogram-la-gputap.json")
+# r2 (CoS #447): a throttled WINDOWED read-back leg asserts the read-back served (scopeSource eq gpu_tap, scopeTapCompleted gt 0); the CONTROL (hide) and the
+# fullscreen cells (the edit area, so the scope, is hidden) do not.
+GPU_TAP_SERVED_GATES = [{"metric": "scopeSource", "op": "eq", "value": "gpu_tap"}, {"metric": "scopeTapCompleted", "op": "gt", "value": 0}]
+# r2: the D4 matrix's cpu cells (the read-back never serves the CPU route; a no-regression check): the cpu histogram-la leg with only its cell changed.
+GPU_TAP_CPU_SCOPE_LEGS = tuple(f"legs/m16-1243-scopes-cpu-{mode}-s{scale}-histogram-la.json"
+                               for mode, scale in (("windowed", 2), ("windowed", 4), ("fullscreen", 1), ("fullscreen", 2), ("fullscreen", 4)))
 # LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1 added the scale-2 Cinematic twin of the scale-2 look leg (the Bachelor CPU Classic | Cinematic look pair).
 SHIPPED_LEGS = ("legs/m16-1243-speed.json", "legs/m16-1243-look.json", "legs/m16-1243-look-scale2.json", "legs/m16-1243-look-cinematic.json", *DISPLAY_MATRIX_LEGS, *PACE_LEGS,
                 *LOOKAHEAD_LEGS, *HEAVY_LEGS, *DECODER_LEGS, "legs/m16-1243-look-scale2-cinematic.json", "legs/m16-1243-look-film.json",
                 "legs/m16-1243-look-scale2-film.json", *(f"legs/m16-1243-look-scale2-{flavor}-agxoff.json" for flavor in ("cinematic", "film")),
                 *(f"legs/m16-1243-display-{mode}-s{scale}-vsync1.json" for scale in (1, 2, 4) for mode in ("fullscreen", "windowed")),
-                *CPU_REDUCED_LEGS, *UPSTREAM_BASELINE_LEGS, *PTRACE_LEGS, *VISUAL_LEGS, *SCOPE_LEGS, *SCOPE_LA_LEGS, *GPU_TAP_SCOPE_LEGS)
+                *CPU_REDUCED_LEGS, *UPSTREAM_BASELINE_LEGS, *PTRACE_LEGS, *VISUAL_LEGS, *SCOPE_LEGS, *SCOPE_LA_LEGS, *GPU_TAP_SCOPE_LEGS,
+                *GPU_TAP_CPU_SCOPE_LEGS)
 # PLAYBACK-VSYNC-DEFAULT-1: the swap-interval-1 twins of the six display-matrix legs (the vsync A/B; the originals stay at the app's default 0).
 VSYNC1_LEGS = tuple(rel.replace(".json", "-vsync1.json") for rel in DISPLAY_MATRIX_LEGS)
 # LOOK-ASSIST-FILM-FLAVOR-2 r2: the AgX-off twins of the scale-2 Cinematic and Film legs carry a committed look receipt (look-receipts/agx-off.marxml).
@@ -290,13 +299,13 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
     HFR_CONFORM_OPEN = "HFR-CONFORM-AWARE-RECEIPT-ORACLES-1 >>>"
     HFR_CONFORM_CLOSE = "HFR-CONFORM-AWARE-RECEIPT-ORACLES-1 <<<"
     HFR_CONFORM_REGIONS = 3
-    # PLAYBACK-GPU-SCOPES-NO-VETO-1 r2: the measured-session eligibility verdict (row B). Eight regions: in the spliced module functions,
-    # Get-AttrCudaLastEligibilityLine's help (1) and Get-AttrCudaEligibilityVerdict's help, parameter, measured-session override and result fields (4), plus
-    # the Get-AttrCudaEligibilityLineForSession splice (1); in the job template the measured-session verdict call and the diagnostics fields (2). Every
-    # baseline line stays verbatim outside them. Absent from the baseline.
+    # PLAYBACK-GPU-SCOPES-NO-VETO-1 r2: the measured-session eligibility verdict (row B) and the summary's scope-feed fields (CoS #447). Ten regions: in the spliced
+    # module functions, Get-AttrCudaLastEligibilityLine's help (1) and Get-AttrCudaEligibilityVerdict's help, parameter, measured-session override and result
+    # fields (4), plus the Get-AttrCudaEligibilityLineForSession splice (1); in the job template the measured-session verdict call, the diagnostics fields, the
+    # cpu_summary_ext scope read and the two summary fields (4). Every baseline line stays verbatim outside them. Absent from the baseline.
     GPU_SCOPES_NO_VETO_OPEN = "PLAYBACK-GPU-SCOPES-NO-VETO-1 >>>"
     GPU_SCOPES_NO_VETO_CLOSE = "PLAYBACK-GPU-SCOPES-NO-VETO-1 <<<"
-    GPU_SCOPES_NO_VETO_REGIONS = 8
+    GPU_SCOPES_NO_VETO_REGIONS = 10
 
     @classmethod
     def strip_regions(cls, text: str) -> tuple[str, dict[str, int]]:
@@ -5690,22 +5699,46 @@ class LegSpecSchemaTests(unittest.TestCase):
     def test_the_gpu_tap_scope_legs_are_the_head_histogram_la_leg_with_only_their_cell_changed(self) -> None:
         """PLAYBACK-GPU-SCOPES-NO-VETO-1: every leg is m16-1243-scopes-cuda-windowed-s1-histogram-la (the HEAD arm) except its legId, card, cell
         (scaleFactor, displayMode, scope, scopesDuringPlayback) and criteria, which keep lookAssistForced eq true and add gpuFramesTotal gt 0 and
-        cpuFrames eq 0. The CONTROL changes only scopesDuringPlayback to hide: same scope, same window layout and viewport as the HEAD arm."""
+        cpuFrames eq 0. The CONTROL changes only scopesDuringPlayback to hide: same scope, same window layout and viewport as the HEAD arm.
+        r2 (CoS #447): every throttled WINDOWED leg also asserts the read-back served (GPU_TAP_SERVED_GATES); hide and fullscreen do not."""
         head = json.loads((DV / "legs/m16-1243-scopes-cuda-windowed-s1-histogram-la.json").read_text(encoding="utf-8"))
         gates = [{"metric": "lookAssistForced", "op": "eq", "value": True}, {"metric": "gpuFramesTotal", "op": "gt", "value": 0},
                  {"metric": "cpuFrames", "op": "eq", "value": 0}]
+        served = 0
         for rel in GPU_TAP_SCOPE_LEGS:
             spec = json.loads((DV / rel).read_text(encoding="utf-8"))
             self.jsonschema.validate(spec, self.schema)
             self.assertEqual(spec["legId"], Path(rel).stem, rel)
             self.assertEqual(spec["card"], "PLAYBACK-GPU-SCOPES-NO-VETO-1", rel)
-            self.assertEqual(spec["criteria"], {"acceptance": {"cuda": gates}, "supplementary": {"cuda": gates}}, rel)
             expected_mode = "hide" if rel.endswith("-la-hide.json") else "throttled"
+            expected_gates = gates + GPU_TAP_SERVED_GATES if expected_mode == "throttled" and spec["displayMode"] == "windowed" else gates
+            served += expected_gates is not gates
+            self.assertEqual(spec["criteria"], {"acceptance": {"cuda": expected_gates}, "supplementary": {"cuda": expected_gates}}, rel)
             self.assertEqual(spec["generatorArgs"], dict(head["generatorArgs"], scope=spec["generatorArgs"]["scope"], scopesDuringPlayback=expected_mode), rel)
             self.assertEqual(dict(spec, legId=head["legId"], card=head["card"], scaleFactor=head["scaleFactor"], displayMode=head["displayMode"],
                                   generatorArgs=head["generatorArgs"], criteria=head["criteria"]), head, rel)
         control = json.loads((DV / GPU_TAP_SCOPE_LEGS[0]).read_text(encoding="utf-8"))
         self.assertEqual((control["scaleFactor"], control["displayMode"], control["generatorArgs"]["scope"]), (1, "windowed", "histogram"))
+        self.assertEqual(served, 5, "windowed s2, s4, waveform, vectorscope and the s1 gputap HEAD leg assert the read-back served")
+        gputap = json.loads((DV / "legs/m16-1243-scopes-cuda-windowed-s1-histogram-la-gputap.json").read_text(encoding="utf-8"))
+        self.assertEqual((gputap["scaleFactor"], gputap["displayMode"], gputap["generatorArgs"]), (1, "windowed", head["generatorArgs"]))
+
+    def test_the_gpu_tap_cpu_matrix_legs_are_the_cpu_histogram_la_leg_with_only_their_cell_changed(self) -> None:
+        """PLAYBACK-GPU-SCOPES-NO-VETO-1 r2: the D4 matrix's cpu cells are m16-1243-scopes-cpu-windowed-s1-histogram-la (unchanged, on master) except their
+        legId, card, scaleFactor and displayMode; the acceptance stays lookAssistForced eq true (a no-regression check, no fps threshold)."""
+        base = json.loads((DV / "legs/m16-1243-scopes-cpu-windowed-s1-histogram-la.json").read_text(encoding="utf-8"))
+        gate = [{"metric": "lookAssistForced", "op": "eq", "value": True}]
+        self.assertEqual(base["criteria"], {"acceptance": {"cpu": gate}, "supplementary": {"cpu": gate}})
+        cells = set()
+        for rel in GPU_TAP_CPU_SCOPE_LEGS:
+            spec = json.loads((DV / rel).read_text(encoding="utf-8"))
+            self.jsonschema.validate(spec, self.schema)
+            self.assertEqual(spec["legId"], Path(rel).stem, rel)
+            self.assertEqual(spec["card"], "PLAYBACK-GPU-SCOPES-NO-VETO-1", rel)
+            self.assertEqual(spec["backends"], ["cpu"], rel)
+            cells.add((spec["displayMode"], spec["scaleFactor"]))
+            self.assertEqual(dict(spec, legId=base["legId"], card=base["card"], scaleFactor=base["scaleFactor"], displayMode=base["displayMode"]), base, rel)
+        self.assertEqual(cells, {("windowed", 2), ("windowed", 4), ("fullscreen", 1), ("fullscreen", 2), ("fullscreen", 4)})
 
     def test_the_hand_listed_shipped_legs_are_exactly_the_legs_directory(self) -> None:
         self.assertEqual(sorted(SHIPPED_LEGS), sorted("legs/" + p.name for p in (DV / "legs").glob("*.json")), "SHIPPED_LEGS drifted from the legs/ directory")

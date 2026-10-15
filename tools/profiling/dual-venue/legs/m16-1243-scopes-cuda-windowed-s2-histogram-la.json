@@ -11,7 +11,7 @@
   "generatorArgs": { "telemetryArm": "LIGHT", "cpuQuiescenceThresholdPercent": 95, "forceLookAssist": true, "scope": "histogram", "scopesDuringPlayback": "throttled" },
   "timeouts": { "queueWaitSec": 900, "extraClaimedWaitSec": 600 },
   "criteria": {
-    "acceptance": { "cuda": [ { "metric": "lookAssistForced", "op": "eq", "value": true }, { "metric": "gpuFramesTotal", "op": "gt", "value": 0 }, { "metric": "cpuFrames", "op": "eq", "value": 0 } ] },
-    "supplementary": { "cuda": [ { "metric": "lookAssistForced", "op": "eq", "value": true }, { "metric": "gpuFramesTotal", "op": "gt", "value": 0 }, { "metric": "cpuFrames", "op": "eq", "value": 0 } ] }
+    "acceptance": { "cuda": [ { "metric": "lookAssistForced", "op": "eq", "value": true }, { "metric": "gpuFramesTotal", "op": "gt", "value": 0 }, { "metric": "cpuFrames", "op": "eq", "value": 0 }, { "metric": "scopeSource", "op": "eq", "value": "gpu_tap" }, { "metric": "scopeTapCompleted", "op": "gt", "value": 0 } ] },
+    "supplementary": { "cuda": [ { "metric": "lookAssistForced", "op": "eq", "value": true }, { "metric": "gpuFramesTotal", "op": "gt", "value": 0 }, { "metric": "cpuFrames", "op": "eq", "value": 0 }, { "metric": "scopeSource", "op": "eq", "value": "gpu_tap" }, { "metric": "scopeTapCompleted", "op": "gt", "value": 0 } ] }
   }
 }
