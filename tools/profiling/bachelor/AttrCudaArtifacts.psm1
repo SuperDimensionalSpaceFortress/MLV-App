@@ -2478,6 +2478,113 @@ function Publish-AttrCudaVisualCaptures {
 }
 # PLAYBACK-VISUAL-INSPECTION-1 <<<
 
+# CPU-SCOPE-LIVE-HEAP-CORRUPTION-1 >>>
+function Start-AttrCudaHeapDumpWatch {
+    <#
+    .SYNOPSIS
+    Start a hidden watcher that ATTACHES procdump (by pid, as the agent user, no elevation, no registry) to the smoke's MLVApp instance and
+    keeps ONE full-memory dump of the first STATUS_HEAP_CORRUPTION (first-chance c0000374) it raises.
+    .DESCRIPTION
+    A heap fail-fast never reaches the app's own unhandled-exception minidump (CrashForensics), and WER LocalDumps is HKLM, so before this
+    every crash leg had dumps=0. The watcher is a separate hidden pwsh (the job itself blocks on the smoke run): it waits up to -MaxWaitSec
+    for a process named like -ExePath whose command line has no --help (the feature probes run `--gui-smoke-playback --help`), then runs
+    `procdump -accepteula -e 1 -f C0000374 -ma -n 1 <pid> <DumpDir>` and exits when procdump does (the dump is written, or the app exited).
+    Attaching after launch keeps the app on its ordinary heap (a debugger LAUNCH would turn on the debug heap). Never throws: the record
+    says why no watcher runs (procdump missing, start failed). Returns the record Stop-AttrCudaHeapDumpWatch completes.
+    #>
+    param([Parameter(Mandatory = $true)][string]$ExePath, [Parameter(Mandatory = $true)][string]$DumpDir, [ValidateRange(10, 7200)][int]$MaxWaitSec = 900,
+        [string]$ProcdumpPath = '', [string]$PwshPath = '')
+    $record = [ordered]@{ schema = 'mlv-app/heap-corruption-dump/v1'; requested = $true; dumpDir = $DumpDir; procdump = $null; watcherPid = $null
+        startedUtc = $null; reason = $null; watcherExited = $null; watcherLog = @(); procdumpOutputTail = $null; dumps = @() }
+    try {
+        if ([string]::IsNullOrWhiteSpace($ProcdumpPath)) {
+            $found = Get-Command 'procdump64.exe' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($null -ne $found) { $ProcdumpPath = $found.Source }
+        }
+        if ([string]::IsNullOrWhiteSpace($ProcdumpPath) -or -not (Test-Path -LiteralPath $ProcdumpPath -PathType Leaf)) {
+            $record.reason = 'PROCDUMP_NOT_FOUND procdump64.exe is not on the agent user PATH'
+            return $record
+        }
+        $record.procdump = $ProcdumpPath
+        if ([string]::IsNullOrWhiteSpace($PwshPath)) { $PwshPath = Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe' }
+        [void](New-Item -ItemType Directory -Force -Path $DumpDir)
+        $quote = { param($s) "'" + ([string]$s).Replace("'", "''") + "'" }
+        $watcher = @(
+            '$ErrorActionPreference = ''Continue'''
+            ('$exeName = ' + (& $quote (Split-Path -Leaf $ExePath)))
+            ('$dumpDir = ' + (& $quote $DumpDir))
+            ('$procdump = ' + (& $quote $ProcdumpPath))
+            ('$deadline = [DateTime]::UtcNow.AddSeconds(' + $MaxWaitSec + ')')
+            '$log = Join-Path $dumpDir ''watcher.log'''
+            'function W([string]$m) { Add-Content -LiteralPath $log -Value ([DateTime]::UtcNow.ToString(''o'') + '' '' + $m) }'
+            'W (''WATCH exe='' + $exeName + '' pid='' + $PID)'
+            '$target = $null'
+            'while ($null -eq $target -and [DateTime]::UtcNow -lt $deadline) {'
+            '    $target = @(Get-CimInstance Win32_Process -Filter ("Name = ''" + $exeName + "''") -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -and $_.CommandLine -notmatch ''--help'' }) | Select-Object -First 1'
+            '    if ($null -eq $target) { Start-Sleep -Milliseconds 200 }'
+            '}'
+            'if ($null -eq $target) { W ''NO_TARGET the smoke instance never appeared''; exit 3 }'
+            'W (''ATTACH pid='' + $target.ProcessId)'
+            '$out = & $procdump -accepteula -e 1 -f C0000374 -ma -n 1 $target.ProcessId $dumpDir 2>&1'
+            '$rc = $LASTEXITCODE'
+            'Set-Content -LiteralPath (Join-Path $dumpDir ''procdump.txt'') -Value ($out | Out-String)'
+            'W (''PROCDUMP_EXIT rc='' + $rc)'
+            'exit 0'
+        ) -join "`n"
+        $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($watcher))
+        $info = New-Object System.Diagnostics.ProcessStartInfo
+        $info.FileName = $PwshPath
+        $info.Arguments = "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $encoded"
+        $info.UseShellExecute = $false
+        $info.CreateNoWindow = $true
+        $process = [System.Diagnostics.Process]::Start($info)
+        $record.watcherPid = $process.Id
+        $record.startedUtc = [DateTime]::UtcNow.ToString('o')
+        $process.Dispose()
+    } catch {
+        $record.reason = "WATCHER_START_FAILED $($_.Exception.GetType().Name)"
+    }
+    return $record
+}
+
+function Stop-AttrCudaHeapDumpWatch {
+    <#
+    .SYNOPSIS
+    Complete a Start-AttrCudaHeapDumpWatch record after the smoke run returned: wait (bounded) for the watcher to finish (procdump may still
+    be writing the dump), kill its tree only past -WaitSec (the app has exited by then, so nothing it is attached to is lost), then record
+    the watcher log, procdump's output tail and every *.dmp (name, bytes) and write <DumpDir>\heap-dump.json. Never throws.
+    #>
+    param([Parameter(Mandatory = $true)]$Record, [ValidateRange(0, 1800)][int]$WaitSec = 300)
+    try {
+        if ($null -ne $Record['watcherPid']) {
+            $watcher = Get-Process -Id ([int]$Record['watcherPid']) -ErrorAction SilentlyContinue
+            if ($null -eq $watcher) { $Record['watcherExited'] = $true }
+            elseif ($watcher.WaitForExit($WaitSec * 1000)) { $Record['watcherExited'] = $true }
+            else {
+                try { & taskkill.exe /PID $Record['watcherPid'] /T /F 2>&1 | Out-Null } catch { }
+                $Record['watcherExited'] = $false
+                $Record['reason'] = "WATCHER_KILLED still running $WaitSec s after the smoke run returned"
+            }
+        }
+        $dir = [string]$Record['dumpDir']
+        if ($dir -and (Test-Path -LiteralPath $dir -PathType Container)) {
+            $logPath = Join-Path $dir 'watcher.log'
+            if (Test-Path -LiteralPath $logPath) { $Record['watcherLog'] = @(Get-Content -LiteralPath $logPath -Tail 20) }
+            $pdPath = Join-Path $dir 'procdump.txt'
+            if (Test-Path -LiteralPath $pdPath) {
+                $pdText = [IO.File]::ReadAllText($pdPath)
+                $Record['procdumpOutputTail'] = $(if ($pdText.Length -gt 4000) { $pdText.Substring($pdText.Length - 4000) } else { $pdText })
+            }
+            $Record['dumps'] = @(Get-ChildItem -LiteralPath $dir -File -Filter '*.dmp' -ErrorAction SilentlyContinue | ForEach-Object { [ordered]@{ name = $_.Name; bytes = $_.Length } })
+            [IO.File]::WriteAllText((Join-Path $dir 'heap-dump.json'), ($Record | ConvertTo-Json -Depth 4), [Text.UTF8Encoding]::new($false))
+        }
+    } catch {
+        $Record['reason'] = "WATCHER_STOP_FAILED $($_.Exception.GetType().Name)"
+    }
+    return $Record
+}
+# CPU-SCOPE-LIVE-HEAP-CORRUPTION-1 <<<
+
 function Publish-AttrCudaFileMove {
     <#
     .SYNOPSIS
@@ -6970,6 +7077,8 @@ Export-ModuleMember -Function `
     Add-AttrCudaVisualCaptureArgument, `
     Get-AttrCudaPresentMonWindowResult, `
     Publish-AttrCudaVisualCaptures, `
+    Start-AttrCudaHeapDumpWatch, `
+    Stop-AttrCudaHeapDumpWatch, `
     Get-AttrCudaPresentMonDisplayReport, `
     Get-AttrCudaAppSwapTelemetry, `
     Get-AttrCudaForegroundVerification, `

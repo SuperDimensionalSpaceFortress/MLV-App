@@ -5691,8 +5691,10 @@ class LegSpecSchemaTests(unittest.TestCase):
             self.assertEqual((spec["legType"], spec["clipId"], spec["playSeconds"], spec["backends"], spec["scaleFactor"], spec["displayMode"]),
                              ("speed", "M16-1243", 25, ["cpu"], 1, mode), rel)
             look = {"disableLookAssist": True} if look_off else {}
+            # r6: the windowed leg (the one soaked) also keeps a procdump heap-corruption dump.
+            dump = {"heapCorruptionDump": True} if mode == "windowed" else {}
             self.assertEqual(spec["generatorArgs"], {"telemetryArm": "LIGHT", "cpuQuiescenceThresholdPercent": 95, **look, "scope": "histogram", "scopeIntervalMs": 0,
-                                                     "scopesDuringPlayback": "throttled"}, rel)
+                                                     "scopesDuringPlayback": "throttled", **dump}, rel)
             self.assertNotIn("look", spec, rel)
             self.assertEqual(spec["criteria"], {"acceptance": {"cpu": []}, "supplementary": {"cpu": []}}, rel)
 
@@ -6432,6 +6434,112 @@ class VisualCaptureGeneratorTests(unittest.TestCase):
         self.assertIn(mapping, runner)
         self.assertGreater(runner.index(mapping), runner.index("if (-not $isLook -and $spec.generatorArgs.PSObject.Properties['forceLookAssist']"))
         self.assertLess(runner.index(mapping), runner.index("$gen['ContactSheet'] = $true; $gen['ContactSheetFrames']"))
+
+
+# CPU-SCOPE-LIVE-HEAP-CORRUPTION-1 r6: the heap-corruption dump. A heap fail-fast (c0000374) never reaches the app's own crash minidump and
+# WER LocalDumps is HKLM, so a leg may ask for a procdump watcher that attaches to the smoke's MLVApp by pid. All test names carry "heap_dump".
+HEAP_OPEN = "CPU-SCOPE-LIVE-HEAP-CORRUPTION-1 >>>"
+HEAP_CLOSE = "CPU-SCOPE-LIVE-HEAP-CORRUPTION-1 <<<"
+
+
+@requires_windows_pwsh
+class HeapDumpGeneratorTests(unittest.TestCase):
+    """-HeapCorruptionDump adds exactly two bracketed regions around the smoke launch and nothing else."""
+
+    setUpClass = classmethod(GeneratorByteIdentityAndVariantTests.setUpClass.__func__)
+    tearDownClass = classmethod(GeneratorByteIdentityAndVariantTests.tearDownClass.__func__)
+    generate = GeneratorByteIdentityAndVariantTests.generate
+    parse_errors = GeneratorByteIdentityAndVariantTests.parse_errors
+
+    def test_the_heap_dump_job_is_the_default_job_plus_two_bracketed_regions(self) -> None:
+        extra = ["-Backend", "cpu", "-DisplayMode", "windowed", "-DisableLookAssist", "-Scope", "histogram", "-ScopeIntervalMs", "0"]
+        base = lf(self.generate(GENERATOR, "heap-base.job.ps1", extra).read_text(encoding="utf-8"))
+        on_path = self.generate(GENERATOR, "heap-on.job.ps1", [*extra, "-HeapCorruptionDump"])
+        self.assertEqual(self.parse_errors(on_path), 0)
+        self.assertNotIn("HeapDump", base, "without -HeapCorruptionDump the job never names the watcher")
+        on = lf(on_path.read_text(encoding="utf-8"))
+        kept: list[str] = []
+        regions: list[list[str]] = []
+        inside: list[str] | None = None
+        for line in on.split("\n"):
+            if HEAP_OPEN in line:
+                self.assertIsNone(inside, "nested heap-dump region")
+                inside = []
+            elif HEAP_CLOSE in line:
+                self.assertIsNotNone(inside, "unopened heap-dump region")
+                regions.append(inside)
+                inside = None
+            elif inside is None:
+                kept.append(line)
+            else:
+                inside.append(line)
+        self.assertIsNone(inside, "unclosed heap-dump region")
+        self.assertEqual(len(regions), 2)
+        self.assertEqual("\n".join(kept), base, "the two regions are the ONLY difference from the job without -HeapCorruptionDump")
+        for fn in ("Start-AttrCudaHeapDumpWatch", "Stop-AttrCudaHeapDumpWatch"):
+            self.assertIn(f"function {fn} {{", "\n".join(regions[0]), "the helpers are spliced in the first region, never into the default embed list")
+        # the order the job runs them in: every feature probe and PresentMon, then the watcher, the launch, its completion, then any early exit
+        launch = '& "$env:ProgramFiles\\PowerShell\\7\\pwsh.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $cmd'
+        order = ["$PresentMonSessionName = Get-PresentMonSessionName $JobId", "$heapDumpRecord = Start-AttrCudaHeapDumpWatch -ExePath $exePath -DumpDir (Join-Path $Pub 'heapdump')",
+                 launch, 'Write-JobTrace "step smoke-launch done rc=$smokeRc"', "$heapDumpRecord = Stop-AttrCudaHeapDumpWatch -Record $heapDumpRecord",
+                 "if ($null -ne $smokeLaunchException -or $smokeRc -ne 0 -or -not (Test-Path -LiteralPath $resultPath)) {"]
+        at = [on.index(s) for s in order]
+        self.assertEqual(at, sorted(at), "watcher after PresentMon, before the launch; completed after the launch, before the failed-run exit")
+
+    def test_the_runner_schema_and_scopelive_leg_carry_the_heap_dump(self) -> None:
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        mapping = ("if ($spec.generatorArgs.PSObject.Properties['heapCorruptionDump'] -and [bool]$spec.generatorArgs.heapCorruptionDump) "
+                   "{ $gen['HeapCorruptionDump'] = $true }")
+        self.assertIn(mapping, runner)
+        self.assertLess(runner.index(mapping), runner.index("if (-not $isLook -and $spec.generatorArgs.PSObject.Properties['forceLookAssist']"),
+                        "the mapping must sit outside the forceLookAssist branch")
+        self.assertIn("$heapDumpShare = Join-Path $artifactsShare 'heapdump'", runner, "the runner copies the dump directory into the evidence")
+        schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
+        self.assertEqual(schema["properties"]["generatorArgs"]["properties"]["heapCorruptionDump"]["type"], "boolean")
+        windowed = json.loads((DV / "legs/m16-1243-scopelive-cpu-windowed-s1-histogram-i0.json").read_text(encoding="utf-8"))
+        self.assertIs(windowed["generatorArgs"]["heapCorruptionDump"], True)
+
+
+@requires_windows_pwsh
+class HeapDumpVenueHelperTests(unittest.TestCase):
+    """The venue-side watcher (AttrCudaArtifacts.psm1), with ping.exe as the target and whoami.exe standing in for procdump (it refuses
+    procdump's arguments and exits 1), so nothing is ever attached or dumped here."""
+
+    def run_module(self, script: str) -> subprocess.CompletedProcess:
+        return run_pwsh(["-Command", f"$ErrorActionPreference = 'Stop'; Import-Module '{ATTR_MODULE}' -Force\n" + script], timeout=180)
+
+    def test_the_heap_dump_watch_without_procdump_says_why_and_starts_nothing(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="heap-none-") as d:
+            proc = self.run_module(f"$r = Start-AttrCudaHeapDumpWatch -ExePath 'C:\\x\\MLVApp.exe' -DumpDir '{d}\\hd' -ProcdumpPath '{d}\\missing\\procdump64.exe'\n"
+                                   "Write-Output ('PID=' + $r.watcherPid); Write-Output ('REASON=' + $r.reason)\n"
+                                   "$r = Stop-AttrCudaHeapDumpWatch -Record $r -WaitSec 5; Write-Output ('DUMPS=' + @($r.dumps).Count)")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            out = dict(l.split("=", 1) for l in proc.stdout.splitlines() if "=" in l)
+            self.assertEqual((out["PID"], out["DUMPS"]), ("", "0"))
+            self.assertTrue(out["REASON"].startswith("PROCDUMP_NOT_FOUND"), out["REASON"])
+
+    def test_the_heap_dump_watch_attaches_to_the_smoke_instance_never_a_help_probe(self) -> None:
+        import os
+        sys32 = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32"
+        with tempfile.TemporaryDirectory(prefix="heap-watch-") as d:
+            proc = self.run_module(
+                f"$r = Start-AttrCudaHeapDumpWatch -ExePath '{sys32 / 'PING.EXE'}' -DumpDir '{d}\\hd' -ProcdumpPath '{sys32 / 'whoami.exe'}' -MaxWaitSec 60\n"
+                f"$help = Start-Process -FilePath '{sys32 / 'PING.EXE'}' -ArgumentList '-n','6','127.0.0.1','--help' -WindowStyle Hidden -PassThru\n"
+                "Start-Sleep -Seconds 2\n"
+                f"$t = Start-Process -FilePath '{sys32 / 'PING.EXE'}' -ArgumentList '-n','4','127.0.0.1' -WindowStyle Hidden -PassThru\n"
+                "$t.WaitForExit(); try { $help.Kill() } catch { }\n"
+                "$r = Stop-AttrCudaHeapDumpWatch -Record $r -WaitSec 60\n"
+                "Write-Output ('TARGET=' + $t.Id); Write-Output ('HELP=' + $help.Id); Write-Output ('EXITED=' + $r.watcherExited); Write-Output ('REASON=' + $r.reason)\n"
+                "$r.watcherLog | ForEach-Object { Write-Output ('LOG=' + $_) }\n"
+                f"Write-Output ('JSON=' + (Test-Path -LiteralPath '{d}\\hd\\heap-dump.json'))")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            lines = proc.stdout.splitlines()
+            out = dict(l.split("=", 1) for l in lines if "=" in l and not l.startswith("LOG="))
+            log = [l[len("LOG="):] for l in lines if l.startswith("LOG=")]
+            self.assertEqual((out["EXITED"], out["REASON"], out["JSON"]), ("True", "", "True"), proc.stdout)
+            self.assertTrue(any(l.endswith(f"ATTACH pid={out['TARGET']}") for l in log), log)
+            self.assertFalse(any(f"pid={out['HELP']}" in l for l in log if "ATTACH" in l), log)
+            self.assertTrue(any(l.endswith("PROCDUMP_EXIT rc=1") for l in log), log)
 
 
 @requires_windows_pwsh
