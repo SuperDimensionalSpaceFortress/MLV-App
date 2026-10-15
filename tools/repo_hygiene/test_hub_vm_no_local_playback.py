@@ -187,6 +187,16 @@ def _differential_corpus(seeds: tuple[str, ...]) -> dict[str, dict]:
             # r3: a leading prohibition reaches the comma clause after a contrast complement
             for neg in ("Never", "Do not"):
                 add(f"{neg} {v.lower()} {pb} without {noun}, {m} or on this host.", tpl="neg-contrast-comma-marker", M=m, N=neg, V=noun)
+    # r4: the defeater axis -- a venue word that is an attribute (possessive / noun) after a routing preposition, and a local-host
+    # marker after the venue phrase in the same clause.
+    for v, pb, m in itertools.product(verbs, pbs, markers):
+        for prep in ("on", "using", "through"):
+            for noun in nouns:
+                add(f"{v} {pb} {m} {prep} {noun}'s clip.", tpl="defeater-possessive", M=m, V=noun)
+                add(f"{v} {pb} {m} {prep} {noun} output.", tpl="defeater-attributive", M=m, V=noun)
+        for ven in venues:
+            for tail in (", on this host", ", then here", " on this host", " here"):
+                add(f"{v} {pb} {m} {ven}{tail}.", tpl="defeater-trailing-host", M=m, V=ven, T=tail)
     for text in seeds:
         add(text, tpl="seed")
     return rows
@@ -210,10 +220,14 @@ def _differential_flips(work: Path, baseline_text: str | None = None) -> tuple[s
         ref, text = base
     baseline = work / "baseline-lint.ps1"
     baseline.write_text(text, encoding="utf-8")
-    corpus = _differential_corpus(PromptLintTests.CLAUSE_MUST_REFUSE + PromptLintTests.CLAUSE_MUST_PASS + PromptLintTests.PROBE_ROWS)
+    corpus = _differential_corpus(PromptLintTests.CLAUSE_MUST_REFUSE + PromptLintTests.CLAUSE_MUST_PASS + PromptLintTests.PROBE_ROWS
+                                  + tuple(text for _, _, text in PromptLintTests.DEFEATER_AXIS) + PromptLintTests.DEFEATER_AXIS_CONTROLS)
     texts = list(corpus)
-    procs = [_lint_finding_counts(baseline, texts, work, "base"), _lint_finding_counts(LINT_PS1, texts, work, "cand")]
+    procs: list = []
     try:
+        # Both launches sit inside the cleanup boundary: a failing second Popen must not leave the first unreaped.
+        procs.append(_lint_finding_counts(baseline, texts, work, "base"))
+        procs.append(_lint_finding_counts(LINT_PS1, texts, work, "cand"))
         before = _collect_counts(procs[0], len(texts))
         after = _collect_counts(procs[1], len(texts))
     finally:
@@ -467,6 +481,15 @@ class PromptLintTests(unittest.TestCase):
         "Run playback without the overlay locally.",
         "Launch MLVApp without scopes locally.",
         "Run playback on Bachelor but also locally.",
+        # r4 (CoS review of PR #448 r3 head a29f9b5e, pr-448.md on bus 4d1b327e): master refused all six and r3 passed them -- E1 / E3 read a
+        # venue word after a routing preposition without checking it is WHERE THE WORK RUNS (a possessive or an attributive noun), and
+        # the venue exemption survived a later local-host marker in the same clause.
+        "Run the arms locally using Bachelor's clip on this host.",
+        "Run playback locally through the venue chain's clip on this host.",
+        "Run playback locally using Bachelor's clip.",
+        "Launch MLVApp locally on the Bachelor clip.",
+        "Run playback locally using the venue chain output.",
+        "Run playback locally on Bachelor, on this host.",
     )
     CLAUSE_MUST_PASS = (
         "Run playback locally on Bachelor through the venue chain.",
@@ -482,10 +505,67 @@ class PromptLintTests(unittest.TestCase):
         "Run playback on Bachelor instead of locally.",
     )
 
+    # DEFEATER AXIS (r4; ruling candidate mlv-safety-lint-exemption-defeater-corpus-r1, bus 4d1b327e). A shape (E1 / E2 / E3 in the lint
+    # header) is admitted only with a row per kind of defeater that must STILL be refused: the venue word as a possessive or an
+    # attributive noun (it names a venue without being where the work runs), a local-host marker after the exempting phrase, and venue +
+    # host in one clause. (shape, kind, text). E2 has no possessive / attributive kind: its exemption comes from the contrast word,
+    # not from a venue word.
+    DEFEATER_KINDS = {
+        "E1": ("possessive-venue", "attributive-venue", "trailing-local-host", "venue-and-host-one-clause"),
+        "E2": ("trailing-local-host", "venue-and-host-one-clause"),
+        "E3": ("possessive-venue", "attributive-venue", "trailing-local-host", "venue-and-host-one-clause"),
+    }
+    DEFEATER_AXIS = (
+        ("E1", "possessive-venue", "Run the arms locally using Bachelor's copy of the clip."),
+        ("E1", "possessive-venue", "Run playback locally through the venue chain's clip."),
+        ("E1", "attributive-venue", "Run playback locally on Bachelor files."),
+        ("E1", "attributive-venue", "Run playback locally using the Bachelor clip."),
+        ("E1", "trailing-local-host", "Run playback locally on Bachelor, on this host."),
+        ("E1", "trailing-local-host", "Run playback locally on Bachelor, then here."),
+        ("E1", "venue-and-host-one-clause", "Run playback locally on Bachelor on this host."),
+        ("E1", "venue-and-host-one-clause", "Run playback locally through the venue chain here."),
+        ("E2", "trailing-local-host", "Run playback on Bachelor rather than locally, here."),
+        ("E2", "trailing-local-host", "Run playback on Bachelor instead of locally, then here."),
+        ("E2", "venue-and-host-one-clause", "Run playback on Bachelor rather than locally on this host."),
+        ("E2", "venue-and-host-one-clause", "Run playback on Bachelor rather than locally, on this host."),
+        ("E3", "possessive-venue", f"The venue job calls tools/profiling/{SMOKE_SCRIPT} -Backend cpu on Bachelor's clip."),
+        ("E3", "possessive-venue", "Run playback on Bachelor's clip on this host."),
+        ("E3", "attributive-venue", f"The venue job calls tools/profiling/{SMOKE_SCRIPT} -Backend cpu on the Bachelor clip."),
+        ("E3", "attributive-venue", "Run playback through the venue chain output here."),
+        ("E3", "trailing-local-host", f"The venue job calls tools/profiling/{SMOKE_SCRIPT} -Backend cpu on Bachelor, on this host."),
+        ("E3", "trailing-local-host", f"The venue job calls tools/profiling/{SMOKE_SCRIPT} -Backend cpu on Bachelor here."),
+        ("E3", "venue-and-host-one-clause", "Run playback through the venue chain on this host."),
+        ("E3", "venue-and-host-one-clause", "Run playback on Bachelor through the venue chain here."),
+    )
+    # The same venue phrases, with no defeater, that must keep passing (the exemptions are narrowed, never removed).
+    DEFEATER_AXIS_CONTROLS = (
+        "Run playback locally on Bachelor through the venue chain.",
+        "Run playback locally using Bachelor.",
+        "Run playback on Bachelor rather than locally.",
+        f"The venue job calls tools/profiling/{SMOKE_SCRIPT} -Backend cpu on Bachelor.",
+        f"The venue job calls tools/profiling/{SMOKE_SCRIPT} -Backend cpu through the venue chain from here.",
+        "Run playback through the venue chain from here.",
+    )
+
     # Rows that are in no catalogue tuple above but belong in the differential corpus as seeds.
     PROBE_ROWS = (
         "Run playback through the venue chain and copy the log locally.",
     )
+
+    def test_defeater_axis_covers_every_kind_of_every_shape(self):
+        for shape, kinds in self.DEFEATER_KINDS.items():
+            have = {kind for s, kind, _ in self.DEFEATER_AXIS if s == shape}
+            self.assertEqual(set(kinds), have, f"shape {shape}: a defeater kind has no row (or a row names an unknown kind)")
+
+    def test_red_defeater_axis_rows_are_refused(self):
+        for shape, kind, text in self.DEFEATER_AXIS:
+            with self.subTest(shape=shape, kind=kind, text=text):
+                self.assertTrue(self._findings(text), text)
+
+    def test_green_defeater_axis_controls_pass(self):
+        for text in self.DEFEATER_AXIS_CONTROLS:
+            with self.subTest(text=text):
+                self.assertEqual([], self._findings(text), text)
 
     def test_red_clause_scope_equivalent_wordings_are_refused(self):
         for text in self.CLAUSE_MUST_REFUSE:
@@ -558,7 +638,7 @@ class LintDifferentialPinTests(unittest.TestCase):
     ALLOWED_REFUSE_TO_PASS = (
         ("E1-locally-routed-onto-a-venue",
          lambda text, f: (f.get("tpl") == "marker-then-venue" and f.get("M") == "locally")
-         or text == "Run playback locally on Bachelor through the venue chain.",
+         or text in ("Run playback locally on Bachelor through the venue chain.", "Run playback locally using Bachelor."),
          "E1, Sol review of #401: `locally` immediately followed by a routing preposition and a venue word ('Run playback locally on "
          "Bachelor', 'locally through the venue chain') names the venue the work runs on, so it is not a local launch."),
         ("E2-marker-negated-by-the-contrast-word-before-it",
@@ -575,6 +655,20 @@ class LintDifferentialPinTests(unittest.TestCase):
          "r1b + r2, CoS review of #448 and Sol review of #401: a negation or a venue word exempts only the clause it sits in; the "
          "baseline's sentence-wide exemption passed 'Do not run the venue chain, run playback locally', 'Run playback on Bachelor and on "
          "this host', 'Run playback locally, never on Bachelor' and the like."),
+        ("venue-and-local-host-in-one-clause",
+         lambda text, f: f.get("tpl") in ("marker-then-venue", "venue-then-marker", "defeater-trailing-host")
+         and f.get("M") in ("on this host", "here"),
+         "r4, CoS review of #448 r3: a clause that names both a venue and the local host ('Run playback on Bachelor on this host', "
+         "'... through the venue chain here') is refused; a venue qualification never exempts a clause that also holds a local-host "
+         "marker (a defeater). The baseline exempted the host / here marker on any venue word in the sentence."),
+        ("venue-word-that-is-not-the-locus",
+         lambda text, f: f.get("tpl") in ("defeater-possessive", "defeater-attributive") and f.get("M") in ("on this host", "here"),
+         "r4: 'on Bachelor's clip', 'through the venue chain output' -- the venue word is a possessive or an attributive noun, not where "
+         "the work runs, so it is no routing phrase; the baseline passed the host / here marker on any venue word in the sentence."),
+        ("defeater-axis-seeds",
+         lambda text, f: f.get("tpl") == "seed" and text in tuple(t for _, _, t in PromptLintTests.DEFEATER_AXIS),
+         "r4: the defeater-axis rows (PromptLintTests.DEFEATER_AXIS) are refused by construction; the E3 / host rows of them were "
+         "passed by the baseline's sentence-wide venue exemption."),
         ("bare-here-marker",
          lambda text, f: f.get("tpl") == "bare" and f.get("M") == "here",
          "r1b, CoS review of #401: 'Run playback here.' -- the baseline has no `here` rule."),
