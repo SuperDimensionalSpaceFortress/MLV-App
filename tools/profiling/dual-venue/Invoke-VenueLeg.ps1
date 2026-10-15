@@ -403,7 +403,7 @@ try {
         if ($spec.generatorArgs.PSObject.Properties['scopeIntervalMs']) { $gen['ScopeIntervalMs'] = [int]$spec.generatorArgs.scopeIntervalMs }
         # PLAYBACK-SCOPES-OPTION-1 r4: the app's playback scopes mode (a scope leg on a Hide-default build must pin it), for any leg.
         if ($spec.generatorArgs.PSObject.Properties['scopesDuringPlayback']) { $gen['ScopesDuringPlayback'] = [string]$spec.generatorArgs.scopesDuringPlayback }
-        # CPU-SCOPE-LIVE-HEAP-CORRUPTION-1: a procdump watcher keeps one full dump of the app's first heap-corruption exception, for any leg.
+        # CPU-SCOPE-LIVE-HEAP-CORRUPTION-1: a debugger watcher keeps one full dump of the app's first heap-corruption exception, for any leg.
         if ($spec.generatorArgs.PSObject.Properties['heapCorruptionDump'] -and [bool]$spec.generatorArgs.heapCorruptionDump) { $gen['HeapCorruptionDump'] = $true }
         # PLAYBACK-BACHELOR-PRESENT-JITTER-1: a SPEED leg may force Look Assist (a capture-free pace leg: no contact-sheet grab in the timed Play).
         if (-not $isLook -and $spec.generatorArgs.PSObject.Properties['forceLookAssist'] -and [bool]$spec.generatorArgs.forceLookAssist) {
@@ -551,11 +551,11 @@ if ($artifactsShare -and (Test-Path -LiteralPath $artifactsShare -PathType Conta
         New-Item -ItemType Directory -Force -Path (Join-Path $evidenceDir 'logs') | Out-Null
         Copy-Item -LiteralPath $failedAppLogShare -Destination (Join-Path $evidenceDir 'logs\smoke-failed-app.log')
     }
-    # CPU-SCOPE-LIVE-HEAP-CORRUPTION-1: a heap-corruption-dump leg's record, watcher log, procdump output and any *.dmp come back whole.
+    # CPU-SCOPE-LIVE-HEAP-CORRUPTION-1: a heap-corruption-dump leg's record, watcher log and any *.dmp come back whole.
     $heapDumpShare = Join-Path $artifactsShare 'heapdump'
     if (Test-Path -LiteralPath $heapDumpShare -PathType Container) {
         New-Item -ItemType Directory -Force -Path (Join-Path $evidenceDir 'heapdump') | Out-Null
-        Get-ChildItem -LiteralPath $heapDumpShare -File | Where-Object { $_.Name -match '^(heap-dump\.json|watcher\.log|procdump\.txt|[^\\/]+\.dmp)$' } | ForEach-Object {
+        Get-ChildItem -LiteralPath $heapDumpShare -File | Where-Object { $_.Name -match '^(heap-dump\.json|watcher\.log|[^\\/]+\.dmp)$' } | ForEach-Object {
             Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $evidenceDir "heapdump\$($_.Name)")
         }
     }

@@ -425,8 +425,9 @@ param(
     [ValidateSet('', 'hide', 'throttled', 'live')]
     [string]$ScopesDuringPlayback = '',
 
-    # CPU-SCOPE-LIVE-HEAP-CORRUPTION-1: attach procdump (by pid, agent user, no registry) to the smoke's MLVApp and keep one full dump of
-    # the first heap-corruption exception (c0000374) under the artifacts' heapdump\. Absent: the emitted job is the text it was before.
+    # CPU-SCOPE-LIVE-HEAP-CORRUPTION-1: attach a minimal debugger (by pid, agent user, no registry; Start-AttrCudaHeapDumpWatch) to the smoke's
+    # MLVApp and keep one full dump of the first heap-corruption exception (c0000374) under the artifacts' heapdump\. Absent: the emitted job
+    # is the text it was before.
     [switch]$HeapCorruptionDump
 )
 
@@ -4543,7 +4544,7 @@ if ($HeapCorruptionDump) {
     $launchAnchor = "`$smokeRc = `$null`n`$smokeLaunchException = `$null"
     $text = Edit-DualVenueTemplate $text $launchAnchor ($heapOpen + "`n" + $heapFunctions + "`n" + @'
 $heapDumpRecord = Start-AttrCudaHeapDumpWatch -ExePath $exePath -DumpDir (Join-Path $Pub 'heapdump')
-Write-JobTrace "step heap-dump-watch watcherPid=$($heapDumpRecord['watcherPid']) procdump=$($heapDumpRecord['procdump']) reason=$($heapDumpRecord['reason'])"
+Write-JobTrace "step heap-dump-watch watcherPid=$($heapDumpRecord['watcherPid']) debugger=$($heapDumpRecord['debugger']) reason=$($heapDumpRecord['reason'])"
 '@ + "`n" + $heapClose + "`n" + $launchAnchor)
     $doneAnchor = 'Write-JobTrace "step smoke-launch done rc=$smokeRc"'
     $text = Edit-DualVenueTemplate $text $doneAnchor ($doneAnchor + "`n" + $heapOpen + "`n" + @'

@@ -6502,44 +6502,59 @@ class HeapDumpGeneratorTests(unittest.TestCase):
 
 @requires_windows_pwsh
 class HeapDumpVenueHelperTests(unittest.TestCase):
-    """The venue-side watcher (AttrCudaArtifacts.psm1), with ping.exe as the target and whoami.exe standing in for procdump (it refuses
-    procdump's arguments and exits 1), so nothing is ever attached or dumped here."""
+    """The venue-side watcher (AttrCudaArtifacts.psm1) end to end: its compiled debugger attaches to a Windows PowerShell target that
+    raises STATUS_HEAP_CORRUPTION (RaiseException c0000374) and writes a small (MiniDumpNormal) dump; a twin with --help is never taken."""
+
+    TARGET_PS = ("Start-Sleep -Seconds 4\n"
+                 "if ($args -contains '--help') { Start-Sleep -Seconds 20; exit 0 }\n"
+                 "Add-Type -MemberDefinition '[DllImport(\"kernel32.dll\")] public static extern void RaiseException(uint code, uint flags, uint count, IntPtr args);' "
+                 "-Name K -Namespace HeapWatchTarget\n"
+                 "[HeapWatchTarget.K]::RaiseException([uint32]3221226356, 1, 0, [IntPtr]::Zero)\n")
 
     def run_module(self, script: str) -> subprocess.CompletedProcess:
-        return run_pwsh(["-Command", f"$ErrorActionPreference = 'Stop'; Import-Module '{ATTR_MODULE}' -Force\n" + script], timeout=180)
+        return run_pwsh(["-Command", f"$ErrorActionPreference = 'Stop'; Import-Module '{ATTR_MODULE}' -Force\n" + script], timeout=240)
 
-    def test_the_heap_dump_watch_without_procdump_says_why_and_starts_nothing(self) -> None:
+    def test_the_heap_dump_watch_with_no_smoke_instance_is_stopped_at_once_with_no_dump(self) -> None:
         with tempfile.TemporaryDirectory(prefix="heap-none-") as d:
-            proc = self.run_module(f"$r = Start-AttrCudaHeapDumpWatch -ExePath 'C:\\x\\MLVApp.exe' -DumpDir '{d}\\hd' -ProcdumpPath '{d}\\missing\\procdump64.exe'\n"
-                                   "Write-Output ('PID=' + $r.watcherPid); Write-Output ('REASON=' + $r.reason)\n"
-                                   "$r = Stop-AttrCudaHeapDumpWatch -Record $r -WaitSec 5; Write-Output ('DUMPS=' + @($r.dumps).Count)")
+            proc = self.run_module(f"$r = Start-AttrCudaHeapDumpWatch -ExePath 'C:\\x\\MLVApp-heap-watch-absent.exe' -DumpDir '{d}\\hd' -MaxWaitSec 600\n"
+                                   "Start-Sleep -Seconds 3; $t0 = Get-Date\n"
+                                   "$r = Stop-AttrCudaHeapDumpWatch -Record $r -WaitSec 300\n"
+                                   "Write-Output ('SEC=' + [int]((Get-Date) - $t0).TotalSeconds); Write-Output ('REASON=' + $r.reason); Write-Output ('DUMPS=' + @($r.dumps).Count)")
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             out = dict(l.split("=", 1) for l in proc.stdout.splitlines() if "=" in l)
-            self.assertEqual((out["PID"], out["DUMPS"]), ("", "0"))
-            self.assertTrue(out["REASON"].startswith("PROCDUMP_NOT_FOUND"), out["REASON"])
+            self.assertEqual(out["DUMPS"], "0")
+            self.assertTrue(out["REASON"].startswith("WATCHER_NO_TARGET"), out["REASON"])
+            self.assertLess(int(out["SEC"]), 60, "a watcher that never attached is not waited out")
 
-    def test_the_heap_dump_watch_attaches_to_the_smoke_instance_never_a_help_probe(self) -> None:
+    def test_the_heap_dump_watch_dumps_the_heap_corruption_of_the_smoke_instance_never_a_help_probe(self) -> None:
         import os
-        sys32 = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32"
+        ps51 = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
         with tempfile.TemporaryDirectory(prefix="heap-watch-") as d:
+            target = Path(d) / "heap-watch-target.ps1"
+            target.write_text(self.TARGET_PS, encoding="ascii")
+            args = f"'-NoProfile','-ExecutionPolicy','Bypass','-File','{target}'"
             proc = self.run_module(
-                f"$r = Start-AttrCudaHeapDumpWatch -ExePath '{sys32 / 'PING.EXE'}' -DumpDir '{d}\\hd' -ProcdumpPath '{sys32 / 'whoami.exe'}' -MaxWaitSec 60\n"
-                f"$help = Start-Process -FilePath '{sys32 / 'PING.EXE'}' -ArgumentList '-n','6','127.0.0.1','--help' -WindowStyle Hidden -PassThru\n"
-                "Start-Sleep -Seconds 2\n"
-                f"$t = Start-Process -FilePath '{sys32 / 'PING.EXE'}' -ArgumentList '-n','4','127.0.0.1' -WindowStyle Hidden -PassThru\n"
-                "$t.WaitForExit(); try { $help.Kill() } catch { }\n"
-                "$r = Stop-AttrCudaHeapDumpWatch -Record $r -WaitSec 60\n"
+                f"$r = Start-AttrCudaHeapDumpWatch -ExePath '{ps51}' -DumpDir '{d}\\hd' -CommandLineMatch '{target.name}' -DumpType 0 -MaxWaitSec 90\n"
+                f"$help = Start-Process -FilePath '{ps51}' -ArgumentList {args},'--help' -WindowStyle Hidden -PassThru\n"
+                "Start-Sleep -Seconds 1\n"
+                f"$t = Start-Process -FilePath '{ps51}' -ArgumentList {args} -WindowStyle Hidden -PassThru\n"
+                "[void]$t.WaitForExit(90000); try { $help.Kill() } catch { }\n"
+                "$r = Stop-AttrCudaHeapDumpWatch -Record $r -WaitSec 90\n"
                 "Write-Output ('TARGET=' + $t.Id); Write-Output ('HELP=' + $help.Id); Write-Output ('EXITED=' + $r.watcherExited); Write-Output ('REASON=' + $r.reason)\n"
+                "Write-Output ('DUMPS=' + @($r.dumps).Count)\n"
                 "$r.watcherLog | ForEach-Object { Write-Output ('LOG=' + $_) }\n"
+                f"Get-ChildItem -LiteralPath '{d}\\hd' -Filter '*.dmp' | ForEach-Object {{ Write-Output ('SIG=' + [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($_.FullName)[0..3])) }}\n"
                 f"Write-Output ('JSON=' + (Test-Path -LiteralPath '{d}\\hd\\heap-dump.json'))")
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             lines = proc.stdout.splitlines()
             out = dict(l.split("=", 1) for l in lines if "=" in l and not l.startswith("LOG="))
             log = [l[len("LOG="):] for l in lines if l.startswith("LOG=")]
-            self.assertEqual((out["EXITED"], out["REASON"], out["JSON"]), ("True", "", "True"), proc.stdout)
+            self.assertEqual((out["EXITED"], out["REASON"], out["DUMPS"], out["SIG"], out["JSON"]), ("True", "", "1", "MDMP", "True"), proc.stdout)
             self.assertTrue(any(l.endswith(f"ATTACH pid={out['TARGET']}") for l in log), log)
             self.assertFalse(any(f"pid={out['HELP']}" in l for l in log if "ATTACH" in l), log)
-            self.assertTrue(any(l.endswith("PROCDUMP_EXIT rc=1") for l in log), log)
+            self.assertTrue(any(" EXCEPTION code=0xC0000374 first=1 " in l for l in log), log)
+            self.assertTrue(any(" DUMP_WRITTEN " in l and l.endswith("context=1") for l in log), log)
+            self.assertTrue(any(l.endswith("DEBUGGER_EXIT rc=0") for l in log), log)
 
 
 @requires_windows_pwsh
