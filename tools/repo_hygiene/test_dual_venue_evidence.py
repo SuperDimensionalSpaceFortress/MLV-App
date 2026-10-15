@@ -6196,9 +6196,9 @@ class LookReceiptRunnerTests(RunnerHarness, unittest.TestCase):
             subprocess.run(["git", "-C", str(self.repo), *args], capture_output=True, text=True, check=True)
         self.working = self.committed.replace(b"<agx>0</agx>", b"<agx>1</agx>")
         target.write_bytes(self.working)   # the working copy now differs from the committed blob
-        param_tail = "$DisplayMode,[switch]$VisualCapture)"
+        param_tail = "$AutomationSettingsDir,$GpuPreLaunches)"
         self.assertIn(param_tail, STUB_GENERATOR, "STUB_GENERATOR param list changed; update this replace target")
-        self.gen.write_text(STUB_GENERATOR.replace(param_tail, "$DisplayMode,[switch]$VisualCapture,$LookReceiptPath)", 1), encoding="utf-8")
+        self.gen.write_text(STUB_GENERATOR.replace(param_tail, "$AutomationSettingsDir,$GpuPreLaunches,$LookReceiptPath)", 1), encoding="utf-8")
         self.work = self.tmp / "work"
 
     def spec(self, **look) -> Path:
