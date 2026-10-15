@@ -127,7 +127,10 @@ struct OverlapRun
     bool heapsValid = true;
 };
 
-OverlapRun runOverlap(bool large, int iterations)
+// r7: sameFrame puts the recon worker on the paused frame itself (the play-stop shape where the
+// last playback frame is the one the paused request redraws), so both reconstruct one frame
+// index at once instead of neighbouring ones.
+OverlapRun runOverlap(bool large, int iterations, bool sameFrame = false)
 {
     OverlapRun run;
     MlvPipelineFixture fixture;
@@ -138,8 +141,8 @@ OverlapRun runOverlap(bool large, int iterations)
     }
     mlvObject_t * video = fixture.video();
     const size_t pixels = overlapPixels(fixture);
-    const uint64_t reconFrames[] = { 0, 1, 2 };
     const uint64_t pausedFrame = 3;
+    const std::vector<uint64_t> reconFrames = sameFrame ? std::vector<uint64_t>{ pausedFrame } : std::vector<uint64_t>{ 0, 1, 2 };
     const uint64_t decodeFrames[] = { 4, 5 };
 
     // Single-threaded references, after one warm-up pass so the first run's one-time loads
@@ -193,7 +196,7 @@ OverlapRun runOverlap(bool large, int iterations)
         while (!go.load()) std::this_thread::yield();
         for (int i = 0; i < iterations; ++i)
         {
-            const size_t index = static_cast<size_t>(i) % (sizeof(reconFrames) / sizeof(reconFrames[0]));
+            const size_t index = static_cast<size_t>(i) % reconFrames.size();
             reconWorkerFrame(video, reconFrames[index], &reconWorker.state, buffer, pixels);
             if (std::memcmp(buffer.data(), reconRef[index].data(), pixels * sizeof(uint16_t)) != 0)
                 ++run.reconMismatches;
@@ -219,9 +222,9 @@ OverlapRun runOverlap(bool large, int iterations)
     reconRendersDone.store(true);
     decodeThread.join();
     run.heapsValid = processHeapsValid();
-    std::printf("[paused-render-recon-overlap] large=%d iterations=%d recon_mismatches=%d decode_mismatches=%d "
+    std::printf("[paused-render-recon-overlap] large=%d same_frame=%d iterations=%d recon_mismatches=%d decode_mismatches=%d "
                 "paused_mismatches=%d paused_not_refused=%d heaps_valid=%d\n",
-                large ? 1 : 0, iterations, run.reconMismatches, run.decodeMismatches, run.pausedMismatches,
+                large ? 1 : 0, sameFrame ? 1 : 0, iterations, run.reconMismatches, run.decodeMismatches, run.pausedMismatches,
                 run.pausedNotRefused, run.heapsValid ? 1 : 0);
     return run;
 }
@@ -245,4 +248,16 @@ TEST(PausedRenderReconOverlap, TinyDualIsoPausedRenderBesideReconWorkerIsExactAn
 TEST(PausedRenderReconOverlap, LargeDualIsoPausedRenderBesideReconWorkerIsExactAndHeapIntact)
 {
     assertOverlapClean(runOverlap(true, overlapIterations(3)));
+}
+
+// r7 (CoS #432, ledger 2026-10-15T07:11:50Z): the same-frame case. The paused render and the
+// recon worker reconstruct the SAME frame index at once.
+TEST(PausedRenderReconOverlap, TinyDualIsoPausedRenderAndReconOnTheSameFrameAreExactAndHeapIntact)
+{
+    assertOverlapClean(runOverlap(false, overlapIterations(16), true));
+}
+
+TEST(PausedRenderReconOverlap, LargeDualIsoPausedRenderAndReconOnTheSameFrameAreExactAndHeapIntact)
+{
+    assertOverlapClean(runOverlap(true, overlapIterations(3), true));
 }
