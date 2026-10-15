@@ -109,6 +109,9 @@ DECODER_LEGS = {"legs/m16-1243-pace-cinematic-fullscreen-s4-dec1.json": "legs/m1
 UPSTREAM_BASELINE_LEGS = tuple(f"legs/m16-1243-upstream-baseline-cpu-{mode}-s1.json" for mode in ("fullscreen", "windowed"))
 # PLAYBACK-STARTUP-CATCHUP-BURST-1 r7: the present-trace twin of a display-matrix cell, differing only in its legId and generatorArgs.presentTrace true.
 PTRACE_LEGS = {"legs/m16-1243-display-fullscreen-s4-ptrace.json": "legs/m16-1243-display-fullscreen-s4.json"}
+# PLAYBACK-STARTUP-WAIT-PREWARM-1: the first-present identity twins of two display-matrix cells, differing only in their legId and
+# generatorArgs.firstPresentCapture true.
+IDENTITY_LEGS = {f"legs/m16-1243-display-{cell}-identity.json": f"legs/m16-1243-display-{cell}.json" for cell in ("windowed-s1", "fullscreen-s4")}
 # PLAYBACK-VISUAL-INSPECTION-1: the window-capture proof leg, a SPEED leg (windowed, scale 2) that names no visualCapture: absent means on.
 VISUAL_LEGS = ("legs/m16-1243-speed-windowed-s2.json",)
 # PLAYBACK-SCOPES-OPTION-1: the windowed scale-1 no-look scope matrix, per backend: N (no scope), T (histogram at the app's default throttle) and
@@ -564,6 +567,24 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         self.assertEqual(text.replace(line, ""), plain, "the flag is the only difference from the plain job")
         runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
         mapping = "if ($spec.generatorArgs.PSObject.Properties['presentTrace'] -and [bool]$spec.generatorArgs.presentTrace) { $gen['PresentTrace'] = $true }"
+        self.assertIn(mapping, runner)
+        self.assertLess(runner.index(mapping), runner.index("if (-not $isLook -and $spec.generatorArgs.PSObject.Properties['forceLookAssist']"),
+                        "the mapping must sit outside the forceLookAssist branch")
+
+    def test_the_first_present_capture_reaches_the_apps_env_only_when_asked(self) -> None:
+        """PLAYBACK-STARTUP-WAIT-PREWARM-1: -FirstPresentCapture adds MLVAPP_SMOKE_FIRST_PRESENT_CAPTURE=1 to the app's env list; absent, the
+        job is the text it was. The runner maps a leg's generatorArgs.firstPresentCapture true for any leg."""
+        plain = self.generate(GENERATOR, "fpc-plain.job.ps1", []).read_text(encoding="utf-8").replace("\r\n", "\n")
+        self.assertNotIn("MLVAPP_SMOKE_FIRST_PRESENT_CAPTURE", plain)
+        job = self.generate(GENERATOR, "fpc-on.job.ps1", ["-FirstPresentCapture"])
+        self.assertEqual(self.parse_errors(job), 0)
+        text = job.read_text(encoding="utf-8").replace("\r\n", "\n")
+        line = "    'MLVAPP_SMOKE_FIRST_PRESENT_CAPTURE=1',\n"
+        self.assertIn("'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',\n" + line, text)
+        self.assertEqual(text.replace(line, ""), plain, "the flag is the only difference from the plain job")
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        mapping = ("if ($spec.generatorArgs.PSObject.Properties['firstPresentCapture'] -and [bool]$spec.generatorArgs.firstPresentCapture) "
+                   "{ $gen['FirstPresentCapture'] = $true }")
         self.assertIn(mapping, runner)
         self.assertLess(runner.index(mapping), runner.index("if (-not $isLook -and $spec.generatorArgs.PSObject.Properties['forceLookAssist']"),
                         "the mapping must sit outside the forceLookAssist branch")
@@ -5630,6 +5651,18 @@ class LegSpecSchemaTests(unittest.TestCase):
             self.assertNotIn("presentTrace", twin["generatorArgs"], twin_rel)
             self.assertEqual(arm["legId"], twin["legId"] + "-ptrace", rel)
             self.assertIs(arm["generatorArgs"].pop("presentTrace"), True, rel)
+            self.assertEqual(dict(arm, legId=twin["legId"]), twin, rel)
+
+    def test_the_identity_legs_are_their_twins_with_the_capture_on(self) -> None:
+        """PLAYBACK-STARTUP-WAIT-PREWARM-1: an identity leg differs from its twin only in its legId and generatorArgs.firstPresentCapture true."""
+        self.assertEqual(self.schema["properties"]["generatorArgs"]["properties"]["firstPresentCapture"]["type"], "boolean")
+        for rel, twin_rel in IDENTITY_LEGS.items():
+            arm = json.loads((DV / rel).read_text(encoding="utf-8"))
+            self.jsonschema.validate(arm, self.schema)
+            twin = json.loads((DV / twin_rel).read_text(encoding="utf-8"))
+            self.assertNotIn("firstPresentCapture", twin["generatorArgs"], twin_rel)
+            self.assertEqual(arm["legId"], twin["legId"] + "-identity", rel)
+            self.assertIs(arm["generatorArgs"].pop("firstPresentCapture"), True, rel)
             self.assertEqual(dict(arm, legId=twin["legId"]), twin, rel)
 
     def test_the_scope_legs_are_no_look_windowed_s1_speed_legs_differing_only_in_scope(self) -> None:
