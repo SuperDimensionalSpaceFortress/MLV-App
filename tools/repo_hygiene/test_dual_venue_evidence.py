@@ -932,7 +932,7 @@ switch ($cfg.mainMode) {
 # The stub records every named argument it was handed (so a test can see that the runner passed a clip ID and a play
 # window, and never a path), and can be told to refuse the way the real generator does.
 STUB_GENERATOR = r"""
-param($SourceCommit,$BuildManifestSha256,$ClipId,$FixtureSha256,$OutFile,$RepoRoot,$Venue,$Backend,$ScaleFactor,$TelemetryArm,$CpuQuiescenceThresholdPercent,[switch]$ContactSheet,$ContactSheetFrames,[switch]$ForceLookAssist,$LookFlavor,$VenueTablePath,$PlaySeconds,$ExpectedScaleRequest,$DisplayMode,[switch]$VisualCapture)
+param($SourceCommit,$BuildManifestSha256,$ClipId,$FixtureSha256,$OutFile,$RepoRoot,$Venue,$Backend,$ScaleFactor,$TelemetryArm,$CpuQuiescenceThresholdPercent,[switch]$ContactSheet,$ContactSheetFrames,[switch]$ForceLookAssist,$LookFlavor,$VenueTablePath,$PlaySeconds,$ExpectedScaleRequest,$DisplayMode,[switch]$VisualCapture,$AutomationSettingsDir,$GpuPreLaunches)
 $cfg = Get-Content -LiteralPath $env:DVE_STUB -Raw | ConvertFrom-Json
 Add-Content -LiteralPath $cfg.genLog -Value (($PSBoundParameters.Keys | Sort-Object | ForEach-Object { $_ + '=' + $PSBoundParameters[$_] }) -join ';')
 if ($cfg.genRefusal) { throw $cfg.genRefusal }
@@ -6750,12 +6750,22 @@ class VisualCaptureRunnerTests(RunnerHarness, unittest.TestCase):
         self.assertIn("FROZEN_DISPLAY", receipt["outcomeDetail"])
         self.assertFalse(receipt["visual"]["counted"])
 
-    def run_self_heal_visual(self, measured: str, launches: dict):
+    def run_self_heal_visual(self, measured: str, launches: dict, declared: int | None = None, **spec_fields):
+        """launches: pre-<n> -> a write_visual_captures mode, or None for a pre-launch that published its self-heal\\pre-<n> but no visual\\.
+        declared: the spec's generatorArgs.gpuPreLaunches count (the pre-launches the leg runs); None leaves the spec without them."""
         self.write_artifacts()
         write_visual_captures(self.artifacts / "visual", measured)
+        shutil.rmtree(self.artifacts / "self-heal", ignore_errors=True)
         for name, mode in launches.items():
-            write_visual_captures(self.artifacts / "self-heal" / name / "visual", mode)
-        return self.run_leg("ultra-magnus", self.write_spec(), extra=["-Backend", "cpu"])
+            if mode is None:
+                (self.artifacts / "self-heal" / name).mkdir(parents=True)
+                (self.artifacts / "self-heal" / name / "pre-launch.json").write_text("{}", encoding="utf-8")
+            else:
+                write_visual_captures(self.artifacts / "self-heal" / name / "visual", mode)
+        if declared is not None:
+            spec_fields["generatorArgs"] = {"automationSettingsDir": "gpu-self-heal-settings", "gpuPreLaunches": (["702@120", "702@120", "none"] * 2)[:declared]}
+        spec = self.speed_spec(**spec_fields) if spec_fields else self.write_spec()
+        return self.run_leg("ultra-magnus", spec, extra=["-Backend", "cpu"])
 
     def test_a_frozen_self_heal_pre_launch_makes_the_leg_invalid_whatever_the_measured_run_shows(self) -> None:
         """GPU-DEVICE-LOSS-SELF-HEAL-1 r6 (CoS #437, Dot 46f5e496): r5 recorded each pre-launch's verdict in receipt.selfHealVisual but gated only
@@ -6767,11 +6777,52 @@ class VisualCaptureRunnerTests(RunnerHarness, unittest.TestCase):
         self.assertIn("FROZEN_DISPLAY on self-heal pre-launch pre-2", receipt["outcomeDetail"])
         self.assertNotIn("pre-1:", receipt["outcomeDetail"])
 
-    def test_a_diverging_self_heal_pre_launch_stays_counted_and_is_named_in_the_detail(self) -> None:
-        _, receipt, _ = self.run_self_heal_visual("ok", {"pre-1": "diverge", "pre-2": "ok"})
+    def test_a_self_heal_leg_whose_every_pre_launch_shows_an_ok_picture_passes(self) -> None:
+        """GPU-DEVICE-LOSS-SELF-HEAL-1 r7: the control for the pins below -- three declared pre-launches, each OK, beside an OK measured run."""
+        _, receipt, _ = self.run_self_heal_visual("ok", {"pre-1": "ok", "pre-2": "ok", "pre-3": "ok"}, declared=3)
+        self.assertEqual([receipt["selfHealVisual"][k]["verdict"] for k in ("pre-1", "pre-2", "pre-3")], ["OK", "OK", "OK"])
         self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+        self.assertNotIn("self-heal pre-launch", receipt["outcomeDetail"])
+
+    def test_a_diverging_self_heal_pre_launch_makes_the_leg_invalid(self) -> None:
+        """GPU-DEVICE-LOSS-SELF-HEAL-1 r7 (sol r6 blocker; the 08:05:36Z ledger scope 'fail the leg on any non-OK pre-n visual verdict'): r6 counted a
+        VISUAL_DIVERGENCE pre-launch and asserted PASS here. The fallback runs are the leg's whole proof, so a picture that diverges is not counted."""
+        _, receipt, _ = self.run_self_heal_visual("ok", {"pre-1": "diverge", "pre-2": "ok"})
+        self.assertEqual(receipt["visual"]["verdict"], "OK", "the measured run's own picture is fine")
+        self.assertEqual(receipt["selfHealVisual"]["pre-1"]["verdict"], "VISUAL_DIVERGENCE")
+        self.assertEqual(receipt["outcome"], "INVALID", receipt["outcomeDetail"])
         self.assertIn("VISUAL_DIVERGENCE on self-heal pre-launch pre-1", receipt["outcomeDetail"])
         self.assertNotIn("pre-2", receipt["outcomeDetail"])
+
+    def test_a_self_heal_pre_launch_with_no_captures_makes_the_leg_invalid(self) -> None:
+        """GPU-DEVICE-LOSS-SELF-HEAL-1 r7: pre-2 published its self-heal\\pre-2 but no visual\\ (captured=false): NOT_CAPTURED is no picture of the fallback."""
+        _, receipt, _ = self.run_self_heal_visual("ok", {"pre-1": "ok", "pre-2": None, "pre-3": "ok"}, declared=3)
+        self.assertEqual((receipt["selfHealVisual"]["pre-2"]["verdict"], receipt["selfHealVisual"]["pre-2"]["captured"]), ("NOT_CAPTURED", False))
+        self.assertEqual(receipt["outcome"], "INVALID", receipt["outcomeDetail"])
+        self.assertIn("NOT_CAPTURED on self-heal pre-launch pre-2", receipt["outcomeDetail"])
+        self.assertNotIn("pre-1", receipt["outcomeDetail"])
+
+    def test_a_blank_self_heal_pre_launch_capture_makes_the_leg_invalid(self) -> None:
+        """GPU-DEVICE-LOSS-SELF-HEAL-1 r7: six flat frames (CAPTURE_BLANK) judge nothing about the fallback run, so the leg is not counted."""
+        _, receipt, _ = self.run_self_heal_visual("ok", {"pre-1": "ok", "pre-2": "ok", "pre-3": "blank"}, declared=3)
+        self.assertEqual(receipt["selfHealVisual"]["pre-3"]["verdict"], "CAPTURE_BLANK")
+        self.assertEqual(receipt["outcome"], "INVALID", receipt["outcomeDetail"])
+        self.assertIn("CAPTURE_BLANK on self-heal pre-launch pre-3", receipt["outcomeDetail"])
+
+    def test_a_declared_self_heal_pre_launch_with_no_visual_entry_makes_the_leg_invalid(self) -> None:
+        """GPU-DEVICE-LOSS-SELF-HEAL-1 r7: the spec declares three pre-launches (generatorArgs.gpuPreLaunches) but self-heal\\pre-2 never arrived, so the
+        receipt holds no selfHealVisual entry for it; and a leg that opted out of visual capture holds none for any of them (NOT_REQUESTED)."""
+        _, receipt, _ = self.run_self_heal_visual("ok", {"pre-1": "ok", "pre-3": "ok"}, declared=3)
+        self.assertNotIn("pre-2", receipt["selfHealVisual"])
+        self.assertEqual(receipt["outcome"], "INVALID", receipt["outcomeDetail"])
+        self.assertIn("NO_VISUAL_ENTRY on self-heal pre-launch pre-2", receipt["outcomeDetail"])
+        self.assertNotIn("pre-1", receipt["outcomeDetail"])
+        _, receipt, _ = self.run_self_heal_visual("ok", {"pre-1": "ok", "pre-2": "ok", "pre-3": "ok"}, declared=3, visualCapture=False,
+                                                  visualCaptureOptOutReason="a capture-free pace A/B arm")
+        self.assertEqual(receipt["visual"]["verdict"], "NOT_REQUESTED")
+        self.assertEqual(receipt["outcome"], "INVALID", receipt["outcomeDetail"])
+        for name in ("pre-1", "pre-2", "pre-3"):
+            self.assertIn(f"NO_VISUAL_ENTRY on self-heal pre-launch {name}", receipt["outcomeDetail"])
 
     def test_a_visual_divergence_is_counted_for_speed_and_surfaced(self) -> None:
         _, receipt, _ = self.run_visual("diverge")

@@ -784,17 +784,30 @@ if ($outcome -in @('PASS', 'FAIL') -and $null -ne $receipt.visual) {
         $detail += "; VISUAL_DIVERGENCE (counted for speed, surfaced for review): $($receipt.visual.reason)"
     }
 }
-# GPU-DEVICE-LOSS-SELF-HEAL-1 r6 (CoS #437, Dot 46f5e496): the same gate over every self-heal pre-launch's captures. The fallback runs L1-L3 ARE what the leg
-# proves, so a pre-launch whose display froze makes the leg INVALID whatever the measured run showed; a divergence is surfaced in the detail, named by launch.
-if ($outcome -in @('PASS', 'FAIL') -and $null -ne $receipt['selfHealVisual']) {
-    $frozenLaunches = @($receipt['selfHealVisual'].Keys | Where-Object { $receipt['selfHealVisual'][$_].verdict -ceq 'FROZEN_DISPLAY' })
-    if ($frozenLaunches.Count -gt 0) {
-        $detail = "INVALID: the job result was $outcome ($detail) but FROZEN_DISPLAY on self-heal pre-launch " + (($frozenLaunches | ForEach-Object { "$($_): $($receipt['selfHealVisual'][$_].reason)" }) -join '; ') + '. A fallback run whose display did not change is not counted, whatever the measured run says'
-        $outcome = 'INVALID'
-    } else {
-        foreach ($launch in @($receipt['selfHealVisual'].Keys | Where-Object { $receipt['selfHealVisual'][$_].verdict -ceq 'VISUAL_DIVERGENCE' })) {
-            $detail += "; VISUAL_DIVERGENCE on self-heal pre-launch $launch (surfaced for review): $($receipt['selfHealVisual'][$launch].reason)"
+# GPU-DEVICE-LOSS-SELF-HEAL-1 r7 (sol r6 blocker; ledger scope 2026-10-15T08:05:36Z): every self-heal pre-launch the leg ran must show an OK picture. The fallback
+# runs L1-L3 ARE what the leg proves, so a PASS/FAIL leg is INVALID when any pre-launch's visual verdict is anything but OK -- FROZEN_DISPLAY, VISUAL_DIVERGENCE,
+# NOT_CAPTURED, CAPTURE_BLANK, NOT_REQUESTED or a verdict this gate does not know -- or when a pre-launch the leg ran (pre-1..pre-<n> for the n entries of
+# generatorArgs.gpuPreLaunches, plus any pre-<n> it published) has no selfHealVisual entry or an entry with no verdict. The detail names every offending launch
+# and its verdict. (The measured run's own gate above, shared by every leg, is unchanged: there a divergence stays counted.)
+$selfHealLaunches = [System.Collections.Generic.List[string]]::new()
+if ($null -ne $spec.PSObject.Properties['generatorArgs'] -and $spec.generatorArgs.PSObject.Properties['gpuPreLaunches']) {
+    for ($i = 1; $i -le @($spec.generatorArgs.gpuPreLaunches).Count; $i++) { $selfHealLaunches.Add("pre-$i") }
+}
+if ($null -ne $receipt['selfHealVisual']) {
+    foreach ($key in @($receipt['selfHealVisual'].Keys | Sort-Object { [int]([string]$_).Substring(4) })) { if (-not $selfHealLaunches.Contains([string]$key)) { $selfHealLaunches.Add([string]$key) } }
+}
+if ($outcome -in @('PASS', 'FAIL') -and $selfHealLaunches.Count -gt 0) {
+    $badLaunches = @(foreach ($launch in $selfHealLaunches) {
+        $entry = $(if ($null -ne $receipt['selfHealVisual'] -and $receipt['selfHealVisual'].Contains($launch)) { $receipt['selfHealVisual'][$launch] } else { $null })
+        if ($null -eq $entry -or [string]::IsNullOrWhiteSpace([string]$entry.verdict)) {
+            "NO_VISUAL_ENTRY on self-heal pre-launch $($launch): the leg ran it but the receipt holds no visual verdict for it"
+        } elseif ([string]$entry.verdict -cne 'OK') {
+            "$([string]$entry.verdict) on self-heal pre-launch $($launch): $($entry.reason)"
         }
+    })
+    if ($badLaunches.Count -gt 0) {
+        $detail = "INVALID: the job result was $outcome ($detail) but " + ($badLaunches -join '; ') + '. A fallback run whose picture is not OK is not counted, whatever the measured run says'
+        $outcome = 'INVALID'
     }
 }
 Complete-Receipt $outcome $detail
