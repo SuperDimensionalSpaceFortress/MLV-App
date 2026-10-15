@@ -30,6 +30,10 @@ from pathlib import Path
 STAMP = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)\.(\d+)Z (.*)$")
 TEST_LINE = re.compile(r"^\S+ \(([A-Za-z0-9_.]+)\) \.\.\. (?:ok|FAIL|ERROR|skipped.*|expected failure)$")
 KEY_PREFIX = "tools.repo_hygiene.test_"
+# A test with a docstring prints ``name (module.Class.name)`` on its own line and
+# ``<first docstring line> ... ok`` on the next, so TEST_LINE alone never sees it.
+DOC_HEAD = re.compile(r"^\S+ \(([A-Za-z0-9_.]+)\)$")
+DOC_RESULT = re.compile(r"^.* \.\.\. (?:ok|FAIL|ERROR|skipped.*|expected failure)$")
 
 
 def _seconds(stamp: re.Match[str]) -> float:
@@ -41,14 +45,24 @@ def class_seconds(log_text: str) -> dict[str, float]:
     """Seconds per ``module.Class`` in one job log."""
     totals: dict[str, float] = defaultdict(float)
     previous: float | None = None
+    pending: str | None = None
     for raw in log_text.splitlines():
         stamp = STAMP.match(raw)
         if not stamp:
             continue
         now = _seconds(stamp)
-        test = TEST_LINE.match(stamp.group(3))
-        if test and previous is not None and test.group(1).startswith(KEY_PREFIX):
-            totals[test.group(1).rsplit(".", 1)[0]] += max(0.0, now - previous)
+        text = stamp.group(3)
+        test = TEST_LINE.match(text)
+        if test:
+            name, pending = test.group(1), None
+        elif pending is not None and DOC_RESULT.match(text):
+            name, pending = pending, None
+        else:
+            doc_head = DOC_HEAD.match(text)
+            pending = doc_head.group(1) if doc_head else None
+            name = None
+        if name and previous is not None and name.startswith(KEY_PREFIX):
+            totals[name.rsplit(".", 1)[0]] += max(0.0, now - previous)
         previous = now
     return dict(totals)
 
