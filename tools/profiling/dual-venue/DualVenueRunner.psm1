@@ -49,7 +49,9 @@ $script:ReceiptSchema = 'mlv-app/dual-venue-receipt/v1'
 # contact sheet needs Python + Pillow on the venue); it is a venue condition, never a product FAIL.
 # SCALE_NOT_HONOURED (DVE-SCALE2-LOOK-LEG-1 r2): the leg played and its proof is sound, but the app rendered at a playback scale other than the one the leg's
 # spec asked for (or declared it would get), or the scale it rendered at cannot be read: no signal, never a PASS under a scale the run did not render at.
-$script:OutcomeEnum = @('PASS', 'FAIL', 'VENUE_UNHEALTHY', 'VENUE_NOT_QUIESCENT', 'VENUE_HOST_MISMATCH', 'DEVICE_UNAVAILABLE', 'UNRESOLVED', 'RETRACTED', 'INVALID', 'VENUE_TOOLING', 'SCALE_NOT_HONOURED')
+# HEAPDUMP_CAPTURE_FAILED (CPU-SCOPE-LIVE-HEAP-CORRUPTION-1 r7): the leg asked for a heap-corruption debugger watch (generatorArgs.heapCorruptionDump) and its
+# capture is not verified (captureState NO_TARGET / KILLED / STOP_FAILED, or no record came back): no signal, never a silent PASS.
+$script:OutcomeEnum = @('PASS', 'FAIL', 'VENUE_UNHEALTHY', 'VENUE_NOT_QUIESCENT', 'VENUE_HOST_MISMATCH', 'DEVICE_UNAVAILABLE', 'UNRESOLVED', 'RETRACTED', 'INVALID', 'VENUE_TOOLING', 'SCALE_NOT_HONOURED', 'HEAPDUMP_CAPTURE_FAILED')
 
 function Get-DvOutcomeEnum { $script:OutcomeEnum }
 
@@ -2127,6 +2129,9 @@ function New-DvReceipt {
         # PLAYBACK-VISUAL-INSPECTION-1: a speed leg's window captures (Read-DvVisualCaptures): requested / opted out, the frames and their hashes,
         # the distinct-picture count, the play-vs-paused difference, the strip, and the gate verdict. Null on a look leg (its contact sheet is the look).
         visual = $null
+        # CPU-SCOPE-LIVE-HEAP-CORRUPTION-1 r7: a heap-corruption-dump leg's typed capture (requested, captureState, reason, dumps with bytes / sha256 / copy and
+        # hash time). Null on a leg that did not ask for the debugger watch.
+        heapDump = $null
         # Retired in round 3 (no registry snapshot is taken any more: master isolates an automation run's settings store; the
         # receipt's playback.settingsIsolated is the proof). The key stays null so a reader written against round 2 still parses.
         registry = $null

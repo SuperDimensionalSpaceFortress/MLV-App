@@ -2496,11 +2496,14 @@ function Start-AttrCudaHeapDumpWatch {
     -ExePath whose command line contains -CommandLineMatch and no --help (the feature probes run `--gui-smoke-playback --help`). Its script
     and log stay in -DumpDir. Never throws: the record says why no watcher runs. Returns the record Stop-AttrCudaHeapDumpWatch completes.
     -DumpType is the MINIDUMP_TYPE: the default 0x1826 is full memory + handles + unloaded modules + memory info + thread info.
+    r7 (CoS #432): every write this function makes goes through the job's slot-checked helpers (New-AttrCudaDirectory, Publish-AttrCudaText);
+    the watcher log is CREATED here through Publish-AttrCudaText, so the hidden watcher only appends to a slot already proven a plain file,
+    and its dump is opened CreateNew (an existing name, a link included, is refused, never written through).
     #>
     param([Parameter(Mandatory = $true)][string]$ExePath, [Parameter(Mandatory = $true)][string]$DumpDir, [ValidateRange(10, 7200)][int]$MaxWaitSec = 900,
         [string]$CommandLineMatch = '--gui-smoke-playback', [ValidateRange(0, 0x3FFFFF)][int]$DumpType = 0x1826, [string]$PwshPath = '')
     $record = [ordered]@{ schema = 'mlv-app/heap-corruption-dump/v1'; requested = $true; dumpDir = $DumpDir; debugger = 'dbghelp-minidump'; dumpType = $DumpType
-        watcherPid = $null; startedUtc = $null; reason = $null; watcherExited = $null; watcherLog = @(); dumps = @() }
+        watcherPid = $null; startedUtc = $null; reason = $null; watcherExited = $null; captureState = $null; watcherLog = @(); dumps = @() }
     $debuggerSource = @'
     using System;
     using System.IO;
@@ -2615,7 +2618,8 @@ function Start-AttrCudaHeapDumpWatch {
 '@
     try {
         if ([string]::IsNullOrWhiteSpace($PwshPath)) { $PwshPath = Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe' }
-        [void](New-Item -ItemType Directory -Force -Path $DumpDir)
+        [void](New-AttrCudaDirectory -Path $DumpDir)
+        [void](Publish-AttrCudaText -Path (Join-Path $DumpDir 'watcher.log') -Value ([DateTime]::UtcNow.ToString('o') + ' WATCH_REQUESTED'))
         $quote = { param($s) "'" + ([string]$s).Replace("'", "''") + "'" }
         $exeName = Split-Path -Leaf $ExePath
         $watcher = @(
@@ -2644,8 +2648,7 @@ function Start-AttrCudaHeapDumpWatch {
             'W (''DEBUGGER_EXIT rc='' + $rc)'
             'exit $rc'
         ) -join "`n"
-        $watcherPath = Join-Path $DumpDir 'heap-dump-watcher.ps1'
-        [IO.File]::WriteAllText($watcherPath, $watcher, [Text.UTF8Encoding]::new($false))
+        $watcherPath = Publish-AttrCudaText -Path (Join-Path $DumpDir 'heap-dump-watcher.ps1') -Value $watcher
         $info = New-Object System.Diagnostics.ProcessStartInfo
         $info.FileName = $PwshPath
         $info.Arguments = "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$watcherPath`""
@@ -2667,9 +2670,19 @@ function Stop-AttrCudaHeapDumpWatch {
     Complete a Start-AttrCudaHeapDumpWatch record after the smoke run returned. A watcher that never attached (no ATTACH line: the app
     never started) is stopped at once; an attached one is waited for, bounded (it ends when the app's process exits, after any dump is
     written), and its tree killed only past -WaitSec (kill-on-exit is off, so the app is never taken with it). Then records the watcher
-    log and every *.dmp (name, bytes) and writes <DumpDir>\heap-dump.json. Never throws.
+    log and every *.dmp (name, bytes), types the capture (captureState, below) and writes <DumpDir>\heap-dump.json through
+    Publish-AttrCudaText. Never throws.
+    captureState (r7, CoS #432) is exactly one of:
+      ATTACHED_NO_CRASH  the debugger attached (DEBUGGER_ATTACHED), the app exited (EXIT_PROCESS) and no trigger exception was seen;
+      DUMPED             a DUMP_WRITTEN line and a non-empty *.dmp: the crash was captured;
+      NO_TARGET          the watcher never attached (no smoke instance appeared, or it was still waiting when the run returned);
+      KILLED             the watcher was still attached -WaitSec after the run returned and its tree was killed;
+      STOP_FAILED        anything else: the watcher could not start, compile or attach, a trigger exception left no dump, the app's exit
+                         was never seen, or this function itself failed.
+    Only the first two are a verified capture: the runner fails any other leg HEAPDUMP_CAPTURE_FAILED (never a silent PASS).
     #>
     param([Parameter(Mandatory = $true)]$Record, [ValidateRange(0, 1800)][int]$WaitSec = 300)
+    $killed = $false
     try {
         $dir = [string]$Record['dumpDir']
         $logPath = if ($dir) { Join-Path $dir 'watcher.log' } else { $null }
@@ -2681,16 +2694,32 @@ function Stop-AttrCudaHeapDumpWatch {
             else {
                 try { & taskkill.exe /PID $Record['watcherPid'] /T /F 2>&1 | Out-Null } catch { }
                 $Record['watcherExited'] = $false
+                $killed = [bool]$attached
                 $Record['reason'] = $(if ($attached) { "WATCHER_KILLED still running $WaitSec s after the smoke run returned" } else { 'WATCHER_NO_TARGET the smoke instance never appeared before the run returned' })
             }
         }
+        $log = @()
         if ($dir -and (Test-Path -LiteralPath $dir -PathType Container)) {
-            if (Test-Path -LiteralPath $logPath) { $Record['watcherLog'] = @(Get-Content -LiteralPath $logPath -Tail 20) }
+            if (Test-Path -LiteralPath $logPath) { $log = @(Get-Content -LiteralPath $logPath); $Record['watcherLog'] = @($log | Select-Object -Last 20) }
             $Record['dumps'] = @(Get-ChildItem -LiteralPath $dir -File -Filter '*.dmp' -ErrorAction SilentlyContinue | ForEach-Object { [ordered]@{ name = $_.Name; bytes = $_.Length } })
-            [IO.File]::WriteAllText((Join-Path $dir 'heap-dump.json'), ($Record | ConvertTo-Json -Depth 4), [Text.UTF8Encoding]::new($false))
+        }
+        $has = { param($token) @($log | Where-Object { $_.Contains($token) }).Count -gt 0 }
+        $Record['captureState'] = $(
+            if ($null -eq $Record['watcherPid']) { 'STOP_FAILED' }
+            elseif ((& $has ' DUMP_WRITTEN ') -and @($Record['dumps'] | Where-Object { $_['bytes'] -gt 0 }).Count -gt 0) { 'DUMPED' }
+            elseif ($killed) { 'KILLED' }
+            elseif ((& $has ' NO_TARGET ') -or -not (& $has ' ATTACH pid=')) { $(if (& $has ' COMPILE_FAILED ') { 'STOP_FAILED' } else { 'NO_TARGET' }) }
+            elseif ((& $has ' DEBUGGER_ATTACHED pid=') -and (& $has ' EXIT_PROCESS ') -and -not (& $has ' EXCEPTION code=') -and $Record['watcherExited'] -eq $true) { 'ATTACHED_NO_CRASH' }
+            else { 'STOP_FAILED' })
+        if ($Record['captureState'] -ceq 'STOP_FAILED' -and [string]::IsNullOrEmpty([string]$Record['reason'])) {
+            $Record['reason'] = 'WATCHER_CAPTURE_UNVERIFIED ' + $(if (& $has ' EXCEPTION code=') { 'a trigger exception left no dump' } elseif (-not (& $has ' DEBUGGER_ATTACHED pid=')) { 'the debugger never attached' } else { 'the app exit was never seen' })
+        }
+        if ($dir -and (Test-Path -LiteralPath $dir -PathType Container)) {
+            [void](Publish-AttrCudaText -Path (Join-Path $dir 'heap-dump.json') -Value ($Record | ConvertTo-Json -Depth 4))
         }
     } catch {
         $Record['reason'] = "WATCHER_STOP_FAILED $($_.Exception.GetType().Name)"
+        $Record['captureState'] = 'STOP_FAILED'
     }
     return $Record
 }

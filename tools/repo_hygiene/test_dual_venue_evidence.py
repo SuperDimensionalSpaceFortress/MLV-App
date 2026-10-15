@@ -5691,7 +5691,7 @@ class LegSpecSchemaTests(unittest.TestCase):
             self.assertEqual((spec["legType"], spec["clipId"], spec["playSeconds"], spec["backends"], spec["scaleFactor"], spec["displayMode"]),
                              ("speed", "M16-1243", 25, ["cpu"], 1, mode), rel)
             look = {"disableLookAssist": True} if look_off else {}
-            # r6: the windowed leg (the one soaked) also keeps a procdump heap-corruption dump.
+            # r6: the windowed leg (the one soaked) also keeps a heap-corruption dump (the compiled attach-by-pid debugger watch).
             dump = {"heapCorruptionDump": True} if mode == "windowed" else {}
             self.assertEqual(spec["generatorArgs"], {"telemetryArm": "LIGHT", "cpuQuiescenceThresholdPercent": 95, **look, "scope": "histogram", "scopeIntervalMs": 0,
                                                      "scopesDuringPlayback": "throttled", **dump}, rel)
@@ -6437,7 +6437,9 @@ class VisualCaptureGeneratorTests(unittest.TestCase):
 
 
 # CPU-SCOPE-LIVE-HEAP-CORRUPTION-1 r6: the heap-corruption dump. A heap fail-fast (c0000374) never reaches the app's own crash minidump and
-# WER LocalDumps is HKLM, so a leg may ask for a procdump watcher that attaches to the smoke's MLVApp by pid. All test names carry "heap_dump".
+# WER LocalDumps is HKLM, so a leg may ask for a debugger watch (a minimal debugger compiled in the job; no external tool) that attaches to the
+# smoke's MLVApp by pid. All test names carry "heap_dump". r7: Stop-AttrCudaHeapDumpWatch types the capture (captureState); the runner fails an
+# unverified capture HEAPDUMP_CAPTURE_FAILED; the soak accounting never pools attached and unattached legs.
 HEAP_OPEN = "CPU-SCOPE-LIVE-HEAP-CORRUPTION-1 >>>"
 HEAP_CLOSE = "CPU-SCOPE-LIVE-HEAP-CORRUPTION-1 <<<"
 
@@ -6519,12 +6521,15 @@ class HeapDumpVenueHelperTests(unittest.TestCase):
             proc = self.run_module(f"$r = Start-AttrCudaHeapDumpWatch -ExePath 'C:\\x\\MLVApp-heap-watch-absent.exe' -DumpDir '{d}\\hd' -MaxWaitSec 600\n"
                                    "Start-Sleep -Seconds 3; $t0 = Get-Date\n"
                                    "$r = Stop-AttrCudaHeapDumpWatch -Record $r -WaitSec 300\n"
-                                   "Write-Output ('SEC=' + [int]((Get-Date) - $t0).TotalSeconds); Write-Output ('REASON=' + $r.reason); Write-Output ('DUMPS=' + @($r.dumps).Count)")
+                                   "Write-Output ('SEC=' + [int]((Get-Date) - $t0).TotalSeconds); Write-Output ('REASON=' + $r.reason); Write-Output ('DUMPS=' + @($r.dumps).Count)\n"
+                                   "Write-Output ('CAPTURE=' + $r.captureState)")
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             out = dict(l.split("=", 1) for l in proc.stdout.splitlines() if "=" in l)
             self.assertEqual(out["DUMPS"], "0")
             self.assertTrue(out["REASON"].startswith("WATCHER_NO_TARGET"), out["REASON"])
             self.assertLess(int(out["SEC"]), 60, "a watcher that never attached is not waited out")
+            # r7 captureState pin: NO_TARGET
+            self.assertEqual(out["CAPTURE"], "NO_TARGET")
 
     def test_the_heap_dump_watch_dumps_the_heap_corruption_of_the_smoke_instance_never_a_help_probe(self) -> None:
         import os
@@ -6541,7 +6546,7 @@ class HeapDumpVenueHelperTests(unittest.TestCase):
                 "[void]$t.WaitForExit(90000); try { $help.Kill() } catch { }\n"
                 "$r = Stop-AttrCudaHeapDumpWatch -Record $r -WaitSec 90\n"
                 "Write-Output ('TARGET=' + $t.Id); Write-Output ('HELP=' + $help.Id); Write-Output ('EXITED=' + $r.watcherExited); Write-Output ('REASON=' + $r.reason)\n"
-                "Write-Output ('DUMPS=' + @($r.dumps).Count)\n"
+                "Write-Output ('DUMPS=' + @($r.dumps).Count); Write-Output ('CAPTURE=' + $r.captureState)\n"
                 "$r.watcherLog | ForEach-Object { Write-Output ('LOG=' + $_) }\n"
                 f"Get-ChildItem -LiteralPath '{d}\\hd' -Filter '*.dmp' | ForEach-Object {{ Write-Output ('SIG=' + [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($_.FullName)[0..3])) }}\n"
                 f"Write-Output ('JSON=' + (Test-Path -LiteralPath '{d}\\hd\\heap-dump.json'))")
@@ -6555,10 +6560,182 @@ class HeapDumpVenueHelperTests(unittest.TestCase):
             self.assertTrue(any(" EXCEPTION code=0xC0000374 first=1 " in l for l in log), log)
             self.assertTrue(any(" DUMP_WRITTEN " in l and l.endswith("context=1") for l in log), log)
             self.assertTrue(any(l.endswith("DEBUGGER_EXIT rc=0") for l in log), log)
+            # r7 captureState pin: DUMPED
+            self.assertEqual(out["CAPTURE"], "DUMPED", proc.stdout)
+
+    # r7 (CoS #432): one pinned test per captureState. NO_TARGET and DUMPED are pinned by the two tests above; the three below pin the rest.
+    def _ps51(self) -> Path:
+        import os
+        return Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+
+    def test_heap_dump_capture_state_attached_no_crash_when_the_target_exits_cleanly(self) -> None:
+        ps51 = self._ps51()
+        with tempfile.TemporaryDirectory(prefix="heap-clean-") as d:
+            target = Path(d) / "heap-clean-target.ps1"
+            target.write_text("Start-Sleep -Seconds 6\nexit 0\n", encoding="ascii")
+            proc = self.run_module(
+                f"$r = Start-AttrCudaHeapDumpWatch -ExePath '{ps51}' -DumpDir '{d}\\hd' -CommandLineMatch '{target.name}' -DumpType 0 -MaxWaitSec 90\n"
+                f"$t = Start-Process -FilePath '{ps51}' -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','{target}' -WindowStyle Hidden -PassThru\n"
+                "[void]$t.WaitForExit(90000)\n"
+                "$r = Stop-AttrCudaHeapDumpWatch -Record $r -WaitSec 90\n"
+                "Write-Output ('CAPTURE=' + $r.captureState); Write-Output ('REASON=' + $r.reason); Write-Output ('DUMPS=' + @($r.dumps).Count)\n"
+                f"Write-Output ('JSONSTATE=' + (Get-Content -LiteralPath '{d}\\hd\\heap-dump.json' -Raw | ConvertFrom-Json).captureState)")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            out = dict(l.split("=", 1) for l in proc.stdout.splitlines() if "=" in l)
+            self.assertEqual((out["CAPTURE"], out["REASON"], out["DUMPS"], out["JSONSTATE"]), ("ATTACHED_NO_CRASH", "", "0", "ATTACHED_NO_CRASH"), proc.stdout)
+
+    def test_heap_dump_capture_state_killed_when_the_attached_watcher_outlives_the_wait(self) -> None:
+        ps51 = self._ps51()
+        with tempfile.TemporaryDirectory(prefix="heap-kill-") as d:
+            target = Path(d) / "heap-kill-target.ps1"
+            target.write_text("Start-Sleep -Seconds 120\n", encoding="ascii")
+            proc = self.run_module(
+                f"$r = Start-AttrCudaHeapDumpWatch -ExePath '{ps51}' -DumpDir '{d}\\hd' -CommandLineMatch '{target.name}' -DumpType 0 -MaxWaitSec 90\n"
+                f"$t = Start-Process -FilePath '{ps51}' -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','{target}' -WindowStyle Hidden -PassThru\n"
+                f"$deadline = (Get-Date).AddSeconds(60); while ((Get-Date) -lt $deadline -and -not (Select-String -LiteralPath '{d}\\hd\\watcher.log' -SimpleMatch -Pattern 'DEBUGGER_ATTACHED' -Quiet)) {{ Start-Sleep -Milliseconds 250 }}\n"
+                "try { $r = Stop-AttrCudaHeapDumpWatch -Record $r -WaitSec 2 } finally { try { $t.Kill() } catch { } }\n"
+                "Write-Output ('CAPTURE=' + $r.captureState); Write-Output ('REASON=' + $r.reason); Write-Output ('EXITED=' + $r.watcherExited)")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            out = dict(l.split("=", 1) for l in proc.stdout.splitlines() if "=" in l)
+            self.assertEqual((out["CAPTURE"], out["EXITED"]), ("KILLED", "False"), proc.stdout)
+            self.assertTrue(out["REASON"].startswith("WATCHER_KILLED"), out["REASON"])
+
+    def test_heap_dump_capture_state_stop_failed_when_the_watcher_cannot_start(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="heap-nostart-") as d:
+            proc = self.run_module(
+                f"$r = Start-AttrCudaHeapDumpWatch -ExePath 'C:\\x\\MLVApp-heap-watch-absent.exe' -DumpDir '{d}\\hd' -MaxWaitSec 10 -PwshPath '{d}\\no-such-pwsh.exe'\n"
+                "$r = Stop-AttrCudaHeapDumpWatch -Record $r -WaitSec 5\n"
+                "Write-Output ('CAPTURE=' + $r.captureState); Write-Output ('REASON=' + $r.reason)\n"
+                f"Write-Output ('JSONSTATE=' + (Get-Content -LiteralPath '{d}\\hd\\heap-dump.json' -Raw | ConvertFrom-Json).captureState)")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            out = dict(l.split("=", 1) for l in proc.stdout.splitlines() if "=" in l)
+            self.assertEqual((out["CAPTURE"], out["JSONSTATE"]), ("STOP_FAILED", "STOP_FAILED"), proc.stdout)
+            self.assertTrue(out["REASON"].startswith("WATCHER_START_FAILED"), out["REASON"])
+
+    def test_heap_dump_watch_writes_only_through_the_publish_helpers(self) -> None:
+        """r7 (CoS #432): Start-/Stop-AttrCudaHeapDumpWatch write nothing raw; the directory, the watcher log, the watcher script and
+        heap-dump.json go through New-AttrCudaDirectory / Publish-AttrCudaText. The hidden watcher's own appends (Add-Content in its W function,
+        the C# Log) go to the log slot Start created through Publish-AttrCudaText, and its dump is opened CreateNew."""
+        module = ATTR_MODULE.read_text(encoding="utf-8")
+        bodies = {fn: re.search(r"(?ms)^function " + fn + r" \{.*?^\}", module).group(0) for fn in ("Start-AttrCudaHeapDumpWatch", "Stop-AttrCudaHeapDumpWatch")}
+        for fn, body in bodies.items():
+            for raw in ("[IO.File]::WriteAllText", "[IO.File]::WriteAllBytes", "Set-Content", "Out-File", "Copy-Item", "Move-Item", "New-Item"):
+                self.assertNotIn(raw, body, f"{fn} writes raw with {raw}")
+        start, stop = bodies["Start-AttrCudaHeapDumpWatch"], bodies["Stop-AttrCudaHeapDumpWatch"]
+        self.assertIn("[void](New-AttrCudaDirectory -Path $DumpDir)", start)
+        self.assertIn("[void](Publish-AttrCudaText -Path (Join-Path $DumpDir 'watcher.log')", start)
+        self.assertIn("$watcherPath = Publish-AttrCudaText -Path (Join-Path $DumpDir 'heap-dump-watcher.ps1') -Value $watcher", start)
+        self.assertEqual(start.count("Add-Content"), 1, "only the hidden watcher's W function appends")
+        self.assertIn("FileMode.CreateNew", start)
+        self.assertIn("[void](Publish-AttrCudaText -Path (Join-Path $dir 'heap-dump.json')", stop)
+        for state in ("ATTACHED_NO_CRASH", "DUMPED", "NO_TARGET", "KILLED", "STOP_FAILED"):
+            self.assertIn(f"'{state}'", stop, f"captureState {state} is not produced")
 
 
 @requires_windows_pwsh
-class VisualCaptureVenueHelperTests(unittest.TestCase):
+class HeapDumpRunnerReceiptTests(RunnerHarness, unittest.TestCase):
+    """r7 (CoS #432): Invoke-VenueLeg lifts the job's captureState into receipt.heapDump and fails an unverified capture HEAPDUMP_CAPTURE_FAILED
+    (never a silent PASS); a dump's bytes, sha256 and copy / hash time are kept (row b)."""
+
+    def setUp(self) -> None:
+        self.make_harness()
+        param_tail = "$DisplayMode,[switch]$VisualCapture)"
+        self.assertIn(param_tail, STUB_GENERATOR, "STUB_GENERATOR param list changed; update this replace target")
+        self.gen.write_text(STUB_GENERATOR.replace(param_tail, "$DisplayMode,[switch]$VisualCapture,[switch]$HeapCorruptionDump)", 1), encoding="utf-8")
+        spec = json.loads(self.write_spec().read_text(encoding="utf-8"))
+        spec["generatorArgs"] = {"heapCorruptionDump": True}
+        self.spec = self.tmp / "spec-heap-dump.json"
+        self.spec.write_text(json.dumps(spec), encoding="utf-8")
+        self.write_artifacts()
+
+    def publish(self, record: dict | None, dump: bytes | None = None) -> None:
+        hd = self.artifacts / "heapdump"
+        shutil.rmtree(hd, ignore_errors=True)
+        hd.mkdir(parents=True)
+        if record is not None:
+            (hd / "heap-dump.json").write_text(json.dumps(record), encoding="utf-8")
+        (hd / "watcher.log").write_text("2026-10-15T00:00:00Z WATCH_REQUESTED\n", encoding="utf-8")
+        if dump is not None:
+            (hd / "MLVApp_1_20261015T000000.dmp").write_bytes(dump)
+
+    def record(self, state: str, **extra) -> dict:
+        return dict({"schema": "mlv-app/heap-corruption-dump/v1", "requested": True, "watcherPid": 1, "watcherExited": True, "reason": None, "captureState": state, "dumps": []}, **extra)
+
+    def test_heap_dump_receipt_keeps_a_verified_capture_and_its_outcome(self) -> None:
+        self.publish(self.record("ATTACHED_NO_CRASH"))
+        proc, receipt, _ = self.run_leg("ultra-magnus", self.spec)
+        self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+        self.assertEqual((receipt["heapDump"]["captureState"], receipt["heapDump"]["captureVerified"], receipt["heapDump"]["dumps"]), ("ATTACHED_NO_CRASH", True, []))
+
+    def test_heap_dump_receipt_fails_an_unverified_capture_never_a_silent_pass(self) -> None:
+        for state in ("NO_TARGET", "KILLED", "STOP_FAILED"):
+            with self.subTest(state=state):
+                self.publish(self.record(state, reason=f"why {state}"))
+                proc, receipt, _ = self.run_leg("ultra-magnus", self.spec)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(receipt["outcome"], "HEAPDUMP_CAPTURE_FAILED", receipt["outcomeDetail"])
+                self.assertIn(f"captureState {state} (why {state}); the job result was PASS", receipt["outcomeDetail"])
+                self.assertIn("DVE_OUTCOME=HEAPDUMP_CAPTURE_FAILED", proc.stdout)
+                self.assertFalse(receipt["heapDump"]["captureVerified"])
+        # no record at all, an untyped (r6b) record, and a DUMPED record whose dump did not come back are not verified either
+        for record, why in ((None, "HEAP_DUMP_RECORD_ABSENT"), ({"schema": "mlv-app/heap-corruption-dump/v1", "watcherPid": 1}, "HEAP_DUMP_RECORD_UNTYPED"),
+                            (self.record("DUMPED"), "DUMP_NOT_RETURNED")):
+            with self.subTest(why=why):
+                self.publish(record)
+                proc, receipt, _ = self.run_leg("ultra-magnus", self.spec)
+                self.assertEqual((receipt["outcome"], receipt["heapDump"]["captureState"]), ("HEAPDUMP_CAPTURE_FAILED", "STOP_FAILED"), receipt["outcomeDetail"])
+                self.assertIn(why, receipt["heapDump"]["reason"])
+
+    def test_heap_dump_receipt_records_the_dump_bytes_sha256_and_copy_and_hash_time(self) -> None:
+        dump = b"MDMP" + b"\x00" * 4096
+        self.publish(self.record("DUMPED", dumps=[{"name": "MLVApp_1_20261015T000000.dmp", "bytes": len(dump)}]), dump=dump)
+        proc, receipt, _ = self.run_leg("ultra-magnus", self.spec)
+        self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+        self.assertEqual(receipt["heapDump"]["captureState"], "DUMPED")
+        [d] = receipt["heapDump"]["dumps"]
+        self.assertEqual((d["name"], d["bytes"], d["sha256"]), ("MLVApp_1_20261015T000000.dmp", len(dump), hashlib.sha256(dump).hexdigest()))
+        self.assertIsInstance(d["copyMs"], int)
+        self.assertIsInstance(d["hashMs"], int)
+
+    def test_heap_dump_receipt_is_null_on_a_leg_that_did_not_ask(self) -> None:
+        self.publish(None)
+        proc, receipt, _ = self.run_leg("ultra-magnus", self.write_spec())
+        self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+        self.assertIsNone(receipt["heapDump"])
+
+
+@requires_windows_pwsh
+class HeapDumpSoakAccountingTests(unittest.TestCase):
+    """r7 (hub ruling 2026-10-15T11:25:44Z row a): Get-HeapDumpSoakAccounting.ps1 never pools debugger-attached and unattached legs, and marks a leg
+    that asked for the watch without a verified attach 'capture not verified' (an r6b log with an ATTACH line but no DEBUGGER_ATTACHED included)."""
+
+    def account(self, records: list[dict]) -> dict:
+        with tempfile.TemporaryDirectory(prefix="heap-acct-") as d:
+            path = Path(d) / "legs.jsonl"
+            path.write_text("\n".join(json.dumps(r) for r in records) + "\n", encoding="utf-8")
+            proc = run_pwsh(["-File", str(DV / "Get-HeapDumpSoakAccounting.ps1"), "-LegsJsonl", str(path), "-AsJson"])
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            return json.loads(proc.stdout)
+
+    def test_heap_dump_soak_accounting_never_pools_and_marks_capture_not_verified(self) -> None:
+        leg = {"status": "RAN", "stopCycle": True, "dumps": []}
+        records = [
+            dict(leg, name="U-1", arm="CTL-W", crash=False),                                     # r3: no watch at all -> unattached
+            dict(leg, name="U-2", arm="FIX-W", crash=True),
+            dict(leg, name="A-1", arm="FIX-W", crash=False, heapDumpWatch="x | ATTACH pid=7 | y DEBUGGER_ATTACHED pid=7 | EXIT_PROCESS exitCode=0"),
+            dict(leg, name="N-1", arm="FIX-W", crash=False, heapDumpWatch="x | ATTACH pid=7 | PROCDUMP_EXIT rc=-1"),   # the r6b procdump shim
+            dict(leg, name="A-2", arm="CTL-W", crash=False, watch="debugger", captureState="ATTACHED_NO_CRASH"),
+            dict(leg, name="N-2", arm="CTL-W", crash=False, watch="debugger", captureState="NO_TARGET"),
+            dict(leg, name="U-3", arm="UN-W", crash=False, watch="none"),
+            dict(leg, name="P-1", arm="PH-W", crash=False, watch="debugger", captureState="ATTACHED_NO_CRASH", pageHeap=True),
+            dict(leg, name="X-1", arm="FIX-W", crash=False, status="NO_CHAIN_RESULT"),
+        ]
+        g = self.account(records)["groups"]
+        self.assertEqual((g["unattached"]["legs"], g["unattached"]["crashes"]), (3, 1))
+        self.assertEqual((g["attached"]["legs"], g["attached"]["crashes"]), (2, 0))
+        self.assertEqual(g["pageheap"]["legs"], 1)
+        self.assertEqual(sorted(n.split(" ")[0] for n in g["captureNotVerified"]["names"]), ["N-1", "N-2"])
+        self.assertEqual(sum(g[k]["legs"] for k in g), 8, "every RAN leg is in exactly one group; the NO_CHAIN_RESULT leg is in none")
     """The venue-side helpers the job splices in (AttrCudaArtifacts.psm1)."""
 
     def run_module(self, script: str) -> subprocess.CompletedProcess:
