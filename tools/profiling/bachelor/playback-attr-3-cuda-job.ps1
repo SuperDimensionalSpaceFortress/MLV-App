@@ -4594,6 +4594,28 @@ if (-not [string]::IsNullOrEmpty($AutomationSettingsDir)) {
     if ($postFirst -lt 0 -or $text.IndexOf($postAnchor, $postFirst + 1, [StringComparison]::Ordinal) -ge 0) { throw 'DUAL_VENUE_GPU_SELF_HEAL_ANCHOR_MISSING the job template has no single smoke-launch-done site to delete the settings store after' }
     $postAt = $postFirst + $postAnchor.Length
     $text = $text.Substring(0, $postAt) + $eol + $postLaunchBlock + $text.Substring($postAt)
+    # r6 (CoS #437): with pre-launches, the L1..L4 facts (Get-AttrCudaSelfHealMetrics) become scalar metrics of the measured run's SUCCESS
+    # summary.json, so the leg's criteria gate them and the receipt validator re-derives them like every other metric. Two bracketed regions:
+    # the computation just before that summary is written, and one summary line per metric right after its cpuFrames line.
+    if ($GpuPreLaunches.Count -gt 0) {
+        $metricsAnchor = '# A SUCCESS summary.json, which the failure paths above all write but the success path did not:'
+        $metricsAt = $text.IndexOf($metricsAnchor, [StringComparison]::Ordinal)
+        if ($metricsAt -lt 0 -or $text.IndexOf($metricsAnchor, $metricsAt + 1, [StringComparison]::Ordinal) -ge 0) { throw 'DUAL_VENUE_GPU_SELF_HEAL_ANCHOR_MISSING the job template has no single success-summary site to add the self-heal metrics to' }
+        $keysAnchor = '    cpuFrames = $gpuSummary.cpuFrames' + $eol
+        $keysAt = $text.IndexOf($keysAnchor, $metricsAt, [StringComparison]::Ordinal)
+        if ($keysAt -lt 0) { throw 'DUAL_VENUE_GPU_SELF_HEAL_ANCHOR_MISSING the success summary has no cpuFrames line to put the self-heal metrics after' }
+        $keyLines = @('    # GPU-DEVICE-LOSS-SELF-HEAL-1 r6 >>>') +
+            @(Get-AttrCudaSelfHealMetricNames -PreLaunchCount $GpuPreLaunches.Count | ForEach-Object { "    $_ = `$selfHealMetrics['$_']" }) +
+            @('    # GPU-DEVICE-LOSS-SELF-HEAL-1 r6 <<<')
+        $text = $text.Substring(0, $keysAt + $keysAnchor.Length) + (($keyLines -join $eol) + $eol) + $text.Substring($keysAt + $keysAnchor.Length)
+        $metricsBlock = @(
+            '# GPU-DEVICE-LOSS-SELF-HEAL-1 r6 >>> (the self-heal proof''s L1..L4 metrics, read from what the pre-launches and the measured run published)'
+            ((Get-AttrCudaEmbeddedFunctionSource -Name @('Get-AttrCudaSelfHealMetricNames', 'Get-AttrCudaSelfHealMetrics')) -replace "\r?\n", $eol)
+            '$selfHealMetrics = Get-AttrCudaSelfHealMetrics -SelfHealDir $selfHealPub -PreLaunches $gpuPreLaunches -MeasuredLogText $rawLog -MeasuredSessionId $measuredSmokeSessionId'
+            '# GPU-DEVICE-LOSS-SELF-HEAL-1 r6 <<<'
+        ) -join $eol
+        $text = $text.Substring(0, $metricsAt) + $metricsBlock + $eol + $text.Substring($metricsAt)
+    }
     # Each pre-launch is one more smoke run inside the job: the um-run timeout grows by one smoke-process timeout per pre-launch.
     if ($GpuPreLaunches.Count -gt 0) {
         $timeBudget['preLaunchSec'] = [int]($GpuPreLaunches.Count * [Math]::Ceiling($timeBudget.smokeProcessTimeoutMs / 1000.0))

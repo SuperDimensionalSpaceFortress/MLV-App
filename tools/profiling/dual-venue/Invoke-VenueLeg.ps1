@@ -708,7 +708,7 @@ if ($visualRequest.applies -and $visualRequest.requested -and $artifactsShare -a
         $receipt.visual.stripCopyPath = $stripCopy
     }
     # GPU-DEVICE-LOSS-SELF-HEAL-1 r5: each self-heal pre-launch (the fallback runs L1-L3) published its own captures under self-heal\pre-<n>\visual; each gets the
-    # same visual block, keyed by its index, so the recovery a reviewer must see is gated like the measured run. Absent on every other leg.
+    # same visual block, keyed by its index (receipt.selfHealVisual). r6: the visual gate below folds every one of them into the leg's outcome. Absent on every other leg.
     $selfHealLocal = Join-Path $evidenceDir 'self-heal'
     if (Test-Path -LiteralPath $selfHealLocal -PathType Container) {
         $receipt['selfHealVisual'] = [ordered]@{}
@@ -782,6 +782,19 @@ if ($outcome -in @('PASS', 'FAIL') -and $null -ne $receipt.visual) {
         $outcome = 'INVALID'
     } elseif ($receipt.visual.verdict -ceq 'VISUAL_DIVERGENCE') {
         $detail += "; VISUAL_DIVERGENCE (counted for speed, surfaced for review): $($receipt.visual.reason)"
+    }
+}
+# GPU-DEVICE-LOSS-SELF-HEAL-1 r6 (CoS #437, Dot 46f5e496): the same gate over every self-heal pre-launch's captures. The fallback runs L1-L3 ARE what the leg
+# proves, so a pre-launch whose display froze makes the leg INVALID whatever the measured run showed; a divergence is surfaced in the detail, named by launch.
+if ($outcome -in @('PASS', 'FAIL') -and $null -ne $receipt['selfHealVisual']) {
+    $frozenLaunches = @($receipt['selfHealVisual'].Keys | Where-Object { $receipt['selfHealVisual'][$_].verdict -ceq 'FROZEN_DISPLAY' })
+    if ($frozenLaunches.Count -gt 0) {
+        $detail = "INVALID: the job result was $outcome ($detail) but FROZEN_DISPLAY on self-heal pre-launch " + (($frozenLaunches | ForEach-Object { "$($_): $($receipt['selfHealVisual'][$_].reason)" }) -join '; ') + '. A fallback run whose display did not change is not counted, whatever the measured run says'
+        $outcome = 'INVALID'
+    } else {
+        foreach ($launch in @($receipt['selfHealVisual'].Keys | Where-Object { $receipt['selfHealVisual'][$_].verdict -ceq 'VISUAL_DIVERGENCE' })) {
+            $detail += "; VISUAL_DIVERGENCE on self-heal pre-launch $launch (surfaced for review): $($receipt['selfHealVisual'][$launch].reason)"
+        }
     }
 }
 Complete-Receipt $outcome $detail

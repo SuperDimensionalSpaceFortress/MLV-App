@@ -3148,6 +3148,160 @@ function New-AttrCudaOwnedRoot {
     [pscustomobject]@{ Path = $full; Swept = $swept; Quarantined = $quarantined }
 }
 
+function Get-AttrCudaSelfHealMetricNames {
+    <#
+    .SYNOPSIS
+    GPU-DEVICE-LOSS-SELF-HEAL-1 r6: the names, in order, of the self-heal metrics a job with -PreLaunchCount
+    pre-launches publishes in its success summary.json (Get-AttrCudaSelfHealMetrics fills them; the generator
+    emits one summary line per name). L<n> is pre-launch n; L<PreLaunchCount + 1> is the measured run.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][int]$PreLaunchCount)
+    $names = @('selfHealPreLaunches', 'selfHealMeasuredPresentedFps')
+    foreach ($n in 1..$PreLaunchCount) {
+        foreach ($suffix in 'Rc', 'PreLaunchOk', 'InjectedFaultCode', 'BreakerTrip', 'SafeStartFlag', 'SafeStartRoute', 'CudaFrames', 'CpuFrames',
+                            'GpuPreviewFrames', 'RefusedGpuPlaybackRecon', 'PresentedFps', 'FpsRatio') {
+            $names += "selfHealL$n$suffix"
+        }
+    }
+    $names += "selfHealL$($PreLaunchCount + 1)FlagCleared"
+    $names += 'selfHealSettingsStoreDeleted'
+    $names
+}
+
+function Get-AttrCudaSelfHealMetrics {
+    <#
+    .SYNOPSIS
+    GPU-DEVICE-LOSS-SELF-HEAL-1 r6 (CoS #437): the L1..L4 facts of the self-heal proof, as flat scalar metrics
+    for the measured run's summary.json, so the leg's criteria gate them (and the receipt validator re-derives
+    them) like every other metric. Read from what the job published under <SelfHealDir>: pre-<n>\ (pre-launch.json,
+    the smoke result.json, the run log result.json.run.log, the GPU field log, the shared store's INI after the
+    launch) and main\ (the measured run's GPU field log and INI, settings-dir.json).
+    .DESCRIPTION
+    A fact that cannot be read is $null, never a default: a criterion on an absent metric fails, so a skipped,
+    failed or underivable pre-launch fails the leg. Per pre-launch n:
+      Rc                      the smoke runner's exit code (raw).
+      PreLaunchOk             1 when the launch ran (record present, no error) and the smoke runner passed, or
+                              failed ONLY on gpu_texture_route_readback_regression: the CUDA texture-route assertion
+                              a launch that leaves CUDA by design fails by construction. 0 otherwise.
+      InjectedFaultCode       the cuda code of the injected device-loss fault in its GPU field log (0: none).
+      BreakerTrip             1 when the log records device_loss/cuda_suppressed_session.
+      SafeStartFlag           1 when the shared INI holds SafeStartEnabled=true after the launch.
+      SafeStartRoute          1 when the log records safe_start/cpu_route (the launch started on the CPU).
+      CudaFrames / CpuFrames / GpuPreviewFrames   the measured session's playback_smoke.gpu_summary counts
+                              (CUDA = recon readback + texture readback + texture no-readback).
+      RefusedGpuPlaybackRecon the measured session's debayered16_recon_reuse_summary refused_gpu_playback_recon.
+      PresentedFps / FpsRatio its playback_smoke.summary presented_fps, and that over the measured run's.
+    and FlagCleared (the measured run): 1 when its log records safe_start_flag/cleared_env and the INI after it
+    has no SafeStartEnabled=true. SettingsStoreDeleted: 1 when settings-dir.json proves the store was removed.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$SelfHealDir,
+        [Parameter(Mandatory = $true)][string[]]$PreLaunches,
+        [AllowEmptyString()][string]$MeasuredLogText = '',
+        [AllowEmptyString()][string]$MeasuredSessionId = ''
+    )
+
+    $m = [ordered]@{}
+    foreach ($name in (Get-AttrCudaSelfHealMetricNames -PreLaunchCount $PreLaunches.Count)) { $m[$name] = $null }
+    $readText = {
+        param([string]$Path)
+        if (Test-Path -LiteralPath $Path -PathType Leaf) { [IO.File]::ReadAllText($Path) } else { $null }
+    }
+    $readJson = {
+        param([string]$Path)
+        $t = & $readText $Path
+        if ($null -eq $t) { return $null }
+        try { $t | ConvertFrom-Json } catch { $null }
+    }
+    # key=value fields of the LAST <marker> line of the session the smoke runner measured (playback_smoke.measured_session id=<n>)
+    $sessionLine = {
+        param([string]$LogText, [string]$Session, [string]$Marker)
+        if ([string]::IsNullOrEmpty($LogText)) { return $null }
+        if ([string]::IsNullOrEmpty($Session)) {
+            $sm = [regex]::Match($LogText, 'playback_smoke\.measured_session id=(\d+)')
+            if (-not $sm.Success) { return $null }
+            $Session = $sm.Groups[1].Value
+        }
+        $found = $null
+        foreach ($lm in [regex]::Matches($LogText, '(?m)' + [regex]::Escape($Marker) + ' session=' + [regex]::Escape($Session) + ' (?<rest>[^\r\n]*)')) { $found = $lm.Groups['rest'].Value }
+        if ($null -eq $found) { return $null }
+        $fields = @{}
+        foreach ($kv in [regex]::Matches($found, '([A-Za-z0-9_]+)=(\S*)')) { $fields[$kv.Groups[1].Value] = $kv.Groups[2].Value }
+        $fields
+    }
+    $telemetry = {
+        param([string]$Dir)
+        $faults = @{}
+        $recoveries = @{}
+        foreach ($f in @(Get-ChildItem -LiteralPath $Dir -File -Filter 'gpu-field-telemetry.jsonl*' -ErrorAction SilentlyContinue | Sort-Object Name)) {
+            foreach ($line in [IO.File]::ReadAllLines($f.FullName)) {
+                try { $j = $line | ConvertFrom-Json } catch { continue }
+                if ($j.kind -ceq 'fault' -and $j.device_loss -eq $true -and $j.site -ceq 'MLVAPP_GPU_FAULT_INJECT') { $faults[[string]$j.fault_utc_ms] = [int]$j.cuda_code }
+                elseif ($j.kind -ceq 'recovery') { $recoveries["$($j.what)/$($j.outcome)"] = $true }
+            }
+        }
+        [pscustomobject]@{ faults = $faults; recoveries = $recoveries }
+    }
+    $iniFlag = {
+        param([string]$Path)
+        $t = & $readText $Path
+        if ($null -eq $t) { return $null }
+        $(if ([regex]::IsMatch($t, '(?m)^SafeStartEnabled=true\s*$')) { 1 } else { 0 })
+    }
+    $fps = {
+        param($Fields)
+        if ($null -eq $Fields -or -not $Fields.ContainsKey('presented_fps')) { return $null }
+        [double]$Fields['presented_fps']
+    }
+
+    $measuredFps = & $fps (& $sessionLine $MeasuredLogText $MeasuredSessionId 'playback_smoke.summary')
+    $m['selfHealMeasuredPresentedFps'] = $measuredFps
+    $records = 0
+    for ($n = 1; $n -le $PreLaunches.Count; $n++) {
+        $dir = Join-Path $SelfHealDir "pre-$n"
+        $record = & $readJson (Join-Path $dir 'pre-launch.json')
+        if ($null -eq $record) { continue }
+        $records++
+        $p = "selfHealL$n"
+        $rc = $(if ($null -ne $record.rc) { [int]$record.rc } else { $null })
+        $m["$($p)Rc"] = $rc
+        $failures = $null
+        $smoke = & $readJson (Join-Path $dir 'result.json')
+        if ($null -ne $smoke -and $null -ne $smoke.PSObject.Properties['validation'] -and $null -ne $smoke.validation) { $failures = @($smoke.validation.failures | Where-Object { $null -ne $_ }) }
+        $ok = $null -eq $record.error -and $null -ne $rc -and (
+            $rc -eq 0 -or ($rc -eq 1 -and $null -ne $failures -and $failures.Count -gt 0 -and
+                           @($failures | Where-Object { -not ([string]$_).StartsWith('gpu_texture_route_readback_regression:') }).Count -eq 0))
+        $m["$($p)PreLaunchOk"] = $(if ($ok) { 1 } else { 0 })
+        $tel = & $telemetry $dir
+        $m["$($p)InjectedFaultCode"] = $(if ($tel.faults.Count -gt 0) { @($tel.faults.Values)[0] } else { 0 })
+        $m["$($p)BreakerTrip"] = $(if ($tel.recoveries.ContainsKey('device_loss/cuda_suppressed_session')) { 1 } else { 0 })
+        $m["$($p)SafeStartRoute"] = $(if ($tel.recoveries.ContainsKey('safe_start/cpu_route')) { 1 } else { 0 })
+        $m["$($p)SafeStartFlag"] = & $iniFlag (Join-Path $dir 'MLVApp.ini')
+        $log = & $readText (Join-Path $dir 'result.json.run.log')
+        $gpu = & $sessionLine $log '' 'playback_smoke.gpu_summary'
+        if ($null -ne $gpu) {
+            $m["$($p)CudaFrames"] = [long]$gpu['gpu_recon_readback_frames'] + [long]$gpu['gpu_texture_readback_frames'] + [long]$gpu['gpu_texture_no_readback_frames']
+            $m["$($p)CpuFrames"] = [long]$gpu['cpu_frames']
+            $m["$($p)GpuPreviewFrames"] = [long]$gpu['gpu_preview_frames']
+        }
+        $reuse = & $sessionLine $log '' 'playback_smoke.debayered16_recon_reuse_summary'
+        if ($null -ne $reuse -and $reuse.ContainsKey('refused_gpu_playback_recon')) { $m["$($p)RefusedGpuPlaybackRecon"] = [long]$reuse['refused_gpu_playback_recon'] }
+        $launchFps = & $fps (& $sessionLine $log '' 'playback_smoke.summary')
+        $m["$($p)PresentedFps"] = $launchFps
+        if ($null -ne $launchFps -and $null -ne $measuredFps -and $measuredFps -gt 0) { $m["$($p)FpsRatio"] = [Math]::Round($launchFps / $measuredFps, 4) }
+    }
+    $m['selfHealPreLaunches'] = $records
+    $main = Join-Path $SelfHealDir 'main'
+    $mainTel = & $telemetry $main
+    $mainFlag = & $iniFlag (Join-Path $main 'MLVApp.ini')
+    if ($null -ne $mainFlag) { $m["selfHealL$($PreLaunches.Count + 1)FlagCleared"] = $(if ($mainTel.recoveries.ContainsKey('safe_start_flag/cleared_env') -and $mainFlag -eq 0) { 1 } else { 0 }) }
+    $store = & $readJson (Join-Path $main 'settings-dir.json')
+    if ($null -ne $store) { $m['selfHealSettingsStoreDeleted'] = $(if ($store.treeRemoved -eq $true -and $store.stillExists -eq $false) { 1 } else { 0 }) }
+    $m
+}
+
 function Initialize-AttrCudaFileIdNative {
     <#
     .SYNOPSIS
@@ -6902,6 +7056,8 @@ function Get-AttrCudaConformAwareSourceFramesVerdict {
 
 Export-ModuleMember -Function `
     Get-AttrCudaArtifactNames, `
+    Get-AttrCudaSelfHealMetricNames, `
+    Get-AttrCudaSelfHealMetrics, `
     New-AttrCudaBuildInfoHeader, `
     Get-AttrCudaEmbeddedFunctionSource, `
     Expand-AttrCudaTemplate, `

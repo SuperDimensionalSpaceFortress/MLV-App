@@ -621,6 +621,8 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         self.assertLess(text.index(self.SELF_HEAL_OWNER_ANCHOR), text.index("$presentMonProc = Start-PresentMonCapture"))
         post = text.index(self.SELF_HEAL_POST_OPEN)
         self.assertEqual(text.index(self.SELF_HEAL_LAUNCH_DONE) + len(self.SELF_HEAL_LAUNCH_DONE), post)
+        text, r6_regions = self.SELF_HEAL_R6.subn("", text)
+        self.assertEqual(r6_regions, 2, "r6: the metrics computation and the success summary's metric lines")
         stripped = text.replace(env_lines, "", 1)
         stripped = stripped[:stripped.index(self.SELF_HEAL_PRE_OPEN)] + stripped[stripped.index(self.SELF_HEAL_OWNER_ANCHOR):]
         post = stripped.index(self.SELF_HEAL_POST_OPEN)
@@ -661,6 +663,42 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
             broken["generatorArgs"].update(bad)
             with self.assertRaises(jsonschema.ValidationError, msg=str(bad)):
                 jsonschema.validate(broken, schema)
+
+    SELF_HEAL_R6 = re.compile(r"(?ms)^[ ]*# GPU-DEVICE-LOSS-SELF-HEAL-1 r6 >>>.*?^[ ]*# GPU-DEVICE-LOSS-SELF-HEAL-1 r6 <<<\n")
+
+    def test_the_gpu_self_heal_job_writes_its_l1_to_l4_metrics_into_the_success_summary(self) -> None:
+        """GPU-DEVICE-LOSS-SELF-HEAL-1 r6 (CoS #437): with pre-launches the job computes the L1..L4 metrics (Get-AttrCudaSelfHealMetrics, embedded)
+        after the measured run published self-heal\\main and its run log is read, and writes one line per metric into the SUCCESS summary.json -- the
+        file whose scalars are the receipt's verbatim metrics, so the leg's criteria gate them and the validator re-derives them. Every metric the
+        tracked leg's criteria name is one the job writes. Without pre-launches neither region exists."""
+        job = self.generate(GENERATOR, "shm.job.ps1", ["-TelemetryArm", "HEAVY", "-AutomationSettingsDir", "gpu-self-heal-settings",
+                                                       "-GpuPreLaunches", "702@120,702@120,none", "-GpuSafeStart", "clear"])
+        self.assertEqual(self.parse_errors(job), 0)
+        text = lf(job.read_text(encoding="utf-8"))
+        self.assertEqual(len(self.SELF_HEAL_R6.findall(text)), 2)
+        self.assertEqual(text.count("function Get-AttrCudaSelfHealMetrics {"), 1)
+        self.assertEqual(text.count("function Get-AttrCudaSelfHealMetricNames {"), 1)
+        compute = text.index("$selfHealMetrics = Get-AttrCudaSelfHealMetrics -SelfHealDir $selfHealPub -PreLaunches $gpuPreLaunches "
+                             "-MeasuredLogText $rawLog -MeasuredSessionId $measuredSmokeSessionId\n")
+        success = text.index("# A SUCCESS summary.json, which the failure paths above all write")
+        self.assertLess(text.index(self.SELF_HEAL_POST_OPEN), compute, "after the measured run's self-heal\\main is published")
+        self.assertLess(text.index("$measuredSmokeSessionId = Get-MeasuredSmokeSessionId $rawLog\n"), compute)
+        self.assertLess(compute, success)
+        summary = text[success:text.index("\n})", success)]
+        proc = run_pwsh(["-Command", f"Import-Module '{ATTR_MODULE}' -Force; Get-AttrCudaSelfHealMetricNames -PreLaunchCount 3"])
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        names = proc.stdout.split()
+        self.assertEqual(len(names), 2 + 3 * 12 + 2)
+        for name in names:
+            self.assertEqual(summary.count(f"\n    {name} = $selfHealMetrics['{name}']\n"), 1, name)
+        leg = json.loads((DV / SELF_HEAL_LEG).read_text(encoding="utf-8"))
+        for role in ("acceptance", "supplementary"):
+            gated = {c["metric"] for c in leg["criteria"][role]["cuda"]}
+            self.assertEqual(gated - set(names), {"rows", "gpuFramesTotal", "cpuFrames"}, role)
+        store_only = lf(self.generate(GENERATOR, "shm-store.job.ps1", ["-TelemetryArm", "HEAVY", "-AutomationSettingsDir", "gpu-self-heal-settings"])
+                        .read_text(encoding="utf-8"))
+        self.assertNotIn("GPU-DEVICE-LOSS-SELF-HEAL-1 r6", store_only)
+        self.assertNotIn("Get-AttrCudaSelfHealMetrics", store_only)
 
     def test_the_runner_passes_a_legs_swap_interval_to_the_generator(self) -> None:
         runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
@@ -6712,6 +6750,29 @@ class VisualCaptureRunnerTests(RunnerHarness, unittest.TestCase):
         self.assertIn("FROZEN_DISPLAY", receipt["outcomeDetail"])
         self.assertFalse(receipt["visual"]["counted"])
 
+    def run_self_heal_visual(self, measured: str, launches: dict):
+        self.write_artifacts()
+        write_visual_captures(self.artifacts / "visual", measured)
+        for name, mode in launches.items():
+            write_visual_captures(self.artifacts / "self-heal" / name / "visual", mode)
+        return self.run_leg("ultra-magnus", self.write_spec(), extra=["-Backend", "cpu"])
+
+    def test_a_frozen_self_heal_pre_launch_makes_the_leg_invalid_whatever_the_measured_run_shows(self) -> None:
+        """GPU-DEVICE-LOSS-SELF-HEAL-1 r6 (CoS #437, Dot 46f5e496): r5 recorded each pre-launch's verdict in receipt.selfHealVisual but gated only
+        receipt.visual, so a frozen fallback run sat beside a PASS. Every pre-launch verdict is now folded into the outcome."""
+        _, receipt, _ = self.run_self_heal_visual("ok", {"pre-1": "ok", "pre-2": "frozen", "pre-3": "ok"})
+        self.assertEqual(receipt["visual"]["verdict"], "OK", "the measured run's own display moved")
+        self.assertEqual([receipt["selfHealVisual"][k]["verdict"] for k in ("pre-1", "pre-2", "pre-3")], ["OK", "FROZEN_DISPLAY", "OK"])
+        self.assertEqual(receipt["outcome"], "INVALID", receipt["outcomeDetail"])
+        self.assertIn("FROZEN_DISPLAY on self-heal pre-launch pre-2", receipt["outcomeDetail"])
+        self.assertNotIn("pre-1:", receipt["outcomeDetail"])
+
+    def test_a_diverging_self_heal_pre_launch_stays_counted_and_is_named_in_the_detail(self) -> None:
+        _, receipt, _ = self.run_self_heal_visual("ok", {"pre-1": "diverge", "pre-2": "ok"})
+        self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+        self.assertIn("VISUAL_DIVERGENCE on self-heal pre-launch pre-1", receipt["outcomeDetail"])
+        self.assertNotIn("pre-2", receipt["outcomeDetail"])
+
     def test_a_visual_divergence_is_counted_for_speed_and_surfaced(self) -> None:
         _, receipt, _ = self.run_visual("diverge")
         self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
@@ -6747,6 +6808,129 @@ class VisualCaptureRunnerTests(RunnerHarness, unittest.TestCase):
         _, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(), gen_refusal="PLAYBACK_ATTR3_OWNER_NOT_CONSENTED stub")
         self.assertEqual(receipt["outcome"], "DEVICE_UNAVAILABLE")
         self.assertEqual((receipt["visual"]["requested"], receipt["visual"]["verdict"]), (True, "NOT_CAPTURED"))
+
+
+SELF_HEAL_ROUTE_FAILURE = ("gpu_texture_route_readback_regression: 528 frame(s) did not reach gpu_texture_no_readback (cpu_frames=528) while the GPU "
+                           "recon texture-present no-readback route was requested in GL-window mode; every frame must reach gpu_texture_no_readback.")
+
+
+def write_self_heal_evidence(root: Path, case: str = "good") -> None:
+    """<artifacts>\\self-heal as the r5 job published it on Bachelor (d3ed879b), reduced to the lines the metrics read: L1 and L2 inject 702 (L2's
+    second loss sets the flag), L3 starts on the CPU, the measured run L4 clears the flag. `case` breaks exactly one fact."""
+    if root.exists():
+        shutil.rmtree(root)
+    launches = {1: ("702@120", 58, 528, 22.597), 2: ("702@120", 58, 528, 22.4), 3: ("none", 0, 595, 23.289)}
+    for n, (inject, cuda, cpu, fps) in launches.items():
+        d = root / f"pre-{n}"
+        if case == "skipped-l2" and n == 2:
+            continue
+        d.mkdir(parents=True)
+        record = {"schema": "mlv-app/gpu-self-heal-pre-launch/v1", "index": n, "faultInject": inject, "startedUtc": "2026-10-15T08:26:35Z",
+                  "finishedUtc": "2026-10-15T08:27:58Z", "rc": 1, "error": None}
+        failures = [SELF_HEAL_ROUTE_FAILURE]
+        if case == "underivable-l1" and n == 1:
+            record.update(rc=None, error="PRE_LAUNCH_COMMAND_UNDERIVABLE")
+        if case == "smoke-failed-l1" and n == 1:
+            failures.append("Playback did not advance past frame 0.")
+        (d / "pre-launch.json").write_text(json.dumps(record), encoding="utf-8")
+        (d / "result.json").write_text(json.dumps({"schema": "mlvapp-gui-smoke-result.v2", "validation": {"failures": failures}}), encoding="utf-8")
+        preview = 12 if case == "gpu-preview-l3" and n == 3 else 0
+        refused = 397 if case == "refused-recon-l3" and n == 3 else 0
+        if case == "slow-l1" and n == 1:
+            fps = 10.6
+        (d / "result.json.run.log").write_text("\n".join([
+            "[2026-10-15T08:27:10.400Z] [INFO] [0xd900] playback_smoke.measured_session id=1",
+            f"[2026-10-15T08:27:36.324Z] [INFO] [0xd900] playback_smoke.summary session=1 reason=visual-capture presented_frames=586 presented_fps={fps} last_presented_frame=597",
+            f"[2026-10-15T08:27:36.326Z] [INFO] [0xd900] playback_smoke.gpu_summary session=1 cpu_frames={cpu} gpu_preview_frames={preview} gpu_recon_readback_frames=0 "
+            f"gpu_texture_readback_frames=0 gpu_texture_no_readback_frames={cuda}",
+            f"[2026-10-15T08:27:36.336Z] [INFO] [0xd900] playback_smoke.debayered16_recon_reuse_summary session=1 scope=presented_frames refused_acquisition_failed=0 "
+            f"refused_gpu_playback_recon={refused} reduced_consumed_frames={cpu}", ""]), encoding="utf-8")
+        rows = []
+        if inject != "none" and not (case == "no-fault-l2" and n == 2):
+            rows.append({"schema": "gpu-field-telemetry.v1", "kind": "fault", "dll": "inject", "stage": "recon:run", "rc": -1, "cuda_code": 702,
+                         "cuda_name": "cudaErrorLaunchTimeout", "site": "MLVAPP_GPU_FAULT_INJECT", "fault_utc_ms": 1792052833759.0 + n, "device_loss": True, "role": "primary"})
+            rows.append({"schema": "gpu-field-telemetry.v1", "kind": "recovery", "what": "device_loss", "outcome": "cuda_suppressed_session"})
+        if n == 2:
+            rows.append({"schema": "gpu-field-telemetry.v1", "kind": "recovery", "what": "safe_start_flag", "outcome": "set"})
+        if n == 3:
+            rows.append({"schema": "gpu-field-telemetry.v1", "kind": "recovery", "what": "safe_start", "outcome": "cpu_route"})
+        (d / "gpu-field-telemetry.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+        flag = n >= 2 and not (case == "no-flag-l2" and n == 2)
+        (d / "MLVApp.ini").write_text("[GpuDeviceLoss]\nRecentLosses=\"1792052833768|gpu;610.74;1808x2268x14c\"\n" + ("SafeStartEnabled=true\n" if flag else ""), encoding="utf-8")
+    main = root / "main"
+    main.mkdir(parents=True)
+    (main / "gpu-field-telemetry.jsonl").write_text(json.dumps({"schema": "gpu-field-telemetry.v1", "kind": "recovery", "what": "safe_start_flag",
+                                                                "outcome": "cleared_env"}) + "\n", encoding="utf-8")
+    (main / "MLVApp.ini").write_text("[GpuDeviceLoss]\nRecentLosses=\"1792052833768|gpu;610.74;1808x2268x14c\"\n"
+                                     + ("SafeStartEnabled=true\n" if case == "flag-kept-l4" else ""), encoding="utf-8")
+    (main / "settings-dir.json").write_text(json.dumps({"schema": "mlv-app/gpu-self-heal-settings-dir/v1", "treeRemoved": True, "filesRemoved": 1, "left": 0,
+                                                        "stillExists": False}), encoding="utf-8")
+
+
+@requires_windows_pwsh
+class SelfHealLegGatesTheL1ToL4FactsTests(unittest.TestCase):
+    """GPU-DEVICE-LOSS-SELF-HEAL-1 r6 (CoS #437): the tracked self-heal leg's criteria, evaluated by the runner's own Test-DvCriteria on the metrics the job
+    writes (Get-AttrCudaSelfHealMetrics, round-tripped through summary.json and Get-DvVerbatimMetrics as a receipt reads them). r1-r5 judged only the
+    measured run's counters, so a failed, skipped or underivable pre-launch, a breaker that never tripped or a slow fallback still passed."""
+
+    CASES = {  # case -> the criteria it must fail (good: none)
+        "good": [],
+        "l4-counters-only": ["selfHealPreLaunches", "selfHealL1PreLaunchOk", "selfHealL1BreakerTrip", "selfHealL2SafeStartFlag", "selfHealL3SafeStartRoute",
+                             "selfHealL4FlagCleared"],
+        "skipped-l2": ["selfHealPreLaunches", "selfHealL2PreLaunchOk", "selfHealL2InjectedFaultCode", "selfHealL2FpsRatio"],
+        "underivable-l1": ["selfHealL1PreLaunchOk"],
+        "smoke-failed-l1": ["selfHealL1PreLaunchOk"],
+        "no-fault-l2": ["selfHealL2InjectedFaultCode", "selfHealL2BreakerTrip"],
+        "no-flag-l2": ["selfHealL2SafeStartFlag"],
+        "gpu-preview-l3": ["selfHealL3GpuPreviewFrames"],
+        "refused-recon-l3": ["selfHealL3RefusedGpuPlaybackRecon"],
+        "slow-l1": ["selfHealL1FpsRatio"],
+        "flag-kept-l4": ["selfHealL4FlagCleared"],
+    }
+
+    def test_the_self_heal_leg_passes_only_when_every_l1_to_l4_fact_holds(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="sh-gate-") as d:
+            measured = Path(d) / "measured.log"
+            measured.write_text("playback_smoke.measured_session id=1\nplayback_smoke.summary session=1 reason=visual-capture presented_frames=599 "
+                                "presented_fps=23.201\n", encoding="utf-8")
+            for case in self.CASES:
+                if case != "l4-counters-only":
+                    write_self_heal_evidence(Path(d) / case / "self-heal", "good" if case == "good" else case)
+            script = (f"$ErrorActionPreference = 'Stop'; Import-Module '{ATTR_MODULE}' -Force; Import-Module '{DV / 'DualVenueRunner.psm1'}' -Force\n"
+                      f"$spec = [IO.File]::ReadAllText('{DV / SELF_HEAL_LEG}') | ConvertFrom-Json\n"
+                      f"$log = [IO.File]::ReadAllText('{measured}')\n"
+                      "$out = [ordered]@{}\n"
+                      f"foreach ($case in @({', '.join(repr(c) for c in self.CASES)})) {{\n"
+                      "  $summary = [ordered]@{ result = 'MEASUREMENT_CAPTURED'; rows = 600; gpuFramesTotal = 599; cpuFrames = 0 }\n"
+                      "  if ($case -cne 'l4-counters-only') {\n"
+                      f"    $m = Get-AttrCudaSelfHealMetrics -SelfHealDir (Join-Path (Join-Path '{d}' $case) 'self-heal') -PreLaunches @('702@120', '702@120', 'none') -MeasuredLogText $log -MeasuredSessionId ''\n"
+                      "    foreach ($k in $m.Keys) { $summary[$k] = $m[$k] }\n"
+                      "  }\n"
+                      "  $metrics = Get-DvVerbatimMetrics -Summary (($summary | ConvertTo-Json -Depth 4) | ConvertFrom-Json) -EvidenceManifest $null\n"
+                      "  $v = Test-DvCriteria -Criteria $spec.criteria.acceptance.cuda -Metrics $metrics\n"
+                      "  $s = Test-DvCriteria -Criteria $spec.criteria.supplementary.cuda -Metrics $metrics\n"
+                      "  $out[$case] = [ordered]@{ pass = $v.pass; supplementaryPass = $s.pass; failures = @($v.failures); metrics = $metrics }\n"
+                      "}\n"
+                      "$out | ConvertTo-Json -Depth 6 -Compress")
+            proc = run_pwsh(["-Command", script])
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        out = json.loads(proc.stdout)
+        good = out["good"]
+        self.assertTrue(good["pass"] and good["supplementaryPass"], good["failures"])
+        self.assertEqual((good["metrics"]["selfHealL1Rc"], good["metrics"]["selfHealL1PreLaunchOk"], good["metrics"]["selfHealL3CudaFrames"],
+                          good["metrics"]["selfHealL1FpsRatio"]), (1, 1, 0, 0.974))
+        for case, expected in self.CASES.items():
+            if case == "good":
+                continue
+            with self.subTest(case):
+                got = out[case]
+                self.assertFalse(got["pass"], case)
+                self.assertFalse(got["supplementaryPass"], case)
+                failed = sorted({f.split(" ")[0].rstrip(":") for f in got["failures"]})
+                for metric in expected:
+                    self.assertIn(metric, failed, f"{case}: {got['failures']}")
+                if case not in ("l4-counters-only", "skipped-l2"):
+                    self.assertEqual(sorted(expected), failed, f"{case} breaks exactly its own fact: {got['failures']}")
 
 
 class VisualCaptureSpecAndAppSourceTests(unittest.TestCase):
