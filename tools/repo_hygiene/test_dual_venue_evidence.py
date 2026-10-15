@@ -6486,6 +6486,49 @@ class VisualCaptureGeneratorTests(unittest.TestCase):
         self.assertGreater(runner.index(mapping), runner.index("if (-not $isLook -and $spec.generatorArgs.PSObject.Properties['forceLookAssist']"))
         self.assertLess(runner.index(mapping), runner.index("$gen['ContactSheet'] = $true; $gen['ContactSheetFrames']"))
 
+    def test_the_visual_capture_self_heal_pre_launches_keep_their_own_captures(self) -> None:
+        """GPU-DEVICE-LOSS-SELF-HEAL-1 r5: the probe adds '--visual-capture-dir', <$Work\\visual> to $cmd BEFORE the self-heal pre-launches run, so each
+        pre-launch (the fallback runs L1-L3) is pointed at its own pre-<n>\\visual and publishes it under self-heal\\pre-<n>; a swap that cannot be proven
+        empties the command (PRE_LAUNCH_COMMAND_UNDERIVABLE). Without -VisualCapture the self-heal job never names a pre-launch capture."""
+        self_heal = ["-TelemetryArm", "HEAVY", "-AutomationSettingsDir", "gpu-self-heal-settings", "-GpuPreLaunches", "702@120,702@120,none", "-GpuSafeStart", "clear"]
+        off = lf(self.generate(GENERATOR, "vis-sh-off.job.ps1", self_heal).read_text(encoding="utf-8"))
+        self.assertNotIn("preVisual", off)
+        on_job = self.generate(GENERATOR, "vis-sh-on.job.ps1", [*self_heal, "-VisualCapture"])
+        self.assertEqual(self.parse_errors(on_job), 0)
+        text = lf(on_job.read_text(encoding="utf-8"))
+        pre = text.index("# GPU-DEVICE-LOSS-SELF-HEAL-1 r2: the shared run-scoped settings store and the self-heal pre-launches")
+        self.assertLess(text.index("$cmd = Add-AttrCudaVisualCaptureArgument -Command $cmd -VisualCaptureDir $visualCaptureDir"), pre,
+                        "the measured run's capture argument is already on $cmd when the pre-launches derive theirs")
+        swap = text.index("    $preVisualDir = Join-Path $preDir 'visual'\n")
+        self.assertLess(text.index("    $preCmd = $cmd.Replace(", pre), swap)
+        self.assertLess(swap, text.index("    if (-not $preCmd.Contains($preResult)", pre), "the swap runs before the command is proven and launched")
+        publish = "    [void](Publish-AttrCudaVisualCaptures -Record $visualCaptureRecord -SourceDir $preVisualDir -PubRoot $prePub)\n"
+        self.assertEqual(text.count(publish), 1)
+        self.assertLess(text.index("    [void](New-AttrCudaDirectory -Path $prePub)\n"), text.index(publish))
+        # the swap itself, run on the command shape the probe produced (a quote in the path included), and fail closed when the pair is absent
+        lines = text[swap:text.index("    }\n", swap) + 6]
+        script = ("$ErrorActionPreference = 'Stop'; Import-Module '" + str(ATTR_MODULE) + "' -Force\n"
+                  "$visualCaptureRecord = @{ forwarded = $true }; $visualCaptureDir = \"C:\\w'k\\visual\"\n"
+                  "foreach ($case in 'ok', 'absent') {\n"
+                  "  $preDir = Join-Path $env:TEMP ('vis-sh-' + [guid]::NewGuid().ToString('N') + \"\\o'1\")\n"
+                  "  $preCmd = \"& 'smoke.ps1' -Output 'r.json' -AdditionalArgs @('--windowed')\"\n"
+                  "  if ($case -ceq 'ok') { $preCmd = Add-AttrCudaVisualCaptureArgument -Command $preCmd -VisualCaptureDir $visualCaptureDir }\n"
+                  + lines +
+                  "  Write-Output ($case + '=' + $preCmd)\n"
+                  "  Write-Output ($case + '_dir=' + (Test-Path -LiteralPath $preVisualDir -PathType Container))\n"
+                  "  Remove-Item -LiteralPath (Split-Path -Parent $preDir) -Recurse -Force -ErrorAction SilentlyContinue\n"
+                  "}\n")
+        proc = run_pwsh(["-Command", script])
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        out = dict(l.split("=", 1) for l in proc.stdout.splitlines() if "=" in l)
+        self.assertNotIn("C:\\w''k\\visual", out["ok"], "the measured run's capture directory is never handed to a pre-launch")
+        self.assertRegex(out["ok"], r"^& 'smoke\.ps1' -Output 'r\.json' -AdditionalArgs @\('--windowed', '--visual-capture-dir', '.*\\o''1\\visual'\)$")
+        self.assertEqual(out["ok_dir"], "True")
+        self.assertEqual(out["absent"], "", "a command whose capture pair cannot be swapped is emptied, so the job's proof check refuses it")
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        self.assertIn("Read-DvVisualCaptures -Requested $true -ArtifactsDir $preDir.FullName -EvidenceDir (Join-Path $preDir.FullName 'inspected')", runner)
+        self.assertIn("$receipt['selfHealVisual'][$preDir.Name] = $preVisual", runner)
+
 
 @requires_windows_pwsh
 class VisualCaptureVenueHelperTests(unittest.TestCase):

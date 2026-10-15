@@ -4508,6 +4508,22 @@ if (-not [string]::IsNullOrEmpty($AutomationSettingsDir)) {
     $eol = if ($text.Contains("`r`n")) { "`r`n" } else { "`n" }
     $scratchLiteral = "'" + $venueScratchRoot.Replace("'", "''") + "'"
     $preLaunchLiteral = '@(' + (($GpuPreLaunches | ForEach-Object { "'$_'" }) -join ', ') + ')'
+    # r5, with -VisualCapture: the job's probe has already added '--visual-capture-dir', <$Work\visual> to $cmd, so each pre-launch is pointed at its OWN
+    # pre-<n>\visual (never the measured run's directory) and publishes it under self-heal\pre-<n>\visual. A command the swap cannot be proven on is not run.
+    $preVisualRedirect = @()
+    $preVisualPublish = @()
+    if ($VisualCapture) {
+        $preVisualRedirect = @(
+            '    $preVisualDir = Join-Path $preDir ''visual'''
+            '    if ($visualCaptureRecord[''forwarded'']) {'
+            '        [void](New-Item -ItemType Directory -Path $preVisualDir -Force)'
+            '        $preVisualTo = "''--visual-capture-dir'', ''" + $preVisualDir.Replace("''", "''''") + "''"'
+            '        $preCmd = $preCmd.Replace("''--visual-capture-dir'', ''" + $visualCaptureDir.Replace("''", "''''") + "''", $preVisualTo)'
+            '        if (-not $preCmd.Contains($preVisualTo)) { $preCmd = '''' }'
+            '    }'
+        )
+        $preVisualPublish = @('    [void](Publish-AttrCudaVisualCaptures -Record $visualCaptureRecord -SourceDir $preVisualDir -PubRoot $prePub)')
+    }
     # The store is created FRESH and journalled (New-AttrCudaOwnedRoot), so the delete after the measured run is by proof. Then the pre-launches, each the
     # measured run's own $cmd with its own -Output and env list, before the owner-footage check (which then covers them too), PresentMon and the measured run.
     $preLaunchBlock = @(
@@ -4528,6 +4544,7 @@ if (-not [string]::IsNullOrEmpty($AutomationSettingsDir)) {
         '    if ($preInject -cne ''none'') { $preEnvs += "MLVAPP_GPU_FAULT_INJECT=$preInject" }'
         '    $preEnvList = "''" + ($preEnvs -join "'',''") + "''"'
         '    $preCmd = $cmd.Replace("-Output $(ConvertTo-PsSingleQuoted $resultPath) ", "-Output $(ConvertTo-PsSingleQuoted $preResult) ").Replace("-ExtraEnvironment @($envList)", "-ExtraEnvironment @($preEnvList)")'
+        $preVisualRedirect
         '    $preRecord = [ordered]@{ schema = ''mlv-app/gpu-self-heal-pre-launch/v1''; index = $preIndex; faultInject = $preInject; startedUtc = (Get-Date).ToUniversalTime().ToString(''o''); finishedUtc = $null; rc = $null; error = $null }'
         '    if (-not $preCmd.Contains($preResult) -or -not $preCmd.Contains("-ExtraEnvironment @($preEnvList)")) {'
         '        $preRecord.error = ''PRE_LAUNCH_COMMAND_UNDERIVABLE'''
@@ -4544,6 +4561,7 @@ if (-not [string]::IsNullOrEmpty($AutomationSettingsDir)) {
         '    $preRecord.finishedUtc = (Get-Date).ToUniversalTime().ToString(''o'')'
         '    $prePub = Join-Path $selfHealPub "pre-$preIndex"'
         '    [void](New-AttrCudaDirectory -Path $prePub)'
+        $preVisualPublish
         '    $preFiles = @(Get-ChildItem -LiteralPath $preDir -File) + @(Get-ChildItem -LiteralPath $preDir -Directory -Filter ''logs-*'' | ForEach-Object { Get-ChildItem -LiteralPath $_.FullName -File | Where-Object { $_.Name -like ''gpu-field-telemetry.jsonl*'' -or $_.Name -like ''mlvapp-*.log'' } })'
         '    foreach ($preFile in $preFiles) { [void](Publish-AttrCudaFileCopy -Source $preFile.FullName -Destination (Join-Path $prePub $preFile.Name)) }'
         '    $preIni = Join-Path $automationSettingsDir ''MLVApp.ini'''

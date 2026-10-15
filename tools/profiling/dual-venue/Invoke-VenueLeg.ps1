@@ -707,6 +707,24 @@ if ($visualRequest.applies -and $visualRequest.requested -and $artifactsShare -a
         Copy-Item -LiteralPath $receipt.visual.stripPath -Destination $stripCopy -Force
         $receipt.visual.stripCopyPath = $stripCopy
     }
+    # GPU-DEVICE-LOSS-SELF-HEAL-1 r5: each self-heal pre-launch (the fallback runs L1-L3) published its own captures under self-heal\pre-<n>\visual; each gets the
+    # same visual block, keyed by its index, so the recovery a reviewer must see is gated like the measured run. Absent on every other leg.
+    $selfHealLocal = Join-Path $evidenceDir 'self-heal'
+    if (Test-Path -LiteralPath $selfHealLocal -PathType Container) {
+        $receipt['selfHealVisual'] = [ordered]@{}
+        foreach ($preDir in @(Get-ChildItem -LiteralPath $selfHealLocal -Directory | Where-Object { $_.Name -cmatch '^pre-\d+$' } | Sort-Object { [int]$_.Name.Substring(4) })) {
+            $preVisual = Read-DvVisualCaptures -Requested $true -ArtifactsDir $preDir.FullName -EvidenceDir (Join-Path $preDir.FullName 'inspected') -LegId "$($spec.legId)-$($preDir.Name)" `
+                -Header "$($spec.legId) $($preDir.Name)  $Venue  $Backend  $($SourceCommit.Substring(0, 12))"
+            if ($preVisual.stripPath -and ($OfflineTestMode -or (Test-DvUnderClaudeState -Path $stripDir))) {
+                New-Item -ItemType Directory -Force -Path $stripDir | Out-Null
+                $preStripCopy = Join-Path $stripDir "strip-$($spec.legId)-$($preDir.Name)-$Venue-$Backend-$($SourceCommit.Substring(0, 8))-$runStamp.png"
+                Copy-Item -LiteralPath $preVisual.stripPath -Destination $preStripCopy -Force
+                $preVisual.stripCopyPath = $preStripCopy
+            }
+            $receipt['selfHealVisual'][$preDir.Name] = $preVisual
+            Write-Output "DVE_VISUAL_$($preDir.Name)=$($preVisual.verdict) STRIP=$(if ($preVisual.stripCopyPath) { $preVisual.stripCopyPath } elseif ($preVisual.stripPath) { $preVisual.stripPath } else { 'none' })"
+        }
+    }
 }
 
 $outcome = $resolved.outcome; $detail = $resolved.detail
