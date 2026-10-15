@@ -33,6 +33,7 @@
 #include "SessionModel.h"
 #include "PlaybackFrameRange.h"
 #include "PlaybackNativePaceGuard.h"
+#include "PlaybackPrepInFlightGate.h"
 #include "PlaybackPresentTrace.h"
 #include "PlaybackScopesDuringPlayback.h"
 #include "PlaybackSlipHistogram.h"
@@ -729,6 +730,7 @@ private:
                 scopeSourceImage = sourceImage;
                 scopeSourceImageSize = sourceImageSize;
                 readyFrame.rawImage8 = sourceImage;
+                readyFrame.rawImage8Bytes = sourceImageSize;
             }
             if( !ownedSourceImage16.empty() )
             {
@@ -1584,6 +1586,7 @@ private:
     bool m_playbackPrepPendingValid = false;
     PlaybackPrepTask m_playbackPrepPending;
     std::deque<PlaybackPrepResult> m_playbackPrepResults;
+    PlaybackPrepInFlightGate m_playbackPrepInFlight;
     std::atomic<uint64_t> m_playbackPrepStaleDropCount{0};
     std::atomic<uint64_t> m_playbackPrepGenerationDropCount{0};
     std::atomic<uint64_t> m_playbackPrepReplacedBeforeComputeCount{0};
@@ -1693,6 +1696,7 @@ private:
     void onPlaybackSmokeApplicationStateChanged( Qt::ApplicationState state );
     void enqueuePlaybackPrepTask( const PlaybackPrepTask &task );
     void invalidatePlaybackPrepForDisplayChange( const char *reason );
+    void drainPlaybackPrepInFlight( const char *reason, int timeoutMs );
     void waitForRenderThreadIdleBeforeCoreMutation( const char *reason );
     struct PlaybackPrepThreadState;
     PlaybackPrepResult buildPlaybackPrepResult( const PlaybackPrepTask &task,

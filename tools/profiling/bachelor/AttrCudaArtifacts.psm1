@@ -2478,6 +2478,253 @@ function Publish-AttrCudaVisualCaptures {
 }
 # PLAYBACK-VISUAL-INSPECTION-1 <<<
 
+# CPU-SCOPE-LIVE-HEAP-CORRUPTION-1 >>>
+function Start-AttrCudaHeapDumpWatch {
+    <#
+    .SYNOPSIS
+    Start a hidden watcher that ATTACHES a minimal debugger (by pid, as the agent user, no elevation, no registry, no external tool) to the
+    smoke's MLVApp instance and keeps ONE dump of the first heap-corruption exception (c0000374, or a c0000409 fail-fast) or second-chance
+    exception the app raises.
+    .DESCRIPTION
+    A heap fail-fast never reaches the app's own unhandled-exception minidump (CrashForensics), and WER LocalDumps is HKLM, so before this
+    every crash leg had dumps=0. procdump is not usable on the venue (Bachelor's chocolatey shim points at a missing binary), so the
+    debugger is compiled here: DebugActiveProcess with kill-on-exit OFF (a watcher that dies leaves the app running), a WaitForDebugEvent
+    loop that passes every exception on unhandled, and dbghelp's MiniDumpWriteDump (System32) with the faulting thread's exception record
+    and context. It stays attached until the process exits. Attaching after launch keeps the app on its ordinary heap (a debugger LAUNCH
+    would turn on the debug heap).
+    The watcher is a separate hidden pwsh (the job itself blocks on the smoke run). It waits up to -MaxWaitSec for a process named like
+    -ExePath whose command line contains -CommandLineMatch and no --help (the feature probes run `--gui-smoke-playback --help`). Its script
+    and log stay in -DumpDir. Never throws: the record says why no watcher runs. Returns the record Stop-AttrCudaHeapDumpWatch completes.
+    -DumpType is the MINIDUMP_TYPE: the default 0x1826 is full memory + handles + unloaded modules + memory info + thread info.
+    r7 (CoS #432): every write this function makes goes through the job's slot-checked helpers (New-AttrCudaDirectory, Publish-AttrCudaText);
+    the watcher log is CREATED here through Publish-AttrCudaText, so the hidden watcher only appends to a slot already proven a plain file,
+    and its dump is opened CreateNew (an existing name, a link included, is refused, never written through).
+    #>
+    param([Parameter(Mandatory = $true)][string]$ExePath, [Parameter(Mandatory = $true)][string]$DumpDir, [ValidateRange(10, 7200)][int]$MaxWaitSec = 900,
+        [string]$CommandLineMatch = '--gui-smoke-playback', [ValidateRange(0, 0x3FFFFF)][int]$DumpType = 0x1826, [string]$PwshPath = '')
+    $record = [ordered]@{ schema = 'mlv-app/heap-corruption-dump/v1'; requested = $true; dumpDir = $DumpDir; debugger = 'dbghelp-minidump'; dumpType = $DumpType
+        watcherPid = $null; startedUtc = $null; reason = $null; watcherExited = $null; captureState = $null; watcherLog = @(); dumps = @() }
+    $debuggerSource = @'
+    using System;
+    using System.IO;
+    using System.Runtime.InteropServices;
+    namespace MlvHeapDumpWatch {
+        public static class Debugger {
+            [DllImport("kernel32.dll", SetLastError = true)] static extern bool DebugActiveProcess(uint pid);
+            [DllImport("kernel32.dll", SetLastError = true)] static extern bool DebugSetProcessKillOnExit(bool kill);
+            [DllImport("kernel32.dll", SetLastError = true)] static extern bool WaitForDebugEvent(IntPtr debugEvent, uint milliseconds);
+            [DllImport("kernel32.dll", SetLastError = true)] static extern bool ContinueDebugEvent(uint pid, uint tid, uint status);
+            [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
+            [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr OpenThread(uint access, bool inherit, uint tid);
+            [DllImport("kernel32.dll", SetLastError = true)] static extern bool GetThreadContext(IntPtr thread, IntPtr context);
+            [DllImport("kernel32.dll", SetLastError = true)] static extern bool CloseHandle(IntPtr handle);
+            [DllImport("dbghelp.dll", SetLastError = true)] static extern bool MiniDumpWriteDump(IntPtr process, uint pid, IntPtr file, uint type, IntPtr exceptionParam, IntPtr userStream, IntPtr callback);
+            const uint DBG_CONTINUE = 0x00010002;
+            const uint DBG_EXCEPTION_NOT_HANDLED = 0x80010001;
+            // x64 DEBUG_EVENT: code @0, pid @4, tid @8, union @16. EXCEPTION_RECORD is 152 bytes, so dwFirstChance is @168.
+            const int UnionOffset = 16;
+            const int ExceptionRecordBytes = 152;
+            const int FirstChanceOffset = 168;
+            const int ContextBytes = 1232;
+
+            static void Log(string path, string message) {
+                try { File.AppendAllText(path, DateTime.UtcNow.ToString("o") + " " + message + Environment.NewLine); } catch (Exception) { }
+            }
+
+            public static int Run(uint pid, string dumpPath, uint dumpType, string logPath) {
+                IntPtr process = OpenProcess(0x1F0FFF, false, pid);
+                if (process == IntPtr.Zero) { Log(logPath, "OPEN_PROCESS_FAILED err=" + Marshal.GetLastWin32Error()); return 2; }
+                if (!DebugActiveProcess(pid)) { Log(logPath, "ATTACH_FAILED err=" + Marshal.GetLastWin32Error()); CloseHandle(process); return 2; }
+                DebugSetProcessKillOnExit(false);
+                Log(logPath, "DEBUGGER_ATTACHED pid=" + pid);
+                IntPtr debugEvent = Marshal.AllocHGlobal(512);
+                int result = 1;
+                long firstChance = 0;
+                bool dumped = false;
+                try {
+                    while (true) {
+                        if (!WaitForDebugEvent(debugEvent, 0xFFFFFFFF)) { Log(logPath, "WAIT_FAILED err=" + Marshal.GetLastWin32Error()); return 4; }
+                        uint code = (uint)Marshal.ReadInt32(debugEvent, 0);
+                        uint eventPid = (uint)Marshal.ReadInt32(debugEvent, 4);
+                        uint tid = (uint)Marshal.ReadInt32(debugEvent, 8);
+                        uint status = DBG_CONTINUE;
+                        if (code == 1) {
+                            uint exception = (uint)Marshal.ReadInt32(debugEvent, UnionOffset);
+                            bool first = Marshal.ReadInt32(debugEvent, FirstChanceOffset) != 0;
+                            bool breakpoint = exception == 0x80000003u || exception == 0x4000001Fu;
+                            if (!breakpoint) { status = DBG_EXCEPTION_NOT_HANDLED; if (first) firstChance++; }
+                            bool trigger = exception == 0xC0000374u || exception == 0xC0000409u || (!first && !breakpoint);
+                            if (trigger) {
+                                Log(logPath, "EXCEPTION code=0x" + exception.ToString("X8") + " first=" + (first ? 1 : 0) + " tid=" + tid
+                                    + " address=0x" + Marshal.ReadInt64(debugEvent, UnionOffset + 16).ToString("X"));
+                                if (!dumped) {
+                                    dumped = true;
+                                    result = WriteDump(process, pid, tid, debugEvent, dumpPath, dumpType, logPath) ? 0 : 3;
+                                }
+                            }
+                        } else if (code == 3 || code == 6) {
+                            IntPtr file = Marshal.ReadIntPtr(debugEvent, UnionOffset);
+                            if (file != IntPtr.Zero) CloseHandle(file);
+                        } else if (code == 5) {
+                            Log(logPath, "EXIT_PROCESS exitCode=" + Marshal.ReadInt32(debugEvent, UnionOffset) + " firstChanceExceptions=" + firstChance);
+                            ContinueDebugEvent(eventPid, tid, status);
+                            return result;
+                        }
+                        ContinueDebugEvent(eventPid, tid, status);
+                    }
+                } finally {
+                    Marshal.FreeHGlobal(debugEvent);
+                    CloseHandle(process);
+                }
+            }
+
+            static bool WriteDump(IntPtr process, uint pid, uint tid, IntPtr debugEvent, string dumpPath, uint dumpType, string logPath) {
+                IntPtr record = Marshal.AllocHGlobal(ExceptionRecordBytes);
+                IntPtr contextRaw = Marshal.AllocHGlobal(ContextBytes + 16);
+                IntPtr pointers = Marshal.AllocHGlobal(16);
+                IntPtr info = Marshal.AllocHGlobal(16);
+                IntPtr thread = IntPtr.Zero;
+                try {
+                    byte[] bytes = new byte[ExceptionRecordBytes];
+                    Marshal.Copy(IntPtr.Add(debugEvent, UnionOffset), bytes, 0, ExceptionRecordBytes);
+                    Marshal.Copy(bytes, 0, record, ExceptionRecordBytes);
+                    IntPtr context = new IntPtr((contextRaw.ToInt64() + 15) & ~15L);
+                    Marshal.Copy(new byte[ContextBytes], 0, context, ContextBytes);
+                    Marshal.WriteInt32(context, 0x30, 0x0010001F);
+                    thread = OpenThread(0x1FFFFF, false, tid);
+                    bool haveContext = thread != IntPtr.Zero && GetThreadContext(thread, context);
+                    Marshal.WriteIntPtr(pointers, 0, record);
+                    Marshal.WriteIntPtr(pointers, 8, context);
+                    // MINIDUMP_EXCEPTION_INFORMATION is pack(4): ThreadId @0, ExceptionPointers @4, ClientPointers (FALSE: our memory) @12.
+                    Marshal.WriteInt32(info, 0, (int)tid);
+                    Marshal.WriteInt64(info, 4, pointers.ToInt64());
+                    Marshal.WriteInt32(info, 12, 0);
+                    using (FileStream stream = new FileStream(dumpPath, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None)) {
+                        bool ok = MiniDumpWriteDump(process, pid, stream.SafeFileHandle.DangerousGetHandle(), dumpType, haveContext ? info : IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
+                        int error = Marshal.GetLastWin32Error();
+                        Log(logPath, (ok ? "DUMP_WRITTEN" : "DUMP_FAILED err=" + error) + " path=" + dumpPath + " bytes=" + stream.Length + " context=" + (haveContext ? 1 : 0));
+                        return ok;
+                    }
+                } catch (Exception e) {
+                    Log(logPath, "DUMP_FAILED " + e.GetType().Name + ": " + e.Message);
+                    return false;
+                } finally {
+                    if (thread != IntPtr.Zero) CloseHandle(thread);
+                    Marshal.FreeHGlobal(record); Marshal.FreeHGlobal(contextRaw); Marshal.FreeHGlobal(pointers); Marshal.FreeHGlobal(info);
+                }
+            }
+        }
+    }
+'@
+    try {
+        if ([string]::IsNullOrWhiteSpace($PwshPath)) { $PwshPath = Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe' }
+        [void](New-AttrCudaDirectory -Path $DumpDir)
+        [void](Publish-AttrCudaText -Path (Join-Path $DumpDir 'watcher.log') -Value ([DateTime]::UtcNow.ToString('o') + ' WATCH_REQUESTED'))
+        $quote = { param($s) "'" + ([string]$s).Replace("'", "''") + "'" }
+        $exeName = Split-Path -Leaf $ExePath
+        $watcher = @(
+            '$ErrorActionPreference = ''Continue'''
+            ('$exeName = ' + (& $quote $exeName))
+            ('$dumpDir = ' + (& $quote $DumpDir))
+            ('$match = ' + (& $quote $CommandLineMatch))
+            ('$dumpType = [uint32]' + $DumpType)
+            ('$deadline = [DateTime]::UtcNow.AddSeconds(' + $MaxWaitSec + ')')
+            '$log = Join-Path $dumpDir ''watcher.log'''
+            'function W([string]$m) { Add-Content -LiteralPath $log -Value ([DateTime]::UtcNow.ToString(''o'') + '' '' + $m) }'
+            'W (''WATCH exe='' + $exeName + '' match='' + $match + '' pid='' + $PID)'
+            '$source = @'''
+            $debuggerSource
+            '''@'
+            'try { Add-Type -TypeDefinition $source -Language CSharp } catch { W (''COMPILE_FAILED '' + $_.Exception.Message); exit 5 }'
+            '$target = $null'
+            'while ($null -eq $target -and [DateTime]::UtcNow -lt $deadline) {'
+            '    $target = @(Get-CimInstance Win32_Process -Filter ("Name = ''" + $exeName + "''") -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -and $_.CommandLine.Contains($match) -and $_.CommandLine -notmatch ''--help'' }) | Select-Object -First 1'
+            '    if ($null -eq $target) { Start-Sleep -Milliseconds 200 }'
+            '}'
+            'if ($null -eq $target) { W ''NO_TARGET the smoke instance never appeared''; exit 3 }'
+            'W (''ATTACH pid='' + $target.ProcessId)'
+            '$dumpPath = Join-Path $dumpDir ([IO.Path]::GetFileNameWithoutExtension($exeName) + ''_'' + $target.ProcessId + ''_'' + [DateTime]::UtcNow.ToString(''yyyyMMddTHHmmss'') + ''.dmp'')'
+            '$rc = [MlvHeapDumpWatch.Debugger]::Run([uint32]$target.ProcessId, $dumpPath, $dumpType, $log)'
+            'W (''DEBUGGER_EXIT rc='' + $rc)'
+            'exit $rc'
+        ) -join "`n"
+        $watcherPath = Publish-AttrCudaText -Path (Join-Path $DumpDir 'heap-dump-watcher.ps1') -Value $watcher
+        $info = New-Object System.Diagnostics.ProcessStartInfo
+        $info.FileName = $PwshPath
+        $info.Arguments = "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$watcherPath`""
+        $info.UseShellExecute = $false
+        $info.CreateNoWindow = $true
+        $process = [System.Diagnostics.Process]::Start($info)
+        $record.watcherPid = $process.Id
+        $record.startedUtc = [DateTime]::UtcNow.ToString('o')
+        $process.Dispose()
+    } catch {
+        $record.reason = "WATCHER_START_FAILED $($_.Exception.GetType().Name)"
+    }
+    return $record
+}
+
+function Stop-AttrCudaHeapDumpWatch {
+    <#
+    .SYNOPSIS
+    Complete a Start-AttrCudaHeapDumpWatch record after the smoke run returned. A watcher that never attached (no ATTACH line: the app
+    never started) is stopped at once; an attached one is waited for, bounded (it ends when the app's process exits, after any dump is
+    written), and its tree killed only past -WaitSec (kill-on-exit is off, so the app is never taken with it). Then records the watcher
+    log and every *.dmp (name, bytes), types the capture (captureState, below) and writes <DumpDir>\heap-dump.json through
+    Publish-AttrCudaText. Never throws.
+    captureState (r7, CoS #432) is exactly one of:
+      ATTACHED_NO_CRASH  the debugger attached (DEBUGGER_ATTACHED), the app exited (EXIT_PROCESS) and no trigger exception was seen;
+      DUMPED             a DUMP_WRITTEN line and a non-empty *.dmp: the crash was captured;
+      NO_TARGET          the watcher never attached (no smoke instance appeared, or it was still waiting when the run returned);
+      KILLED             the watcher was still attached -WaitSec after the run returned and its tree was killed;
+      STOP_FAILED        anything else: the watcher could not start, compile or attach, a trigger exception left no dump, the app's exit
+                         was never seen, or this function itself failed.
+    Only the first two are a verified capture: the runner fails any other leg HEAPDUMP_CAPTURE_FAILED (never a silent PASS).
+    #>
+    param([Parameter(Mandatory = $true)]$Record, [ValidateRange(0, 1800)][int]$WaitSec = 300)
+    $killed = $false
+    try {
+        $dir = [string]$Record['dumpDir']
+        $logPath = if ($dir) { Join-Path $dir 'watcher.log' } else { $null }
+        if ($null -ne $Record['watcherPid']) {
+            $attached = $logPath -and (Test-Path -LiteralPath $logPath) -and [bool](Select-String -LiteralPath $logPath -SimpleMatch -Pattern ' ATTACH pid=' -Quiet)
+            $watcher = Get-Process -Id ([int]$Record['watcherPid']) -ErrorAction SilentlyContinue
+            if ($null -eq $watcher) { $Record['watcherExited'] = $true }
+            elseif ($attached -and $watcher.WaitForExit($WaitSec * 1000)) { $Record['watcherExited'] = $true }
+            else {
+                try { & taskkill.exe /PID $Record['watcherPid'] /T /F 2>&1 | Out-Null } catch { }
+                $Record['watcherExited'] = $false
+                $killed = [bool]$attached
+                $Record['reason'] = $(if ($attached) { "WATCHER_KILLED still running $WaitSec s after the smoke run returned" } else { 'WATCHER_NO_TARGET the smoke instance never appeared before the run returned' })
+            }
+        }
+        $log = @()
+        if ($dir -and (Test-Path -LiteralPath $dir -PathType Container)) {
+            if (Test-Path -LiteralPath $logPath) { $log = @(Get-Content -LiteralPath $logPath); $Record['watcherLog'] = @($log | Select-Object -Last 20) }
+            $Record['dumps'] = @(Get-ChildItem -LiteralPath $dir -File -Filter '*.dmp' -ErrorAction SilentlyContinue | ForEach-Object { [ordered]@{ name = $_.Name; bytes = $_.Length } })
+        }
+        $has = { param($token) @($log | Where-Object { $_.Contains($token) }).Count -gt 0 }
+        $Record['captureState'] = $(
+            if ($null -eq $Record['watcherPid']) { 'STOP_FAILED' }
+            elseif ((& $has ' DUMP_WRITTEN ') -and @($Record['dumps'] | Where-Object { $_['bytes'] -gt 0 }).Count -gt 0) { 'DUMPED' }
+            elseif ($killed) { 'KILLED' }
+            elseif ((& $has ' NO_TARGET ') -or -not (& $has ' ATTACH pid=')) { $(if (& $has ' COMPILE_FAILED ') { 'STOP_FAILED' } else { 'NO_TARGET' }) }
+            elseif ((& $has ' DEBUGGER_ATTACHED pid=') -and (& $has ' EXIT_PROCESS ') -and -not (& $has ' EXCEPTION code=') -and $Record['watcherExited'] -eq $true) { 'ATTACHED_NO_CRASH' }
+            else { 'STOP_FAILED' })
+        if ($Record['captureState'] -ceq 'STOP_FAILED' -and [string]::IsNullOrEmpty([string]$Record['reason'])) {
+            $Record['reason'] = 'WATCHER_CAPTURE_UNVERIFIED ' + $(if (& $has ' EXCEPTION code=') { 'a trigger exception left no dump' } elseif (-not (& $has ' DEBUGGER_ATTACHED pid=')) { 'the debugger never attached' } else { 'the app exit was never seen' })
+        }
+        if ($dir -and (Test-Path -LiteralPath $dir -PathType Container)) {
+            [void](Publish-AttrCudaText -Path (Join-Path $dir 'heap-dump.json') -Value ($Record | ConvertTo-Json -Depth 4))
+        }
+    } catch {
+        $Record['reason'] = "WATCHER_STOP_FAILED $($_.Exception.GetType().Name)"
+        $Record['captureState'] = 'STOP_FAILED'
+    }
+    return $Record
+}
+# CPU-SCOPE-LIVE-HEAP-CORRUPTION-1 <<<
+
 function Publish-AttrCudaFileMove {
     <#
     .SYNOPSIS
@@ -6970,6 +7217,8 @@ Export-ModuleMember -Function `
     Add-AttrCudaVisualCaptureArgument, `
     Get-AttrCudaPresentMonWindowResult, `
     Publish-AttrCudaVisualCaptures, `
+    Start-AttrCudaHeapDumpWatch, `
+    Stop-AttrCudaHeapDumpWatch, `
     Get-AttrCudaPresentMonDisplayReport, `
     Get-AttrCudaAppSwapTelemetry, `
     Get-AttrCudaForegroundVerification, `

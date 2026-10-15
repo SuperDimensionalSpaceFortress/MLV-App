@@ -125,12 +125,17 @@ SCOPE_LEGS["legs/m16-1243-scopes-cuda-windowed-s1-waveform-i0.json"] = (
 # PLAYBACK-SCOPES-OPTION-1 r3: the Look-Assist-ON twins of the N and T arms (the shipping default is Look Assist on): the no-look twin with
 # generatorArgs.forceLookAssist true (a capture-free pace leg at the default Classic flavor) in place of disableLookAssist true.
 SCOPE_LA_LEGS = tuple(f"legs/m16-1243-scopes-{backend}-windowed-s1-{arm}-la.json" for backend in ("cpu", "cuda") for arm in ("none", "histogram"))
+# CPU-SCOPE-LIVE-HEAP-CORRUPTION-1: the live-histogram stop-cycle legs, cpu scale 1 at every-frame histogram, per display mode. Windowed runs Look Assist
+# OFF (the arm that computes the scope); fullscreen leaves Look Assist at the app's default, so it computes no scope and tests the stop with LA on.
+SCOPELIVE_LEGS = {f"legs/m16-1243-scopelive-cpu-{mode}-s1-histogram-i0.json": (mode, look_off) for mode, look_off in (("windowed", True), ("fullscreen", False))}
+# CPU-SCOPE-LIVE-HEAP-CORRUPTION-1 r7: the UNATTACHED arm, the windowed scopelive leg without the debugger watch (attached and unattached legs are counted apart).
+SCOPELIVE_NODBG_LEGS = ("legs/m16-1243-scopelive-cpu-windowed-s1-histogram-i0-nodbg.json",)
 # LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1 added the scale-2 Cinematic twin of the scale-2 look leg (the Bachelor CPU Classic | Cinematic look pair).
 SHIPPED_LEGS = ("legs/m16-1243-speed.json", "legs/m16-1243-look.json", "legs/m16-1243-look-scale2.json", "legs/m16-1243-look-cinematic.json", *DISPLAY_MATRIX_LEGS, *PACE_LEGS,
                 *LOOKAHEAD_LEGS, *HEAVY_LEGS, *DECODER_LEGS, "legs/m16-1243-look-scale2-cinematic.json", "legs/m16-1243-look-film.json",
                 "legs/m16-1243-look-scale2-film.json", *(f"legs/m16-1243-look-scale2-{flavor}-agxoff.json" for flavor in ("cinematic", "film")),
                 *(f"legs/m16-1243-display-{mode}-s{scale}-vsync1.json" for scale in (1, 2, 4) for mode in ("fullscreen", "windowed")),
-                *CPU_REDUCED_LEGS, *UPSTREAM_BASELINE_LEGS, *PTRACE_LEGS, *VISUAL_LEGS, *SCOPE_LEGS, *SCOPE_LA_LEGS)
+                *CPU_REDUCED_LEGS, *UPSTREAM_BASELINE_LEGS, *PTRACE_LEGS, *VISUAL_LEGS, *SCOPE_LEGS, *SCOPE_LA_LEGS, *SCOPELIVE_LEGS, *SCOPELIVE_NODBG_LEGS)
 # PLAYBACK-VSYNC-DEFAULT-1: the swap-interval-1 twins of the six display-matrix legs (the vsync A/B; the originals stay at the app's default 0).
 VSYNC1_LEGS = tuple(rel.replace(".json", "-vsync1.json") for rel in DISPLAY_MATRIX_LEGS)
 # LOOK-ASSIST-FILM-FLAVOR-2 r2: the AgX-off twins of the scale-2 Cinematic and Film legs carry a committed look receipt (look-receipts/agx-off.marxml).
@@ -4909,6 +4914,27 @@ class VenueQuietUnknownIsNotUnmetTests(unittest.TestCase):
         self.assertRegex(proc.stdout, r"(?m)^COOLDOWN_UNMET mean=50\.0% threshold=20(\.0)?% waitedSec=\d+$")
         self.assertNotIn("VENUE_QUIET_UNKNOWN", proc.stdout)
 
+    # CPU-SCOPE-LIVE-HEAP-CORRUPTION-1: a marker record the agent SET ASIDE ('.stale-<ticks>' / '.corrupt-<ticks>') is not a running job.
+    def test_a_set_aside_marker_record_does_not_hold_the_gate_busy(self) -> None:
+        running = self.tmp / "share-bachelor" / "running"
+        (running / "dve-x.started.json.d49877b02a3243aa941ee56642f74291.tmp.stale-639275292076772648").write_text("{}", encoding="utf-8")
+        (running / "dve-y.started.json.tmp.corrupt-639275292076772649").write_text("{", encoding="utf-8")
+        proc = self.gate("samples", "[5, 5, 5]")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("queued=0 running=0", proc.stdout)
+        self.assertRegex(proc.stdout, r"(?m)^QUIET mean=5\.0% ")
+
+    def test_a_live_marker_or_an_unresolved_tmp_still_holds_the_gate_busy(self) -> None:
+        running = self.tmp / "share-bachelor" / "running"
+        for name in ("dve-x.started.json", "dve-y.started.json.d49877b02a3243aa941ee56642f74291.tmp"):
+            marker = running / name
+            marker.write_text("{}", encoding="utf-8")
+            proc = self.gate("samples", "[5, 5, 5]")
+            self.assertIn("queued=0 running=1", proc.stdout, name)
+            self.assertRegex(proc.stdout, r"(?m)^GATE_BUSY ", name)
+            self.assertNotRegex(proc.stdout, r"(?m)^QUIET ", name)
+            marker.unlink()
+
 
 # VENUE-QUIET-SETASIDE-RECORD-1: the agent sets a superseded marker tmp aside IN running\ as '<name>.stale-<ticks>' / '<name>.corrupt-<ticks>' and treats it as resolved
 # (ultra-magnus-agent.ps1 Get-MarkerTempFiles). The gate counted it as a running job, so one such record held Bachelor at running=1 for every lane after its job had
@@ -5655,6 +5681,38 @@ class LegSpecSchemaTests(unittest.TestCase):
             with self.assertRaises(self.jsonschema.ValidationError, msg=repr(bad_value)):
                 self.jsonschema.validate(bad, self.schema)
 
+    def test_the_scopelive_legs_are_cpu_s1_speed_legs_at_every_frame_histogram(self) -> None:
+        """CPU-SCOPE-LIVE-HEAP-CORRUPTION-1: each live-scope stop-cycle leg is a cpu-only SPEED leg at scale 1 in the display mode its name says (LIGHT,
+        the 95 % quiescence gate, informational criteria) with the histogram at scopeIntervalMs 0; only the windowed leg turns Look Assist off. Both pin
+        scopesDuringPlayback throttled (PLAYBACK-SCOPES-OPTION-1 r4), so a Hide-default build still computes the live scope the legs exist to stress."""
+        for rel, (mode, look_off) in SCOPELIVE_LEGS.items():
+            spec = json.loads((DV / rel).read_text(encoding="utf-8"))
+            self.jsonschema.validate(spec, self.schema)
+            self.assertEqual(spec["legId"], Path(rel).stem, rel)
+            self.assertEqual(spec["card"], "CPU-SCOPE-LIVE-HEAP-CORRUPTION-1", rel)
+            self.assertEqual((spec["legType"], spec["clipId"], spec["playSeconds"], spec["backends"], spec["scaleFactor"], spec["displayMode"]),
+                             ("speed", "M16-1243", 25, ["cpu"], 1, mode), rel)
+            look = {"disableLookAssist": True} if look_off else {}
+            # r6: the windowed leg (the one soaked) also keeps a heap-corruption dump (the compiled attach-by-pid debugger watch).
+            dump = {"heapCorruptionDump": True} if mode == "windowed" else {}
+            self.assertEqual(spec["generatorArgs"], {"telemetryArm": "LIGHT", "cpuQuiescenceThresholdPercent": 95, **look, "scope": "histogram", "scopeIntervalMs": 0,
+                                                     "scopesDuringPlayback": "throttled", **dump}, rel)
+            self.assertNotIn("look", spec, rel)
+            self.assertEqual(spec["criteria"], {"acceptance": {"cpu": []}, "supplementary": {"cpu": []}}, rel)
+
+    def test_the_heap_dump_unattached_scopelive_leg_is_the_windowed_leg_without_the_debugger(self) -> None:
+        """r7 (hub ruling 2026-10-15T14:11:59Z): the UNATTACHED arm runs the windowed scopelive leg with ONLY the debugger watch removed (and its own legId),
+        so its crash count is comparable with the attached arm's and is never pooled with it."""
+        windowed = json.loads((DV / "legs/m16-1243-scopelive-cpu-windowed-s1-histogram-i0.json").read_text(encoding="utf-8"))
+        for rel in SCOPELIVE_NODBG_LEGS:
+            spec = json.loads((DV / rel).read_text(encoding="utf-8"))
+            self.jsonschema.validate(spec, self.schema)
+            self.assertEqual(spec["legId"], Path(rel).stem, rel)
+            self.assertNotIn("heapCorruptionDump", spec["generatorArgs"], rel)
+            args = {k: v for k, v in windowed["generatorArgs"].items() if k != "heapCorruptionDump"}
+            self.assertEqual(dict(spec, legId=windowed["legId"], generatorArgs=windowed["generatorArgs"]), windowed, rel)
+            self.assertEqual(spec["generatorArgs"], args, rel)
+
     def test_the_scope_la_legs_are_the_no_look_twins_with_look_assist_forced_on(self) -> None:
         """PLAYBACK-SCOPES-OPTION-1 r3: each -la leg is its no-look twin with only legId, forceLookAssist (not disableLookAssist) and the
         lookAssistForced criterion changed, so the LA-on and LA-off arms measure the same thing but for Look Assist."""
@@ -6393,8 +6451,306 @@ class VisualCaptureGeneratorTests(unittest.TestCase):
         self.assertLess(runner.index(mapping), runner.index("$gen['ContactSheet'] = $true; $gen['ContactSheetFrames']"))
 
 
+# CPU-SCOPE-LIVE-HEAP-CORRUPTION-1 r6: the heap-corruption dump. A heap fail-fast (c0000374) never reaches the app's own crash minidump and
+# WER LocalDumps is HKLM, so a leg may ask for a debugger watch (a minimal debugger compiled in the job; no external tool) that attaches to the
+# smoke's MLVApp by pid. All test names carry "heap_dump". r7: Stop-AttrCudaHeapDumpWatch types the capture (captureState); the runner fails an
+# unverified capture HEAPDUMP_CAPTURE_FAILED; the soak accounting never pools attached and unattached legs.
+HEAP_OPEN = "CPU-SCOPE-LIVE-HEAP-CORRUPTION-1 >>>"
+HEAP_CLOSE = "CPU-SCOPE-LIVE-HEAP-CORRUPTION-1 <<<"
+
+
 @requires_windows_pwsh
-class VisualCaptureVenueHelperTests(unittest.TestCase):
+class HeapDumpGeneratorTests(unittest.TestCase):
+    """-HeapCorruptionDump adds exactly two bracketed regions around the smoke launch and nothing else."""
+
+    setUpClass = classmethod(GeneratorByteIdentityAndVariantTests.setUpClass.__func__)
+    tearDownClass = classmethod(GeneratorByteIdentityAndVariantTests.tearDownClass.__func__)
+    generate = GeneratorByteIdentityAndVariantTests.generate
+    parse_errors = GeneratorByteIdentityAndVariantTests.parse_errors
+
+    def test_the_heap_dump_job_is_the_default_job_plus_two_bracketed_regions(self) -> None:
+        extra = ["-Backend", "cpu", "-DisplayMode", "windowed", "-DisableLookAssist", "-Scope", "histogram", "-ScopeIntervalMs", "0"]
+        base = lf(self.generate(GENERATOR, "heap-base.job.ps1", extra).read_text(encoding="utf-8"))
+        on_path = self.generate(GENERATOR, "heap-on.job.ps1", [*extra, "-HeapCorruptionDump"])
+        self.assertEqual(self.parse_errors(on_path), 0)
+        self.assertNotIn("HeapDump", base, "without -HeapCorruptionDump the job never names the watcher")
+        on = lf(on_path.read_text(encoding="utf-8"))
+        kept: list[str] = []
+        regions: list[list[str]] = []
+        inside: list[str] | None = None
+        for line in on.split("\n"):
+            if HEAP_OPEN in line:
+                self.assertIsNone(inside, "nested heap-dump region")
+                inside = []
+            elif HEAP_CLOSE in line:
+                self.assertIsNotNone(inside, "unopened heap-dump region")
+                regions.append(inside)
+                inside = None
+            elif inside is None:
+                kept.append(line)
+            else:
+                inside.append(line)
+        self.assertIsNone(inside, "unclosed heap-dump region")
+        self.assertEqual(len(regions), 2)
+        self.assertEqual("\n".join(kept), base, "the two regions are the ONLY difference from the job without -HeapCorruptionDump")
+        for fn in ("Start-AttrCudaHeapDumpWatch", "Stop-AttrCudaHeapDumpWatch"):
+            self.assertIn(f"function {fn} {{", "\n".join(regions[0]), "the helpers are spliced in the first region, never into the default embed list")
+        # the order the job runs them in: every feature probe and PresentMon, then the watcher, the launch, its completion, then any early exit
+        launch = '& "$env:ProgramFiles\\PowerShell\\7\\pwsh.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $cmd'
+        order = ["$PresentMonSessionName = Get-PresentMonSessionName $JobId", "$heapDumpRecord = Start-AttrCudaHeapDumpWatch -ExePath $exePath -DumpDir (Join-Path $Pub 'heapdump')",
+                 launch, 'Write-JobTrace "step smoke-launch done rc=$smokeRc"', "$heapDumpRecord = Stop-AttrCudaHeapDumpWatch -Record $heapDumpRecord",
+                 "if ($null -ne $smokeLaunchException -or $smokeRc -ne 0 -or -not (Test-Path -LiteralPath $resultPath)) {"]
+        at = [on.index(s) for s in order]
+        self.assertEqual(at, sorted(at), "watcher after PresentMon, before the launch; completed after the launch, before the failed-run exit")
+
+    def test_the_runner_schema_and_scopelive_leg_carry_the_heap_dump(self) -> None:
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        mapping = ("if ($spec.generatorArgs.PSObject.Properties['heapCorruptionDump'] -and [bool]$spec.generatorArgs.heapCorruptionDump) "
+                   "{ $gen['HeapCorruptionDump'] = $true }")
+        self.assertIn(mapping, runner)
+        self.assertLess(runner.index(mapping), runner.index("if (-not $isLook -and $spec.generatorArgs.PSObject.Properties['forceLookAssist']"),
+                        "the mapping must sit outside the forceLookAssist branch")
+        self.assertIn("$heapDumpShare = Join-Path $artifactsShare 'heapdump'", runner, "the runner copies the dump directory into the evidence")
+        schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
+        self.assertEqual(schema["properties"]["generatorArgs"]["properties"]["heapCorruptionDump"]["type"], "boolean")
+        windowed = json.loads((DV / "legs/m16-1243-scopelive-cpu-windowed-s1-histogram-i0.json").read_text(encoding="utf-8"))
+        self.assertIs(windowed["generatorArgs"]["heapCorruptionDump"], True)
+
+
+@requires_windows_pwsh
+class HeapDumpVenueHelperTests(unittest.TestCase):
+    """The venue-side watcher (AttrCudaArtifacts.psm1) end to end: its compiled debugger attaches to a Windows PowerShell target that
+    raises STATUS_HEAP_CORRUPTION (RaiseException c0000374) and writes a small (MiniDumpNormal) dump; a twin with --help is never taken."""
+
+    TARGET_PS = ("Start-Sleep -Seconds 4\n"
+                 "if ($args -contains '--help') { Start-Sleep -Seconds 20; exit 0 }\n"
+                 "Add-Type -MemberDefinition '[DllImport(\"kernel32.dll\")] public static extern void RaiseException(uint code, uint flags, uint count, IntPtr args);' "
+                 "-Name K -Namespace HeapWatchTarget\n"
+                 "[HeapWatchTarget.K]::RaiseException([uint32]3221226356, 1, 0, [IntPtr]::Zero)\n")
+
+    def run_module(self, script: str) -> subprocess.CompletedProcess:
+        return run_pwsh(["-Command", f"$ErrorActionPreference = 'Stop'; Import-Module '{ATTR_MODULE}' -Force\n" + script], timeout=240)
+
+    def test_the_heap_dump_watch_with_no_smoke_instance_is_stopped_at_once_with_no_dump(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="heap-none-") as d:
+            proc = self.run_module(f"$r = Start-AttrCudaHeapDumpWatch -ExePath 'C:\\x\\MLVApp-heap-watch-absent.exe' -DumpDir '{d}\\hd' -MaxWaitSec 600\n"
+                                   "Start-Sleep -Seconds 3; $t0 = Get-Date\n"
+                                   "$r = Stop-AttrCudaHeapDumpWatch -Record $r -WaitSec 300\n"
+                                   "Write-Output ('SEC=' + [int]((Get-Date) - $t0).TotalSeconds); Write-Output ('REASON=' + $r.reason); Write-Output ('DUMPS=' + @($r.dumps).Count)\n"
+                                   "Write-Output ('CAPTURE=' + $r.captureState)")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            out = dict(l.split("=", 1) for l in proc.stdout.splitlines() if "=" in l)
+            self.assertEqual(out["DUMPS"], "0")
+            self.assertTrue(out["REASON"].startswith("WATCHER_NO_TARGET"), out["REASON"])
+            self.assertLess(int(out["SEC"]), 60, "a watcher that never attached is not waited out")
+            # r7 captureState pin: NO_TARGET
+            self.assertEqual(out["CAPTURE"], "NO_TARGET")
+
+    def test_the_heap_dump_watch_dumps_the_heap_corruption_of_the_smoke_instance_never_a_help_probe(self) -> None:
+        import os
+        ps51 = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+        with tempfile.TemporaryDirectory(prefix="heap-watch-") as d:
+            target = Path(d) / "heap-watch-target.ps1"
+            target.write_text(self.TARGET_PS, encoding="ascii")
+            args = f"'-NoProfile','-ExecutionPolicy','Bypass','-File','{target}'"
+            proc = self.run_module(
+                f"$r = Start-AttrCudaHeapDumpWatch -ExePath '{ps51}' -DumpDir '{d}\\hd' -CommandLineMatch '{target.name}' -DumpType 0 -MaxWaitSec 90\n"
+                f"$help = Start-Process -FilePath '{ps51}' -ArgumentList {args},'--help' -WindowStyle Hidden -PassThru\n"
+                "Start-Sleep -Seconds 1\n"
+                f"$t = Start-Process -FilePath '{ps51}' -ArgumentList {args} -WindowStyle Hidden -PassThru\n"
+                "[void]$t.WaitForExit(90000); try { $help.Kill() } catch { }\n"
+                "$r = Stop-AttrCudaHeapDumpWatch -Record $r -WaitSec 90\n"
+                "Write-Output ('TARGET=' + $t.Id); Write-Output ('HELP=' + $help.Id); Write-Output ('EXITED=' + $r.watcherExited); Write-Output ('REASON=' + $r.reason)\n"
+                "Write-Output ('DUMPS=' + @($r.dumps).Count); Write-Output ('CAPTURE=' + $r.captureState)\n"
+                "$r.watcherLog | ForEach-Object { Write-Output ('LOG=' + $_) }\n"
+                f"Get-ChildItem -LiteralPath '{d}\\hd' -Filter '*.dmp' | ForEach-Object {{ Write-Output ('SIG=' + [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($_.FullName)[0..3])) }}\n"
+                f"Write-Output ('JSON=' + (Test-Path -LiteralPath '{d}\\hd\\heap-dump.json'))")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            lines = proc.stdout.splitlines()
+            out = dict(l.split("=", 1) for l in lines if "=" in l and not l.startswith("LOG="))
+            log = [l[len("LOG="):] for l in lines if l.startswith("LOG=")]
+            self.assertEqual((out["EXITED"], out["REASON"], out["DUMPS"], out["SIG"], out["JSON"]), ("True", "", "1", "MDMP", "True"), proc.stdout)
+            self.assertTrue(any(l.endswith(f"ATTACH pid={out['TARGET']}") for l in log), log)
+            self.assertFalse(any(f"pid={out['HELP']}" in l for l in log if "ATTACH" in l), log)
+            self.assertTrue(any(" EXCEPTION code=0xC0000374 first=1 " in l for l in log), log)
+            self.assertTrue(any(" DUMP_WRITTEN " in l and l.endswith("context=1") for l in log), log)
+            self.assertTrue(any(l.endswith("DEBUGGER_EXIT rc=0") for l in log), log)
+            # r7 captureState pin: DUMPED
+            self.assertEqual(out["CAPTURE"], "DUMPED", proc.stdout)
+
+    # r7 (CoS #432): one pinned test per captureState. NO_TARGET and DUMPED are pinned by the two tests above; the three below pin the rest.
+    def _ps51(self) -> Path:
+        import os
+        return Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+
+    def test_heap_dump_capture_state_attached_no_crash_when_the_target_exits_cleanly(self) -> None:
+        ps51 = self._ps51()
+        with tempfile.TemporaryDirectory(prefix="heap-clean-") as d:
+            target = Path(d) / "heap-clean-target.ps1"
+            target.write_text("Start-Sleep -Seconds 6\nexit 0\n", encoding="ascii")
+            proc = self.run_module(
+                f"$r = Start-AttrCudaHeapDumpWatch -ExePath '{ps51}' -DumpDir '{d}\\hd' -CommandLineMatch '{target.name}' -DumpType 0 -MaxWaitSec 90\n"
+                f"$t = Start-Process -FilePath '{ps51}' -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','{target}' -WindowStyle Hidden -PassThru\n"
+                "[void]$t.WaitForExit(90000)\n"
+                "$r = Stop-AttrCudaHeapDumpWatch -Record $r -WaitSec 90\n"
+                "Write-Output ('CAPTURE=' + $r.captureState); Write-Output ('REASON=' + $r.reason); Write-Output ('DUMPS=' + @($r.dumps).Count)\n"
+                f"Write-Output ('JSONSTATE=' + (Get-Content -LiteralPath '{d}\\hd\\heap-dump.json' -Raw | ConvertFrom-Json).captureState)")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            out = dict(l.split("=", 1) for l in proc.stdout.splitlines() if "=" in l)
+            self.assertEqual((out["CAPTURE"], out["REASON"], out["DUMPS"], out["JSONSTATE"]), ("ATTACHED_NO_CRASH", "", "0", "ATTACHED_NO_CRASH"), proc.stdout)
+
+    def test_heap_dump_capture_state_killed_when_the_attached_watcher_outlives_the_wait(self) -> None:
+        ps51 = self._ps51()
+        with tempfile.TemporaryDirectory(prefix="heap-kill-") as d:
+            target = Path(d) / "heap-kill-target.ps1"
+            target.write_text("Start-Sleep -Seconds 120\n", encoding="ascii")
+            proc = self.run_module(
+                f"$r = Start-AttrCudaHeapDumpWatch -ExePath '{ps51}' -DumpDir '{d}\\hd' -CommandLineMatch '{target.name}' -DumpType 0 -MaxWaitSec 90\n"
+                f"$t = Start-Process -FilePath '{ps51}' -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','{target}' -WindowStyle Hidden -PassThru\n"
+                f"$deadline = (Get-Date).AddSeconds(60); while ((Get-Date) -lt $deadline -and -not (Select-String -LiteralPath '{d}\\hd\\watcher.log' -SimpleMatch -Pattern 'DEBUGGER_ATTACHED' -Quiet)) {{ Start-Sleep -Milliseconds 250 }}\n"
+                "try { $r = Stop-AttrCudaHeapDumpWatch -Record $r -WaitSec 2 } finally { try { $t.Kill() } catch { } }\n"
+                "Write-Output ('CAPTURE=' + $r.captureState); Write-Output ('REASON=' + $r.reason); Write-Output ('EXITED=' + $r.watcherExited)")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            out = dict(l.split("=", 1) for l in proc.stdout.splitlines() if "=" in l)
+            self.assertEqual((out["CAPTURE"], out["EXITED"]), ("KILLED", "False"), proc.stdout)
+            self.assertTrue(out["REASON"].startswith("WATCHER_KILLED"), out["REASON"])
+
+    def test_heap_dump_capture_state_stop_failed_when_the_watcher_cannot_start(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="heap-nostart-") as d:
+            proc = self.run_module(
+                f"$r = Start-AttrCudaHeapDumpWatch -ExePath 'C:\\x\\MLVApp-heap-watch-absent.exe' -DumpDir '{d}\\hd' -MaxWaitSec 10 -PwshPath '{d}\\no-such-pwsh.exe'\n"
+                "$r = Stop-AttrCudaHeapDumpWatch -Record $r -WaitSec 5\n"
+                "Write-Output ('CAPTURE=' + $r.captureState); Write-Output ('REASON=' + $r.reason)\n"
+                f"Write-Output ('JSONSTATE=' + (Get-Content -LiteralPath '{d}\\hd\\heap-dump.json' -Raw | ConvertFrom-Json).captureState)")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            out = dict(l.split("=", 1) for l in proc.stdout.splitlines() if "=" in l)
+            self.assertEqual((out["CAPTURE"], out["JSONSTATE"]), ("STOP_FAILED", "STOP_FAILED"), proc.stdout)
+            self.assertTrue(out["REASON"].startswith("WATCHER_START_FAILED"), out["REASON"])
+
+    def test_heap_dump_watch_writes_only_through_the_publish_helpers(self) -> None:
+        """r7 (CoS #432): Start-/Stop-AttrCudaHeapDumpWatch write nothing raw; the directory, the watcher log, the watcher script and
+        heap-dump.json go through New-AttrCudaDirectory / Publish-AttrCudaText. The hidden watcher's own appends (Add-Content in its W function,
+        the C# Log) go to the log slot Start created through Publish-AttrCudaText, and its dump is opened CreateNew."""
+        module = ATTR_MODULE.read_text(encoding="utf-8")
+        bodies = {fn: re.search(r"(?ms)^function " + fn + r" \{.*?^\}", module).group(0) for fn in ("Start-AttrCudaHeapDumpWatch", "Stop-AttrCudaHeapDumpWatch")}
+        for fn, body in bodies.items():
+            for raw in ("[IO.File]::WriteAllText", "[IO.File]::WriteAllBytes", "Set-Content", "Out-File", "Copy-Item", "Move-Item", "New-Item"):
+                self.assertNotIn(raw, body, f"{fn} writes raw with {raw}")
+        start, stop = bodies["Start-AttrCudaHeapDumpWatch"], bodies["Stop-AttrCudaHeapDumpWatch"]
+        self.assertIn("[void](New-AttrCudaDirectory -Path $DumpDir)", start)
+        self.assertIn("[void](Publish-AttrCudaText -Path (Join-Path $DumpDir 'watcher.log')", start)
+        self.assertIn("$watcherPath = Publish-AttrCudaText -Path (Join-Path $DumpDir 'heap-dump-watcher.ps1') -Value $watcher", start)
+        self.assertEqual(start.count("Add-Content"), 1, "only the hidden watcher's W function appends")
+        self.assertIn("FileMode.CreateNew", start)
+        self.assertIn("[void](Publish-AttrCudaText -Path (Join-Path $dir 'heap-dump.json')", stop)
+        for state in ("ATTACHED_NO_CRASH", "DUMPED", "NO_TARGET", "KILLED", "STOP_FAILED"):
+            self.assertIn(f"'{state}'", stop, f"captureState {state} is not produced")
+
+
+@requires_windows_pwsh
+class HeapDumpRunnerReceiptTests(RunnerHarness, unittest.TestCase):
+    """r7 (CoS #432): Invoke-VenueLeg lifts the job's captureState into receipt.heapDump and fails an unverified capture HEAPDUMP_CAPTURE_FAILED
+    (never a silent PASS); a dump's bytes, sha256 and copy / hash time are kept (row b)."""
+
+    def setUp(self) -> None:
+        self.make_harness()
+        param_tail = "$DisplayMode,[switch]$VisualCapture)"
+        self.assertIn(param_tail, STUB_GENERATOR, "STUB_GENERATOR param list changed; update this replace target")
+        self.gen.write_text(STUB_GENERATOR.replace(param_tail, "$DisplayMode,[switch]$VisualCapture,[switch]$HeapCorruptionDump)", 1), encoding="utf-8")
+        spec = json.loads(self.write_spec().read_text(encoding="utf-8"))
+        spec["generatorArgs"] = {"heapCorruptionDump": True}
+        self.spec = self.tmp / "spec-heap-dump.json"
+        self.spec.write_text(json.dumps(spec), encoding="utf-8")
+        self.write_artifacts()
+
+    def publish(self, record: dict | None, dump: bytes | None = None) -> None:
+        hd = self.artifacts / "heapdump"
+        shutil.rmtree(hd, ignore_errors=True)
+        hd.mkdir(parents=True)
+        if record is not None:
+            (hd / "heap-dump.json").write_text(json.dumps(record), encoding="utf-8")
+        (hd / "watcher.log").write_text("2026-10-15T00:00:00Z WATCH_REQUESTED\n", encoding="utf-8")
+        if dump is not None:
+            (hd / "MLVApp_1_20261015T000000.dmp").write_bytes(dump)
+
+    def record(self, state: str, **extra) -> dict:
+        return dict({"schema": "mlv-app/heap-corruption-dump/v1", "requested": True, "watcherPid": 1, "watcherExited": True, "reason": None, "captureState": state, "dumps": []}, **extra)
+
+    def test_heap_dump_receipt_keeps_a_verified_capture_and_its_outcome(self) -> None:
+        self.publish(self.record("ATTACHED_NO_CRASH"))
+        proc, receipt, _ = self.run_leg("ultra-magnus", self.spec)
+        self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+        self.assertEqual((receipt["heapDump"]["captureState"], receipt["heapDump"]["captureVerified"], receipt["heapDump"]["dumps"]), ("ATTACHED_NO_CRASH", True, []))
+
+    def test_heap_dump_receipt_fails_an_unverified_capture_never_a_silent_pass(self) -> None:
+        for state in ("NO_TARGET", "KILLED", "STOP_FAILED"):
+            with self.subTest(state=state):
+                self.publish(self.record(state, reason=f"why {state}"))
+                proc, receipt, _ = self.run_leg("ultra-magnus", self.spec)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(receipt["outcome"], "HEAPDUMP_CAPTURE_FAILED", receipt["outcomeDetail"])
+                self.assertIn(f"captureState {state} (why {state}); the job result was PASS", receipt["outcomeDetail"])
+                self.assertIn("DVE_OUTCOME=HEAPDUMP_CAPTURE_FAILED", proc.stdout)
+                self.assertFalse(receipt["heapDump"]["captureVerified"])
+        # no record at all, an untyped (r6b) record, and a DUMPED record whose dump did not come back are not verified either
+        for record, why in ((None, "HEAP_DUMP_RECORD_ABSENT"), ({"schema": "mlv-app/heap-corruption-dump/v1", "watcherPid": 1}, "HEAP_DUMP_RECORD_UNTYPED"),
+                            (self.record("DUMPED"), "DUMP_NOT_RETURNED")):
+            with self.subTest(why=why):
+                self.publish(record)
+                proc, receipt, _ = self.run_leg("ultra-magnus", self.spec)
+                self.assertEqual((receipt["outcome"], receipt["heapDump"]["captureState"]), ("HEAPDUMP_CAPTURE_FAILED", "STOP_FAILED"), receipt["outcomeDetail"])
+                self.assertIn(why, receipt["heapDump"]["reason"])
+
+    def test_heap_dump_receipt_records_the_dump_bytes_sha256_and_copy_and_hash_time(self) -> None:
+        dump = b"MDMP" + b"\x00" * 4096
+        self.publish(self.record("DUMPED", dumps=[{"name": "MLVApp_1_20261015T000000.dmp", "bytes": len(dump)}]), dump=dump)
+        proc, receipt, _ = self.run_leg("ultra-magnus", self.spec)
+        self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+        self.assertEqual(receipt["heapDump"]["captureState"], "DUMPED")
+        [d] = receipt["heapDump"]["dumps"]
+        self.assertEqual((d["name"], d["bytes"], d["sha256"]), ("MLVApp_1_20261015T000000.dmp", len(dump), hashlib.sha256(dump).hexdigest()))
+        self.assertIsInstance(d["copyMs"], int)
+        self.assertIsInstance(d["hashMs"], int)
+
+    def test_heap_dump_receipt_is_null_on_a_leg_that_did_not_ask(self) -> None:
+        self.publish(None)
+        proc, receipt, _ = self.run_leg("ultra-magnus", self.write_spec())
+        self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+        self.assertIsNone(receipt["heapDump"])
+
+
+@requires_windows_pwsh
+class HeapDumpSoakAccountingTests(unittest.TestCase):
+    """r7 (hub ruling 2026-10-15T11:25:44Z row a): Get-HeapDumpSoakAccounting.ps1 never pools debugger-attached and unattached legs, and marks a leg
+    that asked for the watch without a verified attach 'capture not verified' (an r6b log with an ATTACH line but no DEBUGGER_ATTACHED included)."""
+
+    def account(self, records: list[dict]) -> dict:
+        with tempfile.TemporaryDirectory(prefix="heap-acct-") as d:
+            path = Path(d) / "legs.jsonl"
+            path.write_text("\n".join(json.dumps(r) for r in records) + "\n", encoding="utf-8")
+            proc = run_pwsh(["-File", str(DV / "Get-HeapDumpSoakAccounting.ps1"), "-LegsJsonl", str(path), "-AsJson"])
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            return json.loads(proc.stdout)
+
+    def test_heap_dump_soak_accounting_never_pools_and_marks_capture_not_verified(self) -> None:
+        leg = {"status": "RAN", "stopCycle": True, "dumps": []}
+        records = [
+            dict(leg, name="U-1", arm="CTL-W", crash=False),                                     # r3: no watch at all -> unattached
+            dict(leg, name="U-2", arm="FIX-W", crash=True),
+            dict(leg, name="A-1", arm="FIX-W", crash=False, heapDumpWatch="x | ATTACH pid=7 | y DEBUGGER_ATTACHED pid=7 | EXIT_PROCESS exitCode=0"),
+            dict(leg, name="N-1", arm="FIX-W", crash=False, heapDumpWatch="x | ATTACH pid=7 | PROCDUMP_EXIT rc=-1"),   # the r6b procdump shim
+            dict(leg, name="A-2", arm="CTL-W", crash=False, watch="debugger", captureState="ATTACHED_NO_CRASH"),
+            dict(leg, name="N-2", arm="CTL-W", crash=False, watch="debugger", captureState="NO_TARGET"),
+            dict(leg, name="U-3", arm="UN-W", crash=False, watch="none"),
+            dict(leg, name="P-1", arm="PH-W", crash=False, watch="debugger", captureState="ATTACHED_NO_CRASH", pageHeap=True),
+            dict(leg, name="X-1", arm="FIX-W", crash=False, status="NO_CHAIN_RESULT"),
+        ]
+        g = self.account(records)["groups"]
+        self.assertEqual((g["unattached"]["legs"], g["unattached"]["crashes"]), (3, 1))
+        self.assertEqual((g["attached"]["legs"], g["attached"]["crashes"]), (2, 0))
+        self.assertEqual(g["pageheap"]["legs"], 1)
+        self.assertEqual(sorted(n.split(" ")[0] for n in g["captureNotVerified"]["names"]), ["N-1", "N-2"])
+        self.assertEqual(sum(g[k]["legs"] for k in g), 8, "every RAN leg is in exactly one group; the NO_CHAIN_RESULT leg is in none")
     """The venue-side helpers the job splices in (AttrCudaArtifacts.psm1)."""
 
     def run_module(self, script: str) -> subprocess.CompletedProcess:

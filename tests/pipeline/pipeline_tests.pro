@@ -129,6 +129,7 @@ SOURCES += \
     $$REPO_ROOT/tests/pipeline/test_cpu_dualiso_preview_scale.cpp \
     $$REPO_ROOT/tests/pipeline/test_gpu_dualiso_preview_scale.cpp \
     $$REPO_ROOT/tests/pipeline/test_debayered16_recon_reuse.cpp \
+    $$REPO_ROOT/tests/pipeline/test_paused_render_recon_overlap.cpp \
     $$REPO_ROOT/tests/pipeline/test_debayered16_honour_scale.cpp \
     $$REPO_ROOT/tests/pipeline/test_playback_prep_worker.cpp \
     $$REPO_ROOT/tests/pipeline/test_gpu_field_telemetry_capture.cpp
