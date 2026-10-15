@@ -133,6 +133,15 @@ TEST(PlaybackAudioStartWiring, TheGuiThreadNeverStartsTheAudioDeviceUnlessLegacy
     ASSERT_TRUE(audio.contains(QStringLiteral("if( ticket != m_prepareTicket.load() ) return;")));
     ASSERT_TRUE(audio.contains(QStringLiteral(
         "if( m_prepared && m_audioEngineRunning && m_preparedFrame == startFrame ) return;")));
+    // r1 venue leg d1426fe1: a window resize (resizeEvent stops the audio) just before Play closed the prepared sink.
+    // A public stop() keeps a prepared (silent, suspended) sink; only the engine's own re-open and reset close it.
+    const QString stopBody = bodyBetween(audio, QStringLiteral("void AudioPlayback::stop()"),
+                                         QStringLiteral("void AudioPlayback::stopNow()"));
+    ASSERT_FALSE(stopBody.isEmpty());
+    const int keep = stopBody.indexOf(QStringLiteral("if( m_prepared ) return;"));
+    const int close = stopBody.indexOf(QStringLiteral("stopNow();"));
+    ASSERT_TRUE(keep >= 0);
+    ASSERT_TRUE(close > keep);
 }
 
 TEST(PlaybackAudioStartWiring, PlayPostsThePrepareAndTheAudioObjectLivesOnItsOwnThread)

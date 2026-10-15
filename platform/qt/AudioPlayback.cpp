@@ -262,7 +262,13 @@ void AudioPlayback::playNow()
 //Stop audio
 void AudioPlayback::stop()
 {
-    post( [this]() { stopNow(); } );
+    post( [this]()
+    {
+        // Row A: a prepared sink is already silent and suspended. Closing it (MainWindow::resizeEvent stops the audio,
+        // and the smoke places its window ~10 ms before Play: r1 leg d1426fe1) only made the next Play re-open it.
+        if( m_prepared ) return;
+        stopNow();
+    } );
 }
 
 void AudioPlayback::stopNow()
