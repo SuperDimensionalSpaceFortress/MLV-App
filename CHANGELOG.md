@@ -16,3 +16,13 @@ maintained in this format.
   reporting.
 - A semantic repository-hygiene check that keeps those routes synchronized with
   their source policies.
+
+### Changed
+
+- High frame rate clips now conform to 24 fps playback by default: a clip
+  above 30 fps plays as slow motion at 24 fps, so every recorded frame is
+  shown. Configure it under **Playback → High Frame Rate Conform** (enable,
+  conform to 24/25/30 fps, for clips above 30/50 fps). Export, metadata and
+  timecode keep the clip's own rate. The environment variable
+  `MLVAPP_PLAYBACK_CONFORM=0|1` overrides the setting for one process (the
+  native-HFR measurement arm) and is never saved.
