@@ -356,7 +356,8 @@ struct ProductionResult
 
 ProductionResult productionStep(MlvPipelineFixture & fixture, uint64_t frame, int scale, WorkerState & worker,
                                 ProductionSlot & slot, Debayered16ReconReuseCounters * counters,
-                                bool overrideAdmitted = false, bool admittedOverride = false)
+                                bool overrideAdmitted = false, bool admittedOverride = false,
+                                bool workerLastReconUsedCuda = false)
 {
     const size_t n = fullPixels(fixture);
     ProductionResult result;
@@ -381,6 +382,8 @@ ProductionResult productionStep(MlvPipelineFixture & fixture, uint64_t frame, in
         if (mlvDualIsoPreviewScaleReconPlan(fixture.video(), scale, &plan))
         {
             slot.reducedReconBayer.resize(static_cast<size_t>(plan.reducedWidth) * plan.reducedHeight);
+            // GPU-DEVICE-LOSS-SELF-HEAL-1 r5: the worker thread's last recon ran on CUDA (the frames before a loss).
+            if (workerLastReconUsedCuda) llrpSetGpuPlaybackReconLastUsedForTesting(1);
             const int rc = mlvDualIsoPreviewScaleReconRun(fixture.video(), &plan, slot.rawImage16.data(),
                                                           slot.reducedReconBayer.data(), &worker.state, kCpuCores,
                                                           nullptr, nullptr);
@@ -631,8 +634,8 @@ TEST(Debayered16ReconReuse, HonourScaleCudaSuppressedSessionPresentsTheCpuRoutes
         Debayered16ReconReuseCounters counters;
         for (int f = 0; f < frames; ++f)
         {
-            llrpSetGpuPlaybackReconLastUsedForTesting(1);
-            const ProductionResult r = productionStep(fixture, static_cast<uint64_t>(f), scale, worker, slot, &counters);
+            const ProductionResult r = productionStep(fixture, static_cast<uint64_t>(f), scale, worker, slot, &counters,
+                                                      false, false, true);
             std::printf("[debayered16-honour-scale] cuda suppressed x%d frame %d: admission=%s outcome=%s dims=%dx%d "
                         "scale=%d render_llrawproc_runs=%llu\n",
                         scale, f, debayered16HonourScaleRefusalName(r.admission), debayered16ReconRefusalName(r.outcome),
