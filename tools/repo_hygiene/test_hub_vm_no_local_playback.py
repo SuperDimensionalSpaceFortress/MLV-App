@@ -661,6 +661,10 @@ class PromptLintTests(unittest.TestCase):
         f"The venue job calls tools/profiling/{SMOKE_SCRIPT} -Backend cpu on Bachelor.",
         f"The venue job calls tools/profiling/{SMOKE_SCRIPT} -Backend cpu through the venue chain from here.",
         "Run playback through the venue chain from here.",
+        # r5: a host noun that is a DESTINATION on a venue launcher line (no local marker in play) must not newly refuse the producer
+        # prompt shape master and r4 pass.
+        f"The venue job calls tools/profiling/{SMOKE_SCRIPT} -Backend cpu on Bachelor and posts the result to the hub.",
+        "Run playback on Bachelor through the venue chain, then post the log to the hub.",
     )
 
     # Rows that are in no catalogue tuple above but belong in the differential corpus as seeds.

@@ -300,6 +300,10 @@ function Get-LocalPlaybackPromptFindings {
     $hostRef = "(?i)${b}(?:${hostDeterminer})\s+(?:${hostNoun})(?![\w\-])|${b}(?:${hostName})(?![\w\-])"
     $backReference = "(?i)${b}(?:" + (ConvertTo-LintAlternation -Words @($lists.BackReferences)) + ")${e}"
     $hostDefeaters = @($hostMarker, $hostRef, $hereDefeater)
+    # Rule 4 (a direct launch line) carries NO local marker: the venue phrase is the only evidence of where it runs, and a host noun there is
+    # usually a destination ("... -Backend cpu on Bachelor and posts the result to the hub"), which master and r4 pass. It keeps the r4
+    # defeaters (the on-this-host marker and a bare here); every `locally` and host-marker rule uses the wide set above.
+    $hostDefeatersLaunch = @($hostMarker, $hereDefeater)
     $direct = @(
         "(?i)${b}MLVApp(Release)?\.exe\s+(?:(?!/\s)\S+\s+){0,12}--(gui-smoke-playback|profile-playback)",
         "(?i)(pwsh|powershell)(\.exe)?${e}[^\n]{0,80}-File\s+\S*$scripts",
@@ -352,7 +356,7 @@ function Get-LocalPlaybackPromptFindings {
                     $m4 = [regex]::Match($s, $pattern)
                     if (-not $m4.Success) { continue }
                     $c = Get-ClauseAt -Clauses $clauses -Index $m4.Index
-                    if (-not ($c.Strong -or $c.Weak -or (Test-VenueExempts -Sentence $s -Clauses $clauses -Clause $c -HostPatterns $hostDefeaters -BackReference $backReference -PlaybackWord $playbackWord) -or (Test-ContrastLead -Sentence $s -Clause $c -Index $m4.Index))) { $hit = 'direct-playback-launch'; break }
+                    if (-not ($c.Strong -or $c.Weak -or (Test-VenueExempts -Sentence $s -Clauses $clauses -Clause $c -HostPatterns $hostDefeatersLaunch -BackReference $backReference -PlaybackWord $playbackWord) -or (Test-ContrastLead -Sentence $s -Clause $c -Index $m4.Index))) { $hit = 'direct-playback-launch'; break }
                 }
             }
             if ($hit) {
