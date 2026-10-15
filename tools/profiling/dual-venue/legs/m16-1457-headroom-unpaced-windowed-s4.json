@@ -20,6 +20,8 @@
     "unpaced": true,
     "presentTrace": true
   },
+  "visualCapture": false,
+  "visualCaptureOptOutReason": "unpaced throughput/stage leg: the untimed capture tail keeps playing unpaced past the measured window, so its presents count against the header-frame loop check and blur the measured rate",
   "timeouts": {
     "queueWaitSec": 900,
     "extraClaimedWaitSec": 600
