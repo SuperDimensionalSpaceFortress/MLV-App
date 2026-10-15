@@ -8,7 +8,6 @@
   "backends": ["cuda", "cpu"],
   "scaleFactor": 2,
   "displayMode": "fullscreen",
-  "visualCapture": true,
   "generatorArgs": { "telemetryArm": "LIGHT", "cpuQuiescenceThresholdPercent": 95 },
   "timeouts": { "queueWaitSec": 900, "extraClaimedWaitSec": 600 },
   "look": { "contactSheetFrames": 6, "lookFlavor": "cinematic" },

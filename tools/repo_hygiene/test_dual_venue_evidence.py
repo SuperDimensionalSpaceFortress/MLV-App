@@ -131,7 +131,11 @@ SHIPPED_LEGS = ("legs/m16-1243-speed.json", "legs/m16-1243-look.json", "legs/m16
                 "legs/m16-1243-look-scale2-film.json", *(f"legs/m16-1243-look-scale2-{flavor}-agxoff.json" for flavor in ("cinematic", "film")),
                 *(f"legs/m16-1243-display-{mode}-s{scale}-vsync1.json" for scale in (1, 2, 4) for mode in ("fullscreen", "windowed")),
                 *CPU_REDUCED_LEGS, *UPSTREAM_BASELINE_LEGS, *PTRACE_LEGS, *VISUAL_LEGS, *SCOPE_LEGS, *SCOPE_LA_LEGS,
-                *(f"legs/m16-1243-exact-fullscreen-s{scale}-{arm}.json" for scale in (1, 2, 4) for arm in ("la", "ctl")))
+                *(f"legs/m16-1243-exact-fullscreen-s{scale}-{arm}.json" for scale in (1, 2, 4) for arm in ("la", "ctl")),
+                *(rel.replace(".json", "-vis.json") for rel in DISPLAY_MATRIX_LEGS))
+# PLAYBACK-CPU-PACE-GAP-1 r12: the visual twins of the six display-matrix cells. A look leg keeps window captures only when it opts in, and the cells
+# themselves stay byte-identical (their legSpecSha256 values sit in receipts), so each twin is its cell plus visualCapture true, under its own legId.
+VIS_LEGS = {rel.replace(".json", "-vis.json"): rel for rel in DISPLAY_MATRIX_LEGS}
 # PLAYBACK-CPU-PACE-GAP-1: the D1 exactness pairs, one per scale: arm A (la) runs the CPU-route lookahead (s1 by explicit depth 1), arm B (ctl) the
 # kill switch; both cpu-only at --drop-frame-mode off with the presented-frame dump on.
 EXACT_LEGS = {scale: (f"legs/m16-1243-exact-fullscreen-s{scale}-la.json", f"legs/m16-1243-exact-fullscreen-s{scale}-ctl.json") for scale in (1, 2, 4)}
@@ -4639,8 +4643,6 @@ class DisplayMatrixLegSetTests(unittest.TestCase):
             self.assertEqual(spec["backends"], ["cuda", "cpu"], rel)
             self.assertEqual(spec["legId"], Path(rel).stem, rel)
             self.assertIn(spec["displayMode"], ("fullscreen", "windowed"))
-            # PLAYBACK-CPU-PACE-GAP-1 r11 (sol r10 BLOCKER): every D4 cell opts in to the visual block (a look leg is off by default).
-            self.assertIs(spec.get("visualCapture"), True, rel)
             if spec["scaleFactor"] != 1:
                 self.assertNotIn("acceptedEffectiveScale", spec, f"{rel}: the CUDA texture route honours scales 2 and 4 (PLAYBACK-CUDA-HONOUR-SCALE-1); a CUDA cell at 1 must not pass")
             grid.add((spec["displayMode"], spec["scaleFactor"]))
@@ -5619,7 +5621,6 @@ class LegSpecSchemaTests(unittest.TestCase):
             arm = json.loads((DV / rel).read_text(encoding="utf-8"))
             self.jsonschema.validate(arm, self.schema)
             base = json.loads((DV / base_rel).read_text(encoding="utf-8"))
-            self.assertIs(base.pop("visualCapture"), True, base_rel)  # PLAYBACK-CPU-PACE-GAP-1 r11: only the D4 cell opts in; the twin stays as shipped
             self.assertNotIn("swapInterval", base["generatorArgs"], base_rel)
             self.assertEqual(arm["generatorArgs"].pop("swapInterval"), 1, rel)
             self.assertEqual(arm["legId"], Path(rel).stem, rel)
@@ -5705,11 +5706,33 @@ class LegSpecSchemaTests(unittest.TestCase):
             arm = json.loads((DV / rel).read_text(encoding="utf-8"))
             self.jsonschema.validate(arm, self.schema)
             twin = json.loads((DV / twin_rel).read_text(encoding="utf-8"))
-            twin.pop("visualCapture", None)  # PLAYBACK-CPU-PACE-GAP-1 r11: the D4 cell's visual opt-in; the trace leg stays as shipped
             self.assertNotIn("presentTrace", twin["generatorArgs"], twin_rel)
             self.assertEqual(arm["legId"], twin["legId"] + "-ptrace", rel)
             self.assertIs(arm["generatorArgs"].pop("presentTrace"), True, rel)
             self.assertEqual(dict(arm, legId=twin["legId"]), twin, rel)
+
+    def test_each_vis_leg_is_its_display_matrix_cell_with_the_visual_opt_in(self) -> None:
+        """PLAYBACK-CPU-PACE-GAP-1 r12: a visual twin differs from its display-matrix cell only in its legId (cell + -vis) and one added line,
+        visualCapture true right after displayMode; the cell itself names no visualCapture (a look leg is off by default)."""
+        for rel, cell_rel in VIS_LEGS.items():
+            arm = json.loads((DV / rel).read_text(encoding="utf-8"))
+            self.jsonschema.validate(arm, self.schema)
+            cell = json.loads((DV / cell_rel).read_text(encoding="utf-8"))
+            self.assertNotIn("visualCapture", cell, cell_rel)
+            self.assertEqual(arm["legId"], cell["legId"] + "-vis", rel)
+            self.assertEqual(arm["legId"], Path(rel).stem, rel)
+            self.assertIs(arm.pop("visualCapture"), True, rel)
+            self.assertEqual(dict(arm, legId=cell["legId"]), cell, rel)
+            self.assertEqual(list(arm), list(cell), "same keys in the same order")
+            text = lambda r: (DV / r).read_bytes().replace(b"\r\n", b"\n").decode("utf-8").split("\n")
+            arm_lines, cell_lines = text(rel), text(cell_rel)
+            self.assertEqual(arm_lines.count('  "visualCapture": true,'), 1, rel)
+            at = arm_lines.index('  "visualCapture": true,')
+            self.assertTrue(arm_lines[at - 1].startswith('  "displayMode": '), rel)
+            del arm_lines[at]
+            self.assertEqual([(a, b) for a, b in zip(arm_lines, cell_lines) if a != b],
+                             [(f'  "legId": "{cell["legId"]}-vis",', f'  "legId": "{cell["legId"]}",')], "byte copies: only the legId line differs")
+            self.assertEqual(len(arm_lines), len(cell_lines), rel)
 
     def test_the_scope_legs_are_no_look_windowed_s1_speed_legs_differing_only_in_scope(self) -> None:
         """PLAYBACK-SCOPES-OPTION-1: every scope leg is a single-backend no-look SPEED leg at windowed scale 1 (LIGHT, the 95 % quiescence gate,
@@ -5770,7 +5793,7 @@ class LegSpecSchemaTests(unittest.TestCase):
             flavored += 1
             if spec["card"] == "DUAL-VENUE-DISPLAY-MATRIX-1":   # the display-matrix legs are cinematic look legs named by their cell (display mode and scale)
                 self.assertEqual(spec["legId"], path.stem, path.name)   # (-ptrace: the cell with the present trace on, PTRACE_LEGS)
-                self.assertRegex(spec["legId"], r"^m16-1243-display-(fullscreen|windowed)-s[124](-ptrace)?$", path.name)
+                self.assertRegex(spec["legId"], r"^m16-1243-display-(fullscreen|windowed)-s[124](-ptrace|-vis)?$", path.name)   # (-vis: VIS_LEGS)
             elif spec["card"] == "PLAYBACK-VSYNC-DEFAULT-1":   # the swap-interval-1 twins of the display-matrix legs, named by their cell
                 self.assertEqual(spec["legId"], path.stem, path.name)
                 self.assertRegex(spec["legId"], r"^m16-1243-display-(fullscreen|windowed)-s[124]-vsync1$", path.name)
