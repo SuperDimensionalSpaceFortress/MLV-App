@@ -1329,14 +1329,21 @@ function Get-DvVisualCaptureRequest {
     <#
     .SYNOPSIS
     Does this leg keep window captures? Every SPEED leg does (an absent visualCapture means on) unless its spec says visualCapture false
-    WITH a visualCaptureOptOutReason; a look leg never runs this capture (applies = false: its contact sheet is the look). An opt-out
-    without a reason, or a reason without the opt-out, is a malformed spec: DVE_LEG_SPEC_INVALID.
+    WITH a visualCaptureOptOutReason; a look leg runs this capture only when its spec opts IN with visualCapture true (absent or false:
+    applies = false, its contact sheet is the look). An opt-out without a reason, or a reason without the opt-out (on a look leg, any
+    reason), is a malformed spec: DVE_LEG_SPEC_INVALID.
     #>
     param([Parameter(Mandatory)]$Spec)
     $applies = ([string](Get-DvProp $Spec 'legType') -cne 'look')
     $flag = $Spec.PSObject.Properties['visualCapture']
     $reason = $Spec.PSObject.Properties['visualCaptureOptOutReason']
     if ($null -ne $flag -and $flag.Value -isnot [bool]) { throw 'DVE_LEG_SPEC_INVALID visualCapture must be a boolean' }
+    # PLAYBACK-CPU-PACE-GAP-1 r11: the D4 display-matrix cells are look legs and must carry the visual block too, so a look leg may opt in.
+    if (-not $applies) {
+        if ($null -ne $reason) { throw 'DVE_LEG_SPEC_INVALID visualCaptureOptOutReason is only for a speed leg (a look leg captures only with visualCapture true)' }
+        $optIn = ($null -ne $flag -and $flag.Value)
+        return [pscustomobject]@{ applies = $optIn; requested = $optIn; optOutReason = $null }
+    }
     if ($null -ne $flag -and -not $flag.Value) {
         if ($null -eq $reason -or [string]::IsNullOrWhiteSpace([string]$reason.Value)) { throw 'DVE_LEG_SPEC_INVALID visualCapture false needs a visualCaptureOptOutReason' }
         return [pscustomobject]@{ applies = $applies; requested = $false; optOutReason = [string]$reason.Value }

@@ -4639,6 +4639,8 @@ class DisplayMatrixLegSetTests(unittest.TestCase):
             self.assertEqual(spec["backends"], ["cuda", "cpu"], rel)
             self.assertEqual(spec["legId"], Path(rel).stem, rel)
             self.assertIn(spec["displayMode"], ("fullscreen", "windowed"))
+            # PLAYBACK-CPU-PACE-GAP-1 r11 (sol r10 BLOCKER): every D4 cell opts in to the visual block (a look leg is off by default).
+            self.assertIs(spec.get("visualCapture"), True, rel)
             if spec["scaleFactor"] != 1:
                 self.assertNotIn("acceptedEffectiveScale", spec, f"{rel}: the CUDA texture route honours scales 2 and 4 (PLAYBACK-CUDA-HONOUR-SCALE-1); a CUDA cell at 1 must not pass")
             grid.add((spec["displayMode"], spec["scaleFactor"]))
@@ -5617,6 +5619,7 @@ class LegSpecSchemaTests(unittest.TestCase):
             arm = json.loads((DV / rel).read_text(encoding="utf-8"))
             self.jsonschema.validate(arm, self.schema)
             base = json.loads((DV / base_rel).read_text(encoding="utf-8"))
+            self.assertIs(base.pop("visualCapture"), True, base_rel)  # PLAYBACK-CPU-PACE-GAP-1 r11: only the D4 cell opts in; the twin stays as shipped
             self.assertNotIn("swapInterval", base["generatorArgs"], base_rel)
             self.assertEqual(arm["generatorArgs"].pop("swapInterval"), 1, rel)
             self.assertEqual(arm["legId"], Path(rel).stem, rel)
@@ -5702,6 +5705,7 @@ class LegSpecSchemaTests(unittest.TestCase):
             arm = json.loads((DV / rel).read_text(encoding="utf-8"))
             self.jsonschema.validate(arm, self.schema)
             twin = json.loads((DV / twin_rel).read_text(encoding="utf-8"))
+            twin.pop("visualCapture", None)  # PLAYBACK-CPU-PACE-GAP-1 r11: the D4 cell's visual opt-in; the trace leg stays as shipped
             self.assertNotIn("presentTrace", twin["generatorArgs"], twin_rel)
             self.assertEqual(arm["legId"], twin["legId"] + "-ptrace", rel)
             self.assertIs(arm["generatorArgs"].pop("presentTrace"), True, rel)
@@ -6529,6 +6533,9 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
             "true": ("@{ legType = 'speed'; visualCapture = $true }", "True|True|"),
             "optout": ("@{ legType = 'speed'; visualCapture = $false; visualCaptureOptOutReason = 'a capture-free pace A/B arm' }", "True|False|a capture-free pace A/B arm"),
             "look": ("@{ legType = 'look' }", "False|False|"),
+            # PLAYBACK-CPU-PACE-GAP-1 r11: a look leg opts in with visualCapture true (the D4 display-matrix cells); false stays off.
+            "look-optin": ("@{ legType = 'look'; visualCapture = $true }", "True|True|"),
+            "look-false": ("@{ legType = 'look'; visualCapture = $false }", "False|False|"),
         }
         for name, (spec, expected) in cases.items():
             with self.subTest(name):
@@ -6536,7 +6543,9 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
                 self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
                 self.assertEqual(out[0] if isinstance(out, list) else out, expected)
         for name, spec in (("no-reason", "@{ legType = 'speed'; visualCapture = $false }"), ("reason-only", "@{ legType = 'speed'; visualCaptureOptOutReason = 'why not' }"),
-                           ("not-bool", "@{ legType = 'speed'; visualCapture = 'no' }")):
+                           ("not-bool", "@{ legType = 'speed'; visualCapture = 'no' }"),
+                           ("look-reason", "@{ legType = 'look'; visualCapture = $false; visualCaptureOptOutReason = 'a look leg has its sheet' }"),
+                           ("look-optin-reason", "@{ legType = 'look'; visualCapture = $true; visualCaptureOptOutReason = 'a look leg has its sheet' }")):
             with self.subTest(name):
                 proc = run_pwsh(["-Command", f"Import-Module '{DV / 'DualVenueRunner.psm1'}' -Force; try {{ [void](Get-DvVisualCaptureRequest -Spec ([pscustomobject]{spec})); 'NO_THROW' }} catch {{ $_.Exception.Message }}"])
                 self.assertTrue(proc.stdout.strip().startswith("DVE_LEG_SPEC_INVALID"), proc.stdout + proc.stderr)

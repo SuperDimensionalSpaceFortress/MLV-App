@@ -223,7 +223,8 @@ $playSeconds = 25
 if ($null -ne $spec.PSObject.Properties['playSeconds']) { $playSeconds = [int]$spec.playSeconds }
 $lookFlavor = $null
 if ($isLook) { $lookFlavor = [string]$spec.look.lookFlavor; if ([string]::IsNullOrWhiteSpace($lookFlavor)) { $lookFlavor = 'classic' } }
-# PLAYBACK-VISUAL-INSPECTION-1: every SPEED leg keeps window captures unless its spec opts out (visualCapture false + a reason); a look leg never.
+# PLAYBACK-VISUAL-INSPECTION-1: every SPEED leg keeps window captures unless its spec opts out (visualCapture false + a reason); a look leg only
+# when its spec opts in with visualCapture true (PLAYBACK-CPU-PACE-GAP-1 r11: the D4 display-matrix cells).
 $visualRequest = Get-DvVisualCaptureRequest -Spec $spec
 
 $role = $null
@@ -417,7 +418,7 @@ try {
             if (-not $gen.ContainsKey('PlaybackRenderLookaheadFrames') -and $spec.generatorArgs.PSObject.Properties['playbackRenderLookaheadFrames']) { $gen['PlaybackRenderLookaheadFrames'] = [int]$spec.generatorArgs.playbackRenderLookaheadFrames }
         }
     }
-    # PLAYBACK-VISUAL-INSPECTION-1: the post-measurement window capture, for every speed leg that does not opt out.
+    # PLAYBACK-VISUAL-INSPECTION-1: the post-measurement window capture, for every speed leg that does not opt out and every look leg that opts in.
     if ($visualRequest.requested) { $gen['VisualCapture'] = $true }
     if ($isLook) {
         $gen['ContactSheet'] = $true; $gen['ContactSheetFrames'] = [int]$spec.look.contactSheetFrames
