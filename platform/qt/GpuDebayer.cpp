@@ -559,6 +559,17 @@ void enterAmazeStageTelemetry(GpuAmazeDebayerRuntime * runtime)
     gpuAmazeCudaErrorsEmitOrphans(runtime->cudaErrors, 1, g_amazeStageTelemetrySink.load(std::memory_order_relaxed));
 }
 
+/* GPU-DEVICE-LOSS-SELF-HEAL-1 r6 (CoS #437, guard under the serializing lock):
+ * the last step before every AMaZE backend run. The entry above can hand an
+ * orphan device-loss code to the breaker on this thread, which suppresses CUDA,
+ * and a loss on another thread can land while this caller waited on live.mutex:
+ * the flag is read again after both. false = the run must not submit. */
+bool enterAmazeRunUnlessCudaSuppressed(GpuAmazeDebayerRuntime * runtime, bool telemetry)
+{
+    if ( telemetry ) enterAmazeStageTelemetry(runtime);
+    return !llrpGpuCudaSuppressed();
+}
+
 /* GPU-FIELD-TELEMETRY-1: one stage record per AMaZE run wrapper call. Success
  * reads the backend's own per-frame timing (no CUDA call); failure (r6) emits
  * every code the call noted (gpuAmazeCudaErrorsEmitFailure). Call sites guard
@@ -609,6 +620,14 @@ struct GpuAmazeDebayerLiveTextureRuntime
         {
             if ( outReason ) *outReason = reason;
             return available;
+        }
+
+        /* r6: create('cuda') below is a CUDA call, so the flag is read again
+         * under the lock; a suppressed session leaves the runtime unattempted. */
+        if ( llrpGpuCudaSuppressed() )
+        {
+            if ( outReason ) *outReason = cudaSuppressedReason();
+            return false;
         }
 
         attempted = true;
@@ -984,7 +1003,11 @@ bool gpuAmazeDebayerApplyGpuOffscreen(const float * inputRawFrame,
         return fail(mismatch);
     }
 
-    if ( GpuFieldTelemetry::enabled() ) enterAmazeStageTelemetry(&runtime);
+    if ( !enterAmazeRunUnlessCudaSuppressed(&runtime, GpuFieldTelemetry::enabled()) )
+    {
+        runtime.destroy(backend);
+        return fail(cudaSuppressedReason());
+    }
     const int rc = runtime.run(backend, inputRawFrame, outputRgb16, width, height);
     if ( GpuFieldTelemetry::enabled() ) noteAmazeStageTelemetry(&runtime, backend, "amaze:offscreen", rc);
     if ( rc != 0 )
@@ -1068,7 +1091,11 @@ bool gpuAmazeDebayerRenderPostWbGlTexture(const float * inputRawFrame,
         return fail(mismatch);
     }
 
-    if ( GpuFieldTelemetry::enabled() ) enterAmazeStageTelemetry(&runtime);
+    if ( !enterAmazeRunUnlessCudaSuppressed(&runtime, GpuFieldTelemetry::enabled()) )
+    {
+        runtime.destroy(backend);
+        return fail(cudaSuppressedReason());
+    }
     const int rc = runtime.runPostWbGlTexture(backend,
                                              inputRawFrame,
                                              glTexture,
@@ -1177,12 +1204,14 @@ bool gpuAmazeDebayerRenderPostWbGlTextureFromR16GlTexture(
     }
 
     QMutexLocker locker(&live.mutex);
+    /* r6: read again under the lock: a caller queued here through a loss must not reach CUDA. */
+    if ( llrpGpuCudaSuppressed() ) return fail(cudaSuppressedReason());
     QString hnyquistReason;
     if ( !setLiveReducedHnyquist(live, reducedHnyquist, &hnyquistReason) )
     {
         return fail(hnyquistReason);
     }
-    if ( GpuFieldTelemetry::enabled() ) enterAmazeStageTelemetry(&live.runtime);
+    if ( !enterAmazeRunUnlessCudaSuppressed(&live.runtime, GpuFieldTelemetry::enabled()) ) return fail(cudaSuppressedReason());
     const int rc =
         live.runtime.runPostWbGlTextureFromR16GlTexture(
             live.backend,
@@ -1250,6 +1279,8 @@ bool gpuAmazeDebayerRenderPostWbGlTextureFromDeviceBayer16(
     }
 
     QMutexLocker locker(&live.mutex);
+    /* r6: read again under the lock: a caller queued here through a loss must not reach CUDA. */
+    if ( llrpGpuCudaSuppressed() ) return fail(cudaSuppressedReason());
     if ( !live.runtime.runPostWbGlTextureFromDeviceBayer16 )
     {
         return fail(QStringLiteral("GPU AMaZE direct device texture-present symbol is unavailable"));
@@ -1260,7 +1291,7 @@ bool gpuAmazeDebayerRenderPostWbGlTextureFromDeviceBayer16(
         return fail(hnyquistReason);
     }
 
-    if ( GpuFieldTelemetry::enabled() ) enterAmazeStageTelemetry(&live.runtime);
+    if ( !enterAmazeRunUnlessCudaSuppressed(&live.runtime, GpuFieldTelemetry::enabled()) ) return fail(cudaSuppressedReason());
     const int rc =
         live.runtime.runPostWbGlTextureFromDeviceBayer16(
             live.backend,
@@ -1440,4 +1471,11 @@ int gpuAmazeDebayerDrainCudaErrorsAtTeardown(int waitMs)
 void gpuAmazeDebayerSetCudaErrorSourceForTesting(const GpuAmazeCudaErrorSource * source)
 {
     g_amazeCudaErrorSourceForTesting.store(source);
+}
+
+bool gpuAmazeDebayerEnterRunForTesting(const GpuAmazeCudaErrorSource & source)
+{
+    GpuAmazeDebayerRuntime runtime;
+    runtime.cudaErrors = source;
+    return enterAmazeRunUnlessCudaSuppressed(&runtime, true);
 }

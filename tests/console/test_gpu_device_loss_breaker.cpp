@@ -219,31 +219,158 @@ TEST(GpuDeviceLossBreaker, PersistedKeysRoundTripThroughTheAppSettingsStore)
     automation_settings::releaseForTest();
 }
 
-// The suppression check in run_backend comes before the backend mutex, and before any backend use.
-TEST(GpuDeviceLossBreaker, RunBackendChecksTheFlagBeforeTheBackendMutex)
+namespace
 {
-    const QString source = readRepoFile(QStringLiteral("src/mlv/llrawproc/llrawproc.c"));
-    const int fn = source.indexOf(QStringLiteral("static int llrawproc_gpu_recon_run_backend("));
-    ASSERT_TRUE(fn >= 0);
-    const int check = source.indexOf(QStringLiteral("if(llrpGpuCudaSuppressed())"), fn);
-    const int lock = source.indexOf(QStringLiteral("pthread_mutex_lock(&g_llrawproc_gpu_recon_backend_mutex)"), fn);
-    ASSERT_TRUE(check > fn);
-    ASSERT_TRUE(lock > fn);
-    ASSERT_TRUE(check < lock);
-    ASSERT_TRUE(source.mid(check, 160).contains(QStringLiteral("LLRP_GPU_PLAYBACK_RECON_RC_CUDA_SUPPRESSED")));
-    // The preupload refuses before its own trylock, and the playback gate before anything else.
-    const int pre = source.indexOf(QStringLiteral("int llrpGpuPlaybackReconPreuploadFrame(uint64_t frame_id,\n"
-                                                  "                                      const uint16_t * raw_input_bayer14,\n"
-                                                  "                                      size_t raw_image_size)\n{"));
-    ASSERT_TRUE(pre >= 0);
-    const int preCheck = source.indexOf(QStringLiteral("if(llrpGpuCudaSuppressed()) return 0;"), pre);
-    const int preLock = source.indexOf(QStringLiteral("pthread_mutex_trylock(&g_llrawproc_gpu_recon_backend_mutex)"), pre);
-    ASSERT_TRUE(preCheck > pre && preCheck < preLock);
-    ASSERT_TRUE(source.contains(QStringLiteral("static int llrawproc_gpu_playback_recon_enabled(void)\n{\n"
-                                               "    if(llrpGpuCudaSuppressed()) return 0;")));
+// r6 (CoS #437; ruling candidate mlv-gpu-guard-under-serializing-lock-r1, ADOPTED): every acquisition of a
+// lock that serializes CUDA work, in `source`, is found by grep (never listed by hand). Each one whose code
+// up to the end of its function submits CUDA work (one of `submits`) must read `guard` after the lock and
+// before that first submission. Release, destroy, reset and teardown calls are not submissions: they free
+// what a loss left behind and are never gated (llrawproc.h). Returns "<tag>:<line>" for each site that does
+// not; a new site added without a re-check is reported here.
+QStringList lockSitesWithoutAReCheck(const QString & source, const char * tag, const QStringList & locks,
+                                     const QStringList & submits, const QString & guard)
+{
+    QStringList missing;
+    for (const QString & lock : locks)
+    {
+        for (int at = source.indexOf(lock); at >= 0; at = source.indexOf(lock, at + 1))
+        {
+            const int end = source.indexOf(QStringLiteral("\n}\n"), at);
+            const QString region = source.mid(at, (end < 0 ? source.size() : end) - at);
+            int firstSubmit = -1;
+            for (const QString & call : submits)
+            {
+                const int c = region.indexOf(call);
+                if (c >= 0 && (firstSubmit < 0 || c < firstSubmit)) firstSubmit = c;
+            }
+            if (firstSubmit < 0) continue; // counters, info, release, teardown: no CUDA work behind this lock
+            const int check = region.indexOf(guard);
+            if (check < 0 || check > firstSubmit)
+                missing << QStringLiteral("%1:%2").arg(QString::fromLatin1(tag)).arg(source.left(at).count(QLatin1Char('\n')) + 1);
+        }
+    }
+    return missing;
+}
+
+QStringList llrawprocLockSitesWithoutAReCheck(const QString & source)
+{
+    return lockSitesWithoutAReCheck(source, "llrawproc.c",
+        {QStringLiteral("pthread_mutex_lock(&g_llrawproc_gpu_recon_backend_mutex)"),
+         QStringLiteral("pthread_mutex_trylock(&g_llrawproc_gpu_recon_backend_mutex)")},
+        {QStringLiteral("g->run("), QStringLiteral("g->run_preuploaded("), QStringLiteral("g->set_clip("),
+         QStringLiteral("g->set_luts("), QStringLiteral("g->set_reduced_iso_notch("), QStringLiteral("g->preupload_frame("),
+         QStringLiteral("g->copy_last_device_output_to_gl_texture("), QStringLiteral("g->retain_last_device_output("),
+         QStringLiteral("llrawproc_gpu_export_backend_available(")}, // creates the backend on first use
+        QStringLiteral("llrpGpuCudaSuppressed()"));
+}
+
+QStringList debayerLockSitesWithoutAReCheck(const QString & source)
+{
+    return lockSitesWithoutAReCheck(source, "GpuDebayer.cpp",
+        {QStringLiteral("QMutexLocker locker(&live.mutex);"), QStringLiteral("QMutexLocker locker(&mutex);"),
+         QStringLiteral("live.mutex.tryLock(")},
+        {QStringLiteral("runtime.create("), QStringLiteral("runtime.run("), QStringLiteral(".runPostWbGlTexture("),
+         QStringLiteral(".runPostWbGlTextureFromR16GlTexture("), QStringLiteral(".runPostWbGlTextureFromDeviceBayer16("),
+         QStringLiteral("setLiveReducedHnyquist("), QStringLiteral("runtime.setReducedHnyquist(")},
+        QStringLiteral("llrpGpuCudaSuppressed()"));
+}
+
+QString replacedOnce(QString text, const QString & from, const QString & to)
+{
+    const int at = text.indexOf(from);
+    ASSERT_TRUE(at >= 0);
+    ASSERT_EQ(-1, text.indexOf(from, at + 1));
+    return text.replace(at, from.size(), to);
+}
+} // namespace
+
+// r6: suppression is read again after every serializing lock that guards CUDA work (the r1-r5 pin,
+// RunBackendChecksTheFlagBeforeTheBackendMutex, locked in the check-before-the-lock-only shape). The check
+// before each lock stays as the fast path.
+TEST(GpuDeviceLossBreaker, EverySerializingLockSiteReChecksSuppressionAfterAcquiring)
+{
+    const QString llrawproc = readRepoFile(QStringLiteral("src/mlv/llrawproc/llrawproc.c"));
+    const QString debayer = readRepoFile(QStringLiteral("platform/qt/GpuDebayer.cpp"));
+    ASSERT_EQ(std::string(), llrawprocLockSitesWithoutAReCheck(llrawproc).join(QStringLiteral(", ")).toStdString());
+    ASSERT_EQ(std::string(), debayerLockSitesWithoutAReCheck(debayer).join(QStringLiteral(", ")).toStdString());
+    // The census sees every site that submits: run_backend, the preupload, the GL copy, the export probe; ensure,
+    // and both live AMaZE runs. Each one's re-check removed is reported (the r5 shape).
+    const QString runRecheck = QStringLiteral(
+        "    pthread_mutex_lock(&g_llrawproc_gpu_recon_backend_mutex);\n"
+        "    /* r6 (CoS #437, guard under the serializing lock): a caller that passed the\n"
+        "     * check above and then waited here through a loss must not reach CUDA. */\n"
+        "    if(llrpGpuCudaSuppressed())\n");
+    const QString noRunRecheck = replacedOnce(llrawproc, runRecheck,
+        QStringLiteral("    pthread_mutex_lock(&g_llrawproc_gpu_recon_backend_mutex);\n    if(0)\n"));
+    ASSERT_EQ(1, (int)llrawprocLockSitesWithoutAReCheck(noRunRecheck).size());
+    const QString noPreuploadRecheck = replacedOnce(llrawproc, QStringLiteral("    suppressed = llrpGpuCudaSuppressed();\n"),
+                                                    QStringLiteral("    suppressed = 0;\n"));
+    ASSERT_EQ(1, (int)llrawprocLockSitesWithoutAReCheck(noPreuploadRecheck).size());
+    const QString liveRecheck = QStringLiteral(
+        "    /* r6: read again under the lock: a caller queued here through a loss must not reach CUDA. */\n"
+        "    if ( llrpGpuCudaSuppressed() ) return fail(cudaSuppressedReason());\n");
+    ASSERT_EQ(2, (int)debayer.count(liveRecheck));
+    QString noLiveRecheck = debayer;
+    noLiveRecheck.replace(liveRecheck, QString());
+    ASSERT_EQ(2, (int)debayerLockSitesWithoutAReCheck(noLiveRecheck).size());
+    const QString noEnsureRecheck = replacedOnce(debayer,
+        QStringLiteral("         * under the lock; a suppressed session leaves the runtime unattempted. */\n        if ( llrpGpuCudaSuppressed() )\n"),
+        QStringLiteral("         * under the lock; a suppressed session leaves the runtime unattempted. */\n        if ( false )\n"));
+    ASSERT_EQ(1, (int)debayerLockSitesWithoutAReCheck(noEnsureRecheck).size());
+    // A new site added later without a re-check is reported.
+    const QString added = llrawproc + QStringLiteral(
+        "\nstatic int a_new_site(void)\n{\n"
+        "    pthread_mutex_lock(&g_llrawproc_gpu_recon_backend_mutex);\n"
+        "    g->run(g->backend, 0, 0, 0, 0, 0);\n"
+        "    pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);\n    return 0;\n}\n");
+    const QStringList newSite = llrawprocLockSitesWithoutAReCheck(added);
+    ASSERT_EQ(1, (int)newSite.size());
+    ASSERT_EQ((QStringLiteral("llrawproc.c:%1").arg(llrawproc.count(QLatin1Char('\n')) + 4)).toStdString(), newSite.at(0).toStdString());
+    // The fast path stays: the run, the preupload and the GL copy refuse before their lock, the playback gate first.
+    for (const char * entry : {"static int llrawproc_gpu_recon_run_backend(", "int llrpGpuPlaybackReconPreuploadFrame(uint64_t frame_id,\n                                      const uint16_t * raw_input_bayer14,\n                                      size_t raw_image_size)\n{",
+                               "int llrpGpuPlaybackReconCopyLastDeviceBayer16ToGlTexture(unsigned int gl_texture_id,\n                                                         int * rc_out)\n{"})
+    {
+        const int fn = llrawproc.indexOf(QString::fromLatin1(entry));
+        ASSERT_TRUE(fn >= 0);
+        const int check = llrawproc.indexOf(QStringLiteral("if(llrpGpuCudaSuppressed())"), fn);
+        int lock = llrawproc.indexOf(QStringLiteral("_mutex_lock(&g_llrawproc_gpu_recon_backend_mutex)"), fn);
+        const int trylock = llrawproc.indexOf(QStringLiteral("_mutex_trylock(&g_llrawproc_gpu_recon_backend_mutex)"), fn);
+        if (trylock >= 0 && (lock < 0 || trylock < lock)) lock = trylock;
+        ASSERT_TRUE(check > fn);
+        ASSERT_TRUE(check < lock);
+    }
+    ASSERT_TRUE(llrawproc.contains(QStringLiteral("static int llrawproc_gpu_playback_recon_enabled(void)\n{\n"
+                                                  "    if(llrpGpuCudaSuppressed()) return 0;")));
     // Both build variants define the flag.
-    ASSERT_EQ(2, (int)source.count(QStringLiteral("int llrpGpuCudaSuppressed(void)\n{")));
-    ASSERT_EQ(2, (int)source.count(QStringLiteral("void llrpSetGpuCudaSuppressed(int suppressed)\n{")));
+    ASSERT_EQ(2, (int)llrawproc.count(QStringLiteral("int llrpGpuCudaSuppressed(void)\n{")));
+    ASSERT_EQ(2, (int)llrawproc.count(QStringLiteral("void llrpSetGpuCudaSuppressed(int suppressed)\n{")));
+}
+
+// r6: every AMaZE run reads the flag again after its telemetry entry, which can deliver an orphan device-loss
+// code to the breaker on the calling thread (the behaviour is pinned in tests/pipeline/test_gpu_device_loss_selfheal.cpp).
+TEST(GpuDeviceLossBreaker, EveryAmazeRunReChecksSuppressionAfterItsTelemetryEntry)
+{
+    const QString debayer = readRepoFile(QStringLiteral("platform/qt/GpuDebayer.cpp"));
+    ASSERT_TRUE(debayer.contains(QStringLiteral(
+        "bool enterAmazeRunUnlessCudaSuppressed(GpuAmazeDebayerRuntime * runtime, bool telemetry)\n{\n"
+        "    if ( telemetry ) enterAmazeStageTelemetry(runtime);\n"
+        "    return !llrpGpuCudaSuppressed();\n}\n")));
+    // The entry is made only there.
+    ASSERT_EQ(2, (int)debayer.count(QStringLiteral("enterAmazeStageTelemetry(")));
+    const QString enter = QStringLiteral("if ( !enterAmazeRunUnlessCudaSuppressed(&");
+    ASSERT_EQ(4, (int)debayer.count(enter));
+    for (const char * call : {"const int rc = runtime.run(backend,", "const int rc = runtime.runPostWbGlTexture(backend,",
+                              "live.runtime.runPostWbGlTextureFromR16GlTexture(", "live.runtime.runPostWbGlTextureFromDeviceBayer16("})
+    {
+        const int callAt = debayer.indexOf(QString::fromLatin1(call));
+        ASSERT_TRUE(callAt > 0);
+        const int enterAt = debayer.lastIndexOf(enter, callAt);
+        ASSERT_TRUE(enterAt > 0);
+        // nothing between the re-check and the call but its refusal
+        const QString between = debayer.mid(enterAt, callAt - enterAt);
+        ASSERT_TRUE(between.contains(QStringLiteral("return fail(cudaSuppressedReason());")));
+        ASSERT_EQ(1, (int)between.count(QStringLiteral(";\n")) - (int)between.count(QStringLiteral("runtime.destroy(backend);\n")));
+    }
 }
 
 // Every CUDA AMaZE entry in GpuDebayer.cpp refuses first while suppressed.

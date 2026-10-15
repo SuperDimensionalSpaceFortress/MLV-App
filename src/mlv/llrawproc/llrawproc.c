@@ -1903,7 +1903,10 @@ static int llrawproc_gpu_recon_backend_available_guarded(int prefer_playback_dll
 {
     int available = 0;
     pthread_mutex_lock(&g_llrawproc_gpu_recon_backend_mutex);
-    available = llrawproc_gpu_export_backend_available(prefer_playback_dll);
+    /* GPU-DEVICE-LOSS-SELF-HEAL-1 r6: the check can create the backend (a CUDA
+     * call), so a suppressed session reads it as unavailable, under the lock. */
+    if(!llrpGpuCudaSuppressed())
+        available = llrawproc_gpu_export_backend_available(prefer_playback_dll);
     pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
     return available;
 }
@@ -2194,6 +2197,7 @@ int llrpGpuPlaybackReconPreuploadFrame(uint64_t frame_id,
     int locked = 0;
     int run_active = 0;
     int bypass_claimed = 0;
+    int suppressed = 0;
     int rc = 0;
     llrpGpuStageTelemetrySink_t telemetry_sink = NULL;
     llrawprocGpuStageTelemetryEvent_t telemetry_event;
@@ -2234,7 +2238,12 @@ int llrpGpuPlaybackReconPreuploadFrame(uint64_t frame_id,
      * pointers cannot be replaced until that call clears run_active and
      * releases the mutex.  This narrow bypass is what permits N+1 upload to
      * overlap N's kernels without racing backend teardown. */
-    if(g->backend
+    /* GPU-DEVICE-LOSS-SELF-HEAL-1 r6: the flag is read again once the lock (or
+     * the bypass claim) is held: a loss delivered since the check above stops
+     * this upload too. */
+    suppressed = llrpGpuCudaSuppressed();
+    if(!suppressed
+     && g->backend
      && g->clip_configured
      && g->preupload_frame
      && g->run_preuploaded
@@ -2286,7 +2295,7 @@ int llrpGpuPlaybackReconPreuploadFrame(uint64_t frame_id,
     {
         llrawproc_gpu_stage_telemetry_emit(telemetry_sink, &telemetry_event, telemetry_pending);
     }
-    return rc == 0;
+    return !suppressed && rc == 0;
 }
 
 static void llrawproc_gpu_recon_luts_key_from_state(
@@ -2357,7 +2366,8 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
     if(device_height_out) *device_height_out = 0;
     if(retained_out) memset(retained_out, 0, sizeof(*retained_out));
     /* GPU-DEVICE-LOSS-SELF-HEAL-1: after a device loss no CUDA call is made on
-     * any thread; checked before any lock or backend access. */
+     * any thread; checked before any lock or backend access (the fast path),
+     * and again once the backend mutex is held (r6). */
     if(llrpGpuCudaSuppressed())
     {
         if(rc_out) *rc_out = LLRP_GPU_PLAYBACK_RECON_RC_CUDA_SUPPRESSED;
@@ -2402,6 +2412,14 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
     frame.apply_dither = state->apply_dither;
 
     pthread_mutex_lock(&g_llrawproc_gpu_recon_backend_mutex);
+    /* r6 (CoS #437, guard under the serializing lock): a caller that passed the
+     * check above and then waited here through a loss must not reach CUDA. */
+    if(llrpGpuCudaSuppressed())
+    {
+        pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
+        if(rc_out) *rc_out = LLRP_GPU_PLAYBACK_RECON_RC_CUDA_SUPPRESSED;
+        return 0;
+    }
     if(!llrawproc_gpu_export_backend_available(prefer_playback_dll))
     {
         pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
@@ -3190,7 +3208,12 @@ int llrpGpuPlaybackReconCopyLastDeviceBayer16ToGlTexture(unsigned int gl_texture
     if(gl_texture_id == 0) return 0;
 
     pthread_mutex_lock(&g_llrawproc_gpu_recon_backend_mutex);
-    if(g->backend && !g->unavailable && g->copy_last_device_output_to_gl_texture)
+    /* r6: read again under the lock (see llrawproc_gpu_recon_run_backend). */
+    if(llrpGpuCudaSuppressed())
+    {
+        rc = LLRP_GPU_PLAYBACK_RECON_RC_CUDA_SUPPRESSED;
+    }
+    else if(g->backend && !g->unavailable && g->copy_last_device_output_to_gl_texture)
     {
         rc = g->copy_last_device_output_to_gl_texture(g->backend, gl_texture_id);
     }

@@ -8,9 +8,13 @@
 // notice and asks for one refresh. (c) a validation failure (no CUDA code) suppresses nothing.
 // (d) with no fault the flag stays clear and every frame reaches the backend. (e) two losses on
 // the same profile, as two launches within 10 minutes, set the persisted safe-start flag.
+// r6 (CoS #437, guard under the serializing lock): (f) a frame queued on the backend mutex while a loss is
+// delivered never reaches the backend; (g) a device-loss orphan delivered by an AMaZE run's telemetry entry
+// stops that very run.
 #include "../common/minitest.h"
 #include "../../src/mlv/llrawproc/llrawproc.h"
 #include "../../platform/qt/AutomationSettings.h"
+#include "../../platform/qt/GpuDebayer.h"
 #include "../../platform/qt/GpuDeviceLossBreaker.h"
 #include "../../platform/qt/GpuDeviceLossBreakerCore.h"
 #include "../../platform/qt/GpuFieldTelemetry.h"
@@ -21,13 +25,18 @@
 #include <QStringList>
 #include <QTemporaryDir>
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 extern "C" int llrpInstallFakeGpuPlaybackReconBackendForTesting(int install);
+extern "C" void llrpHoldGpuReconBackendMutexForTesting(int hold);
 extern "C" int llrpResetGpuExportBackendForTesting(void);
 extern "C" void llrpFakeGpuBackendInjectRunFailureForTesting(int rc, int cuda_code, const char * name);
 extern "C" void llrpFakeGpuBackendReducedIsoNotchStateForTesting(int * last_run_flag,
@@ -266,5 +275,110 @@ TEST(GpuDeviceLossSelfHeal, TwoLossesOnTheSameProfileSetThePersistedFlag)
         ASSERT_TRUE(second.safeStartEnabled());
         ASSERT_EQ(1, (int)second.notices.size());
         ASSERT_EQ(core::noticeText(core::kNoticeFlagSet, "cudaErrorIllegalAddress"), second.notices[0].toStdString());
+    }
+}
+
+namespace
+{
+GpuFieldTelemetry::CudaFault launchTimeout()
+{
+    GpuFieldTelemetry::CudaFault fault;
+    fault.dll = "recon";
+    fault.stage = "recon:run";
+    fault.rc = -1;
+    fault.cudaCode = 702;
+    fault.cudaName = "cudaErrorLaunchTimeout";
+    fault.site = "another thread's run";
+    return fault;
+}
+} // namespace
+
+// (f) A frame passes the check before the lock while CUDA is fine, then waits on the backend mutex (held here,
+// as another frame's run holds it). The loss is delivered while it waits. Once the lock is released it must
+// refuse without touching the backend (r1-r5 checked only before the lock: it ran).
+TEST(GpuDeviceLossSelfHeal, AFrameQueuedOnTheBackendMutexThroughALossNeverReachesTheBackend)
+{
+    CaseScope scope;
+    int rc = -99;
+    int used = -1;
+    std::atomic<bool> done{false};
+    const uint64_t before = fakeRunCount();
+    llrpHoldGpuReconBackendMutexForTesting(1);
+    std::thread queued([&]() {
+        used = runOnce(7, &rc);
+        done.store(true);
+    });
+    // Nothing but the held mutex can keep the frame from finishing: still running after 300 ms means it is
+    // past its check before the lock (a refused frame returns at once) and waiting on the lock.
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    const bool waitedOnTheLock = !done.load();
+    GpuDeviceLossBreaker::onFault(launchTimeout()); // what the fault listener does on the faulting thread
+    const int suppressedWhileQueued = llrpGpuCudaSuppressed();
+    llrpHoldGpuReconBackendMutexForTesting(0);
+    queued.join();
+    ASSERT_TRUE(waitedOnTheLock);
+    ASSERT_EQ(1, suppressedWhileQueued);
+    ASSERT_EQ(0, used);
+    ASSERT_EQ(LLRP_GPU_PLAYBACK_RECON_RC_CUDA_SUPPRESSED, rc);
+    ASSERT_EQ(before, fakeRunCount()); // the backend never ran
+}
+
+namespace
+{
+// A device-loss code the AMaZE DLL noted on the render channel with no call to own it (an orphan): the next
+// run's telemetry entry drains it and hands it to the sink, which reaches the breaker on this thread.
+struct OrphanLaunchTimeout
+{
+    static long pending;
+    static int drains;
+    static int drain(int channel, igpu_cuda_error_t * out, int capacity, unsigned long long * dropped)
+    {
+        if (dropped) *dropped = 0;
+        if (channel != IGPU_CUDA_ERROR_CHANNEL_RENDER || pending == 0 || capacity < 1) return 0;
+        ++drains;
+        std::memset(out, 0, sizeof(*out));
+        out->code = 702;
+        std::strcpy(out->name, "cudaErrorLaunchTimeout");
+        std::strcpy(out->site, "a kernel launch nothing captured");
+        out->count = 1;
+        pending = 0;
+        return 1;
+    }
+};
+long OrphanLaunchTimeout::pending = 0;
+int OrphanLaunchTimeout::drains = 0;
+} // namespace
+
+// (g) The AMaZE run step, telemetry entry on, with a device-loss orphan pending: the entry delivers it to the
+// breaker (CUDA suppressed on this thread), and the same step then refuses the run. r1-r5 entered and ran.
+TEST(GpuDeviceLossSelfHeal, ADeviceLossOrphanDeliveredAtAnAmazeRunsEntryStopsThatRun)
+{
+    CaseScope scope;
+    OrphanLaunchTimeout::pending = 1;
+    OrphanLaunchTimeout::drains = 0;
+    GpuAmazeCudaErrorSource source;
+    source.drain = &OrphanLaunchTimeout::drain;
+    source.pending[IGPU_CUDA_ERROR_CHANNEL_RENDER] = reinterpret_cast<const volatile long *>(&OrphanLaunchTimeout::pending);
+    bool maySubmit = true;
+    int suppressedBefore = -1;
+    scope.withTelemetrySink([&]() {
+        suppressedBefore = llrpGpuCudaSuppressed();
+        maySubmit = gpuAmazeDebayerEnterRunForTesting(source);
+    });
+    ASSERT_EQ(0, suppressedBefore);
+    ASSERT_EQ(1, OrphanLaunchTimeout::drains);
+    ASSERT_EQ(1, scope.seen.deviceLossFaults);   // the orphan reached the breaker's listener
+    ASSERT_EQ(702, scope.seen.lastCode);
+    ASSERT_EQ(1, scope.seen.suppressedAfterListener);
+    ASSERT_FALSE(maySubmit);                       // and the run that entered never submits
+    // With nothing pending the same step lets the run go.
+    {
+        CaseScope clean;
+        OrphanLaunchTimeout::pending = 0;
+        bool cleanMaySubmit = false;
+        clean.withTelemetrySink([&]() { cleanMaySubmit = gpuAmazeDebayerEnterRunForTesting(source); });
+        ASSERT_TRUE(cleanMaySubmit);
+        ASSERT_EQ(0, clean.seen.deviceLossFaults);
+        ASSERT_EQ(0, llrpGpuCudaSuppressed());
     }
 }

@@ -352,8 +352,10 @@ llrpGpuStageTelemetrySink_t llrpGetGpuStageTelemetrySinkForTesting(void);
  * flag. While set, every CUDA entry refuses before taking any lock or touching
  * the backend: the recon run (rc LLRP_GPU_PLAYBACK_RECON_RC_CUDA_SUPPRESSED),
  * the playback recon gate, the async preupload and the GL copy, and every CUDA
- * AMaZE entry in GpuDebayer.cpp. Release, destroy and teardown are never
- * gated. One aligned load per entry. */
+ * AMaZE entry in GpuDebayer.cpp. r6: each one reads the flag again once its
+ * serializing lock is held (and an AMaZE run after its telemetry entry), so a
+ * caller queued through a loss never submits. Release, destroy and teardown
+ * are never gated. One aligned load per check. */
 void llrpSetGpuCudaSuppressed(int suppressed);
 int llrpGpuCudaSuppressed(void);
 /* r6 terminal drain: a code noted after the last captured call has no later
