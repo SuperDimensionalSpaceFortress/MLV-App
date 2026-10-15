@@ -398,6 +398,8 @@ try {
         if ($spec.generatorArgs.PSObject.Properties['disableLookAssist'] -and [bool]$spec.generatorArgs.disableLookAssist) { $gen['DisableLookAssist'] = $true }
         # PLAYBACK-STARTUP-CATCHUP-BURST-1 r7: the app's opt-in per-present playback trace, for any leg.
         if ($spec.generatorArgs.PSObject.Properties['presentTrace'] -and [bool]$spec.generatorArgs.presentTrace) { $gen['PresentTrace'] = $true }
+        # CUDA-HEADROOM-1: an unpaced throughput leg (no pace guard, drop-frame off), for any leg; judged below by the app's own pace_unpaced line.
+        if ($spec.generatorArgs.PSObject.Properties['unpaced'] -and [bool]$spec.generatorArgs.unpaced) { $gen['Unpaced'] = $true }
         # PLAYBACK-SCOPES-OPTION-1: the live scope the smoke forces on, and the app's playback scope throttle interval, for any leg.
         if ($spec.generatorArgs.PSObject.Properties['scope']) { $gen['Scope'] = [string]$spec.generatorArgs.scope }
         if ($spec.generatorArgs.PSObject.Properties['scopeIntervalMs']) { $gen['ScopeIntervalMs'] = [int]$spec.generatorArgs.scopeIntervalMs }
@@ -719,6 +721,13 @@ if ($outcome -eq 'CAPTURED') {
 # run log cannot confirm, is not a valid measurement under that mode: a typed INVALID with the reason, never a PASS or FAIL. (A legacy spec that names no mode keeps its old behaviour.)
 if ($outcome -in @('PASS', 'FAIL') -and $display.blocks) {
     $detail = "INVALID: the job result was $outcome ($detail) but DISPLAY_MODE_NOT_HONOURED: $($display.reason). A run that did not use the display mode the leg names is no measurement under it"
+    $outcome = 'INVALID'
+}
+# CUDA-HEADROOM-1, FAIL CLOSED: an unpaced leg whose run log does not show the app lifting its pace guard (pace_unpaced active=1 drop_frame=0 for the measured session)
+# ran at the clip's own pace, so its fps is the pace wall, not throughput: a typed INVALID, never a PASS or FAIL. A leg that does not ask for it is unchanged.
+$unpacedVerdict = Get-DvUnpacedEvidence -Spec $spec -LogText $runLogText
+if ($outcome -in @('PASS', 'FAIL') -and $unpacedVerdict.blocks) {
+    $detail = "INVALID: the job result was $outcome ($detail) but UNPACED_NOT_HONOURED: $($unpacedVerdict.reason). A paced run is no throughput measurement"
     $outcome = 'INVALID'
 }
 # A signal needs its proof. A PASS or FAIL whose receipt-oracle verdict is not valid (under 20 s of source frames, a wrap,

@@ -896,6 +896,33 @@ function Get-DvDisplayEvidence {
     }
 }
 
+function Get-DvUnpacedEvidence {
+    <#
+    .SYNOPSIS
+    CUDA-HEADROOM-1: did an unpaced leg (generatorArgs.unpaced = true) actually run unpaced? Read from the app's own `playback_smoke.pace_unpaced` line for the
+    MEASURED session (Get-DvSmokeSessionLineFields), never from the spec. FAIL CLOSED: `blocks` is true when the leg asked for it and the line is absent, or says
+    active other than 1, or drop_frame other than 0 -- a build without MLVAPP_PLAYBACK_UNPACED runs at the clip's own pace, and that pace wall is not throughput.
+    A leg that does not ask for it never blocks. Pure and shared: the runner gates on it and Test-DvReceiptValid re-derives it from the hashed run log.
+    #>
+    param([Parameter(Mandatory)]$Spec, [AllowNull()][AllowEmptyString()][string]$LogText)
+    $requested = ((Get-DvProp (Get-DvProp $Spec 'generatorArgs') 'unpaced') -eq $true)
+    $active = $null
+    $dropFrame = $null
+    $verdict = 'NOT_REQUESTED'
+    $reason = $null
+    if ($requested) {
+        $f = Get-DvSmokeSessionLineFields -LogText $LogText -Marker 'pace_unpaced'
+        $active = ConvertTo-DvInt64 $f['active']
+        $dropFrame = ConvertTo-DvInt64 $f['drop_frame']
+        $verdict = 'NOT_HONOURED'
+        if ($f.Count -eq 0) { $reason = 'the run log has no playback_smoke.pace_unpaced line for the measured session, so the app never lifted its pace guard' }
+        elseif ($active -ne 1) { $reason = "playback_smoke.pace_unpaced says active=$($f['active']) (the app did not lift its pace guard)" }
+        elseif ($dropFrame -ne 0) { $reason = "playback_smoke.pace_unpaced says drop_frame=$($f['drop_frame']) (drop-frame mode skips frames instead of rendering them)" }
+        else { $verdict = 'HONOURED' }
+    }
+    [ordered]@{ requested = $requested; active = $active; dropFrame = $dropFrame; verdict = $verdict; reason = $reason; blocks = ($verdict -ceq 'NOT_HONOURED') }
+}
+
 # --- leg sets and the display matrix (DUAL-VENUE-DISPLAY-MATRIX-1) -------------------------------------------------------
 # A LEG SET is a tracked list of committed leg specs that one run executes together. The set does not define legs: every cell is still an ordinary committed leg spec (so every receipt
 # is bound to a committed spec by its sha256, exactly as for a single leg), and the set only says which specs make up the matrix, and in what order a run walks them.
@@ -1846,6 +1873,9 @@ function Test-DvReceiptValid {
                 }
             }
             if ($displayVerdict.blocks) { $invalid.Add("DISPLAY_MODE_NOT_HONOURED: $($displayVerdict.reason); a leg that did not run in the display mode it names is not a valid measurement") }
+            # CUDA-HEADROOM-1: an unpaced leg the app did not run unpaced is the pace wall, not throughput (Get-DvUnpacedEvidence).
+            $unpacedVerdict = Get-DvUnpacedEvidence -Spec $spec -LogText $ev.logText
+            if ($unpacedVerdict.blocks) { $invalid.Add("UNPACED_NOT_HONOURED: $($unpacedVerdict.reason); a paced run is no throughput measurement") }
         }
 
         # ---- the OUTCOME: re-derived from the job's result, its exit code, the verbatim metrics and the COMMITTED criteria -----------
@@ -2196,6 +2226,6 @@ Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-
     ConvertTo-DvLfBytes, Get-DvLegSpecSha256, Get-DvDerivedBackend, Get-DvBackendNotDerivable, Read-DvContactFrames, Get-DvSubjectDigest,
     Get-DvVisualViewportPixels, Get-DvVisualMeanAbsDiff, Get-DvVisualVerdict, New-DvVisualStrip, Read-DvVisualCaptures, Get-DvVisualCaptureRequest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
     Test-DvUnderClaudeState, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvPlaybackProblems,
-    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvDisplayEvidence, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvHealthVerdict,
+    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvHealthVerdict,
     New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout,
     Get-DvResultToken, Resolve-DvJobOutcome, Test-DvCriteria, Get-DvVerbatimMetrics, New-DvReceipt, Write-DvReceipt

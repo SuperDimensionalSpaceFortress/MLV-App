@@ -1802,6 +1802,7 @@ private:
     void previewPicture( int row );
     void setPreviewMode( void );
     double getFramerate( void );
+    double playbackPaceGuardFps( void );
     void paintAudioTrack( void );
     uint8_t drawZebras( QImage *image );
     void drawFrameNumberLabel( int frameIndex = -1 );
