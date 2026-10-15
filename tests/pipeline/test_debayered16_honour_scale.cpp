@@ -573,6 +573,86 @@ TEST(Debayered16ReconReuse, HonourScaleProductionStepConsumesReducedReconOrRende
     }
 }
 
+// GPU-DEVICE-LOSS-SELF-HEAL-1 r5, the declared route (hub ruling r5): a CUDA-preset session after a
+// device loss (MLVAPP_GPU_PLAYBACK_RECON=1 kept, CUDA suppressed, and the recon worker thread's last
+// recon a CUDA one) presents the native CPU route's frame. The CPU-subset Debayered16 render consumes
+// the x4 reduced recon (no gpu_playback_recon refusal, no llrawproc on the render), byte for byte
+// the frame the CPU route (no CUDA preset) presents. The no-fault CUDA session keeps its own route:
+// its CPU plan refuses ("GPU playback recon requested").
+// RED on 79ecc20b (the plan refuses, so the slot is a full-res recon: reducedScale 1) and on
+// c5ab7d0b (the stale CUDA stamp: outcome gpu_playback_recon).
+TEST(Debayered16ReconReuse, HonourScaleCudaSuppressedSessionPresentsTheCpuRoutesReducedRecon)
+{
+    EnvGuard guard;
+    const int scale = 4;
+    const int frames = 2;
+    std::vector<std::vector<uint16_t>> cpuRoute;
+    {
+        MlvPipelineFixture fixture;
+        ASSERT_TRUE(openLargeHq(fixture));
+        WorkerState worker;
+        ProductionSlot slot;
+        for (int f = 0; f < frames; ++f)
+        {
+            const ProductionResult r = productionStep(fixture, static_cast<uint64_t>(f), scale, worker, slot, nullptr);
+            ASSERT_TRUE(r.outcome == Debayered16ReconRefusal::None);
+            ASSERT_EQ(scale, r.dims.reducedScale);
+            const size_t words = static_cast<size_t>(r.dims.width) * static_cast<size_t>(r.dims.height) * 3u;
+            cpuRoute.emplace_back(slot.rawImage16.begin(), slot.rawImage16.begin() + static_cast<std::ptrdiff_t>(words));
+        }
+    }
+
+    struct SuppressedScope
+    {
+        SuppressedScope() { llrpSetGpuCudaSuppressed(1); }
+        ~SuppressedScope()
+        {
+            llrpSetGpuCudaSuppressed(0);
+            llrpSetGpuPlaybackReconLastUsedForTesting(0);
+        }
+    };
+    HONOUR_SCALE_TEST_SETENV("MLVAPP_GPU_PLAYBACK_RECON", "1");
+    MlvPipelineFixture fixture;
+    ASSERT_TRUE(openLargeHq(fixture));
+    // The GL surface the preset installed stays, presenting the 16-bit frame; the prep reduces that.
+    // Presenting the 8-bit image through it instead (r4's F1) is refused (the GUI fixture's prepFactor).
+    PlaybackPrepReducedInputs prep = playbackPrepInputs(scale, fixture.width(), fixture.height(), fixture.width(),
+                                                        fixture.height(), GpuPreviewProcessingConfig());
+    ASSERT_EQ(scale, playbackPrepDecideReduced(prep).factor);
+    prep.gpuImagePresentation = true;
+    ASSERT_TRUE(playbackPrepDecideReduced(prep).refusal == PlaybackPrepReducedRefusal::GpuImagePresentation);
+    mlvDualIsoPreviewScaleRecon_t plan;
+    ASSERT_EQ(0, mlvDualIsoPreviewScaleReconPlan(fixture.video(), scale, &plan));
+    ASSERT_EQ(std::string("GPU playback recon requested"), std::string(plan.reason));
+    {
+        const SuppressedScope suppressed;
+        WorkerState worker;
+        ProductionSlot slot;
+        Debayered16ReconReuseCounters counters;
+        for (int f = 0; f < frames; ++f)
+        {
+            llrpSetGpuPlaybackReconLastUsedForTesting(1);
+            const ProductionResult r = productionStep(fixture, static_cast<uint64_t>(f), scale, worker, slot, &counters);
+            std::printf("[debayered16-honour-scale] cuda suppressed x%d frame %d: admission=%s outcome=%s dims=%dx%d "
+                        "scale=%d render_llrawproc_runs=%llu\n",
+                        scale, f, debayered16HonourScaleRefusalName(r.admission), debayered16ReconRefusalName(r.outcome),
+                        r.dims.width, r.dims.height, r.dims.reducedScale,
+                        static_cast<unsigned long long>(r.renderLlrawprocRuns));
+            ASSERT_TRUE(r.admission == Debayered16HonourScaleRefusal::None);
+            ASSERT_EQ(scale, r.dims.reducedScale);
+            ASSERT_TRUE(r.outcome == Debayered16ReconRefusal::None);
+            ASSERT_EQ(fixture.width() / scale, r.dims.width);
+            ASSERT_EQ(fixture.height() / scale, r.dims.height);
+            ASSERT_EQ(static_cast<uint64_t>(0), r.renderLlrawprocRuns);
+            const size_t words = static_cast<size_t>(r.dims.width) * static_cast<size_t>(r.dims.height) * 3u;
+            ASSERT_EQ(cpuRoute[static_cast<size_t>(f)].size(), words);
+            ASSERT_EQ(0, std::memcmp(cpuRoute[static_cast<size_t>(f)].data(), slot.rawImage16.data(), words * sizeof(uint16_t)));
+        }
+        ASSERT_EQ(static_cast<uint64_t>(0), counters.count(Debayered16ReconRefusal::GpuPlaybackRecon));
+        ASSERT_EQ(static_cast<uint64_t>(frames), counters.consumed());
+    }
+}
+
 // (d) The core entry refuses scale 1, scale 8, a wrong width and AMaZE without writing, and
 // fills the output to Height/scale rows by repeating the last reconstructed row.
 TEST(Debayered16ReconReuse, HonourScaleCoreEntryRefusalsAndRowFill)

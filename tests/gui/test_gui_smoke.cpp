@@ -1,4 +1,5 @@
 #include "../../platform/qt/ColorToolButton.h"
+#include "../../platform/qt/Debayered16ReconReusePolicy.h"
 #include "../../platform/qt/DualIsoPlaybackPolicy.h"
 #include "../../platform/qt/DualIsoPatternMapping.h"
 #include "../../platform/qt/GpuDisplayViewport.h"
@@ -948,6 +949,15 @@ void GuiSmokeTest::mainWindowGpuPreviewPolicyAllowsExperimentalProcessingOnlyWhe
 
 // GPU-DEVICE-LOSS-SELF-HEAL-1 r3: with MLVAPP_EXPERIMENTAL_GPU_PROCESSING set (the CUDA preset), a
 // CUDA-suppressed session lands on the plain CPU route, not GpuPreview.
+// r5, the declared route (hub ruling r5): the fixture builds the state as MainWindow::drawFrame
+// does (16-bit preview = mainWindowAllowsGpu16PreviewRender, the CPU preview route when fast
+// processing for playback is on and GPU preview processing is not, OutputDebayered16 for either
+// preview-processing route, and the honour-scale admission from those). A suppressed session must
+// take the CPU-subset Debayered16 route with the reduced recon admitted; the no-fault CUDA session
+// keeps GpuPreview, where the reduced CPU recon is refused. The GL surface the preset installed
+// stays, so the frame presents through the 16-bit GL path (direct8=0 at the venue). Turning 16-bit
+// off (r4's F1) would make it GpuImagePresentation, which the playback prep refuses to reduce
+// (PlaybackPrepCpuRoute.cpp, pinned in the pipeline suite), so the reduced recon would be refused.
 void GuiSmokeTest::mainWindowGpuPreviewPolicyRoutesCudaSuppressedSessionToCpu()
 {
     QVERIFY(mainWindowGpuPreviewProcessingRequestedForSession(true, false));
@@ -966,7 +976,8 @@ void GuiSmokeTest::mainWindowGpuPreviewPolicyRoutesCudaSuppressedSessionToCpu()
         state.gpuPreviewProcessingCompatible = true;
         state.gpuBilinearDebayerEnvironmentRequested = true;
         state.gpuBilinearDebayerCompatible = true;
-        state.renderThreadUsing16BitPreview = true;
+        state.playbackScaleFactorActive = 4;
+        state.renderThreadUsing16BitPreview = mainWindowAllowsGpu16PreviewRender(state);
         state.renderThreadUsingGpuProcessingPreview = mainWindowAllowsGpuPreviewProcessing(state);
         state.renderThreadUsingGpuBilinearDebayer = mainWindowAllowsGpuBilinearDebayer(state);
 
@@ -976,6 +987,39 @@ void GuiSmokeTest::mainWindowGpuPreviewPolicyRoutesCudaSuppressedSessionToCpu()
         QCOMPARE(static_cast<int>(mainWindowGpuPlaybackPipelineStatus(state, false, false, false)),
                  static_cast<int>(suppressed ? GpuPlaybackPipelineStatus::Cpu
                                              : GpuPlaybackPipelineStatus::GpuPreview));
+
+        // The route drawFrame requests (fast processing for playback on, its config enabled).
+        const bool cpuPreviewRoute = !state.renderThreadUsingGpuProcessingPreview;
+        const bool debayered16 = state.renderThreadUsingGpuProcessingPreview || cpuPreviewRoute;
+        QVERIFY(debayered16);
+        QCOMPARE(cpuPreviewRoute, suppressed);
+        QVERIFY(state.renderThreadUsing16BitPreview);
+        QVERIFY(mainWindowUsesGpu16PreviewPresentation(state));
+        QVERIFY(!mainWindowUsesGpuImagePresentation(state));
+
+        Debayered16HonourScaleInputs honourScale;
+        honourScale.playbackActive = true;
+        honourScale.cpuPreviewRoute = cpuPreviewRoute && debayered16;
+        honourScale.gpuPreviewRoute = state.renderThreadUsingGpuProcessingPreview;
+        honourScale.gpuBilinearDebayer = state.renderThreadUsingGpuBilinearDebayer;
+        honourScale.requestedScale = state.playbackScaleFactorActive;
+        // The prep reduces by the scale only without GpuImagePresentation (asserted above).
+        honourScale.prepFactor = mainWindowUsesGpuImagePresentation(state) ? 1 : state.playbackScaleFactorActive;
+        QCOMPARE(static_cast<int>(debayered16HonourScaleRefusal(honourScale)),
+                 static_cast<int>(suppressed ? Debayered16HonourScaleRefusal::None
+                                             : Debayered16HonourScaleRefusal::NotCpuPreviewRoute));
+
+        if (suppressed)
+        {
+            // r4's F1 (16-bit off while suppressed): the GL surface presents the 8-bit image instead,
+            // and the prep would refuse the reduction, so the reduced recon is refused too.
+            MainWindowGpuPreviewPolicyState f1 = state;
+            f1.renderThreadUsing16BitPreview = false;
+            QVERIFY(mainWindowUsesGpuImagePresentation(f1));
+            honourScale.prepFactor = mainWindowUsesGpuImagePresentation(f1) ? 1 : f1.playbackScaleFactorActive;
+            QCOMPARE(static_cast<int>(debayered16HonourScaleRefusal(honourScale)),
+                     static_cast<int>(Debayered16HonourScaleRefusal::PrepWouldNotReduce));
+        }
     }
 }
 

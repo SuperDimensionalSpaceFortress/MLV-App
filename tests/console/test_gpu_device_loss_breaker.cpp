@@ -331,3 +331,25 @@ TEST(GpuDeviceLossBreaker, SuppressedSessionCpuReconIgnoresTheGpuReconEnv)
     ASSERT_TRUE(at > gate);
     ASSERT_EQ(-1, source.mid(helper, at - helper).indexOf(QStringLiteral("\n}\n")));
 }
+
+// r5 (the declared route): the CPU reduced recon (applyLLRawProcObjectWorker_with_dims, the reduced
+// plan's only product caller) restamps the thread's CUDA-recon flag before it runs, as the full-res
+// worker entry does. Without it every reduced frame after a mid-session loss was refused as a CUDA
+// recon (Bachelor 89c82a63 L1: refused_gpu_playback_recon=397, 10.6 fps).
+TEST(GpuDeviceLossBreaker, SuppressedSessionCpuReducedReconRestampsTheCudaReconFlag)
+{
+    const QString source = readRepoFile(QStringLiteral("src/mlv/llrawproc/llrawproc.c"));
+    const QString reset = QStringLiteral("    llrawproc_gpu_playback_reset_last_run_state();\n");
+    for (const char * entry : {"int applyLLRawProcObjectWorker_with_dims(mlvObject_t * video,",
+                               "void applyLLRawProcObjectWorker(mlvObject_t * video,"})
+    {
+        const int fn = source.indexOf(QString::fromLatin1(entry));
+        ASSERT_TRUE(fn >= 0);
+        const int end = source.indexOf(QStringLiteral("\n}\n"), fn);
+        const int at = source.indexOf(reset, fn);
+        ASSERT_TRUE(at > fn);
+        ASSERT_TRUE(at < end);
+    }
+    const int fn = source.indexOf(QStringLiteral("int applyLLRawProcObjectWorker_with_dims(mlvObject_t * video,"));
+    ASSERT_TRUE(source.indexOf(reset, fn) < source.indexOf(QStringLiteral("return llrawproc_apply_with_dims_internal("), fn));
+}
