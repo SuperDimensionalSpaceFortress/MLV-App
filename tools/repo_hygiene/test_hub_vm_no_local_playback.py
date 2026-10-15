@@ -88,10 +88,10 @@ def _baseline_lint_source() -> tuple[str, str] | None:
 # PREVIOUS-HEAD DIFFERENTIAL (r7; CoS Prevention on PR #448 a595464f, ruling candidate mlv-safety-lint-exemption-defeater-corpus-r1).
 # The differential against master cannot see a narrowing that undoes the PREVIOUS head's own safety gains: a row the previous head
 # refused and master passes shows as zero flips against master. Every round therefore also runs the corpus against the lint of the PR
-# head the round STARTED from. EACH ROUND MOVES THIS to the head it started from (r10 started from r9 fd190b6d; r9 changed no lint
-# behaviour, so r8's db310df5 and r9's fd190b6d carry the same lint). It is checked to be an ancestor of HEAD, so a rebase that drops it
-# fails loudly in CI instead of silently weakening the gate.
-PREVIOUS_PR_HEAD = "fd190b6d59fb1d998b8ebc208f467e6433c86b3c"
+# head the round STARTED from. EACH ROUND MOVES THIS to the head it started from (r11b started from r10 d291f184; r10 started from r9
+# fd190b6d, and r9 changed no lint behaviour). It is checked to be an ancestor of HEAD, so a rebase that drops it fails loudly in CI
+# instead of silently weakening the gate.
+PREVIOUS_PR_HEAD = "d291f184c0a590f5495f3ac7123592792f236c16"
 
 
 def _previous_head_lint_source() -> tuple[str, str] | None:
@@ -151,6 +151,26 @@ def _lint_word_lists(lint: Path, work: Path) -> dict[str, list[str]]:
     if done.returncode != 0 or not done.stdout.strip():
         raise AssertionError(f"the lint exposes no word lists (Get-LocalPlaybackLintWordLists): {(done.stderr or done.stdout).strip()[:300]}")
     return {k: [str(x) for x in v] for k, v in json.loads(done.stdout.strip()).items()}
+
+
+def _json_counts(lint: Path, texts: list[str], work: Path, tag: str) -> list[int]:
+    """Finding count of every text under `lint`, texts passed as a JSON array so a text may hold line breaks (one pwsh process)."""
+    src = work / f"{tag}-in.json"
+    src.write_text(json.dumps(texts), encoding="utf-8")
+    probe = work / f"{tag}-probe.ps1"
+    _write_probe(
+        probe,
+        ". " + _psq(lint) + "\n"
+        "$texts = @(ConvertFrom-Json -InputObject ([System.IO.File]::ReadAllText(" + _psq(src) + ")))\n"
+        "$out = New-Object System.Collections.Generic.List[int]\n"
+        "foreach ($t in $texts) { $out.Add(@(Get-LocalPlaybackPromptFindings -Text ([string]$t)).Count) }\n"
+        "ConvertTo-Json -InputObject @($out.ToArray()) -Compress\n",
+    )
+    proc = subprocess.Popen([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(probe)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        return _collect_counts(proc, len(texts))
+    finally:
+        _kill(proc)
 
 
 def _batch_counts(lint: Path, texts: list[str], work: Path, tag: str) -> list[int]:
@@ -426,6 +446,81 @@ def _r10_rows(lists: dict[str, list[str]]) -> list[tuple[str, bool, str]]:
     return [(g, r, t) for t, (g, r) in out.items()]
 
 
+# r11b axes (opus r10 key on d291f184: the HEAD of an E1 sentence was never read). E1 needs every earlier clause, every earlier ';' group,
+# the marker clause's own prefix and every earlier item of the block to be benign. The refusal generators draw their VERBS and NOUNS from
+# the r8 held-out pools (the lint lists neither), so a refusal rests on the head rule and not on a listed word. The marker clause carries
+# a verb the lint does list ("run playback locally ...") so that master refuses the row too: a head-only row would never be a finding.
+R11_BOUNDARIES = (" and", ", then", ", and then", "; then", ", but", ", so", " - then", ", and", ";")
+R11_KNOWN_VERBS = ("Run", "Play", "Open", "Start", "Launch", "Execute")
+R11_LOCI = ("on the hub-VM", "on my machine", "on this host", "on my rig", "in this container", "at this workstation")
+R11_WEAK_NEGATIONS = ("with no overlay", "no audio", "without audio")
+R11_SENTENCE_BOUNDARIES = (". Then run", ". Run", ". Also run", ". Afterwards, run")
+R11_PREFIX_PREPOSITIONS = ("on", "in", "at", "inside", "within", "onto", "using", "via", "through", "under", "atop", "over")
+R11_ALLOW_ROUTES = ("on Bachelor", "via the venue chain", "through the venue chain", "using Ultra-Magnus", "at the venue job")
+
+
+def _r11_rows(lists: dict[str, list[str]]) -> list[tuple[str, bool, str]]:
+    """(group, must_refuse, text): the r11b axes -- an earlier launch in front of a venue-routed `locally`, across every clause boundary,
+    sentence boundary, host locus, weak negation and r10 allow tail; a host in the marker clause's own prefix; and the ALLOW controls."""
+    out: dict[str, tuple[str, bool]] = {}
+
+    def add(group: str, refuse: bool, text: str) -> None:
+        out.setdefault(text, (group, refuse))
+
+    marker = "run playback locally on Bachelor"
+    # (1) held-out launch verb x held-out host noun x every clause boundary, then the marker clause
+    for verb in HELD_OUT_LAUNCH_VERBS:
+        for noun in HELD_OUT_HOST_NOUNS[:6]:
+            for j in R11_BOUNDARIES:
+                add("r11-earlier-clause-held-out", True, f"{verb.capitalize()} the arms on my {noun}{j} {marker}.")
+    # (2) the lint's own launch verbs x every locus x every boundary, with and without a verb in the marker clause
+    for verb in R11_KNOWN_VERBS:
+        for locus in R11_LOCI:
+            for j in R11_BOUNDARIES:
+                # a `;` cuts the marker clause away from the playback test when it holds no verb of its own (group scope, as at master
+                # and at every earlier head), so the verbless form is only generated for the boundaries that keep one group
+                if ";" not in j:
+                    add("r11-earlier-clause-known", True, f"{verb} playback {locus}{j} locally on Bachelor.")
+                add("r11-earlier-clause-known", True, f"{verb} the arms {locus}{j} {marker}.")
+    # (3) the same earlier launch as an earlier SENTENCE of the block
+    for verb in R11_KNOWN_VERBS:
+        for locus in R11_LOCI:
+            for j in R11_SENTENCE_BOUNDARIES:
+                add("r11-earlier-sentence", True, f"{verb} the arms {locus}{j} playback locally on Bachelor.")
+    # (4) a weak negation in the head never exempts it (the strong ones do)
+    for neg in R11_WEAK_NEGATIONS:
+        for locus in R11_LOCI:
+            for j in R11_BOUNDARIES[:5]:
+                add("r11-weak-negation-head", True, f"Run playback {locus} {neg}{j} {marker}.")
+    # (5) a launch in an earlier semicolon group
+    for locus in R11_LOCI:
+        add("r11-earlier-group", True, f"Run playback {locus}; {marker}.")
+        add("r11-earlier-group", True, f"Run the arms {locus}; then {marker}.")
+    # (6) the r10 allow tails behind an earlier launch: the tail is in the grammar, the head is not benign
+    for verb in HELD_OUT_LAUNCH_VERBS[:8]:
+        for noun in HELD_OUT_HOST_NOUNS[:4]:
+            for prep in R10_ALLOW_PREPOSITIONS[:3]:
+                for venue in R10_VENUE_POOL[:2]:
+                    add("r11-earlier-clause-allow-tail", True, f"{verb.capitalize()} the arms on this {noun}, then {marker} {prep} {venue}.")
+    # (7) a host in the marker clause's own prefix, whatever the preposition and the noun
+    for prep in R11_PREFIX_PREPOSITIONS:
+        for noun in HELD_OUT_HOST_NOUNS[:10]:
+            add("r11-marker-prefix-host", True, f"Run playback {prep} my {noun} locally on Bachelor.")
+    # (8) an earlier un-routed launch with no host at all (accepted over-refusal)
+    for verb in ("run", "start", "open"):
+        for obj in ("the build", "the tests", "the app"):
+            for j in R11_BOUNDARIES[:4]:
+                add("r11-overrefusal-earlier-launch", True, f"{verb.capitalize()} {obj}{j} {marker}.")
+    # (9) ALLOW: the head is itself venue-routed with no host, across the same boundaries and routes
+    for route in R11_ALLOW_ROUTES:
+        for j in R11_BOUNDARIES[:5]:
+            add("r11-allow-routed-head", False, f"Run playback {route}{j} locally on Bachelor.")
+            add("r11-allow-routed-head", False, f"Run the arms {route}{j} {marker}.")
+        for j in R11_SENTENCE_BOUNDARIES[:2]:
+            add("r11-allow-routed-head", False, f"Run the arms {route}{j} playback locally on Bachelor.")
+    return [(g, r, t) for t, (g, r) in out.items()]
+
+
 # The ruling's grammar restated in Python, independent of the lint: the master differential may let a `locally` row flip refuse -> pass
 # only when its venue phrase is terminal under it (ruling 20261015T1650Z: "no master refusal may flip to pass unless its venue phrase
 # is terminal under the grammar"). Deliberately a little NARROWER than the lint where that is simpler: a flip it cannot explain fails.
@@ -445,13 +540,35 @@ _G_E1 = re.compile(r"^(?P<head>.*?)\blocally\s+(?:on|via|through|using)\s+(?:(?:
 _G_LOCAL_IN_HEAD = re.compile(r"\b(?:here|host|machine|hub|localhost|locally|vm)\b", re.I)
 
 
+# r11b: the HEAD of the sentence (what precedes `locally`), restated for the oracle. Cut into pieces at punctuation, a spaced dash and
+# and / or / then / but / so; once a venue-routed phrase is masked no piece may hold a preposition, and a piece that is not the last
+# (the last one is the marker clause's own prefix) may hold a launch verb only inside a venue-routed phrase. Deliberately NARROWER than
+# the lint (no strong-prohibition heads): a flip against master the oracle cannot explain fails.
+_G_PREPOSITION = re.compile(r"\b(?:on|onto|at|in|into|to|from|inside|within|via|using|through|under|over|atop|upon|beside|near|alongside|behind|around|across)\b", re.I)
+_G_LAUNCH = re.compile(r"\b(?:run|runs|running|launch|launches|launching|launched|start|starts|starting|execute|executes|executing|invoke|invokes|invoking|"
+                       r"drive|drives|driving|kick off|play|plays|playing|open|opens|opening)\b", re.I)
+_G_ROUTE_RE = re.compile(_G_ROUTE, re.I)
+_G_HEAD_CUT = re.compile(r"[.!?;,]|\s-{1,2}\s|\b(?:and|or|then|but|so)\b", re.I)
+
+
+def _head_is_benign(head: str) -> bool:
+    pieces = _G_HEAD_CUT.split(head)
+    for i, piece in enumerate(pieces):
+        bare = _G_ROUTE_RE.sub(" ", piece)
+        if _G_PREPOSITION.search(bare):
+            return False
+        if i < len(pieces) - 1 and _G_LAUNCH.search(piece) and bare == piece:
+            return False
+    return True
+
+
 def _e1_terminal_in_grammar(text: str) -> bool:
     """True when `text` is one line whose first `locally <prep> <venue>` phrase is followed only by the closed allow-grammar, and
-    nothing before it names the local machine."""
+    nothing before it names the local machine or launches anywhere else (r11b: the head is benign too)."""
     if "\n" in text:
         return False
     m = _G_E1.match(text)
-    if not m or _G_LOCAL_IN_HEAD.search(m.group("head")):
+    if not m or _G_LOCAL_IN_HEAD.search(m.group("head")) or not _head_is_benign(m.group("head")):
         return False
     return _G_TAIL.fullmatch(text[m.end():]) is not None
 
@@ -565,6 +682,8 @@ def _list_member_rows(lists: dict[str, list[str]]) -> list[tuple[str, bool, str]
         add(group, refuse, text)
     for group, refuse, text in _r10_rows(lists):
         add(group, refuse, text)
+    for group, refuse, text in _r11_rows(lists):
+        add(group, refuse, text)
     return [(g, r, t) for t, (g, r) in rows.items()]
 
 
@@ -665,6 +784,7 @@ def _differential_flips(work: Path, baseline_text: str | None = None, previous_h
                                   + PromptLintTests.CLAUSE_MUST_REFUSE_R8 + PromptLintTests.CLAUSE_MUST_PASS_R8
                                   + PromptLintTests.CLAUSE_MUST_REFUSE_R10 + PromptLintTests.CLAUSE_MUST_REFUSE_R10_OVERREFUSAL
                                   + PromptLintTests.CLAUSE_MUST_PASS_R10
+                                  + PromptLintTests.CLAUSE_MUST_REFUSE_R11 + PromptLintTests.CLAUSE_MUST_PASS_R11
                                   + PromptLintTests.PROBE_ROWS
                                   + tuple(text for _, _, text in PromptLintTests.DEFEATER_AXIS) + PromptLintTests.DEFEATER_AXIS_CONTROLS,
                                   members=tuple(_list_member_rows(_lint_word_lists(LINT_PS1, work))))
@@ -1131,11 +1251,64 @@ class PromptLintTests(unittest.TestCase):
     CLAUSE_MUST_REFUSE_R10_MULTILINE = (
         # from CLAUSE_MUST_PASS_R8_MULTILINE (accepted over-refusal: a blank line is not a block boundary, only a heading is)
         "Run playback locally on Bachelor.\nRead the log.\n\nWrite the summary to the run dir.\n",
-        # accepted over-refusal: a piece that another piece of the block follows must end in punctuation (no fragment runs on across a line)
-        "Run playback locally on Bachelor\nthrough the venue chain.\n",
-        # a host negation and a venue fragment with no separator are not two fragments, also across a line break
-        "Run playback locally on Bachelor, not here\non Bachelor.\n",
         "Run playback locally on Bachelor.\n\nThen quietly play it.\n",
+    )
+    # r11b (sol r10 key, executed): a hard-wrapped PURE venue-routing instruction. r10 required a piece that another piece of the block
+    # follows to end in punctuation, so the wrap refused it (0 -> 1 against fd190b6d). Each piece only has to be in the closed grammar on
+    # its own now; a fragment cut by a line break ("..., not\nhere") is not in the grammar by itself and still refuses (the R11 refusal rows).
+    CLAUSE_MUST_PASS_R11_MULTILINE = (
+        "Run playback locally on Bachelor\nthrough the venue chain.\n",
+        "Run playback locally on Bachelor and\nvia the venue chain.\n",
+        # was a r10 "accepted over-refusal"; each piece is a verbless host negation / venue routing on its own, so it is the same harmless shape
+        "Run playback locally on Bachelor, not here\non Bachelor.\n",
+        "Run playback locally on Bachelor,\nthen on Ultra-Magnus\nand never here.\n",
+    )
+    # r11b: line-break forms that must stay refused: a launch verb, a destination preposition or a cut host negation on the next line.
+    CLAUSE_MUST_REFUSE_R11_MULTILINE = (
+        "Run playback locally on Bachelor\nand then play it here.\n",
+        "Run playback locally on Bachelor, not\nhere on this host.\n",
+        "Run playback locally on Bachelor and\nreplay it to this rig.\n",
+        "Run playback locally on Bachelor,\nthen read the log.\n",
+        "Run the arms on the hub-VM.\nThen run playback locally on Bachelor\nthrough the venue chain.\n",
+    )
+    # r11b: the opus r10 key (an earlier launch is not read) and its relatives. Every row is refused at master; all but the first
+    # control are clean at d291f184 (0 findings there). The sol r10 hard-wrap rows above are the opposite direction (refused at
+    # d291f184, clean here).
+    CLAUSE_MUST_REFUSE_R11 = (
+        # opus r10 BLOCKER, verbatim
+        "Run playback on the hub-VM and locally on Bachelor.",
+        "Run playback on my rig, then locally on Bachelor.",
+        "Run playback on my machine and locally on Bachelor.",
+        "Run the arms on the hub-VM. Then run playback locally on Bachelor.",
+        # the control that already refused
+        "Run playback on this host, then locally on Bachelor.",
+        # a host nobody listed in the marker clause's own prefix; a weak negation in the head; the head in an earlier ';' group
+        "Run playback on my rig locally on Bachelor.",
+        "Run playback on the hub-VM with no overlay and locally on Bachelor.",
+        "Run playback on my rig; run playback locally on Bachelor.",
+        "Run playback on my rig with no overlay, then run playback locally on Bachelor.",
+        # an earlier clause with a verb the lint does not list, behind a preposition it does not need to know the object of
+        "Replay the arms on my rig, then run playback locally on Bachelor.",
+        "Perform playback under my rig, then run playback locally on Bachelor.",
+        # accepted over-refusal (listed in the PR body): an earlier un-routed launch verb in the same sentence
+        "Run the build, then run playback locally on Bachelor.",
+        "Run playback on Bachelor with no overlay and locally on Bachelor.",
+    )
+    # r11b ALLOW: an earlier clause or item that is venue-routed with no host. These are in the differential corpus: master refuses every
+    # `locally`, so each is a refuse -> pass flip that the Python grammar oracle (_head_is_benign) must explain.
+    CLAUSE_MUST_PASS_R11 = (
+        "Run playback on Bachelor, then locally on Bachelor.",
+        "Run the arms on Bachelor and locally on Bachelor through the venue chain.",
+        "Run the arms on Bachelor. Then run playback locally on Bachelor.",
+        "Run playback through the venue chain; run playback locally on Bachelor.",
+    )
+    # r11b ALLOW: an earlier clause or item that a STRONG prohibition governs, or a contrast complement that rules the host out. The
+    # oracle is deliberately narrower than the lint here, so these stay out of the differential corpus (direct tests only).
+    CLAUSE_MUST_PASS_R11_PROHIBITION = (
+        "Never run playback on this host, run playback locally on Bachelor.",
+        "Do not run playback here. Run playback locally on Bachelor.",
+        "Run playback on Bachelor, not on this host, and locally on Bachelor.",
+        "Run playback on Bachelor rather than here, then run playback locally on Bachelor.",
     )
     # r10 ALLOW list: tails in the closed grammar only -- (A) venue routing, (B) a pure locus word, (C) a verbless host negation.
     CLAUSE_MUST_PASS_R10 = (
@@ -1255,7 +1428,8 @@ class PromptLintTests(unittest.TestCase):
                 self.assertEqual([], self._findings(text), text)
 
     def test_green_clause_scope_venue_routed_wordings_pass(self):
-        for text in self.CLAUSE_MUST_PASS + self.CLAUSE_MUST_PASS_R6 + self.CLAUSE_MUST_PASS_R7 + self.CLAUSE_MUST_PASS_R8 + self.CLAUSE_MUST_PASS_R10:
+        for text in (self.CLAUSE_MUST_PASS + self.CLAUSE_MUST_PASS_R6 + self.CLAUSE_MUST_PASS_R7 + self.CLAUSE_MUST_PASS_R8 + self.CLAUSE_MUST_PASS_R10
+                     + self.CLAUSE_MUST_PASS_R11 + self.CLAUSE_MUST_PASS_R11_PROHIBITION):
             with self.subTest(text=text):
                 self.assertEqual([], self._findings(text), text)
 
@@ -1268,6 +1442,26 @@ class PromptLintTests(unittest.TestCase):
     def test_red_r10_accepted_over_refusal_rows_are_refused(self):
         """r10, ruling 20261015T1650Z: a follow-up outside the closed grammar refuses, harmless or not (listed in the PR body)."""
         for text in self.CLAUSE_MUST_REFUSE_R10_OVERREFUSAL + self.CLAUSE_MUST_REFUSE_R10_MULTILINE:
+            with self.subTest(text=text):
+                self.assertTrue(self._findings(text), text)
+
+    def test_red_r11_an_earlier_launch_in_front_of_a_venue_routed_locally_is_refused(self):
+        """r11b: every repro sentence of the opus r10 key (clean at d291f184, RED there; GREEN here) and its relatives."""
+        for text in self.CLAUSE_MUST_REFUSE_R11:
+            with self.subTest(text=text):
+                self.assertTrue(self._findings(text), text)
+
+    def test_green_r11_a_venue_routed_or_prohibited_head_still_passes(self):
+        for text in self.CLAUSE_MUST_PASS_R11 + self.CLAUSE_MUST_PASS_R11_PROHIBITION:
+            with self.subTest(text=text):
+                self.assertEqual([], self._findings(text), text)
+
+    def test_r11_hard_wrapped_pure_venue_routing_passes_and_a_cut_fragment_still_refuses(self):
+        """r11b, sol r10 key (executed): a hard wrap inside a pure venue-routing instruction is not a follow-up."""
+        for text in self.CLAUSE_MUST_PASS_R11_MULTILINE:
+            with self.subTest(text=text):
+                self.assertEqual([], self._findings(text), text)
+        for text in self.CLAUSE_MUST_REFUSE_R11_MULTILINE:
             with self.subTest(text=text):
                 self.assertTrue(self._findings(text), text)
 
@@ -1310,6 +1504,38 @@ class PromptLintTests(unittest.TestCase):
         # every venue sentence is followed, in the same block, by prose outside the grammar: each one refuses
         self.assertEqual(sum(1 for k in range(1, i + 1) if k % 40 == 0), out["findings"])
         self.assertLess(out["seconds"], 10.0, f"a 1 MB heading-free prompt took {out['seconds']:.1f} s")
+
+    def test_r11_a_1mb_block_of_distinct_earlier_launch_items_is_bounded_and_fails_closed(self):
+        """r11b: the earlier-item scan memoises by text and caps clause analyses per call (past the cap an item is dirty). ~1 MB of
+        DISTINCT venue-routed launch items (each needs a clause analysis; the first 400 are benign, the rest are dirty by the cap), no
+        heading, then one venue-routed `locally`: it must lint in under 10 s and, the head being dirty, refuse that one sentence."""
+        lines: list[str] = []
+        size = 0
+        i = 0
+        while size < 1_000_000:
+            i += 1
+            line = f"Step {i} runs the arms on Bachelor. Step {i} records the checksum in the table. "
+            lines.append(line)
+            size += len(line)
+        lines.append("Run playback locally on Bachelor through the venue chain.\n")
+        src = self.tmp / "big-head.txt"
+        src.write_text("".join(lines), encoding="utf-8")
+        probe = self.tmp / "big-head-probe.ps1"
+        _write_probe(
+            probe,
+            ". " + _psq(LINT_PS1) + "\n"
+            "$t = [System.IO.File]::ReadAllText(" + _psq(src) + ")\n"
+            "$sw = [Diagnostics.Stopwatch]::StartNew()\n"
+            "$f = @(Get-LocalPlaybackPromptFindings -Text $t)\n"
+            "$sw.Stop()\n"
+            "ConvertTo-Json -InputObject @{ seconds = $sw.Elapsed.TotalSeconds; findings = $f.Count; length = $t.Length } -Compress\n",
+        )
+        done = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(probe)], capture_output=True, text=True, timeout=300)
+        self.assertEqual(0, done.returncode, done.stderr)
+        out = json.loads(done.stdout.strip())
+        self.assertGreaterEqual(out["length"], 1_000_000)
+        self.assertEqual(1, out["findings"])
+        self.assertLess(out["seconds"], 10.0, f"a 1 MB heading-free prompt with distinct launch items took {out['seconds']:.1f} s")
 
     # Soft, pre-existing over-refusal (refused on master and on r1b): `locally` sits in a clause that copies a log, not in the clause that
     # launches playback. Exempting it needs a handling-verb list, and a list opens "Copy the clip locally and run playback." (the incident
@@ -1413,8 +1639,14 @@ class ListMemberDefeaterTests(unittest.TestCase):
                   "launch-venue-control", "launch-host-destination-control",
                   "r10-adverb-insertion", "r10-adverb-insertion-cross-sentence", "r10-destination-preposition",
                   "r10-destination-preposition-cross-sentence", "r10-held-out-host", "r10-member-control", "r10-member-defeat",
-                  "r10-grammar-allow", "r10-overrefusal-handling"):
+                  "r10-grammar-allow", "r10-overrefusal-handling",
+                  "r11-earlier-clause-held-out", "r11-earlier-clause-known", "r11-earlier-sentence", "r11-weak-negation-head",
+                  "r11-earlier-group", "r11-earlier-clause-allow-tail", "r11-marker-prefix-host", "r11-overrefusal-earlier-launch",
+                  "r11-allow-routed-head"):
             self.assertIn(g, groups, f"no rows generated for {g}")
+        # r11b: every held-out launch verb x six held-out host nouns x every clause boundary, not a sample
+        self.assertGreaterEqual(sum(1 for g, _, _ in self.rows if g == "r11-earlier-clause-held-out"),
+                                len(HELD_OUT_LAUNCH_VERBS) * 6 * len(R11_BOUNDARIES))
         # r10: every destination preposition after every launch verb of the held-out pool, against every venue, in both sentence forms
         dest = len(HELD_OUT_LAUNCH_VERBS) * len(R10_DESTINATION_OBJECTS) * len(R10_DESTINATION_PREPOSITIONS) * len(R10_VENUE_POOL)
         self.assertGreaterEqual(sum(1 for g, _, _ in self.rows if g == "r10-destination-preposition"), dest)
@@ -1536,6 +1768,25 @@ class ListMemberDefeaterTests(unittest.TestCase):
                 self.assertTrue(_e1_terminal_in_grammar(text), text)
             elif g.startswith("r10-") and refuse:
                 self.assertFalse(_e1_terminal_in_grammar(text), text)
+
+    def test_red_r11_an_earlier_launch_is_never_hidden_in_front_of_a_venue_routed_locally(self):
+        for g in ("r11-earlier-clause-held-out", "r11-earlier-clause-known", "r11-earlier-sentence", "r11-weak-negation-head",
+                  "r11-earlier-group", "r11-earlier-clause-allow-tail", "r11-marker-prefix-host", "r11-overrefusal-earlier-launch"):
+            self._group(g, True)
+
+    def test_green_r11_a_venue_routed_head_passes_and_the_oracle_agrees(self):
+        self._group("r11-allow-routed-head", False)
+        for g, refuse, text in self.rows:
+            if g == "r11-allow-routed-head":
+                self.assertTrue(_e1_terminal_in_grammar(text), text)
+            elif g.startswith("r11-") and refuse:
+                self.assertFalse(_e1_terminal_in_grammar(text), text)
+
+    def test_r11_the_head_rule_reads_the_preposition_list_the_lint_exposes(self):
+        """A preposition the lint lists is a host nobody named when it opens a head clause: one prefix row per HostPrepositions member."""
+        for p in self.lists["HostPrepositions"]:
+            text = f"Run playback {p} my rig locally on Bachelor."
+            self.assertGreater(_batch_counts(LINT_PS1, [text], self.tmp, f"prep-{p}")[0], 0, text)
 
     def test_red_r8_held_out_vocabulary_is_refused(self):
         for g in ("r8-held-out-verbless", "r8-held-out-verb-noun", "r8-held-out-trailing"):
@@ -1673,6 +1924,12 @@ class LintDifferentialPinTests(unittest.TestCase):
          "this rig.'): master's sentence-wide prohibition exemption lets the `never` AFTER the marker exempt the whole sentence; r8 "
          "made a prohibition govern the marker only when it precedes it, and r10's grammar admits `never` only with a listed host "
          "target and nothing after it."),
+        ("r11b-play-open-heads-master-does-not-read",
+         lambda text, f: f.get("tpl") == "list-member" and f.get("G") == "r11-earlier-clause-known" and text.startswith(("Play ", "Open ")),
+         "r11b: 'Play playback on the hub-VM and locally on Bachelor.' / 'Open playback on my rig, then locally on Bachelor.' -- `play` "
+         "and `open` are launch verbs this PR added (master's launch-verb list stops at run / launch / start / execute / invoke / drive / "
+         "kick off), so master finds no launch in a sentence whose only verb is one of them and passes it. The head rule refuses them "
+         "like their `Run` twins, which master refuses too."),
         ("hardening-log-handling-tail",
          lambda text, f: f.get("tpl") == "handling-tail" and f.get("M") in ("on this host", "here"),
          "r1b over-refusal kept on purpose (card HUB-VM-LINT-LOG-COPY-OVERREFUSAL-1): 'copy the log on this host' after a venue run "
@@ -1694,6 +1951,15 @@ class LintDifferentialPinTests(unittest.TestCase):
          "harmless handling follow-up ('..., then read the log.'): the first two are the r9 keys' blockers (CLAUSE_MUST_REFUSE_R10, the "
          "r10-* generators), the last is the accepted over-refusal of the ruling (CLAUSE_MUST_REFUSE_R10_OVERREFUSAL, "
          "r10-overrefusal-handling), listed in the PR body. Master refuses every one of them too."),
+        ("r11b-e1-head-must-be-benign",
+         lambda text, f: (f.get("tpl") == "seed" and text in PromptLintTests.CLAUSE_MUST_REFUSE_R11)
+         or (f.get("tpl") == "list-member" and str(f.get("G", "")).startswith("r11-") and f.get("R") is True),
+         "r11b, opus r10 key on d291f184: E1 reads the HEAD as well as the tail. An earlier clause or item that launches somewhere "
+         "(or names a host nobody listed: a preposition left once venue-routed phrases are masked) is not benign, and neither is the "
+         "marker clause's own prefix; a weak negation never makes a head benign. The r10 tip passed 'Run playback on the hub-VM and "
+         "locally on Bachelor.', '... on my rig, then locally on Bachelor.' and the cross-sentence form (CLAUSE_MUST_REFUSE_R11, the "
+         "r11-* generators). The accepted over-refusal is any earlier un-routed launch verb of the block ('Run the build, then run "
+         "playback locally on Bachelor.', r11-overrefusal-earlier-launch), listed in the PR body. Master refuses every one of them."),
     )
 
     @classmethod
@@ -1704,6 +1970,34 @@ class LintDifferentialPinTests(unittest.TestCase):
     def tearDownClass(cls):
         shutil.rmtree(cls.tmp, ignore_errors=True)
 
+    def test_r11_multiline_rows_flip_only_as_listed_against_master_and_the_previous_head(self):
+        """r11b: the single-line differential corpus cannot hold a line break, so every multi-line catalogue row is run through master,
+        the previous PR head and this lint here. A flip needs a reason: the hard-wrapped pure venue-routing rows (sol r10 key) open
+        against d291f184 BY DESIGN (refuse -> pass, listed in the PR body); the rows the head rule closes are the opus r10 relatives."""
+        refuse_rows = (PromptLintTests.CLAUSE_MUST_REFUSE_R8_MULTILINE + PromptLintTests.CLAUSE_MUST_REFUSE_R10_MULTILINE
+                       + PromptLintTests.CLAUSE_MUST_REFUSE_R11_MULTILINE)
+        pass_rows = PromptLintTests.CLAUSE_MUST_PASS_R8_MULTILINE + PromptLintTests.CLAUSE_MUST_PASS_R11_MULTILINE
+        texts = list(refuse_rows + pass_rows)
+        base = _baseline_lint_source()
+        prev_ref, prev_text = _require_previous_head_lint()
+        (self.tmp / "ml-prev.ps1").write_text(prev_text, encoding="utf-8")
+        cand = _json_counts(LINT_PS1, texts, self.tmp, "ml-cand")
+        prev = _json_counts(self.tmp / "ml-prev.ps1", texts, self.tmp, "ml-prev")
+        for text, n in zip(texts, cand):
+            self.assertEqual(text in refuse_rows, n > 0, f"candidate verdict of {text!r}")
+        opened = [t for t, c, p in zip(texts, cand, prev) if p > 0 and c == 0]
+        closed = [t for t, c, p in zip(texts, cand, prev) if p == 0 and c > 0]
+        self.assertEqual(sorted(PromptLintTests.CLAUSE_MUST_PASS_R11_MULTILINE), sorted(opened),
+                         f"against {prev_ref}: the multi-line refuse -> pass flips must be exactly the hard-wrapped venue-routing rows (r11b)")
+        self.assertEqual([], [t for t in closed if t not in PromptLintTests.CLAUSE_MUST_REFUSE_R11_MULTILINE],
+                         f"against {prev_ref}: an unlisted multi-line pass -> refuse flip")
+        if base is not None and base[1].replace("\r\n", "\n") != LINT_PS1.read_text(encoding="utf-8").replace("\r\n", "\n"):
+            (self.tmp / "ml-master.ps1").write_text(base[1], encoding="utf-8")
+            master = _json_counts(self.tmp / "ml-master.ps1", texts, self.tmp, "ml-master")
+            flipped = [t for t, c, m in zip(texts, cand, master) if m > 0 and c == 0]
+            allowed = PromptLintTests.CLAUSE_MUST_PASS_R8_MULTILINE + PromptLintTests.CLAUSE_MUST_PASS_R11_MULTILINE
+            self.assertEqual([], [t for t in flipped if t not in allowed], f"against {base[0]}: an unlisted multi-line refuse -> pass flip")
+
     def test_no_unlisted_flip_against_the_baseline(self):
         ref, opened, closed, size = _differential_flips(self.tmp)
         self.assertGreaterEqual(size, 1000, "the corpus shrank; the pin no longer samples the wording space")
@@ -1713,7 +2007,8 @@ class LintDifferentialPinTests(unittest.TestCase):
             f"baseline {ref}: a safety guard may open or close only on purpose -- fix the lint, or add an allow-list entry with its reason.")
         # Every catalogue row that must be refused is a corpus seed and must not be among the flips at all.
         flipped = {text for text, _ in opened}
-        for text in PromptLintTests.CLAUSE_MUST_REFUSE + PromptLintTests.CLAUSE_MUST_REFUSE_R10 + PromptLintTests.CLAUSE_MUST_REFUSE_R10_OVERREFUSAL:
+        for text in (PromptLintTests.CLAUSE_MUST_REFUSE + PromptLintTests.CLAUSE_MUST_REFUSE_R10 + PromptLintTests.CLAUSE_MUST_REFUSE_R10_OVERREFUSAL
+                     + PromptLintTests.CLAUSE_MUST_REFUSE_R11):
             self.assertNotIn(text, flipped, text)
 
     def test_no_refuse_to_pass_flip_against_the_previous_pr_head(self):
@@ -1731,7 +2026,8 @@ class LintDifferentialPinTests(unittest.TestCase):
         # verdict OR is one of this round's listed closures; none may be among the opened flips
         flipped = {text for text, _ in opened}
         for text in (PromptLintTests.CLAUSE_MUST_REFUSE + PromptLintTests.CLAUSE_MUST_REFUSE_R7 + PromptLintTests.CLAUSE_MUST_REFUSE_R8
-                     + PromptLintTests.CLAUSE_MUST_REFUSE_R10 + PromptLintTests.CLAUSE_MUST_REFUSE_R10_OVERREFUSAL):
+                     + PromptLintTests.CLAUSE_MUST_REFUSE_R10 + PromptLintTests.CLAUSE_MUST_REFUSE_R10_OVERREFUSAL
+                     + PromptLintTests.CLAUSE_MUST_REFUSE_R11):
             self.assertNotIn(text, flipped, text)
 
     def test_previous_pr_head_is_an_ancestor_of_head(self):

@@ -89,6 +89,17 @@
 # Any other token -- a verb, an unlisted noun or adverb, to / into / from / for, a quote or a bracket -- voids E1 and the text REFUSES.
 # Accepted over-refusal (ruling 20261015T1650Z, listed in the PR body): a harmless follow-up in the same block ("..., then post the
 # result to Bachelor.", "...; then run the report on Bachelor.", ". Read the log.") now refuses; put it in its own section.
+# Head-benign E1 (r11b; r10 keys sol + opus on d291f184). r10 read everything AFTER the venue phrase and only a host reference BEFORE it
+# in the marker's own clause, so an earlier clause that launches somewhere local hid behind it ("Run playback on the hub-VM and locally
+# on Bachelor.", "Run playback on my rig, then locally on Bachelor.", "Run the arms on the hub-VM. Then run playback locally on
+# Bachelor."). E1 now also needs the HEAD to be benign: (1) every earlier clause of the sentence (and of an earlier ';' group) is benign
+# (Test-HeadClauseBenign: it has no launch verb, no host reference and no preposition left once its venue-routed phrases are masked
+# ("on my rig" is a host nobody listed); or it opens with a strong prohibition; or it is a contrast complement that leads with what it
+# rules out; or it is itself venue-routed -- a WEAK negation, not / no / without, never makes a clause benign here), (2) the marker
+# clause's own prefix, with the venue-routed phrases masked, holds no preposition ("Run playback on my rig locally on Bachelor"), and (3) no earlier item of the same
+# instruction block is dirty (a launch verb and not benign; Test-EarlierItemDirty). Accepted over-refusal, listed in the PR body: any
+# earlier un-routed launch verb in the block ("Run the build, then run playback locally on Bachelor."). The r10 line-break rule is gone:
+# each tail piece must be in the grammar on its own, which is never wider than reading the pieces joined.
 # Rules 3, 3b and 4 keep master's weak-negation exemption (not / no / without in the marker's clause, narrowed from the whole sentence to
 # the clause), so they refuse at least what master refuses. Anything that is not E1 / E2 / E3 / a prohibition keeps master's verdict.
 # A contrast word still CUTS the sentence (the head clause is judged without its complement) and the complement ends at its next comma; the
@@ -238,12 +249,11 @@ function Get-VenueRoutedLocallyEnd {
 # r10 -- strictly terminal E1 (hub ruling HUB-TICK 20261015T1650Z). One tail PIECE (the rest of the marker's sentence, or one later
 # sentence of its block) is in the closed allow-grammar ($Grammar, built in Get-LocalPlaybackPromptFindings: fragments (A) venue routing,
 # (B) a pure locus word, (C) a verbless host negation, separated by punctuation, a spaced dash or and / or / then). A whitelist, not a
-# blacklist: the first token the grammar does not name fails the match. A piece that another piece of the block follows must end in
-# punctuation, so a fragment never runs on across a line break (each piece is read on its own, which is never wider than reading them joined).
+# blacklist: the first token the grammar does not name fails the match. Each piece is read on its own (r11b: no punctuation is required
+# at a line break; a fragment cut by a line break is not in the grammar by itself, so it still voids E1).
 function Test-TailPiece {
-    param([string]$Text, [bool]$Followed, [regex]$Grammar)
-    if (-not $Grammar.IsMatch($Text)) { return $false }
-    return (-not $Followed) -or ($Text.TrimEnd() -match '[.!?;:,]\z')
+    param([string]$Text, [regex]$Grammar)
+    return $Grammar.IsMatch($Text)
 }
 
 # The venue exemption holds only when the venue routing is the END of what the text says about running: the rest of the sentence
@@ -258,16 +268,102 @@ function Test-VenueTerminalTail {
         $nd[$n] = -1
         for ($j = $n - 1; $j -ge 0; $j--) {
             $followedJ = ($j + 1 -lt $n) -and ($Items[$j + 1].Block -eq $Items[$j].Block)
-            if (-not (Test-TailPiece -Text $Items[$j].Text -Followed $followedJ -Grammar $State.Grammar)) { $nd[$j] = $j }
+            if (-not (Test-TailPiece -Text $Items[$j].Text -Grammar $State.Grammar)) { $nd[$j] = $j }
             elseif ($followedJ) { $nd[$j] = $nd[$j + 1] }
             else { $nd[$j] = -1 }
         }
         $State.NextDirty = $nd
     }
     $followed = ($Index + 1 -lt $n) -and ($Items[$Index + 1].Block -eq $Items[$Index].Block)
-    if (-not (Test-TailPiece -Text $Remainder -Followed $followed -Grammar $State.Grammar)) { return $false }
+    if (-not (Test-TailPiece -Text $Remainder -Grammar $State.Grammar)) { return $false }
     if ($followed -and $State.NextDirty[$Index + 1] -ne -1) { return $false }
     return $true
+}
+
+# r11b -- a clause that cannot hide a local launch in front of a venue-routed E1 marker. $Ctx is the head state built in
+# Get-LocalPlaybackPromptFindings. A clause is benign when (a) it holds no launch verb, no host reference and no preposition once its
+# venue-routed phrases are masked out ("on my rig" is a host nobody listed, so a bare preposition is read as one); (b) it is a CONTRAST
+# complement whose first such word opens it ("rather than here"; "without audio on this host" does not: the host is not what the word
+# rules out); (c) it is a strong prohibition that is inherited, or whose negation comes before its first such word; or (d) it is
+# venue-routed (E3) and holds none of them. A weak negation (not / no / without) never makes a clause benign: "Run playback on the
+# hub-VM with no overlay" is still a launch on the hub-VM.
+function Get-LeftoverPrepositionIndex {
+    param([string]$Text, [hashtable]$Ctx)
+    $masked = [regex]::Replace($Text, $Ctx.Mask, [System.Text.RegularExpressions.MatchEvaluator]{ param($m) ' ' * $m.Length })
+    $pm = [regex]::Match($masked, $Ctx.Preposition)
+    if ($pm.Success) { return $pm.Index }
+    return -1
+}
+
+function Test-HeadClauseBenign {
+    param([object]$Clause, [hashtable]$Ctx)
+    $text = [string]$Clause.Text
+    $first = -1
+    $hostSeen = $false
+    $vm = [regex]::Match($text, $Ctx.LaunchVerb)
+    if ($vm.Success) { $first = $vm.Index }
+    foreach ($pattern in $Ctx.HostPatterns) {
+        $hm = [regex]::Match($text, $pattern)
+        if ($hm.Success) {
+            $hostSeen = $true
+            if ($first -lt 0 -or $hm.Index -lt $first) { $first = $hm.Index }
+        }
+    }
+    $pi = Get-LeftoverPrepositionIndex -Text $text -Ctx $Ctx
+    if ($pi -ge 0 -and ($first -lt 0 -or $pi -lt $first)) { $first = $pi }
+    if ($first -lt 0) { return $true }
+    if ($Clause.Contrast) { return [string]::IsNullOrWhiteSpace($text.Substring(0, $first)) }
+    if ($Clause.Strong) {
+        $neg = [regex]::Match($text, $Ctx.StrongNeg)
+        if (-not $neg.Success -or $neg.Index -lt $first) { return $true }
+    }
+    return [bool]$Clause.Venue -and -not $hostSeen -and $pi -lt 0
+}
+
+# Every clause of the sentence that starts before the marker's clause (an earlier clause, an earlier ';' group) must be benign.
+function Test-SentenceHeadBenign {
+    param([object[]]$Clauses, [object]$MarkerClause, [hashtable]$Ctx)
+    foreach ($k in $Clauses) {
+        if ($k.Start -ge $MarkerClause.Start) { continue }
+        if (-not (Test-HeadClauseBenign -Clause $k -Ctx $Ctx)) { return $false }
+    }
+    return $true
+}
+
+# One earlier ITEM is dirty when it holds a launch verb and is not benign clause by clause. Cheap path first: a launch verb with no venue
+# phrase, no strong prohibition and no contrast word is dirty with no clause analysis. Only an item that names a venue or a prohibition
+# is analysed, memoised by its text, and past $State.Budget analyses the answer is dirty (fail closed, bounded cost).
+function Test-ItemDirty {
+    param([string]$Text, [hashtable]$State)
+    if ($State.Memo.ContainsKey($Text)) { return [bool]$State.Memo[$Text] }
+    $dirty = $false
+    if ([regex]::IsMatch($Text, $State.LaunchVerb)) {
+        $analyse = [regex]::IsMatch($Text, $State.VenueQualified) -or [regex]::IsMatch($Text, $State.StrongNeg) -or [regex]::IsMatch($Text, $State.Contrast)
+        if (-not $analyse -or $State.Budget -le 0) { $dirty = $true }
+        else {
+            $State.Budget = $State.Budget - 1
+            $clauses = @(Get-LintClauses -Sentence $Text -Separator $State.Separator -Contrast $State.Contrast -LaunchVerb $State.LaunchVerb -StrongNeg $State.StrongNeg -WeakNeg $State.WeakNeg -VenueQualified $State.VenueQualified)
+            foreach ($k in $clauses) {
+                if (-not (Test-HeadClauseBenign -Clause $k -Ctx $State)) { $dirty = $true; break }
+            }
+        }
+    }
+    $State.Memo[$Text] = $dirty
+    return $dirty
+}
+
+# True when an item BEFORE $Index in the same instruction block (a block ends at a heading) is dirty. One forward pass: the cursor folds
+# items into a running flag that resets at a block change, so a large heading-free prompt costs one pass. Callers pass a non-decreasing $Index.
+function Test-EarlierItemDirty {
+    param([object]$Items, [int]$Index, [hashtable]$State)
+    while ($State.Cursor -lt $Index) {
+        $it = $Items[$State.Cursor]
+        if ($it.Block -ne $State.Block) { $State.Block = $it.Block; $State.Flag = $false }
+        if (-not $State.Flag -and (Test-ItemDirty -Text $it.Text -State $State)) { $State.Flag = $true }
+        $State.Cursor = $State.Cursor + 1
+    }
+    if ($Items[$Index].Block -ne $State.Block) { return $false }
+    return [bool]$State.Flag
 }
 
 # Defeater (r4, widened r5, fail closed r6): a local-host reference in the clause, or in ANY later clause of the same sentence (across a
@@ -324,7 +420,7 @@ function Get-LocalPlaybackLintWordLists {
         VenueFollowPhrases         = @('from here')
         HostDeterminers            = @('this', 'the', 'my', 'your', 'our', 'that', 'local', 'current', 'same', 'own', 'its', 'their')
         HostNouns                  = @('hub vm', 'hub host', 'hub', 'host', 'vm', 'virtual machine', 'machine', 'box', 'workstation', 'computer', 'pc', 'desktop', 'laptop', 'system', 'device', 'server', 'node', 'guest')
-        HostPrepositions           = @('on', 'onto', 'at', 'in', 'into', 'to', 'from', 'inside', 'within', 'via', 'using')
+        HostPrepositions           = @('on', 'onto', 'at', 'in', 'into', 'to', 'from', 'inside', 'within', 'via', 'using', 'through', 'under', 'over', 'atop', 'upon', 'beside', 'near', 'alongside', 'behind', 'around', 'across')
         HostLocusPrepositions      = @('on', 'at', 'in', 'using')
         HostNames                  = @('localhost', 'virtual-ten', 'hub vm', '127.0.0.1', '::1', 'loopback')
         ContrastWords             = @('instead of', 'rather than', 'without', 'nor', 'skip', 'skips', 'skipping', 'bypass', 'bypasses', 'bypassing')
@@ -455,6 +551,14 @@ function Get-LocalPlaybackPromptFindings {
         Grammar   = [regex]::new("(?i)^\s*(?:(?>${tailSep})\s*)*(?:(?>${tailFrag})(?:\s*(?>${tailSep}))+\s*)*(?:(?>${tailFrag})\s*)?\z")
         NextDirty = $null
     }
+    # r11b: the state of the head-benign check of E1 (Test-EarlierItemDirty / Test-ItemDirty): a memo by item text, a cap on clause
+    # analyses per call (past it an item that needs one is dirty), and the cursor of the single forward pass over the items.
+    $headState = @{
+        LaunchVerb = $launchVerb; StrongNeg = $strongNeg; WeakNeg = $weakNeg; Contrast = $contrast; Separator = $separator
+        VenueQualified = $venueQualified; HostPatterns = $hostDefeaters
+        Mask = "${venueQualified}|${b}from\s+here(?![\w\-'])"; Preposition = "(?i)${b}(?:${hostPreposition})${e}"
+        Memo = @{}; Budget = 400; Cursor = 0; Block = -1; Flag = $false
+    }
     $direct = @(
         "(?i)${b}MLVApp(Release)?\.exe\s+(?:(?!/\s)\S+\s+){0,12}--(gui-smoke-playback|profile-playback)",
         "(?i)(pwsh|powershell)(\.exe)?${e}[^\n]{0,80}-File\s+\S*$scripts",
@@ -529,7 +633,14 @@ function Get-LocalPlaybackPromptFindings {
                         $prefix = $s.Substring($c.Start, [Math]::Max(0, $m.Index - $c.Start))
                         $hostBefore = $false
                         foreach ($pattern in $hostDefeaters) { if ([regex]::IsMatch($prefix, $pattern)) { $hostBefore = $true; break } }
-                        if (-not $hostBefore -and (Test-VenueTerminalTail -Remainder $s.Substring($e1End) -Items $items -Index $itemIndex -State $tailState)) { continue }
+                        # r11b: the HEAD must be benign too -- every earlier clause (and ';' group), the marker clause's own prefix once its
+                        # venue-routed phrases are stripped (no preposition left: "on my rig locally on Bachelor"), and every earlier item
+                        # of the block. Cheap checks first; the block scan folds earlier items once (Test-EarlierItemDirty).
+                        $headBenign = (-not $hostBefore) -and
+                            ((Get-LeftoverPrepositionIndex -Text $prefix -Ctx $headState) -lt 0) -and
+                            (Test-SentenceHeadBenign -Clauses $clauses -MarkerClause $c -Ctx $headState) -and
+                            (-not (Test-EarlierItemDirty -Items $items -Index $itemIndex -State $headState))
+                        if ($headBenign -and (Test-VenueTerminalTail -Remainder $s.Substring($e1End) -Items $items -Index $itemIndex -State $tailState)) { continue }
                     }
                     $hit = 'run-playback-locally'; break
                 }
