@@ -117,6 +117,14 @@ public:
                                                  QString *reason = nullptr,
                                                  quint64 *presentedSerial = nullptr,
                                                  bool *presentedSerialValid = nullptr);
+    /* PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-1 (--visual-capture-dir only): the presentationSerial paintGL() last
+     * promoted (m_presentedSerial) -- a cheap read, no paint and no readback. Returns its validity; false when
+     * no window is active. */
+    static bool presentedSerialIfActive(quint64 *presentedSerial);
+    /* Same, after first painting a pending frame synchronously (paintGL() + swap, the grab idiom without its
+     * readback) when one is waiting on Qt's deferred update(); a frame already painted is not painted again.
+     * GUI-thread only. */
+    static bool paintPendingNowIfActive(quint64 *presentedSerial);
     /* Logical size of the active preview window (empty if none). Used by the display
      * scene-geometry calc so the playback preview resolution tracks the QOpenGLWindow
      * surface, not the hidden QGraphicsView. GUI-thread only. */

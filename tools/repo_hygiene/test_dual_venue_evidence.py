@@ -6306,7 +6306,9 @@ function New-VisPng([string]$Path, [int]$Seed, [int]$Chrome, [int]$Bias, [bool]$
 def write_visual_captures(dest: Path, mode: str = "ok") -> None:
     """The job's published visual\\ directory, as the app and the job write it: play-0..5.png, stop.png, paused.png, visual.json, and the
     job's visual-capture-request.json. mode: ok | frozen (one picture, ticking chrome, advancing app frames) | blank | diverge (the paused
-    full-quality frame has another red level)."""
+    full-quality frame has another red level). PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-1 adds two modes whose stop entry carries the app's
+    binding fields: lagged (the stop capture shows an older picture than its label names: painted_serial != serial, label_bound false) and
+    bound (the unforced stop-unbound.png shows the older picture; the forced, bound stop.png matches paused.png)."""
     if dest.exists():
         shutil.rmtree(dest)
     dest.mkdir(parents=True)
@@ -6314,13 +6316,21 @@ def write_visual_captures(dest: Path, mode: str = "ok") -> None:
     for k in range(6):
         seed = 1 if mode == "frozen" else k
         calls.append(f"New-VisPng '{dest / f'play-{k}.png'}' {seed} {60 + k * 10} 0 ${'true' if mode == 'blank' else 'false'}")
-    calls.append(f"New-VisPng '{dest / 'stop.png'}' 5 120 0 ${'true' if mode == 'blank' else 'false'}")
+    if mode == "bound":
+        calls.append(f"New-VisPng '{dest / 'stop-unbound.png'}' 5 120 40 $false")
+    calls.append(f"New-VisPng '{dest / 'stop.png'}' 5 120 {40 if mode == 'lagged' else 0} ${'true' if mode == 'blank' else 'false'}")
     calls.append(f"New-VisPng '{dest / 'paused.png'}' 5 120 {40 if mode == 'diverge' else 0} ${'true' if mode == 'blank' else 'false'}")
     proc = run_pwsh(["-Command", VISUAL_PNG_PS + "\n".join(calls)])
     assert proc.returncode == 0, proc.stdout + proc.stderr
     frames = [{"kind": "play", "index": k, "file": f"play-{k}.png", "display_frame": 600 + 2 * k, "serial": 900 + k, "play_active": True,
                "tail_elapsed_ms": 250 + 500 * k, "capture_ms": 40.0, "viewport": VIEWPORT, "saved": True, "reason": ""} for k in range(6)]
-    frames.append({"kind": "stop", "index": 0, "file": "stop.png", "display_frame": 612, "play_active": False, "viewport": VIEWPORT, "saved": True, "reason": ""})
+    if mode == "bound":
+        frames.append({"kind": "stop_unbound", "index": 0, "file": "stop-unbound.png", "display_frame": 612, "serial": 912, "painted_serial": 911,
+                       "painted_serial_valid": True, "label_bound": False, "play_active": False, "viewport": VIEWPORT, "saved": True, "reason": ""})
+    stop = {"kind": "stop", "index": 0, "file": "stop.png", "display_frame": 612, "play_active": False, "viewport": VIEWPORT, "saved": True, "reason": ""}
+    if mode in ("lagged", "bound"):
+        stop.update({"serial": 912, "painted_serial": 911 if mode == "lagged" else 912, "painted_serial_valid": True, "label_bound": mode == "bound"})
+    frames.append(stop)
     frames.append({"kind": "paused", "index": 0, "file": "paused.png", "display_frame": 612, "settled": True, "settled_frame": 612, "play_active": False,
                    "viewport": VIEWPORT, "saved": True, "reason": ""})
     (dest / "visual.json").write_text(json.dumps({"schema": "mlv-app/visual-capture/v1", "method": "PrintWindow(PW_RENDERFULLCONTENT)", "tail_ms": 3000,
@@ -6524,6 +6534,60 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
                     self.assertGreater(out["playVsPausedMeanAbsDiffPerChannel"][0], out["playVsPausedMeanAbsDiffPerChannel"][1], "the red shift shows in R")
                 else:
                     self.assertLess(mad, 1.0)
+                # PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-1: a pre-fix visual.json (no binding fields) reads exactly as before
+                self.assertIsNone(out["labelBound"])
+                self.assertIsNone(out["stopUnboundVsPausedMeanAbsDiff"])
+                self.assertIsNone(out["stopUnboundVsStopMeanAbsDiff"])
+
+    def read_visual_mode(self, mode: str, d: str) -> tuple[Path, dict]:
+        art = Path(d) / "artifacts"
+        write_visual_captures(art / "visual", mode)
+        ev = Path(d) / "evidence"
+        proc, out = run_pwsh_json(f"Read-DvVisualCaptures -Requested $true -ArtifactsDir '{art}' -EvidenceDir '{ev}' -LegId 'unit-leg' -Header 'unit' | ConvertTo-Json -Depth 8 -Compress")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return ev, out
+
+    def test_the_visual_reader_says_capture_unbound_when_the_stop_was_not_painted_for_its_label(self) -> None:
+        # G1 (PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-1): the stop capture shows an older picture than its label names, and the app says so
+        # (painted_serial != serial, label_bound false). The stop-vs-paused difference then compares two moments: never a divergence verdict.
+        with tempfile.TemporaryDirectory(prefix="vis-lagged-") as d:
+            _, out = self.read_visual_mode("lagged", d)
+        self.assertEqual((out["verdict"], out["counted"]), ("CAPTURE_UNBOUND", True), out["reason"])
+        self.assertIs(out["labelBound"], False)
+        self.assertGreater(out["playVsPausedMeanAbsDiff"], 12.0, "the difference is still reported")
+        self.assertIn("label", out["reason"])
+
+    def test_the_visual_reader_keeps_the_unbound_stop_beside_the_bound_one(self) -> None:
+        # G2: the app keeps the unforced (master-equivalent) stop capture as stop-unbound.png, then the forced, bound stop.png.
+        with tempfile.TemporaryDirectory(prefix="vis-bound-") as d:
+            ev, out = self.read_visual_mode("bound", d)
+            self.assertEqual(out["verdict"], "OK", out["reason"])
+            self.assertIs(out["labelBound"], True)
+            self.assertLess(out["playVsPausedMeanAbsDiff"], 1.0)
+            self.assertGreater(out["stopUnboundVsPausedMeanAbsDiff"], 12.0)
+            self.assertGreater(out["stopUnboundVsStopMeanAbsDiff"], 12.0)
+            files = {f["file"]: f for f in out["frames"]}
+            self.assertIn("unit-leg-stop-unbound.png", files)
+            local = ev / "visual" / "unit-leg-stop-unbound.png"
+            self.assertEqual(files["unit-leg-stop-unbound.png"]["sha256"], hashlib.sha256(local.read_bytes()).hexdigest())
+            self.assertEqual((files["unit-leg-stop.png"]["paintedSerial"], files["unit-leg-stop.png"]["serial"]), (912, 912))
+            self.assertTrue(Path(out["stripPath"]).is_file())
+
+    def test_the_visual_gate_says_capture_unbound_before_divergence(self) -> None:
+        rows = [  # labelBound, mad -> verdict
+            ("$false", "30.0", "CAPTURE_UNBOUND"), ("$false", "2.0", "CAPTURE_UNBOUND"),
+            ("$true", "30.0", "VISUAL_DIVERGENCE"), ("$true", "2.0", "OK"),
+            ("$null", "30.0", "VISUAL_DIVERGENCE"), ("$null", "2.0", "OK"),
+        ]
+        for bound, mad, verdict in rows:
+            with self.subTest(bound=bound, mad=mad):
+                proc, out = run_pwsh_json("Get-DvVisualVerdict -Requested $true -Captured $true -PlayFrames 6 -DistinctContentHashes 6 -AppDistinctDisplayFrames 6 "
+                                          f"-FlatPlayFrames 0 -PlayVsPausedMeanAbsDiff {mad} -SamePosition $true -LabelBound {bound} | ConvertTo-Json -Compress")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual((out["verdict"], out["counted"]), (verdict, True))
+        proc, out = run_pwsh_json("Get-DvVisualVerdict -Requested $true -Captured $true -PlayFrames 6 -DistinctContentHashes 1 -AppDistinctDisplayFrames 6 "
+                                  "-FlatPlayFrames 0 -PlayVsPausedMeanAbsDiff 2.0 -SamePosition $true -LabelBound $false | ConvertTo-Json -Compress")
+        self.assertEqual(out["verdict"], "FROZEN_DISPLAY", "a frozen display outranks an unbound stop capture")
 
     def test_a_visual_reader_without_a_published_directory_says_not_captured(self) -> None:
         with tempfile.TemporaryDirectory(prefix="vis-none-") as d:
@@ -6580,6 +6644,12 @@ class VisualCaptureRunnerTests(RunnerHarness, unittest.TestCase):
         self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
         self.assertIn("VISUAL_DIVERGENCE", receipt["outcomeDetail"])
         self.assertEqual(receipt["visual"]["verdict"], "VISUAL_DIVERGENCE")
+
+    def test_an_unbound_visual_capture_is_counted_for_speed_and_surfaced(self) -> None:
+        _, receipt, _ = self.run_visual("lagged")
+        self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+        self.assertIn("CAPTURE_UNBOUND", receipt["outcomeDetail"])
+        self.assertEqual((receipt["visual"]["verdict"], receipt["visual"]["labelBound"]), ("CAPTURE_UNBOUND", False))
 
     def test_a_blank_visual_capture_judges_nothing(self) -> None:
         _, receipt, _ = self.run_visual("blank")
@@ -6650,6 +6720,25 @@ class VisualCaptureSpecAndAppSourceTests(unittest.TestCase):
         for forbidden in ("programmaticPlay(", "setChecked( true", "->trigger(", "return "):
             self.assertNotIn(forbidden, block, f"the capture block never starts a Play and never ends the smoke: {forbidden}")
         self.assertIn("PrintWindow( hwnd, memoryDc, PW_RENDERFULLCONTENT )", src)
+        # PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-1 (G3): every capture binds its label to its pixels. Inside grabVisual the pending frame is painted
+        # FIRST, then the label is read, then the window is printed, with no event processed in between (a paint deferred past the label let a
+        # capture show frame N-1 labelled N). The helper lives outside the block, beside the PrintWindow capture.
+        helper = "paintPresentedFrameForCapture("
+        self.assertTrue("static bool paintPresentedFrameForCapture(" in src, "the binding helper is defined in MainWindow.cpp")
+        self.assertLess(abs(src.index("static bool paintPresentedFrameForCapture(") - src.index("static QImage captureTopLevelWindowByPrintWindow(")), 6000,
+                        "the binding helper sits next to the PrintWindow capture")
+        lam = block[block.index("auto grabVisual = [&]"):block.index("// (1) the measured interval ends HERE")]
+        self.assertLess(lam.index(helper), lam.index("m_lastPresentedRequestContext.frameNumber"), "paint first, then read the label")
+        self.assertLess(lam.index("m_lastPresentedRequestContext.frameNumber"), lam.index("captureTopLevelWindowByPrintWindow("))
+        self.assertNotIn("processEvents(", lam[lam.index(helper):lam.index("captureTopLevelWindowByPrintWindow(")],
+                         "nothing may present a newer frame between the paint and the capture")
+        # the stop grab keeps the unforced (master-equivalent) capture first, then the forced, bound one
+        unbound = 'grabVisual( QStringLiteral("stop_unbound"), 0, false );'
+        self.assertLess(block.index("ui->actionPlay->setChecked( false );"), block.index(unbound))
+        self.assertLess(block.index(unbound), block.index('grabVisual( QStringLiteral("stop"), 0, false );'))
+        self.assertNotIn("processEvents(", block[block.index(unbound):block.index('grabVisual( QStringLiteral("stop"), 0, false );')])
+        for field in ('"painted_serial"', '"painted_serial_valid"', '"label_bound"'):
+            self.assertIn(f"QStringLiteral({field})", block)
 
 
 if __name__ == "__main__":

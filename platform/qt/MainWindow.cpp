@@ -1768,6 +1768,43 @@ static QImage captureTopLevelWindowByPrintWindow( QWidget *topLevel,
 #endif
 }
 
+/* PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-1: binds a --visual-capture-dir capture's label to its pixels. A CPU frame is
+ * presented with a deferred paint (the pixmap item's / GL viewport's update()) while finishPresentedFrame() stamps its
+ * label at once, and PrintWindow reads the LAST PAINTED surface -- so a capture taken in between showed frame N-1
+ * labelled N. With paint set, the pending frame is painted synchronously first: the GL window's paintGL()+swap, else
+ * the viewport widget's repaint() (the --screenshot path's idiom). Returns whether the serial of the frame now painted
+ * is known, in *paintedSerialOut: the GL window's / GL viewport's own record of what its paintGL() drew, or, on the
+ * QGraphicsPixmapItem route, the item's serial once repaint() has drawn it (unknown without the forced paint). Only
+ * ever called by --visual-capture-dir, after the measured interval has closed. */
+static bool paintPresentedFrameForCapture( QGraphicsView *view,
+                                           QWidget *viewportWidget,
+                                           bool glWindowRoute,
+                                           quint64 pixmapItemSerial,
+                                           bool paint,
+                                           quint64 *paintedSerialOut )
+{
+    quint64 serial = 0;
+    bool valid = false;
+    if( glWindowRoute )
+    {
+        valid = paint ? GpuDisplayWindow::paintPendingNowIfActive( &serial )
+                      : GpuDisplayWindow::presentedSerialIfActive( &serial );
+    }
+    else if( GpuDisplayViewport::isInstalledOn( view ) )
+    {
+        if( paint && viewportWidget ) viewportWidget->repaint();
+        valid = GpuDisplayViewport::paintedSerialFor( view, &serial );
+    }
+    else if( paint && viewportWidget && viewportWidget->isVisible() && viewportWidget->updatesEnabled() )
+    {
+        viewportWidget->repaint();
+        serial = pixmapItemSerial;
+        valid = serial != 0;
+    }
+    if( paintedSerialOut ) *paintedSerialOut = valid ? serial : 0;
+    return valid;
+}
+
 /* spaceTag argument options: ffmpeg color space tag number compliant */
 #define SPACETAG_REC709   1   /* rec709 color space */
 #define SPACETAG_UNKNOWN  2   /* No color space tag set */
@@ -6146,6 +6183,7 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
             pic.setDevicePixelRatio( devicePixelRatioF() );
         }
         m_pGraphicsItem->setPixmap( pic );
+        m_graphicsItemPresentedSerial = task.requestSerial;
         if( !displayPreviewCachingAllowed
          && m_pRenderThread
          && !releasePresentedFrameEarly )
@@ -10157,6 +10195,8 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
             qint64 tailElapsedMs = 0;
             int displayFrame = -1;
             qulonglong serial = 0;
+            qulonglong paintedSerial = 0;
+            bool paintedSerialValid = false;
             bool playActive = false;
             bool settled = false;
             double captureMs = 0.0;
@@ -10175,11 +10215,19 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
             grab.kind = kind;
             grab.index = index;
             grab.tailElapsedMs = visualTailClock.elapsed();
+            grab.settled = settled;
+            // PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-1: paint the pending frame FIRST, then read the label, then print the
+            // window, with no event handled in between, so the pixels are the frame the label names. Only "stop_unbound"
+            // skips the paint: it is the capture a pre-binding build took (whatever was last painted), kept beside it.
+            quint64 paintedSerial = 0;
+            grab.paintedSerialValid = paintPresentedFrameForCapture( ui->graphicsView, visualViewportWidget, visualUseGlContainer,
+                                                                     m_graphicsItemPresentedSerial,
+                                                                     kind != QStringLiteral("stop_unbound"), &paintedSerial );
+            grab.paintedSerial = static_cast<qulonglong>( paintedSerial );
             grab.displayFrame = m_lastPresentedRequestContextValid
                 ? static_cast<int>( m_lastPresentedRequestContext.frameNumber ) : -1;
             grab.serial = static_cast<qulonglong>( m_lastPresentedRequestSerial );
             grab.playActive = ui->actionPlay->isChecked();
-            grab.settled = settled;
             QElapsedTimer captureClock;
             captureClock.start();
             grab.image = captureTopLevelWindowByPrintWindow( this, visualViewportWidget, &grab.viewport, &grab.reason );
@@ -10211,8 +10259,10 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
             grabVisual( QStringLiteral("play"), k, false );
         }
         // The frame on screen the instant Play is paused: captured BEFORE any event is processed, so it
-        // is still the frame the playback path presented (the paused re-render has not landed yet).
+        // is still the frame the playback path presented (the paused re-render has not landed yet). First
+        // unforced (stop_unbound: what a pre-binding build captured), then painted and bound to its label.
         ui->actionPlay->setChecked( false );
+        grabVisual( QStringLiteral("stop_unbound"), 0, false );
         grabVisual( QStringLiteral("stop"), 0, false );
         const QString visualTailEndUtc = QDateTime::currentDateTimeUtc().toString( Qt::ISODateWithMs );
         const int visualStopFrame = visualGrabs.last().displayFrame;
@@ -10247,7 +10297,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         {
             const QString fileName = grab.kind == QStringLiteral("play")
                 ? QStringLiteral("play-%1.png").arg( grab.index )
-                : grab.kind + QStringLiteral(".png");
+                : QString( grab.kind ).replace( QLatin1Char('_'), QLatin1Char('-') ) + QStringLiteral(".png");
             QJsonObject frameJson;
             frameJson.insert( QStringLiteral("kind"), grab.kind );
             frameJson.insert( QStringLiteral("index"), grab.index );
@@ -10256,6 +10306,9 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
             frameJson.insert( QStringLiteral("tail_elapsed_ms"), static_cast<double>( grab.tailElapsedMs ) );
             frameJson.insert( QStringLiteral("display_frame"), grab.displayFrame );
             frameJson.insert( QStringLiteral("serial"), static_cast<double>( grab.serial ) );
+            frameJson.insert( QStringLiteral("painted_serial"), static_cast<double>( grab.paintedSerial ) );
+            frameJson.insert( QStringLiteral("painted_serial_valid"), grab.paintedSerialValid );
+            frameJson.insert( QStringLiteral("label_bound"), grab.paintedSerialValid && grab.paintedSerial == grab.serial );
             frameJson.insert( QStringLiteral("play_active"), grab.playActive );
             frameJson.insert( QStringLiteral("capture_ms"), grab.captureMs );
             if( grab.kind == QStringLiteral("paused") )
@@ -15174,6 +15227,7 @@ void MainWindow::deleteSession()
     invalidateDisplayPreviewCache();
     GpuDisplayViewport::clearPresentedImage( ui->graphicsView, m_pGraphicsItem );
     m_pGraphicsItem->setPixmap( QPixmap( ":/IMG/IMG/TransDummy.png" ) );
+    m_graphicsItemPresentedSerial = 0;
     m_pScene->setSceneRect( 0, 0, 10, 10 );
 
     //Fake no audio track
@@ -18942,6 +18996,7 @@ void MainWindow::clearPresentationForClipOpen( const char *reason )
         if( m_pGraphicsItem )
         {
             m_pGraphicsItem->setPixmap( QPixmap( ":/IMG/IMG/TransDummy.png" ) );
+            m_graphicsItemPresentedSerial = 0;
             m_pGraphicsItem->setVisible( true );
         }
         if( m_pScene )

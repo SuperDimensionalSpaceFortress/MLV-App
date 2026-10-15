@@ -1541,6 +1541,8 @@ private:
     bool m_headlessPlaybackProfileActive = false;
     uint64_t m_nextRenderRequestSerial = 1;
     uint64_t m_lastPresentedRequestSerial = 0;
+    // PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-1: the requestSerial whose pixmap m_pGraphicsItem holds (0: none / a placeholder).
+    uint64_t m_graphicsItemPresentedSerial = 0;
     GpuPreviewProcessingBackendRequest m_gpuPreviewProcessingBackendRequest =
         GpuPreviewProcessingBackendRequest::Auto;
     GpuBilinearDebayerBackendRequest m_gpuBilinearDebayerBackendRequest =
