@@ -509,6 +509,98 @@ bool GpuDisplayWindow::presentGpuPlaybackReconAmazePostWbTextureIfActive(
         presentationSerial);
 }
 
+bool GpuDisplayWindow::prewarmPlaybackReconRouteIfActive(int texWidth, int texHeight, QString *summary)
+{
+    QMutexLocker lock(&g_activeMutex);
+    GpuDisplayWindow *win = g_activeWindow.load(std::memory_order_acquire);
+    if ( !win )
+    {
+        if ( summary ) *summary = QStringLiteral("ok=0 reason=no_active_window");
+        return false;
+    }
+    if ( QThread::currentThread() != win->thread() )
+    {
+        if ( summary ) *summary = QStringLiteral("ok=0 reason=not_gui_thread");
+        return false;
+    }
+    return win->prewarmPlaybackReconRoute(texWidth, texHeight, summary);
+}
+
+/* PLAYBACK-STARTUP-WAIT-PREWARM-1 Row B: pay the texture route's one-time setup while paused. Compiles the
+ * preview-processing program the route draws with, and runs AMaZE once at the playback size from a temporary R16
+ * texture into a temporary RGBA16 texture -- loading its kernels and sizing its live device buffers (which stay
+ * allocated) -- then unregisters both from CUDA and frees them. Never touches m_texture or the pending frame, and
+ * never paints: what the window shows is unchanged. */
+bool GpuDisplayWindow::prewarmPlaybackReconRoute(int texWidth, int texHeight, QString *summary)
+{
+    QOpenGLContext *glContext = context();
+    if ( !glContext || !isValid() )
+    {
+        if ( summary ) *summary = QStringLiteral("ok=0 reason=no_gl_context");
+        return false;
+    }
+    if ( texWidth <= 32 || texHeight <= 32 )
+    {
+        if ( summary ) *summary = QStringLiteral("ok=0 reason=invalid_size");
+        return false;
+    }
+    QElapsedTimer clock;
+    clock.start();
+    auto nowMs = [&clock]() { return static_cast<double>(clock.nsecsElapsed()) / 1000000.0; };
+    const bool needsCurrent = QOpenGLContext::currentContext() != glContext;
+    if ( needsCurrent ) makeCurrent();
+
+    const double programStartMs = nowMs();
+    ensurePreviewProcessingProgram();
+    const double programMs = nowMs() - programStartMs;
+
+    const double allocStartMs = nowMs();
+    QOpenGLTexture *warmInput = new QOpenGLTexture(QOpenGLTexture::Target2D);
+    warmInput->setFormat(QOpenGLTexture::R16_UNorm);
+    warmInput->setSize(texWidth, texHeight);
+    warmInput->setMipLevels(1);
+    warmInput->allocateStorage(QOpenGLTexture::Red, QOpenGLTexture::UInt16);
+    QOpenGLTexture *warmOutput = new QOpenGLTexture(QOpenGLTexture::Target2D);
+    warmOutput->setFormat(QOpenGLTexture::RGBA16_UNorm);
+    warmOutput->setSize(texWidth, texHeight);
+    warmOutput->setMipLevels(1);
+    warmOutput->allocateStorage(QOpenGLTexture::RGBA, QOpenGLTexture::UInt16);
+    const double allocMs = nowMs() - allocStartMs;
+
+    const double amazeStartMs = nowMs();
+    const double unityWb[3] = { 1.0, 1.0, 1.0 };
+    QString amazeReason;
+    const bool amazeOk =
+        gpuAmazeDebayerRenderPostWbGlTextureFromR16GlTexture(warmInput->textureId(),
+                                                             warmOutput->textureId(),
+                                                             texWidth,
+                                                             texHeight,
+                                                             0,
+                                                             unityWb,
+                                                             &amazeReason);
+    const double amazeMs = nowMs() - amazeStartMs;
+
+    // unregister the temporaries from CUDA before their GL names are freed
+    gpuAmazeDebayerResetR16TextureBackendResources();
+    delete warmInput;
+    delete warmOutput;
+    if ( needsCurrent ) doneCurrent();
+
+    if ( summary )
+    {
+        *summary = QStringLiteral("ok=%1 width=%2 height=%3 program_ms=%4 alloc_ms=%5 amaze_ms=%6 total_ms=%7 reason=\"%8\"")
+            .arg(amazeOk ? 1 : 0)
+            .arg(texWidth)
+            .arg(texHeight)
+            .arg(programMs, 0, 'f', 3)
+            .arg(allocMs, 0, 'f', 3)
+            .arg(amazeMs, 0, 'f', 3)
+            .arg(nowMs(), 0, 'f', 3)
+            .arg(amazeReason);
+    }
+    return amazeOk;
+}
+
 GpuPresentSetupTiming GpuDisplayWindow::lastPresentSetupTimingIfActive()
 {
     QMutexLocker lock(&g_activeMutex);
