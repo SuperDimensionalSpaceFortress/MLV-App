@@ -6751,6 +6751,10 @@ class HeapDumpSoakAccountingTests(unittest.TestCase):
         self.assertEqual(g["pageheap"]["legs"], 1)
         self.assertEqual(sorted(n.split(" ")[0] for n in g["captureNotVerified"]["names"]), ["N-1", "N-2"])
         self.assertEqual(sum(g[k]["legs"] for k in g), 8, "every RAN leg is in exactly one group; the NO_CHAIN_RESULT leg is in none")
+
+
+@requires_windows_pwsh
+class VisualCaptureVenueHelperTests(unittest.TestCase):
     """The venue-side helpers the job splices in (AttrCudaArtifacts.psm1)."""
 
     def run_module(self, script: str) -> subprocess.CompletedProcess:
