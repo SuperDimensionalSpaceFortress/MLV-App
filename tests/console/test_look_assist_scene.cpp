@@ -1313,7 +1313,8 @@ struct OneSurfaceRun
     int renders = 0;
 };
 
-OneSurfaceRun resolveOneSurface( const LookAssistStats &day, int red, int green, int blue )
+OneSurfaceRun resolveOneSurface( const LookAssistStats &day, int red, int green, int blue,
+                                 const std::vector<int> &elsewhere = std::vector<int>{ 140, 140, 140 } )
 {
     const int width = 80, height = 60, downscale = 4;
     const int solvedTemperature = 6600, solvedTint = -10;
@@ -1322,7 +1323,7 @@ OneSurfaceRun resolveOneSurface( const LookAssistStats &day, int red, int green,
     {
         const bool atSolution = temperature == solvedTemperature && tint == solvedTint;
         paintPicture( out, width, height, downscale, [&]( int, int ) {
-            return atSolution ? std::vector<int>{ red, green, blue } : std::vector<int>{ 140, 140, 140 }; } );
+            return atSolution ? std::vector<int>{ red, green, blue } : elsewhere; } );
     };
     LookAssistWhiteBalanceRequest request;
     request.stats = &day;
@@ -1379,6 +1380,55 @@ TEST(LookAssistScene, AnInitialPatchStrictlyNeutralAtTheSolutionIsNotRefusedForO
         ASSERT_FALSE( run.r.autoValid );
         expectMastersBalance( run.r, day, 6000, 0 );
     }
+}
+
+// LOOK-ASSIST-STRICT-NEUTRAL-CHROMA2-PIN-1 (fable + sol, PR #392 r1): the strict-neutral exception forgives ONE chroma
+// step of rise, as the test above is named, and only strictly inside the dead band (|B-R| < 2 and |G| < 2, strict).
+// Integer channels strictly inside the band still reach chroma 2 (140/142/141: B-R +1, G +1.5), so the band alone forgave
+// TWO steps from a grey find. Decision: 140/142/141 from a chroma-0 find is REFUSED -- a two-step rise is a rise; from a
+// chroma-1 find it is one step and accepted. The exact +/-2 bars on both axes are pinned here too (they were held only by
+// the pipeline fixture's f15), each from a chroma-1 find so that the dead band, not the step, is what refuses them.
+TEST(LookAssistScene, TheStrictNeutralExceptionForgivesOneChromaStepOnlyStrictlyInsideTheDeadBand)
+{
+    const LookAssistStats day = daylightWithPrior( 6300, -15 );
+    const auto expectRefused = [&]( const OneSurfaceRun &run, double baseChroma )
+    {
+        ASSERT_TRUE( run.r.initialPatchChecked );
+        ASSERT_TRUE( run.r.initialPatchRefused );
+        ASSERT_FALSE( run.r.initialPatchRefusedAtBase );          // refused by the verification, not the base guard
+        ASSERT_NEAR( baseChroma, run.r.initialPatchBaseChroma, 1e-9 );
+        ASSERT_NEAR( 2.0, run.r.initialPatchFinalChroma, 1e-9 );
+        ASSERT_FALSE( run.r.autoValid );
+        expectMastersBalance( run.r, day, 6000, 0 );
+    };
+    const auto expectAccepted = [&]( const OneSurfaceRun &run, double baseChroma )
+    {
+        ASSERT_TRUE( run.r.initialPatchChecked );
+        ASSERT_FALSE( run.r.initialPatchRefused );
+        ASSERT_NEAR( baseChroma, run.r.initialPatchBaseChroma, 1e-9 );
+        ASSERT_NEAR( 2.0, run.r.initialPatchFinalChroma, 1e-9 );
+        ASSERT_TRUE( run.r.autoValid );
+        ASSERT_TRUE( run.r.decision == QStringLiteral("accepted") );
+        ASSERT_EQ( 6600, run.r.temperature );
+        ASSERT_EQ( -10, run.r.tint );
+    };
+
+    // From a grey find (chroma 0), every chroma-2 surface is a two-step rise and refused:
+    expectRefused( resolveOneSurface( day, 140, 140, 142 ), 0.0 );   // B-R +2, G -1 (on the bar)
+    expectRefused( resolveOneSurface( day, 142, 140, 140 ), 0.0 );   //   mirror: B-R -2, G -1
+    expectRefused( resolveOneSurface( day, 140, 141, 142 ), 0.0 );   // B-R +2, G 0 (on the bar)
+    expectRefused( resolveOneSurface( day, 142, 141, 140 ), 0.0 );   //   mirror: B-R -2, G 0
+    expectRefused( resolveOneSurface( day, 140, 142, 141 ), 0.0 );   // B-R +1, G +1.5: strictly inside the band, two steps
+    expectRefused( resolveOneSurface( day, 141, 139, 140 ), 0.0 );   //   mirror: B-R -1, G -1.5
+
+    // From a chroma-1 find (140/141/140), a chroma-2 surface is one step; only the strict dead band decides:
+    const std::vector<int> chromaOne{ 140, 141, 140 };
+    expectAccepted( resolveOneSurface( day, 140, 142, 141, chromaOne ), 1.0 );   // B-R +1, G +1.5: inside, one step
+    expectAccepted( resolveOneSurface( day, 141, 139, 140, chromaOne ), 1.0 );   //   mirror: B-R -1, G -1.5
+    expectRefused( resolveOneSurface( day, 140, 140, 142, chromaOne ), 1.0 );    // B-R +2 exactly: |B-R| < 2 is strict
+    expectRefused( resolveOneSurface( day, 142, 140, 140, chromaOne ), 1.0 );    //   mirror: B-R -2
+    expectRefused( resolveOneSurface( day, 140, 142, 140, chromaOne ), 1.0 );    // G +2 exactly: |G| < 2 is strict
+    expectRefused( resolveOneSurface( day, 141, 139, 141, chromaOne ), 1.0 );    //   mirror: G -2
 }
 
 TEST(LookAssistScene, AnInitialPatchThatCannotBeVerifiedIsMastersNotBelieved)
