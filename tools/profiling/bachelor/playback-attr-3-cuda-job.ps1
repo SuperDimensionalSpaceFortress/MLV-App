@@ -245,6 +245,11 @@ param(
     # capture of the same frames after the Play stops (--contact-sheet-seek-dir; it never plays,
     # playback_path=false), published apart under paired-seek\contact-sheet\raw. Off by default.
     [switch]$ContactSheetPairedSeek,
+    # PLAYBACK-VISUAL-INSPECTION-1: the app's post-measurement window capture (--visual-capture-dir: after the measured Play's own
+    # stop and its summary, ~3 s of untimed play is captured with PrintWindow, then the paused frame and its paused full-quality
+    # re-render). Forwarded only when the staged binary's smoke help lists the option; PresentMon's window ends where the tail
+    # begins; the captures publish under visual\. Off by default: without it the job is the text it always was.
+    [switch]$VisualCapture,
 
     # CUDA-PLAYBACK-PRESENT-CADENCE-1 round 2 discriminating legs. HEAVY (default, unchanged
     # behavior for every existing caller) keeps every diagnostic env var PLAYBACK-ATTR-3-CUDA
@@ -4513,6 +4518,39 @@ if ($PresentTrace) {
         param($m)
         $m.Value + $m.Groups['ind'].Value + "'MLVAPP_PLAYBACK_PRESENT_TRACE=1'," + $m.Groups['nl'].Value
     })
+}
+
+# PLAYBACK-VISUAL-INSPECTION-1: a visual-capture leg gains three bracketed regions, on the expanded text and only when asked (like --windowed
+# above), so every other job is the text it always was. Each anchor must match exactly once (Edit-DualVenueTemplate throws otherwise):
+#   1. before PresentMon starts: the four module helpers (spliced here, not into the default embed list) and the feature probe + argument;
+#   2. the PresentMon display report windows on the launcher's result with its end cut at the capture tail's start;
+#   3. before the contact-sheet publish (so both land in the artifact index): the request record and the captures under visual\.
+if ($VisualCapture) {
+    $visualOpen = '# PLAYBACK-VISUAL-INSPECTION-1 >>>'
+    $visualClose = '# PLAYBACK-VISUAL-INSPECTION-1 <<<'
+    $visualFunctions = Get-AttrCudaEmbeddedFunctionSource -Name @('Test-AttrCudaVisualCaptureSupport', 'Add-AttrCudaVisualCaptureArgument', 'Get-AttrCudaPresentMonWindowResult', 'Publish-AttrCudaVisualCaptures')
+    $presentMonAnchor = '# CUDA-PERF-DISPLAY-IDENTITY-HARNESS-1/2/3 (sol BLOCKER 2 / fable HARDENING, direction corrected'
+    $text = Edit-DualVenueTemplate $text $presentMonAnchor ($visualOpen + "`n" + $visualFunctions + "`n" + @'
+# The app's post-measurement window capture: forwarded only when the staged binary's smoke help lists --visual-capture-dir (an older
+# build is never handed an option it would refuse). The probe never plays and runs before PresentMon starts.
+$visualCaptureDir = Join-Path $Work 'visual'
+$visualCaptureRecord = Test-AttrCudaVisualCaptureSupport -ExePath $exePath -TimeoutSec 20
+if ($visualCaptureRecord['forwarded']) {
+    [void](New-AttrCudaDirectory -Path $visualCaptureDir)
+    $cmd = Add-AttrCudaVisualCaptureArgument -Command $cmd -VisualCaptureDir $visualCaptureDir
+}
+Write-JobTrace "step visual-capture probe=$($visualCaptureRecord['probe']) forwarded=$($visualCaptureRecord['forwarded'])"
+'@ + "`n" + $visualClose + "`n" + $presentMonAnchor)
+    $reportLine = '$displayReport = Get-AttrCudaPresentMonDisplayReport -CsvPath $presentMonPath -ResultJson $resultJson -EarliestCaptureStartUtc $presentMonCaptureStartUtc -LatestCaptureStartUtc $presentMonPostSpawnUtc'
+    $text = Edit-DualVenueTemplate $text $reportLine ($visualOpen + "`n" + @'
+# The untimed capture tail (and its PrintWindow grabs and paused re-render) is cut off the PresentMon window: it ends where the tail began.
+$presentMonWindowResult = Get-AttrCudaPresentMonWindowResult -ResultJson $resultJson -Record $visualCaptureRecord -VisualCaptureDir $visualCaptureDir
+$displayReport = Get-AttrCudaPresentMonDisplayReport -CsvPath $presentMonPath -ResultJson $presentMonWindowResult -EarliestCaptureStartUtc $presentMonCaptureStartUtc -LatestCaptureStartUtc $presentMonPostSpawnUtc
+'@ + "`n" + $visualClose)
+    $publishAnchor = "# CUDA-PLAYBACK-CONTACT-SHEET-1: publish the raw per-frame PNG+JSON pairs the app's own"
+    $text = Edit-DualVenueTemplate $text $publishAnchor ($visualOpen + "`n" + @'
+[void](Publish-AttrCudaVisualCaptures -Record $visualCaptureRecord -SourceDir $visualCaptureDir -PubRoot $Pub)
+'@ + "`n" + $visualClose + "`n" + $publishAnchor)
 }
 
 # PLAYBACK-SCOPES-OPTION-1: a scope leg swaps the smoke command's ONE '-Scope none' for the named scope, on the expanded text and only when asked

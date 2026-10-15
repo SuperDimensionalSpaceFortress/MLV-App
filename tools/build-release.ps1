@@ -79,12 +79,18 @@ try {
         -RepoRoot $SourceRoot -Owner "qmake-release:$env:USERNAME" -FilePath "$QtBin\qmake.exe" `
         -WorkingDirectory $bd -ArgumentListBase64 $qmakeArgsBase64
     if ($LASTEXITCODE -ne 0) { throw "qmake failed ($LASTEXITCODE)" }
-    $makeArgsJson = ConvertTo-Json -InputObject @('-f', 'Makefile.Release', '-j8') -Compress
-    $makeArgsBase64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($makeArgsJson))
-    & pwsh.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$SourceRoot\tools\coordination\invoke-mlv-exclusive.ps1" `
-        -RepoRoot $SourceRoot -Owner "build-release:$env:USERNAME" -FilePath "$MingwBin\mingw32-make.exe" -WorkingDirectory $bd `
-        -ArgumentListBase64 $makeArgsBase64
-    if ($LASTEXITCODE -ne 0) { throw "make failed ($LASTEXITCODE)" }
+    # BUILD-GUARD-1: the compile runs under the host-global build gate (memory floor, one build slot,
+    # -j4 or -j2 beside another MinGW build) instead of a fixed job count; a refusal exits 3 (BUILD_MEM_REFUSED).
+    . (Join-Path $SourceRoot 'tools\coordination\build-guard.ps1') -Library
+    Invoke-BuildGuard -Label "build-release:$tag" -Action {
+        param($Jobs)
+        $makeArgsJson = ConvertTo-Json -InputObject @('-f', 'Makefile.Release', "-j$Jobs") -Compress
+        $makeArgsBase64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($makeArgsJson))
+        & pwsh.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$SourceRoot\tools\coordination\invoke-mlv-exclusive.ps1" `
+            -RepoRoot $SourceRoot -Owner "build-release:$env:USERNAME" -FilePath "$MingwBin\mingw32-make.exe" -WorkingDirectory $bd `
+            -ArgumentListBase64 $makeArgsBase64
+        if ($LASTEXITCODE -ne 0) { throw "make failed ($LASTEXITCODE)" }
+    }
 } finally { Pop-Location }
 $builtExe = Join-Path $bd "release\MLVApp.exe"
 if (-not (Test-Path $builtExe)) { throw "no exe produced" }

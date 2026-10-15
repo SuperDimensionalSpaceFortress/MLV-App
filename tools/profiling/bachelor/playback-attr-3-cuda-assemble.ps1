@@ -66,7 +66,9 @@ param(
     # ffmpegRuntimeDeployed=false rather than implying a payload that is not there.
     [string]$RuntimeDonorDir = '',
 
-    [int]$MakeJobs = 4,
+    # 0 = whatever tools/coordination/build-guard.ps1 chooses (-j4, or -j2 beside another MinGW build).
+    # A value above 0 can only lower that choice, never raise it.
+    [int]$MakeJobs = 0,
 
     # The launch probe constructs a real QApplication with a sanitized PATH, so a missing
     # deploy fails here instead of on the measurement host. -SkipLaunchProbe exists for hosts
@@ -223,12 +225,19 @@ $qmakeOutput | Set-Content -LiteralPath (Join-Path $logDir 'qmake.log') -Encodin
 if ($qmakeRc -ne 0) { Complete-Failed 13 'qmake' "qmake exit=$qmakeRc (see logs\qmake.log)" }
 $StepLog['qmake'] = 0
 
-Say "MAKE release -j$MakeJobs"
-# "-j$MakeJobs" is QUOTED on purpose: unquoted, PowerShell hands mingw32-make a bare `-j`
-# and the value separately, and make refuses with "the '-j' option requires a positive
-# integer argument" -- observed here, not theorised.
-$makeOutput = @(& $makeExe -C $buildReleaseDir -B release "-j$MakeJobs" 2>&1 | ForEach-Object { [string]$_ })
-$makeRc = $LASTEXITCODE
+# BUILD-GUARD-1: the compile runs under the host-global build gate (memory floor, one build slot,
+# job count); a refusal exits 3 with BUILD_MEM_REFUSED / BUILD_SLOT_BUSY before anything is built.
+. (Join-Path $PSScriptRoot '..\..\coordination\build-guard.ps1') -Library
+Invoke-BuildGuard -Label "attr3-assemble:$($names.shortSha)" -RequestedJobs $MakeJobs -Action {
+    param($Jobs)
+    $script:MakeJobs = $Jobs
+    Say "MAKE release -j$MakeJobs"
+    # "-j$MakeJobs" is QUOTED on purpose: unquoted, PowerShell hands mingw32-make a bare `-j`
+    # and the value separately, and make refuses with "the '-j' option requires a positive
+    # integer argument" -- observed here, not theorised.
+    $script:makeOutput = @(& $makeExe -C $buildReleaseDir -B release "-j$MakeJobs" 2>&1 | ForEach-Object { [string]$_ })
+    $script:makeRc = $LASTEXITCODE
+}
 $makeOutput | Set-Content -LiteralPath (Join-Path $logDir 'make.log') -Encoding UTF8
 if ($makeRc -ne 0) { Complete-Failed 15 'make' "mingw32-make exit=$makeRc (see logs\make.log)" }
 $StepLog['make'] = 0
