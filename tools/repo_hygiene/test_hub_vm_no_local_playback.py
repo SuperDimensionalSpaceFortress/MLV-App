@@ -111,6 +111,25 @@ def _lint_finding_counts(lint: Path, texts: list[str], work: Path, tag: str) -> 
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
 
+def _lint_word_lists(lint: Path, work: Path) -> dict[str, list[str]]:
+    """The closed word lists the lint's exemptions depend on, read from the lint itself (Get-LocalPlaybackLintWordLists)."""
+    probe = work / "lists-probe.ps1"
+    _write_probe(probe, ". " + _psq(lint) + "\nConvertTo-Json -InputObject (Get-LocalPlaybackLintWordLists) -Compress -Depth 4\n")
+    done = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(probe)], capture_output=True, text=True, timeout=120)
+    if done.returncode != 0 or not done.stdout.strip():
+        raise AssertionError(f"the lint exposes no word lists (Get-LocalPlaybackLintWordLists): {(done.stderr or done.stdout).strip()[:300]}")
+    return {k: [str(x) for x in v] for k, v in json.loads(done.stdout.strip()).items()}
+
+
+def _batch_counts(lint: Path, texts: list[str], work: Path, tag: str) -> list[int]:
+    """Finding count of every text under `lint`, in ONE pwsh process (a text per line)."""
+    proc = _lint_finding_counts(lint, texts, work, tag)
+    try:
+        return _collect_counts(proc, len(texts))
+    finally:
+        _kill(proc)
+
+
 def _kill(proc: "subprocess.Popen") -> None:
     """Stop a probe that is still running and reap it (no orphaned pwsh after a timeout or an earlier failure)."""
     if proc.poll() is None:
@@ -135,8 +154,86 @@ def _collect_counts(proc: "subprocess.Popen", expected: int) -> list[int]:
     return counts
 
 
-def _differential_corpus(seeds: tuple[str, ...]) -> dict[str, dict]:
-    """text -> the fields it was built from: launch verb x playback word x local/host/here marker x venue word x negator / contrast word x joiner."""
+# LIST-MEMBER DEFEATERS (r5; ruling candidate mlv-safety-lint-exemption-defeater-corpus-r1 WITH the CoS amendment: one defeater row per
+# member of EVERY closed word list an exemption depends on). The lists are read from the lint (Get-LocalPlaybackLintWordLists), so a
+# word added to one is probed by construction -- nobody has to remember a row for it.
+#
+# Why each member of the lint's locus-preserving follow set keeps the venue as the PLACE the work runs. A member that is not named here
+# fails test_every_follow_member_is_documented_locus_preserving: widening the set takes a reason, in review.
+LOCUS_FOLLOW_REASONS = {
+    "on": "a second routing preposition: 'on Bachelor on the venue chain' is still a venue",
+    "via": "a second routing preposition",
+    "through": "a second routing preposition ('on Bachelor through the venue chain')",
+    "using": "a second routing preposition",
+    "at": "a second routing preposition",
+    "and": "coordinator; the clause ends here and the next clause is judged for a local host",
+    "or": "coordinator; the clause ends here and the next clause is judged for a local host",
+    "but": "coordinator; the clause ends here and the next clause is judged for a local host",
+    "then": "sequencer; the clause ends here and the next clause is judged for a local host",
+}
+# Words that turn the venue into a tool, a source or a producer ("using Bachelor to fetch ...", "using Bachelor for the clip") or open a
+# relative / purpose / manner complement. None is in the follow set; each must END the exemption. Words that are clause cuts of their own
+# (when, after, because, ...) are judged by clause scope, not by this list.
+REJECTED_FOLLOW_POOL = (
+    "to", "for", "as", "that", "which", "with", "from", "so", "only", "also", "too", "just", "in", "by", "than", "where", "since", "if",
+    "of", "into", "onto", "over", "under", "per", "against", "between", "within", "like", "including", "plus", "along", "alongside",
+    "versus", "vs",
+)
+# Contexts a host reference is probed in. The defeater reads the reference itself, so a context must never be what makes a row refuse:
+# every row is carried by `and` (a locus-preserving coordinator) or sits in the venue's own clause.
+HOST_REF_PREPOSITIONS = ("on", "to", "onto", "into", "from", "at")
+
+
+def _list_member_rows(lists: dict[str, list[str]]) -> list[tuple[str, bool, str]]:
+    """(group, must_refuse, text) -- one row per member of every closed list the lint's exemptions depend on."""
+    rows: dict[str, tuple[str, bool]] = {}
+
+    def add(group: str, refuse: bool, text: str) -> None:
+        rows.setdefault(text, (group, refuse))
+
+    follow = lists["VenueFollowLocus"]
+    for w in follow:
+        add("follow-member-then-host", True, f"Run playback locally on Bachelor {w} this host.")
+    for phrase in lists["VenueFollowPhrases"]:
+        add("follow-phrase-control", False, f"Run playback locally on Bachelor {phrase}.")
+        add("follow-phrase-then-host", True, f"Run playback locally on Bachelor {phrase} on this host.")
+        add("follow-phrase-then-backreference", True, f"Run playback locally on Bachelor {phrase}, then run it here.")
+    for w in REJECTED_FOLLOW_POOL:
+        if w in follow:
+            continue
+        add("rejected-follow-word", True, f"Run playback locally using Bachelor {w} the clip.")
+        add("rejected-follow-word-after-comma", True, f"Run playback locally using Bachelor, {w} the clip.")
+    for det in lists["HostDeterminers"]:
+        for noun in lists["HostNouns"]:
+            add("host-reference-bare", True, f"Run playback locally on Bachelor and {det} {noun}.")
+            add("host-reference-possessive", True, f"Run playback locally on Bachelor and {det} {noun}'s copy.")
+            add("host-reference-same-clause", True, f"Run playback locally on Bachelor on {det} {noun}.")
+            for prep in HOST_REF_PREPOSITIONS:
+                add("host-reference-prep-det-noun", True, f"Run playback locally on Bachelor and {prep} {det} {noun}.")
+    for name in lists["HostNames"]:
+        add("host-name", True, f"Run playback locally on Bachelor and {name}.")
+        add("host-name-same-clause", True, f"Run playback locally on Bachelor on {name}.")
+    for w in lists["BackReferences"]:
+        add("back-reference-follow-up", True, f"Run playback locally on Bachelor, then run {w} here.")
+    for p in lists["RoutingPrepositionsLocally"]:
+        add("e1-preposition-possessive", True, f"Run playback locally {p} Bachelor's clip.")
+        add("e1-preposition-purpose", True, f"Run playback locally {p} Bachelor to fetch the clip.")
+        add("e1-preposition-control", False, f"Run playback locally {p} Bachelor.")
+    for p in lists["RoutingPrepositionsVenue"]:
+        add("e3-preposition-then-host", True, f"Run playback {p} Bachelor on this host.")
+        add("e3-preposition-possessive-then-host", True, f"Run playback {p} Bachelor's clip on this host.")
+    for w in lists["VenueWords"]:
+        add("venue-word-control", False, f"Run playback locally on {w}.")
+        add("venue-word-then-host", True, f"Run playback locally on {w} on this host.")
+        add("venue-word-possessive", True, f"Run playback locally on {w}'s clip.")
+    for c in list(lists["ContrastWords"]) + ["not"]:
+        add("contrast-word-then-local-host", True, f"Run playback on Bachelor {c} locally, then here.")
+    return [(g, r, t) for t, (g, r) in rows.items()]
+
+
+def _differential_corpus(seeds: tuple[str, ...], members: tuple = ()) -> dict[str, dict]:
+    """text -> the fields it was built from: launch verb x playback word x local/host/here marker x venue word x negator / contrast word x joiner.
+    `members` are the (group, must_refuse, text) list-member rows (r5); they join the corpus as tpl="list-member"."""
     rows: dict[str, dict] = {}
 
     def add(text: str, **fields) -> None:
@@ -199,6 +296,8 @@ def _differential_corpus(seeds: tuple[str, ...]) -> dict[str, dict]:
                 add(f"{v} {pb} {m} {ven}{tail}.", tpl="defeater-trailing-host", M=m, V=ven, T=tail)
     for text in seeds:
         add(text, tpl="seed")
+    for group, refuse, text in members:
+        add(text, tpl="list-member", G=group, R=refuse)
     return rows
 
 
@@ -221,7 +320,8 @@ def _differential_flips(work: Path, baseline_text: str | None = None) -> tuple[s
     baseline = work / "baseline-lint.ps1"
     baseline.write_text(text, encoding="utf-8")
     corpus = _differential_corpus(PromptLintTests.CLAUSE_MUST_REFUSE + PromptLintTests.CLAUSE_MUST_PASS + PromptLintTests.PROBE_ROWS
-                                  + tuple(text for _, _, text in PromptLintTests.DEFEATER_AXIS) + PromptLintTests.DEFEATER_AXIS_CONTROLS)
+                                  + tuple(text for _, _, text in PromptLintTests.DEFEATER_AXIS) + PromptLintTests.DEFEATER_AXIS_CONTROLS,
+                                  members=tuple(_list_member_rows(_lint_word_lists(LINT_PS1, work))))
     texts = list(corpus)
     procs: list = []
     try:
@@ -490,6 +590,22 @@ class PromptLintTests(unittest.TestCase):
         "Launch MLVApp locally on the Bachelor clip.",
         "Run playback locally using the venue chain output.",
         "Run playback locally on Bachelor, on this host.",
+        # r5 (CoS review of PR #448 r4 head c8d5220a, pr-448.md on bus 6cb7a0f6): master refused every row and r4 passed them. The venue
+        # follow set let an instrument / purpose complement (to, for, as, that, with, so, from, only ...) follow the venue name, and the
+        # host defeater only knew `on this host` / `here`. The first row is the 2026-10-11 incident shape almost word for word.
+        "Run playback locally using the venue chain to copy the clip to this host.",
+        "Run playback locally using the venue chain to fetch the clip.",
+        "Run the arms locally using Bachelor as the clip source.",
+        "Run playback locally using Bachelor for the clip.",
+        "Run playback locally using Bachelor only for the clip copy.",
+        "Run playback locally using the venue chain that produced the clip.",
+        "Run playback locally using Bachelor so the hub has the clip.",
+        "Run playback locally using Bachelor and the hub copy.",
+        "Run playback locally using Bachelor with this host's copy.",
+        "Run playback locally via Bachelor to this host.",
+        "Run the arms locally using Bachelor from this host.",
+        "Run playback locally on Bachelor on my machine.",
+        "Run playback locally on Bachelor, then run it here.",
     )
     CLAUSE_MUST_PASS = (
         "Run playback locally on Bachelor through the venue chain.",
@@ -619,6 +735,105 @@ class PromptLintTests(unittest.TestCase):
 
 
 @requires_pwsh
+class ListMemberDefeaterTests(unittest.TestCase):
+    """r5 (CoS prevention note on PR #448 r4, ruling candidate mlv-safety-lint-exemption-defeater-corpus-r1 WITH the CoS amendment).
+
+    r1b, r2, r3 and r4 each passed their own pins and broke on an outside probe, four times, because the pins sampled the SHAPES somebody
+    thought of while the exemption depended on a closed WORD LIST nobody probed member by member (r4: a follow set that let `to`, `for`,
+    `as`, `that`, `with`, `so` through; a host marker only ever probed as `on this host`). This class reads every such list from the lint
+    and generates one row per member -- so an unprobed member cannot exist, and a word added to a list is tested by construction."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = Path(tempfile.mkdtemp(prefix="hubvm-members-"))
+        cls.lists = _lint_word_lists(LINT_PS1, cls.tmp)
+        cls.rows = _list_member_rows(cls.lists)
+        counts = _batch_counts(LINT_PS1, [t for _, _, t in cls.rows], cls.tmp, "members")
+        cls.verdicts = {t: c for (_, _, t), c in zip(cls.rows, counts)}
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def test_the_lint_exposes_every_list_the_exemptions_depend_on(self):
+        for key in ("VenueWords", "RoutingPrepositionsLocally", "RoutingPrepositionsVenue", "VenueFollowLocus", "VenueFollowPhrases",
+                    "HostDeterminers", "HostNouns", "HostNames", "BackReferences", "ContrastWords"):
+            self.assertTrue(self.lists.get(key), f"list {key} is missing or empty")
+
+    def test_the_lint_builds_its_patterns_from_those_lists(self):
+        """The exposed lists must be the lists the lint USES, not a second copy that can drift: the findings function reads them, and the
+        literal alternation they replaced is gone."""
+        text = LINT_PS1.read_text(encoding="utf-8")
+        body = text[text.index("function Get-LocalPlaybackPromptFindings"):]
+        self.assertIn("Get-LocalPlaybackLintWordLists", body)
+        for key in ("VenueFollowLocus", "VenueFollowPhrases", "HostDeterminers", "HostNouns", "HostNames", "BackReferences", "ContrastWords",
+                    "RoutingPrepositionsLocally", "RoutingPrepositionsVenue", "VenueWords"):
+            self.assertIn(f"$lists.{key}", body, f"the findings function does not read list {key}")
+        self.assertNotRegex(body, r"\$venueFollow\s*=\s*'", "a literal follow alternation came back")
+
+    def test_every_follow_member_is_documented_locus_preserving(self):
+        undocumented = [w for w in self.lists["VenueFollowLocus"] if w not in LOCUS_FOLLOW_REASONS]
+        self.assertEqual([], undocumented, "a word was added to the venue follow set with no documented reason (LOCUS_FOLLOW_REASONS)")
+        for w in self.lists["VenueFollowLocus"]:
+            self.assertTrue(LOCUS_FOLLOW_REASONS[w].strip(), w)
+        # an instrument / purpose / source complement may never be in the set
+        self.assertEqual([], [w for w in REJECTED_FOLLOW_POOL if w in self.lists["VenueFollowLocus"]])
+        for w in ("to", "for", "as", "that", "which", "with", "so", "only", "from"):
+            self.assertNotIn(w, self.lists["VenueFollowLocus"])
+
+    def test_the_row_set_is_not_hollow(self):
+        groups = {g for g, _, _ in self.rows}
+        for g in ("follow-member-then-host", "rejected-follow-word", "rejected-follow-word-after-comma", "host-reference-bare",
+                  "host-reference-possessive", "host-reference-same-clause", "host-reference-prep-det-noun", "host-name",
+                  "back-reference-follow-up", "e1-preposition-possessive", "e3-preposition-then-host", "venue-word-control",
+                  "venue-word-then-host", "venue-word-possessive", "contrast-word-then-local-host"):
+            self.assertIn(g, groups, f"no rows generated for {g}")
+        # preposition x determiner x noun is the full product, not a sample
+        product = len(HOST_REF_PREPOSITIONS) * len(self.lists["HostDeterminers"]) * len(self.lists["HostNouns"])
+        self.assertGreaterEqual(sum(1 for g, _, _ in self.rows if g == "host-reference-prep-det-noun"), product)
+
+    def _group(self, group: str, refuse: bool) -> None:
+        rows = [t for g, r, t in self.rows if g == group]
+        self.assertTrue(rows, f"no rows in {group}")
+        wrong = [t for t in rows if (self.verdicts[t] > 0) != refuse]
+        self.assertEqual([], wrong, f"{group}: rows the lint {'passed' if refuse else 'refused'} that it must {'refuse' if refuse else 'pass'}")
+
+    def test_red_every_follow_member_still_defeated_by_a_host(self):
+        self._group("follow-member-then-host", True)
+        self._group("follow-phrase-then-host", True)
+        self._group("follow-phrase-then-backreference", True)
+
+    def test_red_every_rejected_follow_word_ends_the_exemption(self):
+        self._group("rejected-follow-word", True)
+        self._group("rejected-follow-word-after-comma", True)
+
+    def test_red_every_host_reference_defeats(self):
+        for g in ("host-reference-bare", "host-reference-possessive", "host-reference-same-clause", "host-reference-prep-det-noun",
+                  "host-name", "host-name-same-clause"):
+            self._group(g, True)
+
+    def test_red_every_back_reference_follow_up_defeats(self):
+        self._group("back-reference-follow-up", True)
+
+    def test_red_every_routing_preposition_needs_a_locus(self):
+        for g in ("e1-preposition-possessive", "e1-preposition-purpose", "e3-preposition-then-host", "e3-preposition-possessive-then-host"):
+            self._group(g, True)
+
+    def test_red_every_venue_word_is_a_locus_only_as_itself(self):
+        self._group("venue-word-then-host", True)
+        self._group("venue-word-possessive", True)
+
+    def test_red_every_contrast_word_keeps_a_trailing_local_host_defeated(self):
+        self._group("contrast-word-then-local-host", True)
+
+    def test_green_the_members_still_exempt_what_they_are_for(self):
+        """The narrowed lists must not be dead: every venue word and every routing preposition still passes in its plain form."""
+        self._group("venue-word-control", False)
+        self._group("e1-preposition-control", False)
+        self._group("follow-phrase-control", False)
+
+
+@requires_pwsh
 class LintDifferentialPinTests(unittest.TestCase):
     """HUB-VM-LINT-CLAUSE-SCOPE-1 r2 (CoS prevention note). A catalogue only proves the rows somebody thought of; r1b added an exemption
     (a venue word read before `locally`) that silently opened five wordings the baseline refused. This runs the baseline lint (the lint at
@@ -641,6 +856,16 @@ class LintDifferentialPinTests(unittest.TestCase):
          or text in ("Run playback locally on Bachelor through the venue chain.", "Run playback locally using Bachelor."),
          "E1, Sol review of #401: `locally` immediately followed by a routing preposition and a venue word ('Run playback locally on "
          "Bachelor', 'locally through the venue chain') names the venue the work runs on, so it is not a local launch."),
+        ("E1-per-member-plain-forms",
+         lambda text, f: f.get("tpl") == "list-member" and f.get("G") in ("e1-preposition-control", "venue-word-control"),
+         "r5, ListMemberDefeaterTests: the plain E1 form of every member of RoutingPrepositionsLocally and VenueWords ('Run playback "
+         "locally via Bachelor.', '... on ultra-magnus.') -- the same E1 shape as the entry above, one row per list member, nothing "
+         "after the venue name."),
+        ("E1-locally-on-a-venue-from-here",
+         lambda text, f: f.get("tpl") == "list-member" and f.get("G") == "follow-phrase-control",
+         "r4 design note (CoS), listed in r5: 'Run playback locally on Bachelor from here.' -- `from here` says where a venue job is "
+         "STARTED from, not where it runs, so it is a locus-preserving phrase (VenueFollowPhrases). Every defeater of it is refused: "
+         "'... from here on this host', '... from here, then run it here' (follow-phrase rows)."),
         ("E2-marker-negated-by-the-contrast-word-before-it",
          lambda text, f: f.get("tpl") == "venue-contrast-marker" and f.get("M") == "locally",
          "E2, r1b/r2: 'Run playback on Bachelor rather than / instead of / without / nor / , not locally' -- the marker is the first "
@@ -656,8 +881,9 @@ class LintDifferentialPinTests(unittest.TestCase):
          "baseline's sentence-wide exemption passed 'Do not run the venue chain, run playback locally', 'Run playback on Bachelor and on "
          "this host', 'Run playback locally, never on Bachelor' and the like."),
         ("venue-and-local-host-in-one-clause",
-         lambda text, f: f.get("tpl") in ("marker-then-venue", "venue-then-marker", "defeater-trailing-host")
-         and f.get("M") in ("on this host", "here"),
+         lambda text, f: (f.get("tpl") in ("marker-then-venue", "venue-then-marker", "defeater-trailing-host")
+                          and f.get("M") in ("on this host", "here"))
+         or (f.get("tpl") == "list-member" and f.get("G") in ("e3-preposition-then-host", "e3-preposition-possessive-then-host")),
          "r4, CoS review of #448 r3: a clause that names both a venue and the local host ('Run playback on Bachelor on this host', "
          "'... through the venue chain here') is refused; a venue qualification never exempts a clause that also holds a local-host "
          "marker (a defeater). The baseline exempted the host / here marker on any venue word in the sentence."),
@@ -665,6 +891,11 @@ class LintDifferentialPinTests(unittest.TestCase):
          lambda text, f: f.get("tpl") in ("defeater-possessive", "defeater-attributive") and f.get("M") in ("on this host", "here"),
          "r4: 'on Bachelor's clip', 'through the venue chain output' -- the venue word is a possessive or an attributive noun, not where "
          "the work runs, so it is no routing phrase; the baseline passed the host / here marker on any venue word in the sentence."),
+        ("contrast-word-then-local-host-per-member",
+         lambda text, f: f.get("tpl") == "list-member" and f.get("G") == "contrast-word-then-local-host",
+         "r4 'also closed' class, one row per member of ContrastWords (r5): 'Run playback on Bachelor rather than locally, then here.' -- "
+         "a `here` clause after an E2 complement is a local-host marker and defeats the exemption. The baseline passed the `not` member "
+         "through its sentence-wide weak-negation exemption."),
         ("defeater-axis-seeds",
          lambda text, f: f.get("tpl") == "seed" and text in tuple(t for _, _, t in PromptLintTests.DEFEATER_AXIS),
          "r4: the defeater-axis rows (PromptLintTests.DEFEATER_AXIS) are refused by construction; the E3 / host rows of them were "

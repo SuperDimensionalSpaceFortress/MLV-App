@@ -40,6 +40,14 @@
 # a bare "here" that is not "from here") in the same clause, or in the verbless clauses coordinated after it, DEFEATS E1, E2 and E3: a
 # clause that names both a venue and the local host is refused ("locally on Bachelor, on this host"). Every shape has defeater rows in
 # DEFEATER_AXIS (tools/repo_hygiene/test_hub_vm_no_local_playback.py); a new shape is admitted only with its defeater rows.
+# Closed lists (r5). What may follow the venue name is a LOCUS-PRESERVING word only (another routing preposition or a coordinator, or the
+# phrase "from here"): never a purpose / instrument / source complement (to, for, as, that, which, with, so, only, from ...), which makes
+# the venue a tool, a source or a producer ("using Bachelor to copy the clip to this host", "using the venue chain that produced the clip").
+# A comma continues the clause and what follows it must again be the end or such a word. A defeater is ANY reference to the local machine
+# ("<this|the|my|your|our|that|local> <hub|host|vm|machine|box|...>" in any context, localhost, virtual-ten, a bare here), and it reaches on
+# into a later clause that has a launch verb when that clause refers back to the playback ("then run it here"). Every word list lives in
+# Get-LocalPlaybackLintWordLists, and ListMemberDefeaterTests generates one defeater row PER MEMBER of each, so a word added to a list is
+# tested by construction (ruling candidate mlv-safety-lint-exemption-defeater-corpus-r1 with the CoS amendment).
 # Rules 3, 3b and 4 keep master's weak-negation exemption (not / no / without in the marker's clause, narrowed from the whole sentence to
 # the clause), so they refuse at least what master refuses. Anything that is not E1 / E2 / E3 / a prohibition keeps master's verdict.
 # A contrast word still CUTS the sentence (the head clause is judged without its complement) and the complement ends at its next comma; the
@@ -169,24 +177,27 @@ function Test-ContrastLead {
 # E1: "locally" immediately followed by a routing preposition and a venue LOCUS (a venue word that is where the work runs, see
 # $venueLocus in Get-LocalPlaybackPromptFindings), all inside the marker's own clause.
 function Test-VenueRoutedLocally {
-    param([string]$Sentence, [object]$Clause, [int]$Index, [string]$VenueLocus)
+    param([string]$Sentence, [object]$Clause, [int]$Index, [string]$VenueLocus, [string]$Prepositions)
     if ($Index -lt $Clause.Start -or $Index -ge $Clause.End) { return $false }
     $tail = $Sentence.Substring($Index, $Clause.End - $Index)
-    return [bool]($tail -match "(?i)^locally\s+(?:on|via|through|using)\s+(?:(?:the|a|an)\s+)?${VenueLocus}")
+    return [bool]($tail -match "(?i)^locally\s+(?:${Prepositions})\s+(?:(?:the|a|an)\s+)?${VenueLocus}")
 }
 
-# Defeater (r4): a local-host marker -- "on this host" / "on the hub (VM)" or a bare "here" that is not "from here" -- in the clause, or in the
-# verbless clauses coordinated right after it, that is not itself negated or the first thing of a contrast complement. A venue qualification
-# never exempts a clause that also names the local host.
+# Defeater (r4, widened r5): a local-host reference in the clause, or in the clauses coordinated right after it, that is not itself negated or
+# the first thing of a contrast complement. A venue qualification never exempts a clause that also names the local host. $HostPatterns are
+# the reference patterns (the marker, a determiner + host noun in ANY context, a host name, a bare "here" that is not "from here").
+# The scan runs on through a later clause that has a launch verb only when that clause refers back to the playback ("then run it here"):
+# a verbless clause ("... and the hub copy") is scanned as before, any other verb clause ends the scan.
 function Test-LocalHostInScope {
-    param([string]$Sentence, [object[]]$Clauses, [object]$Clause, [string]$HostMarker, [string]$HereMarker)
+    param([string]$Sentence, [object[]]$Clauses, [object]$Clause, [string[]]$HostPatterns, [string]$BackReference, [string]$PlaybackWord)
     $started = $false
     foreach ($k in $Clauses) {
         if (-not $started) {
             if ([object]::ReferenceEquals($k, $Clause)) { $started = $true } else { continue }
         }
-        elseif ($k.HasVerb -or $k.Contrast -or $k.Strong -or $k.Weak) { break }
-        foreach ($pattern in @($HostMarker, $HereMarker)) {
+        elseif ($k.Contrast -or $k.Strong -or $k.Weak) { break }
+        elseif ($k.HasVerb -and -not (($k.Text -match $BackReference) -or ($k.Text -match $PlaybackWord))) { break }
+        foreach ($pattern in $HostPatterns) {
             foreach ($m in [regex]::Matches($k.Text, $pattern)) {
                 if (-not (Test-ContrastLead -Sentence $Sentence -Clause $k -Index ($k.Start + $m.Index))) { return $true }
             }
@@ -195,11 +206,44 @@ function Test-LocalHostInScope {
     return $false
 }
 
-# A clause is venue-qualified (E3) only when no local-host marker defeats it.
+# A clause is venue-qualified (E3) only when no local-host reference defeats it.
 function Test-VenueExempts {
-    param([string]$Sentence, [object[]]$Clauses, [object]$Clause, [string]$HostMarker, [string]$HereMarker)
+    param([string]$Sentence, [object[]]$Clauses, [object]$Clause, [string[]]$HostPatterns, [string]$BackReference, [string]$PlaybackWord)
     if (-not $Clause.Venue) { return $false }
-    return -not (Test-LocalHostInScope -Sentence $Sentence -Clauses $Clauses -Clause $Clause -HostMarker $HostMarker -HereMarker $HereMarker)
+    return -not (Test-LocalHostInScope -Sentence $Sentence -Clauses $Clauses -Clause $Clause -HostPatterns $HostPatterns -BackReference $BackReference -PlaybackWord $PlaybackWord)
+}
+
+# The CLOSED word lists the exemptions depend on (r5). Every pattern in Get-LocalPlaybackPromptFindings is built from these lists, and
+# tools/repo_hygiene/test_hub_vm_no_local_playback.py (ListMemberDefeaterTests) reads them back and generates one defeater row PER MEMBER,
+# so a word added here is tested by construction. A word joins VenueFollowLocus only with a reason in LOCUS_FOLLOW_REASONS there.
+#   VenueWords                  what names a venue.
+#   RoutingPrepositionsLocally  the preposition that must follow `locally` for E1.   RoutingPrepositionsVenue  the prepositions of an E3 routing phrase.
+#   VenueFollowLocus            what may follow the venue name and still leave it the PLACE the work runs: another routing preposition or a
+#                               coordinator. Never a purpose / instrument / source complement (to for as that which with so only from ...).
+#   VenueFollowPhrases          the same, as a phrase: "from here" says where a venue job is started from, not where it runs.
+#   HostDeterminers / HostNouns / HostNames   a reference to the local machine, in ANY context: "<determiner> <noun>" or a name.
+#   BackReferences              a follow-up clause that names the local host and refers back to the playback defeats the earlier exemption.
+#   ContrastWords               the words that open a contrast complement (E2).
+function Get-LocalPlaybackLintWordLists {
+    return [ordered]@{
+        VenueWords                 = @('venue', 'venues', 'bachelor', 'ultra-magnus', 'um-run', 'Invoke-VenueChain', 'Invoke-VenueLeg', 'Invoke-VenueChain.ps1', 'Invoke-VenueLeg.ps1', 'chain runner')
+        RoutingPrepositionsLocally = @('on', 'via', 'through', 'using')
+        RoutingPrepositionsVenue   = @('on', 'via', 'through', 'using', 'at')
+        VenueFollowLocus           = @('on', 'via', 'through', 'using', 'at', 'and', 'or', 'but', 'then')
+        VenueFollowPhrases         = @('from here')
+        HostDeterminers            = @('this', 'the', 'my', 'your', 'our', 'that', 'local')
+        HostNouns                  = @('hub vm', 'hub host', 'hub', 'host', 'vm', 'machine', 'box', 'workstation', 'computer', 'pc', 'desktop', 'laptop')
+        HostNames                  = @('localhost', 'virtual-ten')
+        BackReferences             = @('it', 'them', 'that', 'those', 'the same', 'again')
+        ContrastWords              = @('instead of', 'rather than', 'without', 'nor', 'skip', 'skips', 'skipping', 'bypass', 'bypasses', 'bypassing')
+    }
+}
+
+# A regex alternation of literal words, longest first, a space in a word matching any run of white space.
+function ConvertTo-LintAlternation {
+    param([string[]]$Words)
+    $sorted = @($Words | Sort-Object -Property @{ Expression = { $_.Length }; Descending = $true })
+    return (($sorted | ForEach-Object { [regex]::Escape($_).Replace('\ ', '\s+') }) -join '|')
 }
 
 function Get-LocalPlaybackPromptFindings {
@@ -212,19 +256,25 @@ function Get-LocalPlaybackPromptFindings {
     $b = '(?<![\w\-])'; $e = '(?![\w\-])'
     $strongNeg = "(?i)${b}(never|do not|don't|must not|mustn't|may not|no local|not locally|forbidden|forbids|refuse[sd]?|refusal|prohibit\w*|instead of running|rather than running|without running)${e}"
     $weakNeg = "(?i)${b}(not|no|without)${e}"
-    $venueWords = 'venue|venues|bachelor|ultra-magnus|um-run|Invoke-Venue(?:Chain|Leg)(?:\.ps1)?|chain runner'
-    # A venue LOCUS (r4): the routing preposition's object is the venue itself, so what follows the venue name can only be the end of the
-    # clause, punctuation, or a function word (a preposition / conjunction). A possessive ("Bachelor's clip") or a noun ("the Bachelor clip",
-    # "the venue chain output") makes the venue an attribute of something else, which says nothing about where the work runs. The follow set
-    # is closed and fails closed: an unknown word after the venue name is not a locus.
+    $lists = Get-LocalPlaybackLintWordLists
+    $venueWords = ConvertTo-LintAlternation -Words @($lists.VenueWords)
+    # A venue LOCUS (r4, narrowed r5): the routing preposition's object is the venue itself, so what follows the venue name can only be the
+    # end of the clause (or of the sentence), or a LOCUS-PRESERVING word -- another routing preposition or a coordinator, never a purpose,
+    # instrument or source complement ("to fetch", "for the clip", "as the clip source", "that produced it", "with this host's copy",
+    # "so the hub has it", "from this host" all make the venue a tool, a source or a producer). A possessive ("Bachelor's clip") or a noun
+    # ("the Bachelor clip", "the venue chain output") makes the venue an attribute of something else. Punctuation continues the clause: what
+    # follows it must again be the end or a locus-preserving word ("on Bachelor, which holds the clip" is not a locus). The sets are
+    # closed and fail closed: an unknown word after the venue name is not a locus.
     $venueName = "(?:${venueWords})(?:\s+(?:chain|chains|runner|job|jobs|leg|legs|lane))*"
-    $venueFollow = 'on|via|through|using|at|in|for|with|from|to|by|and|or|but|then|so|rather|instead|not|nor|never|only|also|too|just|when|while|after|before|once|until|if|because|since|as|than|where|which|that'
-    $venueEnd = "(?=\s*(?:\z|[,;:!?)\]`"]|\.(?:\s|\z))|\s+(?:${venueFollow})(?![\w\-']))"
+    $venueFollow = (ConvertTo-LintAlternation -Words @($lists.VenueFollowLocus)) + '|' + (ConvertTo-LintAlternation -Words @($lists.VenueFollowPhrases))
+    $venueEnd = "(?=\s*(?:\z|[.!?](?:\s|\z)|[,;:)\]`"]\s*(?:\z|[.!?](?:\s|\z)|(?:${venueFollow})(?![\w\-'])))|\s+(?:${venueFollow})(?![\w\-']))"
     $venueLocus = "${venueName}${venueEnd}"
+    $routingLocally = ConvertTo-LintAlternation -Words @($lists.RoutingPrepositionsLocally)
+    $routingVenue = ConvertTo-LintAlternation -Words @($lists.RoutingPrepositionsVenue)
     # E3: a venue word counts only inside a routing phrase ("on Bachelor", "through the venue chain", "via the chain runner") whose object is
     # a venue locus; "since Bachelor is busy", "to avoid the venue chain", "with no venue job" and "using Bachelor's clip" name a venue
     # without routing anything to it.
-    $venueQualified = "(?i)${b}(?:on|via|through|using|at)\s+(?:(?:the|a|an)\s+)?${venueLocus}"
+    $venueQualified = "(?i)${b}(?:${routingVenue})\s+(?:(?:the|a|an)\s+)?${venueLocus}"
     $verbs = 'run|runs|running|launch|launches|launching|launched|start|starts|starting|execute|executes|executing|invoke|invokes|invoking|drive|drives|driving|kick off|play|plays|playing|open|opens|opening'
     $launchVerb = "(?i)${b}(${verbs})${e}"
     $playbackWord = "(?i)(${b}playback${e}|gui-smoke|profile-playback|${b}MLVApp(Release)?(\.exe)?${e}|smoke run|${b}exactness${e}|${b}arms?${e}|${b}GUI${e})"
@@ -233,13 +283,23 @@ function Get-LocalPlaybackPromptFindings {
     $separator = "(?i),\s*(?:(?:then|and|just|also|please|so)\s+)?(?=(?:${verbs}|use|using|do)${e})|${b}(and then|then|and|or|but|after|before|once|when|whenever|while|until|because|otherwise|unless|except|although|though|whereas)${e}|\s-{1,2}\s"
     # Contrast words: the complement after one is negated and never routes. A bare "not" counts unless an auxiliary holds it ("do not", "is not").
     $auxiliary = 'do|does|did|must|may|can|could|should|would|will|shall|is|are|was|were|has|have|had|need|to|if|whether'
-    $contrast = "(?i),\s*(?:not|never)${e}|(?:,\s*)?${b}(?:instead of|rather than|without|nor|skips?|skipping|bypass(?:es|ing)?)${e}|(?<!${b}(?:${auxiliary})\s+)${b}not${e}"
+    $contrastWords = ConvertTo-LintAlternation -Words @($lists.ContrastWords)
+    $contrast = "(?i),\s*(?:not|never)${e}|(?:,\s*)?${b}(?:${contrastWords})${e}|(?<!${b}(?:${auxiliary})\s+)${b}not${e}"
     $incident = '(?i)(?<![\w\-"''`])where\s+an?\s+(gui|desktop|display)(\s+desktop)?\s+session' + $e + '[^.\n]{0,100}' + $b + 'exists?' + $e
     $localMarker = "(?i)${b}locally${e}"
     $hostMarker = "(?i)${b}on\s+(this|the)\s+(hub|host|vm|machine|box)${e}|${b}on\s+virtual-ten${e}"
     $hereMarker = "(?i)${b}here(?![\w\-'])"
     # "from here" says where a venue job is started from, not where it runs; only the defeater skips it (rule 3b still reads it).
     $hereDefeater = "(?i)(?<!${b}from\s+)${b}here(?![\w\-'])"
+    # r5: ANY reference to the local machine defeats a venue exemption, not only "on this host": "<determiner> <noun>" in any context
+    # (to this host, from the hub, my machine, this host's copy, the hub copy) or a host name (localhost, virtual-ten). It is a DEFEATER only;
+    # the rule-3 trigger stays $hostMarker, so a launcher line that merely mentions "the hub" is not newly refused.
+    $hostDeterminer = ConvertTo-LintAlternation -Words @($lists.HostDeterminers)
+    $hostNoun = ConvertTo-LintAlternation -Words @($lists.HostNouns)
+    $hostName = ConvertTo-LintAlternation -Words @($lists.HostNames)
+    $hostRef = "(?i)${b}(?:${hostDeterminer})\s+(?:${hostNoun})(?![\w\-])|${b}(?:${hostName})(?![\w\-])"
+    $backReference = "(?i)${b}(?:" + (ConvertTo-LintAlternation -Words @($lists.BackReferences)) + ")${e}"
+    $hostDefeaters = @($hostMarker, $hostRef, $hereDefeater)
     $direct = @(
         "(?i)${b}MLVApp(Release)?\.exe\s+(?:(?!/\s)\S+\s+){0,12}--(gui-smoke-playback|profile-playback)",
         "(?i)(pwsh|powershell)(\.exe)?${e}[^\n]{0,80}-File\s+\S*$scripts",
@@ -265,9 +325,9 @@ function Get-LocalPlaybackPromptFindings {
                     $c = Get-ClauseAt -Clauses $clauses -Index $m.Index
                     if ($c.Strong) { continue }
                     if ((Test-ContrastLead -Sentence $s -Clause $c -Index $m.Index) -and
-                        -not (Test-LocalHostInScope -Sentence $s -Clauses $clauses -Clause $c -HostMarker $hostMarker -HereMarker $hereDefeater)) { continue }
-                    if ((Test-VenueRoutedLocally -Sentence $s -Clause $c -Index $m.Index -VenueLocus $venueLocus) -and
-                        -not (Test-LocalHostInScope -Sentence $s -Clauses $clauses -Clause $c -HostMarker $hostMarker -HereMarker $hereDefeater)) { continue }
+                        -not (Test-LocalHostInScope -Sentence $s -Clauses $clauses -Clause $c -HostPatterns $hostDefeaters -BackReference $backReference -PlaybackWord $playbackWord)) { continue }
+                    if ((Test-VenueRoutedLocally -Sentence $s -Clause $c -Index $m.Index -VenueLocus $venueLocus -Prepositions $routingLocally) -and
+                        -not (Test-LocalHostInScope -Sentence $s -Clauses $clauses -Clause $c -HostPatterns $hostDefeaters -BackReference $backReference -PlaybackWord $playbackWord)) { continue }
                     $hit = 'run-playback-locally'; break
                 }
             }
@@ -276,14 +336,14 @@ function Get-LocalPlaybackPromptFindings {
             if (-not $hit -and $isPlayback) {
                 foreach ($m in [regex]::Matches($s, $hostMarker)) {
                     $c = Get-ClauseAt -Clauses $clauses -Index $m.Index
-                    if (-not ($c.Strong -or $c.Weak -or (Test-VenueExempts -Sentence $s -Clauses $clauses -Clause $c -HostMarker $hostMarker -HereMarker $hereDefeater) -or (Test-ContrastLead -Sentence $s -Clause $c -Index $m.Index))) { $hit = 'run-playback-on-this-host'; break }
+                    if (-not ($c.Strong -or $c.Weak -or (Test-VenueExempts -Sentence $s -Clauses $clauses -Clause $c -HostPatterns $hostDefeaters -BackReference $backReference -PlaybackWord $playbackWord) -or (Test-ContrastLead -Sentence $s -Clause $c -Index $m.Index))) { $hit = 'run-playback-on-this-host'; break }
                 }
             }
             # (3b) a bare "here" is weak evidence, so the launch verb and the playback word must sit in the same clause as the word
             if (-not $hit) {
                 foreach ($m in [regex]::Matches($s, $hereMarker)) {
                     $c = Get-ClauseAt -Clauses $clauses -Index $m.Index
-                    if ($c.HasVerb -and ($c.Text -match $playbackWord) -and -not ($c.Strong -or $c.Weak -or (Test-VenueExempts -Sentence $s -Clauses $clauses -Clause $c -HostMarker $hostMarker -HereMarker $hereDefeater) -or (Test-ContrastLead -Sentence $s -Clause $c -Index $m.Index))) { $hit = 'run-playback-here'; break }
+                    if ($c.HasVerb -and ($c.Text -match $playbackWord) -and -not ($c.Strong -or $c.Weak -or (Test-VenueExempts -Sentence $s -Clauses $clauses -Clause $c -HostPatterns $hostDefeaters -BackReference $backReference -PlaybackWord $playbackWord) -or (Test-ContrastLead -Sentence $s -Clause $c -Index $m.Index))) { $hit = 'run-playback-here'; break }
                 }
             }
             # (4) a direct command line: the app with a playback mode, or a tracked launcher called with a parameter
@@ -292,7 +352,7 @@ function Get-LocalPlaybackPromptFindings {
                     $m4 = [regex]::Match($s, $pattern)
                     if (-not $m4.Success) { continue }
                     $c = Get-ClauseAt -Clauses $clauses -Index $m4.Index
-                    if (-not ($c.Strong -or $c.Weak -or (Test-VenueExempts -Sentence $s -Clauses $clauses -Clause $c -HostMarker $hostMarker -HereMarker $hereDefeater) -or (Test-ContrastLead -Sentence $s -Clause $c -Index $m4.Index))) { $hit = 'direct-playback-launch'; break }
+                    if (-not ($c.Strong -or $c.Weak -or (Test-VenueExempts -Sentence $s -Clauses $clauses -Clause $c -HostPatterns $hostDefeaters -BackReference $backReference -PlaybackWord $playbackWord) -or (Test-ContrastLead -Sentence $s -Clause $c -Index $m4.Index))) { $hit = 'direct-playback-launch'; break }
                 }
             }
             if ($hit) {
