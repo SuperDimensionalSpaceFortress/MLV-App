@@ -95,12 +95,21 @@ def default_runs_dir():
     override = os.environ.get("MLV_FLEET_RUNS_DIR")
     if override:
         return override
-    try:
-        common = subprocess.run(["git", "rev-parse", "--git-common-dir"], capture_output=True, text=True,
-                                timeout=15, cwd=os.path.dirname(os.path.abspath(__file__))).stdout.strip()
-    except (OSError, subprocess.SubprocessError):
-        common = ""
-    root = os.path.dirname(os.path.abspath(common)) if common else os.getcwd()
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    common = ""
+    # --path-format needs git >= 2.31; an older git rejects it, so retry bare.
+    for flags in (["--path-format=absolute", "--git-common-dir"], ["--git-common-dir"]):
+        try:
+            done = subprocess.run(["git", "rev-parse"] + flags, capture_output=True, text=True,
+                                  timeout=15, cwd=script_dir)
+        except (OSError, subprocess.SubprocessError):
+            break
+        if done.returncode == 0 and done.stdout.strip():
+            common = done.stdout.strip().splitlines()[-1]
+            break
+    # git prints a path relative to ITS cwd (the script dir) from the main checkout; join it to
+    # script_dir, never to the caller's cwd (a no-op when it is already absolute).
+    root = os.path.dirname(os.path.abspath(os.path.join(script_dir, common))) if common else os.getcwd()
     return os.path.join(root, ".claude-state", "fleet-runs")
 
 
