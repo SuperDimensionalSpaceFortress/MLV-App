@@ -4,7 +4,7 @@
   "card": "CUDA-HEADROOM-1",
   "legType": "speed",
   "clipId": "M16-1457",
-  "playSeconds": 25,
+  "playSeconds": 20,
   "backends": [
     "cuda",
     "cpu"
