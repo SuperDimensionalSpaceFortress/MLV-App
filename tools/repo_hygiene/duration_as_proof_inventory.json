@@ -2142,6 +2142,56 @@
       "lines": [
         1298
       ]
+    },
+    {
+      "path": "platform/qt/PlaybackAudioStartPolicy.h",
+      "anchor": "const double aheadMs = ( lagMs > 0.0 ? lagMs : 0.0 ) + ( expectedOpenMs > 0.0 ? expectedOpenMs : 0.0 ) ;",
+      "class": "value_fallback_select",
+      "clock": "qpc_stage_clock",
+      "justification": "PLAYBACK-STARTUP-WAIT-PREWARM-1 Row A reopenSeekFrame: clamps a negative lag or an unknown (0) expected open time to 0 before converting the sum to whole frames of seek-ahead for an audio re-open. A value select feeding a seek position, never proof that a stage ran; which start mode ran is the report's mode field.",
+      "lines": [
+        56
+      ]
+    },
+    {
+      "path": "platform/qt/PlaybackStartupSplit.h",
+      "anchor": "if ( m_playToRequestMs < 0.0 ) m_playToRequestMs = sinceStartMs ;",
+      "class": "value_fallback_select",
+      "clock": "qpc_stage_clock",
+      "justification": "PLAYBACK-STARTUP-WAIT-PREWARM-1 startup split: -1 is the 'no request noted yet' sentinel, so only the session's first render request is recorded (later ones are ignored). A first-sample filter on a telemetry field, not run-proof.",
+      "lines": [
+        83
+      ]
+    },
+    {
+      "path": "platform/qt/PlaybackStartupSplit.h",
+      "anchor": "double playToRequestMs ( ) const { return m_playToRequestMs < 0.0 ? 0.0 : m_playToRequestMs ; }",
+      "class": "display_or_format",
+      "clock": "qpc_stage_clock",
+      "justification": "PLAYBACK-STARTUP-WAIT-PREWARM-1 startup split getter: maps the -1 'none noted' sentinel to 0 so the printed play_to_request_ms field is never negative. Formatting of an already-measured value for the smoke line.",
+      "lines": [
+        121
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_startup_split.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , split . playToRequestMs ( ) , 1 e - 9 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "Pure-function unit test OnlyTheFirstRequestCounts: a freshly constructed StartupSplit with no request noted must read 0 (the sentinel is never printed negative). Synthetic input, no live clock; it checks the getter's math, not that any stage ran.",
+      "lines": [
+        61
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_startup_split.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , fast . gpuRouteSetupFirstMs ( ) , 1 e - 9 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "Pure-function unit test: a synthetic first present no slower than the later presents' median must attribute 0 ms to the route's one-time setup (clamped, never negative). Test-constructed input, no live clock; it checks the attribution math, not that any stage ran.",
+      "lines": [
+        82
+      ]
     }
   ]
 }
