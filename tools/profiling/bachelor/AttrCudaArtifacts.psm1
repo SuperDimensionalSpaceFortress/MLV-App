@@ -2460,9 +2460,10 @@ function Get-AttrCudaPresentMonWindowResult {
 function Publish-AttrCudaVisualCaptures {
     <#
     .SYNOPSIS
-    Publish the job's visual-capture request record and the app's window captures (play-<k>.png, stop.png, paused.png, visual.json) under
-    $PubRoot\visual -- the record always (it says whether the option was forwarded and why not), the captures only when they exist.
-    Returns the published directory.
+    Publish the job's visual-capture request record and the app's window captures (play-<k>.png, stop-unbound.png, stop.png, paused.png,
+    visual.json) under $PubRoot\visual -- the record always (it says whether the option was forwarded and why not), the captures only when
+    they exist. Returns the published directory. (PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-1: stop-unbound.png is the unforced paused-instant
+    capture a binding build keeps beside the bound stop.png.)
     #>
     param($Record, [string]$SourceDir, [string]$PubRoot)
     if ($null -eq $Record) { return $null }
@@ -2470,7 +2471,7 @@ function Publish-AttrCudaVisualCaptures {
     [void](New-AttrCudaDirectory -Path $pubDir)
     [void](Publish-AttrCudaText -Path (Join-Path $pubDir 'visual-capture-request.json') -Value ($Record | ConvertTo-Json -Depth 4))
     if ($Record['forwarded'] -and $SourceDir -and (Test-Path -LiteralPath $SourceDir -PathType Container)) {
-        Get-ChildItem -LiteralPath $SourceDir -File | Where-Object { $_.Name -match '^(play-\d+|stop|paused)\.png$' -or $_.Name -ceq 'visual.json' } | ForEach-Object {
+        Get-ChildItem -LiteralPath $SourceDir -File | Where-Object { $_.Name -match '^(play-\d+|stop-unbound|stop|paused)\.png$' -or $_.Name -ceq 'visual.json' } | ForEach-Object {
             [void](Publish-AttrCudaFileCopy -Source $_.FullName -Destination (Join-Path $pubDir $_.Name))
         }
     }

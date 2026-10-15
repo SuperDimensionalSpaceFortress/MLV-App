@@ -15,20 +15,32 @@ read perfect while the display is frozen. So the capture runs after the measured
    `playback_smoke.summary` / `gate` lines, and every oracle number, are written there), while the SAME Play keeps running -- no
    new Play, no restart, no loop (the clip-length gate's stop-site pin counts this one pause). Then, untimed:
    * 6 captures evenly spaced across a ~3 s tail (the centres of six 500 ms slices);
-   * 1 capture the instant Play is paused, before any event is processed (still the playback-path frame): `stop.png`;
+   * 2 captures the instant Play is paused, before any event is processed (still the playback-path frame): first unforced,
+     `stop-unbound.png` (what a build before PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-1 captured), then bound, `stop.png`;
    * 1 capture after the paused full-quality path re-renders that same frame (`seekAndSettleLoadedClip`): `paused.png`.
 
    Each capture is the WHOLE window via `PrintWindow(hwnd, dc, PW_RENDERFULLCONTENT)` -- the compositor's view of the window,
    GL child windows included, never an in-app readback -- saved at most 1920 wide after Play has stopped, with the video
    viewport rectangle (in the saved image's pixels) and the frame the app says it showed in `visual.json`. A capture failure is
    recorded there and never changes the run's exit code.
+
+   **Binding (PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-1).** PrintWindow reads the LAST PAINTED surface, but the CPU route paints a
+   presented frame later (the pixmap item's or GL viewport's `update()`), while its label (`display_frame`, `serial`) is stamped
+   at once -- so a capture could show frame N-1 labelled N. CUDA paints and swaps before the label is stamped. Every capture
+   except `stop-unbound` therefore paints the pending frame synchronously first (`paintPresentedFrameForCapture`: the GL window's
+   paintGL+swap, else the viewport's `repaint()`), then reads the label, then prints the window, with no event handled between.
+   Each entry carries `painted_serial` (the serial of the frame painted: the GL window's / GL viewport's own record, or on the
+   QGraphicsPixmapItem route -- the Bachelor CPU legs -- the serial the item holds once `repaint()` drew it),
+   `painted_serial_valid`, and `label_bound` (= valid and `painted_serial == serial`). The schema stays `mlv-app/visual-capture/v1`;
+   the fields are additive.
 2. **Job** (`playback-attr-3-cuda-job.ps1 -VisualCapture`, three bracketed `PLAYBACK-VISUAL-INSPECTION-1` regions; the default job
    is unchanged): the staged binary's smoke help is probed for `--visual-capture-dir` before PresentMon starts (an older build is
    never handed the option; the request record says why not), the option joins the smoke runner's one `-AdditionalArgs`, the
    PresentMon display report's window ENDS where the tail began (`tail_begin_utc`; the cut only ever shortens the window), and the
    captures publish under `visual\`.
 3. **Runner** (`Invoke-VenueLeg.ps1`, `Read-DvVisualCaptures`): copies them into the leg's evidence as
-   `visual/<legId>-play-<k>.png`, `visual/<legId>-stop.png`, `visual/<legId>-paused.png` (plus `app-visual.json`, `request.json`),
+   `visual/<legId>-play-<k>.png`, `visual/<legId>-stop-unbound.png` (when the build keeps it), `visual/<legId>-stop.png`,
+   `visual/<legId>-paused.png` (plus `app-visual.json`, `request.json`),
    hashes every file, derives the numbers below from the copies, composes `visual/<legId>-strip.png` (the six play frames, then
    the paused-instant and paused full-quality frames, each tile the video viewport, labelled with the frame the app showed) and
    copies it next to the LOOK sheets: `-SheetCopyDir`, else `.claude-state\dual-venue\sheets\strip-<legId>-<venue>-<backend>-<sha8>-<stamp>.png`.
@@ -43,10 +55,14 @@ Numbers are computed from the VIDEO VIEWPORT only -- the window's timecode and f
 * `playVsPausedMeanAbsDiff`: the largest per-channel mean absolute difference (0..255, viewports at 160x90) between the
   paused-instant frame and its paused full-quality re-render, judged only when both show the same timeline position;
   `playVsPausedMeanAbsDiffPerChannel` keeps R, G, B.
+* `labelBound`: the stop capture's `label_bound`; `null` for a build that predates the binding;
+* `stopUnboundVsPausedMeanAbsDiff` / `stopUnboundVsStopMeanAbsDiff`: the same difference for `stop-unbound.png` against the
+  paused re-render and against the bound stop (the strip adds its tile, labelled "unforced").
 
 | verdict | when | counted |
 |---|---|---|
 | `FROZEN_DISPLAY` | the play frames show ONE picture while the app presented more than one frame across them | **no**: the receipt is `INVALID` |
+| `CAPTURE_UNBOUND` | the app says the stop capture's pixels are not the frame its label names (`label_bound` false); the stop-vs-paused difference compares two moments | yes, and the detail says so |
 | `VISUAL_DIVERGENCE` | the playback frame is further than the threshold from its paused full-quality re-render | yes, and the detail says so |
 | `CAPTURE_BLANK` | every play frame's viewport is flat (std < 1): the capture judges nothing | yes |
 | `NOT_CAPTURED` / `NOT_REQUESTED` | nothing published (an old build, a failed run) / the spec opts out | yes |
@@ -55,6 +71,10 @@ Numbers are computed from the VIDEO VIEWPORT only -- the window's timecode and f
 The divergence threshold (`$script:VisualDivergenceThreshold`, DualVenueRunner.psm1) is calibrated on a known-good leg: 6.0. The
 known-good Bachelor leg (M16-1243 windowed-s2, CPU, build `adf6185a`, receipt `a5d3ffbe`) measured 1.099 on its worst channel;
 three times that (3.3) is under the 6.0 floor, so the floor is the threshold.
+
+**A CPU `VISUAL_DIVERGENCE` from a build without the binding (`labelBound` null) is not a reliable verdict**: its stop capture
+may show an older frame than its label, and the measured CPU stop-vs-paused difference swung 0.969-8.266 run to run on such
+builds (CUDA, which paints before labelling, read 0.65-1.69). Judge CPU divergence only on a bound capture (`labelBound` true).
 
 ## Opting out
 
