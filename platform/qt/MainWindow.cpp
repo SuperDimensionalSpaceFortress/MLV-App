@@ -9479,8 +9479,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         m_identityFirstPresentImage = QImage();
         m_identityFirstPresentFrame = -1;
         m_identityFirstPresentReason.clear();
-        m_identityFirstPresentArmed = true;
-        m_contactSheetOptionsPresent = true;   // finishPresentedFrame() calls the hook only behind this gate
+        m_identityFirstPresentArmed = true;   // finishPresentedFrame() grabs the measured Play's first present
     }
     // ENFORCE-2 round 2: the measured Play ends at the SOONER of the --seconds timeout and the presented-frames
     // target, so that sooner figure is the window it requests -- and must itself reach the 20 s floor (the old
@@ -27616,13 +27615,6 @@ void MainWindow::noteContactSheetPresentedFrame(
     const RenderFrameThread::ReadyFrame &readyFrame,
     const PresentationRequestContext &requestContext )
 {
-    // PLAYBACK-STARTUP-WAIT-PREWARM-1 identity capture: the measured Play's first present, read back right after its swap.
-    if( m_identityFirstPresentArmed && ui->actionPlay->isChecked() )
-    {
-        m_identityFirstPresentArmed = false;
-        m_identityFirstPresentFrame = static_cast<int>( displayFrame );
-        m_identityFirstPresentImage = grabIdentityViewport( &m_identityFirstPresentReason );
-    }
     if( !m_contactSheetCaptureActive ) return;
     // B1: this hook fires on EVERY presented frame. A frame presented while Play is not checked
     // (a seek, a paused redraw) is never kept as playback_path=true.
@@ -31399,6 +31391,14 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
     // when the options are off.
     if( m_contactSheetOptionsPresent )
         noteContactSheetPresentedFrame( displayFrame, readyFrame, requestContext );
+    // PLAYBACK-STARTUP-WAIT-PREWARM-1 identity capture (opt-in, default off: a false bool on the hot path): the measured
+    // Play's first present, read back right after its swap.
+    if( m_identityFirstPresentArmed && ui->actionPlay->isChecked() )
+    {
+        m_identityFirstPresentArmed = false;
+        m_identityFirstPresentFrame = static_cast<int>( displayFrame );
+        m_identityFirstPresentImage = grabIdentityViewport( &m_identityFirstPresentReason );
+    }
     if( dualIsoWarmupInstrumentationEnabled() )
         ++m_dualIsoWarmupTelemetryPresentedFrames;
     if( interactiveTraceEnabled() )
