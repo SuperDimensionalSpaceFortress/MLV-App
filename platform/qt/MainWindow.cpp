@@ -31419,6 +31419,16 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
     splitStep( playback_startup_split::StepSmoke );
     if( splitFirst )
         m_playbackStartupSplit.noteFirstFinish( ( mlv_stage_timing_now() - splitFinishEntry ) * 1000.0 );
+    // PLAYBACK-STARTUP-WAIT-PREWARM-1 Row A: while paused, keep the audio sink open at the frame on screen (silent and
+    // suspended, on the audio thread; coalesced, and kept when already there). The device open (~0.3-0.6 s on Bachelor)
+    // then never races the first Play-present, which only resumes it.
+    if( !ui->actionPlay->isChecked()
+     && !mlvappPlaybackAudioSyncLegacyRequested()
+     && m_pAudioPlayback
+     && ui->actionAudioOutput->isChecked()
+     && ui->actionDropFrameMode->isChecked()
+     && m_pMlvObject && doesMlvHaveAudio( m_pMlvObject ) )
+        m_pAudioPlayback->prepare( static_cast<int>( displayFrame ) );
     // PLAYBACK-STARTUP-WAIT-PREWARM-1 Row B: the clip's first paused present means the open has settled; warm the
     // playback route from the event loop (runPlaybackRoutePrewarm re-decides: Play or another clip in between cancels).
     if( m_playbackRoutePrewarmArmed && !ui->actionPlay->isChecked() )

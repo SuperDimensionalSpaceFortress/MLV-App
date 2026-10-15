@@ -120,6 +120,19 @@ TEST(PlaybackAudioStartWiring, TheGuiThreadNeverStartsTheAudioDeviceUnlessLegacy
     ASSERT_TRUE(play > jump);
     ASSERT_TRUE(async > play); // the else branch
     ASSERT_TRUE(finish.mid(play, async - play).contains(QStringLiteral("else")));
+    // r1 venue leg a702dab3: a sink opened only at Play (0.61 s cold) was still opening at the first present (0.135 s),
+    // so the sync re-opened 27 frames ahead and the audio ran 321 ms early. A settled paused frame keeps it prepared.
+    const int pausedPrepare = finish.indexOf(QStringLiteral(
+        "        m_pAudioPlayback->prepare( static_cast<int>( displayFrame ) );"));
+    ASSERT_TRUE(pausedPrepare > async);
+    const QString guard = finish.mid(pausedPrepare - 400, 400);
+    ASSERT_TRUE(guard.contains(QStringLiteral("if( !ui->actionPlay->isChecked()")));
+    ASSERT_TRUE(guard.contains(QStringLiteral("&& !mlvappPlaybackAudioSyncLegacyRequested()")));
+    // only the newest queued prepare runs, and a sink already prepared at that frame is kept
+    const QString audio = sourceFile("platform/qt/AudioPlayback.cpp");
+    ASSERT_TRUE(audio.contains(QStringLiteral("if( ticket != m_prepareTicket.load() ) return;")));
+    ASSERT_TRUE(audio.contains(QStringLiteral(
+        "if( m_prepared && m_audioEngineRunning && m_preparedFrame == startFrame ) return;")));
 }
 
 TEST(PlaybackAudioStartWiring, PlayPostsThePrepareAndTheAudioObjectLivesOnItsOwnThread)

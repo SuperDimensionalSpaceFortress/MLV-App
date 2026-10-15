@@ -18,6 +18,7 @@
 #include <QDataStream>
 #include <QMutex>
 #include <Qt>
+#include <atomic>
 #include "../../src/mlv_include.h"
 
 class QThread;
@@ -53,7 +54,8 @@ public:
     /*! GUI thread: resets the engine on the worker, brings the object back, quits and joins the thread. */
     void shutdownWorkerThread( void );
     bool usesWorkerThread( void ) const { return m_pWorkerThread != nullptr; }
-    /*! At Play: open the sink silently at \a startFrame and keep it suspended (queued; worker thread only). */
+    /*! At a settled paused frame and at Play: open the sink silently at \a startFrame and keep it suspended (queued;
+     *  coalesced to the newest; a sink already prepared there is kept). No-op without the worker thread. */
     void prepare( int startFrame );
     /*! At a present: start the audio for \a frame, presented at \a presentWallMs (mlv_stage_timing_now() ms). */
     void syncAndPlay( int frame, double presentWallMs );
@@ -96,7 +98,8 @@ private:
     bool m_prepared = false;
     int m_preparedFrame = -1;
     double m_preparedMs = 0.0;
-    double m_lastOpenMs = 0.0;
+    double m_lastOpenMs = 0.0;          // the newest open (warm after the clip's first one): the re-open's seek-ahead
+    std::atomic<quint64> m_prepareTicket { 0 };   // GUI thread bumps it per prepare(); only the newest runs
     mutable QMutex m_reportMutex;
     StartReport m_report;
 };

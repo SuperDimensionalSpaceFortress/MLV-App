@@ -276,16 +276,24 @@ void AudioPlayback::stopNow()
     m_audioEngineRunning = false;
 }
 
-//Row A, at Play: open the sink silently at the start frame and hold it suspended
+//Row A: open the sink silently at a frame and hold it suspended -- at every settled paused frame and at Play, so Play
+//only resumes it. Prepares are coalesced: only the newest one queued runs (a scrub queues many), and a sink already
+//prepared at that frame is kept.
 void AudioPlayback::prepare( int startFrame )
 {
     if( !m_pWorkerThread ) return;   // legacy: the start stays synchronous at the first present
-    post( [this, startFrame]() { prepareNow( startFrame ); } );
+    const quint64 ticket = ++m_prepareTicket;
+    post( [this, startFrame, ticket]()
+    {
+        if( ticket != m_prepareTicket.load() ) return;
+        prepareNow( startFrame );
+    } );
 }
 
 void AudioPlayback::prepareNow( int startFrame )
 {
     if( !m_audioEngineInitialized ) return;
+    if( m_prepared && m_audioEngineRunning && m_preparedFrame == startFrame ) return;
 
     const double startMs = audioNowMs();
     stopNow();
