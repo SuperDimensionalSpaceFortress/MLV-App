@@ -91,6 +91,10 @@ inline int skippedFrames( double fromPosition, double toPosition )
     return skipped > 0 ? skipped : 0;
 }
 
+/*! CUDA-HEADROOM-1: the pace handed to the guard. A pace of 0 or less is already "unknown, leave the request
+ *  unchanged" in grant()/grantWholeFrame(), so unpaced means the guard limits nothing (the throughput legs). */
+inline double guardPaceFps( double paceFps, bool unpaced ) { return unpaced ? 0.0 : paceFps; }
+
 /*! PLAYBACK-STARTUP-CATCHUP-BURST-1: startup_catchup_frames counts the skips of the first 2 s after Play. */
 inline constexpr double kStartupCatchupWindowMs = 2000.0;
 

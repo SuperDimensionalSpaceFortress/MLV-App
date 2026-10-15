@@ -414,6 +414,10 @@ param(
     # frame before the measured Play and the first present after its swap, both into the contact-sheet dir as identity-*). Absent: nothing is
     # set and the emitted job is the text it was before this parameter.
     [switch]$FirstPresentCapture,
+    # CUDA-HEADROOM-1: an unpaced throughput leg (MLVAPP_PLAYBACK_UNPACED=1 lifts the app's pace guard in an automation run, and the
+    # smoke runs with -DropFrameMode off, so every frame is rendered and presented as fast as the pipeline allows). Absent: nothing is
+    # set and the emitted job is the text it was before this parameter.
+    [switch]$Unpaced,
 
     # PLAYBACK-SCOPES-OPTION-1: the live scope the smoke forces on (the smoke runner's -Scope -> the app's --scope, which also shows the
     # edit area). '' or 'none' (the default) keeps -Scope none: the emitted job is the text it was before this parameter.
@@ -4483,6 +4487,21 @@ if ($FirstPresentCapture) {
     })
 }
 
+# CUDA-HEADROOM-1: an unpaced leg adds MLVAPP_PLAYBACK_UNPACED=1 at the same env-list site and turns drop-frame mode off in the smoke
+# command, only when asked. Each anchor must match exactly once, or the generator throws (a template refactor can never silently run
+# a paced leg and report the pace wall as throughput; the runner also fails closed on the app's own pace_unpaced line).
+if ($Unpaced) {
+    $unpacedEnvAnchor = [regex]"(?<ind>[ \t]*)'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',(?<nl>\r?\n)"
+    $unpacedCmdAnchor = [regex]' -UsePersistedPlaybackSettings '
+    if ($unpacedEnvAnchor.Matches($text).Count -ne 1) { throw 'DUAL_VENUE_UNPACED_ANCHOR_MISSING the job template has no single env-list site to add MLVAPP_PLAYBACK_UNPACED to' }
+    if ($unpacedCmdAnchor.Matches($text).Count -ne 1) { throw 'DUAL_VENUE_UNPACED_ANCHOR_MISSING the job template has no single -UsePersistedPlaybackSettings site to add -DropFrameMode off to' }
+    $text = $unpacedEnvAnchor.Replace($text, [System.Text.RegularExpressions.MatchEvaluator]{
+        param($m)
+        $m.Value + $m.Groups['ind'].Value + "'MLVAPP_PLAYBACK_UNPACED=1'," + $m.Groups['nl'].Value
+    })
+    $text = $unpacedCmdAnchor.Replace($text, ' -DropFrameMode off -UsePersistedPlaybackSettings ')
+}
+
 # PLAYBACK-VISUAL-INSPECTION-1: a visual-capture leg gains three bracketed regions, on the expanded text and only when asked (like --windowed
 # above), so every other job is the text it always was. Each anchor must match exactly once (Edit-DualVenueTemplate throws otherwise):
 #   1. before PresentMon starts: the four module helpers (spliced here, not into the default embed list) and the feature probe + argument;
@@ -4575,7 +4594,8 @@ $clipContentSha256 = if ($isFixtureRehearsal) {
     cudaLaunchTimingMinMs = $(if ($CudaLaunchTimingMinMs -ge 0) { $CudaLaunchTimingMinMs } else { $null })
     presentTrace = [bool]$PresentTrace
     firstPresentCapture = [bool]$FirstPresentCapture
-    scope = $(if ([string]::IsNullOrEmpty($Scope)) { 'none' } else { $Scope })
+    unpaced = [bool]$Unpaced
+    scope =$(if ([string]::IsNullOrEmpty($Scope)) { 'none' } else { $Scope })
     scopeIntervalMs = $(if ($ScopeIntervalMs -ge 0) { $ScopeIntervalMs } else { $null })
     scopesDuringPlayback = $(if ([string]::IsNullOrEmpty($ScopesDuringPlayback)) { $null } else { $ScopesDuringPlayback })
     # DUAL-VENUE-EVIDENCE-1: what this generation was authored for (not part of the emitted job's bytes).
