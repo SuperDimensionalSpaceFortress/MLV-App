@@ -76,6 +76,19 @@
 # phrase followed by a comma and an unlisted word (the r5 closed follow list). A strong negation that comes AFTER the marker in its clause
 # ("..., don't wait, then run it here") no longer exempts the clause: a prohibition governs the marker only when it precedes it or is
 # inherited from an earlier clause. Rules 3, 3b and 4 are unchanged by r8.
+# Strictly terminal E1 (r10; hub ruling HUB-TICK 20261015T1650Z). r8's shape (4), the handling clause, and its "more venue routing"
+# with any lead each decided a tail by ENUMERATING verbs, and every round left the next phrase family open: an adverb moved a launch
+# verb out of the pattern ("then read the log to quietly replay it"), a destination preposition after a launch lead read as routing
+# ("then play the clip from the venue chain"). r10 stops enumerating. The tail (the rest of the sentence and every later sentence of
+# the instruction block; a block ends at a heading) must match a CLOSED, VERBLESS allow-grammar, read by a whitelist tokenizer
+# (Test-VenueTerminalTail). A fragment (between , ; : . ! ?, a spaced dash, and / or / then) is exactly one of:
+#   (A) venue routing: a locus preposition (TailLocusPrepositions: on via through using at), an optional article, a venue name, chained
+#       ("through the venue chain", "on Bachelor via the chain runner"), optionally led or followed by pure locus words;
+#   (B) one pure locus word or phrase (TailPureLocus: "from here", "afterwards" ...);
+#   (C) a verbless host negation: TailNegations (not never nor) + a host target ("not here", "never on this host", "not locally").
+# Any other token -- a verb, an unlisted noun or adverb, to / into / from / for, a quote or a bracket -- voids E1 and the text REFUSES.
+# Accepted over-refusal (ruling 20261015T1650Z, listed in the PR body): a harmless follow-up in the same block ("..., then post the
+# result to Bachelor.", "...; then run the report on Bachelor.", ". Read the log.") now refuses; put it in its own section.
 # Rules 3, 3b and 4 keep master's weak-negation exemption (not / no / without in the marker's clause, narrowed from the whole sentence to
 # the clause), so they refuse at least what master refuses. Anything that is not E1 / E2 / E3 / a prohibition keeps master's verdict.
 # A contrast word still CUTS the sentence (the head clause is judged without its complement) and the complement ends at its next comma; the
@@ -222,44 +235,38 @@ function Get-VenueRoutedLocallyEnd {
     return $Index + $m.Length
 }
 
-# r8 -- sentence-terminal E1 (CoS fix option (i)). The venue exemption holds only when the venue routing is the END of what the text says
-# about running: every later clause of the sentence and every later sentence of the same instruction block must be (1) more venue routing
-# (a fragment that ends in a routing preposition + venue locus, and names no local locus before it), (2) a pure locus word ("from here",
-# "afterwards"), (3) a negation that governs a host reference ("not here", "never on this host", "do not run it here"), or (4) a HANDLING
-# clause: a handling verb and its object (read the log, summarize the result, write the summary to the run dir) with no launch verb, no
-# locus preposition and no host reference. Anything else -- a launch verb with whatever object, a verbless "and on this rig", a qualifier
-# that is not one of these -- VOIDS the exemption. No host noun list sits on this path, so a noun nobody listed cannot reopen it.
-# A fragment is cut at sentence ends, ; : , spaced dashes and the coordinating / subordinating connectors.
-function Test-VenueTerminalTail {
-    param([string]$Tail, [hashtable]$Ctx)
-    $afterHandling = $false
-    foreach ($raw in [regex]::Split($Tail, $Ctx.Split)) {
-        $f = ([regex]::Replace($raw, $Ctx.Trim, '')).Trim()
-        if (-not $f) { continue }
-        if ($f -match $Ctx.PureLocus) { $afterHandling = $false; continue }
-        if ($f -match $Ctx.NegatedHost) { $afterHandling = $false; continue }
-        $vm = [regex]::Match($f, $Ctx.VenueFragment)
-        if ($vm.Success) {
-            if (Test-TailWordsClean -Text $vm.Groups['lead'].Value -Ctx $Ctx -Handling $false) { $afterHandling = $false; continue }
-            return $false
-        }
-        if ($f -match $Ctx.HandlingStart) {
-            if (Test-TailWordsClean -Text $f -Ctx $Ctx -Handling $true) { $afterHandling = $true; continue }
-            return $false
-        }
-        if ($afterHandling -and ($f -match $Ctx.NounPhrase) -and (Test-TailWordsClean -Text $f -Ctx $Ctx -Handling $true)) { continue }
-        return $false
-    }
-    return $true
+# r10 -- strictly terminal E1 (hub ruling HUB-TICK 20261015T1650Z). One tail PIECE (the rest of the marker's sentence, or one later
+# sentence of its block) is in the closed allow-grammar ($Grammar, built in Get-LocalPlaybackPromptFindings: fragments (A) venue routing,
+# (B) a pure locus word, (C) a verbless host negation, separated by punctuation, a spaced dash or and / or / then). A whitelist, not a
+# blacklist: the first token the grammar does not name fails the match. A piece that another piece of the block follows must end in
+# punctuation, so a fragment never runs on across a line break (each piece is read on its own, which is never wider than reading them joined).
+function Test-TailPiece {
+    param([string]$Text, [bool]$Followed, [regex]$Grammar)
+    if (-not $Grammar.IsMatch($Text)) { return $false }
+    return (-not $Followed) -or ($Text.TrimEnd() -match '[.!?;:,]\z')
 }
 
-# A tail fragment names no locus: no locus preposition, no host reference (the r4-r7 defeaters), and -- in a handling clause -- no launch
-# verb where a verb can sit (the first word, or after to / by / for / will / should ...; "the run dir" is a noun, not the verb).
-function Test-TailWordsClean {
-    param([string]$Text, [hashtable]$Ctx, [bool]$Handling)
-    if ($Text -match $Ctx.LocusPreposition) { return $false }
-    if ($Handling -and ($Text -match $Ctx.LaunchVerb)) { return $false }
-    foreach ($pattern in $Ctx.HostPatterns) { if ($Text -match $pattern) { return $false } }
+# The venue exemption holds only when the venue routing is the END of what the text says about running: the rest of the sentence
+# ($Remainder) and every later item of the same block must be in the grammar. Later items are read through an index, never copied:
+# $State.NextDirty[j] is the first item at or after j, in j's block, that is NOT in the grammar (-1: none). It is built once, lazily, in
+# one backward pass, so a large heading-free prompt costs O(n) (r9 kept a copy of the rest of the block per item: O(n^2)).
+function Test-VenueTerminalTail {
+    param([string]$Remainder, [object]$Items, [int]$Index, [hashtable]$State)
+    $n = $Items.Count
+    if ($null -eq $State.NextDirty) {
+        $nd = New-Object 'int[]' ($n + 1)
+        $nd[$n] = -1
+        for ($j = $n - 1; $j -ge 0; $j--) {
+            $followedJ = ($j + 1 -lt $n) -and ($Items[$j + 1].Block -eq $Items[$j].Block)
+            if (-not (Test-TailPiece -Text $Items[$j].Text -Followed $followedJ -Grammar $State.Grammar)) { $nd[$j] = $j }
+            elseif ($followedJ) { $nd[$j] = $nd[$j + 1] }
+            else { $nd[$j] = -1 }
+        }
+        $State.NextDirty = $nd
+    }
+    $followed = ($Index + 1 -lt $n) -and ($Items[$Index + 1].Block -eq $Items[$Index].Block)
+    if (-not (Test-TailPiece -Text $Remainder -Followed $followed -Grammar $State.Grammar)) { return $false }
+    if ($followed -and $State.NextDirty[$Index + 1] -ne -1) { return $false }
     return $true
 }
 
@@ -321,12 +328,14 @@ function Get-LocalPlaybackLintWordLists {
         HostLocusPrepositions      = @('on', 'at', 'in', 'using')
         HostNames                  = @('localhost', 'virtual-ten', 'hub vm', '127.0.0.1', '::1', 'loopback')
         ContrastWords             = @('instead of', 'rather than', 'without', 'nor', 'skip', 'skips', 'skipping', 'bypass', 'bypasses', 'bypassing')
-        # r8 (sentence-terminal E1, Test-VenueTerminalTail). These lists only ever ADMIT a tail fragment; a word nobody listed is refused.
-        TailHandlingVerbs          = @('read', 'summarize', 'summarise', 'compare', 'verify', 'check', 'report', 'post', 'write', 'record', 'log', 'list', 'collect', 'gather', 'fetch', 'attach', 'copy', 'save', 'store', 'inspect', 'review', 'diff', 'hash', 'parse', 'extract', 'upload', 'publish', 'note', 'print', 'append', 'update', 'commit')
-        TailLaunchVerbs            = @('replay', 'repeat', 'redo', 'retry', 'restart', 'relaunch', 'reopen', 'perform', 'trigger', 'spawn', 'boot', 'render', 'fire up')
-        TailLocusPrepositions      = @('on', 'onto', 'at', 'in', 'inside', 'within', 'via', 'through', 'using', 'upon', 'outside')
-        TailDestinationPrepositions = @('to', 'into', 'from', 'for')
-        TailNegations              = @('not', 'never', 'no', 'nor', 'do not', "don't", 'must not', "mustn't", 'may not', 'without', 'instead of', 'rather than', 'skip', 'skips', 'skipping', 'bypass', 'bypasses', 'bypassing')
+        # r10 (strictly terminal E1, the closed allow-grammar of Test-VenueTerminalTail). The tokenizer admits ONLY these words (plus
+        # VenueWords and, inside a host negation, HostDeterminers / HostNouns / HostNames / here / locally); any other token voids E1.
+        # There is no verb list and no destination list: to / into / from / for are simply not in the grammar ("from here" is one locus phrase).
+        TailLocusPrepositions      = @('on', 'via', 'through', 'using', 'at')
+        TailArticles               = @('the', 'a', 'an')
+        TailJoiners                = @('and', 'or', 'then')
+        TailNegations              = @('not', 'never', 'nor')
+        TailNegationPrepositions   = @('on', 'at')
         TailPureLocus              = @('from here', 'afterwards', 'afterward', 'later', 'finally', 'next', 'too', 'as well')
     }
 }
@@ -423,26 +432,28 @@ function Get-LocalPlaybackPromptFindings {
         $hostLocusRef += "|(?<!${b}(?:${destinationPreposition})\s+(?:${hostDeterminer})\s+)${b}(?:$(ConvertTo-LintAlternation -Words $nounNames -Loose))(?!\w)"
     }
     $hostDefeatersLaunch = @($hostMarker, $hereDefeater, $hostLocusRef)
-    # r8: the tail context of the sentence-terminal E1 (Test-VenueTerminalTail). Every alternation comes from a word list, and none of them
-    # is a host-noun list: a host reference is admitted only as the object of a negation, and the existing r4-r7 defeaters are an extra veto.
-    $tailDestination = ConvertTo-LintAlternation -Words @($lists.TailDestinationPrepositions)
-    $tailVenueName = "(?:(?:the|a|an)\s+)?${venueName}"
-    $tailPureLocus = ConvertTo-LintAlternation -Words @($lists.TailPureLocus)
-    $tailVenuePhrase = "(?:(?:${routingVenue}|${tailDestination})\s+${tailVenueName})(?:\s+(?:${routingVenue})\s+${tailVenueName})*"
+    # r10: the closed allow-grammar of the strictly terminal E1 (Test-VenueTerminalTail), a whitelist tokenizer as ONE anchored regex.
+    # Every token is a word from a list followed by a token end ($tb); each fragment and each separator is atomic, so the match runs left
+    # to right without backtracking into what it has read and stops at the first token the grammar does not name. Two fragments need a
+    # separator between them ("not here on Bachelor" is not two fragments). A venue fragment is led and followed by pure locus words only.
+    $tb = "(?![\w\-'])"
+    $tailPrep = ConvertTo-LintAlternation -Words @($lists.TailLocusPrepositions)
+    $tailArticle = ConvertTo-LintAlternation -Words @($lists.TailArticles)
+    $tailJoiner = ConvertTo-LintAlternation -Words @($lists.TailJoiners)
     $tailNegation = ConvertTo-LintAlternation -Words @($lists.TailNegations)
-    $tailLaunchExtra = ConvertTo-LintAlternation -Words @($lists.TailLaunchVerbs)
-    $tailHostTarget = "(?:${hostRef}|${hereMarker}|${localMarker})"
-    $tailCtx = @{
-        Split          = "(?i)[.!?;:,]+(?=\s|\z)|\s-{1,2}\s|${b}(?:and then|and|then|or|but|after that|after|before|once|when|whenever|while|until|because|otherwise|unless|except|although|though|whereas|so|also|plus|if|else)${e}"
-        Trim           = "^[\s`"'``(\[]+|[\s`"'``)\]]+`$"
-        PureLocus      = "(?i)^(?:${tailPureLocus})`$"
-        NegatedHost    = "(?i)^(?:${tailNegation})${e}(?:\s+(?:${verbs})(?:\s+\S+){0,2})?(?:\s+(?:${hostLocusPreposition}|${tailDestination}))?\s+${tailHostTarget}`$"
-        VenueFragment  = "(?i)^(?<lead>.*?)(?<![\w\-])(?:locally\s+)?(?<phr>${tailVenuePhrase})(?:\s+(?:${tailPureLocus}))*`$"
-        HandlingStart  = "(?i)^(?:" + (ConvertTo-LintAlternation -Words @($lists.TailHandlingVerbs)) + ")(?:s|es|d|ed|ing)?${e}"
-        NounPhrase     = "(?i)^(?:the|a|an|this|that|these|those|its|their|each|every|all|any|both|my|our|your)\s+\S"
-        LocusPreposition = "(?i)${b}(?:" + (ConvertTo-LintAlternation -Words @($lists.TailLocusPrepositions)) + ")${e}"
-        LaunchVerb     = "(?i)(?:^|${b}(?:to|by|for|will|should|must|can|just|please)\s+)(?:re-?)?(?:${verbs}|${tailLaunchExtra})(?:s|es|ed|d|ing)?${e}"
-        HostPatterns   = $hostDefeaters
+    $tailNegPrep = ConvertTo-LintAlternation -Words @($lists.TailNegationPrepositions)
+    $tailPureLocus = ConvertTo-LintAlternation -Words @($lists.TailPureLocus)
+    $tailVenue = "(?:${venueWords})${tb}(?:\s+(?:chain|chains|runner|job|jobs|leg|legs|lane)${tb})*"
+    $tailRoute = "(?:${tailPrep})${tb}\s+(?:(?:${tailArticle})${tb}\s+)?${tailVenue}"
+    $tailLocus = "(?:${tailPureLocus})${tb}"
+    $tailFragA = "(?:${tailLocus}\s+)*${tailRoute}(?:\s+${tailRoute})*(?:\s+${tailLocus})*"
+    $tailHostDet = "(?:${hostDeterminer})${tb}(?:\s+(?:${hostDeterminer}|${tailArticle})${tb}){0,2}\s+(?:${hostNoun})${hostNounEnd}"
+    $tailFragC = "(?:${tailNegation})${tb}\s+(?:here${tb}|locally${tb}|(?:(?:${tailNegPrep})${tb}\s+)?(?:${hostName})(?!\w)|(?:${tailNegPrep})${tb}\s+(?:${hostNoun})${hostNounEnd}|(?:(?:${tailNegPrep})${tb}\s+)?${tailHostDet})"
+    $tailSep = "(?:[.!?;:,]+(?=\s|\z)|(?<=\s|^)-{1,2}(?=\s)|(?:${tailJoiner})${tb})"
+    $tailFrag = "(?:${tailFragA}|${tailFragC}|${tailLocus})"
+    $tailState = @{
+        Grammar   = [regex]::new("(?i)^\s*(?:(?>${tailSep})\s*)*(?:(?>${tailFrag})(?:\s*(?>${tailSep}))+\s*)*(?:(?>${tailFrag})\s*)?\z")
+        NextDirty = $null
     }
     $direct = @(
         "(?i)${b}MLVApp(Release)?\.exe\s+(?:(?!/\s)\S+\s+){0,12}--(gui-smoke-playback|profile-playback)",
@@ -463,27 +474,31 @@ function Get-LocalPlaybackPromptFindings {
             if ($piece.Trim()) { $items.Add([pscustomobject]@{ Text = $piece.Trim(); Block = $blockId }) }
         }
     }
-    $blockTails = New-Object 'string[]' $items.Count
-    $acc = ''
-    $accBlock = -1
-    for ($i = $items.Count - 1; $i -ge 0; $i--) {
-        if ($items[$i].Block -ne $accBlock) { $accBlock = $items[$i].Block; $acc = '' }
-        $blockTails[$i] = $acc
-        $acc = ($items[$i].Text + ' ' + $acc).Trim()
-    }
+    # r10: no per-item copy of the rest of the block (r9 kept one per item: O(n^2) in time and retained memory on a large heading-free
+    # prompt). The sentence-terminal E1 reads later items through their index (Test-VenueTerminalTail, $tailState.NextDirty).
+    # A sentence that holds none of the rule triggers (the incident phrase, `locally`, an on-this-host marker, a bare `here`, a direct
+    # launch pattern) cannot be refused by any rule below, so it skips the clause analysis: same verdict, linear cost on long prompts.
+    $triggers = @([regex]::new($incident), [regex]::new($localMarker), [regex]::new($hostMarker), [regex]::new($hereMarker)) + @($direct | ForEach-Object { [regex]::new($_) })
     for ($itemIndex = 0; $itemIndex -lt $items.Count; $itemIndex++) {
         foreach ($sentence in @($items[$itemIndex].Text)) {
             $s = $sentence.Trim()
             if ($s.Length -lt 8) { continue }
+            $triggered = $false
+            foreach ($rx in $triggers) { if ($rx.IsMatch($s)) { $triggered = $true; break } }
+            if (-not $triggered) { continue }
             $clauses = @(Get-LintClauses -Sentence $s -Separator $separator -Contrast $contrast -LaunchVerb $launchVerb -StrongNeg $strongNeg -WeakNeg $weakNeg -VenueQualified $venueQualified)
             # Playback test per semicolon group: "Build MLVApp; run the tests on this host" is two instructions, as it was when ';' split sentences.
+            $groupFirst = @{}
+            $groupLast = @{}
+            foreach ($c in $clauses) {
+                $gid = [int]$c.Group
+                if (-not $groupFirst.ContainsKey($gid) -or $c.Start -lt $groupFirst[$gid]) { $groupFirst[$gid] = [int]$c.Start }
+                if (-not $groupLast.ContainsKey($gid) -or $c.End -gt $groupLast[$gid]) { $groupLast[$gid] = [int]$c.End }
+            }
             $groupPlayback = @{}
-            foreach ($gid in @($clauses | ForEach-Object { $_.Group } | Select-Object -Unique)) {
-                $members = @($clauses | Where-Object { $_.Group -eq $gid })
-                $first = ($members | Measure-Object -Property Start -Minimum).Minimum
-                $last = ($members | Measure-Object -Property End -Maximum).Maximum
-                $gt = $s.Substring($first, $last - $first)
-                $groupPlayback[[int]$gid] = ($gt -match $playbackWord) -and ($gt -match $launchVerb)
+            foreach ($gid in @($groupFirst.Keys)) {
+                $gt = $s.Substring($groupFirst[$gid], $groupLast[$gid] - $groupFirst[$gid])
+                $groupPlayback[$gid] = ($gt -match $playbackWord) -and ($gt -match $launchVerb)
             }
             $hit = $null
             # (1) the incident phrase: "where a GUI desktop session and the clip exist" and its relatives. A phrase that opens with a quote
@@ -506,15 +521,15 @@ function Get-LocalPlaybackPromptFindings {
                     }
                     if ((Test-ContrastLead -Sentence $s -Clause $c -Index $m.Index) -and
                         -not (Test-LocalHostInScope -Sentence $s -Clauses $clauses -Clause $c -HostPatterns $hostDefeaters)) { continue }
-                    # E1 is sentence-terminal (r8): the rest of the sentence and of the block must be venue routing, a locus word, a negated
-                    # host reference or a handling clause (Test-VenueTerminalTail). A host reference BEFORE the marker in its own clause is
-                    # still a veto (the r4-r7 scan, now limited to what precedes the venue phrase: what follows it is the tail's to judge).
+                    # E1 is strictly terminal (r10): the rest of the sentence and of the block must be in the closed, verbless allow-grammar
+                    # (Test-VenueTerminalTail). A host reference BEFORE the marker in its own clause is still a veto (the r4-r7 scan, limited
+                    # to what precedes the venue phrase: what follows it is the grammar's to judge).
                     $e1End = Get-VenueRoutedLocallyEnd -Sentence $s -Clause $c -Index $m.Index -VenueLocus $venueLocus -Prepositions $routingLocally
                     if ($e1End -ge 0) {
                         $prefix = $s.Substring($c.Start, [Math]::Max(0, $m.Index - $c.Start))
                         $hostBefore = $false
                         foreach ($pattern in $hostDefeaters) { if ([regex]::IsMatch($prefix, $pattern)) { $hostBefore = $true; break } }
-                        if (-not $hostBefore -and (Test-VenueTerminalTail -Tail ($s.Substring($e1End) + ' ' + $blockTails[$itemIndex]) -Ctx $tailCtx)) { continue }
+                        if (-not $hostBefore -and (Test-VenueTerminalTail -Remainder $s.Substring($e1End) -Items $items -Index $itemIndex -State $tailState)) { continue }
                     }
                     $hit = 'run-playback-locally'; break
                 }
