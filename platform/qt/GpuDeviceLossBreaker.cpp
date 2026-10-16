@@ -146,7 +146,7 @@ void install()
     if (g_installed) return;
     g_installed = true;
     std::unique_ptr<QSettings> settings = automation_settings::openAppSettings();
-    if (qgetenv(core::kEnvSafeStart).trimmed().toLower() == QByteArrayLiteral("clear"))
+    if (core::safeStartClearRequested(qgetenv(core::kEnvSafeStart).constData()))
     {
         clearSafeStartKeys(*settings);
         GpuFieldTelemetry::noteRecovery("safe_start_flag", "cleared_env");
@@ -158,7 +158,13 @@ void install()
         GpuFieldTelemetry::noteRecovery("safe_start", "cpu_route");
         showNotice(QString::fromLatin1(core::kNoticeStartup));
     }
+    llrpSetGpuDeviceLossClassifier(&classifyDeviceLossCodeForBackend);
     GpuFieldTelemetry::setFaultListener(&onFault);
+}
+
+int classifyDeviceLossCodeForBackend(int cudaCode)
+{
+    return GpuFieldTelemetry::isDeviceLossCode(cudaCode) ? 1 : 0;
 }
 
 void onFault(const GpuFieldTelemetry::CudaFault & fault)
@@ -253,6 +259,7 @@ void resetForTesting()
     g_sessionLoss.store(false);
     g_sessionLossCode.store(0);
     g_startedSafe.store(false);
+    llrpSetGpuDeviceLossClassifier(nullptr);
     llrpSetGpuCudaSuppressed(0);
     g_installed = false;
     g_noticeSink = nullptr;

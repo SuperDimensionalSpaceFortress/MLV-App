@@ -10,7 +10,9 @@
 // the same profile, as two launches within 10 minutes, set the persisted safe-start flag.
 // r6 (CoS #437, guard under the serializing lock): (f) a frame queued on the backend mutex while a loss is
 // delivered never reaches the backend; (g) a device-loss orphan delivered by an AMaZE run's telemetry entry
-// stops that very run.
+// stops that very run. GPU-LOSS-EMIT-BEFORE-UNLOCK-1: (h) a caller that takes the backend mutex between the
+// faulting run's (or preupload's) unlock and its emit to the sink never reaches the backend; (i) a failure
+// that is not a device loss leaves that caller free.
 #include "../common/minitest.h"
 #include "../../src/mlv/llrawproc/llrawproc.h"
 #include "../../platform/qt/AutomationSettings.h"
@@ -27,10 +29,12 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -38,8 +42,10 @@
 extern "C" int llrpInstallFakeGpuPlaybackReconBackendForTesting(int install);
 extern "C" void llrpHoldGpuReconBackendMutexForTesting(int hold);
 extern "C" long llrpGpuReconBackendLockArrivalsForTesting(void);
+extern "C" void llrpSetGpuReconAfterUnlockHookForTesting(void (*hook)(void));
 extern "C" int llrpResetGpuExportBackendForTesting(void);
 extern "C" void llrpFakeGpuBackendInjectRunFailureForTesting(int rc, int cuda_code, const char * name);
+extern "C" void llrpFakeGpuBackendInjectPreuploadFailureForTesting(int rc, int cuda_code, const char * name);
 extern "C" void llrpFakeGpuBackendReducedIsoNotchStateForTesting(int * last_run_flag,
                                                                  uint64_t * runs_with_notch,
                                                                  uint64_t * runs_without_notch,
@@ -119,6 +125,8 @@ struct CaseScope
     {
         automation_settings::isolate(sharedSettingsDir.isEmpty() ? settingsDir.path() : sharedSettingsDir);
         GpuDeviceLossBreaker::resetForTesting();
+        // As install() does: the backend suppresses under its lock on a captured device-loss code.
+        llrpSetGpuDeviceLossClassifier(&GpuDeviceLossBreaker::classifyDeviceLossCodeForBackend);
         llrpInstallFakeGpuPlaybackReconBackendForTesting(1);
         GpuDeviceLossBreaker::setNoticeSink([this](const QString & text) { notices.push_back(text); });
         GpuDeviceLossBreaker::setRefreshCallback([this]() { ++refreshes; });
@@ -133,8 +141,9 @@ struct CaseScope
     ~CaseScope()
     {
         runQueuedGuiHalf();
+        llrpSetGpuReconAfterUnlockHookForTesting(nullptr);
         GpuFieldTelemetry::setFaultListener(nullptr);
-        GpuDeviceLossBreaker::resetForTesting();
+        GpuDeviceLossBreaker::resetForTesting(); // also clears the classifier
         llrpInstallFakeGpuPlaybackReconBackendForTesting(0);
         llrpResetGpuExportBackendForTesting();
         automation_settings::releaseForTest();
@@ -387,4 +396,173 @@ TEST(GpuDeviceLossSelfHeal, ADeviceLossOrphanDeliveredAtAnAmazeRunsEntryStopsTha
         ASSERT_EQ(0, clean.seen.deviceLossFaults);
         ASSERT_EQ(0, llrpGpuCudaSuppressed());
     }
+}
+
+namespace
+{
+// GPU-LOSS-EMIT-BEFORE-UNLOCK-1: the gap between the faulting call's unlock and its emit, held open by the
+// after-unlock test hook on the faulting thread (A) while a second caller (B) plays a frame in it. Shared, so
+// B's outputs outlive any timeout; every wait is bounded at 10 s, and B is joined before any assertion.
+struct EmitGap
+{
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool go = false;
+    bool bDone = false;
+    std::atomic<bool> armed{false};
+    std::atomic<int> fired{0};
+    int suppressedInGap = -1;
+    bool hookTimedOut = false;
+    bool bTimedOut = false;
+    int bUsed = -1;
+    int bRc = -99;
+    uint64_t bRunsBefore = 0;
+    uint64_t bRunsAfter = 0;
+};
+
+std::shared_ptr<EmitGap> g_emitGap;
+
+// The after-unlock hook. First call only (later calls, e.g. B's own run in the RED arm, return at once).
+void holdTheEmitGapOpen()
+{
+    const std::shared_ptr<EmitGap> gap = g_emitGap;
+    if (!gap || !gap->armed.exchange(false)) return;
+    gap->fired.fetch_add(1);
+    gap->suppressedInGap = llrpGpuCudaSuppressed();
+    std::unique_lock<std::mutex> lock(gap->mutex);
+    gap->go = true;
+    gap->cv.notify_all();
+    if (!gap->cv.wait_for(lock, std::chrono::seconds(10), [&gap]() { return gap->bDone; })) gap->hookTimedOut = true;
+}
+
+class AsyncH2dOnScope
+{
+    QByteArray saved;
+    bool hadSaved;
+public:
+    AsyncH2dOnScope()
+    {
+        hadSaved = qEnvironmentVariableIsSet("MLVAPP_GPU_PLAYBACK_RECON_ASYNC_H2D");
+        if (hadSaved) saved = qgetenv("MLVAPP_GPU_PLAYBACK_RECON_ASYNC_H2D");
+        qputenv("MLVAPP_GPU_PLAYBACK_RECON_ASYNC_H2D", "1");
+    }
+    ~AsyncH2dOnScope()
+    {
+        if (hadSaved) qputenv("MLVAPP_GPU_PLAYBACK_RECON_ASYNC_H2D", saved);
+        else qunsetenv("MLVAPP_GPU_PLAYBACK_RECON_ASYNC_H2D");
+    }
+};
+
+// The async H2D preupload of the bytes runOnce renders (non-zero = accepted).
+int preuploadOnce(uint64_t frameId)
+{
+    const std::vector<uint16_t> input(16, 100);
+    return llrpGpuPlaybackReconPreuploadFrame(frameId, input.data(), input.size() * sizeof(uint16_t));
+}
+
+// A healthy frame 1; then `inject` arms one failure and `faultingCall` runs on this thread (A). Its after-unlock
+// hook lets B play frame 9 inside the emit gap. B is joined after A's call returns (B's own wait is bounded).
+std::shared_ptr<EmitGap> playAFrameInTheEmitGap(CaseScope & scope, const std::function<void()> & inject,
+                                                const std::function<void()> & faultingCall)
+{
+    const std::shared_ptr<EmitGap> gap = std::make_shared<EmitGap>();
+    g_emitGap = gap;
+    scope.withTelemetrySink([&]() {
+        int rc = -99;
+        runOnce(1, &rc);
+        std::thread b([gap]() {
+            {
+                std::unique_lock<std::mutex> lock(gap->mutex);
+                if (!gap->cv.wait_for(lock, std::chrono::seconds(10), [&gap]() { return gap->go; }))
+                {
+                    gap->bTimedOut = true;
+                    return;
+                }
+            }
+            gap->bRunsBefore = fakeRunCount();
+            gap->bUsed = runOnce(9, &gap->bRc);
+            gap->bRunsAfter = fakeRunCount();
+            std::lock_guard<std::mutex> lock(gap->mutex);
+            gap->bDone = true;
+            gap->cv.notify_all();
+        });
+        llrpSetGpuReconAfterUnlockHookForTesting(&holdTheEmitGapOpen);
+        gap->armed.store(true);
+        inject();
+        faultingCall();
+        b.join();
+        gap->armed.store(false);
+        llrpSetGpuReconAfterUnlockHookForTesting(nullptr);
+    });
+    g_emitGap.reset();
+    return gap;
+}
+
+// The device-loss half: the flag was already set inside the gap, B was refused before the backend, and the emit
+// after the unlock still reached the listener, so the session record and the notice still happen.
+void assertTheEmitGapIsClosedOnALoss(CaseScope & scope, const EmitGap & gap, const char * name)
+{
+    ASSERT_EQ(1, gap.fired.load());
+    ASSERT_FALSE(gap.hookTimedOut);
+    ASSERT_FALSE(gap.bTimedOut);
+    ASSERT_EQ(1, gap.suppressedInGap);
+    ASSERT_EQ(0, gap.bUsed);
+    ASSERT_EQ(LLRP_GPU_PLAYBACK_RECON_RC_CUDA_SUPPRESSED, gap.bRc);
+    ASSERT_EQ(gap.bRunsBefore, gap.bRunsAfter); // B never reached the backend
+    ASSERT_EQ(1, scope.seen.deviceLossFaults);
+    ASSERT_EQ(1, llrpGpuCudaSuppressed());
+    scope.runQueuedGuiHalf();
+    ASSERT_EQ(1, (int)scope.notices.size());
+    ASSERT_EQ(core::noticeText(core::kNoticeSession, name), scope.notices[0].toStdString());
+    ASSERT_EQ(1, (int)scope.recentLosses().size());
+}
+
+void assertANonLossLeavesTheEmitGapFree(int rc, int code, const char * name)
+{
+    CaseScope scope;
+    const std::shared_ptr<EmitGap> gap = playAFrameInTheEmitGap(
+        scope, [rc, code, name]() { llrpFakeGpuBackendInjectRunFailureForTesting(rc, code, name); },
+        []() { int frameRc = -99; runOnce(2, &frameRc); });
+    ASSERT_EQ(1, gap->fired.load());
+    ASSERT_FALSE(gap->hookTimedOut);
+    ASSERT_FALSE(gap->bTimedOut);
+    ASSERT_EQ(0, gap->suppressedInGap);
+    ASSERT_NE(0, gap->bUsed);
+    ASSERT_EQ(0, gap->bRc);
+    ASSERT_EQ(gap->bRunsBefore + 1, gap->bRunsAfter);
+    ASSERT_EQ(0, scope.seen.deviceLossFaults);
+    ASSERT_EQ(0, llrpGpuCudaSuppressed());
+}
+} // namespace
+
+// (h) Frame 2's run fails with a launch timeout. Between its unlock and its emit, B takes the backend mutex: on
+// master the flag was set only by the emit, so B passed the re-check under the lock and submitted once to a
+// dead context. Now the run sets it from the captured code before it unlocks.
+TEST(GpuDeviceLossSelfHeal, ACallerEnteringBetweenTheFaultingRunsUnlockAndItsEmitNeverReachesTheBackend)
+{
+    CaseScope scope;
+    const std::shared_ptr<EmitGap> gap = playAFrameInTheEmitGap(
+        scope, []() { llrpFakeGpuBackendInjectRunFailureForTesting(-1, 702, "cudaErrorLaunchTimeout"); },
+        []() { int rc = -99; runOnce(2, &rc); });
+    assertTheEmitGapIsClosedOnALoss(scope, *gap, "cudaErrorLaunchTimeout");
+}
+
+// (h) The same gap at the async preupload: its captured device-loss code sets the flag before it unlocks.
+TEST(GpuDeviceLossSelfHeal, ACallerEnteringBetweenTheFaultingPreuploadsUnlockAndItsEmitNeverReachesTheBackend)
+{
+    const AsyncH2dOnScope asyncH2d;
+    CaseScope scope;
+    int preuploadAccepted = -1;
+    const std::shared_ptr<EmitGap> gap = playAFrameInTheEmitGap(
+        scope, []() { llrpFakeGpuBackendInjectPreuploadFailureForTesting(-1, 702, "cudaErrorLaunchTimeout"); },
+        [&preuploadAccepted]() { preuploadAccepted = preuploadOnce(3); });
+    ASSERT_EQ(0, preuploadAccepted);
+    assertTheEmitGapIsClosedOnALoss(scope, *gap, "cudaErrorLaunchTimeout");
+}
+
+// (i) A validation failure, and a CUDA failure that is not a device loss, suppress nothing in the gap: B runs.
+TEST(GpuDeviceLossSelfHeal, ANonLossFailureInTheEmitGapLeavesTheNextCallerFree)
+{
+    assertANonLossLeavesTheEmitGapFree(3, 0, nullptr);
+    assertANonLossLeavesTheEmitGapFree(-1, 2, "cudaErrorMemoryAllocation");
 }

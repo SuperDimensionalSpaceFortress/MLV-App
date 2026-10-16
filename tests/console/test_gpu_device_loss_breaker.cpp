@@ -5,8 +5,10 @@
 // (4) the identity-change rule (an unknown current identity is never a change); (5) no notice asks
 // the user to reboot or restart (owner spec r2); (6) the persisted keys round-trip through the
 // app's settings store (automation_settings::isolate); (7) a source-text pin: run_backend checks
-// the suppression flag before it takes the backend mutex. The fault-to-suppression chain through
-// the real llrawproc seam lives in tests/pipeline/test_gpu_device_loss_selfheal.cpp.
+// the suppression flag before it takes the backend mutex; (8) the MLVAPP_GPU_SAFE_START=clear match;
+// (9) every capturing unlock sets the flag on a device loss before it releases the backend mutex. The
+// fault-to-suppression chain through the real llrawproc seam lives in
+// tests/pipeline/test_gpu_device_loss_selfheal.cpp.
 #include "../common/minitest.h"
 #include "../common/repo_paths.h"
 #include "../../platform/qt/AutomationSettings.h"
@@ -64,6 +66,17 @@ TEST(GpuDeviceLossBreaker, ParseFaultInject)
                              "702@ 5", "702@5@6", "abc"})
         ASSERT_FALSE(core::parseFaultInject(bad).armed);
     ASSERT_FALSE(core::parseFaultInject(nullptr).armed); // unset
+}
+
+// GPU-LOSS-EMIT-BEFORE-UNLOCK-1 (c): MLVAPP_GPU_SAFE_START=clear is matched case-insensitively with surrounding
+// whitespace ignored (the parseEnabled convention); no other word, and no near-miss, is a clear.
+TEST(GpuDeviceLossBreaker, SafeStartClearAcceptsCaseAndWhitespaceVariantsOnly)
+{
+    for (const char * ok : {"clear", "CLEAR", " Clear\t", "clear\r\n"})
+        ASSERT_TRUE(core::safeStartClearRequested(ok));
+    ASSERT_FALSE(core::safeStartClearRequested(nullptr)); // unset
+    for (const char * bad : {"", "0", "1", "cleared", "clear!", "c lear", "unclear", "clea", "clear clear"})
+        ASSERT_FALSE(core::safeStartClearRequested(bad));
 }
 
 TEST(GpuDeviceLossBreaker, CudaNamesForTheDeviceLossCodes)
@@ -344,6 +357,60 @@ TEST(GpuDeviceLossBreaker, EverySerializingLockSiteReChecksSuppressionAfterAcqui
     // Both build variants define the flag.
     ASSERT_EQ(2, (int)llrawproc.count(QStringLiteral("int llrpGpuCudaSuppressed(void)\n{")));
     ASSERT_EQ(2, (int)llrawproc.count(QStringLiteral("void llrpSetGpuCudaSuppressed(int suppressed)\n{")));
+}
+
+namespace
+{
+// GPU-LOSS-EMIT-BEFORE-UNLOCK-1: each llrawproc section that captures CUDA codes under the backend mutex and
+// emits them after releasing it scans the captured codes for a device loss as its last statement before the
+// unlock, so the flag is set before any queued caller can take the lock. Returns the functions that do not.
+QStringList capturingUnlocksWithoutSuppression(const QString & source)
+{
+    QStringList missing;
+    const QString suppress = QStringLiteral("llrawproc_gpu_suppress_on_device_loss_locked(");
+    const QString unlock = QStringLiteral("pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);");
+    const QString emitCall = QStringLiteral("llrawproc_gpu_stage_telemetry_emit");
+    for (const char * entry : {"int llrpGpuPlaybackReconDrainCudaErrorsAtTeardown(int wait_ms)\n{",
+                               "int llrpGpuPlaybackReconPreuploadFrame(uint64_t frame_id,\n                                      const uint16_t * raw_input_bayer14,\n                                      size_t raw_image_size)\n{",
+                               "static int llrawproc_gpu_recon_run_backend(",
+                               "int llrpGpuPlaybackReconResetGlTextureResources(void)\n{"})
+    {
+        const int fn = source.indexOf(QString::fromLatin1(entry));
+        const int end = fn < 0 ? -1 : source.indexOf(QStringLiteral("\n}\n"), fn);
+        const QString body = end < 0 ? QString() : source.mid(fn, end - fn);
+        const int at = body.indexOf(suppress);
+        const int unlockAt = at < 0 ? -1 : body.indexOf(unlock, at);
+        const int emitAt = body.indexOf(emitCall);
+        const bool ok = at > 0 && unlockAt > at && emitAt > unlockAt
+            && body.mid(at, unlockAt - at).count(QStringLiteral(";\n")) == 1;
+        if (!ok) missing << QString::fromLatin1(entry).section(QLatin1Char('('), 0, 0);
+    }
+    return missing;
+}
+} // namespace
+
+TEST(GpuDeviceLossBreaker, EveryCapturingUnlockSuppressesOnADeviceLossBeforeReleasing)
+{
+    const QString llrawproc = readRepoFile(QStringLiteral("src/mlv/llrawproc/llrawproc.c"));
+    ASSERT_EQ(std::string(), capturingUnlocksWithoutSuppression(llrawproc).join(QStringLiteral(", ")).toStdString());
+    // The scan sets the flag and never clears it.
+    const QString helper = llrawproc.mid(llrawproc.indexOf(QStringLiteral("static void llrawproc_gpu_suppress_on_device_loss_locked(")));
+    ASSERT_TRUE(helper.left(helper.indexOf(QStringLiteral("\n}\n"))).contains(QStringLiteral("llrpSetGpuCudaSuppressed(1);")));
+    ASSERT_FALSE(helper.left(helper.indexOf(QStringLiteral("\n}\n"))).contains(QStringLiteral("llrpSetGpuCudaSuppressed(0)")));
+    // Mutants: each site's scan removed (the master shape) is reported.
+    for (const char * call : {"    llrawproc_gpu_suppress_on_device_loss_locked(leftovers, 2);\n",
+                              "    if(telemetry_entered) llrawproc_gpu_suppress_on_device_loss_locked(&telemetry_event, 1);\n",
+                              "    llrawproc_gpu_suppress_on_device_loss_locked(telemetry_events, telemetry_event_count);\n",
+                              "    if(telemetry_sink) llrawproc_gpu_suppress_on_device_loss_locked(leftovers, 2);\n"})
+    {
+        const QString mutant = replacedOnce(llrawproc, QString::fromLatin1(call), QString());
+        ASSERT_EQ(1, (int)capturingUnlocksWithoutSuppression(mutant).size());
+    }
+    // The breaker registers the classifier when it installs its fault listener, and a reset clears it.
+    const QString breaker = readRepoFile(QStringLiteral("platform/qt/GpuDeviceLossBreaker.cpp"));
+    ASSERT_TRUE(breaker.contains(QStringLiteral("    llrpSetGpuDeviceLossClassifier(&classifyDeviceLossCodeForBackend);\n"
+                                                "    GpuFieldTelemetry::setFaultListener(&onFault);\n")));
+    ASSERT_TRUE(breaker.contains(QStringLiteral("    llrpSetGpuDeviceLossClassifier(nullptr);\n")));
 }
 
 // r6: every AMaZE run reads the flag again after its telemetry entry, which can deliver an orphan device-loss
