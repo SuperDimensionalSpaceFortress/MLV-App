@@ -92,6 +92,10 @@ def _baseline_lint_source() -> tuple[str, str] | None:
 # d291f184; r10 started from r9 fd190b6d, and r9 changed no lint behaviour). It is checked to be an ancestor of HEAD, so a rebase that
 # drops it fails loudly in CI instead of silently weakening the gate.
 PREVIOUS_PR_HEAD = "d2f3cd05c311f60b8151fe578742c0b3fa104a22"
+# NA2-RULE4-PER-LAUNCHER-SCOPE-1: the r1 head of this PR (the lint CoS reproduced the cross-`;` swallow on). The r2 RED rows are
+# pinned against it in PromptLintTests (test_red_rule4_r2_*), apart from the previous-head differential above, whose r13 multi-line
+# closure assertions are tied to d2f3cd05.
+RULE4_R1_PR_HEAD = "75cb00e1213c7282c02f5f53f3908c2e26e4785c"
 
 
 def _previous_head_lint_source() -> tuple[str, str] | None:
@@ -115,6 +119,20 @@ def _require_previous_head_lint() -> tuple[str, str]:
             raise AssertionError(message + " -- the hygiene jobs check out with fetch-depth: 0, so a missing commit is a stale PREVIOUS_PR_HEAD or a broken checkout")
         raise unittest.SkipTest(message)
     return prev
+
+
+def _rule4_r1_head_lint() -> tuple[str, str]:
+    """(ref, text) of the lint at RULE4_R1_PR_HEAD, with the same skip / fail policy as _require_previous_head_lint."""
+    base = _baseline_lint_source()
+    if base is not None and base[1].replace("\r\n", "\n") == LINT_PS1.read_text(encoding="utf-8").replace("\r\n", "\n"):
+        raise unittest.SkipTest(f"{base[0]} already carries this lint; the r1 head is no longer a baseline")
+    done = subprocess.run(["git", "-C", str(ROOT), "show", f"{RULE4_R1_PR_HEAD}:{LINT_REL}"], capture_output=True, timeout=60)
+    if done.returncode == 0 and done.stdout:
+        return RULE4_R1_PR_HEAD[:8], done.stdout.decode("utf-8")
+    message = f"r1 PR head {RULE4_R1_PR_HEAD[:8]} is not in this clone; the r2 RED proof needs the PR history"
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        raise AssertionError(message + " -- the hygiene jobs check out with fetch-depth: 0, so a missing commit is a broken checkout")
+    raise unittest.SkipTest(message)
 
 
 def _psq(path: object) -> str:
@@ -923,6 +941,7 @@ def _differential_flips(work: Path, baseline_text: str | None = None, previous_h
                                   + PromptLintTests.CLAUSE_MUST_REFUSE_R12 + PromptLintTests.CLAUSE_MUST_PASS_R12
                                   + PromptLintTests.CLAUSE_MUST_REFUSE_R13 + PromptLintTests.CLAUSE_MUST_PASS_R13
                                   + RULE4_SECOND_LAUNCHER_REFUSE + RULE4_SECOND_LAUNCHER_GUARDS + RULE4_BOTH_ROUTED_PASS
+                                  + RULE4_R2_REFUSE + RULE4_R2_GUARDS + RULE4_R2_PASS
                                   + PromptLintTests.PROBE_ROWS
                                   + tuple(text for _, _, text in PromptLintTests.DEFEATER_AXIS) + PromptLintTests.DEFEATER_AXIS_CONTROLS,
                                   members=tuple(_list_member_rows(_lint_word_lists(LINT_PS1, work))))
@@ -998,6 +1017,10 @@ def _rule4_launcher(style: str, backend: str) -> str:
         "pwsh": f"pwsh -File {script} -Backend {backend}",
         "amp": f"& ./{script} -Backend {backend}",
         "app": f"{APP} take01.dat {SMOKE_MODE}",
+        # r2 styles: the script alone by name, and pwsh with options before -File. (A QUOTED `& '<path>' -Backend ...` call is not
+        # matched by any rule-4 pattern at all, at 75cb00e1 and on master alike: reported open, not a row here.)
+        "bare": f"{SMOKE_SCRIPT} -Backend {backend}",
+        "pwshopt": f"pwsh -NoProfile -NonInteractive -File {script} -Backend {backend}",
     }[style]
 
 
@@ -1041,6 +1064,109 @@ def _rule4_rows() -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
 
 
 RULE4_SECOND_LAUNCHER_REFUSE, RULE4_SECOND_LAUNCHER_GUARDS, RULE4_BOTH_ROUTED_PASS = _rule4_rows()
+
+# r2 (CoS review of 75cb00e1: a launcher's lazy gap crossed a `;` and swallowed the NEXT launcher, so the merged span took the first
+# clause's venue route). The r1 sets above are unchanged; everything below is new in r2.
+#   cross-clause   a venue-routed lead that is NOT itself a launcher ("pwsh -File build.ps1 on Bachelor", "<app> <file> on Bachelor")
+#                  followed by an UNROUTED launcher after each separator. The same-style pairs (pwsh + pwsh, app + app) are the CoS repro
+#                  shapes and PASSED at 75cb00e1 (RULE4_R2_CROSS_RED); the mixed-style pairs were refused there already.
+#   "or"           the separator the lint header promises (`or` is a Disjunct cut): the r1 product with " or " as the separator.
+#   single         one launcher per clause: routed passes, unrouted refuses. The verdict must equal the r1 verdict (parity).
+#   venue on B     the route belongs to launcher B only: with A a launcher A is refused; with A not a launcher the sentence passes.
+#   mixed styles   pwsh + app, & ./path + bare script name, pwsh with options before -File.
+RULE4_R2_SEPARATORS = RULE4_SEPARATORS + (("or", " or ", "run"),)
+RULE4_R2_PREFIXES = ("", "The venue job calls ")
+RULE4_R2_MIXED_PAIRS = (("pwsh", "app"), ("app", "pwsh"), ("path", "amp"), ("amp", "path"), ("amp", "bare"), ("bare", "amp"),
+                        ("pwsh", "bare"), ("app", "path"), ("pwshopt", "app"), ("bare", "pwshopt"))
+RULE4_R2_SINGLE_STYLES = ("path", "pwsh", "amp", "app", "bare", "pwshopt")
+
+
+def _rule4_lead(style: str, route: str) -> str:
+    """A venue-routed lead that is not itself a playback launcher: a pwsh call of another script, or the app with a file and no mode."""
+    return {"pwsh": f"pwsh -File build.ps1 {route}", "app": f"{APP} take01.dat {route}"}[style]
+
+
+def _rule4_r2_rows() -> dict[str, tuple[str, ...]]:
+    sets: dict[str, list[str]] = {k: [] for k in (
+        "cross_refuse", "cross_red", "cross_guards", "cross_allow", "or_refuse", "or_allow", "single_refuse", "single_pass",
+        "b_refuse", "b_pass", "mixed_refuse", "mixed_allow")}
+    cos = f"tools/profiling/{SMOKE_SCRIPT}"
+    # the two CoS repro lines of review 6218718347 (a pwsh pair and an app pair), verbatim shapes
+    cos_pwsh = f"pwsh -File build.ps1 on Bachelor; pwsh -File {cos} -Backend cpu."
+    cos_app = f"{APP} take01.dat on Bachelor; then run {APP} take01.dat {SMOKE_MODE}."
+    for row in (cos_pwsh, cos_app):
+        sets["cross_refuse"].append(row)
+        sets["cross_red"].append(row)
+    for prefix, lead_style, route in itertools.product(RULE4_R2_PREFIXES, ("pwsh", "app"), RULE4_ROUTES):
+        lead = f"{prefix}{_rule4_lead(lead_style, route)}"
+        for second_style in ("pwsh", "path", "amp", "app", "bare", "pwshopt"):
+            second = _rule4_launcher(second_style, RULE4_BACKENDS[0])
+            for name, sep, form in RULE4_R2_SEPARATORS:
+                bucket = "cross_guards" if name in RULE4_ALREADY_REFUSED_SEPARATORS else "cross_refuse"
+                sets[bucket].append(f"{lead}{sep}{_rule4_second(form, second)}.")
+                # same family as the lead (a pwsh lead + a pwsh -File second, an app lead + an app second) = the CoS repro shapes
+                # (the options form is RED at 75cb00e1 only behind the plain route; behind the chain route that head refused it already)
+                if bucket == "cross_refuse" and ((lead_style, second_style) in (("pwsh", "pwsh"), ("app", "app"))
+                                                 or ((lead_style, second_style) == ("pwsh", "pwshopt") and route == RULE4_ROUTES[0])):
+                    sets["cross_red"].append(f"{lead}{sep}{_rule4_second(form, second)}.")
+                for second_route in RULE4_ROUTES:
+                    sets["cross_allow"].append(f"{lead}{sep}{_rule4_second(form, second, second_route)}.")
+    # " or " over the r1 product (same-style pairs, a launcher as the lead)
+    for style, backend, route in itertools.product(("path", "pwsh", "amp", "app"), RULE4_BACKENDS, RULE4_ROUTES):
+        if style not in _rule4_styles(backend):
+            continue
+        first = f"The venue job calls {_rule4_launcher(style, RULE4_BACKENDS[0])} {route}"
+        second = _rule4_launcher(style, backend)
+        sets["or_refuse"].append(f"{first} or run {second}.")
+        for second_route in RULE4_ROUTES:
+            sets["or_allow"].append(f"{first} or run {second} {second_route}.")
+    # single-launcher clauses: parity with r1
+    for style, backend in itertools.product(RULE4_R2_SINGLE_STYLES, RULE4_BACKENDS):
+        if style == "app" and backend != RULE4_BACKENDS[0]:
+            continue
+        launcher = _rule4_launcher(style, backend)
+        for lead in ("Run", "The venue job calls", "Then run"):
+            sets["single_refuse"].append(f"{lead} {launcher}.")
+            for route in RULE4_ROUTES:
+                sets["single_pass"].append(f"{lead} {launcher} {route}.")
+    # the route belongs to launcher B only
+    for a_style, b_style in itertools.product(("path", "pwsh", "amp", "app", "bare"), repeat=2):
+        a = _rule4_launcher(a_style, RULE4_BACKENDS[0])
+        b = _rule4_launcher(b_style, RULE4_BACKENDS[1] if b_style != "app" else RULE4_BACKENDS[0])
+        for sep in ("; ", "; then run ", " and run "):
+            sets["b_refuse"].append(f"Run {a}{sep}{b} on Bachelor.")
+    for lead_style, b_style in itertools.product(("pwsh", "app"), ("path", "pwsh", "amp", "app", "bare")):
+        lead = {"pwsh": "pwsh -File build.ps1", "app": f"{APP} take01.dat"}[lead_style]
+        b = _rule4_launcher(b_style, RULE4_BACKENDS[0])
+        for sep in ("; ", "; then run ", " and run "):
+            sets["b_pass"].append(f"{lead}{sep}{b} on Bachelor.")
+    # mixed-style pairs: the first launcher routed, the second not (refuse) / both routed (allow)
+    for (first_style, second_style), (name, sep, form), route in itertools.product(RULE4_R2_MIXED_PAIRS, RULE4_R2_SEPARATORS, RULE4_ROUTES):
+        if name in RULE4_ALREADY_REFUSED_SEPARATORS:
+            continue
+        first = f"The venue job calls {_rule4_launcher(first_style, RULE4_BACKENDS[0])} {route}"
+        second = _rule4_launcher(second_style, RULE4_BACKENDS[0])
+        sets["mixed_refuse"].append(f"{first}{sep}{_rule4_second(form, second)}.")
+        sets["mixed_allow"].append(f"{first}{sep}{_rule4_second(form, second, route)}.")
+    return {k: tuple(dict.fromkeys(v)) for k, v in sets.items()}
+
+
+_RULE4_R2 = _rule4_r2_rows()
+RULE4_R2_CROSS_REFUSE = _RULE4_R2["cross_refuse"]
+RULE4_R2_CROSS_RED = _RULE4_R2["cross_red"]
+RULE4_R2_CROSS_GUARDS = _RULE4_R2["cross_guards"]
+RULE4_R2_CROSS_ALLOW = _RULE4_R2["cross_allow"]
+RULE4_R2_OR_REFUSE = _RULE4_R2["or_refuse"]
+RULE4_R2_OR_ALLOW = _RULE4_R2["or_allow"]
+RULE4_R2_SINGLE_REFUSE = _RULE4_R2["single_refuse"]
+RULE4_R2_SINGLE_PASS = _RULE4_R2["single_pass"]
+RULE4_R2_B_REFUSE = _RULE4_R2["b_refuse"]
+RULE4_R2_B_PASS = _RULE4_R2["b_pass"]
+RULE4_R2_MIXED_REFUSE = _RULE4_R2["mixed_refuse"]
+RULE4_R2_MIXED_ALLOW = _RULE4_R2["mixed_allow"]
+RULE4_R2_REFUSE = RULE4_R2_CROSS_REFUSE + RULE4_R2_OR_REFUSE + RULE4_R2_B_REFUSE + RULE4_R2_MIXED_REFUSE
+RULE4_R2_GUARDS = RULE4_R2_CROSS_GUARDS + RULE4_R2_SINGLE_REFUSE
+RULE4_R2_PASS = RULE4_R2_CROSS_ALLOW + RULE4_R2_OR_ALLOW + RULE4_R2_SINGLE_PASS + RULE4_R2_B_PASS + RULE4_R2_MIXED_ALLOW
 
 
 class HubHostsFileTests(unittest.TestCase):
@@ -1795,6 +1921,47 @@ class PromptLintTests(unittest.TestCase):
         counts = _json_counts(LINT_PS1, rows, self.tmp, "rule4-pass")
         self.assertEqual([], [t for t, n in zip(rows, counts) if n > 0], "rule-4 rows with both launchers routed that the lint refused")
 
+    def test_red_rule4_r2_a_launcher_never_reaches_across_a_clause_into_the_next_launcher(self):
+        """r2 (CoS review of 75cb00e1): the two CoS repro lines, every cross-clause variant after every separator (` or ` included), the
+        route that belongs to launcher B only, and the mixed-style pairs are refused."""
+        cos = f"tools/profiling/{SMOKE_SCRIPT}"
+        for line in (f"pwsh -File build.ps1 on Bachelor; pwsh -File {cos} -Backend cpu.",
+                     f"{APP} take01.dat on Bachelor; then run {APP} take01.dat {SMOKE_MODE}."):
+            self.assertIn(line, RULE4_R2_CROSS_RED)
+        self.assertTrue(any(" or run " in t for t in RULE4_R2_CROSS_REFUSE + RULE4_R2_OR_REFUSE + RULE4_R2_MIXED_REFUSE), "no ` or ` separator row")
+        rows = list(RULE4_R2_REFUSE + RULE4_R2_GUARDS)
+        counts = _json_counts(LINT_PS1, rows, self.tmp, "rule4-r2-refuse")
+        self.assertEqual([], [t for t, n in zip(rows, counts) if n == 0], "r2 rows the lint passed that it must refuse")
+
+    def test_green_rule4_r2_routed_launchers_pass(self):
+        """r2: every launcher routed (cross-clause, ` or `, single-launcher clauses, route on B with a non-launcher A, mixed styles)."""
+        rows = list(RULE4_R2_PASS)
+        counts = _json_counts(LINT_PS1, rows, self.tmp, "rule4-r2-pass")
+        self.assertEqual([], [t for t, n in zip(rows, counts) if n > 0], "r2 rows with every launcher routed that the lint refused")
+
+    def test_rule4_r2_the_cross_clause_rows_are_red_on_the_r1_head_and_every_other_row_keeps_its_r1_verdict(self):
+        """RED proof kept in the suite: the CoS repro shapes (RULE4_R2_CROSS_RED) PASS on the lint of the r1 head 75cb00e1. Nothing else
+        moves against it except the listed opening: a route on launcher B whose lead A is NOT a launcher (RULE4_R2_B_PASS) was refused
+        at the r1 head (the span swallowed B and took A's clause) and passes now. The r1 sets keep their 98 / 196 rows and verdicts."""
+        self.maxDiff = None
+        r1 = _rule4_r1_head_lint()
+        (self.tmp / "rule4-r1-head.ps1").write_text(r1[1], encoding="utf-8")
+        self.assertEqual((98, 196), (len(RULE4_SECOND_LAUNCHER_REFUSE), len(RULE4_BOTH_ROUTED_PASS)))
+        red = list(RULE4_R2_CROSS_RED)
+        counts = _json_counts(self.tmp / "rule4-r1-head.ps1", red, self.tmp, "rule4-r2-red")
+        self.assertEqual([], [t for t, n in zip(red, counts) if n > 0], f"rows {r1[0]} already refuses: not a RED row")
+        refuse_rows = list(RULE4_R2_REFUSE + RULE4_R2_GUARDS + RULE4_SECOND_LAUNCHER_REFUSE + RULE4_SECOND_LAUNCHER_GUARDS)
+        pass_rows = list(RULE4_R2_PASS + RULE4_BOTH_ROUTED_PASS)
+        texts = refuse_rows + pass_rows
+        old = _json_counts(self.tmp / "rule4-r1-head.ps1", texts, self.tmp, "rule4-r2-r1head")
+        new = _json_counts(LINT_PS1, texts, self.tmp, "rule4-r2-now")
+        closed = [t for t, a, b in zip(texts, old, new) if a == 0 and b > 0]
+        opened = [t for t, a, b in zip(texts, old, new) if a > 0 and b == 0]
+        self.assertEqual([], [t for t in closed if t not in RULE4_R2_REFUSE], f"a row {r1[0]} passed that is not a listed r2 closure")
+        self.assertEqual([], [t for t in red if t not in closed], "every RED row must close")
+        self.assertEqual([], [t for t in opened if t not in RULE4_R2_B_PASS], f"a row {r1[0]} refused that now passes and is not a route-on-B row")
+        self.assertTrue(opened, "the route-on-B rows must be the over-refusal this round removed")
+
     def test_rule4_the_refuse_rows_are_red_on_the_baseline(self):
         """RED proof kept in the suite: while master still carries the first-occurrence-only rule 4, every second-launcher row passes it.
         Once master carries this lint (baseline == candidate) the comparison is moot and the test skips, like the differential pin."""
@@ -2288,6 +2455,12 @@ class LintDifferentialPinTests(unittest.TestCase):
          "semicolon group that names no local host): 'Run playback on Bachelor rather than / instead of / without / nor / , not locally' -- the marker is the first "
          "thing of the contrast complement, so it is what the prompt rules out. (Only `locally` flips: the host and 'here' markers were "
          "already passed by the baseline's sentence-wide weak-negation / venue exemption.)"),
+        ("rule4-r2-route-on-launcher-b-with-a-non-launcher-lead",
+         lambda text, f: f.get("tpl") == "seed" and text in RULE4_R2_B_PASS,
+         "NA2-RULE4-PER-LAUNCHER-SCOPE-1 r2 (listed in the PR body): 'pwsh -File build.ps1; pwsh -File <script> -Backend cpu on Bachelor.' "
+         "and the app form (RULE4_R2_B_PASS, 6 rows) hold ONE launcher, the second, and it carries its own venue route; the first call is "
+         "not a playback launcher. Master's greedy gap ran over the ';' and scored the match in the first, unrouted clause, so it "
+         "refused them; a launcher's gap now stops at ';' and at the next launcher token, so only the real launcher is scored."),
     )
     _CLAUSE_SCOPED_TPLS = ("marker-contrast-venue", "marker-contrast-marker", "contrast-first", "marker-join-venue", "venue-join-marker")
     ALLOWED_PASS_TO_REFUSE = (
@@ -2358,10 +2531,12 @@ class LintDifferentialPinTests(unittest.TestCase):
          "r1b over-refusal kept on purpose (card HUB-VM-LINT-LOG-COPY-OVERREFUSAL-1): 'copy the log on this host' after a venue run "
          "is refused like its `locally` twin; a handling-verb list would open 'Copy the clip locally and run playback.'"),
         ("rule4-per-launcher-scope",
-         lambda text, f: f.get("tpl") == "seed" and text in RULE4_SECOND_LAUNCHER_REFUSE,
+         lambda text, f: f.get("tpl") == "seed" and (text in RULE4_SECOND_LAUNCHER_REFUSE or text in RULE4_R2_REFUSE),
          "NA2-RULE4-PER-LAUNCHER-SCOPE-1, CoS post-merge Blocker on #448 (ask 6216180502): rule 4 scores EACH launcher occurrence, so a "
          "venue locus exempts only the launcher it routes. Master read only the first occurrence and passed '<launcher> -Backend cpu on "
-         "Bachelor; then run <launcher> -Backend cpu.' and its relatives (RULE4_SECOND_LAUNCHER_REFUSE)."),
+         "Bachelor; then run <launcher> -Backend cpu.' and its relatives (RULE4_SECOND_LAUNCHER_REFUSE). r2 (CoS review of 75cb00e1): "
+         "the same for a venue-routed lead that is not a launcher, ` or `, a route that belongs to launcher B, and mixed-style pairs "
+         "(RULE4_R2_REFUSE)."),
     )
 
     # r7 PREVIOUS-HEAD gate (CoS Prevention on a595464f). Against the lint of the PR head this round started from, NOTHING may open:
@@ -2376,6 +2551,13 @@ class LintDifferentialPinTests(unittest.TestCase):
          "head grammar admits every member of HeadJoiners / HeadContrasts as its own piece, so a pure venue-routed launch, a joiner and a "
          "verbless host negation pass; the rows are the r12 ALLOW generator (r12-allow-head), refused by master too (`locally` + a "
          "listed launch verb), and each is terminal under the ruling's grammar."),
+        ("rule4-r2-route-on-launcher-b-with-a-non-launcher-lead",
+         lambda text, f: f.get("tpl") == "seed" and text in RULE4_R2_B_PASS,
+         "NA2-RULE4-PER-LAUNCHER-SCOPE-1 r2 (listed in the PR body): 'pwsh -File build.ps1; pwsh -File <script> -Backend cpu on Bachelor.' "
+         "(and the app form) has ONE launcher, the second, and it carries its own venue route; the first call is not a playback launcher. "
+         "d2f3cd05 (and the r1 head) let the first call's lazy gap run over the ';' so the merged span sat in the unrouted first clause "
+         "and the sentence was refused. A launcher's gap now stops at ';' and at the next launcher token, so only the real launcher is "
+         "scored, and it is routed (RULE4_R2_B_PASS, 6 rows: 3 separators x pwsh / app). Master passes them too."),
     )
     ALLOWED_PREVIOUS_HEAD_PASS_TO_REFUSE = (
         ("r10-strictly-terminal-e1",
@@ -2418,10 +2600,12 @@ class LintDifferentialPinTests(unittest.TestCase):
          "executable is a launch). An executable that carries its own route, follows a prohibition, or is the marker clause's own "
          "launch still passes (CLAUSE_MUST_PASS_R13)."),
         ("rule4-per-launcher-scope",
-         lambda text, f: f.get("tpl") == "seed" and text in RULE4_SECOND_LAUNCHER_REFUSE,
+         lambda text, f: f.get("tpl") == "seed" and (text in RULE4_SECOND_LAUNCHER_REFUSE or text in RULE4_R2_REFUSE),
          "NA2-RULE4-PER-LAUNCHER-SCOPE-1, CoS post-merge Blocker on #448 (ask 6216180502): a venue-routed first launcher no longer "
          "exempts a second, unrouted one after ';', ', then' or ' then' (RULE4_SECOND_LAUNCHER_REFUSE). The d2f3cd05 lint passed every "
-         "one of them (rule 4 read only the first launcher occurrence), and master passes them too."),
+         "one of them (rule 4 read only the first launcher occurrence), and master passes them too. r2 (CoS review of 75cb00e1): a "
+         "launcher's gap stops at ';' and at the next pwsh / powershell / app token and spans of different clauses never merge, so "
+         "RULE4_R2_REFUSE (cross-clause pairs, ` or `, a route on launcher B only, mixed styles) refuses as well."),
     )
 
     @classmethod
