@@ -6774,6 +6774,16 @@ function Get-AttrCudaSourceFramesVerdict {
         $failures += "INVALID_SOURCE_FRAMES: required_source_frames=$required; the admitted window is unknown."
     } elseif ($advanced -lt $required) {
         $failures += "INVALID_SOURCE_FRAMES: the engine advanced source_advanced=$advanced distinct source frames but the Play had to consume required_source_frames=$required; under 20 s of real footage is never playback evidence."
+        # HFR-10S-1 >>>
+        # Text only (the verdict never reads it): an HFR source (>= 50 fps native) is admitted at 10 s, so the message names that floor.
+        # Every other rate keeps the base line above verbatim.
+        if ($fields.ContainsKey('native_fps')) {
+            $nativeForText = [double]::Parse($fields['native_fps'], [Globalization.CultureInfo]::InvariantCulture)
+            if ($nativeForText -ge 50.0 -and -not [double]::IsInfinity($nativeForText)) {
+                $failures[-1] = $failures[-1] -replace 'under 20 s of real footage', 'under 10 s of real footage'
+            }
+        }
+        # HFR-10S-1 <<<
     }
     # ENFORCE-4: the oracle re-derives the 20 s floor itself (see Get-GuiSmokeSourceFramesVerdict): a requirement under
     # ceil(20 s x native fps) was admitted for less than 20 s of footage, and a native fps of 0 cannot measure 20 s.
@@ -6781,6 +6791,15 @@ function Get-AttrCudaSourceFramesVerdict {
         $nativeForFloor = [double]::Parse($fields['native_fps'], [Globalization.CultureInfo]::InvariantCulture)
         if ($nativeForFloor -le 0) {
             $failures += "INVALID_SOURCE_FRAMES: native_fps=$nativeForFloor; the native frame rate is unknown, so 20 s of footage cannot be measured."
+        # HFR-10S-1 >>>
+        # Owner amendment 2026-10-15: footage of >= 50 fps native (HFR) needs 10 s, ceil(10 x native fps) source frames; every other
+        # rate keeps the 20 s branch below. Mirrors platform/qt/PlaybackFrameRange.h minPlayWindowSeconds (the emitted job cannot
+        # dot-source gui-smoke-length-gate.ps1's Get-GuiSmokeMinPlaySeconds); a parity test executes all copies on one table.
+        } elseif ($nativeForFloor -ge 50.0 -and -not [double]::IsInfinity($nativeForFloor)) {
+            if ($null -ne $required -and $required -gt 0 -and $required -lt [int64][Math]::Ceiling(10.0 * $nativeForFloor - 0.02)) {
+                $failures += "INVALID_SOURCE_FRAMES: required_source_frames=$required is under ceil(10 s x native_fps=$nativeForFloor); the Play was admitted for less than 10 s of HFR footage."
+            }
+        # HFR-10S-1 <<<
         } elseif ($null -ne $required -and $required -gt 0 -and $required -lt [int64][Math]::Ceiling(20.0 * $nativeForFloor - 0.02)) {
             $failures += "INVALID_SOURCE_FRAMES: required_source_frames=$required is under ceil(20 s x native_fps=$nativeForFloor); the Play was admitted for less than 20 s of footage."
         }

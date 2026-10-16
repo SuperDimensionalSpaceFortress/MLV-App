@@ -293,6 +293,13 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
     HFR_CONFORM_OPEN = "HFR-CONFORM-AWARE-RECEIPT-ORACLES-1 >>>"
     HFR_CONFORM_CLOSE = "HFR-CONFORM-AWARE-RECEIPT-ORACLES-1 <<<"
     HFR_CONFORM_REGIONS = 3
+    # PLAYBACK-CLIP-LENGTH-HFR-10S-1 (owner amendment 2026-10-15): the HFR (>= 50 fps native) 10 s floor branch the embedded source-frame
+    # oracle (Get-AttrCudaSourceFramesVerdict) gains ahead of the unchanged 20 s branch, plus the HFR-only 10 s wording of the
+    # "under N s of real footage" message. Two regions; the baseline's 20 s lines stay verbatim outside them.
+    # The sentinel is the short card id: AttrCudaArtifacts.psm1 may not carry the full one (NoFootageTokensTests forbids its "clip" token there).
+    HFR_10S_OPEN = "HFR-10S-1 >>>"
+    HFR_10S_CLOSE = "HFR-10S-1 <<<"
+    HFR_10S_REGIONS = 2
 
     @classmethod
     def strip_regions(cls, text: str) -> tuple[str, dict[str, int]]:
@@ -303,7 +310,8 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
                     "keepalive-hung-probe": (cls.KEEPALIVE_HUNG_PROBE_OPEN, cls.KEEPALIVE_HUNG_PROBE_CLOSE),
                     "session-locked": (cls.SESSION_LOCKED_OPEN, cls.SESSION_LOCKED_CLOSE),
                     "playback-vsync": (cls.PLAYBACK_VSYNC_OPEN, cls.PLAYBACK_VSYNC_CLOSE),
-                    "hfr-conform-oracles": (cls.HFR_CONFORM_OPEN, cls.HFR_CONFORM_CLOSE)}
+                    "hfr-conform-oracles": (cls.HFR_CONFORM_OPEN, cls.HFR_CONFORM_CLOSE),
+                    "hfr-10s-floor": (cls.HFR_10S_OPEN, cls.HFR_10S_CLOSE)}
         kept: list[str] = []
         inside: str | None = None
         counts = {name: 0 for name in families}
@@ -352,6 +360,8 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         self.assertEqual(old_counts["playback-vsync"], self.PLAYBACK_VSYNC_REGIONS, "the baseline (the pinned GPU-PREF-REGISTRY-STOP-AND-PRUNE-1 generator commit) carries the same bracketed regions")
         self.assertEqual(new_counts["hfr-conform-oracles"], self.HFR_CONFORM_REGIONS, "the default job carries exactly the pinned number of bracketed HFR-CONFORM-AWARE-RECEIPT-ORACLES-1 regions")
         self.assertEqual(old_counts["hfr-conform-oracles"], self.HFR_CONFORM_REGIONS, "the baseline (the pinned GPU-PREF-REGISTRY-STOP-AND-PRUNE-1 generator commit) carries the same bracketed regions")
+        self.assertEqual(new_counts["hfr-10s-floor"], self.HFR_10S_REGIONS, "the default job carries exactly the pinned number of bracketed PLAYBACK-CLIP-LENGTH-HFR-10S-1 regions")
+        self.assertEqual(old_counts["hfr-10s-floor"], 0, "the baseline predates the owner's HFR 10 s amendment")
         self.assertEqual(stripped, old_stripped,
                          "the DEFAULT (bachelor/cuda) emitted job changed outside the bracketed regions -- it must stay byte-identical to the pinned baseline")
 
@@ -796,9 +806,9 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("CLIP_TOO_SHORT", proc.stdout + proc.stderr)
         self.assertFalse(out.exists())
-        # ... and a play window under 20 s never binds.
+        # ... and a play window under the lowest floor (PLAYBACK-CLIP-LENGTH-HFR-10S-1: an HFR clip's 10 s) never binds.
         proc = run_pwsh(["-File", str(GENERATOR), "-SourceCommit", self.head, "-BuildManifestSha256", "ab" * 32, "-ClipId", FIXTURE_IDS[0],
-                         "-FixtureSha256", "cd" * 32, "-RepoRoot", str(self.repo), "-OutFile", str(out), "-PlaySeconds", "19"])
+                         "-FixtureSha256", "cd" * 32, "-RepoRoot", str(self.repo), "-OutFile", str(out), "-PlaySeconds", "9"])
         self.assertNotEqual(proc.returncode, 0)
         self.assertFalse(out.exists())
 
@@ -1788,15 +1798,22 @@ class PlayWindowTests(RunnerHarness, unittest.TestCase):
         _, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(play_seconds=None))
         self.assertIn("PlaySeconds=25", self.generator_calls()[-1])
 
-    def test_a_window_under_20_seconds_is_refused_before_submission(self) -> None:
-        for window in (1, 19):
+    def test_a_window_under_the_lowest_floor_is_refused_before_submission(self) -> None:
+        # PLAYBACK-CLIP-LENGTH-HFR-10S-1: a leg names a clip id, never its fps, so it refuses what NO clip could admit (under the
+        # HFR clip's 10 s); a window under a non-HFR clip's 20 s is refused at the venue by the runner and the app (the clip's header).
+        for window in (1, 9):
             _, receipt, submitted = self.run_leg("ultra-magnus", self.write_spec(play_seconds=window))
             self.assertEqual(submitted, [])
             self.assertEqual(self.generator_calls(), [])
             self.assertEqual(receipt["refusal"], "PLAY_WINDOW_TOO_SHORT")
 
+    def test_a_ten_second_window_reaches_the_generator_for_an_hfr_clip(self) -> None:
+        _, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(play_seconds=10))
+        self.assertNotEqual(receipt.get("refusal"), "PLAY_WINDOW_TOO_SHORT", receipt)
+        self.assertIn("PlaySeconds=10", self.generator_calls()[-1])
+
     def test_mutation_without_the_window_floor_a_one_second_play_reaches_the_venue(self) -> None:
-        mutated = self.mutated_runner([("Invoke-VenueLeg.ps1", "if ($playSeconds -lt 20) {", "if ($false) {")])
+        mutated = self.mutated_runner([("Invoke-VenueLeg.ps1", "if ($playSeconds -lt (Get-DvMinPlaySeconds -LowestAnyClip)) {", "if ($false) {")])
         _, receipt, submitted = self.run_leg("ultra-magnus", self.write_spec(play_seconds=1), dv=mutated)
         self.assertNotEqual(submitted, [])
 
@@ -1913,11 +1930,28 @@ class ReceiptRederivesTheTwentySecondFloorTests(ModuleMutationMixin, unittest.Te
     # (sol's 20-frame repro, the valid=true repro and the floor mutation run through the evidence-bearing path:
     #  EvidenceBoundReceiptTests.test_sols_20_frame_repro_..., test_a_stored_valid_true_..., test_mutation_without_the_floor_...)
     def test_the_floor_is_ceil_20_seconds_times_the_native_fps(self) -> None:
-        for native, floor in ((24.0, 480), (23.976, 480), (25.0, 500), (30.0, 600), (60.0, 1200)):
+        # PLAYBACK-CLIP-LENGTH-HFR-10S-1 (owner amendment 2026-10-15): footage of >= 50 fps native needs 10 s, ceil(10 x native fps).
+        for native, floor, seconds in ((24.0, 480, 20), (23.976, 480, 20), (25.0, 500, 20), (30.0, 600, 20), (49.0, 980, 20),
+                                       (50.0, 500, 10), (59.94, 600, 10), (60.0, 600, 10)):
             ok = ps_problems(good_block(nativeFps=native, paceFps=native, requiredSourceFrames=floor, sourceAdvanced=floor + 10, jobRequiredSourceFrames=floor, jobSourceAdvanced=floor + 10))
             self.assertEqual(ok, [], f"native {native}: {floor} frames is exactly the floor")
             short = ps_problems(good_block(nativeFps=native, paceFps=native, requiredSourceFrames=floor - 1, sourceAdvanced=floor + 10, jobRequiredSourceFrames=floor - 1, jobSourceAdvanced=floor + 10))
-            self.assertTrue(any("ceil(20 s x native_fps" in p for p in short), f"native {native}: {floor - 1} frames is under 20 s: {short}")
+            self.assertTrue(any(f"ceil({seconds} s x native_fps" in p for p in short), f"native {native}: {floor - 1} frames is under {seconds} s: {short}")
+
+    def test_the_hfr_floor_mirrors_the_apps_one_derivation(self) -> None:
+        # PLAYBACK-CLIP-LENGTH-HFR-10S-1: this module cannot dot-source the gate, so it mirrors minPlayWindowSeconds; the constants
+        # agree with platform/qt/PlaybackFrameRange.h and the function agrees with the gate's on one table, unknown = 20 s.
+        header = (ROOT / "platform" / "qt" / "PlaybackFrameRange.h").read_text(encoding="utf-8")
+        module = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        for cpp, ps in (("kStandardMinPlayWindowSeconds", "StandardMinPlaySeconds"), ("kHfrMinPlayWindowSeconds", "HfrMinPlaySeconds"),
+                        ("kHfrNativeFpsThreshold", "HfrNativeFpsThreshold")):
+            value = re.search(rf"constexpr double {cpp} = ([0-9.]+);", header).group(1)
+            self.assertIn(f"$script:{ps} = {value}", module)
+        table = "@(59.94, 60, 50, 49.999, 29.97, 23.976, 0, -60, 'NaN', 'Infinity', 'abc', $null)"
+        mod = _ps_json(f"{table} | ForEach-Object {{ Get-DvMinPlaySeconds -NativeFps $_ }}; Get-DvMinPlaySeconds -LowestAnyClip\n",
+                       DV / "DualVenueRunner.psm1", {})
+        self.assertEqual(mod.returncode, 0, mod.stdout + mod.stderr)
+        self.assertEqual(mod.stdout.split(), ["10", "10", "10", "20", "20", "20", "20", "20", "20", "20", "20", "20", "10"])
 
     def test_pace_override_wrap_and_absent_fields_are_judged_from_the_receipts_own_fields(self) -> None:
         cases = {
@@ -6066,9 +6100,10 @@ class LegSpecSchemaTests(unittest.TestCase):
             self.assertNotRegex(path.read_text(encoding="utf-8"), r"(?i)[a-z]:[\\/]|\.mlv\b", f"{path.name} must name no path")
 
     def test_the_schema_rejects_a_fixture_leg_a_path_and_a_short_window(self) -> None:
+        # A short window is one under the lowest floor (PLAYBACK-CLIP-LENGTH-HFR-10S-1: an HFR clip's 10 s); a leg cannot see the clip's fps.
         spec = json.loads(next(iter(sorted((DV / "legs").glob("*speed*.json")))).read_text(encoding="utf-8"))
         for override in ({"clipId": FIXTURE_IDS[0]}, {"clipId": FIXTURE_IDS[1]}, {"clipId": "C:/footage/" + OWNER_CLIP},
-                         {"playSeconds": 19}, {"clipPath": "C:/x"}):
+                         {"playSeconds": 9}, {"clipPath": "C:/x"}):
             with self.assertRaises(self.jsonschema.ValidationError, msg=str(override)):
                 self.jsonschema.validate(dict(spec, **override), self.schema)
 
@@ -6458,6 +6493,9 @@ class LookReceiptGeneratorTests(unittest.TestCase):
                 # HFR-CONFORM-AWARE-RECEIPT-ORACLES-1's regions: present in both too, at their pinned count.
                 self.assertEqual((new_counts.pop("hfr-conform-oracles"), old_counts.pop("hfr-conform-oracles")),
                                  (GeneratorByteIdentityAndVariantTests.HFR_CONFORM_REGIONS, GeneratorByteIdentityAndVariantTests.HFR_CONFORM_REGIONS), name)
+                # PLAYBACK-CLIP-LENGTH-HFR-10S-1's region: in the new job only (the base predates the owner's 2026-10-15 amendment).
+                self.assertEqual((new_counts.pop("hfr-10s-floor"), old_counts.pop("hfr-10s-floor")),
+                                 (GeneratorByteIdentityAndVariantTests.HFR_10S_REGIONS, 0), name)
                 self.assertEqual(new_counts, old_counts, f"{name}: the job without -LookReceiptPath carries the base generator's bracketed regions")
                 self.assertEqual(kept, old_kept, f"{name}: the job without -LookReceiptPath must be the base generator's bytes")
                 self.assertNotIn(b"LookReceipt", new)

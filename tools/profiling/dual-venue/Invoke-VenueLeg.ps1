@@ -19,7 +19,8 @@
 #   2. ADMIT THE CLIP (round 2, owner rule 2026-09-30): a leg names a CONSENTED CLIP ID, never a path. A tracked
 #      fixture (2 / 16 frames) is refused by master's length gate (FIXTURE_REFUSED_CLIP_TOO_SHORT); a clip this
 #      VENUE has no owner-typed record for in venue-clip-consent.json is refused (VENUE_CLIP_CONSENT_ABSENT);
-#      a play window under 20 s is refused (PLAY_WINDOW_TOO_SHORT); the reviewed cleanup switch must be on
+#      a play window under the lowest floor (10 s, an HFR clip's; 20 s otherwise, applied at the venue) is refused
+#      (PLAY_WINDOW_TOO_SHORT); the reviewed cleanup switch must be on
 #      (OWNER_CLIP_REFUSED_PENDING_CROSS_VOLUME_2). All BEFORE anything is generated or submitted;
 #   3. generate the job (tools/profiling/bachelor/playback-attr-3-cuda-job.ps1 -ClipId -PlaySeconds -Venue -Backend ...):
 #      the generator resolves the clip by id and refuses what master's clip-length gate refuses;
@@ -218,7 +219,8 @@ if ([string]::IsNullOrWhiteSpace($Backend)) { $Backend = [string]@($spec.backend
 if ($Backend -notin @($spec.backends)) { throw "DVE_LEG_SPEC_INVALID backend '$Backend' is not one of this leg's backends ($(@($spec.backends) -join ', '))" }
 $isLook = ($spec.legType -eq 'look')
 # The settled-playback window the job passes to the smoke runner (generator -PlaySeconds). The generator's own default
-# is 25; the owner's floor is 20 and is enforced here before anything is submitted.
+# is 25; the owner's floor (20 s, 10 s for an HFR clip: HFR-10S-1) is enforced here, at its lowest, before anything is
+# submitted, and at the clip's own value by the venue's runner and the app.
 $playSeconds = 25
 if ($null -ne $spec.PSObject.Properties['playSeconds']) { $playSeconds = [int]$spec.playSeconds }
 $lookFlavor = $null
@@ -341,7 +343,9 @@ try {
     }
     # The consent and the venue table must be the COMMITTED ones (production) before anything else is decided.
     if ($null -ne $admissionRefusal) { Stop-Refused $admissionRefusal }
-    if ($playSeconds -lt 20) { Stop-Refused 'PLAY_WINDOW_TOO_SHORT' }
+    # HFR-10S-1: a leg names a clip id, never its fps, so it refuses only what NO clip could admit; the venue's runner
+    # (the clip's header) and the app refuse a window under that clip's own floor (20 s, 10 s for an HFR clip).
+    if ($playSeconds -lt (Get-DvMinPlaySeconds -LowestAnyClip)) { Stop-Refused 'PLAY_WINDOW_TOO_SHORT' }
     $admission = Get-DvClipAdmission -ClipId ([string]$spec.clipId) -Venue $Venue -Table $table -ConsentText ([string]$sources.consentText) -RepoRoot $RepoRoot
     if (-not $admission.admitted) { Stop-Refused ([string]$admission.reason) }
     $receipt.admission.ownerLineSha256 = $admission.ownerLineSha256
