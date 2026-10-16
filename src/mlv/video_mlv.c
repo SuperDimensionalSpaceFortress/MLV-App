@@ -8697,10 +8697,13 @@ static int mlv_dualiso_preview_scale_recon_plan_internal(mlvObject_t * video,
     plan->reducedWidth = full_w / scale;
     plan->reducedHeight = source_h / scale;
     plan->fullResFixes = fixes ? 1 : 0;
-    /* PLAYBACK-CUDA-HONOUR-SCALE-1 r4: the GPU route shrinks on correctly centred,
-     * same-ISO tent bins (the decimators' off-site Gr/Gb turn into AMaZE's column
-     * comb). The CPU route keeps its decimators byte for byte. */
-    plan->phaseTentShrink = gpu ? 1 : 0;
+    /* PLAYBACK-CUDA-HONOUR-SCALE-1 r4: shrink on correctly centred, same-ISO tent
+     * bins (the decimators' off-site Gr/Gb turn into AMaZE's column comb).
+     * PLAYBACK-CPU-REDUCED-SCALE-DISPLAY-GEOMETRY-1: the CPU route too; its
+     * decimators put R, G and B on different column phases and drop rows (colour
+     * fringes and a shifted picture against the paused frame at x2/x4). x8 keeps
+     * its decimator: the tent supports 2 and 4 only. */
+    plan->phaseTentShrink = (scale == 2 || scale == 4) ? 1 : 0;
     return 1;
 }
 

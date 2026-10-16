@@ -345,7 +345,7 @@ param(
     # on gui_smoke.visual_state (look_assist_flavor); the job records that report as lookFlavorReported and
     # lookFlavorHonored = (reported equals requested). An app that reports nothing is 'none' -> not honoured.
     # Only emitted for a LOOK leg (-ForceLookAssist); the default 'classic' adds nothing.
-    [ValidateSet('classic', 'cinematic', 'film')]
+    [ValidateSet('classic', 'cinematic', 'film', 'vision50d')]
     [string]$LookFlavor = 'classic',
 
     # PLAYBACK-BACHELOR-PRESENT-JITTER-1: a capture-free PACE leg -- -ForceLookAssist (and -LookFlavor) without
@@ -421,6 +421,10 @@ param(
     # land in the run log after the Play stops). Absent: nothing is set and the emitted job is the text it was before this parameter.
     [switch]$PresentTrace,
 
+    # PLAYBACK-STARTUP-WAIT-PREWARM-1: the app's opt-in first-present identity capture (MLVAPP_SMOKE_FIRST_PRESENT_CAPTURE=1: the paused start
+    # frame before the measured Play and the first present after its swap, both into the contact-sheet dir as identity-*). Absent: nothing is
+    # set and the emitted job is the text it was before this parameter.
+    [switch]$FirstPresentCapture,
     # CUDA-HEADROOM-1: an unpaced throughput leg (MLVAPP_PLAYBACK_UNPACED=1 lifts the app's pace guard in an automation run, and the
     # smoke runs with -DropFrameMode off, so every frame is rendered and presented as fast as the pipeline allows). Absent: nothing is
     # set and the emitted job is the text it was before this parameter.
@@ -4484,6 +4488,16 @@ if ($PresentTrace) {
     })
 }
 
+# PLAYBACK-STARTUP-WAIT-PREWARM-1: the same env-list site gains the first-present identity capture flag, only when asked.
+if ($FirstPresentCapture) {
+    $identityAnchor = [regex]"(?<ind>[ \t]*)'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',(?<nl>\r?\n)"
+    if ($identityAnchor.Matches($text).Count -ne 1) { throw 'DUAL_VENUE_FIRST_PRESENT_CAPTURE_ANCHOR_MISSING the job template has no single env-list site to add MLVAPP_SMOKE_FIRST_PRESENT_CAPTURE to' }
+    $text = $identityAnchor.Replace($text, [System.Text.RegularExpressions.MatchEvaluator]{
+        param($m)
+        $m.Value + $m.Groups['ind'].Value + "'MLVAPP_SMOKE_FIRST_PRESENT_CAPTURE=1'," + $m.Groups['nl'].Value
+    })
+}
+
 # GPU-DEVICE-LOSS-SELF-HEAL-1 r2: the self-heal proof (see the parameters). Everything below is added to the expanded text and only when asked, so
 # every other job is the text it always was. Each anchor must match exactly once, or the generator throws.
 # `pwsh -File` passes an array argument as ONE string, so -GpuPreLaunches a,b is split on commas.
@@ -4734,6 +4748,7 @@ $clipContentSha256 = if ($isFixtureRehearsal) {
     swapInterval = $(if ($SwapInterval -ge 0) { $SwapInterval } else { $null })
     cudaLaunchTimingMinMs = $(if ($CudaLaunchTimingMinMs -ge 0) { $CudaLaunchTimingMinMs } else { $null })
     presentTrace = [bool]$PresentTrace
+    firstPresentCapture = [bool]$FirstPresentCapture
     unpaced = [bool]$Unpaced
     scope =$(if ([string]::IsNullOrEmpty($Scope)) { 'none' } else { $Scope })
     scopeIntervalMs = $(if ($ScopeIntervalMs -ge 0) { $ScopeIntervalMs } else { $null })

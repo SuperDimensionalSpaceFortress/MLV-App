@@ -109,6 +109,9 @@ DECODER_LEGS = {"legs/m16-1243-pace-cinematic-fullscreen-s4-dec1.json": "legs/m1
 UPSTREAM_BASELINE_LEGS = tuple(f"legs/m16-1243-upstream-baseline-cpu-{mode}-s1.json" for mode in ("fullscreen", "windowed"))
 # PLAYBACK-STARTUP-CATCHUP-BURST-1 r7: the present-trace twin of a display-matrix cell, differing only in its legId and generatorArgs.presentTrace true.
 PTRACE_LEGS = {"legs/m16-1243-display-fullscreen-s4-ptrace.json": "legs/m16-1243-display-fullscreen-s4.json"}
+# PLAYBACK-STARTUP-WAIT-PREWARM-1: the first-present identity twins of two display-matrix cells, differing only in their legId and
+# generatorArgs.firstPresentCapture true.
+IDENTITY_LEGS = {f"legs/m16-1243-display-{cell}-identity.json": f"legs/m16-1243-display-{cell}.json" for cell in ("windowed-s1", "fullscreen-s4")}
 # PLAYBACK-VISUAL-INSPECTION-1: the window-capture proof leg, a SPEED leg (windowed, scale 2) that names no visualCapture: absent means on.
 VISUAL_LEGS = ("legs/m16-1243-speed-windowed-s2.json",)
 # PLAYBACK-SCOPES-OPTION-1: the windowed scale-1 no-look scope matrix, per backend: N (no scope), T (histogram at the app's default throttle) and
@@ -132,13 +135,14 @@ HEADROOM_LEGS = (*(f"legs/{clip}-headroom-unpaced-{mode}-s{scale}.json" for clip
 # LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1 added the scale-2 Cinematic twin of the scale-2 look leg (the Bachelor CPU Classic | Cinematic look pair).
 SHIPPED_LEGS = ("legs/m16-1243-speed.json", "legs/m16-1243-look.json", "legs/m16-1243-look-scale2.json", "legs/m16-1243-look-cinematic.json", *DISPLAY_MATRIX_LEGS, *PACE_LEGS,
                 *LOOKAHEAD_LEGS, *HEAVY_LEGS, *DECODER_LEGS, "legs/m16-1243-look-scale2-cinematic.json", "legs/m16-1243-look-film.json",
-                "legs/m16-1243-look-scale2-film.json", *(f"legs/m16-1243-look-scale2-{flavor}-agxoff.json" for flavor in ("cinematic", "film")),
+                "legs/m16-1243-look-scale2-film.json", "legs/m16-1243-look-scale2-vision50d.json",
+                *(f"legs/m16-1243-look-scale2-{flavor}-agxoff.json" for flavor in ("cinematic", "film", "vision50d")),
                 *(f"legs/m16-1243-display-{mode}-s{scale}-vsync1.json" for scale in (1, 2, 4) for mode in ("fullscreen", "windowed")),
-                *CPU_REDUCED_LEGS, *UPSTREAM_BASELINE_LEGS, *PTRACE_LEGS, *VISUAL_LEGS, *SCOPE_LEGS, *SCOPE_LA_LEGS, *HEADROOM_LEGS)
+                *CPU_REDUCED_LEGS, *UPSTREAM_BASELINE_LEGS, *PTRACE_LEGS, *VISUAL_LEGS, *SCOPE_LEGS, *SCOPE_LA_LEGS, *HEADROOM_LEGS, *IDENTITY_LEGS)
 # PLAYBACK-VSYNC-DEFAULT-1: the swap-interval-1 twins of the six display-matrix legs (the vsync A/B; the originals stay at the app's default 0).
 VSYNC1_LEGS = tuple(rel.replace(".json", "-vsync1.json") for rel in DISPLAY_MATRIX_LEGS)
 # LOOK-ASSIST-FILM-FLAVOR-2 r2: the AgX-off twins of the scale-2 Cinematic and Film legs carry a committed look receipt (look-receipts/agx-off.marxml).
-AGXOFF_LEGS = {f"m16-1243-look-scale2-{flavor}-agxoff": f"m16-1243-look-scale2-{flavor}" for flavor in ("cinematic", "film")}
+AGXOFF_LEGS = {f"m16-1243-look-scale2-{flavor}-agxoff": f"m16-1243-look-scale2-{flavor}" for flavor in ("cinematic", "film", "vision50d")}
 LOOK_RECEIPT_BASE = "6b6f66f52d5344a97de5068b2e7cae1a61edf295"   # the #328 head whose generator, legs and runner this round extends
 # GPU-DEVICE-LOSS-SELF-HEAL-1 r2: the L1..L4 self-heal proof, ONE cuda speed leg whose job runs three pre-launches and the measured run on one settings store.
 SELF_HEAL_LEG = "legs/m16-1243-gpu-self-heal-l1-l4.json"
@@ -703,6 +707,24 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
                         .read_text(encoding="utf-8"))
         self.assertNotIn("GPU-DEVICE-LOSS-SELF-HEAL-1 r6", store_only)
         self.assertNotIn("Get-AttrCudaSelfHealMetrics", store_only)
+
+    def test_the_first_present_capture_reaches_the_apps_env_only_when_asked(self) -> None:
+        """PLAYBACK-STARTUP-WAIT-PREWARM-1: -FirstPresentCapture adds MLVAPP_SMOKE_FIRST_PRESENT_CAPTURE=1 to the app's env list; absent, the
+        job is the text it was. The runner maps a leg's generatorArgs.firstPresentCapture true for any leg."""
+        plain = self.generate(GENERATOR, "fpc-plain.job.ps1", []).read_text(encoding="utf-8").replace("\r\n", "\n")
+        self.assertNotIn("MLVAPP_SMOKE_FIRST_PRESENT_CAPTURE", plain)
+        job = self.generate(GENERATOR, "fpc-on.job.ps1", ["-FirstPresentCapture"])
+        self.assertEqual(self.parse_errors(job), 0)
+        text = job.read_text(encoding="utf-8").replace("\r\n", "\n")
+        line = "    'MLVAPP_SMOKE_FIRST_PRESENT_CAPTURE=1',\n"
+        self.assertIn("'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',\n" + line, text)
+        self.assertEqual(text.replace(line, ""), plain, "the flag is the only difference from the plain job")
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        mapping = ("if ($spec.generatorArgs.PSObject.Properties['firstPresentCapture'] -and [bool]$spec.generatorArgs.firstPresentCapture) "
+                   "{ $gen['FirstPresentCapture'] = $true }")
+        self.assertIn(mapping, runner)
+        self.assertLess(runner.index(mapping), runner.index("if (-not $isLook -and $spec.generatorArgs.PSObject.Properties['forceLookAssist']"),
+                        "the mapping must sit outside the forceLookAssist branch")
 
     def test_an_unpaced_leg_reaches_the_apps_env_and_the_smoke_only_when_asked(self) -> None:
         """CUDA-HEADROOM-1: -Unpaced adds MLVAPP_PLAYBACK_UNPACED=1 to the app's env list and -DropFrameMode off to the smoke command, each
@@ -5849,6 +5871,18 @@ class LegSpecSchemaTests(unittest.TestCase):
             self.assertIs(arm["generatorArgs"].pop("presentTrace"), True, rel)
             self.assertEqual(dict(arm, legId=twin["legId"]), twin, rel)
 
+    def test_the_identity_legs_are_their_twins_with_the_capture_on(self) -> None:
+        """PLAYBACK-STARTUP-WAIT-PREWARM-1: an identity leg differs from its twin only in its legId and generatorArgs.firstPresentCapture true."""
+        self.assertEqual(self.schema["properties"]["generatorArgs"]["properties"]["firstPresentCapture"]["type"], "boolean")
+        for rel, twin_rel in IDENTITY_LEGS.items():
+            arm = json.loads((DV / rel).read_text(encoding="utf-8"))
+            self.jsonschema.validate(arm, self.schema)
+            twin = json.loads((DV / twin_rel).read_text(encoding="utf-8"))
+            self.assertNotIn("firstPresentCapture", twin["generatorArgs"], twin_rel)
+            self.assertEqual(arm["legId"], twin["legId"] + "-identity", rel)
+            self.assertIs(arm["generatorArgs"].pop("firstPresentCapture"), True, rel)
+            self.assertEqual(dict(arm, legId=twin["legId"]), twin, rel)
+
     def test_the_scope_legs_are_no_look_windowed_s1_speed_legs_differing_only_in_scope(self) -> None:
         """PLAYBACK-SCOPES-OPTION-1: every scope leg is a single-backend no-look SPEED leg at windowed scale 1 (LIGHT, the 95 % quiescence gate,
         informational criteria), and each scope arm is its backend's N leg plus only the scope fields."""
@@ -5927,8 +5961,9 @@ class LegSpecSchemaTests(unittest.TestCase):
                 continue
             flavored += 1
             if spec["card"] == "DUAL-VENUE-DISPLAY-MATRIX-1":   # the display-matrix legs are cinematic look legs named by their cell (display mode and scale)
-                self.assertEqual(spec["legId"], path.stem, path.name)   # (-ptrace: the cell with the present trace on, PTRACE_LEGS)
-                self.assertRegex(spec["legId"], r"^m16-1243-display-(fullscreen|windowed)-s[124](-ptrace)?$", path.name)
+                self.assertEqual(spec["legId"], path.stem, path.name)   # (-ptrace: the cell with the present trace on, PTRACE_LEGS;
+                # -identity: the cell with the first-present identity capture on, IDENTITY_LEGS)
+                self.assertRegex(spec["legId"], r"^m16-1243-display-(fullscreen|windowed)-s[124](-ptrace|-identity)?$", path.name)
             elif spec["card"] == "PLAYBACK-VSYNC-DEFAULT-1":   # the swap-interval-1 twins of the display-matrix legs, named by their cell
                 self.assertEqual(spec["legId"], path.stem, path.name)
                 self.assertRegex(spec["legId"], r"^m16-1243-display-(fullscreen|windowed)-s[124]-vsync1$", path.name)

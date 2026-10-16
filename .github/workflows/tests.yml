@@ -212,6 +212,7 @@ jobs:
         run: |
           python -m pytest `
             tools\coordination\test_coordination_guardrails.py `
+            tools\coordination\stuck_queue_checks\test_stuck_queue_checks.py `
             tests\coordination `
             tests\docs `
             -q
