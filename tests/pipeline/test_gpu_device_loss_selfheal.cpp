@@ -498,17 +498,27 @@ std::shared_ptr<EmitGap> playAFrameInTheEmitGap(CaseScope & scope, const std::fu
     return gap;
 }
 
-// The device-loss half: the flag was already set inside the gap, B was refused before the backend, and the emit
-// after the unlock still reached the listener, so the session record and the notice still happen.
+// What the gap saw, on one line, so a failure shows the flag and B's outcome together.
+std::string gapOutcome(int suppressedInGap, int bUsed, int bRc, long long bRunsMoved)
+{
+    return "suppressedInGap=" + std::to_string(suppressedInGap) + " bUsed=" + std::to_string(bUsed != 0 ? 1 : 0)
+        + " bRc=" + std::to_string(bRc) + " bRunsMoved=" + std::to_string(bRunsMoved);
+}
+
+std::string gapOutcome(const EmitGap & gap)
+{
+    return gapOutcome(gap.suppressedInGap, gap.bUsed, gap.bRc, static_cast<long long>(gap.bRunsAfter - gap.bRunsBefore));
+}
+
+// The device-loss half: the flag was already set inside the gap, B was refused before the backend (its run
+// count did not move), and the emit after the unlock still reached the listener, so the session record and the
+// notice still happen.
 void assertTheEmitGapIsClosedOnALoss(CaseScope & scope, const EmitGap & gap, const char * name)
 {
     ASSERT_EQ(1, gap.fired.load());
     ASSERT_FALSE(gap.hookTimedOut);
     ASSERT_FALSE(gap.bTimedOut);
-    ASSERT_EQ(1, gap.suppressedInGap);
-    ASSERT_EQ(0, gap.bUsed);
-    ASSERT_EQ(LLRP_GPU_PLAYBACK_RECON_RC_CUDA_SUPPRESSED, gap.bRc);
-    ASSERT_EQ(gap.bRunsBefore, gap.bRunsAfter); // B never reached the backend
+    ASSERT_EQ(gapOutcome(1, 0, LLRP_GPU_PLAYBACK_RECON_RC_CUDA_SUPPRESSED, 0), gapOutcome(gap));
     ASSERT_EQ(1, scope.seen.deviceLossFaults);
     ASSERT_EQ(1, llrpGpuCudaSuppressed());
     scope.runQueuedGuiHalf();
@@ -526,10 +536,7 @@ void assertANonLossLeavesTheEmitGapFree(int rc, int code, const char * name)
     ASSERT_EQ(1, gap->fired.load());
     ASSERT_FALSE(gap->hookTimedOut);
     ASSERT_FALSE(gap->bTimedOut);
-    ASSERT_EQ(0, gap->suppressedInGap);
-    ASSERT_NE(0, gap->bUsed);
-    ASSERT_EQ(0, gap->bRc);
-    ASSERT_EQ(gap->bRunsBefore + 1, gap->bRunsAfter);
+    ASSERT_EQ(gapOutcome(0, 1, 0, 1), gapOutcome(*gap)); // B ran on the backend exactly once
     ASSERT_EQ(0, scope.seen.deviceLossFaults);
     ASSERT_EQ(0, llrpGpuCudaSuppressed());
 }
