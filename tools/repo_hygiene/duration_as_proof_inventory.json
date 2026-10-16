@@ -2143,6 +2143,156 @@
       "lines": [
         1298
       ]
+    },
+    {
+      "path": "platform/qt/PlaybackStartupSplit.h",
+      "anchor": "if ( m_playToRequestMs < 0.0 ) m_playToRequestMs = sinceStartMs ;",
+      "class": "value_fallback_select",
+      "clock": "qpc_stage_clock",
+      "justification": "PLAYBACK-STARTUP-WAIT-PREWARM-1 startup split: -1 is the 'no request noted yet' sentinel, so only the session's first render request is recorded (later ones are ignored). A first-sample filter on a telemetry field, not run-proof.",
+      "lines": [
+        83
+      ]
+    },
+    {
+      "path": "platform/qt/PlaybackStartupSplit.h",
+      "anchor": "double playToRequestMs ( ) const { return m_playToRequestMs < 0.0 ? 0.0 : m_playToRequestMs ; }",
+      "class": "display_or_format",
+      "clock": "qpc_stage_clock",
+      "justification": "PLAYBACK-STARTUP-WAIT-PREWARM-1 startup split getter: maps the -1 'none noted' sentinel to 0 so the printed play_to_request_ms field is never negative. Formatting of an already-measured value for the smoke line.",
+      "lines": [
+        121
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_startup_split.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , split . playToRequestMs ( ) , 1 e - 9 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "Pure-function unit test OnlyTheFirstRequestCounts: a freshly constructed StartupSplit with no request noted must read 0 (the sentinel is never printed negative). Synthetic input, no live clock; it checks the getter's math, not that any stage ran.",
+      "lines": [
+        61
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_startup_split.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , fast . gpuRouteSetupFirstMs ( ) , 1 e - 9 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "Pure-function unit test: a synthetic first present no slower than the later presents' median must attribute 0 ms to the route's one-time setup (clamped, never negative). Test-constructed input, no live clock; it checks the attribution math, not that any stage ran.",
+      "lines": [
+        82
+      ]
+    },
+    {
+      "path": "platform/qt/AudioPlayback.cpp",
+      "anchor": "for ( int i = 0 ; i < 20 && m_owner . m_pAudioOutput -> processedUSecs ( ) == 0",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "PLAYBACK-STARTUP-WAIT-PREWARM-1 r2 HeldSink::open: waits at most 20 ms for the sink's first host-buffer fill (QAudioSink::processedUSecs, a frame count) before reading it as the host-buffer size; if it stays 0 the latency estimate falls back to 0. Whether the open worked is judged by QAudioSink::error()/state(), never by this count.",
+      "lines": [
+        91
+      ]
+    },
+    {
+      "path": "platform/qt/PlaybackAudioGate.h",
+      "anchor": "if ( ! ( ms > 0.0 ) ) return 0 ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "PLAYBACK-STARTUP-WAIT-PREWARM-1 r2 PlaybackAudioGate::bytesForMs clamps a zero, negative or NaN duration to 0 bytes before converting it to whole audio frames; a value select feeding a read position, never proof that anything ran.",
+      "lines": [
+        40
+      ]
+    },
+    {
+      "path": "platform/qt/PlaybackAudioStartPolicy.h",
+      "anchor": "return ( queued > 0.0 ? queued : 0.0 ) + ( hostBufferMs > 0.0 ? hostBufferMs : 0.0 ) ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "PLAYBACK-STARTUP-WAIT-PREWARM-1 r2 outputLatencyMs clamps a negative ring queue (served minus processed) and an unmeasured host buffer to 0 before summing the audio output latency; a value select feeding the handover position, never a run-proof.",
+      "lines": [
+        77
+      ]
+    },
+    {
+      "path": "platform/qt/PlaybackAudioStartPolicy.h",
+      "anchor": "return frameMs ( frame , fps ) + ( sincePresentMs > 0.0 ? sincePresentMs : 0.0 ) + ( latencyMs > 0.0 ? latencyMs : 0.0 ) ;",
+      "class": "value_fallback_select",
+      "clock": "qpc_stage_clock",
+      "justification": "PLAYBACK-STARTUP-WAIT-PREWARM-1 r2 handoverContentMs clamps a negative time-since-present and latency to 0 so the audio content never starts before the presented frame; a value select feeding the gate position. Which start mode ran is the report's mode/sink fields.",
+      "lines": [
+        84
+      ]
+    },
+    {
+      "path": "platform/qt/PlaybackAudioStartPolicy.h",
+      "anchor": "const double videoMs = frameMs ( frame , m_fps ) + ( sinceMs > 0.0 ? sinceMs : 0.0 ) ;",
+      "class": "value_fallback_select",
+      "clock": "qpc_stage_clock",
+      "justification": "PLAYBACK-STARTUP-WAIT-PREWARM-1 r2 StartEngine::sync: the video timeline position used for the printed offsets, with the same clamp as handoverContentMs; a value for the log line, never a run-proof.",
+      "lines": [
+        236
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_audio_start_engine.cpp",
+      "anchor": "if ( static_cast < long long > ( clock ) % periodMs == 0 ) refill ( ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYBACK-STARTUP-WAIT-PREWARM-1 r2 test-only simulated WASAPI sink: refills its host buffer every periodMs of its own simulated clock (a modulo schedule); it never reads a measured duration and cannot distinguish ran from not-run.",
+      "lines": [
+        125
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_audio_start_engine.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , report . resumeMs , 1 e - 9 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYBACK-STARTUP-WAIT-PREWARM-1 r2 test: a running held sink is not resumed. Negative-lane check paired with the counter proof ASSERT_EQ(0, sink.resumes) and the report's sink == \"running\" just above it.",
+      "lines": [
+        227
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_audio_start_engine.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , report . avOffsetAudibleMs , 1 e - 6 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYBACK-STARTUP-WAIT-PREWARM-1 r2 test: the audible A/V offset reading is 0 by construction of the handover position (a computed offset value, not a stage duration); cannot distinguish ran from not-run.",
+      "lines": [
+        330
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_audio_gate.cpp",
+      "anchor": "ASSERT_EQ ( 0 , static_cast < int > ( gate . bytesForMs ( - 3.0 ) ) ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYBACK-STARTUP-WAIT-PREWARM-1 r2 test: bytesForMs clamps a negative duration to 0 bytes (the value_fallback_select row in PlaybackAudioGate.h).",
+      "lines": [
+        74
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_audio_start_policy.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , playback_audio_start :: handoverContentMs ( - 5 , - 10.0 , - 1.0 , kFps ) , 1 e - 9 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYBACK-STARTUP-WAIT-PREWARM-1 r2 test: handoverContentMs clamps a negative frame, lag and latency to content time 0 (the value_fallback_select row in PlaybackAudioStartPolicy.h).",
+      "lines": [
+        65
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_audio_start_policy.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , playback_audio_start :: frameMs ( 30 , 0.0 ) , 1 e - 9 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYBACK-STARTUP-WAIT-PREWARM-1 r2 test: frameMs returns 0 for an unknown (0) fps instead of dividing by it.",
+      "lines": [
+        66
+      ]
     }
   ]
 }

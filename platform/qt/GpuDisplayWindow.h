@@ -103,6 +103,10 @@ public:
     static bool takeScopeTapIfActive(std::vector<uint8_t> *rgb8, int *width, int *height, quint64 *serial);
     static void invalidateScopeTapIfActive(void);
     static GpuScopeTap::Counters scopeTapCountersIfActive(void);
+    /* PLAYBACK-STARTUP-WAIT-PREWARM-1 Row B: warm the playback recon texture route while paused (program compile,
+     * one AMaZE run at texWidth x texHeight on temporary textures, then freed). Changes nothing on screen. GUI-thread
+     * only; summary receives one "ok=... program_ms=... amaze_ms=..." fragment for the log. */
+    static bool prewarmPlaybackReconRouteIfActive(int texWidth, int texHeight, QString *summary = nullptr);
     static bool readGpuReconSourceBayer16TextureIfActive(QByteArray *textureBytes,
                                                         int *width,
                                                         int *height,
@@ -193,6 +197,7 @@ public:
         int displayWidth,
         int displayHeight,
         quint64 presentationSerial = 0);
+    bool prewarmPlaybackReconRoute(int texWidth, int texHeight, QString *summary);
     /* Where the last setPresentedGpuPlaybackReconAmazePostWbTexture() call's setup block
      * spent its time (reset at the start of every call). */
     const GpuPresentSetupTiming &lastPresentSetupTiming(void) const { return m_lastPresentSetupTiming; }

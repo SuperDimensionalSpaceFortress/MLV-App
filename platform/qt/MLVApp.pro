@@ -118,6 +118,8 @@ win32{
     # gdi32: PLAYBACK-VISUAL-INSPECTION-1's PrintWindow window capture (CreateDIBSection et al.);
     # MinGW only links it by default under -mwindows, which qmake does not pass.
     LIBS += -lgdi32
+    # ole32: PLAYBACK-STARTUP-WAIT-PREWARM-1's audio thread initialises COM (CoInitializeEx) for its WASAPI sink.
+    LIBS += -lole32
     greaterThan(QT_MAJOR_VERSION, 5){
         QMAKE_CXXFLAGS += -fopenmp -mssse3 -std=c++17 -ftree-vectorize
     }
@@ -380,6 +382,13 @@ HEADERS += MainWindow.h \
            Debayered16ReconReusePolicy.h \
            PlaybackDecodeRenderOverlap.h \
            PlaybackNativePaceGuard.h \
+           PlaybackStartupSplit.h \
+           PlaybackAudioStartPolicy.h \
+           PlaybackFirstPresentIdentity.h \
+           PlaybackRoutePrewarmPolicy.h \
+           PlaybackAudioGate.h \
+           PlaybackEnvFlags.h \
+           PlaybackWorkerJoin.h \
            PlaybackPresentTrace.h \
            PlaybackSwapInterval.h \
            PlaybackScopesDuringPlayback.h \

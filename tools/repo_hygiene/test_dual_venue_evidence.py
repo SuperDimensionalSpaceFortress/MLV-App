@@ -109,6 +109,9 @@ DECODER_LEGS = {"legs/m16-1243-pace-cinematic-fullscreen-s4-dec1.json": "legs/m1
 UPSTREAM_BASELINE_LEGS = tuple(f"legs/m16-1243-upstream-baseline-cpu-{mode}-s1.json" for mode in ("fullscreen", "windowed"))
 # PLAYBACK-STARTUP-CATCHUP-BURST-1 r7: the present-trace twin of a display-matrix cell, differing only in its legId and generatorArgs.presentTrace true.
 PTRACE_LEGS = {"legs/m16-1243-display-fullscreen-s4-ptrace.json": "legs/m16-1243-display-fullscreen-s4.json"}
+# PLAYBACK-STARTUP-WAIT-PREWARM-1: the first-present identity twins of two display-matrix cells, differing only in their legId and
+# generatorArgs.firstPresentCapture true.
+IDENTITY_LEGS = {f"legs/m16-1243-display-{cell}-identity.json": f"legs/m16-1243-display-{cell}.json" for cell in ("windowed-s1", "fullscreen-s4")}
 # PLAYBACK-VISUAL-INSPECTION-1: the window-capture proof leg, a SPEED leg (windowed, scale 2) that names no visualCapture: absent means on.
 VISUAL_LEGS = ("legs/m16-1243-speed-windowed-s2.json",)
 # PLAYBACK-SCOPES-OPTION-1: the windowed scale-1 no-look scope matrix, per backend: N (no scope), T (histogram at the app's default throttle) and
@@ -139,13 +142,17 @@ GPU_TAP_SERVED_GATES = [{"metric": "scopeSource", "op": "eq", "value": "gpu_tap"
 # r2: the D4 matrix's cpu cells (the read-back never serves the CPU route; a no-regression check): the cpu histogram-la leg with only its cell changed.
 GPU_TAP_CPU_SCOPE_LEGS = tuple(f"legs/m16-1243-scopes-cpu-{mode}-s{scale}-histogram-la.json"
                                for mode, scale in (("windowed", 2), ("windowed", 4), ("fullscreen", 1), ("fullscreen", 2), ("fullscreen", 4)))
+# CUDA-HEADROOM-1: the unpaced throughput legs (both clips, the D4 cells) and the stage-attribution legs (HEAVY telemetry + CUDA launch timing).
+HEADROOM_LEGS = (*(f"legs/{clip}-headroom-unpaced-{mode}-s{scale}.json" for clip in ("m16-1243", "m16-1457") for mode in ("fullscreen", "windowed") for scale in (1, 2, 4)),
+                 *(f"legs/m16-1243-headroom-stage-{mode}-s{scale}.json" for mode in ("fullscreen", "windowed") for scale in (1, 2, 4)),
+                 "legs/m16-1457-headroom-stage-fullscreen-s1.json")
 # LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1 added the scale-2 Cinematic twin of the scale-2 look leg (the Bachelor CPU Classic | Cinematic look pair).
 SHIPPED_LEGS = ("legs/m16-1243-speed.json", "legs/m16-1243-look.json", "legs/m16-1243-look-scale2.json", "legs/m16-1243-look-cinematic.json", *DISPLAY_MATRIX_LEGS, *PACE_LEGS,
                 *LOOKAHEAD_LEGS, *HEAVY_LEGS, *DECODER_LEGS, "legs/m16-1243-look-scale2-cinematic.json", "legs/m16-1243-look-film.json",
                 "legs/m16-1243-look-scale2-film.json", *(f"legs/m16-1243-look-scale2-{flavor}-agxoff.json" for flavor in ("cinematic", "film")),
                 *(f"legs/m16-1243-display-{mode}-s{scale}-vsync1.json" for scale in (1, 2, 4) for mode in ("fullscreen", "windowed")),
-                *CPU_REDUCED_LEGS, *UPSTREAM_BASELINE_LEGS, *PTRACE_LEGS, *VISUAL_LEGS, *SCOPE_LEGS, *SCOPE_LA_LEGS, *GPU_TAP_SCOPE_LEGS,
-                *GPU_TAP_CPU_SCOPE_LEGS)
+                *CPU_REDUCED_LEGS, *UPSTREAM_BASELINE_LEGS, *PTRACE_LEGS, *VISUAL_LEGS, *SCOPE_LEGS, *SCOPE_LA_LEGS, *HEADROOM_LEGS, *IDENTITY_LEGS,
+                *GPU_TAP_SCOPE_LEGS, *GPU_TAP_CPU_SCOPE_LEGS)
 # PLAYBACK-VSYNC-DEFAULT-1: the swap-interval-1 twins of the six display-matrix legs (the vsync A/B; the originals stay at the app's default 0).
 VSYNC1_LEGS = tuple(rel.replace(".json", "-vsync1.json") for rel in DISPLAY_MATRIX_LEGS)
 # LOOK-ASSIST-FILM-FLAVOR-2 r2: the AgX-off twins of the scale-2 Cinematic and Film legs carry a committed look receipt (look-receipts/agx-off.marxml).
@@ -592,6 +599,56 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         self.assertIn(mapping, runner)
         self.assertLess(runner.index(mapping), runner.index("if (-not $isLook -and $spec.generatorArgs.PSObject.Properties['forceLookAssist']"),
                         "the mapping must sit outside the forceLookAssist branch")
+
+    def test_the_first_present_capture_reaches_the_apps_env_only_when_asked(self) -> None:
+        """PLAYBACK-STARTUP-WAIT-PREWARM-1: -FirstPresentCapture adds MLVAPP_SMOKE_FIRST_PRESENT_CAPTURE=1 to the app's env list; absent, the
+        job is the text it was. The runner maps a leg's generatorArgs.firstPresentCapture true for any leg."""
+        plain = self.generate(GENERATOR, "fpc-plain.job.ps1", []).read_text(encoding="utf-8").replace("\r\n", "\n")
+        self.assertNotIn("MLVAPP_SMOKE_FIRST_PRESENT_CAPTURE", plain)
+        job = self.generate(GENERATOR, "fpc-on.job.ps1", ["-FirstPresentCapture"])
+        self.assertEqual(self.parse_errors(job), 0)
+        text = job.read_text(encoding="utf-8").replace("\r\n", "\n")
+        line = "    'MLVAPP_SMOKE_FIRST_PRESENT_CAPTURE=1',\n"
+        self.assertIn("'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',\n" + line, text)
+        self.assertEqual(text.replace(line, ""), plain, "the flag is the only difference from the plain job")
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        mapping = ("if ($spec.generatorArgs.PSObject.Properties['firstPresentCapture'] -and [bool]$spec.generatorArgs.firstPresentCapture) "
+                   "{ $gen['FirstPresentCapture'] = $true }")
+        self.assertIn(mapping, runner)
+        self.assertLess(runner.index(mapping), runner.index("if (-not $isLook -and $spec.generatorArgs.PSObject.Properties['forceLookAssist']"),
+                        "the mapping must sit outside the forceLookAssist branch")
+    def test_an_unpaced_leg_reaches_the_apps_env_and_the_smoke_only_when_asked(self) -> None:
+        """CUDA-HEADROOM-1: -Unpaced adds MLVAPP_PLAYBACK_UNPACED=1 to the app's env list and -DropFrameMode off to the smoke command, each
+        exactly once; absent, the job has neither. The runner maps a leg's generatorArgs.unpaced true for any leg; the schema declares it."""
+        plain = self.generate(GENERATOR, "up-plain.job.ps1", []).read_text(encoding="utf-8").replace("\r\n", "\n")
+        self.assertNotIn("MLVAPP_PLAYBACK_UNPACED", plain)
+        self.assertNotIn("-DropFrameMode off", plain)
+        job = self.generate(GENERATOR, "up-on.job.ps1", ["-Unpaced"])
+        self.assertEqual(self.parse_errors(job), 0)
+        text = job.read_text(encoding="utf-8").replace("\r\n", "\n")
+        line = "    'MLVAPP_PLAYBACK_UNPACED=1',\n"
+        self.assertEqual(text.count("MLVAPP_PLAYBACK_UNPACED"), 1)
+        self.assertEqual(text.count("-DropFrameMode off"), 1)
+        self.assertIn("'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',\n" + line, text)
+        self.assertIn(" -DropFrameMode off -UsePersistedPlaybackSettings ", text)
+        self.assertEqual(text.replace(line, "").replace(" -DropFrameMode off -UsePersistedPlaybackSettings ", " -UsePersistedPlaybackSettings "), plain,
+                         "the flag and the drop-frame switch are the only differences from the plain job")
+        both = self.generate(GENERATOR, "up-pt.job.ps1", ["-Unpaced", "-PresentTrace", "-SwapInterval", "0"])
+        self.assertEqual(self.parse_errors(both), 0)
+        both_text = both.read_text(encoding="utf-8")
+        for token in ("'MLVAPP_PLAYBACK_UNPACED=1',", "'MLVAPP_PLAYBACK_PRESENT_TRACE=1',", "'MLVAPP_SWAP_INTERVAL=0',", "-DropFrameMode off"):
+            self.assertEqual(both_text.count(token), 1, token)
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        mapping = "if ($spec.generatorArgs.PSObject.Properties['unpaced'] -and [bool]$spec.generatorArgs.unpaced) { $gen['Unpaced'] = $true }"
+        self.assertIn(mapping, runner)
+        self.assertLess(runner.index(mapping), runner.index("if (-not $isLook -and $spec.generatorArgs.PSObject.Properties['forceLookAssist']"),
+                        "the mapping must sit outside the forceLookAssist branch")
+        # the runner fails closed on the app's own line, after the display gate and before the proof gate
+        gate = "if ($outcome -in @('PASS', 'FAIL') -and $unpacedVerdict.blocks) {"
+        self.assertIn(gate, runner)
+        self.assertLess(runner.index("DISPLAY_MODE_NOT_HONOURED"), runner.index(gate))
+        schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
+        self.assertEqual(schema["properties"]["generatorArgs"]["properties"]["unpaced"]["type"], "boolean")
 
     def test_the_runner_passes_a_legs_swap_interval_to_the_generator(self) -> None:
         runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
@@ -4594,6 +4651,54 @@ def run_pwsh_json(script: str, **env: str):
 
 
 @requires_windows_pwsh
+class UnpacedEvidenceTests(unittest.TestCase):
+    """CUDA-HEADROOM-1, FAIL CLOSED: an unpaced leg counts only when the app's own pace_unpaced line for the MEASURED session says active=1 drop_frame=0."""
+
+    UNPACED = {"generatorArgs": {"unpaced": True}}
+
+    def verdict(self, spec: dict, log: str) -> dict:
+        proc, out = run_pwsh_json("$s = $env:DVE_SPEC | ConvertFrom-Json\n(Get-DvUnpacedEvidence -Spec $s -LogText $env:DVE_LOG) | ConvertTo-Json -Compress",
+                                  DVE_SPEC=json.dumps(spec), DVE_LOG=log)
+        self.assertIsNotNone(out, proc.stderr)
+        return out
+
+    @staticmethod
+    def log(*extra: str) -> str:
+        return "\n".join(["playback_smoke.measured_session id=3", "playback_smoke.summary session=3 reason=reached presented_frames=600", *extra]) + "\n"
+
+    def test_honoured_only_with_active_1_and_drop_frame_0(self) -> None:
+        v = self.verdict(self.UNPACED, self.log("playback_smoke.pace_unpaced session=3 active=1 drop_frame=0 run_nonce=n1"))
+        self.assertEqual((v["verdict"], v["blocks"], v["active"], v["dropFrame"]), ("HONOURED", False, 1, 0))
+
+    def test_a_log_without_the_line_blocks(self) -> None:
+        v = self.verdict(self.UNPACED, self.log())
+        self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True))
+        self.assertIn("no playback_smoke.pace_unpaced line", v["reason"])
+
+    def test_active_0_or_drop_frame_1_blocks(self) -> None:
+        for line in ("playback_smoke.pace_unpaced session=3 active=0 drop_frame=0 run_nonce=n1",
+                     "playback_smoke.pace_unpaced session=3 active=1 drop_frame=1 run_nonce=n1"):
+            v = self.verdict(self.UNPACED, self.log(line))
+            self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), line)
+
+    def test_another_sessions_line_does_not_count(self) -> None:
+        v = self.verdict(self.UNPACED, self.log("playback_smoke.pace_unpaced session=2 active=1 drop_frame=0 run_nonce=n1"))
+        self.assertTrue(v["blocks"])
+
+    def test_a_leg_that_does_not_ask_never_blocks(self) -> None:
+        for spec in ({}, {"generatorArgs": {"presentTrace": True}}, {"generatorArgs": {"unpaced": False}}):
+            v = self.verdict(spec, self.log())
+            self.assertEqual((v["verdict"], v["blocks"]), ("NOT_REQUESTED", False), spec)
+
+    def test_the_validator_re_derives_it(self) -> None:
+        module = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        self.assertIn("$unpacedVerdict = Get-DvUnpacedEvidence -Spec $spec -LogText $ev.logText", module)
+        self.assertIn('if ($unpacedVerdict.blocks) { $invalid.Add("UNPACED_NOT_HONOURED:', module)
+        roles = json.loads((DV / "venues.json").read_text(encoding="utf-8"))["roles"]
+        self.assertEqual(roles["CUDA-HEADROOM-1"], {"bachelor": "acceptance", "ultra-magnus": "supplementary"})
+
+
+@requires_windows_pwsh
 class DisplayMatrixLegSetTests(unittest.TestCase):
     """The standard display matrix: the shipped leg set expands to the twelve cells, interleaved across repeats, every cell is an ordinary committed leg spec, and
     the leg set refuses what would not be one matrix."""
@@ -5657,6 +5762,18 @@ class LegSpecSchemaTests(unittest.TestCase):
             self.assertIs(arm["generatorArgs"].pop("presentTrace"), True, rel)
             self.assertEqual(dict(arm, legId=twin["legId"]), twin, rel)
 
+    def test_the_identity_legs_are_their_twins_with_the_capture_on(self) -> None:
+        """PLAYBACK-STARTUP-WAIT-PREWARM-1: an identity leg differs from its twin only in its legId and generatorArgs.firstPresentCapture true."""
+        self.assertEqual(self.schema["properties"]["generatorArgs"]["properties"]["firstPresentCapture"]["type"], "boolean")
+        for rel, twin_rel in IDENTITY_LEGS.items():
+            arm = json.loads((DV / rel).read_text(encoding="utf-8"))
+            self.jsonschema.validate(arm, self.schema)
+            twin = json.loads((DV / twin_rel).read_text(encoding="utf-8"))
+            self.assertNotIn("firstPresentCapture", twin["generatorArgs"], twin_rel)
+            self.assertEqual(arm["legId"], twin["legId"] + "-identity", rel)
+            self.assertIs(arm["generatorArgs"].pop("firstPresentCapture"), True, rel)
+            self.assertEqual(dict(arm, legId=twin["legId"]), twin, rel)
+
     def test_the_scope_legs_are_no_look_windowed_s1_speed_legs_differing_only_in_scope(self) -> None:
         """PLAYBACK-SCOPES-OPTION-1: every scope leg is a single-backend no-look SPEED leg at windowed scale 1 (LIGHT, the 95 % quiescence gate,
         informational criteria), and each scope arm is its backend's N leg plus only the scope fields."""
@@ -5740,6 +5857,26 @@ class LegSpecSchemaTests(unittest.TestCase):
             self.assertEqual(dict(spec, legId=base["legId"], card=base["card"], scaleFactor=base["scaleFactor"], displayMode=base["displayMode"]), base, rel)
         self.assertEqual(cells, {("windowed", 2), ("windowed", 4), ("fullscreen", 1), ("fullscreen", 2), ("fullscreen", 4)})
 
+    def test_only_an_unpaced_swap_interval_0_leg_may_declare_its_tearing_expected(self) -> None:
+        """CUDA-HEADROOM-1 r2: an unpaced leg at swap interval 0 presents with SyncInterval 0, so PresentMon reports AllowsTearing=1 (the hub's
+        TEARING flag). Every headroom leg says so in presentTearingExpectedReason; no other leg carries it, and the schema refuses it on any leg
+        that is not unpaced at swap interval 0, so the exemption can never reach a paced or vsync leg."""
+        for rel in HEADROOM_LEGS:
+            spec = json.loads((DV / rel).read_text(encoding="utf-8"))
+            self.jsonschema.validate(spec, self.schema)
+            self.assertGreaterEqual(len(spec.get("presentTearingExpectedReason", "")), 12, rel)
+        for path in sorted((DV / "legs").glob("*.json")):
+            if "legs/" + path.name not in HEADROOM_LEGS:
+                self.assertNotIn("presentTearingExpectedReason", json.loads(path.read_text(encoding="utf-8")), path.name)
+        leg = json.loads((DV / HEADROOM_LEGS[0]).read_text(encoding="utf-8"))
+        paced = {k: v for k, v in leg["generatorArgs"].items() if k != "unpaced"}
+        no_swap = {k: v for k, v in leg["generatorArgs"].items() if k != "swapInterval"}
+        for name, bad in (("paced", dict(leg, generatorArgs=paced)), ("unpaced false", dict(leg, generatorArgs=dict(leg["generatorArgs"], unpaced=False))),
+                          ("vsync", dict(leg, generatorArgs=dict(leg["generatorArgs"], swapInterval=1))), ("app-default swap", dict(leg, generatorArgs=no_swap)),
+                          ("short reason", dict(leg, presentTearingExpectedReason="tearing"))):
+            with self.assertRaises(self.jsonschema.ValidationError, msg=name):
+                self.jsonschema.validate(bad, self.schema)
+
     def test_the_hand_listed_shipped_legs_are_exactly_the_legs_directory(self) -> None:
         self.assertEqual(sorted(SHIPPED_LEGS), sorted("legs/" + p.name for p in (DV / "legs").glob("*.json")), "SHIPPED_LEGS drifted from the legs/ directory")
 
@@ -5759,8 +5896,9 @@ class LegSpecSchemaTests(unittest.TestCase):
                 continue
             flavored += 1
             if spec["card"] == "DUAL-VENUE-DISPLAY-MATRIX-1":   # the display-matrix legs are cinematic look legs named by their cell (display mode and scale)
-                self.assertEqual(spec["legId"], path.stem, path.name)   # (-ptrace: the cell with the present trace on, PTRACE_LEGS)
-                self.assertRegex(spec["legId"], r"^m16-1243-display-(fullscreen|windowed)-s[124](-ptrace)?$", path.name)
+                self.assertEqual(spec["legId"], path.stem, path.name)   # (-ptrace: the cell with the present trace on, PTRACE_LEGS;
+                # -identity: the cell with the first-present identity capture on, IDENTITY_LEGS)
+                self.assertRegex(spec["legId"], r"^m16-1243-display-(fullscreen|windowed)-s[124](-ptrace|-identity)?$", path.name)
             elif spec["card"] == "PLAYBACK-VSYNC-DEFAULT-1":   # the swap-interval-1 twins of the display-matrix legs, named by their cell
                 self.assertEqual(spec["legId"], path.stem, path.name)
                 self.assertRegex(spec["legId"], r"^m16-1243-display-(fullscreen|windowed)-s[124]-vsync1$", path.name)
@@ -5772,6 +5910,10 @@ class LegSpecSchemaTests(unittest.TestCase):
                 self.assertRegex(spec["legId"], r"^m16-1243-cpu-reduced-(fullscreen|windowed)-s[24]$", path.name)
                 self.assertEqual(spec["backends"], ["cpu"], path.name)
                 self.assertEqual(spec["generatorArgs"]["playbackProcessing"], "receipt", path.name)
+            elif spec["card"] == "CUDA-HEADROOM-1":   # the unpaced throughput and stage legs, named by clip, kind and cell
+                self.assertEqual(spec["legId"], path.stem, path.name)
+                self.assertRegex(spec["legId"], r"^m16-(1243|1457)-headroom-(unpaced|stage)-(fullscreen|windowed)-s[124]$", path.name)
+                self.assertIs(spec["generatorArgs"]["unpaced"], True, path.name)
             else:   # the scale-4 flavored look leg, or its scale-2 twin (LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1), or that twin's AgX-off copy (LOOK-ASSIST-FILM-FLAVOR-2 r2)
                 self.assertIn(spec["legId"], (f"m16-1243-look-{flavor}", f"m16-1243-look-scale2-{flavor}", f"m16-1243-look-scale2-{flavor}-agxoff"), path.name)
                 self.assertEqual(spec["legId"], path.stem, path.name)

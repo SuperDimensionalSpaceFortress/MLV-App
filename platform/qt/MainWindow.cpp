@@ -16,6 +16,7 @@
 #include "DualIsoLevelSyncPolicy.h"
 #include "PlaybackFpsMeterPolicy.h"
 #include "AutomationSettings.h"
+#include "PlaybackEnvFlags.h"
 #include "PlaybackFrameRange.h"
 #include "PlaybackGatePolicy.h"
 #include "PlaybackPrepPresentationPolicy.h"
@@ -194,6 +195,14 @@ static bool mlvappPlaybackPresentTraceRequested()
     return requested;
 }
 
+// CUDA-HEADROOM-1: unpaced automation playback, read once. Honoured only once an automation run has isolated its
+// pacing (playbackPaceGuardFps); it lifts the pace guard and nothing else, and discloses itself after the summary.
+static bool mlvappPlaybackUnpacedRequested()
+{
+    static const bool requested = environmentFlagEnabled( "MLVAPP_PLAYBACK_UNPACED" );
+    return requested;
+}
+
 static bool gpuTexNrOverlapTraceEnabled()
 {
     return environmentFlagEnabled( "MLVAPP_GPU_TEX_NR_OVERLAP_TRACE" );
@@ -204,6 +213,43 @@ static bool gpuTexNrOverlapTraceEnabled()
 static bool mlvappPlaybackStartupCatchupLegacyRequested()
 {
     static const bool requested = environmentFlagEnabled( "MLVAPP_PLAYBACK_STARTUP_CATCHUP_LEGACY" );
+    return requested;
+}
+
+// PLAYBACK-STARTUP-WAIT-PREWARM-1 r2: the exact values (PlaybackEnvFlags.h: on 1/true/on/yes, off 0/false/off/no); unset
+// keeps the default, and anything else keeps it too and is logged once.
+static bool playbackEnvSwitch( const char *name, bool defaultValue )
+{
+    const QByteArray raw = qgetenv( name );
+    const playback_env_flag::Value value = playback_env_flag::parse( raw.constData() );
+    if( value == playback_env_flag::Value::Invalid )
+        qWarning().noquote() << QStringLiteral( "%1=\"%2\" is not one of 1/true/on/yes/0/false/off/no; keeping the default (%3)" )
+                                    .arg( QString::fromLatin1( name ) )
+                                    .arg( QString::fromLocal8Bit( raw ) )
+                                    .arg( defaultValue ? QStringLiteral( "on" ) : QStringLiteral( "off" ) );
+    return playback_env_flag::resolve( value, defaultValue );
+}
+
+// PLAYBACK-STARTUP-WAIT-PREWARM-1 Row A kill switch, read once: the audio device is stopped, seeked and started
+// synchronously on the GUI thread at the first present again (no audio thread, no prepare at Play). Default off.
+static bool mlvappPlaybackAudioSyncLegacyRequested()
+{
+    static const bool requested = playbackEnvSwitch( "MLVAPP_PLAYBACK_AUDIO_SYNC_LEGACY", false );
+    return requested;
+}
+
+// PLAYBACK-STARTUP-WAIT-PREWARM-1 Row B switch, read once: MLVAPP_PLAYBACK_ROUTE_PREWARM=0 (or false/off/no) never warms the
+// CUDA texture playback route while paused, so the first Play-present pays its one-time setup again. Default on.
+static bool mlvappPlaybackRoutePrewarmDisabled()
+{
+    static const bool disabled = !playbackEnvSwitch( "MLVAPP_PLAYBACK_ROUTE_PREWARM", true );
+    return disabled;
+}
+
+// PLAYBACK-STARTUP-WAIT-PREWARM-1: the smoke's opt-in first-present identity capture (with --contact-sheet-dir), read once.
+static bool smokeFirstPresentCaptureRequested()
+{
+    static const bool requested = environmentFlagEnabled( "MLVAPP_SMOKE_FIRST_PRESENT_CAPTURE" );
     return requested;
 }
 
@@ -2378,7 +2424,10 @@ MainWindow::MainWindow(int &argc, char **argv, QWidget *parent) :
     on_horizontalSliderTone_valueChanged( 0 );
 
     //Setup AudioPlayback
-    m_pAudioPlayback = new AudioPlayback( this );
+    // PLAYBACK-STARTUP-WAIT-PREWARM-1 Row A: the audio device lives on its own thread (no parent, so it can move);
+    // the destructor joins that thread before the mlvObject and the window die.
+    m_pAudioPlayback = new AudioPlayback( mlvappPlaybackAudioSyncLegacyRequested() ? this : nullptr );
+    if( !mlvappPlaybackAudioSyncLegacyRequested() ) m_pAudioPlayback->startWorkerThread();
 
     //Set timers
     m_timerId = startTimer( 40, Qt::PreciseTimer ); //25fps initially only, is set after import
@@ -2536,6 +2585,11 @@ MainWindow::~MainWindow()
     delete m_pRenderThread;
     m_pRenderThread = nullptr;
 
+    if( m_pAudioPlayback && !m_pAudioPlayback->shutdownWorkerThread() )
+    {
+        // the audio thread is hung (logged by shutdownWorkerThread): never delete what it may still touch
+        m_pAudioPlayback = nullptr;
+    }
     if( m_pAudioPlayback ) m_pAudioPlayback->stop();
 
     if( m_pMlvObject )
@@ -6296,7 +6350,7 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
     // over (r3 venue leg: a clock started before finishPresentedFrame repaid 15 frames). Until here the guard
     // banks no more than the carry, which the early advance (drawFrameReady) already relied on.
     if( ui->actionPlay->isChecked() )
-        m_playbackPaceGuard.notePresent( mlv_stage_timing_now() * 1000.0, getFramerate() );
+        m_playbackPaceGuard.notePresent( mlv_stage_timing_now() * 1000.0, playbackPaceGuardFps() );
     m_frameStillDrawing = renderThreadBusyForPlaybackAdvance( currentPlaybackAdvanceTarget() );
     if( m_playbackPresentTrace.active() )
         m_playbackPresentTrace.notePresentEnd( mlv_stage_timing_now() * 1000.0 );   // r7 present trace
@@ -6553,6 +6607,8 @@ void MainWindow::drawFrame( bool updateTimecodeLabel )
         mainWindowUsesGpuImagePresentation( renderPolicy );
 
     const uint64_t requestSerial = m_nextRenderRequestSerial++;
+    if( m_playbackSmokeActive && ui->actionPlay->isChecked() )
+        m_playbackStartupSplit.noteRequest( ( mlv_stage_timing_now() - m_playbackSmokeStartTime ) * 1000.0 );
     PresentationRequestContext requestContext;
     requestContext.requestSerial = requestSerial;
     requestContext.sceneWidth = sceneWidth;
@@ -9454,6 +9510,17 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                    ? options.targetPresentedFrames / presentedTargetFps : 0.0, 'f', 3 ) << ")\n";
         return 14;
     }
+    // PLAYBACK-STARTUP-WAIT-PREWARM-1 (opt-in, default off): the paused start frame as the window shows it, grabbed
+    // untimed BEFORE the measured Play; the Play's first present is grabbed by noteContactSheetPresentedFrame().
+    if( smokeFirstPresentCaptureRequested() && !options.contactSheetDir.isEmpty() )
+    {
+        m_identityPrePlayFrame = ui->horizontalSliderPosition->value();
+        m_identityPrePlayImage = grabIdentityViewport( &m_identityPrePlayReason );
+        m_identityFirstPresentImage = QImage();
+        m_identityFirstPresentFrame = -1;
+        m_identityFirstPresentReason.clear();
+        m_identityFirstPresentArmed = true;   // finishPresentedFrame() grabs the measured Play's first present
+    }
     // ENFORCE-2 round 2: the measured Play ends at the SOONER of the --seconds timeout and the presented-frames
     // target, so that sooner figure is the window it requests -- and must itself reach the 20 s floor (the old
     // code requested the LARGER of the two and let a short timeout hide behind a long target).
@@ -9741,7 +9808,13 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
     playback_frame_range::PlayStopState measuredState = playback_frame_range::PlayStopState::Continue;
     for( ;; )
     {
-        qApp->processEvents( QEventLoop::AllEvents );
+        // CUDA-HEADROOM-1: unpaced, the GUI thread never runs dry of present / advance events, so an unbounded
+        // processEvents() returned only at a decode stall (r1 venue: the 480-frame requirement was reached at
+        // ~11.3 s but seen at 14.5 s, 624 frames). A bounded slice keeps the stop check on time; paced runs are unchanged.
+        if( m_automationPacingIsolated && mlvappPlaybackUnpacedRequested() )
+            qApp->processEvents( QEventLoop::AllEvents, 5 );
+        else
+            qApp->processEvents( QEventLoop::AllEvents );
         // ENFORCE-2 round 2 (sol B2) / ENFORCE-3: the switch STOPS Play on the first clip, so it only ever happens
         // once the engine has consumed the required source frames (and not before --stress-switch-at-ms, which the
         // app refuses below 20000 at launch); a Play the engine already ended is attempted too, to fail typed.
@@ -10406,6 +10479,8 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                 << options.contactSheetDir << "\n";
             return 13;
         }
+        if( smokeFirstPresentCaptureRequested() )
+            writeFirstPresentIdentity( options.contactSheetDir, m_identityPrePlayFrame );
 
         const double contactSheetFps = getFramerate();
         const int contactSheetClipFrameCount = loadedFrameCount();
@@ -11183,6 +11258,7 @@ int MainWindow::openMlv( QString fileName )
 
     //Init audio playback engine
     m_pAudioPlayback->initAudioEngine( m_pMlvObject );
+    armPlaybackRoutePrewarm();
 
     // Invalidate any in-flight async look-assist analysis from the previous clip.
     ++m_lookAssistAsyncGeneration;
@@ -11268,13 +11344,17 @@ void MainWindow::playbackHandling(int timeDiff)
         const double paceNowMs = mlv_stage_timing_now() * 1000.0;
         const bool paceGuardArmedBeforeTick = m_playbackPaceGuard.armed();   // slip_summary: a re-arm mid-session
 
+        // CUDA-HEADROOM-1: unpaced, present -> early advance -> render -> present never yields to the smoke's stop check
+        // (r1 venue: Reached at 480 frames, seen at 615). Once the required source frames are consumed, hold.
+        if( m_automationPacingIsolated && mlvappPlaybackUnpacedRequested() && programmaticPlayConsumed() ) return;
+
         //when on last frame
         if( ui->horizontalSliderPosition->value() >= ui->spinBoxCutOut->value() - 1 )
         {
             if( ui->actionLoop->isChecked() )
             {
                 // The wrap to cut-in is a frame transition too: it waits for a whole frame of credit (held last frame).
-                if( !m_playbackPaceGuard.grantLoopWrap( paceNowMs, getFramerate() ) ) return;
+                if( !m_playbackPaceGuard.grantLoopWrap( paceNowMs, playbackPaceGuardFps() ) ) return;
                 const int requestedCutInFrame = ui->spinBoxCutIn->value() - 1;
                 bool cutInFrameChanged = false;
                 const int clampedCutInFrame = playback_frame_range::clampFrameIndex(
@@ -11336,7 +11416,7 @@ void MainWindow::playbackHandling(int timeDiff)
                 //Normal mode: next frame (held while the wall clock owes no whole frame)
                 if( !ui->actionDropFrameMode->isChecked() )
                 {
-                    if( !m_playbackPaceGuard.grantWholeFrame( paceNowMs, getFramerate() ) ) return;
+                    if( !m_playbackPaceGuard.grantWholeFrame( paceNowMs, playbackPaceGuardFps() ) ) return;
                     // PLAYBACK-CLIP-LENGTH-ENFORCE-3: every source frame the engine advances is counted (the
                     // slider value AFTER setValue, so a clamp at the slider maximum is not counted as footage).
                     const double sourcePositionBeforeTick = ui->horizontalSliderPosition->value();
@@ -11363,7 +11443,7 @@ void MainWindow::playbackHandling(int timeDiff)
                 const playback_frame_range::DropFrameTickResult dropFrameTick =
                     playback_frame_range::advanceDropFrameTick(
                         m_newPosDropMode,
-                        m_playbackPaceGuard.grant( getFramerate() * (double)timeDiff / 1000.0, paceNowMs, getFramerate() ),
+                        m_playbackPaceGuard.grant( getFramerate() * (double)timeDiff / 1000.0, paceNowMs, playbackPaceGuardFps() ),
                         ui->spinBoxCutIn->value(), ui->spinBoxCutOut->value(),
                         ui->actionLoop->isChecked() );
                 // slip_summary: the granted share, read back from the tick (a wrap subtracted the cut range width;
@@ -18764,6 +18844,14 @@ double MainWindow::getFramerate( void )
     else return getMlvFramerate( m_pMlvObject );
 }
 
+// CUDA-HEADROOM-1: the pace the NativePaceGuard is handed, and nothing else. An automation run that asked for
+// unpaced playback (mlvappPlaybackUnpacedRequested) hands it 0 (no limit) to measure throughput; the interactive
+// app never does.
+double MainWindow::playbackPaceGuardFps( void )
+{
+    return playback_native_pace::guardPaceFps( getFramerate(), m_automationPacingIsolated && mlvappPlaybackUnpacedRequested() );
+}
+
 //Paint the Audio Track Wave to GUI
 void MainWindow::paintAudioTrack( void )
 {
@@ -24188,6 +24276,11 @@ void MainWindow::on_actionPlay_triggered(bool checked)
          && ui->actionDropFrameMode->isChecked() )
         {
             m_tryToSyncAudio = true;
+            m_pAudioPlayback->clearStartReport();
+            // PLAYBACK-STARTUP-WAIT-PREWARM-1 Row A: open the device now, silently and off the GUI thread, while the
+            // first frame renders; the first present only resumes it (finishPresentedFrame).
+            if( !mlvappPlaybackAudioSyncLegacyRequested() )
+                m_pAudioPlayback->prepare( ui->horizontalSliderPosition->value() );
         }
     }
 
@@ -24819,6 +24912,7 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     m_playbackSmokeFirstPresentMs = 0.0;
     m_playbackSmokeFirstPresentTimelineDeltaAbs = 0;
     m_playbackSmokeStartupSkippedFrames = 0;
+    m_playbackStartupSplit.reset();
     m_playbackSmokePresentedIntervalSumMs = 0.0;
     m_playbackSmokePresentedIntervalMaxMs = 0.0;
     m_playbackSmokeRenderTotalSumMs = 0.0;
@@ -27578,6 +27672,105 @@ void MainWindow::notePlaybackSmokePresentedFrame(
     }
 }
 
+// PLAYBACK-STARTUP-WAIT-PREWARM-1 Row B (PlaybackRoutePrewarmPolicy.h): once per clip load, while paused.
+void MainWindow::runPlaybackRoutePrewarm( quint64 clipGeneration )
+{
+    playback_route_prewarm::Inputs in;
+    in.enabled = !mlvappPlaybackRoutePrewarmDisabled();
+    in.playing = ui->actionPlay->isChecked();
+    in.fileLoaded = m_fileLoaded && m_pMlvObject;
+    in.clipGenerationMatches = clipGeneration == m_playbackRoutePrewarmClipGeneration;
+    in.gpuWindowActive = GpuDisplayWindow::isActive();
+    in.textureRouteRequested =
+        m_lastPresentedRequestContextValid && m_lastPresentedRequestContext.gpuPlaybackReconTexturePresentRequested;
+    in.r16TextureBackendAdmitted =
+        m_lastPresentedRequestContextValid && m_lastPresentedRequestContext.gpuPlaybackReconAmazeTexturePresentAdmitted;
+    const playback_route_prewarm::Decision decision = playback_route_prewarm::decide( in );
+    if( decision != playback_route_prewarm::Decision::Run )
+    {
+        qInfo().noquote() << QStringLiteral( "playback_route_prewarm decision=%1" )
+                                 .arg( QString::fromLatin1( playback_route_prewarm::decisionName( decision ) ) );
+        return;
+    }
+    const int scale = playbackScaleFactorPolicyDecision();
+    mlvDualIsoPreviewScaleRecon_t plan;
+    const bool planOk = ( scale == 2 || scale == 4 )
+                     && mlvDualIsoGpuPreviewScaleReconPlan( m_pMlvObject, scale, 0, &plan ) != 0
+                     && plan.scale == scale;
+    const playback_route_prewarm::Size size = playback_route_prewarm::textureSize(
+        static_cast<int>( getMlvWidth( m_pMlvObject ) ), static_cast<int>( getMlvHeight( m_pMlvObject ) ),
+        scale, planOk, planOk ? plan.reducedWidth : 0, planOk ? plan.reducedHeight : 0 );
+    QString summary;
+    GpuDisplayWindow::prewarmPlaybackReconRouteIfActive( size.width, size.height, &summary );
+    qInfo().noquote() << QStringLiteral( "playback_route_prewarm decision=run scale=%1 %2" ).arg( scale ).arg( summary );
+}
+
+void MainWindow::armPlaybackRoutePrewarm()
+{
+    ++m_playbackRoutePrewarmClipGeneration;   // a prewarm armed for an earlier clip is stale
+    m_playbackRoutePrewarmArmed = !mlvappPlaybackRoutePrewarmDisabled();
+}
+
+QImage MainWindow::grabIdentityViewport( QString *reason )
+{
+    QImage image;
+    if( GpuDisplayWindow::isActive() )
+    {
+        if( !GpuDisplayWindow::grabPresentedFramebufferIfActive( &image, reason ) ) image = QImage();
+        return image;
+    }
+    if( ui->graphicsView && ui->graphicsView->viewport() )
+    {
+        image = ui->graphicsView->viewport()->grab().toImage();
+        if( reason ) *reason = QStringLiteral( "graphics_view_viewport_grab" );
+    }
+    return image;
+}
+
+void MainWindow::writeFirstPresentIdentity( const QString &dir, int startPosition )
+{
+    const QDir outDir( dir );
+    const playback_first_present_identity::Stats stats = playback_first_present_identity::compare(
+        m_identityPrePlayImage, m_identityFirstPresentImage, startPosition, m_identityFirstPresentFrame );
+    const bool preSaved = !m_identityPrePlayImage.isNull()
+                       && m_identityPrePlayImage.save( outDir.absoluteFilePath( QStringLiteral("identity-pre-play.png") ), "PNG" );
+    const bool firstSaved = !m_identityFirstPresentImage.isNull()
+                         && m_identityFirstPresentImage.save( outDir.absoluteFilePath( QStringLiteral("identity-first-present.png") ), "PNG" );
+    QJsonObject json;
+    json.insert( QStringLiteral("schema"), QStringLiteral("mlv-app/first-present-identity/v1") );
+    json.insert( QStringLiteral("start_frame"), startPosition );
+    json.insert( QStringLiteral("first_present_display_frame"), m_identityFirstPresentFrame );
+    json.insert( QStringLiteral("pre_play_saved"), preSaved );
+    json.insert( QStringLiteral("first_present_saved"), firstSaved );
+    json.insert( QStringLiteral("pre_play_reason"), m_identityPrePlayReason );
+    json.insert( QStringLiteral("first_present_reason"), m_identityFirstPresentReason );
+    json.insert( QStringLiteral("width"), m_identityFirstPresentImage.width() );
+    json.insert( QStringLiteral("height"), m_identityFirstPresentImage.height() );
+    json.insert( QStringLiteral("comparable"), stats.comparable );
+    json.insert( QStringLiteral("first_present_std"), stats.firstStd );
+    json.insert( QStringLiteral("mean_abs_diff"), stats.meanAbsDiff );
+    json.insert( QStringLiteral("frame_ok"), stats.frameOk );
+    json.insert( QStringLiteral("pass"), stats.pass );
+    QFile file( outDir.absoluteFilePath( QStringLiteral("identity.json") ) );
+    if( file.open( QIODevice::WriteOnly | QIODevice::Truncate ) )
+    {
+        file.write( QJsonDocument( json ).toJson( QJsonDocument::Indented ) );
+        file.close();
+    }
+    logInteractionEvent(
+        QStringLiteral("gui_smoke.first_present_identity"),
+        QStringLiteral("start_frame=%1 display_frame=%2 std=%3 mean_abs_diff=%4 comparable=%5 frame_ok=%6 pass=%7 pre_saved=%8 first_saved=%9")
+            .arg( startPosition )
+            .arg( m_identityFirstPresentFrame )
+            .arg( stats.firstStd, 0, 'f', 3 )
+            .arg( stats.meanAbsDiff, 0, 'f', 3 )
+            .arg( bool01( stats.comparable ) )
+            .arg( bool01( stats.frameOk ) )
+            .arg( bool01( stats.pass ) )
+            .arg( bool01( preSaved ) )
+            .arg( bool01( firstSaved ) ) );
+}
+
 void MainWindow::noteContactSheetPresentedFrame(
     uint64_t displayFrame,
     const RenderFrameThread::ReadyFrame &readyFrame,
@@ -28012,6 +28205,19 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                // ENFORCE-4 r2: binds this receipt to the invocation that wrote it (see automationRunNonce()).
                .arg( automationRunNonce() );
 
+    // CUDA-HEADROOM-1: an unpaced run says so (the summary format string is pinned); nothing when it is not asked.
+    // The nonce goes through a local: the summary's run-nonce .arg is a stop statement pinned to occur exactly once.
+    if( mlvappPlaybackUnpacedRequested() )
+    {
+        const QString unpacedRunNonce = automationRunNonce();
+        qInfo().noquote()
+            << QStringLiteral( "playback_smoke.pace_unpaced session=%1 active=%2 drop_frame=%3 run_nonce=%4" )
+                   .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
+                   .arg( bool01( m_automationPacingIsolated ) )
+                   .arg( bool01( ui->actionDropFrameMode->isChecked() ) )
+                   .arg( unpacedRunNonce );
+    }
+
     // PLAYBACK-BACHELOR-PRESENT-JITTER-1: the slip summary is taken here, before pace_summary, because the wait for the
     // first frame is mostly repaid AFTER the first present: no grant runs while the render thread is busy, so the
     // guard banks the wait and a later unshaped tick spends it in one burst (Bachelor x4: 23-28 frames about a
@@ -28052,6 +28258,31 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                .arg( m_playbackSmokeStartupSkippedFrames )
                .arg( mlvappPlaybackStartupCatchupLegacyRequested() ? QStringLiteral( "legacy" )
                                                                    : QStringLiteral( "first_present" ) );
+    // PLAYBACK-STARTUP-WAIT-PREWARM-1: where that wait went (PlaybackStartupSplit.h).
+    qInfo().noquote() << m_playbackStartupSplit.line( static_cast<qulonglong>( m_playbackSmokeSessionId ) );
+    // PLAYBACK-STARTUP-WAIT-PREWARM-1 Row A: how this Play's audio started (AudioPlayback::StartReport).
+    {
+        const AudioPlayback::StartReport audioStart =
+            m_pAudioPlayback ? m_pAudioPlayback->startReport() : AudioPlayback::StartReport();
+        qInfo().noquote()
+            << QStringLiteral(
+                   "playback_smoke.audio_start session=%1 mode=%2 prepare_ms=%3 resume_lag_ms=%4 reopen_ms=%5 "
+                   "sync_frame=%6 seek_frame=%7 av_offset_est_ms=%8 av_offset_audible_ms=%9 out_latency_ms=%10 "
+                   "resume_ms=%11 sink=%12 health=%13" )
+                   .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
+                   .arg( QString::fromLatin1( audioStart.mode ) )
+                   .arg( audioStart.prepareMs, 0, 'f', 3 )
+                   .arg( audioStart.resumeLagMs, 0, 'f', 3 )
+                   .arg( audioStart.reopenMs, 0, 'f', 3 )
+                   .arg( audioStart.syncFrame )
+                   .arg( audioStart.seekFrame )
+                   .arg( audioStart.avOffsetEstMs, 0, 'f', 3 )
+                   .arg( audioStart.avOffsetAudibleMs, 0, 'f', 3 )
+                   .arg( audioStart.outLatencyMs, 0, 'f', 3 )
+                   .arg( audioStart.resumeMs, 0, 'f', 3 )
+                   .arg( QString::fromLatin1( audioStart.sink ) )
+                   .arg( QString::fromLatin1( audioStart.health ) );
+    }
 
     qInfo().noquote()
         << QStringLiteral(
@@ -30764,6 +30995,26 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
     const int displaySourceHeight = rgb8DisplaySourceHeight > 0
         ? rgb8DisplaySourceHeight : readyFrame.renderedImageHeight;
     const qint64 prepRegionFinishStartNs = prepRegionClock.nsecsElapsed();
+    // PLAYBACK-STARTUP-WAIT-PREWARM-1: the first Play-present of a smoke session is split into its sub-steps
+    // (playback_smoke.startup_split); later presents feed the session medians.
+    const double splitFinishEntry = mlv_stage_timing_now();
+    const bool splitFirst = m_playbackSmokeActive && ui->actionPlay->isChecked()
+                         && m_playbackSmokePresentedFrames == 0 && !m_playbackStartupSplit.firstCaptured();
+    if( m_playbackSmokeActive && ui->actionPlay->isChecked() )
+    {
+        const double splitRenderMs = telemetryDoubleValue( readyFrame.stageTimingTelemetry, "render_thread_total_ms" );
+        const double splitGuiPresentMs = ( splitFinishEntry - displayStart ) * 1000.0;
+        if( splitFirst ) m_playbackStartupSplit.noteFirstPresent( splitRenderMs, splitGuiPresentMs );
+        else m_playbackStartupSplit.noteLaterPresent( splitRenderMs, splitGuiPresentMs );
+    }
+    double splitMark = splitFinishEntry;
+    const auto splitStep = [&]( int step )
+    {
+        if( !splitFirst ) return;
+        const double t = mlv_stage_timing_now();
+        m_playbackStartupSplit.noteFirstFinishStep( step, ( t - splitMark ) * 1000.0 );
+        splitMark = t;
+    };
     if( dualIsoWarmupInstrumentationEnabled() )
     {
         if( m_dualIsoWarmupTelemetryPresentationGeneration
@@ -30806,6 +31057,7 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
         "drawFrameReady.record",
         displayFrame,
         ( mlv_stage_timing_now() - recordPresentedFrameStart ) * 1000.0 );
+    splitStep( playback_startup_split::StepRecord );
     const double qualityStart = mlv_stage_timing_now();
     m_lastPresentedFrameColorTelemetry = QJsonObject();
     double headlessPresentedColorAnalysisMs = 0.0;
@@ -30854,6 +31106,7 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
         "drawFrameReady.quality",
         displayFrame,
         ( mlv_stage_timing_now() - qualityStart ) * 1000.0 );
+    splitStep( playback_startup_split::StepQuality );
 
     const double scopeDispatchStart = mlv_stage_timing_now();
     m_lastDrawFrameReadyScopesMs = 0.0;
@@ -30973,6 +31226,7 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
         "drawFrameReady.scope_dispatch",
         displayFrame,
         ( mlv_stage_timing_now() - scopeDispatchStart ) * 1000.0 );
+    splitStep( playback_startup_split::StepScopes );
 
     const double overlay_start = mlv_stage_timing_now();
     if( m_tryToSyncAudio && m_pAudioPlayback && ui->actionAudioOutput->isChecked() && ui->actionPlay->isChecked() && ui->actionDropFrameMode->isChecked() )
@@ -30995,10 +31249,34 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
             m_lastPlaybackAudioSyncTime = syncNow;
             ++m_playbackAudioSyncAppliedCount;
             m_playbackPresentTrace.noteAudioSync();
-            m_pAudioPlayback->stop();
-            m_pAudioPlayback->jumpToPos( syncFrame );
-            m_pAudioPlayback->play();
+            if( mlvappPlaybackAudioSyncLegacyRequested() )
+            {
+                const double audioStopStart = mlv_stage_timing_now();
+                m_pAudioPlayback->stop();
+                const double audioJumpStart = mlv_stage_timing_now();
+                m_pAudioPlayback->jumpToPos( syncFrame );
+                const double audioPlayStart = mlv_stage_timing_now();
+                m_pAudioPlayback->play();
+                if( splitFirst )
+                    m_playbackStartupSplit.noteFirstAudio( ( audioJumpStart - audioStopStart ) * 1000.0,
+                                                           ( audioPlayStart - audioJumpStart ) * 1000.0,
+                                                           ( mlv_stage_timing_now() - audioPlayStart ) * 1000.0 );
+                m_pAudioPlayback->noteLegacyStart( syncFrame, static_cast<int>( displayFrame ) );
+            }
+            else
+            {
+                // PLAYBACK-STARTUP-WAIT-PREWARM-1 Row A: the audio thread hands the content to the held sink (resumed
+                // or re-opened first when needed) where the video will be when it is audible; this present is the
+                // anchor. The GUI thread never waits on it.
+                m_pAudioPlayback->syncAndPlay( static_cast<int>( displayFrame ), mlv_stage_timing_now() * 1000.0 );
+            }
         }
+    }
+    if( splitFirst )
+    {
+        const double t = mlv_stage_timing_now();
+        m_playbackStartupSplit.noteFirstAudioSync( ( t - splitMark ) * 1000.0 );
+        splitMark = t;
     }
 
     drawFrameNumberLabel( static_cast<int>(displayFrame) );
@@ -31047,6 +31325,7 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
     const double overlayEndStageTime = mlv_stage_timing_now();
     m_lastDrawFrameReadyOverlayMs = (overlayEndStageTime - overlay_start) * 1000.0;
     mlv_stage_timing_note_elapsed("drawFrameReady.overlay", displayFrame, m_lastDrawFrameReadyOverlayMs);
+    splitStep( playback_startup_split::StepLabels );
     const double drawTotalEndStageTime = mlv_stage_timing_now();
     m_lastDrawFrameReadyTotalMs = (drawTotalEndStageTime - displayStart) * 1000.0;
     if( m_playbackSmokeTimelineTelemetry )
@@ -31241,6 +31520,7 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
     {
         m_playbackQualityLastPresentedTime = 0.0;
     }
+    splitStep( playback_startup_split::StepAuto );
     notePlayToFirstFramePresentation( displayFrame );
     if( m_pRenderThread && !releasePresentedFrameEarly )
         m_pRenderThread->releasePresentedFrameForRequestSerial( readyFrame.requestSerial );
@@ -31318,6 +31598,7 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
             m_playbackFrameAdvancePending = true;
         }
     }
+    splitStep( playback_startup_split::StepAdvance );
     const qint64 prepRegionFinishEndNs = prepRegionClock.nsecsElapsed();
     const double prepRegionFinishMs =
         static_cast<double>( prepRegionFinishEndNs - prepRegionFinishStartNs ) / 1000000.0;
@@ -31354,6 +31635,14 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
     // when the options are off.
     if( m_contactSheetOptionsPresent )
         noteContactSheetPresentedFrame( displayFrame, readyFrame, requestContext );
+    // PLAYBACK-STARTUP-WAIT-PREWARM-1 identity capture (opt-in, default off: a false bool on the hot path): the measured
+    // Play's first present, read back right after its swap.
+    if( m_identityFirstPresentArmed && ui->actionPlay->isChecked() )
+    {
+        m_identityFirstPresentArmed = false;
+        m_identityFirstPresentFrame = static_cast<int>( displayFrame );
+        m_identityFirstPresentImage = grabIdentityViewport( &m_identityFirstPresentReason );
+    }
     if( dualIsoWarmupInstrumentationEnabled() )
         ++m_dualIsoWarmupTelemetryPresentedFrames;
     if( interactiveTraceEnabled() )
@@ -31371,6 +31660,27 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
             true );
     }
     emit frameReady();
+    splitStep( playback_startup_split::StepSmoke );
+    if( splitFirst )
+        m_playbackStartupSplit.noteFirstFinish( ( mlv_stage_timing_now() - splitFinishEntry ) * 1000.0 );
+    // PLAYBACK-STARTUP-WAIT-PREWARM-1 Row A: while paused, keep the audio sink open (running on silence, on the audio
+    // thread; coalesced, and kept when already open). The device open (~0.3-0.6 s on Bachelor) then never races the
+    // first Play-present, which only hands the content over.
+    if( !ui->actionPlay->isChecked()
+     && !mlvappPlaybackAudioSyncLegacyRequested()
+     && m_pAudioPlayback
+     && ui->actionAudioOutput->isChecked()
+     && ui->actionDropFrameMode->isChecked()
+     && m_pMlvObject && doesMlvHaveAudio( m_pMlvObject ) )
+        m_pAudioPlayback->prepare( static_cast<int>( displayFrame ) );
+    // PLAYBACK-STARTUP-WAIT-PREWARM-1 Row B: the clip's first paused present means the open has settled; warm the
+    // playback route from the event loop (runPlaybackRoutePrewarm re-decides: Play or another clip in between cancels).
+    if( m_playbackRoutePrewarmArmed && !ui->actionPlay->isChecked() )
+    {
+        m_playbackRoutePrewarmArmed = false;
+        const quint64 prewarmGeneration = m_playbackRoutePrewarmClipGeneration;
+        QTimer::singleShot( 0, this, [this, prewarmGeneration]() { runPlaybackRoutePrewarm( prewarmGeneration ); } );
+    }
     const bool immediateGpuTexNrDrain =
         mlvappGpuTexNrImmediateDrainRequested()
         && !m_gpuTexNrImmediateDrainActive

@@ -36,6 +36,9 @@
 #include "PlaybackPresentTrace.h"
 #include "PlaybackScopesDuringPlayback.h"
 #include "PlaybackSlipHistogram.h"
+#include "PlaybackStartupSplit.h"
+#include "PlaybackFirstPresentIdentity.h"
+#include "PlaybackRoutePrewarmPolicy.h"
 #include "../../src/mlv_include.h"
 #include "InfoDialog.h"
 #include "StatusDialog.h"
@@ -1166,6 +1169,9 @@ private:
     // PLAYBACK-BACHELOR-PRESENT-JITTER-1: per-present slip accounting and timeline-path reconciliation for the
     // smoke session (playback_smoke.slip_summary); fed only while m_playbackSmokeActive.
     playback_slip::SlipHistogram m_playbackSlipHistogram;
+    // PLAYBACK-STARTUP-WAIT-PREWARM-1: where the Play -> first-present wait goes (playback_smoke.startup_split);
+    // fed only while m_playbackSmokeActive, reset at every smoke session start.
+    playback_startup_split::StartupSplit m_playbackStartupSplit;
     // PLAYBACK-DECODE-RENDER-OVERLAP-1: the last drawFrame() request was on the CUDA texture route (play, texture
     // present requested and admitted, scale 1), where the playback lookahead is on by default
     // (playback_overlap::effectiveLookaheadFrames). The counters feed playback_smoke.overlap_summary.
@@ -1214,6 +1220,16 @@ private:
     int m_contactSheetCaptureStartFrame = 0;
     double m_contactSheetCaptureFps = 0.0;
     QString m_contactSheetCaptureError;
+    // PLAYBACK-STARTUP-WAIT-PREWARM-1 (opt-in, MLVAPP_SMOKE_FIRST_PRESENT_CAPTURE=1, needs --contact-sheet-dir): the paused
+    // start frame grabbed untimed before the measured Play, and the measured Play's first present grabbed right after it
+    // is swapped (noteContactSheetPresentedFrame); written as identity-* beside the contact sheet after the Play stops.
+    bool m_identityFirstPresentArmed = false;
+    QImage m_identityPrePlayImage;
+    QImage m_identityFirstPresentImage;
+    int m_identityPrePlayFrame = -1;
+    int m_identityFirstPresentFrame = -1;
+    QString m_identityPrePlayReason;
+    QString m_identityFirstPresentReason;
     uint64_t m_dualIsoWarmupTelemetryPresentationGeneration = 0;
     int m_dualIsoWarmupTelemetryPresentedFrames = 0;
     uint64_t m_playbackSmokeStartRequestSerial = 0;
@@ -1668,6 +1684,17 @@ private:
     void noteContactSheetPresentedFrame( uint64_t displayFrame,
                                         const RenderFrameThread::ReadyFrame &readyFrame,
                                         const PresentationRequestContext &requestContext );
+    // PLAYBACK-STARTUP-WAIT-PREWARM-1 identity capture: the presented viewport (GL framebuffer when the GPU window is
+    // active, else the graphics view), and the after-stop writer of identity-pre-play.png / identity-first-present.png /
+    // identity.json.
+    QImage grabIdentityViewport( QString *reason );
+    // PLAYBACK-STARTUP-WAIT-PREWARM-1 Row B: armed at clip load, run once from the event loop after the clip's first paused
+    // present (PlaybackRoutePrewarmPolicy.h decides; GpuDisplayWindow::prewarmPlaybackReconRouteIfActive warms).
+    void armPlaybackRoutePrewarm();
+    void runPlaybackRoutePrewarm( quint64 clipGeneration );
+    bool m_playbackRoutePrewarmArmed = false;
+    quint64 m_playbackRoutePrewarmClipGeneration = 0;
+    void writeFirstPresentIdentity( const QString &dir, int startPosition );
     // --gui-smoke-playback only (CUDA-PERF-PLAYBACK-FOREGROUND-1): forces the main window
     // and the GPU display window to the OS foreground and verifies with
     // GetForegroundWindow(); never called from normal (non-smoke) startup or from the
@@ -1821,6 +1848,7 @@ private:
     void previewPicture( int row );
     void setPreviewMode( void );
     double getFramerate( void );
+    double playbackPaceGuardFps( void );
     void paintAudioTrack( void );
     uint8_t drawZebras( QImage *image );
     void drawFrameNumberLabel( int frameIndex = -1 );
