@@ -9100,6 +9100,15 @@ class Na2AssignmentIsNotADeleteTests(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertIn("delete", self._acts(cmd))
 
+    def test_cmd_double_slash_and_compact_switches_are_still_a_delete(self):
+        # r4 (sol r3 key): Git Bash `cmd //c` and compact cmd.exe switches (`/s/c`, `cmd/c`).
+        for cmd in ('cmd //c rd= /s /q C:/review/board/.claude-state/fleet-runs/lane-A-r1',
+                    'cmd //c rmdir= /s /q C:/x/y', 'cmd //c del= /q C:/x/y.txt',
+                    'cmd.exe /s/c rd= /s /q C:\\x', 'cmd.exe /s/c rmdir= /s /q C:\\x', 'cmd.exe /s/c del= /q C:\\x\\y.txt',
+                    'cmd //s //c rd= /s /q C:/x', 'cmd/c rd= /s /q C:\\x', 'cmd.exe /d/s/k rd= /s /q C:\\x'):
+            with self.subTest(cmd=cmd):
+                self.assertIn("delete", self._acts(cmd))
+
     def test_cmd_mentioned_in_a_string_stays_fail_closed(self):
         # Known fail-closed direction (sol r2 hardening row): an assignment next to text that merely
         # mentions `cmd /c` is read strictly. Documented, not loosened.
