@@ -4070,7 +4070,11 @@ class LineEndingsCannotHideACommittedFileTests(ModuleMutationMixin, unittest.Tes
         self.assertIn("$legSpecSha256 = Get-DvLegSpecSha256 $specBytes", runner)
         self.assertNotIn("Get-DvSha256OfBytes $specBytes", runner)
         module = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
-        self.assertIn("(Get-DvLegSpecSha256 $blob.bytes) -ceq $LegSpecSha256", module)
+        # PLAYBACK-GPU-SCOPES-NO-VETO-1 r2b: the lookup caches each blob's Get-DvLegSpecSha256 by blob id (n lookups over n blobs were n^2 git
+        # processes and ran this class past its pwsh timeout once 82 legs shipped); the comparison is still that function's hash.
+        self.assertIn("$known = @{ sha256 = (Get-DvLegSpecSha256 $blob.bytes); text = $blob.text }", module)
+        self.assertIn("if ($known.sha256 -ceq $LegSpecSha256) {", module)
+        self.assertIn("$known = $script:LegSpecBlobCache[$id]", module)
 
     def test_mutation_without_the_line_ending_normalisation_the_committed_spec_is_not_found_on_a_crlf_checkout(self) -> None:
         mutated = self.mutated_module([("Get-DvSha256OfBytes (ConvertTo-DvLfBytes $Bytes)", "Get-DvSha256OfBytes $Bytes")])
