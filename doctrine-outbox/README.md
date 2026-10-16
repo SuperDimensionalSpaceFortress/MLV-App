@@ -6,6 +6,13 @@ is the mechanism, ported from agent-bridge's port of the bus's own reference out
 itself: the unattended drain, the capture hook and the heartbeat debt line are card
 DOCTRINE-OUTBOX-ADOPT-MLV-1b and install against this CLI.
 
+**One file for the fleet (OUTBOX-SINGLE-SOURCE-1).** `tools/coordination/doctrine_outbox.py` is not edited
+per project: every project value (ref, items directory, finding paths, state files, Law-4 deny terms) is
+data in `doctrine-outbox.config.json` at the repo root, and the bus steward adopts the same bytes (the
+digest is pinned in that config's `vendored_from` and by `tests/coordination/test_doctrine_outbox_hooks.py`).
+Change behaviour by changing the config; change the tool only in the bus, then re-vendor. The same file
+also answers the hook commands `check`, `pre-push`, `stop`, `session-start` and `install-hooks`.
+
 **Derive state; this file holds none.** Every value below is a command.
 
 ```
