@@ -388,7 +388,11 @@ function Get-LocalPlaybackLintWordLists {
         # TailNegationPrepositions, TailPureLocus, VenueWords, HostDeterminers, HostNouns and HostNames, so a word added there reaches
         # both grammars.
         LaunchVerbs                = @('run', 'runs', 'running', 'launch', 'launches', 'launching', 'launched', 'start', 'starts', 'starting', 'execute', 'executes', 'executing', 'invoke', 'invokes', 'invoking', 'drive', 'drives', 'driving', 'kick off', 'play', 'plays', 'playing', 'open', 'opens', 'opening')
-        HeadObjectWords            = @('playback', 'arm', 'arms', 'clip', 'clips', 'it', 'them', 'this', 'that', 'app', 'exactness', 'gui', 'gui-smoke', 'smoke', 'mlvapp', 'mlvapp.exe', 'mlvapprelease', 'mlvapprelease.exe')
+        HeadObjectWords            = @('playback', 'arm', 'arms', 'clip', 'clips', 'it', 'them', 'this', 'that', 'app', 'exactness', 'gui', 'gui-smoke', 'smoke')
+        # r13 (HUB-VM-LINT-HEAD-EXECUTABLE-AS-OBJECT-1): an executable, like a clip / file argument (the identifier), is a LAUNCH, never a
+        # stand-alone object phrase. It is admitted only inside a fragment that carries its own route (headRoutedFrag), after a
+        # prohibition word, or as the object of the marker's own bare launch (that launch is routed by `locally <prep> <venue>`).
+        HeadExecutableWords        = @('mlvapp', 'mlvapp.exe', 'mlvapprelease', 'mlvapprelease.exe')
         HeadFillers                = @('please', 'just', 'also', 'now')
         HeadJoiners                = @('and', 'or', 'then', 'but', 'so')
         HeadProhibitions           = @('never', 'do not', "don't", 'must not', "mustn't", 'may not')
@@ -529,14 +533,18 @@ function Get-LocalPlaybackPromptFindings {
     $headObjectWord = "(?:$(ConvertTo-LintAlternation -Words @($lists.HeadObjectWords)))${tb}"
     # an identifier (a clip, an arm, a build tag): letters, then a digit, then more word characters joined by - or . ("M16-1243", "arm2")
     $headIdentifier = "[A-Za-z]{1,6}\d+(?:[\-.]\w+)*${tb}"
-    $headObject = "(?:(?:${tailArticle})${tb}\s+)?(?:${headObjectWord}|${headIdentifier})(?:\s+(?:${headObjectWord}|${headIdentifier}))*"
+    $headExeWord = "(?:$(ConvertTo-LintAlternation -Words @($lists.HeadExecutableWords)))${tb}"
+    # r13: $headObject (plain words only) is the ONLY stand-alone object phrase; $headLaunchObject adds the executables and identifiers
+    # and is read only where the fragment carries its own route (routed fragment, marker's bare launch) or follows a prohibition.
+    $headObject = "(?:(?:${tailArticle})${tb}\s+)?${headObjectWord}(?:\s+${headObjectWord})*"
+    $headLaunchObject = "(?:(?:${tailArticle})${tb}\s+)?(?:${headObjectWord}|${headExeWord}|${headIdentifier})(?:\s+(?:${headObjectWord}|${headExeWord}|${headIdentifier}))*"
     $headFillers = "(?:${headFiller}\s+)*"
     $headUnit = "(?:${tailHostTarget}|${tailRoute}|${tailLocus})"
-    $headProhibitionFrag = "(?:${headProhibition})${tb}(?:\s+${headVerb})?(?:\s+${headObject})?(?:\s+${headUnit}(?:\s+(?:or|nor|and)${tb}\s+${headUnit})*)?"
-    $headRoutedFrag = "${headFillers}(?:${headVerb}\s+)?(?:${headObject}\s+)?${tailFragA}(?:\s+(?:${headContrast})${tb}\s+${tailHostTarget})?"
+    $headProhibitionFrag = "(?:${headProhibition})${tb}(?:\s+${headVerb})?(?:\s+${headLaunchObject})?(?:\s+${headUnit}(?:\s+(?:or|nor|and)${tb}\s+${headUnit})*)?"
+    $headRoutedFrag = "${headFillers}(?:${headVerb}\s+)?(?:${headLaunchObject}\s+)?${tailFragA}(?:\s+(?:${headContrast})${tb}\s+${tailHostTarget})?"
     $headBareVenue = "(?:(?:${tailArticle})${tb}\s+)?${tailVenue}"
     $headFrag = "(?:${headProhibitionFrag}|${tailFragC}|${headRoutedFrag}|${tailLocus}|${headBareVenue}|${headObject})"
-    $headBareLaunch = "${headFillers}${headVerb}(?:\s+${headObject})?"
+    $headBareLaunch = "${headFillers}${headVerb}(?:\s+${headLaunchObject})?"
     $headSep = "(?:[.!?;:,]+(?=\s|\z)|(?<=\s|^)-{1,2}(?=\s)|(?:${headJoiner})${tb})"
     # a list marker or heading marks at the start of an item: "## ", "* ", "> ", "1. ", "2) " ("- " is a spaced dash, a separator)
     $headListMark = "(?:#{1,6}|[*+>]+|\d{1,3}[.)])\s+"

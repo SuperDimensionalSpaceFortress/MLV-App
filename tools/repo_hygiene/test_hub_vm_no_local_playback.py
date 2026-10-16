@@ -88,10 +88,10 @@ def _baseline_lint_source() -> tuple[str, str] | None:
 # PREVIOUS-HEAD DIFFERENTIAL (r7; CoS Prevention on PR #448 a595464f, ruling candidate mlv-safety-lint-exemption-defeater-corpus-r1).
 # The differential against master cannot see a narrowing that undoes the PREVIOUS head's own safety gains: a row the previous head
 # refused and master passes shows as zero flips against master. Every round therefore also runs the corpus against the lint of the PR
-# head the round STARTED from. EACH ROUND MOVES THIS to the head it started from (r12 started from r11b c574ea89; r11b started from r10
+# head the round STARTED from. EACH ROUND MOVES THIS to the head it started from (r13 started from r12 d2f3cd05; r12 started from r11b c574ea89; r11b started from r10
 # d291f184; r10 started from r9 fd190b6d, and r9 changed no lint behaviour). It is checked to be an ancestor of HEAD, so a rebase that
 # drops it fails loudly in CI instead of silently weakening the gate.
-PREVIOUS_PR_HEAD = "c574ea89d26500d2a7f3e3fd18566ee56137a643"
+PREVIOUS_PR_HEAD = "d2f3cd05c311f60b8151fe578742c0b3fa104a22"
 
 
 def _previous_head_lint_source() -> tuple[str, str] | None:
@@ -558,6 +558,11 @@ R12_VERB_FORMS = ("re-{v}", "re{v}", "pre-{v}", "{v}-again", "{v}-through", "aut
 R12_LOCI = ("on this host", "on the hub-VM", "here", "on my rig", "on Bachelor", "")
 R12_EXTRA_LOCI = ("on localhost", "on this tablet", "with this local install", "hub-side", "on-box", "in this container")
 R12_FILLER_POOL = ("please", "just", "also", "now")
+# r13: the file arguments behind an executable. Deliberately neutral made-up names (hub ruling 2026-10-16: a fixture never names a real
+# clip file or uses the raw clip extension): the rule under test is that ANY file argument after an executable is a launch.
+R13_ARGS = ("", " take01.dat", " sample1.bin", " C1")
+# A file argument the closed grammar does not read as an identifier (no digit): refused by every head, so it is a refuse-only control.
+R13_UNLISTED_ARGS = (" sample-a.bin",)
 
 
 def _r12_rows(lists: dict[str, list[str]]) -> list[tuple[str, bool, str]]:
@@ -613,6 +618,26 @@ def _r12_rows(lists: dict[str, list[str]]) -> list[tuple[str, bool, str]]:
         add("r12-allow-head", False, f"Run playback on Bachelor {contrast} here, then {marker}.")
     for joiner in lists["HeadJoiners"]:
         add("r12-allow-head", False, f"Run playback on Bachelor, {joiner} locally on Bachelor.")
+    # (5) r13 (sol r12 BLOCKER HUB-VM-LINT-HEAD-EXECUTABLE-AS-OBJECT-1): an executable, or a clip / file argument, standing alone is a
+    # LAUNCH with no route, never an object phrase. Every executable x argument x every clause and sentence boundary refuses.
+    for exe in lists["HeadExecutableWords"]:
+        for arg in R13_ARGS:
+            for j in R11_BOUNDARIES:
+                add("r13-executable-as-object", True, f"{exe}{arg}{j} {marker}.")
+            for j in R11_SENTENCE_BOUNDARIES:
+                add("r13-executable-as-object", True, f"{exe}{arg}{j} playback locally on Bachelor.")
+            # ALLOW controls: the same launch carrying its OWN route, after a prohibition, or as the marker's own launch
+            add("r13-allow-routed-executable", False, f"Run {exe}{arg} on Bachelor, then locally on Bachelor.")
+            add("r13-allow-routed-executable", False, f"{exe}{arg} on Bachelor; {marker}.")
+            add("r13-allow-routed-executable", False, f"Never run {exe}{arg}, {marker}.")
+            add("r13-allow-routed-executable", False, f"Run {exe}{arg} locally on Bachelor.")
+    for exe in lists["HeadExecutableWords"]:
+        for arg in R13_UNLISTED_ARGS:
+            for j in R11_BOUNDARIES:
+                add("r13-executable-as-object", True, f"{exe}{arg}{j} {marker}.")
+    for arg in R13_ARGS[1:]:
+        for j in R11_BOUNDARIES:
+            add("r13-executable-as-object", True, f"{arg.strip()}{j} {marker}.")
     return [(g, r, t) for t, (g, r) in out.items()]
 
 
@@ -642,20 +667,25 @@ _G_E1 = re.compile(r"^(?P<head>.*?)\blocally\s+(?:on|via|through|using)\s+(?:(?:
 # phrase; the LAST piece may also be a bare launch. Deliberately no wider than the lint: a flip against master it cannot explain fails.
 _G_VERB = (r"(?:running|runs|run|launching|launched|launches|launch|starting|starts|start|executing|executes|execute|invoking|invokes|invoke|"
            r"driving|drives|drive|kick\s+off|playing|plays|play|opening|opens|open)" + _G_TB)
-_G_OBJ_WORD = r"(?:playback|arms?|clips?|it|them|this|that|app|exactness|gui-smoke|gui|smoke|mlvapprelease(?:\.exe)?|mlvapp(?:\.exe)?)" + _G_TB
+_G_OBJ_WORD = r"(?:playback|arms?|clips?|it|them|this|that|app|exactness|gui-smoke|gui|smoke)" + _G_TB
+_G_EXE = r"(?:mlvapprelease(?:\.exe)?|mlvapp(?:\.exe)?)" + _G_TB
 _G_IDENT = r"[A-Za-z]{1,6}\d+(?:[\-.]\w+)*" + _G_TB
-_G_OBJECT = (r"(?:(?:the|a|an)" + _G_TB + r"\s+)?(?:" + _G_OBJ_WORD + r"|" + _G_IDENT + r")(?:\s+(?:" + _G_OBJ_WORD + r"|" + _G_IDENT + r"))*")
+# r13: an executable or a clip / file argument is a LAUNCH, never a stand-alone object phrase (_G_OBJECT, plain words only); it is read
+# (_G_LAUNCH_OBJECT) only where the fragment carries its own route, after a prohibition word or as the marker's own bare launch.
+_G_OBJECT = r"(?:(?:the|a|an)" + _G_TB + r"\s+)?" + _G_OBJ_WORD + r"(?:\s+" + _G_OBJ_WORD + r")*"
+_G_LAUNCH_OBJECT = (r"(?:(?:the|a|an)" + _G_TB + r"\s+)?(?:" + _G_OBJ_WORD + r"|" + _G_EXE + r"|" + _G_IDENT + r")(?:\s+(?:" + _G_OBJ_WORD + r"|"
+                    + _G_EXE + r"|" + _G_IDENT + r"))*")
 _G_FILLERS = r"(?:(?:please|just|also|now)" + _G_TB + r"\s+)*"
 _G_CONTRAST = r"(?:rather\s+than|instead\s+of|not|never|nor)" + _G_TB
 _G_PROHIBITION = r"(?:never|do\s+not|don't|must\s+not|mustn't|may\s+not)" + _G_TB
 _G_UNIT = r"(?:" + _G_HOST_TARGET + r"|" + _G_ROUTE + r"|" + _G_LOCUS + r")"
-_G_H_PROHIBITION = (_G_PROHIBITION + r"(?:\s+" + _G_VERB + r")?(?:\s+" + _G_OBJECT + r")?(?:\s+" + _G_UNIT
+_G_H_PROHIBITION = (_G_PROHIBITION + r"(?:\s+" + _G_VERB + r")?(?:\s+" + _G_LAUNCH_OBJECT + r")?(?:\s+" + _G_UNIT
                     + r"(?:\s+(?:or|nor|and)" + _G_TB + r"\s+" + _G_UNIT + r")*)?")
 _G_A = r"(?:" + _G_LOCUS + r"\s+)*" + _G_ROUTE + r"(?:\s+" + _G_ROUTE + r")*(?:\s+" + _G_LOCUS + r")*"
-_G_H_ROUTED = _G_FILLERS + r"(?:" + _G_VERB + r"\s+)?(?:" + _G_OBJECT + r"\s+)?" + _G_A + r"(?:\s+" + _G_CONTRAST + r"\s+" + _G_HOST_TARGET + r")?"
+_G_H_ROUTED = _G_FILLERS + r"(?:" + _G_VERB + r"\s+)?(?:" + _G_LAUNCH_OBJECT + r"\s+)?" + _G_A + r"(?:\s+" + _G_CONTRAST + r"\s+" + _G_HOST_TARGET + r")?"
 _G_H_BARE_VENUE = r"(?:(?:the|a|an)" + _G_TB + r"\s+)?" + _G_VENUE
 _G_H_FRAG = (r"(?:" + _G_H_PROHIBITION + r"|" + _G_NEGATION + r"|" + _G_H_ROUTED + r"|" + _G_LOCUS + r"|" + _G_H_BARE_VENUE + r"|" + _G_OBJECT + r")")
-_G_H_BARE_LAUNCH = _G_FILLERS + _G_VERB + r"(?:\s+" + _G_OBJECT + r")?"
+_G_H_BARE_LAUNCH = _G_FILLERS + _G_VERB + r"(?:\s+" + _G_LAUNCH_OBJECT + r")?"
 _G_H_SEPARATOR = r"(?:[.!?;:,]+(?=\s|$)|(?<=\s)-{1,2}(?=\s)|(?:and|or|then|but|so)" + _G_TB + r")"
 _G_H_OPEN = (r"\s*(?:(?:#{1,6}|[*+>]+|\d{1,3}[.)])\s+)*(?:" + _G_H_SEPARATOR + r"\s*)*(?:" + _G_H_FRAG + r"(?:\s*" + _G_H_SEPARATOR + r")+\s*)*")
 _G_HEAD_GRAMMAR = re.compile(_G_H_OPEN + r"(?:(?:" + _G_H_FRAG + r"|" + _G_H_BARE_LAUNCH + r")\s*)?", re.I)
@@ -891,6 +921,7 @@ def _differential_flips(work: Path, baseline_text: str | None = None, previous_h
                                   + PromptLintTests.CLAUSE_MUST_PASS_R10
                                   + PromptLintTests.CLAUSE_MUST_REFUSE_R11 + PromptLintTests.CLAUSE_MUST_PASS_R11
                                   + PromptLintTests.CLAUSE_MUST_REFUSE_R12 + PromptLintTests.CLAUSE_MUST_PASS_R12
+                                  + PromptLintTests.CLAUSE_MUST_REFUSE_R13 + PromptLintTests.CLAUSE_MUST_PASS_R13
                                   + PromptLintTests.PROBE_ROWS
                                   + tuple(text for _, _, text in PromptLintTests.DEFEATER_AXIS) + PromptLintTests.DEFEATER_AXIS_CONTROLS,
                                   members=tuple(_list_member_rows(_lint_word_lists(LINT_PS1, work))))
@@ -1468,6 +1499,28 @@ class PromptLintTests(unittest.TestCase):
         "## Through the venue chain\nRun playback locally on Bachelor.\n",
         "## Venue\nRun playback locally on Bachelor\nthrough the venue chain.\n",
     )
+    # r13 (sol r12 BLOCKER HUB-VM-LINT-HEAD-EXECUTABLE-AS-OBJECT-1): an earlier BARE executable command (an executable, with or without a
+    # file argument) is a launch with no route, never an object phrase, so it voids E1 and the text refuses. Sol's repro texts used a
+    # real clip file; per the hub ruling of 2026-10-16 they are restated with a neutral made-up file argument (the rule is that ANY file
+    # argument after an executable is a launch). Every row is refused by master, clean at d2f3cd05 (RED there) and refused here.
+    CLAUSE_MUST_REFUSE_R13 = (
+        "MLVApp.exe take01.dat; run playback locally on Bachelor.",
+        "MLVApp.exe take01.dat. Then run playback locally on Bachelor.",
+        "MLVApp.exe take01.dat, then run playback locally on Bachelor.",
+        "MLVApp.exe and then run playback locally on Bachelor.",
+    )
+    CLAUSE_MUST_REFUSE_R13_MULTILINE = (
+        "MLVApp.exe\nRun playback locally on Bachelor.\n",
+        "MLVAppRelease.exe take01.dat\nRun playback locally on Bachelor.\n",
+        "MLVApp.exe sample1.bin\n\nThen run playback locally on Bachelor.\n",
+    )
+    # r13 ALLOW controls: an executable that carries its OWN route, follows a prohibition, or is the marker clause's own launch.
+    CLAUSE_MUST_PASS_R13 = (
+        "Run MLVApp.exe take01.dat on Bachelor, then run playback locally on Bachelor.",
+        "MLVApp.exe take01.dat on Bachelor; run playback locally on Bachelor.",
+        "Never run MLVApp.exe, run playback locally on Bachelor.",
+        "Run MLVApp.exe take01.dat locally on Bachelor.",
+    )
     # r10 ALLOW list: tails in the closed grammar only -- (A) venue routing, (B) a pure locus word, (C) a verbless host negation.
     CLAUSE_MUST_PASS_R10 = (
         "Run playback locally on Bachelor, then on Ultra-Magnus.",
@@ -1633,6 +1686,17 @@ class PromptLintTests(unittest.TestCase):
         rows = list(self.CLAUSE_MUST_PASS_R12 + self.CLAUSE_MUST_PASS_R12_MULTILINE)
         counts = _json_counts(LINT_PS1, rows, self.tmp, "r12-pass")
         self.assertEqual([], [t for t, n in zip(rows, counts) if n > 0], "r12 rows the lint refused that it must pass")
+
+    def test_red_r13_an_earlier_bare_executable_command_is_refused(self):
+        """r13: sol's r12 repro rows (clean at d2f3cd05, RED there; GREEN here), restated with a neutral file argument."""
+        rows = list(self.CLAUSE_MUST_REFUSE_R13 + self.CLAUSE_MUST_REFUSE_R13_MULTILINE)
+        counts = _json_counts(LINT_PS1, rows, self.tmp, "r13-refuse")
+        self.assertEqual([], [t for t, n in zip(rows, counts) if n == 0], "r13 rows the lint passed that it must refuse")
+
+    def test_green_r13_an_executable_carrying_its_own_route_passes(self):
+        rows = list(self.CLAUSE_MUST_PASS_R13)
+        counts = _json_counts(LINT_PS1, rows, self.tmp, "r13-pass")
+        self.assertEqual([], [t for t, n in zip(rows, counts) if n > 0], "r13 rows the lint refused that it must pass")
 
     def test_a_1mb_heading_free_prompt_completes_in_bounded_time(self):
         """r10 (opus r9 hardening HUB-VM-LINT-BLOCKTAIL-QUADRATIC-1): r9 copied the rest of the block per item, O(n^2) on a large
@@ -1813,8 +1877,11 @@ class ListMemberDefeaterTests(unittest.TestCase):
                   "r11-earlier-group", "r11-earlier-clause-allow-tail", "r11-marker-prefix-host", "r11-overrefusal-earlier-launch",
                   "r11-allow-routed-head",
                   "r12-unlisted-verb-clause", "r12-unlisted-verb-sentence", "r12-overrefusal-unlisted-verb-routed", "r12-hyphen-prefix-form",
-                  "r12-earlier-item-no-locus", "r12-allow-head"):
+                  "r12-earlier-item-no-locus", "r12-allow-head", "r13-executable-as-object", "r13-allow-routed-executable"):
             self.assertIn(g, groups, f"no rows generated for {g}")
+        # r13: every executable x every file argument (none included) x every clause boundary and every sentence boundary
+        self.assertGreaterEqual(sum(1 for g, _, _ in self.rows if g == "r13-executable-as-object"),
+                                len(self.lists["HeadExecutableWords"]) * len(R13_ARGS) * (len(R11_BOUNDARIES) + len(R11_SENTENCE_BOUNDARIES)))
         # r12: every unlisted verb x every locus x every clause boundary and every sentence boundary, and every form of every listed verb
         self.assertGreaterEqual(sum(1 for g, _, _ in self.rows if g.startswith("r12-") and g.endswith(("-clause", "-routed"))),
                                 len(R12_UNLISTED_VERBS) * (len(R12_LOCI) - 1) * len(R11_BOUNDARIES))
@@ -1974,6 +2041,27 @@ class ListMemberDefeaterTests(unittest.TestCase):
                 self.assertTrue(_e1_terminal_in_grammar(text), text)
             elif g.startswith("r12-") and refuse:
                 self.assertFalse(_e1_terminal_in_grammar(text), text)
+
+    def test_red_r13_an_executable_or_file_argument_never_hides_in_front_of_a_venue_routed_locally(self):
+        """r13: every executable x file argument x every clause and sentence boundary is a launch with no route and is refused."""
+        self._group("r13-executable-as-object", True)
+
+    def test_green_r13_a_routed_executable_passes_and_the_oracle_agrees(self):
+        self._group("r13-allow-routed-executable", False)
+        for g, refuse, text in self.rows:
+            if g == "r13-allow-routed-executable":
+                self.assertTrue(_e1_terminal_in_grammar(text), text)
+            elif g.startswith("r13-") and refuse:
+                self.assertFalse(_e1_terminal_in_grammar(text), text)
+
+    def test_r13_executables_are_not_object_words(self):
+        """r13: an executable is a launch, never a stand-alone object phrase -- it lives in its own list, disjoint from HeadObjectWords."""
+        self.assertTrue(self.lists.get("HeadExecutableWords"), "list HeadExecutableWords is missing or empty")
+        self.assertEqual([], [w for w in self.lists["HeadExecutableWords"] if w in self.lists["HeadObjectWords"]])
+        self.assertEqual([], [w for w in self.lists["HeadObjectWords"] if w.lower().endswith(".exe") or w.lower().startswith("mlvapp")])
+        body = LINT_PS1.read_text(encoding="utf-8")
+        body = body[body.index("function Get-LocalPlaybackPromptFindings"):]
+        self.assertIn("$lists.HeadExecutableWords", body, "the findings function does not read list HeadExecutableWords")
 
     def test_r12_head_lists_are_exposed_read_by_the_lint_and_closed(self):
         """r12: the head grammar's lists are exposed and read by the findings function; the old blacklist machinery is gone, and no
@@ -2199,6 +2287,16 @@ class LintDifferentialPinTests(unittest.TestCase):
          "them. The accepted over-refusal is an unlisted verb with a VENUE route ('Replay the arms on Bachelor, then run playback "
          "locally on Bachelor.', r12-overrefusal-unlisted-verb-routed) and any earlier clause, item or heading outside the grammar, "
          "listed in the PR body."),
+        ("r13-executable-is-a-launch-not-an-object",
+         lambda text, f: (f.get("tpl") == "seed" and text in PromptLintTests.CLAUSE_MUST_REFUSE_R13)
+         or (f.get("tpl") == "list-member" and str(f.get("G", "")).startswith("r13-") and f.get("R") is True),
+         "r13, sol r12 key on d2f3cd05 (HUB-VM-LINT-HEAD-EXECUTABLE-AS-OBJECT-1): an executable, or a clip / file argument, standing "
+         "alone is a LAUNCH with no route, never an object phrase. The r12 tip read the app executable as a stand-alone object phrase "
+         "and passed 'MLVApp.exe <file>; run playback locally on Bachelor.' and its sentence-break and line-break forms "
+         "(CLAUSE_MUST_REFUSE_R13, the r13-* generators); they now refuse, and master refuses every one of them. Sol's repro texts "
+         "named a real clip file; the fixtures use neutral made-up file arguments instead (the rule is that ANY file argument after an "
+         "executable is a launch). An executable that carries its own route, follows a prohibition, or is the marker clause's own "
+         "launch still passes (CLAUSE_MUST_PASS_R13)."),
     )
 
     @classmethod
@@ -2215,7 +2313,8 @@ class LintDifferentialPinTests(unittest.TestCase):
         rows opened against d291f184 in r11b and are the previous head's own verdict now), and the only rows that close are the r12
         multi-line rows (an earlier unlisted launch, an earlier heading outside the closed head grammar)."""
         refuse_rows = (PromptLintTests.CLAUSE_MUST_REFUSE_R8_MULTILINE + PromptLintTests.CLAUSE_MUST_REFUSE_R10_MULTILINE
-                       + PromptLintTests.CLAUSE_MUST_REFUSE_R11_MULTILINE + PromptLintTests.CLAUSE_MUST_REFUSE_R12_MULTILINE)
+                       + PromptLintTests.CLAUSE_MUST_REFUSE_R11_MULTILINE + PromptLintTests.CLAUSE_MUST_REFUSE_R12_MULTILINE
+                       + PromptLintTests.CLAUSE_MUST_REFUSE_R13_MULTILINE)
         pass_rows = (PromptLintTests.CLAUSE_MUST_PASS_R8_MULTILINE + PromptLintTests.CLAUSE_MUST_PASS_R11_MULTILINE
                      + PromptLintTests.CLAUSE_MUST_PASS_R12_MULTILINE)
         texts = list(refuse_rows + pass_rows)
@@ -2229,10 +2328,12 @@ class LintDifferentialPinTests(unittest.TestCase):
         opened = [t for t, c, p in zip(texts, cand, prev) if p > 0 and c == 0]
         closed = [t for t, c, p in zip(texts, cand, prev) if p == 0 and c > 0]
         self.assertEqual([], opened, f"against {prev_ref}: no multi-line refuse -> pass flip is allowed in r12")
-        self.assertEqual([], [t for t in closed if t not in PromptLintTests.CLAUSE_MUST_REFUSE_R11_MULTILINE + PromptLintTests.CLAUSE_MUST_REFUSE_R12_MULTILINE],
+        self.assertEqual([], [t for t in closed if t not in PromptLintTests.CLAUSE_MUST_REFUSE_R11_MULTILINE + PromptLintTests.CLAUSE_MUST_REFUSE_R12_MULTILINE
+                              + PromptLintTests.CLAUSE_MUST_REFUSE_R13_MULTILINE],
                          f"against {prev_ref}: an unlisted multi-line pass -> refuse flip")
-        self.assertEqual(sorted(PromptLintTests.CLAUSE_MUST_REFUSE_R12_MULTILINE), sorted(t for t in closed if t in PromptLintTests.CLAUSE_MUST_REFUSE_R12_MULTILINE),
-                         f"against {prev_ref}: every r12 multi-line refusal row must be a closure (RED at the previous head)")
+        # the previous head (d2f3cd05) is r12's own tip, so the r12 rows are its verdict now; the r13 rows are this round's closures
+        self.assertEqual(sorted(PromptLintTests.CLAUSE_MUST_REFUSE_R13_MULTILINE), sorted(t for t in closed if t in PromptLintTests.CLAUSE_MUST_REFUSE_R13_MULTILINE),
+                         f"against {prev_ref}: every r13 multi-line refusal row must be a closure (RED at the previous head)")
         if base is not None and base[1].replace("\r\n", "\n") != LINT_PS1.read_text(encoding="utf-8").replace("\r\n", "\n"):
             (self.tmp / "ml-master.ps1").write_text(base[1], encoding="utf-8")
             master = _json_counts(self.tmp / "ml-master.ps1", texts, self.tmp, "ml-master")
@@ -2251,7 +2352,7 @@ class LintDifferentialPinTests(unittest.TestCase):
         # Every catalogue row that must be refused is a corpus seed and must not be among the flips at all.
         flipped = {text for text, _ in opened}
         for text in (PromptLintTests.CLAUSE_MUST_REFUSE + PromptLintTests.CLAUSE_MUST_REFUSE_R10 + PromptLintTests.CLAUSE_MUST_REFUSE_R10_OVERREFUSAL
-                     + PromptLintTests.CLAUSE_MUST_REFUSE_R11 + PromptLintTests.CLAUSE_MUST_REFUSE_R12):
+                     + PromptLintTests.CLAUSE_MUST_REFUSE_R11 + PromptLintTests.CLAUSE_MUST_REFUSE_R12 + PromptLintTests.CLAUSE_MUST_REFUSE_R13):
             self.assertNotIn(text, flipped, text)
 
     def test_no_refuse_to_pass_flip_against_the_previous_pr_head(self):
@@ -2270,7 +2371,7 @@ class LintDifferentialPinTests(unittest.TestCase):
         flipped = {text for text, _ in opened}
         for text in (PromptLintTests.CLAUSE_MUST_REFUSE + PromptLintTests.CLAUSE_MUST_REFUSE_R7 + PromptLintTests.CLAUSE_MUST_REFUSE_R8
                      + PromptLintTests.CLAUSE_MUST_REFUSE_R10 + PromptLintTests.CLAUSE_MUST_REFUSE_R10_OVERREFUSAL
-                     + PromptLintTests.CLAUSE_MUST_REFUSE_R11 + PromptLintTests.CLAUSE_MUST_REFUSE_R12):
+                     + PromptLintTests.CLAUSE_MUST_REFUSE_R11 + PromptLintTests.CLAUSE_MUST_REFUSE_R12 + PromptLintTests.CLAUSE_MUST_REFUSE_R13):
             self.assertNotIn(text, flipped, text)
 
     def test_previous_pr_head_is_an_ancestor_of_head(self):
