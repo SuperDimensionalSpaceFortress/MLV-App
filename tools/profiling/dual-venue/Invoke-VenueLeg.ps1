@@ -112,7 +112,7 @@ if ($PSCmdlet.ParameterSetName -eq 'Set') {
     $setPlan = Get-DvLegSetPlan -LegSetPath (Join-Path $here "legsets\$LegSet.json") -Repeats $Repeats -Backend $Backend
     Write-Output "DVE_LEGSET=$($setPlan.legSet) CARD=$($setPlan.card) CLIP=$($setPlan.clipId) CELLS=$(@($setPlan.cells).Count) REPEATS=$Repeats LEGS=$(@($setPlan.plan).Count)"
     foreach ($entry in $setPlan.plan) {
-        Write-Output ('DVE_PLAN {0}/{1} repeat={2} cell={3} leg={4} backend={5} display={6} scale={7}' -f $entry.seq, @($setPlan.plan).Count, $entry.repeat, $entry.cellId, $entry.legId, $entry.backend, $entry.displayMode, $entry.scaleFactor)
+        Write-Output ('DVE_PLAN {0}/{1} repeat={2} cell={3} leg={4} backend={5} display={6} scale={7} resolution={8}' -f $entry.seq, @($setPlan.plan).Count, $entry.repeat, $entry.cellId, $entry.legId, $entry.backend, $entry.displayMode, $entry.scaleFactor, (Get-DvScaleLabel -Factor $entry.scaleFactor))
     }
     if ($PlanOnly) { exit 0 }
     foreach ($needed in 'Venue', 'SourceCommit', 'BuildManifestSha256') {
@@ -597,7 +597,7 @@ if ($null -ne $summary -or $null -ne $runLogText) {
 # The scale the app RENDERED at, from its own run log (never from the spec): the receipt carries both numbers and the leg cannot PASS under a scale it did not render at.
 $scale = Get-DvScaleEvidence -Spec $spec -Backend $Backend -LogText $runLogText
 $receipt.scale = $scale
-$scaleNote = "requested scale $($scale.requestedScale), rendered at $($scale.effectiveScale)"
+$scaleNote = "requested scale $($scale.requestedScale) [$(Get-DvScaleLabel -Factor $scale.requestedScale)], rendered at $($scale.effectiveScale) [$(Get-DvScaleLabel -Factor $scale.effectiveScale)]"
 # The display mode the app RAN in and the window it presented in, from its own gui_smoke.window_placement line (never from the spec): the receipt carries the requested and the observed mode.
 $display = Get-DvDisplayEvidence -Spec $spec -LogText $runLogText
 $receipt.display = $display
@@ -708,7 +708,7 @@ if ($outcome -eq 'CAPTURED') {
     $sheetMissing = $isLook -and ($null -eq $receipt.look -or $null -eq $receipt.look.contactSheet)
     # (a capture that published NO run log has no proof at all -- no rendered scale to read, no source frames -- and ends INVALID below, not here)
     if (-not $scale.honoured -and $null -ne $runLogText) {
-        $declared = $(if ([int]$scale.acceptedEffectiveScale -ne [int]$scale.requestedScale) { "the spec declares this backend renders at $($scale.acceptedEffectiveScale)" } else { 'no clamp is declared for this backend' })
+        $declared = $(if ([int]$scale.acceptedEffectiveScale -ne [int]$scale.requestedScale) { "the spec declares this backend renders at $($scale.acceptedEffectiveScale) [$(Get-DvScaleLabel -Factor $scale.acceptedEffectiveScale)]" } else { 'no clamp is declared for this backend' })
         $outcome = 'SCALE_NOT_HONOURED'
         $detail = "CAPTURED but $scaleNote (read from: $($scale.effectiveScaleSource); $declared). A run that did not render at the scale this leg names is no signal under it: the leg is not passed or failed"
     }
@@ -717,7 +717,7 @@ if ($outcome -eq 'CAPTURED') {
     elseif (-not $verdictCriteria.pass) { $outcome = 'FAIL'; $detail = 'CAPTURED; criteria failed: ' + ($verdictCriteria.failures -join '; ') }
     else { $outcome = 'PASS'; $detail = $(if ($verdictCriteria.informational) { 'CAPTURED; no gating criteria for this role/backend (informational)' } else { 'CAPTURED; every criterion for this role/backend held' }) }
     # A declared clamp (the CUDA texture route renders at 1 whatever the request) still passes, but never silently: the detail carries both numbers.
-    if ($outcome -in @('PASS', 'FAIL') -and $scale.verdict -ceq 'DECLARED_CLAMP') { $detail += "; $scaleNote (the spec declares this backend renders at $($scale.acceptedEffectiveScale))" }
+    if ($outcome -in @('PASS', 'FAIL') -and $scale.verdict -ceq 'DECLARED_CLAMP') { $detail += "; $scaleNote (the spec declares this backend renders at $($scale.acceptedEffectiveScale) [$(Get-DvScaleLabel -Factor $scale.acceptedEffectiveScale)])" }
 }
 # DUAL-VENUE-DISPLAY-MATRIX-1, FAIL CLOSED: a leg that ran in a display mode other than the one it names (a requested-windowed leg that ran full screen, or the reverse), or that NAMES a mode the
 # run log cannot confirm, is not a valid measurement under that mode: a typed INVALID with the reason, never a PASS or FAIL. (A legacy spec that names no mode keeps its old behaviour.)
