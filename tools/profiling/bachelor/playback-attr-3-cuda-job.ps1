@@ -345,7 +345,7 @@ param(
     # on gui_smoke.visual_state (look_assist_flavor); the job records that report as lookFlavorReported and
     # lookFlavorHonored = (reported equals requested). An app that reports nothing is 'none' -> not honoured.
     # Only emitted for a LOOK leg (-ForceLookAssist); the default 'classic' adds nothing.
-    [ValidateSet('classic', 'cinematic', 'film')]
+    [ValidateSet('classic', 'cinematic', 'film', 'vision50d')]
     [string]$LookFlavor = 'classic',
 
     # PLAYBACK-BACHELOR-PRESENT-JITTER-1: a capture-free PACE leg -- -ForceLookAssist (and -LookFlavor) without
