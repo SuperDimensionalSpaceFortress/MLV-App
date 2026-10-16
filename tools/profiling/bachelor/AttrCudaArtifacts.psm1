@@ -3635,7 +3635,7 @@ function Get-AttrCudaLastEligibilityLine {
     quoted and routinely contains spaces. The LAST line wins: the probe re-runs per render
     policy evaluation and the final one describes the state the run ended in.
     PLAYBACK-GPU-SCOPES-NO-VETO-1 >>>
-    r2: since the post-measurement visual-capture tail (#428) the state the run ended in is not
+    r2: since the post-measurement window-capture tail (#428) the state the run ended in is not
     the measured session's. The verdict (Get-AttrCudaEligibilityVerdict) therefore reads the line
     in force for the measured session (Get-AttrCudaEligibilityLineForSession) and uses this last
     line only as the fallback when the log has no summary line for that session.
@@ -3672,7 +3672,7 @@ function Get-AttrCudaEligibilityLineForSession {
     "playback_smoke.summary session=<MeasuredSessionId>" and returns, as .values, the LAST
     eligibility line at or before it (key/value hashtable, parsed like
     Get-AttrCudaLastEligibilityLine), or $null when there is none (absence is not evidence).
-    Lines after the summary -- the post-measurement visual-capture tail's paused re-render, for
+    Lines after the summary -- the post-measurement window-capture tail's paused re-render, for
     one -- are counted (tailLinesIgnored) and reported (tailRefused), never read for the verdict.
     measuredWindowRefusingLines counts refusing lines strictly between
     "playback_smoke.start session=<id>" and the summary ($null without a start line); it is
@@ -3745,7 +3745,7 @@ function Get-AttrCudaEligibilityVerdict {
     r2: with -MeasuredSessionId and that session's playback_smoke.summary line in the log, the
     verdict reads the eligibility line in force for the MEASURED session -- the last one at or
     before that summary (Get-AttrCudaEligibilityLineForSession; verdictScope=measured_session) --
-    not a later line from the post-measurement visual-capture tail (tailLinesIgnored /
+    not a later line from the post-measurement window-capture tail (tailLinesIgnored /
     tailRefused report it). No line at or before the summary refuses. Without the id or without
     its summary line, the LAST line in the log is read as before (last_line_fallback).
     PLAYBACK-GPU-SCOPES-NO-VETO-1 <<<

@@ -3404,7 +3404,7 @@ if (-not $keepAliveHealthAfterMeasuredInterval.healthy) {
 $verdict = Get-AttrCudaEligibilityVerdict -LogText $rawLog
 # PLAYBACK-GPU-SCOPES-NO-VETO-1 >>>
 # r2: the line in force for the MEASURED session (the last one at or before its playback_smoke.summary), not the
-# post-measurement visual-capture tail's; the tail is reported, never read. The line above is the baseline call, kept verbatim.
+# post-measurement window-capture tail's; the tail is reported, never read. The line above is the baseline call, kept verbatim.
 $verdict = Get-AttrCudaEligibilityVerdict -LogText $rawLog -MeasuredSessionId $measuredSmokeSessionId
 # PLAYBACK-GPU-SCOPES-NO-VETO-1 <<<
 $diagnostics = [ordered]@{
