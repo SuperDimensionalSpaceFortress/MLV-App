@@ -289,6 +289,7 @@
     <addaction name="actionZoomFit"/>
     <addaction name="actionZoom100"/>
     <addaction name="actionFullscreen"/>
+    <addaction name="actionShowLookLabelInFullscreen"/>
    </widget>
    <widget class="QMenu" name="menuView">
     <property name="title">
@@ -10567,6 +10568,20 @@ QGroupBox::indicator:checked:disabled {
    </property>
    <property name="shortcut">
     <string>Ctrl+F</string>
+   </property>
+  </action>
+  <action name="actionShowLookLabelInFullscreen">
+   <property name="checkable">
+    <bool>true</bool>
+   </property>
+   <property name="checked">
+    <bool>true</bool>
+   </property>
+   <property name="text">
+    <string>Show Look Label in Fullscreen</string>
+   </property>
+   <property name="toolTip">
+    <string>Show the current Look Assist look as small text in the bottom-right corner while in fullscreen. The look itself is applied either way.</string>
    </property>
   </action>
   <action name="actionCaching">

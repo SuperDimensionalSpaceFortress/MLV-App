@@ -8,6 +8,8 @@
 #include "GpuDisplayWindow.h"
 #include "GpuDebayer.h"
 #include "GpuFieldTelemetry.h"
+#include "LookLabelOverlay.h"
+#include "LookLabelPolicy.h"
 #include "PlaybackScaling.h"
 #include "PlaybackSwapInterval.h"
 #include "debug/StageTiming.h"
@@ -158,6 +160,22 @@ QSize GpuDisplayWindow::displaySize()
 {
     GpuDisplayWindow *win = g_activeWindow.load(std::memory_order_acquire);
     return win ? win->size() : QSize();
+}
+
+bool GpuDisplayWindow::setLookLabelIfActive(const QString &text)
+{
+    GpuDisplayWindow *win = g_activeWindow.load(std::memory_order_acquire);
+    if ( !win || QThread::currentThread() != win->thread() ) return false;
+    if ( win->m_lookLabelText == text ) return true;
+    win->m_lookLabelText = text;
+    win->update();
+    return true;
+}
+
+QString GpuDisplayWindow::lookLabelDrawnTextIfActive()
+{
+    GpuDisplayWindow *win = g_activeWindow.load(std::memory_order_acquire);
+    return win ? win->m_lookLabelDrawnText : QString();
 }
 
 namespace
@@ -1402,6 +1420,10 @@ void GpuDisplayWindow::cleanupGLResources()
     m_program = nullptr;
     delete m_previewProcessingProgram;
     m_previewProcessingProgram = nullptr;
+    // The label's image is kept: the next paint re-uploads it into the new context.
+    delete m_lookLabelTexture;
+    m_lookLabelTexture = nullptr;
+    m_lookLabelTextureDirty = true;
 
     if ( madeCurrent ) doneCurrent();
 
@@ -1498,6 +1520,76 @@ void GpuDisplayWindow::updateTextureIfNeeded()
     // reflects whichever route's content m_texture currently holds. See paintGL().
 }
 
+void GpuDisplayWindow::drawLookLabel(int fbw, int fbh)
+{
+    m_lookLabelDrawnText.clear();
+    if ( m_lookLabelText.isEmpty() || fbw <= 0 || fbh <= 0 ) return;
+
+    // Rasterise only when the text or the size changes; every other paint reuses the texture.
+    const int fontPx = look_label::fontPixels(fbh);
+    if ( m_lookLabelImageText != m_lookLabelText || m_lookLabelImageFontPx != fontPx )
+    {
+        m_lookLabelImage = renderLookLabelOverlayImage(m_lookLabelText, fontPx)
+                               .convertToFormat(QImage::Format_RGBA8888_Premultiplied);
+        m_lookLabelImageText = m_lookLabelText;
+        m_lookLabelImageFontPx = fontPx;
+        m_lookLabelTextureDirty = true;
+    }
+    if ( m_lookLabelImage.isNull() ) return;
+    ensureProgram();
+    if ( !m_program ) return;
+    if ( m_lookLabelTextureDirty || !m_lookLabelTexture )
+    {
+        delete m_lookLabelTexture;
+        m_lookLabelTexture = new QOpenGLTexture(QOpenGLTexture::Target2D);
+        m_lookLabelTexture->setFormat(QOpenGLTexture::RGBA8_UNorm);
+        m_lookLabelTexture->setSize(m_lookLabelImage.width(), m_lookLabelImage.height());
+        m_lookLabelTexture->setMipLevels(1);
+        m_lookLabelTexture->allocateStorage(QOpenGLTexture::RGBA, QOpenGLTexture::UInt8);
+        m_lookLabelTexture->setWrapMode(QOpenGLTexture::ClampToEdge);
+        // Drawn 1:1 on whole device pixels, so nearest is exact.
+        m_lookLabelTexture->setMinMagFilters(QOpenGLTexture::Nearest, QOpenGLTexture::Nearest);
+        m_lookLabelTexture->setData(QOpenGLTexture::RGBA, QOpenGLTexture::UInt8,
+                                    m_lookLabelImage.constBits());
+        m_lookLabelTextureDirty = false;
+    }
+
+    const QRect rect = look_label::overlayRect(QSize(fbw, fbh), m_lookLabelImage.size(),
+                                               look_label::marginPixels(fontPx));
+    if ( rect.isEmpty() ) return;
+    const float left = 2.0f * rect.x() / fbw - 1.0f;
+    const float right = 2.0f * (rect.x() + rect.width()) / fbw - 1.0f;
+    const float top = 1.0f - 2.0f * rect.y() / fbh;
+    const float bottom = 1.0f - 2.0f * (rect.y() + rect.height()) / fbh;
+    // Same orientation as the frame quad: screen-top is texture v=0 (QImage row 0).
+    const float verts[16] = {
+        left,  top,    0.0f, 0.0f,
+        right, top,    1.0f, 0.0f,
+        left,  bottom, 0.0f, 1.0f,
+        right, bottom, 1.0f, 1.0f,
+    };
+
+    // Premultiplied "over" for colour; destination alpha is left alone (DWM composites it).
+    glEnable(GL_BLEND);
+    glBlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
+    m_program->bind();
+    m_lookLabelTexture->bind(0);
+    m_program->setUniformValue("frameTexture", 0);
+    const int posLoc = m_program->attributeLocation("position");
+    const int texLoc = m_program->attributeLocation("texCoord");
+    m_program->enableAttributeArray(posLoc);
+    m_program->enableAttributeArray(texLoc);
+    m_program->setAttributeArray(posLoc, GL_FLOAT, verts, 2, 4 * sizeof(float));
+    m_program->setAttributeArray(texLoc, GL_FLOAT, verts + 2, 2, 4 * sizeof(float));
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    m_program->disableAttributeArray(posLoc);
+    m_program->disableAttributeArray(texLoc);
+    m_lookLabelTexture->release();
+    m_program->release();
+    glDisable(GL_BLEND);
+    m_lookLabelDrawnText = m_lookLabelText;
+}
+
 void GpuDisplayWindow::paintGL()
 {
     glDisable(GL_DEPTH_TEST);
@@ -1536,6 +1628,7 @@ void GpuDisplayWindow::paintGL()
     {
         m_texturePresentationActive = false;
         m_presentedSerialValid = false;
+        m_lookLabelDrawnText.clear();
         if ( m_captureReadbackRequested )
         {
             m_captureReadbackSucceeded = false;
@@ -1602,6 +1695,9 @@ void GpuDisplayWindow::paintGL()
     }
     activeProgram->release();
     m_texturePresentationActive = true;
+    // LOOK-FULLSCREEN-PARITY-1: after the frame, before the capture readback below, so a
+    // capture holds exactly what the screen shows.
+    drawLookLabel(fbw, fbh);
 
     // Promote whichever route (QImage upload or GPU-recon texture) most recently
     // supplied pending state into "presented" -- runs for EVERY real paintGL() draw,

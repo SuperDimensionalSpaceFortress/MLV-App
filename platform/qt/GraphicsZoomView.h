@@ -9,6 +9,8 @@
 #define GRAPHICSZOOMVIEW_H
 
 #include <QGraphicsView>
+#include <QPixmap>
+#include <QString>
 #include <QWheelEvent>
 #include <QWidget>
 #include <Qt>
@@ -27,6 +29,11 @@ public:
     void setWbPickerActive(bool on);
     void setBpPickerActive(bool on);
     void setCrossCursorActive(bool on);
+    // LOOK-FULLSCREEN-PARITY-1: the "current look" label in the viewport's bottom-right corner
+    // (empty = none). Rasterised once per change of text or size, blitted in drawForeground().
+    void setLookLabel(const QString &text);
+    // The label text the most recent viewport paint drew ("" when it drew none).
+    QString lookLabelDrawnText(void) const { return m_lookLabelDrawnText; }
 
 public slots:
     void shortCutZoomIn(void);
@@ -47,6 +54,14 @@ protected:
     void mouseReleaseEvent(QMouseEvent *event);
     void wheelEvent(QWheelEvent *event);
     void setPipetteCursor();
+    void drawForeground(QPainter *painter, const QRectF &rect) override;
+    void scrollContentsBy(int dx, int dy) override;
+    QString m_lookLabelText;
+    QString m_lookLabelPixmapText;
+    int m_lookLabelPixmapFontPx = 0;
+    qreal m_lookLabelPixmapDpr = 0.0;
+    QPixmap m_lookLabelPixmap;
+    QString m_lookLabelDrawnText;
     bool m_isZoomEnabled;
     PickerState m_pickerState;
     bool m_isMousePressed;
