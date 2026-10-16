@@ -785,6 +785,8 @@ public:
     }
     /* The flavor on screen: empty until an analysis lands, and empty again after a safety fallback. */
     QString appliedName() const { return m_applied; }
+    /* The last analysis on `receipt` ended in a safety fallback: the baseline sliders are on screen, not the flavor. */
+    bool fellBack( const void *receipt ) const { return receipt != nullptr && receipt == m_receipt && m_fellBack; }
     QString receiptValue( const void *receipt, const QString &selectedFlavorName ) const
     {
         if( receipt == nullptr || receipt != m_receipt ) return selectedFlavorName;

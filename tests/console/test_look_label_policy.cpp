@@ -6,6 +6,7 @@
 #include "../common/repo_paths.h"
 
 #include "../../platform/qt/LookLabelPolicy.h"
+#include "../../src/batch/LookAssistAnalysis.h"
 
 #include <QFile>
 #include <QSettings>
@@ -68,6 +69,64 @@ TEST(LookLabelPolicy, OffWhenLookAssistIsOffWhateverTheFlavor)
 TEST(LookLabelPolicy, UnknownFlavorIsShownAsItIs)
 {
     ASSERT_EQ(std::string("Look: mystery"), labelText(true, "mystery"));
+}
+
+// Catalogue L-04 (sol r4): Cinematic selected + Look Assist on + safety fallback -> the label names the baseline the
+// screen shows, never "Cinematic". Built the way updateLookLabel builds it, from the applied outcome.
+static std::string appliedLabel(bool on, const lookassist::LookAssistFlavorOutcome &outcome, const void *receipt,
+                         const char *selected)
+{
+    const QString sel = QString::fromLatin1(selected);
+    return look_label::appliedText(on, outcome.receiptValue(receipt, sel), outcome.fellBack(receipt)).toStdString();
+}
+
+TEST(LookLabelPolicy, L04SafetyFallbackNamesTheBaselineNotTheSelectedFlavor)
+{
+    int clip = 0, otherClip = 0;
+    lookassist::LookAssistFlavorOutcome outcome;
+    // Pending (no analysis landed yet): the selector's flavor, which is the clip's setting.
+    outcome.begin();
+    ASSERT_EQ(std::string("Look: Cinematic"), appliedLabel(true, outcome, &clip, "cinematic"));
+    // The analysis fell back: the baseline sliders are on screen.
+    outcome.landed(&clip, QStringLiteral("cinematic"), true);
+    const std::string fellBack = appliedLabel(true, outcome, &clip, "cinematic");
+    ASSERT_EQ(std::string("Look: Baseline (fallback)"), fellBack);
+    ASSERT_TRUE(fellBack.find("Cinematic") == std::string::npos);
+    // Look Assist off wins; another clip is not this clip's fallback.
+    ASSERT_EQ(std::string("Look: Off"), appliedLabel(false, outcome, &clip, "cinematic"));
+    ASSERT_EQ(std::string("Look: Cinematic"), appliedLabel(true, outcome, &otherClip, "cinematic"));
+    ASSERT_EQ(std::string("Look: Cinematic"), appliedLabel(true, outcome, nullptr, "cinematic"));
+    // Applied: the flavor the analysis applied.
+    outcome.landed(&clip, QStringLiteral("cinematic"), false);
+    ASSERT_EQ(std::string("Look: Cinematic"), appliedLabel(true, outcome, &clip, "cinematic"));
+    // Cleared (Look Assist off / flavor changed): back to the selector.
+    outcome.landed(&clip, QStringLiteral("cinematic"), true);
+    outcome.clear();
+    ASSERT_EQ(std::string("Look: Cinematic"), appliedLabel(true, outcome, &clip, "cinematic"));
+}
+
+TEST(LookLabelWiring, L04LabelReadsTheAppliedOutcomeAndRefreshesWhenAnalysisLands)
+{
+    const QString mw = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString update = functionBody(mw, QStringLiteral("void MainWindow::updateLookLabel( void )"));
+    ASSERT_TRUE(update.contains(QStringLiteral("look_label::appliedText(")));
+    ASSERT_TRUE(update.contains(QStringLiteral("m_lookAssistFlavorOutcome.receiptValue( lookReceipt,")));
+    ASSERT_TRUE(update.contains(QStringLiteral("m_lookAssistFlavorOutcome.fellBack( lookReceipt )")));
+    ASSERT_FALSE(update.contains(QStringLiteral("look_label::text(")));
+
+    // Every place an analysis lands (applied or safety fallback) re-derives the label before the next statement block:
+    // an updateLookLabel() call within the three lines after each landed( ... ).
+    const QString landedCall = QStringLiteral("m_lookAssistFlavorOutcome.landed(");
+    int landedSites = 0;
+    for ( int at = mw.indexOf(landedCall); at >= 0; at = mw.indexOf(landedCall, at + 1) )
+    {
+        ++landedSites;
+        int lineEnd = at;
+        for ( int line = 0; line < 3 && lineEnd >= 0; ++line ) lineEnd = mw.indexOf(QLatin1Char('\n'), lineEnd + 1);
+        ASSERT_TRUE(lineEnd > at);
+        ASSERT_TRUE(mw.mid(at, lineEnd - at).contains(QStringLiteral("updateLookLabel();")));
+    }
+    ASSERT_EQ(5, landedSites);   // async fail-closed, async post-measure fallback, async applied, sync fallback, sync applied
 }
 
 TEST(LookLabelPolicy, CornerLabelOnlyInFullscreenAndOnlyWhenShown)

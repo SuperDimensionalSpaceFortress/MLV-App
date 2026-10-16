@@ -17100,6 +17100,7 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                     m_lastLookAssistSafetyFallback = true;
                     m_lookAssistFlavorOutcome.landed( activeReceipt, r.flavorName, true );
                     activeReceipt->setLookAssistFlavor( m_lookAssistFlavorOutcome.receiptValue( activeReceipt, r.flavorName ) );
+                    updateLookLabel();   // L-04: the label names the applied look (the baseline), not the selected flavor
                     m_lastLookAssistExposure = activeReceipt->exposure();
                     m_lastLookAssistContrast = activeReceipt->contrast();
                     m_lastLookAssistPivot = activeReceipt->pivot();
@@ -17286,6 +17287,7 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                     m_lastLookAssistSafetyFallback = true;
                     m_lookAssistFlavorOutcome.landed( activeReceipt, r.flavorName, true );
                     activeReceipt->setLookAssistFlavor( m_lookAssistFlavorOutcome.receiptValue( activeReceipt, r.flavorName ) );
+                    updateLookLabel();   // L-04: the label names the applied look (the baseline), not the selected flavor
                     m_lastLookAssistExposure = activeReceipt->exposure();
                     m_lastLookAssistContrast = activeReceipt->contrast();
                     m_lastLookAssistPivot = activeReceipt->pivot();
@@ -17321,6 +17323,7 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                 }
 
                 m_lookAssistFlavorOutcome.landed( activeReceipt, r.flavorName, false );
+                updateLookLabel();   // the analysis landed: the label names the flavor applied
                 logInteractionEvent(
                     QStringLiteral("look_assist.apply.auto_wb_async_applied"),
                     QStringLiteral("generation=%1 valid=%2 source=%3 decision=%4 damping=%5 awb_temp=%6 awb_tint=%7 final_temp=%8 final_tint=%9 preset_exp=%10 frame=%11")
@@ -18157,6 +18160,7 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
         // The baseline sliders are back: the receipt must not keep naming the selected (Cinematic) flavor over them.
         m_lookAssistFlavorOutcome.landed( receipt, lookAssistFlavorName( flavor ), true );
         receipt->setLookAssistFlavor( m_lookAssistFlavorOutcome.receiptValue( receipt, lookAssistFlavorName( flavor ) ) );
+        updateLookLabel();   // L-04: the label names the applied look (the baseline), not the selected flavor
         m_lastLookAssistExposure = receipt->exposure();
         m_lastLookAssistContrast = receipt->contrast();
         m_lastLookAssistPivot = receipt->pivot();
@@ -18176,6 +18180,7 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
 
     m_lookAssistFlavorOutcome.landed( receipt, lookAssistFlavorName( flavor ), false );
     receipt->setLookAssistFlavor( lookAssistFlavorName( flavor ) );
+    updateLookLabel();   // the analysis landed: the label names the flavor applied
     // grade= is appended after flavor=, and only for Film, so a Classic or Cinematic line stays byte-identical. No '%' in it.
     const QString filmGradeLogTail = flavor == LookAssistFlavor::Film ? QStringLiteral(" grade=") + filmGrade : QString();
     logInteractionEvent(
@@ -30177,7 +30182,11 @@ void MainWindow::updateLookLabel( void )
 {
     const bool lookOn = m_fileLoaded && ACTIVE_RECEIPT && ACTIVE_RECEIPT->lookAssistEnabled()
                      && ui->checkBoxLookAssistEnable->isChecked();
-    const QString text = look_label::text( lookOn, lookAssistFlavorName( currentLookAssistFlavor() ) );
+    // The look APPLIED (L-04): a safety fallback restored the baseline, so the label must not name the selected flavor.
+    const void *lookReceipt = lookOn ? ACTIVE_RECEIPT : nullptr;
+    const QString text = look_label::appliedText(
+        lookOn, m_lookAssistFlavorOutcome.receiptValue( lookReceipt, lookAssistFlavorName( currentLookAssistFlavor() ) ),
+        m_lookAssistFlavorOutcome.fellBack( lookReceipt ) );
     const bool fullscreenShown =
         look_label::fullscreenOverlayShown( ui->actionFullscreen->isChecked(), m_lookLabelShowInFullscreen );
     if( text == m_lookLabelText && fullscreenShown == m_lookLabelFullscreenShown ) return;

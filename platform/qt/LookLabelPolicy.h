@@ -51,6 +51,15 @@ inline QString text( bool lookAssistEnabled, const QString &flavorName )
     return display.isEmpty() ? QStringLiteral( "Look: Off" ) : QStringLiteral( "Look: " ) + display;
 }
 
+/*! \brief The label for the look APPLIED, not the one selected (catalogue L-04): after a safety fallback restored
+ *  the baseline sliders it reads "Look: Baseline (fallback)", whatever flavor is selected. `appliedFlavorName` is
+ *  LookAssistFlavorOutcome::receiptValue (the flavor applied, or the selector's while the analysis is pending). */
+inline QString appliedText( bool lookAssistEnabled, const QString &appliedFlavorName, bool safetyFallback )
+{
+    if( lookAssistEnabled && safetyFallback ) return QStringLiteral( "Look: Baseline (fallback)" );
+    return text( lookAssistEnabled, appliedFlavorName );
+}
+
 /*! \brief The corner label is drawn only in fullscreen, and only while the setting shows it. */
 inline bool fullscreenOverlayShown( bool fullscreen, bool showInFullscreenSetting )
 {
