@@ -111,6 +111,12 @@
 # over-refusal, listed in the PR body: any earlier clause, sentence, list item or heading of the block that is not one of those
 # shapes ("Run the build, then run playback locally on Bachelor.", "Replay the arms on Bachelor, then ...", a '## Steps' heading
 # above the venue sentence); put such text in a block of its own. Rules 3, 3b and 4 are unchanged.
+# Per-launcher scope (r14; NA2-RULE4-PER-LAUNCHER-SCOPE-1, CoS post-merge Blocker on PR #448, ask 6216180502). Rule 4 used to read only the
+# FIRST launcher occurrence of each pattern, so a venue-routed first launcher exempted an unrouted second one in the same sentence
+# ("<launcher> -Backend cpu on Bachelor; then run <launcher> -Backend cpu." passed). Rule 4 now scores EVERY launcher occurrence on its
+# own: a venue locus exempts only the launcher it routes, so a later launcher after ; / , then / then / and / or needs its own route.
+# Two launchers in one clause are split at the next launcher's start (the first launcher's stretch also holds the clause lead-in). The
+# two greedy gaps of the direct patterns are lazy, so a first match cannot swallow the second launcher. Rules 2, 3 and 3b are unchanged.
 # Rules 3, 3b and 4 keep master's weak-negation exemption (not / no / without in the marker's clause, narrowed from the whole sentence to
 # the clause), so they refuse at least what master refuses. Anything that is not E1 / E2 / E3 / a prohibition keeps master's verdict.
 # A contrast word still CUTS the sentence (the head clause is judged without its complement) and the complement ends at its next comma; the
@@ -557,8 +563,8 @@ function Get-LocalPlaybackPromptFindings {
         Cursor = 0; Block = -1; Flag = $false
     }
     $direct = @(
-        "(?i)${b}MLVApp(Release)?\.exe\s+(?:(?!/\s)\S+\s+){0,12}--(gui-smoke-playback|profile-playback)",
-        "(?i)(pwsh|powershell)(\.exe)?${e}[^\n]{0,80}-File\s+\S*$scripts",
+        "(?i)${b}MLVApp(Release)?\.exe\s+(?:(?!/\s)\S+\s+){0,12}?--(gui-smoke-playback|profile-playback)",
+        "(?i)(pwsh|powershell)(\.exe)?${e}[^\n]{0,80}?-File\s+\S*$scripts",
         "(?i)(^|[\s``&(])(&\s*)?\.{0,2}[\\/]?\S*$scripts\s+-\w+")
     $findings = New-Object System.Collections.Generic.List[string]
     # A "sentence" is a line, cut again at '. ' so one bullet carrying several instructions is judged piece by piece. A semicolon is NOT a
@@ -651,13 +657,39 @@ function Get-LocalPlaybackPromptFindings {
                     if ($c.HasVerb -and ($c.Text -match $playbackWord) -and -not ($c.Strong -or $c.Weak -or (Test-VenueExempts -Sentence $s -Clauses $clauses -Clause $c -HostPatterns $hostDefeaters) -or (Test-ContrastLead -Sentence $s -Clause $c -Index $m.Index))) { $hit = 'run-playback-here'; break }
                 }
             }
-            # (4) a direct command line: the app with a playback mode, or a tracked launcher called with a parameter
+            # (4) a direct command line: the app with a playback mode, or a tracked launcher called with a parameter.
+            # r14 (NA2-RULE4-PER-LAUNCHER-SCOPE-1): EVERY launcher occurrence is scored on its own. [regex]::Match returned only the first
+            # occurrence of each pattern, so a venue-routed first launcher ended the scan and exempted an unrouted second one after a
+            # semicolon / "then" / "and". One launcher is often matched by two patterns (pwsh -File <script>, <script> -Param): spans that
+            # overlap are ONE occurrence.
             if (-not $hit) {
+                $launchSpans = New-Object System.Collections.Generic.List[object]
                 foreach ($pattern in $direct) {
-                    $m4 = [regex]::Match($s, $pattern)
-                    if (-not $m4.Success) { continue }
-                    $c = Get-ClauseAt -Clauses $clauses -Index $m4.Index
-                    if (-not ($c.Strong -or $c.Weak -or (Test-VenueExempts -Sentence $s -Clauses $clauses -Clause $c -HostPatterns $hostDefeatersLaunch) -or (Test-ContrastLead -Sentence $s -Clause $c -Index $m4.Index))) { $hit = 'direct-playback-launch'; break }
+                    foreach ($m4 in [regex]::Matches($s, $pattern)) { $launchSpans.Add([pscustomobject]@{ Start = [int]$m4.Index; End = [int]($m4.Index + $m4.Length) }) }
+                }
+                $occurrences = New-Object System.Collections.Generic.List[object]
+                foreach ($sp in @($launchSpans | Sort-Object -Property @{ Expression = 'Start'; Descending = $false }, @{ Expression = 'End'; Descending = $true })) {
+                    $last = if ($occurrences.Count -gt 0) { $occurrences[$occurrences.Count - 1] } else { $null }
+                    if ($last -and $sp.Start -lt $last.End) { if ($sp.End -gt $last.End) { $last.End = $sp.End } }
+                    else { $occurrences.Add([pscustomobject]@{ Start = $sp.Start; End = $sp.End; Clause = (Get-ClauseAt -Clauses $clauses -Index $sp.Start) }) }
+                }
+                foreach ($occ in $occurrences) {
+                    $c = $occ.Clause
+                    $mates = @($occurrences | Where-Object { [object]::ReferenceEquals($_.Clause, $c) })
+                    if ($mates.Count -le 1) { $routed = [bool]$c.Venue }
+                    else {
+                        # Two launchers in ONE clause ("... -Backend cpu on Bachelor, ... -Backend cuda"): a venue locus routes only the launcher
+                        # whose own stretch of the clause holds it (the first launcher's stretch also holds the clause lead-in).
+                        $k = [array]::IndexOf($mates, $occ)
+                        $segStart = if ($k -eq 0) { [int]$c.Start } else { [int]$occ.Start }
+                        $segEnd = if ($k + 1 -lt $mates.Count) { [int]$mates[$k + 1].Start } else { [int]$c.End }
+                        # Never wider than the clause test: the clause must be venue-qualified AND this launcher's own stretch must be.
+                        $routed = [bool]($c.Venue -and $segEnd -gt $segStart -and $s.Substring($segStart, $segEnd - $segStart) -match $venueQualified)
+                    }
+                    $exempt = $c.Strong -or $c.Weak -or
+                        ($routed -and -not (Test-LocalHostInScope -Sentence $s -Clauses $clauses -Clause $c -HostPatterns $hostDefeatersLaunch)) -or
+                        (Test-ContrastLead -Sentence $s -Clause $c -Index $occ.Start)
+                    if (-not $exempt) { $hit = 'direct-playback-launch'; break }
                 }
             }
             if ($hit) {

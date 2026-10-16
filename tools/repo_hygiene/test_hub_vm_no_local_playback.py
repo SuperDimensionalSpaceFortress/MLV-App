@@ -922,6 +922,7 @@ def _differential_flips(work: Path, baseline_text: str | None = None, previous_h
                                   + PromptLintTests.CLAUSE_MUST_REFUSE_R11 + PromptLintTests.CLAUSE_MUST_PASS_R11
                                   + PromptLintTests.CLAUSE_MUST_REFUSE_R12 + PromptLintTests.CLAUSE_MUST_PASS_R12
                                   + PromptLintTests.CLAUSE_MUST_REFUSE_R13 + PromptLintTests.CLAUSE_MUST_PASS_R13
+                                  + RULE4_SECOND_LAUNCHER_REFUSE + RULE4_SECOND_LAUNCHER_GUARDS + RULE4_BOTH_ROUTED_PASS
                                   + PromptLintTests.PROBE_ROWS
                                   + tuple(text for _, _, text in PromptLintTests.DEFEATER_AXIS) + PromptLintTests.DEFEATER_AXIS_CONTROLS,
                                   members=tuple(_list_member_rows(_lint_word_lists(LINT_PS1, work))))
@@ -967,6 +968,79 @@ def _pin_problems(opened, closed, allow_open, allow_closed) -> list[str]:
 
 def _code_lines(path: Path) -> list[str]:
     return [ln for ln in path.read_text(encoding="utf-8").splitlines() if not ln.lstrip().startswith("#")]
+
+
+# NA2-RULE4-PER-LAUNCHER-SCOPE-1 (CoS post-merge Blocker on PR #448, ask 6216180502; the seventh outside-probe bypass). Rule 4 scored only
+# the FIRST launcher occurrence of a sentence, so a venue-routed first launcher exempted an unrouted second one after a separator.
+# One row per separator x second-launcher shape x backend x launcher form x route of the first launcher. A command line is assembled
+# from SMOKE_SCRIPT / APP / SMOKE_MODE, so no literal launcher line sits in this file (the hub-VM hooks read the file text).
+RULE4_BACKENDS = ("cpu", "cuda")
+# (name, text between the two launchers, form of the second launcher: "run" = with a launch verb, "bare" = the command line alone)
+RULE4_SEPARATORS = (
+    ("semicolon", "; ", "bare"),
+    ("semicolon-then", "; then ", "run"),
+    ("comma-then", ", then ", "run"),
+    ("sentence-then", ". Then ", "run"),
+    ("then", " then ", "run"),
+    ("and", " and ", "run"),
+    ("semicolon-run", "; ", "run"),
+)
+RULE4_ROUTES = ("on Bachelor", "through the venue chain")
+# A separator that ends the SENTENCE was already read per sentence on master (the second sentence is judged alone): those rows are
+# regression guards, not RED rows.
+RULE4_ALREADY_REFUSED_SEPARATORS = ("sentence-then",)
+
+
+def _rule4_launcher(style: str, backend: str) -> str:
+    script = f"tools/profiling/{SMOKE_SCRIPT}"
+    return {
+        "path": f"{script} -Backend {backend}",
+        "pwsh": f"pwsh -File {script} -Backend {backend}",
+        "amp": f"& ./{script} -Backend {backend}",
+        "app": f"{APP} take01.dat {SMOKE_MODE}",
+    }[style]
+
+
+def _rule4_styles(backend: str) -> tuple[str, ...]:
+    return ("path", "pwsh", "amp", "app") if backend == RULE4_BACKENDS[0] else ("path", "pwsh", "amp")
+
+
+def _rule4_second(form: str, launcher: str, route: str = "") -> str:
+    core = f"run {launcher}" if form == "run" else launcher
+    return f"{core} {route}".rstrip()
+
+
+def _rule4_rows() -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    """-> (second launcher unrouted after a routed first: every row must REFUSE, rows that were already refused: guards,
+    both launchers routed: every row must PASS)."""
+    refuse: list[str] = []
+    guards: list[str] = []
+    allow: list[str] = []
+    for style, backend, route in itertools.product(("path", "pwsh", "amp", "app"), RULE4_BACKENDS, RULE4_ROUTES):
+        if style not in _rule4_styles(backend):
+            continue
+        first = f"The venue job calls {_rule4_launcher(style, RULE4_BACKENDS[0])} {route}"
+        second = _rule4_launcher(style, backend)
+        for name, sep, form in RULE4_SEPARATORS:
+            (guards if name in RULE4_ALREADY_REFUSED_SEPARATORS else refuse).append(f"{first}{sep}{_rule4_second(form, second)}.")
+            for second_route in RULE4_ROUTES:
+                allow.append(f"{first}{sep}{_rule4_second(form, second, second_route)}.")
+        # two launchers in ONE clause (a comma with no verb is not a clause boundary). Master already refuses the first form (the venue
+        # phrase followed by a comma and a launcher is no locus); the second form is a shared route after a launcher list, which master
+        # passed for BOTH launchers and which now refuses (accepted over-refusal: give each launcher its own route).
+        guards.append(f"{first}, {second}.")
+        refuse.append(f"The venue job calls {_rule4_launcher(style, RULE4_BACKENDS[0])}, {second} {route}.")
+        # the UNROUTED launcher comes first: read first on master too
+        guards.append(f"Run {second}; then run {_rule4_launcher(style, RULE4_BACKENDS[0])} {route}.")
+    # the CoS repro lines, verbatim (ask 6216180502): the venue job's first launcher is routed, the second is not
+    cos_script = f"tools/profiling/{SMOKE_SCRIPT}"
+    cos_first = f"The venue job calls {cos_script} -Backend cpu on Bachelor"
+    cos_lines = (f"{cos_first}; then run {cos_script} -Backend cpu.", f"{cos_first}; {cos_script} -Backend cuda.")
+    guards.extend((f"Run {cos_script} -Backend cpu.", f"{cos_first}. Then run {cos_script} -Backend cpu."))
+    return (tuple(dict.fromkeys(list(cos_lines) + refuse)), tuple(dict.fromkeys(guards)), tuple(dict.fromkeys(allow)))
+
+
+RULE4_SECOND_LAUNCHER_REFUSE, RULE4_SECOND_LAUNCHER_GUARDS, RULE4_BOTH_ROUTED_PASS = _rule4_rows()
 
 
 class HubHostsFileTests(unittest.TestCase):
@@ -1698,6 +1772,47 @@ class PromptLintTests(unittest.TestCase):
         counts = _json_counts(LINT_PS1, rows, self.tmp, "r13-pass")
         self.assertEqual([], [t for t, n in zip(rows, counts) if n > 0], "r13 rows the lint refused that it must pass")
 
+    def test_red_rule4_a_second_unrouted_launcher_is_refused_after_every_separator(self):
+        """NA2-RULE4-PER-LAUNCHER-SCOPE-1: a venue locus exempts only the launcher it routes. The CoS repro lines (ask 6216180502) are
+        the first two rows; the rest is separator x second-launcher shape x backend x launcher form x route. The guards (a separate
+        sentence, an unrouted FIRST launcher) were refused before this change and must stay refused."""
+        script = f"tools/profiling/{SMOKE_SCRIPT}"
+        first = f"The venue job calls {script} -Backend cpu on Bachelor"
+        for line in (f"{first}; then run {script} -Backend cpu.", f"{first}; {script} -Backend cuda."):
+            self.assertIn(line, RULE4_SECOND_LAUNCHER_REFUSE)
+        for line in (f"Run {script} -Backend cpu.", f"{first}. Then run {script} -Backend cpu."):
+            self.assertIn(line, RULE4_SECOND_LAUNCHER_GUARDS)
+        for sep in ("; ", ", then ", ". Then ", " then "):  # each separator of the card, with a second launcher on both backends
+            for backend in RULE4_BACKENDS:
+                self.assertTrue(any(sep in t and f"-Backend {backend}." in t for t in RULE4_SECOND_LAUNCHER_REFUSE + RULE4_SECOND_LAUNCHER_GUARDS),
+                                f"no row for separator {sep!r} with backend {backend}")
+        rows = list(RULE4_SECOND_LAUNCHER_REFUSE + RULE4_SECOND_LAUNCHER_GUARDS)
+        counts = _json_counts(LINT_PS1, rows, self.tmp, "rule4-refuse")
+        self.assertEqual([], [t for t, n in zip(rows, counts) if n == 0], "rule-4 second-launcher rows the lint passed that it must refuse")
+
+    def test_green_rule4_both_launchers_venue_routed_pass(self):
+        rows = list(RULE4_BOTH_ROUTED_PASS)
+        counts = _json_counts(LINT_PS1, rows, self.tmp, "rule4-pass")
+        self.assertEqual([], [t for t, n in zip(rows, counts) if n > 0], "rule-4 rows with both launchers routed that the lint refused")
+
+    def test_rule4_the_refuse_rows_are_red_on_the_baseline(self):
+        """RED proof kept in the suite: while master still carries the first-occurrence-only rule 4, every second-launcher row passes it.
+        Once master carries this lint (baseline == candidate) the comparison is moot and the test skips, like the differential pin."""
+        self.maxDiff = None
+        base = _baseline_lint_source()
+        if base is None or base[1].replace("\r\n", "\n") == LINT_PS1.read_text(encoding="utf-8").replace("\r\n", "\n"):
+            self.skipTest("no baseline, or master already carries this lint")
+        (self.tmp / "rule4-master.ps1").write_text(base[1], encoding="utf-8")
+        rows = list(RULE4_SECOND_LAUNCHER_REFUSE)
+        counts = _json_counts(self.tmp / "rule4-master.ps1", rows, self.tmp, "rule4-red")
+        self.assertEqual([], [t for t, n in zip(rows, counts) if n > 0], f"rows {base[0]} already refuses: not a RED row, move it to the guards")
+        guards = list(RULE4_SECOND_LAUNCHER_GUARDS)
+        counts = _json_counts(self.tmp / "rule4-master.ps1", guards, self.tmp, "rule4-guards")
+        self.assertEqual([], [t for t, n in zip(guards, counts) if n == 0], f"guard rows {base[0]} passes: they belong in the RED rows")
+        allow = list(RULE4_BOTH_ROUTED_PASS)
+        counts = _json_counts(self.tmp / "rule4-master.ps1", allow, self.tmp, "rule4-allow")
+        self.assertEqual([], [t for t, n in zip(allow, counts) if n > 0], f"both-routed rows {base[0]} refuses: the ALLOW rows must be unchanged")
+
     def test_a_1mb_heading_free_prompt_completes_in_bounded_time(self):
         """r10 (opus r9 hardening HUB-VM-LINT-BLOCKTAIL-QUADRATIC-1): r9 copied the rest of the block per item, O(n^2) on a large
         heading-free prompt. ~1 MB of prose with venue-routed `locally` sentences, grammar-clean follow-ups and handling follow-ups,
@@ -2242,6 +2357,11 @@ class LintDifferentialPinTests(unittest.TestCase):
          lambda text, f: f.get("tpl") == "handling-tail" and f.get("M") in ("on this host", "here"),
          "r1b over-refusal kept on purpose (card HUB-VM-LINT-LOG-COPY-OVERREFUSAL-1): 'copy the log on this host' after a venue run "
          "is refused like its `locally` twin; a handling-verb list would open 'Copy the clip locally and run playback.'"),
+        ("rule4-per-launcher-scope",
+         lambda text, f: f.get("tpl") == "seed" and text in RULE4_SECOND_LAUNCHER_REFUSE,
+         "NA2-RULE4-PER-LAUNCHER-SCOPE-1, CoS post-merge Blocker on #448 (ask 6216180502): rule 4 scores EACH launcher occurrence, so a "
+         "venue locus exempts only the launcher it routes. Master read only the first occurrence and passed '<launcher> -Backend cpu on "
+         "Bachelor; then run <launcher> -Backend cpu.' and its relatives (RULE4_SECOND_LAUNCHER_REFUSE)."),
     )
 
     # r7 PREVIOUS-HEAD gate (CoS Prevention on a595464f). Against the lint of the PR head this round started from, NOTHING may open:
@@ -2297,6 +2417,11 @@ class LintDifferentialPinTests(unittest.TestCase):
          "named a real clip file; the fixtures use neutral made-up file arguments instead (the rule is that ANY file argument after an "
          "executable is a launch). An executable that carries its own route, follows a prohibition, or is the marker clause's own "
          "launch still passes (CLAUSE_MUST_PASS_R13)."),
+        ("rule4-per-launcher-scope",
+         lambda text, f: f.get("tpl") == "seed" and text in RULE4_SECOND_LAUNCHER_REFUSE,
+         "NA2-RULE4-PER-LAUNCHER-SCOPE-1, CoS post-merge Blocker on #448 (ask 6216180502): a venue-routed first launcher no longer "
+         "exempts a second, unrouted one after ';', ', then' or ' then' (RULE4_SECOND_LAUNCHER_REFUSE). The d2f3cd05 lint passed every "
+         "one of them (rule 4 read only the first launcher occurrence), and master passes them too."),
     )
 
     @classmethod
