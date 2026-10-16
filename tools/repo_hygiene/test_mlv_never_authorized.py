@@ -9190,6 +9190,103 @@ class Na2AssignmentIsNotADeleteTests(unittest.TestCase):
                 self.assertIn("delete", self._acts(cmd))
 
 
+class Na2CmdDelimiterShapeR9Tests(unittest.TestCase):
+    """r9 (CoS 6224673286, Iverson 6224545907): every delimiter cmd.exe accepts after a delete verb's `=`, glued switches,
+    R's literal `\\t`, a verb= with a value after a cmd separator inside a quote, and `erase`; plus the r7 file-name false
+    positives (import.json, python.log, subprocess.json) no longer selecting the strict reading."""
+
+    T = "C:/review/board/.claude-state/fleet-runs/lane-A-r1"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.hook = _load_hook_module()
+
+    def _acts(self, command):
+        return self.hook.shell_acts(command)
+
+    def test_every_cmd_delimiter_and_glued_switch_reads_as_a_delete(self):
+        t = self.T
+        for cmd in (f"rd=/q/s {t}", f"rmdir=/s/q {t}", f"del=/f/q {t}/x.txt", f"rd=,/s {t}", f"rd=;/s {t}", f"rd==/s {t}",
+                    f"rd=\t/s {t}", "Rscript -e \"shell('echo x & rd=\\t/s " + t + "')\"",
+                    "Rscript -e \"shell('echo x & del=" + t + "/x.txt')\"", f"anylauncher \"echo & rd={t}\"",
+                    f"anylauncher 'echo | rmdir={t}'", f"erase {t}/x.txt", f"anylauncher 'echo & erase= /q {t}/x.txt'"):
+            with self.subTest(cmd=cmd):
+                self.assertIn("delete", self._acts(cmd))
+
+    def test_file_names_and_git_bash_paths_keep_the_assignment_exemption(self):
+        for cmd in ('RD="/c/x/lane-A-r1"; cat import.json', "RD=/c/x/lane-B-r1; cat python.log subprocess.json",
+                    "RD=/c/x; ls", 'RD="/c/x"; cat "$RD/a.py"', "RD=/c/x/y; ls"):
+            with self.subTest(cmd=cmd):
+                self.assertNotIn("delete", self._acts(cmd))
+
+
+class Na2MasterParitySweepTests(unittest.TestCase):
+    """r9 (CoS asks 6224004771, 6224673286): the master-parity sweep. Every delete row master's hook DENIES must still be
+    a delete on this head, except the documented incident shapes (a bare assignment outside any launcher or quote).
+    Rows: every deny row of the NA-2 test classes in this file, plus generated cmd.exe delimiter and glued-switch
+    variants inside five launcher wrappers. The base is master read through git; no ref -> skipped with the reason."""
+
+    T = "C:/review/board/.claude-state/fleet-runs/lane-A-r1"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.head = _load_hook_module()
+        cls.base = None
+        cls.base_ref = ""
+        for ref in ("origin/master", "fork/master", "master"):
+            p = subprocess.run(["git", "-C", REPO_ROOT, "show", f"{ref}:tools/hooks/mlv-never-authorized.py"],
+                               capture_output=True, text=True, encoding="utf-8")
+            if p.returncode == 0 and p.stdout:
+                import importlib.util, tempfile
+                d = tempfile.mkdtemp(prefix="na2-parity-")
+                path = os.path.join(d, "hook_master.py")
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write(p.stdout)
+                spec = importlib.util.spec_from_file_location("na2_parity_base", path)
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                cls.base, cls.base_ref = mod, ref
+                break
+
+    def _rows(self):
+        t = self.T
+        tails = (" /s /q {t}", "/s/q {t}", "/q/s {t}", ",/s {t}", ";/s {t}", "=/s {t}", "\\t/s {t}", "\t/s {t}", "{t}")
+        wrappers = ("cmd /c {x}", "Rscript -e \"shell('echo x & {x}')\"", "anylauncher \"echo & {x}\"",
+                    "python -c \"import os; os.system('echo & {x}')\"",
+                    "node -e \"require('child_process').execSync('echo & {x}')\"")
+        rows = []
+        for verb in ("rd", "rmdir", "del", "erase"):
+            for tail in tails:
+                x = verb + "=" + tail.format(t=t)
+                rows.extend(w.format(x=x) for w in wrappers)
+        import ast
+        with open(__file__, encoding="utf-8") as fh:
+            tree = ast.parse(fh.read())
+        for cls in tree.body:
+            if not (isinstance(cls, ast.ClassDef) and cls.name.startswith("Na2")):
+                continue
+            for fn in cls.body:
+                if not isinstance(fn, ast.FunctionDef):
+                    continue
+                src = ast.unparse(fn)
+                if "assertIn('delete'" not in src and "assertEqual(rc, 2" not in src:
+                    continue
+                for node in ast.walk(fn):
+                    if isinstance(node, ast.For) and isinstance(node.iter, ast.Tuple):
+                        for elt in node.iter.elts:
+                            if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                                rows.append(elt.value)
+        return rows
+
+    def test_no_row_master_denies_is_allowed_on_this_head(self):
+        if self.base is None:
+            self.skipTest("no master ref readable through git (origin/master, fork/master, master)")
+        rows = self._rows()
+        self.assertGreater(len(rows), 150)
+        regressions = [r for r in rows if "delete" in self.base.shell_acts(r) and "delete" not in self.head.shell_acts(r)]
+        self.assertEqual(regressions, [], f"master ({self.base_ref}) DENY -> head ALLOW")
+
+
 class Na2ImplicitLauncherEndToEndDenyTests(unittest.TestCase):
     """r8 (Dot advisory abb6d537, carried by the CoS): every implicit-launcher delete row must DENY through the real hook
     CLI (exit 2, NA-2), not only through shell_acts. The protected target is a run dir under a synthetic board root."""

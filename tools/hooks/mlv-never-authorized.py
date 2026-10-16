@@ -1250,9 +1250,10 @@ _DELETE_TAIL = (
     r"|\bshutil\.rmtree\s*\("
     r"|\.unlink\s*\("
 )
-_DELETE_RX = re.compile(r"(?:^|[\s;&|`(])(?:rm|del|rd|rmdir)\b(?!=)" + _DELETE_TAIL, re.I)
+# r9 (CoS 6224673286): `erase` is cmd.exe's `del`.
+_DELETE_RX = re.compile(r"(?:^|[\s;&|`(])(?:rm|del|erase|rd|rmdir)\b(?!=)" + _DELETE_TAIL, re.I)
 # Inside a cmd.exe segment a quote also starts a command (`cmd /c "rd /s /q x"`), so it counts as a boundary there.
-_DELETE_RX_STRICT = re.compile(r"(?:^|[\s;&|`(\"'])(?:rm|del|rd|rmdir)\b" + _DELETE_TAIL, re.I)
+_DELETE_RX_STRICT = re.compile(r"(?:^|[\s;&|`(\"'])(?:rm|del|erase|rd|rmdir)\b" + _DELETE_TAIL, re.I)
 # r3 (sol + fable keys): other switches may come first (`cmd /s /c`, `cmd /d /s /k`, `cmd /v:on /c`), so any number
 # of leading `/x...` switches is skipped before the `/c` or `/k` that runs the command string.
 # r4 (sol r3 key): Git Bash needs `cmd //c` (doubled slash) and cmd.exe accepts compact switches (`cmd /s/c`,
@@ -1270,9 +1271,12 @@ _DELETE_RX_STRICT = re.compile(r"(?:^|[\s;&|`(\"'])(?:rm|del|rd|rmdir)\b" + _DEL
 # trigger it. The exemption survives only for plain POSIX shell text (the incident shape).
 _CMD_SEGMENT_RX = re.compile(
     r"\bcmd(?:\.exe)?\b|\bcomspec\b"
-    r"|(?<![\w.-])(?:python[\d.]*w?|py|pypy[\d.]*|node(?:js)?|deno|bun|perl|ruby|php|pwsh|powershell|tclsh|lua|osascript|java|dotnet)(?:\.exe)?\b"
-    r"|\bimport\b|\b__import__\b|\bsystem\s*\("
-    r"|\bshell\s*=\s*true\b|\bos\.(?:system|popen|spawn\w*|exec\w*)\b|\bsubprocess\b|\bpopen\b"
+    # r9 (Iverson 6224545907): file names such as import.json, python.log and subprocess.json no longer select the
+    # strict reading: an interpreter word must be followed by whitespace, a quote or the end; `import` must start an
+    # import statement; `subprocess` must be a call (`subprocess.run(`). The delete-shape rule below carries the real coverage.
+    r"|(?<![\w.-])(?:python[\d.]*w?|py|pypy[\d.]*|node(?:js)?|deno|bun|perl|ruby|php|pwsh|powershell|tclsh|lua|osascript|java|dotnet)(?:\.exe)?(?=[\s\"']|$)"
+    r"|\bimport\s+[A-Za-z_]|\bfrom\s+[\w.]+\s+import\b|\b__import__\b|\bsystem\s*\("
+    r"|\bshell\s*=\s*true\b|\bos\.(?:system|popen|spawn\w*|exec\w*)\b|\bsubprocess\s*\.\s*[a-z_]+\s*\(|\bpopen\b"
     r"|\bchild_process\b|\bexec(?:sync|file\w*)?\s*\(|\bspawn(?:sync)?\s*\("
     r"|\bstart-process\b|\binvoke-expression\b|\biex\b|\binvoke-item\b|\bshellexecute\w*\b"
     r"|\bwin32_process\b|\binvoke-cimmethod\b|\binvoke-wmimethod\b|\bwmic\b|\bschtasks\b|\bregister-scheduledtask\b"
@@ -1282,7 +1286,13 @@ _CMD_SEGMENT_RX = re.compile(
 # text, or by a one-letter switch (`rd=/s /q x`), is cmd.exe's `=` delimiter. The incident shape always carries a value
 # (`RD="..."`, `RD=/c/x/lane`), so it never matches. Rscript, julia and `wsl ... c''md` reached cmd.exe past the r7 list;
 # the launcher list stays as defence in depth.
-_CMD_DELETE_SHAPE_RX = re.compile(r"(?:^|[\s;&|`(\"'])(?:rm|del|rd|rmdir)=(?:\s|$|/[a-z](?:\s|$))", re.I)
+# r9 (CoS 6224673286): cmd.exe accepts any delimiter after the verb's `=` (whitespace, tab, `,`, `;`, `=`) and glued
+# switches made of rd/del switch letters (`/s/q`, `/f/q`; a Git Bash path such as `/c/x` is not one); R strings carry a literal `\t`. A verb= right after a cmd separator (`&`, `|`) inside an open quote
+# is a delete with a value (`'echo & del=file'`).
+_CMD_DELETE_SHAPE_RX = re.compile(
+    r"(?:^|[\s;&|`(\"'])(?:rm|del|erase|rd|rmdir)=(?:[\s,;=]|\\t|$|(?:/[sqpfa])+(?:[\s,;]|\\t|$))"
+    r"|[\"'][^\"']*(?:&|\|)\s*(?:rm|del|erase|rd|rmdir)=",
+    re.I)
 _MOVE_RX = re.compile(
     r"(?:^|[\s;&|`(])(?:mv|move)\b"
     r"|\bmove-item\b"
