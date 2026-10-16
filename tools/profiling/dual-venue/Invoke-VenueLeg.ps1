@@ -601,6 +601,8 @@ $scaleNote = "requested scale $($scale.requestedScale), rendered at $($scale.eff
 # The display mode the app RAN in and the window it presented in, from its own gui_smoke.window_placement line (never from the spec): the receipt carries the requested and the observed mode.
 $display = Get-DvDisplayEvidence -Spec $spec -LogText $runLogText
 $receipt.display = $display
+# LOOK-FULLSCREEN-PARITY-1: the look label the app showed (fullscreen corner or windowed status bar), from its own gui_smoke.look_label line. Informational.
+$receipt.lookLabel = Get-DvLookLabelEvidence -LogText $runLogText
 $smokeRefusalReason = $(if ($null -ne $summary -and $summary.PSObject.Properties['smokeRefusalReason']) { [string]$summary.smokeRefusalReason } else { '' })
 $resolved = Resolve-DvJobOutcome -ResultToken $token -ExitCode $exitCode -SmokeRefusalReason $smokeRefusalReason
 # A consumer of an evidence launcher ACTS on its exit code (master's consumer scan pins this statement): a job that prints a
