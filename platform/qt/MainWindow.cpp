@@ -16640,6 +16640,7 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
         &stats, s_lookAssistMasterScenePass ? LookAssistRenderFn() : LookAssistRenderFn( renderProcessed ) );
     const LookAssistFlavor flavor = currentLookAssistFlavor();
     m_lookAssistFlavorOutcome.begin();   // reported (telemetry, receipt) only once this analysis lands
+    m_lookAssistFlavorRelay = LookAssistFlavorRelay();   // and no flavor is re-laid over an analysis that has not landed
     // Observation only: how the verdict and balance were reached, appended to look_assist.apply.result.
     LookAssistDecisionTrace decisionTrace;
     decisionTrace.pictureEvidenceAsked = !s_lookAssistMasterScenePass;
@@ -17434,6 +17435,7 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
     // the same function the preset itself ends in): the balance is the Classic one by construction, here as headless.
     const LookAssistFlavor flavorForTheWalk = LookAssistFlavor::Classic;
     bool flavorLaidOver = false;
+    LookAssistPreset presetBeforeFlavor;   // LOOK-PRESET-DROPDOWN-1: the final Classic preset, for m_lookAssistFlavorRelay
     // Film's colour grade (the R/B split curves), laid with the tone overlay below; "none" for Classic and Cinematic.
     QString filmGrade = QStringLiteral("none");
     LookAssistPreset preset = presetForLookAssistScene(
@@ -17962,6 +17964,7 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
         {
             // The balance is final. Lay the flavor over it and measure the picture the user will actually see once,
             // for the diagnostics and the safety guard only: no balance step follows this measurement.
+            presetBeforeFlavor = preset;
             lookAssistApplyFlavorDeltas( &preset, scene, flavor );
             filmGrade = applyLookAssistFilmGrade( receipt, scene, flavor );
             applyLookAssistValues();
@@ -17979,10 +17982,12 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
     if( flavor != LookAssistFlavor::Classic && !flavorLaidOver )
     {
         // No picture analysis to run (no processed colour): the same overlay, nothing to re-measure.
+        presetBeforeFlavor = preset;
         lookAssistApplyFlavorDeltas( &preset, scene, flavor );
         filmGrade = applyLookAssistFilmGrade( receipt, scene, flavor );
         applyLookAssistValues();
     }
+    if( flavor == LookAssistFlavor::Classic ) presetBeforeFlavor = preset;
 
     // [PICTURE-DUMP] env-gated, read-only evidence (MLVAPP_LOOK_ASSIST_PICTURE_DUMP=<dir>): the picture
     // the app itself renders (live processing, analysis thumbnail) at the look just applied, so a
@@ -18256,6 +18261,9 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
 
     m_lookAssistFlavorOutcome.landed( receipt, lookAssistFlavorName( flavor ), false );
     receipt->setLookAssistFlavor( lookAssistFlavorName( flavor ) );
+    m_lookAssistFlavorRelay.receipt = receipt;   // LOOK-PRESET-DROPDOWN-1: landed, so another flavor can be laid over it
+    m_lookAssistFlavorRelay.scene = scene;
+    m_lookAssistFlavorRelay.classicPreset = presetBeforeFlavor;
     // grade= is appended after flavor=, and only for Film and Vision50d, so a Classic or Cinematic line stays byte-identical.
     // No '%' in it.
     const QString filmGradeLogTail = lookAssistFlavorLaysGradationCurve( flavor ) ? QStringLiteral(" grade=") + filmGrade : QString();
@@ -30250,6 +30258,60 @@ LookAssistFlavor MainWindow::currentLookAssistFlavor()
     return selection.flavor;
 }
 
+// LOOK-PRESET-DROPDOWN-1. Owner, 2026-10-15: "... have it change on the fly". Lays `flavor` over the last landed analysis
+// of this clip instead of analysing again: the scene verdict and the balance are flavor-blind (the walk runs on the Classic
+// preset and the flavor is laid afterwards), so the result is the analysis's own Classic preset plus the flavor's tone
+// deltas and grade curve -- exactly what that analysis lays for `flavor` at its overlay step. Exposure, temperature and
+// tint are not flavor sliders and stay. No picture is rendered here, so a pick during Play costs no GUI-thread stall
+// (the full analysis took ~4.5 s on a night clip, LOOK-PRESET-DROPDOWN-1 r2 venue). Not re-run: the post-apply colour-cast
+// guard, which judged the analysed flavor. False (the caller analyses again) when there is nothing landed to lay over.
+bool MainWindow::relayLookAssistFlavor( ReceiptSettings *receipt, LookAssistFlavor flavor )
+{
+    if( !receipt || m_lookAssistFlavorRelay.receipt != receipt || !m_lookAssistApplied.isApplied( receipt )
+     || !receipt->lookAssistEnabled() || !ui->checkBoxLookAssistEnable->isChecked() )
+    {
+        return false;
+    }
+    const LookAssistScene scene = m_lookAssistFlavorRelay.scene;
+    LookAssistPreset preset = m_lookAssistFlavorRelay.classicPreset;
+    lookAssistApplyFlavorDeltas( &preset, scene, flavor );
+    receipt->setContrast( preset.contrast );
+    receipt->setPivot( preset.pivot );
+    receipt->setVibrance( preset.vibrance );
+    receipt->setShadows( preset.shadows );
+    receipt->setHighlights( preset.highlights );
+    ui->horizontalSliderContrast->setValue( preset.contrast );
+    ui->horizontalSliderPivot->setValue( preset.pivot );
+    ui->horizontalSliderVibrance->setValue( preset.vibrance );
+    ui->horizontalSliderShadows->setValue( preset.shadows );
+    ui->horizontalSliderHighlights->setValue( preset.highlights );
+    // The old grade's curve goes (only while it still owns the curve), then the new one is laid (only over a default curve).
+    restoreLookAssistBaselineGradationCurve( receipt );
+    const QString grade = applyLookAssistFilmGrade( receipt, scene, flavor );
+    m_lastLookAssistContrast = preset.contrast;
+    m_lastLookAssistPivot = preset.pivot;
+    m_lastLookAssistShadows = preset.shadows;
+    m_lastLookAssistHighlights = preset.highlights;
+    m_lastLookAssistVibrance = preset.vibrance;
+    m_lookAssistFlavorOutcome.landed( receipt, lookAssistFlavorName( flavor ), false );
+    receipt->setLookAssistFlavor( lookAssistFlavorName( flavor ) );
+    logInteractionEvent(
+        QStringLiteral("look_assist.flavor_relay"),
+        QStringLiteral("flavor=%1 scene=%2 contrast=%3 pivot=%4 shadows=%5 highlights=%6 vibrance=%7 grade=%8 playing=%9 frame=%10")
+            .arg( lookAssistFlavorName( flavor ) )
+            .arg( lookAssistSceneName( scene ) )
+            .arg( preset.contrast )
+            .arg( preset.pivot )
+            .arg( preset.shadows )
+            .arg( preset.highlights )
+            .arg( preset.vibrance )
+            .arg( grade )
+            .arg( bool01( ui->actionPlay->isChecked() ) )
+            .arg( ui->horizontalSliderPosition->value() ) );
+    if( !ui->actionPlay->isChecked() ) requestFrameRefresh( true, "look-assist-flavor-relay" );
+    return true;
+}
+
 // LOOK-FULLSCREEN-PARITY-1. Owner, 2026-10-15: "Full screen dont bypass the look. I just want text in the bottom
 // right showing current look when in full screen and somewhere on GUI when windowed". The label reads the state the
 // grade reads -- the receipt's Look Assist switch, the checkbox, and the flavor in force -- and never changes either.
@@ -30401,6 +30463,8 @@ void MainWindow::on_comboBoxLookAssistFlavor_currentIndexChanged( int )
     updateLookLabel();
     if( !m_fileLoaded || !ACTIVE_RECEIPT ) return;
     ACTIVE_RECEIPT->setLookAssistFlavor( lookAssistFlavorName( currentLookAssistFlavor() ) );
+    // LOOK-PRESET-DROPDOWN-1: over a landed analysis the new flavor is laid at once, no re-analysis (on the fly, also in Play).
+    if( relayLookAssistFlavor( ACTIVE_RECEIPT, currentLookAssistFlavor() ) ) return;
     // A different grade over the same clip: the marker forgets it (otherwise the toggle's frame-ready step would
     // dedup_skip the new analysis after the baseline is restored and leave the clip ungraded under a receipt that
     // names the new flavor), then the same path as switching Look Assist on restores the baseline and analyses
@@ -30584,6 +30648,7 @@ void MainWindow::on_checkBoxLookAssistEnable_clicked( bool checked )
         m_lastLookAssistDiagnosticsValid = false;
         m_lookAssistApplied.clearIf( ACTIVE_RECEIPT );
         m_lookAssistFlavorOutcome.clear();   // the baseline is back: no grade, no fallback, only the selector's setting
+        m_lookAssistFlavorRelay = LookAssistFlavorRelay();
     }
 
     setReceipt( ACTIVE_RECEIPT );

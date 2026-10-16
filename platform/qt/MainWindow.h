@@ -961,6 +961,17 @@ private:
     bool m_lastLookAssistDiagnosticsValid = false;
     QString m_lastWarnedLookAssistFlavorValue;
     lookassist::LookAssistFlavorOutcome m_lookAssistFlavorOutcome;   // how the last analysis ended: telemetry and setReceipt read it
+    // LOOK-PRESET-DROPDOWN-1: what the last sync analysis that LANDED decided before any flavor was laid (its scene and its
+    // final Classic preset, balance included). A flavor is only tone deltas and a grade curve over exactly this, so another
+    // flavor can be laid without analysing again (relayLookAssistFlavor). Valid for `receipt` only; cleared when an
+    // analysis starts, falls back to the baseline, or Look Assist goes off.
+    struct LookAssistFlavorRelay
+    {
+        const void *receipt = nullptr;
+        lookassist::LookAssistScene scene = lookassist::LookAssistScene::Night;
+        lookassist::LookAssistPreset classicPreset;
+    };
+    LookAssistFlavorRelay m_lookAssistFlavorRelay;
     QString m_lastLookAssistScene;
     double m_lastLookAssistMedian = 0.0;
     double m_lastLookAssistP05 = 0.0;
@@ -1908,6 +1919,7 @@ private:
                                    int analysisFrame = -1 );
     void syncLookAssistDerivedUiToReceipt( ReceiptSettings *receipt );
     lookassist::LookAssistFlavor currentLookAssistFlavor();
+    bool relayLookAssistFlavor( ReceiptSettings *receipt, lookassist::LookAssistFlavor flavor );
     // LOOK-FULLSCREEN-PARITY-1: re-derives the look label from the state the grade uses (Look Assist
     // on, the flavor in force) and pushes it to the status bar and, in fullscreen, to the preview
     // surface's corner. Does nothing when neither the text nor where it shows changed.

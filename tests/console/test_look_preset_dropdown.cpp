@@ -187,6 +187,46 @@ TEST(LookPresetDropdownWiring, PersistsThroughTheExistingLookAssistSetting)
     ASSERT_FALSE(select.contains(QStringLiteral("setValue(")));
 }
 
+TEST(LookPresetDropdownWiring, AFlavorPickOverALandedAnalysisIsLaidWithoutAnalysingAgain)
+{
+    // On the fly: r2's venue capture measured a ~4.5 s GUI-thread stall mid-Play when a flavor change re-ran the whole
+    // analysis (night clip). The scene and balance are flavor-blind, so a landed analysis's Classic preset is kept and
+    // another flavor is laid over it -- no picture rendered, no analysis.
+    const QString mw = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString slot = functionBody(mw, QStringLiteral("void MainWindow::on_comboBoxLookAssistFlavor_currentIndexChanged( int )"));
+    const int relayAt = slot.indexOf(QStringLiteral("if( relayLookAssistFlavor( ACTIVE_RECEIPT, currentLookAssistFlavor() ) ) return;"));
+    const int analyseAt = slot.indexOf(QStringLiteral("m_lookAssistApplied.flavorChanged("));
+    ASSERT_TRUE(relayAt >= 0 && analyseAt > relayAt);   // the full analysis stays the fallback
+
+    const QString relay = functionBody(mw, QStringLiteral("bool MainWindow::relayLookAssistFlavor( ReceiptSettings *receipt, LookAssistFlavor flavor )"));
+    // Only over THIS clip's landed analysis, with Look Assist on.
+    ASSERT_TRUE(relay.contains(QStringLiteral("m_lookAssistFlavorRelay.receipt != receipt")));
+    ASSERT_TRUE(relay.contains(QStringLiteral("!m_lookAssistApplied.isApplied( receipt )")));
+    ASSERT_TRUE(relay.contains(QStringLiteral("!receipt->lookAssistEnabled()")));
+    // The analysis's own overlay: its Classic preset, the shared flavor-delta function, the grade-curve swap.
+    ASSERT_TRUE(relay.contains(QStringLiteral("LookAssistPreset preset = m_lookAssistFlavorRelay.classicPreset;")));
+    ASSERT_TRUE(relay.contains(QStringLiteral("lookAssistApplyFlavorDeltas( &preset, scene, flavor );")));
+    ASSERT_TRUE(relay.contains(QStringLiteral("restoreLookAssistBaselineGradationCurve( receipt );")));
+    ASSERT_TRUE(relay.contains(QStringLiteral("applyLookAssistFilmGrade( receipt, scene, flavor )")));
+    ASSERT_TRUE(relay.contains(QStringLiteral("m_lookAssistFlavorOutcome.landed( receipt, lookAssistFlavorName( flavor ), false );")));
+    // Nothing rendered or analysed, and the flavor-blind sliders are left alone.
+    const char *never[] = { "applyLookAssistToReceipt", "get_area_average_downscale_thumnail", "processedThumbnail",
+                            "on_checkBoxLookAssistEnable_clicked", "setExposure(", "setTemperature(", "setTint(",
+                            "actionPlay->setChecked" };
+    for ( const char *call : never ) ASSERT_FALSE(relay.contains(QString::fromLatin1(call)));
+
+    // Recorded only where the sync analysis LANDS (after the safety-fallback return), from the preset before the flavor;
+    // forgotten when an analysis starts and when Look Assist goes off.
+    const int landedAt = mw.indexOf(QStringLiteral("m_lookAssistFlavorRelay.classicPreset = presetBeforeFlavor;"));
+    const int fallbackAt = mw.indexOf(QStringLiteral("requestFrameRefresh( true, \"look-assist-safety-fallback\" );"));
+    ASSERT_TRUE(fallbackAt >= 0 && landedAt > fallbackAt);
+    ASSERT_EQ(3, mw.count(QStringLiteral("presetBeforeFlavor = preset;")));
+    ASSERT_TRUE(mw.contains(QStringLiteral("m_lookAssistFlavorOutcome.begin();   // reported (telemetry, receipt) only once this analysis lands\n"
+                                           "    m_lookAssistFlavorRelay = LookAssistFlavorRelay();")));
+    const QString toggle = functionBody(mw, QStringLiteral("void MainWindow::on_checkBoxLookAssistEnable_clicked( bool checked )"));
+    ASSERT_TRUE(toggle.contains(QStringLiteral("m_lookAssistFlavorRelay = LookAssistFlavorRelay();")));
+}
+
 TEST(LookPresetDropdownWiring, ARePickDuringPlayAnalysesTheFrameOnScreen)
 {
     // On the fly during playback: the toggle's re-analysis must not wait for the baseline frame (it never comes back while
