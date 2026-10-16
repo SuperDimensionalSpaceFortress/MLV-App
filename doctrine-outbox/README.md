@@ -58,14 +58,25 @@ the name of the GPU host. A refusal names the class, never the matched value.
 A project had no way to tell the CoS a concern: only the CoS writes `cos-feedback/`, and a project-owned
 file is the one legal shape (bus Law 2). `target: specs/mlv-app/cos-concerns.md` with `kind: concern` is
 that file. The body is a `### mlv-app-cc-<yyyymmdd>-<n>` heading and exactly seven `- field: value` lines,
-each on one line: `id`, `to` (always `CoS`), `opened_utc`, `expires_utc` (after `opened_utc`; the standard
-is 14 days), `kind` (`output-format` | `process` | `shared-tool-defect` | `fleet-pattern`), `evidence` (bus
-SHAs, public PR comment ids, repo paths) and `ask` (one sentence). The set is closed, so no field can carry
-an approval, a ruling or a permission. The CoS answers each id once, in its own `cos-feedback/mlv-app/concerns.md`:
+each on one line: `id`, `to` (always `CoS`), `opened_utc`, `expires_utc` (after `opened_utc`, and no more
+than 14 days after it: a longer window is refused as `CONCERN_WINDOW_TOO_LONG`), `kind` (`output-format` |
+`process` | `shared-tool-defect` | `fleet-pattern`), `evidence` (bus SHAs, public PR comment ids, repo paths)
+and `ask` (one sentence). The set is closed, so no field is an approval, a ruling or a permission; free text is
+data. The CoS answers each id once, in its own `cos-feedback/mlv-app/concerns.md`:
 `<id> ADOPTED|DISTINGUISHED|NEEDS-INFO <reason>`. Open = entries with no answer line and not expired, derived
-and never stored. The drain holds an entry (`CONCERN_CHANNEL_NOT_RATIFIED`) until the fetched bus tip's
-`cos-feedback/README.md` names `CoS-CONCERN:`, so nothing is written to a file nobody reads. A concern about
-one PR goes instead as a comment on that PR's thread starting `CoS-CONCERN:`.
+and never stored.
+
+The drain holds an entry, and the refusal names the reason:
+- `CONCERN_CHANNEL_NOT_RATIFIED` until the fetched bus tip's `cos-feedback/README.md` carries the exact duty
+  line `- The CoS reads `CoS-CONCERN:` PR comments and every `specs/*/cos-concerns.md` each pass.` (a bullet is
+  optional; a line that merely mentions the token, forbids it, names only R1, or sits in a code fence does not
+  count), so nothing is written to a file nobody reads;
+- `CONCERN_EXPIRED` when `expires_utc` is not after the clock at drain time;
+- `CONCERN_DUPLICATE_ID` when the id heads more than one committed item (all of them are held), or is already
+  in the tip's `specs/mlv-app/cos-concerns.md` under different text. An id names exactly one concern.
+
+A concern about one PR goes instead as a comment on that PR's thread starting `CoS-CONCERN:`. Until the CoS
+duty line lands on the bus, the CoS does not read those comments either.
 
 ## Traps are cards (bus R14.1)
 

@@ -1,8 +1,8 @@
 """The project-to-CoS concern channel in the doctrine outbox (card COS-CONCERN-CHANNEL-1).
 
 A concern is an entry in the project-owned `specs/mlv-app/cos-concerns.md`. The field set is closed, so
-no entry can carry an approval, a ruling or a permission; every entry expires; the drain holds an entry
-until the fetched bus tip's cos-feedback README names the `CoS-CONCERN:` reader duty. Small and fast on
+no field is an approval, a ruling or a permission; every entry expires within 14 days; the drain holds an
+entry that is expired, repeats an id, or has no exact `CoS-CONCERN:` reader-duty line at the fetched bus tip. Small on
 purpose: the 2,900-line sibling suite takes more than ten minutes.
 """
 from __future__ import annotations
@@ -31,6 +31,17 @@ ENTRY = ("### mlv-app-cc-20261016-9\n"
          "- kind: process\n"
          "- evidence: bus commit abc1234, PR comment 6224672124\n"
          "- ask: Re-read the thread before each write.\n")
+
+
+DUTY_LINE = "- The CoS reads `CoS-CONCERN:` PR comments and every `specs/*/cos-concerns.md` each pass.\n"
+RATIFIED_README = "# cos-feedback\n\n## Writer duties\n\n" + DUTY_LINE
+NOW = "2026-10-17T00:00:00Z"
+
+
+@pytest.fixture(autouse=True)
+def _pinned_clock(monkeypatch):
+    """The drain holds an expired concern, so the clock is pinned: ENTRY must not rot on 2026-10-30."""
+    monkeypatch.setattr(ob, "_utc_now_z", lambda: NOW)
 
 
 def git(repo: Path, *args: str) -> str:
@@ -87,6 +98,9 @@ def test_a_well_formed_concern_parses():
     ("an unknown kind", ENTRY.replace("- kind: process", "- kind: approval"), "CONCERN_BAD_KIND"),
     ("a malformed time", ENTRY.replace("2026-10-30T21:50:00Z", "next week"), "CONCERN_BAD_TIME"),
     ("an entry that never expires", ENTRY.replace("2026-10-30T21:50:00Z", "2026-10-16T21:50:00Z"), "CONCERN_NOT_EXPIRING"),
+    ("a window of 14 days and one second", ENTRY.replace("2026-10-30T21:50:00Z", "2026-10-30T21:50:01Z"), "CONCERN_WINDOW_TOO_LONG"),
+    ("an expiry in the year 2999", ENTRY.replace("2026-10-30T21:50:00Z", "2999-01-01T00:00:00Z"), "CONCERN_WINDOW_TOO_LONG"),
+    ("a calendar-impossible time", ENTRY.replace("2026-10-30T21:50:00Z", "2026-13-40T21:50:00Z"), "CONCERN_BAD_TIME"),
     ("an id dated on another day", ENTRY.replace("2026-10-16T21:50:00Z", "2026-10-17T21:50:00Z").replace("2026-10-30T21:50:00Z", "2026-10-31T21:50:00Z"), "CONCERN_ID_DATE"),
 ])
 def test_a_concern_with_a_hole_is_refused(label, body, code):
@@ -113,7 +127,7 @@ def test_the_drain_holds_a_concern_until_the_bus_names_the_reader_duty(tmp_path)
 
 def test_the_drain_appends_a_ratified_concern_under_a_title_and_never_touches_cos_feedback(tmp_path):
     src = init_source(tmp_path)
-    clone = init_bus(tmp_path, "# cos-feedback\n\nThe CoS reads `CoS-CONCERN:` comments each pass.\n")
+    clone = init_bus(tmp_path, RATIFIED_README)
     report = ob.drain(src, clone, "HEAD", tmp_path / "sent.jsonl", [], push=True)
     assert report["refused"] == [] and [p["target"] for p in report["published"]] == [CONCERNS]
     text = git(clone, "show", f"{report['commit']}:{CONCERNS}")
@@ -123,6 +137,89 @@ def test_the_drain_appends_a_ratified_concern_under_a_title_and_never_touches_co
     assert changed == [CONCERNS], "the drain writes the project-owned file and nothing else"
     again = ob.drain(src, clone, "HEAD", tmp_path / "sent-lost.jsonl", [], push=True)
     assert again["published"] == [] and [a["via"] for a in again["already_sent"]] == ["bus_tip"]
+
+
+@pytest.mark.parametrize("label,readme", [
+    ("a sentence that forbids the token", "# cos-feedback\n\nProjects must not use CoS-CONCERN: comments.\n"),
+    ("the token with no duty line", "# cos-feedback\n\nThe CoS reads `CoS-CONCERN:` comments each pass.\n"),
+    ("a duty line that names only R1", "# cos-feedback\n\n- The CoS reads `CoS-CONCERN:` PR comments each pass.\n"),
+    ("the path with no duty line", "# cos-feedback\n\nDo not read `specs/*/cos-concerns.md`; `CoS-CONCERN:` is retired.\n"),
+    ("the exact line inside a code fence", "# cos-feedback\n\n```\n" + DUTY_LINE + "```\n"),
+])
+def test_only_the_exact_duty_line_opens_the_gate(tmp_path, label, readme):
+    src = init_source(tmp_path)
+    clone = init_bus(tmp_path, readme)
+    report = ob.drain(src, clone, "HEAD", tmp_path / "sent.jsonl", [], push=False)
+    assert [r["code"] for r in report["refused"]] == ["CONCERN_CHANNEL_NOT_RATIFIED"], label
+    assert report["published"] == []
+
+
+@pytest.mark.parametrize("readme", [DUTY_LINE, "# cos-feedback\n\n" + DUTY_LINE.lstrip("- "), "# cos-feedback\n\n" + DUTY_LINE.replace("- ", "* ", 1)])
+def test_the_exact_duty_line_opens_the_gate_with_or_without_a_bullet(tmp_path, readme):
+    src = init_source(tmp_path)
+    clone = init_bus(tmp_path, readme)
+    report = ob.drain(src, clone, "HEAD", tmp_path / "sent.jsonl", [], push=False)
+    assert report["refused"] == [] and [w["target"] for w in report["would_push"]] == [CONCERNS]
+
+
+def add_item(src: Path, name: str, body: str) -> None:
+    (src / "doctrine-outbox" / name).write_text(item_text(body), encoding="utf-8")
+    git(src, "add", "-A")
+    git(src, "commit", "-m", f"add {name}")
+
+
+def test_two_committed_items_with_one_concern_id_are_both_held(tmp_path):
+    """CoS repro on 892922b7: two items headed mlv-app-cc-20261016-9 with different asks both published."""
+    src = init_source(tmp_path)
+    add_item(src, "20261016-second-concern.md", ENTRY.replace("Re-read the thread before each write.", "Answer each ask on its own thread."))
+    clone = init_bus(tmp_path, RATIFIED_README)
+    report = ob.drain(src, clone, "HEAD", tmp_path / "sent.jsonl", [], push=True)
+    assert sorted((r["path"], r["code"]) for r in report["refused"]) == [
+        ("doctrine-outbox/20261016-example-concern.md", "CONCERN_DUPLICATE_ID"),
+        ("doctrine-outbox/20261016-second-concern.md", "CONCERN_DUPLICATE_ID")]
+    assert report["published"] == [] and not report["pushed"]
+
+
+def test_a_new_item_reusing_an_id_already_in_the_tip_concerns_file_is_refused(tmp_path):
+    src = init_source(tmp_path)
+    clone = init_bus(tmp_path, RATIFIED_README)
+    first = ob.drain(src, clone, "HEAD", tmp_path / "sent.jsonl", [], push=True)
+    assert first["refused"] == [] and len(first["published"]) == 1
+    # Same id, different ask: a second file in the outbox. The first stays history; only the new one is refused.
+    add_item(src, "20261016-reused-id.md", ENTRY.replace("Re-read the thread before each write.", "A different ask under the same id."))
+    again = ob.drain(src, clone, "HEAD", tmp_path / "sent.jsonl", [], push=True)
+    assert [(r["path"], r["code"]) for r in again["refused"]] == [("doctrine-outbox/20261016-reused-id.md", "CONCERN_DUPLICATE_ID")]
+    assert again["published"] == [] and [a["via"] for a in again["already_sent"]] == ["ledger"]
+    text = git(clone, "show", f"{first['commit']}:{CONCERNS}")
+    assert text.count("### mlv-app-cc-20261016-9") == 1
+
+
+def test_a_distinct_id_is_not_a_duplicate(tmp_path):
+    src = init_source(tmp_path)
+    add_item(src, "20261016-other-concern.md", ENTRY.replace("-9", "-10"))
+    clone = init_bus(tmp_path, RATIFIED_README)
+    report = ob.drain(src, clone, "HEAD", tmp_path / "sent.jsonl", [], push=True)
+    assert report["refused"] == [] and len(report["published"]) == 2
+
+
+def test_the_drain_holds_a_concern_whose_expiry_has_passed(tmp_path, monkeypatch):
+    src = init_source(tmp_path)
+    clone = init_bus(tmp_path, RATIFIED_README)
+    monkeypatch.setattr(ob, "_utc_now_z", lambda: "2026-10-30T21:50:00Z")  # exactly at expires_utc: expired
+    report = ob.drain(src, clone, "HEAD", tmp_path / "sent.jsonl", [], push=False)
+    assert [(r["path"], r["code"]) for r in report["refused"]] == [("doctrine-outbox/20261016-example-concern.md", "CONCERN_EXPIRED")]
+    assert report["published"] == []
+    monkeypatch.setattr(ob, "_utc_now_z", lambda: "2026-10-30T21:49:59Z")  # one second earlier: still open
+    report = ob.drain(src, clone, "HEAD", tmp_path / "sent.jsonl", [], push=False)
+    assert report["refused"] == [] and len(report["would_push"]) == 1
+
+
+def test_validate_flags_a_repeated_concern_id_across_the_files_it_is_given(tmp_path):
+    a, b = tmp_path / "20261016-one-concern.md", tmp_path / "20261016-two-concern.md"
+    a.write_text(item_text(), encoding="utf-8")
+    b.write_text(item_text(ENTRY.replace("Re-read the thread before each write.", "Another ask.")), encoding="utf-8")
+    assert ob.cmd_validate([a], []) == 0
+    assert ob.cmd_validate([a, b], []) == 1
 
 
 def test_every_committed_concern_item_parses_and_passes_law4():

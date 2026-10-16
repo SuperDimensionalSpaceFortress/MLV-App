@@ -78,7 +78,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 PROJECT = "mlv-app"
 OUTBOX_DIR = "doctrine-outbox"
@@ -91,11 +91,18 @@ CARDS_TARGET = f"specs/{PROJECT}/cards.md"
 CONCERNS_TARGET = f"specs/{PROJECT}/cos-concerns.md"
 CONCERNS_READER_FILE = "cos-feedback/README.md"
 CONCERNS_READER_TOKEN = "CoS-CONCERN:"
+# The ratification is ONE line of that README, not the token anywhere in it: the CoS's reader duty names both routes
+# (R1 PR comments and R2 every specs/*/cos-concerns.md). A sentence that merely mentions the token, forbids it, or
+# names only R1 is not the duty; neither is the line inside a code fence. An optional list bullet is allowed.
+CONCERNS_DUTY_LINE_RE = re.compile(r"^ {0,3}(?:[-*] )?The CoS reads `CoS-CONCERN:` .*`specs/\*/cos-concerns\.md`")
+CONCERNS_DUTY_LINE_EXAMPLE = "- The CoS reads `CoS-CONCERN:` PR comments and every `specs/*/cos-concerns.md` each pass."
 CONCERN_FIELDS = ("id", "to", "opened_utc", "expires_utc", "kind", "evidence", "ask")
 CONCERN_KINDS = ("output-format", "process", "shared-tool-defect", "fleet-pattern")
 CONCERN_DEFAULT_DAYS = 14
 CONCERN_ID_RE = re.compile(r"^" + re.escape(PROJECT) + r"-cc-[0-9]{8}-[0-9]{1,3}$")
 CONCERN_UTC_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
+CONCERN_UTC_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+CONCERN_HEADING_RE = re.compile(r"^### (" + re.escape(PROJECT) + r"-cc-[0-9]{8}-[0-9]{1,3})[ \t]*$", re.MULTILINE)
 TARGETS = ("RECEIPTS.md", "TRAPS.md", "RULINGS.md", CARDS_TARGET, CONCERNS_TARGET)
 KINDS = ("receipt", "trap", "ruling", "concern")
 CARD_VALIDATOR_REL = "tools/validate-cards.mjs"
@@ -296,16 +303,19 @@ def parse_item(text: str) -> dict:
                                                   f"(R14.1; format in the bus's {CARD_VALIDATOR_REL})")
     elif not body.lstrip().startswith("### "):
         raise Refusal("ITEM_BODY_NOT_AN_ENTRY", "body must start with a '### ' heading (bus entry grammar)")
+    item = {"meta": meta, "body": body}
     if meta["target"] == CONCERNS_TARGET:
-        screen_concern(body)
-    return {"meta": meta, "body": body}
+        item["concern"] = screen_concern(body)
+    return item
 
 
-def screen_concern(body: str) -> None:
+def screen_concern(body: str) -> dict[str, str]:
     """A concern entry is a heading plus exactly the seven `- field: value` lines of CONCERN_FIELDS, each on one
-    line. The field set is closed, so no field can carry an approval, a ruling or a permission: the channel
-    is a message to the CoS, never a grant (conjugal-fleet-advisory-channel security musts). Every entry
-    expires, and its id is the heading, so the CoS's one-line answer names it exactly."""
+    line. The field set is closed, so no field is an approval, a ruling or a permission; free text is data: the
+    channel is a message to the CoS, never a grant (conjugal-fleet-advisory-channel security musts). Every entry
+    expires within CONCERN_DEFAULT_DAYS of opening, and its id is the heading, so the CoS's one-line answer names
+    it exactly. Returns the validated fields. Whether the id is unique and whether the entry has already expired are
+    questions about OTHER items and about the clock, so the drain answers them (r14_gate), not this parse."""
     rows = [ln.rstrip() for ln in body.strip().splitlines() if ln.strip()]
     heading_id = rows[0][4:].strip()
     if not CONCERN_ID_RE.match(heading_id):
@@ -332,10 +342,20 @@ def screen_concern(body: str) -> None:
     for f in ("opened_utc", "expires_utc"):
         if not CONCERN_UTC_RE.match(fields[f]):
             raise Refusal("CONCERN_BAD_TIME", f"{f} must be YYYY-MM-DDTHH:MM:SSZ")
-    if fields["expires_utc"] <= fields["opened_utc"]:
+        try:
+            datetime.strptime(fields[f], CONCERN_UTC_FORMAT)
+        except ValueError:
+            raise Refusal("CONCERN_BAD_TIME", f"{f} is not a real calendar time") from None
+    opened = datetime.strptime(fields["opened_utc"], CONCERN_UTC_FORMAT)
+    expires = datetime.strptime(fields["expires_utc"], CONCERN_UTC_FORMAT)
+    if expires <= opened:
         raise Refusal("CONCERN_NOT_EXPIRING", "expires_utc must be after opened_utc (every message expires)")
+    if expires - opened > timedelta(days=CONCERN_DEFAULT_DAYS):
+        raise Refusal("CONCERN_WINDOW_TOO_LONG", f"expires_utc is more than {CONCERN_DEFAULT_DAYS} days after opened_utc "
+                                                 f"(an open ask is a standing claim on the CoS; renew with a new id)")
     if not heading_id.split("-cc-")[1].startswith(fields["opened_utc"][:10].replace("-", "")):
         raise Refusal("CONCERN_ID_DATE", "the id date must be the opened_utc date")
+    return fields
 
 
 def _word_boundary_pattern(value: str) -> re.Pattern[str]:
@@ -508,6 +528,11 @@ def merged_into_ref_time(repo: pathlib.Path, ref: str, added_commit: str, first_
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _utc_now_z() -> str:
+    """The clock the drain judges a concern's expiry by, in the entry's own YYYY-MM-DDTHH:MM:SSZ form."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def resolve_ledger(repo: pathlib.Path, ledger: pathlib.Path | None) -> pathlib.Path:
@@ -685,9 +710,11 @@ def card_validator_on_bus(bus_repo: pathlib.Path, tip: str) -> bool:
     return rc == 0
 
 
-def r14_gate(bus_repo: pathlib.Path, tip: str, candidates: list[dict], report: dict) -> list[dict]:
+def r14_gate(bus_repo: pathlib.Path, tip: str, candidates: list[dict], report: dict,
+             concern_dup_ids: frozenset[str] | set[str] = frozenset()) -> list[dict]:
     """The candidates that may be appended at `tip`; the rest go to report["refused"]. A key
-    already on the tip is kept, so the drain reports it as sent rather than refusing history."""
+    already on the tip is kept, so the drain reports it as sent rather than refusing history.
+    `concern_dup_ids` are the concern ids that head more than one committed outbox item."""
     validator = card_validator_on_bus(bus_repo, tip)
     has_cards = any(c["target"] == CARDS_TARGET for c in candidates)
     node, node_refusal = None, None
@@ -719,8 +746,20 @@ def r14_gate(bus_repo: pathlib.Path, tip: str, candidates: list[dict], report: d
             refusal = ("CARDS_PATH_NOT_REGULAR_FILE", f"{entry_problem}; a card is never written through a link or a non-regular entry")
         elif c["target"] == CONCERNS_TARGET and not concern_reader_duty_on_bus(bus_repo, tip):
             refusal = ("CONCERN_CHANNEL_NOT_RATIFIED",
-                       f"{CONCERNS_READER_FILE} at {tip[:12]} does not yet name '{CONCERNS_READER_TOKEN}'; a concern is held "
-                       f"until the CoS has taken the reader duty, so it is never written to a file nobody reads")
+                       f"{CONCERNS_READER_FILE} at {tip[:12]} has no reader-duty line of the form '{CONCERNS_DUTY_LINE_EXAMPLE}'; "
+                       f"a concern is held until the CoS has taken the reader duty, so it is never written to a file nobody reads")
+        elif c["target"] == CONCERNS_TARGET and c["concern"]["expires_utc"] <= _utc_now_z():
+            refusal = ("CONCERN_EXPIRED",
+                       f"{c['concern']['id']} expired at {c['concern']['expires_utc']}; an expired ask is not published "
+                       f"(open a new id if the concern still stands)")
+        elif c["target"] == CONCERNS_TARGET and c["concern"]["id"] in concern_dup_ids:
+            refusal = ("CONCERN_DUPLICATE_ID",
+                       f"{c['concern']['id']} heads more than one committed outbox item; the CoS answers an id once, "
+                       f"so an id names exactly one concern (give each its own -<n>)")
+        elif c["target"] == CONCERNS_TARGET and c["concern"]["id"] in concern_ids_on_bus(bus_repo, tip):
+            refusal = ("CONCERN_DUPLICATE_ID",
+                       f"{c['concern']['id']} is already in {CONCERNS_TARGET} at {tip[:12]} under different text; "
+                       f"an id names exactly one concern (give this one its own -<n>)")
         if refusal is None:
             kept.append(c)
         else:
@@ -729,10 +768,35 @@ def r14_gate(bus_repo: pathlib.Path, tip: str, candidates: list[dict], report: d
 
 
 def concern_reader_duty_on_bus(bus_repo: pathlib.Path, tip: str) -> bool:
-    """The channel is live only once the fetched tip's cos-feedback README names the CoS-CONCERN reader duty
-    (the ratification this tool's R2 route waits for). The tip decides, never a date."""
+    """The channel is live only once the fetched tip's cos-feedback README carries the CoS-CONCERN reader-duty
+    LINE (CONCERNS_DUTY_LINE_RE: names the token AND `specs/*/cos-concerns.md`, outside any code fence), the
+    ratification this tool's R2 route waits for. The tip decides, never a date."""
     text = bus_file_at(bus_repo, tip, CONCERNS_READER_FILE)
-    return text is not None and CONCERNS_READER_TOKEN in text
+    if text is None:
+        return False
+    fenced = False
+    for line in text.splitlines():
+        if line.lstrip().startswith("```"):
+            fenced = not fenced
+        elif not fenced and CONCERNS_DUTY_LINE_RE.match(line):
+            return True
+    return False
+
+
+def concern_ids_on_bus(bus_repo: pathlib.Path, tip: str) -> set[str]:
+    """Every concern id already headed in the tip's project-owned concerns file."""
+    return set(CONCERN_HEADING_RE.findall(bus_file_at(bus_repo, tip, CONCERNS_TARGET) or ""))
+
+
+def concern_duplicate_ids(items: list[dict]) -> set[str]:
+    """Ids that head more than one committed concern item. The drain cannot tell which of two is the
+    real concern, so it holds all of them."""
+    seen: dict[str, int] = {}
+    for it in items:
+        if "item" in it and "concern" in it["item"]:
+            cid = it["item"]["concern"]["id"]
+            seen[cid] = seen.get(cid, 0) + 1
+    return {cid for cid, n in seen.items() if n > 1}
 
 
 def ensure_concerns_file(path: pathlib.Path) -> None:
@@ -886,6 +950,7 @@ def drain(repo: pathlib.Path, bus_repo: pathlib.Path, ref: str, ledger: pathlib.
           deny_terms: list[tuple[str, str]], push: bool, max_attempts: int = 3) -> dict:
     require_tool_at_ref(repo, ref)
     items = load_outbox_items(repo, ref)
+    concern_dup_ids = concern_duplicate_ids(items)
     ledger_keys = read_ledger_keys(ledger)
     report: dict = {"push": push, "published": [], "already_sent": [], "refused": [], "commit": None, "pushed": False}
 
@@ -923,8 +988,11 @@ def drain(repo: pathlib.Path, bus_repo: pathlib.Path, ref: str, ledger: pathlib.
         if key in ledger_keys:
             report["already_sent"].append({"path": it["path"], "key": key, "via": "ledger"})
             continue
-        candidates.append({"path": it["path"], "name": it["name"], "src": src, "target": target,
-                            "key": key, "block": block, "message": message})
+        candidate = {"path": it["path"], "name": it["name"], "src": src, "target": target,
+                     "key": key, "block": block, "message": message}
+        if "concern" in item:
+            candidate["concern"] = item["concern"]
+        candidates.append(candidate)
 
     if not candidates and not claimed:
         return report
@@ -948,7 +1016,7 @@ def drain(repo: pathlib.Path, bus_repo: pathlib.Path, ref: str, ledger: pathlib.
     while True:
         attempt += 1
         # Re-gated on every attempt: a refetched tip may be the one that lands the validator.
-        candidates = r14_gate(bus_repo, tip, candidates, report)
+        candidates = r14_gate(bus_repo, tip, candidates, report, concern_dup_ids)
         if card_pass_len is not None:
             if len(candidates) >= card_pass_len:
                 raise Refusal("CARD_PASS_NOT_SHRINKING", f"{len(candidates)} candidates after a per-card refusal pass over {card_pass_len}")
@@ -1580,6 +1648,7 @@ def check_commits(repo: pathlib.Path, rev_range: str, deny_terms: list[tuple[str
 
 def cmd_validate(paths: list[pathlib.Path], deny_terms: list[tuple[str, str]]) -> int:
     ok = True
+    concern_ids: dict[str, pathlib.Path] = {}
     for p in paths:
         try:
             # drain refuses a badly named item forever (ITEM_BAD_FILENAME), so validate must too:
@@ -1592,6 +1661,11 @@ def cmd_validate(paths: list[pathlib.Path], deny_terms: list[tuple[str, str]]) -
             item = parse_item(text)
             screen_law4(item["body"], deny_terms)
             screen_rendered_card(item)
+            if "concern" in item:
+                cid = item["concern"]["id"]
+                if cid in concern_ids:
+                    raise Refusal("CONCERN_DUPLICATE_ID", f"{cid} also heads {concern_ids[cid].name}; the drain holds both")
+                concern_ids[cid] = p
         except Refusal as e:
             print(f"[doctrine-outbox] REFUSED {p}: {e}", file=sys.stderr)
             ok = False
