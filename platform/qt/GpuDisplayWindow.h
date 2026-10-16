@@ -126,6 +126,15 @@ public:
      * surface, not the hidden QGraphicsView. GUI-thread only. */
     static QSize displaySize(void);
 
+    /* LOOK-FULLSCREEN-PARITY-1: the "current look" label paintGL() draws in the window's
+     * bottom-right corner (empty text = no label). The label is rasterised once per change
+     * of text or framebuffer height and kept as a texture; every paint composites that one
+     * cached quad over the frame, so captures (grabPresentedFramebufferIfActive) see exactly
+     * what the screen shows. GUI-thread only; false when no window is active. */
+    static bool setLookLabelIfActive(const QString &text);
+    /* The label text the most recent paintGL() actually drew ("" when it drew none). */
+    static QString lookLabelDrawnTextIfActive(void);
+
     /* Opt-in (MLVAPP_PLAYBACK_SMOKE_TELEMETRY, the same env var that gates MainWindow's
      * playback smoke frame telemetry) swap-cadence telemetry: records every REAL buffer
      * swap this window performs -- Qt's own automatic swap after paintGL() and the
@@ -246,6 +255,8 @@ private:
      * "already built" check and get bound as if still valid (GPU-TEXNR-S1-DARK-GREEN-1
      * round 2). */
     void cleanupGLResources(void);
+    /* LOOK-FULLSCREEN-PARITY-1: composites the cached look label over the frame just drawn. */
+    void drawLookLabel(int fbw, int fbh);
 
     QOpenGLShaderProgram *m_program;
     // Shared with GpuDisplayViewport (GpuPreviewProcessing.h): the display shader +
@@ -290,6 +301,16 @@ private:
     QString m_rendererDescription;
     // PLAYBACK-VSYNC-DEFAULT-1: wglGetSwapIntervalEXT, looked up in initializeGL().
     QFunctionPointer m_wglGetSwapIntervalExt = nullptr;
+
+    // LOOK-FULLSCREEN-PARITY-1: the corner label (see setLookLabelIfActive). The image and
+    // texture are rebuilt only when the text or the font size (from the framebuffer height) changes.
+    QString m_lookLabelText;
+    QString m_lookLabelImageText;
+    int m_lookLabelImageFontPx = 0;
+    QImage m_lookLabelImage;
+    QOpenGLTexture *m_lookLabelTexture = nullptr;
+    bool m_lookLabelTextureDirty = false;
+    QString m_lookLabelDrawnText;
 
     // Swap telemetry (see resetSwapTelemetry()/swapTelemetrySnapshot()/noteRealSwap()).
     // The session id/active-state live at file scope in the .cpp, not here -- see the

@@ -4728,6 +4728,47 @@ class UnpacedEvidenceTests(unittest.TestCase):
 
 
 @requires_windows_pwsh
+class LookLabelEvidenceTests(unittest.TestCase):
+    """LOOK-FULLSCREEN-PARITY-1: the receipt's lookLabel block is read from the app's own gui_smoke.look_label line; lookLabelShown only when a surface shows the
+    expected, non-empty text."""
+
+    def evidence(self, log: str) -> dict:
+        proc, out = run_pwsh_json("(Get-DvLookLabelEvidence -LogText $env:DVE_LOG) | ConvertTo-Json -Compress", DVE_LOG=log)
+        self.assertIsNotNone(out, proc.stderr)
+        return out
+
+    @staticmethod
+    def line(shown: str, expected: str, surface: str, sif: int = 1) -> str:
+        return f'gui_smoke.look_label shown="{shown}" expected="{expected}" surface={surface} show_in_fullscreen={sif} wait_ms=17'
+
+    def test_fullscreen_and_windowed_labels_are_shown(self) -> None:
+        for surface in ("fullscreen_gpu_window", "fullscreen_cpu_viewport", "windowed_status_bar"):
+            v = self.evidence("gui_smoke.window_placement mode=fullscreen\n" + self.line("Look: Cinematic", "Look: Cinematic", surface) + "\n")
+            self.assertEqual((v["lookLabelShown"], v["shownText"], v["surface"], v["showInFullscreen"], v["waitMs"], v["reason"]),
+                             (True, "Look: Cinematic", surface, True, 17, None), surface)
+
+    def test_not_shown_when_the_surface_drew_nothing_or_the_wrong_text_or_none(self) -> None:
+        for line in (self.line("", "Look: Cinematic", "fullscreen_gpu_window"),
+                     self.line("Look: Off", "Look: Cinematic", "windowed_status_bar"),
+                     self.line("", "Look: Cinematic", "none", sif=0)):
+            v = self.evidence(line + "\n")
+            self.assertFalse(v["lookLabelShown"], line)
+            self.assertTrue(v["reason"], line)
+
+    def test_a_log_without_the_line_is_not_shown_and_the_last_line_wins(self) -> None:
+        v = self.evidence("playback_smoke.summary session=3\n")
+        self.assertEqual((v["lookLabelShown"], v["source"]), (False, "absent from the run log"))
+        v = self.evidence(self.line("", "Look: Classic", "fullscreen_gpu_window") + "\n" + self.line("Look: Classic", "Look: Classic", "fullscreen_gpu_window") + "\n")
+        self.assertTrue(v["lookLabelShown"])
+
+    def test_the_leg_writes_it_next_to_the_display_block(self) -> None:
+        leg = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        self.assertIn("$receipt.lookLabel = Get-DvLookLabelEvidence -LogText $runLogText", leg)
+        app = (ROOT / "platform" / "qt" / "MainWindow.cpp").read_text(encoding="utf-8")
+        self.assertIn('gui_smoke.look_label shown=\\"%1\\" expected=\\"%2\\" surface=%3 show_in_fullscreen=%4 wait_ms=%5', app)
+
+
+@requires_windows_pwsh
 class DisplayMatrixLegSetTests(unittest.TestCase):
     """The standard display matrix: the shipped leg set expands to the twelve cells, interleaved across repeats, every cell is an ordinary committed leg spec, and
     the leg set refuses what would not be one matrix."""

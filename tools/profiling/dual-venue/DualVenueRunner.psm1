@@ -941,6 +941,47 @@ function Get-DvUnpacedEvidence {
     [ordered]@{ requested = $requested; active = $active; dropFrame = $dropFrame; verdict = $verdict; reason = $reason; blocks = ($verdict -ceq 'NOT_HONOURED') }
 }
 
+function Get-DvLookLabelEvidence {
+    <#
+    .SYNOPSIS
+    LOOK-FULLSCREEN-PARITY-1: the receipt's `lookLabel` block -- the "current look" text the app showed on screen, read from its own `gui_smoke.look_label` line
+    (the LAST one in the run log), never from the spec. `shownText` is what the surface actually drew (the fullscreen corner label) or the status-bar label shows
+    (windowed); `expectedText` is what the app derived from the look in force; `surface` is fullscreen_gpu_window / fullscreen_cpu_viewport / windowed_status_bar / none.
+    `lookLabelShown` is true only when the surface is not none and it shows the expected, non-empty text. Informational: it never blocks a leg (a build without the
+    line reports lookLabelShown=false with source 'absent from the run log'). Pure.
+    #>
+    param([AllowNull()][AllowEmptyString()][string]$LogText)
+    $m = $null
+    if (-not [string]::IsNullOrEmpty($LogText)) {
+        foreach ($line in ($LogText -split "`r?`n")) {
+            if ($line -match 'gui_smoke\.look_label shown="(?<shown>[^"]*)" expected="(?<expected>[^"]*)" surface=(?<surface>\S+) show_in_fullscreen=(?<sif>[01]) wait_ms=(?<wait>\d+)') {
+                $m = $Matches.Clone()
+            }
+        }
+    }
+    if ($null -eq $m) {
+        return [ordered]@{ source = 'absent from the run log'; lookLabelShown = $false; shownText = $null; expectedText = $null; surface = $null
+                           showInFullscreen = $null; waitMs = $null; reason = 'the run log has no gui_smoke.look_label line' }
+    }
+    $shown = [string]$m['shown']
+    $expected = [string]$m['expected']
+    $surface = [string]$m['surface']
+    $reason = $null
+    if ($surface -ceq 'none') { $reason = 'no surface showed the look label (fullscreen with the label switched off, or no visible status bar)' }
+    elseif ([string]::IsNullOrEmpty($shown)) { $reason = "the $surface surface drew no look label before the timed play" }
+    elseif ($shown -cne $expected) { $reason = "the $surface surface shows '$shown' but the look in force is '$expected'" }
+    [ordered]@{
+        source = 'gui_smoke.look_label'
+        lookLabelShown = ($null -eq $reason)
+        shownText = $shown
+        expectedText = $expected
+        surface = $surface
+        showInFullscreen = ([int]$m['sif'] -eq 1)
+        waitMs = [int]$m['wait']
+        reason = $reason
+    }
+}
+
 # --- leg sets and the display matrix (DUAL-VENUE-DISPLAY-MATRIX-1) -------------------------------------------------------
 # A LEG SET is a tracked list of committed leg specs that one run executes together. The set does not define legs: every cell is still an ordinary committed leg spec (so every receipt
 # is bound to a committed spec by its sha256, exactly as for a single leg), and the set only says which specs make up the matrix, and in what order a run walks them.
@@ -2172,6 +2213,8 @@ function New-DvReceipt {
         # DUAL-VENUE-DISPLAY-MATRIX-1: the display mode the leg requested, the one the app ran in and the window it presented in (Get-DvDisplayEvidence), next to the scale block.
         # Present on EVERY receipt that names a leg spec (observedMode 'UNKNOWN' until a run log says). A leg that requested a mode the app did not run in is never a PASS/FAIL.
         display = $null
+        # LOOK-FULLSCREEN-PARITY-1: the "current look" label the app showed (Get-DvLookLabelEvidence), next to the display block. Informational, never a gate.
+        lookLabel = $null
         look = $null
         # PLAYBACK-VISUAL-INSPECTION-1: a speed leg's window captures (Read-DvVisualCaptures): requested / opted out, the frames and their hashes,
         # the distinct-picture count, the play-vs-paused difference, the strip, and the gate verdict. Null on a look leg (its contact sheet is the look).
@@ -2224,6 +2267,6 @@ Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-
     ConvertTo-DvLfBytes, Get-DvLegSpecSha256, Get-DvDerivedBackend, Get-DvBackendNotDerivable, Read-DvContactFrames, Get-DvSubjectDigest,
     Get-DvVisualViewportPixels, Get-DvVisualMeanAbsDiff, Get-DvVisualVerdict, New-DvVisualStrip, Read-DvVisualCaptures, Get-DvVisualCaptureRequest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
     Test-DvUnderClaudeState, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvPlaybackProblems,
-    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvHealthVerdict,
+    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLookLabelEvidence, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvHealthVerdict,
     New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout,
     Get-DvResultToken, Resolve-DvJobOutcome, Test-DvCriteria, Get-DvVerbatimMetrics, New-DvReceipt, Write-DvReceipt
