@@ -1683,6 +1683,8 @@ private:
     void runPlaybackRoutePrewarm( quint64 clipGeneration );
     bool m_playbackRoutePrewarmArmed = false;
     quint64 m_playbackRoutePrewarmClipGeneration = 0;
+    // PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-SETUP-1 Row B: this clip's prewarm loaded the recon backend (first_present_split)
+    bool m_playbackReconBackendPreloaded = false;
     void writeFirstPresentIdentity( const QString &dir, int startPosition );
     // --gui-smoke-playback only (CUDA-PERF-PLAYBACK-FOREGROUND-1): forces the main window
     // and the GPU display window to the OS foreground and verifies with

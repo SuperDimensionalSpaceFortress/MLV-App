@@ -131,7 +131,8 @@ SOURCES += \
     $$REPO_ROOT/tests/pipeline/test_debayered16_recon_reuse.cpp \
     $$REPO_ROOT/tests/pipeline/test_debayered16_honour_scale.cpp \
     $$REPO_ROOT/tests/pipeline/test_playback_prep_worker.cpp \
-    $$REPO_ROOT/tests/pipeline/test_gpu_field_telemetry_capture.cpp
+    $$REPO_ROOT/tests/pipeline/test_gpu_field_telemetry_capture.cpp \
+    $$REPO_ROOT/tests/pipeline/test_gpu_playback_recon_preload.cpp
 
 HEADERS += \
     $$REPO_ROOT/platform/qt/Debayered16ReconReusePolicy.h \

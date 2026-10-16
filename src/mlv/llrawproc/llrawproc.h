@@ -270,6 +270,12 @@ size_t llrpGpuPlaybackReconGetLastInputBayer16(uint16_t * output,
 int llrpGpuPlaybackReconGetBackendInfo(llrpGpuPlaybackReconBackendInfo_t * info);
 /* As above, waiting at most wait_ms for the backend lock; 0 if it ran out. */
 int llrpGpuPlaybackReconGetBackendInfoWithin(llrpGpuPlaybackReconBackendInfo_t * info, int wait_ms);
+/* PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-SETUP-1 Row B: load and create the playback recon backend now (while
+ * paused) instead of on the first Play frame's render thread. Exactly the mutex-guarded loader the playback runs
+ * use, with the same prefer_playback_dll=1, so the first run neither releases nor reloads it. Never configures a
+ * clip or LUTs and never runs. 1 when the backend is available; load_ms (may be NULL) receives the call's wall
+ * time. Always 0 in a build without the GPU recon loader. */
+int llrpGpuPlaybackReconPreloadBackend(double * load_ms);
 int llrpGpuPlaybackReconPreuploadFrame(uint64_t frame_id,
                                       const uint16_t * raw_input_bayer14,
                                       size_t raw_image_size);

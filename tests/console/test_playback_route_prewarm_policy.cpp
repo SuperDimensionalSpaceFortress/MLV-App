@@ -163,3 +163,147 @@ TEST(PlaybackRoutePrewarmWiring, ArmedAtClipLoadRunFromAPausedPresentAndKillSwit
     ASSERT_TRUE(lockScopeEnd >= 0);
     ASSERT_TRUE(warm > lockScopeEnd);
 }
+
+// PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-SETUP-1 Row A: the warm keeps its pair as the staged slot (still registered),
+// and the first recon present adopts it before destroyTexture() could reset the caches holding that registration.
+TEST(PlaybackRouteStagedSlotWiring, ThePrewarmKeepsItsWarmedPairAsTheStagedSlotWithoutAReset)
+{
+    const QString window = sourceFile("platform/qt/GpuDisplayWindow.cpp");
+    ASSERT_TRUE(window.contains(QStringLiteral(
+        "playback_env_flag::parse( qgetenv( \"MLVAPP_PLAYBACK_ROUTE_PREWARM_STAGE\" ).constData() ), true );")));
+    const QString prewarm = bodyBetween(window, QStringLiteral("bool GpuDisplayWindow::prewarmPlaybackReconRoute(int texWidth"),
+                                        QStringLiteral("GpuPresentSetupTiming GpuDisplayWindow::lastPresentSetupTimingIfActive()"));
+    ASSERT_FALSE(prewarm.isEmpty());
+    // an earlier staged pair is freed first (after the live-slot skip, before any new allocation)
+    const int keepSlot = prewarm.indexOf(QStringLiteral("skipped=live_slot_warm"));
+    const int freePrevious = prewarm.indexOf(QStringLiteral("releaseStagedReconSlot();"));
+    const int alloc = prewarm.indexOf(QStringLiteral("new QOpenGLTexture("));
+    ASSERT_TRUE(keepSlot >= 0);
+    ASSERT_TRUE(freePrevious > keepSlot);
+    ASSERT_TRUE(alloc > freePrevious);
+    // staged only when the warm succeeded and staging is on
+    ASSERT_TRUE(prewarm.contains(QStringLiteral("const bool staged = amazeOk && playbackRoutePrewarmStageEnabled();")));
+    const int stagedAt = prewarm.indexOf(QStringLiteral("    if ( staged )\n"));
+    const int elseAt = prewarm.indexOf(QStringLiteral("    else\n"), stagedAt);
+    ASSERT_TRUE(stagedAt >= 0);
+    ASSERT_TRUE(elseAt > stagedAt);
+    const QString stagedBranch = prewarm.mid(stagedAt, elseAt - stagedAt);
+    ASSERT_TRUE(stagedBranch.contains(QStringLiteral("m_stagedReconOutput = warmOutput;")));
+    ASSERT_TRUE(stagedBranch.contains(QStringLiteral("m_stagedReconSource = warmInput;")));
+    ASSERT_TRUE(stagedBranch.contains(QStringLiteral("m_stagedReconWidth = texWidth;")));
+    ASSERT_FALSE(stagedBranch.contains(QStringLiteral("ResetR16TextureBackendResources")));
+    ASSERT_FALSE(stagedBranch.contains(QStringLiteral("delete warm")));
+    // the disabled / failed branch is today's code: reset BEFORE the GL textures are freed
+    const int reset = prewarm.indexOf(QStringLiteral("gpuAmazeDebayerResetR16TextureBackendResources();"));
+    const int freeTextures = prewarm.indexOf(QStringLiteral("delete warmOutput;"));
+    ASSERT_TRUE(reset > elseAt);
+    ASSERT_TRUE(freeTextures > reset);
+    ASSERT_TRUE(prewarm.contains(QStringLiteral("staged=%10")));
+}
+
+TEST(PlaybackRouteStagedSlotWiring, TheReallocBranchAdoptsTheStagedPairBeforeDestroyTextureWithNoCudaReset)
+{
+    const QString window = sourceFile("platform/qt/GpuDisplayWindow.cpp");
+    const QString present = bodyBetween(window, QStringLiteral("bool GpuDisplayWindow::setPresentedGpuPlaybackReconAmazePostWbTexture("),
+                                        QStringLiteral("bool GpuDisplayWindow::readGpuReconSourceBayer16Texture("));
+    ASSERT_FALSE(present.isEmpty());
+    const int decideAt = present.indexOf(QStringLiteral("playback_route_staged_slot::decide("));
+    const int destroyAt = present.indexOf(QStringLiteral("destroyTexture();"));
+    ASSERT_TRUE(decideAt >= 0);
+    ASSERT_TRUE(destroyAt > decideAt);
+    // the policy sees the window's own state: is the old texture a recon one, does a recon source exist
+    const QString decideCall = present.mid(decideAt, present.indexOf(QStringLiteral(");"), decideAt) - decideAt);
+    ASSERT_TRUE(decideCall.contains(QStringLiteral("m_textureFromGpuRecon")));
+    ASSERT_TRUE(decideCall.contains(QStringLiteral("m_gpuReconSourceTexture != nullptr")));
+    // Adopt: the old texture deleted with neither CUDA reset, the staged pair moved in, the source left not current
+    const int adoptAt = present.indexOf(QStringLiteral("if ( stagedSlot == playback_route_staged_slot::Decision::Adopt )"));
+    const int adoptEvent = present.indexOf(QStringLiteral("gpuPresentEventNoteTextureRealloc(\"window_recon_slot_adopted\""), adoptAt);
+    ASSERT_TRUE(adoptAt > decideAt);
+    ASSERT_TRUE(adoptAt < destroyAt);
+    ASSERT_TRUE(adoptEvent > adoptAt);
+    const QString adopt = present.mid(adoptAt, adoptEvent - adoptAt);
+    ASSERT_TRUE(adopt.contains(QStringLiteral("delete m_texture;")));
+    ASSERT_TRUE(adopt.contains(QStringLiteral("m_texture = m_stagedReconOutput;")));
+    ASSERT_TRUE(adopt.contains(QStringLiteral("m_gpuReconSourceTexture = m_stagedReconSource;")));
+    ASSERT_TRUE(adopt.contains(QStringLiteral("m_gpuReconSourceTextureCurrent = false;")));
+    ASSERT_FALSE(adopt.contains(QStringLiteral("ResetR16TextureBackendResources")));
+    ASSERT_FALSE(adopt.contains(QStringLiteral("llrpGpuPlaybackReconResetGlTextureResources")));
+    ASSERT_FALSE(adopt.contains(QStringLiteral("destroyTexture();")));
+    // otherwise: a discarded pair is freed, then today's path (destroyTexture + the two realloc events)
+    const int discard = present.indexOf(
+        QStringLiteral("if ( stagedSlot == playback_route_staged_slot::Decision::Discard ) releaseStagedReconSlot();"), adoptEvent);
+    ASSERT_TRUE(discard > adoptEvent);
+    ASSERT_TRUE(destroyAt > discard);
+    ASSERT_TRUE(present.indexOf(QStringLiteral("\"window_rgba16_texture_realloc\""), destroyAt) > destroyAt);
+    ASSERT_TRUE(present.indexOf(QStringLiteral("\"window_r16_texture_realloc\""), destroyAt) > destroyAt);
+    // a failed present still frees whatever slot it holds (an adopted one included), so it is never shown
+    ASSERT_TRUE(present.contains(QStringLiteral("    if ( !ok )\n    {\n        destroyTexture();")));
+}
+
+TEST(PlaybackRouteStagedSlotWiring, TheStagedPairIsFreedResetFirstOnContextCleanupClipChangeAndRearm)
+{
+    const QString window = sourceFile("platform/qt/GpuDisplayWindow.cpp");
+    const QString release = bodyBetween(window, QStringLiteral("void GpuDisplayWindow::releaseStagedReconSlot()"),
+                                        QStringLiteral("void GpuDisplayWindow::cleanupGLResources()"));
+    ASSERT_FALSE(release.isEmpty());
+    const int amazeReset = release.indexOf(QStringLiteral("gpuAmazeDebayerResetR16TextureBackendResources();"));
+    const int reconReset = release.indexOf(QStringLiteral("llrpGpuPlaybackReconResetGlTextureResources();"));
+    const int freeOutput = release.indexOf(QStringLiteral("delete m_stagedReconOutput;"));
+    const int freeSource = release.indexOf(QStringLiteral("delete m_stagedReconSource;"));
+    ASSERT_TRUE(amazeReset >= 0);
+    ASSERT_TRUE(reconReset >= 0);
+    ASSERT_TRUE(freeOutput > amazeReset);
+    ASSERT_TRUE(freeOutput > reconReset);
+    ASSERT_TRUE(freeSource > amazeReset);
+    ASSERT_TRUE(freeSource > reconReset);
+    const QString cleanup = bodyBetween(window, QStringLiteral("void GpuDisplayWindow::cleanupGLResources()"),
+                                        QStringLiteral("void GpuDisplayWindow::applySamplingMode("));
+    ASSERT_FALSE(cleanup.isEmpty());
+    ASSERT_TRUE(cleanup.contains(QStringLiteral("releaseStagedReconSlot();")));
+    // the GUI-thread entry MainWindow uses
+    const QString ifActive = bodyBetween(window, QStringLiteral("void GpuDisplayWindow::releaseStagedPlaybackReconSlotIfActive()"),
+                                         QStringLiteral("bool GpuDisplayWindow::prewarmPlaybackReconRoute(int texWidth"));
+    ASSERT_TRUE(ifActive.contains(QStringLiteral("QThread::currentThread() != win->thread()")));
+    ASSERT_TRUE(ifActive.contains(QStringLiteral("win->releaseStagedReconSlot();")));
+
+    const QString source = sourceFile("platform/qt/MainWindow.cpp");
+    const QString arm = bodyBetween(source, QStringLiteral("void MainWindow::armPlaybackRoutePrewarm()"),
+                                    QStringLiteral("QImage MainWindow::grabIdentityViewport("));
+    ASSERT_TRUE(arm.contains(QStringLiteral("GpuDisplayWindow::releaseStagedPlaybackReconSlotIfActive();")));
+    const QString clipChange = bodyBetween(source, QStringLiteral("void MainWindow::clearPresentationForClipOpen( const char *reason )"),
+                                           QStringLiteral("invalidateDisplayPreviewCache();"));
+    ASSERT_TRUE(clipChange.contains(QStringLiteral("GpuDisplayWindow::releaseStagedPlaybackReconSlotIfActive();")));
+}
+
+// Row B: the recon backend's DLL load + create, paid while paused through the guarded loader.
+TEST(PlaybackReconBackendPreloadWiring, RunCallsThePreloadAfterTheRunDecisionAndTheWindowWarmUnderItsKillSwitch)
+{
+    const QString source = sourceFile("platform/qt/MainWindow.cpp");
+    ASSERT_TRUE(source.contains(QStringLiteral(
+        "static const bool disabled = !playbackEnvSwitch( \"MLVAPP_PLAYBACK_RECON_BACKEND_PRELOAD\", true );")));
+    const QString run = bodyBetween(source, QStringLiteral("void MainWindow::runPlaybackRoutePrewarm( quint64 clipGeneration )"),
+                                    QStringLiteral("void MainWindow::armPlaybackRoutePrewarm()"));
+    ASSERT_FALSE(run.isEmpty());
+    const int notRun = run.indexOf(QStringLiteral("if( decision != playback_route_prewarm::Decision::Run )"));
+    const int warmAt = run.indexOf(QStringLiteral("GpuDisplayWindow::prewarmPlaybackReconRouteIfActive("));
+    const int gate = run.indexOf(QStringLiteral(
+        "const bool backendPreload = !mlvappPlaybackReconBackendPreloadDisabled() && playback_recon_requested_by_environment();"));
+    const int preload = run.indexOf(QStringLiteral(
+        "if( backendPreload ) backendPreloadOk = llrpGpuPlaybackReconPreloadBackend( &backendPreloadMs );"));
+    ASSERT_TRUE(notRun >= 0);
+    ASSERT_TRUE(warmAt > notRun);
+    ASSERT_TRUE(gate > warmAt);
+    ASSERT_TRUE(preload > gate);
+    ASSERT_TRUE(run.contains(QStringLiteral(" backend_preload_ok=%1 backend_preload_ms=%2")));
+    // the loader only: never a clip/LUT configuration or a run from the preload
+    const QString llrawproc = sourceFile("src/mlv/llrawproc/llrawproc.c");
+    const int first = llrawproc.indexOf(QStringLiteral("int llrpGpuPlaybackReconPreloadBackend(double * load_ms)\n{"));
+    ASSERT_TRUE(first >= 0);
+    const QString body = llrawproc.mid(first, llrawproc.indexOf(QStringLiteral("\n}\n"), first) - first);
+    ASSERT_TRUE(body.contains(QStringLiteral("llrawproc_gpu_recon_backend_available_guarded(1)")));
+    ASSERT_FALSE(body.contains(QStringLiteral("set_clip")));
+    ASSERT_FALSE(body.contains(QStringLiteral("set_luts")));
+    ASSERT_FALSE(body.contains(QStringLiteral("run(")));
+    // and the non-GPU build has the matching stub
+    ASSERT_TRUE(llrawproc.indexOf(QStringLiteral("int llrpGpuPlaybackReconPreloadBackend(double * load_ms)\n{"), first + 1) > first);
+}
