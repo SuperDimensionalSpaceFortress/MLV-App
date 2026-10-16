@@ -17,11 +17,13 @@ Rules (every one fails closed; "cannot find it" is a failure, never a pass):
   within that row must equal the header's N. A lagging row is reported by name and line number with
   both values, so one row that names the current profile can never mask another that lags.
 - ``code@rN`` must sit on a word boundary at BOTH edges. On the left, ``xcode@r12`` and ``barcode@r3`` are
-  not profiles. On the right, a row token may not run on into a word character, ``.`` or ``-``:
-  ``code@r11beta``, ``code@r11.5`` and ``code@r11-rc`` are not profiles either (CoS #451 comment
-  6216180890). A bare ``code@r11.`` at the end of a sentence is therefore not read; wrap the token in
-  backticks or end the sentence after a space. The header token already needs its closing backtick
-  right after the digits, so it rejects the same suffixes.
+  not profiles. On the right the check is a fail-closed ALLOWLIST (CoS #451 comment 6216180890, then PR #467):
+  a row token counts only when the digits are followed by the end of the row, whitespace, or one of
+  `` ` ) , ; | ``, or by a period that itself ends the sentence (end of row or whitespace after it).
+  ``code@r11beta``, ``code@r11.5``, ``code@r11-rc``, ``code@r11+``, ``code@r11~1``, ``code@r11/x``,
+  ``code@r11#a`` and ``code@r11`` followed by an en dash are therefore not profiles, and neither is anything
+  else the allowlist does not name. A sentence-final ``code@r11.`` IS read. The header token already needs
+  its closing backtick right after the digits, so it rejects the same suffixes.
 
 Prevention rule (adopted repo-local, from the r1 -> r2 CoS review of PR #451): an agreement guard
 that reads more than one source row carries one RED fixture per row where THAT row alone lags, plus
@@ -61,7 +63,12 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 MAP_FILE = "agents/factory-kernel-instance.md"
 
 _HEADER_PROFILE = re.compile(r"Profile:\s*`(code@r(\d+))`\s+primary")
-_ROW_PROFILE = re.compile(r"(?<![\w-])code@r(\d+)(?![\w.-])")
+# Right edge is an ALLOWLIST (CoS PR #467): the digits must be followed by the end of the row, whitespace, one of
+# the closing delimiters ` ) , ; |, or a period that itself ends the sentence (end of row or whitespace after it).
+# Live map (agents/factory-kernel-instance.md) follows its tokens with a backtick or a space only; ) , ; | are kept
+# because rows legitimately wrap a token in parentheses or list it in prose. Anything else (+ ~ / # : ' an en dash,
+# letters, digits, - or a period that continues) does NOT end the token, so the row names no profile.
+_ROW_PROFILE = re.compile(r"(?<![\w-])code@r(\d+)(?=$|[\s`),;|]|\.(?:$|\s))")
 _CUTOVER_ROW = re.compile(r"^[*_`\s]*(K[35])(?![0-9A-Za-z])")
 _REQUIRED_ROWS = ("K3", "K5")
 
@@ -340,6 +347,9 @@ class RightBoundaryTests(unittest.TestCase):
     """CoS #451 comment 6216180890: ``code@r11beta`` is not the profile token ``code@r11``."""
 
     SUFFIXES = ("beta", ".5", "-rc")
+    # What the r1 denylist ``(?![\w.-])`` still read as a bare r11 (CoS probe on PR #467): the plus, tilde,
+    # slash, hash and en dash each continue the token, and ``..`` is not a sentence end.
+    UNLISTED_DELIMITERS = ("+", "~1", "/x", "#a", "–rc", "..", ".x", ":", "'")
 
     def test_red_row_whose_only_profile_has_a_suffix_names_no_profile(self) -> None:
         for suffix in self.SUFFIXES:
@@ -366,8 +376,28 @@ class RightBoundaryTests(unittest.TestCase):
         self.assertIn("K5 row at line 9 names no", problems[0])
 
     def test_red_embedded_left_and_suffixed_right_still_names_no_profile(self) -> None:
-        k5 = K5_ROW.replace("`profile: code@r11 kernel r5`", "`profile: xcode@r11 kernel r5`")
-        self.assertIn("K5 row at line 9 names no", check_agreement(HEADER_R11 + K3_ROW + k5)[0][0])
+        for suffix in self.SUFFIXES + self.UNLISTED_DELIMITERS:
+            with self.subTest(suffix=suffix):
+                k5 = K5_ROW.replace("`profile: code@r11 kernel r5`", f"`profile: xcode@r11{suffix} kernel r5`")
+                self.assertIn("K5 row at line 9 names no", check_agreement(HEADER_R11 + K3_ROW + k5)[0][0])
+
+    def test_red_right_edge_only_suffix_names_no_profile(self) -> None:
+        """No left-edge noise at all: the suffix alone must void the token (CoS nit on the :368 left-only test)."""
+        for suffix in ("beta",) + self.UNLISTED_DELIMITERS:
+            with self.subTest(suffix=suffix):
+                k5 = K5_ROW.replace("`profile: code@r11 kernel r5`", f"`profile: code@r11{suffix} kernel r5`")
+                problems, summary = check_agreement(HEADER_R11 + K3_ROW + k5)
+                self.assertEqual(summary, "NOT_FOUND")
+                self.assertIn("K5 row at line 9 names no", problems[0])
+
+    def test_red_unlisted_delimiter_row_token_does_not_agree_with_the_same_header_revision(self) -> None:
+        """A denylist reads code@r11+ as r11; the allowlist must not, so the row is never counted as agreeing."""
+        for suffix in self.UNLISTED_DELIMITERS:
+            with self.subTest(suffix=suffix):
+                k3 = K3_ROW.replace("(code@r11 K3 default)", f"(code@r11{suffix} K3 default)")
+                problems, summary = check_agreement(HEADER_R11 + k3 + K5_ROW)
+                self.assertEqual(summary, "NOT_FOUND")
+                self.assertIn("K3 row at line 8 names no", problems[0])
 
     def test_green_suffixed_noise_beside_a_real_token_does_not_count(self) -> None:
         for suffix in self.SUFFIXES:
@@ -383,11 +413,25 @@ class RightBoundaryTests(unittest.TestCase):
                 self.assertEqual(problems, [])
                 self.assertIn("K5 row code@r11", summary)
 
-    def test_red_bare_trailing_period_is_not_read_fails_closed(self) -> None:
-        k5 = K5_ROW.replace("`profile: code@r11 kernel r5`", "now code@r11.")
-        problems, summary = check_agreement(HEADER_R11 + K3_ROW + k5)
-        self.assertEqual(summary, "NOT_FOUND")
-        self.assertIn("K5 row at line 9 names no", problems[0])
+    def test_green_sentence_ending_period_counts(self) -> None:
+        """A period counts only when it ends the sentence: whitespace or the end of the row follows it."""
+        for tail in (". |", ".  next |", ". Next sentence |"):
+            with self.subTest(tail=tail):
+                k5 = f"| K5 declared profile | gate | now code@r11{tail}\n"
+                problems, summary = check_agreement(HEADER_R11 + K3_ROW + k5)
+                self.assertEqual(problems, [])
+                self.assertIn("K5 row code@r11", summary)
+
+    def test_green_period_at_the_very_end_of_the_row_counts(self) -> None:
+        self.assertEqual(check_agreement(HEADER_R11 + K3_ROW + "| K5 declared profile | gate | now code@r11.")[0], [])
+
+    def test_red_period_followed_by_text_is_not_a_sentence_end(self) -> None:
+        for tail in (".5", ".x", "..", ".-", ".|", ".`"):
+            with self.subTest(tail=tail):
+                k5 = f"| K5 declared profile | gate | now code@r11{tail} | open |\n"
+                problems, summary = check_agreement(HEADER_R11 + K3_ROW + k5)
+                self.assertEqual(summary, "NOT_FOUND")
+                self.assertIn("K5 row at line 9 names no", problems[0])
 
     def test_red_header_token_with_a_suffix_is_not_a_primary_profile(self) -> None:
         for suffix in self.SUFFIXES:
