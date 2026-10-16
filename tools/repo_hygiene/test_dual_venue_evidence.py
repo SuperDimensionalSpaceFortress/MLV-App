@@ -27,6 +27,7 @@ Windows-only: the job generator and runner are PowerShell-on-Windows tools (the 
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import io
 import json
@@ -4323,6 +4324,16 @@ class PlaybackScaleIsRequestedAndEffectiveTests(EvidenceFactory, ModuleMutationM
         self.assertIn("requested scale 4", receipt["outcomeDetail"])
         self.assertIn("rendered at 1", receipt["outcomeDetail"])
 
+    def test_the_outcome_detail_names_the_resolution_next_to_each_scale_number(self) -> None:
+        """SCALE-LABEL-CLARITY-1: "scale 4" / "rendered at 1" read backwards; the number stays (asserted above) and the words follow it."""
+        _, receipt, _ = self.leg("cuda", 4, line={"scale_request_last": 1, "scale_active_last": 1}, accepted={"cuda": 1})
+        detail = receipt["outcomeDetail"]
+        self.assertIn("requested scale 4 [Quarter res (0.25x)]", detail)
+        self.assertIn("rendered at 1 [Full res (1x)]", detail)
+        self.assertIn("renders at 1 [Full res (1x)]", detail)
+        _, receipt, _ = self.leg("cuda", 2, line={"scale_request_last": 1, "scale_active_last": 1})
+        self.assertIn("requested scale 2 [Half res (0.5x)]", receipt["outcomeDetail"])
+
     def test_a_declaration_does_not_excuse_a_run_that_rendered_at_neither_the_request_nor_the_declared_scale(self) -> None:
         # the declaration is a claim about the route; if the route changes (cuda now renders 4) the spec is stale and the leg stops passing until it is edited
         _, receipt, _ = self.leg("cuda", 4, line={"scale_request_last": 4, "scale_active_last": 4}, accepted={"cuda": 1})
@@ -4627,6 +4638,48 @@ def run_pwsh_json(script: str, **env: str):
 
 
 @requires_windows_pwsh
+class ScaleLabelMirrorTests(unittest.TestCase):
+    """SCALE-LABEL-CLARITY-1 r2: Get-DvScaleLabel (PowerShell) and scale_label (make-contact-sheet.py) mirror PlaybackScaleLabel::resolutionLabel; the C++ header is the one
+    mapping, so a reworded label there fails here instead of drifting silently into receipts and sheet headers."""
+
+    HEADER = ROOT / "platform" / "qt" / "PlaybackScaleLabel.h"
+
+    def header_labels(self) -> dict:
+        body = self.HEADER.read_text(encoding="utf-8").split("static QString resolutionLabel", 1)[1].split("static QString shortLabel", 1)[0]
+        labels = {int(n): text for n, text in re.findall(r'case (\d+):\s*return QCoreApplication::translate\(\s*"PlaybackScaleLabel",\s*"([^"]+)"\s*\)', body)}
+        self.assertEqual(sorted(labels), [1, 2, 4], "the header maps exactly the three presets by name")
+        custom = re.search(r'default:\s*return QCoreApplication::translate\(\s*"PlaybackScaleLabel",\s*"([^"]+)"', body)
+        self.assertIsNotNone(custom)
+        labels[0] = custom.group(1)   # the template for any other factor, %1 = N
+        return labels
+
+    def test_the_powershell_mirror_equals_the_cpp_header(self) -> None:
+        want = self.header_labels()
+        proc, out = run_pwsh_json("(@(1, 2, 4, 8, 3) | ForEach-Object { [pscustomobject]@{ n = $_; label = (Get-DvScaleLabel -Factor $_) } }) | ConvertTo-Json -Compress")
+        self.assertIsNotNone(out, proc.stderr)
+        got = {row["n"]: row["label"] for row in out}
+        for n in (1, 2, 4):
+            self.assertEqual(got[n], want[n])
+        for n in (3, 8):
+            self.assertEqual(got[n], want[0].replace("%1", str(n)))
+
+    def test_the_contact_sheet_mirror_equals_the_cpp_header(self) -> None:
+        want = self.header_labels()
+        # The hosted Repo Hygiene runner has no numpy and make-contact-sheet.py imports it at module level, so the module is never executed: only the
+        # scale_label function is lifted out of the parsed source and run on its own (it uses builtins only).
+        source = (ROOT / "tools" / "profiling" / "make-contact-sheet.py").read_text(encoding="utf-8")
+        funcs = [node for node in ast.parse(source).body if isinstance(node, ast.FunctionDef) and node.name == "scale_label"]
+        self.assertEqual(len(funcs), 1, "make-contact-sheet.py defines exactly one top-level scale_label")
+        namespace: dict = {}
+        exec(compile(ast.Module(body=funcs, type_ignores=[]), "make-contact-sheet.py:scale_label", "exec"), namespace)
+        scale_label = namespace["scale_label"]
+        for n in (1, 2, 4):
+            self.assertEqual(scale_label(str(n)), want[n])
+        for n in (3, 8):
+            self.assertEqual(scale_label(str(n)), want[0].replace("%1", str(n)))
+
+
+@requires_windows_pwsh
 class UnpacedEvidenceTests(unittest.TestCase):
     """CUDA-HEADROOM-1, FAIL CLOSED: an unpaced leg counts only when the app's own pace_unpaced line for the MEASURED session says active=1 drop_frame=0."""
 
@@ -4811,6 +4864,7 @@ class DisplayMatrixLegSetTests(unittest.TestCase):
         self.assertIn("DVE_LEGSET=display-matrix CARD=DUAL-VENUE-DISPLAY-MATRIX-1 CLIP=M16-1243 CELLS=12 REPEATS=2 LEGS=24", proc.stdout)
         self.assertIn("DVE_PLAN 1/24 repeat=1 cell=cuda-fullscreen-s1 leg=m16-1243-display-fullscreen-s1 backend=cuda display=fullscreen scale=1", proc.stdout)
         self.assertIn("DVE_PLAN 2/24 repeat=1 cell=cuda-windowed-s1 leg=m16-1243-display-windowed-s1 backend=cuda display=windowed scale=1", proc.stdout)
+        self.assertIn("display=windowed scale=1 resolution=Full res (1x)", proc.stdout, "SCALE-LABEL-CLARITY-1: the plan line says the resolution beside the factor")
         self.assertNotIn("DVE_RECEIPT_PATH", proc.stdout, "a plan runs nothing: no leg, so no receipt")
 
     def test_a_leg_set_that_runs_needs_a_venue_a_commit_and_a_build(self) -> None:
@@ -4854,10 +4908,28 @@ class DisplayMatrixLegSetTests(unittest.TestCase):
         self.assertIn("render_work ms", lines[0])
         self.assertIn("dual-ISO ms", lines[0])
         windowed = lines[2]
-        self.assertTrue(windowed.startswith("| cuda-windowed-s2 | cuda | windowed / windowed | 2->1 | 2560x1529 (2380x1373) | 3/3 | 12.00 (11.80-12.10) | 19.40 | 28.5 | 25.0 | PASS x3 |"), windowed)
+        self.assertTrue(windowed.startswith("| cuda-windowed-s2 | cuda | windowed / windowed | Half res (0.5x)->Full res (1x) | 2560x1529 (2380x1373) | 3/3 | 12.00 (11.80-12.10) | 19.40 | 28.5 | 25.0 | PASS x3 |"), windowed)
         cpu = lines[3]
         self.assertIn("| 1/2 | 4.00 (4.00-4.00) |", cpu, "one measurement of two runs; the INVALID repeat is counted in 'ran' and shows no numbers")
         self.assertTrue(cpu.endswith("INVALID x1, PASS x1 |"), cpu)
+
+    def test_the_scale_column_reads_as_resolution_labels_never_bare_factors(self) -> None:
+        """SCALE-LABEL-CLARITY-1 r2: requested -> effective renders through the same mapping as the plan line and outcomeDetail (Get-DvScaleLabel); the
+        internal receipt fields stay numeric. An unread effective scale ('UNKNOWN') says so; an off-preset factor is 'Custom res (1/N)'."""
+        cells = [{"cellId": "cuda-windowed-s2", "backend": "cuda", "displayMode": "windowed", "scaleFactor": 2},
+                 {"cellId": "cpu-windowed-s4", "backend": "cpu", "displayMode": "windowed", "scaleFactor": 4},
+                 {"cellId": "cpu-windowed-s8", "backend": "cpu", "displayMode": "windowed", "scaleFactor": 8},
+                 {"cellId": "cpu-windowed-s1", "backend": "cpu", "displayMode": "windowed", "scaleFactor": 1}]
+        rows = [self.row("cuda-windowed-s2", effectiveScale=2), self.row("cpu-windowed-s4", effectiveScale=1),
+                self.row("cpu-windowed-s8", effectiveScale=8),
+                self.row("cpu-windowed-s1", outcome="INVALID", fps=None, presentedFps=None, effectiveScale="UNKNOWN")]
+        lines = self.table(rows, cells).splitlines()
+        self.assertIn("| Half res (0.5x)->Half res (0.5x) |", lines[2])
+        self.assertIn("| Quarter res (0.25x)->Full res (1x) |", lines[3])
+        self.assertIn("| Custom res (1/8)->Custom res (1/8) |", lines[4])
+        self.assertIn("| Full res (1x)->unknown res |", lines[5])
+        for line in lines[2:]:
+            self.assertNotRegex(line, r"\| \d->\S+ \|", "a bare factor in the scale column is the confusing form this card replaces")
 
     def test_a_cell_with_no_measurement_shows_dashes_and_its_outcome(self) -> None:
         cells = [{"cellId": "cpu-windowed-s1", "backend": "cpu", "displayMode": "windowed", "scaleFactor": 1}]
@@ -4939,8 +5011,8 @@ class DisplayMatrixRunTests(EvidenceFactory, unittest.TestCase):
         summary = re.search(r"DVE_MATRIX_SUMMARY=(.+)", proc.stdout).group(1).strip()
         text = Path(summary).read_text(encoding="utf-8")
         self.assertEqual(len([l for l in text.splitlines() if l.startswith("| cuda-")]), 6)
-        self.assertIn("| cuda-windowed-s1 | cuda | windowed / windowed | 1->1 | 2560x1529 (2380x1373) | 2/2 | 12.60 (12.60-12.60) | 19.40 | 28.5 | 25.5 | PASS x2 |", text)
-        self.assertIn("| cuda-fullscreen-s4 | cuda | fullscreen / fullscreen | 4->4 | 2560x1600 (2560x1600) | 2/2 | 12.40 (12.40-12.40) | 19.40 | 28.5 |", text)
+        self.assertIn("| cuda-windowed-s1 | cuda | windowed / windowed | Full res (1x)->Full res (1x) | 2560x1529 (2380x1373) | 2/2 | 12.60 (12.60-12.60) | 19.40 | 28.5 | 25.5 | PASS x2 |", text)
+        self.assertIn("| cuda-fullscreen-s4 | cuda | fullscreen / fullscreen | Quarter res (0.25x)->Quarter res (0.25x) | 2560x1600 (2560x1600) | 2/2 | 12.40 (12.40-12.40) | 19.40 | 28.5 |", text)
         bad_row = next(l for l in text.splitlines() if l.startswith(f"| {bad_cell} "))
         self.assertIn("| windowed / fullscreen |", bad_row)
         self.assertIn("| 0/2 | - | - | - | - | INVALID x2 |", bad_row)
