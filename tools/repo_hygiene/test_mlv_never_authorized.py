@@ -9154,6 +9154,24 @@ class Na2AssignmentIsNotADeleteTests(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertNotIn("delete", self._acts(cmd))
 
+    def test_cmd_delete_shape_selects_the_strict_reading_whatever_the_launcher(self):
+        # r8 (CoS 6223902133): launchers the r7 list does not name (Rscript, julia, wsl with a split "c''md") still reach
+        # cmd.exe. The DELETE SHAPE decides now: `rd=` followed by whitespace, the end, or a one-letter switch.
+        for cmd in ("Rscript -e \"shell('echo x & rd= /s /q C:/review/board/.claude-state/fleet-runs/lane-A-r1')\"",
+                    "Rscript -e \"shell('echo x & del= /q C:/review/board/.claude-state/fleet-runs/lane-A-r1/x.txt')\"",
+                    "julia -e 'run(`$(\"c\"*\"md\") /c rd= /s /q C:/x`)'",
+                    "wsl.exe -e sh -c 'c''md.exe /c rd= /s /q C:/x'",
+                    "anylauncher 'echo & rd=/s /q C:/x'", "anylauncher 'echo & rmdir=/q C:/x'", "x & rd="):
+            with self.subTest(cmd=cmd):
+                self.assertIn("delete", self._acts(cmd))
+
+    def test_incident_assignment_shapes_never_match_the_delete_shape(self):
+        # r8: the incident shape always carries a value; a Git Bash path after `=` (`/c/x/...`) is not a switch.
+        for cmd in ('RD="/c/x/lane-A-r1"; cat "$RD/a.json"', 'RD=/c/x/lane-B-r1; ls "$RD"', "RD='C:/x/lane-C-r1'; ls \"$RD\"",
+                    'RM=/tmp/x; echo "$RM"', 'RD=/c; ls "$RD"/x', 'DEL=1; echo $DEL'):
+            with self.subTest(cmd=cmd):
+                self.assertNotIn("delete", self._acts(cmd))
+
     def test_assignment_without_any_cmd_mention_is_still_not_a_delete(self):
         # The exemption still holds when nothing in the text names cmd.exe.
         for cmd in ('RD="/c/x/lane-A-r1"; cat "$RD/a.json"', 'DEL=1; echo $DEL; ls /c/commands'):
@@ -9170,6 +9188,46 @@ class Na2AssignmentIsNotADeleteTests(unittest.TestCase):
                     'echo a; rd /s x', 'Remove-Item -Recurse C:\\x', 'git rm x'):
             with self.subTest(cmd=cmd):
                 self.assertIn("delete", self._acts(cmd))
+
+
+class Na2ImplicitLauncherEndToEndDenyTests(unittest.TestCase):
+    """r8 (Dot advisory abb6d537, carried by the CoS): every implicit-launcher delete row must DENY through the real hook
+    CLI (exit 2, NA-2), not only through shell_acts. The protected target is a run dir under a synthetic board root."""
+
+    BOARD = "C:/review/board"
+    TARGET = BOARD + "/.claude-state/fleet-runs/lane-A-r1"
+
+    def _rc(self, command):
+        env = {k: v for k, v in os.environ.items() if not k.startswith("MLV_")}
+        env.pop("CLAUDE_PROJECT_DIR", None)
+        env["MLV_BOARD_ROOT"] = self.BOARD
+        env["PYTHONIOENCODING"] = "utf-8"
+        payload = json.dumps({"tool_name": "PowerShell", "tool_input": {"command": command}})
+        p = subprocess.run([sys.executable, HOOK, "--project-dir", "C:/review/worktree"], input=payload,
+                           capture_output=True, text=True, encoding="utf-8", env=env, timeout=120)
+        return p.returncode, p.stderr
+
+    def test_each_implicit_launcher_delete_is_denied_end_to_end(self):
+        t = self.TARGET
+        for cmd in (f"cmd /c rd= /s /q {t}",
+                    f"python -c \"from os import system; system('echo x & rd= /s /q {t}')\"",
+                    f"python -c \"import subprocess; subprocess.run('echo x & rd= /s /q {t}', shell=True)\"",
+                    f"node -e \"require('child_process').execSync('echo x & rd= /s /q {t}')\"",
+                    f"perl -e \"system('echo & rd= /s /q {t}')\"",
+                    f"Rscript -e \"shell('echo x & rd= /s /q {t}')\"",
+                    f"wsl.exe -e sh -c 'c''md.exe /c rd= /s /q {t}'",
+                    f"anylauncher 'echo & rd=/s /q {t}'"):
+            with self.subTest(cmd=cmd):
+                rc, err = self._rc(cmd)
+                self.assertEqual(rc, 2, err)
+                self.assertIn("NA-2", err)
+
+    def test_incident_shapes_are_allowed_end_to_end(self):
+        t = self.TARGET
+        for cmd in (f'RD="{t}"; cat "$RD/sonnet-001.receipt.json"', f'RD={t}; ls "$RD"/*.py'):
+            with self.subTest(cmd=cmd):
+                rc, err = self._rc(cmd)
+                self.assertEqual(rc, 0, err)
 
 
 if __name__ == "__main__":

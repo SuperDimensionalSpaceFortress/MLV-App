@@ -1278,6 +1278,11 @@ _CMD_SEGMENT_RX = re.compile(
     r"|\bwin32_process\b|\binvoke-cimmethod\b|\binvoke-wmimethod\b|\bwmic\b|\bschtasks\b|\bregister-scheduledtask\b"
     r"|\b[cw]script\b|\bmshta\b|\brundll32\b|\bforfiles\b|\bstart\s+(?:\"|/)",
     re.I)
+# r8 (CoS 6223902133): detect the cmd.exe delete SHAPE, not the launcher. `rd=` followed by whitespace or the end of the
+# text, or by a one-letter switch (`rd=/s /q x`), is cmd.exe's `=` delimiter. The incident shape always carries a value
+# (`RD="..."`, `RD=/c/x/lane`), so it never matches. Rscript, julia and `wsl ... c''md` reached cmd.exe past the r7 list;
+# the launcher list stays as defence in depth.
+_CMD_DELETE_SHAPE_RX = re.compile(r"(?:^|[\s;&|`(\"'])(?:rm|del|rd|rmdir)=(?:\s|$|/[a-z](?:\s|$))", re.I)
 _MOVE_RX = re.compile(
     r"(?:^|[\s;&|`(])(?:mv|move)\b"
     r"|\bmove-item\b"
@@ -1360,7 +1365,7 @@ def shell_acts(command):
     """
     scan = _GIT_RM_CACHED_RX.sub(" gitrmcached ", command or "")
     acts = set()
-    delete_rx = _DELETE_RX_STRICT if _CMD_SEGMENT_RX.search(scan) else _DELETE_RX
+    delete_rx = _DELETE_RX_STRICT if (_CMD_SEGMENT_RX.search(scan) or _CMD_DELETE_SHAPE_RX.search(scan)) else _DELETE_RX
     if delete_rx.search(scan):
         acts.add("delete")
     if _MOVE_RX.search(scan):
