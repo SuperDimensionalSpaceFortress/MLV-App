@@ -15,6 +15,7 @@
 #include "../../platform/qt/PlaybackNativePaceGuard.h"
 
 #include <QFile>
+#include <QRegularExpression>
 #include <QString>
 #include <QTextStream>
 
@@ -768,6 +769,26 @@ TEST(PlaybackStartupCatchup, SkippedFramesCountsOnlyTheFramesJumpedPast)
     ASSERT_EQ(1, playback_native_pace::skippedFrames(2.97, 4.6));
 }
 
+// ---- CUDA-HEADROOM-1: MLVAPP_PLAYBACK_UNPACED hands the guard a pace of 0 (automation only) ----------------
+
+TEST(PlaybackUnpaced, GuardPaceFpsIsThePaceUnlessUnpaced)
+{
+    ASSERT_NEAR(23.976, playback_native_pace::guardPaceFps(23.976, false), 1e-12);
+    ASSERT_NEAR(0.0, playback_native_pace::guardPaceFps(23.976, true), 1e-12);
+}
+
+TEST(PlaybackUnpaced, AnUnpacedGuardGrantsEveryWholeFrameAtOneInstant)
+{
+    NativePaceGuard unpaced;
+    unpaced.reset();
+    for (int i = 0; i < 50; ++i)
+        ASSERT_TRUE(unpaced.grantWholeFrame(1000.0, playback_native_pace::guardPaceFps(kNativeFps, true)));
+    NativePaceGuard paced;
+    paced.reset();
+    ASSERT_TRUE(paced.grantWholeFrame(1000.0, playback_native_pace::guardPaceFps(kNativeFps, false)));
+    ASSERT_FALSE(paced.grantWholeFrame(1000.0, playback_native_pace::guardPaceFps(kNativeFps, false)));
+}
+
 // ---- wiring: MainWindow.cpp needs a full GUI build, so its source is read as text --------------------------
 
 namespace
@@ -801,14 +822,14 @@ TEST(PlaybackNativePaceWiring, EveryEngineAdvanceGoesThroughThePaceGuard)
     ASSERT_FALSE(handling.isEmpty());
     // every-frame mode holds unless a whole frame is owed, BEFORE it moves the slider
     const int whole = handling.indexOf(QStringLiteral(
-        "if( !m_playbackPaceGuard.grantWholeFrame( paceNowMs, getFramerate() ) ) return;"));
+        "if( !m_playbackPaceGuard.grantWholeFrame( paceNowMs, playbackPaceGuardFps() ) ) return;"));
     const int normalAdvance = handling.indexOf(QStringLiteral(
         "ui->horizontalSliderPosition->setValue( ui->horizontalSliderPosition->value() + 1 );"));
     ASSERT_TRUE(whole >= 0);
     ASSERT_TRUE(normalAdvance > whole);
     // the loop wrap to cut-in (either mode) spends a whole frame BEFORE it is counted or moves the slider
     const int wrapGate = handling.indexOf(QStringLiteral(
-        "if( !m_playbackPaceGuard.grantLoopWrap( paceNowMs, getFramerate() ) ) return;"));
+        "if( !m_playbackPaceGuard.grantLoopWrap( paceNowMs, playbackPaceGuardFps() ) ) return;"));
     const int wrapCounted = handling.indexOf(QStringLiteral("m_playbackWrapRecorder.noteEngineWrap();"));
     const int wrapMove = handling.indexOf(QStringLiteral("ui->horizontalSliderPosition->setValue( cutInFrame );"));
     const int loopBranch = handling.indexOf(QStringLiteral("if( ui->actionLoop->isChecked() )"));
@@ -819,7 +840,7 @@ TEST(PlaybackNativePaceWiring, EveryEngineAdvanceGoesThroughThePaceGuard)
     ASSERT_TRUE(handling.indexOf(QStringLiteral("const double paceNowMs = mlv_stage_timing_now() * 1000.0;")) < wrapGate);
     // drop-frame mode advances by the GRANTED share, never the raw fps x timeDiff
     ASSERT_TRUE(handling.contains(QStringLiteral(
-        "m_playbackPaceGuard.grant( getFramerate() * (double)timeDiff / 1000.0, paceNowMs, getFramerate() ),")));
+        "m_playbackPaceGuard.grant( getFramerate() * (double)timeDiff / 1000.0, paceNowMs, playbackPaceGuardFps() ),")));
     ASSERT_FALSE(handling.contains(QStringLiteral("m_newPosDropMode, getFramerate() * (double)timeDiff / 1000.0,")));
     ASSERT_TRUE(handling.contains(QStringLiteral("const double paceNowMs = mlv_stage_timing_now() * 1000.0;")));
     ASSERT_TRUE(handling.contains(QStringLiteral("m_playbackPaceGuard.reset();"))); // paused: re-arm at next Play
@@ -872,7 +893,7 @@ TEST(PlaybackNativePaceWiring, TheFirstPresentStartsThePaceClockWhenItsPresentEn
 {
     const QString source = mainWindowSource();
     const QString note = QStringLiteral(
-        "m_playbackPaceGuard.notePresent( mlv_stage_timing_now() * 1000.0, getFramerate() );");
+        "m_playbackPaceGuard.notePresent( mlv_stage_timing_now() * 1000.0, playbackPaceGuardFps() );");
     // r3 venue legs (Bachelor CUDA): the first draw blocks the GUI thread ~1 s, so a clock started at the top of
     // drawFrameReady banked the stall and repaid it as one 23-frame jump. It starts where the present is done.
     ASSERT_EQ(1, source.count(note));
@@ -903,6 +924,87 @@ TEST(PlaybackNativePaceWiring, TheFirstPresentStartsThePaceClockWhenItsPresentEn
     ASSERT_TRUE(pace >= 0);
     ASSERT_TRUE(startup > pace);
     ASSERT_TRUE(source.contains(QStringLiteral("    m_playbackSmokeStartupSkippedFrames = 0;\n")));
+}
+
+TEST(PlaybackUnpacedWiring, ReadOnceAndHonouredOnlyInAutomation)
+{
+    const QString source = mainWindowSource();
+    // read once, from a static, and nowhere else
+    ASSERT_EQ(1, source.count(QStringLiteral("MLVAPP_PLAYBACK_UNPACED")));
+    ASSERT_EQ(1, source.count(QStringLiteral(
+        "static const bool requested = environmentFlagEnabled( \"MLVAPP_PLAYBACK_UNPACED\" );")));
+    // the interactive app never honours it: the gate needs the automation pacing isolation
+    ASSERT_EQ(1, source.count(QStringLiteral(
+        "return playback_native_pace::guardPaceFps( getFramerate(), m_automationPacingIsolated && mlvappPlaybackUnpacedRequested() );")));
+    // the helper is only the guard's pace argument: the loop wrap, every-frame, drop-frame grant and present note
+    ASSERT_EQ(1, source.count(QStringLiteral("if( !m_playbackPaceGuard.grantLoopWrap( paceNowMs, playbackPaceGuardFps() ) ) return;")));
+    ASSERT_EQ(1, source.count(QStringLiteral("if( !m_playbackPaceGuard.grantWholeFrame( paceNowMs, playbackPaceGuardFps() ) ) return;")));
+    ASSERT_EQ(1, source.count(QStringLiteral(
+        "m_playbackPaceGuard.grant( getFramerate() * (double)timeDiff / 1000.0, paceNowMs, playbackPaceGuardFps() ),")));
+    ASSERT_EQ(1, source.count(QStringLiteral("m_playbackPaceGuard.notePresent( mlv_stage_timing_now() * 1000.0, playbackPaceGuardFps() );")));
+    ASSERT_EQ(4, source.count(QStringLiteral("playbackPaceGuardFps()")));   // the four calls, and no other caller
+    ASSERT_EQ(1, source.count(QStringLiteral("double MainWindow::playbackPaceGuardFps( void )")));
+}
+
+TEST(PlaybackUnpacedWiring, TheMeasuredLoopChecksItsStopInBoundedSlicesOnlyWhenUnpaced)
+{
+    const QString source = mainWindowSource();
+    const QString sliced = QStringLiteral(
+        "        if( m_automationPacingIsolated && mlvappPlaybackUnpacedRequested() )\n"
+        "            qApp->processEvents( QEventLoop::AllEvents, 5 );\n"
+        "        else\n"
+        "            qApp->processEvents( QEventLoop::AllEvents );\n");
+    ASSERT_EQ(1, source.count(sliced));
+    // it is the measured Play's loop: right before the stress switch and the measured stop check
+    const int at = source.indexOf(sliced);
+    const int stress = source.indexOf(QStringLiteral("        if( options.exerciseClipLifecycleStress\n         && !stressAttempted"), at);
+    const int measured = source.indexOf(QStringLiteral("measuredState = programmaticPlayState( playbackClock.elapsed(), measuredSafetyMs );"), at);
+    ASSERT_TRUE(stress > at);
+    ASSERT_TRUE(measured > stress);
+    ASSERT_TRUE(stress - at < 600);
+    // and the engine holds once the required frames are consumed, before any advance path (the loop wrap included)
+    const QString handling = bodyBetween(source, QStringLiteral("void MainWindow::playbackHandling(int timeDiff)"),
+                                         QStringLiteral("void MainWindow::showPerformanceProfilingDialog"));
+    const QString hold = QStringLiteral(
+        "if( m_automationPacingIsolated && mlvappPlaybackUnpacedRequested() && programmaticPlayConsumed() ) return;");
+    ASSERT_EQ(1, source.count(hold));
+    const int holdAt = handling.indexOf(hold);
+    ASSERT_TRUE(holdAt > handling.indexOf(QStringLiteral("const bool paceGuardArmedBeforeTick = m_playbackPaceGuard.armed();")));
+    ASSERT_TRUE(holdAt < handling.indexOf(QStringLiteral("m_playbackPaceGuard.grantLoopWrap(")));
+}
+
+TEST(PlaybackUnpacedWiring, NoGuardCallIsStillPacedByGetFramerate)
+{
+    const QString source = mainWindowSource();
+    const QRegularExpression pacedByFramerate(QStringLiteral(
+        "m_playbackPaceGuard\\.(grant|grantWholeFrame|grantLoopWrap|notePresent)\\([^;\\n]*,\\s*getFramerate\\(\\)\\s*\\)"));
+    ASSERT_FALSE(pacedByFramerate.match(source).hasMatch());
+}
+
+TEST(PlaybackUnpacedWiring, OneDisclosureLineAfterTheSummaryAndOnlyWhenRequested)
+{
+    const QString source = mainWindowSource();
+    const int summary = source.indexOf(QStringLiteral("\"playback_smoke.summary session=%1 reason=%2 elapsed_ms=%3 \""));
+    const QString gate = QStringLiteral("    if( mlvappPlaybackUnpacedRequested() )\n");
+    const int line = source.indexOf(QStringLiteral(
+        "\"playback_smoke.pace_unpaced session=%1 active=%2 drop_frame=%3 run_nonce=%4\""));
+    const int pace = source.indexOf(QStringLiteral("\"playback_smoke.pace_summary session=%1"));
+    ASSERT_TRUE(summary >= 0);
+    ASSERT_TRUE(line > summary);
+    ASSERT_TRUE(pace > line);
+    ASSERT_EQ(1, source.count(QStringLiteral("playback_smoke.pace_unpaced")));
+    const int gateAt = source.lastIndexOf(gate, line);
+    ASSERT_TRUE(gateAt > summary);
+    ASSERT_TRUE(line - gateAt < 200);
+    ASSERT_TRUE(source.mid(gateAt, line - gateAt).contains(QStringLiteral(
+        "const QString unpacedRunNonce = automationRunNonce();")));
+    ASSERT_TRUE(source.mid(line, 600).contains(QStringLiteral(
+        ".arg( bool01( m_automationPacingIsolated ) )\n"
+        "                   .arg( bool01( ui->actionDropFrameMode->isChecked() ) )\n"
+        "                   .arg( unpacedRunNonce );")));
+    // the summary's run-nonce .arg is a pinned stop statement (tools/repo_hygiene/app_play_scan.py): it must stay the
+    // only one in finishPlaybackSmokeTelemetry, so this line never repeats it (the count includes comments)
+    ASSERT_EQ(1, source.count(QStringLiteral(".arg( automationRunNonce() );")));
 }
 
 TEST(PlaybackNativePaceWiring, TheFirstPresentsCatchUpIsSampledAfterItsAdvanceAndNotPaced)
