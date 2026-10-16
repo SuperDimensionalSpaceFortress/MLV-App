@@ -83,9 +83,11 @@ SOURCES += \
     $$REPO_ROOT/tests/console/test_playback_swap_interval.cpp \
     $$REPO_ROOT/tests/console/test_cuda_launch_timing.cpp \
     $$REPO_ROOT/tests/console/test_gpu_field_telemetry.cpp \
+    $$REPO_ROOT/tests/console/test_gpu_device_loss_breaker.cpp \
     $$REPO_ROOT/tests/console/test_gpu_launch_budget.cpp \
     $$REPO_ROOT/tests/console/test_playback_present_trace.cpp \
-    $$REPO_ROOT/tests/console/test_playback_scopes_during_playback.cpp
+    $$REPO_ROOT/tests/console/test_playback_scopes_during_playback.cpp \
+    $$REPO_ROOT/tests/console/test_playback_scale_label.cpp
 
 HEADERS += \
     $$REPO_ROOT/platform/qt/FpmNameValidator.h \
@@ -118,6 +120,7 @@ HEADERS += \
     $$REPO_ROOT/platform/qt/PlaybackPresentedFrameIdentityTracker.h \
     $$REPO_ROOT/platform/qt/PlaybackDropFrameAdvancePolicy.h \
     $$REPO_ROOT/platform/qt/PlaybackAchievedScalePolicy.h \
+    $$REPO_ROOT/platform/qt/PlaybackScaleLabel.h \
     $$REPO_ROOT/platform/qt/PlaybackLookaheadLoopPositionPolicy.h \
     $$REPO_ROOT/platform/qt/PlaybackFpsMeterPolicy.h \
     $$REPO_ROOT/platform/qt/PlaybackDecodeRenderOverlap.h \
@@ -137,7 +140,8 @@ HEADERS += \
     $$REPO_ROOT/platform/qt/DisplayDeviceMapping.h \
     $$REPO_ROOT/tools/gpu/backend/igpu_launch_timing_format.h \
     $$REPO_ROOT/tools/gpu/backend/igpu_launch_budget.h \
-    $$REPO_ROOT/platform/qt/GpuFieldTelemetryCore.h
+    $$REPO_ROOT/platform/qt/GpuFieldTelemetryCore.h \
+    $$REPO_ROOT/platform/qt/GpuDeviceLossBreakerCore.h
 
 win32{
     WINDOWS_TEST_RUNTIME_DEPLOY = $$relative_path($$REPO_ROOT/tools/testing/deploy-windows-test-runtime.ps1, $$OUT_PWD)

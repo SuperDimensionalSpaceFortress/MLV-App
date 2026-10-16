@@ -87,6 +87,9 @@ int llrpGpuPlaybackReconLastPrepareOnlyForTesting(void);
 /* PLAYBACK-CUDA-HONOUR-SCALE-1 r2: a reduced-dims run on a recon DLL without
  * igpu_recon_set_reduced_iso_notch, refused so a meshy frame is never shown. */
 #define LLRP_GPU_PLAYBACK_RECON_RC_NO_REDUCED_ISO_NOTCH 8
+/* GPU-DEVICE-LOSS-SELF-HEAL-1: refused without any CUDA call because CUDA is
+ * suppressed process-wide after a device loss (llrpSetGpuCudaSuppressed). */
+#define LLRP_GPU_PLAYBACK_RECON_RC_CUDA_SUPPRESSED (-20)
 #define LLRP_GPU_RETAINED_OUTSTANDING_MAX 32
 
 typedef struct
@@ -344,6 +347,17 @@ typedef void (*llrpGpuStageTelemetrySink_t)(const char * stage, int rc, double m
                                             unsigned long long dropped);
 void llrpSetGpuStageTelemetrySink(llrpGpuStageTelemetrySink_t sink);
 llrpGpuStageTelemetrySink_t llrpGetGpuStageTelemetrySinkForTesting(void);
+/* GPU-DEVICE-LOSS-SELF-HEAL-1: one process-wide flag, set by
+ * GpuDeviceLossBreaker after a device loss or from the persisted safe-start
+ * flag. While set, every CUDA entry refuses before taking any lock or touching
+ * the backend: the recon run (rc LLRP_GPU_PLAYBACK_RECON_RC_CUDA_SUPPRESSED),
+ * the playback recon gate, the async preupload and the GL copy, and every CUDA
+ * AMaZE entry in GpuDebayer.cpp. r6: each one reads the flag again once its
+ * serializing lock is held (and an AMaZE run after its telemetry entry), so a
+ * caller queued through a loss never submits. Release, destroy and teardown
+ * are never gated. One aligned load per check. */
+void llrpSetGpuCudaSuppressed(int suppressed);
+int llrpGpuCudaSuppressed(void);
 /* r6 terminal drain: a code noted after the last captured call has no later
  * call to drain it at entry. llrpGpuPlaybackReconResetGlTextureResources (the
  * GPU view releasing its GL resources) drains both channels after its reset,

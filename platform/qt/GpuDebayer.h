@@ -150,5 +150,9 @@ int gpuAmazeDebayerDrainCudaErrorsAtTeardown(int waitMs);
 /* Test-only: the source the GL reset and the terminal drain read (NULL restores
  * the DLL's). */
 void gpuAmazeDebayerSetCudaErrorSourceForTesting(const GpuAmazeCudaErrorSource * source);
+/* GPU-DEVICE-LOSS-SELF-HEAL-1 r6, test-only: the step every AMaZE run takes
+ * right before its backend call (telemetry entry on, its orphans read from
+ * `source`, then the suppression flag read again). true = the run may submit. */
+bool gpuAmazeDebayerEnterRunForTesting(const GpuAmazeCudaErrorSource & source);
 
 #endif // GPUDEBAYER_H
