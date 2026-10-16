@@ -6025,9 +6025,10 @@ class LegSpecSchemaTests(unittest.TestCase):
             self.assertNotRegex(path.read_text(encoding="utf-8"), r"(?i)[a-z]:[\\/]|\.mlv\b", f"{path.name} must name no path")
 
     def test_the_schema_rejects_a_fixture_leg_a_path_and_a_short_window(self) -> None:
+        # A short window is one under the lowest floor (PLAYBACK-CLIP-LENGTH-HFR-10S-1: an HFR clip's 10 s); a leg cannot see the clip's fps.
         spec = json.loads(next(iter(sorted((DV / "legs").glob("*speed*.json")))).read_text(encoding="utf-8"))
         for override in ({"clipId": FIXTURE_IDS[0]}, {"clipId": FIXTURE_IDS[1]}, {"clipId": "C:/footage/" + OWNER_CLIP},
-                         {"playSeconds": 19}, {"clipPath": "C:/x"}):
+                         {"playSeconds": 9}, {"clipPath": "C:/x"}):
             with self.assertRaises(self.jsonschema.ValidationError, msg=str(override)):
                 self.jsonschema.validate(dict(spec, **override), self.schema)
 
