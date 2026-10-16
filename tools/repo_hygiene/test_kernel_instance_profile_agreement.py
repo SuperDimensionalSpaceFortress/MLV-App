@@ -16,7 +16,12 @@ Rules (every one fails closed; "cannot find it" is a failure, never a pass):
 - EACH of those rows is compared on its own: it must name at least one ``code@rN``, and the NEWEST N
   within that row must equal the header's N. A lagging row is reported by name and line number with
   both values, so one row that names the current profile can never mask another that lags.
-- ``code@rN`` must start at a word boundary: ``xcode@r12`` and ``barcode@r3`` are not profiles.
+- ``code@rN`` must sit on a word boundary at BOTH edges. On the left, ``xcode@r12`` and ``barcode@r3`` are
+  not profiles. On the right, a row token may not run on into a word character, ``.`` or ``-``:
+  ``code@r11beta``, ``code@r11.5`` and ``code@r11-rc`` are not profiles either (CoS #451 comment
+  6216180890). A bare ``code@r11.`` at the end of a sentence is therefore not read; wrap the token in
+  backticks or end the sentence after a space. The header token already needs its closing backtick
+  right after the digits, so it rejects the same suffixes.
 
 Prevention rule (adopted repo-local, from the r1 -> r2 CoS review of PR #451): an agreement guard
 that reads more than one source row carries one RED fixture per row where THAT row alone lags, plus
@@ -56,7 +61,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 MAP_FILE = "agents/factory-kernel-instance.md"
 
 _HEADER_PROFILE = re.compile(r"Profile:\s*`(code@r(\d+))`\s+primary")
-_ROW_PROFILE = re.compile(r"(?<![\w-])code@r(\d+)")
+_ROW_PROFILE = re.compile(r"(?<![\w-])code@r(\d+)(?![\w.-])")
 _CUTOVER_ROW = re.compile(r"^[*_`\s]*(K[35])(?![0-9A-Za-z])")
 _REQUIRED_ROWS = ("K3", "K5")
 
@@ -329,6 +334,68 @@ class LeftBoundaryTests(unittest.TestCase):
         problems, summary = check_agreement(HEADER_R11 + K3_ROW + k5)
         self.assertEqual(problems, [])
         self.assertIn("K5 row code@r11", summary)
+
+
+class RightBoundaryTests(unittest.TestCase):
+    """CoS #451 comment 6216180890: ``code@r11beta`` is not the profile token ``code@r11``."""
+
+    SUFFIXES = ("beta", ".5", "-rc")
+
+    def test_red_row_whose_only_profile_has_a_suffix_names_no_profile(self) -> None:
+        for suffix in self.SUFFIXES:
+            with self.subTest(suffix=suffix):
+                k5 = K5_ROW.replace("`profile: code@r11 kernel r5`", f"`profile: code@r11{suffix} kernel r5`")
+                problems, summary = check_agreement(HEADER_R11 + K3_ROW + k5)
+                self.assertEqual(summary, "NOT_FOUND")
+                self.assertEqual(len(problems), 1, problems)
+                self.assertIn("K5 row at line 9 names no", problems[0])
+
+    def test_red_k3_row_whose_only_profile_has_a_suffix_names_no_profile(self) -> None:
+        for suffix in self.SUFFIXES:
+            with self.subTest(suffix=suffix):
+                k3 = K3_ROW.replace("(code@r11 K3 default)", f"(code@r11{suffix} K3 default)")
+                problems, summary = check_agreement(HEADER_R11 + k3 + K5_ROW)
+                self.assertEqual(summary, "NOT_FOUND")
+                self.assertIn("K3 row at line 8 names no", problems[0])
+
+    def test_red_suffixed_row_token_does_not_agree_with_the_same_header_revision(self) -> None:
+        header = HEADER_R11.replace("code@r11", "code@r12", 1)
+        k5 = K5_ROW.replace("code@r11", "code@r12beta")
+        problems, _summary = check_agreement(header + K3_ROW.replace("code@r11", "code@r12") + k5)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("K5 row at line 9 names no", problems[0])
+
+    def test_red_embedded_left_and_suffixed_right_still_names_no_profile(self) -> None:
+        k5 = K5_ROW.replace("`profile: code@r11 kernel r5`", "`profile: xcode@r11 kernel r5`")
+        self.assertIn("K5 row at line 9 names no", check_agreement(HEADER_R11 + K3_ROW + k5)[0][0])
+
+    def test_green_suffixed_noise_beside_a_real_token_does_not_count(self) -> None:
+        for suffix in self.SUFFIXES:
+            with self.subTest(suffix=suffix):
+                k5 = K5_ROW.replace("| open |", f"| open, see code@r99{suffix} |")
+                self.assertEqual(check_agreement(HEADER_R11 + K3_ROW + k5)[0], [])
+
+    def test_green_delimited_row_tokens_still_count(self) -> None:
+        for tail in ("`", ")", ",", ";", " ", "|"):
+            with self.subTest(tail=tail):
+                k5 = f"| K5 declared profile | gate | (code@r11{tail}kernel | open |\n"
+                problems, summary = check_agreement(HEADER_R11 + K3_ROW + k5)
+                self.assertEqual(problems, [])
+                self.assertIn("K5 row code@r11", summary)
+
+    def test_red_bare_trailing_period_is_not_read_fails_closed(self) -> None:
+        k5 = K5_ROW.replace("`profile: code@r11 kernel r5`", "now code@r11.")
+        problems, summary = check_agreement(HEADER_R11 + K3_ROW + k5)
+        self.assertEqual(summary, "NOT_FOUND")
+        self.assertIn("K5 row at line 9 names no", problems[0])
+
+    def test_red_header_token_with_a_suffix_is_not_a_primary_profile(self) -> None:
+        for suffix in self.SUFFIXES:
+            with self.subTest(suffix=suffix):
+                header = HEADER_R11.replace("`code@r11` primary", f"`code@r11{suffix}` primary")
+                problems, summary = check_agreement(header + ROWS)
+                self.assertEqual(summary, "NOT_FOUND")
+                self.assertIn("header names no primary profile", problems[0])
 
 
 class ProfileAgreementLiveTreeTests(unittest.TestCase):
