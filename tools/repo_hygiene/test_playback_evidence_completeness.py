@@ -371,6 +371,8 @@ CONSUMER_EXEMPT: dict[str, str] = {
     "tools/repo_hygiene/gpu_job_result_provenance.py": "documentation of which jobs write a provenance record; it launches nothing.",
     "tools/profiling/refresh_period_histogram.py": "documentation of where a sample came from; it launches nothing.",
     "tools/gates/test_output_budget.py": "unit test of compare-output-budget.ps1 (runs it against fakes).",
+    "tools/coordination/lane-local-playback-lint.ps1":
+        "static prompt-text safety lint: it names the venue chain only to recognise venue routing in a prompt and never launches anything.",
 }
 
 
