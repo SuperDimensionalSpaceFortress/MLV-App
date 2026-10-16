@@ -8543,6 +8543,11 @@ uint64_t mlvReducedReconProcessedFrameSignature(uint64_t fullReconSignature, int
 
 static int mlv_gpu_playback_recon_requested_via_env(void)
 {
+    /* GPU-DEVICE-LOSS-SELF-HEAL-1 r4: a CUDA-suppressed session (a device loss
+     * this session, or a safe start) has no GPU recon, so the CPU recon must not
+     * refuse its reduced plan on the env alone (it reconstructed full res: 53-81
+     * ms a frame against 6 ms, under half the CPU route's fps on Bachelor). */
+    if (llrpGpuCudaSuppressed()) return 0;
     const char * gpu = getenv("MLVAPP_GPU_PLAYBACK_RECON");
     return (gpu && *gpu && strcmp(gpu, "0") != 0 && strcmp(gpu, "false") != 0) ? 1 : 0;
 }

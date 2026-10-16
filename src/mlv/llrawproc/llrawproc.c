@@ -289,6 +289,7 @@ void llrpSetGpuPlaybackReconTexturePrepareOnlyForCurrentThread(int enabled)
 
 static int llrawproc_gpu_playback_recon_enabled(void)
 {
+    if(llrpGpuCudaSuppressed()) return 0;
     return g_llrawproc_gpu_playback_recon_allowed
         && llrawproc_env_truthy_value(getenv("MLVAPP_GPU_PLAYBACK_RECON"));
 }
@@ -831,6 +832,21 @@ static llrpGpuReconEventLogger_t g_llrawproc_gpu_recon_event_logger = NULL;
 static llrpGpuStageTelemetrySink_t g_llrawproc_gpu_stage_telemetry_sink = NULL;
 static volatile LONG g_llrawproc_gpu_recon_run_active = 0;
 static volatile LONG g_llrawproc_gpu_preupload_bypass_active = 0;
+/* GPU-DEVICE-LOSS-SELF-HEAL-1: see llrpSetGpuCudaSuppressed in llrawproc.h. */
+static volatile LONG g_llrawproc_gpu_cuda_suppressed = 0;
+/* r10 (CoS #437): frames that passed run_backend's check before the lock and
+ * are about to take the backend mutex; a test's pre-lock rendezvous. */
+static volatile LONG g_llrawproc_gpu_recon_lock_arrivals = 0;
+
+void llrpSetGpuCudaSuppressed(int suppressed)
+{
+    InterlockedExchange(&g_llrawproc_gpu_cuda_suppressed, suppressed ? 1 : 0);
+}
+
+int llrpGpuCudaSuppressed(void)
+{
+    return g_llrawproc_gpu_cuda_suppressed != 0;
+}
 
 /* Caller holds g_llrawproc_gpu_recon_backend_mutex; info is zeroed. */
 static void llrawproc_gpu_recon_fill_backend_info(llrpGpuPlaybackReconBackendInfo_t * info)
@@ -1663,6 +1679,14 @@ void llrpHoldGpuReconBackendMutexForTesting(int hold)
     else pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
 }
 
+/* GPU-DEVICE-LOSS-SELF-HEAL-1 r10 test-only: how many frames have passed
+ * run_backend's check before the lock and reached the backend mutex. */
+long llrpGpuReconBackendLockArrivalsForTesting(void);
+long llrpGpuReconBackendLockArrivalsForTesting(void)
+{
+    return InterlockedCompareExchange(&g_llrawproc_gpu_recon_lock_arrivals, 0, 0);
+}
+
 /* Test-only: model an older DLL (present=0) that lacks
  * igpu_recon_set_reduced_iso_notch, or restore the symbol (present=1). */
 int llrpSetFakeGpuBackendReducedIsoNotchSymbolForTesting(int present);
@@ -1890,7 +1914,10 @@ static int llrawproc_gpu_recon_backend_available_guarded(int prefer_playback_dll
 {
     int available = 0;
     pthread_mutex_lock(&g_llrawproc_gpu_recon_backend_mutex);
-    available = llrawproc_gpu_export_backend_available(prefer_playback_dll);
+    /* GPU-DEVICE-LOSS-SELF-HEAL-1 r6: the check can create the backend (a CUDA
+     * call), so a suppressed session reads it as unavailable, under the lock. */
+    if(!llrpGpuCudaSuppressed())
+        available = llrawproc_gpu_export_backend_available(prefer_playback_dll);
     pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
     return available;
 }
@@ -2181,12 +2208,14 @@ int llrpGpuPlaybackReconPreuploadFrame(uint64_t frame_id,
     int locked = 0;
     int run_active = 0;
     int bypass_claimed = 0;
+    int suppressed = 0;
     int rc = 0;
     llrpGpuStageTelemetrySink_t telemetry_sink = NULL;
     llrawprocGpuStageTelemetryEvent_t telemetry_event;
     int telemetry_entered = 0;
     int telemetry_pending = 0;
     const uint64_t frame_token = llrpGpuPlaybackReconFrameToken(frame_id);
+    if(llrpGpuCudaSuppressed()) return 0;
     if(!llrawproc_env_truthy_value(
            getenv("MLVAPP_GPU_PLAYBACK_RECON_ASYNC_H2D"))
      || !raw_input_bayer14
@@ -2220,7 +2249,12 @@ int llrpGpuPlaybackReconPreuploadFrame(uint64_t frame_id,
      * pointers cannot be replaced until that call clears run_active and
      * releases the mutex.  This narrow bypass is what permits N+1 upload to
      * overlap N's kernels without racing backend teardown. */
-    if(g->backend
+    /* GPU-DEVICE-LOSS-SELF-HEAL-1 r6: the flag is read again once the lock (or
+     * the bypass claim) is held: a loss delivered since the check above stops
+     * this upload too. */
+    suppressed = llrpGpuCudaSuppressed();
+    if(!suppressed
+     && g->backend
      && g->clip_configured
      && g->preupload_frame
      && g->run_preuploaded
@@ -2272,7 +2306,7 @@ int llrpGpuPlaybackReconPreuploadFrame(uint64_t frame_id,
     {
         llrawproc_gpu_stage_telemetry_emit(telemetry_sink, &telemetry_event, telemetry_pending);
     }
-    return rc == 0;
+    return !suppressed && rc == 0;
 }
 
 static void llrawproc_gpu_recon_luts_key_from_state(
@@ -2342,6 +2376,14 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
     if(device_width_out) *device_width_out = 0;
     if(device_height_out) *device_height_out = 0;
     if(retained_out) memset(retained_out, 0, sizeof(*retained_out));
+    /* GPU-DEVICE-LOSS-SELF-HEAL-1: after a device loss no CUDA call is made on
+     * any thread; checked before any lock or backend access (the fast path),
+     * and again once the backend mutex is held (r6). */
+    if(llrpGpuCudaSuppressed())
+    {
+        if(rc_out) *rc_out = LLRP_GPU_PLAYBACK_RECON_RC_CUDA_SUPPRESSED;
+        return 0;
+    }
     if(!state || !state->valid || !gpu_input || raw_image_size == 0) return 0;
     if(out_kind == IGPU_OUT_CPU16 && !gpu_output) return 0;
     if(out_kind == IGPU_OUT_GL_TEXTURE && gl_texture_id == 0) return 0;
@@ -2380,7 +2422,16 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
     frame.playback_preview_scale_factor = state->playback_preview_scale_factor;
     frame.apply_dither = state->apply_dither;
 
+    InterlockedIncrement(&g_llrawproc_gpu_recon_lock_arrivals);
     pthread_mutex_lock(&g_llrawproc_gpu_recon_backend_mutex);
+    /* r6 (CoS #437, guard under the serializing lock): a caller that passed the
+     * check above and then waited here through a loss must not reach CUDA. */
+    if(llrpGpuCudaSuppressed())
+    {
+        pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
+        if(rc_out) *rc_out = LLRP_GPU_PLAYBACK_RECON_RC_CUDA_SUPPRESSED;
+        return 0;
+    }
     if(!llrawproc_gpu_export_backend_available(prefer_playback_dll))
     {
         pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
@@ -3161,10 +3212,20 @@ int llrpGpuPlaybackReconCopyLastDeviceBayer16ToGlTexture(unsigned int gl_texture
     llrawprocGpuExportBackend_t * g = &g_llrawproc_gpu_export_backend;
     int rc = -1;
     if(rc_out) *rc_out = -1;
+    if(llrpGpuCudaSuppressed())
+    {
+        if(rc_out) *rc_out = LLRP_GPU_PLAYBACK_RECON_RC_CUDA_SUPPRESSED;
+        return 0;
+    }
     if(gl_texture_id == 0) return 0;
 
     pthread_mutex_lock(&g_llrawproc_gpu_recon_backend_mutex);
-    if(g->backend && !g->unavailable && g->copy_last_device_output_to_gl_texture)
+    /* r6: read again under the lock (see llrawproc_gpu_recon_run_backend). */
+    if(llrpGpuCudaSuppressed())
+    {
+        rc = LLRP_GPU_PLAYBACK_RECON_RC_CUDA_SUPPRESSED;
+    }
+    else if(g->backend && !g->unavailable && g->copy_last_device_output_to_gl_texture)
     {
         rc = g->copy_last_device_output_to_gl_texture(g->backend, gl_texture_id);
     }
@@ -3582,6 +3643,20 @@ void llrpSetGpuReconEventLogger(llrpGpuReconEventLogger_t logger)
 void llrpSetGpuStageTelemetrySink(llrpGpuStageTelemetrySink_t sink)
 {
     (void)sink;
+}
+
+/* GPU-DEVICE-LOSS-SELF-HEAL-1: no recon backend here, but GpuDebayer.cpp and
+ * the playback gate read the same flag on every platform. */
+static volatile int g_llrawproc_gpu_cuda_suppressed = 0;
+
+void llrpSetGpuCudaSuppressed(int suppressed)
+{
+    __atomic_store_n(&g_llrawproc_gpu_cuda_suppressed, suppressed ? 1 : 0, __ATOMIC_SEQ_CST);
+}
+
+int llrpGpuCudaSuppressed(void)
+{
+    return __atomic_load_n(&g_llrawproc_gpu_cuda_suppressed, __ATOMIC_RELAXED) != 0;
 }
 
 int llrpGpuPlaybackReconDrainCudaErrorsAtTeardown(int wait_ms)
@@ -5880,6 +5955,12 @@ int applyLLRawProcObjectWorker_with_dims(mlvObject_t * video,
                                          llrawprocWorkerState_t * worker,
                                          int flags)
 {
+    /* GPU-DEVICE-LOSS-SELF-HEAL-1 r4: this is the recon worker's reduced recon, so
+     * the thread's "last recon used CUDA" state describes THIS recon, as in
+     * applyLLRawProcObjectWorker. Without it, a CPU reduced recon after a device
+     * loss kept the last CUDA frame's flag, and the render refused every one
+     * ("recon ran on the CUDA playback recon"). The GPU texture branch resets it too. */
+    llrawproc_gpu_playback_reset_last_run_state();
     return llrawproc_apply_with_dims_internal(video, raw_image_buff, raw_image_size,
                                               override_w, override_h, worker, flags);
 }

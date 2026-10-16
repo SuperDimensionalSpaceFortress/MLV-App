@@ -2093,7 +2093,8 @@ function Test-DvCriteria {
     <#
     .SYNOPSIS
     Evaluate a list of {metric, op, value} criteria against the verbatim-copied metrics. An absent metric
-    FAILS the criterion -- a missing number is never a passing number. An empty list is "no gating
+    FAILS the criterion -- a missing number is never a passing number; when the metrics carry a
+    non-empty <metric>CouldNotCheck, that typed reason is the failure text. An empty list is "no gating
     criteria" (informational), reported as such.
     #>
     param($Criteria, $Metrics)
@@ -2104,7 +2105,13 @@ function Test-DvCriteria {
     foreach ($c in $criteriaList) {
         $prop = $null
         if ($null -ne $Metrics) { $prop = $Metrics.PSObject.Properties[[string]$c.metric] }
-        if ($null -eq $prop -or $null -eq $prop.Value) { $failures.Add("$($c.metric): metric absent"); continue }
+        if ($null -eq $prop -or $null -eq $prop.Value) {
+            # GPU-DEVICE-LOSS-SELF-HEAL-1 r10: a producer that could not read a metric names why in <metric>CouldNotCheck; the verdict carries that typed reason.
+            $why = $(if ($null -ne $Metrics) { $Metrics.PSObject.Properties["$($c.metric)CouldNotCheck"] } else { $null })
+            if ($null -ne $why -and -not [string]::IsNullOrWhiteSpace([string]$why.Value)) { $failures.Add("$($c.metric): $($why.Value)") }
+            else { $failures.Add("$($c.metric): metric absent") }
+            continue
+        }
         $actual = $prop.Value; $want = $c.value; $ok = $false
         switch ([string]$c.op) {
             'eq' { $ok = ($actual -eq $want) }
