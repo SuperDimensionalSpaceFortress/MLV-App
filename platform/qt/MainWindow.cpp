@@ -2332,6 +2332,8 @@ MainWindow::MainWindow(int &argc, char **argv, QWidget *parent) :
     // "Film grade", not "Film": the Profile preset "Film" is a different thing.
     ui->comboBoxLookAssistFlavor->setItemData( 2, lookAssistFlavorName( LookAssistFlavor::Film ) );
     ui->comboBoxLookAssistFlavor->setItemData( 2, tr( "Colour-graded look: cool shadows, warm highlights" ), Qt::ToolTipRole );
+    ui->comboBoxLookAssistFlavor->setItemData( 3, lookAssistFlavorName( LookAssistFlavor::Vision50d ) );
+    ui->comboBoxLookAssistFlavor->setItemData( 3, tr( "Kodak Vision3 50D-style look: crisp contrast, neutral colour balance, richer colour. White balance is the same as Classic's." ), Qt::ToolTipRole );
 
     /* Wire the "Abort batch export" button in BatchPrompts QMessageBox */
     BatchPrompts::setAbortBatchCallback([this]{ exportAbort(); });
@@ -16127,18 +16129,19 @@ void MainWindow::restoreLookAssistBaselineGradationCurve( ReceiptSettings *recei
     ui->labelCurves->setConfiguration( curve );
 }
 
-// Lays the Film grade's curve over the finished balance, on the receipt and on the curve widget (which pushes it to the
-// live processing object), and only over a default curve: a user's curve is kept. Classic and Cinematic return "none"
-// untouched. The widget is what the user sees (the receipt's copy can lag an edit), so the decision is made on it.
+// Lays the grade's curve (Film's or Kodak Vision3 50D's) over the finished balance, on the receipt and on the curve widget
+// (which pushes it to the live processing object), and only over a default curve: a user's curve is kept. Classic and
+// Cinematic return "none" untouched. The widget is what the user sees (the receipt's copy can lag an edit), so the
+// decision is made on it.
 QString MainWindow::applyLookAssistFilmGrade( ReceiptSettings *receipt, LookAssistScene scene, LookAssistFlavor flavor )
 {
-    if( !receipt || flavor != LookAssistFlavor::Film ) return QStringLiteral("none");
+    if( !receipt || !lookAssistFlavorLaysGradationCurve( flavor ) ) return QStringLiteral("none");
     const QString current = ui->labelCurves->configuration();
-    const QString decision = lookAssistFilmGradeDecision( flavor, current );
-    if( decision != lookAssistFilmGradeId() ) return decision;
+    const QString decision = lookAssistGradeDecision( flavor, current );
+    if( decision != lookAssistGradeIdForFlavor( flavor ) ) return decision;
     if( receipt->lookAssistBaselineGradationCurve().isEmpty() )
         receipt->setLookAssistBaselineGradationCurve( current.trimmed().isEmpty() ? ReceiptSettings().gradationCurve() : current );
-    const QString film = lookAssistFilmGradationCurve( scene );
+    const QString film = lookAssistGradationCurveForFlavor( flavor, scene );
     receipt->setGradationCurve( film );
     ui->labelCurves->setConfiguration( film );
     return decision;
@@ -16683,9 +16686,9 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
         int raw_w_copy = raw_w;
         int raw_h_copy = raw_h;
 
-        // The Film grade this apply will lay (the receipt's baseline restore already ran): appended only for Film.
-        const QString dispatchFilmGradeLogTail = flavor == LookAssistFlavor::Film
-            ? QStringLiteral(" grade=") + lookAssistFilmGradeDecision( flavor, ui->labelCurves->configuration() )
+        // The grade this apply will lay (the receipt's baseline restore already ran): appended only for Film and Vision50d.
+        const QString dispatchFilmGradeLogTail = lookAssistFlavorLaysGradationCurve( flavor )
+            ? QStringLiteral(" grade=") + lookAssistGradeDecision( flavor, ui->labelCurves->configuration() )
             : QString();
         logInteractionEvent(
             QStringLiteral("look_assist.apply.async_dispatch"),
@@ -18137,8 +18140,9 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
 
     m_lookAssistFlavorOutcome.landed( receipt, lookAssistFlavorName( flavor ), false );
     receipt->setLookAssistFlavor( lookAssistFlavorName( flavor ) );
-    // grade= is appended after flavor=, and only for Film, so a Classic or Cinematic line stays byte-identical. No '%' in it.
-    const QString filmGradeLogTail = flavor == LookAssistFlavor::Film ? QStringLiteral(" grade=") + filmGrade : QString();
+    // grade= is appended after flavor=, and only for Film and Vision50d, so a Classic or Cinematic line stays byte-identical.
+    // No '%' in it.
+    const QString filmGradeLogTail = lookAssistFlavorLaysGradationCurve( flavor ) ? QStringLiteral(" grade=") + filmGrade : QString();
     logInteractionEvent(
         QStringLiteral("look_assist.apply.result"),
         ( QStringLiteral("analysis=raw scene=%1 median=%2 p05=%3 p95=%4 p99=%5 clip_low=%6 clip_high=%7 balance_samples=%8 preset_exp=%9 preset_contrast=%10 preset_pivot=%11 preset_shadows=%12 preset_highlights=%13 preset_vibrance=%14 preset_temp_delta=%15 preset_tint_delta=%16 final_temp=%17 final_tint=%18 thumb=%19x%20 downscale=%21 color_thumb=%22x%23 color_downscale=%24 frame=%25 last_serial=%26 last_frame=%27 next_serial=%28 %29 flavor=%30") + filmGradeLogTail )

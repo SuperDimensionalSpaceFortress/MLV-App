@@ -306,7 +306,7 @@ The job composes a one-backend sheet; `New-VenueSheetPair.ps1` then pairs the tw
 into one `cuda | cpu` sheet, by frame index. Each receipt's `look` block carries the sheet's sha256 and
 path; the pair is its own record (`mlv-app/dual-venue-sheet-pair/v1`) because receipts are never edited.
 
-* `lookFlavor` (`classic` default | `cinematic`) is in the leg spec and the receipt subject and is passed
+* `lookFlavor` (`classic` default | `cinematic` | `film` | `vision50d`) is in the leg spec and the receipt subject and is passed
   to the app as `MLVAPP_LOOK_ASSIST_FLAVOR`. The app reads it (LOOK-ASSIST-FLAVORS-1,
   [docs/look-assist-flavors.md](look-assist-flavors.md)) and reports the flavor it applied on
   `gui_smoke.visual_state` (`look_assist_flavor`). The job copies that report into its summary as
