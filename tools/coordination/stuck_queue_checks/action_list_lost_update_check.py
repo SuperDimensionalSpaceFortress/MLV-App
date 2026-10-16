@@ -111,12 +111,17 @@ def load_module(path):
     return module
 
 
+class HarnessError(RuntimeError):
+    """The trial could not be measured; main() turns it into exit 2, never GREEN."""
+
+
 def one_trial(impl, workdir, n):
     path = str(Path(workdir) / f"actions-{n}.json")
     write_atomic(path, [{"id": f"seed{i}", "status": "done"} for i in range(SEED_ROWS)])
     entry = f"armed-{n}"
     beat_read, arm_done = threading.Event(), threading.Event()
     result = {}
+    errors = []
 
     def beat():
         snapshot = read_list(path)  # the beat's read, taken before the add
@@ -129,13 +134,30 @@ def one_trial(impl, workdir, n):
         result["exit"] = impl.arm(path, entry)
         arm_done.set()
 
-    threads = [threading.Thread(target=beat), threading.Thread(target=arm)]
+    def guarded(name, body):
+        def run():
+            try:
+                body()
+            except BaseException as exc:  # a thread's exception never reaches main on its own
+                errors.append(f"{name} raised {exc!r}")
+                beat_read.set()  # release the peer so the trial ends instead of waiting out its timeout
+                arm_done.set()
+
+        return run
+
+    threads = [threading.Thread(target=guarded("beat_save", beat)), threading.Thread(target=guarded("arm", arm))]
     for t in threads:
         t.start()
     for t in threads:
         t.join(30)
+    if errors:
+        raise HarnessError(f"trial {n}: " + "; ".join(errors))
+    if any(t.is_alive() for t in threads):
+        raise HarnessError(f"trial {n}: a writer did not finish within 30 s")
+    if "exit" not in result:
+        raise HarnessError(f"trial {n}: the arming command returned no exit code")
     present = any(r["id"] == entry for r in read_list(path))
-    return present, result.get("exit")
+    return present, result["exit"]
 
 
 def forced_loss_exit(impl, workdir):
@@ -164,8 +186,8 @@ def main(argv=None):
                 lost += not present
                 silent += (not present) and code == 0
             forced = forced_loss_exit(impl, workdir)
-    except Exception as exc:  # a harness failure must never read as GREEN
-        print(f"ERROR harness could not run the writers: {exc!r}")
+    except Exception as exc:  # a harness or writer failure must never read as GREEN
+        print(f"ERROR harness could not run the writers: {exc}")
         return 2
     label = args.impl or "impl-module"
     print(f"{label}: lost={lost}/{args.trials} lost_but_arm_exit_0={silent}/{args.trials} forced_loss_arm_exit={forced}")
