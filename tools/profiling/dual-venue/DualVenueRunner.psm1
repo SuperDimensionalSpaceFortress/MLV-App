@@ -1112,7 +1112,8 @@ function ConvertTo-DvMatrixTable {
         $range = $(if ($pf.Count -gt 0) { '(' + (& $f ($pf | Measure-Object -Minimum).Minimum 2) + '-' + (& $f ($pf | Measure-Object -Maximum).Maximum 2) + ')' } else { '' })
         $presented = ((& $f (Get-DvMedian $pf) 2) + ' ' + $range).Trim()
         $observed = @($mine | ForEach-Object { $_.observedDisplay } | Sort-Object -Unique) -join ','
-        $eff = @($mine | ForEach-Object { "$($c.scaleFactor)->$($_.effectiveScale)" } | Sort-Object -Unique) -join ','
+        # The words a person reads (SCALE-LABEL-CLARITY-1 r2), from the same mapping as the plan line and outcomeDetail; the row's numeric requested/effective fields are unchanged.
+        $eff = @($mine | ForEach-Object { "$(Get-DvScaleLabel -Factor $c.scaleFactor)->$(Get-DvScaleLabel -Factor $_.effectiveScale)" } | Sort-Object -Unique) -join ','
         $win = @($mine | Where-Object { $_.windowSize } | ForEach-Object { if ($_.previewSize) { "$($_.windowSize) ($($_.previewSize))" } else { $_.windowSize } } | Sort-Object -Unique) -join ', '
         $outcomes = @($mine | ForEach-Object { $_.outcome } | Group-Object | Sort-Object Name | ForEach-Object { "$($_.Name) x$($_.Count)" }) -join ', '
         $lines.Add("| $($c.cellId) | $($c.backend) | $($c.displayMode) / $(if ($observed) { $observed } else { '-' }) | $eff | $(if ($win) { $win } else { '-' }) | $($meas.Count)/$($mine.Count) | $presented | $(& $f (Get-DvMedian @($meas | ForEach-Object { $_.timelineFpsAfterFirstPresent })) 2) | $(& $f (Get-DvMedian @($meas | ForEach-Object { $_.renderWorkMs })) 1) | $(& $f (Get-DvMedian @($meas | ForEach-Object { $_.dualIsoMs })) 1) | $(if ($outcomes) { $outcomes } else { '-' }) |")
