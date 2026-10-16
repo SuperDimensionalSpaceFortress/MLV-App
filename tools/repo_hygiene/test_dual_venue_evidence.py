@@ -27,8 +27,8 @@ Windows-only: the job generator and runner are PowerShell-on-Windows tools (the 
 
 from __future__ import annotations
 
+import ast
 import hashlib
-import importlib.util
 import io
 import json
 import re
@@ -4665,13 +4665,18 @@ class ScaleLabelMirrorTests(unittest.TestCase):
 
     def test_the_contact_sheet_mirror_equals_the_cpp_header(self) -> None:
         want = self.header_labels()
-        spec = importlib.util.spec_from_file_location("make_contact_sheet_mirror", ROOT / "tools" / "profiling" / "make-contact-sheet.py")
-        mcs = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mcs)
+        # The hosted Repo Hygiene runner has no numpy and make-contact-sheet.py imports it at module level, so the module is never executed: only the
+        # scale_label function is lifted out of the parsed source and run on its own (it uses builtins only).
+        source = (ROOT / "tools" / "profiling" / "make-contact-sheet.py").read_text(encoding="utf-8")
+        funcs = [node for node in ast.parse(source).body if isinstance(node, ast.FunctionDef) and node.name == "scale_label"]
+        self.assertEqual(len(funcs), 1, "make-contact-sheet.py defines exactly one top-level scale_label")
+        namespace: dict = {}
+        exec(compile(ast.Module(body=funcs, type_ignores=[]), "make-contact-sheet.py:scale_label", "exec"), namespace)
+        scale_label = namespace["scale_label"]
         for n in (1, 2, 4):
-            self.assertEqual(mcs.scale_label(str(n)), want[n])
+            self.assertEqual(scale_label(str(n)), want[n])
         for n in (3, 8):
-            self.assertEqual(mcs.scale_label(str(n)), want[0].replace("%1", str(n)))
+            self.assertEqual(scale_label(str(n)), want[0].replace("%1", str(n)))
 
 
 @requires_windows_pwsh
