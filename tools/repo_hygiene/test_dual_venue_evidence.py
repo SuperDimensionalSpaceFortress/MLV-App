@@ -4197,9 +4197,11 @@ class LineEndingsCannotHideACommittedFileTests(ModuleMutationMixin, unittest.Tes
 
     def test_each_shipped_leg_is_found_at_head_of_the_real_repo(self) -> None:
         head = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+        # one listing of the tracked files instead of one `git ls-files --error-unmatch` per leg (same assertion: every shipped leg is tracked)
+        tracked = set(subprocess.run(["git", "-C", str(ROOT), "ls-files", "-z", "--", "tools/profiling/dual-venue/legs"], capture_output=True, text=True,
+                                     check=True, stdin=subprocess.DEVNULL, timeout=120).stdout.split("\0"))
         for rel in SHIPPED_LEGS:
-            tracked = subprocess.run(["git", "-C", str(ROOT), "ls-files", "--error-unmatch", "tools/profiling/dual-venue/" + rel], capture_output=True, text=True)
-            self.assertEqual(tracked.returncode, 0, rel)
+            self.assertIn("tools/profiling/dual-venue/" + rel, tracked, rel)
         proc = _ps_json(f"$root = '{ROOT}'\n"
                         f"foreach ($rel in {SHIPPED_LEGS_PS}) {{\n"
                         "  $bytes = [IO.File]::ReadAllBytes((Join-Path $root ('tools/profiling/dual-venue/' + $rel)))\n"

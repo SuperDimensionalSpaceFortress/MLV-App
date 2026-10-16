@@ -228,23 +228,43 @@ function Get-DvProp {
 }
 
 # --- where admission reads its inputs from (round 3, sol BLOCKER) ----------------------------------------------------
+function Get-DvGitTimeoutMilliseconds {
+    # CI-DUALVENUE-EVIDENCE-SHARD2-HANG-1: the longest one git call may run. 120 s by default; DV_GIT_TIMEOUT_SECONDS (1..600) overrides it.
+    # A shorter bound can only refuse more (a timed-out call is exit -1), never admit anything.
+    $seconds = 120
+    $raw = [Environment]::GetEnvironmentVariable('DV_GIT_TIMEOUT_SECONDS')
+    if ($raw -match '^\d{1,3}$' -and [int]$raw -ge 1 -and [int]$raw -le 600) { $seconds = [int]$raw }
+    $seconds * 1000
+}
+
 function Invoke-DvGit {
     # Run git in $RepoRoot; returns exit code, stdout BYTES (a blob must not be re-encoded or newline-translated) and stderr.
+    # Bounded (Get-DvGitTimeoutMilliseconds): a git that does not return is killed with its children and reported as exit -1 with a
+    # DV_GIT_TIMEOUT stderr, so the caller refuses typed instead of waiting out the CI job cap. git gets a closed stdin, no prompt and no pager.
     param([Parameter(Mandatory)][string]$RepoRoot, [Parameter(Mandatory)][string[]]$GitArgs)
     $psi = [System.Diagnostics.ProcessStartInfo]::new('git')
-    $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.CreateNoWindow = $true
+    $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.RedirectStandardInput = $true; $psi.CreateNoWindow = $true
+    $psi.Environment['GIT_TERMINAL_PROMPT'] = '0'; $psi.Environment['GIT_PAGER'] = 'cat'
     # The repo is the one at $RepoRoot and nothing else: a GIT_DIR / GIT_WORK_TREE / GIT_INDEX_FILE / object-store override in the
     # caller's environment would point git at a scratch repo whose "committed" files are whatever the caller wrote, and a replace
     # ref would swap a blob for another one under the same id (--no-replace-objects).
     foreach ($name in @($psi.Environment.Keys | Where-Object { $_ -match '^GIT_(DIR|WORK_TREE|INDEX_FILE|OBJECT_DIRECTORY|ALTERNATE_OBJECT_DIRECTORIES|COMMON_DIR|NAMESPACE|REPLACE_REF_BASE|NO_REPLACE_OBJECTS)$' })) { [void]$psi.Environment.Remove($name) }
     foreach ($a in (@('--no-replace-objects', '-C', $RepoRoot) + $GitArgs)) { [void]$psi.ArgumentList.Add($a) }
+    $limit = Get-DvGitTimeoutMilliseconds
     $proc = [System.Diagnostics.Process]::Start($psi)
     try {
+        $proc.StandardInput.Close()
         $errTask = $proc.StandardError.ReadToEndAsync()
         $ms = [IO.MemoryStream]::new()
-        $proc.StandardOutput.BaseStream.CopyTo($ms)
-        $proc.WaitForExit()
-        [pscustomobject]@{ exitCode = $proc.ExitCode; bytes = $ms.ToArray(); stderr = $errTask.Result }
+        $outTask = $proc.StandardOutput.BaseStream.CopyToAsync($ms)
+        if (-not $proc.WaitForExit($limit)) {
+            try { $proc.Kill($true) } catch { $null = $_ }
+            [void]$proc.WaitForExit(5000)
+            return [pscustomobject]@{ exitCode = -1; bytes = [byte[]]@(); stderr = "DV_GIT_TIMEOUT git did not return within $($limit / 1000) s: git $($GitArgs -join ' ')" }
+        }
+        # the pipes close when git (and anything it started) exits; a straggler holding one open must not outlast a bounded wait
+        [void]$outTask.Wait(10000)
+        [pscustomobject]@{ exitCode = $proc.ExitCode; bytes = $ms.ToArray(); stderr = $(if ($errTask.Wait(10000)) { $errTask.Result } else { '' }) }
     } finally { $proc.Dispose() }
 }
 
@@ -315,6 +335,7 @@ function Get-DvBlobIdAtCommit {
 }
 
 $script:LegsRelativeDir = 'tools/profiling/dual-venue/legs'
+$script:LegBlobCache = @{}
 $script:LookReceiptPattern = '^look-receipts/[a-z0-9-]+\.marxml$'
 
 function Read-DvCommittedLookReceipt {
@@ -358,7 +379,13 @@ function Find-DvCommittedLegSpec {
         if ($row -cnotmatch '^[0-7]{6} blob (?<id>[0-9a-f]{40})\t(?<path>.+)$') { continue }
         $id = $Matches['id']; $path = $Matches['path'].Trim()
         if (-not $path.EndsWith('.json')) { continue }
-        $blob = Get-DvBlobById -RepoRoot $RepoRoot -BlobSha $id
+        # A blob id names its bytes for good, so a blob read once is not read again by the next lookup of this process: every lookup used to
+        # re-read every blob of the directory (two git spawns each), which made finding all N shipped legs quadratic in N.
+        $blob = $script:LegBlobCache[$id]
+        if ($null -eq $blob) {
+            $blob = Get-DvBlobById -RepoRoot $RepoRoot -BlobSha $id
+            if ($blob.ok) { $script:LegBlobCache[$id] = $blob }
+        }
         if ($blob.ok -and (Get-DvLegSpecSha256 $blob.bytes) -ceq $LegSpecSha256) {
             return [pscustomobject]@{ ok = $true; relativePath = $path; blobSha = $id; text = $blob.text }
         }
