@@ -18,6 +18,7 @@ Launch command lines in the fixtures are assembled at run time so this file itse
 
 from __future__ import annotations
 
+import hashlib
 import itertools
 import json
 import os
@@ -174,8 +175,8 @@ def _lint_word_lists(lint: Path, work: Path) -> dict[str, list[str]]:
     return {k: [str(x) for x in v] for k, v in json.loads(done.stdout.strip()).items()}
 
 
-def _json_counts(lint: Path, texts: list[str], work: Path, tag: str) -> list[int]:
-    """Finding count of every text under `lint`, texts passed as a JSON array so a text may hold line breaks (one pwsh process)."""
+def _start_json_counts(lint: Path, texts: list[str], work: Path, tag: str) -> "subprocess.Popen":
+    """Start ONE pwsh that counts the findings of every text under `lint`, the texts passed as a JSON array so a text may hold line breaks."""
     src = work / f"{tag}-in.json"
     src.write_text(json.dumps(texts), encoding="utf-8")
     probe = work / f"{tag}-probe.ps1"
@@ -187,27 +188,13 @@ def _json_counts(lint: Path, texts: list[str], work: Path, tag: str) -> list[int
         "foreach ($t in $texts) { $out.Add(@(Get-LocalPlaybackPromptFindings -Text ([string]$t)).Count) }\n"
         "ConvertTo-Json -InputObject @($out.ToArray()) -Compress\n",
     )
-    proc = subprocess.Popen([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(probe)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    try:
-        return _collect_counts(proc, len(texts))
-    finally:
-        _kill(proc)
-
-
-def _batch_counts(lint: Path, texts: list[str], work: Path, tag: str) -> list[int]:
-    """Finding count of every text under `lint` (a text per line), sharded over up to BATCH_SHARDS pwsh processes: the member corpus
-    is ~32k rows at ~17 ms a row, which one process cannot finish inside a 600 s foreground call (r12)."""
-    shards: list = []
-    try:
-        _start_shards(lint, texts, work, tag, shards)
-        return _collect_shards(shards)
-    finally:
-        for proc, _ in shards:
-            _kill(proc)
+    return subprocess.Popen([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(probe)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
 
 def _start_shards(lint: Path, texts: list[str], work: Path, tag: str, shards: list) -> None:
-    """Start the pwsh shards of one lint over `texts`, appending (Popen, chunk) to `shards` as each starts (the caller owns cleanup)."""
+    """Start the pwsh shards of one lint over `texts` (a text per line), appending (Popen, chunk) to `shards` as each starts (the caller
+    owns cleanup). Up to BATCH_SHARDS processes: the member corpus is ~32k rows at ~17 ms a row, which one process cannot finish inside a
+    600 s foreground call (r12)."""
     count = max(1, min(BATCH_SHARDS, len(texts) // 500))
     size = -(-len(texts) // count) if texts else 0
     chunks = [texts[i:i + size] for i in range(0, len(texts), size)] if size else [texts]
@@ -215,11 +202,63 @@ def _start_shards(lint: Path, texts: list[str], work: Path, tag: str, shards: li
         shards.append((_lint_finding_counts(lint, chunk, work, f"{tag}-s{n}"), chunk))
 
 
-def _collect_shards(shards: list) -> list[int]:
-    counts: list[int] = []
-    for proc, chunk in shards:
-        counts.extend(_collect_counts(proc, len(chunk)))
-    return counts
+# NA2-RULE4-PER-LAUNCHER-SCOPE-1 r3: the finding count of a text is a pure function of (the lint's bytes, the text), so it is computed at
+# most once per module run. The catalogue tests, the list-member setUp, the differential pins and the r1-head RED proof all ask for the
+# same (lint, text) pairs; before r3 each asked its own pwsh (the candidate lint alone ran the whole ~34k-row corpus three times).
+_VERDICTS: dict[tuple[str, str], int] = {}
+
+
+def _lint_digest(lint: Path) -> str:
+    """Identity of a lint copy: its bytes with CRLF folded to LF (the same equivalence the 'master already carries this lint' checks use)."""
+    return hashlib.sha256(Path(lint).read_bytes().replace(b"\r\n", b"\n")).hexdigest()
+
+
+def _prefetch_counts(work: Path, jobs: list[tuple[Path, list[str], str]]) -> None:
+    """Fill _VERDICTS for every (lint, texts, tag) job, running only the (lint bytes, text) pairs not computed yet. Every job's pwsh
+    processes run at the same time and are joined here. A text without a line break goes through the line-per-text shards; a text
+    with one (or an empty text) goes through the JSON array probe."""
+    pending: list[tuple[str, list]] = []  # (lint digest, [(Popen, texts)])
+    queued: set[tuple[str, str]] = set()
+    try:
+        for lint, texts, tag in jobs:
+            digest = _lint_digest(lint)
+            missing = [t for t in dict.fromkeys(texts) if (digest, t) not in _VERDICTS and (digest, t) not in queued]
+            queued.update((digest, t) for t in missing)
+            plain = [t for t in missing if t and "\n" not in t and "\r" not in t]
+            multi = [t for t in missing if not (t and "\n" not in t and "\r" not in t)]
+            if plain:
+                shards: list = []
+                pending.append((digest, shards))
+                _start_shards(lint, plain, work, f"{tag}-p", shards)
+            if multi:
+                procs: list = []
+                pending.append((digest, procs))
+                procs.append((_start_json_counts(lint, multi, work, f"{tag}-m"), multi))
+        for digest, shards in pending:
+            for proc, chunk in shards:
+                for text, count in zip(chunk, _collect_counts(proc, len(chunk))):
+                    _VERDICTS[(digest, text)] = count
+    finally:
+        for _, shards in pending:
+            for proc, _ in shards:
+                _kill(proc)
+
+
+def _verdicts(lint: Path, texts: list[str]) -> list[int]:
+    """The finding count of every text under `lint`; _prefetch_counts must have run for it."""
+    digest = _lint_digest(lint)
+    return [_VERDICTS[(digest, t)] for t in texts]
+
+
+def _json_counts(lint: Path, texts: list[str], work: Path, tag: str) -> list[int]:
+    """Finding count of every text under `lint`; a text may hold line breaks. Computed once per (lint bytes, text) per module run."""
+    _prefetch_counts(work, [(lint, texts, tag)])
+    return _verdicts(lint, texts)
+
+
+def _batch_counts(lint: Path, texts: list[str], work: Path, tag: str) -> list[int]:
+    """Finding count of every text under `lint`, sharded over up to BATCH_SHARDS pwsh processes (see _start_shards)."""
+    return _json_counts(lint, texts, work, tag)
 
 
 def _kill(proc: "subprocess.Popen") -> None:
@@ -946,18 +985,12 @@ def _differential_flips(work: Path, baseline_text: str | None = None, previous_h
                                   + tuple(text for _, _, text in PromptLintTests.DEFEATER_AXIS) + PromptLintTests.DEFEATER_AXIS_CONTROLS,
                                   members=tuple(_list_member_rows(_lint_word_lists(LINT_PS1, work))))
     texts = list(corpus)
-    base_shards: list = []
-    cand_shards: list = []
-    try:
-        # Both launches sit inside the cleanup boundary: a failing second Popen must not leave the first unreaped. Each lint runs as
-        # BATCH_SHARDS pwsh processes (r12: ~32k rows, ~17 ms a row, does not fit one 600 s process).
-        _start_shards(baseline, texts, work, "base", base_shards)
-        _start_shards(LINT_PS1, texts, work, "cand", cand_shards)
-        before = _collect_shards(base_shards)
-        after = _collect_shards(cand_shards)
-    finally:
-        for proc, _ in base_shards + cand_shards:
-            _kill(proc)
+    # Both lints run at the same time, each as up to BATCH_SHARDS pwsh processes (r12: ~32k rows, ~17 ms a row, does not fit one 600 s
+    # process), and only for the (lint bytes, text) pairs no earlier test already computed (r3): the candidate lint's catalogue and
+    # list-member rows are known by now, and a baseline that IS the candidate (the identical-baseline row) costs nothing at all.
+    _prefetch_counts(work, [(baseline, texts, "base"), (LINT_PS1, texts, "cand")])
+    before = _verdicts(baseline, texts)
+    after = _verdicts(LINT_PS1, texts)
     opened = [(t, corpus[t]) for t, b, a in zip(texts, before, after) if b > 0 and a == 0]
     closed = [(t, corpus[t]) for t, b, a in zip(texts, before, after) if b == 0 and a > 0]
     return ref, opened, closed, len(texts)
@@ -1948,11 +1981,13 @@ class PromptLintTests(unittest.TestCase):
         (self.tmp / "rule4-r1-head.ps1").write_text(r1[1], encoding="utf-8")
         self.assertEqual((98, 196), (len(RULE4_SECOND_LAUNCHER_REFUSE), len(RULE4_BOTH_ROUTED_PASS)))
         red = list(RULE4_R2_CROSS_RED)
-        counts = _json_counts(self.tmp / "rule4-r1-head.ps1", red, self.tmp, "rule4-r2-red")
-        self.assertEqual([], [t for t, n in zip(red, counts) if n > 0], f"rows {r1[0]} already refuses: not a RED row")
         refuse_rows = list(RULE4_R2_REFUSE + RULE4_R2_GUARDS + RULE4_SECOND_LAUNCHER_REFUSE + RULE4_SECOND_LAUNCHER_GUARDS)
         pass_rows = list(RULE4_R2_PASS + RULE4_BOTH_ROUTED_PASS)
         texts = refuse_rows + pass_rows
+        # one pass over every row on each lint, both lints at once (the RED rows are among the refuse rows, so they cost nothing extra)
+        _prefetch_counts(self.tmp, [(self.tmp / "rule4-r1-head.ps1", red + texts, "rule4-r2-r1head"), (LINT_PS1, texts, "rule4-r2-now")])
+        counts = _json_counts(self.tmp / "rule4-r1-head.ps1", red, self.tmp, "rule4-r2-red")
+        self.assertEqual([], [t for t, n in zip(red, counts) if n > 0], f"rows {r1[0]} already refuses: not a RED row")
         old = _json_counts(self.tmp / "rule4-r1-head.ps1", texts, self.tmp, "rule4-r2-r1head")
         new = _json_counts(LINT_PS1, texts, self.tmp, "rule4-r2-now")
         closed = [t for t, a, b in zip(texts, old, new) if a == 0 and b > 0]
@@ -1971,6 +2006,8 @@ class PromptLintTests(unittest.TestCase):
             self.skipTest("no baseline, or master already carries this lint")
         (self.tmp / "rule4-master.ps1").write_text(base[1], encoding="utf-8")
         rows = list(RULE4_SECOND_LAUNCHER_REFUSE)
+        # one pwsh pass over the refuse, guard and allow rows together
+        _prefetch_counts(self.tmp, [(self.tmp / "rule4-master.ps1", rows + list(RULE4_SECOND_LAUNCHER_GUARDS) + list(RULE4_BOTH_ROUTED_PASS), "rule4-master")])
         counts = _json_counts(self.tmp / "rule4-master.ps1", rows, self.tmp, "rule4-red")
         self.assertEqual([], [t for t, n in zip(rows, counts) if n > 0], f"rows {base[0]} already refuses: not a RED row, move it to the guards")
         guards = list(RULE4_SECOND_LAUNCHER_GUARDS)
