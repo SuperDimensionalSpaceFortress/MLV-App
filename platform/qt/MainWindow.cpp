@@ -16563,6 +16563,7 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
         &stats, s_lookAssistMasterScenePass ? LookAssistRenderFn() : LookAssistRenderFn( renderProcessed ) );
     const LookAssistFlavor flavor = currentLookAssistFlavor();
     m_lookAssistFlavorOutcome.begin();   // reported (telemetry, receipt) only once this analysis lands
+    // No updateLookLabel() here on purpose: the previous look is still on screen, so its label stays until this lands.
     // Observation only: how the verdict and balance were reached, appended to look_assist.apply.result.
     LookAssistDecisionTrace decisionTrace;
     decisionTrace.pictureEvidenceAsked = !s_lookAssistMasterScenePass;

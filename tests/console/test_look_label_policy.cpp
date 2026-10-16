@@ -9,6 +9,7 @@
 #include "../../src/batch/LookAssistAnalysis.h"
 
 #include <QFile>
+#include <QRegularExpression>
 #include <QSettings>
 #include <QString>
 #include <QTextStream>
@@ -114,19 +115,70 @@ TEST(LookLabelWiring, L04LabelReadsTheAppliedOutcomeAndRefreshesWhenAnalysisLand
     ASSERT_TRUE(update.contains(QStringLiteral("m_lookAssistFlavorOutcome.fellBack( lookReceipt )")));
     ASSERT_FALSE(update.contains(QStringLiteral("look_label::text(")));
 
-    // Every place an analysis lands (applied or safety fallback) re-derives the label before the next statement block:
-    // an updateLookLabel() call within the three lines after each landed( ... ).
+    // Every place an analysis lands (applied or safety fallback) re-derives the label before it logs or leaves:
+    // an updateLookLabel() call after each landed( ... ) and before the next logInteractionEvent( or return.
     const QString landedCall = QStringLiteral("m_lookAssistFlavorOutcome.landed(");
+    const QRegularExpression leaves(QStringLiteral("logInteractionEvent\\(|\\breturn\\b"));
     int landedSites = 0;
     for ( int at = mw.indexOf(landedCall); at >= 0; at = mw.indexOf(landedCall, at + 1) )
     {
         ++landedSites;
-        int lineEnd = at;
-        for ( int line = 0; line < 3 && lineEnd >= 0; ++line ) lineEnd = mw.indexOf(QLatin1Char('\n'), lineEnd + 1);
-        ASSERT_TRUE(lineEnd > at);
-        ASSERT_TRUE(mw.mid(at, lineEnd - at).contains(QStringLiteral("updateLookLabel();")));
+        const int bound = leaves.match(mw, at).capturedStart();
+        ASSERT_TRUE(bound > at);
+        const int refresh = mw.indexOf(QStringLiteral("updateLookLabel();"), at);
+        ASSERT_TRUE(refresh > at && refresh < bound);
     }
     ASSERT_EQ(5, landedSites);   // async fail-closed, async post-measure fallback, async applied, sync fallback, sync applied
+}
+
+// CoS r5: begin() forgets the last outcome, so a label re-derived while the analysis is pending would name the
+// selected flavor while the previous look (here the fallback baseline) is still on screen. The label is therefore
+// deliberately left as it is until the analysis lands.
+TEST(LookLabelPolicy, PendingAnalysisKeepsThePreviousLabelUntilItLands)
+{
+    int clip = 0;
+    lookassist::LookAssistFlavorOutcome outcome;
+    outcome.landed(&clip, QStringLiteral("cinematic"), true);
+    ASSERT_EQ(std::string("Look: Baseline (fallback)"), appliedLabel(true, outcome, &clip, "cinematic"));
+    outcome.begin();
+    ASSERT_EQ(std::string("Look: Cinematic"), appliedLabel(true, outcome, &clip, "cinematic"));
+
+    const QString mw = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString beginCall = QStringLiteral("m_lookAssistFlavorOutcome.begin();");
+    const int begin = mw.indexOf(beginCall);
+    ASSERT_TRUE(begin >= 0);
+    ASSERT_EQ(-1, mw.indexOf(beginCall, begin + 1));   // one analysis entry point
+    ASSERT_TRUE(mw.indexOf(QStringLiteral("// No updateLookLabel() here on purpose"), begin) > begin);
+    const int firstLanded = mw.indexOf(QStringLiteral("m_lookAssistFlavorOutcome.landed("), begin);
+    ASSERT_TRUE(firstLanded > begin);
+    ASSERT_FALSE(mw.mid(begin, firstLanded - begin).contains(QStringLiteral("updateLookLabel();")));
+}
+
+// The documented gap (PR #459 Known gap): MLVAPP_EXPERIMENTAL_GL_VIEWPORT installs GpuDisplayViewport, which owns the
+// viewport's Paint while a GPU frame is pending, so GraphicsZoomView::drawForeground (the CPU corner label) is never
+// reached and nothing else draws the label there. Pinned so a change to that route fails here, not silently on screen.
+TEST(LookLabelWiring, GlViewportRouteIsExcludedFromTheCornerLabel)
+{
+    const QString vp = readRepoFile(QStringLiteral("platform/qt/GpuDisplayViewport.cpp"));
+    // The route: only the environment variable installs it, and only when the GL window is not the preview.
+    ASSERT_TRUE(functionBody(vp, QStringLiteral("const char *GpuDisplayViewport::environmentVariableName()"))
+                    .contains(QStringLiteral("return \"MLVAPP_EXPERIMENTAL_GL_VIEWPORT\";")));
+    ASSERT_TRUE(functionBody(vp, QStringLiteral("bool GpuDisplayViewport::installOn(QGraphicsView *view)"))
+                    .contains(QStringLiteral("if ( !view || !isRequestedByEnvironment() ) return false;")));
+    const QString mw = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    ASSERT_TRUE(mw.contains(QStringLiteral("    if ( !glWindowPreview )\n        GpuDisplayViewport::installOn( ui->graphicsView );")));
+    // It swallows Paint while a frame is pending: QGraphicsView's paint, and so drawForeground, does not run.
+    const QString filter = functionBody(vp, QStringLiteral("bool GpuDisplayViewport::eventFilter(QObject *watched, QEvent *event)"));
+    ASSERT_TRUE(filter.contains(QStringLiteral("event->type() == QEvent::Paint && hasPendingFrame()")));
+    ASSERT_TRUE(filter.contains(QStringLiteral("QOpenGLWidget::event(event);\n        return true;")));
+    // And it draws no label of its own; the corner label lives only in GraphicsZoomView and GpuDisplayWindow.
+    ASSERT_FALSE(vp.contains(QStringLiteral("looklabel"), Qt::CaseInsensitive));
+    ASSERT_FALSE(readRepoFile(QStringLiteral("platform/qt/GpuDisplayViewport.h"))
+                     .contains(QStringLiteral("looklabel"), Qt::CaseInsensitive));
+    // updateLookLabel has no GL-viewport branch: the viewport gets the text and the status bar still shows it.
+    const QString update = functionBody(mw, QStringLiteral("void MainWindow::updateLookLabel( void )"));
+    ASSERT_FALSE(update.contains(QStringLiteral("GpuDisplayViewport")));
+    ASSERT_TRUE(update.contains(QStringLiteral("m_pLookLabelStatus->setText( text )")));
 }
 
 TEST(LookLabelPolicy, CornerLabelOnlyInFullscreenAndOnlyWhenShown)
