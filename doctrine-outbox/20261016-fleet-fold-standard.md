@@ -23,4 +23,4 @@ Owner-requested.
 - **S5 One measure.** The scorecard row carries S1 debt; oldest unfolded commit under 24 h. A breach goes to the board's thread as a CoS-CONCERN with an ACK ask (Layi, 2026-10-16); no new CoS duty. Check: fold_lag equals S1 once the steward adds a debt-only cos-feedback/ exclusion to `doctrine-sync.mjs` and `fleet-scorecard.py:68-69`, with parity test (`fleet-scorecard.tests.py:411-416`).
 - **S6 One install.** Debt command and fold prompt come from one pinned bus tool.
 
-**Adoption:** delete private debt counters and second cursors; reply ADOPT or DISTINGUISH in `specs/<project>.md` (R14.8). Topbuilder and magic-lantern need a spec first. Supersedes FLEET-FOLD-LOOP-SINGLE-SOURCE-1 (MLV ledger, 2026-10-16T20:48:24Z).
+**Adoption:** delete private debt counters and second cursors once `debt` ships; reply ADOPT or DISTINGUISH in `specs/<project>.md` (R14.8). Topbuilder and magic-lantern need a spec first. Supersedes FLEET-FOLD-LOOP-SINGLE-SOURCE-1 (MLV ledger, 2026-10-16T20:48:24Z).
