@@ -1253,7 +1253,9 @@ _DELETE_TAIL = (
 _DELETE_RX = re.compile(r"(?:^|[\s;&|`(])(?:rm|del|rd|rmdir)\b(?!=)" + _DELETE_TAIL, re.I)
 # Inside a cmd.exe segment a quote also starts a command (`cmd /c "rd /s /q x"`), so it counts as a boundary there.
 _DELETE_RX_STRICT = re.compile(r"(?:^|[\s;&|`(\"'])(?:rm|del|rd|rmdir)\b" + _DELETE_TAIL, re.I)
-_CMD_SEGMENT_RX = re.compile(r"\bcmd(?:\.exe)?\b[\"']?\s+/[ckCK]\b", re.I)
+# r3 (sol + fable keys): other switches may come first (`cmd /s /c`, `cmd /d /s /k`, `cmd /v:on /c`), so any number
+# of leading `/x...` switches is skipped before the `/c` or `/k` that runs the command string.
+_CMD_SEGMENT_RX = re.compile(r"\bcmd(?:\.exe)?\b[\"']?(?:\s+/[A-Za-z][^\s/\"']*)*?\s+/[ckCK]\b", re.I)
 _MOVE_RX = re.compile(
     r"(?:^|[\s;&|`(])(?:mv|move)\b"
     r"|\bmove-item\b"

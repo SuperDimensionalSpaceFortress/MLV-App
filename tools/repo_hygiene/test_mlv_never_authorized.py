@@ -9090,6 +9090,21 @@ class Na2AssignmentIsNotADeleteTests(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertIn("delete", self._acts(cmd))
 
+    def test_cmd_exe_leading_switches_before_c_are_still_a_delete(self):
+        # r3 (sol + fable r2 keys): switches before /c or /k must not hide the cmd segment.
+        for cmd in ('cmd /s /c rd= /s /q C:/review/board/.claude-state/fleet-runs/lane-A-r1',
+                    'cmd /s /c rmdir= /s /q C:\\x\\y', 'cmd /s /c del= /q C:\\x\\y.txt',
+                    'cmd /d /s /c rd= /s /q C:\\x', 'cmd /s /k rd= /s /q C:\\x',
+                    'cmd.exe /s /c "rd= /s /q C:\\x"', 'cmd /v:on /c rd= /s /q C:\\x',
+                    'cmd /D /S /C rd= /s /q C:\\x'):
+            with self.subTest(cmd=cmd):
+                self.assertIn("delete", self._acts(cmd))
+
+    def test_cmd_mentioned_in_a_string_stays_fail_closed(self):
+        # Known fail-closed direction (sol r2 hardening row): an assignment next to text that merely
+        # mentions `cmd /c` is read strictly. Documented, not loosened.
+        self.assertIn("delete", self._acts('RD=/c/x/lane-A-r1; echo "cmd /c is a string"'))
+
     def test_real_delete_verbs_still_read_as_deletes(self):
         for cmd in ('rd /s /q C:\\x\\y', 'rm -rf /c/x/y', 'del C:\\x\\y.txt', 'rmdir /c/x/y',
                     'echo a; rd /s x', 'Remove-Item -Recurse C:\\x', 'git rm x'):
