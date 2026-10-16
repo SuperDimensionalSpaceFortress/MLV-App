@@ -6775,7 +6775,7 @@ function Get-AttrCudaSourceFramesVerdict {
     } elseif ($advanced -lt $required) {
         $failures += "INVALID_SOURCE_FRAMES: the engine advanced source_advanced=$advanced distinct source frames but the Play had to consume required_source_frames=$required; under 20 s of real footage is never playback evidence."
         # HFR-10S-1 >>>
-        # Text only (the verdict never reads it): an HFR clip (>= 50 fps native) is admitted at 10 s, so the message names that floor.
+        # Text only (the verdict never reads it): an HFR source (>= 50 fps native) is admitted at 10 s, so the message names that floor.
         # Every other rate keeps the base line above verbatim.
         if ($fields.ContainsKey('native_fps')) {
             $nativeForText = [double]::Parse($fields['native_fps'], [Globalization.CultureInfo]::InvariantCulture)
