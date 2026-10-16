@@ -876,6 +876,43 @@ class SourceFramesOracleParityTests(unittest.TestCase):
         self.assertTrue(self._module_invalid(absent))
         self.assertTrue(self._module_invalid(""))
 
+    def _module_failures(self, line: str, module: Path | None = None) -> list[str]:
+        proc = _pwsh(
+            f"Import-Module {_q(module or self.MODULE)} -Force -DisableNameChecking; "
+            f"$v = Get-AttrCudaSourceFramesVerdict -SummaryLine {_q(line)} -ExpectedRunNonce {_q(RUN_NONCE)}; "
+            "[pscustomobject]@{ failures = @($v.failures | ForEach-Object { [string]$_ }) } | ConvertTo-Json -Compress")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return json.loads(proc.stdout)["failures"]
+
+    def _assert_hfr_wording(self, module: Path | None = None) -> None:
+        """PLAYBACK-CLIP-LENGTH-HFR-10S-1 r3e: the module applies the HFR wording with a -replace on the base message, so a
+        base-message change would make that replace a silent no-op and an HFR failure would name 20 s again. Pin the text."""
+        hfr = _summary_line(**{**GOOD_SOURCE, "wrapped": 0, "wrap_count": 0, "total_frames": 720, "clip_seconds": 12.012,
+                              "presented_frames": 500, "native_fps": 59.94, "pace_fps": 59.94,
+                              "source_advanced": 300, "required_source_frames": 600})
+        hfr_failures = self._module_failures(hfr, module)
+        self.assertTrue(any(f.startswith("INVALID_SOURCE_FRAMES") and "under 10 s of real footage" in f for f in hfr_failures), hfr_failures)
+        self.assertFalse(any("20 s of real footage" in f for f in hfr_failures), hfr_failures)
+
+    def test_an_hfr_source_frames_failure_names_ten_seconds_and_every_other_rate_names_twenty(self) -> None:
+        self._assert_hfr_wording()
+        for native in (23.976, 49.99):
+            with self.subTest(native_fps=native):
+                low = _summary_line(**{**GOOD_SOURCE, "wrapped": 0, "wrap_count": 0, "native_fps": native, "pace_fps": native,
+                                       "source_advanced": 100, "required_source_frames": 1200, "total_frames": 1200})
+                failures = self._module_failures(low)
+                self.assertTrue(any("under 20 s of real footage" in f for f in failures), failures)
+                self.assertFalse(any("10 s of real footage" in f for f in failures), failures)
+        # RED arm: break the -replace pattern in a scratch copy and the pin must fail on it (the real file stays untouched).
+        source = self.MODULE.read_text(encoding="utf-8")
+        needle = "-replace 'under 20 s of real footage', 'under 10 s of real footage'"
+        self.assertEqual(source.count(needle), 1, "the HFR wording replace moved; update this pin")
+        with tempfile.TemporaryDirectory(prefix="hfr-wording-red-") as tmp:
+            broken = Path(tmp) / "AttrCudaArtifacts.psm1"
+            broken.write_text(source.replace(needle, "-replace 'under 21 s of real footage', 'under 10 s of real footage'"), encoding="utf-8")
+            with self.assertRaises(AssertionError):
+                self._assert_hfr_wording(broken)
+
     def _job_oracle_block(self) -> str:
         job = JOB_GENERATOR.read_text(encoding="utf-8")
         start = job.index("$sourceFramesSummaryLine = $null")
