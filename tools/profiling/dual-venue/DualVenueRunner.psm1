@@ -543,7 +543,22 @@ function Get-DvClipAdmission {
 # `$runNonce = ...`): 32 lowercase hex, no prefix. The rule accepts exactly that and nothing else; test_dual_venue_evidence.py
 # evaluates the launcher's own expression and feeds it to this rule, so a producer-format change turns a test red.
 $script:RunNoncePattern = '^[0-9a-f]{32}$'
-$script:MinPlaySeconds = 20.0
+# PLAYBACK-CLIP-LENGTH-HFR-10S-1 (owner amendment 2026-10-15): the floor is a function of the footage's NATIVE fps -- 10 s at
+# >= 50 fps (HFR), 20 s below, 20 s when unknown (fail closed). Mirrors platform/qt/PlaybackFrameRange.h minPlayWindowSeconds
+# and gui-smoke-length-gate.ps1 Get-GuiSmokeMinPlaySeconds (this module is loaded without that file); a parity test compares them.
+$script:StandardMinPlaySeconds = 20.0
+$script:HfrMinPlaySeconds = 10.0
+$script:HfrNativeFpsThreshold = 50.0
+
+function Get-DvMinPlaySeconds {
+    # The play floor of footage at -NativeFps; -LowestAnyClip: the floor where the footage is not known yet (a leg spec names a
+    # clip id, never its fps), i.e. only what NO clip could admit -- the venue's runner and the app apply the clip's own floor.
+    param([AllowNull()]$NativeFps, [switch]$LowestAnyClip)
+    if ($LowestAnyClip) { return $script:HfrMinPlaySeconds }
+    $fps = ConvertTo-DvDouble $NativeFps
+    if ($null -ne $fps -and -not [double]::IsNaN($fps) -and -not [double]::IsInfinity($fps) -and $fps -ge $script:HfrNativeFpsThreshold) { return $script:HfrMinPlaySeconds }
+    $script:StandardMinPlaySeconds
+}
 
 function ConvertTo-DvInt64 {
     # $null for absent / a bool / not an integer: an unparsable number is ABSENT, never zero.
@@ -651,14 +666,16 @@ function Get-DvPlaybackProblems {
     if ($null -eq $advanced) { $reasons.Add('RECEIPT_FIELD_ABSENT: source_advanced') }
     if ($null -eq $required) { $reasons.Add('RECEIPT_FIELD_ABSENT: required_source_frames') }
     elseif ($required -lt 20) { $reasons.Add("INVALID_SOURCE_FRAMES: required_source_frames=$required is under the 20-frame floor; the admitted Play was shorter than 20 s of footage") }
+    # The floor, derived here from the footage's own frame rate: ceil(floor x native fps) frames (HFR-10S-1: Get-DvMinPlaySeconds,
+    # 10 s at >= 50 fps, else 20 s).
+    $floorSeconds = Get-DvMinPlaySeconds -NativeFps $native
     if ($null -ne $advanced -and $null -ne $required) {
-        if ($advanced -lt $required) { $reasons.Add("INVALID_SOURCE_FRAMES: source_advanced=$advanced is under required_source_frames=$required; under 20 s of real footage is never evidence") }
+        if ($advanced -lt $required) { $reasons.Add("INVALID_SOURCE_FRAMES: source_advanced=$advanced is under required_source_frames=$required; under $floorSeconds s of real footage is never evidence") }
     }
-    # The 20 s floor, derived here from the footage's own frame rate: ceil(20 s x native fps) frames.
     if ($null -eq $native) { $reasons.Add('RECEIPT_FIELD_ABSENT: native_fps') }
     elseif ($native -le 0) { $reasons.Add("INVALID_SOURCE_FRAMES: native_fps=$native; the native frame rate is unknown, so 20 s of footage cannot be measured") }
-    elseif ($null -ne $required -and $required -lt [int64][Math]::Ceiling($script:MinPlaySeconds * $native - 0.02)) {
-        $reasons.Add("INVALID_SOURCE_FRAMES: required_source_frames=$required is under ceil(20 s x native_fps=$native); the Play was admitted for less than 20 s of footage")
+    elseif ($null -ne $required -and $required -lt [int64][Math]::Ceiling($floorSeconds * $native - 0.02)) {
+        $reasons.Add("INVALID_SOURCE_FRAMES: required_source_frames=$required is under ceil($floorSeconds s x native_fps=$native); the Play was admitted for less than $floorSeconds s of footage")
     }
     if ($null -eq $pace) { $reasons.Add('RECEIPT_FIELD_ABSENT: pace_fps') }
     elseif ($pace -le 0) { $reasons.Add("INVALID_SOURCE_FRAMES: pace_fps=$pace; a present engine pace that is not positive is unknown") }
@@ -771,6 +788,24 @@ function Get-DvPlaybackEvidence {
     $pb['valid'] = ($problems.Count -eq 0)
     $pb['invalidReasons'] = $problems
     $pb
+}
+
+function Get-DvScaleLabel {
+    <#
+    .SYNOPSIS
+    The words a person reads for a playback scale FACTOR (SCALE-LABEL-CLARITY-1): 1 -> 'Full res (1x)', 2 -> 'Half res (0.5x)', 4 -> 'Quarter res (0.25x)', else 'Custom res (1/N)'.
+    Mirrors PlaybackScaleLabel::resolutionLabel in platform/qt/PlaybackScaleLabel.h; a null or non-numeric factor (scale not yet known) gives 'unknown res'. The factor stays in receipt keys and leg ids.
+    #>
+    [CmdletBinding()]
+    param([AllowNull()][object]$Factor)
+    $n = 0
+    if ($null -eq $Factor -or -not [int]::TryParse([string]$Factor, [ref]$n) -or $n -lt 1) { return 'unknown res' }
+    switch ($n) {
+        1 { 'Full res (1x)' }
+        2 { 'Half res (0.5x)' }
+        4 { 'Quarter res (0.25x)' }
+        default { "Custom res (1/$n)" }
+    }
 }
 
 function Get-DvScaleEvidence {
@@ -1094,7 +1129,8 @@ function ConvertTo-DvMatrixTable {
         $range = $(if ($pf.Count -gt 0) { '(' + (& $f ($pf | Measure-Object -Minimum).Minimum 2) + '-' + (& $f ($pf | Measure-Object -Maximum).Maximum 2) + ')' } else { '' })
         $presented = ((& $f (Get-DvMedian $pf) 2) + ' ' + $range).Trim()
         $observed = @($mine | ForEach-Object { $_.observedDisplay } | Sort-Object -Unique) -join ','
-        $eff = @($mine | ForEach-Object { "$($c.scaleFactor)->$($_.effectiveScale)" } | Sort-Object -Unique) -join ','
+        # The words a person reads (SCALE-LABEL-CLARITY-1 r2), from the same mapping as the plan line and outcomeDetail; the row's numeric requested/effective fields are unchanged.
+        $eff = @($mine | ForEach-Object { "$(Get-DvScaleLabel -Factor $c.scaleFactor)->$(Get-DvScaleLabel -Factor $_.effectiveScale)" } | Sort-Object -Unique) -join ','
         $win = @($mine | Where-Object { $_.windowSize } | ForEach-Object { if ($_.previewSize) { "$($_.windowSize) ($($_.previewSize))" } else { $_.windowSize } } | Sort-Object -Unique) -join ', '
         $outcomes = @($mine | ForEach-Object { $_.outcome } | Group-Object | Sort-Object Name | ForEach-Object { "$($_.Name) x$($_.Count)" }) -join ', '
         $lines.Add("| $($c.cellId) | $($c.backend) | $($c.displayMode) / $(if ($observed) { $observed } else { '-' }) | $eff | $(if ($win) { $win } else { '-' }) | $($meas.Count)/$($mine.Count) | $presented | $(& $f (Get-DvMedian @($meas | ForEach-Object { $_.timelineFpsAfterFirstPresent })) 2) | $(& $f (Get-DvMedian @($meas | ForEach-Object { $_.renderWorkMs })) 1) | $(& $f (Get-DvMedian @($meas | ForEach-Object { $_.dualIsoMs })) 1) | $(if ($outcomes) { $outcomes } else { '-' }) |")
@@ -2204,7 +2240,7 @@ function Write-DvReceipt {
 Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-DvSha256OfBytes, Get-DvSha256OfText, Get-DvSha256OfFile,
     ConvertTo-DvLfBytes, Get-DvLegSpecSha256, Get-DvDerivedBackend, Get-DvBackendNotDerivable, Read-DvContactFrames, Get-DvSubjectDigest,
     Get-DvVisualViewportPixels, Get-DvVisualMeanAbsDiff, Get-DvVisualVerdict, New-DvVisualStrip, Read-DvVisualCaptures, Get-DvVisualCaptureRequest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
-    Test-DvUnderClaudeState, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvPlaybackProblems,
-    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvHealthVerdict,
+    Test-DvUnderClaudeState, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvMinPlaySeconds, Get-DvPlaybackProblems,
+    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvHealthVerdict,
     New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout,
     Get-DvResultToken, Resolve-DvJobOutcome, Test-DvCriteria, Get-DvVerbatimMetrics, New-DvReceipt, Write-DvReceipt

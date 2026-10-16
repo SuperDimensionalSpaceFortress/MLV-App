@@ -106,8 +106,9 @@ class AbsentFieldIsInvalidOnTheRunnerLogSummaryTests(unittest.TestCase):
     def test_the_floor_rederivation_is_mutation_tested(self) -> None:
         source = GATE.read_text(encoding="utf-8")
         mutations = {
-            "the requirement check is inverted": ("[int64]$required -lt [int64][Math]::Ceiling($script:GuiSmokeMinClipSeconds",
-                                                  "[int64]$required -gt [int64][Math]::Ceiling($script:GuiSmokeMinClipSeconds"),
+            # PLAYBACK-CLIP-LENGTH-HFR-10S-1: the floor is $floorSeconds (Get-GuiSmokeMinPlaySeconds of native_fps)
+            "the requirement check is inverted": ("[int64]$required -lt [int64][Math]::Ceiling($floorSeconds",
+                                                  "[int64]$required -gt [int64][Math]::Ceiling($floorSeconds"),
             "an unknown native fps is forgiven": ("[double]$nativeFps -le 0) {\n        $failures += \"INVALID_SOURCE_FRAMES: native_fps=",
                                                   "[double]$nativeFps -lt -1) {\n        $failures += \"INVALID_SOURCE_FRAMES: native_fps="),
         }

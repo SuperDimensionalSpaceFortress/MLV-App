@@ -15,6 +15,7 @@
 #include "../../src/batch/ReceiptApplier.h"
 #include "DualIsoLevelSyncPolicy.h"
 #include "PlaybackFpsMeterPolicy.h"
+#include "PlaybackScaleLabel.h"
 #include "AutomationSettings.h"
 #include "PlaybackEnvFlags.h"
 #include "PlaybackFrameRange.h"
@@ -6719,7 +6720,7 @@ void MainWindow::drawFrame( bool updateTimecodeLabel )
             !displayShaderRefusedStages.isEmpty()
                 ? gpuPreviewProcessingDisplayShaderRefusalReason( displayShaderRefusedStages )
                   + QStringLiteral(": the live display shader does not apply these stages, so GPU playback recon texture-present is refused and playback stays on a route that applies them")
-                : QStringLiteral("GPU playback recon texture-present requires an experimental GL presentation surface, GPU preview processing support, scopes hidden, MLVAPP_GPU_PLAYBACK_RECON=1, Decode/Reconstruct/Process playback mode, x1 scale, and caching off");
+                : QStringLiteral("GPU playback recon texture-present requires an experimental GL presentation surface, GPU preview processing support, scopes hidden, MLVAPP_GPU_PLAYBACK_RECON=1, Decode/Reconstruct/Process playback mode, Full res (1x) playback, and caching off");
     }
     requestContext.renderThreadUsingCpuPreviewProcessing = m_renderThreadUsingCpuPreviewProcessing;
     requestContext.renderThreadUsingPlaybackPreviewProcessing =
@@ -7869,10 +7870,10 @@ int MainWindow::runHeadlessPlaybackProfile(const PlaybackProfileOptions & option
             // Round 2 (hub ruling): the settle also HOLDS Play for the full 20 s floor before it stops it
             // (it used to stop at a 12 s deadline or as soon as the diagnostics settled), and requests that
             // 20 s window, so no settle Play is shorter than the floor. A refusal happens before Play; the
-            // caller returns the typed exit code.
+            // caller returns the typed exit code. HFR-10S-1: the floor is the clip's own (10 s for an HFR clip).
             forceLoopOffForAutomation( "profile-look-assist-settle" );
             if( !programmaticPlay( "profile-look-assist-settle",
-                                   playback_frame_range::kMinPlayWindowSeconds ) )
+                                   playGateMinPlayWindowSeconds() ) )
             {
                 lookAssistSettleSmokeStable = false;
                 lookAssistSettleSmokeFailure = m_lastPlayGateRefusalMessage;
@@ -8242,10 +8243,11 @@ int MainWindow::runHeadlessPlaybackProfile(const PlaybackProfileOptions & option
         // launch is gated HERE, in the app: the window from the current position (the start frame, set
         // above) to the cut-out must be >= 20 s, else Play is never triggered (typed exit 14, zero frames).
         // Round 2 (hub ruling): the exercise requests the 20 s floor and HOLDS Play for all of it -- it used to
-        // stop at the first advancing frame or a 5 s timeout, a Play of well under 20 s.
+        // stop at the first advancing frame or a 5 s timeout, a Play of well under 20 s. HFR-10S-1: the floor is the
+        // clip's own (10 s for an HFR clip).
         forceLoopOffForAutomation( "profile-exercise-play-action" );
         const bool playActionAdmitted = programmaticPlay( "profile-exercise-play-action",
-                                                          playback_frame_range::kMinPlayWindowSeconds );
+                                                          playGateMinPlayWindowSeconds() );
         playActionGateRefused = !playActionAdmitted;
         playActionSmokeStarted = playActionAdmitted && ui->actionPlay->isChecked();
         qApp->processEvents( QEventLoop::AllEvents );
@@ -8828,9 +8830,21 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         return 0;
     }
 
+    // PLAYBACK-CLIP-LENGTH-HFR-10S-1: main.cpp refuses at parse only what no clip could admit (the lowest floor);
+    // now the clip is open, --seconds (the play window) must reach THIS clip's floor (minPlayWindowSeconds of its
+    // native fps: 10 s for an HFR clip, 20 s otherwise or unknown). Refused before anything plays.
+    if( options.durationMs + 1e-6 < playGateMinPlayWindowSeconds() * 1000.0 )
+    {
+        ++m_programmaticPlayLedger.refused;
+        m_programmaticPlayLedger.lastRefusalReason = "PLAY_DURATION_TOO_SHORT";
+        err << "[GUI-SMOKE] ERROR: PLAY_DURATION_TOO_SHORT (--seconds=" << options.durationMs / 1000.0
+            << " window=" << playGateMinPlayWindowSeconds() << ")\n";
+        return 14;
+    }
     // PLAYBACK-CLIP-LENGTH-ENFORCE-1 round 2 (owner rule 2026-09-30): the app's own length gate, for a
     // launch that bypassed tools/profiling/run-release-gui-smoke.ps1 (a direct exe launch). The clip must
-    // be at least 20 s and must outlast the play window measured from --start-frame; path-free message.
+    // be at least its floor (HFR-10S-1: 10 s for an HFR clip, else 20 s) and must outlast the play window
+    // measured from --start-frame; path-free message.
     {
         const int guardFrames = static_cast<int>( getMlvFrames( m_pMlvObject ) );
         const double guardFps = static_cast<double>( getMlvFramerate( m_pMlvObject ) );
@@ -8840,8 +8854,9 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         const double guardRemainingSeconds = guardFps > 0.0
             ? guardClipSeconds - qMax( 0, options.startFrame ) / guardFps
             : 0.0;
-        const double guardRequiredSeconds = qMax( 20.0, guardWindowSeconds );
-        if( guardClipSeconds < 20.0 || guardRemainingSeconds < guardWindowSeconds )
+        const double guardFloorSeconds = playback_frame_range::minPlayWindowSeconds( guardFps );
+        const double guardRequiredSeconds = qMax( guardFloorSeconds, guardWindowSeconds );
+        if( guardClipSeconds < guardFloorSeconds || guardRemainingSeconds < guardWindowSeconds )
         {
             err << "[GUI-SMOKE] ERROR: CLIP_TOO_SHORT (clip="
                 << QString::number( guardRemainingSeconds < guardClipSeconds
@@ -8851,19 +8866,20 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         }
     }
     // ENFORCE-2 round 2 (sol B2): the lifecycle-stress leg STOPS the first clip's Play at the switch (the second
-    // clip is opened, seeked and closed but never played), so the switch may only happen after the 20 s floor.
-    // Also refused in main.cpp at parse time; refused here for any other way of building the options.
+    // clip is opened, seeked and closed but never played), so the switch may only happen after the clip's floor
+    // (HFR-10S-1: 10 s for an HFR clip, else 20 s). main.cpp refuses at parse what no clip could admit; the
+    // clip's own floor is applied here, for any way of building the options.
     if( options.exerciseClipLifecycleStress
-     && !playback_frame_range::stressSwitchReachesFloor( options.stressSwitchAtMs ) )
+     && !playback_frame_range::stressSwitchReachesFloor( options.stressSwitchAtMs, playGateMinPlayWindowSeconds() ) )
     {
         ++m_programmaticPlayLedger.refused;
         m_programmaticPlayLedger.lastRefusalReason = "PLAY_DURATION_TOO_SHORT";
         err << "[GUI-SMOKE] ERROR: PLAY_DURATION_TOO_SHORT (stress-switch-at-ms=" << options.stressSwitchAtMs
-            << " window=" << playback_frame_range::kMinPlayWindowMs << ")\n";
+            << " window=" << playback_frame_range::minPlayWindowMs( playGateNativeFps() ) << ")\n";
         return 14;
     }
     // The lifecycle-stress leg switches to a SECOND clip mid-play: read its MLVI
-    // header (mlv_file_hdr_t: frame count @36, fps nom/denom @44/@48) and apply the 20 s floor. A spanned
+    // header (mlv_file_hdr_t: frame count @36, fps nom/denom @44/@48) and apply its own floor. A spanned
     // or unreadable header is refused fail-closed (the runner sums spanned sets; a direct launch need not).
     if( options.exerciseClipLifecycleStress
      && QFileInfo( options.stressSwitchInputPath ).absoluteFilePath()
@@ -8881,7 +8897,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         const double stressFps = stressHeaderOk && u32( 48 ) > 0
             ? u32( 44 ) / static_cast<double>( u32( 48 ) ) : 0.0;
         const double stressSeconds = stressFps > 0.0 ? u32( 36 ) / stressFps : 0.0;
-        if( !stressHeaderOk || u16( 26 ) > 1 || stressSeconds < 20.0 )
+        if( !stressHeaderOk || u16( 26 ) > 1 || stressSeconds < playback_frame_range::minPlayWindowSeconds( stressFps ) )
         {
             err << "[GUI-SMOKE] ERROR: "
                 << ( stressHeaderOk && u16( 26 ) <= 1 ? "CLIP_TOO_SHORT" : "CLIP_LENGTH_UNKNOWN" )
@@ -11584,7 +11600,7 @@ void MainWindow::showPerformanceProfilingDialog( void )
     cudaPlaybackPreset->setChecked(
         CrashForensics::cudaPlaybackProfilingSettingsEnabled() );
     cudaPlaybackPreset->setToolTip(
-        tr( "Requests the scoped GPU Tex NR telemetry path: GL viewport, GPU preview processing, CUDA playback reconstruction, texture presentation, Phase 3 HQ, and x1 scale." ) );
+        tr( "Requests the scoped GPU Tex NR telemetry path: GL viewport, GPU preview processing, CUDA playback reconstruction, texture presentation, Phase 3 HQ, and Full res (1x) playback." ) );
     presetLayout->addWidget( cudaPlaybackPreset );
 
     QCheckBox * dngAsyncPreset =
@@ -12024,7 +12040,7 @@ void MainWindow::initGui( void )
         pPreviewResSub->addAction( ui->actionPlaybackPreviewResHalf );
         pPreviewResSub->addAction( ui->actionPlaybackPreviewResQuarter );
         m_pPlaybackQualityToolButtonMenu->addMenu( pPreviewResSub );
-        QMenu *pScaleFactorSub = new QMenu( tr( "Scale Factor" ),
+        QMenu *pScaleFactorSub = new QMenu( tr( "Playback Resolution" ),
                                             m_pPlaybackQualityToolButtonMenu );
         pScaleFactorSub->addAction( ui->actionPlaybackScaleAuto );
         pScaleFactorSub->addAction( ui->actionPlaybackScale1 );
@@ -12062,7 +12078,7 @@ void MainWindow::initGui( void )
         m_pPlaybackQualityToolButton->setText( tr( "Playback: Smooth ▾" ) );
         m_pPlaybackQualityToolButton->setToolTip(
             tr( "Playback Mode: choose Auto, Prioritize Quality, Prioritize Smoothness, "
-                "sharp/aggressive preview mode, and x1/x2/x4/x8 playback scale. "
+                "sharp/aggressive preview mode, and Full/Half/Quarter res playback resolution. "
                 "The status suffix reports the presented pipeline: CPU, GPU RB, "
                 "GPU Tex RB, or GPU Tex NR.\n"
                 "Keyboard shortcut: Q" ) );
@@ -21972,9 +21988,10 @@ void MainWindow::updatePlaybackQualityIndicator( void )
          && m_lastPresentedRequestContext.playbackScaleFactor == requestedScale;
         if( activeScaleValid && sameRequest && activeScale != requestedScale )
         {
-            return tr( "x%1->x%2" ).arg( requestedScale ).arg( activeScale );
+            return tr( "%1->%2" ).arg( PlaybackScaleLabel::shortLabel( requestedScale ),
+                                       PlaybackScaleLabel::shortLabel( activeScale ) );
         }
-        return tr( "x%1" ).arg( requestedScale );
+        return PlaybackScaleLabel::shortLabel( requestedScale );
     };
 
     QString text;
@@ -22111,7 +22128,7 @@ void MainWindow::updatePlaybackQualityIndicator( void )
             "per-frame CPU readback." );
     QString toolButtonTooltip =
         tr( "Playback Mode: choose Auto, Prioritize Quality, Prioritize Smoothness, "
-            "sharp/aggressive preview mode, and x1/x2/x4/x8 playback scale. "
+            "sharp/aggressive preview mode, and Full/Half/Quarter res playback resolution. "
             "The status suffix reports the presented pipeline: CPU, GPU Preview, "
             "GPU RB, GPU Tex RB, or scoped GPU Tex NR.\n"
             "Keyboard shortcut: Q" );
@@ -22300,9 +22317,9 @@ int MainWindow::effectivePlaybackScaleFactorForRequest( void ) const
         {
             m_gpuReducedReconSessionReason =
                 requestedScale == 1
-                    ? QStringLiteral("preview scale 1 (full resolution)")
-                    : QStringLiteral("x%1 stays on the full-resolution texture route")
-                          .arg( requestedScale );
+                    ? PlaybackScaleLabel::resolutionLabel( 1 ) + QStringLiteral(" preview")
+                    : QStringLiteral("%1 stays on the full-resolution texture route")
+                          .arg( PlaybackScaleLabel::resolutionLabel( requestedScale ) );
         }
         else if( playbackGpuNoReadbackOutputValidationEnabled() )
         {
@@ -29484,12 +29501,22 @@ void MainWindow::on_actionPlay_toggled(bool checked)
 // The static class test (tools/repo_hygiene/test_playback_clip_length_gate.py) fails on any other
 // programmatic actionPlay->trigger(), any Loop-enable, and any setPlaying outside this commented list.
 // ---------------------------------------------------------------------------------------------------------
+double MainWindow::playGateNativeFps() const
+{
+    return ( m_fileLoaded && m_pMlvObject ) ? static_cast<double>( getMlvFramerate( m_pMlvObject ) ) : 0.0;
+}
+
+double MainWindow::playGateMinPlayWindowSeconds() const
+{
+    return playback_frame_range::minPlayWindowSeconds( playGateNativeFps() );
+}
+
 playback_frame_range::PlayableWindowVerdict MainWindow::checkPlayableWindow( const char *site, double requestedSeconds )
 {
     Q_UNUSED( site );
     const bool haveClip = m_fileLoaded && m_pMlvObject;
     const int totalFrames = haveClip ? static_cast<int>( getMlvFrames( m_pMlvObject ) ) : 0;
-    const double fps = haveClip ? static_cast<double>( getMlvFramerate( m_pMlvObject ) ) : 0.0;
+    const double fps = playGateNativeFps();
     // ENFORCE-2 round 2 (sol B3): measure the range the ENGINE plays -- with MLVAPP_F3_DISABLE_CUT_RANGE_REPAIR
     // set the play path leaves a collapsed / inverted range alone (normalizePlaybackCutRangeForLoadedClip), so
     // the gate must not assume the repair either. This is the one knob that changes the effective range.
@@ -29502,7 +29529,7 @@ playback_frame_range::PlayableWindowVerdict MainWindow::checkPlayableWindow( con
         ui->spinBoxCutIn->value(),
         ui->spinBoxCutOut->value(),
         totalFrames, fps, requestedSeconds,
-        playback_frame_range::kMinPlayWindowSeconds,
+        playback_frame_range::minPlayWindowSeconds( fps ),
         !f3CutRangeRepairDisabledByEnvironment(),
         enginePaceFps > 0.0 ? enginePaceFps : -1.0, automationPlayPaceMode() );
 }
@@ -29537,7 +29564,7 @@ bool MainWindow::programmaticPlay( const char *site, double requestedSeconds )
             m_lastPlayGateRefusalMessage = QStringLiteral(
                 "PLAY_DURATION_TOO_SHORT (requested=%1 window=%2; site=%3)" )
                 .arg( verdict.requestedSeconds, 0, 'f', 3 )
-                .arg( playback_frame_range::kMinPlayWindowSeconds, 0, 'f', 3 )
+                .arg( verdict.floorSeconds, 0, 'f', 3 )
                 .arg( QString::fromLatin1( site ) );
         }
         else if( reason == QLatin1String( "PLAY_PACE_TOO_SLOW" ) )

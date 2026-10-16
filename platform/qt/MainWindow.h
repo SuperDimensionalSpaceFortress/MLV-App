@@ -205,7 +205,8 @@ public:
         bool exerciseClipLifecycleStress = false;
         QString stressSwitchInputPath;
         // ENFORCE-2 round 2: the switch stops Play on the first clip, so it may not happen before the
-        // 20 s play floor (playback_frame_range::kMinPlayWindowMs); runGuiPlaybackSmoke refuses less.
+        // clip's play floor (playback_frame_range::minPlayWindowMs: 20 s, 10 s for an HFR clip); runGuiPlaybackSmoke
+        // refuses less.
         int stressSwitchAtMs = 20000;
         int stressSeekFrame = 8;
         // UM-DISPLAY-SELECT-AND-LOG-1: when true, the smoke session is placed and maximized
@@ -1873,6 +1874,10 @@ private:
     // exercise modes, GUI-smoke measured Play) goes through programmaticPlay(); user input handlers
     // (on_actionPlay_triggered, the Loop menu) are never gated. See PlaybackFrameRange.h.
     playback_frame_range::PlayableWindowVerdict checkPlayableWindow( const char *site, double requestedSeconds );
+    // PLAYBACK-CLIP-LENGTH-HFR-10S-1: the loaded clip's NATIVE fps (0 when no clip: the 20 s floor) and the play floor
+    // derived from it (playback_frame_range::minPlayWindowSeconds).
+    double playGateNativeFps() const;
+    double playGateMinPlayWindowSeconds() const;
     bool programmaticPlay( const char *site, double requestedSeconds );
     void programmaticStop( const char *site );
     void forceLoopOffForAutomation( const char *site );

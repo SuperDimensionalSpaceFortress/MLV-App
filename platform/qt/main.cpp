@@ -928,12 +928,12 @@ static int runPlaybackProfile(QApplication &app)
 
     const QCommandLineOption exerciseScaleFactorToggleOpt(
         QStringLiteral("exercise-scale-toggle"),
-        QStringLiteral("Render at a playback scale, switch to x1 on the loaded clip, and verify the settled frame updates safely."));
+        QStringLiteral("Render at a reduced playback resolution, switch to Full res (1x) on the loaded clip, and verify the settled frame updates safely."));
     parser.addOption(exerciseScaleFactorToggleOpt);
 
     const QCommandLineOption exerciseScaleFactorToggleFromOpt(
         QStringLiteral("exercise-scale-toggle-from"),
-        QStringLiteral("Starting playback scale for --exercise-scale-toggle. Supported values: 2, 4, or 8."),
+        QStringLiteral("Starting playback scale factor for --exercise-scale-toggle (2 = Half res, 4 = Quarter res, 8 = 1/8 res). Supported values: 2, 4, or 8."),
         QStringLiteral("scale"),
         QStringLiteral("2"));
     parser.addOption(exerciseScaleFactorToggleFromOpt);
@@ -1390,7 +1390,7 @@ static int runGuiPlaybackSmoke(QApplication &app)
 
     const QCommandLineOption stressSwitchAtMsOpt(
         QStringLiteral("stress-switch-at-ms"),
-        QStringLiteral("Elapsed playback milliseconds before the lifecycle stress sequence starts. The switch stops Play, so it must be at least 20000 (the 20 s play floor)."),
+        QStringLiteral("Elapsed playback milliseconds before the lifecycle stress sequence starts. The switch stops Play, so it must be at least the clip's play floor (20000; 10000 for a clip of 50 fps or more)."),
         QStringLiteral("milliseconds"),
         QStringLiteral("20000"));
     parser.addOption(stressSwitchAtMsOpt);
@@ -1457,11 +1457,13 @@ static int runGuiPlaybackSmoke(QApplication &app)
         return 2;
     }
     // PLAYBACK-CLIP-LENGTH-ENFORCE-2 round 2 (hub ruling): --seconds IS the play window (the measured Play is
-    // stopped after it), so it must itself reach the 20 s floor -- refused here, typed and before any window.
-    if (seconds + 1e-9 < playback_frame_range::kMinPlayWindowSeconds)
+    // stopped after it), so it must itself reach the floor -- refused here, typed and before any window.
+    // HFR-10S-1: the clip is not open yet, so this refuses what NO clip could admit (the lowest floor, an HFR
+    // clip's); runGuiPlaybackSmoke applies the clip's own floor (minPlayWindowSeconds of its native fps) before Play.
+    if (seconds + 1e-9 < playback_frame_range::kLowestMinPlayWindowSeconds)
     {
         err << "[GUI-SMOKE] ERROR: PLAY_DURATION_TOO_SHORT (--seconds=" << seconds
-            << " window=" << playback_frame_range::kMinPlayWindowSeconds << ")\n";
+            << " window=" << playback_frame_range::kLowestMinPlayWindowSeconds << ")\n";
         return 14;
     }
 
@@ -1539,12 +1541,13 @@ static int runGuiPlaybackSmoke(QApplication &app)
         return 2;
     }
     // ENFORCE-2 round 2 (sol B2): the lifecycle stress switch STOPS Play on the first clip; before the floor it
-    // would end a Play shorter than 20 s. Refused up front when the mode is requested.
+    // would end a Play shorter than the floor. Refused up front when the mode is requested (HFR-10S-1: below the
+    // lowest floor any clip has; runGuiPlaybackSmoke applies the clip's own floor once it is open).
     if (parser.isSet(exerciseClipLifecycleStressOpt)
-        && !playback_frame_range::stressSwitchReachesFloor(stressSwitchAtMs))
+        && !playback_frame_range::stressSwitchReachesFloor(stressSwitchAtMs, playback_frame_range::kLowestMinPlayWindowSeconds))
     {
         err << "[GUI-SMOKE] ERROR: PLAY_DURATION_TOO_SHORT (--stress-switch-at-ms=" << stressSwitchAtMs
-            << " must be >= " << playback_frame_range::kMinPlayWindowMs << ")\n";
+            << " must be >= " << playback_frame_range::kLowestMinPlayWindowSeconds * 1000.0 << ")\n";
         return 14;
     }
     if (parser.isSet(exerciseClipLifecycleStressOpt)

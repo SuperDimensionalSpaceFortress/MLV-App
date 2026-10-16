@@ -19,7 +19,8 @@
 #   2. ADMIT THE CLIP (round 2, owner rule 2026-09-30): a leg names a CONSENTED CLIP ID, never a path. A tracked
 #      fixture (2 / 16 frames) is refused by master's length gate (FIXTURE_REFUSED_CLIP_TOO_SHORT); a clip this
 #      VENUE has no owner-typed record for in venue-clip-consent.json is refused (VENUE_CLIP_CONSENT_ABSENT);
-#      a play window under 20 s is refused (PLAY_WINDOW_TOO_SHORT); the reviewed cleanup switch must be on
+#      a play window under the lowest floor (10 s, an HFR clip's; 20 s otherwise, applied at the venue) is refused
+#      (PLAY_WINDOW_TOO_SHORT); the reviewed cleanup switch must be on
 #      (OWNER_CLIP_REFUSED_PENDING_CROSS_VOLUME_2). All BEFORE anything is generated or submitted;
 #   3. generate the job (tools/profiling/bachelor/playback-attr-3-cuda-job.ps1 -ClipId -PlaySeconds -Venue -Backend ...):
 #      the generator resolves the clip by id and refuses what master's clip-length gate refuses;
@@ -112,7 +113,7 @@ if ($PSCmdlet.ParameterSetName -eq 'Set') {
     $setPlan = Get-DvLegSetPlan -LegSetPath (Join-Path $here "legsets\$LegSet.json") -Repeats $Repeats -Backend $Backend
     Write-Output "DVE_LEGSET=$($setPlan.legSet) CARD=$($setPlan.card) CLIP=$($setPlan.clipId) CELLS=$(@($setPlan.cells).Count) REPEATS=$Repeats LEGS=$(@($setPlan.plan).Count)"
     foreach ($entry in $setPlan.plan) {
-        Write-Output ('DVE_PLAN {0}/{1} repeat={2} cell={3} leg={4} backend={5} display={6} scale={7}' -f $entry.seq, @($setPlan.plan).Count, $entry.repeat, $entry.cellId, $entry.legId, $entry.backend, $entry.displayMode, $entry.scaleFactor)
+        Write-Output ('DVE_PLAN {0}/{1} repeat={2} cell={3} leg={4} backend={5} display={6} scale={7} resolution={8}' -f $entry.seq, @($setPlan.plan).Count, $entry.repeat, $entry.cellId, $entry.legId, $entry.backend, $entry.displayMode, $entry.scaleFactor, (Get-DvScaleLabel -Factor $entry.scaleFactor))
     }
     if ($PlanOnly) { exit 0 }
     foreach ($needed in 'Venue', 'SourceCommit', 'BuildManifestSha256') {
@@ -218,7 +219,8 @@ if ([string]::IsNullOrWhiteSpace($Backend)) { $Backend = [string]@($spec.backend
 if ($Backend -notin @($spec.backends)) { throw "DVE_LEG_SPEC_INVALID backend '$Backend' is not one of this leg's backends ($(@($spec.backends) -join ', '))" }
 $isLook = ($spec.legType -eq 'look')
 # The settled-playback window the job passes to the smoke runner (generator -PlaySeconds). The generator's own default
-# is 25; the owner's floor is 20 and is enforced here before anything is submitted.
+# is 25; the owner's floor (20 s, 10 s for an HFR clip: HFR-10S-1) is enforced here, at its lowest, before anything is
+# submitted, and at the clip's own value by the venue's runner and the app.
 $playSeconds = 25
 if ($null -ne $spec.PSObject.Properties['playSeconds']) { $playSeconds = [int]$spec.playSeconds }
 $lookFlavor = $null
@@ -341,7 +343,9 @@ try {
     }
     # The consent and the venue table must be the COMMITTED ones (production) before anything else is decided.
     if ($null -ne $admissionRefusal) { Stop-Refused $admissionRefusal }
-    if ($playSeconds -lt 20) { Stop-Refused 'PLAY_WINDOW_TOO_SHORT' }
+    # HFR-10S-1: a leg names a clip id, never its fps, so it refuses only what NO clip could admit; the venue's runner
+    # (the clip's header) and the app refuse a window under that clip's own floor (20 s, 10 s for an HFR clip).
+    if ($playSeconds -lt (Get-DvMinPlaySeconds -LowestAnyClip)) { Stop-Refused 'PLAY_WINDOW_TOO_SHORT' }
     $admission = Get-DvClipAdmission -ClipId ([string]$spec.clipId) -Venue $Venue -Table $table -ConsentText ([string]$sources.consentText) -RepoRoot $RepoRoot
     if (-not $admission.admitted) { Stop-Refused ([string]$admission.reason) }
     $receipt.admission.ownerLineSha256 = $admission.ownerLineSha256
@@ -597,7 +601,7 @@ if ($null -ne $summary -or $null -ne $runLogText) {
 # The scale the app RENDERED at, from its own run log (never from the spec): the receipt carries both numbers and the leg cannot PASS under a scale it did not render at.
 $scale = Get-DvScaleEvidence -Spec $spec -Backend $Backend -LogText $runLogText
 $receipt.scale = $scale
-$scaleNote = "requested scale $($scale.requestedScale), rendered at $($scale.effectiveScale)"
+$scaleNote = "requested scale $($scale.requestedScale) [$(Get-DvScaleLabel -Factor $scale.requestedScale)], rendered at $($scale.effectiveScale) [$(Get-DvScaleLabel -Factor $scale.effectiveScale)]"
 # The display mode the app RAN in and the window it presented in, from its own gui_smoke.window_placement line (never from the spec): the receipt carries the requested and the observed mode.
 $display = Get-DvDisplayEvidence -Spec $spec -LogText $runLogText
 $receipt.display = $display
@@ -708,7 +712,7 @@ if ($outcome -eq 'CAPTURED') {
     $sheetMissing = $isLook -and ($null -eq $receipt.look -or $null -eq $receipt.look.contactSheet)
     # (a capture that published NO run log has no proof at all -- no rendered scale to read, no source frames -- and ends INVALID below, not here)
     if (-not $scale.honoured -and $null -ne $runLogText) {
-        $declared = $(if ([int]$scale.acceptedEffectiveScale -ne [int]$scale.requestedScale) { "the spec declares this backend renders at $($scale.acceptedEffectiveScale)" } else { 'no clamp is declared for this backend' })
+        $declared = $(if ([int]$scale.acceptedEffectiveScale -ne [int]$scale.requestedScale) { "the spec declares this backend renders at $($scale.acceptedEffectiveScale) [$(Get-DvScaleLabel -Factor $scale.acceptedEffectiveScale)]" } else { 'no clamp is declared for this backend' })
         $outcome = 'SCALE_NOT_HONOURED'
         $detail = "CAPTURED but $scaleNote (read from: $($scale.effectiveScaleSource); $declared). A run that did not render at the scale this leg names is no signal under it: the leg is not passed or failed"
     }
@@ -717,7 +721,7 @@ if ($outcome -eq 'CAPTURED') {
     elseif (-not $verdictCriteria.pass) { $outcome = 'FAIL'; $detail = 'CAPTURED; criteria failed: ' + ($verdictCriteria.failures -join '; ') }
     else { $outcome = 'PASS'; $detail = $(if ($verdictCriteria.informational) { 'CAPTURED; no gating criteria for this role/backend (informational)' } else { 'CAPTURED; every criterion for this role/backend held' }) }
     # A declared clamp (the CUDA texture route renders at 1 whatever the request) still passes, but never silently: the detail carries both numbers.
-    if ($outcome -in @('PASS', 'FAIL') -and $scale.verdict -ceq 'DECLARED_CLAMP') { $detail += "; $scaleNote (the spec declares this backend renders at $($scale.acceptedEffectiveScale))" }
+    if ($outcome -in @('PASS', 'FAIL') -and $scale.verdict -ceq 'DECLARED_CLAMP') { $detail += "; $scaleNote (the spec declares this backend renders at $($scale.acceptedEffectiveScale) [$(Get-DvScaleLabel -Factor $scale.acceptedEffectiveScale)])" }
 }
 # DUAL-VENUE-DISPLAY-MATRIX-1, FAIL CLOSED: a leg that ran in a display mode other than the one it names (a requested-windowed leg that ran full screen, or the reverse), or that NAMES a mode the
 # run log cannot confirm, is not a valid measurement under that mode: a typed INVALID with the reason, never a PASS or FAIL. (A legacy spec that names no mode keeps its old behaviour.)
