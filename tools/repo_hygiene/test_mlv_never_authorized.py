@@ -9109,6 +9109,21 @@ class Na2AssignmentIsNotADeleteTests(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertIn("delete", self._acts(cmd))
 
+    def test_any_cmd_or_comspec_mention_selects_the_strict_reading(self):
+        # r5 (sol r4 key): `/c` glued to the command word, and %ComSpec% instead of the name.
+        for cmd in ("cmd.exe /cecho cleanup '&' rd= /s /q C:/review/board/.claude-state/fleet-runs/lane-A-r1",
+                    "cmd.exe /cecho cleanup '&' rmdir= /s /q C:\\x", "cmd.exe /cecho cleanup '&' del= /q C:\\x\\y.txt",
+                    "cmd.exe /d /cecho x '&' rd= /s /q C:\\x", '%ComSpec% /c rd= /s /q C:\\x',
+                    '& $env:ComSpec /c rd= /s /q C:\\x'):
+            with self.subTest(cmd=cmd):
+                self.assertIn("delete", self._acts(cmd))
+
+    def test_assignment_without_any_cmd_mention_is_still_not_a_delete(self):
+        # The exemption still holds when nothing in the text names cmd.exe.
+        for cmd in ('RD="/c/x/lane-A-r1"; cat "$RD/a.json"', 'DEL=1; echo $DEL; ls /c/commands'):
+            with self.subTest(cmd=cmd):
+                self.assertNotIn("delete", self._acts(cmd))
+
     def test_cmd_mentioned_in_a_string_stays_fail_closed(self):
         # Known fail-closed direction (sol r2 hardening row): an assignment next to text that merely
         # mentions `cmd /c` is read strictly. Documented, not loosened.

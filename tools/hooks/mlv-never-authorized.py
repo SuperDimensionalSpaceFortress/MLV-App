@@ -1257,7 +1257,10 @@ _DELETE_RX_STRICT = re.compile(r"(?:^|[\s;&|`(\"'])(?:rm|del|rd|rmdir)\b" + _DEL
 # of leading `/x...` switches is skipped before the `/c` or `/k` that runs the command string.
 # r4 (sol r3 key): Git Bash needs `cmd //c` (doubled slash) and cmd.exe accepts compact switches (`cmd /s/c`,
 # `cmd/c`), so slashes may repeat and the whitespace before a switch is optional.
-_CMD_SEGMENT_RX = re.compile(r"\bcmd(?:\.exe)?\b[\"']?(?:\s*/+[A-Za-z][^\s/\"']*)*?\s*/+[ckCK]\b", re.I)
+# r5 (sol r4 key): `/c` may also be glued to the command (`cmd.exe /cecho x & rd= ...`). Four rounds of switch syntax
+# showed that parsing cmd.exe's switches is the wrong shape: ANY mention of cmd/cmd.exe or %ComSpec% now selects the
+# strict regex. Fail-closed by design; the cost is the documented mention-in-a-string deny (NA2-CMD-MENTION-IN-STRING-1).
+_CMD_SEGMENT_RX = re.compile(r"\bcmd(?:\.exe)?\b|\bcomspec\b", re.I)
 _MOVE_RX = re.compile(
     r"(?:^|[\s;&|`(])(?:mv|move)\b"
     r"|\bmove-item\b"
