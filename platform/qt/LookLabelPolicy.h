@@ -13,6 +13,7 @@
 #define LOOKLABELPOLICY_H
 
 #include "AutomationSettings.h"
+#include "../../src/batch/LookAssistAnalysis.h"
 
 #include <QRect>
 #include <QSize>
@@ -58,6 +59,16 @@ inline QString appliedText( bool lookAssistEnabled, const QString &appliedFlavor
 {
     if( lookAssistEnabled && safetyFallback ) return QStringLiteral( "Look: Baseline (fallback)" );
     return text( lookAssistEnabled, appliedFlavorName );
+}
+
+/*! \brief The ONE label derivation (MainWindow::updateLookLabel; every caller -- fullscreen toggle, setSliders, the
+ *  switch, the flavor, a landed analysis -- goes through it). It reads the outcome on screen: while an analysis is
+ *  pending, the one that last landed, so a re-derivation mid-analysis never names the selected flavor early. */
+inline QString shownText( bool lookAssistEnabled, const lookassist::LookAssistFlavorOutcome &outcome,
+                          const void *receipt, const QString &selectedFlavorName )
+{
+    const lookassist::LookAssistFlavorOutcome onScreen = outcome.shown();
+    return appliedText( lookAssistEnabled, onScreen.receiptValue( receipt, selectedFlavorName ), onScreen.fellBack( receipt ) );
 }
 
 /*! \brief The corner label is drawn only in fullscreen, and only while the setting shows it. */

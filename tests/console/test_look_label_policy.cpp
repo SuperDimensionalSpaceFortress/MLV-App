@@ -110,9 +110,8 @@ TEST(LookLabelWiring, L04LabelReadsTheAppliedOutcomeAndRefreshesWhenAnalysisLand
 {
     const QString mw = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     const QString update = functionBody(mw, QStringLiteral("void MainWindow::updateLookLabel( void )"));
-    ASSERT_TRUE(update.contains(QStringLiteral("look_label::appliedText(")));
-    ASSERT_TRUE(update.contains(QStringLiteral("m_lookAssistFlavorOutcome.receiptValue( lookReceipt,")));
-    ASSERT_TRUE(update.contains(QStringLiteral("m_lookAssistFlavorOutcome.fellBack( lookReceipt )")));
+    ASSERT_TRUE(update.contains(QStringLiteral("look_label::shownText(\n        lookOn, m_lookAssistFlavorOutcome, lookReceipt,")));
+    ASSERT_FALSE(update.contains(QStringLiteral("look_label::appliedText(")));
     ASSERT_FALSE(update.contains(QStringLiteral("look_label::text(")));
 
     // Every place an analysis lands (applied or safety fallback) re-derives the label before it logs or leaves:
@@ -152,6 +151,75 @@ TEST(LookLabelPolicy, PendingAnalysisKeepsThePreviousLabelUntilItLands)
     const int firstLanded = mw.indexOf(QStringLiteral("m_lookAssistFlavorOutcome.landed("), begin);
     ASSERT_TRUE(firstLanded > begin);
     ASSERT_FALSE(mw.mid(begin, firstLanded - begin).contains(QStringLiteral("updateLookLabel();")));
+}
+
+// CoS r6 (PR #459): the pin above covers only the text from begin() to the first landed(). While the analysis is
+// pending other callers re-derive the label -- a fullscreen toggle (on_actionFullscreen_triggered) and setSliders --
+// and after a fallback they named the selected flavor while the baseline was still on screen. The pending state now
+// lives in the ONE derivation, look_label::shownText, which every caller reaches through updateLookLabel.
+TEST(LookLabelPolicy, PendingAnalysisPinHoldsForEveryRederivation)
+{
+    int clip = 0, otherClip = 0;
+    const QString cinematic = QStringLiteral("cinematic");
+    lookassist::LookAssistFlavorOutcome outcome;
+    const auto shown = [&](bool on, const void *receipt) {
+        return look_label::shownText(on, outcome, receipt, cinematic).toStdString();
+    };
+    const std::string baseline("Look: Baseline (fallback)");
+
+    outcome.landed(&clip, cinematic, true);   // the analysis fell back: the baseline sliders are on screen
+    ASSERT_EQ(baseline, shown(true, &clip));
+    outcome.begin();                          // a new analysis is pending; the baseline is still on screen
+    ASSERT_EQ(baseline, shown(true, &clip));  // fullscreen toggle mid-analysis: updateLookLabel re-derives
+    ASSERT_EQ(baseline, shown(true, &clip));  // setSliders mid-analysis: updateLookLabel re-derives
+    outcome.begin();                          // the sync pass re-running as master's is still the same pending run
+    ASSERT_EQ(baseline, shown(true, &clip));
+    // Only the label is pinned: the receipt and the telemetry still read the selector's value while pending.
+    ASSERT_EQ(std::string("cinematic"), outcome.receiptValue(&clip, cinematic).toStdString());
+    ASSERT_FALSE(outcome.fellBack(&clip));
+    ASSERT_TRUE(outcome.appliedName().isEmpty());
+    // Look Assist off still wins, and another clip's label is not this clip's fallback.
+    ASSERT_EQ(std::string("Look: Off"), shown(false, &clip));
+    ASSERT_EQ(std::string("Look: Cinematic"), shown(true, &otherClip));
+    // It lands applied: the flavor applied.
+    outcome.landed(&clip, cinematic, false);
+    ASSERT_EQ(std::string("Look: Cinematic"), shown(true, &clip));
+    // Pending after an applied grade keeps naming it, and a fallback landing then names the baseline.
+    outcome.begin();
+    ASSERT_EQ(std::string("Look: Cinematic"), shown(true, &clip));
+    outcome.landed(&clip, cinematic, true);
+    ASSERT_EQ(baseline, shown(true, &clip));
+    // clear() (Look Assist off, flavor changed) ends the pending run: back to the selector.
+    outcome.begin();
+    outcome.clear();
+    ASSERT_EQ(std::string("Look: Cinematic"), shown(true, &clip));
+}
+
+TEST(LookLabelWiring, EveryLabelDerivationGoesThroughTheOnePendingAwareHelper)
+{
+    const QString mw = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    // One derivation in the whole window, in updateLookLabel; no caller builds its own label text.
+    const QString helperCall = QStringLiteral("look_label::shownText(");
+    const int at = mw.indexOf(helperCall);
+    ASSERT_TRUE(at >= 0);
+    ASSERT_EQ(-1, mw.indexOf(helperCall, at + 1));
+    ASSERT_TRUE(functionBody(mw, QStringLiteral("void MainWindow::updateLookLabel( void )")).contains(helperCall));
+    ASSERT_FALSE(mw.contains(QStringLiteral("look_label::appliedText(")));
+    // The two re-deriving callers the CoS named reach the label only through updateLookLabel.
+    const char *callers[] = {
+        "void MainWindow::on_actionFullscreen_triggered( bool checked )",
+        "void MainWindow::setSliders(ReceiptSettings *receipt, bool paste)",
+    };
+    for ( const char *caller : callers )
+    {
+        const QString body = functionBody(mw, QString::fromLatin1(caller));
+        ASSERT_TRUE(body.contains(QStringLiteral("updateLookLabel();")));
+        ASSERT_FALSE(body.contains(QStringLiteral("look_label::")));
+    }
+    // The helper reads the outcome ON SCREEN (the last landed one while pending), not the reported one.
+    const QString policy = readRepoFile(QStringLiteral("platform/qt/LookLabelPolicy.h"));
+    ASSERT_TRUE(functionBody(policy, QStringLiteral("inline QString shownText("))
+                    .contains(QStringLiteral("outcome.shown()")));
 }
 
 // The documented gap (PR #459 Known gap): MLVAPP_EXPERIMENTAL_GL_VIEWPORT installs GpuDisplayViewport, which owns the

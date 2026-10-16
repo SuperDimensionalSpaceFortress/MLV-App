@@ -825,17 +825,35 @@ private:
  *   clear()   Look Assist went off / the clip closed.
  * receiptValue(): the fallback names "classic" (Classic semantics: the writer leaves the element out, so the file is
  * byte-identical to a Classic receipt); an applied grade names the flavor applied; a clip with no recorded outcome
- * (Look Assist off, or the analysis is pending) keeps the selector's value, which is the clip's setting. */
+ * (Look Assist off, or the analysis is pending) keeps the selector's value, which is the clip's setting.
+ * shown(): the outcome ON SCREEN, which the look label reads -- while an analysis is pending, the one that last landed
+ * (the previous look stays on screen until this one lands); otherwise this outcome. */
 class LookAssistFlavorOutcome
 {
 public:
-    void begin() { clear(); }
-    void clear() { m_receipt = nullptr; m_applied.clear(); m_fellBack = false; }
+    void begin()
+    {
+        // A nested begin() (the sync pass re-running as master's) is the same pending run: keep what last landed.
+        if( !m_pending ) { m_shownReceipt = m_receipt; m_shownApplied = m_applied; m_shownFellBack = m_fellBack; }
+        m_receipt = nullptr; m_applied.clear(); m_fellBack = false;
+        m_pending = true;
+    }
+    void clear() { m_receipt = nullptr; m_applied.clear(); m_fellBack = false; m_pending = false; }
     void landed( const void *receipt, const QString &flavorName, bool safetyFallback )
     {
         m_receipt = receipt;
         m_fellBack = safetyFallback;
         m_applied = safetyFallback ? QString() : flavorName;
+        m_pending = false;
+    }
+    LookAssistFlavorOutcome shown() const
+    {
+        if( !m_pending ) return *this;
+        LookAssistFlavorOutcome last;
+        last.m_receipt = m_shownReceipt;
+        last.m_applied = m_shownApplied;
+        last.m_fellBack = m_shownFellBack;
+        return last;
     }
     /* The flavor on screen: empty until an analysis lands, and empty again after a safety fallback. */
     QString appliedName() const { return m_applied; }
@@ -851,6 +869,10 @@ private:
     const void *m_receipt = nullptr;
     QString m_applied;
     bool m_fellBack = false;
+    bool m_pending = false;   // begin() ran and nothing has landed or cleared since
+    const void *m_shownReceipt = nullptr;   // what last landed, kept for shown() while pending
+    QString m_shownApplied;
+    bool m_shownFellBack = false;
 };
 
 /* flavor defaults to Classic, so every caller that does not pass one is master's. The scene verdict is the

@@ -30191,9 +30191,8 @@ void MainWindow::updateLookLabel( void )
                      && ui->checkBoxLookAssistEnable->isChecked();
     // The look APPLIED (L-04): a safety fallback restored the baseline, so the label must not name the selected flavor.
     const void *lookReceipt = lookOn ? ACTIVE_RECEIPT : nullptr;
-    const QString text = look_label::appliedText(
-        lookOn, m_lookAssistFlavorOutcome.receiptValue( lookReceipt, lookAssistFlavorName( currentLookAssistFlavor() ) ),
-        m_lookAssistFlavorOutcome.fellBack( lookReceipt ) );
+    const QString text = look_label::shownText(
+        lookOn, m_lookAssistFlavorOutcome, lookReceipt, lookAssistFlavorName( currentLookAssistFlavor() ) );
     const bool fullscreenShown =
         look_label::fullscreenOverlayShown( ui->actionFullscreen->isChecked(), m_lookLabelShowInFullscreen );
     if( text == m_lookLabelText && fullscreenShown == m_lookLabelFullscreenShown ) return;
