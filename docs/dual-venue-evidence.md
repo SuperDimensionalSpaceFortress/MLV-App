@@ -306,7 +306,7 @@ The job composes a one-backend sheet; `New-VenueSheetPair.ps1` then pairs the tw
 into one `cuda | cpu` sheet, by frame index. Each receipt's `look` block carries the sheet's sha256 and
 path; the pair is its own record (`mlv-app/dual-venue-sheet-pair/v1`) because receipts are never edited.
 
-* `lookFlavor` (`classic` default | `cinematic`) is in the leg spec and the receipt subject and is passed
+* `lookFlavor` (`classic` default | `cinematic` | `film` | `vision50d`) is in the leg spec and the receipt subject and is passed
   to the app as `MLVAPP_LOOK_ASSIST_FLAVOR`. The app reads it (LOOK-ASSIST-FLAVORS-1,
   [docs/look-assist-flavors.md](look-assist-flavors.md)) and reports the flavor it applied on
   `gui_smoke.visual_state` (`look_assist_flavor`). The job copies that report into its summary as
@@ -386,7 +386,7 @@ the generator's `-DisplayMode windowed`; `fullscreen` passes nothing, so a full-
 * **The standard leg set** is `legsets/display-matrix.json`: the owner clip M16-1243, Look Assist Cinematic, `{fullscreen, windowed}` x `{scale 1 = full, 2 = half, 4 = quarter}` x `{cuda, cpu}` = **12 cells**.
   Each cell is an ordinary committed leg spec (`legs/m16-1243-display-<mode>-s<scale>.json`, six specs, each listing both backends); the set only names them. Why a set file and not one matrix spec the
   runner expands: a receipt is bound to a committed spec by its sha256 (`Find-DvCommittedLegSpec`), so a cell that is not a committed spec could never validate. The CUDA texture route honours scales 2 and 4
-  (PLAYBACK-CUDA-HONOUR-SCALE-1), so no cell declares a clamp: a CUDA cell that rendered at 1 reads `2->1` or `4->1` and ends `SCALE_NOT_HONOURED`.
+  (PLAYBACK-CUDA-HONOUR-SCALE-1), so no cell declares a clamp: a CUDA cell that rendered at full resolution reads `Half res (0.5x)->Full res (1x)` or `Quarter res (0.25x)->Full res (1x)` in the summary table (receipt fields stay the numbers `2`/`4` and `1`) and ends `SCALE_NOT_HONOURED`.
   Roles are declared in `venues.json` (`DUAL-VENUE-DISPLAY-MATRIX-1`: Bachelor acceptance, Ultra-Magnus supplementary).
 * **Run it** (one entry point, the same script; `-LegSet` and `-LegSpec` are different parameter sets):
 

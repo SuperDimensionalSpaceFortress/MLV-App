@@ -1,8 +1,8 @@
-# Look Assist flavors: Classic | Cinematic | Film grade
+# Look Assist flavors: Classic | Cinematic | Film grade | Kodak Vision3 50D
 
 Look Assist analyses a clip (scene verdict, exposure, white balance) and writes a handful of receipt sliders.
-Since LOOK-ASSIST-FLAVORS-1 it can do so in one of two flavors, and since LOOK-ASSIST-FILM-FLAVOR-1 in a third
-(Film grade, below). The owner's directive (2026-09-26): *video shouldn't look raw or unprocessed with look
+Since LOOK-ASSIST-FLAVORS-1 it can do so in one of two flavors, since LOOK-ASSIST-FILM-FLAVOR-1 in a third
+(Film grade, below), and since LOOK-ASSIST-KODAK-VISION-50D-1 in a fourth (Kodak Vision3 50D, below). The owner's directive (2026-09-26): *video shouldn't look raw or unprocessed with look
 assist active; it should have an aesthetic cinematic color grade.*
 
 * **Classic** is Look Assist exactly as it was: the same sliders, the same receipt, the same picture, in every
@@ -256,11 +256,25 @@ invalid for this. `--illustrative` still composes an eyeball-only strip, marked 
 Licence: the control points are original and are evaluated by the already-vendored `tk::spline`; no third-party
 LUT or colour-science maths is borrowed.
 
+## Kodak Vision3 50D
+
+Kodak and Vision3 are trademarks of Eastman Kodak Company. This mode is an original approximation: its control points
+are original, and no Kodak LUT or data is used. It is not affiliated with or endorsed by Kodak.
+
+The owner's pick from the 2026-10-15 preview sheet (look C, "Vision3 50D clean"): crisp contrast, a neutral colour
+balance, richer colour. **Kodak Vision3 50D = Cinematic's tone + a vibrance delta + its own gradation curve**
+(`vision50d-v1`): a crisper Y line and a near-neutral R / B mirror at one knot. The machine spelling is `vision50d`; the
+GUI label is *Kodak Vision3 50D*. The curve is laid exactly where and how Film's is (only over a default curve, the same
+baseline element), and the restore puts either grade's curve back (`lookAssistGradeOwnsGradationCurve`). The recipe, its
+table, the vibrance ladder, the gates and the measured numbers are in
+[look-assist-vision50d.md](look-assist-vision50d.md). It is not cleared to ship: the M16-1243 re-grade lean gate (R2)
+fails with this curve.
+
 ## Choosing the flavor
 
 Layers, first non-empty one wins (`lookAssistSelectFlavor()`):
 
-1. `MLVAPP_LOOK_ASSIST_FLAVOR=classic|cinematic|film`: for runs (the venue legs set it). Case and whitespace do not matter.
+1. `MLVAPP_LOOK_ASSIST_FLAVOR=classic|cinematic|film|vision50d`: for runs (the venue legs set it). Case and whitespace do not matter.
 2. The receipt's `<lookAssistFlavor>` element, which the headless / batch path reads. It is **written only for a
    non-Classic flavor**, so a Classic receipt is byte-identical to what it always was; absent means Classic.
 3. The GUI's *Look Assist flavor* selector next to *Auto Look Assist*, persisted as the app setting
@@ -279,11 +293,11 @@ the selector and is corrected on the receipt).
 
 The flavor applied is always reported, appended to the end of the existing lines (never inserted):
 
-* GUI `look_assist.apply.result`: `... next_serial=<n> <decision trace fields> flavor=<classic|cinematic|film>` (the trace is LOOK-ASSIST-DIAG-LOGGING-1's, `has_ev100=` .. `playback_scale=`; flavor comes after it).
+* GUI `look_assist.apply.result`: `... next_serial=<n> <decision trace fields> flavor=<classic|cinematic|film|vision50d>` (the trace is LOOK-ASSIST-DIAG-LOGGING-1's, `has_ev100=` .. `playback_scale=`; flavor comes after it).
 * GUI `look_assist.apply.async_dispatch`: `... floor_lifted=<0|1> flavor=<...>`.
 * Headless `[BATCH] LOOK_ASSIST applied ...`: `... initialPatchFinalChroma=<x> <decision trace fields> flavor=<...>`.
-* On those three lines a Film apply appends ` grade=<film-v3|skipped_user_curve|none>` after `flavor=`; Classic and
-  Cinematic lines carry no `grade=` field (they stay byte-identical), and a reader takes its absence as `none`. The
+* On those three lines a Film apply appends ` grade=<film-v3|skipped_user_curve|none>` after `flavor=`, and a Kodak
+  Vision3 50D apply ` grade=<vision50d-v1|skipped_user_curve>`; Classic and Cinematic lines carry no `grade=` field (they stay byte-identical), and a reader takes its absence as `none`. The
   venue's GUI-smoke result carries it as `visualQuality.lookAssist.presetGrade`.
 * `gui_smoke.visual_state`: `... gpu_preview_processing_reject_reason=<r> look_assist_flavor=<...|none>`. It
   names a flavor only for a look that is on screen: `none` until an analysis lands, and `none` again after the
@@ -337,3 +351,7 @@ The flavor applied is always reported, appended to the end of the existing lines
   the white balance is Classic's on the fixtures; the CUDA display shader and the CPU direct8 route both take the
   Film curves, Y line included (`EngineAnchoredLookAssistFlavorsMatchEngineWithReceiptSCurve`, cases
   `look_assist_film_v3_night_real_frame` and `look_assist_film_v3_shade_real_frame`).
+* Kodak Vision3 50D (vision50d-v1): the console tests (selector, receipt, table, T7 preset, decisions, T8 ownership, GUI
+  selector, result lines), suite `LookAssistVision50dGrade` (T1..T6), the fixture gates and headless ownership cases in
+  `LookAssistFlavorsFixture`, and the GPU parity cases `look_assist_vision50d_night_real_frame` and
+  `look_assist_vision50d_shade_real_frame`. Listed by name in [look-assist-vision50d.md](look-assist-vision50d.md).
