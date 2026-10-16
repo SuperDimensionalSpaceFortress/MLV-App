@@ -32,8 +32,8 @@ change that teaches it.
 
 ```markdown
 ---
-target: TRAPS.md          # RECEIPTS.md | TRAPS.md | RULINGS.md | specs/mlv-app/cards.md (other specs are steward-owned)
-kind: trap                # receipt | trap | ruling
+target: TRAPS.md          # RECEIPTS.md | TRAPS.md | RULINGS.md | specs/mlv-app/cards.md | specs/mlv-app/cos-concerns.md (other specs are steward-owned)
+kind: trap                # receipt | trap | ruling | concern (concern goes only with cos-concerns.md)
 source_commit: PENDING    # PENDING = the commit that adds this file; or an explicit sha
 law4: attested            # required, then SCREENED, never trusted
 # ratified_by: <RULINGS anchor>   required for RULINGS.md; sessions do not mint law
@@ -52,6 +52,20 @@ if they carry an email address, an account or org uuid, a lane wire path, `HUB.m
 pattern, a user-home path, this host's name or account name, or anything in an optional deny file. MLV
 adds its own deny terms: `.claude-state`, `subject-ledger`, `fleet-runs`, `HUB_RUN_WAL`, `dual-lane`, and
 the name of the GPU host. A refusal names the class, never the matched value.
+
+## Concerns to the CoS (COS-CONCERN-CHANNEL-1)
+
+A project had no way to tell the CoS a concern: only the CoS writes `cos-feedback/`, and a project-owned
+file is the one legal shape (bus Law 2). `target: specs/mlv-app/cos-concerns.md` with `kind: concern` is
+that file. The body is a `### mlv-app-cc-<yyyymmdd>-<n>` heading and exactly seven `- field: value` lines,
+each on one line: `id`, `to` (always `CoS`), `opened_utc`, `expires_utc` (after `opened_utc`; the standard
+is 14 days), `kind` (`output-format` | `process` | `shared-tool-defect` | `fleet-pattern`), `evidence` (bus
+SHAs, public PR comment ids, repo paths) and `ask` (one sentence). The set is closed, so no field can carry
+an approval, a ruling or a permission. The CoS answers each id once, in its own `cos-feedback/mlv-app/concerns.md`:
+`<id> ADOPTED|DISTINGUISHED|NEEDS-INFO <reason>`. Open = entries with no answer line and not expired, derived
+and never stored. The drain holds an entry (`CONCERN_CHANNEL_NOT_RATIFIED`) until the fetched bus tip's
+`cos-feedback/README.md` names `CoS-CONCERN:`, so nothing is written to a file nobody reads. A concern about
+one PR goes instead as a comment on that PR's thread starting `CoS-CONCERN:`.
 
 ## Traps are cards (bus R14.1)
 

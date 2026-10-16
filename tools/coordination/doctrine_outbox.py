@@ -86,8 +86,18 @@ TOOL_REL = "tools/coordination/doctrine_outbox.py"
 DEFAULT_REF = "refs/remotes/fork/master"
 # R14.1/R14.7: a project writes its own specs/<project>/cards.md; every other spec stays steward-owned.
 CARDS_TARGET = f"specs/{PROJECT}/cards.md"
-TARGETS = ("RECEIPTS.md", "TRAPS.md", "RULINGS.md", CARDS_TARGET)
-KINDS = ("receipt", "trap", "ruling")
+# The project-to-CoS concern channel (card COS-CONCERN-CHANNEL-1): a project-owned file, one writer (bus Law 2).
+# The CoS answers each id once in its own cos-feedback/<project>/concerns.md; this tool never writes that file.
+CONCERNS_TARGET = f"specs/{PROJECT}/cos-concerns.md"
+CONCERNS_READER_FILE = "cos-feedback/README.md"
+CONCERNS_READER_TOKEN = "CoS-CONCERN:"
+CONCERN_FIELDS = ("id", "to", "opened_utc", "expires_utc", "kind", "evidence", "ask")
+CONCERN_KINDS = ("output-format", "process", "shared-tool-defect", "fleet-pattern")
+CONCERN_DEFAULT_DAYS = 14
+CONCERN_ID_RE = re.compile(r"^" + re.escape(PROJECT) + r"-cc-[0-9]{8}-[0-9]{1,3}$")
+CONCERN_UTC_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
+TARGETS = ("RECEIPTS.md", "TRAPS.md", "RULINGS.md", CARDS_TARGET, CONCERNS_TARGET)
+KINDS = ("receipt", "trap", "ruling", "concern")
 CARD_VALIDATOR_REL = "tools/validate-cards.mjs"
 CARD_VALIDATOR_TIMEOUT_S = 120
 # The summary line the tip's validator prints on every run that reaches its main(). Only exit 0 AND this
@@ -105,6 +115,8 @@ MAX_CARD_LINES = 15
 MAX_CARD_BYTES = 2000
 CARD_HEADING_RE = re.compile(r"^## " + re.escape(PROJECT) + r"/[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 CARDS_TITLE = f"# {PROJECT} cards (R14.1; written only by {PROJECT})\n\n"
+CONCERNS_TITLE = (f"# {PROJECT} concerns to the CoS (written only by {PROJECT}; the CoS answers in "
+                  f"cos-feedback/{PROJECT}/concerns.md)\n\n")
 WORD_CAP = 450
 ITEM_NAME_RE = re.compile(r"^\d{8}-[a-z0-9][a-z0-9-]{2,60}\.md$")
 SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
@@ -266,6 +278,8 @@ def parse_item(text: str) -> dict:
         raise Refusal("ITEM_BAD_KIND", meta["kind"])
     if meta["target"] == CARDS_TARGET and meta["kind"] != "trap":
         raise Refusal("ITEM_CARD_NOT_A_TRAP", f"{CARDS_TARGET} holds trap cards only (R14.1); a {meta['kind']} keeps its own target")
+    if (meta["target"] == CONCERNS_TARGET) != (meta["kind"] == "concern"):
+        raise Refusal("ITEM_CONCERN_TARGET_MISMATCH", f"kind: concern and target: {CONCERNS_TARGET} go together, and only together")
     if meta["source_commit"] != "PENDING" and not SHA_RE.match(meta["source_commit"]):
         raise Refusal("ITEM_BAD_SOURCE_COMMIT", meta["source_commit"])
     if "published_as" in meta and not SHA_RE.match(meta["published_as"]):
@@ -282,7 +296,46 @@ def parse_item(text: str) -> dict:
                                                   f"(R14.1; format in the bus's {CARD_VALIDATOR_REL})")
     elif not body.lstrip().startswith("### "):
         raise Refusal("ITEM_BODY_NOT_AN_ENTRY", "body must start with a '### ' heading (bus entry grammar)")
+    if meta["target"] == CONCERNS_TARGET:
+        screen_concern(body)
     return {"meta": meta, "body": body}
+
+
+def screen_concern(body: str) -> None:
+    """A concern entry is a heading plus exactly the seven `- field: value` lines of CONCERN_FIELDS, each on one
+    line. The field set is closed, so no field can carry an approval, a ruling or a permission: the channel
+    is a message to the CoS, never a grant (conjugal-fleet-advisory-channel security musts). Every entry
+    expires, and its id is the heading, so the CoS's one-line answer names it exactly."""
+    rows = [ln.rstrip() for ln in body.strip().splitlines() if ln.strip()]
+    heading_id = rows[0][4:].strip()
+    if not CONCERN_ID_RE.match(heading_id):
+        raise Refusal("CONCERN_BAD_ID", f"the heading must be '### {PROJECT}-cc-<yyyymmdd>-<n>'")
+    fields: dict[str, str] = {}
+    for ln in rows[1:]:
+        m = re.match(r"^- ([a-z_]+): (\S.*)$", ln)
+        if not m:
+            raise Refusal("CONCERN_BAD_LINE", "every line after the heading is '- <field>: <value>' on one line")
+        if m.group(1) not in CONCERN_FIELDS:
+            raise Refusal("CONCERN_UNKNOWN_FIELD", f"{m.group(1)}; the closed set is {', '.join(CONCERN_FIELDS)}")
+        if m.group(1) in fields:
+            raise Refusal("CONCERN_DUPLICATE_FIELD", m.group(1))
+        fields[m.group(1)] = m.group(2).strip()
+    missing = [f for f in CONCERN_FIELDS if f not in fields]
+    if missing:
+        raise Refusal("CONCERN_MISSING_FIELD", ", ".join(missing))
+    if fields["id"] != heading_id:
+        raise Refusal("CONCERN_ID_MISMATCH", "the id field must equal the heading")
+    if fields["to"] != "CoS":
+        raise Refusal("CONCERN_BAD_ADDRESSEE", "to: CoS is the only addressee")
+    if fields["kind"] not in CONCERN_KINDS:
+        raise Refusal("CONCERN_BAD_KIND", f"{fields['kind']} not in {CONCERN_KINDS}")
+    for f in ("opened_utc", "expires_utc"):
+        if not CONCERN_UTC_RE.match(fields[f]):
+            raise Refusal("CONCERN_BAD_TIME", f"{f} must be YYYY-MM-DDTHH:MM:SSZ")
+    if fields["expires_utc"] <= fields["opened_utc"]:
+        raise Refusal("CONCERN_NOT_EXPIRING", "expires_utc must be after opened_utc (every message expires)")
+    if not heading_id.split("-cc-")[1].startswith(fields["opened_utc"][:10].replace("-", "")):
+        raise Refusal("CONCERN_ID_DATE", "the id date must be the opened_utc date")
 
 
 def _word_boundary_pattern(value: str) -> re.Pattern[str]:
@@ -664,11 +717,29 @@ def r14_gate(bus_repo: pathlib.Path, tip: str, candidates: list[dict], report: d
                        f"node is not on PATH, so {CARD_VALIDATOR_REL} cannot run; a card is never published unvalidated")
         elif c["target"] == CARDS_TARGET and entry_problem:
             refusal = ("CARDS_PATH_NOT_REGULAR_FILE", f"{entry_problem}; a card is never written through a link or a non-regular entry")
+        elif c["target"] == CONCERNS_TARGET and not concern_reader_duty_on_bus(bus_repo, tip):
+            refusal = ("CONCERN_CHANNEL_NOT_RATIFIED",
+                       f"{CONCERNS_READER_FILE} at {tip[:12]} does not yet name '{CONCERNS_READER_TOKEN}'; a concern is held "
+                       f"until the CoS has taken the reader duty, so it is never written to a file nobody reads")
         if refusal is None:
             kept.append(c)
         else:
             report["refused"].append({"path": c["path"], "code": refusal[0], "detail": refusal[1]})
     return kept
+
+
+def concern_reader_duty_on_bus(bus_repo: pathlib.Path, tip: str) -> bool:
+    """The channel is live only once the fetched tip's cos-feedback README names the CoS-CONCERN reader duty
+    (the ratification this tool's R2 route waits for). The tip decides, never a date."""
+    text = bus_file_at(bus_repo, tip, CONCERNS_READER_FILE)
+    return text is not None and CONCERNS_READER_TOKEN in text
+
+
+def ensure_concerns_file(path: pathlib.Path) -> None:
+    """The project creates its own concerns file on its first concern (one writer, bus Law 2)."""
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(CONCERNS_TITLE.encode("utf-8"))
 
 
 def ensure_cards_file(path: pathlib.Path) -> None:
@@ -919,6 +990,9 @@ def drain(repo: pathlib.Path, bus_repo: pathlib.Path, ref: str, ledger: pathlib.
                 if c["target"] == CARDS_TARGET:
                     assert_no_link_in_path(wt, CARDS_TARGET)
                     ensure_cards_file(wt / c["target"])
+                elif c["target"] == CONCERNS_TARGET:
+                    assert_no_link_in_path(wt, CONCERNS_TARGET)
+                    ensure_concerns_file(wt / c["target"])
                 append_block_to_file(wt / c["target"], c["block"])
                 commits[c["key"]] = git_commit(wt, c["message"])
                 attempted[c["key"]] = commits[c["key"]]
