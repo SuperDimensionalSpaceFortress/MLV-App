@@ -4323,6 +4323,16 @@ class PlaybackScaleIsRequestedAndEffectiveTests(EvidenceFactory, ModuleMutationM
         self.assertIn("requested scale 4", receipt["outcomeDetail"])
         self.assertIn("rendered at 1", receipt["outcomeDetail"])
 
+    def test_the_outcome_detail_names_the_resolution_next_to_each_scale_number(self) -> None:
+        """SCALE-LABEL-CLARITY-1: "scale 4" / "rendered at 1" read backwards; the number stays (asserted above) and the words follow it."""
+        _, receipt, _ = self.leg("cuda", 4, line={"scale_request_last": 1, "scale_active_last": 1}, accepted={"cuda": 1})
+        detail = receipt["outcomeDetail"]
+        self.assertIn("requested scale 4 [Quarter res (0.25x)]", detail)
+        self.assertIn("rendered at 1 [Full res (1x)]", detail)
+        self.assertIn("renders at 1 [Full res (1x)]", detail)
+        _, receipt, _ = self.leg("cuda", 2, line={"scale_request_last": 1, "scale_active_last": 1})
+        self.assertIn("requested scale 2 [Half res (0.5x)]", receipt["outcomeDetail"])
+
     def test_a_declaration_does_not_excuse_a_run_that_rendered_at_neither_the_request_nor_the_declared_scale(self) -> None:
         # the declaration is a claim about the route; if the route changes (cuda now renders 4) the spec is stale and the leg stops passing until it is edited
         _, receipt, _ = self.leg("cuda", 4, line={"scale_request_last": 4, "scale_active_last": 4}, accepted={"cuda": 1})
@@ -4770,6 +4780,7 @@ class DisplayMatrixLegSetTests(unittest.TestCase):
         self.assertIn("DVE_LEGSET=display-matrix CARD=DUAL-VENUE-DISPLAY-MATRIX-1 CLIP=M16-1243 CELLS=12 REPEATS=2 LEGS=24", proc.stdout)
         self.assertIn("DVE_PLAN 1/24 repeat=1 cell=cuda-fullscreen-s1 leg=m16-1243-display-fullscreen-s1 backend=cuda display=fullscreen scale=1", proc.stdout)
         self.assertIn("DVE_PLAN 2/24 repeat=1 cell=cuda-windowed-s1 leg=m16-1243-display-windowed-s1 backend=cuda display=windowed scale=1", proc.stdout)
+        self.assertIn("display=windowed scale=1 resolution=Full res (1x)", proc.stdout, "SCALE-LABEL-CLARITY-1: the plan line says the resolution beside the factor")
         self.assertNotIn("DVE_RECEIPT_PATH", proc.stdout, "a plan runs nothing: no leg, so no receipt")
 
     def test_a_leg_set_that_runs_needs_a_venue_a_commit_and_a_build(self) -> None:
