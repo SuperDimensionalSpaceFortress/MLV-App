@@ -1260,7 +1260,17 @@ _DELETE_RX_STRICT = re.compile(r"(?:^|[\s;&|`(\"'])(?:rm|del|rd|rmdir)\b" + _DEL
 # r5 (sol r4 key): `/c` may also be glued to the command (`cmd.exe /cecho x & rd= ...`). Four rounds of switch syntax
 # showed that parsing cmd.exe's switches is the wrong shape: ANY mention of cmd/cmd.exe or %ComSpec% now selects the
 # strict regex. Fail-closed by design; the cost is the documented mention-in-a-string deny (NA2-CMD-MENTION-IN-STRING-1).
-_CMD_SEGMENT_RX = re.compile(r"\bcmd(?:\.exe)?\b|\bcomspec\b", re.I)
+# r6 (sol r5 key): cmd.exe is also reached WITHOUT its name -- Python shell=True / os.system, Node child_process,
+# Start-Process, WMI process creation, scheduled tasks. Any process-launch construct now selects the strict reading
+# too; the exemption survives only for plain shell text that launches nothing (the incident shape).
+_CMD_SEGMENT_RX = re.compile(
+    r"\bcmd(?:\.exe)?\b|\bcomspec\b"
+    r"|\bshell\s*=\s*true\b|\bos\.(?:system|popen|spawn\w*|exec\w*)\b|\bsubprocess\b|\bpopen\b"
+    r"|\bchild_process\b|\bexec(?:sync|file\w*)?\s*\(|\bspawn(?:sync)?\s*\("
+    r"|\bstart-process\b|\binvoke-expression\b|\biex\b|\binvoke-item\b|\bshellexecute\w*\b"
+    r"|\bwin32_process\b|\binvoke-cimmethod\b|\binvoke-wmimethod\b|\bwmic\b|\bschtasks\b|\bregister-scheduledtask\b"
+    r"|\b[cw]script\b|\bmshta\b|\brundll32\b|\bforfiles\b|\bstart\s+(?:\"|/)",
+    re.I)
 _MOVE_RX = re.compile(
     r"(?:^|[\s;&|`(])(?:mv|move)\b"
     r"|\bmove-item\b"

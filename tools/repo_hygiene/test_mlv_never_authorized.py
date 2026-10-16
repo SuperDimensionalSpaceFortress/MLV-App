@@ -9118,6 +9118,17 @@ class Na2AssignmentIsNotADeleteTests(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertIn("delete", self._acts(cmd))
 
+    def test_implicit_cmd_launchers_select_the_strict_reading(self):
+        # r6 (sol r5 key): cmd.exe reached without naming it.
+        for cmd in ("python -c \"import subprocess; subprocess.run('echo x & rd= /s /q C:\\\\x', shell=True)\"",
+                    "python -c \"import os; os.system('echo x & rmdir= /s /q C:\\\\x')\"",
+                    "node -e \"require('child_process').execSync('echo x & del= /q C:\\\\x\\\\y.txt')\"",
+                    "Start-Process -FilePath $env:SystemRoot\\System32\\x.exe -ArgumentList 'echo & rd= /s /q C:\\x'",
+                    "Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine='echo & rd= /s /q C:\\x'}",
+                    "schtasks /create /tn t /tr \"echo & rd= /s /q C:\\x\" /sc once /st 00:00"):
+            with self.subTest(cmd=cmd):
+                self.assertIn("delete", self._acts(cmd))
+
     def test_assignment_without_any_cmd_mention_is_still_not_a_delete(self):
         # The exemption still holds when nothing in the text names cmd.exe.
         for cmd in ('RD="/c/x/lane-A-r1"; cat "$RD/a.json"', 'DEL=1; echo $DEL; ls /c/commands'):
