@@ -11,6 +11,6 @@ applies: mlv-app, airmypc, agent-bridge, conjugal
 check: on the bus run `node tools/tool-census.mjs`; once the file below is adopted in the bus and vendored in airmypc and agent-bridge, the doctrine-outbox family reads 1 distinct version.
 supersedes: none
 evidence: measured
-- **Adopt:** bus steward replaces tools/conjugal-reference/doctrine_outbox.py with tools/coordination/doctrine_outbox.py from MLV-App master (PR OUTBOX-SINGLE-SOURCE-1), byte for byte; sha256 of its LF bytes 0d9ffe3d60b1179b65345855637260e4bd343bd13a7691deedcc540b9b21276e. Conjugal keeps its paths in its own config.
+- **Adopt:** bus steward replaces tools/conjugal-reference/doctrine_outbox.py with tools/coordination/doctrine_outbox.py from MLV-App master (PR OUTBOX-SINGLE-SOURCE-1), byte for byte; sha256 of its LF bytes a6beb9cf8fd425c6e19507202c577ce2063ed38126369766d65ad23ec26fd084. Conjugal keeps its paths in its own config.
 - **Vendor:** airmypc and agent-bridge copy the same bytes and keep a config of their own; verify with the sha256 above.
 - **Open:** the reference's Python entry drain(cfg, hr, project) for the harvest steward is not in the shared file; the steward calls the CLI `drain` or keeps a thin shim.

@@ -8,10 +8,15 @@ DOCTRINE-OUTBOX-ADOPT-MLV-1b and install against this CLI.
 
 **One file for the fleet (OUTBOX-SINGLE-SOURCE-1).** `tools/coordination/doctrine_outbox.py` is not edited
 per project: every project value (ref, items directory, finding paths, state files, Law-4 deny terms) is
-data in `doctrine-outbox.config.json` at the repo root, and the bus steward adopts the same bytes (the
-digest is pinned in that config's `vendored_from` and by `tests/coordination/test_doctrine_outbox_hooks.py`).
-Change behaviour by changing the config; change the tool only in the bus, then re-vendor. The same file
-also answers the hook commands `check`, `pre-push`, `stop`, `session-start` and `install-hooks`.
+data in `doctrine-outbox.config.json` at the repo root. The bus steward is asked to adopt the same bytes
+(handoff card in this directory; adoption is pending, and the bus's own reference copy is a different,
+older file until then). The digest is pinned in that config's `vendored_from` and by
+`tests/coordination/test_doctrine_outbox_hooks.py`. Change behaviour by changing the config; once the bus
+has adopted the file, change the tool only there and re-vendor. The same file also answers the hook
+commands `check`, `pre-push`, `stop`, `session-start` and `install-hooks`. `stop` judges the commits not
+yet on the remote (`default_range`, or `--ref R` for `R..HEAD`); `pre-push` hands git's stdin on to the
+layers after it (`git lfs pre-push`); `install-hooks` leaves the hook executable. A config that is
+present but invalid is `CONFIG_INVALID` (exit 1, naming the key), distinct from `CONFIG_ABSENT` (exit 2).
 
 **Derive state; this file holds none.** Every value below is a command.
 

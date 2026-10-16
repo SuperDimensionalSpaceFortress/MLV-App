@@ -5,8 +5,10 @@ ONE implementation for the whole fleet (owner P1, 2026-10-16: "the same tool exi
 versions"; tools/tool-census.mjs counts the drift). A project supplies only DATA, a
 `doctrine-outbox.config.json` at its repo root (or `--config`), and never edits this file.
 Every project-specific value (project name, default ref, items dir, finding paths, state and
-ledger paths, Law-4 deny terms) comes from that config; see
-tools/conjugal-reference/doctrine-outbox-README.md. Each project vendors this file byte-identically.
+ledger paths, Law-4 deny terms) comes from that config. The config schema is the `_CONFIG_KEYS` set
+and `configure()` below; no bus README documents it yet. The aim is that every project vendors this
+file byte-identically, but that is not true yet: the bus reference copy is a different, older file
+until the bus steward adopts this one, and a project vendors it only after that.
 
 Lineage: the fleet bus's reference outbox -> agent-bridge's port -> a second project's port,
 whose behaviours are the superset below. The item format, front matter, `parse_item`, the Law-4
@@ -64,9 +66,11 @@ BEHAVIOURS
    equal to the certified commit (R7) and recorded in the sent ledger.
 10. Hook commands, for a project that wires this file into git and agent hooks: `check` (an item
    unsent past a window is a stuck drain), `pre-push` (refuses a push whose commits fail
-   check-commits), `stop` (a Stop-hook nudge), `session-start` (installs the pre-push guard and
-   reports debt, never blocks), `install-hooks`. Each takes the repo as an optional first
-   positional, as git and agent hooks call them.
+   check-commits), `stop` (a Stop-hook nudge over the commits not yet on the remote),
+   `session-start` (installs the pre-push guard and reports debt, never blocks), `install-hooks`.
+   Each takes the repo as an optional first positional, as git and agent hooks call them. The
+   installed hook is made executable (git skips one that is not) and passes git's stdin through to
+   whatever layer follows the guard (git lfs pre-push reads the same ref lines).
 
 Nothing here runs itself: the OS drain task, Stop hook and heartbeat debt are the project's wiring.
 
@@ -80,13 +84,15 @@ Subcommands
     check-commits [--range A..B]               (alias: check-range; legacy: check-range REPO [A..B])
     check [REPO] [MAX_AGE_MIN]                 exit 1 when an unsent item is older than the window
     pre-push [REPO] [REMOTE URL]               git pre-push hook; ref lines arrive on stdin
-    stop [REPO]                                Stop hook; hook JSON arrives on stdin
+    stop [REPO] [--ref R]                      Stop hook; hook JSON arrives on stdin; judges R..HEAD
+                                               (default: the config's default_range)
     session-start [REPO]                       install the pre-push guard, report debt; exit 0
     install-hooks [REPO]                       install the pre-push guard only
 Global: [--config doctrine-outbox.config.json] [--repo PATH]
 
 Exit codes: 0 = ok. 1 = debt, undisposed findings, or a validation/screen refusal.
-2 = UNKNOWN (usage error, git failure, ref, tool or config absent). Refusals print to stderr.
+2 = UNKNOWN (usage error, git failure, ref, tool or config absent). Refusals print to stderr; a
+config that is present but wrong is the refusal CONFIG_INVALID (exit 1, naming the key), never CONFIG_ABSENT.
 """
 from __future__ import annotations
 
@@ -189,6 +195,7 @@ LAW4 = BASE_LAW4
 OUTBOX_REF_RE = re.compile(r"$^")
 CONFIG_PATH: pathlib.Path | None = None
 CONFIG_ROOT: pathlib.Path | None = None
+CONFIG_ERROR: Refusal | None = None   # why the config found at import was refused; None once configure() succeeds
 
 _CONFIG_KEYS = frozenset({
     "schema", "project", "tool_rel", "default_ref", "default_range", "outbox_dir", "sent_dir", "cards_target",
@@ -343,6 +350,7 @@ def configure(cfg: dict, config_path: pathlib.Path | None = None) -> None:
         "OUTBOX_REF_RE": re.compile(r"^(?:" + re.escape(outbox_dir) + r"/)?\d{8}-[a-z0-9][a-z0-9-]{2,60}\.md(?:@\S+)?$"),
         "CONFIG_PATH": config_path.resolve() if config_path is not None else None,
         "CONFIG_ROOT": config_path.resolve().parent if config_path is not None else None,
+        "CONFIG_ERROR": None,
     }
     values["KERNEL_SOURCES"] = {values["KERNEL_FILING_SRC"]: values["KERNEL_FILING_DEST"],
                                 values["KERNEL_SPEC_BLOCK_SRC"]: values["KERNEL_SPEC_DEST"]}
@@ -370,17 +378,22 @@ def find_config(start: pathlib.Path) -> pathlib.Path | None:
 
 def _autoconfigure() -> None:
     """Import-time: a vendored copy finds its own project's config. A broken config is not fatal at
-    import (the module stays unconfigured and main() reports it); nothing is guessed."""
+    import (the module stays unconfigured and main() reports it); nothing is guessed. The refusal is
+    kept in CONFIG_ERROR so require_configured() reports a config that is present but wrong as
+    CONFIG_INVALID, never as the CONFIG_ABSENT of a missing one."""
+    global CONFIG_ERROR
     try:
         found = find_config(pathlib.Path(__file__).resolve().parent)
         if found is not None:
             configure(load_config(found), found)
-    except Refusal:
-        pass
+    except Refusal as e:
+        CONFIG_ERROR = e
 
 
 def require_configured() -> None:
     if not PROJECT:
+        if CONFIG_ERROR is not None:
+            raise Refusal(CONFIG_ERROR.code, CONFIG_ERROR.detail)
         raise Unknown("CONFIG_ABSENT", f"no {CONFIG_NAME} found (pass --config, set ${CONFIG_ENV}, or keep it at the repo root)")
 
 
@@ -1792,32 +1805,52 @@ def install_pre_push(repo: pathlib.Path) -> str:
     hook = pathlib.Path(git(repo, "rev-parse", "--path-format=absolute", "--git-path", "hooks/pre-push"))
     hook.parent.mkdir(parents=True, exist_ok=True)
     marker = "# doctrine-outbox-guard"
+    # git hands a pre-push hook its ref lines on stdin, once. The guard's python reads that stream to
+    # the end, so the snippet spools it to a file, feeds the guard from the file, and then rebinds the
+    # hook's own stdin to the file: every layer after the guard (git lfs pre-push, a project's own
+    # checks) reads the same bytes git sent. The file is unlinked while the hook holds it open.
     snippet = (f"\n{marker}: findings reach the bus by file; a finding-path commit must declare.\n"
                f"REPO_ROOT=${{REPO_ROOT:-$(git rev-parse --show-toplevel)}}\n"
                f"OUTBOX_PY=\n"
                f"for cand in python3 python; do\n"
                f"  if command -v \"$cand\" >/dev/null 2>&1 && \"$cand\" --version >/dev/null 2>&1; then OUTBOX_PY=$cand; break; fi\n"
                f"done\n"
+               f"OUTBOX_STDIN=$(mktemp 2>/dev/null) || OUTBOX_STDIN=\"${{TMPDIR:-/tmp}}/outbox-pre-push.$$\"\n"
+               f"cat > \"$OUTBOX_STDIN\"\n"
                f"if [ -n \"$OUTBOX_PY\" ]; then\n"
-               f"  \"$OUTBOX_PY\" \"$REPO_ROOT/{TOOL_REL}\" pre-push \"$REPO_ROOT\" \"$@\" || exit $?\n"
+               f"  \"$OUTBOX_PY\" \"$REPO_ROOT/{TOOL_REL}\" pre-push \"$REPO_ROOT\" \"$@\" < \"$OUTBOX_STDIN\" || {{ OUTBOX_RC=$?; rm -f \"$OUTBOX_STDIN\"; exit $OUTBOX_RC; }}\n"
                f"else\n"
                f"  echo \"doctrine-outbox: no python on PATH; the push guard did not run\" >&2\n"
-               f"fi\n")
+               f"fi\n"
+               f"exec < \"$OUTBOX_STDIN\"\n"
+               f"rm -f \"$OUTBOX_STDIN\" 2>/dev/null || true\n")
     current = hook.read_text(encoding="utf-8") if hook.exists() else "#!/bin/sh\nset -e\nREPO_ROOT=$(git rev-parse --show-toplevel)\n"
     if marker in current:
+        _make_executable(hook)   # an install made before the bit was set is repaired, not skipped
         return "present"
     lines = current.splitlines(True)
-    # Before the LFS layer if it is there (LFS reads stdin, which we do not touch, but keep the
-    # refusing guard ahead of a layer that may exit 2 for an unrelated reason).
+    # Before the LFS layer if it is there: the refusing guard goes ahead of a layer that may exit 2
+    # for an unrelated reason. The snippet restores stdin for that layer (see above).
     idx = next((i for i, line in enumerate(lines) if "git lfs pre-push" in line or "command -v git-lfs" in line), len(lines))
     lines.insert(idx, snippet)
     hook.write_text("".join(lines), encoding="utf-8", newline="\n")
+    _make_executable(hook)
     return "installed"
+
+
+def _make_executable(hook: pathlib.Path) -> None:
+    """git silently skips a pre-push hook that is not executable on POSIX. Grant execute to each
+    class that can already read the file, so a restrictive umask is not widened. On Windows the
+    call is a harmless no-op."""
+    mode = stat.S_IMODE(os.stat(hook).st_mode)
+    os.chmod(hook, mode | ((mode & (stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)) >> 2))
 
 
 def cmd_pre_push(repo: pathlib.Path, deny_terms: list[tuple[str, str]]) -> int:
     """git passes <remote> <url> as argv and ref lines on stdin: <local-ref> <local-sha> <remote-ref> <remote-sha>.
-    Only a push to one of the config's `pre_push_refs` is judged; an unresolvable range refuses."""
+    Only a push to one of the config's `pre_push_refs` is judged; an unresolvable range refuses.
+    This reads stdin to the end; the shell snippet install_pre_push writes spools it first and
+    rebinds the hook's stdin afterwards, so the layers after the guard see the same bytes."""
     problems: list[str] = []
     for line in sys.stdin.read().splitlines():
         parts = line.split()
@@ -1843,10 +1876,17 @@ def cmd_pre_push(repo: pathlib.Path, deny_terms: list[tuple[str, str]]) -> int:
     return 0
 
 
-def cmd_stop(repo: pathlib.Path, ref: str, deny_terms: list[tuple[str, str]]) -> int:
-    """Stop hook: block ONCE (stop_hook_active ends the loop) when a commit from the last 24 h on
-    `ref` would be refused at push. A nudge at the seam the session is standing on; the refusing
-    gate is pre-push. An unreadable ref is no nudge: a Stop hook never wedges a session."""
+def cmd_stop(repo: pathlib.Path, rev_range: str, deny_terms: list[tuple[str, str]]) -> int:
+    """Stop hook: block ONCE (stop_hook_active ends the loop) when a commit from the last 24 h in
+    `rev_range` would be refused at push. A nudge at the seam the session is standing on; the
+    refusing gate is pre-push.
+
+    The range is the commits NOT YET on the remote: the config's `default_range` (for a project whose
+    default_ref is a remote-tracking ref, `<default_ref>..HEAD`), or `--ref R` meaning `R..HEAD`. A
+    commit already on the remote cannot be repaired by the follow-up commit the nudge asks for, so it
+    is never judged. CONSTRAINT: a project must therefore set `default_range` (or pass `--ref`) to a
+    base that exists locally; an unresolvable range is no nudge, because a Stop hook never wedges a
+    session."""
     try:
         data = json.load(sys.stdin)
     except Exception:  # noqa: BLE001 -- no or malformed hook JSON is "not active"
@@ -1854,11 +1894,11 @@ def cmd_stop(repo: pathlib.Path, ref: str, deny_terms: list[tuple[str, str]]) ->
     if data.get("stop_hook_active"):
         return 0
     since = int(time.time()) - HOOK_STOP_WINDOW_S
-    rc, out, _err = git_try(repo, "rev-list", "--no-merges", f"--since={since}", ref)
+    rc, out, _err = git_try(repo, "rev-list", "--no-merges", f"--since={since}", rev_range)
     if rc != 0:
         return 0
     added = set(git_paths(repo, "log", "--no-merges", "--diff-filter=A", "--name-only", "--format=",
-                          f"--since={since}", ref, "--", OUTBOX_DIR))
+                          f"--since={since}", rev_range, "--", OUTBOX_DIR))
     problems: list[str] = []
     for sha in out.split():
         problems.extend(check_commit(repo, sha, added, deny_terms))
@@ -1991,9 +2031,10 @@ def build_parser() -> argparse.ArgumentParser:
     pre_p.add_argument("legacy", nargs="*")
     pre_p.add_argument("--deny-file", type=pathlib.Path, default=None)
 
-    stop_p = sub.add_parser("stop", help="Stop hook: block once when a commit from the last 24 h would be refused at push")
+    stop_p = sub.add_parser("stop", help="Stop hook: block once when a commit from the last 24 h that is not yet on "
+                                         f"the remote would be refused at push (range: {DEFAULT_RANGE or 'the config default_range'})")
     stop_p.add_argument("legacy", nargs="*")
-    stop_p.add_argument("--ref", default=DEFAULT_REF)
+    stop_p.add_argument("--ref", default=None, help="judge the commits in R..HEAD instead of the config's default_range")
     stop_p.add_argument("--deny-file", type=pathlib.Path, default=None)
 
     start_p = sub.add_parser("session-start", help="install the pre-push guard and report debt; always exit 0")
@@ -2067,7 +2108,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.cmd == "pre-push":
             return cmd_pre_push(repo, gather_deny_terms(resolve_deny_file(repo, args.deny_file)))
         if args.cmd == "stop":
-            return cmd_stop(repo, args.ref, gather_deny_terms(resolve_deny_file(repo, args.deny_file)))
+            rev_range = f"{args.ref}..HEAD" if args.ref else DEFAULT_RANGE
+            return cmd_stop(repo, rev_range, gather_deny_terms(resolve_deny_file(repo, args.deny_file)))
         if args.cmd == "session-start":
             return cmd_session_start(repo, args.ref, resolve_ledger(repo, args.ledger))
         if args.cmd == "install-hooks":

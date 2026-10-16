@@ -1,6 +1,6 @@
 {
   "schema": "doctrine-outbox-config.v1",
-  "_comment": "MLV-App's values for the fleet doctrine outbox. Data only: tools/coordination/doctrine_outbox.py is a byte-identical copy of the bus's tools/conjugal-reference/doctrine_outbox.py and is never edited here. The tool finds this file at the repo root (or via --config / $DOCTRINE_OUTBOX_CONFIG).",
+  "_comment": "MLV-App's values for the fleet doctrine outbox. Data only: tools/coordination/doctrine_outbox.py is the config-driven shared file proposed to replace the bus's reference copy (a different, older file today; adoption is pending the bus steward, see the handoff card in doctrine-outbox/). It is never edited here for a project value. The tool finds this file at the repo root (or via --config / $DOCTRINE_OUTBOX_CONFIG).",
   "project": "mlv-app",
   "outbox_dir": "doctrine-outbox",
   "tool_rel": "tools/coordination/doctrine_outbox.py",
@@ -21,6 +21,6 @@
   ],
   "vendored_from": {
     "bus_path": "tools/conjugal-reference/doctrine_outbox.py",
-    "sha256_lf": "0d9ffe3d60b1179b65345855637260e4bd343bd13a7691deedcc540b9b21276e"
+    "sha256_lf": "a6beb9cf8fd425c6e19507202c577ce2063ed38126369766d65ad23ec26fd084"
   }
 }

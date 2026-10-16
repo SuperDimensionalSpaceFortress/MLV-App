@@ -118,6 +118,16 @@ def repo(tmp_path):
     return r
 
 
+@pytest.fixture
+def pushed_repo(repo, tmp_path):
+    """`repo` plus a bare origin that already holds master, so `origin/master..master` resolves."""
+    origin = tmp_path / "stop-origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "master", str(origin)], check=True, capture_output=True, text=True)
+    git(repo, "remote", "add", "origin", str(origin))
+    git(repo, "push", "-q", "origin", "master")
+    return repo
+
+
 def push_line(local: str, remote: str = ZEROS, remote_ref: str = "refs/heads/master") -> str:
     return f"refs/heads/master {local} {remote_ref} {remote}\n"
 
@@ -146,7 +156,9 @@ def test_the_steward_handoff_card_names_the_pinned_digest():
 
 def test_the_tool_names_no_project_host_or_state_directory():
     text = TOOL_SRC.read_text(encoding="utf-8").lower()
-    for needle in ("mlv", "bachelor", ".claude-state", "ultra-magnus", "ultra magnus", "virtual-ten"):
+    needles = ("mlv", "bachelor", ".claude-state", "ultra", "magnus", "virtual-ten", "obabalola", "layi")
+    assert len(needles) == 8   # the PR body says the grep covers eight; keep the two in step
+    for needle in needles:
         assert needle not in text, f"{needle!r} is a project value; it belongs in the config"
 
 
@@ -185,6 +197,24 @@ def test_no_config_is_unknown_not_a_pass(tmp_path):
     assert result.returncode == 2 and "CONFIG_ABSENT" in result.stderr
 
 
+@pytest.mark.parametrize("config_text, offending", [
+    (json.dumps({**BUS_STYLE_CONFIG, "law4_extras": []}), "law4_extras"),
+    ("{not json", "JSONDecodeError"),
+])
+def test_a_broken_config_is_config_invalid_not_config_absent(tmp_path, config_text, offending):
+    """A config that is there but wrong must not read as a missing one: the operator would go
+    looking for a file that exists. The refusal names the offending key (or the parse error)."""
+    lone = tmp_path / "lone"
+    lone.mkdir()
+    copy = lone / "doctrine_outbox.py"
+    copy.write_bytes(TOOL_SRC.read_bytes())
+    (lone / "doctrine-outbox.config.json").write_text(config_text, encoding="utf-8")
+    result = subprocess.run([sys.executable, "-I", str(copy), "check"], capture_output=True, text=True, cwd=lone)
+    assert result.returncode == 1, result.stderr
+    assert "CONFIG_INVALID" in result.stderr and offending in result.stderr
+    assert "CONFIG_ABSENT" not in result.stderr
+
+
 def test_check_range_is_an_alias_with_the_configured_default_range(ob):
     parser = ob.build_parser()
     assert parser.parse_args(["check-range"]).rev_range == "origin/master..master"
@@ -212,6 +242,66 @@ def test_install_hooks_puts_the_guard_ahead_of_an_lfs_layer(ob, repo):
     assert ob.install_pre_push(repo) == "installed"
     text = hook.read_text(encoding="utf-8")
     assert text.index("doctrine-outbox-guard") < text.index("git lfs pre-push")
+
+
+def test_install_hooks_sets_the_executable_bit(ob, repo, monkeypatch):
+    """git skips a pre-push hook that is not executable, silently, on POSIX. The mode cannot be read
+    back on Windows, so this pins the code path: install must chmod the hook with execute bits."""
+    calls: list[tuple[Path, int]] = []
+    real_chmod = os.chmod
+
+    def recording_chmod(path, mode, *args, **kwargs):
+        calls.append((Path(path), mode))
+        return real_chmod(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(os, "chmod", recording_chmod)
+    ob.install_pre_push(repo)
+    hook = repo / ".git" / "hooks" / "pre-push"
+    assert any(p == hook and mode & 0o100 for p, mode in calls), f"no chmod with the owner execute bit on {hook}: {calls}"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="the executable bit is a POSIX file mode")
+def test_installed_hook_is_executable_when_new_existing_and_already_guarded(ob, repo):
+    hook = repo / ".git" / "hooks" / "pre-push"
+    assert ob.install_pre_push(repo) == "installed"
+    assert os.access(hook, os.X_OK)
+    hook.chmod(0o644)   # what an install made before this fix left behind
+    assert ob.install_pre_push(repo) == "present"
+    assert os.access(hook, os.X_OK)
+    hook.unlink()
+    hook.write_text("#!/bin/sh\n", encoding="utf-8", newline="\n")
+    hook.chmod(0o644)   # someone else's non-executable hook that we splice into
+    assert ob.install_pre_push(repo) == "installed"
+    assert os.access(hook, os.X_OK)
+
+
+def test_installed_guard_hands_the_downstream_layer_the_bytes_git_sent(ob, repo, tmp_path):
+    """git lfs pre-push reads the ref lines from stdin. The guard sits ahead of it and its python
+    reads that stdin to the end, so without a restore the downstream layer gets EOF and LFS uploads
+    nothing. A stand-in reader after the guard must receive exactly what git sent, and must not run
+    at all when the guard refuses."""
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "master", str(origin)], check=True, capture_output=True, text=True)
+    git(repo, "remote", "add", "origin", str(origin))
+    git(repo, "push", "-q", "origin", "master")
+    base = git(repo, "rev-parse", "HEAD")
+    hook = repo / ".git" / "hooks" / "pre-push"
+    hook.write_text('#!/bin/sh\nset -e\nREPO_ROOT=$(git rev-parse --show-toplevel)\n'
+                    'cat > "$DOWNSTREAM_OUT"   # git lfs pre-push stand-in\n', encoding="utf-8", newline="\n")
+    assert ob.main(["install-hooks", str(repo)]) == 0
+    text = hook.read_text(encoding="utf-8")
+    assert text.index("doctrine-outbox-guard") < text.index("git lfs pre-push stand-in")
+    seen = tmp_path / "downstream.bin"
+    env = {**os.environ, "DOWNSTREAM_OUT": str(seen)}
+    commit(repo, {"coordination/tools/other.py": "print(1)\n"}, "undeclared")
+    refused = subprocess.run(["git", "-C", str(repo), "push", "origin", "master"], capture_output=True, text=True, env=env)
+    assert refused.returncode != 0 and "PUSH REFUSED" in refused.stderr
+    assert not seen.exists(), "the downstream layer ran although the guard refused the push"
+    git(repo, "commit", "--amend", "-m", "declared\n\nDoctrine-Export: none\n")
+    head = git(repo, "rev-parse", "HEAD")
+    allowed = subprocess.run(["git", "-C", str(repo), "push", "origin", "master"], capture_output=True, text=True, env=env)
+    assert allowed.returncode == 0, allowed.stderr
+    assert seen.read_bytes() == f"refs/heads/master {head} refs/heads/master {base}\n".encode()
 
 
 def test_install_hooks_works_from_a_linked_worktree(ob, repo, tmp_path):
@@ -366,7 +456,8 @@ def test_check_range_legacy_form_takes_repo_then_range(ob, repo, capsys):
 
 # ---------- stop ----------
 
-def test_stop_blocks_once_then_yields(ob, repo, monkeypatch, capsys):
+def test_stop_blocks_once_then_yields(ob, pushed_repo, monkeypatch, capsys):
+    repo = pushed_repo
     commit(repo, {"coordination/tools/other.py": "print(1)\n"}, "a recent commit with no trailer")
     monkeypatch.setattr(sys, "stdin", io.StringIO("{}"))
     assert ob.main(["stop", str(repo)]) == 0
@@ -377,25 +468,52 @@ def test_stop_blocks_once_then_yields(ob, repo, monkeypatch, capsys):
     assert capsys.readouterr().out == ""
 
 
-def test_stop_is_silent_when_every_recent_commit_is_clean(ob, repo, monkeypatch, capsys):
-    commit(repo, {"coordination/tools/other.py": "print(1)\n"}, "declared\n\nDoctrine-Export: none\n")
+def test_stop_is_silent_when_every_recent_commit_is_clean(ob, pushed_repo, monkeypatch, capsys):
+    commit(pushed_repo, {"coordination/tools/other.py": "print(1)\n"}, "declared\n\nDoctrine-Export: none\n")
     monkeypatch.setattr(sys, "stdin", io.StringIO("{}"))
-    assert ob.main(["stop", str(repo)]) == 0
+    assert ob.main(["stop", str(pushed_repo)]) == 0
     assert capsys.readouterr().out == ""
 
 
-def test_stop_looks_back_24_hours_only(ob, repo, monkeypatch, capsys):
-    commit(repo, {"coordination/tools/other.py": "print(1)\n"}, "an old commit with no trailer", env=dated(3 * 24 * 3600))
+def test_stop_looks_back_24_hours_only(ob, pushed_repo, monkeypatch, capsys):
+    commit(pushed_repo, {"coordination/tools/other.py": "print(1)\n"}, "an old commit with no trailer", env=dated(3 * 24 * 3600))
     monkeypatch.setattr(sys, "stdin", io.StringIO("{}"))
-    assert ob.main(["stop", str(repo)]) == 0
+    assert ob.main(["stop", str(pushed_repo)]) == 0
     assert capsys.readouterr().out == ""
 
 
-def test_stop_survives_an_unreadable_ref(ob, repo, monkeypatch, capsys):
-    git(repo, "branch", "-m", "trunk")
+def test_stop_survives_an_unreadable_range(ob, pushed_repo, monkeypatch, capsys):
+    git(pushed_repo, "branch", "-m", "trunk")
+    monkeypatch.setattr(sys, "stdin", io.StringIO("{}"))
+    assert ob.main(["stop", str(pushed_repo)]) == 0
+    assert capsys.readouterr().out == ""
+
+
+def test_stop_judges_only_commits_not_yet_on_the_remote(ob, pushed_repo, monkeypatch, capsys):
+    """A commit already on the remote default ref cannot be fixed by the follow-up commit the nudge
+    asks for, so it must not be judged; the commit still waiting to be pushed must be."""
+    repo = pushed_repo
+    commit(repo, {"coordination/tools/old.py": "print(1)\n"}, "pushed long ago, no trailer")
+    git(repo, "push", "-q", "origin", "master")
     monkeypatch.setattr(sys, "stdin", io.StringIO("{}"))
     assert ob.main(["stop", str(repo)]) == 0
+    assert capsys.readouterr().out == "", "an already-pushed commit was judged"
+    commit(repo, {"coordination/tools/new.py": "print(2)\n"}, "not pushed yet, no trailer")
+    monkeypatch.setattr(sys, "stdin", io.StringIO("{}"))
+    assert ob.main(["stop", str(repo)]) == 0
+    reason = json.loads(capsys.readouterr().out)["reason"]
+    assert "coordination/tools/new.py" in reason and "coordination/tools/old.py" not in reason
+
+
+def test_stop_ref_option_names_the_base_of_the_unpushed_range(ob, pushed_repo, monkeypatch, capsys):
+    repo = pushed_repo
+    commit(repo, {"coordination/tools/other.py": "print(1)\n"}, "no trailer")
+    monkeypatch.setattr(sys, "stdin", io.StringIO("{}"))
+    assert ob.main(["stop", str(repo), "--ref", "HEAD"]) == 0     # HEAD..HEAD is empty
     assert capsys.readouterr().out == ""
+    monkeypatch.setattr(sys, "stdin", io.StringIO("{}"))
+    assert ob.main(["stop", str(repo), "--ref", "origin/master"]) == 0
+    assert json.loads(capsys.readouterr().out)["decision"] == "block"
 
 
 # ---------- end to end: the installed git hook, the real file, a real push ----------
