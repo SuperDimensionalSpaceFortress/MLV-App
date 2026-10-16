@@ -885,6 +885,167 @@ class SmokeRunLogSelectorTests(_PwshCase):
         self.assertTrue(self.log_root.name.startswith("logs-result-"))
 
 
+@requires_pwsh
+class MeasuredSessionEligibilityVerdictTests(_PwshCase):
+    """PLAYBACK-GPU-SCOPES-NO-VETO-1 r2 (row B): the verdict reads the eligibility line in force for the MEASURED
+    session -- the last one at or before its playback_smoke.summary -- not the post-measurement visual-capture tail's
+    paused re-render line (#428), which reads r16_available=0 whenever a scope is visible. The tail is reported
+    (tailLinesIgnored / tailRefused), never read; absence stays refusal; without the session's summary line the old
+    last-line rule applies unchanged (last_line_fallback)."""
+
+    PRE_EXISTING = (
+        "source", "linePresent", "cudaBackendAvailable", "r16Available", "r16Reason", "cudaBackendAttempted",
+        "cudaBackendResolved", "cudaBackendDescription", "scale", "r16ProbeRan", "admitted", "exitCode",
+    )
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._second = 0
+
+    def _ts(self) -> str:
+        self._second += 1
+        return f"[2026-10-15T09:00:{self._second:02d}.100Z] [I] [0x1] "
+
+    def elig(self, cuda: int, r16: int, reason: str = "ok") -> str:
+        return ELIGIBILITY.format(second=0, resolved=1, cuda=cuda, r16=r16, reason=reason).replace(
+            "[2026-09-16T23:00:00.100Z] [I] [0x1] ", self._ts())
+
+    def start(self, session: int) -> str:
+        return self._ts() + f"playback_smoke.start session={session} position=0 cut_in=0 cut_out=599"
+
+    def summary(self, session: int) -> str:
+        return self._ts() + f"playback_smoke.summary session={session} frames_presented=599 source_frames=480"
+
+    def verdicts(self, lines: list[str], session: str) -> tuple[dict, dict]:
+        log = self.tmp / "run.log"
+        log.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        proc = self.run_with_module(
+            f"$text = [IO.File]::ReadAllText('{log}')\n"
+            f"$new = Get-AttrCudaEligibilityVerdict -LogText $text -MeasuredSessionId '{session}'\n"
+            "Write-Output ('NEW=' + ($new | ConvertTo-Json -Compress))\n"
+            "$old = Get-AttrCudaEligibilityVerdict -LogText $text\n"
+            "Write-Output ('OLD=' + ($old | ConvertTo-Json -Compress))\n"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        found = {}
+        for line in proc.stdout.splitlines():
+            for tag in ("NEW=", "OLD="):
+                if line.startswith(tag):
+                    found[tag] = json.loads(line[len(tag):])
+        self.assertIn("NEW=", found, proc.stdout + proc.stderr)
+        self.assertIn("OLD=", found, proc.stdout + proc.stderr)
+        return found["NEW="], found["OLD="]
+
+    def test_t1_the_measured_session_line_admits_whatever_the_tail_says(self) -> None:
+        new, old = self.verdicts([
+            self.elig(1, 0, "paused, scope visible"),   # in force when the session opens: before start, not counted
+            self.start(7),
+            self.elig(1, 0, "paused, scope visible"),   # inside the window: reported, not gating
+            self.elig(1, 1),
+            self.summary(7),
+            self.elig(1, 0, "visual-capture tail re-render"),
+        ], "7")
+        self.assertTrue(new["admitted"])
+        self.assertEqual(new["exitCode"], 0)
+        self.assertEqual(new["verdictScope"], "measured_session")
+        self.assertTrue(new["tailRefused"])
+        self.assertEqual(new["tailLinesIgnored"], 1)
+        self.assertEqual(new["measuredWindowRefusingLines"], 1)
+        # Today's last-line rule refuses this clean session (the r1 leg-01 failure).
+        self.assertFalse(old["admitted"])
+        self.assertEqual(old["verdictScope"], "last_line_fallback")
+
+    def test_t2_a_cpu_fallback_session_stays_refused_when_the_tail_admits(self) -> None:
+        for cuda, r16 in ((0, 1), (1, 0)):
+            with self.subTest(cuda=cuda, r16=r16):
+                new, old = self.verdicts([
+                    self.start(7),
+                    self.elig(cuda, r16, "fallback"),
+                    self.summary(7),
+                    self.elig(1, 1, "tail"),
+                ], "7")
+                self.assertFalse(new["admitted"])
+                self.assertEqual(new["exitCode"], 15)
+                self.assertEqual(new["verdictScope"], "measured_session")
+                self.assertEqual(new["r16Reason"], "fallback")
+                self.assertFalse(new["tailRefused"])
+                # Today the admitting tail line wrongly admits it.
+                self.assertTrue(old["admitted"])
+
+    def test_t3_no_line_at_or_before_the_summary_refuses_even_if_the_tail_admits(self) -> None:
+        new, _old = self.verdicts([self.start(7), self.summary(7), self.elig(1, 1, "tail")], "7")
+        self.assertFalse(new["admitted"])
+        self.assertEqual(new["exitCode"], 15)
+        self.assertFalse(new["linePresent"])
+        self.assertEqual(new["verdictScope"], "measured_session")
+        self.assertEqual(new["tailLinesIgnored"], 1)
+
+    def test_t4_no_measured_summary_falls_back_to_the_last_line_unchanged(self) -> None:
+        for tail_r16 in (1, 0):
+            with self.subTest(tail_r16=tail_r16):
+                new, old = self.verdicts([
+                    self.start(3), self.elig(1, 1), self.summary(3), self.elig(1, tail_r16, "last"),
+                ], "7")
+                self.assertEqual(new["verdictScope"], "last_line_fallback")
+                for field in self.PRE_EXISTING:
+                    self.assertEqual(new[field], old[field], field)
+                self.assertEqual(new["admitted"], bool(tail_r16))
+                self.assertEqual(new["tailLinesIgnored"], 0)
+                self.assertFalse(new["tailRefused"])
+                self.assertIsNone(new["measuredWindowRefusingLines"])
+        # An empty id is the same fallback.
+        new, old = self.verdicts([self.start(7), self.elig(1, 1), self.summary(7), self.elig(1, 0)], "")
+        self.assertEqual(new["verdictScope"], "last_line_fallback")
+        self.assertFalse(new["admitted"])
+
+    def test_t5_the_anchor_is_the_measured_session_not_the_first_summary(self) -> None:
+        warmup_admits = [
+            self.start(3), self.elig(1, 1), self.summary(3),
+            self.start(7), self.elig(0, 1, "measured fallback"), self.summary(7),
+            self.elig(1, 1, "tail"),
+        ]
+        new, _old = self.verdicts(warmup_admits, "7")
+        self.assertFalse(new["admitted"])
+        self.assertEqual(new["r16Reason"], "measured fallback")
+        self._second = 0
+        warmup_refuses = [
+            self.start(3), self.elig(1, 0, "warmup paused"), self.summary(3),
+            self.start(7), self.elig(1, 1, "measured"), self.summary(7),
+            self.elig(1, 0, "tail"),
+        ]
+        new, _old = self.verdicts(warmup_refuses, "7")
+        self.assertTrue(new["admitted"])
+        self.assertEqual(new["r16Reason"], "measured")
+        self.assertTrue(new["tailRefused"])
+        # The session id must match exactly: session 70 is not session 7.
+        self._second = 0
+        new, _old = self.verdicts([self.start(70), self.elig(1, 1), self.summary(70)], "7")
+        self.assertEqual(new["verdictScope"], "last_line_fallback")
+
+    def test_t6_a_log_with_no_tail_keeps_every_pre_existing_field(self) -> None:
+        for cuda, r16 in ((1, 1), (1, 0), (0, 1)):
+            with self.subTest(cuda=cuda, r16=r16):
+                self._second = 0
+                new, old = self.verdicts([self.start(7), self.elig(cuda, r16, "only"), self.summary(7)], "7")
+                self.assertEqual(new["verdictScope"], "measured_session")
+                for field in self.PRE_EXISTING:
+                    self.assertEqual(new[field], old[field], field)
+                self.assertEqual(new["tailLinesIgnored"], 0)
+                self.assertFalse(new["tailRefused"])
+
+    def test_the_job_passes_the_measured_session_and_records_the_new_fields(self) -> None:
+        text = ATTRIBUTION_GENERATOR.read_text(encoding="utf-8")
+        self.assertEqual(
+            1, text.count("$verdict = Get-AttrCudaEligibilityVerdict -LogText $rawLog -MeasuredSessionId $measuredSmokeSessionId"))
+        self.assertLess(text.index("$measuredSmokeSessionId = Get-MeasuredSmokeSessionId $rawLog"),
+                        text.index("$verdict = Get-AttrCudaEligibilityVerdict"))
+        for field in ("verdictScope", "measuredWindowRefusingLines", "tailLinesIgnored", "tailRefused"):
+            self.assertIn(f"    {field} = $verdict.{field}\n", text)
+        # The new function is spliced inside its own sentinel brackets (the default job is pinned byte for byte outside them).
+        self.assertIn("# PLAYBACK-GPU-SCOPES-NO-VETO-1 >>>`r`n\" + (Get-AttrCudaEmbeddedFunctionSource -Name @(\n"
+                      "    'Get-AttrCudaEligibilityLineForSession'\n", text)
+
+
 # --------------------------------------------------------------------------------------------
 # (e) an interrupted stage never publishes build.json
 # --------------------------------------------------------------------------------------------
@@ -4973,6 +5134,8 @@ class EmbeddedFunctionContractTests(_PwshCase):
             "Assert-AttrCudaBuildManifest",
             "Resolve-AttrCudaSmokeRunLog",
             "Get-AttrCudaLastEligibilityLine",
+            # PLAYBACK-GPU-SCOPES-NO-VETO-1 r2: the verdict's measured-session line.
+            "Get-AttrCudaEligibilityLineForSession",
             "Get-AttrCudaEligibilityVerdict",
             "Assert-AttrCudaWritableFileSlot",
             "Test-AttrCudaPathIsReparsePoint",

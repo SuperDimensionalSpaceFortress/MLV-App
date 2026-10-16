@@ -1069,6 +1069,11 @@ private:
     PlaybackScopesMode m_playbackScopesMode = PlaybackScopesSettings::kDefaultMode();
     uint64_t m_playbackScopeUpdateCount = 0;
     uint64_t m_playbackScopeSkipCount = 0;
+    // PLAYBACK-GPU-SCOPES-NO-VETO-1: the Throttled scope fed by the GL viewport's read-back of the drawn picture.
+    bool m_playbackScopeGpuTapServing = false;        // latched per presented frame
+    bool m_playbackScopeGpuTapServedThisPlay = false; // the read-back fed the scope in this play
+    uint64_t m_playbackScopeGpuTapUpdateCount = 0;    // scope updates the read-back fed (subset of m_playbackScopeUpdateCount)
+    std::vector<uint8_t> m_playbackScopeTapRgb8;
     uint64_t m_playbackAudioSyncRequestCount = 0;
     uint64_t m_playbackAudioSyncAppliedCount = 0;
     uint64_t m_playbackAudioSyncSkippedCount = 0;
@@ -1236,6 +1241,12 @@ private:
     uint64_t m_playbackSmokeStartPrepReplacedAfter = 0;
     uint64_t m_playbackSmokeStartScopeUpdates = 0;
     uint64_t m_playbackSmokeStartScopeSkips = 0;
+    uint64_t m_playbackSmokeStartScopeGpuTapUpdates = 0;
+    uint64_t m_playbackSmokeStartScopeTapRequests = 0;
+    uint64_t m_playbackSmokeStartScopeTapCompleted = 0;
+    uint64_t m_playbackSmokeStartScopeTapNotReady = 0;
+    uint64_t m_playbackSmokeStartScopeTapSkipped = 0;
+    double m_playbackSmokeStartScopeTapMapMs = 0.0;
     uint64_t m_playbackSmokeStartAudioSyncRequests = 0;
     uint64_t m_playbackSmokeStartAudioSyncApplied = 0;
     uint64_t m_playbackSmokeStartAudioSyncSkipped = 0;
@@ -1796,6 +1807,16 @@ private:
     int  gpuReducedReconHonouredSessionScale( void ) const;
     int  playbackScaleFactorPolicyDecision( void ) const;
     bool gpuPlaybackReconTextureRouteEligibleAtScaleOne( void ) const;
+    bool gpuPlaybackReconTextureRouteTableAtScaleOne( bool hasScopeVisualization ) const;
+    bool textureRouteEligibleIgnoringScopes( void ) const;
+    bool playbackScopeGpuTapServesNow( bool editAreaVisible ) const;
+    // PLAYBACK-GPU-SCOPES-NO-VETO-1 r2: the active GL surface's scope read-back (GpuDisplayWindow, else the viewport).
+    bool playbackScopeTapSupported( void ) const;
+    bool playbackScopeTapRectCapturable( void ) const;
+    void requestPlaybackScopeTap( int maxWidth ) const;
+    bool takePlaybackScopeTap( std::vector<uint8_t> *rgb8, int *width, int *height, quint64 *serial ) const;
+    GpuScopeTap::Counters playbackScopeTapCounters( void ) const;
+    void invalidatePlaybackScopeTap( void ) const;
     bool scopeDisplayConsumesPresentedPixels( bool editAreaVisible ) const;
     void applyPlaybackScopesMode( PlaybackScopesMode mode, bool persist );
     MainWindowGpuPreviewPolicyState gpuPreviewPolicyForCurrentScopeState(

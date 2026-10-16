@@ -11,12 +11,16 @@
 #include "GpuDebayer.h"
 #include "ZebraThresholds.h"
 #include "GpuPreviewProcessing.h"
+#include "GpuScopeTap.h"
 #include "../../src/mlv/llrawproc/llrawproc.h"
 #include <QImage>
+#include <QOpenGLExtraFunctions>
 #include <QOpenGLFunctions>
 #include <QOpenGLShaderProgram>
 #include <QOpenGLTexture>
 #include <QOpenGLWidget>
+#include <cstdint>
+#include <vector>
 
 class QGraphicsPixmapItem;
 class QGraphicsView;
@@ -136,6 +140,26 @@ public:
      * the start of every such call). */
     const GpuPresentSetupTiming &lastPresentSetupTiming(void) const { return m_lastPresentSetupTiming; }
 
+    /* PLAYBACK-GPU-SCOPES-NO-VETO-1: the Throttled scope's read-back of the picture paintGL drew. A request
+     * makes the next paint blit the drawn image rectangle into a small FBO and read it into a PBO behind a
+     * fence; a later paint (or takeScopeTap) maps it only once the fence has signalled -- never blocking,
+     * never glFinish. Counters are cumulative for the viewport's life. r2: the state machine is GpuScopeTap,
+     * shared with GpuDisplayWindow; under/over from takeScopeTap are always false (the scope feed's clip flags
+     * come from playbackScopeFeedUnderOver, CoS #447 blocker 1). */
+    using ScopeTapCounters = GpuScopeTap::Counters;
+    static bool scopeTapSupported(const QGraphicsView *view);
+    static bool scopeTapRectCapturable(const QGraphicsView *view);
+    static void requestScopeTap(QGraphicsView *view, int maxWidth);
+    static bool takeScopeTap(QGraphicsView *view,
+                             std::vector<uint8_t> *rgb8,
+                             int *width,
+                             int *height,
+                             bool *under,
+                             bool *over,
+                             quint64 *serial);
+    static void invalidateScopeTap(QGraphicsView *view);
+    static ScopeTapCounters scopeTapCountersFor(const QGraphicsView *view);
+
 protected:
     bool eventFilter(QObject *watched, QEvent *event) override;
     void initializeGL() override;
@@ -192,6 +216,8 @@ private:
     int pendingWidth(void) const;
     int pendingHeight(void) const;
     bool hasPendingFrame(void) const;
+
+    GpuScopeTap m_scopeTap{"widget"};
 
     bool m_loggedContext;
     bool m_loggedTexturePath;

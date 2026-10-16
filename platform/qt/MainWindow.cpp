@@ -1630,6 +1630,19 @@ static bool lookAssistProcessedFloorLiftedPostInvalidShouldFailClosed(
 
 static uint8_t scanZebrasRgb8(const uint8_t *rgbData, int width, int height);
 static uint8_t applyZebrasToImage( QImage *image, bool enableZebras );
+// PLAYBACK-GPU-SCOPES-NO-VETO-1: the ScopesLabel type for a scope choice (both scope feeds ask the same helper).
+static ScopesLabel::ScopeType scopesLabelTypeForPlaybackScopeKind( PlaybackScopeKind kind )
+{
+    switch( kind )
+    {
+        case PlaybackScopeKind::Histogram: return ScopesLabel::ScopeHistogram;
+        case PlaybackScopeKind::WaveForm: return ScopesLabel::ScopeWaveForm;
+        case PlaybackScopeKind::RgbParade: return ScopesLabel::ScopeRgbParade;
+        case PlaybackScopeKind::VectorScope: return ScopesLabel::ScopeVectorScope;
+        case PlaybackScopeKind::None: break;
+    }
+    return ScopesLabel::None;
+}
 static bool receiptFileDeclaresLookAssistEnabled( const QString &path )
 {
     QFile file(path);
@@ -10272,6 +10285,23 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
             QStringLiteral("gui_smoke.visual_capture.begin"),
             QStringLiteral("measured_session=%1 tail_ms=%2 play_frames=%3 tail_begin_utc=%4")
                 .arg( visualMeasuredSession ).arg( visualTailMs ).arg( visualPlayFrames ).arg( visualTailBeginUtc ) );
+        // PLAYBACK-GPU-SCOPES-NO-VETO-1: where the scope label sits, so a reviewer script can crop the scope from
+        // the play captures. Logical px relative to the top-level window's client area, beside the captured
+        // video viewport's own rectangle in the same space (visual.json's viewport is that one, in saved pixels).
+        if( ui->labelScope && visualViewportWidget )
+        {
+            const QPoint scopeOffset = ui->labelScope->mapTo( window(), QPoint( 0, 0 ) );
+            const QPoint viewportOffset = visualViewportWidget->mapTo( window(), QPoint( 0, 0 ) );
+            qInfo().noquote()
+                << QStringLiteral( "gui_smoke.visual_capture.scope_rect visible=%1 dpr=%2 scope_x=%3 scope_y=%4 "
+                                   "scope_w=%5 scope_h=%6 viewport_x=%7 viewport_y=%8 viewport_w=%9 viewport_h=%10" )
+                       .arg( bool01( ui->labelScope->isVisible() ) )
+                       .arg( window()->devicePixelRatioF(), 0, 'f', 3 )
+                       .arg( scopeOffset.x() ).arg( scopeOffset.y() )
+                       .arg( ui->labelScope->width() ).arg( ui->labelScope->height() )
+                       .arg( viewportOffset.x() ).arg( viewportOffset.y() )
+                       .arg( visualViewportWidget->width() ).arg( visualViewportWidget->height() );
+        }
         visualTailClock.start();
 
         // (2) K play frames, evenly spaced across the untimed tail (the centres of K equal slices).
@@ -18871,24 +18901,8 @@ void MainWindow::paintAudioTrack( void )
 //Draw Zebras, return: 1=under, 2=over, 3=under+over, 0=okay
 static uint8_t scanZebrasRgb8(const uint8_t *rgbData, int width, int height)
 {
-    uint8_t underOver = 0;
-
-    if( !rgbData || width <= 0 || height <= 0 ) return underOver;
-
-    const int pixelCount = width * height;
-    for( int i = 0; i < pixelCount; ++i )
-    {
-        const uint8_t red = rgbData[i * 3 + 0];
-        const uint8_t green = rgbData[i * 3 + 1];
-        const uint8_t blue = rgbData[i * 3 + 2];
-        const int maxChannel = qMax(red, qMax(green, blue));
-        const int minChannel = qMin(red, qMin(green, blue));
-        const int lightness = (maxChannel + minChannel) / 2;
-        if( lightness >= preview_zebra::kOverThreshold8Bit ) underOver |= 0x02;
-        if( lightness <= preview_zebra::kUnderThreshold8Bit ) underOver |= 0x01;
-    }
-
-    return underOver;
+    // PLAYBACK-GPU-SCOPES-NO-VETO-1: one zebra rule for every scope feed (PlaybackScopesDuringPlayback.h).
+    return playbackScopeZebraScanRgb8( rgbData, width, height );
 }
 
 uint8_t MainWindow::drawZebras(QImage *image)
@@ -19027,6 +19041,8 @@ void MainWindow::clearPresentationForClipOpen( const char *reason )
     {
         ui->labelScope->setScope( NULL, 0, 0, false, false, ScopesLabel::None );
     }
+    // PLAYBACK-GPU-SCOPES-NO-VETO-1 D3: a clip change drops queued and finished scope read-backs of the old clip.
+    if( ui && ui->graphicsView ) invalidatePlaybackScopeTap();
 
     if( ui && ui->graphicsView )
     {
@@ -19735,6 +19751,8 @@ void MainWindow::on_horizontalSliderPosition_valueChanged(int position)
     {
         invalidatePlaybackPrepForDisplayChange( "playback-position-change" );
         invalidateGpuPreviewProcessingConfigCache();
+        // PLAYBACK-GPU-SCOPES-NO-VETO-1 D3: a seek drops queued and finished scope read-backs of the old position.
+        invalidatePlaybackScopeTap();
     }
 
     // PLAYBACK-BACHELOR-PRESENT-JITTER-1: a slider move while playing that no engine path made (playbackHandling
@@ -22252,6 +22270,23 @@ bool MainWindow::gpuPlaybackReconTextureRouteEligibleAtScaleOne( void ) const
         || mainWindowScopeActionConsumesPresentedPixels(
             scopeDisplayVisible, ui->actionShowVectorScope->isChecked() );
 
+    return gpuPlaybackReconTextureRouteTableAtScaleOne( hasScopeVisualization );
+}
+
+// PLAYBACK-GPU-SCOPES-NO-VETO-1: the texture route asked with no scope. RECURSION TRAP: the scope funnel
+// (scopeDisplayConsumesPresentedPixels) asks playbackScopeGpuTapServesNow, which asks this, so neither this
+// nor the table below may ever call the funnel (pinned by PGT-07).
+bool MainWindow::textureRouteEligibleIgnoringScopes( void ) const
+{
+    if( !m_gpuPlaybackReconPolicyLibraryReady ) return false;
+    return gpuPlaybackReconTextureRouteTableAtScaleOne( /*hasScopeVisualization*/ false );
+}
+
+// The live inputs of the pure table, given the scope answer. Callers have already proved the library is ready.
+bool MainWindow::gpuPlaybackReconTextureRouteTableAtScaleOne( bool hasScopeVisualization ) const
+{
+    if( !m_gpuPlaybackReconPolicyLibraryReady ) return false;
+
     const Phase3Mode requestedPhase3Mode =
         phase3ModeFor( playbackQualityModeFromInt( m_playbackQualityMode ) );
 
@@ -22528,6 +22563,8 @@ void MainWindow::on_actionPlaybackScopesLive_triggered()
 void MainWindow::applyPlaybackScopesMode( PlaybackScopesMode mode, bool persist )
 {
     if ( persist ) playbackScopesModeWriteToSettings( mode );
+    // PLAYBACK-GPU-SCOPES-NO-VETO-1 D3: a mode change drops queued and finished scope read-backs.
+    if ( mode != m_playbackScopesMode ) invalidatePlaybackScopeTap();
     m_playbackScopesMode = mode;
     if ( ui->actionPlaybackScopesHide )
         ui->actionPlaybackScopesHide->setChecked( mode == PlaybackScopesMode::Hide );
@@ -22543,7 +22580,77 @@ void MainWindow::applyPlaybackScopesMode( PlaybackScopesMode mode, bool persist 
 bool MainWindow::scopeDisplayConsumesPresentedPixels( bool editAreaVisible ) const
 {
     return playbackScopeDisplayConsumesPresentedPixels(
-        editAreaVisible, ui->actionPlay->isChecked(), m_playbackScopesMode );
+        editAreaVisible, ui->actionPlay->isChecked(), m_playbackScopesMode,
+        playbackScopeGpuTapServesNow( editAreaVisible ) );
+}
+
+// PLAYBACK-GPU-SCOPES-NO-VETO-1: does the active GL surface's read-back of the drawn picture feed the Throttled
+// scope right now? editAreaVisible is the caller's own edit-area answer (dock visibility for the policy
+// builders, the action for the draw gate), exactly as each asks the funnel. The cheap mode/play/visibility
+// inputs short-circuit first, so the per-frame policy reads pay for the rest only in Throttled play.
+// r2: the surface is GpuDisplayWindow when it is active, else the QOpenGLWidget viewport (the dispatch helpers
+// below); a picture the read-back cannot capture (zoomed past fit) keeps the CPU feed (CoS #447 blocker 5).
+bool MainWindow::playbackScopeGpuTapServesNow( bool editAreaVisible ) const
+{
+    PlaybackScopeGpuTapInputs in;
+    in.mode = m_playbackScopesMode;
+    in.playbackActive = ui->actionPlay->isChecked();
+    in.editAreaVisible = editAreaVisible;
+    if( in.mode != PlaybackScopesMode::Throttled || !in.playbackActive || !in.editAreaVisible ) return false;
+    in.anyScopeChecked = ui->actionShowHistogram->isChecked()
+                      || ui->actionShowWaveFormMonitor->isChecked()
+                      || ui->actionShowParade->isChecked()
+                      || ui->actionShowVectorScope->isChecked();
+    in.gpuWidgetViewportInstalled = GpuDisplayViewport::isInstalledOn( ui->graphicsView );
+    in.gpuDisplayWindowActive = GpuDisplayWindow::isActive();
+    in.zebrasEnabled = ui->actionShowZebras->isChecked();
+    in.killSwitch = playbackScopeGpuTapKillSwitch( qgetenv( playbackScopeGpuTapKillSwitchName() ) );
+    if( !in.anyScopeChecked || !( in.gpuWidgetViewportInstalled || in.gpuDisplayWindowActive )
+     || in.zebrasEnabled || in.killSwitch ) return false;
+    in.tapSupported = playbackScopeTapSupported();
+    in.tapRectCapturable = in.tapSupported && playbackScopeTapRectCapturable();
+    in.textureRouteEligibleIgnoringScopes = in.tapRectCapturable && textureRouteEligibleIgnoringScopes();
+    return playbackScopeGpuTapServes( in );
+}
+
+// PLAYBACK-GPU-SCOPES-NO-VETO-1 r2: the scope read-back of whichever GL surface presents -- GpuDisplayWindow when
+// it is active, else the QOpenGLWidget viewport. Every read-back caller goes through these.
+bool MainWindow::playbackScopeTapSupported( void ) const
+{
+    return GpuDisplayWindow::isActive() ? GpuDisplayWindow::scopeTapSupportedIfActive()
+                                        : GpuDisplayViewport::scopeTapSupported( ui->graphicsView );
+}
+
+bool MainWindow::playbackScopeTapRectCapturable( void ) const
+{
+    return GpuDisplayWindow::isActive() ? GpuDisplayWindow::scopeTapRectCapturableIfActive()
+                                        : GpuDisplayViewport::scopeTapRectCapturable( ui->graphicsView );
+}
+
+void MainWindow::requestPlaybackScopeTap( int maxWidth ) const
+{
+    if( GpuDisplayWindow::isActive() ) GpuDisplayWindow::requestScopeTapIfActive( maxWidth );
+    else GpuDisplayViewport::requestScopeTap( ui->graphicsView, maxWidth );
+}
+
+bool MainWindow::takePlaybackScopeTap( std::vector<uint8_t> *rgb8, int *width, int *height, quint64 *serial ) const
+{
+    if( GpuDisplayWindow::isActive() ) return GpuDisplayWindow::takeScopeTapIfActive( rgb8, width, height, serial );
+    return GpuDisplayViewport::takeScopeTap( ui->graphicsView, rgb8, width, height, nullptr, nullptr, serial );
+}
+
+GpuScopeTap::Counters MainWindow::playbackScopeTapCounters( void ) const
+{
+    return GpuDisplayWindow::isActive() ? GpuDisplayWindow::scopeTapCountersIfActive()
+                                        : GpuDisplayViewport::scopeTapCountersFor( ui->graphicsView );
+}
+
+// D3 (CoS #447): stop, seek, clip or mode change drops queued and finished read-backs on BOTH surfaces, so a
+// read-back of the old picture can never land on the scope after the change. No GL.
+void MainWindow::invalidatePlaybackScopeTap( void ) const
+{
+    GpuDisplayWindow::invalidateScopeTapIfActive();
+    GpuDisplayViewport::invalidateScopeTap( ui->graphicsView );
 }
 
 void MainWindow::on_actionPlaybackAutoTarget24_triggered()
@@ -24786,6 +24893,15 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
         m_playbackPrepReplacedAfterComputeCount.load( std::memory_order_acquire );
     m_playbackSmokeStartScopeUpdates = m_playbackScopeUpdateCount;
     m_playbackSmokeStartScopeSkips = m_playbackScopeSkipCount;
+    m_playbackSmokeStartScopeGpuTapUpdates = m_playbackScopeGpuTapUpdateCount;
+    {
+        const GpuScopeTap::Counters tapCounters = playbackScopeTapCounters();
+        m_playbackSmokeStartScopeTapRequests = tapCounters.requests;
+        m_playbackSmokeStartScopeTapCompleted = tapCounters.completed;
+        m_playbackSmokeStartScopeTapNotReady = tapCounters.notReady;
+        m_playbackSmokeStartScopeTapSkipped = tapCounters.skipped;
+        m_playbackSmokeStartScopeTapMapMs = tapCounters.mapMsTotal;
+    }
     m_playbackSmokeStartAudioSyncRequests = m_playbackAudioSyncRequestCount;
     m_playbackSmokeStartAudioSyncApplied = m_playbackAudioSyncAppliedCount;
     m_playbackSmokeStartAudioSyncSkipped = m_playbackAudioSyncSkippedCount;
@@ -28724,6 +28840,19 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
      * continuation line now. The smoke wrapper merges both lines into one
      * cpuSummary object (it matches "cpu_summary " and "cpu_summary_ext"
      * separately). */
+    // PLAYBACK-GPU-SCOPES-NO-VETO-1: where the measured window's scope updates came from (cpu | gpu_tap |
+    // mixed | none) and the GL viewport read-back's own counters over the same window.
+    const GpuScopeTap::Counters scopeTapNow = playbackScopeTapCounters();
+    const quint64 scopeTapCompleted = scopeTapNow.completed - m_playbackSmokeStartScopeTapCompleted;
+    const quint64 scopeUpdatesGpuTap =
+        m_playbackScopeGpuTapUpdateCount - m_playbackSmokeStartScopeGpuTapUpdates;
+    const quint64 scopeUpdatesAll = m_playbackScopeUpdateCount - m_playbackSmokeStartScopeUpdates;
+    const quint64 scopeUpdatesCpu = scopeUpdatesAll >= scopeUpdatesGpuTap ? scopeUpdatesAll - scopeUpdatesGpuTap : 0;
+    const QString scopeTapSource =
+        ( scopeUpdatesGpuTap > 0 && scopeUpdatesCpu > 0 ) ? QStringLiteral("mixed")
+      : scopeUpdatesGpuTap > 0 ? QStringLiteral("gpu_tap")
+      : scopeUpdatesCpu > 0 ? QStringLiteral("cpu")
+      : QStringLiteral("none");
     qInfo().noquote()
         << QStringLiteral(
                "playback_smoke.cpu_summary_ext session=%1 "
@@ -28737,7 +28866,10 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                "avg_processed8_setup_ms=%10 avg_processed8_core_math_ms=%11 "
                "avg_processed8_local_tone_ms=%12 "
                "avg_processed8_threading_overhead_ms=%13 "
-               "avg_processed8_cache_store_ms=%14" )
+               "avg_processed8_cache_store_ms=%14 "
+               "scope_source=%15 scope_tap_requests=%16 scope_tap_completed=%17 "
+               "scope_tap_not_ready=%18 scope_tap_skipped=%19 scope_tap_avg_map_ms=%20 "
+               "scope_tap_w=%21 scope_tap_h=%22" )
                .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
                .arg( avgSmokeMs( m_playbackSmokeProcessingCoreCreativeCurveSumMs ), 0, 'f', 3 )
                .arg( avgSmokeMs( m_playbackSmokeProcessingCoreCreativeGradationSumMs ), 0, 'f', 3 )
@@ -28751,7 +28883,17 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                .arg( avgSmokeMs( m_playbackSmokeProcessed8CoreMathSumMs ), 0, 'f', 3 )
                .arg( avgSmokeMs( m_playbackSmokeProcessed8LocalToneSumMs ), 0, 'f', 3 )
                .arg( avgSmokeMs( m_playbackSmokeProcessed8ThreadingOverheadSumMs ), 0, 'f', 3 )
-               .arg( avgSmokeMs( m_playbackSmokeProcessed8CacheStoreSumMs ), 0, 'f', 3 );
+               .arg( avgSmokeMs( m_playbackSmokeProcessed8CacheStoreSumMs ), 0, 'f', 3 )
+               .arg( scopeTapSource )
+               .arg( static_cast<qulonglong>( scopeTapNow.requests - m_playbackSmokeStartScopeTapRequests ) )
+               .arg( static_cast<qulonglong>( scopeTapCompleted ) )
+               .arg( static_cast<qulonglong>( scopeTapNow.notReady - m_playbackSmokeStartScopeTapNotReady ) )
+               .arg( static_cast<qulonglong>( scopeTapNow.skipped - m_playbackSmokeStartScopeTapSkipped ) )
+               .arg( scopeTapCompleted > 0
+                         ? ( scopeTapNow.mapMsTotal - m_playbackSmokeStartScopeTapMapMs ) / static_cast<double>( scopeTapCompleted )
+                         : 0.0, 0, 'f', 3 )
+               .arg( scopeTapNow.lastWidth )
+               .arg( scopeTapNow.lastHeight );
 
     qInfo().noquote()
         << QStringLiteral(
@@ -29426,14 +29568,23 @@ void MainWindow::on_actionPlay_toggled(bool checked)
     applyEffectiveDualIsoPlaybackSettings();
     // PLAYBACK-SCOPES-OPTION-1: Hide skipped scope work while playing, so redraw the stopped frame
     // for its scope (the policy admits the scope again now that Play is off).
+    // PLAYBACK-GPU-SCOPES-NO-VETO-1: so does a play the GPU read-back served (its scope was downscaled).
     if( !checked
-     && m_playbackScopesMode == PlaybackScopesMode::Hide
-     && ui->actionShowEditArea->isChecked() )
+     && playbackScopesNeedStopRefresh( m_playbackScopesMode, m_playbackScopeGpuTapServedThisPlay,
+                                       ui->actionShowEditArea->isChecked() ) )
     {
         requestFrameRefresh( false, "play-stop-scopes" );
     }
+    // PLAYBACK-GPU-SCOPES-NO-VETO-1 D3: stop (and a new start) drops queued and finished scope read-backs.
+    invalidatePlaybackScopeTap();
+    if( !checked )
+    {
+        m_playbackScopeGpuTapServing = false;
+        m_playbackScopeGpuTapServedThisPlay = false;
+    }
     if( checked )
     {
+        m_playbackScopeGpuTapServedThisPlay = false;
         // PLAYBACK-CLIP-LENGTH-ENFORCE-2: every Play start after the first in this process is a restart,
         // whatever started it; counted so a replay can never pass as a clean measured run.
         if( ++m_playStartsInProcess > 1 ) m_playbackWrapRecorder.noteRestart();
@@ -30967,7 +31118,59 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
     // last paused frame's scope until playback stops. PSO-02: a frame requested under a policy that
     // admitted an RGB8-less route (no scope consumer then, e.g. Hide before a switch to Live) is not
     // measured; the next frame, requested under the new policy, supplies the scope.
-    if( playbackScopeFrameFeedsScope(
+    // PLAYBACK-GPU-SCOPES-NO-VETO-1: FIRST, a Throttled play the GL viewport's read-back serves: when the
+    // throttle is due, ask the viewport to read back the picture it draws next; on every pass, a finished
+    // read-back (fence signalled, mapped without waiting) feeds the scope. No CPU presented pixels are used, so
+    // the GPU texture route stays eligible. Live, CPU routes and mid-play mode switches fall to the branches below.
+    m_playbackScopeGpuTapServing = ui->actionPlay->isChecked()
+        && playbackScopeGpuTapServesNow( ui->actionShowEditArea->isChecked() );
+    if( m_playbackScopeGpuTapServing )
+    {
+        m_playbackScopeGpuTapServedThisPlay = true;
+        const double scopes_start = mlv_stage_timing_now();
+        const double renderTotalMs =
+            telemetryDoubleValue( readyFrame.stageTimingTelemetry, "render_thread_total_ms" );
+        const int intervalMs =
+            playbackScopeUpdateIntervalForMode( m_playbackScopesMode,
+                                                playbackScopeUpdateIntervalMs(),
+                                                renderTotalMs );
+        const bool tapDue =
+            intervalMs <= 0
+         || m_playbackScopeLastUpdateTime <= 0.0
+         || ( scopes_start - m_playbackScopeLastUpdateTime ) * 1000.0 >= static_cast<double>( intervalMs );
+        if( tapDue )
+        {
+            requestPlaybackScopeTap( 512 );
+            m_playbackScopeLastUpdateTime = scopes_start;
+        }
+        else
+        {
+            ++m_playbackScopeSkipCount;
+        }
+        int tapWidth = 0;
+        int tapHeight = 0;
+        quint64 tapSerial = 0;
+        const PlaybackScopeKind tapScopeKind = playbackScopeKindForChecks(
+            ui->actionShowHistogram->isChecked(), ui->actionShowWaveFormMonitor->isChecked(),
+            ui->actionShowParade->isChecked(), ui->actionShowVectorScope->isChecked() );
+        if( takePlaybackScopeTap( &m_playbackScopeTapRgb8, &tapWidth, &tapHeight, &tapSerial )
+         && tapWidth > 0 && tapHeight > 0 && tapScopeKind != PlaybackScopeKind::None )
+        {
+            // CoS #447 blocker 1: the CPU feed's clip flags for the same picture and zebra state (zebras are off
+            // whenever the read-back serves, so no clip markers), never a rule of the read-back's own.
+            bool tapUnder = false;
+            bool tapOver = false;
+            playbackScopeFeedUnderOver( ui->actionShowZebras->isChecked(), m_playbackScopeTapRgb8.data(),
+                                        tapWidth, tapHeight, &tapUnder, &tapOver );
+            ui->labelScope->setScope( m_playbackScopeTapRgb8.data(), tapWidth, tapHeight,
+                                      tapUnder, tapOver, scopesLabelTypeForPlaybackScopeKind( tapScopeKind ) );
+            ++m_playbackScopeUpdateCount;
+            ++m_playbackScopeGpuTapUpdateCount;
+            m_lastDrawFrameReadyScopesMs = ( mlv_stage_timing_now() - scopes_start ) * 1000.0;
+            mlv_stage_timing_note_elapsed("drawFrameReady.scopes", displayFrame, m_lastDrawFrameReadyScopesMs);
+        }
+    }
+    else if( playbackScopeFrameFeedsScope(
             scopeDisplayConsumesPresentedPixels( ui->actionShowEditArea->isChecked() ),
             mainWindowAllowsGpu16PreviewRender( requestContext.gpuPreviewPolicy ) ) )
     {
@@ -30993,44 +31196,20 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
         {
             bool under = false;
             bool over = false;
-            if( ( underOver & 0x01 ) == 0x01 ) under = true;
-            if( ( underOver & 0x02 ) == 0x02 ) over = true;
+            playbackScopeUnderOverFlags( underOver, &under, &over );
 
-            if( ui->actionShowHistogram->isChecked() )
+            // PLAYBACK-GPU-SCOPES-NO-VETO-1 (CoS #447 parity): the same scope choice the read-back feed asks.
+            const PlaybackScopeKind scopeKind = playbackScopeKindForChecks(
+                ui->actionShowHistogram->isChecked(), ui->actionShowWaveFormMonitor->isChecked(),
+                ui->actionShowParade->isChecked(), ui->actionShowVectorScope->isChecked() );
+            if( scopeKind != PlaybackScopeKind::None )
             {
                 ui->labelScope->setScope( const_cast<uint8_t *>( rgb8DisplaySource ),
                                           displaySourceWidth,
                                           displaySourceHeight,
                                           under,
                                           over,
-                                          ScopesLabel::ScopeHistogram );
-            }
-            else if( ui->actionShowWaveFormMonitor->isChecked() )
-            {
-                ui->labelScope->setScope( const_cast<uint8_t *>( rgb8DisplaySource ),
-                                          displaySourceWidth,
-                                          displaySourceHeight,
-                                          under,
-                                          over,
-                                          ScopesLabel::ScopeWaveForm );
-            }
-            else if( ui->actionShowParade->isChecked() )
-            {
-                ui->labelScope->setScope( const_cast<uint8_t *>( rgb8DisplaySource ),
-                                          displaySourceWidth,
-                                          displaySourceHeight,
-                                          under,
-                                          over,
-                                          ScopesLabel::ScopeRgbParade);
-            }
-            else if( ui->actionShowVectorScope->isChecked() )
-            {
-                ui->labelScope->setScope( const_cast<uint8_t *>( rgb8DisplaySource ),
-                                          displaySourceWidth,
-                                          displaySourceHeight,
-                                          under,
-                                          over,
-                                          ScopesLabel::ScopeVectorScope );
+                                          scopesLabelTypeForPlaybackScopeKind( scopeKind ) );
             }
             m_playbackScopeLastUpdateTime = mlv_stage_timing_now();
             ++m_playbackScopeUpdateCount;

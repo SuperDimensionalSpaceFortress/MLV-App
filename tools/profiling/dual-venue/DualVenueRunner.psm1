@@ -315,6 +315,9 @@ function Get-DvBlobIdAtCommit {
 }
 
 $script:LegsRelativeDir = 'tools/profiling/dual-venue/legs'
+# Find-DvCommittedLegSpec: blob id -> @{ sha256 = Get-DvLegSpecSha256 of its bytes; text } for leg-spec blobs already read in this session. A git blob id names its content,
+# so the entry can never go stale; it is filled only from ids `ls-tree` listed at a verified commit of the repo being asked.
+$script:LegSpecBlobCache = @{}
 $script:LookReceiptPattern = '^look-receipts/[a-z0-9-]+\.marxml$'
 
 function Read-DvCommittedLookReceipt {
@@ -358,9 +361,16 @@ function Find-DvCommittedLegSpec {
         if ($row -cnotmatch '^[0-7]{6} blob (?<id>[0-9a-f]{40})\t(?<path>.+)$') { continue }
         $id = $Matches['id']; $path = $Matches['path'].Trim()
         if (-not $path.EndsWith('.json')) { continue }
-        $blob = Get-DvBlobById -RepoRoot $RepoRoot -BlobSha $id
-        if ($blob.ok -and (Get-DvLegSpecSha256 $blob.bytes) -ceq $LegSpecSha256) {
-            return [pscustomobject]@{ ok = $true; relativePath = $path; blobSha = $id; text = $blob.text }
+        # Two git calls per blob, once per session: a caller that looks up every shipped leg (n lookups over n blobs) stays linear in git processes.
+        $known = $script:LegSpecBlobCache[$id]
+        if ($null -eq $known) {
+            $blob = Get-DvBlobById -RepoRoot $RepoRoot -BlobSha $id
+            if (-not $blob.ok) { continue }
+            $known = @{ sha256 = (Get-DvLegSpecSha256 $blob.bytes); text = $blob.text }
+            $script:LegSpecBlobCache[$id] = $known
+        }
+        if ($known.sha256 -ceq $LegSpecSha256) {
+            return [pscustomobject]@{ ok = $true; relativePath = $path; blobSha = $id; text = $known.text }
         }
     }
     $none

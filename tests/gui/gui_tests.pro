@@ -16,6 +16,7 @@ SOURCES += \
     $$REPO_ROOT/platform/qt/GpuPreviewProcessing.cpp \
     $$REPO_ROOT/platform/qt/GpuDisplayWindow.cpp \
     $$REPO_ROOT/platform/qt/GpuDisplayViewport.cpp \
+    $$REPO_ROOT/platform/qt/GpuScopeTap.cpp \
     $$REPO_ROOT/platform/qt/Histogram.cpp \
     $$REPO_ROOT/platform/qt/ScopesLabel.cpp \
     $$REPO_ROOT/platform/qt/VectorScope.cpp \
@@ -34,6 +35,7 @@ HEADERS += \
     $$REPO_ROOT/platform/qt/DualIsoPatternMapping.h \
     $$REPO_ROOT/platform/qt/GpuDisplayWindow.h \
     $$REPO_ROOT/platform/qt/GpuDisplayViewport.h \
+    $$REPO_ROOT/platform/qt/GpuScopeTap.h \
     $$REPO_ROOT/platform/qt/Histogram.h \
     $$REPO_ROOT/platform/qt/MainWindowGpuPreviewPolicy.h \
     $$REPO_ROOT/platform/qt/ScopesLabel.h \

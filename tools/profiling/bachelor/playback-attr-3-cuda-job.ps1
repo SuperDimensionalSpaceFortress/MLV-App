@@ -950,6 +950,11 @@ $embeddedFunctions = $embeddedFunctions + "`r`n# VENUE-SESSION-LOCKED-REFUSAL-1 
 $embeddedFunctions = $embeddedFunctions + "`r`n# HFR-CONFORM-AWARE-RECEIPT-ORACLES-1 >>>`r`n" + (Get-AttrCudaEmbeddedFunctionSource -Name @(
     'Get-AttrCudaConformAwareSourceFramesVerdict'
 )) +"`r`n# HFR-CONFORM-AWARE-RECEIPT-ORACLES-1 <<<"
+# PLAYBACK-GPU-SCOPES-NO-VETO-1 r2: the measured session's eligibility line (the verdict above calls it), spliced inside its own
+# sentinel brackets for the same byte-identity reason as the splices above.
+$embeddedFunctions = $embeddedFunctions + "`r`n# PLAYBACK-GPU-SCOPES-NO-VETO-1 >>>`r`n" + (Get-AttrCudaEmbeddedFunctionSource -Name @(
+    'Get-AttrCudaEligibilityLineForSession'
+)) +"`r`n# PLAYBACK-GPU-SCOPES-NO-VETO-1 <<<"
 $smokeRunnerClosureDigest = Get-AttrCudaClosureDigestHex -Closure $smokeRunnerClosure
 if ($smokeRunnerClosureDigest -notmatch '^[0-9a-f]{64}$') {
     throw "ATTRCUDA_BLOB_SHA_MALFORMED smoke-runner closure digest is not 64 lowercase hex: '$smokeRunnerClosureDigest'"
@@ -3397,6 +3402,11 @@ if (-not $keepAliveHealthAfterMeasuredInterval.healthy) {
 # alone would happily describe some other path. Both fields and r16_reason are recorded
 # either way, so a refusal says WHY.
 $verdict = Get-AttrCudaEligibilityVerdict -LogText $rawLog
+# PLAYBACK-GPU-SCOPES-NO-VETO-1 >>>
+# r2: the line in force for the MEASURED session (the last one at or before its playback_smoke.summary), not the
+# post-measurement window-capture tail's; the tail is reported, never read. The line above is the baseline call, kept verbatim.
+$verdict = Get-AttrCudaEligibilityVerdict -LogText $rawLog -MeasuredSessionId $measuredSmokeSessionId
+# PLAYBACK-GPU-SCOPES-NO-VETO-1 <<<
 $diagnostics = [ordered]@{
     source = $verdict.source
     linePresent = $verdict.linePresent
@@ -3407,6 +3417,12 @@ $diagnostics = [ordered]@{
     cudaBackendResolved = $verdict.cudaBackendResolved
     r16ProbeRan = $verdict.r16ProbeRan
     admitted = $verdict.admitted
+    # PLAYBACK-GPU-SCOPES-NO-VETO-1 >>>
+    verdictScope = $verdict.verdictScope
+    measuredWindowRefusingLines = $verdict.measuredWindowRefusingLines
+    tailLinesIgnored = $verdict.tailLinesIgnored
+    tailRefused = $verdict.tailRefused
+    # PLAYBACK-GPU-SCOPES-NO-VETO-1 <<<
     # Which bytes the verdict was read from, and the binding that proves they are this run's.
     log = [ordered]@{ path = $runLog.path; sha256 = $runLog.sha256; bytes = $runLog.bytes; runNonce = $runLog.runNonce; source = $runLog.source; aggregateSourcePath = $runLog.aggregateSourcePath }
 }
@@ -3944,6 +3960,19 @@ $manifest = [ordered]@{
     capturedUtc = (Get-Date).ToUniversalTime().ToString('o')
 }
 Save-Json $manifest (Join-Path $Pub 'evidence-manifest.json')
+# PLAYBACK-GPU-SCOPES-NO-VETO-1 >>>
+# r2 (CoS #447): where the MEASURED session's scope updates came from (cpu | gpu_tap | mixed | none) and how many GL read-backs
+# completed, from that session's own playback_smoke.cpu_summary_ext line (the last one wins), so a leg spec can assert the read-back
+# served. Absent from a build that predates the fields: both stay $null, and a criterion on them fails (an absent metric never passes).
+$scopeSource = $null
+$scopeTapCompleted = $null
+foreach ($candidateLine in ($rawLog -split "`r?`n")) {
+    if ($candidateLine -match ('playback_smoke\.cpu_summary_ext session=' + [regex]::Escape([string]$measuredSmokeSessionId) + '(\s|$)')) {
+        $scopeSource = if ($candidateLine -match '\sscope_source=(?<v>\S+)') { $Matches['v'] } else { $null }
+        $scopeTapCompleted = if ($candidateLine -match '\sscope_tap_completed=(?<v>\d+)') { [int64]$Matches['v'] } else { $null }
+    }
+}
+# PLAYBACK-GPU-SCOPES-NO-VETO-1 <<<
 # A SUCCESS summary.json, which the failure paths above all write but the success path did not:
 # summary.json is the first file a reader opens, and its absence on the one path that produces
 # numbers is exactly where a rehearsal could be mistaken for a measurement (sol, PR #137 r1).
@@ -3958,6 +3987,10 @@ Save-Json ([ordered]@{
     sourceFrames = $sourceFramesBlock
     gpuFramesTotal = $gpuFramesTotal
     cpuFrames = $gpuSummary.cpuFrames
+    # PLAYBACK-GPU-SCOPES-NO-VETO-1 >>>
+    scopeSource = $scopeSource
+    scopeTapCompleted = $scopeTapCompleted
+    # PLAYBACK-GPU-SCOPES-NO-VETO-1 <<<
     presentMonSamples = $pmRows.Count
     presentMonSelectedChain = $displayReport.selectedChain
     presentMonStatus = $presentMonStatus

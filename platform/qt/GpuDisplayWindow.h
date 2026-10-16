@@ -32,11 +32,13 @@
 #include <QOpenGLWindow>
 #include "GpuDisplayViewport.h"
 #include "GpuPreviewProcessing.h"
+#include "GpuScopeTap.h"
 #include "GpuWindowSwapTelemetry.h"
 #include "../../src/mlv/llrawproc/llrawproc.h"
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 class QGraphicsView;
 
@@ -90,6 +92,17 @@ public:
      * (a default value when no window is active). GUI-thread only; read it right after
      * presentGpuPlaybackReconAmazePostWbTextureIfActive. */
     static GpuPresentSetupTiming lastPresentSetupTimingIfActive(void);
+    /* PLAYBACK-GPU-SCOPES-NO-VETO-1 r2: the Throttled scope's read-back of the picture this window drew, through
+     * the same GpuScopeTap the QOpenGLWidget viewport uses. A request makes the next paintGL (paint-per-submit
+     * paints on every submit) read back the letterboxed picture after the synchronous capture block, never
+     * during a capture paint; paintGL polls the fence at its start. take never calls GL. Each takes
+     * g_activeMutex and refuses (false / no-op / zero counters) with no active window or off the GUI thread. */
+    static bool scopeTapSupportedIfActive(void);
+    static bool scopeTapRectCapturableIfActive(void);
+    static void requestScopeTapIfActive(int maxWidth);
+    static bool takeScopeTapIfActive(std::vector<uint8_t> *rgb8, int *width, int *height, quint64 *serial);
+    static void invalidateScopeTapIfActive(void);
+    static GpuScopeTap::Counters scopeTapCountersIfActive(void);
     /* PLAYBACK-STARTUP-WAIT-PREWARM-1 Row B: warm the playback recon texture route while paused (program compile,
      * one AMaZE run at texWidth x texHeight on temporary textures, then freed). Changes nothing on screen. GUI-thread
      * only; summary receives one "ok=... program_ms=... amaze_ms=..." fragment for the log. */
@@ -282,6 +295,9 @@ private:
     bool m_captureReadbackSucceeded;
     QImage m_captureReadbackImage;
     QString m_captureReadbackError;
+    // PLAYBACK-GPU-SCOPES-NO-VETO-1 r2: the Throttled scope's read-back (see scopeTapSupportedIfActive). The
+    // pending request lives in the tap itself (m_scopeTap.requested()), one flag for both surfaces.
+    GpuScopeTap m_scopeTap{"window"};
     bool m_loggedContext;
     bool m_loggedPaint;
     bool m_loggedPresented;
