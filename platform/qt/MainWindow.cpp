@@ -1576,6 +1576,7 @@ static bool lookAssistProcessedFloorLiftedPostInvalidShouldFailClosed(
 #include "GpuDisplayViewport.h"
 #include "GpuDisplayWindow.h"
 #include "GpuFieldTelemetry.h"
+#include "GpuDeviceLossBreaker.h"
 #include "MainWindowGpuPreviewPolicy.h"
 #include "PlaybackQualityPolicy.h"
 #include "PlaybackScaling.h"
@@ -2089,6 +2090,8 @@ static bool playback_recon_texture_present_requested_by_environment()
 
 static bool playback_recon_requested_by_environment()
 {
+    // GPU-DEVICE-LOSS-SELF-HEAL-1: no CUDA recon after a device loss or on a safe start.
+    if( llrpGpuCudaSuppressed() ) return false;
     const QString value =
         qEnvironmentVariable("MLVAPP_GPU_PLAYBACK_RECON").trimmed();
     return !value.isEmpty()
@@ -2407,6 +2410,22 @@ MainWindow::MainWindow(int &argc, char **argv, QWidget *parent) :
     initLib();
     // PLAYBACK-CUDA-HONOUR-SCALE-1 r2: set_clip/set_luts events reach the log.
     llrpSetGpuReconEventLogger( gpuPresentEventLogReconLine );
+    // GPU-DEVICE-LOSS-SELF-HEAL-1: the non-modal device-loss notice (a queued startup notice shows now) and the
+    // refresh that moves the next frame onto the CPU route without a clip reload.
+    GpuDeviceLossBreaker::setNoticeSink( [this]( const QString &text )
+    {
+        if( text.isEmpty() )
+        {
+            statusBar()->clearMessage();
+            return;
+        }
+        statusBar()->showMessage( text, 0 );
+        qInfo().noquote() << "gpu_device_loss_notice:" << text;
+    } );
+    GpuDeviceLossBreaker::setRefreshCallback( [this]()
+    {
+        requestFrameRefresh( true, "gpu-device-loss-cpu-route" );
+    } );
 
     resetSliders();
 
@@ -6451,7 +6470,8 @@ void MainWindow::drawFrame( bool updateTimecodeLabel )
         GpuDisplayViewport::isInstalledOn( ui->graphicsView );
     renderPolicy.gpuPreviewProcessingBackendRequest = m_gpuPreviewProcessingBackendRequest;
     renderPolicy.gpuPreviewProcessingEnvironmentRequested =
-        gpuPreviewProcessingRequestedByEnvironment();
+        mainWindowGpuPreviewProcessingRequestedForSession(
+            gpuPreviewProcessingRequestedByEnvironment(), llrpGpuCudaSuppressed() != 0 );
     renderPolicy.gpuPreviewProcessingCompatible = gpuPreviewProcessingIsSupported( m_pProcessingObject );
     // PLAYBACK-SEEK-RENDER-PARITY-1: the texture-present routes draw through the live
     // display shader, which applies the full per-pixel chain but not these stages.
@@ -6467,7 +6487,7 @@ void MainWindow::drawFrame( bool updateTimecodeLabel )
         m_pMlvObject && doesMlvAlwaysUseAmaze( m_pMlvObject ) == 0;
     renderPolicy.gpuAmazeDebayerBackendRequest = m_gpuAmazeDebayerBackendRequest;
     renderPolicy.gpuAmazeDebayerEnvironmentRequested =
-        gpuAmazeDebayerRequestedByEnvironment();
+        gpuAmazeDebayerRequestedByEnvironment() && !llrpGpuCudaSuppressed();
     renderPolicy.gpuAmazeTexturePresentationEnvironmentRequested =
         gpuAmazeTexturePresentRequestedByEnvironment();
     renderPolicy.gpuPlaybackReconEnvironmentRequested =
@@ -7870,10 +7890,10 @@ int MainWindow::runHeadlessPlaybackProfile(const PlaybackProfileOptions & option
             // Round 2 (hub ruling): the settle also HOLDS Play for the full 20 s floor before it stops it
             // (it used to stop at a 12 s deadline or as soon as the diagnostics settled), and requests that
             // 20 s window, so no settle Play is shorter than the floor. A refusal happens before Play; the
-            // caller returns the typed exit code.
+            // caller returns the typed exit code. HFR-10S-1: the floor is the clip's own (10 s for an HFR clip).
             forceLoopOffForAutomation( "profile-look-assist-settle" );
             if( !programmaticPlay( "profile-look-assist-settle",
-                                   playback_frame_range::kMinPlayWindowSeconds ) )
+                                   playGateMinPlayWindowSeconds() ) )
             {
                 lookAssistSettleSmokeStable = false;
                 lookAssistSettleSmokeFailure = m_lastPlayGateRefusalMessage;
@@ -8243,10 +8263,11 @@ int MainWindow::runHeadlessPlaybackProfile(const PlaybackProfileOptions & option
         // launch is gated HERE, in the app: the window from the current position (the start frame, set
         // above) to the cut-out must be >= 20 s, else Play is never triggered (typed exit 14, zero frames).
         // Round 2 (hub ruling): the exercise requests the 20 s floor and HOLDS Play for all of it -- it used to
-        // stop at the first advancing frame or a 5 s timeout, a Play of well under 20 s.
+        // stop at the first advancing frame or a 5 s timeout, a Play of well under 20 s. HFR-10S-1: the floor is the
+        // clip's own (10 s for an HFR clip).
         forceLoopOffForAutomation( "profile-exercise-play-action" );
         const bool playActionAdmitted = programmaticPlay( "profile-exercise-play-action",
-                                                          playback_frame_range::kMinPlayWindowSeconds );
+                                                          playGateMinPlayWindowSeconds() );
         playActionGateRefused = !playActionAdmitted;
         playActionSmokeStarted = playActionAdmitted && ui->actionPlay->isChecked();
         qApp->processEvents( QEventLoop::AllEvents );
@@ -8829,9 +8850,21 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         return 0;
     }
 
+    // PLAYBACK-CLIP-LENGTH-HFR-10S-1: main.cpp refuses at parse only what no clip could admit (the lowest floor);
+    // now the clip is open, --seconds (the play window) must reach THIS clip's floor (minPlayWindowSeconds of its
+    // native fps: 10 s for an HFR clip, 20 s otherwise or unknown). Refused before anything plays.
+    if( options.durationMs + 1e-6 < playGateMinPlayWindowSeconds() * 1000.0 )
+    {
+        ++m_programmaticPlayLedger.refused;
+        m_programmaticPlayLedger.lastRefusalReason = "PLAY_DURATION_TOO_SHORT";
+        err << "[GUI-SMOKE] ERROR: PLAY_DURATION_TOO_SHORT (--seconds=" << options.durationMs / 1000.0
+            << " window=" << playGateMinPlayWindowSeconds() << ")\n";
+        return 14;
+    }
     // PLAYBACK-CLIP-LENGTH-ENFORCE-1 round 2 (owner rule 2026-09-30): the app's own length gate, for a
     // launch that bypassed tools/profiling/run-release-gui-smoke.ps1 (a direct exe launch). The clip must
-    // be at least 20 s and must outlast the play window measured from --start-frame; path-free message.
+    // be at least its floor (HFR-10S-1: 10 s for an HFR clip, else 20 s) and must outlast the play window
+    // measured from --start-frame; path-free message.
     {
         const int guardFrames = static_cast<int>( getMlvFrames( m_pMlvObject ) );
         const double guardFps = static_cast<double>( getMlvFramerate( m_pMlvObject ) );
@@ -8841,8 +8874,9 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         const double guardRemainingSeconds = guardFps > 0.0
             ? guardClipSeconds - qMax( 0, options.startFrame ) / guardFps
             : 0.0;
-        const double guardRequiredSeconds = qMax( 20.0, guardWindowSeconds );
-        if( guardClipSeconds < 20.0 || guardRemainingSeconds < guardWindowSeconds )
+        const double guardFloorSeconds = playback_frame_range::minPlayWindowSeconds( guardFps );
+        const double guardRequiredSeconds = qMax( guardFloorSeconds, guardWindowSeconds );
+        if( guardClipSeconds < guardFloorSeconds || guardRemainingSeconds < guardWindowSeconds )
         {
             err << "[GUI-SMOKE] ERROR: CLIP_TOO_SHORT (clip="
                 << QString::number( guardRemainingSeconds < guardClipSeconds
@@ -8852,19 +8886,20 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         }
     }
     // ENFORCE-2 round 2 (sol B2): the lifecycle-stress leg STOPS the first clip's Play at the switch (the second
-    // clip is opened, seeked and closed but never played), so the switch may only happen after the 20 s floor.
-    // Also refused in main.cpp at parse time; refused here for any other way of building the options.
+    // clip is opened, seeked and closed but never played), so the switch may only happen after the clip's floor
+    // (HFR-10S-1: 10 s for an HFR clip, else 20 s). main.cpp refuses at parse what no clip could admit; the
+    // clip's own floor is applied here, for any way of building the options.
     if( options.exerciseClipLifecycleStress
-     && !playback_frame_range::stressSwitchReachesFloor( options.stressSwitchAtMs ) )
+     && !playback_frame_range::stressSwitchReachesFloor( options.stressSwitchAtMs, playGateMinPlayWindowSeconds() ) )
     {
         ++m_programmaticPlayLedger.refused;
         m_programmaticPlayLedger.lastRefusalReason = "PLAY_DURATION_TOO_SHORT";
         err << "[GUI-SMOKE] ERROR: PLAY_DURATION_TOO_SHORT (stress-switch-at-ms=" << options.stressSwitchAtMs
-            << " window=" << playback_frame_range::kMinPlayWindowMs << ")\n";
+            << " window=" << playback_frame_range::minPlayWindowMs( playGateNativeFps() ) << ")\n";
         return 14;
     }
     // The lifecycle-stress leg switches to a SECOND clip mid-play: read its MLVI
-    // header (mlv_file_hdr_t: frame count @36, fps nom/denom @44/@48) and apply the 20 s floor. A spanned
+    // header (mlv_file_hdr_t: frame count @36, fps nom/denom @44/@48) and apply its own floor. A spanned
     // or unreadable header is refused fail-closed (the runner sums spanned sets; a direct launch need not).
     if( options.exerciseClipLifecycleStress
      && QFileInfo( options.stressSwitchInputPath ).absoluteFilePath()
@@ -8882,7 +8917,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         const double stressFps = stressHeaderOk && u32( 48 ) > 0
             ? u32( 44 ) / static_cast<double>( u32( 48 ) ) : 0.0;
         const double stressSeconds = stressFps > 0.0 ? u32( 36 ) / stressFps : 0.0;
-        if( !stressHeaderOk || u16( 26 ) > 1 || stressSeconds < 20.0 )
+        if( !stressHeaderOk || u16( 26 ) > 1 || stressSeconds < playback_frame_range::minPlayWindowSeconds( stressFps ) )
         {
             err << "[GUI-SMOKE] ERROR: "
                 << ( stressHeaderOk && u16( 26 ) <= 1 ? "CLIP_TOO_SHORT" : "CLIP_LENGTH_UNKNOWN" )
@@ -11128,6 +11163,8 @@ int MainWindow::openMlv( QString fileName )
     }
     // GPU-FIELD-TELEMETRY-1: clip identity for the field log (cold; only the basename's hash is kept).
     if ( GpuFieldTelemetry::enabled() ) GpuFieldTelemetry::noteClip( (int)getMlvWidth( m_pMlvObject ), (int)getMlvHeight( m_pMlvObject ), (int)getMlvBitdepth( m_pMlvObject ), isMlvCompressed( m_pMlvObject ) != 0, llrpGetDualIsoValidity( m_pMlvObject ) == DISO_VALID && qEnvironmentVariableIntValue( "MLVAPP_GPU_PLAYBACK_RECON" ) != 0, QFileInfo( fileName ).fileName() );
+    // GPU-DEVICE-LOSS-SELF-HEAL-1: the clip half of the breaker's profile key.
+    GpuDeviceLossBreaker::noteClipOpened( (int)getMlvWidth( m_pMlvObject ), (int)getMlvHeight( m_pMlvObject ), (int)getMlvBitdepth( m_pMlvObject ), isMlvCompressed( m_pMlvObject ) != 0 );
 
     QString audioText;
     if( doesMlvHaveAudio( m_pMlvObject ) )
@@ -11636,6 +11673,8 @@ void MainWindow::showPerformanceProfilingDialog( void )
     const bool cudaEnabled = cudaPlaybackPreset->isChecked();
     CrashForensics::setCudaPlaybackProfilingSettingsEnabled( cudaEnabled );
     CrashForensics::applyCudaPlaybackProfilingEnvironment( cudaEnabled );
+    // GPU-DEVICE-LOSS-SELF-HEAL-1: turning the preset on is the user's "try the GPU again".
+    if( cudaEnabled ) GpuDeviceLossBreaker::userReenableGpu();
     const bool dngAsyncEnabled = dngAsyncPreset->isChecked();
     const int queueDepth = dngQueueDepth->value();
     const int threadCount = dngThreadCount->value();
@@ -19137,7 +19176,8 @@ bool MainWindow::shouldUseGpuPreviewProcessingPath( void ) const
         GpuDisplayViewport::isInstalledOn( ui->graphicsView );
     policyState.gpuPreviewProcessingBackendRequest = m_gpuPreviewProcessingBackendRequest;
     policyState.gpuPreviewProcessingEnvironmentRequested =
-        gpuPreviewProcessingRequestedByEnvironment();
+        mainWindowGpuPreviewProcessingRequestedForSession(
+            gpuPreviewProcessingRequestedByEnvironment(), llrpGpuCudaSuppressed() != 0 );
     policyState.gpuPreviewProcessingCompatible = gpuPreviewProcessingIsSupported( m_pProcessingObject );
     const bool scopeDisplayVisible =
         scopeDisplayConsumesPresentedPixels( ui->dockWidgetEdit->isVisible() );
@@ -19160,7 +19200,8 @@ bool MainWindow::shouldUseGpuBilinearDebayerPath( void ) const
         GpuDisplayViewport::isInstalledOn( ui->graphicsView );
     policyState.gpuPreviewProcessingBackendRequest = m_gpuPreviewProcessingBackendRequest;
     policyState.gpuPreviewProcessingEnvironmentRequested =
-        gpuPreviewProcessingRequestedByEnvironment();
+        mainWindowGpuPreviewProcessingRequestedForSession(
+            gpuPreviewProcessingRequestedByEnvironment(), llrpGpuCudaSuppressed() != 0 );
     policyState.gpuPreviewProcessingCompatible = gpuPreviewProcessingIsSupported( m_pProcessingObject );
     policyState.gpuBilinearDebayerBackendRequest = m_gpuBilinearDebayerBackendRequest;
     policyState.gpuBilinearDebayerEnvironmentRequested =
@@ -19188,11 +19229,12 @@ bool MainWindow::shouldUseGpuAmazeDebayerPath( void ) const
         GpuDisplayViewport::isInstalledOn( ui->graphicsView );
     policyState.gpuPreviewProcessingBackendRequest = m_gpuPreviewProcessingBackendRequest;
     policyState.gpuPreviewProcessingEnvironmentRequested =
-        gpuPreviewProcessingRequestedByEnvironment();
+        mainWindowGpuPreviewProcessingRequestedForSession(
+            gpuPreviewProcessingRequestedByEnvironment(), llrpGpuCudaSuppressed() != 0 );
     policyState.gpuPreviewProcessingCompatible = gpuPreviewProcessingIsSupported( m_pProcessingObject );
     policyState.gpuAmazeDebayerBackendRequest = m_gpuAmazeDebayerBackendRequest;
     policyState.gpuAmazeDebayerEnvironmentRequested =
-        gpuAmazeDebayerRequestedByEnvironment();
+        gpuAmazeDebayerRequestedByEnvironment() && !llrpGpuCudaSuppressed();
     policyState.gpuAmazeDebayerCompatible =
         m_pMlvObject
         && doesMlvAlwaysUseAmaze( m_pMlvObject ) != 0
@@ -22585,7 +22627,8 @@ MainWindowGpuPreviewPolicyState MainWindow::gpuPreviewPolicyForCurrentScopeState
     policyState.gpuPreviewProcessingBackendRequest =
         m_gpuPreviewProcessingBackendRequest;
     policyState.gpuPreviewProcessingEnvironmentRequested =
-        gpuPreviewProcessingRequestedByEnvironment();
+        mainWindowGpuPreviewProcessingRequestedForSession(
+            gpuPreviewProcessingRequestedByEnvironment(), llrpGpuCudaSuppressed() != 0 );
     policyState.gpuPreviewProcessingCompatible =
         gpuPreviewProcessingIsSupported( m_pProcessingObject );
     policyState.gpuBilinearDebayerBackendRequest =
@@ -22596,7 +22639,7 @@ MainWindowGpuPreviewPolicyState MainWindow::gpuPreviewPolicyForCurrentScopeState
         m_pMlvObject && doesMlvAlwaysUseAmaze( m_pMlvObject ) == 0;
     policyState.gpuAmazeDebayerBackendRequest = m_gpuAmazeDebayerBackendRequest;
     policyState.gpuAmazeDebayerEnvironmentRequested =
-        gpuAmazeDebayerRequestedByEnvironment();
+        gpuAmazeDebayerRequestedByEnvironment() && !llrpGpuCudaSuppressed();
     policyState.gpuAmazeTexturePresentationEnvironmentRequested =
         gpuAmazeTexturePresentRequestedByEnvironment();
     policyState.gpuPlaybackReconEnvironmentRequested =
@@ -23992,6 +24035,9 @@ void MainWindow::on_actionFullscreen_triggered( bool checked )
         if( windowWasMaximized ) this->showMaximized();
         else this->showNormal();
         ui->statusBar->show();
+        // GPU-DEVICE-LOSS-SELF-HEAL-1: the device-loss notice survives fullscreen.
+        if( !GpuDeviceLossBreaker::currentNotice().isEmpty() )
+            statusBar()->showMessage( GpuDeviceLossBreaker::currentNotice(), 0 );
         ui->mainToolBar->show();
         ui->menuBar->show();
         ui->horizontalSliderPosition->show();
@@ -29486,12 +29532,22 @@ void MainWindow::on_actionPlay_toggled(bool checked)
 // The static class test (tools/repo_hygiene/test_playback_clip_length_gate.py) fails on any other
 // programmatic actionPlay->trigger(), any Loop-enable, and any setPlaying outside this commented list.
 // ---------------------------------------------------------------------------------------------------------
+double MainWindow::playGateNativeFps() const
+{
+    return ( m_fileLoaded && m_pMlvObject ) ? static_cast<double>( getMlvFramerate( m_pMlvObject ) ) : 0.0;
+}
+
+double MainWindow::playGateMinPlayWindowSeconds() const
+{
+    return playback_frame_range::minPlayWindowSeconds( playGateNativeFps() );
+}
+
 playback_frame_range::PlayableWindowVerdict MainWindow::checkPlayableWindow( const char *site, double requestedSeconds )
 {
     Q_UNUSED( site );
     const bool haveClip = m_fileLoaded && m_pMlvObject;
     const int totalFrames = haveClip ? static_cast<int>( getMlvFrames( m_pMlvObject ) ) : 0;
-    const double fps = haveClip ? static_cast<double>( getMlvFramerate( m_pMlvObject ) ) : 0.0;
+    const double fps = playGateNativeFps();
     // ENFORCE-2 round 2 (sol B3): measure the range the ENGINE plays -- with MLVAPP_F3_DISABLE_CUT_RANGE_REPAIR
     // set the play path leaves a collapsed / inverted range alone (normalizePlaybackCutRangeForLoadedClip), so
     // the gate must not assume the repair either. This is the one knob that changes the effective range.
@@ -29504,7 +29560,7 @@ playback_frame_range::PlayableWindowVerdict MainWindow::checkPlayableWindow( con
         ui->spinBoxCutIn->value(),
         ui->spinBoxCutOut->value(),
         totalFrames, fps, requestedSeconds,
-        playback_frame_range::kMinPlayWindowSeconds,
+        playback_frame_range::minPlayWindowSeconds( fps ),
         !f3CutRangeRepairDisabledByEnvironment(),
         enginePaceFps > 0.0 ? enginePaceFps : -1.0, automationPlayPaceMode() );
 }
@@ -29539,7 +29595,7 @@ bool MainWindow::programmaticPlay( const char *site, double requestedSeconds )
             m_lastPlayGateRefusalMessage = QStringLiteral(
                 "PLAY_DURATION_TOO_SHORT (requested=%1 window=%2; site=%3)" )
                 .arg( verdict.requestedSeconds, 0, 'f', 3 )
-                .arg( playback_frame_range::kMinPlayWindowSeconds, 0, 'f', 3 )
+                .arg( verdict.floorSeconds, 0, 'f', 3 )
                 .arg( QString::fromLatin1( site ) );
         }
         else if( reason == QLatin1String( "PLAY_PACE_TOO_SLOW" ) )

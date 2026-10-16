@@ -1418,9 +1418,14 @@ QStringList r6WiringCensus(const QString & def, const QString & amaze, const QSt
          "resolve drain");
     need(debayer.contains(QStringLiteral("runtime->library.resolve(\"igpu_amaze_debayer_cuda_error_pending_word\")")),
          "resolve pending word");
-    // Each of the 4 runs is entered, under the telemetry gate, before its backend call.
-    const QString enter = QStringLiteral("if ( GpuFieldTelemetry::enabled() ) enterAmazeStageTelemetry(&");
-    need(debayer.count(enter) == 4, "4 AMaZE entries");
+    // Each of the 4 runs is entered, under the telemetry gate, before its backend call (GPU-DEVICE-LOSS-SELF-HEAL-1
+    // r6: through the one step that also reads the suppression flag again after the entry).
+    const QString enter = QStringLiteral("if ( !enterAmazeRunUnlessCudaSuppressed(&");
+    need(debayer.count(enter) == 4
+             && debayer.count(QStringLiteral(", GpuFieldTelemetry::enabled()) )")) == 4
+             && bodyFrom(debayer, QStringLiteral("bool enterAmazeRunUnlessCudaSuppressed("))
+                    .contains(QStringLiteral("    if ( telemetry ) enterAmazeStageTelemetry(runtime);\n")),
+         "4 AMaZE entries");
     const char * calls[] = {"const int rc = runtime.run(backend,", "const int rc = runtime.runPostWbGlTexture(backend,",
                             "live.runtime.runPostWbGlTextureFromR16GlTexture(",
                             "live.runtime.runPostWbGlTextureFromDeviceBayer16("};
@@ -1498,8 +1503,8 @@ TEST(GpuFieldTelemetry, AmazeDrainsEveryCodeAndLeftoversAreDrainedAtTeardown)
     ASSERT_EQ(std::string("failure drains every code; no last-note rule on the r6 path"),
               r6WiringCensus(def, amaze, lastOnly, llrawproc, telemetry).join(QStringLiteral("; ")).toStdString());
     const QString noEntry = replacedOnce(debayer,
-        QStringLiteral("    if ( GpuFieldTelemetry::enabled() ) enterAmazeStageTelemetry(&live.runtime);\n    const int rc =\n"
-                       "        live.runtime.runPostWbGlTextureFromR16GlTexture("),
+        QStringLiteral("    if ( !enterAmazeRunUnlessCudaSuppressed(&live.runtime, GpuFieldTelemetry::enabled()) ) return fail(cudaSuppressedReason());\n"
+                       "    const int rc =\n        live.runtime.runPostWbGlTextureFromR16GlTexture("),
         QStringLiteral("    const int rc =\n        live.runtime.runPostWbGlTextureFromR16GlTexture("));
     ASSERT_EQ(std::string("4 AMaZE entries; an entry right before each AMaZE run"),
               r6WiringCensus(def, amaze, noEntry, llrawproc, telemetry).join(QStringLiteral("; ")).toStdString());

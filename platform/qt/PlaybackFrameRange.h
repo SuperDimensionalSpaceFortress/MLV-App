@@ -222,13 +222,37 @@ struct PlaybackWrapRecorder
 //
 // No programmatic Play (autoplay hook, profile exercise modes, GUI-smoke measured Play, ...) may start unless
 // the footage that Play would actually cover -- from the CURRENT position to the receipt's cut-out -- is at
-// least kMinPlayWindowSeconds AND at least the window the caller asked for; and the process admits only ONE
-// programmatic Play (a restart, re-Play, stress switch or contact-sheet replay is refused, never re-gated).
+// least minPlayWindowSeconds( native fps ) AND at least the window the caller asked for; and the process admits
+// only ONE programmatic Play (a restart, re-Play, stress switch or contact-sheet replay is refused, never re-gated).
 // Pressing Play on the last frame jumps to the first frame (on_actionPlay_triggered), which the position-aware
 // window covers: from the last frame the window is one frame, so it is refused.
+//
+// PLAYBACK-CLIP-LENGTH-HFR-10S-1 (owner amendment 2026-10-15: "Amend rule so that hfr 60fps clips are allowed to be
+// 10 seconds"): the floor is a function of the clip's NATIVE fps -- 10 s for a high-frame-rate clip (native fps >= 50:
+// 50, 59.94, 60), 20 s for every other clip, and 20 s whenever the fps is unknown (fail closed, never 10). Seconds are
+// SOURCE seconds at the native fps, so a conformed play of an HFR clip still has to advance ceil(10 x native fps)
+// source frames. minPlayWindowSeconds() is the ONE derivation every gate below uses; nothing else spells the floor.
 // ---------------------------------------------------------------------------------------------------------
-constexpr double kMinPlayWindowSeconds = 20.0;
-constexpr int kMinPlayWindowMs = 20000;   // kMinPlayWindowSeconds, in the milliseconds the wait loops count
+constexpr double kStandardMinPlayWindowSeconds = 20.0;
+constexpr double kHfrMinPlayWindowSeconds = 10.0;
+constexpr double kHfrNativeFpsThreshold = 50.0;
+// Where the clip is not open yet (argument parsing), only what NO clip could admit is refused: the lowest floor any
+// clip has. The clip's own floor is applied by the gate once the clip is open.
+constexpr double kLowestMinPlayWindowSeconds = kHfrMinPlayWindowSeconds;
+
+inline bool isHighFrameRate( double nativeFps )
+{
+    return std::isfinite( nativeFps ) && nativeFps >= kHfrNativeFpsThreshold;
+}
+inline double minPlayWindowSeconds( double nativeFps )
+{
+    return isHighFrameRate( nativeFps ) ? kHfrMinPlayWindowSeconds : kStandardMinPlayWindowSeconds;
+}
+// The same floor in the milliseconds the wait loops count.
+inline int minPlayWindowMs( double nativeFps )
+{
+    return static_cast<int>( std::lround( minPlayWindowSeconds( nativeFps ) * 1000.0 ) );
+}
 
 // ENFORCE-2 round 2 (hub ruling): the window the caller REQUESTS -- the time its own stop timer / exercise loop
 // lets Play run -- must itself reach the floor; having 20 s of footage available is not enough. Every
@@ -245,8 +269,12 @@ inline double smokePlayRequestSeconds( int durationMs, int targetPresentedFrames
     return std::min( timeoutSeconds, static_cast<double>( targetPresentedFrames ) / fps );
 }
 
-// The lifecycle stress switch STOPS Play on the first clip, so it may only happen once Play has run the floor.
-inline bool stressSwitchReachesFloor( int switchAtMs ) { return switchAtMs >= kMinPlayWindowMs; }
+// The lifecycle stress switch STOPS Play on the first clip, so it may only happen once Play has run the floor
+// (floorSeconds: minPlayWindowSeconds( native fps ), or kLowestMinPlayWindowSeconds before the clip is open).
+inline bool stressSwitchReachesFloor( int switchAtMs, double floorSeconds )
+{
+    return switchAtMs >= std::lround( floorSeconds * 1000.0 );
+}
 
 // ---------------------------------------------------------------------------------------------------------
 // PLAYBACK-CLIP-LENGTH-ENFORCE-3 (owner rule 2026-10-01): "20 s of real footage" is a SOURCE-FRAME quantity.
@@ -414,7 +442,8 @@ struct PlayableWindowVerdict
     const char *scope = "";
     double clipSeconds = 0.0;
     double playableSeconds = 0.0;
-    double requiredSeconds = kMinPlayWindowSeconds;
+    double floorSeconds = kStandardMinPlayWindowSeconds;   // minPlayWindowSeconds( native fps ) the window was judged by
+    double requiredSeconds = kStandardMinPlayWindowSeconds;
     double requestedSeconds = 0.0;   // the window the caller asked to hold Play for
     int positionFrame = 0;     // 0-based, clamped
     int lastPlayableFrame = 0; // 0-based inclusive: the cut-out frame
@@ -428,6 +457,8 @@ struct PlayableWindowVerdict
 
 // paceFps default: "the engine runs at the clip's native fps" (tests, and callers with no override).
 constexpr double kPaceIsNative = 0.0;
+// floorSeconds default: minPlayWindowSeconds( fps ) of the clip being judged (HFR-10S-1).
+constexpr double kFloorFromNativeFps = -1.0;
 
 // engineCutRangeForPlay -- the range the engine ACTUALLY plays. With the collapsed-range repair enabled (the
 // normal state) it is normalizeCutRange(..., repair = true). MLVAPP_F3_DISABLE_CUT_RANGE_REPAIR switches the
@@ -455,13 +486,16 @@ inline CutRange engineCutRangeForPlay( int cutIn, int cutOut, int totalFrames, b
 // the engine must be able to consume them at its ACTUAL pace (paceFps = getFramerate(), a persisted fpsOverride
 // included) inside the caller's wall-clock safety budget -- else PLAY_PACE_TOO_SLOW, before Play. Advancing
 // from the start frame to the Nth frame takes N-1 steps, so wallNeeded = (required - 1) / pace.
+// HFR-10S-1: floorSeconds defaults to minPlayWindowSeconds( fps ) -- 10 s for an HFR clip, 20 s otherwise or unknown.
 inline PlayableWindowVerdict evaluatePlayableWindow(
     int positionFrame, int cutIn, int cutOut, int totalFrames, double fps,
-    double requestedSeconds, double floorSeconds = kMinPlayWindowSeconds,
+    double requestedSeconds, double floorSeconds = kFloorFromNativeFps,
     bool collapsedRangeRepairEnabled = true, double paceFps = kPaceIsNative,
     PlayPaceMode paceMode = PlayPaceMode::Gated )
 {
     PlayableWindowVerdict v;
+    if( floorSeconds == kFloorFromNativeFps ) floorSeconds = minPlayWindowSeconds( fps );
+    v.floorSeconds = floorSeconds;
     v.requiredSeconds = std::max( floorSeconds, requestedSeconds );
     v.requestedSeconds = requestedSeconds;
     if( !( requestedSeconds + 1e-9 >= floorSeconds ) )
@@ -513,11 +547,11 @@ inline PlayableWindowVerdict evaluatePlayableWindow(
 
 // A --presented-frames target ends playback EARLY, after N presented frames: it is itself a play window of
 // N / fps seconds and must reach the floor (a pinned-frame run of 24 frames would play ~1 s). 0 = no early stop.
-inline bool presentedFramesTargetReachesFloor( int targetPresentedFrames, double fps,
-                                               double floorSeconds = kMinPlayWindowSeconds )
+// The floor is the clip's own: minPlayWindowSeconds( fps ) (HFR-10S-1).
+inline bool presentedFramesTargetReachesFloor( int targetPresentedFrames, double fps )
 {
     if( targetPresentedFrames <= 0 ) return true;
-    return fps > 0.0 && static_cast<double>( targetPresentedFrames ) / fps + 1e-9 >= floorSeconds;
+    return fps > 0.0 && static_cast<double>( targetPresentedFrames ) / fps + 1e-9 >= minPlayWindowSeconds( fps );
 }
 
 // ProgrammaticPlayLedger -- pure. One per process. admit() is the only way a programmatic Play is allowed:
