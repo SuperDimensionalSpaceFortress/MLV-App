@@ -2828,7 +2828,7 @@ QGroupBox::indicator:checked:disabled {
                    <item row="3" column="0" colspan="4">
                     <widget class="QComboBox" name="comboBoxLookAssistFlavor">
                      <property name="toolTip">
-                      <string>Look Assist flavor. Classic is the standard conservative look. Cinematic lays a gentle S-curve, controlled highlights and modest colour over the same analysis; white balance is the same as Classic's. Changing it re-runs Look Assist on the current clip.</string>
+                      <string>Look Assist flavor. Classic is the standard conservative look. Cinematic lays a gentle S-curve, controlled highlights and modest colour over the same analysis. Film grade adds cool shadows and warm highlights. Kodak Vision3 50D adds crisp contrast and richer colour with a neutral balance. White balance is the same as Classic's in every flavor. Changing it re-runs Look Assist on the current clip.</string>
                      </property>
                      <item>
                       <property name="text">
@@ -2843,6 +2843,11 @@ QGroupBox::indicator:checked:disabled {
                      <item>
                       <property name="text">
                        <string>Film grade</string>
+                      </property>
+                     </item>
+                     <item>
+                      <property name="text">
+                       <string>Kodak Vision3 50D</string>
                       </property>
                      </item>
                     </widget>

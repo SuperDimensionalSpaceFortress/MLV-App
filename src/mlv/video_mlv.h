@@ -276,8 +276,8 @@ uint64_t getMlvLlrawprocSettingsFingerprint(mlvObject_t * video);
 
 /* CPU-DUALISO-AT-PREVIEW-SCALE-1: phase-3 dual-ISO reconstruction at the
  * playback preview scale. The recon worker reconstructs a Bayer shrunk by the
- * Phase 4B kernels (pl_downsample_bayer_to_bayer_{2,4,8}x keep whole 4-row ISO
- * blocks) instead of the full sensor, and the process stage debayers it at that
+ * phase tent at x2/x4 (centred same-ISO-class bins) or the Phase 4B x8 kernel
+ * (whole 4-row ISO blocks) instead of the full sensor, and the process stage debayers it at that
  * size. Playback only: export and full-quality entries never call these.
  * CPU-DUALISO-REDUCED-ISO-NOTCH-1: the CPU reduced recon ends with the reduced
  * ISO-period notch (LLRP_WITH_DIMS_REDUCED_ISO_NOTCH), as the CUDA one does. */
@@ -291,8 +291,8 @@ typedef struct
     int reducedHeight;
     int fullResFixes;       /* focus/bad pixel fixes run at full res first (stripes/pattern noise are inert on dual ISO) */
     const char * reason;    /* "none" when reduced, otherwise why full resolution */
-    int phaseTentShrink;    /* 1: shrink with pl_downsample_bayer_to_bayer_phase_tent (GPU
-                             * plan only); 0: the Phase 4B decimators (CPU plan) */
+    int phaseTentShrink;    /* 1: shrink with pl_downsample_bayer_to_bayer_phase_tent (both
+                             * plans, x2/x4); 0: the Phase 4B decimator (x8) */
 } mlvDualIsoPreviewScaleRecon_t;
 
 /* Process-wide counters of the phase-tent shrink (successful shrinks and their summed

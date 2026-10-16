@@ -3632,6 +3632,34 @@ TEST(GpuPreviewProcessing, EngineAnchoredLookAssistFlavorsMatchEngineWithReceipt
                                                                              : "look_assist_film_v3_shade_real_frame",
                                                film, curve);
     }
+
+    /* LOOK-ASSIST-KODAK-VISION-50D-1: Kodak Vision3 50D = the Cinematic preset + the vibrance delta, and the vision50d-v1
+     * curves (a crisper Y line and a near-neutral R / B mirror). The display shader and both CPU routes match the engine at
+     * the same budgets, Night and Shade. */
+    LookAssistPreset vision50d = classic;
+    lookAssistApplyFlavorDeltas(&vision50d, LookAssistScene::Night, LookAssistFlavor::Vision50d);
+    ASSERT_EQ(cinematic.contrast, vision50d.contrast);
+    ASSERT_EQ(cinematic.pivot, vision50d.pivot);
+    ASSERT_EQ(cinematic.shadows, vision50d.shadows);
+    ASSERT_EQ(cinematic.highlights, vision50d.highlights);
+    ASSERT_EQ(cinematic.vibrance + lookassist::lookAssistVision50dVibranceDelta(), vision50d.vibrance);
+    for (const LookAssistScene scene : { LookAssistScene::Night, LookAssistScene::Shade })
+    {
+        const QString curve = lookassist::lookAssistVision50dGradationCurve(scene);
+        processingObject_t * probe = initProcessingObject();
+        ASSERT_TRUE(probe != nullptr);
+        lookAssistTestApplyGradationCurve(probe, curve);
+        int yMoved = 0;
+        for (int index = 0; index < 65536; ++index)
+        {
+            if (std::abs(static_cast<int>(probe->gcurve_y[index]) - index) > 200) ++yMoved;
+        }
+        freeProcessingObject(probe);
+        ASSERT_TRUE(yMoved > 1000);
+        run_look_assist_flavor_real_frame_case(scene == LookAssistScene::Night ? "look_assist_vision50d_night_real_frame"
+                                                                             : "look_assist_vision50d_shade_real_frame",
+                                               vision50d, curve);
+    }
 }
 
 struct CreativeChainCase

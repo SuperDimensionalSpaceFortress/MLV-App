@@ -115,16 +115,17 @@ static void restoreHeadlessLookAssistGradationCurve( ReceiptSettings *receipt )
     receipt->setLookAssistBaselineGradationCurve( QString() );
 }
 
-// Lays the Film grade's curve over a default curve (never over a user's) and returns the grade=... decision.
+// Lays the grade's curve (Film's or Kodak Vision3 50D's) over a default curve (never over a user's) and returns the
+// grade=... decision.
 static QString applyHeadlessLookAssistFilmGrade( ReceiptSettings *receipt, LookAssistScene scene, LookAssistFlavor flavor )
 {
-    const QString decision = lookAssistFilmGradeDecision( flavor, receipt->gradationCurve() );
-    if( decision != lookAssistFilmGradeId() ) return decision;
+    const QString decision = lookAssistGradeDecision( flavor, receipt->gradationCurve() );
+    if( decision != lookAssistGradeIdForFlavor( flavor ) ) return decision;
     if( receipt->lookAssistBaselineGradationCurve().isEmpty() )
         receipt->setLookAssistBaselineGradationCurve( receipt->gradationCurve().trimmed().isEmpty()
                                                       ? ReceiptSettings().gradationCurve()
                                                       : receipt->gradationCurve() );
-    receipt->setGradationCurve( lookAssistFilmGradationCurve( scene ) );
+    receipt->setGradationCurve( lookAssistGradationCurveForFlavor( flavor, scene ) );
     return decision;
 }
 
@@ -1192,8 +1193,9 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
     // Film's colour grade, after the preset (its tone is already in the sliders above). The baseline restore at the top of
     // this pass put the user's curve back, so the decision is made against the user's own curve.
     const QString filmGrade = applyHeadlessLookAssistFilmGrade( receipt, scene, flavor );
-    // Appended after flavor=, and only for Film, so a Classic or Cinematic line stays byte-identical. No '%' in it.
-    const QString filmGradeLogTail = flavor == LookAssistFlavor::Film ? QStringLiteral(" grade=") + filmGrade : QString();
+    // Appended after flavor=, and only for Film and Vision50d, so a Classic or Cinematic line stays byte-identical. No '%'
+    // in it.
+    const QString filmGradeLogTail = lookAssistFlavorLaysGradationCurve( flavor ) ? QStringLiteral(" grade=") + filmGrade : QString();
 
     processingSetWhiteBalance( processingObject, temperature, tint / 10.0 );
     resetMlvCache( mlvObject );
