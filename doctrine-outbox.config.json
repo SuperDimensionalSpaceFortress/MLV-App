@@ -1,6 +1,6 @@
 {
   "schema": "doctrine-outbox-config.v1",
-  "_comment": "MLV-App's values for the fleet doctrine outbox. Data only: tools/coordination/doctrine_outbox.py is the config-driven shared file proposed to replace the bus's reference copy (a different, older file today; adoption is pending the bus steward, see the handoff card in doctrine-outbox/). It is never edited here for a project value. The tool finds this file at the repo root (or via --config / $DOCTRINE_OUTBOX_CONFIG).",
+  "_comment": "MLV-App's values for the fleet doctrine outbox. Data only: tools/coordination/doctrine_outbox.py is the config-driven shared file offered as the candidate for the bus's tools/factory/doctrine_outbox.py (adoption is pending the bus steward, see the handoff card in doctrine-outbox/). Once the bus holds it, each project pins a reviewed bus SHA in factory-pins/factory-pins.json and runs it through factory-pins/pin-runner.py, keeping no copy. It is never edited here for a project value. The tool finds this file at the repo root (or via --config / $DOCTRINE_OUTBOX_CONFIG).",
   "project": "mlv-app",
   "outbox_dir": "doctrine-outbox",
   "tool_rel": "tools/coordination/doctrine_outbox.py",
@@ -19,8 +19,8 @@
     { "name": "dual-lane ledger", "pattern": "dual-lane", "ignorecase": true },
     { "name": "GPU host name", "pattern": "ultra[\\s_-]?magnus", "ignorecase": true }
   ],
-  "vendored_from": {
-    "bus_path": "tools/conjugal-reference/doctrine_outbox.py",
-    "sha256_lf": "a6beb9cf8fd425c6e19507202c577ce2063ed38126369766d65ad23ec26fd084"
+  "bus_candidate": {
+    "bus_path": "tools/factory/doctrine_outbox.py",
+    "sha256_lf": "ad9bf2a66dc2918ab2abd359a45693165f75482af82717ee4cddbef1b42da0b5"
   }
 }

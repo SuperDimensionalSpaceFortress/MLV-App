@@ -14,11 +14,13 @@ Named mutations (each turns the named test red, then is reverted):
 """
 from __future__ import annotations
 
+import ast
 import hashlib
 import importlib.util
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -139,19 +141,45 @@ def run_pre_push(ob, repo: Path, monkeypatch, stdin_text: str) -> int:
 
 # ---------- the tool carries no project value ----------
 
-def test_vendored_copy_matches_the_pinned_digest():
-    """The shared file is vendored byte-for-byte; `vendored_from.sha256_lf` in the repo-root config
-    pins the digest of its LF bytes, so a local edit (or a CRLF checkout) cannot drift unnoticed."""
-    pinned = json.loads((REPO_ROOT / "doctrine-outbox.config.json").read_text(encoding="utf-8"))["vendored_from"]["sha256_lf"]
+CANDIDATE_BUS_PATH = "tools/factory/doctrine_outbox.py"
+HANDOFF_CARD = REPO_ROOT / "doctrine-outbox" / "20261016-doctrine-outbox-single-source-superset.md"
+OUTBOX_README = REPO_ROOT / "doctrine-outbox" / "README.md"
+
+
+def _bus_candidate() -> dict:
+    return json.loads((REPO_ROOT / "doctrine-outbox.config.json").read_text(encoding="utf-8"))["bus_candidate"]
+
+
+def test_candidate_matches_the_recorded_digest():
+    """This file is the candidate for the bus's tools/factory/doctrine_outbox.py; `bus_candidate.sha256_lf`
+    in the repo-root config records the digest of its LF bytes, so a local edit (or a CRLF checkout)
+    cannot drift from what the steward is asked to land."""
     lf = TOOL_SRC.read_bytes().replace(b"\r\n", b"\n")
-    assert hashlib.sha256(lf).hexdigest() == pinned
+    assert hashlib.sha256(lf).hexdigest() == _bus_candidate()["sha256_lf"]
 
 
-def test_the_steward_handoff_card_names_the_pinned_digest():
+def test_the_steward_handoff_card_names_the_candidate_digest():
     """The card that asks the bus steward to adopt this file quotes its digest; it must not go stale."""
-    pinned = json.loads((REPO_ROOT / "doctrine-outbox.config.json").read_text(encoding="utf-8"))["vendored_from"]["sha256_lf"]
-    card = (REPO_ROOT / "doctrine-outbox" / "20261016-doctrine-outbox-single-source-superset.md").read_text(encoding="utf-8")
-    assert pinned in card
+    assert _bus_candidate()["sha256_lf"] in HANDOFF_CARD.read_text(encoding="utf-8")
+
+
+def test_adoption_route_is_the_bus_pin_model():
+    """The bus deleted tools/conjugal-reference/doctrine_outbox.py (665b4566) and shares tools by pin:
+    "A tool here is never copied into a project: the project pins it" (bus tools/factory/README.md).
+    The config, card, README and the tool's docstring must name tools/factory/ and the pin, and must
+    not send a project to replace a file in the deleted reference directory or to vendor a copy."""
+    assert _bus_candidate()["bus_path"] == CANDIDATE_BUS_PATH
+    surfaces = {
+        "config": (REPO_ROOT / "doctrine-outbox.config.json").read_text(encoding="utf-8"),
+        "card": HANDOFF_CARD.read_text(encoding="utf-8"),
+        "readme": OUTBOX_README.read_text(encoding="utf-8"),
+        "tool docstring": ast.get_docstring(ast.parse(TOOL_SRC.read_text(encoding="utf-8"))) or "",
+    }
+    for name, text in surfaces.items():
+        assert "factory-pins" in text and CANDIDATE_BUS_PATH in text, f"{name} does not name the bus pin route"
+        assert "conjugal-reference" not in text, f"{name} still names the deleted reference directory"
+        assert not re.search(r"\bvendor(s|ed|ing)?\b|re-vendor", text, re.IGNORECASE), f"{name} still tells a project to vendor a copy"
+    assert "pin-runner.py pin doctrine-outbox" in surfaces["card"]
 
 
 def test_the_tool_names_no_project_host_or_state_directory():

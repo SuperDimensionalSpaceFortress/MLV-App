@@ -8,11 +8,15 @@ DOCTRINE-OUTBOX-ADOPT-MLV-1b and install against this CLI.
 
 **One file for the fleet (OUTBOX-SINGLE-SOURCE-1).** `tools/coordination/doctrine_outbox.py` is not edited
 per project: every project value (ref, items directory, finding paths, state files, Law-4 deny terms) is
-data in `doctrine-outbox.config.json` at the repo root. The bus steward is asked to adopt the same bytes
-(handoff card in this directory; adoption is pending, and the bus's own reference copy is a different,
-older file until then). The digest is pinned in that config's `vendored_from` and by
-`tests/coordination/test_doctrine_outbox_hooks.py`. Change behaviour by changing the config; once the bus
-has adopted the file, change the tool only there and re-vendor. The same file also answers the hook
+data in `doctrine-outbox.config.json` at the repo root. The bus steward is asked to land the same bytes as
+`tools/factory/doctrine_outbox.py` (handoff card in this directory; adoption is pending; the bus deleted its
+reference copy in `665b4566`). Sharing is by pin, not by copy (bus `tools/factory/README.md`: "A tool here is
+never copied into a project: the project pins it"): a project records a reviewed bus SHA with
+`python factory-pins/pin-runner.py pin doctrine-outbox --commit <bus-sha> --path tools/factory/doctrine_outbox.py
+--reviewer <who> --reason <why>`, runs `python factory-pins/pin-runner.py run doctrine-outbox -- --config
+doctrine-outbox.config.json <command>`, and deletes its own copy. The digest of the candidate is recorded in that
+config's `bus_candidate` and checked by `tests/coordination/test_doctrine_outbox_hooks.py`. Change behaviour by
+changing the config; once the bus has the file, change the tool only there and re-pin. The same file also answers the hook
 commands `check`, `pre-push`, `stop`, `session-start` and `install-hooks`. `stop` judges the commits not
 yet on the remote (`default_range`, or `--ref R` for `R..HEAD`); `pre-push` hands git's stdin on to the
 layers after it (`git lfs pre-push`); `install-hooks` leaves the hook executable. A config that is

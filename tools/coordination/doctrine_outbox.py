@@ -6,9 +6,11 @@ versions"; tools/tool-census.mjs counts the drift). A project supplies only DATA
 `doctrine-outbox.config.json` at its repo root (or `--config`), and never edits this file.
 Every project-specific value (project name, default ref, items dir, finding paths, state and
 ledger paths, Law-4 deny terms) comes from that config. The config schema is the `_CONFIG_KEYS` set
-and `configure()` below; no bus README documents it yet. The aim is that every project vendors this
-file byte-identically, but that is not true yet: the bus reference copy is a different, older file
-until the bus steward adopts this one, and a project vendors it only after that.
+and `configure()` below; no bus README documents it yet. This file is the candidate for the bus's
+`tools/factory/doctrine_outbox.py`. Once the bus steward lands it there, a project runs it from the
+bus BY PIN (`factory-pins/pin-runner.py run`, tools/factory/README.md) and keeps no copy of it; the
+pin names a reviewed bus SHA, so nothing runs until the project reviews and pins it. Until then
+this file is the only source.
 
 Lineage: the fleet bus's reference outbox -> agent-bridge's port -> a second project's port,
 whose behaviours are the superset below. The item format, front matter, `parse_item`, the Law-4
@@ -201,7 +203,7 @@ _CONFIG_KEYS = frozenset({
     "schema", "project", "tool_rel", "default_ref", "default_range", "outbox_dir", "sent_dir", "cards_target",
     "finding_path_prefixes", "finding_path_files", "finding_path_regexes", "trailer_mode", "pre_push_refs",
     "law4_extra", "state_dir", "ledger_rel", "deny_file_rel", "subject_ledger_rel", "watermark_rel",
-    "subject_ledger_env", "watermark_env", "identity_name", "identity_email", "vendored_from",
+    "subject_ledger_env", "watermark_env", "identity_name", "identity_email", "bus_candidate",
 })
 
 
@@ -377,7 +379,7 @@ def find_config(start: pathlib.Path) -> pathlib.Path | None:
 
 
 def _autoconfigure() -> None:
-    """Import-time: a vendored copy finds its own project's config. A broken config is not fatal at
+    """Import-time: the tool finds its own project's config. A broken config is not fatal at
     import (the module stays unconfigured and main() reports it); nothing is guessed. The refusal is
     kept in CONFIG_ERROR so require_configured() reports a config that is present but wrong as
     CONFIG_INVALID, never as the CONFIG_ABSENT of a missing one."""
