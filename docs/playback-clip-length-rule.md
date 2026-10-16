@@ -22,6 +22,45 @@ and every wrap, jump-to-first-frame and restart is counted and invalidates the r
 The tracked fixtures (`tiny_dual_iso`, 2 frames; `large_dual_iso`, 16 frames, about 0.1-0.7 s) are for unit
 tests and non-playing checks only. They are never played on a venue.
 
+## Amendment 2026-10-15 (owner): HFR clips need 10 s
+
+> "Amend rule so that hfr 60fps clips are allowed to be 10 seconds"
+
+(PLAYBACK-CLIP-LENGTH-HFR-10S-1.) The floor is now a function of the clip's **native** frame rate:
+
+| Clip | Floor |
+|---|---|
+| high frame rate: native fps >= 50 (50, 59.94, 60, ...) | **10 s** of real footage |
+| every other clip (23.976, 24, 25, 29.97, 30, ...) | 20 s, unchanged |
+| native fps unknown / unreadable / not positive / not finite | 20 s (fail closed, never 10) |
+
+Seconds are SOURCE seconds at the native fps: 10 s of a 59.94 clip is ceil(10 x 59.94) = 600 source frames, and a
+conformed (for example 24 fps) play of an HFR clip still has to advance those 600 source frames. Everything else in
+this rule is unchanged: never loop, never replay, one programmatic Play per process, the window never exceeds the clip,
+a wrap / jump / restart invalidates the run, the app is the gate and refuses BEFORE Play, and the tracked fixtures are
+never played on a venue. Where this document says "20 s" below, read "the clip's floor".
+
+There is ONE derivation, `playback_frame_range::minPlayWindowSeconds(nativeFps)` in `platform/qt/PlaybackFrameRange.h`;
+nothing else spells the floor. Where a script cannot load that header it carries a mirror that a parity test compares
+with it and executes on one table: `Get-GuiSmokeMinPlaySeconds` (`tools/profiling/gui-smoke-length-gate.ps1`),
+`Get-DvMinPlaySeconds` (`tools/profiling/dual-venue/DualVenueRunner.psm1`), and the HFR branch of the attribution job's
+embedded oracle (`Get-AttrCudaSourceFramesVerdict`, inside `PLAYBACK-CLIP-LENGTH-HFR-10S-1` sentinels).
+
+| Enforcement point | How it applies the floor |
+|---|---|
+| `evaluatePlayableWindow` (the app's gate, `MainWindow::checkPlayableWindow`) | `minPlayWindowSeconds` of the loaded clip's native fps |
+| profile Look Assist settle, `--exercise-play-action` | request `playGateMinPlayWindowSeconds()` (the clip's floor) |
+| GUI smoke: `--seconds`, the clip guard, `--presented-frames`, the stress switch, the second (switch) clip | the clip's floor once it is open (`runGuiPlaybackSmoke`), before Play |
+| `main.cpp` argument parse, `Invoke-VenueLeg.ps1`, the attribution job generator's `-PlaySeconds`, `leg-spec.schema.json` | the clip is not open (a leg names a clip id, never its fps), so they refuse only what NO clip could admit: under 10 s (`kLowestMinPlayWindowSeconds`). The clip's own floor is then applied by the runner (header) and the app |
+| `run-release-gui-smoke.ps1` / `Test-GuiSmokeClipLength` | the clip header's fps |
+| receipt oracles (`Get-GuiSmokeSourceFramesVerdict`, `Get-GuiSmokeLoopVerdict`, `Get-DvPlaybackProblems`, `Get-AttrCudaSourceFramesVerdict`) | `required_source_frames >= ceil(floor x native_fps)` from the receipt's own `native_fps` (absent or 0 is INVALID, as before) |
+
+Pinned (RED on the 2026-10-15 master, GREEN after): 59.94 fps 10 s accepted; 59.94 fps 9.9 s refused; 23.976 fps
+10 s refused; 23.976 fps 20 s accepted; unknown fps 10 s refused; 50 fps 10 s accepted; an HFR clip looped to reach 10 s
+refused (`CLIP_TOO_SHORT` before Play, `INVALID_LOOPED` in the oracle). Tests: `HfrPlayFloor.*` in
+`tests/console/test_playback_frame_range.cpp`, `HFR_SOURCE_FRAME_CASES` and `test_hfr_pins_from_the_clip_header` in
+`tools/repo_hygiene/test_playback_clip_length_gate.py`, and the dual-venue / launcher oracle tests.
+
 ## THE APP IS THE GATE (ENFORCE-2)
 
 Why ENFORCE-1 was parked: the tool-side gates read the clip's HEADER, but the app starts playback before any

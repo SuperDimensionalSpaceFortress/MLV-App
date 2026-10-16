@@ -94,6 +94,15 @@ void noteGlIdentity(const QString & renderer, const QString & vendor,
  *  surfaces (GpuDisplayViewport and GpuDisplayWindow). */
 void noteGlContext(QOpenGLContext * context);
 
+/*! GPU-DEVICE-LOSS-SELF-HEAL-1: the recorded GL renderer and driver (sanitized;
+ *  empty until noteGlIdentity ran). Read-only. */
+struct GlIdentity
+{
+    QString renderer;
+    QString driver;
+};
+GlIdentity glIdentity();
+
 /*! Writes the session snapshot (stage lines, unwritten faults, ...). */
 void flush(const char * reason);
 
