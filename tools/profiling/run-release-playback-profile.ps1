@@ -141,8 +141,11 @@ try {
             exit 42
         }
         # ENFORCE-2: the app gates the window from the CURRENT position (--start-frame) to the cut-out at
-        # >= 20 s, so the wrapper requires the same: 20 s must remain after -StartFrame.
-        $profileClipGate = Test-GuiSmokeClipLength -Path (Resolve-FileSystemProviderPath -Path $ClipPath) -WindowSeconds 20 -StartFrame $StartFrame
+        # >= the clip's play floor (20 s, 10 s at >= 50 fps: HFR-10S-1), so the wrapper requires the same: that much must remain
+        # after -StartFrame. The window is the floor of THIS clip's header (Get-GuiSmokeClipPlayFloorSeconds), not a literal.
+        $profileClipPath = Resolve-FileSystemProviderPath -Path $ClipPath
+        $profileWindowSeconds = Get-GuiSmokeClipPlayFloorSeconds -ClipLength (Get-GuiSmokeClipLength -Path $profileClipPath)
+        $profileClipGate = Test-GuiSmokeClipLength -Path $profileClipPath -WindowSeconds $profileWindowSeconds -StartFrame $StartFrame
         if ($profileClipGate.verdict -ne 'OK') {
             [Console]::Error.WriteLine("PLAYBACK-CLIP-LENGTH-ENFORCE-1: $($profileClipGate.message)")
             exit (Get-GuiSmokeGateExitCode -Verdict $profileClipGate.verdict)
@@ -293,7 +296,7 @@ try {
     # ENFORCE-4: -RequireAdmission. This wrapper only reaches here for a PLAY-CAPABLE profile, so a receipt without
     # programmatic_play_admitted (a master-era binary writes none) is INVALID, never "nothing was played".
     $profileVerdict = Get-GuiSmokeEvidencePlayVerdict -Summary $profileSummary `
-        -ExitCode $(if ($profileKilled) { $null } else { $process.ExitCode }) -KilledByLauncher $profileKilled -WindowSeconds 20 `
+        -ExitCode $(if ($profileKilled) { $null } else { $process.ExitCode }) -KilledByLauncher $profileKilled -WindowSeconds $profileWindowSeconds `
         -RequireAdmission $true -ExpectedRunNonce $runNonce -ReceiptPath $outputPath -LaunchedUtc $launchedUtc
     if ($profileVerdict.invalid) {
         # fable H2: the rejected receipt is renamed <name>.INVALID<ext> (and stamped "invalid": true), so an offline reader

@@ -134,6 +134,14 @@ function Get-GuiSmokeClipLength {
     return [pscustomobject]@{ known = $true; reason = ''; frames = $frames; fps = $fps; seconds = ([double]$frames / $fps) }
 }
 
+function Get-GuiSmokeClipPlayFloorSeconds {
+    # The play floor of ONE clip, from the Get-GuiSmokeClipLength result: Get-GuiSmokeMinPlaySeconds of its header fps, and the
+    # 20 s floor when the header cannot be read (the length gate then refuses it as CLIP_LENGTH_UNKNOWN). The one place a launcher
+    # that clamps its own window (validate-visible-playback.ps1, run-release-playback-profile.ps1) takes the floor from.
+    param([Parameter(Mandatory = $true)]$ClipLength)
+    return (Get-GuiSmokeMinPlaySeconds -NativeFps $(if ($ClipLength.known) { $ClipLength.fps } else { $null }))
+}
+
 function Test-GuiSmokeClipLength {
     <#
     .SYNOPSIS
@@ -158,7 +166,7 @@ function Test-GuiSmokeClipLength {
     $inv = [System.Globalization.CultureInfo]::InvariantCulture
     $fmt = { param($v) ([double]$v).ToString('0.###', $inv) }
     $len = Get-GuiSmokeClipLength -Path $Path
-    if ($MinSeconds -lt 0) { $MinSeconds = Get-GuiSmokeMinPlaySeconds -NativeFps $(if ($len.known) { $len.fps } else { $null }) }
+    if ($MinSeconds -lt 0) { $MinSeconds = Get-GuiSmokeClipPlayFloorSeconds -ClipLength $len }
     $required = [Math]::Max($MinSeconds, $WindowSeconds)
     $out = [pscustomobject]@{
         verdict = 'OK'; message = 'OK'; clipSeconds = $len.seconds; windowSeconds = $WindowSeconds
@@ -696,6 +704,8 @@ function Get-GuiSmokeSourceFramesVerdict {
     $nativeFps = & $prop 'native_fps'
     $paceFps = & $prop 'pace_fps'
     $fpsOverride = & $prop 'fps_override'
+    # HFR-10S-1: the floor is the clip's own, Get-GuiSmokeMinPlaySeconds of native_fps (10 s at >= 50 fps, else 20 s).
+    $floorSeconds = Get-GuiSmokeMinPlaySeconds -NativeFps $nativeFps
     if ($null -eq $Summary) {
         $failures += "INVALID_SOURCE_FRAMES: the run produced no playback_smoke.summary, so no source frames can be proven."
     } elseif ($null -eq $advanced -or $null -eq $required) {
@@ -704,13 +714,11 @@ function Get-GuiSmokeSourceFramesVerdict {
     } elseif ([int64]$required -le 0) {
         $failures += "INVALID_SOURCE_FRAMES: required_source_frames=$required; the admitted window is unknown."
     } elseif ([int64]$advanced -lt [int64]$required) {
-        $failures += "INVALID_SOURCE_FRAMES: the engine advanced source_advanced=$advanced distinct source frames but the Play had to consume required_source_frames=$required; under 20 s of real footage is never playback evidence."
+        $failures += "INVALID_SOURCE_FRAMES: the engine advanced source_advanced=$advanced distinct source frames but the Play had to consume required_source_frames=$required; under $floorSeconds s of real footage is never playback evidence."
     }
     # ENFORCE-4: the oracle re-derives the floor itself and does not trust the app's own requirement. A receipt
     # whose required_source_frames is under ceil(floor x native fps) (the 0.02 absorbs the fps printed to 3 decimals) was
     # admitted for less than the floor of footage, and a native_fps of 0 cannot say what the floor is.
-    # HFR-10S-1: the floor is the clip's own, Get-GuiSmokeMinPlaySeconds of native_fps (10 s at >= 50 fps, else 20 s).
-    $floorSeconds = Get-GuiSmokeMinPlaySeconds -NativeFps $nativeFps
     if ($null -ne $Summary -and $null -ne $nativeFps -and [double]$nativeFps -le 0) {
         $failures += "INVALID_SOURCE_FRAMES: native_fps=$nativeFps; the clip's native frame rate is unknown, so 20 s of footage cannot be measured."
     } elseif ($null -ne $Summary -and $null -ne $nativeFps -and $null -ne $required -and [int64]$required -gt 0 -and

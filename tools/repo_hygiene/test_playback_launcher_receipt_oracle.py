@@ -583,6 +583,22 @@ class VisiblePlaybackLauncherStaticTests(unittest.TestCase):
         self.assertLess(loop_end, wait_at)
         self.assertLess(wait_at, kill_at)
 
+    def test_m04_the_script_holds_no_literal_20_second_clamp(self) -> None:
+        code = _strip_comments(self.TEXT)
+        self.assertNotRegex(code, r"\$Seconds\s*-lt\s*20\b")
+        self.assertNotRegex(code, r"\$Seconds\s*=\s*20\b")
+        self.assertIn("Get-GuiSmokeClipPlayFloorSeconds -ClipLength $clipHeaderLength", code)
+        self.assertIn("if ($Seconds -lt $playFloorSeconds)", code)
+        # the clamp reads the clip header and runs after the gate is dot-sourced, before the gate call
+        self.assertLess(code.index("gui-smoke-length-gate.ps1"), code.index("Get-GuiSmokeClipLength -Path $clip"))
+        self.assertLess(code.index("if ($Seconds -lt $playFloorSeconds)"), code.index("Test-GuiSmokeClipLength -Path $clip"))
+
+    def test_m04_the_profile_wrapper_window_is_the_clips_floor_not_a_literal_20(self) -> None:
+        code = _strip_comments(PROFILE_WRAPPER.read_text(encoding="utf-8"))
+        self.assertNotRegex(code, r"-WindowSeconds\s+20\b")
+        self.assertEqual(code.count("-WindowSeconds $profileWindowSeconds"), 2, "the length gate and the receipt verdict share one window")
+        self.assertIn("Get-GuiSmokeClipPlayFloorSeconds -ClipLength (Get-GuiSmokeClipLength", code)
+
     def test_the_process_budget_is_the_apps_safety_net_not_the_capture_schedule(self) -> None:
         code = _strip_comments(self.TEXT)
         self.assertIn("(Get-GuiSmokePlaySafetyMs -Seconds $Seconds)", code)
