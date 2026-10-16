@@ -696,7 +696,7 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         proc = run_pwsh(["-Command", f"Import-Module '{ATTR_MODULE}' -Force; Get-AttrCudaSelfHealMetricNames -PreLaunchCount 3"])
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         names = proc.stdout.split()
-        self.assertEqual(len(names), 2 + 3 * 12 + 2)
+        self.assertEqual(len(names), 2 + 3 * (12 + 6) + 2)
         for name in names:
             self.assertEqual(summary.count(f"\n    {name} = $selfHealMetrics['{name}']\n"), 1, name)
         leg = json.loads((DV / SELF_HEAL_LEG).read_text(encoding="utf-8"))
@@ -7009,6 +7009,16 @@ SELF_HEAL_ROUTE_FAILURE = ("gpu_texture_route_readback_regression: 528 frame(s) 
                            "recon texture-present no-readback route was requested in GL-window mode; every frame must reach gpu_texture_no_readback.")
 
 
+# r10 (CoS #437, Dot c503450a): L3 gpu_summary counters as a run log could carry them unreadable. On a16845f1 [long] read each of these
+# (an absent key, an empty value, '0x0') as 0, so L3's zero-CUDA and zero-preview criteria passed without measuring anything.
+UNREADABLE_L3_COUNTERS = {
+    "counters-absent-l3": "",
+    "counters-null-l3": "gpu_preview_frames= gpu_recon_readback_frames= gpu_texture_readback_frames= gpu_texture_no_readback_frames=",
+    "counters-string-l3": "gpu_preview_frames=0x0 gpu_recon_readback_frames=0x0 gpu_texture_readback_frames=0x0 gpu_texture_no_readback_frames=0x0",
+    "counters-word-l3": "gpu_preview_frames=n/a gpu_recon_readback_frames=n/a gpu_texture_readback_frames=n/a gpu_texture_no_readback_frames=n/a",
+}
+
+
 def write_self_heal_evidence(root: Path, case: str = "good") -> None:
     """<artifacts>\\self-heal as the r5 job published it on Bachelor (d3ed879b), reduced to the lines the metrics read: L1 and L2 inject 702 (L2's
     second loss sets the flag), L3 starts on the CPU, the measured run L4 clears the flag. `case` breaks exactly one fact."""
@@ -7033,11 +7043,16 @@ def write_self_heal_evidence(root: Path, case: str = "good") -> None:
         refused = 397 if case == "refused-recon-l3" and n == 3 else 0
         if case == "slow-l1" and n == 1:
             fps = 10.6
+        counters = (f"gpu_preview_frames={preview} gpu_recon_readback_frames=0 gpu_texture_readback_frames=0 "
+                    f"gpu_texture_no_readback_frames={cuda}")
+        if n == 3 and case in UNREADABLE_L3_COUNTERS:
+            counters = UNREADABLE_L3_COUNTERS[case]
+        if case == "counters-null-l3" and n == 3:
+            refused = ""
         (d / "result.json.run.log").write_text("\n".join([
             "[2026-10-15T08:27:10.400Z] [INFO] [0xd900] playback_smoke.measured_session id=1",
             f"[2026-10-15T08:27:36.324Z] [INFO] [0xd900] playback_smoke.summary session=1 reason=visual-capture presented_frames=586 presented_fps={fps} last_presented_frame=597",
-            f"[2026-10-15T08:27:36.326Z] [INFO] [0xd900] playback_smoke.gpu_summary session=1 cpu_frames={cpu} gpu_preview_frames={preview} gpu_recon_readback_frames=0 "
-            f"gpu_texture_readback_frames=0 gpu_texture_no_readback_frames={cuda}",
+            f"[2026-10-15T08:27:36.326Z] [INFO] [0xd900] playback_smoke.gpu_summary session=1 cpu_frames={cpu} {counters}",
             f"[2026-10-15T08:27:36.336Z] [INFO] [0xd900] playback_smoke.debayered16_recon_reuse_summary session=1 scope=presented_frames refused_acquisition_failed=0 "
             f"refused_gpu_playback_recon={refused} reduced_consumed_frames={cpu}", ""]), encoding="utf-8")
         rows = []
@@ -7045,6 +7060,9 @@ def write_self_heal_evidence(root: Path, case: str = "good") -> None:
             rows.append({"schema": "gpu-field-telemetry.v1", "kind": "fault", "dll": "inject", "stage": "recon:run", "rc": -1, "cuda_code": 702,
                          "cuda_name": "cudaErrorLaunchTimeout", "site": "MLVAPP_GPU_FAULT_INJECT", "fault_utc_ms": 1792052833759.0 + n, "device_loss": True, "role": "primary"})
             rows.append({"schema": "gpu-field-telemetry.v1", "kind": "recovery", "what": "device_loss", "outcome": "cuda_suppressed_session"})
+        if case == "fault-code-absent-l3" and n == 3:
+            rows.append({"schema": "gpu-field-telemetry.v1", "kind": "fault", "dll": "inject", "stage": "recon:run", "rc": -1,
+                         "site": "MLVAPP_GPU_FAULT_INJECT", "fault_utc_ms": 1792052833762.0, "device_loss": True, "role": "primary"})
         if n == 2:
             rows.append({"schema": "gpu-field-telemetry.v1", "kind": "recovery", "what": "safe_start_flag", "outcome": "set"})
         if n == 3:
@@ -7083,19 +7101,29 @@ class SelfHealLegGatesTheL1ToL4FactsTests(unittest.TestCase):
         "flag-kept-l4": ["selfHealL4FlagCleared"],
     }
 
-    def test_the_self_heal_leg_passes_only_when_every_l1_to_l4_fact_holds(self) -> None:
+    # r10: an unreadable L3 counter or fault code -> (the criteria it must fail, the typed reason token their verdict names). The first three PASSED
+    # on a16845f1; there counters-word-l3 ([long]'n/a') and fault-code-absent-l3 (StrictMode on $j.cuda_code) threw and the metrics never existed.
+    COULD_NOT_CHECK_CASES = {
+        "counters-absent-l3": (["selfHealL3CudaFrames", "selfHealL3GpuPreviewFrames"], "COUNTER_ABSENT"),
+        "counters-null-l3": (["selfHealL3CudaFrames", "selfHealL3GpuPreviewFrames", "selfHealL3RefusedGpuPlaybackRecon"], "COUNTER_NULL"),
+        "counters-string-l3": (["selfHealL3CudaFrames", "selfHealL3GpuPreviewFrames"], "COUNTER_NOT_NUMERIC"),
+        "counters-word-l3": (["selfHealL3CudaFrames", "selfHealL3GpuPreviewFrames"], "COUNTER_NOT_NUMERIC"),
+        "fault-code-absent-l3": (["selfHealL3InjectedFaultCode"], "FAULT_CODE_ABSENT"),
+    }
+
+    def evaluate(self, cases) -> dict:
         with tempfile.TemporaryDirectory(prefix="sh-gate-") as d:
             measured = Path(d) / "measured.log"
             measured.write_text("playback_smoke.measured_session id=1\nplayback_smoke.summary session=1 reason=visual-capture presented_frames=599 "
                                 "presented_fps=23.201\n", encoding="utf-8")
-            for case in self.CASES:
+            for case in cases:
                 if case != "l4-counters-only":
                     write_self_heal_evidence(Path(d) / case / "self-heal", "good" if case == "good" else case)
             script = (f"$ErrorActionPreference = 'Stop'; Import-Module '{ATTR_MODULE}' -Force; Import-Module '{DV / 'DualVenueRunner.psm1'}' -Force\n"
                       f"$spec = [IO.File]::ReadAllText('{DV / SELF_HEAL_LEG}') | ConvertFrom-Json\n"
                       f"$log = [IO.File]::ReadAllText('{measured}')\n"
                       "$out = [ordered]@{}\n"
-                      f"foreach ($case in @({', '.join(repr(c) for c in self.CASES)})) {{\n"
+                      f"foreach ($case in @({', '.join(repr(c) for c in cases)})) {{\n"
                       "  $summary = [ordered]@{ result = 'MEASUREMENT_CAPTURED'; rows = 600; gpuFramesTotal = 599; cpuFrames = 0 }\n"
                       "  if ($case -cne 'l4-counters-only') {\n"
                       f"    $m = Get-AttrCudaSelfHealMetrics -SelfHealDir (Join-Path (Join-Path '{d}' $case) 'self-heal') -PreLaunches @('702@120', '702@120', 'none') -MeasuredLogText $log -MeasuredSessionId ''\n"
@@ -7109,7 +7137,10 @@ class SelfHealLegGatesTheL1ToL4FactsTests(unittest.TestCase):
                       "$out | ConvertTo-Json -Depth 6 -Compress")
             proc = run_pwsh(["-Command", script])
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        out = json.loads(proc.stdout)
+        return json.loads(proc.stdout)
+
+    def test_the_self_heal_leg_passes_only_when_every_l1_to_l4_fact_holds(self) -> None:
+        out = self.evaluate(self.CASES)
         good = out["good"]
         self.assertTrue(good["pass"] and good["supplementaryPass"], good["failures"])
         self.assertEqual((good["metrics"]["selfHealL1Rc"], good["metrics"]["selfHealL1PreLaunchOk"], good["metrics"]["selfHealL3CudaFrames"],
@@ -7126,6 +7157,26 @@ class SelfHealLegGatesTheL1ToL4FactsTests(unittest.TestCase):
                     self.assertIn(metric, failed, f"{case}: {got['failures']}")
                 if case not in ("l4-counters-only", "skipped-l2"):
                     self.assertEqual(sorted(expected), failed, f"{case} breaks exactly its own fact: {got['failures']}")
+
+    def test_an_unreadable_counter_is_could_not_check_never_zero(self) -> None:
+        """r10 (CoS #437, Dot c503450a): an L3 gpu_summary whose CUDA and preview counters are absent, empty or not decimal counts, a reuse summary
+        whose refused count is empty, and a fault row with no cuda_code each FAIL exactly their criteria with a typed COULD-NOT-CHECK reason in the
+        verdict -- never a 0 that passes. A present-and-zero counter still passes (good) and a present-and-nonzero one still fails (gpu-preview-l3)."""
+        out = self.evaluate(["good", "gpu-preview-l3", *self.COULD_NOT_CHECK_CASES])
+        self.assertTrue(out["good"]["pass"], out["good"]["failures"])
+        self.assertEqual(out["good"]["metrics"]["selfHealL3GpuPreviewFrames"], 0)
+        self.assertEqual({k: v for k, v in out["good"]["metrics"].items() if k.endswith("CouldNotCheck") and v is not None}, {})
+        self.assertEqual(out["gpu-preview-l3"]["failures"], ["selfHealL3GpuPreviewFrames eq 0 failed (actual 12)"])
+        for case, (expected, token) in self.COULD_NOT_CHECK_CASES.items():
+            with self.subTest(case):
+                got = out[case]
+                self.assertFalse(got["pass"], case)
+                self.assertFalse(got["supplementaryPass"], case)
+                self.assertEqual(sorted({f.split(" ")[0].rstrip(":") for f in got["failures"]}), sorted(expected), got["failures"])
+                for failure in got["failures"]:
+                    self.assertIn(f": COULD-NOT-CHECK {token} ", failure, case)
+                for metric in expected:
+                    self.assertIsNone(got["metrics"][metric], f"{case}: {metric} is never a default")
 
 
 class VisualCaptureSpecAndAppSourceTests(unittest.TestCase):

@@ -37,6 +37,7 @@
 
 extern "C" int llrpInstallFakeGpuPlaybackReconBackendForTesting(int install);
 extern "C" void llrpHoldGpuReconBackendMutexForTesting(int hold);
+extern "C" long llrpGpuReconBackendLockArrivalsForTesting(void);
 extern "C" int llrpResetGpuExportBackendForTesting(void);
 extern "C" void llrpFakeGpuBackendInjectRunFailureForTesting(int rc, int cuda_code, const char * name);
 extern "C" void llrpFakeGpuBackendReducedIsoNotchStateForTesting(int * last_run_flag,
@@ -303,15 +304,20 @@ TEST(GpuDeviceLossSelfHeal, AFrameQueuedOnTheBackendMutexThroughALossNeverReache
     int used = -1;
     std::atomic<bool> done{false};
     const uint64_t before = fakeRunCount();
+    const long arrivalsBefore = llrpGpuReconBackendLockArrivalsForTesting();
     llrpHoldGpuReconBackendMutexForTesting(1);
     std::thread queued([&]() {
         used = runOnce(7, &rc);
         done.store(true);
     });
-    // Nothing but the held mutex can keep the frame from finishing: still running after 300 ms means it is
-    // past its check before the lock (a refused frame returns at once) and waiting on the lock.
-    std::this_thread::sleep_for(std::chrono::milliseconds(300));
-    const bool waitedOnTheLock = !done.load();
+    // r10 (CoS #437): a pre-lock rendezvous, not a sleep. The frame counts its arrival after its check before the
+    // lock passed and just before it takes the mutex held here; a frame refused or failed earlier never counts.
+    // The wait is bounded: a frame that never arrives (or finished) fails the assertion below, never hangs.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (llrpGpuReconBackendLockArrivalsForTesting() == arrivalsBefore && !done.load()
+           && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    const bool waitedOnTheLock = llrpGpuReconBackendLockArrivalsForTesting() == arrivalsBefore + 1 && !done.load();
     GpuDeviceLossBreaker::onFault(launchTimeout()); // what the fault listener does on the faulting thread
     const int suppressedWhileQueued = llrpGpuCudaSuppressed();
     llrpHoldGpuReconBackendMutexForTesting(0);

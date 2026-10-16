@@ -834,6 +834,9 @@ static volatile LONG g_llrawproc_gpu_recon_run_active = 0;
 static volatile LONG g_llrawproc_gpu_preupload_bypass_active = 0;
 /* GPU-DEVICE-LOSS-SELF-HEAL-1: see llrpSetGpuCudaSuppressed in llrawproc.h. */
 static volatile LONG g_llrawproc_gpu_cuda_suppressed = 0;
+/* r10 (CoS #437): frames that passed run_backend's check before the lock and
+ * are about to take the backend mutex; a test's pre-lock rendezvous. */
+static volatile LONG g_llrawproc_gpu_recon_lock_arrivals = 0;
 
 void llrpSetGpuCudaSuppressed(int suppressed)
 {
@@ -1676,6 +1679,14 @@ void llrpHoldGpuReconBackendMutexForTesting(int hold)
     else pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
 }
 
+/* GPU-DEVICE-LOSS-SELF-HEAL-1 r10 test-only: how many frames have passed
+ * run_backend's check before the lock and reached the backend mutex. */
+long llrpGpuReconBackendLockArrivalsForTesting(void);
+long llrpGpuReconBackendLockArrivalsForTesting(void)
+{
+    return InterlockedCompareExchange(&g_llrawproc_gpu_recon_lock_arrivals, 0, 0);
+}
+
 /* Test-only: model an older DLL (present=0) that lacks
  * igpu_recon_set_reduced_iso_notch, or restore the symbol (present=1). */
 int llrpSetFakeGpuBackendReducedIsoNotchSymbolForTesting(int present);
@@ -2411,6 +2422,7 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
     frame.playback_preview_scale_factor = state->playback_preview_scale_factor;
     frame.apply_dither = state->apply_dither;
 
+    InterlockedIncrement(&g_llrawproc_gpu_recon_lock_arrivals);
     pthread_mutex_lock(&g_llrawproc_gpu_recon_backend_mutex);
     /* r6 (CoS #437, guard under the serializing lock): a caller that passed the
      * check above and then waited here through a loss must not reach CUDA. */

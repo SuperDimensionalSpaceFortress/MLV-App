@@ -3154,6 +3154,8 @@ function Get-AttrCudaSelfHealMetricNames {
     GPU-DEVICE-LOSS-SELF-HEAL-1 r6: the names, in order, of the self-heal metrics a job with -PreLaunchCount
     pre-launches publishes in its success summary.json (Get-AttrCudaSelfHealMetrics fills them; the generator
     emits one summary line per name). L<n> is pre-launch n; L<PreLaunchCount + 1> is the measured run.
+    r10: each metric read from a counter, a fault code or a rate has a <metric>CouldNotCheck partner, $null unless that
+    metric could not be read; Test-DvCriteria puts its typed reason in the leg verdict.
     #>
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)][int]$PreLaunchCount)
@@ -3162,6 +3164,9 @@ function Get-AttrCudaSelfHealMetricNames {
         foreach ($suffix in 'Rc', 'PreLaunchOk', 'InjectedFaultCode', 'BreakerTrip', 'SafeStartFlag', 'SafeStartRoute', 'CudaFrames', 'CpuFrames',
                             'GpuPreviewFrames', 'RefusedGpuPlaybackRecon', 'PresentedFps', 'FpsRatio') {
             $names += "selfHealL$n$suffix"
+        }
+        foreach ($suffix in 'InjectedFaultCode', 'CudaFrames', 'CpuFrames', 'GpuPreviewFrames', 'RefusedGpuPlaybackRecon', 'FpsRatio') {
+            $names += "selfHealL$n$($suffix)CouldNotCheck"
         }
     }
     $names += "selfHealL$($PreLaunchCount + 1)FlagCleared"
@@ -3194,6 +3199,11 @@ function Get-AttrCudaSelfHealMetrics {
       PresentedFps / FpsRatio its playback_smoke.summary presented_fps, and that over the measured run's.
     and FlagCleared (the measured run): 1 when its log records safe_start_flag/cleared_env and the INI after it
     has no SafeStartEnabled=true. SettingsStoreDeleted: 1 when settings-dir.json proves the store was removed.
+    r10 (CoS #437, Dot c503450a): a counter is a fact only when its key is present and its value is a decimal count. [long] of
+    an absent key, an empty value or '0x0' is 0, so a gpu_summary that omitted its CUDA and preview counters read as zero CUDA
+    and zero preview frames and passed L3 without measuring anything. An unreadable counter, fault code or rate now leaves its
+    metric $null (its criterion fails) and names why in <metric>CouldNotCheck: 'COULD-NOT-CHECK <TOKEN> <source>', TOKEN one of
+    LINE_ABSENT, COUNTER_ABSENT, COUNTER_NULL, COUNTER_NOT_NUMERIC, FAULT_CODE_ABSENT, FAULT_CODE_NOT_NUMERIC, MEASURED_FPS_UNUSABLE.
     #>
     [CmdletBinding()]
     param(
@@ -3238,7 +3248,7 @@ function Get-AttrCudaSelfHealMetrics {
         foreach ($f in @(Get-ChildItem -LiteralPath $Dir -File -Filter 'gpu-field-telemetry.jsonl*' -ErrorAction SilentlyContinue | Sort-Object Name)) {
             foreach ($line in [IO.File]::ReadAllLines($f.FullName)) {
                 try { $j = $line | ConvertFrom-Json } catch { continue }
-                if ($j.kind -ceq 'fault' -and $j.device_loss -eq $true -and $j.site -ceq 'MLVAPP_GPU_FAULT_INJECT') { $faults[[string]$j.fault_utc_ms] = [int]$j.cuda_code }
+                if ($j.kind -ceq 'fault' -and $j.device_loss -eq $true -and $j.site -ceq 'MLVAPP_GPU_FAULT_INJECT') { $faults[[string]$j.fault_utc_ms] = $(if ($null -ne $j.PSObject.Properties['cuda_code']) { $j.cuda_code } else { $null }) }
                 elseif ($j.kind -ceq 'recovery') { $recoveries["$($j.what)/$($j.outcome)"] = $true }
             }
         }
@@ -3250,13 +3260,34 @@ function Get-AttrCudaSelfHealMetrics {
         if ($null -eq $t) { return $null }
         $(if ([regex]::IsMatch($t, '(?m)^SafeStartEnabled=true\s*$')) { 1 } else { 0 })
     }
-    $fps = {
-        param($Fields)
-        if ($null -eq $Fields -or -not $Fields.ContainsKey('presented_fps')) { return $null }
-        [double]$Fields['presented_fps']
+    # r10: one value of a <marker> line, strictly: { value; reason }. value is $null whenever reason is set (never a cast default).
+    $field = {
+        param($Fields, [string]$Marker, [string]$Key, [string]$Pattern, [type]$Type)
+        $at = "$($Marker -replace '^playback_smoke\.', '').$Key"
+        if ($null -eq $Fields) { return [pscustomobject]@{ value = $null; reason = "LINE_ABSENT $Marker" } }
+        if (-not $Fields.ContainsKey($Key)) { return [pscustomobject]@{ value = $null; reason = "COUNTER_ABSENT $at" } }
+        $raw = [string]$Fields[$Key]
+        if ($raw.Length -eq 0 -or $raw -ceq 'null') { return [pscustomobject]@{ value = $null; reason = "COUNTER_NULL $at" } }
+        $parsed = $null
+        if ($raw -cnotmatch $Pattern -or -not $Type::TryParse($raw, [Globalization.NumberStyles]::AllowDecimalPoint, [Globalization.CultureInfo]::InvariantCulture, [ref]$parsed)) {
+            return [pscustomobject]@{ value = $null; reason = "COUNTER_NOT_NUMERIC $at='$raw'" }
+        }
+        [pscustomobject]@{ value = $parsed; reason = $null }
+    }
+    $count = { param($Fields, [string]$Marker, [string]$Key) & $field $Fields $Marker $Key '^[0-9]+$' ([long]) }
+    $fps = { param($Fields) & $field $Fields 'playback_smoke.summary' 'presented_fps' '^[0-9]+(\.[0-9]+)?$' ([double]) }
+    # a metric from readings: their sum when every one was read, else $null and the typed reasons in <Name>CouldNotCheck
+    $setRead = {
+        param([string]$Name, [object[]]$Readings)
+        $why = @($Readings | Where-Object { $null -ne $_.reason } | ForEach-Object { $_.reason })
+        if ($why.Count -gt 0) { $m["$($Name)CouldNotCheck"] = 'COULD-NOT-CHECK ' + ($why -join '; '); return }
+        $sum = 0L
+        foreach ($r in $Readings) { $sum += $r.value }
+        $m[$Name] = $sum
     }
 
-    $measuredFps = & $fps (& $sessionLine $MeasuredLogText $MeasuredSessionId 'playback_smoke.summary')
+    $measured = & $fps (& $sessionLine $MeasuredLogText $MeasuredSessionId 'playback_smoke.summary')
+    $measuredFps = $measured.value
     $m['selfHealMeasuredPresentedFps'] = $measuredFps
     $records = 0
     for ($n = 1; $n -le $PreLaunches.Count; $n++) {
@@ -3275,22 +3306,31 @@ function Get-AttrCudaSelfHealMetrics {
                            @($failures | Where-Object { -not ([string]$_).StartsWith('gpu_texture_route_readback_regression:') }).Count -eq 0))
         $m["$($p)PreLaunchOk"] = $(if ($ok) { 1 } else { 0 })
         $tel = & $telemetry $dir
-        $m["$($p)InjectedFaultCode"] = $(if ($tel.faults.Count -gt 0) { @($tel.faults.Values)[0] } else { 0 })
+        if ($tel.faults.Count -eq 0) { $m["$($p)InjectedFaultCode"] = 0 }
+        else {
+            # r10: a fault row without an integer cuda_code was [int]$null = 0, i.e. "no injected fault"
+            $code = @($tel.faults.Values)[0]
+            if ($code -is [int] -or $code -is [long]) { $m["$($p)InjectedFaultCode"] = [int]$code }
+            elseif ($null -eq $code) { $m["$($p)InjectedFaultCodeCouldNotCheck"] = 'COULD-NOT-CHECK FAULT_CODE_ABSENT gpu-field-telemetry fault.cuda_code' }
+            else { $m["$($p)InjectedFaultCodeCouldNotCheck"] = "COULD-NOT-CHECK FAULT_CODE_NOT_NUMERIC gpu-field-telemetry fault.cuda_code='$code'" }
+        }
         $m["$($p)BreakerTrip"] = $(if ($tel.recoveries.ContainsKey('device_loss/cuda_suppressed_session')) { 1 } else { 0 })
         $m["$($p)SafeStartRoute"] = $(if ($tel.recoveries.ContainsKey('safe_start/cpu_route')) { 1 } else { 0 })
         $m["$($p)SafeStartFlag"] = & $iniFlag (Join-Path $dir 'MLVApp.ini')
         $log = & $readText (Join-Path $dir 'result.json.run.log')
-        $gpu = & $sessionLine $log '' 'playback_smoke.gpu_summary'
-        if ($null -ne $gpu) {
-            $m["$($p)CudaFrames"] = [long]$gpu['gpu_recon_readback_frames'] + [long]$gpu['gpu_texture_readback_frames'] + [long]$gpu['gpu_texture_no_readback_frames']
-            $m["$($p)CpuFrames"] = [long]$gpu['cpu_frames']
-            $m["$($p)GpuPreviewFrames"] = [long]$gpu['gpu_preview_frames']
-        }
-        $reuse = & $sessionLine $log '' 'playback_smoke.debayered16_recon_reuse_summary'
-        if ($null -ne $reuse -and $reuse.ContainsKey('refused_gpu_playback_recon')) { $m["$($p)RefusedGpuPlaybackRecon"] = [long]$reuse['refused_gpu_playback_recon'] }
-        $launchFps = & $fps (& $sessionLine $log '' 'playback_smoke.summary')
+        $gpuMarker = 'playback_smoke.gpu_summary'
+        $gpu = & $sessionLine $log '' $gpuMarker
+        & $setRead "$($p)CudaFrames" @(foreach ($k in 'gpu_recon_readback_frames', 'gpu_texture_readback_frames', 'gpu_texture_no_readback_frames') { & $count $gpu $gpuMarker $k })
+        & $setRead "$($p)CpuFrames" @(& $count $gpu $gpuMarker 'cpu_frames')
+        & $setRead "$($p)GpuPreviewFrames" @(& $count $gpu $gpuMarker 'gpu_preview_frames')
+        $reuseMarker = 'playback_smoke.debayered16_recon_reuse_summary'
+        & $setRead "$($p)RefusedGpuPlaybackRecon" @(& $count (& $sessionLine $log '' $reuseMarker) $reuseMarker 'refused_gpu_playback_recon')
+        $launch = & $fps (& $sessionLine $log '' 'playback_smoke.summary')
+        $launchFps = $launch.value
         $m["$($p)PresentedFps"] = $launchFps
-        if ($null -ne $launchFps -and $null -ne $measuredFps -and $measuredFps -gt 0) { $m["$($p)FpsRatio"] = [Math]::Round($launchFps / $measuredFps, 4) }
+        if ($null -ne $launch.reason) { $m["$($p)FpsRatioCouldNotCheck"] = "COULD-NOT-CHECK $($launch.reason)" }
+        elseif ($null -eq $measuredFps -or $measuredFps -le 0) { $m["$($p)FpsRatioCouldNotCheck"] = "COULD-NOT-CHECK MEASURED_FPS_UNUSABLE $(if ($null -ne $measured.reason) { $measured.reason } else { "summary.presented_fps=$measuredFps" })" }
+        else { $m["$($p)FpsRatio"] = [Math]::Round($launchFps / $measuredFps, 4) }
     }
     $m['selfHealPreLaunches'] = $records
     $main = Join-Path $SelfHealDir 'main'
