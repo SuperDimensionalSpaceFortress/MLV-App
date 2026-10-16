@@ -21,6 +21,7 @@ import io
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -163,11 +164,13 @@ def test_the_steward_handoff_card_names_the_candidate_digest():
     assert _bus_candidate()["sha256_lf"] in HANDOFF_CARD.read_text(encoding="utf-8")
 
 
-def test_adoption_route_is_the_bus_pin_model():
-    """The bus deleted tools/conjugal-reference/doctrine_outbox.py (665b4566) and shares tools by pin:
-    "A tool here is never copied into a project: the project pins it" (bus tools/factory/README.md).
-    The config, card, README and the tool's docstring must name tools/factory/ and the pin, and must
-    not send a project to replace a file in the deleted reference directory or to vendor a copy."""
+PIN_AWARE_FOLLOW_UP = "OUTBOX-PIN-AWARE-TOOL-AT-REF-1"
+
+
+def test_surfaces_keep_the_local_copy_and_name_the_pin_aware_follow_up():
+    """The installed hook runs `$REPO_ROOT/<tool_rel>` and debt/drain need `tool_rel` at the ref, so a
+    project that deletes its copy after pinning bricks its own pushes (CoS repro on a4480947). Every
+    surface that describes the route must say the copy stays until the pin-aware release, and name it."""
     assert _bus_candidate()["bus_path"] == CANDIDATE_BUS_PATH
     surfaces = {
         "config": (REPO_ROOT / "doctrine-outbox.config.json").read_text(encoding="utf-8"),
@@ -177,9 +180,129 @@ def test_adoption_route_is_the_bus_pin_model():
     }
     for name, text in surfaces.items():
         assert "factory-pins" in text and CANDIDATE_BUS_PATH in text, f"{name} does not name the bus pin route"
+        assert PIN_AWARE_FOLLOW_UP in text, f"{name} does not name the pin-aware follow-up"
         assert "conjugal-reference" not in text, f"{name} still names the deleted reference directory"
         assert not re.search(r"\bvendor(s|ed|ing)?\b|re-vendor", text, re.IGNORECASE), f"{name} still tells a project to vendor a copy"
-    assert "pin-runner.py pin doctrine-outbox" in surfaces["card"]
+        # r5's pattern flagged the card's own "Only after it ships does a project delete its copy". A sentence that
+        # makes the deletion conditional on the pin-aware release is the rule, not a violation of it.
+        unconditional = [s for s in re.split(r"(?<=[.!?])\s+|\n", text)
+                         if re.search(r"deletes? (its|their|the) (own )?(local )?copy|keeping no copy|keeps no copy", s, re.IGNORECASE)
+                         and not re.search(r"\bonly after\b|\buntil\b|\bonce\b", s, re.IGNORECASE)]
+        assert not unconditional, f"{name} still tells a project to delete its copy: {unconditional}"
+
+
+# ---------- the card's route, run end to end against the bus's own pin-runner ----------
+
+BUS_CLONE_CANDIDATES = (os.environ.get("FACTORY_BUS_CLONE", ""), "C:/!Layi Wkspc/softwarefactory-fleet-doctrine")
+RUNNER_BUS_PATH = "tools/factory/pin-runner.py"
+
+
+def _read_only_bus_runner() -> bytes:
+    """The bytes of bus master's pin-runner, read with `git cat-file` (never a write into the bus clone)."""
+    for cand in BUS_CLONE_CANDIDATES:
+        if not cand or not (Path(cand) / ".git").exists():
+            continue
+        for ref in ("origin/master", "master"):
+            proc = subprocess.run(["git", "--no-optional-locks", "-C", cand, "cat-file", "blob", f"{ref}:{RUNNER_BUS_PATH}"],
+                                  capture_output=True, env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
+            if proc.returncode == 0 and proc.stdout:
+                return proc.stdout
+    pytest.skip("no fleet doctrine bus clone with tools/factory/pin-runner.py on this machine (set FACTORY_BUS_CLONE)")
+
+
+def _card_command(fragment: str) -> str:
+    """The backticked `python factory-pins/pin-runner.py ...` command in the steward card that carries `fragment`."""
+    text = HANDOFF_CARD.read_text(encoding="utf-8")
+    found = re.search(r"`(python factory-pins/pin-runner\.py " + re.escape(fragment) + r"[^`]*)`", text)
+    assert found, f"the steward card has no `python factory-pins/pin-runner.py {fragment} ...` command"
+    return found.group(1)
+
+
+def _argv(command: str, **fill: str) -> list[str]:
+    argv = shlex.split(command)
+    assert argv[0] == "python"
+    return [sys.executable, *[fill.get(a, a) for a in argv[1:]]]
+
+
+def test_the_steward_cards_route_runs_end_to_end_against_the_bus_pin_runner(tmp_path):
+    """The first instance of ruling candidate steward-handoff-card-route-is-live-and-exercised-r1: a
+    steward card ships only with a test that RUNS its route against the bus's current share model.
+
+    A scratch bus holds bus master's real tools/factory/pin-runner.py and this tool at the bus path the
+    card names. A scratch consumer follows the card's own commands: adopt the runner, pin the tool with
+    --reviewer/--reason, run it by pin with --config (install-hooks, then session-start), and then pushes
+    through the hook that run installed. The consumer KEEPS its local copy, as the card says: the hook and
+    the debt checks read it. Never writes into the real bus repository."""
+    runner = _read_only_bus_runner()
+    pin_cmd, run_cmd = _card_command("pin doctrine-outbox"), _card_command("run doctrine-outbox")
+    assert "--reviewer" in pin_cmd and "--reason" in pin_cmd, "the card's pin command is refused by the runner without these"
+    assert "--config" in run_cmd, "a pinned run executes from a temp directory and cannot find the config without --config"
+
+    bus = tmp_path / "scratch-bus"
+    bus.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "master", str(bus)], check=True, capture_output=True, text=True)
+    (bus / "tools" / "factory").mkdir(parents=True)
+    (bus / RUNNER_BUS_PATH).write_bytes(runner)
+    (bus / CANDIDATE_BUS_PATH).write_bytes(TOOL_SRC.read_bytes().replace(b"\r\n", b"\n"))
+    git(bus, "add", "-A")
+    git(bus, "commit", "-m", "scratch bus: the runner at bus master plus the candidate")
+    bus_sha = git(bus, "rev-parse", "HEAD")
+
+    consumer = tmp_path / "consumer"
+    consumer.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "master", str(consumer)], check=True, capture_output=True, text=True)
+    config = {**BUS_STYLE_CONFIG, "project": "consumer", "tool_rel": "tools/coordination/doctrine_outbox.py",
+              "state_dir": ".state/outbox", "finding_path_regexes": [r"^agents/[^/]+\.md$"]}
+    commit(consumer, {"doctrine-outbox.config.json": json.dumps(config),
+                      "tools/coordination/doctrine_outbox.py": TOOL_SRC.read_text(encoding="utf-8"),
+                      f"{OUTBOX_DIR}/README.md": "# outbox\n"},
+           "init\n\nDoctrine-Export: none\n")
+    (consumer / "factory-pins").mkdir()
+    (consumer / "factory-pins" / "pin-runner.py").write_bytes(runner)
+    commit(consumer, {"docs/readme.md": "x\n"}, "docs\n\nDoctrine-Export: none\n")
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "master", str(origin)], check=True, capture_output=True, text=True)
+    git(consumer, "remote", "add", "origin", str(origin))
+    git(consumer, "push", "-q", "origin", "master")   # before the guard exists
+
+    env = {**os.environ, "FACTORY_BUS_CLONE": str(bus), "FACTORY_PINS_CACHE": str(tmp_path / "blob-cache")}
+
+    def sh(argv: list[str]) -> subprocess.CompletedProcess:
+        return subprocess.run(argv, cwd=consumer, capture_output=True, text=True, env=env)
+
+    adopt = sh([sys.executable, "factory-pins/pin-runner.py", "adopt-runner", "--commit", bus_sha])
+    assert adopt.returncode == 0, adopt.stderr
+    pin = sh(_argv(pin_cmd, **{"<bus-sha>": bus_sha, "<who>": "r5-e2e", "<why>": "route test"}))
+    assert pin.returncode == 0, pin.stderr
+    pins = json.loads((consumer / "factory-pins" / "factory-pins.json").read_text(encoding="utf-8"))
+    assert pins["tools"]["doctrine-outbox"]["path"] == CANDIDATE_BUS_PATH and pins["tools"]["doctrine-outbox"]["commit"] == bus_sha
+
+    def by_pin(*command: str) -> subprocess.CompletedProcess:
+        return sh(_argv(run_cmd, **{"<command>": command[0]}) + list(command[1:]))
+
+    # Without --config the pinned bytes cannot find the project's values: the reason the card must carry it.
+    bare = sh([sys.executable, "factory-pins/pin-runner.py", "run", "doctrine-outbox", "--", "check-commits"])
+    assert bare.returncode == 2 and "CONFIG_ABSENT" in bare.stderr, (bare.returncode, bare.stderr)
+
+    hooked = by_pin("install-hooks")
+    assert hooked.returncode == 0 and hooked.stdout.strip() == "installed", (hooked.stdout, hooked.stderr)
+    started = by_pin("session-start")
+    assert started.returncode == 0, started.stderr
+    assert "TOOL_ABSENT_AT_REF" not in started.stdout and "UNKNOWN" not in started.stdout, started.stdout
+    assert "pre-push guard: present" in started.stdout and "no unsent doctrine items" in started.stdout, started.stdout
+
+    # The hook the pinned run installed guards a real push. A clean push passes (the guard ran and said yes)...
+    commit(consumer, {"docs/notes.md": "prose\n"}, "docs only")
+    clean = sh(["git", "push", "origin", "master"])
+    assert clean.returncode == 0, clean.stderr
+    # ...and the same hook refuses an undeclared finding-path commit, which proves it ran at all.
+    commit(consumer, {"agents/new.md": "rule\n"}, "undeclared finding path")
+    refused = sh(["git", "push", "origin", "master"])
+    assert refused.returncode != 0 and "PUSH REFUSED" in refused.stderr and "agents/new.md" in refused.stderr, refused.stderr
+    git(consumer, "commit", "--amend", "-m", "declared\n\nDoctrine-Export: none\n")
+    allowed = sh(["git", "push", "origin", "master"])
+    assert allowed.returncode == 0, allowed.stderr
+    assert (consumer / "tools" / "coordination" / "doctrine_outbox.py").is_file()   # the copy the card says to keep
 
 
 def test_the_tool_names_no_project_host_or_state_directory():
@@ -214,6 +337,26 @@ def test_config_refuses_an_unknown_key_and_a_bad_trailer_mode(tmp_path):
     with pytest.raises(fresh.Refusal) as excinfo:
         fresh.configure({**BUS_STYLE_CONFIG, "trailer_mode": "lenient"})
     assert excinfo.value.code == "CONFIG_INVALID"
+
+
+@pytest.mark.parametrize("override, offending", [
+    ({"outbox_dir": "../outside"}, "outbox_dir"),
+    ({"outbox_dir": "doctrine-outbox/../.."}, "outbox_dir"),
+    ({"outbox_dir": "./doctrine-outbox"}, "outbox_dir"),
+    ({"sent_dir": ".."}, "sent_dir"),
+    ({"law4_extra": [{"name": "x", "pattern": "y", "ignorecas": True}]}, "ignorecas"),
+    ({"law4_extra": [{"name": "x", "pattern": "y", "ignorecase": "yes"}]}, "ignorecase"),
+])
+def test_config_refuses_a_dot_dot_directory_and_a_stray_law4_row_key(override, offending):
+    """Iverson r1 improvements 1 and 2 (r1 :302, :274; CoS 6225387980): `..` matches the directory
+    character class, and a misspelt row key silently turned a case-insensitive deny term case-sensitive."""
+    spec = importlib.util.spec_from_file_location("doctrine_outbox_dotdot", TOOL_SRC)
+    fresh = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fresh)
+    with pytest.raises(fresh.Refusal) as excinfo:
+        fresh.configure({**BUS_STYLE_CONFIG, **override})
+    assert excinfo.value.code == "CONFIG_INVALID" and offending in excinfo.value.detail
+    fresh.configure({**BUS_STYLE_CONFIG, "law4_extra": [{"name": "x", "pattern": "y", "ignorecase": True, "_note": "ok"}]})
 
 
 def test_no_config_is_unknown_not_a_pass(tmp_path):
@@ -330,6 +473,87 @@ def test_installed_guard_hands_the_downstream_layer_the_bytes_git_sent(ob, repo,
     allowed = subprocess.run(["git", "-C", str(repo), "push", "origin", "master"], capture_output=True, text=True, env=env)
     assert allowed.returncode == 0, allowed.stderr
     assert seen.read_bytes() == f"refs/heads/master {head} refs/heads/master {base}\n".encode()
+
+
+def _guard_block(*, spool: bool, python_missing_passes: bool) -> str:
+    """The guard snippet as an older release wrote it (no end marker): r1/r2 had no stdin spool and let a
+    push through when python was missing; r3/r4 spooled stdin but still let that push through."""
+    run = ('  "$OUTBOX_PY" "$REPO_ROOT/' + TOOL_REL + '" pre-push "$REPO_ROOT" "$@"'
+           + (' < "$OUTBOX_STDIN" || { OUTBOX_RC=$?; rm -f "$OUTBOX_STDIN"; exit $OUTBOX_RC; }\n' if spool else ' || exit $?\n'))
+    assert python_missing_passes
+    return ("# doctrine-outbox-guard: findings reach the bus by file; a finding-path commit must declare.\n"
+            'REPO_ROOT=${REPO_ROOT:-$(git rev-parse --show-toplevel)}\nOUTBOX_PY=\nfor cand in python3 python; do\n'
+            '  if command -v "$cand" >/dev/null 2>&1 && "$cand" --version >/dev/null 2>&1; then OUTBOX_PY=$cand; break; fi\ndone\n'
+            + ('OUTBOX_STDIN=$(mktemp 2>/dev/null) || OUTBOX_STDIN="${TMPDIR:-/tmp}/outbox-pre-push.$$"\ncat > "$OUTBOX_STDIN"\n' if spool else "")
+            + 'if [ -n "$OUTBOX_PY" ]; then\n' + run + 'else\n'
+            '  echo "doctrine-outbox: no python on PATH; the push guard did not run" >&2\nfi\n'
+            + ('exec < "$OUTBOX_STDIN"\nrm -f "$OUTBOX_STDIN" 2>/dev/null || true\n' if spool else ""))
+
+
+@pytest.mark.parametrize("spool", [False, True], ids=["r1-r2-guard", "r3-r4-guard"])
+def test_install_hooks_replaces_an_older_guard_in_place_and_repairs_the_stdin_hand_off(ob, repo, tmp_path, spool):
+    """r3 improvement 1 (CoS 6224591286, repeated 6225387980): a guard written before r3 swallows git's ref
+    lines, and once install-hooks set its executable bit it started running. install-hooks must replace the
+    old block (and only it) so the layer after the guard reads exactly what git sent."""
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "master", str(origin)], check=True, capture_output=True, text=True)
+    git(repo, "remote", "add", "origin", str(origin))
+    git(repo, "push", "-q", "origin", "master")
+    base = git(repo, "rev-parse", "HEAD")
+    hook = repo / ".git" / "hooks" / "pre-push"
+    before = "#!/bin/sh\nset -e\nREPO_ROOT=$(git rev-parse --show-toplevel)\n"
+    after = 'cat > "$DOWNSTREAM_OUT"   # git lfs pre-push stand-in\n'
+    hook.write_text(before + "\n" + _guard_block(spool=spool, python_missing_passes=True) + after, encoding="utf-8", newline="\n")
+    assert ob.main(["install-hooks", str(repo)]) == 0
+    text = hook.read_text(encoding="utf-8")
+    assert text.count("# doctrine-outbox-guard:") == 1 and text.count("# end doctrine-outbox-guard") == 1
+    assert text.startswith(before) and text.endswith(after), "the lines around the guard were disturbed"
+    assert "the push guard did not run" not in text and "exec < \"$OUTBOX_STDIN\"" in text
+    assert ob.install_pre_push(repo) == "present"
+    seen = tmp_path / "downstream.bin"
+    head = commit(repo, {"docs/notes.md": "prose\n"}, "docs only")
+    pushed = subprocess.run(["git", "-C", str(repo), "push", "origin", "master"], capture_output=True, text=True,
+                            env={**os.environ, "DOWNSTREAM_OUT": str(seen)})
+    assert pushed.returncode == 0, pushed.stderr
+    assert seen.read_bytes() == f"refs/heads/master {head} refs/heads/master {base}\n".encode()
+
+
+def test_install_hooks_reports_repaired_and_refuses_a_block_it_cannot_place(ob, repo, capsys):
+    hook = repo / ".git" / "hooks" / "pre-push"
+    hook.parent.mkdir(parents=True, exist_ok=True)
+    hook.write_text("#!/bin/sh\n\n" + _guard_block(spool=True, python_missing_passes=True), encoding="utf-8", newline="\n")
+    assert ob.main(["install-hooks", str(repo)]) == 0
+    assert capsys.readouterr().out.strip() == "repaired"
+    odd = "#!/bin/sh\n# doctrine-outbox-guard: hand edited\nexit 0\n"
+    hook.write_text(odd, encoding="utf-8", newline="\n")
+    assert ob.main(["install-hooks", str(repo)]) == 1
+    assert "HOOK_UNRECOGNISED" in capsys.readouterr().err
+    assert hook.read_text(encoding="utf-8") == odd, "a block that could not be placed must not be rewritten"
+    assert ob.main(["session-start", str(repo)]) == 0   # informational: never blocks a session start
+    assert "pre-push guard: UNKNOWN" in capsys.readouterr().out
+
+
+def test_installed_hook_refuses_the_push_when_no_python_is_on_path(ob, repo, tmp_path):
+    """Iverson r1 improvement 3 (r1 :1799, CoS 6225387980): a host with no usable python used to print a
+    warning and let the push through, so the guard failed open. A stub python that fails `--version`, first
+    on PATH, stands in for a box without one."""
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "master", str(origin)], check=True, capture_output=True, text=True)
+    git(repo, "remote", "add", "origin", str(origin))
+    git(repo, "push", "-q", "origin", "master")
+    assert ob.main(["install-hooks", str(repo)]) == 0
+    stubs = tmp_path / "stubs"
+    stubs.mkdir()
+    for name in ("python3", "python"):
+        (stubs / name).write_text("#!/bin/sh\nexit 1\n", encoding="utf-8", newline="\n")
+        (stubs / name).chmod(0o755)
+    commit(repo, {"docs/notes.md": "prose\n"}, "docs only")
+    env = {**os.environ, "PATH": str(stubs) + os.pathsep + os.environ["PATH"]}
+    refused = subprocess.run(["git", "-C", str(repo), "push", "origin", "master"], capture_output=True, text=True, env=env)
+    assert refused.returncode != 0 and "no python on PATH" in refused.stderr and "push refused" in refused.stderr, refused.stderr
+    assert git(repo, "rev-parse", "origin/master") != git(repo, "rev-parse", "HEAD"), "the push went through without the guard"
+    allowed = subprocess.run(["git", "-C", str(repo), "push", "origin", "master"], capture_output=True, text=True)
+    assert allowed.returncode == 0, allowed.stderr   # the same hook with a working python passes the clean push
 
 
 def test_install_hooks_works_from_a_linked_worktree(ob, repo, tmp_path):
@@ -560,3 +784,112 @@ def test_installed_hook_blocks_and_allows_a_real_push(ob, repo, tmp_path):
     git(repo, "commit", "--amend", "-m", "declared\n\nDoctrine-Export: none\n")
     allowed = subprocess.run(["git", "-C", str(repo), "push", "origin", "master"], capture_output=True, text=True)
     assert allowed.returncode == 0, allowed.stderr
+
+
+# ---------- r6: where the guard is spliced, the check argument, the cost of a new branch ----------
+
+def _origin_with_master(repo: Path, tmp_path: Path) -> None:
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "master", str(origin)], check=True, capture_output=True, text=True)
+    git(repo, "remote", "add", "origin", str(origin))
+    git(repo, "push", "-q", "origin", "master")
+
+
+def test_install_splices_the_guard_ahead_of_a_hook_that_ends_in_exit_zero(ob, repo, tmp_path):
+    """Dot / opus OUTBOX-HOOK-SPLICE-AFTER-EXIT-1: r1-r5 appended the guard at the end, so a hook that
+    finishes with `exit 0` ended before it and every push went through unjudged."""
+    _origin_with_master(repo, tmp_path)
+    hook = repo / ".git" / "hooks" / "pre-push"
+    hook.write_text("#!/bin/sh\nset -e\necho the-hooks-own-layer >&2\nexit 0\n", encoding="utf-8", newline="\n")
+    assert ob.install_pre_push(repo) == "installed"
+    text = hook.read_text(encoding="utf-8")
+    assert text.startswith("#!/bin/sh\nset -e\n")
+    assert text.index("doctrine-outbox-guard") < text.index("the-hooks-own-layer") < text.index("exit 0")
+    commit(repo, {"coordination/tools/other.py": "print(1)\n"}, "undeclared")
+    refused = subprocess.run(["git", "-C", str(repo), "push", "origin", "master"], capture_output=True, text=True)
+    assert refused.returncode != 0 and "PUSH REFUSED" in refused.stderr, refused.stderr
+    assert "the-hooks-own-layer" not in refused.stderr, "the hook's own layer ran although the guard refused"
+    git(repo, "commit", "--amend", "-m", "declared\n\nDoctrine-Export: none\n")
+    allowed = subprocess.run(["git", "-C", str(repo), "push", "origin", "master"], capture_output=True, text=True)
+    assert allowed.returncode == 0 and "the-hooks-own-layer" in allowed.stderr, allowed.stderr
+
+
+def test_install_splices_the_guard_ahead_of_a_hook_that_execs_another_command(ob, repo, tmp_path):
+    _origin_with_master(repo, tmp_path)
+    base = git(repo, "rev-parse", "HEAD")
+    hook = repo / ".git" / "hooks" / "pre-push"
+    hook.write_text('#!/bin/sh\nexec cat > "$DOWNSTREAM_OUT"   # the next hook replaces this shell\n', encoding="utf-8", newline="\n")
+    assert ob.install_pre_push(repo) == "installed"
+    assert hook.read_text(encoding="utf-8").index("doctrine-outbox-guard") < hook.read_text(encoding="utf-8").index("exec cat")
+    seen = tmp_path / "downstream.bin"
+    env = {**os.environ, "DOWNSTREAM_OUT": str(seen)}
+    commit(repo, {"coordination/tools/other.py": "print(1)\n"}, "undeclared")
+    refused = subprocess.run(["git", "-C", str(repo), "push", "origin", "master"], capture_output=True, text=True, env=env)
+    assert refused.returncode != 0 and "PUSH REFUSED" in refused.stderr and not seen.exists()
+    git(repo, "commit", "--amend", "-m", "declared\n\nDoctrine-Export: none\n")
+    head = git(repo, "rev-parse", "HEAD")
+    allowed = subprocess.run(["git", "-C", str(repo), "push", "origin", "master"], capture_output=True, text=True, env=env)
+    assert allowed.returncode == 0, allowed.stderr
+    assert seen.read_bytes() == f"refs/heads/master {head} refs/heads/master {base}\n".encode()
+
+
+def test_install_refuses_a_guard_that_sits_after_a_terminating_exit_or_exec(ob, repo, capsys):
+    """A guard behind a top-level `exit`/`exec` never runs. install-hooks must say so, not report
+    "present" or "repaired" for it, and must not rewrite the file."""
+    hook = repo / ".git" / "hooks" / "pre-push"
+    hook.parent.mkdir(parents=True, exist_ok=True)
+    assert ob.install_pre_push(repo) == "installed"
+    current = hook.read_text(encoding="utf-8")
+    current_guard = current[current.index("# doctrine-outbox-guard"):]
+    shapes = {
+        "older guard after exit": "#!/bin/sh\nexit 0\n\n" + _guard_block(spool=True, python_missing_passes=True),
+        "current guard after exit": "#!/bin/sh\nexit 0\n\n" + current_guard,
+        "current guard after exec": "#!/bin/sh\nexec true\n\n" + current_guard,
+    }
+    for name, text in shapes.items():
+        hook.write_text(text, encoding="utf-8", newline="\n")
+        assert ob.main(["install-hooks", str(repo)]) == 1, name
+        assert "HOOK_GUARD_UNREACHABLE" in capsys.readouterr().err, name
+        assert hook.read_text(encoding="utf-8") == text, f"{name}: a refused install must not rewrite the hook"
+    # `exec < file` only redirects and an indented `exit` is conditional: neither ends the hook.
+    hook.write_text("#!/bin/sh\nif [ -n \"$SKIP_LAYER\" ]; then\n  exit 0\nfi\nexec 3>&1\n" + current_guard, encoding="utf-8", newline="\n")
+    assert ob.install_pre_push(repo) == "present"
+
+
+def test_check_with_a_non_integer_age_is_a_usage_error_not_a_traceback(ob, repo, capsys):
+    """OUTBOX-CHECK-ARG-PARSE-1: `check REPO soon` died in int() with a traceback."""
+    assert ob.main(["check", str(repo), "soon"]) == 2
+    captured = capsys.readouterr()
+    assert "usage: check" in captured.err and "'soon'" in captured.err and "Traceback" not in captured.err
+    assert captured.out == "", "a usage error must not print a debt verdict"
+    run = subprocess.run([sys.executable, str(repo / TOOL_REL), "--config", str(repo / "doctrine-outbox.config.json"),
+                          "check", str(repo), "1.5"], capture_output=True, text=True)
+    assert run.returncode == 2 and "Traceback" not in run.stderr and "usage: check" in run.stderr, run.stderr
+
+
+@pytest.mark.parametrize("set_head", [True, False], ids=["origin-HEAD-set", "origin-HEAD-absent"])
+def test_pre_push_of_a_new_branch_judges_only_what_is_not_on_the_remote_default(tmp_path, pushed_repo, monkeypatch, capsys, set_head):
+    """OUTBOX-PREPUSH-NEW-BRANCH-COST-1: a push that creates a branch used to re-judge the whole history.
+    The old undeclared commit is already on origin/master, so it is not this push's business; a bad
+    commit made on the new branch is."""
+    cfg = tmp_path / "new-branch.config.json"
+    cfg.write_text(json.dumps({**BUS_STYLE_CONFIG, "pre_push_refs": ["refs/heads/master", "refs/heads/feature"]}), encoding="utf-8")
+    mod = load_tool(cfg)
+    repo = pushed_repo
+    commit(repo, {"coordination/tools/old.py": "print(1)\n"}, "on the default branch long ago, no trailer")
+    git(repo, "push", "-q", "origin", "master")
+    if set_head:
+        git(repo, "remote", "set-head", "origin", "master")
+    git(repo, "checkout", "-q", "-b", "feature")
+    clean = commit(repo, {"docs/notes.md": "prose\n"}, "clean on the branch")
+    new_branch = lambda sha: f"refs/heads/feature {sha} refs/heads/feature {ZEROS}\n"   # noqa: E731
+    assert run_pre_push(mod, repo, monkeypatch, new_branch(clean)) == 0, capsys.readouterr().err
+    bad = commit(repo, {"coordination/tools/new.py": "print(2)\n"}, "on the branch, no trailer")
+    assert run_pre_push(mod, repo, monkeypatch, new_branch(bad)) == 1
+    err = capsys.readouterr().err
+    assert "coordination/tools/new.py" in err and "coordination/tools/old.py" not in err
+    # No remote default branch to measure from (the push names a remote this clone has never fetched):
+    # fall back to the whole history rather than guess a base.
+    monkeypatch.setattr(sys, "stdin", io.StringIO(new_branch(clean)))
+    assert mod.main(["pre-push", str(repo), "elsewhere", "https://example.invalid/x.git"]) == 1
+    assert "coordination/tools/old.py" in capsys.readouterr().err

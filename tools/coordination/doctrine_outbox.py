@@ -7,10 +7,12 @@ versions"; tools/tool-census.mjs counts the drift). A project supplies only DATA
 Every project-specific value (project name, default ref, items dir, finding paths, state and
 ledger paths, Law-4 deny terms) comes from that config. The config schema is the `_CONFIG_KEYS` set
 and `configure()` below; no bus README documents it yet. This file is the candidate for the bus's
-`tools/factory/doctrine_outbox.py`. Once the bus steward lands it there, a project runs it from the
-bus BY PIN (`factory-pins/pin-runner.py run`, tools/factory/README.md) and keeps no copy of it; the
-pin names a reviewed bus SHA, so nothing runs until the project reviews and pins it. Until then
-this file is the only source.
+`tools/factory/doctrine_outbox.py`. Once the bus steward lands it there, a project can run it from the
+bus BY PIN (`factory-pins/pin-runner.py run`, tools/factory/README.md); the pin names a reviewed bus
+SHA, so nothing runs until the project reviews and pins it. A project KEEPS its local copy at config
+`tool_rel` until a pin-aware release (card OUTBOX-PIN-AWARE-TOOL-AT-REF-1: a config-driven hook
+invocation plus a `require_tool_at_ref` that accepts a pinned tool), because the installed hook and the
+debt and drain checks still read that path. Until then this file is the only source.
 
 Lineage: the fleet bus's reference outbox -> agent-bridge's port -> a second project's port,
 whose behaviours are the superset below. The item format, front matter, `parse_item`, the Law-4
@@ -72,7 +74,10 @@ BEHAVIOURS
    `session-start` (installs the pre-push guard and reports debt, never blocks), `install-hooks`.
    Each takes the repo as an optional first positional, as git and agent hooks call them. The
    installed hook is made executable (git skips one that is not) and passes git's stdin through to
-   whatever layer follows the guard (git lfs pre-push reads the same ref lines).
+   whatever layer follows the guard (git lfs pre-push reads the same ref lines). A host with no python
+   refuses the push (a guard that cannot run is not a pass), and an older guard block in an existing
+   hook is replaced in place (`install-hooks` prints `repaired`). The hook and the debt checks still
+   run the file at config `tool_rel`: a project keeps that local copy until a pin-aware release.
 
 Nothing here runs itself: the OS drain task, Stop hook and heartbeat debt are the project's wiring.
 
@@ -115,6 +120,8 @@ from datetime import datetime, timezone
 
 # ---------- constants that are fleet-wide, not per project ----------
 
+GUARD_MARKER = "# doctrine-outbox-guard"
+GUARD_END = "# end doctrine-outbox-guard"
 CONFIG_NAME = "doctrine-outbox.config.json"
 CONFIG_ENV = "DOCTRINE_OUTBOX_CONFIG"
 CONFIG_SCHEMA = "doctrine-outbox-config.v1"
@@ -207,6 +214,9 @@ _CONFIG_KEYS = frozenset({
 })
 
 
+_LAW4_ROW_KEYS = frozenset({"name", "pattern", "ignorecase"})
+
+
 class Refusal(Exception):
     """A schema, Law-4 or contract refusal. Maps to exit code 1."""
 
@@ -282,12 +292,16 @@ def configure(cfg: dict, config_path: pathlib.Path | None = None) -> None:
     if not PROJECT_RE.match(project):
         raise Refusal("CONFIG_INVALID", f"project must match {PROJECT_RE.pattern}")
     dir_re = r"[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*"
+    def plain_dir(value: object) -> bool:
+        # `.` and `..` match the character class, so the regex alone lets `../x` climb out of the repo.
+        return isinstance(value, str) and bool(re.fullmatch(dir_re, value)) and not {".", ".."} & set(value.split("/"))
+
     outbox_dir = cfg.get("outbox_dir", "doctrine-outbox")
-    if not isinstance(outbox_dir, str) or not re.fullmatch(dir_re, outbox_dir):
-        raise Refusal("CONFIG_INVALID", "outbox_dir must be a relative posix path")
+    if not plain_dir(outbox_dir):
+        raise Refusal("CONFIG_INVALID", "outbox_dir must be a relative posix path with no . or .. segment")
     sent_dir = cfg.get("sent_dir", "")
-    if not isinstance(sent_dir, str) or (sent_dir and not re.fullmatch(dir_re, sent_dir)):
-        raise Refusal("CONFIG_INVALID", "sent_dir must be a relative posix path under outbox_dir")
+    if not isinstance(sent_dir, str) or (sent_dir and not plain_dir(sent_dir)):
+        raise Refusal("CONFIG_INVALID", "sent_dir must be a relative posix path under outbox_dir with no . or .. segment")
     cards_target = cfg.get("cards_target", f"specs/{project}/cards.md")
     if not isinstance(cards_target, str) or not cards_target.startswith("specs/") or ".." in cards_target:
         raise Refusal("CONFIG_INVALID", "cards_target must live under specs/")
@@ -304,6 +318,11 @@ def configure(cfg: dict, config_path: pathlib.Path | None = None) -> None:
     for row in extra:
         if not isinstance(row, dict) or not isinstance(row.get("name"), str) or not isinstance(row.get("pattern"), str):
             raise Refusal("CONFIG_INVALID", "each law4_extra row needs a string name and pattern")
+        stray = sorted(k for k in row if k not in _LAW4_ROW_KEYS and not k.startswith("_"))
+        if stray or not isinstance(row.get("ignorecase", False), bool):
+            # A typo such as `ignorecas` would silently turn a case-insensitive deny term case-sensitive.
+            raise Refusal("CONFIG_INVALID", f"law4_extra {row['name']!r}: "
+                          + (f"unknown key(s) {', '.join(stray)}" if stray else "ignorecase must be true or false"))
         try:
             law4.append((row["name"], re.compile(row["pattern"], re.I if row.get("ignorecase") else 0)))
         except re.error as e:
@@ -1806,12 +1825,12 @@ def install_pre_push(repo: pathlib.Path) -> str:
     # Resolve through git: in a linked worktree `.git` is a FILE and hooks live in the common dir.
     hook = pathlib.Path(git(repo, "rev-parse", "--path-format=absolute", "--git-path", "hooks/pre-push"))
     hook.parent.mkdir(parents=True, exist_ok=True)
-    marker = "# doctrine-outbox-guard"
     # git hands a pre-push hook its ref lines on stdin, once. The guard's python reads that stream to
     # the end, so the snippet spools it to a file, feeds the guard from the file, and then rebinds the
     # hook's own stdin to the file: every layer after the guard (git lfs pre-push, a project's own
     # checks) reads the same bytes git sent. The file is unlinked while the hook holds it open.
-    snippet = (f"\n{marker}: findings reach the bus by file; a finding-path commit must declare.\n"
+    # A machine with no python refuses the push: a guard that cannot run must not read as a pass.
+    snippet = (f"{GUARD_MARKER}: findings reach the bus by file; a finding-path commit must declare.\n"
                f"REPO_ROOT=${{REPO_ROOT:-$(git rev-parse --show-toplevel)}}\n"
                f"OUTBOX_PY=\n"
                f"for cand in python3 python; do\n"
@@ -1822,22 +1841,90 @@ def install_pre_push(repo: pathlib.Path) -> str:
                f"if [ -n \"$OUTBOX_PY\" ]; then\n"
                f"  \"$OUTBOX_PY\" \"$REPO_ROOT/{TOOL_REL}\" pre-push \"$REPO_ROOT\" \"$@\" < \"$OUTBOX_STDIN\" || {{ OUTBOX_RC=$?; rm -f \"$OUTBOX_STDIN\"; exit $OUTBOX_RC; }}\n"
                f"else\n"
-               f"  echo \"doctrine-outbox: no python on PATH; the push guard did not run\" >&2\n"
+               f"  echo \"doctrine-outbox: no python on PATH; push refused because the guard cannot run\" >&2\n"
+               f"  rm -f \"$OUTBOX_STDIN\"; exit 1\n"
                f"fi\n"
                f"exec < \"$OUTBOX_STDIN\"\n"
-               f"rm -f \"$OUTBOX_STDIN\" 2>/dev/null || true\n")
+               f"rm -f \"$OUTBOX_STDIN\" 2>/dev/null || true\n"
+               f"{GUARD_END}\n")
     current = hook.read_text(encoding="utf-8") if hook.exists() else "#!/bin/sh\nset -e\nREPO_ROOT=$(git rev-parse --show-toplevel)\n"
-    if marker in current:
-        _make_executable(hook)   # an install made before the bit was set is repaired, not skipped
-        return "present"
     lines = current.splitlines(True)
-    # Before the LFS layer if it is there: the refusing guard goes ahead of a layer that may exit 2
-    # for an unrelated reason. The snippet restores stdin for that layer (see above).
-    idx = next((i for i, line in enumerate(lines) if "git lfs pre-push" in line or "command -v git-lfs" in line), len(lines))
-    lines.insert(idx, snippet)
+    start = next((i for i, line in enumerate(lines) if line.startswith(GUARD_MARKER)), None)
+    if start is not None:
+        # A guard sitting after a top-level `exit`/`exec` is dead code: git runs the hook, the hook ends
+        # first, and the push goes through unjudged. Reporting "present" or "repaired" for it would be a lie.
+        _refuse_if_terminated_before(lines, start)
+        end = _guard_block_end(lines, start)
+        if "".join(lines[start:end + 1]) == snippet:
+            _make_executable(hook)   # an install made before the bit was set is repaired, not skipped
+            return "present"
+        # An older guard (r1-r4: no end marker, no stdin spool, or a push that passes without python)
+        # is replaced in place. Leaving it would be worse than before the executable bit: git used to
+        # skip the hook, and now runs one that swallows the ref lines a following layer needs.
+        lines[start:end + 1] = [snippet]
+        hook.write_text("".join(lines), encoding="utf-8", newline="\n")
+        _make_executable(hook)
+        return "repaired"
+    # OUTBOX-HOOK-SPLICE-AFTER-EXIT-1: right after the shebang and any `set -e` preamble, ahead of every
+    # layer the hook runs. Appended at the end, a hook that ends in `exit 0` or `exec <next hook>` never
+    # reached the guard. The snippet restores stdin for the layers after it (see above), and it sits ahead
+    # of an LFS layer that may exit 2 for an unrelated reason. (r1-r5 spliced before the LFS line, else at the end.)
+    idx = _preamble_end(lines)
+    _refuse_if_terminated_before(lines, idx)
+    if idx and not lines[idx - 1].endswith("\n"):
+        lines[idx - 1] += "\n"
+    lines.insert(idx, "\n" + snippet)
     hook.write_text("".join(lines), encoding="utf-8", newline="\n")
     _make_executable(hook)
     return "installed"
+
+
+SET_PREAMBLE_RE = re.compile(r"^set(\s+[-+]\w+)+\s*(#.*)?$")
+# A top-level line that ends the hook: `exit`, or `exec <command>`. `exec < file` / `exec 3>&1` only
+# redirect, and an indented `exit` sits inside an `if`, so neither ends the script.
+TERMINATOR_RE = re.compile(r"^(?:exit\b|exec\s+(?![0-9]*[<>&]))")
+
+
+def _preamble_end(lines: list[str]) -> int:
+    """Index just past the shebang and any leading `set -e`-style lines (blank and comment lines between
+    them are skipped); 0 when the hook has neither."""
+    first = 1 if lines and lines[0].startswith("#!") else 0
+    end = first
+    for i in range(first, len(lines)):
+        text = lines[i].strip()
+        if SET_PREAMBLE_RE.match(text):
+            end = i + 1
+        elif text and not text.startswith("#"):
+            break
+    return end
+
+
+def _refuse_if_terminated_before(lines: list[str], idx: int) -> None:
+    """Refuse when a top-level `exit`/`exec` stands ahead of line `idx`: a guard placed there would never run."""
+    for i, line in enumerate(lines[:idx]):
+        if TERMINATOR_RE.match(line):
+            raise Refusal("HOOK_GUARD_UNREACHABLE",
+                          f"line {i + 1} of the pre-push hook ({line.strip()!r}) ends the hook before the guard point, "
+                          "so a guard there would never run; remove the guard block by hand and run install-hooks again")
+
+
+def _guard_block_end(lines: list[str], start: int) -> int:
+    """Index of the last line of the guard block that begins at `lines[start]`. A current block ends at
+    GUARD_END. A block written before the end marker existed ends at the `fi` that closes its missing-python
+    branch, plus the stdin rebind and unlink lines when it has them. A block this cannot place is refused:
+    splicing blind into a hook someone edited would break their layers."""
+    for i in range(start + 1, len(lines)):
+        if lines[i].rstrip("\r\n") == GUARD_END:
+            return i
+    said = next((i for i in range(start + 1, len(lines)) if "the push guard did not run" in lines[i]), None)
+    if said is None or said + 1 >= len(lines) or lines[said + 1].rstrip("\r\n") != "fi":
+        raise Refusal("HOOK_UNRECOGNISED", f"the {GUARD_MARKER} block in the pre-push hook has no end marker and is not a "
+                                           "known older shape; remove it by hand and run install-hooks again")
+    end = said + 1
+    for tail in ('exec < "$OUTBOX_STDIN"', 'rm -f "$OUTBOX_STDIN"'):
+        if end + 1 < len(lines) and lines[end + 1].startswith(tail):
+            end += 1
+    return end
 
 
 def _make_executable(hook: pathlib.Path) -> None:
@@ -1848,9 +1935,36 @@ def _make_executable(hook: pathlib.Path) -> None:
     os.chmod(hook, mode | ((mode & (stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)) >> 2))
 
 
-def cmd_pre_push(repo: pathlib.Path, deny_terms: list[tuple[str, str]]) -> int:
+def _remote_default_base(repo: pathlib.Path, remote: str, local_sha: str) -> str | None:
+    """The merge-base of `local_sha` with the remote's default branch, or None when the remote's default
+    branch cannot be found locally or shares no history with the push. OUTBOX-PREPUSH-NEW-BRANCH-COST-1:
+    a push that creates a branch has no remote tip to start from, and walking the whole history on every
+    new branch judges every old commit again. The default branch's commits were judged when they landed,
+    so the walk stops at the point the new branch left it. None means "walk everything": a base this
+    cannot prove is never guessed."""
+    if not remote:
+        return None
+    candidates: list[str] = []
+    rc, out, _err = git_try(repo, "symbolic-ref", "--quiet", "--short", f"refs/remotes/{remote}/HEAD")
+    if rc == 0 and out:
+        candidates.append(out)
+    candidates.extend(f"{remote}/{ref.rsplit('/', 1)[-1]}" for ref in PRE_PUSH_REFS)
+    candidates.extend((f"{remote}/master", f"{remote}/main"))
+    for cand in candidates:
+        rc, _out, _err = git_try(repo, "rev-parse", "--verify", "--quiet", f"refs/remotes/{cand}^{{commit}}")
+        if rc != 0:
+            continue
+        rc, base, _err = git_try(repo, "merge-base", f"refs/remotes/{cand}", local_sha)
+        if rc == 0 and base:
+            return base
+    return None
+
+
+def cmd_pre_push(repo: pathlib.Path, deny_terms: list[tuple[str, str]], remote: str = "") -> int:
     """git passes <remote> <url> as argv and ref lines on stdin: <local-ref> <local-sha> <remote-ref> <remote-sha>.
     Only a push to one of the config's `pre_push_refs` is judged; an unresolvable range refuses.
+    A push that creates the branch judges only the commits not on the remote's default branch
+    (`_remote_default_base`); with no such base it judges the whole history.
     This reads stdin to the end; the shell snippet install_pre_push writes spools it first and
     rebinds the hook's stdin afterwards, so the layers after the guard see the same bytes."""
     problems: list[str] = []
@@ -1861,7 +1975,11 @@ def cmd_pre_push(repo: pathlib.Path, deny_terms: list[tuple[str, str]]) -> int:
         _local_ref, local_sha, remote_ref, remote_sha = parts
         if remote_ref not in PRE_PUSH_REFS or set(local_sha) == {"0"}:
             continue
-        rng = f"{remote_sha}..{local_sha}" if set(remote_sha) != {"0"} else local_sha
+        if set(remote_sha) != {"0"}:
+            rng = f"{remote_sha}..{local_sha}"
+        else:  # a new branch: bound the walk to what is not already on the remote's default branch
+            base = _remote_default_base(repo, remote, local_sha)
+            rng = f"{base}..{local_sha}" if base else local_sha
         try:
             failures = check_commits(repo, rng, deny_terms)
         except Unknown as e:
@@ -1918,7 +2036,7 @@ def cmd_session_start(repo: pathlib.Path, ref: str, ledger: pathlib.Path) -> int
     start, so every failure here is printed and the exit status stays 0."""
     try:
         print(f"[doctrine-outbox] pre-push guard: {install_pre_push(repo)}")
-    except (GitError, OSError) as e:
+    except (GitError, OSError, Refusal) as e:
         print(f"[doctrine-outbox] pre-push guard: UNKNOWN ({e})")
     try:
         print(_debt_text(compute_debt(repo, ref, ledger), ref))
@@ -2104,11 +2222,20 @@ def main(argv: list[str] | None = None) -> int:
             rev_range = legacy[1] if len(legacy) > 1 else args.rev_range
             return cmd_check_commits(repo, rev_range, deny_terms)
         if args.cmd == "check":
-            max_age = int(legacy[1]) if len(legacy) > 1 else HOOK_CHECK_WINDOW_MIN
+            # was: max_age = int(legacy[1]) if len(legacy) > 1 else HOOK_CHECK_WINDOW_MIN  (a bad value was a traceback)
+            max_age = HOOK_CHECK_WINDOW_MIN
+            if len(legacy) > 1:
+                try:
+                    max_age = int(legacy[1])
+                except ValueError:
+                    print(f"[doctrine-outbox] usage: check [REPO [MAX_AGE_MIN]]; MAX_AGE_MIN must be a whole number of "
+                          f"minutes, got {legacy[1]!r}", file=sys.stderr)
+                    return 2
             bus = args.bus.resolve() if args.bus is not None else None
             return cmd_check(repo, args.ref, resolve_ledger(repo, args.ledger), bus, max_age)
         if args.cmd == "pre-push":
-            return cmd_pre_push(repo, gather_deny_terms(resolve_deny_file(repo, args.deny_file)))
+            remote = legacy[1] if len(legacy) > 1 else ""   # git's argv: <remote> <url>, after the repo the hook adds
+            return cmd_pre_push(repo, gather_deny_terms(resolve_deny_file(repo, args.deny_file)), remote)
         if args.cmd == "stop":
             rev_range = f"{args.ref}..HEAD" if args.ref else DEFAULT_RANGE
             return cmd_stop(repo, rev_range, gather_deny_terms(resolve_deny_file(repo, args.deny_file)))

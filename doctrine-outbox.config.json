@@ -1,6 +1,6 @@
 {
   "schema": "doctrine-outbox-config.v1",
-  "_comment": "MLV-App's values for the fleet doctrine outbox. Data only: tools/coordination/doctrine_outbox.py is the config-driven shared file offered as the candidate for the bus's tools/factory/doctrine_outbox.py (adoption is pending the bus steward, see the handoff card in doctrine-outbox/). Once the bus holds it, each project pins a reviewed bus SHA in factory-pins/factory-pins.json and runs it through factory-pins/pin-runner.py, keeping no copy. It is never edited here for a project value. The tool finds this file at the repo root (or via --config / $DOCTRINE_OUTBOX_CONFIG).",
+  "_comment": "MLV-App's values for the fleet doctrine outbox. Data only: tools/coordination/doctrine_outbox.py is the config-driven shared file offered as the candidate for the bus's tools/factory/doctrine_outbox.py (adoption is pending the bus steward, see the handoff card in doctrine-outbox/). Once the bus holds it, each project pins a reviewed bus SHA in factory-pins/factory-pins.json and runs it through factory-pins/pin-runner.py with --config, and keeps its local copy until the pin-aware release OUTBOX-PIN-AWARE-TOOL-AT-REF-1 (the installed hook and the debt checks still read tool_rel). It is never edited here for a project value. The tool finds this file at the repo root (or via --config / $DOCTRINE_OUTBOX_CONFIG).",
   "project": "mlv-app",
   "outbox_dir": "doctrine-outbox",
   "tool_rel": "tools/coordination/doctrine_outbox.py",
@@ -21,6 +21,6 @@
   ],
   "bus_candidate": {
     "bus_path": "tools/factory/doctrine_outbox.py",
-    "sha256_lf": "ad9bf2a66dc2918ab2abd359a45693165f75482af82717ee4cddbef1b42da0b5"
+    "sha256_lf": "4c841fba8f19e3b0fe2c1bc80df0c621d069baf9638547bdd5697afbd6678836"
   }
 }

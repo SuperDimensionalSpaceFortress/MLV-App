@@ -13,13 +13,19 @@ data in `doctrine-outbox.config.json` at the repo root. The bus steward is asked
 reference copy in `665b4566`). Sharing is by pin, not by copy (bus `tools/factory/README.md`: "A tool here is
 never copied into a project: the project pins it"): a project records a reviewed bus SHA with
 `python factory-pins/pin-runner.py pin doctrine-outbox --commit <bus-sha> --path tools/factory/doctrine_outbox.py
---reviewer <who> --reason <why>`, runs `python factory-pins/pin-runner.py run doctrine-outbox -- --config
-doctrine-outbox.config.json <command>`, and deletes its own copy. The digest of the candidate is recorded in that
+--reviewer <who> --reason <why>` and runs `python factory-pins/pin-runner.py run doctrine-outbox -- --config
+doctrine-outbox.config.json <command>`. It KEEPS its local copy until a pin-aware release (card
+OUTBOX-PIN-AWARE-TOOL-AT-REF-1): the hook `install-hooks` writes and the debt and drain checks still read
+`tool_rel`, so deleting the copy bricks the push guard. The digest of the candidate is recorded in that
 config's `bus_candidate` and checked by `tests/coordination/test_doctrine_outbox_hooks.py`. Change behaviour by
 changing the config; once the bus has the file, change the tool only there and re-pin. The same file also answers the hook
 commands `check`, `pre-push`, `stop`, `session-start` and `install-hooks`. `stop` judges the commits not
 yet on the remote (`default_range`, or `--ref R` for `R..HEAD`); `pre-push` hands git's stdin on to the
-layers after it (`git lfs pre-push`); `install-hooks` leaves the hook executable. A config that is
+layers after it (`git lfs pre-push`); `install-hooks` leaves the hook executable and splices the guard right
+after the shebang and any `set -e` lines, so a hook that ends in `exit 0` or `exec <next hook>` still runs it
+(a guard already sitting behind a top-level `exit`/`exec` is refused as `HOOK_GUARD_UNREACHABLE`, never reported
+as present). A push that creates a branch judges only the commits not on the remote's default branch. `check`
+takes a whole number of minutes; anything else is a usage error (exit 2). A config that is
 present but invalid is `CONFIG_INVALID` (exit 1, naming the key), distinct from `CONFIG_ABSENT` (exit 2).
 
 **Derive state; this file holds none.** Every value below is a command.
