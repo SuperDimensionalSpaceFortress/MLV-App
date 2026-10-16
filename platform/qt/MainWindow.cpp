@@ -15,6 +15,7 @@
 #include "../../src/batch/ReceiptApplier.h"
 #include "DualIsoLevelSyncPolicy.h"
 #include "PlaybackFpsMeterPolicy.h"
+#include "PlaybackScaleLabel.h"
 #include "AutomationSettings.h"
 #include "PlaybackEnvFlags.h"
 #include "PlaybackFrameRange.h"
@@ -6719,7 +6720,7 @@ void MainWindow::drawFrame( bool updateTimecodeLabel )
             !displayShaderRefusedStages.isEmpty()
                 ? gpuPreviewProcessingDisplayShaderRefusalReason( displayShaderRefusedStages )
                   + QStringLiteral(": the live display shader does not apply these stages, so GPU playback recon texture-present is refused and playback stays on a route that applies them")
-                : QStringLiteral("GPU playback recon texture-present requires an experimental GL presentation surface, GPU preview processing support, scopes hidden, MLVAPP_GPU_PLAYBACK_RECON=1, Decode/Reconstruct/Process playback mode, x1 scale, and caching off");
+                : QStringLiteral("GPU playback recon texture-present requires an experimental GL presentation surface, GPU preview processing support, scopes hidden, MLVAPP_GPU_PLAYBACK_RECON=1, Decode/Reconstruct/Process playback mode, Full res (1x) playback, and caching off");
     }
     requestContext.renderThreadUsingCpuPreviewProcessing = m_renderThreadUsingCpuPreviewProcessing;
     requestContext.renderThreadUsingPlaybackPreviewProcessing =
@@ -11599,7 +11600,7 @@ void MainWindow::showPerformanceProfilingDialog( void )
     cudaPlaybackPreset->setChecked(
         CrashForensics::cudaPlaybackProfilingSettingsEnabled() );
     cudaPlaybackPreset->setToolTip(
-        tr( "Requests the scoped GPU Tex NR telemetry path: GL viewport, GPU preview processing, CUDA playback reconstruction, texture presentation, Phase 3 HQ, and x1 scale." ) );
+        tr( "Requests the scoped GPU Tex NR telemetry path: GL viewport, GPU preview processing, CUDA playback reconstruction, texture presentation, Phase 3 HQ, and Full res (1x) playback." ) );
     presetLayout->addWidget( cudaPlaybackPreset );
 
     QCheckBox * dngAsyncPreset =
@@ -12039,7 +12040,7 @@ void MainWindow::initGui( void )
         pPreviewResSub->addAction( ui->actionPlaybackPreviewResHalf );
         pPreviewResSub->addAction( ui->actionPlaybackPreviewResQuarter );
         m_pPlaybackQualityToolButtonMenu->addMenu( pPreviewResSub );
-        QMenu *pScaleFactorSub = new QMenu( tr( "Scale Factor" ),
+        QMenu *pScaleFactorSub = new QMenu( tr( "Playback Resolution" ),
                                             m_pPlaybackQualityToolButtonMenu );
         pScaleFactorSub->addAction( ui->actionPlaybackScaleAuto );
         pScaleFactorSub->addAction( ui->actionPlaybackScale1 );
@@ -12077,7 +12078,7 @@ void MainWindow::initGui( void )
         m_pPlaybackQualityToolButton->setText( tr( "Playback: Smooth ▾" ) );
         m_pPlaybackQualityToolButton->setToolTip(
             tr( "Playback Mode: choose Auto, Prioritize Quality, Prioritize Smoothness, "
-                "sharp/aggressive preview mode, and x1/x2/x4/x8 playback scale. "
+                "sharp/aggressive preview mode, and Full/Half/Quarter res playback resolution. "
                 "The status suffix reports the presented pipeline: CPU, GPU RB, "
                 "GPU Tex RB, or GPU Tex NR.\n"
                 "Keyboard shortcut: Q" ) );
@@ -21987,9 +21988,10 @@ void MainWindow::updatePlaybackQualityIndicator( void )
          && m_lastPresentedRequestContext.playbackScaleFactor == requestedScale;
         if( activeScaleValid && sameRequest && activeScale != requestedScale )
         {
-            return tr( "x%1->x%2" ).arg( requestedScale ).arg( activeScale );
+            return tr( "%1->%2" ).arg( PlaybackScaleLabel::shortLabel( requestedScale ),
+                                       PlaybackScaleLabel::shortLabel( activeScale ) );
         }
-        return tr( "x%1" ).arg( requestedScale );
+        return PlaybackScaleLabel::shortLabel( requestedScale );
     };
 
     QString text;
@@ -22126,7 +22128,7 @@ void MainWindow::updatePlaybackQualityIndicator( void )
             "per-frame CPU readback." );
     QString toolButtonTooltip =
         tr( "Playback Mode: choose Auto, Prioritize Quality, Prioritize Smoothness, "
-            "sharp/aggressive preview mode, and x1/x2/x4/x8 playback scale. "
+            "sharp/aggressive preview mode, and Full/Half/Quarter res playback resolution. "
             "The status suffix reports the presented pipeline: CPU, GPU Preview, "
             "GPU RB, GPU Tex RB, or scoped GPU Tex NR.\n"
             "Keyboard shortcut: Q" );
@@ -22315,9 +22317,9 @@ int MainWindow::effectivePlaybackScaleFactorForRequest( void ) const
         {
             m_gpuReducedReconSessionReason =
                 requestedScale == 1
-                    ? QStringLiteral("preview scale 1 (full resolution)")
-                    : QStringLiteral("x%1 stays on the full-resolution texture route")
-                          .arg( requestedScale );
+                    ? PlaybackScaleLabel::resolutionLabel( 1 ) + QStringLiteral(" preview")
+                    : QStringLiteral("%1 stays on the full-resolution texture route")
+                          .arg( PlaybackScaleLabel::resolutionLabel( requestedScale ) );
         }
         else if( playbackGpuNoReadbackOutputValidationEnabled() )
         {

@@ -928,12 +928,12 @@ static int runPlaybackProfile(QApplication &app)
 
     const QCommandLineOption exerciseScaleFactorToggleOpt(
         QStringLiteral("exercise-scale-toggle"),
-        QStringLiteral("Render at a playback scale, switch to x1 on the loaded clip, and verify the settled frame updates safely."));
+        QStringLiteral("Render at a reduced playback resolution, switch to Full res (1x) on the loaded clip, and verify the settled frame updates safely."));
     parser.addOption(exerciseScaleFactorToggleOpt);
 
     const QCommandLineOption exerciseScaleFactorToggleFromOpt(
         QStringLiteral("exercise-scale-toggle-from"),
-        QStringLiteral("Starting playback scale for --exercise-scale-toggle. Supported values: 2, 4, or 8."),
+        QStringLiteral("Starting playback scale factor for --exercise-scale-toggle (2 = Half res, 4 = Quarter res, 8 = 1/8 res). Supported values: 2, 4, or 8."),
         QStringLiteral("scale"),
         QStringLiteral("2"));
     parser.addOption(exerciseScaleFactorToggleFromOpt);
