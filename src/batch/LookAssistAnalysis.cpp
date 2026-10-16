@@ -1628,6 +1628,17 @@ QString lookAssistFlavorName( LookAssistFlavor flavor )
     return flavor == LookAssistFlavor::Cinematic ? QStringLiteral("cinematic") : QStringLiteral("classic");
 }
 
+const std::vector<LookAssistFlavor> &lookAssistFlavors()
+{
+    static const std::vector<LookAssistFlavor> flavors = {
+        LookAssistFlavor::Classic,
+        LookAssistFlavor::Cinematic,
+        LookAssistFlavor::Film,
+        LookAssistFlavor::Vision50d,
+    };
+    return flavors;
+}
+
 QString lookAssistFlavorEnvironmentValue()
 {
     return qEnvironmentVariable( "MLVAPP_LOOK_ASSIST_FLAVOR" );
@@ -1649,15 +1660,15 @@ LookAssistFlavorSelection lookAssistSelectFlavor( const QString &environmentValu
         const QString value = layer.value->trimmed().toLower();
         if( value.isEmpty() ) continue;
         selection.source = QLatin1String( layer.source );
-        if( value == QLatin1String( "classic" ) )
-            selection.flavor = LookAssistFlavor::Classic;
-        else if( value == QLatin1String( "cinematic" ) )
-            selection.flavor = LookAssistFlavor::Cinematic;
-        else if( value == QLatin1String( "film" ) )
-            selection.flavor = LookAssistFlavor::Film;
-        else if( value == QLatin1String( "vision50d" ) )
-            selection.flavor = LookAssistFlavor::Vision50d;
-        else
+        bool known = false;
+        for( const LookAssistFlavor flavor : lookAssistFlavors() )
+        {
+            if( value != lookAssistFlavorName( flavor ) ) continue;
+            selection.flavor = flavor;
+            known = true;
+            break;
+        }
+        if( !known )
         {
             selection.flavor = LookAssistFlavor::Classic;
             selection.unknownValue = true;

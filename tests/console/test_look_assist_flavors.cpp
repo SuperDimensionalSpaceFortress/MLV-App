@@ -537,7 +537,8 @@ TEST(LookAssistFlavors, EveryReceiptStampAndEveryAnalysisOutcomeGoesThroughTheHo
     // The outcome is recorded at the sync result, the sync fallback, and both async sites -- the same call the
     // venue telemetry reads -- and it starts empty each analysis.
     ASSERT_EQ( 1, window.count( QStringLiteral("m_lookAssistFlavorOutcome.begin();") ) );
-    ASSERT_EQ( 5, window.count( QStringLiteral("m_lookAssistFlavorOutcome.landed(") ) );   // sync x2, async x3
+    // sync x2, async x3, and LOOK-PRESET-DROPDOWN-1's flavor relay x1 (a flavor laid over a landed analysis)
+    ASSERT_EQ( 6, window.count( QStringLiteral("m_lookAssistFlavorOutcome.landed(") ) );
     ASSERT_TRUE( window.contains( QStringLiteral("m_lookAssistFlavorOutcome.landed( receipt, lookAssistFlavorName( flavor ), true );") ) );
     ASSERT_TRUE( window.contains( QStringLiteral("m_lookAssistFlavorOutcome.landed( receipt, lookAssistFlavorName( flavor ), false );") ) );
     ASSERT_TRUE( window.contains( QStringLiteral("m_lookAssistFlavorOutcome.appliedName()") ) );

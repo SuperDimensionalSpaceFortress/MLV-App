@@ -72,6 +72,7 @@ class MainWindow;
 }
 
 class QAction;
+class QComboBox;
 class QElapsedTimer;
 class QScreen;
 
@@ -408,6 +409,7 @@ private slots:
     void on_actionPlaybackPreviewResQuarter_triggered();
     void on_actionPlaybackShowQualityIndicator_triggered();
     void on_actionPlaybackVSync_triggered();
+    void on_actionShowLookLabelInFullscreen_triggered();
     void on_actionPlaybackScopesHide_triggered();
     void on_actionPlaybackScopesThrottled_triggered();
     void on_actionPlaybackScopesLive_triggered();
@@ -832,6 +834,13 @@ private:
     QTime m_lastPlaybackFpsStatusUpdateTime;
     QLabel *m_pFrameNumber;
     QLabel *m_pChosenDebayer;
+    // LOOK-PRESET-DROPDOWN-1: the current look, windowed -- "Look:" and a dropdown that both shows and picks it
+    // (it replaces LOOK-FULLSCREEN-PARITY-1's windowed status-bar label).
+    QLabel *m_pLookPresetCaption = nullptr;
+    QComboBox *m_pLookPresetDropdown = nullptr;
+    QString m_lookLabelText;                // the text the look label shows (updateLookLabel)
+    bool m_lookLabelFullscreenShown = false;
+    bool m_lookLabelShowInFullscreen = true; // the persisted "Show Look Label in Fullscreen" setting
     QLabel *m_pPlaybackQualityIndicator = nullptr; // Phase 4E
     // Phase 4F-toolbar: Playback Quality dropdown on the main toolbar. The
     // button is a second view onto the same Playback Quality QActions used
@@ -952,6 +961,17 @@ private:
     bool m_lastLookAssistDiagnosticsValid = false;
     QString m_lastWarnedLookAssistFlavorValue;
     lookassist::LookAssistFlavorOutcome m_lookAssistFlavorOutcome;   // how the last analysis ended: telemetry and setReceipt read it
+    // LOOK-PRESET-DROPDOWN-1: what the last sync analysis that LANDED decided before any flavor was laid (its scene and its
+    // final Classic preset, balance included). A flavor is only tone deltas and a grade curve over exactly this, so another
+    // flavor can be laid without analysing again (relayLookAssistFlavor). Valid for `receipt` only; cleared when an
+    // analysis starts, falls back to the baseline, or Look Assist goes off.
+    struct LookAssistFlavorRelay
+    {
+        const void *receipt = nullptr;
+        lookassist::LookAssistScene scene = lookassist::LookAssistScene::Night;
+        lookassist::LookAssistPreset classicPreset;
+    };
+    LookAssistFlavorRelay m_lookAssistFlavorRelay;
     QString m_lastLookAssistScene;
     double m_lastLookAssistMedian = 0.0;
     double m_lastLookAssistP05 = 0.0;
@@ -1899,6 +1919,19 @@ private:
                                    int analysisFrame = -1 );
     void syncLookAssistDerivedUiToReceipt( ReceiptSettings *receipt );
     lookassist::LookAssistFlavor currentLookAssistFlavor();
+    bool relayLookAssistFlavor( ReceiptSettings *receipt, lookassist::LookAssistFlavor flavor );
+    // LOOK-FULLSCREEN-PARITY-1: re-derives the look label from the state the grade uses (Look Assist
+    // on, the flavor in force) and pushes it to the status bar and, in fullscreen, to the preview
+    // surface's corner. Does nothing when neither the text nor where it shows changed.
+    void updateLookLabel( void );
+    // The look label text actually on screen now, and where ("fullscreen_gpu_window",
+    // "fullscreen_cpu_viewport", "windowed_status_bar" or "none"): the receipt's lookLabelShown.
+    QString lookLabelShownText( QString *surface );
+    // LOOK-PRESET-DROPDOWN-1: shows the state in the windowed dropdown (signals blocked; never writes the grade),
+    // and applies a user's pick through the same paths as the Look Assist checkbox and flavor selector.
+    void syncLookPresetDropdown( bool lookOn, const QString &flavorName );
+    void onLookPresetDropdownActivated( int index );
+    bool selectLookPreset( const QString &key, const char *source );
     void setGradientMask( void );
     uint16_t autoCorrectRawBlackLevel( void );
     uint16_t autoCorrectRawWhiteLevel( void );

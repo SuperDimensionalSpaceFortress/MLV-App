@@ -202,6 +202,8 @@ SOURCES += \
     GpuDebayer.cpp \
     GpuDisplayViewport.cpp \
     GpuDisplayWindow.cpp \
+    LookLabelOverlay.cpp \
+    LookPresetDropdown.cpp \
     GpuFieldTelemetry.cpp \
         main.cpp \
         MainWindow.cpp \
@@ -390,6 +392,10 @@ HEADERS += MainWindow.h \
            PlaybackWorkerJoin.h \
            PlaybackPresentTrace.h \
            PlaybackSwapInterval.h \
+           LookLabelPolicy.h \
+           LookLabelOverlay.h \
+           LookPresetDropdownPolicy.h \
+           LookPresetDropdown.h \
            PlaybackScopesDuringPlayback.h \
            DisplayDeviceMapping.h \
            PlaybackGatePolicy.h \

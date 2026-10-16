@@ -432,7 +432,13 @@ param(
     # honoured only in an automation run such as this smoke). A scope leg on a Hide-default build must ask, or it measures Hide.
     # '' (the default) sets nothing: the emitted job is the text it was before this parameter.
     [ValidateSet('', 'hide', 'throttled', 'live')]
-    [string]$ScopesDuringPlayback = ''
+    [string]$ScopesDuringPlayback = '',
+
+    # LOOK-PRESET-DROPDOWN-1: the look the app picks through its windowed look dropdown in the untimed visual-capture tail,
+    # with Play running (MLVAPP_SMOKE_LOOK_PRESET_SWITCH), so the window captures show the look before and after the pick.
+    # '' (the default) sets nothing: the emitted job is the text it was before this parameter.
+    [ValidateSet('', 'off', 'classic', 'cinematic', 'film', 'vision50d')]
+    [string]$LookPresetSwitch = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -4560,6 +4566,16 @@ if (-not [string]::IsNullOrEmpty($ScopesDuringPlayback)) {
     $text = $scopesModeAnchor.Replace($text, [System.Text.RegularExpressions.MatchEvaluator]{
         param($m)
         $m.Value + $m.Groups['ind'].Value + "'MLVAPP_PLAYBACK_SCOPES_DURING_PLAYBACK=$ScopesDuringPlayback'," + $m.Groups['nl'].Value
+    })
+}
+
+# LOOK-PRESET-DROPDOWN-1: the same env-list site gains the visual-capture tail's look pick, only when asked.
+if (-not [string]::IsNullOrEmpty($LookPresetSwitch)) {
+    $lookPresetAnchor = [regex]"(?<ind>[ \t]*)'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',(?<nl>\r?\n)"
+    if ($lookPresetAnchor.Matches($text).Count -ne 1) { throw 'DUAL_VENUE_LOOK_PRESET_ANCHOR_MISSING the job template has no single env-list site to add MLVAPP_SMOKE_LOOK_PRESET_SWITCH to' }
+    $text = $lookPresetAnchor.Replace($text, [System.Text.RegularExpressions.MatchEvaluator]{
+        param($m)
+        $m.Value + $m.Groups['ind'].Value + "'MLVAPP_SMOKE_LOOK_PRESET_SWITCH=$LookPresetSwitch'," + $m.Groups['nl'].Value
     })
 }
 

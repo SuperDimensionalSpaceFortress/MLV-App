@@ -1579,6 +1579,9 @@ static bool lookAssistProcessedFloorLiftedPostInvalidShouldFailClosed(
 #include "PlaybackQualityPolicy.h"
 #include "PlaybackScaling.h"
 #include "PlaybackSwapInterval.h"
+#include "LookLabelPolicy.h"
+#include "LookPresetDropdown.h"
+#include "LookPresetDropdownPolicy.h"
 #include "ZebraThresholds.h"
 #include "batch/WorkerThreadCount.h"
 #include "ExportSettingsDialog.h"
@@ -8794,6 +8797,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         m_lastLookAssistDiagnosticsValid = false;
         m_lookAssistApplied.clear();
         m_lookAssistFlavorOutcome.clear();
+        updateLookLabel();
     };
 
     m_gpuPreviewProcessingBackendRequest = options.gpuPreviewProcessingBackend;
@@ -9464,6 +9468,56 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
     {
         return logFullscreenSmokeFailure(
             windowedSmoke ? "windowed_placement_not_verified" : "fullscreen_not_verified" );
+    }
+
+    // LOOK-FULLSCREEN-PARITY-1: the look label the screen actually shows (the receipt's lookLabelShown), read back
+    // from the surface that drew it -- not the text it was asked to draw. Bounded wait for the first paint after the
+    // placement above, before the timed Play.
+    {
+        updateLookLabel();
+        QString lookLabelSurface;
+        QString lookLabelShown = lookLabelShownText( &lookLabelSurface );
+        QElapsedTimer lookLabelClock;
+        lookLabelClock.start();
+        while( lookLabelShown != m_lookLabelText && lookLabelSurface != QStringLiteral("none")
+               && lookLabelClock.elapsed() < 1000 )
+        {
+            qApp->processEvents( QEventLoop::AllEvents );
+            QThread::msleep( 5 );
+            lookLabelShown = lookLabelShownText( &lookLabelSurface );
+        }
+        qInfo().noquote()
+            << QStringLiteral( "gui_smoke.look_label shown=\"%1\" expected=\"%2\" surface=%3 show_in_fullscreen=%4 wait_ms=%5" )
+                   .arg( lookLabelShown )
+                   .arg( m_lookLabelText )
+                   .arg( lookLabelSurface )
+                   .arg( bool01( m_lookLabelShowInFullscreen ) )
+                   .arg( lookLabelClock.elapsed() );
+        // LOOK-PRESET-DROPDOWN-1: the windowed dropdown at this venue's real font and scaling -- its text field against
+        // the widest look name, so a capture's "no cropping" is backed by numbers too.
+        if( m_pLookPresetDropdown )
+        {
+            int widestText = 0;
+            QString widestName;
+            for( int i = 0; i < m_pLookPresetDropdown->count(); ++i )
+            {
+                const int advance = look_preset_dropdown::textAdvance( m_pLookPresetDropdown, m_pLookPresetDropdown->itemText( i ) );
+                if( advance > widestText ) { widestText = advance; widestName = m_pLookPresetDropdown->itemText( i ); }
+            }
+            const int textField = look_preset_dropdown::closedTextFieldWidth( m_pLookPresetDropdown );
+            qInfo().noquote()
+                << QStringLiteral( "gui_smoke.look_preset_dropdown visible=%1 enabled=%2 entries=%3 current=\"%4\" width=%5 text_field=%6 widest_text=%7 widest=\"%8\" fits=%9 dpr=%10" )
+                       .arg( bool01( m_pLookPresetDropdown->isVisible() ) )
+                       .arg( bool01( m_pLookPresetDropdown->isEnabled() ) )
+                       .arg( m_pLookPresetDropdown->count() )
+                       .arg( m_pLookPresetDropdown->currentText() )
+                       .arg( m_pLookPresetDropdown->width() )
+                       .arg( textField )
+                       .arg( widestText )
+                       .arg( widestName )
+                       .arg( bool01( textField >= widestText ) )
+                       .arg( m_pLookPresetDropdown->devicePixelRatioF(), 0, 'f', 2 );
+        }
     }
 
     const qint64 preambleMs = preambleClock.elapsed();
@@ -10235,6 +10289,8 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
             bool playActive = false;
             bool settled = false;
             double captureMs = 0.0;
+            QString lookShown;      // LOOK-PRESET-DROPDOWN-1: the look the window's look control showed at the grab
+            QString lookExpected;   // ... and the look in force (m_lookLabelText)
         };
         QVector<VisualGrab> visualGrabs;
         QWidget *visualGlContainer = findChild<QWidget *>( QStringLiteral("gpuDisplayWindowContainer") );
@@ -10260,8 +10316,17 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
             grab.image = captureTopLevelWindowByPrintWindow( this, visualViewportWidget, &grab.viewport, &grab.reason );
             grab.captureMs = static_cast<double>( captureClock.nsecsElapsed() ) / 1.0e6;
             grab.capturedUtc = QDateTime::currentDateTimeUtc().toString( Qt::ISODateWithMs );
+            grab.lookShown = lookLabelShownText( nullptr );
+            grab.lookExpected = m_lookLabelText;
             visualGrabs.append( grab );
         };
+        // LOOK-PRESET-DROPDOWN-1 (MLVAPP_SMOKE_LOOK_PRESET_SWITCH=<off|classic|cinematic|film|vision50d>, default unset): the
+        // look is picked through the windowed dropdown's own path after the second play grab, with Play running, so the
+        // first grabs show the look before and the later ones the look after -- the same Play, never stopped. The measured
+        // session is already closed, so the switch cannot touch an oracle number.
+        const QString lookPresetSwitchKey =
+            qEnvironmentVariable( "MLVAPP_SMOKE_LOOK_PRESET_SWITCH" ).trimmed().toLower();
+        QJsonObject lookPresetSwitchJson;
 
         // (1) the measured interval ends HERE, before the first capture.
         m_contactSheetCaptureActive = false;   // no in-pass contact-sheet grab can land in the tail
@@ -10284,6 +10349,34 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                 QThread::msleep( 2 );
             }
             grabVisual( QStringLiteral("play"), k, false );
+            if( k == 1 && !lookPresetSwitchKey.isEmpty() )
+            {
+                const QString lookBefore = m_lookLabelText;
+                const int frameBefore = m_lastPresentedRequestContextValid
+                    ? static_cast<int>( m_lastPresentedRequestContext.frameNumber ) : -1;
+                const qint64 switchAtMs = visualTailClock.elapsed();
+                const bool switched = selectLookPreset( lookPresetSwitchKey, "smoke" );
+                lookPresetSwitchJson.insert( QStringLiteral("key"), lookPresetSwitchKey );
+                lookPresetSwitchJson.insert( QStringLiteral("accepted"), switched );
+                lookPresetSwitchJson.insert( QStringLiteral("after_play_grab"), k );
+                lookPresetSwitchJson.insert( QStringLiteral("tail_elapsed_ms"), static_cast<double>( switchAtMs ) );
+                lookPresetSwitchJson.insert( QStringLiteral("call_ms"), static_cast<double>( visualTailClock.elapsed() - switchAtMs ) );
+                lookPresetSwitchJson.insert( QStringLiteral("look_before"), lookBefore );
+                lookPresetSwitchJson.insert( QStringLiteral("look_requested"), m_lookLabelText );
+                lookPresetSwitchJson.insert( QStringLiteral("display_frame_before"), frameBefore );
+                lookPresetSwitchJson.insert( QStringLiteral("play_active_after"), ui->actionPlay->isChecked() );
+                logInteractionEvent(
+                    QStringLiteral("gui_smoke.look_preset_switch"),
+                    QStringLiteral("key=%1 accepted=%2 look_before=\"%3\" look_requested=\"%4\" frame_before=%5 tail_ms=%6 call_ms=%7 play_active_after=%8")
+                        .arg( lookPresetSwitchKey )
+                        .arg( bool01( switched ) )
+                        .arg( lookBefore )
+                        .arg( m_lookLabelText )
+                        .arg( frameBefore )
+                        .arg( switchAtMs )
+                        .arg( visualTailClock.elapsed() - switchAtMs )
+                        .arg( bool01( ui->actionPlay->isChecked() ) ) );
+            }
         }
         // The frame on screen the instant Play is paused: captured BEFORE any event is processed, so it
         // is still the frame the playback path presented (the paused re-render has not landed yet).
@@ -10333,6 +10426,8 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
             frameJson.insert( QStringLiteral("serial"), static_cast<double>( grab.serial ) );
             frameJson.insert( QStringLiteral("play_active"), grab.playActive );
             frameJson.insert( QStringLiteral("capture_ms"), grab.captureMs );
+            frameJson.insert( QStringLiteral("look_shown"), grab.lookShown );
+            frameJson.insert( QStringLiteral("look_expected"), grab.lookExpected );
             if( grab.kind == QStringLiteral("paused") )
             {
                 frameJson.insert( QStringLiteral("settled"), grab.settled );
@@ -10383,6 +10478,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         visualJson.insert( QStringLiteral("viewport_source"), visualUseGlContainer
             ? QStringLiteral("gpu_display_window_container") : QStringLiteral("graphics_view_viewport") );
         visualJson.insert( QStringLiteral("frames"), visualFramesJson );
+        if( !lookPresetSwitchJson.isEmpty() ) visualJson.insert( QStringLiteral("look_preset_switch"), lookPresetSwitchJson );
         visualJson.insert( QStringLiteral("frames_written"), visualFramesWritten );
         visualJson.insert( QStringLiteral("error"), visualError );
         if( QDir( options.visualCaptureDir ).exists() )
@@ -11985,6 +12081,25 @@ void MainWindow::initGui( void )
     m_pChosenDebayer->setText( tr( "AMaZE" ) );
     m_pChosenDebayer->setToolTip( tr( "Current debayer algorithm." ) );
     statusBar()->addWidget( m_pChosenDebayer );
+
+    //LOOK-FULLSCREEN-PARITY-1: the current look, windowed (fullscreen draws it in the preview's corner).
+    //LOOK-PRESET-DROPDOWN-1: shown AND picked here -- "Look:" and a dropdown of Off plus every registry flavor, sized
+    //so no name is cropped. It replaces the parity lane's windowed status-bar label: one control, not two.
+    m_pLookPresetCaption = new QLabel( tr( "Look:" ), statusBar() );
+    m_pLookPresetCaption->setObjectName( QStringLiteral( "lookPresetCaption" ) );
+    statusBar()->addWidget( m_pLookPresetCaption );
+    m_pLookPresetDropdown = new QComboBox( statusBar() );
+    m_pLookPresetDropdown->setObjectName( QStringLiteral( "lookPresetDropdown" ) );
+    m_pLookPresetDropdown->setToolTip( tr( "Current Look Assist look. Pick another to change it now, also during playback." ) );
+    m_pLookPresetDropdown->setFocusPolicy( Qt::NoFocus );   // playback keys stay with the window
+    look_preset_dropdown::populate( m_pLookPresetDropdown );
+    m_pLookPresetDropdown->setEnabled( false );   // no clip yet
+    statusBar()->addWidget( m_pLookPresetDropdown );
+    connect( m_pLookPresetDropdown, QOverload<int>::of( &QComboBox::activated ),
+             this, &MainWindow::onLookPresetDropdownActivated );
+    m_lookLabelText = look_label::text( false, QString() );
+    // Every way the checkbox changes without a click handler (a receipt, closing the clip) still updates the label.
+    connect( ui->checkBoxLookAssistEnable, &QCheckBox::toggled, this, [this]( bool ) { updateLookLabel(); } );
 
     //Phase 4E: Set up playback-quality status indicator. Tooltip-described
     //and toggleable via the Playback menu.
@@ -15833,6 +15948,7 @@ void MainWindow::setSliders(ReceiptSettings *receipt, bool paste)
                 ui->comboBoxLookAssistFlavor->setCurrentIndex( flavorIndex );
             }
         }
+        updateLookLabel();   // both signals were blocked above
         logInteractionEvent(
             QStringLiteral("look_assist.setSliders.begin"),
             QStringLiteral("enabled=%1 file_loaded=%2 baseline_valid=%3 receipt_exp=%4 receipt_contrast=%5 receipt_pivot=%6 receipt_temp=%7 receipt_tint=%8 raw_black=%9 raw_white=%10 frame=%11")
@@ -16524,6 +16640,7 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
         &stats, s_lookAssistMasterScenePass ? LookAssistRenderFn() : LookAssistRenderFn( renderProcessed ) );
     const LookAssistFlavor flavor = currentLookAssistFlavor();
     m_lookAssistFlavorOutcome.begin();   // reported (telemetry, receipt) only once this analysis lands
+    m_lookAssistFlavorRelay = LookAssistFlavorRelay();   // and no flavor is re-laid over an analysis that has not landed
     // Observation only: how the verdict and balance were reached, appended to look_assist.apply.result.
     LookAssistDecisionTrace decisionTrace;
     decisionTrace.pictureEvidenceAsked = !s_lookAssistMasterScenePass;
@@ -17318,6 +17435,7 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
     // the same function the preset itself ends in): the balance is the Classic one by construction, here as headless.
     const LookAssistFlavor flavorForTheWalk = LookAssistFlavor::Classic;
     bool flavorLaidOver = false;
+    LookAssistPreset presetBeforeFlavor;   // LOOK-PRESET-DROPDOWN-1: the final Classic preset, for m_lookAssistFlavorRelay
     // Film's colour grade (the R/B split curves), laid with the tone overlay below; "none" for Classic and Cinematic.
     QString filmGrade = QStringLiteral("none");
     LookAssistPreset preset = presetForLookAssistScene(
@@ -17846,6 +17964,7 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
         {
             // The balance is final. Lay the flavor over it and measure the picture the user will actually see once,
             // for the diagnostics and the safety guard only: no balance step follows this measurement.
+            presetBeforeFlavor = preset;
             lookAssistApplyFlavorDeltas( &preset, scene, flavor );
             filmGrade = applyLookAssistFilmGrade( receipt, scene, flavor );
             applyLookAssistValues();
@@ -17863,10 +17982,12 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
     if( flavor != LookAssistFlavor::Classic && !flavorLaidOver )
     {
         // No picture analysis to run (no processed colour): the same overlay, nothing to re-measure.
+        presetBeforeFlavor = preset;
         lookAssistApplyFlavorDeltas( &preset, scene, flavor );
         filmGrade = applyLookAssistFilmGrade( receipt, scene, flavor );
         applyLookAssistValues();
     }
+    if( flavor == LookAssistFlavor::Classic ) presetBeforeFlavor = preset;
 
     // [PICTURE-DUMP] env-gated, read-only evidence (MLVAPP_LOOK_ASSIST_PICTURE_DUMP=<dir>): the picture
     // the app itself renders (live processing, analysis thumbnail) at the look just applied, so a
@@ -18140,6 +18261,9 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
 
     m_lookAssistFlavorOutcome.landed( receipt, lookAssistFlavorName( flavor ), false );
     receipt->setLookAssistFlavor( lookAssistFlavorName( flavor ) );
+    m_lookAssistFlavorRelay.receipt = receipt;   // LOOK-PRESET-DROPDOWN-1: landed, so another flavor can be laid over it
+    m_lookAssistFlavorRelay.scene = scene;
+    m_lookAssistFlavorRelay.classicPreset = presetBeforeFlavor;
     // grade= is appended after flavor=, and only for Film and Vision50d, so a Classic or Cinematic line stays byte-identical.
     // No '%' in it.
     const QString filmGradeLogTail = lookAssistFlavorLaysGradationCurve( flavor ) ? QStringLiteral(" grade=") + filmGrade : QString();
@@ -21347,6 +21471,10 @@ void MainWindow::initPlaybackQualityFromSettings( void )
         ui->actionPlaybackShowQualityIndicator->setChecked( indicatorVisible );
     if ( ui->actionPlaybackVSync )
         ui->actionPlaybackVSync->setChecked( playbackVSyncFromSettings() );
+    m_lookLabelShowInFullscreen = look_label::showInFullscreenFromSettings();
+    if ( ui->actionShowLookLabelInFullscreen )
+        ui->actionShowLookLabelInFullscreen->setChecked( m_lookLabelShowInFullscreen );
+    updateLookLabel();
     applyPlaybackScopesMode( playbackScopesMode(), /*persist*/false );
     updatePhase3PlaybackQualityUi();
 
@@ -22505,6 +22633,14 @@ void MainWindow::on_actionPlaybackShowQualityIndicator_triggered()
 void MainWindow::on_actionPlaybackVSync_triggered()
 {
     playbackVSyncWriteToSettings( ui->actionPlaybackVSync->isChecked() );
+}
+
+// LOOK-FULLSCREEN-PARITY-1: "Show Look Label in Fullscreen". Applies at once and persists.
+void MainWindow::on_actionShowLookLabelInFullscreen_triggered()
+{
+    m_lookLabelShowInFullscreen = ui->actionShowLookLabelInFullscreen->isChecked();
+    look_label::showInFullscreenWriteToSettings( m_lookLabelShowInFullscreen );
+    updateLookLabel();
 }
 
 // PLAYBACK-SCOPES-OPTION-1: "Scopes During Playback". Applies at once (the next presented frame and
@@ -24001,6 +24137,7 @@ void MainWindow::on_actionFullscreen_triggered( bool checked )
         ui->actionShowSessionArea->setEnabled( true );
         ui->actionShowAudioTrack->setEnabled( true );
     }
+    updateLookLabel();
     qApp->processEvents();
     m_frameChanged = true;
 }
@@ -30121,10 +30258,213 @@ LookAssistFlavor MainWindow::currentLookAssistFlavor()
     return selection.flavor;
 }
 
+// LOOK-PRESET-DROPDOWN-1. Owner, 2026-10-15: "... have it change on the fly". Lays `flavor` over the last landed analysis
+// of this clip instead of analysing again: the scene verdict and the balance are flavor-blind (the walk runs on the Classic
+// preset and the flavor is laid afterwards), so the result is the analysis's own Classic preset plus the flavor's tone
+// deltas and grade curve -- exactly what that analysis lays for `flavor` at its overlay step. Exposure, temperature and
+// tint are not flavor sliders and stay. No picture is rendered here, so a pick during Play costs no GUI-thread stall
+// (the full analysis took ~4.5 s on a night clip, LOOK-PRESET-DROPDOWN-1 r2 venue). Not re-run: the post-apply colour-cast
+// guard, which judged the analysed flavor. False (the caller analyses again) when there is nothing landed to lay over.
+bool MainWindow::relayLookAssistFlavor( ReceiptSettings *receipt, LookAssistFlavor flavor )
+{
+    if( !receipt || m_lookAssistFlavorRelay.receipt != receipt || !m_lookAssistApplied.isApplied( receipt )
+     || !receipt->lookAssistEnabled() || !ui->checkBoxLookAssistEnable->isChecked() )
+    {
+        return false;
+    }
+    const LookAssistScene scene = m_lookAssistFlavorRelay.scene;
+    LookAssistPreset preset = m_lookAssistFlavorRelay.classicPreset;
+    lookAssistApplyFlavorDeltas( &preset, scene, flavor );
+    receipt->setContrast( preset.contrast );
+    receipt->setPivot( preset.pivot );
+    receipt->setVibrance( preset.vibrance );
+    receipt->setShadows( preset.shadows );
+    receipt->setHighlights( preset.highlights );
+    ui->horizontalSliderContrast->setValue( preset.contrast );
+    ui->horizontalSliderPivot->setValue( preset.pivot );
+    ui->horizontalSliderVibrance->setValue( preset.vibrance );
+    ui->horizontalSliderShadows->setValue( preset.shadows );
+    ui->horizontalSliderHighlights->setValue( preset.highlights );
+    // The old grade's curve goes (only while it still owns the curve), then the new one is laid (only over a default curve).
+    restoreLookAssistBaselineGradationCurve( receipt );
+    const QString grade = applyLookAssistFilmGrade( receipt, scene, flavor );
+    m_lastLookAssistContrast = preset.contrast;
+    m_lastLookAssistPivot = preset.pivot;
+    m_lastLookAssistShadows = preset.shadows;
+    m_lastLookAssistHighlights = preset.highlights;
+    m_lastLookAssistVibrance = preset.vibrance;
+    m_lookAssistFlavorOutcome.landed( receipt, lookAssistFlavorName( flavor ), false );
+    receipt->setLookAssistFlavor( lookAssistFlavorName( flavor ) );
+    logInteractionEvent(
+        QStringLiteral("look_assist.flavor_relay"),
+        QStringLiteral("flavor=%1 scene=%2 contrast=%3 pivot=%4 shadows=%5 highlights=%6 vibrance=%7 grade=%8 playing=%9 frame=%10")
+            .arg( lookAssistFlavorName( flavor ) )
+            .arg( lookAssistSceneName( scene ) )
+            .arg( preset.contrast )
+            .arg( preset.pivot )
+            .arg( preset.shadows )
+            .arg( preset.highlights )
+            .arg( preset.vibrance )
+            .arg( grade )
+            .arg( bool01( ui->actionPlay->isChecked() ) )
+            .arg( ui->horizontalSliderPosition->value() ) );
+    if( !ui->actionPlay->isChecked() ) requestFrameRefresh( true, "look-assist-flavor-relay" );
+    return true;
+}
+
+// LOOK-FULLSCREEN-PARITY-1. Owner, 2026-10-15: "Full screen dont bypass the look. I just want text in the bottom
+// right showing current look when in full screen and somewhere on GUI when windowed". The label reads the state the
+// grade reads -- the receipt's Look Assist switch, the checkbox, and the flavor in force -- and never changes either.
+// The overlay is rasterised by the surface once per change; nothing here runs per frame.
+void MainWindow::updateLookLabel( void )
+{
+    const bool lookOn = m_fileLoaded && ACTIVE_RECEIPT && ACTIVE_RECEIPT->lookAssistEnabled()
+                     && ui->checkBoxLookAssistEnable->isChecked();
+    const QString flavorName = lookAssistFlavorName( currentLookAssistFlavor() );
+    const QString text = look_label::text( lookOn, flavorName );
+    syncLookPresetDropdown( lookOn, flavorName );   // LOOK-PRESET-DROPDOWN-1: the windowed look, also its enabled state
+    const bool fullscreenShown =
+        look_label::fullscreenOverlayShown( ui->actionFullscreen->isChecked(), m_lookLabelShowInFullscreen );
+    if( text == m_lookLabelText && fullscreenShown == m_lookLabelFullscreenShown ) return;
+    m_lookLabelText = text;
+    m_lookLabelFullscreenShown = fullscreenShown;
+    // One corner label: the GPU window when it is the preview, else the CPU viewport.
+    const QString overlayText = fullscreenShown ? text : QString();
+    const bool gpuWindow = GpuDisplayWindow::isActive();
+    GpuDisplayWindow::setLookLabelIfActive( overlayText );
+    ui->graphicsView->setLookLabel( gpuWindow ? QString() : overlayText );
+    logInteractionEvent(
+        QStringLiteral("look_label.update"),
+        QStringLiteral("text=\"%1\" fullscreen_overlay=%2 surface=%3")
+            .arg( text )
+            .arg( bool01( fullscreenShown ) )
+            .arg( fullscreenShown ? ( gpuWindow ? QStringLiteral("gpu_window") : QStringLiteral("cpu_viewport") )
+                                  : QStringLiteral("status_bar") ) );
+}
+
+QString MainWindow::lookLabelShownText( QString *surface )
+{
+    QString where = QStringLiteral("none");
+    QString shown;
+    if( m_lookLabelFullscreenShown )
+    {
+        if( GpuDisplayWindow::isActive() )
+        {
+            where = QStringLiteral("fullscreen_gpu_window");
+            shown = GpuDisplayWindow::lookLabelDrawnTextIfActive();
+        }
+        else
+        {
+            where = QStringLiteral("fullscreen_cpu_viewport");
+            shown = ui->graphicsView->lookLabelDrawnText();
+        }
+    }
+    else if( m_pLookPresetDropdown && m_pLookPresetDropdown->isVisible() )
+    {
+        // LOOK-PRESET-DROPDOWN-1: the dropdown's entry under its "Look:" caption reads as the label's text.
+        where = QStringLiteral("windowed_status_bar");
+        const int index = m_pLookPresetDropdown->currentIndex();
+        const QString key = m_pLookPresetDropdown->itemData( index ).toString();
+        const look_preset_dropdown::Selection selection = look_preset_dropdown::selectionFor( key );
+        if( selection.valid ) shown = look_label::text( selection.lookAssistEnabled, selection.flavorName );
+    }
+    if( surface ) *surface = where;
+    return shown;
+}
+
+// LOOK-PRESET-DROPDOWN-1. The dropdown only SHOWS here: the entry for the state the grade uses, with signals blocked,
+// so a sync never reaches onLookPresetDropdownActivated. Picking needs a clip (Look Assist is a per-clip switch).
+void MainWindow::syncLookPresetDropdown( bool lookOn, const QString &flavorName )
+{
+    if( !m_pLookPresetDropdown ) return;
+    const bool enabled = m_fileLoaded && ACTIVE_RECEIPT;
+    if( m_pLookPresetDropdown->isEnabled() != enabled ) m_pLookPresetDropdown->setEnabled( enabled );
+    const int index = look_preset_dropdown::indexFor( lookOn, flavorName );
+    if( index < 0 || index == m_pLookPresetDropdown->currentIndex() ) return;
+    const QSignalBlocker blocker( m_pLookPresetDropdown );
+    m_pLookPresetDropdown->setCurrentIndex( index );
+}
+
+// LOOK-PRESET-DROPDOWN-1. Owner, 2026-10-15: "User should be able to select from our Look Presets via a dropdown when
+// in windowed mode and have it change on the fly". activated() fires for a user's pick only (never for a sync).
+void MainWindow::onLookPresetDropdownActivated( int index )
+{
+    if( !m_pLookPresetDropdown ) return;
+    selectLookPreset( m_pLookPresetDropdown->itemData( index ).toString(), "dropdown" );
+}
+
+// One pick, applied through the paths the Look Assist panel already uses, so there is one source of truth: the flavor
+// selector (comboBoxLookAssistFlavor, the persisted app setting) and the clip's Look Assist switch (the checkbox and the
+// receipt). Off switches Look Assist off and keeps the flavor; a flavor switches it on with that flavor. Playback is never
+// stopped: the re-analysis takes the frame on screen (isLookAssistFrameSettledForAnalysis) and the next frame shows it.
+bool MainWindow::selectLookPreset( const QString &key, const char *source )
+{
+    const look_preset_dropdown::Selection selection = look_preset_dropdown::selectionFor( key );
+    const bool playing = ui->actionPlay->isChecked();
+    logInteractionEvent(
+        QStringLiteral("look_preset.select"),
+        QStringLiteral("key=%1 valid=%2 source=%3 file_loaded=%4 playing=%5 frame=%6")
+            .arg( key )
+            .arg( bool01( selection.valid ) )
+            .arg( QString::fromLatin1( source ) )
+            .arg( bool01( m_fileLoaded && ACTIVE_RECEIPT ) )
+            .arg( bool01( playing ) )
+            .arg( ui->horizontalSliderPosition->value() ) );
+    if( !selection.valid || !m_fileLoaded || !ACTIVE_RECEIPT )
+    {
+        updateLookLabel();   // put the dropdown back on the state in force
+        return false;
+    }
+
+    if( !selection.lookAssistEnabled )
+    {
+        if( ui->checkBoxLookAssistEnable->isChecked() )
+        {
+            ui->checkBoxLookAssistEnable->setChecked( false );
+            on_checkBoxLookAssistEnable_clicked( false );
+        }
+        updateLookLabel();
+        return true;
+    }
+
+    const int flavorIndex = ui->comboBoxLookAssistFlavor->findData( selection.flavorName );
+    if( flavorIndex < 0 )
+    {
+        logInteractionEvent( QStringLiteral("look_preset.select.unknown_flavor"),
+                             QStringLiteral("flavor=%1").arg( selection.flavorName ) );
+        updateLookLabel();
+        return false;
+    }
+    if( !ui->checkBoxLookAssistEnable->isChecked() )
+    {
+        // Look Assist was off: the flavor is set first (signals blocked, so no analysis for the old state), then the
+        // switch goes on and analyses once, with the new flavor.
+        {
+            const QSignalBlocker flavorBlocker( ui->comboBoxLookAssistFlavor );
+            ui->comboBoxLookAssistFlavor->setCurrentIndex( flavorIndex );
+        }
+        ACTIVE_RECEIPT->setLookAssistFlavor( lookAssistFlavorName( currentLookAssistFlavor() ) );
+        m_lookAssistApplied.clearIf( ACTIVE_RECEIPT );   // as flavorChanged: the analysis must run for the new flavor
+        m_lookAssistFlavorOutcome.clear();
+        ui->checkBoxLookAssistEnable->setChecked( true );
+        on_checkBoxLookAssistEnable_clicked( true );
+    }
+    else if( ui->comboBoxLookAssistFlavor->currentIndex() != flavorIndex )
+    {
+        // Look Assist is on: exactly the flavor selector's own change path (re-analysis with the new flavor).
+        ui->comboBoxLookAssistFlavor->setCurrentIndex( flavorIndex );
+    }
+    updateLookLabel();
+    return true;
+}
+
 void MainWindow::on_comboBoxLookAssistFlavor_currentIndexChanged( int )
 {
+    updateLookLabel();
     if( !m_fileLoaded || !ACTIVE_RECEIPT ) return;
     ACTIVE_RECEIPT->setLookAssistFlavor( lookAssistFlavorName( currentLookAssistFlavor() ) );
+    // LOOK-PRESET-DROPDOWN-1: over a landed analysis the new flavor is laid at once, no re-analysis (on the fly, also in Play).
+    if( relayLookAssistFlavor( ACTIVE_RECEIPT, currentLookAssistFlavor() ) ) return;
     // A different grade over the same clip: the marker forgets it (otherwise the toggle's frame-ready step would
     // dedup_skip the new analysis after the baseline is restored and leave the clip ungraded under a receipt that
     // names the new flavor), then the same path as switching Look Assist on restores the baseline and analyses
@@ -30155,6 +30495,7 @@ void MainWindow::on_checkBoxLookAssistEnable_clicked( bool checked )
             .arg( ui->horizontalSliderPosition->value() ) );
 
     ACTIVE_RECEIPT->setLookAssistEnabled( checked );
+    updateLookLabel();
 
     if( checked )
     {
@@ -30307,6 +30648,7 @@ void MainWindow::on_checkBoxLookAssistEnable_clicked( bool checked )
         m_lastLookAssistDiagnosticsValid = false;
         m_lookAssistApplied.clearIf( ACTIVE_RECEIPT );
         m_lookAssistFlavorOutcome.clear();   // the baseline is back: no grade, no fallback, only the selector's setting
+        m_lookAssistFlavorRelay = LookAssistFlavorRelay();
     }
 
     setReceipt( ACTIVE_RECEIPT );
@@ -30824,6 +31166,17 @@ bool MainWindow::isLookAssistFrameSettledForAnalysis( int baselineFrame,
         {
             *analysisFrame =
                 static_cast<int>( m_lastPresentedRequestContext.frameNumber );
+        }
+        return true;
+    }
+
+    // LOOK-PRESET-DROPDOWN-1: during Play the picture moves on and the baseline frame never comes back, so in every
+    // mode the frame presented after the baseline restore is the one analysed (Auto's rule above). Playback goes on.
+    if( ui->actionPlay->isChecked() )
+    {
+        if( analysisFrame )
+        {
+            *analysisFrame = static_cast<int>( m_lastPresentedRequestContext.frameNumber );
         }
         return true;
     }

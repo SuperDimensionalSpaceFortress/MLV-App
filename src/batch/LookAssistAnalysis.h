@@ -606,6 +606,11 @@ enum class LookAssistFlavor
  * setting and every log line. */
 QString lookAssistFlavorName( LookAssistFlavor flavor );
 
+/* The flavor registry: every shipped flavor, in the order the GUI lists them (the status-bar look dropdown,
+ * LOOK-PRESET-DROPDOWN-1). lookAssistSelectFlavor accepts exactly these names, so a flavor that is not here cannot be
+ * selected anywhere. */
+const std::vector<LookAssistFlavor> &lookAssistFlavors();
+
 /* Where the flavor in force came from, for the log: "env", "receipt", "app" or "default". */
 struct LookAssistFlavorSelection
 {

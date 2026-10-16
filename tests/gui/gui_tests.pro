@@ -15,6 +15,9 @@ SOURCES += \
     $$REPO_ROOT/platform/qt/GpuDebayer.cpp \
     $$REPO_ROOT/platform/qt/GpuPreviewProcessing.cpp \
     $$REPO_ROOT/platform/qt/GpuDisplayWindow.cpp \
+    $$REPO_ROOT/platform/qt/LookLabelOverlay.cpp \
+    $$REPO_ROOT/platform/qt/LookPresetDropdown.cpp \
+    $$REPO_ROOT/src/batch/LookAssistAnalysis.cpp \
     $$REPO_ROOT/platform/qt/GpuDisplayViewport.cpp \
     $$REPO_ROOT/platform/qt/Histogram.cpp \
     $$REPO_ROOT/platform/qt/ScopesLabel.cpp \
@@ -33,6 +36,11 @@ HEADERS += \
     $$REPO_ROOT/platform/qt/GpuPreviewProcessing.h \
     $$REPO_ROOT/platform/qt/DualIsoPatternMapping.h \
     $$REPO_ROOT/platform/qt/GpuDisplayWindow.h \
+    $$REPO_ROOT/platform/qt/LookLabelOverlay.h \
+    $$REPO_ROOT/platform/qt/LookLabelPolicy.h \
+    $$REPO_ROOT/platform/qt/LookPresetDropdown.h \
+    $$REPO_ROOT/platform/qt/LookPresetDropdownPolicy.h \
+    $$REPO_ROOT/src/batch/LookAssistAnalysis.h \
     $$REPO_ROOT/platform/qt/GpuDisplayViewport.h \
     $$REPO_ROOT/platform/qt/Histogram.h \
     $$REPO_ROOT/platform/qt/MainWindowGpuPreviewPolicy.h \
