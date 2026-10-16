@@ -72,6 +72,7 @@ class MainWindow;
 }
 
 class QAction;
+class QComboBox;
 class QElapsedTimer;
 class QScreen;
 
@@ -833,8 +834,11 @@ private:
     QTime m_lastPlaybackFpsStatusUpdateTime;
     QLabel *m_pFrameNumber;
     QLabel *m_pChosenDebayer;
-    QLabel *m_pLookLabelStatus = nullptr;   // LOOK-FULLSCREEN-PARITY-1: the current look, windowed
-    QString m_lookLabelText;                // the text both labels show (updateLookLabel)
+    // LOOK-PRESET-DROPDOWN-1: the current look, windowed -- "Look:" and a dropdown that both shows and picks it
+    // (it replaces LOOK-FULLSCREEN-PARITY-1's windowed status-bar label).
+    QLabel *m_pLookPresetCaption = nullptr;
+    QComboBox *m_pLookPresetDropdown = nullptr;
+    QString m_lookLabelText;                // the text the look label shows (updateLookLabel)
     bool m_lookLabelFullscreenShown = false;
     bool m_lookLabelShowInFullscreen = true; // the persisted "Show Look Label in Fullscreen" setting
     QLabel *m_pPlaybackQualityIndicator = nullptr; // Phase 4E
@@ -1911,6 +1915,11 @@ private:
     // The look label text actually on screen now, and where ("fullscreen_gpu_window",
     // "fullscreen_cpu_viewport", "windowed_status_bar" or "none"): the receipt's lookLabelShown.
     QString lookLabelShownText( QString *surface );
+    // LOOK-PRESET-DROPDOWN-1: shows the state in the windowed dropdown (signals blocked; never writes the grade),
+    // and applies a user's pick through the same paths as the Look Assist checkbox and flavor selector.
+    void syncLookPresetDropdown( bool lookOn, const QString &flavorName );
+    void onLookPresetDropdownActivated( int index );
+    bool selectLookPreset( const QString &key, const char *source );
     void setGradientMask( void );
     uint16_t autoCorrectRawBlackLevel( void );
     uint16_t autoCorrectRawWhiteLevel( void );

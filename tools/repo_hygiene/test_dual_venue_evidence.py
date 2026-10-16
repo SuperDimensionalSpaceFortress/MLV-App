@@ -132,13 +132,16 @@ SCOPE_LA_LEGS = tuple(f"legs/m16-1243-scopes-{backend}-windowed-s1-{arm}-la.json
 HEADROOM_LEGS = (*(f"legs/{clip}-headroom-unpaced-{mode}-s{scale}.json" for clip in ("m16-1243", "m16-1457") for mode in ("fullscreen", "windowed") for scale in (1, 2, 4)),
                  *(f"legs/m16-1243-headroom-stage-{mode}-s{scale}.json" for mode in ("fullscreen", "windowed") for scale in (1, 2, 4)),
                  "legs/m16-1457-headroom-stage-fullscreen-s1.json")
+# LOOK-PRESET-DROPDOWN-1: the windowed CUDA speed leg whose visual-capture tail picks Kodak Vision3 50D through the look dropdown mid-Play.
+LOOK_PRESET_LEGS = ("legs/m16-1243-look-preset-dropdown-cuda-windowed-s1.json",)
 # LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1 added the scale-2 Cinematic twin of the scale-2 look leg (the Bachelor CPU Classic | Cinematic look pair).
 SHIPPED_LEGS = ("legs/m16-1243-speed.json", "legs/m16-1243-look.json", "legs/m16-1243-look-scale2.json", "legs/m16-1243-look-cinematic.json", *DISPLAY_MATRIX_LEGS, *PACE_LEGS,
                 *LOOKAHEAD_LEGS, *HEAVY_LEGS, *DECODER_LEGS, "legs/m16-1243-look-scale2-cinematic.json", "legs/m16-1243-look-film.json",
                 "legs/m16-1243-look-scale2-film.json", "legs/m16-1243-look-scale2-vision50d.json",
                 *(f"legs/m16-1243-look-scale2-{flavor}-agxoff.json" for flavor in ("cinematic", "film", "vision50d")),
                 *(f"legs/m16-1243-display-{mode}-s{scale}-vsync1.json" for scale in (1, 2, 4) for mode in ("fullscreen", "windowed")),
-                *CPU_REDUCED_LEGS, *UPSTREAM_BASELINE_LEGS, *PTRACE_LEGS, *VISUAL_LEGS, *SCOPE_LEGS, *SCOPE_LA_LEGS, *HEADROOM_LEGS, *IDENTITY_LEGS)
+                *CPU_REDUCED_LEGS, *UPSTREAM_BASELINE_LEGS, *PTRACE_LEGS, *VISUAL_LEGS, *SCOPE_LEGS, *SCOPE_LA_LEGS, *HEADROOM_LEGS, *IDENTITY_LEGS,
+                *LOOK_PRESET_LEGS)
 # PLAYBACK-VSYNC-DEFAULT-1: the swap-interval-1 twins of the six display-matrix legs (the vsync A/B; the originals stay at the app's default 0).
 VSYNC1_LEGS = tuple(rel.replace(".json", "-vsync1.json") for rel in DISPLAY_MATRIX_LEGS)
 # LOOK-ASSIST-FILM-FLAVOR-2 r2: the AgX-off twins of the scale-2 Cinematic and Film legs carry a committed look receipt (look-receipts/agx-off.marxml).
@@ -735,6 +738,34 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
                         "the mapping must sit outside the forceLookAssist branch")
         schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
         self.assertEqual(schema["properties"]["generatorArgs"]["properties"]["scopesDuringPlayback"]["enum"], ["hide", "throttled", "live"])
+
+    def test_the_look_preset_switch_reaches_the_job_only_when_asked(self) -> None:
+        """LOOK-PRESET-DROPDOWN-1: -LookPresetSwitch <key> adds MLVAPP_SMOKE_LOOK_PRESET_SWITCH=<key> to the app's env list (the app picks that
+        look through its windowed dropdown in the untimed visual-capture tail); absent, the job is the default byte for byte. The runner maps a
+        leg's generatorArgs.lookPresetSwitch for any leg, the schema admits Off plus the flavor names, and the launcher clears a stray value."""
+        base = ["-ForceLookAssist", "-LookPaceLeg", "-DisplayMode", "windowed"]
+        plain = self.generate(GENERATOR, "lps-absent.job.ps1", base).read_text(encoding="utf-8").replace("\r\n", "\n")
+        self.assertNotIn("MLVAPP_SMOKE_LOOK_PRESET_SWITCH", plain)
+        picked = self.generate(GENERATOR, "lps-vision50d.job.ps1", [*base, "-LookPresetSwitch", "vision50d"])
+        self.assertEqual(self.parse_errors(picked), 0)
+        picked_text = picked.read_text(encoding="utf-8").replace("\r\n", "\n")
+        line = "    'MLVAPP_SMOKE_LOOK_PRESET_SWITCH=vision50d',\n"
+        self.assertIn("'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',\n" + line, picked_text)
+        self.assertEqual(picked_text.replace(line, ""), plain, "the pick line is the only difference from the plain job")
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        mapping = ("if ($spec.generatorArgs.PSObject.Properties['lookPresetSwitch']) "
+                   "{ $gen['LookPresetSwitch'] = [string]$spec.generatorArgs.lookPresetSwitch }")
+        self.assertIn(mapping, runner)
+        self.assertLess(runner.index(mapping), runner.index("if (-not $isLook -and $spec.generatorArgs.PSObject.Properties['forceLookAssist']"),
+                        "the mapping must sit outside the forceLookAssist branch")
+        schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
+        self.assertEqual(schema["properties"]["generatorArgs"]["properties"]["lookPresetSwitch"]["enum"],
+                         ["off", "classic", "cinematic", "film", "vision50d"])
+        self.assertIn('"MLVAPP_SMOKE_LOOK_PRESET_SWITCH"', LAUNCHER.read_text(encoding="utf-8"))
+        # The app reads the same variable, in the visual-capture tail, through the dropdown's own pick path.
+        app = (ROOT / "platform" / "qt" / "MainWindow.cpp").read_text(encoding="utf-8")
+        self.assertIn('qEnvironmentVariable( "MLVAPP_SMOKE_LOOK_PRESET_SWITCH" )', app)
+        self.assertIn('const bool switched = selectLookPreset( lookPresetSwitchKey, "smoke" );', app)
 
     def test_the_raw_prefetch_decoder_count_reaches_the_job_only_when_asked(self) -> None:
         """PLAYBACK-LJ92-DECODE-THROUGHPUT-1: generatorArgs.rawPrefetchDecoders maps to -RawPrefetchDecoders for any leg (not only a forced-look

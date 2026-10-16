@@ -141,7 +141,8 @@ TEST(LookLabelWiring, LabelReadsTheGradesStateAndUpdatesOnEveryChange)
         "if( text == m_lookLabelText && fullscreenShown == m_lookLabelFullscreenShown ) return;")));
     ASSERT_TRUE(update.contains(QStringLiteral("GpuDisplayWindow::setLookLabelIfActive( overlayText )")));
     ASSERT_TRUE(update.contains(QStringLiteral("ui->graphicsView->setLookLabel(")));
-    ASSERT_TRUE(update.contains(QStringLiteral("m_pLookLabelStatus->setText( text )")));
+    // LOOK-PRESET-DROPDOWN-1 replaced the windowed status-bar label with the look dropdown, synced from here.
+    ASSERT_TRUE(update.contains(QStringLiteral("syncLookPresetDropdown( lookOn, flavorName );")));
 
     // Every change path re-derives it: flavor, the switch (click and programmatic), fullscreen, the setting,
     // a receipt's values, and the smoke's forced-off look.

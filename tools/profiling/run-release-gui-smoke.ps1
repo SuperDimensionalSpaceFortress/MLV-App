@@ -1710,7 +1710,8 @@ $experimentalEnvironment = @(
     "MLVAPP_PLAYBACK_SCOPE_INTERVAL_MS",
     "MLVAPP_DISABLE_RAW_UINT16_PREFETCH",
     "MLVAPP_RAW_UINT16_PREFETCH_DECODERS",
-    "MLVAPP_DISABLE_PLAY_START_PREROLL"
+    "MLVAPP_DISABLE_PLAY_START_PREROLL",
+    "MLVAPP_SMOKE_LOOK_PRESET_SWITCH"
 )
 $experimentalEnvironmentToClear = @(
     $experimentalEnvironment | Where-Object { -not $launchEnv.Contains($_) }

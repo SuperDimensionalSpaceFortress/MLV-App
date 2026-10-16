@@ -5,6 +5,8 @@
 #include "../../platform/qt/GpuDisplayWindow.h"
 #include "../../platform/qt/GpuPreviewProcessing.h"
 #include "../../platform/qt/Histogram.h"
+#include "../../platform/qt/LookPresetDropdown.h"
+#include "../../platform/qt/LookPresetDropdownPolicy.h"
 #include "../../platform/qt/MainWindowGpuPreviewPolicy.h"
 #include "../../platform/qt/PlaybackScopesDuringPlayback.h"
 #include "../../platform/qt/ScopesLabel.h"
@@ -15,7 +17,9 @@
 #include "../common/repo_paths.h"
 #include "../common/test_runtime.h"
 
+#include <QAbstractItemView>
 #include <QApplication>
+#include <QComboBox>
 #include <QFile>
 #include <QFontInfo>
 #include <QFrame>
@@ -25,6 +29,7 @@
 #include <QGuiApplication>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QMainWindow>
 #include <QMap>
 #include <QOffscreenSurface>
 #include <QOpenGLContext>
@@ -34,6 +39,7 @@
 #include <QScopeGuard>
 #include <QScreen>
 #include <QScrollBar>
+#include <QStatusBar>
 #include <QVBoxLayout>
 #include <QWidget>
 #include <QWindow>
@@ -670,6 +676,7 @@ private slots:
     void scopesLabelDispatchesRawWaveformExactly();
     void scopesLabelDispatchesRawParadeExactly();
     void scopesLabelDispatchesRawVectorScopeExactly();
+    void lookPresetDropdownNeverElidesAt100150And200PercentScaling();
 };
 
 void GuiSmokeTest::checkedStateUpdatesPalette()
@@ -3306,6 +3313,78 @@ void GuiSmokeTest::scopesLabelDispatchesRawVectorScopeExactly()
     const QImage actual = render_scopes_label_output(raw, 16, 8, false, false, ScopesLabel::ScopeVectorScope);
     QVERIFY(!actual.isNull());
     assert_expected_hash(expected_hashes, QStringLiteral("scopeslabel.raw_vectorscope"), actual);
+}
+
+// LOOK-PRESET-DROPDOWN-1. Owner, 2026-10-15: "The dropdown should have our Look Name without cropping". The status-bar
+// dropdown is built by look_preset_dropdown::populate exactly as MainWindow builds it, then put in a NARROW window's status
+// bar (so the bar would squeeze it if it could), at the text size of a 9 pt UI font at 100 %, 150 % and 200 % scaling
+// (12, 18, 24 px; this process runs at DPR 1, so the text grows while the style's frame and arrow do not -- the worst case).
+// Every name, the longest included, must fit whole in the closed box's text field and in the open list's rows.
+void GuiSmokeTest::lookPresetDropdownNeverElidesAt100150And200PercentScaling()
+{
+    const QVector<look_preset_dropdown::Entry> entries = look_preset_dropdown::entries();
+    QVERIFY(entries.size() >= 5);   // Off + Classic, Cinematic, Film grade, Kodak Vision3 50D
+    const QString longest = look_preset_dropdown::longestDisplayName();
+    QCOMPARE(longest, QStringLiteral("Kodak Vision3 50D"));
+
+    const struct { int percent; int pixelSize; } scales[] = { { 100, 12 }, { 150, 18 }, { 200, 24 } };
+    for ( const auto &scale : scales )
+    {
+        QMainWindow window;
+        window.resize(320, 200);   // narrower than the box needs at 200 %
+        QFont font = window.font();
+        font.setPixelSize(scale.pixelSize);
+        window.setFont(font);
+        auto *combo = new QComboBox(window.statusBar());
+        combo->setFont(font);
+        look_preset_dropdown::populate(combo);
+        window.statusBar()->addWidget(combo);
+        window.show();
+        QApplication::processEvents();
+
+        QCOMPARE(combo->count(), entries.size());
+        for ( int i = 0; i < entries.size(); ++i )
+        {
+            QCOMPARE(combo->itemText(i), entries.at(i).displayName);
+            QCOMPARE(combo->itemData(i).toString(), entries.at(i).key);
+        }
+        QCOMPARE(combo->view()->textElideMode(), Qt::ElideNone);
+        QVERIFY2(combo->width() >= combo->minimumWidth(),
+                 qPrintable(QStringLiteral("%1 %: squeezed to %2 < %3").arg(scale.percent).arg(combo->width()).arg(combo->minimumWidth())));
+
+        const int field = look_preset_dropdown::closedTextFieldWidth(combo);
+        for ( int i = 0; i < combo->count(); ++i )
+        {
+            combo->setCurrentIndex(i);
+            const int advance = look_preset_dropdown::textAdvance(combo, combo->itemText(i));
+            QVERIFY2(field >= advance + 2,
+                     qPrintable(QStringLiteral("%1 %: \"%2\" needs %3 px, the closed box's text field is %4 px")
+                                    .arg(scale.percent).arg(combo->itemText(i)).arg(advance).arg(field)));
+        }
+        QVERIFY(field >= look_preset_dropdown::textAdvance(combo, longest) + 2);
+        qInfo("look_preset_dropdown scale=%d%% font_px=%d box=%d text_field=%d longest=\"%s\" longest_px=%d",
+              scale.percent, scale.pixelSize, combo->width(), field, qPrintable(longest),
+              look_preset_dropdown::textAdvance(combo, longest));
+
+        // The open list: as wide as its widest row, and no row narrower than its name.
+        combo->showPopup();
+        QApplication::processEvents();
+        QAbstractItemView *view = combo->view();
+        QVERIFY(view->isVisible());
+        QVERIFY2(view->viewport()->width() >= view->sizeHintForColumn(0),
+                 qPrintable(QStringLiteral("%1 %: list viewport %2 px < widest row %3 px")
+                                .arg(scale.percent).arg(view->viewport()->width()).arg(view->sizeHintForColumn(0))));
+        const QFontMetrics listMetrics(view->font());
+        for ( int i = 0; i < combo->count(); ++i )
+        {
+            const QRect row = view->visualRect(view->model()->index(i, 0));
+            QVERIFY2(row.width() >= listMetrics.horizontalAdvance(combo->itemText(i)),
+                     qPrintable(QStringLiteral("%1 %: list row \"%2\" is %3 px, the name needs %4 px")
+                                    .arg(scale.percent).arg(combo->itemText(i)).arg(row.width())
+                                    .arg(listMetrics.horizontalAdvance(combo->itemText(i)))));
+        }
+        combo->hidePopup();
+    }
 }
 
 int main(int argc, char ** argv)
