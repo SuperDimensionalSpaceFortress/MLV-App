@@ -568,13 +568,20 @@ function Get-LocalPlaybackPromptFindings {
     # r2 (NA2-RULE4-PER-LAUNCHER-SCOPE-1, CoS review of 75cb00e1): a launcher's gap can never reach across a `;` or into the NEXT launcher.
     # The r1 gaps ([^\n]{0,80}? after pwsh, up to 12 argument tokens after the app) could run over `; pwsh ...` / `; <app> ...`, so a first
     # launcher that did not match on its own swallowed the second one and the merged span took the FIRST clause's venue route.
-    $launcherStop = "(?<![\w\-])(?:pwsh|powershell|MLVApp)"
-    $pwshGap = "(?:(?!;)(?!${launcherStop}(?:Release)?(?:\.exe)?${e})[^\n]){0,80}?"
-    $appArg = "(?:(?!/\s)(?!\S*?${launcherStop}(?:Release)?(?:\.exe)?${e})[^\s;]+\s+){0,12}?"
+    # r4 (sol r3 + Iverson on 4b9c9387): a gap stops only at a launcher TOKEN that its own pattern anchors on -- the whole argument is
+    # the launcher (optionally quoted, after & or a path), followed by white space -- never at a launcher name inside a path argument
+    # ("--log C:\MLVApp\out.txt", "-WorkingDirectory C:\pwsh\w" stopped the gap and hid the launch). A stop is fail-closed because the
+    # stopping token is matched on its own over the rest of the same gap. The app gap stops at the next app token, the pwsh gap at the
+    # next pwsh / powershell token; a launcher of the other family does not stop a gap (it may not be a launch of its own).
+    $appStop = "[&('`"]*(?:[^\s;]*[\\/])?MLVApp(?:Release)?\.exe['`"]?\s"
+    $pwshStop = "(?<![^\s&('`"\\/])(?:pwsh|powershell)(?:\.exe)?['`"]?\s"
+    $pwshGap = "(?:(?!;)(?!${pwshStop})[^\n]){0,80}?"
+    $appArg = "(?:(?!/\s)(?!${appStop})[^\s;]+\s+){0,12}?"
+    # r4: the quoted call-operator spelling (& '<script>' -Param, & "<app>" ...) is a launcher too.
     $direct = @(
-        "(?i)${b}MLVApp(Release)?\.exe\s+${appArg}--(gui-smoke-playback|profile-playback)",
+        "(?i)${b}MLVApp(Release)?\.exe['`"]?\s+${appArg}--(gui-smoke-playback|profile-playback)",
         "(?i)(pwsh|powershell)(\.exe)?${e}${pwshGap}-File\s+\S*$scripts",
-        "(?i)(^|[\s``&(])(&\s*)?\.{0,2}[\\/]?\S*$scripts\s+-\w+")
+        "(?i)(^|[\s``&(])(&\s*)?\.{0,2}[\\/]?\S*$scripts['`"]?\s+-\w+")
     $findings = New-Object System.Collections.Generic.List[string]
     # A "sentence" is a line, cut again at '. ' so one bullet carrying several instructions is judged piece by piece. A semicolon is NOT a
     # sentence boundary since r6: it is a hard clause cut (no inheritance, per-group playback test) that the defeater scan reads across.
@@ -673,34 +680,43 @@ function Get-LocalPlaybackPromptFindings {
             # overlap are ONE occurrence.
             if (-not $hit) {
                 $launchSpans = New-Object System.Collections.Generic.List[object]
-                foreach ($pattern in $direct) {
-                    foreach ($m4 in [regex]::Matches($s, $pattern)) { $launchSpans.Add([pscustomobject]@{ Start = [int]$m4.Index; End = [int]($m4.Index + $m4.Length) }) }
+                for ($pi = 0; $pi -lt $direct.Count; $pi++) {
+                    foreach ($m4 in [regex]::Matches($s, $direct[$pi])) { $launchSpans.Add([pscustomobject]@{ Start = [int]$m4.Index; End = [int]($m4.Index + $m4.Length); App = ($pi -eq 0) }) }
                 }
                 $occurrences = New-Object System.Collections.Generic.List[object]
                 foreach ($sp in @($launchSpans | Sort-Object -Property @{ Expression = 'Start'; Descending = $false }, @{ Expression = 'End'; Descending = $true })) {
                     $last = if ($occurrences.Count -gt 0) { $occurrences[$occurrences.Count - 1] } else { $null }
                     $spClause = Get-ClauseAt -Clauses $clauses -Index $sp.Start
                     # r2: spans that START in different clauses are different launchers, however they overlap; only same-clause spans merge.
-                    if ($last -and $sp.Start -lt $last.End -and [object]::ReferenceEquals($last.Clause, $spClause)) { if ($sp.End -gt $last.End) { $last.End = $sp.End } }
-                    else { $occurrences.Add([pscustomobject]@{ Start = $sp.Start; End = $sp.End; Clause = $spClause }) }
+                    # r4: and only the two spans of ONE pwsh call merge (pwsh -File <script>, <script> -Param); an app span is one launcher per
+                    # match and never absorbs, or is absorbed by, another span (its gap no longer stops at a pwsh token).
+                    if ($last -and -not $last.App -and -not $sp.App -and $sp.Start -lt $last.End -and [object]::ReferenceEquals($last.Clause, $spClause)) { if ($sp.End -gt $last.End) { $last.End = $sp.End } }
+                    else { $occurrences.Add([pscustomobject]@{ Start = $sp.Start; End = $sp.End; Clause = $spClause; App = $sp.App }) }
                 }
-                foreach ($occ in $occurrences) {
-                    $c = $occ.Clause
-                    $mates = @($occurrences | Where-Object { [object]::ReferenceEquals($_.Clause, $c) })
-                    if ($mates.Count -le 1) { $routed = $true }
-                    else {
-                        # Two launchers in ONE clause ("... -Backend cpu on Bachelor, ... -Backend cuda"): a venue locus routes only the launcher
-                        # whose own stretch of the clause holds it (the first launcher's stretch also holds the clause lead-in).
-                        $k = [array]::IndexOf($mates, $occ)
-                        $segStart = if ($k -eq 0) { [int]$c.Start } else { [int]$occ.Start }
-                        $segEnd = if ($k + 1 -lt $mates.Count) { [int]$mates[$k + 1].Start } else { [int]$c.End }
-                        # Never wider than the clause test: Test-VenueExempts below must hold for the clause AND this launcher's own stretch must be routed.
-                        $routed = [bool]($segEnd -gt $segStart -and $s.Substring($segStart, $segEnd - $segStart) -match $venueQualified)
+                # r4 (Dot advisory 68040a98): the occurrences are sorted by start and a clause is a contiguous range, so the launchers of one
+                # clause are one contiguous run; each run is read once (r3 rescanned every occurrence for its clause mates: quadratic).
+                $i = 0
+                while (-not $hit -and $i -lt $occurrences.Count) {
+                    $c = $occurrences[$i].Clause
+                    $j = $i
+                    while ($j + 1 -lt $occurrences.Count -and [object]::ReferenceEquals($occurrences[$j + 1].Clause, $c)) { $j++ }
+                    for ($k = $i; $k -le $j; $k++) {
+                        $occ = $occurrences[$k]
+                        if ($j -eq $i) { $routed = $true }
+                        else {
+                            # Two launchers in ONE clause ("... -Backend cpu on Bachelor, ... -Backend cuda"): a venue locus routes only the launcher
+                            # whose own stretch of the clause holds it (the first launcher's stretch also holds the clause lead-in).
+                            $segStart = if ($k -eq $i) { [int]$c.Start } else { [int]$occ.Start }
+                            $segEnd = if ($k -lt $j) { [int]$occurrences[$k + 1].Start } else { [int]$c.End }
+                            # Never wider than the clause test: Test-VenueExempts below must hold for the clause AND this launcher's own stretch must be routed.
+                            $routed = [bool]($segEnd -gt $segStart -and $s.Substring($segStart, $segEnd - $segStart) -match $venueQualified)
+                        }
+                        $exempt = $c.Strong -or $c.Weak -or
+                            ($routed -and (Test-VenueExempts -Sentence $s -Clauses $clauses -Clause $c -HostPatterns $hostDefeatersLaunch)) -or
+                            (Test-ContrastLead -Sentence $s -Clause $c -Index $occ.Start)
+                        if (-not $exempt) { $hit = 'direct-playback-launch'; break }
                     }
-                    $exempt = $c.Strong -or $c.Weak -or
-                        ($routed -and (Test-VenueExempts -Sentence $s -Clauses $clauses -Clause $c -HostPatterns $hostDefeatersLaunch)) -or
-                        (Test-ContrastLead -Sentence $s -Clause $c -Index $occ.Start)
-                    if (-not $exempt) { $hit = 'direct-playback-launch'; break }
+                    $i = $j + 1
                 }
             }
             if ($hit) {
