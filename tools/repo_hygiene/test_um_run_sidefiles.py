@@ -89,17 +89,23 @@ class _Share(unittest.TestCase):
     # hook below logs "<poll number> <epoch ms>" there, so a test advances on what the client has
     # DONE (it has polled N times) and never on how long it has been. Nothing in um-run.ps1 or
     # UmRunDrop.psm1 changes: production never passes the hook.
-    def start_ticked(self, *um_run_args: str, hold_first_poll_until: Path | None = None) -> subprocess.Popen:
+    def start_ticked(self, *um_run_args: str, hold_first_poll_until: Path | None = None,
+                     queue_deadline_hook: str | None = None) -> subprocess.Popen:
         """Start um-run.ps1 for JobId demo with the tick hook; failures print `THREW <message>` and exit 1.
 
         hold_first_poll_until: the client blocks (at most 120 s) at the top of its FIRST poll until this
         path exists, so a test can guarantee a claim marker is in place before the client makes any
-        queue-deadline decision, whatever the scheduler does to the test process in between."""
+        queue-deadline decision, whatever the scheduler does to the test process in between.
+
+        queue_deadline_hook: a PowerShell scriptblock literal (`{ ... }`) passed as -TestHookAtQueueDeadline,
+        run inside the client at exactly the queue-deadline recheck."""
         self.ticks_path = self.tmp / "client-ticks.log"
         hold = _q(hold_first_poll_until) if hold_first_poll_until is not None else "''"
+        queue_hook_arg = " -TestHookAtQueueDeadline $queueHook" if queue_deadline_hook is not None else ""
         wrapper = self.tmp / "run-ticked.ps1"
         wrapper.write_text(
             "$ErrorActionPreference = 'Stop'\n"
+            f"$queueHook = {queue_deadline_hook or '$null'}\n"
             f"$tickLog = {_q(self.ticks_path)}\n"
             f"$tickHold = {hold}\n"
             "$tickHook = {\n"
@@ -116,7 +122,7 @@ class _Share(unittest.TestCase):
             "}\n"
             "try {\n"
             f"  $r = & {_q(UM_RUN)} -ScriptPath {_q(self.job)} -AgentShare {_q(self.share)} "
-            f"-PollSeconds 1 -JobId 'demo' {' '.join(um_run_args)} -TestHookAtLoopTop $tickHook\n"
+            f"-PollSeconds 1 -JobId 'demo' {' '.join(um_run_args)} -TestHookAtLoopTop $tickHook{queue_hook_arg}\n"
             "  Write-Output ('E2E_RESULT=OK EXIT=' + $r.exitCode)\n"
             "} catch { Write-Output ('THREW ' + $_.Exception.Message); exit 1 }\n",
             encoding="utf-8",
@@ -1238,55 +1244,57 @@ class UmRunEndToEndTests(_Share):
         # the client's own Get-Date, execDeadline would already be ~3600s in the past the instant it
         # is computed, and the very next loop iteration would throw almost immediately -- long
         # before this client's real budget (2s + >= 20s grace) could possibly be exhausted.
+        #
+        # UMRUN-SIBLING-1122-VACUOUS-1: that test was VACUOUS. It checked only that the process was
+        # still alive 2 s after the marker appeared and then delivered a receipt -- but with the
+        # default 30 s heartbeat freshness and a heartbeat written at setUp, a client whose deadline
+        # was (wrongly) anchored an hour in the past ALSO stays alive: the marker is present, so the
+        # "may still own the job" rule keeps it waiting, and the receipt lands first. Breaking the
+        # queue-deadline `$claimedAt = ...` site left it green. It now uses the same shape as the
+        # skew test above (UMRUN-E2E-TIMING-FLAKES-1): (1) the heartbeat's mtime is an hour old, so
+        # liveness is lost by construction; (2) the marker is removed once the client has started
+        # its second poll (the claim is set before that poll begins), so the first liveness check
+        # that sees no marker throws; and (3) -TimeoutSec 8 makes the budget measurable. A client
+        # whose claim starts at its own observation cannot reach that verdict before observation +
+        # 8 s; one anchored to the hour-old startedUtc throws at its first poll after the marker is
+        # gone, 1-2 s after it was written. The assertion compares the client's LAST poll with the
+        # marker's write time, so a stall can only move the observed time later: a correct client
+        # cannot fail it, and the bug is caught unless something stalls it for 4+ s.
+        timeout_sec = 8
         running_dir = self.share / "running"
-        wrapper = self.tmp / "run-with-hook-skewed.ps1"
+        marker_path = running_dir / "demo.started.json"
+        stale_at = time.time() - 3600
+        os.utime(self.share / "heartbeat.txt", (stale_at, stale_at))
         hook = (
             "{ "
             f"New-Item -ItemType Directory -Force -Path {_q(running_dir)} | Out-Null; "
             "$marker = @{ jobId = 'demo'; startedUtc = (Get-Date).AddHours(-1).ToUniversalTime().ToString('o') } "
             "| ConvertTo-Json -Compress; "
-            f"Set-Content -LiteralPath {_q(running_dir / 'demo.started.json')} -Value $marker "
+            f"Set-Content -LiteralPath {_q(marker_path)} -Value $marker "
             "-Encoding ascii -NoNewline "
             "}"
         )
-        wrapper.write_text(
-            "$ErrorActionPreference = 'Stop'\n"
-            f"$hook = {hook}\n"
-            "try {\n"
-            f"  $r = & {_q(UM_RUN)} -ScriptPath {_q(self.job)} -AgentShare {_q(self.share)} "
-            "-TimeoutSec 3 -PollSeconds 1 -MaxQueueWaitSec 0 -JobId 'demo' "
-            "-TestHookAtQueueDeadline $hook\n"
-            "  Write-Output ('E2E_RESULT=OK EXIT=' + $r.exitCode)\n"
-            "} catch { Write-Output ('THREW ' + $_.Exception.Message) }\n",
-            encoding="utf-8",
-        )
-        proc = subprocess.Popen([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(wrapper)],
-                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        proc = self.start_ticked("-TimeoutSec", str(timeout_sec), "-MaxQueueWaitSec", "0",
+                                 "-MaxHeartbeatAgeSec", "2", queue_deadline_hook=hook)
         try:
-            marker_path = running_dir / "demo.started.json"
-            deadline = time.monotonic() + 15
-            while time.monotonic() < deadline and not marker_path.exists():
-                time.sleep(0.1)
+            self.wait_for_polls(proc, 2)   # poll 1 ran the hook (wrote the marker); poll 2 starts with the claim set
             self.assertTrue(marker_path.exists(), "the hook never wrote the skewed claim marker")
-            # A client that (wrongly) anchored claimedAt to the marker's own hour-old startedUtc
-            # would already be past its execDeadline on the very next poll -- well under 2s away.
-            # Still alive at 2s proves this run's patience came from the client's OWN observation.
-            time.sleep(2.0)
-            self.assertIsNone(
-                proc.poll(),
-                "a stale agent-clock stamp observed at the queue deadline must not shrink the "
-                "client's own patience",
-            )
-            result = {"jobId": "demo", "exitCode": 0, "stdout": "late but real", "stderr": "",
-                      "timeoutSec": 3, "timedOut": False}
-            tmp = self.outbox / "demo.result.tmp"
-            tmp.write_text(json.dumps(result), encoding="ascii")
-            tmp.replace(self.outbox / "demo.result.json")
-            stdout, stderr = proc.communicate(timeout=30)
+            marker_written_at = marker_path.stat().st_mtime
+            # The started marker's presence keeps a client waiting past its budget; it is removed so
+            # the stale-heartbeat verdict can fire (see the skew test above).
+            marker_path.unlink()
+            stdout, stderr = proc.communicate(timeout=timeout_sec + 90)
         finally:
             if proc.poll() is None:
                 proc.kill()
                 proc.communicate()
+        last_poll_at = self.ticks()[-1][1]
+        self.assertGreaterEqual(
+            last_poll_at - marker_written_at, timeout_sec - 2,
+            "a stale agent-clock stamp observed at the queue deadline must not shrink the client's "
+            f"own patience: it reached the liveness verdict {last_poll_at - marker_written_at:.1f}s "
+            f"after the marker was written, before its own {timeout_sec}s budget (counted from "
+            "observing the marker) could elapse")
         # Whitespace-flattened, with "|" removed: PowerShell's own default uncaught-exception
         # formatting word-wraps a long message at a fixed console width, prefixing each
         # continuation line with a literal "| " margin -- both would otherwise split a long
@@ -1294,8 +1302,10 @@ class UmRunEndToEndTests(_Share):
         # length rather than content. None of this file's own asserted text ever contains "|".
         combined = " ".join(_ANSI_ESCAPE.sub("", (stdout or "") + (stderr or "")).replace("|", " ").split())
         self.assertNotIn("was never claimed", combined, combined)
-        self.assertNotIn("THREW", combined, combined)
-        self.assertIn("E2E_RESULT=OK EXIT=0", combined, combined)
+        self.assertNotIn("RETRACTED", combined, combined)
+        self.assertIn("UNRESOLVED:", combined, combined)
+        self.assertIn("stopped proving liveness", combined, combined)
+        self.assertIn("its own started marker is gone too", combined, combined)
 
     # ---- round 11 (sol BLOCKER, item 2): RETRACT at the queue deadline instead of leaving the job
     # ---- in the inbox for the agent to claim after this client has already given up ------------
