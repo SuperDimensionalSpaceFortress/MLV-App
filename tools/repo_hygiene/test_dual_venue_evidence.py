@@ -292,11 +292,12 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
     HFR_CONFORM_CLOSE = "HFR-CONFORM-AWARE-RECEIPT-ORACLES-1 <<<"
     HFR_CONFORM_REGIONS = 3
     # PLAYBACK-CLIP-LENGTH-HFR-10S-1 (owner amendment 2026-10-15): the HFR (>= 50 fps native) 10 s floor branch the embedded source-frame
-    # oracle (Get-AttrCudaSourceFramesVerdict) gains ahead of the unchanged 20 s branch. One region; the baseline's 20 s line stays verbatim.
+    # oracle (Get-AttrCudaSourceFramesVerdict) gains ahead of the unchanged 20 s branch, plus the HFR-only 10 s wording of the
+    # "under N s of real footage" message. Two regions; the baseline's 20 s lines stay verbatim outside them.
     # The sentinel is the short card id: AttrCudaArtifacts.psm1 may not carry the full one (NoFootageTokensTests forbids its "clip" token there).
     HFR_10S_OPEN = "HFR-10S-1 >>>"
     HFR_10S_CLOSE = "HFR-10S-1 <<<"
-    HFR_10S_REGIONS = 1
+    HFR_10S_REGIONS = 2
 
     @classmethod
     def strip_regions(cls, text: str) -> tuple[str, dict[str, int]]:

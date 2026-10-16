@@ -148,6 +148,25 @@ class ReceiptOracleFunctionTests(unittest.TestCase):
         # 23.976 fps 20 s stays valid
         self.assertFalse(_oracle(_good_line(), window=20)["invalid"])
 
+    def test_the_hfr_floor_rounding_boundary_is_exact_on_both_sides(self) -> None:
+        # CoS pr-457 (low-confidence gap): the floor is ceil(10 s x native_fps - 0.02), applied at native_fps >= 50.0. Pin one frame either side of
+        # each edge: the integer product (50.0), the 0.02-frame tolerance (50.001: 10 x fps = 500.01 still needs only 500), and the HFR threshold (49.99 keeps 20 s).
+        def line(native: float, required: int) -> str:
+            return _good_line(total_frames=1200, clip_seconds=24.0, presented_frames=500, native_fps=native, pace_fps=native,
+                              source_advanced=required, required_source_frames=required)
+        admitted = {"50.0 fps at exactly 500 frames": (50.0, 500), "50.001 fps at 500 frames (the 0.02-frame tolerance)": (50.001, 500),
+                    "59.94 fps at 600 frames": (59.94, 600), "49.99 fps at ceil(20 s x 49.99 - 0.02) = 1000 frames": (49.99, 1000)}
+        for name, (native, required) in admitted.items():
+            with self.subTest(name):
+                self.assertFalse(_oracle(line(native, required), window=10)["invalid"], name)
+        refused = {"50.0 fps at 499 frames": (50.0, 499), "50.001 fps at 499 frames": (50.001, 499), "59.94 fps at 599 frames": (59.94, 599),
+                   "49.99 fps at 500 frames (just under the HFR threshold keeps the 20 s floor)": (49.99, 500)}
+        for name, (native, required) in refused.items():
+            with self.subTest(name):
+                verdict = _oracle(line(native, required), window=10)
+                self.assertTrue(verdict["invalid"], verdict)
+                self.assertIn("INVALID_SOURCE_FRAMES", json.dumps(verdict["failures"]))
+
     def test_a_non_zero_exit_names_the_apps_typed_reason(self) -> None:
         verdict = _oracle(None, exit_code=14, message="[GUI-SMOKE] ERROR: SOURCE_FRAMES_SHORT (source_advanced=200)")
         self.assertIn("SOURCE_FRAMES_SHORT", json.dumps(verdict["failures"]))

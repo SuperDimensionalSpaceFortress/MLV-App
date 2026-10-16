@@ -6773,9 +6773,17 @@ function Get-AttrCudaSourceFramesVerdict {
     } elseif ($required -le 0) {
         $failures += "INVALID_SOURCE_FRAMES: required_source_frames=$required; the admitted window is unknown."
     } elseif ($advanced -lt $required) {
-        # text only: names the floor the branch below applies (10 s at >= 50 fps native, else 20 s; the verdict does not use it)
-        $floorForText = if ($fields.ContainsKey('native_fps') -and ($nativeForText = [double]::Parse($fields['native_fps'], [Globalization.CultureInfo]::InvariantCulture)) -ge 50.0 -and -not [double]::IsInfinity($nativeForText)) { 10 } else { 20 }
-        $failures += "INVALID_SOURCE_FRAMES: the engine advanced source_advanced=$advanced distinct source frames but the Play had to consume required_source_frames=$required; under $floorForText s of real footage is never playback evidence."
+        $failures += "INVALID_SOURCE_FRAMES: the engine advanced source_advanced=$advanced distinct source frames but the Play had to consume required_source_frames=$required; under 20 s of real footage is never playback evidence."
+        # HFR-10S-1 >>>
+        # Text only (the verdict never reads it): an HFR clip (>= 50 fps native) is admitted at 10 s, so the message names that floor.
+        # Every other rate keeps the base line above verbatim.
+        if ($fields.ContainsKey('native_fps')) {
+            $nativeForText = [double]::Parse($fields['native_fps'], [Globalization.CultureInfo]::InvariantCulture)
+            if ($nativeForText -ge 50.0 -and -not [double]::IsInfinity($nativeForText)) {
+                $failures[-1] = $failures[-1] -replace 'under 20 s of real footage', 'under 10 s of real footage'
+            }
+        }
+        # HFR-10S-1 <<<
     }
     # ENFORCE-4: the oracle re-derives the 20 s floor itself (see Get-GuiSmokeSourceFramesVerdict): a requirement under
     # ceil(20 s x native fps) was admitted for less than 20 s of footage, and a native fps of 0 cannot measure 20 s.
