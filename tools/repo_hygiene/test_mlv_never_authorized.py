@@ -9129,6 +9129,31 @@ class Na2AssignmentIsNotADeleteTests(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertIn("delete", self._acts(cmd))
 
+    def test_any_interpreter_import_or_system_call_selects_the_strict_reading(self):
+        # r7 (sol r6 key): `from os import system; system(...)` escaped the r6 launch list. Any interpreter
+        # invocation, import statement or bare system( call now selects the strict reading.
+        for cmd in ("python -c \"from os import system; system('echo cleanup & rd= /s /q C:/review/board/.claude-state/fleet-runs/lane-A-r1')\"",
+                    "python -c \"from os import system; system('echo cleanup & rmdir= /s /q C:\\\\x')\"",
+                    "python -c \"from os import system; system('echo cleanup & del= /q C:\\\\x\\\\y.txt')\"",
+                    "py -3 -c \"__import__('os').system('echo x & rd= /s /q C:\\\\x')\"",
+                    "C:\\Python314\\python.exe -c \"import os as o; getattr(o, 'sys' + 'tem')('echo & rd= /s /q C:\\\\x')\"",
+                    "/usr/bin/python3 -c \"exec('echo') ; 'rd= /s /q C:/x'\"",
+                    "perl -e \"system('echo & rd= /s /q C:\\\\x')\"",
+                    "ruby -e \"system('echo & rd= /s /q C:\\\\x')\"",
+                    "php -r \"system('echo & rd= /s /q C:\\\\x');\"",
+                    "pwsh -NoProfile -Command \"[Diagnostics.Process]::Start('c'+'md', '/c rd= /s /q C:\\x')\"",
+                    "powershell -c \"& ('c'+'md') /c rd= /s /q C:\\x\"",
+                    "deno eval \"Deno.run({cmd:['c'+'md','/c','rd= /s /q C:\\\\x']})\""):
+            with self.subTest(cmd=cmd):
+                self.assertIn("delete", self._acts(cmd))
+
+    def test_file_names_ending_in_interpreter_extensions_do_not_select_the_strict_reading(self):
+        # r7: the interpreter word must not follow a dot, so `.py` / `.php` / `.pl` file names keep the exemption.
+        for cmd in ('RD="/c/x/lane-A-r1"; cat "$RD/check.py" "$RD/a.php"', 'RD=/c/x/lane-B-r1; ls "$RD"/*.py',
+                    'DEL=1; echo $DEL; cat tools/coordination/doctrine_outbox.py'):
+            with self.subTest(cmd=cmd):
+                self.assertNotIn("delete", self._acts(cmd))
+
     def test_assignment_without_any_cmd_mention_is_still_not_a_delete(self):
         # The exemption still holds when nothing in the text names cmd.exe.
         for cmd in ('RD="/c/x/lane-A-r1"; cat "$RD/a.json"', 'DEL=1; echo $DEL; ls /c/commands'):

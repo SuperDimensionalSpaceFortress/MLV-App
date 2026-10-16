@@ -1263,8 +1263,15 @@ _DELETE_RX_STRICT = re.compile(r"(?:^|[\s;&|`(\"'])(?:rm|del|rd|rmdir)\b" + _DEL
 # r6 (sol r5 key): cmd.exe is also reached WITHOUT its name -- Python shell=True / os.system, Node child_process,
 # Start-Process, WMI process creation, scheduled tasks. Any process-launch construct now selects the strict reading
 # too; the exemption survives only for plain shell text that launches nothing (the incident shape).
+# r7 (sol r6 key): `from os import system; system(...)` escaped the r6 list. Seven rounds of launch-construct
+# syntax repeat the r5 lesson, so ANY script-interpreter invocation (python/py/node/perl/ruby/php/pwsh/...), any
+# import statement and any bare `system(` call now select the strict reading. The interpreter word may follow a
+# path separator (`C:\Python314\python.exe`, `/usr/bin/python3`) but not a dot, so a file name like `a.py` does not
+# trigger it. The exemption survives only for plain POSIX shell text (the incident shape).
 _CMD_SEGMENT_RX = re.compile(
     r"\bcmd(?:\.exe)?\b|\bcomspec\b"
+    r"|(?<![\w.-])(?:python[\d.]*w?|py|pypy[\d.]*|node(?:js)?|deno|bun|perl|ruby|php|pwsh|powershell|tclsh|lua|osascript|java|dotnet)(?:\.exe)?\b"
+    r"|\bimport\b|\b__import__\b|\bsystem\s*\("
     r"|\bshell\s*=\s*true\b|\bos\.(?:system|popen|spawn\w*|exec\w*)\b|\bsubprocess\b|\bpopen\b"
     r"|\bchild_process\b|\bexec(?:sync|file\w*)?\s*\(|\bspawn(?:sync)?\s*\("
     r"|\bstart-process\b|\binvoke-expression\b|\biex\b|\binvoke-item\b|\bshellexecute\w*\b"
