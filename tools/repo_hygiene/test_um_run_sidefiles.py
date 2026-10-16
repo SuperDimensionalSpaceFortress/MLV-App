@@ -1282,8 +1282,8 @@ class UmRunEndToEndTests(_Share):
         # is before the client's claimedAt, so the bound only errs toward the client). A scheduler
         # pause between a poll's start and its verdict can therefore only move the verdict later --
         # a correct client cannot fail on it (UMRUN-SIBLING-1122-VACUOUS-1 r2, sol BLOCKER). The
-        # second check is the poll COUNT at the verdict: the hour-back client decides on poll 2, a
-        # correct client needs a later poll, and neither a stall nor a late parent changes a count.
+        # poll count is deliberately NOT a discriminator (r3, sol r2 BLOCKER): a correct client
+        # whose poll 2 is delayed past the budget also decides after two polls.
         timeout_sec = 8
         running_dir = self.share / "running"
         marker_path = running_dir / "demo.started.json"
@@ -1313,19 +1313,27 @@ class UmRunEndToEndTests(_Share):
             if proc.poll() is None:
                 proc.kill()
                 proc.communicate()
+        self.assertTrue(self.verdict_path.exists(),
+                        "the client returned instead of throwing UNRESOLVED, so it left no verdict "
+                        "stamp to judge")
         marker_placed_at = int(claim_stamp_path.read_text(encoding="ascii").strip()) / 1000.0
         decided_after = self.verdict_at() - marker_placed_at
+        # The anchor is judged by TIME ALONE: a correct client sets claimedAt after the hook stamped
+        # marker_placed_at and throws only once Now >= claimedAt + timeout_sec, so its verdict is
+        # >= timeout_sec after the stamp whatever the scheduler does and however many polls it got
+        # (0.5 s of slack covers the millisecond truncation of the two stamps). The hour-back client
+        # decides on poll 2, about a second after the stamp. No poll-count bound is asserted: one
+        # would reject a correct client whose polls were delayed (UMRUN-SIBLING-1122-VACUOUS-1 r3,
+        # sol r2 BLOCKER); only the floor of two polls is, since the marker is removed on the second.
         self.assertGreaterEqual(
-            decided_after, timeout_sec - 2,
+            decided_after, timeout_sec - 0.5,
             "a stale agent-clock stamp observed at the queue deadline must not shrink the client's "
             f"own patience: it reached the liveness verdict {decided_after:.1f}s "
             f"after the marker was placed, before its own {timeout_sec}s budget (counted from "
             "observing the marker) could elapse")
-        self.assertGreater(
+        self.assertGreaterEqual(
             len(self.ticks()), 2,
-            "the client decided on its second poll, the one on which the marker was removed: its "
-            "budget was already spent the instant the claim was set (anchored to the marker's "
-            "stale startedUtc instead of the client's own clock)")
+            "the client never reached its second poll, the one on which the marker is removed")
         # Whitespace-flattened, with "|" removed: PowerShell's own default uncaught-exception
         # formatting word-wraps a long message at a fixed console width, prefixing each
         # continuation line with a literal "| " margin -- both would otherwise split a long
