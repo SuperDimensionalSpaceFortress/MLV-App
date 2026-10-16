@@ -79,6 +79,82 @@ class _Share(unittest.TestCase):
             line += f" job={job_id}"
         (self.share / "heartbeat.txt").write_text(line, encoding="utf-8")
 
+    # ---- following the client's own poll loop instead of the wall clock -----------------------
+    # UMRUN-E2E-TIMING-FLAKES-1: a test that choreographs a child pwsh with time.sleep() races the
+    # child's start-up (module import + the drop can take several seconds on a hosted runner, so a
+    # marker written at "t=1s" and removed at "t=2s" can come and go before the client ever polls
+    # -- the client then never saw a claim and RETRACTs) and, when the test also rewrites a file the
+    # client reads, races that read (a truncate-then-write torn heartbeat reads as state=?). The
+    # client already exposes -TestHookAtLoopTop, run at the top of every wait-loop iteration; the
+    # hook below logs "<poll number> <epoch ms>" there, so a test advances on what the client has
+    # DONE (it has polled N times) and never on how long it has been. Nothing in um-run.ps1 or
+    # UmRunDrop.psm1 changes: production never passes the hook.
+    def start_ticked(self, *um_run_args: str, hold_first_poll_until: Path | None = None) -> subprocess.Popen:
+        """Start um-run.ps1 for JobId demo with the tick hook; failures print `THREW <message>` and exit 1.
+
+        hold_first_poll_until: the client blocks (at most 120 s) at the top of its FIRST poll until this
+        path exists, so a test can guarantee a claim marker is in place before the client makes any
+        queue-deadline decision, whatever the scheduler does to the test process in between."""
+        self.ticks_path = self.tmp / "client-ticks.log"
+        hold = _q(hold_first_poll_until) if hold_first_poll_until is not None else "''"
+        wrapper = self.tmp / "run-ticked.ps1"
+        wrapper.write_text(
+            "$ErrorActionPreference = 'Stop'\n"
+            f"$tickLog = {_q(self.ticks_path)}\n"
+            f"$tickHold = {hold}\n"
+            "$tickHook = {\n"
+            "  $tickN = 1 + @(Get-Content -LiteralPath $tickLog -ErrorAction SilentlyContinue).Count\n"
+            "  if ($tickN -eq 1 -and $tickHold) {\n"
+            "    $tickUntil = [DateTime]::UtcNow.AddSeconds(120)\n"
+            "    while (-not (Test-Path -LiteralPath $tickHold) -and [DateTime]::UtcNow -lt $tickUntil) { Start-Sleep -Milliseconds 20 }\n"
+            "  }\n"
+            "  $tickLine = '{0} {1}' -f $tickN, [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()\n"
+            "  for ($tickTry = 0; $tickTry -lt 40; $tickTry++) {\n"
+            "    try { Add-Content -LiteralPath $tickLog -Value $tickLine -Encoding ascii -ErrorAction Stop; break }\n"
+            "    catch { Start-Sleep -Milliseconds 25 }\n"
+            "  }\n"
+            "}\n"
+            "try {\n"
+            f"  $r = & {_q(UM_RUN)} -ScriptPath {_q(self.job)} -AgentShare {_q(self.share)} "
+            f"-PollSeconds 1 -JobId 'demo' {' '.join(um_run_args)} -TestHookAtLoopTop $tickHook\n"
+            "  Write-Output ('E2E_RESULT=OK EXIT=' + $r.exitCode)\n"
+            "} catch { Write-Output ('THREW ' + $_.Exception.Message); exit 1 }\n",
+            encoding="utf-8",
+        )
+        return subprocess.Popen([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(wrapper)],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    def ticks(self) -> list[tuple[int, float]]:
+        """(poll number, epoch seconds) for every poll the client has started so far."""
+        try:
+            text = self.ticks_path.read_text(encoding="ascii")
+        except OSError:
+            return []
+        polls = []
+        for line in text.splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():   # a torn last line is skipped
+                polls.append((int(parts[0]), int(parts[1]) / 1000.0))
+        return polls
+
+    def wait_for_polls(self, proc: subprocess.Popen, count: int, *, within: float = 120.0) -> None:
+        """Block until the client has started `count` polls. `within` is a hang guard, not a budget."""
+        deadline = time.monotonic() + within
+        while time.monotonic() < deadline:
+            if len(self.ticks()) >= count:
+                return
+            self.assertIsNone(proc.poll(), f"um-run exited before it started poll {count}")
+            time.sleep(0.05)
+        self.fail(f"um-run never started poll {count} within {within}s (saw {len(self.ticks())})")
+
+    def wait_until_the_client_has_read(self, proc: subprocess.Popen) -> None:
+        """Return once the client has fully run one poll that began after this call.
+
+        Poll N+1 starts after the caller's last write, so it reads that write; poll N+2 starting
+        proves poll N+1 ran to its end. (Poll N, already running when the caller wrote, may or may
+        not have seen it -- it is never relied on.)"""
+        self.wait_for_polls(proc, len(self.ticks()) + 2)
+
     def drop(self, copier: str, *, side: list[Path] | None = None, job_id: str = "demo",
              module: Path | None = None, repo_root: Path | None = None,
              job_timeout_sec: int | None = None,
@@ -857,24 +933,37 @@ class UmRunEndToEndTests(_Share):
         # natural stale-liveness throw is fast and intentional, not an accidental ~30s coincidence
         # with the default) and heartbeat.txt is never refreshed after setUp, so it goes stale
         # almost immediately once the client starts actually checking it (past budget).
+        #
+        # UMRUN-E2E-TIMING-FLAKES-1: this used to run -TimeoutSec 2 on wall-clock sleeps (marker at
+        # t=1s, removed at t=2s). On a hosted runner the child pwsh could reach its first poll only
+        # AFTER the marker had come and gone (merge_group run 38675787436: "agent heartbeat is 2s
+        # old" at start-up, then RETRACTED after the 10 s queue ceiling), and even when it saw the
+        # marker the old assertions could not tell a marker-anchored deadline from the correct one --
+        # with the marker present a client waits either way, and after it is removed both throw.
+        # Now (1) the test advances on the client's own polls (start_ticked), so the marker is
+        # always observed before it is removed; (2) the heartbeat's mtime is set an hour old, so it
+        # is stale by construction rather than by elapsed time; and (3) -TimeoutSec 8 makes the claim
+        # measurable: a client whose deadline starts at its own observation cannot reach the liveness
+        # verdict before observation + 8 s, while one anchored to the marker's hour-old startedUtc
+        # (the bug) throws at its first poll after the marker is gone, 1-2 s after the marker was
+        # written. The assertion is on the time of the client's LAST poll against the time the marker
+        # was written -- a delay (a stall, a slow runner) can only move that later, so a correct
+        # client cannot fail it, and the bug is caught unless something stalls it for 4+ s.
+        timeout_sec = 8
         running_dir = self.share / "running"
         marker_path = running_dir / "demo.started.json"
-        proc = subprocess.Popen(
-            [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(UM_RUN),
-             "-ScriptPath", str(self.job), "-AgentShare", str(self.share),
-             "-TimeoutSec", "2", "-PollSeconds", "1", "-MaxQueueWaitSec", "10",
-             "-MaxHeartbeatAgeSec", "2", "-JobId", "demo"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        stale_at = time.time() - 3600
+        os.utime(self.share / "heartbeat.txt", (stale_at, stale_at))
+        proc = self.start_ticked("-TimeoutSec", str(timeout_sec), "-MaxQueueWaitSec", "300",
+                                 "-MaxHeartbeatAgeSec", "2")
         try:
-            time.sleep(1.0)
+            self.wait_for_polls(proc, 1)   # the client has dropped the job and is polling
             running_dir.mkdir(parents=True, exist_ok=True)
             skewed = time.gmtime(time.time() - 3600)
             marker = {"jobId": "demo", "startedUtc": time.strftime("%Y-%m-%dT%H:%M:%SZ", skewed)}
+            marker_written_at = time.time()
             marker_path.write_text(json.dumps(marker), encoding="ascii")
-            # One more poll cycle: under a marker-anchored deadline the client would already have
-            # thrown (or misjudged liveness) on the very first check after observing this marker.
-            time.sleep(1.0)
-            self.assertIsNone(proc.poll(), "a stale agent-clock stamp must not shrink the client's own patience")
+            self.wait_until_the_client_has_read(proc)   # it has now observed the marker
             # ATTR3-FOOTAGE-STAGE-SUBMIT-RETRY-1 round 11 (item 3): the started marker's own
             # presence is now an independent proof the agent may still own this job (the deployed
             # agent's silent kill/drain/publish window) -- removing it here simulates that window
@@ -882,11 +971,17 @@ class UmRunEndToEndTests(_Share):
             # was published) so the stale-heartbeat diagnosis below can actually fire, the same way
             # a real agent's own marker removal would let it fire in production.
             marker_path.unlink()
-            stdout, stderr = proc.communicate(timeout=15)
+            stdout, stderr = proc.communicate(timeout=timeout_sec + 90)
         finally:
             if proc.poll() is None:
                 proc.kill()
                 proc.communicate()
+        last_poll_at = self.ticks()[-1][1]
+        self.assertGreaterEqual(
+            last_poll_at - marker_written_at, timeout_sec - 2,
+            "a stale agent-clock stamp must not shrink the client's own patience: it reached the "
+            f"liveness verdict {last_poll_at - marker_written_at:.1f}s after the marker was written, "
+            f"before its own {timeout_sec}s budget (counted from observing the marker) could elapse")
         # Whitespace-flattened, with "|" removed: PowerShell's own default uncaught-exception
         # formatting word-wraps a long message at a fixed console width, prefixing each
         # continuation line with a literal "| " margin -- both would otherwise split a long
@@ -957,29 +1052,37 @@ class UmRunEndToEndTests(_Share):
         # explicitly names a different job: that is liveness-lost for THIS job specifically, and
         # must be diagnosed as such (not silently trusted, and not the generic "no heartbeat" or
         # plain staleness wording).
+        #
+        # UMRUN-E2E-TIMING-FLAKES-1: this used to hold the marker for a wall-clock 1 s..3 s window
+        # with -MaxQueueWaitSec 5; a child pwsh that reached its first poll after the marker was
+        # removed never saw a claim and RETRACTED at the 5 s queue ceiling (PR #427 r4, run
+        # 38568661635). Now the test advances on the client's own polls (start_ticked): the marker is
+        # removed only once the client has observed it. The heartbeat is written once, naming another
+        # job, with -MaxHeartbeatAgeSec 3600 so it is fresh by age for the whole test whatever the
+        # runner does -- the ONLY thing that can make it non-fresh is the job mismatch this test
+        # pins (a broken mismatch check would treat it as fresh and wait, and the test would time out).
         running_dir = self.share / "running"
         marker_path = running_dir / "demo.started.json"
-        proc = subprocess.Popen(
-            [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(UM_RUN),
-             "-ScriptPath", str(self.job), "-AgentShare", str(self.share),
-             "-TimeoutSec", "1", "-PollSeconds", "1", "-MaxQueueWaitSec", "5", "-JobId", "demo"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        proc = self.start_ticked("-TimeoutSec", "1", "-MaxQueueWaitSec", "300", "-MaxHeartbeatAgeSec", "3600")
         try:
-            time.sleep(1.0)
+            self.wait_for_polls(proc, 1)   # the client has dropped the job and is polling
             running_dir.mkdir(parents=True, exist_ok=True)
             marker = {"jobId": "demo", "startedUtc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
             marker_path.write_text(json.dumps(marker), encoding="ascii")
-            # Fresh, but for a DIFFERENT job -- keep it refreshed so the mismatch is definitely
-            # observed at least once.
-            deadline = time.monotonic() + 2.0
-            while time.monotonic() < deadline:
-                self.touch_heartbeat(job_id="someone-elses-job")
-                time.sleep(0.4)
+            # Fresh, but for a DIFFERENT job.
+            self.touch_heartbeat(job_id="someone-elses-job")
+            self.wait_until_the_client_has_read(proc)   # it has now observed the claim
             # ATTR3-FOOTAGE-STAGE-SUBMIT-RETRY-1 round 11 (item 3): a job-mismatch alone is not
             # enough to end the wait any more -- the started marker must ALSO be gone (simulating
             # Complete-StartedMarker having already run for whatever job the agent is now on).
             marker_path.unlink()
-            stdout, stderr = proc.communicate(timeout=15)
+            try:
+                stdout, stderr = proc.communicate(timeout=60)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.communicate()
+                self.fail("the client never stopped: a heartbeat naming a DIFFERENT job, with the started "
+                          "marker gone, was treated as proof of liveness for this job")
         finally:
             if proc.poll() is None:
                 proc.kill()
@@ -1714,15 +1817,24 @@ class UmRunAdmissionWaitTests(_Share):
     def test_the_admission_ceiling_stops_unresolved_and_never_withdraws_the_job(self) -> None:
         # Slots-full and unknown-feed holds are uncapped in the agent; -MaxAdmissionWaitSec bounds them
         # here. The outcome is UNRESOLVED (the agent still holds the job), never RETRACTED.
-        proc = self.start("-TimeoutSec", "60", "-MaxQueueWaitSec", "1", "-MaxAdmissionWaitSec", "3")
+        #
+        # UMRUN-E2E-TIMING-FLAKES-1: this used to rewrite heartbeat.txt every 0.4 s from the test
+        # while the client read it. write_text truncates before it writes, so a read in between is
+        # empty and the ceiling message says "last gate state=?" (PR #425 r5, run 38528323174). The
+        # ceiling does not need a live heartbeat at all -- only the gate state it carries -- so it is
+        # written ONCE, before the marker, and nothing writes it while the client runs. The first
+        # poll is also held until the marker exists: with -MaxQueueWaitSec 1 the old test relied on
+        # the test process writing the marker within a second of the drop, whatever the scheduler did.
+        proc = self.start_ticked("-TimeoutSec", "60", "-MaxQueueWaitSec", "1", "-MaxAdmissionWaitSec", "3",
+                                 hold_first_poll_until=self.share / "running" / "demo.started.json")
         try:
             self.wait_for_drop(proc)
+            self.gate_heartbeat("slots-full", 0)
             self.write_marker(self.admission_marker())
-            self.hold(proc, 20.0, state="slots-full")
         except BaseException:
             proc.kill()
             raise
-        combined = self.finish(proc)
+        combined = self.finish(proc, timeout=120)
         self.assertNotEqual(proc.returncode, 0, combined)
         self.assertIn("UNRESOLVED:", combined, combined)
         self.assertIn("held unlaunched in the agent's heavy-slot admission gate", combined, combined)
