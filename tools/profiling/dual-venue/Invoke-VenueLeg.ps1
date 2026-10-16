@@ -398,6 +398,8 @@ try {
         if ($spec.generatorArgs.PSObject.Properties['disableLookAssist'] -and [bool]$spec.generatorArgs.disableLookAssist) { $gen['DisableLookAssist'] = $true }
         # PLAYBACK-STARTUP-CATCHUP-BURST-1 r7: the app's opt-in per-present playback trace, for any leg.
         if ($spec.generatorArgs.PSObject.Properties['presentTrace'] -and [bool]$spec.generatorArgs.presentTrace) { $gen['PresentTrace'] = $true }
+        # PLAYBACK-STARTUP-WAIT-PREWARM-1: the app's opt-in first-present identity capture, for any leg.
+        if ($spec.generatorArgs.PSObject.Properties['firstPresentCapture'] -and [bool]$spec.generatorArgs.firstPresentCapture) { $gen['FirstPresentCapture'] = $true }
         # CUDA-HEADROOM-1: an unpaced throughput leg (no pace guard, drop-frame off), for any leg; judged below by the app's own pace_unpaced line.
         if ($spec.generatorArgs.PSObject.Properties['unpaced'] -and [bool]$spec.generatorArgs.unpaced) { $gen['Unpaced'] = $true }
         # PLAYBACK-SCOPES-OPTION-1: the live scope the smoke forces on, and the app's playback scope throttle interval, for any leg.
