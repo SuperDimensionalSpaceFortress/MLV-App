@@ -1720,6 +1720,11 @@ def _rule4_r10_rows() -> dict[str, tuple[str, ...]]:
                                                   (SMOKE_MODE, PROFILE_MODE)):
         mention.append(f"{verb} {app}{sep}C:\\build\\{app_release} take01.dat {mode} {RULE4_R7_ROUTE}.")
         mention.append(f"{verb} {app}{sep}C:\\build\\{app_release} {mode} {RULE4_R7_ROUTE}.")
+    # prose that lists the app and the flags with a bare ` / ` between them is a mention, not a launch (the catalogue row of
+    # test_green_prompts_that_must_pass, which the first r10 cut refused)
+    for app, mode in itertools.product((APP, app_release), (SMOKE_MODE, PROFILE_MODE)):
+        mention.append(f"Grep for {app} / --seconds / --autoplay / {mode} in every launcher and apply the same oracle.")
+        mention.append(f"Grep for {app} / {mode} in every launcher.")
     return {"named": named, "grid": tuple(dict.fromkeys(grid)), "routed": tuple(dict.fromkeys(routed)), "glued": tuple(dict.fromkeys(glued)),
             "noarg": tuple(dict.fromkeys(noarg)), "noarg_routed": tuple(dict.fromkeys(noarg_routed)), "mention": tuple(dict.fromkeys(mention))}
 
@@ -1779,13 +1784,14 @@ RULE4_QUOTE_CLAIMS: dict[str, tuple[tuple[str, ...], int]] = {
     "clipLaunch": (("'", '"', "`"), 5),
     # r10: the app token with no argument and a `;` after it opens or closes like the other app tokens (a markdown code span)
     "appBare": (("'", '"', "`"), 1),
+    "clipMention": (("'", '"', "`"), 5),
     # the pwsh token is quoted with ' or " only (r4 comment); the pwsh gap never claimed a backtick
     "pwshStop": (("'", '"'), 2),
     # a quotation of the incident wording opens with any of the three
     "incident": (("'", '"', "`"), 1),
 }
 # the r8 lead pieces (d30d1365); r9 deleted them with the lead lookbehind, the RED/GREEN proof below still reads them at that head
-RULE4_QUOTE_CLAIMS_R8 = {**{k: v for k, v in RULE4_QUOTE_CLAIMS.items() if k != "appBare"}, "leadOpen": (("'", '"', "`"), 1), "leadWords": (("'", '"', "`"), 2), "leadPath": (("'", '"', "`"), 1)}
+RULE4_QUOTE_CLAIMS_R8 = {**{k: v for k, v in RULE4_QUOTE_CLAIMS.items() if k not in ("appBare", "clipMention")}, "leadOpen": (("'", '"', "`"), 1), "leadWords": (("'", '"', "`"), 2), "leadPath": (("'", '"', "`"), 1)}
 # A deliberate single backtick before a bracket or an apostrophe inside a double-quoted pattern string must be named here with its
 # reason (none today; the `"` delimiter escape is the one legitimate single backtick and is covered by the evaluated check).
 RULE4_BACKTICK_ESCAPES: dict[str, str] = {}
