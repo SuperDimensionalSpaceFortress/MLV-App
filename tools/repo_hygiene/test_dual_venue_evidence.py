@@ -6697,25 +6697,58 @@ def write_visual_captures(dest: Path, mode: str = "ok") -> None:
     full-quality frame has another red level). PLAYBACK-FROZEN-DISPLAY-SOURCE-DIFF-1 modes: frozen (the app records source_difference "differ"),
     frozen-unknown (it records nothing), frozen-identical (it records "identical": a static clip), noviewport (a ticking-chrome frozen picture whose
     visual.json carries no viewport rectangle), frozen-partial (frozen + "differ", but play frame 5 alone carries no viewport rectangle),
-    frozen-upper-differ / frozen-upper-identical (the same record in the wrong case: "DIFFER" / "IDENTICAL")."""
+    frozen-upper-differ / frozen-upper-identical (the same record in the wrong case: "DIFFER" / "IDENTICAL").
+    PLAYBACK-SOURCE-FRAME-IDENTITY-1 r4 (acting-cos Dot B1) modes, each a frozen picture whose play frames carry the app's per-frame source_id:
+    frozen-source-partial-unsaved (frames 0-4 over source A; frame 5 over source B was never saved; the app's record "differ"),
+    frozen-source-partial-noviewport (the same, but frame 5 was saved without a viewport rectangle), frozen-source-partial-differ (frames 0-4 over
+    five different sources; frame 5 never saved; "differ"), frozen-source-ids-only (frames 0-4 over five different sources; frame 5 never saved and
+    has no source id, so the app records nothing), frozen-upper-source-id (every source id in upper-case hex, which is not the app's form; "differ")."""
     if dest.exists():
         shutil.rmtree(dest)
     dest.mkdir(parents=True)
     calls = []
-    frozen = mode in ("frozen", "frozen-unknown", "frozen-identical", "frozen-partial", "frozen-upper-differ", "frozen-upper-identical", "noviewport")
+    frozen = mode in ("frozen", "frozen-unknown", "frozen-identical", "frozen-partial", "frozen-upper-differ", "frozen-upper-identical", "noviewport",
+                      "frozen-source-partial-unsaved", "frozen-source-partial-noviewport", "frozen-source-partial-differ", "frozen-source-ids-only",
+                      "frozen-upper-source-id")
     viewport = None if mode == "noviewport" else VIEWPORT
     source_difference = {"frozen": "differ", "frozen-partial": "differ", "frozen-identical": "identical",
-                         "frozen-upper-differ": "DIFFER", "frozen-upper-identical": "IDENTICAL"}.get(mode)
+                         "frozen-upper-differ": "DIFFER", "frozen-upper-identical": "IDENTICAL",
+                         "frozen-source-partial-unsaved": "differ", "frozen-source-partial-noviewport": "differ",
+                         "frozen-source-partial-differ": "differ", "frozen-upper-source-id": "differ"}.get(mode)
+    # play frame 5's capture is unusable in these modes: never saved (no PNG, no viewport) or saved without a viewport rectangle
+    unsaved = {5} if mode in ("frozen-source-partial-unsaved", "frozen-source-partial-differ", "frozen-source-ids-only") else set()
+    no_viewport = {5} if mode in ("frozen-partial", "frozen-source-partial-noviewport") else set()
+
+    def source_id(k: int) -> str | None:
+        """A play frame's source_id as the app writes it (16 lowercase hex digits); None leaves the field out (the app could not read the frame)."""
+        if mode in ("frozen", "frozen-partial", "frozen-source-partial-differ"):
+            return f"{k + 1:016x}"
+        if mode == "frozen-source-ids-only":
+            return None if k == 5 else f"{k + 1:016x}"
+        if mode == "frozen-identical":
+            return "00000000000000aa"
+        if mode in ("frozen-source-partial-unsaved", "frozen-source-partial-noviewport"):
+            return "00000000000000bb" if k == 5 else "00000000000000aa"
+        if mode == "frozen-upper-source-id":
+            return f"{k + 10:016X}"
+        return None
+
     for k in range(6):
         seed = 1 if frozen else k
+        if k in unsaved:
+            continue
         calls.append(f"New-VisPng '{dest / f'play-{k}.png'}' {seed} {60 + k * 10} 0 ${'true' if mode == 'blank' else 'false'}")
     calls.append(f"New-VisPng '{dest / 'stop.png'}' 5 120 0 ${'true' if mode == 'blank' else 'false'}")
     calls.append(f"New-VisPng '{dest / 'paused.png'}' 5 120 {40 if mode == 'diverge' else 0} ${'true' if mode == 'blank' else 'false'}")
     proc = run_pwsh(["-Command", VISUAL_PNG_PS + "\n".join(calls)])
     assert proc.returncode == 0, proc.stdout + proc.stderr
     frames = [{"kind": "play", "index": k, "file": f"play-{k}.png", "display_frame": 600 + 2 * k, "serial": 900 + k, "play_active": True,
-               "tail_elapsed_ms": 250 + 500 * k, "capture_ms": 40.0, "viewport": (None if mode == "frozen-partial" and k == 5 else viewport), "saved": True, "reason": ""}
+               "tail_elapsed_ms": 250 + 500 * k, "capture_ms": 40.0, "viewport": (None if k in no_viewport or k in unsaved else viewport),
+               "saved": k not in unsaved, "reason": ("PrintWindow failed" if k in unsaved else "")}
               for k in range(6)]
+    for frame in frames:
+        if source_id(frame["index"]) is not None:
+            frame["source_id"] = source_id(frame["index"])
     frames.append({"kind": "stop", "index": 0, "file": "stop.png", "display_frame": 612, "play_active": False, "viewport": viewport, "saved": True, "reason": ""})
     frames.append({"kind": "paused", "index": 0, "file": "paused.png", "display_frame": 612, "settled": True, "settled_frame": 612, "play_active": False,
                    "viewport": viewport, "saved": True, "reason": ""})
@@ -7066,6 +7099,66 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
                     note_at = out["reason"].find("1 saved play frame(s) have no usable viewport rectangle and were not judged")
                     self.assertGreaterEqual(frozen_at, 0, out["reason"])
                     self.assertGreater(note_at, frozen_at, out["reason"])
+
+    def test_the_source_difference_is_judged_over_the_same_frames_the_picture_is(self) -> None:
+        """PLAYBACK-SOURCE-FRAME-IDENTITY-1 r4 (acting-cos Dot B1, PR #477 head fa20d035): the app's source_difference covers EVERY play capture, a usable
+        picture or not, while the picture is judged only over the play frames with a content hash. Five frozen frames over ONE source beside a sixth over
+        another source whose capture is unusable read `differ` in the app's record, yet the judged frames are a static clip. So the runner derives the
+        source difference from the judged frames' own source_id, and the app's scalar is a cross-check: a disagreement is recorded, never decisive."""
+        # mode, verdict, counted, source difference, the app's record, cross-check, saved play frames, judged play frames
+        rows = (("frozen-source-partial-unsaved", "OK", True, "known-identical", "differ", "disagree", 5, 5),
+                ("frozen-source-partial-noviewport", "OK", True, "known-identical", "differ", "disagree", 6, 5),
+                ("frozen-source-partial-differ", "FROZEN_DISPLAY", False, "known-differ", "differ", "agree", 5, 5),
+                ("frozen-source-ids-only", "FROZEN_DISPLAY", False, "known-differ", None, "disagree", 5, 5),
+                ("frozen-upper-source-id", "FROZEN_DISPLAY_SUSPECTED", True, "unknown", "differ", "disagree", 6, 6),
+                ("frozen-upper-differ", "FROZEN_DISPLAY_SUSPECTED", True, "unknown", "DIFFER", "agree", 6, 6),
+                ("frozen", "FROZEN_DISPLAY", False, "known-differ", "differ", "agree", 6, 6),
+                ("frozen-partial", "FROZEN_DISPLAY", False, "known-differ", "differ", "agree", 6, 5),
+                ("frozen-identical", "OK", True, "known-identical", "identical", "agree", 6, 6),
+                ("frozen-unknown", "FROZEN_DISPLAY_SUSPECTED", True, "unknown", None, "agree", 6, 6))
+        for mode, verdict, counted, source, app, cross, saved, judged in rows:
+            with self.subTest(mode), tempfile.TemporaryDirectory(prefix=f"vis-{mode}-") as d:
+                art = Path(d) / "artifacts"
+                write_visual_captures(art / "visual", mode)
+                ev = Path(d) / "evidence"
+                proc, out = run_pwsh_json(f"Read-DvVisualCaptures -Requested $true -ArtifactsDir '{art}' -EvidenceDir '{ev}' -LegId 'unit-leg' -Header 'unit' | ConvertTo-Json -Depth 8 -Compress")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual((out["verdict"], out["counted"]), (verdict, counted), out["reason"])
+                self.assertEqual(out["sourceDifference"], source)
+                self.assertEqual(out.get("appSourceDifference"), app, "the app's own record is kept as written")
+                self.assertEqual(out.get("sourceDifferenceCrossCheck"), cross)
+                self.assertEqual((out["savedPlayFrames"], out["playFrames"], out["distinctContentHashes"]), (saved, judged, 1))
+                if cross == "disagree":
+                    self.assertIn("the judged frames decide", out["reason"] or "", "a disagreement is recorded in the reason")
+                else:
+                    self.assertNotIn("the judged frames decide", out["reason"] or "")
+                if verdict == "OK":
+                    self.assertIn("static clip", out["reason"], "the waived frozen check still says so")
+                play_ids = [f.get("sourceId") for f in out["frames"] if f["kind"] == "play"]
+                self.assertEqual(len(play_ids), 6, "every play frame stays in the receipt, judged or not")
+
+    def test_the_source_difference_of_the_judged_frames_follows_the_apps_rule(self) -> None:
+        """Get-DvVisualSourceDifference mirrors visual_capture_source_difference::decide (VisualCaptureSourceDifference.h) over the judged frames:
+        known-differ when two source ids differ; known-identical when every frame has an id, they span two or more distinct display frames and all are
+        equal; unknown otherwise (fewer than two frames, a missing or malformed id, a display frame of -1, one repeated display frame)."""
+        a, b = "00000000000000aa", "00000000000000bb"
+        rows = (([], "unknown"),
+                ([(a, 10)], "unknown"),
+                ([(a, 10), (a, 11)], "known-identical"),
+                ([(a, 10), (b, 11)], "known-differ"),
+                ([(a, 10), (a, 11), (b, 12)], "known-differ"),
+                ([(a, 10), (None, 11), (b, 12)], "unknown"),                  # every judged frame needs an id, as in the app
+                ([(a, 10), ("00000000000000AA", 11)], "unknown"),             # upper case is not the app's form
+                ([(a, 10), ("aa", 11)], "unknown"),                           # nor is a short id
+                ([(a, 10), (a, -1)], "unknown"),
+                ([(a, 10), (a, 10)], "unknown"),                              # a stuck clock is not evidence of a static clip
+                ([(a, 10), (b, 10)], "unknown"))                              # the app's rule: one display frame decides nothing
+        for frames, expected in rows:
+            with self.subTest(frames=frames):
+                items = ", ".join(f"[pscustomobject]@{{ sourceId = {('$null' if sid is None else repr(sid))}; displayFrame = {df} }}" for sid, df in frames)
+                proc, out = run_pwsh_json(f"ConvertTo-Json -Compress -InputObject (Get-DvVisualSourceDifference -Frames @({items}))")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(out, expected)
 
     def test_a_visual_reader_without_a_published_directory_says_not_captured(self) -> None:
         with tempfile.TemporaryDirectory(prefix="vis-none-") as d:
