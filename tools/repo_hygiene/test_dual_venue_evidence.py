@@ -28,6 +28,7 @@ Windows-only: the job generator and runner are PowerShell-on-Windows tools (the 
 from __future__ import annotations
 
 import ast
+import concurrent.futures
 import hashlib
 import io
 import json
@@ -162,6 +163,14 @@ def run_pwsh(args: list[str], env_extra: dict | None = None, timeout: int = 600)
                           capture_output=True, text=True, timeout=timeout, env=env)
 
 
+def run_pwsh_many(arg_lists: list[list[str]], env_extra: dict | None = None, timeout: int = 600) -> list[subprocess.CompletedProcess]:
+    """run_pwsh for several independent invocations at once (a few pwsh at a time, never more than the host has cores), results in input order.
+    Only for runs that touch nothing in common: each is its own process with its own output file."""
+    import os
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(4, os.cpu_count() or 1))) as pool:
+        return list(pool.map(lambda args: run_pwsh(args, env_extra, timeout), arg_lists))
+
+
 def launcher_nonce_expression(launcher_text: str) -> str:
     """The right-hand side of the launcher's `$runNonce = ...` line: the REAL producer of every run nonce the app echoes
     (round 3, fable BLOCKER: the rule was written against a hand-made constant and rejected what the launcher mints)."""
@@ -215,10 +224,15 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
     it against a sparse CLONE whose two fixture files are header-only ~30 s stand-ins (never real footage), the same
     device master's own generator tests use."""
 
+    warm_first = True   # the first `generate` of the class runs every request on `warm_requests` at once; read from the class's OWN __dict__ (see `generate`), so a subclass or a borrower never inherits it
+
     @classmethod
     def setUpClass(cls) -> None:
         cls._tmp = tempfile.TemporaryDirectory(prefix="dve-gen-")
         cls.tmp = Path(cls._tmp.name)
+        cls._generated = {}   # (script, arguments) -> (job file, the generator's CompletedProcess); see generate / warm_generated
+        cls._parse_cache = {}   # job file -> parse error count
+        cls._warmed = False
         cls.head = git("rev-parse", "HEAD")
         cls.repo = cls.tmp / "repo"
         subprocess.run(["git", "clone", "-q", "--shared", "--no-checkout", str(ROOT), str(cls.repo)], check=True)
@@ -240,11 +254,83 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
     def tearDownClass(cls) -> None:
         cls._tmp.cleanup()
 
+    @classmethod
+    def generator_command(cls, script: Path, out: Path, extra: list[str]) -> list[str]:
+        return ["-File", str(script), "-SourceCommit", cls.head, "-BuildManifestSha256", "ab" * 32,
+                "-ClipId", FIXTURE_IDS[0], "-FixtureSha256", "cd" * 32, "-RepoRoot", str(cls.repo),
+                "-OutFile", str(out), *extra]
+
+    @classmethod
+    def warm_requests(cls) -> list[tuple[Path, list[str]]]:
+        """Every distinct (script, arguments) the tests below ask `generate` for. A generator run is ~5 s (a pwsh start plus a 560 KB job to emit), so the first
+        `generate` of the class runs all of these at once, a few pwsh at a time, and each test then takes its job from the cache. This list is only an accelerator:
+        a request that is not on it is generated when a test asks for it (and cached), so a test added without extending it is correct, just not warmed."""
+        cs4 = ["-ContactSheet", "-ContactSheetFrames", "4"]
+        look = ["-ForceLookAssist", "-ContactSheet", "-LookFlavor", "cinematic"]
+        pace = ["-ForceLookAssist", "-LookPaceLeg", "-LookFlavor", "cinematic"]
+        heavy = ["-TelemetryArm", "HEAVY"]
+        store = [*heavy, "-AutomationSettingsDir", "gpu-self-heal-settings"]
+        cpu1 = ["-Backend", "cpu", "-ScaleFactor", "1"]
+        scope_base = [*cpu1, "-DisplayMode", "windowed", "-DisableLookAssist"]
+        byte_identical = [[], [*cs4, "-TelemetryArm", "LIGHT", "-DisablePaintPerSubmit"], ["-PlaySeconds", "30"]]
+        requests: list[tuple[Path, list[str]]] = [(GENERATOR, extra) for extra in byte_identical]
+        if cls.baseline_available:
+            old = cls.baseline_root / "tools" / "profiling" / "bachelor" / "playback-attr-3-cuda-job.ps1"
+            requests += [(old, extra) for extra in byte_identical]
+        for extra in (["-Venue", "bachelor", "-Backend", "cuda", "-ScaleFactor", "4", "-CpuQuiescenceThresholdPercent", "20.0"], ["-ExpectedScaleRequest", "1"],
+                      cs4, [*cs4, "-DisplayMode", "fullscreen"], [*cs4, "-DisplayMode", "windowed"], ["-DisplayMode", "windowed"],
+                      ["-ContactSheet", "-ContactSheetPairedSeek", "-DisplayMode", "windowed"], ["-Venue", "ultra-magnus"], ["-Backend", "cpu"], look, pace,
+                      [*pace, "-PlaybackRenderLookaheadFrames", "3"],
+                      *([*extra, "-SwapInterval", interval] for interval in ("0", "1") for extra in ([], look, [*look, "-DisplayMode", "windowed"])),
+                      *(["-CudaLaunchTimingMinMs", ms] for ms in ("0", "2", "2.5")), ["-SwapInterval", "1", "-CudaLaunchTimingMinMs", "2"],
+                      ["-PresentTrace"], ["-GpuFaultInject", "702@120"], ["-GpuSafeStart", "clear"], heavy, store,
+                      [*store, "-GpuPreLaunches", "702@120,702@120,none", "-GpuSafeStart", "clear"], ["-FirstPresentCapture"], ["-Unpaced"],
+                      ["-Unpaced", "-PresentTrace", "-SwapInterval", "0"], ["-Backend", "cpu", *cs4], ["-Backend", "cpu", *cs4, "-PlaybackProcessing", "receipt"],
+                      ["-Backend", "cpu", *cs4, "-PlaybackProcessing", ""], cpu1, [*cpu1, "-DisableLookAssist"],
+                      [*cpu1, "-DisplayMode", "windowed", "-DisableLookAssist"], scope_base, [*scope_base, "-Scope", "none"], [*scope_base, "-Scope", "histogram"],
+                      [*scope_base, "-Scope", "histogram", "-ScopeIntervalMs", "0"],
+                      ["-ScaleFactor", "1", "-DisplayMode", "windowed", "-DisableLookAssist", "-Scope", "waveform"],
+                      [*scope_base, "-Scope", "histogram"], [*scope_base, "-Scope", "histogram", "-ScopesDuringPlayback", "throttled"],
+                      ["-RawPrefetchDecoders", "0"], ["-RawPrefetchDecoders", "2"], [*pace, "-RawPrefetchDecoders", "1"],
+                      ["-ScaleFactor", "1", "-CpuQuiescenceThresholdPercent", "35.5"], ["-Venue", "ultra-magnus", "-PlaySeconds", "28"],
+                      ["-Backend", "cpu", "-PlaySeconds", "28"]):
+            requests.append((GENERATOR, extra))
+        return requests
+
+    @classmethod
+    def warm_generated(cls) -> None:
+        """Run `warm_requests` concurrently (every run is its own pwsh writing its own file) and parse-check the jobs in one more pwsh. The outcomes are kept
+        unasserted: `generate` asserts the exit code of the run its test asked for, exactly as before, so a failure is still reported by that test."""
+        unique: dict[tuple[str, tuple[str, ...]], tuple[Path, list[str]]] = {}
+        for script, extra in cls.warm_requests():
+            unique.setdefault((str(script), tuple(extra)), (script, extra))
+        jobs = [(key, script, extra, cls.tmp / f"warm-{n}.job.ps1") for n, (key, (script, extra)) in enumerate(unique.items())]
+        procs = run_pwsh_many([cls.generator_command(script, out, extra) for _key, script, extra, out in jobs])
+        for (key, _script, _extra, out), proc in zip(jobs, procs):
+            cls._generated[key] = (out, proc)
+        ok = [str(out) for (_k, _s, _e, out), proc in zip(jobs, procs) if proc.returncode == 0 and out.exists()]
+        script = ("foreach ($f in ($env:DVE_PARSE_FILES -split '\\|')) { $t=$null;$e=$null;"
+                  "[void][System.Management.Automation.Language.Parser]::ParseFile($f,[ref]$t,[ref]$e);Write-Output ($f + '|' + $e.Count) }")
+        parsed = run_pwsh(["-Command", script], env_extra={"DVE_PARSE_FILES": "|".join(ok)}) if ok else None
+        if parsed is not None and parsed.returncode == 0:
+            for line in parsed.stdout.splitlines():
+                path, _sep, count = line.rpartition("|")
+                if path and count.strip().isdigit():
+                    cls._parse_cache[path] = int(count)
+
     def generate(self, script: Path, out_name: str, extra: list[str]) -> Path:
-        out = self.tmp / out_name
-        proc = run_pwsh(["-File", str(script), "-SourceCommit", self.head, "-BuildManifestSha256", "ab" * 32,
-                         "-ClipId", FIXTURE_IDS[0], "-FixtureSha256", "cd" * 32, "-RepoRoot", str(self.repo),
-                         "-OutFile", str(out), *extra])
+        """The same script and arguments emit the same bytes whatever the output file is called, so a request is run once per class (see `warm_requests`).
+        The warm-up is opt-in per class: only a class that sets `warm_first = True` in its own body runs it. A subclass (CpuGeneratedJobs.Boot asks for ~5 jobs) or a
+        borrower that did not opt in would otherwise pay the whole ~60-job warm-up on its first request, and so would any future subclass."""
+        cls = type(self)
+        if cls.__dict__.get("warm_first", False) and not cls._warmed:
+            cls._warmed = True
+            cls.warm_generated()
+        key = (str(script), tuple(extra))
+        if key not in cls._generated:
+            out = self.tmp / f"gen-{len(cls._generated)}-{out_name}"   # (unique: a cached job is never overwritten by a later request that reuses a name)
+            cls._generated[key] = (out, run_pwsh(self.generator_command(script, out, extra)))
+        out, proc = cls._generated[key]
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         return out
 
@@ -455,6 +541,8 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         self.assertFalse(out.exists())
 
     def parse_errors(self, job: Path) -> int:
+        if str(job) in self._parse_cache:   # (a job `warm_generated` parsed: a generated file is never rewritten)
+            return self._parse_cache[str(job)]
         script = ("$t=$null;$e=$null;[void][System.Management.Automation.Language.Parser]::ParseFile("
                   f"'{job}',[ref]$t,[ref]$e);Write-Output $e.Count")
         proc = run_pwsh(["-Command", script])
@@ -647,15 +735,15 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         post = stripped.index(self.SELF_HEAL_POST_OPEN)
         post_end = stripped.index("\n}\n", stripped.index("} catch {", post)) + 3
         self.assertEqual(stripped[:post] + stripped[post_end:], plain)
-        for extra, token in ((["-GpuPreLaunches", "702@120"], "DUAL_VENUE_GPU_PRE_LAUNCH_NEEDS_SETTINGS_DIR"),
-                             (["-AutomationSettingsDir", "s", "-GpuPreLaunches", "702@120", "-ForceLookAssist", "-ContactSheet"], "DUAL_VENUE_GPU_PRE_LAUNCH_NEEDS_SPEED_LEG"),
-                             (["-AutomationSettingsDir", "s", "-GpuPreLaunches", "701@1"], "DUAL_VENUE_GPU_PRE_LAUNCH_INVALID"),
-                             (["-AutomationSettingsDir", "s", "-GpuPreLaunches", "none,none,none,none,none"], "DUAL_VENUE_GPU_PRE_LAUNCH_INVALID"),
-                             (["-GpuFaultInject", "701@1"], "GpuFaultInject"),
-                             (["-AutomationSettingsDir", "..\\x"], "AutomationSettingsDir")):
-            out = self.tmp / "sh-refused.job.ps1"
-            proc = run_pwsh(["-File", str(GENERATOR), "-SourceCommit", self.head, "-BuildManifestSha256", "ab" * 32,
-                             "-ClipId", FIXTURE_IDS[0], "-FixtureSha256", "cd" * 32, "-RepoRoot", str(self.repo), "-OutFile", str(out), *extra])
+        cases = ((["-GpuPreLaunches", "702@120"], "DUAL_VENUE_GPU_PRE_LAUNCH_NEEDS_SETTINGS_DIR"),
+                 (["-AutomationSettingsDir", "s", "-GpuPreLaunches", "702@120", "-ForceLookAssist", "-ContactSheet"], "DUAL_VENUE_GPU_PRE_LAUNCH_NEEDS_SPEED_LEG"),
+                 (["-AutomationSettingsDir", "s", "-GpuPreLaunches", "701@1"], "DUAL_VENUE_GPU_PRE_LAUNCH_INVALID"),
+                 (["-AutomationSettingsDir", "s", "-GpuPreLaunches", "none,none,none,none,none"], "DUAL_VENUE_GPU_PRE_LAUNCH_INVALID"),
+                 (["-GpuFaultInject", "701@1"], "GpuFaultInject"),
+                 (["-AutomationSettingsDir", "..\\x"], "AutomationSettingsDir"))
+        outs = [self.tmp / f"sh-refused-{n}.job.ps1" for n in range(len(cases))]
+        procs = run_pwsh_many([self.generator_command(GENERATOR, out, extra) for out, (extra, _token) in zip(outs, cases)])   # (independent runs, one pwsh each)
+        for out, (extra, token), proc in zip(outs, cases, procs):
             self.assertNotEqual(proc.returncode, 0, token)
             self.assertIn(token, proc.stdout + proc.stderr)
             self.assertFalse(out.exists(), token)
@@ -917,16 +1005,16 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
             self.assertIn("$PlaySeconds = 28", text, name)
 
     def test_refused_combinations_throw_before_emitting(self) -> None:
-        for extra, token in ((["-Backend", "cpu", "-DisablePaintPerSubmit"], "DUAL_VENUE_CPU_BACKEND_CONFLICT"),
-                             (["-ForceLookAssist"], "DUAL_VENUE_LOOK_REQUIRES_CONTACT_SHEET"),
-                             (["-LookPaceLeg"], "DUAL_VENUE_LOOK_PACE_LEG_SHAPE"),
-                             (["-ForceLookAssist", "-ContactSheet", "-LookPaceLeg"], "DUAL_VENUE_LOOK_PACE_LEG_SHAPE"),
-                             (["-PlaybackRenderLookaheadFrames", "3"], "DUAL_VENUE_LOOKAHEAD_NEEDS_LOOK_PACE_LEG"),
-                             (["-ForceLookAssist", "-ContactSheet", "-DisableLookAssist"], "DUAL_VENUE_LOOK_ASSIST_CONFLICT"),
-                             (["-ForceLookAssist", "-LookPaceLeg", "-LookFlavor", "cinematic", "-DisableLookAssist"], "DUAL_VENUE_LOOK_ASSIST_CONFLICT")):
-            out = self.tmp / "refused.job.ps1"
-            proc = run_pwsh(["-File", str(GENERATOR), "-SourceCommit", self.head, "-BuildManifestSha256", "ab" * 32,
-                             "-ClipId", FIXTURE_IDS[0], "-FixtureSha256", "cd" * 32, "-RepoRoot", str(self.repo), "-OutFile", str(out), *extra])
+        cases = ((["-Backend", "cpu", "-DisablePaintPerSubmit"], "DUAL_VENUE_CPU_BACKEND_CONFLICT"),
+                 (["-ForceLookAssist"], "DUAL_VENUE_LOOK_REQUIRES_CONTACT_SHEET"),
+                 (["-LookPaceLeg"], "DUAL_VENUE_LOOK_PACE_LEG_SHAPE"),
+                 (["-ForceLookAssist", "-ContactSheet", "-LookPaceLeg"], "DUAL_VENUE_LOOK_PACE_LEG_SHAPE"),
+                 (["-PlaybackRenderLookaheadFrames", "3"], "DUAL_VENUE_LOOKAHEAD_NEEDS_LOOK_PACE_LEG"),
+                 (["-ForceLookAssist", "-ContactSheet", "-DisableLookAssist"], "DUAL_VENUE_LOOK_ASSIST_CONFLICT"),
+                 (["-ForceLookAssist", "-LookPaceLeg", "-LookFlavor", "cinematic", "-DisableLookAssist"], "DUAL_VENUE_LOOK_ASSIST_CONFLICT"))
+        outs = [self.tmp / f"refused-{n}.job.ps1" for n in range(len(cases))]
+        procs = run_pwsh_many([self.generator_command(GENERATOR, out, extra) for out, (extra, _token) in zip(outs, cases)])   # (independent runs, one pwsh each)
+        for out, (extra, token), proc in zip(outs, cases, procs):
             self.assertNotEqual(proc.returncode, 0)
             self.assertIn(token, proc.stdout + proc.stderr)
             self.assertFalse(out.exists())
@@ -2173,13 +2261,16 @@ class ProductionRepo:
     runner is exercised exactly as production runs it (no test seam), against the committed-revision rule."""
 
     def __init__(self, test: unittest.TestCase, records: list[dict], cleanup_gone: bool = False, mutations: list[tuple[str, str, str]] | None = None,
-                 blankets: list[dict] | None = None) -> None:
+                 blankets: list[dict] | None = None, shipped_legs: bool = False) -> None:
         self.test = test
         tmp = tempfile.TemporaryDirectory(prefix="dve-prod-")
         test.addCleanup(tmp.cleanup)
         self.root = Path(tmp.name) / "repo"
         self.dv = self.root / "tools" / "profiling" / "dual-venue"
-        shutil.copytree(DV, self.dv)
+        # The validator reads EVERY committed leg spec (two git spawns each) to find the one a receipt names by sha, so the ~70 shipped legs cost ~15 s
+        # per validation (the bulk of this file's runtime). A throwaway repo therefore carries only the legs a test commits itself (commit_leg);
+        # `shipped_legs=True` keeps the whole shipped legs/ directory for the tests that exercise the lookup against the real tree.
+        shutil.copytree(DV, self.dv, ignore=None if shipped_legs else lambda directory, names: [n for n in names if Path(directory) == DV / "legs" and n.endswith(".json")])
         for name, old, new in mutations or []:
             path = self.dv / name
             text = path.read_text(encoding="utf-8")
@@ -2768,9 +2859,10 @@ class EvidenceFactory(RunnerHarness):
     """Builds evidence-bearing receipts. Mixed into a TestCase whose setUp calls make_harness()."""
 
     def prod_repo(self, venue: str = "ultra-magnus", records: list[dict] | None = None, cleanup_gone: bool = True, leg_type: str = "speed",
-                  spec: Path | None = None, mutations: list[tuple[str, str, str]] | None = None, blankets: list[dict] | None = None) -> ProductionRepo:
+                  spec: Path | None = None, mutations: list[tuple[str, str, str]] | None = None, blankets: list[dict] | None = None,
+                  shipped_legs: bool = False) -> ProductionRepo:
         recs = [consent_record(venue, OWNER_CLIP)] if records is None else records
-        repo = ProductionRepo(self, records=recs, cleanup_gone=cleanup_gone, mutations=mutations, blankets=blankets)
+        repo = ProductionRepo(self, records=recs, cleanup_gone=cleanup_gone, mutations=mutations, blankets=blankets, shipped_legs=shipped_legs)
         self.spec_path = spec or self.write_spec(leg_type=leg_type)
         repo.commit_leg(self.spec_path, "unit-leg.json")
         return repo
@@ -2964,7 +3056,7 @@ class EvidenceBoundReceiptTests(EvidenceFactory, ModuleMutationMixin, unittest.T
 
     # -- the sound path -------------------------------------------------------------------------------------------------
     def test_a_receipt_built_through_the_evidence_path_is_verified_and_pass_vs_fail_is_derived_from_the_committed_criteria(self) -> None:
-        repo = self.prod_repo()
+        repo = self.prod_repo(shipped_legs=True)   # the one test that keeps the whole shipped legs/ tree, so the validator's scan of every committed leg stays covered
         ev = self.evidence("ok")
         self.assertAdvisory(self.receipt_for(repo, ev), repo)
         # the criteria come from the COMMITTED leg spec (supplementary/cuda: rows gt 0): a run whose rows are 0 is a derived FAIL
@@ -6729,13 +6821,80 @@ def write_visual_captures(dest: Path, mode: str = "ok") -> None:
                                                                   "reason": None, "forwarded": True, "presentMonWindowEndUtc": "2026-10-13T22:00:00.000Z"}), encoding="utf-8")
 
 
+class GeneratorWarmUpIsOptInPerClassTests(unittest.TestCase):
+    """The generator class's concurrent warm-up (~60 jobs) belongs to the class that defines the warm list. A subclass that does not set `warm_first` in its own body
+    (test_dve_leg_terminals.CpuGeneratedJobs.Boot asks for ~5 jobs) performs zero warm runs. No pwsh runs here: `warm_generated` is counted, not executed."""
+
+    @staticmethod
+    def stubs() -> tuple[list[str], type, type, type]:
+        calls: list[str] = []
+        key = (str(Path("job-generator.ps1")), ())
+
+        class Defining(GeneratorByteIdentityAndVariantTests):
+            warm_first = True
+
+            @classmethod
+            def setUpClass(cls) -> None:
+                cls._generated = {key: (Path("cached.job.ps1"), subprocess.CompletedProcess([], 0, "", ""))}
+                cls._parse_cache = {}
+                cls._warmed = False
+
+            @classmethod
+            def tearDownClass(cls) -> None:
+                pass
+
+            @classmethod
+            def warm_generated(cls) -> None:
+                calls.append(cls.__name__)
+
+            def runTest(self) -> None:  # pragma: no cover - never run
+                pass
+
+        class Inheriting(Defining):
+            pass
+
+        class OptedIn(Defining):
+            warm_first = True
+
+        return calls, Defining, Inheriting, OptedIn
+
+    def request(self, cls: type) -> None:
+        cls.setUpClass()
+        cls("runTest").generate(Path("job-generator.ps1"), "x.job.ps1", [])
+
+    def test_the_real_generator_class_defines_the_flag_in_its_own_body(self) -> None:
+        self.assertIs(GeneratorByteIdentityAndVariantTests.__dict__.get("warm_first"), True)
+
+    def test_the_defining_class_still_warms_once(self) -> None:
+        calls, defining, _inheriting, _opted_in = self.stubs()
+        self.request(defining)
+        defining("runTest").generate(Path("job-generator.ps1"), "y.job.ps1", [])
+        self.assertEqual(calls, ["Defining"])
+
+    def test_a_subclass_that_does_not_opt_in_performs_zero_warm_runs(self) -> None:
+        calls, _defining, inheriting, _opted_in = self.stubs()
+        self.assertTrue(inheriting.warm_first, "the flag is still visible through inheritance; only the class's own body counts")
+        self.request(inheriting)
+        self.assertEqual(calls, [])
+
+    def test_a_subclass_can_opt_in_in_its_own_body(self) -> None:
+        calls, _defining, _inheriting, opted_in = self.stubs()
+        self.request(opted_in)
+        self.assertEqual(calls, ["OptedIn"])
+
+    def test_the_visual_capture_borrower_performs_zero_warm_runs(self) -> None:
+        self.assertFalse(VisualCaptureGeneratorTests.__dict__.get("warm_first", False))
+
+
 @requires_windows_pwsh
 class VisualCaptureGeneratorTests(unittest.TestCase):
     """-VisualCapture adds exactly three bracketed regions to the job (helpers + probe + argument; the PresentMon window cut; the publish) and nothing else."""
 
     setUpClass = classmethod(GeneratorByteIdentityAndVariantTests.setUpClass.__func__)
     tearDownClass = classmethod(GeneratorByteIdentityAndVariantTests.tearDownClass.__func__)
+    warm_first = False   # six requests, not the generator class's ~60: nothing to warm
     generate = GeneratorByteIdentityAndVariantTests.generate
+    generator_command = classmethod(GeneratorByteIdentityAndVariantTests.generator_command.__func__)
     parse_errors = GeneratorByteIdentityAndVariantTests.parse_errors
 
     @staticmethod
