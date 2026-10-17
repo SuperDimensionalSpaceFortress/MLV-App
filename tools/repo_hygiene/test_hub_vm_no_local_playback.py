@@ -38,6 +38,15 @@ LINT_PS1 = ROOT / "tools" / "coordination" / "lane-local-playback-lint.ps1"
 INVOKE_LANE = ROOT / "tools" / "coordination" / "Invoke-Lane.ps1"
 PROFILING = ROOT / "tools" / "profiling"
 
+
+def _lint_reading_body() -> str:
+    """The text where the lint READS its word lists: the cached pattern-set builder (Get-LintPatternSet, which turns every exposed list
+    into a pattern once per process since r11) through the end of the file, which includes the findings function. The structural pins
+    below check this region, so a list member cannot be exposed and left unread by either function."""
+    text = LINT_PS1.read_text(encoding="utf-8")
+    return text[text.index("function Get-LintPatternSet"):]
+
+
 PWSH = shutil.which("pwsh")
 requires_pwsh = unittest.skipIf(PWSH is None, "pwsh is not on PATH")
 
@@ -3202,13 +3211,13 @@ class ListMemberDefeaterTests(unittest.TestCase):
 
     def test_the_lint_builds_its_patterns_from_those_lists(self):
         """The exposed lists must be the lists the lint USES, not a second copy that can drift: the findings function reads them, and the
-        literal alternation they replaced is gone."""
-        text = LINT_PS1.read_text(encoding="utf-8")
-        body = text[text.index("function Get-LocalPlaybackPromptFindings"):]
+        literal alternation they replaced is gone. Since r11 the reads live in the cached builder (Get-LintPatternSet), so the pin checks the
+        builder plus the findings function."""
+        body = _lint_reading_body()
         self.assertIn("Get-LocalPlaybackLintWordLists", body)
         for key in ("VenueFollowLocus", "VenueFollowPhrases", "HostDeterminers", "HostNouns", "HostNames", "HostPrepositions", "HostLocusPrepositions", "ContrastWords",
                     "RoutingPrepositionsLocally", "RoutingPrepositionsVenue", "VenueWords"):
-            self.assertIn(f"$lists.{key}", body, f"the findings function does not read list {key}")
+            self.assertIn(f"$lists.{key}", body, f"the lint does not read list {key}")
         self.assertNotRegex(body, r"\$venueFollow\s*=\s*'", "a literal follow alternation came back")
 
     def test_every_follow_member_is_documented_locus_preserving(self):
@@ -3342,10 +3351,9 @@ class ListMemberDefeaterTests(unittest.TestCase):
         no destination preposition can enter the grammar."""
         for key in ("TailLocusPrepositions", "TailArticles", "TailJoiners", "TailNegations", "TailNegationPrepositions", "TailPureLocus"):
             self.assertTrue(self.lists.get(key), f"list {key} is missing or empty")
-        text = LINT_PS1.read_text(encoding="utf-8")
-        body = text[text.index("function Get-LocalPlaybackPromptFindings"):]
+        body = _lint_reading_body()
         for key in ("TailLocusPrepositions", "TailArticles", "TailJoiners", "TailNegations", "TailNegationPrepositions", "TailPureLocus"):
-            self.assertIn(f"$lists.{key}", body, f"the findings function does not read list {key}")
+            self.assertIn(f"$lists.{key}", body, f"the lint (builder + findings function) does not read list {key}")
         for gone in ("TailHandlingVerbs", "TailLaunchVerbs", "TailDestinationPrepositions"):
             self.assertNotIn(gone, self.lists, f"{gone} came back: r10 decides a tail by a closed grammar, not by enumerating verbs")
         self.assertEqual(["at", "on", "through", "using", "via"], sorted(self.lists["TailLocusPrepositions"]))
@@ -3422,9 +3430,8 @@ class ListMemberDefeaterTests(unittest.TestCase):
         self.assertTrue(self.lists.get("HeadExecutableWords"), "list HeadExecutableWords is missing or empty")
         self.assertEqual([], [w for w in self.lists["HeadExecutableWords"] if w in self.lists["HeadObjectWords"]])
         self.assertEqual([], [w for w in self.lists["HeadObjectWords"] if w.lower().endswith(".exe") or w.lower().startswith("mlvapp")])
-        body = LINT_PS1.read_text(encoding="utf-8")
-        body = body[body.index("function Get-LocalPlaybackPromptFindings"):]
-        self.assertIn("$lists.HeadExecutableWords", body, "the findings function does not read list HeadExecutableWords")
+        body = _lint_reading_body()
+        self.assertIn("$lists.HeadExecutableWords", body, "the lint (builder + findings function) does not read list HeadExecutableWords")
 
     def test_r12_head_lists_are_exposed_read_by_the_lint_and_closed(self):
         """r12: the head grammar's lists are exposed and read by the findings function; the old blacklist machinery is gone, and no
@@ -3432,9 +3439,9 @@ class ListMemberDefeaterTests(unittest.TestCase):
         for key in ("LaunchVerbs", "HeadObjectWords", "HeadFillers", "HeadJoiners", "HeadProhibitions", "HeadContrasts"):
             self.assertTrue(self.lists.get(key), f"list {key} is missing or empty")
         text = LINT_PS1.read_text(encoding="utf-8")
-        body = text[text.index("function Get-LocalPlaybackPromptFindings"):]
+        body = _lint_reading_body()
         for key in ("LaunchVerbs", "HeadObjectWords", "HeadFillers", "HeadJoiners", "HeadProhibitions", "HeadContrasts"):
-            self.assertIn(f"$lists.{key}", body, f"the findings function does not read list {key}")
+            self.assertIn(f"$lists.{key}", body, f"the lint (builder + findings function) does not read list {key}")
         for gone in ("Get-LeftoverPrepositionIndex", "Test-HeadClauseBenign", "Test-SentenceHeadBenign", "Test-ItemDirty", "$headState.Budget",
                      "$headState.Memo"):
             self.assertNotIn(gone, text, f"{gone} came back: r12 reads the head by a closed whitelist, not by a blacklist")
