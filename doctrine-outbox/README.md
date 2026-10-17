@@ -75,6 +75,33 @@ pattern, a user-home path, this host's name or account name, or anything in an o
 adds its own deny terms: `.claude-state`, `subject-ledger`, `fleet-runs`, `HUB_RUN_WAL`, `dual-lane`, and
 the name of the GPU host. A refusal names the class, never the matched value.
 
+## Routes are run, and candidates name what they supersede (CARD-ROUTE-EXERCISE-1)
+
+CoS work order FWO-DEFECT-PREVENT-1 items 3 and 4, both in `validate`.
+
+**Run a card's route before pushing it.** `python tools/coordination/doctrine_outbox.py validate --exercise
+--bus <bus clone> doctrine-outbox/<file>.md` (the bus defaults to `$FACTORY_BUS_CLONE`) clones the bus's committed
+tip into a scratch directory with `git clone --local --no-hardlinks`, drops its `origin`, and runs every command the
+item names there, without a shell, then removes that directory by name. The bus is only read; no route runs in it,
+and a `--scratch-root` inside it is refused (exit 2). A command is:
+- a line of a fenced block whose info string starts `route` (`$ ` or `> ` prompt and `#` lines dropped); or
+- a backticked span of two or more words inside a route section, which opens at a `Route:` or `Adopt:` label
+  line (bullet and bold allowed) and runs to the next blank line, `#` heading or fence. Bullets right under it,
+  such as `- **Pin:**`, are in the section. A one-word span (`debt`, `RULINGS.md`) is a name, not a command.
+
+Each command prints one `ROUTE_OK`, `ROUTE_MISSING` (no such program, or the python/node/bash/sh/pwsh script it
+names is not in the clone), `ROUTE_FAILED` (non-zero exit, an unfilled `<name>` placeholder, or it does not
+parse), `ROUTE_TIMEOUT` (`--timeout`, default 60 s) or `ROUTE_UNSAFE` line, then the item name and the command.
+Anything but OK exits 1. Give `<name>` placeholders a value with `--fill name=VALUE`. A route must be exercisable
+offline: a pipe or redirect, `git push`, any `gh`, `claude`/`codex` `auth|login|logout`, a network client, a
+publish verb, a URL or `user@host:` argument, a credential name or `--token`, and inline code (`python -c`) are
+`ROUTE_UNSAFE` and are not run. Put a command a card ships but the bus does not yet have in prose, not in a route.
+
+**A ruling candidate names the rules it overlaps.** An item whose `### ` heading holds `RULING CANDIDATE:` or whose
+body has a line opening `Ruling candidate` must carry a `touches/supersedes:` list: rule ids on that line, or as
+bullets under it, or the single entry `none: <reason of at least 4 words>`. `validate` refuses it otherwise
+(`RULING_CANDIDATE_NO_SUPERSEDES`, `_NONE_NEEDS_REASON`, `_NONE_WITH_RULES`), with or without `--exercise`.
+
 ## Concerns to the CoS (COS-CONCERN-CHANNEL-1)
 
 A project had no way to tell the CoS a concern: only the CoS writes `cos-feedback/`, and a project-owned
