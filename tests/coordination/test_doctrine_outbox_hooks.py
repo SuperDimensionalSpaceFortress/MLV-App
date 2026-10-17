@@ -900,7 +900,8 @@ def test_install_splices_the_guard_ahead_of_a_hook_that_execs_another_command(ob
 
 def test_install_refuses_a_guard_that_sits_after_a_terminating_exit_or_exec(ob, repo, capsys):
     """A guard behind a top-level `exit`/`exec` never runs. install-hooks must say so, not report
-    "present" or "repaired" for it, and must not rewrite the file."""
+    "present" or "repaired" for it, and must not rewrite the file.
+    r9: a RECOGNISED block behind an `exit`/`exec` is moved ahead of it and reported `repaired` (CoS r7 improvement 1)."""
     hook = repo / ".git" / "hooks" / "pre-push"
     hook.parent.mkdir(parents=True, exist_ok=True)
     assert ob.install_pre_push(repo) == "installed"
@@ -913,9 +914,15 @@ def test_install_refuses_a_guard_that_sits_after_a_terminating_exit_or_exec(ob, 
     }
     for name, text in shapes.items():
         hook.write_text(text, encoding="utf-8", newline="\n")
-        assert ob.main(["install-hooks", str(repo)]) == 1, name
-        assert "HOOK_GUARD_UNREACHABLE" in capsys.readouterr().err, name
-        assert hook.read_text(encoding="utf-8") == text, f"{name}: a refused install must not rewrite the hook"
+        # r9 (CoS r7 improvement 1): a recognised guard behind an `exit`/`exec` is MOVED to the splice point, not
+        # refused. r8 and earlier asserted exit code 1, HOOK_GUARD_UNREACHABLE on stderr and an untouched hook here.
+        assert ob.main(["install-hooks", str(repo)]) == 0, name
+        captured = capsys.readouterr()
+        assert captured.out.strip() == "repaired" and "HOOK_GUARD_UNREACHABLE" not in captured.err, (name, captured)
+        moved = hook.read_text(encoding="utf-8")
+        assert moved != text and moved.count("# doctrine-outbox-guard:") == 1, f"{name}: the guard was not moved"
+        assert moved.index("# doctrine-outbox-guard:") < re.search(r"^(exit|exec)\b", moved, re.MULTILINE).start(), name
+        assert ob.install_pre_push(repo) == "present", name
     # `exec < file` only redirects and an indented `exit` is conditional: neither ends the hook.
     hook.write_text("#!/bin/sh\nif [ -n \"$SKIP_LAYER\" ]; then\n  exit 0\nfi\nexec 3>&1\n" + current_guard, encoding="utf-8", newline="\n")
     # r7: a guard behind real layers is no longer "present": it moves to the splice point ("repaired"), after
@@ -992,6 +999,24 @@ def test_repair_moves_an_older_guard_ahead_of_a_layer_that_reads_the_ref_lines(o
     assert ob.install_pre_push(repo) == "present"
 
 
+def test_repair_moves_an_older_guard_that_sits_after_a_top_level_exit(ob, repo, tmp_path):
+    """CoS r7 improvement 1 (comment 6227688765): r1-r4 appended the guard at the end, so every project hook that
+    ends in `exit 0` holds a dead older guard. Repair used to refuse that one population (the pre-move check on
+    the OLD position); it now moves the block ahead of the exit, and the check on the NEW index stays."""
+    _origin_with_master(repo, tmp_path)
+    hook = repo / ".git" / "hooks" / "pre-push"
+    # The CoS repro: hook body `echo L; exit 0`, then an r4 install (guard appended at the end).
+    hook.write_text("#!/bin/sh\necho L\nexit 0\n\n" + _guard_block(spool=True, python_missing_passes=True),
+                    encoding="utf-8", newline="\n")
+    assert ob.install_pre_push(repo) == "repaired"   # on 87569086 this raised HOOK_GUARD_UNREACHABLE
+    text = hook.read_text(encoding="utf-8")
+    assert text.count("# doctrine-outbox-guard:") == 1 and "the push guard did not run" not in text
+    assert text.index("doctrine-outbox-guard") < text.index("echo L") < text.index("exit 0"), "the guard is still behind the exit"
+    refused = _push_undeclared(repo)
+    assert refused.returncode != 0 and "PUSH REFUSED" in refused.stderr, f"undeclared push was allowed: {refused.returncode} {refused.stderr}"
+    assert ob.install_pre_push(repo) == "present"
+
+
 _HOSTILE_SHAPES = {
     "ends-in-exit-0": "echo the-hooks-own-layer >&2\nexit 0\n",
     "execs-another-hook": 'exec cat > "$DOWNSTREAM_OUT"\n',
@@ -1012,6 +1037,11 @@ def _outcome_hook(kind: str, shape_body: str, ob, repo: Path) -> tuple[str, str]
         hook.write_text(head + shape_body, encoding="utf-8", newline="\n")
         assert ob.install_pre_push(repo) == "installed"
         return hook.read_text(encoding="utf-8"), "present"
+    if kind == "edited-block":
+        # r9: a block someone edited by hand: the marker is there, but there is no end marker and no known older
+        # shape, so its extent cannot be told. The one kind that stays refused (see _CELL_REFUSAL_REASON).
+        return (head + shape_body + "\n# doctrine-outbox-guard: findings reach the bus by file; a finding-path commit must declare.\n"
+                "echo edited-by-the-owner >&2\n"), "refused"
     # A CURRENT guard appended behind the shape: it is no more reachable than an old one.
     hook = repo / ".git" / "hooks" / "pre-push"
     hook.write_text(head, encoding="utf-8", newline="\n")
@@ -1020,24 +1050,39 @@ def _outcome_hook(kind: str, shape_body: str, ob, repo: Path) -> tuple[str, str]
     return head + shape_body + "\n" + current[current.index("# doctrine-outbox-guard"):], "repaired"
 
 
-@pytest.mark.parametrize("kind", ["installed", "repaired", "present", "current-guard-appended"])
-@pytest.mark.parametrize("shape", sorted(_HOSTILE_SHAPES))
-def test_no_install_outcome_leaves_a_dead_guard_behind_a_hostile_hook_shape(ob, repo, tmp_path, capsys, kind, shape):
-    """CoS r6 prevention check: every install outcome over every hostile hook shape either refuses the install
-    or leaves a guard that refuses an undeclared push. "installed", "repaired" or "present" with a guard the push
-    never reaches is the failure; it was found one outcome at a time in r5, r6 and r7."""
+_MATRIX_KINDS = ["installed", "repaired", "present", "current-guard-appended", "edited-block"]
+# r9 (CoS r7 improvement 2, ACK 6227942977): ONE pinned outcome per cell. r7 and r8 accepted any refusal in any
+# cell, so a safe repair that regressed into a refusal still passed (repaired x ends-in-exit-0 did exactly that
+# until r9). A pin is "installed" / "repaired" / "present", or ("refused", CODE).
+_CELL_PINS = {
+    **{("installed", s): "installed" for s in _HOSTILE_SHAPES},              # fresh install: the guard goes ahead of every layer
+    **{("repaired", s): "repaired" for s in _HOSTILE_SHAPES},                # an r4 block is moved to the splice point
+    **{("present", s): "present" for s in _HOSTILE_SHAPES},                  # the install above is already at the splice point
+    **{("current-guard-appended", s): "repaired" for s in _HOSTILE_SHAPES},  # a current block behind the layers is moved too
+    **{("edited-block", s): ("refused", "HOOK_UNRECOGNISED") for s in _HOSTILE_SHAPES},
+}
+# Every refused cell carries the written reason a move is not safe there (the CoS prevention check).
+_CELL_REFUSAL_REASON = {
+    "edited-block": "the block has a marker but no end marker and no known older shape, so where it ends cannot be proved; "
+                    "moving it would cut into the owner's own lines of the hook, and leaving it would report a dead guard as live",
+}
+
+
+def _check_matrix_cell(ob, repo: Path, tmp_path: Path, capsys, kind: str, shape: str, pin) -> None:
+    """Run install-hooks over one (kind, shape) cell and assert the cell's outcome equals `pin` exactly."""
     _origin_with_master(repo, tmp_path)
     hook = repo / ".git" / "hooks" / "pre-push"
-    text, expected = _outcome_hook(kind, _HOSTILE_SHAPES[shape], ob, repo)
+    text, _unused = _outcome_hook(kind, _HOSTILE_SHAPES[shape], ob, repo)
     hook.write_text(text, encoding="utf-8", newline="\n")
     capsys.readouterr()
     rc = ob.main(["install-hooks", str(repo)])
     out = capsys.readouterr()
-    if rc != 0:
-        assert "HOOK_GUARD_UNREACHABLE" in out.err or "HOOK_UNRECOGNISED" in out.err, out.err
+    if isinstance(pin, tuple):
+        code = pin[1]
+        assert rc != 0 and code in out.err, f"{kind}/{shape}: pinned as refused with {code}, got rc={rc} out={out.out!r} err={out.err!r}"
         assert hook.read_text(encoding="utf-8") == text, "a refused install must not rewrite the hook"
         return
-    assert out.out.strip() == expected, (out.out, out.err)
+    assert rc == 0 and out.out.strip() == pin, f"{kind}/{shape}: pinned as {pin!r}, got rc={rc} out={out.out!r} err={out.err!r}"
     assert hook.read_text(encoding="utf-8").count("# doctrine-outbox-guard:") == 1
     seen = tmp_path / "downstream.bin"
     commit(repo, {"coordination/tools/other.py": "print(1)\n"}, "undeclared")
@@ -1045,6 +1090,38 @@ def test_no_install_outcome_leaves_a_dead_guard_behind_a_hostile_hook_shape(ob, 
                              env={**os.environ, "DOWNSTREAM_OUT": str(seen)})
     assert refused.returncode != 0 and "PUSH REFUSED" in refused.stderr, f"{kind}/{shape}: the guard is dead: {refused.stderr}"
     assert not seen.exists() and "the-hooks-own-layer" not in refused.stderr
+
+
+@pytest.mark.parametrize("kind", _MATRIX_KINDS)
+@pytest.mark.parametrize("shape", sorted(_HOSTILE_SHAPES))
+def test_no_install_outcome_leaves_a_dead_guard_behind_a_hostile_hook_shape(ob, repo, tmp_path, capsys, kind, shape):
+    """CoS r6 prevention check, r9 form: every install outcome over every hostile hook shape matches ONE pinned
+    outcome. "installed", "repaired" or "present" must leave a guard that refuses an undeclared push; a pinned
+    refusal must name its code and leave the hook untouched. A cell that drifts from its pin fails."""
+    _check_matrix_cell(ob, repo, tmp_path, capsys, kind, shape, _CELL_PINS[(kind, shape)])
+
+
+def test_every_matrix_cell_has_exactly_one_pin_and_every_refused_cell_has_a_written_reason():
+    cells = {(k, s) for k in _MATRIX_KINDS for s in _HOSTILE_SHAPES}
+    assert set(_CELL_PINS) == cells, "a cell has no pin, or a pin names no cell"
+    for (kind, shape), pin in _CELL_PINS.items():
+        if isinstance(pin, tuple):
+            assert pin[0] == "refused" and re.fullmatch(r"HOOK_[A-Z_]+", pin[1]), (kind, shape, pin)
+            assert len(_CELL_REFUSAL_REASON.get(kind, "")) > 40, f"refused cell {kind}/{shape} carries no written reason a move is unsafe"
+        else:
+            assert pin in ("installed", "repaired", "present"), (kind, shape, pin)
+
+
+def test_flipping_a_cells_pin_turns_the_matrix_red(ob, repo, tmp_path, capsys):
+    """r9 improvement 2: the repaired x ends-in-exit-0 cell is `repaired`. Pinned as a refusal (what r7 and r8 let
+    pass) or as `installed`, the same cell must FAIL; the correct pin must pass."""
+    scratch = tmp_path / "flip"
+    scratch.mkdir()
+    for wrong in (("refused", "HOOK_GUARD_UNREACHABLE"), "installed", "present"):
+        with pytest.raises(AssertionError):
+            _check_matrix_cell(ob, repo, scratch, capsys, "repaired", "ends-in-exit-0", wrong)
+        git(repo, "remote", "remove", "origin")   # each call adds the scratch origin again
+    _check_matrix_cell(ob, repo, scratch, capsys, "repaired", "ends-in-exit-0", "repaired")
 
 
 # ---------- r8: the new-branch base comes only from a ref the hook guards ----------
