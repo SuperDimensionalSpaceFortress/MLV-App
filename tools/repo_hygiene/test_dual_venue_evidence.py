@@ -224,6 +224,8 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
     it against a sparse CLONE whose two fixture files are header-only ~30 s stand-ins (never real footage), the same
     device master's own generator tests use."""
 
+    warm_first = True   # the first `generate` of the class runs every request on `warm_requests` at once (a class that borrows `generate` leaves this False)
+
     @classmethod
     def setUpClass(cls) -> None:
         cls._tmp = tempfile.TemporaryDirectory(prefix="dve-gen-")
@@ -319,7 +321,7 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
     def generate(self, script: Path, out_name: str, extra: list[str]) -> Path:
         """The same script and arguments emit the same bytes whatever the output file is called, so a request is run once per class (see `warm_requests`)."""
         cls = type(self)
-        if not cls._warmed:
+        if cls.warm_first and not cls._warmed:
             cls._warmed = True
             cls.warm_generated()
         key = (str(script), tuple(extra))
@@ -6823,7 +6825,9 @@ class VisualCaptureGeneratorTests(unittest.TestCase):
 
     setUpClass = classmethod(GeneratorByteIdentityAndVariantTests.setUpClass.__func__)
     tearDownClass = classmethod(GeneratorByteIdentityAndVariantTests.tearDownClass.__func__)
+    warm_first = False   # six requests, not the generator class's ~60: nothing to warm
     generate = GeneratorByteIdentityAndVariantTests.generate
+    generator_command = classmethod(GeneratorByteIdentityAndVariantTests.generator_command.__func__)
     parse_errors = GeneratorByteIdentityAndVariantTests.parse_errors
 
     @staticmethod
