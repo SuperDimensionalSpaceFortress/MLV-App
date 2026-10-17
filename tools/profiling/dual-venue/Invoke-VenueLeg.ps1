@@ -398,6 +398,11 @@ try {
         if ($spec.generatorArgs.PSObject.Properties['rawPrefetchDecoders']) { $gen['RawPrefetchDecoders'] = [int]$spec.generatorArgs.rawPrefetchDecoders }
         # GPU-EVENT153-ROOTCAUSE-2: the CUDA per-launch timer and its line threshold, for any leg.
         if ($spec.generatorArgs.PSObject.Properties['cudaLaunchTimingMinMs']) { $gen['CudaLaunchTimingMinMs'] = [double]$spec.generatorArgs.cudaLaunchTimingMinMs }
+        # GPU-DEVICE-LOSS-SELF-HEAL-1 r2: the injected device loss, the safe-start clear, the shared settings store and the pre-launches of the self-heal proof, for any leg.
+        if ($spec.generatorArgs.PSObject.Properties['gpuFaultInject']) { $gen['GpuFaultInject'] = [string]$spec.generatorArgs.gpuFaultInject }
+        if ($spec.generatorArgs.PSObject.Properties['gpuSafeStart']) { $gen['GpuSafeStart'] = [string]$spec.generatorArgs.gpuSafeStart }
+        if ($spec.generatorArgs.PSObject.Properties['automationSettingsDir']) { $gen['AutomationSettingsDir'] = [string]$spec.generatorArgs.automationSettingsDir }
+        if ($spec.generatorArgs.PSObject.Properties['gpuPreLaunches']) { $gen['GpuPreLaunches'] = [string[]]@($spec.generatorArgs.gpuPreLaunches) }
         # UPSTREAM-CPU-BASELINE-1: a no-look leg runs the app with Look Assist OFF (the fork's default is on); the generator refuses it with a forced look, typed.
         if ($spec.generatorArgs.PSObject.Properties['disableLookAssist'] -and [bool]$spec.generatorArgs.disableLookAssist) { $gen['DisableLookAssist'] = $true }
         # PLAYBACK-STARTUP-CATCHUP-BURST-1 r7: the app's opt-in per-present playback trace, for any leg.
@@ -577,6 +582,13 @@ if ($artifactsShare -and (Test-Path -LiteralPath $artifactsShare -PathType Conta
     }
     $receipt.evidence.artifactIndexPath = $artifactsShare.TrimEnd('\') + '\artifact-index.json'
     $receipt.evidence.localEvidenceDir = $evidenceDir
+    # GPU-DEVICE-LOSS-SELF-HEAL-1 r2: a leg with generatorArgs.automationSettingsDir publishes <artifacts>\self-heal (each pre-launch's result, run log, GPU field
+    # log and INI; the measured run's GPU field log and INI; the store's delete record); it is fetched back into the local evidence. Absent on every other leg.
+    $selfHealShare = Join-Path $artifactsShare 'self-heal'
+    if (Test-Path -LiteralPath $selfHealShare -PathType Container) {
+        Copy-Item -LiteralPath $selfHealShare -Destination (Join-Path $evidenceDir 'self-heal') -Recurse
+        Write-Output "DVE_SELF_HEAL=$(Join-Path $evidenceDir 'self-heal') FILES=$(@(Get-ChildItem -LiteralPath (Join-Path $evidenceDir 'self-heal') -File -Recurse).Count)"
+    }
     # The launcher's result.json (the nonce it generated, the sha256 of the run-log snapshot) and the app's run log (the summary line
     # the proof is re-derived from).
     if (Test-Path -LiteralPath $resultLocal -PathType Leaf) {
@@ -703,6 +715,24 @@ if ($visualRequest.applies -and $visualRequest.requested -and $artifactsShare -a
         Copy-Item -LiteralPath $receipt.visual.stripPath -Destination $stripCopy -Force
         $receipt.visual.stripCopyPath = $stripCopy
     }
+    # GPU-DEVICE-LOSS-SELF-HEAL-1 r5: each self-heal pre-launch (the fallback runs L1-L3) published its own captures under self-heal\pre-<n>\visual; each gets the
+    # same visual block, keyed by its index (receipt.selfHealVisual). r6: the visual gate below folds every one of them into the leg's outcome. Absent on every other leg.
+    $selfHealLocal = Join-Path $evidenceDir 'self-heal'
+    if (Test-Path -LiteralPath $selfHealLocal -PathType Container) {
+        $receipt['selfHealVisual'] = [ordered]@{}
+        foreach ($preDir in @(Get-ChildItem -LiteralPath $selfHealLocal -Directory | Where-Object { $_.Name -cmatch '^pre-\d+$' } | Sort-Object { [int]$_.Name.Substring(4) })) {
+            $preVisual = Read-DvVisualCaptures -Requested $true -ArtifactsDir $preDir.FullName -EvidenceDir (Join-Path $preDir.FullName 'inspected') -LegId "$($spec.legId)-$($preDir.Name)" `
+                -Header "$($spec.legId) $($preDir.Name)  $Venue  $Backend  $($SourceCommit.Substring(0, 12))"
+            if ($preVisual.stripPath -and ($OfflineTestMode -or (Test-DvUnderClaudeState -Path $stripDir))) {
+                New-Item -ItemType Directory -Force -Path $stripDir | Out-Null
+                $preStripCopy = Join-Path $stripDir "strip-$($spec.legId)-$($preDir.Name)-$Venue-$Backend-$($SourceCommit.Substring(0, 8))-$runStamp.png"
+                Copy-Item -LiteralPath $preVisual.stripPath -Destination $preStripCopy -Force
+                $preVisual.stripCopyPath = $preStripCopy
+            }
+            $receipt['selfHealVisual'][$preDir.Name] = $preVisual
+            Write-Output "DVE_VISUAL_$($preDir.Name)=$($preVisual.verdict) STRIP=$(if ($preVisual.stripCopyPath) { $preVisual.stripCopyPath } elseif ($preVisual.stripPath) { $preVisual.stripPath } else { 'none' })"
+        }
+    }
 }
 
 $outcome = $resolved.outcome; $detail = $resolved.detail
@@ -759,14 +789,42 @@ if ($outcome -in @('PASS', 'FAIL') -and $proofProblems.Count -gt 0) {
     $detail = "INVALID: the job result was $outcome ($detail) but the receipt-oracle verdict is not valid: $($proofProblems -join '; ')"
     $outcome = 'INVALID'
 }
-# PLAYBACK-VISUAL-INSPECTION-1, the visual gate: a FROZEN_DISPLAY leg (one picture across the play frames while the app presented several) is not counted --
-# every cadence number can read perfect over a frozen display; a VISUAL_DIVERGENCE leg stays counted for speed and says so in its detail.
+# PLAYBACK-VISUAL-INSPECTION-1, the visual gate: a FROZEN_DISPLAY leg (one picture across the play frames while the app presented several AND the app records
+# the source frames as differing, source_difference "differ") is not counted -- every cadence number can read perfect over a frozen display; the same picture
+# over an unrecorded source is FROZEN_DISPLAY_SUSPECTED, and a VISUAL_DIVERGENCE leg stays counted for speed and says so in its detail.
 if ($outcome -in @('PASS', 'FAIL') -and $null -ne $receipt.visual) {
     if ($receipt.visual.verdict -ceq 'FROZEN_DISPLAY') {
         $detail = "INVALID: the job result was $outcome ($detail) but FROZEN_DISPLAY: $($receipt.visual.reason). A leg whose display did not change is not counted, whatever its cadence numbers say"
         $outcome = 'INVALID'
-    } elseif ($receipt.visual.verdict -ceq 'VISUAL_DIVERGENCE') {
-        $detail += "; VISUAL_DIVERGENCE (counted for speed, surfaced for review): $($receipt.visual.reason)"
+    } elseif ($receipt.visual.verdict -cin @('VISUAL_DIVERGENCE', 'FROZEN_DISPLAY_SUSPECTED', 'VISUAL_ASSESSMENT_UNAVAILABLE')) {
+        # (PLAYBACK-FROZEN-DISPLAY-SOURCE-DIFF-1: a single picture over an unknown source, and a leg with no viewport rectangle, are counted and surfaced like a divergence)
+        $detail += "; $($receipt.visual.verdict) (counted for speed, surfaced for review): $($receipt.visual.reason)"
+    }
+}
+# GPU-DEVICE-LOSS-SELF-HEAL-1 r7 (sol r6 blocker; ledger scope 2026-10-15T08:05:36Z): every self-heal pre-launch the leg ran must show an OK picture. The fallback
+# runs L1-L3 ARE what the leg proves, so a PASS/FAIL leg is INVALID when any pre-launch's visual verdict is anything but OK -- FROZEN_DISPLAY, VISUAL_DIVERGENCE,
+# NOT_CAPTURED, CAPTURE_BLANK, NOT_REQUESTED or a verdict this gate does not know -- or when a pre-launch the leg ran (pre-1..pre-<n> for the n entries of
+# generatorArgs.gpuPreLaunches, plus any pre-<n> it published) has no selfHealVisual entry or an entry with no verdict. The detail names every offending launch
+# and its verdict. (The measured run's own gate above, shared by every leg, is unchanged: there a divergence stays counted.)
+$selfHealLaunches = [System.Collections.Generic.List[string]]::new()
+if ($null -ne $spec.PSObject.Properties['generatorArgs'] -and $spec.generatorArgs.PSObject.Properties['gpuPreLaunches']) {
+    for ($i = 1; $i -le @($spec.generatorArgs.gpuPreLaunches).Count; $i++) { $selfHealLaunches.Add("pre-$i") }
+}
+if ($null -ne $receipt['selfHealVisual']) {
+    foreach ($key in @($receipt['selfHealVisual'].Keys | Sort-Object { [int]([string]$_).Substring(4) })) { if (-not $selfHealLaunches.Contains([string]$key)) { $selfHealLaunches.Add([string]$key) } }
+}
+if ($outcome -in @('PASS', 'FAIL') -and $selfHealLaunches.Count -gt 0) {
+    $badLaunches = @(foreach ($launch in $selfHealLaunches) {
+        $entry = $(if ($null -ne $receipt['selfHealVisual'] -and $receipt['selfHealVisual'].Contains($launch)) { $receipt['selfHealVisual'][$launch] } else { $null })
+        if ($null -eq $entry -or [string]::IsNullOrWhiteSpace([string]$entry.verdict)) {
+            "NO_VISUAL_ENTRY on self-heal pre-launch $($launch): the leg ran it but the receipt holds no visual verdict for it"
+        } elseif ([string]$entry.verdict -cne 'OK') {
+            "$([string]$entry.verdict) on self-heal pre-launch $($launch): $($entry.reason)"
+        }
+    })
+    if ($badLaunches.Count -gt 0) {
+        $detail = "INVALID: the job result was $outcome ($detail) but " + ($badLaunches -join '; ') + '. A fallback run whose picture is not OK is not counted, whatever the measured run says'
+        $outcome = 'INVALID'
     }
 }
 Complete-Receipt $outcome $detail

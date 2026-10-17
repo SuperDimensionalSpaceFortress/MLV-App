@@ -9,6 +9,7 @@
 #include "MyApplication.h"
 #include "CrashForensics.h"
 #include "GpuFieldTelemetry.h"
+#include "GpuDeviceLossBreaker.h"
 #include "Phase3Mode.h"
 #include "PlaybackFrameRange.h"
 #include "PlaybackSwapInterval.h"
@@ -1799,6 +1800,8 @@ int main(int argc, char *argv[])
     bool trim_mlv = hasTrimMlvFlag(argc, argv);
     // GPU-FIELD-TELEMETRY-1: local GPU field log (ON unless MLVAPP_GPU_TELEMETRY=0); never in batch / trim.
     if (!batch && !trim_mlv) GpuFieldTelemetry::install();
+    // GPU-DEVICE-LOSS-SELF-HEAL-1: before the CUDA preset below, so a persisted safe-start flag means no CUDA call.
+    if (!batch && !trim_mlv) GpuDeviceLossBreaker::install();
     bool profile_playback = hasPlaybackProfileFlag(argc, argv);
     bool gui_playback_smoke = hasGuiPlaybackSmokeFlag(argc, argv);
     const bool normal_gui =

@@ -203,6 +203,7 @@ SOURCES += \
     GpuDisplayViewport.cpp \
     GpuDisplayWindow.cpp \
     GpuFieldTelemetry.cpp \
+    GpuDeviceLossBreaker.cpp \
         main.cpp \
         MainWindow.cpp \
     ../../src/debayer/amaze_demosaic.c \
@@ -409,6 +410,8 @@ HEADERS += MainWindow.h \
     GpuDisplayWindow.h \
     GpuFieldTelemetry.h \
     GpuFieldTelemetryCore.h \
+    GpuDeviceLossBreaker.h \
+    GpuDeviceLossBreakerCore.h \
     ../../tools/gpu/igpu_cuda_error.h \
     ../../src/debayer/debayer.h \
     ../../src/debayer/helpersse2.h \

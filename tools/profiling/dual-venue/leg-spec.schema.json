@@ -31,6 +31,10 @@
     "generatorArgs": {
       "type": "object", "additionalProperties": false,
       "properties": {
+        "gpuFaultInject": { "type": "string", "pattern": "^(700|702|719|999)@[1-9][0-9]*$", "description": "GPU-DEVICE-LOSS-SELF-HEAL-1 r2: the measured run's injected device loss, <cuda code>@<n-th successful run stage> (MLVAPP_GPU_FAULT_INJECT; generator -GpuFaultInject). Injection only: never a real TDR." },
+        "gpuSafeStart": { "enum": ["clear"], "description": "GPU-DEVICE-LOSS-SELF-HEAL-1 r2: MLVAPP_GPU_SAFE_START=clear for the measured run (the app clears a persisted safe-start flag at startup; generator -GpuSafeStart)." },
+        "automationSettingsDir": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$", "description": "GPU-DEVICE-LOSS-SELF-HEAL-1 r2: a directory NAME under the job's own work dir that every launch of the job shares as its run-scoped settings store (MLVAPP_AUTOMATION_SETTINGS_DIR; generator -AutomationSettingsDir). Created fresh, deleted by proof after the measured run; its INI is published under <artifacts>\\self-heal." },
+        "gpuPreLaunches": { "type": "array", "minItems": 1, "maxItems": 4, "items": { "type": "string", "pattern": "^((700|702|719|999)@[1-9][0-9]*|none)$" }, "description": "GPU-DEVICE-LOSS-SELF-HEAL-1 r2 (needs automationSettingsDir; speed legs only): launches of the measured run's own smoke command, in order, BEFORE PresentMon and the measured run, on the shared store; each '<code>@<n>' injects that device loss, 'none' injects nothing. Each publishes under <artifacts>\\self-heal\\pre-<n> (generator -GpuPreLaunches)." },
         "telemetryArm": { "enum": ["HEAVY", "LIGHT"] },
         "cpuQuiescenceThresholdPercent": { "type": "number", "exclusiveMinimum": 0, "maximum": 100 },
         "forceLookAssist": { "type": "boolean", "description": "SPEED legs only (PLAYBACK-BACHELOR-PRESENT-JITTER-1): force Look Assist on WITHOUT a contact sheet (generator -ForceLookAssist -LookPaceLeg), so no GUI-thread framebuffer grab lands inside the timed Play. A look leg ignores it (its look block forces Look Assist)." },
