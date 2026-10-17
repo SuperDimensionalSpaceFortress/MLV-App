@@ -1,6 +1,7 @@
 {
   "schema": "pin-runner-fixture.v1",
-  "_comment": "pin-runner.bus-c6391d29.py.txt is DATA: a byte copy of the fleet bus's tools/factory/pin-runner.py, kept so the steward-card route test runs in hosted CI where no bus clone exists. The .txt extension keeps it out of the python tool census; the test writes it out as pin-runner.py inside a scratch directory. To refresh: read the new bus blob, replace the .py.txt, and update every value here.",
+  "_comment": "SUPERSEDED: this pair is kept only because test data is not deleted here, and nothing reads it. pin-runner.bus-c6391d29.py.txt is DATA: a byte copy of an older fleet bus tools/factory/pin-runner.py. The live fixture is pin-runner.bus-49009d20.json (see superseded_by); to refresh, edit that pair, not this one.",
+  "superseded_by": "pin-runner.bus-49009d20.json",
   "bus_repository": "softwarefactory-fleet-doctrine",
   "bus_sha": "c6391d29bb9dbe02ec42720ff26bdfab800945fa",
   "bus_path": "tools/factory/pin-runner.py",

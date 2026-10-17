@@ -193,7 +193,7 @@ def test_surfaces_keep_the_local_copy_and_name_the_pin_aware_follow_up():
 
 # ---------- the card's route, run end to end against the bus's own pin-runner ----------
 
-# r9 (CoS r8 soft note): BUS_CLONE_CANDIDATES and its hub-path default were removed; nothing read them, FACTORY_BUS_CLONE is read directly below.
+# The bus clone, when there is one, comes only from the FACTORY_BUS_CLONE environment variable, read directly below; there is no default path.
 RUNNER_BUS_PATH = "tools/factory/pin-runner.py"
 # r7 (CoS r6 improvement 2): hosted CI has no bus clone, so this route test used to skip there and never ran
 # where it matters. The bus runner now travels with the tests as DATA (a .py.txt, outside the python census),
@@ -899,9 +899,9 @@ def test_install_splices_the_guard_ahead_of_a_hook_that_execs_another_command(ob
 
 
 def test_install_refuses_a_guard_that_sits_after_a_terminating_exit_or_exec(ob, repo, capsys):
-    """A guard behind a top-level `exit`/`exec` never runs. install-hooks must say so, not report
-    "present" or "repaired" for it, and must not rewrite the file.
-    r9: a RECOGNISED block behind an `exit`/`exec` is moved ahead of it and reported `repaired` (CoS r7 improvement 1)."""
+    """An older or current guard behind a top-level `exit`/`exec` is repaired: install-hooks moves it ahead of the terminator, prints `repaired`, leaves exactly one guard, and a second install prints `present`.
+    A guard behind a terminator never runs, so install-hooks must not report `present` for it before the move.
+    (The name predates the repair behaviour and is kept; a rename would read as a removed test.)"""
     hook = repo / ".git" / "hooks" / "pre-push"
     hook.parent.mkdir(parents=True, exist_ok=True)
     assert ob.install_pre_push(repo) == "installed"

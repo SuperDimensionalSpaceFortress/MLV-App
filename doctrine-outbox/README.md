@@ -23,8 +23,8 @@ commands `check`, `pre-push`, `stop`, `session-start` and `install-hooks`. `stop
 yet on the remote (`default_range`, or `--ref R` for `R..HEAD`); `pre-push` hands git's stdin on to the
 layers after it (`git lfs pre-push`); `install-hooks` leaves the hook executable and splices the guard right
 after the shebang and any `set -e` lines, so a hook that ends in `exit 0` or `exec <next hook>` still runs it
-(a guard already sitting behind a top-level `exit`/`exec` is refused as `HOOK_GUARD_UNREACHABLE`, never reported
-as present). A push that creates a branch judges only the commits not on the remote's default branch. `check`
+(a guard already sitting behind a top-level `exit`/`exec` is moved ahead of it and reported as `repaired`, never
+as present; `HOOK_GUARD_UNREACHABLE` stays as a defensive invariant that cannot fire today). A push that creates a branch judges only the commits not on the remote's default branch. `check`
 takes a whole number of minutes; anything else is a usage error (exit 2). A config that is
 present but invalid is `CONFIG_INVALID` (exit 1, naming the key), distinct from `CONFIG_ABSENT` (exit 2).
 

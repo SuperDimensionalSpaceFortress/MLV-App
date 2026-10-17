@@ -1852,13 +1852,13 @@ def install_pre_push(repo: pathlib.Path) -> str:
     lines = current.splitlines(True)
     start = next((i for i, line in enumerate(lines) if line.startswith(GUARD_MARKER)), None)
     if start is not None:
-        # A guard sitting after a top-level `exit`/`exec` is dead code: git runs the hook, the hook ends
-        # first, and the push goes through unjudged. Reporting "present" or "repaired" for it would be a lie.
-        # r9 (CoS r7 improvement 1, ACK 6227942977): the refusal is no longer made at the OLD position, because a
-        # recognised block is moved to the splice point below and only the NEW index must be reachable. r1-r4
-        # appended the guard at the end, so every hook that ends in `exit 0` holds exactly this dead older guard;
-        # refusing it left the one population repair exists for unrepaired. The call this line replaces was:
-        #     _refuse_if_terminated_before(lines, start)
+        # Invariant: a guard is live only when no top-level `exit`/`exec` stands ahead of it. A guard behind
+        # one is dead code: git runs the hook, the hook ends first, and the push goes through unjudged, so
+        # "present" or "repaired" may be reported only for a block that ends up reachable. The refusal is
+        # checked only at the new index, after the move below, never at the old position: a recognised block
+        # is taken out and re-inserted at the splice point, so where it used to sit does not matter. A hook
+        # that ends in `exit 0` and was given its guard by appending at the end holds exactly such a dead
+        # older block, and that is the population this repair exists for.
         end = _guard_block_end(lines, start)
         # OUTBOX-REPAIR-MOVES-GUARD-1: a guard is only live when nothing but the shebang, `set` lines and
         # comments stand ahead of it. Behind a layer that reads git's ref lines from stdin it gets an empty
@@ -1874,7 +1874,9 @@ def install_pre_push(repo: pathlib.Path) -> str:
             lines[start:end + 1] = [snippet]
         else:
             # Not at the splice point: take the block out and put the current one where a fresh install
-            # puts it, then prove nothing ends the hook ahead of the new position.
+            # puts it. The check below is a defensive invariant: `_preamble_end` stops at the first line that
+            # is not the shebang, a `set` line, a comment or blank, and none of those is a terminator, so it
+            # cannot fire today; it keeps "the new position is reachable" true if `_preamble_end` changes.
             del lines[start:end + 1]
             idx = _preamble_end(lines)
             _refuse_if_terminated_before(lines, idx)
@@ -1888,6 +1890,8 @@ def install_pre_push(repo: pathlib.Path) -> str:
     # layer the hook runs. Appended at the end, a hook that ends in `exit 0` or `exec <next hook>` never
     # reached the guard. The snippet restores stdin for the layers after it (see above), and it sits ahead
     # of an LFS layer that may exit 2 for an unrelated reason. (r1-r5 spliced before the LFS line, else at the end.)
+    # The refusal below is the same defensive invariant as in the repair path: it cannot fire while
+    # `_preamble_end` only skips the shebang, `set` lines, comments and blanks.
     idx = _preamble_end(lines)
     _refuse_if_terminated_before(lines, idx)
     if idx and not lines[idx - 1].endswith("\n"):
