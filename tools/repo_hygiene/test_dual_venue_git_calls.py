@@ -11,7 +11,9 @@ Pinned here:
   * ``Invoke-DvGit`` returns a typed ``DV_GIT_TIMEOUT`` failure (exit -1, never an admission) when git does not return within the bound;
   * ``Invoke-DvGit`` closes git's stdin and turns prompts and the pager off;
   * (r2, CoS I1) a child that outlives git holding its output is killed and is a typed ``DV_GIT_PIPE_STRAGGLER`` failure (exit -1, no
-    partial bytes), never git's own exit code.
+    partial bytes), never git's own exit code;
+  * (r3, CoS N3) a git that cannot be started is a typed ``DV_GIT_START_FAILED`` refusal and leaks no job object;
+  * (r3, CoS N4) the straggler message says "(killed)" only when the kill is confirmed, "(kill not confirmed)" otherwise.
 The tests run wherever pwsh does (Windows and the ubuntu shards; CoS N2).
 """
 
@@ -151,6 +153,9 @@ class GitCallsAreBoundedTests(unittest.TestCase):
         done = self.invoke_dv_git(self.make_repo(), "'-c', 'alias.dvs=!echo partial; sleep 60 & exit 0', 'dvs'", {"DV_GIT_TIMEOUT_SECONDS": "5"}, timeout=45)
         self.assertIn("EXIT -1", done.stdout, "a straggler holding git's output must fail typed, never return git's exit code with partial bytes")
         self.assertIn("DV_GIT_PIPE_STRAGGLER", done.stdout)
+        # CoS N4: "(killed)" is claimed because the call's pipes closed after the kill; "(kill not confirmed)" would mean they did not.
+        self.assertIn("(killed)", done.stdout)
+        self.assertNotIn("kill not confirmed", done.stdout)
         self.assertNotIn("partial", done.stdout.split("ERR ", 1)[0], "no partial bytes may be returned")
         self.assertLess(time.monotonic() - started, 30, "the drain bound is the 5 s git bound; the call must not wait out the 60 s child")
         deadline = time.monotonic() + 10
@@ -159,6 +164,51 @@ class GitCallsAreBoundedTests(unittest.TestCase):
             time.sleep(0.5)
             survivors = _sleepers() - before
         self.assertEqual(survivors, set(), "the sleeper git started must be killed, not left running")
+
+    def in_module(self, body: str) -> str:
+        """Run ``body`` inside the module scope (Invoke-DvGit, its script-scope seam and its counters are module-private). Returns stdout."""
+        script = _import(f"& (Get-Module DualVenueRunner) {{\n{body}\n}}\n")
+        proc = subprocess.run([PWSH, *PWSH_ARGS, "-Command", script], capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return proc.stdout
+
+    def test_a_git_that_cannot_be_started_fails_typed_and_leaks_no_job_handle(self) -> None:
+        # CoS N3 (PR #472, comment 6228350481): r2 created the job object BEFORE Process.Start and ran Start outside the try, so a Start that
+        # threw leaked the job handle (Windows) and escaped as an exception. Now: typed exit -1, and every job opened is closed. On Linux and
+        # macOS no job object exists (opened = closed = 0), so there the test pins the typed failure only.
+        repo = self.make_repo()
+        out = self.in_module(
+            "$script:DvGitExecutable = 'dv-no-such-git-binary'\n"
+            "for ($i = 0; $i -lt 3; $i++) {\n"
+            f"  try {{ $r = Invoke-DvGit -RepoRoot '{repo}' -GitArgs @('rev-parse', 'HEAD'); Write-Output ('EXIT ' + $r.exitCode); Write-Output ('BYTES ' + $r.bytes.Length); Write-Output ('ERR ' + $r.stderr) }}\n"
+            "  catch { Write-Output ('THREW ' + $_.Exception.Message) }\n"
+            "}\n"
+            "Write-Output ('JOBS opened=' + $script:DvJobsOpened + ' closed=' + $script:DvJobsClosed)\n")
+        self.assertNotIn("THREW", out, "a git that cannot be started must be a typed refusal, not an exception")
+        self.assertEqual(out.count("EXIT -1"), 3, out)
+        self.assertEqual(out.count("BYTES 0"), 3, out)
+        self.assertEqual(out.count("ERR DV_GIT_START_FAILED"), 3, out)
+        match = re.search(r"JOBS opened=(\d+) closed=(\d+)", out)
+        self.assertIsNotNone(match, out)
+        self.assertEqual(match.group(1), match.group(2), "every job object opened must be closed (a Start that throws must not leak one)")
+
+    def test_the_straggler_message_claims_a_kill_only_when_it_is_confirmed(self) -> None:
+        # CoS N4: macOS reaches only the direct child, so the message must not say "(killed)" unless the kill was confirmed. The refusal is the
+        # same typed exit -1 either way; only the wording differs.
+        out = self.in_module(
+            "$a = Get-DvStragglerMessage -GitExit 0 -Seconds 5 -KillConfirmed $true -GitArgs @('log', '-1')\n"
+            "$b = Get-DvStragglerMessage -GitExit 0 -Seconds 5 -KillConfirmed $false -GitArgs @('log', '-1')\n"
+            "Write-Output ('CONFIRMED ' + $a)\nWrite-Output ('UNCONFIRMED ' + $b)\n")
+        confirmed = next(line for line in out.splitlines() if line.startswith("CONFIRMED "))
+        unconfirmed = next(line for line in out.splitlines() if line.startswith("UNCONFIRMED "))
+        for line in (confirmed, unconfirmed):
+            self.assertIn("DV_GIT_PIPE_STRAGGLER", line)
+            self.assertIn("git exited 0 but a process it started still held its output open after 5 s", line)
+            self.assertTrue(line.endswith("git log -1"), line)
+        self.assertIn("(killed)", confirmed)
+        self.assertNotIn("kill not confirmed", confirmed)
+        self.assertIn("(kill not confirmed)", unconfirmed)
+        self.assertNotIn("(killed)", unconfirmed)
 
 
 _SLEEPER = re.compile(r'sleep(\.exe)?"?\s+60\s*$')

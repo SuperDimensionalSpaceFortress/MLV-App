@@ -262,6 +262,8 @@ function Stop-DvGitCall {
     # Kill everything one git call started, including a child whose own parent has already exited. No parent-pid chain leads back to git
     # then (`sh -c 'x & exit 0'`: sh is gone, the background child is not), so Kill($true) alone misses it. The call's job object reaches it
     # on Windows; on Linux its environment tag in /proc/<pid>/environ does (every child inherits the tag unless it scrubs its environment).
+    # macOS has neither: it reaches only the direct child and its process tree (Kill($true)), so a child whose parent has already exited
+    # survives there. The callers therefore never claim a kill from this function: they claim it only once the call's pipes have closed.
     param([Parameter(Mandatory)]$Proc, [IntPtr]$Job, [string]$Tag)
     try { $Proc.Kill($true) } catch { $null = $_ }
     $native = Get-DvJobNative
@@ -277,6 +279,21 @@ function Stop-DvGitCall {
     }
 }
 
+function Get-DvStragglerMessage {
+    # The DV_GIT_PIPE_STRAGGLER stderr. "(killed)" is claimed only when the kill is CONFIRMED (the call's pipes closed after Stop-DvGitCall);
+    # otherwise "(kill not confirmed)": macOS cannot reach a child whose parent has exited. The refusal (exit -1) is the same either way.
+    param([Parameter(Mandatory)][int]$GitExit, [Parameter(Mandatory)][int]$Seconds, [Parameter(Mandatory)][bool]$KillConfirmed, [Parameter(Mandatory)][string[]]$GitArgs)
+    $state = $(if ($KillConfirmed) { 'killed' } else { 'kill not confirmed' })
+    "DV_GIT_PIPE_STRAGGLER git exited $GitExit but a process it started still held its output open after $Seconds s ($state): git $($GitArgs -join ' ')"
+}
+
+# The program Invoke-DvGit starts. Module-private on purpose and NOT an environment variable: the caller's environment must never be able to
+# swap the git that admission reads from. A test sets it inside the module scope to make Process.Start throw.
+$script:DvGitExecutable = 'git'
+# Job objects opened and closed by Invoke-DvGit (Windows). Equal after every call; a test reads them to prove no handle leaks.
+$script:DvJobsOpened = 0
+$script:DvJobsClosed = 0
+
 function Invoke-DvGit {
     # Run git in $RepoRoot; returns exit code, stdout BYTES (a blob must not be re-encoded or newline-translated) and stderr.
     # Bounded (Get-DvGitTimeoutMilliseconds): a git that does not return is killed with its children and reported as exit -1 with a
@@ -284,7 +301,7 @@ function Invoke-DvGit {
     # A git that exits while a process it started still holds its stdout/stderr open is killed the same way and is exit -1 with a
     # DV_GIT_PIPE_STRAGGLER stderr: every bounded failure is exit -1 with a typed stderr, never git's exit code with partial bytes.
     param([Parameter(Mandatory)][string]$RepoRoot, [Parameter(Mandatory)][string[]]$GitArgs)
-    $psi = [System.Diagnostics.ProcessStartInfo]::new('git')
+    $psi = [System.Diagnostics.ProcessStartInfo]::new($script:DvGitExecutable)
     $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.RedirectStandardInput = $true; $psi.CreateNoWindow = $true
     $psi.Environment['GIT_TERMINAL_PROMPT'] = '0'; $psi.Environment['GIT_PAGER'] = 'cat'
     # The repo is the one at $RepoRoot and nothing else: a GIT_DIR / GIT_WORK_TREE / GIT_INDEX_FILE / object-store override in the
@@ -297,9 +314,18 @@ function Invoke-DvGit {
     $tag = [guid]::NewGuid().ToString('N')
     $psi.Environment['DV_GIT_CALL_TAG'] = $tag
     $native = Get-DvJobNative
-    $job = $(if ($null -ne $native) { $native::CreateJobObjectW([IntPtr]::Zero, [IntPtr]::Zero) } else { [IntPtr]::Zero })
-    $proc = [System.Diagnostics.Process]::Start($psi)
+    $job = [IntPtr]::Zero
+    $proc = $null
     try {
+        # r3 (CoS N3): the job object is created AFTER Process.Start and inside this try, so the finally below always closes it. r2 created it
+        # first and started the process outside the try: a Start that threw (git not on PATH) leaked the job handle on Windows. A Start that
+        # throws is now a typed refusal like every other bounded failure, exit -1, never an exception the caller has not handled.
+        try { $proc = [System.Diagnostics.Process]::Start($psi) }
+        catch { return [pscustomobject]@{ exitCode = -1; bytes = [byte[]]@(); stderr = "DV_GIT_START_FAILED git could not be started: $($_.Exception.Message)" } }
+        if ($null -ne $native) {
+            $job = $native::CreateJobObjectW([IntPtr]::Zero, [IntPtr]::Zero)
+            if ($job -ne [IntPtr]::Zero) { $script:DvJobsOpened++ }
+        }
         # Everything git starts from here on is in the job. A child git started in the microseconds before this call would escape it, but the
         # refusals below do not depend on the kill: a timeout or a straggler is exit -1 whether or not its processes could be killed.
         if ($job -ne [IntPtr]::Zero) { [void]$native::AssignProcessToJobObject($job, $proc.Handle) }
@@ -322,13 +348,15 @@ function Invoke-DvGit {
         if (-not [System.Threading.Tasks.Task]::WaitAll([System.Threading.Tasks.Task[]]@($outTask, $errTask), $drain)) {
             $gitExit = $proc.ExitCode
             Stop-DvGitCall -Proc $proc -Job $job -Tag $tag
-            try { [void][System.Threading.Tasks.Task]::WaitAll([System.Threading.Tasks.Task[]]@($outTask, $errTask), 5000) } catch { $null = $_ }
-            return [pscustomobject]@{ exitCode = -1; bytes = [byte[]]@(); stderr = "DV_GIT_PIPE_STRAGGLER git exited $gitExit but a process it started still held its output open after $($drain / 1000) s (killed): git $($GitArgs -join ' ')" }
+            # r3 (CoS N4): the kill is confirmed by the evidence that matters, the pipes closing. Closed within 5 s = every holder is gone.
+            $confirmed = $false
+            try { $confirmed = [System.Threading.Tasks.Task]::WaitAll([System.Threading.Tasks.Task[]]@($outTask, $errTask), 5000) } catch { $null = $_ }
+            return [pscustomobject]@{ exitCode = -1; bytes = [byte[]]@(); stderr = (Get-DvStragglerMessage -GitExit $gitExit -Seconds ($drain / 1000) -KillConfirmed $confirmed -GitArgs $GitArgs) }
         }
         [pscustomobject]@{ exitCode = $proc.ExitCode; bytes = $ms.ToArray(); stderr = $errTask.Result }
     } finally {
-        $proc.Dispose()
-        if ($job -ne [IntPtr]::Zero) { [void]$native::CloseHandle($job) }
+        if ($null -ne $proc) { $proc.Dispose() }
+        if ($job -ne [IntPtr]::Zero) { [void]$native::CloseHandle($job); $script:DvJobsClosed++ }
     }
 }
 
