@@ -21,6 +21,7 @@
 #include "PlaybackFrameRange.h"
 #include "PlaybackGatePolicy.h"
 #include "PlaybackPrepPresentationPolicy.h"
+#include "VisualCaptureSourceDifference.h"
 #include "debug/StageTiming.h"
 extern "C" {
 #include "../../src/mlv/pipeline_stage_capture.h"
@@ -10354,6 +10355,38 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
             visualError = QStringLiteral( "visual capture directory could not be created" );
         }
         const QDir visualDir( options.visualCaptureDir );
+        // PLAYBACK-SOURCE-FRAME-IDENTITY-1: each play frame's SOURCE identity (the bytes the decoder
+        // reads for its display_frame), read here because Play has stopped, once per distinct frame.
+        // The verdict across them is visual.json's source_difference (VisualCaptureSourceDifference.h).
+        QHash<int, quint64> visualSourceHashes;
+        QSet<int> visualSourceHashFailed;
+        QVector<visual_capture_source_difference::PlayIdentity> visualPlayIdentities;
+        for( const VisualGrab &grab : visualGrabs )
+        {
+            if( grab.kind != QStringLiteral("play") ) continue;
+            visual_capture_source_difference::PlayIdentity identity;
+            identity.displayFrame = grab.displayFrame;
+            if( m_pMlvObject && grab.displayFrame >= 0 && !visualSourceHashFailed.contains( grab.displayFrame ) )
+            {
+                if( !visualSourceHashes.contains( grab.displayFrame ) )
+                {
+                    uint64_t sourceHash = 0;
+                    if( getMlvFrameSourceHash64( m_pMlvObject, static_cast<uint64_t>( grab.displayFrame ), &sourceHash ) == 0 )
+                        visualSourceHashes.insert( grab.displayFrame, static_cast<quint64>( sourceHash ) );
+                    else
+                        visualSourceHashFailed.insert( grab.displayFrame );
+                }
+                const auto known = visualSourceHashes.constFind( grab.displayFrame );
+                if( known != visualSourceHashes.constEnd() )
+                {
+                    identity.valid = true;
+                    identity.hash = known.value();
+                }
+            }
+            visualPlayIdentities.append( identity );
+        }
+        const visual_capture_source_difference::Verdict visualSourceVerdict =
+            visual_capture_source_difference::decide( visualPlayIdentities );
         for( const VisualGrab &grab : visualGrabs )
         {
             const QString fileName = grab.kind == QStringLiteral("play")
@@ -10369,6 +10402,13 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
             frameJson.insert( QStringLiteral("serial"), static_cast<double>( grab.serial ) );
             frameJson.insert( QStringLiteral("play_active"), grab.playActive );
             frameJson.insert( QStringLiteral("capture_ms"), grab.captureMs );
+            if( grab.kind == QStringLiteral("play") && grab.displayFrame >= 0 )
+            {
+                const auto known = visualSourceHashes.constFind( grab.displayFrame );
+                if( known != visualSourceHashes.constEnd() )
+                    frameJson.insert( QStringLiteral("source_id"),
+                                      visual_capture_source_difference::sourceIdHex( known.value() ) );
+            }
             if( grab.kind == QStringLiteral("paused") )
             {
                 frameJson.insert( QStringLiteral("settled"), grab.settled );
@@ -10421,6 +10461,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         visualJson.insert( QStringLiteral("frames"), visualFramesJson );
         visualJson.insert( QStringLiteral("frames_written"), visualFramesWritten );
         visualJson.insert( QStringLiteral("error"), visualError );
+        visual_capture_source_difference::apply( visualJson, visualSourceVerdict );
         if( QDir( options.visualCaptureDir ).exists() )
         {
             QFile visualJsonFile( visualDir.absoluteFilePath( QStringLiteral("visual.json") ) );
@@ -10432,7 +10473,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         }
         logInteractionEvent(
             QStringLiteral("gui_smoke.visual_capture"),
-            QStringLiteral("measured_session=%1 requested=%2 written=%3 stop_frame=%4 paused_settled=%5 tail_begin_utc=%6 tail_end_utc=%7 error=\"%8\"")
+            QStringLiteral("measured_session=%1 requested=%2 written=%3 stop_frame=%4 paused_settled=%5 tail_begin_utc=%6 tail_end_utc=%7 error=\"%8\" source_difference=%9")
                 .arg( visualMeasuredSession )
                 .arg( visualGrabs.size() )
                 .arg( visualFramesWritten )
@@ -10440,7 +10481,11 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                 .arg( bool01( visualSettled ) )
                 .arg( visualTailBeginUtc )
                 .arg( visualTailEndUtc )
-                .arg( visualError ) );
+                .arg( visualError )
+                .arg( visualSourceVerdict == visual_capture_source_difference::Verdict::Differ
+                          ? QStringLiteral("differ")
+                          : visualSourceVerdict == visual_capture_source_difference::Verdict::Identical
+                              ? QStringLiteral("identical") : QStringLiteral("omitted") ) );
     }
 
     if( ui->actionPlay->isChecked() )

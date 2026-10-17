@@ -56,6 +56,27 @@ The divergence threshold (`$script:VisualDivergenceThreshold`, DualVenueRunner.p
 known-good Bachelor leg (M16-1243 windowed-s2, CPU, build `adf6185a`, receipt `a5d3ffbe`) measured 1.099 on its worst channel;
 three times that (3.3) is under the 6.0 floor, so the floor is the threshold.
 
+## Source-frame identity: `source_id` and `source_difference` (PLAYBACK-SOURCE-FRAME-IDENTITY-1)
+
+One picture across the play frames is FROZEN only if the SOURCE frames behind them differ; a static clip shows one picture
+too. Display-side hashes cannot tell the two apart (a frozen display freezes them), so the app records the source itself. After
+Play has stopped (step (4) of the capture block, never in the timed window or the tail), for each distinct `display_frame` of
+the play captures it reads the bytes the decoder reads for that frame -- the encoded VIDF payload at
+`video_index[frame].frame_offset`: `frame_size` bytes for LJ92 and JPEG2K, the packed RAW size otherwise -- under the file's
+own mutex, without decoding, and hashes them with FNV-1a 64 (`getMlvFrameSourceHash64`, `src/mlv/video_mlv.c`).
+
+* `frames[].source_id` (play entries only): that hash as 16 lowercase hex digits. Absent when it could not be read.
+* `source_difference` (top level), a JSON string, exactly one of:
+  * `"differ"`: at least two play frames' source ids differ;
+  * `"identical"`: every play frame has a source id, they span at least two distinct `display_frame` values, and all are equal;
+  * absent otherwise: fewer than two play frames, any frame without a source id (an unreadable frame, a frame index of -1),
+    or one repeated `display_frame` (a stuck playback clock is not evidence of a static clip).
+
+The runner reads the field case-sensitively and accepts only those two strings; anything else is unknown. `"identical"` waives the
+frozen gate, which is why it is written only on that positive evidence. Scope: MLV containers only; an MCRAW or CinemaDNG-folder
+clip has no source id and the field is omitted. The policy is `platform/qt/VisualCaptureSourceDifference.h`; the
+`gui_smoke.visual_capture` log line ends with `source_difference=<differ|identical|omitted>`.
+
 ## Opting out
 
 Absent means on for every speed leg. A spec opts out with `"visualCapture": false` AND a `"visualCaptureOptOutReason"` (at least

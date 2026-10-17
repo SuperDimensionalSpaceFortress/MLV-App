@@ -4120,6 +4120,72 @@ static int getMlvRawFrameUint16Direct(mlvObject_t * video, uint64_t frameIndex, 
     return 0;
 }
 
+/* PLAYBACK-SOURCE-FRAME-IDENTITY-1: see video_mlv.h. Reads the same byte span
+ * getMlvRawFrameUint16Direct reads for an MLV frame, under the same per-chunk
+ * mutex, into its own bounded buffer; it never decodes, never touches the
+ * prefetch ring, the per-thread telemetry or video->VIDF. */
+int getMlvFrameSourceHash64(mlvObject_t * video, uint64_t frameIndex, uint64_t * hashOut)
+{
+    if (!video || !hashOut) return 1;
+    if ((isMcrawLoaded(video)) || (isDngFolderLoaded(video))) return 1;
+    if (frameIndex >= (uint64_t)getMlvFrames(video) || !video->video_index) return 1;
+
+    const frame_index_t * entry = &video->video_index[frameIndex];
+    const int chunk = (int)entry->chunk_num;
+    if (chunk < 0 || chunk >= video->filenum || !video->file || !video->file[chunk]
+        || !video->main_file_mutex) return 1;
+
+    size_t byte_count = 0;
+    if ((video->MLVI.videoClass & MLV_VIDEO_CLASS_FLAG_LJ92)
+        || (video->MLVI.videoClass & MLV_VIDEO_CLASS_FLAG_JPEG2K))
+    {
+        byte_count = (size_t)entry->frame_size;
+    }
+    else
+    {
+        size_t packed_frame_size = 0;
+        size_t raw_frame_capacity = 0;
+        if (!mlvRawFrameInputCapacity(video->RAWI.xRes, video->RAWI.yRes,
+                                      video->RAWI.raw_info.bits_per_pixel, 0,
+                                      &packed_frame_size, &raw_frame_capacity))
+            return 1;
+        byte_count = packed_frame_size;
+    }
+    if (byte_count == 0) return 1;
+
+    const size_t block_capacity = (size_t)1 << 20;
+    uint8_t * block = (uint8_t *)malloc(block_capacity);
+    if (!block) return 1;
+
+    uint64_t hash = 0xcbf29ce484222325ull; /* FNV-1a 64 offset basis */
+    int failed = 0;
+    FILE * file = video->file[chunk];
+    pthread_mutex_lock(video->main_file_mutex + chunk);
+    file_set_pos(file, entry->frame_offset, SEEK_SET);
+    size_t remaining = byte_count;
+    while (remaining > 0)
+    {
+        const size_t want = remaining < block_capacity ? remaining : block_capacity;
+        if (fread(block, 1, want, file) != want)
+        {
+            failed = 1;
+            break;
+        }
+        for (size_t i = 0; i < want; ++i)
+        {
+            hash ^= (uint64_t)block[i];
+            hash *= 0x100000001b3ull; /* FNV-1a 64 prime */
+        }
+        remaining -= want;
+    }
+    pthread_mutex_unlock(video->main_file_mutex + chunk);
+    free(block);
+
+    if (failed) return 1;
+    *hashOut = hash;
+    return 0;
+}
+
 int getMlvRawFrameUint16(mlvObject_t * video, uint64_t frameIndex, uint16_t * unpackedFrame)
 {
     const int compressedRaw = isMcrawLoaded(video)

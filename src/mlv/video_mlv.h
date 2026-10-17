@@ -523,6 +523,15 @@ void mlv_phase4bv_reset_env_cache_for_testing(void);
  * Needs memory to return to, sized: sizeof(float) * getMlvHeight(urvid) * getMlvWidth(urvid)
  * Output values will be in range 0-65535 (16 bit), float is only because AMAzE uses it */
 int getMlvRawFrameUint16(mlvObject_t * video, uint64_t frameIndex, uint16_t * unpackedFrame);
+/* PLAYBACK-SOURCE-FRAME-IDENTITY-1: a 64-bit identity of a frame's SOURCE bytes, for the
+ * --visual-capture-dir writer's visual.json source_id / source_difference. It is FNV-1a 64
+ * over exactly the byte span the decoder reads for the frame (the encoded VIDF payload at
+ * video_index[frameIndex].frame_offset: frame_size bytes for LJ92 and JPEG2K, the packed RAW
+ * size otherwise), read under main_file_mutex[chunk] without decoding. Returns 0 and sets
+ * *hashOut on success; nonzero (no identity, so the writer omits the field) for NULL inputs,
+ * MCRAW and CinemaDNG-folder sources (MLV containers only), an index out of range, a missing
+ * index or file, a zero byte count, or a short read. Not for the playback path: it reads disk. */
+int getMlvFrameSourceHash64(mlvObject_t * video, uint64_t frameIndex, uint64_t * hashOut);
 int getMlvRawFrameProcessedUint16Direct(mlvObject_t * video,
                                         uint64_t frameIndex,
                                         uint16_t * outputFrame,
