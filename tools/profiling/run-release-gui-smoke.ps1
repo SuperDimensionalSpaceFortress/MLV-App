@@ -1354,10 +1354,12 @@ if (-not $LaunchOnlyProbe) {
         exit (Get-GuiSmokeGateExitCode -Verdict $clipLengthGate.verdict)
     }
     # ENFORCE-2 round 2 (sol B2): the lifecycle-stress switch STOPS Play on the first clip (the second clip is
-    # opened, seeked and closed, never played), so it may only happen after the 20 s floor. The default is
-    # 20000 ms; anything shorter would end a Play under the floor and is refused: exit 41 PLAY_WINDOW_TOO_SHORT.
-    if ($ExerciseClipLifecycleStress -and $StressSwitchAtMs -lt $script:GuiSmokeMinPlayWindowMs) {
-        [Console]::Error.WriteLine("PLAYBACK-CLIP-LENGTH-ENFORCE-2: PLAY_WINDOW_TOO_SHORT (stress-switch-at-ms=$StressSwitchAtMs window=$($script:GuiSmokeMinPlayWindowMs))")
+    # opened, seeked and closed, never played), so it may only happen after the clip's floor (HFR-10S-1: 10 s for an
+    # HFR clip, else 20 s, from the gate's header fps). The default is 20000 ms; anything shorter than the floor would
+    # end a Play under it and is refused: exit 41 PLAY_WINDOW_TOO_SHORT.
+    $stressFloorMs = Get-GuiSmokeMinPlayWindowMs -NativeFps $clipLengthGate.fps
+    if ($ExerciseClipLifecycleStress -and $StressSwitchAtMs -lt $stressFloorMs) {
+        [Console]::Error.WriteLine("PLAYBACK-CLIP-LENGTH-ENFORCE-2: PLAY_WINDOW_TOO_SHORT (stress-switch-at-ms=$StressSwitchAtMs window=$stressFloorMs)")
         exit (Get-GuiSmokeGateExitCode -Verdict 'PLAY_WINDOW_TOO_SHORT')
     }
     # The lifecycle-stress leg switches to a SECOND clip mid-play: it is gated too
