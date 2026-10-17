@@ -605,7 +605,17 @@ function Get-LocalPlaybackPromptFindings {
     # in the PR body: an app call with an argument and no route of its own refuses even when a later launcher in the sentence is routed
     # (`<app> <clip>; <routed script> on Bachelor.`), and so does an app mention with an argument that no verb launches.
     $clipLaunch = "(?i)${b}MLVApp(Release)?\.exe['`"``]?\s+(?!${appArg}--(?:gui-smoke-playback|profile-playback))(?!${appStop})[^\s;]"
-    $findings = New-Object System.Collections.Generic.List[string]
+    # r10 (CoS review 6230713095 on 96cdd148, B6; hub ruling): the clip launch above was scored only in a sentence that already held a direct
+    # launch. A `;` between the app's argument and its playback mode cuts the app gap (r2, right for the r1 cross-`;` Blocker), so the
+    # mode flag was out of reach, the sentence held no direct launch, the app-plus-argument call was never scored and the sentence
+    # passed (`Run <app> <clip>; add <mode>.`). Now the clip launch is scored whenever the sentence holds a playback mode flag ANYWHERE
+    # ($modeFlag, also a trigger below), so that call must carry its own route. The same hole one character over, an app token with no
+    # argument and the `;` glued to it or spaced after it (`Run <app>; add <mode>.`), is $appBare: a tightening (the pin passes it). It is
+    # scored only when the sentence holds a mode flag and NO direct launch: a bare app mention before a routed launch (`Build <app>; then
+    # run <app> <mode> on Bachelor.`) is a build step, not a launch, and keeps passing (the pin passes it too).
+    $modeFlag = "(?i)--(?:gui-smoke-playback|profile-playback)"
+    $appBare = "(?i)${b}MLVApp(Release)?\.exe['`"``]?\s*;"
+    $findings =New-Object System.Collections.Generic.List[string]
     # A "sentence" is a line, cut again at '. ' so one bullet carrying several instructions is judged piece by piece. A semicolon is NOT a
     # sentence boundary since r6: it is a hard clause cut (no inheritance, per-group playback test) that the defeater scan reads across.
     # r8: every sentence knows the sentences that FOLLOW it in the same instruction block, because the sentence-terminal E1 reads them:
@@ -624,7 +634,7 @@ function Get-LocalPlaybackPromptFindings {
     # prompt). The sentence-terminal E1 reads later items through their index (Test-VenueTerminalTail, $tailState.NextDirty).
     # A sentence that holds none of the rule triggers (the incident phrase, `locally`, an on-this-host marker, a bare `here`, a direct
     # launch pattern) cannot be refused by any rule below, so it skips the clause analysis: same verdict, linear cost on long prompts.
-    $triggers = @([regex]::new($incident), [regex]::new($localMarker), [regex]::new($hostMarker), [regex]::new($hereMarker)) + @($direct | ForEach-Object { [regex]::new($_) })
+    $triggers = @([regex]::new($incident), [regex]::new($localMarker), [regex]::new($hostMarker), [regex]::new($hereMarker), [regex]::new($modeFlag)) + @($direct | ForEach-Object { [regex]::new($_) })
     for ($itemIndex = 0; $itemIndex -lt $items.Count; $itemIndex++) {
         foreach ($sentence in @($items[$itemIndex].Text)) {
             $s = $sentence.Trim()
@@ -707,8 +717,16 @@ function Get-LocalPlaybackPromptFindings {
                     foreach ($m4 in [regex]::Matches($s, $direct[$pi])) { $launchSpans.Add([pscustomobject]@{ Start = [int]$m4.Index; End = [int]($m4.Index + $m4.Length); App = ($pi -eq 0) }) }
                 }
                 # r4b: an app launch with a clip argument is one launcher of its own (an app span: it never merges)
-                if ($launchSpans.Count -gt 0) {
+                # r10 (B6): scored in a sentence that holds a direct launch OR a playback mode flag anywhere (a `;` may cut the two apart)
+                $hasModeFlag = [regex]::IsMatch($s, $modeFlag)
+                $hasDirectLaunch = $launchSpans.Count -gt 0
+                if ($hasDirectLaunch -or $hasModeFlag) {
                     foreach ($m4 in [regex]::Matches($s, $clipLaunch)) { $launchSpans.Add([pscustomobject]@{ Start = [int]$m4.Index; End = [int]($m4.Index + $m4.Length); App = $true }) }
+                }
+                # an app token with no argument is a mention, not a launch, unless NOTHING else in the sentence is: the mode flag cut off by
+                # the `;` and no direct launch. With a direct launch present, `Build <app>; then run <app> <mode> on Bachelor.` stays a pass.
+                if ($hasModeFlag -and -not $hasDirectLaunch) {
+                    foreach ($m4 in [regex]::Matches($s, $appBare)) { $launchSpans.Add([pscustomobject]@{ Start = [int]$m4.Index; End = [int]($m4.Index + $m4.Length); App = $true }) }
                 }
                 $occurrences = New-Object System.Collections.Generic.List[object]
                 foreach ($sp in @($launchSpans | Sort-Object -Property @{ Expression = 'Start'; Descending = $false }, @{ Expression = 'End'; Descending = $true })) {

@@ -1008,6 +1008,7 @@ def _differential_flips(work: Path, baseline_text: str | None = None, previous_h
                                   + PromptLintTests.CLAUSE_MUST_REFUSE_R13 + PromptLintTests.CLAUSE_MUST_PASS_R13
                                   + RULE4_SECOND_LAUNCHER_REFUSE + RULE4_SECOND_LAUNCHER_GUARDS + RULE4_BOTH_ROUTED_PASS
                                   + RULE4_R2_REFUSE + RULE4_R2_GUARDS + RULE4_R2_PASS + RULE4_R2_B_APP_REFUSE + RULE4_R4_SEEDS + RULE4_R6_SEEDS + RULE4_R7_SEEDS
+                                  + RULE4_R10_SEEDS
                                   + PromptLintTests.PROBE_ROWS
                                   + tuple(text for _, _, text in PromptLintTests.DEFEATER_AXIS) + PromptLintTests.DEFEATER_AXIS_CONTROLS,
                                   members=tuple(_list_member_rows(_lint_word_lists(LINT_PS1, work))))
@@ -1570,12 +1571,9 @@ RULE4_R9_FAMILY = _RULE4_R9["family"]
 RULE4_R9_SWEEP_ALLOWED: dict[str, str] = {}
 
 
-def _rule4_r9_fuzz_rows(seed: int = RULE4_R9_FUZZ_SEED, count: int = RULE4_R9_FUZZ_ROWS) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    """-> (unrouted rows, their routed twins). The Prevention of CoS review 6230178238: the LEAD (what stands between a verb, or no verb,
-    or a verbless clause opener, and the app token) is drawn at random, not listed. Pools: plain words, words with an apostrophe or a
-    hyphen, punctuation (`,` `:` `*` `_` `[` `<` `{` `(`), unquoted spaced paths, environment-variable and relative paths, code spans and
-    quotes. The same seed gives the same rows on every machine (random.Random(int) is a Mersenne Twister)."""
-    rng = random.Random(seed)
+def _rule4_r9_draw_lead(rng: random.Random, arg: str = "take01.dat") -> str:
+    """One random LEAD plus the app call `<app> <arg>` that ends it (r10: lifted out of the r9 fuzz so the tail-axis fuzz draws the same
+    lead axis; with the default `arg` and the same `rng` it draws exactly what r9 drew, call for call)."""
     words = ("build", "release", "x64", "debug", "nightly", "fresh", "same", "new", "old", "again", "as", "at", "the", "a", "one", "more", "time")
     apostrophe = ("Layi's", "team's", "build's", "that's", "Layi's")
     hyphen = ("x64-release", "pwsh-free", "re-built", "one-off", "pre-release", "clip-free")
@@ -1585,47 +1583,56 @@ def _rule4_r9_fuzz_rows(seed: int = RULE4_R9_FUZZ_SEED, count: int = RULE4_R9_FU
     env_paths = ("$env:BIN\\", "%BIN%\\", "~/bin/", "build\\", ".\\", "./", "/usr/local/bin/", "$HOME/bin/", "..\\out\\")
     verbs = RULE4_R9_VERBS + tuple(v.lower() for v in RULE4_R9_VERBS) + ("Open", "Start", "Then run", "run")
     openers = ("", "", "Then", "First", "Next", "Finally", "Run:", "Step 1:", "Now:", "Also,")
-    twins = _rule4_r9_twins()
     apps = (APP, "MLVApp" + "Release.exe")
+    tokens: list[str] = []
+    for _ in range(rng.randrange(0, 5)):
+        kind = rng.randrange(0, 8)
+        if kind == 0:
+            tokens.append(rng.choice(words))
+        elif kind == 1:
+            tokens.append(rng.choice(apostrophe))
+        elif kind == 2:
+            tokens.append(rng.choice(hyphen))
+        elif kind == 3:
+            tokens.append(rng.choice(punct))
+        elif kind == 4:
+            tokens.append(rng.choice(attached))
+        elif kind == 5:
+            tokens.append("`" + rng.choice(words) + "`")
+        elif kind == 6:
+            q = rng.choice(("'", '"'))
+            tokens.append(q + rng.choice(words) + q)
+        else:
+            tokens.append(rng.choice(words + hyphen))
+    head = rng.choice(openers)
+    verb = rng.choice(verbs) if rng.randrange(0, 5) else ""
+    prefix = rng.choice(("", "", spaced_paths[rng.randrange(0, len(spaced_paths))], env_paths[rng.randrange(0, len(env_paths))]))
+    app = rng.choice(apps)
+    call = f"{prefix}{app} {arg}"
+    shape = rng.randrange(0, 5)
+    if shape == 0:
+        call = f"`{call}`"
+    elif shape == 1:
+        call = f"{prefix}'{app}' {arg}"
+    elif shape == 2:
+        call = f'{prefix}"{app}" {arg}'
+    return " ".join(part for part in (head, verb, *tokens, call) if part)
+
+
+def _rule4_r9_fuzz_rows(seed: int = RULE4_R9_FUZZ_SEED, count: int = RULE4_R9_FUZZ_ROWS) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """-> (unrouted rows, their routed twins). The Prevention of CoS review 6230178238: the LEAD (what stands between a verb, or no verb,
+    or a verbless clause opener, and the app token) is drawn at random, not listed (`_rule4_r9_draw_lead`). Pools: plain words, words
+    with an apostrophe or a hyphen, punctuation (`,` `:` `*` `_` `[` `<` `{` `(`), unquoted spaced paths, environment-variable and
+    relative paths, code spans and quotes. The same seed gives the same rows on every machine (random.Random(int) is a Mersenne Twister)."""
+    rng = random.Random(seed)
+    twins = _rule4_r9_twins()
     unrouted: list[str] = []
     routed: list[str] = []
     seen: set[str] = set()
     guard = 0
     while len(unrouted) < count and guard < count * 50:
         guard += 1
-        tokens: list[str] = []
-        for _ in range(rng.randrange(0, 5)):
-            kind = rng.randrange(0, 8)
-            if kind == 0:
-                tokens.append(rng.choice(words))
-            elif kind == 1:
-                tokens.append(rng.choice(apostrophe))
-            elif kind == 2:
-                tokens.append(rng.choice(hyphen))
-            elif kind == 3:
-                tokens.append(rng.choice(punct))
-            elif kind == 4:
-                tokens.append(rng.choice(attached))
-            elif kind == 5:
-                tokens.append("`" + rng.choice(words) + "`")
-            elif kind == 6:
-                q = rng.choice(("'", '"'))
-                tokens.append(q + rng.choice(words) + q)
-            else:
-                tokens.append(rng.choice(words + hyphen))
-        head = rng.choice(openers)
-        verb = rng.choice(verbs) if rng.randrange(0, 5) else ""
-        prefix = rng.choice(("", "", spaced_paths[rng.randrange(0, len(spaced_paths))], env_paths[rng.randrange(0, len(env_paths))]))
-        app = rng.choice(apps)
-        call = f"{prefix}{app} take01.dat"
-        shape = rng.randrange(0, 5)
-        if shape == 0:
-            call = f"`{call}`"
-        elif shape == 1:
-            call = f"{prefix}'{app}' take01.dat"
-        elif shape == 2:
-            call = f'{prefix}"{app}" take01.dat'
-        lead = " ".join(part for part in (head, verb, *tokens, call) if part)
+        lead = _rule4_r9_draw_lead(rng)
         sep = rng.choice(RULE4_R9_SEPARATORS)
         twin = rng.choice(twins)
         row = f"{lead}{sep}{twin}."
@@ -1639,6 +1646,127 @@ def _rule4_r9_fuzz_rows(seed: int = RULE4_R9_FUZZ_SEED, count: int = RULE4_R9_FU
 
 RULE4_R9_FUZZ_REFUSE, RULE4_R9_FUZZ_PASS = _rule4_r9_fuzz_rows()
 
+# r10 (CoS review 6230713095 on 96cdd148, B6 + the soft note + Recurrence 5; hub ruling). A `;` between the app's argument and its
+# playback mode cut the app gap (r2), the sentence then held no direct launch, the app-plus-argument call was never scored and the whole
+# sentence passed (`Run <app> <clip>; add <mode>.`). r10 scores the clip launch whenever the sentence holds a mode flag anywhere. The rows
+# below are the CoS rows plus the TAIL axis: what stands between the app's argument and the mode flag. Every earlier sweep fuzzed the lead
+# (what comes BEFORE the app) and kept the mode flag in the same clause; the tail was never an axis (Recurrence 5: a narrowing's parity
+# sweep fuzzes both sides of the token). Fixtures keep this file's `.dat` clip-name convention.
+RULE4_R9_PR_HEAD = "96cdd148e1a690e0b4dc9382398e76808d0d1bf6"
+RULE4_R10_FUZZ_SEED = 20261018
+RULE4_R10_FUZZ_ROWS = 2400
+PROFILE_MODE = "--profile-" + "playback"
+# the tail templates ({m} the mode flag): the separator and the clause that stands between the app's argument and the mode flag. Tails
+# with `here` are refused whatever the route says and so are never twinned.
+RULE4_R10_TAILS = (
+    ("semicolon", "; add {m}"),
+    ("semicolon-then", "; then add {m}"),
+    ("semicolon-no-space", ";add {m}"),
+    ("semicolon-no-space-then", ";then add {m}"),
+    ("spaced-semicolon", " ; add {m}"),
+    ("spaced-semicolon-bare-mode", " ; {m}"),
+    ("semicolon-bare-mode", "; {m}"),
+    ("later-clause-with-a-verb", "; copy the log, then pass {m}"),
+    ("later-clause-then-a-routed-run", "; add {m}; run the venue chain on Bachelor"),
+    ("negated-later-clause", "; do not pass {m} anywhere, run it on Bachelor"),
+    ("negated-later-clause-use", "; never use {m} locally, run it on Bachelor"),
+)
+RULE4_R10_ARGS = ("take01.dat", "take01.dat --verbose", "--clip=take01.dat", "-v take01.dat", "take01")
+
+
+def _rule4_r10_glued(tail: str) -> bool:
+    """A tail whose `;` has no space after it and is followed by a word that is no locus-preserving one. A route written right before it
+    (`on Bachelor;add ...`) is no venue locus to the lint (the text after a punctuation mark must be the end or a locus-preserving word;
+    `then` is one, so `on Bachelor;then add ...` is a route), on the pin and on every head alike: such a twin refuses everywhere, so it
+    is no ALLOW row (RULE4_R10_GLUED_ROUTE pins that both agree)."""
+    return tail.startswith(";") and tail[1:2].isalpha() and not tail.startswith(";then ")
+
+
+def _rule4_r10_rows() -> dict[str, tuple[str, ...]]:
+    """`named` (the CoS rows, fixtures with `.dat`), `grid` (verb x call x tail x mode), `routed` (the grid rows with the route on the app
+    call itself: must pass), `glued` (the same with a `;` glued to the route: refused by the pin and the head alike), `noarg` (the soft
+    note: the app token with no argument, `;` glued or spaced after it, then a mode: a tightening, the pin passes most of them),
+    `noarg_routed` (the same with a route on the app call)."""
+    app_release = "MLVApp" + "Release.exe"
+    named = (f"Run {app_release} take01.dat; add {SMOKE_MODE}.",
+             f"Run {app_release} take01.dat; use {SMOKE_MODE} here.",
+             f"Start {APP} take01.dat; pass {PROFILE_MODE}.",
+             f"Run {app_release} take01.dat;add {SMOKE_MODE}.",
+             f"Run {app_release} take01.dat ; {PROFILE_MODE}",
+             f"Run C:\\build\\{app_release} take01.dat --verbose; then add {SMOKE_MODE}.",
+             f"Run {app_release} take01.dat; add {SMOKE_MODE}; run the venue chain on Bachelor.",
+             f"Run {app_release} take01.dat; do not pass {SMOKE_MODE} here, run it on Bachelor.")
+    grid: list[str] = []
+    routed: list[str] = []
+    glued: list[str] = []
+    for verb, app, arg, (_, tail), mode in itertools.product(("Run", "Start", "Launch", "Re-run"), (APP, app_release), RULE4_R10_ARGS,
+                                                             RULE4_R10_TAILS, (SMOKE_MODE, PROFILE_MODE)):
+        call = f"{verb} {app} {arg}"
+        grid.append(f"{call}{tail.format(m=mode)}.")
+        (glued if _rule4_r10_glued(tail) else routed).append(f"{call} {RULE4_R7_ROUTE}{tail.format(m=mode)}.")
+    noarg: list[str] = []
+    noarg_routed: list[str] = []
+    # every tail starts with a `;` (glued to the app token: `<app>; add`, `<app>;add`) or a spaced one (`<app> ; add`)
+    for verb, app, (_, tail), mode in itertools.product(("Run", "Start"), (APP, app_release), RULE4_R10_TAILS, (SMOKE_MODE, PROFILE_MODE)):
+        noarg.append(f"{verb} {app}{tail.format(m=mode)}.")
+        if not _rule4_r10_glued(tail):
+            noarg_routed.append(f"{verb} {app} {RULE4_R7_ROUTE}{tail.format(m=mode)}.")
+    # a bare app mention (a build step, no argument) before a ROUTED direct launch is no launch: `$appBare` is scored only in a sentence
+    # with a mode flag and no direct launch, so these keep passing (the pin passes them too). The spaced ` ; run ` form is left out: the
+    # pin refuses it (its gap crossed the `;` and merged the mention with the routed launch) and r2 through r9 pass it, the same r2
+    # narrowing as the three RULE4_R2_B_OPENED rows (named in the PR body).
+    mention: list[str] = []
+    for verb, app, sep, mode in itertools.product(("Build", "Compile", "Copy"), (APP, app_release), ("; then run ", ";run ", "; run "),
+                                                  (SMOKE_MODE, PROFILE_MODE)):
+        mention.append(f"{verb} {app}{sep}C:\\build\\{app_release} take01.dat {mode} {RULE4_R7_ROUTE}.")
+        mention.append(f"{verb} {app}{sep}C:\\build\\{app_release} {mode} {RULE4_R7_ROUTE}.")
+    return {"named": named, "grid": tuple(dict.fromkeys(grid)), "routed": tuple(dict.fromkeys(routed)), "glued": tuple(dict.fromkeys(glued)),
+            "noarg": tuple(dict.fromkeys(noarg)), "noarg_routed": tuple(dict.fromkeys(noarg_routed)), "mention": tuple(dict.fromkeys(mention))}
+
+
+_RULE4_R10 = _rule4_r10_rows()
+RULE4_R10_NAMED = _RULE4_R10["named"]
+RULE4_R10_GRID = _RULE4_R10["grid"]
+RULE4_R10_GRID_ROUTED = _RULE4_R10["routed"]
+RULE4_R10_GLUED_ROUTE = _RULE4_R10["glued"]
+RULE4_R10_NOARG = _RULE4_R10["noarg"]
+RULE4_R10_NOARG_ROUTED = _RULE4_R10["noarg_routed"]
+RULE4_R10_MENTION_PASS = _RULE4_R10["mention"]
+RULE4_R10_REFUSE = tuple(dict.fromkeys(RULE4_R10_NAMED + RULE4_R10_GRID + RULE4_R10_NOARG))
+# the rows the differential corpus carries as seeds (the CoS rows and the no-argument form); the grid and the fuzz are judged by the r10 tests
+RULE4_R10_SEEDS = tuple(dict.fromkeys(RULE4_R10_NAMED + RULE4_R10_NOARG))
+# The r10 sweep's allow-list: a row the pin refuses that passes on the head. EMPTY; an entry needs a reason.
+RULE4_R10_SWEEP_ALLOWED: dict[str, str] = {}
+
+
+def _rule4_r10_fuzz_rows(seed: int = RULE4_R10_FUZZ_SEED, count: int = RULE4_R10_FUZZ_ROWS) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """-> (unrouted rows, their routed twins). Recurrence 5 (CoS review 6230713095): the TAIL axis (RULE4_R10_TAILS: `;`, `; then`, `;` with
+    no space, ` ; `, a later clause with a verb, a negated later clause, a later routed run) crossed with the LEAD axis of r9 (the same
+    generator, `_rule4_r9_draw_lead`) and with the app's argument (RULE4_R10_ARGS) and the mode flag. The twin carries the route on the app
+    call itself (none for a tail whose `;` is glued to the route: `_rule4_r10_glued`). The same seed gives the same rows on every machine."""
+    rng = random.Random(seed)
+    unrouted: list[str] = []
+    routed: list[str] = []
+    seen: set[str] = set()
+    guard = 0
+    while len(unrouted) < count and guard < count * 50:
+        guard += 1
+        arg = rng.choice(RULE4_R10_ARGS)
+        lead = _rule4_r9_draw_lead(rng, arg)
+        _, tail = rng.choice(RULE4_R10_TAILS)
+        mode = rng.choice((SMOKE_MODE, PROFILE_MODE))
+        row = f"{lead}{tail.format(m=mode)}."
+        if row in seen:
+            continue
+        seen.add(row)
+        unrouted.append(row)
+        if not _rule4_r10_glued(tail):
+            routed.append(f"{lead} {RULE4_R7_ROUTE}{tail.format(m=mode)}.")
+    return tuple(unrouted), tuple(routed)
+
+
+RULE4_R10_FUZZ_REFUSE, RULE4_R10_FUZZ_PASS = _rule4_r10_fuzz_rows()
+
 # r9 quote-class pin (CoS review 6230178238, Prevention; the B4 root cause). In a PowerShell double-quoted string a backtick escapes the NEXT
 # character, so `"['`"]"` silently evaluates to `['"]`: the class the author meant to hold a backtick does not. A comment can claim a
 # quote set the pattern does not hold, and a test on rows only sees it when a row happens to use that character. This reads the EVALUATED
@@ -1649,13 +1777,15 @@ RULE4_QUOTE_CLAIMS: dict[str, tuple[tuple[str, ...], int]] = {
     # r8: a backtick opens or closes an app token like a quote does (a markdown code span)
     "appStop": (("'", '"', "`"), 2),
     "clipLaunch": (("'", '"', "`"), 5),
+    # r10: the app token with no argument and a `;` after it opens or closes like the other app tokens (a markdown code span)
+    "appBare": (("'", '"', "`"), 1),
     # the pwsh token is quoted with ' or " only (r4 comment); the pwsh gap never claimed a backtick
     "pwshStop": (("'", '"'), 2),
     # a quotation of the incident wording opens with any of the three
     "incident": (("'", '"', "`"), 1),
 }
 # the r8 lead pieces (d30d1365); r9 deleted them with the lead lookbehind, the RED/GREEN proof below still reads them at that head
-RULE4_QUOTE_CLAIMS_R8 = {**RULE4_QUOTE_CLAIMS, "leadOpen": (("'", '"', "`"), 1), "leadWords": (("'", '"', "`"), 2), "leadPath": (("'", '"', "`"), 1)}
+RULE4_QUOTE_CLAIMS_R8 = {**{k: v for k, v in RULE4_QUOTE_CLAIMS.items() if k != "appBare"}, "leadOpen": (("'", '"', "`"), 1), "leadWords": (("'", '"', "`"), 2), "leadPath": (("'", '"', "`"), 1)}
 # A deliberate single backtick before a bracket or an apostrophe inside a double-quoted pattern string must be named here with its
 # reason (none today; the `"` delimiter escape is the one legitimate single backtick and is covered by the evaluated check).
 RULE4_BACKTICK_ESCAPES: dict[str, str] = {}
@@ -2780,6 +2910,91 @@ class PromptLintTests(unittest.TestCase):
         self.assertEqual([], [t for t in RULE4_R9_PASS + RULE4_R9_FUZZ_PASS if old[t] > 0], f"routed rows {r8[0]} refuses: the ALLOW rows must be unchanged")
         self.assertEqual([], [t for t in earlier if (old[t] > 0) != (new[t] > 0)][:20], f"an earlier rule-4 row changed its verdict against {r8[0]}")
 
+    def test_red_rule4_r10_a_semicolon_between_the_app_argument_and_its_mode_never_hides_the_launch(self):
+        """r10 (CoS review 6230713095, B6; hub ruling): an app call with an argument is scored whenever the sentence holds a playback mode
+        flag anywhere, so `<app> <clip>; add <mode>.` must carry its own route. The eight CoS rows, the tail grid (what stands between the
+        app's argument and the mode: `;`, `; then`, `;` with no space, ` ; `, a later clause with a verb, a negated later clause, a later
+        routed run), the no-argument form (the soft note) and the tail-axis fuzz refuse; the same calls with their own route pass; a
+        route glued to the `;` (`on Bachelor;add`) is no route and refuses."""
+        self.assertEqual(8, len(RULE4_R10_NAMED))
+        self.assertGreaterEqual(len(RULE4_R10_FUZZ_REFUSE), 2000, "the tail fuzz is at least a couple of thousand rows")
+        self.assertEqual(len(RULE4_R10_FUZZ_REFUSE), len(set(RULE4_R10_FUZZ_REFUSE)))
+        self.assertTrue(RULE4_R10_GLUED_ROUTE and RULE4_R10_NOARG and RULE4_R10_GRID_ROUTED)
+        rows = list(dict.fromkeys(RULE4_R10_REFUSE + RULE4_R10_FUZZ_REFUSE + RULE4_R10_GLUED_ROUTE))
+        counts = _json_counts(LINT_PS1, rows, self.tmp, "rule4-r10-refuse")
+        self.assertEqual([], [t for t, n in zip(rows, counts) if n == 0][:20], "r10 rows the lint passed that it must refuse")
+        rows = list(dict.fromkeys(RULE4_R10_GRID_ROUTED + RULE4_R10_NOARG_ROUTED + RULE4_R10_FUZZ_PASS + RULE4_R10_MENTION_PASS))
+        counts = _json_counts(LINT_PS1, rows, self.tmp, "rule4-r10-pass")
+        self.assertEqual([], [t for t, n in zip(rows, counts) if n > 0][:20],
+                         "r10 rows with a route on the app call (or a bare app mention before a routed launch) that the lint refused")
+
+    def test_rule4_r10_sweep_no_row_the_pin_or_master_refuses_passes_on_the_head(self):
+        """The r10 sweep against the PINNED pre-change master (and against the current baseline ref, when it still differs from the head)
+        with an EMPTY allow-list: the CoS rows, the tail grid, the no-argument form, the routed and glued twins, the 15 named over-refusal
+        rows and the tail-axis fuzz (RULE4_R10_FUZZ_ROWS rows, seed RULE4_R10_FUZZ_SEED). No row the pin refuses may pass on the head. It
+        does not skip once master carries this lint."""
+        self.maxDiff = None
+        pin = _rule4_r1_head_lint(RULE4_PRE_CHANGE_MASTER, "pre-change master", moot_once_master_carries_it=False)
+        (self.tmp / "rule4-r10-pin.ps1").write_text(pin[1], encoding="utf-8")
+        texts = list(dict.fromkeys(RULE4_R10_REFUSE + RULE4_R10_GRID_ROUTED + RULE4_R10_GLUED_ROUTE + RULE4_R10_NOARG_ROUTED + RULE4_R10_MENTION_PASS
+                                   + RULE4_R2_B_APP_REFUSE + RULE4_R10_FUZZ_REFUSE + RULE4_R10_FUZZ_PASS))
+        _prefetch_counts(self.tmp, [(self.tmp / "rule4-r10-pin.ps1", texts, "rule4-r10-pin"), (LINT_PS1, texts, "rule4-r10-now")])
+        old = dict(zip(texts, _verdicts(self.tmp / "rule4-r10-pin.ps1", texts)))
+        new = dict(zip(texts, _verdicts(LINT_PS1, texts)))
+        opened = [t for t in texts if old[t] > 0 and new[t] == 0 and t not in RULE4_R10_SWEEP_ALLOWED]
+        self.assertEqual([], opened[:20], f"{len(opened)} row(s) {pin[0]} refuses that now pass: an unlisted refuse -> pass flip of the tail")
+        self.assertEqual([], [t for t, why in RULE4_R10_SWEEP_ALLOWED.items() if not why.strip()], "a sweep allow-list entry has no reason")
+        self.assertEqual([], [t for t in RULE4_R10_GRID_ROUTED + RULE4_R10_NOARG_ROUTED + RULE4_R10_MENTION_PASS + RULE4_R10_FUZZ_PASS if old[t] > 0][:20],
+                         f"routed rows {pin[0]} refuses: the ALLOW rows must be unchanged")
+        for row in RULE4_R10_NAMED + RULE4_R10_GRID:
+            self.assertGreater(old[row], 0, f"{pin[0]} passes a CoS / grid row: it is not a refuse -> pass flip")
+        # a route glued to the `;` is no route on the pin either: the head agrees with it row for row
+        self.assertEqual([], [t for t in RULE4_R10_GLUED_ROUTE if (old[t] > 0) != (new[t] > 0)][:20], "glued-route rows where the pin and the head disagree")
+        # the no-argument form is a tightening: the head refuses every row, the pin does not
+        self.assertTrue(any(old[t] == 0 for t in RULE4_R10_NOARG), "the no-argument tightening is a flip against the pin (the pin passes some of it)")
+        # the fuzz refuses by construction: the app call has no route of its own, whatever stands in front of it or after it
+        self.assertEqual([], [t for t in RULE4_R10_FUZZ_REFUSE if new[t] == 0][:20], "tail fuzz rows with no route of their own that the head passes")
+        base = _baseline_lint_source()
+        if base is not None and base[1].replace("\r\n", "\n") != LINT_PS1.read_text(encoding="utf-8").replace("\r\n", "\n"):
+            (self.tmp / "rule4-r10-master.ps1").write_text(base[1], encoding="utf-8")
+            rows = list(dict.fromkeys(RULE4_R10_NAMED + RULE4_R10_GRID + RULE4_R10_GRID_ROUTED))
+            _prefetch_counts(self.tmp, [(self.tmp / "rule4-r10-master.ps1", rows, "rule4-r10-master")])
+            master = dict(zip(rows, _verdicts(self.tmp / "rule4-r10-master.ps1", rows)))
+            self.assertEqual([], [t for t in rows if master[t] > 0 and new[t] == 0][:20], f"rows {base[0]} refuses that now pass")
+
+    def test_rule4_r10_rows_are_red_on_the_r9_head_and_every_earlier_row_keeps_its_verdict(self):
+        """RED proof kept in the suite: the CoS rows, the tail grid, the no-argument form and the tail fuzz all PASS on the lint of the r9
+        head 96cdd148 (the app gap stops at `;`, the sentence holds no direct launch, nothing is scored), and the pin refuses the CoS
+        rows. Against that head nothing else moves: the routed rows keep passing and every earlier rule-4 row keeps its verdict."""
+        self.maxDiff = None
+        r9 = _rule4_r1_head_lint(RULE4_R9_PR_HEAD, "r9")
+        (self.tmp / "rule4-r9-head.ps1").write_text(r9[1], encoding="utf-8")
+        pin = _rule4_r1_head_lint(RULE4_PRE_CHANGE_MASTER, "pre-change master", moot_once_master_carries_it=False)
+        (self.tmp / "rule4-r10-pin2.ps1").write_text(pin[1], encoding="utf-8")
+        earlier = list(dict.fromkeys(RULE4_R2_REFUSE + RULE4_R2_GUARDS + RULE4_SECOND_LAUNCHER_REFUSE + RULE4_SECOND_LAUNCHER_GUARDS
+                                     + RULE4_R2_PASS + RULE4_BOTH_ROUTED_PASS + RULE4_R4_REFUSE + RULE4_R4_PASS + RULE4_R6_REFUSE + RULE4_R6_PASS
+                                     + RULE4_R7_REFUSE + RULE4_R7_PASS + RULE4_R8_REFUSE + RULE4_R8_PASS + RULE4_R8_OVERREFUSAL
+                                     + RULE4_R9_REFUSE + RULE4_R9_PASS + RULE4_R2_B_APP_REFUSE + RULE4_R9_FUZZ_REFUSE + RULE4_R9_FUZZ_PASS))
+        mine = list(dict.fromkeys(RULE4_R10_REFUSE + RULE4_R10_GRID_ROUTED + RULE4_R10_GLUED_ROUTE + RULE4_R10_NOARG_ROUTED + RULE4_R10_MENTION_PASS
+                                  + RULE4_R10_FUZZ_REFUSE + RULE4_R10_FUZZ_PASS))
+        _prefetch_counts(self.tmp, [(self.tmp / "rule4-r9-head.ps1", earlier + mine, "rule4-r10-r9head"), (LINT_PS1, earlier + mine, "rule4-r10-r9now"),
+                                    (self.tmp / "rule4-r10-pin2.ps1", mine, "rule4-r10-pin2")])
+        old = dict(zip(earlier + mine, _verdicts(self.tmp / "rule4-r9-head.ps1", earlier + mine)))
+        new = dict(zip(earlier + mine, _verdicts(LINT_PS1, earlier + mine)))
+        pinned = dict(zip(mine, _verdicts(self.tmp / "rule4-r10-pin2.ps1", mine)))
+        for row in RULE4_R10_NAMED + RULE4_R10_NOARG:
+            self.assertEqual(0, old[row], f"{r9[0]} already refuses a CoS / no-argument row: not a RED row")
+        for row in RULE4_R10_NAMED:
+            self.assertGreater(pinned[row], 0, f"{pin[0]} passes a CoS row: it would be a tightening, not a parity restore")
+        self.assertEqual([], [t for t in RULE4_R10_GRID if old[t] > 0][:20], f"grid rows {r9[0]} already refuses: not RED rows")
+        fuzz_red = [t for t in RULE4_R10_FUZZ_REFUSE if old[t] == 0 and pinned[t] > 0]
+        self.assertGreaterEqual(len(fuzz_red), 1000, f"the tail fuzz reaches the hole: {len(fuzz_red)} row(s) the pin refuses and {r9[0]} passes")
+        self.assertEqual([], [t for t in RULE4_R10_FUZZ_REFUSE if old[t] > 0][:20], f"tail fuzz rows {r9[0]} already refuses")
+        self.assertEqual([], [t for t in RULE4_R10_GRID_ROUTED + RULE4_R10_NOARG_ROUTED + RULE4_R10_MENTION_PASS + RULE4_R10_FUZZ_PASS if old[t] > 0],
+                         f"routed rows {r9[0]} refuses: the ALLOW rows must be unchanged")
+        self.assertEqual([], [t for t in RULE4_R10_GLUED_ROUTE if old[t] > 0], f"glued-route rows {r9[0]} refuses: they open only because of the hole")
+        self.assertEqual([], [t for t in earlier if (old[t] > 0) != (new[t] > 0)][:20], f"an earlier rule-4 row changed its verdict against {r9[0]}")
+
     def test_rule4_every_quote_class_holds_every_character_its_comment_claims(self):
         """r9 (CoS Prevention, the B4 root cause): the EVALUATED patterns, not their source, hold the quote characters their comments claim.
         Static guard: evaluated-only for the delimiter escape (see RULE4_BACKTICK_ESCAPES), because a backtick before `"` is also the one
@@ -3392,7 +3607,12 @@ class LintDifferentialPinTests(unittest.TestCase):
          "is refused like its `locally` twin; a handling-verb list would open 'Copy the clip locally and run playback.'"),
         ("rule4-per-launcher-scope",
          lambda text, f: f.get("tpl") == "seed" and (text in RULE4_SECOND_LAUNCHER_REFUSE or text in RULE4_R2_REFUSE or text in RULE4_R4_REFUSE
-                                                     or text in RULE4_R6_REFUSE or text in RULE4_R7_REFUSE or text in RULE4_R2_B_APP_REFUSE),
+                                                     or text in RULE4_R6_REFUSE or text in RULE4_R7_REFUSE or text in RULE4_R2_B_APP_REFUSE
+                                                     or text in RULE4_R10_SEEDS),
+         "r10 (hub ruling on CoS review 6230713095, B6, listed in the PR body): the app call before a `;` that cuts it from its playback mode "
+         "('Run <app> <clip>; add <mode>.', RULE4_R10_NAMED) is a launch of its own and needs its own route; master refuses the CoS rows "
+         "(its app gap crossed the `;`), so against master they are no flip. The no-argument form ('Run <app>; add <mode>.', RULE4_R10_NOARG) "
+         "refuses under the same rule: a tightening, master passes most of it. "
          "r9 (hub ruling on CoS review 6230178238, listed in the PR body): the 15 rows `<app> <clip><sep><routed script> on Bachelor.` "
          "(RULE4_R2_B_APP_REFUSE) are an accepted over-refusal -- the first clause is an app launch with a clip and no route of its own. "
          "NA2-RULE4-PER-LAUNCHER-SCOPE-1, CoS post-merge Blocker on #448 (ask 6216180502): rule 4 scores EACH launcher occurrence, so a "
@@ -3473,7 +3693,12 @@ class LintDifferentialPinTests(unittest.TestCase):
          "launch still passes (CLAUSE_MUST_PASS_R13)."),
         ("rule4-per-launcher-scope",
          lambda text, f: f.get("tpl") == "seed" and (text in RULE4_SECOND_LAUNCHER_REFUSE or text in RULE4_R2_REFUSE or text in RULE4_R4_REFUSE
-                                                     or text in RULE4_R6_REFUSE or text in RULE4_R7_REFUSE or text in RULE4_R2_B_APP_REFUSE),
+                                                     or text in RULE4_R6_REFUSE or text in RULE4_R7_REFUSE or text in RULE4_R2_B_APP_REFUSE
+                                                     or text in RULE4_R10_SEEDS),
+         "r10 (hub ruling on CoS review 6230713095, B6, listed in the PR body): the app call before a `;` that cuts it from its playback mode "
+         "('Run <app> <clip>; add <mode>.', RULE4_R10_NAMED) is a launch of its own and needs its own route; master refuses the CoS rows "
+         "(its app gap crossed the `;`), so against master they are no flip. The no-argument form ('Run <app>; add <mode>.', RULE4_R10_NOARG) "
+         "refuses under the same rule: a tightening, master passes most of it. "
          "r9 (hub ruling on CoS review 6230178238, listed in the PR body): the 15 rows `<app> <clip><sep><routed script> on Bachelor.` "
          "(RULE4_R2_B_APP_REFUSE) are an accepted over-refusal -- the first clause is an app launch with a clip and no route of its own. "
          "NA2-RULE4-PER-LAUNCHER-SCOPE-1, CoS post-merge Blocker on #448 (ask 6216180502): a venue-routed first launcher no longer "
