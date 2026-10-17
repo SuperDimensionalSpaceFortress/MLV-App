@@ -126,11 +126,12 @@ def _require_previous_head_lint() -> tuple[str, str]:
     return prev
 
 
-def _rule4_r1_head_lint(head: str = RULE4_R1_PR_HEAD, label: str = "r1") -> tuple[str, str]:
+def _rule4_r1_head_lint(head: str = RULE4_R1_PR_HEAD, label: str = "r1", moot_once_master_carries_it: bool = True) -> tuple[str, str]:
     """(ref, text) of the lint at RULE4_R1_PR_HEAD (or another round head of this PR), with the same skip / fail policy as
-    _require_previous_head_lint."""
+    _require_previous_head_lint. `moot_once_master_carries_it=False` is for a check that stays true after the merge (r7 sweep: nothing the
+    pre-change master refuses may pass), which must not skip when master already carries this lint."""
     base = _baseline_lint_source()
-    if base is not None and base[1].replace("\r\n", "\n") == LINT_PS1.read_text(encoding="utf-8").replace("\r\n", "\n"):
+    if moot_once_master_carries_it and base is not None and base[1].replace("\r\n", "\n") == LINT_PS1.read_text(encoding="utf-8").replace("\r\n", "\n"):
         raise unittest.SkipTest(f"{base[0]} already carries this lint; the {label} head is no longer a baseline")
     done = subprocess.run(["git", "-C", str(ROOT), "show", f"{head}:{LINT_REL}"], capture_output=True, timeout=60)
     if done.returncode == 0 and done.stdout:
@@ -196,15 +197,32 @@ def _start_json_counts(lint: Path, texts: list[str], work: Path, tag: str) -> "s
     return subprocess.Popen([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(probe)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
 
+def _shard_chunks(texts: list[str], rows_per_shard: int) -> list[list[str]]:
+    """`texts` cut into up to BATCH_SHARDS chunks of about equal size, one chunk per `rows_per_shard` rows (at least one chunk)."""
+    count = max(1, min(BATCH_SHARDS, len(texts) // rows_per_shard))
+    size = -(-len(texts) // count) if texts else 0
+    return [texts[i:i + size] for i in range(0, len(texts), size)] if size else [texts]
+
+
 def _start_shards(lint: Path, texts: list[str], work: Path, tag: str, shards: list) -> None:
     """Start the pwsh shards of one lint over `texts` (a text per line), appending (Popen, chunk) to `shards` as each starts (the caller
     owns cleanup). Up to BATCH_SHARDS processes: the member corpus is ~32k rows at ~17 ms a row, which one process cannot finish inside a
     600 s foreground call (r12)."""
-    count = max(1, min(BATCH_SHARDS, len(texts) // 500))
-    size = -(-len(texts) // count) if texts else 0
-    chunks = [texts[i:i + size] for i in range(0, len(texts), size)] if size else [texts]
-    for n, chunk in enumerate(chunks):
+    for n, chunk in enumerate(_shard_chunks(texts, 500)):
         shards.append((_lint_finding_counts(lint, chunk, work, f"{tag}-s{n}"), chunk))
+
+
+# r7 (Iverson I-iv2): the texts that hold a line break go through the JSON array probe, and they are cut into shards the same way as the
+# plain ones. Measured at r7: the multi-line catalogue is 34 texts (30 + 4 line-break rows) and the differential corpus holds none, so one
+# pwsh takes 0.9 s and the unsharded path was no tail; the split only starts at 200 texts (a shard per 100, a row here is a whole block that
+# the head and tail grammars read), so today it changes nothing and a catalogue that grows past that bound no longer queues in one process.
+MULTI_ROWS_PER_SHARD = 100
+
+
+def _start_json_shards(lint: Path, texts: list[str], work: Path, tag: str, shards: list) -> None:
+    """Start the pwsh shards of one lint over `texts` that may hold line breaks (JSON array probe), appending (Popen, chunk) to `shards`."""
+    for n, chunk in enumerate(_shard_chunks(texts, MULTI_ROWS_PER_SHARD)):
+        shards.append((_start_json_counts(lint, chunk, work, f"{tag}-s{n}"), chunk))
 
 
 # NA2-RULE4-PER-LAUNCHER-SCOPE-1 r3: the finding count of a text is a pure function of (the lint's bytes, the text), so it is computed at
@@ -241,7 +259,7 @@ def _prefetch_counts(work: Path, jobs: list[tuple[Path, list[str], str]]) -> Non
             if multi:
                 procs: list = []
                 pending.append((digest, procs))
-                procs.append((_start_json_counts(lint, multi, work, f"{tag}-m"), multi))
+                _start_json_shards(lint, multi, work, f"{tag}-m", procs)
         for digest, shards in pending:
             for proc, chunk in shards:
                 for text, count in zip(chunk, _collect_counts(proc, len(chunk))):
@@ -988,7 +1006,7 @@ def _differential_flips(work: Path, baseline_text: str | None = None, previous_h
                                   + PromptLintTests.CLAUSE_MUST_REFUSE_R12 + PromptLintTests.CLAUSE_MUST_PASS_R12
                                   + PromptLintTests.CLAUSE_MUST_REFUSE_R13 + PromptLintTests.CLAUSE_MUST_PASS_R13
                                   + RULE4_SECOND_LAUNCHER_REFUSE + RULE4_SECOND_LAUNCHER_GUARDS + RULE4_BOTH_ROUTED_PASS
-                                  + RULE4_R2_REFUSE + RULE4_R2_GUARDS + RULE4_R2_PASS + RULE4_R4_SEEDS + RULE4_R6_SEEDS
+                                  + RULE4_R2_REFUSE + RULE4_R2_GUARDS + RULE4_R2_PASS + RULE4_R4_SEEDS + RULE4_R6_SEEDS + RULE4_R7_SEEDS
                                   + PromptLintTests.PROBE_ROWS
                                   + tuple(text for _, _, text in PromptLintTests.DEFEATER_AXIS) + PromptLintTests.DEFEATER_AXIS_CONTROLS,
                                   members=tuple(_list_member_rows(_lint_word_lists(LINT_PS1, work))))
@@ -1329,6 +1347,72 @@ RULE4_R6_PASS = _RULE4_R6["pass"]
 RULE4_R6_NAMED = _RULE4_R6["named"]
 RULE4_R6_REFUSE = RULE4_R6_RED + RULE4_R6_GUARDS
 RULE4_R6_SEEDS = tuple(RULE4_R6_REFUSE + RULE4_R6_PASS)
+
+# r7 (CoS review 6228973410 on 0fb1eb8c: Blocker B3, N1, N2, Prevention). The r6 head is the RED baseline of these rows
+# (PromptLintTests.test_rule4_r7_*). r4b and r6 each read a LIST of clip shapes and each list missed a form: B3 is `--clip=<clip>`, `/clip
+# <clip>` and a bare token with no extension, and N2 is seven options before the clip. The r7 pattern reads no shape at all (any first
+# argument after the app that is not the next launcher), and the sweep below is the check the CoS asked for: it is GENERATED from an
+# argument grammar, not from the shapes anybody remembered, and it is judged against the pinned pre-change master, not against a list.
+#   sweep    argument grammar (attached `=` values, `/` options, bare tokens, numbers, quoted values with and without a space, option
+#            chains of 1-8 flags and of 1-8 flag + value pairs) x lead verb (with the app name it launches) x separator x the routed
+#            launcher it sits next to (an app call, a script call) x the clip launch as the FIRST and as the SECOND launcher, once without
+#            a route of its own (must refuse) and once with one (must pass).
+#   fixtures the CoS rows name a real clip file; this round has no clip and NA-4 refuses that file extension in an edit, so every fixture keeps the
+#            CoS row exactly (the `=` attachment, the `/` option, the bare token, the separators, the launcher twins) and uses this file's
+#            `.dat` clip-name convention.
+RULE4_R6_PR_HEAD = "0fb1eb8c5c2453d9f1d1d8f704a220da37637619"
+RULE4_R7_LEAD_APPS = (("Run", "MLVApp" + "Release.exe"), ("Open", APP))
+RULE4_R7_SEPARATORS = ("; run ", ", then run ", " and run ")
+RULE4_R7_ROUTE = "on Bachelor"
+
+
+def _rule4_r7_args() -> tuple[str, ...]:
+    """The argument grammar: what can follow the app token of a launch, up to and including the clip."""
+    attached = ("--clip=take01.dat", "--clip=D:\\clips\\a.dat", "-c=take01.dat", "--fps=24", "--clip='D:\\my clips\\a.dat'", '--clip="D:\\my clips\\a.dat"')
+    slash = ("/clip take01.dat", "/v take01.dat", "/clip", "/clip D:\\clips\\a.dat")
+    bare = ("take01", "take01.dat", "D:\\clips\\take01", "24", "3.5")
+    quoted = ("'take01.dat'", '"take01.dat"', "'D:\\my clips\\a.dat'", '"D:\\my clips\\a.dat"', "--clip 'take01.dat'",
+              "--clip 'D:\\my clips\\a.dat'", '--clip "D:\\my clips\\a.dat"')
+    flags = tuple(" ".join(f"--o{i}" for i in range(1, n + 1)) + " take01.dat" for n in range(1, 9))
+    pairs = tuple(" ".join(f"--o{i} v{i}" for i in range(1, n + 1)) + " take01.dat" for n in range(1, 9))
+    return attached + slash + bare + quoted + flags + pairs
+
+
+def _rule4_r7_rows() -> dict[str, tuple[str, ...]]:
+    script = f"tools/profiling/{SMOKE_SCRIPT}"
+    app_release = "MLVApp" + "Release.exe"
+    twins = (f"C:\\build\\{app_release} take01.dat {SMOKE_MODE} {RULE4_R7_ROUTE}", f"pwsh -File {script} -Backend cpu {RULE4_R7_ROUTE}")
+    unrouted: list[str] = []
+    routed: list[str] = []
+    for (lead, app), sep, arg, twin in itertools.product(RULE4_R7_LEAD_APPS, RULE4_R7_SEPARATORS, _rule4_r7_args(), twins):
+        # the clip launch is the FIRST launcher: the route on the next launcher must not cover it
+        unrouted.append(f"{lead} {app} {arg}{sep}{twin}.")
+        routed.append(f"{lead} {app} {arg} {RULE4_R7_ROUTE}{sep}{twin}.")
+        # the clip launch is the SECOND launcher (the first one is routed)
+        unrouted.append(f"{lead} {twin}{sep}{app} {arg}.")
+        routed.append(f"{lead} {twin}{sep}{app} {arg} {RULE4_R7_ROUTE}.")
+    # the CoS rows of review 6228973410, verbatim in shape (`.dat` fixtures): B3 (four, each with its `; run` / `, then run` twins) and N1
+    second = f"C:\\build\\{app_release} take01.dat {SMOKE_MODE} {RULE4_R7_ROUTE}."
+    named: list[str] = []
+    for sep in (" and run ", "; run ", ", then run "):
+        named.extend((f"Run {app_release} --clip=take01.dat{sep}{second}",
+                      f"Run {app_release} --clip=D:\\clips\\a.dat{sep}{second}",
+                      f"Run {app_release} /clip take01.dat{sep}{second}",
+                      f"Run {app_release} take01{sep}{second}"))
+    named.append(f"Run C:\\build\\{app_release} take01.dat {SMOKE_MODE} {RULE4_R7_ROUTE} and run {app_release} --clip=take02.dat.")
+    named_b3 = tuple(named[:12])
+    return {"unrouted": tuple(dict.fromkeys(list(named) + unrouted)), "routed": tuple(dict.fromkeys(routed)), "named": tuple(named), "named_b3": named_b3}
+
+
+_RULE4_R7 = _rule4_r7_rows()
+RULE4_R7_REFUSE = _RULE4_R7["unrouted"]
+RULE4_R7_PASS = _RULE4_R7["routed"]
+RULE4_R7_NAMED = _RULE4_R7["named"]
+RULE4_R7_NAMED_B3 = _RULE4_R7["named_b3"]
+# The sweep's allow-list: a row the pre-change master refuses that passes on the head. It is EMPTY, and an entry needs a reason, so a
+# refuse -> pass flip of the argument grammar cannot be added without saying why.
+RULE4_R7_SWEEP_ALLOWED: dict[str, str] = {}
+RULE4_R7_SEEDS = tuple(RULE4_R7_REFUSE + RULE4_R7_PASS)
 
 
 class HubHostsFileTests(unittest.TestCase):
@@ -2189,6 +2273,65 @@ class PromptLintTests(unittest.TestCase):
         self.assertEqual([], [t for t in RULE4_R6_PASS if old[t] > 0], f"routed rows {r4b[0]} refuses: the ALLOW rows must be unchanged")
         self.assertEqual([], [t for t in earlier if (old[t] > 0) != (new[t] > 0)], f"an earlier rule-4 row changed its verdict against {r4b[0]}")
 
+    def test_red_rule4_r7_any_first_argument_after_the_app_is_a_launch_of_its_own(self):
+        """r7: the CoS rows (B3 with its `; run` / `, then run` twins, N1) and the generated argument-grammar sweep (attached `=` values,
+        `/` options, bare tokens, numbers, quoted values, option chains of 1-8, first and second launcher, every separator and launcher
+        twin) refuse without a route of their own; the same rows with their own route pass."""
+        self.assertEqual(13, len(RULE4_R7_NAMED))
+        self.assertEqual(12, len(RULE4_R7_NAMED_B3))
+        for row in RULE4_R7_NAMED:
+            self.assertIn(row, RULE4_R7_REFUSE)
+        args = _rule4_r7_args()
+        self.assertTrue(any("=" in a for a in args) and any(a.startswith("/") for a in args) and "take01" in args, "the B3 argument forms")
+        self.assertTrue(any(a.count("--o") == 8 for a in args), "the option chain of eight")
+        self.assertEqual((913, 912), (len(RULE4_R7_REFUSE), len(RULE4_R7_PASS)))
+        rows = list(RULE4_R7_REFUSE)
+        counts = _json_counts(LINT_PS1, rows, self.tmp, "rule4-r7-refuse")
+        self.assertEqual([], [t for t, n in zip(rows, counts) if n == 0], "r7 rows the lint passed that it must refuse")
+        rows = list(RULE4_R7_PASS)
+        counts = _json_counts(LINT_PS1, rows, self.tmp, "rule4-r7-pass")
+        self.assertEqual([], [t for t, n in zip(rows, counts) if n > 0], "r7 rows with every launcher routed that the lint refused")
+
+    def test_rule4_r7_sweep_no_row_the_pre_change_master_refuses_passes_on_the_head(self):
+        """The Prevention check: the rows are GENERATED from an argument grammar and judged against the pinned pre-change master, not against
+        a list of shapes. No row that RULE4_PRE_CHANGE_MASTER refuses may pass on the head unless RULE4_R7_SWEEP_ALLOWED names it (it is
+        empty). It does not skip once master carries this lint: the property stays true after the merge."""
+        self.maxDiff = None
+        pin = _rule4_r1_head_lint(RULE4_PRE_CHANGE_MASTER, "pre-change master", moot_once_master_carries_it=False)
+        (self.tmp / "rule4-r7-pin.ps1").write_text(pin[1], encoding="utf-8")
+        texts = list(RULE4_R7_REFUSE + RULE4_R7_PASS)
+        _prefetch_counts(self.tmp, [(self.tmp / "rule4-r7-pin.ps1", texts, "rule4-r7-pin"), (LINT_PS1, texts, "rule4-r7-now")])
+        old = dict(zip(texts, _verdicts(self.tmp / "rule4-r7-pin.ps1", texts)))
+        new = dict(zip(texts, _verdicts(LINT_PS1, texts)))
+        opened = [t for t in texts if old[t] > 0 and new[t] == 0 and t not in RULE4_R7_SWEEP_ALLOWED]
+        self.assertEqual([], opened, f"rows {pin[0]} refuses that now pass: an unlisted refuse -> pass flip of the argument grammar")
+        self.assertEqual([], [t for t, why in RULE4_R7_SWEEP_ALLOWED.items() if not why.strip()], "a sweep allow-list entry has no reason")
+        self.assertEqual([], [t for t in RULE4_R7_PASS if old[t] > 0], f"routed rows {pin[0]} refuses: the ALLOW rows must be unchanged")
+        # the B3 rows are the ones the pin refuses and a list-based head would pass: they are in the sweep, so the sweep covers them
+        for row in RULE4_R7_NAMED_B3:
+            self.assertGreater(old[row], 0, f"{pin[0]} passes the B3 row: it is not a refuse -> pass flip")
+
+    def test_rule4_r7_rows_are_red_on_the_r6_head_and_every_earlier_row_keeps_its_verdict(self):
+        """RED proof kept in the suite: the four B3 rows (and their twins) and N1 PASS on the lint of the r6 head 0fb1eb8c, and so do other
+        sweep rows (option chains past six, attached values, `/` options, bare tokens). Against that head nothing else moves: the routed
+        rows keep passing and every earlier rule-4 row keeps its verdict."""
+        self.maxDiff = None
+        r6 = _rule4_r1_head_lint(RULE4_R6_PR_HEAD, "r6")
+        (self.tmp / "rule4-r6-head.ps1").write_text(r6[1], encoding="utf-8")
+        earlier = list(dict.fromkeys(RULE4_R2_REFUSE + RULE4_R2_GUARDS + RULE4_SECOND_LAUNCHER_REFUSE + RULE4_SECOND_LAUNCHER_GUARDS
+                                     + RULE4_R2_PASS + RULE4_BOTH_ROUTED_PASS + RULE4_R4_REFUSE + RULE4_R4_PASS + RULE4_R6_REFUSE + RULE4_R6_PASS))
+        mine = list(RULE4_R7_REFUSE + RULE4_R7_PASS)
+        _prefetch_counts(self.tmp, [(self.tmp / "rule4-r6-head.ps1", earlier + mine, "rule4-r7-r6head"), (LINT_PS1, earlier + mine, "rule4-r7-r6now")])
+        old = dict(zip(earlier + mine, _verdicts(self.tmp / "rule4-r6-head.ps1", earlier + mine)))
+        new = dict(zip(earlier + mine, _verdicts(LINT_PS1, earlier + mine)))
+        for row in RULE4_R7_NAMED:
+            self.assertEqual(0, old[row], f"{r6[0]} already refuses a CoS row: not a RED row")
+        red = [t for t in RULE4_R7_REFUSE if old[t] == 0]
+        self.assertGreater(len(red), len(RULE4_R7_NAMED), "the sweep reaches past the named rows")
+        self.assertTrue(any("--o7" in t for t in red) and any("=take01" in t or "=D:" in t for t in red) and any("/clip" in t for t in red), "the N2 / B3 argument forms are RED")
+        self.assertEqual([], [t for t in RULE4_R7_PASS if old[t] > 0], f"routed rows {r6[0]} refuses: the ALLOW rows must be unchanged")
+        self.assertEqual([], [t for t in earlier if (old[t] > 0) != (new[t] > 0)], f"an earlier rule-4 row changed its verdict against {r6[0]}")
+
     def test_rule4_the_refuse_rows_are_red_on_the_baseline(self):
         """RED proof kept in the suite: every second-launcher row passes the lint of RULE4_PRE_CHANGE_MASTER, the master this PR branched
         from (its rule 4 read only the first launcher occurrence).
@@ -2771,7 +2914,7 @@ class LintDifferentialPinTests(unittest.TestCase):
          "is refused like its `locally` twin; a handling-verb list would open 'Copy the clip locally and run playback.'"),
         ("rule4-per-launcher-scope",
          lambda text, f: f.get("tpl") == "seed" and (text in RULE4_SECOND_LAUNCHER_REFUSE or text in RULE4_R2_REFUSE or text in RULE4_R4_REFUSE
-                                                     or text in RULE4_R6_REFUSE),
+                                                     or text in RULE4_R6_REFUSE or text in RULE4_R7_REFUSE),
          "NA2-RULE4-PER-LAUNCHER-SCOPE-1, CoS post-merge Blocker on #448 (ask 6216180502): rule 4 scores EACH launcher occurrence, so a "
          "venue locus exempts only the launcher it routes. Master read only the first occurrence and passed '<launcher> -Backend cpu on "
          "Bachelor; then run <launcher> -Backend cpu.' and its relatives (RULE4_SECOND_LAUNCHER_REFUSE). r2 (CoS review of 75cb00e1): "
@@ -2779,7 +2922,11 @@ class LintDifferentialPinTests(unittest.TestCase):
          "(RULE4_R2_REFUSE). r4 (sol r3 + Iverson on 4b9c9387): the quoted call `& '<script>' -Param` is a launcher, and a launcher "
          "name inside a path argument no longer ends a launcher's argument gap (RULE4_R4_REFUSE). r6 (CoS review of 469e513d, B1 + B2 + "
          "Improvement 1): an app launch whose clip follows an option, has no extension, or is a quoted path with a space is a launch of its "
-         "own (RULE4_R6_REFUSE); master refused the B1 / B2 rows, and passes the clip-launch-as-second-launcher rows of Improvement 1."),
+         "own (RULE4_R6_REFUSE); master refused the B1 / B2 rows, and passes the clip-launch-as-second-launcher rows of Improvement 1. "
+         "r7 (CoS review of 0fb1eb8c, B3 + N1 + N2): ANY first argument after the app that is not the next launcher makes the call a launch "
+         "of its own, so `--opt=value`, `/opt`, a bare token and an option chain of any length refuse (RULE4_R7_REFUSE, the generated "
+         "argument-grammar sweep); master refused the B3 rows (the first app call reaches a mode flag over the next launcher) and passes the "
+         "rows whose clip launch is the SECOND launcher (N1)."),
     )
 
     # r7 PREVIOUS-HEAD gate (CoS Prevention on a595464f). Against the lint of the PR head this round started from, NOTHING may open:
@@ -2800,7 +2947,8 @@ class LintDifferentialPinTests(unittest.TestCase):
          "(and the app form) has ONE launcher, the second, and it carries its own venue route; the first call is not a playback launcher. "
          "d2f3cd05 (and the r1 head) let the first call's lazy gap run over the ';' so the merged span sat in the unrouted first clause "
          "and the sentence was refused. A launcher's gap now stops at ';' and at the next launcher token, so only the real launcher is "
-         "scored, and it is routed (RULE4_R2_B_PASS, 6 rows: 3 separators x pwsh / app). Master passes them too."),
+         "scored, and it is routed (RULE4_R2_B_PASS, 6 rows: 3 separators x pwsh / app). Master refuses them too (its greedy gap scored "
+         "the match in the first, unrouted clause), so against master these six rows are refuse -> pass flips, as against d2f3cd05."),
     )
     ALLOWED_PREVIOUS_HEAD_PASS_TO_REFUSE = (
         ("r10-strictly-terminal-e1",
@@ -2844,7 +2992,7 @@ class LintDifferentialPinTests(unittest.TestCase):
          "launch still passes (CLAUSE_MUST_PASS_R13)."),
         ("rule4-per-launcher-scope",
          lambda text, f: f.get("tpl") == "seed" and (text in RULE4_SECOND_LAUNCHER_REFUSE or text in RULE4_R2_REFUSE or text in RULE4_R4_REFUSE
-                                                     or text in RULE4_R6_REFUSE),
+                                                     or text in RULE4_R6_REFUSE or text in RULE4_R7_REFUSE),
          "NA2-RULE4-PER-LAUNCHER-SCOPE-1, CoS post-merge Blocker on #448 (ask 6216180502): a venue-routed first launcher no longer "
          "exempts a second, unrouted one after ';', ', then' or ' then' (RULE4_SECOND_LAUNCHER_REFUSE). The d2f3cd05 lint passed every "
          "one of them (rule 4 read only the first launcher occurrence), and master passes them too. r2 (CoS review of 75cb00e1): a "
@@ -2852,7 +3000,10 @@ class LintDifferentialPinTests(unittest.TestCase):
          "RULE4_R2_REFUSE (cross-clause pairs, ` or `, a route on launcher B only, mixed styles) refuses as well. r4: the quoted call "
          "and a launcher name inside a path argument (RULE4_R4_REFUSE), passed by d2f3cd05 and master alike. r6: an app launch whose clip "
          "follows an option, has no extension, or is a quoted path with a space (RULE4_R6_REFUSE): d2f3cd05 and master "
-         "refuse 60 of the 182 RED rows (the six B1 rows and both B2 rows among them) and pass the other 122, which are the rows that flip."),
+         "refuse 60 of the 182 RED rows (the six B1 rows and both B2 rows among them) and pass the other 122, which are the rows that flip. "
+         "r7: any first argument after the app that is not the next launcher is a launch of its own (RULE4_R7_REFUSE, the generated "
+         "argument-grammar sweep): d2f3cd05 and master refuse only the rows whose first app call reaches a mode flag over a later "
+         "launcher (196 of the 913 unrouted rows, the B3 rows among them) and pass the rest, which are the rows that flip."),
     )
 
     @classmethod

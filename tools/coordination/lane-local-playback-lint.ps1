@@ -587,13 +587,14 @@ function Get-LocalPlaybackPromptFindings {
     # Bachelor") never covers it. It is scored only in a sentence that holds a direct launch above (it is no trigger of its own), it
     # starts at the app token like the app pattern, and an app call whose gap reaches a playback mode is the app pattern's, not this one.
     # A verbless "<app> <clip>" lead stays a non-launcher lead (r2, RULE4_R2_B_PASS).
-    # r6 (CoS review of 469e513d, B1 + B2): the clip may follow option tokens ("--clip <clip>", "-v <clip>", "--input <path>": an option, then one
-    # optional value that is not itself an option), and the clip / path token is (a) a quoted string taken as ONE unit, spaces included
-    # ("'D:\my clips\a.dat'"), (b) a token with an extension, or (c) a token with a path separator and no extension ("D:\clips\take01").
-    # Neither the value nor the clip token may be the next app launcher, so a second launcher never reads as the first one's clip.
-    $clipOptions = "(?:-[^\s;]*\s+(?:(?!-)(?!${appStop})[^\s;]+\s+)?){0,6}"
-    $clipToken = "(?:'[^']*'|`"[^`"]*`"|['`"]?(?!${appStop})[^\s;'`"\-][^\s;'`"]*(?:\.\w+|[\\/][^\s;'`"]*))"
-    $clipLaunch = "(?i)(?<=${b}(?:${verbs})\s+(?:&\s*)?['`"]?(?:[^\s;'`"]*[\\/])?)MLVApp(Release)?\.exe['`"]?\s+(?!${appArg}--(?:gui-smoke-playback|profile-playback))${clipOptions}${clipToken}"
+    # r7 (CoS review of 0fb1eb8c, B3 + N1 + N2): the pattern no longer enumerates clip shapes. r4b took a bare clip, r6 added options, a quoted
+    # path and a separator-only token, and each list left a form out (`--clip=<clip>`, `/clip <clip>`, a bare token with no extension, seven
+    # options before the clip). Master's reading is the rule: ANY first argument after the app that is not the next app launcher makes the
+    # call a launch of its own, in a call whose gap holds no playback mode (that one is the app pattern's, the lookahead below). So an
+    # attached `--opt=value`, a `/opt`, a bare token, a number, a quoted value and a chain of any length are covered by construction, and
+    # nothing in this pattern reads the shape of the argument. The next app launcher stays out of it, so a second launcher never reads as
+    # the first one's argument (it is scored on its own route). An app token with no argument after it is no launch here (needs `\s+<arg>`).
+    $clipLaunch = "(?i)(?<=${b}(?:${verbs})\s+(?:&\s*)?['`"]?(?:[^\s;'`"]*[\\/])?)MLVApp(Release)?\.exe['`"]?\s+(?!${appArg}--(?:gui-smoke-playback|profile-playback))(?!${appStop})[^\s;]"
     $findings = New-Object System.Collections.Generic.List[string]
     # A "sentence" is a line, cut again at '. ' so one bullet carrying several instructions is judged piece by piece. A semicolon is NOT a
     # sentence boundary since r6: it is a hard clause cut (no inheritance, per-group playback test) that the defeater scan reads across.
