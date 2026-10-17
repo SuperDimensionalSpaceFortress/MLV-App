@@ -3052,7 +3052,7 @@ class EvidenceBoundReceiptTests(EvidenceFactory, ModuleMutationMixin, unittest.T
 
     # -- the sound path -------------------------------------------------------------------------------------------------
     def test_a_receipt_built_through_the_evidence_path_is_verified_and_pass_vs_fail_is_derived_from_the_committed_criteria(self) -> None:
-        repo = self.prod_repo()
+        repo = self.prod_repo(shipped_legs=True)   # the one test that keeps the whole shipped legs/ tree, so the validator's scan of every committed leg stays covered
         ev = self.evidence("ok")
         self.assertAdvisory(self.receipt_for(repo, ev), repo)
         # the criteria come from the COMMITTED leg spec (supplementary/cuda: rows gt 0): a run whose rows are 0 is a derived FAIL
