@@ -197,6 +197,356 @@
       "check": "test:tools/repo_hygiene/test_shipping_defaults.py::ShippingDefaultsTests::test_source_mirror_drift_is_rejected",
       "bullet": "agents/release-and-regression.md:62 Any change to a playback/processing DEFAULT (e.g. Preview Resolution =",
       "basis": "asserts a changed default in MainWindow.ui/.cpp no longer matches tools/gates/shipping-defaults.json and fails verify_repository"
+    },
+    "27c51052bc6b3b8065335ea989ff5cfceb350a7580fbc38511be39a1dd617e27": {
+      "check": "test:tools/repo_hygiene/test_mlv_never_authorized.py::MlvNeverAuthorizedHookTests::test_na11_write_under_tools_agent_bridge_at_board_venue_still_denied",
+      "bullet": "agents/agent-bridge-source-of-truth.md:6 Suspend feature work, bugfixes, refactors, and CI-only churn on in-tree `tools/a",
+      "basis": "NA-11 hook row (docs/never-authorized.json NA-11): a Write under tools/agent-bridge/ is denied even at the board venue. The registry's enforced_today for NA-11 still reads prose-only, so guard:NA-11 is refused by the census; the generated hook case is the check"
+    },
+    "b8971a216d538abc20458e328d240ea12420a4fc61f7d5dce85913fc5b8af37f": {
+      "check": "test:tools/repo_hygiene/test_mlv_never_authorized.py::MlvNeverAuthorizedHookTests::test_fp1_v_write_publishing_the_board_spec_to_a_sibling_repository_is_refused",
+      "bullet": "agents/doctrine-consumer.md:48 Do not reintroduce `MLV_FLEET_BUS_ROOT` as a write root (NA-7 third-root narrowi",
+      "basis": "NA-7 hook row: the doctrine-bus clone is a sibling repository, and a Write to a sibling is refused by the ordinary NA-7 rule (the row pins the third-root narrowing as a DENY)"
+    },
+    "cd403c521cec37922731a4b8e5fff61b2c1a986ef0787e399b0fd97772fac82e": {
+      "check": "test:tools/repo_hygiene/test_mlv_never_authorized.py::MlvNeverAuthorizedHookTests::test_fp1_v_write_publishing_the_board_spec_to_a_sibling_repository_is_refused",
+      "bullet": "agents/doctrine-consumer.md:53 Re-adding NA-7 bus write roots.",
+      "basis": "same NA-7 case: a re-added bus write root would turn this DENY row red"
+    },
+    "8c5a4ad7167d0ddfe9199b6299aa10ef9e302cb03df38508c4414c3c2bbe2b3f": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:5 The repo owns work-block closeout through `closeout.config.json`, `tools/repo_hy",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "4cff47326e7902fd369815d08f09e07965f0bd4ff58999552281a2da7a7c2743": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:6 The shared hybrid closeout contract lives at [`CLOSEOUT-CANONICAL-CONTRACT.md`](",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "a12c8c7f3605ef387d8486aea57aee11965aa5290bcfbdb1484f06341d30117f": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:7 Incoming closeout addenda are repo-wide closeout framework changes, not chat-onl",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "8ef57462cf2c3160f866c5e6c262541d767f8693c82682424e9ee3cf9f833a44": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:8 Substantive replies are closeout events, not optional checkpoints. The human-fac",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "57546d0c4a869d0316550d23a11639161e039c5ca8b842ecac87fce325a715e7": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:9 Repo-owned closeout/dashboard PowerShell commands must prefer PowerShell 7+ thro",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "15d5f81ef33d14f98a25c6192c1b2970e2ff3c8e7cc7c4e422742f56e02d1ef6": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:10 At the start of a non-trivial work block, prefer:",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "6f6e4cff4a35e091ffcc68c5623b97d02f805c1303099a5d3075e9facbd72650": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:11 `pwsh.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File tools",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "1fddadd3ed3317fa8d418cb3bd53623969c331670fad69cfba6f612179e624de": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:12 Use a subject that describes the user-visible purpose of the change, for example",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "363135c211f87963d131104642d6e04d9e0433cb81e01b656fc96dc92fd4b35d": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:13 Before asking for or recording exact-range content approval, run the candidate-a",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "dc259e3fa90f0a206b931c98305215257af1799b592458bbc1daf5c0543621a0": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:14 Candidate-acceptance commands are generated-state operations under `.claude-stat",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "5afafd99499beacae6d1899c01bdf30b8bd41efb2a167d7570cc5d624072d1e5": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:15 If `start-work-block` begins on a clean protected target branch and `workBlockBo",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "9a5ff25a4a5ca48214674a974dbf6a7494b9f370233fbe2086d42e4a11fcea7b": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:16 Work blocks must start from clean `master`/target or an already approved and int",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "2237ae264d25da1ad1d9d5c5a871ffb3c9682fc46a0bd5baa36dae6b624a32b5": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:17 Before any final response after non-trivial edits, always trigger closeout:",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "d750e6e33070f04498963acbdc4b7b69f4db2536225a578a6dc19088fca69b63": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:18 `pwsh.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File tools",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "7b062ebd204a38a7b0060c81f0b9725f876d7e06ad3f5ba7fb7d805829048efb": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:19 Content review gate (coordination-file approval for finalize). When `contentRevi",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "6d5387af1c94c812185ca7058f469bca123b8de0934372fd0ca42a05ba1678df": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:20 Coordination ledger ordering/fragmentation. For `.claude-state/coordination/gpu-",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "7fd486a7f5dca46c3a8fa3ab7195228c9ed9842f3b1fc225dfc90e4f19da79d1": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:21 To audit whole-repo branch/worktree/stash cleanup, run:",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "5a5e581d5c12131c2e909508e8cdda629e84e13e237cc26a4a6995ff028b769d": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:22 `pwsh.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File tools",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "0934c9528813fa1bb4fa864ac607068db4f9f92b2dd1c2e88200dcf15ca92c7a": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:23 Treat user-visible completion of a mutating work block as a hard-clean event by ",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "17607201ff0d88ade43e6092dc083323b7f2d016e5d40d623224a6542c0dfcd3": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:24 TortoiseGit/libgit2 can fail ref pickers when generated Codex turn-diff refs poi",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "eef5d33ce927f8dd5121158e5f876b816f586bf57644c84716f0cc460abd646f": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:25 To advance the retained-candidate remediation queue one safe candidate at a time",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "a60bf335ef2bea73dfce6d1420752657d68c4068d8efde7ee46e0288d0f0febf": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:26 `pwsh.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File tools",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "9f9dabd0e8913ebbe21a9dbd4d935aa59b8eb42242b2f5cafd8cdf26b1986f41": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:27 The trigger must run even when mutation will be blocked. The repo detector/audit",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "aa77a9ef3534032ec7d05238384b900584fb2dc1a6c1267f64e29d0478a4cbdf": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:28 The shared bridge reminder now runs dirty-state remediation triage on every resp",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "a028f4766bee5aa475aa3070bcbd7f3ef084478fb64c224400ea6c112a6966fd": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:29 Do not stash, commit, delete, or reset dirty paths classified as `foreignDirty`;",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "9a918fb2aea157a540011850bfa6fe18decf7b08173dca75f826cc17aee6abf1": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:30 High-impact mutation, including repo-sweep pruning, is allowed only after the ex",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "5f4bd7a96c4cabba587bec255b7335b9705bce5d2525a1e0a8edf4a213263bbb": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:31 For eligible symbolic actions, the repo auto-quorum actor may generate Codex/sel",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "04f48c823c9216bcd5024e7738f6028a1de157c4b3fab29042f67ecfb74d4d2d": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:32 Declared review surfaces that cannot run must write a durable `review_surface_un",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "efda680d437915ed3958b8ec0ae543d240b0ad95c5341f54a3f7819a77c4b030": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:33 Repo sweep retention is not complete at first classification. Non-protected reta",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "7cf052d9877d16a66465dbceadd5500625ee07a72b227b73d154d4ee4cd725bb": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:34 Split-required owned dirty work should not remain a passive blocker. When policy",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "c9e456829341481b9bc56c76f36386a6340c30403351cd38f7a8ac5b4bea6c11": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:35 Retained blockers must enter the blocker auto-remediation queue before becoming ",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "151ad546b4ebddcdeb5e2d60f0f60d097bebb2d6a8158a66d228548980282cfc": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:36 Stale review tuples are not terminal when `autoQuorum.allowStaleReviewRenewal=tr",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "1629059f95693176e29dfa6e99baf267c1900d63ade39e0e522484daf795a020": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:37 Response/final hooks must not create or resurrect managed session worktrees, but",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "72b4293bf82162a1c13aa710efdaa91985023c7c87f920fde223347a47ce7244": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:38 Clean-at-start dirty paths may be auto-claimed only when the broker manifest pro",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "b284e72631a6a9a35ccdd620521a9d8dfe7339eb7674c6f29c0c9f3314e9c7e9": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:39 Paths already dirty in the broker baseline are never whole-file checkpointed as ",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "189aa9fb28592f8e264967a77394048349529d292aa20f81373bd63a33364190": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:40 Closeout Remediation Freeze: This repo keeps remediation freeze disabled by defa",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "71df9d1ea4a0e498afeced31ab29dc360b79258f87433b0ae5b72b13922fba38": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:41 Before treating closeout blockers as authoritative, the worktree must pass the c",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "044a78f43227e0d7ad747d10e8c48e7498ad39215373ee0505e04393ec4e8dc0": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:42 If publish/upstream/final-push repair is blocked only by missing metrics, handof",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "22a3893dc691ecfc756fff191fb14ae12f3f1dfe20ef093c5fe4f9ea4cd951fe": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:43 Repo-owned closeout commits should be written for human developers, not just the",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "f7666d99d75ee1c01d77a71daac5b7d54f4b6b0249d1ee548d3ac955de4ad06e": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:44 Retroactive commit-message repair must start with a reviewed rewrite map, not an",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "72a39da292f357b2373dbe41523bcac078bf29588813d9e7e70ab05d8f37554c": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:45 The finalize loop must be bounded and auditable. Each retry must write the selec",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "a20c63ac591f6cbd554e5a664ceb836f3f7264146595734f0e3f33b9029ff937": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:46 Closeout actors must be bounded at the process boundary. Detector, repair, revie",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "8916dd2a4ad7fb20dd460205ce9d95085b93ac62ed9a217157949b72fe5ba9f5": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:47 Finalize and `complete --finalize` have semantic success authority only when the",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "b470eb9dc1514613b159bba83e27be4efb40c467a52906e49cc4877037d9ff60": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:48 Hard-clean final responses are blocked unless the repo-closed postcondition pass",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "6cc05c9cd5209cf74c0665faced7095d7ad98686347e6312508da7397f93a538": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:49 Hard-clean must inspect `git worktree list --porcelain` as part of repo closure.",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "3a3303ec8f00d41f9ff0f2787623ab55694ba8506a4b9f79011e4da59e79d1a3": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:50 Closeout summaries, handoffs, metrics, and cleanup status must derive their fina",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "37f4184c570a8dadc34f751d8dde7b8a157a7ea490bb18d0aa935575b22f817f": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:51 Repo state for dashboards is logged through `repoStateLedger`: `tools\\repo_hygie",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "048fcf8bf65677bd0d6ebb4f9b0b539c32d2761e09a90dc24bf36ac483022e3a": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:52 The canonical closeout contract is the shared block in [`CLOSEOUT-CANONICAL-CONT",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "ad78be7c123e4a7a9f7ef25c55ad8f0bd7ff05468dc9371d686a6827d2ffdba0": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:53 Whenever closeout workflow semantics change, update this summary, the canonical ",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "89b62fd81b003a9960f5d4900e4ab1fa379e0cb35b40c95d1c65232d38cf80ae": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:54 The shared closeout report envelope is canonical across repos: `objective`, `las",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "4e9f27536f3fcde4b43469c07ab9cec7fc5d756d9633afec989436e3482554af": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:55 The compare output itself should also be durable and machine-labeled. Emit a `cl",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "ceb7f7df6fc01a5ac65c399b99a05f383287a9b71a01b52735a08a2059d5c3b6": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:56 Live dashboard refresh should use `pwsh.exe -NoLogo -NoProfile -NonInteractive -",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "e07f67f252e7faa2a60ab81136758bcd3079b0c415ee3014262175d2d519b755": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:57 `webDashboardSpec` is read-only by default and `symbolic-action-request-only`: s",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "d587fcb142bdd77624bcd319146788ac86347d103321dfb6c5ce5e29098ece28": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:58 The local dashboard helper is `tools\\closeout\\start-closeout-dashboard.ps1`; it ",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "e82fe1d82718e4d94e09bd528ce61cd9606438efdbb28a49f020041f6dd1c330": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:59 Dashboard symbolic action intent is durable but non-mutating: `/api/closeout/act",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "7311bc8f797990e10c02ddf21b6228ebe9318f0ace2efa03930c3d84ea5c1561": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:60 Rollback is feasible only through repo-owned evidence and Git-safe actions. `rol",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "70601276029b2604518afc3df63be52dcab7c7e04dbdb06590b1886ca1f9bc75": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:61 Protected target closeout is a no-op only when `hardClean.protectedTargetNoopClo",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "dbd28991e2437d2b4938b782481edfc05d43d831dc249df69f4837f3543dda1b": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:62 Runtime services that execute repo code must follow configured lifecycle actors.",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "4da9490d10ba9d8b8c8e163d5135fc527619bd9378b68252492190dc5bef8c0e": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:63 Clean integration and remediation actors must create temporary Git worktrees wit",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "7c608b56a004a7a8c0a739a9a07e60711cd753928380e971d4b8c349d6afd675": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:64 A target push non-fast-forward is a recoverable target race, not permission to f",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "688b4e0b9099a5d365272bed7e93f11912127193e5d9eaf1d9feda51539b6767": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:65 Never advance a branch ref with raw `git update-ref` while that branch is checke",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "1bbd7a3b2ae1b4c9f3af95a2c97b8796dd8c551232c93df455d1f603a75d9bfb": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:66 Closeout completion is a fixed point, not the first successful merge. After fina",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "071d1f4149e4d9edf2bee3761291240e728c3ea4421a321e0eed2689232cc742": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:67 Remote feature branches are temporary unless policy explicitly retains them. Aft",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "e3fad09b21610e4086a896846ccd57d58db32068358d09c9875d3e436eeae74e": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:68 Retained remediation is a dedicated actor, not a chat follow-up. `remediate-reta",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "d90fa0229e20ce0031d91ffb772a74789b9ed2a91563e05bffc16b4b8021088f": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:69 Remaining-candidate cleanup is a bounded remediation queue. Older `fork/codex/*`",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "c849a4ec1a122071e31e8cbd317c6f4f6940a737f5e25c7c48f4977ea8dcc50d": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:70 Merge-failed retained candidates are not terminal by default. Repo sweep must pr",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "4175720cfc116beeef876db1c452055e12c027f886fcee5905f8f9e3abc038a1": {
+      "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
+      "bullet": "agents/brokered-auto-closeout.md:71 Evidence-preserving transaction prune: Branches are transactions, not archives. ",
+      "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
     }
   }
 }
