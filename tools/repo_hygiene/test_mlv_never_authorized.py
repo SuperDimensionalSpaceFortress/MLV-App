@@ -9053,5 +9053,279 @@ for _case in CASES:
         setattr(Na6DifferentialTests, _name, _make_differential(_case))
 
 
+class Na2AssignmentIsNotADeleteTests(unittest.TestCase):
+    """HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (2026-10-15): a shell VARIABLE named like a delete verb
+    (`RD=...`, `RM=...`, `DEL=...`) is an assignment, not a delete.  `_DELETE_RX` matched the bare word
+    `rd` before `=` (`=` is a word boundary), so every later command that MENTIONED `$RD` -- a run dir --
+    was attributed a delete of that run dir and refused by NA-2.  Measured the same day: three headless
+    lanes (STUCK-RECONCILER-1 r1, LOOK-ASSIST-KODAK-VISION-50D-1 r2, HUB-VM-LINT-CLAUSE-SCOPE-1 r11)
+    stopped PARTIAL on their first read-only command.  Real delete verbs must still read as deletes.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.hook = _load_hook_module()
+
+    def _acts(self, command):
+        return self.hook.shell_acts(command)
+
+    def test_assignment_of_rd_is_not_a_delete(self):
+        cmd = 'RD="/c/x/fleet-runs/lane-A-r1"; cat "$RD/sonnet-001.receipt.json" "$RD/arm.ps1"'
+        self.assertNotIn("delete", self._acts(cmd))
+
+    def test_assignment_then_mkdir_is_not_a_delete(self):
+        cmd = 'RD="/c/x/fleet-runs/lane-B-r1"; mkdir -p "$RD"; ls "$RD"'
+        self.assertNotIn("delete", self._acts(cmd))
+
+    def test_other_delete_verb_named_variables_are_not_deletes(self):
+        for cmd in ('RM=/tmp/x; echo "$RM"', 'DEL=1; echo $DEL', 'RMDIR="a b"; ls "$RMDIR"'):
+            with self.subTest(cmd=cmd):
+                self.assertNotIn("delete", self._acts(cmd))
+
+    def test_cmd_exe_equals_delimiter_is_still_a_delete(self):
+        # r2 (sol key blocker): cmd.exe treats `=` as a delimiter, so these REALLY delete.
+        for cmd in ('cmd /c rd= /s /q C:/review/board/.claude-state/fleet-runs/lane-A-r1',
+                    'cmd /c rmdir= /s /q C:\\x\\y', 'cmd.exe /c del= C:\\x\\y.txt', 'cmd /k rd=/s /q x',
+                    'echo a && cmd /C "rd= /s /q C:\\x"'):
+            with self.subTest(cmd=cmd):
+                self.assertIn("delete", self._acts(cmd))
+
+    def test_cmd_exe_leading_switches_before_c_are_still_a_delete(self):
+        # r3 (sol + fable r2 keys): switches before /c or /k must not hide the cmd segment.
+        for cmd in ('cmd /s /c rd= /s /q C:/review/board/.claude-state/fleet-runs/lane-A-r1',
+                    'cmd /s /c rmdir= /s /q C:\\x\\y', 'cmd /s /c del= /q C:\\x\\y.txt',
+                    'cmd /d /s /c rd= /s /q C:\\x', 'cmd /s /k rd= /s /q C:\\x',
+                    'cmd.exe /s /c "rd= /s /q C:\\x"', 'cmd /v:on /c rd= /s /q C:\\x',
+                    'cmd /D /S /C rd= /s /q C:\\x'):
+            with self.subTest(cmd=cmd):
+                self.assertIn("delete", self._acts(cmd))
+
+    def test_cmd_double_slash_and_compact_switches_are_still_a_delete(self):
+        # r4 (sol r3 key): Git Bash `cmd //c` and compact cmd.exe switches (`/s/c`, `cmd/c`).
+        for cmd in ('cmd //c rd= /s /q C:/review/board/.claude-state/fleet-runs/lane-A-r1',
+                    'cmd //c rmdir= /s /q C:/x/y', 'cmd //c del= /q C:/x/y.txt',
+                    'cmd.exe /s/c rd= /s /q C:\\x', 'cmd.exe /s/c rmdir= /s /q C:\\x', 'cmd.exe /s/c del= /q C:\\x\\y.txt',
+                    'cmd //s //c rd= /s /q C:/x', 'cmd/c rd= /s /q C:\\x', 'cmd.exe /d/s/k rd= /s /q C:\\x'):
+            with self.subTest(cmd=cmd):
+                self.assertIn("delete", self._acts(cmd))
+
+    def test_any_cmd_or_comspec_mention_selects_the_strict_reading(self):
+        # r5 (sol r4 key): `/c` glued to the command word, and %ComSpec% instead of the name.
+        for cmd in ("cmd.exe /cecho cleanup '&' rd= /s /q C:/review/board/.claude-state/fleet-runs/lane-A-r1",
+                    "cmd.exe /cecho cleanup '&' rmdir= /s /q C:\\x", "cmd.exe /cecho cleanup '&' del= /q C:\\x\\y.txt",
+                    "cmd.exe /d /cecho x '&' rd= /s /q C:\\x", '%ComSpec% /c rd= /s /q C:\\x',
+                    '& $env:ComSpec /c rd= /s /q C:\\x'):
+            with self.subTest(cmd=cmd):
+                self.assertIn("delete", self._acts(cmd))
+
+    def test_implicit_cmd_launchers_select_the_strict_reading(self):
+        # r6 (sol r5 key): cmd.exe reached without naming it.
+        for cmd in ("python -c \"import subprocess; subprocess.run('echo x & rd= /s /q C:\\\\x', shell=True)\"",
+                    "python -c \"import os; os.system('echo x & rmdir= /s /q C:\\\\x')\"",
+                    "node -e \"require('child_process').execSync('echo x & del= /q C:\\\\x\\\\y.txt')\"",
+                    "Start-Process -FilePath $env:SystemRoot\\System32\\x.exe -ArgumentList 'echo & rd= /s /q C:\\x'",
+                    "Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine='echo & rd= /s /q C:\\x'}",
+                    "schtasks /create /tn t /tr \"echo & rd= /s /q C:\\x\" /sc once /st 00:00"):
+            with self.subTest(cmd=cmd):
+                self.assertIn("delete", self._acts(cmd))
+
+    def test_any_interpreter_import_or_system_call_selects_the_strict_reading(self):
+        # r7 (sol r6 key): `from os import system; system(...)` escaped the r6 launch list. Any interpreter
+        # invocation, import statement or bare system( call now selects the strict reading.
+        for cmd in ("python -c \"from os import system; system('echo cleanup & rd= /s /q C:/review/board/.claude-state/fleet-runs/lane-A-r1')\"",
+                    "python -c \"from os import system; system('echo cleanup & rmdir= /s /q C:\\\\x')\"",
+                    "python -c \"from os import system; system('echo cleanup & del= /q C:\\\\x\\\\y.txt')\"",
+                    "py -3 -c \"__import__('os').system('echo x & rd= /s /q C:\\\\x')\"",
+                    "C:\\Python314\\python.exe -c \"import os as o; getattr(o, 'sys' + 'tem')('echo & rd= /s /q C:\\\\x')\"",
+                    "/usr/bin/python3 -c \"exec('echo') ; 'rd= /s /q C:/x'\"",
+                    "perl -e \"system('echo & rd= /s /q C:\\\\x')\"",
+                    "ruby -e \"system('echo & rd= /s /q C:\\\\x')\"",
+                    "php -r \"system('echo & rd= /s /q C:\\\\x');\"",
+                    "pwsh -NoProfile -Command \"[Diagnostics.Process]::Start('c'+'md', '/c rd= /s /q C:\\x')\"",
+                    "powershell -c \"& ('c'+'md') /c rd= /s /q C:\\x\"",
+                    "deno eval \"Deno.run({cmd:['c'+'md','/c','rd= /s /q C:\\\\x']})\""):
+            with self.subTest(cmd=cmd):
+                self.assertIn("delete", self._acts(cmd))
+
+    def test_file_names_ending_in_interpreter_extensions_do_not_select_the_strict_reading(self):
+        # r7: the interpreter word must not follow a dot, so `.py` / `.php` / `.pl` file names keep the exemption.
+        for cmd in ('RD="/c/x/lane-A-r1"; cat "$RD/check.py" "$RD/a.php"', 'RD=/c/x/lane-B-r1; ls "$RD"/*.py',
+                    'DEL=1; echo $DEL; cat tools/coordination/doctrine_outbox.py'):
+            with self.subTest(cmd=cmd):
+                self.assertNotIn("delete", self._acts(cmd))
+
+    def test_cmd_delete_shape_selects_the_strict_reading_whatever_the_launcher(self):
+        # r8 (CoS 6223902133): launchers the r7 list does not name (Rscript, julia, wsl with a split "c''md") still reach
+        # cmd.exe. The DELETE SHAPE decides now: `rd=` followed by whitespace, the end, or a one-letter switch.
+        for cmd in ("Rscript -e \"shell('echo x & rd= /s /q C:/review/board/.claude-state/fleet-runs/lane-A-r1')\"",
+                    "Rscript -e \"shell('echo x & del= /q C:/review/board/.claude-state/fleet-runs/lane-A-r1/x.txt')\"",
+                    "julia -e 'run(`$(\"c\"*\"md\") /c rd= /s /q C:/x`)'",
+                    "wsl.exe -e sh -c 'c''md.exe /c rd= /s /q C:/x'",
+                    "anylauncher 'echo & rd=/s /q C:/x'", "anylauncher 'echo & rmdir=/q C:/x'", "x & rd="):
+            with self.subTest(cmd=cmd):
+                self.assertIn("delete", self._acts(cmd))
+
+    def test_incident_assignment_shapes_never_match_the_delete_shape(self):
+        # r8: the incident shape always carries a value; a Git Bash path after `=` (`/c/x/...`) is not a switch.
+        for cmd in ('RD="/c/x/lane-A-r1"; cat "$RD/a.json"', 'RD=/c/x/lane-B-r1; ls "$RD"', "RD='C:/x/lane-C-r1'; ls \"$RD\"",
+                    'RM=/tmp/x; echo "$RM"', 'RD=/c; ls "$RD"/x', 'DEL=1; echo $DEL'):
+            with self.subTest(cmd=cmd):
+                self.assertNotIn("delete", self._acts(cmd))
+
+    def test_assignment_without_any_cmd_mention_is_still_not_a_delete(self):
+        # The exemption still holds when nothing in the text names cmd.exe.
+        for cmd in ('RD="/c/x/lane-A-r1"; cat "$RD/a.json"', 'DEL=1; echo $DEL; ls /c/commands'):
+            with self.subTest(cmd=cmd):
+                self.assertNotIn("delete", self._acts(cmd))
+
+    def test_cmd_mentioned_in_a_string_stays_fail_closed(self):
+        # Known fail-closed direction (sol r2 hardening row): an assignment next to text that merely
+        # mentions `cmd /c` is read strictly. Documented, not loosened.
+        self.assertIn("delete", self._acts('RD=/c/x/lane-A-r1; echo "cmd /c is a string"'))
+
+    def test_real_delete_verbs_still_read_as_deletes(self):
+        for cmd in ('rd /s /q C:\\x\\y', 'rm -rf /c/x/y', 'del C:\\x\\y.txt', 'rmdir /c/x/y',
+                    'echo a; rd /s x', 'Remove-Item -Recurse C:\\x', 'git rm x'):
+            with self.subTest(cmd=cmd):
+                self.assertIn("delete", self._acts(cmd))
+
+
+class Na2CmdDelimiterShapeR9Tests(unittest.TestCase):
+    """r9 (CoS 6224673286, Iverson 6224545907): every delimiter cmd.exe accepts after a delete verb's `=`, glued switches,
+    R's literal `\\t`, a verb= with a value after a cmd separator inside a quote, and `erase`; plus the r7 file-name false
+    positives (import.json, python.log, subprocess.json) no longer selecting the strict reading."""
+
+    T = "C:/review/board/.claude-state/fleet-runs/lane-A-r1"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.hook = _load_hook_module()
+
+    def _acts(self, command):
+        return self.hook.shell_acts(command)
+
+    def test_every_cmd_delimiter_and_glued_switch_reads_as_a_delete(self):
+        t = self.T
+        for cmd in (f"rd=/q/s {t}", f"rmdir=/s/q {t}", f"del=/f/q {t}/x.txt", f"rd=,/s {t}", f"rd=;/s {t}", f"rd==/s {t}",
+                    f"rd=\t/s {t}", "Rscript -e \"shell('echo x & rd=\\t/s " + t + "')\"",
+                    "Rscript -e \"shell('echo x & del=" + t + "/x.txt')\"", f"anylauncher \"echo & rd={t}\"",
+                    f"anylauncher 'echo | rmdir={t}'", f"erase {t}/x.txt", f"anylauncher 'echo & erase= /q {t}/x.txt'"):
+            with self.subTest(cmd=cmd):
+                self.assertIn("delete", self._acts(cmd))
+
+    def test_file_names_and_git_bash_paths_keep_the_assignment_exemption(self):
+        for cmd in ('RD="/c/x/lane-A-r1"; cat import.json', "RD=/c/x/lane-B-r1; cat python.log subprocess.json",
+                    "RD=/c/x; ls", 'RD="/c/x"; cat "$RD/a.py"', "RD=/c/x/y; ls"):
+            with self.subTest(cmd=cmd):
+                self.assertNotIn("delete", self._acts(cmd))
+
+
+class Na2MasterParitySweepTests(unittest.TestCase):
+    """r9 (CoS asks 6224004771, 6224673286): the master-parity sweep. Every delete row master's hook DENIES must still be
+    a delete on this head, except the documented incident shapes (a bare assignment outside any launcher or quote).
+    Rows: every deny row of the NA-2 test classes in this file, plus generated cmd.exe delimiter and glued-switch
+    variants inside five launcher wrappers. The base is master read through git; no ref -> skipped with the reason."""
+
+    T = "C:/review/board/.claude-state/fleet-runs/lane-A-r1"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.head = _load_hook_module()
+        cls.base = None
+        cls.base_ref = ""
+        for ref in ("origin/master", "fork/master", "master"):
+            p = subprocess.run(["git", "-C", REPO_ROOT, "show", f"{ref}:tools/hooks/mlv-never-authorized.py"],
+                               capture_output=True, text=True, encoding="utf-8")
+            if p.returncode == 0 and p.stdout:
+                import importlib.util, tempfile
+                d = tempfile.mkdtemp(prefix="na2-parity-")
+                path = os.path.join(d, "hook_master.py")
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write(p.stdout)
+                spec = importlib.util.spec_from_file_location("na2_parity_base", path)
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                cls.base, cls.base_ref = mod, ref
+                break
+
+    def _rows(self):
+        t = self.T
+        tails = (" /s /q {t}", "/s/q {t}", "/q/s {t}", ",/s {t}", ";/s {t}", "=/s {t}", "\\t/s {t}", "\t/s {t}", "{t}")
+        wrappers = ("cmd /c {x}", "Rscript -e \"shell('echo x & {x}')\"", "anylauncher \"echo & {x}\"",
+                    "python -c \"import os; os.system('echo & {x}')\"",
+                    "node -e \"require('child_process').execSync('echo & {x}')\"")
+        rows = []
+        for verb in ("rd", "rmdir", "del", "erase"):
+            for tail in tails:
+                x = verb + "=" + tail.format(t=t)
+                rows.extend(w.format(x=x) for w in wrappers)
+        import ast
+        with open(__file__, encoding="utf-8") as fh:
+            tree = ast.parse(fh.read())
+        for cls in tree.body:
+            if not (isinstance(cls, ast.ClassDef) and cls.name.startswith("Na2")):
+                continue
+            for fn in cls.body:
+                if not isinstance(fn, ast.FunctionDef):
+                    continue
+                src = ast.unparse(fn)
+                if "assertIn('delete'" not in src and "assertEqual(rc, 2" not in src:
+                    continue
+                for node in ast.walk(fn):
+                    if isinstance(node, ast.For) and isinstance(node.iter, ast.Tuple):
+                        for elt in node.iter.elts:
+                            if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                                rows.append(elt.value)
+        return rows
+
+    def test_no_row_master_denies_is_allowed_on_this_head(self):
+        if self.base is None:
+            self.skipTest("no master ref readable through git (origin/master, fork/master, master)")
+        rows = self._rows()
+        self.assertGreater(len(rows), 150)
+        regressions = [r for r in rows if "delete" in self.base.shell_acts(r) and "delete" not in self.head.shell_acts(r)]
+        self.assertEqual(regressions, [], f"master ({self.base_ref}) DENY -> head ALLOW")
+
+
+class Na2ImplicitLauncherEndToEndDenyTests(unittest.TestCase):
+    """r8 (Dot advisory abb6d537, carried by the CoS): every implicit-launcher delete row must DENY through the real hook
+    CLI (exit 2, NA-2), not only through shell_acts. The protected target is a run dir under a synthetic board root."""
+
+    BOARD = "C:/review/board"
+    TARGET = BOARD + "/.claude-state/fleet-runs/lane-A-r1"
+
+    def _rc(self, command):
+        env = {k: v for k, v in os.environ.items() if not k.startswith("MLV_")}
+        env.pop("CLAUDE_PROJECT_DIR", None)
+        env["MLV_BOARD_ROOT"] = self.BOARD
+        env["PYTHONIOENCODING"] = "utf-8"
+        payload = json.dumps({"tool_name": "PowerShell", "tool_input": {"command": command}})
+        p = subprocess.run([sys.executable, HOOK, "--project-dir", "C:/review/worktree"], input=payload,
+                           capture_output=True, text=True, encoding="utf-8", env=env, timeout=120)
+        return p.returncode, p.stderr
+
+    def test_each_implicit_launcher_delete_is_denied_end_to_end(self):
+        t = self.TARGET
+        for cmd in (f"cmd /c rd= /s /q {t}",
+                    f"python -c \"from os import system; system('echo x & rd= /s /q {t}')\"",
+                    f"python -c \"import subprocess; subprocess.run('echo x & rd= /s /q {t}', shell=True)\"",
+                    f"node -e \"require('child_process').execSync('echo x & rd= /s /q {t}')\"",
+                    f"perl -e \"system('echo & rd= /s /q {t}')\"",
+                    f"Rscript -e \"shell('echo x & rd= /s /q {t}')\"",
+                    f"wsl.exe -e sh -c 'c''md.exe /c rd= /s /q {t}'",
+                    f"anylauncher 'echo & rd=/s /q {t}'"):
+            with self.subTest(cmd=cmd):
+                rc, err = self._rc(cmd)
+                self.assertEqual(rc, 2, err)
+                self.assertIn("NA-2", err)
+
+    def test_incident_shapes_are_allowed_end_to_end(self):
+        t = self.TARGET
+        for cmd in (f'RD="{t}"; cat "$RD/sonnet-001.receipt.json"', f'RD={t}; ls "$RD"/*.py'):
+            with self.subTest(cmd=cmd):
+                rc, err = self._rc(cmd)
+                self.assertEqual(rc, 0, err)
+
+
 if __name__ == "__main__":
     unittest.main()

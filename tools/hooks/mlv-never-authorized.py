@@ -1237,15 +1237,62 @@ def read_json(path):
 
 # ------------------------------------------------------------------------ verbs
 
-_DELETE_RX = re.compile(
-    r"(?:^|[\s;&|`(])(?:rm|del|rd|rmdir)\b"
+# HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (2026-10-15): a bare verb word directly followed by `=` is a POSIX shell
+# VARIABLE assignment (`RD="<run dir>"`), not a delete.  Without the exemption, `RD=` read as `rd` and every later
+# mention of `$RD` was refused as a delete of that run dir (three lanes, one day).
+# r2 (sol key): cmd.exe treats `=` as an argument DELIMITER, so `cmd /c rd= /s /q <dir>` really is `rd /s /q <dir>`.
+# The exemption therefore applies ONLY when the text has no cmd.exe segment (`cmd /c`, `cmd.exe /k`, ...);
+# with one, `_DELETE_RX_STRICT` (no `(?!=)`) decides, as before this card.
+_DELETE_TAIL = (
     r"|\bremove-item\b"
     r"|\bgit\s+rm\b"
     r"|\bos\.(?:remove|unlink)\s*\("
     r"|\bshutil\.rmtree\s*\("
-    r"|\.unlink\s*\(",
-    re.I,
+    r"|\.unlink\s*\("
 )
+# r9 (CoS 6224673286): `erase` is cmd.exe's `del`.
+_DELETE_RX = re.compile(r"(?:^|[\s;&|`(])(?:rm|del|erase|rd|rmdir)\b(?!=)" + _DELETE_TAIL, re.I)
+# Inside a cmd.exe segment a quote also starts a command (`cmd /c "rd /s /q x"`), so it counts as a boundary there.
+_DELETE_RX_STRICT = re.compile(r"(?:^|[\s;&|`(\"'])(?:rm|del|erase|rd|rmdir)\b" + _DELETE_TAIL, re.I)
+# r3 (sol + fable keys): other switches may come first (`cmd /s /c`, `cmd /d /s /k`, `cmd /v:on /c`), so any number
+# of leading `/x...` switches is skipped before the `/c` or `/k` that runs the command string.
+# r4 (sol r3 key): Git Bash needs `cmd //c` (doubled slash) and cmd.exe accepts compact switches (`cmd /s/c`,
+# `cmd/c`), so slashes may repeat and the whitespace before a switch is optional.
+# r5 (sol r4 key): `/c` may also be glued to the command (`cmd.exe /cecho x & rd= ...`). Four rounds of switch syntax
+# showed that parsing cmd.exe's switches is the wrong shape: ANY mention of cmd/cmd.exe or %ComSpec% now selects the
+# strict regex. Fail-closed by design; the cost is the documented mention-in-a-string deny (NA2-CMD-MENTION-IN-STRING-1).
+# r6 (sol r5 key): cmd.exe is also reached WITHOUT its name -- Python shell=True / os.system, Node child_process,
+# Start-Process, WMI process creation, scheduled tasks. Any process-launch construct now selects the strict reading
+# too; the exemption survives only for plain shell text that launches nothing (the incident shape).
+# r7 (sol r6 key): `from os import system; system(...)` escaped the r6 list. Seven rounds of launch-construct
+# syntax repeat the r5 lesson, so ANY script-interpreter invocation (python/py/node/perl/ruby/php/pwsh/...), any
+# import statement and any bare `system(` call now select the strict reading. The interpreter word may follow a
+# path separator (`C:\Python314\python.exe`, `/usr/bin/python3`) but not a dot, so a file name like `a.py` does not
+# trigger it. The exemption survives only for plain POSIX shell text (the incident shape).
+_CMD_SEGMENT_RX = re.compile(
+    r"\bcmd(?:\.exe)?\b|\bcomspec\b"
+    # r9 (Iverson 6224545907): file names such as import.json, python.log and subprocess.json no longer select the
+    # strict reading: an interpreter word must be followed by whitespace, a quote or the end; `import` must start an
+    # import statement; `subprocess` must be a call (`subprocess.run(`). The delete-shape rule below carries the real coverage.
+    r"|(?<![\w.-])(?:python[\d.]*w?|py|pypy[\d.]*|node(?:js)?|deno|bun|perl|ruby|php|pwsh|powershell|tclsh|lua|osascript|java|dotnet)(?:\.exe)?(?=[\s\"']|$)"
+    r"|\bimport\s+[A-Za-z_]|\bfrom\s+[\w.]+\s+import\b|\b__import__\b|\bsystem\s*\("
+    r"|\bshell\s*=\s*true\b|\bos\.(?:system|popen|spawn\w*|exec\w*)\b|\bsubprocess\s*\.\s*[a-z_]+\s*\(|\bpopen\b"
+    r"|\bchild_process\b|\bexec(?:sync|file\w*)?\s*\(|\bspawn(?:sync)?\s*\("
+    r"|\bstart-process\b|\binvoke-expression\b|\biex\b|\binvoke-item\b|\bshellexecute\w*\b"
+    r"|\bwin32_process\b|\binvoke-cimmethod\b|\binvoke-wmimethod\b|\bwmic\b|\bschtasks\b|\bregister-scheduledtask\b"
+    r"|\b[cw]script\b|\bmshta\b|\brundll32\b|\bforfiles\b|\bstart\s+(?:\"|/)",
+    re.I)
+# r8 (CoS 6223902133): detect the cmd.exe delete SHAPE, not the launcher. `rd=` followed by whitespace or the end of the
+# text, or by a one-letter switch (`rd=/s /q x`), is cmd.exe's `=` delimiter. The incident shape always carries a value
+# (`RD="..."`, `RD=/c/x/lane`), so it never matches. Rscript, julia and `wsl ... c''md` reached cmd.exe past the r7 list;
+# the launcher list stays as defence in depth.
+# r9 (CoS 6224673286): cmd.exe accepts any delimiter after the verb's `=` (whitespace, tab, `,`, `;`, `=`) and glued
+# switches made of rd/del switch letters (`/s/q`, `/f/q`; a Git Bash path such as `/c/x` is not one); R strings carry a literal `\t`. A verb= right after a cmd separator (`&`, `|`) inside an open quote
+# is a delete with a value (`'echo & del=file'`).
+_CMD_DELETE_SHAPE_RX = re.compile(
+    r"(?:^|[\s;&|`(\"'])(?:rm|del|erase|rd|rmdir)=(?:[\s,;=]|\\t|$|(?:/[sqpfa])+(?:[\s,;]|\\t|$))"
+    r"|[\"'][^\"']*(?:&|\|)\s*(?:rm|del|erase|rd|rmdir)=",
+    re.I)
 _MOVE_RX = re.compile(
     r"(?:^|[\s;&|`(])(?:mv|move)\b"
     r"|\bmove-item\b"
@@ -1328,7 +1375,8 @@ def shell_acts(command):
     """
     scan = _GIT_RM_CACHED_RX.sub(" gitrmcached ", command or "")
     acts = set()
-    if _DELETE_RX.search(scan):
+    delete_rx = _DELETE_RX_STRICT if (_CMD_SEGMENT_RX.search(scan) or _CMD_DELETE_SHAPE_RX.search(scan)) else _DELETE_RX
+    if delete_rx.search(scan):
         acts.add("delete")
     if _MOVE_RX.search(scan):
         acts.add("move")
