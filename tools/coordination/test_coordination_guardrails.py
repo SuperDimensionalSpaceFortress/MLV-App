@@ -7,7 +7,10 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -57,7 +60,36 @@ def init_repo(tmp_path):
     )
 
 
+# COST (CI-SHARD8-GUARDRAILS-COST-1): the git repositories the fixtures below build cost six to forty-five git
+# processes each and were rebuilt for every test that uses one (editing_board alone is called by 27 tests,
+# coverage_repo by 17). Each distinct repository is now built ONCE per pytest session by the original builder
+# (the `_build_*` functions, bodies unchanged) in a directory of its own, and every test copies that directory
+# tree into its own tmp_path, so no test can see another's writes. Only repositories whose `.git` holds no
+# absolute path are templated this way (no remote); stale_ref_repo, whose clone remembers its origin's path, is not.
+_FIXTURE_TEMPLATES = {}
+_TEMPLATE_BASE = {}
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _fixture_template_base(tmp_path_factory):
+    _TEMPLATE_BASE["dir"] = tmp_path_factory.getbasetemp()
+
+
+def fixture_template(key, build):
+    """Run `build(root)` once per `key` in a fresh directory of the session's base temp dir; return (root, its result)."""
+    if key not in _FIXTURE_TEMPLATES:
+        root = Path(tempfile.mkdtemp(prefix="guardrails-fixture-template-", dir=_TEMPLATE_BASE["dir"]))
+        _FIXTURE_TEMPLATES[key] = (root, build(root))
+    return _FIXTURE_TEMPLATES[key]
+
+
 def make_repo(tmp_path):
+    root, shas = fixture_template(("make_repo",), _build_make_repo)
+    shutil.copytree(root, tmp_path, dirs_exist_ok=True)
+    return shas
+
+
+def _build_make_repo(tmp_path):
     init_repo(tmp_path)
     subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True)
     subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, check=True)
@@ -498,6 +530,12 @@ def guard_status(script_path, ref="fork/master", env=None):
 
 
 def currency_repo(tmp_path):
+    root, _ = fixture_template(("currency_repo",), _build_currency_repo)
+    shutil.copytree(root, tmp_path, dirs_exist_ok=True)
+    return tmp_path / "tool.ps1"
+
+
+def _build_currency_repo(tmp_path):
     """A repo with a 'fork/master' ref and a tracked script, so the guard has something to compare."""
     init_repo(tmp_path)
     subprocess.run(["git", "config", "user.email", "t@e.com"], cwd=tmp_path, check=True)
@@ -1904,6 +1942,12 @@ def write_fields_card(dir_path, card_id, extra_lines=""):
 
 
 def editing_board(tmp_path, with_lane_shim=True):
+    root, head = fixture_template(("editing_board", with_lane_shim), lambda r: _build_editing_board(r, with_lane_shim)[1])
+    shutil.copytree(root, tmp_path, dirs_exist_ok=True)
+    return tmp_path / ".claude-state" / "coordination" / "dual-lane", head
+
+
+def _build_editing_board(tmp_path, with_lane_shim=True):
     """A throwaway git repo playing the board root: a 'fork/master' ref for baseSha resolution
     and worktree-add, and the dual-lane coordination tree an editing dispatch reads from (the
     composer template, and by default a fake Start-EditingLane.ps1 shim so no real lane is ever
@@ -3807,6 +3851,14 @@ def coverage_stamp(epoch):
 
 
 def coverage_repo(tmp_path, landed=True):
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    root, _ = fixture_template(("coverage_repo", landed), lambda r: _build_coverage_repo(r, landed))
+    repo = tmp_path / "repo"
+    shutil.copytree(root / "repo", repo)
+    return repo
+
+
+def _build_coverage_repo(tmp_path, landed=True):
     """Share 6/10 over the window, two recognized product PRs, so only coverage and rate decide."""
     tmp_path.mkdir(parents=True, exist_ok=True)
     repo = ratio_source_init_repo(tmp_path / "repo")

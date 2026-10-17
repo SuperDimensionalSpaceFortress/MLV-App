@@ -18,6 +18,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -50,9 +51,42 @@ def dated(seconds_ago: float) -> dict[str, str]:
     return {"GIT_AUTHOR_DATE": stamp, "GIT_COMMITTER_DATE": stamp}
 
 
+# COST (CI-SHARD8-GUARDRAILS-COST-1): the bus and source fixtures below were rebuilt from scratch for every
+# test -- eight to ten git processes each, about 0.1 s apiece on a hosted Windows runner -- and this file
+# builds them for well over a hundred tests. Each distinct fixture is now built ONCE per pytest session by
+# the original builder (`_build_bus` / `_build_source`, bodies unchanged) and every test gets its own
+# private copy of that directory tree, so no test can see another's writes. The one absolute path a copy
+# carries (the clone's `origin` url) is repointed at the copy's own bare repo.
+_FIXTURE_TEMPLATES: dict = {}
+_TEMPLATE_BASE: dict = {}
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _fixture_template_base(tmp_path_factory):
+    _TEMPLATE_BASE["dir"] = tmp_path_factory.getbasetemp()
+
+
+def _fixture_template(key: tuple, build):
+    """Build `key`'s fixture once under a fresh directory in the session's base temp dir, then reuse it."""
+    if key not in _FIXTURE_TEMPLATES:
+        _FIXTURE_TEMPLATES[key] = build(Path(tempfile.mkdtemp(prefix="outbox-fixture-template-", dir=_TEMPLATE_BASE["dir"])))
+    return _FIXTURE_TEMPLATES[key]
+
+
 def init_bus(tmp_path: Path, crlf_target: str | None = None, name: str = "bus",
              traps: str | None = None) -> tuple[Path, Path]:
     """A bare repo as the bus 'origin', and a clone of it as the bus working repo."""
+    template_bare, template_clone = _fixture_template(
+        ("bus", crlf_target, traps), lambda root: _build_bus(root, crlf_target, "bus", traps))
+    bare = tmp_path / f"{name}-origin.git"
+    clone = tmp_path / f"{name}-clone"
+    shutil.copytree(template_bare, bare)
+    shutil.copytree(template_clone, clone)
+    git(clone, "remote", "set-url", "origin", str(bare))
+    return bare, clone
+
+
+def _build_bus(tmp_path: Path, crlf_target: str | None, name: str, traps: str | None) -> tuple[Path, Path]:
     bare = tmp_path / f"{name}-origin.git"
     clone = tmp_path / f"{name}-clone"
     subprocess.run(["git", "init", "--bare", "-b", "master", str(bare)], check=True, capture_output=True, text=True)
@@ -74,6 +108,13 @@ def init_bus(tmp_path: Path, crlf_target: str | None = None, name: str = "bus",
 
 def init_source(tmp_path: Path, name: str = "source", with_tool: bool = True) -> Path:
     """A small source repo on master. With the tool committed, as on a ref that has adopted it."""
+    template = _fixture_template(("source", with_tool), lambda root: _build_source(root, "source", with_tool))
+    src = tmp_path / name
+    shutil.copytree(template, src)
+    return src
+
+
+def _build_source(tmp_path: Path, name: str, with_tool: bool) -> Path:
     src = tmp_path / name
     src.mkdir()
     subprocess.run(["git", "init", "-b", "master", str(src)], check=True, capture_output=True, text=True)
