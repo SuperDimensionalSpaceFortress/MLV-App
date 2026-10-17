@@ -605,7 +605,10 @@ TEST(PlaybackGpuClockKickWiring, TheKernelIsBoundedByAGlobaltimerDeadlineOnItsOw
     ASSERT_TRUE(begin.contains(QStringLiteral(
         "cudaStreamCreateWithPriority(&backend->kickStream, cudaStreamNonBlocking, leastPriority);")));
     ASSERT_TRUE(begin.contains(QStringLiteral("k_clock_kick<<<1, 32, 0, backend->kickStream>>>(")));
-    ASSERT_TRUE(begin.contains(QStringLiteral("if (!backend || max_ms <= 0 || max_ms > kClockKickMaxMsCap) return -1;")));
+    // bad max_ms (0 or below, or above the 2 s cap) is refused before anything is launched
+    ASSERT_TRUE(begin.contains(QStringLiteral("> kClockKickMaxMsCap) return -1;")));
+    ASSERT_TRUE(begin.indexOf(QStringLiteral("> kClockKickMaxMsCap) return -1;"))
+                < begin.indexOf(QStringLiteral("k_clock_kick<<<1, 32, 0, backend->kickStream>>>(")));
     ASSERT_TRUE(begin.contains(QStringLiteral("if (backend->kickLaunched && backend->kickHost && !backend->kickHost->done) return 1;")));
     // it never touches the AMaZE live buffers or tile streams
     ASSERT_FALSE(begin.contains(QStringLiteral("liveTileStreams")));

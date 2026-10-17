@@ -116,11 +116,12 @@ TEST(PlaybackGpuClockKickPolicy, IntervalMhzIsCyclesOverNanoseconds)
     ASSERT_EQ(2, static_cast<int>(mhz.size()));
     ASSERT_NEAR(210.0, mhz[0], 1e-6);
     ASSERT_NEAR(1500.0, mhz[1], 1e-6);
-    const std::vector<double> ms = playback_gpu_clock_kick::sampleMs(ns);
-    ASSERT_EQ(3, static_cast<int>(ms.size()));
-    ASSERT_NEAR(0.0, ms[0], 1e-9);
-    ASSERT_NEAR(5.0, ms[1], 1e-9);
-    ASSERT_NEAR(10.0, ms[2], 1e-9);
+    // sample offsets from the first sample: the first is the origin, then 5 and 10
+    const std::vector<double> offsets = playback_gpu_clock_kick::sampleMs(ns);
+    ASSERT_EQ(3, static_cast<int>(offsets.size()));
+    ASSERT_NEAR(0.0, offsets[0], 1e-9);
+    ASSERT_NEAR(5.0, offsets[1], 1e-9);
+    ASSERT_NEAR(10.0, offsets[2], 1e-9);
     // a sample that does not advance in time is 0 MHz, never a division by zero; one sample has no interval
     const std::vector<double> flat = playback_gpu_clock_kick::intervalMhz({7ull, 7ull}, {1, 500});
     ASSERT_EQ(1, static_cast<int>(flat.size()));

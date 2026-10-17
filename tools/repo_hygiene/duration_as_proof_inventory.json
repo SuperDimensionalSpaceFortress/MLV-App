@@ -2363,6 +2363,16 @@
       "lines": [
         66
       ]
+    },
+    {
+      "path": "platform/qt/PlaybackStartupSplit.h",
+      "anchor": "+ ( kickLeadMs < 0.0 ? QStringLiteral ( \"NA\" ) : QString :: number ( kickLeadMs , 'f' , 3 ) ) ;",
+      "class": "display_or_format",
+      "clock": "other",
+      "justification": "PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row 0 first_present_split formatter: kickLeadMs defaults to the -1 'not stamped' sentinel (no kick ran, or no AMaZE call was probed before the first present) and prints NA for it; MainWindow sets it from two std::chrono::steady_clock stamps (kick begin, frame 0's AMaZE call). Formatting only; nothing infers that a stage ran from it.",
+      "lines": [
+        193
+      ]
     }
   ]
 }
