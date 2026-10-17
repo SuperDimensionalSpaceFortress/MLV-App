@@ -583,11 +583,11 @@ function Get-LocalPlaybackPromptFindings {
         "(?i)${b}MLVApp(Release)?\.exe['`"]?\s+${appArg}--(gui-smoke-playback|profile-playback)",
         "(?i)(pwsh|powershell)(\.exe)?${e}${pwshGap}-File\s+\S*$scripts",
         "(?i)(^|[\s``&(])(&\s*)?\.{0,2}[\\/]?\S*$scripts['`"]?\s+-\w+")
-    # r4b (hub ruling, HUB-TICK 20261016T2244Z): a listed launch verb + the app + a clip / file argument ("Run <app> take01.dat") is an
-    # app LAUNCH too, so its own clause must carry the venue: a route on the NEXT launcher ("... and run <app> take01.dat <mode> on
-    # Bachelor") never covers it. It is scored only in a sentence that holds a direct launch above (it is no trigger of its own), it
-    # starts at the app token like the app pattern, and an app call whose gap reaches a playback mode is the app pattern's, not this one.
-    # A verbless "<app> <clip>" lead stays a non-launcher lead (r2, RULE4_R2_B_PASS).
+    # r4b (hub ruling, HUB-TICK 20261016T2244Z): the app + a clip / file argument ("Run <app> take01.dat") is an app LAUNCH too, so its
+    # own clause must carry the venue: a route on the NEXT launcher ("... and run <app> take01.dat <mode> on Bachelor") never covers it.
+    # It is scored only in a sentence that holds a direct launch above (it is no trigger of its own), it starts at the app token like the
+    # app pattern, and an app call whose gap reaches a playback mode is the app pattern's, not this one.
+    # (r9: a verbless "<app> <clip>" is a launch of its own too; the 15 r2 rows that held one as a non-launcher lead now refuse.)
     # r7 (CoS review of 0fb1eb8c, B3 + N1 + N2): the pattern no longer enumerates clip shapes. r4b took a bare clip, r6 added options, a quoted
     # path and a separator-only token, and each list left a form out (`--clip=<clip>`, `/clip <clip>`, a bare token with no extension, seven
     # options before the clip). Master's reading is the rule: ANY first argument after the app that is not the next app launcher makes the
@@ -595,17 +595,16 @@ function Get-LocalPlaybackPromptFindings {
     # attached `--opt=value`, a `/opt`, a bare token, a number, a quoted value and a chain of any length are covered by construction, and
     # nothing in this pattern reads the shape of the argument. The next app launcher stays out of it, so a second launcher never reads as
     # the first one's argument (it is scored on its own route). An app token with no argument after it is no launch here (needs `\s+<arg>`).
-    # r8 (opus review of 03e7ae1b, blocker + hardening 1-2): the LEAD of a launch -- what may stand between the listed verb and the app
-    # token -- is read by construction, not by a list of wrappers. r7 took only `<verb> [&] ['"] [path]`, so a markdown code span (a
-    # backtick before the app), `Re-run <app>` (a hyphen before the verb) and `Run the <app> ...` (a word between verb and app) hid the
-    # FIRST launch and a later routed launcher's venue covered it: a refuse -> pass flip against the pin. The lead is now any run of
-    # openers (`&`, `(`, a quote, a backtick) and plain words, ending in an optional path, that holds no launcher word and no playback
-    # mode: a launcher word is `pwsh` / `powershell`, and the app token, a script name and a mode flag are not plain words (`.`/`-`).
-    # The verb may carry a hyphenated prefix (`Re-run`). A comma, a colon or any other punctuation ends the lead.
-    $leadOpen = '(?:[&(''"`]\s*)*'
-    $leadWords = '(?:' + $leadOpen + '(?!(?:pwsh|powershell)(?![\w\-]))\w+[''"`]*\s+)*'
-    $leadPath = '(?:[^\s;''"`]*[\\/])?'
-    $clipLaunch = "(?i)(?<=(?<!\w)(?:\w+-)?(?:${verbs})(?![\w\-])\s+${leadWords}${leadOpen}${leadPath})MLVApp(Release)?\.exe['`"``]?\s+(?!${appArg}--(?:gui-smoke-playback|profile-playback))(?!${appStop})[^\s;]"
+    # r9 (CoS review 6230178238 on d30d1365, B5; hub ruling): the pattern reads NO lead at all. r4b..r8 required a listed launch verb and a
+    # lead (r8: openers, plain words, one path) before the app token, and every shape the lead grammar did not name hid the FIRST launch
+    # of a sentence and let a later routed launcher's venue cover it: an unquoted path with a space, a word with an apostrophe or a
+    # hyphen, punctuation in the lead, a clause with no verb right before the app (`Run: .\<app> <clip>`, `Then <app> <clip>`). Four
+    # rounds of widening the lead (B1, B3, B4, B5) each left the next form out, so the lead is gone: an app token is a launch of its own
+    # when ITS OWN argument gap (up to the next separator or launcher) holds an argument and no playback mode, whatever stands in front of it.
+    # A path before the app token is part of the token (the left bound is a non-word, non-hyphen character). Accepted over-refusal, named
+    # in the PR body: an app call with an argument and no route of its own refuses even when a later launcher in the sentence is routed
+    # (`<app> <clip>; <routed script> on Bachelor.`), and so does an app mention with an argument that no verb launches.
+    $clipLaunch = "(?i)${b}MLVApp(Release)?\.exe['`"``]?\s+(?!${appArg}--(?:gui-smoke-playback|profile-playback))(?!${appStop})[^\s;]"
     $findings = New-Object System.Collections.Generic.List[string]
     # A "sentence" is a line, cut again at '. ' so one bullet carrying several instructions is judged piece by piece. A semicolon is NOT a
     # sentence boundary since r6: it is a hard clause cut (no inheritance, per-group playback test) that the defeater scan reads across.
