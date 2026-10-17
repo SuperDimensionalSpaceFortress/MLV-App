@@ -27694,7 +27694,8 @@ void MainWindow::runPlaybackRoutePrewarm( quint64 clipGeneration )
 void MainWindow::postPlaybackReconWarm( quint64 clipGeneration )
 {
     m_playbackReconWarmRepostArmed = false;
-    if( !m_pRenderThread || !m_fileLoaded || !m_pMlvObject ) return;
+    // one warm per clip: a warm that ran is never repeated (a later raw-level change leaves set_clip to Play, correctly)
+    if( !m_pRenderThread || !m_fileLoaded || !m_pMlvObject || m_playbackReconWarmRan ) return;
     playback_recon_warm_run::Decision decision = playback_recon_warm_run::decide(
         !mlvappPlaybackReconWarmRunDisabled() && !mlvappPlaybackRoutePrewarmDisabled(),
         ui->actionPlay->isChecked(),

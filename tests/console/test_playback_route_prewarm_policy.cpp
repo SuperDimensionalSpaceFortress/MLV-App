@@ -345,6 +345,9 @@ TEST(PlaybackReconWarmRunWiring, TheRunPostsTheWarmAfterTheBackendPreloadUnderIt
     ASSERT_TRUE(decideCall.contains(QStringLiteral("llrpGpuCudaSuppressed() != 0")));
     ASSERT_TRUE(decideCall.contains(QStringLiteral("!m_pRenderThread->isIdle()")));
     ASSERT_TRUE(decideCall.contains(QStringLiteral("if( decision.run )")));
+    // one warm per clip
+    ASSERT_TRUE(postBody.indexOf(QStringLiteral("|| m_playbackReconWarmRan ) return;")) < decideAt);
+    ASSERT_TRUE(postBody.indexOf(QStringLiteral("|| m_playbackReconWarmRan ) return;")) >= 0);
     // a new clip re-arms it with the prewarm
     const QString arm = bodyBetween(source, QStringLiteral("void MainWindow::armPlaybackRoutePrewarm()"),
                                     QStringLiteral("QImage MainWindow::grabIdentityViewport("));
@@ -379,11 +382,21 @@ TEST(PlaybackReconWarmRunWiring, TheWarmNeverPresentsNeverTouchesPlayAndWritesNo
                                      QStringLiteral("bool RenderFrameThread::realWorkPendingLocked("));
     ASSERT_FALSE(take.isEmpty());
     const int pop = take.indexOf(QStringLiteral("m_reconRequests.pop_front();"));
-    const int recheck = take.indexOf(QStringLiteral(
-        "if( entry && entry->warm ) entry->warmRealRequestPending = realWorkPendingLocked();"));
+    const int recheck = take.indexOf(QStringLiteral("entry->warmRealRequestPending = realWorkPendingLocked();"));
+    const int running = take.indexOf(QStringLiteral("m_warmRunning = !entry->warmRealRequestPending;"));
     ASSERT_TRUE(pop >= 0);
     ASSERT_TRUE(recheck > pop);
-    ASSERT_TRUE(thread.contains(QStringLiteral("[]( const ReconQueueEntry &entry ) { return !entry.warm; }")));
+    ASSERT_TRUE(running > recheck);
+    // a queued warm is not pipeline work; a RUNNING one is (it reads m_pMlvObject: lock() / isIdle() wait it out
+    // before a clip change or a raw-level change), and it is cleared before the done is posted
+    const QString inFlight = bodyBetween(thread, QStringLiteral("bool RenderFrameThread::phase3WorkInFlightLocked( void ) const"),
+                                         QStringLiteral("void RenderFrameThread::queueDecodeRequestLocked("));
+    ASSERT_TRUE(inFlight.contains(QStringLiteral("if( m_warmRunning ) return true;")));
+    ASSERT_TRUE(inFlight.contains(QStringLiteral("[]( const ReconQueueEntry &entry ) { return !entry.warm; }")));
+    const int cleared = warm.indexOf(QStringLiteral("m_warmRunning = false;"));
+    const int posted = warm.indexOf(QStringLiteral("QMetaObject::invokeMethod( this,"));
+    ASSERT_TRUE(cleared >= 0);
+    ASSERT_TRUE(posted > cleared);
 
     // the core: uncached decode, last-run state saved before and restored after, the Play frame-0 thread opt-ins
     const QString core = sourceFile("platform/qt/PlaybackReconWarmRun.h");

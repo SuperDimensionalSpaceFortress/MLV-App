@@ -1927,7 +1927,10 @@ void RenderFrameThread::stopReconWorkerLocked( void )
 
 bool RenderFrameThread::phase3WorkInFlightLocked( void ) const
 {
-    // Row W: a queued paused warm run is not pipeline work (it has no slot and never publishes a frame)
+    // Row W: a queued paused warm run is not pipeline work (it has no slot and never publishes a frame) and is dropped
+    // as it starts when real work is pending; a RUNNING one is, because it reads m_pMlvObject and its llrawproc settings
+    // (lock() and isIdle() wait it out before a clip change or a raw-level change)
+    if( m_warmRunning ) return true;
     const bool reconWorkQueued =
         std::any_of( m_reconRequests.begin(), m_reconRequests.end(),
                      []( const ReconQueueEntry &entry ) { return !entry.warm; } );
@@ -2159,7 +2162,11 @@ bool RenderFrameThread::takeReconRequestForWorker( ReconQueueEntry *entry )
     if( entry ) *entry = m_reconRequests.front();
     m_reconRequests.pop_front();
     // Row W: real requests always win -- a warm that finds any work pending as it starts is dropped (and reported)
-    if( entry && entry->warm ) entry->warmRealRequestPending = realWorkPendingLocked();
+    if( entry && entry->warm )
+    {
+        entry->warmRealRequestPending = realWorkPendingLocked();
+        m_warmRunning = !entry->warmRealRequestPending;
+    }
     if( heldForRender ) m_overlapMeter.noteReconHeldForRender();
     m_overlapMeter.upstreamBegin( mlv_stage_timing_now() * 1000.0,
                                   downstreamFrameInFlightLocked( takenSlotIndex ),
@@ -2227,6 +2234,7 @@ void RenderFrameThread::warmReconForWorker( const ReconQueueEntry &entry,
     done.renderMs = ( mlv_stage_timing_now() - startStageTime ) * 1000.0;
     {
         QMutexLocker locker( &m_mutex );
+        m_warmRunning = false;   // signalReconDoneFromWorker wakes lock() / isIdle() waiters next
         done.realRequestArrivedDuringWarm = !entry.warmRealRequestPending && realWorkPendingLocked();
     }
     QMetaObject::invokeMethod( this, [this, done]() { emit playbackReconWarmDone( done ); }, Qt::QueuedConnection );

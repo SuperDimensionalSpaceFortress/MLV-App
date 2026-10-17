@@ -712,6 +712,8 @@ private:
     bool downstreamFrameInFlightLocked( int excludeSlotIndex ) const;
     bool upstreamWorkInFlightLocked( int excludeSlotIndex ) const;
     std::deque<ReconQueueEntry> m_reconRequests;
+    /* Row W: a warm is running on the recon worker (pipeline work: it reads m_pMlvObject). Under m_mutex. */
+    bool m_warmRunning = false;
     /* Row W: the warm's throwaway decode and reduced buffers, touched only on the recon worker. */
     std::vector<uint16_t> m_warmRawScratch;
     std::vector<uint16_t> m_warmReducedScratch;
