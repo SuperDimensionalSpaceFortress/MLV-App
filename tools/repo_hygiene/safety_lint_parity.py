@@ -5,7 +5,7 @@ WHY THIS EXISTS (FWO-DEFECT-PREVENT-1 item 1).  Several PRs on 2026-10-16 change
 rows, yet let through a command that fork/master's lint DENIED (HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 r8/r9, NA2-RULE4-PER-LAUNCHER-
 SCOPE-1 `--clip` variants).  Nothing compared the head against master over a whole corpus.  This runner does: every corpus row
 is judged by master's lint and by the head's, and a row master DENIES while the head ALLOWS is a LOOSENED row.  A LOOSENED row
-fails the run unless safety_lint_parity_allow.json lists its id with a reason and a PR number.
+fails the run unless safety_lint_parity_allow.json lists its id with a reason, a PR number and the row's text hash.
 
 THE TWO LINTS.
   hook      tools/hooks/mlv-never-authorized.py, the PreToolUse hook.  Master's copy is loaded by `git show` into a temp module
@@ -21,15 +21,33 @@ THE CORPUS has two sources, both reported per row:
     naming the source.  This is where rows live that no test file on the head carries (the #455 and #465 branches' rows).
   * rows DERIVED at run time by importing the head's own test modules (`CASES` of test_mlv_never_authorized.py with
     expect == DENY; the must-refuse tuples of test_hub_vm_no_local_playback.py), so a deny row added to either suite joins the
-    comparison with no edit here.  A derived row that cannot be built is an ERROR, never a skip.
+    comparison with no edit here, UNIONED BY ID with the same rows read from the baseline's copy of those two modules (r5).
+    A derived row that cannot be built is an ERROR, never a skip.
 
 EXIT CODES.  0 = no unlisted LOOSENED row and no error.  1 = at least one unlisted LOOSENED row (reported even when an error
 also occurred, because it is the definite finding).  2 = could not decide: a git failure, a lint that threw, an unparseable or
 unrunnable row, a malformed corpus or allow-list.  A row that cannot be run is never a pass.
 
-KNOWN LIMIT.  Only the head's test modules are imported for derived rows.  A deny row the head DELETED from its tests escapes
-unless the JSON corpus also carries it; the pinned minimum row counts in test_safety_lint_parity.py exist so that a shrinking
-corpus is a red test, not a quiet one.
+DERIVED ROWS ARE THE UNION OF THE HEAD'S AND THE BASELINE'S TEST MODULES (r5, CoS B1 on 778974a4; doctrine Recurrence 6: a master-
+parity gate takes its expectations from the baseline, never only from the head under test).  Through r4 only the head's own test
+modules were imported, so a PR that loosened a lint and then flipped the matching test row to `expect: ALLOW` (or deleted it) took
+that row out of the comparison, and the exact row-count pins stayed green when one row went out and another came in.  Now the
+baseline's copy of each test module (`git show <base>:<path>`, executed by load_source_as with `__file__` at the head test file's
+path, like the r3 root fix) is read too, and its rows are unioned with the head's BY ID.  A row only the baseline has is judged
+like any other: master verdict against head verdict, so a deleted or flipped master-denied row that the head lint now allows is
+LOOSENED.  A baseline test module that cannot be read or executed is an ERROR (exit 2), never a silent skip.  The exact derived
+pins in test_safety_lint_parity.py count the HEAD's rows only and still catch an in-place deletion on their own; the union covers
+the swap they cannot see.
+
+ALLOW-LIST ENTRIES ARE BOUND TO THE ROW'S TEXT (r5, CoS I2).  An entry carries the row id AND `hash`, the short_hash of the row's text
+(a hook row's command, a playback row's sentence); the LOOSENED line prints it.  A row whose id matches but whose text hash does not
+is treated as unlisted, so editing a row's text under an old id cannot inherit an old excuse.
+
+KNOWN LIMITS.
+  * Payload rows reach the hook through `decide()` directly (a raw-stdin row goes through `main()`), so a head change to `main()` or
+    `parse_argv`, the fail-closed paths around `decide()`, is NOT compared by this runner.  A `main()` pass is a follow-up card (CoS I3).
+  * Only the corpus, the head's rows and the baseline's rows are judged.  A master-denied command that appears in none of them is
+    invisible to the run, which is what safety_lint_parity_corpus.json and the defeater-corpus card are for.
 """
 
 from __future__ import annotations
@@ -199,11 +217,14 @@ def load_allow(path: Path) -> dict[str, dict]:
     except (OSError, ValueError) as exc:
         raise ParityError(f"allow-list {path} is unreadable: {exc}") from exc
     if not isinstance(entries, list):
-        raise ParityError(f"allow-list {path} must be a JSON list of {{id, reason, pr}}")
+        raise ParityError(f"allow-list {path} must be a JSON list of {{id, reason, pr, hash}}")
     out: dict[str, dict] = {}
     for entry in entries:
         if not isinstance(entry, dict) or not str(entry.get("id", "")).strip() or not str(entry.get("reason", "")).strip() or entry.get("pr") in (None, "", 0):
             raise ParityError(f"allow-list entry needs an id, a reason and a pr number: {str(entry)[:160]}")
+        # r5 (CoS I2): the entry is bound to the row's text hash, so an edited row under an old id is not excused by it
+        if not isinstance(entry.get("hash"), str) or not re.fullmatch(r"[0-9a-f]{10}", entry["hash"]):
+            raise ParityError(f"allow-list entry {entry['id']} needs a `hash` (the 10-hex short_hash of the row's text, printed on its LOOSENED line): {str(entry)[:160]}")
         if entry["id"] in out:
             raise ParityError(f"allow-list lists {entry['id']} twice")
         out[entry["id"]] = entry
@@ -218,6 +239,7 @@ class HookCase:
     def __init__(self, row_id: str, why: str, source: str, build):
         self.id, self.why, self.source, self.build = row_id, why, source, build
         self.display = ""
+        self.text = ""  # the row's full, run-stable text: what an allow-list entry's `hash` is taken over
 
 
 def _hook_env(paths: dict, overrides: dict, unset, venue_key: str) -> tuple[dict, str | None]:
@@ -237,9 +259,9 @@ def _hook_env(paths: dict, overrides: dict, unset, venue_key: str) -> tuple[dict
     return env, venue
 
 
-def derived_hook_cases(root: Path) -> list[HookCase]:
-    """Every DENY row of the head's CASES table, built exactly as the suite builds it, minus the subprocess."""
-    tm = load_module(root / HOOK_TEST_REL, "parity_head_hook_tests")
+def _hook_cases_from(tm, source: str, which: str) -> list[HookCase]:
+    """Every DENY row of one test module's CASES table (`which` names it: head or baseline), built exactly as the suite builds it,
+    minus the subprocess.  `source` tags the row ("derived" / "derived-base")."""
     cases = []
     used: set[str] = set()
     for case in tm.CASES:
@@ -263,10 +285,27 @@ def derived_hook_cases(root: Path) -> list[HookCase]:
             env, venue = _hook_env(probe.paths, overrides, tm.UNSET, tm.VENUE_KEY)
             return stdin_text, env, venue, probe.doCleanups
 
-        hc = HookCase(row_id, f"{HOOK_TEST_REL} CASES[{case['name']!r}] (group {case.get('group')}, {case.get('na', '?')})",
-                      "derived", build)
+        hc = HookCase(row_id, f"{HOOK_TEST_REL} CASES[{case['name']!r}] (group {case.get('group')}, {case.get('na', '?')}; {which} copy)",
+                      source, build)
         hc.display = str(case.get("input", case.get("raw", "")))[:200]
+        hc.text = json.dumps([case.get("tool"), case.get("input", case.get("raw", ""))], sort_keys=True, default=str)
         cases.append(hc)
+    return cases
+
+
+def derived_hook_cases(root: Path, base_ref: str | None = None) -> list[HookCase]:
+    """The head's DENY rows, plus (r5, CoS B1) every DENY row only the BASELINE's copy of the suite carries, unioned by id.
+
+    `base_ref` is a git ref or sha.  With it, the baseline's test module is read with `git show` and executed by load_source_as at the
+    head test file's own path (so the REPO_ROOT it derives from `__file__` is the head's, as with the r3 root fix); a base-only row
+    is a deny row the head deleted or flipped to ALLOW, and the caller judges it like any other.  A baseline module that cannot be
+    shown or executed raises ParityError (exit 2).  Without `base_ref` only the head's rows are returned (the exact pins count those)."""
+    tm = load_module(root / HOOK_TEST_REL, "parity_head_hook_tests")
+    cases = _hook_cases_from(tm, "derived", "head")
+    if base_ref:
+        base_tm = load_source_as(git(root, "show", f"{base_ref}:{HOOK_TEST_REL}"), "parity_base_hook_tests", root / HOOK_TEST_REL)
+        have = {c.id for c in cases}
+        cases += [c for c in _hook_cases_from(base_tm, "derived-base", "baseline") if c.id not in have]
     return cases
 
 
@@ -290,6 +329,7 @@ def corpus_hook_cases(rows: list[dict]) -> list[HookCase]:
 
             hc = HookCase(row_id, row["why"], "corpus", build)
             hc.display = row["command"][:200]
+            hc.text = row["command"]
             out.append(hc)
     return out
 
@@ -336,7 +376,8 @@ def hook_verdict(module, stdin_text: str, env: dict, venue: str | None) -> tuple
 def run_hook(base_module, head_module, cases: list[HookCase]) -> list[dict]:
     results = []
     for case in cases:
-        res = {"id": case.id, "lint": "hook", "why": case.why, "source": case.source, "display": case.display}
+        res = {"id": case.id, "lint": "hook", "why": case.why, "source": case.source, "display": case.display,
+               "text_hash": short_hash(case.text)}
         cleanup = None
         try:
             stdin_text, env, venue, cleanup = case.build()
@@ -354,13 +395,12 @@ def run_hook(base_module, head_module, cases: list[HookCase]) -> list[dict]:
 
 # ------------------------------------------------------------------------------------------------ playback rows
 
-def derived_playback_rows(root: Path) -> tuple[list[dict], object]:
-    """Every must-refuse sentence of the head's playback suite; also returns that module (its `_json_counts` is the probe)."""
-    pb = load_module(root / PLAYBACK_TEST_REL, "parity_head_playback_tests")
+def _playback_rows_from(pb, source: str, which: str) -> list[dict]:
+    """Every must-refuse sentence of one playback test module (`which` names it: head or baseline); `source` tags the rows."""
     rows: dict[str, dict] = {}
 
     def add(name: str, text: str, where: str) -> None:
-        rows.setdefault(f"playback:{name}:{short_hash(text)}", {"text": text, "why": f"{PLAYBACK_TEST_REL} {where}"})
+        rows.setdefault(f"playback:{name}:{short_hash(text)}", {"text": text, "why": f"{PLAYBACK_TEST_REL} {where} ({which} copy)"})
 
     lints = pb.PromptLintTests
     for name in sorted(dir(lints)):
@@ -375,7 +415,20 @@ def derived_playback_rows(root: Path) -> tuple[list[dict], object]:
             for text in value:
                 add(name, text, f"module-level {name}")
     add("INCIDENT_LINE", "## VENUE\n" + pb.INCIDENT_LINE + "\n", "INCIDENT_LINE (the 2026-10-11 producer-prompt incident)")
-    return [{"id": k, "lint": "playback", "source": "derived", **v} for k, v in rows.items()], pb
+    return [{"id": k, "lint": "playback", "source": source, **v} for k, v in rows.items()]
+
+
+def derived_playback_rows(root: Path, base_ref: str | None = None) -> tuple[list[dict], object]:
+    """The head's must-refuse sentences, plus (r5, CoS B1) every sentence only the BASELINE's copy of the suite refuses, unioned by id
+    (the id carries a hash of the text, so a reworded sentence is a different row).  Also returns the HEAD's module, whose
+    `_write_probe` / `_psq` / `PWSH` helpers drive the probe.  A baseline module that cannot be shown or executed raises ParityError."""
+    pb = load_module(root / PLAYBACK_TEST_REL, "parity_head_playback_tests")
+    rows = _playback_rows_from(pb, "derived", "head")
+    if base_ref:
+        base_pb = load_source_as(git(root, "show", f"{base_ref}:{PLAYBACK_TEST_REL}"), "parity_base_playback_tests", root / PLAYBACK_TEST_REL)
+        have = {r["id"] for r in rows}
+        rows += [r for r in _playback_rows_from(base_pb, "derived-base", "baseline") if r["id"] not in have]
+    return rows, pb
 
 
 def parse_probe_output(returncode: int, out: str, err: str, expected: int) -> list[int]:
@@ -449,7 +502,8 @@ def run_playback(pb, base_lint: Path, head_lint: Path, rows: list[dict], work: P
             break
     results = []
     for n, row in enumerate(rows):
-        res = {"id": row["id"], "lint": "playback", "why": row["why"], "source": row["source"], "display": row["text"][:200]}
+        res = {"id": row["id"], "lint": "playback", "why": row["why"], "source": row["source"], "display": row["text"][:200],
+               "text_hash": short_hash(row["text"])}
         if failure:
             res["error"] = failure
         else:
@@ -471,16 +525,18 @@ def classify(res: dict, allow: dict) -> str:
     return "LOOSENED"
 
 
-def collect(lints, corpus_path: Path, derived: bool, root: Path = ROOT):
-    """(hook cases, playback rows, playback module or None). Pure collection: nothing is judged here."""
+def collect(lints, corpus_path: Path, derived: bool, root: Path = ROOT, base_ref: str | None = None):
+    """(hook cases, playback rows, playback module or None). Pure collection: nothing is judged here.
+    `base_ref` (r5): the baseline whose test modules are unioned into the derived rows; ignored when `derived` is off."""
+    base_ref = base_ref if derived else None
     static = load_corpus(corpus_path)
     hook_cases = corpus_hook_cases(static) if "hook" in lints else []
     playback = [r for r in static if r["lint"] == "playback"] if "playback" in lints else []
     pb = None
     if "hook" in lints and derived:
-        hook_cases += derived_hook_cases(root)
+        hook_cases += derived_hook_cases(root, base_ref)
     if "playback" in lints and (derived or playback):
-        extra, pb = derived_playback_rows(root)
+        extra, pb = derived_playback_rows(root, base_ref)
         if derived:
             playback = playback + [r for r in extra if r["id"] not in {p["id"] for p in playback}]
     ids = [c.id for c in hook_cases] + [r["id"] for r in playback]
@@ -496,7 +552,7 @@ def run(base: str, lints, corpus_path: Path = DEFAULT_CORPUS, allow_path: Path =
     allow = load_allow(allow_path)
     base_sha = git(root, "rev-parse", "--verify", base + "^{commit}").strip()
     head_sha = git(root, "rev-parse", "HEAD").strip()
-    hook_cases, playback_rows, pb = collect(lints, corpus_path, derived, root)
+    hook_cases, playback_rows, pb = collect(lints, corpus_path, derived, root, base_sha)
     work = Path(tempfile.mkdtemp(prefix="safety-lint-parity-"))
     results: list[dict] = []
     try:
@@ -516,9 +572,13 @@ def run(base: str, lints, corpus_path: Path = DEFAULT_CORPUS, allow_path: Path =
         shutil.rmtree(work, ignore_errors=True)
     for res in results:
         res["class"] = classify(res, allow)
-        res["allowed"] = res["class"] == "LOOSENED" and res["id"] in allow
+        # r5 (CoS I2): an entry excuses a row only when its id AND its text hash match; a hash mismatch is treated as unlisted
+        entry = allow.get(res["id"]) if res["class"] == "LOOSENED" else None
+        res["allowed"] = entry is not None and entry["hash"] == res.get("text_hash")
         if res["allowed"]:
-            res["allow_entry"] = allow[res["id"]]
+            res["allow_entry"] = entry
+        elif entry is not None:
+            res["allow_hash_mismatch"] = entry["hash"]
     loosened = [r for r in results if r["class"] == "LOOSENED" and not r["allowed"]]
     errors = [r for r in results if r["class"] == "error"]
     counts = {c: sum(1 for r in results if r["class"] == c) for c in ("same", "tightened", "LOOSENED", "error")}
@@ -533,7 +593,9 @@ def render(report: dict) -> str:
     lines = [f"safety-lint-parity base={report['base']} ({report['base_sha'][:8]}) head={report['head_sha'][:8]} lints={','.join(report['lints'])}"]
     for r in report["results"]:
         if r["class"] == "LOOSENED" and not r["allowed"]:
-            lines.append(f"LOOSENED {r['id']} [{r['lint']}] master={r['master']} head={r['head']} :: {r['display']}")
+            stale_hash = (f" (allow-list entry {r['id']} is bound to hash {r['allow_hash_mismatch']}, this row's text hashes to "
+                          f"{r['text_hash']}: treated as unlisted)") if "allow_hash_mismatch" in r else ""
+            lines.append(f"LOOSENED {r['id']} [{r['lint']}] hash={r['text_hash']} master={r['master']} head={r['head']}{stale_hash} :: {r['display']}")
         elif r["allowed"]:
             e = r["allow_entry"]
             lines.append(f"ALLOWED-LOOSENED {r['id']} [{r['lint']}] pr={e['pr']} reason={e['reason']} :: {r['display']}")

@@ -1436,6 +1436,156 @@
    "lint": "playback",
    "text": "Run MLVAppRelease.exe --clip=\"D:\\clips\\my take\\a.mlv\" --gui-smoke-playback",
    "why": "authored by SAFETY-LINT-MASTER-PARITY-DIFF-1: the #465 branch carries no quoted clip path containing a space (only `--clip D:\\clips\\a.mlv`), so this card adds the shape"
+  },
+  {
+   "id": "b465-b5-01",
+   "lint": "playback",
+   "text": "Run C:\\Program Files\\MLVApp\\MLVAppRelease.exe take01.mlv and run C:\\build\\MLVAppRelease.exe take01.dat --gui-smoke-playback on Bachelor.",
+   "why": "CoS review of #465 r8 B5 (comment 6230178238, pwsh 7.4), family 1 (unquoted path with a space): a first launch the r8 lint's lead did not read; master refuses it. Lint test data, never executed"
+  },
+  {
+   "id": "b465-b5-02",
+   "lint": "playback",
+   "text": "Run Layi's MLVAppRelease.exe take01.mlv and run C:\\build\\MLVAppRelease.exe take01.dat --gui-smoke-playback on Bachelor.",
+   "why": "CoS review of #465 r8 B5 (comment 6230178238, pwsh 7.4), family 2 (a word with an apostrophe): master refuses it. Lint test data, never executed"
+  },
+  {
+   "id": "b465-b5-03",
+   "lint": "playback",
+   "text": "Run the x64-release MLVAppRelease.exe take01.mlv and run C:\\build\\MLVAppRelease.exe take01.dat --gui-smoke-playback on Bachelor.",
+   "why": "CoS review of #465 r8 B5 (comment 6230178238, pwsh 7.4), family 3 (a hyphenated word): master refuses it. Lint test data, never executed"
+  },
+  {
+   "id": "b465-b5-04",
+   "lint": "playback",
+   "text": "Run pwsh-free MLVAppRelease.exe take01.mlv and run C:\\build\\MLVAppRelease.exe take01.dat --gui-smoke-playback on Bachelor.",
+   "why": "CoS review of #465 r8 B5 (comment 6230178238, pwsh 7.4), family 3 (a hyphenated word): master refuses it. Lint test data, never executed"
+  },
+  {
+   "id": "b465-b5-05",
+   "lint": "playback",
+   "text": "Run, as before, MLVAppRelease.exe take01.mlv and run C:\\build\\MLVAppRelease.exe take01.dat --gui-smoke-playback on Bachelor.",
+   "why": "CoS review of #465 r8 B5 (comment 6230178238, pwsh 7.4), family 4 (punctuation in the lead): master refuses it. Lint test data, never executed"
+  },
+  {
+   "id": "b465-b5-06",
+   "lint": "playback",
+   "text": "Run again: MLVAppRelease.exe take01.mlv and run C:\\build\\MLVAppRelease.exe take01.dat --gui-smoke-playback on Bachelor.",
+   "why": "CoS review of #465 r8 B5 (comment 6230178238, pwsh 7.4), family 4 (punctuation in the lead): master refuses it. Lint test data, never executed"
+  },
+  {
+   "id": "b465-b5-07",
+   "lint": "playback",
+   "text": "Run: .\\MLVAppRelease.exe take01.mlv and run C:\\build\\MLVAppRelease.exe take01.dat --gui-smoke-playback on Bachelor.",
+   "why": "CoS review of #465 r8 B5 (comment 6230178238, pwsh 7.4), family 5 (no verb right before the app): master refuses it. Lint test data, never executed"
+  },
+  {
+   "id": "b465-b5-08",
+   "lint": "playback",
+   "text": "Then MLVApp.exe take01.mlv and run C:\\build\\MLVAppRelease.exe take01.dat --gui-smoke-playback on Bachelor.",
+   "why": "CoS review of #465 r8 B5 (comment 6230178238, pwsh 7.4), family 5 (no verb right before the app): master refuses it. Lint test data, never executed"
+  },
+  {
+   "id": "b465-b5-09",
+   "lint": "playback",
+   "text": "First ~/bin/MLVAppRelease.exe take01.mlv and run C:\\build\\MLVAppRelease.exe take01.dat --gui-smoke-playback on Bachelor.",
+   "why": "CoS review of #465 r8 B5 (comment 6230178238, pwsh 7.4), family 5 (no verb right before the app): master refuses it. Lint test data, never executed"
+  },
+  {
+   "id": "b465-b5-10",
+   "lint": "playback",
+   "text": "First build\\MLVAppRelease.exe take01.mlv and run C:\\build\\MLVAppRelease.exe take01.dat --gui-smoke-playback on Bachelor.",
+   "why": "CoS review of #465 r8 B5 (comment 6230178238, pwsh 7.4), family 5 (verbless opener, relative path): master refuses it. Lint test data, never executed"
+  },
+  {
+   "id": "b465-b5-11",
+   "lint": "playback",
+   "text": "Then $env:BIN\\MLVAppRelease.exe take01.mlv and run C:\\build\\MLVAppRelease.exe take01.dat --gui-smoke-playback on Bachelor.",
+   "why": "CoS review of #465 r8 B5 (comment 6230178238, pwsh 7.4), family 5 (verbless opener, $env: path): master refuses it. Lint test data, never executed"
+  },
+  {
+   "id": "b465-b5-12",
+   "lint": "playback",
+   "text": "First %BIN%\\MLVAppRelease.exe take01.mlv and run C:\\build\\MLVAppRelease.exe take01.dat --gui-smoke-playback on Bachelor.",
+   "why": "CoS review of #465 r8 B5 (comment 6230178238, pwsh 7.4), family 5 (verbless opener, %VAR% path): master refuses it. Lint test data, never executed"
+  },
+  {
+   "id": "b465-b5-13",
+   "lint": "playback",
+   "text": "Execute Layi's MLVAppRelease.exe take01.mlv and run C:\\build\\MLVAppRelease.exe take01.dat --gui-smoke-playback on Bachelor.",
+   "why": "CoS review of #465 r8 B5 (comment 6230178238, pwsh 7.4): the verb axis (Execute) over family 2; master refuses it. Lint test data, never executed"
+  },
+  {
+   "id": "b465-b5-14",
+   "lint": "playback",
+   "text": "Re-run the x64-release MLVAppRelease.exe take01.mlv and run C:\\build\\MLVAppRelease.exe take01.dat --gui-smoke-playback on Bachelor.",
+   "why": "CoS review of #465 r8 B5 (comment 6230178238, pwsh 7.4): the verb axis (Re-run) over family 3; master refuses it. Lint test data, never executed"
+  },
+  {
+   "id": "b465-b5-15",
+   "lint": "playback",
+   "text": "Launch C:\\Program Files\\MLVApp\\MLVAppRelease.exe take01.mlv and run C:\\build\\MLVAppRelease.exe take01.dat --gui-smoke-playback on Bachelor.",
+   "why": "CoS review of #465 r8 B5 (comment 6230178238, pwsh 7.4): the verb axis (Launch) over family 1; master refuses it. Lint test data, never executed"
+  },
+  {
+   "id": "b465-b5-16",
+   "lint": "playback",
+   "text": "Kick off pwsh-free MLVAppRelease.exe take01.mlv and run C:\\build\\MLVAppRelease.exe take01.dat --gui-smoke-playback on Bachelor.",
+   "why": "CoS review of #465 r8 B5 (comment 6230178238, pwsh 7.4): the verb axis (Kick off) over family 3; master refuses it. Lint test data, never executed"
+  },
+  {
+   "id": "b465-b5-17",
+   "lint": "playback",
+   "text": "Play Layi's MLVAppRelease.exe take01.mlv and run C:\\build\\MLVAppRelease.exe take01.dat --gui-smoke-playback on Bachelor.",
+   "why": "CoS review of #465 r8 B5 (comment 6230178238, pwsh 7.4): the verb axis (Play) over family 2; master refuses it. Lint test data, never executed"
+  },
+  {
+   "id": "b465-b6-01",
+   "lint": "playback",
+   "text": "Run MLVAppRelease.exe take01.mlv; add --gui-smoke-playback.",
+   "why": "CoS review of #465 r9 B6 (comment 6230713095, pwsh 7.4): a semicolon between the app launch and its playback mode hides the launch; master refuses it. Lint test data, never executed"
+  },
+  {
+   "id": "b465-b6-02",
+   "lint": "playback",
+   "text": "Run MLVAppRelease.exe take01.mlv; use --gui-smoke-playback here.",
+   "why": "CoS review of #465 r9 B6 (comment 6230713095, pwsh 7.4): a semicolon between the app launch and its playback mode hides the launch; master refuses it. Lint test data, never executed"
+  },
+  {
+   "id": "b465-b6-03",
+   "lint": "playback",
+   "text": "Start MLVApp.exe take01.mlv; pass --profile-playback.",
+   "why": "CoS review of #465 r9 B6 (comment 6230713095, pwsh 7.4): a semicolon between the app launch and its playback mode hides the launch; master refuses it. Lint test data, never executed"
+  },
+  {
+   "id": "b465-b6-04",
+   "lint": "playback",
+   "text": "Run MLVAppRelease.exe take01.mlv;add --gui-smoke-playback.",
+   "why": "CoS review of #465 r9 B6 (comment 6230713095, pwsh 7.4): the semicolon with no space after it; master refuses it. Lint test data, never executed"
+  },
+  {
+   "id": "b465-b6-05",
+   "lint": "playback",
+   "text": "Run MLVAppRelease.exe take01.mlv ; --profile-playback",
+   "why": "CoS review of #465 r9 B6 (comment 6230713095, pwsh 7.4): the spaced semicolon before a bare mode flag; master refuses it. Lint test data, never executed"
+  },
+  {
+   "id": "b465-b6-06",
+   "lint": "playback",
+   "text": "Run C:\\build\\MLVAppRelease.exe take01.mlv --verbose; then add --gui-smoke-playback.",
+   "why": "CoS review of #465 r9 B6 (comment 6230713095, pwsh 7.4): a later clause (`; then add`) carries the mode flag; master refuses it. Lint test data, never executed"
+  },
+  {
+   "id": "b465-b6-07",
+   "lint": "playback",
+   "text": "Run MLVAppRelease.exe take01.mlv; add --gui-smoke-playback; run the venue chain on Bachelor.",
+   "why": "CoS review of #465 r9 B6 (comment 6230713095, pwsh 7.4): the mode flag in a middle clause, a venue clause after it; master refuses it. Lint test data, never executed"
+  },
+  {
+   "id": "b465-b6-08",
+   "lint": "playback",
+   "text": "Run MLVAppRelease.exe take01.mlv; do not pass --gui-smoke-playback here, run it on Bachelor.",
+   "why": "CoS review of #465 r9 B6 (comment 6230713095, pwsh 7.4): a negated mode flag in a later clause; master refuses it. Lint test data, never executed"
   }
  ],
  "groups": [],

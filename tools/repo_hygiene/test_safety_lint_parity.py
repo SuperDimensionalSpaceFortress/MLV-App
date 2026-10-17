@@ -37,13 +37,16 @@ BOARD, VENUE = "C:/review/board", "C:/review/worktree"
 DENIED = {"id": "t-protected-rd", "lint": "hook", "tool_name": "PowerShell", "board_root": BOARD, "cwd": VENUE,
           "command": "cmd /c rd /s /q " + BOARD + "/.claude-state/fleet-runs/lane-A-r1", "why": "synthetic: a delete of a protected run dir"}
 
-ALWAYS_ALLOW_HOOK = "def decide(payload, project_dir):\n    return 0, ''\n\n\ndef main():\n    return 0\n"
+# r5 (CoS I2): an allow-list entry is bound to the row's text hash; for a hook row that text is its command.
+DENIED_HASH = slp.short_hash(DENIED["command"])
+
+ALWAYS_ALLOW_HOOK ="def decide(payload, project_dir):\n    return 0, ''\n\n\ndef main():\n    return 0\n"
 ALWAYS_THROW_HOOK = "def decide(payload, project_dir):\n    raise RuntimeError('synthetic rule crash')\n\n\ndef main():\n    return 0\n"
 
 # Pinned floors. A shrinking corpus is a red test; raise these when rows are added, never lower them.
-MIN_STATIC_ROWS = 385      # the JSON corpus: 205 kept static rows + the 180-row #455 sweep when this card landed (385)
+MIN_STATIC_ROWS = 410      # the JSON corpus: 205 kept static rows + the 180-row #455 sweep when this card landed (385), + the 25 r5 CoS #465 B5/B6 rows (410)
 MIN_HOOK_ROWS = 247        # hook share of the JSON corpus: 67 static #455 rows + the 180-row sweep (247 when this card landed)
-MIN_PLAYBACK_ROWS = 138    # playback share: the #465 RULE4 rows master refuses + the authored spaced-clip rows (138 when this card landed)
+MIN_PLAYBACK_ROWS = 163    # playback share: the #465 RULE4 rows master refuses + the authored spaced-clip rows (138 when this card landed), + 25 r5 B5/B6 rows (163)
 MIN_DERIVED_HOOK_ROWS = 200  # DENY rows of test_mlv_never_authorized.CASES (203 when this card landed)
 
 # r4 EXACT pins (sol r1 HARDENING: the floor of 200 let three existing DENY rows vanish with the count pin still green, and the
@@ -140,7 +143,7 @@ class AllowListTests(ParityRunnerCase):
         return _write(self.tmp / "allow-with.json", json.dumps(list(entries)))
 
     def test_an_allow_listed_row_is_reported_but_does_not_fail(self):
-        entry = {"id": "t-protected-rd", "reason": "synthetic intended loosening", "pr": 999}
+        entry = {"id": "t-protected-rd", "reason": "synthetic intended loosening", "pr": 999, "hash": DENIED_HASH}
         rc, out = self.cli("--corpus", str(self.corpus(DENIED)), "--allow", str(self.allow_with(entry)), "--head-hook", str(self.head_hook(ALWAYS_ALLOW_HOOK)))
         self.assertEqual(rc, slp.EXIT_OK, out)
         self.assertIn("ALLOWED-LOOSENED t-protected-rd", out)
@@ -149,16 +152,48 @@ class AllowListTests(ParityRunnerCase):
         self.assertIn("unlisted=0, allowed=1", out)
 
     def test_an_allow_entry_for_another_row_does_not_excuse_this_one(self):
-        entry = {"id": "t-some-other-row", "reason": "unrelated", "pr": 1}
+        entry = {"id": "t-some-other-row", "reason": "unrelated", "pr": 1, "hash": DENIED_HASH}
         rc, out = self.cli("--corpus", str(self.corpus(DENIED)), "--allow", str(self.allow_with(entry)), "--head-hook", str(self.head_hook(ALWAYS_ALLOW_HOOK)))
         self.assertEqual(rc, slp.EXIT_LOOSENED, out)
         self.assertIn("note: allow-list entry t-some-other-row matches no LOOSENED row", out)
 
     def test_an_allow_entry_without_a_reason_or_pr_exits_2(self):
-        for entry in ({"id": "t-protected-rd", "pr": 5}, {"id": "t-protected-rd", "reason": "r"}, {"id": "t-protected-rd", "reason": "r", "pr": 0}):
+        h = DENIED_HASH  # r5: each entry carries a valid hash, so it is the missing reason / pr that makes it malformed
+        for entry in ({"id": "t-protected-rd", "pr": 5, "hash": h}, {"id": "t-protected-rd", "reason": "r", "hash": h},
+                      {"id": "t-protected-rd", "reason": "r", "pr": 0, "hash": h}):
             with self.subTest(entry=entry):
                 rc, out = self.cli("--corpus", str(self.corpus(DENIED)), "--allow", str(self.allow_with(entry)))
                 self.assertEqual(rc, slp.EXIT_UNDECIDED, out)
+
+    def test_an_allow_entry_without_a_valid_hash_exits_2(self):
+        # r5 (CoS I2): an entry with no hash would be keyed by id alone, which is the hole this closes
+        base = {"id": "t-protected-rd", "reason": "r", "pr": 5}
+        for label, entry in {"missing": base, "empty": dict(base, hash=""), "not-hex": dict(base, hash="not-a-hash!"),
+                             "wrong-type": dict(base, hash=12345), "too-short": dict(base, hash="abc")}.items():
+            with self.subTest(hash=label):
+                rc, out = self.cli("--corpus", str(self.corpus(DENIED)), "--allow", str(self.allow_with(entry)))
+                self.assertEqual(rc, slp.EXIT_UNDECIDED, out)
+                self.assertIn("hash", out)
+
+    def test_I2_the_same_id_with_edited_text_is_not_excused_by_the_old_entry(self):
+        entry = {"id": "t-protected-rd", "reason": "synthetic intended loosening", "pr": 999, "hash": DENIED_HASH}
+        edited = dict(DENIED, command=DENIED["command"] + "-r2")  # same id, the command text changed
+        self.assertNotEqual(slp.short_hash(edited["command"]), DENIED_HASH)
+        rc, out = self.cli("--corpus", str(self.corpus(edited)), "--allow", str(self.allow_with(entry)), "--head-hook", str(self.head_hook(ALWAYS_ALLOW_HOOK)))
+        self.assertEqual(rc, slp.EXIT_LOOSENED, out)
+        self.assertIn("LOOSENED t-protected-rd", out)
+        self.assertIn(f"hash={slp.short_hash(edited['command'])}", out)
+        self.assertIn("treated as unlisted", out)
+        self.assertNotIn("ALLOWED-LOOSENED", out)
+        self.assertIn("unlisted=1, allowed=0", out)
+
+    def test_I2_the_unedited_row_is_still_excused_and_its_hash_is_printed_for_the_entry_author(self):
+        entry = {"id": "t-protected-rd", "reason": "synthetic intended loosening", "pr": 999, "hash": DENIED_HASH}
+        rc, out = self.cli("--corpus", str(self.corpus(DENIED)), "--allow", str(self.allow_with(entry)), "--head-hook", str(self.head_hook(ALWAYS_ALLOW_HOOK)))
+        self.assertEqual(rc, slp.EXIT_OK, out)
+        self.assertIn("unlisted=0, allowed=1", out)
+        rc, out = self.cli("--corpus", str(self.corpus(DENIED)), "--allow", str(self.allow), "--head-hook", str(self.head_hook(ALWAYS_ALLOW_HOOK)))
+        self.assertIn(f"LOOSENED t-protected-rd [hook] hash={DENIED_HASH}", out)
 
     def test_the_tracked_allow_list_starts_empty(self):
         self.assertEqual(slp.load_allow(slp.DEFAULT_ALLOW), {}, "an entry belongs here only with a reason and a PR number, added in review")
@@ -193,6 +228,32 @@ class CorpusPinTests(unittest.TestCase):
 
     def test_the_derived_hook_rows_cannot_silently_shrink(self):
         self.assertGreaterEqual(len(slp.derived_hook_cases(REPO_ROOT)), MIN_DERIVED_HOOK_ROWS)
+
+
+COS_465_PROBE_IDS = [f"b465-b5-{n:02d}" for n in range(1, 18)] + [f"b465-b6-{n:02d}" for n in range(1, 9)]
+
+
+class Cos465ProbeRowsTests(ParityRunnerCase):
+    """r5 (CoS I1): the #465 B5 (comment 6230178238) and B6 (comment 6230713095) probe rows that master refuses are in the corpus."""
+
+    def test_the_25_probe_rows_are_present_playback_rows_that_cite_their_comment(self):
+        by_id = {r["id"]: r for r in slp.load_corpus(slp.DEFAULT_CORPUS)}
+        for row_id in COS_465_PROBE_IDS:
+            with self.subTest(row=row_id):
+                self.assertIn(row_id, by_id)
+                self.assertEqual(by_id[row_id]["lint"], "playback")
+                self.assertIn("6230178238" if "-b5-" in row_id else "6230713095", by_id[row_id]["why"])
+        self.assertEqual(len(COS_465_PROBE_IDS), 25)
+
+    @unittest.skipUnless(PWSH, "pwsh is required to run the playback probe")
+    def test_master_refuses_every_probe_row(self):
+        sha = _baseline_sha()
+        if sha is None:
+            self.skipTest("no baseline ref resolves (fork/master, origin/master, master)")
+        rows = [{k: v for k, v in r.items() if k != "source"} for r in slp.load_corpus(slp.DEFAULT_CORPUS) if r["id"] in COS_465_PROBE_IDS]
+        self.assertEqual(len(rows), len(COS_465_PROBE_IDS))
+        report = slp.run(sha, ("playback",), self.corpus(*rows), self.allow, derived=False)
+        self.assertEqual([r["id"] for r in report["results"] if r.get("master") != slp.DENY], [], "master's lint must DENY every probe row")
 
 
 def derived_pin_failures(root: Path) -> list[str]:
@@ -340,6 +401,148 @@ class RootFixTests(unittest.TestCase):
         self.assertEqual(report["rc"], slp.EXIT_OK)
         self.assertGreaterEqual(report["rows"], MIN_STATIC_ROWS + MIN_DERIVED_HOOK_ROWS)
         self.assertEqual(report["pwsh_spawns"], 2 if PWSH else 0, "one pwsh per lint, however many rows")
+
+
+# r5 B1 (CoS review of 778974a4): derived rows came only from the HEAD's own test modules, so a PR that loosens a lint and flips the
+# matching test row to ALLOW (while adding one new DENY row, so the exact count pin stays green) left the comparison clean.  These
+# fixtures are scratch "head" files, written to a temp dir, that WRAP the real tracked files: each is exec'd with __file__ pointing at
+# the real path (so the worktree_root / REPO_ROOT it derives are the real ones) and then changes exactly one thing.  Nothing tracked
+# is edited.  LOOSEN_COMMAND is the CoS repro row: master's NA-3 denies it.
+LOOSEN_COMMAND = "claude auth logout"
+LOOSENED_CASE_NAME = "control claude auth logout"
+LOOSENED_ROW_ID = "hook:control-claude-auth-logout"
+
+
+def _wrapped_head_hook_source() -> str:
+    real = str(REPO_ROOT / slp.HOOK_REL)
+    return "\n".join([
+        f"_REAL = {real!r}",
+        # __file__ is deliberately NOT reset here: the runner loads master's bytes as if they lived at THIS file's path (the r3 root
+        # fix), so both copies must derive the same worktree_root from it, or six NA-7 rows read as phantom 'tightened'.
+        "exec(compile(open(_REAL, encoding='utf-8').read(), _REAL, 'exec'), globals())",
+        "_real_decide = decide",
+        "",
+        "",
+        "def decide(payload, project_dir):",
+        f"    if (payload.get('tool_input') or {{}}).get('command') == {LOOSEN_COMMAND!r}:",
+        "        return 0, ''",
+        "    return _real_decide(payload, project_dir)",
+        "",
+    ])
+
+
+def _wrapped_head_hook_tests_source() -> str:
+    real = str(REPO_ROOT / slp.HOOK_TEST_REL)
+    return "\n".join([
+        f"_REAL = {real!r}",
+        "__file__ = _REAL",
+        "exec(compile(open(_REAL, encoding='utf-8').read(), _REAL, 'exec'), globals())",
+        f"_target = next(c for c in CASES if c['name'] == {LOOSENED_CASE_NAME!r})",
+        "_donor = next(c for c in CASES if c.get('expect') == 'DENY' and c['name'] != _target['name'] and 'raw' not in c)",
+        "# the swap: the loosened row's expectation flips to ALLOW, one NEW deny row (a copy of another DENY row) keeps the count",
+        "CASES = [dict(c, expect='ALLOW') if c is _target else c for c in CASES] + [dict(_donor, name='r5 swapped-in deny row')]",
+        "",
+    ])
+
+
+class BaselineDerivedRowsTests(ParityRunnerCase):
+    """r5 B1: derived rows are the UNION of the head's test modules and the baseline's, by id; a base-only row is judged like any other."""
+
+    def scratch_head(self):
+        return (_write(self.tmp / "head_hook.py", _wrapped_head_hook_source()),
+                _write(self.tmp / "head_hook_tests.py", _wrapped_head_hook_tests_source()))
+
+    def redirect_head_hook_tests(self, tests: Path):
+        real = slp.load_module
+
+        def load(path, name):
+            return real(tests if Path(path).name == Path(slp.HOOK_TEST_REL).name else path, name)
+        return mock.patch.object(slp, "load_module", load)
+
+    def run_derived(self, tests: Path, *args):
+        out = io.StringIO()
+        with self.redirect_head_hook_tests(tests), contextlib.redirect_stdout(out):
+            rc = slp.main(["--base", "HEAD", "--lint", "hook", "--corpus", str(self.corpus()), "--allow", str(self.allow), *args])
+        return rc, out.getvalue()
+
+    def test_B1_a_row_loosened_and_flipped_to_allow_with_the_count_unchanged_is_still_loosened(self):
+        hook, tests = self.scratch_head()
+        with self.redirect_head_hook_tests(tests):
+            head_ids = [c.id for c in slp.derived_hook_cases(REPO_ROOT)]
+        self.assertEqual(len(head_ids), EXACT_DERIVED_HOOK_ROWS, "the swap keeps the exact count pin green: this is the CoS repro")
+        self.assertNotIn(LOOSENED_ROW_ID, head_ids, "the head's own table no longer expects a deny for the loosened row")
+        rc, out = self.run_derived(tests, "--head-hook", str(hook))
+        self.assertEqual(rc, slp.EXIT_LOOSENED, out)
+        self.assertIn(f"LOOSENED {LOOSENED_ROW_ID}", out)
+        self.assertIn("master=DENY head=ALLOW", out)
+        self.assertIn("loosened=1", out)
+
+    def test_B1_control_the_same_head_tests_with_the_real_head_hook_are_clean(self):
+        _, tests = self.scratch_head()
+        rc, out = self.run_derived(tests)
+        self.assertEqual(rc, slp.EXIT_OK, out)
+        self.assertIn("tightened=0 loosened=0", out, "no phantom rows: base-only rows classify the same as the head on an unchanged hook")
+        self.assertNotIn("LOOSENED", out.replace("loosened=", ""))
+
+    def test_B1_the_union_adds_only_rows_the_head_lacks_and_nothing_when_base_equals_head(self):
+        head_only = slp.derived_hook_cases(REPO_ROOT)
+        union = slp.derived_hook_cases(REPO_ROOT, "HEAD")
+        self.assertEqual([c.id for c in union], [c.id for c in head_only], "base == head: the union adds no row")
+        _, tests = self.scratch_head()
+        with self.redirect_head_hook_tests(tests):
+            swapped = slp.derived_hook_cases(REPO_ROOT, "HEAD")
+        self.assertEqual(len(swapped), EXACT_DERIVED_HOOK_ROWS + 1, "the swapped-out row comes back from the baseline: head's 203 + 1 base-only")
+        self.assertEqual([c.source for c in swapped if c.id == LOOSENED_ROW_ID], ["derived-base"])
+
+    def test_B1_a_baseline_test_module_that_cannot_be_loaded_is_exit_2_never_a_skip(self):
+        real_git = slp.git
+        for label, outcome in {"does-not-compile": "def (:\n", "git-show-fails": slp.ParityError("git show failed: no such path at base")}.items():
+            def fake_git(root, *args, outcome=outcome):
+                if len(args) >= 2 and args[0] == "show" and args[1].endswith(":" + slp.HOOK_TEST_REL):
+                    if isinstance(outcome, Exception):
+                        raise outcome
+                    return outcome
+                return real_git(root, *args)
+            with self.subTest(baseline=label):
+                out = io.StringIO()
+                with mock.patch.object(slp, "git", fake_git), contextlib.redirect_stdout(out):
+                    rc = slp.main(["--base", "HEAD", "--lint", "hook", "--corpus", str(self.corpus()), "--allow", str(self.allow)])
+                self.assertEqual(rc, slp.EXIT_UNDECIDED, out.getvalue())
+                self.assertIn("CANNOT-DECIDE", out.getvalue())
+
+    @unittest.skipUnless(PWSH, "pwsh is required to run the playback probe")
+    def test_B1_playback_a_sentence_the_head_dropped_from_its_suite_and_now_allows_is_still_loosened(self):
+        # the victim: one must-refuse sentence that appears exactly once, so dropping it from the head's suite removes the only row
+        rows, pb = slp.derived_playback_rows(REPO_ROOT)
+        texts = [r["text"] for r in rows]
+        victim_row = next(r for r in rows if r["id"].startswith("playback:CLAUSE_MUST_REFUSE") and texts.count(r["text"]) == 1)
+        victim, name = victim_row["text"], victim_row["id"].split(":")[1]
+        tests = _write(self.tmp / "head_playback_tests.py", "\n".join([
+            f"_REAL = {str(REPO_ROOT / slp.PLAYBACK_TEST_REL)!r}",
+            "__file__ = _REAL",
+            "exec(compile(open(_REAL, encoding='utf-8').read(), _REAL, 'exec'), globals())",
+            f"setattr(PromptLintTests, {name!r}, tuple(t for t in getattr(PromptLintTests, {name!r}) if t != {victim!r}))",
+            ""]))
+        victim_file = self.tmp / "victim.txt"
+        victim_file.write_bytes(victim.encode("utf-8"))
+        lint = _write(self.tmp / "head_lint.ps1", "\n".join([
+            "$ErrorActionPreference = 'Stop'",
+            ". " + pb._psq(REPO_ROOT / slp.LINT_REL),
+            "# a ScriptBlock copy of the real function (a FunctionInfo re-resolves by name and would recurse into the override below)",
+            "$script:orig = ${function:Get-LocalPlaybackPromptFindings}",
+            "$script:victim = [System.IO.File]::ReadAllText(" + pb._psq(victim_file) + ", [System.Text.Encoding]::UTF8)",
+            "function Get-LocalPlaybackPromptFindings { param([string]$Text) if ($Text -ceq $script:victim) { return @() }; & $script:orig -Text $Text }",
+            ""]))
+        real = slp.load_module
+
+        def load(path, mod_name):
+            return real(tests if Path(path).name == Path(slp.PLAYBACK_TEST_REL).name else path, mod_name)
+        out = io.StringIO()
+        with mock.patch.object(slp, "load_module", load), contextlib.redirect_stdout(out):
+            rc = slp.main(["--base", "HEAD", "--lint", "playback", "--corpus", str(self.corpus()), "--allow", str(self.allow), "--head-lint", str(lint)])
+        self.assertEqual(rc, slp.EXIT_LOOSENED, out.getvalue())
+        self.assertIn(f"LOOSENED {victim_row['id']}", out.getvalue())
+        self.assertIn("loosened=1", out.getvalue())
 
 
 def _baseline_sha() -> str | None:
