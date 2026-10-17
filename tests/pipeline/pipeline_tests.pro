@@ -133,7 +133,8 @@ SOURCES += \
     $$REPO_ROOT/tests/pipeline/test_debayered16_honour_scale.cpp \
     $$REPO_ROOT/tests/pipeline/test_playback_prep_worker.cpp \
     $$REPO_ROOT/tests/pipeline/test_gpu_field_telemetry_capture.cpp \
-    $$REPO_ROOT/tests/pipeline/test_gpu_device_loss_selfheal.cpp
+    $$REPO_ROOT/tests/pipeline/test_gpu_device_loss_selfheal.cpp \
+    $$REPO_ROOT/tests/pipeline/test_visual_capture_source_hash.cpp
 
 HEADERS += \
     $$REPO_ROOT/platform/qt/Debayered16ReconReusePolicy.h \

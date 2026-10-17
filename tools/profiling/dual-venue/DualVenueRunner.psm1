@@ -1641,6 +1641,32 @@ function Get-DvVisualVerdict {
     [pscustomobject]@{ verdict = 'OK'; counted = $true; reason = $waivedReason }
 }
 
+function Get-DvVisualSourceDifference {
+    <#
+    .SYNOPSIS
+    Whether the source frames behind the JUDGED play frames differ (pure): known-differ | known-identical | unknown, from each frame's own `sourceId`
+    (the app's per-frame source_id: exactly 16 lowercase hex digits; anything else is no id) and `displayFrame`. The app's rule
+    (visual_capture_source_difference::decide, platform/qt/VisualCaptureSourceDifference.h), over the frames passed: unknown with fewer than two frames,
+    any frame without an id or with a display frame below 0, or fewer than two distinct display frames; else known-differ when two ids differ, and
+    known-identical when all are equal. PLAYBACK-SOURCE-FRAME-IDENTITY-1 r4 (acting-cos Dot B1): the caller passes the frames the picture is judged
+    over, so the two numbers the frozen gate compares come from ONE population.
+    #>
+    param([object[]]$Frames = @())
+    $judged = @($Frames | Where-Object { $null -ne $_ })
+    if ($judged.Count -lt 2) { return 'unknown' }
+    $ids = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+    $displayFrames = [System.Collections.Generic.HashSet[int]]::new()
+    foreach ($f in $judged) {
+        $id = Get-DvProp $f 'sourceId'; $displayFrame = Get-DvProp $f 'displayFrame'
+        if (-not ($id -is [string] -and $id -cmatch '^[0-9a-f]{16}\z')) { return 'unknown' }   # \z: a trailing newline is not the app's form either
+        if ($null -eq $displayFrame -or [int]$displayFrame -lt 0) { return 'unknown' }
+        [void]$ids.Add($id); [void]$displayFrames.Add([int]$displayFrame)
+    }
+    if ($displayFrames.Count -lt 2) { return 'unknown' }
+    if ($ids.Count -gt 1) { return 'known-differ' }
+    'known-identical'
+}
+
 function New-DvVisualStrip {
     <#
     .SYNOPSIS
@@ -1704,6 +1730,7 @@ function Read-DvVisualCaptures {
         method = $null; forwarded = $null; probe = $null; probeReason = $null; captured = $false
         frames = @(); playFrames = 0; savedPlayFrames = 0; distinctContentHashes = 0; appDistinctDisplayFrames = 0; flatPlayFrames = 0
         sourceDifference = 'unknown'; viewportUnavailablePlayFrames = 0
+        appSourceDifference = $null; sourceDifferenceCrossCheck = $null
         stopFrame = $null; pausedSettled = $null; pausedFrame = $null; samePosition = $false
         playVsPausedMeanAbsDiff = $null; playVsPausedMeanAbsDiffPerChannel = $null; divergenceThreshold = $script:VisualDivergenceThreshold
         tailBeginUtc = $null; tailEndUtc = $null; presentMonWindowEndUtc = $null
@@ -1711,13 +1738,17 @@ function Read-DvVisualCaptures {
         verdict = $null; counted = $true; reason = $null; appError = $null
     }
     $notJudgedNote = $null   # set once the frames are read; kept after a verdict reason rather than replaced by it
+    $crossCheckNote = $null  # set when the app's source_difference is not what the judged frames' source ids show; kept the same way
     $finish = {
+        $notes = @(@($notJudgedNote, $crossCheckNote) | Where-Object { $_ })
+        $note = $(if ($notes.Count -gt 0) { $notes -join '; ' } else { $null })
         $v = Get-DvVisualVerdict -Requested $Requested -Captured ([bool]$block.captured) -PlayFrames ([int]$block.playFrames) -DistinctContentHashes ([int]$block.distinctContentHashes) `
             -AppDistinctDisplayFrames ([int]$block.appDistinctDisplayFrames) -FlatPlayFrames ([int]$block.flatPlayFrames) -PlayVsPausedMeanAbsDiff $block.playVsPausedMeanAbsDiff -SamePosition ([bool]$block.samePosition) `
             -SourceDifference ([string]$block.sourceDifference) -ViewportUnavailablePlayFrames ([int]$block.viewportUnavailablePlayFrames)
         # a gate reason replaces a step's reason, except that a NOT_CAPTURED leg keeps the step that says WHY nothing was captured
         # (the verdict reason comes first, then the note that some saved play frames were not judged)
-        if ($null -ne $v.reason -and -not ($v.verdict -ceq 'NOT_CAPTURED' -and $null -ne $block.reason)) { $block.reason = $(if ($notJudgedNote) { "$($v.reason); $notJudgedNote" } else { $v.reason }) }
+        if ($null -ne $v.reason -and -not ($v.verdict -ceq 'NOT_CAPTURED' -and $null -ne $block.reason)) { $block.reason = $(if ($note) { "$($v.reason); $note" } else { $v.reason }) }
+        elseif ($null -eq $v.reason -and $note -and (-not $block.reason -or $block.reason -ceq $notJudgedNote)) { $block.reason = $note }   # no gate reason: the notes stand alone
         $block.verdict = $v.verdict; $block.counted = $v.counted
         $block
     }
@@ -1743,9 +1774,12 @@ function Read-DvVisualCaptures {
     Copy-Item -LiteralPath $appJsonShare -Destination (Join-Path $dir 'app-visual.json') -Force
     try { $app = [IO.File]::ReadAllText((Join-Path $dir 'app-visual.json')) | ConvertFrom-Json -ErrorAction Stop } catch { $block.reason = 'the app''s visual.json is not valid JSON'; return (& $finish) }
     $block.method = [string](Get-DvProp $app 'method'); $block.appError = [string](Get-DvProp $app 'error')
-    # Whether the source frames differ: only the app's own record says so (differ | identical, exactly that case: `identical` waives the gate, so `IDENTICAL`
-    # is not the app's word); anything else, or nothing, is unknown -- never a guess.
-    $block.sourceDifference = $(switch -CaseSensitive ([string](Get-DvProp $app 'source_difference')) { 'differ' { 'known-differ' } 'identical' { 'known-identical' } default { 'unknown' } })
+    # Whether the source frames differ: only the app's own records say so -- never a guess. Its top-level source_difference (differ | identical, exactly that
+    # case: `identical` waives the gate, so `IDENTICAL` is not the app's word; anything else, or nothing, is unknown) covers EVERY play capture, a usable
+    # picture or not, so it is kept as written and only CROSS-CHECKS the decision (PLAYBACK-SOURCE-FRAME-IDENTITY-1 r4, acting-cos Dot B1). The decision
+    # is taken below from the judged frames' own source_id (Get-DvVisualSourceDifference).
+    $block.appSourceDifference = Get-DvProp $app 'source_difference'
+    $appSourceDifference = $(switch -CaseSensitive ([string]$block.appSourceDifference) { 'differ' { 'known-differ' } 'identical' { 'known-identical' } default { 'unknown' } })
     $block.tailBeginUtc = ConvertTo-DvVisualUtcText (Get-DvProp $app 'tail_begin_utc'); $block.tailEndUtc = ConvertTo-DvVisualUtcText (Get-DvProp $app 'tail_end_utc')
     $frames = [System.Collections.Generic.List[object]]::new()
     $pixels = @{}
@@ -1757,7 +1791,8 @@ function Read-DvVisualCaptures {
         $legName = $(if ($kind -ceq 'play') { "$LegId-play-$index.png" } else { "$LegId-$kind.png" })
         $entry = [ordered]@{ kind = $kind; index = $index; file = $legName; sha256 = $null; contentHash = $null; viewportMean = $null; viewportStd = $null; viewportAvailable = $true
                              displayFrame = Get-DvProp $f 'display_frame'; playActive = Get-DvProp $f 'play_active'; tailElapsedMs = Get-DvProp $f 'tail_elapsed_ms'
-                             captureMs = Get-DvProp $f 'capture_ms'; viewport = Get-DvProp $f 'viewport'; saved = [bool](Get-DvProp $f 'saved'); appReason = Get-DvProp $f 'reason' }
+                             captureMs = Get-DvProp $f 'capture_ms'; viewport = Get-DvProp $f 'viewport'; saved = [bool](Get-DvProp $f 'saved'); appReason = Get-DvProp $f 'reason'
+                             sourceId = Get-DvProp $f 'source_id' }
         $src = Join-Path $share $file
         if ($entry.saved -and (Test-Path -LiteralPath $src -PathType Leaf)) {
             $local = Join-Path $dir $legName
@@ -1787,6 +1822,15 @@ function Read-DvVisualCaptures {
     if ($block.viewportUnavailablePlayFrames -gt 0 -and $play.Count -ge 2) {
         $notJudgedNote = "$($block.viewportUnavailablePlayFrames) saved play frame(s) have no usable viewport rectangle and were not judged; the other $($play.Count) were"
         if (-not $block.reason) { $block.reason = $notJudgedNote }
+    }
+    # The source difference is judged over the SAME frames as the picture ($play: the play frames with a content hash), so FROZEN_DISPLAY fires only
+    # when the judged frames themselves show differing source ids under one picture (acting-cos Dot B1 on PR #477). A disagreement with the app's
+    # all-captures scalar is recorded (sourceDifferenceCrossCheck, and a note in the reason); it never decides.
+    $block.sourceDifference = Get-DvVisualSourceDifference -Frames $play
+    $block.sourceDifferenceCrossCheck = $(if ($appSourceDifference -ceq $block.sourceDifference) { 'agree' } else { 'disagree' })
+    if ($block.sourceDifferenceCrossCheck -ceq 'disagree') {
+        $appWord = $(if ($null -eq $block.appSourceDifference) { 'no source_difference' } else { "source_difference '$($block.appSourceDifference)'" })
+        $crossCheckNote = "the app's $appWord (over every play capture) is not the $($block.sourceDifference) the $($play.Count) judged frames' source ids show; the judged frames decide"
     }
     $block.distinctContentHashes = @($play | ForEach-Object { $_.contentHash } | Sort-Object -Unique).Count
     $block.appDistinctDisplayFrames = @($play | ForEach-Object { $_.displayFrame } | Where-Object { $null -ne $_ -and [int]$_ -ge 0 } | Sort-Object -Unique).Count
@@ -2406,7 +2450,7 @@ function Write-DvReceipt {
 
 Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-DvSha256OfBytes, Get-DvSha256OfText, Get-DvSha256OfFile,
     ConvertTo-DvLfBytes, Get-DvLegSpecSha256, Get-DvDerivedBackend, Get-DvBackendNotDerivable, Read-DvContactFrames, Get-DvSubjectDigest,
-    Get-DvVisualViewportPixels, Get-DvVisualMeanAbsDiff, Get-DvVisualVerdict, New-DvVisualStrip, Read-DvVisualCaptures, Get-DvVisualCaptureRequest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
+    Get-DvVisualViewportPixels, Get-DvVisualMeanAbsDiff, Get-DvVisualVerdict, Get-DvVisualSourceDifference, New-DvVisualStrip, Read-DvVisualCaptures, Get-DvVisualCaptureRequest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
     Test-DvUnderClaudeState, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvMinPlaySeconds, Get-DvPlaybackProblems,
     Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvHealthVerdict,
     New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout,
