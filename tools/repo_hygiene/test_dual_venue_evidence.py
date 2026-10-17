@@ -224,7 +224,7 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
     it against a sparse CLONE whose two fixture files are header-only ~30 s stand-ins (never real footage), the same
     device master's own generator tests use."""
 
-    warm_first = True   # the first `generate` of the class runs every request on `warm_requests` at once (a class that borrows `generate` leaves this False)
+    warm_first = True   # the first `generate` of the class runs every request on `warm_requests` at once; read from the class's OWN __dict__ (see `generate`), so a subclass or a borrower never inherits it
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -319,9 +319,11 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
                     cls._parse_cache[path] = int(count)
 
     def generate(self, script: Path, out_name: str, extra: list[str]) -> Path:
-        """The same script and arguments emit the same bytes whatever the output file is called, so a request is run once per class (see `warm_requests`)."""
+        """The same script and arguments emit the same bytes whatever the output file is called, so a request is run once per class (see `warm_requests`).
+        The warm-up is opt-in per class: only a class that sets `warm_first = True` in its own body runs it. A subclass (CpuGeneratedJobs.Boot asks for ~5 jobs) or a
+        borrower that did not opt in would otherwise pay the whole ~60-job warm-up on its first request, and so would any future subclass."""
         cls = type(self)
-        if cls.warm_first and not cls._warmed:
+        if cls.__dict__.get("warm_first", False) and not cls._warmed:
             cls._warmed = True
             cls.warm_generated()
         key = (str(script), tuple(extra))
@@ -6817,6 +6819,71 @@ def write_visual_captures(dest: Path, mode: str = "ok") -> None:
     (dest / "visual.json").write_text(json.dumps(visual), encoding="utf-8")
     (dest / "visual-capture-request.json").write_text(json.dumps({"schema": "mlv-app/visual-capture-request/v1", "requested": True, "probe": "supported",
                                                                   "reason": None, "forwarded": True, "presentMonWindowEndUtc": "2026-10-13T22:00:00.000Z"}), encoding="utf-8")
+
+
+class GeneratorWarmUpIsOptInPerClassTests(unittest.TestCase):
+    """The generator class's concurrent warm-up (~60 jobs) belongs to the class that defines the warm list. A subclass that does not set `warm_first` in its own body
+    (test_dve_leg_terminals.CpuGeneratedJobs.Boot asks for ~5 jobs) performs zero warm runs. No pwsh runs here: `warm_generated` is counted, not executed."""
+
+    @staticmethod
+    def stubs() -> tuple[list[str], type, type, type]:
+        calls: list[str] = []
+        key = (str(Path("job-generator.ps1")), ())
+
+        class Defining(GeneratorByteIdentityAndVariantTests):
+            warm_first = True
+
+            @classmethod
+            def setUpClass(cls) -> None:
+                cls._generated = {key: (Path("cached.job.ps1"), subprocess.CompletedProcess([], 0, "", ""))}
+                cls._parse_cache = {}
+                cls._warmed = False
+
+            @classmethod
+            def tearDownClass(cls) -> None:
+                pass
+
+            @classmethod
+            def warm_generated(cls) -> None:
+                calls.append(cls.__name__)
+
+            def runTest(self) -> None:  # pragma: no cover - never run
+                pass
+
+        class Inheriting(Defining):
+            pass
+
+        class OptedIn(Defining):
+            warm_first = True
+
+        return calls, Defining, Inheriting, OptedIn
+
+    def request(self, cls: type) -> None:
+        cls.setUpClass()
+        cls("runTest").generate(Path("job-generator.ps1"), "x.job.ps1", [])
+
+    def test_the_real_generator_class_defines_the_flag_in_its_own_body(self) -> None:
+        self.assertIs(GeneratorByteIdentityAndVariantTests.__dict__.get("warm_first"), True)
+
+    def test_the_defining_class_still_warms_once(self) -> None:
+        calls, defining, _inheriting, _opted_in = self.stubs()
+        self.request(defining)
+        defining("runTest").generate(Path("job-generator.ps1"), "y.job.ps1", [])
+        self.assertEqual(calls, ["Defining"])
+
+    def test_a_subclass_that_does_not_opt_in_performs_zero_warm_runs(self) -> None:
+        calls, _defining, inheriting, _opted_in = self.stubs()
+        self.assertTrue(inheriting.warm_first, "the flag is still visible through inheritance; only the class's own body counts")
+        self.request(inheriting)
+        self.assertEqual(calls, [])
+
+    def test_a_subclass_can_opt_in_in_its_own_body(self) -> None:
+        calls, _defining, _inheriting, opted_in = self.stubs()
+        self.request(opted_in)
+        self.assertEqual(calls, ["OptedIn"])
+
+    def test_the_visual_capture_borrower_performs_zero_warm_runs(self) -> None:
+        self.assertFalse(VisualCaptureGeneratorTests.__dict__.get("warm_first", False))
 
 
 @requires_windows_pwsh
