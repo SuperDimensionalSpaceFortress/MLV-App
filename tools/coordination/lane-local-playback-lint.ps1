@@ -424,13 +424,28 @@ function ConvertTo-LintAlternation {
 # E1 marker reaches them (-WithGrammars). Every static [regex]::Match / Matches / IsMatch went through .NET's 15-entry static regex
 # cache; the rule-4 patterns pushed the distinct patterns one sentence reads past 15, so each call re-parsed the big ones. Get-LintRegex
 # keeps one Regex per pattern string for the life of the process (default options, exactly what the static calls used).
+# r14b (culture fail-open, sol r12d): a case-insensitive Regex fixes its case table when it is CONSTRUCTED, from the thread's CurrentCulture
+# (tr-TR: I matches only the dotless i, so "ON THIS HOST" no longer matches "this host"). The static calls built it under the culture of each
+# call; a cached one kept the culture of the call that warmed it, so a process warmed under tr-TR allowed under en-US what dc124533 refused.
+# New-LintRegex builds EVERY cached Regex under en-US, the culture dc124533 was verified under, and restores the caller's culture, so the
+# result depends on neither the warm-time nor the call-time culture. RegexOptions.CultureInvariant is NOT used: it folds U+0130 differently
+# from en-US (dc124533 under en-US refuses a dotted capital I in the host phrase, invariant does not), which would let a row through.
+function New-LintRegex {
+    param([string]$Pattern)
+    $saved = [System.Globalization.CultureInfo]::CurrentCulture
+    try {
+        [System.Globalization.CultureInfo]::CurrentCulture = [System.Globalization.CultureInfo]::GetCultureInfo('en-US')
+        return [regex]::new($Pattern)
+    }
+    finally { [System.Globalization.CultureInfo]::CurrentCulture = $saved }
+}
 $script:LintPatternSet = $null
 $script:LintRegexCache = [hashtable]::new([System.StringComparer]::Ordinal)
 function Get-LintRegex {
     param([string]$Pattern)
     $rx = $script:LintRegexCache[$Pattern]
     if ($null -eq $rx) {
-        $rx = [regex]::new($Pattern)
+        $rx = New-LintRegex $Pattern
         $script:LintRegexCache[$Pattern] = $rx
     }
     return $rx
@@ -541,7 +556,7 @@ function Get-LintPatternSet {
     $tailFragC = "(?:${tailNegation})${tb}\s+${tailHostTarget}"
     $tailSep = "(?:[.!?;:,]+(?=\s|\z)|(?<=\s|^)-{1,2}(?=\s)|(?:${tailJoiner})${tb})"
     $tailFrag = "(?:${tailFragA}|${tailFragC}|${tailLocus})"
-    $tailGrammar = [regex]::new("(?i)^\s*(?:(?>${tailSep})\s*)*(?:(?>${tailFrag})(?:\s*(?>${tailSep}))+\s*)*(?:(?>${tailFrag})\s*)?\z")
+    $tailGrammar = New-LintRegex ("(?i)^\s*(?:(?>${tailSep})\s*)*(?:(?>${tailFrag})(?:\s*(?>${tailSep}))+\s*)*(?:(?>${tailFrag})\s*)?\z")
     # r12: the closed HEAD grammar (see the header, Test-HeadGrammar), built from the same token machinery as the tail grammar. A head
     # piece is parsed LEFT TO RIGHT from its first character and every fragment is atomic: the first token no list names ends the match
     # and the piece is dirty. Fragments, in order (the first that matches wins, so a longer shape is listed before its own prefix):
@@ -577,8 +592,8 @@ function Get-LintPatternSet {
     $headOpen = "(?i)^\s*(?:${headListMark})*(?:(?>${headSep})\s*)*(?:(?>${headFrag})(?:\s*(?>${headSep}))+\s*)*"
     # r12: the head check of E1 reads both grammars with a cursor over the earlier items (Test-EarlierItemDirty; the per-call state is
     # built in Get-LocalPlaybackPromptFindings, r11). The marker's own head may end in a bare launch; an earlier item may not.
-    $headGrammar = [regex]::new("${headOpen}(?:(?>${headFrag}|${headBareLaunch})\s*)?\z")
-    $itemGrammar = [regex]::new("${headOpen}(?:(?>${headFrag})\s*)?\z")
+    $headGrammar = New-LintRegex "${headOpen}(?:(?>${headFrag}|${headBareLaunch})\s*)?\z"
+    $itemGrammar = New-LintRegex "${headOpen}(?:(?>${headFrag})\s*)?\z"
     }
     # r2 (NA2-RULE4-PER-LAUNCHER-SCOPE-1, CoS review of 75cb00e1): a launcher's gap can never reach across a `;` or into the NEXT launcher.
     # The r1 gaps ([^\n]{0,80}? after pwsh, up to 12 argument tokens after the app) could run over `; pwsh ...` / `; <app> ...`, so a first
@@ -641,7 +656,7 @@ function Get-LintPatternSet {
         HostDefeaters = $hostDefeaters; HostDefeatersLaunch = $hostDefeatersLaunch
         Direct = $direct; ClipLaunch = $clipLaunch; ClipMention = $clipMention; AppBare = $appBare; ModeFlag = $modeFlag
         # the rule triggers, in the order they were always tried (the incident phrase, the three markers, the mode flag, then the launch patterns)
-        Triggers = @([regex]::new($incident), [regex]::new($localMarker), [regex]::new($hostMarker), [regex]::new($hereMarker), [regex]::new($modeFlag)) + @($direct | ForEach-Object { [regex]::new($_) })
+        Triggers = @((New-LintRegex $incident), (New-LintRegex $localMarker), (New-LintRegex $hostMarker), (New-LintRegex $hereMarker), (New-LintRegex $modeFlag)) + @($direct | ForEach-Object { New-LintRegex $_ })
     }
     if ($WithGrammars) { $set.TailGrammar = $tailGrammar; $set.HeadGrammar = $headGrammar; $set.ItemGrammar = $itemGrammar }
     $script:LintPatternSet = $set
