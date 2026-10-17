@@ -5,8 +5,10 @@
 // (4) the identity-change rule (an unknown current identity is never a change); (5) no notice asks
 // the user to reboot or restart (owner spec r2); (6) the persisted keys round-trip through the
 // app's settings store (automation_settings::isolate); (7) a source-text pin: run_backend checks
-// the suppression flag before it takes the backend mutex. The fault-to-suppression chain through
-// the real llrawproc seam lives in tests/pipeline/test_gpu_device_loss_selfheal.cpp.
+// the suppression flag before it takes the backend mutex; (8) the MLVAPP_GPU_SAFE_START=clear match;
+// (9) every capturing unlock sets the flag on a device loss before it releases the backend mutex. The
+// fault-to-suppression chain through the real llrawproc seam lives in
+// tests/pipeline/test_gpu_device_loss_selfheal.cpp.
 #include "../common/minitest.h"
 #include "../common/repo_paths.h"
 #include "../../platform/qt/AutomationSettings.h"
@@ -14,6 +16,7 @@
 
 #include <QDir>
 #include <QFile>
+#include <QRegularExpression>
 #include <QSettings>
 #include <QString>
 #include <QStringList>
@@ -64,6 +67,17 @@ TEST(GpuDeviceLossBreaker, ParseFaultInject)
                              "702@ 5", "702@5@6", "abc"})
         ASSERT_FALSE(core::parseFaultInject(bad).armed);
     ASSERT_FALSE(core::parseFaultInject(nullptr).armed); // unset
+}
+
+// GPU-LOSS-EMIT-BEFORE-UNLOCK-1 (c): MLVAPP_GPU_SAFE_START=clear is matched case-insensitively with surrounding
+// whitespace ignored (the parseEnabled convention); no other word, and no near-miss, is a clear.
+TEST(GpuDeviceLossBreaker, SafeStartClearAcceptsCaseAndWhitespaceVariantsOnly)
+{
+    for (const char * ok : {"clear", "CLEAR", " Clear\t", "clear\r\n"})
+        ASSERT_TRUE(core::safeStartClearRequested(ok));
+    ASSERT_FALSE(core::safeStartClearRequested(nullptr)); // unset
+    for (const char * bad : {"", "0", "1", "cleared", "clear!", "c lear", "unclear", "clea", "clear clear"})
+        ASSERT_FALSE(core::safeStartClearRequested(bad));
 }
 
 TEST(GpuDeviceLossBreaker, CudaNamesForTheDeviceLossCodes)
@@ -344,6 +358,358 @@ TEST(GpuDeviceLossBreaker, EverySerializingLockSiteReChecksSuppressionAfterAcqui
     // Both build variants define the flag.
     ASSERT_EQ(2, (int)llrawproc.count(QStringLiteral("int llrpGpuCudaSuppressed(void)\n{")));
     ASSERT_EQ(2, (int)llrawproc.count(QStringLiteral("void llrpSetGpuCudaSuppressed(int suppressed)\n{")));
+}
+
+namespace
+{
+// GPU-LOSS-EMIT-BEFORE-UNLOCK-1: each llrawproc section that captures CUDA codes under the backend mutex and
+// emits them after releasing it scans the captured codes for a device loss as its last statement before the
+// unlock, so the flag is set before any queued caller can take the lock. r2 (CoS I2): the sections are
+// DISCOVERED, not listed: every function body (a column-0 "{" line up to the next column-0 "}") that contains
+// both the backend unlock and an llrawproc_gpu_stage_telemetry_emit* call. For every emit call in such a body,
+// the nearest unlock before it must have the scan as the one statement just ahead of it.
+struct CapturingUnlockCensus
+{
+    QStringList sites;   // every discovered section, in source order
+    QStringList missing; // the discovered sections that do not scan before the unlock
+};
+
+// The function name on the signature that ends just before `open` (the "\n" ahead of the column-0 "{"); the
+// signature may wrap onto indented continuation lines.
+QString functionNameBefore(const QString & source, int open)
+{
+    int lineStart = source.lastIndexOf(QLatin1Char('\n'), open - 1) + 1;
+    while (lineStart > 1 && source.at(lineStart).isSpace())
+        lineStart = source.lastIndexOf(QLatin1Char('\n'), lineStart - 2) + 1;
+    QString name = source.mid(lineStart, open - lineStart).section(QLatin1Char('('), 0, 0).section(QLatin1Char(' '), -1);
+    while (name.startsWith(QLatin1Char('*'))) name.remove(0, 1);
+    return name;
+}
+
+CapturingUnlockCensus capturingUnlockCensus(const QString & source)
+{
+    CapturingUnlockCensus census;
+    const QString suppress = QStringLiteral("llrawproc_gpu_suppress_on_device_loss_locked(");
+    const QString unlock = QStringLiteral("pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);");
+    const QString emitCall = QStringLiteral("llrawproc_gpu_stage_telemetry_emit");
+    for (int open = source.indexOf(QStringLiteral("\n{\n")); open >= 0;
+         open = source.indexOf(QStringLiteral("\n{\n"), open + 1))
+    {
+        const int close = source.indexOf(QStringLiteral("\n}"), open + 2);
+        if (close < 0) break;
+        const QString body = source.mid(open, close - open);
+        if (!body.contains(unlock) || !body.contains(emitCall)) continue;
+        const QString name = functionNameBefore(source, open);
+        census.sites << name;
+        bool ok = true;
+        for (int emitAt = body.indexOf(emitCall); emitAt >= 0; emitAt = body.indexOf(emitCall, emitAt + 1))
+        {
+            const int unlockAt = body.lastIndexOf(unlock, emitAt - 1);
+            const int at = unlockAt < 0 ? -1 : body.lastIndexOf(suppress, unlockAt - 1);
+            if (at < 0 || body.mid(at, unlockAt - at).count(QStringLiteral(";\n")) != 1) ok = false;
+        }
+        if (!ok) census.missing << name;
+    }
+    return census;
+}
+
+QStringList capturingUnlocksWithoutSuppression(const QString & source)
+{
+    return capturingUnlockCensus(source).missing;
+}
+
+// r3 (CoS I3): discovery sees only bodies whose "{" is a column-0 line of its own, so a one-line definition
+// (`int f(int wait_ms) {`) would hide a section. Two guards close that. (1) No column-0 line ends in ") {".
+QStringList columnZeroOneLineDefinitions(const QString & source)
+{
+    QStringList found;
+    const QStringList lines = source.split(QLatin1Char('\n'));
+    for (int i = 0; i < lines.size(); ++i)
+    {
+        const QString & line = lines.at(i);
+        if (!line.isEmpty() && !line.at(0).isSpace() && line.trimmed().endsWith(QStringLiteral(") {")))
+            found << QStringLiteral("llrawproc.c:%1").arg(i + 1);
+    }
+    return found;
+}
+
+// (2) Every backend unlock lies inside a discovered section or one of these bodies, which hold the unlock but never
+// emit (a listed body that gains an emit is discovered, and fails the census line in the test below).
+const QStringList & nonEmittingUnlockBodies()
+{
+    static const QStringList bodies = {
+        QStringLiteral("llrpGpuPlaybackReconGetBackendInfo"),
+        QStringLiteral("llrpGpuPlaybackReconGetBackendInfoWithin"),
+        QStringLiteral("llrpInstallFakeGpuPlaybackReconBackendForTesting"),
+        QStringLiteral("llrpFakeGpuBackendFailCreateForTesting"),
+        QStringLiteral("llrpHoldGpuReconBackendMutexForTesting"),
+        QStringLiteral("llrpSetFakeGpuBackendReducedIsoNotchSymbolForTesting"),
+        QStringLiteral("llrawproc_gpu_recon_backend_available_guarded"),
+        QStringLiteral("llrpGpuPlaybackReconCopyLastDeviceBayer16ToGlTexture"),
+        QStringLiteral("llrpGpuPlaybackReconReleaseRetainedDeviceBayer16"),
+        QStringLiteral("llrpGpuPlaybackReconRetainedOutstandingCount"),
+        QStringLiteral("llrpGpuPlaybackReconClipDimsChangeRefusals"),
+        QStringLiteral("llrpGpuPlaybackReconReducedIsoNotchAvailable")};
+    return bodies;
+}
+
+// The column-0 body holding each backend unlock, in source order ("" when no column-0 body holds it).
+QStringList backendUnlockOwners(const QString & source)
+{
+    QStringList owners;
+    const QString unlock = QStringLiteral("_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex)");
+    for (int at = source.indexOf(unlock); at >= 0; at = source.indexOf(unlock, at + 1))
+    {
+        const int open = source.lastIndexOf(QStringLiteral("\n{\n"), at);
+        const int close = open < 0 ? -1 : source.indexOf(QStringLiteral("\n}"), open + 2);
+        owners << ((open >= 0 && close > at) ? functionNameBefore(source, open) : QString());
+    }
+    return owners;
+}
+
+QStringList unlocksOutsideKnownBodies(const QString & source)
+{
+    const QStringList sites = capturingUnlockCensus(source).sites;
+    const QStringList owners = backendUnlockOwners(source);
+    const QString unlock = QStringLiteral("_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex)");
+    QStringList outside;
+    int at = -1;
+    for (const QString & owner : owners)
+    {
+        at = source.indexOf(unlock, at + 1);
+        if (owner.isEmpty() || (!sites.contains(owner) && !nonEmittingUnlockBodies().contains(owner)))
+            outside << QStringLiteral("llrawproc.c:%1 (%2)").arg(source.left(at).count(QLatin1Char('\n')) + 1)
+                           .arg(owner.isEmpty() ? QStringLiteral("no column-0 body") : owner);
+    }
+    return outside;
+}
+
+// r5 (CoS I5): the C source with every comment blanked to spaces. Newlines are kept, so line numbers hold; string and
+// character literals are copied as they are, so a "//" or "/*" inside one does not start a comment.
+QString withoutCComments(const QString & source)
+{
+    QString out = source;
+    enum { Code, LineComment, BlockComment, StringLiteral, CharLiteral } state = Code;
+    for (int i = 0; i < out.size(); ++i)
+    {
+        const ushort c = out.at(i).unicode();
+        const ushort next = i + 1 < out.size() ? out.at(i + 1).unicode() : 0;
+        switch (state)
+        {
+        case Code:
+            if (c == '/' && next == '/') { state = LineComment; out[i] = QLatin1Char(' '); }
+            else if (c == '/' && next == '*') { state = BlockComment; out[i] = out[i + 1] = QLatin1Char(' '); ++i; }
+            else if (c == '"') state = StringLiteral;
+            else if (c == '\'') state = CharLiteral;
+            break;
+        case LineComment:
+            if (c == '\n') state = Code;
+            else out[i] = QLatin1Char(' ');
+            break;
+        case BlockComment:
+            if (c == '*' && next == '/') { out[i] = out[i + 1] = QLatin1Char(' '); ++i; state = Code; }
+            else if (c != '\n') out[i] = QLatin1Char(' ');
+            break;
+        case StringLiteral:
+        case CharLiteral:
+            if (c == '\\') ++i;
+            else if (c == (state == StringLiteral ? '"' : '\'')) state = Code;
+            break;
+        }
+    }
+    return out;
+}
+
+// r5 (CoS I5): what is wrong with one slot in llrawproc.c, "" when nothing. With comments stripped, the slot name as a
+// whole word (\bname\b) must appear exactly 3 times: (1) its declaration line `static PVOID volatile <name> = NULL;`,
+// (2) `&<name>` as the first argument of one InterlockedExchangePointer( (the write) and (3) `&<name>` as the first
+// argument of one InterlockedCompareExchangePointer( (the read). Every other occurrence is reported with its line: a
+// bare name without a leading & that is not the declaration (a plain read, or a plain store with or without spaces),
+// or an & outside those two calls. A second declaration, write or read changes the count and is reported too.
+QString slotPinViolations(const QString & source, const QString & name)
+{
+    const QString code = withoutCComments(source);
+    const QString declaration = QStringLiteral("static PVOID volatile %1 = NULL;").arg(name);
+    const QRegularExpression word(QStringLiteral("\\b%1\\b").arg(QRegularExpression::escape(name)));
+    int total = 0;
+    int declarations = 0;
+    int writes = 0;
+    int reads = 0;
+    QStringList stray;
+    for (QRegularExpressionMatchIterator it = word.globalMatch(code); it.hasNext();)
+    {
+        const int at = it.next().capturedStart();
+        ++total;
+        const QString where = QStringLiteral("llrawproc.c:%1").arg(code.left(at).count(QLatin1Char('\n')) + 1);
+        // `&name`, not `&&name` (a logical and in front of a bare read).
+        const bool addressed = at > 0 && code.at(at - 1) == QLatin1Char('&') && (at < 2 || code.at(at - 2) != QLatin1Char('&'));
+        if (!addressed)
+        {
+            const int lineStart = code.lastIndexOf(QLatin1Char('\n'), at) + 1;
+            const int lineEnd = code.indexOf(QLatin1Char('\n'), at);
+            if (code.mid(lineStart, (lineEnd < 0 ? code.size() : lineEnd) - lineStart).trimmed() == declaration)
+                ++declarations;
+            else
+                stray << QStringLiteral("bare %1").arg(where);
+            continue;
+        }
+        const QString before = code.left(at - 1).trimmed();
+        if (before.endsWith(QStringLiteral("InterlockedCompareExchangePointer(")))
+            ++reads;
+        else if (before.endsWith(QStringLiteral("InterlockedExchangePointer(")))
+            ++writes;
+        else
+            stray << QStringLiteral("& outside an interlocked call %1").arg(where);
+    }
+    QStringList problems;
+    if (total != 3) problems << QStringLiteral("%1 occurrences, not 3").arg(total);
+    if (declarations != 1) problems << QStringLiteral("%1 declarations, not 1").arg(declarations);
+    if (writes != 1) problems << QStringLiteral("%1 interlocked writes, not 1").arg(writes);
+    if (reads != 1) problems << QStringLiteral("%1 interlocked reads, not 1").arg(reads);
+    problems << stray;
+    return problems.join(QStringLiteral("; "));
+}
+
+// r5 (CoS I5): the r4 slot pin exactly as it stood at f1115c6c, kept so the test shows what it missed. It finds the
+// declaration, the write and the read, counts `&<name>` (2) and `<name> = ` (1, the declaration). It does not see a
+// plain read (no & and no " = ") or a store written without spaces (`<name>=`): both CoS mutants pass it.
+bool r4SlotPinHolds(const QString & source, const QString & name)
+{
+    return source.contains(QStringLiteral("static PVOID volatile %1 = NULL;\n").arg(name))
+        && source.contains(QStringLiteral("InterlockedExchangePointer(&%1, (PVOID)").arg(name))
+        && (source.contains(QStringLiteral("InterlockedCompareExchangePointer(\n        &%1, NULL, NULL)").arg(name))
+            || source.contains(QStringLiteral("InterlockedCompareExchangePointer(&%1, NULL, NULL)").arg(name)))
+        && source.count(QStringLiteral("&%1").arg(name)) == 2
+        && source.count(QStringLiteral("%1 = ").arg(name)) == 1;
+}
+} // namespace
+
+TEST(GpuDeviceLossBreaker, EveryCapturingUnlockSuppressesOnADeviceLossBeforeReleasing)
+{
+    const QString llrawproc = readRepoFile(QStringLiteral("src/mlv/llrawproc/llrawproc.c"));
+    // Discovered, not listed (CoS I2). Exactly these four sections capture under the backend mutex and emit after
+    // it: a new one that scans first is added to this line on purpose; one that does not also fails the next line.
+    ASSERT_EQ(std::string("llrpGpuPlaybackReconDrainCudaErrorsAtTeardown, llrpGpuPlaybackReconPreuploadFrame, "
+                          "llrawproc_gpu_recon_run_backend, llrpGpuPlaybackReconResetGlTextureResources"),
+              capturingUnlockCensus(llrawproc).sites.join(QStringLiteral(", ")).toStdString());
+    ASSERT_EQ(std::string(), capturingUnlocksWithoutSuppression(llrawproc).join(QStringLiteral(", ")).toStdString());
+    // Fifth-site mutants: a copy of the teardown drain under a new name, with its scan moved after the unlock or
+    // dropped, is discovered as a fifth section and reported; the four real sections stay clean.
+    const QString drainEntry = QStringLiteral("int llrpGpuPlaybackReconDrainCudaErrorsAtTeardown(int wait_ms)\n{");
+    const int drainAt = llrawproc.indexOf(drainEntry);
+    ASSERT_TRUE(drainAt > 0);
+    QString fifthSite = llrawproc.mid(drainAt, llrawproc.indexOf(QStringLiteral("\n}\n"), drainAt) + 3 - drainAt);
+    fifthSite.replace(QStringLiteral("llrpGpuPlaybackReconDrainCudaErrorsAtTeardown"), QStringLiteral("llrpFifthCapturingSiteMutant"));
+    const QString scanThenUnlock = QStringLiteral("    llrawproc_gpu_suppress_on_device_loss_locked(leftovers, 2);\n"
+                                                  "    pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);\n");
+    for (const QString & fifthShape : {QStringLiteral("    pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);\n"
+                                                      "    llrawproc_gpu_suppress_on_device_loss_locked(leftovers, 2);\n"),
+                                       QStringLiteral("    pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);\n")})
+    {
+        const QString withFifth = llrawproc + QStringLiteral("\n") + replacedOnce(fifthSite, scanThenUnlock, fifthShape);
+        const CapturingUnlockCensus census = capturingUnlockCensus(withFifth);
+        ASSERT_EQ(5, (int)census.sites.size());
+        ASSERT_EQ(std::string("llrpFifthCapturingSiteMutant"), census.missing.join(QStringLiteral(", ")).toStdString());
+    }
+    // ...and the same copy left in its scanning shape is discovered and passes.
+    ASSERT_EQ(5, (int)capturingUnlockCensus(llrawproc + QStringLiteral("\n") + fifthSite).sites.size());
+    ASSERT_EQ(0, (int)capturingUnlocksWithoutSuppression(llrawproc + QStringLiteral("\n") + fifthSite).size());
+    // r3 (CoS I3): the two guards hold on this tree, and every listed non-emitting body still holds an unlock.
+    ASSERT_EQ(std::string(), columnZeroOneLineDefinitions(llrawproc).join(QStringLiteral(", ")).toStdString());
+    ASSERT_EQ(std::string(), unlocksOutsideKnownBodies(llrawproc).join(QStringLiteral(", ")).toStdString());
+    for (const QString & body : nonEmittingUnlockBodies())
+        ASSERT_EQ(body.toStdString() + " holds an unlock",
+                  body.toStdString() + (backendUnlockOwners(llrawproc).contains(body) ? " holds an unlock" : " holds no unlock"));
+    // RED row (the CoS I3 reproduction): the fifth copy written as a one-line definition with its scan dropped. The
+    // census alone still finds the four sections and nothing missing; both guards report it.
+    const QString oneLineFifth = replacedOnce(
+        replacedOnce(fifthSite, scanThenUnlock, QStringLiteral("    pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);\n")),
+        QStringLiteral("int llrpFifthCapturingSiteMutant(int wait_ms)\n{"), QStringLiteral("int llrpFifthKR(int wait_ms) {"));
+    const QString withOneLineFifth = llrawproc + QStringLiteral("\n") + oneLineFifth;
+    ASSERT_EQ(4, (int)capturingUnlockCensus(withOneLineFifth).sites.size());
+    ASSERT_EQ(0, (int)capturingUnlocksWithoutSuppression(withOneLineFifth).size());
+    ASSERT_EQ(QStringLiteral("llrawproc.c:%1").arg(llrawproc.count(QLatin1Char('\n')) + 2).toStdString(),
+              columnZeroOneLineDefinitions(withOneLineFifth).join(QStringLiteral(", ")).toStdString());
+    const QStringList oneLineOutside = unlocksOutsideKnownBodies(withOneLineFifth);
+    ASSERT_EQ(1, (int)oneLineOutside.size());
+    ASSERT_EQ(std::string("(no column-0 body)"), oneLineOutside.at(0).mid(oneLineOutside.at(0).indexOf(QLatin1Char('('))).toStdString());
+    // ...and a new column-0 body holding the unlock that is neither discovered nor listed is reported by name.
+    const QString unlisted = llrawproc + QStringLiteral(
+        "\nstatic int a_new_unlocking_body(void)\n{\n"
+        "    pthread_mutex_lock(&g_llrawproc_gpu_recon_backend_mutex);\n"
+        "    pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);\n    return 0;\n}\n");
+    const QStringList unlistedOutside = unlocksOutsideKnownBodies(unlisted);
+    ASSERT_EQ(1, (int)unlistedOutside.size());
+    ASSERT_EQ(std::string("(a_new_unlocking_body)"), unlistedOutside.at(0).mid(unlistedOutside.at(0).indexOf(QLatin1Char('('))).toStdString());
+    // The scan sets the flag and never clears it.
+    const QString helper = llrawproc.mid(llrawproc.indexOf(QStringLiteral("static void llrawproc_gpu_suppress_on_device_loss_locked(")));
+    ASSERT_TRUE(helper.left(helper.indexOf(QStringLiteral("\n}\n"))).contains(QStringLiteral("llrpSetGpuCudaSuppressed(1);")));
+    ASSERT_FALSE(helper.left(helper.indexOf(QStringLiteral("\n}\n"))).contains(QStringLiteral("llrpSetGpuCudaSuppressed(0)")));
+    // Mutants: each site's scan removed (the master shape) is reported.
+    for (const char * call : {"    llrawproc_gpu_suppress_on_device_loss_locked(leftovers, 2);\n",
+                              "    if(telemetry_entered) llrawproc_gpu_suppress_on_device_loss_locked(&telemetry_event, 1);\n",
+                              "    llrawproc_gpu_suppress_on_device_loss_locked(telemetry_events, telemetry_event_count);\n",
+                              "    if(telemetry_sink) llrawproc_gpu_suppress_on_device_loss_locked(leftovers, 2);\n"})
+    {
+        const QString mutant = replacedOnce(llrawproc, QString::fromLatin1(call), QString());
+        ASSERT_EQ(1, (int)capturingUnlocksWithoutSuppression(mutant).size());
+    }
+    // The breaker registers the classifier when it installs its fault listener, and a reset clears it.
+    const QString breaker = readRepoFile(QStringLiteral("platform/qt/GpuDeviceLossBreaker.cpp"));
+    ASSERT_TRUE(breaker.contains(QStringLiteral("    llrpSetGpuDeviceLossClassifier(&classifyDeviceLossCodeForBackend);\n"
+                                                "    GpuFieldTelemetry::setFaultListener(&onFault);\n")));
+    ASSERT_TRUE(breaker.contains(QStringLiteral("    llrpSetGpuDeviceLossClassifier(nullptr);\n")));
+    // r4 (Iverson 6227232346): each slot is declared PVOID volatile, and the source holds an InterlockedExchangePointer
+    // write and an InterlockedCompareExchangePointer read of it. These five r4 lines alone do NOT prove there is no
+    // other access (CoS I5, 6228586737): a plain read or a no-space store passes them. The r5 pin below does.
+    for (const char * slot : {"g_llrawproc_gpu_device_loss_classifier", "g_llrawproc_gpu_recon_after_unlock_hook"})
+    {
+        const QString name = QString::fromLatin1(slot);
+        ASSERT_TRUE(llrawproc.contains(QStringLiteral("static PVOID volatile %1 = NULL;\n").arg(name)));
+        ASSERT_TRUE(llrawproc.contains(QStringLiteral("InterlockedExchangePointer(&%1, (PVOID)").arg(name)));
+        ASSERT_TRUE(llrawproc.contains(QStringLiteral("InterlockedCompareExchangePointer(\n        &%1, NULL, NULL)").arg(name))
+                    || llrawproc.contains(QStringLiteral("InterlockedCompareExchangePointer(&%1, NULL, NULL)").arg(name)));
+        ASSERT_EQ(2, (int)llrawproc.count(QStringLiteral("&%1").arg(name))); // two address-taken uses; a plain read has no & and is not counted
+        ASSERT_EQ(1, (int)llrawproc.count(QStringLiteral("%1 = ").arg(name))); // spaced `name = ` only; a no-space store is not counted
+        // r5 (CoS I5): with comments stripped, the name appears exactly 3 times - the declaration, one interlocked
+        // write and one interlocked read - and no other occurrence is a bare \bname\b without a leading &.
+        ASSERT_EQ(std::string(), slotPinViolations(llrawproc, name).toStdString());
+        ASSERT_TRUE(r4SlotPinHolds(llrawproc, name));
+        // A mention in a comment is not an access: the stripped count is unchanged by one.
+        ASSERT_EQ(std::string(), slotPinViolations(llrawproc + QStringLiteral("\n/* %1 = x; */\n// if(!%1) return;\n").arg(name),
+                                                   name).toStdString());
+    }
+    // r5 RED rows (the CoS I5 reproduction, 6228586737). Each mutant passes the r4 pin (r4SlotPinHolds stays true, so
+    // f1115c6c could not see it) and the r5 pin reports it by line.
+    const QString classifier = QStringLiteral("g_llrawproc_gpu_device_loss_classifier");
+    const QString classifierWrite =
+        QStringLiteral("    InterlockedExchangePointer(&g_llrawproc_gpu_device_loss_classifier, (PVOID)classifier);\n");
+    const QString classifierRead =
+        QStringLiteral("InterlockedCompareExchangePointer(&g_llrawproc_gpu_device_loss_classifier, NULL, NULL)");
+    const struct { QString from; QString to; QString added; } slotMutants[] = {
+        // CoS mutant 1: a plain read of the slot.
+        {QStringLiteral("    if(!classifier) return;\n"),
+         QStringLiteral("    if(!g_llrawproc_gpu_device_loss_classifier) return;\n"),
+         QStringLiteral("if(!g_llrawproc_gpu_device_loss_classifier) return;")},
+        // CoS mutant 2: a plain store with no spaces around '=', next to the interlocked write.
+        {classifierWrite, classifierWrite + QStringLiteral("    g_llrawproc_gpu_device_loss_classifier=(PVOID)c;\n"),
+         QStringLiteral("g_llrawproc_gpu_device_loss_classifier=(PVOID)c;")}};
+    for (const auto & m : slotMutants)
+    {
+        const QString mutant = replacedOnce(llrawproc, m.from, m.to);
+        const int line = mutant.left(mutant.indexOf(m.added)).count(QLatin1Char('\n')) + 1;
+        ASSERT_TRUE(r4SlotPinHolds(mutant, classifier));
+        ASSERT_EQ(QStringLiteral("4 occurrences, not 3; bare llrawproc.c:%1").arg(line).toStdString(),
+                  slotPinViolations(mutant, classifier).toStdString());
+    }
+    // ...and the interlocked read swapped for a plain read keeps the count at 3: the r5 pin still reports it (the r4
+    // pin does too, by its & count), so the count alone is not what carries the pin.
+    const QString swappedRead = replacedOnce(llrawproc, classifierRead, classifier);
+    ASSERT_FALSE(r4SlotPinHolds(swappedRead, classifier));
+    ASSERT_EQ(QStringLiteral("0 interlocked reads, not 1; bare llrawproc.c:%1")
+                  .arg(swappedRead.left(swappedRead.indexOf(QStringLiteral("(llrpGpuDeviceLossClassifier_t)\n        ") + classifier))
+                           .count(QLatin1Char('\n')) + 2).toStdString(),
+              slotPinViolations(swappedRead, classifier).toStdString());
 }
 
 // r6: every AMaZE run reads the flag again after its telemetry entry, which can deliver an orphan device-loss
