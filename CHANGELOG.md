@@ -61,3 +61,23 @@ maintained in this format.
     `MLVAPP_PLAYBACK_ROUTE_PREWARM`, which still turns all of it off.
   - Playback smoke logs a `playback_smoke.first_present_split` line saying
     where the first frame's time went.
+- The first frame of Play on the CUDA playback route no longer pays for the
+  first GPU recon run (PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1).
+  - While paused, after the route warm, the paused frame is reconstructed
+    once on the GPU the same way Play's first frame is, and then debayered
+    into the kept textures. This sets up the recon (about 164 MB of buffers at
+    full resolution, plus the LUT upload) before Play instead of on its first
+    frame. Nothing is shown and nothing is cached. The GPU memory is now held
+    from that point instead of from Play: about 200 MB at full resolution,
+    about a quarter of that at half and a sixteenth at quarter.
+  - Any other render, decode or recon work goes first. A warm that finds work
+    pending is skipped and tried again 0.5 s later (for up to 30 s). A warm
+    that is already running when Play starts finishes first, so that Play
+    waits for at most one recon run.
+  - `MLVAPP_PLAYBACK_RECON_WARM_RUN` (default on, same values as
+    `MLVAPP_PLAYBACK_ROUTE_PREWARM`) turns it off.
+    `MLVAPP_PLAYBACK_ROUTE_PREWARM=0` still turns everything off.
+  - Playback logs one `playback_recon_warm` line per warm. The
+    `first_present_split` line adds `warm_run`, `set_clip_at_play` and
+    `set_luts_at_play`, and a new `playback_smoke.render_first_split` line
+    splits the first render into decode, llrawproc and the rest.

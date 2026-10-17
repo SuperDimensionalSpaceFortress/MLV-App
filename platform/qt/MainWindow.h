@@ -39,6 +39,7 @@
 #include "PlaybackStartupSplit.h"
 #include "PlaybackFirstPresentIdentity.h"
 #include "PlaybackRoutePrewarmPolicy.h"
+#include "PlaybackReconWarmRunPolicy.h"
 #include "../../src/mlv_include.h"
 #include "InfoDialog.h"
 #include "StatusDialog.h"
@@ -1686,6 +1687,16 @@ private:
     quint64 m_playbackRoutePrewarmClipGeneration = 0;
     // PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-SETUP-1 Row B: this clip's prewarm loaded the recon backend (first_present_split)
     bool m_playbackReconBackendPreloaded = false;
+    // PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1 Row W (PlaybackReconWarmRunPolicy.h): after the prewarm, ONE paused recon
+    // warm run per clip on the recon worker; a skip for real work pending is re-posted kRepostDelayMs later.
+    void postPlaybackReconWarm( quint64 clipGeneration );
+    void onPlaybackReconWarmDone( const RenderFrameThread::PlaybackReconWarmDone &done );
+    void schedulePlaybackReconWarmRepost( playback_recon_warm_run::Reason reason, quint64 clipGeneration );
+    bool m_playbackReconWarmPrewarmRan = false;   // this clip's route prewarm decided Run
+    int m_playbackReconWarmScale = 1;             // the Play-time scale the prewarm sized for
+    int m_playbackReconWarmPosts = 0;             // posts this clip (PlaybackReconWarmRunPolicy.h kMaxPosts)
+    bool m_playbackReconWarmRepostArmed = false;  // a re-post timer is pending
+    bool m_playbackReconWarmRan = false;          // first_present_split warm_run
     void writeFirstPresentIdentity( const QString &dir, int startPosition );
     // --gui-smoke-playback only (CUDA-PERF-PLAYBACK-FOREGROUND-1): forces the main window
     // and the GPU display window to the OS foreground and verifies with

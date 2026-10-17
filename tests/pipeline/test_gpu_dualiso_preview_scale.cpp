@@ -45,6 +45,7 @@
 #include "../../src/debayer/debayer.h"
 #include "../../src/processing/playback_downsample.h"
 #include "../../platform/qt/PlaybackScaling.h"
+#include "../../platform/qt/PlaybackReconWarmRun.h"
 
 #include <QDir>
 
@@ -2451,4 +2452,195 @@ TEST(CpuDualIsoPreviewScale, ReducedIsoNotchFlagOnlyOnTheCpuRoute)
     applyLLRawProcObjectWorker(fixture.video(), full.data(), full.size() * sizeof(uint16_t), &worker.state, 0);
     std::printf("[gpu-dualiso-preview-scale] notch flag: full-res worker recon sha256 %s\n",
                 sha256_bytes(full.data(), full.size() * sizeof(uint16_t)).c_str());
+}
+
+// PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1 Row W (T2): the paused recon warm run (PlaybackReconWarmRun.h, the code the
+// recon worker runs) pays the first set_clip / set_luts, so a Play-shaped frame-0 run on the SAME llrawproc worker
+// state configures nothing; its retained output is released to zero outstanding; the thread's last-run state is put
+// back; and a Play run at other dims afterwards is not refused (the token was released, so no CLIP_DIMS_BUSY).
+namespace {
+
+// What the recon worker does for a Play texture-route frame at x1 (RenderFrameThread::reconFrameForWorker):
+// the three thread opt-ins, the frame id, then the llrawproc call on ITS worker state.
+llrpGpuPlaybackRetainedDeviceBayer16_t playShapedX1Run(MlvPipelineFixture & fixture, uint64_t frame,
+                                                       llrawprocWorkerState_t * worker)
+{
+    llrpGpuPlaybackRetainedDeviceBayer16_t device;
+    std::memset(&device, 0, sizeof(device));
+    std::vector<uint16_t> raw = decodeRaw(fixture, frame);
+    if (raw.empty()) return device;
+    const TextureRouteThreadOptIn optIn;
+    mlv_pipeline_capture_set_current_frame(frame);
+    applyLLRawProcObjectWorker(fixture.video(), raw.data(), raw.size() * sizeof(uint16_t), worker, 0);
+    if (!llrpGpuPlaybackReconGetLastRetainedDeviceBayer16(&device)) std::memset(&device, 0, sizeof(device));
+    return device;
+}
+
+} // namespace
+
+TEST(GpuPlaybackReconWarmRun, TheWarmPaysTheFirstSetClipAndSetLutsSoAPlayRunOnTheSameWorkerConfiguresNothing)
+{
+    GpuReconEnv env(true);
+    MlvPipelineFixture fixture;
+    ASSERT_TRUE(openGpuEligibleFixture(fixture));
+    ASSERT_FALSE(fixture.renderFrame8(0).empty());
+    const FakeGpuBackendScope fake;
+    WorkerState reconWorker;
+    std::vector<uint16_t> raw;
+    std::vector<uint16_t> reduced;
+
+    const uint64_t setClipStart = llrpGpuPlaybackReconSetClipCount();
+    const uint64_t setLutsStart = llrpGpuPlaybackReconSetLutsCount();
+    const playback_recon_warm_run::Outcome warm = playback_recon_warm_run::run(
+        fixture.video(), 1, 1, fixture.width(), fixture.height(), &reconWorker.state, 1, raw, reduced);
+    std::printf("[gpu-recon-warm] warm ran=%d reason=%s set_clip_calls=%llu set_luts_calls=%llu rc=%d %dx%d\n",
+                warm.ran ? 1 : 0, playback_recon_warm_run::reasonName(warm.reason),
+                static_cast<unsigned long long>(warm.setClipCalls), static_cast<unsigned long long>(warm.setLutsCalls),
+                warm.backendRc, warm.width, warm.height);
+    ASSERT_TRUE(warm.ran);
+    ASSERT_TRUE(playback_recon_warm_run::Reason::None == warm.reason);
+    ASSERT_NE(0u, warm.retained.token);
+    ASSERT_EQ(fixture.width(), warm.width);
+    ASSERT_EQ(fixture.height(), warm.height);
+    // the warm configured the fresh backend: the first set_clip and set_luts are its
+    ASSERT_EQ(1u, warm.setClipCalls);
+    ASSERT_EQ(1u, warm.setLutsCalls);
+    ASSERT_EQ(setClipStart + 1, llrpGpuPlaybackReconSetClipCount());
+    ASSERT_EQ(setLutsStart + 1, llrpGpuPlaybackReconSetLutsCount());
+    ASSERT_EQ(1, llrpGpuPlaybackReconRetainedOutstandingCount());
+
+    // the thread's last-run state was empty before the warm and is empty again: nothing can consume its output
+    llrpGpuPlaybackRetainedDeviceBayer16_t leaked;
+    std::memset(&leaked, 0, sizeof(leaked));
+    ASSERT_EQ(0, llrpGpuPlaybackReconGetLastRetainedDeviceBayer16(&leaked) && leaked.valid ? 1 : 0);
+    llrpGpuPlaybackReconState_t leakedState = {};
+    ASSERT_EQ(0, llrpGpuPlaybackReconGetLastPreparedState(&leakedState) && leakedState.valid ? 1 : 0);
+
+    // the GUI releases the token: nothing outstanding
+    ASSERT_NE(0, llrpGpuPlaybackReconReleaseRetainedDeviceBayer16(warm.retained.token));
+    ASSERT_EQ(0, llrpGpuPlaybackReconRetainedOutstandingCount());
+
+    // Play frame 0 at the same state, on the same worker: neither count moves
+    const uint64_t setClipBeforePlay = llrpGpuPlaybackReconSetClipCount();
+    const uint64_t setLutsBeforePlay = llrpGpuPlaybackReconSetLutsCount();
+    const llrpGpuPlaybackRetainedDeviceBayer16_t play = playShapedX1Run(fixture, 1, &reconWorker.state);
+    ASSERT_NE(0, play.valid);
+    ASSERT_EQ(setClipBeforePlay, llrpGpuPlaybackReconSetClipCount());
+    ASSERT_EQ(setLutsBeforePlay, llrpGpuPlaybackReconSetLutsCount());
+    ASSERT_NE(0, llrpGpuPlaybackReconReleaseRetainedDeviceBayer16(play.token));
+    ASSERT_EQ(0, llrpGpuPlaybackReconRetainedOutstandingCount());
+    ASSERT_EQ(0, llrpFakeGpuBackendFreedInUseRetainedForTesting());
+}
+
+// Why the warm runs on the recon worker: the set_luts key holds the worker's own LUT scratch pointers, so the same
+// frame on ANOTHER worker state configures the LUTs again. (A warm on the render thread would have left set_luts to
+// Play.)
+TEST(GpuPlaybackReconWarmRun, AWarmOnAnotherWorkerStateLeavesSetLutsToPlay)
+{
+    GpuReconEnv env(true);
+    MlvPipelineFixture fixture;
+    ASSERT_TRUE(openGpuEligibleFixture(fixture));
+    ASSERT_FALSE(fixture.renderFrame8(0).empty());
+    const FakeGpuBackendScope fake;
+    WorkerState otherWorker;
+    WorkerState reconWorker;
+    std::vector<uint16_t> raw;
+    std::vector<uint16_t> reduced;
+    const playback_recon_warm_run::Outcome warm = playback_recon_warm_run::run(
+        fixture.video(), 1, 1, fixture.width(), fixture.height(), &otherWorker.state, 1, raw, reduced);
+    ASSERT_TRUE(warm.ran);
+    ASSERT_NE(0, llrpGpuPlaybackReconReleaseRetainedDeviceBayer16(warm.retained.token));
+    const uint64_t setClipBeforePlay = llrpGpuPlaybackReconSetClipCount();
+    const uint64_t setLutsBeforePlay = llrpGpuPlaybackReconSetLutsCount();
+    const llrpGpuPlaybackRetainedDeviceBayer16_t play = playShapedX1Run(fixture, 1, &reconWorker.state);
+    ASSERT_NE(0, play.valid);
+    std::printf("[gpu-recon-warm] other worker: play set_clip_calls=%llu set_luts_calls=%llu\n",
+                static_cast<unsigned long long>(llrpGpuPlaybackReconSetClipCount() - setClipBeforePlay),
+                static_cast<unsigned long long>(llrpGpuPlaybackReconSetLutsCount() - setLutsBeforePlay));
+    ASSERT_EQ(setClipBeforePlay, llrpGpuPlaybackReconSetClipCount());   // the clip key is worker-independent
+    ASSERT_EQ(setLutsBeforePlay + 1, llrpGpuPlaybackReconSetLutsCount());
+    ASSERT_NE(0, llrpGpuPlaybackReconReleaseRetainedDeviceBayer16(play.token));
+    ASSERT_EQ(0, llrpGpuPlaybackReconRetainedOutstandingCount());
+}
+
+TEST(GpuPlaybackReconWarmRun, APlayRunAtOtherDimsAfterTheWarmIsNotRefused)
+{
+    GpuReconEnv env(true);
+    MlvPipelineFixture fixture;
+    ASSERT_TRUE(openGpuEligibleFixture(fixture));
+    ASSERT_FALSE(fixture.renderFrame8(0).empty());
+    const FakeGpuBackendScope fake;
+    WorkerState reconWorker;
+    std::vector<uint16_t> raw;
+    std::vector<uint16_t> reduced;
+    // a warm at x1 (full dims), released
+    const playback_recon_warm_run::Outcome warm = playback_recon_warm_run::run(
+        fixture.video(), 1, 1, fixture.width(), fixture.height(), &reconWorker.state, 1, raw, reduced);
+    ASSERT_TRUE(warm.ran);
+    ASSERT_NE(0, llrpGpuPlaybackReconReleaseRetainedDeviceBayer16(warm.retained.token));
+    ASSERT_EQ(0, llrpGpuPlaybackReconRetainedOutstandingCount());
+    // the scale changed while paused: Play runs the reduced route at other dims, set_clip "dims", and is not refused
+    const uint64_t refusalsBefore = llrpGpuPlaybackReconClipDimsChangeRefusals();
+    const uint64_t setClipBefore = llrpGpuPlaybackReconSetClipCount();
+    GpuReducedFrame frame;
+    ASSERT_TRUE(gpuReducedFrame(fixture, 1, 2, &frame));
+    ASSERT_EQ(frame.plan.reducedWidth, frame.device.width);
+    ASSERT_EQ(refusalsBefore, llrpGpuPlaybackReconClipDimsChangeRefusals());
+    ASSERT_EQ(setClipBefore + 1, llrpGpuPlaybackReconSetClipCount());
+    ASSERT_EQ(0, llrpGpuPlaybackReconRetainedOutstandingCount());
+    ASSERT_EQ(0, llrpFakeGpuBackendFreedInUseRetainedForTesting());
+}
+
+TEST(GpuPlaybackReconWarmRun, TheWarmPutsBackTheThreadsLastRunState)
+{
+    GpuReconEnv env(true);
+    MlvPipelineFixture fixture;
+    ASSERT_TRUE(openGpuEligibleFixture(fixture));
+    ASSERT_FALSE(fixture.renderFrame8(0).empty());
+    const FakeGpuBackendScope fake;
+    WorkerState reconWorker;
+    // a real frame's run left its retained output and prepared state on this thread
+    const llrpGpuPlaybackRetainedDeviceBayer16_t before = playShapedX1Run(fixture, 1, &reconWorker.state);
+    ASSERT_NE(0, before.valid);
+    llrpGpuPlaybackReconState_t preparedBefore = {};
+    ASSERT_NE(0, llrpGpuPlaybackReconGetLastPreparedState(&preparedBefore));
+    std::vector<uint16_t> raw;
+    std::vector<uint16_t> reduced;
+    const playback_recon_warm_run::Outcome warm = playback_recon_warm_run::run(
+        fixture.video(), 2, 1, fixture.width(), fixture.height(), &reconWorker.state, 1, raw, reduced);
+    ASSERT_TRUE(warm.ran);
+    ASSERT_NE(before.token, warm.retained.token);
+    // the thread reads the real frame's values again, never the warm's
+    llrpGpuPlaybackRetainedDeviceBayer16_t after;
+    std::memset(&after, 0, sizeof(after));
+    ASSERT_NE(0, llrpGpuPlaybackReconGetLastRetainedDeviceBayer16(&after));
+    ASSERT_EQ(before.token, after.token);
+    ASSERT_TRUE(before.device_bayer16 == after.device_bayer16);
+    llrpGpuPlaybackReconState_t preparedAfter = {};
+    ASSERT_NE(0, llrpGpuPlaybackReconGetLastPreparedState(&preparedAfter));
+    ASSERT_EQ(preparedBefore.width, preparedAfter.width);
+    ASSERT_EQ(preparedBefore.height, preparedAfter.height);
+    ASSERT_NE(0, llrpGpuPlaybackReconReleaseRetainedDeviceBayer16(warm.retained.token));
+    ASSERT_NE(0, llrpGpuPlaybackReconReleaseRetainedDeviceBayer16(before.token));
+    ASSERT_EQ(0, llrpGpuPlaybackReconRetainedOutstandingCount());
+}
+
+TEST(GpuPlaybackReconWarmRun, WithoutTheGpuPlaybackReconNothingIsRetainedOrConfigured)
+{
+    GpuReconEnv env(false);   // MLVAPP_GPU_PLAYBACK_RECON unset: the recon is the CPU one
+    MlvPipelineFixture fixture;
+    ASSERT_TRUE(openGpuEligibleFixture(fixture));
+    ASSERT_FALSE(fixture.renderFrame8(0).empty());
+    const FakeGpuBackendScope fake;
+    WorkerState reconWorker;
+    std::vector<uint16_t> raw;
+    std::vector<uint16_t> reduced;
+    const uint64_t setClipBefore = llrpGpuPlaybackReconSetClipCount();
+    const playback_recon_warm_run::Outcome warm = playback_recon_warm_run::run(
+        fixture.video(), 1, 1, fixture.width(), fixture.height(), &reconWorker.state, 1, raw, reduced);
+    ASSERT_FALSE(warm.ran);
+    ASSERT_TRUE(playback_recon_warm_run::Reason::ReconNotRetained == warm.reason);
+    ASSERT_EQ(0u, warm.retained.token);
+    ASSERT_EQ(setClipBefore, llrpGpuPlaybackReconSetClipCount());
+    ASSERT_EQ(0, llrpGpuPlaybackReconRetainedOutstandingCount());
 }

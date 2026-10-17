@@ -19,6 +19,13 @@
  *   playback_smoke.first_present_split session=N slot=<adopted|realloc|discarded|kept|none> handoff=<mode>
  *   setup_program_ms= setup_lut_ms= setup_blur_ms= setup_realloc_ms= setup_sampling_ms= recon_wall_ms=
  *   amaze_kernel_ms= amaze_download_ms= paint_ms= gui_pickup_ms= backend_preloaded=<0|1>
+ *   warm_run=<0|1> set_clip_at_play=<n> set_luts_at_play=<n>
+ *
+ * PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1 Row 0: warm_run says this clip's paused recon warm run retained an output;
+ * set_clip_at_play / set_luts_at_play count the session's GPU recon set_clip / set_luts calls up to the first present
+ * (0 when the warm absorbed them). And render_first split from the first frame's existing stage timers (NA where a part
+ * has none; other = render_first minus the timed parts):
+ *   playback_smoke.render_first_split session=N render_first_ms= decode_ms= llrawproc_ms= recon_run_ms=NA other_ms=
  */
 
 #ifndef PLAYBACKSTARTUPSPLIT_H
@@ -91,6 +98,10 @@ struct FirstPresentSplit
     double paintMs = 0.0;
     double guiPickupMs = 0.0;
     bool backendPreloaded = false;
+    // PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1 Row 0
+    bool warmRun = false;
+    long long setClipAtPlay = 0;
+    long long setLutsAtPlay = 0;
 
     QString line( unsigned long long session ) const
     {
@@ -109,7 +120,44 @@ struct FirstPresentSplit
              + QStringLiteral( " amaze_download_ms=" ) + ms( amazeDownloadMs )
              + QStringLiteral( " paint_ms=" ) + ms( paintMs )
              + QStringLiteral( " gui_pickup_ms=" ) + ms( guiPickupMs )
-             + QStringLiteral( " backend_preloaded=" ) + ( backendPreloaded ? QStringLiteral( "1" ) : QStringLiteral( "0" ) );
+             + QStringLiteral( " backend_preloaded=" ) + ( backendPreloaded ? QStringLiteral( "1" ) : QStringLiteral( "0" ) )
+             + QStringLiteral( " warm_run=" ) + ( warmRun ? QStringLiteral( "1" ) : QStringLiteral( "0" ) )
+             + QStringLiteral( " set_clip_at_play=" ) + QString::number( setClipAtPlay )
+             + QStringLiteral( " set_luts_at_play=" ) + QString::number( setLutsAtPlay );
+    }
+};
+
+/*! PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1 Row 0: the first measured frame's render_first, split by the stage timers
+ *  it already carries (raw_uint16_ms for the decode, llrawproc_total_ms for the recon worker's llrawproc call, which
+ *  holds the GPU recon run). A part without a timer prints NA; other is render_first minus the parts that have one. */
+struct RenderFirstSplit
+{
+    double renderFirstMs = 0.0;
+    bool hasDecode = false;
+    double decodeMs = 0.0;
+    bool hasLlrawproc = false;
+    double llrawprocMs = 0.0;
+    bool hasReconRun = false;     // no per-frame timer today: the run is inside llrawproc_ms
+    double reconRunMs = 0.0;
+
+    double otherMs() const
+    {
+        double rest = renderFirstMs;
+        if( hasDecode ) rest -= decodeMs;
+        if( hasLlrawproc ) rest -= llrawprocMs;
+        else if( hasReconRun ) rest -= reconRunMs;
+        return rest > 0.0 ? rest : 0.0;
+    }
+
+    QString line( unsigned long long session ) const
+    {
+        const auto ms = []( bool has, double value ) { return has ? QString::number( value, 'f', 3 ) : QStringLiteral( "NA" ); };
+        return QStringLiteral( "playback_smoke.render_first_split session=" ) + QString::number( session )
+             + QStringLiteral( " render_first_ms=" ) + ms( true, renderFirstMs )
+             + QStringLiteral( " decode_ms=" ) + ms( hasDecode, decodeMs )
+             + QStringLiteral( " llrawproc_ms=" ) + ms( hasLlrawproc, llrawprocMs )
+             + QStringLiteral( " recon_run_ms=" ) + ms( hasReconRun, reconRunMs )
+             + QStringLiteral( " other_ms=" ) + ms( true, otherMs() );
     }
 };
 
@@ -176,6 +224,11 @@ public:
     void noteFirstPresentSplit( const FirstPresentSplit &split ) { m_firstPresentSplit = split; }
     const FirstPresentSplit &firstPresentSplit() const { return m_firstPresentSplit; }
     QString firstPresentLine( unsigned long long session ) const { return m_firstPresentSplit.line( session ); }
+
+    /*! PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1 Row 0: the first frame's render_first parts (reset with the rest). */
+    void noteRenderFirstSplit( const RenderFirstSplit &split ) { m_renderFirstSplit = split; }
+    const RenderFirstSplit &renderFirstSplit() const { return m_renderFirstSplit; }
+    QString renderFirstLine( unsigned long long session ) const { return m_renderFirstSplit.line( session ); }
 
     double playToRequestMs() const { return m_playToRequestMs < 0.0 ? 0.0 : m_playToRequestMs; }
     double renderFirstMs() const { return m_renderFirstMs; }
@@ -245,6 +298,7 @@ private:
     double m_audioPlayMs = 0.0;
     double m_finishStepMs[StepCount] = {};
     FirstPresentSplit m_firstPresentSplit;
+    RenderFirstSplit m_renderFirstSplit;
     std::vector<double> m_laterRender;
     std::vector<double> m_laterGuiPresent;
 };

@@ -557,6 +557,98 @@ void GpuDisplayWindow::releaseStagedPlaybackReconSlotIfActive()
     win->releaseStagedReconSlot();
 }
 
+bool GpuDisplayWindow::warmStagedReconSlotFromDeviceBayer16IfActive(const uint16_t *deviceBayer16,
+                                                                    int width,
+                                                                    int height,
+                                                                    int blackLevel,
+                                                                    const double wbMultipliers[3],
+                                                                    bool reducedHnyquist,
+                                                                    double *kernelMs,
+                                                                    QString *reason)
+{
+    if ( kernelMs ) *kernelMs = 0.0;
+    GpuDisplayWindow *win = nullptr;
+    {
+        QMutexLocker lock(&g_activeMutex);
+        win = g_activeWindow.load(std::memory_order_acquire);
+        if ( !win )
+        {
+            if ( reason ) *reason = QStringLiteral("no_active_window");
+            return false;
+        }
+        if ( QThread::currentThread() != win->thread() )
+        {
+            if ( reason ) *reason = QStringLiteral("not_gui_thread");
+            return false;
+        }
+    }
+    // like the prewarm: GUI thread, no g_activeMutex (the window is only destroyed on this thread)
+    return win->warmStagedReconSlotFromDeviceBayer16(deviceBayer16, width, height, blackLevel, wbMultipliers,
+                                                     reducedHnyquist, kernelMs, reason);
+}
+
+/* PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1 Row W: the first recon present's AMaZE call (device Bayer16 -> RGBA16, the
+ * retained-device branch of setPresentedGpuPlaybackReconAmazePostWbTexture), run while paused into the staged output
+ * the first Play-present adopts. The staged pair stays staged; m_texture, m_gpuReconSourceTexture and the pending
+ * frame are untouched and nothing is painted, so what the window shows is unchanged. */
+bool GpuDisplayWindow::warmStagedReconSlotFromDeviceBayer16(const uint16_t *deviceBayer16,
+                                                            int width,
+                                                            int height,
+                                                            int blackLevel,
+                                                            const double wbMultipliers[3],
+                                                            bool reducedHnyquist,
+                                                            double *kernelMs,
+                                                            QString *reason)
+{
+    if ( !deviceBayer16 || width <= 0 || height <= 0 )
+    {
+        if ( reason ) *reason = QStringLiteral("no_device_output");
+        return false;
+    }
+    // a window/fullscreen toggle or context loss freed the staged pair (cleanupGLResources): nothing to warm into
+    if ( !m_stagedReconOutput || !m_stagedReconSource )
+    {
+        if ( reason ) *reason = QStringLiteral("no_staged_slot");
+        return false;
+    }
+    if ( m_stagedReconWidth != width || m_stagedReconHeight != height )
+    {
+        if ( reason ) *reason = QStringLiteral("staged_slot_size_mismatch");
+        return false;
+    }
+    QOpenGLContext *glContext = context();
+    if ( !glContext || !isValid() )
+    {
+        if ( reason ) *reason = QStringLiteral("no_gl_context");
+        return false;
+    }
+    // the present would refuse this too (playbackReducedHnyquistPresentRefused)
+    if ( reducedHnyquist && !gpuAmazeDebayerReducedHnyquistAvailable() )
+    {
+        if ( reason ) *reason = gpuAmazeDebayerReducedHnyquistMissingReason();
+        return false;
+    }
+    const bool needsCurrent = QOpenGLContext::currentContext() != glContext;
+    if ( needsCurrent ) makeCurrent();
+    GpuAmazeDebayerBackendTiming timing;
+    QString amazeReason;
+    const bool amazeOk =
+        gpuAmazeDebayerRenderPostWbGlTextureFromDeviceBayer16(deviceBayer16,
+                                                              m_stagedReconOutput->textureId(),
+                                                              width,
+                                                              height,
+                                                              blackLevel,
+                                                              wbMultipliers,
+                                                              &amazeReason,
+                                                              nullptr,
+                                                              &timing,
+                                                              reducedHnyquist);
+    if ( needsCurrent ) doneCurrent();
+    if ( kernelMs && amazeOk && timing.available ) *kernelMs = timing.kernelMs;
+    if ( reason ) *reason = amazeReason;
+    return amazeOk;
+}
+
 /* PLAYBACK-STARTUP-WAIT-PREWARM-1 Row B: pay the texture route's one-time setup while paused. Compiles the
  * preview-processing program the route draws with, and runs AMaZE once at the playback size from a temporary R16
  * texture into a temporary RGBA16 texture -- loading its kernels and sizing its live device buffers (which stay

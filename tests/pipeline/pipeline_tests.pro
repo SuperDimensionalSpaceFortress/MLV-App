@@ -161,6 +161,8 @@ HEADERS += \
     $$REPO_ROOT/platform/qt/GpuPreviewProcessing.h \
     $$REPO_ROOT/platform/qt/PlaybackPrepCpuRoute.h \
     $$REPO_ROOT/platform/qt/GpuPreviewHostRoute.h \
+    $$REPO_ROOT/platform/qt/PlaybackReconWarmRunPolicy.h \
+    $$REPO_ROOT/platform/qt/PlaybackReconWarmRun.h \
     $$REPO_ROOT/tests/pipeline/ojph_decoder_test_stub.h \
     $$REPO_ROOT/tests/pipeline/mlv_pipeline_fixture.h \
     $$REPO_ROOT/tests/pipeline/dualiso_mesh_metrics.h \

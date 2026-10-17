@@ -279,6 +279,16 @@ int llrpGpuPlaybackReconGetBackendInfoWithin(llrpGpuPlaybackReconBackendInfo_t *
  * clip or LUTs and never runs. 1 when the backend is available; load_ms (may be NULL) receives the call's wall
  * time. Always 0 in a build without the GPU recon loader. */
 int llrpGpuPlaybackReconPreloadBackend(double * load_ms);
+/* PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1: the paused recon warm run (platform/qt/PlaybackReconWarmRun.h) runs the
+ * Play frame-0 prepare-only recon on the recon worker thread. Save moves this thread's last-run playback recon state
+ * (what the llrpGpuPlaybackReconGetLast* calls return) aside and leaves it empty; Restore drops what the warm left and
+ * puts the saved state back, so nothing on the thread can read the warm's prepared state or retained output. Save
+ * returns an opaque heap snapshot (NULL when it cannot allocate: the warm then skips); Restore frees it. */
+void * llrpGpuPlaybackReconSaveLastRunState(void);
+void llrpGpuPlaybackReconRestoreLastRunState(void * snapshot);
+/* The calling thread's last recon run's set_clip / set_luts wall time (0 when that run needed neither). */
+double llrpGpuPlaybackReconLastSetClipMilliseconds(void);
+double llrpGpuPlaybackReconLastSetLutsMilliseconds(void);
 int llrpGpuPlaybackReconPreuploadFrame(uint64_t frame_id,
                                       const uint16_t * raw_input_bayer14,
                                       size_t raw_image_size);

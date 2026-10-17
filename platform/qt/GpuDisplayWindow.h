@@ -100,6 +100,19 @@ public:
      * delete) when one is held -- on clip close and before a prewarm is re-armed. GUI-thread only; a no-op without an
      * active window or a staged pair. */
     static void releaseStagedPlaybackReconSlotIfActive(void);
+    /* PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1 Row W: run the first recon present's AMaZE (device Bayer16 -> RGBA16)
+     * from the paused warm run's retained output into the staged slot's output texture, so Play's first AMaZE is not
+     * the first on the device path. Only when a staged pair exists at exactly width x height; never assigns m_texture
+     * or m_gpuReconSourceTexture and never paints. GUI-thread only; the caller still owns (and releases) the token.
+     * kernelMs gets the AMaZE kernel time when it ran; false with reason when it did not. */
+    static bool warmStagedReconSlotFromDeviceBayer16IfActive(const uint16_t *deviceBayer16,
+                                                             int width,
+                                                             int height,
+                                                             int blackLevel,
+                                                             const double wbMultipliers[3],
+                                                             bool reducedHnyquist,
+                                                             double *kernelMs,
+                                                             QString *reason);
     static bool readGpuReconSourceBayer16TextureIfActive(QByteArray *textureBytes,
                                                         int *width,
                                                         int *height,
@@ -244,6 +257,15 @@ private:
     void destroyTexture(void);
     /* Row A: free the staged pair, unregistering both runtimes' CUDA-GL caches first (reset before delete). */
     void releaseStagedReconSlot(void);
+    /* Row W: the member half of warmStagedReconSlotFromDeviceBayer16IfActive. */
+    bool warmStagedReconSlotFromDeviceBayer16(const uint16_t *deviceBayer16,
+                                              int width,
+                                              int height,
+                                              int blackLevel,
+                                              const double wbMultipliers[3],
+                                              bool reducedHnyquist,
+                                              double *kernelMs,
+                                              QString *reason);
     void applySamplingMode(GpuDisplayViewport::SamplingMode samplingMode);
     /* Releases every context-bound processing resource (passthrough program, shared
      * preview-processing program, LUT texture set) so the next present rebuilds them
