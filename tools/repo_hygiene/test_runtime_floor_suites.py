@@ -296,5 +296,28 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(0, code, out)
 
 
+class ChangedFilesPathTests(unittest.TestCase):
+    """DG-GIT-PATHLIST: git quotes/escapes a special path in --name-only output unless -z is used, and the text
+    decode of a non-ASCII name is locale-dependent; the runner must hand back the REAL path so a row can match it."""
+
+    def test_non_ascii_and_spaced_paths_come_back_real_and_map_to_their_row(self):
+        committed = "tools/coordination/café tool.ps1"
+        uncommitted = "tools/coordination/naïve tool.ps1"
+        names = [committed, uncommitted]
+        if sys.platform != "win32":
+            quoted = 'tools/coordination/say "hi" \\ tool.ps1'
+            names.append(quoted)
+        data = manifest_of(row("coord", ["tools/coordination/*.ps1"], [], []))
+        repo = FixtureRepo(self, data, {uncommitted: PORTABLE}, {name: PORTABLE for name in names if name != uncommitted})
+        (repo.root / uncommitted).write_text(PORTABLE + "# edit\n", encoding="utf-8", newline="\n")
+        merge_base, changed = rfs.changed_files(repo.root, "base")
+        self.assertRegex(merge_base, r"^[0-9a-f]{40}$")
+        self.assertEqual(sorted(names), changed)
+        matched = rfs.match_rows(data, changed)
+        self.assertEqual([("coord", sorted(names))], [(r["id"], because) for r, because in matched])
+        plan = rfs.build_plan(matched, repo.root)
+        self.assertEqual([sorted(names)], [t["files"] for t in plan if t["kind"] == "row-note"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -212,15 +212,19 @@ def detect_runtime(runtime_id: str) -> dict:
 # --- git ----------------------------------------------------------------------------------------------------
 
 
-def _git(worktree: Path, *args: str) -> list[str]:
+def _git(worktree: Path, *args: str, nul: bool = False) -> list[str]:
+    """Output records, decoded as UTF-8. ``nul=True`` splits on NUL for a ``-z`` command, so a path holding a
+    quote, tab, newline or non-ASCII character is returned as written, never as a quoted escape string."""
     try:
         done = subprocess.run(["git", "-C", str(worktree), "-c", "core.quotepath=off", *args],
-                              capture_output=True, text=True, timeout=120)
+                              capture_output=True, timeout=120)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise Undecidable(f"git {' '.join(args)} could not run: {exc}") from exc
     if done.returncode != 0:
-        raise Undecidable(f"git {' '.join(args)} failed (exit {done.returncode}): {done.stderr.strip()[:200]}")
-    return [line for line in done.stdout.splitlines() if line]
+        raise Undecidable(f"git {' '.join(args)} failed (exit {done.returncode}): "
+                          f"{done.stderr.decode('utf-8', 'replace').strip()[:200]}")
+    out = done.stdout.decode("utf-8", "replace")
+    return [rec for rec in (out.split("\0") if nul else out.splitlines()) if rec]
 
 
 def changed_files(worktree: Path, base: str) -> tuple[str, list[str]]:
@@ -231,8 +235,8 @@ def changed_files(worktree: Path, base: str) -> tuple[str, list[str]]:
     merge_base = (_git(worktree, "merge-base", base, "HEAD") or [""])[0].strip()
     if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", merge_base):
         raise Undecidable(f"git merge-base returned a value that is not a commit sha: {merge_base!r}")
-    names = _git(worktree, "diff", "--name-only", "--no-renames", f"{merge_base}..HEAD")
-    names += _git(worktree, "diff", "--name-only", "--no-renames", "HEAD")
+    names = _git(worktree, "diff", "--name-only", "-z", "--no-renames", f"{merge_base}..HEAD", nul=True)
+    names += _git(worktree, "diff", "--name-only", "-z", "--no-renames", "HEAD", nul=True)
     return merge_base, sorted({n.replace("\\", "/") for n in names})
 
 
