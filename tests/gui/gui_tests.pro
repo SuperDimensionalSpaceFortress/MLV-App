@@ -30,6 +30,7 @@ SOURCES += \
 
 HEADERS += \
     $$REPO_ROOT/platform/qt/ColorToolButton.h \
+    $$REPO_ROOT/platform/qt/Debayered16ReconReusePolicy.h \
     $$REPO_ROOT/platform/qt/GpuDebayer.h \
     $$REPO_ROOT/platform/qt/GpuPreviewProcessing.h \
     $$REPO_ROOT/platform/qt/DualIsoPatternMapping.h \
