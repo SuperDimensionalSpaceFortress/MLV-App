@@ -9,13 +9,18 @@ credential prompt, a pager) would block the whole shard until the job cap killed
 Pinned here:
   * finding every leg spec costs git spawns LINEAR in the leg count (a blob is read once per process, whatever the number of lookups);
   * ``Invoke-DvGit`` returns a typed ``DV_GIT_TIMEOUT`` failure (exit -1, never an admission) when git does not return within the bound;
-  * ``Invoke-DvGit`` closes git's stdin and turns prompts and the pager off.
+  * ``Invoke-DvGit`` closes git's stdin and turns prompts and the pager off;
+  * (r2, CoS I1) a child that outlives git holding its output is killed and is a typed ``DV_GIT_PIPE_STRAGGLER`` failure (exit -1, no
+    partial bytes), never git's own exit code.
+The tests run wherever pwsh does (Windows and the ubuntu shards; CoS N2).
 """
 
 from __future__ import annotations
 
 import os
+import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -27,7 +32,10 @@ ROOT = Path(__file__).resolve().parents[2]
 MODULE = ROOT / "tools" / "profiling" / "dual-venue" / "DualVenueRunner.psm1"
 LEGS_REL = "tools/profiling/dual-venue/legs"
 PWSH = shutil.which("pwsh")
-requires_windows_pwsh = unittest.skipIf(PWSH is None or sys.platform != "win32", "needs pwsh on Windows")
+# r1: requires_windows_pwsh = unittest.skipIf(PWSH is None or sys.platform != "win32", "needs pwsh on Windows")
+# CoS N2: the tests pass on Linux pwsh too, so they also run on the ubuntu shards. The one skip left is the one they genuinely need: no pwsh.
+requires_pwsh = unittest.skipIf(PWSH is None, "needs pwsh on PATH (the module under test is PowerShell)")
+requires_windows_pwsh = requires_pwsh   # the r1 name, kept so nothing that imports it breaks; it no longer means Windows only
 PWSH_ARGS = ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass"]
 LEG_COUNT = 16
 
@@ -133,6 +141,60 @@ class GitCallsAreBoundedTests(unittest.TestCase):
         done = self.invoke_dv_git(self.make_repo(), "'-c', 'alias.dvenv=!echo T=$GIT_TERMINAL_PROMPT P=$GIT_PAGER', 'dvenv'",
                                   {"GIT_TERMINAL_PROMPT": "1", "GIT_PAGER": "more"})
         self.assertIn("OUT T=0 P=cat", done.stdout)
+
+    def test_a_child_that_outlives_git_holding_its_output_is_killed_and_fails_typed(self) -> None:
+        # CoS I1 (PR #472, comment 6227363745), reproduced: git exits 0 but a process it started still holds stdout open. On 76999ae4 the call
+        # returned git's own exit 0 with the partial bytes ("EXIT 0 OUT [partial]") after two unchecked 10 s waits, and the sleeper lived on.
+        before = _sleepers()
+        self.addCleanup(_kill_new_sleepers, before)
+        started = time.monotonic()
+        done = self.invoke_dv_git(self.make_repo(), "'-c', 'alias.dvs=!echo partial; sleep 60 & exit 0', 'dvs'", {"DV_GIT_TIMEOUT_SECONDS": "5"}, timeout=45)
+        self.assertIn("EXIT -1", done.stdout, "a straggler holding git's output must fail typed, never return git's exit code with partial bytes")
+        self.assertIn("DV_GIT_PIPE_STRAGGLER", done.stdout)
+        self.assertNotIn("partial", done.stdout.split("ERR ", 1)[0], "no partial bytes may be returned")
+        self.assertLess(time.monotonic() - started, 30, "the drain bound is the 5 s git bound; the call must not wait out the 60 s child")
+        deadline = time.monotonic() + 10
+        survivors = _sleepers() - before
+        while survivors and time.monotonic() < deadline:
+            time.sleep(0.5)
+            survivors = _sleepers() - before
+        self.assertEqual(survivors, set(), "the sleeper git started must be killed, not left running")
+
+
+_SLEEPER = re.compile(r'sleep(\.exe)?"?\s+60\s*$')
+
+
+def _sleepers() -> set[int]:
+    """Pids of the processes running `sleep 60` (the straggler of the alias above). Compared as a before/after set: other work on the host may
+    run its own sleeps, and only a NEW one is this test's."""
+    found: set[int] = set()
+    if sys.platform == "win32":
+        query = "Get-CimInstance Win32_Process -Filter \"Name='sleep.exe'\" | ForEach-Object { '' + $_.ProcessId + [char]9 + $_.CommandLine }"
+        out = subprocess.run([PWSH, *PWSH_ARGS, "-Command", query], capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL).stdout
+        for line in out.splitlines():
+            pid, _, cmd = line.partition("\t")
+            if pid.strip().isdigit() and _SLEEPER.search(cmd.strip()):
+                found.add(int(pid))
+        return found
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            argv = (entry / "cmdline").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        if len(argv) >= 2 and os.path.basename(argv[0]) in (b"sleep", b"sleep.exe") and argv[1] == b"60":
+            found.add(int(entry.name))
+    return found
+
+
+def _kill_new_sleepers(before: set[int]) -> None:
+    """Cleanup only (the assertion above is the check): a RED run must not leave its 60 s sleeper behind."""
+    for pid in _sleepers() - before:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":

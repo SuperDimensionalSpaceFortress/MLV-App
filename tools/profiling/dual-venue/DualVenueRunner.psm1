@@ -237,10 +237,52 @@ function Get-DvGitTimeoutMilliseconds {
     $seconds * 1000
 }
 
+$script:DvJobNative = $null
+$script:DvJobNativeTried = $false
+function Get-DvJobNative {
+    # Windows: four kernel32 job-object calls, emitted ONCE per process with Reflection.Emit (about 45 ms; Add-Type's compiler costs 0.5-0.9 s
+    # in every pwsh process, which every test process would pay). $null elsewhere, or when the emit fails: the caller then has Kill($true) only.
+    if (-not $IsWindows) { return $null }
+    if ($script:DvJobNativeTried) { return $script:DvJobNative }
+    $script:DvJobNativeTried = $true
+    try {
+        $asm = [Reflection.Emit.AssemblyBuilder]::DefineDynamicAssembly([Reflection.AssemblyName]::new('DvGitJob'), [Reflection.Emit.AssemblyBuilderAccess]::Run)
+        $tb = $asm.DefineDynamicModule('DvGitJob').DefineType('DvGitJobNative', 'Public, Class, Abstract, Sealed')
+        foreach ($s in @(@('CreateJobObjectW', [IntPtr], @([IntPtr], [IntPtr])), @('AssignProcessToJobObject', [bool], @([IntPtr], [IntPtr])),
+                         @('TerminateJobObject', [bool], @([IntPtr], [uint32])), @('CloseHandle', [bool], @([IntPtr])))) {
+            $m = $tb.DefinePInvokeMethod($s[0], 'kernel32.dll', 'Public, Static, PinvokeImpl', 'Standard', $s[1], [Type[]]$s[2], 'Winapi', 'Unicode')
+            $m.SetImplementationFlags('PreserveSig')
+        }
+        $script:DvJobNative = $tb.CreateType()
+    } catch { $script:DvJobNative = $null }
+    $script:DvJobNative
+}
+
+function Stop-DvGitCall {
+    # Kill everything one git call started, including a child whose own parent has already exited. No parent-pid chain leads back to git
+    # then (`sh -c 'x & exit 0'`: sh is gone, the background child is not), so Kill($true) alone misses it. The call's job object reaches it
+    # on Windows; on Linux its environment tag in /proc/<pid>/environ does (every child inherits the tag unless it scrubs its environment).
+    param([Parameter(Mandatory)]$Proc, [IntPtr]$Job, [string]$Tag)
+    try { $Proc.Kill($true) } catch { $null = $_ }
+    $native = Get-DvJobNative
+    if ($null -ne $native -and $Job -ne [IntPtr]::Zero) { [void]$native::TerminateJobObject($Job, [uint32]1) }
+    if ($IsLinux -and -not [string]::IsNullOrEmpty($Tag)) {
+        $needle = "`0DV_GIT_CALL_TAG=$Tag`0"
+        foreach ($dir in [IO.Directory]::GetDirectories('/proc')) {
+            $name = [IO.Path]::GetFileName($dir)
+            if ($name -notmatch '^\d{1,9}$' -or [int]$name -eq $PID) { continue }
+            try { $envText = "`0" + [Text.Encoding]::Latin1.GetString([IO.File]::ReadAllBytes("$dir/environ")) } catch { continue }
+            if ($envText.Contains($needle)) { try { [System.Diagnostics.Process]::GetProcessById([int]$name).Kill() } catch { $null = $_ } }
+        }
+    }
+}
+
 function Invoke-DvGit {
     # Run git in $RepoRoot; returns exit code, stdout BYTES (a blob must not be re-encoded or newline-translated) and stderr.
     # Bounded (Get-DvGitTimeoutMilliseconds): a git that does not return is killed with its children and reported as exit -1 with a
     # DV_GIT_TIMEOUT stderr, so the caller refuses typed instead of waiting out the CI job cap. git gets a closed stdin, no prompt and no pager.
+    # A git that exits while a process it started still holds its stdout/stderr open is killed the same way and is exit -1 with a
+    # DV_GIT_PIPE_STRAGGLER stderr: every bounded failure is exit -1 with a typed stderr, never git's exit code with partial bytes.
     param([Parameter(Mandatory)][string]$RepoRoot, [Parameter(Mandatory)][string[]]$GitArgs)
     $psi = [System.Diagnostics.ProcessStartInfo]::new('git')
     $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.RedirectStandardInput = $true; $psi.CreateNoWindow = $true
@@ -251,21 +293,43 @@ function Invoke-DvGit {
     foreach ($name in @($psi.Environment.Keys | Where-Object { $_ -match '^GIT_(DIR|WORK_TREE|INDEX_FILE|OBJECT_DIRECTORY|ALTERNATE_OBJECT_DIRECTORIES|COMMON_DIR|NAMESPACE|REPLACE_REF_BASE|NO_REPLACE_OBJECTS)$' })) { [void]$psi.Environment.Remove($name) }
     foreach ($a in (@('--no-replace-objects', '-C', $RepoRoot) + $GitArgs)) { [void]$psi.ArgumentList.Add($a) }
     $limit = Get-DvGitTimeoutMilliseconds
+    # A fresh tag per call, inherited by everything git starts: how Stop-DvGitCall finds those children on Linux once their parent is gone.
+    $tag = [guid]::NewGuid().ToString('N')
+    $psi.Environment['DV_GIT_CALL_TAG'] = $tag
+    $native = Get-DvJobNative
+    $job = $(if ($null -ne $native) { $native::CreateJobObjectW([IntPtr]::Zero, [IntPtr]::Zero) } else { [IntPtr]::Zero })
     $proc = [System.Diagnostics.Process]::Start($psi)
     try {
+        # Everything git starts from here on is in the job. A child git started in the microseconds before this call would escape it, but the
+        # refusals below do not depend on the kill: a timeout or a straggler is exit -1 whether or not its processes could be killed.
+        if ($job -ne [IntPtr]::Zero) { [void]$native::AssignProcessToJobObject($job, $proc.Handle) }
         $proc.StandardInput.Close()
         $errTask = $proc.StandardError.ReadToEndAsync()
         $ms = [IO.MemoryStream]::new()
         $outTask = $proc.StandardOutput.BaseStream.CopyToAsync($ms)
         if (-not $proc.WaitForExit($limit)) {
-            try { $proc.Kill($true) } catch { $null = $_ }
+            # try { $proc.Kill($true) } catch { $null = $_ }   (r1; Stop-DvGitCall does this and also reaches children whose parent exited)
+            Stop-DvGitCall -Proc $proc -Job $job -Tag $tag
             [void]$proc.WaitForExit(5000)
             return [pscustomobject]@{ exitCode = -1; bytes = [byte[]]@(); stderr = "DV_GIT_TIMEOUT git did not return within $($limit / 1000) s: git $($GitArgs -join ' ')" }
         }
-        # the pipes close when git (and anything it started) exits; a straggler holding one open must not outlast a bounded wait
-        [void]$outTask.Wait(10000)
-        [pscustomobject]@{ exitCode = $proc.ExitCode; bytes = $ms.ToArray(); stderr = $(if ($errTask.Wait(10000)) { $errTask.Result } else { '' }) }
-    } finally { $proc.Dispose() }
+        # r1: "the pipes close when git (and anything it started) exits; a straggler holding one open must not outlast a bounded wait"
+        # r1: [void]$outTask.Wait(10000), then git's own exit code with $ms.ToArray(): the wait's result was dropped (CoS I1, PR #472).
+        # git has exited, but its pipes close only when every process holding them has exited too. A child that outlives git with stdout or
+        # stderr still open is a typed failure, exit -1 (DV_GIT_PIPE_STRAGGLER, a sibling of DV_GIT_TIMEOUT): never git's own exit code with
+        # the bytes that happened to arrive, and never ToArray() while CopyToAsync may still be writing. The drain shares the git bound.
+        $drain = [Math]::Min(10000, $limit)
+        if (-not [System.Threading.Tasks.Task]::WaitAll([System.Threading.Tasks.Task[]]@($outTask, $errTask), $drain)) {
+            $gitExit = $proc.ExitCode
+            Stop-DvGitCall -Proc $proc -Job $job -Tag $tag
+            try { [void][System.Threading.Tasks.Task]::WaitAll([System.Threading.Tasks.Task[]]@($outTask, $errTask), 5000) } catch { $null = $_ }
+            return [pscustomobject]@{ exitCode = -1; bytes = [byte[]]@(); stderr = "DV_GIT_PIPE_STRAGGLER git exited $gitExit but a process it started still held its output open after $($drain / 1000) s (killed): git $($GitArgs -join ' ')" }
+        }
+        [pscustomobject]@{ exitCode = $proc.ExitCode; bytes = $ms.ToArray(); stderr = $errTask.Result }
+    } finally {
+        $proc.Dispose()
+        if ($job -ne [IntPtr]::Zero) { [void]$native::CloseHandle($job) }
+    }
 }
 
 function Get-DvCommittedFile {
@@ -381,10 +445,13 @@ function Find-DvCommittedLegSpec {
         if (-not $path.EndsWith('.json')) { continue }
         # A blob id names its bytes for good, so a blob read once is not read again by the next lookup of this process: every lookup used to
         # re-read every blob of the directory (two git spawns each), which made finding all N shipped legs quadratic in N.
-        $blob = $script:LegBlobCache[$id]
+        # Keyed by repo AND blob id (CoS N1): a hit must not skip Get-DvBlobById's "a blob of this repository" check for a second repo
+        # that one process looks at (as the tests do). r1 keyed by $id alone.
+        $cacheKey = $RepoRoot + [char]0 + $id
+        $blob = $script:LegBlobCache[$cacheKey]
         if ($null -eq $blob) {
             $blob = Get-DvBlobById -RepoRoot $RepoRoot -BlobSha $id
-            if ($blob.ok) { $script:LegBlobCache[$id] = $blob }
+            if ($blob.ok) { $script:LegBlobCache[$cacheKey] = $blob }
         }
         if ($blob.ok -and (Get-DvLegSpecSha256 $blob.bytes) -ceq $LegSpecSha256) {
             return [pscustomobject]@{ ok = $true; relativePath = $path; blobSha = $id; text = $blob.text }
