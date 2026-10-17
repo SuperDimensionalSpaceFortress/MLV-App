@@ -135,8 +135,9 @@ CONCERNS_READER_TOKEN = "CoS-CONCERN:"
 # (R1 PR comments and R2 every specs/*/cos-concerns.md). The gate opens only on a line EQUAL to the example below
 # (an optional leading `- ` or `* ` bullet and surrounding whitespace allowed); a line that adds, forbids or negates
 # anything is not the duty, and a line inside a ``` fence, a ~~~ fence or an HTML comment never counts.
-CONCERNS_DUTY_LINE_RE = re.compile(r"^ {0,3}(?:[-*] )?The CoS reads `CoS-CONCERN:` .*`specs/\*/cos-concerns\.md`")
 CONCERNS_DUTY_LINE_EXAMPLE = "- The CoS reads `CoS-CONCERN:` PR comments and every `specs/*/cos-concerns.md` each pass."
+CONCERNS_DUTY_LINE_RE = re.compile(r"^\s*(?:[-*]\s+)?" + re.escape(CONCERNS_DUTY_LINE_EXAMPLE[2:]) + r"\s*$")
+_FENCE_OPEN_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 CONCERN_FIELDS = ("id", "to", "opened_utc", "expires_utc", "kind", "evidence", "ask")
 CONCERN_KINDS = ("output-format", "process", "shared-tool-defect", "fleet-pattern")
 CONCERN_DEFAULT_DAYS = 14
@@ -978,6 +979,9 @@ def r14_gate(bus_repo: pathlib.Path, tip: str, candidates: list[dict], report: d
         except Refusal as e:
             node_refusal = (e.code, e.detail)
     entry_problem = cards_tip_entry_problem(bus_repo, tip) if has_cards and validator else None
+    has_concerns = any(c["target"] == CONCERNS_TARGET for c in candidates)
+    concerns_entry_problem = cards_tip_entry_problem(bus_repo, tip, CONCERNS_TARGET) if has_concerns else None
+    concerns_on_tip = concern_entries_on_bus(bus_repo, tip) if has_concerns and not concerns_entry_problem else {}
     kept = []
     for c in candidates:
         refusal = None
@@ -1002,6 +1006,9 @@ def r14_gate(bus_repo: pathlib.Path, tip: str, candidates: list[dict], report: d
             refusal = ("CONCERN_CHANNEL_NOT_RATIFIED",
                        f"{CONCERNS_READER_FILE} at {tip[:12]} has no reader-duty line of the form '{CONCERNS_DUTY_LINE_EXAMPLE}'; "
                        f"a concern is held until the CoS has taken the reader duty, so it is never written to a file nobody reads")
+        elif c["target"] == CONCERNS_TARGET and concerns_entry_problem:
+            refusal = ("CONCERNS_PATH_NOT_REGULAR_FILE",
+                       f"{concerns_entry_problem}; a concern is never written through a link or a non-regular entry")
         elif c["target"] == CONCERNS_TARGET and c["concern"]["expires_utc"] <= _utc_now_z():
             refusal = ("CONCERN_EXPIRED",
                        f"{c['concern']['id']} expired at {c['concern']['expires_utc']}; an expired ask is not published "
@@ -1010,10 +1017,9 @@ def r14_gate(bus_repo: pathlib.Path, tip: str, candidates: list[dict], report: d
             refusal = ("CONCERN_DUPLICATE_ID",
                        f"{c['concern']['id']} heads more than one committed outbox item; the CoS answers an id once, "
                        f"so an id names exactly one concern (give each its own -<n>)")
-        elif c["target"] == CONCERNS_TARGET and c["concern"]["id"] in concern_ids_on_bus(bus_repo, tip):
+        elif c["target"] == CONCERNS_TARGET and c["concern"]["id"] in concerns_on_tip:
             refusal = ("CONCERN_DUPLICATE_ID",
-                       f"{c['concern']['id']} is already in {CONCERNS_TARGET} at {tip[:12]} under different text; "
-                       f"an id names exactly one concern (give this one its own -<n>)")
+                       concern_tip_duplicate_detail(c["concern"], concerns_on_tip[c["concern"]["id"]], tip))
         if refusal is None:
             kept.append(c)
         else:
@@ -1023,23 +1029,70 @@ def r14_gate(bus_repo: pathlib.Path, tip: str, candidates: list[dict], report: d
 
 def concern_reader_duty_on_bus(bus_repo: pathlib.Path, tip: str) -> bool:
     """The channel is live only once the fetched tip's cos-feedback README carries the CoS-CONCERN reader-duty
-    LINE (CONCERNS_DUTY_LINE_RE: names the token AND `specs/*/cos-concerns.md`, outside any code fence), the
-    ratification this tool's R2 route waits for. The tip decides, never a date."""
+    LINE, the ratification this tool's R2 route waits for. The tip decides, never a date."""
     text = bus_file_at(bus_repo, tip, CONCERNS_READER_FILE)
-    if text is None:
-        return False
-    fenced = False
+    return text is not None and has_concerns_duty_line(text)
+
+
+def has_concerns_duty_line(text: str) -> bool:
+    """True when a line EQUAL to CONCERNS_DUTY_LINE_EXAMPLE (an optional `- ` or `* ` bullet and surrounding
+    whitespace allowed, nothing else) stands outside every ``` fence, ~~~ fence and <!-- --> comment. A line that
+    merely starts like the duty, adds a clause, forbids it or negates it is not the duty. A fence marker inside a
+    comment, and a comment marker inside a fence, are plain text (CommonMark: a fence closes on a marker of the same
+    character at least as long as the opener)."""
+    fence = ""        # the opening marker while inside a fence
+    in_comment = False
     for line in text.splitlines():
-        if line.lstrip().startswith("```"):
-            fenced = not fenced
-        elif not fenced and CONCERNS_DUTY_LINE_RE.match(line):
-            return True
+        if fence:
+            close = re.match(r"^ {0,3}(" + re.escape(fence[0]) + r"{" + str(len(fence)) + r",})\s*$", line)
+            if close:
+                fence = ""
+            continue
+        if not in_comment:
+            opener = _FENCE_OPEN_RE.match(line)
+            if opener:
+                fence = opener.group(1)
+                continue
+            if CONCERNS_DUTY_LINE_RE.match(line):
+                return True
+        pos = 0
+        while True:
+            marker = "-->" if in_comment else "<!--"
+            hit = line.find(marker, pos)
+            if hit < 0:
+                break
+            in_comment = not in_comment
+            pos = hit + len(marker)
     return False
 
 
-def concern_ids_on_bus(bus_repo: pathlib.Path, tip: str) -> set[str]:
-    """Every concern id already headed in the tip's project-owned concerns file."""
-    return set(CONCERN_HEADING_RE.findall(bus_file_at(bus_repo, tip, CONCERNS_TARGET) or ""))
+def concern_entries_on_bus(bus_repo: pathlib.Path, tip: str) -> dict[str, dict[str, str]]:
+    """Every concern already headed in the tip's project-owned concerns file, as id -> its `- field: value` lines.
+    An entry runs from its heading to the next heading or outbox marker."""
+    text = bus_file_at(bus_repo, tip, CONCERNS_TARGET) or ""
+    entries: dict[str, dict[str, str]] = {}
+    current: dict[str, str] | None = None
+    for line in text.splitlines():
+        heading = CONCERN_HEADING_RE.match(line)
+        if heading:
+            current = entries.setdefault(heading.group(1), {})
+        elif line.startswith(("### ", "<!-- outbox:")):
+            current = None
+        elif current is not None:
+            m = re.match(r"^- ([a-z_]+): (\S.*)$", line.rstrip())
+            if m:
+                current.setdefault(m.group(1), m.group(2).strip())
+    return entries
+
+
+def concern_tip_duplicate_detail(concern: dict[str, str], published: dict[str, str], tip: str) -> str:
+    """Why an id already at the tip refuses a new item: the fields that differ from the published entry, named, or
+    the plain fact that none does (the same entry filed again under another outbox key)."""
+    differs = [f for f in CONCERN_FIELDS if concern.get(f) != published.get(f)]
+    what = (f"field(s) {', '.join(differs)} differ from that entry" if differs
+            else "no field differs from that entry (the same concern filed again under another outbox key)")
+    return (f"{concern['id']} is already in {CONCERNS_TARGET} at {tip[:12]}; {what}. "
+            f"An id names exactly one concern (give this one its own -<n>)")
 
 
 def concern_duplicate_ids(items: list[dict]) -> set[str]:
@@ -1098,20 +1151,22 @@ def validate_cards_file(wt: pathlib.Path, cards_file: pathlib.Path | None = None
         raise Refusal("CARD_VALIDATOR_FAILED", f"exit 0 without a '0 problem(s)' summary line: {out[:400] or 'no output'}")
 
 
-def cards_tip_entry_problem(bus_repo: pathlib.Path, tip: str) -> str | None:
-    """Why the tip's cards-path entry may not be written through, or None. Only a missing entry
-    (the project's first card) or a regular 100644 blob qualifies: a 120000 link, a 160000 gitlink
-    or a 100755 file is refused, since the drain writes through the checkout of that path."""
-    proc = _run_git(bus_repo, ["ls-tree", "-z", tip, "--", CARDS_TARGET])
+def cards_tip_entry_problem(bus_repo: pathlib.Path, tip: str, target: str | None = None) -> str | None:
+    """Why the tip's entry for a project-owned file (the cards file, or the concerns file when `target` names it)
+    may not be written through, or None. Only a missing entry (the project's first card or concern) or a regular
+    100644 blob qualifies: a 120000 link, a 160000 gitlink or a 100755 file is refused, since the drain writes
+    through the checkout of that path."""
+    target = target or CARDS_TARGET
+    proc = _run_git(bus_repo, ["ls-tree", "-z", tip, "--", target])
     if proc.returncode != 0:
-        raise Refusal("TIP_BLOB_READ_FAILED", f"{tip[:12]}:{CARDS_TARGET}: ls-tree: {proc.stderr.strip()[:300]}")
+        raise Refusal("TIP_BLOB_READ_FAILED", f"{tip[:12]}:{target}: ls-tree: {proc.stderr.strip()[:300]}")
     for entry in proc.stdout.split("\0"):
         meta, _tab, path = entry.partition("\t")
-        if not entry or path != CARDS_TARGET:
+        if not entry or path != target:
             continue
         fields = meta.split()
         if fields[:2] != [REGULAR_FILE_MODE, "blob"]:
-            return f"{CARDS_TARGET} at {tip[:12]} is mode {fields[0] if fields else '?'}, not a regular {REGULAR_FILE_MODE} blob"
+            return f"{target} at {tip[:12]} is mode {fields[0] if fields else '?'}, not a regular {REGULAR_FILE_MODE} blob"
     return None
 
 

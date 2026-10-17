@@ -90,12 +90,16 @@ and never stored.
 
 The drain holds an entry, and the refusal names the reason:
 - `CONCERN_CHANNEL_NOT_RATIFIED` until the fetched bus tip's `cos-feedback/README.md` carries the exact duty
-  line `- The CoS reads `CoS-CONCERN:` PR comments and every `specs/*/cos-concerns.md` each pass.` (a bullet is
-  optional; a line that merely mentions the token, forbids it, names only R1, or sits in a code fence does not
-  count), so nothing is written to a file nobody reads;
+  line `- The CoS reads `CoS-CONCERN:` PR comments and every `specs/*/cos-concerns.md` each pass.`: a line EQUAL to
+  it (a leading `- ` or `* ` bullet and surrounding whitespace are optional, nothing else). A line that only
+  starts like it, adds a clause, forbids or negates it, names only R1, or sits inside a ``` fence, a `~~~` fence
+  or an HTML comment (one line or many) does not count, so nothing is written to a file nobody reads;
+- `CONCERNS_PATH_NOT_REGULAR_FILE` when the tip's `specs/mlv-app/cos-concerns.md` is a link or any entry other
+  than a regular 100644 blob: that concern alone is refused and the rest of the drain goes on;
 - `CONCERN_EXPIRED` when `expires_utc` is not after the clock at drain time;
 - `CONCERN_DUPLICATE_ID` when the id heads more than one committed item (all of them are held), or is already
-  in the tip's `specs/mlv-app/cos-concerns.md` under different text. An id names exactly one concern.
+  in the tip's `specs/mlv-app/cos-concerns.md`; the refusal names the fields that differ from the published
+  entry, or says none does. An id names exactly one concern.
 
 A concern about one PR goes instead as a comment on that PR's thread starting `CoS-CONCERN:`. Until the CoS
 duty line lands on the bus, the CoS does not read those comments either.

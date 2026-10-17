@@ -154,6 +154,48 @@ def test_only_the_exact_duty_line_opens_the_gate(tmp_path, label, readme):
     assert report["published"] == []
 
 
+DUTY_PREFIX = "The CoS reads `CoS-CONCERN:` "
+
+
+@pytest.mark.parametrize("label,readme", [
+    ("the prefix then a sentence that forbids R2",
+     "# cos-feedback\n\n- " + DUTY_PREFIX + "PR comments only; reading `specs/*/cos-concerns.md` is forbidden.\n"),
+    ("the prefix then a negated form",
+     "# cos-feedback\n\n- " + DUTY_PREFIX + "PR comments and every `specs/*/cos-concerns.md` each pass is NOT the rule.\n"),
+    ("the exact line with a trailing clause",
+     "# cos-feedback\n\n" + DUTY_LINE.rstrip("\n") + " Except never.\n"),
+    ("the exact line inside a tilde fence", "# cos-feedback\n\n~~~\n" + DUTY_LINE + "~~~\n"),
+    ("the exact line inside a longer tilde fence", "# cos-feedback\n\n~~~~\n~~~\n" + DUTY_LINE + "~~~~\n"),
+    ("the exact line inside a single-line HTML comment", "# cos-feedback\n\n<!-- " + DUTY_LINE.rstrip("\n") + " -->\n"),
+    ("the exact line inside a multi-line HTML comment", "# cos-feedback\n\n<!--\n" + DUTY_LINE + "-->\n"),
+    ("the exact line in a comment that opens after text", "# cos-feedback\n\nnote <!-- retired:\n" + DUTY_LINE + "still retired -->\n"),
+])
+def test_a_line_that_starts_with_the_duty_prefix_but_is_not_the_duty_does_not_open_the_gate(tmp_path, label, readme):
+    """CoS r2 review, I5: the r2 gate anchored only the prefix and then took `.*`, so each of these opened it."""
+    src = init_source(tmp_path)
+    clone = init_bus(tmp_path, readme)
+    report = ob.drain(src, clone, "HEAD", tmp_path / "sent.jsonl", [], push=False)
+    assert [r["code"] for r in report["refused"]] == ["CONCERN_CHANNEL_NOT_RATIFIED"], label
+    assert report["published"] == []
+
+
+@pytest.mark.parametrize("label,readme", [
+    ("the line after a closed HTML comment", "# cos-feedback\n\n<!-- a note -->\n" + DUTY_LINE),
+    ("the line after a closed multi-line comment", "# cos-feedback\n\n<!--\nnote\n-->\n" + DUTY_LINE),
+    ("the line after a closed backtick fence", "# cos-feedback\n\n```\ncode\n```\n" + DUTY_LINE),
+    ("the line after a closed tilde fence", "# cos-feedback\n\n~~~\ncode\n~~~\n" + DUTY_LINE),
+    ("a fence marker inside a comment is not a fence", "# cos-feedback\n\n<!--\n~~~\n-->\n" + DUTY_LINE),
+    ("a comment marker inside a fence is not a comment", "# cos-feedback\n\n```\n<!--\n```\n" + DUTY_LINE),
+    ("the line with surrounding whitespace", "# cos-feedback\n\n  " + DUTY_LINE.rstrip("\n") + "   \n"),
+    ("the line with CRLF endings", "# cos-feedback\r\n\r\n" + DUTY_LINE.rstrip("\n") + "\r\n"),
+])
+def test_the_duty_line_still_counts_after_a_closed_fence_or_comment(tmp_path, label, readme):
+    src = init_source(tmp_path)
+    clone = init_bus(tmp_path, readme)
+    report = ob.drain(src, clone, "HEAD", tmp_path / "sent.jsonl", [], push=False)
+    assert report["refused"] == [] and [w["target"] for w in report["would_push"]] == [CONCERNS], label
+
+
 @pytest.mark.parametrize("readme", [DUTY_LINE, "# cos-feedback\n\n" + DUTY_LINE.lstrip("- "), "# cos-feedback\n\n" + DUTY_LINE.replace("- ", "* ", 1)])
 def test_the_exact_duty_line_opens_the_gate_with_or_without_a_bullet(tmp_path, readme):
     src = init_source(tmp_path)
@@ -163,6 +205,7 @@ def test_the_exact_duty_line_opens_the_gate_with_or_without_a_bullet(tmp_path, r
 
 
 def add_item(src: Path, name: str, body: str) -> None:
+    (src / "doctrine-outbox").mkdir(exist_ok=True)  # git rm of the last item removes the directory
     (src / "doctrine-outbox" / name).write_text(item_text(body), encoding="utf-8")
     git(src, "add", "-A")
     git(src, "commit", "-m", f"add {name}")
@@ -192,6 +235,88 @@ def test_a_new_item_reusing_an_id_already_in_the_tip_concerns_file_is_refused(tm
     assert again["published"] == [] and [a["via"] for a in again["already_sent"]] == ["ledger"]
     text = git(clone, "show", f"{first['commit']}:{CONCERNS}")
     assert text.count("### mlv-app-cc-20261016-9") == 1
+
+
+def retire_first_item(src: Path) -> None:
+    """Drop the already-published item from the outbox, so the new item meets the TIP's duplicate check and not
+    the one for two committed items sharing an id."""
+    git(src, "rm", "-q", "doctrine-outbox/20261016-example-concern.md")
+    git(src, "commit", "-m", "retire the first concern item")
+
+
+def test_the_tip_duplicate_refusal_names_the_fields_that_differ(tmp_path):
+    """CoS r2 review, N2: the message said 'under different text' for any differing key; it now names them."""
+    src = init_source(tmp_path)
+    clone = init_bus(tmp_path, RATIFIED_README)
+    first = ob.drain(src, clone, "HEAD", tmp_path / "sent.jsonl", [], push=True)
+    assert first["refused"] == []
+    changed = (ENTRY.replace("Re-read the thread before each write.", "A different ask under the same id.")
+               .replace("bus commit abc1234, PR comment 6224672124", "bus commit def5678"))
+    retire_first_item(src)
+    add_item(src, "20261016-reused-id.md", changed)
+    again = ob.drain(src, clone, "HEAD", tmp_path / "sent.jsonl", [], push=True)
+    [refusal] = again["refused"]
+    assert refusal["code"] == "CONCERN_DUPLICATE_ID"
+    assert "field(s) evidence, ask differ from that entry" in refusal["detail"], refusal["detail"]
+    assert "different text" not in refusal["detail"]
+
+
+def test_the_tip_duplicate_refusal_says_so_when_no_field_differs(tmp_path):
+    """The same entry re-filed under another outbox key: no field differs, and the message must not claim one does."""
+    src = init_source(tmp_path)
+    clone = init_bus(tmp_path, RATIFIED_README)
+    first = ob.drain(src, clone, "HEAD", tmp_path / "sent.jsonl", [], push=True)
+    assert first["refused"] == []
+    # A later commit changes the item's outbox key (it hashes the source commit) but not one concern field.
+    retire_first_item(src)
+    add_item(src, "20261016-refiled.md", ENTRY)
+    again = ob.drain(src, clone, "HEAD", tmp_path / "sent.jsonl", [], push=True)
+    [refusal] = again["refused"]
+    assert refusal["code"] == "CONCERN_DUPLICATE_ID"
+    assert "no field differs" in refusal["detail"] and "differ from that entry" not in refusal["detail"], refusal["detail"]
+
+
+def _tip_entry(clone: Path, mode: str, content: str, path: str = CONCERNS) -> None:
+    """Land `path` on the bus tip as an entry of the given git mode (a 120000 entry is a symlink)."""
+    git(clone, "fetch", "-q", "origin")
+    git(clone, "checkout", "-q", "--detach", "origin/master")
+    blob = subprocess.run(["git", "-C", str(clone), "hash-object", "-w", "--stdin"], input=content, check=True,
+                          capture_output=True, text=True).stdout.strip()
+    git(clone, "update-index", "--add", "--cacheinfo", f"{mode},{blob},{path}")
+    git(clone, "commit", "-m", f"tip concerns entry {mode}")
+    git(clone, "push", "origin", "HEAD:refs/heads/master")
+
+
+@pytest.mark.parametrize("mode", ["120000", "100755"])
+def test_a_concerns_file_that_is_not_a_regular_blob_at_the_tip_is_a_per_item_refusal(tmp_path, mode):
+    """Iverson advisory on 35dca646: a symlinked concerns file had no per-item refusal, so the drain aborted."""
+    src = init_source(tmp_path)
+    (src / "doctrine-outbox" / "20261016-b-receipt.md").write_text(
+        item_text("### A receipt\nbody\n", target="RECEIPTS.md", kind="receipt"), encoding="utf-8")
+    git(src, "add", "-A")
+    git(src, "commit", "-m", "add a receipt")
+    clone = init_bus(tmp_path, RATIFIED_README)
+    _tip_entry(clone, mode, "../../elsewhere.md" if mode == "120000" else ob.CONCERNS_TITLE)
+    bare = tmp_path / "bus-origin.git"
+    before_blob = git(bare, "rev-parse", f"master:{CONCERNS}")
+
+    report = ob.drain(src, clone, "HEAD", tmp_path / "sent.jsonl", [], push=True)
+
+    assert [(r["path"], r["code"]) for r in report["refused"]] == [
+        ("doctrine-outbox/20261016-example-concern.md", "CONCERNS_PATH_NOT_REGULAR_FILE")]
+    assert mode in report["refused"][0]["detail"] and CONCERNS in report["refused"][0]["detail"]
+    assert [p["target"] for p in report["published"]] == ["RECEIPTS.md"], "the receipt is not held by the refused concern"
+    assert git(bare, "ls-tree", "master", "--", CONCERNS).startswith(f"{mode} "), "the concerns entry itself is untouched"
+    assert git(bare, "rev-parse", f"master:{CONCERNS}") == before_blob, "nothing was written through the link"
+    assert git(bare, "ls-tree", "-r", "master", "--name-only").splitlines().count("elsewhere.md") == 0
+
+
+def test_a_regular_concerns_file_at_the_tip_still_takes_the_next_concern(tmp_path):
+    src = init_source(tmp_path)
+    clone = init_bus(tmp_path, RATIFIED_README)
+    _tip_entry(clone, "100644", ob.CONCERNS_TITLE)
+    report = ob.drain(src, clone, "HEAD", tmp_path / "sent.jsonl", [], push=False)
+    assert report["refused"] == [] and [w["target"] for w in report["would_push"]] == [CONCERNS]
 
 
 def test_a_distinct_id_is_not_a_duplicate(tmp_path):
