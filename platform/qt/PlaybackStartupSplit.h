@@ -13,6 +13,12 @@
  *   playback_smoke.startup_split session=N play_to_request_ms= render_first_ms= gui_present_first_ms=
  *   finish_first_ms= audio_sync_first_ms= audio_stop_ms= audio_jump_ms= audio_play_ms=
  *   finish_other_top=<name>:<ms> gpu_route_setup_first_ms=
+ *
+ * PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-SETUP-1 Row 0: where the first GPU-window present itself went, one line
+ * beside it (FirstPresentSplit; zeros and "none" when the first present was not the window's texture route):
+ *   playback_smoke.first_present_split session=N slot=<adopted|realloc|discarded|kept|none> handoff=<mode>
+ *   setup_program_ms= setup_lut_ms= setup_blur_ms= setup_realloc_ms= setup_sampling_ms= recon_wall_ms=
+ *   amaze_kernel_ms= amaze_download_ms= paint_ms= gui_pickup_ms= backend_preloaded=<0|1>
  */
 
 #ifndef PLAYBACKSTARTUPSPLIT_H
@@ -66,6 +72,54 @@ inline double median( std::vector<double> values )
     return ( lower + upper ) * 0.5;
 }
 
+/*! The first Play-present's GPU window parts (Row 0). slot: what the window's texture slot did (the staged prewarm
+ *  pair adopted or discarded, a plain re-allocation, or kept); setup_*: GpuPresentSetupTiming of that call (blur =
+ *  drain + upload + check); amaze_*: its AMaZE-only kernel / download (the download includes the output's CUDA-GL
+ *  register and map); paint: the post block (paint + swap); gui_pickup: render thread done -> GUI present start. */
+struct FirstPresentSplit
+{
+    QString slot = QStringLiteral( "none" );
+    QString handoff = QStringLiteral( "none" );
+    double setupProgramMs = 0.0;
+    double setupLutMs = 0.0;
+    double setupBlurMs = 0.0;
+    double setupReallocMs = 0.0;
+    double setupSamplingMs = 0.0;
+    double reconWallMs = 0.0;
+    double amazeKernelMs = 0.0;
+    double amazeDownloadMs = 0.0;
+    double paintMs = 0.0;
+    double guiPickupMs = 0.0;
+    bool backendPreloaded = false;
+
+    QString line( unsigned long long session ) const
+    {
+        const auto ms = []( double value ) { return QString::number( value, 'f', 3 ); };
+        // concatenated, not .arg()-chained: slot/handoff are free text and must never be re-substituted
+        return QStringLiteral( "playback_smoke.first_present_split session=" ) + QString::number( session )
+             + QStringLiteral( " slot=" ) + ( slot.isEmpty() ? QStringLiteral( "none" ) : slot )
+             + QStringLiteral( " handoff=" ) + ( handoff.isEmpty() ? QStringLiteral( "none" ) : handoff )
+             + QStringLiteral( " setup_program_ms=" ) + ms( setupProgramMs )
+             + QStringLiteral( " setup_lut_ms=" ) + ms( setupLutMs )
+             + QStringLiteral( " setup_blur_ms=" ) + ms( setupBlurMs )
+             + QStringLiteral( " setup_realloc_ms=" ) + ms( setupReallocMs )
+             + QStringLiteral( " setup_sampling_ms=" ) + ms( setupSamplingMs )
+             + QStringLiteral( " recon_wall_ms=" ) + ms( reconWallMs )
+             + QStringLiteral( " amaze_kernel_ms=" ) + ms( amazeKernelMs )
+             + QStringLiteral( " amaze_download_ms=" ) + ms( amazeDownloadMs )
+             + QStringLiteral( " paint_ms=" ) + ms( paintMs )
+             + QStringLiteral( " gui_pickup_ms=" ) + ms( guiPickupMs )
+             + QStringLiteral( " backend_preloaded=" ) + ( backendPreloaded ? QStringLiteral( "1" ) : QStringLiteral( "0" ) );
+    }
+};
+
+/*! Render thread done -> GUI present start, in ms; 0 when either stamp is unknown or out of order. */
+inline double guiPickupMs( double frameReadyEmitStageTimeS, double displayStartS )
+{
+    if( frameReadyEmitStageTimeS <= 0.0 || displayStartS < frameReadyEmitStageTimeS ) return 0.0;
+    return ( displayStartS - frameReadyEmitStageTimeS ) * 1000.0;
+}
+
 class StartupSplit
 {
 public:
@@ -117,6 +171,11 @@ public:
     void noteFirstAudioSync( double ms ) { m_audioSyncFirstMs = ms; }
 
     void noteFirstFinish( double ms ) { m_finishFirstMs = ms; }
+
+    /*! Row 0: the first present's GPU window parts (reset with the rest at every session start). */
+    void noteFirstPresentSplit( const FirstPresentSplit &split ) { m_firstPresentSplit = split; }
+    const FirstPresentSplit &firstPresentSplit() const { return m_firstPresentSplit; }
+    QString firstPresentLine( unsigned long long session ) const { return m_firstPresentSplit.line( session ); }
 
     double playToRequestMs() const { return m_playToRequestMs < 0.0 ? 0.0 : m_playToRequestMs; }
     double renderFirstMs() const { return m_renderFirstMs; }
@@ -185,6 +244,7 @@ private:
     double m_audioJumpMs = 0.0;
     double m_audioPlayMs = 0.0;
     double m_finishStepMs[StepCount] = {};
+    FirstPresentSplit m_firstPresentSplit;
     std::vector<double> m_laterRender;
     std::vector<double> m_laterGuiPresent;
 };

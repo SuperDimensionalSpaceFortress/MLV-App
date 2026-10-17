@@ -44,3 +44,20 @@ maintained in this format.
     turns the warm off. Both take exactly `1`, `true`, `on` or `yes`, and
     `0`, `false`, `off` or `no`, in any case. Any other value keeps the
     default and is logged once.
+- Play at full resolution (scale 1) on the CUDA playback route starts sooner
+  (PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-SETUP-1).
+  - The paused warm now keeps the two textures it warmed, still registered
+    with CUDA, and the first frame of Play uses them. Before, the first frame
+    allocated and registered a new pair, which took about 100-200 ms at full
+    resolution. The kept pair is used only when the size matches and the
+    window is still showing the paused picture; otherwise it is freed and
+    the first frame allocates as before. A clip change, a window/fullscreen
+    change or a lost GL context frees it.
+  - The CUDA recon library is loaded while paused, not on the first frame
+    of Play.
+  - `MLVAPP_PLAYBACK_ROUTE_PREWARM_STAGE` (default on) turns off keeping the
+    textures, and `MLVAPP_PLAYBACK_RECON_BACKEND_PRELOAD` (default on) turns
+    off the early load. Both take the same values as
+    `MLVAPP_PLAYBACK_ROUTE_PREWARM`, which still turns all of it off.
+  - Playback smoke logs a `playback_smoke.first_present_split` line saying
+    where the first frame's time went.
