@@ -87,6 +87,10 @@ void clearSafeStart(QSettings & settings, const char * outcome)
 {
     clearSafeStartKeys(settings);
     GpuFieldTelemetry::noteRecovery("safe_start_flag", outcome);
+    // Invariant (GPU-LOSS-EMIT-BEFORE-UNLOCK-1): the backend's classifier can set suppression before onFault sets
+    // g_sessionLoss, but nothing reaches the lift below in that gap within one process: both callers need the persisted
+    // flag, which is set only after this session's own loss (g_sessionLoss already true) or found at a start install()
+    // already suppressed (no CUDA call runs to capture a code).
     if (g_sessionLoss.load()) return;
     llrpSetGpuCudaSuppressed(0);
     if (!g_notice.isEmpty()) showNotice(QString());
@@ -146,7 +150,7 @@ void install()
     if (g_installed) return;
     g_installed = true;
     std::unique_ptr<QSettings> settings = automation_settings::openAppSettings();
-    if (qgetenv(core::kEnvSafeStart).trimmed().toLower() == QByteArrayLiteral("clear"))
+    if (core::safeStartClearRequested(qgetenv(core::kEnvSafeStart).constData()))
     {
         clearSafeStartKeys(*settings);
         GpuFieldTelemetry::noteRecovery("safe_start_flag", "cleared_env");
@@ -158,7 +162,15 @@ void install()
         GpuFieldTelemetry::noteRecovery("safe_start", "cpu_route");
         showNotice(QString::fromLatin1(core::kNoticeStartup));
     }
+    // Installed once (g_installed above), before any backend caller runs; only resetForTesting clears it.
+    // llrawproc writes and reads the slot with Interlocked*Pointer (GPU-LOSS-EMIT-BEFORE-UNLOCK-1 r4).
+    llrpSetGpuDeviceLossClassifier(&classifyDeviceLossCodeForBackend);
     GpuFieldTelemetry::setFaultListener(&onFault);
+}
+
+int classifyDeviceLossCodeForBackend(int cudaCode)
+{
+    return GpuFieldTelemetry::isDeviceLossCode(cudaCode) ? 1 : 0;
 }
 
 void onFault(const GpuFieldTelemetry::CudaFault & fault)
@@ -253,6 +265,7 @@ void resetForTesting()
     g_sessionLoss.store(false);
     g_sessionLossCode.store(0);
     g_startedSafe.store(false);
+    llrpSetGpuDeviceLossClassifier(nullptr);
     llrpSetGpuCudaSuppressed(0);
     g_installed = false;
     g_noticeSink = nullptr;

@@ -107,6 +107,29 @@ inline FaultInject parseFaultInject(const char * value)
     return armed;
 }
 
+/* MLVAPP_GPU_SAFE_START: "clear", case-insensitive, with surrounding ASCII
+ * whitespace ignored (the GpuFieldTelemetryCore::parseEnabled convention; a
+ * trailing space from `set X=clear ` is a real Windows trap). Any other word,
+ * empty or unset is not a clear. */
+inline bool safeStartClearRequested(const char * value)
+{
+    if (!value) return false;
+    const auto space = [](char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\v' || c == '\f'; };
+    const char * begin = value;
+    while (*begin && space(*begin)) ++begin;
+    const char * end = begin + std::strlen(begin);
+    while (end > begin && space(end[-1])) --end;
+    static const char kClear[] = "clear";
+    if (static_cast<std::size_t>(end - begin) != sizeof(kClear) - 1) return false;
+    for (std::size_t i = 0; i < sizeof(kClear) - 1; ++i)
+    {
+        char c = begin[i];
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+        if (c != kClear[i]) return false;
+    }
+    return true;
+}
+
 inline std::string keyPart(const std::string & text)
 {
     const std::string s = GpuFieldTelemetryCore::sanitize(text, 96);
