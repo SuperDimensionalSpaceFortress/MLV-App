@@ -54,8 +54,8 @@ change that teaches it.
 
 ```markdown
 ---
-target: TRAPS.md          # RECEIPTS.md | TRAPS.md | RULINGS.md | specs/mlv-app/cards.md (other specs are steward-owned)
-kind: trap                # receipt | trap | ruling
+target: TRAPS.md          # RECEIPTS.md | TRAPS.md | RULINGS.md | specs/mlv-app/cards.md | specs/mlv-app/cos-concerns.md (other specs are steward-owned)
+kind: trap                # receipt | trap | ruling | concern (concern goes only with cos-concerns.md)
 source_commit: PENDING    # PENDING = the commit that adds this file; or an explicit sha
 law4: attested            # required, then SCREENED, never trusted
 # ratified_by: <RULINGS anchor>   required for RULINGS.md; sessions do not mint law
@@ -74,6 +74,42 @@ if they carry an email address, an account or org uuid, a lane wire path, `HUB.m
 pattern, a user-home path, this host's name or account name, or anything in an optional deny file. MLV
 adds its own deny terms: `.claude-state`, `subject-ledger`, `fleet-runs`, `HUB_RUN_WAL`, `dual-lane`, and
 the name of the GPU host. A refusal names the class, never the matched value.
+
+## Concerns to the CoS (COS-CONCERN-CHANNEL-1)
+
+A project had no way to tell the CoS a concern: only the CoS writes `cos-feedback/`, and a project-owned
+file is the one legal shape (bus Law 2). `target: specs/mlv-app/cos-concerns.md` with `kind: concern` is
+that file. The body is a `### mlv-app-cc-<yyyymmdd>-<n>` heading and exactly seven `- field: value` lines,
+each on one line: `id`, `to` (always `CoS`), `opened_utc`, `expires_utc` (after `opened_utc`, and no more
+than 14 days after it: a longer window is refused as `CONCERN_WINDOW_TOO_LONG`), `kind` (`output-format` |
+`process` | `shared-tool-defect` | `fleet-pattern`), `evidence` (bus SHAs, public PR comment ids, repo paths)
+and `ask` (one sentence). The set is closed, so no field is an approval, a ruling or a permission; free text is
+data. The CoS answers each id once, in its own `cos-feedback/mlv-app/concerns.md`:
+`<id> ADOPTED|DISTINGUISHED|NEEDS-INFO <reason>`. Open = entries with no answer line and not expired, derived
+and never stored.
+
+The drain holds an entry, and the refusal names the reason:
+- `CONCERN_CHANNEL_NOT_RATIFIED` until the fetched bus tip's `cos-feedback/README.md` carries the exact duty
+  line `- The CoS reads `CoS-CONCERN:` PR comments and every `specs/*/cos-concerns.md` each pass.`: a line EQUAL to
+  it (a leading `-` or `*` bullet followed by 1 to 4 spaces or a tab is optional, the line may be indented 0 to 3
+  spaces and carry trailing whitespace, nothing else). A line that only starts like it, adds a clause, forbids or
+  negates it, names only R1, sits at 4 or more spaces or a tab, has 5 or more spaces after the bullet (both are
+  indented code blocks), or sits inside a ``` fence, a `~~~` fence or an HTML comment (one line or many) does not
+  count, so nothing is written to a file nobody reads. Lines end only at `\n`, `\r\n` or `\r`, as in Markdown: a
+  vertical tab, form feed, `\x85`, U+2028 or U+2029 inside the text does not start a new line. The scan does
+  not parse inline code, so a `<!--` inside a code span before the line keeps the gate shut (it fails closed);
+- `CONCERNS_PATH_IS_LINK` when `specs` or `specs/mlv-app` at the tip is a link (120000), a gitlink (160000) or
+  any other entry that is not a directory (a regular file, say, worded "not a directory: mode 100644"), and
+  `CONCERNS_PATH_NOT_REGULAR_FILE` when the tip's `specs/mlv-app/cos-concerns.md` is a link or any entry
+  other than a regular 100644 blob: that concern alone is refused and the rest of the drain goes on. A card gets
+  the same walk over its own path under `CARDS_PATH_IS_LINK` (the same three cases at `specs` or `specs/mlv-app`);
+- `CONCERN_EXPIRED` when `expires_utc` is not after the clock at drain time;
+- `CONCERN_DUPLICATE_ID` when the id heads more than one committed item (all of them are held), or is already
+  in the tip's `specs/mlv-app/cos-concerns.md`; the refusal names the fields that differ from the published
+  entry, or says none does. An id names exactly one concern.
+
+A concern about one PR goes instead as a comment on that PR's thread starting `CoS-CONCERN:`. The CoS reads
+those comments too: the duty line is live at the bus `cos-feedback/README.md:65`.
 
 ## Traps are cards (bus R14.1)
 
