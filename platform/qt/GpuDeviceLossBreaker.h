@@ -19,7 +19,8 @@
  * GpuDeviceLoss/SafeStartEnabled plus the GL renderer, driver, clip profile and
  * UTC it was set on. A flagged launch starts with CUDA suppressed. The flag
  * clears on a GL renderer or driver change (seen at clip open), when the user
- * turns the CUDA playback preset on, or with MLVAPP_GPU_SAFE_START=clear.
+ * turns the CUDA playback preset on, or with MLVAPP_GPU_SAFE_START=clear
+ * (case-insensitive, surrounding whitespace ignored).
  *
  * MLVAPP_GPU_FAULT_INJECT=<code>@<n> (700|702|719|999) notes one injected
  * fault after the n-th successful "recon:run" / "amaze:*" stage, once per
@@ -48,6 +49,11 @@ void install();
  *  one queued invoke only. */
 void onFault(const GpuFieldTelemetry::CudaFault & fault);
 
+/*! GPU-LOSS-EMIT-BEFORE-UNLOCK-1: the llrawproc device-loss classifier install()
+ *  registers (llrpSetGpuDeviceLossClassifier). Called under the backend mutex:
+ *  pure, no lock, no Qt. 1 for a device-loss code, else 0. */
+int classifyDeviceLossCodeForBackend(int cudaCode);
+
 /*! GUI thread: the clip just opened (its profile is the clip half of the key). */
 void noteClipOpened(int width, int height, int bitsPerPixel, bool compressed);
 
@@ -69,8 +75,8 @@ bool startedSafe();
 bool faultInjectArmed();
 void noteRunStageForInjection(const char * stage);
 
-/*! Test-only: forget the session loss, lift suppression, drop the sinks and
- *  the clip profile. */
+/*! Test-only: forget the session loss, lift suppression, drop the sinks, the
+ *  backend classifier and the clip profile. */
 void resetForTesting();
 
 } // namespace GpuDeviceLossBreaker
