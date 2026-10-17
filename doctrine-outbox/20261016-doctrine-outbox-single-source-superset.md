@@ -11,6 +11,6 @@ applies: mlv-app, airmypc, agent-bridge, conjugal
 check: on the bus run `node tools/tool-census.mjs`; once projects run the file by pin from tools/factory/ and drop their copies, the doctrine-outbox family reads 1 distinct version.
 supersedes: none
 evidence: measured
-- **Adopt:** bus steward adds tools/coordination/doctrine_outbox.py from MLV-App PR 468 as tools/factory/doctrine_outbox.py, byte for byte; sha256 of its LF bytes 4c841fba8f19e3b0fe2c1bc80df0c621d069baf9638547bdd5697afbd6678836.
+- **Adopt:** bus steward adds tools/coordination/doctrine_outbox.py from MLV-App PR 468 as tools/factory/doctrine_outbox.py, byte for byte; sha256 of its LF bytes 870d26f01fcba3793997df43679e64b91b7a401ed734685cd303b1683285b42f.
 - **Pin:** each project reviews that bus SHA, then runs `python factory-pins/pin-runner.py pin doctrine-outbox --commit <bus-sha> --path tools/factory/doctrine_outbox.py --reviewer <who> --reason <why>`. A pinned run is `python factory-pins/pin-runner.py run doctrine-outbox -- --config doctrine-outbox.config.json <command>`. The project KEEPS its copy: deleting it bricks the push hook and reads debt as UNKNOWN TOOL_ABSENT_AT_REF.
 - **Follow-up:** OUTBOX-PIN-AWARE-TOOL-AT-REF-1 makes the hook invocation config-driven and `require_tool_at_ref` accept a pinned tool. Only after it ships does a project delete its copy.

@@ -195,19 +195,81 @@ def test_surfaces_keep_the_local_copy_and_name_the_pin_aware_follow_up():
 
 BUS_CLONE_CANDIDATES = (os.environ.get("FACTORY_BUS_CLONE", ""), "C:/!Layi Wkspc/softwarefactory-fleet-doctrine")
 RUNNER_BUS_PATH = "tools/factory/pin-runner.py"
+# r7 (CoS r6 improvement 2): hosted CI has no bus clone, so this route test used to skip there and never ran
+# where it matters. The bus runner now travels with the tests as DATA (a .py.txt, outside the python census),
+# pinned by bus SHA and sha256 in the sidecar. FACTORY_BUS_CLONE, when set, is checked AGAINST the fixture.
+RUNNER_FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures"
+RUNNER_FIXTURE_META = RUNNER_FIXTURE_DIR / "pin-runner.bus-c6391d29.json"
+
+
+def _runner_fixture() -> bytes:
+    """The committed copy of the bus runner (LF bytes), proven against the sidecar's recorded digest. A missing
+    or altered fixture FAILS: this test has no skip, so CI can never pass by not running it."""
+    meta = json.loads(RUNNER_FIXTURE_META.read_text(encoding="utf-8"))
+    assert meta["bus_path"] == RUNNER_BUS_PATH and re.fullmatch(r"[0-9a-f]{40}", meta["bus_sha"])
+    data = (RUNNER_FIXTURE_DIR / f"pin-runner.bus-{meta['bus_sha'][:8]}.py.txt").read_bytes().replace(b"\r\n", b"\n")
+    assert len(data) == meta["bytes"], f"fixture is {len(data)} bytes, the sidecar records {meta['bytes']}"
+    assert hashlib.sha256(data).hexdigest() == meta["sha256_lf"], "the pin-runner fixture differs from its recorded sha256"
+    assert hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest() == meta["git_blob_id"], "fixture is not the recorded git blob"
+    return data
+
+
+def _live_bus_runner(clone: str) -> bytes | None:
+    """The bytes of the clone's master pin-runner, read with `git cat-file` (never a write into the bus clone);
+    None when the clone cannot supply them."""
+    if not clone or not (Path(clone) / ".git").exists():
+        return None
+    for ref in ("origin/master", "master"):
+        proc = subprocess.run(["git", "--no-optional-locks", "-C", clone, "cat-file", "blob", f"{ref}:{RUNNER_BUS_PATH}"],
+                              capture_output=True, env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
+        if proc.returncode == 0 and proc.stdout:
+            return proc.stdout.replace(b"\r\n", b"\n")
+    return None
 
 
 def _read_only_bus_runner() -> bytes:
-    """The bytes of bus master's pin-runner, read with `git cat-file` (never a write into the bus clone)."""
-    for cand in BUS_CLONE_CANDIDATES:
-        if not cand or not (Path(cand) / ".git").exists():
-            continue
-        for ref in ("origin/master", "master"):
-            proc = subprocess.run(["git", "--no-optional-locks", "-C", cand, "cat-file", "blob", f"{ref}:{RUNNER_BUS_PATH}"],
-                                  capture_output=True, env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
-            if proc.returncode == 0 and proc.stdout:
-                return proc.stdout
-    pytest.skip("no fleet doctrine bus clone with tools/factory/pin-runner.py on this machine (set FACTORY_BUS_CLONE)")
+    """The pin-runner the route test runs: always the committed fixture. With FACTORY_BUS_CLONE set, the live
+    clone's blob must equal the fixture; a bus that moved on fails here, naming the refresh, rather than letting
+    the fixture rot into a test of bytes the bus no longer ships."""
+    fixture = _runner_fixture()
+    clone = os.environ.get("FACTORY_BUS_CLONE", "")
+    if clone:
+        live = _live_bus_runner(clone)
+        assert live is not None, f"FACTORY_BUS_CLONE={clone!r} holds no {RUNNER_BUS_PATH} on origin/master or master"
+        assert live == fixture, (f"the bus clone's {RUNNER_BUS_PATH} differs from {RUNNER_FIXTURE_META.name}'s fixture; "
+                                 "review the new blob, then replace the .py.txt and the sidecar values")
+    return fixture
+
+
+def test_runner_fixture_is_proven_and_the_route_test_has_no_skip_path(tmp_path, monkeypatch):
+    """CoS r6 improvement 2: under CI (CI set, no bus clone anywhere) the route test must run on the fixture; a
+    drifted clone must fail rather than skip; and the route test must not contain a skip."""
+    monkeypatch.setenv("CI", "true")
+    monkeypatch.delenv("FACTORY_BUS_CLONE", raising=False)
+    fixture = _read_only_bus_runner()
+    assert fixture.startswith(b"#!/usr/bin/env python3") and b"def cmd_install" in fixture
+    assert json.loads(RUNNER_FIXTURE_META.read_text(encoding="utf-8"))["bus_sha"][:8] in RUNNER_FIXTURE_META.name
+    src = Path(__file__).read_text(encoding="utf-8")
+    for fn in ("_runner_fixture", "_read_only_bus_runner", "test_the_steward_cards_route_runs_end_to_end_against_the_bus_pin_runner"):
+        body = src[src.index(f"def {fn}("):]
+        body = body[:body.index("\ndef ", 1)] if "\ndef " in body[1:] else body
+        assert "pytest.skip" not in body and "skipif" not in body, f"{fn} can skip"
+    route_def = "def test_the_steward_cards_route_runs_end_to_end_against_the_bus_pin_runner("
+    decorators = src[src.index("\n" + route_def) - 160:src.index("\n" + route_def)]   # a marker above the def would be a skip too
+    assert "mark.skip" not in decorators and "mark.xfail" not in decorators
+    # A clone whose blob equals the fixture passes; a clone whose blob drifted fails loudly.
+    bus = tmp_path / "bus"
+    (bus / "tools" / "factory").mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", "-b", "master", str(bus)], check=True, capture_output=True, text=True)
+    (bus / RUNNER_BUS_PATH).write_bytes(fixture)
+    git(bus, "add", "-A")
+    git(bus, "commit", "-m", "same runner")
+    monkeypatch.setenv("FACTORY_BUS_CLONE", str(bus))
+    assert _read_only_bus_runner() == fixture
+    (bus / RUNNER_BUS_PATH).write_bytes(fixture + b"# drift\n")
+    git(bus, "commit", "-am", "bus moved on")
+    with pytest.raises(AssertionError, match="differs from"):
+        _read_only_bus_runner()
 
 
 def _card_command(fragment: str) -> str:
@@ -507,7 +569,10 @@ def test_install_hooks_replaces_an_older_guard_in_place_and_repairs_the_stdin_ha
     assert ob.main(["install-hooks", str(repo)]) == 0
     text = hook.read_text(encoding="utf-8")
     assert text.count("# doctrine-outbox-guard:") == 1 and text.count("# end doctrine-outbox-guard") == 1
-    assert text.startswith(before) and text.endswith(after), "the lines around the guard were disturbed"
+    # r7: the guard moves to the splice point (right after the shebang and `set -e`), so the REPO_ROOT line that
+    # used to precede it now follows it. Every line around the guard is still there, in the same order.
+    assert text.startswith("#!/bin/sh\nset -e\n") and text.endswith(after), "the lines around the guard were disturbed"
+    assert text.index("# end doctrine-outbox-guard") < text.index("REPO_ROOT=$(git rev-parse --show-toplevel)\n\n" + after[:10])
     assert "the push guard did not run" not in text and "exec < \"$OUTBOX_STDIN\"" in text
     assert ob.install_pre_push(repo) == "present"
     seen = tmp_path / "downstream.bin"
@@ -853,6 +918,9 @@ def test_install_refuses_a_guard_that_sits_after_a_terminating_exit_or_exec(ob, 
         assert hook.read_text(encoding="utf-8") == text, f"{name}: a refused install must not rewrite the hook"
     # `exec < file` only redirects and an indented `exit` is conditional: neither ends the hook.
     hook.write_text("#!/bin/sh\nif [ -n \"$SKIP_LAYER\" ]; then\n  exit 0\nfi\nexec 3>&1\n" + current_guard, encoding="utf-8", newline="\n")
+    # r7: a guard behind real layers is no longer "present": it moves to the splice point ("repaired"), after
+    # which a second install finds it where it belongs.
+    assert ob.install_pre_push(repo) == "repaired"
     assert ob.install_pre_push(repo) == "present"
 
 
@@ -893,3 +961,87 @@ def test_pre_push_of_a_new_branch_judges_only_what_is_not_on_the_remote_default(
     monkeypatch.setattr(sys, "stdin", io.StringIO(new_branch(clean)))
     assert mod.main(["pre-push", str(repo), "elsewhere", "https://example.invalid/x.git"]) == 1
     assert "coordination/tools/old.py" in capsys.readouterr().err
+
+
+# ---------- r7: a repaired guard moves to the splice point; outcome x hostile shape ----------
+
+STDIN_READER_LAYER = "while read lref lsha rref rsha; do :; done\necho the-hooks-own-layer >&2\n"
+
+
+def _push_undeclared(repo: Path) -> subprocess.CompletedProcess:
+    commit(repo, {"coordination/tools/other.py": "print(1)\n"}, "undeclared")
+    return subprocess.run(["git", "-C", str(repo), "push", "origin", "master"], capture_output=True, text=True)
+
+
+def test_repair_moves_an_older_guard_ahead_of_a_layer_that_reads_the_ref_lines(ob, repo, tmp_path):
+    """CoS r6 improvement 1 (comment 6226980669): repair replaced an r4 guard where it stood, at the end, so a
+    project layer that reads git's ref lines from stdin ahead of it left the guard an empty stream and every
+    push went through. A recognised older block moves to the splice point a fresh install uses."""
+    _origin_with_master(repo, tmp_path)
+    hook = repo / ".git" / "hooks" / "pre-push"
+    hook.write_text("#!/bin/sh\nset -e\n" + STDIN_READER_LAYER + "\n" + _guard_block(spool=True, python_missing_passes=True),
+                    encoding="utf-8", newline="\n")
+    assert ob.install_pre_push(repo) == "repaired"
+    text = hook.read_text(encoding="utf-8")
+    assert text.startswith("#!/bin/sh\nset -e\n")
+    assert text.count("# doctrine-outbox-guard:") == 1 and "the push guard did not run" not in text
+    refused = _push_undeclared(repo)   # behaviour first: on b5310592 this push is ALLOWED (returncode 0)
+    assert refused.returncode != 0 and "PUSH REFUSED" in refused.stderr, f"undeclared push was allowed: {refused.returncode} {refused.stderr}"
+    assert "the-hooks-own-layer" not in refused.stderr, "the hook's own layer ran although the guard refused"
+    assert text.index("doctrine-outbox-guard") < text.index("while read lref"), "the repaired guard still sits behind the stdin reader"
+    assert ob.install_pre_push(repo) == "present"
+
+
+_HOSTILE_SHAPES = {
+    "ends-in-exit-0": "echo the-hooks-own-layer >&2\nexit 0\n",
+    "execs-another-hook": 'exec cat > "$DOWNSTREAM_OUT"\n',
+    "stdin-reading-layer": STDIN_READER_LAYER,
+}
+
+
+def _outcome_hook(kind: str, shape_body: str, ob, repo: Path) -> tuple[str, str]:
+    """(hook text, expected install outcome when the install is not refused) for an install outcome built
+    over a hostile hook shape."""
+    head = "#!/bin/sh\nset -e\n"
+    if kind == "installed":
+        return head + shape_body, "installed"
+    if kind == "repaired":
+        return head + shape_body + "\n" + _guard_block(spool=True, python_missing_passes=True), "repaired"
+    if kind == "present":
+        hook = repo / ".git" / "hooks" / "pre-push"
+        hook.write_text(head + shape_body, encoding="utf-8", newline="\n")
+        assert ob.install_pre_push(repo) == "installed"
+        return hook.read_text(encoding="utf-8"), "present"
+    # A CURRENT guard appended behind the shape: it is no more reachable than an old one.
+    hook = repo / ".git" / "hooks" / "pre-push"
+    hook.write_text(head, encoding="utf-8", newline="\n")
+    assert ob.install_pre_push(repo) == "installed"
+    current = hook.read_text(encoding="utf-8")
+    return head + shape_body + "\n" + current[current.index("# doctrine-outbox-guard"):], "repaired"
+
+
+@pytest.mark.parametrize("kind", ["installed", "repaired", "present", "current-guard-appended"])
+@pytest.mark.parametrize("shape", sorted(_HOSTILE_SHAPES))
+def test_no_install_outcome_leaves_a_dead_guard_behind_a_hostile_hook_shape(ob, repo, tmp_path, capsys, kind, shape):
+    """CoS r6 prevention check: every install outcome over every hostile hook shape either refuses the install
+    or leaves a guard that refuses an undeclared push. "installed", "repaired" or "present" with a guard the push
+    never reaches is the failure; it was found one outcome at a time in r5, r6 and r7."""
+    _origin_with_master(repo, tmp_path)
+    hook = repo / ".git" / "hooks" / "pre-push"
+    text, expected = _outcome_hook(kind, _HOSTILE_SHAPES[shape], ob, repo)
+    hook.write_text(text, encoding="utf-8", newline="\n")
+    capsys.readouterr()
+    rc = ob.main(["install-hooks", str(repo)])
+    out = capsys.readouterr()
+    if rc != 0:
+        assert "HOOK_GUARD_UNREACHABLE" in out.err or "HOOK_UNRECOGNISED" in out.err, out.err
+        assert hook.read_text(encoding="utf-8") == text, "a refused install must not rewrite the hook"
+        return
+    assert out.out.strip() == expected, (out.out, out.err)
+    assert hook.read_text(encoding="utf-8").count("# doctrine-outbox-guard:") == 1
+    seen = tmp_path / "downstream.bin"
+    commit(repo, {"coordination/tools/other.py": "print(1)\n"}, "undeclared")
+    refused = subprocess.run(["git", "-C", str(repo), "push", "origin", "master"], capture_output=True, text=True,
+                             env={**os.environ, "DOWNSTREAM_OUT": str(seen)})
+    assert refused.returncode != 0 and "PUSH REFUSED" in refused.stderr, f"{kind}/{shape}: the guard is dead: {refused.stderr}"
+    assert not seen.exists() and "the-hooks-own-layer" not in refused.stderr

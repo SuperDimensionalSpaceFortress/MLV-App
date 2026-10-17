@@ -76,7 +76,8 @@ BEHAVIOURS
    installed hook is made executable (git skips one that is not) and passes git's stdin through to
    whatever layer follows the guard (git lfs pre-push reads the same ref lines). A host with no python
    refuses the push (a guard that cannot run is not a pass), and an older guard block in an existing
-   hook is replaced in place (`install-hooks` prints `repaired`). The hook and the debt checks still
+   hook is MOVED to the splice point right after the shebang and `set` lines (`install-hooks` prints
+   `repaired`), so a layer that reads git's stdin ahead of it cannot starve it. The hook and the debt checks still
    run the file at config `tool_rel`: a project keeps that local copy until a pin-aware release.
 
 Nothing here runs itself: the OS drain task, Stop hook and heartbeat debt are the project's wiring.
@@ -1855,13 +1856,27 @@ def install_pre_push(repo: pathlib.Path) -> str:
         # first, and the push goes through unjudged. Reporting "present" or "repaired" for it would be a lie.
         _refuse_if_terminated_before(lines, start)
         end = _guard_block_end(lines, start)
-        if "".join(lines[start:end + 1]) == snippet:
+        # OUTBOX-REPAIR-MOVES-GUARD-1: a guard is only live when nothing but the shebang, `set` lines and
+        # comments stand ahead of it. Behind a layer that reads git's ref lines from stdin it gets an empty
+        # stream and passes every push, so "present" or an in-place "repaired" there would be a dead guard.
+        at_splice = _only_preamble_before(lines, start)
+        if at_splice and "".join(lines[start:end + 1]) == snippet:
             _make_executable(hook)   # an install made before the bit was set is repaired, not skipped
             return "present"
         # An older guard (r1-r4: no end marker, no stdin spool, or a push that passes without python)
-        # is replaced in place. Leaving it would be worse than before the executable bit: git used to
+        # is replaced. Leaving it would be worse than before the executable bit: git used to
         # skip the hook, and now runs one that swallows the ref lines a following layer needs.
-        lines[start:end + 1] = [snippet]
+        if at_splice:
+            lines[start:end + 1] = [snippet]
+        else:
+            # Not at the splice point: take the block out and put the current one where a fresh install
+            # puts it, then prove nothing ends the hook ahead of the new position.
+            del lines[start:end + 1]
+            idx = _preamble_end(lines)
+            _refuse_if_terminated_before(lines, idx)
+            if idx and not lines[idx - 1].endswith("\n"):
+                lines[idx - 1] += "\n"
+            lines.insert(idx, "\n" + snippet)
         hook.write_text("".join(lines), encoding="utf-8", newline="\n")
         _make_executable(hook)
         return "repaired"
@@ -1897,6 +1912,17 @@ def _preamble_end(lines: list[str]) -> int:
         elif text and not text.startswith("#"):
             break
     return end
+
+
+def _only_preamble_before(lines: list[str], idx: int) -> bool:
+    """True when every line ahead of `idx` is the shebang, a `set` line, a comment or blank: the guard at
+    `idx` then runs before any layer of the hook, with git's stdin untouched."""
+    for i, line in enumerate(lines[:idx]):
+        text = line.strip()
+        if not text or text.startswith("#") or SET_PREAMBLE_RE.match(text):
+            continue
+        return False
+    return True
 
 
 def _refuse_if_terminated_before(lines: list[str], idx: int) -> None:
