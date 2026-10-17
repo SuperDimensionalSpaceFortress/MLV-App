@@ -84,6 +84,17 @@
       "suites": [{"kind": "ps-parse"}]
     },
     {
+      "id": "py-runtime-floor-suites",
+      "globs": ["tools/repo_hygiene/runtime_floor_suites.py", "tools/coordination/runtime-floors.json"],
+      "floor": "declared",
+      "runtimes": ["python-3.13"],
+      "evidence": [
+        {"file": ".python-version", "line": 1, "contains": "3.13"},
+        {"file": ".github/workflows/tests.yml", "line": 45, "contains": "python-version-file"}
+      ],
+      "suites": [{"kind": "pytest", "path": "tools/repo_hygiene/test_runtime_floor_suites.py"}]
+    },
+    {
       "id": "py-check-lane-model-currency",
       "globs": ["tools/coordination/check-lane-model-currency.py"],
       "floor": "declared",
