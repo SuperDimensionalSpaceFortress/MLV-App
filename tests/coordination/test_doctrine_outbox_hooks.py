@@ -1045,3 +1045,58 @@ def test_no_install_outcome_leaves_a_dead_guard_behind_a_hostile_hook_shape(ob, 
                              env={**os.environ, "DOWNSTREAM_OUT": str(seen)})
     assert refused.returncode != 0 and "PUSH REFUSED" in refused.stderr, f"{kind}/{shape}: the guard is dead: {refused.stderr}"
     assert not seen.exists() and "the-hooks-own-layer" not in refused.stderr
+
+
+# ---------- r8: the new-branch base comes only from a ref the hook guards ----------
+
+def _diverged_remote(repo: Path, guarded_branch: str, publish_guarded: bool) -> tuple[str, str]:
+    """`pushed_repo` plus: the guarded branch (one commit past the root), an unguarded origin/master that has
+    moved on, and an unguarded origin/topic. Returns (guarded tip, local sha of a new branch cut from that tip
+    with one more commit). The two merge-bases differ, so a wrong base shows as a different sha."""
+    root = git(repo, "rev-parse", "HEAD")
+    git(repo, "checkout", "-q", "-b", guarded_branch, root)
+    tip = commit(repo, {"docs/guarded.md": "prose\n"}, "on the guarded branch")
+    if publish_guarded:
+        git(repo, "push", "-q", "origin", f"{guarded_branch}:refs/heads/{guarded_branch}")
+    git(repo, "push", "-q", "origin", f"{root}:refs/heads/topic")
+    git(repo, "checkout", "-q", "master")
+    commit(repo, {"coordination/tools/old.py": "print(1)\n"}, "on master long ago, no trailer")
+    git(repo, "push", "-q", "origin", "master")
+    git(repo, "checkout", "-q", "-b", "feature", tip)
+    return tip, commit(repo, {"docs/notes.md": "more prose\n"}, "on the new branch")
+
+
+@pytest.mark.parametrize("guarded_branch,publish_guarded,set_head,expect_guarded_tip", [
+    ("release", False, False, False),       # guarded branch absent on the remote; unguarded origin/master must not stand in
+    ("release/1.0", True, False, True),     # a branch name with a slash is the whole name after refs/heads/
+    ("release", False, True, False),        # origin/HEAD -> origin/master is a ref the hook never judged
+], ids=["unguarded-master-never-picked", "slash-branch-keeps-its-whole-name", "unguarded-origin-HEAD-never-picked"])
+def test_new_branch_base_comes_only_from_a_guarded_ref(tmp_path, pushed_repo, guarded_branch, publish_guarded, set_head, expect_guarded_tip):
+    """Iverson advisory on b5310592 (comment 6227229808, ACK 6227530991): _remote_default_base fell back to
+    origin/master and origin/main by name and read the name after the LAST slash, so the base could be a ref
+    the hook never judged. A base it cannot prove is None (walk everything)."""
+    cfg = tmp_path / "base-ref.config.json"
+    cfg.write_text(json.dumps({**BUS_STYLE_CONFIG, "pre_push_refs": [f"refs/heads/{guarded_branch}"]}), encoding="utf-8")
+    mod = load_tool(cfg)
+    repo = pushed_repo
+    tip, local = _diverged_remote(repo, guarded_branch, publish_guarded)
+    if set_head:
+        git(repo, "remote", "set-head", "origin", "master")
+    base = mod._remote_default_base(repo, "origin", local)
+    assert base == (tip if expect_guarded_tip else None), (base, tip)
+    assert base != git(repo, "merge-base", "refs/remotes/origin/master", local)
+
+
+def test_new_branch_push_with_no_guarded_base_judges_the_whole_history(tmp_path, pushed_repo, monkeypatch, capsys):
+    """The behaviour behind the unit rows: with origin/master unguarded and the guarded branch not yet on the
+    remote, the old undeclared commit on origin/master is judged, not skipped."""
+    cfg = tmp_path / "base-ref-push.config.json"
+    cfg.write_text(json.dumps({**BUS_STYLE_CONFIG, "pre_push_refs": ["refs/heads/release"]}), encoding="utf-8")
+    mod = load_tool(cfg)
+    repo = pushed_repo
+    _diverged_remote(repo, "release", publish_guarded=False)
+    git(repo, "checkout", "-q", "-B", "release", "master")   # cut from the unguarded master, old.py in its history
+    local = commit(repo, {"docs/notes.md": "more prose\n"}, "on the new guarded branch")
+    line = f"refs/heads/release {local} refs/heads/release {ZEROS}\n"
+    assert run_pre_push(mod, repo, monkeypatch, line) == 1
+    assert "coordination/tools/old.py" in capsys.readouterr().err
