@@ -1286,7 +1286,7 @@ $fence
                 $laneWorkDir = $existingWt
                 Write-Output "WORKSTREAM: CONTINUATION card=$cardId branch=$branch tip=$branchTip reusing-worktree=$laneWorkDir"
             } else {
-                & git -C $RepoRoot -c core.longpaths=true worktree add $laneWorkDir $branch 2>&1 | Out-Null
+                & git -C $RepoRoot -c core.longpaths=true -c core.fsmonitor=false worktree add $laneWorkDir $branch 2>&1 | Out-Null
                 Write-Output "WORKSTREAM: CONTINUATION card=$cardId branch=$branch tip=$branchTip new-worktree=$laneWorkDir"
             }
             $script:IsContinuation = $true
@@ -1305,7 +1305,7 @@ $fence
                 exit 3
             }
             Write-Output "WORKSTREAM: reusing existing branch $branch (no commits beyond baseSha), moved to $baseSha"
-            & git -C $RepoRoot -c core.longpaths=true worktree add $laneWorkDir $branch 2>&1 | Out-Null
+            & git -C $RepoRoot -c core.longpaths=true -c core.fsmonitor=false worktree add $laneWorkDir $branch 2>&1 | Out-Null
         }
     } else {
         if ($ContinueFromSha) {
@@ -1313,13 +1313,19 @@ $fence
             Write-DispatchAttempt -Outcome 'refused-before-launch' -Cause 'continuation-branch-absent' -ExitCode 6 -Detail "branch=$branch expected=$ContinueFromSha"
             exit 6
         }
-        & git -C $RepoRoot -c core.longpaths=true worktree add -b $branch $laneWorkDir $baseSha 2>&1 | Out-Null
+        & git -C $RepoRoot -c core.longpaths=true -c core.fsmonitor=false worktree add -b $branch $laneWorkDir $baseSha 2>&1 | Out-Null
     }
     if ($LASTEXITCODE -ne 0) {
         Write-Output "WORKSTREAM: CANNOT-DETERMINE - git worktree add failed for $laneWorkDir at $baseSha (branch $branch)"
         Write-DispatchAttempt -Outcome 'refused-before-launch' -Cause 'worktree-add-failed' -ExitCode 3 -Detail "workDir=$laneWorkDir baseSha=$baseSha branch=$branch"
         exit 3
     }
+    # HOST-FSMONITOR-DAEMON-LEAK-1 (a): a new OR reused lane worktree must not start a `git fsmonitor--daemon` on its first status. Fail-soft: the helper
+    # lives in lane-fsmonitor.ps1 (a fixture that copies this script without it just skips), and nothing here may fail a dispatch.
+    try {
+        if (-not (Get-Command Disable-LaneWorktreeFsmonitor -ErrorAction SilentlyContinue)) { . (Join-Path $PSScriptRoot 'lane-fsmonitor.ps1') }
+        $null = Disable-LaneWorktreeFsmonitor -WorkDir $laneWorkDir
+    } catch { Write-Output "WORKSTREAM: fsmonitor disable skipped for ${laneWorkDir}: $($_.Exception.Message)" }
 
     $script:LastWorktreeDisposition = $null
     function Remove-LaneWorktreeIfClean([string]$WorkDirToCheck) {
