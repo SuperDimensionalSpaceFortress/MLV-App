@@ -193,13 +193,13 @@ def test_surfaces_keep_the_local_copy_and_name_the_pin_aware_follow_up():
 
 # ---------- the card's route, run end to end against the bus's own pin-runner ----------
 
-BUS_CLONE_CANDIDATES = (os.environ.get("FACTORY_BUS_CLONE", ""), "C:/!Layi Wkspc/softwarefactory-fleet-doctrine")
+# r9 (CoS r8 soft note): BUS_CLONE_CANDIDATES and its hub-path default were removed; nothing read them, FACTORY_BUS_CLONE is read directly below.
 RUNNER_BUS_PATH = "tools/factory/pin-runner.py"
 # r7 (CoS r6 improvement 2): hosted CI has no bus clone, so this route test used to skip there and never ran
 # where it matters. The bus runner now travels with the tests as DATA (a .py.txt, outside the python census),
 # pinned by bus SHA and sha256 in the sidecar. FACTORY_BUS_CLONE, when set, is checked AGAINST the fixture.
 RUNNER_FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures"
-RUNNER_FIXTURE_META = RUNNER_FIXTURE_DIR / "pin-runner.bus-c6391d29.json"
+RUNNER_FIXTURE_META = RUNNER_FIXTURE_DIR / "pin-runner.bus-49009d20.json"
 
 
 def _runner_fixture() -> bytes:
