@@ -1414,6 +1414,74 @@ RULE4_R7_NAMED_B3 = _RULE4_R7["named_b3"]
 RULE4_R7_SWEEP_ALLOWED: dict[str, str] = {}
 RULE4_R7_SEEDS = tuple(RULE4_R7_REFUSE + RULE4_R7_PASS)
 
+# r8 (opus key on 03e7ae1b: Blocker + hardening 1-3). The r7 sweep generated the ARGUMENT after the app but fixed the LEAD at `Run <app>` /
+# `Open <app>`, so a markdown code span, `Re-run <app>` and `Run the <app> ...` hid the first launch and a later routed launcher's venue
+# covered it (a refuse -> pass flip against the pin). The r8 lint reads the lead by construction (any run of openers and plain words
+# between the listed verb and the app), and this sweep adds the two axes that were missing, judged by the same pinned-master test:
+#   lead wrapper  none, a backtick code span (with the second call bare and in a code span too), single quotes, double quotes, one word
+#                 and two words between the verb and the app.
+#   verb form     Run, run, Open, open, Launch, Start, Re-run, and `Then run`; the SECOND launcher takes the same verbs behind ` and `.
+# The argument axis is the two shapes that matter for the lead (a bare clip, an attached `--clip=` value): r7's sweep already covers the
+# argument grammar. The pwsh cost is bounded: ~1800 rows, one sharded prefetch, the time is in the PR body.
+# Fixtures keep the `.dat` clip-name convention of this file (no clip this round; NA-4 refuses the real extension in an edit).
+RULE4_R7_PR_HEAD = "03e7ae1b49d469d6be0139b528356bebea0cb8d7"
+RULE4_R8_VERBS = ("Run", "run", "Open", "open", "Launch", "Start", "Re-run", "Then run")
+RULE4_R8_SEPARATORS = ("; run ", ", then run ", " and run ")
+
+
+def _rule4_r8_wraps(app: str, arg: str) -> tuple[tuple[str, bool], ...]:
+    """The lead-wrapper axis: (the call as written after the verb, whether the other call is wrapped in a code span too)."""
+    return ((f"{app} {arg}", False),
+            (f"`{app} {arg}`", False),
+            (f"`{app} {arg}`", True),
+            (f"'{app}' {arg}", False),
+            (f'"{app}" {arg}', False),
+            (f"the {app} {arg}", False),
+            (f"the new {app} {arg}", False))
+
+
+def _rule4_r8_rows() -> dict[str, tuple[str, ...]]:
+    script = f"tools/profiling/{SMOKE_SCRIPT}"
+    app_release = "MLVApp" + "Release.exe"
+    route = RULE4_R7_ROUTE
+    twin_calls = (f"C:\\build\\{app_release} take01.dat {SMOKE_MODE}", f"pwsh -File {script} -Backend cpu")
+    unrouted: list[str] = []
+    routed: list[str] = []
+    for verb, sep, arg, twin_call in itertools.product(RULE4_R8_VERBS, RULE4_R8_SEPARATORS, ("take01.dat", "--clip=take01.dat"), twin_calls):
+        for call, span_twin in _rule4_r8_wraps(app_release, arg):
+            twin = f"`{twin_call}` {route}" if span_twin else f"{twin_call} {route}"
+            # the wrapped call is the FIRST launcher: the route on the next launcher must not cover it
+            unrouted.append(f"{verb} {call}{sep}{twin}.")
+            routed.append(f"{verb} {call} {route}{sep}{twin}.")
+    # the wrapped call is the SECOND launcher (the first one is routed), behind the same verb forms
+    for verb, arg, twin_call in itertools.product(RULE4_R8_VERBS, ("take01.dat", "--clip=take01.dat"), twin_calls):
+        for call, span_twin in _rule4_r8_wraps(app_release, arg):
+            first = f"`{twin_call}` {route}" if span_twin else f"{twin_call} {route}"
+            sep = f" and {verb.lower()} "
+            unrouted.append(f"Run {first}{sep}{call}.")
+            routed.append(f"Run {first}{sep}{call} {route}.")
+    # the opus rows: the code-span catalogue row with its `; run` / `, then run` twins, the second call with and without backticks, and the
+    # two hardening rows (a hyphen-prefixed verb, a word between the verb and the app) with the same three separators
+    second = f"C:\\build\\{app_release} take01.dat {SMOKE_MODE}"
+    named: list[str] = []
+    for sep in (" and run ", "; run ", ", then run "):
+        named.append(f"Run `{app_release} take01.dat`{sep}`{second}` {route}.")
+        named.append(f"Run `{app_release} take01.dat`{sep}{second} {route}.")
+        named.append(f"Re-run {app_release} take01.dat{sep}{second} {route}.")
+        named.append(f"Run the {app_release} build on take01.dat{sep}{second} {route}.")
+    return {"unrouted": tuple(dict.fromkeys(list(named) + unrouted)), "routed": tuple(dict.fromkeys(routed)), "named": tuple(named)}
+
+
+_RULE4_R8 = _rule4_r8_rows()
+RULE4_R8_REFUSE = _RULE4_R8["unrouted"]
+RULE4_R8_PASS = _RULE4_R8["routed"]
+RULE4_R8_NAMED = _RULE4_R8["named"]
+# Accepted over-refusal (opus note on 03e7ae1b, named in the PR body): any first argument after a launcher that follows a routed launch is
+# a launch of its own, so a harmless second call refuses where the pin passes it. It fails closed; route it or split the sentence.
+RULE4_R8_OVERREFUSAL = (f"Run C:\\build\\{'MLVApp' + 'Release.exe'} take01.dat {SMOKE_MODE} {RULE4_R7_ROUTE} and open {'MLVApp' + 'Release.exe'} --help.",)
+# The r8 sweep's allow-list: a row the pre-change master refuses that passes on the head. EMPTY; an entry needs a reason.
+RULE4_R8_SWEEP_ALLOWED: dict[str, str] = {}
+
 
 class HubHostsFileTests(unittest.TestCase):
     def test_file_names_the_hub_and_no_venue(self):
@@ -2331,6 +2399,61 @@ class PromptLintTests(unittest.TestCase):
         self.assertTrue(any("--o7" in t for t in red) and any("=take01" in t or "=D:" in t for t in red) and any("/clip" in t for t in red), "the N2 / B3 argument forms are RED")
         self.assertEqual([], [t for t in RULE4_R7_PASS if old[t] > 0], f"routed rows {r6[0]} refuses: the ALLOW rows must be unchanged")
         self.assertEqual([], [t for t in earlier if (old[t] > 0) != (new[t] > 0)], f"an earlier rule-4 row changed its verdict against {r6[0]}")
+
+    def test_red_rule4_r8_the_lead_of_a_launch_is_any_run_of_openers_and_plain_words(self):
+        """r8: the opus rows (a markdown code span, `Re-run`, a word between the verb and the app; each with its `; run` / `, then run`
+        twins) and the generated lead-wrapper x verb-form sweep refuse without a route of their own; the same rows with their own route
+        pass. The accepted over-refusal (a harmless second call after a routed launch) refuses."""
+        self.assertEqual(12, len(RULE4_R8_NAMED))
+        for row in RULE4_R8_NAMED:
+            self.assertIn(row, RULE4_R8_REFUSE)
+        self.assertTrue(any("`" in t for t in RULE4_R8_NAMED) and any(t.startswith("Re-run ") for t in RULE4_R8_NAMED)
+                        and any(t.startswith("Run the ") for t in RULE4_R8_NAMED), "the opus row shapes")
+        self.assertEqual({"Run", "run", "Open", "open", "Launch", "Start", "Re-run", "Then run"}, set(RULE4_R8_VERBS))
+        rows = list(RULE4_R8_REFUSE + RULE4_R8_OVERREFUSAL)
+        counts = _json_counts(LINT_PS1, rows, self.tmp, "rule4-r8-refuse")
+        self.assertEqual([], [t for t, n in zip(rows, counts) if n == 0], "r8 rows the lint passed that it must refuse")
+        rows = list(RULE4_R8_PASS)
+        counts = _json_counts(LINT_PS1, rows, self.tmp, "rule4-r8-pass")
+        self.assertEqual([], [t for t, n in zip(rows, counts) if n > 0], "r8 rows with every launcher routed that the lint refused")
+
+    def test_rule4_r8_sweep_no_row_the_pre_change_master_refuses_passes_on_the_head(self):
+        """The r8 Prevention check: the lead-wrapper x verb-form rows are GENERATED and judged against the pinned pre-change master. No row
+        it refuses may pass on the head unless RULE4_R8_SWEEP_ALLOWED names it (empty). It does not skip once master carries this lint."""
+        self.maxDiff = None
+        pin = _rule4_r1_head_lint(RULE4_PRE_CHANGE_MASTER, "pre-change master", moot_once_master_carries_it=False)
+        (self.tmp / "rule4-r8-pin.ps1").write_text(pin[1], encoding="utf-8")
+        texts = list(RULE4_R8_REFUSE + RULE4_R8_PASS + RULE4_R8_OVERREFUSAL)
+        _prefetch_counts(self.tmp, [(self.tmp / "rule4-r8-pin.ps1", texts, "rule4-r8-pin"), (LINT_PS1, texts, "rule4-r8-now")])
+        old = dict(zip(texts, _verdicts(self.tmp / "rule4-r8-pin.ps1", texts)))
+        new = dict(zip(texts, _verdicts(LINT_PS1, texts)))
+        opened = [t for t in texts if old[t] > 0 and new[t] == 0 and t not in RULE4_R8_SWEEP_ALLOWED]
+        self.assertEqual([], opened, f"rows {pin[0]} refuses that now pass: an unlisted refuse -> pass flip of the lead grammar")
+        self.assertEqual([], [t for t, why in RULE4_R8_SWEEP_ALLOWED.items() if not why.strip()], "a sweep allow-list entry has no reason")
+        self.assertEqual([], [t for t in RULE4_R8_PASS if old[t] > 0], f"routed rows {pin[0]} refuses: the ALLOW rows must be unchanged")
+        for row in RULE4_R8_NAMED:
+            self.assertGreater(old[row], 0, f"{pin[0]} passes the opus row: it is not a refuse -> pass flip")
+
+    def test_rule4_r8_rows_are_red_on_the_r7_head_and_every_earlier_row_keeps_its_verdict(self):
+        """RED proof kept in the suite: the opus rows PASS on the lint of the r7 head 03e7ae1b, and so do other sweep rows (wrapped and
+        prefixed leads). Against that head nothing else moves: the routed rows keep passing and every earlier rule-4 row keeps its verdict."""
+        self.maxDiff = None
+        r7 = _rule4_r1_head_lint(RULE4_R7_PR_HEAD, "r7")
+        (self.tmp / "rule4-r7-head.ps1").write_text(r7[1], encoding="utf-8")
+        earlier = list(dict.fromkeys(RULE4_R2_REFUSE + RULE4_R2_GUARDS + RULE4_SECOND_LAUNCHER_REFUSE + RULE4_SECOND_LAUNCHER_GUARDS
+                                     + RULE4_R2_PASS + RULE4_BOTH_ROUTED_PASS + RULE4_R4_REFUSE + RULE4_R4_PASS + RULE4_R6_REFUSE + RULE4_R6_PASS
+                                     + RULE4_R7_REFUSE + RULE4_R7_PASS))
+        mine = list(RULE4_R8_REFUSE + RULE4_R8_PASS + RULE4_R8_OVERREFUSAL)
+        _prefetch_counts(self.tmp, [(self.tmp / "rule4-r7-head.ps1", earlier + mine, "rule4-r8-r7head"), (LINT_PS1, earlier + mine, "rule4-r8-r7now")])
+        old = dict(zip(earlier + mine, _verdicts(self.tmp / "rule4-r7-head.ps1", earlier + mine)))
+        new = dict(zip(earlier + mine, _verdicts(LINT_PS1, earlier + mine)))
+        for row in RULE4_R8_NAMED:
+            self.assertEqual(0, old[row], f"{r7[0]} already refuses an opus row: not a RED row")
+        red = [t for t in RULE4_R8_REFUSE if old[t] == 0]
+        self.assertGreater(len(red), len(RULE4_R8_NAMED), "the sweep reaches past the named rows")
+        self.assertTrue(any("`" in t for t in red) and any("Re-run" in t for t in red) and any(" the " in t for t in red), "the lead-wrapper and verb-form axes are RED")
+        self.assertEqual([], [t for t in RULE4_R8_PASS if old[t] > 0], f"routed rows {r7[0]} refuses: the ALLOW rows must be unchanged")
+        self.assertEqual([], [t for t in earlier if (old[t] > 0) != (new[t] > 0)], f"an earlier rule-4 row changed its verdict against {r7[0]}")
 
     def test_rule4_the_refuse_rows_are_red_on_the_baseline(self):
         """RED proof kept in the suite: every second-launcher row passes the lint of RULE4_PRE_CHANGE_MASTER, the master this PR branched

@@ -573,7 +573,8 @@ function Get-LocalPlaybackPromptFindings {
     # ("--log C:\MLVApp\out.txt", "-WorkingDirectory C:\pwsh\w" stopped the gap and hid the launch). A stop is fail-closed because the
     # stopping token is matched on its own over the rest of the same gap. The app gap stops at the next app token, the pwsh gap at the
     # next pwsh / powershell token; a launcher of the other family does not stop a gap (it may not be a launch of its own).
-    $appStop = "[&('`"]*(?:[^\s;]*[\\/])?MLVApp(?:Release)?\.exe['`"]?\s"
+    # r8: a backtick opens or closes an app token like a quote does (a markdown code span), so the next app launcher stops a gap in either spelling.
+    $appStop = "[&('`"``]*(?:[^\s;]*[\\/])?MLVApp(?:Release)?\.exe['`"``]?\s"
     $pwshStop = "(?<![^\s&('`"\\/])(?:pwsh|powershell)(?:\.exe)?['`"]?\s"
     $pwshGap = "(?:(?!;)(?!${pwshStop})[^\n]){0,80}?"
     $appArg = "(?:(?!/\s)(?!${appStop})[^\s;]+\s+){0,12}?"
@@ -594,7 +595,17 @@ function Get-LocalPlaybackPromptFindings {
     # attached `--opt=value`, a `/opt`, a bare token, a number, a quoted value and a chain of any length are covered by construction, and
     # nothing in this pattern reads the shape of the argument. The next app launcher stays out of it, so a second launcher never reads as
     # the first one's argument (it is scored on its own route). An app token with no argument after it is no launch here (needs `\s+<arg>`).
-    $clipLaunch = "(?i)(?<=${b}(?:${verbs})\s+(?:&\s*)?['`"]?(?:[^\s;'`"]*[\\/])?)MLVApp(Release)?\.exe['`"]?\s+(?!${appArg}--(?:gui-smoke-playback|profile-playback))(?!${appStop})[^\s;]"
+    # r8 (opus review of 03e7ae1b, blocker + hardening 1-2): the LEAD of a launch -- what may stand between the listed verb and the app
+    # token -- is read by construction, not by a list of wrappers. r7 took only `<verb> [&] ['"] [path]`, so a markdown code span (a
+    # backtick before the app), `Re-run <app>` (a hyphen before the verb) and `Run the <app> ...` (a word between verb and app) hid the
+    # FIRST launch and a later routed launcher's venue covered it: a refuse -> pass flip against the pin. The lead is now any run of
+    # openers (`&`, `(`, a quote, a backtick) and plain words, ending in an optional path, that holds no launcher word and no playback
+    # mode: a launcher word is `pwsh` / `powershell`, and the app token, a script name and a mode flag are not plain words (`.`/`-`).
+    # The verb may carry a hyphenated prefix (`Re-run`). A comma, a colon or any other punctuation ends the lead.
+    $leadOpen = '(?:[&(''"`]\s*)*'
+    $leadWords = '(?:' + $leadOpen + '(?!(?:pwsh|powershell)(?![\w\-]))\w+[''"`]*\s+)*'
+    $leadPath = '(?:[^\s;''"`]*[\\/])?'
+    $clipLaunch = "(?i)(?<=(?<!\w)(?:\w+-)?(?:${verbs})(?![\w\-])\s+${leadWords}${leadOpen}${leadPath})MLVApp(Release)?\.exe['`"``]?\s+(?!${appArg}--(?:gui-smoke-playback|profile-playback))(?!${appStop})[^\s;]"
     $findings = New-Object System.Collections.Generic.List[string]
     # A "sentence" is a line, cut again at '. ' so one bullet carrying several instructions is judged piece by piece. A semicolon is NOT a
     # sentence boundary since r6: it is a hard clause cut (no inheritance, per-group playback test) that the defeater scan reads across.
