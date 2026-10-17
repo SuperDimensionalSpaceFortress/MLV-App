@@ -176,9 +176,9 @@ function Remove-NoLocalPlaybackSection {
 function Get-LintClauses {
     param([string]$Sentence, [string]$Separator, [string]$Contrast, [string]$LaunchVerb, [string]$StrongNeg, [string]$WeakNeg, [string]$VenueQualified)
     $cuts = New-Object System.Collections.Generic.List[object]
-    foreach ($m in [regex]::Matches($Sentence, $Separator)) { $cuts.Add([pscustomobject]@{ Index = $m.Index; Length = $m.Length; Contrast = $false; Disjunct = ($m.Value.Trim() -ieq 'or'); Hard = ($m.Value -ceq ';') }) }
+    foreach ($m in (Get-LintRegex $Separator).Matches($Sentence)) { $cuts.Add([pscustomobject]@{ Index = $m.Index; Length = $m.Length; Contrast = $false; Disjunct = ($m.Value.Trim() -ieq 'or'); Hard = ($m.Value -ceq ';') }) }
     if ($Contrast) {
-        foreach ($m in [regex]::Matches($Sentence, $Contrast)) { $cuts.Add([pscustomobject]@{ Index = $m.Index; Length = $m.Length; Contrast = $true; Disjunct = $false; Hard = $false }) }
+        foreach ($m in (Get-LintRegex $Contrast).Matches($Sentence)) { $cuts.Add([pscustomobject]@{ Index = $m.Index; Length = $m.Length; Contrast = $true; Disjunct = $false; Hard = $false }) }
     }
     $ordered = @($cuts | Sort-Object -Property @{ Expression = 'Index'; Descending = $false }, @{ Expression = 'Length'; Descending = $true })
     $spans = New-Object System.Collections.Generic.List[object]
@@ -261,7 +261,7 @@ function Get-VenueRoutedLocallyEnd {
     param([string]$Sentence, [object]$Clause, [int]$Index, [string]$VenueLocus, [string]$Prepositions)
     if ($Index -lt $Clause.Start -or $Index -ge $Clause.End) { return -1 }
     $tail = $Sentence.Substring($Index, $Clause.End - $Index)
-    $m = [regex]::Match($tail, "(?i)^locally\s+(?:${Prepositions})\s+(?:(?:the|a|an)\s+)?${VenueLocus}")
+    $m = (Get-LintRegex "(?i)^locally\s+(?:${Prepositions})\s+(?:(?:the|a|an)\s+)?${VenueLocus}").Match($tail)
     if (-not $m.Success) { return -1 }
     return $Index + $m.Length
 }
@@ -340,7 +340,7 @@ function Test-LocalHostInScope {
         }
         elseif ($k.Contrast -or $k.Strong -or $k.Weak) { continue }
         foreach ($pattern in $HostPatterns) {
-            foreach ($m in [regex]::Matches($k.Text, $pattern)) {
+            foreach ($m in (Get-LintRegex $pattern).Matches($k.Text)) {
                 if (-not (Test-ContrastLead -Sentence $Sentence -Clause $k -Index ($k.Start + $m.Index))) { return $true }
             }
         }
@@ -418,11 +418,29 @@ function ConvertTo-LintAlternation {
     return (($sorted | ForEach-Object { [regex]::Escape($_).Replace('\ ', $gap) }) -join '|')
 }
 
-function Get-LocalPlaybackPromptFindings {
-    [CmdletBinding()]
-    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Text)
+# r11 (NA2-RULE4-PER-LAUNCHER-SCOPE-1, merge_group 39021953705 timed the coordination step out): no behaviour change, only cost.
+# Every pattern below is a pure function of the closed word lists, so the whole set is built ONCE per process (Get-LintPatternSet) instead
+# of once per call (~90 string builds and six regex constructions, ~15-30 ms a call), and the two big grammars are built only when an
+# E1 marker reaches them (-WithGrammars). Every static [regex]::Match / Matches / IsMatch went through .NET's 15-entry static regex
+# cache; the rule-4 patterns pushed the distinct patterns one sentence reads past 15, so each call re-parsed the big ones. Get-LintRegex
+# keeps one Regex per pattern string for the life of the process (default options, exactly what the static calls used).
+$script:LintPatternSet = $null
+$script:LintRegexCache = [hashtable]::new([System.StringComparer]::Ordinal)
+function Get-LintRegex {
+    param([string]$Pattern)
+    $rx = $script:LintRegexCache[$Pattern]
+    if ($null -eq $rx) {
+        $rx = [regex]::new($Pattern)
+        $script:LintRegexCache[$Pattern] = $rx
+    }
+    return $rx
+}
 
-    $scan = Remove-NoLocalPlaybackSection -Text $Text
+function Get-LintPatternSet {
+    [CmdletBinding()]
+    param([switch]$WithGrammars)
+
+    if ($null -ne $script:LintPatternSet -and (-not $WithGrammars -or $script:LintPatternSet.ContainsKey('TailGrammar'))) { return $script:LintPatternSet }
     # A verb or product word is bounded by non-word, non-hyphen characters, so "run-release-gui-smoke" is not the verb "run" and
     # "MLVAPP_C1_VECTORS_DIR" is not the app.
     $b = '(?<![\w\-])'; $e = '(?![\w\-])'
@@ -501,6 +519,8 @@ function Get-LocalPlaybackPromptFindings {
         $hostLocusRef += "|(?<!${b}(?:${destinationPreposition})\s+(?:${hostDeterminer})\s+)${b}(?:$(ConvertTo-LintAlternation -Words $nounNames -Loose))(?!\w)"
     }
     $hostDefeatersLaunch = @($hostMarker, $hereDefeater, $hostLocusRef)
+    $tailGrammar = $null; $headGrammar = $null; $itemGrammar = $null
+    if ($WithGrammars) {
     # r10: the closed allow-grammar of the strictly terminal E1 (Test-VenueTerminalTail), a whitelist tokenizer as ONE anchored regex.
     # Every token is a word from a list followed by a token end ($tb); each fragment and each separator is atomic, so the match runs left
     # to right without backtracking into what it has read and stops at the first token the grammar does not name. Two fragments need a
@@ -521,10 +541,7 @@ function Get-LocalPlaybackPromptFindings {
     $tailFragC = "(?:${tailNegation})${tb}\s+${tailHostTarget}"
     $tailSep = "(?:[.!?;:,]+(?=\s|\z)|(?<=\s|^)-{1,2}(?=\s)|(?:${tailJoiner})${tb})"
     $tailFrag = "(?:${tailFragA}|${tailFragC}|${tailLocus})"
-    $tailState = @{
-        Grammar   = [regex]::new("(?i)^\s*(?:(?>${tailSep})\s*)*(?:(?>${tailFrag})(?:\s*(?>${tailSep}))+\s*)*(?:(?>${tailFrag})\s*)?\z")
-        NextDirty = $null
-    }
+    $tailGrammar = [regex]::new("(?i)^\s*(?:(?>${tailSep})\s*)*(?:(?>${tailFrag})(?:\s*(?>${tailSep}))+\s*)*(?:(?>${tailFrag})\s*)?\z")
     # r12: the closed HEAD grammar (see the header, Test-HeadGrammar), built from the same token machinery as the tail grammar. A head
     # piece is parsed LEFT TO RIGHT from its first character and every fragment is atomic: the first token no list names ends the match
     # and the piece is dirty. Fragments, in order (the first that matches wins, so a longer shape is listed before its own prefix):
@@ -558,12 +575,10 @@ function Get-LocalPlaybackPromptFindings {
     # a list marker or heading marks at the start of an item: "## ", "* ", "> ", "1. ", "2) " ("- " is a spaced dash, a separator)
     $headListMark = "(?:#{1,6}|[*+>]+|\d{1,3}[.)])\s+"
     $headOpen = "(?i)^\s*(?:${headListMark})*(?:(?>${headSep})\s*)*(?:(?>${headFrag})(?:\s*(?>${headSep}))+\s*)*"
-    # r12: the state of the head check of E1: both grammars and the cursor of the single forward pass over the earlier items
-    # (Test-EarlierItemDirty). The marker's own head may end in a bare launch; an earlier item may not.
-    $headState = @{
-        HeadGrammar = [regex]::new("${headOpen}(?:(?>${headFrag}|${headBareLaunch})\s*)?\z")
-        ItemGrammar = [regex]::new("${headOpen}(?:(?>${headFrag})\s*)?\z")
-        Cursor = 0; Block = -1; Flag = $false
+    # r12: the head check of E1 reads both grammars with a cursor over the earlier items (Test-EarlierItemDirty; the per-call state is
+    # built in Get-LocalPlaybackPromptFindings, r11). The marker's own head may end in a bare launch; an earlier item may not.
+    $headGrammar = [regex]::new("${headOpen}(?:(?>${headFrag}|${headBareLaunch})\s*)?\z")
+    $itemGrammar = [regex]::new("${headOpen}(?:(?>${headFrag})\s*)?\z")
     }
     # r2 (NA2-RULE4-PER-LAUNCHER-SCOPE-1, CoS review of 75cb00e1): a launcher's gap can never reach across a `;` or into the NEXT launcher.
     # The r1 gaps ([^\n]{0,80}? after pwsh, up to 12 argument tokens after the app) could run over `; pwsh ...` / `; <app> ...`, so a first
@@ -619,6 +634,38 @@ function Get-LocalPlaybackPromptFindings {
     # app and the flags with a bare ` / ` between them, and a separator slash is no argument (appArg stops at one for the same reason).
     # It is scored only where there is no direct launch, so the r9 reading of $clipLaunch in a launch sentence is unchanged.
     $clipMention = "(?i)${b}MLVApp(Release)?\.exe['`"``]?\s+(?!/\s)(?!${appArg}--(?:gui-smoke-playback|profile-playback))(?!${appStop})[^\s;]"
+    $set = @{
+        Separator = $separator; Contrast = $contrast; LaunchVerb = $launchVerb; StrongNeg = $strongNeg; WeakNeg = $weakNeg
+        VenueQualified = $venueQualified; PlaybackWord = $playbackWord; VenueLocus = $venueLocus; RoutingLocally = $routingLocally
+        Incident = $incident; LocalMarker = $localMarker; HostMarker = $hostMarker; HereMarker = $hereMarker
+        HostDefeaters = $hostDefeaters; HostDefeatersLaunch = $hostDefeatersLaunch
+        Direct = $direct; ClipLaunch = $clipLaunch; ClipMention = $clipMention; AppBare = $appBare; ModeFlag = $modeFlag
+        # the rule triggers, in the order they were always tried (the incident phrase, the three markers, the mode flag, then the launch patterns)
+        Triggers = @([regex]::new($incident), [regex]::new($localMarker), [regex]::new($hostMarker), [regex]::new($hereMarker), [regex]::new($modeFlag)) + @($direct | ForEach-Object { [regex]::new($_) })
+    }
+    if ($WithGrammars) { $set.TailGrammar = $tailGrammar; $set.HeadGrammar = $headGrammar; $set.ItemGrammar = $itemGrammar }
+    $script:LintPatternSet = $set
+    return $set
+}
+
+function Get-LocalPlaybackPromptFindings {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Text)
+
+    $scan = Remove-NoLocalPlaybackSection -Text $Text
+    $patterns = Get-LintPatternSet
+    $separator = $patterns.Separator; $contrast = $patterns.Contrast; $launchVerb = $patterns.LaunchVerb
+    $strongNeg = $patterns.StrongNeg; $weakNeg = $patterns.WeakNeg; $venueQualified = $patterns.VenueQualified
+    $playbackWord = $patterns.PlaybackWord; $venueLocus = $patterns.VenueLocus; $routingLocally = $patterns.RoutingLocally
+    $localMarker = $patterns.LocalMarker; $hostMarker = $patterns.HostMarker; $hereMarker = $patterns.HereMarker
+    $hostDefeaters = $patterns.HostDefeaters; $hostDefeatersLaunch = $patterns.HostDefeatersLaunch
+    $direct = $patterns.Direct; $modeFlag = $patterns.ModeFlag
+    $triggers = $patterns.Triggers
+    # (incident, clipLaunch, clipMention and appBare are read as $patterns.<Name> below: tools/repo_hygiene's quote-class pin evaluates the
+    # LAST assignment of each of those names in this file, which must stay the pattern itself, not a copy out of the set)
+    # the per-call state of the two E1 grammars (the cursor and the memo are mutated while one prompt is read); built when an E1 marker needs it
+    $tailState = $null
+    $headState = $null
     $findings = New-Object System.Collections.Generic.List[string]
     # A "sentence" is a line, cut again at '. ' so one bullet carrying several instructions is judged piece by piece. A semicolon is NOT a
     # sentence boundary since r6: it is a hard clause cut (no inheritance, per-group playback test) that the defeater scan reads across.
@@ -638,7 +685,6 @@ function Get-LocalPlaybackPromptFindings {
     # prompt). The sentence-terminal E1 reads later items through their index (Test-VenueTerminalTail, $tailState.NextDirty).
     # A sentence that holds none of the rule triggers (the incident phrase, `locally`, an on-this-host marker, a bare `here`, a direct
     # launch pattern) cannot be refused by any rule below, so it skips the clause analysis: same verdict, linear cost on long prompts.
-    $triggers = @([regex]::new($incident), [regex]::new($localMarker), [regex]::new($hostMarker), [regex]::new($hereMarker), [regex]::new($modeFlag)) + @($direct | ForEach-Object { [regex]::new($_) })
     for ($itemIndex = 0; $itemIndex -lt $items.Count; $itemIndex++) {
         foreach ($sentence in @($items[$itemIndex].Text)) {
             $s = $sentence.Trim()
@@ -663,21 +709,22 @@ function Get-LocalPlaybackPromptFindings {
             $hit = $null
             # (1) the incident phrase: "where a GUI desktop session and the clip exist" and its relatives. A phrase that opens with a quote
             # mark is a QUOTATION of the old wording (an incident report), not an instruction; the clause holding "where" must not be a prohibition.
-            $m1 = [regex]::Match($s, $incident)
+            $m1 = (Get-LintRegex $patterns.Incident).Match($s)
             if ($m1.Success -and -not (Get-ClauseAt -Clauses $clauses -Index $m1.Index).Strong) { $hit = 'where-a-gui-session-exists' }
             # (2) "locally" attached to a playback / smoke / MLVApp / arm instruction. FAIL CLOSED: its own clause must be a prohibition, or
             # match E1 (locally + routing preposition + venue word) or E2 (the marker opens a contrast complement). A venue word elsewhere
             # in the clause ("locally since Bachelor is busy") exempts nothing.
             if (-not $hit) {
-                foreach ($m in [regex]::Matches($s, $localMarker)) {
+                foreach ($m in (Get-LintRegex $localMarker).Matches($s)) {
                     $c = Get-ClauseAt -Clauses $clauses -Index $m.Index
                     if (-not $groupPlayback[[int]$c.Group]) { continue }
                     # A prohibition exempts the marker only when it GOVERNS it: inherited from an earlier clause, or its own negation word sits
                     # before the marker. A negation that comes AFTER the marker in the same clause ("..., don't wait, then run it here") is
                     # a qualifier of something else and hides nothing (r8; it used to exempt the whole clause).
                     if ($c.Strong) {
-                        if (-not [regex]::IsMatch($c.Text, $strongNeg)) { continue }
-                        if ([regex]::IsMatch($s.Substring($c.Start, [Math]::Max(0, $m.Index - $c.Start)), $strongNeg)) { continue }
+                        $strongNegRx = Get-LintRegex $strongNeg
+                        if (-not $strongNegRx.IsMatch($c.Text)) { continue }
+                        if ($strongNegRx.IsMatch($s.Substring($c.Start, [Math]::Max(0, $m.Index - $c.Start)))) { continue }
                     }
                     if ((Test-ContrastLead -Sentence $s -Clause $c -Index $m.Index) -and
                         -not (Test-LocalHostInScope -Sentence $s -Clauses $clauses -Clause $c -HostPatterns $hostDefeaters)) { continue }
@@ -687,6 +734,11 @@ function Get-LocalPlaybackPromptFindings {
                     # must every earlier item of the block. The head grammar has no host list to miss: a word it does not name voids E1.
                     $e1End = Get-VenueRoutedLocallyEnd -Sentence $s -Clause $c -Index $m.Index -VenueLocus $venueLocus -Prepositions $routingLocally
                     if ($e1End -ge 0) {
+                        if ($null -eq $headState) {
+                            $grammars = Get-LintPatternSet -WithGrammars
+                            $tailState = @{ Grammar = $grammars.TailGrammar; NextDirty = $null }
+                            $headState = @{ HeadGrammar = $grammars.HeadGrammar; ItemGrammar = $grammars.ItemGrammar; Cursor = 0; Block = -1; Flag = $false }
+                        }
                         $headBenign = (Test-HeadGrammar -Head $s.Substring(0, $m.Index) -Grammar $headState.HeadGrammar) -and
                             (-not (Test-EarlierItemDirty -Items $items -Index $itemIndex -State $headState))
                         if ($headBenign -and (Test-VenueTerminalTail -Remainder $s.Substring($e1End) -Items $items -Index $itemIndex -State $tailState)) { continue }
@@ -697,7 +749,7 @@ function Get-LocalPlaybackPromptFindings {
             # (3) "on this host / the hub (VM)" attached to a playback launch; a negation or a venue word in that clause exempts it (master's
             # exemption, clause-scoped), as does E2
             if (-not $hit) {
-                foreach ($m in [regex]::Matches($s, $hostMarker)) {
+                foreach ($m in (Get-LintRegex $hostMarker).Matches($s)) {
                     $c = Get-ClauseAt -Clauses $clauses -Index $m.Index
                     if (-not $groupPlayback[[int]$c.Group]) { continue }
                     if (-not ($c.Strong -or $c.Weak -or (Test-VenueExempts -Sentence $s -Clauses $clauses -Clause $c -HostPatterns $hostDefeaters) -or (Test-ContrastLead -Sentence $s -Clause $c -Index $m.Index))) { $hit = 'run-playback-on-this-host'; break }
@@ -705,7 +757,7 @@ function Get-LocalPlaybackPromptFindings {
             }
             # (3b) a bare "here" is weak evidence, so the launch verb and the playback word must sit in the same clause as the word
             if (-not $hit) {
-                foreach ($m in [regex]::Matches($s, $hereMarker)) {
+                foreach ($m in (Get-LintRegex $hereMarker).Matches($s)) {
                     $c = Get-ClauseAt -Clauses $clauses -Index $m.Index
                     if ($c.HasVerb -and ($c.Text -match $playbackWord) -and -not ($c.Strong -or $c.Weak -or (Test-VenueExempts -Sentence $s -Clauses $clauses -Clause $c -HostPatterns $hostDefeaters) -or (Test-ContrastLead -Sentence $s -Clause $c -Index $m.Index))) { $hit = 'run-playback-here'; break }
                 }
@@ -718,21 +770,21 @@ function Get-LocalPlaybackPromptFindings {
             if (-not $hit) {
                 $launchSpans = New-Object System.Collections.Generic.List[object]
                 for ($pi = 0; $pi -lt $direct.Count; $pi++) {
-                    foreach ($m4 in [regex]::Matches($s, $direct[$pi])) { $launchSpans.Add([pscustomobject]@{ Start = [int]$m4.Index; End = [int]($m4.Index + $m4.Length); App = ($pi -eq 0) }) }
+                    foreach ($m4 in (Get-LintRegex $direct[$pi]).Matches($s)) { $launchSpans.Add([pscustomobject]@{ Start = [int]$m4.Index; End = [int]($m4.Index + $m4.Length); App = ($pi -eq 0) }) }
                 }
                 # r4b: an app launch with a clip argument is one launcher of its own (an app span: it never merges)
                 # r10 (B6): scored in a sentence that holds a direct launch OR a playback mode flag anywhere (a `;` may cut the two apart)
-                $hasModeFlag = [regex]::IsMatch($s, $modeFlag)
+                $hasModeFlag = (Get-LintRegex $modeFlag).IsMatch($s)
                 $hasDirectLaunch = $launchSpans.Count -gt 0
                 if ($hasDirectLaunch) {
-                    foreach ($m4 in [regex]::Matches($s, $clipLaunch)) { $launchSpans.Add([pscustomobject]@{ Start = [int]$m4.Index; End = [int]($m4.Index + $m4.Length); App = $true }) }
+                    foreach ($m4 in (Get-LintRegex $patterns.ClipLaunch).Matches($s)) { $launchSpans.Add([pscustomobject]@{ Start = [int]$m4.Index; End = [int]($m4.Index + $m4.Length); App = $true }) }
                 }
                 elseif ($hasModeFlag) {
                     # no direct launch: the mode flag was cut off by the `;` or sits out of the app's reach. An app token with no argument is a
                     # mention, not a launch, unless NOTHING else in the sentence is. With a direct launch present, `Build <app>; then run <app>
                     # <mode> on Bachelor.` stays a pass.
-                    foreach ($m4 in [regex]::Matches($s, $clipMention)) { $launchSpans.Add([pscustomobject]@{ Start = [int]$m4.Index; End = [int]($m4.Index + $m4.Length); App = $true }) }
-                    foreach ($m4 in [regex]::Matches($s, $appBare)) { $launchSpans.Add([pscustomobject]@{ Start = [int]$m4.Index; End = [int]($m4.Index + $m4.Length); App = $true }) }
+                    foreach ($m4 in (Get-LintRegex $patterns.ClipMention).Matches($s)) { $launchSpans.Add([pscustomobject]@{ Start = [int]$m4.Index; End = [int]($m4.Index + $m4.Length); App = $true }) }
+                    foreach ($m4 in (Get-LintRegex $patterns.AppBare).Matches($s)) { $launchSpans.Add([pscustomobject]@{ Start = [int]$m4.Index; End = [int]($m4.Index + $m4.Length); App = $true }) }
                 }
                 $occurrences = New-Object System.Collections.Generic.List[object]
                 foreach ($sp in @($launchSpans | Sort-Object -Property @{ Expression = 'Start'; Descending = $false }, @{ Expression = 'End'; Descending = $true })) {
