@@ -413,7 +413,8 @@ LOOSENED_CASE_NAME = "control claude auth logout"
 LOOSENED_ROW_ID = "hook:control-claude-auth-logout"
 
 
-def _wrapped_head_hook_source() -> str:
+def _wrapped_head_hook_source(loosen_command: str = LOOSEN_COMMAND) -> str:
+    """The wrapper head hook: the real hook, except that it ALLOWS exactly `loosen_command` (default: the CoS repro row). r6 parametrized it."""
     real = str(REPO_ROOT / slp.HOOK_REL)
     return "\n".join([
         f"_REAL = {real!r}",
@@ -424,7 +425,7 @@ def _wrapped_head_hook_source() -> str:
         "",
         "",
         "def decide(payload, project_dir):",
-        f"    if (payload.get('tool_input') or {{}}).get('command') == {LOOSEN_COMMAND!r}:",
+        f"    if (payload.get('tool_input') or {{}}).get('command') == {loosen_command!r}:",
         "        return 0, ''",
         "    return _real_decide(payload, project_dir)",
         "",
@@ -543,6 +544,168 @@ class BaselineDerivedRowsTests(ParityRunnerCase):
         self.assertEqual(rc, slp.EXIT_LOOSENED, out.getvalue())
         self.assertIn(f"LOOSENED {victim_row['id']}", out.getvalue())
         self.assertIn("loosened=1", out.getvalue())
+
+
+# r6 B2 (CoS review of 9931280c): both unions were keyed by id, and a hook row's id is its case NAME, so editing a row's input in place under
+# the same name (or a static corpus row's text under its id) took the master-denied command out of the comparison with every count
+# unchanged.  The unions are now by (id, content); a baseline row whose id the head has with different content joins as `<id>@base-<hash>`.
+# The scratch "head" files below wrap the real tracked ones and change exactly one thing; nothing tracked is edited.
+def _head_hook_tests_source_with(case_name: str, mutation: str) -> str:
+    """A scratch head copy of the hook suite whose CASES row named `case_name` is replaced by `mutation`, an expression over `c`."""
+    real = str(REPO_ROOT / slp.HOOK_TEST_REL)
+    return "\n".join([
+        f"_REAL = {real!r}",
+        "__file__ = _REAL",
+        "exec(compile(open(_REAL, encoding='utf-8').read(), _REAL, 'exec'), globals())",
+        f"_target = next(c for c in CASES if c['name'] == {case_name!r})",
+        f"CASES = [({mutation}) if c is _target else c for c in CASES]",
+        "",
+    ])
+
+
+class BaselineContentUnionTests(ParityRunnerCase):
+    """r6 B2, hook half: derived hook rows are unioned with the baseline's by (id, content), content = tool, input, fixture and raw."""
+
+    def redirect_head_hook_tests(self, tests: Path):
+        real = slp.load_module
+
+        def load(path, name):
+            return real(tests if Path(path).name == Path(slp.HOOK_TEST_REL).name else path, name)
+        return mock.patch.object(slp, "load_module", load)
+
+    def test_B2_an_input_edited_in_place_under_the_same_name_is_still_loosened(self):
+        hook = _write(self.tmp / "head_hook.py", _wrapped_head_hook_source())
+        tests = _write(self.tmp / "head_hook_tests.py", _head_hook_tests_source_with(
+            LOOSENED_CASE_NAME, "dict(c, input=dict(c['input'], command=c['input']['command'] + ' --all'))"))
+        with self.redirect_head_hook_tests(tests):
+            head_ids = [c.id for c in slp.derived_hook_cases(REPO_ROOT)]
+        self.assertEqual(len(head_ids), EXACT_DERIVED_HOOK_ROWS, "the count pin stays green: this is the CoS B2 repro")
+        self.assertIn(LOOSENED_ROW_ID, head_ids, "same name, same expectation: the head still has a row under the id")
+        out = io.StringIO()
+        with self.redirect_head_hook_tests(tests), contextlib.redirect_stdout(out):
+            rc = slp.main(["--base", "HEAD", "--lint", "hook", "--corpus", str(self.corpus()), "--allow", str(self.allow), "--head-hook", str(hook)])
+        self.assertEqual(rc, slp.EXIT_LOOSENED, out.getvalue())
+        self.assertRegex(out.getvalue(), rf"LOOSENED {LOOSENED_ROW_ID}@base-[0-9a-f]{{10}} ")
+        self.assertIn("master=DENY head=ALLOW", out.getvalue())
+        self.assertIn("loosened=1", out.getvalue())
+
+    def test_B2_a_fixture_or_raw_swap_under_the_same_name_and_input_joins_as_a_base_row(self):
+        tm = slp.load_module(REPO_ROOT / slp.HOOK_TEST_REL, "parity_b2_probe_tests")
+        deny = [c for c in tm.CASES if c.get("expect") == "DENY"]
+        fixture_case = next(c for c in deny if "raw" not in c and c.get("fixture", "default") != "default")
+        raw_case = next(c for c in deny if "raw" in c)
+        for label, case, mutation in (("fixture", fixture_case, "dict(c, fixture='default')"), ("raw", raw_case, "dict(c, raw=c['raw'] + ' ')")):
+            with self.subTest(swap=label):
+                tests = _write(self.tmp / f"head_{label}_tests.py", _head_hook_tests_source_with(case["name"], mutation))
+                with self.redirect_head_hook_tests(tests):
+                    union = slp.derived_hook_cases(REPO_ROOT, "HEAD")
+                extra = [c for c in union if "@base-" in c.id]
+                self.assertEqual(len(union), EXACT_DERIVED_HOOK_ROWS + 1)
+                self.assertEqual(len(extra), 1, [c.id for c in extra])
+                self.assertTrue(extra[0].id.startswith("hook:" + slp.slug(case["name"])), extra[0].id)
+                self.assertEqual(extra[0].source, "derived-base")
+
+    def test_B2_the_text_a_derived_hook_row_is_hashed_over_carries_fixture_and_raw(self):
+        rows = {c.id: c for c in slp.derived_hook_cases(REPO_ROOT)}
+        tm = slp.load_module(REPO_ROOT / slp.HOOK_TEST_REL, "parity_b2_probe_tests")
+        fixture_case = next(c for c in tm.CASES if c.get("expect") == "DENY" and "raw" not in c and c.get("fixture", "default") != "default")
+        self.assertEqual(json.loads(rows["hook:" + slp.slug(fixture_case["name"])].text)[2], fixture_case["fixture"])
+        raw_case = next(c for c in tm.CASES if c.get("expect") == "DENY" and "raw" in c)
+        self.assertEqual(json.loads(rows["hook:" + slp.slug(raw_case["name"])].text)[3], raw_case["raw"])
+
+    def test_B2_with_base_equal_to_head_the_content_union_adds_no_row(self):
+        head_only, _, _ = slp.collect(("hook",), slp.DEFAULT_CORPUS, True, REPO_ROOT, None)
+        union, _, _ = slp.collect(("hook",), slp.DEFAULT_CORPUS, True, REPO_ROOT, "HEAD")
+        self.assertEqual([c.id for c in union], [c.id for c in head_only])
+
+
+class BaselineCorpusUnionTests(ParityRunnerCase):
+    """r6 B2, static-corpus half: `collect` also reads the baseline's safety_lint_parity_corpus.json (`git show`) and unions it with the
+    head's by (id, content); a row whose text changed under its id comes back as `<id>@base-<hash>`."""
+
+    def tracked_doc(self) -> dict:
+        return json.loads(slp.DEFAULT_CORPUS.read_text(encoding="utf-8"))
+
+    def test_B2_a_hook_corpus_row_whose_text_changed_under_its_id_is_still_loosened(self):
+        expanded = [r for r in slp.load_corpus(slp.DEFAULT_CORPUS) if r["lint"] == "hook"]
+        commands = [r["command"] for r in expanded]
+        # a row whose command no other corpus row carries (b455-literal-01 is also swept by b455-sweep-001: that would mask the hole)
+        picked = next(r for r in expanded if commands.count(r["command"]) == 1 and r["id"].startswith("b455-literal-"))
+        original, row_id = picked["command"], picked["id"]
+        doc = self.tracked_doc()
+        next(r for r in doc["rows"] if r["id"] == row_id)["command"] = "ls"
+        head_corpus = _write(self.tmp / "head_corpus.json", json.dumps(doc))
+        self.assertEqual(len(slp.load_corpus(head_corpus)), len(slp.load_corpus(slp.DEFAULT_CORPUS)), "row count unchanged")
+        hook = _write(self.tmp / "head_hook.py", _wrapped_head_hook_source(original))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = slp.main(["--base", "HEAD", "--lint", "hook", "--corpus", str(head_corpus), "--allow", str(self.allow), "--head-hook", str(hook)])
+        self.assertEqual(rc, slp.EXIT_LOOSENED, out.getvalue())
+        self.assertRegex(out.getvalue(), rf"LOOSENED {row_id}@base-[0-9a-f]{{10}} ")
+        self.assertIn("master=DENY head=ALLOW", out.getvalue())
+        self.assertIn("loosened=1", out.getvalue())
+
+    @unittest.skipUnless(PWSH, "pwsh is required to run the playback probe")
+    def test_B2_the_8_b465_b6_rows_replaced_by_a_copy_of_b5_01_under_their_ids_are_still_loosened(self):
+        rows = {r["id"]: r for r in slp.load_corpus(slp.DEFAULT_CORPUS)}
+        b6 = [f"b465-b6-{n:02d}" for n in range(1, 9)]
+        victims = [rows[i]["text"] for i in b6]
+        doc = self.tracked_doc()
+        for row in doc["rows"]:
+            if row["id"] in b6:
+                row["text"] = rows["b465-b5-01"]["text"]
+        head_corpus = _write(self.tmp / "head_corpus.json", json.dumps(doc))
+        self.assertEqual(len(slp.load_corpus(head_corpus)), len(rows), "row count unchanged")
+        pb = slp.derived_playback_rows(REPO_ROOT)[1]
+        victim_file = _write(self.tmp / "victims.json", json.dumps(victims))
+        lint = _write(self.tmp / "head_lint.ps1", "\n".join([
+            "$ErrorActionPreference = 'Stop'",
+            ". " + pb._psq(REPO_ROOT / slp.LINT_REL),
+            "$script:orig = ${function:Get-LocalPlaybackPromptFindings}",
+            "$script:victims = @(ConvertFrom-Json -InputObject ([System.IO.File]::ReadAllText(" + pb._psq(victim_file) + ")))",
+            "function Get-LocalPlaybackPromptFindings { param([string]$Text) if ($script:victims -ccontains $Text) { return @() }; & $script:orig -Text $Text }",
+            ""]))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = slp.main(["--base", "HEAD", "--lint", "playback", "--corpus", str(head_corpus), "--allow", str(self.allow), "--head-lint", str(lint)])
+        self.assertEqual(rc, slp.EXIT_LOOSENED, out.getvalue())
+        for row_id in b6:
+            self.assertRegex(out.getvalue(), rf"LOOSENED {row_id}@base-[0-9a-f]{{10}} ")
+
+    def test_B2_with_base_equal_to_head_the_corpus_union_adds_no_row(self):
+        head_only, head_pb, _ = slp.collect(("hook", "playback"), slp.DEFAULT_CORPUS, False, REPO_ROOT, None)
+        union, union_pb, _ = slp.collect(("hook", "playback"), slp.DEFAULT_CORPUS, True, REPO_ROOT, "HEAD")
+        static_ids = {r["id"] for r in slp.load_corpus(slp.DEFAULT_CORPUS)}
+        self.assertEqual({c.id for c in union if c.source.startswith("corpus")}, {c.id for c in head_only if c.source.startswith("corpus")})
+        self.assertEqual([r["id"] for r in union_pb if r["id"] in static_ids], [r["id"] for r in head_pb if r["id"] in static_ids])
+        self.assertEqual([x for x in [c.id for c in union] + [r["id"] for r in union_pb] if "@base-" in x], [])
+
+    def test_B2_a_baseline_corpus_that_cannot_be_read_or_parsed_is_exit_2_never_a_skip(self):
+        real_git = slp.git
+        shapes = {"not-json": "{not json", "wrong-schema": json.dumps({"schema": "nope", "rows": []}),
+                  "git-show-fails": slp.ParityError("git show failed: corpus unreadable at base")}
+        for label, outcome in shapes.items():
+            def fake_git(root, *args, outcome=outcome):
+                if len(args) >= 2 and args[0] == "show" and args[1].endswith(":" + slp.CORPUS_REL):
+                    if isinstance(outcome, Exception):
+                        raise outcome
+                    return outcome
+                return real_git(root, *args)
+            with self.subTest(baseline=label):
+                out = io.StringIO()
+                with mock.patch.object(slp, "git", fake_git), contextlib.redirect_stdout(out):
+                    rc = slp.main(["--base", "HEAD", "--lint", "hook", "--corpus", str(self.corpus(DENIED)), "--allow", str(self.allow)])
+                self.assertEqual(rc, slp.EXIT_UNDECIDED, out.getvalue())
+                self.assertIn("CANNOT-DECIDE", out.getvalue())
+                self.assertIn("baseline corpus", out.getvalue())
+
+    def test_B2_a_base_that_has_no_corpus_file_at_all_is_a_stated_bootstrap_not_an_error(self):
+        # fork/master carried no corpus until this card merged: the path being ABSENT at the base is the only silent-free case, and it is reported
+        with mock.patch.object(slp, "git_path_exists", lambda root, ref, rel: False):
+            report = slp.run("HEAD", ("hook",), self.corpus(DENIED), self.allow, derived=True)
+        self.assertEqual(report["rc"], slp.EXIT_OK, report["counts"])
+        self.assertTrue(any("no baseline corpus" in n for n in report["notes"]), report["notes"])
+        self.assertIn("no baseline corpus", slp.render(report))
 
 
 def _baseline_sha() -> str | None:

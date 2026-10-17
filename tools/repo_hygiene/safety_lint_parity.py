@@ -33,11 +33,24 @@ parity gate takes its expectations from the baseline, never only from the head u
 modules were imported, so a PR that loosened a lint and then flipped the matching test row to `expect: ALLOW` (or deleted it) took
 that row out of the comparison, and the exact row-count pins stayed green when one row went out and another came in.  Now the
 baseline's copy of each test module (`git show <base>:<path>`, executed by load_source_as with `__file__` at the head test file's
-path, like the r3 root fix) is read too, and its rows are unioned with the head's BY ID.  A row only the baseline has is judged
-like any other: master verdict against head verdict, so a deleted or flipped master-denied row that the head lint now allows is
-LOOSENED.  A baseline test module that cannot be read or executed is an ERROR (exit 2), never a silent skip.  The exact derived
-pins in test_safety_lint_parity.py count the HEAD's rows only and still catch an in-place deletion on their own; the union covers
-the swap they cannot see.
+path, like the r3 root fix) is read too, and its rows are unioned with the head's (r5: BY ID; r6: BY ID AND CONTENT, next paragraph).
+A row only the baseline has is judged like any other: master verdict against head verdict, so a deleted or flipped master-denied
+row that the head lint now allows is LOOSENED.  A baseline test module that cannot be read or executed is an ERROR (exit 2), never
+a silent skip.  The exact derived pins in test_safety_lint_parity.py count the HEAD's rows only and still catch an in-place
+deletion on their own; the union covers the swap they cannot see.
+
+THE UNION IS BY (ID, CONTENT), AND IT COVERS THE STATIC CORPUS TOO (r6, CoS B2 on 9931280c).  r5 keyed the union by id alone, and a
+hook row's id is "hook:" + slug(case name), so a head that kept a row's name and expectation but changed its INPUT (or its fixture,
+or its raw stdin) still took the master-denied command out of the comparison, with every count pin green.  The static corpus had the
+same hole: it was read from the head only.  Now (a) a derived hook row's content is its tool, input, fixture and raw, hashed with
+short_hash; (b) a baseline row whose id the head also has, with a DIFFERENT content hash, joins as `<id>@base-<hash>` and is judged
+like any other row (master verdict against head verdict); a baseline row whose (id, content) the head already has is not duplicated,
+so with base == head nothing is added; (c) `collect` reads the baseline's safety_lint_parity_corpus.json with
+`git show <base>:tools/repo_hygiene/safety_lint_parity_corpus.json`, parses it like the head's, and unions its static rows (a static
+row's content is its lint, text, tool name, cwd and board root) the same way.  A baseline corpus that exists but cannot be shown or
+parsed is an ERROR (exit 2); a corpus path that does not exist at the base at all (the card that introduces the file) is reported
+as a `note:` line and unions nothing.  `--no-derived` still means the head's JSON corpus alone.  Playback derived ids already carry
+the sentence's hash, so a reworded sentence was always a different row and needed no change.
 
 ALLOW-LIST ENTRIES ARE BOUND TO THE ROW'S TEXT (r5, CoS I2).  An entry carries the row id AND `hash`, the short_hash of the row's text
 (a hook row's command, a playback row's sentence); the LOOSENED line prints it.  A row whose id matches but whose text hash does not
@@ -46,8 +59,9 @@ is treated as unlisted, so editing a row's text under an old id cannot inherit a
 KNOWN LIMITS.
   * Payload rows reach the hook through `decide()` directly (a raw-stdin row goes through `main()`), so a head change to `main()` or
     `parse_argv`, the fail-closed paths around `decide()`, is NOT compared by this runner.  A `main()` pass is a follow-up card (CoS I3).
-  * Only the corpus, the head's rows and the baseline's rows are judged.  A master-denied command that appears in none of them is
-    invisible to the run, which is what safety_lint_parity_corpus.json and the defeater-corpus card are for.
+  * Only the corpus (the head's and, since r6, the baseline's), the head's rows and the baseline's rows are judged.  A master-denied
+    command that appears in none of them is invisible to the run, which is what safety_lint_parity_corpus.json and the defeater-
+    corpus card are for.
 """
 
 from __future__ import annotations
@@ -73,6 +87,7 @@ HOOK_REL = "tools/hooks/mlv-never-authorized.py"
 LINT_REL = "tools/coordination/lane-local-playback-lint.ps1"
 HOOK_TEST_REL = "tools/repo_hygiene/test_mlv_never_authorized.py"
 PLAYBACK_TEST_REL = "tools/repo_hygiene/test_hub_vm_no_local_playback.py"
+CORPUS_REL = "tools/repo_hygiene/safety_lint_parity_corpus.json"  # r6: where the BASELINE's copy of the static corpus is read from
 DEFAULT_CORPUS = HERE / "safety_lint_parity_corpus.json"
 DEFAULT_ALLOW = HERE / "safety_lint_parity_allow.json"
 CORPUS_SCHEMA = "safety-lint-parity-corpus.v1"
@@ -146,13 +161,23 @@ def _expand(text: str, macros: dict) -> str:
 
 
 def load_corpus(path: Path) -> list[dict]:
-    """The static rows of the JSON corpus, groups and generators expanded. Every row: id, lint, why, and command/text."""
+    """The static rows of the JSON corpus file at `path`, groups and generators expanded. Every row: id, lint, why, and command/text."""
     try:
-        doc = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, ValueError) as exc:  # ValueError: UnicodeDecodeError on a file that is not UTF-8, as before the r6 split
         raise ParityError(f"corpus {path} is unreadable: {exc}") from exc
+    return parse_corpus(text, str(path))
+
+
+def parse_corpus(text: str, label: str) -> list[dict]:
+    """The static rows of one corpus document (r6: factored out of load_corpus so the BASELINE's copy, read with `git show`, is parsed
+    by exactly the same code as the head's). `label` names the source in every error."""
+    try:
+        doc = json.loads(text)
+    except ValueError as exc:
+        raise ParityError(f"corpus {label} is unreadable: {exc}") from exc
     if not isinstance(doc, dict) or doc.get("schema") != CORPUS_SCHEMA:
-        raise ParityError(f"corpus {path} does not declare schema {CORPUS_SCHEMA}")
+        raise ParityError(f"corpus {label} does not declare schema {CORPUS_SCHEMA}")
     macros = doc.get("macros", {})
     rows: list[dict] = []
 
@@ -209,6 +234,55 @@ def load_corpus(path: Path) -> list[dict]:
     if dupes:
         raise ParityError(f"corpus ids are not unique: {dupes[:5]}")
     return rows
+
+
+def git_path_exists(root: Path, ref: str, rel: str) -> bool:
+    """True when `rel` is in the tree of `ref`. A git failure raises ParityError (it is never read as 'absent')."""
+    try:
+        done = subprocess.run(["git", "-C", str(root), "ls-tree", "--name-only", ref, "--", rel], capture_output=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ParityError(f"git ls-tree {ref} -- {rel} could not run: {exc}") from exc
+    if done.returncode != 0:
+        raise ParityError(f"git ls-tree {ref} -- {rel} failed rc={done.returncode}: {done.stderr.decode('utf-8', 'replace').strip()[:300]}")
+    return bool(done.stdout.strip())
+
+
+def static_content(row: dict) -> str:
+    """Everything about a static corpus row that decides its verdict: the lint, the text, and (hook rows) the tool name, cwd and board root.
+    The id, the `why` and the source are labels and are NOT part of it."""
+    field = "command" if row["lint"] == "hook" else "text"
+    return json.dumps([row["lint"], row.get(field), row.get("tool_name"), row.get("cwd"), row.get("board_root")], sort_keys=True, default=str)
+
+
+def baseline_corpus(root: Path, base_ref: str) -> list[dict] | None:
+    """The BASELINE's static corpus rows, read with `git show <base>:<corpus path>` and parsed like the head's (r6, CoS B2), or None when
+    the corpus file does not exist at the base at all (the card that introduces it: nothing was there to protect, and the caller says so).
+    A corpus that exists at the base but cannot be shown or parsed raises ParityError (exit 2), never a silent skip."""
+    if not git_path_exists(root, base_ref, CORPUS_REL):
+        return None
+    try:
+        return parse_corpus(git(root, "show", f"{base_ref}:{CORPUS_REL}"), f"{base_ref}:{CORPUS_REL}")
+    except ParityError as exc:
+        raise ParityError(f"baseline corpus could not be read: {exc}") from exc
+
+
+def union_static(head_rows: list[dict], base_rows: list[dict]) -> list[dict]:
+    """Head rows, plus every baseline row the head lacks by (id, content). A baseline row whose id the head has with DIFFERENT content
+    joins as `<id>@base-<hash of its content>` so its master-denied text is still judged against the head's lint (r6, CoS B2); a
+    baseline row whose id the head lacks joins under its own id; identical (id, content) rows are not duplicated."""
+    have = {(r["id"], short_hash(static_content(r))) for r in head_rows}
+    head_ids = {r["id"] for r in head_rows}
+    out = list(head_rows)
+    for row in base_rows:
+        digest = short_hash(static_content(row))
+        if (row["id"], digest) in have:
+            continue
+        joined = dict(row, source="corpus-base", why=f"{row['why']} (baseline copy of the corpus row)")
+        if row["id"] in head_ids:
+            joined["id"] = f"{row['id']}@base-{digest}"
+        have.add((joined["id"], digest))
+        out.append(joined)
+    return out
 
 
 def load_allow(path: Path) -> dict[str, dict]:
@@ -288,9 +362,31 @@ def _hook_cases_from(tm, source: str, which: str) -> list[HookCase]:
         hc = HookCase(row_id, f"{HOOK_TEST_REL} CASES[{case['name']!r}] (group {case.get('group')}, {case.get('na', '?')}; {which} copy)",
                       source, build)
         hc.display = str(case.get("input", case.get("raw", "")))[:200]
-        hc.text = json.dumps([case.get("tool"), case.get("input", case.get("raw", ""))], sort_keys=True, default=str)
+        # r6 (CoS B2): the hashed text is EVERYTHING in the case that decides the verdict: tool, input, fixture (the environment the row
+        # runs under) and raw (the stdin text of a raw row).  A fixture swap changes the verdict without changing the input.
+        hc.text = json.dumps([case.get("tool"), case.get("input", case.get("raw", "")), case.get("fixture", "default"), case.get("raw")],
+                             sort_keys=True, default=str)
         cases.append(hc)
     return cases
+
+
+def union_hook_cases(head: list[HookCase], base: list[HookCase]) -> list[HookCase]:
+    """Head cases, plus every baseline case the head lacks by (id, content) (r6, CoS B2: r5 unioned by id alone, and a hook row's id is its
+    case NAME, so editing a row's input in place under the same name dropped the baseline's command from the comparison with the
+    count unchanged).  A baseline case whose id the head has with a different content hash joins as `<id>@base-<hash>`; one whose id
+    the head lacks joins under its own id; an identical (id, content) pair is not duplicated."""
+    have = {(c.id, short_hash(c.text)) for c in head}
+    head_ids = {c.id for c in head}
+    out = list(head)
+    for case in base:
+        digest = short_hash(case.text)
+        if (case.id, digest) in have:
+            continue
+        if case.id in head_ids:
+            case.id = f"{case.id}@base-{digest}"
+        have.add((case.id, digest))
+        out.append(case)
+    return out
 
 
 def derived_hook_cases(root: Path, base_ref: str | None = None) -> list[HookCase]:
@@ -304,8 +400,7 @@ def derived_hook_cases(root: Path, base_ref: str | None = None) -> list[HookCase
     cases = _hook_cases_from(tm, "derived", "head")
     if base_ref:
         base_tm = load_source_as(git(root, "show", f"{base_ref}:{HOOK_TEST_REL}"), "parity_base_hook_tests", root / HOOK_TEST_REL)
-        have = {c.id for c in cases}
-        cases += [c for c in _hook_cases_from(base_tm, "derived-base", "baseline") if c.id not in have]
+        cases = union_hook_cases(cases, _hook_cases_from(base_tm, "derived-base", "baseline"))  # r6: by (id, content), was by id alone
     return cases
 
 
@@ -327,7 +422,7 @@ def corpus_hook_cases(rows: list[dict]) -> list[HookCase]:
                 stdin_text = json.dumps({"tool_name": tool, "tool_input": {"command": row["command"]}})
                 return stdin_text, env, row.get("cwd"), lambda: shutil.rmtree(tmp, True)
 
-            hc = HookCase(row_id, row["why"], "corpus", build)
+            hc = HookCase(row_id, row["why"], row.get("source", "corpus"), build)  # r6: "corpus-base" for a row only the baseline's corpus has
             hc.display = row["command"][:200]
             hc.text = row["command"]
             out.append(hc)
@@ -525,11 +620,22 @@ def classify(res: dict, allow: dict) -> str:
     return "LOOSENED"
 
 
-def collect(lints, corpus_path: Path, derived: bool, root: Path = ROOT, base_ref: str | None = None):
+def collect(lints, corpus_path: Path, derived: bool, root: Path = ROOT, base_ref: str | None = None, notes: list[str] | None = None):
     """(hook cases, playback rows, playback module or None). Pure collection: nothing is judged here.
-    `base_ref` (r5): the baseline whose test modules are unioned into the derived rows; ignored when `derived` is off."""
+    `base_ref` (r5): the baseline whose test modules are unioned into the derived rows; ignored when `derived` is off.
+    r6 (CoS B2): with `base_ref` the baseline's static corpus (`git show <base>:<corpus path>`) is unioned with the head's by (id, content)
+    too, so a corpus row edited in place under its id still brings its baseline text into the comparison.  `--no-derived` means the
+    head's JSON corpus alone: nothing is read from the baseline.  When the corpus file does not exist at the base at all (the card that
+    introduces it), nothing is unioned and a line is appended to `notes`; a corpus that exists but cannot be read or parsed is an error."""
     base_ref = base_ref if derived else None
     static = load_corpus(corpus_path)
+    if base_ref:
+        base_static = baseline_corpus(root, base_ref)
+        if base_static is None:
+            if notes is not None:
+                notes.append(f"no baseline corpus: {CORPUS_REL} does not exist at {base_ref[:8]}, so there is no baseline corpus row to union")
+        else:
+            static = union_static(static, base_static)
     hook_cases = corpus_hook_cases(static) if "hook" in lints else []
     playback = [r for r in static if r["lint"] == "playback"] if "playback" in lints else []
     pb = None
@@ -552,7 +658,8 @@ def run(base: str, lints, corpus_path: Path = DEFAULT_CORPUS, allow_path: Path =
     allow = load_allow(allow_path)
     base_sha = git(root, "rev-parse", "--verify", base + "^{commit}").strip()
     head_sha = git(root, "rev-parse", "HEAD").strip()
-    hook_cases, playback_rows, pb = collect(lints, corpus_path, derived, root, base_sha)
+    notes: list[str] = []
+    hook_cases, playback_rows, pb = collect(lints, corpus_path, derived, root, base_sha, notes)
     work = Path(tempfile.mkdtemp(prefix="safety-lint-parity-"))
     results: list[dict] = []
     try:
@@ -586,7 +693,7 @@ def run(base: str, lints, corpus_path: Path = DEFAULT_CORPUS, allow_path: Path =
     return {"base": base, "base_sha": base_sha, "head_sha": head_sha, "lints": list(lints), "rc": rc, "rows": len(results),
             "counts": counts, "loosened_unlisted": len(loosened), "allowed": sum(1 for r in results if r["allowed"]),
             "stale_allow_ids": sorted(set(allow) - {r["id"] for r in results if r["class"] == "LOOSENED"}),
-            "pwsh_spawns": stats["pwsh_spawns"], "results": results}
+            "pwsh_spawns": stats["pwsh_spawns"], "notes": notes, "results": results}
 
 
 def render(report: dict) -> str:
@@ -601,6 +708,8 @@ def render(report: dict) -> str:
             lines.append(f"ALLOWED-LOOSENED {r['id']} [{r['lint']}] pr={e['pr']} reason={e['reason']} :: {r['display']}")
         elif r["class"] == "error":
             lines.append(f"ERROR {r['id']} [{r['lint']}] {r['error']}")
+    for note in report.get("notes", []):
+        lines.append(f"note: {note}")
     for stale in report["stale_allow_ids"]:
         lines.append(f"note: allow-list entry {stale} matches no LOOSENED row (a ceiling, not a requirement)")
     c = report["counts"]
