@@ -1,8 +1,28 @@
 import hashlib, importlib.util, json, os, re, subprocess, sys, threading, time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
+
+# CI-SHARD8-GUARDRAILS-TIME-BUDGET-1: the tests marked @lane_concurrent (see below) run several at a time, so a launcher run
+# that takes 5 s alone can take three times that beside its neighbours. Their per-call `timeout=` guards stay exactly as
+# written for every serial test; on a batch thread each is multiplied by _BATCH_TIMEOUT_SCALE, which keeps the guard as far
+# from the expected duration as it was when the test ran alone. (A guard is a hang detector, never a property under test.)
+_real_subprocess = subprocess
+_BATCH_TIMEOUT_SCALE = 3
+
+
+class _ScaledSubprocess:
+    def __getattr__(self, name):
+        return getattr(_real_subprocess, name)
+
+    def run(self, *args, **kwargs):
+        if kwargs.get("timeout") is not None and threading.current_thread().name.startswith("lane-batch"):
+            kwargs["timeout"] = kwargs["timeout"] * _BATCH_TIMEOUT_SCALE
+        return _real_subprocess.run(*args, **kwargs)
+
+
+subprocess = _ScaledSubprocess()
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
@@ -82,12 +102,8 @@ def wait_json(path, pred=lambda x: True, seconds=12, encoding="utf-8"):
     raise AssertionError(f"timeout {path}: {last!r}")
 
 
-def identity(pid):
-    # 1 s -TimeoutSec deadline race (evidence 2026-09-09): the fallback receipt
-    # built in Invoke-Lane.ps1's catch block can carry containment.ownerPid=None
-    # when the deadline fires before a contained host was ever started. There is
-    # no process to look up in that case, so return None instead of int(None).
-    if pid is None: return None
+def _identity_via_pwsh(pid):
+    # The original probe, kept as the reference the in-process probe below is checked against.
     q=f"$p=Get-Process -Id {int(pid)} -ErrorAction SilentlyContinue;if($null-eq $p){{exit 3}};$p.StartTime.ToUniversalTime().ToString('o')"
     try:
         r=subprocess.run([PWSH,"-NoProfile","-NonInteractive","-Command",q],text=True,capture_output=True,timeout=PWSH_PROBE_TIMEOUT_SEC)
@@ -96,6 +112,69 @@ def identity(pid):
         pytest.fail(f"StartTime probe for pid {int(pid)} did not answer within {PWSH_PROBE_TIMEOUT_SEC} s "
                     "(cold pwsh start); the process identity is UNKNOWN, not absent")
     return r.stdout.strip() if r.returncode==0 else None
+
+
+# CI-SHARD8-GUARDRAILS-TIME-BUDGET-1: every identity() / stop_exact() / wait_absent() poll used to start a COLD
+# `pwsh -NoProfile` (about 0.7 s on a loaded host), and the fixture teardown alone paid that once or twice per test
+# (166 tests, several polls each). The probe now asks Windows directly (OpenProcess + GetProcessTimes, which is the
+# same FILETIME .NET's Process.StartTime reads) and renders it in .NET's round-trip "o" form, so the value still
+# compares equal to the createdUtc strings the launcher and the fixture children write. The first call of the session
+# checks the new probe against the pwsh probe on this very (live) process, so a format drift fails loudly instead of
+# making wait_absent pass vacuously (a string that never matches reads as "process gone").
+_PROCESS_QUERY_LIMITED_INFORMATION=0x1000; _PROCESS_TERMINATE=0x0001; _STILL_ACTIVE=259
+_FILETIME_UNIX_EPOCH_SEC=11644473600
+_identity_checked_against_pwsh=[False]
+_identity_check_lock=threading.Lock()
+
+
+def _kernel32():
+    import ctypes
+    from ctypes import wintypes
+    k=ctypes.WinDLL("kernel32",use_last_error=True)
+    k.OpenProcess.restype=wintypes.HANDLE; k.OpenProcess.argtypes=[wintypes.DWORD,wintypes.BOOL,wintypes.DWORD]
+    k.GetExitCodeProcess.argtypes=[wintypes.HANDLE,ctypes.POINTER(wintypes.DWORD)]
+    k.GetProcessTimes.argtypes=[wintypes.HANDLE]+[ctypes.POINTER(wintypes.FILETIME)]*4
+    k.TerminateProcess.argtypes=[wintypes.HANDLE,wintypes.UINT]
+    k.CloseHandle.argtypes=[wintypes.HANDLE]
+    return k,ctypes,wintypes
+
+
+def _identity_native(pid):
+    k,ctypes,wintypes=_kernel32()
+    h=k.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION,False,int(pid))
+    if not h: return None   # no such process (Get-Process would have found nothing either)
+    try:
+        code=wintypes.DWORD()
+        # An exited process whose handle someone else still holds can be opened; Get-Process does not list it.
+        if not k.GetExitCodeProcess(h,ctypes.byref(code)) or code.value!=_STILL_ACTIVE: return None
+        created,exited,kernel,user=(wintypes.FILETIME() for _ in range(4))
+        if not k.GetProcessTimes(h,ctypes.byref(created),ctypes.byref(exited),ctypes.byref(kernel),ctypes.byref(user)): return None
+        ticks=(created.dwHighDateTime<<32)|created.dwLowDateTime   # 100 ns units since 1601-01-01 UTC
+        whole,frac=divmod(ticks,10_000_000)
+        stamp=datetime.fromtimestamp(whole-_FILETIME_UNIX_EPOCH_SEC,tz=timezone.utc)
+        return f"{stamp:%Y-%m-%dT%H:%M:%S}.{frac:07d}Z"
+    finally:
+        k.CloseHandle(h)
+
+
+def identity(pid):
+    # 1 s -TimeoutSec deadline race (evidence 2026-09-09): the fallback receipt
+    # built in Invoke-Lane.ps1's catch block can carry containment.ownerPid=None
+    # when the deadline fires before a contained host was ever started. There is
+    # no process to look up in that case, so return None instead of int(None).
+    if pid is None: return None
+    _check_identity_probe_once()
+    return _identity_native(pid)
+
+
+def _check_identity_probe_once():
+    # Unconditional and about a process that is certainly alive (this one), so a format drift cannot hide behind targets that
+    # have already exited by the time they are probed (which would make wait_absent pass without looking at anything).
+    with _identity_check_lock:
+        if _identity_checked_against_pwsh[0]: return
+        me=os.getpid(); native=_identity_native(me); reference=_identity_via_pwsh(me)
+        assert native is not None and native==reference,f"in-process StartTime probe {native!r} disagrees with the pwsh reference {reference!r} for this very process"
+        _identity_checked_against_pwsh[0]=True
 
 
 def wait_absent(item, seconds=10):
@@ -108,11 +187,14 @@ def wait_absent(item, seconds=10):
 
 def stop_exact(item):
     if identity(item["pid"]) == item["createdUtc"]:
-        subprocess.run([PWSH,"-NoProfile","-NonInteractive","-Command",f"Stop-Process -Id {int(item['pid'])} -Force"],timeout=PWSH_PROBE_TIMEOUT_SEC,check=False)
+        k,ctypes,wintypes=_kernel32()
+        h=k.OpenProcess(_PROCESS_TERMINATE,False,int(item["pid"]))
+        if h:
+            try: k.TerminateProcess(h,1)   # Stop-Process -Force is TerminateProcess too
+            finally: k.CloseHandle(h)
 
 
-@pytest.fixture
-def fixture_tree(tmp_path):
+def _make_fixture_tree(tmp_path):
     grand=tmp_path/"grand.ps1"; child=tmp_path/"child.ps1"; shim=tmp_path/"fake-claude.cmd"
     # State files (child.json / grand.json) appear only once COMPLETE: temp + move. Set-Content creates the file EMPTY before its first byte, so a reader -- or a lane timeout that kills the writer in that window -- saw a zero-length file (CI-FLAKE-LANE-CONTAINMENT-OWNER-LOSS-MOVE-1: JSONDecodeError at char 0).
     # MLV_FIXTURE_GRAND_START_DELAY_MS (test-only, unset = no-op) stands in for a loaded host's slow pwsh cold start.
@@ -230,7 +312,10 @@ else{[Console]::Error.Write('fixture-err')}
 exit 0
 ''',encoding="ascii")
     shim.write_text(f'@echo off\r\n"{PWSH}" -NoProfile -NonInteractive -File "{child}" %*\r\n',encoding="ascii")
-    yield {"root":tmp_path,"shim":shim,"child":child,"grand":grand}
+    return {"root":tmp_path,"shim":shim,"child":child,"grand":grand}
+
+
+def _cleanup_fixture_tree(tmp_path):
     for name in ("child.json","grand.json"):
         p=tmp_path/name
         if p.exists():
@@ -238,7 +323,130 @@ exit 0
             except Exception: pass
 
 
-def prepare(tree, mode, assignment_failure=False, editing=False, allowed_tools="", lane="sonnet", mutation=None, allow_bulk_reads=False, result_json=None):
+@pytest.fixture
+def fixture_tree(tmp_path):
+    tree=_make_fixture_tree(tmp_path)
+    yield tree
+    _cleanup_fixture_tree(tmp_path)
+
+
+# CI-SHARD8-GUARDRAILS-TIME-BUDGET-1: this file starts one to four cold pwsh processes per test and spends almost all of its
+# wall time waiting on them, one test at a time, on a runner whose other cores sit idle. Tests that are a pure function of
+# their own fixture tree (and parameters) -- no fixed budget tighter than the lane's own 30 s, no race against a clock --
+# are marked @lane_concurrent. The FIRST marked test of a session starts every marked test of the selection on a small
+# thread pool, each in its own tree exactly as the fixture would build it, and each marked test then reports ITS OWN
+# outcome (assertion text, traceback and all) when pytest reaches it, so nothing is merged, sampled or skipped. Every test
+# that is NOT marked first waits for the whole batch to finish, so the timing-sensitive tests (deadline, kill, owner-loss,
+# startup-budget, pipe-holder, promoter-timeout) still run alone on a quiet host, exactly as they did before.
+_BATCH_WORKERS=max(1,min(3,(os.cpu_count() or 2)-1))
+_batch={"lock":threading.Lock(),"pool":None,"futures":{},"current":None,"elapsed":{}}
+_batch_local=threading.local()
+
+
+def lane_concurrent(fn):
+    import functools
+    @functools.wraps(fn)
+    def reported(*args,**kwargs):
+        return _batch_outcome(_batch["current"])
+    reported._mlv_lane_concurrent_body=fn
+    return reported
+
+
+def _batch_run(body,params,workdir,nodeid):
+    import inspect
+    started=time.monotonic(); tree=None
+    _batch_local.isolate_scratch=True
+    try:
+        kwargs={}
+        for name in inspect.signature(body).parameters:
+            if name=="fixture_tree": tree=kwargs[name]=_make_fixture_tree(workdir)
+            elif name=="tmp_path": kwargs[name]=workdir
+            elif name in params: kwargs[name]=params[name]
+            else: raise RuntimeError(f"{nodeid}: @lane_concurrent supports only fixture_tree, tmp_path and parameters, not {name!r}")
+        return body(**kwargs)
+    finally:
+        if tree is not None: _cleanup_fixture_tree(workdir)
+        _batch["elapsed"][nodeid]=time.monotonic()-started
+
+
+def _batch_schedule(session,factory):
+    import concurrent.futures
+    with _batch["lock"]:
+        if _batch["pool"] is None:
+            _with_precompiled_job_type(CANDIDATE.read_text(encoding="utf-8"))   # the shared assembly, compiled before any worker needs it
+            _batch["pool"]=concurrent.futures.ThreadPoolExecutor(max_workers=_BATCH_WORKERS,thread_name_prefix="lane-batch")
+        for item in session.items:
+            body=getattr(getattr(item,"function",None),"_mlv_lane_concurrent_body",None)
+            if body is None or item.nodeid in _batch["futures"] or item.get_closest_marker("skip") is not None: continue
+            params=dict(item.callspec.params) if hasattr(item,"callspec") else {}
+            _batch["futures"][item.nodeid]=_batch["pool"].submit(_batch_run,body,params,factory.mktemp("lane-batch"),item.nodeid)
+
+
+def _batch_drain():
+    import concurrent.futures
+    with _batch["lock"]: pending=list(_batch["futures"].values())
+    concurrent.futures.wait(pending)
+
+
+def _batch_outcome(nodeid):
+    return _batch["futures"][nodeid].result()   # re-raises the test body's own AssertionError / pytest.fail / skip
+
+
+@pytest.fixture(autouse=True)
+def _lane_batch_gate(request,tmp_path_factory):
+    if getattr(request.function,"_mlv_lane_concurrent_body",None) is not None:
+        _batch_schedule(request.session,tmp_path_factory)
+        _batch["current"]=request.node.nodeid
+    else:
+        _batch_drain()
+    yield
+    report=os.environ.get("MLV_LANE_BATCH_DURATIONS")   # optional: per-test wall time of the batch, for before/after tables
+    if report and request.node.nodeid in _batch["elapsed"]:
+        with open(report,"a",encoding="utf-8") as f: f.write(f"{_batch['elapsed'][request.node.nodeid]:.2f}s {request.node.nodeid}\n")
+
+
+# CI-SHARD8-GUARDRAILS-TIME-BUDGET-1: every Invoke-Lane.ps1 run compiles the MlvLaneJob C# type with Add-Type, about
+# 1.2 s of Roslyn on a cold pwsh, and this file starts roughly 150 runs. The fixture copy of the launcher now loads
+# that SAME source from an assembly compiled once per distinct source text (the compile is done by the same
+# Add-Type, with -OutputAssembly), so the type, its P/Invoke surface and the Job Object behaviour the tests assert
+# on are unchanged -- a test that mutates the C# gets its own compile of the mutated text. The verbatim in-script
+# compile is still exercised by the tests that pass verbatim_job_type=True, and any compile failure here falls
+# back to the verbatim block, so this can only ever make a run faster, never skip a check.
+_JOB_TYPE_BLOCK_OPEN="if (-not ('MlvLaneJob' -as [type])) {\n    Add-Type -TypeDefinition @'\n"
+_JOB_TYPE_BLOCK_CLOSE="\n'@\n}\n"
+_job_type_assemblies={}
+_job_type_dir=[None]
+_job_type_lock=threading.Lock()   # the concurrent batch below calls prepare() from several threads
+
+
+def _compile_job_type(source):
+    import atexit, shutil, tempfile
+    key=hashlib.sha256(source.encode("utf-8")).hexdigest()
+    with _job_type_lock:
+        if key in _job_type_assemblies: return _job_type_assemblies[key]
+        if _job_type_dir[0] is None:
+            _job_type_dir[0]=Path(tempfile.mkdtemp(prefix="mlv-lane-job-type-"))
+            atexit.register(shutil.rmtree,str(_job_type_dir[0]),True)
+        src=_job_type_dir[0]/(key[:16]+".cs.txt"); dll=_job_type_dir[0]/(key[:16]+".dll")
+        src.write_text(source,encoding="utf-8")
+        q=f"$ErrorActionPreference='Stop';Add-Type -TypeDefinition (Get-Content -Raw -LiteralPath '{src}') -OutputAssembly '{dll}'"
+        r=subprocess.run([PWSH,"-NoLogo","-NoProfile","-NonInteractive","-Command",q],text=True,capture_output=True,timeout=120)
+        _job_type_assemblies[key]=dll if r.returncode==0 and dll.exists() else None
+        return _job_type_assemblies[key]
+
+
+def _with_precompiled_job_type(text):
+    start=text.find(_JOB_TYPE_BLOCK_OPEN)
+    if start<0: return text
+    end=text.find(_JOB_TYPE_BLOCK_CLOSE,start+len(_JOB_TYPE_BLOCK_OPEN))
+    if end<0: return text
+    dll=_compile_job_type(text[start+len(_JOB_TYPE_BLOCK_OPEN):end])
+    if dll is None: return text
+    loader="if (-not ('MlvLaneJob' -as [type])) {\n    Add-Type -LiteralPath '"+str(dll).replace("'","''")+"'\n}\n"
+    return text[:start]+loader+text[end+len(_JOB_TYPE_BLOCK_CLOSE):]
+
+
+def prepare(tree, mode, assignment_failure=False, editing=False, allowed_tools="", lane="sonnet", mutation=None, allow_bulk_reads=False, result_json=None, verbatim_job_type=False):
     root=tree["root"]; script=root/"Invoke-Lane.ps1"
     text=CANDIDATE.read_text(encoding="utf-8")
     text=text.replace("$CLAUDE_EXE = Join-Path $env:APPDATA 'npm\\claude.cmd'", "$CLAUDE_EXE = '"+str(tree['shim']).replace("'","''")+"'")
@@ -246,6 +454,7 @@ def prepare(tree, mode, assignment_failure=False, editing=False, allowed_tools="
     if assignment_failure:
         text=text.replace("[MlvLaneJob]::AssignOrThrow($jobHandle, $proc.Handle)", "throw [ComponentModel.Win32Exception]::new(5, 'fixture-assignment-failure')")
     if mutation: text=mutation(text)
+    if not verbatim_job_type: text=_with_precompiled_job_type(text)
     script.write_text(text,encoding="utf-8")
     (root/"lane-provider-refusal.ps1").write_bytes((ROOT/"tools"/"coordination"/"lane-provider-refusal.ps1").read_bytes())
     (root/"lane-no-background.py").write_bytes((ROOT/"tools"/"coordination"/"lane-no-background.py").read_bytes())
@@ -291,6 +500,10 @@ def prepare(tree, mode, assignment_failure=False, editing=False, allowed_tools="
     if result_json is not None:
         env["MLV_FIXTURE_RESULT_JSON"]=str(result_json_path)
     cmd=[PWSH,"-NoLogo","-NoProfile","-NonInteractive","-ExecutionPolicy","Bypass","-File",str(script),"-Lane",lane,"-Prompt","fixture prompt","-WorkDir",str(root),"-RunDir",str(run),"-TimeoutSec","3" if mode=="timeout" else "30","-Card","FIXTURE","-ReasoningEffort","low","-NoWorktreeSweep"]
+    # Per-tree lane scratch for the concurrent batch only: the default root (C:\mlvtmp\lane-scratch) is one directory shared by
+    # every fixture run ("run-<lane>-001"), which runs on different batch threads would otherwise create and delete under each
+    # other. Serial callers (including tests/coordination/test_lane_bulk_scratch.py, which appends its own -ScratchRoot) are unchanged.
+    if getattr(_batch_local,"isolate_scratch",False): cmd += ["-ScratchRoot",str(root/"lane-scratch")]
     # -NoWorktreeSweep: the exit sweep defaults ON against C:\mlvtmp; a fixture lane must never
     # look at the host's real lane worktrees (Retire-LaneWorktree.ps1 is not copied here anyway).
     if editing: cmd += ["-AllowEdits","-AllowedTools",allowed_tools]
@@ -336,7 +549,7 @@ def settings_path_for(receipt):
 
 
 def test_read_only_argv_json_stdin_and_tool_denial(fixture_tree):
-    cmd,env,receipt=prepare(fixture_tree,"normal")
+    cmd,env,receipt=prepare(fixture_tree,"normal",verbatim_job_type=True)
     r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
     assert r.returncode==0,(r.stdout,r.stderr)
     q=json.loads(receipt.read_text(encoding="utf-8")); assert q["state"]=="complete" and q["complete"]
@@ -1212,7 +1425,7 @@ def test_timeout_kills_owned_child_and_grandchild(fixture_tree):
 
 
 def test_owner_loss_closes_job(fixture_tree):
-    cmd,env,receipt=prepare(fixture_tree,"ownerloss")
+    cmd,env,receipt=prepare(fixture_tree,"ownerloss",verbatim_job_type=True)
     outer=subprocess.Popen(cmd,env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
     q=wait_json(receipt,lambda x:x.get("state")=="running" and x.get("containment",{}).get("promptDelivered"))
     assert q["containment"]["childCreatedUtc"]==identity(q["containment"]["childPid"])
@@ -2912,3 +3125,117 @@ def test_host_exit_after_the_lane_deadline_stays_a_timeout_not_launch_no_child(f
     assert q["timedOut"] is True
     assert r.returncode==124,(r.returncode,r.stdout,r.stderr)
     assert q["containment"]["childPid"] is None and q["containment"]["promptDelivered"] is False
+
+
+# CI-SHARD8-GUARDRAILS-TIME-BUDGET-1: the tests that run as one concurrent batch (see lane_concurrent above). Each one is a
+# pure function of its own fixture tree and parameters: normal-mode lane runs on the lane's own 30 s budget (or a budget of
+# exactly 0, which no load can change), asserting on the receipt and the files the run left behind.
+# DELIBERATELY NOT LISTED -- they race a real clock or a real kill and keep running alone, after the batch has drained
+# (test_setup_origin_and_expired_budget_are_deterministic freezes the lane's stopwatch, so its [0-0] row still hands the child a
+# REAL 3 s WaitForExit and passes only if the fake provider's cold pwsh finishes inside it -- a race that loaded neighbours lose):
+# test_timeout_kills_owned_child_and_grandchild, test_owner_loss_closes_job, test_receipt_write_retries_through_a_transient_
+# destination_lock, test_wait_json_waits_out_a_file_that_is_still_empty, test_startup_consumes_same_deadline_without_starting_
+# provider, test_final_receipt_io_failure_* (both), test_codex_read_only_lane_refuses_when_a_descendant_holds_the_mcp_list_pipe,
+# test_codex_pin_promoter_timed_out_write_probe_is_unproven, test_codex_pin_promoter_child_holding_the_pipes_after_timeout_*,
+# test_child_never_created_*, test_ran_and_timed_out_lane_keeps_ended_incomplete_unchanged,
+# test_host_exiting_before_child_*, test_host_exit_after_the_lane_deadline_*, and every test with no fixture_tree/tmp_path.
+_LANE_CONCURRENT_TESTS=(
+    "test_read_only_argv_json_stdin_and_tool_denial",
+    "test_prompt_file_path_reaches_the_child_as_mlv_lane_prompt",
+    "test_relative_prompt_file_is_exported_as_an_absolute_path",
+    "test_mlv_lane_prompt_is_scoped_to_the_child_and_never_leaks_into_the_caller",
+    "test_inline_prompt_drops_an_inherited_mlv_lane_prompt",
+    "test_resolved_model_ignores_an_auxiliary_model_beside_the_lane_model",
+    "test_no_worktree_sweep_leaves_the_receipt_key_null",
+    "test_worktree_sweep_failure_is_recorded_and_never_blocks_the_receipt",
+    "test_resolved_model_is_unknown_when_the_requested_family_is_absent",
+    "test_resolved_model_is_unknown_when_canonical_model_is_missing",
+    "test_read_only_settings_json_wires_lane_no_background_hook",
+    "test_bulk_reads_lane_still_gets_the_hook_without_the_deny_rules",
+    "test_editing_settings_json_also_wires_lane_no_background_hook",
+    "test_codex_lane_resolves_tier_to_the_highest_version_slug_in_the_cache",
+    "test_model_override_bypasses_tier_resolution_and_is_recorded",
+    "test_model_override_on_a_claude_lane_bypasses_the_alias",
+    "test_codex_tier_resolution_fails_closed_when_the_cache_is_unavailable",
+    "test_codex_start_failure_leaves_resolved_model_unknown_with_selected_model_recorded",
+    "test_codex_resolver_degenerate_json_without_ok_field_fails_closed_with_typed_token",
+    "test_real_lane_launch_refuses_non_high_effort",
+    "test_codex_lane_gets_no_settings_file_or_flag",
+    "test_hook_copy_is_reserved_in_run_dir_not_resolved_from_worktree",
+    "test_launch_refuses_when_background_gate_selftest_fails",
+    "test_launch_proceeds_and_registers_exec_form_exactly_when_python_override_resolves",
+    "test_shell_override_env_vars_no_longer_affect_the_launch",
+    "test_launch_refuses_when_python_override_points_at_a_present_but_non_python_executable",
+    "test_launch_refuses_when_hook_copy_goes_missing_before_selftest_even_though_python_exits_2_either_way",
+    "test_launch_refuses_when_hook_copy_is_syntactically_broken_before_selftest",
+    "test_launch_refuses_when_python_override_is_not_a_valid_win32_executable_and_the_selftest_invocation_itself_throws",
+    "test_launch_refuses_when_python_override_is_unresolvable",
+    "test_post_run_tamper_check_catches_hook_copy_rewritten_during_the_run",
+    "test_post_run_tamper_check_catches_hook_copy_deleted_during_the_run",
+    "test_post_run_tamper_check_catches_interpreter_replaced_during_the_run",
+    "test_post_run_tamper_check_catches_interpreter_deleted_during_the_run",
+    "test_post_run_tamper_check_reports_both_hook_copy_and_interpreter_tamper_together",
+    "test_assignment_failure_starts_no_provider",
+    "test_editing_argv_preserves_allowlist_and_denies_nested_tools",
+    "test_editing_explicit_nested_tool_is_rejected_before_reservation",
+    "test_every_disallowed_tool_is_individually_rejected_from_an_editing_allowlist",
+    "test_codex_editing_lane_with_denied_tool_in_allowlist_is_not_rejected_by_the_claude_only_preflight",
+    "test_codex_launch_stays_direct_without_claude_flags",
+    "test_codex_read_only_lane_runs_unelevated_windows_sandbox",
+    "test_codex_workspace_write_lane_keeps_default_windows_sandbox",
+    "test_codex_receipt_never_claims_a_windows_sandbox_mode_codex_ignored",
+    "test_codex_receipt_keeps_the_requested_windows_sandbox_when_codex_ignored_another_key",
+    "test_codex_receipt_keeps_the_requested_windows_sandbox_when_codex_warns_nothing",
+    "test_codex_receipt_keeps_genuine_ignored_evidence_when_the_prompt_overlaps_it",
+    "test_codex_receipt_keeps_genuine_ignored_evidence_without_a_user_marker",
+    "test_codex_receipt_keeps_the_requested_windows_sandbox_when_a_warning_names_it_without_ignoring_it",
+    "test_codex_read_only_lane_disables_every_mcp_server",
+    "test_codex_read_only_lane_with_no_listed_mcp_server_still_disables_plugins_and_apps",
+    "test_codex_workspace_write_lane_keeps_mcp_servers_unchanged",
+    "test_codex_read_only_lane_refuses_launch_when_mcp_list_is_unreadable",
+    "test_codex_read_only_lane_refuses_launch_when_mcp_list_output_exceeds_the_cap",
+    "test_codex_pin_present_and_matching_runs_the_pinned_exe_on_its_promoted_sandbox",
+    "test_codex_pin_unusable_falls_back_to_the_global_codex_with_the_named_reason",
+    "test_codex_pin_runs_the_global_cli_when_the_resolved_model_was_never_probed",
+    "test_codex_pin_keeps_the_pinned_exe_for_a_probed_model_among_several",
+    "test_codex_tier_resolution_refuses_a_stale_models_cache",
+    "test_codex_pin_keeps_the_high_effort_refusal_for_the_pinned_exe",
+    "test_codex_pin_is_never_consulted_by_a_launcher_whose_exe_was_swapped",
+    "test_codex_pin_does_not_apply_to_a_producer_lane",
+    "test_codex_pin_promoter_config_failure_is_not_a_denial",
+    "test_codex_pin_promoter_denial_without_a_working_control_is_unproven",
+    "test_codex_pin_promoter_refusal_without_a_denial_signature_is_unproven",
+    "test_codex_pin_promoter_genuine_denial_with_control_promotes",
+    "test_codex_pin_promoter_probes_every_lane_tier_and_records_each_model",
+    "test_codex_pin_promoter_probes_one_model_once_when_two_tiers_resolve_to_it",
+    "test_codex_pin_promoter_refuses_the_whole_pin_when_one_tier_model_cannot_exec",
+    "test_codex_pin_promoter_refuses_when_a_tier_does_not_resolve",
+    "test_codex_pin_promoter_refuses_when_the_models_cache_is_stale",
+    "test_claude_lane_receipt_carries_a_null_codex_exe",
+    "test_zero_timeout_exhausts_budget_before_spawn_and_names_the_reason",
+    "test_start_threw_is_classified_as_no_host",
+    "test_post_start_unrecorded_is_named_not_hidden",
+    "test_pre_assignment_kill_failure_is_recorded_not_swallowed",
+    "test_pre_assignment_kill_wait_timeout_is_recorded_not_killed",
+    "test_direct_launch_writes_a_reserved_versioned_ledger_row_naming_its_receipt",
+    "test_dispatcher_launch_writes_a_linked_row_not_a_second_reservation",
+    "test_unwritable_ledger_refuses_the_launch_with_a_named_failure",
+    "test_pre_launch_git_capture_failure_is_unavailable_and_never_flips_state",
+    "test_post_exit_git_capture_failure_is_unavailable_and_never_claims_clean",
+    "test_pre_launch_revparse_head_failure_is_unavailable_not_not_applicable",
+    "test_post_exit_revparse_head_failure_is_unavailable_not_head_moved",
+    "test_further_edit_of_pre_dirty_binary_tracked_file_is_ended_incomplete",
+    "test_dirty_tracked_worktree_introduced_by_editing_lane_is_ended_incomplete",
+    "test_further_edit_of_already_dirty_tracked_file_is_ended_incomplete",
+    "test_further_edit_of_already_dirty_tracked_path_with_space_and_non_ascii_name_is_ended_incomplete",
+    "test_untracked_only_dirt_does_not_trigger_dirty_no_commit",
+    "test_clean_git_worktree_is_still_marked_complete",
+    "test_pre_existing_tracked_dirt_unchanged_by_editing_lane_stays_complete",
+    "test_committed_work_with_leftover_tracked_dirt_stays_complete",
+    "test_codex_lane_with_dirty_tracked_worktree_is_never_ended_incomplete_by_this_rule",
+    "test_read_only_claude_lane_with_dirty_tracked_worktree_is_never_ended_incomplete_by_this_rule",
+    "test_exhausted_budget_before_child_stays_a_timeout_not_launch_no_child",
+)
+for _name in _LANE_CONCURRENT_TESTS:
+    assert _name in globals() and hasattr(globals()[_name],"__call__"),f"_LANE_CONCURRENT_TESTS names {_name!r}, which is not a test defined in this file"
+    globals()[_name]=lane_concurrent(globals()[_name])
