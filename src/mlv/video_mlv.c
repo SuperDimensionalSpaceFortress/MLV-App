@@ -4211,6 +4211,11 @@ int getMlvRawFrameUint16(mlvObject_t * video, uint64_t frameIndex, uint16_t * un
     return result;
 }
 
+int getMlvRawFrameUint16Uncached(mlvObject_t * video, uint64_t frameIndex, uint16_t * unpackedFrame)
+{
+    return getMlvRawFrameUint16Direct(video, frameIndex, unpackedFrame);
+}
+
 static int getMlvRawFrameProcessedUint16DirectImpl(mlvObject_t * video,
                                                    uint64_t frameIndex,
                                                    uint16_t * outputFrame,

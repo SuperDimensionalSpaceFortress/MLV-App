@@ -247,6 +247,24 @@ static bool mlvappPlaybackRoutePrewarmDisabled()
     return disabled;
 }
 
+// PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-SETUP-1 Row B switch, read once: MLVAPP_PLAYBACK_RECON_BACKEND_PRELOAD=0 leaves
+// the recon backend DLL load + create to the first Play frame's render thread again. Default on; the route prewarm's
+// own switch still turns everything off.
+static bool mlvappPlaybackReconBackendPreloadDisabled()
+{
+    static const bool disabled = !playbackEnvSwitch( "MLVAPP_PLAYBACK_RECON_BACKEND_PRELOAD", true );
+    return disabled;
+}
+
+// PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1 Row W switch, read once: MLVAPP_PLAYBACK_RECON_WARM_RUN=0 leaves the first
+// GPU recon run (set_clip, set_luts, first-run allocations) to Play frame 0 again. Default on; the route prewarm's own
+// switch still turns everything off.
+static bool mlvappPlaybackReconWarmRunDisabled()
+{
+    static const bool disabled = !playbackEnvSwitch( "MLVAPP_PLAYBACK_RECON_WARM_RUN", true );
+    return disabled;
+}
+
 // PLAYBACK-STARTUP-WAIT-PREWARM-1: the smoke's opt-in first-present identity capture (with --contact-sheet-dir), read once.
 static bool smokeFirstPresentCaptureRequested()
 {
@@ -2378,6 +2396,8 @@ MainWindow::MainWindow(int &argc, char **argv, QWidget *parent) :
     m_pRenderThread = new RenderFrameThread();
     m_pRenderThread->start();
     connect( m_pRenderThread, SIGNAL(frameReady()), this, SLOT(drawFrameReady()) );
+    // PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1 Row W: emitted on this (GUI) thread, posted by the recon worker
+    connect( m_pRenderThread, &RenderFrameThread::playbackReconWarmDone, this, &MainWindow::onPlaybackReconWarmDone );
     while( !m_pRenderThread->isRunning() ) {}
 
     // Playback-prep worker handles heavy image work on a background thread and
@@ -5446,6 +5466,14 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
             readyFrame.stageTimingTelemetry.insert(
                 QStringLiteral("gpu_playback_recon_texture_present_setup_lut_miss"),
                 QString::fromLatin1( st.lut_miss ? st.lut_miss : "none" ) );
+            // PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-SETUP-1 Row 0: the window's slot outcome and AMaZE-only parts
+            readyFrame.stageTimingTelemetry.insert(
+                QStringLiteral("gpu_playback_recon_texture_present_slot"),
+                QString::fromLatin1( st.slot ? st.slot : "none" ) );
+            readyFrame.stageTimingTelemetry.insert(
+                QStringLiteral("gpu_playback_recon_texture_present_amaze_kernel_ms"), st.amaze_kernel_ms );
+            readyFrame.stageTimingTelemetry.insert(
+                QStringLiteral("gpu_playback_recon_texture_present_amaze_download_ms"), st.amaze_download_ms );
         }
         readyFrame.stageTimingTelemetry.insert(
             QStringLiteral("gpu_playback_recon_texture_present_recon_wall_ms"),
@@ -19055,6 +19083,8 @@ GpuPreviewProcessingConfig MainWindow::gpuPreviewProcessingConfigForCurrentSetti
 
 void MainWindow::clearPresentationForClipOpen( const char *reason )
 {
+    // PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-SETUP-1 Row A: a clip close/open frees the prewarm's staged recon pair
+    GpuDisplayWindow::releaseStagedPlaybackReconSlotIfActive();
     invalidateDisplayPreviewCache();
     invalidatePlaybackPrepForDisplayChange( reason );
     m_pendingPresentationRequests.clear();
@@ -27638,12 +27668,131 @@ void MainWindow::runPlaybackRoutePrewarm( quint64 clipGeneration )
         scale, planOk, planOk ? plan.reducedWidth : 0, planOk ? plan.reducedHeight : 0 );
     QString summary;
     GpuDisplayWindow::prewarmPlaybackReconRouteIfActive( size.width, size.height, &summary );
-    qInfo().noquote() << QStringLiteral( "playback_route_prewarm decision=run scale=%1 %2" ).arg( scale ).arg( summary );
+    // PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-SETUP-1 Row B: the recon backend's DLL load + create, paid here while paused
+    // instead of on the first Play frame's render thread. Same predicate the render path enables the GPU playback recon
+    // with (MLVAPP_GPU_PLAYBACK_RECON; the Run decision above already requires the CUDA texture route). Loader only: no
+    // set_clip, set_luts or run.
+    int backendPreloadOk = 0;
+    double backendPreloadMs = 0.0;
+    const bool backendPreload = !mlvappPlaybackReconBackendPreloadDisabled() && playback_recon_requested_by_environment();
+    if( backendPreload ) backendPreloadOk = llrpGpuPlaybackReconPreloadBackend( &backendPreloadMs );
+    m_playbackReconBackendPreloaded = backendPreloadOk != 0;
+    // the summary is appended, never .arg()-substituted, so a '%' in its reason text cannot eat the fields after it
+    qInfo().noquote() << QStringLiteral( "playback_route_prewarm decision=run scale=%1 " ).arg( scale ) + summary
+                             + QStringLiteral( " backend_preload_ok=%1 backend_preload_ms=%2" )
+                                   .arg( backendPreload ? QString::number( backendPreloadOk ) : QStringLiteral( "skipped" ) )
+                                   .arg( backendPreloadMs, 0, 'f', 3 );
+    // PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1 Row W: with the backend loaded, the first GPU recon run itself (set_clip,
+    // set_luts, first-run allocations) is paid now, on the recon worker that will run Play frame 0, at the same scale.
+    m_playbackReconWarmPrewarmRan = true;
+    m_playbackReconWarmScale = scale;
+    postPlaybackReconWarm( clipGeneration );
+}
+
+// PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1 Row W (PlaybackReconWarmRunPolicy.h): post ONE paused warm of the current
+// frame to the recon worker. Never touches actionPlay, programmaticPlay(), the play ledger or Loop.
+void MainWindow::postPlaybackReconWarm( quint64 clipGeneration )
+{
+    m_playbackReconWarmRepostArmed = false;
+    // one warm per clip: a warm that ran is never repeated (a later raw-level change leaves set_clip to Play, correctly)
+    if( !m_pRenderThread || !m_fileLoaded || !m_pMlvObject || m_playbackReconWarmRan ) return;
+    playback_recon_warm_run::Decision decision = playback_recon_warm_run::decide(
+        !mlvappPlaybackReconWarmRunDisabled() && !mlvappPlaybackRoutePrewarmDisabled(),
+        ui->actionPlay->isChecked(),
+        clipGeneration == m_playbackRoutePrewarmClipGeneration,
+        m_playbackReconWarmPrewarmRan,
+        m_playbackReconBackendPreloaded,
+        llrpGpuCudaSuppressed() != 0,
+        !m_pRenderThread->isIdle() );
+    if( decision.run )
+    {
+        ++m_playbackReconWarmPosts;
+        // the paused frame on screen is the frame Play renders first
+        const int frame = m_lastPresentedRequestContextValid ? static_cast<int>( m_lastPresentedRequestContext.frameNumber )
+                                                             : ui->horizontalSliderPosition->value();
+        // the render thread re-checks for pending work under its lock as it queues, and again as the warm starts
+        const playback_recon_warm_run::Reason queued = m_pRenderThread->requestPlaybackReconWarm(
+            static_cast<uint32_t>( qMax( 0, frame ) ), m_playbackReconWarmScale, clipGeneration );
+        if( queued == playback_recon_warm_run::Reason::None ) return;   // the outcome arrives as playbackReconWarmDone
+        decision.run = false;
+        decision.reason = queued;
+    }
+    playback_recon_warm_run::Line line;
+    line.reason = decision.reason;
+    line.scale = m_playbackReconWarmScale;
+    line.released = true;   // nothing was retained
+    line.outstandingAfter = llrpGpuPlaybackReconRetainedOutstandingCount();
+    qInfo().noquote() << line.format();
+    schedulePlaybackReconWarmRepost( decision.reason, clipGeneration );
+}
+
+// Row W: real work was in the way (Look Assist settling, scrubbing): try again shortly; postPlaybackReconWarm re-decides
+// (Play, another clip or the post budget ends it).
+void MainWindow::schedulePlaybackReconWarmRepost( playback_recon_warm_run::Reason reason, quint64 clipGeneration )
+{
+    if( m_playbackReconWarmRepostArmed
+     || !playback_recon_warm_run::repostAfterSkip( reason, m_playbackReconWarmPosts ) ) return;
+    m_playbackReconWarmRepostArmed = true;
+    QTimer::singleShot( playback_recon_warm_run::kRepostDelayMs, this,
+                        [this, clipGeneration]() { postPlaybackReconWarm( clipGeneration ); } );
+}
+
+// Row W, GUI half: AMaZE from the warm's retained output into #473's staged slot (only for this clip, while paused),
+// then ALWAYS release the token -- including the skipped, stale-clip and playing cases.
+void MainWindow::onPlaybackReconWarmDone( const RenderFrameThread::PlaybackReconWarmDone &done )
+{
+    const playback_recon_warm_run::Outcome &outcome = done.outcome;
+    const bool playing = ui->actionPlay->isChecked();
+    const bool clipMatches = done.clipGeneration == m_playbackRoutePrewarmClipGeneration;
+    const bool hasOutput = outcome.ran && outcome.retained.device_bayer16 && outcome.retained.token != 0;
+    playback_recon_warm_run::Line line;
+    line.run = outcome.ran;
+    line.reason = outcome.reason;
+    line.scale = outcome.scale;
+    line.width = outcome.width;
+    line.height = outcome.height;
+    line.renderMs = done.renderMs;
+    line.setClipMs = outcome.setClipMs;
+    line.setLutsMs = outcome.setLutsMs;
+    line.runMs = outcome.runMs;
+    line.overlappedPlay = done.realRequestArrivedDuringWarm && playing;
+    QString amazeReason;
+    if( playback_recon_warm_run::guiAmazeAllowed( hasOutput, playing, clipMatches ) )
+    {
+        const double wb[3] = { done.wbMultipliers[0], done.wbMultipliers[1], done.wbMultipliers[2] };
+        line.amazeOk = GpuDisplayWindow::warmStagedReconSlotFromDeviceBayer16IfActive(
+            outcome.retained.device_bayer16, outcome.width, outcome.height, done.blackLevel, wb,
+            playbackReducedHnyquistWanted( outcome.scale > 1 ), &line.amazeKernelMs, &amazeReason );
+    }
+    else if( hasOutput )
+    {
+        amazeReason = playing ? QStringLiteral( "playing" ) : QStringLiteral( "stale_clip" );
+    }
+    line.released = llrpGpuPlaybackReconReleaseRetainedDeviceBayer16( outcome.retained.token ) != 0;
+    line.outstandingAfter = llrpGpuPlaybackReconRetainedOutstandingCount();
+    if( hasOutput && clipMatches ) m_playbackReconWarmRan = true;
+    // a device loss mid-run leaves no token (released=1 above is the no-op release of token 0); the line says why
+    qInfo().noquote() << line.format() + QStringLiteral( " frame=%1 decode_ms=%2 set_clip_calls=%3 set_luts_calls=%4 rc=%5 amaze_reason=\"" )
+                                             .arg( done.frameNumber )
+                                             .arg( outcome.decodeMs, 0, 'f', 3 )
+                                             .arg( static_cast<qulonglong>( outcome.setClipCalls ) )
+                                             .arg( static_cast<qulonglong>( outcome.setLutsCalls ) )
+                                             .arg( outcome.backendRc )
+                             + amazeReason + QStringLiteral( "\"" );
+    if( clipMatches && !playing ) schedulePlaybackReconWarmRepost( outcome.reason, done.clipGeneration );
 }
 
 void MainWindow::armPlaybackRoutePrewarm()
 {
     ++m_playbackRoutePrewarmClipGeneration;   // a prewarm armed for an earlier clip is stale
+    // Row A: a pair staged for an earlier clip is never adopted by this one
+    GpuDisplayWindow::releaseStagedPlaybackReconSlotIfActive();
+    m_playbackReconBackendPreloaded = false;
+    // Row W: a new clip re-arms the warm with the prewarm (a pending warm of the old clip is dropped or releases only)
+    m_playbackReconWarmPrewarmRan = false;
+    m_playbackReconWarmPosts = 0;
+    m_playbackReconWarmRepostArmed = false;
+    m_playbackReconWarmRan = false;
     m_playbackRoutePrewarmArmed = !mlvappPlaybackRoutePrewarmDisabled();
 }
 
@@ -28196,6 +28345,10 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                                                                    : QStringLiteral( "first_present" ) );
     // PLAYBACK-STARTUP-WAIT-PREWARM-1: where that wait went (PlaybackStartupSplit.h).
     qInfo().noquote() << m_playbackStartupSplit.line( static_cast<qulonglong>( m_playbackSmokeSessionId ) );
+    // PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-SETUP-1 Row 0: and where its first GPU window present went.
+    qInfo().noquote() << m_playbackStartupSplit.firstPresentLine( static_cast<qulonglong>( m_playbackSmokeSessionId ) );
+    // PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1 Row 0: and where its first render went.
+    qInfo().noquote() << m_playbackStartupSplit.renderFirstLine( static_cast<qulonglong>( m_playbackSmokeSessionId ) );
     // PLAYBACK-STARTUP-WAIT-PREWARM-1 Row A: how this Play's audio started (AudioPlayback::StartReport).
     {
         const AudioPlayback::StartReport audioStart =
@@ -30917,6 +31070,43 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
         const double splitGuiPresentMs = ( splitFinishEntry - displayStart ) * 1000.0;
         if( splitFirst ) m_playbackStartupSplit.noteFirstPresent( splitRenderMs, splitGuiPresentMs );
         else m_playbackStartupSplit.noteLaterPresent( splitRenderMs, splitGuiPresentMs );
+    }
+    // PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-SETUP-1 Row 0: the first present's GPU window parts
+    // (playback_smoke.first_present_split), read from the telemetry its texture present just wrote.
+    if( splitFirst )
+    {
+        const QJsonObject &t = readyFrame.stageTimingTelemetry;
+        playback_startup_split::FirstPresentSplit fp;
+        const QString slot = telemetryStringValue( t, "gpu_playback_recon_texture_present_slot" );
+        const QString handoff = telemetryStringValue( t, "gpu_playback_recon_texture_present_handoff_mode" );
+        if( !slot.isEmpty() ) fp.slot = slot;
+        if( !handoff.isEmpty() ) fp.handoff = handoff;
+        fp.setupProgramMs = telemetryDoubleValue( t, "gpu_playback_recon_texture_present_setup_program_ms" );
+        fp.setupLutMs = telemetryDoubleValue( t, "gpu_playback_recon_texture_present_setup_lut_ms" );
+        fp.setupBlurMs = telemetryDoubleValue( t, "gpu_playback_recon_texture_present_setup_blur_drain_ms" )
+                       + telemetryDoubleValue( t, "gpu_playback_recon_texture_present_setup_blur_upload_ms" )
+                       + telemetryDoubleValue( t, "gpu_playback_recon_texture_present_setup_blur_check_ms" );
+        fp.setupReallocMs = telemetryDoubleValue( t, "gpu_playback_recon_texture_present_setup_realloc_ms" );
+        fp.setupSamplingMs = telemetryDoubleValue( t, "gpu_playback_recon_texture_present_setup_sampling_ms" );
+        fp.reconWallMs = telemetryDoubleValue( t, "gpu_playback_recon_texture_present_recon_wall_ms" );
+        fp.amazeKernelMs = telemetryDoubleValue( t, "gpu_playback_recon_texture_present_amaze_kernel_ms" );
+        fp.amazeDownloadMs = telemetryDoubleValue( t, "gpu_playback_recon_texture_present_amaze_download_ms" );
+        fp.paintMs = telemetryDoubleValue( t, "gpu_playback_recon_texture_present_post_ms" );
+        fp.guiPickupMs = playback_startup_split::guiPickupMs( readyFrame.frameReadyEmitStageTime, displayStart );
+        fp.backendPreloaded = m_playbackReconBackendPreloaded;
+        // PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1 Row 0: did the paused warm absorb the first set_clip / set_luts?
+        fp.warmRun = m_playbackReconWarmRan;
+        fp.setClipAtPlay = static_cast<long long>( llrpGpuPlaybackReconSetClipCount() - m_playbackSmokeStartGpuSetClipCount );
+        fp.setLutsAtPlay = static_cast<long long>( llrpGpuPlaybackReconSetLutsCount() - m_playbackSmokeStartGpuSetLutsCount );
+        m_playbackStartupSplit.noteFirstPresentSplit( fp );
+        // Row 0: render_first by the first frame's existing stage timers (never a new hot-path timer)
+        playback_startup_split::RenderFirstSplit rf;
+        rf.renderFirstMs = telemetryDoubleValue( t, "render_thread_total_ms" );
+        rf.hasDecode = t.contains( QStringLiteral( "raw_uint16_ms" ) );
+        rf.decodeMs = telemetryDoubleValue( t, "raw_uint16_ms" );
+        rf.hasLlrawproc = t.contains( QStringLiteral( "llrawproc_total_ms" ) );
+        rf.llrawprocMs = telemetryDoubleValue( t, "llrawproc_total_ms" );
+        m_playbackStartupSplit.noteRenderFirstSplit( rf );
     }
     double splitMark = splitFinishEntry;
     const auto splitStep = [&]( int step )

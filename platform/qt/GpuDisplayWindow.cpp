@@ -8,6 +8,8 @@
 #include "GpuDisplayWindow.h"
 #include "GpuDebayer.h"
 #include "GpuFieldTelemetry.h"
+#include "PlaybackEnvFlags.h"
+#include "PlaybackRouteStagedSlotPolicy.h"
 #include "PlaybackScaling.h"
 #include "PlaybackSwapInterval.h"
 #include "debug/StageTiming.h"
@@ -94,6 +96,17 @@ bool paintPerSubmitEnabled()
     static const bool enabled =
         !qEnvironmentVariableIsSet( "MLVAPP_GPU_WINDOW_PAINT_PER_SUBMIT" )
         || qEnvironmentVariable( "MLVAPP_GPU_WINDOW_PAINT_PER_SUBMIT" ) != QStringLiteral("0");
+    return enabled;
+}
+
+// PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-SETUP-1 Row A, read once, with the same exact values as its parent switch
+// MLVAPP_PLAYBACK_ROUTE_PREWARM (PlaybackEnvFlags.h: 0/false/off/no turns it off; unset or anything else keeps the
+// default, on). On keeps the prewarm's warmed pair as the staged slot the first recon present adopts; off restores
+// the #450 warm-then-free path exactly.
+bool playbackRoutePrewarmStageEnabled()
+{
+    static const bool enabled = playback_env_flag::resolve(
+        playback_env_flag::parse( qgetenv( "MLVAPP_PLAYBACK_ROUTE_PREWARM_STAGE" ).constData() ), true );
     return enabled;
 }
 
@@ -532,11 +545,117 @@ bool GpuDisplayWindow::prewarmPlaybackReconRouteIfActive(int texWidth, int texHe
     return win->prewarmPlaybackReconRoute(texWidth, texHeight, summary);
 }
 
+void GpuDisplayWindow::releaseStagedPlaybackReconSlotIfActive()
+{
+    GpuDisplayWindow *win = nullptr;
+    {
+        QMutexLocker lock(&g_activeMutex);
+        win = g_activeWindow.load(std::memory_order_acquire);
+        if ( !win || QThread::currentThread() != win->thread() ) return;
+    }
+    // like the prewarm: GUI thread, no g_activeMutex (the window is only destroyed on this thread)
+    win->releaseStagedReconSlot();
+}
+
+bool GpuDisplayWindow::warmStagedReconSlotFromDeviceBayer16IfActive(const uint16_t *deviceBayer16,
+                                                                    int width,
+                                                                    int height,
+                                                                    int blackLevel,
+                                                                    const double wbMultipliers[3],
+                                                                    bool reducedHnyquist,
+                                                                    double *kernelMs,
+                                                                    QString *reason)
+{
+    if ( kernelMs ) *kernelMs = 0.0;
+    GpuDisplayWindow *win = nullptr;
+    {
+        QMutexLocker lock(&g_activeMutex);
+        win = g_activeWindow.load(std::memory_order_acquire);
+        if ( !win )
+        {
+            if ( reason ) *reason = QStringLiteral("no_active_window");
+            return false;
+        }
+        if ( QThread::currentThread() != win->thread() )
+        {
+            if ( reason ) *reason = QStringLiteral("not_gui_thread");
+            return false;
+        }
+    }
+    // like the prewarm: GUI thread, no g_activeMutex (the window is only destroyed on this thread)
+    return win->warmStagedReconSlotFromDeviceBayer16(deviceBayer16, width, height, blackLevel, wbMultipliers,
+                                                     reducedHnyquist, kernelMs, reason);
+}
+
+/* PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1 Row W: the first recon present's AMaZE call (device Bayer16 -> RGBA16, the
+ * retained-device branch of setPresentedGpuPlaybackReconAmazePostWbTexture), run while paused into the staged output
+ * the first Play-present adopts. The staged pair stays staged; m_texture, m_gpuReconSourceTexture and the pending
+ * frame are untouched and nothing is painted, so what the window shows is unchanged. */
+bool GpuDisplayWindow::warmStagedReconSlotFromDeviceBayer16(const uint16_t *deviceBayer16,
+                                                            int width,
+                                                            int height,
+                                                            int blackLevel,
+                                                            const double wbMultipliers[3],
+                                                            bool reducedHnyquist,
+                                                            double *kernelMs,
+                                                            QString *reason)
+{
+    if ( !deviceBayer16 || width <= 0 || height <= 0 )
+    {
+        if ( reason ) *reason = QStringLiteral("no_device_output");
+        return false;
+    }
+    // a window/fullscreen toggle or context loss freed the staged pair (cleanupGLResources): nothing to warm into
+    if ( !m_stagedReconOutput || !m_stagedReconSource )
+    {
+        if ( reason ) *reason = QStringLiteral("no_staged_slot");
+        return false;
+    }
+    if ( m_stagedReconWidth != width || m_stagedReconHeight != height )
+    {
+        if ( reason ) *reason = QStringLiteral("staged_slot_size_mismatch");
+        return false;
+    }
+    QOpenGLContext *glContext = context();
+    if ( !glContext || !isValid() )
+    {
+        if ( reason ) *reason = QStringLiteral("no_gl_context");
+        return false;
+    }
+    // the present would refuse this too (playbackReducedHnyquistPresentRefused)
+    if ( reducedHnyquist && !gpuAmazeDebayerReducedHnyquistAvailable() )
+    {
+        if ( reason ) *reason = gpuAmazeDebayerReducedHnyquistMissingReason();
+        return false;
+    }
+    const bool needsCurrent = QOpenGLContext::currentContext() != glContext;
+    if ( needsCurrent ) makeCurrent();
+    GpuAmazeDebayerBackendTiming timing;
+    QString amazeReason;
+    const bool amazeOk =
+        gpuAmazeDebayerRenderPostWbGlTextureFromDeviceBayer16(deviceBayer16,
+                                                              m_stagedReconOutput->textureId(),
+                                                              width,
+                                                              height,
+                                                              blackLevel,
+                                                              wbMultipliers,
+                                                              &amazeReason,
+                                                              nullptr,
+                                                              &timing,
+                                                              reducedHnyquist);
+    if ( needsCurrent ) doneCurrent();
+    if ( kernelMs && amazeOk && timing.available ) *kernelMs = timing.kernelMs;
+    if ( reason ) *reason = amazeReason;
+    return amazeOk;
+}
+
 /* PLAYBACK-STARTUP-WAIT-PREWARM-1 Row B: pay the texture route's one-time setup while paused. Compiles the
  * preview-processing program the route draws with, and runs AMaZE once at the playback size from a temporary R16
  * texture into a temporary RGBA16 texture -- loading its kernels and sizing its live device buffers (which stay
  * allocated) -- then unregisters both from CUDA and frees them. Never touches m_texture or the pending frame, and
- * never paints: what the window shows is unchanged. */
+ * never paints: what the window shows is unchanged.
+ * PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-SETUP-1 Row A: when staging is on and the warm succeeds, the pair is kept
+ * (still registered) as m_stagedReconOutput / m_stagedReconSource instead, for the first recon present to adopt. */
 bool GpuDisplayWindow::prewarmPlaybackReconRoute(int texWidth, int texHeight, QString *summary)
 {
     QOpenGLContext *glContext = context();
@@ -571,6 +690,10 @@ bool GpuDisplayWindow::prewarmPlaybackReconRoute(int texWidth, int texHeight, QS
     const bool needsCurrent = QOpenGLContext::currentContext() != glContext;
     if ( needsCurrent ) makeCurrent();
 
+    // PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-SETUP-1 Row A: a pair staged by an earlier warm goes first (CUDA reset,
+    // then delete), so at most one staged pair is ever held.
+    releaseStagedReconSlot();
+
     const double programStartMs = nowMs();
     ensurePreviewProcessingProgram();
     const double programMs = nowMs() - programStartMs;
@@ -601,16 +724,32 @@ bool GpuDisplayWindow::prewarmPlaybackReconRoute(int texWidth, int texHeight, QS
                                                              &amazeReason);
     const double amazeMs = nowMs() - amazeStartMs;
 
-    // unregister the temporaries from CUDA before their GL names are freed
-    gpuAmazeDebayerResetR16TextureBackendResources();
-    delete warmInput;
-    delete warmOutput;
+    const bool staged = amazeOk && playbackRoutePrewarmStageEnabled();
+    if ( staged )
+    {
+        // Row A: keep the warmed pair as the staged slot (PlaybackRouteStagedSlotPolicy.h). No CUDA reset here: the
+        // AMaZE live cache keeps the staged output's registration, so the first recon present that adopts it neither
+        // allocates nor registers again. Same sampling-edge state the realloc branch gives a new pair.
+        warmInput->setWrapMode(QOpenGLTexture::ClampToEdge);
+        warmOutput->setWrapMode(QOpenGLTexture::ClampToEdge);
+        m_stagedReconOutput = warmOutput;
+        m_stagedReconSource = warmInput;
+        m_stagedReconWidth = texWidth;
+        m_stagedReconHeight = texHeight;
+    }
+    else
+    {
+        // unregister the temporaries from CUDA before their GL names are freed
+        gpuAmazeDebayerResetR16TextureBackendResources();
+        delete warmInput;
+        delete warmOutput;
+    }
     if ( needsCurrent ) doneCurrent();
 
     if ( summary )
     {
         *summary = QStringLiteral("ok=%1 width=%2 height=%3 program_ms=%4 alloc_ms=%5 amaze_ms=%6 total_ms=%7 "
-                                  "live_slot_held=%8 live_slot_evicted=%9 reason=\"%10\"")
+                                  "live_slot_held=%8 live_slot_evicted=%9 staged=%10 reason=\"%11\"")
             .arg(amazeOk ? 1 : 0)
             .arg(texWidth)
             .arg(texHeight)
@@ -620,6 +759,7 @@ bool GpuDisplayWindow::prewarmPlaybackReconRoute(int texWidth, int texHeight, QS
             .arg(nowMs(), 0, 'f', 3)
             .arg(liveSlotHeld ? 1 : 0)
             .arg(liveSlotHeld ? 1 : 0)
+            .arg(staged ? 1 : 0)
             .arg(amazeReason);
     }
     return amazeOk;
@@ -935,19 +1075,65 @@ bool GpuDisplayWindow::setPresentedGpuPlaybackReconAmazePostWbTexture(
         m_lutSet, previewProcessing, texWidth, texHeight, &setupTiming );
 
     partStartMs = elapsedMs();
+    // PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-SETUP-1 Row A: the paused prewarm's staged pair, if any, is adopted or
+    // discarded here, decided BEFORE destroyTexture() can reset the CUDA-GL caches that still hold its registration.
+    const playback_route_staged_slot::Decision stagedSlot = playback_route_staged_slot::decide(
+        playbackRoutePrewarmStageEnabled(),
+        m_stagedReconOutput && m_stagedReconSource,
+        m_stagedReconWidth,
+        m_stagedReconHeight,
+        texWidth,
+        texHeight,
+        m_textureFromGpuRecon,
+        m_gpuReconSourceTexture != nullptr);
+    setupTiming.slot = "kept";
     if ( !m_texture
       || m_texture->width() != texWidth
       || m_texture->height() != texHeight
       || !m_textureFromGpuRecon )
     {
-        destroyTexture();
-        m_texture = new QOpenGLTexture(QOpenGLTexture::Target2D);
-        m_texture->setFormat(QOpenGLTexture::RGBA16_UNorm);
-        m_texture->setSize(texWidth, texHeight);
-        m_texture->setMipLevels(1);
-        m_texture->allocateStorage(QOpenGLTexture::RGBA, QOpenGLTexture::UInt16);
-        m_texture->setWrapMode(QOpenGLTexture::ClampToEdge);
-        gpuPresentEventNoteTextureRealloc("window_rgba16_texture_realloc", texWidth, texHeight);
+        if ( stagedSlot == playback_route_staged_slot::Decision::Adopt )
+        {
+            // The old texture is the paused QImage one (never CUDA-registered) and no recon source exists, so it is
+            // freed with neither CUDA reset: the AMaZE live cache keeps the staged output's registration. The state
+            // is the one destroyTexture() leaves; the source stays not current until a present writes it.
+            delete m_texture;
+            m_texture = m_stagedReconOutput;
+            m_gpuReconSourceTexture = m_stagedReconSource;
+            m_stagedReconOutput = nullptr;
+            m_stagedReconSource = nullptr;
+            m_stagedReconWidth = 0;
+            m_stagedReconHeight = 0;
+            m_pendingTextureFromGpuRecon = false;
+            m_gpuReconSourceTextureCurrent = false;
+            m_texturePresentationActive = false;
+            m_pendingTextureWidth = 0;
+            m_pendingTextureHeight = 0;
+            m_pendingDisplayWidth = 0;
+            m_pendingDisplayHeight = 0;
+            gpuPresentEventNoteTextureRealloc("window_recon_slot_adopted", texWidth, texHeight);
+            setupTiming.slot = playback_route_staged_slot::decisionName(stagedSlot);
+        }
+        else
+        {
+            if ( stagedSlot == playback_route_staged_slot::Decision::Discard ) releaseStagedReconSlot();
+            setupTiming.slot = stagedSlot == playback_route_staged_slot::Decision::Discard
+                ? playback_route_staged_slot::decisionName(stagedSlot)
+                : "realloc";
+            destroyTexture();
+            m_texture = new QOpenGLTexture(QOpenGLTexture::Target2D);
+            m_texture->setFormat(QOpenGLTexture::RGBA16_UNorm);
+            m_texture->setSize(texWidth, texHeight);
+            m_texture->setMipLevels(1);
+            m_texture->allocateStorage(QOpenGLTexture::RGBA, QOpenGLTexture::UInt16);
+            m_texture->setWrapMode(QOpenGLTexture::ClampToEdge);
+            gpuPresentEventNoteTextureRealloc("window_rgba16_texture_realloc", texWidth, texHeight);
+        }
+    }
+    else if ( stagedSlot == playback_route_staged_slot::Decision::Discard )
+    {
+        // a live recon slot is kept; a pair staged beside it is never adopted
+        releaseStagedReconSlot();
     }
     m_textureFromGpuRecon = true;
     if ( !m_gpuReconSourceTexture
@@ -1127,6 +1313,11 @@ bool GpuDisplayWindow::setPresentedGpuPlaybackReconAmazePostWbTexture(
     }
 
     const bool ok = reconOk && amazeOk;
+    if ( amazeTiming.available )
+    {
+        setupTiming.amaze_kernel_ms = amazeTiming.kernelMs;
+        setupTiming.amaze_download_ms = amazeTiming.downloadMs;
+    }
     if ( timing )
     {
         *timing = llrpGpuPlaybackReconCombineTiming(
@@ -1500,6 +1691,24 @@ void GpuDisplayWindow::destroyTexture()
     m_pendingDisplayHeight = 0;
 }
 
+void GpuDisplayWindow::releaseStagedReconSlot()
+{
+    if ( !m_stagedReconOutput && !m_stagedReconSource ) return;
+    QOpenGLContext *glContext = context();
+    const bool needsCurrent = glContext && QOpenGLContext::currentContext() != glContext;
+    const bool madeCurrent = needsCurrent ? (makeCurrent(), true) : false;
+    // unregister the staged pair from both runtimes' CUDA-GL caches before its GL names are freed
+    gpuAmazeDebayerResetR16TextureBackendResources();
+    llrpGpuPlaybackReconResetGlTextureResources();
+    delete m_stagedReconOutput;
+    delete m_stagedReconSource;
+    m_stagedReconOutput = nullptr;
+    m_stagedReconSource = nullptr;
+    m_stagedReconWidth = 0;
+    m_stagedReconHeight = 0;
+    if ( madeCurrent ) doneCurrent();
+}
+
 void GpuDisplayWindow::cleanupGLResources()
 {
     // FAIL CLOSED (GPU-TEXNR-S1-DARK-GREEN-1 round 3, fable minor 1): mirrors
@@ -1512,6 +1721,8 @@ void GpuDisplayWindow::cleanupGLResources()
     const bool needsCurrent = glContext && QOpenGLContext::currentContext() != glContext;
     const bool madeCurrent = needsCurrent ? (makeCurrent(), true) : false;
 
+    // Row A: a staged prewarm pair is context-bound too (a window/fullscreen toggle or context loss frees it)
+    releaseStagedReconSlot();
     destroyTexture();
     gpuPreviewProcessingDestroyLutTextureSet(m_lutSet);
     delete m_program;
