@@ -221,7 +221,51 @@ def test_the_duty_line_indented_up_to_three_spaces_still_opens_the_gate(tmp_path
     assert report["refused"] == [] and [w["target"] for w in report["would_push"]] == [CONCERNS]
 
 
-@pytest.mark.parametrize("readme", [DUTY_LINE, "# cos-feedback\n\n" + DUTY_LINE.lstrip("- "), "# cos-feedback\n\n" + DUTY_LINE.replace("- ", "* ", 1)])
+@pytest.mark.parametrize("gap", [" ", "  ", "   ", "    ", "\t"])
+def test_a_bullet_followed_by_one_to_four_spaces_or_a_tab_opens_the_gate(tmp_path, gap):
+    """CoS r4 review, N5 (controls): CommonMark takes 1 to 4 spaces, or a tab, after a list marker as the marker gap."""
+    src = init_source(tmp_path)
+    clone = init_bus(tmp_path, "# cos-feedback\n\n" + DUTY_LINE.replace("- ", "-" + gap, 1))
+    report = ob.drain(src, clone, "HEAD", tmp_path / "sent.jsonl", [], push=False)
+    assert report["refused"] == [] and [w["target"] for w in report["would_push"]] == [CONCERNS]
+
+
+@pytest.mark.parametrize("marker", ["-", "*"])
+def test_a_bullet_followed_by_five_spaces_is_an_indented_code_block_and_does_not_open_the_gate(tmp_path, marker):
+    """CoS r4 review, N5: with 5 or more spaces after the marker the item content is an indented code block."""
+    src = init_source(tmp_path)
+    clone = init_bus(tmp_path, "# cos-feedback\n\n" + DUTY_LINE.replace("- ", marker + "     ", 1))
+    report = ob.drain(src, clone, "HEAD", tmp_path / "sent.jsonl", [], push=False)
+    assert [r["code"] for r in report["refused"]] == ["CONCERN_CHANNEL_NOT_RATIFIED"]
+    assert report["published"] == []
+
+
+@pytest.mark.parametrize("label,readme", [
+    ("an indented code line ended by a vertical tab", "# cos-feedback\n\np\n\n    code\x0b" + DUTY_LINE),
+    ("a form feed before the line", "# cos-feedback\n\np\n\n    code\x0c" + DUTY_LINE),
+    ("a unicode line separator inside one paragraph line", "# cos-feedback\n\nx " + DUTY_LINE),
+    ("a unicode paragraph separator inside one paragraph line", "# cos-feedback\n\nx " + DUTY_LINE),
+    ("a next-line character inside one paragraph line", "# cos-feedback\n\nx\x85" + DUTY_LINE),
+])
+def test_only_newline_carriage_return_and_crlf_end_a_line_for_the_duty_scan(tmp_path, label, readme):
+    """CoS r4 review, N6: str.splitlines() also breaks on \\v, \\f, \\x1c-\\x1e, \\x85, U+2028 and U+2029, which Markdown
+    does not; the duty text there is part of a longer line, so it must not open the gate."""
+    src = init_source(tmp_path)
+    clone = init_bus(tmp_path, readme)
+    report = ob.drain(src, clone, "HEAD", tmp_path / "sent.jsonl", [], push=False)
+    assert [r["code"] for r in report["refused"]] == ["CONCERN_CHANNEL_NOT_RATIFIED"], label
+    assert report["published"] == []
+
+
+@pytest.mark.parametrize("newline", ["\r\n", "\r"])
+def test_the_duty_line_still_counts_when_lines_end_in_crlf_or_cr(tmp_path, newline):
+    src = init_source(tmp_path)
+    clone = init_bus(tmp_path, ("# cos-feedback\n\n" + DUTY_LINE).replace("\n", newline))
+    report = ob.drain(src, clone, "HEAD", tmp_path / "sent.jsonl", [], push=False)
+    assert report["refused"] == [] and [w["target"] for w in report["would_push"]] == [CONCERNS]
+
+
+@pytest.mark.parametrize("readme", [DUTY_LINE, "# cos-feedback\n\n" + DUTY_LINE.lstrip("- "),"# cos-feedback\n\n" + DUTY_LINE.replace("- ", "* ", 1)])
 def test_the_exact_duty_line_opens_the_gate_with_or_without_a_bullet(tmp_path, readme):
     src = init_source(tmp_path)
     clone = init_bus(tmp_path, readme)
@@ -356,6 +400,29 @@ def test_a_link_on_a_parent_of_the_concerns_path_at_the_tip_is_a_per_item_refusa
     assert link_path in report["refused"][0]["detail"] and "120000" in report["refused"][0]["detail"]
     assert [p["target"] for p in report["published"]] == ["RECEIPTS.md"], "the receipt is not held by the refused concern"
     assert git(bare, "ls-tree", "master", "--", link_path).startswith("120000 "), "the link itself is untouched"
+
+
+@pytest.mark.parametrize("plain_path", ["specs", "specs/mlv-app"])
+def test_a_regular_file_on_a_parent_of_the_concerns_path_is_refused_as_not_a_directory(tmp_path, plain_path):
+    """CoS r4 review, N7: a regular file where `specs` or `specs/mlv-app` should be is still a per-item refusal, but
+    its detail says "not a directory: mode 100644" rather than describing a link."""
+    src = init_source(tmp_path)
+    (src / "doctrine-outbox" / "20261016-b-receipt.md").write_text(
+        item_text("### A receipt\nbody\n", target="RECEIPTS.md", kind="receipt"), encoding="utf-8")
+    git(src, "add", "-A")
+    git(src, "commit", "-m", "add a receipt")
+    clone = init_bus(tmp_path, RATIFIED_README)
+    _tip_entry(clone, "100644", "just a file\n", path=plain_path)
+    bare = tmp_path / "bus-origin.git"
+
+    report = ob.drain(src, clone, "HEAD", tmp_path / "sent.jsonl", [], push=True)
+
+    assert [(r["path"], r["code"]) for r in report["refused"]] == [
+        ("doctrine-outbox/20261016-example-concern.md", "CONCERNS_PATH_IS_LINK")]
+    assert f"{plain_path} at " in report["refused"][0]["detail"]
+    assert "not a directory: mode 100644" in report["refused"][0]["detail"]
+    assert [p["target"] for p in report["published"]] == ["RECEIPTS.md"], "the receipt is not held by the refused concern"
+    assert git(bare, "ls-tree", "master", "--", plain_path).startswith("100644 "), "the file itself is untouched"
 
 
 def test_a_directory_on_the_concerns_path_is_not_a_link(tmp_path):

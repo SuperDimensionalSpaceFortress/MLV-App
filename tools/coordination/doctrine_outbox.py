@@ -133,11 +133,12 @@ CONCERNS_READER_FILE = "cos-feedback/README.md"
 CONCERNS_READER_TOKEN = "CoS-CONCERN:"
 # The ratification is ONE line of that README, not the token anywhere in it: the CoS's reader duty names both routes
 # (R1 PR comments and R2 every specs/*/cos-concerns.md). The gate opens only on a line EQUAL to the example below
-# (an optional leading `- ` or `* ` bullet allowed, indented 0 to 3 spaces, and trailing whitespace); a line that adds,
-# forbids or negates anything is not the duty, a line at 4 or more spaces or a tab is an indented code block, and a
-# line inside a ``` fence, a ~~~ fence or an HTML comment never counts.
+# (an optional leading `-` or `*` bullet followed by 1 to 4 spaces or a tab, indented 0 to 3 spaces, and trailing
+# whitespace); a line that adds, forbids or negates anything is not the duty, a line at 4 or more spaces or a tab (or
+# with 5 or more spaces after the bullet) is an indented code block, and a line inside a ``` fence, a ~~~ fence or an
+# HTML comment never counts. Lines end only at \n, \r\n or \r, as in Markdown.
 CONCERNS_DUTY_LINE_EXAMPLE = "- The CoS reads `CoS-CONCERN:` PR comments and every `specs/*/cos-concerns.md` each pass."
-CONCERNS_DUTY_LINE_RE = re.compile(r"^ {0,3}(?:[-*]\s+)?" + re.escape(CONCERNS_DUTY_LINE_EXAMPLE[2:]) + r"\s*$")
+CONCERNS_DUTY_LINE_RE = re.compile(r"^ {0,3}(?:[-*](?: {1,4}|\t))?" + re.escape(CONCERNS_DUTY_LINE_EXAMPLE[2:]) + r"\s*$")
 _FENCE_OPEN_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 CONCERN_FIELDS = ("id", "to", "opened_utc", "expires_utc", "kind", "evidence", "ask")
 CONCERN_KINDS = ("output-format", "process", "shared-tool-defect", "fleet-pattern")
@@ -1044,16 +1045,18 @@ def concern_reader_duty_on_bus(bus_repo: pathlib.Path, tip: str) -> bool:
 
 
 def has_concerns_duty_line(text: str) -> bool:
-    """True when a line EQUAL to CONCERNS_DUTY_LINE_EXAMPLE (an optional `- ` or `* ` bullet, indented 0 to 3 spaces,
-    and trailing whitespace allowed, nothing else) stands outside every ``` fence, ~~~ fence and <!-- --> comment. A
-    line that merely starts like the duty, adds a clause, forbids it or negates it is not the duty, and neither is
-    one at 4 or more spaces or a tab (an indented code block). A fence marker inside a comment, and a comment marker
+    """True when a line EQUAL to CONCERNS_DUTY_LINE_EXAMPLE (an optional `-` or `*` bullet followed by 1 to 4 spaces or
+    a tab, indented 0 to 3 spaces, and trailing whitespace allowed, nothing else) stands outside every ``` fence, ~~~
+    fence and <!-- --> comment. A line that merely starts like the duty, adds a clause, forbids it or negates it is not
+    the duty, and neither is one at 4 or more spaces or a tab (an indented code block), or one with 5 or more spaces
+    after the bullet (the same, inside the list item). Lines end only at \\n, \\r\\n or \\r, as in Markdown: a \\v, \\f,
+    \\x1c-\\x1e, \\x85, U+2028 or U+2029 does not start a new line. A fence marker inside a comment, and a comment marker
     inside a fence, are plain text (CommonMark: a fence closes on a marker of the same character at least as long as
     the opener). The scan does not parse inline code: a `<!--` inside a code span before the line opens a comment
     that never closes, so the gate stays shut. That fails closed, which is the safe side."""
     fence = ""        # the opening marker while inside a fence
     in_comment = False
-    for line in text.splitlines():
+    for line in re.split(r"\r\n|\r|\n", text):
         if fence:
             close = re.match(r"^ {0,3}(" + re.escape(fence[0]) + r"{" + str(len(fence)) + r",})\s*$", line)
             if close:
@@ -1185,7 +1188,8 @@ def tip_parent_link_problem(bus_repo: pathlib.Path, tip: str, target: str) -> st
     """Why a directory on the way to `target` at the tip is not a plain directory, or None. Each parent component is
     looked up on its own (`specs`, then `specs/<project>`): a leaf lookup through a link returns nothing, so
     cards_tip_entry_problem alone cannot see a link above the file. Only a tree (040000) or a missing component
-    qualifies; a 120000 link or a 160000 gitlink is named. The walk stops at the first missing component."""
+    qualifies; a 120000 link or a 160000 gitlink is named as a mode that is not a directory, and any other entry (a
+    regular file, say) is named "not a directory: mode <mode>". The walk stops at the first missing component."""
     parts = pathlib.PurePosixPath(target).parts
     for depth in range(1, len(parts)):
         prefix = "/".join(parts[:depth])
@@ -1200,7 +1204,10 @@ def tip_parent_link_problem(bus_repo: pathlib.Path, tip: str, target: str) -> st
             found = True
             fields = meta.split()
             if fields[:2] != ["040000", "tree"]:
-                return f"{prefix} at {tip[:12]} is mode {fields[0] if fields else '?'}, not a directory"
+                mode = fields[0] if fields else "?"
+                if mode in ("120000", "160000"):
+                    return f"{prefix} at {tip[:12]} is mode {mode}, not a directory"
+                return f"{prefix} at {tip[:12]} is not a directory: mode {mode}"
         if not found:
             return None
     return None

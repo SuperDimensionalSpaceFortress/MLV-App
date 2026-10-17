@@ -91,15 +91,18 @@ and never stored.
 The drain holds an entry, and the refusal names the reason:
 - `CONCERN_CHANNEL_NOT_RATIFIED` until the fetched bus tip's `cos-feedback/README.md` carries the exact duty
   line `- The CoS reads `CoS-CONCERN:` PR comments and every `specs/*/cos-concerns.md` each pass.`: a line EQUAL to
-  it (a leading `- ` or `* ` bullet is optional, the line may be indented 0 to 3 spaces and carry trailing
-  whitespace, nothing else). A line that only starts like it, adds a clause, forbids or negates it, names only
-  R1, sits at 4 or more spaces or a tab (an indented code block), or sits inside a ``` fence, a `~~~` fence or
-  an HTML comment (one line or many) does not count, so nothing is written to a file nobody reads. The scan does
+  it (a leading `-` or `*` bullet followed by 1 to 4 spaces or a tab is optional, the line may be indented 0 to 3
+  spaces and carry trailing whitespace, nothing else). A line that only starts like it, adds a clause, forbids or
+  negates it, names only R1, sits at 4 or more spaces or a tab, has 5 or more spaces after the bullet (both are
+  indented code blocks), or sits inside a ``` fence, a `~~~` fence or an HTML comment (one line or many) does not
+  count, so nothing is written to a file nobody reads. Lines end only at `\n`, `\r\n` or `\r`, as in Markdown: a
+  vertical tab, form feed, `\x85`, U+2028 or U+2029 inside the text does not start a new line. The scan does
   not parse inline code, so a `<!--` inside a code span before the line keeps the gate shut (it fails closed);
-- `CONCERNS_PATH_IS_LINK` when `specs` or `specs/mlv-app` at the tip is a link (120000) or a gitlink (160000),
-  and `CONCERNS_PATH_NOT_REGULAR_FILE` when the tip's `specs/mlv-app/cos-concerns.md` is a link or any entry
+- `CONCERNS_PATH_IS_LINK` when `specs` or `specs/mlv-app` at the tip is a link (120000), a gitlink (160000) or
+  any other entry that is not a directory (a regular file, say, worded "not a directory: mode 100644"), and
+  `CONCERNS_PATH_NOT_REGULAR_FILE` when the tip's `specs/mlv-app/cos-concerns.md` is a link or any entry
   other than a regular 100644 blob: that concern alone is refused and the rest of the drain goes on. A card gets
-  the same walk over its own path under `CARDS_PATH_IS_LINK` (a link at `specs` or `specs/mlv-app`);
+  the same walk over its own path under `CARDS_PATH_IS_LINK` (the same three cases at `specs` or `specs/mlv-app`);
 - `CONCERN_EXPIRED` when `expires_utc` is not after the clock at drain time;
 - `CONCERN_DUPLICATE_ID` when the id heads more than one committed item (all of them are held), or is already
   in the tip's `specs/mlv-app/cos-concerns.md`; the refusal names the fields that differ from the published
