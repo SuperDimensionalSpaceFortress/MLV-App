@@ -1,55 +1,86 @@
 #!/usr/bin/env python3
-"""Doctrine outbox for MLV-App: findings reach the fleet doctrine bus by FILE, not by memory.
+"""Doctrine outbox: findings reach the fleet doctrine bus by FILE, not by memory.
 
-Ported from agent-bridge's `tools/doctrine_outbox.py` (github/master bfc39bf), itself a
-port of the fleet bus's reference outbox. The item format, front matter, `parse_item`,
-the Law-4 screen shape, `idempotency_key` and `render_block` are byte-compatible, so a
-block reads `<!-- outbox:<key> mlv-app:<sha12> -->`.
+ONE implementation for the whole fleet (owner P1, 2026-10-16: "the same tool exists in several
+versions"; tools/tool-census.mjs counts the drift). A project supplies only DATA, a
+`doctrine-outbox.config.json` at its repo root (or `--config`), and never edits this file.
+Every project-specific value (project name, default ref, items dir, finding paths, state and
+ledger paths, Law-4 deny terms) comes from that config. The config schema is the `_CONFIG_KEYS` set
+and `configure()` below; no bus README documents it yet. This file is the candidate for the bus's
+`tools/factory/doctrine_outbox.py`. Once the bus steward lands it there, a project can run it from the
+bus BY PIN (`factory-pins/pin-runner.py run`, tools/factory/README.md); the pin names a reviewed bus
+SHA, so nothing runs until the project reviews and pins it. A project KEEPS its local copy at config
+`tool_rel` until a pin-aware release (card OUTBOX-PIN-AWARE-TOOL-AT-REF-1: a config-driven hook
+invocation plus a `require_tool_at_ref` that accepts a pinned tool), because the installed hook and the
+debt and drain checks still read that path. Until then this file is the only source.
 
-WHAT IS DIFFERENT HERE (MLV-App's checkout shape drove every change)
---------------------------------------------------------------------
-1. REF, never HEAD. In MLV-App `origin` is the UPSTREAM project and the checkout sits on
-   a peer branch, so every item / debt / age query takes `--ref`, default
-   `refs/remotes/fork/master`, and reads committed bytes only. A ref that lacks this
-   tool or the items directory is `TOOL_ABSENT_AT_REF` and debt is UNKNOWN (exit 2),
-   never 0 -- the false all-clear a stale checkout would otherwise print.
+Lineage: the fleet bus's reference outbox -> agent-bridge's port -> a second project's port,
+whose behaviours are the superset below. The item format, front matter, `parse_item`, the Law-4
+screen shape, `idempotency_key` and `render_block` are byte-compatible across all of them, so
+a block reads `<!-- outbox:<key> <project>:<sha12> -->`.
+
+THE FAILURE THIS EXISTS FOR
+---------------------------
+A directive that lives in a session's head is not a mechanism: a real fix (a parity checker
+minting a hard ACCOUNT_MISMATCH on a healthy host) was published only because the owner asked
+"did you publish it?". The author writes the finding as a file in the SAME COMMIT as the fix;
+scripts check and publish it. No model decides "is this a finding".
+
+BEHAVIOURS
+----------
+1. REF, never HEAD. `--ref` (config `default_ref`) names the committed state every item / debt /
+   age query reads; the worktree and a peer branch are invisible. A ref that lacks this tool or
+   the items directory is `TOOL_ABSENT_AT_REF` and debt is UNKNOWN (exit 2), never 0 -- the
+   false all-clear a stale checkout would otherwise print.
 2. NO RE-APPEND of hand-written bus entries. An item may carry tracked front matter
-   `published_as: <bus sha>`; drain verifies that sha is an ancestor of the fetched bus
-   tip AND the item's `### ` heading is present in the target at that sha, then skips
-   the item. An unverifiable claim is refused, never trusted and never appended.
-3. Bus-side idempotency: a key already on the fetched bus tip is never re-appended, even
-   with an empty or lost sent ledger (new clone, machine move).
-4. Drain guarantees a blank line before every appended block, checks the byte prefix on
-   the COMMITTED blobs, retries from scratch on a non-fast-forward, and proves each push
-   with `ls-remote`. Debt age is measured from the first-parent merge into `--ref`, not
-   the branch commit's date.
-5. `check-ledger`: the capture-check primitive. Structured findings (`Finding: KF-<nn>`
-   tags, and KF ids inside `## KERNEL FINDINGS`) must each be followed by
-   `Doctrine-Export: outbox <item>` or `Doctrine-Export: none <reason, >= 4 words>`.
-   Keyword hits are ADVISORY output only. The watermark is a byte offset plus the sha256
-   of the prefix, advanced only on disposition.
-6. `check-commits`: commits touching a finding path need a `Doctrine-Export:` trailer.
-7. Law 4 adds MLV deny terms: the board's private state paths and the GPU host name.
-8. Dropped from the agent-bridge port: `seed` (agent-bridge's own 2026-09-25 manual drain
-   rows) and `check-decision` (a decision-JSON contract no MLV lane emits).
-9. R14.1 (bus RULINGS.md, "a new trap filing is a card"): `target: specs/mlv-app/cards.md`
-   files a `kind: trap` item as a card. Once the fetched bus tip carries
-   `tools/validate-cards.mjs` (R14 packet 2), a new TRAPS.md append is refused
-   (`R14_1_TRAP_FILING_IS_A_CARD`); the switch is the bus ref, never a date. Before any
-   push the would-be cards file is checked by that validator, run with node inside the
-   drain's temp worktree; an absent validator or node refuses the card (fail closed).
-10. Kernel filing (bus kernel K12 s4; adjudications/factory-kernel/README.md; PROMPT-K s4-5):
-   `kernel-filing` publishes `doctrine-outbox/kernel-filing/<yyyymmdd>/` on `--ref` to bus branch
-   `review/mlv-app-kernel-<YYYY-MM-DD>`, never master. It rewrites
-   `adjudications/factory-kernel/mlv-app.md` wholesale and appends an optional block to
-   `specs/mlv-app.md` (a revised block for the same date replaces the earlier one); no other path,
-   and no CLI parameter can name a branch or a path. An empty filing or block is refused. The
-   branch is created from bus master, or fast-forwarded when every commit on it is this outbox's.
-   Every success, including a no-op and a lost-ack recovery, is proven by `ls-remote` equal to
-   the certified commit (R7) and recorded in the sent ledger.
+   `published_as: <bus sha>`; drain verifies that sha is an ancestor of the fetched bus tip AND
+   the item's `### ` heading is present in the target at that sha, then skips the item. An
+   unverifiable claim is refused, never trusted and never appended.
+3. Bus-side idempotency: a key already on the fetched bus tip is never re-appended, even with an
+   empty or lost sent ledger (new clone, machine move).
+4. Drain guarantees a blank line before every appended block, checks the byte prefix on the
+   COMMITTED blobs, retries from scratch on a non-fast-forward, and proves each push with
+   `ls-remote`. Debt age is measured from the first-parent merge into `--ref`, not the branch
+   commit's date.
+5. `check-ledger`: the capture-check primitive. Structured findings (`Finding: KF-<nn>` tags, and
+   KF ids inside `## KERNEL FINDINGS`) must each be followed by `Doctrine-Export: outbox <item>`
+   or `Doctrine-Export: none <reason, >= 4 words>`. Keyword hits are ADVISORY output only. The
+   watermark is a byte offset plus the sha256 of the prefix, advanced only on disposition.
+6. `check-commits`: commits touching a finding path (config) need a `Doctrine-Export:` trailer.
+   `check-range` is its older spelling. Config `trailer_mode` picks the grammar: `reasoned`
+   (default: `none <reason>` / `outbox <item>`) or `bare` (the bus reference's: `none`, or
+   `outbox` when the commit itself adds an item).
+7. Law 4 is screened mechanically on the body, the filename and the commit message: the universal
+   classes below, plus the project's own deny terms (config `law4_extra`), plus the host, account
+   and deny-file names gathered at run time.
+8. R14.1 (bus RULINGS.md, "a new trap filing is a card"): `target: specs/<project>/cards.md` files
+   a `kind: trap` item as a card. Once the fetched bus tip carries `tools/validate-cards.mjs`
+   (R14 packet 2), a new TRAPS.md append is refused (`R14_1_TRAP_FILING_IS_A_CARD`); the switch
+   is the bus ref, never a date. Before any push the would-be cards file is checked by that
+   validator, run with node inside the drain's temp worktree; an absent validator or node refuses
+   the card (fail closed).
+9. Kernel filing (bus kernel K12 s4; adjudications/factory-kernel/README.md; PROMPT-K s4-5):
+   `kernel-filing` publishes `<outbox_dir>/kernel-filing/<yyyymmdd>/` on `--ref` to bus branch
+   `review/<project>-kernel-<YYYY-MM-DD>`, never master. It rewrites
+   `adjudications/factory-kernel/<project>.md` wholesale and appends an optional block to
+   `specs/<project>.md` (a revised block for the same date replaces the earlier one); no other
+   path, and no CLI parameter can name a branch or a path. An empty filing or block is refused.
+   The branch is created from bus master, or fast-forwarded when every commit on it is this
+   outbox's. Every success, including a no-op and a lost-ack recovery, is proven by `ls-remote`
+   equal to the certified commit (R7) and recorded in the sent ledger.
+10. Hook commands, for a project that wires this file into git and agent hooks: `check` (an item
+   unsent past a window is a stuck drain), `pre-push` (refuses a push whose commits fail
+   check-commits), `stop` (a Stop-hook nudge over the commits not yet on the remote),
+   `session-start` (installs the pre-push guard and reports debt, never blocks), `install-hooks`.
+   Each takes the repo as an optional first positional, as git and agent hooks call them. The
+   installed hook is made executable (git skips one that is not) and passes git's stdin through to
+   whatever layer follows the guard (git lfs pre-push reads the same ref lines). A host with no python
+   refuses the push (a guard that cannot run is not a pass), and an older guard block in an existing
+   hook is MOVED to the splice point right after the shebang and `set` lines (`install-hooks` prints
+   `repaired`), so a layer that reads git's stdin ahead of it cannot starve it. The hook and the debt checks still
+   run the file at config `tool_rel`: a project keeps that local copy until a pin-aware release.
 
-Wiring (OS drain task, Stop hook, heartbeat debt) is card DOCTRINE-OUTBOX-ADOPT-MLV-1b and
-installs against this CLI. Nothing here runs itself.
+Nothing here runs itself: the OS drain task, Stop hook and heartbeat debt are the project's wiring.
 
 Subcommands
 -----------
@@ -58,10 +89,18 @@ Subcommands
     drain --bus PATH [--ref R] [--push] [--ledger P] [--deny-file P]
     kernel-filing --bus PATH [--ref R] [--push] [--ledger P] [--deny-file P]
     check-ledger [--ledger P] [--watermark P] [--advance | --baseline]
-    check-commits [--range A..B]
+    check-commits [--range A..B]               (alias: check-range; legacy: check-range REPO [A..B])
+    check [REPO] [MAX_AGE_MIN]                 exit 1 when an unsent item is older than the window
+    pre-push [REPO] [REMOTE URL]               git pre-push hook; ref lines arrive on stdin
+    stop [REPO] [--ref R]                      Stop hook; hook JSON arrives on stdin; judges R..HEAD
+                                               (default: the config's default_range)
+    session-start [REPO]                       install the pre-push guard, report debt; exit 0
+    install-hooks [REPO]                       install the pre-push guard only
+Global: [--config doctrine-outbox.config.json] [--repo PATH]
 
 Exit codes: 0 = ok. 1 = debt, undisposed findings, or a validation/screen refusal.
-2 = UNKNOWN (usage error, git failure, ref or tool absent). Refusals print to stderr.
+2 = UNKNOWN (usage error, git failure, ref, tool or config absent). Refusals print to stderr; a
+config that is present but wrong is the refusal CONFIG_INVALID (exit 1, naming the key), never CONFIG_ABSENT.
 """
 from __future__ import annotations
 
@@ -78,16 +117,34 @@ import subprocess
 import sys
 import tempfile
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
-PROJECT = "mlv-app"
-OUTBOX_DIR = "doctrine-outbox"
-TOOL_REL = "tools/coordination/doctrine_outbox.py"
-DEFAULT_REF = "refs/remotes/fork/master"
-# R14.1/R14.7: a project writes its own specs/<project>/cards.md; every other spec stays steward-owned.
-CARDS_TARGET = f"specs/{PROJECT}/cards.md"
-TARGETS = ("RECEIPTS.md", "TRAPS.md", "RULINGS.md", CARDS_TARGET)
-KINDS = ("receipt", "trap", "ruling")
+# ---------- constants that are fleet-wide, not per project ----------
+
+GUARD_MARKER = "# doctrine-outbox-guard"
+GUARD_END = "# end doctrine-outbox-guard"
+CONFIG_NAME = "doctrine-outbox.config.json"
+CONFIG_ENV = "DOCTRINE_OUTBOX_CONFIG"
+CONFIG_SCHEMA = "doctrine-outbox-config.v1"
+KINDS = ("receipt", "trap", "ruling", "concern")
+# The project-to-CoS concern channel (card COS-CONCERN-CHANNEL-1): a project-owned file, one writer (bus Law 2).
+# The CoS answers each id once in its own cos-feedback/<project>/concerns.md; this tool never writes that file.
+CONCERNS_READER_FILE = "cos-feedback/README.md"
+CONCERNS_READER_TOKEN = "CoS-CONCERN:"
+# The ratification is ONE line of that README, not the token anywhere in it: the CoS's reader duty names both routes
+# (R1 PR comments and R2 every specs/*/cos-concerns.md). The gate opens only on a line EQUAL to the example below
+# (an optional leading `-` or `*` bullet followed by 1 to 4 spaces or a tab, indented 0 to 3 spaces, and trailing
+# whitespace); a line that adds, forbids or negates anything is not the duty, a line at 4 or more spaces or a tab (or
+# with 5 or more spaces after the bullet) is an indented code block, and a line inside a ``` fence, a ~~~ fence or an
+# HTML comment never counts. Lines end only at \n, \r\n or \r, as in Markdown.
+CONCERNS_DUTY_LINE_EXAMPLE = "- The CoS reads `CoS-CONCERN:` PR comments and every `specs/*/cos-concerns.md` each pass."
+CONCERNS_DUTY_LINE_RE = re.compile(r"^ {0,3}(?:[-*](?: {1,4}|\t))?" + re.escape(CONCERNS_DUTY_LINE_EXAMPLE[2:]) + r"\s*$")
+_FENCE_OPEN_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+CONCERN_FIELDS = ("id", "to", "opened_utc", "expires_utc", "kind", "evidence", "ask")
+CONCERN_KINDS = ("output-format", "process", "shared-tool-defect", "fleet-pattern")
+CONCERN_DEFAULT_DAYS = 14
+CONCERN_UTC_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
+CONCERN_UTC_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 CARD_VALIDATOR_REL = "tools/validate-cards.mjs"
 CARD_VALIDATOR_TIMEOUT_S = 120
 # The summary line the tip's validator prints on every run that reaches its main(). Only exit 0 AND this
@@ -103,44 +160,21 @@ REGULAR_FILE_MODE = "100644"
 # a test pins them to the vendored copy. The drain's authority is still that validator.
 MAX_CARD_LINES = 15
 MAX_CARD_BYTES = 2000
-CARD_HEADING_RE = re.compile(r"^## " + re.escape(PROJECT) + r"/[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
-CARDS_TITLE = f"# {PROJECT} cards (R14.1; written only by {PROJECT})\n\n"
 WORD_CAP = 450
 ITEM_NAME_RE = re.compile(r"^\d{8}-[a-z0-9][a-z0-9-]{2,60}\.md$")
 SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
 STALE_HOURS = 24
+PROJECT_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
+TRAILER_KEY = "Doctrine-Export"
+TRAILER_MODES = ("reasoned", "bare")
+BARE_TRAILER_VALUES = ("none", "outbox")
+HOOK_CHECK_WINDOW_MIN = 60   # the drain ticks every 15 min; an item unsent for 60 has missed several
+HOOK_STOP_WINDOW_S = 24 * 3600
 
-# Kernel filing: fixed source names map to fixed bus paths; the branch is derived from the date dir.
-KERNEL_DIR = f"{OUTBOX_DIR}/kernel-filing"
-KERNEL_FILING_SRC = f"adjudications-factory-kernel-{PROJECT}.md"
-KERNEL_SPEC_BLOCK_SRC = f"specs-{PROJECT}-block.md"
-KERNEL_FILING_DEST = f"adjudications/factory-kernel/{PROJECT}.md"
-KERNEL_SPEC_DEST = f"specs/{PROJECT}.md"
-KERNEL_SOURCES = {KERNEL_FILING_SRC: KERNEL_FILING_DEST, KERNEL_SPEC_BLOCK_SRC: KERNEL_SPEC_DEST}
-KERNEL_BRANCH_RE = re.compile(r"review/" + re.escape(PROJECT) + r"-kernel-[0-9]{4}-[0-9]{2}-[0-9]{2}")  # fullmatch only
-
-# Fixed, non-personal identity for every bus commit this tool makes. Pinned both via
-# `-c user.name=`/`-c user.email=` on the commit invocation AND via GIT_AUTHOR_*/
-# GIT_COMMITTER_* env vars, so ambient repo/global git config can never win either way.
-OUTBOX_IDENTITY_NAME = "mlv-app doctrine outbox"
-OUTBOX_IDENTITY_EMAIL = "outbox@mlv-app.invalid"
-
-LEDGER_REL = pathlib.Path(".claude-state") / "doctrine-outbox" / "sent.jsonl"
-DENY_FILE_REL = pathlib.Path(".claude-state") / "doctrine-outbox" / "deny-names.txt"
-SUBJECT_LEDGER_REL = pathlib.Path(".claude-state") / "kernel" / "subject-ledger.md"
-WATERMARK_REL = pathlib.Path(".claude-state") / "doctrine-outbox" / "ledger-watermark.json"
-SUBJECT_LEDGER_ENV = "MLV_OUTBOX_LEDGER"
-WATERMARK_ENV = "MLV_OUTBOX_WATERMARK"
-
-# Paths where findings have historically come from: a commit touching one must declare
-# `Doctrine-Export:`. Deliberately narrow, so ordinary product commits carry nothing.
-FINDING_PATH_PREFIXES = ("tools/coordination/", "agents/", ".claude/")
-FINDING_PATH_FILES = ("CLAUDE.md",)
-
-# Law 4 screen on the body. Each pattern names the class it refuses; the screen prints
-# which, never the matched text. The first nine are agent-bridge's; the rest
-# are MLV's own deny terms (private board state, and the GPU host).
-LAW4 = (
+# Law 4 screen on the body: the classes that are banned for EVERY project. Each pattern names the
+# class it refuses; the screen prints which, never the matched text. A project's own deny terms
+# (private board state, a GPU host name, ...) are DATA in its config (`law4_extra`).
+BASE_LAW4 = (
     ("email address", re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")),
     ("account/org uuid", re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", re.I)),
     ("lane wire path", re.compile(r"coordination/(lanes|comms)/")),
@@ -150,13 +184,60 @@ LAW4 = (
     ("owner state dir", re.compile(r"(?<![A-Za-z0-9_./-])state/")),
     ("dead-man floor surface", re.compile(r"coordination/deadman/")),
     ("user home path", re.compile(r"(?:[A-Za-z]:\\Users\\|/Users/|/home/|(?<![A-Za-z0-9])/[A-Za-z]/Users/)[^\s\\/]+", re.I)),
-    ("board private state dir", re.compile(r"\.claude-state\b", re.I)),
-    ("subject ledger", re.compile(r"subject-ledger", re.I)),
-    ("fleet run receipts", re.compile(r"fleet-runs", re.I)),
-    ("hub write-ahead log", re.compile(r"HUB_RUN_WAL", re.I)),
-    ("dual-lane ledger", re.compile(r"dual-lane", re.I)),
-    ("GPU host name", re.compile(r"ultra[\s_-]?magnus", re.I)),
 )
+
+# ---------- per-project values: filled by configure(), never edited by hand ----------
+
+PROJECT = ""
+OUTBOX_DIR = "doctrine-outbox"
+SENT_DIR = ""        # optional: a directory under OUTBOX_DIR whose items are already sent (moved there)
+SENT_PREFIX = ""     # f"{OUTBOX_DIR}/{SENT_DIR}/" when SENT_DIR is set, else ""
+TOOL_REL = ""
+DEFAULT_REF = ""
+DEFAULT_RANGE = ""
+CARDS_TARGET = ""
+TARGETS: tuple[str, ...] = ("RECEIPTS.md", "TRAPS.md", "RULINGS.md")
+CARD_HEADING_RE = re.compile(r"^## $")
+CARDS_TITLE = ""
+CONCERNS_TARGET = ""
+CONCERNS_TITLE = ""
+CONCERN_ID_RE = re.compile(r"$^")
+CONCERN_HEADING_RE = re.compile(r"$^")
+KERNEL_DIR = ""
+KERNEL_FILING_SRC = ""
+KERNEL_SPEC_BLOCK_SRC = ""
+KERNEL_FILING_DEST = ""
+KERNEL_SPEC_DEST = ""
+KERNEL_SOURCES: dict[str, str] = {}
+KERNEL_BRANCH_RE = re.compile(r"$^")
+OUTBOX_IDENTITY_NAME = ""
+OUTBOX_IDENTITY_EMAIL = ""
+LEDGER_REL = pathlib.Path()
+DENY_FILE_REL = pathlib.Path()
+SUBJECT_LEDGER_REL: pathlib.Path | None = None
+WATERMARK_REL = pathlib.Path()
+SUBJECT_LEDGER_ENV = "DOCTRINE_OUTBOX_LEDGER"
+WATERMARK_ENV = "DOCTRINE_OUTBOX_WATERMARK"
+FINDING_PATH_PREFIXES: tuple[str, ...] = ()
+FINDING_PATH_FILES: tuple[str, ...] = ()
+FINDING_PATH_REGEXES: tuple[re.Pattern[str], ...] = ()
+TRAILER_MODE = "reasoned"
+PRE_PUSH_REFS: tuple[str, ...] = ("refs/heads/master",)
+LAW4 = BASE_LAW4
+OUTBOX_REF_RE = re.compile(r"$^")
+CONFIG_PATH: pathlib.Path | None = None
+CONFIG_ROOT: pathlib.Path | None = None
+CONFIG_ERROR: Refusal | None = None   # why the config found at import was refused; None once configure() succeeds
+
+_CONFIG_KEYS = frozenset({
+    "schema", "project", "tool_rel", "default_ref", "default_range", "outbox_dir", "sent_dir", "cards_target",
+    "finding_path_prefixes", "finding_path_files", "finding_path_regexes", "trailer_mode", "pre_push_refs",
+    "law4_extra", "state_dir", "ledger_rel", "deny_file_rel", "subject_ledger_rel", "watermark_rel",
+    "subject_ledger_env", "watermark_env", "identity_name", "identity_email", "bus_candidate",
+})
+
+
+_LAW4_ROW_KEYS = frozenset({"name", "pattern", "ignorecase"})
 
 
 class Refusal(Exception):
@@ -172,11 +253,200 @@ class GitError(Exception):
 
 
 class Unknown(Exception):
-    """The answer cannot be derived (ref/tool/ledger absent). Maps to exit code 2, never 0."""
+    """The answer cannot be derived (ref/tool/ledger/config absent). Maps to exit code 2, never 0."""
 
     def __init__(self, code: str, detail: str = "") -> None:
         super().__init__(f"{code}: {detail}" if detail else code)
         self.code, self.detail = code, detail
+
+
+# ---------- configuration ----------
+
+def _str_list(cfg: dict, key: str, default: tuple[str, ...] = ()) -> tuple[str, ...]:
+    value = cfg.get(key, list(default))
+    if not isinstance(value, list) or not all(isinstance(v, str) and v for v in value):
+        raise Refusal("CONFIG_INVALID", f"{key} must be a list of non-empty strings")
+    return tuple(value)
+
+
+def _rel_value(value: object, key: str) -> pathlib.Path:
+    if not isinstance(value, str) or not value:
+        raise Refusal("CONFIG_INVALID", f"{key} must be a non-empty string")
+    parts = pathlib.PurePosixPath(value.replace("\\", "/")).parts
+    if pathlib.PurePosixPath(value.replace("\\", "/")).is_absolute() or ".." in parts or not parts:
+        raise Refusal("CONFIG_INVALID", f"{key} must be a relative path inside the repo: {value}")
+    return pathlib.Path(*parts)
+
+
+def _state_rel(cfg: dict, key: str, leaf: str) -> pathlib.Path:
+    """A state file's repo-relative path: its own key if given, else `state_dir`/`leaf`. Neither is
+    a refusal -- the tool names no default location, so no project's layout is baked into it."""
+    if key in cfg:
+        return _rel_value(cfg[key], key)
+    if "state_dir" in cfg:
+        return _rel_value(cfg["state_dir"], "state_dir") / leaf
+    raise Refusal("CONFIG_INVALID", f"{key} or state_dir is required")
+
+
+def load_config(path: pathlib.Path) -> dict:
+    """The parsed config, schema-checked. An unknown key is refused (a typo must not silently drop a
+    deny term); keys starting with `_` are comments."""
+    try:
+        cfg = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError) as e:
+        raise Refusal("CONFIG_INVALID", f"{path}: {type(e).__name__}: {e}") from None
+    if not isinstance(cfg, dict):
+        raise Refusal("CONFIG_INVALID", f"{path}: top level must be an object")
+    if cfg.get("schema") != CONFIG_SCHEMA:
+        raise Refusal("CONFIG_INVALID", f"{path}: schema must be {CONFIG_SCHEMA!r}")
+    unknown = sorted(k for k in cfg if k not in _CONFIG_KEYS and not k.startswith("_"))
+    if unknown:
+        raise Refusal("CONFIG_INVALID", f"{path}: unknown key(s) {', '.join(unknown)}")
+    return cfg
+
+
+def configure(cfg: dict, config_path: pathlib.Path | None = None) -> None:
+    """Install one project's values into the module. Atomic: every value is validated and built
+    first, and the module is rebound only when all of them are good."""
+    for key in ("project", "tool_rel", "default_ref"):
+        if not isinstance(cfg.get(key), str) or not cfg[key]:
+            raise Refusal("CONFIG_INVALID", f"{key} is required")
+    project = cfg["project"]
+    if not PROJECT_RE.match(project):
+        raise Refusal("CONFIG_INVALID", f"project must match {PROJECT_RE.pattern}")
+    dir_re = r"[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*"
+    def plain_dir(value: object) -> bool:
+        # `.` and `..` match the character class, so the regex alone lets `../x` climb out of the repo.
+        return isinstance(value, str) and bool(re.fullmatch(dir_re, value)) and not {".", ".."} & set(value.split("/"))
+
+    outbox_dir = cfg.get("outbox_dir", "doctrine-outbox")
+    if not plain_dir(outbox_dir):
+        raise Refusal("CONFIG_INVALID", "outbox_dir must be a relative posix path with no . or .. segment")
+    sent_dir = cfg.get("sent_dir", "")
+    if not isinstance(sent_dir, str) or (sent_dir and not plain_dir(sent_dir)):
+        raise Refusal("CONFIG_INVALID", "sent_dir must be a relative posix path under outbox_dir with no . or .. segment")
+    cards_target = cfg.get("cards_target", f"specs/{project}/cards.md")
+    if not isinstance(cards_target, str) or not cards_target.startswith("specs/") or ".." in cards_target:
+        raise Refusal("CONFIG_INVALID", "cards_target must live under specs/")
+    trailer_mode = cfg.get("trailer_mode", "reasoned")
+    if trailer_mode not in TRAILER_MODES:
+        raise Refusal("CONFIG_INVALID", f"trailer_mode must be one of {TRAILER_MODES}")
+    default_range = cfg.get("default_range", f"{cfg['default_ref']}..HEAD")
+    if not isinstance(default_range, str) or ".." not in default_range:
+        raise Refusal("CONFIG_INVALID", "default_range must be a git range A..B")
+    law4 = list(BASE_LAW4)
+    extra = cfg.get("law4_extra", [])
+    if not isinstance(extra, list):
+        raise Refusal("CONFIG_INVALID", "law4_extra must be a list of {name, pattern, ignorecase?}")
+    for row in extra:
+        if not isinstance(row, dict) or not isinstance(row.get("name"), str) or not isinstance(row.get("pattern"), str):
+            raise Refusal("CONFIG_INVALID", "each law4_extra row needs a string name and pattern")
+        stray = sorted(k for k in row if k not in _LAW4_ROW_KEYS and not k.startswith("_"))
+        if stray or not isinstance(row.get("ignorecase", False), bool):
+            # A typo such as `ignorecas` would silently turn a case-insensitive deny term case-sensitive.
+            raise Refusal("CONFIG_INVALID", f"law4_extra {row['name']!r}: "
+                          + (f"unknown key(s) {', '.join(stray)}" if stray else "ignorecase must be true or false"))
+        try:
+            law4.append((row["name"], re.compile(row["pattern"], re.I if row.get("ignorecase") else 0)))
+        except re.error as e:
+            raise Refusal("CONFIG_INVALID", f"law4_extra {row['name']!r}: {e}") from None
+    finding_regexes = []
+    for pattern in _str_list(cfg, "finding_path_regexes"):
+        try:
+            finding_regexes.append(re.compile(pattern))
+        except re.error as e:
+            raise Refusal("CONFIG_INVALID", f"finding_path_regexes {pattern!r}: {e}") from None
+    identity_name = cfg.get("identity_name", f"{project} doctrine outbox")
+    identity_email = cfg.get("identity_email", f"outbox@{project}.invalid")
+    env_stem = project.upper().replace("-", "_")
+    values = {
+        "PROJECT": project,
+        "OUTBOX_DIR": outbox_dir,
+        "SENT_DIR": sent_dir,
+        "SENT_PREFIX": f"{outbox_dir}/{sent_dir}/" if sent_dir else "",
+        "TOOL_REL": cfg["tool_rel"],
+        "DEFAULT_REF": cfg["default_ref"],
+        "DEFAULT_RANGE": default_range,
+        "CARDS_TARGET": cards_target,
+        "CONCERNS_TARGET": f"specs/{project}/cos-concerns.md",
+        "TARGETS": ("RECEIPTS.md", "TRAPS.md", "RULINGS.md", cards_target, f"specs/{project}/cos-concerns.md"),
+        "CARD_HEADING_RE": re.compile(r"^## " + re.escape(project) + r"/[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"),
+        "CARDS_TITLE": f"# {project} cards (R14.1; written only by {project})\n\n",
+        "CONCERNS_TITLE": (f"# {project} concerns to the CoS (written only by {project}; the CoS answers in "
+                           f"cos-feedback/{project}/concerns.md)\n\n"),
+        "CONCERN_ID_RE": re.compile(r"^" + re.escape(project) + r"-cc-[0-9]{8}-[0-9]{1,3}$"),
+        "CONCERN_HEADING_RE": re.compile(r"^### (" + re.escape(project) + r"-cc-[0-9]{8}-[0-9]{1,3})[ \t]*$", re.MULTILINE),
+        "KERNEL_DIR": f"{outbox_dir}/kernel-filing",
+        "KERNEL_FILING_SRC": f"adjudications-factory-kernel-{project}.md",
+        "KERNEL_SPEC_BLOCK_SRC": f"specs-{project}-block.md",
+        "KERNEL_FILING_DEST": f"adjudications/factory-kernel/{project}.md",
+        "KERNEL_SPEC_DEST": f"specs/{project}.md",
+        "KERNEL_BRANCH_RE": re.compile(r"review/" + re.escape(project) + r"-kernel-[0-9]{4}-[0-9]{2}-[0-9]{2}"),  # fullmatch only
+        "OUTBOX_IDENTITY_NAME": identity_name,
+        "OUTBOX_IDENTITY_EMAIL": identity_email,
+        "LEDGER_REL": _state_rel(cfg, "ledger_rel", "sent.jsonl"),
+        "DENY_FILE_REL": _state_rel(cfg, "deny_file_rel", "deny-names.txt"),
+        "SUBJECT_LEDGER_REL": _rel_value(cfg["subject_ledger_rel"], "subject_ledger_rel") if "subject_ledger_rel" in cfg else None,
+        "WATERMARK_REL": _state_rel(cfg, "watermark_rel", "ledger-watermark.json"),
+        "SUBJECT_LEDGER_ENV": cfg.get("subject_ledger_env", f"{env_stem}_OUTBOX_LEDGER"),
+        "WATERMARK_ENV": cfg.get("watermark_env", f"{env_stem}_OUTBOX_WATERMARK"),
+        "FINDING_PATH_PREFIXES": _str_list(cfg, "finding_path_prefixes"),
+        "FINDING_PATH_FILES": _str_list(cfg, "finding_path_files"),
+        "FINDING_PATH_REGEXES": tuple(finding_regexes),
+        "TRAILER_MODE": trailer_mode,
+        "PRE_PUSH_REFS": _str_list(cfg, "pre_push_refs", ("refs/heads/master",)),
+        "LAW4": tuple(law4),
+        "OUTBOX_REF_RE": re.compile(r"^(?:" + re.escape(outbox_dir) + r"/)?\d{8}-[a-z0-9][a-z0-9-]{2,60}\.md(?:@\S+)?$"),
+        "CONFIG_PATH": config_path.resolve() if config_path is not None else None,
+        "CONFIG_ROOT": config_path.resolve().parent if config_path is not None else None,
+        "CONFIG_ERROR": None,
+    }
+    values["KERNEL_SOURCES"] = {values["KERNEL_FILING_SRC"]: values["KERNEL_FILING_DEST"],
+                                values["KERNEL_SPEC_BLOCK_SRC"]: values["KERNEL_SPEC_DEST"]}
+    for name in (values["SUBJECT_LEDGER_ENV"], values["WATERMARK_ENV"]):
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Z][A-Z0-9_]*", name):
+            raise Refusal("CONFIG_INVALID", f"environment variable name {name!r} is not UPPER_SNAKE")
+    globals().update(values)
+
+
+def find_config(start: pathlib.Path) -> pathlib.Path | None:
+    """The config for a tool file at `start`: $DOCTRINE_OUTBOX_CONFIG, else the nearest
+    doctrine-outbox.config.json walking up from `start`, stopping at the first directory that is a
+    git root (so a tool never adopts a config from outside its own repository)."""
+    env = os.environ.get(CONFIG_ENV)
+    if env:
+        return pathlib.Path(env)
+    for directory in (start, *list(start.parents)[:5]):
+        candidate = directory / CONFIG_NAME
+        if candidate.is_file():
+            return candidate
+        if (directory / ".git").exists():
+            return None
+    return None
+
+
+def _autoconfigure() -> None:
+    """Import-time: the tool finds its own project's config. A broken config is not fatal at
+    import (the module stays unconfigured and main() reports it); nothing is guessed. The refusal is
+    kept in CONFIG_ERROR so require_configured() reports a config that is present but wrong as
+    CONFIG_INVALID, never as the CONFIG_ABSENT of a missing one."""
+    global CONFIG_ERROR
+    try:
+        found = find_config(pathlib.Path(__file__).resolve().parent)
+        if found is not None:
+            configure(load_config(found), found)
+    except Refusal as e:
+        CONFIG_ERROR = e
+
+
+def require_configured() -> None:
+    if not PROJECT:
+        if CONFIG_ERROR is not None:
+            raise Refusal(CONFIG_ERROR.code, CONFIG_ERROR.detail)
+        raise Unknown("CONFIG_ABSENT", f"no {CONFIG_NAME} found (pass --config, set ${CONFIG_ENV}, or keep it at the repo root)")
+
+
+_autoconfigure()
 
 
 # ---------- git plumbing ----------
@@ -243,6 +513,7 @@ def cat_file_blob(repo: pathlib.Path, ref: str, path: str) -> bytes:
 
 def parse_item(text: str) -> dict:
     """Front matter + body. Refuses on any schema hole; never guesses a default."""
+    require_configured()
     if not text.startswith("---\n"):
         raise Refusal("ITEM_NO_FRONT_MATTER")
     end = text.find("\n---\n", 4)
@@ -266,6 +537,8 @@ def parse_item(text: str) -> dict:
         raise Refusal("ITEM_BAD_KIND", meta["kind"])
     if meta["target"] == CARDS_TARGET and meta["kind"] != "trap":
         raise Refusal("ITEM_CARD_NOT_A_TRAP", f"{CARDS_TARGET} holds trap cards only (R14.1); a {meta['kind']} keeps its own target")
+    if (meta["target"] == CONCERNS_TARGET) != (meta["kind"] == "concern"):
+        raise Refusal("ITEM_CONCERN_TARGET_MISMATCH", f"kind: concern and target: {CONCERNS_TARGET} go together, and only together")
     if meta["source_commit"] != "PENDING" and not SHA_RE.match(meta["source_commit"]):
         raise Refusal("ITEM_BAD_SOURCE_COMMIT", meta["source_commit"])
     if "published_as" in meta and not SHA_RE.match(meta["published_as"]):
@@ -282,7 +555,59 @@ def parse_item(text: str) -> dict:
                                                   f"(R14.1; format in the bus's {CARD_VALIDATOR_REL})")
     elif not body.lstrip().startswith("### "):
         raise Refusal("ITEM_BODY_NOT_AN_ENTRY", "body must start with a '### ' heading (bus entry grammar)")
-    return {"meta": meta, "body": body}
+    item = {"meta": meta, "body": body}
+    if meta["target"] == CONCERNS_TARGET:
+        item["concern"] = screen_concern(body)
+    return item
+
+
+def screen_concern(body: str) -> dict[str, str]:
+    """A concern entry is a heading plus exactly the seven `- field: value` lines of CONCERN_FIELDS, each on one
+    line. The field set is closed, so no field is an approval, a ruling or a permission; free text is data: the
+    channel is a message to the CoS, never a grant (conjugal-fleet-advisory-channel security musts). Every entry
+    expires within CONCERN_DEFAULT_DAYS of opening, and its id is the heading, so the CoS's one-line answer names
+    it exactly. Returns the validated fields. Whether the id is unique and whether the entry has already expired are
+    questions about OTHER items and about the clock, so the drain answers them (r14_gate), not this parse."""
+    rows = [ln.rstrip() for ln in body.strip().splitlines() if ln.strip()]
+    heading_id = rows[0][4:].strip()
+    if not CONCERN_ID_RE.match(heading_id):
+        raise Refusal("CONCERN_BAD_ID", f"the heading must be '### {PROJECT}-cc-<yyyymmdd>-<n>'")
+    fields: dict[str, str] = {}
+    for ln in rows[1:]:
+        m = re.match(r"^- ([a-z_]+): (\S.*)$", ln)
+        if not m:
+            raise Refusal("CONCERN_BAD_LINE", "every line after the heading is '- <field>: <value>' on one line")
+        if m.group(1) not in CONCERN_FIELDS:
+            raise Refusal("CONCERN_UNKNOWN_FIELD", f"{m.group(1)}; the closed set is {', '.join(CONCERN_FIELDS)}")
+        if m.group(1) in fields:
+            raise Refusal("CONCERN_DUPLICATE_FIELD", m.group(1))
+        fields[m.group(1)] = m.group(2).strip()
+    missing = [f for f in CONCERN_FIELDS if f not in fields]
+    if missing:
+        raise Refusal("CONCERN_MISSING_FIELD", ", ".join(missing))
+    if fields["id"] != heading_id:
+        raise Refusal("CONCERN_ID_MISMATCH", "the id field must equal the heading")
+    if fields["to"] != "CoS":
+        raise Refusal("CONCERN_BAD_ADDRESSEE", "to: CoS is the only addressee")
+    if fields["kind"] not in CONCERN_KINDS:
+        raise Refusal("CONCERN_BAD_KIND", f"{fields['kind']} not in {CONCERN_KINDS}")
+    for f in ("opened_utc", "expires_utc"):
+        if not CONCERN_UTC_RE.match(fields[f]):
+            raise Refusal("CONCERN_BAD_TIME", f"{f} must be YYYY-MM-DDTHH:MM:SSZ")
+        try:
+            datetime.strptime(fields[f], CONCERN_UTC_FORMAT)
+        except ValueError:
+            raise Refusal("CONCERN_BAD_TIME", f"{f} is not a real calendar time") from None
+    opened = datetime.strptime(fields["opened_utc"], CONCERN_UTC_FORMAT)
+    expires = datetime.strptime(fields["expires_utc"], CONCERN_UTC_FORMAT)
+    if expires <= opened:
+        raise Refusal("CONCERN_NOT_EXPIRING", "expires_utc must be after opened_utc (every message expires)")
+    if expires - opened > timedelta(days=CONCERN_DEFAULT_DAYS):
+        raise Refusal("CONCERN_WINDOW_TOO_LONG", f"expires_utc is more than {CONCERN_DEFAULT_DAYS} days after opened_utc "
+                                                 f"(an open ask is a standing claim on the CoS; renew with a new id)")
+    if not heading_id.split("-cc-")[1].startswith(fields["opened_utc"][:10].replace("-", "")):
+        raise Refusal("CONCERN_ID_DATE", "the id date must be the opened_utc date")
+    return fields
 
 
 def _word_boundary_pattern(value: str) -> re.Pattern[str]:
@@ -352,7 +677,8 @@ def idempotency_key(source_commit: str, target: str, body: str) -> str:
     return hashlib.sha256(f"{source_commit}\n{target}\n{body}".encode("utf-8")).hexdigest()[:16]
 
 
-def render_block(item: dict, source_commit: str, project: str = PROJECT) -> tuple[str, str]:
+def render_block(item: dict, source_commit: str, project: str | None = None) -> tuple[str, str]:
+    project = project or PROJECT
     key = idempotency_key(source_commit, item["meta"]["target"], item["body"])
     body = item["body"].rstrip("\n")
     if item["meta"]["target"] == CARDS_TARGET:
@@ -391,6 +717,7 @@ def require_tool_at_ref(repo: pathlib.Path, ref: str) -> None:
     """Raise Unknown unless `ref` resolves AND carries this tool and the items directory.
     Called before any debt/drain answer, so a checkout that predates the tool can never
     read as 'no debt'."""
+    require_configured()
     rc, _out, _err = git_try(repo, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}")
     if rc != 0:
         raise Unknown("REF_UNRESOLVED", ref)
@@ -410,10 +737,13 @@ def added_in(repo: pathlib.Path, ref: str, path: str) -> str | None:
 
 def load_outbox_items(repo: pathlib.Path, ref: str) -> list[dict]:
     """Items committed on `ref` under OUTBOX_DIR. Worktree-only files are invisible on
-    purpose: drain and debt both publish/report committed bytes."""
+    purpose: drain and debt both publish/report committed bytes. Items already moved under the
+    project's `sent_dir` (when it sets one) are sent by construction and are not loaded."""
     items: list[dict] = []
     for p in git_paths(repo, "ls-tree", "-r", "--name-only", ref, "--", OUTBOX_DIR):
         if not p or "/" not in p or not p.startswith(OUTBOX_DIR + "/") or p.startswith(KERNEL_DIR + "/"):
+            continue
+        if SENT_PREFIX and p.startswith(SENT_PREFIX):
             continue
         name = p.rsplit("/", 1)[-1]
         if name == "README.md" and p == f"{OUTBOX_DIR}/README.md":
@@ -455,6 +785,11 @@ def merged_into_ref_time(repo: pathlib.Path, ref: str, added_commit: str, first_
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _utc_now_z() -> str:
+    """The clock the drain judges a concern's expiry by, in the entry's own YYYY-MM-DDTHH:MM:SSZ form."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def resolve_ledger(repo: pathlib.Path, ledger: pathlib.Path | None) -> pathlib.Path:
@@ -632,9 +967,11 @@ def card_validator_on_bus(bus_repo: pathlib.Path, tip: str) -> bool:
     return rc == 0
 
 
-def r14_gate(bus_repo: pathlib.Path, tip: str, candidates: list[dict], report: dict) -> list[dict]:
+def r14_gate(bus_repo: pathlib.Path, tip: str, candidates: list[dict], report: dict,
+             concern_dup_ids: frozenset[str] | set[str] = frozenset()) -> list[dict]:
     """The candidates that may be appended at `tip`; the rest go to report["refused"]. A key
-    already on the tip is kept, so the drain reports it as sent rather than refusing history."""
+    already on the tip is kept, so the drain reports it as sent rather than refusing history.
+    `concern_dup_ids` are the concern ids that head more than one committed outbox item."""
     validator = card_validator_on_bus(bus_repo, tip)
     has_cards = any(c["target"] == CARDS_TARGET for c in candidates)
     node, node_refusal = None, None
@@ -643,7 +980,13 @@ def r14_gate(bus_repo: pathlib.Path, tip: str, candidates: list[dict], report: d
             node = find_node(bus_repo)
         except Refusal as e:
             node_refusal = (e.code, e.detail)
+    cards_link_problem = tip_parent_link_problem(bus_repo, tip, CARDS_TARGET) if has_cards and validator else None
     entry_problem = cards_tip_entry_problem(bus_repo, tip) if has_cards and validator else None
+    has_concerns = any(c["target"] == CONCERNS_TARGET for c in candidates)
+    concerns_link_problem = tip_parent_link_problem(bus_repo, tip, CONCERNS_TARGET) if has_concerns else None
+    concerns_entry_problem = cards_tip_entry_problem(bus_repo, tip, CONCERNS_TARGET) if has_concerns else None
+    concerns_on_tip = (concern_entries_on_bus(bus_repo, tip)
+                       if has_concerns and not (concerns_entry_problem or concerns_link_problem) else {})
     kept = []
     for c in candidates:
         refusal = None
@@ -662,13 +1005,126 @@ def r14_gate(bus_repo: pathlib.Path, tip: str, candidates: list[dict], report: d
         elif c["target"] == CARDS_TARGET and node is None:
             refusal = ("CARD_VALIDATOR_NODE_ABSENT",
                        f"node is not on PATH, so {CARD_VALIDATOR_REL} cannot run; a card is never published unvalidated")
+        elif c["target"] == CARDS_TARGET and cards_link_problem:
+            refusal = ("CARDS_PATH_IS_LINK", f"{cards_link_problem}; a card is never written through a link on its path")
         elif c["target"] == CARDS_TARGET and entry_problem:
             refusal = ("CARDS_PATH_NOT_REGULAR_FILE", f"{entry_problem}; a card is never written through a link or a non-regular entry")
+        elif c["target"] == CONCERNS_TARGET and not concern_reader_duty_on_bus(bus_repo, tip):
+            refusal = ("CONCERN_CHANNEL_NOT_RATIFIED",
+                       f"{CONCERNS_READER_FILE} at {tip[:12]} has no reader-duty line of the form '{CONCERNS_DUTY_LINE_EXAMPLE}'; "
+                       f"a concern is held until the CoS has taken the reader duty, so it is never written to a file nobody reads")
+        elif c["target"] == CONCERNS_TARGET and concerns_link_problem:
+            refusal = ("CONCERNS_PATH_IS_LINK",
+                       f"{concerns_link_problem}; a concern is never written through a link on its path")
+        elif c["target"] == CONCERNS_TARGET and concerns_entry_problem:
+            refusal = ("CONCERNS_PATH_NOT_REGULAR_FILE",
+                       f"{concerns_entry_problem}; a concern is never written through a link or a non-regular entry")
+        elif c["target"] == CONCERNS_TARGET and c["concern"]["expires_utc"] <= _utc_now_z():
+            refusal = ("CONCERN_EXPIRED",
+                       f"{c['concern']['id']} expired at {c['concern']['expires_utc']}; an expired ask is not published "
+                       f"(open a new id if the concern still stands)")
+        elif c["target"] == CONCERNS_TARGET and c["concern"]["id"] in concern_dup_ids:
+            refusal = ("CONCERN_DUPLICATE_ID",
+                       f"{c['concern']['id']} heads more than one committed outbox item; the CoS answers an id once, "
+                       f"so an id names exactly one concern (give each its own -<n>)")
+        elif c["target"] == CONCERNS_TARGET and c["concern"]["id"] in concerns_on_tip:
+            refusal = ("CONCERN_DUPLICATE_ID",
+                       concern_tip_duplicate_detail(c["concern"], concerns_on_tip[c["concern"]["id"]], tip))
         if refusal is None:
             kept.append(c)
         else:
             report["refused"].append({"path": c["path"], "code": refusal[0], "detail": refusal[1]})
     return kept
+
+
+def concern_reader_duty_on_bus(bus_repo: pathlib.Path, tip: str) -> bool:
+    """The channel is live only once the fetched tip's cos-feedback README carries the CoS-CONCERN reader-duty
+    LINE, the ratification this tool's R2 route waits for. The tip decides, never a date."""
+    text = bus_file_at(bus_repo, tip, CONCERNS_READER_FILE)
+    return text is not None and has_concerns_duty_line(text)
+
+
+def has_concerns_duty_line(text: str) -> bool:
+    """True when a line EQUAL to CONCERNS_DUTY_LINE_EXAMPLE (an optional `-` or `*` bullet followed by 1 to 4 spaces or
+    a tab, indented 0 to 3 spaces, and trailing whitespace allowed, nothing else) stands outside every ``` fence, ~~~
+    fence and <!-- --> comment. A line that merely starts like the duty, adds a clause, forbids it or negates it is not
+    the duty, and neither is one at 4 or more spaces or a tab (an indented code block), or one with 5 or more spaces
+    after the bullet (the same, inside the list item). Lines end only at \\n, \\r\\n or \\r, as in Markdown: a \\v, \\f,
+    \\x1c-\\x1e, \\x85, U+2028 or U+2029 does not start a new line. A fence marker inside a comment, and a comment marker
+    inside a fence, are plain text (CommonMark: a fence closes on a marker of the same character at least as long as
+    the opener). The scan does not parse inline code: a `<!--` inside a code span before the line opens a comment
+    that never closes, so the gate stays shut. That fails closed, which is the safe side."""
+    fence = ""        # the opening marker while inside a fence
+    in_comment = False
+    for line in re.split(r"\r\n|\r|\n", text):
+        if fence:
+            close = re.match(r"^ {0,3}(" + re.escape(fence[0]) + r"{" + str(len(fence)) + r",})\s*$", line)
+            if close:
+                fence = ""
+            continue
+        if not in_comment:
+            opener = _FENCE_OPEN_RE.match(line)
+            if opener:
+                fence = opener.group(1)
+                continue
+            if CONCERNS_DUTY_LINE_RE.match(line):
+                return True
+        pos = 0
+        while True:
+            marker = "-->" if in_comment else "<!--"
+            hit = line.find(marker, pos)
+            if hit < 0:
+                break
+            in_comment = not in_comment
+            pos = hit + len(marker)
+    return False
+
+
+def concern_entries_on_bus(bus_repo: pathlib.Path, tip: str) -> dict[str, dict[str, str]]:
+    """Every concern already headed in the tip's project-owned concerns file, as id -> its `- field: value` lines.
+    An entry runs from its heading to the next heading or outbox marker."""
+    text = bus_file_at(bus_repo, tip, CONCERNS_TARGET) or ""
+    entries: dict[str, dict[str, str]] = {}
+    current: dict[str, str] | None = None
+    for line in text.splitlines():
+        heading = CONCERN_HEADING_RE.match(line)
+        if heading:
+            current = entries.setdefault(heading.group(1), {})
+        elif line.startswith(("### ", "<!-- outbox:")):
+            current = None
+        elif current is not None:
+            m = re.match(r"^- ([a-z_]+): (\S.*)$", line.rstrip())
+            if m:
+                current.setdefault(m.group(1), m.group(2).strip())
+    return entries
+
+
+def concern_tip_duplicate_detail(concern: dict[str, str], published: dict[str, str], tip: str) -> str:
+    """Why an id already at the tip refuses a new item: the fields that differ from the published entry, named, or
+    the plain fact that none does (the same entry filed again under another outbox key)."""
+    differs = [f for f in CONCERN_FIELDS if concern.get(f) != published.get(f)]
+    what = (f"field(s) {', '.join(differs)} differ from that entry" if differs
+            else "no field differs from that entry (the same concern filed again under another outbox key)")
+    return (f"{concern['id']} is already in {CONCERNS_TARGET} at {tip[:12]}; {what}. "
+            f"An id names exactly one concern (give this one its own -<n>)")
+
+
+def concern_duplicate_ids(items: list[dict]) -> set[str]:
+    """Ids that head more than one committed concern item. The drain cannot tell which of two is the
+    real concern, so it holds all of them."""
+    seen: dict[str, int] = {}
+    for it in items:
+        if "item" in it and "concern" in it["item"]:
+            cid = it["item"]["concern"]["id"]
+            seen[cid] = seen.get(cid, 0) + 1
+    return {cid for cid, n in seen.items() if n > 1}
+
+
+def ensure_concerns_file(path: pathlib.Path) -> None:
+    """The project creates its own concerns file on its first concern (one writer, bus Law 2)."""
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(CONCERNS_TITLE.encode("utf-8"))
 
 
 def ensure_cards_file(path: pathlib.Path) -> None:
@@ -709,20 +1165,51 @@ def validate_cards_file(wt: pathlib.Path, cards_file: pathlib.Path | None = None
         raise Refusal("CARD_VALIDATOR_FAILED", f"exit 0 without a '0 problem(s)' summary line: {out[:400] or 'no output'}")
 
 
-def cards_tip_entry_problem(bus_repo: pathlib.Path, tip: str) -> str | None:
-    """Why the tip's cards-path entry may not be written through, or None. Only a missing entry
-    (the project's first card) or a regular 100644 blob qualifies: a 120000 link, a 160000 gitlink
-    or a 100755 file is refused, since the drain writes through the checkout of that path."""
-    proc = _run_git(bus_repo, ["ls-tree", "-z", tip, "--", CARDS_TARGET])
+def cards_tip_entry_problem(bus_repo: pathlib.Path, tip: str, target: str | None = None) -> str | None:
+    """Why the tip's entry for a project-owned file (the cards file, or the concerns file when `target` names it)
+    may not be written through, or None. Only a missing entry (the project's first card or concern) or a regular
+    100644 blob qualifies: a 120000 link, a 160000 gitlink or a 100755 file is refused, since the drain writes
+    through the checkout of that path."""
+    target = target or CARDS_TARGET
+    proc = _run_git(bus_repo, ["ls-tree", "-z", tip, "--", target])
     if proc.returncode != 0:
-        raise Refusal("TIP_BLOB_READ_FAILED", f"{tip[:12]}:{CARDS_TARGET}: ls-tree: {proc.stderr.strip()[:300]}")
+        raise Refusal("TIP_BLOB_READ_FAILED", f"{tip[:12]}:{target}: ls-tree: {proc.stderr.strip()[:300]}")
     for entry in proc.stdout.split("\0"):
         meta, _tab, path = entry.partition("\t")
-        if not entry or path != CARDS_TARGET:
+        if not entry or path != target:
             continue
         fields = meta.split()
         if fields[:2] != [REGULAR_FILE_MODE, "blob"]:
-            return f"{CARDS_TARGET} at {tip[:12]} is mode {fields[0] if fields else '?'}, not a regular {REGULAR_FILE_MODE} blob"
+            return f"{target} at {tip[:12]} is mode {fields[0] if fields else '?'}, not a regular {REGULAR_FILE_MODE} blob"
+    return None
+
+
+def tip_parent_link_problem(bus_repo: pathlib.Path, tip: str, target: str) -> str | None:
+    """Why a directory on the way to `target` at the tip is not a plain directory, or None. Each parent component is
+    looked up on its own (`specs`, then `specs/<project>`): a leaf lookup through a link returns nothing, so
+    cards_tip_entry_problem alone cannot see a link above the file. Only a tree (040000) or a missing component
+    qualifies; a 120000 link or a 160000 gitlink is named as a mode that is not a directory, and any other entry (a
+    regular file, say) is named "not a directory: mode <mode>". The walk stops at the first missing component."""
+    parts = pathlib.PurePosixPath(target).parts
+    for depth in range(1, len(parts)):
+        prefix = "/".join(parts[:depth])
+        proc = _run_git(bus_repo, ["ls-tree", "-z", tip, "--", prefix])
+        if proc.returncode != 0:
+            raise Refusal("TIP_BLOB_READ_FAILED", f"{tip[:12]}:{prefix}: ls-tree: {proc.stderr.strip()[:300]}")
+        found = False
+        for entry in proc.stdout.split("\0"):
+            meta, _tab, path = entry.partition("\t")
+            if not entry or path != prefix:
+                continue
+            found = True
+            fields = meta.split()
+            if fields[:2] != ["040000", "tree"]:
+                mode = fields[0] if fields else "?"
+                if mode in ("120000", "160000"):
+                    return f"{prefix} at {tip[:12]} is mode {mode}, not a directory"
+                return f"{prefix} at {tip[:12]} is not a directory: mode {mode}"
+        if not found:
+            return None
     return None
 
 
@@ -815,6 +1302,7 @@ def drain(repo: pathlib.Path, bus_repo: pathlib.Path, ref: str, ledger: pathlib.
           deny_terms: list[tuple[str, str]], push: bool, max_attempts: int = 3) -> dict:
     require_tool_at_ref(repo, ref)
     items = load_outbox_items(repo, ref)
+    concern_dup_ids = concern_duplicate_ids(items)
     ledger_keys = read_ledger_keys(ledger)
     report: dict = {"push": push, "published": [], "already_sent": [], "refused": [], "commit": None, "pushed": False}
 
@@ -852,8 +1340,11 @@ def drain(repo: pathlib.Path, bus_repo: pathlib.Path, ref: str, ledger: pathlib.
         if key in ledger_keys:
             report["already_sent"].append({"path": it["path"], "key": key, "via": "ledger"})
             continue
-        candidates.append({"path": it["path"], "name": it["name"], "src": src, "target": target,
-                            "key": key, "block": block, "message": message})
+        candidate = {"path": it["path"], "name": it["name"], "src": src, "target": target,
+                     "key": key, "block": block, "message": message}
+        if "concern" in item:
+            candidate["concern"] = item["concern"]
+        candidates.append(candidate)
 
     if not candidates and not claimed:
         return report
@@ -877,7 +1368,7 @@ def drain(repo: pathlib.Path, bus_repo: pathlib.Path, ref: str, ledger: pathlib.
     while True:
         attempt += 1
         # Re-gated on every attempt: a refetched tip may be the one that lands the validator.
-        candidates = r14_gate(bus_repo, tip, candidates, report)
+        candidates = r14_gate(bus_repo, tip, candidates, report, concern_dup_ids)
         if card_pass_len is not None:
             if len(candidates) >= card_pass_len:
                 raise Refusal("CARD_PASS_NOT_SHRINKING", f"{len(candidates)} candidates after a per-card refusal pass over {card_pass_len}")
@@ -919,6 +1410,9 @@ def drain(repo: pathlib.Path, bus_repo: pathlib.Path, ref: str, ledger: pathlib.
                 if c["target"] == CARDS_TARGET:
                     assert_no_link_in_path(wt, CARDS_TARGET)
                     ensure_cards_file(wt / c["target"])
+                elif c["target"] == CONCERNS_TARGET:
+                    assert_no_link_in_path(wt, CONCERNS_TARGET)
+                    ensure_concerns_file(wt / c["target"])
                 append_block_to_file(wt / c["target"], c["block"])
                 commits[c["key"]] = git_commit(wt, c["message"])
                 attempted[c["key"]] = commits[c["key"]]
@@ -1257,6 +1751,18 @@ def compute_debt(repo: pathlib.Path, ref: str, ledger: pathlib.Path, bus_repo: p
     }
 
 
+def _debt_text(result: dict, ref: str) -> str:
+    if not result["count"]:
+        return f"[doctrine-outbox] no unsent doctrine items on {ref}"
+    stale = " STALE (> 24 h)" if result["stale_over_24h"] else ""
+    lines = [f"[doctrine-outbox] {result['count']} unsent doctrine item(s) on {ref}; "
+             f"oldest {result['oldest_age_hours']} h since merge{stale}:"]
+    for u in result["items"]:
+        age = "age unknown" if u["age_hours"] is None else f"{u['age_hours']} h"
+        lines.append(f"  {u['path']}  ({u['detail']}; {age})")
+    return "\n".join(lines)
+
+
 def cmd_debt(repo: pathlib.Path, ref: str, ledger: pathlib.Path, bus_repo: pathlib.Path | None = None,
              as_json: bool = False, now: float | None = None) -> int:
     try:
@@ -1272,16 +1778,27 @@ def cmd_debt(repo: pathlib.Path, ref: str, ledger: pathlib.Path, bus_repo: pathl
     if as_json:
         print(json.dumps(result, sort_keys=True))
         return 1 if result["count"] else 0
-    if not result["count"]:
-        print(f"[doctrine-outbox] no unsent doctrine items on {ref}")
-        return 0
-    stale = " STALE (> 24 h)" if result["stale_over_24h"] else ""
-    print(f"[doctrine-outbox] {result['count']} unsent doctrine item(s) on {ref}; "
-          f"oldest {result['oldest_age_hours']} h since merge{stale}:")
-    for u in result["items"]:
-        age = "age unknown" if u["age_hours"] is None else f"{u['age_hours']} h"
-        print(f"  {u['path']}  ({u['detail']}; {age})")
-    return 1
+    print(_debt_text(result, ref))
+    return 1 if result["count"] else 0
+
+
+def cmd_check(repo: pathlib.Path, ref: str, ledger: pathlib.Path, bus_repo: pathlib.Path | None = None,
+              max_age_min: int = HOOK_CHECK_WINDOW_MIN) -> int:
+    """Unsent items older than the window. The drain ticks every 15 min, so an item unsent for 60
+    has missed several: that names a stuck seam, not a queue. `debt` stays "any unsent = 1"; a gate
+    needs this age form so a just-committed item is not a red bar."""
+    try:
+        result = compute_debt(repo, ref, ledger, bus_repo)
+    except Unknown as e:
+        print(f"[doctrine-outbox] check: UNKNOWN ({e})")
+        return 2
+    print(_debt_text(result, ref))
+    stale = [u for u in result["items"] if u["age_hours"] is not None and u["age_hours"] * 60 > max_age_min]
+    if stale:
+        print(f"[doctrine-outbox] REFUSED: {len(stale)} item(s) unsent for > {max_age_min} min -- "
+              f"the drain is not running or is refusing; read its receipts")
+        return 1
+    return 0
 
 
 # ---------- check-ledger: the capture check ----------
@@ -1291,7 +1808,6 @@ LEDGER_SECTION_RE = re.compile(r"^##\s+KERNEL FINDINGS\b")
 LEDGER_HEADING_RE = re.compile(r"^#{1,2}\s")
 SECTION_ITEM_RE = re.compile(r"^\s*(?:[-*]\s+)?(?:\*\*)?(KF-\d+)\b")
 DISPOSITION_RE = re.compile(r"^\s*(?:[-*]\s+)?(?:\*\*)?Doctrine-Export:\s*(?:\*\*)?\s*(outbox|none)\b\s*(.*?)\s*$")
-OUTBOX_REF_RE = re.compile(r"^(?:" + re.escape(OUTBOX_DIR) + r"/)?\d{8}-[a-z0-9][a-z0-9-]{2,60}\.md(?:@\S+)?$")
 NONE_REASON_MIN_WORDS = 4
 # Advisory only: these say "look here", never "fail". The structured tag is the gate.
 ADVISORY_RES = (
@@ -1359,6 +1875,9 @@ def resolve_subject_ledger(repo: pathlib.Path, ledger: pathlib.Path | None) -> p
     env = os.environ.get(SUBJECT_LEDGER_ENV)
     if env:
         return pathlib.Path(env).resolve()
+    if SUBJECT_LEDGER_REL is None:
+        raise Unknown("SUBJECT_LEDGER_UNCONFIGURED",
+                      f"pass --ledger, set ${SUBJECT_LEDGER_ENV}, or set subject_ledger_rel in {CONFIG_NAME}")
     return repo / SUBJECT_LEDGER_REL
 
 
@@ -1398,6 +1917,7 @@ def check_ledger(ledger: pathlib.Path, watermark: pathlib.Path, advance: bool = 
     least one is not, 2 = the ledger cannot be read (UNKNOWN). Advisory hits never affect
     the code. `advance` moves the watermark to the first undisposed finding (or the end of
     the last complete line if none); `baseline` is the one explicit waiver of history."""
+    require_configured()
     lines: list[str] = []
     try:
         data = ledger.read_bytes()
@@ -1437,16 +1957,56 @@ ANY_TRAILER_RE = re.compile(r"^Doctrine-Export:", re.M)
 
 
 def is_finding_path(path: str) -> bool:
-    return path in FINDING_PATH_FILES or path.startswith(FINDING_PATH_PREFIXES)
+    return (path in FINDING_PATH_FILES or path.startswith(FINDING_PATH_PREFIXES)
+            or any(rx.match(path) for rx in FINDING_PATH_REGEXES))
 
 
 def range_added_items(repo: pathlib.Path, rev_range: str) -> set[str]:
     return set(git_paths(repo, "log", "--no-merges", "--diff-filter=A", "--name-only", "--format=", rev_range, "--", OUTBOX_DIR))
 
 
+def check_commit_bare(repo: pathlib.Path, sha: str, deny_terms: list[tuple[str, str]]) -> list[str]:
+    """`trailer_mode: bare` -- the fleet bus reference's grammar. The trailer is exactly `none` or
+    `outbox`; `outbox` means THIS commit adds an item under the outbox directory (not the README,
+    not the sent directory, not a kernel filing). The item is parsed and screened from the commit's
+    own bytes. Items are judged from ADDED/MODIFIED paths only: a steward's move into the sent
+    directory DELETES the root item, and validating a deleted path would refuse its landing commit."""
+    paths = git_paths(repo, "diff-tree", "--no-commit-id", "--name-only", "-r", "--root", sha)
+    present = set(git_paths(repo, "diff-tree", "--no-commit-id", "--name-only", "-r", "--root", "--diff-filter=AM", sha))
+    added = [p for p in paths if p in present and p.startswith(OUTBOX_DIR + "/")
+             and not (SENT_PREFIX and p.startswith(SENT_PREFIX)) and not p.startswith(KERNEL_DIR + "/")
+             and p != OUTBOX_DIR + "/README.md"]
+    hits = [p for p in paths if is_finding_path(p)]
+    lines = git(repo, "show", "-s", f"--format=%(trailers:key={TRAILER_KEY},valueonly)", sha).splitlines()
+    trailer = lines[0].strip().lower() if lines and lines[0].strip() else None
+    problems: list[str] = []
+    if hits and trailer is None:
+        problems.append(f"{sha[:10]} touches {hits[0]} and carries no '{TRAILER_KEY}:' trailer "
+                        f"(write '{TRAILER_KEY}: none' or '{TRAILER_KEY}: outbox' + an item)")
+    if trailer is not None and trailer not in BARE_TRAILER_VALUES:
+        problems.append(f"{sha[:10]} '{TRAILER_KEY}: {trailer}' is not one of {BARE_TRAILER_VALUES}")
+    if trailer == "outbox" and not added:
+        problems.append(f"{sha[:10]} declares '{TRAILER_KEY}: outbox' but adds no {OUTBOX_DIR}/ item (declared-but-not-filed)")
+    for p in added:
+        name = p.rsplit("/", 1)[-1]
+        if not ITEM_NAME_RE.match(name):
+            problems.append(f"{sha[:10]} {p}: name must be <yyyymmdd>-<slug>.md")
+            continue
+        try:
+            text = git(repo, "show", f"{sha}:{p}")
+            item = parse_item(text + "\n")
+            screen_law4(item["body"], deny_terms)
+            screen_rendered_card(item)
+        except Refusal as e:
+            problems.append(f"{sha[:10]} {p}: {e}")
+    return problems
+
+
 def check_commit(repo: pathlib.Path, sha: str, added_items: set[str],
                  deny_terms: list[tuple[str, str]]) -> list[str]:
     """Problems with one commit's `Doctrine-Export:` trailers; empty means it passes."""
+    if TRAILER_MODE == "bare":
+        return check_commit_bare(repo, sha, deny_terms)
     files = git_paths(repo, "diff-tree", "--no-commit-id", "--name-only", "-r", "--root", sha)
     touches = [f for f in files if is_finding_path(f)]
     message = git(repo, "show", "-s", "--format=%B", sha)
@@ -1488,6 +2048,7 @@ def check_commit(repo: pathlib.Path, sha: str, added_items: set[str],
 def check_commits(repo: pathlib.Path, rev_range: str, deny_terms: list[tuple[str, str]]) -> dict[str, list[str]]:
     """{sha: problems} for every non-merge commit in `rev_range` that fails. Raises Unknown
     when the range cannot be resolved -- an unresolvable range is not a passing one."""
+    require_configured()
     for end in [e for e in re.split(r"\.{2,3}", rev_range) if e]:
         rc, _out, _err = git_try(repo, "rev-parse", "--verify", "--quiet", f"{end}^{{commit}}")
         if rc != 0:
@@ -1502,10 +2063,279 @@ def check_commits(repo: pathlib.Path, rev_range: str, deny_terms: list[tuple[str
     return failures
 
 
+# ---------- hook commands: pre-push, stop, session-start, install-hooks ----------
+
+def install_pre_push(repo: pathlib.Path) -> str:
+    """Idempotently splice the outbox guard into the repo's pre-push hook. Machine-local, so a
+    SessionStart hook can do this on every machine and every rotation without being asked."""
+    # Resolve through git: in a linked worktree `.git` is a FILE and hooks live in the common dir.
+    hook = pathlib.Path(git(repo, "rev-parse", "--path-format=absolute", "--git-path", "hooks/pre-push"))
+    hook.parent.mkdir(parents=True, exist_ok=True)
+    # git hands a pre-push hook its ref lines on stdin, once. The guard's python reads that stream to
+    # the end, so the snippet spools it to a file, feeds the guard from the file, and then rebinds the
+    # hook's own stdin to the file: every layer after the guard (git lfs pre-push, a project's own
+    # checks) reads the same bytes git sent. The file is unlinked while the hook holds it open.
+    # A machine with no python refuses the push: a guard that cannot run must not read as a pass.
+    snippet = (f"{GUARD_MARKER}: findings reach the bus by file; a finding-path commit must declare.\n"
+               f"REPO_ROOT=${{REPO_ROOT:-$(git rev-parse --show-toplevel)}}\n"
+               f"OUTBOX_PY=\n"
+               f"for cand in python3 python; do\n"
+               f"  if command -v \"$cand\" >/dev/null 2>&1 && \"$cand\" --version >/dev/null 2>&1; then OUTBOX_PY=$cand; break; fi\n"
+               f"done\n"
+               f"OUTBOX_STDIN=$(mktemp 2>/dev/null) || OUTBOX_STDIN=\"${{TMPDIR:-/tmp}}/outbox-pre-push.$$\"\n"
+               f"cat > \"$OUTBOX_STDIN\"\n"
+               f"if [ -n \"$OUTBOX_PY\" ]; then\n"
+               f"  \"$OUTBOX_PY\" \"$REPO_ROOT/{TOOL_REL}\" pre-push \"$REPO_ROOT\" \"$@\" < \"$OUTBOX_STDIN\" || {{ OUTBOX_RC=$?; rm -f \"$OUTBOX_STDIN\"; exit $OUTBOX_RC; }}\n"
+               f"else\n"
+               f"  echo \"doctrine-outbox: no python on PATH; push refused because the guard cannot run\" >&2\n"
+               f"  rm -f \"$OUTBOX_STDIN\"; exit 1\n"
+               f"fi\n"
+               f"exec < \"$OUTBOX_STDIN\"\n"
+               f"rm -f \"$OUTBOX_STDIN\" 2>/dev/null || true\n"
+               f"{GUARD_END}\n")
+    current = hook.read_text(encoding="utf-8") if hook.exists() else "#!/bin/sh\nset -e\nREPO_ROOT=$(git rev-parse --show-toplevel)\n"
+    lines = current.splitlines(True)
+    start = next((i for i, line in enumerate(lines) if line.startswith(GUARD_MARKER)), None)
+    if start is not None:
+        # Invariant: a guard is live only when no top-level `exit`/`exec` stands ahead of it. A guard behind
+        # one is dead code: git runs the hook, the hook ends first, and the push goes through unjudged, so
+        # "present" or "repaired" may be reported only for a block that ends up reachable. The refusal is
+        # checked only at the new index, after the move below, never at the old position: a recognised block
+        # is taken out and re-inserted at the splice point, so where it used to sit does not matter. A hook
+        # that ends in `exit 0` and was given its guard by appending at the end holds exactly such a dead
+        # older block, and that is the population this repair exists for.
+        end = _guard_block_end(lines, start)
+        # OUTBOX-REPAIR-MOVES-GUARD-1: a guard is only live when nothing but the shebang, `set` lines and
+        # comments stand ahead of it. Behind a layer that reads git's ref lines from stdin it gets an empty
+        # stream and passes every push, so "present" or an in-place "repaired" there would be a dead guard.
+        at_splice = _only_preamble_before(lines, start)
+        if at_splice and "".join(lines[start:end + 1]) == snippet:
+            _make_executable(hook)   # an install made before the bit was set is repaired, not skipped
+            return "present"
+        # An older guard (r1-r4: no end marker, no stdin spool, or a push that passes without python)
+        # is replaced. Leaving it would be worse than before the executable bit: git used to
+        # skip the hook, and now runs one that swallows the ref lines a following layer needs.
+        if at_splice:
+            lines[start:end + 1] = [snippet]
+        else:
+            # Not at the splice point: take the block out and put the current one where a fresh install
+            # puts it. The check below is a defensive invariant: `_preamble_end` stops at the first line that
+            # is not the shebang, a `set` line, a comment or blank, and none of those is a terminator, so it
+            # cannot fire today; it keeps "the new position is reachable" true if `_preamble_end` changes.
+            del lines[start:end + 1]
+            idx = _preamble_end(lines)
+            _refuse_if_terminated_before(lines, idx)
+            if idx and not lines[idx - 1].endswith("\n"):
+                lines[idx - 1] += "\n"
+            lines.insert(idx, "\n" + snippet)
+        hook.write_text("".join(lines), encoding="utf-8", newline="\n")
+        _make_executable(hook)
+        return "repaired"
+    # OUTBOX-HOOK-SPLICE-AFTER-EXIT-1: right after the shebang and any `set -e` preamble, ahead of every
+    # layer the hook runs. Appended at the end, a hook that ends in `exit 0` or `exec <next hook>` never
+    # reached the guard. The snippet restores stdin for the layers after it (see above), and it sits ahead
+    # of an LFS layer that may exit 2 for an unrelated reason. (r1-r5 spliced before the LFS line, else at the end.)
+    # The refusal below is the same defensive invariant as in the repair path: it cannot fire while
+    # `_preamble_end` only skips the shebang, `set` lines, comments and blanks.
+    idx = _preamble_end(lines)
+    _refuse_if_terminated_before(lines, idx)
+    if idx and not lines[idx - 1].endswith("\n"):
+        lines[idx - 1] += "\n"
+    lines.insert(idx, "\n" + snippet)
+    hook.write_text("".join(lines), encoding="utf-8", newline="\n")
+    _make_executable(hook)
+    return "installed"
+
+
+SET_PREAMBLE_RE = re.compile(r"^set(\s+[-+]\w+)+\s*(#.*)?$")
+# A top-level line that ends the hook: `exit`, or `exec <command>`. `exec < file` / `exec 3>&1` only
+# redirect, and an indented `exit` sits inside an `if`, so neither ends the script.
+TERMINATOR_RE = re.compile(r"^(?:exit\b|exec\s+(?![0-9]*[<>&]))")
+
+
+def _preamble_end(lines: list[str]) -> int:
+    """Index just past the shebang and any leading `set -e`-style lines (blank and comment lines between
+    them are skipped); 0 when the hook has neither."""
+    first = 1 if lines and lines[0].startswith("#!") else 0
+    end = first
+    for i in range(first, len(lines)):
+        text = lines[i].strip()
+        if SET_PREAMBLE_RE.match(text):
+            end = i + 1
+        elif text and not text.startswith("#"):
+            break
+    return end
+
+
+def _only_preamble_before(lines: list[str], idx: int) -> bool:
+    """True when every line ahead of `idx` is the shebang, a `set` line, a comment or blank: the guard at
+    `idx` then runs before any layer of the hook, with git's stdin untouched."""
+    for i, line in enumerate(lines[:idx]):
+        text = line.strip()
+        if not text or text.startswith("#") or SET_PREAMBLE_RE.match(text):
+            continue
+        return False
+    return True
+
+
+def _refuse_if_terminated_before(lines: list[str], idx: int) -> None:
+    """Refuse when a top-level `exit`/`exec` stands ahead of line `idx`: a guard placed there would never run."""
+    for i, line in enumerate(lines[:idx]):
+        if TERMINATOR_RE.match(line):
+            raise Refusal("HOOK_GUARD_UNREACHABLE",
+                          f"line {i + 1} of the pre-push hook ({line.strip()!r}) ends the hook before the guard point, "
+                          "so a guard there would never run; remove the guard block by hand and run install-hooks again")
+
+
+def _guard_block_end(lines: list[str], start: int) -> int:
+    """Index of the last line of the guard block that begins at `lines[start]`. A current block ends at
+    GUARD_END. A block written before the end marker existed ends at the `fi` that closes its missing-python
+    branch, plus the stdin rebind and unlink lines when it has them. A block this cannot place is refused:
+    splicing blind into a hook someone edited would break their layers."""
+    for i in range(start + 1, len(lines)):
+        if lines[i].rstrip("\r\n") == GUARD_END:
+            return i
+    said = next((i for i in range(start + 1, len(lines)) if "the push guard did not run" in lines[i]), None)
+    if said is None or said + 1 >= len(lines) or lines[said + 1].rstrip("\r\n") != "fi":
+        raise Refusal("HOOK_UNRECOGNISED", f"the {GUARD_MARKER} block in the pre-push hook has no end marker and is not a "
+                                           "known older shape; remove it by hand and run install-hooks again")
+    end = said + 1
+    for tail in ('exec < "$OUTBOX_STDIN"', 'rm -f "$OUTBOX_STDIN"'):
+        if end + 1 < len(lines) and lines[end + 1].startswith(tail):
+            end += 1
+    return end
+
+
+def _make_executable(hook: pathlib.Path) -> None:
+    """git silently skips a pre-push hook that is not executable on POSIX. Grant execute to each
+    class that can already read the file, so a restrictive umask is not widened. On Windows the
+    call is a harmless no-op."""
+    mode = stat.S_IMODE(os.stat(hook).st_mode)
+    os.chmod(hook, mode | ((mode & (stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)) >> 2))
+
+
+def _remote_default_base(repo: pathlib.Path, remote: str, local_sha: str) -> str | None:
+    """The merge-base of `local_sha` with the remote's default branch, or None when the remote's default
+    branch cannot be found locally or shares no history with the push. OUTBOX-PREPUSH-NEW-BRANCH-COST-1:
+    a push that creates a branch has no remote tip to start from, and walking the whole history on every
+    new branch judges every old commit again. The default branch's commits were judged when they landed,
+    so the walk stops at the point the new branch left it. None means "walk everything": a base this
+    cannot prove is never guessed. r8: "default branch" means a branch in `pre_push_refs` (its commits were
+    judged when they landed); the remote's HEAD, master and main count only when that config guards them."""
+    if not remote:
+        return None
+    # r8 (Iverson advisory on b5310592, ACK 6227530991): a base is taken only from a branch the hook guards
+    # (`pre_push_refs`), by its WHOLE name after refs/heads/. r1-r7 also tried the remote's HEAD and
+    # `{remote}/master` / `{remote}/main` whatever the config guarded, and read the name after the last
+    # slash (refs/heads/release/1.0 became `1.0`), so the walk could start from a ref the hook never judged:
+    #     candidates.extend(f"{remote}/{ref.rsplit('/', 1)[-1]}" for ref in PRE_PUSH_REFS)
+    #     candidates.extend((f"{remote}/master", f"{remote}/main"))
+    guarded = [ref[len("refs/heads/"):] for ref in PRE_PUSH_REFS if ref.startswith("refs/heads/")]
+    candidates: list[str] = []
+    rc, out, _err = git_try(repo, "symbolic-ref", "--quiet", "--short", f"refs/remotes/{remote}/HEAD")
+    if rc == 0 and out.startswith(f"{remote}/") and out[len(remote) + 1:] in guarded:
+        candidates.append(out)
+    candidates.extend(f"{remote}/{name}" for name in guarded)
+    for cand in candidates:
+        rc, _out, _err = git_try(repo, "rev-parse", "--verify", "--quiet", f"refs/remotes/{cand}^{{commit}}")
+        if rc != 0:
+            continue
+        rc, base, _err = git_try(repo, "merge-base", f"refs/remotes/{cand}", local_sha)
+        if rc == 0 and base:
+            return base
+    return None
+
+
+def cmd_pre_push(repo: pathlib.Path, deny_terms: list[tuple[str, str]], remote: str = "") -> int:
+    """git passes <remote> <url> as argv and ref lines on stdin: <local-ref> <local-sha> <remote-ref> <remote-sha>.
+    Only a push to one of the config's `pre_push_refs` is judged; an unresolvable range refuses.
+    A push that creates the branch judges only the commits not on the remote's default branch
+    (`_remote_default_base`); with no such base it judges the whole history.
+    This reads stdin to the end; the shell snippet install_pre_push writes spools it first and
+    rebinds the hook's stdin afterwards, so the layers after the guard see the same bytes."""
+    problems: list[str] = []
+    for line in sys.stdin.read().splitlines():
+        parts = line.split()
+        if len(parts) != 4:
+            continue
+        _local_ref, local_sha, remote_ref, remote_sha = parts
+        if remote_ref not in PRE_PUSH_REFS or set(local_sha) == {"0"}:
+            continue
+        if set(remote_sha) != {"0"}:
+            rng = f"{remote_sha}..{local_sha}"
+        else:  # a new branch: bound the walk to what is not already on the remote's default branch
+            base = _remote_default_base(repo, remote, local_sha)
+            rng = f"{base}..{local_sha}" if base else local_sha
+        try:
+            failures = check_commits(repo, rng, deny_terms)
+        except Unknown as e:
+            problems.append(f"cannot check {rng}: {e}")
+            continue
+        for sha, found in failures.items():
+            problems.extend(f"{sha[:10]} {p}" for p in found)
+    if problems:
+        print("[doctrine-outbox] PUSH REFUSED -- doctrine export is declared per commit, not remembered:", file=sys.stderr)
+        for p in problems:
+            print("  " + p, file=sys.stderr)
+        print(f"  see {OUTBOX_DIR}/README.md", file=sys.stderr)
+        return 1
+    return 0
+
+
+def cmd_stop(repo: pathlib.Path, rev_range: str, deny_terms: list[tuple[str, str]]) -> int:
+    """Stop hook: block ONCE (stop_hook_active ends the loop) when a commit from the last 24 h in
+    `rev_range` would be refused at push. A nudge at the seam the session is standing on; the
+    refusing gate is pre-push.
+
+    The range is the commits NOT YET on the remote: the config's `default_range` (for a project whose
+    default_ref is a remote-tracking ref, `<default_ref>..HEAD`), or `--ref R` meaning `R..HEAD`. A
+    commit already on the remote cannot be repaired by the follow-up commit the nudge asks for, so it
+    is never judged. CONSTRAINT: a project must therefore set `default_range` (or pass `--ref`) to a
+    base that exists locally; an unresolvable range is no nudge, because a Stop hook never wedges a
+    session."""
+    try:
+        data = json.load(sys.stdin)
+    except Exception:  # noqa: BLE001 -- no or malformed hook JSON is "not active"
+        data = {}
+    if data.get("stop_hook_active"):
+        return 0
+    since = int(time.time()) - HOOK_STOP_WINDOW_S
+    rc, out, _err = git_try(repo, "rev-list", "--no-merges", f"--since={since}", rev_range)
+    if rc != 0:
+        return 0
+    added = set(git_paths(repo, "log", "--no-merges", "--diff-filter=A", "--name-only", "--format=",
+                          f"--since={since}", rev_range, "--", OUTBOX_DIR))
+    problems: list[str] = []
+    for sha in out.split():
+        problems.extend(check_commit(repo, sha, added, deny_terms))
+    if not problems:
+        return 0
+    print(json.dumps({"decision": "block",
+                      "reason": ("A commit from the last 24 h will be refused at push by the doctrine-outbox guard. "
+                                 "Fix it now (a follow-up commit is fine; never rewrite history): "
+                                 + " | ".join(problems[:4]) + f" -- see {OUTBOX_DIR}/README.md")}))
+    return 0
+
+
+def cmd_session_start(repo: pathlib.Path, ref: str, ledger: pathlib.Path) -> int:
+    """Install the pre-push guard, then report debt. Informational: it never blocks a session
+    start, so every failure here is printed and the exit status stays 0."""
+    try:
+        print(f"[doctrine-outbox] pre-push guard: {install_pre_push(repo)}")
+    except (GitError, OSError, Refusal) as e:
+        print(f"[doctrine-outbox] pre-push guard: UNKNOWN ({e})")
+    try:
+        print(_debt_text(compute_debt(repo, ref, ledger), ref))
+    except (Unknown, GitError) as e:
+        print(f"[doctrine-outbox] debt: UNKNOWN ({e})")
+    return 0
+
+
 # ---------- CLI commands ----------
 
 def cmd_validate(paths: list[pathlib.Path], deny_terms: list[tuple[str, str]]) -> int:
     ok = True
+    concern_ids: dict[str, pathlib.Path] = {}
     for p in paths:
         try:
             # drain refuses a badly named item forever (ITEM_BAD_FILENAME), so validate must too:
@@ -1518,6 +2348,11 @@ def cmd_validate(paths: list[pathlib.Path], deny_terms: list[tuple[str, str]]) -
             item = parse_item(text)
             screen_law4(item["body"], deny_terms)
             screen_rendered_card(item)
+            if "concern" in item:
+                cid = item["concern"]["id"]
+                if cid in concern_ids:
+                    raise Refusal("CONCERN_DUPLICATE_ID", f"{cid} also heads {concern_ids[cid].name}; the drain holds both")
+                concern_ids[cid] = p
         except Refusal as e:
             print(f"[doctrine-outbox] REFUSED {p}: {e}", file=sys.stderr)
             ok = False
@@ -1539,13 +2374,19 @@ def cmd_check_commits(repo: pathlib.Path, rev_range: str, deny_terms: list[tuple
 
 # ---------- argument parsing / entry point ----------
 
+HOOK_COMMANDS = ("check", "pre-push", "stop", "session-start", "install-hooks")
+
+
 def _default_repo() -> pathlib.Path:
-    return pathlib.Path(__file__).resolve().parents[2]
+    """The repo the config belongs to (the config sits at its root); the cwd when there is none."""
+    return CONFIG_ROOT if CONFIG_ROOT is not None else pathlib.Path.cwd()
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="doctrine_outbox", description=__doc__,
                                       formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--config", type=pathlib.Path, default=None,
+                        help=f"the project's {CONFIG_NAME} (default: ${CONFIG_ENV}, else found beside the tool)")
     parser.add_argument("--repo", type=pathlib.Path, default=_default_repo())
     sub = parser.add_subparsers(dest="cmd", required=True)
 
@@ -1566,7 +2407,8 @@ def build_parser() -> argparse.ArgumentParser:
     drain_p.add_argument("--ledger", type=pathlib.Path, default=None, help="the SENT ledger (sent.jsonl)")
     drain_p.add_argument("--deny-file", type=pathlib.Path, default=None)
 
-    kernel_p = sub.add_parser("kernel-filing", help=f"publish {KERNEL_DIR}/<yyyymmdd>/ to review/{PROJECT}-kernel-<date> "
+    kernel_p = sub.add_parser("kernel-filing", help=f"publish {KERNEL_DIR or '<outbox_dir>/kernel-filing'}/<yyyymmdd>/ to "
+                                                     f"review/{PROJECT or '<project>'}-kernel-<date> "
                                                      "(dry run unless --push); no branch or path parameter exists")
     kernel_p.add_argument("--bus", required=True, type=pathlib.Path)
     kernel_p.add_argument("--ref", default=DEFAULT_REF)
@@ -1582,17 +2424,69 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--advance", action="store_true", help="advance the watermark past disposed findings")
     mode.add_argument("--baseline", action="store_true", help="explicitly waive all history up to now")
 
-    commits_p = sub.add_parser("check-commits", help="commits touching a finding path need a Doctrine-Export trailer")
-    commits_p.add_argument("--range", dest="rev_range", default=f"{DEFAULT_REF}..HEAD")
-    commits_p.add_argument("--deny-file", type=pathlib.Path, default=None)
+    for name in ("check-commits", "check-range"):
+        commits_p = sub.add_parser(name, help="commits touching a finding path need a Doctrine-Export trailer "
+                                              "(legacy form: [REPO [A..B]])")
+        commits_p.add_argument("legacy", nargs="*", help="optional REPO then A..B, as the older check-range was called")
+        commits_p.add_argument("--range", dest="rev_range", default=DEFAULT_RANGE)
+        commits_p.add_argument("--deny-file", type=pathlib.Path, default=None)
+
+    check_p = sub.add_parser("check", help="exit 1 when an unsent item is older than MAX_AGE_MIN (default "
+                                           f"{HOOK_CHECK_WINDOW_MIN}); args: [REPO [MAX_AGE_MIN]]")
+    check_p.add_argument("legacy", nargs="*")
+    check_p.add_argument("--ref", default=DEFAULT_REF)
+    check_p.add_argument("--ledger", type=pathlib.Path, default=None)
+    check_p.add_argument("--bus", type=pathlib.Path, default=None)
+
+    pre_p = sub.add_parser("pre-push", help="git pre-push hook: refuse a push of commits that fail check-commits; "
+                                            "args: [REPO [REMOTE URL]], ref lines on stdin")
+    pre_p.add_argument("legacy", nargs="*")
+    pre_p.add_argument("--deny-file", type=pathlib.Path, default=None)
+
+    stop_p = sub.add_parser("stop", help="Stop hook: block once when a commit from the last 24 h that is not yet on "
+                                         f"the remote would be refused at push (range: {DEFAULT_RANGE or 'the config default_range'})")
+    stop_p.add_argument("legacy", nargs="*")
+    stop_p.add_argument("--ref", default=None, help="judge the commits in R..HEAD instead of the config's default_range")
+    stop_p.add_argument("--deny-file", type=pathlib.Path, default=None)
+
+    start_p = sub.add_parser("session-start", help="install the pre-push guard and report debt; always exit 0")
+    start_p.add_argument("legacy", nargs="*")
+    start_p.add_argument("--ref", default=DEFAULT_REF)
+    start_p.add_argument("--ledger", type=pathlib.Path, default=None)
+
+    install_p = sub.add_parser("install-hooks", help="install the pre-push guard only")
+    install_p.add_argument("legacy", nargs="*")
 
     return parser
 
 
+def _apply_cli_config(argv: list[str]) -> None:
+    """Honour `--config` before the parser is built: its defaults (--ref, --range, --repo) come from it."""
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config", type=pathlib.Path, default=None)
+    known, _rest = pre.parse_known_args(argv)
+    if known.config is not None:
+        configure(load_config(known.config), known.config)
+
+
 def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    try:
+        _apply_cli_config(argv)
+        if "-h" not in argv and "--help" not in argv:
+            require_configured()
+    except Refusal as e:
+        print(f"[doctrine-outbox] {e}", file=sys.stderr)
+        return 1
+    except Unknown as e:
+        print(f"[doctrine-outbox] UNKNOWN {e}", file=sys.stderr)
+        return 2
     parser = build_parser()
     args = parser.parse_args(argv)
     repo = args.repo.resolve()
+    legacy = list(getattr(args, "legacy", []) or [])
+    if legacy:  # hooks call `<cmd> REPO ...`; the first positional is always the repo
+        repo = pathlib.Path(legacy[0]).resolve()
     try:
         if args.cmd == "validate":
             deny_terms = gather_deny_terms(resolve_deny_file(repo, args.deny_file))
@@ -1615,9 +2509,33 @@ def main(argv: list[str] | None = None) -> int:
                                      advance=args.advance, baseline=args.baseline)
             print("\n".join(out))
             return code
-        if args.cmd == "check-commits":
+        if args.cmd in ("check-commits", "check-range"):
             deny_terms = gather_deny_terms(resolve_deny_file(repo, args.deny_file))
-            return cmd_check_commits(repo, args.rev_range, deny_terms)
+            rev_range = legacy[1] if len(legacy) > 1 else args.rev_range
+            return cmd_check_commits(repo, rev_range, deny_terms)
+        if args.cmd == "check":
+            # was: max_age = int(legacy[1]) if len(legacy) > 1 else HOOK_CHECK_WINDOW_MIN  (a bad value was a traceback)
+            max_age = HOOK_CHECK_WINDOW_MIN
+            if len(legacy) > 1:
+                try:
+                    max_age = int(legacy[1])
+                except ValueError:
+                    print(f"[doctrine-outbox] usage: check [REPO [MAX_AGE_MIN]]; MAX_AGE_MIN must be a whole number of "
+                          f"minutes, got {legacy[1]!r}", file=sys.stderr)
+                    return 2
+            bus = args.bus.resolve() if args.bus is not None else None
+            return cmd_check(repo, args.ref, resolve_ledger(repo, args.ledger), bus, max_age)
+        if args.cmd == "pre-push":
+            remote = legacy[1] if len(legacy) > 1 else ""   # git's argv: <remote> <url>, after the repo the hook adds
+            return cmd_pre_push(repo, gather_deny_terms(resolve_deny_file(repo, args.deny_file)), remote)
+        if args.cmd == "stop":
+            rev_range = f"{args.ref}..HEAD" if args.ref else DEFAULT_RANGE
+            return cmd_stop(repo, rev_range, gather_deny_terms(resolve_deny_file(repo, args.deny_file)))
+        if args.cmd == "session-start":
+            return cmd_session_start(repo, args.ref, resolve_ledger(repo, args.ledger))
+        if args.cmd == "install-hooks":
+            print(install_pre_push(repo))
+            return 0
     except Refusal as e:
         print(f"[doctrine-outbox] {e}", file=sys.stderr)
         return 1
