@@ -224,6 +224,8 @@ function Disable-DriverFsmonitor {
     try {
         if (-not (Get-Command Disable-LaneWorktreeFsmonitor -ErrorAction SilentlyContinue)) { . (Join-Path $PSScriptRoot 'lane-fsmonitor.ps1') }
         $null = Disable-LaneWorktreeFsmonitor -WorkDir $DriverRoot
+        # r2: the driver worktree persists between cycles, so a daemon from before this fix may already be running in it.
+        $null = Stop-LaneWorktreeFsmonitor -WorkDir $DriverRoot
     } catch { }
 }
 

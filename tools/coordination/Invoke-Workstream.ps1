@@ -1263,6 +1263,13 @@ $fence
                 # tree someone else left dirty carries staged, tracked or untracked changes the
                 # lane did not make and will commit as if it had. Refuse and name the paths; the
                 # owner of that work decides, never this dispatch.
+                # HOST-FSMONITOR-DAEMON-LEAK-1 r2 (sol r1 BLOCKER): the status below is the first git command to read this worktree's index, so it would
+                # start a daemon in a worktree that predates the fix - and the dirty branch exits before the disable further down. Protect FIRST (disable,
+                # then stop a daemon already running there), on the clean and the dirty path alike. Fail-soft: a fixture without the helper just skips.
+                try {
+                    if (-not (Get-Command Protect-LaneWorktreeFsmonitor -ErrorAction SilentlyContinue)) { . (Join-Path $PSScriptRoot 'lane-fsmonitor.ps1') }
+                    $null = Protect-LaneWorktreeFsmonitor -WorkDir $existingWt
+                } catch { Write-Output "WORKSTREAM: fsmonitor protect skipped for ${existingWt}: $($_.Exception.Message)" }
                 $dirty = @(& git -C $existingWt status --porcelain 2>$null | Where-Object { $_ })
                 if ($LASTEXITCODE -ne 0) {
                     Write-Output "WORKSTREAM: CANNOT-DETERMINE - status failed in existing worktree $existingWt"

@@ -910,6 +910,8 @@ $WorkDir = (Resolve-Path -LiteralPath $WorkDir).Path
 try {
     . (Join-Path $PSScriptRoot 'lane-fsmonitor.ps1')
     $null = Disable-LaneWorktreeFsmonitor -WorkDir $WorkDir
+    # r2 (opus r1 note 5): a relaunched worktree may already have a daemon; stop it (by worktree path, over its own IPC) once the config is off.
+    $null = Stop-LaneWorktreeFsmonitor -WorkDir $WorkDir
 } catch { }
 
 # ---------------------------------------------------------------- 0.1 pre-flight (before any process, before any run dir)

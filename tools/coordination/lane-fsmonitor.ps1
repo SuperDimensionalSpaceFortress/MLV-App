@@ -4,8 +4,8 @@
 # `git fsmonitor--daemon run --detach` that nothing ever stops: 65 daemons for 64 worktrees, the oldest 17 h old, ~51 MiB private each, host commit
 # at 61 GiB against the 60 GiB gate. Two halves, both fail-soft (an optimisation must never turn a lane or a retirement into a failure):
 #   Disable-LaneWorktreeFsmonitor  (a) core.fsmonitor=false in THIS worktree's config.worktree, so a status there starts nothing. Only when
-#                                      extensions.worktreeConfig is already on; otherwise `--worktree` writes the SHARED config and would
-#                                      switch the board's fsmonitor off too, so it is skipped, never flipped on.
+#                                      extensions.worktreeConfig is already on; otherwise `--worktree` errors (git 2.40, several worktrees)
+#                                      or may write the SHARED config and switch the board's fsmonitor off too, so it is skipped, never flipped on.
 #   Stop-LaneWorktreeFsmonitor     (b) `git fsmonitor--daemon stop` for exactly this worktree. NEVER kill by name or pid: the daemon is asked
 #                                      to exit over its own IPC. A daemon also holds the worktree directory open, which is a removal hazard.
 # Both refuse the main checkout (git dir == common dir): the board's own daemon is not a lane daemon. Both return an object, never throw.
@@ -53,4 +53,15 @@ function Stop-LaneWorktreeFsmonitor {
         else { $r.action = 'stopped' }
     } catch { $r.action = 'failed'; $r.reason = "cannot-determine: $($_.Exception.Message)" }
     return [pscustomobject]$r
+}
+
+# r2 (sol r1 BLOCKER): for a worktree that ALREADY EXISTS, so a daemon may already be running (a lane worktree made before this fix, or one a
+# status touched first). Order matters: disable first so nothing can restart the daemon, then stop the one that is there.
+# Call it BEFORE the first git command that reads the worktree's index (status, diff, reset, checkout). Never throws.
+function Protect-LaneWorktreeFsmonitor {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$WorkDir)
+    $d = Disable-LaneWorktreeFsmonitor -WorkDir $WorkDir
+    $s = Stop-LaneWorktreeFsmonitor -WorkDir $WorkDir
+    return [pscustomobject][ordered]@{ schema = 'mlv-app/lane-fsmonitor/v1'; workDir = $WorkDir; disable = $d.action; stop = $s.action; reason = (@($d.reason, $s.reason) | Where-Object { $_ }) -join ' | ' }
 }
