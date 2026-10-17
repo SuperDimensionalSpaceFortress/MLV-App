@@ -625,6 +625,13 @@ TEST(PlaybackGpuClockKickWiring, TheKernelIsBoundedByAGlobaltimerDeadlineOnItsOw
     ASSERT_FALSE(begin.isEmpty());
     ASSERT_TRUE(begin.contains(QStringLiteral(
         "cudaStreamCreateWithPriority(&backend->kickStream, cudaStreamNonBlocking, leastPriority);")));
+    // the kick is a chain of short launches: none exceeds the 100 ms per-launch budget (GPU-LAUNCH-BUDGET-TILING-1)
+    ASSERT_TRUE(cu.contains(QStringLiteral("constexpr int kClockKickChunkMs = 20;")));
+    ASSERT_TRUE(kernel.contains(QStringLiteral("if (t - tIn >= chunkNs) break;")));
+    ASSERT_TRUE(begin.contains(QStringLiteral(
+        "const unsigned int chunks = static_cast<unsigned int>((max_ms + kClockKickChunkMs - 1) / kClockKickChunkMs);")));
+    // clock64 is per SM: every sample carries its %smid
+    ASSERT_TRUE(kernel.contains(QStringLiteral("s->sampleSm[count] = igpu_smid();")));
     ASSERT_TRUE(begin.contains(QStringLiteral("k_clock_kick<<<1, 32, 0, backend->kickStream>>>(")));
     // bad max_ms (0 or below, or above the 2 s cap) is refused before anything is launched
     ASSERT_TRUE(begin.contains(QStringLiteral("> kClockKickMaxMsCap) return -1;")));

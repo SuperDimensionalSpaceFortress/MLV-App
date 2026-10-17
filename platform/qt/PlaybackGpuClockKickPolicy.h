@@ -5,9 +5,10 @@
  * PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row K. The first AMaZE at Play costs 118-176 ms on Bachelor s1 against
  * ~18 ms once the GPU is busy: after the paused idle before Play the GPU sits in a low P-state (P8, ~210 MHz under a
  * held CUDA context), and the first frame's AMaZE pays the ramp. At Play, before the play-start frame request,
- * MainWindow launches ONE <<<1, 32>>> kernel on a lowest-priority stream of the already-loaded AMaZE backend
- * (igpu_amaze_debayer_clock_kick_begin). It spins on %globaltimer for at most kKickMaxMs while frame 0 decodes and
- * reconstructs, so the clocks ramp before its AMaZE starts, sampling (%globaltimer, clock64) every ~5 ms. Frame 0's
+ * MainWindow starts a <<<1, 32>>> spin on a lowest-priority stream of the already-loaded AMaZE backend
+ * (igpu_amaze_debayer_clock_kick_begin): a chain of launches of at most 20 ms each (the 100 ms per-launch budget),
+ * spinning on %globaltimer for at most kKickMaxMs in all while frame 0 decodes and reconstructs, so the clocks ramp
+ * before its AMaZE starts, sampling (%globaltimer, clock64, %smid) every ~5 ms. Frame 0's
  * AMaZE drain raises its stop flag; MainWindow collects it at the first present, Play stop, a clip change, a device
  * loss, the window going away or the deadline. Zero cost while paused; it never keeps clocks up while idle.
  * MLVAPP_PLAYBACK_GPU_CLOCK_KICK=0 turns it off.
@@ -101,18 +102,38 @@ inline Reason reasonFromBeginFailure( const QString &why )
 }
 
 /*! SM MHz over each interval between consecutive (%globaltimer ns, clock64) samples; an interval whose time does not
- *  advance is 0. One fewer value than samples (none for fewer than 2). */
-inline std::vector<double> intervalMhz( const std::vector<unsigned long long> &ns, const std::vector<long long> &clk )
+ *  advance is 0. One fewer value than samples (none for fewer than 2). clock64 is per SM and the kick's chunk launches
+ *  may run on different SMs: with \a sm given (one %smid per sample), an interval whose two samples are on different
+ *  SMs is -1 (unknown, skipped by every reader below). */
+inline std::vector<double> intervalMhz( const std::vector<unsigned long long> &ns, const std::vector<long long> &clk,
+                                        const std::vector<unsigned int> &sm = std::vector<unsigned int>() )
 {
     std::vector<double> mhz;
     const size_t n = ns.size() < clk.size() ? ns.size() : clk.size();
     for( size_t i = 1; i < n; ++i )
     {
+        if( i < sm.size() && sm[i] != sm[i - 1] )
+        {
+            mhz.push_back( -1.0 );
+            continue;
+        }
         const double dns = ns[i] > ns[i - 1] ? static_cast<double>( ns[i] - ns[i - 1] ) : 0.0;
         const double dclk = clk[i] > clk[i - 1] ? static_cast<double>( clk[i] - clk[i - 1] ) : 0.0;
         mhz.push_back( dns > 0.0 ? dclk * 1000.0 / dns : 0.0 );
     }
     return mhz;
+}
+
+/*! The first / last known (>= 0) interval MHz; -1 when none is known. */
+inline double firstKnownMhz( const std::vector<double> &intervalMhzValues )
+{
+    for( double mhz : intervalMhzValues ) if( mhz >= 0.0 ) return mhz;
+    return -1.0;
+}
+inline double lastKnownMhz( const std::vector<double> &intervalMhzValues )
+{
+    for( size_t i = intervalMhzValues.size(); i > 0; --i ) if( intervalMhzValues[i - 1] >= 0.0 ) return intervalMhzValues[i - 1];
+    return -1.0;
 }
 
 /*! Each sample's time since the first, in ms. */
@@ -125,7 +146,8 @@ inline std::vector<double> sampleMs( const std::vector<unsigned long long> &ns )
 }
 
 /*! Kick start -> the end of the first interval at >= kRampFraction of the highest interval MHz; -1 when unknown
- *  (fewer than 2 samples, or no interval above 0). intervalMhz[i] spans sampleMs[i] -> sampleMs[i + 1]. */
+ *  (fewer than 2 samples, or no interval above 0). intervalMhz[i] spans sampleMs[i] -> sampleMs[i + 1]; an unknown
+ *  (-1, cross-SM) interval is never the peak and never reaches the threshold. */
 inline double rampMsTo80pct( const std::vector<double> &sampleMsSinceFirst, const std::vector<double> &intervalMhzValues )
 {
     if( sampleMsSinceFirst.size() < 2 || intervalMhzValues.empty() ) return -1.0;

@@ -79,6 +79,11 @@ const WholeFrameLaunch kWholeFrameLaunches[] = {
     {"amaze", "k_reduced_hnyquist121"},
     {"amaze", "k_pack_rgb16_to_rgba16"},
     {"amaze", "k_pack_rgb16_to_rgba16_post_wb_undo"},
+    // PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1: outside the tile bodies but NOT frame-sized: a <<<1, 1>>> spin of
+    // kProbeSpinNs (50 us), and the clock kick's <<<1, 32>>> chunk, each launch bounded by kClockKickChunkMs (20 ms),
+    // whatever the frame. Neither runs on the measured M16-1456 fixture path (armed / Play-start only).
+    {"amaze", "k_sm_clock_probe"},
+    {"amaze", "k_clock_kick"},
 };
 
 QString readRepoFile(const QString & relativePath)
@@ -409,7 +414,8 @@ TEST(GpuLaunchBudget, WholeFrameLaunchesAreAnExplicitList)
     const QString recon = readRepoFile(QString::fromLatin1(kRecon));
     const QString amaze = readRepoFile(QString::fromLatin1(kAmaze));
     ASSERT_EQ(std::string(), wholeFrameListProblems(recon, amaze).join(QStringLiteral("\n")).toStdString());
-    ASSERT_EQ(3, (int)launchSites(amazeOutsideTiles(amaze)).size());
+    // 3 frame-sized packs/filters + PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1's probe and kick (constant-size grids)
+    ASSERT_EQ(5, (int)launchSites(amazeOutsideTiles(amaze)).size());
 
     // RED on a new whole-frame launch, with the message that says what to do.
     const QString added = QStringLiteral(

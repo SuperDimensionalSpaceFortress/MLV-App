@@ -370,6 +370,7 @@ static double kick_max_interval_mhz(const igpu_clock_kick_report_t & r)
     double best = 0.0;
     for (int i = 1; i < r.samples; ++i)
     {
+        if (r.sample_sm[i] != r.sample_sm[i - 1]) continue;   // clock64 is per SM
         const double dns = (double)(r.sample_ns[i] - r.sample_ns[i - 1]);
         const double dclk = (double)(r.sample_clk[i] - r.sample_clk[i - 1]);
         if (dns > 0.0 && dclk * 1000.0 / dns > best) best = dclk * 1000.0 / dns;

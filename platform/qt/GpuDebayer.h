@@ -60,7 +60,7 @@ struct GpuAmazeClockKickReport
     int stoppedBy = 0;        // 0 deadline, 1 end, 2 a live run's drain
     double ranMs = 0.0;
     std::vector<double> sampleMs;    // since the kick's first sample
-    std::vector<double> intervalMhz; // SM MHz over each sample interval (sampleMs[i] -> sampleMs[i+1])
+    std::vector<double> intervalMhz; // SM MHz over each sample interval (sampleMs[i] -> sampleMs[i+1]); -1 across SMs
 };
 
 const char * gpuBilinearDebayerEnvironmentVariableName(void);

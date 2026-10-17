@@ -129,6 +129,30 @@ TEST(PlaybackGpuClockKickPolicy, IntervalMhzIsCyclesOverNanoseconds)
     ASSERT_TRUE(playback_gpu_clock_kick::intervalMhz({7ull}, {1}).empty());
 }
 
+TEST(PlaybackGpuClockKickPolicy, AnIntervalAcrossTwoSmsIsUnknown)
+{
+    // clock64 is per SM and the kick's chunk launches may land on different SMs: such an interval is -1
+    const std::vector<unsigned long long> ns = {0ull, 5000000ull, 10000000ull, 15000000ull};
+    const std::vector<long long> clk = {1000, 1000 + 1050000, 77, 77 + 7500000};
+    const std::vector<unsigned int> sm = {3u, 3u, 9u, 9u};
+    const std::vector<double> mhz = playback_gpu_clock_kick::intervalMhz(ns, clk, sm);
+    ASSERT_EQ(3, static_cast<int>(mhz.size()));
+    ASSERT_NEAR(210.0, mhz[0], 1e-6);
+    ASSERT_NEAR(-1.0, mhz[1], 1e-9);
+    ASSERT_NEAR(1500.0, mhz[2], 1e-6);
+    // first / last known skip the unknown ones; none known is -1
+    ASSERT_NEAR(210.0, playback_gpu_clock_kick::firstKnownMhz(mhz), 1e-6);
+    ASSERT_NEAR(1500.0, playback_gpu_clock_kick::lastKnownMhz(mhz), 1e-6);
+    ASSERT_NEAR(1500.0, playback_gpu_clock_kick::firstKnownMhz({-1.0, 1500.0, -1.0}), 1e-6);
+    ASSERT_NEAR(1500.0, playback_gpu_clock_kick::lastKnownMhz({-1.0, 1500.0, -1.0}), 1e-6);
+    ASSERT_NEAR(-1.0, playback_gpu_clock_kick::firstKnownMhz({-1.0, -1.0}), 1e-9);
+    ASSERT_NEAR(-1.0, playback_gpu_clock_kick::lastKnownMhz({}), 1e-9);
+    // an unknown interval is never the peak and never the ramp point
+    ASSERT_NEAR(15.0, playback_gpu_clock_kick::rampMsTo80pct({0.0, 5.0, 10.0, 15.0}, {210.0, -1.0, 1500.0}), 1e-9);
+    // fewer SM ids than samples: the rest count as one SM
+    ASSERT_NEAR(1500.0, playback_gpu_clock_kick::intervalMhz({0ull, 5000000ull}, {0, 7500000}, {4u})[0], 1e-6);
+}
+
 TEST(PlaybackGpuClockKickPolicy, TheRampIsTheEndOfTheFirstIntervalAt80PercentOfThePeak)
 {
     using playback_gpu_clock_kick::rampMsTo80pct;

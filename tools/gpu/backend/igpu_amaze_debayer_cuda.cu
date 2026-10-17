@@ -59,8 +59,10 @@ struct ClockKickShared
     volatile unsigned int exitReason;  /* 0 deadline, else the stop value the kernel saw */
     volatile unsigned long long startNs;
     volatile unsigned long long endNs;
+    volatile unsigned long long nextSampleNs;   /* carried from one chunk launch to the next */
     volatile unsigned long long sampleNs[IGPU_CLOCK_KICK_MAX_SAMPLES];
     volatile long long sampleClk[IGPU_CLOCK_KICK_MAX_SAMPLES];
+    volatile unsigned int sampleSm[IGPU_CLOCK_KICK_MAX_SAMPLES];   /* clock64 is per SM: %smid of each sample */
 };
 
 struct igpu_amaze_debayer_backend
@@ -189,44 +191,78 @@ __global__ void k_sm_clock_probe(unsigned long long * out, unsigned long long sp
     out[1] = static_cast<unsigned long long>(c1 - c0);
 }
 
-/* Row K: lane 0 spins until maxNs after its start or until the host-mapped stop flag is set, sampling
- * (%globaltimer, clock64) every periodNs (at most maxPeriodic) plus one closing sample; done is written last. */
+__device__ __forceinline__ unsigned int igpu_smid()
+{
+    unsigned int id;
+    asm volatile("mov.u32 %0, %%smid;" : "=r"(id));
+    return id;
+}
+
+/* Row K: one CHUNK of the kick. begin enqueues `chunks` of these back to back on the kick stream, so no single launch
+ * exceeds the 100 ms per-launch budget (GPU-LAUNCH-BUDGET-TILING-1, IGPU_LT_LAUNCH_BUDGET_MS) while the kick as a whole
+ * runs up to maxNs. Lane 0 spins for at most chunkNs, until maxNs after the FIRST chunk's start, or until the
+ * host-mapped stop flag is set, sampling (%globaltimer, clock64, %smid) every periodNs and once as it leaves (at most
+ * IGPU_CLOCK_KICK_MAX_SAMPLES over the whole kick). clock64 is per SM and a chunk may run on another SM, so the host
+ * only reads an interval whose two samples share an SM. A chunk that starts after a stop or past the deadline returns
+ * at once. The last chunk writes done, last. */
 __global__ void k_clock_kick(ClockKickShared * s,
                              unsigned long long maxNs,
+                             unsigned long long chunkNs,
                              unsigned long long periodNs,
-                             unsigned int maxPeriodic)
+                             unsigned int chunk,
+                             unsigned int chunks)
 {
     if (blockIdx.x != 0 || threadIdx.x != 0) return;
-    const unsigned long long t0 = igpu_globaltimer_ns();
-    s->startNs = t0;
-    unsigned int count = 0;
-    unsigned long long next = t0;
-    unsigned int reason = 0;
-    for (;;)
+    const unsigned long long tIn = igpu_globaltimer_ns();
+    if (chunk == 0)
     {
-        const unsigned long long t = igpu_globaltimer_ns();
-        if (t >= next && count < maxPeriodic)
-        {
-            s->sampleNs[count] = t;
-            s->sampleClk[count] = clock64();
-            ++count;
-            next = t + periodNs;
-        }
-        const unsigned int stop = s->stop;
-        if (stop != 0)
-        {
-            reason = stop;
-            break;
-        }
-        if (t - t0 >= maxNs) break;
+        s->startNs = tIn;
+        s->nextSampleNs = tIn;
     }
-    const unsigned long long tEnd = igpu_globaltimer_ns();
-    s->sampleNs[count] = tEnd;
-    s->sampleClk[count] = clock64();
-    ++count;
-    s->endNs = tEnd;
-    s->count = count;
-    s->exitReason = reason;
+    const unsigned long long t0 = s->startNs;
+    unsigned int count = s->count;
+    unsigned long long next = s->nextSampleNs;
+    unsigned int reason = s->exitReason;
+    if (reason == 0 && s->stop == 0 && tIn - t0 < maxNs)
+    {
+        for (;;)
+        {
+            const unsigned long long t = igpu_globaltimer_ns();
+            if (t >= next && count < IGPU_CLOCK_KICK_MAX_SAMPLES)
+            {
+                s->sampleNs[count] = t;
+                s->sampleClk[count] = clock64();
+                s->sampleSm[count] = igpu_smid();
+                ++count;
+                next = t + periodNs;
+            }
+            const unsigned int stop = s->stop;
+            if (stop != 0)
+            {
+                reason = stop;
+                break;
+            }
+            if (t - t0 >= maxNs) break;
+            if (t - tIn >= chunkNs) break;
+        }
+        const unsigned long long tOut = igpu_globaltimer_ns();
+        if (count < IGPU_CLOCK_KICK_MAX_SAMPLES)
+        {
+            s->sampleNs[count] = tOut;
+            s->sampleClk[count] = clock64();
+            s->sampleSm[count] = igpu_smid();
+            ++count;
+        }
+        s->count = count;
+        s->nextSampleNs = next;
+        s->exitReason = reason;
+        s->endNs = tOut;
+    }
+    else if (reason == 0 && s->stop != 0)
+    {
+        s->exitReason = s->stop;
+    }
+    if (chunk + 1 < chunks) return;
     __threadfence_system();
     s->done = 1;
     __threadfence_system();
@@ -235,9 +271,9 @@ __global__ void k_clock_kick(ClockKickShared * s,
 constexpr unsigned long long kProbeSpinNs = 50000ull;
 constexpr int kClockKickMaxMsCap = 2000;
 constexpr unsigned long long kClockKickPeriodNs = 5000000ull;
-constexpr unsigned int kClockKickMaxPeriodicSamples = 80;
+/* One kick launch spins at most this long: far under the 100 ms per-launch budget (IGPU_LT_LAUNCH_BUDGET_MS). */
+constexpr int kClockKickChunkMs = 20;
 constexpr double kClockKickEndWaitMs = 2.0;
-static_assert(kClockKickMaxPeriodicSamples + 1 <= IGPU_CLOCK_KICK_MAX_SAMPLES, "closing sample slot");
 
 /* Row 0: SM MHz on `stream` (launch + sync, host-mapped result), or 0.0 when a step fails. Its codes are noted
  * (the run that called it captures them, or the next run emits them as orphans); it never throws, so a failed
@@ -2447,16 +2483,28 @@ extern "C" int igpu_amaze_debayer_clock_kick_begin(igpu_amaze_debayer_backend * 
     }
     std::memset(static_cast<void *>(backend->kickHost), 0, sizeof(ClockKickShared));
     const unsigned long long maxNs = static_cast<unsigned long long>(max_ms) * 1000000ull;
-    IGPU_LT_LAUNCH("k_clock_kick", 1, 32, backend->kickStream,
-                   k_clock_kick<<<1, 32, 0, backend->kickStream>>>(backend->kickDevice,
-                                                                   maxNs,
-                                                                   kClockKickPeriodNs,
-                                                                   kClockKickMaxPeriodicSamples));
-    const cudaError_t launchRc = cudaGetLastError();
-    if (launchRc != cudaSuccess)
+    const unsigned long long chunkNs = static_cast<unsigned long long>(kClockKickChunkMs) * 1000000ull;
+    /* back to back on the one kick stream: ceil(max_ms / chunk) launches of at most kClockKickChunkMs each */
+    const unsigned int chunks = static_cast<unsigned int>((max_ms + kClockKickChunkMs - 1) / kClockKickChunkMs);
+    for (unsigned int chunk = 0; chunk < chunks; ++chunk)
     {
-        IGPU_CUDA_ERROR_NOTE(launchRc, "clock_kick:launch");
-        return -2;
+        IGPU_LT_LAUNCH("k_clock_kick", 1, 32, backend->kickStream,
+                       k_clock_kick<<<1, 32, 0, backend->kickStream>>>(backend->kickDevice,
+                                                                       maxNs,
+                                                                       chunkNs,
+                                                                       kClockKickPeriodNs,
+                                                                       chunk,
+                                                                       chunks));
+        const cudaError_t launchRc = cudaGetLastError();
+        if (launchRc != cudaSuccess)
+        {
+            IGPU_CUDA_ERROR_NOTE(launchRc, "clock_kick:launch");
+            /* the chunks already queued see the stop flag and return at once (done is never written: the last chunk
+             * was not queued); nothing is left to collect */
+            backend->kickHost->stop = 1;
+            backend->kickLaunched = false;
+            return -2;
+        }
     }
     /* WDDM batches launches: a query submits the kick now instead of at the next sync. NotReady is the answer. */
     const cudaError_t queryRc = cudaStreamQuery(backend->kickStream);
@@ -2497,6 +2545,7 @@ extern "C" int igpu_amaze_debayer_clock_kick_end(igpu_amaze_debayer_backend * ba
     {
         out->sample_ns[i] = s->sampleNs[i];
         out->sample_clk[i] = s->sampleClk[i];
+        out->sample_sm[i] = s->sampleSm[i];
     }
     out->samples = static_cast<int>(count);
     out->stopped_by = static_cast<int>(s->exitReason);

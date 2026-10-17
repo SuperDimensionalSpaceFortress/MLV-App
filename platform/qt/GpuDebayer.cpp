@@ -1301,9 +1301,10 @@ bool gpuAmazeDebayerRenderPostWbGlTextureFromR16GlTexture(
     {
         return fail(hnyquistReason);
     }
-    if ( !enterAmazeRunUnlessCudaSuppressed(&live.runtime, GpuFieldTelemetry::enabled()) ) return fail(cudaSuppressedReason());
+    // PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row 0 (host-only, no CUDA call): this run's probe arm and start stamp
     const LiveProbeArm probeArm = takeLiveProbeArm(live);
     const double runStartSteadyMs = gpuAmazeDebayerSteadyNowMs();
+    if ( !enterAmazeRunUnlessCudaSuppressed(&live.runtime, GpuFieldTelemetry::enabled()) ) return fail(cudaSuppressedReason());
     const int rc =
         live.runtime.runPostWbGlTextureFromR16GlTexture(
             live.backend,
@@ -1384,9 +1385,10 @@ bool gpuAmazeDebayerRenderPostWbGlTextureFromDeviceBayer16(
         return fail(hnyquistReason);
     }
 
-    if ( !enterAmazeRunUnlessCudaSuppressed(&live.runtime, GpuFieldTelemetry::enabled()) ) return fail(cudaSuppressedReason());
+    // PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row 0 (host-only, no CUDA call): this run's probe arm and start stamp
     const LiveProbeArm probeArm = takeLiveProbeArm(live);
     const double runStartSteadyMs = gpuAmazeDebayerSteadyNowMs();
+    if ( !enterAmazeRunUnlessCudaSuppressed(&live.runtime, GpuFieldTelemetry::enabled()) ) return fail(cudaSuppressedReason());
     const int rc =
         live.runtime.runPostWbGlTextureFromDeviceBayer16(
             live.backend,
@@ -1658,7 +1660,8 @@ GpuAmazeClockKickReport gpuAmazeDebayerClockKickEnd(void)
     const int n = raw.samples < 0 ? 0 : ( raw.samples > IGPU_CLOCK_KICK_MAX_SAMPLES ? IGPU_CLOCK_KICK_MAX_SAMPLES : raw.samples );
     std::vector<unsigned long long> ns(raw.sample_ns, raw.sample_ns + n);
     std::vector<long long> clk(raw.sample_clk, raw.sample_clk + n);
+    std::vector<unsigned int> sm(raw.sample_sm, raw.sample_sm + n);   // clock64 is per SM: cross-SM intervals are unknown
     report.sampleMs = playback_gpu_clock_kick::sampleMs(ns);
-    report.intervalMhz = playback_gpu_clock_kick::intervalMhz(ns, clk);
+    report.intervalMhz = playback_gpu_clock_kick::intervalMhz(ns, clk, sm);
     return report;
 }

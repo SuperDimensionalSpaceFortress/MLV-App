@@ -131,9 +131,11 @@ typedef struct {
 int igpu_amaze_debayer_arm_probe(igpu_amaze_debayer_backend * backend, int calls);
 int igpu_amaze_debayer_last_probe(igpu_amaze_debayer_backend * backend, igpu_amaze_probe_t * out);
 
-/* Optional clock-kick extension (Row K). begin launches ONE <<<1, 32>>> kernel on a backend-owned lowest-priority
- * non-blocking stream that spins on %globaltimer until max_ms or a host-mapped stop flag, writing a (%globaltimer,
- * clock64) sample about every 5 ms plus a closing one to mapped pinned memory. It never touches the live buffers or
+/* Optional clock-kick extension (Row K). begin enqueues a chain of <<<1, 32>>> launches of at most 20 ms each (the
+ * 100 ms per-launch budget, IGPU_LT_LAUNCH_BUDGET_MS) on a backend-owned lowest-priority non-blocking stream; together
+ * they spin on %globaltimer until max_ms after the first starts, or until a host-mapped stop flag, writing a
+ * (%globaltimer, clock64, %smid) sample about every 5 ms and as each launch leaves, to mapped pinned memory. clock64 is
+ * per SM: an interval is only meaningful between two samples of the same SM. It never touches the live buffers or
  * the tile streams. A live run raises the stop flag right after its tile drain, so the kick never overlaps a CUDA-GL
  * handoff. begin returns 0 (launched), 1 (a kick is still in flight), -1 (bad argument: max_ms outside 1..2000) or
  * -2 (a CUDA call failed; its code is noted). end raises the stop flag and collects the samples once the kernel
@@ -144,11 +146,12 @@ int igpu_amaze_debayer_last_probe(igpu_amaze_debayer_backend * backend, igpu_ama
 
 typedef struct {
     int state;          /* 0 collected, 1 pending, 2 none */
-    int samples;        /* valid entries in sample_ns / sample_clk, the closing sample last */
+    int samples;        /* valid entries in sample_ns / sample_clk / sample_sm, in time order */
     int stopped_by;     /* 0 deadline, 1 end(), 2 a live run's drain */
-    double ran_ms;      /* the kernel's own %globaltimer start -> end */
+    double ran_ms;      /* the kick's own %globaltimer start -> end */
     unsigned long long sample_ns[IGPU_CLOCK_KICK_MAX_SAMPLES];
     long long sample_clk[IGPU_CLOCK_KICK_MAX_SAMPLES];
+    unsigned int sample_sm[IGPU_CLOCK_KICK_MAX_SAMPLES];
 } igpu_clock_kick_report_t;
 
 int igpu_amaze_debayer_clock_kick_begin(igpu_amaze_debayer_backend * backend, int max_ms);

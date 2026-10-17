@@ -27872,11 +27872,8 @@ void MainWindow::endPlaybackGpuClockKick( const char *site )
     line.decision = m_playbackGpuClockKickDecision;
     line.ranMs = report.ranMs;
     line.samples = static_cast<int>( report.sampleMs.size() );
-    if( !report.intervalMhz.empty() )
-    {
-        line.mhzFirst = report.intervalMhz.front();
-        line.mhzLast = report.intervalMhz.back();
-    }
+    line.mhzFirst = playback_gpu_clock_kick::firstKnownMhz( report.intervalMhz );
+    line.mhzLast = playback_gpu_clock_kick::lastKnownMhz( report.intervalMhz );
     line.rampMs = playback_gpu_clock_kick::rampMsTo80pct( report.sampleMs, report.intervalMhz );
     line.stoppedBy = QString::fromLatin1( playback_gpu_clock_kick::stoppedByName( report.state, report.stoppedBy ) );
     line.endedAt = QString::fromLatin1( site );
