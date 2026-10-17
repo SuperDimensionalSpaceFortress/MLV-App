@@ -16,6 +16,7 @@
 
 #include <QDir>
 #include <QFile>
+#include <QRegularExpression>
 #include <QSettings>
 #include <QString>
 #include <QStringList>
@@ -482,6 +483,105 @@ QStringList unlocksOutsideKnownBodies(const QString & source)
     }
     return outside;
 }
+
+// r5 (CoS I5): the C source with every comment blanked to spaces. Newlines are kept, so line numbers hold; string and
+// character literals are copied as they are, so a "//" or "/*" inside one does not start a comment.
+QString withoutCComments(const QString & source)
+{
+    QString out = source;
+    enum { Code, LineComment, BlockComment, StringLiteral, CharLiteral } state = Code;
+    for (int i = 0; i < out.size(); ++i)
+    {
+        const ushort c = out.at(i).unicode();
+        const ushort next = i + 1 < out.size() ? out.at(i + 1).unicode() : 0;
+        switch (state)
+        {
+        case Code:
+            if (c == '/' && next == '/') { state = LineComment; out[i] = QLatin1Char(' '); }
+            else if (c == '/' && next == '*') { state = BlockComment; out[i] = out[i + 1] = QLatin1Char(' '); ++i; }
+            else if (c == '"') state = StringLiteral;
+            else if (c == '\'') state = CharLiteral;
+            break;
+        case LineComment:
+            if (c == '\n') state = Code;
+            else out[i] = QLatin1Char(' ');
+            break;
+        case BlockComment:
+            if (c == '*' && next == '/') { out[i] = out[i + 1] = QLatin1Char(' '); ++i; state = Code; }
+            else if (c != '\n') out[i] = QLatin1Char(' ');
+            break;
+        case StringLiteral:
+        case CharLiteral:
+            if (c == '\\') ++i;
+            else if (c == (state == StringLiteral ? '"' : '\'')) state = Code;
+            break;
+        }
+    }
+    return out;
+}
+
+// r5 (CoS I5): what is wrong with one slot in llrawproc.c, "" when nothing. With comments stripped, the slot name as a
+// whole word (\bname\b) must appear exactly 3 times: (1) its declaration line `static PVOID volatile <name> = NULL;`,
+// (2) `&<name>` as the first argument of one InterlockedExchangePointer( (the write) and (3) `&<name>` as the first
+// argument of one InterlockedCompareExchangePointer( (the read). Every other occurrence is reported with its line: a
+// bare name without a leading & that is not the declaration (a plain read, or a plain store with or without spaces),
+// or an & outside those two calls. A second declaration, write or read changes the count and is reported too.
+QString slotPinViolations(const QString & source, const QString & name)
+{
+    const QString code = withoutCComments(source);
+    const QString declaration = QStringLiteral("static PVOID volatile %1 = NULL;").arg(name);
+    const QRegularExpression word(QStringLiteral("\\b%1\\b").arg(QRegularExpression::escape(name)));
+    int total = 0;
+    int declarations = 0;
+    int writes = 0;
+    int reads = 0;
+    QStringList stray;
+    for (QRegularExpressionMatchIterator it = word.globalMatch(code); it.hasNext();)
+    {
+        const int at = it.next().capturedStart();
+        ++total;
+        const QString where = QStringLiteral("llrawproc.c:%1").arg(code.left(at).count(QLatin1Char('\n')) + 1);
+        // `&name`, not `&&name` (a logical and in front of a bare read).
+        const bool addressed = at > 0 && code.at(at - 1) == QLatin1Char('&') && (at < 2 || code.at(at - 2) != QLatin1Char('&'));
+        if (!addressed)
+        {
+            const int lineStart = code.lastIndexOf(QLatin1Char('\n'), at) + 1;
+            const int lineEnd = code.indexOf(QLatin1Char('\n'), at);
+            if (code.mid(lineStart, (lineEnd < 0 ? code.size() : lineEnd) - lineStart).trimmed() == declaration)
+                ++declarations;
+            else
+                stray << QStringLiteral("bare %1").arg(where);
+            continue;
+        }
+        const QString before = code.left(at - 1).trimmed();
+        if (before.endsWith(QStringLiteral("InterlockedCompareExchangePointer(")))
+            ++reads;
+        else if (before.endsWith(QStringLiteral("InterlockedExchangePointer(")))
+            ++writes;
+        else
+            stray << QStringLiteral("& outside an interlocked call %1").arg(where);
+    }
+    QStringList problems;
+    if (total != 3) problems << QStringLiteral("%1 occurrences, not 3").arg(total);
+    if (declarations != 1) problems << QStringLiteral("%1 declarations, not 1").arg(declarations);
+    if (writes != 1) problems << QStringLiteral("%1 interlocked writes, not 1").arg(writes);
+    if (reads != 1) problems << QStringLiteral("%1 interlocked reads, not 1").arg(reads);
+    problems << stray;
+    return problems.join(QStringLiteral("; "));
+}
+
+// r5 (CoS I5): the r4 slot pin exactly as it stood at f1115c6c, kept so the test shows what it missed. It finds the
+// declaration, the write and the read, counts `&<name>` (2) and `<name> = ` (1, the declaration). It does not see a
+// plain read (no & and no " = ") or a store written without spaces (`<name>=`): both CoS mutants pass it.
+bool r4SlotPinHolds(const QString & source, const QString & name)
+{
+    return source.contains(QStringLiteral("static PVOID volatile %1 = NULL;\n").arg(name))
+        && source.contains(QStringLiteral("InterlockedExchangePointer(&%1, (PVOID)").arg(name))
+        && (source.contains(QStringLiteral("InterlockedCompareExchangePointer(\n        &%1, NULL, NULL)").arg(name))
+            || source.contains(QStringLiteral("InterlockedCompareExchangePointer(&%1, NULL, NULL)").arg(name)))
+        && source.count(QStringLiteral("&%1").arg(name)) == 2
+        && source.count(QStringLiteral("%1 = ").arg(name)) == 1;
+}
 } // namespace
 
 TEST(GpuDeviceLossBreaker, EveryCapturingUnlockSuppressesOnADeviceLossBeforeReleasing)
@@ -559,7 +659,9 @@ TEST(GpuDeviceLossBreaker, EveryCapturingUnlockSuppressesOnADeviceLossBeforeRele
     ASSERT_TRUE(breaker.contains(QStringLiteral("    llrpSetGpuDeviceLossClassifier(&classifyDeviceLossCodeForBackend);\n"
                                                 "    GpuFieldTelemetry::setFaultListener(&onFault);\n")));
     ASSERT_TRUE(breaker.contains(QStringLiteral("    llrpSetGpuDeviceLossClassifier(nullptr);\n")));
-    // r4 (Iverson 6227232346): the classifier and after-unlock hook slots are interlocked, never plain volatile.
+    // r4 (Iverson 6227232346): each slot is declared PVOID volatile, and the source holds an InterlockedExchangePointer
+    // write and an InterlockedCompareExchangePointer read of it. These five r4 lines alone do NOT prove there is no
+    // other access (CoS I5, 6228586737): a plain read or a no-space store passes them. The r5 pin below does.
     for (const char * slot : {"g_llrawproc_gpu_device_loss_classifier", "g_llrawproc_gpu_recon_after_unlock_hook"})
     {
         const QString name = QString::fromLatin1(slot);
@@ -567,9 +669,47 @@ TEST(GpuDeviceLossBreaker, EveryCapturingUnlockSuppressesOnADeviceLossBeforeRele
         ASSERT_TRUE(llrawproc.contains(QStringLiteral("InterlockedExchangePointer(&%1, (PVOID)").arg(name)));
         ASSERT_TRUE(llrawproc.contains(QStringLiteral("InterlockedCompareExchangePointer(\n        &%1, NULL, NULL)").arg(name))
                     || llrawproc.contains(QStringLiteral("InterlockedCompareExchangePointer(&%1, NULL, NULL)").arg(name)));
-        ASSERT_EQ(2, (int)llrawproc.count(QStringLiteral("&%1").arg(name))); // one write, one read: no other access
-        ASSERT_EQ(1, (int)llrawproc.count(QStringLiteral("%1 = ").arg(name))); // the declaration: no plain store
+        ASSERT_EQ(2, (int)llrawproc.count(QStringLiteral("&%1").arg(name))); // two address-taken uses; a plain read has no & and is not counted
+        ASSERT_EQ(1, (int)llrawproc.count(QStringLiteral("%1 = ").arg(name))); // spaced `name = ` only; a no-space store is not counted
+        // r5 (CoS I5): with comments stripped, the name appears exactly 3 times - the declaration, one interlocked
+        // write and one interlocked read - and no other occurrence is a bare \bname\b without a leading &.
+        ASSERT_EQ(std::string(), slotPinViolations(llrawproc, name).toStdString());
+        ASSERT_TRUE(r4SlotPinHolds(llrawproc, name));
+        // A mention in a comment is not an access: the stripped count is unchanged by one.
+        ASSERT_EQ(std::string(), slotPinViolations(llrawproc + QStringLiteral("\n/* %1 = x; */\n// if(!%1) return;\n").arg(name),
+                                                   name).toStdString());
     }
+    // r5 RED rows (the CoS I5 reproduction, 6228586737). Each mutant passes the r4 pin (r4SlotPinHolds stays true, so
+    // f1115c6c could not see it) and the r5 pin reports it by line.
+    const QString classifier = QStringLiteral("g_llrawproc_gpu_device_loss_classifier");
+    const QString classifierWrite =
+        QStringLiteral("    InterlockedExchangePointer(&g_llrawproc_gpu_device_loss_classifier, (PVOID)classifier);\n");
+    const QString classifierRead =
+        QStringLiteral("InterlockedCompareExchangePointer(&g_llrawproc_gpu_device_loss_classifier, NULL, NULL)");
+    const struct { QString from; QString to; QString added; } slotMutants[] = {
+        // CoS mutant 1: a plain read of the slot.
+        {QStringLiteral("    if(!classifier) return;\n"),
+         QStringLiteral("    if(!g_llrawproc_gpu_device_loss_classifier) return;\n"),
+         QStringLiteral("if(!g_llrawproc_gpu_device_loss_classifier) return;")},
+        // CoS mutant 2: a plain store with no spaces around '=', next to the interlocked write.
+        {classifierWrite, classifierWrite + QStringLiteral("    g_llrawproc_gpu_device_loss_classifier=(PVOID)c;\n"),
+         QStringLiteral("g_llrawproc_gpu_device_loss_classifier=(PVOID)c;")}};
+    for (const auto & m : slotMutants)
+    {
+        const QString mutant = replacedOnce(llrawproc, m.from, m.to);
+        const int line = mutant.left(mutant.indexOf(m.added)).count(QLatin1Char('\n')) + 1;
+        ASSERT_TRUE(r4SlotPinHolds(mutant, classifier));
+        ASSERT_EQ(QStringLiteral("4 occurrences, not 3; bare llrawproc.c:%1").arg(line).toStdString(),
+                  slotPinViolations(mutant, classifier).toStdString());
+    }
+    // ...and the interlocked read swapped for a plain read keeps the count at 3: the r5 pin still reports it (the r4
+    // pin does too, by its & count), so the count alone is not what carries the pin.
+    const QString swappedRead = replacedOnce(llrawproc, classifierRead, classifier);
+    ASSERT_FALSE(r4SlotPinHolds(swappedRead, classifier));
+    ASSERT_EQ(QStringLiteral("0 interlocked reads, not 1; bare llrawproc.c:%1")
+                  .arg(swappedRead.left(swappedRead.indexOf(QStringLiteral("(llrpGpuDeviceLossClassifier_t)\n        ") + classifier))
+                           .count(QLatin1Char('\n')) + 2).toStdString(),
+              slotPinViolations(swappedRead, classifier).toStdString());
 }
 
 // r6: every AMaZE run reads the flag again after its telemetry entry, which can deliver an orphan device-loss
