@@ -2606,8 +2606,12 @@ TEST(GpuPlaybackReconWarmRun, TheWarmPutsBackTheThreadsLastRunState)
     ASSERT_NE(0, llrpGpuPlaybackReconGetLastPreparedState(&preparedBefore));
     std::vector<uint16_t> raw;
     std::vector<uint16_t> reduced;
+    // frame 1 again, the frame every other test here uses (r1's first cut used frame 2 and the warm did not run there);
+    // its own run, its own token
     const playback_recon_warm_run::Outcome warm = playback_recon_warm_run::run(
-        fixture.video(), 2, 1, fixture.width(), fixture.height(), &reconWorker.state, 1, raw, reduced);
+        fixture.video(), 1, 1, fixture.width(), fixture.height(), &reconWorker.state, 1, raw, reduced);
+    std::printf("[gpu-recon-warm] restore: warm ran=%d reason=%s rc=%d\n", warm.ran ? 1 : 0,
+                playback_recon_warm_run::reasonName(warm.reason), warm.backendRc);
     ASSERT_TRUE(warm.ran);
     ASSERT_NE(before.token, warm.retained.token);
     // the thread reads the real frame's values again, never the warm's
