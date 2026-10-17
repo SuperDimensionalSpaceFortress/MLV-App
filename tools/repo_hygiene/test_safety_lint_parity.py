@@ -1,0 +1,254 @@
+#!/usr/bin/env python3
+"""SAFETY-LINT-MASTER-PARITY-DIFF-1: tests for tools/repo_hygiene/safety_lint_parity.py (the master-vs-head safety-lint runner).
+
+Cost: the hook-only tests run in process (zero pwsh). Exactly ONE test (the base == head full-corpus pin) runs the playback lint, and
+it spawns two pwsh processes (master's lint, the head's; `pwsh_spawns` is asserted). Base is "HEAD" throughout, so the tests do not
+depend on a fork/master ref being fetched; the real-tree run against fork/master is the CLI in the PR body.
+HeadVersusBaselineGateTests is the gate itself; it runs (two more pwsh) only when a lint differs from the merge-base's, and skips otherwise,
+so a PR that touches neither lint pays nothing for it.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import io
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+
+import safety_lint_parity as slp  # noqa: E402
+
+REPO_ROOT = HERE.parents[1]
+PWSH = shutil.which("pwsh")
+
+# Where the gate takes the baseline from: the first ref that resolves, as LintDifferentialPinTests does.
+BASELINE_REFS = ("fork/master", "origin/master", "master")
+BOARD, VENUE = "C:/review/board", "C:/review/worktree"
+# A plain delete of a protected run dir: master's NA-2 refuses it, and a head that allows everything loosens it.
+DENIED = {"id": "t-protected-rd", "lint": "hook", "tool_name": "PowerShell", "board_root": BOARD, "cwd": VENUE,
+          "command": "cmd /c rd /s /q " + BOARD + "/.claude-state/fleet-runs/lane-A-r1", "why": "synthetic: a delete of a protected run dir"}
+
+ALWAYS_ALLOW_HOOK = "def decide(payload, project_dir):\n    return 0, ''\n\n\ndef main():\n    return 0\n"
+ALWAYS_THROW_HOOK = "def decide(payload, project_dir):\n    raise RuntimeError('synthetic rule crash')\n\n\ndef main():\n    return 0\n"
+
+# Pinned floors. A shrinking corpus is a red test; raise these when rows are added, never lower them.
+MIN_STATIC_ROWS = 385      # the JSON corpus: 205 kept static rows + the 180-row #455 sweep when this card landed (385)
+MIN_HOOK_ROWS = 247        # hook share of the JSON corpus: 67 static #455 rows + the 180-row sweep (247 when this card landed)
+MIN_PLAYBACK_ROWS = 138    # playback share: the #465 RULE4 rows master refuses + the authored spaced-clip rows (138 when this card landed)
+MIN_DERIVED_HOOK_ROWS = 200  # DENY rows of test_mlv_never_authorized.CASES (203 when this card landed)
+
+
+def _write(path: Path, text: str) -> Path:
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+class ParityRunnerCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="parity-test-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.allow = _write(self.tmp / "allow.json", "[]")
+
+    def corpus(self, *rows, name="corpus.json") -> Path:
+        return _write(self.tmp / name, json.dumps({"schema": slp.CORPUS_SCHEMA, "rows": list(rows)}))
+
+    def head_hook(self, source: str) -> Path:
+        return _write(self.tmp / "head_hook.py", source)
+
+    def cli(self, *args):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = slp.main(["--base", "HEAD", "--lint", "hook", "--no-derived", *args])
+        return rc, out.getvalue()
+
+
+class RedGreenTests(ParityRunnerCase):
+    def test_a_head_that_allows_a_master_denied_row_exits_1_and_names_the_row(self):
+        rc, out = self.cli("--corpus", str(self.corpus(DENIED)), "--allow", str(self.allow), "--head-hook", str(self.head_hook(ALWAYS_ALLOW_HOOK)))
+        self.assertEqual(rc, slp.EXIT_LOOSENED, out)
+        self.assertIn("LOOSENED t-protected-rd", out)
+        self.assertIn("master=DENY head=ALLOW", out)
+        self.assertIn("cmd /c rd /s /q", out)  # the line carries the command
+
+    def test_the_real_head_equal_to_master_exits_0(self):
+        rc, out = self.cli("--corpus", str(self.corpus(DENIED)), "--allow", str(self.allow))
+        self.assertEqual(rc, slp.EXIT_OK, out)
+        self.assertNotIn("LOOSENED t-protected-rd", out)
+        self.assertIn("rows=1 same=1 tightened=0 loosened=0", out)
+
+    def test_the_control_row_really_is_denied_by_the_baseline(self):
+        report = slp.run("HEAD", ("hook",), self.corpus(DENIED), self.allow, derived=False)
+        self.assertEqual(report["results"][0]["master"], slp.DENY, report["results"][0])
+
+    def test_a_head_that_denies_what_master_allows_is_tightened_not_loosened(self):
+        allowed = dict(DENIED, id="t-harmless-ls", command="ls -la")
+        deny_all = "def decide(payload, project_dir):\n    return 2, 'synthetic deny'\n\n\ndef main():\n    return 2\n"
+        rc, out = self.cli("--corpus", str(self.corpus(allowed)), "--allow", str(self.allow), "--head-hook", str(self.head_hook(deny_all)))
+        self.assertEqual(rc, slp.EXIT_OK, out)
+        self.assertIn("tightened=1 loosened=0", out)
+
+
+class UndecidedTests(ParityRunnerCase):
+    def test_a_lint_that_throws_exits_2_not_0(self):
+        rc, out = self.cli("--corpus", str(self.corpus(DENIED)), "--allow", str(self.allow), "--head-hook", str(self.head_hook(ALWAYS_THROW_HOOK)))
+        self.assertEqual(rc, slp.EXIT_UNDECIDED, out)
+        self.assertIn("ERROR t-protected-rd", out)
+        self.assertIn("synthetic rule crash", out)
+
+    def test_an_unparseable_row_exits_2(self):
+        for bad in ({"id": "t-no-command", "lint": "hook", "why": "x"}, {"id": "t-bad-lint", "lint": "nope", "command": "x", "why": "x"},
+                    {"lint": "hook", "command": "x", "why": "no id"}):
+            with self.subTest(row=bad):
+                rc, out = self.cli("--corpus", str(self.corpus(bad)), "--allow", str(self.allow))
+                self.assertEqual(rc, slp.EXIT_UNDECIDED, out)
+                self.assertIn("CANNOT-DECIDE", out)
+
+    def test_a_corpus_that_is_not_json_exits_2(self):
+        rc, out = self.cli("--corpus", str(_write(self.tmp / "bad.json", "{not json")), "--allow", str(self.allow))
+        self.assertEqual(rc, slp.EXIT_UNDECIDED, out)
+
+    def test_a_base_ref_git_cannot_resolve_exits_2(self):
+        rc, out = self.cli("--base", "refs/heads/no-such-ref-for-parity", "--corpus", str(self.corpus(DENIED)), "--allow", str(self.allow))
+        self.assertEqual(rc, slp.EXIT_UNDECIDED, out)
+
+    def test_a_loosened_row_outranks_an_error_in_the_exit_code(self):
+        errored = dict(DENIED, id="t-errors", command="ls")
+        mixed = "def decide(payload, project_dir):\n    if 'ls' == payload['tool_input']['command']:\n        raise RuntimeError('boom')\n    return 0, ''\n\n\ndef main():\n    return 0\n"
+        rc, out = self.cli("--corpus", str(self.corpus(DENIED, errored)), "--allow", str(self.allow), "--head-hook", str(self.head_hook(mixed)))
+        self.assertEqual(rc, slp.EXIT_LOOSENED, out)
+        self.assertIn("ERROR t-errors", out)
+
+
+class AllowListTests(ParityRunnerCase):
+    def allow_with(self, *entries) -> Path:
+        return _write(self.tmp / "allow-with.json", json.dumps(list(entries)))
+
+    def test_an_allow_listed_row_is_reported_but_does_not_fail(self):
+        entry = {"id": "t-protected-rd", "reason": "synthetic intended loosening", "pr": 999}
+        rc, out = self.cli("--corpus", str(self.corpus(DENIED)), "--allow", str(self.allow_with(entry)), "--head-hook", str(self.head_hook(ALWAYS_ALLOW_HOOK)))
+        self.assertEqual(rc, slp.EXIT_OK, out)
+        self.assertIn("ALLOWED-LOOSENED t-protected-rd", out)
+        self.assertIn("pr=999", out)
+        self.assertIn("synthetic intended loosening", out)
+        self.assertIn("unlisted=0, allowed=1", out)
+
+    def test_an_allow_entry_for_another_row_does_not_excuse_this_one(self):
+        entry = {"id": "t-some-other-row", "reason": "unrelated", "pr": 1}
+        rc, out = self.cli("--corpus", str(self.corpus(DENIED)), "--allow", str(self.allow_with(entry)), "--head-hook", str(self.head_hook(ALWAYS_ALLOW_HOOK)))
+        self.assertEqual(rc, slp.EXIT_LOOSENED, out)
+        self.assertIn("note: allow-list entry t-some-other-row matches no LOOSENED row", out)
+
+    def test_an_allow_entry_without_a_reason_or_pr_exits_2(self):
+        for entry in ({"id": "t-protected-rd", "pr": 5}, {"id": "t-protected-rd", "reason": "r"}, {"id": "t-protected-rd", "reason": "r", "pr": 0}):
+            with self.subTest(entry=entry):
+                rc, out = self.cli("--corpus", str(self.corpus(DENIED)), "--allow", str(self.allow_with(entry)))
+                self.assertEqual(rc, slp.EXIT_UNDECIDED, out)
+
+    def test_the_tracked_allow_list_starts_empty(self):
+        self.assertEqual(slp.load_allow(slp.DEFAULT_ALLOW), {}, "an entry belongs here only with a reason and a PR number, added in review")
+
+
+class CorpusPinTests(unittest.TestCase):
+    def test_the_tracked_corpus_cannot_silently_shrink(self):
+        rows = slp.load_corpus(slp.DEFAULT_CORPUS)
+        hook = [r for r in rows if r["lint"] == "hook"]
+        playback = [r for r in rows if r["lint"] == "playback"]
+        self.assertGreaterEqual(len(rows), MIN_STATIC_ROWS)
+        self.assertGreaterEqual(len(hook), MIN_HOOK_ROWS)
+        self.assertGreaterEqual(len(playback), MIN_PLAYBACK_ROWS)
+
+    def test_an_fstring_row_and_a_spaced_clip_row_are_present_by_id(self):
+        by_id = {r["id"]: r for r in slp.load_corpus(slp.DEFAULT_CORPUS)}
+        self.assertIn("b455-fstring-01", by_id)
+        self.assertEqual(by_id["b455-fstring-01"]["lint"], "hook")
+        self.assertIn("#455", by_id["b455-fstring-01"]["why"])
+        self.assertIn("authored-spaced-clip-01", by_id)
+        spaced = by_id["authored-spaced-clip-01"]
+        self.assertEqual(spaced["lint"], "playback")
+        self.assertRegex(spaced["text"], r'--clip "[^"]* [^"]*"', "a quoted clip path that contains a space")
+
+    def test_every_row_names_its_source(self):
+        for row in slp.load_corpus(slp.DEFAULT_CORPUS):
+            self.assertTrue(row["why"].strip(), row["id"])
+
+    def test_the_sweep_generator_expands_to_180_rows(self):
+        sweep = [r for r in slp.load_corpus(slp.DEFAULT_CORPUS) if r["id"].startswith("b455-sweep-")]
+        self.assertEqual(len(sweep), 180)  # 4 verbs x 9 tails x 5 wrappers, all distinct
+
+    def test_the_derived_hook_rows_cannot_silently_shrink(self):
+        self.assertGreaterEqual(len(slp.derived_hook_cases(REPO_ROOT)), MIN_DERIVED_HOOK_ROWS)
+
+
+class RootFixTests(unittest.TestCase):
+    def test_master_source_runs_with_the_head_files_location(self):
+        pretend = HERE / "no-such-dir" / "tools" / "hooks" / "x.py"
+        module = slp.load_source_as("WHERE = __file__\n", "parity_test_where", pretend)
+        self.assertEqual(module.WHERE, str(pretend))
+
+    def test_a_source_that_does_not_compile_is_an_error_not_a_pass(self):
+        with self.assertRaises(slp.ParityError):
+            slp.load_source_as("def (:\n", "parity_test_broken", HERE / "x.py")
+
+    def test_base_equal_to_head_over_the_full_corpus_is_zero_tightened_zero_loosened(self):
+        """Pins the r3 root fix: without it master's hook, loaded from a temp path, derived a different worktree_root from its own
+        __file__ and six NA-7 / NA-10 rows read as 'tightened'. A tree whose lints are edited and uncommitted is skipped: the
+        comparison would then be of a real change, not of a copy with itself."""
+        dirty = subprocess.run(["git", "-C", str(REPO_ROOT), "status", "--porcelain", "--", slp.HOOK_REL, slp.LINT_REL],
+                               capture_output=True, text=True, timeout=60)
+        if dirty.returncode != 0 or dirty.stdout.strip():
+            self.skipTest("a lint file is edited and uncommitted; base HEAD is not a copy of it")
+        lints = slp.LINTS if PWSH else ("hook",)
+        report = slp.run("HEAD", lints)
+        self.assertEqual(report["counts"]["tightened"], 0, [r["id"] for r in report["results"] if r["class"] == "tightened"])
+        self.assertEqual(report["counts"]["LOOSENED"], 0, [r["id"] for r in report["results"] if r["class"] == "LOOSENED"])
+        self.assertEqual(report["counts"]["error"], 0, [r for r in report["results"] if r["class"] == "error"][:3])
+        self.assertEqual(report["rc"], slp.EXIT_OK)
+        self.assertGreaterEqual(report["rows"], MIN_STATIC_ROWS + MIN_DERIVED_HOOK_ROWS)
+        self.assertEqual(report["pwsh_spawns"], 2 if PWSH else 0, "one pwsh per lint, however many rows")
+
+
+def _baseline_sha() -> str | None:
+    """The merge-base of HEAD and the first baseline ref that resolves (PARITY_BASELINE_REF overrides), or None.
+
+    The MERGE-BASE, not the ref tip: a branch cut before master tightened a lint must not read as having loosened it."""
+    refs = (os.environ["PARITY_BASELINE_REF"],) if os.environ.get("PARITY_BASELINE_REF") else BASELINE_REFS
+    for ref in refs:
+        done = subprocess.run(["git", "-C", str(REPO_ROOT), "merge-base", ref, "HEAD"], capture_output=True, text=True, timeout=60)
+        if done.returncode == 0 and done.stdout.strip():
+            return done.stdout.strip()
+    return None
+
+
+class HeadVersusBaselineGateTests(unittest.TestCase):
+    """The gate itself, as a unit test so hosted CI enforces it with no workflow edit: the head's two safety lints must not loosen
+    anything the baseline's lints deny over the whole corpus, unless safety_lint_parity_allow.json lists the row with a reason and a PR.
+
+    Skipped when the lints are byte-identical to the baseline's (nothing to compare; also the state right after a merge, where the base
+    == head pin above already ran). Like LintDifferentialPinTests, a missing baseline ref FAILS in hosted CI (fetch-depth: 0)."""
+
+    def test_head_does_not_loosen_the_baseline_lints(self):
+        sha = _baseline_sha()
+        if sha is None:
+            message = "no baseline ref resolves (fork/master, origin/master, master); the parity gate needs git history"
+            if os.environ.get("GITHUB_ACTIONS") == "true":
+                raise AssertionError(message + " -- the hygiene jobs check out with fetch-depth: 0, so a missing ref is a broken checkout")
+            self.skipTest(message)
+        same = subprocess.run(["git", "-C", str(REPO_ROOT), "diff", "--quiet", sha, "--", slp.HOOK_REL, slp.LINT_REL], timeout=60)
+        if same.returncode == 0:
+            self.skipTest(f"both lints are byte-identical to the baseline's at {sha[:8]}; nothing to compare")
+        report = slp.run(sha, slp.LINTS if PWSH else ("hook",))
+        loosened = [f"{r['id']}: {r['display']}" for r in report["results"] if r["class"] == "LOOSENED" and not r["allowed"]]
+        self.assertEqual(loosened, [], "master DENIES, head ALLOWS; fix the lint, or list the row in safety_lint_parity_allow.json with a reason and a PR")
+        self.assertEqual([r["id"] for r in report["results"] if r["class"] == "error"], [], "a row that cannot be run is never a pass")
+
+
+if __name__ == "__main__":
+    unittest.main()
