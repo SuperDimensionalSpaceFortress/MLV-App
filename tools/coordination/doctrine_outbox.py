@@ -80,11 +80,24 @@ BEHAVIOURS
    `repaired`), so a layer that reads git's stdin ahead of it cannot starve it. The hook and the debt checks still
    run the file at config `tool_rel`: a project keeps that local copy until a pin-aware release.
 
+11. Ruling candidates name what they touch or supersede (CoS work order FWO-DEFECT-PREVENT-1 item 4). `validate`
+   refuses an item that proposes a ruling candidate (a `### ` heading with `RULING CANDIDATE:`, or a body line opening
+   `Ruling candidate`) unless it carries a non-empty `touches/supersedes:` list: rule ids on that line (comma or
+   semicolon separated) or as bullets under it, or the single entry `none: <reason of >= 4 words>`
+   (`RULING_CANDIDATE_NO_SUPERSEDES`, `_NONE_NEEDS_REASON`, `_NONE_WITH_RULES`). The drain does not apply it.
+12. Card routes are run before they ship (item 3). `validate --exercise` runs every command an item names, in a scratch
+   `git clone --local --no-hardlinks` of the bus (`--bus`, default $FACTORY_BUS_CLONE) with `origin` removed, never in the
+   bus itself, and prints one `ROUTE_OK|ROUTE_MISSING|ROUTE_FAILED|ROUTE_TIMEOUT|ROUTE_UNSAFE <item> <command>` line per
+   command. Anything but OK exits 1. A command that would push, publish, go online or touch a credential is
+   ROUTE_UNSAFE, not run. The extraction rule and the outcome meanings are the block comment above `extract_routes`.
+
 Nothing here runs itself: the OS drain task, Stop hook and heartbeat debt are the project's wiring.
 
 Subcommands
 -----------
-    validate <item.md>...                       parse + screen item files
+    validate <item.md>... [--exercise [--bus PATH] [--timeout S] [--fill NAME=VALUE]... [--scratch-root PATH]]
+                                                parse + screen item files; a ruling candidate needs `touches/supersedes:`;
+                                                --exercise also runs every route command an item names (behaviour 12)
     debt [--ref R] [--ledger P] [--bus PATH] [--json]
     drain --bus PATH [--ref R] [--push] [--ledger P] [--deny-file P]
     kernel-filing --bus PATH [--ref R] [--push] [--ledger P] [--deny-file P]
@@ -110,6 +123,7 @@ import json
 import os
 import pathlib
 import re
+import shlex
 import shutil
 import socket
 import stat
@@ -2331,10 +2345,357 @@ def cmd_session_start(repo: pathlib.Path, ref: str, ledger: pathlib.Path) -> int
     return 0
 
 
+# ---------- ruling candidates must name what they touch or supersede ----------
+#
+# CoS work order FWO-DEFECT-PREVENT-1 item 4 (ruling candidate `ruling-candidates-name-what-they-supersede-r1`):
+# a proposal that overlaps standing doctrine without saying so is found by the reviewer, not the producer.
+# `validate` therefore refuses a ruling candidate that carries no `touches/supersedes:` list.
+
+RULING_CANDIDATE_HEADING_RE = re.compile(r"ruling[\s-]+candidate\s*:", re.I)
+RULING_CANDIDATE_LEAD_RE = re.compile(r"^[ \t]*(?:\*\*)?ruling[\s-]+candidate\b", re.I | re.M)
+TOUCHES_LABEL_RE = re.compile(r"^([ \t]*)([-*][ \t]+)?(?:\*\*)?touches/supersedes:(?:\*\*)?[ \t]*(.*?)[ \t]*$", re.I)
+TOUCHES_BULLET_RE = re.compile(r"^([ \t]*)[-*][ \t]+(\S.*?)[ \t]*$")
+TOUCHES_NONE_RE = re.compile(r"^none\b[ \t]*[:\-–—]?[ \t]*(.*)$", re.I)
+
+
+def is_ruling_candidate(item: dict) -> bool:
+    """A ruling candidate is an item whose `### ` heading holds `RULING CANDIDATE:` (any case, a space or hyphen
+    between the words) or whose body has a line that opens with `Ruling candidate` (bold allowed). A heading that
+    only mentions someone else's candidate (`... for ruling candidate <id>`, no colon) is a measurement, not a
+    proposal. A `kind: ruling` item is a ratified ruling (`ratified_by` is required for it), not a candidate."""
+    return bool(RULING_CANDIDATE_HEADING_RE.search(item_heading(item)) or RULING_CANDIDATE_LEAD_RE.search(item["body"]))
+
+
+def touches_supersedes_entries(body: str) -> list[str] | None:
+    """The entries of a candidate's `touches/supersedes:` list, or None when the label is absent. The label may
+    be a bullet and bold. Entries are the comma- or semicolon-separated rule ids after it on the same line, plus
+    the bullet lines indented under it (or, when the label is not a bullet, the bullets right below it) up to the
+    first blank line or non-bullet. A value that opens with `none` is one entry, whole, so its reason keeps its
+    commas. A label inside a fenced block does not count."""
+    lines = body.splitlines()
+    fence: tuple[str, int] | None = None
+    for i, raw in enumerate(lines):
+        line = raw.rstrip("\r")
+        opened = _FENCE_OPEN_RE.match(line)
+        if fence is not None:
+            if opened and opened.group(1)[0] == fence[0] and len(opened.group(1)) >= fence[1] and not line.strip(" `~"):
+                fence = None
+            continue
+        if opened:
+            fence = (opened.group(1)[0], len(opened.group(1)))
+            continue
+        found = TOUCHES_LABEL_RE.match(line)
+        if not found:
+            continue
+        indent, bullet, inline = len(found.group(1).expandtabs(4)), found.group(2), found.group(3).replace("**", "").strip()
+        entries: list[str] = []
+        if inline:
+            entries = [inline] if TOUCHES_NONE_RE.match(inline) else [e.strip(" `") for e in re.split(r"[;,]", inline) if e.strip(" `")]
+        for follow in lines[i + 1:]:
+            sub = TOUCHES_BULLET_RE.match(follow.rstrip("\r"))
+            if not sub:
+                break
+            depth = len(sub.group(1).expandtabs(4))
+            if bullet is not None and depth <= indent:
+                break
+            entries.append(sub.group(2).replace("**", "").strip(" `"))
+        return entries
+    return None
+
+
+def screen_ruling_candidate(item: dict) -> None:
+    """Refuse a ruling candidate without a non-empty `touches/supersedes:` list. Each entry is a rule id (or any
+    non-empty name of a standing rule or candidate), or the single entry `none: <reason>` with a reason of at
+    least NONE_REASON_MIN_WORDS words, the same floor a `Doctrine-Export: none` disposition carries."""
+    if not is_ruling_candidate(item):
+        return
+    entries = touches_supersedes_entries(item["body"])
+    if not entries:
+        raise Refusal("RULING_CANDIDATE_NO_SUPERSEDES",
+                      "a ruling candidate needs a non-empty `touches/supersedes:` list (rule ids it touches or supersedes, "
+                      "or `none: <reason>`)")
+    nones = [e for e in entries if TOUCHES_NONE_RE.match(e)]
+    if not nones:
+        return
+    if len(entries) > 1:
+        raise Refusal("RULING_CANDIDATE_NONE_WITH_RULES", "`none` cannot sit beside rule ids in `touches/supersedes:`")
+    reason = TOUCHES_NONE_RE.match(nones[0]).group(1)
+    if len(reason.split()) < NONE_REASON_MIN_WORDS:
+        raise Refusal("RULING_CANDIDATE_NONE_NEEDS_REASON",
+                      f"`none` in `touches/supersedes:` needs a reason of at least {NONE_REASON_MIN_WORDS} words")
+
+
+# ---------- card routes: run every command an item names (validate --exercise) ----------
+#
+# CoS work order FWO-DEFECT-PREVENT-1 item 3 (ruling candidate `steward-handoff-card-route-is-live-and-exercised-r1`):
+# a card that names a command nobody ran ships a route that does not exist (#468 adoption steps; #469 `doctrine-sync debt`).
+#
+# WHAT COUNTS AS A ROUTE COMMAND (the extraction rule, applied to the item body):
+#   1. Every non-blank line of a fenced block whose info string starts with `route` (```route or ~~~route), except a
+#      line that starts with `#`; a leading `$ ` or `> ` is dropped.
+#   2. Every backticked span with two or more words inside a ROUTE SECTION. A section opens at a line whose label is
+#      `Route:` or `Adopt:` (bullet and bold allowed, any case) and runs to the next blank line, `#` heading or fence.
+#      Adjacent bullets belong to the section, so a `Pin:` bullet right under `Adopt:` is exercised too.
+#   A one-word span (`debt`, `RULINGS.md`) is a name, not a command. Spans outside a section are prose and are not run.
+# Commands are POSIX-quoted (shlex) and run WITHOUT a shell, one per line, in a scratch clone of the bus.
+# `<name>` placeholders are filled from --fill name=VALUE; one left unfilled is ROUTE_FAILED.
+#
+# OUTCOMES, one line each: `ROUTE_OK|ROUTE_MISSING|ROUTE_FAILED|ROUTE_TIMEOUT|ROUTE_UNSAFE <item> <command>`.
+#   MISSING  the program is not on PATH or in the scratch clone, or a python/node/bash/sh/pwsh script it names is not
+#            in the scratch clone (`python factory-pins/pin-runner.py` when the bus lacks that file).
+#   FAILED   it ran and exited non-zero, or a placeholder was left unfilled, or the line does not parse.
+#   TIMEOUT  it ran past --timeout seconds and was killed.
+#   UNSAFE   it was NOT run: a route must be exercisable offline and without credentials. Refused: a shell operator
+#            (pipe, `&&`, `;`, redirect); `git push`/`send-pack`/`credential`; any `gh`; claude/codex `auth|login|logout`; a
+#            network client (curl, wget, ssh, scp, ...); a publish/push/upload verb on a package tool; a URL or
+#            `user@host:` remote in any argument; a credential name or `--token`/`--password`; inline code
+#            (`python -c`, `node -e`, `pwsh -Command`).
+# Any outcome but OK fails the run (exit 1). The commands run in `git clone --local --no-hardlinks` of --bus
+# (default $FACTORY_BUS_CLONE) with `origin` removed, under a scratch directory this tool creates and removes by name.
+# --bus is only READ, by that clone; no route runs in it. The scratch root may not be inside it (exit 2).
+
+ROUTE_LABEL_RE = re.compile(r"^[ \t]*(?:[-*][ \t]+)?(?:\*\*)?(?:route|adopt)(?:\*\*)?[ \t]*:(?:\*\*)?", re.I)
+ROUTE_FENCE_INFO_RE = re.compile(r"^route\b", re.I)
+ROUTE_SPAN_RE = re.compile(r"`([^`\n]+)`")
+ROUTE_HEADING_RE = re.compile(r"^ {0,3}#{1,6}\s")
+ROUTE_PLACEHOLDER_RE = re.compile(r"<([A-Za-z][\w.-]*)>")
+ROUTE_PROMPT_RE = re.compile(r"^[$>]\s+")
+ROUTE_SHELL_OPERATOR_RE = re.compile(r"^(?:&&|\|\||\||;|&|[0-9]?[<>]+.*)$")
+ROUTE_URL_RE = re.compile(r"^(?:[a-z][a-z0-9+.-]*://|[\w.-]+@[\w.-]+:)", re.I)
+ROUTE_CREDENTIAL_RE = re.compile(r"(?:ANTHROPIC_|CLAUDE_CODE_OAUTH|GITHUB_TOKEN|GH_TOKEN|API_KEY|AUTH_TOKEN|--token|--password)", re.I)
+ROUTE_NETWORK_CLIENTS = frozenset({"curl", "wget", "ssh", "scp", "sftp", "ftp", "rsync", "nc", "ncat", "telnet",
+                                   "invoke-webrequest", "iwr", "invoke-restmethod", "irm"})
+ROUTE_PUBLISH_TOOLS = frozenset({"npm", "pnpm", "yarn", "twine", "docker", "cargo", "gem", "dotnet", "nuget", "pip"})
+ROUTE_PUBLISH_VERBS = frozenset({"publish", "push", "upload"})
+ROUTE_GIT_WRITES = frozenset({"push", "send-pack", "credential", "credential-store", "credential-cache"})
+ROUTE_INLINE_CODE_FLAGS = {"python": {"-c"}, "node": {"-e", "--eval", "-p", "--print"}, "bash": {"-c"}, "sh": {"-c"},
+                           "pwsh": {"-command", "-c", "-encodedcommand"}, "powershell": {"-command", "-c", "-encodedcommand"}}
+ROUTE_SCRIPT_LAUNCHERS = frozenset({"python", "py", "node", "bash", "sh"})
+ROUTE_PYTHON_NAMES = frozenset({"python", "python3"})
+ROUTE_STRIPPED_ENV_RE = re.compile(r"(?:TOKEN|SECRET|PASSWORD|API_?KEY|CREDENTIAL)|^(?:ANTHROPIC_|CLAUDE_CODE_|GH_|GITHUB_)", re.I)
+ROUTE_SCRATCH_PREFIX = "outbox-exercise-"
+ROUTE_DEFAULT_TIMEOUT_S = 60.0
+ROUTE_BUS_ENV = "FACTORY_BUS_CLONE"
+ROUTE_STATUSES = ("ROUTE_OK", "ROUTE_MISSING", "ROUTE_FAILED", "ROUTE_TIMEOUT", "ROUTE_UNSAFE")
+
+
+def extract_routes(body: str) -> list[str]:
+    """The route commands an item body names, in order and without repeats; the rule is the block comment above."""
+    routes: list[str] = []
+    fence: tuple[str, int, bool] | None = None
+    in_section = False
+
+    def add(command: str) -> None:
+        if command and command not in routes:
+            routes.append(command)
+
+    for raw in body.splitlines():
+        line = raw.rstrip("\r")
+        opened = _FENCE_OPEN_RE.match(line)
+        if fence is not None:
+            if opened and opened.group(1)[0] == fence[0] and len(opened.group(1)) >= fence[1] and not line.strip(" `~"):
+                fence = None
+            elif fence[2]:
+                command = ROUTE_PROMPT_RE.sub("", line.strip())
+                if command and not command.startswith("#"):
+                    add(command)
+            continue
+        if opened:
+            info = line.strip()[len(opened.group(1)):].strip()
+            fence = (opened.group(1)[0], len(opened.group(1)), bool(ROUTE_FENCE_INFO_RE.match(info)))
+            in_section = False
+            continue
+        if not line.strip() or ROUTE_HEADING_RE.match(line):
+            in_section = False
+            continue
+        if ROUTE_LABEL_RE.match(line):
+            in_section = True
+        if in_section:
+            for span in ROUTE_SPAN_RE.findall(line):
+                command = ROUTE_PROMPT_RE.sub("", span.strip())
+                if len(command.split()) >= 2:
+                    add(command)
+    return routes
+
+
+def route_unsafe_reason(argv: list[str]) -> str | None:
+    """Why a parsed route must not be run, or None. See the block comment above for the list."""
+    if not argv:
+        return "empty command"
+    name = pathlib.PurePath(argv[0]).name.lower()
+    name = re.sub(r"\.(?:exe|cmd|bat|ps1)$", "", name)
+    if name in ROUTE_PYTHON_NAMES:
+        name = "python"
+    for tok in argv:
+        if ROUTE_SHELL_OPERATOR_RE.match(tok):
+            return f"shell operator {tok!r}: a route is one command, no shell"
+        if ROUTE_URL_RE.match(tok) or ROUTE_URL_RE.match(tok.split("=", 1)[-1]):
+            return f"network target {tok!r}: a route must run offline"
+        if ROUTE_CREDENTIAL_RE.search(tok):
+            return f"credential {tok!r}: a route touches no credential"
+    rest = [t.lower() for t in argv[1:]]
+    if name in ROUTE_NETWORK_CLIENTS:
+        return f"{name} is a network client"
+    if name == "gh":
+        return "gh talks to GitHub"
+    if name in ("claude", "codex") and any(t in ("auth", "login", "logout") for t in rest):
+        return f"{name} auth is never run by a route"
+    if name == "git":
+        sub = None
+        skip = 0
+        for t in argv[1:]:
+            if skip:
+                skip -= 1
+            elif t in ("-C", "-c", "--git-dir", "--work-tree"):
+                skip = 1
+            elif not t.startswith("-"):
+                sub = t
+                break
+        if sub in ROUTE_GIT_WRITES:
+            return f"git {sub} would publish"
+    if name in ROUTE_PUBLISH_TOOLS and any(t in ROUTE_PUBLISH_VERBS for t in rest):
+        return f"{name} {next(t for t in rest if t in ROUTE_PUBLISH_VERBS)} would publish"
+    if any(t in ROUTE_INLINE_CODE_FLAGS.get(name, ()) for t in rest):
+        return "inline code is not a route"
+    return None
+
+
+def route_missing_reason(argv: list[str], cwd: pathlib.Path) -> str | None:
+    """Why a parsed route cannot start: its program is not on PATH or in the scratch clone, or the script a
+    launcher names is not in the clone. None when it can be started."""
+    program = argv[0]
+    name = re.sub(r"\.exe$", "", pathlib.PurePath(program).name.lower())
+    if name not in ROUTE_PYTHON_NAMES:
+        local = (cwd / program) if ("/" in program or "\\" in program) else None
+        if shutil.which(program, path=os.environ.get("PATH")) is None and not (local is not None and local.is_file()):
+            return f"{program}: no such program on PATH or in the scratch clone"
+    script: str | None = None
+    if name in ROUTE_SCRIPT_LAUNCHERS:
+        script = next((t for t in argv[1:] if not t.startswith("-")), None)
+        if name in ROUTE_PYTHON_NAMES | {"py"} and any(t == "-m" for t in argv[1:]):
+            script = None
+    elif name in ("pwsh", "powershell"):
+        lowered = [t.lower() for t in argv[1:]]
+        if "-file" in lowered and lowered.index("-file") + 1 < len(lowered):
+            script = argv[1:][lowered.index("-file") + 1]
+    if script is not None and not (cwd / script).is_file():
+        return f"{script}: no such script in the scratch clone"
+    return None
+
+
+def exercise_route(command: str, cwd: pathlib.Path, timeout: float, fills: dict[str, str]) -> tuple[str, str]:
+    """Run one route command in `cwd`; return (ROUTE_* status, detail). Never raises for a route's own failure."""
+    try:
+        argv = shlex.split(command)
+    except ValueError as e:
+        return "ROUTE_FAILED", f"does not parse as a POSIX command line: {e}"
+    # Fill after splitting, so a filled value (a Windows path with backslashes) is never re-parsed as shell text.
+    argv = [ROUTE_PLACEHOLDER_RE.sub(lambda m: fills.get(m.group(1), m.group(0)), tok) for tok in argv]
+    unfilled = next((m for tok in argv if (m := ROUTE_PLACEHOLDER_RE.search(tok))), None)
+    if unfilled:
+        return "ROUTE_FAILED", f"unfilled placeholder <{unfilled.group(1)}>; pass --fill {unfilled.group(1)}=VALUE"
+    unsafe = route_unsafe_reason(argv)
+    if unsafe:
+        return "ROUTE_UNSAFE", unsafe
+    missing = route_missing_reason(argv, cwd)
+    if missing:
+        return "ROUTE_MISSING", missing
+    if pathlib.PurePath(argv[0]).name.lower() in ROUTE_PYTHON_NAMES:
+        argv[0] = sys.executable
+    env = {k: v for k, v in os.environ.items() if not ROUTE_STRIPPED_ENV_RE.search(k)}
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    try:
+        proc = subprocess.run(argv, cwd=str(cwd), capture_output=True, text=True, encoding="utf-8", errors="replace",
+                              timeout=timeout, env=env, stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        return "ROUTE_TIMEOUT", f"still running after {timeout:g}s"
+    except FileNotFoundError as e:
+        return "ROUTE_MISSING", str(e)
+    except OSError as e:
+        return "ROUTE_FAILED", f"could not start: {e}"
+    if proc.returncode != 0:
+        tail = (proc.stderr.strip() or proc.stdout.strip()).splitlines()[-1:] or [""]
+        return "ROUTE_FAILED", f"exit {proc.returncode}: {tail[0][:200]}"
+    return "ROUTE_OK", ""
+
+
+def _writable_retry(func, path, _exc) -> None:
+    """rmtree error hook: git object files are read-only on Windows; make the entry writable and retry once."""
+    os.chmod(path, stat.S_IWRITE)
+    func(path)
+
+
+def remove_exercise_scratch(base: pathlib.Path, scratch_root: pathlib.Path) -> None:
+    """Remove the scratch directory THIS run made, by name: it must sit directly under `scratch_root`, carry the
+    run's prefix and be a real directory (not a link). Anything else is left alone."""
+    if (base.parent.resolve() != scratch_root.resolve() or not base.name.startswith(ROUTE_SCRATCH_PREFIX)
+            or base.is_symlink() or not base.is_dir()):
+        return
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(base, onexc=_writable_retry)
+    else:
+        shutil.rmtree(base, onerror=lambda f, p, e: _writable_retry(f, p, e))
+
+
+def make_exercise_scratch(bus: pathlib.Path, scratch_root: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path, str]:
+    """A scratch clone of the bus's committed tip: (scratch dir, clone, tip sha). The bus is read, never written,
+    and the scratch root may not be inside it. `origin` is removed so nothing in the clone can push back."""
+    if not (bus / ".git").exists() and not (bus / "HEAD").is_file():
+        raise Unknown("EXERCISE_BUS_NOT_A_REPO", f"{bus} is not a git repository")
+    resolved_root, resolved_bus = scratch_root.resolve(), bus.resolve()
+    if resolved_root == resolved_bus or resolved_root.is_relative_to(resolved_bus):
+        raise Unknown("EXERCISE_SCRATCH_INSIDE_BUS", f"scratch root {scratch_root} is inside the bus {bus}; routes never run in the live bus")
+    scratch_root.mkdir(parents=True, exist_ok=True)
+    base = pathlib.Path(tempfile.mkdtemp(prefix=ROUTE_SCRATCH_PREFIX, dir=str(scratch_root)))
+    try:
+        clone = base / "bus"
+        proc = _run_git(base, ["clone", "--local", "--no-hardlinks", "-q", str(bus), str(clone)])
+        if proc.returncode != 0:
+            raise Unknown("EXERCISE_CLONE_FAILED", proc.stderr.strip()[:300])
+        git(clone, "remote", "remove", "origin")
+        return base, clone, git(clone, "rev-parse", "HEAD")
+    except BaseException:
+        remove_exercise_scratch(base, scratch_root)
+        raise
+
+
+def run_exercise(entries: list[tuple[str, dict]], bus: pathlib.Path | None, timeout: float,
+                 fills: dict[str, str], scratch_root: pathlib.Path | None) -> int:
+    """Exercise the routes of already-validated items (name, item); 0 when every route is ROUTE_OK."""
+    plan = [(name, command) for name, item in entries for command in extract_routes(item["body"])]
+    for name, item in entries:
+        if not extract_routes(item["body"]):
+            print(f"ROUTE_NONE {name} (names no route command)")
+    if not plan:
+        return 0
+    if bus is None:
+        env_bus = os.environ.get(ROUTE_BUS_ENV)
+        if not env_bus:
+            raise Unknown("EXERCISE_BUS_UNSET", f"pass --bus <bus clone> or set ${ROUTE_BUS_ENV}")
+        bus = pathlib.Path(env_bus)
+    root = scratch_root if scratch_root is not None else pathlib.Path(tempfile.gettempdir())
+    base, clone, tip = make_exercise_scratch(bus.resolve(), root)
+    ok = True
+    try:
+        print(f"ROUTE_BUS {tip[:12]} (scratch clone of {bus.name}; commands run there, never in the bus)")
+        for name, command in plan:
+            status, detail = exercise_route(command, clone, timeout, fills)
+            print(f"{status} {name} {command}")
+            if status != "ROUTE_OK":
+                ok = False
+                print(f"  {detail}", file=sys.stderr)
+    finally:
+        remove_exercise_scratch(base, root)
+    return 0 if ok else 1
+
+
 # ---------- CLI commands ----------
 
-def cmd_validate(paths: list[pathlib.Path], deny_terms: list[tuple[str, str]]) -> int:
+def cmd_validate(paths: list[pathlib.Path], deny_terms: list[tuple[str, str]],
+                 exercise: dict | None = None) -> int:
+    """Validate item files; with `exercise` (bus, timeout, fills, scratch_root) also run each valid item's routes."""
     ok = True
+    valid: list[tuple[str, dict]] = []
     concern_ids: dict[str, pathlib.Path] = {}
     for p in paths:
         try:
@@ -2348,6 +2709,7 @@ def cmd_validate(paths: list[pathlib.Path], deny_terms: list[tuple[str, str]]) -
             item = parse_item(text)
             screen_law4(item["body"], deny_terms)
             screen_rendered_card(item)
+            screen_ruling_candidate(item)
             if "concern" in item:
                 cid = item["concern"]["id"]
                 if cid in concern_ids:
@@ -2358,6 +2720,10 @@ def cmd_validate(paths: list[pathlib.Path], deny_terms: list[tuple[str, str]]) -
             ok = False
             continue
         print(f"[doctrine-outbox] OK {p}: target={item['meta']['target']} kind={item['meta']['kind']}")
+        valid.append((p.name, item))
+    if exercise is not None:
+        if run_exercise(valid, **exercise) != 0:
+            ok = False
     return 0 if ok else 1
 
 
@@ -2393,6 +2759,16 @@ def build_parser() -> argparse.ArgumentParser:
     validate_p = sub.add_parser("validate", help="parse + screen one or more item files")
     validate_p.add_argument("items", nargs="+", type=pathlib.Path)
     validate_p.add_argument("--deny-file", type=pathlib.Path, default=None)
+    validate_p.add_argument("--exercise", action="store_true",
+                            help="also run every command each item names (see 'card routes') in a scratch clone of the bus")
+    validate_p.add_argument("--bus", type=pathlib.Path, default=None,
+                            help=f"with --exercise: the bus clone to copy (default ${ROUTE_BUS_ENV}); read, never run in")
+    validate_p.add_argument("--timeout", type=float, default=ROUTE_DEFAULT_TIMEOUT_S,
+                            help="with --exercise: seconds before a route is ROUTE_TIMEOUT (default %(default)s)")
+    validate_p.add_argument("--fill", action="append", default=[], metavar="NAME=VALUE",
+                            help="with --exercise: the value for a <NAME> placeholder in a route (repeatable)")
+    validate_p.add_argument("--scratch-root", type=pathlib.Path, default=None,
+                            help="with --exercise: where the scratch clone is made and removed (default: the temp dir)")
 
     debt_p = sub.add_parser("debt", help="list unsent items; exit 1 if any, 2 if UNKNOWN")
     debt_p.add_argument("--ref", default=DEFAULT_REF)
@@ -2490,7 +2866,18 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.cmd == "validate":
             deny_terms = gather_deny_terms(resolve_deny_file(repo, args.deny_file))
-            return cmd_validate(args.items, deny_terms)
+            exercise = None
+            if args.exercise:
+                fills: dict[str, str] = {}
+                for pair in args.fill:
+                    name, sep, value = pair.partition("=")
+                    if not sep or not name:
+                        parser.error(f"--fill wants NAME=VALUE, got {pair!r}")
+                    fills[name] = value
+                exercise = {"bus": args.bus, "timeout": args.timeout, "fills": fills, "scratch_root": args.scratch_root}
+            elif args.bus is not None or args.fill or args.scratch_root is not None:
+                parser.error("--bus, --fill and --scratch-root need --exercise")
+            return cmd_validate(args.items, deny_terms, exercise)
         if args.cmd == "debt":
             ledger = resolve_ledger(repo, args.ledger)
             bus = args.bus.resolve() if args.bus is not None else None
