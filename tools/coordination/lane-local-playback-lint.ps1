@@ -427,14 +427,21 @@ function ConvertTo-LintAlternation {
 # r14b (culture fail-open, sol r12d): a case-insensitive Regex fixes its case table when it is CONSTRUCTED, from the thread's CurrentCulture
 # (tr-TR: I matches only the dotless i, so "ON THIS HOST" no longer matches "this host"). The static calls built it under the culture of each
 # call; a cached one kept the culture of the call that warmed it, so a process warmed under tr-TR allowed under en-US what dc124533 refused.
-# New-LintRegex builds EVERY cached Regex under en-US, the culture dc124533 was verified under, and restores the caller's culture, so the
-# result depends on neither the warm-time nor the call-time culture. RegexOptions.CultureInvariant is NOT used: it folds U+0130 differently
-# from en-US (dc124533 under en-US refuses a dotted capital I in the host phrase, invariant does not), which would let a row through.
+# r14c measured both halves (CultureIndependenceTests): the table is read at CONSTRUCTION only (a Regex built under en-US matches the same under
+# tr-TR, and the reverse), and every culture but tr / az folds like en-US. New-LintRegex therefore builds EVERY cached Regex under en-US,
+# the behaviour dc124533 had under every non-Turkish culture, and restores the caller's culture, so the result depends on neither the
+# warm-time nor the call-time culture. RegexOptions.CultureInvariant is NOT used: it folds U+0130 differently from en-US (dc124533 under
+# en-US refuses a dotted capital I in the host phrase, invariant does not), which would let a row through. A runtime without en-US data
+# (invariant-globalization mode) has no Turkish table either, so the pattern is then built under the culture it already has.
+# The other case-folding the lint does (-match, -ieq, -contains, -split, -replace) is PowerShell's own culture-invariant comparison, and its
+# only sorts are by length and index, so a Regex built here is the one culture-dependent object (CultureIndependenceTests pins that too).
+$script:LintBuildCulture = try { [System.Globalization.CultureInfo]::GetCultureInfo('en-US') } catch { $null }
 function New-LintRegex {
     param([string]$Pattern)
+    if ($null -eq $script:LintBuildCulture) { return [regex]::new($Pattern) }
     $saved = [System.Globalization.CultureInfo]::CurrentCulture
     try {
-        [System.Globalization.CultureInfo]::CurrentCulture = [System.Globalization.CultureInfo]::GetCultureInfo('en-US')
+        [System.Globalization.CultureInfo]::CurrentCulture = $script:LintBuildCulture
         return [regex]::new($Pattern)
     }
     finally { [System.Globalization.CultureInfo]::CurrentCulture = $saved }

@@ -1886,6 +1886,60 @@ def _quote_class_problems(lint: Path, claims: dict, work: Path, tag: str) -> lis
     return problems
 
 
+# r14c (NA2-RULE4-PER-LAUNCHER-SCOPE-1, sol r12d on PR #465): the r11 regex cache built a case-insensitive Regex once, under the culture of whatever
+# call warmed it, and .NET fixes a Regex's case table at CONSTRUCTION. A process warmed under tr-TR then ALLOWED under en-US the sentences dc124533
+# (which built the pattern under each call's own culture) refused. These helpers run the lint through a sequence of cultures in ONE process.
+def _culture_sequence_counts(lint: Path, texts: list[str], sequence: tuple[str, ...], work: Path, tag: str) -> list[list[int]]:
+    """Finding counts of every text, one list per culture in `sequence`; ONE pwsh dot-sources `lint` and visits the cultures in order, so the
+    regexes the first culture built are the ones every later culture uses. 'invariant' is the invariant culture."""
+    src = work / f"{tag}-in.json"
+    src.write_text(json.dumps(texts), encoding="utf-8")
+    probe = work / f"{tag}-probe.ps1"
+    _write_probe(
+        probe,
+        ". " + _psq(lint) + "\n"
+        "$texts = @(ConvertFrom-Json -InputObject ([System.IO.File]::ReadAllText(" + _psq(src) + ", [System.Text.Encoding]::UTF8)))\n"
+        "$steps = New-Object System.Collections.Generic.List[string]\n"
+        "foreach ($name in @(" + ", ".join(_psq(c) for c in sequence) + ")) {\n"
+        "    if ($name -eq 'invariant') { [System.Globalization.CultureInfo]::CurrentCulture = [System.Globalization.CultureInfo]::InvariantCulture }\n"
+        "    else { [System.Globalization.CultureInfo]::CurrentCulture = [System.Globalization.CultureInfo]::GetCultureInfo($name) }\n"
+        "    $row = New-Object System.Collections.Generic.List[int]\n"
+        "    foreach ($t in $texts) { $row.Add(@(Get-LocalPlaybackPromptFindings -Text ([string]$t)).Count) }\n"
+        "    $steps.Add('[' + ($row.ToArray() -join ',') + ']')\n"
+        "}\n"
+        "'[' + ($steps.ToArray() -join ',') + ']'\n",
+    )
+    done = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(probe)], capture_output=True, text=True, encoding="utf-8", timeout=600)
+    if done.returncode != 0 or not done.stdout.strip():
+        raise AssertionError(f"the culture-sequence probe failed: {(done.stderr or done.stdout).strip()[:300]}")
+    steps = json.loads(done.stdout.strip())
+    return [[int(n) for n in step] for step in steps]
+
+
+# What may build a Regex in the lint: New-LintRegex and nothing else. A static [regex]::Match / IsMatch goes through .NET's shared cache under
+# the CURRENT culture, `New-Object ...Regex` and a [regex] cast construct one under it, so each would bring the culture dependence back.
+_REGEX_BUILD = re.compile(r"\[regex\]::(?:new|match|matches|ismatch|replace|split)\b|New-Object\s+(?:System\.Text\.RegularExpressions\.)?Regex\b"
+                          r"|\[regex\]\s*['\"(]|=\s*\[regex\]|-as\s+\[regex\]|\bRegexOptions\b", re.IGNORECASE)  # a `[regex]$Grammar` PARAMETER takes an object already built
+
+
+def _regex_construction_problems(text: str) -> list[str]:
+    """Every way `text` (the lint source) builds a Regex outside New-LintRegex, or builds it there without the en-US culture."""
+    start = text.find("function New-LintRegex")
+    if start < 0:
+        return ["no function New-LintRegex: the cached Regex objects are built under whatever culture warms them"]
+    end = text.index("\n}\n", start) + 3
+    problems = []
+    if "GetCultureInfo('en-US')" not in text:
+        problems.append("the lint never resolves the en-US culture New-LintRegex builds under")
+    body = text[start:end]
+    if "CurrentCulture = $script:LintBuildCulture" not in body or "finally" not in body:
+        problems.append("New-LintRegex does not set the build culture and restore the caller's in a finally block")
+    outside = text[:start] + text[end:]
+    problems += [f"a Regex is built outside New-LintRegex: {ln.strip()[:100]}" for ln in outside.splitlines()
+                 if not ln.lstrip().startswith("#") and _REGEX_BUILD.search(ln)]
+    return problems
+
+
 class HubHostsFileTests(unittest.TestCase):
     def test_file_names_the_hub_and_no_venue(self):
         cfg = _config()
@@ -3830,6 +3884,117 @@ class LintDifferentialPinTests(unittest.TestCase):
         self.assertEqual([], _pin_problems([], [], self.ALLOWED_REFUSE_TO_PASS, self.ALLOWED_PASS_TO_REFUSE),
                          "allow-list entries are a ceiling, never a required set")
         self.assertTrue(_pin_problems([], [], (("no-reason", lambda t, f: True, " "),), ()))
+
+
+@requires_pwsh
+class CultureIndependenceTests(unittest.TestCase):
+    """r14c (sol r12d, CHANGES_REQUESTED on PR #465 r11/r12). The lint's verdict must not depend on the culture a process warmed its cached
+    Regex objects under, nor on the culture it is called under. tr-TR is the case: its (?i) table pairs I with the dotless i, so a pattern built
+    there does not match "ON THIS HOST". dc124533 built every pattern under the culture of the call itself; r11 built each once per process, so a
+    process warmed under tr-TR allowed under en-US what dc124533 refused (and the reverse order refused a venue-routed sentence dc124533 allowed).
+    The reference for every row is the lint run alone under en-US, the behaviour dc124533 has under every culture but tr / az."""
+
+    DOTTED = chr(0x130)
+    DOTLESS = chr(0x131)
+    REFUSE = (
+        "Run playback ON THIS HOST.", "RUN PLAYBACK ON THIS HOST.", "Run playback on this host.", "Run playback ON THIS HUB.",
+        "Run playback ON THIS MACHINE.", "Run playback ON THIS BOX.", "Run playback ON VIRTUAL-TEN.", "Run playback LOCALLY.",
+        "Run the GUI smoke HERE.", "Run playback ON TH" + DOTTED + "S HOST.", "Run playback on th" + DOTTED + "s host.",
+    )
+    PASS = ("Run playback LOCALLY ON BACHELOR THROUGH THE VENUE CHAIN.",)
+    # a wording that sits on the edge of the Turkish case table: only parity with the en-US run is asserted, not a verdict
+    PARITY = ("Run playback on th" + DOTLESS + "s host.", "Run playback ON THE VM.", "Run playback ON THE HOST, not on Bachelor.")
+    SEQUENCES = (
+        ("tr-TR", "en-US"), ("en-US", "tr-TR"), ("az-Latn-AZ", "en-US"), ("tr-TR", "az-Latn-AZ", "en-US", "invariant"),
+        ("invariant", "en-US", "az-Latn-AZ", "tr-TR"), ("en-US", "invariant", "tr-TR", "en-US", "az-Latn-AZ"),
+    )
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = Path(tempfile.mkdtemp(prefix="hubvm-culture-"))
+        cls.rows = list(cls.REFUSE + cls.PASS + cls.PARITY)
+        cls.reference = _culture_sequence_counts(LINT_PS1, cls.rows, ("en-US",), cls.tmp, "ref")[0]
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def test_the_en_us_reference_refuses_and_passes_the_listed_rows(self):
+        verdicts = dict(zip(self.rows, self.reference))
+        for text in self.REFUSE:
+            self.assertGreater(verdicts[text], 0, f"{text!r} is not refused under en-US")
+        for text in self.PASS:
+            self.assertEqual(0, verdicts[text], f"{text!r} is refused under en-US")
+
+    def test_a_process_warmed_under_turkish_still_refuses_under_english(self):
+        """The sol r12d repro: warm under tr-TR, switch to en-US, lint "Run playback ON THIS HOST." -> must stay refused."""
+        steps = _culture_sequence_counts(LINT_PS1, self.rows, ("tr-TR", "en-US"), self.tmp, "tr-en")
+        for culture, counts in zip(("tr-TR", "en-US"), steps):
+            verdicts = dict(zip(self.rows, counts))
+            for text in self.REFUSE:
+                self.assertGreater(verdicts[text], 0, f"warmed under tr-TR, called under {culture}: {text!r} is allowed")
+
+    def test_a_process_warmed_under_english_still_refuses_under_turkish_and_still_passes_the_routed_sentence(self):
+        steps = _culture_sequence_counts(LINT_PS1, self.rows, ("en-US", "tr-TR"), self.tmp, "en-tr")
+        for culture, counts in zip(("en-US", "tr-TR"), steps):
+            verdicts = dict(zip(self.rows, counts))
+            for text in self.REFUSE:
+                self.assertGreater(verdicts[text], 0, f"warmed under en-US, called under {culture}: {text!r} is allowed")
+            for text in self.PASS:
+                self.assertEqual(0, verdicts[text], f"warmed under en-US, called under {culture}: {text!r} is refused")
+
+    def test_the_routed_sentence_passes_after_a_turkish_warm_up(self):
+        """The reverse direction of the fail-open: a Turkish-warmed cache REFUSED a venue-routed sentence dc124533 allows under en-US."""
+        steps = _culture_sequence_counts(LINT_PS1, list(self.PASS), ("tr-TR", "en-US", "tr-TR"), self.tmp, "routed")
+        for culture, counts in zip(("tr-TR", "en-US", "tr-TR"), steps):
+            self.assertEqual([0] * len(self.PASS), counts, f"{culture}: the venue-routed sentence is refused")
+
+    def test_every_order_of_cultures_in_one_process_gives_the_en_us_result_row_for_row(self):
+        for number, sequence in enumerate(self.SEQUENCES):
+            steps = _culture_sequence_counts(LINT_PS1, self.rows, sequence, self.tmp, f"seq{number}")
+            self.assertEqual(len(sequence), len(steps), sequence)
+            for culture, counts in zip(sequence, steps):
+                drift = [(t, want, got) for t, want, got in zip(self.rows, self.reference, counts) if want != got]
+                self.assertEqual([], drift, f"sequence {sequence}, called under {culture}: rows that differ from the en-US run (text, en-US, got)")
+
+    def test_a_regex_reads_its_case_table_at_construction_not_at_match(self):
+        """The premise of the fix, measured on the runtime that runs the lint: a pattern built under tr-TR misses an upper-case I whatever the
+        match-time culture is, and one built under en-US matches it whatever the match-time culture is. If .NET ever changes this, the fix's
+        reasoning (and New-LintRegex) must be revisited, so it fails here."""
+        probe = self.tmp / "premise-probe.ps1"
+        _write_probe(
+            probe,
+            "function Use-Culture([string]$n) { [System.Globalization.CultureInfo]::CurrentCulture = [System.Globalization.CultureInfo]::GetCultureInfo($n) }\n"
+            "$out = New-Object System.Collections.Generic.List[string]\n"
+            "foreach ($built in @('tr-TR', 'en-US')) {\n"
+            "    Use-Culture $built\n"
+            "    $rx = [regex]::new('(?i)this')\n"
+            "    foreach ($matched in @('en-US', 'tr-TR')) { Use-Culture $matched; $out.Add(\"$built|$matched|\" + [int]$rx.IsMatch('THIS')) }\n"
+            "}\n"
+            "$out\n",
+        )
+        done = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(probe)], capture_output=True, text=True, timeout=120)
+        self.assertEqual(0, done.returncode, done.stderr)
+        self.assertEqual(["tr-TR|en-US|0", "tr-TR|tr-TR|0", "en-US|en-US|1", "en-US|tr-TR|1"], done.stdout.split(), done.stdout)
+
+    def test_every_regex_is_built_by_new_lintregex_under_en_us(self):
+        self.assertEqual([], _regex_construction_problems(LINT_PS1.read_text(encoding="utf-8")))
+
+    def test_the_construction_pin_bites(self):
+        """Mutations of the lint source, each of which must be reported: a Regex built outside New-LintRegex (new, a static call, two casts, -as, New-Object), the
+        build culture dropped, the restore dropped, and the function removed."""
+        text = LINT_PS1.read_text(encoding="utf-8")
+        self.assertEqual([], _regex_construction_problems(text))
+        anchor = "    $rx = $script:LintRegexCache[$Pattern]\n"
+        self.assertIn(anchor, text)
+        for what, line in (("new", "    $dodge = [regex]::new('x')\n"), ("static", "    $dodge = [regex]::IsMatch('a', 'b')\n"),
+                           ("cast", "    $dodge = [regex]'x'\n"), ("cast-variable", "    $dodge = [regex]$Pattern\n"),
+                           ("as", "    $dodge = $Pattern -as [regex]\n"), ("object", "    $dodge = New-Object System.Text.RegularExpressions.Regex 'x'\n")):
+            self.assertTrue(_regex_construction_problems(text.replace(anchor, anchor + line, 1)), what)
+        self.assertTrue(_regex_construction_problems(text.replace("CurrentCulture = $script:LintBuildCulture", "CurrentCulture = $saved", 1)), "culture dropped")
+        self.assertTrue(_regex_construction_problems(text.replace("finally {", "catch {", 1)), "restore dropped")
+        self.assertTrue(_regex_construction_problems(text.replace("function New-LintRegex", "function New-OtherRegex", 1)), "function removed")
+        self.assertTrue(_regex_construction_problems(text.replace("GetCultureInfo('en-US')", "GetCultureInfo('tr-TR')")), "wrong culture")
 
 
 @requires_pwsh
