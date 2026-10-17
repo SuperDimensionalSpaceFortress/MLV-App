@@ -81,3 +81,23 @@ maintained in this format.
     `first_present_split` line adds `warm_run`, `set_clip_at_play` and
     `set_luts_at_play`, and a new `playback_smoke.render_first_split` line
     splits the first render into decode, llrawproc and the rest.
+- On the CUDA playback route, Play now wakes the GPU as it starts, so the first
+  frame's debayer does not run at idle GPU clocks
+  (PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1).
+  - When Play starts, and the AMaZE library is already loaded, MLV App runs
+    one small GPU task on a lowest-priority stream while the first frame is
+    decoded. It stops when that frame's debayer finishes, at the first shown
+    frame, or after 400 ms at most. Nothing runs while paused, and it never
+    keeps the GPU clocks up while idle. The CPU route never touches CUDA for
+    it.
+  - `MLVAPP_PLAYBACK_GPU_CLOCK_KICK` (default on, same values as
+    `MLVAPP_PLAYBACK_ROUTE_PREWARM`) turns it off.
+  - The paused warm, the route warm and the first four debayers of each Play
+    now read the GPU clock in-process (never through NVML) and time the
+    debayer on the GPU. The `playback_route_prewarm`, `playback_recon_warm`
+    and `first_present_split` lines add `amaze_sm_mhz_before`,
+    `amaze_sm_mhz_after` and `amaze_device_ms` (`NA` with an older AMaZE
+    library); `first_present_split` also adds `clock_kick`,
+    `clock_kick_reason` and `kick_lead_ms`. A new
+    `playback_smoke.amaze_first_frames` line lists the first four debayers,
+    and a `playback_gpu_clock_kick` line reports each Play's GPU task.

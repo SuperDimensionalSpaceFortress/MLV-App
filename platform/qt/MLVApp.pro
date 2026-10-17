@@ -389,6 +389,7 @@ HEADERS += MainWindow.h \
            PlaybackRouteStagedSlotPolicy.h \
            PlaybackReconWarmRunPolicy.h \
            PlaybackReconWarmRun.h \
+           PlaybackGpuClockKickPolicy.h \
            PlaybackAudioGate.h \
            PlaybackEnvFlags.h \
            PlaybackWorkerJoin.h \

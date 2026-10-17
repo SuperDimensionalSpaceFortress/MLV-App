@@ -11,6 +11,7 @@
 #include "PlaybackEnvFlags.h"
 #include "PlaybackRouteStagedSlotPolicy.h"
 #include "PlaybackScaling.h"
+#include "PlaybackStartupSplit.h"
 #include "PlaybackSwapInterval.h"
 #include "debug/StageTiming.h"
 #include "../../src/mlv_include.h"
@@ -564,9 +565,11 @@ bool GpuDisplayWindow::warmStagedReconSlotFromDeviceBayer16IfActive(const uint16
                                                                     const double wbMultipliers[3],
                                                                     bool reducedHnyquist,
                                                                     double *kernelMs,
-                                                                    QString *reason)
+                                                                    QString *reason,
+                                                                    GpuAmazeDebayerBackendTiming *amazeTiming)
 {
     if ( kernelMs ) *kernelMs = 0.0;
+    if ( amazeTiming ) *amazeTiming = GpuAmazeDebayerBackendTiming();
     GpuDisplayWindow *win = nullptr;
     {
         QMutexLocker lock(&g_activeMutex);
@@ -584,7 +587,7 @@ bool GpuDisplayWindow::warmStagedReconSlotFromDeviceBayer16IfActive(const uint16
     }
     // like the prewarm: GUI thread, no g_activeMutex (the window is only destroyed on this thread)
     return win->warmStagedReconSlotFromDeviceBayer16(deviceBayer16, width, height, blackLevel, wbMultipliers,
-                                                     reducedHnyquist, kernelMs, reason);
+                                                     reducedHnyquist, kernelMs, reason, amazeTiming);
 }
 
 /* PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1 Row W: the first recon present's AMaZE call (device Bayer16 -> RGBA16, the
@@ -598,7 +601,8 @@ bool GpuDisplayWindow::warmStagedReconSlotFromDeviceBayer16(const uint16_t *devi
                                                             const double wbMultipliers[3],
                                                             bool reducedHnyquist,
                                                             double *kernelMs,
-                                                            QString *reason)
+                                                            QString *reason,
+                                                            GpuAmazeDebayerBackendTiming *amazeTiming)
 {
     if ( !deviceBayer16 || width <= 0 || height <= 0 )
     {
@@ -632,6 +636,8 @@ bool GpuDisplayWindow::warmStagedReconSlotFromDeviceBayer16(const uint16_t *devi
     if ( needsCurrent ) makeCurrent();
     GpuAmazeDebayerBackendTiming timing;
     QString amazeReason;
+    // PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row 0: this AMaZE run is probed (SM MHz, device time)
+    gpuAmazeDebayerArmProbe(1);
     const bool amazeOk =
         gpuAmazeDebayerRenderPostWbGlTextureFromDeviceBayer16(deviceBayer16,
                                                               m_stagedReconOutput->textureId(),
@@ -643,8 +649,10 @@ bool GpuDisplayWindow::warmStagedReconSlotFromDeviceBayer16(const uint16_t *devi
                                                               nullptr,
                                                               &timing,
                                                               reducedHnyquist);
+    gpuAmazeDebayerArmProbe(0);
     if ( needsCurrent ) doneCurrent();
     if ( kernelMs && amazeOk && timing.available ) *kernelMs = timing.kernelMs;
+    if ( amazeTiming && amazeOk ) *amazeTiming = timing;
     if ( reason ) *reason = amazeReason;
     return amazeOk;
 }
@@ -714,6 +722,9 @@ bool GpuDisplayWindow::prewarmPlaybackReconRoute(int texWidth, int texHeight, QS
     const double amazeStartMs = nowMs();
     const double unityWb[3] = { 1.0, 1.0, 1.0 };
     QString amazeReason;
+    // PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row 0: this AMaZE run is probed (SM MHz, device time)
+    gpuAmazeDebayerArmProbe(1);
+    GpuAmazeDebayerBackendTiming amazeTiming;
     const bool amazeOk =
         gpuAmazeDebayerRenderPostWbGlTextureFromR16GlTexture(warmInput->textureId(),
                                                              warmOutput->textureId(),
@@ -721,7 +732,10 @@ bool GpuDisplayWindow::prewarmPlaybackReconRoute(int texWidth, int texHeight, QS
                                                              texHeight,
                                                              0,
                                                              unityWb,
-                                                             &amazeReason);
+                                                             &amazeReason,
+                                                             nullptr,
+                                                             &amazeTiming);
+    gpuAmazeDebayerArmProbe(0);
     const double amazeMs = nowMs() - amazeStartMs;
 
     const bool staged = amazeOk && playbackRoutePrewarmStageEnabled();
@@ -761,6 +775,10 @@ bool GpuDisplayWindow::prewarmPlaybackReconRoute(int texWidth, int texHeight, QS
             .arg(liveSlotHeld ? 1 : 0)
             .arg(staged ? 1 : 0)
             .arg(amazeReason);
+        // Row 0: appended, never .arg()-substituted (the reason above is free text)
+        *summary += playback_startup_split::amazeProbeFields(amazeTiming.probeAvailable, amazeTiming.probeValid,
+                                                             amazeTiming.smMhzBefore, amazeTiming.smMhzAfter,
+                                                             amazeTiming.deviceMs);
     }
     return amazeOk;
 }
@@ -847,6 +865,9 @@ GpuDisplayWindow::~GpuDisplayWindow()
         if ( g_activeWindow.load(std::memory_order_acquire) == this )
             g_activeWindow.store(nullptr, std::memory_order_release);
     }
+    // PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row K: a Play-start clock kick ends with the window it was
+    // started for (it holds no GL resource; this only raises its stop flag, with no CUDA call)
+    gpuAmazeDebayerClockKickEnd();
     // Tear down GL objects only while the context is valid (makeCurrent() is void on
     // QOpenGLWindow); anything missed here is reclaimed when the context is destroyed.
     if ( isValid() )

@@ -39,6 +39,7 @@
 #include <cstdint>
 
 class QGraphicsView;
+struct GpuAmazeDebayerBackendTiming;
 
 class GpuDisplayWindow : public QOpenGLWindow, protected QOpenGLFunctions
 {
@@ -105,6 +106,8 @@ public:
      * the first on the device path. Only when a staged pair exists at exactly width x height; never assigns m_texture
      * or m_gpuReconSourceTexture and never paints. GUI-thread only; the caller still owns (and releases) the token.
      * kernelMs gets the AMaZE kernel time when it ran; false with reason when it did not. */
+    /* PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row 0: the AMaZE run is probed; *amazeTiming (optional)
+     * receives its timing and probe. */
     static bool warmStagedReconSlotFromDeviceBayer16IfActive(const uint16_t *deviceBayer16,
                                                              int width,
                                                              int height,
@@ -112,7 +115,8 @@ public:
                                                              const double wbMultipliers[3],
                                                              bool reducedHnyquist,
                                                              double *kernelMs,
-                                                             QString *reason);
+                                                             QString *reason,
+                                                             GpuAmazeDebayerBackendTiming *amazeTiming = nullptr);
     static bool readGpuReconSourceBayer16TextureIfActive(QByteArray *textureBytes,
                                                         int *width,
                                                         int *height,
@@ -265,7 +269,8 @@ private:
                                               const double wbMultipliers[3],
                                               bool reducedHnyquist,
                                               double *kernelMs,
-                                              QString *reason);
+                                              QString *reason,
+                                              GpuAmazeDebayerBackendTiming *amazeTiming);
     void applySamplingMode(GpuDisplayViewport::SamplingMode samplingMode);
     /* Releases every context-bound processing resource (passthrough program, shared
      * preview-processing program, LUT texture set) so the next present rebuilds them

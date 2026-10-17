@@ -180,7 +180,10 @@ TEST(PlaybackFirstPresentSplit, TheLineCarriesEveryFieldInOrder)
                   "setup_program_ms=0.500 setup_lut_ms=1.250 setup_blur_ms=11.000 setup_realloc_ms=0.125 "
                   "setup_sampling_ms=0.250 recon_wall_ms=30.000 amaze_kernel_ms=12.500 amaze_download_ms=4.000 "
                   "paint_ms=9.000 gui_pickup_ms=40.000 backend_preloaded=1 warm_run=1 set_clip_at_play=0 "
-                  "set_luts_at_play=1"),
+                  "set_luts_at_play=1"
+                  // PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row 0: the probe and the kick ride at the end
+                  " amaze_sm_mhz_before=NA amaze_sm_mhz_after=NA amaze_device_ms=NA clock_kick=skip "
+                  "clock_kick_reason=none kick_lead_ms=NA"),
               fp.line(7).toStdString());
 }
 
@@ -191,7 +194,9 @@ TEST(PlaybackFirstPresentSplit, ANonWindowFirstPresentPrintsNoneAndZeros)
                   "playback_smoke.first_present_split session=2 slot=none handoff=none setup_program_ms=0.000 "
                   "setup_lut_ms=0.000 setup_blur_ms=0.000 setup_realloc_ms=0.000 setup_sampling_ms=0.000 "
                   "recon_wall_ms=0.000 amaze_kernel_ms=0.000 amaze_download_ms=0.000 paint_ms=0.000 "
-                  "gui_pickup_ms=0.000 backend_preloaded=0 warm_run=0 set_clip_at_play=0 set_luts_at_play=0"),
+                  "gui_pickup_ms=0.000 backend_preloaded=0 warm_run=0 set_clip_at_play=0 set_luts_at_play=0"
+                  " amaze_sm_mhz_before=NA amaze_sm_mhz_after=NA amaze_device_ms=NA clock_kick=skip "
+                  "clock_kick_reason=none kick_lead_ms=NA"),
               split.firstPresentLine(2).toStdString());
     // empty free text never leaves a field without a value
     playback_startup_split::FirstPresentSplit fp;
@@ -363,4 +368,136 @@ TEST(PlaybackRenderFirstSplitWiring, FedFromTheFirstPresentAndPrintedAfterTheFir
     ASSERT_TRUE(source.contains(QStringLiteral(
         "    m_playbackSmokeStartGpuSetClipCount = llrpGpuPlaybackReconSetClipCount();\n"
         "    m_playbackSmokeStartGpuSetLutsCount = llrpGpuPlaybackReconSetLutsCount();\n")));
+}
+
+// PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row 0: the first Play AMaZE's in-process probe (SM MHz before / after its
+// tile batch, the batch's device time) and the Play-start kick on first_present_split; the session's first four AMaZE
+// runs on playback_smoke.amaze_first_frames; the same probe fields on the prewarm and warm lines. NA whenever the DLL
+// lacks the probe symbol or the run was not probed.
+TEST(PlaybackAmazeProbeFields, KnownOnlyWithTheSymbolAndAValidProbe)
+{
+    using playback_startup_split::amazeProbeFields;
+    ASSERT_EQ(std::string(" amaze_sm_mhz_before=210.4 amaze_sm_mhz_after=1755.0 amaze_device_ms=131.250"),
+              amazeProbeFields(true, true, 210.42, 1755.0, 131.25).toStdString());
+    const std::string na(" amaze_sm_mhz_before=NA amaze_sm_mhz_after=NA amaze_device_ms=NA");
+    ASSERT_EQ(na, amazeProbeFields(false, true, 210.0, 1755.0, 131.25).toStdString());   // an older DLL
+    ASSERT_EQ(na, amazeProbeFields(true, false, 210.0, 1755.0, 131.25).toStdString());   // unprobed or failed
+}
+
+TEST(PlaybackAmazeProbeFields, TheFirstPresentSplitCarriesTheProbeAndTheKick)
+{
+    playback_startup_split::FirstPresentSplit fp;
+    fp.probeAvailable = true;
+    fp.probeValid = true;
+    fp.amazeSmMhzBefore = 1650.0;
+    fp.amazeSmMhzAfter = 1800.0;
+    fp.amazeDeviceMs = 17.5;
+    fp.clockKickRun = true;
+    fp.clockKickReason = QStringLiteral("none");
+    fp.kickLeadMs = 190.25;
+    const std::string text = fp.line(9).toStdString();
+    ASSERT_TRUE(text.find(" set_luts_at_play=0 amaze_sm_mhz_before=1650.0 amaze_sm_mhz_after=1800.0 "
+                          "amaze_device_ms=17.500 clock_kick=run clock_kick_reason=none kick_lead_ms=190.250")
+                != std::string::npos);
+    // the line ends with the kick lead
+    ASSERT_EQ(text.size() - std::string("kick_lead_ms=190.250").size(), text.rfind("kick_lead_ms=190.250"));
+    // a skipped kick names why; a probe the DLL cannot give is NA
+    fp.probeAvailable = false;
+    fp.clockKickRun = false;
+    fp.clockKickReason = QStringLiteral("cpu_route");
+    fp.kickLeadMs = -1.0;
+    ASSERT_TRUE(fp.line(9).contains(QStringLiteral(
+        " amaze_sm_mhz_before=NA amaze_sm_mhz_after=NA amaze_device_ms=NA clock_kick=skip clock_kick_reason=cpu_route "
+        "kick_lead_ms=NA")));
+    fp.clockKickReason.clear();
+    ASSERT_TRUE(fp.line(9).contains(QStringLiteral(" clock_kick_reason=none ")));
+}
+
+TEST(PlaybackAmazeFirstFrames, EachRunIsKernelDeviceMhzAndARunNotReachedIsNA)
+{
+    playback_startup_split::AmazeFirstFrames frames;
+    ASSERT_EQ(std::string("playback_smoke.amaze_first_frames session=4 f0=NA/NA/NA f1=NA/NA/NA f2=NA/NA/NA f3=NA/NA/NA"),
+              frames.line(4).toStdString());
+    frames.count = 3;
+    frames.probeAvailable = true;
+    frames.kernelMs[0] = 144.125;
+    frames.deviceMs[0] = 140.5;
+    frames.smMhzBefore[0] = 210.0;
+    frames.valid[0] = true;
+    frames.kernelMs[1] = 19.0;
+    frames.deviceMs[1] = 17.25;
+    frames.smMhzBefore[1] = 1755.0;
+    frames.valid[1] = true;
+    frames.kernelMs[2] = 18.5;   // a probe step failed on this run: its kernel_ms is still known
+    frames.valid[2] = false;
+    ASSERT_EQ(std::string("playback_smoke.amaze_first_frames session=5 f0=144.125/140.500/210.0 f1=19.000/17.250/1755.0 "
+                          "f2=18.500/NA/NA f3=NA/NA/NA"),
+              frames.line(5).toStdString());
+    // an older DLL: kernel_ms only
+    frames.probeAvailable = false;
+    ASSERT_TRUE(frames.line(5).contains(QStringLiteral(" f0=144.125/NA/NA f1=19.000/NA/NA ")));
+}
+
+TEST(PlaybackAmazeFirstFrames, ItIsResetWithTheSession)
+{
+    StartupSplit split;
+    playback_startup_split::AmazeFirstFrames frames;
+    frames.count = 1;
+    frames.kernelMs[0] = 20.0;
+    split.noteAmazeFirstFrames(frames);
+    ASSERT_EQ(1, split.amazeFirstFrames().count);
+    ASSERT_TRUE(split.amazeFirstFramesLine(2).contains(QStringLiteral(" f0=20.000/NA/NA ")));
+    split.reset();
+    ASSERT_EQ(0, split.amazeFirstFrames().count);
+    ASSERT_TRUE(split.amazeFirstFramesLine(2).contains(QStringLiteral(" f0=NA/NA/NA ")));
+}
+
+TEST(PlaybackAmazeProbeWiring, FedFromTheSessionRecordAndPrintedAfterTheRenderFirstLine)
+{
+    const QString source = mainWindowSource();
+    const int renderFirst = source.indexOf(QStringLiteral(
+        "qInfo().noquote() << m_playbackStartupSplit.renderFirstLine( static_cast<qulonglong>( m_playbackSmokeSessionId ) );"));
+    const int firstFrames = source.indexOf(QStringLiteral(
+        "qInfo().noquote() << m_playbackStartupSplit.amazeFirstFramesLine( static_cast<qulonglong>( m_playbackSmokeSessionId ) );"));
+    const int gpu = source.indexOf(QStringLiteral("\"playback_smoke.gpu_summary session=%1 cpu_frames=%2 \""));
+    ASSERT_TRUE(renderFirst >= 0);
+    ASSERT_TRUE(firstFrames > renderFirst);
+    ASSERT_TRUE(gpu > firstFrames);
+    const QString feedFrames = source.mid(renderFirst, firstFrames - renderFirst);
+    ASSERT_TRUE(feedFrames.contains(QStringLiteral("const GpuAmazeProbeSessionRecord record = gpuAmazeDebayerProbeSessionRecord();")));
+    ASSERT_TRUE(feedFrames.contains(QStringLiteral("m_playbackStartupSplit.noteAmazeFirstFrames( frames );")));
+    // first_present_split: frame 0 is the session record's first probed run, beside the kick decision
+    const QString finish = bodyBetween(source, QStringLiteral("void MainWindow::finishPresentedFrame( uint64_t displayFrame,"),
+                                       QStringLiteral("void MainWindow::drawFrameReady()"));
+    ASSERT_FALSE(finish.isEmpty());
+    const int splitFirst = finish.indexOf(QStringLiteral("    if( splitFirst )\n"));
+    const int record = finish.indexOf(QStringLiteral(
+        "const GpuAmazeProbeSessionRecord probeRecord = gpuAmazeDebayerProbeSessionRecord();"));
+    const int fed = finish.indexOf(QStringLiteral("m_playbackStartupSplit.noteFirstPresentSplit( fp );"));
+    ASSERT_TRUE(splitFirst >= 0);
+    ASSERT_TRUE(record > splitFirst);
+    ASSERT_TRUE(fed > record);
+    const QString feed = finish.mid(record, fed - record);
+    ASSERT_TRUE(feed.contains(QStringLiteral("fp.amazeSmMhzBefore = probeRecord.smMhzBefore[0];")));
+    ASSERT_TRUE(feed.contains(QStringLiteral("fp.amazeDeviceMs = probeRecord.deviceMs[0];")));
+    ASSERT_TRUE(feed.contains(QStringLiteral("fp.kickLeadMs = probeRecord.startSteadyMs[0] - m_playbackGpuClockKickBeginSteadyMs;")));
+    ASSERT_TRUE(feed.contains(QStringLiteral("fp.clockKickRun = m_playbackGpuClockKickDecision.run;")));
+    // the probe fields on the prewarm line (GpuDisplayWindow) and the warm line (MainWindow)
+    const QString windowPath = repo_file_path(QStringLiteral("platform/qt/GpuDisplayWindow.cpp"));
+    QFile windowFile(windowPath);
+    ASSERT_TRUE(windowFile.open(QIODevice::ReadOnly | QIODevice::Text));
+    const QString window = QTextStream(&windowFile).readAll();
+    const QString prewarm = bodyBetween(window, QStringLiteral("bool GpuDisplayWindow::prewarmPlaybackReconRoute(int texWidth"),
+                                        QStringLiteral("GpuPresentSetupTiming GpuDisplayWindow::lastPresentSetupTimingIfActive()"));
+    ASSERT_FALSE(prewarm.isEmpty());
+    const int arm = prewarm.indexOf(QStringLiteral("gpuAmazeDebayerArmProbe(1);"));
+    const int run = prewarm.indexOf(QStringLiteral("gpuAmazeDebayerRenderPostWbGlTextureFromR16GlTexture(warmInput->textureId(),"));
+    const int disarm = prewarm.indexOf(QStringLiteral("gpuAmazeDebayerArmProbe(0);"));
+    ASSERT_TRUE(arm >= 0);
+    ASSERT_TRUE(run > arm);
+    ASSERT_TRUE(disarm > run);
+    ASSERT_TRUE(prewarm.contains(QStringLiteral("*summary += playback_startup_split::amazeProbeFields(amazeTiming.probeAvailable,")));
+    const QString warmDone = bodyBetween(source, QStringLiteral("void MainWindow::onPlaybackReconWarmDone("),
+                                         QStringLiteral("void MainWindow::armPlaybackRoutePrewarm()"));
+    ASSERT_TRUE(warmDone.contains(QStringLiteral("+ playback_startup_split::amazeProbeFields( amazeTiming.probeAvailable, amazeTiming.probeValid,")));
 }

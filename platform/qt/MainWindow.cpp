@@ -265,6 +265,14 @@ static bool mlvappPlaybackReconWarmRunDisabled()
     return disabled;
 }
 
+// PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row K switch, read once: MLVAPP_PLAYBACK_GPU_CLOCK_KICK=0 starts no
+// Play-start GPU clock kick (PlaybackGpuClockKickPolicy.h). Default on.
+static bool mlvappPlaybackGpuClockKickDisabled()
+{
+    static const bool disabled = !playbackEnvSwitch( "MLVAPP_PLAYBACK_GPU_CLOCK_KICK", true );
+    return disabled;
+}
+
 // PLAYBACK-STARTUP-WAIT-PREWARM-1: the smoke's opt-in first-present identity capture (with --contact-sheet-dir), read once.
 static bool smokeFirstPresentCaptureRequested()
 {
@@ -2444,6 +2452,8 @@ MainWindow::MainWindow(int &argc, char **argv, QWidget *parent) :
     } );
     GpuDeviceLossBreaker::setRefreshCallback( [this]()
     {
+        // PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row K: a device loss ends a kick still held (no CUDA call)
+        endPlaybackGpuClockKick( "device_loss" );
         requestFrameRefresh( true, "gpu-device-loss-cpu-route" );
     } );
 
@@ -27757,12 +27767,13 @@ void MainWindow::onPlaybackReconWarmDone( const RenderFrameThread::PlaybackRecon
     line.runMs = outcome.runMs;
     line.overlappedPlay = done.realRequestArrivedDuringWarm && playing;
     QString amazeReason;
+    GpuAmazeDebayerBackendTiming amazeTiming;   // PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row 0: its probe
     if( playback_recon_warm_run::guiAmazeAllowed( hasOutput, playing, clipMatches ) )
     {
         const double wb[3] = { done.wbMultipliers[0], done.wbMultipliers[1], done.wbMultipliers[2] };
         line.amazeOk = GpuDisplayWindow::warmStagedReconSlotFromDeviceBayer16IfActive(
             outcome.retained.device_bayer16, outcome.width, outcome.height, done.blackLevel, wb,
-            playbackReducedHnyquistWanted( outcome.scale > 1 ), &line.amazeKernelMs, &amazeReason );
+            playbackReducedHnyquistWanted( outcome.scale > 1 ), &line.amazeKernelMs, &amazeReason, &amazeTiming );
     }
     else if( hasOutput )
     {
@@ -27772,7 +27783,11 @@ void MainWindow::onPlaybackReconWarmDone( const RenderFrameThread::PlaybackRecon
     line.outstandingAfter = llrpGpuPlaybackReconRetainedOutstandingCount();
     if( hasOutput && clipMatches ) m_playbackReconWarmRan = true;
     // a device loss mid-run leaves no token (released=1 above is the no-op release of token 0); the line says why
-    qInfo().noquote() << line.format() + QStringLiteral( " frame=%1 decode_ms=%2 set_clip_calls=%3 set_luts_calls=%4 rc=%5 amaze_reason=\"" )
+    qInfo().noquote() << line.format()
+                             + playback_startup_split::amazeProbeFields( amazeTiming.probeAvailable, amazeTiming.probeValid,
+                                                                         amazeTiming.smMhzBefore, amazeTiming.smMhzAfter,
+                                                                         amazeTiming.deviceMs )
+                             + QStringLiteral( " frame=%1 decode_ms=%2 set_clip_calls=%3 set_luts_calls=%4 rc=%5 amaze_reason=\"" )
                                              .arg( done.frameNumber )
                                              .arg( outcome.decodeMs, 0, 'f', 3 )
                                              .arg( static_cast<qulonglong>( outcome.setClipCalls ) )
@@ -27794,6 +27809,84 @@ void MainWindow::armPlaybackRoutePrewarm()
     m_playbackReconWarmRepostArmed = false;
     m_playbackReconWarmRan = false;
     m_playbackRoutePrewarmArmed = !mlvappPlaybackRoutePrewarmDisabled();
+    // PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row K: a clip change ends a kick still held
+    endPlaybackGpuClockKick( "clip_change" );
+}
+
+// PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row K (PlaybackGpuClockKickPolicy.h) and Row 0: at Play, before the
+// play-start frame request. Row 0's session probe is armed for every Play (it never loads the DLL); the kick only runs
+// on the CUDA texture route with the AMaZE backend already loaded, never loading it.
+void MainWindow::beginPlaybackGpuClockKick()
+{
+    if( m_playbackGpuClockKickActive ) endPlaybackGpuClockKick( "next_play" );
+    gpuAmazeDebayerBeginProbeSession();
+    m_playbackGpuClockKickSession = static_cast<quint64>( m_playbackSmokeSessionId );
+    const bool routeAdmitted = m_lastPresentedRequestContextValid
+                            && m_lastPresentedRequestContext.gpuPlaybackReconTexturePresentRequested
+                            && m_lastPresentedRequestContext.gpuPlaybackReconAmazeTexturePresentAdmitted;
+    const bool cudaSuppressed = llrpGpuCudaSuppressed() != 0;
+    playback_gpu_clock_kick::Decision decision = playback_gpu_clock_kick::decide(
+        !mlvappPlaybackGpuClockKickDisabled(),
+        ui->actionPlay->isChecked(),
+        routeAdmitted,
+        routeAdmitted && !cudaSuppressed && gpuAmazeDebayerLiveBackendLoaded(),
+        cudaSuppressed,
+        false );
+    if( decision.run )
+    {
+        QString why;
+        double beginSteadyMs = 0.0;
+        if( gpuAmazeDebayerClockKickBegin( playback_gpu_clock_kick::kKickMaxMs, &why, &beginSteadyMs ) )
+        {
+            m_playbackGpuClockKickDecision = decision;
+            m_playbackGpuClockKickActive = true;
+            m_playbackGpuClockKickBeginSteadyMs = beginSteadyMs;
+            // the kernel stops itself at kKickMaxMs; this collects and logs it when no present came first
+            const quint64 serial = ++m_playbackGpuClockKickSerial;
+            QTimer::singleShot( playback_gpu_clock_kick::kKickMaxMs + 50, this, [this, serial]()
+            {
+                if( serial == m_playbackGpuClockKickSerial ) endPlaybackGpuClockKick( "deadline_timer" );
+            } );
+            return;
+        }
+        decision.run = false;
+        decision.reason = playback_gpu_clock_kick::reasonFromBeginFailure( why );
+    }
+    m_playbackGpuClockKickDecision = decision;
+    playback_gpu_clock_kick::Line line;
+    line.session = m_playbackGpuClockKickSession;
+    line.decision = decision;
+    qInfo().noquote() << line.format();
+}
+
+// Row K: raise the stop flag, collect (no CUDA call, at most ~2 ms) and log. Once per kick; a no-op without one.
+void MainWindow::endPlaybackGpuClockKick( const char *site )
+{
+    if( !m_playbackGpuClockKickActive ) return;
+    m_playbackGpuClockKickActive = false;
+    ++m_playbackGpuClockKickSerial;
+    const GpuAmazeClockKickReport report = gpuAmazeDebayerClockKickEnd();
+    const GpuAmazeProbeSessionRecord record = gpuAmazeDebayerProbeSessionRecord();
+    playback_gpu_clock_kick::Line line;
+    line.session = m_playbackGpuClockKickSession;
+    line.decision = m_playbackGpuClockKickDecision;
+    line.ranMs = report.ranMs;
+    line.samples = static_cast<int>( report.sampleMs.size() );
+    if( !report.intervalMhz.empty() )
+    {
+        line.mhzFirst = report.intervalMhz.front();
+        line.mhzLast = report.intervalMhz.back();
+    }
+    line.rampMs = playback_gpu_clock_kick::rampMsTo80pct( report.sampleMs, report.intervalMhz );
+    line.stoppedBy = QString::fromLatin1( playback_gpu_clock_kick::stoppedByName( report.state, report.stoppedBy ) );
+    line.endedAt = QString::fromLatin1( site );
+    // frame 0's own probe: the first AMaZE run of this Play
+    if( record.calls > 0 )
+    {
+        if( record.probeAvailable && record.valid[0] ) line.mhzAtAmaze0 = record.smMhzBefore[0];
+        line.kickLeadMs = record.startSteadyMs[0] - m_playbackGpuClockKickBeginSteadyMs;
+    }
+    qInfo().noquote() << line.format();
 }
 
 QImage MainWindow::grabIdentityViewport( QString *reason )
@@ -28349,6 +28442,22 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
     qInfo().noquote() << m_playbackStartupSplit.firstPresentLine( static_cast<qulonglong>( m_playbackSmokeSessionId ) );
     // PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1 Row 0: and where its first render went.
     qInfo().noquote() << m_playbackStartupSplit.renderFirstLine( static_cast<qulonglong>( m_playbackSmokeSessionId ) );
+    // PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row 0: and its first four AMaZE runs (kernel / device / SM MHz).
+    {
+        const GpuAmazeProbeSessionRecord record = gpuAmazeDebayerProbeSessionRecord();
+        playback_startup_split::AmazeFirstFrames frames;
+        frames.count = qMin( record.calls, playback_startup_split::AmazeFirstFrames::kFrames );
+        frames.probeAvailable = record.probeAvailable;
+        for( int i = 0; i < frames.count; ++i )
+        {
+            frames.kernelMs[i] = record.kernelMs[i];
+            frames.deviceMs[i] = record.deviceMs[i];
+            frames.smMhzBefore[i] = record.smMhzBefore[i];
+            frames.valid[i] = record.valid[i];
+        }
+        m_playbackStartupSplit.noteAmazeFirstFrames( frames );
+    }
+    qInfo().noquote() << m_playbackStartupSplit.amazeFirstFramesLine( static_cast<qulonglong>( m_playbackSmokeSessionId ) );
     // PLAYBACK-STARTUP-WAIT-PREWARM-1 Row A: how this Play's audio started (AudioPlayback::StartReport).
     {
         const AudioPlayback::StartReport audioStart =
@@ -29612,6 +29721,8 @@ void MainWindow::on_actionPlay_toggled(bool checked)
         // read by finishPlaybackSmokeTelemetry() below via m_playbackScreensaverBlockedCount
         // before that counter is reset by the next play-start.
         m_playbackDisplayRequiredActive = false;
+        // PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row K: a kick still held ends with its Play
+        endPlaybackGpuClockKick( "play_stop" );
         finishPlaybackSmokeTelemetry( "play-stop" );
         m_playbackStopped = true;
         m_playToFirstFramePending = false;
@@ -29656,6 +29767,9 @@ void MainWindow::on_actionPlay_toggled(bool checked)
         beginPlaybackSmokeTelemetry();
         beginPlayToFirstFrameMeasurement();
         m_playbackScopeLastUpdateTime = 0.0;
+        // PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row K: the GPU clocks ramp while frame 0 decodes, so the kick
+        // starts before the play-start frame request (PlaybackGpuClockKickPolicy.h)
+        beginPlaybackGpuClockKick();
         requestFrameRefresh( true, "play-start" );
         m_lastPlayStartPrerollRequested = primePlaybackCacheOnPlayStart();
         m_playbackFrameAdvancePending = true;
@@ -31098,6 +31212,21 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
         fp.warmRun = m_playbackReconWarmRan;
         fp.setClipAtPlay = static_cast<long long>( llrpGpuPlaybackReconSetClipCount() - m_playbackSmokeStartGpuSetClipCount );
         fp.setLutsAtPlay = static_cast<long long>( llrpGpuPlaybackReconSetLutsCount() - m_playbackSmokeStartGpuSetLutsCount );
+        // PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row 0: frame 0's AMaZE probe (the session's first probed run)
+        // and this Play's clock kick
+        const GpuAmazeProbeSessionRecord probeRecord = gpuAmazeDebayerProbeSessionRecord();
+        if( probeRecord.calls > 0 )
+        {
+            fp.probeAvailable = probeRecord.probeAvailable;
+            fp.probeValid = probeRecord.valid[0];
+            fp.amazeSmMhzBefore = probeRecord.smMhzBefore[0];
+            fp.amazeSmMhzAfter = probeRecord.smMhzAfter[0];
+            fp.amazeDeviceMs = probeRecord.deviceMs[0];
+            if( m_playbackGpuClockKickDecision.run )
+                fp.kickLeadMs = probeRecord.startSteadyMs[0] - m_playbackGpuClockKickBeginSteadyMs;
+        }
+        fp.clockKickRun = m_playbackGpuClockKickDecision.run;
+        fp.clockKickReason = QString::fromLatin1( playback_gpu_clock_kick::reasonName( m_playbackGpuClockKickDecision.reason ) );
         m_playbackStartupSplit.noteFirstPresentSplit( fp );
         // Row 0: render_first by the first frame's existing stage timers (never a new hot-path timer)
         playback_startup_split::RenderFirstSplit rf;
@@ -31108,6 +31237,8 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
         rf.llrawprocMs = telemetryDoubleValue( t, "llrawproc_total_ms" );
         m_playbackStartupSplit.noteRenderFirstSplit( rf );
     }
+    // PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row K: this Play's first present (painted) ends its clock kick
+    if( m_playbackGpuClockKickActive && ui->actionPlay->isChecked() ) endPlaybackGpuClockKick( "first_present" );
     double splitMark = splitFinishEntry;
     const auto splitStep = [&]( int step )
     {

@@ -26,6 +26,15 @@
  * (0 when the warm absorbed them). And render_first split from the first frame's existing stage timers (NA where a part
  * has none; other = render_first minus the timed parts):
  *   playback_smoke.render_first_split session=N render_first_ms= decode_ms= llrawproc_ms= recon_run_ms=NA other_ms=
+ *
+ * PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row 0: the first Play AMaZE's in-process probe (SM MHz just before
+ * and after its tile batch, clock64 over %globaltimer, and the batch's device time from CUDA events) and the Play-start
+ * clock kick ride at the end of first_present_split (NA when the DLL lacks the probe or the run was not probed):
+ *   ... amaze_sm_mhz_before= amaze_sm_mhz_after= amaze_device_ms= clock_kick=<run|skip> clock_kick_reason=
+ *   kick_lead_ms=
+ * and the session's first four AMaZE runs, each <kernel_ms>/<device_ms>/<sm_mhz_before>:
+ *   playback_smoke.amaze_first_frames session=N f0= f1= f2= f3=
+ * The route prewarm and the paused recon warm lines carry the same three probe fields (amazeProbeFields).
  */
 
 #ifndef PLAYBACKSTARTUPSPLIT_H
@@ -79,6 +88,50 @@ inline double median( std::vector<double> values )
     return ( lower + upper ) * 0.5;
 }
 
+/*! PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row 0: " amaze_sm_mhz_before= amaze_sm_mhz_after= amaze_device_ms="
+ *  for one probed AMaZE run; every value is NA unless the DLL exports the probe and the run's probe is valid. */
+inline QString amazeProbeFields( bool probeAvailable, bool probeValid, double smMhzBefore, double smMhzAfter, double deviceMs )
+{
+    const bool known = probeAvailable && probeValid;
+    const auto value = [known]( double v, int decimals )
+    { return known ? QString::number( v, 'f', decimals ) : QStringLiteral( "NA" ); };
+    return QStringLiteral( " amaze_sm_mhz_before=" ) + value( smMhzBefore, 1 )
+         + QStringLiteral( " amaze_sm_mhz_after=" ) + value( smMhzAfter, 1 )
+         + QStringLiteral( " amaze_device_ms=" ) + value( deviceMs, 3 );
+}
+
+/*! Row 0: the session's first AMaZE runs (frame 0 first), each kernel_ms / device_ms / sm_mhz_before; a run the
+ *  session did not reach is NA/NA/NA, and device / MHz are NA when that run's probe is unknown. */
+struct AmazeFirstFrames
+{
+    static constexpr int kFrames = 4;
+    int count = 0;
+    bool probeAvailable = false;
+    double kernelMs[kFrames] = {};
+    double deviceMs[kFrames] = {};
+    double smMhzBefore[kFrames] = {};
+    bool valid[kFrames] = {};
+
+    QString line( unsigned long long session ) const
+    {
+        QString text = QStringLiteral( "playback_smoke.amaze_first_frames session=" ) + QString::number( session );
+        for( int i = 0; i < kFrames; ++i )
+        {
+            text += QStringLiteral( " f" ) + QString::number( i ) + QStringLiteral( "=" );
+            if( i >= count )
+            {
+                text += QStringLiteral( "NA/NA/NA" );
+                continue;
+            }
+            const bool known = probeAvailable && valid[i];
+            text += QString::number( kernelMs[i], 'f', 3 ) + QStringLiteral( "/" )
+                  + ( known ? QString::number( deviceMs[i], 'f', 3 ) : QStringLiteral( "NA" ) ) + QStringLiteral( "/" )
+                  + ( known ? QString::number( smMhzBefore[i], 'f', 1 ) : QStringLiteral( "NA" ) );
+        }
+        return text;
+    }
+};
+
 /*! The first Play-present's GPU window parts (Row 0). slot: what the window's texture slot did (the staged prewarm
  *  pair adopted or discarded, a plain re-allocation, or kept); setup_*: GpuPresentSetupTiming of that call (blur =
  *  drain + upload + check); amaze_*: its AMaZE-only kernel / download (the download includes the output's CUDA-GL
@@ -102,6 +155,15 @@ struct FirstPresentSplit
     bool warmRun = false;
     long long setClipAtPlay = 0;
     long long setLutsAtPlay = 0;
+    // PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row 0: the first Play AMaZE's probe and the Play-start kick
+    bool probeAvailable = false;
+    bool probeValid = false;
+    double amazeSmMhzBefore = 0.0;
+    double amazeSmMhzAfter = 0.0;
+    double amazeDeviceMs = 0.0;
+    bool clockKickRun = false;
+    QString clockKickReason = QStringLiteral( "none" );
+    double kickLeadMs = -1.0;   // kick begin -> frame 0's AMaZE call; < 0 = NA
 
     QString line( unsigned long long session ) const
     {
@@ -123,7 +185,12 @@ struct FirstPresentSplit
              + QStringLiteral( " backend_preloaded=" ) + ( backendPreloaded ? QStringLiteral( "1" ) : QStringLiteral( "0" ) )
              + QStringLiteral( " warm_run=" ) + ( warmRun ? QStringLiteral( "1" ) : QStringLiteral( "0" ) )
              + QStringLiteral( " set_clip_at_play=" ) + QString::number( setClipAtPlay )
-             + QStringLiteral( " set_luts_at_play=" ) + QString::number( setLutsAtPlay );
+             + QStringLiteral( " set_luts_at_play=" ) + QString::number( setLutsAtPlay )
+             + amazeProbeFields( probeAvailable, probeValid, amazeSmMhzBefore, amazeSmMhzAfter, amazeDeviceMs )
+             + QStringLiteral( " clock_kick=" ) + ( clockKickRun ? QStringLiteral( "run" ) : QStringLiteral( "skip" ) )
+             + QStringLiteral( " clock_kick_reason=" ) + ( clockKickReason.isEmpty() ? QStringLiteral( "none" ) : clockKickReason )
+             + QStringLiteral( " kick_lead_ms=" )
+             + ( kickLeadMs < 0.0 ? QStringLiteral( "NA" ) : QString::number( kickLeadMs, 'f', 3 ) );
     }
 };
 
@@ -230,6 +297,11 @@ public:
     const RenderFirstSplit &renderFirstSplit() const { return m_renderFirstSplit; }
     QString renderFirstLine( unsigned long long session ) const { return m_renderFirstSplit.line( session ); }
 
+    /*! PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row 0: the session's first AMaZE runs (reset with the rest). */
+    void noteAmazeFirstFrames( const AmazeFirstFrames &frames ) { m_amazeFirstFrames = frames; }
+    const AmazeFirstFrames &amazeFirstFrames() const { return m_amazeFirstFrames; }
+    QString amazeFirstFramesLine( unsigned long long session ) const { return m_amazeFirstFrames.line( session ); }
+
     double playToRequestMs() const { return m_playToRequestMs < 0.0 ? 0.0 : m_playToRequestMs; }
     double renderFirstMs() const { return m_renderFirstMs; }
     double guiPresentFirstMs() const { return m_guiPresentFirstMs; }
@@ -299,6 +371,7 @@ private:
     double m_finishStepMs[StepCount] = {};
     FirstPresentSplit m_firstPresentSplit;
     RenderFirstSplit m_renderFirstSplit;
+    AmazeFirstFrames m_amazeFirstFrames;
     std::vector<double> m_laterRender;
     std::vector<double> m_laterGuiPresent;
 };

@@ -482,3 +482,141 @@ TEST(PlaybackReconWarmRunWiring, TheWarmGuiFunctionNeverAssignsTheDisplayedTextu
     ASSERT_TRUE(amaze > size);
     ASSERT_TRUE(warm.contains(QStringLiteral("m_stagedReconOutput->textureId(),")));
 }
+
+// PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row K (PlaybackGpuClockKickPolicy.h): the Play-start GPU clock kick starts
+// before the play-start frame request, ends at the first present / stop / clip change / device loss / window teardown,
+// never loads the AMaZE DLL, and its kernel is bounded by a %globaltimer deadline on its own lowest-priority stream.
+TEST(PlaybackGpuClockKickWiring, PlayStartsTheKickBeforeThePlayStartFrameRequest)
+{
+    const QString source = sourceFile("platform/qt/MainWindow.cpp");
+    ASSERT_TRUE(source.contains(QStringLiteral(
+        "static const bool disabled = !playbackEnvSwitch( \"MLVAPP_PLAYBACK_GPU_CLOCK_KICK\", true );")));
+    const QString toggled = bodyBetween(source, QStringLiteral("void MainWindow::on_actionPlay_toggled(bool checked)"),
+                                        QStringLiteral("double MainWindow::playGateNativeFps() const"));
+    ASSERT_FALSE(toggled.isEmpty());
+    const int smoke = toggled.indexOf(QStringLiteral("beginPlaybackSmokeTelemetry();"));
+    const int kick = toggled.indexOf(QStringLiteral("beginPlaybackGpuClockKick();"));
+    const int request = toggled.indexOf(QStringLiteral("requestFrameRefresh( true, \"play-start\" );"));
+    ASSERT_TRUE(smoke >= 0);
+    ASSERT_TRUE(kick > smoke);       // the session id the kick line carries is assigned
+    ASSERT_TRUE(request > kick);     // the clocks ramp while frame 0 decodes
+    ASSERT_EQ(1, toggled.count(QStringLiteral("beginPlaybackGpuClockKick();")));
+    // stop ends it before the smoke session is finished
+    const int stop = toggled.indexOf(QStringLiteral("endPlaybackGpuClockKick( \"play_stop\" );"));
+    const int finish = toggled.indexOf(QStringLiteral("finishPlaybackSmokeTelemetry( \"play-stop\" );"));
+    ASSERT_TRUE(stop >= 0);
+    ASSERT_TRUE(finish > stop);
+
+    // the begin: the policy decides on the live state, then the backend re-checks under its lock
+    const QString begin = bodyBetween(source, QStringLiteral("void MainWindow::beginPlaybackGpuClockKick()"),
+                                      QStringLiteral("void MainWindow::endPlaybackGpuClockKick( const char *site )"));
+    ASSERT_FALSE(begin.isEmpty());
+    const int decideAt = begin.indexOf(QStringLiteral("playback_gpu_clock_kick::decide("));
+    const int beginAt = begin.indexOf(QStringLiteral("gpuAmazeDebayerClockKickBegin( playback_gpu_clock_kick::kKickMaxMs, &why, &beginSteadyMs )"));
+    ASSERT_TRUE(decideAt >= 0);
+    ASSERT_TRUE(beginAt > decideAt);
+    const QString decideCall = begin.mid(decideAt, beginAt - decideAt);
+    ASSERT_TRUE(decideCall.contains(QStringLiteral("!mlvappPlaybackGpuClockKickDisabled(),")));
+    ASSERT_TRUE(decideCall.contains(QStringLiteral("ui->actionPlay->isChecked(),")));
+    ASSERT_TRUE(decideCall.contains(QStringLiteral("m_lastPresentedRequestContext.gpuPlaybackReconAmazeTexturePresentAdmitted")));
+    ASSERT_TRUE(decideCall.contains(QStringLiteral("gpuAmazeDebayerLiveBackendLoaded()")));
+    ASSERT_TRUE(decideCall.contains(QStringLiteral("llrpGpuCudaSuppressed() != 0")));
+    ASSERT_TRUE(decideCall.contains(QStringLiteral("if( decision.run )")));
+    // Row 0's session probe is armed on every Play, kick or not
+    ASSERT_TRUE(begin.indexOf(QStringLiteral("gpuAmazeDebayerBeginProbeSession();")) < decideAt);
+    ASSERT_TRUE(begin.indexOf(QStringLiteral("gpuAmazeDebayerBeginProbeSession();")) >= 0);
+    // at most one kick per Play: a held one is ended first
+    ASSERT_TRUE(begin.indexOf(QStringLiteral("if( m_playbackGpuClockKickActive ) endPlaybackGpuClockKick( \"next_play\" );")) >= 0);
+    // a deadline timer collects it when no present came first, and a stale timer is a no-op
+    ASSERT_TRUE(begin.contains(QStringLiteral("QTimer::singleShot( playback_gpu_clock_kick::kKickMaxMs + 50, this,")));
+    ASSERT_TRUE(begin.contains(QStringLiteral("if( serial == m_playbackGpuClockKickSerial ) endPlaybackGpuClockKick( \"deadline_timer\" );")));
+}
+
+TEST(PlaybackGpuClockKickWiring, TheKickEndsAtTheFirstPresentClipChangeDeviceLossAndWindowTeardown)
+{
+    const QString source = sourceFile("platform/qt/MainWindow.cpp");
+    const QString finish = bodyBetween(source, QStringLiteral("void MainWindow::finishPresentedFrame( uint64_t displayFrame,"),
+                                       QStringLiteral("void MainWindow::drawFrameReady()"));
+    ASSERT_TRUE(finish.contains(QStringLiteral(
+        "if( m_playbackGpuClockKickActive && ui->actionPlay->isChecked() ) endPlaybackGpuClockKick( \"first_present\" );")));
+    const QString arm = bodyBetween(source, QStringLiteral("void MainWindow::armPlaybackRoutePrewarm()"),
+                                    QStringLiteral("void MainWindow::beginPlaybackGpuClockKick()"));
+    ASSERT_TRUE(arm.contains(QStringLiteral("endPlaybackGpuClockKick( \"clip_change\" );")));
+    const int refresh = source.indexOf(QStringLiteral("GpuDeviceLossBreaker::setRefreshCallback( [this]()"));
+    const int loss = source.indexOf(QStringLiteral("endPlaybackGpuClockKick( \"device_loss\" );"), refresh);
+    const int cpuRoute = source.indexOf(QStringLiteral("requestFrameRefresh( true, \"gpu-device-loss-cpu-route\" );"), refresh);
+    ASSERT_TRUE(refresh >= 0);
+    ASSERT_TRUE(loss > refresh);
+    ASSERT_TRUE(cpuRoute > loss);
+    // the end is once per kick and logs its line
+    const QString end = bodyBetween(source, QStringLiteral("void MainWindow::endPlaybackGpuClockKick( const char *site )"),
+                                    QStringLiteral("QImage MainWindow::grabIdentityViewport("));
+    ASSERT_FALSE(end.isEmpty());
+    const int guard = end.indexOf(QStringLiteral("if( !m_playbackGpuClockKickActive ) return;"));
+    const int collect = end.indexOf(QStringLiteral("gpuAmazeDebayerClockKickEnd();"));
+    ASSERT_TRUE(guard >= 0);
+    ASSERT_TRUE(collect > guard);
+    ASSERT_TRUE(end.contains(QStringLiteral("++m_playbackGpuClockKickSerial;")));
+    ASSERT_TRUE(end.contains(QStringLiteral("qInfo().noquote() << line.format();")));
+    // the window going away ends it (it holds no GL resource)
+    const QString window = sourceFile("platform/qt/GpuDisplayWindow.cpp");
+    const QString destructor = bodyBetween(window, QStringLiteral("GpuDisplayWindow::~GpuDisplayWindow()"),
+                                           QStringLiteral("    if ( isValid() )"));
+    ASSERT_TRUE(destructor.contains(QStringLiteral("gpuAmazeDebayerClockKickEnd();")));
+}
+
+TEST(PlaybackGpuClockKickWiring, TheKickNeverLoadsTheDllAndReChecksTheLossUnderTheLiveLock)
+{
+    const QString debayer = sourceFile("platform/qt/GpuDebayer.cpp");
+    const QString kick = bodyBetween(debayer, QStringLiteral("bool gpuAmazeDebayerLiveBackendLoaded(void)"),
+                                     QStringLiteral("GpuAmazeClockKickReport gpuAmazeDebayerClockKickEnd(void)\n{"));
+    const QString kickEnd = bodyBetween(debayer, QStringLiteral("GpuAmazeClockKickReport gpuAmazeDebayerClockKickEnd(void)\n{"),
+                                        QStringLiteral("    return report;\n}\n"));
+    ASSERT_FALSE(kick.isEmpty());
+    ASSERT_FALSE(kickEnd.isEmpty());
+    ASSERT_FALSE(kick.contains(QStringLiteral("ensure(")));
+    ASSERT_FALSE(kickEnd.contains(QStringLiteral("ensure(")));
+    ASSERT_TRUE(kick.contains(QStringLiteral("if ( !live.attempted || !live.available || !live.backend ) return fail(\"backend_not_loaded\");")));
+    const int lock = kick.indexOf(QStringLiteral("QMutexLocker locker(&live.mutex);"), kick.indexOf(QStringLiteral("bool gpuAmazeDebayerClockKickBegin(")));
+    const int recheck = kick.indexOf(QStringLiteral("enterAmazeRunUnlessCudaSuppressed(&live.runtime, GpuFieldTelemetry::enabled())"));
+    const int launch = kick.indexOf(QStringLiteral("live.runtime.clockKickBegin(live.backend, maxMs)"));
+    ASSERT_TRUE(lock >= 0);
+    ASSERT_TRUE(recheck > lock);
+    ASSERT_TRUE(launch > recheck);
+    // both symbols are optional: an older DLL skips the kick and prints NA for the probe
+    ASSERT_TRUE(debayer.contains(QStringLiteral("runtime.library.resolve(\"igpu_amaze_debayer_clock_kick_begin\")")));
+    ASSERT_TRUE(debayer.contains(QStringLiteral("runtime.library.resolve(\"igpu_amaze_debayer_last_probe\")")));
+    ASSERT_FALSE(debayer.contains(QStringLiteral("\"igpu_amaze_debayer_clock_kick_begin\",\n")));   // never a required resolve
+}
+
+TEST(PlaybackGpuClockKickWiring, TheKernelIsBoundedByAGlobaltimerDeadlineOnItsOwnLowestPriorityStream)
+{
+    const QString cu = sourceFile("tools/gpu/backend/igpu_amaze_debayer_cuda.cu");
+    const QString kernel = bodyBetween(cu, QStringLiteral("__global__ void k_clock_kick(ClockKickShared * s,"),
+                                       QStringLiteral("constexpr unsigned long long kProbeSpinNs"));
+    ASSERT_FALSE(kernel.isEmpty());
+    ASSERT_TRUE(kernel.contains(QStringLiteral("const unsigned long long t = igpu_globaltimer_ns();")));
+    ASSERT_TRUE(kernel.contains(QStringLiteral("if (t - t0 >= maxNs) break;")));
+    ASSERT_TRUE(kernel.contains(QStringLiteral("const unsigned int stop = s->stop;")));
+    ASSERT_TRUE(cu.contains(QStringLiteral("asm volatile(\"mov.u64 %0, %%globaltimer;\" : \"=l\"(t));")));
+    const QString begin = bodyBetween(cu, QStringLiteral("extern \"C\" int igpu_amaze_debayer_clock_kick_begin("),
+                                      QStringLiteral("extern \"C\" int igpu_amaze_debayer_clock_kick_end("));
+    ASSERT_FALSE(begin.isEmpty());
+    ASSERT_TRUE(begin.contains(QStringLiteral(
+        "cudaStreamCreateWithPriority(&backend->kickStream, cudaStreamNonBlocking, leastPriority);")));
+    ASSERT_TRUE(begin.contains(QStringLiteral("k_clock_kick<<<1, 32, 0, backend->kickStream>>>(")));
+    ASSERT_TRUE(begin.contains(QStringLiteral("if (!backend || max_ms <= 0 || max_ms > kClockKickMaxMsCap) return -1;")));
+    ASSERT_TRUE(begin.contains(QStringLiteral("if (backend->kickLaunched && backend->kickHost && !backend->kickHost->done) return 1;")));
+    // it never touches the AMaZE live buffers or tile streams
+    ASSERT_FALSE(begin.contains(QStringLiteral("liveTileStreams")));
+    ASSERT_FALSE(begin.contains(QStringLiteral("liveTileDeviceBuffers")));
+    ASSERT_FALSE(begin.contains(QStringLiteral("ensure_live_texture_buffers")));
+    // the end makes no CUDA call (safe after a device loss) and waits a bounded time
+    const QString end = bodyBetween(cu, QStringLiteral("extern \"C\" int igpu_amaze_debayer_clock_kick_end("),
+                                    QStringLiteral("extern \"C\" int igpu_amaze_debayer_last_cuda_error("));
+    ASSERT_FALSE(end.isEmpty());
+    ASSERT_FALSE(end.contains(QStringLiteral("cuda")));
+    ASSERT_TRUE(end.contains(QStringLiteral("while (!s->done && now_ms() - waitStart < kClockKickEndWaitMs)")));
+    // both live runs end a running kick right after their tile drain, before the CUDA-GL handoff
+    ASSERT_EQ(2, cu.count(QStringLiteral("            probe);\n        stop_clock_kick_for_live_run(backend);\n")));
+}

@@ -37,6 +37,7 @@
 #include "PlaybackScopesDuringPlayback.h"
 #include "PlaybackSlipHistogram.h"
 #include "PlaybackStartupSplit.h"
+#include "PlaybackGpuClockKickPolicy.h"
 #include "PlaybackFirstPresentIdentity.h"
 #include "PlaybackRoutePrewarmPolicy.h"
 #include "PlaybackReconWarmRunPolicy.h"
@@ -1697,6 +1698,16 @@ private:
     int m_playbackReconWarmPosts = 0;             // posts this clip (PlaybackReconWarmRunPolicy.h kMaxPosts)
     bool m_playbackReconWarmRepostArmed = false;  // a re-post timer is pending
     bool m_playbackReconWarmRan = false;          // first_present_split warm_run
+    // PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row K (PlaybackGpuClockKickPolicy.h): at Play, before the play-start
+    // frame request, one bounded GPU clock kick on the loaded AMaZE backend; ended (and logged) at the first present,
+    // Play stop, a clip change, a device loss, the next Play or its deadline. Also arms Row 0's session probe.
+    void beginPlaybackGpuClockKick();
+    void endPlaybackGpuClockKick( const char *site );
+    bool m_playbackGpuClockKickActive = false;
+    playback_gpu_clock_kick::Decision m_playbackGpuClockKickDecision;   // this Play's (first_present_split)
+    double m_playbackGpuClockKickBeginSteadyMs = 0.0;
+    quint64 m_playbackGpuClockKickSerial = 0;     // cancels a stale deadline timer
+    quint64 m_playbackGpuClockKickSession = 0;
     void writeFirstPresentIdentity( const QString &dir, int startPosition );
     // --gui-smoke-playback only (CUDA-PERF-PLAYBACK-FOREGROUND-1): forces the main window
     // and the GPU display window to the OS foreground and verifies with
