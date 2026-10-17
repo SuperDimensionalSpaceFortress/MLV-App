@@ -289,7 +289,10 @@ New-Item -ItemType Directory -Path (Join-Path $bus 'cos-feedback\mlv-app') -Forc
 $of = Join-Path $WorkRoot 'c13.out.md'
 # r1: the git path asks GitHub for the PR state list; the tests never do, so the r1 scanner is handed an empty list through its -PrStateFile seam (the pre-r1 scanner has no such parameter and is run without it)
 $emptyList = Join-Path $WorkRoot 'pr-state-empty.json'
-[IO.File]::WriteAllText($emptyList, '[]', $utf8)
+# r2 (HUB-TOOLS-TRACKED-1): an EMPTY list left PR 301 / 303 unnamed, so the scanner read them live with `gh pr view`. On a machine whose gh reaches GitHub they are real, merged PRs of this repo
+# (state=MERGED); on a hosted runner without a usable token the read failed (UNKNOWN reason=gh-failed, exit 20) and two rows went red. The list now names both as MERGED, so the git path never calls gh.
+# was: [IO.File]::WriteAllText($emptyList, '[]', $utf8)
+[IO.File]::WriteAllText($emptyList, '[{"number":301,"state":"MERGED"},{"number":303,"state":"MERGED"}]', $utf8)
 $gx = if (Select-String -LiteralPath $Script -Pattern 'PrStateFile' -Quiet) { @('-PrStateFile', $emptyList) } else { @() }
 $lines = & pwsh -NoProfile -NonInteractive -File $Script -BusRoot $bus -Ref master -OutFile $of -Repo $repo @gx 2>&1
 $code = $LASTEXITCODE

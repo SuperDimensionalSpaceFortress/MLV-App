@@ -111,7 +111,10 @@ class TestPortedSuite(ScanCase):
         r = subprocess.run(
             [*PWSH, '-File', str(SUITE), '-ScriptPath', str(self.script),
              '-WorkRoot', str(self.tmp / 'suite-work')],
-            text=True, capture_output=True, timeout=SUBPROCESS_TIMEOUT, cwd=str(self.tmp))
+            text=True, capture_output=True, timeout=SUBPROCESS_TIMEOUT, cwd=str(self.tmp),
+            # r2: the suite must never depend on a live gh. An unusable token makes any stray gh call fail the same way on every machine
+            # (a dev box that is logged in used to hide two rows that read real PRs #301 / #303 live and went red on hosted CI).
+            env={**os.environ, 'GH_TOKEN': 'invalid-token-hermetic-suite', 'GITHUB_TOKEN': 'invalid-token-hermetic-suite'})
         m = re.search(r'^TESTS passed=(\d+) failed=0\s*$', r.stdout, re.M)
         self.assertEqual(r.returncode, 0, r.stdout[-2000:] + r.stderr[-500:])
         self.assertIsNotNone(m, r.stdout[-2000:])

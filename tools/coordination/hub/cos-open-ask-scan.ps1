@@ -320,7 +320,8 @@ if ($FixtureDir) {
         $busCommit = $rv.out.Trim().Substring(0, 8)
         $cd = BusGit @('log', '-1', '--format=%cI', $Ref)
         if ($cd.ok) { $busCommitted = Fmt (ToUtc $cd.out.Trim()) }
-        $ls = BusGit @('ls-tree', '-r', '--name-only', $Ref, '--', "$FeedbackPath/")
+        # DG-GIT-PATHLIST: quotepath off so a non-ASCII feedback path is printed raw and reaches 'git show' unquoted.
+        $ls = BusGit @('-c', 'core.quotepath=false', 'ls-tree', '-r', '--name-only', $Ref, '--', "$FeedbackPath/")
         if (-not $ls.ok) {
             $out.Add("UNKNOWN pr=- reason=ls-tree-failed $($ls.err.Trim())"); $counts.unknown++
         } else {
