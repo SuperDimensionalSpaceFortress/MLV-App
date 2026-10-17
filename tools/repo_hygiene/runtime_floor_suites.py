@@ -384,7 +384,7 @@ def run_task(task: dict, worktree: Path, timeout: int) -> dict:
 
 def _label(task: dict) -> str:
     runtime = task["runtime"] or "default"
-    return f"{task['kind']} {task['suite']} [{runtime}]"
+    return f"{task['kind']} {task['suite']} [{runtime}] (row {task['row']})"
 
 
 def main(argv: list[str] | None = None, detect=detect_runtime) -> int:
