@@ -582,6 +582,12 @@ function Get-LocalPlaybackPromptFindings {
         "(?i)${b}MLVApp(Release)?\.exe['`"]?\s+${appArg}--(gui-smoke-playback|profile-playback)",
         "(?i)(pwsh|powershell)(\.exe)?${e}${pwshGap}-File\s+\S*$scripts",
         "(?i)(^|[\s``&(])(&\s*)?\.{0,2}[\\/]?\S*$scripts['`"]?\s+-\w+")
+    # r4b (hub ruling, HUB-TICK 20261016T2244Z): a listed launch verb + the app + a clip / file argument ("Run <app> take01.dat") is an
+    # app LAUNCH too, so its own clause must carry the venue: a route on the NEXT launcher ("... and run <app> take01.dat <mode> on
+    # Bachelor") never covers it. It is scored only in a sentence that holds a direct launch above (it is no trigger of its own), it
+    # starts at the app token like the app pattern, and an app call whose gap reaches a playback mode is the app pattern's, not this one.
+    # A verbless "<app> <clip>" lead stays a non-launcher lead (r2, RULE4_R2_B_PASS).
+    $clipLaunch = "(?i)(?<=${b}(?:${verbs})\s+(?:&\s*)?['`"]?(?:[^\s;'`"]*[\\/])?)MLVApp(Release)?\.exe['`"]?\s+(?!${appArg}--(?:gui-smoke-playback|profile-playback))['`"]?[^\s;'`"\-][^\s;'`"]*\.\w+"
     $findings = New-Object System.Collections.Generic.List[string]
     # A "sentence" is a line, cut again at '. ' so one bullet carrying several instructions is judged piece by piece. A semicolon is NOT a
     # sentence boundary since r6: it is a hard clause cut (no inheritance, per-group playback test) that the defeater scan reads across.
@@ -682,6 +688,10 @@ function Get-LocalPlaybackPromptFindings {
                 $launchSpans = New-Object System.Collections.Generic.List[object]
                 for ($pi = 0; $pi -lt $direct.Count; $pi++) {
                     foreach ($m4 in [regex]::Matches($s, $direct[$pi])) { $launchSpans.Add([pscustomobject]@{ Start = [int]$m4.Index; End = [int]($m4.Index + $m4.Length); App = ($pi -eq 0) }) }
+                }
+                # r4b: an app launch with a clip argument is one launcher of its own (an app span: it never merges)
+                if ($launchSpans.Count -gt 0) {
+                    foreach ($m4 in [regex]::Matches($s, $clipLaunch)) { $launchSpans.Add([pscustomobject]@{ Start = [int]$m4.Index; End = [int]($m4.Index + $m4.Length); App = $true }) }
                 }
                 $occurrences = New-Object System.Collections.Generic.List[object]
                 foreach ($sp in @($launchSpans | Sort-Object -Property @{ Expression = 'Start'; Descending = $false }, @{ Expression = 'End'; Descending = $true })) {

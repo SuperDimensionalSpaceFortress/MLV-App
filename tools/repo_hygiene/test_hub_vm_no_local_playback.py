@@ -97,6 +97,10 @@ PREVIOUS_PR_HEAD = "d2f3cd05c311f60b8151fe578742c0b3fa104a22"
 # pinned against it in PromptLintTests (test_red_rule4_r2_*), apart from the previous-head differential above, whose r13 multi-line
 # closure assertions are tied to d2f3cd05.
 RULE4_R1_PR_HEAD = "75cb00e1213c7282c02f5f53f3908c2e26e4785c"
+# r4b (CoS Improvement 6224545625): the master this PR branched from (merge of #448), whose rule 4 read only the first launcher
+# occurrence. The RED proof of the r1 second-launcher rows is pinned to it (test_rule4_the_refuse_rows_are_red_on_the_baseline); it
+# never moves, because every later master carries the change.
+RULE4_PRE_CHANGE_MASTER = "2f8d1a97f954a69e45200fba130e9472e838a178"
 
 
 def _previous_head_lint_source() -> tuple[str, str] | None:
@@ -1247,7 +1251,17 @@ def _rule4_r4_rows() -> dict[str, tuple[str, ...]]:
     sets["guards"].append(f"Run {app_release} take01.dat on Bachelor and run C:\\build\\{app_release} take01.dat {SMOKE_MODE}.")
     for row in iverson + (f"Run {app_release} --clip D:\\clips\\a.mlv {SMOKE_MODE}", f"Run pwsh -NoProfile -WorkingDirectory C:\\MLVApp\\w -File {script}"):
         sets["pass"].append(f"{row} on Bachelor.")
-    sets["pass"].append(f"Run {app_release} take01.dat and run C:\\build\\{app_release} take01.dat {SMOKE_MODE} on Bachelor.")
+    # r4b (hub ruling, HUB-TICK 20261016T2244Z): a launch verb + the app + a clip argument is an app LAUNCH, so its own clause must carry
+    # the venue; the route on launcher B never covers it. The first row is the differential-pin seed master and d2f3cd05 refuse and the
+    # r3 / r4 heads passed (the r4 gap stops at the second app token, so the first app matched no pattern). A VERBLESS "<app> <clip>"
+    # lead stays the r2 non-launcher lead (RULE4_R2_B_PASS pins it; no new row of that shape is added here, so nothing opens against
+    # master or d2f3cd05 beyond r2's listed B_PASS opening), and a lead that carries its own route passes: the control below.
+    sets["red"].extend((f"Run {app_release} take01.dat and run C:\\build\\{app_release} take01.dat {SMOKE_MODE} on Bachelor.",
+                        f"Run {APP} take01.dat and run {APP} take01.dat {SMOKE_MODE} on Bachelor.",
+                        f"Run {app_release} take01.dat; run C:\\build\\{app_release} take01.dat {SMOKE_MODE} on Bachelor.",
+                        f"Open {APP} D:\\clips\\a.mlv, then run {APP} take01.dat {SMOKE_MODE} on Bachelor.",
+                        f"Run {app_release} take01.dat and run {script} -Backend cpu on Bachelor."))
+    sets["pass"].append(f"Run {app_release} take01.dat on Bachelor and run C:\\build\\{app_release} take01.dat {SMOKE_MODE} on Bachelor.")
     return {k: tuple(dict.fromkeys(v)) for k, v in sets.items()}
 
 
@@ -2088,18 +2102,27 @@ class PromptLintTests(unittest.TestCase):
         self.assertEqual([], [t for t in earlier if (old[t] > 0) != (new[t] > 0)], f"an r1 / r2 row changed its verdict against {r3[0]}")
 
     def test_rule4_the_refuse_rows_are_red_on_the_baseline(self):
-        """RED proof kept in the suite: while master still carries the first-occurrence-only rule 4, every second-launcher row passes it.
-        Once master carries this lint (baseline == candidate) the comparison is moot and the test skips, like the differential pin."""
+        """RED proof kept in the suite: every second-launcher row passes the lint of RULE4_PRE_CHANGE_MASTER, the master this PR branched
+        from (its rule 4 read only the first launcher occurrence).
+
+        r4b (CoS Improvement 6224545625): the proof is judged against that PINNED pre-change commit, never against fork/master or
+        HUB_VM_LINT_BASELINE_REF. Once this PR merges those refs carry the change, so the next lint PR (whose lint differs from master's
+        by one byte) failed here with 'already refuses: not a RED row'; only byte-identity used to skip. If the pinned baseline ever
+        refuses EVERY RED row it carries the change and is no RED baseline: the test skips with that reason instead of failing.
+
+        Retirement: the pin never moves (re-pinning it to a later master would make it carry the change). The test is deleted, not
+        re-pinned, when the rule-4 catalogue retires; the candidate verdicts stay pinned by test_red_rule4_* either way."""
         self.maxDiff = None
-        base = _baseline_lint_source()
-        if base is None or base[1].replace("\r\n", "\n") == LINT_PS1.read_text(encoding="utf-8").replace("\r\n", "\n"):
-            self.skipTest("no baseline, or master already carries this lint")
+        base = _rule4_r1_head_lint(RULE4_PRE_CHANGE_MASTER, "pre-change master")
         (self.tmp / "rule4-master.ps1").write_text(base[1], encoding="utf-8")
         rows = list(RULE4_SECOND_LAUNCHER_REFUSE)
         # one pwsh pass over the refuse, guard and allow rows together
         _prefetch_counts(self.tmp, [(self.tmp / "rule4-master.ps1", rows + list(RULE4_SECOND_LAUNCHER_GUARDS) + list(RULE4_BOTH_ROUTED_PASS), "rule4-master")])
         counts = _json_counts(self.tmp / "rule4-master.ps1", rows, self.tmp, "rule4-red")
-        self.assertEqual([], [t for t, n in zip(rows, counts) if n > 0], f"rows {base[0]} already refuses: not a RED row, move it to the guards")
+        refused = [t for t, n in zip(rows, counts) if n > 0]
+        if rows and len(refused) == len(rows):
+            self.skipTest(f"{base[0]} already refuses every RED row: it carries the change, so it is no RED baseline")
+        self.assertEqual([], refused, f"rows {base[0]} already refuses: not a RED row, move it to the guards")
         guards = list(RULE4_SECOND_LAUNCHER_GUARDS)
         counts = _json_counts(self.tmp / "rule4-master.ps1", guards, self.tmp, "rule4-guards")
         self.assertEqual([], [t for t, n in zip(guards, counts) if n == 0], f"guard rows {base[0]} passes: they belong in the RED rows")
