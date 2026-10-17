@@ -470,7 +470,7 @@ the receipt -- the contact sheet, and, on a failed smoke run, `smoke-stderr.txt`
 * **`INVALID` is not a failure of the product**: the run could not show >= 20 s of distinct source frames (or
   the proof is absent). It carries no signal; the card stays open. Fix the venue or the clip and re-run.
 * **Every speed leg keeps window captures** (PLAYBACK-VISUAL-INSPECTION-1): the receipt's `visual` block, the frames under
-  `visual/` in the evidence and one strip per leg; a `FROZEN_DISPLAY` leg is `INVALID`. Open the strip before approving a playback
+  `visual/` in the evidence and one strip per leg; a `FROZEN_DISPLAY` leg (one picture over source frames known to differ) is `INVALID`; `FROZEN_DISPLAY_SUSPECTED` and `VISUAL_ASSESSMENT_UNAVAILABLE` are counted and surfaced. Open the strip before approving a playback
   PR. Design, gate and opt-out: [dual-venue-visual-capture.md](dual-venue-visual-capture.md).
 
 ## Outcome mapping (job `RESULT=` token -> receipt outcome)

@@ -795,8 +795,9 @@ if ($outcome -in @('PASS', 'FAIL') -and $null -ne $receipt.visual) {
     if ($receipt.visual.verdict -ceq 'FROZEN_DISPLAY') {
         $detail = "INVALID: the job result was $outcome ($detail) but FROZEN_DISPLAY: $($receipt.visual.reason). A leg whose display did not change is not counted, whatever its cadence numbers say"
         $outcome = 'INVALID'
-    } elseif ($receipt.visual.verdict -ceq 'VISUAL_DIVERGENCE') {
-        $detail += "; VISUAL_DIVERGENCE (counted for speed, surfaced for review): $($receipt.visual.reason)"
+    } elseif ($receipt.visual.verdict -cin @('VISUAL_DIVERGENCE', 'FROZEN_DISPLAY_SUSPECTED', 'VISUAL_ASSESSMENT_UNAVAILABLE')) {
+        # (PLAYBACK-FROZEN-DISPLAY-SOURCE-DIFF-1: a single picture over an unknown source, and a leg with no viewport rectangle, are counted and surfaced like a divergence)
+        $detail += "; $($receipt.visual.verdict) (counted for speed, surfaced for review): $($receipt.visual.reason)"
     }
 }
 # GPU-DEVICE-LOSS-SELF-HEAL-1 r7 (sol r6 blocker; ledger scope 2026-10-15T08:05:36Z): every self-heal pre-launch the leg ran must show an OK picture. The fallback
