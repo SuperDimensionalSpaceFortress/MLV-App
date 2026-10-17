@@ -22,6 +22,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from tools.repo_hygiene import runtime_floor_suites as rfs
 
@@ -317,6 +318,30 @@ class ChangedFilesPathTests(unittest.TestCase):
         self.assertEqual([("coord", sorted(names))], [(r["id"], because) for r, because in matched])
         plan = rfs.build_plan(matched, repo.root)
         self.assertEqual([sorted(names)], [t["files"] for t in plan if t["kind"] == "row-note"])
+
+    def test_a_backslash_in_a_git_reported_path_is_kept_on_every_os(self):
+        """git writes ``/`` as the separator in -z output on every OS, so a ``\\`` in a reported name is a legal
+        POSIX filename character; rewriting it names a different, nonexistent file. Reached without creating
+        such a file, so the Windows leg covers the defect the ubuntu leg found."""
+        real = 'tools/coordination/say "hi" \\ tool.ps1'
+        sha = "a" * 40
+
+        def fake_git(worktree, *args, nul=False):
+            if args[0] == "merge-base":
+                return [sha]
+            if args[0] == "diff":
+                return [real] if f"{sha}..HEAD" in args else []
+            return ["fake-git-dir"]
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(rfs, "_git", fake_git):
+            merge_base, changed = rfs.changed_files(Path(tmp), "base")
+        self.assertEqual(sha, merge_base)
+        self.assertEqual([real], changed)
+
+    def test_nul_records_split_without_touching_a_backslash(self):
+        raw = 'tools/a\\b.ps1\0tools/café tool.ps1\0'.encode("utf-8")
+        self.assertEqual(['tools/a\\b.ps1', 'tools/café tool.ps1'], rfs._records(raw, nul=True))
+        self.assertEqual(['one', 'two'], rfs._records(b"one\ntwo\n", nul=False))
 
 
 if __name__ == "__main__":
