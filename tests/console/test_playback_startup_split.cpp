@@ -152,3 +152,215 @@ TEST(PlaybackStartupSplitWiring, TheLineIsPrintedBesideStartupCatchupAndFedFromT
         at = next;
     }
 }
+
+// PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-SETUP-1 Row 0: playback_smoke.first_present_split -- where the first GPU
+// window present itself went (slot outcome, setup parts, recon, AMaZE kernel/download, paint, GUI pickup).
+TEST(PlaybackFirstPresentSplit, TheLineCarriesEveryFieldInOrder)
+{
+    playback_startup_split::FirstPresentSplit fp;
+    fp.slot = QStringLiteral("adopted");
+    fp.handoff = QStringLiteral("direct_device_bayer16");
+    fp.setupProgramMs = 0.5;
+    fp.setupLutMs = 1.25;
+    fp.setupBlurMs = 11.0;
+    fp.setupReallocMs = 0.125;
+    fp.setupSamplingMs = 0.25;
+    fp.reconWallMs = 30.0;
+    fp.amazeKernelMs = 12.5;
+    fp.amazeDownloadMs = 4.0;
+    fp.paintMs = 9.0;
+    fp.guiPickupMs = 40.0;
+    fp.backendPreloaded = true;
+    // PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1 Row 0: the warm witness rides at the end
+    fp.warmRun = true;
+    fp.setClipAtPlay = 0;
+    fp.setLutsAtPlay = 1;
+    ASSERT_EQ(std::string(
+                  "playback_smoke.first_present_split session=7 slot=adopted handoff=direct_device_bayer16 "
+                  "setup_program_ms=0.500 setup_lut_ms=1.250 setup_blur_ms=11.000 setup_realloc_ms=0.125 "
+                  "setup_sampling_ms=0.250 recon_wall_ms=30.000 amaze_kernel_ms=12.500 amaze_download_ms=4.000 "
+                  "paint_ms=9.000 gui_pickup_ms=40.000 backend_preloaded=1 warm_run=1 set_clip_at_play=0 "
+                  "set_luts_at_play=1"),
+              fp.line(7).toStdString());
+}
+
+TEST(PlaybackFirstPresentSplit, ANonWindowFirstPresentPrintsNoneAndZeros)
+{
+    StartupSplit split;
+    ASSERT_EQ(std::string(
+                  "playback_smoke.first_present_split session=2 slot=none handoff=none setup_program_ms=0.000 "
+                  "setup_lut_ms=0.000 setup_blur_ms=0.000 setup_realloc_ms=0.000 setup_sampling_ms=0.000 "
+                  "recon_wall_ms=0.000 amaze_kernel_ms=0.000 amaze_download_ms=0.000 paint_ms=0.000 "
+                  "gui_pickup_ms=0.000 backend_preloaded=0 warm_run=0 set_clip_at_play=0 set_luts_at_play=0"),
+              split.firstPresentLine(2).toStdString());
+    // empty free text never leaves a field without a value
+    playback_startup_split::FirstPresentSplit fp;
+    fp.slot.clear();
+    fp.handoff.clear();
+    ASSERT_TRUE(fp.line(1).contains(QStringLiteral(" slot=none handoff=none ")));
+    // a '%' in free text is printed as is, never substituted
+    fp.handoff = QStringLiteral("odd%1mode");
+    ASSERT_TRUE(fp.line(1).contains(QStringLiteral(" handoff=odd%1mode ")));
+}
+
+TEST(PlaybackFirstPresentSplit, ItIsResetWithTheSessionAndKeptUntilThen)
+{
+    StartupSplit split;
+    playback_startup_split::FirstPresentSplit fp;
+    fp.slot = QStringLiteral("realloc");
+    fp.reconWallMs = 3.0;
+    split.noteFirstPresentSplit(fp);
+    ASSERT_EQ(std::string("realloc"), split.firstPresentSplit().slot.toStdString());
+    ASSERT_TRUE(split.firstPresentLine(4).contains(QStringLiteral(" recon_wall_ms=3.000 ")));
+    split.reset();
+    ASSERT_EQ(std::string("none"), split.firstPresentSplit().slot.toStdString());
+    ASSERT_NEAR(0.0, split.firstPresentSplit().reconWallMs, 1e-9);
+}
+
+TEST(PlaybackFirstPresentSplit, GuiPickupIsRenderDoneToGuiPresentStart)
+{
+    using playback_startup_split::guiPickupMs;
+    ASSERT_NEAR(40.0, guiPickupMs(10.000, 10.040), 1e-6);
+    ASSERT_NEAR(0.0, guiPickupMs(0.0, 10.040), 1e-9);   // render stamp unknown
+    ASSERT_NEAR(0.0, guiPickupMs(10.050, 10.040), 1e-9); // out of order: never negative
+}
+
+TEST(PlaybackFirstPresentSplitWiring, PrintedAfterStartupSplitAndFedFromTheFirstPresentsTelemetry)
+{
+    const QString source = mainWindowSource();
+    const int split = source.indexOf(QStringLiteral(
+        "qInfo().noquote() << m_playbackStartupSplit.line( static_cast<qulonglong>( m_playbackSmokeSessionId ) );"));
+    const int firstPresent = source.indexOf(QStringLiteral(
+        "qInfo().noquote() << m_playbackStartupSplit.firstPresentLine( static_cast<qulonglong>( m_playbackSmokeSessionId ) );"));
+    const int gpu = source.indexOf(QStringLiteral("\"playback_smoke.gpu_summary session=%1 cpu_frames=%2 \""));
+    ASSERT_TRUE(split >= 0);
+    ASSERT_TRUE(firstPresent > split);
+    ASSERT_TRUE(gpu > firstPresent);
+    // the window's setup split of the first call carries the slot outcome and the AMaZE-only parts
+    ASSERT_TRUE(source.contains(QStringLiteral(
+        "QStringLiteral(\"gpu_playback_recon_texture_present_slot\"),\n"
+        "                QString::fromLatin1( st.slot ? st.slot : \"none\" ) );")));
+    ASSERT_TRUE(source.contains(QStringLiteral(
+        "QStringLiteral(\"gpu_playback_recon_texture_present_amaze_download_ms\"), st.amaze_download_ms );")));
+    const QString finish = bodyBetween(source, QStringLiteral("void MainWindow::finishPresentedFrame( uint64_t displayFrame,"),
+                                       QStringLiteral("void MainWindow::drawFrameReady()"));
+    ASSERT_FALSE(finish.isEmpty());
+    const int firstNote = finish.indexOf(QStringLiteral("m_playbackStartupSplit.noteFirstPresent( splitRenderMs, splitGuiPresentMs );"));
+    const int fed = finish.indexOf(QStringLiteral("m_playbackStartupSplit.noteFirstPresentSplit( fp );"));
+    ASSERT_TRUE(firstNote >= 0);
+    ASSERT_TRUE(fed > firstNote);
+    const QString feed = finish.mid(firstNote, fed - firstNote);
+    ASSERT_TRUE(feed.contains(QStringLiteral("    if( splitFirst )\n")));
+    ASSERT_TRUE(feed.contains(QStringLiteral(
+        "fp.guiPickupMs = playback_startup_split::guiPickupMs( readyFrame.frameReadyEmitStageTime, displayStart );")));
+    ASSERT_TRUE(feed.contains(QStringLiteral("fp.backendPreloaded = m_playbackReconBackendPreloaded;")));
+    ASSERT_TRUE(feed.contains(QStringLiteral("\"gpu_playback_recon_texture_present_post_ms\"")));
+    // and the window records both parts on every present
+    const QString windowPath = repo_file_path(QStringLiteral("platform/qt/GpuDisplayWindow.cpp"));
+    QFile windowFile(windowPath);
+    ASSERT_TRUE(windowFile.open(QIODevice::ReadOnly | QIODevice::Text));
+    const QString window = QTextStream(&windowFile).readAll();
+    ASSERT_TRUE(window.contains(QStringLiteral("setupTiming.amaze_download_ms = amazeTiming.downloadMs;")));
+    ASSERT_TRUE(window.contains(QStringLiteral("setupTiming.slot = \"kept\";")));
+}
+
+// PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1 Row 0: the warm witness (warm_run, set_clip_at_play, set_luts_at_play on
+// first_present_split) and playback_smoke.render_first_split from the first frame's existing stage timers.
+TEST(PlaybackRenderFirstSplit, TheLineCarriesEveryFieldInOrderAndOtherIsTheRest)
+{
+    playback_startup_split::RenderFirstSplit rf;
+    rf.renderFirstMs = 150.0;
+    rf.hasDecode = true;
+    rf.decodeMs = 17.0;
+    rf.hasLlrawproc = true;
+    rf.llrawprocMs = 120.5;
+    ASSERT_NEAR(12.5, rf.otherMs(), 1e-9);
+    ASSERT_EQ(std::string(
+                  "playback_smoke.render_first_split session=5 render_first_ms=150.000 decode_ms=17.000 "
+                  "llrawproc_ms=120.500 recon_run_ms=NA other_ms=12.500"),
+              rf.line(5).toStdString());
+}
+
+TEST(PlaybackRenderFirstSplit, APartWithoutATimerIsNAAndOtherNeverGoesNegative)
+{
+    playback_startup_split::RenderFirstSplit rf;
+    rf.renderFirstMs = 40.0;
+    ASSERT_EQ(std::string(
+                  "playback_smoke.render_first_split session=1 render_first_ms=40.000 decode_ms=NA llrawproc_ms=NA "
+                  "recon_run_ms=NA other_ms=40.000"),
+              rf.line(1).toStdString());
+    rf.hasDecode = true;
+    rf.decodeMs = 30.0;
+    rf.hasLlrawproc = true;
+    rf.llrawprocMs = 30.0;   // timers from different clocks can sum past render_first
+    ASSERT_NEAR(0.0, rf.otherMs(), 1e-9);
+    // a recon-run timer counts only when llrawproc (which holds the run) has none
+    playback_startup_split::RenderFirstSplit run;
+    run.renderFirstMs = 100.0;
+    run.hasReconRun = true;
+    run.reconRunMs = 60.0;
+    ASSERT_NEAR(40.0, run.otherMs(), 1e-9);
+    run.hasLlrawproc = true;
+    run.llrawprocMs = 80.0;
+    ASSERT_NEAR(20.0, run.otherMs(), 1e-9);
+}
+
+TEST(PlaybackRenderFirstSplit, ItIsResetWithTheSession)
+{
+    StartupSplit split;
+    playback_startup_split::RenderFirstSplit rf;
+    rf.renderFirstMs = 99.0;
+    split.noteRenderFirstSplit(rf);
+    ASSERT_NEAR(99.0, split.renderFirstSplit().renderFirstMs, 1e-9);
+    ASSERT_TRUE(split.renderFirstLine(2).contains(QStringLiteral(" render_first_ms=99.000 ")));
+    split.reset();
+    ASSERT_NEAR(0.0, split.renderFirstSplit().renderFirstMs, 1e-9);
+    ASSERT_TRUE(split.renderFirstLine(2).contains(QStringLiteral(" decode_ms=NA ")));
+    // and the first-present witness resets too
+    playback_startup_split::FirstPresentSplit fp;
+    fp.warmRun = true;
+    fp.setClipAtPlay = 3;
+    split.noteFirstPresentSplit(fp);
+    ASSERT_TRUE(split.firstPresentLine(1).contains(QStringLiteral(" warm_run=1 set_clip_at_play=3 set_luts_at_play=0")));
+    split.reset();
+    ASSERT_TRUE(split.firstPresentLine(1).contains(QStringLiteral(" warm_run=0 set_clip_at_play=0 set_luts_at_play=0")));
+}
+
+TEST(PlaybackRenderFirstSplitWiring, FedFromTheFirstPresentAndPrintedAfterTheFirstPresentLine)
+{
+    const QString source = mainWindowSource();
+    const int firstPresent = source.indexOf(QStringLiteral(
+        "qInfo().noquote() << m_playbackStartupSplit.firstPresentLine( static_cast<qulonglong>( m_playbackSmokeSessionId ) );"));
+    const int renderFirst = source.indexOf(QStringLiteral(
+        "qInfo().noquote() << m_playbackStartupSplit.renderFirstLine( static_cast<qulonglong>( m_playbackSmokeSessionId ) );"));
+    const int gpu = source.indexOf(QStringLiteral("\"playback_smoke.gpu_summary session=%1 cpu_frames=%2 \""));
+    ASSERT_TRUE(firstPresent >= 0);
+    ASSERT_TRUE(renderFirst > firstPresent);
+    ASSERT_TRUE(gpu > renderFirst);
+    const QString finish = bodyBetween(source, QStringLiteral("void MainWindow::finishPresentedFrame( uint64_t displayFrame,"),
+                                       QStringLiteral("void MainWindow::drawFrameReady()"));
+    ASSERT_FALSE(finish.isEmpty());
+    const int splitFirst = finish.indexOf(QStringLiteral("    if( splitFirst )\n"));
+    const int fpFed = finish.indexOf(QStringLiteral("m_playbackStartupSplit.noteFirstPresentSplit( fp );"));
+    const int rfFed = finish.indexOf(QStringLiteral("m_playbackStartupSplit.noteRenderFirstSplit( rf );"));
+    ASSERT_TRUE(splitFirst >= 0);
+    ASSERT_TRUE(fpFed > splitFirst);
+    ASSERT_TRUE(rfFed > fpFed);
+    const QString feed = finish.mid(splitFirst, rfFed - splitFirst);
+    // the witness: the session's set_clip / set_luts calls up to the first present, from the session-start baselines
+    ASSERT_TRUE(feed.contains(QStringLiteral("fp.warmRun = m_playbackReconWarmRan;")));
+    ASSERT_TRUE(feed.contains(QStringLiteral(
+        "fp.setClipAtPlay = static_cast<long long>( llrpGpuPlaybackReconSetClipCount() - m_playbackSmokeStartGpuSetClipCount );")));
+    ASSERT_TRUE(feed.contains(QStringLiteral(
+        "fp.setLutsAtPlay = static_cast<long long>( llrpGpuPlaybackReconSetLutsCount() - m_playbackSmokeStartGpuSetLutsCount );")));
+    // existing timers only: render_first is the startup_split's own, the parts are keys the frame already carries
+    ASSERT_TRUE(feed.contains(QStringLiteral("rf.renderFirstMs = telemetryDoubleValue( t, \"render_thread_total_ms\" );")));
+    ASSERT_TRUE(feed.contains(QStringLiteral("rf.hasDecode = t.contains( QStringLiteral( \"raw_uint16_ms\" ) );")));
+    ASSERT_TRUE(feed.contains(QStringLiteral("rf.hasLlrawproc = t.contains( QStringLiteral( \"llrawproc_total_ms\" ) );")));
+    ASSERT_FALSE(feed.contains(QStringLiteral("mlv_stage_timing_now")));
+    ASSERT_FALSE(feed.contains(QStringLiteral("QElapsedTimer")));
+    // the baselines are taken at the smoke session start
+    ASSERT_TRUE(source.contains(QStringLiteral(
+        "    m_playbackSmokeStartGpuSetClipCount = llrpGpuPlaybackReconSetClipCount();\n"
+        "    m_playbackSmokeStartGpuSetLutsCount = llrpGpuPlaybackReconSetLutsCount();\n")));
+}

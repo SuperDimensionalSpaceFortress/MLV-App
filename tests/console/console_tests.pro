@@ -79,6 +79,8 @@ SOURCES += \
     $$REPO_ROOT/tests/console/test_playback_env_flags.cpp \
     $$REPO_ROOT/tests/console/test_playback_first_present_identity.cpp \
     $$REPO_ROOT/tests/console/test_playback_route_prewarm_policy.cpp \
+    $$REPO_ROOT/tests/console/test_playback_route_staged_slot_policy.cpp \
+    $$REPO_ROOT/tests/console/test_playback_recon_warm_run_policy.cpp \
     $$REPO_ROOT/tests/console/test_playback_decode_render_overlap.cpp \
     $$REPO_ROOT/tests/console/test_playback_swap_interval.cpp \
     $$REPO_ROOT/tests/console/test_cuda_launch_timing.cpp \
@@ -136,6 +138,8 @@ HEADERS += \
     $$REPO_ROOT/platform/qt/PlaybackWorkerJoin.h \
     $$REPO_ROOT/platform/qt/PlaybackFirstPresentIdentity.h \
     $$REPO_ROOT/platform/qt/PlaybackRoutePrewarmPolicy.h \
+    $$REPO_ROOT/platform/qt/PlaybackRouteStagedSlotPolicy.h \
+    $$REPO_ROOT/platform/qt/PlaybackReconWarmRunPolicy.h \
     $$REPO_ROOT/platform/qt/GpuTexturePresentAvailabilityPolicy.h \
     $$REPO_ROOT/platform/qt/DisplayDeviceMapping.h \
     $$REPO_ROOT/tools/gpu/backend/igpu_launch_timing_format.h \
