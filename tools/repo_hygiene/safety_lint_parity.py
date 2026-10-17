@@ -21,7 +21,8 @@ THE CORPUS has two sources, both reported per row:
     naming the source.  This is where rows live that no test file on the head carries (the #455 and #465 branches' rows).
   * rows DERIVED at run time by importing the head's own test modules (`CASES` of test_mlv_never_authorized.py with
     expect == DENY; the must-refuse tuples of test_hub_vm_no_local_playback.py), so a deny row added to either suite joins the
-    comparison with no edit here, UNIONED BY ID with the same rows read from the baseline's copy of those two modules (r5).
+    comparison with no edit here, UNIONED BY ID with the same rows read from the baseline's copy of those two modules (r5; since r6 BY (ID,
+    CONTENT), since r8 a hook twin whose BUILT stimulus differs between the two builders also keeps its baseline row: see the r8 paragraph).
     A derived row that cannot be built is an ERROR, never a skip.
 
 EXIT CODES.  0 = no unlisted LOOSENED row and no error.  1 = at least one unlisted LOOSENED row (reported even when an error
@@ -52,8 +53,18 @@ parsed is an ERROR (exit 2); a corpus path that does not exist at the base at al
 as a `note:` line and unions nothing.  `--no-derived` still means the head's JSON corpus alone.  Playback derived ids already carry
 the sentence's hash, so a reworded sentence was always a different row and needed no change.
 
+THE BUILT STIMULUS, AND THE DERIVED PLAYBACK IDS (r8, acting-cos Dot B3 and B4 on c722b29c).  B3: the (id, content) key of a derived hook row is
+the CASES fields, so a head that kept a CASES entry and changed the BUILDER (`_substitute`, `_render_content`, a fixture, the enable-literal
+binder) fed BOTH lints the head-built command while the baseline-built command, the one master denies, never reached the head's lint.  For
+every (id, content) twin the two builders' stimuli (stdin text, environment, venue; the scratch dir's random name masked) are now compared,
+and a baseline row whose stimulus differs joins as `<id>@base-<hash>` like any other base row.  A builder that raises counts as different.
+When the head's hook test module is the baseline's text (modulo line endings; it imports only the standard library) nothing is built twice.
+B4: a derived playback id carries the hash of its sentence, and a static corpus row that holds such an id with DIFFERENT text is REFUSED
+(exit 2, the id named); r5-r7 resolved the clash silently in favour of the static row, so a harmless row under a derived id deleted the
+original sentence from the comparison.  The same id and the same text is one sentence, compared once.
+
 ALLOW-LIST ENTRIES ARE BOUND TO THE ROW'S TEXT (r5, CoS I2).  An entry carries the row id AND `hash`, the short_hash of the row's text
-(a hook row's command, a playback row's sentence); the LOOSENED line prints it.  A row whose id matches but whose text hash does not
+(a hook row's command, a playback row's sentence; r8: for a static hook row the JSON of [hook, command, tool, cwd, board root]); the LOOSENED line prints it.  A row whose id matches but whose text hash does not
 is treated as unlisted, so editing a row's text under an old id cannot inherit an old excuse.
 
 KNOWN LIMITS.
@@ -311,10 +322,30 @@ def load_allow(path: Path) -> dict[str, dict]:
 class HookCase:
     """One hook row: how to build (stdin text, environment, venue) on demand, and a cleanup for its tmp board."""
 
-    def __init__(self, row_id: str, why: str, source: str, build):
+    def __init__(self, row_id: str, why: str, source: str, build, tmp_names: list | None = None):
         self.id, self.why, self.source, self.build = row_id, why, source, build
         self.display = ""
         self.text = ""  # the row's full, run-stable text: what an allow-list entry's `hash` is taken over
+        # r8 (B3): `build` appends the basename of the scratch dir it made, so `stimulus` can mask the one part that differs between two builds
+        self.tmp_names = tmp_names if tmp_names is not None else []
+
+    def stimulus(self) -> str:
+        """The BUILT stimulus of this row (stdin text, environment, venue), canonicalised: the scratch dir's random name is masked.
+
+        r8 (B3, acting-cos Dot on c722b29c).  `text` is the CASES fields only, so two builders that read the same entry and produce
+        different commands (a changed `_substitute`, `_render_content`, fixture or enable-literal binder) share one content hash.  The
+        union compares this string for such twins; it is deterministic across two builds of one module once the tmp name is masked."""
+        del self.tmp_names[:]
+        stdin_text, env, venue, cleanup = self.build()
+        try:
+            blob = repr((stdin_text, sorted(env.items()), venue))
+            names = list(self.tmp_names)
+        finally:
+            with contextlib.suppress(Exception):
+                cleanup()
+        for name in names:
+            blob = re.sub(re.escape(name), "<TMP>", blob, flags=re.IGNORECASE)
+        return blob
 
 
 def _hook_env(paths: dict, overrides: dict, unset, venue_key: str) -> tuple[dict, str | None]:
@@ -346,10 +377,12 @@ def _hook_cases_from(tm, source: str, which: str) -> list[HookCase]:
         while row_id in used:
             row_id += "-x"
         used.add(row_id)
+        tmp_names: list[str] = []  # r8 (B3): see HookCase.stimulus
 
-        def build(case=case, tm=tm):
+        def build(case=case, tm=tm, tmp_names=tmp_names):
             probe = tm.MlvNeverAuthorizedHookTests("test_hook_script_is_present_on_this_ref")
             probe.setUp()
+            tmp_names.append(os.path.basename(probe.tmp))
             overrides = tm.FIXTURES[case.get("fixture", "default")](probe.paths)
             probe._bind_the_enable_literal()
             if "raw" in case:
@@ -361,7 +394,7 @@ def _hook_cases_from(tm, source: str, which: str) -> list[HookCase]:
             return stdin_text, env, venue, probe.doCleanups
 
         hc = HookCase(row_id, f"{HOOK_TEST_REL} CASES[{case['name']!r}] (group {case.get('group')}, {case.get('na', '?')}; {which} copy)",
-                      source, build)
+                      source, build, tmp_names)
         hc.display = str(case.get("input", case.get("raw", "")))[:200]
         # r6 (CoS B2): the hashed text is EVERYTHING in the case that decides the verdict: tool, input, fixture (the environment the row
         # runs under) and raw (the stdin text of a raw row).  A fixture swap changes the verdict without changing the input.
@@ -371,18 +404,31 @@ def _hook_cases_from(tm, source: str, which: str) -> list[HookCase]:
     return cases
 
 
-def union_hook_cases(head: list[HookCase], base: list[HookCase]) -> list[HookCase]:
+def union_hook_cases(head: list[HookCase], base: list[HookCase], same_source: bool = False) -> list[HookCase]:
     """Head cases, plus every baseline case the head lacks by (id, content) (r6, CoS B2: r5 unioned by id alone, and a hook row's id is its
     case NAME, so editing a row's input in place under the same name dropped the baseline's command from the comparison with the
     count unchanged).  A baseline case whose id the head has with a different content hash joins as `<id>@base-<hash>`; one whose id
     the head lacks joins under its own id; an identical (id, content) pair is not duplicated."""
     have = {(c.id, short_hash(c.text)) for c in head}
     head_ids = {c.id for c in head}
+    twins = {(c.id, short_hash(c.text)): c for c in head}  # r8 (B3): the head's row for each (id, content) pair, to compare built stimuli
     out = list(head)
     for case in base:
         digest = short_hash(case.text)
         if (case.id, digest) in have:
-            continue
+            # r8 (B3): the same (id, content) is not the same ROW when the head's builder turns it into a different command.  Keep the
+            # baseline row, built by the BASELINE's builder, as `<id>@base-<hash>` unless both builders produce the same stimulus.  A
+            # builder that raises on either side counts as different (the row then errors visibly instead of being dropped).
+            twin = twins.get((case.id, digest))
+            if twin is not None and not same_source:
+                try:
+                    same = twin.stimulus() == case.stimulus()
+                except Exception:  # noqa: BLE001 - an unbuildable row is kept, never dropped
+                    same = False
+                if same:
+                    continue
+            else:
+                continue
         if case.id in head_ids:
             case.id = f"{case.id}@base-{digest}"
         have.add((case.id, digest))
@@ -391,7 +437,8 @@ def union_hook_cases(head: list[HookCase], base: list[HookCase]) -> list[HookCas
 
 
 def derived_hook_cases(root: Path, base_ref: str | None = None) -> list[HookCase]:
-    """The head's DENY rows, plus (r5, CoS B1) every DENY row only the BASELINE's copy of the suite carries, unioned by id.
+    """The head's DENY rows, plus (r5, CoS B1) every DENY row only the BASELINE's copy of the suite carries, unioned by (id, content) since r6
+    and, since r8, also every (id, content) twin whose baseline-built stimulus differs from the head-built one (B3).
 
     `base_ref` is a git ref or sha.  With it, the baseline's test module is read with `git show` and executed by load_source_as at the
     head test file's own path (so the REPO_ROOT it derives from `__file__` is the head's, as with the r3 root fix); a base-only row
@@ -400,8 +447,17 @@ def derived_hook_cases(root: Path, base_ref: str | None = None) -> list[HookCase
     tm = load_module(root / HOOK_TEST_REL, "parity_head_hook_tests")
     cases = _hook_cases_from(tm, "derived", "head")
     if base_ref:
-        base_tm = load_source_as(git(root, "show", f"{base_ref}:{HOOK_TEST_REL}"), "parity_base_hook_tests", root / HOOK_TEST_REL)
-        cases = union_hook_cases(cases, _hook_cases_from(base_tm, "derived-base", "baseline"))  # r6: by (id, content), was by id alone
+        base_source = git(root, "show", f"{base_ref}:{HOOK_TEST_REL}")
+        base_tm = load_source_as(base_source, "parity_base_hook_tests", root / HOOK_TEST_REL)
+        # r8 (B3): the hook suite imports only the standard library (and the hook, shared by both sides), so when the head module's file is
+        # the baseline's text (modulo line endings) every builder is identical and the per-row stimulus comparison is skipped for speed.
+        # The file LOADED is `__spec__.origin`, not `__file__`: a wrapper module may reassign `__file__` (the scratch heads of the tests do).
+        head_file = getattr(getattr(tm, "__spec__", None), "origin", None)
+        try:
+            same_source = bool(head_file) and Path(head_file).read_text(encoding="utf-8").replace("\r\n", "\n") == base_source.replace("\r\n", "\n")
+        except (OSError, ValueError):
+            same_source = False
+        cases = union_hook_cases(cases, _hook_cases_from(base_tm, "derived-base", "baseline"), same_source)  # r6: by (id, content)
     return cases
 
 
@@ -425,7 +481,9 @@ def corpus_hook_cases(rows: list[dict]) -> list[HookCase]:
 
             hc = HookCase(row_id, row["why"], row.get("source", "corpus"), build)  # r6: "corpus-base" for a row only the baseline's corpus has
             hc.display = row["command"][:200]
-            hc.text = row["command"]
+            # r8 (nonblocking, acting-cos Dot): the hash binds the semantic context too (tool, cwd, board root), not the command alone, so an
+            # allow-list entry for a row cannot excuse the same command run under a different tool, venue or board.
+            hc.text = json.dumps(["hook", row["command"], tool, row.get("cwd"), row.get("board_root")], sort_keys=True, default=str)
             out.append(hc)
     return out
 
@@ -645,7 +703,16 @@ def collect(lints, corpus_path: Path, derived: bool, root: Path = ROOT, base_ref
     if "playback" in lints and (derived or playback):
         extra, pb = derived_playback_rows(root, base_ref)
         if derived:
-            playback = playback + [r for r in extra if r["id"] not in {p["id"] for p in playback}]
+            # r8 (B4, acting-cos Dot on c722b29c): this was `r["id"] not in <static ids>`, so a static row reusing a derived sentence's id
+            # with harmless text removed the original (or baseline) sentence from the comparison.  A derived id carries the hash of its
+            # sentence, so a static row that holds the id with DIFFERENT text is either a mistake or a swap: REFUSED (exit 2), never
+            # resolved in either direction.  The same id AND text is one sentence and is compared once, as the static row.
+            static_text = {p["id"]: p["text"] for p in playback}
+            for r in extra:
+                if r["id"] in static_text and static_text[r["id"]] != r["text"]:
+                    raise ParityError(f"static corpus row {r['id']} reuses the id of a derived playback sentence ({r['source']}) with different text "
+                                      f"(static {short_hash(static_text[r['id']])} vs derived {short_hash(r['text'])}): rename the static row")
+            playback = playback + [r for r in extra if r["id"] not in static_text]
     ids = [c.id for c in hook_cases] + [r["id"] for r in playback]
     dupes = sorted({i for i in ids if ids.count(i) > 1})
     if dupes:

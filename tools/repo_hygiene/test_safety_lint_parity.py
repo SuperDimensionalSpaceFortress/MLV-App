@@ -39,7 +39,9 @@ DENIED = {"id": "t-protected-rd", "lint": "hook", "tool_name": "PowerShell", "bo
           "command": "cmd /c rd /s /q " + BOARD + "/.claude-state/fleet-runs/lane-A-r1", "why": "synthetic: a delete of a protected run dir"}
 
 # r5 (CoS I2): an allow-list entry is bound to the row's text hash; for a hook row that text is its command.
-DENIED_HASH = slp.short_hash(DENIED["command"])
+# r8: for a static hook row that text is [hook, command, tool, cwd, board root] (the command alone, as through r7, let one entry excuse the same
+# command under another tool, venue or board).
+DENIED_HASH = slp.short_hash(json.dumps(["hook", DENIED["command"], DENIED["tool_name"], DENIED["cwd"], DENIED["board_root"]], sort_keys=True, default=str))
 
 ALWAYS_ALLOW_HOOK ="def decide(payload, project_dir):\n    return 0, ''\n\n\ndef main():\n    return 0\n"
 ALWAYS_THROW_HOOK = "def decide(payload, project_dir):\n    raise RuntimeError('synthetic rule crash')\n\n\ndef main():\n    return 0\n"
@@ -183,7 +185,9 @@ class AllowListTests(ParityRunnerCase):
         rc, out = self.cli("--corpus", str(self.corpus(edited)), "--allow", str(self.allow_with(entry)), "--head-hook", str(self.head_hook(ALWAYS_ALLOW_HOOK)))
         self.assertEqual(rc, slp.EXIT_LOOSENED, out)
         self.assertIn("LOOSENED t-protected-rd", out)
-        self.assertIn(f"hash={slp.short_hash(edited['command'])}", out)
+        # r8: the printed hash is over [hook, command, tool, cwd, board root], not the command alone (r5-r7: slp.short_hash(edited['command']))
+        edited_hash = slp.short_hash(json.dumps(["hook", edited["command"], edited["tool_name"], edited["cwd"], edited["board_root"]], sort_keys=True, default=str))
+        self.assertIn(f"hash={edited_hash}", out)
         self.assertIn("treated as unlisted", out)
         self.assertNotIn("ALLOWED-LOOSENED", out)
         self.assertIn("unlisted=1, allowed=0", out)
@@ -195,6 +199,20 @@ class AllowListTests(ParityRunnerCase):
         self.assertIn("unlisted=0, allowed=1", out)
         rc, out = self.cli("--corpus", str(self.corpus(DENIED)), "--allow", str(self.allow), "--head-hook", str(self.head_hook(ALWAYS_ALLOW_HOOK)))
         self.assertIn(f"LOOSENED t-protected-rd [hook] hash={DENIED_HASH}", out)
+
+    def test_r8_the_same_command_under_another_cwd_or_tool_or_board_hashes_differently(self):
+        hashes = {slp.short_hash(slp.corpus_hook_cases([dict(DENIED, **change)])[0].text)
+                  for change in ({}, {"cwd": VENUE + "-other"}, {"tool_name": "Bash"}, {"board_root": BOARD + "-other"})}
+        self.assertEqual(len(hashes), 4, "tool, cwd and board root are part of what an allow entry's hash binds")
+        self.assertIn(DENIED_HASH, hashes)
+
+    def test_r8_an_entry_for_the_command_under_one_cwd_does_not_excuse_it_under_another(self):
+        entry = {"id": "t-protected-rd", "reason": "synthetic intended loosening", "pr": 999, "hash": DENIED_HASH}
+        allow = _write(self.tmp / "allow-bound.json", json.dumps([entry]))
+        moved = dict(DENIED, cwd=VENUE + "-other")
+        rc, out = self.cli("--corpus", str(self.corpus(moved)), "--allow", str(allow), "--head-hook", str(self.head_hook(ALWAYS_ALLOW_HOOK)))
+        self.assertEqual(rc, slp.EXIT_LOOSENED, out)
+        self.assertIn("treated as unlisted", out)
 
     def test_the_tracked_allow_list_starts_empty(self):
         self.assertEqual(slp.load_allow(slp.DEFAULT_ALLOW), {}, "an entry belongs here only with a reason and a PR number, added in review")
@@ -739,6 +757,154 @@ class BaselineCorpusUnionTests(ParityRunnerCase):
         self.assertIn("no baseline corpus", slp.render(report))
 
 
+# r8 B3 (acting-cos Dot on c722b29c): the union kept a baseline hook row only when its (id, content) differed from the head's, and the content
+# is the CASES fields.  A head that left the CASES entry untouched and changed the BUILDER (here `_substitute` appends ` --all`) fed both lints
+# the head's built command, so the baseline-built command (the one master denies) never reached the head's lint.  Now the built stimulus of
+# every (id, content) twin is compared (canonicalised for the tmp dir's random name) and a baseline row whose stimulus differs is kept.
+def _head_hook_tests_source_with_builder_change() -> str:
+    """A scratch head copy of the hook suite: CASES untouched, `_substitute` appends ` --all` to the one command LOOSEN_COMMAND."""
+    real = str(REPO_ROOT / slp.HOOK_TEST_REL)
+    return "\n".join([
+        f"_REAL = {real!r}",
+        "__file__ = _REAL",
+        "exec(compile(open(_REAL, encoding='utf-8').read(), _REAL, 'exec'), globals())",
+        "_orig_substitute = MlvNeverAuthorizedHookTests._substitute",
+        "",
+        "",
+        "def _substitute(self, value):",
+        "    out = _orig_substitute(self, value)",
+        f"    return out + ' --all' if out == {LOOSEN_COMMAND!r} else out",
+        "",
+        "",
+        "MlvNeverAuthorizedHookTests._substitute = _substitute",
+        "",
+    ])
+
+
+class BuilderSemanticsUnionTests(ParityRunnerCase):
+    """r8 B3: a row whose CASES fields are unchanged but whose BUILDER changed still brings its baseline-built stimulus into the comparison."""
+
+    def redirect_head_hook_tests(self, tests: Path):
+        real = slp.load_module
+
+        def load(path, name):
+            return real(tests if Path(path).name == Path(slp.HOOK_TEST_REL).name else path, name)
+        return mock.patch.object(slp, "load_module", load)
+
+    def scratch(self):
+        return (_write(self.tmp / "head_hook.py", _wrapped_head_hook_source()),
+                _write(self.tmp / "head_hook_tests.py", _head_hook_tests_source_with_builder_change()))
+
+    def run_main(self, hook: Path, tests: Path | None):
+        out = io.StringIO()
+        patch = self.redirect_head_hook_tests(tests) if tests else contextlib.nullcontext()
+        with patch, contextlib.redirect_stdout(out):
+            rc = slp.main(["--base", "HEAD", "--lint", "hook", "--corpus", str(self.corpus()), "--allow", str(self.allow), "--head-hook", str(hook)])
+        return rc, out.getvalue()
+
+    def test_B3_the_cases_fields_are_unchanged_but_the_head_builder_feeds_both_lints_a_changed_command(self):
+        _, tests = self.scratch()
+        tm = slp.load_module(tests, "parity_b3_head_tests")
+        base_tm = slp.load_module(REPO_ROOT / slp.HOOK_TEST_REL, "parity_b3_base_tests")
+        row = next(c for c in slp._hook_cases_from(tm, "derived", "head") if c.id == LOOSENED_ROW_ID)
+        row_base = next(c for c in slp._hook_cases_from(base_tm, "derived-base", "baseline") if c.id == LOOSENED_ROW_ID)
+        self.assertEqual(row.text, row_base.text, "the CASES entry is untouched: the content hash cannot see the change")
+        head_stdin, _, _, head_cleanup = row.build()
+        base_stdin, _, _, base_cleanup = row_base.build()
+        head_cleanup()
+        base_cleanup()
+        self.assertIn(LOOSEN_COMMAND + " --all", json.loads(head_stdin)["tool_input"]["command"], "the head builder appended --all")
+        self.assertEqual(json.loads(base_stdin)["tool_input"]["command"], LOOSEN_COMMAND, "the baseline builder did not")
+
+    def test_B3_the_baseline_built_stimulus_is_kept_and_judged_loosened(self):
+        hook, tests = self.scratch()
+        # the control: the same scratch hook over the UNEDITED suite, which names the rows this temp layout already reads as LOOSENED (r7)
+        control_rc, control_out = self.run_main(hook, None)
+        control_ids = _loosened_ids(control_out)
+        self.assertIn(LOOSENED_ROW_ID, control_ids)
+        phantom = sorted(set(control_ids) - {LOOSENED_ROW_ID})
+        with self.redirect_head_hook_tests(tests):
+            head_ids = [c.id for c in slp.derived_hook_cases(REPO_ROOT)]
+        self.assertEqual(len(head_ids), EXACT_DERIVED_HOOK_ROWS, "the count pin stays green: this is the CoS B3 repro")
+        rc, out = self.run_main(hook, tests)
+        self.assertEqual(rc, slp.EXIT_LOOSENED, out)
+        self.assertRegex(out, rf"LOOSENED {LOOSENED_ROW_ID}@base-[0-9a-f]{{10}} ")
+        self.assertIn("master=DENY head=ALLOW", out)
+        edited_ids = _loosened_ids(out)
+        self.assertEqual(sorted(i for i in edited_ids if "@base-" not in i), phantom, "the head-built row is DENIED by both lints, so it is not loosened")
+        self.assertEqual(len([i for i in edited_ids if i.startswith(LOOSENED_ROW_ID + "@base-")]), 1)
+
+    def test_B3_with_an_identical_builder_the_union_adds_no_row(self):
+        union = slp.derived_hook_cases(REPO_ROOT, "HEAD")
+        self.assertEqual(len(union), EXACT_DERIVED_HOOK_ROWS, "same module on both sides: every stimulus is equal, nothing joins")
+        self.assertEqual([c.id for c in union if "@base-" in c.id], [])
+
+    def test_B3_a_builder_that_cannot_be_built_keeps_the_baseline_row_instead_of_dropping_it(self):
+        real_build = slp.HookCase.stimulus
+
+        def boom(self):
+            if self.id == LOOSENED_ROW_ID:
+                raise RuntimeError("synthetic: this row's builder crashes")
+            return real_build(self)
+        # a head module whose text differs from the baseline's (the scratch builder change) so the comparison really runs
+        _, tests = self.scratch()
+        with self.redirect_head_hook_tests(tests), mock.patch.object(slp.HookCase, "stimulus", boom):
+            union = slp.derived_hook_cases(REPO_ROOT, "HEAD")
+        self.assertEqual(len([c.id for c in union if c.id.startswith(LOOSENED_ROW_ID + "@base-")]), 1)
+        self.assertEqual(len([c for c in union if c.id == LOOSENED_ROW_ID]), 1, "the head's own row stays")
+
+
+# r8 B4 (acting-cos Dot on c722b29c): derived playback rows were suppressed solely by the static corpus's ids, so a static row reusing a
+# derived row's id with harmless text removed the derived sentence from the comparison.  Chosen fix: REFUSE (exit 2, named reason) a static
+# row whose id is a derived row's id but whose text differs; an identical id AND text is the same sentence and is compared once.
+class StaticRowReusesDerivedPlaybackIdTests(ParityRunnerCase):
+    def derived_row(self):
+        rows, _ = slp.derived_playback_rows(REPO_ROOT)
+        return rows[0]
+
+    def static_playback(self, row_id: str, text: str) -> dict:
+        return {"id": row_id, "lint": "playback", "text": text, "why": "synthetic: a static row that reuses a derived playback id"}
+
+    def test_B4_a_static_row_with_a_derived_id_and_harmless_text_is_refused_not_a_silent_replacement(self):
+        victim = self.derived_row()
+        corpus = self.corpus(self.static_playback(victim["id"], "ls -la"))
+        with self.assertRaises(slp.ParityError) as caught:
+            slp.collect(("playback",), corpus, True, REPO_ROOT, "HEAD")
+        message = str(caught.exception)
+        self.assertIn(victim["id"], message)
+        self.assertIn("different text", message)
+
+    def test_B4_the_refusal_is_exit_2_with_the_reason_on_the_summary_line(self):
+        victim = self.derived_row()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = slp.main(["--base", "HEAD", "--lint", "playback", "--corpus", str(self.corpus(self.static_playback(victim["id"], "ls -la"))), "--allow", str(self.allow)])
+        self.assertEqual(rc, slp.EXIT_UNDECIDED, out.getvalue())
+        self.assertIn("CANNOT-DECIDE", out.getvalue())
+        self.assertIn(victim["id"], out.getvalue())
+
+    def test_B4_the_derived_sentence_is_never_dropped_from_the_comparison(self):
+        victim = self.derived_row()
+        try:
+            _, rows, _ = slp.collect(("playback",), self.corpus(self.static_playback(victim["id"], "ls -la")), True, REPO_ROOT, "HEAD")
+        except slp.ParityError:
+            return  # refused: the sentence stays in the comparison because nothing runs on a refused corpus
+        self.assertIn(victim["text"], [r["text"] for r in rows], "the derived sentence must still be compared")
+
+    def test_B4_an_identical_id_and_text_is_one_row_not_a_refusal(self):
+        victim = self.derived_row()
+        _, rows, _ = slp.collect(("playback",), self.corpus(self.static_playback(victim["id"], victim["text"])), True, REPO_ROOT, "HEAD")
+        self.assertEqual([r["id"] for r in rows].count(victim["id"]), 1)
+        self.assertEqual([r["text"] for r in rows if r["id"] == victim["id"]], [victim["text"]])
+
+    def test_B4_a_static_row_with_its_own_id_leaves_every_derived_row_in_place(self):
+        derived, _ = slp.derived_playback_rows(REPO_ROOT, "HEAD")
+        _, rows, _ = slp.collect(("playback",), self.corpus(self.static_playback("t-b4-own-id", "ls -la")), True, REPO_ROOT, "HEAD")
+        # the baseline's tracked corpus is unioned in too (r6), so the count is not derived + 1; what must hold is that nothing is lost
+        self.assertIn("t-b4-own-id", [r["id"] for r in rows])
+        self.assertEqual({r["id"] for r in derived} - {r["id"] for r in rows}, set())
+
+
 def _baseline_sha() -> str | None:
     """The merge-base of HEAD and the first baseline ref that resolves (PARITY_BASELINE_REF overrides), or None.
 
@@ -768,8 +934,11 @@ class HeadVersusBaselineGateTests(unittest.TestCase):
         same = subprocess.run(["git", "-C", str(REPO_ROOT), "diff", "--quiet", sha, "--", slp.HOOK_REL, slp.LINT_REL], timeout=60)
         if same.returncode == 0:
             self.skipTest(f"both lints are byte-identical to the baseline's at {sha[:8]}; nothing to compare")
+        if not PWSH and os.environ.get("GITHUB_ACTIONS") == "true":
+            # r8 (nonblocking, acting-cos Dot): without pwsh the playback half silently dropped out of the hosted gate; hosted runners have pwsh
+            raise AssertionError("pwsh is not on PATH in hosted CI: the playback half of the parity gate would be skipped silently")
         report = slp.run(sha, slp.LINTS if PWSH else ("hook",))
-        loosened = [f"{r['id']}: {r['display']}" for r in report["results"] if r["class"] == "LOOSENED" and not r["allowed"]]
+        loosened =[f"{r['id']}: {r['display']}" for r in report["results"] if r["class"] == "LOOSENED" and not r["allowed"]]
         self.assertEqual(loosened, [], "master DENIES, head ALLOWS; fix the lint, or list the row in safety_lint_parity_allow.json with a reason and a PR")
         self.assertEqual([r["id"] for r in report["results"] if r["class"] == "error"], [], "a row that cannot be run is never a pass")
 
