@@ -2214,6 +2214,36 @@
       ]
     },
     {
+      "path": "tests/console/test_playback_startup_split.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , rf . otherMs ( ) , 1 e - 9 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1 Row 0 pure-function unit test APartWithoutATimerIsNAAndOtherNeverGoesNegative: synthetic decode + llrawproc parts summing past a synthetic render_first must clamp other_ms to 0, never negative. Test-constructed values, no live clock; it checks the clamp, not that any stage ran.",
+      "lines": [
+        296
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_startup_split.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , split . renderFirstSplit ( ) . renderFirstMs , 1 e - 9 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1 Row 0 pure-function unit test ItIsResetWithTheSession: a synthetic RenderFirstSplit (renderFirstMs=99.0) noted on a StartupSplit must read back 0 after reset(). Test-constructed value, no live clock; it checks the reset, not that any stage ran.",
+      "lines": [
+        317
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_recon_warm_run_policy.cpp",
+      "anchor": "ASSERT_TRUE ( playback_recon_warm_run :: kRepostDelayMs > 0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1 Row W pure-policy unit test: the warm's re-post delay constant is positive (a 0 ms re-post would spin the GUI event loop while real work is pending). A compile-time constant, no clock read; it pins the policy value, not that anything ran.",
+      "lines": [
+        123
+      ]
+    },
+    {
       "path": "tests/pipeline/test_gpu_playback_recon_preload.cpp",
       "anchor": "ASSERT_TRUE ( loadMs >= 0.0 ) ;",
       "class": "not_run_proof_structural",

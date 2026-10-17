@@ -456,7 +456,7 @@ TEST(PlaybackReconWarmRunWiring, TheGuiReleasesTheTokenOnEveryPath)
     ASSERT_TRUE(outstanding > release);
     ASSERT_TRUE(log > outstanding);
     // the release is unconditional: the line before it closes the AMaZE if/else at function level
-    ASSERT_TRUE(done.mid(amaze, release - amaze).contains(QStringLiteral("\n    }\n    line.released")));
+    ASSERT_TRUE(done.mid(amaze, release - amaze).endsWith(QStringLiteral("\n    }\n    ")));
     ASSERT_EQ(1, done.count(QStringLiteral("llrpGpuPlaybackReconReleaseRetainedDeviceBayer16(")));
 }
 
