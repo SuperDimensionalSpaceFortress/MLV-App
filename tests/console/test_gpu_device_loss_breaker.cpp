@@ -416,6 +416,72 @@ QStringList capturingUnlocksWithoutSuppression(const QString & source)
 {
     return capturingUnlockCensus(source).missing;
 }
+
+// r3 (CoS I3): discovery sees only bodies whose "{" is a column-0 line of its own, so a one-line definition
+// (`int f(int wait_ms) {`) would hide a section. Two guards close that. (1) No column-0 line ends in ") {".
+QStringList columnZeroOneLineDefinitions(const QString & source)
+{
+    QStringList found;
+    const QStringList lines = source.split(QLatin1Char('\n'));
+    for (int i = 0; i < lines.size(); ++i)
+    {
+        const QString & line = lines.at(i);
+        if (!line.isEmpty() && !line.at(0).isSpace() && line.trimmed().endsWith(QStringLiteral(") {")))
+            found << QStringLiteral("llrawproc.c:%1").arg(i + 1);
+    }
+    return found;
+}
+
+// (2) Every backend unlock lies inside a discovered section or one of these bodies, which hold the unlock but never
+// emit (a listed body that gains an emit is discovered, and fails the census line in the test below).
+const QStringList & nonEmittingUnlockBodies()
+{
+    static const QStringList bodies = {
+        QStringLiteral("llrpGpuPlaybackReconGetBackendInfo"),
+        QStringLiteral("llrpGpuPlaybackReconGetBackendInfoWithin"),
+        QStringLiteral("llrpInstallFakeGpuPlaybackReconBackendForTesting"),
+        QStringLiteral("llrpFakeGpuBackendFailCreateForTesting"),
+        QStringLiteral("llrpHoldGpuReconBackendMutexForTesting"),
+        QStringLiteral("llrpSetFakeGpuBackendReducedIsoNotchSymbolForTesting"),
+        QStringLiteral("llrawproc_gpu_recon_backend_available_guarded"),
+        QStringLiteral("llrpGpuPlaybackReconCopyLastDeviceBayer16ToGlTexture"),
+        QStringLiteral("llrpGpuPlaybackReconReleaseRetainedDeviceBayer16"),
+        QStringLiteral("llrpGpuPlaybackReconRetainedOutstandingCount"),
+        QStringLiteral("llrpGpuPlaybackReconClipDimsChangeRefusals"),
+        QStringLiteral("llrpGpuPlaybackReconReducedIsoNotchAvailable")};
+    return bodies;
+}
+
+// The column-0 body holding each backend unlock, in source order ("" when no column-0 body holds it).
+QStringList backendUnlockOwners(const QString & source)
+{
+    QStringList owners;
+    const QString unlock = QStringLiteral("_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex)");
+    for (int at = source.indexOf(unlock); at >= 0; at = source.indexOf(unlock, at + 1))
+    {
+        const int open = source.lastIndexOf(QStringLiteral("\n{\n"), at);
+        const int close = open < 0 ? -1 : source.indexOf(QStringLiteral("\n}"), open + 2);
+        owners << ((open >= 0 && close > at) ? functionNameBefore(source, open) : QString());
+    }
+    return owners;
+}
+
+QStringList unlocksOutsideKnownBodies(const QString & source)
+{
+    const QStringList sites = capturingUnlockCensus(source).sites;
+    const QStringList owners = backendUnlockOwners(source);
+    const QString unlock = QStringLiteral("_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex)");
+    QStringList outside;
+    int at = -1;
+    for (const QString & owner : owners)
+    {
+        at = source.indexOf(unlock, at + 1);
+        if (owner.isEmpty() || (!sites.contains(owner) && !nonEmittingUnlockBodies().contains(owner)))
+            outside << QStringLiteral("llrawproc.c:%1 (%2)").arg(source.left(at).count(QLatin1Char('\n')) + 1)
+                           .arg(owner.isEmpty() ? QStringLiteral("no column-0 body") : owner);
+    }
+    return outside;
+}
 } // namespace
 
 TEST(GpuDeviceLossBreaker, EveryCapturingUnlockSuppressesOnADeviceLossBeforeReleasing)
@@ -448,6 +514,33 @@ TEST(GpuDeviceLossBreaker, EveryCapturingUnlockSuppressesOnADeviceLossBeforeRele
     // ...and the same copy left in its scanning shape is discovered and passes.
     ASSERT_EQ(5, (int)capturingUnlockCensus(llrawproc + QStringLiteral("\n") + fifthSite).sites.size());
     ASSERT_EQ(0, (int)capturingUnlocksWithoutSuppression(llrawproc + QStringLiteral("\n") + fifthSite).size());
+    // r3 (CoS I3): the two guards hold on this tree, and every listed non-emitting body still holds an unlock.
+    ASSERT_EQ(std::string(), columnZeroOneLineDefinitions(llrawproc).join(QStringLiteral(", ")).toStdString());
+    ASSERT_EQ(std::string(), unlocksOutsideKnownBodies(llrawproc).join(QStringLiteral(", ")).toStdString());
+    for (const QString & body : nonEmittingUnlockBodies())
+        ASSERT_EQ(body.toStdString() + " holds an unlock",
+                  body.toStdString() + (backendUnlockOwners(llrawproc).contains(body) ? " holds an unlock" : " holds no unlock"));
+    // RED row (the CoS I3 reproduction): the fifth copy written as a one-line definition with its scan dropped. The
+    // census alone still finds the four sections and nothing missing; both guards report it.
+    const QString oneLineFifth = replacedOnce(
+        replacedOnce(fifthSite, scanThenUnlock, QStringLiteral("    pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);\n")),
+        QStringLiteral("int llrpFifthCapturingSiteMutant(int wait_ms)\n{"), QStringLiteral("int llrpFifthKR(int wait_ms) {"));
+    const QString withOneLineFifth = llrawproc + QStringLiteral("\n") + oneLineFifth;
+    ASSERT_EQ(4, (int)capturingUnlockCensus(withOneLineFifth).sites.size());
+    ASSERT_EQ(0, (int)capturingUnlocksWithoutSuppression(withOneLineFifth).size());
+    ASSERT_EQ(QStringLiteral("llrawproc.c:%1").arg(llrawproc.count(QLatin1Char('\n')) + 2).toStdString(),
+              columnZeroOneLineDefinitions(withOneLineFifth).join(QStringLiteral(", ")).toStdString());
+    const QStringList oneLineOutside = unlocksOutsideKnownBodies(withOneLineFifth);
+    ASSERT_EQ(1, (int)oneLineOutside.size());
+    ASSERT_EQ(std::string("(no column-0 body)"), oneLineOutside.at(0).mid(oneLineOutside.at(0).indexOf(QLatin1Char('('))).toStdString());
+    // ...and a new column-0 body holding the unlock that is neither discovered nor listed is reported by name.
+    const QString unlisted = llrawproc + QStringLiteral(
+        "\nstatic int a_new_unlocking_body(void)\n{\n"
+        "    pthread_mutex_lock(&g_llrawproc_gpu_recon_backend_mutex);\n"
+        "    pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);\n    return 0;\n}\n");
+    const QStringList unlistedOutside = unlocksOutsideKnownBodies(unlisted);
+    ASSERT_EQ(1, (int)unlistedOutside.size());
+    ASSERT_EQ(std::string("(a_new_unlocking_body)"), unlistedOutside.at(0).mid(unlistedOutside.at(0).indexOf(QLatin1Char('('))).toStdString());
     // The scan sets the flag and never clears it.
     const QString helper = llrawproc.mid(llrawproc.indexOf(QStringLiteral("static void llrawproc_gpu_suppress_on_device_loss_locked(")));
     ASSERT_TRUE(helper.left(helper.indexOf(QStringLiteral("\n}\n"))).contains(QStringLiteral("llrpSetGpuCudaSuppressed(1);")));

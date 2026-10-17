@@ -611,3 +611,43 @@ TEST(GpuDeviceLossSelfHeal, ANonLossFailureInTheEmitGapLeavesTheNextCallerFree)
     assertANonLossLeavesTheEmitGapFree(3, 0, nullptr);
     assertANonLossLeavesTheEmitGapFree(-1, 2, "cudaErrorMemoryAllocation");
 }
+
+// (j) r3 (CoS I4), the RED arm for all four gap tests, kept in the suite: with the classifier unregistered the
+// scan before each unlock does nothing (the r1 RED arm disabled its body instead), and the same device loss leaves
+// the gap open, so B reaches the backend and runs once. The emit after the unlock still lands the loss. This shows
+// each gap test above fails without the fix.
+TEST(GpuDeviceLossSelfHeal, WithTheScanDisabledACallerInEachEmitGapReachesTheBackend)
+{
+    const auto assertTheGapIsOpen = [](const std::function<void()> & inject, const std::function<void()> & faultingCall,
+                                       const char * site) {
+        CaseScope scope;
+        llrpSetGpuDeviceLossClassifier(nullptr);
+        const std::shared_ptr<EmitGap> gap = playAFrameInTheEmitGap(scope, inject, faultingCall);
+        // One composite line per site, so a failure names the site next to what the gap saw.
+        const std::string seen = std::string(site) + ": fired=" + std::to_string(gap->fired.load())
+            + " hookTimedOut=" + std::to_string(gap->hookTimedOut ? 1 : 0) + " bTimedOut=" + std::to_string(gap->bTimedOut ? 1 : 0)
+            + " " + gapOutcome(*gap) + " deviceLossFaults=" + std::to_string(scope.seen.deviceLossFaults)
+            + " suppressedAfter=" + std::to_string(llrpGpuCudaSuppressed());
+        ASSERT_EQ(std::string(site) + ": fired=1 hookTimedOut=0 bTimedOut=0 " + gapOutcome(0, 1, 0, 1)
+                      + " deviceLossFaults=1 suppressedAfter=1", seen);
+    };
+    assertTheGapIsOpen([]() { llrpFakeGpuBackendInjectRunFailureForTesting(-1, 702, "cudaErrorLaunchTimeout"); },
+                       []() { int rc = -99; runOnce(2, &rc); }, "run_backend");
+    {
+        const AsyncH2dOnScope asyncH2d;
+        assertTheGapIsOpen([]() { llrpFakeGpuBackendInjectPreuploadFailureForTesting(-1, 702, "cudaErrorLaunchTimeout"); },
+                           []() { preuploadOnce(3); }, "preupload");
+    }
+    assertTheGapIsOpen(
+        []() {
+            llrpFakeGpuBackendArmCudaNoteForTesting(IGPU_CUDA_ERROR_CHANNEL_RENDER, 702, "cudaErrorLaunchTimeout",
+                                                    "reset_gl:set_device");
+        },
+        []() { llrpGpuPlaybackReconResetGlTextureResources(); }, "GL reset");
+    assertTheGapIsOpen(
+        []() {
+            llrpFakeGpuBackendNoteCudaErrorForTesting(IGPU_CUDA_ERROR_CHANNEL_RENDER, 702, "cudaErrorLaunchTimeout",
+                                                      "gl_r16:map");
+        },
+        []() { llrpGpuPlaybackReconDrainCudaErrorsAtTeardown(1000); }, "teardown drain");
+}
