@@ -7058,6 +7058,12 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
                 self.assertEqual((out["captured"], out["savedPlayFrames"], out["playFrames"]), (True, 6, judged), "6 PNGs were saved; `playFrames` counts the judged ones")
                 if mode == "frozen-identical":
                     self.assertIn("the app records the source frames as identical", out["reason"])
+                if mode == "frozen-partial":
+                    # CoS #474 N4: the verdict reason and the reader's not-judged note are both kept, verdict reason first
+                    frozen_at = out["reason"].find("show ONE picture")
+                    note_at = out["reason"].find("1 saved play frame(s) have no usable viewport rectangle and were not judged")
+                    self.assertGreaterEqual(frozen_at, 0, out["reason"])
+                    self.assertGreater(note_at, frozen_at, out["reason"])
 
     def test_a_visual_reader_without_a_published_directory_says_not_captured(self) -> None:
         with tempfile.TemporaryDirectory(prefix="vis-none-") as d:
