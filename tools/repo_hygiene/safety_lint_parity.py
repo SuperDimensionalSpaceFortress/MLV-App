@@ -239,7 +239,8 @@ def parse_corpus(text: str, label: str) -> list[dict]:
 def git_path_exists(root: Path, ref: str, rel: str) -> bool:
     """True when `rel` is in the tree of `ref`. A git failure raises ParityError (it is never read as 'absent')."""
     try:
-        done = subprocess.run(["git", "-C", str(root), "ls-tree", "--name-only", ref, "--", rel], capture_output=True, timeout=120)
+        # DG-GIT-PATHLIST (r7): quotepath off, so a non-ASCII path is never read back in its quoted form (only emptiness is tested here).
+        done = subprocess.run(["git", "-C", str(root), "-c", "core.quotepath=false", "ls-tree", "--name-only", ref, "--", rel], capture_output=True, timeout=120)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise ParityError(f"git ls-tree {ref} -- {rel} could not run: {exc}") from exc
     if done.returncode != 0:
@@ -667,7 +668,9 @@ def run(base: str, lints, corpus_path: Path = DEFAULT_CORPUS, allow_path: Path =
             head_hook_path = head_hook or (root / HOOK_REL)
             # master's bytes run as if they lived at the head hook's path (see load_source_as): one worktree_root for both.
             base_module = load_source_as(git(root, "show", f"{base_sha}:{HOOK_REL}"), "parity_base_hook", head_hook_path.resolve())
-            head_module = load_module(head_hook_path, "parity_head_hook")
+            # r7: the head loads from the SAME resolved spelling as master. Before, master got .resolve() and the head the raw path, so a head hook
+            # under an alias (8.3 short name, junction, subst drive: a hosted Windows temp dir) derived a different worktree_root than master.
+            head_module = load_module(head_hook_path.resolve(), "parity_head_hook")
             results += run_hook(base_module, head_module, hook_cases)
         if playback_rows:
             if pb is None or not getattr(pb, "PWSH", None):

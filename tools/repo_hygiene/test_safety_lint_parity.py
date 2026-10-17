@@ -14,6 +14,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -563,6 +564,11 @@ def _head_hook_tests_source_with(case_name: str, mutation: str) -> str:
     ])
 
 
+def _loosened_ids(output: str) -> list[str]:
+    """The row ids on the runner's `LOOSENED <id> [<lint>] ...` lines (the summary's `loosened=` counter is lower-case and has no `[`)."""
+    return re.findall(r"^LOOSENED (\S+) \[", output, re.MULTILINE)
+
+
 class BaselineContentUnionTests(ParityRunnerCase):
     """r6 B2, hook half: derived hook rows are unioned with the baseline's by (id, content), content = tool, input, fixture and raw."""
 
@@ -581,13 +587,26 @@ class BaselineContentUnionTests(ParityRunnerCase):
             head_ids = [c.id for c in slp.derived_hook_cases(REPO_ROOT)]
         self.assertEqual(len(head_ids), EXACT_DERIVED_HOOK_ROWS, "the count pin stays green: this is the CoS B2 repro")
         self.assertIn(LOOSENED_ROW_ID, head_ids, "same name, same expectation: the head still has a row under the id")
+        # r7: independent of where the temp dir lives.  A hosted runner's temp layout can make path-escape rows ({OUTSIDE}, {BOARD}/..) read
+        # LOOSENED under the scratch head hook in EVERY run of that layout, so the number is not 1 there.  The CONTROL (same scratch hook, the
+        # suite unedited) names those rows; the edit must add exactly one row on top of them and change no other row's class.
+        control = io.StringIO()
+        with contextlib.redirect_stdout(control):
+            slp.main(["--base", "HEAD", "--lint", "hook", "--corpus", str(self.corpus()), "--allow", str(self.allow), "--head-hook", str(hook)])
+        control_ids = _loosened_ids(control.getvalue())
+        self.assertIn(LOOSENED_ROW_ID, control_ids, "the control has the unedited row, which the scratch head hook allows")
+        phantom = sorted(set(control_ids) - {LOOSENED_ROW_ID})
         out = io.StringIO()
         with self.redirect_head_hook_tests(tests), contextlib.redirect_stdout(out):
             rc = slp.main(["--base", "HEAD", "--lint", "hook", "--corpus", str(self.corpus()), "--allow", str(self.allow), "--head-hook", str(hook)])
         self.assertEqual(rc, slp.EXIT_LOOSENED, out.getvalue())
         self.assertRegex(out.getvalue(), rf"LOOSENED {LOOSENED_ROW_ID}@base-[0-9a-f]{{10}} ")
         self.assertIn("master=DENY head=ALLOW", out.getvalue())
-        self.assertIn("loosened=1", out.getvalue())
+        edited_ids = _loosened_ids(out.getvalue())
+        self.assertEqual(sorted(i for i in edited_ids if "@base-" not in i), phantom, "no other row changed class relative to the control")
+        self.assertEqual(len([i for i in edited_ids if i.startswith(LOOSENED_ROW_ID + "@base-")]), 1)
+        self.assertEqual(len(edited_ids), len(phantom) + 1, "exactly the one edited row on top of the control's set")
+        self.assertIn(f"loosened={len(phantom) + 1} (", out.getvalue())
 
     def test_B2_a_fixture_or_raw_swap_under_the_same_name_and_input_joins_as_a_base_row(self):
         tm = slp.load_module(REPO_ROOT / slp.HOOK_TEST_REL, "parity_b2_probe_tests")
@@ -637,13 +656,25 @@ class BaselineCorpusUnionTests(ParityRunnerCase):
         head_corpus = _write(self.tmp / "head_corpus.json", json.dumps(doc))
         self.assertEqual(len(slp.load_corpus(head_corpus)), len(slp.load_corpus(slp.DEFAULT_CORPUS)), "row count unchanged")
         hook = _write(self.tmp / "head_hook.py", _wrapped_head_hook_source(original))
+        # r7: independent of where the temp dir lives (see the hook-half test above): the control is the same scratch hook over the UNEDITED
+        # tracked corpus; the edit adds exactly one row on top of whatever that layout already reads as LOOSENED.
+        control = io.StringIO()
+        with contextlib.redirect_stdout(control):
+            slp.main(["--base", "HEAD", "--lint", "hook", "--corpus", str(slp.DEFAULT_CORPUS), "--allow", str(self.allow), "--head-hook", str(hook)])
+        control_ids = _loosened_ids(control.getvalue())
+        self.assertIn(row_id, control_ids, "the control has the unedited row, which the scratch head hook allows")
+        phantom = sorted(set(control_ids) - {row_id})
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             rc = slp.main(["--base", "HEAD", "--lint", "hook", "--corpus", str(head_corpus), "--allow", str(self.allow), "--head-hook", str(hook)])
         self.assertEqual(rc, slp.EXIT_LOOSENED, out.getvalue())
         self.assertRegex(out.getvalue(), rf"LOOSENED {row_id}@base-[0-9a-f]{{10}} ")
         self.assertIn("master=DENY head=ALLOW", out.getvalue())
-        self.assertIn("loosened=1", out.getvalue())
+        edited_ids = _loosened_ids(out.getvalue())
+        self.assertEqual(sorted(i for i in edited_ids if "@base-" not in i), phantom, "no other row changed class relative to the control")
+        self.assertEqual(len([i for i in edited_ids if i.startswith(row_id + "@base-")]), 1)
+        self.assertEqual(len(edited_ids), len(phantom) + 1, "exactly the one edited row on top of the control's set")
+        self.assertIn(f"loosened={len(phantom) + 1} (", out.getvalue())
 
     @unittest.skipUnless(PWSH, "pwsh is required to run the playback probe")
     def test_B2_the_8_b465_b6_rows_replaced_by_a_copy_of_b5_01_under_their_ids_are_still_loosened(self):
