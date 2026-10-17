@@ -1947,6 +1947,16 @@ static int llrawproc_gpu_recon_backend_available_guarded(int prefer_playback_dll
     return available;
 }
 
+/* PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-SETUP-1 Row B: the playback runs pass prefer_playback_dll=1, so this loads
+ * the same DLL/backend name and the first run's llrawproc_gpu_export_backend_available(1) is a hit. */
+int llrpGpuPlaybackReconPreloadBackend(double * load_ms)
+{
+    const double start_s = mlv_stage_timing_now();
+    const int available = llrawproc_gpu_recon_backend_available_guarded(1);
+    if(load_ms) *load_ms = (mlv_stage_timing_now() - start_s) * 1000.0;
+    return available;
+}
+
 /* GPU-FIELD-TELEMETRY-1: one stage call's outcome, captured under the backend
  * mutex (or the preupload bypass claim) and handed to the sink after it is
  * released. */
@@ -3454,6 +3464,12 @@ static int llrawproc_gpu_export_backend_available(int prefer_playback_dll)
 static int llrawproc_gpu_recon_backend_available_guarded(int prefer_playback_dll)
 {
     return llrawproc_gpu_export_backend_available(prefer_playback_dll);
+}
+
+int llrpGpuPlaybackReconPreloadBackend(double * load_ms)
+{
+    if(load_ms) *load_ms = 0.0;
+    return 0;
 }
 
 int llrpResetGpuExportBackendForTesting(void);

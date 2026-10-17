@@ -52,6 +52,12 @@ struct GpuPresentSetupTiming
     double blur_check_ms = 0.0;
     double realloc_ms = 0.0;
     double sampling_ms = 0.0;
+    /* PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-SETUP-1 Row 0: what the window's realloc branch did with the texture
+     * slot ("kept", "realloc", "adopted", "discarded"; "none" outside GpuDisplayWindow), and this call's AMaZE-only
+     * kernel / download time (the download includes the output texture's CUDA-GL register and map). */
+    const char * slot = "none";
+    double amaze_kernel_ms = 0.0;
+    double amaze_download_ms = 0.0;
 };
 
 struct GpuPreviewProcessingConfig

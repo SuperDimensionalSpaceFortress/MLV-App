@@ -2184,6 +2184,47 @@
       ]
     },
     {
+      "path": "tests/console/test_playback_startup_split.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , split . firstPresentSplit ( ) . reconWallMs , 1 e - 9 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-SETUP-1 Row 0 pure-function unit test ItIsResetWithTheSessionAndKeptUntilThen: a synthetic FirstPresentSplit (reconWallMs=3.0) noted on a StartupSplit must read back 0 after reset(). Test-constructed value, no live clock; it checks the reset, not that any stage ran.",
+      "lines": [
+        212
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_startup_split.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , guiPickupMs ( 0.0 , 10.040 ) , 1 e - 9 ) ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-SETUP-1 Row 0 pure-function unit test GuiPickupIsRenderDoneToGuiPresentStart: an unknown (0) render-done stamp must yield 0 ms, not a huge gap from the clock origin. Synthetic stamps, no live clock; it pins the sentinel fallback, not that any stage ran.",
+      "lines": [
+        219
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_startup_split.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , guiPickupMs ( 10.050 , 10.040 ) , 1 e - 9 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-SETUP-1 Row 0 pure-function unit test GuiPickupIsRenderDoneToGuiPresentStart: out-of-order synthetic stamps (render done after the GUI present start) must clamp to 0 ms, never negative. No live clock; it checks the clamp, not that any stage ran.",
+      "lines": [
+        220
+      ]
+    },
+    {
+      "path": "tests/pipeline/test_gpu_playback_recon_preload.cpp",
+      "anchor": "ASSERT_TRUE ( loadMs >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-SETUP-1 Row B: llrpGpuPlaybackReconPreloadBackend's load_ms out-param is written (the -1.0 sentinel is replaced) and never negative; a >= 0.0 check that cannot distinguish ran from not-ran. The run proof is the return value and llrpGpuExportBackendAttemptedForTesting() == 1 asserted beside it in both tests.",
+      "lines": [
+        35,
+        48
+      ]
+    },
+    {
       "path": "platform/qt/AudioPlayback.cpp",
       "anchor": "for ( int i = 0 ; i < 20 && m_owner . m_pAudioOutput -> processedUSecs ( ) == 0",
       "class": "value_fallback_select",
