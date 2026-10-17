@@ -9,6 +9,7 @@
 
 #include <QFile>
 #include <QString>
+#include <QStringList>
 #include <QTextStream>
 
 #include <string>
@@ -518,10 +519,14 @@ TEST(PlaybackGpuClockKickWiring, PlayStartsTheKickBeforeThePlayStartFrameRequest
     const QString decideCall = begin.mid(decideAt, beginAt - decideAt);
     ASSERT_TRUE(decideCall.contains(QStringLiteral("!mlvappPlaybackGpuClockKickDisabled(),")));
     ASSERT_TRUE(decideCall.contains(QStringLiteral("ui->actionPlay->isChecked(),")));
-    ASSERT_TRUE(decideCall.contains(QStringLiteral("m_lastPresentedRequestContext.gpuPlaybackReconAmazeTexturePresentAdmitted")));
+    ASSERT_TRUE(decideCall.contains(QStringLiteral("routeAdmitted,")));
     ASSERT_TRUE(decideCall.contains(QStringLiteral("gpuAmazeDebayerLiveBackendLoaded()")));
-    ASSERT_TRUE(decideCall.contains(QStringLiteral("llrpGpuCudaSuppressed() != 0")));
     ASSERT_TRUE(decideCall.contains(QStringLiteral("if( decision.run )")));
+    // the route and the loss flag are the live state, read just before the decision
+    const QString inputs = begin.left(decideAt);
+    ASSERT_TRUE(inputs.contains(QStringLiteral("&& m_lastPresentedRequestContext.gpuPlaybackReconTexturePresentRequested")));
+    ASSERT_TRUE(inputs.contains(QStringLiteral("&& m_lastPresentedRequestContext.gpuPlaybackReconAmazeTexturePresentAdmitted;")));
+    ASSERT_TRUE(inputs.contains(QStringLiteral("const bool cudaSuppressed = llrpGpuCudaSuppressed() != 0;")));
     // Row 0's session probe is armed on every Play, kick or not
     ASSERT_TRUE(begin.indexOf(QStringLiteral("gpuAmazeDebayerBeginProbeSession();")) < decideAt);
     ASSERT_TRUE(begin.indexOf(QStringLiteral("gpuAmazeDebayerBeginProbeSession();")) >= 0);
@@ -574,11 +579,27 @@ TEST(PlaybackGpuClockKickWiring, TheKickNeverLoadsTheDllAndReChecksTheLossUnderT
                                         QStringLiteral("    return report;\n}\n"));
     ASSERT_FALSE(kick.isEmpty());
     ASSERT_FALSE(kickEnd.isEmpty());
-    ASSERT_FALSE(kick.contains(QStringLiteral("ensure(")));
-    ASSERT_FALSE(kickEnd.contains(QStringLiteral("ensure(")));
+    // code lines only: the comment that says "never live.ensure()" is not a call
+    const auto codeOnly = [](const QString & body)
+    {
+        QStringList kept;
+        for (const QString & line : body.split(QLatin1Char('\n')))
+        {
+            const QString t = line.trimmed();
+            if (t.startsWith(QStringLiteral("//")) || t.startsWith(QStringLiteral("/*")) || t.startsWith(QStringLiteral("*")))
+                continue;
+            kept << line;
+        }
+        return kept.join(QLatin1Char('\n'));
+    };
+    ASSERT_TRUE(kick.contains(QStringLiteral("never live.ensure()")));
+    ASSERT_FALSE(codeOnly(kick).contains(QStringLiteral("ensure(")));
+    ASSERT_FALSE(codeOnly(kickEnd).contains(QStringLiteral("ensure(")));
     ASSERT_TRUE(kick.contains(QStringLiteral("if ( !live.attempted || !live.available || !live.backend ) return fail(\"backend_not_loaded\");")));
     const int lock = kick.indexOf(QStringLiteral("QMutexLocker locker(&live.mutex);"), kick.indexOf(QStringLiteral("bool gpuAmazeDebayerClockKickBegin(")));
-    const int recheck = kick.indexOf(QStringLiteral("enterAmazeRunUnlessCudaSuppressed(&live.runtime, GpuFieldTelemetry::enabled())"));
+    const int recheck = kick.indexOf(QStringLiteral(
+        "const bool mayLaunch = enterAmazeRunUnlessCudaSuppressed(&live.runtime, GpuFieldTelemetry::enabled());"));
+    ASSERT_TRUE(kick.contains(QStringLiteral("if ( !mayLaunch ) return fail(\"cuda_suppressed\");")));
     const int launch = kick.indexOf(QStringLiteral("live.runtime.clockKickBegin(live.backend, maxMs)"));
     ASSERT_TRUE(lock >= 0);
     ASSERT_TRUE(recheck > lock);

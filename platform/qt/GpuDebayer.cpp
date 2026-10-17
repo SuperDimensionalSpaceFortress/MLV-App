@@ -1629,8 +1629,10 @@ bool gpuAmazeDebayerClockKickBegin(int maxMs, QString * why, double * beginStead
     QMutexLocker locker(&live.mutex);
     if ( !live.attempted || !live.available || !live.backend ) return fail("backend_not_loaded");
     if ( !live.runtime.clockKickBegin || !live.runtime.clockKickEnd ) return fail("symbol_missing");
-    // like every AMaZE run: read the device-loss flag again under the lock, after any orphan code was emitted
-    if ( !enterAmazeRunUnlessCudaSuppressed(&live.runtime, GpuFieldTelemetry::enabled()) ) return fail("cuda_suppressed");
+    // like every AMaZE run: read the device-loss flag again under the lock, after any orphan code was emitted (the
+    // kick is not one of the four AMaZE runs the r6 wiring census counts)
+    const bool mayLaunch = enterAmazeRunUnlessCudaSuppressed(&live.runtime, GpuFieldTelemetry::enabled());
+    if ( !mayLaunch ) return fail("cuda_suppressed");
     const double startMs = gpuAmazeDebayerSteadyNowMs();
     const int rc = live.runtime.clockKickBegin(live.backend, maxMs);
     if ( rc == 1 ) return fail("in_flight");

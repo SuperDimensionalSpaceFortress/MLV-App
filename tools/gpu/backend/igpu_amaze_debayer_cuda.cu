@@ -267,9 +267,10 @@ double sm_clock_probe_mhz(igpu_amaze_debayer_backend * backend, cudaStream_t str
     volatile unsigned long long * result = backend->probeHost;
     result[0] = 0;
     result[1] = 0;
-    k_sm_clock_probe<<<1, 1, 0, stream>>>(backend->probeDevice, kProbeSpinNs);
+    IGPU_LT_LAUNCH("k_sm_clock_probe", 1, 1, stream,
+                   k_sm_clock_probe<<<1, 1, 0, stream>>>(backend->probeDevice, kProbeSpinNs));
     cudaError_t rc = cudaPeekAtLastError();
-    if (rc == cudaSuccess) rc = cudaStreamSynchronize(stream);
+    if (rc == cudaSuccess) rc = IGPU_LT_SYNC_CALL("probe:sm_clock_sync", cudaStreamSynchronize(stream));
     if (rc != cudaSuccess)
     {
         IGPU_CUDA_ERROR_NOTE(rc, "probe:sm_clock");
@@ -348,14 +349,23 @@ void stop_clock_kick_for_live_run(igpu_amaze_debayer_backend * backend)
     }
 }
 
+/* Teardown adds no synchronisation (CudaLaunchTiming.TimingOnAddsNoSynchronisationAtBackendTeardown): a kick still
+ * running is told to stop and given the same bounded host-only wait as end(); one that has not finished by then keeps
+ * its mapped block (it is never freed under a running kernel). */
 void free_probe_and_kick(igpu_amaze_debayer_backend * backend)
 {
     if (backend->kickHost)
     {
-        backend->kickHost->stop = 1;
-        /* the deadline bounds the kernel; after a device loss this returns at once */
-        if (backend->kickStream) cudaStreamSynchronize(backend->kickStream);
-        cudaFreeHost(backend->kickHost);
+        ClockKickShared * s = backend->kickHost;
+        if (s->stop == 0) s->stop = 1;
+        const double waitStart = now_ms();
+        while (backend->kickLaunched && !s->done && now_ms() - waitStart < kClockKickEndWaitMs)
+        {
+        }
+        if (!backend->kickLaunched || s->done)
+        {
+            cudaFreeHost(backend->kickHost);
+        }
         backend->kickHost = nullptr;
         backend->kickDevice = nullptr;
     }
@@ -2437,10 +2447,11 @@ extern "C" int igpu_amaze_debayer_clock_kick_begin(igpu_amaze_debayer_backend * 
     }
     std::memset(static_cast<void *>(backend->kickHost), 0, sizeof(ClockKickShared));
     const unsigned long long maxNs = static_cast<unsigned long long>(max_ms) * 1000000ull;
-    k_clock_kick<<<1, 32, 0, backend->kickStream>>>(backend->kickDevice,
-                                                    maxNs,
-                                                    kClockKickPeriodNs,
-                                                    kClockKickMaxPeriodicSamples);
+    IGPU_LT_LAUNCH("k_clock_kick", 1, 32, backend->kickStream,
+                   k_clock_kick<<<1, 32, 0, backend->kickStream>>>(backend->kickDevice,
+                                                                   maxNs,
+                                                                   kClockKickPeriodNs,
+                                                                   kClockKickMaxPeriodicSamples));
     const cudaError_t launchRc = cudaGetLastError();
     if (launchRc != cudaSuccess)
     {
