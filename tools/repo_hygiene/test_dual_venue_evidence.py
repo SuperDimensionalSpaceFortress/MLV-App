@@ -6694,14 +6694,16 @@ def write_visual_captures(dest: Path, mode: str = "ok") -> None:
     job's visual-capture-request.json. mode: ok | frozen (one picture, ticking chrome, advancing app frames) | blank | diverge (the paused
     full-quality frame has another red level). PLAYBACK-FROZEN-DISPLAY-SOURCE-DIFF-1 modes: frozen (the app records source_difference "differ"),
     frozen-unknown (it records nothing), frozen-identical (it records "identical": a static clip), noviewport (a ticking-chrome frozen picture whose
-    visual.json carries no viewport rectangle)."""
+    visual.json carries no viewport rectangle), frozen-partial (frozen + "differ", but play frame 5 alone carries no viewport rectangle),
+    frozen-upper-differ / frozen-upper-identical (the same record in the wrong case: "DIFFER" / "IDENTICAL")."""
     if dest.exists():
         shutil.rmtree(dest)
     dest.mkdir(parents=True)
     calls = []
-    frozen = mode in ("frozen", "frozen-unknown", "frozen-identical", "noviewport")
+    frozen = mode in ("frozen", "frozen-unknown", "frozen-identical", "frozen-partial", "frozen-upper-differ", "frozen-upper-identical", "noviewport")
     viewport = None if mode == "noviewport" else VIEWPORT
-    source_difference = {"frozen": "differ", "frozen-identical": "identical"}.get(mode)
+    source_difference = {"frozen": "differ", "frozen-partial": "differ", "frozen-identical": "identical",
+                         "frozen-upper-differ": "DIFFER", "frozen-upper-identical": "IDENTICAL"}.get(mode)
     for k in range(6):
         seed = 1 if frozen else k
         calls.append(f"New-VisPng '{dest / f'play-{k}.png'}' {seed} {60 + k * 10} 0 ${'true' if mode == 'blank' else 'false'}")
@@ -6710,7 +6712,8 @@ def write_visual_captures(dest: Path, mode: str = "ok") -> None:
     proc = run_pwsh(["-Command", VISUAL_PNG_PS + "\n".join(calls)])
     assert proc.returncode == 0, proc.stdout + proc.stderr
     frames = [{"kind": "play", "index": k, "file": f"play-{k}.png", "display_frame": 600 + 2 * k, "serial": 900 + k, "play_active": True,
-               "tail_elapsed_ms": 250 + 500 * k, "capture_ms": 40.0, "viewport": viewport, "saved": True, "reason": ""} for k in range(6)]
+               "tail_elapsed_ms": 250 + 500 * k, "capture_ms": 40.0, "viewport": (None if mode == "frozen-partial" and k == 5 else viewport), "saved": True, "reason": ""}
+              for k in range(6)]
     frames.append({"kind": "stop", "index": 0, "file": "stop.png", "display_frame": 612, "play_active": False, "viewport": viewport, "saved": True, "reason": ""})
     frames.append({"kind": "paused", "index": 0, "file": "paused.png", "display_frame": 612, "settled": True, "settled_frame": 612, "play_active": False,
                    "viewport": viewport, "saved": True, "reason": ""})
@@ -6919,27 +6922,71 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
 
     def test_the_visual_gate_judges_a_single_picture_by_whether_the_source_frames_differ(self) -> None:
         """PLAYBACK-FROZEN-DISPLAY-SOURCE-DIFF-1 (CoS #428 Improvement): one picture across the play frames is a FROZEN display only when the source
-        frames are KNOWN to differ. A static clip legitimately shows one picture; an unknown source is suspected, reported and not excluded."""
-        rows = [  # source difference (None = parameter omitted), viewport-unavailable play frames, distinct -> verdict, counted
-            ("known-differ", 0, 1, "FROZEN_DISPLAY", False),            # known-differ + one picture: unchanged, excluded
-            ("known-identical", 0, 1, "OK", True),                      # a static / repeated-picture clip: not frozen
-            ("unknown", 0, 1, "FROZEN_DISPLAY_SUSPECTED", True),        # nothing records it: suspected, NOT excluded
-            (None, 0, 1, "FROZEN_DISPLAY_SUSPECTED", True),             # the default is unknown, never a guess
-            ("known-differ", 0, 6, "OK", True),                         # pictures moved: the source difference does not matter
-            ("unknown", 0, 6, "OK", True),
-            ("known-differ", 6, 1, "VISUAL_ASSESSMENT_UNAVAILABLE", True),   # no viewport rectangle: the whole window is never judged instead
-            (None, 1, 6, "VISUAL_ASSESSMENT_UNAVAILABLE", True),              # one play frame without a viewport is enough
+        frames are KNOWN to differ. A static clip legitimately shows one picture; an unknown source is suspected, reported and not excluded.
+        r2 (CoS #474 I1): the frames that HAVE a viewport are judged first; the gate is unavailable only when fewer than two of them remain."""
+        rows = [  # source difference (None = parameter omitted), judged (viewport) play frames, play frames without a viewport, distinct -> verdict, counted
+            ("known-differ", 6, 0, 1, "FROZEN_DISPLAY", False),            # known-differ + one picture: unchanged, excluded
+            ("known-identical", 6, 0, 1, "OK", True),                      # a static / repeated-picture clip: not frozen
+            ("unknown", 6, 0, 1, "FROZEN_DISPLAY_SUSPECTED", True),        # nothing records it: suspected, NOT excluded
+            (None, 6, 0, 1, "FROZEN_DISPLAY_SUSPECTED", True),             # the default is unknown, never a guess
+            ("known-differ", 6, 0, 6, "OK", True),                         # pictures moved: the source difference does not matter
+            ("unknown", 6, 0, 6, "OK", True),
+            ("known-differ", 0, 6, 0, "VISUAL_ASSESSMENT_UNAVAILABLE", True),   # no viewport rectangle at all: the whole window is never judged instead
+            (None, 1, 5, 1, "VISUAL_ASSESSMENT_UNAVAILABLE", True),             # one usable frame judges nothing
+            ("known-differ", 5, 1, 1, "FROZEN_DISPLAY", False),            # CoS I1: the five frames that have a viewport show one picture over a known-differ source
+            ("known-differ", 2, 4, 1, "FROZEN_DISPLAY", False),            # two usable frames are enough to judge
+            ("unknown", 5, 1, 1, "FROZEN_DISPLAY_SUSPECTED", True),
+            ("known-identical", 5, 1, 1, "OK", True),
+            ("known-differ", 5, 1, 5, "OK", True),                         # five distinct pictures and one frame without a viewport: judged, nothing wrong
         ]
-        for src, unavailable, distinct, verdict, counted in rows:
-            with self.subTest(source=src, unavailable=unavailable, distinct=distinct):
-                src_arg = f"-SourceDifference {src} " if src else ""
-                proc, out = run_pwsh_json(f"Get-DvVisualVerdict -Requested $true -Captured $true -PlayFrames 6 -DistinctContentHashes {distinct} -AppDistinctDisplayFrames 6 "
-                                          f"-FlatPlayFrames 0 -PlayVsPausedMeanAbsDiff 2.0 -SamePosition $true {src_arg}-ViewportUnavailablePlayFrames {unavailable} | ConvertTo-Json -Compress")
-                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-                self.assertEqual((out["verdict"], out["counted"]), (verdict, counted))
+        for src, play, unavailable, distinct, verdict, counted in rows:
+            with self.subTest(source=src, play=play, unavailable=unavailable, distinct=distinct):
+                out = self.visual_verdict(src, play, unavailable, distinct)
+                self.assertEqual((out["verdict"], out["counted"]), (verdict, counted), out["reason"])
         proc, out = run_pwsh_json("Get-DvVisualVerdict -Requested $true -Captured $true -PlayFrames 6 -DistinctContentHashes 1 -AppDistinctDisplayFrames 6 "
                                   "-FlatPlayFrames 0 -PlayVsPausedMeanAbsDiff 2.0 -SamePosition $true | ConvertTo-Json -Compress")
         self.assertEqual((proc.returncode, out["verdict"]), (0, "FROZEN_DISPLAY_SUSPECTED"), "ViewportUnavailablePlayFrames defaults to 0")
+
+    def visual_verdict(self, src, play, unavailable, distinct):
+        """One Get-DvVisualVerdict call over `play` judged (viewport) play frames; src None omits -SourceDifference (the default)."""
+        src_arg = f"-SourceDifference {src} " if src else ""
+        proc, out = run_pwsh_json(f"Get-DvVisualVerdict -Requested $true -Captured $true -PlayFrames {play} -DistinctContentHashes {distinct} -AppDistinctDisplayFrames 6 "
+                                  f"-FlatPlayFrames 0 -PlayVsPausedMeanAbsDiff 2.0 -SamePosition $true {src_arg}-ViewportUnavailablePlayFrames {unavailable} | ConvertTo-Json -Compress")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return out
+
+    def test_the_visual_gate_says_why_a_known_identical_single_picture_is_ok(self) -> None:
+        """CoS #474 I3: the frozen check is waived on the app's own word, so the receipt carries that word (a wrong `identical` from a future build shows)."""
+        out = self.visual_verdict("known-identical", 6, 0, 1)
+        self.assertEqual((out["verdict"], out["counted"]), ("OK", True))
+        self.assertIn("the app records the source frames as identical", out["reason"])
+        self.assertIn("static clip", out["reason"])
+        self.assertIsNone(self.visual_verdict("known-identical", 6, 0, 6)["reason"], "six distinct pictures waive nothing: no reason")
+        self.assertIsNone(self.visual_verdict("known-differ", 6, 0, 6)["reason"])
+
+    # Prevention (CoS #474): when a pure verdict function gains a verdict, add rows that pair it with EVERY verdict that sets counted = false, and say which wins.
+    # (source difference, judged play frames, play frames without a viewport, distinct, winner); each pair must show BOTH of its verdicts winning somewhere.
+    NEW_VISUAL_VERDICT_PAIRINGS = {
+        ("FROZEN_DISPLAY_SUSPECTED", "FROZEN_DISPLAY"): [("unknown", 6, 0, 1, "FROZEN_DISPLAY_SUSPECTED"), ("known-differ", 6, 0, 1, "FROZEN_DISPLAY")],
+        ("VISUAL_ASSESSMENT_UNAVAILABLE", "FROZEN_DISPLAY"): [("known-differ", 5, 1, 1, "FROZEN_DISPLAY"), ("known-differ", 1, 5, 1, "VISUAL_ASSESSMENT_UNAVAILABLE"),
+                                                              ("known-differ", 0, 6, 0, "VISUAL_ASSESSMENT_UNAVAILABLE")],
+    }
+
+    def test_every_new_visual_verdict_is_paired_with_every_excluding_verdict(self) -> None:
+        text = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        body = text[text.index("function Get-DvVisualVerdict {"):text.index("function New-DvVisualStrip {")]
+        excluding = set(re.findall(r"verdict = '([A-Z_]+)'; counted = \$false", body))
+        self.assertTrue(excluding, "the verdict function names no counted = $false verdict (the pairing check lost its subject)")
+        for new in ("FROZEN_DISPLAY_SUSPECTED", "VISUAL_ASSESSMENT_UNAVAILABLE"):
+            for ex in sorted(excluding):
+                with self.subTest(new=new, excluding=ex):
+                    rows = self.NEW_VISUAL_VERDICT_PAIRINGS.get((new, ex))
+                    self.assertTrue(rows, f"add rows pairing {new} with the excluding verdict {ex} to NEW_VISUAL_VERDICT_PAIRINGS")
+                    self.assertEqual({r[-1] for r in rows}, {new, ex}, "both verdicts of the pair must win somewhere")
+                    for src, play, unavailable, distinct, winner in rows:
+                        out = self.visual_verdict(src, play, unavailable, distinct)
+                        self.assertEqual(out["verdict"], winner, f"{src} play={play} unavailable={unavailable} distinct={distinct}: {out['reason']}")
+        self.assertEqual({k[1] for k in self.NEW_VISUAL_VERDICT_PAIRINGS}, excluding, "a pairing names a verdict that no longer excludes")
 
     def test_the_default_divergence_threshold_is_six_not_twelve(self) -> None:
         # The gate table above passes -Threshold explicitly, so it cannot see the module default. These rows pass none: a same-position
@@ -6987,11 +7034,17 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
 
     def test_the_visual_reader_takes_the_source_difference_from_the_apps_record_and_never_guesses(self) -> None:
         """PLAYBACK-FROZEN-DISPLAY-SOURCE-DIFF-1: visual.json's source_difference (differ | identical) is the only record of whether the source frames differ;
-        absent or anything else is unknown. A missing viewport rectangle is an unavailable assessment, not a judgement of the whole window."""
-        for mode, verdict, counted, source, distinct in (("frozen", "FROZEN_DISPLAY", False, "known-differ", 1),
-                                                         ("frozen-identical", "OK", True, "known-identical", 1),
-                                                         ("frozen-unknown", "FROZEN_DISPLAY_SUSPECTED", True, "unknown", 1),
-                                                         ("noviewport", "VISUAL_ASSESSMENT_UNAVAILABLE", True, "unknown", 0)):
+        absent or anything else is unknown (case counts: `DIFFER` / `IDENTICAL` are not the app's words). A missing viewport rectangle is an unavailable
+        assessment, not a judgement of the whole window; the frames that DO have one are still judged (CoS #474 I1). The receipt counts the saved play
+        frames (`savedPlayFrames`, `captured`) apart from the judged ones (`playFrames`) (CoS #474 N2)."""
+        # mode, verdict, counted, source, judged play frames, without a viewport
+        for mode, verdict, counted, source, judged, no_viewport in (("frozen", "FROZEN_DISPLAY", False, "known-differ", 6, 0),
+                                                                    ("frozen-identical", "OK", True, "known-identical", 6, 0),
+                                                                    ("frozen-unknown", "FROZEN_DISPLAY_SUSPECTED", True, "unknown", 6, 0),
+                                                                    ("frozen-upper-differ", "FROZEN_DISPLAY_SUSPECTED", True, "unknown", 6, 0),
+                                                                    ("frozen-upper-identical", "FROZEN_DISPLAY_SUSPECTED", True, "unknown", 6, 0),
+                                                                    ("frozen-partial", "FROZEN_DISPLAY", False, "known-differ", 5, 1),
+                                                                    ("noviewport", "VISUAL_ASSESSMENT_UNAVAILABLE", True, "unknown", 0, 6)):
             with self.subTest(mode), tempfile.TemporaryDirectory(prefix=f"vis-{mode}-") as d:
                 art = Path(d) / "artifacts"
                 write_visual_captures(art / "visual", mode)
@@ -7000,8 +7053,11 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
                 self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
                 self.assertEqual((out["verdict"], out["counted"]), (verdict, counted), out["reason"])
                 self.assertEqual(out["sourceDifference"], source)
-                self.assertEqual(out["distinctContentHashes"], distinct, "no viewport: no whole-window hash stands in for the picture" if mode == "noviewport" else "")
-                self.assertEqual(out["viewportUnavailablePlayFrames"], 6 if mode == "noviewport" else 0)
+                self.assertEqual(out["distinctContentHashes"], 0 if judged == 0 else 1, "no viewport: no whole-window hash stands in for the picture" if judged == 0 else "")
+                self.assertEqual(out["viewportUnavailablePlayFrames"], no_viewport)
+                self.assertEqual((out["captured"], out["savedPlayFrames"], out["playFrames"]), (True, 6, judged), "6 PNGs were saved; `playFrames` counts the judged ones")
+                if mode == "frozen-identical":
+                    self.assertIn("the app records the source frames as identical", out["reason"])
 
     def test_a_visual_reader_without_a_published_directory_says_not_captured(self) -> None:
         with tempfile.TemporaryDirectory(prefix="vis-none-") as d:

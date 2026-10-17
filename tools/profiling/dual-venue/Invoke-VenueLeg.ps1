@@ -789,8 +789,9 @@ if ($outcome -in @('PASS', 'FAIL') -and $proofProblems.Count -gt 0) {
     $detail = "INVALID: the job result was $outcome ($detail) but the receipt-oracle verdict is not valid: $($proofProblems -join '; ')"
     $outcome = 'INVALID'
 }
-# PLAYBACK-VISUAL-INSPECTION-1, the visual gate: a FROZEN_DISPLAY leg (one picture across the play frames while the app presented several) is not counted --
-# every cadence number can read perfect over a frozen display; a VISUAL_DIVERGENCE leg stays counted for speed and says so in its detail.
+# PLAYBACK-VISUAL-INSPECTION-1, the visual gate: a FROZEN_DISPLAY leg (one picture across the play frames while the app presented several AND the app records
+# the source frames as differing, source_difference "differ") is not counted -- every cadence number can read perfect over a frozen display; the same picture
+# over an unrecorded source is FROZEN_DISPLAY_SUSPECTED, and a VISUAL_DIVERGENCE leg stays counted for speed and says so in its detail.
 if ($outcome -in @('PASS', 'FAIL') -and $null -ne $receipt.visual) {
     if ($receipt.visual.verdict -ceq 'FROZEN_DISPLAY') {
         $detail = "INVALID: the job result was $outcome ($detail) but FROZEN_DISPLAY: $($receipt.visual.reason). A leg whose display did not change is not counted, whatever its cadence numbers say"

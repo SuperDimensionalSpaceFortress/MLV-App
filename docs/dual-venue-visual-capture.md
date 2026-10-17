@@ -48,15 +48,18 @@ Numbers are computed from the VIDEO VIEWPORT only -- the window's timecode and f
 |---|---|---|
 | `FROZEN_DISPLAY` | the play frames show ONE picture while the app presented more than one frame across them AND the source frames are known to differ (`sourceDifference` `known-differ`) | **no**: the receipt is `INVALID` |
 | `FROZEN_DISPLAY_SUSPECTED` | the same one picture, but nothing records whether the source frames differ (`sourceDifference` `unknown`): a static clip shows one picture legitimately | yes, and the detail says so |
-| `VISUAL_ASSESSMENT_UNAVAILABLE` | a play frame has no usable viewport rectangle in `visual.json` (absent, empty or outside the image): the whole window, with its timecode and chrome, is never judged in its place | yes, and the detail says so |
+| `VISUAL_ASSESSMENT_UNAVAILABLE` | play frames have no usable viewport rectangle in `visual.json` (absent, empty or outside the image) AND fewer than two play frames with one remain: the whole window, with its timecode and chrome, is never judged in its place. With two or more usable frames those are judged as above (a known-differ leg with one frame lacking a rectangle is still `FROZEN_DISPLAY`) | yes, and the detail says so |
 | `VISUAL_DIVERGENCE` | the playback frame is further than the threshold from its paused full-quality re-render | yes, and the detail says so |
 | `CAPTURE_BLANK` | every play frame's viewport is flat (std < 1): the capture judges nothing | yes |
 | `NOT_CAPTURED` / `NOT_REQUESTED` | nothing published (an old build, a failed run) / the spec opts out | yes |
 | `OK` | none of the above | yes |
 
 `sourceDifference` is read from the app's own `visual.json` field `source_difference` (`differ` -> `known-differ`, `identical` ->
-`known-identical`); absent or anything else is `unknown`, never a guess. One picture over `known-identical` source frames is a
-static clip, not frozen (`OK`). No app build writes the field yet, so until one does a single picture reads
+`known-identical`); absent or anything else (the wrong case included: `IDENTICAL`) is `unknown`, never a guess. One picture over
+`known-identical` source frames is a static clip, not frozen (`OK`, with the reason "one picture; the app records the source frames as
+identical: a static clip", so a wrong `identical` from a future build shows in the receipt). `playFrames` counts the judged play
+frames (those with a viewport); `savedPlayFrames` the play PNGs saved; `captured` is true when any was saved. The app side is
+tracked as `PLAYBACK-SOURCE-FRAME-IDENTITY-1`. No app build writes the field yet, so until one does a single picture reads
 `FROZEN_DISPLAY_SUSPECTED`. A self-heal pre-launch still needs `OK`, so either new verdict there makes the leg `INVALID`.
 
 The divergence threshold (`$script:VisualDivergenceThreshold`, DualVenueRunner.psm1) is calibrated on a known-good leg: 6.0. The
