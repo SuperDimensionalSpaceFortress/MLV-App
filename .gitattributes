@@ -25,3 +25,5 @@ tools/profiling/dual-venue/legsets/*.json text eol=lf
 tools/profiling/dual-venue/venue-clip-consent.json text eol=lf
 tools/profiling/dual-venue/venues.json text eol=lf
 tests/coordination/fixtures/bus-validate-cards/*.mjs text eol=lf
+tools/coordination/doctrine_outbox.py text eol=lf
+doctrine-outbox.config.json text eol=lf
