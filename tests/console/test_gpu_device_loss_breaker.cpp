@@ -363,36 +363,91 @@ namespace
 {
 // GPU-LOSS-EMIT-BEFORE-UNLOCK-1: each llrawproc section that captures CUDA codes under the backend mutex and
 // emits them after releasing it scans the captured codes for a device loss as its last statement before the
-// unlock, so the flag is set before any queued caller can take the lock. Returns the functions that do not.
-QStringList capturingUnlocksWithoutSuppression(const QString & source)
+// unlock, so the flag is set before any queued caller can take the lock. r2 (CoS I2): the sections are
+// DISCOVERED, not listed: every function body (a column-0 "{" line up to the next column-0 "}") that contains
+// both the backend unlock and an llrawproc_gpu_stage_telemetry_emit* call. For every emit call in such a body,
+// the nearest unlock before it must have the scan as the one statement just ahead of it.
+struct CapturingUnlockCensus
 {
-    QStringList missing;
+    QStringList sites;   // every discovered section, in source order
+    QStringList missing; // the discovered sections that do not scan before the unlock
+};
+
+// The function name on the signature that ends just before `open` (the "\n" ahead of the column-0 "{"); the
+// signature may wrap onto indented continuation lines.
+QString functionNameBefore(const QString & source, int open)
+{
+    int lineStart = source.lastIndexOf(QLatin1Char('\n'), open - 1) + 1;
+    while (lineStart > 1 && source.at(lineStart).isSpace())
+        lineStart = source.lastIndexOf(QLatin1Char('\n'), lineStart - 2) + 1;
+    QString name = source.mid(lineStart, open - lineStart).section(QLatin1Char('('), 0, 0).section(QLatin1Char(' '), -1);
+    while (name.startsWith(QLatin1Char('*'))) name.remove(0, 1);
+    return name;
+}
+
+CapturingUnlockCensus capturingUnlockCensus(const QString & source)
+{
+    CapturingUnlockCensus census;
     const QString suppress = QStringLiteral("llrawproc_gpu_suppress_on_device_loss_locked(");
     const QString unlock = QStringLiteral("pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);");
     const QString emitCall = QStringLiteral("llrawproc_gpu_stage_telemetry_emit");
-    for (const char * entry : {"int llrpGpuPlaybackReconDrainCudaErrorsAtTeardown(int wait_ms)\n{",
-                               "int llrpGpuPlaybackReconPreuploadFrame(uint64_t frame_id,\n                                      const uint16_t * raw_input_bayer14,\n                                      size_t raw_image_size)\n{",
-                               "static int llrawproc_gpu_recon_run_backend(",
-                               "int llrpGpuPlaybackReconResetGlTextureResources(void)\n{"})
+    for (int open = source.indexOf(QStringLiteral("\n{\n")); open >= 0;
+         open = source.indexOf(QStringLiteral("\n{\n"), open + 1))
     {
-        const int fn = source.indexOf(QString::fromLatin1(entry));
-        const int end = fn < 0 ? -1 : source.indexOf(QStringLiteral("\n}\n"), fn);
-        const QString body = end < 0 ? QString() : source.mid(fn, end - fn);
-        const int at = body.indexOf(suppress);
-        const int unlockAt = at < 0 ? -1 : body.indexOf(unlock, at);
-        const int emitAt = body.indexOf(emitCall);
-        const bool ok = at > 0 && unlockAt > at && emitAt > unlockAt
-            && body.mid(at, unlockAt - at).count(QStringLiteral(";\n")) == 1;
-        if (!ok) missing << QString::fromLatin1(entry).section(QLatin1Char('('), 0, 0);
+        const int close = source.indexOf(QStringLiteral("\n}"), open + 2);
+        if (close < 0) break;
+        const QString body = source.mid(open, close - open);
+        if (!body.contains(unlock) || !body.contains(emitCall)) continue;
+        const QString name = functionNameBefore(source, open);
+        census.sites << name;
+        bool ok = true;
+        for (int emitAt = body.indexOf(emitCall); emitAt >= 0; emitAt = body.indexOf(emitCall, emitAt + 1))
+        {
+            const int unlockAt = body.lastIndexOf(unlock, emitAt - 1);
+            const int at = unlockAt < 0 ? -1 : body.lastIndexOf(suppress, unlockAt - 1);
+            if (at < 0 || body.mid(at, unlockAt - at).count(QStringLiteral(";\n")) != 1) ok = false;
+        }
+        if (!ok) census.missing << name;
     }
-    return missing;
+    return census;
+}
+
+QStringList capturingUnlocksWithoutSuppression(const QString & source)
+{
+    return capturingUnlockCensus(source).missing;
 }
 } // namespace
 
 TEST(GpuDeviceLossBreaker, EveryCapturingUnlockSuppressesOnADeviceLossBeforeReleasing)
 {
     const QString llrawproc = readRepoFile(QStringLiteral("src/mlv/llrawproc/llrawproc.c"));
+    // Discovered, not listed (CoS I2). Exactly these four sections capture under the backend mutex and emit after
+    // it: a new one that scans first is added to this line on purpose; one that does not also fails the next line.
+    ASSERT_EQ(std::string("llrpGpuPlaybackReconDrainCudaErrorsAtTeardown, llrpGpuPlaybackReconPreuploadFrame, "
+                          "llrawproc_gpu_recon_run_backend, llrpGpuPlaybackReconResetGlTextureResources"),
+              capturingUnlockCensus(llrawproc).sites.join(QStringLiteral(", ")).toStdString());
     ASSERT_EQ(std::string(), capturingUnlocksWithoutSuppression(llrawproc).join(QStringLiteral(", ")).toStdString());
+    // Fifth-site mutants: a copy of the teardown drain under a new name, with its scan moved after the unlock or
+    // dropped, is discovered as a fifth section and reported; the four real sections stay clean.
+    const QString drainEntry = QStringLiteral("int llrpGpuPlaybackReconDrainCudaErrorsAtTeardown(int wait_ms)\n{");
+    const int drainAt = llrawproc.indexOf(drainEntry);
+    ASSERT_TRUE(drainAt > 0);
+    QString fifthSite = llrawproc.mid(drainAt, llrawproc.indexOf(QStringLiteral("\n}\n"), drainAt) + 3 - drainAt);
+    fifthSite.replace(QStringLiteral("llrpGpuPlaybackReconDrainCudaErrorsAtTeardown"), QStringLiteral("llrpFifthCapturingSiteMutant"));
+    const QString scanThenUnlock = QStringLiteral("    llrawproc_gpu_suppress_on_device_loss_locked(leftovers, 2);\n"
+                                                  "    pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);\n");
+    for (const QString & fifthShape : {QStringLiteral("    pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);\n"
+                                                      "    llrawproc_gpu_suppress_on_device_loss_locked(leftovers, 2);\n"),
+                                       QStringLiteral("    pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);\n")})
+    {
+        const QString withFifth = llrawproc + QStringLiteral("\n") + replacedOnce(fifthSite, scanThenUnlock, fifthShape);
+        const CapturingUnlockCensus census = capturingUnlockCensus(withFifth);
+        ASSERT_EQ(5, (int)census.sites.size());
+        ASSERT_EQ(std::string("llrpFifthCapturingSiteMutant"), census.missing.join(QStringLiteral(", ")).toStdString());
+    }
+    // ...and the same copy left in its scanning shape is discovered and passes.
+    ASSERT_EQ(5, (int)capturingUnlockCensus(llrawproc + QStringLiteral("\n") + fifthSite).sites.size());
+    ASSERT_EQ(0, (int)capturingUnlocksWithoutSuppression(llrawproc + QStringLiteral("\n") + fifthSite).size());
     // The scan sets the flag and never clears it.
     const QString helper = llrawproc.mid(llrawproc.indexOf(QStringLiteral("static void llrawproc_gpu_suppress_on_device_loss_locked(")));
     ASSERT_TRUE(helper.left(helper.indexOf(QStringLiteral("\n}\n"))).contains(QStringLiteral("llrpSetGpuCudaSuppressed(1);")));

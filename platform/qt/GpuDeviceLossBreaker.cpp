@@ -87,6 +87,10 @@ void clearSafeStart(QSettings & settings, const char * outcome)
 {
     clearSafeStartKeys(settings);
     GpuFieldTelemetry::noteRecovery("safe_start_flag", outcome);
+    // Invariant (GPU-LOSS-EMIT-BEFORE-UNLOCK-1): the backend's classifier can set suppression before onFault sets
+    // g_sessionLoss, but nothing reaches the lift below in that gap within one process: both callers need the persisted
+    // flag, which is set only after this session's own loss (g_sessionLoss already true) or found at a start install()
+    // already suppressed (no CUDA call runs to capture a code).
     if (g_sessionLoss.load()) return;
     llrpSetGpuCudaSuppressed(0);
     if (!g_notice.isEmpty()) showNotice(QString());

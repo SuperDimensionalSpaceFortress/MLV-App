@@ -1687,10 +1687,12 @@ long llrpGpuReconBackendLockArrivalsForTesting(void)
     return InterlockedCompareExchange(&g_llrawproc_gpu_recon_lock_arrivals, 0, 0);
 }
 
-/* GPU-LOSS-EMIT-BEFORE-UNLOCK-1 test-only: called by run_backend and the
- * preupload right after they release the backend mutex (and the bypass claim)
- * and before they emit to the telemetry sink: the gap a test holds open. NULL
- * (the default) calls nothing. */
+/* TEST SEAM (GPU-LOSS-EMIT-BEFORE-UNLOCK-1), not a production feature: only
+ * tests/pipeline/test_gpu_device_loss_selfheal.cpp sets the hook. Called by
+ * each capturing section (run_backend, the preupload, the GL reset and the
+ * teardown drain) right after it releases the backend mutex (and the bypass
+ * claim) and before it emits to the telemetry sink: the gap a test holds open.
+ * NULL (the default, and always in the app) calls nothing: one pointer load. */
 static void (*volatile g_llrawproc_gpu_recon_after_unlock_hook)(void) = NULL;
 
 void llrpSetGpuReconAfterUnlockHookForTesting(void (*hook)(void));
@@ -2247,6 +2249,7 @@ int llrpGpuPlaybackReconDrainCudaErrorsAtTeardown(int wait_ms)
     llrawproc_gpu_stage_telemetry_take_leftovers(g, leftovers);
     llrawproc_gpu_suppress_on_device_loss_locked(leftovers, 2);
     pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
+    llrawproc_gpu_recon_after_unlock_for_testing();
     return llrawproc_gpu_stage_telemetry_emit_leftovers(sink, leftovers);
 }
 
@@ -2843,6 +2846,7 @@ int llrpGpuPlaybackReconResetGlTextureResources(void)
     if(telemetry_sink) llrawproc_gpu_stage_telemetry_take_leftovers(g, leftovers);
     if(telemetry_sink) llrawproc_gpu_suppress_on_device_loss_locked(leftovers, 2);
     pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
+    llrawproc_gpu_recon_after_unlock_for_testing();
     if(telemetry_sink) llrawproc_gpu_stage_telemetry_emit_leftovers(telemetry_sink, leftovers);
     return ok;
 }

@@ -12,7 +12,8 @@
 // delivered never reaches the backend; (g) a device-loss orphan delivered by an AMaZE run's telemetry entry
 // stops that very run. GPU-LOSS-EMIT-BEFORE-UNLOCK-1: (h) a caller that takes the backend mutex between the
 // faulting run's (or preupload's) unlock and its emit to the sink never reaches the backend; (i) a failure
-// that is not a device loss leaves that caller free.
+// that is not a device loss leaves that caller free. r2: (h) also at the GL reset and the teardown drain, so all
+// four capturing sections are covered at runtime.
 #include "../common/minitest.h"
 #include "../../src/mlv/llrawproc/llrawproc.h"
 #include "../../platform/qt/AutomationSettings.h"
@@ -20,6 +21,7 @@
 #include "../../platform/qt/GpuDeviceLossBreaker.h"
 #include "../../platform/qt/GpuDeviceLossBreakerCore.h"
 #include "../../platform/qt/GpuFieldTelemetry.h"
+#include "../../tools/gpu/backend/igpu_cuda_error_slot.h"
 
 #include <QCoreApplication>
 #include <QSettings>
@@ -46,6 +48,8 @@ extern "C" void llrpSetGpuReconAfterUnlockHookForTesting(void (*hook)(void));
 extern "C" int llrpResetGpuExportBackendForTesting(void);
 extern "C" void llrpFakeGpuBackendInjectRunFailureForTesting(int rc, int cuda_code, const char * name);
 extern "C" void llrpFakeGpuBackendInjectPreuploadFailureForTesting(int rc, int cuda_code, const char * name);
+extern "C" void llrpFakeGpuBackendNoteCudaErrorForTesting(int channel, int cuda_code, const char * name, const char * site);
+extern "C" void llrpFakeGpuBackendArmCudaNoteForTesting(int channel, int cuda_code, const char * name, const char * site);
 extern "C" void llrpFakeGpuBackendReducedIsoNotchStateForTesting(int * last_run_flag,
                                                                  uint64_t * runs_with_notch,
                                                                  uint64_t * runs_without_notch,
@@ -564,6 +568,40 @@ TEST(GpuDeviceLossSelfHeal, ACallerEnteringBetweenTheFaultingPreuploadsUnlockAnd
         scope, []() { llrpFakeGpuBackendInjectPreuploadFailureForTesting(-1, 702, "cudaErrorLaunchTimeout"); },
         [&preuploadAccepted]() { preuploadAccepted = preuploadOnce(3); });
     ASSERT_EQ(0, preuploadAccepted);
+    assertTheEmitGapIsClosedOnALoss(scope, *gap, "cudaErrorLaunchTimeout");
+}
+
+// (h) r2 (CoS I2): the same gap at the GL reset (the GPU view releasing its GL resources): the code its reset
+// notes is taken as a leftover under the lock, and the scan sets the flag before the unlock.
+TEST(GpuDeviceLossSelfHeal, ACallerEnteringBetweenTheGlResetsUnlockAndItsEmitNeverReachesTheBackend)
+{
+    CaseScope scope;
+    int resetOk = -1;
+    const std::shared_ptr<EmitGap> gap = playAFrameInTheEmitGap(
+        scope,
+        []() {
+            llrpFakeGpuBackendArmCudaNoteForTesting(IGPU_CUDA_ERROR_CHANNEL_RENDER, 702, "cudaErrorLaunchTimeout",
+                                                    "reset_gl:set_device");
+        },
+        [&resetOk]() { resetOk = llrpGpuPlaybackReconResetGlTextureResources(); });
+    ASSERT_EQ(1, resetOk);
+    assertTheEmitGapIsClosedOnALoss(scope, *gap, "cudaErrorLaunchTimeout");
+}
+
+// (h) r2 (CoS I2): the same gap at the session-end teardown drain: a device-loss code left pending on the render
+// channel is taken under the lock, and the scan sets the flag before the unlock.
+TEST(GpuDeviceLossSelfHeal, ACallerEnteringBetweenTheTeardownDrainsUnlockAndItsEmitNeverReachesTheBackend)
+{
+    CaseScope scope;
+    int drained = -1;
+    const std::shared_ptr<EmitGap> gap = playAFrameInTheEmitGap(
+        scope,
+        []() {
+            llrpFakeGpuBackendNoteCudaErrorForTesting(IGPU_CUDA_ERROR_CHANNEL_RENDER, 702, "cudaErrorLaunchTimeout",
+                                                      "gl_r16:map");
+        },
+        [&drained]() { drained = llrpGpuPlaybackReconDrainCudaErrorsAtTeardown(1000); });
+    ASSERT_EQ(1, drained);
     assertTheEmitGapIsClosedOnALoss(scope, *gap, "cudaErrorLaunchTimeout");
 }
 
