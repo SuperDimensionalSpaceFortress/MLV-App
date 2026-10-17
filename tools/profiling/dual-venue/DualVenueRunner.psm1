@@ -1542,18 +1542,25 @@ function Get-DvVisualViewportPixels {
     .SYNOPSIS
     The video viewport of one captured window PNG, downscaled (high-quality bilinear) to -Width x -Height, as packed RGB bytes, plus their sha256
     (the frame's CONTENT hash: equal pictures hash equal whatever the chrome around them shows) and the pixel mean / standard deviation. The
-    viewport rectangle is the app's own (visual.json, in the saved image's pixels); absent or empty, the whole image is used.
+    viewport rectangle is the app's own (visual.json, in the saved image's pixels). Absent or empty it is UNUSABLE: with -RequireViewport the
+    function returns $null (the window's timecode and chrome change over a frozen picture, so the whole image never stands in for the picture);
+    without it the whole image is used (callers that only want pixels).
     #>
-    param([Parameter(Mandatory)][string]$Path, $Viewport, [int]$Width = 64, [int]$Height = 36)
+    param([Parameter(Mandatory)][string]$Path, $Viewport, [int]$Width = 64, [int]$Height = 36, [switch]$RequireViewport)
     Add-Type -AssemblyName System.Drawing
     $src = [System.Drawing.Bitmap]::new($Path)
     try {
         $rect = [System.Drawing.Rectangle]::new(0, 0, $src.Width, $src.Height)
+        $viewportUsable = $false
         if ($null -ne $Viewport) {
             $vx = [int](Get-DvProp $Viewport 'x'); $vy = [int](Get-DvProp $Viewport 'y'); $vw = [int](Get-DvProp $Viewport 'w'); $vh = [int](Get-DvProp $Viewport 'h')
             if ($vw -gt 0 -and $vh -gt 0) { $rect = [System.Drawing.Rectangle]::Intersect($rect, [System.Drawing.Rectangle]::new($vx, $vy, $vw, $vh)) }
+            $viewportUsable = ($vw -gt 0 -and $vh -gt 0 -and $rect.Width -gt 0 -and $rect.Height -gt 0)
         }
-        if ($rect.Width -le 0 -or $rect.Height -le 0) { $rect = [System.Drawing.Rectangle]::new(0, 0, $src.Width, $src.Height) }
+        if (-not $viewportUsable) {
+            if ($RequireViewport) { return $null }
+            $rect = [System.Drawing.Rectangle]::new(0, 0, $src.Width, $src.Height)
+        }
         # The viewport is CLONED out first and scaled with edge mirroring: a filtered scale of a sub-rectangle reads the pixels just outside it,
         # which are the window chrome -- and the chrome (timecode, fps) changes over a frozen picture.
         $crop = $src.Clone($rect, [System.Drawing.Imaging.PixelFormat]::Format24bppRgb)
@@ -1604,22 +1611,34 @@ function Get-DvVisualVerdict {
     <#
     .SYNOPSIS
     The visual gate, from numbers only (pure). FROZEN_DISPLAY: every play frame shows ONE picture while the app says it presented more than
-    one frame across them -- the measured trap where every cadence metric reads perfect over a frozen display; such a leg is NOT counted.
+    one frame across them AND the source frames are KNOWN to differ (-SourceDifference known-differ) -- the measured trap where every cadence metric
+    reads perfect over a frozen display; such a leg is NOT counted. The same picture over known-identical source frames is a static clip, not frozen
+    (OK); over an unknown source (the default: nothing records it, so it is never guessed) it is FROZEN_DISPLAY_SUSPECTED, counted and surfaced.
+    -PlayFrames is the number of JUDGED play frames (those with a usable viewport); -ViewportUnavailablePlayFrames are the saved ones without. The judged
+    frames are judged first: two or more of them are enough for FROZEN_DISPLAY and the other verdicts, whatever the rest lack.
+    VISUAL_ASSESSMENT_UNAVAILABLE: play frames lack a usable viewport rectangle AND fewer than two judged ones remain, so nothing is judged (counted, surfaced; never the whole window).
     VISUAL_DIVERGENCE: the playback-path frame is further than the threshold from its paused full-quality re-render; counted for speed and
     surfaced. CAPTURE_BLANK: every play frame's viewport is flat (a blank capture judges nothing). NOT_CAPTURED / NOT_REQUESTED: no captures.
     #>
     param([bool]$Requested, [bool]$Captured, [int]$PlayFrames, [int]$DistinctContentHashes, [int]$AppDistinctDisplayFrames, [int]$FlatPlayFrames,
-          $PlayVsPausedMeanAbsDiff, [bool]$SamePosition, [double]$Threshold = $script:VisualDivergenceThreshold)
+          $PlayVsPausedMeanAbsDiff, [bool]$SamePosition, [double]$Threshold = $script:VisualDivergenceThreshold,
+          [ValidateSet('known-differ', 'known-identical', 'unknown')][string]$SourceDifference = 'unknown', [int]$ViewportUnavailablePlayFrames = 0)
     if (-not $Requested) { return [pscustomobject]@{ verdict = 'NOT_REQUESTED'; counted = $true; reason = 'the leg spec opts out of window captures' } }
+    if ($ViewportUnavailablePlayFrames -gt 0 -and $PlayFrames -lt 2) { return [pscustomobject]@{ verdict = 'VISUAL_ASSESSMENT_UNAVAILABLE'; counted = $true; reason = "$ViewportUnavailablePlayFrames play frame(s) have no usable viewport rectangle (visual.json), leaving $PlayFrames judged, so the picture cannot be told from the window's timecode and chrome: no visual assessment" } }
     if (-not $Captured -or $PlayFrames -lt 2) { return [pscustomobject]@{ verdict = 'NOT_CAPTURED'; counted = $true; reason = "only $PlayFrames play frame(s) were captured" } }
     if ($FlatPlayFrames -ge $PlayFrames) { return [pscustomobject]@{ verdict = 'CAPTURE_BLANK'; counted = $true; reason = 'every play frame''s viewport is flat: the capture shows no picture, so it judges nothing' } }
-    if ($DistinctContentHashes -eq 1 -and $AppDistinctDisplayFrames -gt 1) {
-        return [pscustomobject]@{ verdict = 'FROZEN_DISPLAY'; counted = $false; reason = "the $PlayFrames play frames show ONE picture while the app presented $AppDistinctDisplayFrames distinct frames across them" }
+    if ($DistinctContentHashes -eq 1 -and $AppDistinctDisplayFrames -gt 1 -and $SourceDifference -ceq 'known-differ') {
+        return [pscustomobject]@{ verdict = 'FROZEN_DISPLAY'; counted = $false; reason = "the $PlayFrames play frames show ONE picture while the app presented $AppDistinctDisplayFrames distinct frames across them and the source frames are known to differ" }
+    }
+    if ($DistinctContentHashes -eq 1 -and $AppDistinctDisplayFrames -gt 1 -and $SourceDifference -ceq 'unknown') {
+        return [pscustomobject]@{ verdict = 'FROZEN_DISPLAY_SUSPECTED'; counted = $true; reason = "the $PlayFrames play frames show ONE picture while the app presented $AppDistinctDisplayFrames distinct frames across them, but nothing records whether the source frames differ (a static clip shows one picture legitimately): suspected, not excluded" }
     }
     if ($SamePosition -and $null -ne $PlayVsPausedMeanAbsDiff -and [double]$PlayVsPausedMeanAbsDiff -gt $Threshold) {
         return [pscustomobject]@{ verdict = 'VISUAL_DIVERGENCE'; counted = $true; reason = "the playback-path frame is $PlayVsPausedMeanAbsDiff (per-channel mean absolute difference, 0..255) from its paused full-quality re-render; the threshold is $Threshold" }
     }
-    [pscustomobject]@{ verdict = 'OK'; counted = $true; reason = $null }
+    # one picture over source frames the app itself records as identical: the frozen check was waived on its word, so the receipt says so
+    $waivedReason = $(if ($DistinctContentHashes -eq 1 -and $AppDistinctDisplayFrames -gt 1 -and $SourceDifference -ceq 'known-identical') { 'one picture; the app records the source frames as identical: a static clip' } else { $null })
+    [pscustomobject]@{ verdict = 'OK'; counted = $true; reason = $waivedReason }
 }
 
 function New-DvVisualStrip {
@@ -1683,18 +1702,22 @@ function Read-DvVisualCaptures {
     $block = [ordered]@{
         schema = $script:VisualSchema; requested = $Requested; optOutReason = $(if ($Requested) { $null } else { $OptOutReason })
         method = $null; forwarded = $null; probe = $null; probeReason = $null; captured = $false
-        frames = @(); playFrames = 0; distinctContentHashes = 0; appDistinctDisplayFrames = 0; flatPlayFrames = 0
+        frames = @(); playFrames = 0; savedPlayFrames = 0; distinctContentHashes = 0; appDistinctDisplayFrames = 0; flatPlayFrames = 0
+        sourceDifference = 'unknown'; viewportUnavailablePlayFrames = 0
         stopFrame = $null; pausedSettled = $null; pausedFrame = $null; samePosition = $false
         playVsPausedMeanAbsDiff = $null; playVsPausedMeanAbsDiffPerChannel = $null; divergenceThreshold = $script:VisualDivergenceThreshold
         tailBeginUtc = $null; tailEndUtc = $null; presentMonWindowEndUtc = $null
         stripPath = $null; stripSha256 = $null; stripCopyPath = $null
         verdict = $null; counted = $true; reason = $null; appError = $null
     }
+    $notJudgedNote = $null   # set once the frames are read; kept after a verdict reason rather than replaced by it
     $finish = {
         $v = Get-DvVisualVerdict -Requested $Requested -Captured ([bool]$block.captured) -PlayFrames ([int]$block.playFrames) -DistinctContentHashes ([int]$block.distinctContentHashes) `
-            -AppDistinctDisplayFrames ([int]$block.appDistinctDisplayFrames) -FlatPlayFrames ([int]$block.flatPlayFrames) -PlayVsPausedMeanAbsDiff $block.playVsPausedMeanAbsDiff -SamePosition ([bool]$block.samePosition)
+            -AppDistinctDisplayFrames ([int]$block.appDistinctDisplayFrames) -FlatPlayFrames ([int]$block.flatPlayFrames) -PlayVsPausedMeanAbsDiff $block.playVsPausedMeanAbsDiff -SamePosition ([bool]$block.samePosition) `
+            -SourceDifference ([string]$block.sourceDifference) -ViewportUnavailablePlayFrames ([int]$block.viewportUnavailablePlayFrames)
         # a gate reason replaces a step's reason, except that a NOT_CAPTURED leg keeps the step that says WHY nothing was captured
-        if ($null -ne $v.reason -and -not ($v.verdict -ceq 'NOT_CAPTURED' -and $null -ne $block.reason)) { $block.reason = $v.reason }
+        # (the verdict reason comes first, then the note that some saved play frames were not judged)
+        if ($null -ne $v.reason -and -not ($v.verdict -ceq 'NOT_CAPTURED' -and $null -ne $block.reason)) { $block.reason = $(if ($notJudgedNote) { "$($v.reason); $notJudgedNote" } else { $v.reason }) }
         $block.verdict = $v.verdict; $block.counted = $v.counted
         $block
     }
@@ -1720,6 +1743,9 @@ function Read-DvVisualCaptures {
     Copy-Item -LiteralPath $appJsonShare -Destination (Join-Path $dir 'app-visual.json') -Force
     try { $app = [IO.File]::ReadAllText((Join-Path $dir 'app-visual.json')) | ConvertFrom-Json -ErrorAction Stop } catch { $block.reason = 'the app''s visual.json is not valid JSON'; return (& $finish) }
     $block.method = [string](Get-DvProp $app 'method'); $block.appError = [string](Get-DvProp $app 'error')
+    # Whether the source frames differ: only the app's own record says so (differ | identical, exactly that case: `identical` waives the gate, so `IDENTICAL`
+    # is not the app's word); anything else, or nothing, is unknown -- never a guess.
+    $block.sourceDifference = $(switch -CaseSensitive ([string](Get-DvProp $app 'source_difference')) { 'differ' { 'known-differ' } 'identical' { 'known-identical' } default { 'unknown' } })
     $block.tailBeginUtc = ConvertTo-DvVisualUtcText (Get-DvProp $app 'tail_begin_utc'); $block.tailEndUtc = ConvertTo-DvVisualUtcText (Get-DvProp $app 'tail_end_utc')
     $frames = [System.Collections.Generic.List[object]]::new()
     $pixels = @{}
@@ -1729,7 +1755,7 @@ function Read-DvVisualCaptures {
         $kind = [string](Get-DvProp $f 'kind'); $index = [int](Get-DvProp $f 'index'); $file = [string](Get-DvProp $f 'file')
         if ($kind -cnotin @('play', 'stop', 'paused') -or $file -cnotmatch '^(play-\d+|stop|paused)\.png$') { continue }
         $legName = $(if ($kind -ceq 'play') { "$LegId-play-$index.png" } else { "$LegId-$kind.png" })
-        $entry = [ordered]@{ kind = $kind; index = $index; file = $legName; sha256 = $null; contentHash = $null; viewportMean = $null; viewportStd = $null
+        $entry = [ordered]@{ kind = $kind; index = $index; file = $legName; sha256 = $null; contentHash = $null; viewportMean = $null; viewportStd = $null; viewportAvailable = $true
                              displayFrame = Get-DvProp $f 'display_frame'; playActive = Get-DvProp $f 'play_active'; tailElapsedMs = Get-DvProp $f 'tail_elapsed_ms'
                              captureMs = Get-DvProp $f 'capture_ms'; viewport = Get-DvProp $f 'viewport'; saved = [bool](Get-DvProp $f 'saved'); appReason = Get-DvProp $f 'reason' }
         $src = Join-Path $share $file
@@ -1738,9 +1764,12 @@ function Read-DvVisualCaptures {
             Copy-Item -LiteralPath $src -Destination $local -Force
             $entry.sha256 = Get-DvSha256OfFile $local
             try {
-                $hashPx = Get-DvVisualViewportPixels -Path $local -Viewport $entry.viewport -Width $script:VisualHashSize[0] -Height $script:VisualHashSize[1]
-                $entry.contentHash = $hashPx.contentHash; $entry.viewportMean = $hashPx.mean; $entry.viewportStd = $hashPx.std
-                if ($kind -cne 'play') { $pixels[$kind] = (Get-DvVisualViewportPixels -Path $local -Viewport $entry.viewport -Width $script:VisualDiffSize[0] -Height $script:VisualDiffSize[1]).rgb }
+                $hashPx = Get-DvVisualViewportPixels -Path $local -Viewport $entry.viewport -Width $script:VisualHashSize[0] -Height $script:VisualHashSize[1] -RequireViewport
+                if ($null -eq $hashPx) { $entry.viewportAvailable = $false }   # no usable viewport rectangle: the whole window is never hashed in its place
+                else {
+                    $entry.contentHash = $hashPx.contentHash; $entry.viewportMean = $hashPx.mean; $entry.viewportStd = $hashPx.std
+                    if ($kind -cne 'play') { $pixels[$kind] = (Get-DvVisualViewportPixels -Path $local -Viewport $entry.viewport -Width $script:VisualDiffSize[0] -Height $script:VisualDiffSize[1] -RequireViewport).rgb }
+                }
             } catch { $entry.appReason = "the runner could not read the image: $($_.Exception.GetType().Name)" }
         }
         if ($kind -ceq 'paused') { $block.pausedSettled = Get-DvProp $f 'settled'; $block.pausedFrame = Get-DvProp $f 'settled_frame' }
@@ -1748,9 +1777,17 @@ function Read-DvVisualCaptures {
         $frames.Add([pscustomobject]$entry)
     }
     $block.frames = $frames.ToArray()
+    # `playFrames` counts the JUDGED play frames (those with a usable viewport); `savedPlayFrames` the play PNGs the app saved and the runner copied;
+    # `captured` is true when any was saved, so a leg whose every viewport is missing still says six pictures were captured and none judged.
     $play = @($frames | Where-Object { $_.kind -ceq 'play' -and $_.contentHash })
     $block.playFrames = $play.Count
-    $block.captured = ($play.Count -gt 0)
+    $block.savedPlayFrames = @($frames | Where-Object { $_.kind -ceq 'play' -and $_.sha256 }).Count
+    $block.captured = ($block.savedPlayFrames -gt 0)
+    $block.viewportUnavailablePlayFrames = @($frames | Where-Object { $_.kind -ceq 'play' -and $_.sha256 -and -not $_.viewportAvailable }).Count
+    if ($block.viewportUnavailablePlayFrames -gt 0 -and $play.Count -ge 2) {
+        $notJudgedNote = "$($block.viewportUnavailablePlayFrames) saved play frame(s) have no usable viewport rectangle and were not judged; the other $($play.Count) were"
+        if (-not $block.reason) { $block.reason = $notJudgedNote }
+    }
     $block.distinctContentHashes = @($play | ForEach-Object { $_.contentHash } | Sort-Object -Unique).Count
     $block.appDistinctDisplayFrames = @($play | ForEach-Object { $_.displayFrame } | Where-Object { $null -ne $_ -and [int]$_ -ge 0 } | Sort-Object -Unique).Count
     $block.flatPlayFrames = @($play | Where-Object { $null -ne $_.viewportStd -and [double]$_.viewportStd -lt $script:VisualFlatViewportStd }).Count
@@ -1765,7 +1802,8 @@ function Read-DvVisualCaptures {
         [pscustomobject]@{ path = $(if ($_.sha256) { Join-Path $dir $_.file } else { $null }); viewport = $_.viewport; label = $label } })
     if ($tiles.Count -gt 0) {
         $v = Get-DvVisualVerdict -Requested $true -Captured ([bool]$block.captured) -PlayFrames ([int]$block.playFrames) -DistinctContentHashes ([int]$block.distinctContentHashes) `
-            -AppDistinctDisplayFrames ([int]$block.appDistinctDisplayFrames) -FlatPlayFrames ([int]$block.flatPlayFrames) -PlayVsPausedMeanAbsDiff $block.playVsPausedMeanAbsDiff -SamePosition ([bool]$block.samePosition)
+            -AppDistinctDisplayFrames ([int]$block.appDistinctDisplayFrames) -FlatPlayFrames ([int]$block.flatPlayFrames) -PlayVsPausedMeanAbsDiff $block.playVsPausedMeanAbsDiff -SamePosition ([bool]$block.samePosition) `
+            -SourceDifference ([string]$block.sourceDifference) -ViewportUnavailablePlayFrames ([int]$block.viewportUnavailablePlayFrames)
         $head = "$Header  visual=$($v.verdict)  distinct=$($block.distinctContentHashes)/$($block.playFrames)  play-vs-paused=$($block.playVsPausedMeanAbsDiff)"
         try {
             $block.stripPath = New-DvVisualStrip -Tiles $tiles -OutPath (Join-Path $dir "$LegId-strip.png") -Header $head.Trim()
