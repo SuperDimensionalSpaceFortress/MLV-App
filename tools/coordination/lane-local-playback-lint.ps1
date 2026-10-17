@@ -587,7 +587,13 @@ function Get-LocalPlaybackPromptFindings {
     # Bachelor") never covers it. It is scored only in a sentence that holds a direct launch above (it is no trigger of its own), it
     # starts at the app token like the app pattern, and an app call whose gap reaches a playback mode is the app pattern's, not this one.
     # A verbless "<app> <clip>" lead stays a non-launcher lead (r2, RULE4_R2_B_PASS).
-    $clipLaunch = "(?i)(?<=${b}(?:${verbs})\s+(?:&\s*)?['`"]?(?:[^\s;'`"]*[\\/])?)MLVApp(Release)?\.exe['`"]?\s+(?!${appArg}--(?:gui-smoke-playback|profile-playback))['`"]?[^\s;'`"\-][^\s;'`"]*\.\w+"
+    # r6 (CoS review of 469e513d, B1 + B2): the clip may follow option tokens ("--clip <clip>", "-v <clip>", "--input <path>": an option, then one
+    # optional value that is not itself an option), and the clip / path token is (a) a quoted string taken as ONE unit, spaces included
+    # ("'D:\my clips\a.dat'"), (b) a token with an extension, or (c) a token with a path separator and no extension ("D:\clips\take01").
+    # Neither the value nor the clip token may be the next app launcher, so a second launcher never reads as the first one's clip.
+    $clipOptions = "(?:-[^\s;]*\s+(?:(?!-)(?!${appStop})[^\s;]+\s+)?){0,6}"
+    $clipToken = "(?:'[^']*'|`"[^`"]*`"|['`"]?(?!${appStop})[^\s;'`"\-][^\s;'`"]*(?:\.\w+|[\\/][^\s;'`"]*))"
+    $clipLaunch = "(?i)(?<=${b}(?:${verbs})\s+(?:&\s*)?['`"]?(?:[^\s;'`"]*[\\/])?)MLVApp(Release)?\.exe['`"]?\s+(?!${appArg}--(?:gui-smoke-playback|profile-playback))${clipOptions}${clipToken}"
     $findings = New-Object System.Collections.Generic.List[string]
     # A "sentence" is a line, cut again at '. ' so one bullet carrying several instructions is judged piece by piece. A semicolon is NOT a
     # sentence boundary since r6: it is a hard clause cut (no inheritance, per-group playback test) that the defeater scan reads across.

@@ -988,7 +988,7 @@ def _differential_flips(work: Path, baseline_text: str | None = None, previous_h
                                   + PromptLintTests.CLAUSE_MUST_REFUSE_R12 + PromptLintTests.CLAUSE_MUST_PASS_R12
                                   + PromptLintTests.CLAUSE_MUST_REFUSE_R13 + PromptLintTests.CLAUSE_MUST_PASS_R13
                                   + RULE4_SECOND_LAUNCHER_REFUSE + RULE4_SECOND_LAUNCHER_GUARDS + RULE4_BOTH_ROUTED_PASS
-                                  + RULE4_R2_REFUSE + RULE4_R2_GUARDS + RULE4_R2_PASS + RULE4_R4_SEEDS
+                                  + RULE4_R2_REFUSE + RULE4_R2_GUARDS + RULE4_R2_PASS + RULE4_R4_SEEDS + RULE4_R6_SEEDS
                                   + PromptLintTests.PROBE_ROWS
                                   + tuple(text for _, _, text in PromptLintTests.DEFEATER_AXIS) + PromptLintTests.DEFEATER_AXIS_CONTROLS,
                                   members=tuple(_list_member_rows(_lint_word_lists(LINT_PS1, work))))
@@ -1272,6 +1272,63 @@ RULE4_R4_PASS = _RULE4_R4["pass"]
 RULE4_R4_REFUSE = RULE4_R4_RED + RULE4_R4_GUARDS
 # the differential corpus is one text per line: the line-break rows are judged by the catalogue tests only
 RULE4_R4_SEEDS = tuple(t for t in RULE4_R4_REFUSE + RULE4_R4_PASS if "\n" not in t)
+
+# r6 (CoS review 6227161437 on 469e513d: Blocker B1, Improvement 1, Prevention; CoS Dot fold-in 6228249768: Blocker B2). The r4b head is the
+# RED baseline of these rows (PromptLintTests.test_rule4_r6_*). The r4b clip-launch pattern took a bare first argument with an extension and
+# nothing else, so an app launch whose clip follows an option (`--clip <clip>`, `-v <clip>`, `--input <path>`), has no extension, or is a
+# quoted path with a space never counted as a launch of its own: a venue route on the NEXT launcher then covered it. Master refused every
+# one of the B1 / B2 rows, so against master (and the pre-change pin) they are guards, not RED rows; Improvement 1's two rows pass on master
+# too. Fixture clips follow this file's clip-name convention (take01.dat, a.dat): the lint's clip test is extension-generic.
+#   axis     the clip-argument axis the Prevention note asks for: argument form x lead verb x separator x the launcher that carries the route
+#            (an app launch with a bare clip, a tracked script call), in both orders (the clip launch first, and as the SECOND launcher).
+RULE4_R4B_PR_HEAD = "469e513d6151655a0d11d6f3bd5c97f5190dcb40"
+RULE4_R6_LEADS = ("Run", "Open")
+RULE4_R6_SEPARATORS = ("; run ", ", then run ", " and run ")
+
+
+def _rule4_r6_rows() -> dict[str, tuple[str, ...]]:
+    app_release = "MLVApp" + "Release.exe"
+    script = f"tools/profiling/{SMOKE_SCRIPT}"
+    # argument forms the r4b pattern did not read as a clip launch (RED) and the ones it already read (guards)
+    red_args = ("--clip take01.dat", "-v take01.dat", "--input D:\\clips\\a.dat", "D:\\clips\\take01", "--fps 24 take01.dat", "-v --clip take01.dat",
+                "'D:\\my clips\\a.dat'", '"D:\\my clips\\a.dat"', "--clip 'D:\\my clips\\a.dat'", '--clip "D:\\my clips\\a.dat"')
+    guard_args = ("take01.dat", "D:\\clips\\a.dat", "'D:\\clips\\a.dat'", '"D:\\clips\\a.dat"')
+    routed_seconds = (f"C:\\build\\{app_release} take01.dat {SMOKE_MODE} on Bachelor", f"pwsh -File {script} -Backend cpu on Bachelor")
+    routed_first = f"C:\\build\\{app_release} take01.dat {SMOKE_MODE} on Bachelor"
+    sets: dict[str, list[str]] = {k: [] for k in ("red", "guards", "pass", "named")}
+    for args, key in ((red_args, "red"), (guard_args, "guards")):
+        for lead, sep, arg in itertools.product(RULE4_R6_LEADS, RULE4_R6_SEPARATORS, args):
+            for second in routed_seconds:
+                # the clip launch is the FIRST launcher and has no route of its own; the route on launcher B must not cover it
+                sets[key].append(f"{lead} {app_release} {arg}{sep}{second}.")
+                sets["pass"].append(f"{lead} {app_release} {arg} on Bachelor{sep}{second}.")
+            # the clip launch is the SECOND launcher and has no route of its own (Improvement 1)
+            sets[key].append(f"{lead} {routed_first}{sep}{app_release} {arg}.")
+            sets["pass"].append(f"{lead} {routed_first}{sep}{app_release} {arg} on Bachelor.")
+    # the CoS rows, verbatim in shape: B1 (six), Improvement 1 (two), B2 (two)
+    second = f"C:\\build\\{app_release} take01.dat {SMOKE_MODE} on Bachelor."
+    sets["named"].extend((f"Run {app_release} --clip take01.dat and run {second}",
+                          f"Run {app_release} --clip take01.dat; run {second}",
+                          f"Run {app_release} --clip take01.dat, then run {second}",
+                          f"Run {app_release} -v take01.dat and run {second}",
+                          f"Run {app_release} --input D:\\clips\\a.dat and run {second}",
+                          f"Run {app_release} D:\\clips\\take01 and run {second}",
+                          f"Run C:\\build\\{app_release} take01.dat {SMOKE_MODE} on Bachelor and run {app_release} --clip take02.dat.",
+                          f"Run {app_release} --clip D:\\clips\\a.dat and run pwsh -File {script} -Backend cpu on Bachelor.",
+                          f"Run {app_release} 'D:\\my clips\\a.dat' and run {second}",
+                          f'Run {app_release} "D:\\my clips\\a.dat" and run {second}'))
+    # every CoS row is a RED row against the r4b head (the axis holds most of them; two are in no axis cell)
+    sets["red"].extend(sets["named"])
+    return {k: tuple(dict.fromkeys(v)) for k, v in sets.items()}
+
+
+_RULE4_R6 = _rule4_r6_rows()
+RULE4_R6_RED = _RULE4_R6["red"]
+RULE4_R6_GUARDS = _RULE4_R6["guards"]
+RULE4_R6_PASS = _RULE4_R6["pass"]
+RULE4_R6_NAMED = _RULE4_R6["named"]
+RULE4_R6_REFUSE = RULE4_R6_RED + RULE4_R6_GUARDS
+RULE4_R6_SEEDS = tuple(RULE4_R6_REFUSE + RULE4_R6_PASS)
 
 
 class HubHostsFileTests(unittest.TestCase):
@@ -2101,6 +2158,37 @@ class PromptLintTests(unittest.TestCase):
         self.assertEqual([], [t for t in RULE4_R4_GUARDS if old[t] == 0], f"guard rows {r3[0]} passes: they belong in the RED rows")
         self.assertEqual([], [t for t in earlier if (old[t] > 0) != (new[t] > 0)], f"an r1 / r2 row changed its verdict against {r3[0]}")
 
+    def test_red_rule4_r6_a_clip_after_an_option_or_a_quoted_spaced_path_is_a_launch_of_its_own(self):
+        """r6: the CoS rows (B1, Improvement 1, B2) and the clip-argument axis (option forms, no extension, quoted with and without a space,
+        as the first and as the second launcher, after every separator) refuse; the same rows with their own route pass."""
+        for row in RULE4_R6_NAMED:
+            self.assertIn(row, RULE4_R6_REFUSE)
+        self.assertEqual(10, len(RULE4_R6_NAMED))
+        self.assertTrue(any("'D:\\my clips" in t for t in RULE4_R6_RED) and any('"D:\\my clips' in t for t in RULE4_R6_RED), "the quoted-with-space axis rows")
+        rows = list(RULE4_R6_REFUSE)
+        counts = _json_counts(LINT_PS1, rows, self.tmp, "rule4-r6-refuse")
+        self.assertEqual([], [t for t, n in zip(rows, counts) if n == 0], "r6 rows the lint passed that it must refuse")
+        rows = list(RULE4_R6_PASS)
+        counts = _json_counts(LINT_PS1, rows, self.tmp, "rule4-r6-pass")
+        self.assertEqual([], [t for t, n in zip(rows, counts) if n > 0], "r6 rows with every launcher routed that the lint refused")
+
+    def test_rule4_r6_rows_are_red_on_the_r4b_head_and_every_earlier_row_keeps_its_verdict(self):
+        """RED proof kept in the suite: every RULE4_R6_RED row PASSES on the lint of the r4b head 469e513d (and every guard is refused
+        there). Against that head nothing else moves: every earlier rule-4 row keeps its verdict."""
+        self.maxDiff = None
+        r4b = _rule4_r1_head_lint(RULE4_R4B_PR_HEAD, "r4b")
+        (self.tmp / "rule4-r4b-head.ps1").write_text(r4b[1], encoding="utf-8")
+        earlier = list(dict.fromkeys(RULE4_R2_REFUSE + RULE4_R2_GUARDS + RULE4_SECOND_LAUNCHER_REFUSE + RULE4_SECOND_LAUNCHER_GUARDS
+                                     + RULE4_R2_PASS + RULE4_BOTH_ROUTED_PASS + RULE4_R4_REFUSE + RULE4_R4_PASS))
+        mine = list(RULE4_R6_REFUSE + RULE4_R6_PASS)
+        _prefetch_counts(self.tmp, [(self.tmp / "rule4-r4b-head.ps1", earlier + mine, "rule4-r6-r4bhead"), (LINT_PS1, earlier + mine, "rule4-r6-now")])
+        old = dict(zip(earlier + mine, _verdicts(self.tmp / "rule4-r4b-head.ps1", earlier + mine)))
+        new = dict(zip(earlier + mine, _verdicts(LINT_PS1, earlier + mine)))
+        self.assertEqual([], [t for t in RULE4_R6_RED if old[t] > 0], f"rows {r4b[0]} already refuses: not a RED row")
+        self.assertEqual([], [t for t in RULE4_R6_GUARDS if old[t] == 0], f"guard rows {r4b[0]} passes: they belong in the RED rows")
+        self.assertEqual([], [t for t in RULE4_R6_PASS if old[t] > 0], f"routed rows {r4b[0]} refuses: the ALLOW rows must be unchanged")
+        self.assertEqual([], [t for t in earlier if (old[t] > 0) != (new[t] > 0)], f"an earlier rule-4 row changed its verdict against {r4b[0]}")
+
     def test_rule4_the_refuse_rows_are_red_on_the_baseline(self):
         """RED proof kept in the suite: every second-launcher row passes the lint of RULE4_PRE_CHANGE_MASTER, the master this PR branched
         from (its rule 4 read only the first launcher occurrence).
@@ -2108,7 +2196,8 @@ class PromptLintTests(unittest.TestCase):
         r4b (CoS Improvement 6224545625): the proof is judged against that PINNED pre-change commit, never against fork/master or
         HUB_VM_LINT_BASELINE_REF. Once this PR merges those refs carry the change, so the next lint PR (whose lint differs from master's
         by one byte) failed here with 'already refuses: not a RED row'; only byte-identity used to skip. If the pinned baseline ever
-        refuses EVERY RED row it carries the change and is no RED baseline: the test skips with that reason instead of failing.
+        refuses EVERY RED row it carries the change and is no RED baseline: the test skips with that reason instead of failing. The pin
+        never changes, so that skip can only fire in a broken clone or after a history rewrite (CoS nit on 469e513d); it is a guard, not a path.
 
         Retirement: the pin never moves (re-pinning it to a later master would make it carry the change). The test is deleted, not
         re-pinned, when the rule-4 catalogue retires; the candidate verdicts stay pinned by test_red_rule4_* either way."""
@@ -2681,13 +2770,16 @@ class LintDifferentialPinTests(unittest.TestCase):
          "r1b over-refusal kept on purpose (card HUB-VM-LINT-LOG-COPY-OVERREFUSAL-1): 'copy the log on this host' after a venue run "
          "is refused like its `locally` twin; a handling-verb list would open 'Copy the clip locally and run playback.'"),
         ("rule4-per-launcher-scope",
-         lambda text, f: f.get("tpl") == "seed" and (text in RULE4_SECOND_LAUNCHER_REFUSE or text in RULE4_R2_REFUSE or text in RULE4_R4_REFUSE),
+         lambda text, f: f.get("tpl") == "seed" and (text in RULE4_SECOND_LAUNCHER_REFUSE or text in RULE4_R2_REFUSE or text in RULE4_R4_REFUSE
+                                                     or text in RULE4_R6_REFUSE),
          "NA2-RULE4-PER-LAUNCHER-SCOPE-1, CoS post-merge Blocker on #448 (ask 6216180502): rule 4 scores EACH launcher occurrence, so a "
          "venue locus exempts only the launcher it routes. Master read only the first occurrence and passed '<launcher> -Backend cpu on "
          "Bachelor; then run <launcher> -Backend cpu.' and its relatives (RULE4_SECOND_LAUNCHER_REFUSE). r2 (CoS review of 75cb00e1): "
          "the same for a venue-routed lead that is not a launcher, ` or `, a route that belongs to launcher B, and mixed-style pairs "
          "(RULE4_R2_REFUSE). r4 (sol r3 + Iverson on 4b9c9387): the quoted call `& '<script>' -Param` is a launcher, and a launcher "
-         "name inside a path argument no longer ends a launcher's argument gap (RULE4_R4_REFUSE)."),
+         "name inside a path argument no longer ends a launcher's argument gap (RULE4_R4_REFUSE). r6 (CoS review of 469e513d, B1 + B2 + "
+         "Improvement 1): an app launch whose clip follows an option, has no extension, or is a quoted path with a space is a launch of its "
+         "own (RULE4_R6_REFUSE); master refused the B1 / B2 rows, and passes the clip-launch-as-second-launcher rows of Improvement 1."),
     )
 
     # r7 PREVIOUS-HEAD gate (CoS Prevention on a595464f). Against the lint of the PR head this round started from, NOTHING may open:
@@ -2751,13 +2843,16 @@ class LintDifferentialPinTests(unittest.TestCase):
          "executable is a launch). An executable that carries its own route, follows a prohibition, or is the marker clause's own "
          "launch still passes (CLAUSE_MUST_PASS_R13)."),
         ("rule4-per-launcher-scope",
-         lambda text, f: f.get("tpl") == "seed" and (text in RULE4_SECOND_LAUNCHER_REFUSE or text in RULE4_R2_REFUSE or text in RULE4_R4_REFUSE),
+         lambda text, f: f.get("tpl") == "seed" and (text in RULE4_SECOND_LAUNCHER_REFUSE or text in RULE4_R2_REFUSE or text in RULE4_R4_REFUSE
+                                                     or text in RULE4_R6_REFUSE),
          "NA2-RULE4-PER-LAUNCHER-SCOPE-1, CoS post-merge Blocker on #448 (ask 6216180502): a venue-routed first launcher no longer "
          "exempts a second, unrouted one after ';', ', then' or ' then' (RULE4_SECOND_LAUNCHER_REFUSE). The d2f3cd05 lint passed every "
          "one of them (rule 4 read only the first launcher occurrence), and master passes them too. r2 (CoS review of 75cb00e1): a "
          "launcher's gap stops at ';' and at the next pwsh / powershell / app token and spans of different clauses never merge, so "
          "RULE4_R2_REFUSE (cross-clause pairs, ` or `, a route on launcher B only, mixed styles) refuses as well. r4: the quoted call "
-         "and a launcher name inside a path argument (RULE4_R4_REFUSE), passed by d2f3cd05 and master alike."),
+         "and a launcher name inside a path argument (RULE4_R4_REFUSE), passed by d2f3cd05 and master alike. r6: an app launch whose clip "
+         "follows an option, has no extension, or is a quoted path with a space (RULE4_R6_REFUSE): d2f3cd05 and master "
+         "refuse 60 of the 182 RED rows (the six B1 rows and both B2 rows among them) and pass the other 122, which are the rows that flip."),
     )
 
     @classmethod
