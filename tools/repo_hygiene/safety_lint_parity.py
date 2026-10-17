@@ -319,15 +319,48 @@ def load_allow(path: Path) -> dict[str, dict]:
 
 # ------------------------------------------------------------------------------------------------ hook rows
 
+def fs_state(root: str, names: list[str]) -> list[tuple]:
+    """r9 (B3, filesystem variant): everything a fixture left under the scratch root `root`, as sorted (relative path, kind, size, sha256) tuples.
+
+    The hook reads files the fixture wrote (a receipt's size, a snapshot's rows), so two builders that emit the same stdin and environment
+    but write different files are different stimuli.  The scratch dir's random basename (`names`) is masked in every path and in every file's
+    content before it is hashed, so the state of two builds of ONE builder is identical.  The size is the raw byte length (what the hook
+    reads); the hash is over the masked bytes.  An unreadable entry raises OSError, and the caller counts a raising build as different."""
+    masks = [re.compile(re.escape(name.encode("utf-8")), re.IGNORECASE) for name in names]  # applied to file content (bytes)
+    path_masks = [re.compile(re.escape(name), re.IGNORECASE) for name in names]  # applied to the relative path (str)
+    entries = []
+    for here, dirs, files in os.walk(root):
+        dirs.sort()
+        for name in sorted(dirs) + sorted(files):
+            full = os.path.join(here, name)
+            rel = os.path.relpath(full, root).replace(os.sep, "/")
+            for path_mask in path_masks:
+                rel = path_mask.sub("<TMP>", rel)
+            if os.path.islink(full):
+                entries.append((rel, "link", 0, hashlib.sha256(os.readlink(full).encode("utf-8", "replace")).hexdigest()))
+            elif os.path.isdir(full):
+                entries.append((rel, "dir", 0, ""))
+            else:
+                with open(full, "rb") as handle:
+                    data = handle.read()
+                size = len(data)
+                for mask in masks:
+                    data = mask.sub(b"<TMP>", data)
+                entries.append((rel, "file", size, hashlib.sha256(data).hexdigest()))
+    return sorted(entries)
+
+
 class HookCase:
     """One hook row: how to build (stdin text, environment, venue) on demand, and a cleanup for its tmp board."""
 
-    def __init__(self, row_id: str, why: str, source: str, build, tmp_names: list | None = None):
+    def __init__(self, row_id: str, why: str, source: str, build, tmp_names: list | None = None, fs_roots: list | None = None):
         self.id, self.why, self.source, self.build = row_id, why, source, build
         self.display = ""
         self.text = ""  # the row's full, run-stable text: what an allow-list entry's `hash` is taken over
         # r8 (B3): `build` appends the basename of the scratch dir it made, so `stimulus` can mask the one part that differs between two builds
         self.tmp_names = tmp_names if tmp_names is not None else []
+        # r9 (B3, filesystem variant): `build` also appends the scratch dir's full path, so `stimulus` can bind the files the fixture wrote
+        self.fs_roots = fs_roots if fs_roots is not None else []
 
     def stimulus(self) -> str:
         """The BUILT stimulus of this row (stdin text, environment, venue), canonicalised: the scratch dir's random name is masked.
@@ -336,10 +369,13 @@ class HookCase:
         different commands (a changed `_substitute`, `_render_content`, fixture or enable-literal binder) share one content hash.  The
         union compares this string for such twins; it is deterministic across two builds of one module once the tmp name is masked."""
         del self.tmp_names[:]
+        del self.fs_roots[:]
         stdin_text, env, venue, cleanup = self.build()
         try:
-            blob = repr((stdin_text, sorted(env.items()), venue))
             names = list(self.tmp_names)
+            # r9 (B3, filesystem variant): the files the fixture wrote are part of the stimulus (path, size, sha256 of each, tmp name masked)
+            fs = [fs_state(root, names) for root in list(self.fs_roots)]
+            blob = repr((stdin_text, sorted(env.items()), venue, fs))
         finally:
             with contextlib.suppress(Exception):
                 cleanup()
@@ -378,11 +414,13 @@ def _hook_cases_from(tm, source: str, which: str) -> list[HookCase]:
             row_id += "-x"
         used.add(row_id)
         tmp_names: list[str] = []  # r8 (B3): see HookCase.stimulus
+        fs_roots: list[str] = []  # r9 (B3, filesystem variant): the scratch roots whose files `stimulus` binds
 
-        def build(case=case, tm=tm, tmp_names=tmp_names):
+        def build(case=case, tm=tm, tmp_names=tmp_names, fs_roots=fs_roots):
             probe = tm.MlvNeverAuthorizedHookTests("test_hook_script_is_present_on_this_ref")
             probe.setUp()
             tmp_names.append(os.path.basename(probe.tmp))
+            fs_roots.append(probe.tmp)
             overrides = tm.FIXTURES[case.get("fixture", "default")](probe.paths)
             probe._bind_the_enable_literal()
             if "raw" in case:
@@ -394,7 +432,7 @@ def _hook_cases_from(tm, source: str, which: str) -> list[HookCase]:
             return stdin_text, env, venue, probe.doCleanups
 
         hc = HookCase(row_id, f"{HOOK_TEST_REL} CASES[{case['name']!r}] (group {case.get('group')}, {case.get('na', '?')}; {which} copy)",
-                      source, build, tmp_names)
+                      source, build, tmp_names, fs_roots)
         hc.display = str(case.get("input", case.get("raw", "")))[:200]
         # r6 (CoS B2): the hashed text is EVERYTHING in the case that decides the verdict: tool, input, fixture (the environment the row
         # runs under) and raw (the stdin text of a raw row).  A fixture swap changes the verdict without changing the input.

@@ -854,6 +854,142 @@ class BuilderSemanticsUnionTests(ParityRunnerCase):
         self.assertEqual(len([c for c in union if c.id == LOOSENED_ROW_ID]), 1, "the head's own row stays")
 
 
+# r9 B3, filesystem-fixture variant (acting-cos Dot on 2582ca65): r8 compared stdin, environment and venue before it discarded an apparently
+# identical baseline builder, and a fixture's FILES are none of those.  `fixture_existing_receipt` writes live.json, whose size the hook reads,
+# so a head that changed the size that fixture writes (CASES and environment untouched) produced equal stimuli, and the baseline's receipt
+# state was dropped; a head hook that allows the shrinking write only against the ORIGINAL receipt size then escaped parity.  Chosen fix (a): the
+# stimulus now also binds the state of the scratch root after the build (relative path, size and sha256 of every file the fixture wrote, the
+# scratch dir's random name masked), so the two builds differ whenever a fixture writes a different file.
+CARVEOUT_WRITE_CASE = "carveout receipt shrink as a Write"
+CARVEOUT_WRITE_ROW_ID = "hook:" + slp.slug(CARVEOUT_WRITE_CASE)
+
+
+def _head_hook_tests_source_with_fixture(fixture_body: str) -> str:
+    """A scratch head copy of the hook suite: CASES untouched, the `existing_receipt` fixture replaced by `fixture_body` (a function body over `paths`)."""
+    real = str(REPO_ROOT / slp.HOOK_TEST_REL)
+    return "\n".join([
+        f"_REAL = {real!r}",
+        "__file__ = _REAL",
+        "exec(compile(open(_REAL, encoding='utf-8').read(), _REAL, 'exec'), globals())",
+        "",
+        "",
+        "def _head_fixture_existing_receipt(paths):",
+        *["    " + line for line in fixture_body.splitlines()],
+        "    return {}",
+        "",
+        "",
+        "FIXTURES['existing_receipt'] = _head_fixture_existing_receipt",
+        "",
+    ])
+
+
+def _head_hook_source_allowing_the_shrink_only_at_size(size: int) -> str:
+    """The wrapper head hook: the real hook, except that a Write of a receipts/live.json that is EXACTLY `size` bytes long is allowed."""
+    real = str(REPO_ROOT / slp.HOOK_REL)
+    return "\n".join([
+        f"_REAL = {real!r}",
+        "exec(compile(open(_REAL, encoding='utf-8').read(), _REAL, 'exec'), globals())",
+        "_real_decide = decide",
+        "",
+        "",
+        "def decide(payload, project_dir):",
+        "    import os as _os",
+        "    tool_input = payload.get('tool_input') or {}",
+        "    path = str(tool_input.get('file_path') or '').replace(chr(92), '/')",
+        "    if payload.get('tool_name') == 'Write' and path.endswith('/receipts/live.json') and _os.path.exists(path) and _os.path.getsize(path) == " + repr(size) + ":",
+        "        return 0, ''",
+        "    return _real_decide(payload, project_dir)",
+        "",
+    ])
+
+
+class FilesystemFixtureUnionTests(ParityRunnerCase):
+    """r9 B3: a fixture that writes a different file is a different row, even when its stdin, environment and venue are equal."""
+
+    PADDED = "_write(os.path.join(paths['RECEIPTS'], 'live.json'), RECEIPT_LONG + chr(10) + 'x' * 64)"
+    SAME_BYTES_OTHER_CODE = "_write(os.path.join(paths['RECEIPTS'], 'live.json'), ''.join([RECEIPT_LONG[:100], RECEIPT_LONG[100:]]))"
+    SAME_SIZE_OTHER_BYTES = "_write(os.path.join(paths['RECEIPTS'], 'live.json'), RECEIPT_LONG.replace('x', 'y'))"
+
+    def redirect_head_hook_tests(self, tests: Path):
+        real = slp.load_module
+
+        def load(path, name):
+            return real(tests if Path(path).name == Path(slp.HOOK_TEST_REL).name else path, name)
+        return mock.patch.object(slp, "load_module", load)
+
+    def original_size(self) -> int:
+        base_tm = slp.load_module(REPO_ROOT / slp.HOOK_TEST_REL, "parity_b3fs_sizes")
+        return len(base_tm.RECEIPT_LONG.encode("utf-8"))
+
+    def scratch(self, fixture_body: str):
+        return (_write(self.tmp / "head_hook.py", _head_hook_source_allowing_the_shrink_only_at_size(self.original_size())),
+                _write(self.tmp / "head_hook_tests.py", _head_hook_tests_source_with_fixture(fixture_body)))
+
+    def run_main(self, hook: Path, tests: Path):
+        out = io.StringIO()
+        with self.redirect_head_hook_tests(tests), contextlib.redirect_stdout(out):
+            rc = slp.main(["--base", "HEAD", "--lint", "hook", "--corpus", str(self.corpus()), "--allow", str(self.allow), "--head-hook", str(hook)])
+        return rc, out.getvalue()
+
+    def twin_rows(self, tests: Path):
+        with self.redirect_head_hook_tests(tests):
+            tm = slp.load_module(tests, "parity_b3fs_head_tests")
+        base_tm = slp.load_module(REPO_ROOT / slp.HOOK_TEST_REL, "parity_b3fs_base_tests")
+        head_row = next(c for c in slp._hook_cases_from(tm, "derived", "head") if c.id == CARVEOUT_WRITE_ROW_ID)
+        base_row = next(c for c in slp._hook_cases_from(base_tm, "derived-base", "baseline") if c.id == CARVEOUT_WRITE_ROW_ID)
+        return head_row, base_row
+
+    def test_B3fs_the_cases_stdin_and_environment_are_equal_but_the_receipt_the_fixture_wrote_is_not(self):
+        _, tests = self.scratch(self.PADDED)
+        head_row, base_row = self.twin_rows(tests)
+        self.assertEqual(head_row.text, base_row.text, "the CASES entry is untouched: the content hash cannot see the change")
+        head_stdin, head_env, head_venue, head_cleanup = head_row.build()
+        base_stdin, base_env, base_venue, base_cleanup = base_row.build()
+        try:
+            head_receipt = os.path.join(json.loads(head_stdin)["tool_input"]["file_path"])
+            base_receipt = os.path.join(json.loads(base_stdin)["tool_input"]["file_path"])
+            head_size, base_size = os.path.getsize(head_receipt), os.path.getsize(base_receipt)
+        finally:
+            head_cleanup()
+            base_cleanup()
+        self.assertEqual(sorted(head_env) , sorted(base_env), "the environment KEYS are equal")
+        self.assertEqual(head_venue, base_venue)
+        self.assertNotEqual(head_size, base_size, "the two fixtures wrote receipts of different sizes")
+        self.assertNotEqual(head_row.stimulus(), base_row.stimulus(), "the built stimulus must bind the filesystem state the fixture created")
+
+    def test_B3fs_a_fixture_that_writes_the_same_bytes_by_other_code_joins_no_row(self):
+        _, tests = self.scratch(self.SAME_BYTES_OTHER_CODE)
+        head_row, base_row = self.twin_rows(tests)
+        self.assertEqual(head_row.stimulus(), base_row.stimulus(), "same files, same bytes: the baseline builder is a duplicate")
+
+    def test_B3fs_a_fixture_that_writes_the_same_size_with_other_bytes_is_a_different_row(self):
+        _, tests = self.scratch(self.SAME_SIZE_OTHER_BYTES)
+        head_row, base_row = self.twin_rows(tests)
+        self.assertNotEqual(head_row.stimulus(), base_row.stimulus(), "the sha256 is part of the bound state, not the size alone")
+
+    def test_B3fs_the_stimulus_of_one_builder_is_stable_across_two_builds_for_every_derived_row(self):
+        base_tm = slp.load_module(REPO_ROOT / slp.HOOK_TEST_REL, "parity_b3fs_stable_tests")
+        unstable = [c.id for c in slp._hook_cases_from(base_tm, "derived-base", "baseline") if c.stimulus() != c.stimulus()]
+        self.assertEqual(unstable, [], "a builder whose files differ between two builds would keep every baseline twin")
+
+    def test_B3fs_the_baseline_receipt_state_is_kept_and_a_head_that_allows_only_the_original_size_is_loosened(self):
+        hook, tests = self.scratch(self.PADDED)
+        # the control: the same scratch hook over the UNEDITED suite allows the shrink against the original size, so that row is LOOSENED already
+        control_rc, control_out = self.run_main(hook, _write(self.tmp / "unedited_tests.py", _head_hook_tests_source_with_fixture(
+            "_write(os.path.join(paths['RECEIPTS'], 'live.json'), RECEIPT_LONG)")))
+        self.assertEqual(control_rc, slp.EXIT_LOOSENED, control_out)
+        self.assertIn(f"LOOSENED {CARVEOUT_WRITE_ROW_ID} [", control_out)
+        # the edit: the head fixture writes a larger receipt, CASES and environment unchanged; the head-built row is denied, the baseline-built one is not
+        with self.redirect_head_hook_tests(tests):
+            head_ids = [c.id for c in slp.derived_hook_cases(REPO_ROOT)]
+        self.assertEqual(len(head_ids), EXACT_DERIVED_HOOK_ROWS, "the count pin stays green: this is the CoS B3 filesystem repro")
+        rc, out = self.run_main(hook, tests)
+        self.assertEqual(rc, slp.EXIT_LOOSENED, out)
+        self.assertRegex(out, rf"LOOSENED {CARVEOUT_WRITE_ROW_ID}@base-[0-9a-f]{{10}} ")
+        self.assertIn("master=DENY head=ALLOW", out)
+        self.assertEqual([i for i in _loosened_ids(out) if i == CARVEOUT_WRITE_ROW_ID], [], "the head-built row is denied by the head hook, so it is not loosened")
+
+
 # r8 B4 (acting-cos Dot on c722b29c): derived playback rows were suppressed solely by the static corpus's ids, so a static row reusing a
 # derived row's id with harmless text removed the derived sentence from the comparison.  Chosen fix: REFUSE (exit 2, named reason) a static
 # row whose id is a derived row's id but whose text differs; an identical id AND text is the same sentence and is compared once.
