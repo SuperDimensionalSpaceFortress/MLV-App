@@ -1692,18 +1692,23 @@ long llrpGpuReconBackendLockArrivalsForTesting(void)
  * each capturing section (run_backend, the preupload, the GL reset and the
  * teardown drain) right after it releases the backend mutex (and the bypass
  * claim) and before it emits to the telemetry sink: the gap a test holds open.
- * NULL (the default, and always in the app) calls nothing: one pointer load. */
-static void (*volatile g_llrawproc_gpu_recon_after_unlock_hook)(void) = NULL;
+ * NULL (the default, and always in the app) calls nothing: one pointer load.
+ * r4 (Iverson 6227232346): the slot is written with InterlockedExchangePointer and
+ * read with InterlockedCompareExchangePointer(&p, NULL, NULL), like the file's other
+ * cross-thread state (InterlockedExchange in llrpSetGpuCudaSuppressed), not a plain
+ * volatile load/store. The slot holds the function pointer as a PVOID. */
+static PVOID volatile g_llrawproc_gpu_recon_after_unlock_hook = NULL;
 
 void llrpSetGpuReconAfterUnlockHookForTesting(void (*hook)(void));
 void llrpSetGpuReconAfterUnlockHookForTesting(void (*hook)(void))
 {
-    g_llrawproc_gpu_recon_after_unlock_hook = hook;
+    InterlockedExchangePointer(&g_llrawproc_gpu_recon_after_unlock_hook, (PVOID)hook);
 }
 
 static void llrawproc_gpu_recon_after_unlock_for_testing(void)
 {
-    void (*hook)(void) = g_llrawproc_gpu_recon_after_unlock_hook;
+    void (*hook)(void) = (void (*)(void))InterlockedCompareExchangePointer(
+        &g_llrawproc_gpu_recon_after_unlock_hook, NULL, NULL);
     if(hook) hook();
 }
 
@@ -1962,12 +1967,16 @@ typedef struct
     llrawprocGpuCudaNotes_t noted;   /* noted during this failed call: [0] primary */
 } llrawprocGpuStageTelemetryEvent_t;
 
-/* GPU-LOSS-EMIT-BEFORE-UNLOCK-1: see llrpSetGpuDeviceLossClassifier in llrawproc.h. */
-static volatile llrpGpuDeviceLossClassifier_t g_llrawproc_gpu_device_loss_classifier = NULL;
+/* GPU-LOSS-EMIT-BEFORE-UNLOCK-1: see llrpSetGpuDeviceLossClassifier in llrawproc.h.
+ * r4 (Iverson 6227232346): written with InterlockedExchangePointer and read with
+ * InterlockedCompareExchangePointer(&p, NULL, NULL), not as a plain volatile. In the
+ * app it is set once, when the breaker installs (GpuDeviceLossBreaker.cpp, before any
+ * backend caller runs), and cleared only by its resetForTesting. Held as a PVOID. */
+static PVOID volatile g_llrawproc_gpu_device_loss_classifier = NULL;
 
 void llrpSetGpuDeviceLossClassifier(llrpGpuDeviceLossClassifier_t classifier)
 {
-    g_llrawproc_gpu_device_loss_classifier = classifier;
+    InterlockedExchangePointer(&g_llrawproc_gpu_device_loss_classifier, (PVOID)classifier);
 }
 
 /* GPU-LOSS-EMIT-BEFORE-UNLOCK-1: caller holds the backend mutex (or the preupload bypass
@@ -1975,7 +1984,8 @@ void llrpSetGpuDeviceLossClassifier(llrpGpuDeviceLossClassifier_t classifier)
  * the flag now; the sink still gets every record after the unlock. */
 static void llrawproc_gpu_suppress_on_device_loss_locked(const llrawprocGpuStageTelemetryEvent_t * ev, int count)
 {
-    const llrpGpuDeviceLossClassifier_t classifier = g_llrawproc_gpu_device_loss_classifier;
+    const llrpGpuDeviceLossClassifier_t classifier = (llrpGpuDeviceLossClassifier_t)
+        InterlockedCompareExchangePointer(&g_llrawproc_gpu_device_loss_classifier, NULL, NULL);
     int i;
     int j;
     if(!classifier) return;

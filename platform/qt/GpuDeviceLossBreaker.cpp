@@ -162,6 +162,8 @@ void install()
         GpuFieldTelemetry::noteRecovery("safe_start", "cpu_route");
         showNotice(QString::fromLatin1(core::kNoticeStartup));
     }
+    // Installed once (g_installed above), before any backend caller runs; only resetForTesting clears it.
+    // llrawproc writes and reads the slot with Interlocked*Pointer (GPU-LOSS-EMIT-BEFORE-UNLOCK-1 r4).
     llrpSetGpuDeviceLossClassifier(&classifyDeviceLossCodeForBackend);
     GpuFieldTelemetry::setFaultListener(&onFault);
 }

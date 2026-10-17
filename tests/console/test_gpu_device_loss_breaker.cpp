@@ -559,6 +559,17 @@ TEST(GpuDeviceLossBreaker, EveryCapturingUnlockSuppressesOnADeviceLossBeforeRele
     ASSERT_TRUE(breaker.contains(QStringLiteral("    llrpSetGpuDeviceLossClassifier(&classifyDeviceLossCodeForBackend);\n"
                                                 "    GpuFieldTelemetry::setFaultListener(&onFault);\n")));
     ASSERT_TRUE(breaker.contains(QStringLiteral("    llrpSetGpuDeviceLossClassifier(nullptr);\n")));
+    // r4 (Iverson 6227232346): the classifier and after-unlock hook slots are interlocked, never plain volatile.
+    for (const char * slot : {"g_llrawproc_gpu_device_loss_classifier", "g_llrawproc_gpu_recon_after_unlock_hook"})
+    {
+        const QString name = QString::fromLatin1(slot);
+        ASSERT_TRUE(llrawproc.contains(QStringLiteral("static PVOID volatile %1 = NULL;\n").arg(name)));
+        ASSERT_TRUE(llrawproc.contains(QStringLiteral("InterlockedExchangePointer(&%1, (PVOID)").arg(name)));
+        ASSERT_TRUE(llrawproc.contains(QStringLiteral("InterlockedCompareExchangePointer(\n        &%1, NULL, NULL)").arg(name))
+                    || llrawproc.contains(QStringLiteral("InterlockedCompareExchangePointer(&%1, NULL, NULL)").arg(name)));
+        ASSERT_EQ(2, (int)llrawproc.count(QStringLiteral("&%1").arg(name))); // one write, one read: no other access
+        ASSERT_EQ(1, (int)llrawproc.count(QStringLiteral("%1 = ").arg(name))); // the declaration: no plain store
+    }
 }
 
 // r6: every AMaZE run reads the flag again after its telemetry entry, which can deliver an orphan device-loss
