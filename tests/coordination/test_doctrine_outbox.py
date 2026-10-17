@@ -1758,6 +1758,33 @@ def test_r14_a_gitlink_cards_entry_at_the_tip_is_refused(tmp_path):
     assert report["pushed"] is False
 
 
+@needs_node
+@pytest.mark.parametrize("link_path", ["specs", "specs/mlv-app"])
+def test_r14_a_link_on_a_parent_of_the_cards_path_at_the_tip_is_a_per_item_refusal(tmp_path, link_path):
+    """CoS r3 review, I7 (cards path): a link at `specs` or `specs/mlv-app` made ls-tree on the leaf return nothing,
+    so the write-time guard aborted the whole drain; now only the card is refused, under its own code."""
+    bare, clone = init_bus(tmp_path)
+    add_validator(clone)
+    git(clone, "fetch", "-q", "origin")
+    git(clone, "checkout", "-q", "--detach", "origin/master")
+    blob = subprocess.run(["git", "-C", str(clone), "hash-object", "-w", "--stdin"], input="../../elsewhere", check=True,
+                          capture_output=True, text=True).stdout.strip()
+    git(clone, "rm", "-r", "-q", "--cached", "--ignore-unmatch", link_path)  # index only: the link replaces a directory
+    git(clone, "update-index", "--add", "--cacheinfo", f"120000,{blob},{link_path}")
+    git(clone, "commit", "-m", f"tip link at {link_path}")
+    git(clone, "push", "origin", "HEAD:refs/heads/master")
+    src = init_source(tmp_path)
+    add_item(src, "20261007-a-good-card.md", target=CARDS, body=CARD_BODY)
+    add_item(src, "20261007-b-receipt.md", target="RECEIPTS.md", kind="receipt", body="### A receipt\nbody\n")
+
+    report = ob.drain(src, clone, "HEAD", tmp_path / "sent.jsonl", [], push=True)
+
+    assert [(r["path"], r["code"]) for r in report["refused"]] == [("doctrine-outbox/20261007-a-good-card.md", "CARDS_PATH_IS_LINK")]
+    assert link_path in report["refused"][0]["detail"] and "120000" in report["refused"][0]["detail"]
+    assert [p["target"] for p in report["published"]] == ["RECEIPTS.md"], "the receipt is not held by the refused card"
+    assert git(bare, "ls-tree", "master", "--", link_path).startswith("120000 "), "the link itself is untouched"
+
+
 def _make_dir_link(link: Path, target: Path) -> None:
     try:
         link.symlink_to(target, target_is_directory=True)

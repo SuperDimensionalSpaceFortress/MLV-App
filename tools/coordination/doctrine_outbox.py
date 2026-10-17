@@ -133,10 +133,11 @@ CONCERNS_READER_FILE = "cos-feedback/README.md"
 CONCERNS_READER_TOKEN = "CoS-CONCERN:"
 # The ratification is ONE line of that README, not the token anywhere in it: the CoS's reader duty names both routes
 # (R1 PR comments and R2 every specs/*/cos-concerns.md). The gate opens only on a line EQUAL to the example below
-# (an optional leading `- ` or `* ` bullet and surrounding whitespace allowed); a line that adds, forbids or negates
-# anything is not the duty, and a line inside a ``` fence, a ~~~ fence or an HTML comment never counts.
+# (an optional leading `- ` or `* ` bullet allowed, indented 0 to 3 spaces, and trailing whitespace); a line that adds,
+# forbids or negates anything is not the duty, a line at 4 or more spaces or a tab is an indented code block, and a
+# line inside a ``` fence, a ~~~ fence or an HTML comment never counts.
 CONCERNS_DUTY_LINE_EXAMPLE = "- The CoS reads `CoS-CONCERN:` PR comments and every `specs/*/cos-concerns.md` each pass."
-CONCERNS_DUTY_LINE_RE = re.compile(r"^\s*(?:[-*]\s+)?" + re.escape(CONCERNS_DUTY_LINE_EXAMPLE[2:]) + r"\s*$")
+CONCERNS_DUTY_LINE_RE = re.compile(r"^ {0,3}(?:[-*]\s+)?" + re.escape(CONCERNS_DUTY_LINE_EXAMPLE[2:]) + r"\s*$")
 _FENCE_OPEN_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 CONCERN_FIELDS = ("id", "to", "opened_utc", "expires_utc", "kind", "evidence", "ask")
 CONCERN_KINDS = ("output-format", "process", "shared-tool-defect", "fleet-pattern")
@@ -978,10 +979,13 @@ def r14_gate(bus_repo: pathlib.Path, tip: str, candidates: list[dict], report: d
             node = find_node(bus_repo)
         except Refusal as e:
             node_refusal = (e.code, e.detail)
+    cards_link_problem = tip_parent_link_problem(bus_repo, tip, CARDS_TARGET) if has_cards and validator else None
     entry_problem = cards_tip_entry_problem(bus_repo, tip) if has_cards and validator else None
     has_concerns = any(c["target"] == CONCERNS_TARGET for c in candidates)
+    concerns_link_problem = tip_parent_link_problem(bus_repo, tip, CONCERNS_TARGET) if has_concerns else None
     concerns_entry_problem = cards_tip_entry_problem(bus_repo, tip, CONCERNS_TARGET) if has_concerns else None
-    concerns_on_tip = concern_entries_on_bus(bus_repo, tip) if has_concerns and not concerns_entry_problem else {}
+    concerns_on_tip = (concern_entries_on_bus(bus_repo, tip)
+                       if has_concerns and not (concerns_entry_problem or concerns_link_problem) else {})
     kept = []
     for c in candidates:
         refusal = None
@@ -1000,12 +1004,17 @@ def r14_gate(bus_repo: pathlib.Path, tip: str, candidates: list[dict], report: d
         elif c["target"] == CARDS_TARGET and node is None:
             refusal = ("CARD_VALIDATOR_NODE_ABSENT",
                        f"node is not on PATH, so {CARD_VALIDATOR_REL} cannot run; a card is never published unvalidated")
+        elif c["target"] == CARDS_TARGET and cards_link_problem:
+            refusal = ("CARDS_PATH_IS_LINK", f"{cards_link_problem}; a card is never written through a link on its path")
         elif c["target"] == CARDS_TARGET and entry_problem:
             refusal = ("CARDS_PATH_NOT_REGULAR_FILE", f"{entry_problem}; a card is never written through a link or a non-regular entry")
         elif c["target"] == CONCERNS_TARGET and not concern_reader_duty_on_bus(bus_repo, tip):
             refusal = ("CONCERN_CHANNEL_NOT_RATIFIED",
                        f"{CONCERNS_READER_FILE} at {tip[:12]} has no reader-duty line of the form '{CONCERNS_DUTY_LINE_EXAMPLE}'; "
                        f"a concern is held until the CoS has taken the reader duty, so it is never written to a file nobody reads")
+        elif c["target"] == CONCERNS_TARGET and concerns_link_problem:
+            refusal = ("CONCERNS_PATH_IS_LINK",
+                       f"{concerns_link_problem}; a concern is never written through a link on its path")
         elif c["target"] == CONCERNS_TARGET and concerns_entry_problem:
             refusal = ("CONCERNS_PATH_NOT_REGULAR_FILE",
                        f"{concerns_entry_problem}; a concern is never written through a link or a non-regular entry")
@@ -1035,11 +1044,13 @@ def concern_reader_duty_on_bus(bus_repo: pathlib.Path, tip: str) -> bool:
 
 
 def has_concerns_duty_line(text: str) -> bool:
-    """True when a line EQUAL to CONCERNS_DUTY_LINE_EXAMPLE (an optional `- ` or `* ` bullet and surrounding
-    whitespace allowed, nothing else) stands outside every ``` fence, ~~~ fence and <!-- --> comment. A line that
-    merely starts like the duty, adds a clause, forbids it or negates it is not the duty. A fence marker inside a
-    comment, and a comment marker inside a fence, are plain text (CommonMark: a fence closes on a marker of the same
-    character at least as long as the opener)."""
+    """True when a line EQUAL to CONCERNS_DUTY_LINE_EXAMPLE (an optional `- ` or `* ` bullet, indented 0 to 3 spaces,
+    and trailing whitespace allowed, nothing else) stands outside every ``` fence, ~~~ fence and <!-- --> comment. A
+    line that merely starts like the duty, adds a clause, forbids it or negates it is not the duty, and neither is
+    one at 4 or more spaces or a tab (an indented code block). A fence marker inside a comment, and a comment marker
+    inside a fence, are plain text (CommonMark: a fence closes on a marker of the same character at least as long as
+    the opener). The scan does not parse inline code: a `<!--` inside a code span before the line opens a comment
+    that never closes, so the gate stays shut. That fails closed, which is the safe side."""
     fence = ""        # the opening marker while inside a fence
     in_comment = False
     for line in text.splitlines():
@@ -1167,6 +1178,31 @@ def cards_tip_entry_problem(bus_repo: pathlib.Path, tip: str, target: str | None
         fields = meta.split()
         if fields[:2] != [REGULAR_FILE_MODE, "blob"]:
             return f"{target} at {tip[:12]} is mode {fields[0] if fields else '?'}, not a regular {REGULAR_FILE_MODE} blob"
+    return None
+
+
+def tip_parent_link_problem(bus_repo: pathlib.Path, tip: str, target: str) -> str | None:
+    """Why a directory on the way to `target` at the tip is not a plain directory, or None. Each parent component is
+    looked up on its own (`specs`, then `specs/<project>`): a leaf lookup through a link returns nothing, so
+    cards_tip_entry_problem alone cannot see a link above the file. Only a tree (040000) or a missing component
+    qualifies; a 120000 link or a 160000 gitlink is named. The walk stops at the first missing component."""
+    parts = pathlib.PurePosixPath(target).parts
+    for depth in range(1, len(parts)):
+        prefix = "/".join(parts[:depth])
+        proc = _run_git(bus_repo, ["ls-tree", "-z", tip, "--", prefix])
+        if proc.returncode != 0:
+            raise Refusal("TIP_BLOB_READ_FAILED", f"{tip[:12]}:{prefix}: ls-tree: {proc.stderr.strip()[:300]}")
+        found = False
+        for entry in proc.stdout.split("\0"):
+            meta, _tab, path = entry.partition("\t")
+            if not entry or path != prefix:
+                continue
+            found = True
+            fields = meta.split()
+            if fields[:2] != ["040000", "tree"]:
+                return f"{prefix} at {tip[:12]} is mode {fields[0] if fields else '?'}, not a directory"
+        if not found:
+            return None
     return None
 
 

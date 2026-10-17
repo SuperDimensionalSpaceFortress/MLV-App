@@ -169,6 +169,8 @@ DUTY_PREFIX = "The CoS reads `CoS-CONCERN:` "
     ("the exact line inside a single-line HTML comment", "# cos-feedback\n\n<!-- " + DUTY_LINE.rstrip("\n") + " -->\n"),
     ("the exact line inside a multi-line HTML comment", "# cos-feedback\n\n<!--\n" + DUTY_LINE + "-->\n"),
     ("the exact line in a comment that opens after text", "# cos-feedback\n\nnote <!-- retired:\n" + DUTY_LINE + "still retired -->\n"),
+    ("the exact line after an inline-code `<!--` that never closes (fails closed, CoS r3 N3)",
+     "# cos-feedback\n\nUse `<!--` carefully.\n\n" + DUTY_LINE),
 ])
 def test_a_line_that_starts_with_the_duty_prefix_but_is_not_the_duty_does_not_open_the_gate(tmp_path, label, readme):
     """CoS r2 review, I5: the r2 gate anchored only the prefix and then took `.*`, so each of these opened it."""
@@ -194,6 +196,29 @@ def test_the_duty_line_still_counts_after_a_closed_fence_or_comment(tmp_path, la
     clone = init_bus(tmp_path, readme)
     report = ob.drain(src, clone, "HEAD", tmp_path / "sent.jsonl", [], push=False)
     assert report["refused"] == [] and [w["target"] for w in report["would_push"]] == [CONCERNS], label
+
+
+@pytest.mark.parametrize("label,readme", [
+    ("the exact line at 4 spaces after a blank line", "# cos-feedback\n\npara\n\n    " + DUTY_LINE),
+    ("the exact line at a tab after a blank line", "# cos-feedback\n\npara\n\n\t" + DUTY_LINE),
+    ("the exact line at 8 spaces after a blank line", "# cos-feedback\n\npara\n\n        " + DUTY_LINE),
+])
+def test_the_duty_line_in_an_indented_code_block_does_not_open_the_gate(tmp_path, label, readme):
+    """CoS r3 review, I6: the r3 anchor `^\\s*` took the line at 4 spaces or a tab, which CommonMark renders as an
+    indented code block; the CoS writes the duty as a top-level bullet, so only 0 to 3 spaces count."""
+    src = init_source(tmp_path)
+    clone = init_bus(tmp_path, readme)
+    report = ob.drain(src, clone, "HEAD", tmp_path / "sent.jsonl", [], push=False)
+    assert [r["code"] for r in report["refused"]] == ["CONCERN_CHANNEL_NOT_RATIFIED"], label
+    assert report["published"] == []
+
+
+@pytest.mark.parametrize("indent", ["", " ", "   "])
+def test_the_duty_line_indented_up_to_three_spaces_still_opens_the_gate(tmp_path, indent):
+    src = init_source(tmp_path)
+    clone = init_bus(tmp_path, "# cos-feedback\n\npara\n\n" + indent + DUTY_LINE)
+    report = ob.drain(src, clone, "HEAD", tmp_path / "sent.jsonl", [], push=False)
+    assert report["refused"] == [] and [w["target"] for w in report["would_push"]] == [CONCERNS]
 
 
 @pytest.mark.parametrize("readme", [DUTY_LINE, "# cos-feedback\n\n" + DUTY_LINE.lstrip("- "), "# cos-feedback\n\n" + DUTY_LINE.replace("- ", "* ", 1)])
@@ -309,6 +334,36 @@ def test_a_concerns_file_that_is_not_a_regular_blob_at_the_tip_is_a_per_item_ref
     assert git(bare, "ls-tree", "master", "--", CONCERNS).startswith(f"{mode} "), "the concerns entry itself is untouched"
     assert git(bare, "rev-parse", f"master:{CONCERNS}") == before_blob, "nothing was written through the link"
     assert git(bare, "ls-tree", "-r", "master", "--name-only").splitlines().count("elsewhere.md") == 0
+
+
+@pytest.mark.parametrize("link_path", ["specs", "specs/mlv-app"])
+def test_a_link_on_a_parent_of_the_concerns_path_at_the_tip_is_a_per_item_refusal(tmp_path, link_path):
+    """CoS r3 review, I7: with `specs` or `specs/mlv-app` a link at the tip, ls-tree on the leaf path returns nothing,
+    so the leaf check passed and the write-time guard aborted the whole drain. Now only the concern is refused."""
+    src = init_source(tmp_path)
+    (src / "doctrine-outbox" / "20261016-b-receipt.md").write_text(
+        item_text("### A receipt\nbody\n", target="RECEIPTS.md", kind="receipt"), encoding="utf-8")
+    git(src, "add", "-A")
+    git(src, "commit", "-m", "add a receipt")
+    clone = init_bus(tmp_path, RATIFIED_README)
+    _tip_entry(clone, "120000", "../../elsewhere", path=link_path)
+    bare = tmp_path / "bus-origin.git"
+
+    report = ob.drain(src, clone, "HEAD", tmp_path / "sent.jsonl", [], push=True)
+
+    assert [(r["path"], r["code"]) for r in report["refused"]] == [
+        ("doctrine-outbox/20261016-example-concern.md", "CONCERNS_PATH_IS_LINK")]
+    assert link_path in report["refused"][0]["detail"] and "120000" in report["refused"][0]["detail"]
+    assert [p["target"] for p in report["published"]] == ["RECEIPTS.md"], "the receipt is not held by the refused concern"
+    assert git(bare, "ls-tree", "master", "--", link_path).startswith("120000 "), "the link itself is untouched"
+
+
+def test_a_directory_on_the_concerns_path_is_not_a_link(tmp_path):
+    src = init_source(tmp_path)
+    clone = init_bus(tmp_path, RATIFIED_README)
+    _tip_entry(clone, "100644", ob.CONCERNS_TITLE)  # specs and specs/mlv-app are ordinary directories here
+    report = ob.drain(src, clone, "HEAD", tmp_path / "sent.jsonl", [], push=False)
+    assert report["refused"] == [] and [w["target"] for w in report["would_push"]] == [CONCERNS]
 
 
 def test_a_regular_concerns_file_at_the_tip_still_takes_the_next_concern(tmp_path):

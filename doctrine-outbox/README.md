@@ -91,18 +91,22 @@ and never stored.
 The drain holds an entry, and the refusal names the reason:
 - `CONCERN_CHANNEL_NOT_RATIFIED` until the fetched bus tip's `cos-feedback/README.md` carries the exact duty
   line `- The CoS reads `CoS-CONCERN:` PR comments and every `specs/*/cos-concerns.md` each pass.`: a line EQUAL to
-  it (a leading `- ` or `* ` bullet and surrounding whitespace are optional, nothing else). A line that only
-  starts like it, adds a clause, forbids or negates it, names only R1, or sits inside a ``` fence, a `~~~` fence
-  or an HTML comment (one line or many) does not count, so nothing is written to a file nobody reads;
-- `CONCERNS_PATH_NOT_REGULAR_FILE` when the tip's `specs/mlv-app/cos-concerns.md` is a link or any entry other
-  than a regular 100644 blob: that concern alone is refused and the rest of the drain goes on;
+  it (a leading `- ` or `* ` bullet is optional, the line may be indented 0 to 3 spaces and carry trailing
+  whitespace, nothing else). A line that only starts like it, adds a clause, forbids or negates it, names only
+  R1, sits at 4 or more spaces or a tab (an indented code block), or sits inside a ``` fence, a `~~~` fence or
+  an HTML comment (one line or many) does not count, so nothing is written to a file nobody reads. The scan does
+  not parse inline code, so a `<!--` inside a code span before the line keeps the gate shut (it fails closed);
+- `CONCERNS_PATH_IS_LINK` when `specs` or `specs/mlv-app` at the tip is a link (120000) or a gitlink (160000),
+  and `CONCERNS_PATH_NOT_REGULAR_FILE` when the tip's `specs/mlv-app/cos-concerns.md` is a link or any entry
+  other than a regular 100644 blob: that concern alone is refused and the rest of the drain goes on. A card gets
+  the same walk over its own path under `CARDS_PATH_IS_LINK` (a link at `specs` or `specs/mlv-app`);
 - `CONCERN_EXPIRED` when `expires_utc` is not after the clock at drain time;
 - `CONCERN_DUPLICATE_ID` when the id heads more than one committed item (all of them are held), or is already
   in the tip's `specs/mlv-app/cos-concerns.md`; the refusal names the fields that differ from the published
   entry, or says none does. An id names exactly one concern.
 
-A concern about one PR goes instead as a comment on that PR's thread starting `CoS-CONCERN:`. Until the CoS
-duty line lands on the bus, the CoS does not read those comments either.
+A concern about one PR goes instead as a comment on that PR's thread starting `CoS-CONCERN:`. The CoS reads
+those comments too: the duty line is live at the bus `cos-feedback/README.md:65`.
 
 ## Traps are cards (bus R14.1)
 
