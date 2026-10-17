@@ -378,6 +378,63 @@ def derived_playback_rows(root: Path) -> tuple[list[dict], object]:
     return [{"id": k, "lint": "playback", "source": "derived", **v} for k, v in rows.items()], pb
 
 
+def parse_probe_output(returncode: int, out: str, err: str, expected: int) -> list[int]:
+    """The finding counts of one playback probe, or ParityError.  r4 (sol r1 BLOCKER, PARITY-ERROR-01).
+
+    The adopted collector (test_hub_vm_no_local_playback._collect_counts) accepted any right-length list when pwsh exited 0.  An
+    unreadable baseline dot-source plus a missing finding function wrote to stderr, exited 0 and printed [0], which read as an ALLOW
+    verdict (master=ALLOW against head=DENY is `tightened`, exit 0).  Here ANY stderr text is an evaluation error, whatever the exit
+    code, and so is a count that is not a non-negative integer.  The probe sets $ErrorActionPreference = 'Stop', so a non-terminating
+    error also arrives as a non-zero exit with a PARITY-PROBE-ERROR line."""
+    if returncode != 0:
+        raise ParityError(f"playback probe exited {returncode}: {(err or out).strip()[:300]}")
+    if err.strip():
+        raise ParityError(f"playback probe wrote to stderr (an evaluation error, even with exit 0): {err.strip()[:300]}")
+    try:
+        counts = json.loads(out.strip())
+    except ValueError as exc:
+        raise ParityError(f"playback probe printed no JSON count list: {out.strip()[:200]!r}") from exc
+    if not isinstance(counts, list) or any(isinstance(c, bool) or not isinstance(c, int) or c < 0 for c in counts):
+        raise ParityError(f"playback probe printed something other than a list of non-negative counts: {out.strip()[:200]!r}")
+    if len(counts) != expected:
+        raise ParityError(f"playback probe returned {len(counts)} verdicts for {expected} sentences")
+    return counts
+
+
+def playback_probe_counts(pb, lint: Path, texts: list[str], work: Path, tag: str) -> list[int]:
+    """One pwsh judges every text under `lint`; same shape as the suite's `_json_counts`, but every evaluation error is fatal.
+
+    Dot-sourcing and the whole loop sit inside try with $ErrorActionPreference = 'Stop', so an unreadable lint, a missing
+    Get-LocalPlaybackPromptFindings or a non-terminating error inside it ends the probe (exit 3, PARITY-PROBE-ERROR on stderr)."""
+    src = work / f"{tag}-in.json"
+    src.write_text(json.dumps(texts), encoding="utf-8")
+    probe = work / f"{tag}-probe.ps1"
+    pb._write_probe(
+        probe,
+        "$ErrorActionPreference = 'Stop'\n"
+        "try {\n"
+        ". " + pb._psq(lint) + "\n"
+        "$texts = @(ConvertFrom-Json -InputObject ([System.IO.File]::ReadAllText(" + pb._psq(src) + ")))\n"
+        "$out = New-Object System.Collections.Generic.List[int]\n"
+        "foreach ($t in $texts) { $out.Add(@(Get-LocalPlaybackPromptFindings -Text ([string]$t)).Count) }\n"
+        "ConvertTo-Json -InputObject @($out.ToArray()) -Compress\n"
+        "} catch {\n"
+        "[Console]::Error.WriteLine('PARITY-PROBE-ERROR: ' + $_.Exception.Message)\n"
+        "exit 3\n"
+        "}\n",
+    )
+    proc = subprocess.Popen([pb.PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(probe)],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        out, err = proc.communicate(timeout=1500)
+    except subprocess.TimeoutExpired:
+        pb._kill(proc)
+        raise
+    finally:
+        pb._kill(proc)
+    return parse_probe_output(proc.returncode, out, err, len(texts))
+
+
 def run_playback(pb, base_lint: Path, head_lint: Path, rows: list[dict], work: Path, stats: dict) -> list[dict]:
     texts = [r["text"] for r in rows]
     counts: dict[str, list[int]] = {}
@@ -385,7 +442,8 @@ def run_playback(pb, base_lint: Path, head_lint: Path, rows: list[dict], work: P
     for tag, lint in (("master", base_lint), ("head", head_lint)):
         stats["pwsh_spawns"] += 1
         try:
-            counts[tag] = pb._json_counts(lint, texts, work, f"parity-{tag}")
+            # r4: was pb._json_counts(...), whose collector read a stderr-writing exit-0 probe as an ALLOW verdict (PARITY-ERROR-01)
+            counts[tag] = playback_probe_counts(pb, lint, texts, work, f"parity-{tag}")
         except Exception as exc:  # noqa: BLE001 - one failed probe leaves every playback row undecided
             failure = f"{tag} lint probe failed: {type(exc).__name__}: {str(exc)[:300]}"
             break

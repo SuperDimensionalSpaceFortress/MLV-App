@@ -20,6 +20,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -44,6 +45,13 @@ MIN_STATIC_ROWS = 385      # the JSON corpus: 205 kept static rows + the 180-row
 MIN_HOOK_ROWS = 247        # hook share of the JSON corpus: 67 static #455 rows + the 180-row sweep (247 when this card landed)
 MIN_PLAYBACK_ROWS = 138    # playback share: the #465 RULE4 rows master refuses + the authored spaced-clip rows (138 when this card landed)
 MIN_DERIVED_HOOK_ROWS = 200  # DENY rows of test_mlv_never_authorized.CASES (203 when this card landed)
+
+# r4 EXACT pins (sol r1 HARDENING: the floor of 200 let three existing DENY rows vanish with the count pin still green, and the
+# derived playback rows had no pin at all). The derived rows are the whole of the head's own deny suites, so any change in their
+# number is a corpus change that a reviewer should see: adding a deny row to either suite means raising the matching number here in
+# the same commit; DELETING one fails this test. The floors above stay as the coarse lower bound.
+EXACT_DERIVED_HOOK_ROWS = 203      # DENY rows of test_mlv_never_authorized.CASES
+EXACT_DERIVED_PLAYBACK_ROWS = 211  # must-refuse sentences of test_hub_vm_no_local_playback.py, deduplicated by (name, text)
 
 
 def _write(path: Path, text: str) -> Path:
@@ -185,6 +193,125 @@ class CorpusPinTests(unittest.TestCase):
 
     def test_the_derived_hook_rows_cannot_silently_shrink(self):
         self.assertGreaterEqual(len(slp.derived_hook_cases(REPO_ROOT)), MIN_DERIVED_HOOK_ROWS)
+
+
+def derived_pin_failures(root: Path) -> list[str]:
+    """Every way the head's derived row counts differ from the exact pins (empty list == pinned). Takes a root so a scratch copy of
+    the two deny suites, with one row deleted, can be judged by the very check the test runs (see the r4 RED proof in the PR body)."""
+    failures = []
+    hook = len(slp.derived_hook_cases(root))
+    playback = len(slp.derived_playback_rows(root)[0])
+    if hook != EXACT_DERIVED_HOOK_ROWS:
+        failures.append(f"derived hook DENY rows: {hook} != pinned {EXACT_DERIVED_HOOK_ROWS}")
+    if playback != EXACT_DERIVED_PLAYBACK_ROWS:
+        failures.append(f"derived playback must-refuse rows: {playback} != pinned {EXACT_DERIVED_PLAYBACK_ROWS}")
+    return failures
+
+
+class DerivedCorpusExactPinTests(unittest.TestCase):
+    """PARITY-HARDEN-01 (sol r1 HARDENING): a deleted derived deny row, hook or playback, fails a pin; the floor is not the pin."""
+
+    def test_the_derived_rows_match_the_exact_pins(self):
+        self.assertEqual(derived_pin_failures(REPO_ROOT), [], "raise the EXACT_* pin in the same commit that ADDS a deny row; deleting one is the failure")
+
+    def _trimmed_loader(self, drop_hook: bool, drop_playback: bool):
+        real = slp.load_module
+
+        def load(path, name):
+            module = real(path, name)
+            if drop_hook and hasattr(module, "CASES"):
+                gone = next(c for c in module.CASES if c.get("expect") == "DENY")
+                module.CASES = [c for c in module.CASES if c is not gone]
+            if drop_playback and hasattr(module, "PromptLintTests"):
+                lints = module.PromptLintTests
+                victim = sorted(n for n in dir(lints) if n.startswith("CLAUSE_MUST_REFUSE"))[0]
+                setattr(lints, victim, tuple(getattr(lints, victim))[1:])
+            return module
+        return load
+
+    def test_one_deleted_hook_deny_row_fails_the_pin_that_the_floor_would_have_passed(self):
+        with mock.patch.object(slp, "load_module", self._trimmed_loader(True, False)):
+            self.assertEqual(len(slp.derived_hook_cases(REPO_ROOT)), EXACT_DERIVED_HOOK_ROWS - 1)
+            self.assertGreaterEqual(EXACT_DERIVED_HOOK_ROWS - 1, MIN_DERIVED_HOOK_ROWS, "the old floor is blind to this deletion")
+            failures = derived_pin_failures(REPO_ROOT)
+        self.assertEqual(len(failures), 1, failures)
+        self.assertIn("derived hook DENY rows", failures[0])
+
+    def test_one_deleted_playback_must_refuse_row_fails_the_pin(self):
+        with mock.patch.object(slp, "load_module", self._trimmed_loader(False, True)):
+            self.assertEqual(len(slp.derived_playback_rows(REPO_ROOT)[0]), EXACT_DERIVED_PLAYBACK_ROWS - 1)
+            failures = derived_pin_failures(REPO_ROOT)
+        self.assertEqual(len(failures), 1, failures)
+        self.assertIn("derived playback must-refuse rows", failures[0])
+
+
+BROKEN_BASELINES = {
+    # master's playback lint defines no finding function (the sol r1 repro: stderr, exit 0, [0])
+    "no-finding-function": "# a baseline that defines nothing\n",
+    # the baseline dot-sources a file that is not there
+    "unreadable-dot-source": ". 'C:/no/such/dir/lane-local-playback-lint-baseline.ps1'\n",
+    # a finding function that reports a NON-terminating error and returns no findings
+    "nonterminating-write-error": "function Get-LocalPlaybackPromptFindings { param($Text) Write-Error 'synthetic evaluation error'; return @() }\n",
+}
+
+
+class PlaybackProbeErrorTests(ParityRunnerCase):
+    """PARITY-ERROR-01 (sol r1 BLOCKER): a playback probe that hit an evaluation error is class `error` (exit 2), never an ALLOW verdict.
+
+    Before r4 the adopted probe left $ErrorActionPreference at Continue and its collector accepted a right-length count list when
+    pwsh exited 0, so an unreadable baseline read master=ALLOW, which against a head that DENIES is `tightened` and selects exit 0."""
+
+    def playback_row(self):
+        row = next(r for r in slp.load_corpus(slp.DEFAULT_CORPUS) if r["lint"] == "playback")
+        return {k: v for k, v in row.items() if k != "source"} | {"id": "t-playback-deny"}
+
+    def cli_with_baseline(self, baseline_source: str):
+        real_git = slp.git
+
+        def fake_git(root, *args):
+            if len(args) >= 2 and args[0] == "show" and args[1].endswith(":" + slp.LINT_REL):
+                return baseline_source
+            return real_git(root, *args)
+
+        with mock.patch.object(slp, "git", fake_git):
+            return self.cli("--lint", "playback", "--corpus", str(self.corpus(self.playback_row())), "--allow", str(self.allow))
+
+    @unittest.skipUnless(PWSH, "pwsh is required to run the playback probe")
+    def test_PARITY_ERROR_01_an_unreadable_or_broken_playback_baseline_exits_2_never_allow(self):
+        for label, source in BROKEN_BASELINES.items():
+            with self.subTest(baseline=label):
+                rc, out = self.cli_with_baseline(source)
+                self.assertEqual(rc, slp.EXIT_UNDECIDED, out)
+                self.assertIn("ERROR t-playback-deny", out)
+                self.assertIn("error=1", out)
+                self.assertNotIn("tightened=1", out, "a row that cannot be run must not read as an ALLOW verdict")
+
+    @unittest.skipUnless(PWSH, "pwsh is required to run the playback probe")
+    def test_PARITY_ERROR_01_a_missing_baseline_file_is_an_error_row_not_an_allow(self):
+        pb = slp.derived_playback_rows(REPO_ROOT)[1]
+        rows = [dict(self.playback_row(), source="corpus")]
+        stats = {"pwsh_spawns": 0}
+        results = slp.run_playback(pb, self.tmp / "no-such-baseline.ps1", REPO_ROOT / slp.LINT_REL, rows, self.tmp, stats)
+        self.assertIn("error", results[0], results[0])
+        self.assertNotIn("master", results[0])
+        self.assertEqual(slp.classify(results[0], {}), "error")
+
+    @unittest.skipUnless(PWSH, "pwsh is required to run the playback probe")
+    def test_PARITY_ERROR_01_a_broken_head_lint_is_an_error_row_too(self):
+        pb = slp.derived_playback_rows(REPO_ROOT)[1]
+        broken = _write(self.tmp / "broken-head.ps1", BROKEN_BASELINES["nonterminating-write-error"])
+        rows = [dict(self.playback_row(), source="corpus")]
+        results = slp.run_playback(pb, REPO_ROOT / slp.LINT_REL, broken, rows, self.tmp, {"pwsh_spawns": 0})
+        self.assertEqual(slp.classify(results[0], {}), "error", results[0])
+
+    def test_PARITY_ERROR_01_the_collector_refuses_stderr_noise_and_bad_shapes(self):
+        self.assertEqual(slp.parse_probe_output(0, "[0,2,1]", "", 3), [0, 2, 1])
+        for label, args in {"stderr-with-exit-0": (0, "[0]", "Get-LocalPlaybackPromptFindings : not recognized", 1),
+                            "nonzero-exit": (1, "[0]", "", 1), "wrong-length": (0, "[0,1]", "", 3),
+                            "not-json": (0, "boom", "", 1), "negative-count": (0, "[-1]", "", 1),
+                            "non-integer": (0, "[\"x\"]", "", 1)}.items():
+            with self.subTest(case=label), self.assertRaises(slp.ParityError):
+                slp.parse_probe_output(*args)
 
 
 class RootFixTests(unittest.TestCase):
