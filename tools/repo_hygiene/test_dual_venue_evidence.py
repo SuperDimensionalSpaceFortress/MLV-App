@@ -37,6 +37,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -1382,10 +1383,69 @@ class RunnerReceiptTests(RunnerHarness, unittest.TestCase):
 
     def test_a_build_that_is_not_staged_is_device_unavailable_never_a_different_build(self) -> None:
         self.build_json.write_text('{"stub": "different bytes"}', encoding="utf-8")
-        proc, receipt, submitted = self.run_leg("ultra-magnus", self.write_spec())
+        proc, receipt, submitted = self.run_leg("ultra-magnus", self.write_spec(), extra=["-StagedBuildSettleSec", "2"])
         self.assertEqual(receipt["outcome"], "DEVICE_UNAVAILABLE")
         self.assertIn("BUILD_NOT_STAGED", receipt["outcomeDetail"])
         self.assertEqual(len(submitted), 1)
+
+    # -- VENUE-STAGED-BUILD-VANISHED-AFTER-ADMISSION-WAIT-1: the staged manifest is re-verified AFTER admission, with one bounded settle wait --------
+    def _flip_build_json_after(self, seconds: float, write: "bytes | None") -> threading.Timer:
+        """A stage that completes while the leg waits: after `seconds` the manifest becomes `write` (None = it is removed)."""
+        def flip() -> None:
+            if write is None:
+                self.build_json.unlink(missing_ok=True)
+            else:
+                self.build_json.write_bytes(write)
+        timer = threading.Timer(seconds, flip)
+        timer.daemon = True
+        timer.start()
+        self.addCleanup(timer.cancel)
+        return timer
+
+    def test_a_manifest_that_mismatches_after_admission_but_settles_is_waited_for_and_the_leg_runs(self) -> None:
+        good = self.build_json.read_bytes()
+        self.build_json.write_bytes(b'{"stub": "a stage is still replacing this"}')
+        self._flip_build_json_after(4.0, good)
+        self.write_artifacts()
+        proc, receipt, submitted = self.run_leg("ultra-magnus", self.write_spec())
+        self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+        self.assertEqual(len(submitted), 2, f"the health probe and the leg are submitted once the manifest settles, got {submitted}")
+        self.assertIn("DVE_STAGED_BUILD_SETTLED", proc.stdout)
+
+    def test_a_manifest_that_is_briefly_absent_after_admission_but_returns_is_waited_for_and_the_leg_runs(self) -> None:
+        good = self.build_json.read_bytes()
+        self.build_json.unlink()
+        self._flip_build_json_after(4.0, good)
+        self.write_artifacts()
+        proc, receipt, submitted = self.run_leg("ultra-magnus", self.write_spec())
+        self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+        self.assertEqual(len(submitted), 2, submitted)
+
+    def test_a_manifest_that_never_settles_is_the_typed_after_admission_failure_with_observed_expected_and_wait(self) -> None:
+        self.build_json.write_bytes(b'{"stub": "the first assemble, never replaced"}')
+        observed = hashlib.sha256(self.build_json.read_bytes()).hexdigest()
+        proc, receipt, submitted = self.run_leg("ultra-magnus", self.write_spec(), extra=["-StagedBuildSettleSec", "3"])
+        self.assertEqual(receipt["outcome"], "DEVICE_UNAVAILABLE")   # the P4 enum has no value for a refusal: the typed token leads outcomeDetail (as every refusal does)
+        detail = receipt["outcomeDetail"]
+        self.assertTrue(detail.startswith("BUILD_NOT_STAGED_AFTER_ADMISSION"), detail)
+        self.assertIn(f"observed={observed}", detail)
+        self.assertIn(f"expected={self.build_sha}", detail)
+        self.assertRegex(detail, r"waited=[3-9]s")
+        self.assertEqual(len(submitted), 1, f"only the health probe may be submitted, got {submitted}")
+
+    def test_a_manifest_that_stays_absent_names_observed_missing(self) -> None:
+        self.build_json.unlink()
+        proc, receipt, submitted = self.run_leg("ultra-magnus", self.write_spec(), extra=["-StagedBuildSettleSec", "2"])
+        self.assertEqual(receipt["outcome"], "DEVICE_UNAVAILABLE")
+        self.assertTrue(receipt["outcomeDetail"].startswith("BUILD_NOT_STAGED_AFTER_ADMISSION"), receipt["outcomeDetail"])
+        self.assertIn("observed=MISSING", receipt["outcomeDetail"])
+        self.assertEqual(len(submitted), 1)
+
+    def test_a_settle_wait_of_zero_checks_once_and_does_not_wait(self) -> None:
+        self.build_json.write_bytes(b'{"stub": "different bytes"}')
+        proc, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(), extra=["-StagedBuildSettleSec", "0"])
+        self.assertTrue(receipt["outcomeDetail"].startswith("BUILD_NOT_STAGED_AFTER_ADMISSION"), receipt["outcomeDetail"])
+        self.assertIn("waited=0s", receipt["outcomeDetail"])
 
     def test_a_typed_job_refusal_maps_to_a_venue_outcome_and_a_capture_to_pass_or_fail(self) -> None:
         self.write_artifacts()

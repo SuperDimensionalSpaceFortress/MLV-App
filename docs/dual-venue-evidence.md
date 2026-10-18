@@ -427,7 +427,11 @@ the generator's `-DisplayMode windowed`; `fullscreen` passes nothing, so a full-
 
 Stage the **same build** on the venue first (assemble once; stage with `playback-attr-3-cuda-stage-job.ps1`
 and `attr3-stage-smoke-runner-job.ps1` using `-AgentRoot` from `venues.json`). The runner refuses --
-`DEVICE_UNAVAILABLE` -- to substitute a different build. The consented clip is resolved and verified by the job
+`DEVICE_UNAVAILABLE` -- to substitute a different build. The staged manifest is re-verified after admission, just
+before launch: a missing or different one is re-read for `-StagedBuildSettleSec` (default 60) and then fails with
+`BUILD_NOT_STAGED_AFTER_ADMISSION observed=<sha256|MISSING> expected=<sha256> waited=<N>s` leading `outcomeDetail`.
+Re-assembling a head changes its manifest sha256 (`assembledAtUtc`), and a stage JobId is single-use, so after a
+re-assemble re-stage under a new JobId; "stage reused" is not proof the cache holds the new manifest. The consented clip is resolved and verified by the job
 at the venue, by id; the runner never stages, opens or names it.
 
 ```powershell

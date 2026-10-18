@@ -118,6 +118,38 @@ function Get-DvSha256OfFile([string]$Path) {
     } finally { $stream.Dispose() }
 }
 
+function Get-DvStagedBuildState {
+    <#
+    .SYNOPSIS
+    What the venue's cache holds for a head's build manifest, compared with the sha256 the leg was given. Read-only; names one file, never lists the cache.
+    .DESCRIPTION
+    Returns { state; observed }. state is OK (the staged manifest hashes to ExpectedSha256), MISSING (no such file; observed = 'MISSING') or MISMATCH (a
+    different manifest is staged: observed is its sha256, or 'UNREADABLE' when it could not be read, e.g. a stage is replacing it right now).
+    With -SettleSec N a state other than OK is re-read every -PollSec until it is OK or N seconds have passed (one bounded wait for an in-progress stage to
+    finish: the stage job publishes the manifest LAST, by rename). waitedSec is how long it waited. Nothing is re-staged here: the leg has no build dir, and a
+    stage JobId is single-use.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$ManifestPath,
+        [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{64}$')][string]$ExpectedSha256,
+        [ValidateRange(0, 3600)][int]$SettleSec = 0,
+        [ValidateRange(1, 60)][int]$PollSec = 2
+    )
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    while ($true) {
+        $observed = 'MISSING'
+        if (Test-Path -LiteralPath $ManifestPath -PathType Leaf) {
+            try { $observed = Get-DvSha256OfFile $ManifestPath } catch { $observed = 'UNREADABLE' }
+        }
+        $state = if ($observed -ceq $ExpectedSha256) { 'OK' } elseif ($observed -ceq 'MISSING') { 'MISSING' } else { 'MISMATCH' }
+        if ($state -ceq 'OK' -or $clock.Elapsed.TotalSeconds -ge $SettleSec) {
+            return [pscustomobject]@{ state = $state; observed = $observed; waitedSec = [int][Math]::Floor($clock.Elapsed.TotalSeconds) }
+        }
+        $remainingMs = [int][Math]::Ceiling(($SettleSec - $clock.Elapsed.TotalSeconds) * 1000)
+        Start-Sleep -Milliseconds ([Math]::Max(1, [Math]::Min($PollSec * 1000, $remainingMs)))
+    }
+}
+
 function ConvertTo-DvLfBytes {
     <#
     .SYNOPSIS
@@ -2409,7 +2441,7 @@ function Write-DvReceipt {
     $path
 }
 
-Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-DvSha256OfBytes, Get-DvSha256OfText, Get-DvSha256OfFile,
+Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-DvSha256OfBytes, Get-DvSha256OfText, Get-DvSha256OfFile, Get-DvStagedBuildState,
     ConvertTo-DvLfBytes, Get-DvLegSpecSha256, Get-DvDerivedBackend, Get-DvBackendNotDerivable, Read-DvContactFrames, Get-DvSubjectDigest,
     Get-DvVisualViewportPixels, Get-DvVisualMeanAbsDiff, Get-DvVisualVerdict, New-DvVisualStrip, Read-DvVisualCaptures, Get-DvVisualCaptureRequest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
     Test-DvUnderClaudeState, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvMinPlaySeconds, Get-DvPlaybackProblems,
