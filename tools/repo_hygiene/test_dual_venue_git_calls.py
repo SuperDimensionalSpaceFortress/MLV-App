@@ -273,24 +273,6 @@ class GitCallsAreBoundedTests(unittest.TestCase):
             "}\n")
         self.assertEqual([line for line in out.splitlines() if line.startswith("MS ")], ["MS 120000", "MS 120000", "MS 30000"])
 
-    def test_a_faulted_read_with_a_straggler_still_claims_the_kill_it_made(self) -> None:
-        # r2 (opus): the output sink faults (a one-byte, non-expandable stream) while a child that outlives git holds stderr. The drain wait times
-        # out, the straggler is killed, and the confirming wait THROWS (the faulted read) once the pipes close: that is a confirmed kill, not
-        # "(kill not confirmed)". The refusal is exit -1 with no bytes either way.
-        token = _own_sleep_token("60")
-        self.addCleanup(_kill_sleepers, token)
-        repo = self.make_repo()
-        out = self.in_module(
-            "$script:DvGitNewSink = { [IO.MemoryStream]::new([byte[]]::new(1)) }\n"
-            f"$r = Invoke-DvGit -RepoRoot '{repo}' -GitArgs @('-c', 'alias.dvfs=!echo xxxx; sleep {token} & exit 0', 'dvfs')\n"
-            "Write-Output ('EXIT ' + $r.exitCode); Write-Output ('BYTES ' + $r.bytes.Length); Write-Output ('ERR ' + $r.stderr)\n",
-            {"DV_GIT_TIMEOUT_SECONDS": "5"})
-        self.assertIn("EXIT -1", out)
-        self.assertIn("BYTES 0", out)
-        self.assertIn("DV_GIT_PIPE_STRAGGLER", out)
-        self.assertIn("(killed)", out, "the kill worked (the pipes closed); only the faulted read made the confirming wait throw")
-        self.assertNotIn("kill not confirmed", out)
-
     @unittest.skipUnless(sys.platform.startswith("linux"), "the escape needs /proc/<pid>/environ tag discovery (Linux) and POSIX env/sleep")
     def test_a_straggler_that_scrubs_its_environment_is_refused_with_kill_not_confirmed(self) -> None:
         # CI-DUALVENUE-GIT-KILL-NOT-CONFIRMED-ROW-1 (CoS #472 N5): `env -i` drops the per-call tag, so Stop-DvGitCall cannot find the child by
