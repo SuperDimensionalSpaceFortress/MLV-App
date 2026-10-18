@@ -4458,6 +4458,9 @@ TEST(DualIsoPipeline, DngFrameAsyncWriterDebugDelayCanFillConfiguredQueue)
     qputenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER", QByteArrayLiteral("1"));
     qputenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER_QUEUE_DEPTH", QByteArrayLiteral("2"));
     qputenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER_DEBUG_DELAY_MS", QByteArrayLiteral("2000"));
+    // Ordering guarantee: the writer holds frame 1 until the queue is full, so the fill no
+    // longer depends on the producer enqueuing frame 2 within the 2000 ms delay.
+    qputenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER_DEBUG_HOLD_UNTIL_FULL_MS", QByteArrayLiteral("30000"));
     qunsetenv("MLVAPP_CDNG_EXPORT_PAYLOAD_HANDOFF");
 
     MlvPipelineFixture fixture;
@@ -4508,7 +4511,127 @@ TEST(DualIsoPipeline, DngFrameAsyncWriterDebugDelayCanFillConfiguredQueue)
     qunsetenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER_QUEUE_DEPTH");
     qunsetenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER_THREADS");
     qunsetenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER_DEBUG_DELAY_MS");
+    qunsetenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER_DEBUG_HOLD_UNTIL_FULL_MS");
     qunsetenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER_COMPRESS");
+}
+
+// RED variant for the 2026-10-16 flake: a producer that is slower than the 2000 ms debug
+// delay between its two enqueues (a loaded host). On the sleep-only hook the writer dequeues
+// frame 1 before frame 2 arrives and async_writer_max_queued stays 1; the hold makes the fill
+// an ordering guarantee, so the same stall must still report 2.
+TEST(DualIsoPipeline, DngFrameAsyncWriterQueueFillSurvivesProducerStallPastDebugDelay)
+{
+    QTemporaryDir temp_dir;
+    ASSERT_TRUE(temp_dir.isValid());
+
+    const QString first_path = temp_dir.filePath(QStringLiteral("async-stall-first.dng"));
+    const QString second_path = temp_dir.filePath(QStringLiteral("async-stall-second.dng"));
+    const QString profile_path = temp_dir.filePath(QStringLiteral("async-stall-profile.json"));
+    qputenv("MLVAPP_EXPORT_STAGE_PROFILER", QByteArrayLiteral("1"));
+    qputenv("MLVAPP_EXPORT_STAGE_PROFILE_FILE", profile_path.toLocal8Bit());
+    qputenv("MLVAPP_EXPORT_STAGE_PROFILE_BUILD_ID", QByteArrayLiteral("async-stall-test"));
+    qputenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER", QByteArrayLiteral("1"));
+    qputenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER_QUEUE_DEPTH", QByteArrayLiteral("2"));
+    qputenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER_DEBUG_DELAY_MS", QByteArrayLiteral("2000"));
+    qputenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER_DEBUG_HOLD_UNTIL_FULL_MS", QByteArrayLiteral("30000"));
+    qunsetenv("MLVAPP_CDNG_EXPORT_PAYLOAD_HANDOFF");
+
+    MlvPipelineFixture fixture;
+    assert_fixture_ready(fixture);
+    std::vector<uint16_t> frame = fixture.renderFrame16(0, 1);
+    ASSERT_TRUE(!frame.empty());
+
+    int32_t par[4] = { 1, 1, 1, 1 };
+    dngObject_t * dng = initDngObject(fixture.video(), UNCOMPRESSED_RAW, 1.0, par);
+    ASSERT_TRUE(dng != nullptr);
+
+    dngPayloadWriter_t * writer = createDngPayloadWriter();
+    ASSERT_TRUE(writer != nullptr);
+
+    QByteArray first_path_bytes = first_path.toLocal8Bit();
+    QByteArray second_path_bytes = second_path.toLocal8Bit();
+    ASSERT_EQ(0, saveDngFrameViaAsyncPayloadWriter(writer,
+                                                   fixture.video(),
+                                                   dng,
+                                                   0,
+                                                   first_path_bytes.data(),
+                                                   nullptr));
+    std::this_thread::sleep_for(std::chrono::milliseconds(2500));
+    ASSERT_EQ(0, saveDngFrameViaAsyncPayloadWriter(writer,
+                                                   fixture.video(),
+                                                   dng,
+                                                   0,
+                                                   second_path_bytes.data(),
+                                                   nullptr));
+    ASSERT_EQ(0, finishDngPayloadWriter(writer));
+    freeDngObject(dng);
+
+    const QByteArray json_bytes = read_all_bytes(profile_path);
+    const QJsonDocument doc = QJsonDocument::fromJson(json_bytes);
+    ASSERT_TRUE(doc.isObject());
+    const QJsonObject root = doc.object();
+    ASSERT_EQ(2, root.value(QStringLiteral("async_writer_queue_capacity")).toInt());
+    ASSERT_EQ(2, root.value(QStringLiteral("async_writer_max_queued")).toInt());
+    ASSERT_EQ(2, root.value(QStringLiteral("async_writer_jobs_started")).toInt());
+    ASSERT_EQ(2, root.value(QStringLiteral("async_writer_jobs_finished")).toInt());
+
+    qunsetenv("MLVAPP_EXPORT_STAGE_PROFILER");
+    qunsetenv("MLVAPP_EXPORT_STAGE_PROFILE_FILE");
+    qunsetenv("MLVAPP_EXPORT_STAGE_PROFILE_BUILD_ID");
+    qunsetenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER");
+    qunsetenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER_QUEUE_DEPTH");
+    qunsetenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER_DEBUG_DELAY_MS");
+    qunsetenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER_DEBUG_HOLD_UNTIL_FULL_MS");
+}
+
+// The hold is bounded and fails loudly: a queue that never fills (one frame into a depth-2
+// queue, producer still running) must surface as a failed finish, not a silent pass or a hang.
+TEST(DualIsoPipeline, DngFrameAsyncWriterDebugHoldTimeoutFailsLoudly)
+{
+    QTemporaryDir temp_dir;
+    ASSERT_TRUE(temp_dir.isValid());
+
+    const QString first_path = temp_dir.filePath(QStringLiteral("async-hold-timeout.dng"));
+    const QString profile_path = temp_dir.filePath(QStringLiteral("async-hold-timeout-profile.json"));
+    qputenv("MLVAPP_EXPORT_STAGE_PROFILER", QByteArrayLiteral("1"));
+    qputenv("MLVAPP_EXPORT_STAGE_PROFILE_FILE", profile_path.toLocal8Bit());
+    qputenv("MLVAPP_EXPORT_STAGE_PROFILE_BUILD_ID", QByteArrayLiteral("async-hold-timeout-test"));
+    qputenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER", QByteArrayLiteral("1"));
+    qputenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER_QUEUE_DEPTH", QByteArrayLiteral("2"));
+    qputenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER_DEBUG_HOLD_UNTIL_FULL_MS", QByteArrayLiteral("300"));
+    qunsetenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER_DEBUG_DELAY_MS");
+    qunsetenv("MLVAPP_CDNG_EXPORT_PAYLOAD_HANDOFF");
+
+    MlvPipelineFixture fixture;
+    assert_fixture_ready(fixture);
+    std::vector<uint16_t> frame = fixture.renderFrame16(0, 1);
+    ASSERT_TRUE(!frame.empty());
+
+    int32_t par[4] = { 1, 1, 1, 1 };
+    dngObject_t * dng = initDngObject(fixture.video(), UNCOMPRESSED_RAW, 1.0, par);
+    ASSERT_TRUE(dng != nullptr);
+
+    dngPayloadWriter_t * writer = createDngPayloadWriter();
+    ASSERT_TRUE(writer != nullptr);
+
+    QByteArray first_path_bytes = first_path.toLocal8Bit();
+    ASSERT_EQ(0, saveDngFrameViaAsyncPayloadWriter(writer,
+                                                   fixture.video(),
+                                                   dng,
+                                                   0,
+                                                   first_path_bytes.data(),
+                                                   nullptr));
+    // Outlast the 300 ms hold bound while the producer is still active (no finish yet).
+    std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+    ASSERT_NE(0, finishDngPayloadWriter(writer));
+    freeDngObject(dng);
+
+    qunsetenv("MLVAPP_EXPORT_STAGE_PROFILER");
+    qunsetenv("MLVAPP_EXPORT_STAGE_PROFILE_FILE");
+    qunsetenv("MLVAPP_EXPORT_STAGE_PROFILE_BUILD_ID");
+    qunsetenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER");
+    qunsetenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER_QUEUE_DEPTH");
+    qunsetenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER_DEBUG_HOLD_UNTIL_FULL_MS");
 }
 
 TEST(DualIsoPipeline, ExportStageProfilerRecordsQueueIdleBetweenFrameSaves)

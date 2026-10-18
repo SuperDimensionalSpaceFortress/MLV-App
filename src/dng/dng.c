@@ -26,6 +26,7 @@
 #include <string.h>
 #include <math.h>
 #include <limits.h>
+#include <errno.h>
 #include <pthread.h>
 #include <time.h>
 
@@ -435,6 +436,39 @@ static void dng_payload_writer_debug_delay(void)
     const clock_t ticks = (clock_t)(((double)delay_ms / 1000.0) * (double)CLOCKS_PER_SEC);
     while((clock() - start) < ticks) {}
 #endif
+}
+
+/* Debug-only ordering guarantee for the writer-queue fill test. Same gates as the delay above
+ * (profiler on, profile file set) plus MLVAPP_CDNG_EXPORT_ASYNC_WRITER_DEBUG_HOLD_UNTIL_FULL_MS:
+ * the writer thread holds its first dequeue until the queue is full (or finish is called), and
+ * the value is the upper bound on that wait. When set it replaces the sleep above. Inert when
+ * unset. Returns the bound in ms, 0 when the hold is off. */
+static unsigned dng_payload_writer_debug_hold_bound_ms_from_env(void)
+{
+    const char * profiler_enabled = getenv("MLVAPP_EXPORT_STAGE_PROFILER");
+    const char * profile_file = getenv("MLVAPP_EXPORT_STAGE_PROFILE_FILE");
+    const char * value = getenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER_DEBUG_HOLD_UNTIL_FULL_MS");
+    char * end = NULL;
+    long parsed = 0;
+    if(!export_profile_env_truthy(profiler_enabled) || profile_file == NULL || profile_file[0] == '\0')
+    {
+        return 0;
+    }
+    if(value == NULL || value[0] == '\0')
+    {
+        return 0;
+    }
+
+    parsed = strtol(value, &end, 10);
+    if(end == value || parsed <= 0)
+    {
+        return 0;
+    }
+    if(parsed > DNG_PAYLOAD_WRITER_MAX_DEBUG_DELAY_MS)
+    {
+        return DNG_PAYLOAD_WRITER_MAX_DEBUG_DELAY_MS;
+    }
+    return (unsigned)parsed;
 }
 
 static int export_profile_configure_from_env(void)
@@ -3264,6 +3298,8 @@ struct dngPayloadWriter
     size_t active_jobs;
     size_t jobs_started;
     size_t jobs_finished;
+    int debug_hold_pending;
+    unsigned debug_hold_bound;
     dngPayloadWriterJob_t * jobs;
 };
 
@@ -3311,6 +3347,51 @@ static size_t dng_payload_writer_thread_count_from_env(void)
     return (size_t)parsed;
 }
 
+/* Caller holds writer->mutex. Parks the writer until the queue is full or finish was called.
+ * A bounded wait that runs out first is loud: stderr plus first_error, so finish fails. */
+static void dng_payload_writer_debug_hold_until_full(dngPayloadWriter_t * writer)
+{
+    const unsigned bound_ms = writer->debug_hold_bound;
+    struct timespec deadline;
+    int timed_out = 0;
+    if(clock_gettime(CLOCK_REALTIME, &deadline) != 0)
+    {
+        timed_out = 1;
+    }
+    else
+    {
+        deadline.tv_sec += (time_t)(bound_ms / 1000u);
+        deadline.tv_nsec += (long)(bound_ms % 1000u) * 1000000L;
+        if(deadline.tv_nsec >= 1000000000L)
+        {
+            deadline.tv_sec += 1;
+            deadline.tv_nsec -= 1000000000L;
+        }
+    }
+
+    while(!timed_out && writer->debug_hold_pending
+          && writer->queue_count < writer->queue_capacity && !writer->stopping)
+    {
+        if(pthread_cond_timedwait(&writer->can_consume, &writer->mutex, &deadline) == ETIMEDOUT)
+        {
+            timed_out = 1;
+        }
+    }
+
+    if(timed_out && writer->debug_hold_pending
+       && writer->queue_count < writer->queue_capacity && !writer->stopping)
+    {
+        fprintf(stderr,
+                "[dng] async writer debug hold timed out after %u ms with the queue not full\n",
+                bound_ms);
+        if(writer->first_error == 0)
+        {
+            writer->first_error = 1;
+        }
+    }
+    writer->debug_hold_pending = 0;
+}
+
 static void * dng_payload_writer_main(void * opaque)
 {
     dngPayloadWriter_t * writer = (dngPayloadWriter_t*)opaque;
@@ -3333,9 +3414,16 @@ static void * dng_payload_writer_main(void * opaque)
             pthread_mutex_unlock(&writer->mutex);
             break;
         }
-        pthread_mutex_unlock(&writer->mutex);
-        dng_payload_writer_debug_delay();
-        pthread_mutex_lock(&writer->mutex);
+        if(writer->debug_hold_pending)
+        {
+            dng_payload_writer_debug_hold_until_full(writer);
+        }
+        else
+        {
+            pthread_mutex_unlock(&writer->mutex);
+            dng_payload_writer_debug_delay();
+            pthread_mutex_lock(&writer->mutex);
+        }
         if(writer->queue_count == 0)
         {
             pthread_mutex_unlock(&writer->mutex);
@@ -3409,6 +3497,8 @@ dngPayloadWriter_t * createDngPayloadWriter(void)
 
     writer->queue_capacity = dng_payload_writer_queue_depth_from_env();
     writer->thread_count = dng_payload_writer_thread_count_from_env();
+    writer->debug_hold_bound = dng_payload_writer_debug_hold_bound_ms_from_env();
+    writer->debug_hold_pending = writer->debug_hold_bound != 0u;
     writer->jobs = (dngPayloadWriterJob_t*)calloc(writer->queue_capacity, sizeof(dngPayloadWriterJob_t));
     if(!writer->jobs)
     {
@@ -3523,6 +3613,11 @@ static int enqueueDngPayloadWriterJob(dngPayloadWriter_t * writer,
     queued_after_enqueue = writer->queue_count;
     queue_capacity = writer->queue_capacity;
     pthread_cond_signal(&writer->can_consume);
+    if(writer->debug_hold_pending)
+    {
+        /* Debug hold only: wake every writer thread parked in the hold, not just one. */
+        pthread_cond_broadcast(&writer->can_consume);
+    }
     pthread_mutex_unlock(&writer->mutex);
     export_profile_note_async_writer_threads(writer->thread_count);
     export_profile_note_async_writer_queue(queue_capacity, queued_after_enqueue);
