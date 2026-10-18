@@ -902,11 +902,21 @@ namespace {
 QString codeLinesOnly(const QString & body)
 {
     QStringList kept;
+    bool inBlock = false;   // a /* ... */ comment spanning lines (a code line may start with '*': a dereference)
     for (const QString & line : body.split(QLatin1Char('\n')))
     {
         const QString t = line.trimmed();
-        if (t.startsWith(QStringLiteral("//")) || t.startsWith(QStringLiteral("/*")) || t.startsWith(QStringLiteral("*")))
+        if (inBlock)
+        {
+            if (t.contains(QStringLiteral("*/"))) inBlock = false;
             continue;
+        }
+        if (t.startsWith(QStringLiteral("//"))) continue;
+        if (t.startsWith(QStringLiteral("/*")))
+        {
+            inBlock = !t.contains(QStringLiteral("*/"));
+            continue;
+        }
         kept << line;
     }
     return kept.join(QLatin1Char('\n'));
