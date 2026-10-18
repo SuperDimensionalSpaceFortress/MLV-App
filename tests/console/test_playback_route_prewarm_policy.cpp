@@ -617,7 +617,9 @@ TEST(PlaybackGpuClockKickWiring, TheKernelIsBoundedByAGlobaltimerDeadlineOnItsOw
                                        QStringLiteral("constexpr unsigned long long kProbeSpinNs"));
     ASSERT_FALSE(kernel.isEmpty());
     ASSERT_TRUE(kernel.contains(QStringLiteral("const unsigned long long t = igpu_globaltimer_ns();")));
-    ASSERT_TRUE(kernel.contains(QStringLiteral("if (t - t0 >= maxNs) break;")));
+    // the kick's own deadline: maxNs after the first chunk's start (startNs), seen by every chunk
+    ASSERT_TRUE(kernel.contains(QStringLiteral("            if (t - t0 >= maxNs)\n            {\n                s->expired = 1;\n                break;\n")));
+    ASSERT_TRUE(kernel.contains(QStringLiteral("const unsigned long long t0 = s->startNs;")));
     ASSERT_TRUE(kernel.contains(QStringLiteral("const unsigned int stop = s->stop;")));
     ASSERT_TRUE(cu.contains(QStringLiteral("asm volatile(\"mov.u64 %0, %%globaltimer;\" : \"=l\"(t));")));
     const QString begin = bodyBetween(cu, QStringLiteral("extern \"C\" int igpu_amaze_debayer_clock_kick_begin("),
@@ -625,18 +627,31 @@ TEST(PlaybackGpuClockKickWiring, TheKernelIsBoundedByAGlobaltimerDeadlineOnItsOw
     ASSERT_FALSE(begin.isEmpty());
     ASSERT_TRUE(begin.contains(QStringLiteral(
         "cudaStreamCreateWithPriority(&backend->kickStream, cudaStreamNonBlocking, leastPriority);")));
-    // the kick is a chain of short launches: none exceeds the 100 ms per-launch budget (GPU-LAUNCH-BUDGET-TILING-1)
-    ASSERT_TRUE(cu.contains(QStringLiteral("constexpr int kClockKickChunkMs = 20;")));
+    // the kick is a chain of short launches: none exceeds the 100 ms per-launch budget (GPU-LAUNCH-BUDGET-TILING-1),
+    // and a host feeder keeps at most two queued, so work that must wait for the device's queued work (frame 0's recon
+    // on the venue waited for a whole up-front chain: llrawproc 353 ms) waits for at most ~20 ms of kick
+    ASSERT_TRUE(cu.contains(QStringLiteral("constexpr int kClockKickChunkMs = 10;")));
+    ASSERT_TRUE(cu.contains(QStringLiteral("constexpr unsigned int kClockKickChunksInFlight = 2;")));
     ASSERT_TRUE(kernel.contains(QStringLiteral("if (t - tIn >= chunkNs) break;")));
-    ASSERT_TRUE(begin.contains(QStringLiteral(
-        "const unsigned int chunks = static_cast<unsigned int>((max_ms + kClockKickChunkMs - 1) / kClockKickChunkMs);")));
+    ASSERT_TRUE(kernel.contains(QStringLiteral("s->chunksDone = chunk + 1;")));
+    const QString feeder = bodyBetween(cu, QStringLiteral("void clock_kick_feeder(igpu_amaze_debayer_backend * backend, unsigned long long maxNs)"),
+                                       QStringLiteral("void free_probe_and_kick(igpu_amaze_debayer_backend * backend)"));
+    ASSERT_FALSE(feeder.isEmpty());
+    const int inFlight = feeder.indexOf(QStringLiteral("if (launched >= s->chunksDone + kClockKickChunksInFlight)"));
+    const int launch = feeder.indexOf(QStringLiteral("k_clock_kick<<<1, 32, 0, backend->kickStream>>>("));
+    ASSERT_TRUE(inFlight >= 0);
+    ASSERT_TRUE(launch > inFlight);
+    ASSERT_TRUE(feeder.contains(QStringLiteral("while (s->stop == 0 && s->expired == 0 && launched < kClockKickMaxChunks")));
+    // the feeder never synchronises: it sleeps, launches, and publishes done once its chunks drain
+    ASSERT_FALSE(feeder.contains(QStringLiteral("Synchronize")));
+    ASSERT_TRUE(feeder.contains(QStringLiteral("s->done = 1;")));
     // clock64 is per SM: every sample carries its %smid
     ASSERT_TRUE(kernel.contains(QStringLiteral("s->sampleSm[count] = igpu_smid();")));
-    ASSERT_TRUE(begin.contains(QStringLiteral("k_clock_kick<<<1, 32, 0, backend->kickStream>>>(")));
-    // bad max_ms (0 or below, or above the 2 s cap) is refused before anything is launched
+    // begin starts the feeder; bad max_ms (0 or below, or above the 2 s cap) is refused before anything starts
+    ASSERT_TRUE(begin.contains(QStringLiteral("backend->kickFeeder = std::thread(clock_kick_feeder, backend, maxNs);")));
     ASSERT_TRUE(begin.contains(QStringLiteral("> kClockKickMaxMsCap) return -1;")));
     ASSERT_TRUE(begin.indexOf(QStringLiteral("> kClockKickMaxMsCap) return -1;"))
-                < begin.indexOf(QStringLiteral("k_clock_kick<<<1, 32, 0, backend->kickStream>>>(")));
+                < begin.indexOf(QStringLiteral("backend->kickFeeder = std::thread(")));
     ASSERT_TRUE(begin.contains(QStringLiteral("if (backend->kickLaunched && backend->kickHost && !backend->kickHost->done) return 1;")));
     // it never touches the AMaZE live buffers or tile streams
     ASSERT_FALSE(begin.contains(QStringLiteral("liveTileStreams")));

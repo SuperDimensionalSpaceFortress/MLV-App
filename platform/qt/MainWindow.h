@@ -1708,6 +1708,8 @@ private:
     double m_playbackGpuClockKickBeginSteadyMs = 0.0;
     quint64 m_playbackGpuClockKickSerial = 0;     // cancels a stale deadline timer
     quint64 m_playbackGpuClockKickSession = 0;
+    QString m_playbackGpuClockKickEndedAt;         // the first site that asked for the end (ended_at)
+    int m_playbackGpuClockKickPendingRetries = 0;  // collects that found the feeder still draining
     void writeFirstPresentIdentity( const QString &dir, int startPosition );
     // --gui-smoke-playback only (CUDA-PERF-PLAYBACK-FOREGROUND-1): forces the main window
     // and the GPU display window to the OS foreground and verifies with

@@ -31,6 +31,9 @@ TEST(PlaybackGpuClockKickPolicy, RunsOnlyWhenEveryGuardPasses)
     ASSERT_EQ(std::string("none"), name(d.reason));
     // the kernel's own deadline: far under WDDM's 2 s TDR
     ASSERT_EQ(400, playback_gpu_clock_kick::kKickMaxMs);
+    // a pending collect is retried briefly (the backend's feeder drains its last chunk in a few ms), never for long
+    ASSERT_TRUE(playback_gpu_clock_kick::kKickPendingRetryMs * playback_gpu_clock_kick::kKickPendingRetries <= 400);
+    ASSERT_TRUE(playback_gpu_clock_kick::kKickPendingRetries > 0);
 }
 
 TEST(PlaybackGpuClockKickPolicy, TheKillSwitchSkipsAsDisabled)

@@ -27840,6 +27840,8 @@ void MainWindow::beginPlaybackGpuClockKick()
         {
             m_playbackGpuClockKickDecision = decision;
             m_playbackGpuClockKickActive = true;
+            m_playbackGpuClockKickEndedAt.clear();
+            m_playbackGpuClockKickPendingRetries = 0;
             m_playbackGpuClockKickBeginSteadyMs = beginSteadyMs;
             // the kernel stops itself at kKickMaxMs; this collects and logs it when no present came first
             const quint64 serial = ++m_playbackGpuClockKickSerial;
@@ -27863,9 +27865,22 @@ void MainWindow::beginPlaybackGpuClockKick()
 void MainWindow::endPlaybackGpuClockKick( const char *site )
 {
     if( !m_playbackGpuClockKickActive ) return;
-    m_playbackGpuClockKickActive = false;
+    if( m_playbackGpuClockKickEndedAt.isEmpty() ) m_playbackGpuClockKickEndedAt = QString::fromLatin1( site );
     ++m_playbackGpuClockKickSerial;
     const GpuAmazeClockKickReport report = gpuAmazeDebayerClockKickEnd();
+    // the stop flag is up, but the backend's feeder has not yet seen its last chunk finish (it waits a few ms at most):
+    // collect again shortly, up to kKickPendingRetries times, then log it as pending
+    if( report.state == 1 && m_playbackGpuClockKickPendingRetries < playback_gpu_clock_kick::kKickPendingRetries )
+    {
+        ++m_playbackGpuClockKickPendingRetries;
+        const quint64 serial = m_playbackGpuClockKickSerial;
+        QTimer::singleShot( playback_gpu_clock_kick::kKickPendingRetryMs, this, [this, serial]()
+        {
+            if( serial == m_playbackGpuClockKickSerial ) endPlaybackGpuClockKick( "pending_retry" );
+        } );
+        return;
+    }
+    m_playbackGpuClockKickActive = false;
     const GpuAmazeProbeSessionRecord record = gpuAmazeDebayerProbeSessionRecord();
     playback_gpu_clock_kick::Line line;
     line.session = m_playbackGpuClockKickSession;
@@ -27876,7 +27891,7 @@ void MainWindow::endPlaybackGpuClockKick( const char *site )
     line.mhzLast = playback_gpu_clock_kick::lastKnownMhz( report.intervalMhz );
     line.rampMs = playback_gpu_clock_kick::rampMsTo80pct( report.sampleMs, report.intervalMhz );
     line.stoppedBy = QString::fromLatin1( playback_gpu_clock_kick::stoppedByName( report.state, report.stoppedBy ) );
-    line.endedAt = QString::fromLatin1( site );
+    line.endedAt = m_playbackGpuClockKickEndedAt;   // where the end was first asked for
     // frame 0's own probe: the first AMaZE run of this Play
     if( record.calls > 0 )
     {

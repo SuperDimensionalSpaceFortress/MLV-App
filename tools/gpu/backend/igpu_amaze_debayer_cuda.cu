@@ -19,6 +19,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <thread>
 #include <cstdlib>
 #include <cstring>
 #include <sstream>
@@ -60,6 +61,8 @@ struct ClockKickShared
     volatile unsigned long long startNs;
     volatile unsigned long long endNs;
     volatile unsigned long long nextSampleNs;   /* carried from one chunk launch to the next */
+    volatile unsigned int chunksDone;           /* kernel: chunks finished (they run in order on the kick stream) */
+    volatile unsigned int expired;              /* kernel: a chunk saw the kick's deadline */
     volatile unsigned long long sampleNs[IGPU_CLOCK_KICK_MAX_SAMPLES];
     volatile long long sampleClk[IGPU_CLOCK_KICK_MAX_SAMPLES];
     volatile unsigned int sampleSm[IGPU_CLOCK_KICK_MAX_SAMPLES];   /* clock64 is per SM: %smid of each sample */
@@ -81,6 +84,7 @@ struct igpu_amaze_debayer_backend
     ClockKickShared * kickHost = nullptr;
     ClockKickShared * kickDevice = nullptr;
     bool kickLaunched = false;   // launched and not yet collected
+    std::thread kickFeeder;      // submits the kick's chunks, at most kClockKickChunksInFlight queued at a time
     igpu_amaze_debayer_timing_t lastTiming;
     uint16_t * liveReconBayer16 = nullptr;
     float * liveRawFloat = nullptr;
@@ -198,19 +202,19 @@ __device__ __forceinline__ unsigned int igpu_smid()
     return id;
 }
 
-/* Row K: one CHUNK of the kick. begin enqueues `chunks` of these back to back on the kick stream, so no single launch
- * exceeds the 100 ms per-launch budget (GPU-LAUNCH-BUDGET-TILING-1, IGPU_LT_LAUNCH_BUDGET_MS) while the kick as a whole
- * runs up to maxNs. Lane 0 spins for at most chunkNs, until maxNs after the FIRST chunk's start, or until the
- * host-mapped stop flag is set, sampling (%globaltimer, clock64, %smid) every periodNs and once as it leaves (at most
- * IGPU_CLOCK_KICK_MAX_SAMPLES over the whole kick). clock64 is per SM and a chunk may run on another SM, so the host
- * only reads an interval whose two samples share an SM. A chunk that starts after a stop or past the deadline returns
- * at once. The last chunk writes done, last. */
+/* Row K: one CHUNK of the kick. A host feeder thread (clock_kick_feeder) keeps at most kClockKickChunksInFlight of
+ * these queued on the kick stream, so no single launch exceeds the 100 ms per-launch budget
+ * (GPU-LAUNCH-BUDGET-TILING-1, IGPU_LT_LAUNCH_BUDGET_MS), and any other work that has to wait for the device's queued
+ * work waits for at most those few chunks, never for the whole kick. Lane 0 spins for at most chunkNs, until maxNs
+ * after the FIRST chunk's start, or until the host-mapped stop flag is set, sampling (%globaltimer, clock64, %smid)
+ * every periodNs and once as it leaves (at most IGPU_CLOCK_KICK_MAX_SAMPLES over the whole kick). clock64 is per SM and
+ * a chunk may run on another SM, so the host only reads an interval whose two samples share an SM. A chunk that starts
+ * after a stop or past the deadline returns at once. Each chunk publishes chunksDone last. */
 __global__ void k_clock_kick(ClockKickShared * s,
                              unsigned long long maxNs,
                              unsigned long long chunkNs,
                              unsigned long long periodNs,
-                             unsigned int chunk,
-                             unsigned int chunks)
+                             unsigned int chunk)
 {
     if (blockIdx.x != 0 || threadIdx.x != 0) return;
     const unsigned long long tIn = igpu_globaltimer_ns();
@@ -242,7 +246,11 @@ __global__ void k_clock_kick(ClockKickShared * s,
                 reason = stop;
                 break;
             }
-            if (t - t0 >= maxNs) break;
+            if (t - t0 >= maxNs)
+            {
+                s->expired = 1;
+                break;
+            }
             if (t - tIn >= chunkNs) break;
         }
         const unsigned long long tOut = igpu_globaltimer_ns();
@@ -262,9 +270,12 @@ __global__ void k_clock_kick(ClockKickShared * s,
     {
         s->exitReason = s->stop;
     }
-    if (chunk + 1 < chunks) return;
+    else if (tIn - t0 >= maxNs)
+    {
+        s->expired = 1;
+    }
     __threadfence_system();
-    s->done = 1;
+    s->chunksDone = chunk + 1;
     __threadfence_system();
 }
 
@@ -272,7 +283,12 @@ constexpr unsigned long long kProbeSpinNs = 50000ull;
 constexpr int kClockKickMaxMsCap = 2000;
 constexpr unsigned long long kClockKickPeriodNs = 5000000ull;
 /* One kick launch spins at most this long: far under the 100 ms per-launch budget (IGPU_LT_LAUNCH_BUDGET_MS). */
-constexpr int kClockKickChunkMs = 20;
+constexpr int kClockKickChunkMs = 10;
+/* The feeder keeps at most this many chunks queued: work that must wait for the device's queued work (an implicit
+ * synchronisation in another stream or DLL) waits for at most ~20 ms of kick, never the whole kick. */
+constexpr unsigned int kClockKickChunksInFlight = 2;
+constexpr unsigned int kClockKickMaxChunks = (kClockKickMaxMsCap + kClockKickChunkMs - 1) / kClockKickChunkMs + 1;
+constexpr double kClockKickDrainWaitMs = 50.0;
 constexpr double kClockKickEndWaitMs = 2.0;
 
 /* Row 0: SM MHz on `stream` (launch + sync, host-mapped result), or 0.0 when a step fails. Its codes are noted
@@ -385,11 +401,66 @@ void stop_clock_kick_for_live_run(igpu_amaze_debayer_backend * backend)
     }
 }
 
+/* Row K: the kick's host feeder (one thread per kick, started by clock_kick_begin). It keeps at most
+ * kClockKickChunksInFlight chunks queued, launching the next as one finishes, until the stop flag, the kick's
+ * deadline (a chunk saw it, or the feeder's own clock as a backstop), or a failed launch. Then it waits (bounded) for
+ * the chunks it launched to finish and publishes done, which end() reads. It makes no synchronising call. */
+void clock_kick_feeder(igpu_amaze_debayer_backend * backend, unsigned long long maxNs)
+{
+    ClockKickShared * s = backend->kickHost;
+    const unsigned long long chunkNs = static_cast<unsigned long long>(kClockKickChunkMs) * 1000000ull;
+    const double maxMs = static_cast<double>(maxNs) / 1000000.0;
+    const double started = now_ms();
+    unsigned int launched = 0;
+    while (s->stop == 0 && s->expired == 0 && launched < kClockKickMaxChunks
+           && now_ms() - started < maxMs + kClockKickDrainWaitMs)
+    {
+        if (launched >= s->chunksDone + kClockKickChunksInFlight)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            continue;
+        }
+        IGPU_LT_LAUNCH("k_clock_kick", 1, 32, backend->kickStream,
+                       k_clock_kick<<<1, 32, 0, backend->kickStream>>>(backend->kickDevice,
+                                                                       maxNs,
+                                                                       chunkNs,
+                                                                       kClockKickPeriodNs,
+                                                                       launched));
+        const cudaError_t launchRc = cudaGetLastError();
+        if (launchRc != cudaSuccess)
+        {
+            IGPU_CUDA_ERROR_NOTE(launchRc, "clock_kick:launch");
+            break;
+        }
+        ++launched;
+        /* WDDM batches launches: a query submits this chunk now instead of at the next sync. NotReady is the answer. */
+        const cudaError_t queryRc = cudaStreamQuery(backend->kickStream);
+        if (queryRc != cudaSuccess && queryRc != cudaErrorNotReady)
+        {
+            IGPU_CUDA_ERROR_NOTE(queryRc, "clock_kick:submit");
+            break;
+        }
+    }
+    const double drainStart = now_ms();
+    while (s->chunksDone < launched && now_ms() - drainStart < kClockKickDrainWaitMs)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (s->chunksDone >= launched)
+    {
+        std::atomic_thread_fence(std::memory_order_release);
+        s->done = 1;
+    }
+}
+
 /* Teardown adds no synchronisation (CudaLaunchTiming.TimingOnAddsNoSynchronisationAtBackendTeardown): a kick still
- * running is told to stop and given the same bounded host-only wait as end(); one that has not finished by then keeps
- * its mapped block (it is never freed under a running kernel). */
+ * running is told to stop, its feeder joined (it only sleeps and launches; it exits once it sees the flag and its
+ * chunks drain, bounded), and one whose chunks have still not finished keeps its mapped block (it is never freed under
+ * a running kernel). */
 void free_probe_and_kick(igpu_amaze_debayer_backend * backend)
 {
+    if (backend->kickHost && backend->kickHost->stop == 0) backend->kickHost->stop = 1;
+    if (backend->kickFeeder.joinable()) backend->kickFeeder.join();
     if (backend->kickHost)
     {
         ClockKickShared * s = backend->kickHost;
@@ -2481,36 +2552,18 @@ extern "C" int igpu_amaze_debayer_clock_kick_begin(igpu_amaze_debayer_backend * 
         backend->kickHost = static_cast<ClockKickShared *>(host);
         backend->kickDevice = static_cast<ClockKickShared *>(device);
     }
+    /* the previous kick's feeder has published done (or never started): joining it does not wait on the GPU */
+    if (backend->kickFeeder.joinable()) backend->kickFeeder.join();
     std::memset(static_cast<void *>(backend->kickHost), 0, sizeof(ClockKickShared));
     const unsigned long long maxNs = static_cast<unsigned long long>(max_ms) * 1000000ull;
-    const unsigned long long chunkNs = static_cast<unsigned long long>(kClockKickChunkMs) * 1000000ull;
-    /* back to back on the one kick stream: ceil(max_ms / chunk) launches of at most kClockKickChunkMs each */
-    const unsigned int chunks = static_cast<unsigned int>((max_ms + kClockKickChunkMs - 1) / kClockKickChunkMs);
-    for (unsigned int chunk = 0; chunk < chunks; ++chunk)
+    /* the chunks are submitted by the feeder, at most kClockKickChunksInFlight of kClockKickChunkMs at a time */
+    try
     {
-        IGPU_LT_LAUNCH("k_clock_kick", 1, 32, backend->kickStream,
-                       k_clock_kick<<<1, 32, 0, backend->kickStream>>>(backend->kickDevice,
-                                                                       maxNs,
-                                                                       chunkNs,
-                                                                       kClockKickPeriodNs,
-                                                                       chunk,
-                                                                       chunks));
-        const cudaError_t launchRc = cudaGetLastError();
-        if (launchRc != cudaSuccess)
-        {
-            IGPU_CUDA_ERROR_NOTE(launchRc, "clock_kick:launch");
-            /* the chunks already queued see the stop flag and return at once (done is never written: the last chunk
-             * was not queued); nothing is left to collect */
-            backend->kickHost->stop = 1;
-            backend->kickLaunched = false;
-            return -2;
-        }
+        backend->kickFeeder = std::thread(clock_kick_feeder, backend, maxNs);
     }
-    /* WDDM batches launches: a query submits the kick now instead of at the next sync. NotReady is the answer. */
-    const cudaError_t queryRc = cudaStreamQuery(backend->kickStream);
-    if (queryRc != cudaSuccess && queryRc != cudaErrorNotReady)
+    catch (...)
     {
-        IGPU_CUDA_ERROR_NOTE(queryRc, "clock_kick:submit");
+        return -2;
     }
     backend->kickLaunched = true;
     return 0;

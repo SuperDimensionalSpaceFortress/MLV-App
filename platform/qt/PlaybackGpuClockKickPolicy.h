@@ -38,6 +38,11 @@ constexpr int kKickMaxMs = 400;
 /*! The share of the kick's highest interval MHz that counts as ramped. */
 constexpr double kRampFraction = 0.8;
 
+/*! A collect that finds the backend's feeder still draining its last chunk (state pending) is retried this often, this
+ *  many times, before the line is logged as pending. */
+constexpr int kKickPendingRetryMs = 20;
+constexpr int kKickPendingRetries = 10;
+
 enum class Reason
 {
     None,              // run
