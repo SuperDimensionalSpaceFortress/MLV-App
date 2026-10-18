@@ -54,8 +54,14 @@ Numbers are computed from the VIDEO VIEWPORT only -- the window's timecode and f
 | `NOT_CAPTURED` / `NOT_REQUESTED` | nothing published (an old build, a failed run) / the spec opts out | yes |
 | `OK` | none of the above | yes |
 
-`sourceDifference` is read from the app's own `visual.json` field `source_difference` (`differ` -> `known-differ`, `identical` ->
-`known-identical`); absent or anything else (the wrong case included: `IDENTICAL`) is `unknown`, never a guess. One picture over
+`sourceDifference` is derived from the app's own per-frame records over the SAME frames the picture is judged over (the play
+frames with a content hash): `Get-DvVisualSourceDifference` applies the app's rule (next section) to those frames' `source_id`, so
+`known-differ` means the judged frames themselves show differing source ids. The app's top-level `source_difference` covers EVERY
+play capture, a usable picture or not, so it is kept as written (`appSourceDifference`) and only cross-checks the decision
+(`sourceDifferenceCrossCheck`: `agree` or `disagree`; a disagreement also adds a note to the reason, and never decides).
+PLAYBACK-SOURCE-FRAME-IDENTITY-1 r4 (acting-cos Dot B1 on PR #477): five frozen frames over one source beside an unusable sixth over
+another read `differ` in the app's record, but the judged frames are a static clip. The app's words map `differ` -> `known-differ`,
+`identical` -> `known-identical`; absent or anything else (the wrong case included: `IDENTICAL`) is `unknown`, never a guess. One picture over
 `known-identical` source frames is a static clip, not frozen (`OK`, with the reason "one picture; the app records the source frames as
 identical: a static clip", so a wrong `identical` from a future build shows in the receipt). `playFrames` counts the judged play
 frames (those with a viewport); `savedPlayFrames` the play PNGs saved; `captured` is true when any was saved. The app side is
@@ -65,6 +71,29 @@ tracked as `PLAYBACK-SOURCE-FRAME-IDENTITY-1`. No app build writes the field yet
 The divergence threshold (`$script:VisualDivergenceThreshold`, DualVenueRunner.psm1) is calibrated on a known-good leg: 6.0. The
 known-good Bachelor leg (M16-1243 windowed-s2, CPU, build `adf6185a`, receipt `a5d3ffbe`) measured 1.099 on its worst channel;
 three times that (3.3) is under the 6.0 floor, so the floor is the threshold.
+
+## Source-frame identity: `source_id` and `source_difference` (PLAYBACK-SOURCE-FRAME-IDENTITY-1)
+
+One picture across the play frames is FROZEN only if the SOURCE frames behind them differ; a static clip shows one picture
+too. Display-side hashes cannot tell the two apart (a frozen display freezes them), so the app records the source itself. After
+Play has stopped (step (4) of the capture block, never in the timed window or the tail), for each distinct `display_frame` of
+the play captures it reads the bytes the decoder reads for that frame -- the encoded VIDF payload at
+`video_index[frame].frame_offset`: `frame_size` bytes for LJ92 and JPEG2K, the packed RAW size otherwise -- under the file's
+own mutex, without decoding, and hashes them with FNV-1a 64 (`getMlvFrameSourceHash64`, `src/mlv/video_mlv.c`).
+
+* `frames[].source_id` (play entries only): that hash as 16 lowercase hex digits. Absent when it could not be read.
+* `source_difference` (top level), a JSON string, exactly one of:
+  * `"differ"`: at least two play frames' source ids differ;
+  * `"identical"`: every play frame has a source id, they span at least two distinct `display_frame` values, and all are equal;
+  * absent otherwise: fewer than two play frames, any frame without a source id (an unreadable frame, a frame index of -1),
+    or one repeated `display_frame` (a stuck playback clock is not evidence of a static clip).
+
+The runner decides from `frames[].source_id` of the judged play frames (exactly 16 lowercase hex digits; anything else is no id)
+by the same rule, and reads the top-level field case-sensitively, accepting only those two strings, as a cross-check; anything
+else is unknown. `"identical"` waives the
+frozen gate, which is why it is written only on that positive evidence. Scope: MLV containers only; an MCRAW or CinemaDNG-folder
+clip has no source id and the field is omitted. The policy is `platform/qt/VisualCaptureSourceDifference.h`; the
+`gui_smoke.visual_capture` log line ends with `source_difference=<differ|identical|omitted>`.
 
 ## Opting out
 
