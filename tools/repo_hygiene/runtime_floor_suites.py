@@ -36,6 +36,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -48,6 +49,9 @@ RUNTIME_RE = re.compile(r"^(powershell-5\.1|pwsh|python-3\.\d{1,2})$")
 SUITE_KINDS = ("pytest", "ps-parse", "ps-script")
 FLOORS = ("declared", "undeclared")
 PS_SUFFIXES = (".ps1", ".psm1")
+_IS_NT = os.name == "nt"
+_KILL_SIGNAL = getattr(signal, "SIGKILL", signal.SIGTERM)
+TASKKILL_TIMEOUT = 30
 
 
 class Undecidable(Exception):
@@ -362,22 +366,47 @@ def task_argv(task: dict, worktree: Path) -> list[str]:
     return prefix + ps + ["-EncodedCommand", encoded]
 
 
+def _spawn(argv: list[str], **kwargs):
+    """The one place a suite child is started; tests replace it to capture argv and cwd without a real shell."""
+    return subprocess.Popen(argv, **kwargs)
+
+
+def _kill_tree(proc) -> None:
+    """Kill the timed-out child and everything it started. Every step is bounded or best-effort, so the kill
+    itself can never hang the runner."""
+    if _IS_NT:
+        try:
+            subprocess.run(["taskkill.exe", "/PID", str(proc.pid), "/T", "/F"], capture_output=True,
+                           timeout=TASKKILL_TIMEOUT)
+            return
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    else:
+        try:
+            os.killpg(proc.pid, _KILL_SIGNAL)  # the child leads its own session, so its pid is the group id
+            return
+        except OSError:
+            pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
+
+
 def run_task(task: dict, worktree: Path, timeout: int) -> dict:
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
     started = time.monotonic()
     status, out = "PASS", ""
+    own_session = {} if _IS_NT else {"start_new_session": True}
     try:
-        proc = subprocess.Popen(task_argv(task, worktree), cwd=str(worktree), env=env, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, text=True, errors="replace")
+        proc = _spawn(task_argv(task, worktree), cwd=str(worktree), env=env, stdout=subprocess.PIPE,
+                      stderr=subprocess.STDOUT, text=True, errors="replace", **own_session)
         try:
             out, _ = proc.communicate(timeout=timeout)
             if proc.returncode != 0:
                 status = "FAIL"
         except subprocess.TimeoutExpired:
-            if os.name == "nt":
-                subprocess.run(["taskkill.exe", "/PID", str(proc.pid), "/T", "/F"], capture_output=True)
-            else:
-                proc.kill()
+            _kill_tree(proc)
             try:
                 out, _ = proc.communicate(timeout=30)
             except subprocess.TimeoutExpired:
@@ -408,8 +437,10 @@ def main(argv: list[str] | None = None, detect=detect_runtime) -> int:
     parser.add_argument("--include-slow", action="store_true", help="also run suites the manifest marks slow (over about a minute)")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
-    worktree = Path(args.worktree)
-    result: dict = {"worktree": str(worktree), "base": args.base, "changed": [], "tasks": [], "verdict": "UNKNOWN"}
+    # Absolute once, before planning and spawning: every child runs with cwd=<worktree>, so a relative value kept
+    # as given and prefixed onto a file argument would be looked up under <worktree>/<worktree>/...
+    worktree = Path(os.path.abspath(args.worktree))
+    result: dict ={"worktree": str(worktree), "base": args.base, "changed": [], "tasks": [], "verdict": "UNKNOWN"}
 
     def emit(code: int, verdict: str, note: str) -> int:
         result["verdict"], result["note"] = verdict, note

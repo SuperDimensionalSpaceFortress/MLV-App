@@ -12,10 +12,13 @@ RUNTIME-FLOOR-LOCAL-MATRIX-1 (CoS FWO-DEFECT-PREVENT-1 item 5). Two halves:
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import importlib.util
 import io
 import json
+import os
+import re
 import shutil
 import subprocess
 import sys
@@ -342,6 +345,135 @@ class ChangedFilesPathTests(unittest.TestCase):
         raw = 'tools/a\\b.ps1\0tools/café tool.ps1\0'.encode("utf-8")
         self.assertEqual(['tools/a\\b.ps1', 'tools/café tool.ps1'], rfs._records(raw, nul=True))
         self.assertEqual(['one', 'two'], rfs._records(b"one\ntwo\n", nul=False))
+
+
+class FakeProc:
+    """Stands in for a Popen child: ``communicate`` pops scripted results (an exception is raised, not returned)."""
+
+    def __init__(self, pid=4242, results=(("ok", None),), returncode=0):
+        self.pid, self.returncode, self.results, self.killed = pid, returncode, list(results), 0
+
+    def communicate(self, timeout=None):
+        result = self.results.pop(0)
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    def kill(self):
+        self.killed += 1
+
+
+class RelativeWorktreeTests(unittest.TestCase):
+    """CoS B1 (head e5dd4b47): a relative --worktree was kept as given, prefixed onto the PowerShell file
+    arguments, AND set as the child cwd, so ``lane/tools/a.ps1`` was looked up under ``lane/lane/tools/a.ps1``."""
+
+    @staticmethod
+    def _detect(rid):
+        return {"id": rid, "argv": [rid + "-exe"], "version": "9.9.9"}
+
+    @staticmethod
+    def _parse_files(argv):
+        snippet = base64.b64decode(argv[argv.index("-EncodedCommand") + 1]).decode("utf-16-le")
+        listed = re.search(r"foreach \(\$f in @\((.*?)\)\) \{", snippet).group(1)
+        return [name.replace("''", "'") for name in re.findall(r"'((?:[^']|'')*)'", listed)]
+
+    def _drive_from_parent(self, suites, runtimes):
+        data = manifest_of(row("r", ["tools/a.ps1"], runtimes, suites))
+        base = {"tools/a.ps1": PORTABLE, "tools/t.ps1": PORTABLE, "tools/test_a.py": "def test_a():\n    pass\n"}
+        repo = FixtureRepo(self, data, base, {"tools/a.ps1": PORTABLE + "# c\n"})
+        calls = []
+
+        def fake_spawn(argv, **kwargs):
+            calls.append((list(argv), kwargs.get("cwd")))
+            return FakeProc()
+
+        before = os.getcwd()
+        self.addCleanup(os.chdir, before)
+        os.chdir(str(repo.root.parent))
+        buffer = io.StringIO()
+        with mock.patch.object(rfs, "_spawn", fake_spawn), contextlib.redirect_stdout(buffer):
+            code = rfs.main(["--worktree", repo.root.name, "--base", "base", "--manifest",
+                             str(repo.root / "manifest.json"), "--timeout", "120"], detect=self._detect)
+        self.assertEqual(0, code, buffer.getvalue())
+        return repo, calls
+
+    def _assert_resolves(self, repo, cwd, name):
+        resolved = Path(os.path.abspath(cwd)) / name
+        self.assertTrue(resolved.is_file(), f"{name!r} resolved against child cwd {cwd!r} names {resolved}, not a file")
+        self.assertEqual(repo.root.resolve(), Path(os.path.abspath(cwd)).resolve())
+
+    def test_relative_worktree_ps_script_file_argument_names_an_existing_file(self):
+        repo, calls = self._drive_from_parent([{"kind": "ps-script", "path": "tools/t.ps1"}], ["pwsh"])
+        self.assertEqual(1, len(calls), calls)
+        argv, cwd = calls[0]
+        self._assert_resolves(repo, cwd, argv[argv.index("-File") + 1])
+
+    def test_relative_worktree_ps_parse_file_arguments_name_existing_files(self):
+        repo, calls = self._drive_from_parent([{"kind": "ps-parse"}], ["pwsh"])
+        self.assertEqual(1, len(calls), calls)
+        argv, cwd = calls[0]
+        files = self._parse_files(argv)
+        self.assertEqual(1, len(files), files)
+        for name in files:
+            self._assert_resolves(repo, cwd, name)
+
+    def test_relative_worktree_pytest_path_stays_the_relative_suite_path(self):
+        repo, calls = self._drive_from_parent([{"kind": "pytest", "path": "tools/test_a.py"}], [THIS_PY])
+        self.assertEqual(1, len(calls), calls)
+        argv, cwd = calls[0]
+        self.assertIn("tools/test_a.py", argv)
+        self._assert_resolves(repo, cwd, "tools/test_a.py")
+
+
+class TimeoutKillTests(unittest.TestCase):
+    """RUNTIME-FLOOR-TASKKILL-TIMEOUT-1: a hung taskkill.exe must not hang the runner, and a POSIX timeout must
+    reach grandchildren, so the child starts in its own session and the whole group is killed."""
+
+    TASK = {"kind": "pytest", "suite": "tools/test_a.py", "runtime": None, "row": "r", "argv_prefix": ["py"]}
+    EXPIRED = subprocess.TimeoutExpired("suite", 1)
+
+    def _run(self, proc, nt):
+        spawned = []
+
+        def fake_spawn(argv, **kwargs):
+            spawned.append(kwargs)
+            return proc
+
+        with mock.patch.object(rfs, "_spawn", fake_spawn), mock.patch.object(rfs, "_IS_NT", nt):
+            return rfs.run_task(self.TASK, Path(tempfile.gettempdir()), 1), spawned[0]
+
+    def test_a_hung_taskkill_is_bounded_and_falls_back_to_killing_the_child(self):
+        proc = FakeProc(results=[self.EXPIRED, ("late", None)])
+        calls = []
+
+        def hung_taskkill(argv, **kwargs):
+            calls.append((argv, kwargs))
+            raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
+
+        with mock.patch.object(rfs.subprocess, "run", hung_taskkill):
+            result, spawn_kwargs = self._run(proc, nt=True)
+        self.assertEqual("TIMEOUT", result["status"])
+        self.assertEqual(1, len(calls), calls)
+        self.assertEqual("taskkill.exe", calls[0][0][0])
+        self.assertIsNotNone(calls[0][1].get("timeout"), "taskkill.exe must be run with a timeout")
+        self.assertEqual(1, proc.killed)
+        self.assertNotIn("start_new_session", spawn_kwargs)
+
+    def test_posix_timeout_kills_the_whole_process_group_of_a_child_in_its_own_session(self):
+        proc = FakeProc(pid=777, results=[self.EXPIRED, ("late", None)])
+        killpg = mock.Mock()
+        with mock.patch.object(rfs.os, "killpg", killpg, create=True):
+            result, spawn_kwargs = self._run(proc, nt=False)
+        self.assertEqual("TIMEOUT", result["status"])
+        self.assertIs(True, spawn_kwargs.get("start_new_session"))
+        killpg.assert_called_once_with(777, rfs._KILL_SIGNAL)
+
+    def test_posix_group_kill_falls_back_to_the_child_when_the_group_is_gone(self):
+        proc = FakeProc(pid=778, results=[self.EXPIRED, ("late", None)])
+        with mock.patch.object(rfs.os, "killpg", mock.Mock(side_effect=ProcessLookupError), create=True):
+            result, _ = self._run(proc, nt=False)
+        self.assertEqual("TIMEOUT", result["status"])
+        self.assertEqual(1, proc.killed)
 
 
 if __name__ == "__main__":
