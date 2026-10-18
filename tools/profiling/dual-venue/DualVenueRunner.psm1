@@ -233,7 +233,8 @@ function Get-DvGitTimeoutMilliseconds {
     # A shorter bound can only refuse more (a timed-out call is exit -1), never admit anything.
     $seconds = 120
     $raw = [Environment]::GetEnvironmentVariable('DV_GIT_TIMEOUT_SECONDS')
-    if ($raw -match '^[0-9]{1,3}$' -and [int]$raw -ge 1 -and [int]$raw -le 600) { $seconds = [int]$raw }
+    # r2 (opus P-01): \z, not $: .NET's $ also matches before a final newline, so '30<LF>' was accepted as 30 s.
+    if ($raw -match '^[0-9]{1,3}\z' -and [int]$raw -ge 1 -and [int]$raw -le 600) { $seconds = [int]$raw }
     $seconds * 1000
 }
 
@@ -360,13 +361,15 @@ function Invoke-DvGit {
             # r3 (CoS N4): the kill is confirmed by the evidence that matters, the pipes closing. Closed within 5 s = every holder of the pipe
             # closed its copy of it (KILL-NOT-CONFIRMED-ROW-1: a holder that ended on its own in that window counts, as does one that was killed).
             $confirmed = $false
-            try { $confirmed = [System.Threading.Tasks.Task]::WaitAll([System.Threading.Tasks.Task[]]@($outTask, $errTask), 5000) } catch { $null = $_ }
+            # r2 (opus): WaitAll throws only AFTER every task has completed, so a throw here is a faulted read on pipes that DID close.
+            try { $confirmed = [System.Threading.Tasks.Task]::WaitAll([System.Threading.Tasks.Task[]]@($outTask, $errTask), 5000) } catch { $confirmed = $true }
             return [pscustomobject]@{ exitCode = -1; bytes = [byte[]]@(); stderr = (Get-DvStragglerMessage -GitExit $gitExit -Seconds ($drain / 1000) -KillConfirmed $confirmed -GitArgs $GitArgs) }
         }
         [pscustomobject]@{ exitCode = $proc.ExitCode; bytes = $ms.ToArray(); stderr = $errTask.Result }
     } finally {
         if ($null -ne $proc) { $proc.Dispose() }
-        if ($job -ne [IntPtr]::Zero) { [void]$native::CloseHandle($job); $script:DvJobsClosed++ }
+        # r2 (opus): the counter moves only on CloseHandle's own true return, so a build that drops the call can no longer pass the open = closed pin.
+        if ($job -ne [IntPtr]::Zero -and $native::CloseHandle($job)) { $script:DvJobsClosed++ }
     }
 }
 
