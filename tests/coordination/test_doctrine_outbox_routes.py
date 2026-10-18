@@ -519,6 +519,9 @@ def test_the_shipped_candidates_that_predate_the_rule_still_parse():
 #   M9  RULING_CANDIDATE_LEAD_RE without the bullet/quote prefix      -> the H6 rows
 # r4 (sol r3 RX-06): a credential fill with shell-operator / placeholder syntax, or in the program or script position,
 # is printed raw -> M10 exercise_route returns its detail without redact_secret_values -> the RX-06 rows
+# r4b (opus r4 RX-07): a credential value that repr() escapes (backslash, both quote kinds) is printed by the shell-operator
+# reason -> M11 that reason formats the raw token with !r (the choke point alone still holds, rows stay green);
+# M12 M11 plus redact_secret_values replaces the literal secret only -> the RX-07 rows
 # ====================================================================================================
 
 SENTINEL = "REVIEW_SENTINEL_NOT_A_SECRET_7f3a9"
@@ -1008,6 +1011,63 @@ def test_rx06_nothing_a_run_prints_or_writes_carries_the_value(tmp_path, capsys,
     captured = capsys.readouterr()
     assert RX06 not in captured.out and RX06 not in captured.err
     assert not [p for p in tmp_path.rglob("*") if p.is_file() and RX06.encode() in p.read_bytes()]
+
+
+# ---------- r4b / RX-07: a credential value that repr() escapes is not printed either ----------
+# The shell-operator reason formatted the raw token with !r BEFORE the redact_secret_values choke point, so a value with a
+# backslash (doubled by repr) or both quote kinds (the quote escaped) no longer matched the literal secret and was printed.
+# Mutations: M11 revert the site (route_unsafe_reason formats the raw token with !r) -> still green, the choke point holds;
+# M12 revert the choke point's repr forms too -> the RX-07 rows go red.
+
+RX07_VALUES = [
+    ">RX07\\SENT",                    # a real single backslash (repr doubles it)
+    ">C:\\RX07\\SENT",                # a Windows path
+    ">RX07'q\"SENT",                  # both quote kinds (repr escapes the quote)
+]
+
+
+def rx07_leaks(text: str, value: str) -> bool:
+    return value in text or repr(value)[1:-1] in text or repr(value) in text
+
+
+@pytest.mark.parametrize("value", RX07_VALUES)
+def test_rx07_a_credential_fill_with_an_escaped_character_is_not_printed_by_the_shell_operator_reason(tmp_path, value):
+    status, detail = ob.exercise_route("python tools/x.py ><api_key>", tmp_path, 30, {"api_key": value[1:]})
+    assert status == "ROUTE_UNSAFE" and not rx07_leaks(detail, value[1:]) and not rx07_leaks(detail, value), detail
+    assert "<redacted>" in detail, detail
+
+
+@pytest.mark.parametrize("value", RX07_VALUES)
+def test_rx07_sols_r3_template_with_an_escaped_value_is_not_printed(tmp_path, value):
+    fills = {"label": value, "value": value}
+    status, detail = ob.exercise_route("python tools/x.py <label> DB_PASSWORD=<value>", tmp_path, 30, fills)
+    assert status == "ROUTE_UNSAFE" and not rx07_leaks(detail, value), detail
+
+
+def test_rx07_the_choke_point_alone_redacts_the_escaped_forms_of_a_secret():
+    for value in RX07_VALUES:
+        text = f"a {value!r} b {repr(value)[1:-1]} c {value}"
+        assert not rx07_leaks(ob.redact_secret_values(text, [value]), value), text
+    assert ob.redact_secret_values("keep this", ["x\\y"]) == "keep this"
+
+
+def test_rx07_the_shell_operator_reason_redacts_before_it_formats(tmp_path):
+    status, reason = ob.exercise_route("python tools/x.py ><api_key>", tmp_path, 30, {"api_key": "RX07\\SENT"})
+    assert status == "ROUTE_UNSAFE" and "RX07" not in reason and "\\\\" not in reason, reason
+
+
+@pytest.mark.parametrize("value", RX07_VALUES)
+def test_rx07_nothing_a_run_prints_or_writes_carries_the_escaped_value(tmp_path, capsys, value):
+    bus = make_bus(tmp_path, {"tools/x.py": STUB_OK})
+    item = item_file(tmp_path, adopt("python tools/x.py ><api_key>"))
+    assert exercise(tmp_path, item, bus, "--fill", f"api_key={value[1:]}") == 1
+    captured = capsys.readouterr()
+    for stream in (captured.out, captured.err):
+        assert not rx07_leaks(stream, value[1:]) and not rx07_leaks(stream, value), stream
+    for p in tmp_path.rglob("*"):
+        if p.is_file():
+            data = p.read_bytes()
+            assert value[1:].encode() not in data and repr(value[1:])[1:-1].encode() not in data, p
 
 
 # ---------- r3 hardening: a python option that takes an operand is not the script ----------

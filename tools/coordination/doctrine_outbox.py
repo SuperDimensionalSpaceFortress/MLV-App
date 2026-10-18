@@ -2588,9 +2588,11 @@ def route_secret_values(template: list[str], fills: dict[str, str]) -> list[str]
 
 
 def redact_secret_values(text: str, secrets: Iterable[str] = ()) -> str:
-    """`text` with every secret (route_secret_values) replaced by `<redacted>`, longest first, wherever it appears."""
-    for secret in sorted({x for x in secrets if x}, key=len, reverse=True):
-        text = text.replace(secret, "<redacted>")
+    """`text` with every secret (route_secret_values) replaced by `<redacted>`, longest first, wherever it appears: as it
+    is, and as repr() writes it (a backslash doubled, a quote escaped), so a `!r` site cannot print what a plain one hides."""
+    forms = {form for x in secrets if x for form in (x, repr(x), repr(x)[1:-1]) if form}
+    for form in sorted(forms, key=len, reverse=True):
+        text = text.replace(form, "<redacted>")
     return text
 
 
@@ -2814,7 +2816,7 @@ def route_unsafe_reason(argv: list[str], cwd: str | os.PathLike | None = None, b
     here = str(cwd) if cwd is not None else os.getcwd()
     for tok in argv:
         if ROUTE_SHELL_OPERATOR_RE.match(tok):
-            return f"shell operator {tok!r}: a route is one command, no shell"
+            return f"shell operator {redact_route_text(tok, secrets)!r}: a route is one command, no shell"
         if ROUTE_URL_RE.match(tok) or ROUTE_URL_RE.match(tok.split("=", 1)[-1]):
             return f"network target {redact_route_text(tok, secrets)!r}: a route must run offline"
         if ROUTE_CREDENTIAL_RE.search(tok) or ROUTE_CRED_ASSIGN_RE.match(tok):
