@@ -21,6 +21,28 @@ using playback_warm_output_reuse::reuse;
 
 namespace {
 
+// PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1 F-key: the recon's per-run constants (the M16-1243 playback shape)
+playback_warm_output_reuse::PreparedState preparedState()
+{
+    playback_warm_output_reuse::PreparedState s;
+    s.valid = true;
+    s.whiteDarkened = 8191;
+    s.blackDelta = 23;
+    s.evCorrection = -3.0000000000000004;
+    s.darkNoise = 4.5;
+    s.interpMethod = 1;
+    s.useAliasMap = 0;
+    s.useFullres = 1;
+    s.chromaSmoothMethod = 1;
+    s.applyDither = 1;
+    s.isBright[0] = 1;
+    s.isBright[1] = 1;
+    s.isBright[2] = 0;
+    s.isBright[3] = 0;
+    s.frameId = 1243;
+    return s;
+}
+
 Key warmKey()
 {
     Key k;
@@ -36,6 +58,7 @@ Key warmKey()
     k.setClipCountAfterWarm = 3;
     k.setLutsCountAfterWarm = 5;
     k.captureId = 7;
+    k.state = preparedState();
     return k;
 }
 
@@ -207,8 +230,9 @@ TEST(PlaybackWarmOutputReusePolicy, TheFieldsAndTheOutcomeNames)
     // every reason has its own name
     const Reason all[] = {Reason::None, Reason::Disabled, Reason::NotAdopted, Reason::NoWarmKey, Reason::ValidationProbe,
                           Reason::CudaSuppressed, Reason::FrameMismatch, Reason::SizeMismatch, Reason::BlackMismatch,
-                          Reason::WbMismatch, Reason::HnyquistMismatch, Reason::ReconConfiguredSinceWarm, Reason::Hit,
-                          Reason::ContentMismatch, Reason::CompareFailed, Reason::SymbolMissing, Reason::CaptureMissing};
+                          Reason::WbMismatch, Reason::HnyquistMismatch, Reason::ReconConfiguredSinceWarm,
+                          Reason::StateMismatch, Reason::Hit, Reason::ContentMismatch, Reason::CompareFailed,
+                          Reason::SymbolMissing, Reason::CaptureMissing};
     for (const Reason a : all)
         for (const Reason b : all)
             if (a != b) ASSERT_TRUE(name(a) != name(b));
@@ -252,4 +276,135 @@ TEST(PlaybackWarmOutputReusePolicy, AReusedFrameZeroIsNeverLabelledByFrameOnesRe
     ASSERT_EQ(std::string("playback_smoke.amaze_first_frames session=3 f0=31.500/30.250/405.0 "
                           "f1=18.000/17.500/1755.0 f2=NA/NA/NA f3=NA/NA/NA"),
               frames.line(3).toStdString());
+}
+
+// ---- PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1 T-D: the prepared recon state is part of the key ----
+// The GPU recon takes white_darkened, black_delta, ev_correction, dark_noise, is_bright and the method flags as per-run
+// constants (cudaMemcpyToSymbol in igpu_recon_cuda.cu), not through set_clip / set_luts, so the counters cannot see a
+// change in them. A warm whose state differs from Play's is refused before any device compare.
+
+TEST(PlaybackWarmOutputReusePolicy, EachPreparedStateFieldThatDiffersIsAStateMismatchBeforeAnyCompare)
+{
+    using playback_warm_output_reuse::PreparedState;
+    struct Case
+    {
+        const char *field;
+        void (*mutate)(PreparedState &);
+    };
+    const Case cases[] = {
+        {"white_darkened", [](PreparedState &s) { s.whiteDarkened += 1; }},
+        {"black_delta", [](PreparedState &s) { s.blackDelta += 1; }},
+        {"ev_correction", [](PreparedState &s) { s.evCorrection = std::nextafter(s.evCorrection, 0.0); }},
+        {"dark_noise", [](PreparedState &s) { s.darkNoise = std::nextafter(s.darkNoise, INFINITY); }},
+        {"interp_method", [](PreparedState &s) { s.interpMethod = 0; }},
+        {"use_alias_map", [](PreparedState &s) { s.useAliasMap = 1; }},
+        {"use_fullres", [](PreparedState &s) { s.useFullres = 0; }},
+        {"chroma_smooth_method", [](PreparedState &s) { s.chromaSmoothMethod = 0; }},
+        {"apply_dither", [](PreparedState &s) { s.applyDither = 0; }},
+        {"is_bright", [](PreparedState &s) { s.isBright[0] = 0; }},
+        {"is_bright", [](PreparedState &s) { s.isBright[3] = 1; }},
+        {"frame_id", [](PreparedState &s) { s.frameId += 1; }},
+    };
+    for (const Case &c : cases)
+    {
+        Key present = presentKey();
+        c.mutate(present.state);
+        const Reason r = gate(warmKey(), present);
+        ASSERT_EQ(std::string("state_mismatch"), name(r));
+        ASSERT_FALSE(reuse(r));
+        ASSERT_TRUE(r != Reason::None);   // the caller compares only on None
+        ASSERT_EQ(std::string("skip"), std::string(playback_warm_output_reuse::outcomeName(r, false)));
+        ASSERT_EQ(std::string(c.field),
+                  playback_warm_output_reuse::preparedStateDiff(warmKey().state, present.state).toStdString());
+        // the same field changed on the warm's side instead
+        Key warm = warmKey();
+        c.mutate(warm.state);
+        ASSERT_EQ(std::string("state_mismatch"), name(gate(warm, presentKey())));
+    }
+    // equal states (and everything else equal) still go to the compare
+    ASSERT_TRUE(Reason::None == gate(warmKey(), presentKey()));
+    ASSERT_EQ(std::string(), playback_warm_output_reuse::preparedStateDiff(warmKey().state, presentKey().state).toStdString());
+}
+
+TEST(PlaybackWarmOutputReusePolicy, AMissingPreparedStateOnEitherSideIsAStateMismatch)
+{
+    Key warm = warmKey();
+    warm.state.valid = false;   // the warm could not read its prepared state
+    ASSERT_EQ(std::string("state_mismatch"), name(gate(warm, presentKey())));
+    Key present = presentKey();
+    present.state = playback_warm_output_reuse::PreparedState();
+    ASSERT_EQ(std::string("state_mismatch"), name(gate(warmKey(), present)));
+    ASSERT_EQ(std::string("valid"),
+              playback_warm_output_reuse::preparedStateDiff(warmKey().state, present.state).toStdString());
+    // the earlier skip reasons still outrank it
+    Key frame = presentKey();
+    frame.frame += 1;
+    frame.state = playback_warm_output_reuse::PreparedState();
+    ASSERT_EQ(std::string("frame_mismatch"), name(gate(warmKey(), frame)));
+    ASSERT_EQ(std::string("recon_configured_since_warm"),
+              name(preGate(true, true, warmKey(), present, false, false, warmKey().setClipCountAfterWarm + 1,
+                           warmKey().setLutsCountAfterWarm)));
+}
+
+TEST(PlaybackWarmOutputReusePolicy, ThePreparedStateIsReadFromTheReconStateByName)
+{
+    // the shape of llrpGpuPlaybackReconState_t (llrawproc.h): the template reads the same member names
+    struct ReconState
+    {
+        int valid;
+        int width;
+        int height;
+        int black_level;
+        int white_level;
+        int white_darkened;
+        int black_delta;
+        double ev_correction;
+        double dark_noise;
+        int interp_method;
+        int use_alias_map;
+        int use_fullres;
+        int chroma_smooth_method;
+        int playback_preview_scale_factor;
+        int is_bright[4];
+        int apply_dither;
+        uint64_t frame_id;
+    };
+    ReconState r = {1, 1808, 2268, 2047, 16383, 8191, 23, -3.0000000000000004, 4.5, 1, 0, 1, 1, 0, {1, 1, 0, 0}, 1, 1243};
+    const playback_warm_output_reuse::PreparedState s = playback_warm_output_reuse::preparedStateFrom(r);
+    ASSERT_EQ(std::string(), playback_warm_output_reuse::preparedStateDiff(preparedState(), s).toStdString());
+    r.valid = 0;
+    ASSERT_FALSE(playback_warm_output_reuse::preparedStateFrom(r).valid);
+}
+
+TEST(PlaybackWarmOutputReusePolicy, AMissCarriesBothStatesAndAHitOrSkipCarriesNone)
+{
+    using playback_warm_output_reuse::stateFields;
+    Key present = presentKey();
+    present.state.whiteDarkened = 8190;
+    const std::string state = stateFields(Reason::StateMismatch, warmKey(), present).toStdString();
+    ASSERT_EQ(std::string(" warm_state=wd=8191,bd=23,ev=-3.0000000000000004,dn=4.5,interp=1,alias=0,fullres=1,cs=1,"
+                          "dither=1,bright=1/1/0/0,fid=1243"
+                          " play_state=wd=8190,bd=23,ev=-3.0000000000000004,dn=4.5,interp=1,alias=0,fullres=1,cs=1,"
+                          "dither=1,bright=1/1/0/0,fid=1243 state_diff=white_darkened"),
+              state);
+    // a content miss with equal states says so: the difference is in the input, not in the constants
+    const std::string content = stateFields(Reason::ContentMismatch, warmKey(), presentKey()).toStdString();
+    ASSERT_TRUE(content.find(" warm_state=wd=8191,") == 0);
+    ASSERT_EQ(content.size() - std::string(" state_diff=none").size(), content.rfind(" state_diff=none"));
+    // a missing state prints none
+    Key none = presentKey();
+    none.state = playback_warm_output_reuse::PreparedState();
+    ASSERT_TRUE(stateFields(Reason::StateMismatch, warmKey(), none).contains(QStringLiteral(" play_state=none ")));
+    // nothing on a hit or a skip for any other reason
+    for (const Reason r : {Reason::Hit, Reason::Disabled, Reason::NotAdopted, Reason::NoWarmKey, Reason::FrameMismatch,
+                           Reason::WbMismatch, Reason::ReconConfiguredSinceWarm, Reason::CompareFailed})
+        ASSERT_TRUE(stateFields(r, warmKey(), present).isEmpty());
+    // the first-present split line ends with them on a miss
+    playback_startup_split::FirstPresentSplit fp;
+    fp.warmOutputReuse = QStringLiteral("skip");
+    fp.reuseReason = QStringLiteral("state_mismatch");
+    fp.reuseStates = QString::fromStdString(state);
+    const std::string line = fp.line(4).toStdString();
+    const std::string tail = " warm_output_reuse=skip reuse_reason=state_mismatch reuse_compare_ms=0.000" + state;
+    ASSERT_EQ(line.size() - tail.size(), line.rfind(tail));
 }
