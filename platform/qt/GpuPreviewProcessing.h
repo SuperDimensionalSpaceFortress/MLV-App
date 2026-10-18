@@ -52,6 +52,19 @@ struct GpuPresentSetupTiming
     double blur_check_ms = 0.0;
     double realloc_ms = 0.0;
     double sampling_ms = 0.0;
+    /* PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-SETUP-1 Row 0: what the window's realloc branch did with the texture
+     * slot ("kept", "realloc", "adopted", "discarded"; "none" outside GpuDisplayWindow), and this call's AMaZE-only
+     * kernel / download time (the download includes the output texture's CUDA-GL register and map). */
+    const char * slot = "none";
+    double amaze_kernel_ms = 0.0;
+    double amaze_download_ms = 0.0;
+    /* PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1 R3 (PlaybackWarmOutputReusePolicy.h): whether this call
+     * kept the paused warm's AMaZE output ("hit", "miss", "skip"; "none" outside GpuDisplayWindow), why, and the
+     * compare's wall time. */
+    const char * warm_output_reuse = "none";
+    const char * reuse_reason = "none";
+    double reuse_compare_ms = 0.0;
+    bool reuse_verify_ran = false;   // R4: the identity check re-ran this frame's AMaZE after the swap
 };
 
 struct GpuPreviewProcessingConfig

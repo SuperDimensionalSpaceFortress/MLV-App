@@ -33,12 +33,14 @@
 #include "GpuDisplayViewport.h"
 #include "GpuPreviewProcessing.h"
 #include "GpuWindowSwapTelemetry.h"
+#include "PlaybackWarmOutputReusePolicy.h"
 #include "../../src/mlv/llrawproc/llrawproc.h"
 #include <array>
 #include <cstddef>
 #include <cstdint>
 
 class QGraphicsView;
+struct GpuAmazeDebayerBackendTiming;
 
 class GpuDisplayWindow : public QOpenGLWindow, protected QOpenGLFunctions
 {
@@ -92,8 +94,38 @@ public:
     static GpuPresentSetupTiming lastPresentSetupTimingIfActive(void);
     /* PLAYBACK-STARTUP-WAIT-PREWARM-1 Row B: warm the playback recon texture route while paused (program compile,
      * one AMaZE run at texWidth x texHeight on temporary textures, then freed). Changes nothing on screen. GUI-thread
-     * only; summary receives one "ok=... program_ms=... amaze_ms=..." fragment for the log. */
+     * only; summary receives one "ok=... program_ms=... amaze_ms=..." fragment for the log.
+     * PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-SETUP-1 Row A: unless MLVAPP_PLAYBACK_ROUTE_PREWARM_STAGE=0, a warm that
+     * succeeds keeps its pair as the staged slot (summary "staged=1") instead of freeing it. */
     static bool prewarmPlaybackReconRouteIfActive(int texWidth, int texHeight, QString *summary = nullptr);
+    /* PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-SETUP-1 Row A: free the prewarm's staged recon pair (CUDA reset, then
+     * delete) when one is held -- on clip close and before a prewarm is re-armed. GUI-thread only; a no-op without an
+     * active window or a staged pair. */
+    static void releaseStagedPlaybackReconSlotIfActive(void);
+    /* PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1 Row W: run the first recon present's AMaZE (device Bayer16 -> RGBA16)
+     * from the paused warm run's retained output into the staged slot's output texture, so Play's first AMaZE is not
+     * the first on the device path. Only when a staged pair exists at exactly width x height; never assigns m_texture
+     * or m_gpuReconSourceTexture and never paints. GUI-thread only; the caller still owns (and releases) the token.
+     * kernelMs gets the AMaZE kernel time when it ran; false with reason when it did not. */
+    /* PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row 0: the AMaZE run is probed; *amazeTiming (optional)
+     * receives its timing and probe. */
+    static bool warmStagedReconSlotFromDeviceBayer16IfActive(const uint16_t *deviceBayer16,
+                                                             int width,
+                                                             int height,
+                                                             int blackLevel,
+                                                             const double wbMultipliers[3],
+                                                             bool reducedHnyquist,
+                                                             double *kernelMs,
+                                                             QString *reason,
+                                                             GpuAmazeDebayerBackendTiming *amazeTiming = nullptr,
+                                                             uint64_t frame = 0,
+                                                             uint64_t setClipCountAfter = 0,
+                                                             uint64_t setLutsCountAfter = 0,
+                                                             QString *reuseCapture = nullptr);
+    /* PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1 R2 (PlaybackWarmOutputReusePolicy.h): after the warm's
+     * AMaZE succeeded, its input is captured and the staged slot's warm key is set (frame, dims, black, WB, H-Nyquist,
+     * the set_clip / set_luts counts after the warm run, the capture id); *reuseCapture says ok, failed,
+     * symbol_missing, cuda_suppressed or backend_not_loaded (none when AMaZE did not succeed). */
     static bool readGpuReconSourceBayer16TextureIfActive(QByteArray *textureBytes,
                                                         int *width,
                                                         int *height,
@@ -236,6 +268,34 @@ private:
     void ensurePreviewProcessingProgram(void);
     void updateTextureIfNeeded(void);
     void destroyTexture(void);
+    /* Row A: free the staged pair, unregistering both runtimes' CUDA-GL caches first (reset before delete). */
+    void releaseStagedReconSlot(void);
+    /* Row W: the member half of warmStagedReconSlotFromDeviceBayer16IfActive. */
+    bool warmStagedReconSlotFromDeviceBayer16(const uint16_t *deviceBayer16,
+                                              int width,
+                                              int height,
+                                              int blackLevel,
+                                              const double wbMultipliers[3],
+                                              bool reducedHnyquist,
+                                              double *kernelMs,
+                                              QString *reason,
+                                              GpuAmazeDebayerBackendTiming *amazeTiming,
+                                              uint64_t frame,
+                                              uint64_t setClipCountAfter,
+                                              uint64_t setLutsCountAfter,
+                                              QString *reuseCapture);
+    /* R2: clears the warm key and the backend's input capture (no CUDA call). */
+    void clearStagedReconWarmKey(void);
+    /* R4 (identity legs only, MLVAPP_SMOKE_FIRST_PRESENT_CAPTURE=1): after a reused frame was painted and swapped, run
+     * its AMaZE fresh from the same device input into a scratch RGBA16 texture, read both textures back and compare
+     * them; logs one playback_warm_output_reuse_verify line. Context current. Returns the wall ms it took. */
+    double verifyWarmOutputReuse(const uint16_t *deviceBayer16,
+                                 int width,
+                                 int height,
+                                 int blackLevel,
+                                 const double wbMultipliers[3],
+                                 bool reducedHnyquist,
+                                 uint64_t frame);
     void applySamplingMode(GpuDisplayViewport::SamplingMode samplingMode);
     /* Releases every context-bound processing resource (passthrough program, shared
      * preview-processing program, LUT texture set) so the next present rebuilds them
@@ -261,6 +321,17 @@ private:
     GpuDisplayViewport::PresentationOptions m_reconPresentationOptions;
     QOpenGLTexture *m_texture;
     QOpenGLTexture *m_gpuReconSourceTexture;
+    /* PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-SETUP-1 Row A: the prewarm's warmed RGBA16 output and R16 source, kept
+     * registered with the AMaZE CUDA-GL cache while paused. Never drawn or read; the first recon present adopts them
+     * as m_texture / m_gpuReconSourceTexture (PlaybackRouteStagedSlotPolicy.h) or frees them. */
+    QOpenGLTexture *m_stagedReconOutput = nullptr;
+    QOpenGLTexture *m_stagedReconSource = nullptr;
+    int m_stagedReconWidth = 0;
+    int m_stagedReconHeight = 0;
+    /* PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1 R2: what the paused warm's AMaZE wrote into
+     * m_stagedReconOutput ran on (valid only after that AMaZE succeeded and its input was captured). Moved out by the
+     * first recon present that adopts the pair, cleared with the pair. */
+    playback_warm_output_reuse::Key m_stagedReconWarmKey;
     QImage m_pendingImage;
     int m_pendingTextureWidth;
     int m_pendingTextureHeight;

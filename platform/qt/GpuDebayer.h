@@ -4,6 +4,7 @@
 #include <QString>
 
 #include <cstdint>
+#include <vector>
 
 #include "../../tools/gpu/igpu_cuda_error.h"
 
@@ -28,6 +29,38 @@ struct GpuAmazeDebayerBackendTiming
     double kernelMs = 0.0;
     double downloadMs = 0.0;
     double totalMs = 0.0;
+    /* PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row 0: this run's in-process probe (armed runs only).
+     * probeAvailable: the DLL exports igpu_amaze_debayer_last_probe; probeValid: this run was armed and every
+     * probe step worked. */
+    bool probeAvailable = false;
+    bool probeValid = false;
+    double smMhzBefore = 0.0;
+    double smMhzAfter = 0.0;
+    double deviceMs = 0.0;
+};
+
+/* Row 0: the first armed live runs since the last gpuAmazeDebayerBeginProbeSession() (Play start), in call order. */
+struct GpuAmazeProbeSessionRecord
+{
+    static constexpr int kMaxCalls = 4;
+    int calls = 0;
+    bool probeAvailable = false;
+    double kernelMs[kMaxCalls] = {};
+    double deviceMs[kMaxCalls] = {};
+    double smMhzBefore[kMaxCalls] = {};
+    double smMhzAfter[kMaxCalls] = {};
+    bool valid[kMaxCalls] = {};
+    double startSteadyMs[kMaxCalls] = {};   // gpuAmazeDebayerSteadyNowMs() as the run's backend call began
+};
+
+/* Row K: one collected clock kick (igpu_amaze_debayer_clock_kick_end). */
+struct GpuAmazeClockKickReport
+{
+    int state = 2;            // 0 collected, 1 pending, 2 none / unavailable
+    int stoppedBy = 0;        // 0 deadline, 1 end, 2 a live run's drain
+    double ranMs = 0.0;
+    std::vector<double> sampleMs;    // since the kick's first sample
+    std::vector<double> intervalMhz; // SM MHz over each sample interval (sampleMs[i] -> sampleMs[i+1]); -1 across SMs
 };
 
 const char * gpuBilinearDebayerEnvironmentVariableName(void);
@@ -97,6 +130,35 @@ void gpuAmazeDebayerNoteReducedHnyquistFrame(void);
 void gpuAmazeDebayerNoteReducedHnyquistRefusal(void);
 quint64 gpuAmazeDebayerReducedHnyquistFrames(void);
 quint64 gpuAmazeDebayerReducedHnyquistRefusals(void);
+/* PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row 0: arm the next `calls` live AMaZE runs (the two
+ * *FromR16GlTexture / *FromDeviceBayer16 wrappers above) for the in-process SM-clock + device-time probe. Never loads
+ * the DLL: the count is kept here and handed to the backend under the live lock right before each run. An armed run
+ * reports into its GpuAmazeDebayerBackendTiming and into the session record. Zero cost for unarmed runs. */
+void gpuAmazeDebayerArmProbe(int calls);
+/* Row 0: clears the session record and arms GpuAmazeProbeSessionRecord::kMaxCalls runs (MainWindow, at Play). */
+void gpuAmazeDebayerBeginProbeSession(void);
+GpuAmazeProbeSessionRecord gpuAmazeDebayerProbeSessionRecord(void);
+/* The steady clock the session record and the kick are stamped with (ms). */
+double gpuAmazeDebayerSteadyNowMs(void);
+/* Row K: the AMaZE live runtime is already loaded and created (never loads it). */
+bool gpuAmazeDebayerLiveBackendLoaded(void);
+/* Row K: begin the Play-start clock kick on the loaded backend. Returns false with *why (backend_not_loaded,
+ * symbol_missing, cuda_suppressed, in_flight, begin_failed) when nothing was launched. Re-checks the device-loss flag
+ * under the live lock. *beginSteadyMs = gpuAmazeDebayerSteadyNowMs() at the launch. */
+bool gpuAmazeDebayerClockKickBegin(int maxMs, QString * why, double * beginSteadyMs);
+/* Row K: end (raise the stop flag) and collect; never loads the DLL, never makes a CUDA call. */
+GpuAmazeClockKickReport gpuAmazeDebayerClockKickEnd(void);
+/* PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1 R1 (PlaybackWarmOutputReusePolicy.h). Capture copies one
+ * AMaZE input (device Bayer16) into the loaded backend and returns its capture id; false with *why (cuda_suppressed,
+ * backend_not_loaded, symbol_missing, failed) and *captureId 0 otherwise. MatchesCapture compares a device Bayer16
+ * against that capture exactly: true with *equal on a completed compare, false with *why (cuda_suppressed,
+ * capture_missing, symbol_missing, compare_failed). Both re-check the device-loss flag under the live lock and never
+ * load the DLL. Release clears the capture id; never gated, never a CUDA call. */
+bool gpuAmazeDebayerCaptureInputBayer16(const uint16_t * deviceBayer16, int width, int height,
+                                        quint64 * captureId, QString * why);
+bool gpuAmazeDebayerInputBayer16MatchesCapture(const uint16_t * deviceBayer16, int width, int height,
+                                               quint64 captureId, bool * equal, QString * why);
+void gpuAmazeDebayerReleaseInputCapture(void);
 bool gpuAmazeDebayerApplyGpuOffscreenPostWb(const float * inputRawFrame,
                                            uint16_t * outputRgb16,
                                            int width,
