@@ -17,7 +17,9 @@
 #define CUDA_AMAZE_DEBAYER_STAGE_PROBE_NO_MAIN 1
 #include "../cuda_amaze_debayer_stage_probe.cu"
 
+#include <atomic>
 #include <chrono>
+#include <thread>
 #include <cstdlib>
 #include <cstring>
 #include <sstream>
@@ -48,9 +50,41 @@ struct CachedGlImageResource
     unsigned int flags = 0;
 };
 
+/* PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row K: the clock kick's mapped pinned block (< 2 KB). The host
+ * writes stop; the kernel writes the rest, then done last. */
+struct ClockKickShared
+{
+    volatile unsigned int stop;        /* 0 run, 1 end(), 2 a live run's drain */
+    volatile unsigned int done;
+    volatile unsigned int count;
+    volatile unsigned int exitReason;  /* 0 deadline, else the stop value the kernel saw */
+    volatile unsigned long long startNs;
+    volatile unsigned long long endNs;
+    volatile unsigned long long nextSampleNs;   /* carried from one chunk launch to the next */
+    volatile unsigned int chunksDone;           /* kernel: chunks finished (they run in order on the kick stream) */
+    volatile unsigned int expired;              /* kernel: a chunk saw the kick's deadline */
+    volatile unsigned long long sampleNs[IGPU_CLOCK_KICK_MAX_SAMPLES];
+    volatile long long sampleClk[IGPU_CLOCK_KICK_MAX_SAMPLES];
+    volatile unsigned int sampleSm[IGPU_CLOCK_KICK_MAX_SAMPLES];   /* clock64 is per SM: %smid of each sample */
+};
+
 struct igpu_amaze_debayer_backend
 {
     std::string description;
+    /* PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row 0: igpu_amaze_debayer_arm_probe / last_probe. */
+    int probeArmedCalls = 0;
+    igpu_amaze_probe_t lastProbe{};
+    unsigned long long * probeHost = nullptr;
+    unsigned long long * probeDevice = nullptr;
+    cudaEvent_t probeStart = nullptr;
+    cudaEvent_t probeMark = nullptr;
+    cudaEvent_t probeEnd = nullptr;
+    /* Row K: igpu_amaze_debayer_clock_kick_begin / end. */
+    cudaStream_t kickStream = nullptr;
+    ClockKickShared * kickHost = nullptr;
+    ClockKickShared * kickDevice = nullptr;
+    bool kickLaunched = false;   // launched and not yet collected
+    std::thread kickFeeder;      // submits the kick's chunks, at most kClockKickChunksInFlight queued at a time
     igpu_amaze_debayer_timing_t lastTiming;
     uint16_t * liveReconBayer16 = nullptr;
     float * liveRawFloat = nullptr;
@@ -133,6 +167,327 @@ double now_ms()
     using clock = std::chrono::steady_clock;
     const auto now = clock::now().time_since_epoch();
     return std::chrono::duration<double, std::milli>(now).count();
+}
+
+/* PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1: the device's ns timer (no NVML; it runs at a fixed rate whatever
+ * the SM clock). clock64 over it is the SM clock. */
+__device__ __forceinline__ unsigned long long igpu_globaltimer_ns()
+{
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+}
+
+/* Row 0: one thread spins spinNs on %globaltimer; out[0] = ns spanned, out[1] = SM cycles over it. */
+__global__ void k_sm_clock_probe(unsigned long long * out, unsigned long long spinNs)
+{
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    const unsigned long long t0 = igpu_globaltimer_ns();
+    const long long c0 = clock64();
+    unsigned long long t1 = t0;
+    long long c1 = c0;
+    do
+    {
+        t1 = igpu_globaltimer_ns();
+        c1 = clock64();
+    } while (t1 - t0 < spinNs);
+    out[0] = t1 - t0;
+    out[1] = static_cast<unsigned long long>(c1 - c0);
+}
+
+__device__ __forceinline__ unsigned int igpu_smid()
+{
+    unsigned int id;
+    asm volatile("mov.u32 %0, %%smid;" : "=r"(id));
+    return id;
+}
+
+/* Row K: one CHUNK of the kick. A host feeder thread (clock_kick_feeder) keeps at most kClockKickChunksInFlight of
+ * these queued on the kick stream, so no single launch exceeds the 100 ms per-launch budget
+ * (GPU-LAUNCH-BUDGET-TILING-1, IGPU_LT_LAUNCH_BUDGET_MS), and any other work that has to wait for the device's queued
+ * work waits for at most those few chunks, never for the whole kick. Lane 0 spins for at most chunkNs, until maxNs
+ * after the FIRST chunk's start, or until the host-mapped stop flag is set, sampling (%globaltimer, clock64, %smid)
+ * every periodNs and once as it leaves (at most IGPU_CLOCK_KICK_MAX_SAMPLES over the whole kick). clock64 is per SM and
+ * a chunk may run on another SM, so the host only reads an interval whose two samples share an SM. A chunk that starts
+ * after a stop or past the deadline returns at once. Each chunk publishes chunksDone last. */
+__global__ void k_clock_kick(ClockKickShared * s,
+                             unsigned long long maxNs,
+                             unsigned long long chunkNs,
+                             unsigned long long periodNs,
+                             unsigned int chunk)
+{
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    const unsigned long long tIn = igpu_globaltimer_ns();
+    if (chunk == 0)
+    {
+        s->startNs = tIn;
+        s->nextSampleNs = tIn;
+    }
+    const unsigned long long t0 = s->startNs;
+    unsigned int count = s->count;
+    unsigned long long next = s->nextSampleNs;
+    unsigned int reason = s->exitReason;
+    if (reason == 0 && s->stop == 0 && tIn - t0 < maxNs)
+    {
+        for (;;)
+        {
+            const unsigned long long t = igpu_globaltimer_ns();
+            if (t >= next && count < IGPU_CLOCK_KICK_MAX_SAMPLES)
+            {
+                s->sampleNs[count] = t;
+                s->sampleClk[count] = clock64();
+                s->sampleSm[count] = igpu_smid();
+                ++count;
+                next = t + periodNs;
+            }
+            const unsigned int stop = s->stop;
+            if (stop != 0)
+            {
+                reason = stop;
+                break;
+            }
+            if (t - t0 >= maxNs)
+            {
+                s->expired = 1;
+                break;
+            }
+            if (t - tIn >= chunkNs) break;
+        }
+        const unsigned long long tOut = igpu_globaltimer_ns();
+        if (count < IGPU_CLOCK_KICK_MAX_SAMPLES)
+        {
+            s->sampleNs[count] = tOut;
+            s->sampleClk[count] = clock64();
+            s->sampleSm[count] = igpu_smid();
+            ++count;
+        }
+        s->count = count;
+        s->nextSampleNs = next;
+        s->exitReason = reason;
+        s->endNs = tOut;
+    }
+    else if (reason == 0 && s->stop != 0)
+    {
+        s->exitReason = s->stop;
+    }
+    else if (tIn - t0 >= maxNs)
+    {
+        s->expired = 1;
+    }
+    __threadfence_system();
+    s->chunksDone = chunk + 1;
+    __threadfence_system();
+}
+
+constexpr unsigned long long kProbeSpinNs = 50000ull;
+constexpr int kClockKickMaxMsCap = 2000;
+constexpr unsigned long long kClockKickPeriodNs = 5000000ull;
+/* One kick launch spins at most this long: far under the 100 ms per-launch budget (IGPU_LT_LAUNCH_BUDGET_MS). */
+constexpr int kClockKickChunkMs = 10;
+/* The feeder keeps at most this many chunks queued: work that must wait for the device's queued work (an implicit
+ * synchronisation in another stream or DLL) waits for at most ~20 ms of kick, never the whole kick. */
+constexpr unsigned int kClockKickChunksInFlight = 2;
+constexpr unsigned int kClockKickMaxChunks = (kClockKickMaxMsCap + kClockKickChunkMs - 1) / kClockKickChunkMs + 1;
+constexpr double kClockKickDrainWaitMs = 50.0;
+constexpr double kClockKickEndWaitMs = 2.0;
+
+/* Row 0: SM MHz on `stream` (launch + sync, host-mapped result), or 0.0 when a step fails. Its codes are noted
+ * (the run that called it captures them, or the next run emits them as orphans); it never throws, so a failed
+ * probe never fails the run. */
+double sm_clock_probe_mhz(igpu_amaze_debayer_backend * backend, cudaStream_t stream)
+{
+    if (!backend->probeHost)
+    {
+        void * host = nullptr;
+        cudaError_t rc = cudaHostAlloc(&host, 2u * sizeof(unsigned long long), cudaHostAllocMapped);
+        if (rc != cudaSuccess)
+        {
+            IGPU_CUDA_ERROR_NOTE(rc, "probe:host_alloc");
+            return 0.0;
+        }
+        void * device = nullptr;
+        rc = cudaHostGetDevicePointer(&device, host, 0);
+        if (rc != cudaSuccess)
+        {
+            IGPU_CUDA_ERROR_NOTE(rc, "probe:device_pointer");
+            cudaFreeHost(host);
+            return 0.0;
+        }
+        backend->probeHost = static_cast<unsigned long long *>(host);
+        backend->probeDevice = static_cast<unsigned long long *>(device);
+    }
+    volatile unsigned long long * result = backend->probeHost;
+    result[0] = 0;
+    result[1] = 0;
+    IGPU_LT_LAUNCH("k_sm_clock_probe", 1, 1, stream,
+                   k_sm_clock_probe<<<1, 1, 0, stream>>>(backend->probeDevice, kProbeSpinNs));
+    cudaError_t rc = cudaPeekAtLastError();
+    if (rc == cudaSuccess) rc = IGPU_LT_SYNC_CALL("probe:sm_clock_sync", cudaStreamSynchronize(stream));
+    if (rc != cudaSuccess)
+    {
+        IGPU_CUDA_ERROR_NOTE(rc, "probe:sm_clock");
+        return 0.0;
+    }
+    const unsigned long long ns = result[0];
+    const unsigned long long cycles = result[1];
+    if (ns == 0) return 0.0;
+    return static_cast<double>(cycles) * 1000.0 / static_cast<double>(ns);
+}
+
+/* Row 0: the device-time events of one armed batch (see run_frame_to_device_rgb16_bayer16_post_wb_batched). */
+struct LiveRunProbe
+{
+    cudaEvent_t start = nullptr;
+    cudaEvent_t mark = nullptr;
+    cudaEvent_t end = nullptr;
+    bool ok = false;
+};
+
+bool ensure_probe_events(igpu_amaze_debayer_backend * backend)
+{
+    cudaEvent_t * events[] = {&backend->probeStart, &backend->probeMark, &backend->probeEnd};
+    for (cudaEvent_t * event : events)
+    {
+        if (*event) continue;
+        const cudaError_t rc = cudaEventCreate(event);
+        if (rc != cudaSuccess)
+        {
+            IGPU_CUDA_ERROR_NOTE(rc, "probe:event_create");
+            *event = nullptr;
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Row 0: an armed run's probe steps. begin (before the kernel_ms window) consumes one armed call, reads
+ * mhz_before on tile stream 0 and hands back the events for the batch; finish (after the drain and after the
+ * timing fields are set) reads device_ms and mhz_after. lastProbe.valid is 0 for an unarmed run. */
+LiveRunProbe * begin_live_run_probe(igpu_amaze_debayer_backend * backend, LiveRunProbe * probe)
+{
+    backend->lastProbe = igpu_amaze_probe_t{};
+    if (backend->probeArmedCalls <= 0 || backend->liveTileStreams.empty()) return nullptr;
+    --backend->probeArmedCalls;
+    if (!ensure_probe_events(backend)) return nullptr;
+    backend->lastProbe.sm_mhz_before = sm_clock_probe_mhz(backend, backend->liveTileStreams[0]);
+    probe->start = backend->probeStart;
+    probe->mark = backend->probeMark;
+    probe->end = backend->probeEnd;
+    probe->ok = backend->lastProbe.sm_mhz_before > 0.0;
+    return probe;
+}
+
+void finish_live_run_probe(igpu_amaze_debayer_backend * backend, const LiveRunProbe * probe)
+{
+    if (!probe || !probe->ok) return;
+    float deviceMs = 0.0f;
+    const cudaError_t rc = cudaEventElapsedTime(&deviceMs, probe->start, probe->end);
+    if (rc != cudaSuccess)
+    {
+        IGPU_CUDA_ERROR_NOTE(rc, "probe:elapsed");
+        return;
+    }
+    backend->lastProbe.device_ms = static_cast<double>(deviceMs);
+    backend->lastProbe.sm_mhz_after = sm_clock_probe_mhz(backend, backend->liveTileStreams[0]);
+    backend->lastProbe.valid = backend->lastProbe.sm_mhz_after > 0.0 ? 1 : 0;
+}
+
+/* Row K: a live run's drain ends a running kick (host write only), so the kick never overlaps its CUDA-GL handoff. */
+void stop_clock_kick_for_live_run(igpu_amaze_debayer_backend * backend)
+{
+    if (backend->kickLaunched && backend->kickHost && backend->kickHost->stop == 0)
+    {
+        backend->kickHost->stop = 2;
+    }
+}
+
+/* Row K: the kick's host feeder (one thread per kick, started by clock_kick_begin). It keeps at most
+ * kClockKickChunksInFlight chunks queued, launching the next as one finishes, until the stop flag, the kick's
+ * deadline (a chunk saw it, or the feeder's own clock as a backstop), or a failed launch. Then it waits (bounded) for
+ * the chunks it launched to finish and publishes done, which end() reads. It makes no synchronising call. */
+void clock_kick_feeder(igpu_amaze_debayer_backend * backend, unsigned long long maxNs)
+{
+    ClockKickShared * s = backend->kickHost;
+    const unsigned long long chunkNs = static_cast<unsigned long long>(kClockKickChunkMs) * 1000000ull;
+    const double maxMs = static_cast<double>(maxNs) / 1000000.0;
+    const double started = now_ms();
+    unsigned int launched = 0;
+    while (s->stop == 0 && s->expired == 0 && launched < kClockKickMaxChunks
+           && now_ms() - started < maxMs + kClockKickDrainWaitMs)
+    {
+        if (launched >= s->chunksDone + kClockKickChunksInFlight)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            continue;
+        }
+        IGPU_LT_LAUNCH("k_clock_kick", 1, 32, backend->kickStream,
+                       k_clock_kick<<<1, 32, 0, backend->kickStream>>>(backend->kickDevice,
+                                                                       maxNs,
+                                                                       chunkNs,
+                                                                       kClockKickPeriodNs,
+                                                                       launched));
+        const cudaError_t launchRc = cudaGetLastError();
+        if (launchRc != cudaSuccess)
+        {
+            IGPU_CUDA_ERROR_NOTE(launchRc, "clock_kick:launch");
+            break;
+        }
+        ++launched;
+        /* WDDM batches launches: a query submits this chunk now instead of at the next sync. NotReady is the answer. */
+        const cudaError_t queryRc = cudaStreamQuery(backend->kickStream);
+        if (queryRc != cudaSuccess && queryRc != cudaErrorNotReady)
+        {
+            IGPU_CUDA_ERROR_NOTE(queryRc, "clock_kick:submit");
+            break;
+        }
+    }
+    const double drainStart = now_ms();
+    while (s->chunksDone < launched && now_ms() - drainStart < kClockKickDrainWaitMs)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (s->chunksDone >= launched)
+    {
+        std::atomic_thread_fence(std::memory_order_release);
+        s->done = 1;
+    }
+}
+
+/* Teardown adds no synchronisation (CudaLaunchTiming.TimingOnAddsNoSynchronisationAtBackendTeardown): a kick still
+ * running is told to stop, its feeder joined (it only sleeps and launches; it exits once it sees the flag and its
+ * chunks drain, bounded), and one whose chunks have still not finished keeps its mapped block (it is never freed under
+ * a running kernel). */
+void free_probe_and_kick(igpu_amaze_debayer_backend * backend)
+{
+    if (backend->kickHost && backend->kickHost->stop == 0) backend->kickHost->stop = 1;
+    if (backend->kickFeeder.joinable()) backend->kickFeeder.join();
+    if (backend->kickHost)
+    {
+        ClockKickShared * s = backend->kickHost;
+        if (s->stop == 0) s->stop = 1;
+        const double waitStart = now_ms();
+        while (backend->kickLaunched && !s->done && now_ms() - waitStart < kClockKickEndWaitMs)
+        {
+        }
+        if (!backend->kickLaunched || s->done)
+        {
+            cudaFreeHost(backend->kickHost);
+        }
+        backend->kickHost = nullptr;
+        backend->kickDevice = nullptr;
+    }
+    if (backend->kickStream) cudaStreamDestroy(backend->kickStream);
+    backend->kickStream = nullptr;
+    backend->kickLaunched = false;
+    if (backend->probeHost) cudaFreeHost(backend->probeHost);
+    backend->probeHost = nullptr;
+    backend->probeDevice = nullptr;
+    cudaEvent_t * events[] = {&backend->probeStart, &backend->probeMark, &backend->probeEnd};
+    for (cudaEvent_t * event : events)
+    {
+        if (*event) cudaEventDestroy(*event);
+        *event = nullptr;
+    }
 }
 
 int reset_cached_gl_resource(CachedGlImageResource * cache, bool tolerateInvalidGraphicsContext)
@@ -1078,12 +1433,25 @@ void run_frame_to_device_rgb16_bayer16_post_wb_batched(
     double wbMultiplierR,
     double wbMultiplierG,
     double wbMultiplierB,
-    bool fastLaunchChecks = false)
+    bool fastLaunchChecks = false,
+    LiveRunProbe * probe = nullptr)
 {
     const std::size_t batchSize = std::min(buffers.size(), streams.size());
     if (batchSize == 0)
     {
         return;
+    }
+
+    /* PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row 0 (armed runs only): start on stream 0 before the first
+     * tile; after the launch loop every active stream is joined into stream 0, then end. */
+    if (probe && probe->ok)
+    {
+        const cudaError_t rc = cudaEventRecord(probe->start, streams[0]);
+        if (rc != cudaSuccess)
+        {
+            IGPU_CUDA_ERROR_NOTE(rc, "probe:event_start");
+            probe->ok = false;
+        }
     }
 
     std::size_t inFlight = 0;
@@ -1115,6 +1483,21 @@ void run_frame_to_device_rgb16_bayer16_post_wb_batched(
     }
 
     const std::size_t active = std::min(inFlight, batchSize);
+    if (probe && probe->ok)
+    {
+        cudaError_t rc = cudaSuccess;
+        for (std::size_t slot = 0; slot < active && rc == cudaSuccess; ++slot)
+        {
+            rc = cudaEventRecord(probe->mark, streams[slot]);
+            if (rc == cudaSuccess) rc = cudaStreamWaitEvent(streams[0], probe->mark, 0);
+        }
+        if (rc == cudaSuccess) rc = cudaEventRecord(probe->end, streams[0]);
+        if (rc != cudaSuccess)
+        {
+            IGPU_CUDA_ERROR_NOTE(rc, "probe:event_join");
+            probe->ok = false;
+        }
+    }
     for (std::size_t slot = 0; slot < active; ++slot)
     {
         CK(IGPU_LT_SYNC_CALL("tiles:drain_sync", cudaStreamSynchronize(streams[slot])));
@@ -1650,6 +2033,7 @@ int copy_rgb16_to_gl_rgba16_texture_post_wb_undo(const uint16_t * dRgb16,
 
 extern "C" void igpu_amaze_debayer_destroy(igpu_amaze_debayer_backend * backend)
 {
+    if (backend) free_probe_and_kick(backend);
     free_live_texture_buffers(backend);
     delete backend;
     igpu_lt::teardown("destroy");
@@ -1909,6 +2293,7 @@ extern "C" int igpu_amaze_debayer_run_post_wb_gl_texture_from_r16_gl_texture(
     if (black_level < 1000) black_level = -1000;
 
     std::memset(&backend->lastTiming, 0, sizeof(backend->lastTiming));
+    backend->lastProbe = igpu_amaze_probe_t{};
 
     const double totalStart = now_ms();
     igpu_lt::FrameScope lt_frame(width, height);
@@ -1924,6 +2309,9 @@ extern "C" int igpu_amaze_debayer_run_post_wb_gl_texture_from_r16_gl_texture(
         if (copyRc != 0) return copyRc;
         backend->lastTiming.upload_ms = now_ms() - uploadStart;
 
+        /* PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row 0: armed runs only, outside kernel_ms. */
+        LiveRunProbe probeStorage;
+        LiveRunProbe * probe = begin_live_run_probe(backend, &probeStorage);
         const double kernelStart = now_ms();
         /* r3: the reduced H-Nyquist filter works on device RGB16 before the WB-undo
          * pack, so a reduced run never stores tiles straight to RGBA16. */
@@ -1941,7 +2329,9 @@ extern "C" int igpu_amaze_debayer_run_post_wb_gl_texture_from_r16_gl_texture(
             wb_multiplier_r,
             wb_multiplier_g,
             wb_multiplier_b,
-            live_fast_launch_checks_from_env());
+            live_fast_launch_checks_from_env(),
+            probe);
+        stop_clock_kick_for_live_run(backend);
         const uint16_t * packRgb16 = backend->liveRgb16;
         if (hnyquist)
         {
@@ -1976,6 +2366,8 @@ extern "C" int igpu_amaze_debayer_run_post_wb_gl_texture_from_r16_gl_texture(
                     &backend->liveOutputRgba16Resource);
         backend->lastTiming.download_ms = now_ms() - handoffStart;
         backend->lastTiming.total_ms = now_ms() - totalStart;
+        /* Row 0: device_ms and mhz_after, after every timing field (armed runs only) */
+        finish_live_run_probe(backend, probe);
         igpu_lt::poll();
         return rc;
     }
@@ -2008,6 +2400,7 @@ extern "C" int igpu_amaze_debayer_run_post_wb_gl_texture_from_device_bayer16(
     if (black_level < 1000) black_level = -1000;
 
     std::memset(&backend->lastTiming, 0, sizeof(backend->lastTiming));
+    backend->lastProbe = igpu_amaze_probe_t{};
 
     const double totalStart = now_ms();
     igpu_lt::FrameScope lt_frame(width, height);
@@ -2016,6 +2409,9 @@ extern "C" int igpu_amaze_debayer_run_post_wb_gl_texture_from_device_bayer16(
         ensure_live_texture_buffers(backend, width, height);
         backend->lastTiming.upload_ms = 0.0;
 
+        /* PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row 0: armed runs only, outside kernel_ms. */
+        LiveRunProbe probeStorage;
+        LiveRunProbe * probe = begin_live_run_probe(backend, &probeStorage);
         const double kernelStart = now_ms();
         /* r3: the reduced H-Nyquist filter works on device RGB16 before the WB-undo
          * pack, so a reduced run never stores tiles straight to RGBA16. */
@@ -2033,7 +2429,9 @@ extern "C" int igpu_amaze_debayer_run_post_wb_gl_texture_from_device_bayer16(
             wb_multiplier_r,
             wb_multiplier_g,
             wb_multiplier_b,
-            live_fast_launch_checks_from_env());
+            live_fast_launch_checks_from_env(),
+            probe);
+        stop_clock_kick_for_live_run(backend);
         const uint16_t * packRgb16 = backend->liveRgb16;
         if (hnyquist)
         {
@@ -2068,6 +2466,8 @@ extern "C" int igpu_amaze_debayer_run_post_wb_gl_texture_from_device_bayer16(
                     &backend->liveOutputRgba16Resource);
         backend->lastTiming.download_ms = now_ms() - handoffStart;
         backend->lastTiming.total_ms = now_ms() - totalStart;
+        /* Row 0: device_ms and mhz_after, after every timing field (armed runs only) */
+        finish_live_run_probe(backend, probe);
         igpu_lt::poll();
         return rc;
     }
@@ -2099,6 +2499,114 @@ extern "C" int igpu_amaze_debayer_last_timing(igpu_amaze_debayer_backend * backe
 {
     if (!backend || !timing) return -1;
     *timing = backend->lastTiming;
+    return 0;
+}
+
+/* PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row 0. */
+extern "C" int igpu_amaze_debayer_arm_probe(igpu_amaze_debayer_backend * backend, int calls)
+{
+    if (!backend || calls < 0) return -1;
+    backend->probeArmedCalls = calls;
+    return 0;
+}
+
+extern "C" int igpu_amaze_debayer_last_probe(igpu_amaze_debayer_backend * backend, igpu_amaze_probe_t * out)
+{
+    if (!backend || !out) return -1;
+    *out = backend->lastProbe;
+    return 0;
+}
+
+/* Row K. */
+extern "C" int igpu_amaze_debayer_clock_kick_begin(igpu_amaze_debayer_backend * backend, int max_ms)
+{
+    if (!backend || max_ms <= 0 || max_ms > kClockKickMaxMsCap) return -1;
+    if (backend->kickLaunched && backend->kickHost && !backend->kickHost->done) return 1;
+    backend->kickLaunched = false;   // a finished kick nobody collected is dropped
+    if (!backend->kickStream)
+    {
+        int leastPriority = 0;
+        int greatestPriority = 0;
+        cudaError_t rc = cudaDeviceGetStreamPriorityRange(&leastPriority, &greatestPriority);
+        if (rc == cudaSuccess)
+            rc = cudaStreamCreateWithPriority(&backend->kickStream, cudaStreamNonBlocking, leastPriority);
+        if (rc != cudaSuccess)
+        {
+            IGPU_CUDA_ERROR_NOTE(rc, "clock_kick:stream");
+            backend->kickStream = nullptr;
+            return -2;
+        }
+    }
+    if (!backend->kickHost)
+    {
+        void * host = nullptr;
+        cudaError_t rc = cudaHostAlloc(&host, sizeof(ClockKickShared), cudaHostAllocMapped);
+        void * device = nullptr;
+        if (rc == cudaSuccess) rc = cudaHostGetDevicePointer(&device, host, 0);
+        if (rc != cudaSuccess)
+        {
+            IGPU_CUDA_ERROR_NOTE(rc, "clock_kick:host_alloc");
+            if (host) cudaFreeHost(host);
+            return -2;
+        }
+        backend->kickHost = static_cast<ClockKickShared *>(host);
+        backend->kickDevice = static_cast<ClockKickShared *>(device);
+    }
+    /* the previous kick's feeder has published done (or never started): joining it does not wait on the GPU */
+    if (backend->kickFeeder.joinable()) backend->kickFeeder.join();
+    std::memset(static_cast<void *>(backend->kickHost), 0, sizeof(ClockKickShared));
+    const unsigned long long maxNs = static_cast<unsigned long long>(max_ms) * 1000000ull;
+    /* the chunks are submitted by the feeder, at most kClockKickChunksInFlight of kClockKickChunkMs at a time */
+    try
+    {
+        backend->kickFeeder = std::thread(clock_kick_feeder, backend, maxNs);
+    }
+    catch (...)
+    {
+        return -2;
+    }
+    backend->kickLaunched = true;
+    return 0;
+}
+
+extern "C" int igpu_amaze_debayer_clock_kick_end(igpu_amaze_debayer_backend * backend,
+                                                 igpu_clock_kick_report_t * out)
+{
+    if (!backend || !out) return -1;
+    std::memset(out, 0, sizeof(*out));
+    if (!backend->kickLaunched || !backend->kickHost)
+    {
+        out->state = 2;
+        return 2;
+    }
+    ClockKickShared * s = backend->kickHost;
+    if (s->stop == 0) s->stop = 1;
+    /* host memory only, no CUDA call: bounded, and safe after a device loss */
+    const double waitStart = now_ms();
+    while (!s->done && now_ms() - waitStart < kClockKickEndWaitMs)
+    {
+    }
+    if (!s->done)
+    {
+        out->state = 1;
+        return 1;
+    }
+    std::atomic_thread_fence(std::memory_order_acquire);
+    unsigned int count = s->count;
+    if (count > IGPU_CLOCK_KICK_MAX_SAMPLES) count = IGPU_CLOCK_KICK_MAX_SAMPLES;
+    for (unsigned int i = 0; i < count; ++i)
+    {
+        out->sample_ns[i] = s->sampleNs[i];
+        out->sample_clk[i] = s->sampleClk[i];
+        out->sample_sm[i] = s->sampleSm[i];
+    }
+    out->samples = static_cast<int>(count);
+    out->stopped_by = static_cast<int>(s->exitReason);
+    const unsigned long long startNs = s->startNs;
+    const unsigned long long endNs = s->endNs;
+    out->ran_ms = endNs > startNs ? static_cast<double>(endNs - startNs) / 1000000.0 : 0.0;
+    out->state = 0;
+    backend->kickLaunched = false;
     return 0;
 }
 
