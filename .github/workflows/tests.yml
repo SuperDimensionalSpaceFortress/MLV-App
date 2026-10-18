@@ -157,9 +157,11 @@ jobs:
     # One Windows runner took 39-61 min for the whole suite (73.5 min on PR #225, cap 75).
     # Shards 1-7 each run a seventh of the unittest classes, weighted by measured seconds
     # (about 9.5 min of tests), and shard 8 runs the pytest guardrails plus the remaining
-    # steps (about 11 min), so a shard is expected at 10-12 min including setup. 40 leaves
-    # more than 3x for runner variance.
-    timeout-minutes: 40
+    # steps (about 11 min), so a shard is expected at 10-12 min including setup. Hosted runs
+    # measured 23-39 min per shard (shard 1 up to 40.1, shard 5 up to 39.6, shard 8 up to 39.4
+    # before the lane containment tests moved to their own job), so 50 is the margin for
+    # shards 1 and 5 until the shard 1 fix and a weight rebalance land.
+    timeout-minutes: 50
     strategy:
       fail-fast: false
       matrix:
@@ -215,6 +217,7 @@ jobs:
             tools\coordination\stuck_queue_checks\test_stuck_queue_checks.py `
             tests\coordination `
             tests\docs `
+            --ignore=tests\coordination\test_lane_containment.py `
             -q
 
       - name: Run demote-factory-bridge refusal-path tests
@@ -233,6 +236,38 @@ jobs:
           & "$env:RUNNER_TEMP\python-lock-tools\Scripts\python.exe" -m pip install --disable-pip-version-check --no-input --only-binary=:all: --require-hashes -r .github/requirements/lock-tools.txt
           & tools\dependencies\update-python-locks.ps1 -RepoRoot . -Python "$env:RUNNER_TEMP\python-lock-tools\Scripts\python.exe" -Check
 
+  repo-hygiene-python-windows-containment:
+    # tests\coordination\test_lane_containment.py is about 15 min of shard 8 (166 tests, a cold
+    # pwsh per case), which with the rest of shard 8 reached the 40 min cap in six hosted runs.
+    # It runs here, in parallel with the shard matrix, and shard 8 ignores it, so the file is
+    # collected in exactly one job. The aggregate `Repo Hygiene Python (windows-latest)` below
+    # requires this job, so a failed, cancelled or skipped run still fails the required check.
+    name: Repo Hygiene Python windows lane containment
+    runs-on: windows-latest
+    # About 15-20 min measured; 45 leaves more than 2x for runner variance.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version-file: ".python-version"
+
+      - name: Install repo hygiene test dependencies
+        shell: pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$ErrorActionPreference = 'Stop'; $PSNativeCommandUseErrorActionPreference = $true; . '{0}'"
+        run: |
+          python -m pip install --disable-pip-version-check --no-input --only-binary=:all: --require-hashes -r .github/requirements/pip.txt
+          python -m pip install --disable-pip-version-check --no-input --only-binary=:all: --require-hashes -r .github/requirements/repo-hygiene.txt
+          python -m pip check
+
+      - name: Run lane containment tests
+        shell: pwsh
+        run: python -m pytest tests\coordination\test_lane_containment.py -q
+
   repo-hygiene-python-windows:
     # Keeps the required status-check name `Repo Hygiene Python (windows-latest)` that
     # branch protection pins. It succeeds only when every Windows shard job succeeded: a
@@ -240,7 +275,7 @@ jobs:
     # (not `!cancelled()`) keeps it running when the whole run is cancelled, so a cancel
     # leaves the required check failed rather than condition-skipped, which GitHub accepts.
     name: Repo Hygiene Python (windows-latest)
-    needs: repo-hygiene-python-windows-shard
+    needs: [repo-hygiene-python-windows-shard, repo-hygiene-python-windows-containment]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -251,6 +286,13 @@ jobs:
         run: |
           echo "windows shard matrix result: $SHARDS_RESULT"
           test "$SHARDS_RESULT" = "success"
+
+      - name: Require the lane containment job to have passed
+        env:
+          CONTAINMENT_RESULT: ${{ needs.repo-hygiene-python-windows-containment.result }}
+        run: |
+          echo "windows lane containment result: $CONTAINMENT_RESULT"
+          test "$CONTAINMENT_RESULT" = "success"
 
   windows-product-oracles-part:
     name: Windows Product Oracles part ${{ matrix.part }}/3
