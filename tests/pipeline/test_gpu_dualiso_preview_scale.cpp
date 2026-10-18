@@ -48,6 +48,7 @@
 #include "../../platform/qt/PlaybackReconWarmRun.h"
 
 #include <QDir>
+#include <QTemporaryDir>
 
 #include <algorithm>
 #include <cmath>
@@ -2647,4 +2648,249 @@ TEST(GpuPlaybackReconWarmRun, WithoutTheGpuPlaybackReconNothingIsRetainedOrConfi
     ASSERT_EQ(0u, warm.retained.token);
     ASSERT_EQ(setClipBefore, llrpGpuPlaybackReconSetClipCount());
     ASSERT_EQ(0, llrpGpuPlaybackReconRetainedOutstandingCount());
+}
+
+// PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1 T-A: PR #498's reuse missed 2/2 at the venue with content_mismatch
+// (Play frame 0's AMaZE input != the paused warm's). The warm restores this thread's last-run GPU state but not the
+// shared dual-ISO runtime state (pattern, auto/ev/black-delta match) that every run is seeded from and that a run
+// publishes when it changed. An unsettled histogram match (auto -2, ev 1, bd -1: the DISO_FORCED shape) is solved by
+// the first run and published as black_delta/64, so the next run starts from a settled seed. The fake backend dumps
+// exactly what each run handed the backend (in.u16, LUTs, scalars); the warm's and Play's must be byte-identical, and
+// so must their retained outputs.
+namespace {
+
+bool readFileBytes(const std::string & path, std::vector<unsigned char> * out)
+{
+    out->clear();
+    FILE * f = std::fopen(path.c_str(), "rb");
+    if (!f) return false;
+    unsigned char buffer[65536];
+    size_t n = 0;
+    while ((n = std::fread(buffer, 1, sizeof(buffer), f)) > 0) out->insert(out->end(), buffer, buffer + n);
+    std::fclose(f);
+    return true;
+}
+
+std::vector<std::string> splitLines(const std::vector<unsigned char> & bytes)
+{
+    std::vector<std::string> lines(1);
+    for (const unsigned char c : bytes)
+    {
+        if (c == '\n') lines.emplace_back();
+        else if (c != '\r') lines.back().push_back(static_cast<char>(c));
+    }
+    return lines;
+}
+
+// Compares one dumped file of the warm and of Play; on a difference prints the first differing line (text) or byte
+// offset (binary). Absent in both is equal (randn05 is only written with dither on).
+bool warmAndPlayDumpsEqual(const char * variant, const std::string & warmDir, const std::string & playDir,
+                           const char * name)
+{
+    std::vector<unsigned char> warm;
+    std::vector<unsigned char> play;
+    const bool hasWarm = readFileBytes(warmDir + "/" + name, &warm);
+    const bool hasPlay = readFileBytes(playDir + "/" + name, &play);
+    if (!hasWarm && !hasPlay)
+    {
+        std::printf("[warm-recon-determinism] %s %s absent in both\n", variant, name);
+        return true;
+    }
+    if (hasWarm != hasPlay)
+    {
+        std::printf("[warm-recon-determinism] %s %s MISMATCH present warm=%d play=%d\n", variant, name,
+                    hasWarm ? 1 : 0, hasPlay ? 1 : 0);
+        return false;
+    }
+    if (warm == play)
+    {
+        std::printf("[warm-recon-determinism] %s %s identical (%zu bytes)\n", variant, name, warm.size());
+        return true;
+    }
+    if (std::string(name) == "scalars.txt")
+    {
+        const std::vector<std::string> w = splitLines(warm);
+        const std::vector<std::string> p = splitLines(play);
+        for (size_t i = 0; i < std::max(w.size(), p.size()); ++i)
+        {
+            const std::string wl = i < w.size() ? w[i] : std::string("<none>");
+            const std::string pl = i < p.size() ? p[i] : std::string("<none>");
+            if (wl != pl)
+                std::printf("[warm-recon-determinism] %s %s MISMATCH line %zu warm '%s' play '%s'\n", variant, name,
+                            i + 1, wl.c_str(), pl.c_str());
+        }
+        return false;
+    }
+    size_t first = 0;
+    size_t differing = 0;
+    const size_t common = std::min(warm.size(), play.size());
+    for (size_t i = 0; i < common; ++i)
+    {
+        if (warm[i] == play[i]) continue;
+        if (differing == 0) first = i;
+        ++differing;
+    }
+    std::printf("[warm-recon-determinism] %s %s MISMATCH bytes warm=%zu play=%zu differing_bytes=%zu first_offset=%zu "
+                "warm=0x%02x play=0x%02x\n",
+                variant, name, warm.size(), play.size(), differing, first,
+                first < warm.size() ? warm[first] : 0u, first < play.size() ? play[first] : 0u);
+    return false;
+}
+
+void printSharedSeeds(const char * variant, const char * when, mlvObject_t * video)
+{
+    std::printf("[warm-recon-determinism] %s %s shared auto=%d ev=%.17g bd=%d pattern=%d\n", variant, when,
+                video->llrawproc->diso_auto_correction, video->llrawproc->diso_ev_correction,
+                video->llrawproc->diso_black_delta, video->llrawproc->diso_pattern);
+}
+
+struct WarmPlayVariant
+{
+    const char * name;
+    int autoCorrection;
+    bool pausedRenderFirst;
+};
+
+// One variant on one frame: the warm (PlaybackReconWarmRun.h) then a Play-shaped frame-0 run on the same recon worker
+// state. Returns the number of dumped files (plus the retained output) that differ.
+int warmThenPlayDifferences(const WarmPlayVariant & variant, const std::string & root)
+{
+    const uint64_t kFrame = 1;
+    GpuReconEnv env(true);
+    MlvPipelineFixture fixture;
+    if (!openGpuEligibleFixture(fixture)) return 1000;
+    mlvObject_t * video = fixture.video();
+    video->llrawproc->diso_auto_correction = variant.autoCorrection;
+    video->llrawproc->diso_ev_correction = 1;
+    video->llrawproc->diso_black_delta = -1;
+    printSharedSeeds(variant.name, "start", video);
+    if (variant.pausedRenderFirst)
+    {
+        if (fixture.renderFrame8(kFrame).empty()) return 1000;
+        printSharedSeeds(variant.name, "after-paused-render", video);
+    }
+    const FakeGpuBackendScope fake;
+    WorkerState reconWorker;
+    const std::string warmDir = root + "/" + variant.name + "/warm";
+    const std::string playDir = root + "/" + variant.name + "/play";
+    QDir().mkpath(QString::fromStdString(warmDir));
+    QDir().mkpath(QString::fromStdString(playDir));
+
+    std::vector<uint16_t> raw;
+    std::vector<uint16_t> reduced;
+    GPU_DUALISO_TEST_SETENV("MLVAPP_FAKE_GPU_RECON_DUMP_DIR", warmDir.c_str());
+    const playback_recon_warm_run::Outcome warm = playback_recon_warm_run::run(
+        video, static_cast<uint32_t>(kFrame), 1, fixture.width(), fixture.height(), &reconWorker.state, 1, raw,
+        reduced);
+    GPU_DUALISO_TEST_UNSETENV("MLVAPP_FAKE_GPU_RECON_DUMP_DIR");
+    std::printf("[warm-recon-determinism] %s warm ran=%d reason=%s rc=%d %dx%d\n", variant.name, warm.ran ? 1 : 0,
+                playback_recon_warm_run::reasonName(warm.reason), warm.backendRc, warm.width, warm.height);
+    printSharedSeeds(variant.name, "after-warm", video);
+    if (!warm.ran) return 1000;
+    // the fake's retain hands out one shared pointer: copy the warm's words before Play overwrites them
+    const size_t words = static_cast<size_t>(warm.width) * static_cast<size_t>(warm.height);
+    const std::vector<uint16_t> warmOut(warm.retained.device_bayer16, warm.retained.device_bayer16 + words);
+    llrpGpuPlaybackReconReleaseRetainedDeviceBayer16(warm.retained.token);
+
+    GPU_DUALISO_TEST_SETENV("MLVAPP_FAKE_GPU_RECON_DUMP_DIR", playDir.c_str());
+    const llrpGpuPlaybackRetainedDeviceBayer16_t play = playShapedX1Run(fixture, kFrame, &reconWorker.state);
+    GPU_DUALISO_TEST_UNSETENV("MLVAPP_FAKE_GPU_RECON_DUMP_DIR");
+    printSharedSeeds(variant.name, "after-play", video);
+    if (!play.valid || !play.device_bayer16) return 1000;
+    const std::vector<uint16_t> playOut(play.device_bayer16,
+                                        play.device_bayer16 + static_cast<size_t>(play.width) * play.height);
+    llrpGpuPlaybackReconReleaseRetainedDeviceBayer16(play.token);
+
+    int differences = 0;
+    for (const char * name : { "in.u16", "raw2ev.i32", "ev2raw.i32", "mix_curve.f64", "fullres_curve.f64",
+                               "randn05.f32", "scalars.txt" })
+    {
+        if (!warmAndPlayDumpsEqual(variant.name, warmDir, playDir, name)) ++differences;
+    }
+    if (warmOut != playOut)
+    {
+        size_t first = 0;
+        size_t differing = 0;
+        for (size_t i = 0; i < std::min(warmOut.size(), playOut.size()); ++i)
+        {
+            if (warmOut[i] == playOut[i]) continue;
+            if (differing == 0) first = i;
+            ++differing;
+        }
+        std::printf("[warm-recon-determinism] %s retained MISMATCH words warm=%zu play=%zu differing=%zu first=%zu\n",
+                    variant.name, warmOut.size(), playOut.size(), differing, first);
+        ++differences;
+    }
+    else
+    {
+        std::printf("[warm-recon-determinism] %s retained identical (%zu words)\n", variant.name, warmOut.size());
+    }
+    std::printf("[warm-recon-determinism] %s RESULT %s differences=%d\n", variant.name,
+                differences ? "DIFFER" : "IDENTICAL", differences);
+    return differences;
+}
+
+} // namespace
+
+TEST(GpuPlaybackReconWarmRun, TheWarmAndPlayFrameZeroHandTheBackendTheSameBytes)
+{
+    QTemporaryDir dumps;
+    ASSERT_TRUE(dumps.isValid());
+    const std::string root = dumps.path().toStdString();
+    const WarmPlayVariant variants[] = {
+        { "V1-warm-first", -2, false },
+        { "V2-paused-render-first", -2, true },
+        { "V3-iso-ratio", -1, false },
+    };
+    int failed = 0;
+    for (const WarmPlayVariant & variant : variants)
+    {
+        if (warmThenPlayDifferences(variant, root) != 0) ++failed;
+    }
+    ASSERT_EQ(0, failed);
+}
+
+// T-B guard: the warm decodes with getMlvRawFrameUint16Uncached, Play through the LJ92 prefetch ring. The same frame
+// must come back as the same words. Hypothesis (b) of the successor note; a guard, not the RED.
+TEST(GpuPlaybackReconWarmRun, TheUncachedDecodeEqualsAPrefetchRingHit)
+{
+    {
+        MlvPipelineFixture fixture;
+        ASSERT_TRUE(openGpuEligibleFixture(fixture));
+        mlvObject_t * video = fixture.video();
+        const bool lj92 = (video->MLVI.videoClass & MLV_VIDEO_CLASS_FLAG_LJ92) != 0;
+        const size_t words = static_cast<size_t>(fixture.width()) * static_cast<size_t>(fixture.height());
+        std::vector<uint16_t> uncached(words);
+        std::vector<uint16_t> cached(words);
+        ASSERT_EQ(0, getMlvRawFrameUint16Uncached(video, 1, uncached.data()));
+        ASSERT_EQ(0, getMlvRawFrameUint16(video, 1, cached.data()));
+        std::printf("[warm-recon-determinism] T-B tiny_dual_iso lj92=%d (%s) source=%s equal=%d\n", lj92 ? 1 : 0,
+                    lj92 ? "ring possible" : "not LJ92: no prefetch ring, the guard is the direct decode only",
+                    mlvRawUint16SourceName(getMlvLastRawUint16Source()), uncached == cached ? 1 : 0);
+        ASSERT_TRUE(uncached == cached);
+    }
+    // An LJ92 clip with the ring armed: read the frame before, let the worker prefetch ahead, then read a ring hit.
+    mlvSetPlaybackAggressivePreviewMode(0);
+    processingSetPlaybackPreviewMode(0);
+    MlvPipelineFixture fixture;
+    QString error;
+    ASSERT_TRUE(fixture.openClipFile(repo_file_path(QStringLiteral("tests/fixtures/clips/large_dual_iso.mlv")), &error));
+    mlvObject_t * video = fixture.video();
+    video->playback_scale_factor_active = 1;
+    ASSERT_TRUE((video->MLVI.videoClass & MLV_VIDEO_CLASS_FLAG_LJ92) != 0);
+    ASSERT_EQ(1, mlvRawUint16PrefetchAllowedForTesting(video));
+    const size_t words = static_cast<size_t>(fixture.width()) * static_cast<size_t>(fixture.height());
+    std::vector<uint16_t> uncached(words);
+    std::vector<uint16_t> cached(words);
+    mlvCancelPreviewPrefetch(video);
+    ASSERT_EQ(0, getMlvRawFrameUint16(video, 1, cached.data()));   // arms the ring: frames 2.. are prefetched
+    ASSERT_TRUE(mlvWaitForRawUint16PrefetchIdleForTesting(video, 10000));
+    ASSERT_EQ(0, getMlvRawFrameUint16(video, 2, cached.data()));
+    const int source = getMlvLastRawUint16Source();
+    ASSERT_EQ(0, getMlvRawFrameUint16Uncached(video, 2, uncached.data()));
+    std::printf("[warm-recon-determinism] T-B large_dual_iso frame 2 source=%s equal=%d\n",
+                mlvRawUint16SourceName(source), uncached == cached ? 1 : 0);
+    ASSERT_TRUE(source == MLV_RAW_UINT16_SOURCE_HIT || source == MLV_RAW_UINT16_SOURCE_INFLIGHT_WAIT_HIT);
+    ASSERT_TRUE(uncached == cached);
+    mlvCancelPreviewPrefetch(video);
 }

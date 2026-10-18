@@ -895,3 +895,110 @@ TEST(PlaybackWarmOutputReuseWiring, TheFirstPresentSplitReadsTheReuseAndAReusedF
     // the warm line carries the capture outcome
     ASSERT_TRUE(source.contains(QStringLiteral("+ playback_warm_output_reuse::captureField( reuseCapture );")));
 }
+
+// PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1. Code lines only (the comments around these sites name the calls).
+namespace {
+
+QString codeLinesOnly(const QString & body)
+{
+    QStringList kept;
+    for (const QString & line : body.split(QLatin1Char('\n')))
+    {
+        const QString t = line.trimmed();
+        if (t.startsWith(QStringLiteral("//")) || t.startsWith(QStringLiteral("/*")) || t.startsWith(QStringLiteral("*")))
+            continue;
+        kept << line;
+    }
+    return kept.join(QLatin1Char('\n'));
+}
+
+} // namespace
+
+// T-C (hypothesis (c)): the retained copy is a device-to-device cudaMemcpy, which returns before the copy completes and
+// runs on the legacy default stream; every reader of the retained pointer (the AMaZE streams, the capture and the
+// compare) is cudaStreamNonBlocking and so is not ordered after it. The copy must be host-complete before the pointer
+// is handed out, through the launch-timing ledger and the error-slot noting CK.
+TEST(PlaybackWarmReconDeterminismWiring, TheRetainedCopyIsHostCompleteBeforeItsPointerIsHandedOut)
+{
+    const QString cu = sourceFile("tools/gpu/backend/igpu_recon_cuda.cu");
+    const QString body = codeLinesOnly(bodyBetween(cu, QStringLiteral("int igpu_recon_retain_last_device_output(igpu_recon_backend* b,"),
+                                                   QStringLiteral("int igpu_recon_release_retained_device_output(igpu_recon_backend* b,")));
+    ASSERT_FALSE(body.isEmpty());
+    const int copy = body.indexOf(QStringLiteral("cudaMemcpyDeviceToDevice"));
+    const int handed = body.indexOf(QStringLiteral("*device_bayer16 = b->retained_device_output[slot];"));
+    ASSERT_TRUE(copy >= 0);
+    ASSERT_TRUE(handed > copy);
+    const QString between = body.mid(copy, handed - copy);
+    const bool hostComplete = between.contains(QStringLiteral("cudaEventSynchronize("))
+                           || between.contains(QStringLiteral("cudaStreamSynchronize("));
+    ASSERT_TRUE(hostComplete);
+    ASSERT_TRUE(between.contains(QStringLiteral("CK(IGPU_LT_SYNC_CALL(\"retain:")));
+}
+
+// F-key: the prepared recon state travels with the warm key and the present's key, and is compared before the compare.
+TEST(PlaybackWarmReconDeterminismWiring, ThePreparedStateIsReadBeforeTheRestoreAndKeysBothSides)
+{
+    const QString core = sourceFile("platform/qt/PlaybackReconWarmRun.h");
+    const int apply = core.indexOf(QStringLiteral("applyLLRawProcObjectWorker( video, raw.data()"));
+    const int read = core.indexOf(QStringLiteral("llrpGpuPlaybackReconGetLastPreparedState( &prepared )"));
+    const int stamped = core.indexOf(QStringLiteral("prepared.frame_id = frame;"));
+    const int restore = core.indexOf(QStringLiteral("llrpGpuPlaybackReconRestoreLastRunState( saved );"));
+    ASSERT_TRUE(apply >= 0);
+    ASSERT_TRUE(read > apply);
+    ASSERT_TRUE(stamped > read);
+    ASSERT_TRUE(restore > stamped);
+    const QString main = sourceFile("platform/qt/MainWindow.cpp");
+    ASSERT_TRUE(main.contains(QStringLiteral("const playback_warm_output_reuse::PreparedState warmState = "
+                                             "playback_warm_output_reuse::preparedStateFrom( outcome.prepared );")));
+    ASSERT_TRUE(main.contains(QStringLiteral("&reuseCapture, &warmState );")));
+    const QString window = sourceFile("platform/qt/GpuDisplayWindow.cpp");
+    const QString warm = bodyBetween(window, QStringLiteral("bool GpuDisplayWindow::warmStagedReconSlotFromDeviceBayer16(const uint16_t"),
+                                     QStringLiteral("bool GpuDisplayWindow::prewarmPlaybackReconRoute(int texWidth"));
+    ASSERT_TRUE(warm.contains(QStringLiteral("if ( warmState ) key.state = *warmState;")));
+    const QString present = bodyBetween(window, QStringLiteral("bool GpuDisplayWindow::setPresentedGpuPlaybackReconAmazePostWbTexture("),
+                                        QStringLiteral("double GpuDisplayWindow::verifyWarmOutputReuse("));
+    const int presentState = present.indexOf(QStringLiteral("presentKey.state = playback_warm_output_reuse::preparedStateFrom( *state );"));
+    const int gate = present.indexOf(QStringLiteral("playback_warm_output_reuse::Reason reuseReason = playback_warm_output_reuse::preGate("));
+    const int compare = present.indexOf(QStringLiteral("gpuAmazeDebayerInputBayer16MatchesCapture("));
+    const int states = present.indexOf(QStringLiteral("setupTiming.reuse_states = playback_warm_output_reuse::stateFields( reuseReason, warmKey, presentKey );"));
+    ASSERT_TRUE(presentState >= 0);
+    ASSERT_TRUE(gate > presentState);
+    ASSERT_TRUE(compare > gate);
+    ASSERT_TRUE(states > compare);
+    // the states reach the first-present split: written once, read once
+    ASSERT_EQ(2, (int)main.count(QStringLiteral("\"gpu_playback_recon_texture_present_reuse_states\"")));
+    ASSERT_TRUE(main.contains(QStringLiteral("fp.reuseStates = telemetryStringValue( t, \"gpu_playback_recon_texture_present_reuse_states\" );")));
+}
+
+// F-diag: the miss dump is opt-in. Nothing under it runs unless MLVAPP_PLAYBACK_WARM_REUSE_MISS_DUMP_DIR is set, and it
+// runs only on a content miss, before the capture is released (the dump reads it).
+TEST(PlaybackWarmReconDeterminismWiring, TheMissDumpRunsOnlyWithItsEnvAndOnlyOnAContentMiss)
+{
+    const QString window = sourceFile("platform/qt/GpuDisplayWindow.cpp");
+    ASSERT_EQ(1, (int)window.count(QStringLiteral("qgetenv( \"MLVAPP_PLAYBACK_WARM_REUSE_MISS_DUMP_DIR\" )")));
+    const QString dump = bodyBetween(window, QStringLiteral("void GpuDisplayWindow::dumpWarmOutputReuseMiss("),
+                                     QStringLiteral("\n}\n"));
+    ASSERT_FALSE(dump.isEmpty());
+    const QString code = codeLinesOnly(dump);
+    const int env = code.indexOf(QStringLiteral("const QString dir = warmOutputReuseMissDumpDir();"));
+    const int gate = code.indexOf(QStringLiteral("if ( dir.isEmpty() ) return;"));
+    const int download = code.indexOf(QStringLiteral("gpuAmazeDebayerDownloadBayer16ForDiagnostics("));
+    ASSERT_TRUE(env >= 0);
+    ASSERT_TRUE(gate > env);
+    ASSERT_TRUE(download > gate);
+    const QString present = bodyBetween(window, QStringLiteral("bool GpuDisplayWindow::setPresentedGpuPlaybackReconAmazePostWbTexture("),
+                                        QStringLiteral("double GpuDisplayWindow::verifyWarmOutputReuse("));
+    const int onMiss = present.indexOf(QStringLiteral("if ( reuseReason == playback_warm_output_reuse::Reason::ContentMismatch )"));
+    const int called = present.indexOf(QStringLiteral("dumpWarmOutputReuseMiss( deviceBayer16, texWidth, texHeight, warmKey, presentKey );"));
+    const int released = present.indexOf(QStringLiteral("if ( warmKey.valid ) gpuAmazeDebayerReleaseInputCapture();"));
+    ASSERT_TRUE(onMiss >= 0);
+    ASSERT_TRUE(called > onMiss);
+    ASSERT_TRUE(released > called);
+    // the backend export is optional, and like the capture it never loads the DLL and re-checks the loss flag
+    const QString debayer = sourceFile("platform/qt/GpuDebayer.cpp");
+    ASSERT_TRUE(debayer.contains(QStringLiteral("runtime.library.resolve(\"igpu_amaze_debayer_download_bayer16\")")));
+    ASSERT_TRUE(debayer.contains(QStringLiteral(
+        "const bool mayDownload = enterAmazeRunUnlessCudaSuppressed(&live.runtime, GpuFieldTelemetry::enabled());")));
+    ASSERT_TRUE(sourceFile("tools/gpu/backend/igpu_amaze_debayer_cuda.def").contains(
+        QStringLiteral("    igpu_amaze_debayer_download_bayer16\n")));
+}
