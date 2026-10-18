@@ -1724,8 +1724,11 @@ private:
     void onPlaybackSmokeApplicationStateChanged( Qt::ApplicationState state );
     void enqueuePlaybackPrepTask( const PlaybackPrepTask &task );
     void invalidatePlaybackPrepForDisplayChange( const char *reason );
-    void drainPlaybackPrepInFlight( const char *reason, int timeoutMs );
-    void waitForRenderThreadIdleBeforeCoreMutation( const char *reason );
+    PlaybackPrepDrainOutcome drainPlaybackPrepInFlight( const char *reason, int timeoutMs );
+    // Returns playbackPrepBorrowFreeingMutationAllowed for its drain: a caller that
+    // then frees memory a prep task borrows must abort on false.
+    bool waitForRenderThreadIdleBeforeCoreMutation( const char *reason );
+    bool playbackPrepQuiescentBeforeClipReplacement( const char *reason );
     struct PlaybackPrepThreadState;
     PlaybackPrepResult buildPlaybackPrepResult( const PlaybackPrepTask &task,
                                                 PlaybackPrepThreadState *threadState = nullptr );
@@ -1777,7 +1780,7 @@ private:
     void initPlaybackPreviewModeFromSettings( void );
     void initPlaybackPreviewResolutionFromSettings( void );
     void drainLookAssistWorkers( const char *reason );
-    void freeActiveMlvObjectAfterLifecycleBarrier( const char *reason );
+    bool freeActiveMlvObjectAfterLifecycleBarrier( const char *reason );
     void initPlaybackScaleFactorFromSettings( void );
     void seedPlaybackQualityActiveStateForCurrentContext( void );
     void resetPlaybackQualityAutoRunState( void );
