@@ -171,6 +171,23 @@ try {
     Check ($stop.Count -eq 1 -and $stop[0].job -eq 'k-1' -and @($stop[0].remainingMembers) -contains 'outbox\k-1.result.json') 'manifest carries a stopped row naming the partial job'
     Remove-Root
 
+    # --- sol r3 blocker: a claim that comes AND GOES between two member moves, leaving a young record behind
+    New-Root
+    New-Entry 'processed\t-1.job.ps1' 60; New-Entry 'outbox\t-1.result.json' 60
+    $hr = $root
+    $transient = {
+        param($m)
+        if ($m.entry.Name -eq 't-1.job.ps1') {
+            $mk = Join-Path $hr 'running\t-1.started.json'
+            Set-Content $mk 'x'; Remove-Item -LiteralPath $mk
+            Set-Content (Join-Path $hr 'processed\t-1.started.completed.json') 'x'
+        }
+    }.GetNewClosure()
+    $out = & $rot -AgentShare $root -OlderThanDays 30 -NowUtc $now -Apply -TestHookBeforeMove $transient | Out-String | ConvertFrom-Json
+    Check ($LASTEXITCODE -eq 3 -and $out.stoppedOn.step -eq 'changed' -and $out.stoppedOn.error -match 'membership changed|new member') "claim lifecycle between moves stops with step=changed (exit $LASTEXITCODE, why '$($out.stoppedOn.error)')"
+    Check ((Has 'outbox\t-1.result.json') -and (Has 'processed\t-1.started.completed.json')) 'remaining planned member and the new young record stay live'
+    Remove-Root
+
     # --- failed done row after a successful rename (sol r1 hardening): stop, report the moved member
     New-Root
     New-Entry 'processed\d-1.job.ps1' 60

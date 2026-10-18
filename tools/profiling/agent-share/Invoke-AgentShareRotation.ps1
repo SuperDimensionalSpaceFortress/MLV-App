@@ -19,8 +19,10 @@ Rules:
 - The plan is a snapshot, so -Apply RE-VALIDATES each job just before moving it: the job's members in
   processed\ and outbox\ are re-listed and must be the same names with the same LastWriteTimeUtc, all still
   older than the cutoff, and no entry for the job may have appeared in inbox\, running\, orphaned\ or cancel\.
-  Immediately before EACH member's own rename the live directories are probed again for the job (so a claim that
-  appears mid-job is caught) and the member is re-stat'ed. Any difference skips the WHOLE job
+  Immediately before EACH member's own rename that whole-job check runs again over the not-yet-moved members (so a
+  claim that appears mid-job is caught, and so is one that came and went but left a new or rewritten member), and
+  the member is re-stat'ed. A claim that appears and vanishes between two checks leaving nothing behind cannot be
+  seen by any re-check; it also leaves nothing to protect. Any difference skips the WHOLE job
   (stats.changedSinceScan); if it is detected after some members already moved, the run stops (exit 3,
   step=changed), the remaining members stay live, and a "stopped" manifest row names the partial job with its
   moved and remaining members. The residual window is the milliseconds between that probe and the rename.
@@ -158,12 +160,17 @@ function Get-JobEntriesNow([string]$key, [string[]]$dirs) {
     }
 }
 
-function Get-JobChange($c) {
-    # $null when the job is exactly as planned; otherwise why it is not.
+function Get-JobChange($c, [string[]]$moved = @()) {
+    # $null when the job is exactly as planned; otherwise why it is not. Run before the job's first rename AND before
+    # every later one, so a claim that came and went between two renames is still caught by what it left behind
+    # (a new or rewritten member). $moved = the members this run already renamed, which are expected to be gone.
     $liveNow = @(Get-JobEntriesNow $c.key @('inbox', 'running', 'orphaned', 'cancel'))
     if ($liveNow.Count) { return "live entry appeared: $($liveNow[0].dir)\$($liveNow[0].entry.Name)" }
     $planned = @{}
-    foreach ($m in $c.members) { $planned["$($m.dir)\$($m.entry.Name)"] = $m.plannedUtc }
+    foreach ($m in $c.members) {
+        $id = "$($m.dir)\$($m.entry.Name)"
+        if ($id -notin $moved) { $planned[$id] = $m.plannedUtc }
+    }
     $current = @(Get-JobEntriesNow $c.key $rotated)
     if ($current.Count -ne $planned.Count) { return "membership changed: planned $($planned.Count), now $($current.Count)" }
     foreach ($n in $current) {
@@ -175,11 +182,12 @@ function Get-JobChange($c) {
     return $null
 }
 
-function Get-MemberChange($c, $m) {
-    # Immediately before ONE member's rename: no live claim may have appeared for the job (every inbox/running/
-    # orphaned/cancel shape, nonce .tmp markers included), and the member must be unchanged since the scan.
-    $liveNow = @(Get-JobEntriesNow $c.key @('inbox', 'running', 'orphaned', 'cancel'))
-    if ($liveNow.Count) { return "live entry appeared: $($liveNow[0].dir)\$($liveNow[0].entry.Name)" }
+function Get-MemberChange($c, $m, [string[]]$moved) {
+    # Immediately before ONE member's rename: the WHOLE job is re-validated (no live claim in any inbox/running/
+    # orphaned/cancel shape, nonce .tmp markers included; the not-yet-moved members are exactly the planned ones with
+    # their planned times, all older than the cutoff; nothing new has appeared), then the member itself is re-stat'ed.
+    $why = Get-JobChange $c $moved
+    if ($why) { return $why }
     $m.entry.Refresh()
     if (-not $m.entry.Exists) { return "vanished since scan" }
     if ($m.entry.LastWriteTimeUtc -ne $m.plannedUtc) { return "rewritten since scan" }
@@ -217,7 +225,7 @@ if ($Apply -and $plan.Count) {
             continue jobs
         }
         foreach ($m in $c.members) {
-            $why = Get-MemberChange $c $m
+            $why = Get-MemberChange $c $m $movedHere
             if ($why) {
                 if (-not $movedHere.Count) {
                     $stats.changedSinceScan++
