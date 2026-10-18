@@ -194,7 +194,16 @@ if ($Apply -and $plan.Count) {
     try {
         $lock = [IO.FileStream]::new($lockPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None, 4096, [IO.FileOptions]::DeleteOnClose)
     } catch {
-        throw "ROTATION_LOCKED $lockPath exists: another -Apply run holds this share (or a crashed one left it; check before removing it by hand)"
+        # Only "file exists" (Win32 80, or 183) means another run holds the lock; anything else (access denied, share
+        # unreachable) is a different failure and says so. DeleteOnClose removes the file when the holder's handle closes,
+        # including on a crash; only a lost SMB session can leave it until the server times that session out.
+        $ex = $_.Exception
+        while ($ex.InnerException) { $ex = $ex.InnerException }
+        $code = $ex.HResult -band 0xFFFF
+        if ($ex -is [IO.IOException] -and $code -in 80, 183) {
+            throw "ROTATION_LOCKED $lockPath exists: another -Apply run holds this share (a lost SMB session can leave it until the server times the session out)"
+        }
+        throw "ROTATION_LOCK_FAILED ${lockPath}: $($ex.Message)"
     }
     try {
     foreach ($c in $plan) { foreach ($m in $c.members) { $m | Add-Member -NotePropertyName plannedUtc -NotePropertyValue $m.entry.LastWriteTimeUtc -Force } }
