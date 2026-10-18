@@ -6789,7 +6789,8 @@ def write_visual_captures(dest: Path, mode: str = "ok") -> None:
     full-quality frame has another red level). PLAYBACK-FROZEN-DISPLAY-SOURCE-DIFF-1 modes: frozen (the app records source_difference "differ"),
     frozen-unknown (it records nothing), frozen-identical (it records "identical": a static clip), noviewport (a ticking-chrome frozen picture whose
     visual.json carries no viewport rectangle), frozen-partial (frozen + "differ", but play frame 5 alone carries no viewport rectangle),
-    frozen-upper-differ / frozen-upper-identical (the same record in the wrong case: "DIFFER" / "IDENTICAL")."""
+    frozen-upper-differ / frozen-upper-identical (the same record in the wrong case: "DIFFER" / "IDENTICAL"), partial-ok (six distinct pictures, but play
+    frame 5 alone carries no viewport rectangle: a plain OK with a not-judged note)."""
     if dest.exists():
         shutil.rmtree(dest)
     dest.mkdir(parents=True)
@@ -6806,7 +6807,7 @@ def write_visual_captures(dest: Path, mode: str = "ok") -> None:
     proc = run_pwsh(["-Command", VISUAL_PNG_PS + "\n".join(calls)])
     assert proc.returncode == 0, proc.stdout + proc.stderr
     frames = [{"kind": "play", "index": k, "file": f"play-{k}.png", "display_frame": 600 + 2 * k, "serial": 900 + k, "play_active": True,
-               "tail_elapsed_ms": 250 + 500 * k, "capture_ms": 40.0, "viewport": (None if mode == "frozen-partial" and k == 5 else viewport), "saved": True, "reason": ""}
+               "tail_elapsed_ms": 250 + 500 * k, "capture_ms": 40.0, "viewport": (None if mode in ("frozen-partial", "partial-ok") and k == 5 else viewport), "saved": True, "reason": ""}
               for k in range(6)]
     frames.append({"kind": "stop", "index": 0, "file": "stop.png", "display_frame": 612, "play_active": False, "viewport": viewport, "saved": True, "reason": ""})
     frames.append({"kind": "paused", "index": 0, "file": "paused.png", "display_frame": 612, "settled": True, "settled_frame": 612, "play_active": False,
@@ -7225,6 +7226,41 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
                     note_at = out["reason"].find("1 saved play frame(s) have no usable viewport rectangle and were not judged")
                     self.assertGreaterEqual(frozen_at, 0, out["reason"])
                     self.assertGreater(note_at, frozen_at, out["reason"])
+
+    def test_a_strip_that_cannot_be_composed_keeps_every_other_reason(self) -> None:
+        """CoS #474 N5: the strip failure used to be overwritten by any verdict reason, and on a plain OK it replaced the not-judged note. The reasons are
+        composed `<verdict reason>; <not-judged note>; <strip failure>`: none is dropped. The strip is made to fail by a directory sitting where its PNG goes."""
+        strip_failure = "the strip could not be composed"
+        not_judged = "1 saved play frame(s) have no usable viewport rectangle and were not judged"
+        # mode, verdict, texts that must all appear, in this order
+        for mode, verdict, texts in (("frozen", "FROZEN_DISPLAY", ["show ONE picture", strip_failure]),
+                                     ("frozen-partial", "FROZEN_DISPLAY", ["show ONE picture", not_judged, strip_failure]),
+                                     ("partial-ok", "OK", [not_judged, strip_failure]),
+                                     ("ok", "OK", [strip_failure])):
+            with self.subTest(mode), tempfile.TemporaryDirectory(prefix=f"vis-strip-{mode}-") as d:
+                art = Path(d) / "artifacts"
+                write_visual_captures(art / "visual", mode)
+                ev = Path(d) / "evidence"
+                (ev / "visual" / "unit-leg-strip.png").mkdir(parents=True)
+                proc, out = run_pwsh_json(f"Read-DvVisualCaptures -Requested $true -ArtifactsDir '{art}' -EvidenceDir '{ev}' -LegId 'unit-leg' -Header 'unit' | ConvertTo-Json -Depth 8 -Compress")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(out["verdict"], verdict, out["reason"])
+                self.assertIsNone(out["stripPath"])
+                at = [out["reason"].find(text) for text in texts]
+                self.assertTrue(all(i >= 0 for i in at), out["reason"])
+                self.assertEqual(at, sorted(at), out["reason"])
+
+    def test_a_strip_that_composes_leaves_the_reason_as_it_was(self) -> None:
+        """CoS #474 N5 (no change when the strip is fine): no strip text is added, and the partial-ok note stays the whole reason."""
+        for mode, reason in (("ok", None), ("partial-ok", "1 saved play frame(s) have no usable viewport rectangle and were not judged; the other 5 were")):
+            with self.subTest(mode), tempfile.TemporaryDirectory(prefix=f"vis-strip-ok-{mode}-") as d:
+                art = Path(d) / "artifacts"
+                write_visual_captures(art / "visual", mode)
+                ev = Path(d) / "evidence"
+                proc, out = run_pwsh_json(f"Read-DvVisualCaptures -Requested $true -ArtifactsDir '{art}' -EvidenceDir '{ev}' -LegId 'unit-leg' -Header 'unit' | ConvertTo-Json -Depth 8 -Compress")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual((out["verdict"], out["reason"]), ("OK", reason))
+                self.assertTrue(Path(out["stripPath"]).is_file())
 
     def test_a_visual_reader_without_a_published_directory_says_not_captured(self) -> None:
         with tempfile.TemporaryDirectory(prefix="vis-none-") as d:
