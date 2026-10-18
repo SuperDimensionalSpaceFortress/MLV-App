@@ -90,8 +90,11 @@ maintained in this format.
     frame, or after 400 ms at most. Nothing runs while paused, and it never
     keeps the GPU clocks up while idle. The CPU route never touches CUDA for
     it.
-  - `MLVAPP_PLAYBACK_GPU_CLOCK_KICK` (default on, same values as
-    `MLVAPP_PLAYBACK_ROUTE_PREWARM`) turns it off.
+  - `MLVAPP_PLAYBACK_GPU_CLOCK_KICK` (default off, same values as
+    `MLVAPP_PLAYBACK_ROUTE_PREWARM`) turns it on. It shipped default on and
+    was switched to default off before release
+    (PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1), so a Play
+    wakes the GPU only when this is set to `1`.
   - The paused warm, the route warm and the first four debayers of each Play
     now read the GPU clock in-process (never through NVML) and time the
     debayer on the GPU. The `playback_route_prewarm`, `playback_recon_warm`

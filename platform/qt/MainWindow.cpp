@@ -265,11 +265,12 @@ static bool mlvappPlaybackReconWarmRunDisabled()
     return disabled;
 }
 
-// PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row K switch, read once: MLVAPP_PLAYBACK_GPU_CLOCK_KICK=0 starts no
-// Play-start GPU clock kick (PlaybackGpuClockKickPolicy.h). Default on.
+// PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row K switch, read once: the Play-start GPU clock kick
+// (PlaybackGpuClockKickPolicy.h). Default off; MLVAPP_PLAYBACK_GPU_CLOCK_KICK=1 opts in (HUB RULING
+// 2026-10-18T06:16:26Z item (1), applied by PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1 R0).
 static bool mlvappPlaybackGpuClockKickDisabled()
 {
-    static const bool disabled = !playbackEnvSwitch( "MLVAPP_PLAYBACK_GPU_CLOCK_KICK", true );
+    static const bool disabled = !playbackEnvSwitch( "MLVAPP_PLAYBACK_GPU_CLOCK_KICK", false );
     return disabled;
 }
 

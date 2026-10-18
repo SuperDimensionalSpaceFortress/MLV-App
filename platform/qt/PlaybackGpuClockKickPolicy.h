@@ -11,7 +11,8 @@
  * before its AMaZE starts, sampling (%globaltimer, clock64, %smid) every ~5 ms. Frame 0's
  * AMaZE drain raises its stop flag; MainWindow collects it at the first present, Play stop, a clip change, a device
  * loss, the window going away or the deadline. Zero cost while paused; it never keeps clocks up while idle.
- * MLVAPP_PLAYBACK_GPU_CLOCK_KICK=0 turns it off.
+ * Default off since the HUB RULING of 2026-10-18T06:16:26Z item (1): MLVAPP_PLAYBACK_GPU_CLOCK_KICK=1 opts in
+ * (=0, or unset, leaves it off).
  *
  *   playback_gpu_clock_kick session=N decision=<run|skip> reason=<name> max_ms= ran_ms= samples= mhz_first=
  *   mhz_at_amaze0= mhz_last= ramp_ms_to_80pct= stopped_by=<deadline|end|amaze_drain|pending|none>

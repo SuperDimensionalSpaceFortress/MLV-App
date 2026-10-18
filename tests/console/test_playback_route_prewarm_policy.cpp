@@ -491,6 +491,9 @@ TEST(PlaybackGpuClockKickWiring, PlayStartsTheKickBeforeThePlayStartFrameRequest
 {
     const QString source = sourceFile("platform/qt/MainWindow.cpp");
     ASSERT_TRUE(source.contains(QStringLiteral(
+        "static const bool disabled = !playbackEnvSwitch( \"MLVAPP_PLAYBACK_GPU_CLOCK_KICK\", false );")));
+    // HUB RULING 2026-10-18T06:16:26Z item (1): the kick defaults OFF (=1 opts in); the default-on literal is gone
+    ASSERT_FALSE(source.contains(QStringLiteral(
         "static const bool disabled = !playbackEnvSwitch( \"MLVAPP_PLAYBACK_GPU_CLOCK_KICK\", true );")));
     const QString toggled = bodyBetween(source, QStringLiteral("void MainWindow::on_actionPlay_toggled(bool checked)"),
                                         QStringLiteral("double MainWindow::playGateNativeFps() const"));
