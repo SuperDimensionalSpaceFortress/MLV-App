@@ -2373,6 +2373,16 @@
       "lines": [
         217
       ]
+    },
+    {
+      "path": "tests/pipeline/test_dual_iso_pipeline.cpp",
+      "anchor": "ASSERT_EQ ( 0 , doc . object ( ) . value ( QStringLiteral ( \"async_writer_debug_delay_ms\" ) ) . toInt ( - 1 ) ) ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "PIPELINE-DNG-ASYNC-WRITER-QUEUE-FILL-FLAKE-1 r2 strict-parse test: async_writer_debug_delay_ms is the parsed MLVAPP_CDNG_EXPORT_ASYNC_WRITER_DEBUG_DELAY_MS config value echoed into the profile, not a measured duration. The assert proves the malformed value '5garbage' parses as off (0) instead of a 5 ms delay; the -1 default makes a missing field fail. Run-proof for the frame is the ASSERT_EQ(0, saveDngFrameViaAsyncPayloadWriter/finishDngPayloadWriter) pair above.",
+      "lines": [
+        4726
+      ]
     }
   ]
 }
