@@ -62,6 +62,14 @@ HISTORICAL: dict[str, str] = {
     "docs/lane-prompts/v2/fields-PROD-TOOLCHAIN-1.md": _HISTORICAL_CARD,
     "docs/lane-prompts/v2/ratify-plan-OPUS.md": "historical: plan-ratification prompt of 2026-09",
     "docs/lane-prompts/v2/ratify-plan-SOL.md": "historical: plan-ratification prompt of 2026-09",
+    # HUB-TOOLS-TRACKED-1: the CoS open-ask scanner reads RECORDED bus headers (cos-feedback/mlv-app/pr-N.md) that were written
+    # before the transfer and still carry `repo: <old slug>`. Matching that name is its job (-RepoAlias), so the old slug IS the data
+    # here, exactly like repository_identity.py; it is never used to call GitHub (the scan passes -Repo, the new slug, to gh).
+    "tools/coordination/hub/cos-open-ask-scan.ps1": "recorded bus headers still carry the old repo name: the default -RepoAlias that keeps them scannable (gh is called with the new -Repo)",
+    "tools/coordination/hub/hub-profile.json": "repoAliases: the former repo name that recorded bus headers carry; ownerLogin/repoSlug name the live repo",
+    "tools/coordination/hub/Test-CosOpenAskScan.ps1": "fixtures of legacy bus headers (repo: <old slug>) that must stay scannable, plus the case-insensitive variant",
+    "tools/coordination/hub/cos-scan-fixtures-bus/pr-413.md": "verbatim copy of a recorded bus feedback file (the ledger's 14:28Z false-positive set); editing it would void the verbatim claim",
+    "tests/coordination/test_hub_cos_open_ask_scan.py": "passes the former repo name as -RepoAlias / header fixture to prove legacy bus headers still scan",
 }
 
 _HOOK_DEFERRAL = (
