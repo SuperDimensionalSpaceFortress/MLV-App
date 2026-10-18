@@ -27,3 +27,6 @@ tools/profiling/dual-venue/venues.json text eol=lf
 tests/coordination/fixtures/bus-validate-cards/*.mjs text eol=lf
 tools/coordination/doctrine_outbox.py text eol=lf
 doctrine-outbox.config.json text eol=lf
+factory-pins/pin-runner.py text eol=lf
+factory-pins/factory-pins.json text eol=lf
+tests/coordination/fixtures/factory-pins-bytes/*.txt text eol=lf
