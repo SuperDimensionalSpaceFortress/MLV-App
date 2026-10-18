@@ -127,19 +127,34 @@ def test_a_malformed_pins_file_is_reported():
         assert malformed(broken), "a broken pins file was accepted"
 
 
-def consumer(tmp_path: Path, pins: dict) -> tuple[Path, dict[str, str]]:
-    """A scratch consumer holding the vendored runner, `pins`, and a blob cache seeded from the fixtures."""
+def consumer(tmp_path: Path, pins: dict, seed_cache: bool = True) -> tuple[Path, dict[str, str]]:
+    """A scratch consumer holding the vendored runner and `pins` (its bus_clone list emptied, so no machine's
+    real bus clone can be found), plus a blob cache seeded from the fixtures unless `seed_cache` is False."""
     root = tmp_path / "consumer"
     (root / "factory-pins").mkdir(parents=True)
     shutil.copyfile(RUNNER, root / "factory-pins" / "pin-runner.py")
-    (root / "factory-pins" / "factory-pins.json").write_text(json.dumps(pins, indent=2) + "\n", encoding="utf-8")
+    scratch = dict(pins, bus_clone=[])
+    (root / "factory-pins" / "factory-pins.json").write_text(json.dumps(scratch, indent=2) + "\n", encoding="utf-8")
     cache = tmp_path / "cache"
     cache.mkdir()
-    for name, record in load_pins()["tools"].items():
-        (cache / record["blob"]).write_bytes(pinned_fixture(name, record))
+    if seed_cache:
+        for name, record in load_pins()["tools"].items():
+            (cache / record["blob"]).write_bytes(pinned_fixture(name, record))
     env = {k: v for k, v in os.environ.items() if k != "FACTORY_BUS_CLONE"}
     env.update(FACTORY_PINS_CACHE=str(cache), PYTHONUTF8="1")
     return root, env
+
+
+def scratch_bus(tmp_path: Path) -> Path:
+    """A throwaway git repo whose object store holds the pinned bytes: a bus clone without the real bus."""
+    bus = tmp_path / "bus"
+    bus.mkdir()
+    subprocess.run(["git", "init", "-q", str(bus)], check=True, timeout=60)
+    for name, record in load_pins()["tools"].items():
+        blob = subprocess.run(["git", "-C", str(bus), "hash-object", "-w", "--stdin"], input=pinned_fixture(name, record),
+                              capture_output=True, check=True, timeout=60).stdout.decode().strip()
+        assert blob == record["blob"], f"{name}: the fixture is not the pinned blob"
+    return bus
 
 
 def run_pinned(root: Path, env: dict[str, str], *args: str) -> subprocess.CompletedProcess:
@@ -157,6 +172,10 @@ def test_the_runner_executes_the_pinned_bytes_without_a_bus_clone(tmp_path):
 def test_the_runner_refuses_a_pin_whose_recorded_hash_is_tampered(tmp_path):
     tampered = load_pins()
     tampered["tools"]["check-doc-size"]["sha256"] = "0" * 64
-    root, env = consumer(tmp_path, tampered)
+    # An empty cache and a bus clone that DOES hold the pinned blob: the runner reads it, the recorded hash
+    # disagrees, and it REFUSES (exit 2) rather than run. Without a clone it would be UNAVAILABLE (exit 3).
+    root, env = consumer(tmp_path, tampered, seed_cache=False)
+    env["FACTORY_BUS_CLONE"] = str(scratch_bus(tmp_path))
     done = run_pinned(root, env, "--help")
     assert done.returncode == 2, (done.returncode, done.stdout, done.stderr)
+    assert "--config" not in done.stdout, "a pin whose hash does not match was executed"
