@@ -2587,12 +2587,18 @@ def route_secret_values(template: list[str], fills: dict[str, str]) -> list[str]
     return sorted(values, key=lambda v: (-len(v), v))
 
 
+def redact_secret_values(text: str, secrets: Iterable[str] = ()) -> str:
+    """`text` with every secret (route_secret_values) replaced by `<redacted>`, longest first, wherever it appears."""
+    for secret in sorted({x for x in secrets if x}, key=len, reverse=True):
+        text = text.replace(secret, "<redacted>")
+    return text
+
+
 def redact_route_text(text: str, secrets: Iterable[str] = ()) -> str:
     """Route text as shown to a person: a credential assignment keeps its name and loses its value
     (`GH_TOKEN=abc` -> `GH_TOKEN=<redacted>`), as do the value after `--token`/`--password` and the user-info of a URL.
     `secrets` (route_secret_values) are replaced first, longest first, wherever they appear and whatever they contain."""
-    for secret in sorted({x for x in secrets if x}, key=len, reverse=True):
-        text = text.replace(secret, "<redacted>")
+    text = redact_secret_values(text, secrets)
     text = ROUTE_CRED_ASSIGN_ANY_RE.sub(lambda m: f"{m.group('name')}=<redacted>", text)
     text = ROUTE_CRED_FLAG_RE.sub(lambda m: f"{m.group('flag')}{m.group('sep')}<redacted>", text)
     return ROUTE_URL_USERINFO_RE.sub(r"\1<redacted>@", text)
@@ -3035,12 +3041,19 @@ def exercise_route(command: str, cwd: pathlib.Path, timeout: float, fills: dict[
         argv = split_route(command)
     except ValueError as e:
         return "ROUTE_FAILED", f"does not parse as a command line: {e}"
-    # Fill after splitting, so a filled value (a Windows path with backslashes) is never re-parsed as shell text.
     secrets = route_secret_values(argv, fills)                          # decided on the template, before any value is substituted
-    argv = [ROUTE_PLACEHOLDER_RE.sub(lambda m: fills.get(m.group(1), m.group(0)), tok) for tok in argv]
-    unfilled = next((m for tok in argv if (m := ROUTE_PLACEHOLDER_RE.search(tok))), None)
-    if unfilled:
+    status, detail = _exercise_route_argv(argv, cwd, timeout, fills, bus, secrets)
+    return status, redact_secret_values(detail, secrets)                # the one choke point: no branch below can print a credential
+
+
+def _exercise_route_argv(argv: list[str], cwd: pathlib.Path, timeout: float, fills: dict[str, str],
+                         bus: pathlib.Path | None, secrets: list[str]) -> tuple[str, str]:
+    """exercise_route past the parse; its detail is redacted once by the caller (redact_secret_values)."""
+    unfilled = next((m for tok in argv for m in ROUTE_PLACEHOLDER_RE.finditer(tok) if m.group(1) not in fills), None)
+    if unfilled:                                                        # judged on the template: a filled value is never a placeholder
         return "ROUTE_FAILED", f"unfilled placeholder <{unfilled.group(1)}>; pass --fill {unfilled.group(1)}=VALUE"
+    # Fill after splitting, so a filled value (a Windows path with backslashes) is never re-parsed as shell text.
+    argv = [ROUTE_PLACEHOLDER_RE.sub(lambda m: fills[m.group(1)], tok) for tok in argv]
     unsafe = route_unsafe_reason(argv, cwd, bus, secrets)
     if unsafe:
         return "ROUTE_UNSAFE", unsafe

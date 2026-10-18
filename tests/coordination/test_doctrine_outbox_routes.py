@@ -517,6 +517,8 @@ def test_the_shipped_candidates_that_predate_the_rule_still_parse():
 #   M7  ROUTE_WRAPPERS emptied / _route_git_unsafe returns None       -> the RX-02 rows
 #   M8  bus_commits_behind_origin returns 0                           -> the RX-04 row
 #   M9  RULING_CANDIDATE_LEAD_RE without the bullet/quote prefix      -> the H6 rows
+# r4 (sol r3 RX-06): a credential fill with shell-operator / placeholder syntax, or in the program or script position,
+# is printed raw -> M10 exercise_route returns its detail without redact_secret_values -> the RX-06 rows
 # ====================================================================================================
 
 SENTINEL = "REVIEW_SENTINEL_NOT_A_SECRET_7f3a9"
@@ -962,6 +964,50 @@ def test_rx05_a_value_after_a_token_flag_is_redacted_whole(tmp_path):
 
 def test_rx05_a_fill_that_is_not_a_credential_is_left_alone(tmp_path):
     assert ob.route_secret_values(["python", "tools/x.py", "<branch>"], {"branch": "feature one"}) == []
+
+
+# ---------- r4 / RX-06: EVERY diagnostic of a route is redacted, not only the credential branch ----------
+# r3 redacted a credential fill in the whole-token branch and the failure tail only; the shell-operator reason, the
+# unfilled-placeholder reason and route_missing_reason printed the expanded token raw. exercise_route now redacts the
+# detail it returns once, and judges "unfilled" on the template. Mutation: drop that one call (or judge unfilled after the
+# fill) -> the RX-06 rows go red.
+
+RX06 = "RX06_SENTINEL"
+
+
+def test_rx06_a_credential_fill_that_looks_like_a_shell_operator_is_not_printed(tmp_path):
+    fills = {"label": ">" + RX06, "value": ">" + RX06}
+    status, detail = ob.exercise_route("python tools/x.py <label> DB_PASSWORD=<value>", tmp_path, 30, fills)
+    assert status == "ROUTE_UNSAFE" and RX06 not in detail, detail
+
+
+def test_rx06_a_credential_fill_that_looks_like_a_placeholder_is_not_printed(tmp_path):
+    status, detail = ob.exercise_route("DB_PASSWORD=<value> python tools/x.py", tmp_path, 30, {"value": f"<{RX06}>"})
+    assert status.startswith("ROUTE_") and status != "ROUTE_OK" and RX06 not in detail, detail
+    status, detail = ob.exercise_route("python tools/x.py <api_key>", tmp_path, 30, {"api_key": f"<{RX06}>"})
+    assert RX06 not in detail, detail
+
+
+def test_rx06_a_credential_fill_in_the_program_or_script_position_is_not_printed_by_route_missing(tmp_path):
+    status, detail = ob.exercise_route("python <api_key>", tmp_path, 30, {"api_key": f"{RX06}.py"})
+    assert status == "ROUTE_MISSING" and RX06 not in detail and "<redacted>" in detail, detail
+    status, detail = ob.exercise_route("<api_key> go", tmp_path, 30, {"api_key": RX06})
+    assert status == "ROUTE_MISSING" and RX06 not in detail and "<redacted>" in detail, detail
+
+
+@pytest.mark.parametrize("command, value", [
+    ("python tools/x.py <label> DB_PASSWORD=<value>", ">" + RX06),
+    ("DB_PASSWORD=<value> python tools/x.py", f"<{RX06}>"),
+    ("python <api_key>", f"{RX06}.py"),
+])
+def test_rx06_nothing_a_run_prints_or_writes_carries_the_value(tmp_path, capsys, command, value):
+    bus = make_bus(tmp_path, {"tools/x.py": STUB_OK})
+    item = item_file(tmp_path, adopt(command))
+    fills = ["--fill", f"value={value}", "--fill", f"label={value}", "--fill", f"api_key={value}"]
+    assert exercise(tmp_path, item, bus, *fills) == 1
+    captured = capsys.readouterr()
+    assert RX06 not in captured.out and RX06 not in captured.err
+    assert not [p for p in tmp_path.rglob("*") if p.is_file() and RX06.encode() in p.read_bytes()]
 
 
 # ---------- r3 hardening: a python option that takes an operand is not the script ----------

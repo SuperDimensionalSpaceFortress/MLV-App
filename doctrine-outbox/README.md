@@ -114,7 +114,8 @@ these are `ROUTE_UNSAFE` and are not run:
   publish, upload, install or fetch verb (`pip install`, `npm install`, `yarn add`, ...), a URL or `user@host:`
   argument, and a credential assignment (`GH_TOKEN=`, `ANTHROPIC_*=`, `*_TOKEN=`, `*_KEY=`, `*PASSWORD*=`) or `--token`.
 
-A credential's value is never printed: it shows as `NAME=<redacted>` in every diagnostic and route line. Put a
+A credential's value is never printed: it shows as `NAME=<redacted>` in every diagnostic and route line, whatever it contains (shell syntax, `<name>`, a path),
+because the one detail a route returns is redacted once, last (RX-06). Put a
 command a card ships but the bus does not yet have in prose, not in a route.
 
 **A ruling candidate names the rules it overlaps.** An item whose `### ` heading holds `RULING CANDIDATE:` or whose
