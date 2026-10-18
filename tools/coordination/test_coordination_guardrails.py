@@ -3507,7 +3507,7 @@ def ratio_full_dispatch_board(tmp_path, guard_payload, use_real_guard=False):
     tool_dir.mkdir(parents=True, exist_ok=True)
     shutil.copy2(RATIO_WORKSTREAM, tool_dir / "Invoke-Workstream.ps1")
     shutil.copy2(RATIO_GUARD if use_real_guard else guard, tool_dir / "Test-ProductRatioGuard.ps1")
-    for dependency in ("landing-probe.ps1", "compose-lane-prompt-core.ps1", "repo-slug.ps1", "Retire-LaneWorktree.ps1",
+    for dependency in ("landing-probe.ps1", "compose-lane-prompt-core.ps1", "repo-slug.ps1", "Retire-LaneWorktree.ps1", "lane-fsmonitor.ps1",
                        "Get-DoctrineBrief.ps1", "get_doctrine_brief.py"):
         shutil.copy2(RATIO_WORKSTREAM.parent / dependency, tool_dir / dependency)
     # get_doctrine_brief.py honours a fixture only inside the fixtures/ beside itself, so the
@@ -4158,3 +4158,222 @@ def test_ratio_coverage_marker_is_carried_by_both_shipped_writers_and_the_guard(
     marker = "MLV-DISPATCH-LEDGER-WRITER-V3-SERIALIZED"
     for path in (LANE_RUNNER, RATIO_WORKSTREAM, RATIO_SOURCE_GUARD):
         assert marker in path.read_text(encoding="utf-8"), path
+
+
+# ---------------------------------------------------------------- HOST-FSMONITOR-DAEMON-LEAK-1
+# MEASURED 2026-10-17 on Virtual-Ten: 65 `git fsmonitor--daemon run --detach` processes for 64 worktrees, the oldest 17 h old,
+# ~51 MiB private each, host commit 61 GiB against a 60 GiB gate. The board's .git/config carries core.fsmonitor=true, every
+# linked worktree inherits it, the first `git status` in a worktree starts a daemon, and nothing stopped it when the lane ended.
+# (a) lane worktrees get a worktree-scoped core.fsmonitor=false at creation / launch; (b) retirement stops the daemon first.
+FSMON_LIB = ROOT / "tools" / "coordination" / "lane-fsmonitor.ps1"
+FSMON_PWSH = shutil.which("pwsh")
+fsmon_only = pytest.mark.skipif(
+    sys.platform != "win32" or FSMON_PWSH is None,
+    reason="the builtin fsmonitor daemon and the PowerShell helpers are exercised on the Windows venue only",
+)
+
+
+def fsmon_pwsh(body):
+    return subprocess.run(
+        [FSMON_PWSH, "-NoProfile", "-NonInteractive", "-Command", f". '{FSMON_LIB}'; {body}"],
+        text=True, capture_output=True,
+    )
+
+
+def fsmon_watching(path):
+    done = subprocess.run(["git", "-C", str(path), "fsmonitor--daemon", "status"], text=True, capture_output=True)
+    return "is watching" in (done.stdout + done.stderr)
+
+
+@pytest.fixture
+def fsmon_board(tmp_path):
+    """A board with core.fsmonitor=true at repo scope (the live shape) and one linked lane worktree. Stops any daemon on exit."""
+    main = tmp_path / "board"
+    main.mkdir()
+    make_repo(main)
+    git(main, "config", "core.fsmonitor", "true")
+    wt = tmp_path / "lane-wt"
+    # -c core.fsmonitor=false: the fixture itself must not start the daemon it is about to measure.
+    git(main, "-c", "core.fsmonitor=false", "worktree", "add", "-q", "-b", "lane", str(wt))
+    try:
+        yield main, wt
+    finally:
+        for p in (wt, main):
+            subprocess.run(["git", "-C", str(p), "fsmonitor--daemon", "stop"], capture_output=True)
+
+
+@fsmon_only
+def test_fsmonitor_disable_is_worktree_scoped_and_a_status_then_starts_no_daemon(fsmon_board):
+    main, wt = fsmon_board
+    git(main, "config", "extensions.worktreeConfig", "true")
+    done = fsmon_pwsh(f"(Disable-LaneWorktreeFsmonitor -WorkDir '{wt}').action")
+    assert done.returncode == 0 and done.stdout.strip() == "disabled", (done.stdout, done.stderr)
+    assert git(wt, "config", "--get", "core.fsmonitor") == "false"
+    assert git(main, "config", "--local", "--get", "core.fsmonitor") == "true", "the board's own setting must be untouched"
+    git(wt, "status", "--porcelain")
+    assert not fsmon_watching(wt), "a status in the disabled worktree started a daemon"
+
+
+@fsmon_only
+def test_fsmonitor_control_a_status_in_an_untouched_worktree_does_start_a_daemon(fsmon_board):
+    """The control: same fixture, no helper call. Proves the daemon the fix prevents is real, not an artifact."""
+    main, wt = fsmon_board
+    git(main, "config", "extensions.worktreeConfig", "true")
+    git(wt, "status", "--porcelain")
+    assert fsmon_watching(wt)
+
+
+@fsmon_only
+def test_fsmonitor_disable_refuses_to_write_the_shared_config_without_the_worktree_extension(fsmon_board):
+    main, wt = fsmon_board
+    done = fsmon_pwsh(f"(Disable-LaneWorktreeFsmonitor -WorkDir '{wt}') | ConvertTo-Json -Compress")
+    assert done.returncode == 0, done.stderr
+    assert '"action":"skipped"' in done.stdout and "extensions.worktreeConfig" in done.stdout, done.stdout
+    assert git(main, "config", "--local", "--get", "core.fsmonitor") == "true"
+    assert git(wt, "config", "--get", "core.fsmonitor") == "true", "without the extension nothing may be written"
+
+
+@fsmon_only
+def test_fsmonitor_helpers_never_touch_the_main_checkout(fsmon_board):
+    main, wt = fsmon_board
+    git(main, "config", "extensions.worktreeConfig", "true")
+    git(main, "status", "--porcelain")  # starts the board's own daemon
+    assert fsmon_watching(main)
+    done = fsmon_pwsh(f"(Disable-LaneWorktreeFsmonitor -WorkDir '{main}').action; (Stop-LaneWorktreeFsmonitor -WorkDir '{main}').action")
+    assert done.returncode == 0 and done.stdout.split() == ["skipped", "skipped"], (done.stdout, done.stderr)
+    assert fsmon_watching(main), "the canonical board checkout's daemon was stopped"
+    assert git(main, "config", "--local", "--get", "core.fsmonitor") == "true"
+
+
+@fsmon_only
+def test_fsmonitor_stop_ends_only_the_named_worktrees_daemon(fsmon_board):
+    main, wt = fsmon_board
+    git(main, "config", "extensions.worktreeConfig", "true")
+    git(wt, "status", "--porcelain")
+    git(main, "status", "--porcelain")
+    assert fsmon_watching(wt) and fsmon_watching(main)
+    done = fsmon_pwsh(f"(Stop-LaneWorktreeFsmonitor -WorkDir '{wt}').action")
+    assert done.returncode == 0 and done.stdout.strip() == "stopped", (done.stdout, done.stderr)
+    assert not fsmon_watching(wt)
+    assert fsmon_watching(main)
+    again = fsmon_pwsh(f"(Stop-LaneWorktreeFsmonitor -WorkDir '{wt}').action")
+    assert again.stdout.strip() == "none", "a worktree with no daemon is a quiet no-op"
+
+
+def test_fsmonitor_fix_is_wired_into_every_lane_worktree_path():
+    coord = ROOT / "tools" / "coordination"
+    retire = (coord / "Retire-LaneWorktree.ps1").read_text(encoding="utf-8")
+    assert "lane-fsmonitor.ps1" in retire, "Retire-LaneWorktree.ps1 must load the helpers it calls"
+    body = retire[retire.index("function Invoke-RetireLaneWorktree"):]
+    # (b) the daemon is stopped before the worktree is removed, and (a) the worktree is switched off before the gate's first status.
+    assert body.index("Disable-LaneWorktreeFsmonitor") < body.index("'status', '--porcelain', '-uall'")
+    assert body.index("Stop-LaneWorktreeFsmonitor") < body.index("'worktree', 'remove'")
+    for name in ("Invoke-Lane.ps1", "Invoke-Workstream.ps1", "Invoke-WorkstreamLoop.ps1"):
+        assert "Disable-LaneWorktreeFsmonitor" in (coord / name).read_text(encoding="utf-8"), name
+    # Every tracked `worktree add` also passes -c core.fsmonitor=false: the checkout inside `add` is itself a daemon starter.
+    for name in ("Invoke-Workstream.ps1", "Invoke-WorkstreamLoop.ps1"):
+        adds = [ln for ln in (coord / name).read_text(encoding="utf-8").splitlines() if "worktree add" in ln and ln.lstrip().startswith("&")]
+        assert adds and all("core.fsmonitor=false" in ln for ln in adds), (name, adds)
+
+
+# ---- r2 (sol r1 BLOCKER on d754de31): ORDER. The disable has to precede the first git command that reads the worktree's index; a disable that
+# runs after the first `git status` leaves the daemon that status started. r1 pinned only that the call APPEARS in each script.
+def test_fsmonitor_disable_precedes_the_first_git_command_in_invoke_lane():
+    lane = (ROOT / "tools" / "coordination" / "Invoke-Lane.ps1").read_text(encoding="utf-8")
+    disable = lane.index("$null = Disable-LaneWorktreeFsmonitor -WorkDir $WorkDir")
+    first_git = re.search(r"^\$\w+\s*=\s*Invoke-GitCaptureUtf8\b", lane, re.M)
+    assert first_git, "Invoke-Lane.ps1 no longer calls git at top level; re-pin this test on its first git command"
+    assert disable < first_git.start(), "Invoke-Lane.ps1 runs git in the lane worktree before disabling its fsmonitor"
+    assert "Stop-LaneWorktreeFsmonitor -WorkDir $WorkDir" in lane[disable:first_git.start()], "a relaunched worktree's running daemon must be stopped too"
+
+
+def test_fsmonitor_protect_precedes_every_git_command_on_the_reused_continuation_worktree():
+    ws = (ROOT / "tools" / "coordination" / "Invoke-Workstream.ps1").read_text(encoding="utf-8")
+    protect = ws.index("$null = Protect-LaneWorktreeFsmonitor -WorkDir $existingWt")
+    reuse_git = [m.start() for m in re.finditer(r"git -C \$existingWt\b", ws)]
+    assert reuse_git, "the reuse path no longer runs git in $existingWt; re-pin this test"
+    assert protect < min(reuse_git), "Invoke-Workstream.ps1 runs git in a reused worktree before protecting it"
+    assert protect < ws.index("continuation-worktree-dirty"), "the dirty-worktree refusal (exit 6) must not be reachable before the protect"
+
+
+def test_fsmonitor_disable_and_stop_precede_the_driver_worktree_reset():
+    loop = (ROOT / "tools" / "coordination" / "Invoke-WorkstreamLoop.ps1").read_text(encoding="utf-8")
+    sync = loop[loop.index("function Sync-DriverWorktree"):]
+    created = sync.index("            return $null\n        }\n")  # end of the create-a-new-driver branch; what follows is the reuse path
+    assert "Disable-DriverFsmonitor" in sync[created:sync.index("git -C $DriverRoot reset")], "the reused driver worktree is reset before its fsmonitor is disabled"
+    helper = loop[loop.index("function Disable-DriverFsmonitor"):loop.index("function Sync-DriverWorktree")]
+    assert "Disable-LaneWorktreeFsmonitor" in helper and "Stop-LaneWorktreeFsmonitor" in helper
+
+
+@fsmon_only
+def test_fsmonitor_protect_disables_and_stops_a_daemon_already_running(fsmon_board):
+    main, wt = fsmon_board
+    git(main, "config", "extensions.worktreeConfig", "true")
+    git(wt, "status", "--porcelain")
+    assert fsmon_watching(wt)
+    done = fsmon_pwsh(f"$p = Protect-LaneWorktreeFsmonitor -WorkDir '{wt}'; $p.disable; $p.stop")
+    assert done.returncode == 0 and done.stdout.split() == ["disabled", "stopped"], (done.stdout, done.stderr)
+    assert not fsmon_watching(wt)
+    git(wt, "status", "--porcelain")
+    assert not fsmon_watching(wt), "a status after the protect started a daemon again"
+
+
+def fsmon_continuation_board(tmp_path, monkeypatch, card_id, dirty, prestart):
+    """A board with core.fsmonitor=true at repo scope and extensions.worktreeConfig on (the live shape), and a continuation branch checked out
+    in an EXISTING worktree that predates the fix (no worktree-scoped override). prestart=True also leaves a daemon already running there."""
+    dual, head = editing_board(tmp_path)
+    git(tmp_path, "config", "extensions.worktreeConfig", "true")
+    branch = "product/" + card_id
+    git(tmp_path, "checkout", "-q", "-b", branch)
+    (tmp_path / "stage1.txt").write_text("stage one\n")
+    git(tmp_path, "add", "stage1.txt")
+    git(tmp_path, "commit", "-qm", "stage one")
+    tip = git(tmp_path, "rev-parse", "HEAD")
+    git(tmp_path, "checkout", "-q", "--detach", head)
+    wt = tmp_path / ("wt-" + card_id.lower())
+    git(tmp_path, "-c", "core.fsmonitor=false", "worktree", "add", "-q", str(wt), branch)
+    git(tmp_path, "config", "core.fsmonitor", "true")
+    if dirty:
+        (wt / "someone-elses-work.txt").write_text("uncommitted\n")
+    if prestart:
+        git(wt, "status", "--porcelain")
+        assert fsmon_watching(wt), "the fixture failed to start the daemon it is about to measure"
+    # The lane shim records the daemon state at the moment the lane would start, before the dispatcher's own cleanup can retire the worktree.
+    probe = tmp_path / "fsmon-at-lane-start.txt"
+    monkeypatch.setenv("MLV_FSMON_PROBE_OUT", str(probe))
+    (dual / "Start-EditingLane.ps1").write_text(
+        "param([string]$Lane,[string]$PromptFile,[string]$WorkDir,[string]$Card,[string]$RunDir,[string]$ExtraReadDir,[int]$TimeoutSec)\n"
+        "$o = (& git -C $WorkDir fsmonitor--daemon status 2>&1 | Out-String)\n"
+        "Set-Content -LiteralPath $env:MLV_FSMON_PROBE_OUT -Value ('PROBE ' + $o)\n"
+        "exit 0\n", encoding="ascii")
+    return dual, wt, tip, probe
+
+
+def fsmon_continuation_cleanup(tmp_path, wt, card_id):
+    for p in (wt, tmp_path):
+        subprocess.run(["git", "-C", str(p), "fsmonitor--daemon", "stop"], capture_output=True)
+    subprocess.run(["git", "worktree", "remove", "--force", str(wt)], cwd=tmp_path, check=False, capture_output=True)
+    cleanup_lane_worktree(tmp_path, card_id)
+
+
+@fsmon_only
+@pytest.mark.parametrize("prestart", [False, True], ids=["no-daemon-yet", "daemon-already-running"])
+@pytest.mark.parametrize("dirty", [False, True], ids=["clean", "dirty-exit6"])
+def test_continuation_reuse_starts_and_leaves_no_fsmonitor_daemon(tmp_path, monkeypatch, dirty, prestart):
+    """sol r1 BLOCKER: the reused-continuation path ran `git status` before disabling fsmonitor, so a worktree that predates the fix got a daemon
+    on the dispatcher's own status; the dirty branch exits 6 before the later disable and never reached it at all."""
+    card_id = "TEST-FSMON-CONT-%s-%s" % ("D" if dirty else "C", "P" if prestart else "N")
+    dual, wt, tip, probe = fsmon_continuation_board(tmp_path, monkeypatch, card_id, dirty, prestart)
+    try:
+        result = run_editing_dispatch(tmp_path, [_reuse_card(dual, card_id)], card_id, extra=("-ContinueFromSha", tip), dry_run=False)
+        if dirty:
+            assert result.returncode == 6 and "REFUSED continuation-worktree-dirty" in result.stdout, result.stdout + result.stderr
+            assert not fsmon_watching(wt), "the dirty-refusal path left a fsmonitor daemon running in the reused worktree"
+            assert git(wt, "config", "--get", "core.fsmonitor") == "false"
+        else:
+            assert result.returncode == 0 and "reusing-worktree=" in result.stdout, result.stdout + result.stderr
+            assert probe.exists(), "the lane shim never ran: " + result.stdout + result.stderr
+            seen = probe.read_text(encoding="utf-8")
+            assert "is watching" not in seen, "a fsmonitor daemon was running in the reused worktree when the lane started: " + seen
+    finally:
+        fsmon_continuation_cleanup(tmp_path, wt, card_id)
