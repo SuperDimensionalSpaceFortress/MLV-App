@@ -355,9 +355,17 @@ llrpGpuStageTelemetrySink_t llrpGetGpuStageTelemetrySinkForTesting(void);
  * AMaZE entry in GpuDebayer.cpp. r6: each one reads the flag again once its
  * serializing lock is held (and an AMaZE run after its telemetry entry), so a
  * caller queued through a loss never submits. Release, destroy and teardown
- * are never gated. One aligned load per check. */
+ * are never gated. One aligned load per check. GPU-LOSS-EMIT-BEFORE-UNLOCK-1:
+ * the backend's serializing sections set the flag before releasing the lock
+ * when a captured code is a device loss, so no caller can enter between the
+ * faulting call's unlock and its emit. */
 void llrpSetGpuCudaSuppressed(int suppressed);
 int llrpGpuCudaSuppressed(void);
+/* GPU-LOSS-EMIT-BEFORE-UNLOCK-1: returns non-zero for a device-loss CUDA code. Set by
+ * GpuDeviceLossBreaker::install(); NULL (no breaker) = no suppression before unlock. Must be
+ * pure: no lock, no Qt. */
+typedef int (*llrpGpuDeviceLossClassifier_t)(int cuda_code);
+void llrpSetGpuDeviceLossClassifier(llrpGpuDeviceLossClassifier_t classifier);
 /* r6 terminal drain: a code noted after the last captured call has no later
  * call to drain it at entry. llrpGpuPlaybackReconResetGlTextureResources (the
  * GPU view releasing its GL resources) drains both channels after its reset,
