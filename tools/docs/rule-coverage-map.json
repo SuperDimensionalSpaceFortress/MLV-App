@@ -548,9 +548,9 @@
       "bullet": "agents/brokered-auto-closeout.md:71 Evidence-preserving transaction prune: Branches are transactions, not archives. ",
       "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
     },
-    "e84663d397d3aca80ed1516960d431ccbb0c9f050df2fa1750c73f1e822b92bd": {
+    "ab892da6b791bb16bf9f230293a116c330c79c209173913ac1cbdc639196f12a": {
       "check": "prose-only: enforced by the merge-enqueue.ps1 status gate (rule TIP_LEGS) in the board-local, untracked .claude-state/fleet-runs/hub-tools, not by a tracked check",
-      "bullet": "agents/orchestration-tiering.md:93 a `review/<seat>` commit status on the head SHA (success = APPROVE, failure = CHANGES_REQUESTED);",
+      "bullet": "agents/orchestration-tiering.md:93 a `review/<seat>` commit status on the head SHA (success = APPROVE, failure or error = CHANGES_REQUESTED);",
       "basis": "the only enforcement is the board-local merge-enqueue.ps1 TIP_LEGS gate, which is untracked and so cannot be cited as a tracked check; never counted as coverage"
     },
     "0f66d141966a73babb603f73a5fbf1e757c93d4ccac6a20aa08303ff18cf46b7": {
