@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -716,8 +717,13 @@ def test_removing_the_generated_na11_denial_methods_stops_it_counting(tmp_path):
 
     res = run(_tracked_repo_copy(tmp_path / "copy", {NA_TEST: drop_loop}))
     assert na11["id"] in [e["id"] for e in res["errors"]], "NA-11 must be reported stale"
-    assert res["behavioural_mapped"] == real["behavioural_mapped"] - 1
-    assert res["mapped"] == real["mapped"] - 1
+    # Every bullet whose check is a case that loop generates goes stale with it. This used to
+    # be exactly one (NA-11); RULE-COVERAGE-RATCHET-1 maps three more bullets to generated NA
+    # hook cases, so the expected drop is derived from the stale list, not hard-coded to 1.
+    stale = len(res["errors"])
+    assert stale >= 1 and real["errors"] == []
+    assert res["behavioural_mapped"] == real["behavioural_mapped"] - stale
+    assert res["mapped"] == real["mapped"] - stale
 
 
 def test_the_tracked_na11_mapping_names_a_generated_denial_case():
@@ -820,3 +826,314 @@ def test_an_inventory_bullet_with_no_strength_is_counted_as_a_pin(tmp_path):
     assert res["pin_mapped"] == 2, "a and b carry no strength, so they are pins"
     assert res["behavioural_mapped"] == 2, "an explicit behavioural, and a rule bullet"
     assert res["token_inventory"] == 3 and res["rule_bullets"] == 4 + 1
+
+
+# ---------------------------------------------------------------------------------------------
+# RULE-COVERAGE-RATCHET-1: a tighten-only baseline turns the census from a report into a gate
+# (HUB RULING item 5, subject ledger 2026-10-16T16:44:15Z). The gate is these tests, which CI
+# already collects from tests/docs/; no workflow was edited.
+#   G1  at HEAD the real census holds tools/docs/rule-coverage-baseline.json
+#   G2  RED rows: one behavioural check below the baseline, a relabel to prose-only, a new
+#       unmapped bullet, and a reworded mapped bullet each fail the gate and name the numbers
+#   G3  the baseline file is tighten-only against its merge-base copy (RED rows on a throwaway
+#       git repo prove the comparison can fail)
+#
+# Named mutations (each turns the named test red, then is reverted):
+#   M7  stop comparing behavioural_checked to the baseline     -> test_gate_is_red_one_check_below_the_baseline
+#   M8  stop comparing unmapped to unmapped_max                -> test_a_new_unmapped_bullet_trips_the_unmapped_ceiling
+#   M9  count a prose-only relabel as a behavioural check      -> test_relabelling_a_real_check_prose_only_trips_the_gate
+#   M10 skip the merge-base comparison                         -> test_a_baseline_that_loosens_against_the_merge_base_fails
+# ---------------------------------------------------------------------------------------------
+
+BASELINE_REL = "tools/docs/rule-coverage-baseline.json"
+CHECK_OK = "test:tests/test_x.py::TestX::test_ok"
+BASE_REFS = ("refs/remotes/fork/master", "refs/remotes/origin/master", "refs/heads/master")
+
+
+def write_baseline(root: Path, behavioural_checked: int, unmapped_max: int,
+                   rule: str = "tighten-only") -> None:
+    (root / "tools" / "docs").mkdir(parents=True, exist_ok=True)
+    (root / BASELINE_REL).write_text(json.dumps({
+        "behavioural_checked": behavioural_checked, "unmapped_max": unmapped_max,
+        "generated_from": "0" * 40, "rule": rule}), encoding="utf-8")
+
+
+def gate(root: Path):
+    """(census result, [baseline failure]) for a tree that carries its own baseline file."""
+    res = run(root)
+    baseline, err = rcc.load_baseline(str(root))
+    assert err is None, err
+    return res, rcc.baseline_failures(res, baseline)
+
+
+def two_checked_repo(root: Path) -> dict:
+    """make_repo's seven bullets with two behavioural checks: behavioural 2, unmapped 5."""
+    make_repo(root)
+    t = ids_by_text(root)
+    write_map(root, {t["numbered rule one"]: {"check": CHECK_OK},
+                     t["numbered rule two"]: {"check": CHECK_OK}})
+    return t
+
+
+# ----- G1: the real tree --------------------------------------------------------------------
+
+def test_census_holds_the_tracked_baseline_at_head():
+    """The gate. If this fails, a rule bullet lost its check (or a new rule arrived with no
+    check and no 'prose-only: <reason>' label). Fix the cause: re-point the mapping, add the
+    check, or label the bullet prose-only with its reason in tools/docs/rule-coverage-map.json.
+    Do NOT lower the baseline: test_baseline_file_is_tighten_only_against_the_merge_base
+    refuses that."""
+    res = run(REPO_ROOT)
+    baseline, err = rcc.load_baseline(str(REPO_ROOT))
+    assert err is None, err
+    failures = rcc.baseline_failures(res, baseline)
+    assert failures == [], failures
+    assert baseline["behavioural_checked"] > 0 and baseline["unmapped_max"] >= 0
+    assert rcc.main(["--repo-root", str(REPO_ROOT), "--baseline", "--no-list"]) == 0
+
+
+def test_the_tracked_baseline_is_a_valid_tighten_only_file():
+    base, err = rcc.load_baseline(str(REPO_ROOT))
+    assert err is None, err
+    assert base["rule"] == "tighten-only"
+    assert isinstance(base["generated_from"], str) and len(base["generated_from"]) == 40
+
+
+# ----- G2: RED rows -------------------------------------------------------------------------
+
+def test_gate_is_red_one_check_below_the_baseline(tmp_path, capsys):
+    two_checked_repo(tmp_path)
+    write_baseline(tmp_path, behavioural_checked=3, unmapped_max=5)
+    res, failures = gate(tmp_path)
+    assert res["behavioural_mapped"] == 2 and res["unmapped"] == 5
+    assert len(failures) == 1
+    assert "behavioural_checked 2 is below the baseline 3" in failures[0]
+    assert rcc.main(["--repo-root", str(tmp_path), "--baseline", "--no-list"]) == 1
+    out = capsys.readouterr().out
+    assert "BASELINE REGRESSION" in out and "behavioural_checked 2 is below the baseline 3" in out
+    # GREEN control: the same tree against a baseline it meets passes, exit 0.
+    write_baseline(tmp_path, behavioural_checked=2, unmapped_max=5)
+    assert gate(tmp_path)[1] == []
+    assert rcc.main(["--repo-root", str(tmp_path), "--baseline", "--no-list"]) == 0
+    assert "PASS -- the census holds the baseline" in capsys.readouterr().out
+
+
+def test_relabelling_a_real_check_prose_only_trips_the_gate(tmp_path):
+    t = two_checked_repo(tmp_path)
+    write_baseline(tmp_path, behavioural_checked=2, unmapped_max=5)
+    before, failures = gate(tmp_path)
+    assert failures == [] and before["behavioural_mapped"] == 2
+    write_map(tmp_path, {t["numbered rule one"]: {"check": CHECK_OK},
+                         t["numbered rule two"]: {"check": "prose-only: gave up"}})
+    after, failures = gate(tmp_path)
+    assert after["behavioural_mapped"] == 1 and after["prose_only"] == 1
+    assert after["unmapped"] == before["unmapped"], "a relabel must not hide the lost check"
+    assert len(failures) == 1 and "behavioural_checked 1 is below the baseline 2" in failures[0]
+
+
+def test_a_new_unmapped_bullet_trips_the_unmapped_ceiling(tmp_path):
+    t = two_checked_repo(tmp_path)
+    write_baseline(tmp_path, behavioural_checked=2, unmapped_max=5)
+    (tmp_path / "CLAUDE.md").write_text(CLAUDE_MD + "\n- A brand new rule nobody checks.\n",
+                                        encoding="utf-8")
+    res, failures = gate(tmp_path)
+    assert res["unmapped"] == 6
+    assert len(failures) == 1 and "unmapped 6 is above the baseline unmapped_max 5" in failures[0]
+    # Labelling the new bullet prose-only (with a reason) restores the count: it is then
+    # an honest admission, not an unexamined rule.
+    new_id = ids_by_text(tmp_path)["A brand new rule nobody checks."]
+    write_map(tmp_path, {t["numbered rule one"]: {"check": CHECK_OK},
+                         t["numbered rule two"]: {"check": CHECK_OK},
+                         new_id: {"check": "prose-only: judgment call"}})
+    res, failures = gate(tmp_path)
+    assert res["unmapped"] == 5 and failures == []
+
+
+def test_rewording_a_checked_bullet_trips_the_gate(tmp_path):
+    t = two_checked_repo(tmp_path)
+    write_baseline(tmp_path, behavioural_checked=2, unmapped_max=5)
+    (tmp_path / "CLAUDE.md").write_text(
+        CLAUDE_MD.replace("1. numbered rule one", "1. numbered rule one, reworded"),
+        encoding="utf-8")
+    res, failures = gate(tmp_path)
+    assert t["numbered rule one"] in [e["id"] for e in res["errors"]], "the old id is stale"
+    assert res["behavioural_mapped"] == 1
+    assert any("behavioural_checked 1 is below the baseline 2" in f for f in failures)
+
+
+def test_both_regressions_are_named_together(tmp_path):
+    two_checked_repo(tmp_path)
+    write_baseline(tmp_path, behavioural_checked=9, unmapped_max=1)
+    _, failures = gate(tmp_path)
+    assert len(failures) == 2
+    joined = " | ".join(failures)
+    assert "behavioural_checked 2" in joined and "baseline 9" in joined
+    assert "unmapped 5" in joined and "unmapped_max 1" in joined
+
+
+@pytest.mark.parametrize("body, needle", [
+    (None, "cannot read baseline file"),
+    ("{not json", "cannot read baseline file"),
+    ("[]", "must be a JSON object"),
+    ('{"behavioural_checked": -1, "unmapped_max": 5, "rule": "tighten-only"}', "behavioural_checked"),
+    ('{"behavioural_checked": true, "unmapped_max": 5, "rule": "tighten-only"}', "behavioural_checked"),
+    ('{"behavioural_checked": 2, "unmapped_max": "5", "rule": "tighten-only"}', "unmapped_max"),
+    ('{"behavioural_checked": 2, "unmapped_max": 5, "rule": "report-only"}', "tighten-only"),
+])
+def test_an_unreadable_or_malformed_baseline_is_an_error_not_a_pass(tmp_path, capsys, body, needle):
+    two_checked_repo(tmp_path)
+    if body is not None:
+        (tmp_path / "tools" / "docs").mkdir(parents=True, exist_ok=True)
+        (tmp_path / BASELINE_REL).write_text(body, encoding="utf-8")
+    base, err = rcc.load_baseline(str(tmp_path))
+    assert base is None and needle in err
+    assert rcc.main(["--repo-root", str(tmp_path), "--baseline", "--no-list"]) == 2
+    assert needle in capsys.readouterr().err
+
+
+def test_baseline_argument_outside_the_repo_root_is_rejected(tmp_path, capsys):
+    repo = make_repo(tmp_path / "repo")
+    outside = tmp_path / "outside.json"
+    write_baseline(tmp_path, 0, 999)
+    outside.write_text((tmp_path / BASELINE_REL).read_text(encoding="utf-8"), encoding="utf-8")
+    assert rcc.main(["--repo-root", str(repo), "--baseline", str(outside), "--no-list"]) == 2
+    assert "outside the repo root" in capsys.readouterr().err
+
+
+def test_json_output_carries_the_baseline_verdict(tmp_path, capsys):
+    two_checked_repo(tmp_path)
+    write_baseline(tmp_path, behavioural_checked=3, unmapped_max=5)
+    assert rcc.main(["--repo-root", str(tmp_path), "--baseline", "--json"]) == 1
+    data = json.loads(capsys.readouterr().out)
+    assert data["baseline"]["behavioural_checked"] == 3 and len(data["baseline"]["failures"]) == 1
+    # Without --baseline the report is unchanged: no key, and no new failure mode.
+    assert rcc.main(["--repo-root", str(tmp_path), "--json"]) == 0
+    assert "baseline" not in json.loads(capsys.readouterr().out)
+
+
+# ----- G3: the baseline file only tightens --------------------------------------------------
+
+def test_loosening_rule_compares_both_numbers():
+    old = {"behavioural_checked": 17, "unmapped_max": 110}
+    assert rcc.baseline_loosened(old, dict(old)) == []
+    assert rcc.baseline_loosened(old, {"behavioural_checked": 18, "unmapped_max": 109}) == []
+    down = rcc.baseline_loosened(old, {"behavioural_checked": 16, "unmapped_max": 110})
+    assert len(down) == 1 and "DOWN 17 -> 16" in down[0]
+    up = rcc.baseline_loosened(old, {"behavioural_checked": 17, "unmapped_max": 111})
+    assert len(up) == 1 and "UP 110 -> 111" in up[0]
+    assert len(rcc.baseline_loosened(old, {"behavioural_checked": 1, "unmapped_max": 999})) == 2
+
+
+def _git(repo: Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.invalid",
+         "-c", "commit.gpgsign=false", *args],
+        capture_output=True, text=True, timeout=120)
+
+
+def merge_base_baseline(repo: Path, base_refs=BASE_REFS):
+    """(merge-base sha, baseline text at it, or None when that commit has no baseline file).
+    The first base ref that exists and shares history with HEAD wins; with none usable this
+    FAILS rather than skips, because a skipped tighten-only check is a silent loosening."""
+    tried = []
+    for ref in base_refs:
+        if _git(repo, "rev-parse", "--verify", "--quiet", ref).returncode != 0:
+            tried.append("%s (absent)" % ref)
+            continue
+        mb = _git(repo, "merge-base", "HEAD", ref)
+        sha = mb.stdout.strip()
+        if mb.returncode != 0 or not sha:
+            tried.append("%s (no merge-base with HEAD: shallow clone?)" % ref)
+            continue
+        if _git(repo, "cat-file", "-e", "%s:%s" % (sha, BASELINE_REL)).returncode != 0:
+            return sha, None
+        shown = _git(repo, "show", "%s:%s" % (sha, BASELINE_REL))
+        assert shown.returncode == 0, shown.stderr
+        return sha, shown.stdout
+    pytest.fail("cannot find a merge-base to hold the baseline against; tried %s. CI checks "
+                "out with fetch-depth 0; locally run `git fetch fork`." % ", ".join(tried))
+
+
+def check_tighten_only(repo: Path, base_refs=BASE_REFS):
+    """[why] the working-tree baseline loosens the merge-base copy, or None on a first
+    introduction (the merge-base has no baseline file)."""
+    sha, old_text = merge_base_baseline(repo, base_refs)
+    if old_text is None:
+        return None
+    old, err = rcc.parse_baseline(json.loads(old_text.lstrip("﻿")), "merge-base baseline")
+    assert err is None, err
+    new, err = rcc.load_baseline(str(repo))
+    assert err is None, err
+    return rcc.baseline_loosened(old, new)
+
+
+def test_baseline_file_is_tighten_only_against_the_merge_base():
+    """Fails if behavioural_checked went DOWN or unmapped_max went UP versus the copy at the
+    merge-base with master. Skips only when the merge-base carries no baseline file at all
+    (the PR that introduces it). A lower baseline needs the rules it stops counting to go away
+    on master first; a PR cannot talk its own gate down."""
+    verdict = check_tighten_only(REPO_ROOT)
+    if verdict is None:
+        pytest.skip("the merge-base has no %s: first introduction of the baseline" % BASELINE_REL)
+    assert verdict == [], verdict
+
+
+def _baseline_repo(tmp_path: Path, base=(17, 110), head=(17, 110), base_has_file=True) -> Path:
+    """A throwaway git repo: master holds the baseline `base`, branch `feature` holds `head`."""
+    repo = tmp_path / "gitrepo"
+    repo.mkdir(parents=True)
+    assert _git(repo, "init", "-q", "-b", "master").returncode == 0
+    (repo / "README.md").write_text("x\n", encoding="utf-8")
+    if base_has_file:
+        write_baseline(repo, *base)
+    assert _git(repo, "add", "-A").returncode == 0
+    assert _git(repo, "commit", "-q", "-m", "base").returncode == 0
+    assert _git(repo, "checkout", "-q", "-b", "feature").returncode == 0
+    write_baseline(repo, *head)
+    assert _git(repo, "add", "-A").returncode == 0
+    assert _git(repo, "commit", "-q", "--allow-empty", "-m", "head").returncode == 0
+    return repo
+
+
+MASTER_ONLY = ("refs/heads/master",)
+
+
+def test_a_baseline_that_loosens_against_the_merge_base_fails(tmp_path):
+    repo = _baseline_repo(tmp_path, base=(17, 110), head=(16, 110))
+    verdict = check_tighten_only(repo, MASTER_ONLY)
+    assert verdict and "DOWN 17 -> 16" in verdict[0]
+    repo2 = _baseline_repo(tmp_path / "two", base=(17, 110), head=(17, 111))
+    verdict = check_tighten_only(repo2, MASTER_ONLY)
+    assert verdict and "UP 110 -> 111" in verdict[0]
+
+
+def test_a_baseline_that_holds_or_tightens_passes_the_merge_base_comparison(tmp_path):
+    same = _baseline_repo(tmp_path / "same", base=(17, 110), head=(17, 110))
+    assert check_tighten_only(same, MASTER_ONLY) == []
+    tighter = _baseline_repo(tmp_path / "tighter", base=(17, 110), head=(20, 90))
+    assert check_tighten_only(tighter, MASTER_ONLY) == []
+
+
+def test_first_introduction_of_the_baseline_has_nothing_to_compare(tmp_path):
+    repo = _baseline_repo(tmp_path, head=(17, 110), base_has_file=False)
+    sha, text = merge_base_baseline(repo, MASTER_ONLY)
+    assert len(sha) == 40 and text is None
+    assert check_tighten_only(repo, MASTER_ONLY) is None
+
+
+def test_the_merge_base_not_the_branch_tip_is_the_reference(tmp_path):
+    """A baseline change already on master AFTER the branch point does not count against the
+    branch: the comparison is with the merge-base copy, so a concurrent tightening on master
+    cannot make an unrelated branch look like it loosened."""
+    repo = _baseline_repo(tmp_path, base=(17, 110), head=(17, 110))
+    assert _git(repo, "checkout", "-q", "master").returncode == 0
+    write_baseline(repo, 25, 80)
+    assert _git(repo, "commit", "-q", "-am", "master tightens").returncode == 0
+    assert _git(repo, "checkout", "-q", "feature").returncode == 0
+    assert check_tighten_only(repo, MASTER_ONLY) == []
+
+
+def test_an_unresolvable_base_ref_fails_instead_of_skipping(tmp_path):
+    repo = _baseline_repo(tmp_path)
+    with pytest.raises(pytest.fail.Exception, match="cannot find a merge-base"):
+        merge_base_baseline(repo, ("refs/remotes/nowhere/master",))

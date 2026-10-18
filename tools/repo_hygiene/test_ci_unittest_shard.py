@@ -124,7 +124,11 @@ SETUP_SECONDS = 150
 # A shard is expected at no more than this share of its job's timeout-minutes, so a runner
 # twice as slow as the table still finishes. Shard 2/8 was expected at 26 % of its 40 min
 # cap by a stale table, took 31 min (78 %), and was cancelled three times on PR #442.
-CAP_SHARE = 0.6
+# 50 min cap since 2026-10-17; budget kept at the former 24 min (40 * 60 * 0.6 = 50 * 60 * 0.48).
+CAP_SHARE = 0.48
+# The absolute expected-time budget per shard. The cap was raised for runner variance, not to
+# admit a heavier shard, so growth past this still fails whatever CAP_SHARE and the cap say.
+MAX_BUDGET_SECONDS = 24 * 60
 # Tests of classes the table has no row for are weighted by count, not measured.
 MAX_UNMEASURED_TEST_SHARE = 0.05
 
@@ -159,6 +163,13 @@ class ShardDurationBudgetTests(unittest.TestCase):
                 f"{CAP_SHARE:.0%} of its {cap.group(1)} min cap ({budget:.0f} s); re-derive "
                 "ci_unittest_shard_weights.json from fresh hosted logs or add shards",
             )
+
+    def test_the_expected_time_budget_stays_at_the_original_24_minutes(self) -> None:
+        # Raising the job cap 40 -> 50 must not buy a looser per-shard budget: the share
+        # constant is tightened so cap * share still comes to the former 24 min.
+        cap = re.search(r"(?m)^    timeout-minutes: (\d+)$", _windows_shard_job())
+        self.assertIsNotNone(cap)
+        self.assertLessEqual(int(cap.group(1)) * 60 * CAP_SHARE, MAX_BUDGET_SECONDS + 1e-6)
 
     def test_the_table_measures_nearly_every_discovered_test(self) -> None:
         # An unmeasured class costs DEFAULT_TEST_SECONDS per test whatever it really takes;
