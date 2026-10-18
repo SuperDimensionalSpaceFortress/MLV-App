@@ -903,6 +903,16 @@ public static class MlvLaneJob {
 # ---------------------------------------------------------------- resolve inputs
 if (-not $WorkDir) { $WorkDir = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..\..')).Path }
 $WorkDir = (Resolve-Path -LiteralPath $WorkDir).Path
+# HOST-FSMONITOR-DAEMON-LEAK-1 (a): every lane the hub dispatches passes through here, whoever created its worktree (the hub's ad hoc setup
+# scripts are not tracked). The board's core.fsmonitor=true is inherited by every linked worktree, and the first `git status` below would start a
+# `git fsmonitor--daemon` that outlives the lane (65 of them, 61 GiB host commit, 2026-10-17). Worktree-scoped, refuses the main checkout, and
+# fail-soft: a lane must never fail to launch over this.
+try {
+    . (Join-Path $PSScriptRoot 'lane-fsmonitor.ps1')
+    $null = Disable-LaneWorktreeFsmonitor -WorkDir $WorkDir
+    # r2 (opus r1 note 5): a relaunched worktree may already have a daemon; stop it (by worktree path, over its own IPC) once the config is off.
+    $null = Stop-LaneWorktreeFsmonitor -WorkDir $WorkDir
+} catch { }
 
 # ---------------------------------------------------------------- 0.1 pre-flight (before any process, before any run dir)
 # (a) A codex lane can never be granted write access: no Claude hook is visible to codex exec,
