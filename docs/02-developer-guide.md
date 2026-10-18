@@ -1024,9 +1024,12 @@ All workflows live under `.github/workflows/`.
 
 `tests.yml` reports more check runs than there are required checks: the hygiene suite
 runs as `Repo Hygiene Python ubuntu shard N/4` and `Repo Hygiene Python windows shard N/8`
-jobs, and the product oracles as `Windows Product Oracles part N/3` jobs (none required by
-name); an aggregator per required name needs every one of its shards and carries the
-required name. The unittest shards are sets of whole test classes weighted by measured
+jobs, plus a `Repo Hygiene Python windows lane containment` job that runs
+`tests/coordination/test_lane_containment.py` in parallel (windows shard 8 ignores that
+file, so it is collected in exactly one job), and the product oracles as
+`Windows Product Oracles part N/3` jobs (none required by name); an aggregator per
+required name needs every one of its shards (the windows one also the containment job) and
+carries the required name. The unittest shards are sets of whole test classes weighted by measured
 seconds (`tools/repo_hygiene/ci_unittest_shard_weights.json`, regenerated from CI job logs
 with `tools/repo_hygiene/ci_unittest_shard_timings.py`), and every shard job proves the
 shards together hold exactly the ids `unittest discover` collects. **Five check names are
