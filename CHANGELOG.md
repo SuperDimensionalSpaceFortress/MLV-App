@@ -114,8 +114,9 @@ maintained in this format.
     the frame, size, black level, white balance and filter setting all
     match. In every other case it debayers as before. Look, LUT and blur
     changes are applied when the frame is drawn, so they are never stale.
-  - `MLVAPP_PLAYBACK_WARM_OUTPUT_REUSE` (default on, same values as
-    `MLVAPP_PLAYBACK_ROUTE_PREWARM`) turns it off.
+  - `MLVAPP_PLAYBACK_WARM_OUTPUT_REUSE` (same values as
+    `MLVAPP_PLAYBACK_ROUTE_PREWARM`) switches it. It is off by default
+    since PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1 (below).
   - The `first_present_split` line adds `warm_output_reuse`,
     `reuse_reason` and `reuse_compare_ms`, and the `playback_recon_warm`
     line adds `reuse_capture`. On a reused first frame,
@@ -143,3 +144,7 @@ maintained in this format.
     It writes `warm.u16`, `play.u16` and `diff.txt` and logs a
     `playback_warm_output_reuse_miss_dump` line. Venue legs ask for it
     with `generatorArgs.warmReuseMissDump`.
+  - Reusing the warm's debayer is now off by default;
+    `MLVAPP_PLAYBACK_WARM_OUTPUT_REUSE=1` turns it on. No venue run has
+    shown it hitting yet, and a miss costs a comparison (0.25 to 36 ms
+    measured) before the debayer runs anyway.

@@ -802,7 +802,8 @@ TEST(PlaybackWarmOutputReuseWiring, TheGateAndTheCompareComeBeforeTheDeviceAmaze
     ASSERT_TRUE(verify > swap);
     ASSERT_TRUE(present.contains(QStringLiteral("postMs = elapsedMs() - postStartMs - verifyMs;")));
     ASSERT_TRUE(window.contains(QStringLiteral("windowEnvFlagEnabled( qgetenv( \"MLVAPP_SMOKE_FIRST_PRESENT_CAPTURE\" ) )")));
-    ASSERT_TRUE(window.contains(QStringLiteral("qgetenv( \"MLVAPP_PLAYBACK_WARM_OUTPUT_REUSE\" ).constData() ), true );")));
+    // PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1: default OFF (opt-in) until a venue shows the reuse hitting
+    ASSERT_TRUE(window.contains(QStringLiteral("qgetenv( \"MLVAPP_PLAYBACK_WARM_OUTPUT_REUSE\" ).constData() ), false );")));
     // the verify unregisters its scratch texture from the AMaZE cache before freeing it
     const QString check = bodyBetween(window, QStringLiteral("double GpuDisplayWindow::verifyWarmOutputReuse("),
                                       QStringLiteral("bool GpuDisplayWindow::readGpuReconSourceBayer16Texture("));

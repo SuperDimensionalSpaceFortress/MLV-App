@@ -19,7 +19,8 @@
  * DETERMINISM-1 F-key adds the recon's per-run constants (PreparedState): a difference there is state_mismatch,
  * decided before any compare, and a state or content miss logs both states.
  *
- * MLVAPP_PLAYBACK_WARM_OUTPUT_REUSE=0 (or false/off/no) turns it off; default on.
+ * MLVAPP_PLAYBACK_WARM_OUTPUT_REUSE=1 (or true/on/yes) turns it on; default OFF since WARM-RECON-DETERMINISM-1 (no
+ * venue has shown it hitting yet, and a miss pays the compare).
  *
  *   ... warm_output_reuse=<hit|miss|skip> reuse_reason=<name> reuse_compare_ms=<x>
  *
@@ -40,7 +41,7 @@ namespace playback_warm_output_reuse
 enum class Reason
 {
     None,                       // preGate: every field matches, go compare
-    Disabled,                   // MLVAPP_PLAYBACK_WARM_OUTPUT_REUSE=0
+    Disabled,                   // MLVAPP_PLAYBACK_WARM_OUTPUT_REUSE not on (the default)
     NotAdopted,                 // this present did not adopt the staged pair (realloc, kept, discarded)
     NoWarmKey,                  // no successful warm since the slot was staged (or the key was consumed)
     ValidationProbe,            // a validation-probe present always runs the full path

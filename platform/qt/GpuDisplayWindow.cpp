@@ -114,12 +114,14 @@ bool playbackRoutePrewarmStageEnabled()
     return enabled;
 }
 
-// PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1 R2 kill switch, read once, same values as above
-// (PlaybackWarmOutputReusePolicy.h): 0/false/off/no makes Play's first recon present always run AMaZE again. Default on.
+// PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1 R2 switch, read once, same values as above
+// (PlaybackWarmOutputReusePolicy.h). PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1: default OFF (opt-in with
+// 1/true/on/yes) until a venue shows the reuse hitting at s1 on both fullscreen and windowed, so a miss never pays the
+// compare; off, Play's first recon present always runs AMaZE again.
 bool playbackWarmOutputReuseEnabled()
 {
     static const bool enabled = playback_env_flag::resolve(
-        playback_env_flag::parse( qgetenv( "MLVAPP_PLAYBACK_WARM_OUTPUT_REUSE" ).constData() ), true );
+        playback_env_flag::parse( qgetenv( "MLVAPP_PLAYBACK_WARM_OUTPUT_REUSE" ).constData() ), false );
     return enabled;
 }
 
