@@ -133,6 +133,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
 
 # ---------- constants that are fleet-wide, not per project ----------
@@ -2571,9 +2572,27 @@ def route_program_name(program: str) -> str:
     return "python" if name in ROUTE_PYTHON_NAMES else name
 
 
-def redact_route_text(text: str) -> str:
+def route_secret_values(template: list[str], fills: dict[str, str]) -> list[str]:
+    """The --fill values bound to a credential, found on the TEMPLATE argv (before any value is substituted), so a value
+    with whitespace in it is one secret and never a run of tokens: every placeholder in a token that names a credential
+    (`NAME=<v>`, `--password=<v>`) or follows `--token`/`--password`, plus every fill whose own name reads as one."""
+    names = {n for n, v in fills.items() if v and ROUTE_CRED_NAME_RE.search(n)}
+    for i, tok in enumerate(template):
+        after_flag = i > 0 and re.fullmatch(r"--(?:token|password)[\w-]*", template[i - 1], re.I) is not None
+        if after_flag or ROUTE_CREDENTIAL_RE.search(tok) or ROUTE_CRED_ASSIGN_RE.match(tok):
+            names.update(m.group(1) for m in ROUTE_PLACEHOLDER_RE.finditer(tok))
+    values = {fills[n] for n in names if fills.get(n)}
+    for value in list(values):                   # a route may echo one line of a multi-line value, or one word of a multiword one
+        values.update(part for part in re.split(r"\s+", value) if len(part) >= 3)
+    return sorted(values, key=lambda v: (-len(v), v))
+
+
+def redact_route_text(text: str, secrets: Iterable[str] = ()) -> str:
     """Route text as shown to a person: a credential assignment keeps its name and loses its value
-    (`GH_TOKEN=abc` -> `GH_TOKEN=<redacted>`), as do the value after `--token`/`--password` and the user-info of a URL."""
+    (`GH_TOKEN=abc` -> `GH_TOKEN=<redacted>`), as do the value after `--token`/`--password` and the user-info of a URL.
+    `secrets` (route_secret_values) are replaced first, longest first, wherever they appear and whatever they contain."""
+    for secret in sorted({x for x in secrets if x}, key=len, reverse=True):
+        text = text.replace(secret, "<redacted>")
     text = ROUTE_CRED_ASSIGN_ANY_RE.sub(lambda m: f"{m.group('name')}=<redacted>", text)
     text = ROUTE_CRED_FLAG_RE.sub(lambda m: f"{m.group('flag')}{m.group('sep')}<redacted>", text)
     return ROUTE_URL_USERINFO_RE.sub(r"\1<redacted>@", text)
@@ -2601,7 +2620,7 @@ def _route_path_candidates(tok: str) -> list[str]:
     return [c for c in found if c and "\0" not in c]
 
 
-def route_live_bus_reason(argv: list[str], cwd: str, bus: str) -> str | None:
+def route_live_bus_reason(argv: list[str], cwd: str, bus: str, secrets: Iterable[str] = ()) -> str | None:
     """Why a route touches the live bus: its cwd, or any argument (or the value of `--opt=VALUE`) resolves inside it.
     Decided on identity (real path, case-folded, `..` collapsed), so every spelling of the bus path is caught."""
     live = route_real_path(bus)
@@ -2614,7 +2633,7 @@ def route_live_bus_reason(argv: list[str], cwd: str, bus: str) -> str | None:
             except (OSError, ValueError):                       # not a path (`HEAD:master`): nothing to compare
                 continue
             if inside:
-                return f"argument {redact_route_text(tok)!r} resolves inside the live bus; a route works in the scratch clone only"
+                return f"argument {redact_route_text(tok, secrets)!r} resolves inside the live bus; a route works in the scratch clone only"
     return None
 
 
@@ -2641,6 +2660,29 @@ def _route_python_unsafe(rest: list[str]) -> str | None:
                 module = cluster[pos + 1:] or (rest[i + 1] if i + 1 < len(rest) else "")
                 if module.split(".")[0] not in ROUTE_PYTHON_MODULES and module not in ROUTE_PYTHON_MODULES:
                     return f"python -m {module or '?'} is not an allowlisted module ({', '.join(sorted(ROUTE_PYTHON_MODULES))})"
+                return None
+            if ch in "WX":                                        # takes the rest of the cluster, or the next token
+                if pos == len(cluster) - 1:
+                    i += 1
+                break
+        i += 1
+    return None
+
+
+def _route_python_script(rest: list[str]) -> str | None:
+    """The script a python/py launcher names, past the options that take an operand (`-X utf8`, `-W ignore`,
+    `--check-hash-based-pycs default`); None when it runs a module (`-m`) or names no script."""
+    i = 0
+    while i < len(rest):
+        tok = rest[i]
+        cluster = _route_flag_cluster(tok)
+        if cluster is None:
+            if tok.startswith("--"):
+                i += 2 if tok == "--check-hash-based-pycs" else 1
+                continue
+            return tok
+        for pos, ch in enumerate(cluster):
+            if ch == "m":
                 return None
             if ch in "WX":                                        # takes the rest of the cluster, or the next token
                 if pos == len(cluster) - 1:
@@ -2709,7 +2751,7 @@ def _route_powershell_unsafe(rest: list[str]) -> str | None:
     return "pwsh/powershell must be run as `-File <script>`; a bare argument is a command"
 
 
-def _route_git_unsafe(argv: list[str], cwd: str) -> str | None:
+def _route_git_unsafe(argv: list[str], cwd: str, secrets: Iterable[str] = ()) -> str | None:
     """git: a read-only or scratch-local verb only (allowlist), no `-c`, no `--config-env`, no `config` write, and
     `-C`/`--git-dir`/`--work-tree` only inside the scratch clone (`cwd`)."""
     scratch = route_real_path(cwd)
@@ -2740,7 +2782,7 @@ def _route_git_unsafe(argv: list[str], cwd: str) -> str | None:
             except (OSError, ValueError):
                 outside = True
             if outside:
-                return f"git {tok} targets {redact_route_text(target)!r}, outside the scratch clone"
+                return f"git {tok} targets {redact_route_text(target, secrets)!r}, outside the scratch clone"
         i += 1
     if sub is None:
         return None
@@ -2756,10 +2798,11 @@ def _route_git_unsafe(argv: list[str], cwd: str) -> str | None:
     return None
 
 
-def route_unsafe_reason(argv: list[str], cwd: str | os.PathLike | None = None, bus: str | os.PathLike | None = None) -> str | None:
+def route_unsafe_reason(argv: list[str], cwd: str | os.PathLike | None = None, bus: str | os.PathLike | None = None,
+                        secrets: Iterable[str] = ()) -> str | None:
     """Why a parsed route must not be run, or None. See the block comment above for the list. A diagnostic never
-    carries a credential's value (redact_route_text). `cwd` is the scratch clone (default: the current directory)
-    and `bus` the live bus, when known."""
+    carries a credential's value (redact_route_text; `secrets` are the filled values bound to one, route_secret_values).
+    `cwd` is the scratch clone (default: the current directory) and `bus` the live bus, when known."""
     if not argv:
         return "empty command"
     here = str(cwd) if cwd is not None else os.getcwd()
@@ -2767,9 +2810,10 @@ def route_unsafe_reason(argv: list[str], cwd: str | os.PathLike | None = None, b
         if ROUTE_SHELL_OPERATOR_RE.match(tok):
             return f"shell operator {tok!r}: a route is one command, no shell"
         if ROUTE_URL_RE.match(tok) or ROUTE_URL_RE.match(tok.split("=", 1)[-1]):
-            return f"network target {redact_route_text(tok)!r}: a route must run offline"
+            return f"network target {redact_route_text(tok, secrets)!r}: a route must run offline"
         if ROUTE_CREDENTIAL_RE.search(tok) or ROUTE_CRED_ASSIGN_RE.match(tok):
-            return f"credential {redact_route_text(tok)!r}: a route touches no credential"
+            shown = f"{tok.split('=', 1)[0]}=<redacted>" if ROUTE_CRED_ASSIGN_RE.match(tok) else redact_route_text(tok, secrets)
+            return f"credential {shown!r}: a route touches no credential"
     if ROUTE_ENV_PREFIX_RE.match(argv[0]):
         return "an environment assignment prefix is shell syntax; a route is one command, no shell"
     name = route_program_name(argv[0])
@@ -2800,11 +2844,11 @@ def route_unsafe_reason(argv: list[str], cwd: str | os.PathLike | None = None, b
     elif name in ROUTE_INLINE_INTERPRETERS and any(t in ROUTE_INLINE_INTERPRETERS[name] for t in argv[1:]):
         reason = "inline code is not a route"
     elif name == "git":
-        reason = _route_git_unsafe(argv, here)
+        reason = _route_git_unsafe(argv, here, secrets)
     if reason:
         return reason
     if bus is not None:
-        return route_live_bus_reason(argv, here, str(bus))
+        return route_live_bus_reason(argv, here, str(bus), secrets)
     return None
 
 
@@ -2826,8 +2870,8 @@ def route_missing_reason(argv: list[str], cwd: pathlib.Path) -> str | None:
     script: str | None = None
     if name in ROUTE_SCRIPT_LAUNCHERS:
         script = next((t for t in argv[1:] if not t.startswith("-")), None)
-        if name in ("python", "py") and any(t == "-m" for t in argv[1:]):
-            script = None
+        if name in ("python", "py"):
+            script = _route_python_script(argv[1:])
     elif name in ("pwsh", "powershell"):
         lowered = [t.lower() for t in argv[1:]]
         if "-file" in lowered and lowered.index("-file") + 1 < len(lowered):
@@ -2992,11 +3036,12 @@ def exercise_route(command: str, cwd: pathlib.Path, timeout: float, fills: dict[
     except ValueError as e:
         return "ROUTE_FAILED", f"does not parse as a command line: {e}"
     # Fill after splitting, so a filled value (a Windows path with backslashes) is never re-parsed as shell text.
+    secrets = route_secret_values(argv, fills)                          # decided on the template, before any value is substituted
     argv = [ROUTE_PLACEHOLDER_RE.sub(lambda m: fills.get(m.group(1), m.group(0)), tok) for tok in argv]
     unfilled = next((m for tok in argv if (m := ROUTE_PLACEHOLDER_RE.search(tok))), None)
     if unfilled:
         return "ROUTE_FAILED", f"unfilled placeholder <{unfilled.group(1)}>; pass --fill {unfilled.group(1)}=VALUE"
-    unsafe = route_unsafe_reason(argv, cwd, bus)
+    unsafe = route_unsafe_reason(argv, cwd, bus, secrets)
     if unsafe:
         return "ROUTE_UNSAFE", unsafe
     missing = route_missing_reason(argv, cwd)
@@ -3009,18 +3054,15 @@ def exercise_route(command: str, cwd: pathlib.Path, timeout: float, fills: dict[
     try:
         returncode, out, err = run_route_process(argv, cwd, env, timeout)
     except FileNotFoundError as e:
-        return "ROUTE_MISSING", str(e)
+        return "ROUTE_MISSING", redact_route_text(str(e), secrets)
     except OSError as e:
-        return "ROUTE_FAILED", f"could not start: {e}"
+        return "ROUTE_FAILED", f"could not start: {redact_route_text(str(e), secrets)}"
     if returncode is None:
         return "ROUTE_TIMEOUT", f"still running after {timeout:g}s; its process tree was killed"
     if returncode != 0:
-        tail = (err.strip() or out.strip()).splitlines()[-1:] or [""]
-        shown = tail[0]
-        for name, value in fills.items():
-            if value and ROUTE_CRED_NAME_RE.search(name):
-                shown = shown.replace(value, "<redacted>")
-        return "ROUTE_FAILED", f"exit {returncode}: {redact_route_text(shown)[:200]}"
+        text = redact_route_text(err.strip() or out.strip(), secrets)      # whole output first: a value may span lines
+        shown = (text.splitlines()[-1:] or [""])[0]
+        return "ROUTE_FAILED", f"exit {returncode}: {shown[:200]}"
     return "ROUTE_OK", ""
 
 

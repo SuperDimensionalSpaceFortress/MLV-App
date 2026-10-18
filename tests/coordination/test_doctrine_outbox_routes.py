@@ -891,6 +891,98 @@ def test_redact_route_text_forms():
     assert ob.redact_route_text("python tools/ok.py go") == "python tools/ok.py go"
 
 
+# ---------- r3 B4 / RX-05: a refused credential assignment redacts its ENTIRE value ----------
+# r2 redacted the expanded token with a `\S*` pattern, so a --fill value holding whitespace lost only its first word
+# (`DB_PASSWORD=<redacted> SECOND_SENTINEL`). The value is now decided on the TEMPLATE token and replaced whole.
+#   M8  route_secret_values returns []  and the whole-token branch of the credential diagnostic removed -> the RX-05 rows
+
+RX05_SENTINELS = {
+    "multiword": ("FIRST_SENTINEL SECOND_SENTINEL", ["FIRST_SENTINEL", "SECOND_SENTINEL"]),
+    "tabs_and_newline": ("TAB_ONE_SENTINEL\tTAB_TWO_SENTINEL\nLINE_THREE_SENTINEL", ["TAB_ONE_SENTINEL", "TAB_TWO_SENTINEL", "LINE_THREE_SENTINEL"]),
+    "quotes_in_the_value": ('"QUOTED_ONE_SENTINEL QUOTED_TWO_SENTINEL"', ["QUOTED_ONE_SENTINEL", "QUOTED_TWO_SENTINEL"]),
+}
+
+
+@pytest.mark.parametrize("case", list(RX05_SENTINELS))
+def test_rx05_a_credential_fill_with_whitespace_is_redacted_whole(tmp_path, case):
+    value, parts = RX05_SENTINELS[case]
+    status, detail = ob.exercise_route("DB_PASSWORD=<value> python tools/x.py", tmp_path, 30, {"value": value})
+    assert status == "ROUTE_UNSAFE" and "DB_PASSWORD=<redacted>" in detail
+    for part in parts:
+        assert part not in detail, detail
+
+
+@pytest.mark.parametrize("case", list(RX05_SENTINELS))
+def test_rx05_nothing_a_run_prints_or_writes_carries_the_value(tmp_path, capsys, case):
+    value, parts = RX05_SENTINELS[case]
+    bus = make_bus(tmp_path, {"tools/x.py": STUB_OK})
+    item = item_file(tmp_path, adopt("DB_PASSWORD=<value> python tools/x.py"))
+    assert exercise(tmp_path, item, bus, "--fill", f"value={value}") == 1
+    captured = capsys.readouterr()
+    assert statuses(captured.out) == ["ROUTE_UNSAFE"]
+    for part in parts:
+        assert part not in captured.out and part not in captured.err
+        assert not [p for p in tmp_path.rglob("*") if p.is_file() and part.encode() in p.read_bytes()]
+
+
+def test_rx05_a_quoted_multiword_value_written_in_the_card_is_redacted_whole(tmp_path):
+    for command in ('DB_PASSWORD="QLIT_ONE_SENTINEL QLIT_TWO_SENTINEL" python tools/x.py',
+                    "DB_PASSWORD='QLIT_ONE_SENTINEL QLIT_TWO_SENTINEL' python tools/x.py"):
+        status, detail = ob.exercise_route(command, tmp_path, 30, {})
+        assert status == "ROUTE_UNSAFE" and "DB_PASSWORD=<redacted>" in detail
+        assert "QLIT_ONE_SENTINEL" not in detail and "QLIT_TWO_SENTINEL" not in detail, detail
+
+
+@pytest.mark.parametrize("tok", ["DB_PASSWORD=QTOK_ONE_SENTINEL QTOK_TWO_SENTINEL", "--password=QTOK_ONE_SENTINEL QTOK_TWO_SENTINEL"])
+def test_rx05_one_token_holding_whitespace_after_posix_unquoting_is_redacted_whole(tmp_path, tok):
+    # POSIX shlex turns DB_PASSWORD="a b" into ONE token `DB_PASSWORD=a b`; Windows' non-POSIX split does not, so the
+    # token list is given directly to keep this row the same on both.
+    reason = ob.route_unsafe_reason([tok, "python", "tools/x.py"], tmp_path)
+    assert reason and "QTOK_ONE_SENTINEL" not in reason and "QTOK_TWO_SENTINEL" not in reason, reason
+
+
+def test_rx05_a_credential_value_that_also_appears_elsewhere_is_redacted_there_too(tmp_path):
+    shared = "SHARED_ONE_SENTINEL SHARED_TWO_SENTINEL"
+    fills = {"label": shared, "value": shared}
+    status, detail = ob.exercise_route("python tools/x.py <label> DB_PASSWORD=<value>", tmp_path, 30, fills)
+    assert status == "ROUTE_UNSAFE" and "SHARED_ONE_SENTINEL" not in detail and "SHARED_TWO_SENTINEL" not in detail, detail
+    (tmp_path / "tools").mkdir()
+    (tmp_path / "tools" / "echo_err.py").write_text(STUB_ECHO_ERR, encoding="utf-8")
+    status, detail = ob.exercise_route("python tools/echo_err.py <label> <db_password>", tmp_path, 30, {"label": shared, "db_password": shared})
+    assert status == "ROUTE_FAILED" and "<redacted>" in detail
+    assert "SHARED_ONE_SENTINEL" not in detail and "SHARED_TWO_SENTINEL" not in detail, detail
+
+
+def test_rx05_a_value_after_a_token_flag_is_redacted_whole(tmp_path):
+    value = "FLAGGED_ONE_SENTINEL FLAGGED_TWO_SENTINEL"
+    status, detail = ob.exercise_route("python tools/x.py --password=<value>", tmp_path, 30, {"value": value})
+    assert status == "ROUTE_UNSAFE" and "FLAGGED_ONE_SENTINEL" not in detail and "FLAGGED_TWO_SENTINEL" not in detail, detail
+    assert ob.route_secret_values(["x", "--token", "<v>"], {"v": value}) == [value, "FLAGGED_ONE_SENTINEL", "FLAGGED_TWO_SENTINEL"]
+
+
+def test_rx05_a_fill_that_is_not_a_credential_is_left_alone(tmp_path):
+    assert ob.route_secret_values(["python", "tools/x.py", "<branch>"], {"branch": "feature one"}) == []
+
+
+# ---------- r3 hardening: a python option that takes an operand is not the script ----------
+
+@pytest.mark.parametrize("command", [
+    "python -B -X utf8 tools/ok.py go",
+    "python -W ignore tools/ok.py go",
+    "python -Xutf8 -W error tools/ok.py go",
+    "python --check-hash-based-pycs default tools/ok.py go",
+])
+def test_a_python_option_operand_is_not_taken_for_the_script(tmp_path, command):
+    (tmp_path / "tools").mkdir()
+    (tmp_path / "tools" / "ok.py").write_text(STUB_OK, encoding="utf-8")
+    assert ob.exercise_route(command, tmp_path, 30, {}) == ("ROUTE_OK", "")
+
+
+def test_a_python_launcher_naming_a_missing_script_past_its_options_is_still_route_missing(tmp_path):
+    status, detail = ob.exercise_route("python -X utf8 tools/gone.py go", tmp_path, 30, {})
+    assert status == "ROUTE_MISSING" and "tools/gone.py" in detail and "utf8" not in detail
+
+
 # ---------- H5 / RX-04: a stale bus clone is flagged ----------
 
 def make_upstream_and_bus(tmp_path: Path) -> tuple[Path, Path]:
