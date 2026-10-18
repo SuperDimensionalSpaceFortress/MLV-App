@@ -1,7 +1,7 @@
 # HubProfile.psm1 - loads and validates a hub profile (see README.md in this folder).
 # Get-HubProfile [-Path <file>] returns the parsed profile object, or throws a typed error:
 #   HubProfileMissingKeyException   a required key is absent or empty (message: "hub-profile-missing-key: <key>")
-#   HubProfileUnreadableException   the file is absent or is not valid JSON (message: "hub-profile-unreadable: <path> (<why>)")
+#   HubProfileUnreadableException   the file is absent, is not valid JSON, or its root is not a JSON object (a scalar or an array) (message: "hub-profile-unreadable: <path> (<why>)")
 # The default path is hub-profile.json beside this module.
 Set-StrictMode -Version Latest
 
@@ -27,7 +27,8 @@ function Get-HubProfile {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw [HubProfileUnreadableException]::new($Path, 'file not found') }
     try { $p = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json -ErrorAction Stop }
     catch { throw [HubProfileUnreadableException]::new($Path, 'not valid JSON') }
-    if ($null -eq $p -or $p -isnot [pscustomobject]) { throw [HubProfileUnreadableException]::new($Path, 'not a JSON object') }
+    # [pscustomobject] is the PSObject accelerator, which every value satisfies; the real type is PSCustomObject, so a scalar or array root (17, "x", [1]) is caught here.
+    if ($null -eq $p -or $p -isnot [System.Management.Automation.PSCustomObject]) { throw [HubProfileUnreadableException]::new($Path, 'not a JSON object') }
 
     foreach ($k in $script:RequiredKeys) {
         $prop = $p.PSObject.Properties[$k]
