@@ -135,6 +135,10 @@
     worktree, ~93% in two CIM scans, so the sweep passes ONE process snapshot (-ProcessSnapshot).
 #>
 
+# HOST-FSMONITOR-DAEMON-LEAK-1: Disable-/Stop-LaneWorktreeFsmonitor live in a light sibling so callers that only create worktrees need not compile this
+# file's Add-Type readers. Loaded fail-soft (a fixture that copies this file alone just skips the fsmonitor calls below).
+$laneFsmonitorLib = Join-Path $PSScriptRoot 'lane-fsmonitor.ps1'
+if (Test-Path -LiteralPath $laneFsmonitorLib) { . $laneFsmonitorLib }
 $script:SweepStampName = 'mlv-sweep-examined'
 $script:RetireDebrisPattern ='(^|/)(__pycache__|\.pytest_cache|\.hypothesis|build-release|build-debug|build-avx-parity|build-console)/$|\.pyc$'
 $script:HolderScriptExt = 'ps1|psm1|py|cmd|bat|js|mjs'
@@ -633,6 +637,8 @@ function Invoke-RetireLaneWorktree {
         if ($gd.out[0] -eq $cd.out[0]) { $d.action = 'skipped'; $d.reason = 'not-a-linked-worktree: main checkout'; return [pscustomobject]$d }
         if (($top.out[0] -replace '/', '\').TrimEnd('\') -ne $wd) { $d.action = 'skipped'; $d.reason = 'not-a-linked-worktree: WorkDir is a subdirectory'; return [pscustomobject]$d }
         $main = Split-Path -Parent ($cd.out[0] -replace '/', '\')
+        # HOST-FSMONITOR-DAEMON-LEAK-1 (a): off BEFORE the gate's own `status` calls, which would otherwise start a daemon in a worktree kept for any reason.
+        if (Get-Command Disable-LaneWorktreeFsmonitor -ErrorAction SilentlyContinue) { $null = Disable-LaneWorktreeFsmonitor -WorkDir $wd }
 
         $h = Run-Git $wd @('rev-parse', 'HEAD'); if ($h.code) { $d.reason = 'cannot-determine: rev-parse HEAD'; return [pscustomobject]$d }
         $d.head = $h.out[0]
@@ -698,6 +704,8 @@ function Invoke-RetireLaneWorktree {
             $d.quarantined += $dst
         }
         $c = Run-Git $wd @('clean', '-fdX'); if ($c.code) { $d.reason = 'remove-failed: git clean -fdX: ' + ($c.out -join ' | '); return [pscustomobject]$d }
+        # HOST-FSMONITOR-DAEMON-LEAK-1 (b): ask this worktree's daemon to exit before its directory goes. Best effort; the result never changes the disposition.
+        if (Get-Command Stop-LaneWorktreeFsmonitor -ErrorAction SilentlyContinue) { $null = Stop-LaneWorktreeFsmonitor -WorkDir $wd }
         $r = Run-Git $main @('-c', 'core.longpaths=true', 'worktree', 'remove', $wd)
         if ($r.code) { $d.reason = 'remove-failed: ' + ($r.out -join ' | '); return [pscustomobject]$d }
         $d.action = 'retired'; $d.reason = 'ok'
