@@ -17,9 +17,13 @@ Named mutations (each turns the named test red, then is reverted):
 from __future__ import annotations
 
 import importlib.util
+import io
 import os
+import shlex
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -280,8 +284,7 @@ def test_scp_style_remote_is_a_network_target():
 def test_a_filled_windows_path_is_not_reparsed(tmp_path):
     """The value is substituted after the line is split, so its backslashes survive."""
     marker = tmp_path / "back\\slash-marker.txt" if os.name != "nt" else tmp_path / "marker.txt"
-    status, _detail = ob.exercise_route("python tools/mark.py <marker>", tmp_path, 30, {"marker": str(marker)}) \
-        if (tmp_path / "tools" / "mark.py").exists() else ("ROUTE_MISSING", "")
+    status, _detail = ob.exercise_route("python tools/mark.py <marker>", tmp_path, 30, {"marker": str(marker)})
     assert status == "ROUTE_MISSING"          # no script in a bare tmp_path: the run never reached the marker
     (tmp_path / "tools").mkdir()
     (tmp_path / "tools" / "mark.py").write_text(STUB_MARK, encoding="utf-8")
@@ -504,3 +507,462 @@ def test_the_shipped_candidates_that_predate_the_rule_still_parse():
     for name in ("20261016-fleet-fold-standard.md", "20261005-an-edit-time-text-hook-cannot-judge-test-still-executes.md"):
         text = (REPO_ROOT / "doctrine-outbox" / name).read_text(encoding="utf-8")
         assert ob.parse_item(text)["meta"]["law4"] == "attested"
+
+
+# ====================================================================================================
+# r2 fix round (sol r2 B1-B4, opus H1-H7). Named mutations, each turns its rows red then is reverted:
+#   M4  route_live_bus_reason returns None                          -> the RX-03 identity rows
+#   M5  _kill_route_tree kills only the direct child                  -> the RX-01 process-tree row
+#   M6  redact_route_text returns its input                           -> the B4 redaction rows
+#   M7  ROUTE_WRAPPERS emptied / _route_git_unsafe returns None       -> the RX-02 rows
+#   M8  bus_commits_behind_origin returns 0                           -> the RX-04 row
+#   M9  RULING_CANDIDATE_LEAD_RE without the bullet/quote prefix      -> the H6 rows
+# ====================================================================================================
+
+SENTINEL = "REVIEW_SENTINEL_NOT_A_SECRET_7f3a9"
+STUB_SPAWN = (
+    "import os, pathlib, subprocess, sys, time\n"
+    "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(600)'])\n"
+    "pathlib.Path(sys.argv[1]).write_text(f'{os.getpid()} {child.pid}')\n"
+    "time.sleep(600)\n"
+)
+STUB_ECHO_ERR = "import sys\nprint(sys.argv[1], file=sys.stderr)\nsys.exit(3)\n"
+
+
+def pid_alive(pid: int) -> bool:
+    try:
+        import psutil
+        return psutil.pid_exists(pid) and psutil.Process(pid).status() != psutil.STATUS_ZOMBIE
+    except ImportError:
+        pass
+    if os.name == "nt":
+        listing = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True, text=True).stdout
+        return str(pid) in listing.split()
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    try:
+        return "State:\tZ" not in Path(f"/proc/{pid}/status").read_text()
+    except OSError:
+        return True
+
+
+def force_kill(pid: int) -> None:
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True)
+    else:
+        try:
+            os.kill(pid, 9)
+        except OSError:
+            pass
+
+
+def bus_spellings(tmp_path: Path, bus: Path) -> dict[str, str]:
+    """Every spelling of 'a file inside the live bus' that the identity rule has to see through."""
+    spell = {"canonical": str(bus / "x.txt"), "trailing-slash": str(bus) + os.sep, "dotdot": str(bus / "sub" / ".." / "x.txt")}
+    if os.name == "nt":
+        spell["case-varied"] = str(bus / "x.txt").swapcase()
+        import ctypes
+        buf = ctypes.create_unicode_buffer(1024)
+        if ctypes.windll.kernel32.GetShortPathNameW(str(bus), buf, 1024) and buf.value.lower() != str(bus).lower():
+            spell["short-name"] = buf.value + "\\x.txt"
+    link = tmp_path / "link-to-bus"
+    try:
+        if os.name == "nt":
+            made = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(bus)], capture_output=True, text=True).returncode == 0
+        else:
+            os.symlink(bus, link)
+            made = True
+    except OSError:
+        made = False
+    if made:
+        spell["junction"] = str(link / "x.txt")
+    return spell
+
+
+SPELLINGS = ["canonical", "trailing-slash", "dotdot", "case-varied", "short-name", "junction"]
+
+
+# ---------- B1 / H3 / RX-03: the live bus, by identity, through every spelling ----------
+
+@pytest.mark.parametrize("spelling", SPELLINGS)
+def test_rx03_an_argument_inside_the_live_bus_is_unsafe_through_any_spelling(tmp_path, capsys, spelling):
+    bus = make_bus(tmp_path, {"tools/mark.py": STUB_MARK})
+    spell = bus_spellings(tmp_path, bus)
+    if spelling not in spell:
+        pytest.skip(f"no {spelling} spelling on this platform or the link could not be made")
+    item = item_file(tmp_path, adopt("python tools/mark.py <where>"))
+    assert exercise(tmp_path, item, bus, "--fill", f"where={spell[spelling]}") == 1
+    assert statuses(capsys.readouterr().out) == ["ROUTE_UNSAFE"]
+    assert not (bus / "x.txt").exists()
+
+
+@pytest.mark.parametrize("spelling", SPELLINGS)
+def test_rx03_a_scratch_root_inside_the_live_bus_is_exit_2_through_any_spelling(tmp_path, capsys, spelling):
+    bus = make_bus(tmp_path, {"tools/mark.py": STUB_MARK})
+    spell = bus_spellings(tmp_path, bus)
+    if spelling not in spell:
+        pytest.skip(f"no {spelling} spelling on this platform or the link could not be made")
+    item = item_file(tmp_path, adopt("python tools/mark.py out.txt"))
+    assert exercise(tmp_path, item, bus, scratch=Path(spell[spelling])) == 2
+    assert "EXERCISE_SCRATCH_INSIDE_BUS" in capsys.readouterr().err
+    assert not (bus / "x.txt").exists() and git(bus, "status", "--porcelain") == ""
+
+
+def test_rx03_an_option_value_inside_the_live_bus_is_unsafe(tmp_path, capsys):
+    bus = make_bus(tmp_path, {"tools/mark.py": STUB_MARK})
+    item = item_file(tmp_path, adopt("python tools/mark.py --out=<bus>/x.txt"))
+    assert exercise(tmp_path, item, bus, "--fill", f"bus={bus}") == 1
+    assert statuses(capsys.readouterr().out) == ["ROUTE_UNSAFE"] and not (bus / "x.txt").exists()
+
+
+def test_rx03_a_route_whose_cwd_is_the_live_bus_is_unsafe(tmp_path):
+    bus = make_bus(tmp_path, {"tools/mark.py": STUB_MARK})
+    status, detail = ob.exercise_route("python tools/mark.py m.txt", bus, 30, {}, bus)
+    assert status == "ROUTE_UNSAFE" and "live bus" in detail
+    assert not (bus / "m.txt").exists()
+
+
+@pytest.mark.parametrize("command", [
+    "git -C <bus> pull --ff-only",
+    "git -C <bus> log --oneline",
+    "git --git-dir=<bus>/.git log",
+    "git --work-tree <bus> status",
+])
+def test_rx03_a_git_route_aimed_at_the_live_bus_by_fill_is_unsafe(tmp_path, capsys, command):
+    bus = make_bus(tmp_path, {"README.md": "bus\n"})
+    head = git(bus, "rev-parse", "HEAD")
+    item = item_file(tmp_path, adopt(command))
+    assert exercise(tmp_path, item, bus, "--fill", f"bus={bus}") == 1
+    assert statuses(capsys.readouterr().out) == ["ROUTE_UNSAFE"]
+    assert git(bus, "rev-parse", "HEAD") == head and git(bus, "status", "--porcelain") == ""
+
+
+def test_the_scratch_placeholder_names_the_scratch_clone(tmp_path, capsys):
+    bus = make_bus(tmp_path, {"tools/mark.py": STUB_MARK})
+    item = item_file(tmp_path, adopt("git -C <scratch> log --oneline", "python tools/mark.py <scratch>/marker.txt"))
+    assert exercise(tmp_path, item, bus) == 0
+    assert statuses(capsys.readouterr().out) == ["ROUTE_OK", "ROUTE_OK"]
+    assert not (bus / "marker.txt").exists()
+
+
+# ---------- B2 / RX-02: wrappers, indirections, online and install verbs ----------
+
+BYPASSES = [
+    "cmd /c git push",
+    "cmd /c python tools/mark.py out.txt",
+    "env gh pr create",
+    "env python tools/mark.py out.txt",
+    "sudo git status",
+    "xargs git push",
+    "start notepad",
+    "time git status",
+    "FOO=1 python tools/mark.py out.txt",
+    'bash -c "git push"',
+    'bash -lc "git push"',
+    'sh -ec "git push"',
+    "bash -o pipefail -c 'git push'",
+    "pwsh -c 'git push'",
+    "pwsh -co 'git push'",
+    "pwsh -com 'git push'",
+    "pwsh -Command 'git push'",
+    "pwsh -e ZQBjAGgAbwA=",
+    "pwsh -ec ZQBjAGgAbwA=",
+    "pwsh -enc ZQBjAGgAbwA=",
+    "powershell -EncodedCommand ZQBjAGgAbwA=",
+    "pwsh git push",
+    'python -c "print(1)"',
+    'python -Ic "print(1)"',
+    "python -m twine upload dist/x",
+    "python -m pip install requests",
+    "python -m http.server",
+    "py -3 -c 1",
+    "node -pe 1",
+    "node --eval 1",
+    "ruby -e 1",
+    "npx claude auth login",
+    "npx some-publisher",
+    "claude auth login",
+    "git -c alias.ship=push ship",
+    "git -c core.sshCommand=x log",
+    "git --config-env=a=B log",
+    "git ship",
+    "git config exercise.probe yes",
+    "git config --add exercise.probe yes",
+    "git config --unset exercise.probe",
+    "git log --output=elsewhere.txt",
+    "git grep -Ofalse needle",
+    "find . -exec git push ;",
+]
+ONLINE_AND_INSTALL = [
+    "git pull --ff-only",
+    "git fetch origin",
+    "git fetch --all",
+    "git push origin master",
+    "git ls-remote origin",
+    "git remote update",
+    "git clone https://example.invalid/x.git",
+    "git clone example.com:o/r",
+    "git submodule update --init",
+    "pip install requests",
+    "pip3 download requests",
+    "npm install",
+    "npm i left-pad",
+    "yarn install",
+    "yarn add left-pad",
+    "pnpm add left-pad",
+    "cargo install ripgrep",
+]
+
+
+@pytest.mark.parametrize("command", BYPASSES)
+def test_rx02_a_wrapper_or_indirection_is_unsafe(tmp_path, command):
+    assert ob.route_unsafe_reason(ob.split_route(command), tmp_path) is not None, command
+
+
+@pytest.mark.parametrize("command", ONLINE_AND_INSTALL)
+def test_online_git_verbs_and_package_installs_are_unsafe(tmp_path, command):
+    assert ob.route_unsafe_reason(ob.split_route(command), tmp_path) is not None, command
+
+
+@pytest.mark.parametrize("command", ["git -C .. status", "git -C / status", "git --git-dir=.. log", "git -C sub/../.. log"])
+def test_rx02_git_aimed_outside_the_scratch_clone_is_unsafe(tmp_path, command):
+    (tmp_path / "sub").mkdir(exist_ok=True)
+    reason = ob.route_unsafe_reason(ob.split_route(command), tmp_path)
+    assert reason is not None and "outside the scratch clone" in reason, command
+
+
+def test_rx02_git_aimed_at_an_absolute_outside_path_is_unsafe(tmp_path):
+    outside = tmp_path.parent
+    reason = ob.route_unsafe_reason(["git", "-C", str(outside), "status"], tmp_path / "scratch")
+    assert reason is not None and "outside the scratch clone" in reason
+
+
+@pytest.mark.parametrize("command", [
+    "git log --oneline", "git -C . status --short", "git rev-parse HEAD", "git config --get user.name", "git config --list",
+    "git -C sub log", "python tools/mark.py out.txt", "python -u tools/mark.py out.txt", "python -W ignore tools/mark.py x",
+    "python -X utf8 tools/mark.py x", "python -m pytest tests -q", "python tools/mark.py -c", "py -3 tools/mark.py x",
+    "pwsh -NoProfile -File tools/x.ps1 -Command foo", "bash tools/x.sh -c", "node tools/x.js --eval", "node --max-old-space-size=100 tools/x.js",
+    "doctrine-sync-not-a-program debt", "pytest tests -q",
+])
+def test_rx02_safe_look_alikes_are_still_not_refused(tmp_path, command):
+    (tmp_path / "sub").mkdir(exist_ok=True)
+    assert ob.route_unsafe_reason(ob.split_route(command), tmp_path) is None, command
+
+
+def test_rx02_a_bypass_is_refused_before_it_is_launched(tmp_path, capsys):
+    bus = make_bus(tmp_path, {"tools/mark.py": STUB_MARK})
+    marker = tmp_path / "marker.txt"
+    commands = ["cmd /c python tools/mark.py <marker>", "env python tools/mark.py <marker>",
+                'bash -lc "python tools/mark.py <marker>"', "pwsh -co 'python tools/mark.py marker'",
+                "git -c alias.m=status m", "python -Ic 1"]
+    item = item_file(tmp_path, adopt(*commands))
+    assert exercise(tmp_path, item, bus, "--fill", f"marker={marker}") == 1
+    assert statuses(capsys.readouterr().out) == ["ROUTE_UNSAFE"] * len(commands)
+    assert not marker.exists()
+
+
+# ---------- B3 / RX-01: a timeout ends the whole process tree ----------
+
+def test_rx01_a_timeout_kills_the_whole_process_tree(tmp_path):
+    (tmp_path / "tools").mkdir()
+    (tmp_path / "tools" / "spawn.py").write_text(STUB_SPAWN, encoding="utf-8")
+    pidfile = tmp_path / "pids.txt"
+    result: list = []
+    runner = threading.Thread(target=lambda: result.append(ob.exercise_route("python tools/spawn.py <pidfile>", tmp_path, 2, {"pidfile": str(pidfile)})),
+                              daemon=True)
+    started = time.monotonic()
+    runner.start()
+    try:
+        runner.join(30)                        # the unfixed code blocks here for as long as the grandchild sleeps
+        elapsed = time.monotonic() - started
+        assert not runner.is_alive(), "exercise_route did not return: the route's process tree outlived the timeout"
+        assert result and result[0][0] == "ROUTE_TIMEOUT" and elapsed < 10, (result, elapsed)
+        assert pidfile.exists(), "the route never started"
+        parent, child = (int(p) for p in pidfile.read_text().split())
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and (pid_alive(parent) or pid_alive(child)):
+            time.sleep(0.2)
+        assert not pid_alive(child), "the grandchild survived the timeout"
+        assert not pid_alive(parent), "the route's own process survived the timeout"
+    finally:
+        if pidfile.exists():
+            for pid in pidfile.read_text().split():
+                force_kill(int(pid))
+
+
+def test_rx01_the_timeout_reaches_a_route_run_through_the_cli(tmp_path, capsys):
+    bus = make_bus(tmp_path, {"tools/spawn.py": STUB_SPAWN})
+    pidfile = tmp_path / "pids.txt"
+    item = item_file(tmp_path, adopt("python tools/spawn.py <pidfile>"))
+    try:
+        assert exercise(tmp_path, item, bus, "--timeout", "2", "--fill", f"pidfile={pidfile}") == 1
+        assert statuses(capsys.readouterr().out) == ["ROUTE_TIMEOUT"]
+        assert not any(pid_alive(int(p)) for p in pidfile.read_text().split())
+    finally:
+        if pidfile.exists():
+            for pid in pidfile.read_text().split():
+                force_kill(int(pid))
+
+
+def test_route_output_is_bounded_to_its_tail(tmp_path):
+    code = "import sys\nfor i in range(60000):\n    sys.stdout.write('x' * 100 + '\\n')\nprint('TAILMARK')\nsys.stderr.write('E' * 200000 + 'ERRTAIL')\nsys.exit(4)\n"
+    (tmp_path / "noisy.py").write_text(code, encoding="utf-8")
+    returncode, out, err = ob.run_route_process([sys.executable, "noisy.py"], tmp_path, dict(os.environ), 60)
+    assert returncode == 4
+    assert len(out) <= ob.ROUTE_OUTPUT_CAP_BYTES and out.rstrip().endswith("TAILMARK")
+    assert len(err) <= ob.ROUTE_OUTPUT_CAP_BYTES and err.endswith("ERRTAIL")
+
+
+# ---------- B4: a credential's value is never printed or written ----------
+
+CREDENTIAL_ROUTES = [
+    "GH_TOKEN=<value> gh pr create",
+    "ANTHROPIC_API_KEY=<value> python tools/mark.py out.txt",
+    "MY_SERVICE_TOKEN=<value> python tools/mark.py out.txt",
+    "DEPLOY_KEY=<value> python tools/mark.py out.txt",
+    "DB_PASSWORD=<value> python tools/mark.py out.txt",
+    "python tools/mark.py out.txt --token=<value>",
+    "python tools/mark.py out.txt --token <value>",
+    "python tools/mark.py https://user:<value>@example.invalid/x",
+]
+
+
+def everything_written_under(root: Path) -> bytes:
+    return b"".join(f.read_bytes() for f in root.rglob("*") if f.is_file())
+
+
+@pytest.mark.parametrize("command", CREDENTIAL_ROUTES)
+def test_b4_a_refused_credential_never_shows_its_value(tmp_path, capsys, command):
+    bus = make_bus(tmp_path, {"tools/mark.py": STUB_MARK})
+    item = item_file(tmp_path, adopt(command))
+    assert exercise(tmp_path, item, bus, "--fill", f"value={SENTINEL}") == 1
+    captured = capsys.readouterr()
+    assert statuses(captured.out) == ["ROUTE_UNSAFE"]
+    assert SENTINEL not in captured.out and SENTINEL not in captured.err
+    assert SENTINEL.encode() not in everything_written_under(tmp_path)
+    status, detail = ob.exercise_route(command, tmp_path, 30, {"value": SENTINEL})
+    assert status == "ROUTE_UNSAFE" and SENTINEL not in detail
+
+
+def test_b4_a_refused_credential_keeps_its_name_and_hides_the_value(tmp_path):
+    status, detail = ob.exercise_route("GH_TOKEN=<value> gh pr create", tmp_path, 30, {"value": SENTINEL})
+    assert status == "ROUTE_UNSAFE" and "GH_TOKEN=<redacted>" in detail
+
+
+def test_b4_a_secret_written_in_the_card_is_redacted_in_the_route_line(tmp_path, capsys):
+    bus = make_bus(tmp_path)
+    item = item_file(tmp_path, adopt(f"GH_TOKEN={SENTINEL} gh pr create"))
+    assert exercise(tmp_path, item, bus) == 1
+    captured = capsys.readouterr()
+    assert route_lines(captured.out)[0].endswith("GH_TOKEN=<redacted> gh pr create")
+    assert SENTINEL not in captured.out and SENTINEL not in captured.err
+
+
+def test_b4_a_fill_pair_without_equals_is_not_echoed(tmp_path, capsys):
+    item = item_file(tmp_path, adopt("python tools/ok.py go"))
+    with pytest.raises(SystemExit) as excinfo:
+        ob.main(["--repo", str(tmp_path), "validate", str(item), "--exercise", "--fill", SENTINEL])
+    assert excinfo.value.code == 2
+    captured = capsys.readouterr()
+    assert SENTINEL not in captured.out and SENTINEL not in captured.err
+
+
+def test_b4_a_credential_named_fill_is_scrubbed_from_a_failure_tail(tmp_path):
+    (tmp_path / "tools").mkdir()
+    (tmp_path / "tools" / "echo_err.py").write_text(STUB_ECHO_ERR, encoding="utf-8")
+    status, detail = ob.exercise_route("python tools/echo_err.py <api_key>", tmp_path, 30, {"api_key": SENTINEL})
+    assert status == "ROUTE_FAILED" and SENTINEL not in detail and "<redacted>" in detail
+
+
+def test_redact_route_text_forms():
+    assert ob.redact_route_text("GH_TOKEN=abc gh pr create") == "GH_TOKEN=<redacted> gh pr create"
+    assert ob.redact_route_text("x --token abc y") == "x --token <redacted> y"
+    assert ob.redact_route_text("x --password=abc") == "x --password=<redacted>"
+    assert ob.redact_route_text("git clone https://u:p@h/x.git") == "git clone https://<redacted>@h/x.git"
+    assert ob.redact_route_text("python tools/ok.py go") == "python tools/ok.py go"
+
+
+# ---------- H5 / RX-04: a stale bus clone is flagged ----------
+
+def make_upstream_and_bus(tmp_path: Path) -> tuple[Path, Path]:
+    upstream = tmp_path / "upstream"
+    upstream.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "master", str(upstream)], check=True, capture_output=True, text=True)
+    (upstream / "tools").mkdir()
+    (upstream / "tools" / "ok.py").write_text(STUB_OK, encoding="utf-8")
+    git(upstream, "add", "-A")
+    git(upstream, "commit", "-q", "-m", "one")
+    bus = tmp_path / "bus"
+    subprocess.run(["git", "clone", "-q", str(upstream), str(bus)], check=True, capture_output=True, text=True)
+    return upstream, bus
+
+
+def test_rx04_a_bus_behind_its_origin_warns_and_the_exit_is_unchanged(tmp_path, capsys):
+    upstream, bus = make_upstream_and_bus(tmp_path)
+    (upstream / "tools" / "ok.py").unlink()
+    git(upstream, "add", "-A")
+    git(upstream, "commit", "-q", "-m", "two removes the script")
+    git(bus, "fetch", "-q", "origin")
+    item = item_file(tmp_path, adopt("python tools/ok.py go"))
+    assert exercise(tmp_path, item, bus) == 0                     # the stale bus still has the script
+    captured = capsys.readouterr()
+    assert statuses(captured.out) == ["ROUTE_OK"] and "ROUTE_BUS_STALE 1" in captured.err
+    git(bus, "merge", "-q", "--ff-only", "origin/master")          # caught up: the script is gone, and no warning
+    assert exercise(tmp_path, item, bus) == 1
+    captured = capsys.readouterr()
+    assert statuses(captured.out) == ["ROUTE_MISSING"] and "ROUTE_BUS_STALE" not in captured.err
+
+
+def test_a_bus_without_an_origin_does_not_warn(tmp_path, capsys):
+    bus = make_bus(tmp_path, {"tools/ok.py": STUB_OK})
+    item = item_file(tmp_path, adopt("python tools/ok.py go"))
+    assert exercise(tmp_path, item, bus) == 0
+    assert "ROUTE_BUS_STALE" not in capsys.readouterr().err
+
+
+# ---------- H6: a bulleted or quoted ruling-candidate lead ----------
+
+@pytest.mark.parametrize("body", [
+    "### mlv-app - x\n\n- **Ruling candidate:** the hook is deny-only.\n",
+    "### mlv-app - x\n\n> Ruling candidate: the hook is deny-only.\n",
+    "### mlv-app - x\n\n* Ruling-candidate (not law): the hook is deny-only.\n",
+    "### mlv-app - x\n\n> - **Ruling candidate** the hook is deny-only.\n",
+])
+def test_h6_a_bulleted_or_quoted_lead_still_needs_the_list(body):
+    assert refusal_code(body) == "RULING_CANDIDATE_NO_SUPERSEDES"
+
+
+def test_h6_a_bulleted_lead_with_the_list_passes():
+    body = "### mlv-app - x\n\n- **Ruling candidate:** the hook is deny-only.\n\ntouches/supersedes: R14.8\n"
+    assert refusal_code(body) is None
+
+
+# ---------- H7: Windows fidelity ----------
+
+@pytest.mark.skipif(os.name != "nt", reason="a .cmd shim and a backslash path are Windows things")
+def test_h7_a_cmd_shim_is_route_missing_with_its_reason(tmp_path, monkeypatch):
+    shims = tmp_path / "shims"
+    shims.mkdir()
+    (shims / "fancytool.cmd").write_text("@echo off\r\n", encoding="utf-8")
+    monkeypatch.setenv("PATH", str(shims) + os.pathsep + os.environ["PATH"])
+    status, detail = ob.exercise_route("fancytool run", tmp_path, 30, {})
+    assert status == "ROUTE_MISSING" and "shim" in detail
+
+
+@pytest.mark.skipif(os.name != "nt", reason="a backslash path in route text is a Windows thing")
+def test_h7_a_backslash_path_in_route_text_is_kept(tmp_path):
+    (tmp_path / "tools").mkdir()
+    (tmp_path / "tools" / "ok.py").write_text(STUB_OK, encoding="utf-8")
+    assert ob.exercise_route("python tools\\ok.py go", tmp_path, 30, {}) == ("ROUTE_OK", "")
+    assert ob.split_route('python "tools\\ok.py" "a b"') == ["python", "tools\\ok.py", "a b"]
+
+
+def test_h7_a_character_the_stream_cannot_encode_does_not_raise():
+    stream = io.TextIOWrapper(io.BytesIO(), encoding="cp1252")
+    ob._route_say("ROUTE_OK item python tools/ok.py caf\u00e9 \u2192 \u65e5\u672c", stream)
+    stream.flush()
+    assert stream.buffer.getvalue().startswith(b"ROUTE_OK item")
