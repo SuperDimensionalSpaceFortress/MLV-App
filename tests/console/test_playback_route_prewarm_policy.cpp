@@ -669,3 +669,229 @@ TEST(PlaybackGpuClockKickWiring, TheKernelIsBoundedByAGlobaltimerDeadlineOnItsOw
     // both live runs end a running kick right after their tile drain, before the CUDA-GL handoff
     ASSERT_EQ(2, cu.count(QStringLiteral("            probe);\n        stop_clock_kick_for_live_run(backend);\n")));
 }
+
+// PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1 R2 (PlaybackWarmOutputReusePolicy.h): Play's first recon present
+// keeps the paused warm's AMaZE output only after preGate and the exact input compare; every other path runs the AMaZE
+// call unchanged. These pin the order of the key's life (set only after the warm's AMaZE succeeded, moved out by the
+// adopting present before the staged members are cleared, cleared with the slot and by a re-run prewarm) and the call
+// order in the present.
+TEST(PlaybackWarmOutputReuseWiring, TheWarmKeysTheSlotOnlyAfterItsAmazeSucceeded)
+{
+    const QString window = sourceFile("platform/qt/GpuDisplayWindow.cpp");
+    const QString warm = bodyBetween(window, QStringLiteral("bool GpuDisplayWindow::warmStagedReconSlotFromDeviceBayer16(const uint16_t"),
+                                     QStringLiteral("bool GpuDisplayWindow::prewarmPlaybackReconRoute(int texWidth"));
+    ASSERT_FALSE(warm.isEmpty());
+    // an older key is dropped first, whatever this warm does
+    const int clearAt = warm.indexOf(QStringLiteral("clearStagedReconWarmKey();"));
+    const int noOutput = warm.indexOf(QStringLiteral("if ( reason ) *reason = QStringLiteral(\"no_device_output\");"));
+    ASSERT_TRUE(clearAt >= 0);
+    ASSERT_TRUE(noOutput > clearAt);
+    const int amaze = warm.indexOf(QStringLiteral("const bool amazeOk =\n        gpuAmazeDebayerRenderPostWbGlTextureFromDeviceBayer16(deviceBayer16,"));
+    const int gate = warm.indexOf(QStringLiteral("    if ( amazeOk )\n    {\n        quint64 captureId = 0;"));
+    const int capture = warm.indexOf(QStringLiteral("gpuAmazeDebayerCaptureInputBayer16(deviceBayer16, width, height, &captureId, &captureWhy)"));
+    const int keyed = warm.indexOf(QStringLiteral("m_stagedReconWarmKey = key;"));
+    ASSERT_TRUE(amaze >= 0);
+    ASSERT_TRUE(gate > amaze);
+    ASSERT_TRUE(capture > gate);
+    ASSERT_TRUE(keyed > capture);
+    ASSERT_EQ(1, (int)warm.count(QStringLiteral("m_stagedReconWarmKey = ")));
+    // the key carries the capture id and every non-content AMaZE input
+    for (const char *field : {"key.valid = true;", "key.frame = frame;", "key.width = width;", "key.height = height;",
+                              "key.blackLevel = blackLevel;", "key.wb[0] = wbMultipliers[0];", "key.wb[1] = wbMultipliers[1];",
+                              "key.wb[2] = wbMultipliers[2];", "key.reducedHnyquist = reducedHnyquist;",
+                              "key.setClipCountAfterWarm = setClipCountAfter;", "key.setLutsCountAfterWarm = setLutsCountAfter;",
+                              "key.captureId = captureId;"})
+        ASSERT_TRUE(warm.contains(QString::fromLatin1(field)));
+    // MainWindow hands the warm its frame and the counts read on the worker right after the run
+    const QString source = sourceFile("platform/qt/MainWindow.cpp");
+    ASSERT_TRUE(source.contains(QStringLiteral(
+        "static_cast<uint64_t>( done.frameNumber ), outcome.setClipCountAfter, outcome.setLutsCountAfter,")));
+    const QString core = sourceFile("platform/qt/PlaybackReconWarmRun.h");
+    const int after = core.indexOf(QStringLiteral("out.setClipCountAfter = llrpGpuPlaybackReconSetClipCount();"));
+    ASSERT_TRUE(after > core.indexOf(QStringLiteral("applyLLRawProcObjectWorker( video, raw.data()")));
+    ASSERT_TRUE(core.contains(QStringLiteral("out.setLutsCountAfter = llrpGpuPlaybackReconSetLutsCount();")));
+}
+
+TEST(PlaybackWarmOutputReuseWiring, TheKeyIsClearedWithTheSlotAndByAReRunPrewarm)
+{
+    const QString window = sourceFile("platform/qt/GpuDisplayWindow.cpp");
+    const QString clear = bodyBetween(window, QStringLiteral("void GpuDisplayWindow::clearStagedReconWarmKey()"),
+                                      QStringLiteral("void GpuDisplayWindow::releaseStagedReconSlot()"));
+    ASSERT_TRUE(clear.contains(QStringLiteral("m_stagedReconWarmKey = playback_warm_output_reuse::Key();")));
+    ASSERT_TRUE(clear.contains(QStringLiteral("if ( held ) gpuAmazeDebayerReleaseInputCapture();")));
+    // the slot release clears the key first, before its no-pair early return
+    const QString release = bodyBetween(window, QStringLiteral("void GpuDisplayWindow::releaseStagedReconSlot()"),
+                                        QStringLiteral("void GpuDisplayWindow::cleanupGLResources()"));
+    const int cleared = release.indexOf(QStringLiteral("clearStagedReconWarmKey();"));
+    const int early = release.indexOf(QStringLiteral("if ( !m_stagedReconOutput && !m_stagedReconSource ) return;"));
+    ASSERT_TRUE(cleared >= 0);
+    ASSERT_TRUE(early > cleared);
+    // cleanupGLResources (window/fullscreen toggle, context loss) goes through the slot release
+    const QString cleanup = bodyBetween(window, QStringLiteral("void GpuDisplayWindow::cleanupGLResources()"),
+                                        QStringLiteral("    destroyTexture();"));
+    ASSERT_TRUE(cleanup.contains(QStringLiteral("releaseStagedReconSlot();")));
+    // a re-run prewarm clears it at the top, before its own early returns
+    const QString prewarm = bodyBetween(window, QStringLiteral("bool GpuDisplayWindow::prewarmPlaybackReconRoute(int texWidth"),
+                                        QStringLiteral("    QOpenGLContext *glContext = context();"));
+    ASSERT_TRUE(prewarm.contains(QStringLiteral("clearStagedReconWarmKey();")));
+}
+
+TEST(PlaybackWarmOutputReuseWiring, TheAdoptingPresentMovesTheKeyOutBeforeTheStagedMembersAreCleared)
+{
+    const QString window = sourceFile("platform/qt/GpuDisplayWindow.cpp");
+    const QString present = bodyBetween(window, QStringLiteral("bool GpuDisplayWindow::setPresentedGpuPlaybackReconAmazePostWbTexture("),
+                                        QStringLiteral("double GpuDisplayWindow::verifyWarmOutputReuse("));
+    ASSERT_FALSE(present.isEmpty());
+    const int adopt = present.indexOf(QStringLiteral("if ( stagedSlot == playback_route_staged_slot::Decision::Adopt )"));
+    const int moved = present.indexOf(QStringLiteral("warmKey = m_stagedReconWarmKey;"), adopt);
+    const int emptied = present.indexOf(QStringLiteral("m_stagedReconWarmKey = playback_warm_output_reuse::Key();"), adopt);
+    const int adopted = present.indexOf(QStringLiteral("stagedAdopted = true;"), adopt);
+    const int stagedCleared = present.indexOf(QStringLiteral("m_stagedReconOutput = nullptr;"), adopt);
+    ASSERT_TRUE(adopt >= 0);
+    ASSERT_TRUE(moved > adopt);
+    ASSERT_TRUE(emptied > moved);
+    ASSERT_TRUE(adopted > moved);
+    ASSERT_TRUE(stagedCleared > adopted);
+    // a key the present did not move out is consumed anyway
+    ASSERT_TRUE(present.contains(QStringLiteral("if ( !stagedAdopted && m_stagedReconWarmKey.valid ) clearStagedReconWarmKey();")));
+}
+
+TEST(PlaybackWarmOutputReuseWiring, TheGateAndTheCompareComeBeforeTheDeviceAmazeWhichStaysOnEveryOtherPath)
+{
+    const QString window = sourceFile("platform/qt/GpuDisplayWindow.cpp");
+    const QString present = bodyBetween(window, QStringLiteral("bool GpuDisplayWindow::setPresentedGpuPlaybackReconAmazePostWbTexture("),
+                                        QStringLiteral("double GpuDisplayWindow::verifyWarmOutputReuse("));
+    const int dims = present.indexOf(QStringLiteral("          && deviceHeight == texHeight )"));
+    const int gate = present.indexOf(QStringLiteral("playback_warm_output_reuse::Reason reuseReason = playback_warm_output_reuse::preGate("));
+    const int onNone = present.indexOf(QStringLiteral("if ( reuseReason == playback_warm_output_reuse::Reason::None )"));
+    const int compare = present.indexOf(QStringLiteral("gpuAmazeDebayerInputBayer16MatchesCapture("));
+    const int released = present.indexOf(QStringLiteral("if ( warmKey.valid ) gpuAmazeDebayerReleaseInputCapture();"));
+    const int amaze = present.indexOf(QStringLiteral(
+        "                warmOutputReused\n"
+        "                || gpuAmazeDebayerRenderPostWbGlTextureFromDeviceBayer16(\n"
+        "                    deviceBayer16,\n"
+        "                    m_texture->textureId(),"));
+    ASSERT_TRUE(dims >= 0);
+    ASSERT_TRUE(gate > dims);
+    ASSERT_TRUE(onNone > gate);
+    ASSERT_TRUE(compare > onNone);
+    ASSERT_TRUE(released > compare);
+    ASSERT_TRUE(amaze > released);
+    // the gate reads the live state: the frame id, the dims, black, WB, H-Nyquist, the loss flag, the probe, the counts
+    const QString gateCall = present.mid(gate, onNone - gate);
+    for (const char *input : {"playbackWarmOutputReuseEnabled(),", "stagedAdopted,", "warmKey,", "presentKey,",
+                              "llrpGpuCudaSuppressed() != 0,", "validationProbeTexture,",
+                              "llrpGpuPlaybackReconSetClipCount(),", "llrpGpuPlaybackReconSetLutsCount());"})
+        ASSERT_TRUE(gateCall.contains(QString::fromLatin1(input)));
+    for (const char *field : {"presentKey.frame = state->frame_id;", "presentKey.width = texWidth;", "presentKey.height = texHeight;",
+                              "presentKey.blackLevel = blackLevel;", "presentKey.wb[2] = wbMultipliers[2];",
+                              "presentKey.reducedHnyquist = reducedHnyquist;"})
+        ASSERT_TRUE(present.contains(QString::fromLatin1(field)));
+    // only a hit skips the call: reuse() is true for Hit alone (PlaybackWarmOutputReusePolicy.h)
+    ASSERT_TRUE(present.contains(QStringLiteral("const bool warmOutputReused = playback_warm_output_reuse::reuse(reuseReason);")));
+    ASSERT_EQ(1, (int)present.count(QStringLiteral("warmOutputReused\n                || ")));
+    // the validation-proof step and the r16 bridge fallback are untouched
+    ASSERT_TRUE(present.indexOf(QStringLiteral("const bool validationProofOk =")) > amaze);
+    ASSERT_TRUE(present.contains(QStringLiteral("            && gpuAmazeDebayerRenderPostWbGlTextureFromR16GlTexture(\n")));
+    // the capture is consumed on the paths that never reached the compare, too
+    ASSERT_EQ(2, (int)present.count(QStringLiteral("if ( warmKey.valid ) gpuAmazeDebayerReleaseInputCapture();")));
+    // R4: the identity check runs after the paint and the swap, only on an identity leg, only on a reused frame
+    const int swap = present.indexOf(QStringLiteral("glContext->swapBuffers(this);"));
+    const int verify = present.indexOf(QStringLiteral("if ( reusedDeviceBayer16 && warmOutputReuseVerifyRequested() )"));
+    ASSERT_TRUE(swap >= 0);
+    ASSERT_TRUE(verify > swap);
+    ASSERT_TRUE(present.contains(QStringLiteral("postMs = elapsedMs() - postStartMs - verifyMs;")));
+    ASSERT_TRUE(window.contains(QStringLiteral("windowEnvFlagEnabled( qgetenv( \"MLVAPP_SMOKE_FIRST_PRESENT_CAPTURE\" ) )")));
+    ASSERT_TRUE(window.contains(QStringLiteral("qgetenv( \"MLVAPP_PLAYBACK_WARM_OUTPUT_REUSE\" ).constData() ), true );")));
+    // the verify unregisters its scratch texture from the AMaZE cache before freeing it
+    const QString check = bodyBetween(window, QStringLiteral("double GpuDisplayWindow::verifyWarmOutputReuse("),
+                                      QStringLiteral("bool GpuDisplayWindow::readGpuReconSourceBayer16Texture("));
+    const int reset = check.indexOf(QStringLiteral("gpuAmazeDebayerResetR16TextureBackendResources();"));
+    ASSERT_TRUE(reset >= 0);
+    ASSERT_TRUE(check.indexOf(QStringLiteral("delete scratch;")) > reset);
+}
+
+TEST(PlaybackWarmOutputReuseWiring, TheBackendWrappersRespectTheAmazeRunCensusAndNeverLoadTheDll)
+{
+    const QString debayer = sourceFile("platform/qt/GpuDebayer.cpp");
+    // the census forms (test_gpu_device_loss_breaker.cpp, test_gpu_field_telemetry.cpp): still exactly 4 AMaZE runs
+    ASSERT_EQ(4, (int)debayer.count(QStringLiteral("if ( !enterAmazeRunUnlessCudaSuppressed(&")));
+    ASSERT_TRUE(debayer.contains(QStringLiteral(
+        "const bool mayCapture = enterAmazeRunUnlessCudaSuppressed(&live.runtime, GpuFieldTelemetry::enabled());")));
+    ASSERT_TRUE(debayer.contains(QStringLiteral(
+        "const bool mayCompare = enterAmazeRunUnlessCudaSuppressed(&live.runtime, GpuFieldTelemetry::enabled());")));
+    const QString capture = bodyBetween(debayer, QStringLiteral("bool gpuAmazeDebayerCaptureInputBayer16("),
+                                        QStringLiteral("bool gpuAmazeDebayerInputBayer16MatchesCapture("));
+    const QString matches = bodyBetween(debayer, QStringLiteral("bool gpuAmazeDebayerInputBayer16MatchesCapture("),
+                                        QStringLiteral("void gpuAmazeDebayerReleaseInputCapture(void)"));
+    const QString release = bodyBetween(debayer, QStringLiteral("void gpuAmazeDebayerReleaseInputCapture(void)"),
+                                        QStringLiteral("\n}\n"));
+    ASSERT_FALSE(capture.isEmpty());
+    ASSERT_FALSE(matches.isEmpty());
+    ASSERT_FALSE(release.isEmpty());
+    // code lines only: the comments that say "never live.ensure()" are not calls
+    const auto codeOnly = [](const QString & body)
+    {
+        QStringList kept;
+        for (const QString & line : body.split(QLatin1Char('\n')))
+            if (!line.trimmed().startsWith(QStringLiteral("//"))) kept << line;
+        return kept.join(QLatin1Char('\n'));
+    };
+    ASSERT_TRUE(capture.contains(QStringLiteral("never live.ensure()")));
+    const QString captureCode = codeOnly(capture);
+    const QString matchesCode = codeOnly(matches);
+    for (const QString *body : {&captureCode, &matchesCode})
+    {
+        // suppressed first, the live lock, then the re-check; never live.ensure()
+        const int first = body->indexOf(QStringLiteral("if ( llrpGpuCudaSuppressed() ) return fail(\"cuda_suppressed\");"));
+        const int lock = body->indexOf(QStringLiteral("QMutexLocker locker(&live.mutex);"));
+        const int recheck = body->indexOf(QStringLiteral("enterAmazeRunUnlessCudaSuppressed(&live.runtime"));
+        ASSERT_TRUE(first >= 0);
+        ASSERT_TRUE(lock > first);
+        ASSERT_TRUE(recheck > lock);
+        ASSERT_FALSE(body->contains(QStringLiteral("live.ensure(")));
+    }
+    // the release is never gated and never loads
+    ASSERT_FALSE(codeOnly(release).contains(QStringLiteral("llrpGpuCudaSuppressed")));
+    ASSERT_FALSE(codeOnly(release).contains(QStringLiteral("ensure(")));
+    // all three symbols are optional resolves
+    for (const char *symbol : {"igpu_amaze_debayer_capture_input_bayer16", "igpu_amaze_debayer_input_bayer16_matches_capture",
+                               "igpu_amaze_debayer_release_input_capture"})
+    {
+        ASSERT_TRUE(debayer.contains(QStringLiteral("runtime.library.resolve(\"%1\")").arg(QString::fromLatin1(symbol))));
+        ASSERT_TRUE(sourceFile("tools/gpu/backend/igpu_amaze_debayer_cuda.def").contains(
+            QStringLiteral("    %1\n").arg(QString::fromLatin1(symbol))));
+    }
+    // the backend: no compare is launched without the matching capture, and the release makes no CUDA call
+    const QString cu = sourceFile("tools/gpu/backend/igpu_amaze_debayer_cuda.cu");
+    const QString match = bodyBetween(cu, QStringLiteral("extern \"C\" int igpu_amaze_debayer_input_bayer16_matches_capture("),
+                                      QStringLiteral("extern \"C\" int igpu_amaze_debayer_release_input_capture("));
+    const int refuse = match.indexOf(QStringLiteral("if (backend->captureId == 0 || !backend->captureBayer16 || capture_id != backend->captureId"));
+    const int launch = match.indexOf(QStringLiteral("k_bayer16_differs<<<"));
+    ASSERT_TRUE(refuse >= 0);
+    ASSERT_TRUE(launch > refuse);
+    const QString rel = bodyBetween(cu, QStringLiteral("extern \"C\" int igpu_amaze_debayer_release_input_capture("),
+                                    QStringLiteral("\n}\n"));
+    ASSERT_FALSE(rel.isEmpty());
+    ASSERT_FALSE(rel.contains(QStringLiteral("cuda")));
+    // destroy frees the capture, before the backend is deleted
+    const QString destroy = bodyBetween(cu, QStringLiteral("extern \"C\" void igpu_amaze_debayer_destroy("),
+                                        QStringLiteral("    delete backend;"));
+    ASSERT_TRUE(destroy.contains(QStringLiteral("free_input_capture(backend);")));
+}
+
+TEST(PlaybackWarmOutputReuseWiring, TheFirstPresentSplitReadsTheReuseAndAReusedFrameZeroHasNoProbe)
+{
+    const QString source = sourceFile("platform/qt/MainWindow.cpp");
+    for (const char *key : {"gpu_playback_recon_texture_present_warm_output_reuse", "gpu_playback_recon_texture_present_reuse_reason",
+                            "gpu_playback_recon_texture_present_reuse_compare_ms", "gpu_playback_recon_texture_present_reuse_verify_ran"})
+        ASSERT_EQ(2, (int)source.count(QStringLiteral("\"%1\"").arg(QString::fromLatin1(key))));   // written once, read once
+    ASSERT_TRUE(source.contains(QStringLiteral("        if( fp.frame0Reused() )\n        {")));
+    ASSERT_TRUE(source.contains(QStringLiteral("            fp.probeValid = false;")));
+    ASSERT_TRUE(source.contains(QStringLiteral("frames.frame0Reused = firstSplit.frame0Reused();")));
+    // the kick (default off) still ends at the first present
+    ASSERT_TRUE(source.contains(QStringLiteral(
+        "if( m_playbackGpuClockKickActive && ui->actionPlay->isChecked() ) endPlaybackGpuClockKick( \"first_present\" );")));
+    // the warm line carries the capture outcome
+    ASSERT_TRUE(source.contains(QStringLiteral("+ playback_warm_output_reuse::captureField( reuseCapture );")));
+}

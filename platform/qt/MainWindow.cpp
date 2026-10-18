@@ -5485,6 +5485,17 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
                 QStringLiteral("gpu_playback_recon_texture_present_amaze_kernel_ms"), st.amaze_kernel_ms );
             readyFrame.stageTimingTelemetry.insert(
                 QStringLiteral("gpu_playback_recon_texture_present_amaze_download_ms"), st.amaze_download_ms );
+            // PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1 R3: did this call keep the paused warm's output
+            readyFrame.stageTimingTelemetry.insert(
+                QStringLiteral("gpu_playback_recon_texture_present_warm_output_reuse"),
+                QString::fromLatin1( st.warm_output_reuse ? st.warm_output_reuse : "none" ) );
+            readyFrame.stageTimingTelemetry.insert(
+                QStringLiteral("gpu_playback_recon_texture_present_reuse_reason"),
+                QString::fromLatin1( st.reuse_reason ? st.reuse_reason : "none" ) );
+            readyFrame.stageTimingTelemetry.insert(
+                QStringLiteral("gpu_playback_recon_texture_present_reuse_compare_ms"), st.reuse_compare_ms );
+            readyFrame.stageTimingTelemetry.insert(
+                QStringLiteral("gpu_playback_recon_texture_present_reuse_verify_ran"), st.reuse_verify_ran );
         }
         readyFrame.stageTimingTelemetry.insert(
             QStringLiteral("gpu_playback_recon_texture_present_recon_wall_ms"),
@@ -27769,12 +27780,15 @@ void MainWindow::onPlaybackReconWarmDone( const RenderFrameThread::PlaybackRecon
     line.overlappedPlay = done.realRequestArrivedDuringWarm && playing;
     QString amazeReason;
     GpuAmazeDebayerBackendTiming amazeTiming;   // PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row 0: its probe
+    QString reuseCapture;   // PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1 R2: the warm key's input capture
     if( playback_recon_warm_run::guiAmazeAllowed( hasOutput, playing, clipMatches ) )
     {
         const double wb[3] = { done.wbMultipliers[0], done.wbMultipliers[1], done.wbMultipliers[2] };
         line.amazeOk = GpuDisplayWindow::warmStagedReconSlotFromDeviceBayer16IfActive(
             outcome.retained.device_bayer16, outcome.width, outcome.height, done.blackLevel, wb,
-            playbackReducedHnyquistWanted( outcome.scale > 1 ), &line.amazeKernelMs, &amazeReason, &amazeTiming );
+            playbackReducedHnyquistWanted( outcome.scale > 1 ), &line.amazeKernelMs, &amazeReason, &amazeTiming,
+            static_cast<uint64_t>( done.frameNumber ), outcome.setClipCountAfter, outcome.setLutsCountAfter,
+            &reuseCapture );
     }
     else if( hasOutput )
     {
@@ -27794,7 +27808,8 @@ void MainWindow::onPlaybackReconWarmDone( const RenderFrameThread::PlaybackRecon
                                              .arg( static_cast<qulonglong>( outcome.setClipCalls ) )
                                              .arg( static_cast<qulonglong>( outcome.setLutsCalls ) )
                                              .arg( outcome.backendRc )
-                             + amazeReason + QStringLiteral( "\"" );
+                             + amazeReason + QStringLiteral( "\"" )
+                             + playback_warm_output_reuse::captureField( reuseCapture );
     if( clipMatches && !playing ) schedulePlaybackReconWarmRepost( outcome.reason, done.clipGeneration );
 }
 
@@ -28459,14 +28474,19 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
     {
         const GpuAmazeProbeSessionRecord record = gpuAmazeDebayerProbeSessionRecord();
         playback_startup_split::AmazeFirstFrames frames;
-        frames.count = qMin( record.calls, playback_startup_split::AmazeFirstFrames::kFrames );
+        // PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1 R3: a reused frame 0 has no record; R4's verify run
+        // (identity legs) is record 0 and is skipped, so record i is always labelled by its own frame
+        const playback_startup_split::FirstPresentSplit &firstSplit = m_playbackStartupSplit.firstPresentSplit();
+        frames.frame0Reused = firstSplit.frame0Reused();
+        const int skip = frames.frame0Reused && firstSplit.reuseVerifyRan ? 1 : 0;
+        frames.count = qMax( 0, qMin( record.calls - skip, playback_startup_split::AmazeFirstFrames::kFrames ) );
         frames.probeAvailable = record.probeAvailable;
         for( int i = 0; i < frames.count; ++i )
         {
-            frames.kernelMs[i] = record.kernelMs[i];
-            frames.deviceMs[i] = record.deviceMs[i];
-            frames.smMhzBefore[i] = record.smMhzBefore[i];
-            frames.valid[i] = record.valid[i];
+            frames.kernelMs[i] = record.kernelMs[i + skip];
+            frames.deviceMs[i] = record.deviceMs[i + skip];
+            frames.smMhzBefore[i] = record.smMhzBefore[i + skip];
+            frames.valid[i] = record.valid[i + skip];
         }
         m_playbackStartupSplit.noteAmazeFirstFrames( frames );
     }
@@ -31240,6 +31260,19 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
         }
         fp.clockKickRun = m_playbackGpuClockKickDecision.run;
         fp.clockKickReason = QString::fromLatin1( playback_gpu_clock_kick::reasonName( m_playbackGpuClockKickDecision.reason ) );
+        // PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1 R3: the reuse outcome (absent: the CPU route, skip)
+        const QString reuse = telemetryStringValue( t, "gpu_playback_recon_texture_present_warm_output_reuse" );
+        const QString reuseReason = telemetryStringValue( t, "gpu_playback_recon_texture_present_reuse_reason" );
+        fp.warmOutputReuse = reuse.isEmpty() || reuse == QLatin1String( "none" ) ? QStringLiteral( "skip" ) : reuse;
+        fp.reuseReason = reuseReason.isEmpty() ? QStringLiteral( "cpu_route" ) : reuseReason;
+        fp.reuseCompareMs = telemetryDoubleValue( t, "gpu_playback_recon_texture_present_reuse_compare_ms" );
+        fp.reuseVerifyRan = t.value( QStringLiteral( "gpu_playback_recon_texture_present_reuse_verify_ran" ) ).toBool();
+        if( fp.frame0Reused() )
+        {
+            // frame 0 ran no AMaZE at Play: probe record 0 is frame 1 (or R4's verify run), never frame 0's
+            fp.probeValid = false;
+            fp.kickLeadMs = -1.0;
+        }
         m_playbackStartupSplit.noteFirstPresentSplit( fp );
         // Row 0: render_first by the first frame's existing stage timers (never a new hot-path timer)
         playback_startup_split::RenderFirstSplit rf;

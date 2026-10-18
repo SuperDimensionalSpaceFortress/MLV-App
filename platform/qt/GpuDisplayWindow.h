@@ -33,6 +33,7 @@
 #include "GpuDisplayViewport.h"
 #include "GpuPreviewProcessing.h"
 #include "GpuWindowSwapTelemetry.h"
+#include "PlaybackWarmOutputReusePolicy.h"
 #include "../../src/mlv/llrawproc/llrawproc.h"
 #include <array>
 #include <cstddef>
@@ -116,7 +117,15 @@ public:
                                                              bool reducedHnyquist,
                                                              double *kernelMs,
                                                              QString *reason,
-                                                             GpuAmazeDebayerBackendTiming *amazeTiming = nullptr);
+                                                             GpuAmazeDebayerBackendTiming *amazeTiming = nullptr,
+                                                             uint64_t frame = 0,
+                                                             uint64_t setClipCountAfter = 0,
+                                                             uint64_t setLutsCountAfter = 0,
+                                                             QString *reuseCapture = nullptr);
+    /* PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1 R2 (PlaybackWarmOutputReusePolicy.h): after the warm's
+     * AMaZE succeeded, its input is captured and the staged slot's warm key is set (frame, dims, black, WB, H-Nyquist,
+     * the set_clip / set_luts counts after the warm run, the capture id); *reuseCapture says ok, failed,
+     * symbol_missing, cuda_suppressed or backend_not_loaded (none when AMaZE did not succeed). */
     static bool readGpuReconSourceBayer16TextureIfActive(QByteArray *textureBytes,
                                                         int *width,
                                                         int *height,
@@ -270,7 +279,23 @@ private:
                                               bool reducedHnyquist,
                                               double *kernelMs,
                                               QString *reason,
-                                              GpuAmazeDebayerBackendTiming *amazeTiming);
+                                              GpuAmazeDebayerBackendTiming *amazeTiming,
+                                              uint64_t frame,
+                                              uint64_t setClipCountAfter,
+                                              uint64_t setLutsCountAfter,
+                                              QString *reuseCapture);
+    /* R2: clears the warm key and the backend's input capture (no CUDA call). */
+    void clearStagedReconWarmKey(void);
+    /* R4 (identity legs only, MLVAPP_SMOKE_FIRST_PRESENT_CAPTURE=1): after a reused frame was painted and swapped, run
+     * its AMaZE fresh from the same device input into a scratch RGBA16 texture, read both textures back and compare
+     * them; logs one playback_warm_output_reuse_verify line. Context current. Returns the wall ms it took. */
+    double verifyWarmOutputReuse(const uint16_t *deviceBayer16,
+                                 int width,
+                                 int height,
+                                 int blackLevel,
+                                 const double wbMultipliers[3],
+                                 bool reducedHnyquist,
+                                 uint64_t frame);
     void applySamplingMode(GpuDisplayViewport::SamplingMode samplingMode);
     /* Releases every context-bound processing resource (passthrough program, shared
      * preview-processing program, LUT texture set) so the next present rebuilds them
@@ -303,6 +328,10 @@ private:
     QOpenGLTexture *m_stagedReconSource = nullptr;
     int m_stagedReconWidth = 0;
     int m_stagedReconHeight = 0;
+    /* PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1 R2: what the paused warm's AMaZE wrote into
+     * m_stagedReconOutput ran on (valid only after that AMaZE succeeded and its input was captured). Moved out by the
+     * first recon present that adopts the pair, cleared with the pair. */
+    playback_warm_output_reuse::Key m_stagedReconWarmKey;
     QImage m_pendingImage;
     int m_pendingTextureWidth;
     int m_pendingTextureHeight;

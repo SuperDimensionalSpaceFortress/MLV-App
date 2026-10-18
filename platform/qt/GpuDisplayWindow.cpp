@@ -31,8 +31,10 @@
 #include <QtDebug>
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <vector>
 
 namespace
 {
@@ -109,6 +111,23 @@ bool playbackRoutePrewarmStageEnabled()
     static const bool enabled = playback_env_flag::resolve(
         playback_env_flag::parse( qgetenv( "MLVAPP_PLAYBACK_ROUTE_PREWARM_STAGE" ).constData() ), true );
     return enabled;
+}
+
+// PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1 R2 kill switch, read once, same values as above
+// (PlaybackWarmOutputReusePolicy.h): 0/false/off/no makes Play's first recon present always run AMaZE again. Default on.
+bool playbackWarmOutputReuseEnabled()
+{
+    static const bool enabled = playback_env_flag::resolve(
+        playback_env_flag::parse( qgetenv( "MLVAPP_PLAYBACK_WARM_OUTPUT_REUSE" ).constData() ), true );
+    return enabled;
+}
+
+// R4: the smoke's first-present identity capture (identity legs only), read once like MainWindow's
+// smokeFirstPresentCaptureRequested().
+bool warmOutputReuseVerifyRequested()
+{
+    static const bool requested = windowEnvFlagEnabled( qgetenv( "MLVAPP_SMOKE_FIRST_PRESENT_CAPTURE" ) );
+    return requested;
 }
 
 /* GLSL 1.20 passthrough -- works in the NVIDIA compatibility context a QOpenGLWindow
@@ -566,10 +585,15 @@ bool GpuDisplayWindow::warmStagedReconSlotFromDeviceBayer16IfActive(const uint16
                                                                     bool reducedHnyquist,
                                                                     double *kernelMs,
                                                                     QString *reason,
-                                                                    GpuAmazeDebayerBackendTiming *amazeTiming)
+                                                                    GpuAmazeDebayerBackendTiming *amazeTiming,
+                                                                    uint64_t frame,
+                                                                    uint64_t setClipCountAfter,
+                                                                    uint64_t setLutsCountAfter,
+                                                                    QString *reuseCapture)
 {
     if ( kernelMs ) *kernelMs = 0.0;
     if ( amazeTiming ) *amazeTiming = GpuAmazeDebayerBackendTiming();
+    if ( reuseCapture ) *reuseCapture = QStringLiteral("none");
     GpuDisplayWindow *win = nullptr;
     {
         QMutexLocker lock(&g_activeMutex);
@@ -587,7 +611,8 @@ bool GpuDisplayWindow::warmStagedReconSlotFromDeviceBayer16IfActive(const uint16
     }
     // like the prewarm: GUI thread, no g_activeMutex (the window is only destroyed on this thread)
     return win->warmStagedReconSlotFromDeviceBayer16(deviceBayer16, width, height, blackLevel, wbMultipliers,
-                                                     reducedHnyquist, kernelMs, reason, amazeTiming);
+                                                     reducedHnyquist, kernelMs, reason, amazeTiming,
+                                                     frame, setClipCountAfter, setLutsCountAfter, reuseCapture);
 }
 
 /* PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1 Row W: the first recon present's AMaZE call (device Bayer16 -> RGBA16, the
@@ -602,8 +627,16 @@ bool GpuDisplayWindow::warmStagedReconSlotFromDeviceBayer16(const uint16_t *devi
                                                             bool reducedHnyquist,
                                                             double *kernelMs,
                                                             QString *reason,
-                                                            GpuAmazeDebayerBackendTiming *amazeTiming)
+                                                            GpuAmazeDebayerBackendTiming *amazeTiming,
+                                                            uint64_t frame,
+                                                            uint64_t setClipCountAfter,
+                                                            uint64_t setLutsCountAfter,
+                                                            QString *reuseCapture)
 {
+    if ( reuseCapture ) *reuseCapture = QStringLiteral("none");
+    // PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1 R2: whatever this warm does, an older key no longer
+    // describes the staged output
+    clearStagedReconWarmKey();
     if ( !deviceBayer16 || width <= 0 || height <= 0 )
     {
         if ( reason ) *reason = QStringLiteral("no_device_output");
@@ -650,6 +683,35 @@ bool GpuDisplayWindow::warmStagedReconSlotFromDeviceBayer16(const uint16_t *devi
                                                               &timing,
                                                               reducedHnyquist);
     gpuAmazeDebayerArmProbe(0);
+    // R2: ONLY after the warm's AMaZE succeeded is the staged output what Play frame 0's AMaZE would write: capture
+    // its exact input, then key it. A failed capture leaves the key invalid (Play runs AMaZE).
+    if ( amazeOk )
+    {
+        quint64 captureId = 0;
+        QString captureWhy;
+        if ( gpuAmazeDebayerCaptureInputBayer16(deviceBayer16, width, height, &captureId, &captureWhy) )
+        {
+            playback_warm_output_reuse::Key key;
+            key.valid = true;
+            key.frame = frame;
+            key.width = width;
+            key.height = height;
+            key.blackLevel = blackLevel;
+            key.wb[0] = wbMultipliers[0];
+            key.wb[1] = wbMultipliers[1];
+            key.wb[2] = wbMultipliers[2];
+            key.reducedHnyquist = reducedHnyquist;
+            key.setClipCountAfterWarm = setClipCountAfter;
+            key.setLutsCountAfterWarm = setLutsCountAfter;
+            key.captureId = captureId;
+            m_stagedReconWarmKey = key;
+            if ( reuseCapture ) *reuseCapture = QStringLiteral("ok");
+        }
+        else if ( reuseCapture )
+        {
+            *reuseCapture = captureWhy == QLatin1String("failed") ? QStringLiteral("failed") : captureWhy;
+        }
+    }
     if ( needsCurrent ) doneCurrent();
     if ( kernelMs && amazeOk && timing.available ) *kernelMs = timing.kernelMs;
     if ( amazeTiming && amazeOk ) *amazeTiming = timing;
@@ -666,6 +728,9 @@ bool GpuDisplayWindow::warmStagedReconSlotFromDeviceBayer16(const uint16_t *devi
  * (still registered) as m_stagedReconOutput / m_stagedReconSource instead, for the first recon present to adopt. */
 bool GpuDisplayWindow::prewarmPlaybackReconRoute(int texWidth, int texHeight, QString *summary)
 {
+    // PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1 R2: a re-run prewarm stages an unfilled output (unity
+    // WB, an unwritten R16 input): no warm key survives it
+    clearStagedReconWarmKey();
     QOpenGLContext *glContext = context();
     if ( !glContext || !isValid() )
     {
@@ -1108,6 +1173,9 @@ bool GpuDisplayWindow::setPresentedGpuPlaybackReconAmazePostWbTexture(
         m_textureFromGpuRecon,
         m_gpuReconSourceTexture != nullptr);
     setupTiming.slot = "kept";
+    // PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1 R2: the warm key of an adopted pair, moved out below
+    playback_warm_output_reuse::Key warmKey;
+    bool stagedAdopted = false;
     if ( !m_texture
       || m_texture->width() != texWidth
       || m_texture->height() != texHeight
@@ -1119,6 +1187,11 @@ bool GpuDisplayWindow::setPresentedGpuPlaybackReconAmazePostWbTexture(
             // freed with neither CUDA reset: the AMaZE live cache keeps the staged output's registration. The state
             // is the one destroyTexture() leaves; the source stays not current until a present writes it.
             delete m_texture;
+            // R2: the key goes with the output it describes (consumed: the member is cleared, the capture stays until
+            // the compare below)
+            warmKey = m_stagedReconWarmKey;
+            m_stagedReconWarmKey = playback_warm_output_reuse::Key();
+            stagedAdopted = true;
             m_texture = m_stagedReconOutput;
             m_gpuReconSourceTexture = m_stagedReconSource;
             m_stagedReconOutput = nullptr;
@@ -1156,6 +1229,8 @@ bool GpuDisplayWindow::setPresentedGpuPlaybackReconAmazePostWbTexture(
         // a live recon slot is kept; a pair staged beside it is never adopted
         releaseStagedReconSlot();
     }
+    // R2: a key not moved out above is never used (consumed by this present whatever its slot outcome)
+    if ( !stagedAdopted && m_stagedReconWarmKey.valid ) clearStagedReconWarmKey();
     m_textureFromGpuRecon = true;
     if ( !m_gpuReconSourceTexture
       || m_gpuReconSourceTexture->width() != texWidth
@@ -1188,6 +1263,11 @@ bool GpuDisplayWindow::setPresentedGpuPlaybackReconAmazePostWbTexture(
     bool reconOk = false;
     bool amazeOk = false;
     bool sourceTextureCurrent = false;
+    // R2: until the direct device branch decides, no reuse (the r16 bridge and a failed direct recon never reuse)
+    setupTiming.warm_output_reuse = "skip";
+    setupTiming.reuse_reason = !stagedAdopted ? "not_adopted" : ( warmKey.valid ? "no_device_input" : "no_warm_key" );
+    // R4: the device input of a reused frame, for the identity check after the swap (identity legs only)
+    const uint16_t *reusedDeviceBayer16 = nullptr;
 
     {
         llrpGpuPlaybackReconTiming_t directReconTiming;
@@ -1227,9 +1307,47 @@ bool GpuDisplayWindow::setPresentedGpuPlaybackReconAmazePostWbTexture(
           && deviceWidth == texWidth
           && deviceHeight == texHeight )
         {
+            // PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1 R2 (PlaybackWarmOutputReusePolicy.h): the adopted
+            // output already holds this AMaZE when the warm ran on exactly this input; every other outcome runs it.
+            playback_warm_output_reuse::Key presentKey;
+            presentKey.frame = state->frame_id;
+            presentKey.width = texWidth;
+            presentKey.height = texHeight;
+            presentKey.blackLevel = blackLevel;
+            presentKey.wb[0] = wbMultipliers[0];
+            presentKey.wb[1] = wbMultipliers[1];
+            presentKey.wb[2] = wbMultipliers[2];
+            presentKey.reducedHnyquist = reducedHnyquist;
+            playback_warm_output_reuse::Reason reuseReason = playback_warm_output_reuse::preGate(
+                playbackWarmOutputReuseEnabled(),
+                stagedAdopted,
+                warmKey,
+                presentKey,
+                llrpGpuCudaSuppressed() != 0,
+                validationProbeTexture,
+                llrpGpuPlaybackReconSetClipCount(),
+                llrpGpuPlaybackReconSetLutsCount());
+            bool reuseCompareAttempted = false;
+            if ( reuseReason == playback_warm_output_reuse::Reason::None )
+            {
+                reuseCompareAttempted = true;
+                const double compareStartMs = elapsedMs();
+                bool sameInput = false;
+                QString compareWhy;
+                const bool compared = gpuAmazeDebayerInputBayer16MatchesCapture(
+                    deviceBayer16, texWidth, texHeight, warmKey.captureId, &sameInput, &compareWhy);
+                setupTiming.reuse_compare_ms = elapsedMs() - compareStartMs;
+                reuseReason = playback_warm_output_reuse::afterCompare(compared, sameInput, compareWhy);
+            }
+            // the capture is consumed by this present on every path (no CUDA call)
+            if ( warmKey.valid ) gpuAmazeDebayerReleaseInputCapture();
+            const bool warmOutputReused = playback_warm_output_reuse::reuse(reuseReason);
+            setupTiming.warm_output_reuse = playback_warm_output_reuse::outcomeName(reuseReason, reuseCompareAttempted);
+            setupTiming.reuse_reason = playback_warm_output_reuse::reasonName(reuseReason);
             const double directAmazeStartMs = elapsedMs();
             const bool directAmazeOk =
-                gpuAmazeDebayerRenderPostWbGlTextureFromDeviceBayer16(
+                warmOutputReused
+                || gpuAmazeDebayerRenderPostWbGlTextureFromDeviceBayer16(
                     deviceBayer16,
                     m_texture->textureId(),
                     texWidth,
@@ -1241,6 +1359,7 @@ bool GpuDisplayWindow::setPresentedGpuPlaybackReconAmazePostWbTexture(
                     &directAmazeTiming,
                     reducedHnyquist);
             const double directAmazeWallMs = elapsedMs() - directAmazeStartMs;
+            if ( warmOutputReused ) reusedDeviceBayer16 = deviceBayer16;
             if ( directAmazeOk )
             {
                 int validationProofRc = 0;
@@ -1295,6 +1414,8 @@ bool GpuDisplayWindow::setPresentedGpuPlaybackReconAmazePostWbTexture(
                     .arg(directRc);
         }
     }
+    // R2: the capture is consumed on the paths that never reached the compare too (no CUDA call; idempotent)
+    if ( warmKey.valid ) gpuAmazeDebayerReleaseInputCapture();
 
     if ( !reconOk || !amazeOk )
     {
@@ -1424,13 +1545,22 @@ bool GpuDisplayWindow::setPresentedGpuPlaybackReconAmazePostWbTexture(
         }
         paintedSynchronously = true;
     }
+    // PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1 R4: identity legs prove the kept output equals a fresh
+    // AMaZE of the same input (never on a timing leg; its time is kept out of post_ms)
+    double verifyMs = 0.0;
+    if ( reusedDeviceBayer16 && warmOutputReuseVerifyRequested() )
+    {
+        verifyMs = verifyWarmOutputReuse(reusedDeviceBayer16, texWidth, texHeight, blackLevel, wbMultipliers,
+                                         reducedHnyquist, state->frame_id);
+        setupTiming.reuse_verify_ran = true;
+    }
     if ( madeCurrent ) doneCurrent();
     // Only fall back to Qt's paint-event cycle when this submit did NOT already paint --
     // otherwise Qt would paint the SAME serial a second time (m_presentedSerial is only
     // promoted inside paintGL(), so a second call here would re-promote an already-shown
     // serial and pay a second vsync-blocked swap for content already on screen).
     if ( !paintedSynchronously ) update();
-    postMs = elapsedMs() - postStartMs;
+    postMs = elapsedMs() - postStartMs - verifyMs;
     if ( handoffMode ) *handoffMode = handoffModeValue;
     if ( timing )
     {
@@ -1443,6 +1573,97 @@ bool GpuDisplayWindow::setPresentedGpuPlaybackReconAmazePostWbTexture(
         timing->post_ms = postMs;
     }
     return true;
+}
+
+double GpuDisplayWindow::verifyWarmOutputReuse(const uint16_t *deviceBayer16,
+                                               int width,
+                                               int height,
+                                               int blackLevel,
+                                               const double wbMultipliers[3],
+                                               bool reducedHnyquist,
+                                               uint64_t frame)
+{
+    QElapsedTimer clock;
+    clock.start();
+    auto line = [&](int identical, qint64 differing, int maxAbs, const QString &why)
+    {
+        qInfo().noquote() << QStringLiteral("playback_warm_output_reuse_verify frame=%1 identical=%2 differing_texels=%3 "
+                                            "max_abs_diff=%4 verify_ms=%5")
+                                 .arg(static_cast<qulonglong>(frame))
+                                 .arg(identical)
+                                 .arg(differing)
+                                 .arg(maxAbs)
+                                 .arg(static_cast<double>(clock.nsecsElapsed()) / 1000000.0, 0, 'f', 3)
+                             + ( why.isEmpty() ? QString() : QStringLiteral(" reason=\"") + why + QStringLiteral("\"") );
+    };
+#if defined(QT_OPENGL_ES_2)
+    Q_UNUSED(deviceBayer16); Q_UNUSED(width); Q_UNUSED(height); Q_UNUSED(blackLevel); Q_UNUSED(wbMultipliers);
+    Q_UNUSED(reducedHnyquist);
+    line(0, -1, -1, QStringLiteral("glGetTexImage unavailable on OpenGL ES"));
+    return static_cast<double>(clock.nsecsElapsed()) / 1000000.0;
+#else
+    QOpenGLContext *glContext = context();
+    QOpenGLFunctions *gl = glContext ? glContext->functions() : nullptr;
+    using GlGetTexImageFn = void (*)(GLenum, GLint, GLenum, GLenum, void *);
+    GlGetTexImageFn glGetTexImageProc =
+        glContext ? reinterpret_cast<GlGetTexImageFn>(glContext->getProcAddress("glGetTexImage")) : nullptr;
+    if ( !gl || !glGetTexImageProc || !m_texture || width <= 0 || height <= 0 )
+    {
+        line(0, -1, -1, QStringLiteral("no_gl_readback"));
+        return static_cast<double>(clock.nsecsElapsed()) / 1000000.0;
+    }
+    QOpenGLTexture *scratch = new QOpenGLTexture(QOpenGLTexture::Target2D);
+    scratch->setFormat(QOpenGLTexture::RGBA16_UNorm);
+    scratch->setSize(width, height);
+    scratch->setMipLevels(1);
+    scratch->allocateStorage(QOpenGLTexture::RGBA, QOpenGLTexture::UInt16);
+    QString amazeReason;
+    const bool fresh = gpuAmazeDebayerRenderPostWbGlTextureFromDeviceBayer16(deviceBayer16,
+                                                                             scratch->textureId(),
+                                                                             width,
+                                                                             height,
+                                                                             blackLevel,
+                                                                             wbMultipliers,
+                                                                             &amazeReason,
+                                                                             nullptr,
+                                                                             nullptr,
+                                                                             reducedHnyquist);
+    const size_t words = static_cast<size_t>(width) * static_cast<size_t>(height) * 4u;
+    std::vector<uint16_t> kept(words, 0);
+    std::vector<uint16_t> again(words, 0);
+    gl->glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    m_texture->bind(0);
+    glGetTexImageProc(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_SHORT, kept.data());
+    m_texture->release();
+    scratch->bind(0);
+    glGetTexImageProc(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_SHORT, again.data());
+    scratch->release();
+    const GLenum error = gl->glGetError();
+    // unregister the scratch texture from the AMaZE CUDA-GL cache before its GL name is freed (the next present
+    // registers m_texture again)
+    gpuAmazeDebayerResetR16TextureBackendResources();
+    delete scratch;
+    if ( !fresh || error != GL_NO_ERROR )
+    {
+        line(0, -1, -1, !fresh ? amazeReason : QStringLiteral("gl_error=%1").arg(static_cast<int>(error)));
+        return static_cast<double>(clock.nsecsElapsed()) / 1000000.0;
+    }
+    qint64 differing = 0;
+    int maxAbs = 0;
+    for ( size_t t = 0; t < words; t += 4 )
+    {
+        bool texelDiffers = false;
+        for ( size_t c = 0; c < 4; ++c )
+        {
+            const int d = std::abs(static_cast<int>(kept[t + c]) - static_cast<int>(again[t + c]));
+            if ( d != 0 ) texelDiffers = true;
+            if ( d > maxAbs ) maxAbs = d;
+        }
+        if ( texelDiffers ) ++differing;
+    }
+    line(differing == 0 ? 1 : 0, differing, maxAbs, QString());
+    return static_cast<double>(clock.nsecsElapsed()) / 1000000.0;
+#endif
 }
 
 bool GpuDisplayWindow::readGpuReconSourceBayer16Texture(QByteArray *textureBytes,
@@ -1712,8 +1933,19 @@ void GpuDisplayWindow::destroyTexture()
     m_pendingDisplayHeight = 0;
 }
 
+void GpuDisplayWindow::clearStagedReconWarmKey()
+{
+    const bool held = m_stagedReconWarmKey.valid;
+    m_stagedReconWarmKey = playback_warm_output_reuse::Key();
+    // no CUDA call (the backend only clears its capture id): safe at any time, after a device loss too
+    if ( held ) gpuAmazeDebayerReleaseInputCapture();
+}
+
 void GpuDisplayWindow::releaseStagedReconSlot()
 {
+    // PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1 R2: the key describes the staged output; it goes first,
+    // with or without a pair
+    clearStagedReconWarmKey();
     if ( !m_stagedReconOutput && !m_stagedReconSource ) return;
     QOpenGLContext *glContext = context();
     const bool needsCurrent = glContext && QOpenGLContext::currentContext() != glContext;

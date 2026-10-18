@@ -43,6 +43,10 @@ struct Outcome
     double setLutsMs = 0.0;
     uint64_t setClipCalls = 0;
     uint64_t setLutsCalls = 0;
+    // PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1 R2: the process-wide set_clip / set_luts counts right
+    // after this run (the warm key: a later configuration call means the warm's output may be stale)
+    uint64_t setClipCountAfter = 0;
+    uint64_t setLutsCountAfter = 0;
     int backendRc = 0;
     llrpGpuPlaybackRetainedDeviceBayer16_t retained;   // valid when ran; the caller releases retained.token
 
@@ -145,8 +149,10 @@ inline Outcome run( mlvObject_t *video,
             }
         }
         out.runMs = ( mlv_stage_timing_now() - runStart ) * 1000.0;
-        out.setClipCalls = llrpGpuPlaybackReconSetClipCount() - setClipBefore;
-        out.setLutsCalls = llrpGpuPlaybackReconSetLutsCount() - setLutsBefore;
+        out.setClipCountAfter = llrpGpuPlaybackReconSetClipCount();
+        out.setLutsCountAfter = llrpGpuPlaybackReconSetLutsCount();
+        out.setClipCalls = out.setClipCountAfter - setClipBefore;
+        out.setLutsCalls = out.setLutsCountAfter - setLutsBefore;
         // this thread's run_backend just measured them (0 when the run needed neither)
         out.setClipMs = out.setClipCalls ? llrpGpuPlaybackReconLastSetClipMilliseconds() : 0.0;
         out.setLutsMs = out.setLutsCalls ? llrpGpuPlaybackReconLastSetLutsMilliseconds() : 0.0;

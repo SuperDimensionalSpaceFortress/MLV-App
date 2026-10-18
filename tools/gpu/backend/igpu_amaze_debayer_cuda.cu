@@ -85,6 +85,18 @@ struct igpu_amaze_debayer_backend
     ClockKickShared * kickDevice = nullptr;
     bool kickLaunched = false;   // launched and not yet collected
     std::thread kickFeeder;      // submits the kick's chunks, at most kClockKickChunksInFlight queued at a time
+    /* PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1 R1: igpu_amaze_debayer_capture_input_bayer16 /
+     * input_bayer16_matches_capture / release_input_capture. A backend-owned copy of one AMaZE input, its dims and a
+     * capture id issued by this backend (0 = none); a recreated backend starts with none. */
+    uint16_t * captureBayer16 = nullptr;
+    std::size_t captureCapacity = 0;   // elements allocated in captureBayer16
+    int captureWidth = 0;
+    int captureHeight = 0;
+    unsigned long long captureId = 0;
+    unsigned long long captureNextId = 0;
+    cudaStream_t captureStream = nullptr;
+    unsigned int * captureDiffersDevice = nullptr;
+    unsigned int * captureDiffersHost = nullptr;   // pinned
     igpu_amaze_debayer_timing_t lastTiming;
     uint16_t * liveReconBayer16 = nullptr;
     float * liveRawFloat = nullptr;
@@ -487,6 +499,84 @@ void free_probe_and_kick(igpu_amaze_debayer_backend * backend)
     {
         if (*event) cudaEventDestroy(*event);
         *event = nullptr;
+    }
+}
+
+/* PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1 R1: destroy() frees the input capture and clears its id.
+ * No synchronisation is added here (TimingOnAddsNoSynchronisationAtBackendTeardown): the capture's own calls each
+ * synchronise their stream before they return, so no work on it is outstanding. */
+void free_input_capture(igpu_amaze_debayer_backend * backend)
+{
+    if (!backend) return;
+    if (backend->captureBayer16) cudaFree(backend->captureBayer16);
+    backend->captureBayer16 = nullptr;
+    backend->captureCapacity = 0;
+    backend->captureWidth = 0;
+    backend->captureHeight = 0;
+    backend->captureId = 0;
+    if (backend->captureDiffersDevice) cudaFree(backend->captureDiffersDevice);
+    backend->captureDiffersDevice = nullptr;
+    if (backend->captureDiffersHost) cudaFreeHost(backend->captureDiffersHost);
+    backend->captureDiffersHost = nullptr;
+    if (backend->captureStream) cudaStreamDestroy(backend->captureStream);
+    backend->captureStream = nullptr;
+}
+
+/* R1: grid-stride exact compare of two Bayer16 buffers. With vec16 set both are 16-byte aligned: 16-byte words, then
+ * the tail elements; otherwise every element. The first difference seen sets *differs; a thread that sees it set
+ * stops. Reads only. */
+__global__ void k_bayer16_differs(const uint16_t * a,
+                                  const uint16_t * b,
+                                  unsigned long long count,
+                                  int vec16,
+                                  volatile unsigned int * differs)
+{
+    const unsigned long long stride = static_cast<unsigned long long>(blockDim.x) * gridDim.x;
+    const unsigned long long first = static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    unsigned long long tail = 0;
+    if (vec16)
+    {
+        const unsigned long long words = count / 8ull;
+        const uint4 * wa = reinterpret_cast<const uint4 *>(a);
+        const uint4 * wb = reinterpret_cast<const uint4 *>(b);
+        for (unsigned long long w = first; w < words; w += stride)
+        {
+            if (*differs) return;
+            const uint4 x = wa[w];
+            const uint4 y = wb[w];
+            if (x.x != y.x || x.y != y.y || x.z != y.z || x.w != y.w)
+            {
+                *differs = 1u;
+                return;
+            }
+        }
+        tail = words * 8ull;
+    }
+    for (unsigned long long e = tail + first; e < count; e += stride)
+    {
+        if (a[e] != b[e])
+        {
+            *differs = 1u;
+            return;
+        }
+    }
+}
+
+/* R1: the capture's own non-blocking stream, created once. */
+void ensure_capture_stream(igpu_amaze_debayer_backend * backend)
+{
+    if (!backend->captureStream) CK(cudaStreamCreateWithFlags(&backend->captureStream, cudaStreamNonBlocking));
+}
+
+/* R1: the compare's device flag and its pinned host copy, allocated once. */
+void ensure_capture_flag(igpu_amaze_debayer_backend * backend)
+{
+    if (!backend->captureDiffersDevice) CK(cudaMalloc(&backend->captureDiffersDevice, sizeof(unsigned int)));
+    if (!backend->captureDiffersHost)
+    {
+        void * host = nullptr;
+        CK(cudaHostAlloc(&host, sizeof(unsigned int), cudaHostAllocDefault));
+        backend->captureDiffersHost = static_cast<unsigned int *>(host);
     }
 }
 
@@ -2034,6 +2124,7 @@ int copy_rgb16_to_gl_rgba16_texture_post_wb_undo(const uint16_t * dRgb16,
 extern "C" void igpu_amaze_debayer_destroy(igpu_amaze_debayer_backend * backend)
 {
     if (backend) free_probe_and_kick(backend);
+    free_input_capture(backend);
     free_live_texture_buffers(backend);
     delete backend;
     igpu_lt::teardown("destroy");
@@ -2613,6 +2704,111 @@ extern "C" int igpu_amaze_debayer_clock_kick_end(igpu_amaze_debayer_backend * ba
 extern "C" int igpu_amaze_debayer_last_cuda_error(igpu_cuda_error_t * out)
 {
     return igpu_cuda_error_slot::copy_last(out);
+}
+
+/* PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1 R1 (after last_cuda_error: the kick end's body, which the
+ * Row K wiring test reads up to last_cuda_error, makes no CUDA call). */
+extern "C" int igpu_amaze_debayer_capture_input_bayer16(igpu_amaze_debayer_backend * backend,
+                                                        const uint16_t * device_bayer16,
+                                                        int width,
+                                                        int height,
+                                                        unsigned long long * capture_id)
+{
+    if (capture_id) *capture_id = 0;
+    if (!backend || !device_bayer16 || !capture_id || width <= 0 || height <= 0) return -1;
+    /* a failed capture holds none */
+    backend->captureId = 0;
+    backend->captureWidth = 0;
+    backend->captureHeight = 0;
+    const std::size_t count = static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
+    try
+    {
+        ensure_capture_stream(backend);
+        if (!backend->captureBayer16 || backend->captureCapacity != count)
+        {
+            if (backend->captureBayer16) CK(cudaFree(backend->captureBayer16));
+            backend->captureBayer16 = nullptr;
+            backend->captureCapacity = 0;
+            CK(cudaMalloc(&backend->captureBayer16, count * sizeof(uint16_t)));
+            backend->captureCapacity = count;
+        }
+        ensure_capture_flag(backend);   // here, while paused: the compare at Play allocates nothing
+        CK(cudaMemcpyAsync(backend->captureBayer16, device_bayer16, count * sizeof(uint16_t),
+                           cudaMemcpyDeviceToDevice, backend->captureStream));
+        CK(IGPU_LT_SYNC_CALL("capture:sync", cudaStreamSynchronize(backend->captureStream)));
+    }
+    catch (const CudaStageProbeError & error)
+    {
+        std::fprintf(stderr, "[igpu_amaze_debayer_cuda] %s\n", error.what());
+        return -2;
+    }
+    backend->captureWidth = width;
+    backend->captureHeight = height;
+    backend->captureId = ++backend->captureNextId;
+    *capture_id = backend->captureId;
+    return 0;
+}
+
+extern "C" int igpu_amaze_debayer_input_bayer16_matches_capture(igpu_amaze_debayer_backend * backend,
+                                                                const uint16_t * device_bayer16,
+                                                                int width,
+                                                                int height,
+                                                                unsigned long long capture_id,
+                                                                int * equal)
+{
+    if (equal) *equal = 0;
+    if (!backend || !device_bayer16 || !equal || width <= 0 || height <= 0) return -1;
+    /* no capture, another capture, or other dims: not equal, and nothing is launched */
+    if (backend->captureId == 0 || !backend->captureBayer16 || capture_id != backend->captureId
+        || width != backend->captureWidth || height != backend->captureHeight)
+    {
+        return 0;
+    }
+    const unsigned long long count = static_cast<unsigned long long>(width) * static_cast<unsigned long long>(height);
+    try
+    {
+        ensure_capture_stream(backend);
+        ensure_capture_flag(backend);   // allocated by the capture; a no-op here
+        *backend->captureDiffersHost = 1u;   // a copy that never lands reads as different
+        CK(cudaMemsetAsync(backend->captureDiffersDevice, 0, sizeof(unsigned int), backend->captureStream));
+        const int vec16 = ((reinterpret_cast<uintptr_t>(device_bayer16)
+                            | reinterpret_cast<uintptr_t>(backend->captureBayer16)) & 15u) == 0 ? 1 : 0;
+        const int threads = 256;
+        const unsigned long long units = vec16 ? (count / 8ull > 0 ? count / 8ull : count) : count;
+        unsigned long long wanted = (units + threads - 1ull) / threads;
+        if (wanted < 1ull) wanted = 1ull;
+        const int blocks = static_cast<int>(wanted > 1024ull ? 1024ull : wanted);
+        IGPU_LT_LAUNCH("k_bayer16_differs", blocks, threads, backend->captureStream,
+                       k_bayer16_differs<<<blocks, threads, 0, backend->captureStream>>>(device_bayer16,
+                                                                                         backend->captureBayer16,
+                                                                                         count,
+                                                                                         vec16,
+                                                                                         backend->captureDiffersDevice));
+        CK(cudaGetLastError());
+        CK(cudaMemcpyAsync(backend->captureDiffersHost, backend->captureDiffersDevice, sizeof(unsigned int),
+                           cudaMemcpyDeviceToHost, backend->captureStream));
+        CK(IGPU_LT_SYNC_CALL("capture:compare_sync", cudaStreamSynchronize(backend->captureStream)));
+    }
+    catch (const CudaStageProbeError & error)
+    {
+        std::fprintf(stderr, "[igpu_amaze_debayer_cuda] %s\n", error.what());
+        *equal = 0;
+        return -2;
+    }
+    *equal = *backend->captureDiffersHost == 0u ? 1 : 0;
+    return 0;
+}
+
+/* Clears the capture id and dims, so no later compare can match it; makes no CUDA call (safe after a device loss, and
+ * never a device-wide synchronisation: cudaFree would be one, and this runs inside the Play present while the next
+ * frame's recon may be in flight). The buffer stays for the next capture of the same size; destroy() frees it. */
+extern "C" int igpu_amaze_debayer_release_input_capture(igpu_amaze_debayer_backend * backend)
+{
+    if (!backend) return -1;
+    backend->captureId = 0;
+    backend->captureWidth = 0;
+    backend->captureHeight = 0;
+    return 0;
 }
 
 /* GPU-FIELD-TELEMETRY-1 r6: every code a failed call noted, and a lock-free

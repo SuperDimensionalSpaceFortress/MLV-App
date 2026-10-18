@@ -35,12 +35,19 @@
  * and the session's first four AMaZE runs, each <kernel_ms>/<device_ms>/<sm_mhz_before>:
  *   playback_smoke.amaze_first_frames session=N f0= f1= f2= f3=
  * The route prewarm and the paused recon warm lines carry the same three probe fields (amazeProbeFields).
+ *
+ * PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1 R3: first_present_split ends with the reuse fields
+ * (PlaybackWarmOutputReusePolicy.h), " warm_output_reuse= reuse_reason= reuse_compare_ms=". On a hit frame 0 runs no
+ * AMaZE at Play: its probe fields print NA, and amaze_first_frames prints f0=reused with f1.. taken from the session's
+ * first probed runs (frame 1 onwards), so a later frame is never labelled f0.
  */
 
 #ifndef PLAYBACKSTARTUPSPLIT_H
 #define PLAYBACKSTARTUPSPLIT_H
 
 #include <QString>
+
+#include "PlaybackWarmOutputReusePolicy.h"
 
 #include <algorithm>
 #include <vector>
@@ -111,13 +118,22 @@ struct AmazeFirstFrames
     double deviceMs[kFrames] = {};
     double smMhzBefore[kFrames] = {};
     bool valid[kFrames] = {};
+    /* PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1 R3: frame 0 kept the warm's output (no AMaZE ran for it
+     * at Play): f0 prints "reused" and record i is frame i + 1. */
+    bool frame0Reused = false;
 
     QString line( unsigned long long session ) const
     {
         QString text = QStringLiteral( "playback_smoke.amaze_first_frames session=" ) + QString::number( session );
-        for( int i = 0; i < kFrames; ++i )
+        for( int f = 0; f < kFrames; ++f )
         {
-            text += QStringLiteral( " f" ) + QString::number( i ) + QStringLiteral( "=" );
+            text += QStringLiteral( " f" ) + QString::number( f ) + QStringLiteral( "=" );
+            if( frame0Reused && f == 0 )
+            {
+                text += QStringLiteral( "reused" );
+                continue;
+            }
+            const int i = frame0Reused ? f - 1 : f;   // the record of frame f
             if( i >= count )
             {
                 text += QStringLiteral( "NA/NA/NA" );
@@ -164,6 +180,14 @@ struct FirstPresentSplit
     bool clockKickRun = false;
     QString clockKickReason = QStringLiteral( "none" );
     double kickLeadMs = -1.0;   // kick begin -> frame 0's AMaZE call; < 0 = NA
+    // PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1 R3 (PlaybackWarmOutputReusePolicy.h); "skip"/"none" on
+    // a present that never reached the GPU window (the CPU route)
+    QString warmOutputReuse = QStringLiteral( "skip" );
+    QString reuseReason = QStringLiteral( "none" );
+    double reuseCompareMs = 0.0;
+    bool reuseVerifyRan = false;   // R4: an identity leg re-ran frame 0's AMaZE after the swap (probe record 0)
+
+    bool frame0Reused() const { return warmOutputReuse == QLatin1String( "hit" ); }
 
     QString line( unsigned long long session ) const
     {
@@ -190,7 +214,8 @@ struct FirstPresentSplit
              + QStringLiteral( " clock_kick=" ) + ( clockKickRun ? QStringLiteral( "run" ) : QStringLiteral( "skip" ) )
              + QStringLiteral( " clock_kick_reason=" ) + ( clockKickReason.isEmpty() ? QStringLiteral( "none" ) : clockKickReason )
              + QStringLiteral( " kick_lead_ms=" )
-             + ( kickLeadMs < 0.0 ? QStringLiteral( "NA" ) : QString::number( kickLeadMs, 'f', 3 ) );
+             + ( kickLeadMs < 0.0 ? QStringLiteral( "NA" ) : QString::number( kickLeadMs, 'f', 3 ) )
+             + playback_warm_output_reuse::fields( warmOutputReuse, reuseReason, reuseCompareMs );
     }
 };
 

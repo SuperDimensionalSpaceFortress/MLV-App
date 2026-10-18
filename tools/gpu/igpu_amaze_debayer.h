@@ -157,6 +157,30 @@ typedef struct {
 int igpu_amaze_debayer_clock_kick_begin(igpu_amaze_debayer_backend * backend, int max_ms);
 int igpu_amaze_debayer_clock_kick_end(igpu_amaze_debayer_backend * backend, igpu_clock_kick_report_t * out);
 
+/* Optional input-capture extension (PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1 R1).
+ * capture_input_bayer16 copies width*height Bayer16 elements from a device pointer (the AMaZE input) into a
+ * backend-owned device buffer (allocated, or reused when the size matches), on a backend-owned non-blocking stream,
+ * synchronised before it returns, and issues a new capture id (> 0, monotonic per backend) in *capture_id. Returns 0;
+ * -1 for a bad argument, -2 when a CUDA call failed (its code is noted; no capture is then held, *capture_id 0).
+ * input_bayer16_matches_capture sets *equal to 1 only when capture_id is the backend's current capture, the dims
+ * equal the capture's, and every element of device_bayer16 equals the capture (an exact compare kernel on the same
+ * stream, synchronised). No capture, another id or other dims set *equal 0 and launch nothing. Returns 0, -1 for a bad
+ * argument, -2 when a CUDA call failed (*equal 0; the caller then runs AMaZE).
+ * release_input_capture clears the capture id (no compare matches until the next capture); it makes no CUDA call, so
+ * it is safe after a device loss and never synchronises. destroy frees the buffer. Older DLLs omit all three. */
+int igpu_amaze_debayer_capture_input_bayer16(igpu_amaze_debayer_backend * backend,
+                                             const uint16_t * device_bayer16,
+                                             int width,
+                                             int height,
+                                             unsigned long long * capture_id);
+int igpu_amaze_debayer_input_bayer16_matches_capture(igpu_amaze_debayer_backend * backend,
+                                                     const uint16_t * device_bayer16,
+                                                     int width,
+                                                     int height,
+                                                     unsigned long long capture_id,
+                                                     int * equal);
+int igpu_amaze_debayer_release_input_capture(igpu_amaze_debayer_backend * backend);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

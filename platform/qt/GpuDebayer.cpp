@@ -353,6 +353,11 @@ typedef int (*GpuAmazeArmProbeFn)(igpu_amaze_debayer_backend *, int);
 typedef int (*GpuAmazeLastProbeFn)(igpu_amaze_debayer_backend *, igpu_amaze_probe_t *);
 typedef int (*GpuAmazeClockKickBeginFn)(igpu_amaze_debayer_backend *, int);
 typedef int (*GpuAmazeClockKickEndFn)(igpu_amaze_debayer_backend *, igpu_clock_kick_report_t *);
+// PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1 R1 (optional symbols)
+typedef int (*GpuAmazeCaptureInputBayer16Fn)(igpu_amaze_debayer_backend *, const uint16_t *, int, int, unsigned long long *);
+typedef int (*GpuAmazeInputBayer16MatchesCaptureFn)(igpu_amaze_debayer_backend *, const uint16_t *, int, int,
+                                                     unsigned long long, int *);
+typedef int (*GpuAmazeReleaseInputCaptureFn)(igpu_amaze_debayer_backend *);
 
 struct GpuAmazeDebayerRuntime
 {
@@ -377,6 +382,11 @@ struct GpuAmazeDebayerRuntime
     GpuAmazeLastProbeFn lastProbe = nullptr;
     GpuAmazeClockKickBeginFn clockKickBegin = nullptr;
     GpuAmazeClockKickEndFn clockKickEnd = nullptr;
+    /* PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1 R1: optional (live runtime only); older DLLs omit
+     * them, and the warm output is then never reused (reason symbol_missing). */
+    GpuAmazeCaptureInputBayer16Fn captureInputBayer16 = nullptr;
+    GpuAmazeInputBayer16MatchesCaptureFn inputBayer16MatchesCapture = nullptr;
+    GpuAmazeReleaseInputCaptureFn releaseInputCapture = nullptr;
 };
 
 typedef int (*GpuAmazeDrainCudaErrorsFn)(int, igpu_cuda_error_t *, int, unsigned long long *);
@@ -682,6 +692,14 @@ struct GpuAmazeDebayerLiveTextureRuntime
             reinterpret_cast<GpuAmazeClockKickBeginFn>(runtime.library.resolve("igpu_amaze_debayer_clock_kick_begin"));
         runtime.clockKickEnd =
             reinterpret_cast<GpuAmazeClockKickEndFn>(runtime.library.resolve("igpu_amaze_debayer_clock_kick_end"));
+        /* PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1 R1: optional; a missing symbol means no reuse,
+         * never a failed present. */
+        runtime.captureInputBayer16 = reinterpret_cast<GpuAmazeCaptureInputBayer16Fn>(
+            runtime.library.resolve("igpu_amaze_debayer_capture_input_bayer16"));
+        runtime.inputBayer16MatchesCapture = reinterpret_cast<GpuAmazeInputBayer16MatchesCaptureFn>(
+            runtime.library.resolve("igpu_amaze_debayer_input_bayer16_matches_capture"));
+        runtime.releaseInputCapture = reinterpret_cast<GpuAmazeReleaseInputCaptureFn>(
+            runtime.library.resolve("igpu_amaze_debayer_release_input_capture"));
 
         backend = runtime.create("cuda");
         if ( !backend )
@@ -1664,4 +1682,66 @@ GpuAmazeClockKickReport gpuAmazeDebayerClockKickEnd(void)
     report.sampleMs = playback_gpu_clock_kick::sampleMs(ns);
     report.intervalMhz = playback_gpu_clock_kick::intervalMhz(ns, clk, sm);
     return report;
+}
+
+// PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1 R1
+bool gpuAmazeDebayerCaptureInputBayer16(const uint16_t * deviceBayer16, int width, int height,
+                                        quint64 * captureId, QString * why)
+{
+    if ( captureId ) *captureId = 0;
+    auto fail = [&](const char * reason) -> bool
+    {
+        if ( why ) *why = QString::fromLatin1(reason);
+        return false;
+    };
+    if ( llrpGpuCudaSuppressed() ) return fail("cuda_suppressed");
+    // never live.ensure(): the warm that captures already ran AMaZE on the loaded backend
+    GpuAmazeDebayerLiveTextureRuntime & live = liveAmazeTextureRuntime();
+    QMutexLocker locker(&live.mutex);
+    if ( !live.attempted || !live.available || !live.backend ) return fail("backend_not_loaded");
+    if ( !live.runtime.captureInputBayer16 || !live.runtime.inputBayer16MatchesCapture || !live.runtime.releaseInputCapture )
+        return fail("symbol_missing");
+    // like the kick: the device-loss flag read again under the lock (not one of the four AMaZE runs the census counts)
+    const bool mayCapture = enterAmazeRunUnlessCudaSuppressed(&live.runtime, GpuFieldTelemetry::enabled());
+    if ( !mayCapture ) return fail("cuda_suppressed");
+    unsigned long long id = 0;
+    if ( live.runtime.captureInputBayer16(live.backend, deviceBayer16, width, height, &id) != 0 || id == 0 )
+        return fail("failed");
+    if ( captureId ) *captureId = id;
+    if ( why ) why->clear();
+    return true;
+}
+
+bool gpuAmazeDebayerInputBayer16MatchesCapture(const uint16_t * deviceBayer16, int width, int height,
+                                               quint64 captureId, bool * equal, QString * why)
+{
+    if ( equal ) *equal = false;
+    auto fail = [&](const char * reason) -> bool
+    {
+        if ( why ) *why = QString::fromLatin1(reason);
+        return false;
+    };
+    if ( llrpGpuCudaSuppressed() ) return fail("cuda_suppressed");
+    // never live.ensure(): a capture exists only on a backend that is already loaded
+    GpuAmazeDebayerLiveTextureRuntime & live = liveAmazeTextureRuntime();
+    QMutexLocker locker(&live.mutex);
+    if ( !live.attempted || !live.available || !live.backend ) return fail("capture_missing");
+    if ( !live.runtime.inputBayer16MatchesCapture ) return fail("symbol_missing");
+    const bool mayCompare = enterAmazeRunUnlessCudaSuppressed(&live.runtime, GpuFieldTelemetry::enabled());
+    if ( !mayCompare ) return fail("cuda_suppressed");
+    int same = 0;
+    if ( live.runtime.inputBayer16MatchesCapture(live.backend, deviceBayer16, width, height,
+                                                 static_cast<unsigned long long>(captureId), &same) != 0 )
+        return fail("compare_failed");
+    if ( equal ) *equal = same == 1;
+    if ( why ) why->clear();
+    return true;
+}
+
+void gpuAmazeDebayerReleaseInputCapture(void)
+{
+    // never gated: the backend's release makes no CUDA call (safe after a device loss)
+    GpuAmazeDebayerLiveTextureRuntime & live = liveAmazeTextureRuntime();
+    QMutexLocker locker(&live.mutex);
+    if ( live.backend && live.runtime.releaseInputCapture ) live.runtime.releaseInputCapture(live.backend);
 }

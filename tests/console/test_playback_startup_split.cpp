@@ -183,7 +183,9 @@ TEST(PlaybackFirstPresentSplit, TheLineCarriesEveryFieldInOrder)
                   "set_luts_at_play=1"
                   // PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row 0: the probe and the kick ride at the end
                   " amaze_sm_mhz_before=NA amaze_sm_mhz_after=NA amaze_device_ms=NA clock_kick=skip "
-                  "clock_kick_reason=none kick_lead_ms=NA"),
+                  "clock_kick_reason=none kick_lead_ms=NA"
+                  // PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1 R3: the reuse fields ride at the end
+                  " warm_output_reuse=skip reuse_reason=none reuse_compare_ms=0.000"),
               fp.line(7).toStdString());
 }
 
@@ -196,7 +198,8 @@ TEST(PlaybackFirstPresentSplit, ANonWindowFirstPresentPrintsNoneAndZeros)
                   "recon_wall_ms=0.000 amaze_kernel_ms=0.000 amaze_download_ms=0.000 paint_ms=0.000 "
                   "gui_pickup_ms=0.000 backend_preloaded=0 warm_run=0 set_clip_at_play=0 set_luts_at_play=0"
                   " amaze_sm_mhz_before=NA amaze_sm_mhz_after=NA amaze_device_ms=NA clock_kick=skip "
-                  "clock_kick_reason=none kick_lead_ms=NA"),
+                  "clock_kick_reason=none kick_lead_ms=NA"
+                  " warm_output_reuse=skip reuse_reason=none reuse_compare_ms=0.000"),
               split.firstPresentLine(2).toStdString());
     // empty free text never leaves a field without a value
     playback_startup_split::FirstPresentSplit fp;
@@ -399,8 +402,9 @@ TEST(PlaybackAmazeProbeFields, TheFirstPresentSplitCarriesTheProbeAndTheKick)
     ASSERT_TRUE(text.find(" set_luts_at_play=0 amaze_sm_mhz_before=1650.0 amaze_sm_mhz_after=1800.0 "
                           "amaze_device_ms=17.500 clock_kick=run clock_kick_reason=none kick_lead_ms=190.250")
                 != std::string::npos);
-    // the line ends with the kick lead
-    ASSERT_EQ(text.size() - std::string("kick_lead_ms=190.250").size(), text.rfind("kick_lead_ms=190.250"));
+    // the kick lead is followed only by the reuse fields (PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1 R3)
+    const std::string tail = "kick_lead_ms=190.250 warm_output_reuse=skip reuse_reason=none reuse_compare_ms=0.000";
+    ASSERT_EQ(text.size() - tail.size(), text.rfind(tail));
     // a skipped kick names why; a probe the DLL cannot give is NA
     fp.probeAvailable = false;
     fp.clockKickRun = false;

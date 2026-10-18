@@ -82,6 +82,7 @@ SOURCES += \
     $$REPO_ROOT/tests/console/test_playback_route_staged_slot_policy.cpp \
     $$REPO_ROOT/tests/console/test_playback_recon_warm_run_policy.cpp \
     $$REPO_ROOT/tests/console/test_playback_gpu_clock_kick_policy.cpp \
+    $$REPO_ROOT/tests/console/test_playback_warm_output_reuse_policy.cpp \
     $$REPO_ROOT/tests/console/test_playback_decode_render_overlap.cpp \
     $$REPO_ROOT/tests/console/test_playback_swap_interval.cpp \
     $$REPO_ROOT/tests/console/test_cuda_launch_timing.cpp \

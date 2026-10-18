@@ -148,6 +148,17 @@ bool gpuAmazeDebayerLiveBackendLoaded(void);
 bool gpuAmazeDebayerClockKickBegin(int maxMs, QString * why, double * beginSteadyMs);
 /* Row K: end (raise the stop flag) and collect; never loads the DLL, never makes a CUDA call. */
 GpuAmazeClockKickReport gpuAmazeDebayerClockKickEnd(void);
+/* PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1 R1 (PlaybackWarmOutputReusePolicy.h). Capture copies one
+ * AMaZE input (device Bayer16) into the loaded backend and returns its capture id; false with *why (cuda_suppressed,
+ * backend_not_loaded, symbol_missing, failed) and *captureId 0 otherwise. MatchesCapture compares a device Bayer16
+ * against that capture exactly: true with *equal on a completed compare, false with *why (cuda_suppressed,
+ * capture_missing, symbol_missing, compare_failed). Both re-check the device-loss flag under the live lock and never
+ * load the DLL. Release clears the capture id; never gated, never a CUDA call. */
+bool gpuAmazeDebayerCaptureInputBayer16(const uint16_t * deviceBayer16, int width, int height,
+                                        quint64 * captureId, QString * why);
+bool gpuAmazeDebayerInputBayer16MatchesCapture(const uint16_t * deviceBayer16, int width, int height,
+                                               quint64 captureId, bool * equal, QString * why);
+void gpuAmazeDebayerReleaseInputCapture(void);
 bool gpuAmazeDebayerApplyGpuOffscreenPostWb(const float * inputRawFrame,
                                            uint16_t * outputRgb16,
                                            int width,

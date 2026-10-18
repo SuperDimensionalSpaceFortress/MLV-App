@@ -104,3 +104,19 @@ maintained in this format.
     `clock_kick_reason` and `kick_lead_ms`. A new
     `playback_smoke.amaze_first_frames` line lists the first four debayers,
     and a `playback_gpu_clock_kick` line reports each Play's GPU task.
+- At full resolution on the CUDA playback route, the first frame of Play no
+  longer runs its debayer a second time
+  (PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1).
+  - The paused warm already debayers that frame into the textures Play
+    shows first. MLV App now keeps a GPU copy of the warm's debayer input
+    (about 8 MB at full resolution, 2 MB at half, 0.5 MB at quarter). Play
+    skips its own debayer only when its input is byte-for-byte the same and
+    the frame, size, black level, white balance and filter setting all
+    match. In every other case it debayers as before. Look, LUT and blur
+    changes are applied when the frame is drawn, so they are never stale.
+  - `MLVAPP_PLAYBACK_WARM_OUTPUT_REUSE` (default on, same values as
+    `MLVAPP_PLAYBACK_ROUTE_PREWARM`) turns it off.
+  - The `first_present_split` line adds `warm_output_reuse`,
+    `reuse_reason` and `reuse_compare_ms`, and the `playback_recon_warm`
+    line adds `reuse_capture`. On a reused first frame,
+    `amaze_first_frames` prints `f0=reused`.

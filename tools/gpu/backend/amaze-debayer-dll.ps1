@@ -123,7 +123,10 @@ $required = @(
     'igpu_amaze_debayer_arm_probe',
     'igpu_amaze_debayer_last_probe',
     'igpu_amaze_debayer_clock_kick_begin',
-    'igpu_amaze_debayer_clock_kick_end'
+    'igpu_amaze_debayer_clock_kick_end',
+    'igpu_amaze_debayer_capture_input_bayer16',
+    'igpu_amaze_debayer_input_bayer16_matches_capture',
+    'igpu_amaze_debayer_release_input_capture'
 )
 $missing = @()
 foreach ($name in $required) {

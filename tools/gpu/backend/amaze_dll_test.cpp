@@ -483,6 +483,146 @@ static int run_clock_kick_mode(HMODULE dll, igpu_amaze_debayer_backend * backend
     return pass ? 0 : 1;
 }
 
+/* PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1 T3 --input-capture: the R1 capture / exact compare / release
+ * (capture then match on the same buffer gives 1; one changed pixel, other dims, a stale id, and after release give 0)
+ * and AMaZE determinism (the device Bayer16 -> RGBA16 run twice on the same input is bit-identical, both H-Nyquist
+ * settings). This MSVC harness links no CUDA runtime: device buffers come from the cudart DLL that ships beside the
+ * backend (cudart64_*.dll), loaded by name; the runtime API shares the process's primary context with the backend. */
+typedef int (*pfn_capture_input)(igpu_amaze_debayer_backend *, const uint16_t *, int, int, unsigned long long *);
+typedef int (*pfn_matches_capture)(igpu_amaze_debayer_backend *, const uint16_t *, int, int, unsigned long long, int *);
+typedef int (*pfn_release_capture)(igpu_amaze_debayer_backend *);
+typedef int (*pfn_run_post_wb_from_device)(igpu_amaze_debayer_backend *, const uint16_t *, unsigned int,
+                                           int, int, int, double, double, double);
+typedef int (*pfn_cuda_malloc)(void **, size_t);
+typedef int (*pfn_cuda_memcpy)(void *, const void *, size_t, int);
+typedef int (*pfn_cuda_free)(void *);
+
+static HMODULE load_cudart(const std::string & dllPath)
+{
+    std::string dir = dllPath;
+    const size_t slash = dir.find_last_of("\\/");
+    dir = slash == std::string::npos ? std::string() : dir.substr(0, slash + 1);
+    for (const char * name : {"cudart64_12.dll", "cudart64_13.dll", "cudart64_110.dll"})
+    {
+        HMODULE m = LoadLibraryA((dir + name).c_str());
+        if (!m) m = LoadLibraryA(name);
+        if (m) return m;
+    }
+    return NULL;
+}
+
+static int run_input_capture_mode(HMODULE dll, igpu_amaze_debayer_backend * backend, const std::string & dllPath,
+                                  const std::vector<float> & raw, int width, int height)
+{
+    pfn_capture_input f_capture;
+    pfn_matches_capture f_matches;
+    pfn_release_capture f_release;
+    pfn_run_post_wb_from_device f_device;
+    pfn_set_reduced_hnyquist f_hny;
+    RESOLVE(f_capture, pfn_capture_input, "igpu_amaze_debayer_capture_input_bayer16");
+    RESOLVE(f_matches, pfn_matches_capture, "igpu_amaze_debayer_input_bayer16_matches_capture");
+    RESOLVE(f_release, pfn_release_capture, "igpu_amaze_debayer_release_input_capture");
+    RESOLVE(f_device, pfn_run_post_wb_from_device, "igpu_amaze_debayer_run_post_wb_gl_texture_from_device_bayer16");
+    RESOLVE(f_hny, pfn_set_reduced_hnyquist, "igpu_amaze_debayer_set_reduced_hnyquist");
+    HMODULE cudart = load_cudart(dllPath);
+    if (!cudart)
+    {
+        std::fprintf(stderr, "[amaze_dll_test] input-capture: no cudart64_*.dll beside %s or on PATH\n", dllPath.c_str());
+        return 5;
+    }
+    pfn_cuda_malloc c_malloc = (pfn_cuda_malloc)GetProcAddress(cudart, "cudaMalloc");
+    pfn_cuda_memcpy c_memcpy = (pfn_cuda_memcpy)GetProcAddress(cudart, "cudaMemcpy");
+    pfn_cuda_free c_free = (pfn_cuda_free)GetProcAddress(cudart, "cudaFree");
+    if (!c_malloc || !c_memcpy || !c_free)
+    {
+        std::fprintf(stderr, "[amaze_dll_test] input-capture: cudart lacks cudaMalloc/cudaMemcpy/cudaFree\n");
+        return 5;
+    }
+    bool pass = true;
+    auto check = [&pass](bool ok, const char * what)
+    {
+        std::printf("[amaze_dll_test] input-capture %-62s %s\n", what, ok ? "ok" : "FAIL");
+        if (!ok) pass = false;
+    };
+    const size_t pixelCount = (size_t)width * (size_t)height;
+    const size_t bytes = pixelCount * sizeof(uint16_t);
+    std::vector<uint16_t> bayer(pixelCount);
+    for (size_t i = 0; i < pixelCount; ++i) bayer[i] = (uint16_t)(raw[i] > 65535.0f ? 65535.0f : raw[i]);
+    std::vector<uint16_t> changed = bayer;
+    changed[pixelCount / 2 + 3] = (uint16_t)(changed[pixelCount / 2 + 3] ^ 1u);   // one pixel, one LSB
+    void * dA = NULL;
+    void * dB = NULL;
+    const int cudaHostToDevice = 1;
+    if (c_malloc(&dA, bytes) != 0 || c_malloc(&dB, bytes) != 0
+        || c_memcpy(dA, bayer.data(), bytes, cudaHostToDevice) != 0
+        || c_memcpy(dB, changed.data(), bytes, cudaHostToDevice) != 0)
+    {
+        std::fprintf(stderr, "[amaze_dll_test] input-capture: device buffer setup failed\n");
+        return 5;
+    }
+    const uint16_t * a = (const uint16_t *)dA;
+    const uint16_t * b = (const uint16_t *)dB;
+
+    // capture / compare / release
+    unsigned long long id = 0;
+    int equal = -1;
+    check(f_capture(NULL, a, width, height, &id) == -1 && f_matches(backend, a, width, height, 1, NULL) == -1,
+          "rejects bad arguments");
+    check(f_matches(backend, a, width, height, 1, &equal) == 0 && equal == 0, "no capture yet: not equal");
+    check(f_capture(backend, a, width, height, &id) == 0 && id > 0, "capture issues an id > 0");
+    check(f_matches(backend, a, width, height, id, &equal) == 0 && equal == 1, "same buffer, same id: equal");
+    check(f_matches(backend, b, width, height, id, &equal) == 0 && equal == 0, "one pixel one LSB changed: not equal");
+    check(f_matches(backend, a, width, height - 2, id, &equal) == 0 && equal == 0, "other dims: not equal");
+    check(f_matches(backend, a, height, width, id, &equal) == 0 && equal == 0, "dims swapped: not equal");
+    check(f_matches(backend, a, width, height, id + 1, &equal) == 0 && equal == 0, "a stale or foreign id: not equal");
+    check(f_matches(backend, a, width, height, 0, &equal) == 0 && equal == 0, "id 0: not equal");
+    unsigned long long id2 = 0;
+    check(f_capture(backend, b, width, height, &id2) == 0 && id2 > id, "a second capture issues a newer id");
+    check(f_matches(backend, b, width, height, id, &equal) == 0 && equal == 0, "the first id is stale after it");
+    check(f_matches(backend, b, width, height, id2, &equal) == 0 && equal == 1, "the second capture matches its buffer");
+    check(f_matches(backend, a, width, height, id2, &equal) == 0 && equal == 0, "and not the other buffer");
+    check(f_release(backend) == 0 && f_release(NULL) == -1, "release");
+    check(f_matches(backend, b, width, height, id2, &equal) == 0 && equal == 0, "after release: not equal");
+    unsigned long long id3 = 0;
+    check(f_capture(backend, a, width, height, &id3) == 0 && id3 > id2, "a capture after release (buffer reused)");
+    check(f_matches(backend, a, width, height, id3, &equal) == 0 && equal == 1, "matches again");
+
+    // AMaZE determinism on the device Bayer16 route the warm and Play both use
+    HiddenGlContext gl;
+    if (!create_hidden_gl_context(&gl)) return 5;
+    GLuint out1 = 0;
+    GLuint out2 = 0;
+    if (!create_rgba16_texture(&out1, width, height, "determinism 1") || !create_rgba16_texture(&out2, width, height, "determinism 2"))
+    {
+        destroy_hidden_gl_context(&gl);
+        return 5;
+    }
+    std::vector<uint16_t> rgba1(pixelCount * 4u, 0u);
+    std::vector<uint16_t> rgba2(pixelCount * 4u, 0u);
+    for (int hny = 0; hny <= 1; ++hny)
+    {
+        check(f_hny(backend, hny) == 0, hny ? "reduced H-Nyquist on" : "reduced H-Nyquist off");
+        const int rc1 = f_device(backend, a, (unsigned int)out1, width, height, 2048, 2.0176366843033511, 1.0, 1.5503875968992249);
+        const int rc2 = f_device(backend, a, (unsigned int)out2, width, height, 2048, 2.0176366843033511, 1.0, 1.5503875968992249);
+        check(rc1 == 0 && rc2 == 0, "two device-Bayer16 AMaZE runs");
+        const bool read = read_rgba16_texture(out1, &rgba1, "determinism 1") && read_rgba16_texture(out2, &rgba2, "determinism 2");
+        size_t differing = 0;
+        for (size_t i = 0; read && i < rgba1.size(); ++i) if (rgba1[i] != rgba2[i]) ++differing;
+        std::printf("[amaze_dll_test] input-capture determinism hnyquist=%d differing_words=%zu fnv1=%016llx fnv2=%016llx\n",
+                    hny, differing, (unsigned long long)fnv1a64(rgba1.data(), rgba1.size() * 2u),
+                    (unsigned long long)fnv1a64(rgba2.data(), rgba2.size() * 2u));
+        check(read && differing == 0, "the same input gives bit-identical RGBA16");
+    }
+    (void)f_hny(backend, 0);
+    glDeleteTextures(1, &out2);
+    glDeleteTextures(1, &out1);
+    destroy_hidden_gl_context(&gl);
+    c_free(dB);
+    c_free(dA);
+    std::printf("\n[amaze_dll_test] RESULT: %s (input capture + determinism)\n", pass ? "PASS" : "FAIL");
+    return pass ? 0 : 1;
+}
+
 int main(int argc, char ** argv)
 {
     std::string dllPath = "igpu_amaze_debayer_cuda.dll";
@@ -498,12 +638,17 @@ int main(int argc, char ** argv)
     std::string dumpDir;
     int inputBlack = 0;
     bool clockKick = false;   // PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1: run_clock_kick_mode
+    bool inputCapture = false;   // PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1 T3: run_input_capture_mode
 
     for (int i = 1; i < argc; ++i)
     {
         if (std::strcmp(argv[i], "--gl-texture") == 0)
         {
             runGlTexture = true;
+        }
+        else if (std::strcmp(argv[i], "--input-capture") == 0)
+        {
+            inputCapture = true;
         }
         else if (std::strcmp(argv[i], "--clock-kick") == 0)
         {
@@ -616,6 +761,13 @@ int main(int argc, char ** argv)
         f_destroy(backend);
         FreeLibrary(dll);
         return kickRc;
+    }
+    if (inputCapture)
+    {
+        const int captureRc = run_input_capture_mode(dll, backend, dllPath, raw, width, height);
+        f_destroy(backend);
+        FreeLibrary(dll);
+        return captureRc;
     }
     if (reducedHnyquist)
     {
