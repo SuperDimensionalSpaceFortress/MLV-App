@@ -16,11 +16,20 @@ Rules:
 - A job id with any entry in inbox\, running\ (final marker, unresolved .tmp marker, or set-aside record),
   orphaned\ or cancel\ is skipped whatever its age.
 - The month folder is the job's newest member's LastWriteTimeUtc (yyyy-MM), the same month for both halves.
+- The plan is a snapshot, so -Apply RE-VALIDATES each job just before moving it: the job's members in
+  processed\ and outbox\ are re-listed and must be the same names with the same LastWriteTimeUtc, all still
+  older than the cutoff, and no entry for the job may have appeared in inbox\, running\, orphaned\ or cancel\.
+  Each member is re-stat'ed again immediately before its own rename. Any difference skips the WHOLE job
+  (stats.changedSinceScan); if it is detected after some members already moved, the run stops (exit 3) with the
+  partial job named. The residual window is the milliseconds between a member's re-stat and its rename.
+- -Apply holds an exclusive lock (<share>\archive\rotation-manifests\rotation.lock, opened CreateNew and removed
+  on close) so two -Apply runs never work the same share at once; a second run refuses with ROTATION_LOCKED.
 - Moves are same-share renames (no data copy). In -Apply mode each move is bracketed in
   <share>\archive\rotation-manifests\<stamp>.jsonl: an "intent" row is appended BEFORE the rename and a
   "done" row (ok true/false) after it. If the intent row cannot be written, that entry is not moved. On the
-  first failed rename or failed "done" row the run STOPS and exits 3, naming the partial job; the manifest's
-  intent rows say exactly which members moved, so the job can be moved back or finished by hand.
+  first failed rename or failed "done" row the run STOPS and exits 3, naming the partial job (stoppedOn in the
+  report on stdout and in -ReportPath). An intent row records an ATTEMPTED move, not its outcome: an intent with
+  no done row is reconciled by checking whether its `to` path exists (moved) or its `from` path does (not moved).
 - Consumers that probe outbox\<id>.result.json (um-run, UmRunDrop's JOBID_IN_USE pre-check) see only the
   live window; a re-used job id older than the cutoff is no longer refused by that pre-check, which is
   documented there as a fast check, not the protection (the inbox claim rename is).
@@ -45,7 +54,9 @@ param(
     # Test seam: evaluate ages against this instant instead of now.
     [Nullable[datetime]]$NowUtc = $null,
     # Test seam: a scriptblock run before each rename with the member; a throw simulates a failed rename.
-    [scriptblock]$TestHookBeforeMove = $null
+    [scriptblock]$TestHookBeforeMove = $null,
+    # Test seam: a scriptblock run before each job's re-validation with the planned job (simulates a concurrent write).
+    [scriptblock]$TestHookBeforeRevalidate = $null
 )
 
 $ErrorActionPreference = 'Stop'
@@ -134,11 +145,74 @@ function Add-ManifestRow([System.Collections.IDictionary]$row) {
     Add-Content -LiteralPath $manifest -Value ($row | ConvertTo-Json -Compress) -Encoding utf8 -ErrorAction Stop
 }
 
+function Get-JobEntriesNow([string]$key, [string[]]$dirs) {
+    # This job's entries in $dirs as they are NOW: a server-filtered "<key>*" listing, kept to exactly this job.
+    foreach ($d in $dirs) {
+        $di = [IO.DirectoryInfo](Join-Path $AgentShare $d)
+        if (-not $di.Exists) { continue }
+        foreach ($e in $di.EnumerateFileSystemInfos("$key*")) {
+            if (Test-AgentShareJobEntry -Name $e.Name -JobId $key) { [pscustomobject]@{ dir = $d; entry = $e } }
+        }
+    }
+}
+
+function Get-JobChange($c) {
+    # $null when the job is exactly as planned; otherwise why it is not.
+    $liveNow = @(Get-JobEntriesNow $c.key @('inbox', 'running', 'orphaned', 'cancel'))
+    if ($liveNow.Count) { return "live entry appeared: $($liveNow[0].dir)\$($liveNow[0].entry.Name)" }
+    $planned = @{}
+    foreach ($m in $c.members) { $planned["$($m.dir)\$($m.entry.Name)"] = $m.plannedUtc }
+    $current = @(Get-JobEntriesNow $c.key $rotated)
+    if ($current.Count -ne $planned.Count) { return "membership changed: planned $($planned.Count), now $($current.Count)" }
+    foreach ($n in $current) {
+        $id = "$($n.dir)\$($n.entry.Name)"
+        if (-not $planned.ContainsKey($id)) { return "new member: $id" }
+        if ($n.entry.LastWriteTimeUtc -ne $planned[$id]) { return "rewritten since scan: $id" }
+        if ($n.entry.LastWriteTimeUtc -ge $cutoff) { return "younger than cutoff: $id" }
+    }
+    return $null
+}
+
+function Get-MemberChange($m) {
+    # Re-stat one member immediately before its rename.
+    $m.entry.Refresh()
+    if (-not $m.entry.Exists) { return "vanished since scan" }
+    if ($m.entry.LastWriteTimeUtc -ne $m.plannedUtc) { return "rewritten since scan" }
+    return $null
+}
+
+$stats.changedSinceScan = 0
+$stats.changed = @()
 if ($Apply -and $plan.Count) {
     New-Item -ItemType Directory -Force -Path $manifestDir | Out-Null
+    $lockPath = Join-Path $manifestDir 'rotation.lock'
+    try {
+        $lock = [IO.FileStream]::new($lockPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None, 4096, [IO.FileOptions]::DeleteOnClose)
+    } catch {
+        throw "ROTATION_LOCKED $lockPath exists: another -Apply run holds this share (or a crashed one left it; check before removing it by hand)"
+    }
+    try {
+    foreach ($c in $plan) { foreach ($m in $c.members) { $m | Add-Member -NotePropertyName plannedUtc -NotePropertyValue $m.entry.LastWriteTimeUtc -Force } }
     :jobs foreach ($c in $plan) {
         $movedHere = @()
+        if ($TestHookBeforeRevalidate) { & $TestHookBeforeRevalidate $c }
+        $why = Get-JobChange $c
+        if ($why) {
+            $stats.changedSinceScan++
+            if ($stats.changed.Count -lt 10) { $stats.changed += "$($c.key): $why" }
+            continue jobs
+        }
         foreach ($m in $c.members) {
+            $why = Get-MemberChange $m
+            if ($why) {
+                if (-not $movedHere.Count) {
+                    $stats.changedSinceScan++
+                    if ($stats.changed.Count -lt 10) { $stats.changed += "$($c.key): $($m.dir)\$($m.entry.Name) $why" }
+                    continue jobs
+                }
+                $report.stoppedOn = [ordered]@{ job = $c.key; step = 'changed'; entry = "$($m.dir)\$($m.entry.Name)"; error = $why; movedMembers = $movedHere }
+                break jobs
+            }
             $base = [ordered]@{ job = $c.key; dir = $m.dir; name = $m.entry.Name; from = $m.entry.FullName; to = $m.dest
                 lastWriteTimeUtc = $m.entry.LastWriteTimeUtc.ToString('o') }
             try {
@@ -170,6 +244,7 @@ if ($Apply -and $plan.Count) {
             }
         }
     }
+    } finally { $lock.Dispose() }
 }
 
 $report.elapsedMs = $sw.ElapsedMilliseconds

@@ -33,8 +33,13 @@ $keys = @{
     'J.result.json' = 'J'; 'J.result.tmp' = 'J'; 'J.result.0123456789abcdef0123456789abcdef.tmp' = 'J'
     'J.artifacts' = 'J'; 'J.artifacts.unproven-1' = 'J'; 'J.cancel' = 'J'
     'J.other.result.json' = 'J.other'; 'J.other.started.json.tmp' = 'J.other'; 'wbdet-20260903-141643' = 'wbdet-20260903-141643'
+    # sol r1 blocker 1: dotted ids that contain a suffix word keep their whole id; UmRunDrop nonce temps reduce to J
+    'J.artifacts.result.json' = 'J.artifacts'; 'J.started.result.json' = 'J.started'; 'J.artifacts.started.json.tmp' = 'J.artifacts'
+    'x.cancel.job.ps1' = 'x.cancel'; 'J.0123456789abcdef0123456789abcdef.meta.tmp' = 'J'; 'J.0123456789abcdef0123456789abcdef.job.tmp' = 'J'
+    'J.provenance.json' = 'J'; 'J.out.txt' = 'J'; 'J.err.txt' = 'J'; 'J.heavy-slot.wait.txt' = 'J'
 }
 foreach ($n in $keys.Keys) { Check ((Get-AgentShareJobKey -Name $n) -ceq $keys[$n]) "job key '$n' -> '$($keys[$n])' (got '$(Get-AgentShareJobKey -Name $n)')" }
+Check (-not (Test-AgentShareJobEntry -Name 'J.artifacts.result.json' -JobId 'J')) 'exact lookup: J.artifacts.result.json is not job J'
 
 try {
     # --- base scenario
@@ -114,6 +119,60 @@ try {
     Check ($cap.stats.eligibleJobs -eq 1 -and $cap.stats.keptCap -eq 1) 'cap: one job planned, one kept'
     Check ((Has 'archive\processed\2026-08\m-1.job.ps1') -and (Has 'archive\outbox\2026-08\m-1.result.json')) 'cap: oldest job moved whole'
     Check ((Has 'processed\m-2.job.ps1') -and (Has 'outbox\m-2.result.json')) 'cap: capped job kept whole'
+    Remove-Root
+
+    # --- sol r1 blocker 2: the apply phase re-validates the snapshot
+    New-Root
+    New-Entry 'processed\c-1.job.ps1' 60; New-Entry 'outbox\c-1.result.json' 60      # rewritten after the scan
+    New-Entry 'processed\c-2.job.ps1' 60; New-Entry 'outbox\c-2.result.json' 60      # claimed live after the scan
+    New-Entry 'processed\c-3.job.ps1' 60; New-Entry 'outbox\c-3.result.json' 60      # untouched: still moves
+    New-Entry 'inbox\c-4.0123456789abcdef0123456789abcdef.meta.tmp' 0; New-Entry 'outbox\c-4.result.json' 60   # nonce temp protects
+    # Hooks run inside the rotation script's scope, so they capture the mock root by closure.
+    $hr = $root
+    $reval = {
+        param($c)
+        if ($c.key -eq 'c-1') { [IO.File]::SetLastWriteTimeUtc((Join-Path $hr 'outbox\c-1.result.json'), [DateTime]::UtcNow) }
+        if ($c.key -eq 'c-2') { Set-Content (Join-Path $hr 'running\c-2.started.json.tmp') 'x' }
+    }.GetNewClosure()
+    $out = & $rot -AgentShare $root -OlderThanDays 30 -NowUtc $now -Apply -TestHookBeforeRevalidate $reval | Out-String | ConvertFrom-Json
+    Check ($LASTEXITCODE -eq 0 -and $out.stats.changedSinceScan -eq 2) "changed jobs skipped, run continues (exit $LASTEXITCODE, changed $($out.stats.changedSinceScan))"
+    Check ((Has 'processed\c-1.job.ps1') -and (Has 'outbox\c-1.result.json')) 'rewritten-after-scan job kept whole'
+    Check ((Has 'processed\c-2.job.ps1') -and (Has 'outbox\c-2.result.json')) 'live-after-scan job kept whole'
+    Check ((Has 'archive\processed\2026-08\c-3.job.ps1') -and (Has 'archive\outbox\2026-08\c-3.result.json')) 'unchanged job still moved'
+    Check ((Has 'outbox\c-4.result.json') -and $out.stats.keptLive -eq 1) 'UmRunDrop nonce temp in inbox protects its job'
+    Remove-Root
+
+    # --- a member rewritten while earlier members of its job move: stop, name the partial job
+    New-Root
+    New-Entry 'processed\r-1.job.ps1' 60; New-Entry 'outbox\r-1.result.json' 60
+    $hr = $root
+    $mid = { param($m) if ($m.entry.Name -eq 'r-1.job.ps1') { [IO.File]::SetLastWriteTimeUtc((Join-Path $hr 'outbox\r-1.result.json'), [DateTime]::UtcNow) } }.GetNewClosure()
+    $out = & $rot -AgentShare $root -OlderThanDays 30 -NowUtc $now -Apply -TestHookBeforeMove $mid | Out-String | ConvertFrom-Json
+    Check ($LASTEXITCODE -eq 3 -and $out.stoppedOn.step -eq 'changed' -and $out.stoppedOn.job -eq 'r-1') "mid-job rewrite stops with step=changed (exit $LASTEXITCODE)"
+    Check ((Has 'outbox\r-1.result.json')) 'rewritten member was not moved'
+    Remove-Root
+
+    # --- failed done row after a successful rename (sol r1 hardening): stop, report the moved member
+    New-Root
+    New-Entry 'processed\d-1.job.ps1' 60
+    $hr = $root
+    $ro = { param($m) Get-ChildItem (Join-Path $hr 'archive\rotation-manifests') -Filter *.jsonl | ForEach-Object { $_.IsReadOnly = $true } }.GetNewClosure()
+    $out = & $rot -AgentShare $root -OlderThanDays 30 -NowUtc $now -Apply -TestHookBeforeMove $ro | Out-String | ConvertFrom-Json
+    Check ($LASTEXITCODE -eq 3 -and $out.stoppedOn.step -eq 'done-row' -and @($out.stoppedOn.movedMembers).Count -eq 1) "done-row failure stops and names the moved member (exit $LASTEXITCODE, step $($out.stoppedOn.step))"
+    $rows = @(Get-ChildItem (Join-Path $root 'archive\rotation-manifests') -Filter *.jsonl | ForEach-Object { $_.IsReadOnly = $false; Get-Content $_.FullName } | ForEach-Object { $_ | ConvertFrom-Json })
+    Check ($rows.Count -eq 1 -and $rows[0].phase -eq 'intent' -and (Has 'archive\processed\2026-08\d-1.job.ps1')) 'intent without done reconciles by the to path existing'
+    Remove-Root
+
+    # --- single-writer lock (fable r1 hardening)
+    New-Root
+    New-Entry 'processed\l-1.job.ps1' 60
+    New-Item -ItemType Directory -Force (Join-Path $root 'archive\rotation-manifests') | Out-Null
+    $held = [IO.FileStream]::new((Join-Path $root 'archive\rotation-manifests\rotation.lock'), [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None, 4096, [IO.FileOptions]::DeleteOnClose)
+    $msg = pwsh -NoProfile -File $rot -AgentShare $root -OlderThanDays 30 -NowUtc $now.ToString('o') -Apply 2>&1 | Out-String
+    $held.Dispose()
+    Check ($LASTEXITCODE -ne 0 -and $msg -match 'ROTATION_LOCKED' -and (Has 'processed\l-1.job.ps1')) 'a second -Apply refuses with ROTATION_LOCKED and moves nothing'
+    $out = Invoke-Rot @('-Apply')
+    Check ($LASTEXITCODE -eq 0 -and (Has 'archive\processed\2026-08\l-1.job.ps1') -and -not (Has 'archive\rotation-manifests\rotation.lock')) 'lock released: the next run moves and leaves no lock file'
 } finally {
     Remove-Root
 }

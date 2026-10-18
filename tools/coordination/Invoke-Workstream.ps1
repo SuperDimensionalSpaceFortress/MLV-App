@@ -987,7 +987,7 @@ prove you tested the right MACHINE: a falsifier on the mechanism is not a falsif
 venue. (Measured 2026-09-04: a lane read PresentMon MISSING at C:\mlvtmp\mlv-agent\cache\
 from this VM and reported it as contradicting the card, while the GPU host was unreachable.)
 NEVER LIST \\bachelor\mlv-agent\processed OR \outbox UNBOUNDED (ls, ls -t, dir, find, or
-Get-ChildItem without a bound): they hold thousands of entries, and `ls -t` opens every file over
+Get-ChildItem without a bound): they hold thousands of entries, and ``ls -t`` opens every file over
 SMB so Defender scans each one (2026-10-17: one listing ran >10 min at about one host core). Probe
 one job by exact name (outbox\<jobId>.result.json), or run
 tools\profiling\agent-share\Get-AgentShareRecent.ps1 -Directory outbox -First 20 (or -JobId <id>).
