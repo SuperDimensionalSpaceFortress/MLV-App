@@ -9,13 +9,15 @@ for over 10 minutes and cost about one host core. NEVER list those directories w
 
 This script enumerates with [IO.DirectoryInfo]::EnumerateFileSystemInfos, which returns names and
 timestamps from the directory listing without opening any file (20.7k entries in about 2.5 s over SMB),
-then keeps only the newest -First entries. For one job, pass -JobId: that is an exact-name probe, not a
-listing. Old entries are moved under <share>\archive\<dir>\<yyyy-MM>\ by Invoke-AgentShareRotation.ps1;
-pass -IncludeArchive to search there too (bounded the same way).
+then keeps only the newest -First entries. For one job, pass -JobId: the server-side pattern "<id>*" narrows
+the listing and AgentShare.psm1's job-key rule keeps exactly that id (never "<id>.other.*", a different dotted
+job id). Old entries are moved under <share>\archive\<dir>\<yyyy-MM>\ by Invoke-AgentShareRotation.ps1;
+pass -IncludeArchive to search there too (bounded the same way). An unreachable share is an error, never an
+empty answer; -AsJson always emits an array ([] when nothing matches).
 
 .EXAMPLE
-pwsh -NoProfile -File tools\profiling\agent-share\Get-AgentShareRecent.ps1 -Directory outbox -First 20
-pwsh -NoProfile -File tools\profiling\agent-share\Get-AgentShareRecent.ps1 -Directory outbox -JobId venue-quiet-probe-20261018T000337475Z
+pwsh -NoProfile -File "C:\!Layi Wkspc\MLV-App\tools\profiling\agent-share\Get-AgentShareRecent.ps1" -Directory outbox -First 20
+pwsh -NoProfile -File "C:\!Layi Wkspc\MLV-App\tools\profiling\agent-share\Get-AgentShareRecent.ps1" -Directory outbox -JobId venue-quiet-probe-20261018T000337475Z
 #>
 [CmdletBinding()]
 param(
@@ -33,6 +35,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+Import-Module (Join-Path $PSScriptRoot 'AgentShare.psm1') -Force
 if ($JobId -and $JobId -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$') { throw "JOBID_INVALID '$JobId'" }
 if ($NamePrefix -and $NamePrefix -notmatch '^[A-Za-z0-9._-]{1,128}$') { throw "NAME_PREFIX_INVALID '$NamePrefix'" }
 
@@ -56,22 +59,27 @@ function ConvertTo-Row([IO.FileSystemInfo]$e) {
     }
 }
 
-$rows = @()
-if ($JobId) {
-    foreach ($r in $roots) {
-        # Exact-name probe of the artifact shapes the agent writes; a pattern search scoped to this one id.
-        $di = [IO.DirectoryInfo]$r
-        if (-not $di.Exists) { continue }
-        $rows += @($di.EnumerateFileSystemInfos("$JobId.*") | ForEach-Object { ConvertTo-Row $_ })
+function Get-Entries([string]$root, [string]$pattern) {
+    # An unreachable live directory is an error, never an empty answer; an absent archive month is just absent.
+    $di = [IO.DirectoryInfo]$root
+    if (-not $di.Exists) {
+        if ($root -eq $dir) { throw "DIRECTORY_UNREADABLE $root (an unreachable share is not an empty one)" }
+        return
     }
+    $di.EnumerateFileSystemInfos($pattern)
+}
+
+if ($JobId) {
+    # The server-side pattern narrows the listing; the job-key test then keeps exactly this id, so -JobId J never
+    # returns J.other.result.json (job J.other) or Jx.result.json.
+    $entries = foreach ($r in $roots) { Get-Entries $r "$JobId*" }
+    $rows = @($entries | Where-Object { Test-AgentShareJobEntry -Name $_.Name -JobId $JobId } |
+        Sort-Object LastWriteTimeUtc -Descending | ForEach-Object { ConvertTo-Row $_ })
 } else {
     $pattern = if ($NamePrefix) { "$NamePrefix*" } else { '*' }
-    $entries = foreach ($r in $roots) {
-        $di = [IO.DirectoryInfo]$r
-        if (-not $di.Exists) { if ($r -eq $dir) { throw "DIRECTORY_UNREADABLE $r (an unreachable share is not an empty one)" }; continue }
-        $di.EnumerateFileSystemInfos($pattern)
-    }
+    $entries = foreach ($r in $roots) { Get-Entries $r $pattern }
     $rows = @($entries | Sort-Object LastWriteTimeUtc -Descending -Top $First | ForEach-Object { ConvertTo-Row $_ })
 }
 
-if ($AsJson) { $rows | ConvertTo-Json -Depth 3 } else { $rows | Format-Table name, kind, lastWriteTimeUtc, length -AutoSize | Out-String -Width 220 }
+# JSON is always an array, [] included, so a consumer never has to special-case one row or none.
+if ($AsJson) { ConvertTo-Json -InputObject @($rows) -Depth 3 } else { $rows | Format-Table name, kind, lastWriteTimeUtc, length -AutoSize | Out-String -Width 220 }
