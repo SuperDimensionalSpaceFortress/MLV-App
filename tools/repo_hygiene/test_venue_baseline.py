@@ -271,6 +271,9 @@ class VenueBaselineTests(unittest.TestCase):
             self.assertEqual(r["status"], "RAN")
             self.assertEqual(r["outcome"], "PASS")
             self.assertTrue(Path(r["receiptPath"]).is_file(), r["receiptPath"])
+            # the receipt went through the evidence-bearing validator and the row carries its verdict: the stub's receipt has no admission or evidence, so it re-derives to nothing
+            self.assertIn(r["receiptVerification"]["status"], ("INVALID", "INCOMPLETE"), r["receiptVerification"])
+            self.assertIs(r["receiptVerification"]["valid"], False)
             # the hub-VM load, sampled at the start AND the end of the run (the stub reads 10.5/12.5 first, 11.5/40.0 after)
             hl = r["hubLoad"]
             self.assertEqual((hl["start"]["commitGiB"], hl["start"]["cpuPercent"]), (10.5, 12.5))

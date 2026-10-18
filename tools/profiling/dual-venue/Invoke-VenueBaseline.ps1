@@ -226,9 +226,13 @@ function Invoke-BoundedChain([string]$Backend) {
 function Get-RowFigures([string]$ReceiptPath, $Leg, [string]$Backend) {
     # The figures exactly as the receipt reports them (null when the receipt does not carry one; never a default). presentedFps / timelineFpsAfterFirstPresent come from
     # the receipt's own hashed run log through Get-DvMatrixRow, which refuses a log that no longer hashes to the receipt.
-    $f = [ordered]@{ receipt = $null; outcome = $null; fps = $null; drops = $null; stall = $null }
+    $f = [ordered]@{ receipt = $null; outcome = $null; fps = $null; drops = $null; stall = $null; verification = $null }
     if (-not $ReceiptPath -or -not (Test-Path -LiteralPath $ReceiptPath -PathType Leaf)) { return $f }
     try { $rc = [IO.File]::ReadAllText($ReceiptPath) | ConvertFrom-Json } catch { return $f }
+    # The evidence-bearing validator (-RepoRoot re-derives the admission from the committed blobs and the run from the hashed evidence). Its verdict is recorded beside the figures,
+    # not used as a gate: a production receipt is ADVISORY at best and every Ultra-Magnus figure is supplementary, so the row says what the validator said and the reader decides.
+    $v = try { Test-DvReceiptValid -Receipt $rc -RepoRoot $repo } catch { $null }
+    $f.verification = $(if ($v) { [ordered]@{ status = [string]$v.status; valid = [bool]$v.valid; reasons = @($v.reasons | Select-Object -First 3) } } else { [ordered]@{ status = 'VALIDATOR_ERROR'; valid = $false; reasons = @() } })
     $m = Get-DvProp $rc 'metrics'; $pb = Get-DvProp $rc 'playback'; $pm = Get-DvProp $m 'presentMonStats'
     $entry = [pscustomobject]@{ seq = 1; repeat = 1; cellId = $Leg.legId; backend = $Backend; displayMode = [string](Get-DvProp (Get-DvProp $rc 'display') 'requestedMode'); scaleFactor = Get-DvProp (Get-DvProp $rc 'scale') 'requestedScale' }
     $row = try { Get-DvMatrixRow -PlanEntry $entry -Receipt $rc } catch { $null }
@@ -283,7 +287,7 @@ foreach ($b in $StandardBackends) {
             $rows.Add([ordered]@{
                 schema = 'mlv-app/venue-baseline-trend/v1'; utc = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'); venue = $Venue; role = $planLeg.role
                 sourceCommit = $commit; leg = $planLeg.legId; card = $planLeg.card; backend = $b; status = $legStatus; failure = $failure
-                outcome = $legOutcome; fps = $fig.fps; drops = $fig.drops; stall = $fig.stall
+                outcome = $legOutcome; fps = $fig.fps; drops = $fig.drops; stall = $fig.stall; receiptVerification = $fig.verification
                 receiptPath = $(if ($leg.PSObject.Properties['receipt'] -and $leg.receipt) { [string]$leg.receipt } else { $null }); buildManifestSha256 = $manifest; runDir = $RunDir; hubLoad = $null
             })
         }
