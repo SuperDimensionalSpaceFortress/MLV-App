@@ -11674,6 +11674,44 @@ TEST(DualIsoPipeline, Processed8PrefetchEnablesStandardScaleTwoFourAndEightButNo
     processingSetPlaybackPreviewMode(0);
 }
 
+/* DUALISO-PREFETCH-INDIRECT-WORKER-HIT-ORACLE-FLAKE-1: wait until the
+ * processed8 prefetch worker is idle, failing loudly only on a HANG.
+ *
+ * The idle wait is condition-driven (it returns the instant the worker has
+ * no pending request and is not busy: 0 ms for every wait after the first),
+ * so its timeout was never meant to assert a latency. The old fixed 5000 ms
+ * bound did exactly that for the worker's COLD first task (thread start,
+ * processing-object init, first indirect render): on a CPU-starved host that
+ * task took 5.8 s and 16.9 s (2 logical CPUs, 8 busy loops), the wait timed
+ * out at busy=0 pending=1, and merge_group 39092417197 bounced an unrelated
+ * PR. The worker always finished; nothing was wrong with its pixels.
+ *
+ * The bound below is a hang detector. A worker that never goes idle still
+ * fails the test, and the failure prints the worker state so the hang is
+ * attributable. It does not weaken what the tests prove: every hit is still
+ * byte-compared against the foreground reference and a forced fresh render. */
+static bool waitForProcessed8PrefetchIdleOrHang(mlvObject_t * video)
+{
+    constexpr uint32_t kHangGuardMs = 120000;
+    if (mlvWaitForProcessed8PrefetchIdleForTesting(video, kHangGuardMs))
+    {
+        return true;
+    }
+
+    pthread_mutex_lock(&video->processed8_prefetch_mutex);
+    const int started = video->processed8_prefetch_thread_started;
+    const int busy = video->processed8_prefetch_worker_busy;
+    const int pending = video->processed8_prefetch_request_pending;
+    pthread_mutex_unlock(&video->processed8_prefetch_mutex);
+    std::fprintf(stderr,
+                 "Processed8Prefetch idle wait HUNG for %u ms: thread_started=%d worker_busy=%d request_pending=%d\n",
+                 static_cast<unsigned>(kHangGuardMs),
+                 started,
+                 busy,
+                 pending);
+    return false;
+}
+
 /* 2026-06-11: the prefetch worker learned the indirect processed16->8 render
  * for direct8-incompatible processing states (the default Auto Look Assist
  * preset is the common real-world case). Three contracts are pinned here:
@@ -11763,7 +11801,7 @@ TEST(DualIsoPipeline, Processed8PrefetchIndirectWorkerHitMatchesForegroundRefere
                     }
                 }
             }
-            ASSERT_TRUE(mlvWaitForProcessed8PrefetchIdleForTesting(fixture.video(), 5000));
+            ASSERT_TRUE(waitForProcessed8PrefetchIdleOrHang(fixture.video()));
         }
     }
 
@@ -11778,7 +11816,7 @@ TEST(DualIsoPipeline, Processed8PrefetchIndirectWorkerHitMatchesForegroundRefere
      * same frame and processing state. This catches a worker snapshot that
      * is internally key-consistent but pixel-incomplete. */
     ASSERT_FALSE(first_prefetched_bytes.empty());
-    ASSERT_TRUE(mlvWaitForProcessed8PrefetchIdleForTesting(fixture.video(), 5000));
+    ASSERT_TRUE(waitForProcessed8PrefetchIdleOrHang(fixture.video()));
     MLVAPP_TEST_SETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH", "0");
     invalidateMlvProcessedPreviewCache(fixture.video());
     const std::vector<uint8_t> forced_fresh =
@@ -11864,7 +11902,7 @@ TEST(DualIsoPipeline, Processed8PrefetchIndirectAggressiveX4WorkerHitMatchesRefe
                     }
                 }
             }
-            ASSERT_TRUE(mlvWaitForProcessed8PrefetchIdleForTesting(fixture.video(), 5000));
+            ASSERT_TRUE(waitForProcessed8PrefetchIdleOrHang(fixture.video()));
         }
     }
 
@@ -12001,7 +12039,7 @@ TEST(DualIsoPipeline, Processed8PrefetchIndirectClarityKeepsSkip)
     {
         (void)fixture.renderFrame8Scaled(f, 1, 4);
         prefetched_hits += getMlvLastProcessed8PrefetchHit() ? 1 : 0;
-        ASSERT_TRUE(mlvWaitForProcessed8PrefetchIdleForTesting(fixture.video(), 5000));
+        ASSERT_TRUE(waitForProcessed8PrefetchIdleOrHang(fixture.video()));
     }
     ASSERT_EQ(0, prefetched_hits);
 
@@ -12030,7 +12068,7 @@ TEST(DualIsoPipeline, Processed8InvalidationIsGenerationBarrierAndForcesSnapshot
     }
 
     (void)fixture.renderFrame8Scaled(0, 1, 4);
-    ASSERT_TRUE(mlvWaitForProcessed8PrefetchIdleForTesting(fixture.video(), 5000));
+    ASSERT_TRUE(waitForProcessed8PrefetchIdleOrHang(fixture.video()));
     ASSERT_EQ(0, fixture.video()->processed8_prefetch_snapshot_dirty);
 
     /* pre_calc_levels is copied into the worker snapshot but deliberately is
@@ -12073,7 +12111,7 @@ TEST(DualIsoPipeline, Processed8InvalidationIsGenerationBarrierAndForcesSnapshot
     pthread_mutex_unlock(&fixture.video()->processed8_prefetch_mutex);
     ASSERT_EQ(0, dirty_after_request);
     ASSERT_EQ(replacement, snapshot_level);
-    ASSERT_TRUE(mlvWaitForProcessed8PrefetchIdleForTesting(fixture.video(), 5000));
+    ASSERT_TRUE(waitForProcessed8PrefetchIdleOrHang(fixture.video()));
 
     processingSetPlaybackPreviewMode(0);
     MLVAPP_TEST_UNSETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH");
@@ -12109,7 +12147,7 @@ TEST(DualIsoPipeline, Processed8InvalidationRejectsInFlightOldGenerationStoreAnd
 
     invalidateMlvProcessedPreviewCache(fixture.video());
     mlvSetProcessed8PrefetchPauseBeforeStoreForTesting(fixture.video(), 0);
-    ASSERT_TRUE(mlvWaitForProcessed8PrefetchIdleForTesting(fixture.video(), 5000));
+    ASSERT_TRUE(waitForProcessed8PrefetchIdleOrHang(fixture.video()));
 
     pthread_mutex_lock(&fixture.video()->processed8_prefetch_mutex);
     bool any_published_slot = false;
