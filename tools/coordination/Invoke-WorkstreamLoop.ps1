@@ -218,16 +218,29 @@ function Invoke-GitFetchFork {
     return [pscustomobject]@{ Ok = $false; Attempts = $Attempts; ExitCode = $last }
 }
 
+# HOST-FSMONITOR-DAEMON-LEAK-1 (a): the tool-owned driver worktree inherits the board's core.fsmonitor=true like every other worktree, and the
+# `reset --hard` below would start a daemon in it. Fail-soft: the helper lives in lane-fsmonitor.ps1, which a pinned sibling directory may not carry.
+function Disable-DriverFsmonitor {
+    try {
+        if (-not (Get-Command Disable-LaneWorktreeFsmonitor -ErrorAction SilentlyContinue)) { . (Join-Path $PSScriptRoot 'lane-fsmonitor.ps1') }
+        $null = Disable-LaneWorktreeFsmonitor -WorkDir $DriverRoot
+        # r2: the driver worktree persists between cycles, so a daemon from before this fix may already be running in it.
+        $null = Stop-LaneWorktreeFsmonitor -WorkDir $DriverRoot
+    } catch { }
+}
+
 function Sync-DriverWorktree {
     # Returns $null on success, or a CANNOT-DETERMINE reason string.
     try {
         if (-not (Test-Path -LiteralPath (Join-Path $DriverRoot '.git'))) {
             if (Test-Path -LiteralPath $DriverRoot) { Remove-Item -LiteralPath $DriverRoot -Recurse -Force }
             Invoke-GitFetchFork | Out-Null
-            & git -C $RepoRoot -c core.longpaths=true worktree add --detach $DriverRoot $TargetRef 2>&1 | Out-Null
+            & git -C $RepoRoot -c core.longpaths=true -c core.fsmonitor=false worktree add --detach $DriverRoot $TargetRef 2>&1 | Out-Null
             if ($LASTEXITCODE -ne 0) { return "could not create driver worktree at $DriverRoot" }
+            Disable-DriverFsmonitor
             return $null
         }
+        Disable-DriverFsmonitor
         $fetch = Invoke-GitFetchFork
         if (-not $fetch.Ok) { return "git fetch fork failed (exit $($fetch.ExitCode)) after $($fetch.Attempts) attempts; driver worktree may be stale" }
         # Hard reset is safe here and ONLY here: this worktree is tool-owned, is
