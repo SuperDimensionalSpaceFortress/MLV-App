@@ -18,6 +18,7 @@ Launch command lines in the fixtures are assembled at run time so this file itse
 
 from __future__ import annotations
 
+import hashlib
 import itertools
 import json
 import os
@@ -25,6 +26,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -129,6 +131,43 @@ def _write_probe(path: Path, body: str) -> None:
 
 BATCH_SHARDS = 6
 
+# CI-LINTDIFF-PIN-HOSTED-COST-1 (CoS #472 ask 6228350481). A hosted windows shard has a 40 min job cap and runs many other tests, so a
+# corpus probe that outlives its share cancels the WHOLE job (the 1500 s bound did, on run 38967884804: PRs #465, #467, #472 re-ran or
+# staled). LINT_PROBE_BOUND_SEC is one wall-clock budget for everything a corpus evaluation starts (all lints and shards run
+# concurrently, so it is also the longest any one probe may take): past it the test FAILS typed, naming the probe and the elapsed time.
+# 600 s is the ceiling the card allows and leaves the rest of the shard's budget to the other tests; the evaluation costs about 1 CPU-minute per
+# 3k rows a lint, so a healthy host is well inside it and only a starved one fails (by name, in one test, not as a cancelled job).
+LINT_PROBE_BOUND_SEC = 600
+
+# Every pwsh this module starts for the lint probes is noted here (see _popen_pwsh / _run_pwsh), so the differential class can pin its own count.
+_PWSH_SPAWNS: list[str] = []
+# Verdicts are a pure function of (lint text, corpus), so a lint already evaluated over a corpus is not evaluated again. The key is the lint's
+# git blob id plus a digest of the corpus; a miss is computed in-test by _corpus_counts (nothing is committed, so nothing can go stale).
+# A failed evaluation is cached as its error too, so the next test of the class fails at once instead of waiting out another bound.
+_COUNT_CACHE: dict = {}
+_WORD_LIST_CACHE: dict = {}
+
+
+def _popen_pwsh(probe: Path) -> "subprocess.Popen":
+    """The one place a pwsh lint probe is started in the background; counted in _PWSH_SPAWNS."""
+    _PWSH_SPAWNS.append(probe.name)
+    proc = subprocess.Popen([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(probe)],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    proc.started_at = time.monotonic()  # read by _collect_counts for its typed timeout message
+    return proc
+
+
+def _run_pwsh(probe: Path, timeout: int) -> "subprocess.CompletedProcess":
+    """The one place a pwsh lint probe is run in the foreground; counted in _PWSH_SPAWNS."""
+    _PWSH_SPAWNS.append(probe.name)
+    return subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(probe)], capture_output=True, text=True, timeout=timeout)
+
+
+def _lint_blob_id(lint: Path) -> str:
+    """The git blob id of the lint as it will be read (line endings normalised to LF, as the baseline-equals-candidate checks already do)."""
+    data = lint.read_bytes().replace(b"\r\n", b"\n")
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+
 
 def _lint_finding_counts(lint: Path, texts: list[str], work: Path, tag: str) -> "subprocess.Popen":
     """Start ONE pwsh that dot-sources `lint` and counts the findings of every text (one sentence per line). Returns the Popen."""
@@ -142,18 +181,21 @@ def _lint_finding_counts(lint: Path, texts: list[str], work: Path, tag: str) -> 
         "foreach ($l in [System.IO.File]::ReadAllLines(" + _psq(src) + ")) { $out.Add(@(Get-LocalPlaybackPromptFindings -Text $l).Count) }\n"
         "ConvertTo-Json -InputObject @($out.ToArray()) -Compress\n",
     )
-    return subprocess.Popen([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(probe)],
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    return _popen_pwsh(probe)
 
 
 def _lint_word_lists(lint: Path, work: Path) -> dict[str, list[str]]:
-    """The closed word lists the lint's exemptions depend on, read from the lint itself (Get-LocalPlaybackLintWordLists)."""
-    probe = work / "lists-probe.ps1"
-    _write_probe(probe, ". " + _psq(lint) + "\nConvertTo-Json -InputObject (Get-LocalPlaybackLintWordLists) -Compress -Depth 4\n")
-    done = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(probe)], capture_output=True, text=True, timeout=120)
-    if done.returncode != 0 or not done.stdout.strip():
-        raise AssertionError(f"the lint exposes no word lists (Get-LocalPlaybackLintWordLists): {(done.stderr or done.stdout).strip()[:300]}")
-    return {k: [str(x) for x in v] for k, v in json.loads(done.stdout.strip()).items()}
+    """The closed word lists the lint's exemptions depend on, read from the lint itself (Get-LocalPlaybackLintWordLists).
+    One pwsh per distinct lint text (cached by blob id); each caller gets its own copy of the lists."""
+    blob = _lint_blob_id(lint)
+    if blob not in _WORD_LIST_CACHE:
+        probe = work / "lists-probe.ps1"
+        _write_probe(probe, ". " + _psq(lint) + "\nConvertTo-Json -InputObject (Get-LocalPlaybackLintWordLists) -Compress -Depth 4\n")
+        done = _run_pwsh(probe, 120)
+        if done.returncode != 0 or not done.stdout.strip():
+            raise AssertionError(f"the lint exposes no word lists (Get-LocalPlaybackLintWordLists): {(done.stderr or done.stdout).strip()[:300]}")
+        _WORD_LIST_CACHE[blob] = {k: [str(x) for x in v] for k, v in json.loads(done.stdout.strip()).items()}
+    return {k: list(v) for k, v in _WORD_LIST_CACHE[blob].items()}
 
 
 def _json_counts(lint: Path, texts: list[str], work: Path, tag: str) -> list[int]:
@@ -169,7 +211,7 @@ def _json_counts(lint: Path, texts: list[str], work: Path, tag: str) -> list[int
         "foreach ($t in $texts) { $out.Add(@(Get-LocalPlaybackPromptFindings -Text ([string]$t)).Count) }\n"
         "ConvertTo-Json -InputObject @($out.ToArray()) -Compress\n",
     )
-    proc = subprocess.Popen([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(probe)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    proc = _popen_pwsh(probe)  # one pwsh for the whole (small) list; counted in _PWSH_SPAWNS
     try:
         return _collect_counts(proc, len(texts))
     finally:
@@ -197,11 +239,43 @@ def _start_shards(lint: Path, texts: list[str], work: Path, tag: str, shards: li
         shards.append((_lint_finding_counts(lint, chunk, work, f"{tag}-s{n}"), chunk))
 
 
-def _collect_shards(shards: list) -> list[int]:
+def _collect_shards(shards: list, deadline: float | None = None) -> list[int]:
     counts: list[int] = []
+    if deadline is None:  # one budget for all shards of the call, not a fresh bound per shard
+        deadline = time.monotonic() + LINT_PROBE_BOUND_SEC
     for proc, chunk in shards:
-        counts.extend(_collect_counts(proc, len(chunk)))
+        counts.extend(_collect_counts(proc, len(chunk), deadline))
     return counts
+
+
+def _corpus_counts(lints: list[Path], texts: list[str], work: Path, tag: str) -> list[list[int]]:
+    """Finding count of every text under each lint of `lints` (same order). Each DISTINCT lint text (git blob id) is evaluated once per
+    corpus per process -- the baseline test, the previous-head test and the identical-baseline test all share the candidate's verdicts,
+    and a baseline equal to the candidate costs nothing -- and every distinct lint starts at once, as BATCH_SHARDS pwsh shards. All of
+    them run inside ONE LINT_PROBE_BOUND_SEC budget. No row is skipped: every distinct lint is evaluated over every text."""
+    digest = hashlib.sha1(json.dumps(texts).encode("utf-8")).hexdigest()
+    keys = [(_lint_blob_id(lint), digest) for lint in lints]
+    started: dict = {}
+    deadline = time.monotonic() + LINT_PROBE_BOUND_SEC
+    try:
+        for n, (lint, key) in enumerate(zip(lints, keys)):
+            if key not in _COUNT_CACHE and key not in started:
+                started[key] = []
+                _start_shards(lint, texts, work, f"{tag}{n}", started[key])
+        for key, shards in started.items():
+            try:
+                _COUNT_CACHE[key] = _collect_shards(shards, deadline)
+            except AssertionError as err:
+                _COUNT_CACHE[key] = err
+    finally:
+        for shards in started.values():
+            for proc, _ in shards:
+                _kill(proc)
+    verdicts = [_COUNT_CACHE[key] for key in keys]
+    for verdict in verdicts:
+        if isinstance(verdict, AssertionError):
+            raise AssertionError(str(verdict))
+    return verdicts
 
 
 def _kill(proc: "subprocess.Popen") -> None:
@@ -214,14 +288,19 @@ def _kill(proc: "subprocess.Popen") -> None:
         pass
 
 
-def _collect_counts(proc: "subprocess.Popen", expected: int) -> list[int]:
+def _collect_counts(proc: "subprocess.Popen", expected: int, deadline: float | None = None) -> list[int]:
+    """The verdicts of one probe. `deadline` is a time.monotonic() instant shared by every probe of one evaluation (default: a fresh
+    LINT_PROBE_BOUND_SEC from now). A probe still running at the deadline is killed and the test FAILS typed with the probe's name and the
+    elapsed time -- an AssertionError, never a subprocess.TimeoutExpired nor a job cancelled by the shard's 40 min cap."""
+    if deadline is None:
+        deadline = time.monotonic() + LINT_PROBE_BOUND_SEC
     try:
-        # r10: the corpus grew past 26k rows and the baseline lints take several ms a row on a loaded runner; r12: ~32k rows at ~19 ms a
-        # row on a loaded host measured 600 s and timed out, so the bound is 1500 s
-        out, err = proc.communicate(timeout=1500)
+        out, err = proc.communicate(timeout=max(1.0, deadline - time.monotonic()))
     except subprocess.TimeoutExpired:
+        elapsed = time.monotonic() - getattr(proc, "started_at", time.monotonic())
         _kill(proc)
-        raise
+        raise AssertionError(f"lint probe {Path(str(proc.args[-1])).name} ({expected} rows) did not finish inside its budget "
+                             f"(elapsed {elapsed:.0f} s, bound {LINT_PROBE_BOUND_SEC} s); the host is too slow for the differential corpus") from None
     if proc.returncode != 0:
         raise AssertionError(f"lint probe failed: {err}")
     counts = json.loads(out.strip())
@@ -892,6 +971,29 @@ def _differential_corpus(seeds: tuple[str, ...], members: tuple = ()) -> dict[st
     return rows
 
 
+# The number of distinct wordings the differential pin evaluates under EVERY lint it compares. CI-LINTDIFF-PIN-HOSTED-COST-1 changed HOW
+# they are evaluated (once per distinct lint text, see _corpus_counts), never WHICH: this is the count on fork/master 6f11ca50 before that
+# change, derived with `_full_differential_corpus(...)` = _differential_corpus(the PromptLintTests catalogues + PROBE_ROWS + DEFEATER_AXIS
+# and its controls, members=_list_member_rows(the lint's word lists)) -> len(...). The corpus grows with the catalogues and the lint's
+# word lists, so a round that adds rows or list members raises this number in the same commit; it never falls without a reviewed reason.
+DIFFERENTIAL_CORPUS_ROWS = 34676
+
+
+def _full_differential_corpus(work: Path) -> dict[str, dict]:
+    """The whole differential corpus (text -> fields): every catalogue row, probe row and defeater row as a seed, plus the list-member rows."""
+    return _differential_corpus(PromptLintTests.CLAUSE_MUST_REFUSE + PromptLintTests.CLAUSE_MUST_PASS + PromptLintTests.CLAUSE_MUST_PASS_R6
+                                + PromptLintTests.CLAUSE_MUST_REFUSE_R7 + PromptLintTests.CLAUSE_MUST_PASS_R7
+                                + PromptLintTests.CLAUSE_MUST_REFUSE_R8 + PromptLintTests.CLAUSE_MUST_PASS_R8
+                                + PromptLintTests.CLAUSE_MUST_REFUSE_R10 + PromptLintTests.CLAUSE_MUST_REFUSE_R10_OVERREFUSAL
+                                + PromptLintTests.CLAUSE_MUST_PASS_R10
+                                + PromptLintTests.CLAUSE_MUST_REFUSE_R11 + PromptLintTests.CLAUSE_MUST_PASS_R11
+                                + PromptLintTests.CLAUSE_MUST_REFUSE_R12 + PromptLintTests.CLAUSE_MUST_PASS_R12
+                                + PromptLintTests.CLAUSE_MUST_REFUSE_R13 + PromptLintTests.CLAUSE_MUST_PASS_R13
+                                + PromptLintTests.PROBE_ROWS
+                                + tuple(text for _, _, text in PromptLintTests.DEFEATER_AXIS) + PromptLintTests.DEFEATER_AXIS_CONTROLS,
+                                members=tuple(_list_member_rows(_lint_word_lists(LINT_PS1, work))))
+
+
 def _differential_flips(work: Path, baseline_text: str | None = None, previous_head: bool = False) -> tuple[str, list[tuple[str, dict]], list[tuple[str, dict]], int]:
     """Run baseline and candidate lints over the corpus. -> (baseline ref, refuse->pass rows, pass->refuse rows, corpus size).
 
@@ -914,30 +1016,12 @@ def _differential_flips(work: Path, baseline_text: str | None = None, previous_h
         ref, text = base
     baseline = work / "baseline-lint.ps1"
     baseline.write_text(text, encoding="utf-8")
-    corpus = _differential_corpus(PromptLintTests.CLAUSE_MUST_REFUSE + PromptLintTests.CLAUSE_MUST_PASS + PromptLintTests.CLAUSE_MUST_PASS_R6
-                                  + PromptLintTests.CLAUSE_MUST_REFUSE_R7 + PromptLintTests.CLAUSE_MUST_PASS_R7
-                                  + PromptLintTests.CLAUSE_MUST_REFUSE_R8 + PromptLintTests.CLAUSE_MUST_PASS_R8
-                                  + PromptLintTests.CLAUSE_MUST_REFUSE_R10 + PromptLintTests.CLAUSE_MUST_REFUSE_R10_OVERREFUSAL
-                                  + PromptLintTests.CLAUSE_MUST_PASS_R10
-                                  + PromptLintTests.CLAUSE_MUST_REFUSE_R11 + PromptLintTests.CLAUSE_MUST_PASS_R11
-                                  + PromptLintTests.CLAUSE_MUST_REFUSE_R12 + PromptLintTests.CLAUSE_MUST_PASS_R12
-                                  + PromptLintTests.CLAUSE_MUST_REFUSE_R13 + PromptLintTests.CLAUSE_MUST_PASS_R13
-                                  + PromptLintTests.PROBE_ROWS
-                                  + tuple(text for _, _, text in PromptLintTests.DEFEATER_AXIS) + PromptLintTests.DEFEATER_AXIS_CONTROLS,
-                                  members=tuple(_list_member_rows(_lint_word_lists(LINT_PS1, work))))
+    corpus = _full_differential_corpus(work)
     texts = list(corpus)
-    base_shards: list = []
-    cand_shards: list = []
-    try:
-        # Both launches sit inside the cleanup boundary: a failing second Popen must not leave the first unreaped. Each lint runs as
-        # BATCH_SHARDS pwsh processes (r12: ~32k rows, ~17 ms a row, does not fit one 600 s process).
-        _start_shards(baseline, texts, work, "base", base_shards)
-        _start_shards(LINT_PS1, texts, work, "cand", cand_shards)
-        before = _collect_shards(base_shards)
-        after = _collect_shards(cand_shards)
-    finally:
-        for proc, _ in base_shards + cand_shards:
-            _kill(proc)
+    # Baseline and candidate start together as BATCH_SHARDS pwsh shards each (r12: ~32k rows, ~17 ms a row, does not fit one process), inside
+    # one LINT_PROBE_BOUND_SEC budget and one cleanup boundary (_corpus_counts). A lint text already evaluated by an earlier test of this
+    # process -- the candidate always, the baseline when it is the same text -- is read from the in-process cache instead of being run again.
+    before, after = _corpus_counts([baseline, LINT_PS1], texts, work, "diff")
     opened = [(t, corpus[t]) for t, b, a in zip(texts, before, after) if b > 0 and a == 0]
     closed = [(t, corpus[t]) for t, b, a in zip(texts, before, after) if b == 0 and a > 0]
     return ref, opened, closed, len(texts)
@@ -2299,13 +2383,65 @@ class LintDifferentialPinTests(unittest.TestCase):
          "launch still passes (CLAUSE_MUST_PASS_R13)."),
     )
 
+    # CI-LINTDIFF-PIN-HOSTED-COST-1 spawn ceiling: the most pwsh processes this class may start. Derivation, for the widest case (a baseline
+    # and a previous head that both differ from the candidate): 1 word-list probe + 3 distinct lints x BATCH_SHARDS (6) shards + 3
+    # multi-line probes (_json_counts: candidate, previous head, master) + 2 probes of test_a_lint_text_is_evaluated_once_per_corpus
+    # + 1 probe of test_a_slow_probe_fails_typed_with_its_name_and_elapsed_time = 25. Before the change the same case started
+    # 3 tests x (1 word-list probe + 2 lints x 6 shards) + 3 multi-line probes = 42.
+    MAX_PWSH_SPAWNS = 25
+
     @classmethod
     def setUpClass(cls):
         cls.tmp = Path(tempfile.mkdtemp(prefix="hubvm-diff-"))
+        cls.spawns_before = len(_PWSH_SPAWNS)
 
     @classmethod
     def tearDownClass(cls):
         shutil.rmtree(cls.tmp, ignore_errors=True)
+        started = _PWSH_SPAWNS[cls.spawns_before:]
+        if len(started) > cls.MAX_PWSH_SPAWNS:
+            raise AssertionError(f"LintDifferentialPinTests started {len(started)} pwsh processes, ceiling {cls.MAX_PWSH_SPAWNS}: {started}")
+
+    def test_the_corpus_row_count_is_pinned(self):
+        """CI-LINTDIFF-PIN-HOSTED-COST-1 guard (a): the rows the pin evaluates are the rows it evaluated before the cost cut."""
+        corpus = _full_differential_corpus(self.tmp)
+        self.assertEqual(DIFFERENTIAL_CORPUS_ROWS, len(corpus),
+                         "the differential corpus changed size; if a catalogue or a lint word list grew on purpose, raise "
+                         "DIFFERENTIAL_CORPUS_ROWS in the same commit, and never lower it without a reviewed reason")
+
+    def test_a_lint_text_is_evaluated_once_per_corpus(self):
+        """CI-LINTDIFF-PIN-HOSTED-COST-1 guard (b): equal lint texts share one evaluation (a copy, even with other line endings), a repeat
+        of the same corpus spawns nothing, and a different lint text is its own evaluation -- no verdict is ever borrowed across lints."""
+        rows = ["Run playback locally.", "Run playback on Bachelor.", "Build the console tests."]
+        same = self.tmp / "same-lint.ps1"
+        same.write_bytes(LINT_PS1.read_bytes().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"))
+        other = self.tmp / "other-lint.ps1"
+        other.write_bytes(LINT_PS1.read_bytes() + b"\n# a different blob\n")
+        start = len(_PWSH_SPAWNS)
+        first, copy = _corpus_counts([LINT_PS1, same], rows, self.tmp, "once")
+        self.assertEqual(first, copy)
+        self.assertEqual(1, len(_PWSH_SPAWNS) - start, "two equal lint texts must start one probe")
+        again, = _corpus_counts([LINT_PS1], rows, self.tmp, "once-again")
+        self.assertEqual(first, again)
+        self.assertEqual(1, len(_PWSH_SPAWNS) - start, "a corpus already evaluated under a lint must not start a probe")
+        different, = _corpus_counts([other], rows, self.tmp, "once-other")
+        self.assertEqual(2, len(_PWSH_SPAWNS) - start, "a different lint text is evaluated by its own probe")
+        self.assertEqual(len(rows), len(different))
+        self.assertGreater(first[0], 0, "`Run playback locally.` is refused: the cached verdicts are real counts")
+
+    def test_a_slow_probe_fails_typed_with_its_name_and_elapsed_time(self):
+        """CI-LINTDIFF-PIN-HOSTED-COST-1 bound: a probe that outlives the budget raises an AssertionError naming it, not TimeoutExpired."""
+        probe = self.tmp / "slow-probe.ps1"
+        _write_probe(probe, "Start-Sleep -Seconds 60\n")
+        proc = _popen_pwsh(probe)
+        try:
+            with self.assertRaises(AssertionError) as caught:
+                _collect_counts(proc, 3, time.monotonic() + 1)
+        finally:
+            _kill(proc)
+        self.assertIn("slow-probe.ps1", str(caught.exception))
+        self.assertIn("elapsed", str(caught.exception))
+        self.assertLessEqual(LINT_PROBE_BOUND_SEC, 600)
 
     def test_r11_multiline_rows_flip_only_as_listed_against_master_and_the_previous_head(self):
         """r11b / r12: the single-line differential corpus cannot hold a line break, so every multi-line catalogue row is run through
@@ -2345,6 +2481,7 @@ class LintDifferentialPinTests(unittest.TestCase):
     def test_no_unlisted_flip_against_the_baseline(self):
         ref, opened, closed, size = _differential_flips(self.tmp)
         self.assertGreaterEqual(size, 1000, "the corpus shrank; the pin no longer samples the wording space")
+        self.assertEqual(DIFFERENTIAL_CORPUS_ROWS, size, "every pinned corpus row is evaluated against the baseline and the candidate")
         problems = _pin_problems(opened, closed, self.ALLOWED_REFUSE_TO_PASS, self.ALLOWED_PASS_TO_REFUSE)
         self.assertEqual(
             [], problems,
@@ -2361,6 +2498,7 @@ class LintDifferentialPinTests(unittest.TestCase):
         ref, opened, closed, size = _differential_flips(self.tmp, previous_head=True)
         self.assertEqual(PREVIOUS_PR_HEAD[:8], ref)
         self.assertGreaterEqual(size, 1000, "the corpus shrank; the pin no longer samples the wording space")
+        self.assertEqual(DIFFERENTIAL_CORPUS_ROWS, size, "every pinned corpus row is evaluated against the previous head and the candidate")
         problems = _pin_problems(opened, closed, self.ALLOWED_PREVIOUS_HEAD_REFUSE_TO_PASS, self.ALLOWED_PREVIOUS_HEAD_PASS_TO_REFUSE)
         self.assertEqual(
             [], problems,
@@ -2390,8 +2528,9 @@ class LintDifferentialPinTests(unittest.TestCase):
     def test_identical_baseline_passes(self):
         """Once this change is on master the baseline IS the candidate: no flips, and the pin must pass (it failed on r2, whose entries
         were each required to match a flip)."""
-        ref, opened, closed, _ = _differential_flips(self.tmp, baseline_text=LINT_PS1.read_text(encoding="utf-8"))
+        ref, opened, closed, size = _differential_flips(self.tmp, baseline_text=LINT_PS1.read_text(encoding="utf-8"))
         self.assertEqual("candidate-itself", ref)
+        self.assertEqual(DIFFERENTIAL_CORPUS_ROWS, size, "the identical-baseline state covers every pinned corpus row too")
         self.assertEqual(([], []), ([t for t, _ in opened], [t for t, _ in closed]))
         self.assertEqual([], _pin_problems(opened, closed, self.ALLOWED_REFUSE_TO_PASS, self.ALLOWED_PASS_TO_REFUSE))
 
