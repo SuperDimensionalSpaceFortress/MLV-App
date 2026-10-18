@@ -19,9 +19,11 @@ Rules:
 - The plan is a snapshot, so -Apply RE-VALIDATES each job just before moving it: the job's members in
   processed\ and outbox\ are re-listed and must be the same names with the same LastWriteTimeUtc, all still
   older than the cutoff, and no entry for the job may have appeared in inbox\, running\, orphaned\ or cancel\.
-  Each member is re-stat'ed again immediately before its own rename. Any difference skips the WHOLE job
-  (stats.changedSinceScan); if it is detected after some members already moved, the run stops (exit 3) with the
-  partial job named. The residual window is the milliseconds between a member's re-stat and its rename.
+  Immediately before EACH member's own rename the live directories are probed again for the job (so a claim that
+  appears mid-job is caught) and the member is re-stat'ed. Any difference skips the WHOLE job
+  (stats.changedSinceScan); if it is detected after some members already moved, the run stops (exit 3,
+  step=changed), the remaining members stay live, and a "stopped" manifest row names the partial job with its
+  moved and remaining members. The residual window is the milliseconds between that probe and the rename.
 - -Apply holds an exclusive lock (<share>\archive\rotation-manifests\rotation.lock, opened CreateNew and removed
   on close) so two -Apply runs never work the same share at once; a second run refuses with ROTATION_LOCKED.
 - Moves are same-share renames (no data copy). In -Apply mode each move is bracketed in
@@ -173,8 +175,11 @@ function Get-JobChange($c) {
     return $null
 }
 
-function Get-MemberChange($m) {
-    # Re-stat one member immediately before its rename.
+function Get-MemberChange($c, $m) {
+    # Immediately before ONE member's rename: no live claim may have appeared for the job (every inbox/running/
+    # orphaned/cancel shape, nonce .tmp markers included), and the member must be unchanged since the scan.
+    $liveNow = @(Get-JobEntriesNow $c.key @('inbox', 'running', 'orphaned', 'cancel'))
+    if ($liveNow.Count) { return "live entry appeared: $($liveNow[0].dir)\$($liveNow[0].entry.Name)" }
     $m.entry.Refresh()
     if (-not $m.entry.Exists) { return "vanished since scan" }
     if ($m.entry.LastWriteTimeUtc -ne $m.plannedUtc) { return "rewritten since scan" }
@@ -203,7 +208,7 @@ if ($Apply -and $plan.Count) {
             continue jobs
         }
         foreach ($m in $c.members) {
-            $why = Get-MemberChange $m
+            $why = Get-MemberChange $c $m
             if ($why) {
                 if (-not $movedHere.Count) {
                     $stats.changedSinceScan++
@@ -243,6 +248,17 @@ if ($Apply -and $plan.Count) {
                 break jobs
             }
         }
+    }
+    if ($report.stoppedOn) {
+        # Name the partial job in the manifest too, with what moved and what stayed live, so the manifest alone
+        # accounts for it. A failure to write this row is reported, never hidden (the stdout report still has it).
+        $sj = @($plan | Where-Object { $_.key -eq $report.stoppedOn.job })[0]
+        $moved = @($report.stoppedOn.movedMembers)
+        $report.stoppedOn.remainingMembers = @($sj.members | ForEach-Object { "$($_.dir)\$($_.entry.Name)" } | Where-Object { $_ -notin $moved })
+        try {
+            $row = [ordered]@{ phase = 'stopped' } + $report.stoppedOn
+            Add-ManifestRow $row
+        } catch { $report.stoppedOn.stoppedRowError = $_.Exception.Message }
     }
     } finally { $lock.Dispose() }
 }

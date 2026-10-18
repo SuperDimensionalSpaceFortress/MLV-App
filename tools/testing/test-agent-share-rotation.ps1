@@ -36,7 +36,11 @@ $keys = @{
     # sol r1 blocker 1: dotted ids that contain a suffix word keep their whole id; UmRunDrop nonce temps reduce to J
     'J.artifacts.result.json' = 'J.artifacts'; 'J.started.result.json' = 'J.started'; 'J.artifacts.started.json.tmp' = 'J.artifacts'
     'x.cancel.job.ps1' = 'x.cancel'; 'J.0123456789abcdef0123456789abcdef.meta.tmp' = 'J'; 'J.0123456789abcdef0123456789abcdef.job.tmp' = 'J'
-    'J.provenance.json' = 'J'; 'J.out.txt' = 'J'; 'J.err.txt' = 'J'; 'J.heavy-slot.wait.txt' = 'J'
+    'J.provenance.json' = 'J'; 'J.out.txt' = 'J'; 'J.err.txt' = 'J'
+    # sol r2 hardening: the agent's heavy-slot holder logs belong to J (ultra-magnus-agent.ps1 "$id.heavy-slot.out.txt")
+    'J.heavy-slot.out.txt' = 'J'; 'J.heavy-slot.err.txt' = 'J'; 'J.x.heavy-slot.out.txt' = 'J.x'
+    # Dot 85c1267 reserved-token shapes
+    'J.started.job.ps1' = 'J.started'; 'J.started.started.json' = 'J.started'; 'J.started.started.json.tmp' = 'J.started'; 'J.started.meta.json' = 'J.started'
 }
 foreach ($n in $keys.Keys) { Check ((Get-AgentShareJobKey -Name $n) -ceq $keys[$n]) "job key '$n' -> '$($keys[$n])' (got '$(Get-AgentShareJobKey -Name $n)')" }
 Check (-not (Test-AgentShareJobEntry -Name 'J.artifacts.result.json' -JobId 'J')) 'exact lookup: J.artifacts.result.json is not job J'
@@ -150,6 +154,21 @@ try {
     $out = & $rot -AgentShare $root -OlderThanDays 30 -NowUtc $now -Apply -TestHookBeforeMove $mid | Out-String | ConvertFrom-Json
     Check ($LASTEXITCODE -eq 3 -and $out.stoppedOn.step -eq 'changed' -and $out.stoppedOn.job -eq 'r-1') "mid-job rewrite stops with step=changed (exit $LASTEXITCODE)"
     Check ((Has 'outbox\r-1.result.json')) 'rewritten member was not moved'
+    Remove-Root
+
+    # --- sol r2 blocker: a live claim that appears MID-JOB (after the first member moved) stops the job
+    New-Root
+    New-Entry 'processed\k-1.job.ps1' 60; New-Entry 'outbox\k-1.result.json' 60
+    New-Entry 'processed\k-2.job.ps1' 50
+    $hr = $root
+    $claim = { param($m) if ($m.entry.Name -eq 'k-1.job.ps1') { Set-Content (Join-Path $hr 'running\k-1.started.json.0123456789abcdef0123456789abcdef.tmp') 'x' } }.GetNewClosure()
+    $out = & $rot -AgentShare $root -OlderThanDays 30 -NowUtc $now -Apply -TestHookBeforeMove $claim | Out-String | ConvertFrom-Json
+    Check ($LASTEXITCODE -eq 3 -and $out.stoppedOn.step -eq 'changed' -and $out.stoppedOn.job -eq 'k-1' -and $out.stoppedOn.error -match 'live entry appeared') "mid-job live claim stops with step=changed (exit $LASTEXITCODE, step $($out.stoppedOn.step))"
+    Check ((Has 'outbox\k-1.result.json') -and (Has 'processed\k-2.job.ps1')) 'remaining member and later jobs stay live'
+    Check (@($out.stoppedOn.movedMembers).Count -eq 1 -and @($out.stoppedOn.remainingMembers) -contains 'outbox\k-1.result.json') 'report names moved and remaining members'
+    $rows = @(Get-ChildItem (Join-Path $root 'archive\rotation-manifests') -Filter *.jsonl | ForEach-Object { Get-Content $_.FullName } | ForEach-Object { $_ | ConvertFrom-Json })
+    $stop = @($rows | Where-Object phase -eq 'stopped')
+    Check ($stop.Count -eq 1 -and $stop[0].job -eq 'k-1' -and @($stop[0].remainingMembers) -contains 'outbox\k-1.result.json') 'manifest carries a stopped row naming the partial job'
     Remove-Root
 
     # --- failed done row after a successful rename (sol r1 hardening): stop, report the moved member

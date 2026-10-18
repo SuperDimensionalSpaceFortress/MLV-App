@@ -28,7 +28,7 @@ param(
     [int]$First = 20,
     # Name prefix filter applied during enumeration (passed to the directory search, so the server filters).
     [string]$NamePrefix = '',
-    # Exact job id: probes the known artifact names directly; no directory listing at all.
+    # Exact job id: a server-filtered "<id>*" enumeration, then AgentShare.psm1's job-key test keeps exactly this id.
     [string]$JobId = '',
     [switch]$IncludeArchive,
     [switch]$AsJson
