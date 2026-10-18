@@ -32,6 +32,7 @@ Section headings are stable IDs. Demoted sections and where they went:
 | Section (stable ID) | Now lives in |
 |---|---|
 | Agent Bridge — Session Closeout | [claude/session-closeout.md](claude/session-closeout.md) |
+| Agent Bridge — Session Startup (Hook-Driven) | [claude/agent-bridge-session-startup.md](claude/agent-bridge-session-startup.md) |
 | Architecture (Locked — Do Not Deviate) | [claude/batch-cli-spec.md](claude/batch-cli-spec.md) |
 | Target Export Format | [claude/batch-cli-spec.md](claude/batch-cli-spec.md) |
 | Settings / Receipt Strategy (PHASED — Critical Design Decision) | [claude/batch-cli-spec.md](claude/batch-cli-spec.md) |
@@ -110,53 +111,6 @@ machine-specific facts (host access, local paths). When saving something new:
 
 ---
 
-## Agent Bridge — Session Startup (Hook-Driven)
-
-This repo uses an agent-bridge to coordinate with a peer Codex session. The
-`SessionStart` hook in `.claude/settings.local.json` runs
-`tools/agent-bridge/bootstrap_session.py` automatically at the start of every
-session — its stdout is injected into your context. The bootstrap registers
-this session as the active Claude bridge owner (superseding any older Claude
-session), drains messages from the previous session, sends a HANDSHAKE to
-Codex, and updates the watcher config.
-
-After the hook fires, do these in order:
-1. **Read `drained_previous_messages`** in the hook output — surface any unread
-   messages from the previous session to the user before proceeding.
-2. **Use the returned `session_id`** as your active Claude bridge GUID for this session.
-3. **If `check_inbox` returns a `SESSION_UPDATE: superseded` control message at any
-   point**, stop all bridge sends immediately — a newer Claude session has taken over.
-4. **Read `active_session_unread`** in the hook output — these are unread rows
-   already sitting in the new active session bucket. Surface them, then mark each
-   read by id after handling.
-5. **Start the bridge Monitor** — the Monitor is Claude's inbox wake mechanism and does
-   NOT survive context compaction. Start it every session, no exceptions:
-   ```
-   Monitor(persistent=True, command="<python> -u tools/agent-bridge/bridge_monitor_poll.py --state-dir <bridge-state-dir> --agent claude --session-id <active-guid> --project mlv-app --poll-interval-seconds 2")
-   ```
-   Use `bridge_monitor_poll.py` for the Monitor. Do not substitute
-   `probe_server.py`; probes are diagnostics and will not keep Claude's inbox
-   wake path armed. Before saying "waiting for Codex," verify the Monitor task
-   is active. If no Monitor is running, start one before waiting.
-   If a bridge message arrives with `TYPE: CONTROL` and
-   `SUBJECT: MONITOR_RESTART_REQUIRED`, stop any stale Monitor task handle and
-   immediately start a fresh `bridge_monitor_poll.py` Monitor with the command
-   shown in the message. The watcher sends this control when it detects a stale
-   or missing Monitor heartbeat, or when bridge Monitor-related code changes.
-
-When a Monitor notification fires, call `mcp__agent-bridge__check_inbox` with
-`agent=claude`, `session_id=<active-guid-or-mlv-app>`, `mark_read=False`, then mark
-each message read explicitly by id.
-
-If the hook output is missing from your session-start context (broken JSON,
-deleted file, hook failure), fall back to running `bootstrap_session.py`
-manually with the command stored in `.claude/settings.local.json`.
-
-Bridge protocol details: `tools/agent-bridge/BRIDGE_PROTOCOL.md`
-Hardening plan and audit log: `tools/agent-bridge/BRIDGE_HARDENING.md`
-
----
-
 ## Behavioral Rules for Claude Code
 
 1. **No speculation** — search the repo and quote exact code before writing
@@ -172,5 +126,7 @@ Hardening plan and audit log: `tools/agent-bridge/BRIDGE_HARDENING.md`
 11. **No receipt parsing until Phase 6** — use defaults for Phases 0-5
 12. **Use BatchPrompts helper class** — no inline if/else for dialog replacement
 13. **Patch only CDNG export path dialogs** — do NOT globally disable message boxes
+14. **Never list the GPU agent share unbounded** — no `ls`/`ls -t`/`dir` of `\\bachelor\mlv-agent\processed` or `outbox` (thousands of files; each is opened over SMB and Defender-scanned, ~1 host core for 10+ min on 2026-10-17). Probe `outbox\<jobId>.result.json` by name or run `tools/profiling/agent-share/Get-AgentShareRecent.ps1 -First 20`
+15. **Commands handed to the owner use absolute, quoted paths** — `pwsh -NoProfile -File "C:\!Layi Wkspc\MLV-App\tools\...\X.ps1"`, pointing at a file that exists now (a branch-only script lives in its worktree). The owner's shell may be in System32
 
 ---
