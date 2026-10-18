@@ -5496,6 +5496,9 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
                 QStringLiteral("gpu_playback_recon_texture_present_reuse_compare_ms"), st.reuse_compare_ms );
             readyFrame.stageTimingTelemetry.insert(
                 QStringLiteral("gpu_playback_recon_texture_present_reuse_verify_ran"), st.reuse_verify_ran );
+            // PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1 F-key: both recon states on a state or content miss
+            readyFrame.stageTimingTelemetry.insert(
+                QStringLiteral("gpu_playback_recon_texture_present_reuse_states"), st.reuse_states );
         }
         readyFrame.stageTimingTelemetry.insert(
             QStringLiteral("gpu_playback_recon_texture_present_recon_wall_ms"),
@@ -27784,11 +27787,13 @@ void MainWindow::onPlaybackReconWarmDone( const RenderFrameThread::PlaybackRecon
     if( playback_recon_warm_run::guiAmazeAllowed( hasOutput, playing, clipMatches ) )
     {
         const double wb[3] = { done.wbMultipliers[0], done.wbMultipliers[1], done.wbMultipliers[2] };
+        // PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1 F-key: the recon constants the warm's output was made with
+        const playback_warm_output_reuse::PreparedState warmState = playback_warm_output_reuse::preparedStateFrom( outcome.prepared );
         line.amazeOk = GpuDisplayWindow::warmStagedReconSlotFromDeviceBayer16IfActive(
             outcome.retained.device_bayer16, outcome.width, outcome.height, done.blackLevel, wb,
             playbackReducedHnyquistWanted( outcome.scale > 1 ), &line.amazeKernelMs, &amazeReason, &amazeTiming,
             static_cast<uint64_t>( done.frameNumber ), outcome.setClipCountAfter, outcome.setLutsCountAfter,
-            &reuseCapture );
+            &reuseCapture, &warmState );
     }
     else if( hasOutput )
     {
@@ -27809,6 +27814,7 @@ void MainWindow::onPlaybackReconWarmDone( const RenderFrameThread::PlaybackRecon
                                              .arg( static_cast<qulonglong>( outcome.setLutsCalls ) )
                                              .arg( outcome.backendRc )
                              + amazeReason + QStringLiteral( "\"" )
+                             + QStringLiteral( " warm_runs=" ) + QString::number( outcome.warmRuns )
                              + playback_warm_output_reuse::captureField( reuseCapture );
     if( clipMatches && !playing ) schedulePlaybackReconWarmRepost( outcome.reason, done.clipGeneration );
 }
@@ -31267,6 +31273,7 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
         fp.reuseReason = reuseReason.isEmpty() ? QStringLiteral( "cpu_route" ) : reuseReason;
         fp.reuseCompareMs = telemetryDoubleValue( t, "gpu_playback_recon_texture_present_reuse_compare_ms" );
         fp.reuseVerifyRan = t.value( QStringLiteral( "gpu_playback_recon_texture_present_reuse_verify_ran" ) ).toBool();
+        fp.reuseStates = telemetryStringValue( t, "gpu_playback_recon_texture_present_reuse_states" );
         if( fp.frame0Reused() )
         {
             // frame 0 ran no AMaZE at Play: probe record 0 is frame 1 (or R4's verify run), never frame 0's

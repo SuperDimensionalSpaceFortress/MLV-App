@@ -2811,6 +2811,42 @@ extern "C" int igpu_amaze_debayer_release_input_capture(igpu_amaze_debayer_backe
     return 0;
 }
 
+/* PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1 F-diag (the opt-in warm-reuse miss dump only): copies width*height
+ * Bayer16 words to host memory -- the held capture when device_bayer16 is NULL (capture_id must be the current one and
+ * the dims equal), else device_bayer16 -- on the capture stream, synchronised before it returns. */
+extern "C" int igpu_amaze_debayer_download_bayer16(igpu_amaze_debayer_backend * backend,
+                                                  const uint16_t * device_bayer16,
+                                                  unsigned long long capture_id,
+                                                  uint16_t * host,
+                                                  int width,
+                                                  int height)
+{
+    if (!backend || !host || width <= 0 || height <= 0) return -1;
+    const uint16_t * source = device_bayer16;
+    if (!source)
+    {
+        if (backend->captureId == 0 || !backend->captureBayer16 || capture_id != backend->captureId
+            || width != backend->captureWidth || height != backend->captureHeight)
+        {
+            return -1;
+        }
+        source = backend->captureBayer16;
+    }
+    const std::size_t count = static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
+    try
+    {
+        ensure_capture_stream(backend);
+        CK(cudaMemcpyAsync(host, source, count * sizeof(uint16_t), cudaMemcpyDeviceToHost, backend->captureStream));
+        CK(IGPU_LT_SYNC_CALL("capture:download_sync", cudaStreamSynchronize(backend->captureStream)));
+    }
+    catch (const CudaStageProbeError & error)
+    {
+        std::fprintf(stderr, "[igpu_amaze_debayer_cuda] %s\n", error.what());
+        return -2;
+    }
+    return 0;
+}
+
 /* GPU-FIELD-TELEMETRY-1 r6: every code a failed call noted, and a lock-free
  * "anything pending" word (igpu_cuda_error.h). */
 extern "C" int igpu_amaze_debayer_drain_cuda_errors(int channel, igpu_cuda_error_t * out, int capacity,

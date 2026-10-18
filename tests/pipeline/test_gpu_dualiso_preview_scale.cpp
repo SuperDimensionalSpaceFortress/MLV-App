@@ -2783,8 +2783,9 @@ int warmThenPlayDifferences(const WarmPlayVariant & variant, const std::string &
         video, static_cast<uint32_t>(kFrame), 1, fixture.width(), fixture.height(), &reconWorker.state, 1, raw,
         reduced);
     GPU_DUALISO_TEST_UNSETENV("MLVAPP_FAKE_GPU_RECON_DUMP_DIR");
-    std::printf("[warm-recon-determinism] %s warm ran=%d reason=%s rc=%d %dx%d\n", variant.name, warm.ran ? 1 : 0,
-                playback_recon_warm_run::reasonName(warm.reason), warm.backendRc, warm.width, warm.height);
+    std::printf("[warm-recon-determinism] %s warm ran=%d reason=%s rc=%d %dx%d warm_runs=%d\n", variant.name,
+                warm.ran ? 1 : 0, playback_recon_warm_run::reasonName(warm.reason), warm.backendRc, warm.width,
+                warm.height, warm.warmRuns);
     printSharedSeeds(variant.name, "after-warm", video);
     if (!warm.ran) return 1000;
     // the fake's retain hands out one shared pointer: copy the warm's words before Play overwrites them
@@ -2848,6 +2849,51 @@ TEST(GpuPlaybackReconWarmRun, TheWarmAndPlayFrameZeroHandTheBackendTheSameBytes)
         if (warmThenPlayDifferences(variant, root) != 0) ++failed;
     }
     ASSERT_EQ(0, failed);
+}
+
+// F-a: a warm whose run solved the unsettled match (and published it) runs once more and keeps the settled run; a warm
+// on an already settled state runs once. The kept run's prepared state is Play's (white_darkened included), stamped
+// with the warm's frame, and nothing is left outstanding but the kept token.
+TEST(GpuPlaybackReconWarmRun, AWarmThatSettlesTheSharedMatchRunsTwiceAndKeepsTheSettledRun)
+{
+    for (const bool settledFirst : {false, true})
+    {
+        GpuReconEnv env(true);
+        MlvPipelineFixture fixture;
+        ASSERT_TRUE(openGpuEligibleFixture(fixture));
+        mlvObject_t * video = fixture.video();
+        video->llrawproc->diso_auto_correction = -2;
+        video->llrawproc->diso_ev_correction = 1;
+        video->llrawproc->diso_black_delta = -1;
+        if (settledFirst) ASSERT_FALSE(fixture.renderFrame8(1).empty());
+        const FakeGpuBackendScope fake;
+        WorkerState reconWorker;
+        std::vector<uint16_t> raw;
+        std::vector<uint16_t> reduced;
+        const playback_recon_warm_run::Outcome warm = playback_recon_warm_run::run(
+            video, 1, 1, fixture.width(), fixture.height(), &reconWorker.state, 1, raw, reduced);
+        std::printf("[warm-recon-determinism] F-a settledFirst=%d warm ran=%d reason=%s warm_runs=%d wd=%d fid=%llu\n",
+                    settledFirst ? 1 : 0, warm.ran ? 1 : 0, playback_recon_warm_run::reasonName(warm.reason),
+                    warm.warmRuns, warm.prepared.white_darkened,
+                    static_cast<unsigned long long>(warm.prepared.frame_id));
+        ASSERT_TRUE(warm.ran);
+        ASSERT_TRUE(playback_recon_warm_run::Reason::None == warm.reason);
+        ASSERT_EQ(settledFirst ? 1 : 2, warm.warmRuns);
+        ASSERT_EQ(1, llrpGpuPlaybackReconRetainedOutstandingCount());   // the first run's token was released
+        ASSERT_NE(0, warm.prepared.valid);
+        ASSERT_EQ(1u, static_cast<unsigned>(warm.prepared.frame_id));
+        ASSERT_NE(0, llrpGpuPlaybackReconReleaseRetainedDeviceBayer16(warm.retained.token));
+        // Play frame 0 on the same worker is prepared exactly as the kept run
+        const llrpGpuPlaybackRetainedDeviceBayer16_t play = playShapedX1Run(fixture, 1, &reconWorker.state);
+        ASSERT_NE(0, play.valid);
+        llrpGpuPlaybackReconState_t playState = {};
+        ASSERT_NE(0, llrpGpuPlaybackReconGetLastPreparedState(&playState));
+        ASSERT_EQ(playState.white_darkened, warm.prepared.white_darkened);
+        ASSERT_EQ(playState.black_delta, warm.prepared.black_delta);
+        ASSERT_TRUE(playState.ev_correction == warm.prepared.ev_correction);
+        ASSERT_NE(0, llrpGpuPlaybackReconReleaseRetainedDeviceBayer16(play.token));
+        ASSERT_EQ(0, llrpGpuPlaybackReconRetainedOutstandingCount());
+    }
 }
 
 // T-B guard: the warm decodes with getMlvRawFrameUint16Uncached, Play through the LJ92 prefetch ring. The same frame

@@ -286,6 +286,13 @@ int llrpGpuPlaybackReconPreloadBackend(double * load_ms);
  * returns an opaque heap snapshot (NULL when it cannot allocate: the warm then skips); Restore frees it. */
 void * llrpGpuPlaybackReconSaveLastRunState(void);
 void llrpGpuPlaybackReconRestoreLastRunState(void * snapshot);
+/* PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1 F-a: the shared dual-ISO runtime state every run is seeded from
+ * (the ISO pattern, the auto / ev / black-delta exposure match and the DNG levels), read under llrawproc_mutex. A run
+ * publishes it when it changed, so the paused warm reads it before and after its run: a change means the warm solved
+ * the match that Play frame 0 will start from, settled. 0 when video or out is NULL. Equal compares every field
+ * exactly (auto included). */
+int llrpGetSharedRuntimeState(mlvObject_t * video, llrawproc_runtime_state_t * out);
+int llrpSharedRuntimeStateEqual(const llrawproc_runtime_state_t * lhs, const llrawproc_runtime_state_t * rhs);
 /* The calling thread's last recon run's set_clip / set_luts wall time (0 when that run needed neither). */
 double llrpGpuPlaybackReconLastSetClipMilliseconds(void);
 double llrpGpuPlaybackReconLastSetLutsMilliseconds(void);

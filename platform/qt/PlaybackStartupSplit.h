@@ -186,6 +186,9 @@ struct FirstPresentSplit
     QString reuseReason = QStringLiteral( "none" );
     double reuseCompareMs = 0.0;
     bool reuseVerifyRan = false;   // R4: an identity leg re-ran frame 0's AMaZE after the swap (probe record 0)
+    // PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1 F-key: " warm_state= play_state= state_diff=" on a state or
+    // content miss (playback_warm_output_reuse::stateFields), else empty; ends the line
+    QString reuseStates;
 
     bool frame0Reused() const { return warmOutputReuse == QLatin1String( "hit" ); }
 
@@ -215,7 +218,8 @@ struct FirstPresentSplit
              + QStringLiteral( " clock_kick_reason=" ) + ( clockKickReason.isEmpty() ? QStringLiteral( "none" ) : clockKickReason )
              + QStringLiteral( " kick_lead_ms=" )
              + ( kickLeadMs < 0.0 ? QStringLiteral( "NA" ) : QString::number( kickLeadMs, 'f', 3 ) )
-             + playback_warm_output_reuse::fields( warmOutputReuse, reuseReason, reuseCompareMs );
+             + playback_warm_output_reuse::fields( warmOutputReuse, reuseReason, reuseCompareMs )
+             + reuseStates;
     }
 };
 

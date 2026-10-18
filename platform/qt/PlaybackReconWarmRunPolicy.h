@@ -40,7 +40,10 @@ enum class Reason
     DecodeFailed,
     ReconNotRetained,     // the prepare-only run produced no retained output (rc in the line)
     PipelineCapture,      // MLVAPP pipeline capture is on: a warm would write capture files for the frame
-    SnapshotFailed        // the last-run state could not be saved
+    SnapshotFailed,       // the last-run state could not be saved
+    // PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1 F-a: the shared dual-ISO runtime state (the exposure match Play
+    // is seeded from) still changed on the warm's second run: no output is kept, Play runs normally
+    NotConverged
 };
 
 struct Decision
@@ -86,6 +89,7 @@ inline const char *reasonName( Reason reason )
     case Reason::ReconNotRetained: return "recon_not_retained";
     case Reason::PipelineCapture: return "pipeline_capture";
     case Reason::SnapshotFailed: return "snapshot_failed";
+    case Reason::NotConverged: return "not_converged";
     }
     return "none";
 }

@@ -65,6 +65,9 @@ struct GpuPresentSetupTiming
     const char * reuse_reason = "none";
     double reuse_compare_ms = 0.0;
     bool reuse_verify_ran = false;   // R4: the identity check re-ran this frame's AMaZE after the swap
+    /* PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1 F-key: both recon states on a state or content miss
+     * (playback_warm_output_reuse::stateFields), else empty. */
+    QString reuse_states;
 };
 
 struct GpuPreviewProcessingConfig

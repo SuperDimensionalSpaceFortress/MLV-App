@@ -8,10 +8,13 @@
  * scratch pointers (dualiso.c: state->raw2ev = scratch->ev_raw2ev), so a warm on any other worker state would leave
  * set_luts to Play. RenderFrameThread runs it on the recon worker, which then runs Play frame 0.
  *
- * Nothing a later request reads is written: the decode bypasses the LJ92 prefetch ring
- * (getMlvRawFrameUint16Uncached), the frame goes into the caller's scratch buffers, and this thread's last-run recon
- * state is saved before and restored after (llrpGpuPlaybackReconSaveLastRunState). On success the retained device
- * output is the caller's to release. Qt-free, so the pipeline tests drive it against the fake backend.
+ * The decode bypasses the LJ92 prefetch ring (getMlvRawFrameUint16Uncached), the frame goes into the caller's scratch
+ * buffers, and this thread's last-run recon state is saved before and restored after
+ * (llrpGpuPlaybackReconSaveLastRunState). One thing a later request reads IS written, exactly as any paused render
+ * writes it: the shared dual-ISO runtime state (the exposure match) a run publishes when it changed. So the kept output
+ * is the run that left that state unchanged (PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1 F-a, see run()). On
+ * success the retained device output is the caller's to release. Qt-free, so the pipeline tests drive it against the
+ * fake backend.
  */
 
 #ifndef PLAYBACKRECONWARMRUN_H
@@ -49,9 +52,22 @@ struct Outcome
     uint64_t setLutsCountAfter = 0;
     int backendRc = 0;
     llrpGpuPlaybackRetainedDeviceBayer16_t retained;   // valid when ran; the caller releases retained.token
+    // PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1: the llrawproc runs this warm made (F-a: 2 when the first one
+    // changed the shared dual-ISO runtime state), and the recon state the kept output was prepared with (F-key: its
+    // frame_id is the warm's frame; valid 0 when it could not be read). Its LUT pointers are the worker's scratch:
+    // read its scalars only.
+    int warmRuns = 0;
+    llrpGpuPlaybackReconState_t prepared;
 
-    Outcome() { std::memset( &retained, 0, sizeof( retained ) ); }
+    Outcome()
+    {
+        std::memset( &retained, 0, sizeof( retained ) );
+        std::memset( &prepared, 0, sizeof( prepared ) );
+    }
 };
+
+/*! F-a: a warm whose run changed the shared runtime state runs once more; a second change keeps nothing. */
+constexpr int kMaxWarmRuns = 2;
 
 /*! The three thread opt-ins of a Play texture-route frame (RenderFrameThread's GpuPlaybackReconScope,
  *  ...TexturePresentScope and ...PrepareOnlyScope), cleared on exit exactly as they are. */
@@ -123,17 +139,29 @@ inline Outcome run( mlvObject_t *video,
         out.reason = Reason::SnapshotFailed;
         return out;
     }
-    const double decodeStart = mlv_stage_timing_now();
-    const bool decoded = getMlvRawFrameUint16Uncached( video, frame, raw.data() ) == 0;
-    out.decodeMs = ( mlv_stage_timing_now() - decodeStart ) * 1000.0;
-    if( !decoded )
+    // PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1 F-a: every run is seeded from the shared dual-ISO runtime state
+    // and publishes it when it changed. A warm that solves an unsettled exposure match (auto -2) made its recon from
+    // the first solve, while Play frame 0 starts from the published, settled match (black_delta round-trips as /64,
+    // so white_darkened differs): that output is not Play's. It is released and the frame runs once more, seeded as
+    // Play will be. The match math itself is unchanged (DUALISO-MATCH-SETTLE-PARITY-1).
+    llrawproc_runtime_state_t seed;
+    std::memset( &seed, 0, sizeof( seed ) );
+    (void)llrpGetSharedRuntimeState( video, &seed );
+    const uint64_t setClipBefore = llrpGpuPlaybackReconSetClipCount();
+    const uint64_t setLutsBefore = llrpGpuPlaybackReconSetLutsCount();
+    for( int attempt = 0; attempt < kMaxWarmRuns; ++attempt )
     {
-        out.reason = Reason::DecodeFailed;
-    }
-    else
-    {
-        const uint64_t setClipBefore = llrpGpuPlaybackReconSetClipCount();
-        const uint64_t setLutsBefore = llrpGpuPlaybackReconSetLutsCount();
+        // each run reprocesses the frame in place: decode it again
+        const double decodeStart = mlv_stage_timing_now();
+        const bool decoded = getMlvRawFrameUint16Uncached( video, frame, raw.data() ) == 0;
+        out.decodeMs += ( mlv_stage_timing_now() - decodeStart ) * 1000.0;
+        if( !decoded )
+        {
+            out.reason = Reason::DecodeFailed;
+            break;
+        }
+        const uint64_t setClipRunStart = llrpGpuPlaybackReconSetClipCount();
+        const uint64_t setLutsRunStart = llrpGpuPlaybackReconSetLutsCount();
         const double runStart = mlv_stage_timing_now();
         {
             const ThreadOptIn optIn;
@@ -148,14 +176,15 @@ inline Outcome run( mlvObject_t *video,
                 applyLLRawProcObjectWorker( video, raw.data(), words * sizeof( uint16_t ), worker, 0 );
             }
         }
-        out.runMs = ( mlv_stage_timing_now() - runStart ) * 1000.0;
+        out.runMs += ( mlv_stage_timing_now() - runStart ) * 1000.0;
+        ++out.warmRuns;
         out.setClipCountAfter = llrpGpuPlaybackReconSetClipCount();
         out.setLutsCountAfter = llrpGpuPlaybackReconSetLutsCount();
         out.setClipCalls = out.setClipCountAfter - setClipBefore;
         out.setLutsCalls = out.setLutsCountAfter - setLutsBefore;
         // this thread's run_backend just measured them (0 when the run needed neither)
-        out.setClipMs = out.setClipCalls ? llrpGpuPlaybackReconLastSetClipMilliseconds() : 0.0;
-        out.setLutsMs = out.setLutsCalls ? llrpGpuPlaybackReconLastSetLutsMilliseconds() : 0.0;
+        if( out.setClipCountAfter != setClipRunStart ) out.setClipMs += llrpGpuPlaybackReconLastSetClipMilliseconds();
+        if( out.setLutsCountAfter != setLutsRunStart ) out.setLutsMs += llrpGpuPlaybackReconLastSetLutsMilliseconds();
         out.backendRc = llrpGpuPlaybackReconLastRunRcForTesting();
         llrpGpuPlaybackRetainedDeviceBayer16_t retained;
         std::memset( &retained, 0, sizeof( retained ) );
@@ -168,11 +197,33 @@ inline Outcome run( mlvObject_t *video,
             out.width = retained.width;
             out.height = retained.height;
             out.ran = true;
+            out.reason = Reason::None;
         }
         else
         {
             out.reason = Reason::ReconNotRetained;
         }
+        // F-key: the per-run recon constants of this output, read before the restore below drops them
+        llrpGpuPlaybackReconState_t prepared;
+        std::memset( &prepared, 0, sizeof( prepared ) );
+        if( llrpGpuPlaybackReconGetLastPreparedState( &prepared ) != 0 )
+        {
+            prepared.frame_id = frame;   // as RenderFrameThread stamps Play's: the snapshot carries no frame identity
+            out.prepared = prepared;
+        }
+        llrawproc_runtime_state_t after;
+        std::memset( &after, 0, sizeof( after ) );
+        (void)llrpGetSharedRuntimeState( video, &after );
+        if( llrpSharedRuntimeStateEqual( &seed, &after ) ) break;   // Play frame 0 is seeded exactly as this run was
+        // this run settled the shared state: its output is not Play frame 0's
+        seed = after;
+        if( out.ran ) (void)llrpGpuPlaybackReconReleaseRetainedDeviceBayer16( out.retained.token );
+        std::memset( &out.retained, 0, sizeof( out.retained ) );
+        std::memset( &out.prepared, 0, sizeof( out.prepared ) );
+        out.width = 0;
+        out.height = 0;
+        out.ran = false;
+        out.reason = Reason::NotConverged;   // replaced by the next run's outcome; kept when this was the last run
     }
     llrpGpuPlaybackReconRestoreLastRunState( saved );
     return out;

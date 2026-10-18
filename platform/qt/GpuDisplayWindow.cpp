@@ -28,6 +28,7 @@
 #include <QElapsedTimer>
 #include <QMutex>
 #include <QDir>
+#include <QFile>
 #include <QtDebug>
 #include <algorithm>
 #include <atomic>
@@ -128,6 +129,15 @@ bool warmOutputReuseVerifyRequested()
 {
     static const bool requested = windowEnvFlagEnabled( qgetenv( "MLVAPP_SMOKE_FIRST_PRESENT_CAPTURE" ) );
     return requested;
+}
+
+// PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1 F-diag, read once: the directory a warm-reuse content miss is
+// dumped into. Unset or empty (the default): off, and nothing under it runs.
+QString warmOutputReuseMissDumpDir()
+{
+    static const QString dir =
+        QString::fromLocal8Bit( qgetenv( "MLVAPP_PLAYBACK_WARM_REUSE_MISS_DUMP_DIR" ) ).trimmed();
+    return dir;
 }
 
 /* GLSL 1.20 passthrough -- works in the NVIDIA compatibility context a QOpenGLWindow
@@ -589,7 +599,8 @@ bool GpuDisplayWindow::warmStagedReconSlotFromDeviceBayer16IfActive(const uint16
                                                                     uint64_t frame,
                                                                     uint64_t setClipCountAfter,
                                                                     uint64_t setLutsCountAfter,
-                                                                    QString *reuseCapture)
+                                                                    QString *reuseCapture,
+                                                                    const playback_warm_output_reuse::PreparedState *warmState)
 {
     if ( kernelMs ) *kernelMs = 0.0;
     if ( amazeTiming ) *amazeTiming = GpuAmazeDebayerBackendTiming();
@@ -612,7 +623,8 @@ bool GpuDisplayWindow::warmStagedReconSlotFromDeviceBayer16IfActive(const uint16
     // like the prewarm: GUI thread, no g_activeMutex (the window is only destroyed on this thread)
     return win->warmStagedReconSlotFromDeviceBayer16(deviceBayer16, width, height, blackLevel, wbMultipliers,
                                                      reducedHnyquist, kernelMs, reason, amazeTiming,
-                                                     frame, setClipCountAfter, setLutsCountAfter, reuseCapture);
+                                                     frame, setClipCountAfter, setLutsCountAfter, reuseCapture,
+                                                     warmState);
 }
 
 /* PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1 Row W: the first recon present's AMaZE call (device Bayer16 -> RGBA16, the
@@ -631,7 +643,8 @@ bool GpuDisplayWindow::warmStagedReconSlotFromDeviceBayer16(const uint16_t *devi
                                                             uint64_t frame,
                                                             uint64_t setClipCountAfter,
                                                             uint64_t setLutsCountAfter,
-                                                            QString *reuseCapture)
+                                                            QString *reuseCapture,
+                                                            const playback_warm_output_reuse::PreparedState *warmState)
 {
     if ( reuseCapture ) *reuseCapture = QStringLiteral("none");
     // PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1 R2: whatever this warm does, an older key no longer
@@ -704,6 +717,8 @@ bool GpuDisplayWindow::warmStagedReconSlotFromDeviceBayer16(const uint16_t *devi
             key.setClipCountAfterWarm = setClipCountAfter;
             key.setLutsCountAfterWarm = setLutsCountAfter;
             key.captureId = captureId;
+            // WARM-RECON-DETERMINISM-1 F-key: the recon constants of this input (unknown without them: never reused)
+            if ( warmState ) key.state = *warmState;
             m_stagedReconWarmKey = key;
             if ( reuseCapture ) *reuseCapture = QStringLiteral("ok");
         }
@@ -1318,6 +1333,8 @@ bool GpuDisplayWindow::setPresentedGpuPlaybackReconAmazePostWbTexture(
             presentKey.wb[1] = wbMultipliers[1];
             presentKey.wb[2] = wbMultipliers[2];
             presentKey.reducedHnyquist = reducedHnyquist;
+            // WARM-RECON-DETERMINISM-1 F-key: this present's recon constants (the state its recon ran with)
+            presentKey.state = playback_warm_output_reuse::preparedStateFrom( *state );
             playback_warm_output_reuse::Reason reuseReason = playback_warm_output_reuse::preGate(
                 playbackWarmOutputReuseEnabled(),
                 stagedAdopted,
@@ -1339,6 +1356,11 @@ bool GpuDisplayWindow::setPresentedGpuPlaybackReconAmazePostWbTexture(
                 setupTiming.reuse_compare_ms = elapsedMs() - compareStartMs;
                 reuseReason = playback_warm_output_reuse::afterCompare(compared, sameInput, compareWhy);
             }
+            // WARM-RECON-DETERMINISM-1: both states on a state or content miss; the opt-in dump reads the capture, so
+            // before its release
+            setupTiming.reuse_states = playback_warm_output_reuse::stateFields( reuseReason, warmKey, presentKey );
+            if ( reuseReason == playback_warm_output_reuse::Reason::ContentMismatch )
+                dumpWarmOutputReuseMiss( deviceBayer16, texWidth, texHeight, warmKey, presentKey );
             // the capture is consumed by this present on every path (no CUDA call)
             if ( warmKey.valid ) gpuAmazeDebayerReleaseInputCapture();
             const bool warmOutputReused = playback_warm_output_reuse::reuse(reuseReason);
@@ -1749,6 +1771,90 @@ bool GpuDisplayWindow::readGpuReconSourceBayer16Texture(QByteArray *textureBytes
     if ( reason ) reason->clear();
     return true;
 #endif
+}
+
+void GpuDisplayWindow::dumpWarmOutputReuseMiss(const uint16_t *deviceBayer16,
+                                               int width,
+                                               int height,
+                                               const playback_warm_output_reuse::Key &warmKey,
+                                               const playback_warm_output_reuse::Key &presentKey)
+{
+    const QString dir = warmOutputReuseMissDumpDir();
+    if ( dir.isEmpty() ) return;
+    QElapsedTimer clock;
+    clock.start();
+    const size_t words = width > 0 && height > 0 ? static_cast<size_t>(width) * static_cast<size_t>(height) : 0;
+    std::vector<uint16_t> warm(words, 0);
+    std::vector<uint16_t> play(words, 0);
+    QString warmWhy = QStringLiteral("no_dims");
+    QString playWhy = QStringLiteral("no_dims");
+    // the warm's capture (by its id) and Play's own device input, copied to the host on the backend's capture stream
+    const bool warmOk = words != 0
+        && gpuAmazeDebayerDownloadBayer16ForDiagnostics(nullptr, warmKey.captureId, warm.data(), width, height, &warmWhy);
+    const bool playOk = words != 0
+        && gpuAmazeDebayerDownloadBayer16ForDiagnostics(deviceBayer16, 0, play.data(), width, height, &playWhy);
+    qint64 differing = -1;
+    qint64 first = -1;
+    qint64 last = -1;
+    qint64 rowsWithDiff = -1;
+    int maxAbs = -1;
+    if ( warmOk && playOk )
+    {
+        differing = 0;
+        rowsWithDiff = 0;
+        maxAbs = 0;
+        for ( int y = 0; y < height; ++y )
+        {
+            bool rowDiffers = false;
+            for ( int x = 0; x < width; ++x )
+            {
+                const size_t i = static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(x);
+                const int d = std::abs(static_cast<int>(warm[i]) - static_cast<int>(play[i]));
+                if ( d == 0 ) continue;
+                if ( first < 0 ) first = static_cast<qint64>(i);
+                last = static_cast<qint64>(i);
+                ++differing;
+                rowDiffers = true;
+                if ( d > maxAbs ) maxAbs = d;
+            }
+            if ( rowDiffers ) ++rowsWithDiff;
+        }
+    }
+    const QString fields =
+        QStringLiteral("frame=%1 width=%2 height=%3 warm_download=%4 play_download=%5 differing_words=%6 first_index=%7 "
+                       "first_row=%8 last_index=%9 rows_with_diff=%10 max_abs_diff=%11")
+            .arg(static_cast<qulonglong>(presentKey.frame))
+            .arg(width)
+            .arg(height)
+            .arg(warmOk ? QStringLiteral("ok") : warmWhy)
+            .arg(playOk ? QStringLiteral("ok") : playWhy)
+            .arg(differing)
+            .arg(first)
+            .arg(first >= 0 && width > 0 ? first / width : -1)
+            .arg(last)
+            .arg(rowsWithDiff)
+            .arg(maxAbs);
+    const QString states = playback_warm_output_reuse::stateFields(
+        playback_warm_output_reuse::Reason::ContentMismatch, warmKey, presentKey);
+    QDir().mkpath(dir);
+    const auto writeFile = [&dir](const QString &name, const char *data, qint64 bytes)
+    {
+        QFile file(QDir(dir).filePath(name));
+        if ( !file.open(QIODevice::WriteOnly | QIODevice::Truncate) ) return false;
+        const bool ok = file.write(data, bytes) == bytes;
+        file.close();
+        return ok;
+    };
+    const qint64 rawBytes = static_cast<qint64>(words * sizeof(uint16_t));
+    if ( warmOk ) writeFile(QStringLiteral("warm.u16"), reinterpret_cast<const char *>(warm.data()), rawBytes);
+    if ( playOk ) writeFile(QStringLiteral("play.u16"), reinterpret_cast<const char *>(play.data()), rawBytes);
+    const QByteArray text = (fields.split(QLatin1Char(' ')).join(QLatin1Char('\n'))
+                             + states.split(QLatin1Char(' ')).join(QLatin1Char('\n')) + QLatin1Char('\n')).toUtf8();
+    writeFile(QStringLiteral("diff.txt"), text.constData(), text.size());
+    qInfo().noquote() << QStringLiteral("playback_warm_output_reuse_miss_dump ") + fields + states
+                             + QStringLiteral(" dump_ms=")
+                             + QString::number(static_cast<double>(clock.nsecsElapsed()) / 1000000.0, 'f', 3)
+                             + QStringLiteral(" dir=\"") + dir + QStringLiteral("\"");
 }
 
 bool GpuDisplayWindow::grabPresentedFramebufferIfActive(QImage *outImage,

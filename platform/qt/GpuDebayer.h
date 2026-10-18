@@ -159,6 +159,12 @@ bool gpuAmazeDebayerCaptureInputBayer16(const uint16_t * deviceBayer16, int widt
 bool gpuAmazeDebayerInputBayer16MatchesCapture(const uint16_t * deviceBayer16, int width, int height,
                                                quint64 captureId, bool * equal, QString * why);
 void gpuAmazeDebayerReleaseInputCapture(void);
+/* PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1 F-diag (the opt-in warm-reuse miss dump only): copies width*height
+ * Bayer16 words to host memory -- the held capture when deviceBayer16 is null (captureId must be the current one, dims
+ * equal), else that device pointer. False with *why (cuda_suppressed, backend_not_loaded, symbol_missing, failed);
+ * like the capture it re-checks the device-loss flag under the live lock and never loads the DLL. */
+bool gpuAmazeDebayerDownloadBayer16ForDiagnostics(const uint16_t * deviceBayer16, quint64 captureId, uint16_t * host,
+                                                  int width, int height, QString * why);
 bool gpuAmazeDebayerApplyGpuOffscreenPostWb(const float * inputRawFrame,
                                            uint16_t * outputRgb16,
                                            int width,

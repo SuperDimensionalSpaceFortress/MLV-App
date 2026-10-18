@@ -23,3 +23,4 @@ EXPORTS
     igpu_amaze_debayer_capture_input_bayer16
     igpu_amaze_debayer_input_bayer16_matches_capture
     igpu_amaze_debayer_release_input_capture
+    igpu_amaze_debayer_download_bayer16

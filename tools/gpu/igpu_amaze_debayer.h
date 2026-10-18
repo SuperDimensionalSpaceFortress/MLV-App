@@ -181,6 +181,18 @@ int igpu_amaze_debayer_input_bayer16_matches_capture(igpu_amaze_debayer_backend 
                                                      int * equal);
 int igpu_amaze_debayer_release_input_capture(igpu_amaze_debayer_backend * backend);
 
+/* Optional diagnostic download (PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1 F-diag, the opt-in warm-reuse miss
+ * dump). Copies width*height Bayer16 elements into host memory: the held capture when device_bayer16 is NULL (capture_id
+ * must be the current capture and the dims equal), else device_bayer16; on the capture stream, synchronised before it
+ * returns. Returns 0; -1 for a bad argument or no such capture; -2 when a CUDA call failed (its code is noted). Older
+ * DLLs omit it. */
+int igpu_amaze_debayer_download_bayer16(igpu_amaze_debayer_backend * backend,
+                                        const uint16_t * device_bayer16,
+                                        unsigned long long capture_id,
+                                        uint16_t * host,
+                                        int width,
+                                        int height);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

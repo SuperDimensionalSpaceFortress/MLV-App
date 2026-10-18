@@ -105,6 +105,10 @@ TEST(PlaybackReconWarmRunPolicy, RenderThreadOutcomesHaveNames)
     ASSERT_EQ(std::string("recon_not_retained"), name(Reason::ReconNotRetained));
     ASSERT_EQ(std::string("pipeline_capture"), name(Reason::PipelineCapture));
     ASSERT_EQ(std::string("snapshot_failed"), name(Reason::SnapshotFailed));
+    // PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1 F-a: the shared runtime state changed on both runs; never
+    // re-posted (another warm would solve the same unsettled state again)
+    ASSERT_EQ(std::string("not_converged"), name(Reason::NotConverged));
+    ASSERT_FALSE(playback_recon_warm_run::repostAfterSkip(Reason::NotConverged, 1));
 }
 
 TEST(PlaybackReconWarmRunPolicy, OnlyARealRequestSkipIsRepostedWithinTheBudget)

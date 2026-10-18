@@ -120,3 +120,26 @@ maintained in this format.
     `reuse_reason` and `reuse_compare_ms`, and the `playback_recon_warm`
     line adds `reuse_capture`. On a reused first frame,
     `amaze_first_frames` prints `f0=reused`.
+- The paused warm now prepares the first frame exactly as Play will
+  (PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1).
+  - A dual-ISO clip whose exposure match was not yet settled had it solved
+    by the warm. Play then started from the settled match, so its recon
+    used a slightly different white level, and the warm's debayer never
+    matched Play's. When the warm's run changes that shared match, the
+    warm now runs the frame once more and keeps that run. The
+    `playback_recon_warm` line adds `warm_runs` (1 or 2); a match that
+    still changes on the second run keeps nothing (`not_converged`).
+  - Play's first frame also checks the recon's per-frame settings (white
+    level, black delta, exposure, noise, method flags, bright rows, frame)
+    against the warm's before it compares any pixels. A difference is
+    `reuse_reason=state_mismatch`. On a state or content miss,
+    `first_present_split` ends with `warm_state`, `play_state` and
+    `state_diff`.
+  - The CUDA recon library now waits for its copy of a kept frame before
+    handing it on. The debayer and the reuse check run on other GPU queues
+    that did not wait for that copy.
+  - `MLVAPP_PLAYBACK_WARM_REUSE_MISS_DUMP_DIR` (default unset: off) names a
+    folder for a diagnostic dump of both debayer inputs on a content miss.
+    It writes `warm.u16`, `play.u16` and `diff.txt` and logs a
+    `playback_warm_output_reuse_miss_dump` line. Venue legs ask for it
+    with `generatorArgs.warmReuseMissDump`.

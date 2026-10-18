@@ -121,11 +121,14 @@ public:
                                                              uint64_t frame = 0,
                                                              uint64_t setClipCountAfter = 0,
                                                              uint64_t setLutsCountAfter = 0,
-                                                             QString *reuseCapture = nullptr);
+                                                             QString *reuseCapture = nullptr,
+                                                             const playback_warm_output_reuse::PreparedState *warmState = nullptr);
     /* PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1 R2 (PlaybackWarmOutputReusePolicy.h): after the warm's
      * AMaZE succeeded, its input is captured and the staged slot's warm key is set (frame, dims, black, WB, H-Nyquist,
      * the set_clip / set_luts counts after the warm run, the capture id); *reuseCapture says ok, failed,
-     * symbol_missing, cuda_suppressed or backend_not_loaded (none when AMaZE did not succeed). */
+     * symbol_missing, cuda_suppressed or backend_not_loaded (none when AMaZE did not succeed).
+     * PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1 F-key: *warmState (the recon constants of the warm's output) is
+     * keyed too; without it the key's state is unknown and Play never reuses (state_mismatch). */
     static bool readGpuReconSourceBayer16TextureIfActive(QByteArray *textureBytes,
                                                         int *width,
                                                         int *height,
@@ -283,9 +286,20 @@ private:
                                               uint64_t frame,
                                               uint64_t setClipCountAfter,
                                               uint64_t setLutsCountAfter,
-                                              QString *reuseCapture);
+                                              QString *reuseCapture,
+                                              const playback_warm_output_reuse::PreparedState *warmState);
     /* R2: clears the warm key and the backend's input capture (no CUDA call). */
     void clearStagedReconWarmKey(void);
+    /* PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1 F-diag (opt-in: MLVAPP_PLAYBACK_WARM_REUSE_MISS_DUMP_DIR; nothing
+     * runs without it). On a content miss, before the capture is released: copies the warm's captured AMaZE input and
+     * Play's device input to the host, writes <dir>/warm.u16 and <dir>/play.u16 (raw little-endian words), both recon
+     * states and the difference (differing words, first index, max abs diff, the row of the first) to <dir>/diff.txt,
+     * and logs one playback_warm_output_reuse_miss_dump line. Diagnostic only: Play's AMaZE runs unchanged. */
+    void dumpWarmOutputReuseMiss(const uint16_t *deviceBayer16,
+                                 int width,
+                                 int height,
+                                 const playback_warm_output_reuse::Key &warmKey,
+                                 const playback_warm_output_reuse::Key &presentKey);
     /* R4 (identity legs only, MLVAPP_SMOKE_FIRST_PRESENT_CAPTURE=1): after a reused frame was painted and swapped, run
      * its AMaZE fresh from the same device input into a scratch RGBA16 texture, read both textures back and compare
      * them; logs one playback_warm_output_reuse_verify line. Context current. Returns the wall ms it took. */

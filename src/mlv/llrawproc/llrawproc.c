@@ -4234,6 +4234,20 @@ static int llrawproc_runtime_state_equal(const llrawproc_runtime_state_t * lhs,
     return 1;
 }
 
+int llrpGetSharedRuntimeState(mlvObject_t * video, llrawproc_runtime_state_t * out)
+{
+    if (!video || !video->llrawproc || !out) return 0;
+    pthread_mutex_lock(&video->llrawproc_mutex);
+    *out = llrawproc_capture_shared_runtime_state(video->llrawproc);
+    pthread_mutex_unlock(&video->llrawproc_mutex);
+    return 1;
+}
+
+int llrpSharedRuntimeStateEqual(const llrawproc_runtime_state_t * lhs, const llrawproc_runtime_state_t * rhs)
+{
+    return llrawproc_runtime_state_equal(lhs, rhs, 1);
+}
+
 static void llrawproc_worker_ensure_luts(llrawprocWorkerState_t * worker, int32_t black_level)
 {
     if (!worker) return;

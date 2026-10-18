@@ -358,6 +358,9 @@ typedef int (*GpuAmazeCaptureInputBayer16Fn)(igpu_amaze_debayer_backend *, const
 typedef int (*GpuAmazeInputBayer16MatchesCaptureFn)(igpu_amaze_debayer_backend *, const uint16_t *, int, int,
                                                      unsigned long long, int *);
 typedef int (*GpuAmazeReleaseInputCaptureFn)(igpu_amaze_debayer_backend *);
+// PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1 F-diag (optional symbol)
+typedef int (*GpuAmazeDownloadBayer16Fn)(igpu_amaze_debayer_backend *, const uint16_t *, unsigned long long, uint16_t *,
+                                         int, int);
 
 struct GpuAmazeDebayerRuntime
 {
@@ -387,6 +390,8 @@ struct GpuAmazeDebayerRuntime
     GpuAmazeCaptureInputBayer16Fn captureInputBayer16 = nullptr;
     GpuAmazeInputBayer16MatchesCaptureFn inputBayer16MatchesCapture = nullptr;
     GpuAmazeReleaseInputCaptureFn releaseInputCapture = nullptr;
+    /* PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1 F-diag: optional; without it the miss dump writes no words. */
+    GpuAmazeDownloadBayer16Fn downloadBayer16 = nullptr;
 };
 
 typedef int (*GpuAmazeDrainCudaErrorsFn)(int, igpu_cuda_error_t *, int, unsigned long long *);
@@ -700,6 +705,9 @@ struct GpuAmazeDebayerLiveTextureRuntime
             runtime.library.resolve("igpu_amaze_debayer_input_bayer16_matches_capture"));
         runtime.releaseInputCapture = reinterpret_cast<GpuAmazeReleaseInputCaptureFn>(
             runtime.library.resolve("igpu_amaze_debayer_release_input_capture"));
+        // PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1 F-diag: optional (the opt-in miss dump only)
+        runtime.downloadBayer16 = reinterpret_cast<GpuAmazeDownloadBayer16Fn>(
+            runtime.library.resolve("igpu_amaze_debayer_download_bayer16"));
 
         backend = runtime.create("cuda");
         if ( !backend )
@@ -1744,4 +1752,28 @@ void gpuAmazeDebayerReleaseInputCapture(void)
     GpuAmazeDebayerLiveTextureRuntime & live = liveAmazeTextureRuntime();
     QMutexLocker locker(&live.mutex);
     if ( live.backend && live.runtime.releaseInputCapture ) live.runtime.releaseInputCapture(live.backend);
+}
+
+// PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1 F-diag
+bool gpuAmazeDebayerDownloadBayer16ForDiagnostics(const uint16_t * deviceBayer16, quint64 captureId, uint16_t * host,
+                                                  int width, int height, QString * why)
+{
+    auto fail = [&](const char * reason) -> bool
+    {
+        if ( why ) *why = QString::fromLatin1(reason);
+        return false;
+    };
+    if ( llrpGpuCudaSuppressed() ) return fail("cuda_suppressed");
+    // never live.ensure(): a capture and a device input exist only on a backend that is already loaded
+    GpuAmazeDebayerLiveTextureRuntime & live = liveAmazeTextureRuntime();
+    QMutexLocker locker(&live.mutex);
+    if ( !live.attempted || !live.available || !live.backend ) return fail("backend_not_loaded");
+    if ( !live.runtime.downloadBayer16 ) return fail("symbol_missing");
+    const bool mayDownload = enterAmazeRunUnlessCudaSuppressed(&live.runtime, GpuFieldTelemetry::enabled());
+    if ( !mayDownload ) return fail("cuda_suppressed");
+    if ( live.runtime.downloadBayer16(live.backend, deviceBayer16, static_cast<unsigned long long>(captureId), host,
+                                      width, height) != 0 )
+        return fail("failed");
+    if ( why ) why->clear();
+    return true;
 }
