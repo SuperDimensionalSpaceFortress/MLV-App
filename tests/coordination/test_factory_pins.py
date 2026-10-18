@@ -34,6 +34,17 @@ HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 TOOL_KEYS = {"path", "commit", "blob", "bytes", "sha256", "interpreter", "reviewer", "reason", "pinned_utc"}
 RUNNER_KEYS = {"commit", "path", "blob", "bytes", "sha256"}
 REQUIRED_TOOLS = ("check-doc-size",)
+# Variables that redirect git (a hook run from a linked worktree exports GIT_DIR) or the runner at a real bus.
+REPO_ENV = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_PREFIX")
+
+
+def hermetic_env() -> dict[str, str]:
+    """os.environ with nothing that could point a test at the real bus clone, the real blob cache or an
+    inherited repository (CHECK-DOC-SIZE-SINGLE-SOURCE-1: a pytest run from a git hook in a linked worktree
+    would otherwise `git init` and `hash-object -w` into the WRONG repository)."""
+    drop = {"FACTORY_BUS_CLONE", "FACTORY_PINS_CACHE"}
+    return {k: v for k, v in os.environ.items() if k.upper() not in REPO_ENV and k.upper() not in drop}
 
 
 def load_pins(path: Path = PINS_FILE) -> dict:
@@ -140,7 +151,7 @@ def consumer(tmp_path: Path, pins: dict, seed_cache: bool = True) -> tuple[Path,
     if seed_cache:
         for name, record in load_pins()["tools"].items():
             (cache / record["blob"]).write_bytes(pinned_fixture(name, record))
-    env = {k: v for k, v in os.environ.items() if k != "FACTORY_BUS_CLONE"}
+    env = hermetic_env()
     env.update(FACTORY_PINS_CACHE=str(cache), PYTHONUTF8="1")
     return root, env
 
@@ -149,10 +160,11 @@ def scratch_bus(tmp_path: Path) -> Path:
     """A throwaway git repo whose object store holds the pinned bytes: a bus clone without the real bus."""
     bus = tmp_path / "bus"
     bus.mkdir()
-    subprocess.run(["git", "init", "-q", str(bus)], check=True, timeout=60)
+    env = hermetic_env()
+    subprocess.run(["git", "init", "-q", str(bus)], check=True, timeout=60, env=env)
     for name, record in load_pins()["tools"].items():
         blob = subprocess.run(["git", "-C", str(bus), "hash-object", "-w", "--stdin"], input=pinned_fixture(name, record),
-                              capture_output=True, check=True, timeout=60).stdout.decode().strip()
+                              capture_output=True, check=True, timeout=60, env=env).stdout.decode().strip()
         assert blob == record["blob"], f"{name}: the fixture is not the pinned blob"
     return bus
 
@@ -179,3 +191,18 @@ def test_the_runner_refuses_a_pin_whose_recorded_hash_is_tampered(tmp_path):
     done = run_pinned(root, env, "--help")
     assert done.returncode == 2, (done.returncode, done.stdout, done.stderr)
     assert "--config" not in done.stdout, "a pin whose hash does not match was executed"
+
+
+def test_the_scratch_bus_ignores_an_inherited_git_dir(tmp_path, monkeypatch):
+    # Opus #491 r1 hardening: a test run under a git hook in a linked worktree inherits GIT_DIR. The scratch
+    # bus must still be created where it was asked, and must hold the pinned blob there.
+    bogus = tmp_path / "not-a-repo"
+    bogus.mkdir()
+    monkeypatch.setenv("GIT_DIR", str(bogus))
+    monkeypatch.setenv("GIT_WORK_TREE", str(bogus))
+    bus = scratch_bus(tmp_path)
+    assert (bus / ".git").is_dir(), "git init followed the inherited GIT_DIR"
+    assert not any(bogus.iterdir()), "the scratch bus wrote into the inherited GIT_DIR"
+    blob = load_pins()["tools"]["check-doc-size"]["blob"]
+    seen = subprocess.run(["git", "-C", str(bus), "cat-file", "-e", blob], env=hermetic_env(), capture_output=True, timeout=60)
+    assert seen.returncode == 0, "the pinned blob is not in the scratch bus"
