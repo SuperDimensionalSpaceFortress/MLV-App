@@ -12,6 +12,9 @@
 #      answer inside -ProbeTimeoutSec (SHARE_UNREACHABLE), and finds the staged build manifest (BUILD_NOT_STAGED when it is not there);
 #   4. runs the standard legs through the tracked Invoke-VenueChain.ps1 -PreferQuietWindows, once per backend (cuda, then cpu), as a CHILD process bounded by
 #      -MaxTotalSec (+ -KillGraceSec): the chain's own -DeadlineUtc stops it gracefully, the kill is the backstop, so nothing here can wait unbounded;
+#      The chain's exit code is read before any row is built (a pinned consumer of the evidence launchers: tools/repo_hygiene/test_playback_evidence_completeness.py).
+#      A leg is recorded RAN only when the chain ended on its own, with a documented exit that agrees with its CHAIN_RESULT, and the leg's receipt is readable;
+#      otherwise the row is status EVIDENCE_INCOMPLETE / outcome INVALID with a `failure` text and NO figures, and the run exits CHAIN_FAILED (27).
 #   5. appends ONE JSON line per leg that touched the venue to the trend file (default <main checkout>\.claude-state\dual-venue\baseline-trend.jsonl), then
 #      samples the hub-VM load again; the same two samples sit in every row of the run.
 #
@@ -254,6 +257,10 @@ foreach ($b in $StandardBackends) {
     Out-Line "BASELINE_CHAIN backend=$b start"
     $c = Invoke-BoundedChain $b
     $chains.Add($c)
+    # The chain's exit code is read BEFORE any row is built. A leg is recorded RAN only when the chain ended on its own with a documented exit that agrees with the
+    # exit its CHAIN_RESULT reports (the guard in test_playback_evidence_completeness.py pins this statement). Anything else is a typed EVIDENCE_INCOMPLETE row.
+    $resultExit = $(if ($c.result -and $c.result.PSObject.Properties['exitCode']) { [int]$c.result.exitCode } else { $null })
+    $chainComplete = (-not $c.timedOut) -and ($null -ne $c.exit) -and ($null -ne $resultExit) -and ($resultExit -eq [int]$c.exit) -and (([int]$c.exit) -in 0, 2, 3, 4, 5, 6, 7, 8)
     $ranHere = 0
     if ($c.result) {
         foreach ($leg in @($c.result.legs)) {
@@ -262,17 +269,28 @@ foreach ($b in $StandardBackends) {
             $planLeg = @($legs | Where-Object { $leg.spec -and ([IO.Path]::GetFullPath([string]$leg.spec) -ieq $_.spec) })[0]
             if ($null -eq $planLeg) { $planLeg = @($legs | Where-Object { [string]$leg.name -like "*$($_.legId)*" })[0] }
             if ($null -eq $planLeg) { continue }
-            $fig = Get-RowFigures $(if ($leg.PSObject.Properties['receipt']) { [string]$leg.receipt } else { '' }) $planLeg $b
+            # An incomplete chain's receipts are never read: no figure of such a leg reaches the trend file.
+            $fig = Get-RowFigures $(if ($chainComplete -and $leg.PSObject.Properties['receipt']) { [string]$leg.receipt } else { '' }) $planLeg $b
+            $legStatus = [string]$leg.status
+            $legOutcome = $(if ($fig.outcome) { $fig.outcome } else { [string]$leg.outcome })
+            $failure = $null
+            if (-not $chainComplete) { $failure = "the $b chain did not end on its own with a documented exit that agrees with its CHAIN_RESULT (exit=$($c.exit) timedOut=$($c.timedOut) resultExit=$resultExit)" }
+            elseif ($legStatus -ceq 'RAN' -and -not $fig.outcome) {
+                $failure = 'the leg is RAN but its receipt is missing or unreadable, so no figure can be recorded'
+                if ($null -eq $typed) { $typed = @{ reason = 'LEG_FAILED'; detail = "a $b leg ($($planLeg.legId)) is RAN but its receipt is missing or unreadable (EVIDENCE_INCOMPLETE)" } }
+            }
+            if ($failure -and $legStatus -ceq 'RAN') { $legStatus = 'EVIDENCE_INCOMPLETE'; $legOutcome = 'INVALID' }
             $rows.Add([ordered]@{
                 schema = 'mlv-app/venue-baseline-trend/v1'; utc = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'); venue = $Venue; role = $planLeg.role
-                sourceCommit = $commit; leg = $planLeg.legId; card = $planLeg.card; backend = $b; status = [string]$leg.status
-                outcome = $(if ($fig.outcome) { $fig.outcome } else { [string]$leg.outcome }); fps = $fig.fps; drops = $fig.drops; stall = $fig.stall
+                sourceCommit = $commit; leg = $planLeg.legId; card = $planLeg.card; backend = $b; status = $legStatus; failure = $failure
+                outcome = $legOutcome; fps = $fig.fps; drops = $fig.drops; stall = $fig.stall
                 receiptPath = $(if ($leg.PSObject.Properties['receipt'] -and $leg.receipt) { [string]$leg.receipt } else { $null }); buildManifestSha256 = $manifest; runDir = $RunDir; hubLoad = $null
             })
         }
     }
     $stop = $c.result.stopReason
     if ($c.timedOut) { if ($null -eq $typed) { $typed = @{ reason = 'BASELINE_CAP_EXCEEDED'; detail = "the $b chain was still running at the $MaxTotalSec s cap + $KillGraceSec s grace and was killed" } }; break }
+    if (-not $chainComplete) { if ($null -eq $typed) { $typed = @{ reason = 'CHAIN_FAILED'; detail = "the $b chain exit ($($c.exit)) and its CHAIN_RESULT (exitCode $resultExit) are not a documented, agreeing pair; its legs are recorded as EVIDENCE_INCOMPLETE" } }; break }
     switch ($c.exit) {
         0 { }
         2 { if ($null -eq $typed) { $typed = @{ reason = 'USAGE'; detail = "the $b chain refused its arguments (CHAIN_USAGE)" } }; break }

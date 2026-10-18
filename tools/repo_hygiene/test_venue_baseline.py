@@ -57,11 +57,11 @@ $mode = $(if ($env:FAKE_CHAIN_MODE) { $env:FAKE_CHAIN_MODE } else { 'ok' })
 Add-Content -LiteralPath $env:FAKE_CHAIN_LOG -Value ("CALL backend=$Backend venue=$Venue commit=$SourceCommit manifest=$BuildManifestSha256 prefer=$($PreferQuietWindows.IsPresent) deadline=$DeadlineUtc legspec=$LegSpec pid=$PID")
 New-Item -ItemType Directory -Force -Path $RunDir | Out-Null
 $specs = @($LegSpec -split ',' | Where-Object { $_ })
-function Emit($legs, [int]$code, $stop) {
+function Emit($legs, [int]$code, $stop, $procExit = $null) {
     $r = [ordered]@{ schema = 'mlv-app/venue-chain-result/v1'; venue = $Venue; runDir = $RunDir; exitCode = $code; stopReason = $stop; legs = @($legs)
         ran = @($legs | Where-Object { $_.status -ceq 'RAN' }).Count; failed = @($legs | Where-Object { $_.status -ceq 'LEG_FAILED' }).Count; notRun = @($legs | Where-Object { $_.status -ceq 'NOT_RUN' }).Count }
     'CHAIN_RESULT=' + ($r | ConvertTo-Json -Compress -Depth 6)
-    exit $code
+    exit $(if ($null -ne $procExit) { $procExit } else { $code })
 }
 $n = 0
 $legs = foreach ($s in $specs) {
@@ -69,7 +69,7 @@ $legs = foreach ($s in $specs) {
     $legId = [IO.Path]::GetFileNameWithoutExtension($s)
     $name = ('{0:00}-{1}-{2}' -f $n, $legId, $Backend)
     switch ($mode) {
-        'ok' {
+        { $_ -in 'ok', 'mismatch', 'undocumented', 'noreceipt' } {
             $rd = Join-Path $env:FAKE_ROOT "receipts\CARD-1\$legId\$Venue"
             New-Item -ItemType Directory -Force -Path $rd | Out-Null
             $rp = Join-Path $rd ("rcpt-$Backend-$n.json")
@@ -81,6 +81,7 @@ $legs = foreach ($s in $specs) {
                 playback = [ordered]@{ sourceAdvanced = 600; requiredSourceFrames = 600; nativeFps = 23.976; paceFps = 23.976 }
                 display = [ordered]@{ requestedMode = 'fullscreen' }; scale = [ordered]@{ requestedScale = 1 } }
             Set-Content -LiteralPath $rp -Value ($rc | ConvertTo-Json -Depth 8)
+            if ($mode -ceq 'noreceipt') { Remove-Item -LiteralPath $rp -Force }
             [pscustomobject]@{ name = $name; spec = $s; backend = $Backend; status = 'RAN'; verdict = 'QUIET'; outcome = 'PASS'; legExit = 0; receipt = $rp }
         }
         'legfail' { [pscustomobject]@{ name = $name; spec = $s; backend = $Backend; status = 'LEG_FAILED'; verdict = 'QUIET'; outcome = 'INVALID'; printedOutcome = 'PASS'; legExit = 5; receipt = $null } }
@@ -89,6 +90,9 @@ $legs = foreach ($s in $specs) {
 }
 switch ($mode) {
     'ok' { Emit $legs 0 $null }
+    'noreceipt' { Emit $legs 0 $null }
+    'mismatch' { Emit $legs 0 $null 7 }
+    'undocumented' { Emit $legs 9 $null }
     'legfail' { Emit $legs 7 $null }
     'deadline' { Emit $legs 3 'DEADLINE' }
     'gate' { Emit $legs 4 'GATE_UNREADABLE' }
@@ -306,6 +310,37 @@ class VenueBaselineTests(unittest.TestCase):
         self.assertEqual(len(rows), 4)       # both chains still ran: a dead leg does not stop the other backend
         self.assertTrue(all(r["status"] == "LEG_FAILED" and r["outcome"] == "INVALID" and r["receiptPath"] is None and r["fps"] is None for r in rows), rows)
         self.assertIn("reason=LEG_FAILED", p.stdout)
+
+    # ---------------------------------------------------------------- the chain's exit code gates every row (evidence-completeness guard)
+    def assert_no_ran_row_and_no_figures(self, rows: list[dict], expected: int) -> None:
+        self.assertEqual(len(rows), expected, rows)
+        for r in rows:
+            self.assertEqual(r["status"], "EVIDENCE_INCOMPLETE", r)
+            self.assertEqual(r["outcome"], "INVALID", r)
+            self.assertTrue(r["failure"], r)
+            self.assertTrue(r["fps"] is None and r["drops"] is None and r["stall"] is None, r)
+
+    def test_a_chain_exit_that_disagrees_with_its_chain_result_records_no_ran_row(self) -> None:
+        p = self.run_baseline(mode="mismatch")      # CHAIN_RESULT says exitCode 0, the process exits 7
+        self.assertEqual(p.returncode, EXIT["CHAIN_FAILED"], p.stdout + p.stderr)
+        self.assertIn("reason=CHAIN_FAILED", p.stdout)
+        self.assert_no_ran_row_and_no_figures(self.trend_rows(), 2)
+        self.assertEqual(len(self.chain_calls()), 1)      # an untrusted chain stops the plan: the cpu chain never started
+
+    def test_an_undocumented_chain_exit_records_no_ran_row(self) -> None:
+        p = self.run_baseline(mode="undocumented")      # CHAIN_RESULT and the process agree on 9, which the chain never documents
+        self.assertEqual(p.returncode, EXIT["CHAIN_FAILED"], p.stdout + p.stderr)
+        self.assert_no_ran_row_and_no_figures(self.trend_rows(), 2)
+
+    def test_a_ran_leg_with_no_readable_receipt_is_an_incomplete_row_and_a_failed_run(self) -> None:
+        p = self.run_baseline(mode="noreceipt")
+        self.assertEqual(p.returncode, EXIT["LEG_FAILED"], p.stdout + p.stderr)
+        self.assertIn("reason=LEG_FAILED", p.stdout)
+        self.assert_no_ran_row_and_no_figures(self.trend_rows(), 4)      # a dead receipt does not stop the other backend
+
+    def test_a_clean_chain_rows_carry_no_failure_text(self) -> None:
+        self.assertEqual(self.run_baseline().returncode, 0)
+        self.assertTrue(all(r["failure"] is None and r["status"] == "RAN" for r in self.trend_rows()))
 
     # ---------------------------------------------------------------- typed refusals
     def test_busy_agent_exits_typed_and_never_calls_the_chain(self) -> None:
