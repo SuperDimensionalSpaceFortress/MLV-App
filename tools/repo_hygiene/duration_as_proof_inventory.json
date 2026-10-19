@@ -492,6 +492,16 @@
       ]
     },
     {
+      "path": "src/mlv/video_mlv.c",
+      "anchor": "const double max_slice_s = ( video -> processed8_prefetch_test_wait_slice_ms > 0 )",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "mlv_processed8_prefetch_wait_slice_locked() picks the fallback slice length for the processed8 test idle waiters: a test-set slice override (ms, a config seam; production leaves it 0) when non-zero, else the 50 ms default. A config select on a seam value, never a measured duration and never used to prove a stage ran (PROCESSED8-IDLE-WAIT-PREDICATE-RECHECK-1 r2).",
+      "lines": [
+        9507
+      ]
+    },
+    {
       "path": "tests/console/test_clip_golden.cpp",
       "anchor": "if ( sample . value ( QStringLiteral ( \"raw_uint16_ms\" ) ) . toDouble ( ) > 0.0 ) {",
       "class": "run_proof",
