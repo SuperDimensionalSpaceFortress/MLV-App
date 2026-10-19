@@ -1057,6 +1057,50 @@ class VenueChainSupplementaryTests(unittest.TestCase):
         self.assertEqual([(s["status"], s["trigger"]) for s in res["supplementary"]], [("RAN", "held")])
         self.assertFalse([l for l in self.chain_log(rd) if "TICKET_STALE_REMOVED" in l], "the supplementary run cost the chain its place in the line")
 
+    # ---------------------------------------------------------------- (b) held inside ONE blocking probe (heavy-slot admission), r3 / sol r2 BLOCKER
+    def test_a_probe_that_ends_not_measured_after_a_long_hold_still_gets_the_held_offer_before_the_chain_stops(self) -> None:
+        # The Bachelor pre-claim probe blocks past the 2 s threshold (a stand-in for a heavy-slot admission hold that runs to -ProbeAdmissionWaitSec) and then returns
+        # VENUE_QUIET_UNKNOWN (um-run's UNRESOLVED at the admission ceiling). The chain never came round its wait loop in between, so the offer must be made when the probe returns,
+        # BEFORE the OnUnknown Stop path sets stopReason (a stopped chain skips every offer as CHAIN_STOPPED).
+        rd = self.case / "lane-ADMISSION"
+        r = self.run_chain(rd, self.specs[:1], "-SupplementaryHeldSec", "2", env=self.env(FAKE_QUIET_MODES="UNKNOWN", FAKE_QUIET_SLEEP_PRE="3"))
+        # fail-closed and unchanged: the Bachelor leg is NOT_RUN VENUE_QUIET_UNKNOWN, exit 6, the chain stopped, and Bachelor never ran the leg
+        self.assertEqual(r.returncode, 6, r.stdout + r.stderr)
+        res = chain_result(r.stdout)
+        self.assertEqual([(l["status"], l["verdict"]) for l in res["legs"]], [("NOT_RUN", "VENUE_QUIET_UNKNOWN")])
+        self.assertEqual((res["ran"], res["failed"], res["notRun"], res["exitCode"], res["stopReason"]), (0, 0, 1, 6, "VENUE_QUIET_UNKNOWN"))
+        # the offer: the same leg ran on ultra-magnus, as the held offer, and only there
+        self.assertEqual([(l, v) for l, v, _ in self.starts()], [("sp-a.json", "ultra-magnus")])
+        self.assertEqual([(s["status"], s["trigger"], s["venue"], s["role"]) for s in res["supplementary"]], [("RAN", "held", "ultra-magnus", "supplementary")])
+        log = self.chain_log(rd)
+        offered = [i for i, l in enumerate(log) if " SUPPLEMENTARY_CLAIM_TAKEN " in l]
+        stopped = [i for i, l in enumerate(log) if " NOT_RUN VENUE_QUIET_UNKNOWN " in l]
+        self.assertTrue(offered and stopped, log)
+        self.assertLess(offered[0], stopped[0], "the offer came before the Bachelor leg was stopped")
+        self.assertFalse((self.claims / "ultra-magnus.claim.json").exists())
+        self.assertFalse((self.claims / "bachelor.claim.json").exists())
+
+    def test_a_probe_that_ends_not_measured_after_a_short_wait_gets_no_offer(self) -> None:
+        # the default 1800 s threshold is not reached by a 3 s probe: the leg is NOT_RUN exactly as before and ultra-magnus is never touched
+        rd = self.case / "lane-ADMISSION-SHORT"
+        r = self.run_chain(rd, self.specs[:1], env=self.env(FAKE_QUIET_MODES="UNKNOWN", FAKE_QUIET_SLEEP_PRE="3"))
+        self.assertEqual(r.returncode, 6, r.stdout + r.stderr)
+        res = chain_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"], res["supplementary"]), (6, "VENUE_QUIET_UNKNOWN", []))
+        self.assertEqual(self.starts(), [])
+        self.assertEqual([c for c in self.quiet_calls() if "venue=ultra-magnus" in c], [])
+
+    def test_the_offer_after_a_not_measured_probe_never_moves_the_bachelor_verdict_when_the_chain_goes_on(self) -> None:
+        # -OnUnknown Continue: leg 1's probe is not measured after a long hold (offered on ultra-magnus), leg 2 is measured and runs on Bachelor. Exit 6 stays; legs stays Bachelor-only.
+        rd = self.case / "lane-ADMISSION-CONT"
+        r = self.run_chain(rd, self.specs, "-SupplementaryHeldSec", "2", "-OnUnknown", "Continue", env=self.env(FAKE_QUIET_MODES="UNKNOWN,QUIET,QUIET,QUIET", FAKE_QUIET_SLEEP_PRE="3"))
+        self.assertEqual(r.returncode, 6, r.stdout + r.stderr)
+        res = chain_result(r.stdout)
+        self.assertEqual([l["status"] for l in res["legs"]], ["NOT_RUN", "RAN"])
+        self.assertEqual((res["ran"], res["notRun"], res["exitCode"], res["stopReason"]), (1, 1, 6, None))
+        self.assertEqual([(l, v) for l, v, _ in self.starts()], [("sp-a.json", "ultra-magnus"), ("sp-b.json", "bachelor"), ("sp-b.json", "ultra-magnus")])
+        self.assertEqual([(s["name"], s["trigger"], s["status"]) for s in res["supplementary"]], [("01-sp-a-spec", "held", "RAN"), ("02-sp-b-spec", "after-leg", "RAN")])
+
     # ---------------------------------------------------------------- (e) the opt-out
     def test_no_supplementary_switch_runs_nothing_on_ultra_magnus(self) -> None:
         rd = self.case / "lane-OPTOUT"
@@ -1189,6 +1233,12 @@ class VenueChainSupplementaryTests(unittest.TestCase):
         mut = self.mutated_runner("-ge $SupplementaryHeldSec) { Invoke-Supplementary $leg 'held' }", "-ge 999999) { Invoke-Supplementary $leg 'held' }", 2)
         self.run_chain(self.case / "lane-MHELD", self.specs[:1], "-SupplementaryHeldSec", "2", runner=mut, env=self.env(FAKE_QUIET_MODES="BUSY,QUIET,QUIET", FAKE_QUIET_SLEEP_PRE="3"))
         self.assertEqual([(l, v) for l, v, _ in self.starts()], [("sp-a.json", "bachelor"), ("sp-a.json", "ultra-magnus")], "without the held check the offer can only come after the leg")
+
+    def test_mutation_offer_after_a_not_measured_probe_removed_reproduces_sol_r2(self) -> None:
+        mut = self.mutated_runner("            if ($suppEnabled -and ([DateTime]::UtcNow - $legWaitStart).TotalSeconds -ge $SupplementaryHeldSec) {\n", "            if ($false) {\n", 1)
+        r = self.run_chain(self.case / "lane-MADM", self.specs[:1], "-SupplementaryHeldSec", "2", runner=mut, env=self.env(FAKE_QUIET_MODES="UNKNOWN", FAKE_QUIET_SLEEP_PRE="3"))
+        self.assertEqual(r.returncode, 6)
+        self.assertEqual(self.starts(), [], "without the offer on a not-measured probe the admission-exhaustion path makes no offer at all (the defect)")
 
     def test_mutation_supplementary_failure_leaking_into_the_chain_exit_is_caught(self) -> None:
         # a mutant that lets a supplementary crash set the chain exit code to 7 reproduces the defect test_a_crashing_supplementary_leg_... guards against

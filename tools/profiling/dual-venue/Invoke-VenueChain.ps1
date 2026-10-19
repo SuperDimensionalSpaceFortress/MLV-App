@@ -29,8 +29,10 @@
 #   5. LOG. -ChainLog (default <RunDir>\chain.log): one line per event, UTC stamp first; the last line is CHAIN_RESULT=<json> (also printed on stdout).
 #      The leg's own output goes to <RunDir>\leg-<name>.out.txt, each probe's to <RunDir>\quiet-<name>-<phase>.out.txt, probes append to <RunDir>\gate.log.
 #   6. SUPPLEMENTARY LEGS (VENUE-UM-SUPPLEMENTARY-WHEN-BACHELOR-HELD-1; owner directive 2026-10-18: every playback chain ALSO runs its legs on ultra-magnus when that agent is idle).
-#      Only a -Venue bachelor chain, ON by default, off with -NoSupplementary. The same leg is offered on ultra-magnus (role supplementary) (a) after each Bachelor leg ran, and (b) while a leg
-#      has waited more than -SupplementaryHeldSec (1800) in any gate (heavy-slot, heat/quiet, claim line), checked each time the wait loop comes round. An offer needs: the spec's
+#      Only a -Venue bachelor chain, ON by default, off with -NoSupplementary. The same leg is offered on ultra-magnus (role supplementary) (a) after each Bachelor leg ran, and (b) once a leg
+#      has waited more than -SupplementaryHeldSec (1800), checked each time the wait loop comes round (queue/heat gate that returns GATE_BUSY, claim line) AND once more when a Bachelor pre-claim
+#      quiet probe ends VENUE_QUIET_UNKNOWN, before the leg is stopped. COVERAGE LIMIT: one probe BLOCKS the loop, and a heavy-slot admission hold inside it can last up to -ProbeAdmissionWaitSec
+#      (7200), so the held offer for an admission hold is made when that probe returns (at the latest at the admission ceiling), NOT at 30 minutes; a hold inside the leg child is offered after the leg. An offer needs: the spec's
 #      criteria.supplementary block for the backend; ultra-magnus's own claim FREE and no live ticket (Get-VenueSupplementaryIdle, never a process scan); the build ALREADY staged in its
 #      cache (the chain stages and builds nothing); the venue's claim taken (one shot, never waited on); one quiet probe (-MaxWaitSec 0) QUIET or COOLDOWN_UNMET. Anything else is one typed
 #      `SUPPLEMENTARY_SKIPPED leg=<n> trigger=<t> reason=<R>` line (NO_SUPPLEMENTARY_CRITERIA, BACKEND_NOT_IN_SPEC, SPEC_UNREADABLE, CHAIN_STOPPED, DEADLINE_NEAR, UM_BUSY, UM_NOT_QUIET,
@@ -399,6 +401,11 @@ foreach ($leg in $plan) {
         if ($pre.verdict -ceq 'USAGE') { $stopReason = 'USAGE'; $exitCode = 2; Add-Result $leg 'NOT_RUN' @{ verdict = 'USAGE'; reason = 'wait-venuequiet-usage' }; L "LEG $($leg.name) NOT_RUN USAGE reason=wait-venuequiet-usage"; break }
         if ($pre.verdict -in @('GATE_UNREADABLE', 'HOST_MISMATCH')) { $stopReason = $pre.verdict; $exitCode = $(if ($pre.verdict -ceq 'GATE_UNREADABLE') { 4 } else { 5 }); Add-Result $leg 'NOT_RUN' @{ verdict = $pre.verdict; reason = 'phase=pre-claim' }; L "LEG $($leg.name) NOT_RUN $($pre.verdict) phase=pre-claim"; break }
         if ($pre.verdict -ceq 'VENUE_QUIET_UNKNOWN') {
+            # (a1) the probe blocked the wait loop (heavy-slot admission can hold it up to -ProbeAdmissionWaitSec) and ended not measured: the leg has been held, so make the held
+            # offer NOW, before -OnUnknown Stop sets stopReason (a stopped chain skips every offer as CHAIN_STOPPED). The Bachelor verdict, exit code and stop below are unchanged.
+            if ($suppEnabled -and ([DateTime]::UtcNow - $legWaitStart).TotalSeconds -ge $SupplementaryHeldSec) {
+                Invoke-Supplementary $leg 'held'
+            }
             Add-Result $leg 'NOT_RUN' @{ verdict = 'VENUE_QUIET_UNKNOWN'; reason = $pre.reason; phase = 'pre-claim' }
             L "LEG $($leg.name) NOT_RUN VENUE_QUIET_UNKNOWN reason=$($pre.reason) phase=pre-claim (the venue was not measured; onUnknown=$OnUnknown)"
             $exitCode = 6; if ($OnUnknown -ceq 'Stop') { $stopReason = 'VENUE_QUIET_UNKNOWN' }
