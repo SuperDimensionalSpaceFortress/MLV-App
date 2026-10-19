@@ -13,7 +13,7 @@ import subprocess
 import sys
 import zlib
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 
@@ -26,6 +26,24 @@ STAMP = re.compile(rb"MLVAPP_BUILDSTAMP_v1\|sha=([0-9a-f]{40})\|dirty=([01])")
 
 class ContractError(ValueError):
     pass
+
+
+class FileBindingError(FileNotFoundError):
+    """A pinned file is absent or differs from its pin; ``kind`` is MISSING, LENGTH_MISMATCH or HASH_MISMATCH."""
+
+    def __init__(self, kind: str, message: str) -> None:
+        super().__init__(message)
+        self.kind = kind
+
+
+def _is_absolute_path(value: str) -> bool:
+    return Path(value).is_absolute() or PureWindowsPath(value).is_absolute()
+
+
+def resolve_receipt_path(spec: dict[str, Any], repo_root: Path) -> Path:
+    """The pinned receipt: an absolute path as written, or a repo-relative path resolved against ``repo_root``."""
+    raw = spec["receipt"]["path"]
+    return Path(raw) if _is_absolute_path(raw) else (repo_root / raw).resolve()
 
 
 def _pairs(pairs: list[tuple[str, Any]], where: str = "object") -> dict[str, Any]:
@@ -98,6 +116,8 @@ def validate_spec(spec: Any) -> dict[str, Any]:
         require_hash(obj["sha256"], f"{where}.sha256")
     if not is_int(receipt["length"]) or receipt["length"] < 0:
         raise ContractError("receipt.length must be a nonnegative integer")
+    if not _is_absolute_path(receipt["path"]) and ".." in receipt["path"].replace("\\", "/").split("/"):
+        raise ContractError("a repo-relative receipt.path must not leave the repository")
     if type(root["profiles"]) is not list or not root["profiles"]:
         raise ContractError("profiles must be a nonempty array")
     profile_ids: set[str] = set()
@@ -108,7 +128,10 @@ def validate_spec(spec: Any) -> dict[str, Any]:
         profile_ids.add(profile["id"])
         if type(profile["disableLookAssist"]) is not bool:
             raise ContractError(f"profiles[{index}].disableLookAssist must be boolean")
-        if profile["playbackProcessing"] not in ("receipt", "none"):
+        # The value is the runner's -PlaybackProcessing and the app's playback_processing_selected label, which are
+        # "subset" (the smoke lane's fast processing, no receipt) or "receipt". "none" is neither, so it can bind to
+        # neither the runner nor the evidence.
+        if profile["playbackProcessing"] not in ("receipt", "subset"):
             raise ContractError(f"profiles[{index}].playbackProcessing is unsupported")
         if profile["qualityMode"] != "1" or profile["expectedQualityMode"] != 1 or profile["scaleFactor"] != "" or profile["expectedScaleRequest"] != 4 or profile["selectionAuthority"] != "shipping-default-controlled":
             raise ContractError(f"profiles[{index}] must use the pinned High Quality shipping selection and derived scale")
@@ -175,13 +198,13 @@ def sha256_file(path: Path) -> str:
 
 def validate_file(path: Path, length: int, digest: str, where: str) -> None:
     if not path.is_file():
-        raise FileNotFoundError(f"{where} missing: {path}")
+        raise FileBindingError("MISSING", f"{where} missing: {path}")
     actual_length = path.stat().st_size
     if actual_length != length:
-        raise FileNotFoundError(f"{where} length mismatch: expected {length}, got {actual_length}")
+        raise FileBindingError("LENGTH_MISMATCH", f"{where} length mismatch: expected {length}, got {actual_length}")
     actual_hash = sha256_file(path)
     if actual_hash != digest.upper():
-        raise FileNotFoundError(f"{where} hash mismatch: expected {digest.upper()}, got {actual_hash}")
+        raise FileBindingError("HASH_MISMATCH", f"{where} hash mismatch: expected {digest.upper()}, got {actual_hash}")
 
 
 def validate_shipping_alignment(spec: dict[str, Any], shipping_path: Path) -> None:
@@ -226,6 +249,14 @@ def validate_exe(path: Path, commit: str, digest: str, repo_root: Path) -> dict[
 def preflight(spec_path: Path, repo_root: Path, baseline: tuple[Path, str, str] | None, candidate: tuple[Path, str, str] | None) -> tuple[dict[str, Any], int]:
     spec = validate_spec(load_json(spec_path))
     problems: list[str] = []
+    typed: list[dict[str, Any]] = []
+
+    def block(code: str, message: str, **extra: Any) -> None:
+        # ``failures`` keeps the human strings; ``typedFailures`` is the same list with a stable code per entry, so a
+        # later run can tell "baseline not pinned" from "clip not acquired" from "receipt unreachable".
+        problems.append(message)
+        typed.append({"code": code, "detail": message, **extra})
+
     corpus: list[dict[str, Any]] = []
     shipping_path = (repo_root / spec["shippingDefaults"]["path"]).resolve()
     try:
@@ -234,9 +265,15 @@ def preflight(spec_path: Path, repo_root: Path, baseline: tuple[Path, str, str] 
         raise ContractError(str(exc)) from exc
     validate_shipping_alignment(spec, shipping_path)
     if spec["baseline"]["status"] != "reviewed_instrumented_known_good":
-        problems.append("reviewed instrumented known-good baseline bridge is not pinned")
+        block("BASELINE_NOT_PINNED", "reviewed instrumented known-good baseline bridge is not pinned")
     unavailable_ids = [clip["id"] for clip in spec["clips"] if clip.get("evidenceStatus") == "required_corpus_not_acquired" and clip["required"]]
-    problems.extend(f"required clip has no pinned length/hash: {clip_id}" for clip_id in unavailable_ids)
+    for clip_id in unavailable_ids:
+        block("REQUIRED_CLIP_NOT_ACQUIRED", f"required clip has no pinned length/hash: {clip_id}", clipId=clip_id)
+    receipt = resolve_receipt_path(spec, repo_root)
+    try:
+        validate_file(receipt, spec["receipt"]["length"], spec["receipt"]["sha256"], "receipt")
+    except FileBindingError as exc:
+        block(f"RECEIPT_{exc.kind}", str(exc))
     if problems:
         corpus = [
             {"id": clip["id"], "required": clip["required"], "status": "missing_contract_evidence" if clip["id"] in unavailable_ids else "not_checked_due_to_contract_block"}
@@ -246,23 +283,18 @@ def preflight(spec_path: Path, repo_root: Path, baseline: tuple[Path, str, str] 
             "schema": REPORT_SCHEMA, "phase": "preflight", "specPath": str(spec_path.resolve()),
             "specSha256": sha256_file(spec_path), "shippingDefaultsSha256": sha256_file(shipping_path),
             "corpus": corpus, "executables": {}, "blockingVerdict": "INDETERMINATE",
-            "cadenceVerdict": "INDETERMINATE", "authorizing": False, "failures": problems,
+            "cadenceVerdict": "INDETERMINATE", "authorizing": False, "failures": problems, "typedFailures": typed,
         }
         return report, 4
-    receipt = Path(spec["receipt"]["path"])
-    try:
-        validate_file(receipt, spec["receipt"]["length"], spec["receipt"]["sha256"], "receipt")
-    except FileNotFoundError as exc:
-        problems.append(str(exc))
     for clip in spec["clips"]:
         status = "available"
         try:
             for part in clip["parts"]:
                 validate_file(Path(part["path"]), part["length"], part["sha256"], f"clip {clip['id']} part {part['path']}")
-        except FileNotFoundError as exc:
+        except FileBindingError as exc:
             status = "missing_or_mismatch"
             if clip["required"]:
-                problems.append(str(exc))
+                block(f"CLIP_PART_{exc.kind}", str(exc), clipId=clip["id"])
         corpus.append({"id": clip["id"], "required": clip["required"], "status": status})
     executables: dict[str, Any] = {}
     if baseline is not None and candidate is not None:
@@ -285,6 +317,7 @@ def preflight(spec_path: Path, repo_root: Path, baseline: tuple[Path, str, str] 
         "cadenceVerdict": "INDETERMINATE",
         "authorizing": False,
         "failures": problems,
+        "typedFailures": typed,
     }
     return report, 4 if problems else 0
 
@@ -407,7 +440,7 @@ def compare_images(baseline_path: Path, candidate_path: Path) -> dict[str, Any]:
     }
 
 
-def _smoke_binding(result_path: Path, expected_exe: dict[str, Any], expected_clip: dict[str, Any], expected_profile: dict[str, Any], spec: dict[str, Any]) -> dict[str, Any]:
+def _smoke_binding(result_path: Path, expected_exe: dict[str, Any], expected_clip: dict[str, Any], expected_profile: dict[str, Any], spec: dict[str, Any], receipt_path: Path) -> dict[str, Any]:
     result = load_json(result_path)
     if type(result) is not dict or result.get("schema") != "mlvapp-gui-smoke-result.v1":
         raise ContractError(f"invalid smoke result schema: {result_path}")
@@ -432,7 +465,7 @@ def _smoke_binding(result_path: Path, expected_exe: dict[str, Any], expected_cli
     receipt_binding = bindings.get("receipt")
     if expected_profile["playbackProcessing"] == "receipt":
         expected_receipt = spec["receipt"]
-        if type(receipt_binding) is not dict or str(Path(receipt_binding.get("path", "")).resolve()).casefold() != str(Path(expected_receipt["path"]).resolve()).casefold() or receipt_binding.get("length") != expected_receipt["length"] or str(receipt_binding.get("sha256", "")).upper() != expected_receipt["sha256"].upper():
+        if type(receipt_binding) is not dict or str(Path(receipt_binding.get("path", "")).resolve()).casefold() != str(receipt_path.resolve()).casefold() or receipt_binding.get("length") != expected_receipt["length"] or str(receipt_binding.get("sha256", "")).upper() != expected_receipt["sha256"].upper():
             raise ContractError(f"smoke receipt binding mismatch: {result_path}")
     elif receipt_binding is not None:
         raise ContractError(f"WB-locked profile must not carry a receipt binding: {result_path}")
@@ -519,7 +552,8 @@ def evaluate(spec: dict[str, Any], evidence: Any, spec_path: Path) -> tuple[dict
     repo_root = spec_path.parents[2]
     validate_exe(Path(evidence_root["baseline"]["path"]), evidence_root["baseline"]["commit"], evidence_root["baseline"]["sha256"], repo_root)
     validate_exe(Path(evidence_root["candidate"]["path"]), evidence_root["candidate"]["commit"], evidence_root["candidate"]["sha256"], repo_root)
-    validate_file(Path(spec["receipt"]["path"]), spec["receipt"]["length"], spec["receipt"]["sha256"], "receipt")
+    receipt_path = resolve_receipt_path(spec, repo_root)
+    validate_file(receipt_path, spec["receipt"]["length"], spec["receipt"]["sha256"], "receipt")
     for clip in spec["clips"]:
         if clip.get("evidenceStatus") == "required_corpus_not_acquired":
             raise ContractError(f"required clip has no pinned length/hash: {clip['id']}")
@@ -547,8 +581,8 @@ def evaluate(spec: dict[str, Any], evidence: Any, spec_path: Path) -> tuple[dict
         observed.add(key)
         clip = next(item for item in spec["clips"] if item["id"] == pair["clipId"])
         profile = next(item for item in spec["profiles"] if item["id"] == pair["profileId"])
-        baseline_binding = _smoke_binding(Path(pair["baselineResult"]), evidence_root["baseline"], clip, profile, spec)
-        candidate_binding = _smoke_binding(Path(pair["candidateResult"]), evidence_root["candidate"], clip, profile, spec)
+        baseline_binding = _smoke_binding(Path(pair["baselineResult"]), evidence_root["baseline"], clip, profile, spec, receipt_path)
+        candidate_binding = _smoke_binding(Path(pair["candidateResult"]), evidence_root["candidate"], clip, profile, spec, receipt_path)
         left_provenance = baseline_binding["provenance"]
         right_provenance = candidate_binding["provenance"]
         pair_fields = ("requestedStartFrame", "effectiveStartFrame", "requestedFrame", "displayFrame", "presentationIndex", "requestSerial", "requestSerialOffset", "screenshotMethod", "screenshotWidth", "screenshotHeight")
