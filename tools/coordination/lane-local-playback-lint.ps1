@@ -124,6 +124,13 @@
 # the clause), so they refuse at least what master refuses. Anything that is not E1 / E2 / E3 / a prohibition keeps master's verdict.
 # A contrast word still CUTS the sentence (the head clause is judged without its complement) and the complement ends at its next comma; the
 # clause after that comma inherits from the HEAD clause, so a leading "Never run playback ..." still reaches "..., locally or on this host".
+# Sentence split and code span (NA2-RULE4-SENTENCE-SPLIT-AND-CODESPAN-APP-1, CoS review 6231429063 soft notes on #465). Rule 4 reads one
+# sentence at a time, so `Run <app> <clip>. Add <mode>.` was never one launch. A mode flag that no app launch of its own sentence holds
+# (an ORPHAN flag) now reaches the ADJACENT sentences of its block (a heading ends it): an app call there is scored as if the flag stood
+# in its own sentence (the r10 reading), and so is an app token that ends its sentence (`Run <app>. Add <mode>.`). A flag that a launch
+# holds reaches nothing, so `Build <app>. Then run <app> <clip> <mode> on Bachelor.` passes; two sentences away is out of reach. The app
+# and tracked-script tokens close with a backtick like the other app tokens (a markdown code span), so ``Run `<app>` <mode>.`` is a
+# direct launch. Refuse-only: the pin 2f8d1a97 passes every row this adds a refusal for.
 #
 # ASCII only (PowerShell 5.1 reads a BOM-less file as the ANSI code page). No Set-StrictMode here: a dot-sourced file would leak it into the caller.
 
@@ -616,10 +623,12 @@ function Get-LintPatternSet {
     $pwshGap = "(?:(?!;)(?!${pwshStop})[^\n]){0,80}?"
     $appArg = "(?:(?!/\s)(?!${appStop})[^\s;]+\s+){0,12}?"
     # r4: the quoted call-operator spelling (& '<script>' -Param, & "<app>" ...) is a launcher too.
+    # NA2-RULE4-SENTENCE-SPLIT-AND-CODESPAN-APP-1 (amend (a), RULE4-DIRECT-APP-BACKTICK-CLOSE-1): the app and the script token close with ' " or
+    # a backtick (a markdown code span closed right after the token: ``Run `<app>` <mode>.``); the class used to hold ' and " only.
     $direct = @(
-        "(?i)${b}MLVApp(Release)?\.exe['`"]?\s+${appArg}--(gui-smoke-playback|profile-playback)",
+        "(?i)${b}MLVApp(Release)?\.exe['`"``]?\s+${appArg}--(gui-smoke-playback|profile-playback)",
         "(?i)(pwsh|powershell)(\.exe)?${e}${pwshGap}-File\s+\S*$scripts",
-        "(?i)(^|[\s``&(])(&\s*)?\.{0,2}[\\/]?\S*$scripts['`"]?\s+-\w+")
+        "(?i)(^|[\s``&(])(&\s*)?\.{0,2}[\\/]?\S*$scripts['`"``]?\s+-\w+")
     # r4b (hub ruling, HUB-TICK 20261016T2244Z): the app + a clip / file argument ("Run <app> take01.dat") is an app LAUNCH too, so its
     # own clause must carry the venue: a route on the NEXT launcher ("... and run <app> take01.dat <mode> on Bachelor") never covers it.
     # It is scored only in a sentence that holds a direct launch above (it is no trigger of its own), it starts at the app token like the
@@ -656,12 +665,15 @@ function Get-LintPatternSet {
     # app and the flags with a bare ` / ` between them, and a separator slash is no argument (appArg stops at one for the same reason).
     # It is scored only where there is no direct launch, so the r9 reading of $clipLaunch in a launch sentence is unchanged.
     $clipMention = "(?i)${b}MLVApp(Release)?\.exe['`"``]?\s+(?!/\s)(?!${appArg}--(?:gui-smoke-playback|profile-playback))(?!${appStop})[^\s;]"
+    # NA2-RULE4-SENTENCE-SPLIT-AND-CODESPAN-APP-1: the no-argument twin across a sentence (`Run <app>. Add <mode>.`), an app token that ends
+    # its sentence; scored only next to an orphan mode flag (see Get-LocalPlaybackPromptFindings), like $appBare next to its `;`.
+    $appEnd = "(?i)${b}MLVApp(Release)?\.exe['`"``]?[.!?]*\z"
     $set = @{
         Separator = $separator; Contrast = $contrast; LaunchVerb = $launchVerb; StrongNeg = $strongNeg; WeakNeg = $weakNeg
         VenueQualified = $venueQualified; PlaybackWord = $playbackWord; VenueLocus = $venueLocus; RoutingLocally = $routingLocally
         Incident = $incident; LocalMarker = $localMarker; HostMarker = $hostMarker; HereMarker = $hereMarker
         HostDefeaters = $hostDefeaters; HostDefeatersLaunch = $hostDefeatersLaunch
-        Direct = $direct; ClipLaunch = $clipLaunch; ClipMention = $clipMention; AppBare = $appBare; ModeFlag = $modeFlag
+        Direct = $direct; ClipLaunch = $clipLaunch; ClipMention = $clipMention; AppBare = $appBare; AppEnd = $appEnd; ModeFlag = $modeFlag
         # the rule triggers, in the order they were always tried (the incident phrase, the three markers, the mode flag, then the launch patterns)
         Triggers = @((New-LintRegex $incident), (New-LintRegex $localMarker), (New-LintRegex $hostMarker), (New-LintRegex $hereMarker), (New-LintRegex $modeFlag)) + @($direct | ForEach-Object { New-LintRegex $_ })
     }
@@ -681,10 +693,10 @@ function Get-LocalPlaybackPromptFindings {
     $playbackWord = $patterns.PlaybackWord; $venueLocus = $patterns.VenueLocus; $routingLocally = $patterns.RoutingLocally
     $localMarker = $patterns.LocalMarker; $hostMarker = $patterns.HostMarker; $hereMarker = $patterns.HereMarker
     $hostDefeaters = $patterns.HostDefeaters; $hostDefeatersLaunch = $patterns.HostDefeatersLaunch
-    $direct = $patterns.Direct; $modeFlag = $patterns.ModeFlag
+    $modeFlag = $patterns.ModeFlag
     $triggers = $patterns.Triggers
-    # (incident, clipLaunch, clipMention and appBare are read as $patterns.<Name> below: tools/repo_hygiene's quote-class pin evaluates the
-    # LAST assignment of each of those names in this file, which must stay the pattern itself, not a copy out of the set)
+    # (incident, direct, clipLaunch, clipMention, appBare and appEnd are read as $patterns.<Name> below: tools/repo_hygiene's quote-class pin
+    # evaluates the LAST assignment of each of those names in this file, which must stay the pattern itself, not a copy out of the set)
     # the per-call state of the two E1 grammars (the cursor and the memo are mutated while one prompt is read); built when an E1 marker needs it
     $tailState = $null
     $headState = $null
@@ -703,6 +715,21 @@ function Get-LocalPlaybackPromptFindings {
             if ($piece.Trim()) { $items.Add([pscustomobject]@{ Text = $piece.Trim(); Block = $blockId }) }
         }
     }
+    # NA2-RULE4-SENTENCE-SPLIT-AND-CODESPAN-APP-1: an item holds an ORPHAN mode flag when one of its mode flags sits in no app launch match of
+    # that item (`Add <mode>.`). Such a flag reaches the adjacent items of the same block (rule 4 below and the trigger test).
+    $modeRx = Get-LintRegex $modeFlag
+    $appLaunchRx = Get-LintRegex $patterns.Direct[0]
+    $orphanMode = New-Object 'bool[]' $items.Count
+    for ($j = 0; $j -lt $items.Count; $j++) {
+        $t = $items[$j].Text
+        if (-not $modeRx.IsMatch($t)) { continue }
+        $held = @($appLaunchRx.Matches($t))
+        foreach ($mf in $modeRx.Matches($t)) {
+            $inLaunch = $false
+            foreach ($h in $held) { if ($mf.Index -ge $h.Index -and $mf.Index -lt $h.Index + $h.Length) { $inLaunch = $true; break } }
+            if (-not $inLaunch) { $orphanMode[$j] = $true; break }
+        }
+    }
     # r10: no per-item copy of the rest of the block (r9 kept one per item: O(n^2) in time and retained memory on a large heading-free
     # prompt). The sentence-terminal E1 reads later items through their index (Test-VenueTerminalTail, $tailState.NextDirty).
     # A sentence that holds none of the rule triggers (the incident phrase, `locally`, an on-this-host marker, a bare `here`, a direct
@@ -711,8 +738,11 @@ function Get-LocalPlaybackPromptFindings {
         foreach ($sentence in @($items[$itemIndex].Text)) {
             $s = $sentence.Trim()
             if ($s.Length -lt 8) { continue }
-            $triggered = $false
-            foreach ($rx in $triggers) { if ($rx.IsMatch($s)) { $triggered = $true; break } }
+            $block = $items[$itemIndex].Block
+            $neighbourMode = ($itemIndex -gt 0 -and $orphanMode[$itemIndex - 1] -and $items[$itemIndex - 1].Block -eq $block) -or
+                ($itemIndex + 1 -lt $items.Count -and $orphanMode[$itemIndex + 1] -and $items[$itemIndex + 1].Block -eq $block)
+            $triggered = $neighbourMode
+            if (-not $triggered) { foreach ($rx in $triggers) { if ($rx.IsMatch($s)) { $triggered = $true; break } } }
             if (-not $triggered) { continue }
             $clauses = @(Get-LintClauses -Sentence $s -Separator $separator -Contrast $contrast -LaunchVerb $launchVerb -StrongNeg $strongNeg -WeakNeg $weakNeg -VenueQualified $venueQualified)
             # Playback test per semicolon group: "Build MLVApp; run the tests on this host" is two instructions, as it was when ';' split sentences.
@@ -791,13 +821,22 @@ function Get-LocalPlaybackPromptFindings {
             # overlap are ONE occurrence.
             if (-not $hit) {
                 $launchSpans = New-Object System.Collections.Generic.List[object]
-                for ($pi = 0; $pi -lt $direct.Count; $pi++) {
-                    foreach ($m4 in (Get-LintRegex $direct[$pi]).Matches($s)) { $launchSpans.Add([pscustomobject]@{ Start = [int]$m4.Index; End = [int]($m4.Index + $m4.Length); App = ($pi -eq 0) }) }
+                for ($pi = 0; $pi -lt $patterns.Direct.Count; $pi++) {
+                    foreach ($m4 in (Get-LintRegex $patterns.Direct[$pi]).Matches($s)) {
+                        # NA2-RULE4-SENTENCE-SPLIT-AND-CODESPAN-APP-1 (refuse-only): an app or script token closed by a backtick right after it is a
+                        # launch only since amend (a). Such a span does not count as the sentence's direct launch below, so the r10 reading the
+                        # sentence had without it (ClipMention and AppBare next to a mode flag) still runs: `Build `<app>`; then run `<app>` <clip>
+                        # <mode> on Bachelor.` stays refused.
+                        $tokenEnd = if ($pi -eq 0) { $m4.Value.IndexOf('.exe', [StringComparison]::OrdinalIgnoreCase) + 4 } elseif ($pi -eq 2) { $m4.Value.LastIndexOf('.ps1', [StringComparison]::OrdinalIgnoreCase) + 4 } else { -1 }
+                        $spanOnly = $tokenEnd -ge 4 -and $tokenEnd -lt $m4.Value.Length -and $m4.Value[$tokenEnd] -eq [char]96
+                        $launchSpans.Add([pscustomobject]@{ Start = [int]$m4.Index; End = [int]($m4.Index + $m4.Length); App = ($pi -eq 0); CodeSpanOnly = $spanOnly })
+                    }
                 }
                 # r4b: an app launch with a clip argument is one launcher of its own (an app span: it never merges)
                 # r10 (B6): scored in a sentence that holds a direct launch OR a playback mode flag anywhere (a `;` may cut the two apart)
-                $hasModeFlag = (Get-LintRegex $modeFlag).IsMatch($s)
-                $hasDirectLaunch = $launchSpans.Count -gt 0
+                # (an orphan mode flag of an adjacent sentence counts as one of this sentence: `Run <app> <clip>. Add <mode>.`)
+                $hasModeFlag = $modeRx.IsMatch($s) -or $neighbourMode
+                $hasDirectLaunch = @($launchSpans | Where-Object { -not $_.CodeSpanOnly }).Count -gt 0
                 if ($hasDirectLaunch) {
                     foreach ($m4 in (Get-LintRegex $patterns.ClipLaunch).Matches($s)) { $launchSpans.Add([pscustomobject]@{ Start = [int]$m4.Index; End = [int]($m4.Index + $m4.Length); App = $true }) }
                 }
@@ -807,6 +846,9 @@ function Get-LocalPlaybackPromptFindings {
                     # <mode> on Bachelor.` stays a pass.
                     foreach ($m4 in (Get-LintRegex $patterns.ClipMention).Matches($s)) { $launchSpans.Add([pscustomobject]@{ Start = [int]$m4.Index; End = [int]($m4.Index + $m4.Length); App = $true }) }
                     foreach ($m4 in (Get-LintRegex $patterns.AppBare).Matches($s)) { $launchSpans.Add([pscustomobject]@{ Start = [int]$m4.Index; End = [int]($m4.Index + $m4.Length); App = $true }) }
+                    if ($neighbourMode) {
+                        foreach ($m4 in (Get-LintRegex $patterns.AppEnd).Matches($s)) { $launchSpans.Add([pscustomobject]@{ Start = [int]$m4.Index; End = [int]($m4.Index + $m4.Length); App = $true }) }
+                    }
                 }
                 $occurrences = New-Object System.Collections.Generic.List[object]
                 foreach ($sp in @($launchSpans | Sort-Object -Property @{ Expression = 'Start'; Descending = $false }, @{ Expression = 'End'; Descending = $true })) {

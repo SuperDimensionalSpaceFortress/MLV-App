@@ -60,7 +60,8 @@ MIN_DERIVED_HOOK_ROWS = 200  # DENY rows of test_mlv_never_authorized.CASES (203
 # number is a corpus change that a reviewer should see: adding a deny row to either suite means raising the matching number here in
 # the same commit; DELETING one fails this test. The floors above stay as the coarse lower bound.
 EXACT_DERIVED_HOOK_ROWS = 203      # DENY rows of test_mlv_never_authorized.CASES
-EXACT_DERIVED_PLAYBACK_ROWS = 6018  # must-refuse sentences of test_hub_vm_no_local_playback.py, deduplicated by (name, text): 211 + 5,807 non-fuzz RULE4_* rows
+EXACT_DERIVED_PLAYBACK_ROWS = 6776  # must-refuse sentences of test_hub_vm_no_local_playback.py, deduplicated by (name, text): 211 + 5,807 non-fuzz RULE4_* rows
+# + 758 of NA2-RULE4-SENTENCE-SPLIT-AND-CODESPAN-APP-1 (RULE4_SPLIT_REFUSE 700, RULE4_SPLIT_SLASH_GUARDS 16, RULE4_SPLIT_SPAN_GUARDS 42)
 # r18 (hub ruling #3, amends #2): rows of #465's two seeded FUZZ tuples, left out of the derived corpus above, head AND baseline, by the
 # explicit list slp.PARITY_EXCLUDED_DIFFERENTIAL_TUPLES (parity cost: 12,018 rows did not finish in 1,198 s). Pinned so deleting one, or adding
 # an unlisted row to a listed tuple, is visible: RULE4_R9_FUZZ_REFUSE 3,600 + RULE4_R10_FUZZ_REFUSE 2,400.
