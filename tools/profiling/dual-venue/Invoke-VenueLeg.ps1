@@ -66,6 +66,9 @@ param(
     [ValidateSet('cuda', 'cpu')][string]$Backend = '',
     # Run only the health probe (and P6) and stop: records the venue's state without running the leg.
     [switch]$HealthOnly,
+    # VENUE-STAGED-BUILD-VANISHED-AFTER-ADMISSION-WAIT-1: after admission and just before submit, a staged build manifest that is missing or not the named sha256 is re-read for up to
+    # this many seconds (an in-progress stage publishes the manifest LAST, by rename) before the leg fails BUILD_NOT_STAGED_AFTER_ADMISSION. 0 = look once.
+    [ValidateRange(0, 600)][int]$StagedBuildSettleSec = 60,
     [string]$Actor = '',
     # Where receipts go. Default: <main checkout>\.claude-state\dual-venue\receipts (gitignored). Must sit under a
     # `.claude-state` directory in production (a receipt and its evidence name an owner clip's run).
@@ -153,7 +156,7 @@ if ($null -ne $setPlan) {
             '-BuildManifestSha256', $BuildManifestSha256, '-Backend', $entry.backend, '-ReceiptRoot', $ReceiptRoot, '-Actor', $Actor)
         if (-not [string]::IsNullOrWhiteSpace($SheetCopyDir)) { $childArgs += @('-SheetCopyDir', $SheetCopyDir) }
         if ($OfflineTestMode) { $childArgs += '-OfflineTestMode' }
-        foreach ($seam in 'ConsentPath', 'VenueTablePath', 'RepoRoot', 'WorkDir', 'UmRunScript', 'GeneratorScript') {
+        foreach ($seam in 'ConsentPath', 'VenueTablePath', 'RepoRoot', 'WorkDir', 'UmRunScript', 'GeneratorScript', 'StagedBuildSettleSec') {
             if ($PSBoundParameters.ContainsKey($seam)) { $childArgs += @("-$seam", [string](Get-Variable -Name $seam -ValueOnly)) }
         }
         $childOut = @(& $pwshExe @childArgs 2>&1 | ForEach-Object { [string]$_ })
@@ -497,8 +500,14 @@ try {
     $short = $SourceCommit.Substring(0, 12)
     $cacheShare = $agentShare.TrimEnd('\') + '\cache'
     $buildJson = "$cacheShare\playback-attr-3-cuda-$short-build.json"
-    if (-not (Test-Path -LiteralPath $buildJson -PathType Leaf)) { Stop-Leg 'DEVICE_UNAVAILABLE' "BUILD_NOT_STAGED: no build manifest for $short on this venue" }
-    if ((Get-DvSha256OfFile $buildJson) -ne $BuildManifestSha256) { Stop-Leg 'DEVICE_UNAVAILABLE' "BUILD_NOT_STAGED: the staged build manifest for $short is not sha256 $BuildManifestSha256 (a different build is never substituted)" }
+    # The staged manifest is re-verified HERE, after the claim and the health probe, immediately before launch. A manifest that is not the named one is re-read for a bounded time
+    # (a stage still publishing); only then is the leg failed, typed, with what was observed. The P4 enum has no value for a refusal: the token leads outcomeDetail, as every refusal does.
+    $staged = Get-DvStagedBuildState -ManifestPath $buildJson -ExpectedSha256 $BuildManifestSha256 -SettleSec $StagedBuildSettleSec
+    if ($staged.state -cne 'OK') {
+        Stop-Leg 'DEVICE_UNAVAILABLE' "BUILD_NOT_STAGED_AFTER_ADMISSION: the staged build manifest for $short is $($staged.state) observed=$($staged.observed) expected=$BuildManifestSha256 waited=$($staged.waitedSec)s (a different build is never substituted)"
+    }
+    if ($staged.waitedSec -gt 0) { Write-Output "DVE_STAGED_BUILD_SETTLED waited=$($staged.waitedSec)s manifest=$short" }
+    # (the earlier look-once BUILD_NOT_STAGED compare is replaced by the settle check above)
     $runnerDir = "$cacheShare\$($generated.smokeRunnerClosureDirName)"
     if (-not (Test-Path -LiteralPath $runnerDir -PathType Container)) { Stop-Leg 'DEVICE_UNAVAILABLE' "SMOKE_RUNNER_NOT_STAGED: $($generated.smokeRunnerClosureDirName) is not in this venue's cache" }
 
