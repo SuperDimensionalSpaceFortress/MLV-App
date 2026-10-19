@@ -2405,11 +2405,14 @@ def cmd_session_start(repo: pathlib.Path, ref: str, ledger: pathlib.Path) -> int
 #             ...) or `--token`/`--password`; any `gh`; claude/codex `auth|login|logout`; a network client (curl, ssh, npx, ...);
 #             `find -exec`/`-delete`; a `git` that resolves only inside the clone or to a program that is not git; and git
 #             other than the allowlisted read-only or scratch-local verbs (no push, pull, fetch, ls-remote, clone, remote,
-#             submodule, aliases), with no `-c`/`--config-env`, no `config` write, `-C`/`--git-dir`/`--work-tree` only inside the
-#             scratch clone, and none of the forms that start a helper (ROUTE_GIT_RUNS_COMMANDS, _route_git_helper_reason):
-#             `--exec`, `--upload-pack`, `--receive-pack`, `--ext-diff`, `-O`/`--open-files-in-pager`, `--output`, `apply
-#             --unsafe-paths`, `-S`/`--gpg-sign` on commit, tag, merge, cherry-pick and revert, `tag -s|-u|--local-user`,
-#             `merge -s|--strategy`, and a `!` alias.
+#             submodule, aliases), with no `-c`/`--config-env`, no `config` write, `-C` only inside the scratch clone and never
+#             into (or under) a bare repository layout, no alternate git directory (ROUTE_GIT_ALT_DIR_OPTIONS: `--git-dir`,
+#             `--work-tree`, `--namespace`, `--super-prefix`, `--bare`; `rev-parse --git-dir` only prints), and none of the forms
+#             that start a helper (ROUTE_GIT_RUNS_COMMANDS, _route_git_helper_reason): `--exec`, `--upload-pack`,
+#             `--receive-pack`, `--ext-diff`, `-O`/`--open-files-in-pager`, `--output`, every abbreviation of a refused long
+#             option (_route_git_long_refused), a short-option cluster carrying `-O` on grep, `apply --unsafe-paths`,
+#             `-S`/`--gpg-sign` on commit, tag, merge, cherry-pick and revert, `tag -s|-u|--local-user`, `merge -s|--strategy`,
+#             and a `!` alias.
 #   LIVE BUS HUB RULING (r2, binding): "refuse if --bus resolves to the live clone" means NO ROUTE runs with its working
 #             directory, a `-C`/`--git-dir`/`--work-tree` target, or any argument or --fill value (also the value of
 #             `--opt=VALUE`) that resolves INSIDE the live bus. The default $FACTORY_BUS_CLONE is still cloned, read-only.
@@ -2479,10 +2482,12 @@ ROUTE_GIT_CONFIG_READS = frozenset({"--get", "--get-all", "--get-regexp", "--get
 ROUTE_GIT_CONFIG_WRITES = frozenset({"--add", "--unset", "--unset-all", "--replace-all", "--edit", "-e", "--rename-section",
                                      "--remove-section", "set", "unset", "edit", "rename-section", "remove-section"})
 ROUTE_GIT_RUNS_COMMANDS = frozenset({"--output", "--open-files-in-pager", "--upload-pack", "--receive-pack", "--exec", "--ext-diff"})
+ROUTE_GIT_ALT_DIR_OPTIONS = frozenset({"--git-dir", "--work-tree", "--namespace", "--super-prefix", "--bare"})   # another repository or tree
 ROUTE_GIT_SIGN_VERBS = frozenset({"commit", "tag", "merge", "cherry-pick", "revert"})          # verbs that can start gpg
 ROUTE_GIT_STRATEGY_VERBS = frozenset({"merge", "cherry-pick", "revert"})                       # verbs that look up git-merge-<name>
 ROUTE_GIT_HARDENING = ("core.pager=cat", "core.editor=false", "diff.external=", "core.fsmonitor=false", "commit.gpgsign=false",
-                       "tag.gpgsign=false")                                                    # `-c` pairs before every run git
+                       "tag.gpgsign=false", "safe.bareRepository=explicit", "gpg.program=false", "gpg.ssh.program=false",
+                       "gpg.x509.program=false")                                               # `-c` pairs before every run git
 ROUTE_NO_HOOKS_DIR = "outbox-route-no-hooks"                                                   # empty, beside the clone in the scratch
 ROUTE_HELPER_ENV = frozenset({"EDITOR", "VISUAL", "PAGER", "SSH_ASKPASS"})                     # helpers git reads besides GIT_*
 ROUTE_STRIPPED_ENV_RE = re.compile(r"(?:TOKEN|SECRET|PASSWORD|API_?KEY|CREDENTIAL)|^(?:ANTHROPIC_|CLAUDE_CODE_|GH_|GIT_|GITHUB_)", re.I)
@@ -2551,23 +2556,50 @@ def route_runs(argv: list[str]) -> bool:
     return name in ROUTE_EXEC_ALLOW or (name.endswith(".exe") and name[:-4] in ROUTE_EXEC_ALLOW)
 
 
+def route_pathext() -> list[str]:
+    """The extensions a Windows lookup appends, in PATHEXT order; empty off Windows."""
+    if os.name != "nt":
+        return []
+    return [e for e in os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(os.pathsep) if e]
+
+
+def route_program_candidates(entry: str, program: str) -> list[str]:
+    """The files a lookup of `program` tries in one directory: the name itself, or on Windows the name plus each PATHEXT
+    extension in order (the bare name first only when it already ends in one of them)."""
+    exts = route_pathext()
+    if not exts:
+        return [os.path.join(entry, program)]
+    spelled = [os.path.join(entry, program)] if program.lower().endswith(tuple(e.lower() for e in exts)) else []
+    return [*spelled, *(os.path.join(entry, program + e) for e in exts)]
+
+
 def route_git_candidates(entry: str) -> list[str]:
     """The files a `git` lookup tries in one directory: `git` itself, or on Windows `git` plus each PATHEXT extension in order."""
-    if os.name != "nt":
-        return [os.path.join(entry, "git")]
-    exts = [e for e in os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(os.pathsep) if e]
-    return [os.path.join(entry, "git" + e) for e in exts]
+    return route_program_candidates(entry, "git")
 
 
-def route_find_git(entries: Iterable[str]) -> str | None:
-    """The first existing, executable regular file named git in the ABSOLUTE directories `entries`, in order; None when there is
-    none. Walked by hand because shutil.which puts the current directory in front of any `path=` on Windows (unless
-    NoDefaultCurrentDirectoryInExePath is set), so it would find a git planted in the clone it runs from."""
+def route_absolute_entries(path_value: str | None) -> list[str]:
+    """The ABSOLUTE directories of a PATH value, in order. A relative entry (`.`, empty, `bin`, `..\\x`), a quoted entry
+    (`"C:\\x"`, whose quotes make it relative to the current directory) and one with a NUL are dropped: none is a place a lookup
+    may search, because each one means a directory under the current one."""
+    return [e for e in (path_value or "").split(os.pathsep) if e and "\0" not in e and os.path.isabs(e)]
+
+
+def route_find_program(entries: Iterable[str], program: str) -> str | None:
+    """The first existing, executable regular file named `program` (PATHEXT spellings on Windows) in the ABSOLUTE directories
+    `entries`, in order; None when there is none. Walked by hand because shutil.which puts the current directory in front of
+    any `path=` on Windows (unless NoDefaultCurrentDirectoryInExePath is set), so it would find a program planted in the clone it
+    runs from."""
     for entry in entries:
-        for candidate in route_git_candidates(entry):
+        for candidate in route_program_candidates(entry, program):
             if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
                 return candidate
     return None
+
+
+def route_find_git(entries: Iterable[str]) -> str | None:
+    """route_find_program for `git`: the first git in the ABSOLUTE directories `entries`, else None."""
+    return route_find_program(entries, "git")
 
 
 def route_git_binary(cwd: str | os.PathLike) -> tuple[str | None, tuple[str, str] | None]:
@@ -2578,12 +2610,11 @@ def route_git_binary(cwd: str | os.PathLike) -> tuple[str | None, tuple[str, str
     of what is found must not lie inside the clone and must itself be called git, and it must not be a `.cmd`/`.bat` shim."""
     scratch = route_real_path(str(cwd))
     absolute, kept = [], []
-    for entry in os.environ.get("PATH", "").split(os.pathsep):
+    for entry in route_absolute_entries(os.environ.get("PATH", "")):
         try:
-            if entry and os.path.isabs(entry):
-                absolute.append(entry)
-                if not route_inside(route_real_path(entry), scratch):
-                    kept.append(entry)
+            absolute.append(entry)
+            if not route_inside(route_real_path(entry), scratch):
+                kept.append(entry)
         except (OSError, ValueError):
             continue
     found = route_find_git(kept)
@@ -2685,9 +2716,39 @@ def route_live_bus_reason(argv: list[str], cwd: str, bus: str, secrets: Iterable
     return None
 
 
+def _route_git_long_refused(tok: str, refused: Iterable[str]) -> str | None:
+    """The refused long option `tok` names, else None: `tok` is `--name` or `--name=value`, and git reads any unambiguous prefix of
+    a long option as that option (`--open-files` is `--open-files-in-pager`, `--out` is `--output`), so every `--name` that is a
+    PREFIX of a refused option counts, fail-closed (an ambiguous prefix git would reject is refused too)."""
+    if not tok.startswith("--") or len(tok) < 3:
+        return None
+    name = tok[2:].split("=", 1)[0]
+    if not name:
+        return None
+    return next((full for full in sorted(r.lstrip("-") for r in refused) if full.startswith(name)), None)
+
+
+def _route_git_bare_layout(path: str, scratch: str) -> str | None:
+    """The directory between `path` and the scratch clone root `scratch` (inclusive of `path`, exclusive of the root) that is a
+    bare repository layout (`HEAD` file plus `objects/` and `refs/`), else None. `git -C fx` would open it as the repository
+    and read its config (a textconv or filter driver) unless safe.bareRepository says otherwise; the route screen refuses it."""
+    current = route_real_path(path)
+    while route_inside(current, scratch) and current != scratch:
+        if (os.path.isfile(os.path.join(current, "HEAD")) and os.path.isdir(os.path.join(current, "objects"))
+                and os.path.isdir(os.path.join(current, "refs"))):
+            return current
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+    return None
+
+
 def _route_git_unsafe(argv: list[str], cwd: str, secrets: Iterable[str] = ()) -> str | None:
-    """git: a read-only or scratch-local verb only (allowlist), no `-c`, no `--config-env`, no `config` write, and
-    `-C`/`--git-dir`/`--work-tree` only inside the scratch clone (`cwd`)."""
+    """git: a read-only or scratch-local verb only (allowlist), no `-c`, no `--config-env`, no `config` write, no option that can
+    name a program for git to start (long, abbreviated or inside a short-option cluster), no alternate git directory
+    (`--git-dir`, `--work-tree`, `--namespace`, `--super-prefix`, `--bare`), and `-C` only into a directory inside the scratch
+    clone (`cwd`) that is not itself, nor sits under, a bare repository layout."""
     scratch = route_real_path(cwd)
     here = cwd
     i, sub = 1, None
@@ -2695,30 +2756,44 @@ def _route_git_unsafe(argv: list[str], cwd: str, secrets: Iterable[str] = ()) ->
         tok = argv[i]
         if tok == "-c":
             return "git -c: a config override can smuggle in an alias, a helper or a pager"
-        if tok.startswith("--config-env") or tok.startswith("--exec-path"):
-            return f"git {tok.split('=', 1)[0]} changes what git runs"
-        if tok.split("=", 1)[0] in ROUTE_GIT_RUNS_COMMANDS:             # before the verb too: `git --upload-pack=x log`
-            return f"git {tok.split('=', 1)[0]} writes outside the scratch clone or runs another program"
-        target = None
+        refused = _route_git_long_refused(tok, (*ROUTE_GIT_RUNS_COMMANDS, "config-env", "exec-path"))
+        if refused:                                                     # before the verb too: `git --upload-pack=x log`
+            return f"git {tok.split('=', 1)[0]} ({refused}) changes what git runs, writes outside the scratch clone or runs another program"
+        if tok == "--attr-source" and i + 1 < len(argv):                # reads attributes from a tree-ish; its value is not the verb
+            i += 2
+            continue
+        alternate = _route_git_long_refused(tok, ROUTE_GIT_ALT_DIR_OPTIONS)
+        if alternate:
+            tok_name = tok.split("=", 1)[0]
+            if alternate in ("git-dir", "work-tree") and "=" not in tok and i + 1 < len(argv):
+                value = argv[i + 1]                                     # next-token form: its value is the target
+            else:
+                value = tok.split("=", 1)[1] if "=" in tok else None
+            if alternate in ("git-dir", "work-tree") and value:
+                target = os.path.join(here, os.path.expanduser(value))
+                try:
+                    outside = not route_inside(route_real_path(target), scratch)
+                except (OSError, ValueError):
+                    outside = True
+                if outside:
+                    return f"git {tok_name} targets {redact_route_text(target, secrets)!r}, outside the scratch clone"
+            return f"git {tok_name} selects another git directory or work tree; a route runs in the scratch clone's own repository"
         if tok == "-C" and i + 1 < len(argv):
             here = os.path.join(here, os.path.expanduser(argv[i + 1]))
-            target, i = here, i + 1
-        elif tok in ("--git-dir", "--work-tree", "--namespace", "--super-prefix", "--attr-source") and i + 1 < len(argv):
-            target, i = (argv[i + 1] if tok in ("--git-dir", "--work-tree") else None), i + 1
-            if target is not None:
-                target = os.path.join(here, os.path.expanduser(target))
-        elif tok.startswith(("--git-dir=", "--work-tree=")):
-            target = os.path.join(here, os.path.expanduser(tok.split("=", 1)[1]))
-        elif not tok.startswith("-"):
-            sub = tok
-            break
-        if target is not None:
             try:
-                outside = not route_inside(route_real_path(target), scratch)
+                outside = not route_inside(route_real_path(here), scratch)
             except (OSError, ValueError):
                 outside = True
             if outside:
-                return f"git {tok} targets {redact_route_text(target, secrets)!r}, outside the scratch clone"
+                return f"git -C targets {redact_route_text(here, secrets)!r}, outside the scratch clone"
+            bare = _route_git_bare_layout(here, scratch)
+            if bare is not None:
+                return (f"git -C targets {redact_route_text(here, secrets)!r}, which is or sits under a bare repository layout "
+                        f"({pathlib.PurePath(bare).name}); git would open it as the repository and read its config")
+            i += 1
+        elif not tok.startswith("-"):
+            sub = tok
+            break
         i += 1
     if sub is None:
         return None
@@ -2731,8 +2806,14 @@ def _route_git_unsafe(argv: list[str], cwd: str, secrets: Iterable[str] = ()) ->
         if not any(t in ROUTE_GIT_CONFIG_READS for t in after) or any(t in ROUTE_GIT_CONFIG_WRITES for t in after):
             return "git config is read-only in a route (--get, --get-all, --get-regexp, --list)"
     for tok in after:
-        if tok.split("=", 1)[0] in ROUTE_GIT_RUNS_COMMANDS or (sub == "grep" and tok.startswith("-O")):
-            return f"git {sub} {tok.split('=', 1)[0]} writes outside the scratch clone or runs another program"
+        refused = _route_git_long_refused(tok, ROUTE_GIT_RUNS_COMMANDS)
+        if refused:
+            return f"git {sub} {tok.split('=', 1)[0]} ({refused}) writes outside the scratch clone or runs another program"
+        alternate = _route_git_long_refused(tok, ROUTE_GIT_ALT_DIR_OPTIONS)
+        if alternate and sub != "rev-parse":                            # `rev-parse --git-dir` only prints; everything else is refused
+            return f"git {sub} {tok.split('=', 1)[0]} ({alternate}) selects another git directory or work tree"
+        if sub == "grep" and "O" in (_route_flag_cluster(tok) or ""):
+            return f"git grep {tok}: a short-option cluster with -O names a pager program for git to start"
     return _route_git_helper_reason(sub, after)
 
 
@@ -3042,13 +3123,17 @@ def route_script_operands(argv: list[str], name: str | None = None) -> list[str]
 
 def route_resolve_program(program: str, cwd: pathlib.Path) -> str | None:
     """The file a route's program names: a path (relative to the scratch clone) when it holds a separator, else the first
-    match on PATH. None when there is none."""
+    match in the ABSOLUTE entries of PATH (route_find_program). The current directory is never searched, and neither is a
+    relative or quoted PATH entry: shutil.which would, on Windows, so a program planted in the clone would resolve. None when
+    there is none."""
     if "/" in program or "\\" in program:
         local = pathlib.Path(program)
         if not local.is_absolute():
             local = cwd / local
-        return str(local) if local.is_file() else shutil.which(str(local))
-    return shutil.which(program, path=os.environ.get("PATH"))
+        if local.is_file():
+            return str(local)
+        return next((str(spelled) for spelled in (pathlib.Path(str(local) + e) for e in route_pathext()) if spelled.is_file()), None)
+    return route_find_program(route_absolute_entries(os.environ.get("PATH")), program)
 
 
 def _route_script_problem(script: str, cwd: pathlib.Path) -> tuple[str, str] | None:
@@ -3105,15 +3190,27 @@ def split_route(command: str) -> list[str]:
             for tok in shlex.split(command, posix=False)]
 
 
-def route_exercise_env(base: dict[str, str] | None = None) -> dict[str, str]:
+def route_exercise_env(base: dict[str, str] | None = None, clone: str | os.PathLike | None = None) -> dict[str, str]:
     """The environment a route that IS run gets: `base` (default: this process's) without the interpreter-injection variables
     (ROUTE_INJECTION_ENV, any case: a startup hook or preload a launched interpreter would run), the generic helper variables
     (ROUTE_HELPER_ENV: EDITOR, VISUAL, PAGER, SSH_ASKPASS), any credential-shaped variable and every GIT_* variable (GIT_EDITOR,
     GIT_SEQUENCE_EDITOR, GIT_PAGER, GIT_ASKPASS, GIT_SSH[_COMMAND], GIT_EXTERNAL_DIFF, GIT_CONFIG_PARAMETERS, ...), then git
-    told to prompt for nothing and read no user or system config."""
+    told to prompt for nothing and read no user or system config. PATH (any case of the key) keeps only its ABSOLUTE entries
+    (route_absolute_entries) and, when `clone` is given, only those whose real path is outside the clone: a `false.exe` or `gpg`
+    planted in the clone is never found through `.`, an empty entry, a relative one, a quoted one or a junction into it."""
     source = os.environ if base is None else base
     env = {k: v for k, v in source.items()
            if k.upper() not in ROUTE_INJECTION_ENV and k.upper() not in ROUTE_HELPER_ENV and not ROUTE_STRIPPED_ENV_RE.search(k)}
+    scratch = route_real_path(str(clone)) if clone is not None else None
+    for key in [k for k in env if k.upper() == "PATH"]:
+        kept = []
+        for entry in route_absolute_entries(env[key]):
+            try:
+                if scratch is None or not route_inside(route_real_path(entry), scratch):
+                    kept.append(entry)
+            except (OSError, ValueError):
+                continue
+        env[key] = os.pathsep.join(kept)
     env.update({"GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull})
     return env
 
@@ -3301,7 +3398,7 @@ def _exercise_route_argv(argv: list[str], cwd: pathlib.Path, timeout: float, fil
     if refused:
         return refused
     try:
-        returncode, out, err = run_route_process(route_git_command(str(git_bin), argv, cwd), cwd, route_exercise_env(), timeout)
+        returncode, out, err = run_route_process(route_git_command(str(git_bin), argv, cwd), cwd, route_exercise_env(clone=cwd), timeout)
     except FileNotFoundError as e:
         return "ROUTE_MISSING", f"PROGRAM_NOT_FOUND: {redact_route_text(str(e), secrets)}"
     except OSError as e:

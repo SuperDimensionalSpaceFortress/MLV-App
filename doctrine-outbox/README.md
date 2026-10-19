@@ -97,8 +97,9 @@ clone. A bus clone behind its own `origin` prints `ROUTE_BUS_STALE <behind>` on 
 
 **Every route gets a safety screen and a static existence check, and neither runs anything.** The screen refuses a route
 that is not offline, credential-free and confined to the clone (the `ROUTE_UNSAFE` list below). The existence check needs
-the program to resolve on `PATH` or inside the clone, and every script the route names to be a file inside the clone,
-symlinks and junctions followed: the script of `python`/`py`, `node` (and its `-r`/`--require`/`--import`/`--loader`
+the program to be a file in one of the absolute entries of `PATH` (walked by hand with `PATHEXT`; a relative, empty or quoted
+entry is dropped) or, when it is spelled as a path, a file inside the clone, never the current directory, and every script the
+route names to be a file inside the clone, symlinks and junctions followed: the script of `python`/`py`, `node` (and its `-r`/`--require`/`--import`/`--loader`
 preloads), a shell (and its `--rcfile`/`--init-file`), `deno run`, `bun run`/`bun <file>` (and `--preload`), `pwsh -File`,
 `awk -f`, `tclsh`, `perl`, `ruby`, `php`, ... A `bun run build` names a package script, not a file, and is not looked up.
 The program is read by what it resolves to as well as by its name, so a link called `helper.exe` that is really `python`
@@ -110,9 +111,9 @@ has its script checked. A miss is `ROUTE_MISSING` with a typed reason first in i
 **Only a route whose program is on the execution allowlist is run, and the allowlist is `git`.** It is decided on the
 program as the route spells it, a bare name (`git`, `git.exe`; never a path, so `tools/git` and `/usr/bin/git` are not on
 it), and on its resolved executable: the first `git` on a `PATH` stripped of every relative entry and every entry inside the
-scratch clone, whose real path is not inside the clone and is itself called `git`. Those entries are walked by hand and the
-current directory is never consulted (on Windows `shutil.which` searches it before `PATH`, so it would find a `git.exe` planted
-in the clone). A `git` that resolves only inside the
+scratch clone, whose real path is not inside the clone and is itself called `git`. Those entries are walked by hand (the same
+walk finds every other program's existence check) and the current directory is never consulted (on Windows `shutil.which`
+searches it before `PATH`, so it would find a `git.exe` or a `nosuch.exe` planted in the clone). A `git` that resolves only inside the
 clone, or to some other program, is `ROUTE_UNSAFE`; a `.cmd`/`.bat` shim is `ROUTE_MISSING PROGRAM_IS_SHIM`. Every other program is
 **existence-checked but not executed**: it prints `ROUTE_NOT_EXECUTED`, which is a skip and not a failure (so a card's
 `py -3 tools/x.py` still validates), and it is never launched, whatever its arguments. That includes every shell,
@@ -144,17 +145,28 @@ A `git` route that is run gets the interpreter-injection environment stripped: `
 `NODE_OPTIONS`, `NODE_PATH`, `PERL5OPT`, `PERL5LIB`, `RUBYOPT`, `BASH_ENV` and `ENV`, plus credential-shaped variables, user
 and system git config, every `GIT_*` variable (`GIT_EDITOR`, `GIT_SEQUENCE_EDITOR`, `GIT_PAGER`, `GIT_ASKPASS`, `GIT_SSH`,
 `GIT_SSH_COMMAND`, `GIT_EXTERNAL_DIFF`, `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`, ...) and the generic
-helpers `EDITOR`, `VISUAL`, `PAGER` and `SSH_ASKPASS`. Git is started as `git -c core.pager=cat -c core.editor=false
--c diff.external= -c core.fsmonitor=false -c commit.gpgsign=false -c tag.gpgsign=false -c core.hooksPath=<an empty directory
+helpers `EDITOR`, `VISUAL`, `PAGER` and `SSH_ASKPASS`. Its `PATH` keeps only the absolute entries whose real path is outside
+the clone (a `.`, empty, relative or quoted entry, and a junction or link into the clone, are dropped), so a `false.exe` or
+`gpg` planted in the clone is never found. Git is started as `git -c core.pager=cat -c core.editor=false
+-c diff.external= -c core.fsmonitor=false -c commit.gpgsign=false -c tag.gpgsign=false -c safe.bareRepository=explicit
+-c gpg.program=false -c gpg.ssh.program=false -c gpg.x509.program=false -c core.hooksPath=<an empty directory
 beside the clone in the scratch> ...`, so no pager, editor, external diff, hook or signing program is reachable even through
-a verb that wants one. A route may not pass `-c` itself. It must be exercisable offline and only in the scratch clone, so
+a verb that wants one, and a bare repository committed in the clone is never opened as the repository. A route may not pass
+`-c` itself. It must be exercisable offline and only in the scratch clone, so
 these are `ROUTE_UNSAFE`, whether or not the program would be run:
 - a shell operator (pipe, redirect, `&&`, `;`) or an environment-assignment prefix;
 - git other than an allowlisted read-only or scratch-local verb (`log`, `status`, `show`, `diff`, `rev-parse`,
   `commit`, `checkout`, ... but never `push`, `pull`, `fetch`, `ls-remote`, `clone`, `remote`, `submodule` or an
-  alias), `git -c`, `--config-env`, a `git config` write, and `-C`/`--git-dir`/`--work-tree` outside the scratch clone;
+  alias), `git -c`, `--config-env`, a `git config` write, and `-C` outside the scratch clone or into a directory that is, or
+  sits under, a bare repository layout (`HEAD`, `objects/` and `refs/`) inside it;
+- an alternate git directory: `--git-dir`, `--work-tree`, `--namespace`, `--super-prefix` and `--bare` in every form (`=` or
+  the next token, any abbreviation; after the verb too, except that `rev-parse --git-dir` only prints), whether the target is
+  outside the clone (the diagnostic says so) or inside it;
 - a git option that starts a helper or writes outside the clone: `--exec`, `--upload-pack`, `--receive-pack` (before or after
-  the verb), `--ext-diff`, `-O`/`--open-files-in-pager`, `--output`, `apply --unsafe-paths`, `-S`/`--gpg-sign` on `commit`,
+  the verb), `--ext-diff`, `-O`/`--open-files-in-pager`, `--output`, `--config-env`, `--exec-path` and every abbreviation of
+  one (git reads any unambiguous prefix, so `--open-files`, `--out`, `--ext` and `--exec-p` count: any `--name` that is a
+  prefix of a refused option is refused, fail-closed), a short-option cluster that carries `-O` on `git grep` (`-nOpython`,
+  `-Ofoo`, `-nO`), `apply --unsafe-paths`, `-S`/`--gpg-sign` on `commit`,
   `tag`, `merge`, `cherry-pick` or `revert`, `tag -s`/`-u`/`--local-user`, `merge -s` and `--strategy` (git looks the strategy
   up on `PATH` as `git-merge-<name>`), and a `!` alias (`git !echo hi`);
 - any `gh`, `claude`/`codex` `auth|login|logout`, a network client (`curl`, `ssh`, `npx`, ...), `find -exec`, a URL or

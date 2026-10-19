@@ -602,7 +602,7 @@ def test_b_git_resolution_never_consults_the_current_directory(tmp_path, launche
     monkeypatch.chdir(elsewhere)
     system = shutil.which("git")                                          # the system git, looked up from an empty cwd
     clone = make_clone(tmp_path)
-    for name in ("git.exe", "git.cmd", "git.bat", "git"):
+    for name in ("git.exe", "git.cmd", "git.bat", "git.com", "git"):
         planted = clone / name
         planted.write_text("", encoding="utf-8")
         planted.chmod(0o755)
@@ -1599,6 +1599,288 @@ def test_a_character_the_stream_cannot_encode_does_not_raise():
     ob._route_say("ROUTE_OK item git log caf\u00e9 \u2192 \u65e5\u672c", stream)
     stream.flush()
     assert stream.buffer.getvalue().startswith(b"ROUTE_OK item")
+
+
+# ---------- r4: the r3 key findings (sol r3 blockers, opus r3 blocker and hardening) ----------
+# Each refused row is asserted on the real exercise_route with the launch mocked: ROUTE_UNSAFE and no launch. The real-git rows
+# run a git against a driver that WRITES A MARKER FILE and assert the marker is absent; a control run on an unhardened command
+# shows the fixture is live (a driver that never ran would make "absent" prove nothing).
+
+R4_HELPER_FORMS = {
+    "grep -nOpython (sol r3 repro)": "git grep -nOpython HIT -- payload.py",
+    "grep -Ofoo": "git grep -Ofoo needle",
+    "grep -nO": "git grep -nO needle",
+    "grep -On": "git grep -On needle",
+    "grep -inOgit": "git grep -inOgit needle",
+    "grep -cO": "git grep -cO needle",
+    "--open-files= abbreviation": "git grep --open-files=python needle",
+    "--open abbreviation, next token": "git grep --open python needle",
+    "--o abbreviation": "git grep --o=python needle",
+    "--out abbreviation": "git log --out=elsewhere.txt",
+    "--outp abbreviation, next token": "git log --outp elsewhere.txt",
+    "--ext abbreviation": "git diff --ext",
+    "--ext-d abbreviation": "git diff --ext-d",
+    "--exe abbreviation": "git log --exe=evil",
+    "--exe abbreviation before the verb": "git --exe=evil log",
+    "--upl abbreviation": "git log --upl=evil",
+    "--rec abbreviation": "git log --rec evil",
+    "--e abbreviation": "git log --e=evil",
+    "--config-e abbreviation before the verb": "git --config-e=a=B log",
+    "--exec-p abbreviation before the verb": "git --exec-p=x log",
+}
+
+
+@pytest.mark.parametrize("name", list(R4_HELPER_FORMS))
+def test_r4_a_clustered_or_abbreviated_helper_option_is_unsafe_before_launch(tmp_path, launches, name):
+    clone = make_clone(tmp_path)
+    status, detail = ob.exercise_route(R4_HELPER_FORMS[name], clone, 30, {})
+    assert status == "ROUTE_UNSAFE", (name, status, detail)
+    assert launches == [], f"{name} reached the process launch"
+
+
+R4_ALT_DIR_FORMS = {
+    "--git-dir= inside the clone": "git --git-dir=fx show HEAD",
+    "--git-dir <next token> inside the clone": "git --git-dir fx show HEAD",
+    "--git abbreviation": "git --git=fx show HEAD",
+    "--work-tree= inside the clone": "git --work-tree=. status",
+    "--git-dir plus --work-tree": "git --git-dir=.git --work-tree=. status",
+    "--namespace=": "git --namespace=x log",
+    "--namespace <next token>": "git --namespace x log",
+    "--super-prefix=": "git --super-prefix=x/ log",
+    "--bare after -C": "git -C fx --bare log -p",
+    "--ba abbreviation": "git --ba log",
+    "--work abbreviation": "git --work=. status",
+}
+
+
+@pytest.mark.parametrize("name", list(R4_ALT_DIR_FORMS))
+def test_r4_an_alternate_git_directory_is_unsafe_in_every_form(tmp_path, launches, name):
+    clone = make_clone(tmp_path)
+    status, detail = ob.exercise_route(R4_ALT_DIR_FORMS[name], clone, 30, {})
+    assert status == "ROUTE_UNSAFE", (name, status, detail)
+    assert launches == [], f"{name} reached the process launch"
+
+
+@pytest.mark.parametrize("command", [
+    "git grep -n needle", "git grep -nw needle", "git grep -c needle", "git grep -e needle", "git grep -in needle -- payload.py",
+    "git log --oneline --format=%H --since=1.day --no-color", "git log --stat --name-only", "git diff --cached --name-status",
+    "git log --branches --grep=x", "git log --oneline -5", "git rev-parse --git-dir", "git rev-parse --is-bare-repository",
+    "git diff --word-diff", "git log --show-signature",
+])
+def test_r4_the_safe_twin_of_a_refused_option_is_launched(tmp_path, launches, command):
+    clone = make_clone(tmp_path)
+    status, detail = ob.exercise_route(command, clone, 30, {})
+    assert status == "ROUTE_OK" and len(launches) == 1, (command, status, detail)
+
+
+def test_r4_a_dash_c_into_a_plain_directory_is_launched_and_into_a_bare_layout_is_not(tmp_path, launches):
+    clone = make_clone(tmp_path, {"sub/readme.txt": "x\n"})
+    assert ob.exercise_route("git -C sub log", clone, 30, {})[0] == "ROUTE_OK" and len(launches) == 1
+    for name in ("HEAD", "config"):
+        (clone / "fx").mkdir(exist_ok=True)
+        (clone / "fx" / name).write_text("ref: refs/heads/m\n" if name == "HEAD" else "[core]\n\tbare = true\n", encoding="utf-8")
+    for sub in ("objects", "refs"):
+        (clone / "fx" / sub).mkdir(exist_ok=True)
+    (clone / "fx" / "deeper").mkdir(exist_ok=True)
+    for target in ("fx", "fx/deeper"):
+        status, detail = ob.exercise_route(f"git -C {target} log -p", clone, 30, {})
+        assert status == "ROUTE_UNSAFE" and "bare" in detail and len(launches) == 1, (target, status, detail)
+
+
+def planted_bare_layout(tmp_path: Path, clone: Path) -> Path:
+    """A bare repository committed inside the clone as `fx/`, whose config defines a textconv driver that writes a marker file
+    and whose info/attributes selects it for every path. Returns the marker path (absent until a driver runs)."""
+    src = tmp_path / "bare-src"
+    src.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "m", str(src)], check=True, capture_output=True, text=True)
+    for text in ("one\n", "two\n"):
+        (src / "payload.txt").write_text(text, encoding="utf-8")
+        git(src, "add", "-A")
+        git(src, "commit", "-q", "-m", f"c {text.strip()}")
+    fx = clone / "fx"
+    subprocess.run(["git", "clone", "-q", "--bare", str(src), str(fx)], check=True, capture_output=True, text=True)
+    marker = tmp_path / "driver-ran.marker"
+    script = tmp_path / "driver.py"
+    script.write_text("import pathlib, sys\npathlib.Path(sys.argv[1]).write_text('ran')\nprint('converted')\n", encoding="utf-8")
+    command = " ".join(f'\\"{Path(p).as_posix()}\\"' for p in (sys.executable, script, marker))
+    with open(fx / "config", "a", encoding="utf-8", newline="\n") as handle:
+        handle.write(f'[diff "x"]\n\ttextconv = {command}\n')
+    (fx / "info").mkdir(exist_ok=True)
+    (fx / "info" / "attributes").write_text("* diff=x\n", encoding="utf-8")
+    return marker
+
+
+def real_git(argv: list[str], clone: Path, env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+    return subprocess.run(argv, cwd=str(clone), env=ob.route_exercise_env() if env is None else env, capture_output=True, text=True, timeout=60)
+
+
+def test_r4_a_committed_bare_layout_never_runs_its_textconv_driver(tmp_path):
+    """opus r3 blocker: `git -C fx log -p` with a textconv driver in fx/config and `* diff=x` in fx/info/attributes."""
+    clone = make_clone(tmp_path)
+    marker = planted_bare_layout(tmp_path, clone)
+    git_bin = shutil.which("git")
+    assert git_bin is not None
+    real_git([git_bin, "-C", "fx", "log", "-p"], clone)                          # control: the plain command does run the driver
+    if not marker.exists():
+        pytest.skip("the control run did not start the planted driver on this git, so 'absent' would prove nothing")
+    marker.unlink()
+    real_git(ob.route_git_command(git_bin, ["git", "-C", "fx", "log", "-p"], clone), clone)
+    assert not marker.exists(), "safe.bareRepository=explicit did not stop git opening the committed bare layout"
+    for command in ("git -C fx log -p", "git --git-dir=fx show HEAD", "git -C fx show HEAD", "git --git-dir fx log -p"):
+        status, detail = ob.exercise_route(command, clone, 30, {})
+        assert status == "ROUTE_UNSAFE", (command, status, detail)
+        assert not marker.exists(), command
+
+
+def test_r4_the_hardening_pairs_name_safe_bare_repository_and_every_signing_program(tmp_path, launches):
+    clone = make_clone(tmp_path)
+    assert ob.exercise_route("git log", clone, 30, {})[0] == "ROUTE_OK"
+    pairs = set(git_dash_c(launches[0]["argv"]))
+    assert {"safe.bareRepository=explicit", "gpg.program=false", "gpg.ssh.program=false", "gpg.x509.program=false",
+            "core.editor=false", "core.pager=cat", "diff.external=", "core.fsmonitor=false"} <= pairs, pairs
+    assert {p.split("=", 1)[0] for p in ("safe.bareRepository=explicit", "gpg.program=false")} <= {p.split("=", 1)[0] for p in ob.ROUTE_GIT_HARDENING}
+
+
+def test_r4_the_environment_path_keeps_only_absolute_entries_outside_the_clone(tmp_path):
+    clone = make_clone(tmp_path)
+    inside = clone / "bin"
+    inside.mkdir()
+    outside = tmp_path / "system"
+    outside.mkdir()
+    entries = [".", "", "bin", os.path.join("..", "x"), str(inside), str(clone), f'"{outside}"', str(outside)]
+    env = ob.route_exercise_env({"Path": os.pathsep.join(entries), "KEEP_ME": "yes"}, clone=clone)
+    assert env["Path"] == str(outside) and env["KEEP_ME"] == "yes", env["Path"]
+    assert [k for k in env if k.upper() == "PATH"] == ["Path"]
+    assert ob.route_exercise_env({"PATH": os.pathsep.join([".", "", str(outside)])})["PATH"] == str(outside)   # no clone: relative still goes
+
+
+def test_r4_the_git_child_gets_that_path_and_a_planted_helper_is_never_started(tmp_path, launches, monkeypatch):
+    """opus r3 hardening: PATH='.;<system>' and a false/gpg in the clone. The launch sees no relative and no in-clone entry."""
+    clone = make_clone(tmp_path)
+    inside = clone / "bin"
+    inside.mkdir()
+    for planted in (clone / "false.exe", clone / "false.bat", clone / "gpg.exe", inside / "false.exe"):
+        planted.write_text("", encoding="utf-8")
+        planted.chmod(0o755)
+    monkeypatch.chdir(clone)
+    monkeypatch.setenv("PATH", os.pathsep.join([".", "", str(inside), os.environ["PATH"]]))
+    status, detail = ob.exercise_route("git commit --allow-empty", clone, 30, {})
+    assert status == "ROUTE_OK" and len(launches) == 1, (status, detail)
+    entries = launches[0]["env"]["PATH"].split(os.pathsep)
+    assert entries and all(os.path.isabs(e) for e in entries), entries
+    assert not [e for e in entries if ob.route_inside(ob.route_real_path(e), ob.route_real_path(str(clone)))], entries
+
+
+def test_r4_a_planted_gpg_and_false_in_the_clone_are_never_started_by_a_real_git(tmp_path, monkeypatch):
+    """The marker row: a signed commit makes `git log --show-signature` start gpg; with PATH='.;<system>' the clone's own
+    `gpg` and `false` (shebang scripts that write a marker) used to be found. They must not run."""
+    repo = tmp_path / "clone"
+    subprocess.run(["git", "init", "-q", "-b", "m", str(repo)], check=True, capture_output=True, text=True)
+    marker = tmp_path / "helper-ran.marker"
+    for name in ("gpg", "false"):
+        planted = repo / name
+        with open(planted, "w", encoding="utf-8", newline="\n") as handle:      # LF only: a CRLF shebang names an interpreter that does not exist
+            handle.write(f"#!/bin/sh\n: > '{marker.as_posix()}'\nexit 1\n")
+        planted.chmod(0o755)
+    empty = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"                          # the empty tree, a fixed id in every sha1 repository
+    written = subprocess.run(["git", "-C", str(repo), "hash-object", "-t", "tree", "-w", "--stdin"], input="", capture_output=True, text=True)
+    assert written.returncode == 0 and written.stdout.strip() == empty, (written.returncode, written.stdout, written.stderr)
+    body = (f"tree {empty}\nauthor t <t@example.invalid> 1 +0000\ncommitter t <t@example.invalid> 1 +0000\n"
+            "gpgsig -----BEGIN PGP SIGNATURE-----\n \n abc\n -----END PGP SIGNATURE-----\n\nmsg\n")
+    made = subprocess.run(["git", "-C", str(repo), "hash-object", "-t", "commit", "-w", "--stdin"], input=body.encode("utf-8"), capture_output=True)
+    sha = made.stdout.decode("utf-8").strip()                                   # bytes in: text mode would write CRLF line ends into the object
+    assert made.returncode == 0 and len(sha) >= 40, (made.returncode, made.stdout, made.stderr)
+    git(repo, "update-ref", "refs/heads/m", sha)
+    monkeypatch.setenv("PATH", os.pathsep.join([".", os.environ["PATH"]]))
+    git_bin = shutil.which("git")
+    unfiltered = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)   # keeps the `.` entry
+    real_git([git_bin, "log", "--show-signature"], repo, unfiltered)             # control: the plain git starts the planted gpg
+    if not marker.exists():
+        pytest.skip("the control run did not start the planted gpg on this git/platform, so 'absent' would prove nothing")
+    marker.unlink()
+    assert ob.exercise_route("git log --show-signature", repo, 30, {})[0] in ("ROUTE_OK", "ROUTE_FAILED")
+    assert not marker.exists(), "a helper planted in the clone was started through a relative PATH entry"
+
+
+def test_r4_program_lookup_never_consults_the_current_directory(tmp_path, monkeypatch):
+    """shutil.which searches the current directory first on win32 unless NoDefaultCurrentDirectoryInExePath is set; a missing
+    program must stay ROUTE_MISSING PROGRAM_NOT_FOUND however the host is set."""
+    monkeypatch.delenv("NoDefaultCurrentDirectoryInExePath", raising=False)
+    clone = make_clone(tmp_path)
+    for name in ("nosuch.exe", "nosuch.cmd", "nosuch.bat", "nosuch.com", "nosuch"):
+        planted = clone / name
+        planted.write_text("", encoding="utf-8")
+        planted.chmod(0o755)
+    monkeypatch.chdir(clone)
+    assert ob.route_resolve_program("nosuch", clone) is None
+    status, detail = ob.exercise_route("nosuch arg", clone, 30, {})
+    assert status == "ROUTE_MISSING" and detail.startswith("PROGRAM_NOT_FOUND"), (status, detail)
+    monkeypatch.setenv("PATH", os.pathsep.join([".", "", os.environ["PATH"]]))     # a relative PATH entry does not count either
+    assert ob.route_resolve_program("nosuch", clone) is None
+    status, detail = ob.exercise_route("nosuch arg", clone, 30, {})
+    assert status == "ROUTE_MISSING" and detail.startswith("PROGRAM_NOT_FOUND"), (status, detail)
+
+
+def test_r4_program_lookup_still_finds_an_absolute_path_entry_and_a_path_in_the_clone(tmp_path, monkeypatch):
+    clone = make_clone(tmp_path, {"tools/mytool.exe": "", "tools/other": ""})
+    (clone / "tools" / "other").chmod(0o755)
+    folder = tmp_path / "abs"
+    folder.mkdir()
+    exe = folder / ("found.exe" if os.name == "nt" else "found")
+    exe.write_text("", encoding="utf-8")
+    exe.chmod(0o755)
+    monkeypatch.setenv("PATH", os.pathsep.join([f'"{folder}"', str(folder)]))      # the quoted entry is dropped, the plain one walked
+    assert os.path.normcase(ob.route_resolve_program("found", clone) or "") == os.path.normcase(str(exe))
+    assert ob.route_resolve_program("tools/other", clone) == str(clone / "tools" / "other")
+    assert ob.route_resolve_program("tools/mytool", clone) is not None             # a PATHEXT spelling of a path in the clone
+    assert ob.route_resolve_program("tools/missing", clone) is None
+
+
+def test_r4_a_quoted_path_entry_is_not_walked_for_git(tmp_path, monkeypatch):
+    system = shutil.which("git")
+    if system is None:
+        pytest.skip("no system git")
+    clone = make_clone(tmp_path)
+    monkeypatch.setenv("PATH", f'"{Path(system).parent}"')
+    found, refused = ob.route_git_binary(clone)
+    assert found is None and refused is not None and refused[0] == "ROUTE_MISSING" and "PROGRAM_NOT_FOUND" in refused[1], (found, refused)
+    assert ob.route_exercise_env({"PATH": os.environ["PATH"]}, clone=clone)["PATH"] == ""
+
+
+def test_r4_a_path_entry_that_is_a_junction_into_the_clone_is_excluded(tmp_path, monkeypatch):
+    clone = make_clone(tmp_path)
+    inside = clone / "bin"
+    inside.mkdir()
+    (inside / ("git.exe" if os.name == "nt" else "git")).write_text("", encoding="utf-8")
+    (inside / ("git.exe" if os.name == "nt" else "git")).chmod(0o755)
+    link = tmp_path / "linked-bin"
+    try:
+        if os.name == "nt":
+            made = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(inside)], capture_output=True, text=True)
+            if made.returncode != 0:
+                raise OSError(made.stderr.strip() or made.stdout.strip())
+        else:
+            os.symlink(inside, link, target_is_directory=True)
+    except (OSError, NotImplementedError) as e:
+        pytest.skip(f"cannot create a directory junction or symlink on this host ({e}); the realpath exclusion is read from the code")
+    system = shutil.which("git")                                                   # looked up BEFORE the junction is the whole PATH
+    monkeypatch.setenv("PATH", str(link))
+    found, refused = ob.route_git_binary(clone)
+    assert found is None and refused is not None and refused[0] == "ROUTE_UNSAFE" and "scratch clone" in refused[1], (found, refused)
+    assert ob.route_exercise_env({"PATH": str(link)}, clone=clone)["PATH"] == ""
+    if system is not None:                                                       # a junction entry ahead of the system git never wins
+        monkeypatch.setenv("PATH", os.pathsep.join([str(link), str(Path(system).parent)]))
+        found, refused = ob.route_git_binary(clone)
+        assert refused is None and found is not None
+        assert not ob.route_inside(ob.route_real_path(found), ob.route_real_path(str(clone)))
+
+
+def test_r4_the_readme_states_the_r4_rules_and_not_the_overbroad_sentences():
+    text = (REPO_ROOT / "doctrine-outbox" / "README.md").read_text(encoding="utf-8")
+    for needle in ("safe.bareRepository=explicit", "gpg.program=false", "short-option cluster", "abbreviation", "--bare", "--namespace",
+                   "--super-prefix", "absolute", "never the current directory"):
+        assert needle in text, needle
+    assert "resolve on `PATH` or inside the clone" not in text, "the existence check never consults the current directory"
 
 
 # ---------- the README catalogue names every repro and the launcher rule ----------
