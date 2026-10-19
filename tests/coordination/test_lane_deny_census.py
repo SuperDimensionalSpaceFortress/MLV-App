@@ -70,6 +70,14 @@ def test_a_line_one_that_names_an_NA_rule_is_refined_by_the_body_lines_naming_th
              "- mlv-never-authorized.py NA-2 \"shrinking overwrite\" denied one Edit of the report script.",
              "- Disclosure: earlier a PreToolUse hook blocked a `python - <<EOF` edit; I used the Edit tool instead."]
     assert census_tool.classify(lines) == "NA-2 shrink"
+    # SAFETY-LINT-MASTER-PARITY-DIFF-1 r1: line 1 names NA-10 (no sub-class); body prose that mentions NA-7 and a
+    # temp path on the same line is not the stop.
+    na10 = ["PARTIAL hook NA-10 denied a read-only diagnostic Bash command (redirect read as a write)",
+            "Hook reply: \"NA-10: a shell write edits this lane's OWN gate\"",
+            "The master's hook is loaded from a temp path and derives a root from its own location (NA-10 / NA-7)."]
+    assert census_tool.classify(na10) == "other-deny"
+    assert census_tool.classify(["PARTIAL PreToolUse hook NA-11 denies any Edit of tools/agent-bridge/** -> successor r2",
+                                 "all three Edit calls were denied by hook NA-11; RED->GREEN (forced) and a delete of x"]) == "other-deny"
     # No NA token on line 1: every body evidence line is still in play, class order decides.
     assert census_tool.classify(["PARTIAL hook deny"] + lines[1:]) == "STDIN-REPL"
 

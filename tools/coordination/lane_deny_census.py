@@ -59,8 +59,11 @@ _SCRATCH = re.compile(_SCRATCH_WORDS, re.I)
 _ARROW = re.compile(r"\s*(?:->|→)\s*(?=successor\b)", re.I)   # only the successor arrow ends the reason
 
 
-def _first_rule(text):
+def _first_rule(text, families=None):
+    """First class whose rule matches; with families (NA-n tokens line 1 named), only that family's classes."""
     for name, rx in _RULES[1:]:
+        if families is not None and name.split()[0].upper() not in families:
+            continue
         if rx.search(text):
             return name
     return None
@@ -93,10 +96,11 @@ def classify(lines):
         return "no-deny"
     cls = _first_rule(text) if _DENY_WORD.search(text) else None
     if cls is None:
-        # A line 1 that names an NA rule is refined by the body lines naming that same rule: it is the stop.
-        named = set(_NA_TOKEN.findall(text))
-        pool = [ln for ln in body if named & set(_NA_TOKEN.findall(ln))] if named else []
-        cls = _first_rule("\n".join(pool or body)) or "other-deny"
+        # A line 1 that names an NA rule is refined by the body lines naming that same rule, and only by that
+        # rule's classes (NA-10, NA-11, ... have none, so they are 'other-deny'): it is the stop.
+        named = {t.upper() for t in _NA_TOKEN.findall(text)}
+        pool = [ln for ln in body if named & {t.upper() for t in _NA_TOKEN.findall(ln)}] if named else []
+        cls = _first_rule("\n".join(pool or body), named or None) or "other-deny"
     if cls == "NA-7 outside-root" and any(
         _NA7_LINE.search(ln) and _SCRATCH.search(ln) for ln in [text] + body
     ):
