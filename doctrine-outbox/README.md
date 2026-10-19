@@ -14,9 +14,9 @@ reference copy in `665b4566`). Sharing is by pin, not by copy (bus `tools/factor
 never copied into a project: the project pins it"): a project records a reviewed bus SHA with
 `python factory-pins/pin-runner.py pin doctrine-outbox --commit <bus-sha> --path tools/factory/doctrine_outbox.py
 --reviewer <who> --reason <why>` and runs `python factory-pins/pin-runner.py run doctrine-outbox -- --config
-doctrine-outbox.config.json <command>`. It KEEPS its local copy until a pin-aware release (card
-OUTBOX-PIN-AWARE-TOOL-AT-REF-1): the hook `install-hooks` writes and the debt and drain checks still read
-`tool_rel`, so deleting the copy bricks the push guard. The digest of the candidate is recorded in that
+doctrine-outbox.config.json <command>`. Setting `tool_pin` in the config (card
+OUTBOX-PIN-AWARE-TOOL-AT-REF-1) makes the hook `install-hooks` writes and the debt and drain checks use the pin; without it they read
+`tool_rel`, so a project KEEPS its copy until it sets `tool_pin`. The digest of the candidate is recorded in that
 config's `bus_candidate` and checked by `tests/coordination/test_doctrine_outbox_hooks.py`. Change behaviour by
 changing the config; once the bus has the file, change the tool only there and re-pin. The same file also answers the hook
 commands `check`, `pre-push`, `stop`, `session-start` and `install-hooks`. `stop` judges the commits not
