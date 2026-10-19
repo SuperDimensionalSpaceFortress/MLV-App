@@ -79,12 +79,23 @@ BEHAVIOURS
    hook is MOVED to the splice point right after the shebang and `set` lines (`install-hooks` prints
    `repaired`), so a layer that reads git's stdin ahead of it cannot starve it. The hook and the debt checks still
    run the file at config `tool_rel`: a project keeps that local copy until a pin-aware release.
+11. Card routes are checked before they ship (CoS work order FWO-DEFECT-PREVENT-1 item 3; fail-closed, CARD-ROUTE-EXERCISE-2).
+   `validate --exercise` takes every command an item names and, in a scratch `git clone --local --no-hardlinks` of the
+   bus (`--bus`, default $FACTORY_BUS_CLONE) with `origin` removed, never in the bus itself, (a) checks that its program
+   and any script it names exist, running nothing, and (b) runs it only when its program is not a launcher (sh, bash, cmd,
+   pwsh, python, py, node, perl, ruby, an env/xargs-style wrapper, ...). A launcher route is existence-checked and then
+   skipped as `ROUTE_NOT_EXECUTED_LAUNCHER`, never launched. It prints one
+   `ROUTE_OK|ROUTE_NOT_EXECUTED_LAUNCHER|ROUTE_MISSING|ROUTE_FAILED|ROUTE_TIMEOUT|ROUTE_UNSAFE <item> <command>` line per
+   command; anything but the first two exits 1. The extraction rule and the outcome meanings are the block comment above
+   `extract_routes`.
 
 Nothing here runs itself: the OS drain task, Stop hook and heartbeat debt are the project's wiring.
 
 Subcommands
 -----------
-    validate <item.md>...                       parse + screen item files
+    validate <item.md>... [--exercise [--bus PATH] [--timeout S] [--fill NAME=VALUE]... [--scratch-root PATH]]
+                                                parse + screen item files; --exercise also checks every route command
+                                                an item names (behaviour 11)
     debt [--ref R] [--ledger P] [--bus PATH] [--json]
     drain --bus PATH [--ref R] [--push] [--ledger P] [--deny-file P]
     kernel-filing --bus PATH [--ref R] [--push] [--ledger P] [--deny-file P]
@@ -107,16 +118,21 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import pathlib
 import re
+import shlex
 import shutil
+import signal
 import socket
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
 
 # ---------- constants that are fleet-wide, not per project ----------
@@ -2331,10 +2347,836 @@ def cmd_session_start(repo: pathlib.Path, ref: str, ledger: pathlib.Path) -> int
     return 0
 
 
+# ---------- card routes: check every command a card names (validate --exercise) ----------
+#
+# CoS work order FWO-DEFECT-PREVENT-1 item 3 (ruling candidate `steward-handoff-card-route-is-live-and-exercised-r1`):
+# a card that names a command nobody ran ships a route that does not exist (#468 adoption steps; #469 `doctrine-sync debt`).
+# CARD-ROUTE-EXERCISE-2 is the fail-closed successor of CARD-ROUTE-EXERCISE-1 (PR 479, parked): that card decided which script
+# a launcher would run with two hand-written walks over one argv (a safety matcher and a script discovery), and every review
+# round found a spelling where they disagreed. This tool never launches a launcher, so no second grammar can disagree.
+#
+# WHAT COUNTS AS A ROUTE COMMAND (the extraction rule, applied to the item body):
+#   1. Every non-blank line of a fenced block whose info string starts with `route` (```route or ~~~route), except a
+#      line that starts with `#`; a leading `$ ` or `> ` is dropped.
+#   2. Every backticked span with two or more words inside a ROUTE SECTION. A section opens at a line whose label is
+#      `Route:` or `Adopt:` (bullet and bold allowed, any case) and runs to the next blank line, `#` heading or fence.
+#      Adjacent bullets belong to the section, so a `Pin:` bullet right under `Adopt:` is checked too.
+#   A one-word span (`debt`, `RULINGS.md`) is a name, not a command. Spans outside a section are prose and are not run.
+# Commands are split without a shell (POSIX shlex; on Windows non-POSIX shlex so a backslash path stays whole), one per
+# line, and checked in a scratch clone of the bus. `<name>` placeholders are filled from --fill name=VALUE (`<scratch>` is
+# the scratch clone itself); one left unfilled is ROUTE_FAILED.
+#
+# TWO STEPS PER ROUTE, in this order:
+#   1. STATIC EXISTENCE CHECK, for EVERY route, launcher routes included. It runs nothing. The route's program must resolve
+#      (PATH, or a path inside the scratch clone), and when the route names a script (python/py, node, a shell, pwsh/powershell,
+#      perl/ruby/php/lua/Rscript/osascript) that script must be a file that resolves, symlinks and junctions followed, inside
+#      the scratch clone. A miss is ROUTE_MISSING with a typed reason first in its detail: PROGRAM_NOT_FOUND, PROGRAM_IS_SHIM
+#      (a `.cmd`/`.bat` shim cannot start without `cmd /c`), SCRIPT_NOT_FOUND or SCRIPT_OUTSIDE_CLONE. WHICH token is "the
+#      script" is a best-effort reading of the launcher's options, and nothing is launched on the strength of it.
+#   2. EXECUTION, only when the program is not a LAUNCHER. A launcher is a program that runs code named in its own arguments
+#      or environment: a shell (sh, bash, zsh, dash, ...), cmd, pwsh/powershell, python/py, node/deno/bun, perl/ruby/php/lua/
+#      Rscript/osascript, an env/xargs/nohup/timeout-style wrapper, a package tool (npm, pip, cargo, ...) or a build driver
+#      (make, ...). A launcher route that passes step 1 is `ROUTE_NOT_EXECUTED_LAUNCHER`: a skip, NOT a failure, so a card's
+#      `py -3 tools/x.py` still validates. It is NEVER launched, whatever its arguments (`pwsh <outside.ps1> -File <in-clone>`,
+#      `node -r <in-clone> <outside.js>`, `bash --rcfile <in-clone> <outside.sh>`, `python --check-hash-based-pycs default
+#      <outside.py>` and the other PR 479 repros are all launcher routes). Launching them is the separate later card
+#      CARD-ROUTE-EXERCISE-LAUNCHER-ALLOWLIST-1: exact shapes, a pinned (not PATH-shadowed) executable, and secondary execution
+#      inputs (preload flags, environment) have to be closed first.
+#
+# OUTCOMES, one line each: `ROUTE_OK|ROUTE_NOT_EXECUTED_LAUNCHER|ROUTE_MISSING|ROUTE_FAILED|ROUTE_TIMEOUT|ROUTE_UNSAFE <item> <command>`.
+#   OK        it ran and exited 0.
+#   NOT_EXECUTED_LAUNCHER  it is a launcher route that passed the static check; not run, not a failure.
+#   MISSING   the static check failed (the typed reasons above).
+#   FAILED    it ran and exited non-zero, or a placeholder was left unfilled, or the line does not parse.
+#   TIMEOUT   it ran past --timeout seconds; its whole process tree was killed (a Job Object on Windows, a process
+#             group on POSIX), so nothing outlives the call. Only the last 64 KiB of each output stream is kept.
+#   UNSAFE    it was NOT run: a route that is run must be offline, credential-free and confined to the scratch clone.
+#             Refused: a shell operator (pipe, `&&`, `;`, redirect); an environment-assignment prefix; a URL or `user@host:`
+#             remote in any argument; a credential assignment (`NAME=value` for ANTHROPIC_*, GH_*, *_TOKEN, *_KEY, *PASSWORD*,
+#             ...) or `--token`/`--password`; any `gh`; claude/codex `auth|login|logout`; a network client (curl, ssh, npx, ...);
+#             `find -exec`/`-delete`; and git other than the allowlisted read-only or scratch-local verbs (no push, pull, fetch,
+#             ls-remote, clone, remote, submodule, aliases), with no `-c`/`--config-env`, no `config` write, and
+#             `-C`/`--git-dir`/`--work-tree` only inside the scratch clone.
+#   LIVE BUS HUB RULING (r2, binding): "refuse if --bus resolves to the live clone" means NO ROUTE runs with its working
+#             directory, a `-C`/`--git-dir`/`--work-tree` target, or any argument or --fill value (also the value of
+#             `--opt=VALUE`) that resolves INSIDE the live bus. The default $FACTORY_BUS_CLONE is still cloned, read-only.
+#             Identity is decided on `os.path.realpath` + `normcase` (junctions, symlinks and 8.3 names followed, `..`
+#             collapsed, case folded, trailing separators dropped) and compared by containment: a route that does is
+#             ROUTE_UNSAFE, and a --scratch-root inside the bus is exit 2.
+# A route that IS run gets the interpreter-injection environment stripped (PYTHONPATH, PYTHONSTARTUP, PYTHONHOME, NODE_OPTIONS,
+# NODE_PATH, PERL5OPT, PERL5LIB, RUBYOPT, BASH_ENV, ENV) and every credential-shaped variable, git's user and system config and
+# every GIT_* variable (route_exercise_env).
+# A credential's value is never printed: a diagnostic, a ROUTE line or an error shows `NAME=<redacted>`.
+# Any outcome but OK and NOT_EXECUTED_LAUNCHER fails the run (exit 1). The commands run in `git clone --local --no-hardlinks`
+# of --bus (default $FACTORY_BUS_CLONE) with `origin` removed, under a scratch directory this tool creates and removes by name.
+# --bus is only READ, by that clone; no route runs in it. The scratch root may not be inside it (exit 2).
+# A bus clone behind its own origin/master prints a `ROUTE_BUS_STALE <behind>` warning on stderr; the exit is unchanged.
+
+ROUTE_LABEL_RE = re.compile(r"^[ \t]*(?:[-*][ \t]+)?(?:\*\*)?(?:route|adopt)(?:\*\*)?[ \t]*:(?:\*\*)?", re.I)
+ROUTE_FENCE_INFO_RE = re.compile(r"^route\b", re.I)
+ROUTE_SPAN_RE = re.compile(r"`([^`\n]+)`")
+ROUTE_HEADING_RE = re.compile(r"^ {0,3}#{1,6}\s")
+ROUTE_PLACEHOLDER_RE = re.compile(r"<([A-Za-z][\w.-]*)>")
+ROUTE_PROMPT_RE = re.compile(r"^[$>]\s+")
+ROUTE_SHELL_OPERATOR_RE = re.compile(r"^(?:&&|\|\||\||;|&|[0-9]?[<>]+.*)$")
+ROUTE_URL_RE = re.compile(r"^(?:[a-z][a-z0-9+.-]*://|[\w.-]+@[\w.-]+:)", re.I)
+ROUTE_CREDENTIAL_RE = re.compile(r"(?:ANTHROPIC_|CLAUDE_CODE_OAUTH|GITHUB_TOKEN|GH_TOKEN|API_KEY|AUTH_TOKEN|--token|--password)", re.I)
+_ROUTE_CRED_NAME = (r"(?:[^=\s'\"]*(?:TOKEN|PASSWORD|PASSWD|SECRET|CREDENTIAL|ANTHROPIC_|CLAUDE_CODE_OAUTH)[^=\s'\"]*"
+                    r"|[^=\s'\"]*[_-]KEY|(?:GH|GITHUB)_[^=\s'\"]*)")
+ROUTE_CRED_ASSIGN_RE = re.compile(rf"^{_ROUTE_CRED_NAME}=", re.I)
+ROUTE_CRED_ASSIGN_ANY_RE = re.compile(rf"(?P<name>{_ROUTE_CRED_NAME})=(?:\"[^\"]*\"|'[^']*'|\S*)", re.I)
+ROUTE_CRED_FLAG_RE = re.compile(r"(?P<flag>--(?:token|password)[\w-]*)(?P<sep>\s+)(?!<redacted>)(?:\"[^\"]*\"|'[^']*'|\S+)", re.I)
+ROUTE_URL_USERINFO_RE = re.compile(r"([a-z][a-z0-9+.-]*://)[^/\s@]+@", re.I)
+ROUTE_CRED_NAME_RE = re.compile(r"token|password|passwd|secret|credential|api[_-]?key|[_-]key$", re.I)
+ROUTE_ENV_PREFIX_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+ROUTE_NETWORK_CLIENTS = frozenset({"curl", "wget", "ssh", "scp", "sftp", "ftp", "rsync", "nc", "ncat", "telnet",
+                                   "invoke-webrequest", "iwr", "invoke-restmethod", "irm", "npx", "pnpx", "bunx", "uvx",
+                                   "apt", "apt-get", "brew", "choco", "winget", "scoop", "bitsadmin", "certutil"})
+ROUTE_WRAPPERS = frozenset({"cmd", "env", "sudo", "doas", "runas", "start", "wsl", "xargs", "nohup", "command", "exec", "eval",
+                            "nice", "ionice", "time", "timeout", "stdbuf", "setsid", "watch", "busybox", "wscript", "cscript",
+                            "mshta", "rundll32", "regsvr32", "forfiles", "schtasks", "call", "builtin", "conhost", "wt",
+                            "invoke-expression", "iex", "invoke-command", "icm", "start-process", "saps", "invoke-item", "ii"})
+ROUTE_PACKAGE_TOOLS = frozenset({"npm", "pnpm", "yarn", "bun", "pip", "pip3", "pipx", "uv", "poetry", "conda", "mamba", "twine",
+                                 "docker", "cargo", "gem", "dotnet", "nuget", "composer", "flit", "hatch"})
+ROUTE_FIND_RUNS = frozenset({"-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprintf", "-fls"})
+ROUTE_SHELLS = frozenset({"bash", "sh", "zsh", "dash", "ksh", "ash", "fish", "csh", "tcsh"})
+ROUTE_PYTHONS = frozenset({"python", "pythonw", "pypy", "py"})
+ROUTE_POWERSHELLS = frozenset({"pwsh", "powershell", "pwsh-preview"})
+ROUTE_INLINE_INTERPRETERS = {"ruby": {"-e"}, "perl": {"-e", "-E"}, "php": {"-r"}, "lua": {"-e"}, "rscript": {"-e"},
+                             "osascript": {"-e"}, "deno": {"eval"}, "bun": {"-e", "--eval", "-p", "--print"}}
+ROUTE_LAUNCHERS = (ROUTE_SHELLS | ROUTE_PYTHONS | ROUTE_POWERSHELLS | ROUTE_WRAPPERS | ROUTE_PACKAGE_TOOLS
+                   | frozenset(ROUTE_INLINE_INTERPRETERS)
+                   | {"node", "nodejs", "tclsh", "awk", "gawk", "mawk", "nawk", "make", "gmake", "mingw32-make", "cmake", "ninja", "msbuild"})
+ROUTE_GIT_ALLOWED = frozenset({
+    "log", "status", "show", "diff", "rev-parse", "rev-list", "ls-files", "ls-tree", "cat-file", "describe", "grep", "blame",
+    "shortlog", "merge-base", "for-each-ref", "show-ref", "name-rev", "diff-tree", "diff-index", "diff-files", "check-ignore",
+    "count-objects", "fsck", "version", "show-branch", "reflog", "branch", "tag", "add", "commit", "checkout", "switch",
+    "restore", "reset", "merge", "cherry-pick", "stash", "apply", "mv", "rm", "config"})
+ROUTE_GIT_CONFIG_READS = frozenset({"--get", "--get-all", "--get-regexp", "--get-urlmatch", "--list", "-l", "get", "list"})
+ROUTE_GIT_CONFIG_WRITES = frozenset({"--add", "--unset", "--unset-all", "--replace-all", "--edit", "-e", "--rename-section",
+                                     "--remove-section", "set", "unset", "edit", "rename-section", "remove-section"})
+ROUTE_GIT_RUNS_COMMANDS = frozenset({"--output", "--open-files-in-pager", "--upload-pack", "--receive-pack", "--exec", "--ext-diff"})
+ROUTE_STRIPPED_ENV_RE = re.compile(r"(?:TOKEN|SECRET|PASSWORD|API_?KEY|CREDENTIAL)|^(?:ANTHROPIC_|CLAUDE_CODE_|GH_|GIT_|GITHUB_)", re.I)
+ROUTE_INJECTION_ENV = frozenset({"PYTHONPATH", "PYTHONSTARTUP", "PYTHONHOME", "NODE_OPTIONS", "NODE_PATH", "PERL5OPT", "PERL5LIB",
+                                 "RUBYOPT", "BASH_ENV", "ENV"})
+ROUTE_SCRATCH_PREFIX = "outbox-exercise-"
+ROUTE_DEFAULT_TIMEOUT_S = 60.0
+ROUTE_OUTPUT_CAP_BYTES = 64 * 1024
+ROUTE_BUS_ENV = "FACTORY_BUS_CLONE"
+ROUTE_PASSING = ("ROUTE_OK", "ROUTE_NOT_EXECUTED_LAUNCHER")
+ROUTE_STATUSES = (*ROUTE_PASSING, "ROUTE_MISSING", "ROUTE_FAILED", "ROUTE_TIMEOUT", "ROUTE_UNSAFE")
+
+
+def extract_routes(body: str) -> list[str]:
+    """The route commands an item body names, in order and without repeats; the rule is the block comment above."""
+    routes: list[str] = []
+    fence: tuple[str, int, bool] | None = None
+    in_section = False
+
+    def add(command: str) -> None:
+        if command and command not in routes:
+            routes.append(command)
+
+    for raw in body.splitlines():
+        line = raw.rstrip("\r")
+        opened = _FENCE_OPEN_RE.match(line)
+        if fence is not None:
+            if opened and opened.group(1)[0] == fence[0] and len(opened.group(1)) >= fence[1] and not line.strip(" `~"):
+                fence = None
+            elif fence[2]:
+                command = ROUTE_PROMPT_RE.sub("", line.strip())
+                if command and not command.startswith("#"):
+                    add(command)
+            continue
+        if opened:
+            info = line.strip()[len(opened.group(1)):].strip()
+            fence = (opened.group(1)[0], len(opened.group(1)), bool(ROUTE_FENCE_INFO_RE.match(info)))
+            in_section = False
+            continue
+        if not line.strip() or ROUTE_HEADING_RE.match(line):
+            in_section = False
+            continue
+        if ROUTE_LABEL_RE.match(line):
+            in_section = True
+        if in_section:
+            for span in ROUTE_SPAN_RE.findall(line):
+                command = ROUTE_PROMPT_RE.sub("", span.strip())
+                if len(command.split()) >= 2:
+                    add(command)
+    return routes
+
+
+def route_program_name(program: str) -> str:
+    """The lower-case program name of an argv[0]: directory and `.exe/.cmd/.bat/.com/.ps1` dropped, a trailing version
+    dropped (`python3.12` and `python3` read as `python`, `perl5.36` as `perl`)."""
+    name = re.sub(r"\.(?:exe|cmd|bat|com|ps1)$", "", re.split(r"[\\/]", program)[-1].lower())
+    return re.sub(r"[\d.\-]+$", "", name) or name
+
+
+def route_is_launcher(argv: list[str]) -> bool:
+    """True when the route's program runs code named in its own arguments (ROUTE_LAUNCHERS). Such a route is never launched."""
+    return bool(argv) and route_program_name(argv[0]) in ROUTE_LAUNCHERS
+
+
+def route_secret_values(template: list[str], fills: dict[str, str]) -> list[str]:
+    """The --fill values bound to a credential, found on the TEMPLATE argv (before any value is substituted), so a value
+    with whitespace in it is one secret and never a run of tokens: every placeholder in a token that names a credential
+    (`NAME=<v>`, `--password=<v>`) or follows `--token`/`--password`, plus every fill whose own name reads as one."""
+    names = {n for n, v in fills.items() if v and ROUTE_CRED_NAME_RE.search(n)}
+    for i, tok in enumerate(template):
+        after_flag = i > 0 and re.fullmatch(r"--(?:token|password)[\w-]*", template[i - 1], re.I) is not None
+        if after_flag or ROUTE_CREDENTIAL_RE.search(tok) or ROUTE_CRED_ASSIGN_RE.match(tok):
+            names.update(m.group(1) for m in ROUTE_PLACEHOLDER_RE.finditer(tok))
+    values = {fills[n] for n in names if fills.get(n)}
+    for value in list(values):                   # a route may echo one line of a multi-line value, or one word of a multiword one
+        values.update(part for part in re.split(r"\s+", value) if len(part) >= 3)
+    return sorted(values, key=lambda v: (-len(v), v))
+
+
+def redact_secret_values(text: str, secrets: Iterable[str] = ()) -> str:
+    """`text` with every secret (route_secret_values) replaced by `<redacted>`, longest first, wherever it appears: as it
+    is, and as repr() writes it (a backslash doubled, a quote escaped), so a `!r` site cannot print what a plain one hides."""
+    forms = {form for x in secrets if x for form in (x, repr(x), repr(x)[1:-1]) if form}
+    for form in sorted(forms, key=len, reverse=True):
+        text = text.replace(form, "<redacted>")
+    return text
+
+
+def redact_route_text(text: str, secrets: Iterable[str] = ()) -> str:
+    """Route text as shown to a person: a credential assignment keeps its name and loses its value
+    (`GH_TOKEN=abc` -> `GH_TOKEN=<redacted>`), as do the value after `--token`/`--password` and the user-info of a URL.
+    `secrets` (route_secret_values) are replaced first, longest first, wherever they appear and whatever they contain."""
+    text = redact_secret_values(text, secrets)
+    text = ROUTE_CRED_ASSIGN_ANY_RE.sub(lambda m: f"{m.group('name')}=<redacted>", text)
+    text = ROUTE_CRED_FLAG_RE.sub(lambda m: f"{m.group('flag')}{m.group('sep')}<redacted>", text)
+    return ROUTE_URL_USERINFO_RE.sub(r"\1<redacted>@", text)
+
+
+def route_real_path(path: str, base: str | None = None) -> str:
+    """A path in the form two spellings of one place share: `~` and `..` collapsed, junctions/symlinks followed
+    (8.3 short names expand on Windows), case folded where the filesystem folds it, no trailing separator."""
+    expanded = os.path.expanduser(path)
+    if base is not None and not os.path.isabs(expanded):
+        expanded = os.path.join(base, expanded)
+    return os.path.normcase(os.path.realpath(expanded))
+
+
+def route_inside(path: str, root: str) -> bool:
+    """True when the already-normalized `path` is `root` or lies under it."""
+    return path == root or path.startswith(root.rstrip("\\/") + os.sep)
+
+
+def _route_path_candidates(tok: str) -> list[str]:
+    """What a token may name as a path: the token, and the part after `=` of `--opt=VALUE`."""
+    found = [tok]
+    if "=" in tok:
+        found.append(tok.split("=", 1)[1])
+    return [c for c in found if c and "\0" not in c]
+
+
+def route_live_bus_reason(argv: list[str], cwd: str, bus: str, secrets: Iterable[str] = ()) -> str | None:
+    """Why a route touches the live bus: its cwd, or any argument (or the value of `--opt=VALUE`) resolves inside it.
+    Decided on identity (real path, case-folded, `..` collapsed), so every spelling of the bus path is caught."""
+    live = route_real_path(bus)
+    if route_inside(route_real_path(cwd), live):
+        return "the route's working directory is inside the live bus"
+    for tok in argv:
+        for candidate in _route_path_candidates(tok):
+            try:
+                inside = route_inside(route_real_path(candidate, cwd), live)
+            except (OSError, ValueError):                       # not a path (`HEAD:master`): nothing to compare
+                continue
+            if inside:
+                return f"argument {redact_route_text(tok, secrets)!r} resolves inside the live bus; a route works in the scratch clone only"
+    return None
+
+
+def _route_git_unsafe(argv: list[str], cwd: str, secrets: Iterable[str] = ()) -> str | None:
+    """git: a read-only or scratch-local verb only (allowlist), no `-c`, no `--config-env`, no `config` write, and
+    `-C`/`--git-dir`/`--work-tree` only inside the scratch clone (`cwd`)."""
+    scratch = route_real_path(cwd)
+    here = cwd
+    i, sub = 1, None
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "-c":
+            return "git -c: a config override can smuggle in an alias, a helper or a pager"
+        if tok.startswith("--config-env") or tok.startswith("--exec-path"):
+            return f"git {tok.split('=', 1)[0]} changes what git runs"
+        target = None
+        if tok == "-C" and i + 1 < len(argv):
+            here = os.path.join(here, os.path.expanduser(argv[i + 1]))
+            target, i = here, i + 1
+        elif tok in ("--git-dir", "--work-tree", "--namespace", "--super-prefix", "--attr-source") and i + 1 < len(argv):
+            target, i = (argv[i + 1] if tok in ("--git-dir", "--work-tree") else None), i + 1
+            if target is not None:
+                target = os.path.join(here, os.path.expanduser(target))
+        elif tok.startswith(("--git-dir=", "--work-tree=")):
+            target = os.path.join(here, os.path.expanduser(tok.split("=", 1)[1]))
+        elif not tok.startswith("-"):
+            sub = tok
+            break
+        if target is not None:
+            try:
+                outside = not route_inside(route_real_path(target), scratch)
+            except (OSError, ValueError):
+                outside = True
+            if outside:
+                return f"git {tok} targets {redact_route_text(target, secrets)!r}, outside the scratch clone"
+        i += 1
+    if sub is None:
+        return None
+    if sub not in ROUTE_GIT_ALLOWED:
+        return f"git {sub} is not an allowlisted read-only or scratch-local verb (online verbs, publishing, aliases and unlisted verbs are never run)"
+    after = argv[i + 1:]
+    if sub == "config":
+        if not any(t in ROUTE_GIT_CONFIG_READS for t in after) or any(t in ROUTE_GIT_CONFIG_WRITES for t in after):
+            return "git config is read-only in a route (--get, --get-all, --get-regexp, --list)"
+    for tok in after:
+        if tok.split("=", 1)[0] in ROUTE_GIT_RUNS_COMMANDS or (sub == "grep" and tok.startswith("-O")):
+            return f"git {sub} {tok.split('=', 1)[0]} writes outside the scratch clone or runs another program"
+    return None
+
+
+def route_unsafe_reason(argv: list[str], cwd: str | os.PathLike | None = None, bus: str | os.PathLike | None = None,
+                        secrets: Iterable[str] = ()) -> str | None:
+    """Why a parsed route must not be RUN, or None. Asked only of a route whose program is not a launcher (a launcher route is
+    never run, so it needs no verdict); the list is in the block comment above. A diagnostic never carries a credential's
+    value (redact_route_text; `secrets` are the filled values bound to one, route_secret_values). `cwd` is the scratch clone
+    (default: the current directory) and `bus` the live bus, when known."""
+    if not argv:
+        return "empty command"
+    here = str(cwd) if cwd is not None else os.getcwd()
+    for tok in argv:
+        if ROUTE_SHELL_OPERATOR_RE.match(tok):
+            return f"shell operator {redact_route_text(tok, secrets)!r}: a route is one command, no shell"
+        if ROUTE_URL_RE.match(tok) or ROUTE_URL_RE.match(tok.split("=", 1)[-1]):
+            return f"network target {redact_route_text(tok, secrets)!r}: a route must run offline"
+        if ROUTE_CREDENTIAL_RE.search(tok) or ROUTE_CRED_ASSIGN_RE.match(tok):
+            shown = f"{tok.split('=', 1)[0]}=<redacted>" if ROUTE_CRED_ASSIGN_RE.match(tok) else redact_route_text(tok, secrets)
+            return f"credential {shown!r}: a route touches no credential"
+    if ROUTE_ENV_PREFIX_RE.match(argv[0]):
+        return "an environment assignment prefix is shell syntax; a route is one command, no shell"
+    name = route_program_name(argv[0])
+    rest = [t.lower() for t in argv[1:]]
+    if name in ROUTE_NETWORK_CLIENTS:
+        return f"{name} is a network client"
+    if name == "gh":
+        return "gh talks to GitHub"
+    if name in ("claude", "codex") and any(t in ("auth", "login", "logout") for t in rest):
+        return f"{name} auth is never run by a route"
+    if name == "find" and any(t in ROUTE_FIND_RUNS for t in rest):
+        return "find -exec/-delete runs or removes something else"
+    if name == "git":
+        reason = _route_git_unsafe(argv, here, secrets)
+        if reason:
+            return reason
+    if bus is not None:
+        return route_live_bus_reason(argv, here, str(bus), secrets)
+    return None
+
+
+def _route_flag_cluster(tok: str) -> str | None:
+    """The letters of a single-dash option cluster (`-Ic` -> `Ic`), or None for a long option or a non-option."""
+    return tok[1:] if len(tok) > 1 and tok[0] == "-" and tok[1] != "-" else None
+
+
+def _route_python_script(rest: list[str]) -> str | None:
+    """The script a python/py launcher names, past the options that take an operand (`-X utf8`, `-W ignore`,
+    `--check-hash-based-pycs default`); None when it runs a module (`-m`) or inline code (`-c`) or names no script."""
+    i = 0
+    while i < len(rest):
+        tok = rest[i]
+        cluster = _route_flag_cluster(tok)
+        if cluster is None:
+            if tok == "-":
+                return None
+            if tok.startswith("--"):
+                i += 2 if tok == "--check-hash-based-pycs" else 1
+                continue
+            return tok
+        for pos, ch in enumerate(cluster):
+            if ch in "mc":
+                return None
+            if ch in "WX":                                        # takes the rest of the cluster, or the next token
+                if pos == len(cluster) - 1:
+                    i += 1
+                break
+        i += 1
+    return None
+
+
+def _route_shell_script(rest: list[str]) -> str | None:
+    """bash/sh/zsh/...: the first operand past the options that take one (`-o pipefail`, `--rcfile f`); None for `-c` code."""
+    i = 0
+    while i < len(rest):
+        tok = rest[i]
+        if tok in ("-o", "+o", "-O", "+O", "--rcfile", "--init-file"):
+            i += 2
+            continue
+        cluster = _route_flag_cluster(tok)
+        if cluster is None:
+            if tok == "-":
+                return None
+            if tok.startswith("--"):
+                if tok.split("=", 1)[0] == "--command":
+                    return None
+                i += 1
+                continue
+            return tok
+        if "c" in cluster:
+            return None
+        i += 1
+    return None
+
+
+def _route_node_script(rest: list[str]) -> str | None:
+    """node: the first operand past the options that take one (`-r preload.js`, `--import x`); None for `-e`/`-p` code."""
+    i = 0
+    while i < len(rest):
+        tok = rest[i]
+        if tok in ("-r", "--require", "--import", "--loader", "--experimental-loader", "--input-type", "--conditions", "-C"):
+            i += 2
+            continue
+        cluster = _route_flag_cluster(tok)
+        if cluster is None:
+            if tok == "-":
+                return None
+            if tok.startswith("--"):
+                if tok.split("=", 1)[0] in ("--eval", "--print"):
+                    return None
+                i += 1
+                continue
+            return tok
+        if set(cluster) & {"e", "p"}:
+            return None
+        i += 1
+    return None
+
+
+def _route_generic_script(rest: list[str], inline: set[str]) -> str | None:
+    """perl/ruby/php/lua/Rscript/osascript: the first operand that is not an option; None for inline code."""
+    for tok in rest:
+        if tok in inline:
+            return None
+        if tok.startswith("-") and tok != "-":
+            continue
+        return None if tok == "-" else tok
+    return None
+
+
+def _powershell_flag(tok: str) -> str:
+    """The lowercase name of a PowerShell switch token (`-NoProfile`, `/f`, `--file`, `-f:x`), else ''. A `/`-led token
+    with another separator after it (`/tmp/x.ps1`) is a path, not a switch."""
+    if tok[:1] not in ("-", "/") or len(tok) < 2:
+        return ""
+    if tok[0] == "/" and re.search(r"[\\/]", tok[1:]):
+        return ""
+    return tok[1:].split(":", 1)[0].lower().lstrip("-")
+
+
+def _powershell_is_file_flag(tok: str) -> bool:
+    """True for every spelling PowerShell takes as -File: any prefix of it, either case, `-`/`/`/`--`."""
+    flag = _powershell_flag(tok)
+    return bool(flag) and "file".startswith(flag)
+
+
+ROUTE_PWSH_OPERAND_FLAGS = frozenset({"executionpolicy", "ep", "workingdirectory", "wd", "inputformat", "in", "if", "outputformat", "o",
+                                      "of", "windowstyle", "w", "configurationname", "config", "cfg", "settingsfile", "version", "v",
+                                      "custompipename"})
+
+
+def _route_powershell_script(rest: list[str]) -> str | None:
+    """pwsh/powershell: the FIRST of a bare operand (pwsh 7 reads the first bare argument as the script, an implicit -File) and
+    a `-File <script>` flag in any spelling; None for `-Command`/`-EncodedCommand` (inline code) and for no script at all."""
+    i = 0
+    while i < len(rest):
+        tok = rest[i]
+        flag = _powershell_flag(tok)
+        if not flag:
+            return tok
+        if _powershell_is_file_flag(tok):
+            if ":" in tok:
+                return tok.split(":", 1)[1] or None
+            return rest[i + 1] if i + 1 < len(rest) else None
+        if "command".startswith(flag) or "encodedcommand".startswith(flag) or "commandwithargs".startswith(flag) or flag == "ec":
+            return None
+        i += 2 if flag in ROUTE_PWSH_OPERAND_FLAGS else 1
+    return None
+
+
+def route_script_operand(argv: list[str]) -> str | None:
+    """The file a launcher route names as its script, for the STATIC existence check only (nothing is launched on its
+    strength); None when the route names none (a module, inline code, a wrapper, a program that is no interpreter)."""
+    name = route_program_name(argv[0])
+    rest = argv[1:]
+    if name in ROUTE_PYTHONS:
+        return _route_python_script(rest)
+    if name in ROUTE_SHELLS:
+        return _route_shell_script(rest)
+    if name in ("node", "nodejs"):
+        return _route_node_script(rest)
+    if name in ROUTE_POWERSHELLS:
+        return _route_powershell_script(rest)
+    if name in ROUTE_INLINE_INTERPRETERS and name not in ("deno", "bun"):
+        return _route_generic_script(rest, ROUTE_INLINE_INTERPRETERS[name])
+    return None
+
+
+def route_resolve_program(program: str, cwd: pathlib.Path) -> str | None:
+    """The file a route's program names: a path (relative to the scratch clone) when it holds a separator, else the first
+    match on PATH. None when there is none."""
+    if "/" in program or "\\" in program:
+        local = pathlib.Path(program)
+        if not local.is_absolute():
+            local = cwd / local
+        return str(local) if local.is_file() else shutil.which(str(local))
+    return shutil.which(program, path=os.environ.get("PATH"))
+
+
+def route_missing_reason(argv: list[str], cwd: pathlib.Path, launcher: bool | None = None) -> tuple[str, str] | None:
+    """The STATIC existence check; it runs nothing. (typed reason, text) when the route's program does not resolve, resolves
+    to a `.cmd`/`.bat` shim (only a route that will be RUN needs to start), or the script it names is not a file inside the
+    scratch clone (missing, or resolving outside it: an absolute path, `..` or an outward symlink or junction). None when
+    both exist."""
+    program = argv[0]
+    found = route_resolve_program(program, cwd)
+    if found is None:
+        return "PROGRAM_NOT_FOUND", f"{program}: no such program on PATH or in the scratch clone"
+    if launcher is None:
+        launcher = route_is_launcher(argv)
+    if not launcher and os.name == "nt" and found.lower().endswith((".cmd", ".bat")):
+        return "PROGRAM_IS_SHIM", (f"{program}: resolves to a {pathlib.PurePath(found).suffix.lower()} shim ({found}); "
+                                   "a shim is not exercisable without cmd /c, which a route may not use")
+    script = route_script_operand(argv)
+    if script is None:
+        return None
+    try:
+        real = (cwd / script).resolve(strict=False)                     # follows a symlink; an absolute `script` replaces cwd
+        inside = real.is_relative_to(cwd.resolve())                     # containment by path, never a string prefix
+        is_file = real.is_file()
+    except (OSError, ValueError):
+        return "SCRIPT_NOT_FOUND", f"{script}: no such script in the scratch clone"
+    if not inside:
+        return "SCRIPT_OUTSIDE_CLONE", f"{script}: resolves outside the scratch clone"
+    if not is_file:
+        return "SCRIPT_NOT_FOUND", f"{script}: no such script in the scratch clone"
+    return None
+
+
+def split_route(command: str) -> list[str]:
+    """A route line as argv, without a shell. POSIX quoting; on Windows non-POSIX shlex, so a backslash path
+    (`tools\\x.py`) stays whole, with the quotes then removed from each token."""
+    if os.name != "nt":
+        return shlex.split(command)
+    return [re.sub(r'"([^"]*)"|\'([^\']*)\'', lambda m: m.group(1) if m.group(1) is not None else m.group(2), tok)
+            for tok in shlex.split(command, posix=False)]
+
+
+def route_exercise_env(base: dict[str, str] | None = None) -> dict[str, str]:
+    """The environment a route that IS run gets: `base` (default: this process's) without the interpreter-injection variables
+    (ROUTE_INJECTION_ENV, any case: a startup hook or preload a launched interpreter would run), any credential-shaped variable
+    and every GIT_* variable, then git told to prompt for nothing and read no user or system config."""
+    source = os.environ if base is None else base
+    env = {k: v for k, v in source.items() if k.upper() not in ROUTE_INJECTION_ENV and not ROUTE_STRIPPED_ENV_RE.search(k)}
+    env.update({"GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull})
+    return env
+
+
+class _WinJob:
+    """A Windows Job Object that kills every process in it when closed (JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE), so a
+    timeout reaches the route's grandchildren, not just its direct child."""
+
+    def __init__(self, pid: int) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        class Basic(ctypes.Structure):
+            _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64), ("PerJobUserTimeLimit", ctypes.c_int64),
+                        ("LimitFlags", wintypes.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                        ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", wintypes.DWORD),
+                        ("Affinity", ctypes.c_size_t), ("PriorityClass", wintypes.DWORD), ("SchedulingClass", wintypes.DWORD)]
+
+        class IoCounters(ctypes.Structure):
+            _fields_ = [(n, ctypes.c_uint64) for n in ("Read", "Write", "Other", "ReadBytes", "WriteBytes", "OtherBytes")]
+
+        class Extended(ctypes.Structure):
+            _fields_ = [("Basic", Basic), ("Io", IoCounters), ("ProcessMemoryLimit", ctypes.c_size_t),
+                        ("JobMemoryLimit", ctypes.c_size_t), ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                        ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateJobObjectW.restype = wintypes.HANDLE
+        k32.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
+        k32.OpenProcess.restype = wintypes.HANDLE
+        k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD]
+        k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        self._k32 = k32
+        self._handle = k32.CreateJobObjectW(None, None)
+        if not self._handle:
+            raise OSError(ctypes.get_last_error(), "CreateJobObjectW failed")
+        info = Extended()
+        info.Basic.LimitFlags = 0x2000                                  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        process = None
+        try:
+            if not k32.SetInformationJobObject(self._handle, 9, ctypes.byref(info), ctypes.sizeof(info)):  # JobObjectExtendedLimitInformation
+                raise OSError(ctypes.get_last_error(), "SetInformationJobObject failed")
+            process = k32.OpenProcess(0x0100 | 0x0001, False, pid)      # PROCESS_SET_QUOTA | PROCESS_TERMINATE
+            if not process or not k32.AssignProcessToJobObject(self._handle, process):
+                raise OSError(ctypes.get_last_error(), "AssignProcessToJobObject failed")
+        except OSError:
+            self.close()
+            raise
+        finally:
+            if process:
+                k32.CloseHandle(process)
+
+    def close(self) -> None:
+        """Close the job; Windows kills whatever is still in it."""
+        if self._handle:
+            self._k32.CloseHandle(self._handle)
+            self._handle = None
+
+
+def _kill_route_tree(proc: subprocess.Popen, job: "_WinJob | None") -> None:
+    """End the route's process and every descendant it started, then reap the direct child."""
+    if os.name == "nt":
+        if job is not None:
+            job.close()
+        else:
+            try:
+                subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True, timeout=30)
+            except (OSError, subprocess.SubprocessError):
+                pass
+    else:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _drain_tail(stream, cap: int, sink: list) -> None:
+    """Read `stream` to EOF keeping only its last `cap` bytes, so a noisy route cannot grow memory without bound."""
+    tail = bytearray()
+    try:
+        while True:
+            chunk = stream.read(65536)
+            if not chunk:
+                break
+            tail += chunk
+            if len(tail) > cap:
+                del tail[:len(tail) - cap]
+    except (OSError, ValueError):
+        pass
+    sink.append(bytes(tail))
+
+
+def run_route_process(argv: list[str], cwd: pathlib.Path, env: dict[str, str], timeout: float) -> tuple[int | None, str, str]:
+    """Run one route to completion or `timeout`: (returncode, stdout tail, stderr tail); returncode None on timeout.
+    The ONLY place a route is launched. On timeout the whole process tree is killed (a Job Object on Windows, a process
+    group on POSIX), so no descendant outlives the call or keeps a pipe open. Only the last ROUTE_OUTPUT_CAP_BYTES of each
+    stream are kept."""
+    extra = {"start_new_session": True} if os.name != "nt" else {}
+    proc = subprocess.Popen(argv, cwd=str(cwd), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            env=env, bufsize=0, **extra)
+    job = None
+    if os.name == "nt":
+        try:
+            job = _WinJob(proc.pid)
+        except OSError:
+            job = None                                                  # falls back to taskkill /T on timeout
+    sinks: tuple[list, list] = ([], [])
+    readers = [threading.Thread(target=_drain_tail, args=(stream, ROUTE_OUTPUT_CAP_BYTES, sink), daemon=True)
+               for stream, sink in ((proc.stdout, sinks[0]), (proc.stderr, sinks[1]))]
+    for reader in readers:
+        reader.start()
+    deadline = time.monotonic() + timeout
+    timed_out = False
+    try:
+        proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+        for reader in readers:                                          # a descendant holding a pipe open counts against the same deadline
+            reader.join(max(0.0, deadline - time.monotonic()))
+        timed_out = any(reader.is_alive() for reader in readers)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+    finally:
+        if timed_out:
+            _kill_route_tree(proc, job)
+        elif job is not None:
+            job.close()                                                 # a clean run leaves nothing of its own running
+    for reader in readers:
+        reader.join(5)
+    out, err = ([s[0].decode("utf-8", "replace") if s else "" for s in sinks])
+    return (None if timed_out else proc.returncode), out, err
+
+
+def exercise_route(command: str, cwd: pathlib.Path, timeout: float, fills: dict[str, str],
+                   bus: pathlib.Path | None = None) -> tuple[str, str]:
+    """Check one route command against `cwd` (the scratch clone); return (ROUTE_* status, detail). Never raises for a route's
+    own failure. `bus` is the live bus: a route that would be run with its cwd or any argument inside it is ROUTE_UNSAFE.
+    No detail carries a credential's value."""
+    try:
+        argv = split_route(command)
+    except ValueError as e:
+        return "ROUTE_FAILED", f"does not parse as a command line: {e}"
+    secrets = route_secret_values(argv, fills)                          # decided on the template, before any value is substituted
+    status, detail = _exercise_route_argv(argv, cwd, timeout, fills, bus, secrets)
+    return status, redact_secret_values(detail, secrets)                # the one choke point: no branch below can print a credential
+
+
+def _exercise_route_argv(argv: list[str], cwd: pathlib.Path, timeout: float, fills: dict[str, str],
+                         bus: pathlib.Path | None, secrets: list[str]) -> tuple[str, str]:
+    """exercise_route past the parse; its detail is redacted once by the caller (redact_secret_values)."""
+    unfilled = next((m for tok in argv for m in ROUTE_PLACEHOLDER_RE.finditer(tok) if m.group(1) not in fills), None)
+    if unfilled:                                                        # judged on the template: a filled value is never a placeholder
+        return "ROUTE_FAILED", f"unfilled placeholder <{unfilled.group(1)}>; pass --fill {unfilled.group(1)}=VALUE"
+    # Fill after splitting, so a filled value (a Windows path with backslashes) is never re-parsed as shell text.
+    argv = [ROUTE_PLACEHOLDER_RE.sub(lambda m: fills[m.group(1)], tok) for tok in argv]
+    if not argv:
+        return "ROUTE_FAILED", "empty command"
+    launcher = route_is_launcher(argv)
+    if not launcher:                                                    # only a route that will be run needs a safety verdict
+        unsafe = route_unsafe_reason(argv, cwd, bus, secrets)
+        if unsafe:
+            return "ROUTE_UNSAFE", unsafe
+    missing = route_missing_reason(argv, cwd, launcher)                 # the static check: every route, nothing runs
+    if missing:
+        return "ROUTE_MISSING", f"{missing[0]}: {missing[1]}"
+    if launcher:
+        return "ROUTE_NOT_EXECUTED_LAUNCHER", (f"{route_program_name(argv[0])} is a launcher: its program and script exist, "
+                                              "and it is never run (CARD-ROUTE-EXERCISE-LAUNCHER-ALLOWLIST-1)")
+    resolved = route_resolve_program(argv[0], cwd)                      # run the file the static check resolved
+    argv = [resolved or argv[0], *argv[1:]]
+    try:
+        returncode, out, err = run_route_process(argv, cwd, route_exercise_env(), timeout)
+    except FileNotFoundError as e:
+        return "ROUTE_MISSING", f"PROGRAM_NOT_FOUND: {redact_route_text(str(e), secrets)}"
+    except OSError as e:
+        return "ROUTE_FAILED", f"could not start: {redact_route_text(str(e), secrets)}"
+    if returncode is None:
+        return "ROUTE_TIMEOUT", f"still running after {timeout:g}s; its process tree was killed"
+    if returncode != 0:
+        text = redact_route_text(err.strip() or out.strip(), secrets)      # whole output first: a value may span lines
+        shown = (text.splitlines()[-1:] or [""])[0]
+        return "ROUTE_FAILED", f"exit {returncode}: {shown[:200]}"
+    return "ROUTE_OK", ""
+
+
+def _writable_retry(func, path, _exc) -> None:
+    """rmtree error hook: git object files are read-only on Windows; make the entry writable and retry once."""
+    os.chmod(path, stat.S_IWRITE)
+    func(path)
+
+
+def remove_exercise_scratch(base: pathlib.Path, scratch_root: pathlib.Path) -> None:
+    """Remove the scratch directory THIS run made, by name: it must sit directly under `scratch_root`, carry the
+    run's prefix and be a real directory (not a link). Anything else is left alone."""
+    if (base.parent.resolve() != scratch_root.resolve() or not base.name.startswith(ROUTE_SCRATCH_PREFIX)
+            or base.is_symlink() or not base.is_dir()):
+        return
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(base, onexc=_writable_retry)
+    else:
+        shutil.rmtree(base, onerror=lambda f, p, e: _writable_retry(f, p, e))
+
+
+def make_exercise_scratch(bus: pathlib.Path, scratch_root: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path, str]:
+    """A scratch clone of the bus's committed tip: (scratch dir, clone, tip sha). The bus is read, never written,
+    and the scratch root may not be inside it. `origin` is removed so nothing in the clone can push back."""
+    if not (bus / ".git").exists() and not (bus / "HEAD").is_file():
+        raise Unknown("EXERCISE_BUS_NOT_A_REPO", f"{bus} is not a git repository")
+    if route_inside(route_real_path(str(scratch_root)), route_real_path(str(bus))):
+        raise Unknown("EXERCISE_SCRATCH_INSIDE_BUS", f"scratch root {scratch_root} is inside the bus {bus}; routes never run in the live bus")
+    scratch_root.mkdir(parents=True, exist_ok=True)
+    base = pathlib.Path(tempfile.mkdtemp(prefix=ROUTE_SCRATCH_PREFIX, dir=str(scratch_root)))
+    try:
+        clone = base / "bus"
+        proc = _run_git(base, ["clone", "--local", "--no-hardlinks", "-q", str(bus), str(clone)])
+        if proc.returncode != 0:
+            raise Unknown("EXERCISE_CLONE_FAILED", proc.stderr.strip()[:300])
+        git(clone, "remote", "remove", "origin")
+        return base, clone, git(clone, "rev-parse", "HEAD")
+    except BaseException:
+        remove_exercise_scratch(base, scratch_root)
+        raise
+
+
+def run_exercise(entries: list[tuple[str, dict]], bus: pathlib.Path | None, timeout: float,
+                 fills: dict[str, str], scratch_root: pathlib.Path | None) -> int:
+    """Check the routes of already-validated items (name, item); 0 when every route is ROUTE_OK or a launcher skip."""
+    plan = [(name, command) for name, item in entries for command in extract_routes(item["body"])]
+    for name, item in entries:
+        if not extract_routes(item["body"]):
+            _route_say(f"ROUTE_NONE {name} (names no route command)")
+    if not plan:
+        return 0
+    if bus is None:
+        env_bus = os.environ.get(ROUTE_BUS_ENV)
+        if not env_bus:
+            raise Unknown("EXERCISE_BUS_UNSET", f"pass --bus <bus clone> or set ${ROUTE_BUS_ENV}")
+        bus = pathlib.Path(env_bus)
+    root = scratch_root if scratch_root is not None else pathlib.Path(tempfile.gettempdir())
+    bus = bus.resolve()
+    base, clone, tip = make_exercise_scratch(bus, root)
+    ok = True
+    try:
+        _route_say(f"ROUTE_BUS {tip[:12]} (scratch clone of {bus.name}; commands run there, never in the bus)")
+        behind = bus_commits_behind_origin(bus)
+        if behind:
+            _route_say(f"ROUTE_BUS_STALE {behind} (the bus clone is {behind} commit(s) behind its origin as of its last fetch; "
+                       f"git pull --ff-only there, or a script removed upstream still reads ROUTE_OK)", sys.stderr)
+        fills = {"scratch": str(clone), **fills}                       # `<scratch>` names the scratch clone
+        for name, command in plan:
+            status, detail = exercise_route(command, clone, timeout, fills, bus)
+            _route_say(f"{status} {name} {redact_route_text(command)}")
+            if status != "ROUTE_OK":
+                _route_say(f"  {detail}", sys.stderr)
+            if status not in ROUTE_PASSING:
+                ok = False
+    finally:
+        remove_exercise_scratch(base, root)
+    return 0 if ok else 1
+
+
+def _route_say(line: str, stream=None) -> None:
+    """Print one line that cannot raise on a stream whose encoding lacks a character of it (a cp1252 pipe)."""
+    stream = stream or sys.stdout
+    encoding = getattr(stream, "encoding", None) or "utf-8"
+    print(line.encode(encoding, errors="replace").decode(encoding), file=stream)
+
+
+def bus_commits_behind_origin(bus: pathlib.Path) -> int:
+    """How many commits the bus clone's HEAD is behind its own origin/HEAD, origin/master or origin/main (the newest
+    of what its last fetch saw); 0 when none of those refs exists or the count cannot be read."""
+    for ref in ("refs/remotes/origin/HEAD", "refs/remotes/origin/master", "refs/remotes/origin/main"):
+        try:
+            if _run_git(bus, ["rev-parse", "--verify", "--quiet", ref]).returncode != 0:
+                continue
+            counted = _run_git(bus, ["rev-list", "--count", f"HEAD..{ref}"])
+        except (OSError, subprocess.SubprocessError):
+            return 0
+        if counted.returncode == 0 and counted.stdout.strip().isdigit():
+            return int(counted.stdout.strip())
+    return 0
+
+
 # ---------- CLI commands ----------
 
-def cmd_validate(paths: list[pathlib.Path], deny_terms: list[tuple[str, str]]) -> int:
+def cmd_validate(paths: list[pathlib.Path], deny_terms: list[tuple[str, str]],
+                 exercise: dict | None = None) -> int:
+    """Validate item files; with `exercise` (bus, timeout, fills, scratch_root) also check each valid item's routes."""
     ok = True
+    valid: list[tuple[str, dict]] = []
     concern_ids: dict[str, pathlib.Path] = {}
     for p in paths:
         try:
@@ -2358,6 +3200,10 @@ def cmd_validate(paths: list[pathlib.Path], deny_terms: list[tuple[str, str]]) -
             ok = False
             continue
         print(f"[doctrine-outbox] OK {p}: target={item['meta']['target']} kind={item['meta']['kind']}")
+        valid.append((p.name, item))
+    if exercise is not None:
+        if run_exercise(valid, **exercise) != 0:
+            ok = False
     return 0 if ok else 1
 
 
@@ -2393,6 +3239,17 @@ def build_parser() -> argparse.ArgumentParser:
     validate_p = sub.add_parser("validate", help="parse + screen one or more item files")
     validate_p.add_argument("items", nargs="+", type=pathlib.Path)
     validate_p.add_argument("--deny-file", type=pathlib.Path, default=None)
+    validate_p.add_argument("--exercise", action="store_true",
+                            help="also check every command each item names (see 'card routes') in a scratch clone of the bus: "
+                                 "existence for every route, execution only for a route that starts no launcher")
+    validate_p.add_argument("--bus", type=pathlib.Path, default=None,
+                            help=f"with --exercise: the bus clone to copy (default ${ROUTE_BUS_ENV}); read, never run in")
+    validate_p.add_argument("--timeout", type=float, default=ROUTE_DEFAULT_TIMEOUT_S,
+                            help="with --exercise: seconds before a route is ROUTE_TIMEOUT (default %(default)s)")
+    validate_p.add_argument("--fill", action="append", default=[], metavar="NAME=VALUE",
+                            help="with --exercise: the value for a <NAME> placeholder in a route (repeatable)")
+    validate_p.add_argument("--scratch-root", type=pathlib.Path, default=None,
+                            help="with --exercise: where the scratch clone is made and removed (default: the temp dir)")
 
     debt_p = sub.add_parser("debt", help="list unsent items; exit 1 if any, 2 if UNKNOWN")
     debt_p.add_argument("--ref", default=DEFAULT_REF)
@@ -2490,7 +3347,20 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.cmd == "validate":
             deny_terms = gather_deny_terms(resolve_deny_file(repo, args.deny_file))
-            return cmd_validate(args.items, deny_terms)
+            exercise = None
+            if args.exercise:
+                if not math.isfinite(args.timeout) or args.timeout <= 0:
+                    parser.error(f"--timeout wants a finite number of seconds above zero; got {args.timeout:g}")
+                fills: dict[str, str] = {}
+                for pair in args.fill:
+                    name, sep, value = pair.partition("=")
+                    if not sep or not name:
+                        parser.error("--fill wants NAME=VALUE; an argument without `=` was given (its text is not echoed: it may be a secret)")
+                    fills[name] = value
+                exercise = {"bus": args.bus, "timeout": args.timeout, "fills": fills, "scratch_root": args.scratch_root}
+            elif args.bus is not None or args.fill or args.scratch_root is not None:
+                parser.error("--bus, --fill and --scratch-root need --exercise")
+            return cmd_validate(args.items, deny_terms, exercise)
         if args.cmd == "debt":
             ledger = resolve_ledger(repo, args.ledger)
             bus = args.bus.resolve() if args.bus is not None else None

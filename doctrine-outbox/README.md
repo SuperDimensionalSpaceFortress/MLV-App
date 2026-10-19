@@ -75,6 +75,81 @@ pattern, a user-home path, this host's name or account name, or anything in an o
 adds its own deny terms: `.claude-state`, `subject-ledger`, `fleet-runs`, `HUB_RUN_WAL`, `dual-lane`, and
 the name of the GPU host. A refusal names the class, never the matched value.
 
+## Card routes are checked before they ship (CARD-ROUTE-EXERCISE-2)
+
+CoS work order FWO-DEFECT-PREVENT-1 item 3, in `validate --exercise`. It is fail-closed: it replaces the parked
+CARD-ROUTE-EXERCISE-1 (PR 479), whose launcher support relied on two hand-written walks over one command line (a safety
+matcher and a script discovery) that kept disagreeing about which script would run.
+
+`python tools/coordination/doctrine_outbox.py validate --exercise --bus <bus clone> doctrine-outbox/<file>.md` (the bus
+defaults to `$FACTORY_BUS_CLONE`) clones the bus's committed tip into a scratch directory with
+`git clone --local --no-hardlinks`, drops its `origin`, checks every command the item names there, without a shell, then
+removes that directory by name. The bus is only read. **"Refuse if `--bus` resolves to the live clone" means this (hub
+ruling, r2):** no route runs with its working directory, a `-C`/`--git-dir`/`--work-tree` target, or any argument or
+`--fill` value (also the value of `--opt=VALUE`) that resolves inside the live bus; that route is `ROUTE_UNSAFE`. A
+`--scratch-root` inside the bus is exit 2. "Inside" is decided on identity, not spelling: real path (junctions, symlinks
+and 8.3 names followed), `..` collapsed, case folded, trailing separators dropped. `<scratch>` in a route names the scratch
+clone. A bus clone behind its own `origin` prints `ROUTE_BUS_STALE <behind>` on stderr (the exit is unchanged). A command is:
+- a line of a fenced block whose info string starts `route` (`$ ` or `> ` prompt and `#` lines dropped); or
+- a backticked span of two or more words inside a route section, which opens at a `Route:` or `Adopt:` label
+  line (bullet and bold allowed) and runs to the next blank line, `#` heading or fence. Bullets right under it,
+  such as `- **Pin:**`, are in the section. A one-word span (`debt`, `RULINGS.md`) is a name, not a command.
+
+**Every route gets a static existence check, which runs nothing.** Its program must resolve on `PATH` or inside the
+clone, and when it names a script (`python`/`py`, `node`, a shell, `pwsh -File`, `perl`, `ruby`, `php`, ...) that script must
+be a file inside the clone, symlinks and junctions followed. A miss is `ROUTE_MISSING` with a typed reason first in its
+detail: `PROGRAM_NOT_FOUND`, `PROGRAM_IS_SHIM` (a `.cmd`/`.bat` shim cannot start without `cmd /c`), `SCRIPT_NOT_FOUND` or
+`SCRIPT_OUTSIDE_CLONE` (an absolute path, a `..` path or an outward link). This covers the #468 and #469 evidence: a
+nonexistent runner script, and a `doctrine-sync debt` no bus carries.
+
+**Only a route whose program is not a launcher is run.** A launcher is a program that runs code named in its own arguments
+or environment: `sh`, `bash`, `zsh`, `dash`, `cmd`, `pwsh`, `powershell`, `python`, `python3`, `py`, `node`, `deno`, `perl`,
+`ruby`, `php`, an `env`/`xargs`/`nohup`/`timeout`-style wrapper, a package tool (`npm`, `pip`, `cargo`, ...) or a build
+driver (`make`, ...). A launcher route that passes the static check is **existence-checked but not executed**: it prints
+`ROUTE_NOT_EXECUTED_LAUNCHER`, which is a skip and not a failure (so a card's `py -3 tools/x.py` still validates), and it
+is never launched, whatever its arguments. Launching launcher routes is the separate later card
+CARD-ROUTE-EXERCISE-LAUNCHER-ALLOWLIST-1: exact shapes, a pinned (not `PATH`-shadowed) executable and the secondary
+execution inputs (preload flags, environment) have to be closed first. Because nothing launches on the strength of the
+static check's reading of a launcher's options, the PR 479 bypass class (a check that accepts one script while the
+launcher runs another) cannot reach a launch. Each known repro has an acceptance test row that mocks the process launch and
+asserts it is not called:
+
+| Repro (all launcher routes) | Outcome |
+|---|---|
+| B1: `python <outside script that exists>` | `ROUTE_MISSING SCRIPT_OUTSIDE_CLONE`, not launched |
+| `pwsh -f <outside>` (and `-fi`, `-File:`, `/f`) | `ROUTE_MISSING SCRIPT_OUTSIDE_CLONE`, not launched |
+| `pwsh <outside.ps1> -File <in-clone>` (pwsh 7 runs the first bare argument) | `ROUTE_MISSING SCRIPT_OUTSIDE_CLONE`, not launched |
+| `pwsh -NoProfile <outside.ps1> -f` | `ROUTE_MISSING SCRIPT_OUTSIDE_CLONE`, not launched |
+| `node -r <in-clone> <outside.js>` | `ROUTE_MISSING SCRIPT_OUTSIDE_CLONE`, not launched |
+| `bash --rcfile <in-clone> <outside.sh>` | `ROUTE_MISSING SCRIPT_OUTSIDE_CLONE`, not launched |
+| `bash -o x <outside.sh>` | `ROUTE_MISSING SCRIPT_OUTSIDE_CLONE`, not launched |
+| `python --check-hash-based-pycs default <outside.py>` | `ROUTE_MISSING SCRIPT_OUTSIDE_CLONE`, not launched |
+
+A second row set forces the static check to pass everything and shows each repro is still `ROUTE_NOT_EXECUTED_LAUNCHER`
+and still not launched.
+
+A route that is run (`git`, `pytest`, `jq`, ...) gets the interpreter-injection environment stripped: `PYTHONPATH`,
+`PYTHONSTARTUP`, `PYTHONHOME`, `NODE_OPTIONS`, `NODE_PATH`, `PERL5OPT`, `PERL5LIB`, `RUBYOPT`, `BASH_ENV` and `ENV`, plus
+credential-shaped variables, user and system git config and every `GIT_*` variable. It must be exercisable offline and
+only in the scratch clone, so these are `ROUTE_UNSAFE` and are not run:
+- a shell operator (pipe, redirect, `&&`, `;`) or an environment-assignment prefix;
+- git other than an allowlisted read-only or scratch-local verb (`log`, `status`, `show`, `diff`, `rev-parse`,
+  `commit`, `checkout`, ... but never `push`, `pull`, `fetch`, `ls-remote`, `clone`, `remote`, `submodule` or an
+  alias), `git -c`, `--config-env`, a `git config` write, and `-C`/`--git-dir`/`--work-tree` outside the scratch clone;
+- any `gh`, `claude`/`codex` `auth|login|logout`, a network client (`curl`, `ssh`, `npx`, ...), `find -exec`, a URL or
+  `user@host:` argument, and a credential assignment (`GH_TOKEN=`, `ANTHROPIC_*=`, `*_TOKEN=`, `*_KEY=`, `*PASSWORD*=`)
+  or `--token`.
+
+Each route prints one `ROUTE_OK`, `ROUTE_NOT_EXECUTED_LAUNCHER`, `ROUTE_MISSING`, `ROUTE_FAILED` (non-zero exit, an
+unfilled `<name>` placeholder, or it does not parse), `ROUTE_TIMEOUT` (`--timeout`, default 60 s; the whole process tree
+is killed, via a Job Object on Windows and a process group on POSIX) or `ROUTE_UNSAFE` line, then the item name and the
+command. Anything but the first two exits 1. Only the last 64 KiB of a route's output is kept. Route text is split like a
+POSIX shell (on Windows a backslash path stays whole). Give `<name>` placeholders a value with `--fill name=VALUE`.
+`--timeout` must be a finite number of seconds above zero; `nan`, `inf`, `0` and a negative value are refused before any
+route runs. A credential's value is never printed: it shows as `NAME=<redacted>` in every diagnostic and route line, whatever
+it contains, in the form it was filled and in the form `repr()` writes it. Put a command a card ships but the bus does not
+yet have in prose, not in a route.
+
 ## Concerns to the CoS (COS-CONCERN-CHANNEL-1)
 
 A project had no way to tell the CoS a concern: only the CoS writes `cos-feedback/`, and a project-owned
