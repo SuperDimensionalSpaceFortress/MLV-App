@@ -627,6 +627,7 @@ function Invoke-RetireLaneWorktree {
         $o = & git.exe -C $C @A 2>&1
         [pscustomobject]@{ code = $LASTEXITCODE; out = @($o | ForEach-Object { "$_" }) }
     }
+    $wd = $null
     try {
         if (-not (Test-Path -LiteralPath $WorkDir -PathType Container)) { $d.action = 'skipped'; $d.reason = 'not-a-linked-worktree: path absent'; return [pscustomobject]$d }
         $wd = (Resolve-Path -LiteralPath $WorkDir).Path.TrimEnd('\')
@@ -639,6 +640,9 @@ function Invoke-RetireLaneWorktree {
         $main = Split-Path -Parent ($cd.out[0] -replace '/', '\')
         # HOST-FSMONITOR-DAEMON-LEAK-1 (a): off BEFORE the gate's own `status` calls, which would otherwise start a daemon in a worktree kept for any reason.
         if (Get-Command Disable-LaneWorktreeFsmonitor -ErrorAction SilentlyContinue) { $null = Disable-LaneWorktreeFsmonitor -WorkDir $wd }
+        # LANE-FSMONITOR-PIN-AND-RETIRE-HARDENING-1: a daemon already running here (a worktree that predates the fix) survives every path below that KEEPS the
+        # worktree, so stop it now, before the gate; the finally further down repeats it for a daemon the gate's own status started when the disable was skipped.
+        if (Get-Command Stop-LaneWorktreeFsmonitor -ErrorAction SilentlyContinue) { $null = Stop-LaneWorktreeFsmonitor -WorkDir $wd }
 
         $h = Run-Git $wd @('rev-parse', 'HEAD'); if ($h.code) { $d.reason = 'cannot-determine: rev-parse HEAD'; return [pscustomobject]$d }
         $d.head = $h.out[0]
@@ -711,6 +715,11 @@ function Invoke-RetireLaneWorktree {
         $d.action = 'retired'; $d.reason = 'ok'
     } catch {
         $d.action = 'kept'; $d.reason = "cannot-determine: $($_.Exception.Message)"
+    } finally {
+        # Every path that leaves the worktree standing (kept, would-retire) ends with no daemon in it; a retired worktree is gone. Best effort, never throws.
+        if ($wd -and $d.action -ne 'retired' -and $d.action -ne 'skipped' -and (Get-Command Stop-LaneWorktreeFsmonitor -ErrorAction SilentlyContinue)) {
+            try { $null = Stop-LaneWorktreeFsmonitor -WorkDir $wd } catch { }
+        }
     }
     return [pscustomobject]$d
 }

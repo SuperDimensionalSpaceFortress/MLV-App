@@ -4441,10 +4441,51 @@ FSMON_DISABLE_LINE = "$null = Disable-LaneWorktreeFsmonitor -WorkDir $WorkDir"
 FSMON_INSERT_BEFORE = "try {\n    . (Join-Path $PSScriptRoot 'lane-fsmonitor.ps1')"
 
 
+# Every way Invoke-Lane.ps1 starts git: `& git`, `& git.exe`, `& $gitExe`, a bare `git ...` command, Start-Process, cmd /c, Invoke-Expression, a
+# ProcessStartInfo whose FileName is git, Process.Start('git'). A helper that wraps one of these (Invoke-GitCaptureUtf8, and whatever calls it) is git
+# too, found by name below, so a call through a helper counts like the raw shape.
+FSMON_GIT_SHAPES = (
+    r"&[ \t]*['\"]?[^\s'\"|;)]*\bgit(?:\.exe)?['\"]?(?=[\s;)|]|$)",
+    r"&[ \t]*\$\w*git\w*\b",
+    r"(?:^|[;{(|])[ \t]*git(?:\.exe)?[ \t]+[-\w]",
+    r"\bStart-Process\b[^\n]*\bgit\b",
+    r"\b(?:cmd|cmd\.exe)[ \t]+/c\b[^\n]*\bgit\b",
+    r"\bInvoke-Expression\b[^\n]*\bgit\b",
+    r"\bProcess\]::Start\([ \t]*['\"][^'\"]*git",
+    r"\.FileName[ \t]*=[ \t]*['\"][^'\"]*\bgit(?:\.exe)?['\"]",
+)
+FSMON_GIT_RE = re.compile("|".join("(?:%s)" % s for s in FSMON_GIT_SHAPES), re.M | re.I)
+FSMON_FUNCTION_RE = re.compile(r"^function[ \t]+([\w-]+)\b[^\n]*?(?:\{[ \t]*\n.*?^\}[ \t]*$|\{[^\n]*\}[ \t]*$)", re.M | re.S)
+
+
+def fsmon_blank(text, pattern, flags=0):
+    """Replace every match with spaces, keeping newlines, so offsets in the result are offsets in the original."""
+    return re.sub(pattern, lambda m: re.sub(r"[^\n]", " ", m.group(0)), text, flags=flags)
+
+
+def fsmon_git_invocation_offsets(lane_text):
+    """Offsets of the top-level (outside any function body) lines of a PowerShell script that start git, directly or through a helper."""
+    code = fsmon_blank(lane_text, r"<#.*?#>", re.S)
+    code = fsmon_blank(code, r"@(['\"])[ \t]*\n.*?\n\1@", re.S)
+    code = fsmon_blank(code, r"^[ \t]*#[^\n]*", re.M)
+    bodies = {m.group(1): m.group(0) for m in FSMON_FUNCTION_RE.finditer(code)}
+    wrappers = {n for n, b in bodies.items() if FSMON_GIT_RE.search(b)}
+    while True:
+        more = {n for n, b in bodies.items() if n not in wrappers and any(re.search(r"(?<![\w-])%s(?![\w-])" % re.escape(w), b) for w in wrappers)}
+        if not more:
+            break
+        wrappers |= more
+    top = fsmon_blank(code, FSMON_FUNCTION_RE.pattern, FSMON_FUNCTION_RE.flags)
+    hits = [m.start() for m in FSMON_GIT_RE.finditer(top)]
+    for w in wrappers:
+        hits += [m.start() for m in re.finditer(r"(?<![\w-])%s(?![\w-])" % re.escape(w), top)]
+    return sorted(hits)
+
+
 def fsmon_lane_pin_violation(lane_text):
     disable = lane_text.index(FSMON_DISABLE_LINE)
-    first_git = re.search(r"^\$\w+\s*=\s*Invoke-GitCaptureUtf8\b", lane_text, re.M)
-    return first_git is None or first_git.start() < disable
+    hits = fsmon_git_invocation_offsets(lane_text)
+    return not hits or hits[0] < disable
 
 
 def test_fsmonitor_lane_pin_accepts_the_shipped_invoke_lane():

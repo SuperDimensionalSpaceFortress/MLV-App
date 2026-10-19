@@ -2144,6 +2144,9 @@ if (-not $NoWorktreeSweep) {
         $worktreeSweep = [ordered]@{ error = "cannot-determine: $($_.Exception.Message)" }
     }
 }
+# LANE-FSMONITOR-PIN-AND-RETIRE-HARDENING-1: a worktree this lane leaves standing must not keep a daemon. Without extensions.worktreeConfig the launch-time
+# disable is skipped, so the lane's own status restarted the daemon that was stopped at launch. Fail-soft; a no-op once the worktree is retired (path absent).
+try { $null = Stop-LaneWorktreeFsmonitor -WorkDir $WorkDir } catch { }
 # `processEnded` records that the child exited; `complete` records POSITIVE evidence that the WORK
 # finished (exit 0 and, for claude, a success envelope). Until 2026-09-14 `complete` meant only the
 # former, so an exit-1 error_max_turns run was receipted state=complete, complete=true.
