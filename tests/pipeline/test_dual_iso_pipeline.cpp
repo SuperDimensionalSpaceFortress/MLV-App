@@ -12448,7 +12448,13 @@ TEST(DualIsoPipeline, Processed8InvalidationRejectsInFlightOldGenerationStoreAnd
  * the mutex; if the worker cleared pending first, the unfixed waiter would see
  * idle and return promptly, and this test could not fail. A signal the waiter
  * absorbs only re-parks it (pending is still 1), so the next one is sent until
- * the worker has consumed the armed failure, and nothing is sent after it. */
+ * the worker has consumed the armed failure, and nothing is sent after it.
+ *
+ * The waiter is parked before the request exists, on a test-held worker_busy:
+ * the worker's own loop waits on pending alone, so it stays parked, and a
+ * worker that has not yet re-parked after the idle wait cannot consume the
+ * failure before the waiter is waiting. pending=1 and busy=0 are then set in
+ * one critical section, leaving the waiter parked on the pending request. */
 TEST(DualIsoPipeline, Processed8PrefetchIdleWaitWakesWhenWorkerPrepareFails)
 {
     MLVAPP_TEST_SETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH", "1");
@@ -12472,11 +12478,11 @@ TEST(DualIsoPipeline, Processed8PrefetchIdleWaitWakesWhenWorkerPrepareFails)
     (void)fixture.renderFrame8Scaled(0, 1, 4);
     ASSERT_TRUE(waitForProcessed8PrefetchIdleOrHang(fixture.video()));
 
-    /* Arm one worker prepare failure and a pending request without waking the
-     * worker, so the waiter parks on pending alone. */
+    /* Arm one worker prepare failure; the worker only consumes it on a pending
+     * request, and none exists yet. */
     mlvSetProcessed8PrefetchPrepareFailuresForTesting(fixture.video(), 1);
     pthread_mutex_lock(&fixture.video()->processed8_prefetch_mutex);
-    fixture.video()->processed8_prefetch_request_pending = 1;
+    fixture.video()->processed8_prefetch_worker_busy = 1;
     pthread_mutex_unlock(&fixture.video()->processed8_prefetch_mutex);
 
     int waiter_result = 0;
@@ -12486,18 +12492,29 @@ TEST(DualIsoPipeline, Processed8PrefetchIdleWaitWakesWhenWorkerPrepareFails)
     });
 
     bool waiter_is_blocked = false;
-    int armed_when_blocked = -1;
     for (int attempt = 0; attempt < 5000 && !waiter_is_blocked; ++attempt)
     {
         pthread_mutex_lock(&fixture.video()->processed8_prefetch_mutex);
         waiter_is_blocked = fixture.video()->processed8_prefetch_test_idle_waiters > 0;
-        armed_when_blocked = fixture.video()->processed8_prefetch_test_prepare_failures;
         pthread_mutex_unlock(&fixture.video()->processed8_prefetch_mutex);
         if (!waiter_is_blocked)
         {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
     }
+
+    /* Hand the waiter's predicate from the test-held busy to the pending
+     * request in one critical section, without waking anyone. */
+    int armed_when_blocked = -1;
+    pthread_mutex_lock(&fixture.video()->processed8_prefetch_mutex);
+    if (waiter_is_blocked)
+    {
+        waiter_is_blocked = fixture.video()->processed8_prefetch_test_idle_waiters > 0;
+        armed_when_blocked = fixture.video()->processed8_prefetch_test_prepare_failures;
+        fixture.video()->processed8_prefetch_request_pending = 1;
+    }
+    fixture.video()->processed8_prefetch_worker_busy = 0;
+    pthread_mutex_unlock(&fixture.video()->processed8_prefetch_mutex);
 
     /* Wake the worker; stop as soon as it has taken the prepare-failure path. */
     int failures_left = -1;
@@ -12535,8 +12552,9 @@ TEST(DualIsoPipeline, Processed8PrefetchIdleWaitWakesWhenWorkerPrepareFails)
                  failures_left);
 
     ASSERT_TRUE(waiter_is_blocked);
-    /* Inconclusive guard: the worker must not consume the failure before the
-     * waiter parks, or the waiter never waits on the cleared request. */
+    /* Inconclusive guard: the failure was still armed when the pending request
+     * appeared under a waiter already parked, so the waiter waits on the very
+     * request the failure path clears. */
     ASSERT_EQ(1, armed_when_blocked);
     /* The worker really took the prepare-failure path. */
     ASSERT_EQ(0, failures_left);
