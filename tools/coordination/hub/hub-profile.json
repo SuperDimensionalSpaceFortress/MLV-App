@@ -1,0 +1,12 @@
+{
+  "schema": "hub-profile.v1",
+  "project": "mlv-app",
+  "boardRoot": "C:\\!Layi Wkspc\\MLV-App",
+  "repoSlug": "SuperDimensionalSpaceFortress/MLV-App",
+  "repoAliases": ["layibabalola/MLV-App"],
+  "ownerLogin": "layibabalola",
+  "busRoot": "C:\\!Layi Wkspc\\softwarefactory-fleet-doctrine",
+  "busRef": "origin/master",
+  "cosFeedbackPath": "cos-feedback/mlv-app",
+  "cosOpenAsksOutFile": ".claude-state/heartbeat/cos-open-asks.md"
+}

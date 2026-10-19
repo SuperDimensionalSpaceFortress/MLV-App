@@ -923,7 +923,7 @@ class RepoHygieneTests(unittest.TestCase):
         bridge_workflow = (ROOT / ".github" / "workflows" / "factory-bridge.yml").read_text(
             encoding="utf-8"
         )
-        self.assertEqual(workflow.count('python-version-file: ".python-version"'), 6)
+        self.assertEqual(workflow.count('python-version-file: ".python-version"'), 8)
         self.assertEqual(bridge_workflow.count('python-version-file: ".python-version"'), 1)
         # The moved job retains the same locked dependency policy; count both
         # reviewed workflow surfaces so relocation cannot weaken its checks.
@@ -942,7 +942,7 @@ class RepoHygieneTests(unittest.TestCase):
             for line in workflow.splitlines()
             if "-m pip install " in line
         ]
-        self.assertEqual(len(install_lines), 13)
+        self.assertEqual(len(install_lines), 17)
         for line in install_lines:
             for required_flag in (
                 "--disable-pip-version-check",
@@ -954,7 +954,7 @@ class RepoHygieneTests(unittest.TestCase):
                 self.assertIn(required_flag, line, f"unsafe Python install command: {line}")
             lock_path = line.rsplit(" -r ", 1)[1].strip()
             self.assertIn(lock_path, allowed_locks, f"unapproved Python lock: {lock_path}")
-        self.assertEqual(workflow.count("python -m pip check"), 6)
+        self.assertEqual(workflow.count("python -m pip check"), 8)
 
         observed_locks: dict[str, dict[str, str]] = {}
         for relative_path, roots in PYTHON_LOCK_ROOTS.items():
@@ -1059,7 +1059,9 @@ class RepoHygieneTests(unittest.TestCase):
             "protected-check-route": 10,
             "repo-hygiene-python-ubuntu-shard": 30,
             "repo-hygiene-python": 5,
-            "repo-hygiene-python-windows-shard": 40,
+            "repo-hygiene-python-windows-shard": 50,
+            "repo-hygiene-python-windows-containment": 45,
+            "repo-hygiene-python-windows-coordination-heavy": 45,
             "repo-hygiene-python-windows": 5,
             "windows-product-oracles-part": 60,
             "windows-product-oracles": 5,
@@ -1074,7 +1076,7 @@ class RepoHygieneTests(unittest.TestCase):
         expected_remote_uses = [
             ("actions/checkout", "fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09", "v5"),
             ("actions/setup-python", "ece7cb06caefa5fff74198d8649806c4678c61a1", "v6"),
-        ] * 6 + [
+        ] * 8 + [
             ("actions/upload-artifact", "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a", "v7"),
         ] * 3
         uses_entries = []
@@ -1113,7 +1115,7 @@ class RepoHygieneTests(unittest.TestCase):
             r"\s+persist-credentials: false\s*$",
             workflow,
         )
-        self.assertEqual(len(checkout_blocks), 6)
+        self.assertEqual(len(checkout_blocks), 8)
 
         aqt_steps = re.findall(
             r"(?ms)^      - name: Install Qt 6\.10\.2 \+ MinGW 13\.1\r?\n"
@@ -1284,7 +1286,20 @@ class RepoHygieneTests(unittest.TestCase):
                 self.assertIn(
                     f"    name: Repo Hygiene Python ({os_name}-latest)\n", aggregator.replace("\r\n", "\n")
                 )
-                self.assertIn(f"    needs: {shard_id}", aggregator)
+                if os_name == "windows":
+                    # The lane containment job gates the same required check as the shards.
+                    self.assertIn(
+                        f"    needs: [{shard_id}, repo-hygiene-python-windows-containment, "
+                        "repo-hygiene-python-windows-coordination-heavy]",
+                        aggregator,
+                    )
+                    self.assertIn("needs.repo-hygiene-python-windows-containment.result", aggregator)
+                    self.assertIn('test "$CONTAINMENT_RESULT" = "success"', aggregator)
+                    # So does the heavy coordination job.
+                    self.assertIn("needs.repo-hygiene-python-windows-coordination-heavy.result", aggregator)
+                    self.assertIn('test "$HEAVY_RESULT" = "success"', aggregator)
+                else:
+                    self.assertIn(f"    needs: {shard_id}", aggregator)
                 self.assertIn(f"needs.{shard_id}.result", aggregator)
                 self.assertIn('test "$SHARDS_RESULT" = "success"', aggregator)
                 self.assertIn("    if: ${{ always() }}", aggregator.replace("\r\n", "\n"))
@@ -1336,6 +1351,117 @@ class RepoHygieneTests(unittest.TestCase):
         ):
             block = windows_shard[windows_shard.index(f"- name: {step}") :].split("\n      - ")[0]
             self.assertIn(f"if: matrix.shard == {windows_tail}", block)
+
+    def test_lane_containment_runs_in_exactly_one_windows_job(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "tests.yml").read_text(encoding="utf-8").replace("\r\n", "\n")
+        containment_id = "repo-hygiene-python-windows-containment"
+        containment_path = "tests\\coordination\\test_lane_containment.py"
+        shard_job = self._workflow_job(workflow, "repo-hygiene-python-windows-shard")
+        containment_job = self._workflow_job(workflow, containment_id)
+
+        def strip_comments(text: str) -> str:
+            return re.sub(r"(?m)^\s*#.*$", "", text)
+
+        # Shard 8 ignores exactly the file the containment job runs.
+        heavy_paths = [
+            "tests\\coordination\\test_doctrine_outbox.py",
+            "tests\\coordination\\test_doctrine_outbox_concerns.py",
+            "tests\\coordination\\test_doctrine_outbox_hooks.py",
+            "tests\\coordination\\test_retire_lane_worktree.py",
+        ]
+        self.assertEqual(
+            re.findall(r"--ignore=(\S+)", strip_comments(shard_job)), [containment_path, *heavy_paths]
+        )
+        self.assertEqual(re.findall(r"pytest (\S+)", strip_comments(containment_job)), [containment_path])
+
+        # Exactly one job collects the file: it is named as a run target, or its directory is
+        # a run target and it is not ignored.
+        jobs_text = workflow[workflow.index("\njobs:") :]
+        job_ids = re.findall(r"(?m)^  ([a-z0-9-]+):\r?$", jobs_text)
+        self.assertIn(containment_id, job_ids)
+        collectors = []
+        for job_id in job_ids:
+            tokens = strip_comments(self._workflow_job(workflow, job_id)).replace("`", " ").split()
+            ignored = f"--ignore={containment_path}" in tokens
+            if containment_path in tokens or ("tests\\coordination" in tokens and not ignored):
+                collectors.append(job_id)
+        self.assertEqual(collectors, [containment_id])
+
+        # Same setup as a shard: the pinned checkout and setup-python SHAs and the same
+        # requirement files, byte for byte, up to the job's own work.
+        def setup_steps(job: str, first_own_step: str) -> str:
+            return job[job.index("      - uses: actions/checkout@") : job.index(first_own_step)]
+
+        self.assertEqual(
+            setup_steps(containment_job, "      - name: Run lane containment tests"),
+            setup_steps(shard_job, "      - name: Prove the unittest shards cover every discovered test"),
+        )
+        # A condition would let the job skip, and the aggregate would then be the only guard.
+        self.assertNotRegex(strip_comments(containment_job), r"(?m)^    if:")
+
+    def test_heavy_coordination_files_run_in_exactly_one_windows_job(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "tests.yml").read_text(encoding="utf-8").replace("\r\n", "\n")
+        heavy_id = "repo-hygiene-python-windows-coordination-heavy"
+        heavy_paths = [
+            "tests\\coordination\\test_doctrine_outbox.py",
+            "tests\\coordination\\test_doctrine_outbox_concerns.py",
+            "tests\\coordination\\test_doctrine_outbox_hooks.py",
+            "tests\\coordination\\test_retire_lane_worktree.py",
+        ]
+        shard_job = self._workflow_job(workflow, "repo-hygiene-python-windows-shard")
+        heavy_job = self._workflow_job(workflow, heavy_id)
+
+        def strip_comments(text: str) -> str:
+            return re.sub(r"(?m)^\s*#.*$", "", text)
+
+        # The heavy job runs exactly the four files shard 8 ignores, as named targets and nothing else.
+        heavy_tokens = strip_comments(heavy_job).replace("`", " ").split()
+        self.assertEqual([t for t in heavy_tokens if t.startswith("tests\\")], heavy_paths)
+        self.assertEqual(sum(1 for t in heavy_tokens if t == "pytest"), 1)
+        self.assertNotIn("--ignore", " ".join(heavy_tokens))
+        for path in heavy_paths:
+            self.assertIn(f"--ignore={path}", strip_comments(shard_job).replace("`", " ").split())
+
+        # Each file is collected by exactly one job: named as a run target, or its directory is a
+        # run target and it is not ignored in that job.
+        jobs_text = workflow[workflow.index("\njobs:") :]
+        job_ids = re.findall(r"(?m)^  ([a-z0-9-]+):\r?$", jobs_text)
+        self.assertIn(heavy_id, job_ids)
+        for path in heavy_paths:
+            with self.subTest(path=path):
+                collectors = []
+                for job_id in job_ids:
+                    tokens = strip_comments(self._workflow_job(workflow, job_id)).replace("`", " ").split()
+                    ignored = f"--ignore={path}" in tokens
+                    if path in tokens or ("tests\\coordination" in tokens and not ignored):
+                        collectors.append(job_id)
+                self.assertEqual(collectors, [heavy_id])
+
+        # Same setup as a shard, byte for byte, up to the job's own work.
+        def setup_steps(job: str, first_own_step: str) -> str:
+            return job[job.index("      - uses: actions/checkout@") : job.index(first_own_step)]
+
+        self.assertEqual(
+            setup_steps(heavy_job, "      - name: Run heavy coordination tests"),
+            setup_steps(shard_job, "      - name: Prove the unittest shards cover every discovered test"),
+        )
+        # A condition would let the job skip, and the aggregate would then be the only guard.
+        self.assertNotRegex(strip_comments(heavy_job), r"(?m)^    if:")
+
+    def test_shard_8_guardrails_step_keeps_all_four_of_its_paths(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "tests.yml").read_text(encoding="utf-8").replace("\r\n", "\n")
+        shard_job = self._workflow_job(workflow, "repo-hygiene-python-windows-shard")
+        block = shard_job[shard_job.index("- name: Run coordination and self-healing guardrails") :].split(
+            "\n      - "
+        )[0]
+        tokens = block.replace("`", " ").split()
+        for path in (
+            "tools\\coordination\\test_coordination_guardrails.py",
+            "tools\\coordination\\stuck_queue_checks\\test_stuck_queue_checks.py",
+            "tests\\coordination",
+            "tests\\docs",
+        ):
+            self.assertIn(path, tokens)
 
     def test_product_oracles_are_split_into_parts_behind_the_required_name(self) -> None:
         workflow = (ROOT / ".github" / "workflows" / "tests.yml").read_text(encoding="utf-8").replace("\r\n", "\n")
@@ -1899,8 +2025,8 @@ class RepoHygieneTests(unittest.TestCase):
 
         expected_remote_inventory = Counter(
             {
-                ("actions/checkout", "v5"): 11,
-                ("actions/setup-python", "v6"): 11,
+                ("actions/checkout", "v5"): 13,
+                ("actions/setup-python", "v6"): 13,
                 ("actions/upload-artifact", "v7"): 13,
                 ("ConorMacBride/install-package", "v1"): 2,
             }
