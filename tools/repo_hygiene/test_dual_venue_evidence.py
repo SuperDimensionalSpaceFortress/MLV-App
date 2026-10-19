@@ -3400,11 +3400,12 @@ class EvidenceBoundReceiptTests(EvidenceFactory, ModuleMutationMixin, unittest.T
         callers = {n for n, t in texts.items() if re.search(r"Test-DvReceiptValid\s+-", t) and n != "tools/repo_hygiene/test_dual_venue_evidence.py"}
         # LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1 added New-VenueFlavorPair.ps1 (the Classic | Cinematic pair), which validates both receipts the same way.
         self.assertEqual(callers, {"tools/profiling/dual-venue/DualVenueRunner.psm1", "tools/profiling/dual-venue/New-VenueSheetPair.ps1",
-                                   "tools/profiling/dual-venue/New-VenueFlavorPair.ps1"})
+                                   "tools/profiling/dual-venue/New-VenueFlavorPair.ps1", "tools/profiling/dual-venue/Invoke-VenueBaseline.ps1"})
         self.assertEqual(self.readers_without_repo_root({n: texts[n] for n in callers}), [])
         # nothing else in the tree reads a receipt file: a new reader must call the validator (and be added to this list in review)
         readers = {n for n, t in texts.items() if ("dual-venue-receipt/v1" in t or "dual-venue\\receipts" in t or "dual-venue/receipts" in t)
-                   and n not in ("tools/repo_hygiene/test_dual_venue_evidence.py", "tools/repo_hygiene/test_mlv_never_authorized.py")}
+                   # (test files hold receipt-shaped fixtures they never read back; test_venue_baseline.py's stub chain writes one for the baseline runner, which IS a caller above)
+                   and n not in ("tools/repo_hygiene/test_dual_venue_evidence.py", "tools/repo_hygiene/test_mlv_never_authorized.py", "tools/repo_hygiene/test_venue_baseline.py")}
         self.assertEqual(readers, {"tools/profiling/dual-venue/DualVenueRunner.psm1", "tools/profiling/dual-venue/Invoke-VenueLeg.ps1"},
                          "an unknown reader of dual-venue receipts must call Test-DvReceiptValid -RepoRoot and be named here")
         mutated = texts["tools/profiling/dual-venue/New-VenueSheetPair.ps1"].replace("Test-DvReceiptValid -Receipt $r -RepoRoot $repoRoot", "Test-DvReceiptValid -Receipt $r")
