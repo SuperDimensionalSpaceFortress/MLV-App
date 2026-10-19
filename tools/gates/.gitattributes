@@ -1,0 +1,3 @@
+# The output-budget spec pins this receipt by length and sha256, so checkout must never rewrite its line endings
+# (core.autocrlf=true would otherwise turn the 529 LF bytes into 543 CRLF bytes and fail the pin).
+receipts/*.marxml text eol=lf
