@@ -169,6 +169,89 @@ class TestProfileSeam(ScanCase):
     def test_g6_tracked_profile_holds_the_live_defaults(self):
         self.assertEqual(json.loads(PROFILE.read_text(encoding='utf-8')), EXPECTED_PROFILE)
 
+    def test_g7_scalar_json_profile_is_unreadable_not_missing_key(self):
+        # HUB-TOOLS-TRACKED-HARDENING-1: a valid JSON scalar / array root is "not a JSON object" (unreadable), never missing-key schema.
+        for label, text in (('int', '17'), ('string', '"x"'), ('bool', 'true'), ('array', '[1]'), ('null', 'null')):
+            with self.subTest(root=label):
+                profile = self.tmp / f'scalar-{label}.json'
+                profile.write_text(text, encoding='utf-8')
+                code, out, err = self.scan('-FixtureDir', str(self.fixture_dir()), '-ProfilePath', str(profile), '-OutFile', '')
+                self.assertEqual(code, 20, out + err)
+                self.assertIn(f'UNKNOWN pr=- reason=hub-profile-unreadable path={profile}', out.splitlines())
+                self.assertNotIn('hub-profile-missing-key', out)
+
+    def test_g8_module_raises_the_documented_exception_for_a_scalar_root(self):
+        module = HUB / 'HubProfile.psm1'
+        for label, text in (('int', '17'), ('string', '"x"')):
+            with self.subTest(root=label):
+                profile = self.tmp / f'module-{label}.json'
+                profile.write_text(text, encoding='utf-8')
+                script = (
+                    f"Import-Module '{module}' -Force; "
+                    f"try {{ Get-HubProfile -Path '{profile}' | Out-Null; 'NO-THROW' }} "
+                    "catch { $_.Exception.GetType().Name }"
+                )
+                r = subprocess.run([*PWSH, '-Command', script], text=True, capture_output=True, timeout=SUBPROCESS_TIMEOUT, cwd=str(self.tmp))
+                self.assertEqual(r.stdout.strip(), 'HubProfileUnreadableException', r.stdout + r.stderr)
+
+
+@unittest.skipUnless(os.name == 'nt', 'the fake gh is a .cmd')
+class TestStateListGhExeSeam(ScanCase):
+    """COS-SCAN-STATE-LIST-GHEXE-SEAM-1: the PR state-list call runs through -GhExe, so a run with no -PrStateFile never reaches the real gh."""
+
+    PR = 77
+
+    def make_bus(self):
+        bus = self.tmp / 'bus'
+        (bus / 'cos-feedback' / 'mlv-app').mkdir(parents=True)
+        (bus / 'cos-feedback' / 'mlv-app' / f'pr-{self.PR}.md').write_text(GREEN_FIXTURE.format(pr=self.PR), encoding='utf-8', newline='\n')
+        for g in (['init', '-q', '-b', 'master'], ['add', 'cos-feedback'],
+                  ['-c', 'user.name=t', '-c', 'user.email=t@example.invalid', 'commit', '-q', '-m', 'fixture']):
+            subprocess.run(['git', '-C', str(bus), *g], check=True, capture_output=True)
+        return bus
+
+    def make_fake_gh(self, list_reply):
+        """A fake gh that records every call to calls.log; `pr list` answers list_reply (or fails when it is None)."""
+        calls = self.tmp / 'calls.log'
+        answer = f'echo {list_reply}\r\nexit /b 0' if list_reply is not None else 'exit /b 1'
+        fake = self.tmp / 'fake-gh.cmd'
+        fake.write_text(
+            '@echo off\r\n'
+            f'echo %*>>"{calls}"\r\n'
+            'if "%~1"=="pr" if "%~2"=="list" goto list\r\n'
+            'echo [[]]\r\nexit /b 0\r\n'
+            f':list\r\n{answer}\r\n',
+            encoding='ascii',
+        )
+        return fake, calls
+
+    def run_scan(self, fake):
+        # No -PrStateFile, no -FixtureDir, no -GhDataDir: the live path. The environment makes any stray real gh unusable
+        # (a bad token and an unresolvable host), so a regression fails the assertions instead of reading GitHub.
+        env = {**os.environ, 'GH_TOKEN': 'invalid-token-hermetic', 'GITHUB_TOKEN': 'invalid-token-hermetic',
+               'GH_ENTERPRISE_TOKEN': 'invalid-token-hermetic', 'GH_HOST': 'gh.invalid'}
+        cmd = [*PWSH, '-File', str(self.script), '-BusRoot', str(self.make_bus()), '-Ref', 'master', '-Repo', REPO,
+               '-OwnerLogin', 'layibabalola', '-OutFile', '', '-FeedbackPath', 'cos-feedback/mlv-app',
+               '-RepoAlias', 'layibabalola/MLV-App', '-GhExe', str(fake), '-GhTimeoutSec', '30']
+        r = subprocess.run(cmd, text=True, capture_output=True, timeout=SUBPROCESS_TIMEOUT, cwd=str(self.tmp), env=env)
+        return r.returncode, r.stdout, r.stderr
+
+    def test_h1_state_list_goes_through_ghexe(self):
+        fake, calls = self.make_fake_gh(f'[{{"number":{self.PR},"state":"MERGED"}}]')
+        code, out, err = self.run_scan(fake)
+        log = calls.read_text(encoding='ascii') if calls.exists() else ''
+        self.assertRegex(log, r'(?m)^pr list --repo \S+ --state all ', 'the state list never reached the injected GhExe')
+        self.assertEqual(code, 0, out + err)
+        self.assertRegex(out, rf'(?m)^NOASK pr={self.PR} verdict=merge-when-ci-green state=MERGED$')
+
+    def test_h2_failed_ghexe_state_list_is_unknown(self):
+        fake, calls = self.make_fake_gh(None)
+        code, out, err = self.run_scan(fake)
+        log = calls.read_text(encoding='ascii') if calls.exists() else ''
+        self.assertRegex(log, r'(?m)^pr list ', 'the state list never reached the injected GhExe')
+        self.assertEqual(code, 20, out + err)
+        self.assertRegex(out, r'(?m)^UNKNOWN pr=- reason=pr-state-list-failed gh-failed')
+
 
 if __name__ == '__main__':
     unittest.main()
