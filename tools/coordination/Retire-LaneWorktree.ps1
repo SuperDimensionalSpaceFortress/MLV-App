@@ -733,8 +733,11 @@ function Invoke-RetireLaneWorktree {
     } finally {
         # Every path that leaves the worktree standing (kept, would-retire) ends with no daemon in it; a retired worktree is gone. Best effort, never throws.
         # Only when the disable did not take: after a successful disable the early stop already left none and nothing can start one.
+        # LANE-FSMONITOR-FOLLOWUPS-1 (b): unless that early stop FAILED. The disable only prevents a new daemon; a daemon already running is still
+        # there, so this is the one retry (bounded: it is this single call, never a loop). Its outcome lands in `final`, the early failure stays in `early`.
         if ($wd -and $d.action -ne 'retired' -and $d.action -ne 'skipped') {
-            if ($null -ne $d.fsmonitorStop.disable -and $d.fsmonitorStop.disable -eq 'disabled') {
+            $earlyStopFailed = ($null -ne $d.fsmonitorStop.early -and $d.fsmonitorStop.early -like 'failed*')
+            if ($null -ne $d.fsmonitorStop.disable -and $d.fsmonitorStop.disable -eq 'disabled' -and -not $earlyStopFailed) {
                 $d.fsmonitorStop.final = 'not-run: disable succeeded'
             } elseif (Get-Command Stop-LaneWorktreeFsmonitor -ErrorAction SilentlyContinue) {
                 try { $d.fsmonitorStop.final = Get-FsmonitorStepNote (Stop-LaneWorktreeFsmonitor -WorkDir $wd) }

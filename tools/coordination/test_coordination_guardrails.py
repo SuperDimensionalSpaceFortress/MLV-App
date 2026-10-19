@@ -4451,6 +4451,69 @@ def test_retire_records_each_fsmonitor_step_and_gates_the_final_stop_on_the_disa
     assert not fsmon_watching(wt)
 
 
+FSMON_STUB_DISABLE_TOOK = (
+    "function Disable-LaneWorktreeFsmonitor { param($WorkDir) [pscustomobject]@{ action = 'disabled'; reason = $null } }"
+)
+
+
+def fsmon_retire_with_stopped_daemon_stub(wt, stop_outcomes):
+    """Run the real Invoke-RetireLaneWorktree with the fsmonitor helpers replaced AFTER the library loads: the disable always takes, and the Nth
+    stop call returns stop_outcomes[N-1] (the last repeats). Returns (disposition, number of stop calls). No daemon is involved, so the failed-stop
+    path that cannot be provoked with a real daemon becomes deterministic."""
+    outcomes = ",".join("'%s'" % o for o in stop_outcomes)
+    stubs = (
+        FSMON_STUB_DISABLE_TOOK + "; $global:StopCalls = 0; $global:Outcomes = @(" + outcomes + "); "
+        "function Stop-LaneWorktreeFsmonitor { param($WorkDir) $i = [math]::Min($global:StopCalls, $global:Outcomes.Count - 1); $global:StopCalls++; "
+        "if ($global:Outcomes[$i] -eq 'failed') { [pscustomobject]@{ action = 'failed'; reason = 'fsmonitor--daemon stop failed: stub' } } "
+        "else { [pscustomobject]@{ action = $global:Outcomes[$i]; reason = $null } } }"
+    )
+    script = (
+        "$ErrorActionPreference='Stop'; Set-StrictMode -Version Latest; "
+        f". '{FSMON_RETIRE_LIB}'; {stubs}; $snap = {FSMON_NO_PROCS}; "
+        f"$d = Invoke-RetireLaneWorktree -WorkDir '{wt}' -MergeTarget 'master' -ProcessSnapshot $snap; "
+        "[pscustomobject]@{ d = $d; stopCalls = $global:StopCalls } | ConvertTo-Json -Depth 6"
+    )
+    done = subprocess.run([FSMON_PWSH, "-NoProfile", "-NonInteractive", "-Command", script], text=True, capture_output=True)
+    assert done.returncode == 0, (done.stdout, done.stderr)
+    out = json.loads(done.stdout)
+    return out["d"], out["stopCalls"]
+
+
+@fsmon_only
+def test_retire_retries_a_failed_early_stop_once_when_the_disable_took(fsmon_board):
+    """LANE-FSMONITOR-FOLLOWUPS-1 (b): the early stop failed (a daemon may still run) but the disable took, so the finally block used to write
+    'not-run: disable succeeded' and never tried again. The disable only prevents a NEW daemon; it does not end one that is already running."""
+    main, wt = fsmon_board
+    (wt / "someone-elses-work.txt").write_text("uncommitted\n")
+    d, calls = fsmon_retire_with_stopped_daemon_stub(wt, ["failed", "stopped"])
+    assert d["action"] == "kept" and d["reason"].startswith("dirty"), "the retry must not change the disposition: " + str(d)
+    step = d["fsmonitorStop"]
+    assert step["disable"] == "disabled" and step["early"].startswith("failed:"), step
+    assert step["final"] == "stopped", "a failed early stop after a successful disable must be retried and the retry recorded: " + str(step)
+    assert calls == 2, "exactly one retry"
+
+
+@fsmon_only
+def test_retire_retry_of_a_failed_early_stop_is_bounded_and_records_its_failure(fsmon_board):
+    main, wt = fsmon_board
+    (wt / "someone-elses-work.txt").write_text("uncommitted\n")
+    d, calls = fsmon_retire_with_stopped_daemon_stub(wt, ["failed"])
+    assert d["action"] == "kept" and d["reason"].startswith("dirty"), d
+    step = d["fsmonitorStop"]
+    assert step["early"].startswith("failed:") and step["final"].startswith("failed:"), step
+    assert calls == 2, "one retry, never a loop"
+
+
+@fsmon_only
+def test_retire_does_not_retry_when_the_early_stop_did_not_fail(fsmon_board):
+    main, wt = fsmon_board
+    (wt / "someone-elses-work.txt").write_text("uncommitted\n")
+    d, calls = fsmon_retire_with_stopped_daemon_stub(wt, ["stopped"])
+    step = d["fsmonitorStop"]
+    assert step["early"] == "stopped" and step["final"] == "not-run: disable succeeded", step
+    assert calls == 1
+
+
 def test_fsmonitor_retire_never_discards_a_stop_result_and_gates_the_finally_stop():
     """Source pin for the paths the fixture cannot reach hermetically (a real retirement depends on the host's live processes): the removal stop is
     recorded before `worktree remove`, no stop result is thrown away with `$null =`, and the finally stop is conditional on the disable."""
@@ -4475,6 +4538,22 @@ def test_invoke_lane_stops_the_daemon_when_the_lane_ends_with_the_worktree_kept(
     assert lane.index("$dirtyCheckReason = $null") < stop < lane.index("$receipt = [ordered]@{"), "the lane-end stop must sit after the post-exit dirty check and before the receipt"
     # The stop result is recorded, not discarded (FSMONITOR-STOP-RESULT-VISIBILITY-1).
     assert "fsmonitorStop = $fsmonitorStop" in lane and lane.count("$null = Stop-LaneWorktreeFsmonitor -WorkDir $WorkDir") == 1, "only the launch-time stop may discard its result"
+
+
+def test_invoke_lane_closes_its_kill_on_close_job_before_the_lane_end_stop():
+    """LANE-FSMONITOR-FOLLOWUPS-1 (c), evidence pin (no behaviour change). A descendant of the lane cannot restart fsmonitor between the job close and
+    the lane-end stop because the job's only limit is KILL_ON_JOB_CLOSE (0x2000): no BREAKAWAY_OK (0x800) or SILENT_BREAKAWAY_OK (0x1000), so no
+    descendant can leave it, and closing the handle kills every one. The first close sits at the top of the finally block, ahead of the retire gate,
+    the sweep, the post-exit dirty check and the lane-end stop. What this does NOT cover is a process started OUTSIDE the job (WMI, a scheduled task,
+    COM): that is the open question in LANE-FSMONITOR-DESCENDANT-RESTART-1."""
+    lane = FSMON_LANE_TEXT
+    assert "value.BasicLimitInformation.LimitFlags=0x2000;" in lane, "the job limit changed; re-derive whether a descendant can now break away"
+    finally_at = lane.index("# Cleanup must precede all receipt construction and I/O")
+    first_close = lane.index("[MlvLaneJob]::CloseHandle($jobHandle)", finally_at)
+    assert first_close - finally_at < 400, "the job close is no longer the first act of the finally block"
+    stop = lane.rfind(FSMON_END_STOP)
+    assert first_close < lane.index("Invoke-RetireLaneWorktree -WorkDir $WorkDir") < stop
+    assert first_close < lane.index("Invoke-SweepMergedLaneWorktrees -RepoRoot") < stop
 
 
 @pytest.mark.parametrize(
@@ -4516,14 +4595,17 @@ FSMON_INSERT_BEFORE = "try {\n    . (Join-Path $PSScriptRoot 'lane-fsmonitor.ps1
 # too, found by name below, so a call through a helper counts like the raw shape.
 FSMON_GIT_SHAPES = (
     r"&[ \t]*['\"]?[^\s'\"|;)]*\bgit(?:\.exe)?['\"]?(?=[\s;)|]|$)",
-    r"&[ \t]*\$\w*git\w*\b",
-    r"(?:^|[;{(|=])[ \t]*git(?:\.exe)?[ \t]+[-\w]",
+    r"&[ \t]*(['\"])[^'\"\n]*\bgit(?:\.exe)?\1",  # & 'C:\Program Files\Git\cmd\git.exe' (a quoted path may hold spaces)
+    r"&[ \t]*\$\{?\w*git\w*\b",
+    r"(?:^|[;{(|=])[ \t]*git(?:\.exe)?[ \t]+[-\w@$]",  # git -C x | git @splat | git $argv | git $args
     r"\bStart-Process\b[^\n]*\bgit\b",
+    r"\bStart-Process\b[ \t]+(?:-FilePath[ \t]+)?\$\w*git\w*\b",  # Start-Process $gitExe 'status'
+    r"\bStart-Process\b[^\n]*-FilePath[ \t]+\$\w*git\w*\b",
     r"\b(?:cmd|cmd\.exe)[ \t]+/c\b[^\n]*\bgit\b",
-    r"\bInvoke-Expression\b[^\n]*\bgit\b",
+    r"\b(?:Invoke-Expression|iex)\b[^\n]*\bgit\b",
     r"\bProcess\]::Start\([ \t]*['\"][^'\"]*git",
     r"\.FileName[ \t]*=[ \t]*['\"][^'\"]*\bgit(?:\.exe)?['\"]",
-    r"&[ \t]*\([^)\n]*\bgit\b",  # & (Get-Command git) -C ...
+    r"&[ \t]*\$?\([^)\n]*\bgit\b",  # & (Get-Command git) -C ...   and   & $(Get-Command git) -C ...
 )
 # A bare `git ...` starts a statement after ; { ( | or `=` (`$out = git status`). Matching is case-insensitive: PowerShell is.
 FSMON_GIT_RE = re.compile("|".join("(?:%s)" % s for s in FSMON_GIT_SHAPES), re.M | re.I)
@@ -4533,6 +4615,36 @@ FSMON_FUNCTION_RE = re.compile(
     r"^([ \t]*)function[ \t]+([\w-]+)\b[^\n]*?\n?[ \t]*(?:\{[ \t]*\r?\n.*?^\1\}[ \t]*\r?$|\{[^\n]*\}[ \t]*\r?$)", re.M | re.S | re.I
 )
 FSMON_STATEMENT_PREFIX = ";{(|= \t\r\n"
+
+# LANE-FSMONITOR-FOLLOWUPS-1 (a): names that STAND FOR git, found by reading the script's own assignments. `$tool = 'git'` / `$g = (Get-Command git).Source`
+# make `& $tool ...` and `Start-Process $tool` git calls whatever the variable is called, and `Set-Alias g git` makes a bare `g ...` one. A name
+# that is computed, read from the environment or returned by a helper is out of reach of a lexical scan (see FSMON_INDIRECT_KNOWN_GAPS).
+FSMON_GIT_VALUE = (
+    r"(?:['\"](?:[^'\"\n]*[\\/])?git(?:\.exe)?['\"]"
+    r"|\(?[ \t]*Get-Command[ \t]+(?:-Name[ \t]+)?['\"]?(?:[^\s'\"|)]*[\\/])?git(?:\.exe)?(?![\w.-]))"
+)
+FSMON_GIT_VAR_RE = re.compile(r"\$(\w+)[ \t]*=[ \t]*" + FSMON_GIT_VALUE, re.I)
+FSMON_GIT_ALIAS_RE = re.compile(
+    r"\b(?:Set|New)-Alias\b[ \t]+(?:-Name[ \t]+)?(\w+)[ \t]+(?:-Value[ \t]+)?['\"]?(?:[^\s'\"]*[\\/])?git(?:\.exe)?['\"]?(?=\s|$)", re.I
+)
+
+
+def fsmon_alias_git_re(code):
+    """Regex matching a call through a variable or alias that stands for git, or None when the script defines none."""
+    variables = sorted({m.group(1) for m in FSMON_GIT_VAR_RE.finditer(code)})
+    aliases = sorted({m.group(1) for m in FSMON_GIT_ALIAS_RE.finditer(code)})
+    parts = []
+    if variables:
+        names = "|".join(re.escape(v) for v in variables)
+        parts += [
+            r"&[ \t]*\$\{?(?:%s)\}?(?![\w])" % names,
+            r"\bStart-Process\b[ \t]+(?:-FilePath[ \t]+)?\$(?:%s)(?![\w])" % names,
+            r"\bStart-Process\b[^\n]*-FilePath[ \t]+\$(?:%s)(?![\w])" % names,
+        ]
+    if aliases:
+        names = "|".join(re.escape(a) for a in aliases)
+        parts += [r"(?:^|[;{(|=])[ \t]*(?:%s)(?=[ \t]|$)" % names, r"&[ \t]*(?:%s)(?![\w-])" % names]
+    return re.compile("|".join("(?:%s)" % p for p in parts), re.M | re.I) if parts else None
 
 
 def fsmon_blank(text, pattern, flags=0):
@@ -4590,8 +4702,16 @@ def fsmon_git_invocation_offsets(lane_text):
     def mention(name):
         return re.compile(r"(?<![\w-])%s(?![\w-])" % re.escape(name), re.I)
 
+    alias_re = fsmon_alias_git_re(code)
+
+    def git_matches(text, lo=0, hi=None):
+        hi = len(text) if hi is None else hi
+        for rx in (FSMON_GIT_RE, alias_re):
+            if rx is not None:
+                yield from rx.finditer(text, lo, hi)
+
     spans = {m.group(2).lower(): (m.start(), m.end()) for m in FSMON_FUNCTION_RE.finditer(code)}
-    wrappers = {n for n, (lo, hi) in spans.items() if any(live(m, code) is not None for m in FSMON_GIT_RE.finditer(code, lo, hi))}
+    wrappers = {n for n, (lo, hi) in spans.items() if any(live(m, code) is not None for m in git_matches(code, lo, hi))}
     while True:
         more = {
             n for n, (lo, hi) in spans.items()
@@ -4601,7 +4721,7 @@ def fsmon_git_invocation_offsets(lane_text):
             break
         wrappers |= more
     top = fsmon_blank(code, FSMON_FUNCTION_RE.pattern, FSMON_FUNCTION_RE.flags)
-    hits = [live(m, top) for m in FSMON_GIT_RE.finditer(top)]
+    hits = [live(m, top) for m in git_matches(top)]
     for w in wrappers:
         hits += [live(m, top) for m in mention(w).finditer(top)]
     return sorted(h for h in hits if h is not None)
@@ -4675,6 +4795,92 @@ def test_fsmonitor_lane_pin_reads_powershell_lexing_shapes(git_call):
     lane = (ROOT / "tools" / "coordination" / "Invoke-Lane.ps1").read_text(encoding="utf-8")
     mutated = lane.replace(FSMON_INSERT_BEFORE, git_call + "\n" + FSMON_INSERT_BEFORE, 1)
     assert fsmon_lane_pin_violation(mutated), "the pin passes a lane script that runs git before the disable: " + git_call
+
+
+# LANE-FSMONITOR-FOLLOWUPS-1 (a): the scanner is a regex over PowerShell text, so it is syntax-limited. These pin the indirect and aliased spellings of
+# "run git" it must catch (each one a probed shape, see FSMON_INDIRECT_CAUGHT) and name the ones it cannot (FSMON_INDIRECT_KNOWN_GAPS). Detection
+# is NOT claimed exhaustive: a name that is computed at run time or read from the environment hides git from any lexical scan.
+FSMON_INDIRECT_CAUGHT = {
+    # already caught before this card; pinned so a later regex edit cannot drop them
+    "var-assigned-from-get-command": "$git = (Get-Command git.exe).Source\n& $git -C $WorkDir status",
+    "amp-fullpath-unquoted": "& C:\\Git\\cmd\\git.exe -C $WorkDir status",
+    "amp-fullpath-dq-env": "& \"$env:ProgramFiles\\Git\\cmd\\git.exe\" -C $WorkDir status",
+    "start-process-fullpath": "Start-Process -FilePath 'C:\\Program Files\\Git\\cmd\\git.exe' -ArgumentList 'status'",
+    "splat-amp-git": "$a = @('-C', $WorkDir, 'status')\n& git @a",
+    "splat-amp-var-gitexe": "$a = @('-C', $WorkDir, 'status')\n& $gitExe @a",
+    "amp-var-named-for-git-path": "$gitPath = 'C:\\Git\\cmd\\git.exe'\n& $gitPath status",
+    "bare-git-with-splat-after-flag": "git -C $WorkDir @a",
+    "scriptblock-amp": "& { git -C $WorkDir status }",
+    "invoke-expression-string": "Invoke-Expression 'git -C $WorkDir status'",
+    "cmd-c": "cmd /c git -C $WorkDir status",
+    "process-start-info": "$psi = New-Object Diagnostics.ProcessStartInfo\n$psi.FileName = 'git'",
+    "process-start-fullpath": "[void][Diagnostics.Process]::Start('C:\\Git\\cmd\\git.exe', 'status')",
+    # extended by this card (RED on the previous scanner)
+    "amp-fullpath-sq-with-space": "& 'C:\\Program Files\\Git\\cmd\\git.exe' -C $WorkDir status",
+    "amp-fullpath-dq-with-space": "& \"C:\\Program Files\\Git\\cmd\\git.exe\" -C $WorkDir status",
+    "amp-braced-variable": "& ${gitExe} -C $WorkDir status",
+    "amp-subexpression-get-command": "& $(Get-Command git.exe) -C $WorkDir status",
+    "start-process-variable-named-for-git": "Start-Process -FilePath $gitExe -ArgumentList 'status'",
+    "start-process-positional-variable": "Start-Process $gitExe 'status'",
+    "bare-git-splat": "$a = @('-C', $WorkDir, 'status')\ngit @a",
+    "bare-git-exe-splat": "$a = @('-C', $WorkDir, 'status')\ngit.exe @a",
+    "bare-git-array-variable": "$a = @('status')\ngit $a",
+    "bare-git-args-variable": "git $args",
+    "iex-alias": "iex 'git -C $WorkDir status'",
+    "set-alias-to-git": "Set-Alias g git\ng -C $WorkDir status",
+    "new-alias-named-to-git-exe": "New-Alias -Name gg -Value git.exe\ngg status",
+    "variable-holding-git-name-called-with-amp": "$tool = 'git'\n& $tool -C $WorkDir status",
+    "variable-from-get-command-called-with-amp": "$g = (Get-Command git).Source\n& $g -C $WorkDir status",
+    "variable-holding-git-name-splatted": "$tool = 'git'\n$a = @('-C', $WorkDir, 'status')\n& $tool @a",
+    "variable-holding-git-name-in-start-process": "$tool = 'git'\nStart-Process $tool 'status'",
+}
+# Spellings no lexical scan can resolve: the git name is computed, read from the environment or returned by a function. Each is asserted to be a MISS
+# so the gap stays visible; when one is closed, this assertion fails and the entry moves to FSMON_INDIRECT_CAUGHT.
+FSMON_INDIRECT_KNOWN_GAPS = {
+    "computed-name": "& (\"gi\" + \"t\") -C $WorkDir status",
+    "environment-supplied-path": "& $env:GIT_EXE -C $WorkDir status",
+    "variable-from-helper-result": "$exe = Find-Tool 'vcs'\n& $exe -C $WorkDir status",
+    "variable-from-other-variable": "$tool = $global:Vcs\n& $tool -C $WorkDir status",
+}
+FSMON_LANE_TEXT = (ROOT / "tools" / "coordination" / "Invoke-Lane.ps1").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("git_call", list(FSMON_INDIRECT_CAUGHT.values()), ids=list(FSMON_INDIRECT_CAUGHT))
+def test_fsmonitor_lane_pin_catches_indirect_and_aliased_git_before_the_disable(git_call):
+    assert FSMON_INSERT_BEFORE in FSMON_LANE_TEXT, "the insertion anchor moved; re-pin this test"
+    mutated = FSMON_LANE_TEXT.replace(FSMON_INSERT_BEFORE, git_call + "\n" + FSMON_INSERT_BEFORE, 1)
+    assert fsmon_lane_pin_violation(mutated), "the pin passes a lane script that runs git before the disable: " + git_call
+
+
+@pytest.mark.parametrize("git_call", list(FSMON_INDIRECT_CAUGHT.values()), ids=list(FSMON_INDIRECT_CAUGHT))
+def test_fsmonitor_end_stop_pin_catches_indirect_and_aliased_git_after_the_stop(git_call):
+    anchor = "$receipt = [ordered]@{"
+    assert anchor in FSMON_LANE_TEXT, "the receipt anchor moved; re-pin this test"
+    assert fsmon_end_stop_violation(FSMON_LANE_TEXT.replace(anchor, git_call + "\n" + anchor, 1)), "the pin passes a git call after the lane-end stop: " + git_call
+
+
+@pytest.mark.parametrize("git_call", list(FSMON_INDIRECT_KNOWN_GAPS.values()), ids=list(FSMON_INDIRECT_KNOWN_GAPS))
+def test_fsmonitor_lane_pin_known_gaps_are_misses_on_purpose(git_call):
+    """KNOWN GAP, expected miss. A scan of the text cannot see that these start git. If this fails, the scanner learned the shape: move it to
+    FSMON_INDIRECT_CAUGHT rather than deleting the case."""
+    mutated = FSMON_LANE_TEXT.replace(FSMON_INSERT_BEFORE, git_call + "\n" + FSMON_INSERT_BEFORE, 1)
+    assert not fsmon_lane_pin_violation(mutated), "known gap closed; promote it to FSMON_INDIRECT_CAUGHT: " + git_call
+
+
+@pytest.mark.parametrize(
+    "not_git",
+    [
+        "$tool = 'ls'\n& $tool -C $WorkDir",
+        "Set-Alias ll Get-ChildItem\nll $WorkDir",
+        "$tool = 'github-cli'\n& $tool status",
+        "Start-Process notepad $gitNotes",
+        "Write-Host 'git $args'",
+    ],
+    ids=["variable-holds-other-tool", "alias-to-other-command", "variable-holds-name-merely-containing-git", "start-process-other-tool", "string-mention"],
+)
+def test_fsmonitor_lane_pin_indirect_shapes_do_not_flag_unrelated_commands(not_git):
+    mutated = FSMON_LANE_TEXT.replace(FSMON_INSERT_BEFORE, not_git + "\n" + FSMON_INSERT_BEFORE, 1)
+    assert not fsmon_lane_pin_violation(mutated), "an unrelated command was read as git: " + not_git
 
 
 # A helper is git too, so a CALL ahead of the disable counts wherever the helper is defined and however it is spelled.
