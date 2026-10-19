@@ -9468,14 +9468,34 @@ int getMlvLastProcessed8PrefetchHit(void)
     return g_mlv_last_processed8_prefetch_hit;
 }
 
+/* winpthreads and Apple wait processed8 slices relative to now, so their cond
+ * keeps the default clock; elsewhere the slice abstime is CLOCK_MONOTONIC and
+ * the cond must measure the same clock. Untimed waits are unaffected. */
+static void mlv_processed8_prefetch_cond_init(pthread_cond_t * cond)
+{
+#if defined(_WIN32) || defined(__APPLE__)
+    pthread_cond_init(cond, NULL);
+#else
+    pthread_condattr_t attr;
+    pthread_condattr_init(&attr);
+    pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+    pthread_cond_init(cond, &attr);
+    pthread_condattr_destroy(&attr);
+#endif
+}
+
 /* Bounded wait on processed8_prefetch_cond against a MONOTONIC budget
- * (mlv_stage_timing_now: QPC / CLOCK_MONOTONIC). The condvar keeps the default
- * clock (it is shared with the worker's untimed wait), so each wait is a short
- * slice with a fresh CLOCK_REALTIME abstime: a wall-clock step perturbs at most
- * one slice, and a missed broadcast costs at most one slice. Caller holds the
- * mutex and re-checks its predicate after every return. Returns 0 while budget
- * remains (woken or slice elapsed), ETIMEDOUT once the budget is spent, or the
- * clock_gettime failure as non-zero. */
+ * (mlv_stage_timing_now: QPC / CLOCK_MONOTONIC). Each wait is a short slice
+ * (a missed broadcast costs at most one slice), and no slice reads the wall
+ * clock: winpthreads and Apple wait a relative slice, and elsewhere the cond
+ * runs on CLOCK_MONOTONIC (mlv_processed8_prefetch_cond_init). A wall-clock
+ * step therefore cannot stretch a slice, and the whole wait is bounded by the
+ * budget plus one slice. Caller holds the mutex and re-checks its predicate
+ * after every return. Returns 0 while budget remains (woken or slice elapsed),
+ * ETIMEDOUT once the budget is spent, or a wait/clock failure as non-zero.
+ * The test wall-clock skew seam applies to CLOCK_REALTIME reads, so it has
+ * nothing to skew here; the clock-step row is RED on the realtime abstime
+ * this replaced (PROCESSED8-IDLE-WAIT-PREDICATE-RECHECK-1 r2). */
 static int mlv_processed8_prefetch_wait_slice_locked(mlvObject_t * video,
                                                      double deadline_s)
 {
@@ -9488,23 +9508,30 @@ static int mlv_processed8_prefetch_wait_slice_locked(mlvObject_t * video,
         ? (double)video->processed8_prefetch_test_wait_slice_ms / 1000.0
         : 0.05;
     const double slice_s = (remaining_s < max_slice_s) ? remaining_s : max_slice_s;
-    struct timespec abstime;
-    if (clock_gettime(CLOCK_REALTIME, &abstime) != 0)
+    const int64_t slice_ns = (int64_t)(slice_s * 1e9);
+    struct timespec wait_time;
+#if defined(_WIN32) || defined(__APPLE__)
+    wait_time.tv_sec = (time_t)(slice_ns / 1000000000LL);
+    wait_time.tv_nsec = (long)(slice_ns % 1000000000LL);
+    const int rc = pthread_cond_timedwait_relative_np(&video->processed8_prefetch_cond,
+                                                      &video->processed8_prefetch_mutex,
+                                                      &wait_time);
+#else
+    if (clock_gettime(CLOCK_MONOTONIC, &wait_time) != 0)
     {
         return EINVAL;
     }
-    const int64_t slice_ns = (int64_t)(slice_s * 1e9)
-                           + video->processed8_prefetch_test_wall_clock_skew_ns;
-    abstime.tv_nsec += (long)(slice_ns % 1000000000LL);
-    abstime.tv_sec += (time_t)(slice_ns / 1000000000LL);
-    if (abstime.tv_nsec >= 1000000000L)
+    wait_time.tv_nsec += (long)(slice_ns % 1000000000LL);
+    wait_time.tv_sec += (time_t)(slice_ns / 1000000000LL);
+    if (wait_time.tv_nsec >= 1000000000L)
     {
-        ++abstime.tv_sec;
-        abstime.tv_nsec -= 1000000000L;
+        ++wait_time.tv_sec;
+        wait_time.tv_nsec -= 1000000000L;
     }
     const int rc = pthread_cond_timedwait(&video->processed8_prefetch_cond,
                                           &video->processed8_prefetch_mutex,
-                                          &abstime);
+                                          &wait_time);
+#endif
     if (rc == ETIMEDOUT)
     {
         ++video->processed8_prefetch_test_slice_expiries;
@@ -9670,7 +9697,7 @@ mlvObject_t * initMlvObject()
     pthread_mutex_init(&video->llrawproc_mutex, NULL);
     pthread_mutex_init(&video->llrawproc_worker_mutex, NULL);
     pthread_mutex_init(&video->processed8_prefetch_mutex, NULL);
-    pthread_cond_init(&video->processed8_prefetch_cond, NULL);
+    mlv_processed8_prefetch_cond_init(&video->processed8_prefetch_cond);
     pthread_mutex_init(&video->raw_uint16_prefetch_mutex, NULL);
     pthread_cond_init(&video->raw_uint16_prefetch_cond, NULL);
     video->llrawproc_workers = NULL;
