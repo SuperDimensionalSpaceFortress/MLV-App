@@ -1089,3 +1089,38 @@ TEST(PlaybackWarmReconDeterminismWiring, NoWarmEntryReadsTheClipAfterItsLifetime
     ASSERT_TRUE(warm.contains(QStringLiteral(
         "done.blackLevel = ( m_pMlvObject && !entry.warmRealRequestPending ) ? getMlvBlackLevel( m_pMlvObject ) : 0;")));
 }
+
+// r3 (U-02, sol r2 = fable r2): a warm that is queued but not yet taken is not pipeline work, so the clip close's idle
+// barrier passes while it is queued. After that barrier and before freeMlvObject, the close detaches the clip from the
+// render thread under its mutex: every queued warm is dropped, a warm the worker took in the meantime is waited out,
+// and the thread's clip pointer is cleared (a warm run against no clip reads nothing: run() refuses a null video).
+TEST(PlaybackWarmReconDeterminismWiring, AClipCloseDropsEveryQueuedWarmBeforeTheClipIsFreed)
+{
+    const QString main = codeLinesOnly(bodyBetween(sourceFile("platform/qt/MainWindow.cpp"),
+                                                   QStringLiteral("void MainWindow::freeActiveMlvObjectAfterLifecycleBarrier( const char *reason )"),
+                                                   QStringLiteral("\n}\n")));
+    ASSERT_FALSE(main.isEmpty());
+    const int barrier = main.indexOf(QStringLiteral("waitForRenderThreadIdleBeforeCoreMutation( barrierReason );"));
+    const int detach = main.indexOf(QStringLiteral("if( m_pRenderThread ) m_pRenderThread->detachClipBeforeFree();"));
+    const int freed = main.indexOf(QStringLiteral("freeMlvObject( m_pMlvObject );"));
+    printf("[U-02] close: barrier=%d detach=%d free=%d\n", barrier, detach, freed);
+    ASSERT_TRUE(barrier >= 0);
+    ASSERT_TRUE(detach > barrier);
+    ASSERT_TRUE(freed > detach);
+    const QString thread = sourceFile("platform/qt/RenderFrameThread.cpp");
+    const QString body = codeLinesOnly(bodyBetween(thread, QStringLiteral("void RenderFrameThread::detachClipBeforeFree( void )"),
+                                                   QStringLiteral("\n}\n")));
+    ASSERT_FALSE(body.isEmpty());
+    const int locked = body.indexOf(QStringLiteral("QMutexLocker locker( &m_mutex );"));
+    const int dropped = body.indexOf(QStringLiteral("playback_recon_warm_run::dropQueuedWarms( m_reconRequests );"));
+    const int waited = body.indexOf(QStringLiteral("while( m_warmRunning ) m_waitCondition.wait( &m_mutex );"));
+    const int cleared = body.indexOf(QStringLiteral("m_pMlvObject = nullptr;"));
+    ASSERT_TRUE(locked >= 0);
+    ASSERT_TRUE(dropped > locked);
+    ASSERT_TRUE(waited > dropped);
+    ASSERT_TRUE(cleared > waited);
+    // a warm run reads the clip only through a non-null pointer
+    ASSERT_TRUE(thread.contains(QStringLiteral("m_pMlvObject ? qMax( 1, m_pMlvObject->cpu_cores ) : 1,")));
+    ASSERT_TRUE(sourceFile("platform/qt/PlaybackReconWarmRun.h").contains(
+        QStringLiteral("if( !video || !worker || fullWidth <= 0 || fullHeight <= 0 )")));
+}
