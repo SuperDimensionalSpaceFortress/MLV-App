@@ -2744,16 +2744,28 @@ def _route_node_unsafe(rest: list[str]) -> str | None:
     return None
 
 
+def _powershell_flag(tok: str) -> str:
+    """The lowercase name of a PowerShell switch token (`-NoProfile`, `/f`, `--file`, `-f:x`), else ''."""
+    if tok[:1] not in ("-", "/") or len(tok) < 2:
+        return ""
+    return tok[1:].split(":", 1)[0].lower().lstrip("-")
+
+
+def _powershell_is_file_flag(tok: str) -> bool:
+    """True for every spelling PowerShell takes as -File: any prefix of it, either case, `-`/`/`/`--`. The safety matcher and
+    script discovery both ask this, so what one accepts as a file flag the other cannot miss (RX-08)."""
+    flag = _powershell_flag(tok)
+    return bool(flag) and "file".startswith(flag)
+
+
 def _route_powershell_unsafe(rest: list[str]) -> str | None:
     """pwsh/powershell: only `-File <script>`; any prefix of -Command / -EncodedCommand (`-c`, `-co`, `-e`, `-ec`), or no -File at all
     (a bare argument is a command), is inline code."""
     for tok in rest:
-        if tok[:1] not in ("-", "/") or len(tok) < 2:
-            continue
-        flag = tok[1:].split(":", 1)[0].lower().lstrip("-")
+        flag = _powershell_flag(tok)
         if not flag:
             continue
-        if "file".startswith(flag):
+        if _powershell_is_file_flag(tok):
             return None                                            # what follows -File is the script's own
         if "command".startswith(flag) or "encodedcommand".startswith(flag) or "commandwithargs".startswith(flag) or flag == "ec":
             return "inline code is not a route"
@@ -2883,9 +2895,13 @@ def route_missing_reason(argv: list[str], cwd: pathlib.Path) -> str | None:
         if name in ("python", "py"):
             script = _route_python_script(argv[1:])
     elif name in ("pwsh", "powershell"):
-        lowered = [t.lower() for t in argv[1:]]
-        if "-file" in lowered and lowered.index("-file") + 1 < len(lowered):
-            script = argv[1:][lowered.index("-file") + 1]
+        rest = argv[1:]
+        at = next((i for i, t in enumerate(rest) if _powershell_is_file_flag(t)), None)    # the first one, as the matcher stops at
+        if at is not None:
+            script = rest[at].split(":", 1)[1] if ":" in rest[at] else ""                  # `-f:<script>` carries it in the token
+            if not script and at + 1 < len(rest):
+                script = rest[at + 1]
+            script = script or None
     if script is not None:
         real = (cwd / script).resolve(strict=False)                     # follows a symlink; an absolute `script` replaces cwd
         if not real.is_relative_to(cwd.resolve()):                      # containment by path, never a string prefix

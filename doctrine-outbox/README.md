@@ -119,7 +119,9 @@ because the one detail a route returns is redacted once, last (RX-06), in the fo
 a diagnostic that quotes a token cannot print what a plain one hides (RX-07). The script a launcher names
 (`python`, `py`, `node`, `bash`, `pwsh -File`, ...) must resolve, symlinks and junctions followed, to a file inside the
 scratch clone: an absolute path, a `..` path or an outward link is `ROUTE_MISSING ... resolves outside the scratch clone`,
-never run (RX-08). `--timeout` must be a finite number of seconds above zero; `nan`, `inf`, `0` and a negative value
+never run (RX-08). That holds for every spelling PowerShell takes for `-File` (`-f`, `-fi`, `-fil`, any case, `/f`,
+`-f:<script>`): script discovery and the safety matcher share one file-flag test, so an abbreviation cannot skip the
+containment check (RX-08-PWSH-FILE-ALIASES). `--timeout` must be a finite number of seconds above zero; `nan`, `inf`, `0` and a negative value
 are refused before any route runs (RX-09). Put a
 command a card ships but the bus does not yet have in prose, not in a route.
 

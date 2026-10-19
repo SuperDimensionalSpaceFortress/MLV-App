@@ -14,6 +14,7 @@ Named mutations (each turns the named test red, then is reverted):
   M2  run routes in the bus instead of the scratch clone                -> test_routes_never_run_in_the_bus_and_the_scratch_is_removed
   M3  let screen_ruling_candidate return early                          -> test_seed_469_ruling_candidate_without_the_list_is_refused
   M13 drop the containment test in route_missing_reason (r5, RX-08)     -> the test_rx08_* outside-path rows
+  M14 script discovery looks only for the exact `-file` (r6, RX-08)     -> the test_rx08_every_pwsh_file_flag_form_* outside rows
 """
 from __future__ import annotations
 
@@ -1249,6 +1250,66 @@ def test_rx08_a_script_inside_the_clone_is_accepted(tmp_path):
 def test_rx08_a_missing_script_inside_the_clone_keeps_its_reason(tmp_path):
     clone, _outside = rx08_clone(tmp_path)
     assert ob.route_missing_reason(["python", "tools/absent.py"], clone) == "tools/absent.py: no such script in the scratch clone"
+
+
+# ---------- r6 / RX-08 (PWSH-FILE-ALIASES): every spelling PowerShell accepts for -File is the file flag ----------
+# The safety matcher took any prefix of `-File` (`-f`, `-fi`, ...) but script discovery looked for the exact `-file`, so
+# `pwsh -NoProfile -f "<outside.ps1>"` left script=None, skipped the containment test and reached the launch (sol, r5).
+# Mutation M14: put the discovery back to the exact-`-file` lookup -> the outside rows below go red.
+
+PWSH_FILE_FLAG_FORMS = [
+    ["-f", "{p}"], ["-F", "{p}"], ["-fi", "{p}"], ["-fil", "{p}"], ["-file", "{p}"], ["-File", "{p}"], ["-FILE", "{p}"],
+    ["-NoProfile", "-f", "{p}"], ["-NoProfile", "-fi", "{p}"], ["/f", "{p}"], ["/File", "{p}"], ["--file", "{p}"],
+    ["-f:{p}"], ["-File:{p}"],
+]
+
+
+def rx08_pwsh_argv(tail: list[str], script: Path) -> list[str]:
+    return ["pwsh", *[t.format(p=str(script)) for t in tail]]
+
+
+@pytest.fixture
+def rx08_launch_log(monkeypatch):
+    """pwsh is taken as found, and the process launch is replaced by a recorder: no route script ever runs."""
+    launched: list[list[str]] = []
+    real_which = ob.shutil.which
+    monkeypatch.setattr(ob.shutil, "which", lambda program, *a, **k: "pwsh-on-path" if program == "pwsh" else real_which(program, *a, **k))
+    monkeypatch.setattr(ob, "run_route_process", lambda argv, cwd, env, timeout: (launched.append(list(argv)) or (0, "", "")))
+    return launched
+
+
+@pytest.mark.parametrize("tail", PWSH_FILE_FLAG_FORMS, ids=[" ".join(t) for t in PWSH_FILE_FLAG_FORMS])
+def test_rx08_every_pwsh_file_flag_form_outside_the_clone_is_refused_before_launch(tmp_path, rx08_launch_log, tail):
+    clone, outside = rx08_clone(tmp_path)
+    script = outside.with_suffix(".ps1")
+    script.write_text("exit 0\n", encoding="utf-8")
+    status, detail = ob._exercise_route_argv(rx08_pwsh_argv(tail, script), clone, 30, {}, None, [])
+    assert status == "ROUTE_MISSING" and detail.endswith("resolves outside the scratch clone"), (status, detail)
+    assert rx08_launch_log == []
+
+
+@pytest.mark.parametrize("tail", PWSH_FILE_FLAG_FORMS, ids=[" ".join(t) for t in PWSH_FILE_FLAG_FORMS])
+def test_rx08_every_pwsh_file_flag_form_inside_the_clone_is_accepted(tmp_path, rx08_launch_log, tail):
+    clone, _outside = rx08_clone(tmp_path)
+    script = clone / "tools" / "ok.ps1"
+    script.write_text("exit 0\n", encoding="utf-8")
+    assert ob.route_missing_reason(rx08_pwsh_argv(tail, script), clone) is None
+    assert ob._exercise_route_argv(rx08_pwsh_argv(tail, script), clone, 30, {}, None, []) == ("ROUTE_OK", "")
+    assert len(rx08_launch_log) == 1
+
+
+@pytest.mark.parametrize("tail", [["-f", "{p}"], ["-fi", "{p}"], ["-File:{p}"]], ids=["-f", "-fi", "-File:"])
+def test_rx08_a_missing_script_behind_a_file_flag_form_keeps_its_reason(tmp_path, rx08_launch_log, tail):
+    clone, _outside = rx08_clone(tmp_path)
+    reason = ob.route_missing_reason(rx08_pwsh_argv(tail, clone / "tools" / "absent.ps1"), clone)
+    assert reason is not None and reason.endswith("no such script in the scratch clone"), reason
+
+
+def test_rx08_the_matcher_and_script_discovery_share_one_file_flag_test():
+    for tok in ("-f", "-fi", "-fil", "-file", "-File", "/f", "--file", "-f:x"):
+        assert ob._powershell_is_file_flag(tok), tok
+    for tok in ("-NoProfile", "-c", "-command", "-e", "-ec", "-fx", "-filer", "plain", "-", ""):
+        assert not ob._powershell_is_file_flag(tok), tok
 
 
 # ---------- r5 / RX-09: --timeout is a finite positive number of seconds ----------
