@@ -233,7 +233,8 @@ function Get-DvGitTimeoutMilliseconds {
     # A shorter bound can only refuse more (a timed-out call is exit -1), never admit anything.
     $seconds = 120
     $raw = [Environment]::GetEnvironmentVariable('DV_GIT_TIMEOUT_SECONDS')
-    if ($raw -match '^\d{1,3}$' -and [int]$raw -ge 1 -and [int]$raw -le 600) { $seconds = [int]$raw }
+    # r2 (opus P-01): \z, not $: .NET's $ also matches before a final newline, so '30<LF>' was accepted as 30 s.
+    if ($raw -match '^[0-9]{1,3}\z' -and [int]$raw -ge 1 -and [int]$raw -le 600) { $seconds = [int]$raw }
     $seconds * 1000
 }
 
@@ -293,6 +294,8 @@ $script:DvGitExecutable = 'git'
 # Job objects opened and closed by Invoke-DvGit (Windows). Equal after every call; a test reads them to prove no handle leaks.
 $script:DvJobsOpened = 0
 $script:DvJobsClosed = 0
+# Where Invoke-DvGit collects git's stdout. Module-private seam: a test swaps in a sink that faults, to prove a faulted pipe read is typed.
+$script:DvGitNewSink = { [IO.MemoryStream]::new() }
 
 function Invoke-DvGit {
     # Run git in $RepoRoot; returns exit code, stdout BYTES (a blob must not be re-encoded or newline-translated) and stderr.
@@ -331,7 +334,7 @@ function Invoke-DvGit {
         if ($job -ne [IntPtr]::Zero) { [void]$native::AssignProcessToJobObject($job, $proc.Handle) }
         $proc.StandardInput.Close()
         $errTask = $proc.StandardError.ReadToEndAsync()
-        $ms = [IO.MemoryStream]::new()
+        $ms = & $script:DvGitNewSink
         $outTask = $proc.StandardOutput.BaseStream.CopyToAsync($ms)
         if (-not $proc.WaitForExit($limit)) {
             # try { $proc.Kill($true) } catch { $null = $_ }   (r1; Stop-DvGitCall does this and also reaches children whose parent exited)
@@ -345,10 +348,18 @@ function Invoke-DvGit {
         # stderr still open is a typed failure, exit -1 (DV_GIT_PIPE_STRAGGLER, a sibling of DV_GIT_TIMEOUT): never git's own exit code with
         # the bytes that happened to arrive, and never ToArray() while CopyToAsync may still be writing. The drain shares the git bound.
         $drain = [Math]::Min(10000, $limit)
-        if (-not [System.Threading.Tasks.Task]::WaitAll([System.Threading.Tasks.Task[]]@($outTask, $errTask), $drain)) {
+        # HARDENING-2 (2): a faulted pipe read makes WaitAll throw (AggregateException). That is a typed failure too, exit -1 DV_GIT_PIPE_FAULT.
+        $drained = $false; $fault = $null
+        try { $drained = [System.Threading.Tasks.Task]::WaitAll([System.Threading.Tasks.Task[]]@($outTask, $errTask), $drain) } catch { $fault = $_.Exception.GetBaseException() }
+        if ($null -ne $fault) {
+            Stop-DvGitCall -Proc $proc -Job $job -Tag $tag
+            return [pscustomobject]@{ exitCode = -1; bytes = [byte[]]@(); stderr = "DV_GIT_PIPE_FAULT reading git's output failed ($($fault.GetType().Name): $($fault.Message)): git $($GitArgs -join ' ')" }
+        }
+        if (-not $drained) {
             $gitExit = $proc.ExitCode
             Stop-DvGitCall -Proc $proc -Job $job -Tag $tag
-            # r3 (CoS N4): the kill is confirmed by the evidence that matters, the pipes closing. Closed within 5 s = every holder is gone.
+            # r3 (CoS N4): the kill is confirmed by the evidence that matters, the pipes closing. Closed within 5 s = every holder of the pipe
+            # closed its copy of it (KILL-NOT-CONFIRMED-ROW-1: a holder that ended on its own in that window counts, as does one that was killed).
             $confirmed = $false
             try { $confirmed = [System.Threading.Tasks.Task]::WaitAll([System.Threading.Tasks.Task[]]@($outTask, $errTask), 5000) } catch { $null = $_ }
             return [pscustomobject]@{ exitCode = -1; bytes = [byte[]]@(); stderr = (Get-DvStragglerMessage -GitExit $gitExit -Seconds ($drain / 1000) -KillConfirmed $confirmed -GitArgs $GitArgs) }
@@ -356,7 +367,8 @@ function Invoke-DvGit {
         [pscustomobject]@{ exitCode = $proc.ExitCode; bytes = $ms.ToArray(); stderr = $errTask.Result }
     } finally {
         if ($null -ne $proc) { $proc.Dispose() }
-        if ($job -ne [IntPtr]::Zero) { [void]$native::CloseHandle($job); $script:DvJobsClosed++ }
+        # r2 (opus): the counter moves only on CloseHandle's own true return, so a build that drops the call can no longer pass the open = closed pin.
+        if ($job -ne [IntPtr]::Zero -and $native::CloseHandle($job)) { $script:DvJobsClosed++ }
     }
 }
 
@@ -427,7 +439,8 @@ function Get-DvBlobIdAtCommit {
 }
 
 $script:LegsRelativeDir = 'tools/profiling/dual-venue/legs'
-$script:LegBlobCache = @{}
+# Ordinal keys (HARDENING-2 (3)): @{} compares case-insensitively, so /tmp/Repo and /tmp/repo (two repos on a case-sensitive filesystem) shared an entry.
+$script:LegBlobCache = [hashtable]::new([StringComparer]::Ordinal)
 $script:LookReceiptPattern = '^look-receipts/[a-z0-9-]+\.marxml$'
 
 function Read-DvCommittedLookReceipt {
@@ -475,7 +488,8 @@ function Find-DvCommittedLegSpec {
         # re-read every blob of the directory (two git spawns each), which made finding all N shipped legs quadratic in N.
         # Keyed by repo AND blob id (CoS N1): a hit must not skip Get-DvBlobById's "a blob of this repository" check for a second repo
         # that one process looks at (as the tests do). r1 keyed by $id alone.
-        $cacheKey = $RepoRoot + [char]0 + $id
+        # HARDENING-2 (3): the root is normalised, so 'C:\r', 'C:\r\' and 'C:\x\..\r' are one repo and one entry per blob.
+        $cacheKey = [IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetFullPath($RepoRoot)) + [char]0 + $id
         $blob = $script:LegBlobCache[$cacheKey]
         if ($null -eq $blob) {
             $blob = Get-DvBlobById -RepoRoot $RepoRoot -BlobSha $id
