@@ -67,9 +67,20 @@ ALLOW-LIST ENTRIES ARE BOUND TO THE ROW'S TEXT (r5, CoS I2).  An entry carries t
 (a hook row's command, a playback row's sentence; r8: for a static hook row the JSON of [hook, command, tool, cwd, board root]); the LOOSENED line prints it.  A row whose id matches but whose text hash does not
 is treated as unlisted, so editing a row's text under an old id cannot inherit an old excuse.
 
+THE MAIN-PATH PASS (SAFETY-LINT-PARITY-MAIN-PATH-1, CoS #475 I3).  Payload rows reach the hook through `decide()` directly, so before this pass
+a head change to `main()` or `parse_argv`, the fail-closed paths around `decide()`, was NOT compared: a head whose `parse_argv` returned
+ALLOW on an argv master refuses passed parity.  Now every payload row (the derived CASES and the static corpus) is ALSO driven through the
+hook's real `main()` on master and on the head, as a `main:<id>` twin with lint `hook-main`: stdin is the row's JSON, argv is the registered
+`--project-dir <venue>`, the environment is the row's, and `SystemExit` and escaping exceptions are caught.  MAIN_PATH_ROWS adds the entry-point
+shapes no corpus row expresses (no argv, an unknown / abbreviated / valueless flag, a stray positional, a missing or non-object tool_input).
+Raw-stdin rows (not JSON, empty, no tool_name, an array) already went through `main()` and get no twin.  Exit status is read as the host reads
+it: 2 blocks, everything else (0, 1, an uncaught traceback) lets the call through, so a `main()` that crashes where master refuses is a
+LOOSENED row.  Twins are classified, allow-listed (by id `main:<id>` and text hash) and reported exactly like payload rows.  `--no-main` skips
+the pass.  The playback lint has NO entry point to drive: lane-local-playback-lint.ps1 is dot-sourced and "runs nothing"; its fail-closed
+callers (Invoke-Lane.ps1, dispatch-perf-lane.ps1) are not compared by this runner.
+
 KNOWN LIMITS.
-  * Payload rows reach the hook through `decide()` directly (a raw-stdin row goes through `main()`), so a head change to `main()` or
-    `parse_argv`, the fail-closed paths around `decide()`, is NOT compared by this runner.  A `main()` pass is a follow-up card (CoS I3).
+  * The main-path pass covers the hook only (see above); a head change to the callers of the playback lint is not compared.
   * Only the corpus (the head's and, since r6, the baseline's), the head's rows and the baseline's rows are judged.  A master-denied
     command that appears in none of them is invisible to the run, which is what safety_lint_parity_corpus.json and the defeater-
     corpus card are for.
@@ -543,15 +554,26 @@ def _process_state(env: dict, argv: list[str], stdin_text: str):
         os.environ.update(saved_env)
 
 
-def hook_verdict(module, stdin_text: str, env: dict, venue: str | None) -> tuple[str, str]:
-    """(DENY|ALLOW, reason) from one hook module. A payload row goes through `decide` so a rule that throws surfaces as an error
-    here instead of being turned into a fail-closed deny by `main`; a raw-stdin row can only go through `main`."""
+def _payload_dict(stdin_text: str) -> dict | None:
+    """The stdin text as a JSON object, or None when it is not one (empty, not JSON, an array ...): such a row can only go through `main`."""
     try:
         payload = json.loads(stdin_text)
     except ValueError:
-        payload = None
-    if payload is None or not isinstance(payload, dict):
-        argv = [getattr(module, "__file__", "hook")] + (["--project-dir", venue] if venue is not None else [])
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _venue_argv(venue: str | None) -> list[str]:
+    """The argv tail the registered hook command passes: `--project-dir <venue>`, or nothing for a row with no venue."""
+    return ["--project-dir", venue] if venue is not None else []
+
+
+def hook_verdict(module, stdin_text: str, env: dict, venue: str | None) -> tuple[str, str]:
+    """(DENY|ALLOW, reason) from one hook module. A payload row goes through `decide` so a rule that throws surfaces as an error
+    here instead of being turned into a fail-closed deny by `main`; a raw-stdin row can only go through `main`."""
+    payload = _payload_dict(stdin_text)
+    if payload is None:
+        argv = [getattr(module, "__file__", "hook")] + _venue_argv(venue)
         with _process_state(env, argv, stdin_text) as err:
             code = module.main()
             reason = err.getvalue().strip()
@@ -565,16 +587,100 @@ def hook_verdict(module, stdin_text: str, env: dict, venue: str | None) -> tuple
     raise ParityError(f"hook returned exit code {code!r}")
 
 
-def run_hook(base_module, head_module, cases: list[HookCase]) -> list[dict]:
+def hook_main_verdict(module, stdin_text: str, env: dict, argv_tail: list[str]) -> tuple[str, str]:
+    """(DENY|ALLOW, reason) from the module's REAL entry point, `main()`, with stdin, argv and the environment as a process would see them.
+
+    MAIN-PATH PASS (CoS #475 I3).  `decide` is only the middle of the hook: `main` owns the argv parse, the stdin read, the empty-stdin and
+    not-JSON refusals and the catch-all that turns a crashing rule into a deny.  Claude Code blocks a tool call on exit 2 ONLY; exit 0 allows it
+    and so does every other code (1, a traceback, a raised SystemExit(3) ...), so the process exit status is derived the way `sys.exit(main())`
+    derives it (None -> 0, an int as is, anything else -> 1) and only 2 is a DENY.  An uncaught exception is exit 1, i.e. fail OPEN, and reads
+    as ALLOW with the exception in the reason: a head whose `main` lets one escape has loosened a master that refuses."""
+    argv = [getattr(module, "__file__", "hook")] + list(argv_tail)
+    with _process_state(env, argv, stdin_text) as err:
+        try:
+            value = module.main()
+        except SystemExit as stop:
+            value = stop.code
+        except Exception as exc:  # noqa: BLE001 - a Python traceback exits 1: the host does not block on it
+            value = 1
+            err.write(f"uncaught {type(exc).__name__}: {exc}\n")
+        reason = err.getvalue().strip()
+    code = 0 if value is None else value if isinstance(value, int) and not isinstance(value, bool) else 1
+    if code == 2:
+        return DENY, reason
+    return ALLOW, (reason if code == 0 else f"exit {code} (the host blocks only on 2): {reason}".strip())
+
+
+# The entry-point rows no corpus row can express: they vary the ARGV or the stdin SHAPE, not the command.  (The derived CASES already carry
+# four raw-stdin rows through main(): not JSON, empty stdin, no tool_name, a JSON array.)  Measured on fork/master at 2913c40b: six of these
+# eight are DENIED (the five argv rows and the string tool_input) and two are ALLOWED (marked "master allows"): a master-ALLOW row can only
+# read `tightened` or `same`, so it records the baseline without ever failing a run.  Pinned by EXACT_MAIN_PATH_ROWS in the test.
+BENIGN_PAYLOAD = json.dumps({"tool_name": "PowerShell", "tool_input": {"command": "Get-Date"}})
+MAIN_PATH_VENUE = "C:/review/worktree"
+MAIN_PATH_ROWS = (
+    {"id": "main-path:no-tool-input", "stdin": json.dumps({"tool_name": "PowerShell"}), "argv": ["--project-dir", MAIN_PATH_VENUE],
+     "why": "decide() treats a missing tool_input as {}; master allows the empty call (master allows)"},
+    {"id": "main-path:tool-input-is-a-string", "stdin": json.dumps({"tool_name": "PowerShell", "tool_input": "Get-Date"}), "argv": ["--project-dir", MAIN_PATH_VENUE],
+     "why": "tool_input that is not an object is a hook-error deny in decide()"},
+    {"id": "main-path:no-argv", "stdin": BENIGN_PAYLOAD, "argv": [],
+     "why": "the registered command always passes --project-dir; with no argv at all parse_argv returns None and master allows a benign call (master allows)"},
+    {"id": "main-path:unknown-flag-after-project-dir", "stdin": BENIGN_PAYLOAD, "argv": ["--project-dir", MAIN_PATH_VENUE, "--bogus"],
+     "why": "parse_argv raises on an unknown flag (parse_known_args would swallow it); main turns that into a deny"},
+    {"id": "main-path:unknown-flag-alone", "stdin": BENIGN_PAYLOAD, "argv": ["--bogus"],
+     "why": "an unknown flag with no --project-dir at all"},
+    {"id": "main-path:abbreviated-flag", "stdin": BENIGN_PAYLOAD, "argv": ["--project", MAIN_PATH_VENUE],
+     "why": "allow_abbrev=False: a prefix of --project-dir is an unknown flag, not a silent match"},
+    {"id": "main-path:project-dir-without-a-value", "stdin": BENIGN_PAYLOAD, "argv": ["--project-dir"],
+     "why": "the flag with its value missing is a parse error"},
+    {"id": "main-path:stray-positional", "stdin": BENIGN_PAYLOAD, "argv": [MAIN_PATH_VENUE],
+     "why": "a bare positional argument is an unknown argument"},
+)
+
+
+def run_main_path_rows(base_module, head_module) -> list[dict]:
+    """MAIN_PATH_ROWS through both modules' `main()`, classified like every other row (lint `hook-main`)."""
+    results = []
+    for row in MAIN_PATH_ROWS:
+        res = {"id": row["id"], "lint": "hook-main", "why": row["why"], "source": "main-path", "display": f"argv={row['argv']} stdin={row['stdin'][:120]}",
+               "text_hash": short_hash(json.dumps(["hook-main", row["stdin"], row["argv"]], sort_keys=True))}
+        tmp = tempfile.mkdtemp(prefix="parity-main-path-")
+        try:
+            board = os.path.join(tmp, "board")
+            paths = {"BOARD": board, "CACHE": os.path.join(tmp, "cache"),
+                     "SNAPSHOT": os.path.join(board, ".claude-state", "coordination", "dual-lane", "receipts", "required-checks-live.jsonl")}
+            env, _ = _hook_env(paths, {}, object(), "")
+            res["master"], res["master_reason"] = hook_main_verdict(base_module, row["stdin"], env, row["argv"])
+            res["head"], res["head_reason"] = hook_main_verdict(head_module, row["stdin"], env, row["argv"])
+        except Exception as exc:  # noqa: BLE001 - a row that cannot be run is never a pass
+            res["error"] = f"{type(exc).__name__}: {exc}"[:400]
+        finally:
+            shutil.rmtree(tmp, True)
+        results.append(res)
+    return results
+
+
+def run_hook(base_module, head_module, cases: list[HookCase], main_pass: bool = False) -> list[dict]:
+    """Every case through `decide` (or `main` for a raw-stdin row) on both modules; with `main_pass`, every payload case is ALSO driven through
+    `main()` (argv `--project-dir <venue>`, the case's stdin and environment) as a `main:<id>` twin, and the MAIN_PATH_ROWS follow."""
     results = []
     for case in cases:
         res = {"id": case.id, "lint": "hook", "why": case.why, "source": case.source, "display": case.display,
                "text_hash": short_hash(case.text)}
         cleanup = None
+        twin = None
         try:
             stdin_text, env, venue, cleanup = case.build()
             res["master"], res["master_reason"] = hook_verdict(base_module, stdin_text, env, venue)
             res["head"], res["head_reason"] = hook_verdict(head_module, stdin_text, env, venue)
+            # a raw-stdin row already went through main() above, with this very argv: a twin would only repeat it
+            if main_pass and _payload_dict(stdin_text) is not None:
+                twin = {"id": "main:" + case.id, "lint": "hook-main", "why": f"{case.why} [through main()]", "source": case.source,
+                        "display": case.display, "text_hash": short_hash("main\n" + case.text)}
+                try:
+                    twin["master"], twin["master_reason"] = hook_main_verdict(base_module, stdin_text, env, _venue_argv(venue))
+                    twin["head"], twin["head_reason"] = hook_main_verdict(head_module, stdin_text, env, _venue_argv(venue))
+                except Exception as exc:  # noqa: BLE001 - the twin cannot be run: an error row, not a pass
+                    twin["error"] = f"{type(exc).__name__}: {exc}"[:400]
         except Exception as exc:  # noqa: BLE001 - a lint that throws is a row that cannot be decided
             res["error"] = f"{type(exc).__name__}: {exc}"[:400]
         finally:
@@ -582,6 +688,10 @@ def run_hook(base_module, head_module, cases: list[HookCase]) -> list[dict]:
                 with contextlib.suppress(Exception):
                     cleanup()
         results.append(res)
+        if twin is not None:
+            results.append(twin)
+    if main_pass:
+        results += run_main_path_rows(base_module, head_module)
     return results
 
 
@@ -759,7 +869,7 @@ def collect(lints, corpus_path: Path, derived: bool, root: Path = ROOT, base_ref
 
 
 def run(base: str, lints, corpus_path: Path = DEFAULT_CORPUS, allow_path: Path = DEFAULT_ALLOW, head_hook: Path | None = None,
-        head_lint: Path | None = None, derived: bool = True, root: Path = ROOT) -> dict:
+        head_lint: Path | None = None, derived: bool = True, root: Path = ROOT, main_pass: bool = True) -> dict:
     stats = {"pwsh_spawns": 0}
     allow = load_allow(allow_path)
     base_sha = git(root, "rev-parse", "--verify", base + "^{commit}").strip()
@@ -776,7 +886,7 @@ def run(base: str, lints, corpus_path: Path = DEFAULT_CORPUS, allow_path: Path =
             # r7: the head loads from the SAME resolved spelling as master. Before, master got .resolve() and the head the raw path, so a head hook
             # under an alias (8.3 short name, junction, subst drive: a hosted Windows temp dir) derived a different worktree_root than master.
             head_module = load_module(head_hook_path.resolve(), "parity_head_hook")
-            results += run_hook(base_module, head_module, hook_cases)
+            results += run_hook(base_module, head_module, hook_cases, main_pass)
         if playback_rows:
             if pb is None or not getattr(pb, "PWSH", None):
                 raise ParityError("pwsh is not on PATH: the playback lint cannot be judged")
@@ -801,7 +911,7 @@ def run(base: str, lints, corpus_path: Path = DEFAULT_CORPUS, allow_path: Path =
     return {"base": base, "base_sha": base_sha, "head_sha": head_sha, "lints": list(lints), "rc": rc, "rows": len(results),
             "counts": counts, "loosened_unlisted": len(loosened), "allowed": sum(1 for r in results if r["allowed"]),
             "stale_allow_ids": sorted(set(allow) - {r["id"] for r in results if r["class"] == "LOOSENED"}),
-            "pwsh_spawns": stats["pwsh_spawns"], "notes": notes, "results": results}
+            "pwsh_spawns": stats["pwsh_spawns"], "main_rows": sum(1 for r in results if r["lint"] == "hook-main"), "notes": notes, "results": results}
 
 
 def render(report: dict) -> str:
@@ -823,7 +933,7 @@ def render(report: dict) -> str:
     c = report["counts"]
     lines.append(f"SAFETY-LINT-PARITY rc={report['rc']} rows={report['rows']} same={c['same']} tightened={c['tightened']} "
                  f"loosened={c['LOOSENED']} (unlisted={report['loosened_unlisted']}, allowed={report['allowed']}) error={c['error']} "
-                 f"pwsh_spawns={report['pwsh_spawns']}")
+                 f"pwsh_spawns={report['pwsh_spawns']} main_rows={report['main_rows']}")
     return "\n".join(lines)
 
 
@@ -837,10 +947,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--head-hook", type=Path, default=None, help="judge this hook file as the head (default: the working tree's)")
     parser.add_argument("--head-lint", type=Path, default=None, help="judge this playback lint as the head (default: the working tree's)")
     parser.add_argument("--no-derived", action="store_true", help="skip rows derived from the head's test modules (the JSON corpus only)")
+    parser.add_argument("--no-main", action="store_true", help="skip the main()-path pass (the hook's argv/stdin entry point); decide()-level rows only")
     args = parser.parse_args(argv)
     lints = LINTS if args.lint == "all" else (args.lint,)
     try:
-        report = run(args.base, lints, args.corpus, args.allow, args.head_hook, args.head_lint, not args.no_derived)
+        report = run(args.base, lints, args.corpus, args.allow, args.head_hook, args.head_lint, not args.no_derived, main_pass=not args.no_main)
     except ParityError as exc:
         print(f"SAFETY-LINT-PARITY rc={EXIT_UNDECIDED} CANNOT-DECIDE: {exc}")
         return EXIT_UNDECIDED

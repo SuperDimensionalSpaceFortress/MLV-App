@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """SAFETY-LINT-MASTER-PARITY-DIFF-1: tests for tools/repo_hygiene/safety_lint_parity.py (the master-vs-head safety-lint runner).
 
-Cost: the hook-only tests run in process (zero pwsh). Exactly ONE test (the base == head full-corpus pin) runs the playback lint, and
+Cost: the hook-only tests run in process (zero pwsh); the main()-path pass (MainPathPassTests) is in process too. Exactly ONE test (the base == head full-corpus pin) runs the playback lint, and
 it spawns two pwsh processes (master's lint, the head's; `pwsh_spawns` is asserted). Base is "HEAD" throughout, so the tests do not
 depend on a fork/master ref being fetched; the real-tree run against fork/master is the CLI in the PR body.
 HeadVersusBaselineGateTests is the gate itself; it runs (two more pwsh) only when a lint differs from the merge-base's, and skips otherwise,
@@ -43,6 +43,7 @@ DENIED = {"id": "t-protected-rd", "lint": "hook", "tool_name": "PowerShell", "bo
 # command under another tool, venue or board).
 DENIED_HASH = slp.short_hash(json.dumps(["hook", DENIED["command"], DENIED["tool_name"], DENIED["cwd"], DENIED["board_root"]], sort_keys=True, default=str))
 
+NO_MAIN = "--no-main"  # skips the main()-path pass: the decide()-level tests below pin exact row accounting that the main: twins would change
 ALWAYS_ALLOW_HOOK ="def decide(payload, project_dir):\n    return 0, ''\n\n\ndef main():\n    return 0\n"
 ALWAYS_THROW_HOOK = "def decide(payload, project_dir):\n    raise RuntimeError('synthetic rule crash')\n\n\ndef main():\n    return 0\n"
 
@@ -77,10 +78,12 @@ class ParityRunnerCase(unittest.TestCase):
     def head_hook(self, source: str) -> Path:
         return _write(self.tmp / "head_hook.py", source)
 
-    def cli(self, *args):
+    def cli(self, *args, main=False):
+        """The hook half of the CLI. The decide()-level tests pin exact row accounting, so they run `--no-main`; `main=True` runs the
+        main()-path pass too (MainPathPassTests)."""
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            rc = slp.main(["--base", "HEAD", "--lint", "hook", "--no-derived", *args])
+            rc = slp.main(["--base", "HEAD", "--lint", "hook", "--no-derived", *(() if main else (NO_MAIN,)), *args])
         return rc, out.getvalue()
 
 
@@ -420,6 +423,13 @@ class RootFixTests(unittest.TestCase):
         self.assertEqual(report["rc"], slp.EXIT_OK)
         self.assertGreaterEqual(report["rows"], MIN_STATIC_ROWS + MIN_DERIVED_HOOK_ROWS)
         self.assertEqual(report["pwsh_spawns"], 2 if PWSH else 0, "one pwsh per lint, however many rows")
+        # the main()-path pass ran over the whole hook corpus: a twin per payload row, every MAIN_PATH_ROWS row, all `same` against itself
+        ids = {r["id"] for r in report["results"]}
+        twins = [r for r in report["results"] if r["id"].startswith("main:")]
+        self.assertTrue(all(r["id"][len("main:"):] in ids for r in twins), "a twin without its payload row")
+        self.assertGreaterEqual(len(twins), MIN_HOOK_ROWS, "the static hook corpus alone is MIN_HOOK_ROWS payload rows")
+        self.assertEqual([r["id"] for r in slp.MAIN_PATH_ROWS if r["id"] not in ids], [])
+        self.assertEqual(report["main_rows"], len(twins) + len(slp.MAIN_PATH_ROWS))
 
 
 # r5 B1 (CoS review of 778974a4): derived rows came only from the HEAD's own test modules, so a PR that loosens a lint and flips the
@@ -482,7 +492,7 @@ class BaselineDerivedRowsTests(ParityRunnerCase):
     def run_derived(self, tests: Path, *args):
         out = io.StringIO()
         with self.redirect_head_hook_tests(tests), contextlib.redirect_stdout(out):
-            rc = slp.main(["--base", "HEAD", "--lint", "hook", "--corpus", str(self.corpus()), "--allow", str(self.allow), *args])
+            rc = slp.main(["--base", "HEAD", "--lint", "hook", NO_MAIN, "--corpus", str(self.corpus()), "--allow", str(self.allow), *args])
         return rc, out.getvalue()
 
     def test_B1_a_row_loosened_and_flipped_to_allow_with_the_count_unchanged_is_still_loosened(self):
@@ -526,7 +536,7 @@ class BaselineDerivedRowsTests(ParityRunnerCase):
             with self.subTest(baseline=label):
                 out = io.StringIO()
                 with mock.patch.object(slp, "git", fake_git), contextlib.redirect_stdout(out):
-                    rc = slp.main(["--base", "HEAD", "--lint", "hook", "--corpus", str(self.corpus()), "--allow", str(self.allow)])
+                    rc = slp.main(["--base", "HEAD", "--lint", "hook", NO_MAIN, "--corpus", str(self.corpus()), "--allow", str(self.allow)])
                 self.assertEqual(rc, slp.EXIT_UNDECIDED, out.getvalue())
                 self.assertIn("CANNOT-DECIDE", out.getvalue())
 
@@ -610,13 +620,13 @@ class BaselineContentUnionTests(ParityRunnerCase):
         # suite unedited) names those rows; the edit must add exactly one row on top of them and change no other row's class.
         control = io.StringIO()
         with contextlib.redirect_stdout(control):
-            slp.main(["--base", "HEAD", "--lint", "hook", "--corpus", str(self.corpus()), "--allow", str(self.allow), "--head-hook", str(hook)])
+            slp.main(["--base", "HEAD", "--lint", "hook", NO_MAIN, "--corpus", str(self.corpus()), "--allow", str(self.allow), "--head-hook", str(hook)])
         control_ids = _loosened_ids(control.getvalue())
         self.assertIn(LOOSENED_ROW_ID, control_ids, "the control has the unedited row, which the scratch head hook allows")
         phantom = sorted(set(control_ids) - {LOOSENED_ROW_ID})
         out = io.StringIO()
         with self.redirect_head_hook_tests(tests), contextlib.redirect_stdout(out):
-            rc = slp.main(["--base", "HEAD", "--lint", "hook", "--corpus", str(self.corpus()), "--allow", str(self.allow), "--head-hook", str(hook)])
+            rc = slp.main(["--base", "HEAD", "--lint", "hook", NO_MAIN, "--corpus", str(self.corpus()), "--allow", str(self.allow), "--head-hook", str(hook)])
         self.assertEqual(rc, slp.EXIT_LOOSENED, out.getvalue())
         self.assertRegex(out.getvalue(), rf"LOOSENED {LOOSENED_ROW_ID}@base-[0-9a-f]{{10}} ")
         self.assertIn("master=DENY head=ALLOW", out.getvalue())
@@ -678,13 +688,13 @@ class BaselineCorpusUnionTests(ParityRunnerCase):
         # tracked corpus; the edit adds exactly one row on top of whatever that layout already reads as LOOSENED.
         control = io.StringIO()
         with contextlib.redirect_stdout(control):
-            slp.main(["--base", "HEAD", "--lint", "hook", "--corpus", str(slp.DEFAULT_CORPUS), "--allow", str(self.allow), "--head-hook", str(hook)])
+            slp.main(["--base", "HEAD", "--lint", "hook", NO_MAIN, "--corpus", str(slp.DEFAULT_CORPUS), "--allow", str(self.allow), "--head-hook", str(hook)])
         control_ids = _loosened_ids(control.getvalue())
         self.assertIn(row_id, control_ids, "the control has the unedited row, which the scratch head hook allows")
         phantom = sorted(set(control_ids) - {row_id})
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            rc = slp.main(["--base", "HEAD", "--lint", "hook", "--corpus", str(head_corpus), "--allow", str(self.allow), "--head-hook", str(hook)])
+            rc = slp.main(["--base", "HEAD", "--lint", "hook", NO_MAIN, "--corpus", str(head_corpus), "--allow", str(self.allow), "--head-hook", str(hook)])
         self.assertEqual(rc, slp.EXIT_LOOSENED, out.getvalue())
         self.assertRegex(out.getvalue(), rf"LOOSENED {row_id}@base-[0-9a-f]{{10}} ")
         self.assertIn("master=DENY head=ALLOW", out.getvalue())
@@ -743,7 +753,7 @@ class BaselineCorpusUnionTests(ParityRunnerCase):
             with self.subTest(baseline=label):
                 out = io.StringIO()
                 with mock.patch.object(slp, "git", fake_git), contextlib.redirect_stdout(out):
-                    rc = slp.main(["--base", "HEAD", "--lint", "hook", "--corpus", str(self.corpus(DENIED)), "--allow", str(self.allow)])
+                    rc = slp.main(["--base", "HEAD", "--lint", "hook", NO_MAIN, "--corpus", str(self.corpus(DENIED)), "--allow", str(self.allow)])
                 self.assertEqual(rc, slp.EXIT_UNDECIDED, out.getvalue())
                 self.assertIn("CANNOT-DECIDE", out.getvalue())
                 self.assertIn("baseline corpus", out.getvalue())
@@ -799,7 +809,7 @@ class BuilderSemanticsUnionTests(ParityRunnerCase):
         out = io.StringIO()
         patch = self.redirect_head_hook_tests(tests) if tests else contextlib.nullcontext()
         with patch, contextlib.redirect_stdout(out):
-            rc = slp.main(["--base", "HEAD", "--lint", "hook", "--corpus", str(self.corpus()), "--allow", str(self.allow), "--head-hook", str(hook)])
+            rc = slp.main(["--base", "HEAD", "--lint", "hook", NO_MAIN, "--corpus", str(self.corpus()), "--allow", str(self.allow), "--head-hook", str(hook)])
         return rc, out.getvalue()
 
     def test_B3_the_cases_fields_are_unchanged_but_the_head_builder_feeds_both_lints_a_changed_command(self):
@@ -928,7 +938,7 @@ class FilesystemFixtureUnionTests(ParityRunnerCase):
     def run_main(self, hook: Path, tests: Path):
         out = io.StringIO()
         with self.redirect_head_hook_tests(tests), contextlib.redirect_stdout(out):
-            rc = slp.main(["--base", "HEAD", "--lint", "hook", "--corpus", str(self.corpus()), "--allow", str(self.allow), "--head-hook", str(hook)])
+            rc = slp.main(["--base", "HEAD", "--lint", "hook", NO_MAIN, "--corpus", str(self.corpus()), "--allow", str(self.allow), "--head-hook", str(hook)])
         return rc, out.getvalue()
 
     def twin_rows(self, tests: Path):
@@ -1039,6 +1049,189 @@ class StaticRowReusesDerivedPlaybackIdTests(ParityRunnerCase):
         # the baseline's tracked corpus is unioned in too (r6), so the count is not derived + 1; what must hold is that nothing is lost
         self.assertIn("t-b4-own-id", [r["id"] for r in rows])
         self.assertEqual({r["id"] for r in derived} - {r["id"] for r in rows}, set())
+
+
+# SAFETY-LINT-PARITY-MAIN-PATH-1 (CoS #475 I3): the hook's main() / parse_argv fail-closed paths.  Through r9 every payload row reached the hook
+# through decide() directly, so a head whose parse_argv returned ALLOW on an argv master refuses passed parity.  The synthetic heads below wrap
+# the real hook (exec'd into the scratch module's globals, like the r5-r9 heads) and replace exactly one entry-point function; nothing tracked
+# is edited.  The expected sets are the master-DENIED rows of MAIN_PATH_ROWS that each break makes a head ALLOW.
+EXACT_MAIN_PATH_ROWS = 8
+MAIN_PATH_MASTER_DENIES = ("tool-input-is-a-string", "unknown-flag-after-project-dir", "unknown-flag-alone", "abbreviated-flag",
+                           "project-dir-without-a-value", "stray-positional")
+MAIN_PATH_BAD_ARGV = tuple(i for i in MAIN_PATH_MASTER_DENIES if i != "tool-input-is-a-string")
+
+
+def _main_path_head(overrides: str) -> str:
+    """A scratch head hook: the real hook, then `overrides` (Python source) redefining one function in the same globals."""
+    real = str(REPO_ROOT / slp.HOOK_REL)
+    return "\n".join([f"_REAL = {real!r}", "exec(compile(open(_REAL, encoding='utf-8').read(), _REAL, 'exec'), globals())", overrides, ""])
+
+
+# each: (label, overrides, the master-denied MAIN_PATH_ROWS ids the head now ALLOWS)
+MAIN_PATH_BREAKS = (
+    ("parse_argv-returns-None-for-every-argv", "def parse_argv(argv):\n    return None\n", MAIN_PATH_BAD_ARGV),
+    # the exact regression the hook's own docstring names: parse_known_args swallows unknown flags (the missing value still errors, as SystemExit 2)
+    ("parse_argv-uses-parse_known_args-and-abbreviations",
+     "def parse_argv(argv):\n    import argparse\n    p = argparse.ArgumentParser(add_help=False)\n    p.add_argument('--project-dir', dest='project_dir', default=None)\n"
+     "    return p.parse_known_args(argv)[0].project_dir\n",
+     ("unknown-flag-after-project-dir", "unknown-flag-alone", "abbreviated-flag", "stray-positional")),
+    ("main-returns-0-when-parse_argv-raises",
+     "_real_main = main\n\n\ndef main():\n    try:\n        parse_argv(sys.argv[1:])\n    except _ArgvError:\n        return 0\n    return _real_main()\n", MAIN_PATH_BAD_ARGV),
+    # exit 1 is not exit 2: the host lets the call through
+    ("main-exits-1-when-parse_argv-raises",
+     "_real_main = main\n\n\ndef main():\n    try:\n        parse_argv(sys.argv[1:])\n    except _ArgvError:\n        return 1\n    return _real_main()\n", MAIN_PATH_BAD_ARGV),
+    ("main-lets-an-exception-escape", "def main():\n    raise RuntimeError('synthetic escape')\n", MAIN_PATH_MASTER_DENIES),
+    ("main-calls-sys-exit-0", "def main():\n    sys.exit(0)\n", MAIN_PATH_MASTER_DENIES),
+)
+
+
+class MainPathPassTests(ParityRunnerCase):
+    """The main()-path pass: every payload row and MAIN_PATH_ROWS through the hook's real entry point on master and on the head."""
+
+    def run_main_cli(self, source: str, *extra):
+        return self.cli("--corpus", str(self.corpus(DENIED)), "--allow", str(self.allow), "--head-hook", str(self.head_hook(source)), *extra, main=True)
+
+    # ---- RED: a head that fails open on a path around decide() must exit 1
+    def test_a_head_whose_parse_argv_allows_malformed_argv_where_master_refuses_exits_1(self):
+        rc, out = self.run_main_cli(_main_path_head("def parse_argv(argv):\n    return None\n"))
+        self.assertEqual(rc, slp.EXIT_LOOSENED, out)
+        for row in MAIN_PATH_BAD_ARGV:
+            self.assertIn(f"LOOSENED main-path:{row} [hook-main]", out)
+            self.assertIn("master=DENY head=ALLOW", out)
+
+    def test_every_break_of_the_entry_point_loosens_exactly_the_rows_it_opens(self):
+        for label, overrides, expected in MAIN_PATH_BREAKS:
+            with self.subTest(head=label):
+                rc, out = self.run_main_cli(_main_path_head(overrides))
+                self.assertEqual(rc, slp.EXIT_LOOSENED, out)
+                loosened = {i for i in _loosened_ids(out) if i.startswith("main-path:")}
+                self.assertEqual(loosened, {f"main-path:{e}" for e in expected}, out)
+
+    def test_a_main_that_crashes_is_loosened_because_the_host_blocks_only_on_exit_2(self):
+        head = self.head_hook(_main_path_head("def main():\n    raise RuntimeError('synthetic escape')\n"))
+        report = slp.run("HEAD", ("hook",), self.corpus(DENIED), self.allow, head, None, False)
+        self.assertEqual(report["rc"], slp.EXIT_LOOSENED)
+        crashed = next(r for r in report["results"] if r["id"] == "main:t-protected-rd")
+        self.assertEqual((crashed["master"], crashed["head"]), (slp.DENY, slp.ALLOW), crashed)
+        self.assertIn("uncaught RuntimeError: synthetic escape", crashed["head_reason"])
+
+    # ---- the hole, shown: the same heads pass the decide()-level run, which is what the runner did before this card
+    def test_the_same_heads_are_invisible_to_the_decide_level_pass(self):
+        for label, overrides, _ in MAIN_PATH_BREAKS:
+            with self.subTest(head=label):
+                rc, out = self.cli("--corpus", str(self.corpus(DENIED)), "--allow", str(self.allow), "--head-hook", str(self.head_hook(_main_path_head(overrides))))
+                self.assertEqual(rc, slp.EXIT_OK, out)
+                self.assertNotIn("hook-main", out)
+
+    # ---- GREEN: no diff stays exit 0
+    def test_a_head_equal_to_master_exits_0_with_every_twin_and_malformed_row_the_same(self):
+        rc, out = self.cli("--corpus", str(self.corpus(DENIED)), "--allow", str(self.allow), main=True)
+        self.assertEqual(rc, slp.EXIT_OK, out)
+        self.assertIn(f"rows={2 + EXACT_MAIN_PATH_ROWS} same={2 + EXACT_MAIN_PATH_ROWS} tightened=0 loosened=0", out)
+        self.assertIn(f"main_rows={1 + EXACT_MAIN_PATH_ROWS}", out)
+
+    def test_a_cosmetic_change_to_the_head_hook_stays_exit_0(self):
+        rc, out = self.run_main_cli(_main_path_head("_COSMETIC_CONSTANT = 1\n"))
+        self.assertEqual(rc, slp.EXIT_OK, out)
+        self.assertIn("loosened=0", out)
+
+    def test_a_head_that_refuses_more_is_tightened_not_loosened_on_the_main_path_too(self):
+        refuse_all_argv = "_real_main = main\n\n\ndef main():\n    if not sys.argv[1:]:\n        return 2\n    return _real_main()\n"
+        rc, out = self.run_main_cli(_main_path_head(refuse_all_argv))
+        self.assertEqual(rc, slp.EXIT_OK, out)
+        self.assertRegex(out, r"tightened=[1-9]")  # main-path:no-argv: master allows, the head now refuses
+
+    # ---- classification, allow-list and reporting are the payload rows' own
+    def test_a_main_path_row_is_excused_only_by_an_allow_entry_bound_to_its_id_and_hash(self):
+        rows = [r for r in slp.MAIN_PATH_ROWS if r["id"].split(":")[1] in MAIN_PATH_BAD_ARGV]
+        entries = [{"id": r["id"], "reason": "synthetic intended loosening", "pr": 999,
+                    "hash": slp.short_hash(json.dumps(["hook-main", r["stdin"], r["argv"]], sort_keys=True))} for r in rows]
+        head = self.head_hook(_main_path_head("def parse_argv(argv):\n    return None\n"))
+        allow = _write(self.tmp / "allow-main.json", json.dumps(entries))
+        rc, out = self.cli("--corpus", str(self.corpus(DENIED)), "--allow", str(allow), "--head-hook", str(head), main=True)
+        self.assertEqual(rc, slp.EXIT_OK, out)
+        self.assertIn(f"allowed={len(rows)}", out)
+        self.assertIn("ALLOWED-LOOSENED main-path:unknown-flag-alone", out)
+        stale = _write(self.tmp / "allow-stale.json", json.dumps([dict(entries[0], hash="0" * 10)]))
+        rc, out = self.cli("--corpus", str(self.corpus(DENIED)), "--allow", str(stale), "--head-hook", str(head), main=True)
+        self.assertEqual(rc, slp.EXIT_LOOSENED, out)
+        self.assertIn("treated as unlisted", out)
+
+    def test_a_payload_row_gets_a_main_twin_and_a_raw_stdin_row_does_not(self):
+        report = slp.run("HEAD", ("hook",), self.corpus(DENIED), self.allow, derived=False)
+        ids = [r["id"] for r in report["results"]]
+        self.assertEqual(ids[:2], ["t-protected-rd", "main:t-protected-rd"])
+        self.assertEqual(report["main_rows"], 1 + EXACT_MAIN_PATH_ROWS)
+        twin = report["results"][1]
+        self.assertEqual((twin["lint"], twin["master"], twin["head"], twin["class"]), ("hook-main", slp.DENY, slp.DENY, "same"))
+        raw = [slp.HookCase("hook:raw", "w", "derived", lambda: ("", {}, None, lambda: None)),
+               slp.HookCase("hook:payload", "w", "derived", lambda: (json.dumps({"tool_name": "Read", "tool_input": {}}), dict(os.environ), None, lambda: None))]
+        base = head = slp.load_module(REPO_ROOT / slp.HOOK_REL, "parity_main_twin_probe")
+        self.assertEqual([r["id"] for r in slp.run_hook(base, head, raw, True)[:3]], ["hook:raw", "hook:payload", "main:hook:payload"])
+
+    def test_no_main_skips_the_pass(self):
+        report = slp.run("HEAD", ("hook",), self.corpus(DENIED), self.allow, derived=False, main_pass=False)
+        self.assertEqual([r["id"] for r in report["results"]], ["t-protected-rd"])
+        self.assertEqual(report["main_rows"], 0)
+
+    # ---- the malformed-input table
+    def test_the_malformed_input_table_is_pinned_and_has_unique_ids(self):
+        ids = [r["id"] for r in slp.MAIN_PATH_ROWS]
+        self.assertEqual(len(ids), EXACT_MAIN_PATH_ROWS, "raise EXACT_MAIN_PATH_ROWS in the commit that ADDS a row; deleting one is the failure")
+        self.assertEqual(len(set(ids)), len(ids))
+        self.assertTrue(all(r["id"].startswith("main-path:") and r["why"].strip() for r in slp.MAIN_PATH_ROWS))
+        denied = sorted(r["id"].split(":")[1] for r in slp.MAIN_PATH_ROWS if "(master allows)" not in r["why"])
+        self.assertEqual(denied, sorted(MAIN_PATH_MASTER_DENIES), "the rows labelled as master-denied are the ones the break tests expect to loosen")
+
+    def test_the_baseline_refuses_every_row_the_table_says_it_refuses(self):
+        sha = _baseline_sha()
+        if sha is None:
+            self.skipTest("no baseline ref resolves (fork/master, origin/master, master)")
+        report = slp.run(sha, ("hook",), self.corpus(DENIED), self.allow, derived=False)
+        verdicts = {r["id"].split(":")[1]: r["master"] for r in report["results"] if r["id"].startswith("main-path:")}
+        self.assertEqual({k for k, v in verdicts.items() if v == slp.DENY} & set(MAIN_PATH_MASTER_DENIES), set(MAIN_PATH_MASTER_DENIES), verdicts)
+
+    # ---- hook_main_verdict itself: exit-status reading, and the process state a row sees
+    def probe(self, main, stdin_text="", argv_tail=(), env=None):
+        module = type(sys)("parity_probe_hook")
+        module.__file__ = "probe-hook.py"
+        module.main = main
+        return slp.hook_main_verdict(module, stdin_text, env if env is not None else {"PROBE_ENV": "1"}, list(argv_tail))
+
+    def test_the_exit_status_is_read_the_way_sys_exit_reads_it(self):
+        def raises(value):
+            def main():
+                raise SystemExit(value)
+            return main
+        for label, main, expect in (("return 0", lambda: 0, slp.ALLOW), ("return None", lambda: None, slp.ALLOW), ("return 2", lambda: 2, slp.DENY),
+                                    ("return 1", lambda: 1, slp.ALLOW), ("return 3", lambda: 3, slp.ALLOW), ("return a string", lambda: "refused", slp.ALLOW),
+                                    ("SystemExit(2)", raises(2), slp.DENY), ("SystemExit(0)", raises(0), slp.ALLOW), ("SystemExit(None)", raises(None), slp.ALLOW),
+                                    ("SystemExit('msg')", raises("msg"), slp.ALLOW)):
+            with self.subTest(main=label):
+                self.assertEqual(self.probe(main)[0], expect)
+        verdict, reason = self.probe(lambda: 1)
+        self.assertIn("exit 1", reason)
+
+    def test_an_escaping_exception_is_exit_1_and_allows_with_the_exception_named(self):
+        def boom():
+            raise KeyError("synthetic")
+        verdict, reason = self.probe(boom)
+        self.assertEqual(verdict, slp.ALLOW)
+        self.assertIn("uncaught KeyError", reason)
+        self.assertIn("exit 1", reason)
+
+    def test_main_sees_the_rows_stdin_argv_and_environment_and_leaves_the_process_as_it_found_it(self):
+        seen = {}
+
+        def main():
+            seen.update(stdin=sys.stdin.read(), argv=list(sys.argv), probe=os.environ.get("PROBE_ENV"), home=os.environ.get("HOME", "unset-sentinel"))
+            sys.stderr.write("the hook's stderr line\n")
+            return 2
+        before = (sys.stdin, sys.stdout, sys.stderr, list(sys.argv), dict(os.environ))
+        verdict, reason = self.probe(main, '{"tool_name": "X"}', ["--project-dir", "V"], {"PROBE_ENV": "yes"})
+        self.assertEqual(seen, {"stdin": '{"tool_name": "X"}', "argv": ["probe-hook.py", "--project-dir", "V"], "probe": "yes", "home": "unset-sentinel"})
+        self.assertEqual((verdict, reason), (slp.DENY, "the hook's stderr line"))
+        self.assertEqual((sys.stdin, sys.stdout, sys.stderr, list(sys.argv), dict(os.environ)), before)
 
 
 def _baseline_sha() -> str | None:
