@@ -71,6 +71,7 @@ class OutputBudgetTests(unittest.TestCase):
         self.baseline["sha256"] = output_budget.sha256_file(self.root / "base.exe")
         self.candidate["sha256"] = output_budget.sha256_file(self.root / "candidate.exe")
         self.spec["baseline"]["executableSha256"] = self.baseline["sha256"]
+        self.spec["baseline"]["artifact"] = str(self.root / "base.exe")
         self.spec_path.write_text(json.dumps(self.spec), encoding="utf-8")
         self.base_result = self._write_result("base-result.json", self.baseline["path"], self.base_png)
         self.cand_result = self._write_result("candidate-result.json", self.candidate["path"], self.cand_png)
@@ -306,6 +307,53 @@ class OutputBudgetTests(unittest.TestCase):
         _, code, codes = self._preflight_codes(spec)
         self.assertEqual(4, code)
         self.assertEqual([("CLIP_PART_MISSING", "clip")], codes)
+
+    def _baseline_codes(self, spec):
+        report, code, codes = self._preflight_codes(spec)
+        return report, code, [name for name, _ in codes if name.startswith("BASELINE_")]
+
+    def test_pinned_baseline_with_unresolvable_artifact_is_unverified_without_exes(self):
+        spec = json.loads(json.dumps(self.spec))
+        spec["baseline"]["artifact"] = str(self.root / "no-such-artifact.exe")
+        report, code, baseline_codes = self._baseline_codes(spec)
+        self.assertEqual(4, code)
+        self.assertEqual(["BASELINE_ARTIFACT_UNVERIFIED"], baseline_codes)
+        self.assertFalse(report["authorizing"])
+        self.assertEqual(len(report["failures"]), len(report["typedFailures"]))
+
+    def test_non_path_artifact_identifier_is_unverified(self):
+        spec = json.loads(json.dumps(self.spec))
+        spec["baseline"]["artifact"] = "fixture://reviewed-baseline"
+        self.assertEqual(["BASELINE_ARTIFACT_UNVERIFIED"], self._baseline_codes(spec)[2])
+
+    def test_pinned_baseline_with_matching_artifact_is_verified(self):
+        report, code, baseline_codes = self._baseline_codes(json.loads(json.dumps(self.spec)))
+        self.assertEqual(0, code, report["failures"])
+        self.assertEqual([], baseline_codes)
+
+    def test_relative_artifact_resolves_against_the_spec_directory(self):
+        spec = json.loads(json.dumps(self.spec))
+        (self.root / "tools/gates/art.bin").write_bytes(b"reviewed artifact")
+        spec["baseline"]["artifact"] = "art.bin"
+        spec["baseline"]["executableSha256"] = output_budget.sha256_file(self.root / "tools/gates/art.bin")
+        report, code, baseline_codes = self._baseline_codes(spec)
+        self.assertEqual(0, code, report["failures"])
+        self.assertEqual([], baseline_codes)
+
+    def test_artifact_with_a_different_sha256_is_a_distinct_code(self):
+        # distinct from UNVERIFIED (as RECEIPT_HASH_MISMATCH is from RECEIPT_MISSING): "cannot be found" is retryable by
+        # acquiring the artifact, "found but wrong bytes" means the pin or the store is wrong.
+        spec = json.loads(json.dumps(self.spec))
+        spec["baseline"]["executableSha256"] = "C" * 64
+        report, code, baseline_codes = self._baseline_codes(spec)
+        self.assertEqual(4, code)
+        self.assertEqual(["BASELINE_ARTIFACT_SHA_MISMATCH"], baseline_codes)
+        self.assertEqual(len(report["failures"]), len(report["typedFailures"]))
+
+    def test_unpinned_baseline_is_not_also_reported_as_an_unverified_artifact(self):
+        report, code, baseline_codes = self._baseline_codes(self._unpinned())
+        self.assertEqual(4, code)
+        self.assertEqual(["BASELINE_NOT_PINNED"], baseline_codes)
 
     def test_relative_receipt_path_resolves_against_the_repo_root_and_cannot_escape_it(self):
         (self.root / "tools/gates/receipts").mkdir()
