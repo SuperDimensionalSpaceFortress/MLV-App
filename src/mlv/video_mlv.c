@@ -9484,15 +9484,19 @@ static int mlv_processed8_prefetch_wait_slice_locked(mlvObject_t * video,
     {
         return ETIMEDOUT;
     }
-    const double slice_s = (remaining_s < 0.05) ? remaining_s : 0.05;
+    const double max_slice_s = (video->processed8_prefetch_test_wait_slice_ms > 0)
+        ? (double)video->processed8_prefetch_test_wait_slice_ms / 1000.0
+        : 0.05;
+    const double slice_s = (remaining_s < max_slice_s) ? remaining_s : max_slice_s;
     struct timespec abstime;
     if (clock_gettime(CLOCK_REALTIME, &abstime) != 0)
     {
         return EINVAL;
     }
-    const long slice_ns = (long)(slice_s * 1e9);
-    abstime.tv_nsec += slice_ns % 1000000000L;
-    abstime.tv_sec += (time_t)(slice_ns / 1000000000L);
+    const int64_t slice_ns = (int64_t)(slice_s * 1e9)
+                           + video->processed8_prefetch_test_wall_clock_skew_ns;
+    abstime.tv_nsec += (long)(slice_ns % 1000000000LL);
+    abstime.tv_sec += (time_t)(slice_ns / 1000000000LL);
     if (abstime.tv_nsec >= 1000000000L)
     {
         ++abstime.tv_sec;
@@ -9501,7 +9505,12 @@ static int mlv_processed8_prefetch_wait_slice_locked(mlvObject_t * video,
     const int rc = pthread_cond_timedwait(&video->processed8_prefetch_cond,
                                           &video->processed8_prefetch_mutex,
                                           &abstime);
-    return (rc == ETIMEDOUT) ? 0 : rc;
+    if (rc == ETIMEDOUT)
+    {
+        ++video->processed8_prefetch_test_slice_expiries;
+        return 0;
+    }
+    return rc;
 }
 
 int mlvWaitForProcessed8PrefetchIdleForTesting(mlvObject_t * video,
@@ -9682,6 +9691,9 @@ mlvObject_t * initMlvObject()
     video->processed8_prefetch_test_paused_before_store = 0;
     video->processed8_prefetch_test_idle_waiters = 0;
     video->processed8_prefetch_test_prepare_failures = 0;
+    video->processed8_prefetch_test_wait_slice_ms = 0;
+    video->processed8_prefetch_test_wall_clock_skew_ns = 0;
+    video->processed8_prefetch_test_slice_expiries = 0;
     video->raw_uint16_prefetch_threads_started = 0;
     video->raw_uint16_prefetch_decoders = 0;
     video->raw_uint16_prefetch_stop = 0;

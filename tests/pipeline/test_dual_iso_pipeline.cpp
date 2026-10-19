@@ -11934,6 +11934,61 @@ static bool waitForProcessed8PrefetchIdleOrHang(mlvObject_t * video)
     return false;
 }
 
+/* PROCESSED8-IDLE-WAIT-PREDICATE-RECHECK-1 r2: wait until a test idle waiter
+ * is parked on processed8_prefetch_cond. The waiter raises the idle-waiter
+ * count and enters the cond wait under one hold of the mutex, so a count above
+ * zero seen under the mutex means it is inside the wait. The budget is a
+ * steady_clock deadline, not an iteration cap: a 1 ms sleep runs at the
+ * Windows timer granularity, and r1's 5000 x 1 ms cap ran 80-91 s. */
+static bool waitForProcessed8IdleWaiterParked(mlvObject_t * video, const char * test_name)
+{
+    constexpr auto kParkBudget = std::chrono::milliseconds(5000);
+    const auto park_start = std::chrono::steady_clock::now();
+    const auto park_deadline = park_start + kParkBudget;
+    for (;;)
+    {
+        pthread_mutex_lock(&video->processed8_prefetch_mutex);
+        const bool parked = video->processed8_prefetch_test_idle_waiters > 0;
+        pthread_mutex_unlock(&video->processed8_prefetch_mutex);
+        if (parked)
+        {
+            return true;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= park_deadline)
+        {
+            std::fprintf(stderr,
+                         "%s: INCONCLUSIVE: the idle waiter did not park within the %lld ms steady_clock budget (waited %.1f ms)\n",
+                         test_name,
+                         static_cast<long long>(kParkBudget.count()),
+                         std::chrono::duration<double, std::milli>(now - park_start).count());
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
+/* Sets the processed8 slice-wait seams and zeroes the expired-slice counter.
+ * slice_ms 0 keeps the production 50 ms slice; wall_clock_skew_ns 0 is none. */
+static void setProcessed8WaitSeams(mlvObject_t * video,
+                                   uint32_t slice_ms,
+                                   int64_t wall_clock_skew_ns)
+{
+    pthread_mutex_lock(&video->processed8_prefetch_mutex);
+    video->processed8_prefetch_test_wait_slice_ms = slice_ms;
+    video->processed8_prefetch_test_wall_clock_skew_ns = wall_clock_skew_ns;
+    video->processed8_prefetch_test_slice_expiries = 0;
+    pthread_mutex_unlock(&video->processed8_prefetch_mutex);
+}
+
+static int readProcessed8SliceExpiries(mlvObject_t * video)
+{
+    pthread_mutex_lock(&video->processed8_prefetch_mutex);
+    const int expiries = video->processed8_prefetch_test_slice_expiries;
+    pthread_mutex_unlock(&video->processed8_prefetch_mutex);
+    return expiries;
+}
+
 /* 2026-06-11: the prefetch worker learned the indirect processed16->8 render
  * for direct8-incompatible processing states (the default Auto Look Assist
  * preset is the common real-world case). Three contracts are pinned here:
@@ -12395,7 +12450,10 @@ TEST(DualIsoPipeline, Processed8InvalidationRejectsInFlightOldGenerationStoreAnd
     ASSERT_EQ(0, getMlvLastProcessed8PrefetchHit());
 
     /* Also pin the condition-variable contract: an idle waiter blocked only
-     * by a pending request must wake when invalidation clears and broadcasts. */
+     * by a pending request must wake when invalidation clears and broadcasts.
+     * The fallback slice is widened to the whole budget, so the waiter can
+     * only return early on a broadcast, never on a slice re-check. */
+    setProcessed8WaitSeams(fixture.video(), 5000, 0);
     pthread_mutex_lock(&fixture.video()->processed8_prefetch_mutex);
     fixture.video()->processed8_prefetch_request_pending = 1;
     pthread_mutex_unlock(&fixture.video()->processed8_prefetch_mutex);
@@ -12406,17 +12464,8 @@ TEST(DualIsoPipeline, Processed8InvalidationRejectsInFlightOldGenerationStoreAnd
         waiter_result = mlvWaitForProcessed8PrefetchIdleForTesting(fixture.video(), 5000);
     });
 
-    bool waiter_is_blocked = false;
-    for (int attempt = 0; attempt < 5000 && !waiter_is_blocked; ++attempt)
-    {
-        pthread_mutex_lock(&fixture.video()->processed8_prefetch_mutex);
-        waiter_is_blocked = fixture.video()->processed8_prefetch_test_idle_waiters > 0;
-        pthread_mutex_unlock(&fixture.video()->processed8_prefetch_mutex);
-        if (!waiter_is_blocked)
-        {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
-    }
+    bool waiter_is_blocked = waitForProcessed8IdleWaiterParked(
+        fixture.video(), "Processed8InvalidationRejectsInFlightOldGenerationStoreAndWakesWaiter");
     if (!waiter_is_blocked)
     {
         invalidateMlvProcessedPreviewCache(fixture.video());
@@ -12430,8 +12479,12 @@ TEST(DualIsoPipeline, Processed8InvalidationRejectsInFlightOldGenerationStoreAnd
     }
     const double waiter_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - waiter_start).count();
+    const int slice_expiries = readProcessed8SliceExpiries(fixture.video());
+    setProcessed8WaitSeams(fixture.video(), 0, 0);
     ASSERT_EQ(1, waiter_result);
     ASSERT_TRUE(waiter_ms < 1000.0);
+    /* Woken by the invalidation broadcast, not by a slice running out. */
+    ASSERT_EQ(0, slice_expiries);
 
     processingSetPlaybackPreviewMode(0);
     MLVAPP_TEST_UNSETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH");
@@ -12481,6 +12534,10 @@ TEST(DualIsoPipeline, Processed8PrefetchIdleWaitWakesWhenWorkerPrepareFails)
     /* Arm one worker prepare failure; the worker only consumes it on a pending
      * request, and none exists yet. */
     mlvSetProcessed8PrefetchPrepareFailuresForTesting(fixture.video(), 1);
+    /* r2: widen the fallback slice to the whole budget, so only the
+     * prepare-failure broadcast can return the waiter early (a 50 ms slice
+     * re-check would otherwise hide a missing broadcast). */
+    setProcessed8WaitSeams(fixture.video(), 5000, 0);
     pthread_mutex_lock(&fixture.video()->processed8_prefetch_mutex);
     fixture.video()->processed8_prefetch_worker_busy = 1;
     pthread_mutex_unlock(&fixture.video()->processed8_prefetch_mutex);
@@ -12491,17 +12548,8 @@ TEST(DualIsoPipeline, Processed8PrefetchIdleWaitWakesWhenWorkerPrepareFails)
         waiter_result = mlvWaitForProcessed8PrefetchIdleForTesting(fixture.video(), 5000);
     });
 
-    bool waiter_is_blocked = false;
-    for (int attempt = 0; attempt < 5000 && !waiter_is_blocked; ++attempt)
-    {
-        pthread_mutex_lock(&fixture.video()->processed8_prefetch_mutex);
-        waiter_is_blocked = fixture.video()->processed8_prefetch_test_idle_waiters > 0;
-        pthread_mutex_unlock(&fixture.video()->processed8_prefetch_mutex);
-        if (!waiter_is_blocked)
-        {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
-    }
+    bool waiter_is_blocked = waitForProcessed8IdleWaiterParked(
+        fixture.video(), "Processed8PrefetchIdleWaitWakesWhenWorkerPrepareFails");
 
     /* Hand the waiter's predicate from the test-held busy to the pending
      * request in one critical section, without waking anyone. */
@@ -12544,12 +12592,15 @@ TEST(DualIsoPipeline, Processed8PrefetchIdleWaitWakesWhenWorkerPrepareFails)
     pthread_mutex_lock(&fixture.video()->processed8_prefetch_mutex);
     failures_left = fixture.video()->processed8_prefetch_test_prepare_failures;
     pthread_mutex_unlock(&fixture.video()->processed8_prefetch_mutex);
+    const int slice_expiries = readProcessed8SliceExpiries(fixture.video());
+    setProcessed8WaitSeams(fixture.video(), 0, 0);
     std::fprintf(stderr,
-                 "Processed8PrefetchIdleWaitWakesWhenWorkerPrepareFails: waiter_result=%d waiter_ms=%.1f armed_when_blocked=%d failures_left=%d\n",
+                 "Processed8PrefetchIdleWaitWakesWhenWorkerPrepareFails: waiter_result=%d waiter_ms=%.1f armed_when_blocked=%d failures_left=%d slice_expiries=%d\n",
                  waiter_result,
                  waiter_ms,
                  armed_when_blocked,
-                 failures_left);
+                 failures_left,
+                 slice_expiries);
 
     ASSERT_TRUE(waiter_is_blocked);
     /* Inconclusive guard: the failure was still armed when the pending request
@@ -12560,9 +12611,264 @@ TEST(DualIsoPipeline, Processed8PrefetchIdleWaitWakesWhenWorkerPrepareFails)
     ASSERT_EQ(0, failures_left);
     ASSERT_EQ(1, waiter_result);
     ASSERT_TRUE(waiter_ms < 1000.0);
+    /* Woken by the prepare-failure broadcast, not by a slice running out:
+     * deleting that broadcast leaves the waiter asleep for the whole slice. */
+    ASSERT_EQ(0, slice_expiries);
 
     processingSetPlaybackPreviewMode(0);
     MLVAPP_TEST_UNSETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH");
+}
+
+/* PROCESSED8-IDLE-WAIT-PREDICATE-RECHECK-1 r2, broadcast pin for
+ * mlv_reset_processed8_prefetch_locked. mlvCancelPreviewPrefetch clears the
+ * pending request through that helper and broadcasts nowhere else (the
+ * invalidation path broadcasts a second time, so it cannot pin this one).
+ * The waiter is parked first on a test-held worker_busy, then handed to a
+ * pending request no one wakes the worker for, exactly as in the
+ * prepare-failure test. With the fallback slice widened to the budget, only
+ * the reset broadcast can return the waiter before the budget runs out. */
+TEST(DualIsoPipeline, Processed8PrefetchIdleWaitWakesOnCancelClear)
+{
+    MLVAPP_TEST_SETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH", "1");
+    processingSetPlaybackPreviewMode(1);
+    processingSetPlaybackAggressivePreviewMode(0);
+
+    QString error_message;
+    MlvPipelineFixture fixture;
+    ASSERT_TRUE(fixture.openTinyDualIso(&error_message));
+    ASSERT_TRUE(fixture.loadReceipt(QStringLiteral("tests/fixtures/receipts/tiny_dual_iso_preview.marxml"),
+                                    &error_message));
+    ASSERT_TRUE(fixture.applyReceipt(&error_message));
+
+    if ((fixture.width() % 4) != 0 || (fixture.height() % 4) != 0)
+    {
+        processingSetPlaybackPreviewMode(0);
+        MLVAPP_TEST_UNSETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH");
+        return;
+    }
+
+    (void)fixture.renderFrame8Scaled(0, 1, 4);
+    ASSERT_TRUE(waitForProcessed8PrefetchIdleOrHang(fixture.video()));
+
+    constexpr uint32_t kBudgetMs = 5000;
+    setProcessed8WaitSeams(fixture.video(), kBudgetMs, 0);
+    pthread_mutex_lock(&fixture.video()->processed8_prefetch_mutex);
+    fixture.video()->processed8_prefetch_worker_busy = 1;
+    pthread_mutex_unlock(&fixture.video()->processed8_prefetch_mutex);
+
+    int waiter_result = 0;
+    std::thread waiter([&]() {
+        waiter_result = mlvWaitForProcessed8PrefetchIdleForTesting(fixture.video(), kBudgetMs);
+    });
+    const bool waiter_is_blocked = waitForProcessed8IdleWaiterParked(
+        fixture.video(), "Processed8PrefetchIdleWaitWakesOnCancelClear");
+
+    /* Hand the waiter's predicate to a pending request, without waking anyone. */
+    int pending_before_cancel = -1;
+    int busy_before_cancel = -1;
+    pthread_mutex_lock(&fixture.video()->processed8_prefetch_mutex);
+    if (waiter_is_blocked)
+    {
+        fixture.video()->processed8_prefetch_request_pending = 1;
+    }
+    fixture.video()->processed8_prefetch_worker_busy = 0;
+    pthread_mutex_unlock(&fixture.video()->processed8_prefetch_mutex);
+    pthread_mutex_lock(&fixture.video()->processed8_prefetch_mutex);
+    pending_before_cancel = fixture.video()->processed8_prefetch_request_pending;
+    busy_before_cancel = fixture.video()->processed8_prefetch_worker_busy;
+    pthread_mutex_unlock(&fixture.video()->processed8_prefetch_mutex);
+
+    const auto clear_start = std::chrono::steady_clock::now();
+    mlvCancelPreviewPrefetch(fixture.video());
+    waiter.join();
+    const double wake_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - clear_start).count();
+    const int slice_expiries = readProcessed8SliceExpiries(fixture.video());
+    setProcessed8WaitSeams(fixture.video(), 0, 0);
+    std::fprintf(stderr,
+                 "Processed8PrefetchIdleWaitWakesOnCancelClear: waiter_result=%d wake_ms=%.1f pending_before_cancel=%d busy_before_cancel=%d slice_expiries=%d\n",
+                 waiter_result,
+                 wake_ms,
+                 pending_before_cancel,
+                 busy_before_cancel,
+                 slice_expiries);
+
+    ASSERT_TRUE(waiter_is_blocked);
+    /* Inconclusive guards: the worker had not taken the request, so only the
+     * cancel can clear the waiter's predicate. */
+    ASSERT_EQ(1, pending_before_cancel);
+    ASSERT_EQ(0, busy_before_cancel);
+    ASSERT_EQ(1, waiter_result);
+    ASSERT_EQ(0, slice_expiries);
+    ASSERT_TRUE(wake_ms < 1000.0);
+
+    processingSetPlaybackPreviewMode(0);
+    MLVAPP_TEST_UNSETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH");
+}
+
+/* PROCESSED8-IDLE-WAIT-PREDICATE-RECHECK-1 r2, broadcast pin for
+ * mlv_processed8_prefetch_note_request. A repeat request for the same frame
+ * at the same threads, scale and state takes no reset path (the next frame
+ * would not do: this clip's state signature changes from frame 0 to 1), so the
+ * request broadcast is the only thing that wakes the parked worker; without
+ * it the worker never runs, pending stays set and the idle wait reports a
+ * hang. The generation guard proves the reset path (which broadcasts too)
+ * did not run. */
+TEST(DualIsoPipeline, Processed8PrefetchIdleWaitWakesWorkerOnRepeatRequest)
+{
+    MLVAPP_TEST_SETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH", "1");
+    processingSetPlaybackPreviewMode(1);
+    processingSetPlaybackAggressivePreviewMode(0);
+
+    QString error_message;
+    MlvPipelineFixture fixture;
+    ASSERT_TRUE(fixture.openTinyDualIso(&error_message));
+    ASSERT_TRUE(fixture.loadReceipt(QStringLiteral("tests/fixtures/receipts/tiny_dual_iso_preview.marxml"),
+                                    &error_message));
+    ASSERT_TRUE(fixture.applyReceipt(&error_message));
+
+    if ((fixture.width() % 4) != 0 || (fixture.height() % 4) != 0)
+    {
+        processingSetPlaybackPreviewMode(0);
+        MLVAPP_TEST_UNSETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH");
+        return;
+    }
+
+    /* Two warm-up requests: the first render settles state the signature
+     * covers, so only the third request is a true repeat. */
+    for (int warm = 0; warm < 2; ++warm)
+    {
+        (void)fixture.renderFrame8Scaled(0, 1, 4);
+        ASSERT_TRUE(waitForProcessed8PrefetchIdleOrHang(fixture.video()));
+    }
+
+    constexpr uint32_t kBudgetMs = 10000;
+    setProcessed8WaitSeams(fixture.video(), kBudgetMs, 0);
+    pthread_mutex_lock(&fixture.video()->processed8_prefetch_mutex);
+    const uint32_t generation_before = fixture.video()->processed8_prefetch_generation;
+    pthread_mutex_unlock(&fixture.video()->processed8_prefetch_mutex);
+
+    (void)fixture.renderFrame8Scaled(0, 1, 4);
+
+    pthread_mutex_lock(&fixture.video()->processed8_prefetch_mutex);
+    const uint32_t generation_after = fixture.video()->processed8_prefetch_generation;
+    pthread_mutex_unlock(&fixture.video()->processed8_prefetch_mutex);
+
+    const int waiter_result = mlvWaitForProcessed8PrefetchIdleForTesting(fixture.video(), kBudgetMs);
+    const int slice_expiries = readProcessed8SliceExpiries(fixture.video());
+    pthread_mutex_lock(&fixture.video()->processed8_prefetch_mutex);
+    const int pending_after = fixture.video()->processed8_prefetch_request_pending;
+    pthread_mutex_unlock(&fixture.video()->processed8_prefetch_mutex);
+    setProcessed8WaitSeams(fixture.video(), 0, 0);
+    std::fprintf(stderr,
+                 "Processed8PrefetchIdleWaitWakesWorkerOnRepeatRequest: waiter_result=%d generation_before=%u generation_after=%u pending_after=%d slice_expiries=%d\n",
+                 waiter_result,
+                 static_cast<unsigned>(generation_before),
+                 static_cast<unsigned>(generation_after),
+                 pending_after,
+                 slice_expiries);
+
+    /* Inconclusive guard: no reset path, so no other broadcast. */
+    ASSERT_EQ(generation_before, generation_after);
+    ASSERT_EQ(1, waiter_result);
+    ASSERT_EQ(0, pending_after);
+    ASSERT_EQ(0, slice_expiries);
+
+    processingSetPlaybackPreviewMode(0);
+    MLVAPP_TEST_UNSETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH");
+}
+
+/* PROCESSED8-IDLE-WAIT-PREDICATE-RECHECK-1 r2, timeout branch (sol r1
+ * catalogue row): busy predicate, 1000 ms budget, the wall clock steps back
+ * 60 s after the slice deadline is read, no notification. The step is driven
+ * by the wall-clock skew seam: a CLOCK_REALTIME read 60 s ahead of the clock
+ * the cond waits on is exactly what a 60 s backward step after the read
+ * leaves behind. The waiter must time out within the monotonic budget plus
+ * one slice (the margin below is scheduler slack; the defect waits 60 s), and
+ * must not return before the budget while the predicate is still busy. No
+ * worker is started, and the test holds worker_busy, so nothing notifies. */
+TEST(DualIsoPipeline, Processed8PrefetchIdleWaitTimesOutWithinMonotonicBudgetWhenWallClockStepsBack)
+{
+    QString error_message;
+    MlvPipelineFixture fixture;
+    ASSERT_TRUE(fixture.openTinyDualIso(&error_message));
+
+    constexpr uint32_t kBudgetMs = 1000;
+    constexpr double kSliceMs = 50.0;
+    constexpr double kSchedulerSlackMs = 950.0;
+    constexpr int64_t kWallClockStepBackNs = 60LL * 1000000000LL;
+    setProcessed8WaitSeams(fixture.video(), 0, kWallClockStepBackNs);
+    pthread_mutex_lock(&fixture.video()->processed8_prefetch_mutex);
+    fixture.video()->processed8_prefetch_worker_busy = 1;
+    pthread_mutex_unlock(&fixture.video()->processed8_prefetch_mutex);
+
+    const auto wait_start = std::chrono::steady_clock::now();
+    const int waiter_result = mlvWaitForProcessed8PrefetchIdleForTesting(fixture.video(), kBudgetMs);
+    const double waited_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - wait_start).count();
+
+    const int slice_expiries = readProcessed8SliceExpiries(fixture.video());
+    pthread_mutex_lock(&fixture.video()->processed8_prefetch_mutex);
+    fixture.video()->processed8_prefetch_worker_busy = 0;
+    pthread_mutex_unlock(&fixture.video()->processed8_prefetch_mutex);
+    setProcessed8WaitSeams(fixture.video(), 0, 0);
+    std::fprintf(stderr,
+                 "Processed8PrefetchIdleWaitTimesOutWithinMonotonicBudgetWhenWallClockStepsBack: waiter_result=%d waited_ms=%.1f slice_expiries=%d\n",
+                 waiter_result,
+                 waited_ms,
+                 slice_expiries);
+
+    /* Still busy, so the predicate re-check reports a hang. */
+    ASSERT_EQ(0, waiter_result);
+    /* Returned through slices running out, not through a wake. */
+    ASSERT_TRUE(slice_expiries >= 1);
+    ASSERT_TRUE(waited_ms >= static_cast<double>(kBudgetMs) - 10.0);
+    ASSERT_TRUE(waited_ms < static_cast<double>(kBudgetMs) + kSliceMs + kSchedulerSlackMs);
+}
+
+/* PROCESSED8-IDLE-WAIT-PREDICATE-RECHECK-1 r2, slice fallback (fable r1
+ * catalogue row, silent-clear arm): a parked waiter's predicate is cleared
+ * under the mutex WITHOUT a broadcast. The production 50 ms slice must still
+ * return it long before its 5000 ms budget, and it must be a slice that ran
+ * out (not a wake) that returned it. The broadcast-present arms above return
+ * with zero expired slices. */
+TEST(DualIsoPipeline, Processed8PrefetchIdleWaitSilentClearReturnsOnSliceRecheck)
+{
+    QString error_message;
+    MlvPipelineFixture fixture;
+    ASSERT_TRUE(fixture.openTinyDualIso(&error_message));
+
+    constexpr uint32_t kBudgetMs = 5000;
+    setProcessed8WaitSeams(fixture.video(), 0, 0);
+    pthread_mutex_lock(&fixture.video()->processed8_prefetch_mutex);
+    fixture.video()->processed8_prefetch_worker_busy = 1;
+    pthread_mutex_unlock(&fixture.video()->processed8_prefetch_mutex);
+
+    int waiter_result = 0;
+    std::thread waiter([&]() {
+        waiter_result = mlvWaitForProcessed8PrefetchIdleForTesting(fixture.video(), kBudgetMs);
+    });
+    const bool waiter_is_blocked = waitForProcessed8IdleWaiterParked(
+        fixture.video(), "Processed8PrefetchIdleWaitSilentClearReturnsOnSliceRecheck");
+
+    pthread_mutex_lock(&fixture.video()->processed8_prefetch_mutex);
+    fixture.video()->processed8_prefetch_worker_busy = 0;
+    pthread_mutex_unlock(&fixture.video()->processed8_prefetch_mutex);
+    const auto clear_start = std::chrono::steady_clock::now();
+    waiter.join();
+    const double return_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - clear_start).count();
+    const int slice_expiries = readProcessed8SliceExpiries(fixture.video());
+    std::fprintf(stderr,
+                 "Processed8PrefetchIdleWaitSilentClearReturnsOnSliceRecheck: waiter_result=%d return_ms=%.1f slice_expiries=%d\n",
+                 waiter_result,
+                 return_ms,
+                 slice_expiries);
+
+    ASSERT_TRUE(waiter_is_blocked);
+    ASSERT_EQ(1, waiter_result);
+    ASSERT_TRUE(slice_expiries >= 1);
+    ASSERT_TRUE(return_ms < 1000.0);
 }
 
 /* Round-2 item 2 (2026-06-12): the indirect worker render at x2 SHARP was
