@@ -225,6 +225,148 @@ class AnchorCitationTests(unittest.TestCase):
             self.assertTrue(rfs.validate_manifest(data), evidence)
 
 
+YAML_JOBS = (
+    "jobs:\n"
+    "  route:\n"
+    "    runs-on: x\n"
+    "    steps:\n"
+    "      - name: Set up\n"
+    "        with:\n"
+    "          python-version-file: \".python-version\"\n"
+    "      # deeper comment\n"
+    "      - name: Derive\n"
+    "        run: |\n"
+    "          python tools/x.py\n"
+    "\n"
+    "  # sibling comment\n"
+    "  other:\n"
+    "    runs-on: y\n"
+    "    steps:\n"
+    "      - run: other-step\n"
+)
+YAML_COMMENT_SPLIT = (
+    "jobs:\n"
+    "  route:\n"
+    "    steps:\n"
+    "      - run: before\n"
+    "  # same-indent comment\n"
+    "      - run: after\n"
+)
+HERE_STRING = "function Foo {\n    $x = @'\ncol-zero text\n'@\n    $after = 1\n}\n"
+ALLMAN = "function Bar\n{\n    $body = 1\n}\n"
+BLANKS = "function Baz {\n    $a = 1\n\n   \n    $b = 2\n}\n"
+
+
+class ScopeBoundaryTests(unittest.TestCase):
+    """RUNTIME-FLOOR-CITE-ANCHOR-FOLLOWUPS-1: the ``within`` scope ends at the first non-blank line indented no deeper
+    than the anchor line. Rows marked PIN record that behaviour; each one is an EARLY end, which can only turn a
+    citation red (``matches 0 lines``) and can never resolve it to a different line, because ``contains`` must still
+    be unique inside the shorter scope."""
+
+    def resolve(self, text, contains, within):
+        return rfs.resolve_evidence({"contains": contains, "within": within}, text.splitlines())
+
+    def assertUnresolved(self, result):
+        line, problem = result
+        self.assertIsNone(line)
+        self.assertIn("matches 0 lines", problem)
+
+    def test_yaml_job_scope_resolves_a_line_in_the_job(self):
+        self.assertEqual((7, None), self.resolve(YAML_JOBS, "python-version-file", "  route:"))
+
+    def test_yaml_deeper_indented_comment_stays_inside_the_job(self):  # PIN
+        self.assertEqual((11, None), self.resolve(YAML_JOBS, "python tools/x.py", "  route:"))
+
+    def test_yaml_blank_line_does_not_end_the_job_scope(self):  # PIN
+        self.assertEqual((11, None), self.resolve(YAML_JOBS, "tools/x.py", "  route:"))
+
+    def test_yaml_sibling_job_is_outside_the_scope(self):  # PIN
+        self.assertUnresolved(self.resolve(YAML_JOBS, "other-step", "  route:"))
+        self.assertEqual((17, None), self.resolve(YAML_JOBS, "other-step", "  other:"))
+
+    def test_yaml_same_indent_comment_ends_the_scope_early(self):  # PIN
+        self.assertEqual((4, None), self.resolve(YAML_COMMENT_SPLIT, "before", "  route:"))
+        self.assertUnresolved(self.resolve(YAML_COMMENT_SPLIT, "after", "  route:"))
+
+    def test_column_zero_line_ends_the_scope_early(self):  # PIN
+        self.assertEqual((2, None), self.resolve(HERE_STRING, "$x", "function Foo"))
+        self.assertUnresolved(self.resolve(HERE_STRING, "$after", "function Foo"))
+
+    def test_next_line_opening_brace_leaves_an_empty_scope(self):  # PIN
+        self.assertUnresolved(self.resolve(ALLMAN, "$body", "function Bar"))
+
+    def test_blank_and_whitespace_only_lines_stay_inside_the_scope(self):  # PIN
+        self.assertEqual((5, None), self.resolve(BLANKS, "$b", "function Baz"))
+
+    def test_an_early_end_never_resolves_to_a_different_line(self):  # PIN
+        # the cited text also exists past the early end; the scoped lookup must report a problem, not that other hit
+        text = "function Foo {\n    $tag = 1\n# col-zero\n    $tag = 2\n}\n"
+        self.assertEqual((2, None), self.resolve(text, "$tag = 1", "function Foo"))
+        self.assertUnresolved(self.resolve(text, "$tag = 2", "function Foo"))
+
+
+class EvidenceReportTests(unittest.TestCase):
+    """The resolved line is reported next to the hint; drift is advice, never a failure."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="rfs-report-"))
+        self.addCleanup(shutil.rmtree, str(self.root), True)
+        (self.root / "mod.psm1").write_text(CITED_MODULE, encoding="utf-8", newline="\n")
+
+    def manifest(self, *items):
+        evidence = [{"file": "mod.psm1", **item} for item in items]
+        return manifest_of(row("a", ["mod.psm1"], ["pwsh"], [{"kind": "ps-parse"}], evidence=evidence))
+
+    def test_report_names_resolved_line_beside_each_hint(self):
+        data = self.manifest({"line": 8, "contains": "'only-here'"},
+                             {"line": 3, "contains": "pwsh.exe", "within": "function Invoke-DvLeg"},
+                             {"contains": "$tail"})
+        report = rfs.evidence_report(data, self.root)
+        self.assertEqual(3, len(report), report)
+        self.assertIn("resolved line 8, hint 8 (in sync)", report[0])
+        self.assertIn("resolved line 7, hint 3 (drifted by 4)", report[1])
+        self.assertIn("resolved line 12, no hint", report[2])
+        for line in report:
+            self.assertIn("a: mod.psm1: ", line)
+
+    def test_drift_is_not_a_problem(self):
+        data = self.manifest({"line": 9999, "contains": "'only-here'"})
+        self.assertEqual([], rfs.check_evidence(data, self.root))
+        self.assertIn("drifted by", rfs.evidence_report(data, self.root)[0])
+
+    def test_report_lists_an_unresolvable_citation_as_unresolved(self):
+        data = self.manifest({"line": 1, "contains": "no-such-text"})
+        report = rfs.evidence_report(data, self.root)
+        self.assertEqual(1, len(report), report)
+        self.assertIn("UNRESOLVED", report[0])
+        self.assertIn("matches 0 lines", report[0])
+
+    def run_cli(self, data):
+        (self.root / "manifest.json").write_text(json.dumps(data), encoding="utf-8")
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = rfs.main(["--worktree", str(self.root), "--manifest", str(self.root / "manifest.json"),
+                             "--check-evidence"])
+        return code, buffer.getvalue()
+
+    def test_check_evidence_flag_exits_0_on_drift_and_prints_the_report(self):
+        code, out = self.run_cli(self.manifest({"line": 9999, "contains": "'only-here'"}))
+        self.assertEqual(0, code, out)
+        self.assertIn("resolved line 8, hint 9999 (drifted by 9991)", out)
+
+    def test_check_evidence_flag_exits_1_on_an_unresolvable_citation(self):
+        code, out = self.run_cli(self.manifest({"line": 1, "contains": "no-such-text"}))
+        self.assertEqual(1, code, out)
+        self.assertIn("UNRESOLVED", out)
+
+    def test_check_evidence_flag_passes_on_the_checked_in_manifest(self):
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = rfs.main(["--worktree", str(REPO_ROOT), "--check-evidence"])
+        self.assertEqual(0, code, buffer.getvalue())
+        self.assertNotIn("UNRESOLVED", buffer.getvalue())
+
+
 class ValidateManifestTests(unittest.TestCase):
     def test_rejects_each_malformed_shape(self):
         good = row("a", ["x/*.ps1"], ["pwsh"], [{"kind": "ps-parse"}])

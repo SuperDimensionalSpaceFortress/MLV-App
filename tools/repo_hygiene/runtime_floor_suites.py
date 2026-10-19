@@ -23,6 +23,9 @@ Exit codes: 0 = every task that ran passed, or no row matched ("none mapped");
             2 = could not decide (bad worktree, unresolvable base, git failure, invalid manifest, a matched
                 row naming a suite file that does not exist) -- UNKNOWN, never a pass.
 
+``--check-evidence`` prints the resolved line beside each declared floor's ``line`` hint and runs nothing else
+(exit 1 only for an unresolvable citation; a drifted hint is advice).
+
 Read-only on the worktree: git calls only read, and every child runs with PYTHONDONTWRITEBYTECODE=1 and
 ``-p no:cacheprovider``. ``--list`` prints the plan without running anything.
 """
@@ -169,6 +172,11 @@ def resolve_evidence(item: dict, lines: list[str]) -> tuple[int | None, str | No
     ``contains`` must match exactly one line of the scope. The scope is the whole file, or with ``within`` the
     block that opens at the one line holding that literal and runs over the lines indented deeper than it
     (a function, a YAML job). ``line`` is only a hint: an edit above the cited text never turns it red.
+
+    The scope ends at the first non-blank line indented no deeper than the ``within`` line, so it ends EARLY at a
+    comment at the same indent, a column-zero line (a here-string body), or an opening brace on the line after the
+    ``within`` line. An early end can only turn a citation red (``matches 0 lines``): ``contains`` must still be
+    unique inside the shorter scope, so it never resolves to a different line.
     """
     scope = range(len(lines))
     where = "the file"
@@ -189,20 +197,41 @@ def resolve_evidence(item: dict, lines: list[str]) -> tuple[int | None, str | No
     return hits[0] + 1, None
 
 
-def check_evidence(manifest: dict, root: Path) -> list[str]:
-    """Each declared floor must cite, by a unique text anchor, a real file that contains the quoted text."""
-    problems: list[str] = []
+def _walk_evidence(manifest: dict, root: Path):
+    """Yield (row id, evidence item, resolved 1-based line or None, problem or None) for every citation."""
     for row in manifest["rows"]:
         for item in row.get("evidence", []):
             target = Path(root) / item["file"]
             if not target.is_file():
-                problems.append(f"{row['id']}: evidence file missing: {item['file']}")
+                yield row["id"], item, None, f"evidence file missing: {item['file']}"
                 continue
             lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
-            _, problem = resolve_evidence(item, lines)
-            if problem:
-                problems.append(f"{row['id']}: {item['file']}: {problem}")
-    return problems
+            resolved, problem = resolve_evidence(item, lines)
+            yield row["id"], item, resolved, (f"{item['file']}: {problem}" if problem else None)
+
+
+def check_evidence(manifest: dict, root: Path) -> list[str]:
+    """Each declared floor must cite, by a unique text anchor, a real file that contains the quoted text."""
+    return [f"{row_id}: {problem}" for row_id, _, _, problem in _walk_evidence(manifest, root) if problem]
+
+
+def evidence_report(manifest: dict, root: Path) -> list[str]:
+    """One line per citation: the resolved line beside its ``line`` hint. Drift is advice, never a failure; only an
+    UNRESOLVED citation (the problems ``check_evidence`` returns) is one."""
+    report = []
+    for row_id, item, resolved, problem in _walk_evidence(manifest, root):
+        if problem:
+            report.append(f"{row_id}: UNRESOLVED {problem}")
+            continue
+        hint = item.get("line")
+        if hint is None:
+            note = "no hint"
+        elif hint == resolved:
+            note = f"hint {hint} (in sync)"
+        else:
+            note = f"hint {hint} (drifted by {abs(hint - resolved)})"
+        report.append(f"{row_id}: {item['file']}: resolved line {resolved}, {note}")
+    return report
 
 
 # --- runtimes -----------------------------------------------------------------------------------------------
@@ -465,6 +494,8 @@ def main(argv: list[str] | None = None, detect=detect_runtime) -> int:
     parser.add_argument("--list", action="store_true", help="print the plan and run nothing")
     parser.add_argument("--strict-absent", action="store_true", help="a declared runtime that is absent exits 1")
     parser.add_argument("--include-slow", action="store_true", help="also run suites the manifest marks slow (over about a minute)")
+    parser.add_argument("--check-evidence", action="store_true",
+                        help="print the resolved line beside each evidence hint and run nothing else; exit 1 only on an UNRESOLVED citation")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     # Absolute once, before planning and spawning: every child runs with cwd=<worktree>, so a relative value kept
@@ -482,6 +513,15 @@ def main(argv: list[str] | None = None, detect=detect_runtime) -> int:
 
     try:
         manifest = load_manifest(Path(args.manifest) if args.manifest else worktree / DEFAULT_MANIFEST)
+        if args.check_evidence:
+            report = evidence_report(manifest, worktree)
+            result["evidence"] = report
+            if not args.json:
+                print("\n".join(report))
+            bad = sum("UNRESOLVED" in line for line in report)
+            if bad:
+                return emit(1, "FAIL", f"{bad} of {len(report)} citation(s) unresolved")
+            return emit(0, "PASS", f"{len(report)} citation(s) resolved")
         merge_base, changed = changed_files(worktree, args.base)
         result.update(mergeBase=merge_base, changed=changed)
         matched = match_rows(manifest, changed)
