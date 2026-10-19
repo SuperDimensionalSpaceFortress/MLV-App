@@ -120,6 +120,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import pathlib
 import re
@@ -2862,7 +2863,8 @@ def route_unsafe_reason(argv: list[str], cwd: str | os.PathLike | None = None, b
 
 def route_missing_reason(argv: list[str], cwd: pathlib.Path) -> str | None:
     """Why a parsed route cannot start: its program is not on PATH or in the scratch clone, it is a `.cmd`/`.bat` shim
-    (not startable without `cmd /c`, which a route may not use), or the script a launcher names is not in the clone.
+    (not startable without `cmd /c`, which a route may not use), or the script a launcher names is not in the clone
+    (missing, or resolving outside it: an absolute path, `..` or an outward symlink).
     None when it can be started."""
     program = argv[0]
     name = route_program_name(program)
@@ -2884,8 +2886,12 @@ def route_missing_reason(argv: list[str], cwd: pathlib.Path) -> str | None:
         lowered = [t.lower() for t in argv[1:]]
         if "-file" in lowered and lowered.index("-file") + 1 < len(lowered):
             script = argv[1:][lowered.index("-file") + 1]
-    if script is not None and not (cwd / script).is_file():
-        return f"{script}: no such script in the scratch clone"
+    if script is not None:
+        real = (cwd / script).resolve(strict=False)                     # follows a symlink; an absolute `script` replaces cwd
+        if not real.is_relative_to(cwd.resolve()):                      # containment by path, never a string prefix
+            return f"{script}: resolves outside the scratch clone"
+        if not real.is_file():
+            return f"{script}: no such script in the scratch clone"
     return None
 
 
@@ -3357,6 +3363,8 @@ def main(argv: list[str] | None = None) -> int:
             deny_terms = gather_deny_terms(resolve_deny_file(repo, args.deny_file))
             exercise = None
             if args.exercise:
+                if not math.isfinite(args.timeout) or args.timeout <= 0:
+                    parser.error(f"--timeout wants a finite number of seconds above zero; got {args.timeout:g}")
                 fills: dict[str, str] = {}
                 for pair in args.fill:
                     name, sep, value = pair.partition("=")

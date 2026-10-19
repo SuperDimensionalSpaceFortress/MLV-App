@@ -13,6 +13,7 @@ Named mutations (each turns the named test red, then is reverted):
   M1  drop the `script not in the clone` check in route_missing_reason  -> test_seed_468_missing_runner_script_is_route_missing
   M2  run routes in the bus instead of the scratch clone                -> test_routes_never_run_in_the_bus_and_the_scratch_is_removed
   M3  let screen_ruling_candidate return early                          -> test_seed_469_ruling_candidate_without_the_list_is_refused
+  M13 drop the containment test in route_missing_reason (r5, RX-08)     -> the test_rx08_* outside-path rows
 """
 from __future__ import annotations
 
@@ -1169,3 +1170,102 @@ def test_h7_a_character_the_stream_cannot_encode_does_not_raise():
     ob._route_say("ROUTE_OK item python tools/ok.py caf\u00e9 \u2192 \u65e5\u672c", stream)
     stream.flush()
     assert stream.buffer.getvalue().startswith(b"ROUTE_OK item")
+
+
+# ---------- r5 / RX-08: a launcher's script must resolve inside the scratch clone ----------
+# route_missing_reason accepted any existing file: an absolute path, `..` or an outward symlink ran code from outside the
+# clone (CoS B1 on 977e479e). Mutation M13: revert the containment (back to `(cwd / script).is_file()`) -> the outside rows go red.
+
+def rx08_clone(tmp_path: Path) -> tuple[Path, Path]:
+    clone = tmp_path / "clone"
+    (clone / "tools").mkdir(parents=True)
+    outside = tmp_path / "outside.py"
+    outside.write_text(STUB_MARK, encoding="utf-8")
+    return clone, outside
+
+
+def test_rx08_an_absolute_script_outside_the_clone_is_refused(tmp_path):
+    clone, outside = rx08_clone(tmp_path)
+    status, detail = ob.exercise_route(f'python "{outside}" ran.txt', clone, 30, {})
+    assert status == "ROUTE_MISSING" and "resolves outside the scratch clone" in detail, (status, detail)
+    assert not (clone / "ran.txt").exists()
+
+
+def test_rx08_a_parent_relative_script_outside_the_clone_is_refused(tmp_path):
+    clone, _outside = rx08_clone(tmp_path)
+    reason = ob.route_missing_reason(["python", "../outside.py", "ran.txt"], clone)
+    assert reason == "../outside.py: resolves outside the scratch clone", reason
+
+
+def test_rx08_a_sibling_directory_sharing_the_clone_name_prefix_is_outside(tmp_path):
+    clone, _outside = rx08_clone(tmp_path)
+    sibling = tmp_path / "clone-evil"
+    sibling.mkdir()
+    (sibling / "x.py").write_text(STUB_OK, encoding="utf-8")
+    reason = ob.route_missing_reason(["python", "../clone-evil/x.py"], clone)
+    assert reason == "../clone-evil/x.py: resolves outside the scratch clone", reason
+
+
+@pytest.mark.parametrize("argv_tail", [["-File", "{p}"], ["-NoProfile", "-File", "{p}"]])
+def test_rx08_a_pwsh_file_outside_the_clone_is_refused(tmp_path, argv_tail):
+    clone, outside = rx08_clone(tmp_path)
+    script = outside.with_suffix(".ps1")
+    script.write_text("exit 0\n", encoding="utf-8")
+    reason = ob.route_missing_reason(["pwsh", *[t.format(p=str(script)) for t in argv_tail]], clone)
+    assert reason is not None and reason.endswith("resolves outside the scratch clone"), reason
+
+
+def test_rx08_an_outward_symlink_inside_the_clone_is_refused(tmp_path):
+    clone, outside = rx08_clone(tmp_path)
+    link = clone / "tools" / "link.py"
+    try:
+        os.symlink(outside, link)
+    except (OSError, NotImplementedError) as e:
+        pytest.skip(f"this OS refused to create a symlink without privilege: {e}")
+    reason = ob.route_missing_reason(["python", "tools/link.py", "ran.txt"], clone)
+    assert reason == "tools/link.py: resolves outside the scratch clone", reason
+
+
+@pytest.mark.skipif(os.name != "nt", reason="a directory junction is a Windows thing; the symlink row covers POSIX")
+def test_rx08_an_outward_junction_inside_the_clone_is_refused(tmp_path):
+    # A junction needs no privilege, so this covers the outward-link case on a host where the symlink row skips.
+    clone, outside = rx08_clone(tmp_path)
+    target = tmp_path / "elsewhere"
+    target.mkdir()
+    (target / "x.py").write_text(STUB_MARK, encoding="utf-8")
+    made = subprocess.run(["cmd", "/c", "mklink", "/J", str(clone / "tools" / "jn"), str(target)], capture_output=True, text=True)
+    assert made.returncode == 0, made.stdout + made.stderr
+    reason = ob.route_missing_reason(["python", "tools/jn/x.py", "ran.txt"], clone)
+    assert reason == "tools/jn/x.py: resolves outside the scratch clone", reason
+
+
+def test_rx08_a_script_inside_the_clone_is_accepted(tmp_path):
+    clone, _outside = rx08_clone(tmp_path)
+    (clone / "tools" / "ok.py").write_text(STUB_OK, encoding="utf-8")
+    assert ob.route_missing_reason(["python", "tools/ok.py"], clone) is None
+    assert ob.exercise_route("python tools/ok.py", clone, 30, {}) == ("ROUTE_OK", "")
+
+
+def test_rx08_a_missing_script_inside_the_clone_keeps_its_reason(tmp_path):
+    clone, _outside = rx08_clone(tmp_path)
+    assert ob.route_missing_reason(["python", "tools/absent.py"], clone) == "tools/absent.py: no such script in the scratch clone"
+
+
+# ---------- r5 / RX-09: --timeout is a finite positive number of seconds ----------
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf", "0", "-1"])
+def test_rx09_a_nonfinite_or_nonpositive_timeout_is_refused_before_any_route_runs(tmp_path, capsys, value):
+    bus = make_bus(tmp_path, {"tools/x.py": STUB_MARK})
+    item = item_file(tmp_path, adopt("python tools/x.py ran.txt"))
+    with pytest.raises(SystemExit) as stop:
+        exercise(tmp_path, item, bus, f"--timeout={value}")
+    assert stop.value.code == 2
+    assert "--timeout wants a finite number of seconds above zero" in capsys.readouterr().err
+    assert not list(tmp_path.rglob("ran.txt"))
+
+
+def test_rx09_a_finite_positive_timeout_is_accepted(tmp_path, capsys):
+    bus = make_bus(tmp_path, {"tools/x.py": STUB_OK})
+    item = item_file(tmp_path, adopt("python tools/x.py"))
+    assert exercise(tmp_path, item, bus, "--timeout", "30") == 0
+    assert statuses(capsys.readouterr().out) == ["ROUTE_OK"]

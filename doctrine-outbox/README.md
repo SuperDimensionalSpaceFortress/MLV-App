@@ -116,7 +116,11 @@ these are `ROUTE_UNSAFE` and are not run:
 
 A credential's value is never printed: it shows as `NAME=<redacted>` in every diagnostic and route line, whatever it contains (shell syntax, `<name>`, a path, a backslash or a quote),
 because the one detail a route returns is redacted once, last (RX-06), in the form it was filled and in the form `repr()` writes it, so
-a diagnostic that quotes a token cannot print what a plain one hides (RX-07). Put a
+a diagnostic that quotes a token cannot print what a plain one hides (RX-07). The script a launcher names
+(`python`, `py`, `node`, `bash`, `pwsh -File`, ...) must resolve, symlinks and junctions followed, to a file inside the
+scratch clone: an absolute path, a `..` path or an outward link is `ROUTE_MISSING ... resolves outside the scratch clone`,
+never run (RX-08). `--timeout` must be a finite number of seconds above zero; `nan`, `inf`, `0` and a negative value
+are refused before any route runs (RX-09). Put a
 command a card ships but the bus does not yet have in prose, not in a route.
 
 **A ruling candidate names the rules it overlaps.** An item whose `### ` heading holds `RULING CANDIDATE:` or whose
