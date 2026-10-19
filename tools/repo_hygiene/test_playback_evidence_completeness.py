@@ -343,6 +343,13 @@ CONSUMER_ACTS_ON_EXIT: dict[str, str] = {
     # LEG_FAILED / INVALID and the chain exits 7, whatever DVE_OUTCOME the dead leg printed (never recorded as a RAN leg).
     "tools/profiling/dual-venue/Invoke-VenueChain.ps1":
         r"\$legCode\s*=\s*\$LASTEXITCODE[\s\S]*?if\s*\(\$legCode\s+-ne\s+0\)\s*\{[\s\S]*?'LEG_FAILED'[\s\S]*?\$exitCode\s*=\s*7\b",
+    # UM-REGULAR-BASELINE-1 r2: runs the chain once per backend as a child process and reads its exit code ($p.ExitCode) BEFORE any trend row is
+    # built. A leg is RAN only when the chain ended on its own with a documented exit that agrees with its CHAIN_RESULT; otherwise the row is
+    # EVIDENCE_INCOMPLETE (no figures) and the run exits CHAIN_FAILED. A dead leg (chain exit 7) stays a typed LEG_FAILED row.
+    "tools/profiling/dual-venue/Invoke-VenueBaseline.ps1":
+        r"\$p\.ExitCode[\s\S]*?\$chainComplete\s*=\s*\(-not\s+\$c\.timedOut\)[\s\S]*?\(\$resultExit\s+-eq\s+\[int\]\$c\.exit\)[\s\S]*?"
+        r"if\s*\(-not\s+\$chainComplete\)\s*\{\s*\$failure\s*=[\s\S]*?'EVIDENCE_INCOMPLETE'[\s\S]*?"
+        r"if\s*\(-not\s+\$chainComplete\)\s*\{[\s\S]*?reason\s*=\s*'CHAIN_FAILED'",
 }
 
 # Scripts that NAME an evidence launcher (or a consumer) and are not consumers that publish a result. Each reason is read

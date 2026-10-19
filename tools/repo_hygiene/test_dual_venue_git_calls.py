@@ -19,6 +19,8 @@ The tests run wherever pwsh does (Windows and the ubuntu shards; CoS N2).
 
 from __future__ import annotations
 
+import base64
+import json
 import os
 import re
 import shutil
@@ -200,6 +202,60 @@ class GitCallsAreBoundedTests(unittest.TestCase):
             time.sleep(0.5)
             survivors = _sleepers(token)
         self.assertEqual(survivors, set(), "the sleeper git started must be killed, not left running")
+
+    @unittest.skipUnless(sys.platform == "win32", "job objects exist on Windows only")
+    def test_git_is_in_the_job_before_it_can_start_a_child_however_long_the_parent_stalls(self) -> None:
+        # CI-FLAKE-DV-GIT-PIPE-STRAGGLER-KILL-1: hosted Windows shard 2/8 failed this file's straggler test three times in 2.5 h with "(kill not
+        # confirmed)". Process.Start followed by AssignProcessToJobObject left a window: a child git started before the assignment (`sh -c 'sleep & exit 0'`
+        # is born, its parent exits) was never in the job, so TerminateJobObject missed it and Kill($true) had no parent chain to it. Measured on an
+        # idle host, a 20-40 ms stall between the two calls was enough. The module now starts git suspended and resumes it once it is in the job, so
+        # a stall at that point (the DvStartGate seam, 1.5 s here, 75 times the measured escape) cannot let anything out: the child has not run yet.
+        token = _own_sleep_token("62")
+        self.addCleanup(_kill_sleepers, token)
+        repo = self.make_repo()
+        out = self.in_module(
+            "$script:GateRan = $false\n"
+            "$script:DvStartGate = { Start-Sleep -Milliseconds 1500; $script:GateRan = $true }\n"
+            f"$r = Invoke-DvGit -RepoRoot '{repo}' -GitArgs @('-c', 'alias.dvs=!echo partial; sleep {token} & exit 0', 'dvs')\n"
+            "Write-Output ('GATE ' + $script:GateRan)\nWrite-Output ('EXIT ' + $r.exitCode)\nWrite-Output ('ERR ' + $r.stderr)\n"
+            "Write-Output ('JOBS opened=' + $script:DvJobsOpened + ' closed=' + $script:DvJobsClosed)\n",
+            {"DV_GIT_TIMEOUT_SECONDS": "3"})
+        self.assertIn("GATE True", out, "the stall seam must have run between the child's creation and its job assignment")
+        self.assertIn("EXIT -1", out)
+        self.assertIn("DV_GIT_PIPE_STRAGGLER", out)
+        self.assertIn("(killed)", out, "the child was in the job from its first instruction, so the kill must be confirmed")
+        self.assertNotIn("kill not confirmed", out)
+        match = re.search(r"JOBS opened=(\d+) closed=(\d+)", out)
+        self.assertIsNotNone(match, out)
+        self.assertEqual(match.group(1), match.group(2), "every job object opened must be closed")
+        deadline = time.monotonic() + 10
+        survivors = _sleepers(token)
+        while survivors and time.monotonic() < deadline:
+            time.sleep(0.5)
+            survivors = _sleepers(token)
+        self.assertEqual(survivors, set(), "the sleeper git started must be killed, not left running")
+
+    def test_a_windows_argument_survives_the_suspended_start_byte_for_byte(self) -> None:
+        # The suspended start builds git's command line itself (ConvertTo-DvWindowsArg), where Process.Start used ArgumentList: spaces, quotes,
+        # backslash runs before a quote, a trailing backslash and shell metacharacters must reach git unchanged.
+        # `git rev-parse --sq-quote <arg>` prints the argument git received, single-quoted. The cases travel as a JSON file, so no shell layer
+        # between Python and the module can reshape them.
+        cases = ["plain", "two words", 'say "hi"', "back\\", 'back\\"quote', "C:\\a b\\", "a&b;c|d", "tab\there", 'x\\\\"y']   # no empty case: Invoke-DvGit's mandatory [string[]] GitArgs refuses an empty element
+        repo = self.make_repo()
+        cases_file = Path(tempfile.mkdtemp(prefix="dve-args-")) / "cases.json"
+        self.addCleanup(shutil.rmtree, cases_file.parent, True)
+        cases_file.write_text(json.dumps(cases), encoding="utf-8")
+        out = self.in_module(
+            f"$cases = @(Get-Content -Raw -LiteralPath '{cases_file}' | ConvertFrom-Json)\n"
+            "for ($i = 0; $i -lt $cases.Count; $i++) {\n"
+            f"  $r = Invoke-DvGit -RepoRoot '{repo}' -GitArgs @('rev-parse', '--sq-quote', [string]$cases[$i])\n"
+            "  Write-Output ('CASE ' + $i + ' ' + $r.exitCode + ' ' + [Convert]::ToBase64String($r.bytes))\n"
+            "}\n")
+        for index, case in enumerate(cases):
+            match = re.search(rf"^CASE {index} (-?\d+) (\S*)$", out, re.MULTILINE)
+            self.assertIsNotNone(match, out)
+            self.assertEqual(match.group(1), "0", f"case {index} {case!r}: {out}")
+            self.assertEqual(base64.b64decode(match.group(2)).decode("utf-8").strip(), "'" + case + "'", f"case {index} {case!r} did not reach git unchanged")
 
     def in_module(self, body: str, env_extra: dict[str, str] | None = None) -> str:
         return _in_module(self, body, env_extra)
