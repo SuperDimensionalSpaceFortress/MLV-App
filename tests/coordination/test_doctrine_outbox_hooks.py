@@ -143,7 +143,9 @@ def run_pre_push(ob, repo: Path, monkeypatch, stdin_text: str) -> int:
 # ---------- the tool carries no project value ----------
 
 CANDIDATE_BUS_PATH = "tools/factory/doctrine_outbox.py"
-HANDOFF_CARD = REPO_ROOT / "doctrine-outbox" / "20261016-doctrine-outbox-single-source-superset.md"
+# The earlier card (20261016-doctrine-outbox-single-source-superset.md) is already on the bus with the previous
+# digest; the tool changed, so the steward is handed this one, which supersedes it.
+HANDOFF_CARD = REPO_ROOT / "doctrine-outbox" / "20261019-doctrine-outbox-pin-aware-hook-candidate.md"
 OUTBOX_README = REPO_ROOT / "doctrine-outbox" / "README.md"
 
 
@@ -168,8 +170,8 @@ PIN_AWARE_FOLLOW_UP = "OUTBOX-PIN-AWARE-TOOL-AT-REF-1"
 
 
 def test_surfaces_keep_the_local_copy_and_name_the_pin_aware_follow_up():
-    """The installed hook runs `$REPO_ROOT/<tool_rel>` and debt/drain need `tool_rel` at the ref, so a
-    project that deletes its copy after pinning bricks its own pushes (CoS repro on a4480947). Every
+    """Without `tool_pin` the installed hook runs `$REPO_ROOT/<tool_rel>` and debt/drain need `tool_rel` at the
+    ref, so a project that deletes its copy after pinning bricks its own pushes (CoS repro on a4480947). Every
     surface that describes the route must say the copy stays until the pin-aware release, and name it."""
     assert _bus_candidate()["bus_path"] == CANDIDATE_BUS_PATH
     surfaces = {
@@ -293,7 +295,7 @@ def test_the_steward_cards_route_runs_end_to_end_against_the_bus_pin_runner(tmp_
     A scratch bus holds bus master's real tools/factory/pin-runner.py and this tool at the bus path the
     card names. A scratch consumer follows the card's own commands: adopt the runner, pin the tool with
     --reviewer/--reason, run it by pin with --config (install-hooks, then session-start), and then pushes
-    through the hook that run installed. The consumer KEEPS its local copy, as the card says: the hook and
+    through the hook that run installed. The consumer sets no `tool_pin`, so it KEEPS its local copy: the hook and
     the debt checks read it. Never writes into the real bus repository."""
     runner = _read_only_bus_runner()
     pin_cmd, run_cmd = _card_command("pin doctrine-outbox"), _card_command("run doctrine-outbox")
@@ -364,7 +366,148 @@ def test_the_steward_cards_route_runs_end_to_end_against_the_bus_pin_runner(tmp_
     git(consumer, "commit", "--amend", "-m", "declared\n\nDoctrine-Export: none\n")
     allowed = sh(["git", "push", "origin", "master"])
     assert allowed.returncode == 0, allowed.stderr
-    assert (consumer / "tools" / "coordination" / "doctrine_outbox.py").is_file()   # the copy the card says to keep
+    assert (consumer / "tools" / "coordination" / "doctrine_outbox.py").is_file()   # no tool_pin: the copy stays
+
+
+# ---------- OUTBOX-PIN-AWARE-TOOL-AT-REF-1: the hook and the ref check accept a pinned tool ----------
+
+PIN_NAME = "doctrine-outbox"
+# Named mutations (each turns the named tests red, then is reverted):
+#   P1  the hook always runs `$REPO_ROOT/<tool_rel>`           -> test_installed_hook_runs_the_pin_when_the_local_copy_is_gone
+#   P2  require_tool_at_ref always demands the file at tool_rel -> test_the_ref_check_accepts_a_pin_in_place_of_the_local_copy
+
+
+def _pinned_consumer(tmp_path: Path, tool_rel: str | None = "tools/coordination/doctrine_outbox.py") -> tuple[Path, dict[str, str], Path]:
+    """A consumer that runs the tool BY PIN and keeps NO copy of it. Its config names `tool_pin`; `tool_rel` is the
+    path of the copy it deleted (what a project's config says right after the deletion), or absent when None. A
+    scratch bus holds the bus runner and this tool at the bus path; the consumer adopts the runner and pins the
+    tool exactly as the steward card says. Returns (repo, env for git, config path)."""
+    runner = _read_only_bus_runner()
+    bus = tmp_path / "scratch-bus"
+    (bus / "tools" / "factory").mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", "-b", "master", str(bus)], check=True, capture_output=True, text=True)
+    (bus / RUNNER_BUS_PATH).write_bytes(runner)
+    (bus / CANDIDATE_BUS_PATH).write_bytes(TOOL_SRC.read_bytes().replace(b"\r\n", b"\n"))
+    git(bus, "add", "-A")
+    git(bus, "commit", "-m", "scratch bus: the runner plus the candidate")
+    bus_sha = git(bus, "rev-parse", "HEAD")
+
+    consumer = tmp_path / "pinned-consumer"
+    consumer.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "master", str(consumer)], check=True, capture_output=True, text=True)
+    config = {k: v for k, v in BUS_STYLE_CONFIG.items() if k != "tool_rel"}
+    config.update(project="consumer", tool_pin=PIN_NAME, state_dir=".state/outbox", finding_path_regexes=[r"^agents/[^/]+\.md$"])
+    if tool_rel is not None:
+        config["tool_rel"] = tool_rel
+    cfg_path = consumer / "doctrine-outbox.config.json"
+    commit(consumer, {"doctrine-outbox.config.json": json.dumps(config), f"{OUTBOX_DIR}/README.md": "# outbox\n"},
+           "init\n\nDoctrine-Export: none\n")
+    (consumer / "factory-pins").mkdir()
+    (consumer / "factory-pins" / "pin-runner.py").write_bytes(runner)
+    env = {**os.environ, "FACTORY_BUS_CLONE": str(bus), "FACTORY_PINS_CACHE": str(tmp_path / "blob-cache")}
+
+    def sh(argv: list[str]) -> subprocess.CompletedProcess:
+        return subprocess.run(argv, cwd=consumer, capture_output=True, text=True, env=env)
+
+    adopt = sh([sys.executable, "factory-pins/pin-runner.py", "adopt-runner", "--commit", bus_sha])
+    assert adopt.returncode == 0, adopt.stderr
+    pin = sh([sys.executable, "factory-pins/pin-runner.py", "pin", PIN_NAME, "--commit", bus_sha, "--path", CANDIDATE_BUS_PATH,
+              "--reviewer", "pin-aware-fixture", "--reason", "fixture"])
+    assert pin.returncode == 0, pin.stderr
+    git(consumer, "add", "-A")
+    git(consumer, "commit", "-m", "pin the tool\n\nDoctrine-Export: none\n")
+    origin = tmp_path / "pinned-origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "master", str(origin)], check=True, capture_output=True, text=True)
+    git(consumer, "remote", "add", "origin", str(origin))
+    git(consumer, "push", "-q", "origin", "master")   # before the guard exists
+    return consumer, env, cfg_path
+
+
+def test_installed_hook_runs_the_pin_when_the_local_copy_is_gone(tmp_path):
+    """CoS repro on a4480947: a project that pins the shared outbox and deletes its copy bricked its own
+    pushes, because the hook ran `$REPO_ROOT/<tool_rel>`. With `tool_pin` in the config the hook runs the pin
+    through the vendored runner, with the config handed over, and guards a real push with no copy anywhere."""
+    consumer, env, cfg_path = _pinned_consumer(tmp_path)
+    ob = load_tool(cfg_path)
+    assert ob.TOOL_PIN == PIN_NAME and ob.TOOL_REL, "the config still names the deleted copy"
+    assert not [p for p in git(consumer, "ls-files").splitlines() if p.endswith("doctrine_outbox.py")], "the fixture must hold no copy"
+    assert ob.install_pre_push(consumer) == "installed"
+    hook = (consumer / ".git" / "hooks" / "pre-push").read_text(encoding="utf-8")
+    assert "factory-pins/pin-runner.py" in hook and f"run {PIN_NAME} --" in hook and "DOCTRINE_OUTBOX_CONFIG=" in hook
+    assert ob.TOOL_REL not in hook
+    assert ob.install_pre_push(consumer) == "present"   # idempotent for the pinned shape too
+
+    def push() -> subprocess.CompletedProcess:
+        return subprocess.run(["git", "-C", str(consumer), "push", "origin", "master"], capture_output=True, text=True, env=env)
+
+    commit(consumer, {"docs/notes.md": "prose\n"}, "docs only")
+    clean = push()
+    assert clean.returncode == 0, clean.stderr   # the pinned guard ran and said yes (a missing tool would exit non-zero)
+    commit(consumer, {"agents/new.md": "rule\n"}, "undeclared finding path")
+    refused = push()
+    assert refused.returncode != 0 and "PUSH REFUSED" in refused.stderr and "agents/new.md" in refused.stderr, refused.stderr
+    git(consumer, "commit", "--amend", "-m", "declared\n\nDoctrine-Export: none\n")
+    allowed = push()
+    assert allowed.returncode == 0, allowed.stderr
+
+
+@pytest.mark.parametrize("tool_rel", ["tools/coordination/doctrine_outbox.py", None], ids=["stale-tool_rel", "no-tool_rel"])
+def test_the_ref_check_accepts_a_pin_in_place_of_the_local_copy(tmp_path, capsys, tool_rel):
+    consumer, _env, cfg_path = _pinned_consumer(tmp_path, tool_rel)
+    ob = load_tool(cfg_path)
+    ob.require_tool_at_ref(consumer, "master")   # no tool_rel file at the ref, and no raise
+    assert ob.main(["--config", str(cfg_path), "--repo", str(consumer), "debt", "--ref", "master"]) == 0
+    assert "TOOL_ABSENT_AT_REF" not in capsys.readouterr().err
+
+
+def test_a_pinned_config_is_unknown_at_a_ref_without_the_pin(tmp_path):
+    """The pin must be AT the ref: a ref that predates the runner, or whose pins file names no such tool, reads as
+    TOOL_ABSENT_AT_REF (exit 2), never as 'no debt'."""
+    consumer, _env, cfg_path = _pinned_consumer(tmp_path)
+    ob = load_tool(cfg_path)
+    with pytest.raises(ob.Unknown, match="TOOL_ABSENT_AT_REF.*pin-runner.py"):
+        ob.require_tool_at_ref(consumer, "master~1")   # the init commit: config and README, no runner yet
+    pins_path = consumer / "factory-pins" / "factory-pins.json"
+    pins = json.loads(pins_path.read_text(encoding="utf-8"))
+    pins["tools"] = {"other-tool": pins["tools"][PIN_NAME]}
+    commit(consumer, {"factory-pins/factory-pins.json": json.dumps(pins)}, "re-pin something else\n\nDoctrine-Export: none\n")
+    with pytest.raises(ob.Unknown, match=f"TOOL_ABSENT_AT_REF.*no pin named {PIN_NAME}"):
+        ob.require_tool_at_ref(consumer, "master")
+
+
+def test_a_pin_does_not_excuse_a_missing_outbox_directory(tmp_path):
+    consumer, _env, cfg_path = _pinned_consumer(tmp_path)
+    ob = load_tool(cfg_path)
+    git(consumer, "rm", "-q", f"{OUTBOX_DIR}/README.md")
+    git(consumer, "commit", "-m", "drop the outbox\n\nDoctrine-Export: none\n")
+    with pytest.raises(ob.Unknown, match="TOOL_ABSENT_AT_REF"):
+        ob.require_tool_at_ref(consumer, "master")
+
+
+@pytest.mark.parametrize("override, offending", [
+    ({"tool_pin": "not a pin name"}, "tool_pin"),
+    ({"tool_pin": 7}, "tool_pin"),
+    ({"tool_pin": ""}, "tool_rel"),   # no pin and (below) no tool_rel: the tool has no location
+])
+def test_config_needs_tool_rel_or_a_valid_tool_pin(override, offending):
+    spec = importlib.util.spec_from_file_location("doctrine_outbox_pincfg", TOOL_SRC)
+    fresh = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fresh)
+    no_rel = {k: v for k, v in BUS_STYLE_CONFIG.items() if k != "tool_rel"}
+    with pytest.raises(fresh.Refusal) as excinfo:
+        fresh.configure({**no_rel, **override})
+    assert excinfo.value.code == "CONFIG_INVALID" and offending in excinfo.value.detail
+    fresh.configure({**no_rel, "tool_pin": PIN_NAME})                       # a pin alone is a complete tool location
+    fresh.configure({**BUS_STYLE_CONFIG, "tool_pin": PIN_NAME})             # both: the pin wins, the copy is tolerated
+
+
+def test_a_config_without_tool_pin_installs_the_byte_identical_local_copy_hook(ob, repo):
+    """The default is unchanged: no `tool_pin` -> the guard runs `$REPO_ROOT/<tool_rel>` exactly as before."""
+    assert ob.TOOL_PIN == ""
+    assert ob.install_pre_push(repo) == "installed"
+    hook = (repo / ".git" / "hooks" / "pre-push").read_text(encoding="utf-8")
+    assert f'  "$OUTBOX_PY" "$REPO_ROOT/{TOOL_REL}" pre-push "$REPO_ROOT" "$@" < "$OUTBOX_STDIN" ||' in hook
+    assert "pin-runner" not in hook and "DOCTRINE_OUTBOX_CONFIG" not in hook
 
 
 def test_the_tool_names_no_project_host_or_state_directory():
