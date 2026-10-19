@@ -712,6 +712,15 @@ CONSUMER_FAILING_ACTION: dict[str, tuple[tuple[str, int], ...]] = {
     "tools/profiling/dual-venue/Invoke-VenueChain.ps1": (
         (r"\$legCode\s*=\s*\$LASTEXITCODE[\s\S]*?if\s*\(\$legCode\s+-ne\s+0\)\s*\{\s*"
          r"(?P<act>Add-Result\s+\$leg\s+'LEG_FAILED'\s+@\{[^\n]*outcome\s*=\s*'INVALID'[^\n]*\})", 1),),
+    # UM-REGULAR-BASELINE-1 r3: a chain that did not end on its own with a documented exit that agrees with its CHAIN_RESULT gives its legs the
+    # failure text and an EVIDENCE_INCOMPLETE / INVALID row with no figures, types the run CHAIN_FAILED (27); a dead leg (chain exit 7) types it
+    # LEG_FAILED (25); the typed reason becomes the process exit code.
+    "tools/profiling/dual-venue/Invoke-VenueBaseline.ps1": (
+        (r"\$chainComplete\s*=\s*\(-not\s+\$c\.timedOut\)[\s\S]*?if\s*\(-not\s+\$chainComplete\)\s*\{\s*(?P<act>\$failure\s*=\s*\")", 1),
+        (r"if\s*\(\$failure\s+-and\s+\$legStatus\s+-ceq\s+'RAN'\)\s*\{\s*(?P<act>\$legStatus\s*=\s*'EVIDENCE_INCOMPLETE';\s*\$legOutcome\s*=\s*'INVALID')", 1),
+        (r"if\s*\(-not\s+\$chainComplete\)\s*\{\s*if\s*\(\$null\s+-eq\s+\$typed\)\s*\{\s*\$typed\s*=\s*@\{\s*(?P<act>reason\s*=\s*'CHAIN_FAILED')", 1),
+        (r"\b7\s*\{\s*if\s*\(\$null\s+-eq\s+\$typed\)\s*\{\s*\$typed\s*=\s*@\{\s*(?P<act>reason\s*=\s*'LEG_FAILED')", 1),
+        (r"\$code\s*=\s*\[int\]\$ExitCodes\[\$reason\][\s\S]*?(?P<act>\bexit\s+\$code\b)", 1)),
 }
 
 
