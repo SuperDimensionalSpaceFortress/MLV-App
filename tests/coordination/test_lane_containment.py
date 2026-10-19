@@ -2738,6 +2738,40 @@ def test_clean_git_worktree_is_still_marked_complete(fixture_tree):
     assert q["failure"] is None
 
 
+def _fsmonitor_daemon_watching(path):
+    r=subprocess.run(["git","-C",str(path),"fsmonitor--daemon","status"],capture_output=True,text=True,timeout=30)
+    return "is watching" in (r.stdout+r.stderr)
+
+
+# LANE-FSMONITOR-PIN-AND-RETIRE-HARDENING-1 r2 (sol r1 blocker): the lane-end daemon stop used to sit BEFORE the receipt's own git calls, so the
+# post-exit `rev-parse HEAD` / tracked-dirt `git status` started the daemon again and nothing stopped it. Shape: a linked worktree inheriting
+# core.fsmonitor=true, extensions.worktreeConfig OFF (so the launch-time disable is skipped), an editing Claude lane without -RetireWorktree, HEAD unchanged.
+def test_unchanged_head_editing_lane_leaves_no_fsmonitor_daemon_after_all_receipt_probes(fixture_tree):
+    root=fixture_tree["root"]
+    board=root/"board"; board.mkdir()
+    _seed_git_repo(board)
+    cmd,env,receipt=prepare(fixture_tree,"normal",editing=True,allowed_tools="Read,Write,Edit")
+    hook=board/"tools"/"hooks"/"mlv-never-authorized.py"; hook.parent.mkdir(parents=True)
+    hook.write_bytes((root/"tools"/"hooks"/"mlv-never-authorized.py").read_bytes())
+    _git(board,"add","tools/hooks/mlv-never-authorized.py")
+    _git(board,"commit","-q","-m","hook")
+    wt=root/"lane-wt"
+    _git(board,"-c","core.fsmonitor=false","worktree","add","-q","-b","lane",str(wt))
+    _git(board,"config","core.fsmonitor","true")
+    (root/"lane-fsmonitor.ps1").write_bytes((ROOT/"tools"/"coordination"/"lane-fsmonitor.ps1").read_bytes())
+    cmd[cmd.index("-WorkDir")+1]=str(wt)
+    try:
+        r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=90)
+        assert r.returncode==0,(r.stdout,r.stderr)
+        q=json.loads(receipt.read_text(encoding="utf-8"))
+        assert q["state"]=="complete" and q["dirtyCheck"]=="clean", "the post-exit probes did not run: %s %s"%(q["state"],q["dirtyCheck"])
+        assert not _fsmonitor_daemon_watching(wt), "a fsmonitor daemon is running in the lane worktree after the receipt's own git probes"
+        assert q["fsmonitorStop"]["action"] in ("stopped","none"),q["fsmonitorStop"]
+    finally:
+        for p in (wt,board):
+            subprocess.run(["git","-C",str(p),"fsmonitor--daemon","stop"],capture_output=True,timeout=30)
+
+
 def test_pre_existing_tracked_dirt_unchanged_by_editing_lane_stays_complete(fixture_tree):
     # Producer brief round 2, required case: dirt that existed BEFORE the lane ever ran, and
     # that the lane's own run leaves byte-for-byte unchanged, must never flip a receipt -- only

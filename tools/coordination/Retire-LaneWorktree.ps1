@@ -606,7 +606,15 @@ function Invoke-RetireLaneWorktree {
         schema = 'mlv-app/lane-worktree-disposition/v1'; workDir = $WorkDir; action = 'kept'; reason = $null
         head = $null; branch = $null; quarantined = @(); holders = @(); cwdProbe = $null; cwdUnknown = @()
         cwdExempt = 0; worktreeCreatedUtc = $null; cwdExemptOwner = @(); cwdOwnerProbe = $null; cwdOwnerSkipped = @()
+        # LANE-FSMONITOR-PIN-AND-RETIRE-HARDENING-1 r2: what each fsmonitor step did, as 'action' or 'action: reason' ('stopped', 'none: no daemon',
+        # 'failed: ...', 'not-run: ...'). Best effort: never changes `action`/`reason`, but a 'failed' here means a daemon may still be running.
+        fsmonitorStop = [ordered]@{ disable = $null; early = $null; remove = $null; final = $null }
         utc = (Get-Date).ToUniversalTime().ToString('o')
+    }
+    function Get-FsmonitorStepNote([object]$Result) {
+        if ($null -eq $Result) { return 'not-run: helper not loaded' }
+        if ($Result.reason) { return "$($Result.action): $($Result.reason)" }
+        return [string]$Result.action
     }
     # Fail closed on the cwd probe's own blind spots (see CWD PROBE IS LOUD): true = refused, disposition filled in.
     function Test-CwdRefusal([object]$Sn) {
@@ -639,10 +647,15 @@ function Invoke-RetireLaneWorktree {
         if (($top.out[0] -replace '/', '\').TrimEnd('\') -ne $wd) { $d.action = 'skipped'; $d.reason = 'not-a-linked-worktree: WorkDir is a subdirectory'; return [pscustomobject]$d }
         $main = Split-Path -Parent ($cd.out[0] -replace '/', '\')
         # HOST-FSMONITOR-DAEMON-LEAK-1 (a): off BEFORE the gate's own `status` calls, which would otherwise start a daemon in a worktree kept for any reason.
-        if (Get-Command Disable-LaneWorktreeFsmonitor -ErrorAction SilentlyContinue) { $null = Disable-LaneWorktreeFsmonitor -WorkDir $wd }
+        $disableResult = $null
+        if (Get-Command Disable-LaneWorktreeFsmonitor -ErrorAction SilentlyContinue) { $disableResult = Disable-LaneWorktreeFsmonitor -WorkDir $wd }
+        $d.fsmonitorStop.disable = Get-FsmonitorStepNote $disableResult
         # LANE-FSMONITOR-PIN-AND-RETIRE-HARDENING-1: a daemon already running here (a worktree that predates the fix) survives every path below that KEEPS the
-        # worktree, so stop it now, before the gate; the finally further down repeats it for a daemon the gate's own status started when the disable was skipped.
-        if (Get-Command Stop-LaneWorktreeFsmonitor -ErrorAction SilentlyContinue) { $null = Stop-LaneWorktreeFsmonitor -WorkDir $wd }
+        # worktree, so stop it now, before the gate. The finally further down repeats it only when the disable did not take (skipped or failed): a
+        # disabled worktree cannot have a daemon restarted by the gate's own status.
+        $stopResult = $null
+        if (Get-Command Stop-LaneWorktreeFsmonitor -ErrorAction SilentlyContinue) { $stopResult = Stop-LaneWorktreeFsmonitor -WorkDir $wd }
+        $d.fsmonitorStop.early = Get-FsmonitorStepNote $stopResult
 
         $h = Run-Git $wd @('rev-parse', 'HEAD'); if ($h.code) { $d.reason = 'cannot-determine: rev-parse HEAD'; return [pscustomobject]$d }
         $d.head = $h.out[0]
@@ -709,7 +722,9 @@ function Invoke-RetireLaneWorktree {
         }
         $c = Run-Git $wd @('clean', '-fdX'); if ($c.code) { $d.reason = 'remove-failed: git clean -fdX: ' + ($c.out -join ' | '); return [pscustomobject]$d }
         # HOST-FSMONITOR-DAEMON-LEAK-1 (b): ask this worktree's daemon to exit before its directory goes. Best effort; the result never changes the disposition.
-        if (Get-Command Stop-LaneWorktreeFsmonitor -ErrorAction SilentlyContinue) { $null = Stop-LaneWorktreeFsmonitor -WorkDir $wd }
+        $removeStop = $null
+        if (Get-Command Stop-LaneWorktreeFsmonitor -ErrorAction SilentlyContinue) { $removeStop = Stop-LaneWorktreeFsmonitor -WorkDir $wd }
+        $d.fsmonitorStop.remove = Get-FsmonitorStepNote $removeStop
         $r = Run-Git $main @('-c', 'core.longpaths=true', 'worktree', 'remove', $wd)
         if ($r.code) { $d.reason = 'remove-failed: ' + ($r.out -join ' | '); return [pscustomobject]$d }
         $d.action = 'retired'; $d.reason = 'ok'
@@ -717,8 +732,16 @@ function Invoke-RetireLaneWorktree {
         $d.action = 'kept'; $d.reason = "cannot-determine: $($_.Exception.Message)"
     } finally {
         # Every path that leaves the worktree standing (kept, would-retire) ends with no daemon in it; a retired worktree is gone. Best effort, never throws.
-        if ($wd -and $d.action -ne 'retired' -and $d.action -ne 'skipped' -and (Get-Command Stop-LaneWorktreeFsmonitor -ErrorAction SilentlyContinue)) {
-            try { $null = Stop-LaneWorktreeFsmonitor -WorkDir $wd } catch { }
+        # Only when the disable did not take: after a successful disable the early stop already left none and nothing can start one.
+        if ($wd -and $d.action -ne 'retired' -and $d.action -ne 'skipped') {
+            if ($null -ne $d.fsmonitorStop.disable -and $d.fsmonitorStop.disable -eq 'disabled') {
+                $d.fsmonitorStop.final = 'not-run: disable succeeded'
+            } elseif (Get-Command Stop-LaneWorktreeFsmonitor -ErrorAction SilentlyContinue) {
+                try { $d.fsmonitorStop.final = Get-FsmonitorStepNote (Stop-LaneWorktreeFsmonitor -WorkDir $wd) }
+                catch { $d.fsmonitorStop.final = "failed: cannot-determine: $($_.Exception.Message)" }
+            } else {
+                $d.fsmonitorStop.final = 'not-run: helper not loaded'
+            }
         }
     }
     return [pscustomobject]$d
