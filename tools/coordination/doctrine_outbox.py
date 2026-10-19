@@ -2423,11 +2423,13 @@ def cmd_session_start(repo: pathlib.Path, ref: str, ledger: pathlib.Path) -> int
 # A route that IS run gets the interpreter-injection environment stripped (PYTHONPATH, PYTHONSTARTUP, PYTHONHOME, NODE_OPTIONS,
 # NODE_PATH, PERL5OPT, PERL5LIB, RUBYOPT, BASH_ENV, ENV), every credential-shaped variable, every GIT_* variable (GIT_EDITOR,
 # GIT_SEQUENCE_EDITOR, GIT_PAGER, GIT_ASKPASS, GIT_SSH, GIT_SSH_COMMAND, GIT_EXTERNAL_DIFF, GIT_CONFIG_PARAMETERS, ...) and the
-# generic helpers EDITOR, VISUAL, PAGER and SSH_ASKPASS (route_exercise_env), with GIT_CONFIG_NOSYSTEM=1 and GIT_CONFIG_GLOBAL an
-# empty file beside the clone, so no driver or helper defined in the user, XDG or system config is reachable.
-# Git itself is started as `git -c core.pager=cat -c core.editor=false -c diff.external= -c core.hooksPath=<an empty directory in
-# the scratch> ...` (ROUTE_GIT_HARDENING, route_git_command), so no pager, editor, external diff, hook or signing program is
-# reachable even through a verb that wants one.
+# generic helpers EDITOR, VISUAL, PAGER and SSH_ASKPASS (route_exercise_env), with GIT_CONFIG_NOSYSTEM=1, GIT_ATTR_NOSYSTEM=1 and
+# GIT_CONFIG_GLOBAL an empty file beside the clone, so no driver or helper defined in the user, XDG or system config is reachable.
+# Git itself is started as `git -c core.pager=cat -c core.editor=false -c diff.external= -c core.attributesFile= -c core.excludesFile=
+# -c core.hooksPath=<an empty directory in the scratch> ...` (ROUTE_GIT_HARDENING, route_git_command), so no pager, editor, external
+# diff, hook or signing program is reachable even through a verb that wants one.
+# The SCRATCH CLONE is made under the same isolation (run_isolated_git: the same git, environment and `-c` pairs a route gets), so a
+# filter, hook or helper the host's config defines (git-lfs in the system config) never starts while the bus is being checked out.
 # A credential's value is never printed: a diagnostic, a ROUTE line or an error shows `NAME=<redacted>`.
 # Any outcome but OK and NOT_EXECUTED fails the run (exit 1). The commands run in `git clone --local --no-hardlinks`
 # of --bus (default $FACTORY_BUS_CLONE) with `origin` removed, under a scratch directory this tool creates and removes by name.
@@ -2502,9 +2504,9 @@ def _verb(flags: str = "", valued: str = "", letters: str = "", value_letters: s
 _ROUTE_GIT_DIFF_FLAGS = "--stat --shortstat --numstat --name-only --name-status --no-color --no-textconv --no-ext-diff --no-patch"
 ROUTE_GIT_VERBS: dict[str, RouteGitVerb] = {          # read-only verbs only; the per-verb lists are the whole option grammar
     "log": _verb(f"{_ROUTE_GIT_DIFF_FLAGS} --oneline --all --branches --tags --reverse --first-parent --no-merges --merges "
-                 "--abbrev-commit --decorate --no-decorate --show-signature",
+                 "--abbrev-commit --decorate --no-decorate",
                  "--format --pretty --since --until --author --grep --max-count --date", "s", "nS", digits=True),
-    "show": _verb(f"{_ROUTE_GIT_DIFF_FLAGS} --oneline --abbrev-commit --show-signature", "--format --pretty", "s"),
+    "show": _verb(f"{_ROUTE_GIT_DIFF_FLAGS} --oneline --abbrev-commit", "--format --pretty", "s"),
     "diff": _verb(f"{_ROUTE_GIT_DIFF_FLAGS} --cached --staged --word-diff --quiet --exit-code", "", "s"),
     "grep": _verb("", "", "nilcwFE", "e"),
     "rev-parse": _verb("--verify --short --abbrev-ref --symbolic-full-name --show-toplevel --git-dir --is-inside-work-tree "
@@ -2525,8 +2527,8 @@ ROUTE_GIT_VERBS: dict[str, RouteGitVerb] = {          # read-only verbs only; th
     "name-rev": _verb("--name-only --tags"),
     "count-objects": _verb("--verbose --human-readable", "", "vH", positional="none"),
     "version": _verb("--build-options", positional="none"),
-    "branch": _verb("--list --remotes --verbose --show-current --no-color", "", "lrv", positional="list",
-                    list_flags=frozenset({"--list"}), list_letters=frozenset("l")),
+    "branch": _verb("--list --remotes --verbose --show-current --no-color", "", "rv", positional="list",
+                    list_flags=frozenset({"--list"})),                  # no `-l`: an older git reads it as --create-reflog
     "tag": _verb("--list", "", "l", positional="list", list_flags=frozenset({"--list"}), list_letters=frozenset("l")),
     "config": _verb("--get --get-all --get-regexp --list --show-origin", "", "l",
                     first=frozenset({"--get", "--get-all", "--get-regexp", "--list", "-l"})),
@@ -2534,7 +2536,7 @@ ROUTE_GIT_VERBS: dict[str, RouteGitVerb] = {          # read-only verbs only; th
 ROUTE_GIT_ALT_DIR_OPTIONS = frozenset({"--git-dir", "--work-tree", "--namespace", "--super-prefix", "--bare"})   # another repository or tree
 ROUTE_GIT_HARDENING = ("core.pager=cat", "core.editor=false", "diff.external=", "core.fsmonitor=false", "commit.gpgsign=false",
                        "tag.gpgsign=false", "safe.bareRepository=explicit", "gpg.program=false", "gpg.ssh.program=false",
-                       "gpg.x509.program=false")                                               # `-c` pairs before every run git
+                       "gpg.x509.program=false", "core.attributesFile=", "core.excludesFile=")  # `-c` pairs before every run git
 ROUTE_NO_HOOKS_DIR = "outbox-route-no-hooks"                                                   # empty, beside the clone in the scratch
 ROUTE_EMPTY_GLOBAL_CONFIG = "outbox-route-empty-gitconfig"                                      # empty file, beside the clone: GIT_CONFIG_GLOBAL
 ROUTE_HELPER_ENV = frozenset({"EDITOR", "VISUAL", "PAGER", "SSH_ASKPASS"})                     # helpers git reads besides GIT_*
@@ -3286,9 +3288,9 @@ def route_exercise_env(base: dict[str, str] | None = None, clone: str | os.PathL
     (ROUTE_INJECTION_ENV, any case: a startup hook or preload a launched interpreter would run), the generic helper variables
     (ROUTE_HELPER_ENV: EDITOR, VISUAL, PAGER, SSH_ASKPASS), any credential-shaped variable and every GIT_* variable (GIT_EDITOR,
     GIT_SEQUENCE_EDITOR, GIT_PAGER, GIT_ASKPASS, GIT_SSH[_COMMAND], GIT_EXTERNAL_DIFF, GIT_CONFIG_PARAMETERS, ...), then git
-    told to prompt for nothing and read no system config (GIT_CONFIG_NOSYSTEM=1) and, as its global config, only an EMPTY file
-    beside the clone (route_git_global_config; os.devnull when no clone is given), so no driver, alias or helper defined in
-    ~/.gitconfig, the XDG config or the system config is reachable. PATH (any case of the key) keeps only its ABSOLUTE entries
+    told to prompt for nothing and read no system config or system attributes (GIT_CONFIG_NOSYSTEM=1, GIT_ATTR_NOSYSTEM=1) and, as
+    its global config, only an EMPTY file beside the clone (route_git_global_config; os.devnull when no clone is given), so no
+    driver, filter, alias or helper defined in ~/.gitconfig, the XDG config or the system config is reachable. PATH (any case of the key) keeps only its ABSOLUTE entries
     (route_absolute_entries) and, when `clone` is given, only those whose real path is outside the clone: a `false.exe` or `gpg`
     planted in the clone is never found through `.`, an empty entry, a relative one, a quoted one or a junction into it."""
     source = os.environ if base is None else base
@@ -3305,8 +3307,17 @@ def route_exercise_env(base: dict[str, str] | None = None, clone: str | os.PathL
                 continue
         env[key] = os.pathsep.join(kept)
     global_config = route_git_global_config(clone) if clone is not None else os.devnull
-    env.update({"GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": global_config})
+    env.update({"GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_NOSYSTEM": "1", "GIT_ATTR_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": global_config})
     return env
+
+
+def run_isolated_git(git_bin: str, args: list[str], cwd: str | os.PathLike, clone: str | os.PathLike,
+                     timeout: float = 120) -> subprocess.CompletedProcess[str]:
+    """Run `git <args>` in `cwd` exactly as a route's git is run: the command line of route_git_command and the environment of
+    route_exercise_env, both keyed to the scratch `clone` (its parent directory holds the empty hooks directory and the empty
+    global config). The scratch clone is made and read through this one function, so preparation and routes cannot drift."""
+    return subprocess.run(route_git_command(git_bin, ["git", *args], clone), cwd=str(cwd), env=route_exercise_env(clone=clone),
+                          capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
 
 
 def route_git_global_config(clone: str | os.PathLike) -> str:
@@ -3534,7 +3545,9 @@ def remove_exercise_scratch(base: pathlib.Path, scratch_root: pathlib.Path) -> N
 
 def make_exercise_scratch(bus: pathlib.Path, scratch_root: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path, str]:
     """A scratch clone of the bus's committed tip: (scratch dir, clone, tip sha). The bus is read, never written,
-    and the scratch root may not be inside it. `origin` is removed so nothing in the clone can push back."""
+    and the scratch root may not be inside it. `origin` is removed so nothing in the clone can push back. Every git call here runs
+    under the isolation a route gets (run_isolated_git), so no filter, hook or helper the host's config defines starts while the
+    bus is cloned and checked out, before any route is screened."""
     if not (bus / ".git").exists() and not (bus / "HEAD").is_file():
         raise Unknown("EXERCISE_BUS_NOT_A_REPO", f"{bus} is not a git repository")
     if route_inside(route_real_path(str(scratch_root)), route_real_path(str(bus))):
@@ -3543,11 +3556,21 @@ def make_exercise_scratch(bus: pathlib.Path, scratch_root: pathlib.Path) -> tupl
     base = pathlib.Path(tempfile.mkdtemp(prefix=ROUTE_SCRATCH_PREFIX, dir=str(scratch_root)))
     try:
         clone = base / "bus"
-        proc = _run_git(base, ["clone", "--local", "--no-hardlinks", "-q", str(bus), str(clone)])
+        git_bin, refused = route_git_binary(clone)
+        if refused:
+            raise Unknown("EXERCISE_GIT_UNAVAILABLE", refused[1])
+
+        def isolated(cwd: pathlib.Path, *args: str) -> subprocess.CompletedProcess[str]:
+            return run_isolated_git(git_bin, ["-c", "core.autocrlf=false", "-c", "core.safecrlf=false", *args], cwd, clone)
+
+        proc = isolated(base, "clone", "--local", "--no-hardlinks", "-q", str(bus), str(clone))
         if proc.returncode != 0:
             raise Unknown("EXERCISE_CLONE_FAILED", proc.stderr.strip()[:300])
-        git(clone, "remote", "remove", "origin")
-        return base, clone, git(clone, "rev-parse", "HEAD")
+        for args in (("remote", "remove", "origin"), ("rev-parse", "HEAD")):
+            proc = isolated(clone, *args)
+            if proc.returncode != 0:
+                raise GitError(f"git {' '.join(args)} (in {clone}): {proc.stderr.strip()}")
+        return base, clone, proc.stdout.strip()
     except BaseException:
         remove_exercise_scratch(base, scratch_root)
         raise

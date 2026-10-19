@@ -1686,7 +1686,7 @@ def test_r4_an_alternate_git_directory_is_unsafe_in_every_form(tmp_path, launche
     "git grep -n needle", "git grep -nw needle", "git grep -c needle", "git grep -e needle", "git grep -in needle -- payload.py",
     "git log --oneline --format=%H --since=1.day --no-color", "git log --stat --name-only", "git diff --cached --name-status",
     "git log --branches --grep=x", "git log --oneline -5", "git rev-parse --git-dir", "git rev-parse --is-bare-repository",
-    "git diff --word-diff", "git log --show-signature",
+    "git diff --word-diff",                                                      # r6 NA-6: `git log --show-signature` moved to R6_RED
 ])
 def test_r4_the_safe_twin_of_a_refused_option_is_launched(tmp_path, launches, command):
     clone = make_clone(tmp_path)
@@ -1821,8 +1821,11 @@ def test_r4_a_planted_gpg_and_false_in_the_clone_are_never_started_by_a_real_git
     if not marker.exists():
         pytest.skip("the control run did not start the planted gpg on this git/platform, so 'absent' would prove nothing")
     marker.unlink()
-    assert ob.exercise_route("git log --show-signature", repo, 30, {})[0] in ("ROUTE_OK", "ROUTE_FAILED")
+    # r6: `--show-signature` is off the option list, so the route is refused unrun; the hardened command line is still run below
+    assert ob.exercise_route("git log --show-signature", repo, 30, {})[0] in ("ROUTE_OK", "ROUTE_FAILED", "ROUTE_UNSAFE")
     assert not marker.exists(), "a helper planted in the clone was started through a relative PATH entry"
+    real_git(ob.route_git_command(git_bin, ["git", "log", "--show-signature"], repo), repo, ob.route_exercise_env(clone=repo))
+    assert not marker.exists(), "a helper planted in the clone was started through the hardened command line"
 
 
 def test_r4_program_lookup_never_consults_the_current_directory(tmp_path, monkeypatch):
@@ -2076,7 +2079,7 @@ R5_OK_MOCKED = [
     "git describe --tags --always", "git for-each-ref --format=%(refname) --sort=-committerdate --count=5", "git show-ref --heads",
     "git merge-base --is-ancestor HEAD HEAD", "git rev-list --count HEAD", "git shortlog -sn HEAD", "git name-rev --name-only HEAD",
     "git count-objects -v", "git version", "git config --get-regexp core", "git config -l", "git config --list --show-origin",
-    "git branch", "git branch --list", "git branch -l fe*", "git branch -vv", "git branch --show-current", "git tag", "git tag -l v*",
+    "git branch", "git branch --list", "git branch --list fe*", "git branch -vv", "git branch --show-current", "git tag", "git tag -l v*",
     "git tag --list", "git -C sub log -- readme.txt", "git log -- sub", "git diff HEAD -- f a",
 ]
 
@@ -2225,3 +2228,174 @@ def test_r5_the_readme_states_the_r5_contract_and_lists_every_verb():
     for verb in ob.ROUTE_GIT_VERBS:
         assert f"`{verb}`" in section, verb
     assert "scratch-local verb" not in section, "write verbs are no longer run"
+
+
+# ---------- CARD-ROUTE-EXERCISE-3 r1: the scratch clone is made under the isolation a route gets ----------
+# Successor to parked #514. Both r5 keys found one gap in PREPARATION: make_exercise_scratch cloned with the host's own git config,
+# so a bus `.gitattributes` of `* filter=lfs` started git-lfs at checkout (this host's system gitconfig defines it), before any
+# route was screened. Each red row builds a bus whose committed files select a filter, or a hook directory the HOST config names,
+# and whose program WRITES A MARKER FILE; it then runs `validate --exercise` and asserts the marker is absent and the committed
+# bytes are checked out untouched. The control rows make the SAME clone without the isolation and demand the marker, so a red row
+# can fail: a program that never ran on this git would make "absent" prove nothing, and a skipped control is not accepted here.
+
+R6_PAYLOAD = b"version https://git-lfs.github.com/spec/v1\r\noid sha256:" + b"0" * 64 + b"\r\nsize 12\r\n"   # CRLF: no eol rewrite
+R6_KINDS = ["global keyprobe filter", "system keyprobe filter", "system lfs filter", "global post-checkout hook"]
+R6_HOSTILE_ENV = ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_COUNT", "XDG_CONFIG_HOME")
+
+
+def r6_marker_command(tmp_path: Path) -> tuple[Path, str]:
+    """The marker path (absent until the program runs) and a git-config value that runs a program writing it and exiting at once
+    (it never reads stdin: a long-running `process` filter would otherwise wait on git while git waits on it)."""
+    marker = tmp_path / "prep-ran.marker"
+    script = tmp_path / "prep_program.py"
+    script.write_text("import pathlib, sys\npathlib.Path(sys.argv[1]).write_text('ran')\n", encoding="utf-8")
+    return marker, " ".join(f'\\"{Path(p).as_posix()}\\"' for p in (sys.executable, script, marker))
+
+
+def r6_bus(tmp_path: Path, attributes: bytes) -> Path:
+    """A bus whose committed .gitattributes selects a filter for every path and whose payload.bin is R6_PAYLOAD. Built under an
+    empty config, or this host's own lfs filter would rewrite the payload while it is committed."""
+    bus = tmp_path / "bus"
+    bus.mkdir()
+    env = dict(os.environ, GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull, GIT_ATTR_NOSYSTEM="1")
+    (bus / ".gitattributes").write_bytes(attributes)
+    (bus / "payload.bin").write_bytes(R6_PAYLOAD)
+    for args in (["init", "-q", "-b", "master"], ["add", "-A"], ["commit", "-q", "-m", "r6 bus"]):
+        done = subprocess.run(["git", "-C", str(bus), *GIT_ID, *args], env=env, capture_output=True, text=True)
+        assert done.returncode == 0, (args, done.stderr)
+    return bus
+
+
+def r6_arm(tmp_path: Path, monkeypatch, kind: str) -> tuple[Path, Path, bytes]:
+    """The bus, the marker and the committed .gitattributes bytes for `kind`, with the host config the kind names put in place
+    through GIT_CONFIG_GLOBAL or GIT_CONFIG_SYSTEM (a test file, never the real one)."""
+    marker, command = r6_marker_command(tmp_path)
+    name = "lfs" if "lfs" in kind else "keyprobe"
+    attributes = f"* filter={name}\n".encode() if "filter" in kind else b"# no filter selected\n"
+    bus = r6_bus(tmp_path, attributes)
+    config = tmp_path / "host.gitconfig"
+    if "filter" in kind:
+        text = (f'[filter "{name}"]\n\tclean = {command}\n\tsmudge = {command}\n\tprocess = {command}\n'
+                + ("\trequired = true\n" if name == "lfs" else ""))
+    else:
+        hooks = tmp_path / "host-hooks"
+        hooks.mkdir()
+        hook = hooks / "post-checkout"
+        with open(hook, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(f"#!/bin/sh\n: > '{marker.as_posix()}'\nexit 0\n")
+        hook.chmod(0o755)
+        text = f"[core]\n\thooksPath = {hooks.as_posix()}\n"
+    with open(config, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(text)
+    for var in R6_HOSTILE_ENV:
+        monkeypatch.delenv(var, raising=False)
+    if kind.startswith("system"):
+        monkeypatch.setenv("GIT_CONFIG_SYSTEM", str(config))
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    else:
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
+        monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    return bus, marker, attributes
+
+
+@pytest.mark.parametrize("kind", R6_KINDS)
+def test_r6_control_the_same_clone_without_the_isolation_does_start_the_program(tmp_path, monkeypatch, kind):
+    bus, marker, _attributes = r6_arm(tmp_path, monkeypatch, kind)
+    subprocess.run(["git", "clone", "--local", "--no-hardlinks", "-q", str(bus), str(tmp_path / "unisolated")],
+                   capture_output=True, text=True, timeout=60)
+    assert marker.exists(), f"{kind}: the unisolated clone did not start the program, so the red row below could not fail"
+
+
+@pytest.mark.parametrize("kind", R6_KINDS)
+def test_r6_preparing_the_scratch_clone_starts_no_program_and_checks_the_bytes_out_untouched(tmp_path, monkeypatch, capsys, kind):
+    bus, marker, attributes = r6_arm(tmp_path, monkeypatch, kind)
+    kept: list[Path] = []
+    monkeypatch.setattr(ob, "remove_exercise_scratch", lambda base, root: kept.append(base))   # keep it, to read what was checked out
+    assert exercise(tmp_path, item_file(tmp_path, adopt("git ls-files")), bus) == 0
+    assert statuses(capsys.readouterr().out) == ["ROUTE_OK"], kind
+    assert not marker.exists(), f"{kind}: a program the host config defines was started while the scratch clone was prepared"
+    clone = kept[0] / "bus"
+    assert (clone / "payload.bin").read_bytes() == R6_PAYLOAD, kind
+    assert (clone / ".gitattributes").read_bytes() == attributes, kind
+
+
+def test_r6_every_git_call_of_preparation_gets_the_route_command_line_and_environment(tmp_path, monkeypatch):
+    bus = make_bus(tmp_path)
+    calls: list[tuple[list[str], dict[str, str]]] = []
+    real_run = subprocess.run
+
+    def spy(argv, *args, **kwargs):
+        calls.append((list(argv), dict(kwargs["env"])))
+        return real_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(ob.subprocess, "run", spy)
+    base, clone, tip = ob.make_exercise_scratch(bus, tmp_path / "scratch")
+    monkeypatch.setattr(ob.subprocess, "run", real_run)
+    assert len(calls) == 3 and calls[0][0][-1] == str(clone)                         # clone, remote remove, rev-parse
+    for argv, env in calls:
+        pairs = git_dash_c(argv)
+        assert set(ob.ROUTE_GIT_HARDENING) <= set(pairs), pairs
+        assert {"core.attributesFile=", "core.excludesFile="} <= set(pairs), pairs
+        hooks = [p.split("=", 1)[1] for p in pairs if p.startswith("core.hooksPath=")]
+        assert len(hooks) == 1 and Path(hooks[0]).parent == base and list(Path(hooks[0]).iterdir()) == [], hooks
+        assert env["GIT_CONFIG_NOSYSTEM"] == "1" and env["GIT_ATTR_NOSYSTEM"] == "1" and env["GIT_TERMINAL_PROMPT"] == "0"
+        assert Path(env["GIT_CONFIG_GLOBAL"]).parent == base and Path(env["GIT_CONFIG_GLOBAL"]).read_bytes() == b""
+        assert not [k for k in env if k.startswith("GIT_") and k not in
+                    {"GIT_CONFIG_NOSYSTEM", "GIT_ATTR_NOSYSTEM", "GIT_TERMINAL_PROMPT", "GIT_CONFIG_GLOBAL"}], sorted(env)
+        assert os.path.isabs(argv[0]) and all(os.path.isabs(e) for e in env["PATH"].split(os.pathsep) if e)
+    assert tip == git(bus, "rev-parse", "HEAD")
+    ob.remove_exercise_scratch(base, tmp_path / "scratch")
+
+
+def test_r6_preparation_refuses_a_git_that_resolves_only_inside_the_scratch(tmp_path, monkeypatch):
+    bus = make_bus(tmp_path)
+    monkeypatch.setattr(ob, "route_git_binary", lambda cwd: (None, ("ROUTE_UNSAFE", "git resolves inside the scratch clone")))
+    with pytest.raises(ob.Unknown) as raised:
+        ob.make_exercise_scratch(bus, tmp_path / "scratch")
+    assert raised.value.code == "EXERCISE_GIT_UNAVAILABLE"
+    assert list((tmp_path / "scratch").iterdir()) == [], "the half-made scratch directory was not removed"
+
+
+def test_r6_a_route_git_also_gets_attr_nosystem_and_empty_attribute_and_exclude_files(tmp_path, launches):
+    clone = make_clone(tmp_path)
+    assert ob.exercise_route("git log", clone, 30, {})[0] == "ROUTE_OK"
+    assert launches[0]["env"]["GIT_ATTR_NOSYSTEM"] == "1" and ob.route_exercise_env()["GIT_ATTR_NOSYSTEM"] == "1"
+    pairs = git_dash_c(launches[0]["argv"])
+    assert "core.attributesFile=" in pairs and "core.excludesFile=" in pairs, pairs
+
+
+def test_r6_the_empty_attribute_and_exclude_files_reach_a_real_git(tmp_path, capsys):
+    bus = make_bus(tmp_path)
+    item = item_file(tmp_path, adopt("git config --get core.attributesFile", "git config --get core.excludesFile"))
+    assert exercise(tmp_path, item, bus) == 0
+    assert statuses(capsys.readouterr().out) == ["ROUTE_OK"] * 2
+
+
+@pytest.mark.parametrize("command", ["git branch -l", "git branch -l fe*", "git branch -lv", "git branch -rl", "git branch -vl fe*"])
+def test_r6_branch_has_no_l_letter_so_list_is_spelled_out(tmp_path, launches, command):
+    clone = make_clone(tmp_path)
+    status, detail = ob.exercise_route(command, clone, 30, {})
+    assert status == "ROUTE_UNSAFE" and launches == [], (command, status, detail)
+    spec = ob.ROUTE_GIT_VERBS["branch"]
+    assert "l" not in spec.letters | spec.value_letters and not spec.list_letters and spec.list_flags == {"--list"}
+    assert ob.exercise_route("git branch --list fe*", clone, 30, {})[0] == "ROUTE_OK" and len(launches) == 1
+    assert "l" in ob.ROUTE_GIT_VERBS["tag"].letters and ob.exercise_route("git tag -l v*", clone, 30, {})[0] == "ROUTE_OK"   # tag -l is only a list
+
+
+@pytest.mark.parametrize("command", ["git log --show-signature", "git show --show-signature", "git log --show-signature HEAD",
+                                     "git show --show-signature --stat HEAD"])
+def test_r6_show_signature_is_off_the_option_list_for_log_and_show(tmp_path, launches, command):
+    clone = make_clone(tmp_path)
+    status, detail = ob.exercise_route(command, clone, 30, {})
+    assert status == "ROUTE_UNSAFE" and "--show-signature" in detail and launches == [], (command, status, detail)
+    assert not {"--show-signature"} & (ob.ROUTE_GIT_VERBS["log"].flags | ob.ROUTE_GIT_VERBS["show"].flags)
+
+
+def test_r6_the_readme_states_that_scratch_creation_runs_under_the_route_isolation():
+    text = (REPO_ROOT / "doctrine-outbox" / "README.md").read_text(encoding="utf-8")
+    section = text[text.index("## Card routes are checked before they ship"):text.index("## Concerns to the CoS")]
+    flat = " ".join(section.split())
+    for needle in ("scratch clone is made under the same isolation as the routes", "`GIT_ATTR_NOSYSTEM=1`", "-c core.attributesFile=",
+                   "-c core.excludesFile=", "git-lfs filter-process", "`run_isolated_git`"):
+        assert needle in flat, needle
+    assert "`log --show-signature` reaches" not in flat

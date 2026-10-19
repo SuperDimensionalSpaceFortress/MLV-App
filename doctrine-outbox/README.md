@@ -152,8 +152,9 @@ before launch):
   or inside it.
 - The verb is one of the read-only verbs `log`, `show`, `diff`, `grep`, `rev-parse`, `rev-list`, `status`, `ls-files`,
   `ls-tree`, `cat-file`, `describe`, `blame`, `shortlog`, `merge-base`, `for-each-ref`, `show-ref`, `name-rev`,
-  `count-objects`, `version`, `branch` and `tag` in list form only (no name unless `--list`/`-l` is given, and no
-  `-d`/`-D`/`-m`/`-c`/`-f`/`-a`/`-s`/`-u`), and `config` in a read mode only (its first word `--get`, `--get-all`,
+  `count-objects`, `version`, `branch` and `tag` in list form only (no name unless `--list` is given, and for `tag` also `-l`;
+  `branch` has no `-l` letter, which an older git reads as `--create-reflog`; and no `-d`/`-D`/`-m`/`-c`/`-f`/`-a`/`-s`/`-u`),
+  and `config` in a read mode only (its first word `--get`, `--get-all`,
   `--get-regexp`, `--list` or `-l`). No verb that can write is run: `commit`, `checkout`, `switch`, `restore`, `reset`,
   `merge`, `cherry-pick`, `revert`, `stash`, `apply`, `am`, `mv`, `rm`, `rebase`, `add`, `notes`, `worktree`, `gc`, `fetch`,
   `pull`, `push`, `clone`, `submodule`, ... are all `ROUTE_UNSAFE`, as is an alias (`git ship`, or a `!` alias such as
@@ -175,7 +176,8 @@ A `git` route that is run gets the interpreter-injection environment stripped: `
 `NODE_OPTIONS`, `NODE_PATH`, `PERL5OPT`, `PERL5LIB`, `RUBYOPT`, `BASH_ENV` and `ENV`, plus credential-shaped variables, every
 `GIT_*` variable (`GIT_EDITOR`, `GIT_SEQUENCE_EDITOR`, `GIT_PAGER`, `GIT_ASKPASS`, `GIT_SSH`, `GIT_SSH_COMMAND`,
 `GIT_EXTERNAL_DIFF`, `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT`, `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`, ...) and the
-generic helpers `EDITOR`, `VISUAL`, `PAGER` and `SSH_ASKPASS`. Its git config is isolated: `GIT_CONFIG_NOSYSTEM=1`, and
+generic helpers `EDITOR`, `VISUAL`, `PAGER` and `SSH_ASKPASS`. Its git config is isolated: `GIT_CONFIG_NOSYSTEM=1`,
+`GIT_ATTR_NOSYSTEM=1`, and
 `GIT_CONFIG_GLOBAL` names an empty file the tool writes beside the clone in its scratch directory (emptied before every run),
 so a driver, alias or helper defined in the system config, `~/.gitconfig` or the XDG config never applies; a test defines a
 textconv driver through `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`, `~/.gitconfig`, the XDG config (with an XDG attributes file
@@ -184,9 +186,19 @@ keeps only the absolute entries whose real path is outside the clone (a `.`, emp
 or link into the clone, are dropped), so a `false.exe` or `gpg` planted in the clone is never found. Git is started as
 `git -c core.pager=cat -c core.editor=false -c diff.external= -c core.fsmonitor=false -c commit.gpgsign=false
 -c tag.gpgsign=false -c safe.bareRepository=explicit -c gpg.program=false -c gpg.ssh.program=false
--c gpg.x509.program=false -c core.hooksPath=<an empty directory beside the clone in the scratch> ...`, so no pager, editor,
-external diff, hook or signing program is reachable even through a verb that wants one (`log --show-signature` reaches
-`false`), and a bare repository committed in the clone is never opened as the repository. A route must be exercisable
+-c gpg.x509.program=false -c core.attributesFile= -c core.excludesFile=
+-c core.hooksPath=<an empty directory beside the clone in the scratch> ...`, so no pager, editor, external diff, hook,
+signing program or attributes or excludes file of the host is reachable even through a verb that wants one (`--show-signature`
+is not on the option list of `log` or `show`), and a bare repository committed in the clone is never opened as the
+repository.
+
+The scratch clone is made under the same isolation as the routes, before any route is screened (`run_isolated_git`: the same
+git binary, environment and `-c` pairs, with `git clone --local` and the two follow-up calls going through it). Without that,
+`git clone` read the host's own config, and this host's system `gitconfig` defines `[filter "lfs"] process = git-lfs
+filter-process`, so a bus `.gitattributes` of `* filter=lfs` started git-lfs at checkout. A test builds a bus selecting
+a filter (`keyprobe`, and `lfs`) or a `post-checkout` hook that the host config defines (through `GIT_CONFIG_GLOBAL` and
+`GIT_CONFIG_SYSTEM`), shows a plain `git clone` starts the program, and shows `validate --exercise` never does and checks the
+committed bytes out as committed. A route must be exercisable
 offline and only in the scratch clone, so these are `ROUTE_UNSAFE` too, whether or not the program would be run:
 - a shell operator (pipe, redirect, `&&`, `;`) or an environment-assignment prefix;
 - any `gh`, `claude`/`codex` `auth|login|logout`, a network client (`curl`, `ssh`, `npx`, ...), `find -exec`, a URL or
