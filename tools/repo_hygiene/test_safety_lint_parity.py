@@ -11,6 +11,7 @@ so a PR that touches neither lint pays nothing for it.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -19,6 +20,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -57,7 +59,17 @@ MIN_DERIVED_HOOK_ROWS = 200  # DENY rows of test_mlv_never_authorized.CASES (203
 # number is a corpus change that a reviewer should see: adding a deny row to either suite means raising the matching number here in
 # the same commit; DELETING one fails this test. The floors above stay as the coarse lower bound.
 EXACT_DERIVED_HOOK_ROWS = 203      # DENY rows of test_mlv_never_authorized.CASES
-EXACT_DERIVED_PLAYBACK_ROWS = 211  # must-refuse sentences of test_hub_vm_no_local_playback.py, deduplicated by (name, text)
+EXACT_DERIVED_PLAYBACK_ROWS = 6018  # must-refuse sentences of test_hub_vm_no_local_playback.py, deduplicated by (name, text): 211 + 5,807 non-fuzz RULE4_* rows
+# r18 (hub ruling #3, amends #2): rows of #465's two seeded FUZZ tuples, left out of the derived corpus above, head AND baseline, by the
+# explicit list slp.PARITY_EXCLUDED_DIFFERENTIAL_TUPLES (parity cost: 12,018 rows did not finish in 1,198 s). Pinned so deleting one, or adding
+# an unlisted row to a listed tuple, is visible: RULE4_R9_FUZZ_REFUSE 3,600 + RULE4_R10_FUZZ_REFUSE 2,400.
+EXACT_EXCLUDED_DIFFERENTIAL_ROWS = 6000
+# r18: the fuzz generators themselves. A change to a generator or its seed shows here, because the excluded rows get no parity loosening check.
+# Each value is (row count, sha256 of the sorted, newline-joined row texts), derived from the head and never hand-picked.
+EXACT_FUZZ_GENERATOR_PINS = {
+    "RULE4_R9_FUZZ_REFUSE": (3600, "c5a0812dd155f31503bc42a92bddc350b64efbae3e2a1a25aafcf56c47c5c03a"),
+    "RULE4_R10_FUZZ_REFUSE": (2400, "7f905d1ccbb6d7ddb7f223e3133f850ccd779d32882bdd79e7393b4484d05889"),
+}
 
 
 def _write(path: Path, text: str) -> Path:
@@ -280,11 +292,15 @@ def derived_pin_failures(root: Path) -> list[str]:
     the two deny suites, with one row deleted, can be judged by the very check the test runs (see the r4 RED proof in the PR body)."""
     failures = []
     hook = len(slp.derived_hook_cases(root))
-    playback = len(slp.derived_playback_rows(root)[0])
+    playback_rows, pb = slp.derived_playback_rows(root)
+    playback = len(playback_rows)
+    excluded = len(slp.excluded_playback_rows(pb))
     if hook != EXACT_DERIVED_HOOK_ROWS:
         failures.append(f"derived hook DENY rows: {hook} != pinned {EXACT_DERIVED_HOOK_ROWS}")
     if playback != EXACT_DERIVED_PLAYBACK_ROWS:
         failures.append(f"derived playback must-refuse rows: {playback} != pinned {EXACT_DERIVED_PLAYBACK_ROWS}")
+    if excluded != EXACT_EXCLUDED_DIFFERENTIAL_ROWS:
+        failures.append(f"excluded differential playback rows: {excluded} != pinned {EXACT_EXCLUDED_DIFFERENTIAL_ROWS}")
     return failures
 
 
@@ -323,6 +339,85 @@ class DerivedCorpusExactPinTests(unittest.TestCase):
             failures = derived_pin_failures(REPO_ROOT)
         self.assertEqual(len(failures), 1, failures)
         self.assertIn("derived playback must-refuse rows", failures[0])
+
+
+class ExplicitDifferentialExclusionTests(unittest.TestCase):
+    """r16c (hub ruling #2), amended by r18 (hub ruling #3): #465's two seeded fuzz tuples are left out of the derived corpus, head and
+    baseline, by an exact-name list, not a prefix or a regex."""
+
+    def _head_module(self):
+        return slp.derived_playback_rows(REPO_ROOT)[1]
+
+    def test_every_excluded_name_is_a_tuple_of_strings_in_the_head_playback_suite(self):
+        pb = self._head_module()
+        stale = sorted(n for n in slp.PARITY_EXCLUDED_DIFFERENTIAL_TUPLES
+                       if not (isinstance(getattr(pb, n, None), tuple) and getattr(pb, n) and all(isinstance(t, str) for t in getattr(pb, n))))
+        self.assertEqual(stale, [], "a stale entry excludes nothing and would hide a rename; drop or fix it")
+
+    def test_the_excluded_rows_match_the_pin_and_the_derived_ids_do_not_overlap(self):
+        pb = self._head_module()
+        excluded = slp.excluded_playback_rows(pb)
+        self.assertEqual(len(excluded), EXACT_EXCLUDED_DIFFERENTIAL_ROWS, "raise or lower the pin in the same commit that adds or deletes an excluded row")
+        derived_ids = {r["id"] for r in slp.derived_playback_rows(REPO_ROOT)[0]}
+        self.assertEqual(derived_ids & {r["id"] for r in excluded}, set())
+        self.assertTrue(all(r["id"].split(":")[1] in slp.PARITY_EXCLUDED_DIFFERENTIAL_TUPLES for r in excluded))
+
+    def test_the_exclusion_is_an_exact_name_list(self):
+        self.assertTrue(all(re.fullmatch(r"[A-Z0-9_]+", n) for n in slp.PARITY_EXCLUDED_DIFFERENTIAL_TUPLES))
+        self.assertIsInstance(slp.PARITY_EXCLUDED_DIFFERENTIAL_TUPLES, frozenset)
+
+    def test_a_non_rule4_refuse_tuple_and_an_unlisted_rule4_tuple_are_still_derived(self):
+        fake = types.ModuleType("fake_playback_tests")
+        fake.PromptLintTests = type("PromptLintTests", (), {})
+        fake.INCIDENT_LINE = "incident"
+        fake.OTHER_CARD_REFUSE = ("other card sentence one", "other card sentence two")
+        fake.RULE4_UNLISTED_NEW_REFUSE = ("unlisted rule4 sentence",)
+        fake.RULE4_R9_FUZZ_REFUSE = ("listed fuzz sentence",)
+        derived = {r["id"].split(":")[1] for r in slp._playback_rows_from(fake, "derived", "head", "skip")}
+        self.assertIn("OTHER_CARD_REFUSE", derived)
+        self.assertIn("RULE4_UNLISTED_NEW_REFUSE", derived, "a new RULE4_* tuple must be counted until someone lists it")
+        self.assertNotIn("RULE4_R9_FUZZ_REFUSE", derived)
+        self.assertEqual({r["id"].split(":")[1] for r in slp.excluded_playback_rows(fake)}, {"RULE4_R9_FUZZ_REFUSE"})
+
+    def test_the_baseline_union_does_not_re_add_an_excluded_row(self):
+        """r18 (hub ruling #3): a baseline that carries a listed fuzz tuple (every `--base HEAD` run, and master once #465 lands) must not
+        return its rows through the union; a baseline-only row of an unlisted tuple still joins it."""
+        baseline_source = (
+            "class PromptLintTests:\n    pass\n"
+            "INCIDENT_LINE = 'incident'\n"
+            "RULE4_R9_FUZZ_REFUSE = ('baseline fuzz sentence one', 'baseline fuzz sentence two')\n"
+            "RULE4_R10_FUZZ_REFUSE = ('baseline tail fuzz sentence',)\n"
+            "RULE4_BASELINE_ONLY_REFUSE = ('baseline only non fuzz sentence',)\n")
+        with mock.patch.object(slp, "git", lambda root, *args: baseline_source):
+            rows, _ = slp.derived_playback_rows(REPO_ROOT, "HEAD")
+        by_name = {}
+        for r in rows:
+            by_name.setdefault(r["id"].split(":")[1], []).append(r)
+        for name in slp.PARITY_EXCLUDED_DIFFERENTIAL_TUPLES:
+            self.assertNotIn(name, by_name, f"{name} came back through the baseline union")
+        self.assertEqual([r["text"] for r in by_name["RULE4_BASELINE_ONLY_REFUSE"]], ["baseline only non fuzz sentence"])
+        self.assertEqual(by_name["RULE4_BASELINE_ONLY_REFUSE"][0]["source"], "derived-base")
+
+    def test_a_baseline_equal_to_head_adds_no_row_and_re_adds_no_excluded_row(self):
+        rows, _ = slp.derived_playback_rows(REPO_ROOT, "HEAD")
+        self.assertEqual(len(rows), EXACT_DERIVED_PLAYBACK_ROWS, "--base HEAD must see exactly the head's derived rows")
+        self.assertEqual([r["id"] for r in rows if r["id"].split(":")[1] in slp.PARITY_EXCLUDED_DIFFERENTIAL_TUPLES], [])
+
+    def test_a_non_fuzz_rule4_tuple_is_derived(self):
+        names = {r["id"].split(":")[1] for r in slp.derived_playback_rows(REPO_ROOT)[0]}
+        self.assertIn("RULE4_R9_REFUSE", names)
+        self.assertIn("RULE4_R2_REFUSE", names)
+        self.assertEqual(slp.PARITY_EXCLUDED_DIFFERENTIAL_TUPLES, frozenset({"RULE4_R9_FUZZ_REFUSE", "RULE4_R10_FUZZ_REFUSE"}))
+
+    def test_the_fuzz_generators_are_pinned_by_count_and_sha256(self):
+        """r18: the excluded fuzz rows get no parity loosening check, so a change to a generator or a seed must be visible in review."""
+        self.assertEqual(set(EXACT_FUZZ_GENERATOR_PINS), set(slp.PARITY_EXCLUDED_DIFFERENTIAL_TUPLES))
+        pb = self._head_module()
+        for name, (count, digest) in sorted(EXACT_FUZZ_GENERATOR_PINS.items()):
+            texts = getattr(pb, name)
+            self.assertEqual(len(texts), count, f"{name} row count")
+            self.assertEqual(hashlib.sha256("\n".join(sorted(texts)).encode("utf-8")).hexdigest(), digest,
+                             f"{name} texts changed: re-derive the pin in the same commit that changes the generator or its seed")
 
 
 BROKEN_BASELINES = {
