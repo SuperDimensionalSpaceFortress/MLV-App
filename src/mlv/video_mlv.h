@@ -477,6 +477,7 @@ int getMlvLastProcessed8CacheHitScaleFactor(void);
 int getMlvLastProcessed8PrefetchHit(void);
 int getMlvProcessed8PrefetchEnabledForTesting(const mlvObject_t * video);
 int mlvWaitForProcessed8PrefetchIdleForTesting(mlvObject_t * video, uint32_t timeout_ms);
+void mlvSetProcessed8PrefetchPrepareFailuresForTesting(mlvObject_t * video, int count);
 void mlvSetProcessed8PrefetchPauseBeforeStoreForTesting(mlvObject_t * video, int enabled);
 int mlvWaitForProcessed8PrefetchPausedBeforeStoreForTesting(mlvObject_t * video,
                                                             uint32_t timeout_ms);

@@ -12437,6 +12437,116 @@ TEST(DualIsoPipeline, Processed8InvalidationRejectsInFlightOldGenerationStoreAnd
     MLVAPP_TEST_UNSETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH");
 }
 
+/* PROCESSED8-IDLE-WAIT-PREDICATE-RECHECK-1: when the worker's cache prepare
+ * fails it clears request_pending. An idle waiter parked only on that pending
+ * request must wake promptly; before the fix the failure path never broadcast
+ * and the timed wait never re-checked, so the waiter slept to its deadline and
+ * reported a false hang.
+ *
+ * The worker is woken with pthread_cond_signal, retried, never a broadcast: a
+ * broadcast would also wake the parked waiter, which then races the worker for
+ * the mutex; if the worker cleared pending first, the unfixed waiter would see
+ * idle and return promptly, and this test could not fail. A signal the waiter
+ * absorbs only re-parks it (pending is still 1), so the next one is sent until
+ * the worker has consumed the armed failure, and nothing is sent after it. */
+TEST(DualIsoPipeline, Processed8PrefetchIdleWaitWakesWhenWorkerPrepareFails)
+{
+    MLVAPP_TEST_SETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH", "1");
+    processingSetPlaybackPreviewMode(1);
+    processingSetPlaybackAggressivePreviewMode(0);
+
+    QString error_message;
+    MlvPipelineFixture fixture;
+    ASSERT_TRUE(fixture.openTinyDualIso(&error_message));
+    ASSERT_TRUE(fixture.loadReceipt(QStringLiteral("tests/fixtures/receipts/tiny_dual_iso_preview.marxml"),
+                                    &error_message));
+    ASSERT_TRUE(fixture.applyReceipt(&error_message));
+
+    if ((fixture.width() % 4) != 0 || (fixture.height() % 4) != 0)
+    {
+        processingSetPlaybackPreviewMode(0);
+        MLVAPP_TEST_UNSETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH");
+        return;
+    }
+
+    (void)fixture.renderFrame8Scaled(0, 1, 4);
+    ASSERT_TRUE(waitForProcessed8PrefetchIdleOrHang(fixture.video()));
+
+    /* Arm one worker prepare failure and a pending request without waking the
+     * worker, so the waiter parks on pending alone. */
+    mlvSetProcessed8PrefetchPrepareFailuresForTesting(fixture.video(), 1);
+    pthread_mutex_lock(&fixture.video()->processed8_prefetch_mutex);
+    fixture.video()->processed8_prefetch_request_pending = 1;
+    pthread_mutex_unlock(&fixture.video()->processed8_prefetch_mutex);
+
+    int waiter_result = 0;
+    const auto waiter_start = std::chrono::steady_clock::now();
+    std::thread waiter([&]() {
+        waiter_result = mlvWaitForProcessed8PrefetchIdleForTesting(fixture.video(), 5000);
+    });
+
+    bool waiter_is_blocked = false;
+    int armed_when_blocked = -1;
+    for (int attempt = 0; attempt < 5000 && !waiter_is_blocked; ++attempt)
+    {
+        pthread_mutex_lock(&fixture.video()->processed8_prefetch_mutex);
+        waiter_is_blocked = fixture.video()->processed8_prefetch_test_idle_waiters > 0;
+        armed_when_blocked = fixture.video()->processed8_prefetch_test_prepare_failures;
+        pthread_mutex_unlock(&fixture.video()->processed8_prefetch_mutex);
+        if (!waiter_is_blocked)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+
+    /* Wake the worker; stop as soon as it has taken the prepare-failure path. */
+    int failures_left = -1;
+    if (waiter_is_blocked && armed_when_blocked == 1)
+    {
+        for (int signal_attempt = 0; signal_attempt < 100 && failures_left != 0; ++signal_attempt)
+        {
+            pthread_mutex_lock(&fixture.video()->processed8_prefetch_mutex);
+            pthread_cond_signal(&fixture.video()->processed8_prefetch_cond);
+            pthread_mutex_unlock(&fixture.video()->processed8_prefetch_mutex);
+            for (int poll = 0; poll < 50; ++poll)
+            {
+                pthread_mutex_lock(&fixture.video()->processed8_prefetch_mutex);
+                failures_left = fixture.video()->processed8_prefetch_test_prepare_failures;
+                pthread_mutex_unlock(&fixture.video()->processed8_prefetch_mutex);
+                if (failures_left == 0)
+                {
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        }
+    }
+    waiter.join();
+    const double waiter_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - waiter_start).count();
+    pthread_mutex_lock(&fixture.video()->processed8_prefetch_mutex);
+    failures_left = fixture.video()->processed8_prefetch_test_prepare_failures;
+    pthread_mutex_unlock(&fixture.video()->processed8_prefetch_mutex);
+    std::fprintf(stderr,
+                 "Processed8PrefetchIdleWaitWakesWhenWorkerPrepareFails: waiter_result=%d waiter_ms=%.1f armed_when_blocked=%d failures_left=%d\n",
+                 waiter_result,
+                 waiter_ms,
+                 armed_when_blocked,
+                 failures_left);
+
+    ASSERT_TRUE(waiter_is_blocked);
+    /* Inconclusive guard: the worker must not consume the failure before the
+     * waiter parks, or the waiter never waits on the cleared request. */
+    ASSERT_EQ(1, armed_when_blocked);
+    /* The worker really took the prepare-failure path. */
+    ASSERT_EQ(0, failures_left);
+    ASSERT_EQ(1, waiter_result);
+    ASSERT_TRUE(waiter_ms < 1000.0);
+
+    processingSetPlaybackPreviewMode(0);
+    MLVAPP_TEST_UNSETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH");
+}
+
 /* Round-2 item 2 (2026-06-12): the indirect worker render at x2 SHARP was
  * re-A/B'd post-quarter-res and recorded as a DEAD END (the cheap foreground
  * already fits the frame budget warm; the worker core-split slows warm runs).

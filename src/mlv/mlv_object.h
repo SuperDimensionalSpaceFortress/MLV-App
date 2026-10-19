@@ -281,6 +281,8 @@ typedef struct {
     int processed8_prefetch_test_pause_before_store;
     int processed8_prefetch_test_paused_before_store;
     int processed8_prefetch_test_idle_waiters;
+    /* Production leaves this zero; tests force N worker cache-prepare failures. */
+    int processed8_prefetch_test_prepare_failures;
     /* Phase E6: scaleFactor accompanying the most recent note_request. The
      * worker uses this to record the slot's `scale` lane (so render-thread
      * lookups at the same scale match) and to set

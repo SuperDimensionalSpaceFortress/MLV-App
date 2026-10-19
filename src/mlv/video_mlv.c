@@ -3051,7 +3051,17 @@ static void * mlv_processed8_prefetch_thread_main(void * opaque)
         const int out_h = (requestScale > 1) ? (full_h / requestScale) : full_h;
         const uint64_t rgb_frame_size = (uint64_t)out_w * (uint64_t)out_h * 3u;
 
-        if (!mlv_prepare_processed_frame_8bit_cache_locked(video, rgb_frame_size))
+        int prepare_failed = 0;
+        if (video->processed8_prefetch_test_prepare_failures > 0)
+        {
+            --video->processed8_prefetch_test_prepare_failures;
+            prepare_failed = 1;
+        }
+        else if (!mlv_prepare_processed_frame_8bit_cache_locked(video, rgb_frame_size))
+        {
+            prepare_failed = 1;
+        }
+        if (prepare_failed)
         {
             video->processed8_prefetch_request_pending = 0;
             pthread_mutex_unlock(&video->processed8_prefetch_mutex);
@@ -9494,6 +9504,19 @@ int mlvWaitForProcessed8PrefetchIdleForTesting(mlvObject_t * video,
     return 1;
 }
 
+void mlvSetProcessed8PrefetchPrepareFailuresForTesting(mlvObject_t * video,
+                                                       int count)
+{
+    if (!video)
+    {
+        return;
+    }
+
+    pthread_mutex_lock(&video->processed8_prefetch_mutex);
+    video->processed8_prefetch_test_prepare_failures = (count > 0) ? count : 0;
+    pthread_mutex_unlock(&video->processed8_prefetch_mutex);
+}
+
 void mlvSetProcessed8PrefetchPauseBeforeStoreForTesting(mlvObject_t * video,
                                                         int enabled)
 {
@@ -9645,6 +9668,7 @@ mlvObject_t * initMlvObject()
     video->processed8_prefetch_test_pause_before_store = 0;
     video->processed8_prefetch_test_paused_before_store = 0;
     video->processed8_prefetch_test_idle_waiters = 0;
+    video->processed8_prefetch_test_prepare_failures = 0;
     video->raw_uint16_prefetch_threads_started = 0;
     video->raw_uint16_prefetch_decoders = 0;
     video->raw_uint16_prefetch_stop = 0;
