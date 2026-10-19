@@ -6,15 +6,18 @@
 #
 # What it does, in order (a refusal at any step is a typed non-zero exit; see the table below):
 #   1. reads venues.json and the two standard leg specs (legs\m16-1243-look.json, legs\m16-1243-display-fullscreen-s1.json), and takes each leg's ROLE from the
-#      table (Get-DvVenueRole, the card named in the spec). -SourceCommit defaults to the local fork/master ref (-Fetch runs a bounded `git fetch fork master` first);
-#   2. -WhatIf stops here: it prints the plan (BASELINE_PLAN / BASELINE_LEG / BASELINE_CMD lines) and runs nothing, reads no share and samples nothing;
+#      table (Get-DvVenueRole, the card named in the spec). -SourceCommit defaults to the local fork/master ref (-Fetch runs `git fetch fork master` first, as a child bounded
+#      by -MaxTotalSec and killed past it: FETCH_TIMEOUT; -WhatIf never fetches);
+#   2. -WhatIf stops here: it prints the plan (BASELINE_PLAN / BASELINE_LEG / BASELINE_CMD lines) and runs nothing, fetches nothing, reads no share and samples nothing;
 #   3. samples the hub-VM load (commit GiB, CPU %), refuses when the venue claim is live or a ticket is queued (AGENT_BUSY), refuses when the agent share does not
 #      answer inside -ProbeTimeoutSec (SHARE_UNREACHABLE), and finds the staged build manifest (BUILD_NOT_STAGED when it is not there);
 #   4. runs the standard legs through the tracked Invoke-VenueChain.ps1 -PreferQuietWindows, once per backend (cuda, then cpu), as a CHILD process bounded by
 #      -MaxTotalSec (+ -KillGraceSec): the chain's own -DeadlineUtc stops it gracefully, the kill is the backstop, so nothing here can wait unbounded;
 #      The chain's exit code is read before any row is built (a pinned consumer of the evidence launchers: tools/repo_hygiene/test_playback_evidence_completeness.py).
-#      A leg is recorded RAN only when the chain ended on its own, with a documented exit that agrees with its CHAIN_RESULT, and the leg's receipt is readable;
-#      otherwise the row is status EVIDENCE_INCOMPLETE / outcome INVALID with a `failure` text and NO figures, and the run exits CHAIN_FAILED (27).
+#      A leg is recorded RAN, with figures, only when the chain ended on its own with exit 0 that agrees with its CHAIN_RESULT, and the leg's receipt is readable and
+#      its validator verdict is ADVISORY / NO_SIGNAL / VERIFIED* (INVALID, INCOMPLETE and a validator error are refused); otherwise the row is status EVIDENCE_INCOMPLETE
+#      (EVIDENCE_INVALID for an INVALID verdict) / outcome INVALID with a `failure` text and NO figures. An undocumented or disagreeing exit exits CHAIN_FAILED (27); a documented
+#      non-zero exit (7, 3, gate) keeps its own typed exit but its legs carry no figures either.
 #   5. appends ONE JSON line per leg that touched the venue to the trend file (default <main checkout>\.claude-state\dual-venue\baseline-trend.jsonl), then
 #      samples the hub-VM load again; the same two samples sit in every row of the run.
 #
@@ -29,10 +32,11 @@
 # 20 AGENT_BUSY (a live claim or queued ticket, or the venue never went quiet before the deadline with no leg run); 21 SHARE_UNREACHABLE; 22 BUILD_NOT_STAGED;
 # 23 GATE_REFUSED (the chain stopped on GATE_UNREADABLE / HOST_MISMATCH / VENUE_QUIET_UNKNOWN / an unhealthy streak: chain exits 4, 5, 6, 8);
 # 24 BASELINE_CAP_EXCEEDED (-MaxTotalSec ran out; rows for the legs that did run are still appended); 25 LEG_FAILED (a leg process died: chain exit 7);
-# 26 SOURCE_COMMIT_UNRESOLVED; 27 CHAIN_FAILED (the chain ended with no CHAIN_RESULT or an undocumented exit). 17 is NOT used: it is the hub-VM playback refusal.
+# 26 SOURCE_COMMIT_UNRESOLVED; 27 CHAIN_FAILED (the chain ended with no CHAIN_RESULT or an undocumented exit);
+# 28 FETCH_TIMEOUT (-Fetch: git fetch outlived -MaxTotalSec and was killed). 17 is NOT used: it is the hub-VM playback refusal.
 #
 # NO LOCAL PLAYBACK: this script never starts MLVApp. Playback happens only on the venue, through the chain (hub-hosts.json, HUB-VM-NO-LOCAL-PLAYBACK-1).
-# -ChainScript / -HubLoadScript / -AgentShare / -ClaimDir / -VenueTablePath / -RepoRoot are seams for the offline tests (tools/repo_hygiene/test_venue_baseline.py);
+# -ChainScript / -ValidatorScript / -GitExe / -HubLoadScript / -AgentShare / -ClaimDir / -VenueTablePath / -RepoRoot are seams for the offline tests (tools/repo_hygiene/test_venue_baseline.py);
 # production passes none. Scheduling is NOT here: the hub wires one call into MLVHubAutopilot (see the PR body).
 [CmdletBinding()]
 param(
@@ -49,6 +53,8 @@ param(
     [switch]$WhatIf,
     [switch]$Fetch,
     [string]$ChainScript = '',
+    [string]$ValidatorScript = '',
+    [string]$GitExe = 'git',
     [string]$HubLoadScript = '',
     [string]$AgentShare = '',
     [string]$ClaimDir = '',
@@ -64,7 +70,7 @@ $StandardLegs = @('legs\m16-1243-look.json', 'legs\m16-1243-display-fullscreen-s
 $StandardBackends = @('cuda', 'cpu')
 $ExitCodes = [ordered]@{
     OK = 0; USAGE = 2; AGENT_BUSY = 20; SHARE_UNREACHABLE = 21; BUILD_NOT_STAGED = 22; GATE_REFUSED = 23
-    BASELINE_CAP_EXCEEDED = 24; LEG_FAILED = 25; SOURCE_COMMIT_UNRESOLVED = 26; CHAIN_FAILED = 27
+    BASELINE_CAP_EXCEEDED = 24; LEG_FAILED = 25; SOURCE_COMMIT_UNRESOLVED = 26; CHAIN_FAILED = 27; FETCH_TIMEOUT = 28
 }
 $startedUtc = [DateTime]::UtcNow
 $pwshExe = [Environment]::ProcessPath
@@ -140,14 +146,32 @@ foreach ($rel in $StandardLegs) {
     $legs.Add([pscustomobject]@{ legId = [string]$spec.legId; card = [string]$spec.card; spec = (Resolve-Path -LiteralPath $path).Path; backends = @($spec.backends); role = (Get-DvVenueRole -Table $table -Card ([string]$spec.card) -Venue $Venue) })
 }
 
+$deadline = $startedUtc.AddSeconds($MaxTotalSec)
+
+function Invoke-BoundedFetch {
+    # `git fetch fork master` as a CHILD bounded by the same -MaxTotalSec budget as everything else: past the deadline the child and its tree are killed. Returns $true when it timed out.
+    $psi = [Diagnostics.ProcessStartInfo]::new($GitExe)
+    foreach ($a in @('-C', $repo, 'fetch', '--quiet', 'fork', 'master')) { [void]$psi.ArgumentList.Add($a) }
+    $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.RedirectStandardInput = $true; $psi.CreateNoWindow = $true
+    $p = [Diagnostics.Process]::Start($psi)
+    $p.StandardInput.Close()
+    [void]$p.StandardOutput.ReadToEndAsync(); [void]$p.StandardError.ReadToEndAsync()
+    $done = $p.WaitForExit([int][Math]::Max(1000, ($deadline - [DateTime]::UtcNow).TotalMilliseconds))
+    if (-not $done) { try { $p.Kill($true) } catch { }; [void]$p.WaitForExit(15000) }
+    -not $done
+}
+
 $commit = $SourceCommit
 if (-not $commit) {
-    if ($Fetch) { try { & git -C $repo fetch --quiet fork master 2>&1 | Out-Null } catch { } }
+    # -WhatIf never fetches (it runs nothing); a failed fetch is not an error (the local fork/master ref is used), a stalled one is FETCH_TIMEOUT.
+    if ($Fetch -and -not $WhatIf) {
+        $fetchTimedOut = try { Invoke-BoundedFetch } catch { $false }
+        if ($fetchTimedOut) { Stop-Baseline 'FETCH_TIMEOUT' "git fetch fork master was still running at the $MaxTotalSec s cap and was killed" }
+    }
     $ref = (& git -C $repo rev-parse --verify --quiet 'refs/remotes/fork/master^{commit}' 2>$null)
     if ($LASTEXITCODE -ne 0 -or [string]$ref -cnotmatch '^[0-9a-f]{40}$') { Stop-Baseline 'SOURCE_COMMIT_UNRESOLVED' 'refs/remotes/fork/master does not resolve; pass -SourceCommit <40-hex> or fetch fork' }
     $commit = [string]$ref
 }
-$deadline = $startedUtc.AddSeconds($MaxTotalSec)
 
 function Get-ChainArgs([string]$Backend, [string]$ChainRunDir, [string]$Manifest) {
     @('-NoProfile', '-NonInteractive', '-File', $chainPath, '-Venue', $Venue, '-LegSpec', (($legs | ForEach-Object { $_.spec }) -join ','), '-Backend', $Backend,
@@ -226,14 +250,19 @@ function Invoke-BoundedChain([string]$Backend) {
 function Get-RowFigures([string]$ReceiptPath, $Leg, [string]$Backend) {
     # The figures exactly as the receipt reports them (null when the receipt does not carry one; never a default). presentedFps / timelineFpsAfterFirstPresent come from
     # the receipt's own hashed run log through Get-DvMatrixRow, which refuses a log that no longer hashes to the receipt.
-    $f = [ordered]@{ receipt = $null; outcome = $null; fps = $null; drops = $null; stall = $null; verification = $null }
+    $f = [ordered]@{ receipt = $null; outcome = $null; fps = $null; drops = $null; stall = $null; verification = $null; rejected = $null }
     if (-not $ReceiptPath -or -not (Test-Path -LiteralPath $ReceiptPath -PathType Leaf)) { return $f }
     try { $rc = [IO.File]::ReadAllText($ReceiptPath) | ConvertFrom-Json } catch { return $f }
-    # The evidence-bearing validator (-RepoRoot re-derives the admission from the committed blobs and the run from the hashed evidence). Its verdict is recorded beside the figures,
-    # not used as a gate: a production receipt is ADVISORY at best and every Ultra-Magnus figure is supplementary, so the row says what the validator said and the reader decides.
-    $v = try { Test-DvReceiptValid -Receipt $rc -RepoRoot $repo } catch { $null }
-    $f.verification = $(if ($v) { [ordered]@{ status = [string]$v.status; valid = [bool]$v.valid; reasons = @($v.reasons | Select-Object -First 3) } } else { [ordered]@{ status = 'VALIDATOR_ERROR'; valid = $false; reasons = @() } })
-    $m = Get-DvProp $rc 'metrics'; $pb = Get-DvProp $rc 'playback'; $pm = Get-DvProp $m 'presentMonStats'
+    # The evidence-bearing validator (-RepoRoot re-derives the admission from the committed blobs and the run from the hashed evidence). Its verdict is recorded in the row AND gates
+    # the figures: a production receipt is ADVISORY at best (valid=false by design, so `valid` is not the gate), and only ADVISORY / NO_SIGNAL / VERIFIED / VERIFIED_OFFLINE_TEST
+    # receipts have their figures copied. INVALID, INCOMPLETE, a validator error or any status not named here is `rejected`: no figure, the caller types the row.
+    $v = try {
+        if ($ValidatorScript) { $o = (& $pwshExe -NoProfile -NonInteractive -File $ValidatorScript -ReceiptPath $ReceiptPath) -join "`n"; if ($LASTEXITCODE -ne 0) { throw "validator exit $LASTEXITCODE" }; $o | ConvertFrom-Json }
+        else { Test-DvReceiptValid -Receipt $rc -RepoRoot $repo }
+    } catch { $null }
+    $f.verification = $(if ($v -and [string]$v.status) { [ordered]@{ status = [string]$v.status; valid = [bool]$v.valid; reasons = @($v.reasons | Select-Object -First 3) } } else { [ordered]@{ status = 'VALIDATOR_ERROR'; valid = $false; reasons = @() } })
+    if ($f.verification.status -cnotin @('ADVISORY', 'NO_SIGNAL', 'VERIFIED', 'VERIFIED_OFFLINE_TEST')) { $f.rejected = $f.verification.status; return $f }
+    $m =Get-DvProp $rc 'metrics'; $pb = Get-DvProp $rc 'playback'; $pm = Get-DvProp $m 'presentMonStats'
     $entry = [pscustomobject]@{ seq = 1; repeat = 1; cellId = $Leg.legId; backend = $Backend; displayMode = [string](Get-DvProp (Get-DvProp $rc 'display') 'requestedMode'); scaleFactor = Get-DvProp (Get-DvProp $rc 'scale') 'requestedScale' }
     $row = try { Get-DvMatrixRow -PlanEntry $entry -Receipt $rc } catch { $null }
     $f.outcome = [string](Get-DvProp $rc 'outcome')
@@ -265,6 +294,9 @@ foreach ($b in $StandardBackends) {
     # exit its CHAIN_RESULT reports (the guard in test_playback_evidence_completeness.py pins this statement). Anything else is a typed EVIDENCE_INCOMPLETE row.
     $resultExit = $(if ($c.result -and $c.result.PSObject.Properties['exitCode']) { [int]$c.result.exitCode } else { $null })
     $chainComplete = (-not $c.timedOut) -and ($null -ne $c.exit) -and ($null -ne $resultExit) -and ($resultExit -eq [int]$c.exit) -and (([int]$c.exit) -in 0, 2, 3, 4, 5, 6, 7, 8)
+    # A trend figure needs more than a documented, agreeing exit: the chain must also have EXITED 0. A chain that died (7), hit its deadline (3) or stopped on a gate has no clean
+    # measurement, even for a leg that RAN before it.
+    $chainClean = $chainComplete -and ([int]$c.exit -eq 0)
     $ranHere = 0
     if ($c.result) {
         foreach ($leg in @($c.result.legs)) {
@@ -273,17 +305,24 @@ foreach ($b in $StandardBackends) {
             $planLeg = @($legs | Where-Object { $leg.spec -and ([IO.Path]::GetFullPath([string]$leg.spec) -ieq $_.spec) })[0]
             if ($null -eq $planLeg) { $planLeg = @($legs | Where-Object { [string]$leg.name -like "*$($_.legId)*" })[0] }
             if ($null -eq $planLeg) { continue }
-            # An incomplete chain's receipts are never read: no figure of such a leg reaches the trend file.
-            $fig = Get-RowFigures $(if ($chainComplete -and $leg.PSObject.Properties['receipt']) { [string]$leg.receipt } else { '' }) $planLeg $b
+            # An unclean chain's receipts are never read: no figure of such a leg reaches the trend file.
+            $fig = Get-RowFigures $(if ($chainClean -and $leg.PSObject.Properties['receipt']) { [string]$leg.receipt } else { '' }) $planLeg $b
             $legStatus = [string]$leg.status
             $legOutcome = $(if ($fig.outcome) { $fig.outcome } else { [string]$leg.outcome })
             $failure = $null
             if (-not $chainComplete) { $failure = "the $b chain did not end on its own with a documented exit that agrees with its CHAIN_RESULT (exit=$($c.exit) timedOut=$($c.timedOut) resultExit=$resultExit)" }
+            elseif (-not $chainClean) { $failure = "the $b chain ended on its own with a documented non-zero exit ($($c.exit), stopReason=$($c.result.stopReason)), so none of its legs is a clean measurement and no figure is recorded" }
+            elseif ($fig.rejected) {
+                $failure = "$(if ($fig.rejected -ceq 'INVALID') { 'EVIDENCE_INVALID' } else { 'EVIDENCE_INCOMPLETE' }): the leg's receipt validated $($fig.rejected), so no figure is recorded"
+                if ($null -eq $typed) { $typed = @{ reason = 'LEG_FAILED'; detail = "a $b leg ($($planLeg.legId)) has a receipt the validator refused ($($fig.rejected)); no figure was recorded" } }
+            }
             elseif ($legStatus -ceq 'RAN' -and -not $fig.outcome) {
                 $failure = 'the leg is RAN but its receipt is missing or unreadable, so no figure can be recorded'
                 if ($null -eq $typed) { $typed = @{ reason = 'LEG_FAILED'; detail = "a $b leg ($($planLeg.legId)) is RAN but its receipt is missing or unreadable (EVIDENCE_INCOMPLETE)" } }
             }
             if ($failure -and $legStatus -ceq 'RAN') { $legStatus = 'EVIDENCE_INCOMPLETE'; $legOutcome = 'INVALID' }
+            if ($failure) { $fig.fps = $null; $fig.drops = $null; $fig.stall = $null }      # a typed failure never carries figures, whatever the receipt held
+            if ($fig.rejected -ceq 'INVALID' -and $legStatus -ceq 'EVIDENCE_INCOMPLETE') { $legStatus = 'EVIDENCE_INVALID' }
             $rows.Add([ordered]@{
                 schema = 'mlv-app/venue-baseline-trend/v1'; utc = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'); venue = $Venue; role = $planLeg.role
                 sourceCommit = $commit; leg = $planLeg.legId; card = $planLeg.card; backend = $b; status = $legStatus; failure = $failure

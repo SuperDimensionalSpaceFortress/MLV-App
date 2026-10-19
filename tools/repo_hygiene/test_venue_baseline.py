@@ -45,10 +45,11 @@ MANIFEST_BYTES = b'{"sourceCommit": "' + SHA.encode() + b'"}\n'
 MANIFEST_SHA = hashlib.sha256(MANIFEST_BYTES).hexdigest()
 LEG_IDS = ("m16-1243-look", "m16-1243-display-fullscreen-s1")
 EXIT = {"OK": 0, "USAGE": 2, "AGENT_BUSY": 20, "SHARE_UNREACHABLE": 21, "BUILD_NOT_STAGED": 22, "GATE_REFUSED": 23,
-        "BASELINE_CAP_EXCEEDED": 24, "LEG_FAILED": 25, "SOURCE_COMMIT_UNRESOLVED": 26, "CHAIN_FAILED": 27}
+        "BASELINE_CAP_EXCEEDED": 24, "LEG_FAILED": 25, "SOURCE_COMMIT_UNRESOLVED": 26, "CHAIN_FAILED": 27, "FETCH_TIMEOUT": 28}
 
-# Invoke-VenueChain.ps1 stand-in. FAKE_CHAIN_MODE: ok | legfail | deadline | gate | noresult | sleep. It logs each call to FAKE_CHAIN_LOG and, for ok, writes a
-# receipt per leg with the metrics the real receipt carries and prints CHAIN_RESULT= exactly as the real chain does.
+# Invoke-VenueChain.ps1 stand-in. FAKE_CHAIN_MODE: ok | legfail | deadline | gate | noresult | sleep | ranfail | randeadline. It logs each call to FAKE_CHAIN_LOG and, for ok,
+# writes a receipt per leg with the metrics the real receipt carries and prints CHAIN_RESULT= exactly as the real chain does. ranfail / randeadline: the FIRST leg RAN with a
+# readable receipt, then a later leg died (chain exit 7) / the deadline hit (chain exit 3): a documented exit that agrees with its CHAIN_RESULT.
 FAKE_CHAIN = r"""
 [CmdletBinding()]
 param([string]$Venue, [string]$LegSpec, [string]$Backend = '', [string]$RunDir, [string]$SourceCommit, [string]$BuildManifestSha256, [switch]$PreferQuietWindows,
@@ -69,7 +70,7 @@ $legs = foreach ($s in $specs) {
     $legId = [IO.Path]::GetFileNameWithoutExtension($s)
     $name = ('{0:00}-{1}-{2}' -f $n, $legId, $Backend)
     switch ($mode) {
-        { $_ -in 'ok', 'mismatch', 'undocumented', 'noreceipt' } {
+        { $_ -in 'ok', 'mismatch', 'undocumented', 'noreceipt' -or ($_ -in 'ranfail', 'randeadline' -and $n -eq 1) } {
             $rd = Join-Path $env:FAKE_ROOT "receipts\CARD-1\$legId\$Venue"
             New-Item -ItemType Directory -Force -Path $rd | Out-Null
             $rp = Join-Path $rd ("rcpt-$Backend-$n.json")
@@ -84,7 +85,7 @@ $legs = foreach ($s in $specs) {
             if ($mode -ceq 'noreceipt') { Remove-Item -LiteralPath $rp -Force }
             [pscustomobject]@{ name = $name; spec = $s; backend = $Backend; status = 'RAN'; verdict = 'QUIET'; outcome = 'PASS'; legExit = 0; receipt = $rp }
         }
-        'legfail' { [pscustomobject]@{ name = $name; spec = $s; backend = $Backend; status = 'LEG_FAILED'; verdict = 'QUIET'; outcome = 'INVALID'; printedOutcome = 'PASS'; legExit = 5; receipt = $null } }
+        { $_ -ceq 'legfail' -or ($_ -ceq 'ranfail' -and $n -gt 1) } { [pscustomobject]@{ name = $name; spec = $s; backend = $Backend; status = 'LEG_FAILED'; verdict = 'QUIET'; outcome = 'INVALID'; printedOutcome = 'PASS'; legExit = 5; receipt = $null } }
         default { [pscustomobject]@{ name = $name; spec = $s; backend = $Backend; status = 'NOT_RUN'; verdict = 'DEADLINE'; reason = 'deadline-before-leg' } }
     }
 }
@@ -94,10 +95,27 @@ switch ($mode) {
     'mismatch' { Emit $legs 0 $null 7 }
     'undocumented' { Emit $legs 9 $null }
     'legfail' { Emit $legs 7 $null }
+    'ranfail' { Emit $legs 7 $null }
+    'randeadline' { Emit $legs 3 'DEADLINE' }
     'deadline' { Emit $legs 3 'DEADLINE' }
     'gate' { Emit $legs 4 'GATE_UNREADABLE' }
     'noresult' { 'the chain died'; exit 0 }
     'sleep' { Start-Sleep -Seconds 300; exit 0 }
+}
+"""
+
+# Test-DvReceiptValid stand-in (-ValidatorScript): logs the receipt it was asked about and prints the verdict FAKE_VALIDATOR_MODE names. advisory is what a production
+# receipt gets at best (valid=false by design, DualVenueRunner.psm1 Test-DvReceiptValid); error exits non-zero with no output.
+FAKE_VALIDATOR = r"""
+[CmdletBinding()]
+param([string]$ReceiptPath)
+Add-Content -LiteralPath $env:FAKE_VALIDATOR_LOG -Value $ReceiptPath
+switch ($env:FAKE_VALIDATOR_MODE) {
+    'invalid' { '{"status":"INVALID","valid":false,"reasons":["PLAYBACK_NOT_FROM_EVIDENCE: playback.sourceAdvanced is not what the hashed run log and result re-derive"]}' }
+    'incomplete' { '{"status":"INCOMPLETE","valid":false,"reasons":["EVIDENCE_ABSENT: summary.json is not in the evidence"]}' }
+    'unknown' { '{"status":"SOMETHING_NEW","valid":true,"reasons":[]}' }
+    'error' { exit 3 }
+    default { '{"status":"ADVISORY","valid":false,"reasons":["VENUE_ANCHOR_ABSENT"]}' }
 }
 """
 
@@ -142,30 +160,40 @@ class VenueBaselineTests(unittest.TestCase):
         self.chain.write_text(FAKE_CHAIN, encoding="utf-8")
         self.hub = self.case / "fake-hub-load.ps1"
         self.hub.write_text(FAKE_HUB_LOAD, encoding="utf-8")
+        self.validator = self.case / "fake-validator.ps1"
+        self.validator.write_text(FAKE_VALIDATOR, encoding="utf-8")
+        self.validator_log = self.case / "validator-calls.log"
         self.chain_log = self.case / "chain-calls.log"
         self.fake_root = self.case / "fake-root"
         self.fake_root.mkdir()
 
     def env(self, **extra: str) -> dict[str, str]:
         e = dict(os.environ)
-        e.update({"FAKE_CHAIN_LOG": str(self.chain_log), "FAKE_ROOT": str(self.fake_root), "FAKE_HUB_COUNT": str(self.case / "hub-count.txt")})
+        e.update({"FAKE_CHAIN_LOG": str(self.chain_log), "FAKE_ROOT": str(self.fake_root), "FAKE_HUB_COUNT": str(self.case / "hub-count.txt"),
+                  "FAKE_VALIDATOR_LOG": str(self.validator_log)})
         e.update(extra)
         return e
 
-    def args(self, *extra: str, share: Path | None = None, commit: str | None = SHA, stub_chain: bool = True) -> list[str]:
+    def args(self, *extra: str, share: Path | None = None, commit: str | None = SHA, stub_chain: bool = True, stub_validator: bool = True) -> list[str]:
         a = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(BASELINE), "-TrendFile", str(self.trend), "-RunDir", str(self.run_dir),
              "-AgentShare", str(share or self.share), "-ClaimDir", str(self.claims), "-HubLoadScript", str(self.hub)]
         if stub_chain:       # the plan test leaves the real chain script in place: that is the path the plan must print
             a += ["-ChainScript", str(self.chain)]
+        if stub_validator:   # the stub receipts have no admission or hashed evidence, so the REAL validator can only call them INVALID; a test of the real one passes stub_validator=False
+            a += ["-ValidatorScript", str(self.validator)]
         if commit:
             a += ["-SourceCommit", commit]
         return a + list(extra)
 
-    def run_baseline(self, *extra: str, mode: str = "ok", timeout: int = 240, **kw) -> subprocess.CompletedProcess:
-        return subprocess.run(self.args(*extra, **kw), capture_output=True, text=True, timeout=timeout, env=self.env(FAKE_CHAIN_MODE=mode), stdin=subprocess.DEVNULL)
+    def run_baseline(self, *extra: str, mode: str = "ok", validator: str = "advisory", timeout: int = 240, **kw) -> subprocess.CompletedProcess:
+        return subprocess.run(self.args(*extra, **kw), capture_output=True, text=True, timeout=timeout,
+                              env=self.env(FAKE_CHAIN_MODE=mode, FAKE_VALIDATOR_MODE=validator), stdin=subprocess.DEVNULL)
 
     def chain_calls(self) -> list[str]:
         return self.chain_log.read_text(encoding="utf-8").splitlines() if self.chain_log.exists() else []
+
+    def validator_calls(self) -> list[str]:
+        return self.validator_log.read_text(encoding="utf-8").splitlines() if self.validator_log.exists() else []
 
     def trend_rows(self) -> list[dict]:
         return [json.loads(line) for line in self.trend.read_text(encoding="utf-8").splitlines() if line.strip()] if self.trend.exists() else []
@@ -271,8 +299,9 @@ class VenueBaselineTests(unittest.TestCase):
             self.assertEqual(r["status"], "RAN")
             self.assertEqual(r["outcome"], "PASS")
             self.assertTrue(Path(r["receiptPath"]).is_file(), r["receiptPath"])
-            # the receipt went through the evidence-bearing validator and the row carries its verdict: the stub's receipt has no admission or evidence, so it re-derives to nothing
-            self.assertIn(r["receiptVerification"]["status"], ("INVALID", "INCOMPLETE"), r["receiptVerification"])
+            # the receipt went through the validator and the row carries its verdict: ADVISORY is the best a production receipt can be (valid=false by design), and the only
+            # kind whose figures are copied (INVALID / INCOMPLETE / a validator error are refused: test_a_receipt_the_validator_refuses_...)
+            self.assertEqual(r["receiptVerification"]["status"], "ADVISORY", r["receiptVerification"])
             self.assertIs(r["receiptVerification"]["valid"], False)
             # the hub-VM load, sampled at the start AND the end of the run (the stub reads 10.5/12.5 first, 11.5/40.0 after)
             hl = r["hubLoad"]
@@ -344,6 +373,123 @@ class VenueBaselineTests(unittest.TestCase):
     def test_a_clean_chain_rows_carry_no_failure_text(self) -> None:
         self.assertEqual(self.run_baseline().returncode, 0)
         self.assertTrue(all(r["failure"] is None and r["status"] == "RAN" for r in self.trend_rows()))
+
+    # ---------------------------------------------------------------- r5 B1: a receipt the validator refuses yields no figures
+    def test_a_receipt_the_validator_refuses_yields_no_figures_and_a_typed_failure(self) -> None:
+        # exit-0 chain, readable receipt with figures, the validator says INVALID / INCOMPLETE / (errors) / (a status nobody documented): every one fails closed
+        for verdict, status, token in (("invalid", "EVIDENCE_INVALID", "EVIDENCE_INVALID"), ("incomplete", "EVIDENCE_INCOMPLETE", "EVIDENCE_INCOMPLETE"),
+                                       ("error", "EVIDENCE_INCOMPLETE", "EVIDENCE_INCOMPLETE"), ("unknown", "EVIDENCE_INCOMPLETE", "EVIDENCE_INCOMPLETE")):
+            with self.subTest(verdict=verdict):
+                self.trend.unlink(missing_ok=True)
+                p = self.run_baseline(validator=verdict)
+                self.assertEqual(p.returncode, EXIT["LEG_FAILED"], p.stdout + p.stderr)
+                rows = self.trend_rows()
+                self.assertEqual(len(rows), 4, rows)
+                for r in rows:
+                    self.assertEqual((r["status"], r["outcome"]), (status, "INVALID"), r)
+                    self.assertTrue(str(r["failure"]).startswith(token), r)
+                    self.assertTrue(r["fps"] is None and r["drops"] is None and r["stall"] is None, r)
+                self.assertTrue(len(self.validator_calls()) >= 4, self.validator_calls())
+
+    def test_the_real_validator_refuses_the_stub_receipts_so_no_figures_reach_the_trend(self) -> None:
+        # no -ValidatorScript: the evidence-bearing validator itself runs (with the repo root), and a stub receipt has no admission or hashed evidence
+        p = self.run_baseline(stub_validator=False)
+        self.assertEqual(p.returncode, EXIT["LEG_FAILED"], p.stdout + p.stderr)
+        rows = self.trend_rows()
+        self.assertEqual(len(rows), 4, rows)
+        for r in rows:
+            self.assertIn(r["status"], ("EVIDENCE_INVALID", "EVIDENCE_INCOMPLETE"), r)
+            self.assertNotEqual(r["status"], "RAN", r)
+            self.assertTrue(r["fps"] is None and r["drops"] is None and r["stall"] is None, r)
+            self.assertIn(r["receiptVerification"]["status"], ("INVALID", "INCOMPLETE"), r)
+
+    # ---------------------------------------------------------------- r5 B2: a non-zero chain exit yields no figures, documented and agreeing or not
+    def test_a_documented_nonzero_chain_exit_after_a_ran_leg_yields_no_figures(self) -> None:
+        p = self.run_baseline(mode="ranfail")      # leg 1 RAN with a readable receipt, leg 2 died: CHAIN_RESULT exitCode 7 and the process exits 7
+        self.assertEqual(p.returncode, EXIT["LEG_FAILED"], p.stdout + p.stderr)
+        rows = self.trend_rows()
+        self.assertEqual(len(rows), 4, rows)      # both chains ran: a dead leg does not stop the other backend
+        ran_legs = [r for r in rows if r["leg"] == LEG_IDS[0]]
+        self.assertEqual(len(ran_legs), 2, rows)
+        for r in ran_legs:
+            self.assertEqual((r["status"], r["outcome"]), ("EVIDENCE_INCOMPLETE", "INVALID"), r)
+            self.assertIn("non-zero exit", r["failure"], r)
+            self.assertTrue(r["fps"] is None and r["drops"] is None and r["stall"] is None, r)
+        for r in rows:
+            self.assertNotEqual(r["status"], "RAN", r)
+            self.assertTrue(r["fps"] is None and r["drops"] is None and r["stall"] is None, r)
+        self.assertEqual(self.validator_calls(), [], "a nonzero chain's receipts are never read")
+
+    def test_a_documented_deadline_exit_after_a_ran_leg_yields_no_figures(self) -> None:
+        p = self.run_baseline(mode="randeadline")      # leg 1 RAN with a readable receipt, then the chain hit its deadline: exit 3 on both sides
+        self.assertEqual(p.returncode, EXIT["BASELINE_CAP_EXCEEDED"], p.stdout + p.stderr)
+        rows = self.trend_rows()
+        self.assertEqual(len(rows), 1, rows)
+        self.assertEqual((rows[0]["status"], rows[0]["outcome"]), ("EVIDENCE_INCOMPLETE", "INVALID"), rows[0])
+        self.assertIn("non-zero exit", rows[0]["failure"], rows[0])
+        self.assertTrue(rows[0]["fps"] is None and rows[0]["drops"] is None and rows[0]["stall"] is None, rows[0])
+        self.assertEqual(self.validator_calls(), [])
+
+    # ---------------------------------------------------------------- r5 B3: -WhatIf never fetches, and a fetch is bounded by the cap
+    def make_fetch_fixture(self, sleep_sec: int) -> dict[str, str]:
+        repo = self.case / "repo"
+        repo.mkdir()
+        git = lambda *a: subprocess.run(["git", "-C", str(repo), *a], capture_output=True, text=True, check=True, stdin=subprocess.DEVNULL).stdout.strip()
+        git("init", "-q")
+        git("config", "user.email", "unit@example.invalid")
+        git("config", "user.name", "unit")
+        (repo / "f.txt").write_text("x", encoding="utf-8")
+        git("add", "f.txt")
+        git("commit", "-q", "-m", "one")
+        git("update-ref", "refs/remotes/fork/master", git("rev-parse", "HEAD"))
+        stub_ps1 = self.case / "git-stub.ps1"
+        stub_ps1.write_text('Add-Content -LiteralPath $env:GIT_STUB_LOG -Value ("FETCH pid=$PID args=" + ($args -join " "))\n'
+                            'Start-Sleep -Seconds ([int]$env:GIT_STUB_SLEEP)\n', encoding="utf-8")
+        stub_cmd = self.case / "git-stub.cmd"
+        stub_cmd.write_text(f'@echo off\r\n"{PWSH}" -NoProfile -NonInteractive -File "{stub_ps1}" %*\r\n', encoding="ascii")
+        return {"repo": str(repo), "cmd": str(stub_cmd), "log": str(self.case / "git-stub.log"), "sleep": str(sleep_sec)}
+
+    def fetch_args(self, fx: dict[str, str], *extra: str) -> list[str]:
+        return self.args("-RepoRoot", fx["repo"], "-GitExe", fx["cmd"], "-Fetch", *extra, commit=None)
+
+    def fetch_env(self, fx: dict[str, str]) -> dict[str, str]:
+        return self.env(FAKE_CHAIN_MODE="ok", FAKE_VALIDATOR_MODE="advisory", GIT_STUB_LOG=fx["log"], GIT_STUB_SLEEP=fx["sleep"])
+
+    def test_whatif_with_fetch_never_invokes_git_fetch(self) -> None:
+        fx = self.make_fetch_fixture(sleep_sec=120)
+        t0 = time.monotonic()
+        p = subprocess.run(self.fetch_args(fx, "-WhatIf"), capture_output=True, text=True, timeout=120, env=self.fetch_env(fx), stdin=subprocess.DEVNULL)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("BASELINE_PLAN", p.stdout)
+        self.assertFalse(Path(fx["log"]).exists(), "-WhatIf ran git fetch")
+        self.assertLess(time.monotonic() - t0, 30)
+
+    def test_a_fetch_that_outlives_the_cap_is_killed_and_typed(self) -> None:
+        fx = self.make_fetch_fixture(sleep_sec=120)
+        t0 = time.monotonic()
+        p = subprocess.run(self.fetch_args(fx, "-MaxTotalSec", "10", "-KillGraceSec", "0"), capture_output=True, text=True, timeout=120, env=self.fetch_env(fx),
+                           stdin=subprocess.DEVNULL)
+        elapsed = time.monotonic() - t0
+        self.assertEqual(p.returncode, EXIT["FETCH_TIMEOUT"], p.stdout + p.stderr)
+        self.assertIn("reason=FETCH_TIMEOUT", p.stdout)
+        self.assertLess(elapsed, 30, "the runner waited past its cap for a stalled git fetch (the stub sleeps 120 s)")
+        calls = Path(fx["log"]).read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(calls), 1, calls)
+        pid = int(re.search(r"pid=(\d+)", calls[0]).group(1))
+        deadline = time.monotonic() + 15
+        while pid_alive(pid) and time.monotonic() < deadline:
+            time.sleep(0.5)
+        self.assertFalse(pid_alive(pid), "the fetch process outlived the cap")
+        self.assertEqual(self.chain_calls(), [])
+        self.assertFalse(self.trend.exists())
+
+    def test_a_fetch_that_returns_in_time_is_run_once_and_the_baseline_proceeds(self) -> None:
+        fx = self.make_fetch_fixture(sleep_sec=0)
+        p = subprocess.run(self.fetch_args(fx, "-BuildManifestSha256", "c" * 64), capture_output=True, text=True, timeout=240, env=self.fetch_env(fx), stdin=subprocess.DEVNULL)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(len(Path(fx["log"]).read_text(encoding="utf-8").splitlines()), 1)
+        self.assertIn("fetch --quiet fork master", Path(fx["log"]).read_text(encoding="utf-8"))
+        self.assertEqual(len(self.chain_calls()), 2)
 
     # ---------------------------------------------------------------- typed refusals
     def test_busy_agent_exits_typed_and_never_calls_the_chain(self) -> None:
