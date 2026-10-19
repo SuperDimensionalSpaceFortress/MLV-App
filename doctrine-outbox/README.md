@@ -141,34 +141,54 @@ process launch and asserts it is not called:
 A second row set forces the static check to pass everything and shows each repro is still `ROUTE_NOT_EXECUTED` and still not
 launched.
 
+**A `git` route runs only read-only verbs, each with its own option allowlist (r5, the final round).** Four rounds of
+refusing named git options each leaked one more option class, and the real card routes on the bus run no git at all, so the
+screen is now positive (`ROUTE_GIT_VERBS` in the tool is the whole grammar; anything it does not name is `ROUTE_UNSAFE`
+before launch):
+- Before the verb only `-C <dir>` is accepted, and only into a directory inside the scratch clone that is not, and does not sit
+  under, a bare repository layout (`HEAD`, `objects/` and `refs/`). `-c`, `--config-env`, `-p`/`--paginate`, `--exec-path`
+  and every other global option are refused, and so is an alternate git directory (`--git-dir`, `--work-tree`, `--namespace`,
+  `--super-prefix`, `--bare`) in any form or abbreviation, whether its target is outside the clone (the diagnostic says so)
+  or inside it.
+- The verb is one of the read-only verbs `log`, `show`, `diff`, `grep`, `rev-parse`, `rev-list`, `status`, `ls-files`,
+  `ls-tree`, `cat-file`, `describe`, `blame`, `shortlog`, `merge-base`, `for-each-ref`, `show-ref`, `name-rev`,
+  `count-objects`, `version`, `branch` and `tag` in list form only (no name unless `--list`/`-l` is given, and no
+  `-d`/`-D`/`-m`/`-c`/`-f`/`-a`/`-s`/`-u`), and `config` in a read mode only (its first word `--get`, `--get-all`,
+  `--get-regexp`, `--list` or `-l`). No verb that can write is run: `commit`, `checkout`, `switch`, `restore`, `reset`,
+  `merge`, `cherry-pick`, `revert`, `stash`, `apply`, `am`, `mv`, `rm`, `rebase`, `add`, `notes`, `worktree`, `gc`, `fetch`,
+  `pull`, `push`, `clone`, `submodule`, ... are all `ROUTE_UNSAFE`, as is an alias (`git ship`, or a `!` alias such as
+  `git !echo hi`). (`status` and `diff` may refresh the scratch clone's own index, as git always does.)
+- Each option must be on that verb's list, matched as an exact token. Git reads any unambiguous prefix of a long option; the
+  screen reads none, so an abbreviation (`--onel`, `--unsafe-p`, `--build-f`, `--strat=`) is refused. A long option takes a
+  value only as `--name=value` (`--format=%h`), never as the next token. A short-option cluster is read letter by letter
+  against the verb's letters, and a value-taking letter takes the rest of the cluster or the next token (`-n3`, `-n 3`,
+  `grep -e TODO`), so `merge -qsoctopus`, `grep -nO` and `log -sp` are refused. `--` ends the options; what follows is
+  pathspecs. None of these is on any list: `--output`, `--no-index`, `--pathspec-from-file`, `--contents`, `--file`,
+  `--textconv`, `--ext-diff`, `-O`/`--open-files-in-pager`, `--exec`, `--upload-pack`, `--unsafe-paths`,
+  `--build-fake-ancestor`, `--strategy`/`merge -s` and `--gpg-sign`.
+- Every option value and every positional (a revision, a path or a pathspec) must resolve inside the scratch clone, read
+  relative to the `-C` directory: `..` collapsed, symlinks, junctions and 8.3 names followed, case folded on Windows. An
+  absolute path outside the clone, a `..` that leaves it and an outward link are refused, and so is a positional that starts
+  with `:` (pathspec magic such as `:(top)`, `:/` or `:!`, or an index path).
+
 A `git` route that is run gets the interpreter-injection environment stripped: `PYTHONPATH`, `PYTHONSTARTUP`, `PYTHONHOME`,
-`NODE_OPTIONS`, `NODE_PATH`, `PERL5OPT`, `PERL5LIB`, `RUBYOPT`, `BASH_ENV` and `ENV`, plus credential-shaped variables, user
-and system git config, every `GIT_*` variable (`GIT_EDITOR`, `GIT_SEQUENCE_EDITOR`, `GIT_PAGER`, `GIT_ASKPASS`, `GIT_SSH`,
-`GIT_SSH_COMMAND`, `GIT_EXTERNAL_DIFF`, `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`, ...) and the generic
-helpers `EDITOR`, `VISUAL`, `PAGER` and `SSH_ASKPASS`. Its `PATH` keeps only the absolute entries whose real path is outside
-the clone (a `.`, empty, relative or quoted entry, and a junction or link into the clone, are dropped), so a `false.exe` or
-`gpg` planted in the clone is never found. Git is started as `git -c core.pager=cat -c core.editor=false
--c diff.external= -c core.fsmonitor=false -c commit.gpgsign=false -c tag.gpgsign=false -c safe.bareRepository=explicit
--c gpg.program=false -c gpg.ssh.program=false -c gpg.x509.program=false -c core.hooksPath=<an empty directory
-beside the clone in the scratch> ...`, so no pager, editor, external diff, hook or signing program is reachable even through
-a verb that wants one, and a bare repository committed in the clone is never opened as the repository. A route may not pass
-`-c` itself. It must be exercisable offline and only in the scratch clone, so
-these are `ROUTE_UNSAFE`, whether or not the program would be run:
+`NODE_OPTIONS`, `NODE_PATH`, `PERL5OPT`, `PERL5LIB`, `RUBYOPT`, `BASH_ENV` and `ENV`, plus credential-shaped variables, every
+`GIT_*` variable (`GIT_EDITOR`, `GIT_SEQUENCE_EDITOR`, `GIT_PAGER`, `GIT_ASKPASS`, `GIT_SSH`, `GIT_SSH_COMMAND`,
+`GIT_EXTERNAL_DIFF`, `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT`, `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`, ...) and the
+generic helpers `EDITOR`, `VISUAL`, `PAGER` and `SSH_ASKPASS`. Its git config is isolated: `GIT_CONFIG_NOSYSTEM=1`, and
+`GIT_CONFIG_GLOBAL` names an empty file the tool writes beside the clone in its scratch directory (emptied before every run),
+so a driver, alias or helper defined in the system config, `~/.gitconfig` or the XDG config never applies; a test defines a
+textconv driver through `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`, `~/.gitconfig`, the XDG config (with an XDG attributes file
+selecting it) and `GIT_CONFIG_COUNT`, shows a plain `git show HEAD` runs it each time, and shows the route never does. Its `PATH`
+keeps only the absolute entries whose real path is outside the clone (a `.`, empty, relative or quoted entry, and a junction
+or link into the clone, are dropped), so a `false.exe` or `gpg` planted in the clone is never found. Git is started as
+`git -c core.pager=cat -c core.editor=false -c diff.external= -c core.fsmonitor=false -c commit.gpgsign=false
+-c tag.gpgsign=false -c safe.bareRepository=explicit -c gpg.program=false -c gpg.ssh.program=false
+-c gpg.x509.program=false -c core.hooksPath=<an empty directory beside the clone in the scratch> ...`, so no pager, editor,
+external diff, hook or signing program is reachable even through a verb that wants one (`log --show-signature` reaches
+`false`), and a bare repository committed in the clone is never opened as the repository. A route must be exercisable
+offline and only in the scratch clone, so these are `ROUTE_UNSAFE` too, whether or not the program would be run:
 - a shell operator (pipe, redirect, `&&`, `;`) or an environment-assignment prefix;
-- git other than an allowlisted read-only or scratch-local verb (`log`, `status`, `show`, `diff`, `rev-parse`,
-  `commit`, `checkout`, ... but never `push`, `pull`, `fetch`, `ls-remote`, `clone`, `remote`, `submodule` or an
-  alias), `git -c`, `--config-env`, a `git config` write, and `-C` outside the scratch clone or into a directory that is, or
-  sits under, a bare repository layout (`HEAD`, `objects/` and `refs/`) inside it;
-- an alternate git directory: `--git-dir`, `--work-tree`, `--namespace`, `--super-prefix` and `--bare` in every form (`=` or
-  the next token, any abbreviation; after the verb too, except that `rev-parse --git-dir` only prints), whether the target is
-  outside the clone (the diagnostic says so) or inside it;
-- a git option that starts a helper or writes outside the clone: `--exec`, `--upload-pack`, `--receive-pack` (before or after
-  the verb), `--ext-diff`, `-O`/`--open-files-in-pager`, `--output`, `--config-env`, `--exec-path` and every abbreviation of
-  one (git reads any unambiguous prefix, so `--open-files`, `--out`, `--ext` and `--exec-p` count: any `--name` that is a
-  prefix of a refused option is refused, fail-closed), a short-option cluster that carries `-O` on `git grep` (`-nOpython`,
-  `-Ofoo`, `-nO`), `apply --unsafe-paths`, `-S`/`--gpg-sign` on `commit`,
-  `tag`, `merge`, `cherry-pick` or `revert`, `tag -s`/`-u`/`--local-user`, `merge -s` and `--strategy` (git looks the strategy
-  up on `PATH` as `git-merge-<name>`), and a `!` alias (`git !echo hi`);
 - any `gh`, `claude`/`codex` `auth|login|logout`, a network client (`curl`, `ssh`, `npx`, ...), `find -exec`, a URL or
   `user@host:` argument, and a credential assignment (`GH_TOKEN=`, `ANTHROPIC_*=`, `*_TOKEN=`, `*_KEY=`, `*PASSWORD*=`)
   or `--token`.

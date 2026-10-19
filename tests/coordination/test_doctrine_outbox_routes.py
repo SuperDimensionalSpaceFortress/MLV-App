@@ -12,7 +12,9 @@ was inside the clone, and every review round found a spelling where they disagre
       program it did not list, pytest for one, was executed; r2 inverts it);
   (c) refuses every known PR 479 bypass repro before launch: one row each, the process launch mocked and asserted NOT called;
   (d) strips the interpreter-injection and git editor/pager/helper environment from a route that is run, and refuses the git
-      forms that start a helper (`-c`, signing, `merge -s`, `--exec`, `--upload-pack`, `!` aliases, ...) as ROUTE_UNSAFE.
+      forms that start a helper (`-c`, signing, `merge -s`, `--exec`, `--upload-pack`, `!` aliases, ...) as ROUTE_UNSAFE;
+  (r5) runs read-only git verbs only, each with a positive option list, every value and positional inside the scratch clone,
+      and global/system git config isolated (hub ruling #514 r5: the denylist leaked one option class per round).
 
 Seed RED rows come from the failures the CoS found by hand:
   #468 r3/r4  an adoption step `python factory-pins/pin-runner.py pin ...` against a bus without that file
@@ -679,7 +681,11 @@ def test_a_filled_windows_path_is_not_reparsed(tmp_path, launches):
     clone = make_clone(tmp_path)
     value = "C:\\some dir\\back\\slash"
     status, _detail = ob.exercise_route("git log <where>", clone, 30, {"where": value})
-    assert status == "ROUTE_OK" and launches[0]["argv"][-1] == value and launches[0]["argv"][-2] == "log"
+    if os.name == "nt":                                                           # r5: an absolute path outside the clone is refused
+        assert status == "ROUTE_UNSAFE" and launches == []
+    value = "some dir\\back\\slash"                                                # the same backslashes, inside the clone
+    status, _detail = ob.exercise_route("git log <where>", clone, 30, {"where": value})
+    assert status == "ROUTE_OK" and launches[-1]["argv"][-1] == value and launches[-1]["argv"][-2] == "log"
 
 
 def test_b_an_unfilled_placeholder_on_a_route_that_is_not_run_is_noted_and_not_a_failure(tmp_path, launchers, launches):
@@ -806,8 +812,12 @@ def test_an_unsafe_route_never_runs_and_its_safe_twin_does(tmp_path, capsys):
     assert exercise(tmp_path, item, bus) == 1
     assert statuses(capsys.readouterr().out) == ["ROUTE_UNSAFE"]
     twin = item_file(tmp_path, adopt("git branch exercised-here"), name="20261017-safe-twin.md")
-    assert exercise(tmp_path, twin, bus) == 0
-    assert git(bus, "branch", "--list", "exercised-here") == ""         # the branch was made in the scratch clone only
+    assert exercise(tmp_path, twin, bus) == 1                            # r5 NA-6: a branch name creates a branch, a write
+    assert statuses(capsys.readouterr().out) == ["ROUTE_UNSAFE"]
+    assert git(bus, "branch", "--list", "exercised-here") == ""         # nothing was made anywhere
+    listing = item_file(tmp_path, adopt("git branch --list exercised-here"), name="20261017-safe-twin-2.md")
+    assert exercise(tmp_path, listing, bus) == 0                         # the read-only twin runs
+    assert statuses(capsys.readouterr().out) == ["ROUTE_OK"]
 
 
 # ---------- (d) git forms that start a helper are refused before launch: one row each ----------
@@ -854,14 +864,24 @@ def test_d_a_git_form_that_starts_a_helper_is_unsafe_before_launch(tmp_path, lau
 
 
 @pytest.mark.parametrize("command", [
-    "git commit --allow-empty -m x", "git commit -s -m x", "git commit -am x", "git tag v1", "git tag -l v*", "git tag -d v1",
-    "git merge other", "git merge --squash other", "git merge --no-edit other", "git log -S needle", "git log -s", "git diff -s",
-    "git apply x.patch", "git apply --check x.patch", "git cherry-pick abc", "git grep needle", "git config --get alias.x",
+    "git tag -l v*", "git log -S needle", "git log -s", "git diff -s", "git grep needle", "git config --get alias.x",
 ])
 def test_d_the_safe_twin_of_a_refused_git_form_is_launched(tmp_path, launches, command):
     clone = make_clone(tmp_path)
     status, detail = ob.exercise_route(command, clone, 30, {})
     assert status == "ROUTE_OK" and len(launches) == 1, (command, status, detail)
+
+
+@pytest.mark.parametrize("command", [                                   # r5 NA-6: these twins were run before; each one writes
+    "git commit --allow-empty -m x", "git commit -s -m x", "git commit -am x", "git tag v1", "git tag -d v1",
+    "git merge other", "git merge --squash other", "git merge --no-edit other", "git apply x.patch", "git apply --check x.patch",
+    "git cherry-pick abc",
+])
+def test_d_r5_a_former_write_verb_twin_is_now_unsafe_before_launch(tmp_path, launches, command):
+    clone = make_clone(tmp_path)
+    status, detail = ob.exercise_route(command, clone, 30, {})
+    assert status == "ROUTE_UNSAFE", (command, status, detail)
+    assert launches == [], f"{command} reached the process launch"
 
 
 GIT_HELPER_ENV = ["GIT_EDITOR", "GIT_SEQUENCE_EDITOR", "EDITOR", "VISUAL", "GIT_PAGER", "PAGER", "GIT_ASKPASS", "SSH_ASKPASS", "GIT_SSH",
@@ -882,7 +902,8 @@ def test_d_the_editor_variables_of_the_hub_do_not_reach_a_git_commit(tmp_path, l
                         ("PAGER", "python"), ("SSH_ASKPASS", "python")):
         monkeypatch.setenv(name, value)
     clone = make_clone(tmp_path)
-    assert ob.exercise_route("git commit --allow-empty", clone, 30, {})[0] == "ROUTE_OK"
+    assert ob.exercise_route("git commit --allow-empty", clone, 30, {})[0] == "ROUTE_UNSAFE" and launches == []   # r5 NA-6
+    assert ob.exercise_route("git log", clone, 30, {})[0] == "ROUTE_OK"
     env, argv = launches[0]["env"], launches[0]["argv"]
     assert not {"EDITOR", "VISUAL", "GIT_EDITOR", "PAGER", "SSH_ASKPASS"} & {k.upper() for k in env}
     assert "core.editor=false" in argv and "core.pager=cat" in argv
@@ -1053,11 +1074,11 @@ def test_d_the_environment_a_run_route_receives_has_none_of_them(tmp_path, launc
 def test_routes_never_run_in_the_bus_and_the_scratch_is_removed(tmp_path, capsys):
     bus = make_bus(tmp_path)
     scratch = tmp_path / "scratch"
-    item = item_file(tmp_path, adopt("git branch exercised-here", "git checkout -q exercised-here"))
+    item = item_file(tmp_path, adopt("git branch exercised-here", "git checkout -q exercised-here", "git log --oneline"))
     head = git(bus, "rev-parse", "HEAD")
-    assert exercise(tmp_path, item, bus, scratch=scratch) == 0
+    assert exercise(tmp_path, item, bus, scratch=scratch) == 1                  # r5 NA-6: the two write routes are refused
     out = capsys.readouterr().out
-    assert statuses(out) == ["ROUTE_OK", "ROUTE_OK"] and f"ROUTE_BUS {head[:12]}" in out
+    assert statuses(out) == ["ROUTE_UNSAFE", "ROUTE_UNSAFE", "ROUTE_OK"] and f"ROUTE_BUS {head[:12]}" in out
     assert git(bus, "branch", "--list", "exercised-here") == ""
     assert git(bus, "status", "--porcelain") == "" and git(bus, "rev-parse", "HEAD") == head
     assert list(scratch.iterdir()) == []
@@ -1765,6 +1786,8 @@ def test_r4_the_git_child_gets_that_path_and_a_planted_helper_is_never_started(t
     monkeypatch.chdir(clone)
     monkeypatch.setenv("PATH", os.pathsep.join([".", "", str(inside), os.environ["PATH"]]))
     status, detail = ob.exercise_route("git commit --allow-empty", clone, 30, {})
+    assert status == "ROUTE_UNSAFE" and launches == [], (status, detail)          # r5 NA-6: commit writes; a read route is run
+    status, detail = ob.exercise_route("git log --oneline", clone, 30, {})
     assert status == "ROUTE_OK" and len(launches) == 1, (status, detail)
     entries = launches[0]["env"]["PATH"].split(os.pathsep)
     assert entries and all(os.path.isabs(e) for e in entries), entries
@@ -1909,3 +1932,296 @@ def test_the_readme_claims_nothing_the_code_does_not_enforce():
                  "git log --exec=evil", "git !echo hi"):
         status, _detail = ob.exercise_route(form, REPO_ROOT, 30, {})
         assert status == "ROUTE_UNSAFE", form
+
+
+# ---------- r5 (final round): read-only verbs, a per-verb option allowlist, path confinement, config isolation ----------
+# Hub ruling #514 r5: four rounds of denylist patching each leaked one more option class (sol r4: `apply --unsafe-p`,
+# `apply --build-fake-ancestor=../x`, `merge -qsoctopus`). Real card routes on the bus run no git at all, so a route keeps the
+# read-only verbs only, and each verb accepts only the options on its own list: exact tokens (an abbreviation is refused), short
+# clusters letter by letter (a value-taking letter takes the rest of the cluster or the next token), `--` ends the options.
+# Every option value and every positional must resolve inside the scratch clone. Red rows: the real exercise_route with the
+# launch mocked, ROUTE_UNSAFE and no launch.
+
+R5_RED = {
+    "sol r4: apply --unsafe-p": "git apply --unsafe-p evil.patch",
+    "sol r4: apply --build-fake-ancestor= outside": "git apply --build-fake-ancestor=../outside.idx safe.patch",
+    "sol r4: merge -qsoctopus": "git merge -qsoctopus abc def",
+    "merge --strat=foo": "git merge --strat=foo other",
+    "merge -nsfoo": "git merge -nsfoo other",
+    "apply --build-f next token": "git apply --build-f ../x safe.patch",
+    "diff --no-index outside": "git diff --no-index a ../outside",
+    "grep --no-index outside": "git grep --no-index x ../outside",
+    "log -O outside": "git log -O ../outside",
+    "blame --contents outside": "git blame --contents ../outside f",
+    "log --pathspec-from-file=": "git log --pathspec-from-file=../x",
+    "ls-files --pathspec-from-file=": "git ls-files --pathspec-from-file=../x",
+    "diff --pathspec-from-file=": "git diff --pathspec-from-file=../x",
+    "grep --pathspec-from-file=": "git grep --pathspec-from-file=../x needle",
+    "status --pathspec-from-file=": "git status --pathspec-from-file=../x",
+    "status --pathspec-from-file next token": "git status --pathspec-from-file ../x",
+    "checkout a branch": "git checkout other",
+    "checkout -q": "git checkout -q other",
+    "checkout -- a path": "git checkout -- f",
+    "checkout -b": "git checkout -b fresh",
+    "commit --allow-empty": "git commit --allow-empty -m x",
+    "commit -am": "git commit -am x",
+    "commit": "git commit",
+    "stash": "git stash",
+    "stash push -u": "git stash push -u -m x",
+    "stash list": "git stash list",
+    "stash pop": "git stash pop",
+    "an abbreviation of an allowed option": "git log --onel",
+    "an abbreviation of an allowed valued option": "git log --form=%H",
+    "log --output": "git log --output=x",
+    "log --ext-diff": "git log --ext-diff",
+    "show --textconv": "git show --textconv HEAD",
+    "a flag given a value": "git log --oneline=x",
+    "a valued option in next-token form": "git log --format %H",
+    "a cluster with a letter off the list": "git log -sp",
+    "a cluster hiding -O after an allowed letter": "git grep -nO needle",
+    "a lone dash": "git diff -",
+    "a value letter with nothing after it": "git grep -e",
+    "-<N> on a verb without it": "git diff -3",
+    "positional outside by ..": "git log ../outside",
+    "pathspec outside after --": "git log -- ../outside",
+    "grep pathspec outside": "git grep needle -- ../outside",
+    "ls-files outside": "git ls-files ../outside",
+    "-C into a subdirectory, then .. twice": "git -C sub log -- ../../outside",
+    "top magic, long form": "git log -- :(top)x",
+    "top magic, short form": "git log -- :/x",
+    "exclude magic": "git ls-files :!x",
+    "icase magic": "git ls-files :(icase)X",
+    "an option value outside by ..": "git log --grep=../../x",
+    "a branch name creates a branch": "git branch fresh",
+    "branch -v plus a name creates a branch": "git branch -v fresh",
+    "branch -d": "git branch -d other",
+    "branch -D": "git branch -D other",
+    "branch -m": "git branch -m a b",
+    "branch -c": "git branch -c a b",
+    "branch -f": "git branch -f other HEAD",
+    "branch -a": "git branch -a",
+    "branch -u": "git branch -u other",
+    "branch --set-upstream-to": "git branch --set-upstream-to=other",
+    "a tag name creates a tag": "git tag v1",
+    "tag -d": "git tag -d v1",
+    "tag -a": "git tag -a v1 -m x",
+    "tag -s": "git tag -s v1",
+    "tag -f": "git tag -f v1",
+    "tag -u": "git tag -u KEYID v1",
+    "config write": "git config a.b c",
+    "config read without a mode first": "git config a.b",
+    "config --global read": "git config --global --get a.b",
+    "config --file read": "git config --get a.b --file=../x",
+    "config set subcommand": "git config set a.b c",
+    "config --get after a write mode": "git config --add a.b c --get",
+    "config --edit": "git config --edit",
+    "-p before the verb": "git -p log",
+    "--paginate before the verb": "git --paginate log",
+    "--no-replace-objects before the verb": "git --no-replace-objects log",
+    "--literal-pathspecs before the verb": "git --literal-pathspecs log",
+    "--attr-source before the verb": "git --attr-source=HEAD log",
+    "--exec-path before the verb": "git --exec-path=x log",
+    "--html-path before the verb": "git --html-path",
+    "no verb": "git",
+    "-C and no verb": "git -C .",
+}
+
+
+@pytest.mark.parametrize("name", list(R5_RED))
+def test_r5_a_red_row_is_unsafe_before_launch(tmp_path, launches, name):
+    clone = make_clone(tmp_path, {"f": "x\n", "a": "x\n", "sub/readme.txt": "x\n"})
+    status, detail = ob.exercise_route(R5_RED[name], clone, 30, {})
+    assert status == "ROUTE_UNSAFE", (name, status, detail)
+    assert launches == [], f"{name} reached the process launch"
+
+
+R5_WRITE_VERBS = [
+    "add", "commit", "checkout", "switch", "restore", "reset", "merge", "cherry-pick", "revert", "stash", "apply", "am", "mv", "rm",
+    "rebase", "pull", "push", "fetch", "clone", "init", "notes", "worktree", "submodule", "gc", "prune", "repack", "update-ref",
+    "update-index", "symbolic-ref", "clean", "archive", "bundle", "format-patch", "fsck", "reflog", "remote", "ls-remote",
+    "maintenance", "replace", "filter-branch", "fast-import", "sparse-checkout", "bisect", "commit-tree", "hash-object", "mktag",
+    "mktree", "read-tree", "write-tree", "checkout-index", "pack-refs", "credential", "daemon", "send-email", "request-pull",
+    "difftool", "mergetool", "instaweb", "gui", "help", "show-branch", "diff-tree", "diff-index", "diff-files", "check-ignore",
+    "var", "config-env",
+]
+
+
+@pytest.mark.parametrize("verb", R5_WRITE_VERBS)
+def test_r5_a_write_capable_or_dropped_verb_is_unsafe_in_any_form(tmp_path, launches, verb):
+    clone = make_clone(tmp_path)
+    for command in (f"git {verb}", f"git {verb} HEAD", f"git -C . {verb} --help"):
+        status, detail = ob.exercise_route(command, clone, 30, {})
+        assert status == "ROUTE_UNSAFE", (command, status, detail)
+    assert launches == [], f"git {verb} reached the process launch"
+
+
+def test_r5_the_verb_list_is_read_only_and_branch_and_tag_list_only():
+    assert not set(R5_WRITE_VERBS) & set(ob.ROUTE_GIT_VERBS), set(R5_WRITE_VERBS) & set(ob.ROUTE_GIT_VERBS)
+    assert ob.ROUTE_GIT_VERBS["branch"].positional == "list" and ob.ROUTE_GIT_VERBS["tag"].positional == "list"
+    for verb in ("branch", "tag"):
+        letters = ob.ROUTE_GIT_VERBS[verb].letters | ob.ROUTE_GIT_VERBS[verb].value_letters
+        assert not set("dDmMcCfFasuSe") & letters, (verb, letters)
+    for verb, spec in ob.ROUTE_GIT_VERBS.items():                               # no option that names a file to read or write
+        names = spec.flags | spec.valued
+        assert not {"--output", "--no-index", "--pathspec-from-file", "--contents", "--file", "--textconv", "--ext-diff",
+                    "--open-files-in-pager", "--exec", "--upload-pack", "--unsafe-paths", "--strategy", "--gpg-sign"} & names, verb
+        assert "O" not in spec.letters | spec.value_letters, verb
+
+
+R5_OK_MOCKED = [
+    "git log --oneline -n 3", "git log -n3", "git log -3", "git log -s", "git log -S needle", "git log -sn3",
+    "git log --format=%h %s --date=short", "git grep -eO -- docs", "git grep -ne TODO", "git grep -nie TODO -- docs",
+    "git rev-parse --short HEAD", "git rev-parse -q --verify HEAD", "git status --porcelain", "git status -sb",
+    "git ls-tree -r HEAD", "git ls-files -s", "git cat-file -t HEAD", "git cat-file -p HEAD:f", "git blame -L 1,2 f",
+    "git describe --tags --always", "git for-each-ref --format=%(refname) --sort=-committerdate --count=5", "git show-ref --heads",
+    "git merge-base --is-ancestor HEAD HEAD", "git rev-list --count HEAD", "git shortlog -sn HEAD", "git name-rev --name-only HEAD",
+    "git count-objects -v", "git version", "git config --get-regexp core", "git config -l", "git config --list --show-origin",
+    "git branch", "git branch --list", "git branch -l fe*", "git branch -vv", "git branch --show-current", "git tag", "git tag -l v*",
+    "git tag --list", "git -C sub log -- readme.txt", "git log -- sub", "git diff HEAD -- f a",
+]
+
+
+@pytest.mark.parametrize("command", R5_OK_MOCKED)
+def test_r5_a_listed_read_only_form_is_launched(tmp_path, launches, command):
+    clone = make_clone(tmp_path, {"f": "x\n", "a": "x\n", "sub/readme.txt": "x\n", "docs/notes.md": "TODO\n"})
+    status, detail = ob.exercise_route(command, clone, 30, {})
+    assert status == "ROUTE_OK" and len(launches) == 1, (command, status, detail)
+    assert launches[0]["argv"][-len(ob.split_route(command)) + 1:] == ob.split_route(command)[1:]   # the route's words, untouched
+
+
+def r5_bus(tmp_path: Path) -> Path:
+    """A bus with two commits and a docs/ file carrying TODO, so every R5_GREEN row has something to read."""
+    bus = make_bus(tmp_path, {"docs/notes.md": "TODO: one\n"})
+    (bus / "docs" / "notes.md").write_text("TODO: one\nTODO: two\n", encoding="utf-8")
+    git(bus, "add", "-A")
+    git(bus, "commit", "-q", "-m", "second")
+    return bus
+
+
+R5_GREEN = ["git log --oneline -n 3", "git show --stat HEAD", "git diff --name-only HEAD~1 HEAD", "git grep -n -e TODO -- docs",
+            "git rev-parse --verify HEAD", "git status --short", "git ls-files"]
+
+
+@pytest.mark.parametrize("command", R5_GREEN)
+def test_r5_a_green_row_runs_for_real_in_the_scratch_clone(tmp_path, capsys, monkeypatch, command):
+    bus = r5_bus(tmp_path)
+    head = git(bus, "rev-parse", "HEAD")
+    real, seen = ob.run_route_process, []
+    monkeypatch.setattr(ob, "run_route_process", lambda argv, cwd, env, timeout: (seen.append((list(argv), cwd)), real(argv, cwd, env, timeout))[1])
+    assert exercise(tmp_path, item_file(tmp_path, adopt(command)), bus) == 0
+    assert statuses(capsys.readouterr().out) == ["ROUTE_OK"], command
+    assert len(seen) == 1 and Path(seen[0][0][0]).stem.lower() == "git" and seen[0][1].name == "bus"
+    assert seen[0][1].resolve() != bus.resolve()
+    assert git(bus, "rev-parse", "HEAD") == head and git(bus, "status", "--porcelain") == ""
+
+
+def test_r5_an_absolute_path_outside_the_clone_is_unsafe_in_every_position(tmp_path, launches):
+    clone = make_clone(tmp_path, {"f": "x\n"})
+    away = (tmp_path / "away").as_posix()
+    for command in (f"git log -- {away}", f"git log {away}", f"git grep needle -- {away}", f"git ls-files {away}",
+                    f"git log --grep={away}", f"git grep -e {away} -- f", f"git blame -L 1,2 {away}"):
+        status, detail = ob.exercise_route(command, clone, 30, {})
+        assert status == "ROUTE_UNSAFE" and "outside the scratch clone" in detail, (command, status, detail)
+    if os.name == "nt":                                                           # case folded, and a drive-relative spelling
+        status, detail = ob.exercise_route(f"git log -- {away.swapcase()}", clone, 30, {})
+        assert status == "ROUTE_UNSAFE", (status, detail)
+    assert launches == []
+
+
+def test_r5_a_path_through_an_outward_link_in_the_clone_is_unsafe(tmp_path, launches):
+    clone = make_clone(tmp_path, {"f": "x\n"})
+    away = tmp_path / "away"
+    away.mkdir()
+    (away / "x.txt").write_text("x\n", encoding="utf-8")
+    try:
+        if os.name == "nt":
+            made = subprocess.run(["cmd", "/c", "mklink", "/J", str(clone / "jn"), str(away)], capture_output=True, text=True)
+            if made.returncode != 0:
+                raise OSError(made.stderr.strip() or made.stdout.strip())
+        else:
+            os.symlink(away, clone / "jn", target_is_directory=True)
+    except (OSError, NotImplementedError) as e:
+        pytest.skip(f"cannot make a junction or symlink on this host ({e})")
+    for command in ("git log -- jn/x.txt", "git ls-files jn", "git grep needle -- jn", "git -C . log jn/x.txt"):
+        status, detail = ob.exercise_route(command, clone, 30, {})
+        assert status == "ROUTE_UNSAFE" and "outside the scratch clone" in detail, (command, status, detail)
+    assert launches == []
+
+
+def test_r5_the_git_child_reads_an_empty_global_config_beside_the_clone_and_no_system_config(tmp_path, launches):
+    clone = make_clone(tmp_path)
+    assert ob.exercise_route("git log", clone, 30, {})[0] == "ROUTE_OK"
+    env = launches[0]["env"]
+    assert env["GIT_CONFIG_NOSYSTEM"] == "1"
+    global_config = Path(env["GIT_CONFIG_GLOBAL"])
+    assert global_config.is_file() and global_config.read_bytes() == b"" and global_config.parent == clone.parent
+    assert not ob.route_inside(ob.route_real_path(str(global_config)), ob.route_real_path(str(clone)))
+    global_config.write_text("[alias]\n\tx = !id\n", encoding="utf-8")            # whatever was left there is emptied for the next run
+    assert ob.exercise_route("git log", clone, 30, {})[0] == "ROUTE_OK"
+    assert Path(launches[1]["env"]["GIT_CONFIG_GLOBAL"]).read_bytes() == b""
+
+
+def r5_repo_with_a_driver(tmp_path: Path) -> tuple[Path, Path, str]:
+    """A repository whose committed .gitattributes selects diff driver `x` for every path, with two commits; returns it, the
+    marker path (absent until a driver runs) and a config text that defines `x` as a textconv writing the marker."""
+    repo = tmp_path / "clone"
+    subprocess.run(["git", "init", "-q", "-b", "m", str(repo)], check=True, capture_output=True, text=True)
+    (repo / ".gitattributes").write_text("* diff=x\n", encoding="utf-8")
+    for text in ("one\n", "two\n"):
+        (repo / "payload.txt").write_text(text, encoding="utf-8")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", f"c {text.strip()}")
+    marker = tmp_path / "global-driver-ran.marker"
+    script = tmp_path / "driver.py"
+    script.write_text("import pathlib, sys\npathlib.Path(sys.argv[1]).write_text('ran')\nprint('converted')\n", encoding="utf-8")
+    command = " ".join(f'\\"{Path(p).as_posix()}\\"' for p in (sys.executable, script, marker))
+    return repo, marker, f'[diff "x"]\n\ttextconv = {command}\n'
+
+
+@pytest.mark.parametrize("where", ["GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "HOME .gitconfig", "XDG config and attributes",
+                                   "GIT_CONFIG_COUNT"])
+def test_r5_a_driver_in_global_or_system_config_never_runs(tmp_path, monkeypatch, where):
+    """Config isolation, shown on a real git: a textconv driver defined where git looks for global or system config (and
+    selected for every path by the committed .gitattributes) runs on a plain `git show HEAD`, and never on the route."""
+    repo, marker, driver = r5_repo_with_a_driver(tmp_path)
+    for name in ("GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "XDG_CONFIG_HOME", "GIT_CONFIG_COUNT"):
+        monkeypatch.delenv(name, raising=False)
+    home = tmp_path / "home"
+    (home / ".config" / "git").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    config = tmp_path / "driver.gitconfig"
+    with open(config, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(driver)
+    if where in ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"):
+        monkeypatch.setenv(where, str(config))
+    elif where == "HOME .gitconfig":
+        shutil.copy(config, home / ".gitconfig")
+    elif where == "XDG config and attributes":
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
+        shutil.copy(config, home / ".config" / "git" / "config")
+        (home / ".config" / "git" / "attributes").write_text("* diff=x\n", encoding="utf-8")
+    else:
+        monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+        monkeypatch.setenv("GIT_CONFIG_KEY_0", "diff.x.textconv")
+        monkeypatch.setenv("GIT_CONFIG_VALUE_0", driver.split("textconv = ", 1)[1].strip().replace('\\"', '"'))
+    git_bin = shutil.which("git")
+    assert git_bin is not None
+    subprocess.run([git_bin, "show", "HEAD"], cwd=str(repo), env=dict(os.environ, GIT_TERMINAL_PROMPT="0"), capture_output=True, timeout=60)
+    if not marker.exists():
+        pytest.skip(f"the control run did not start the {where} driver on this git, so 'absent' would prove nothing")
+    marker.unlink()
+    status, detail = ob.exercise_route("git show HEAD", repo, 30, {})
+    assert status in ("ROUTE_OK", "ROUTE_FAILED"), (status, detail)
+    assert not marker.exists(), f"a driver defined in {where} ran on a route"
+
+
+def test_r5_the_readme_states_the_r5_contract_and_lists_every_verb():
+    text = (REPO_ROOT / "doctrine-outbox" / "README.md").read_text(encoding="utf-8")
+    section = text[text.index("## Card routes are checked before they ship"):text.index("## Concerns to the CoS")]
+    for needle in ("read-only verbs", "option allowlist", "exact token", "letter by letter", "`--` ends", "inside the scratch clone",
+                   "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL", "pathspec magic", "list form"):
+        assert needle in section, needle
+    for verb in ob.ROUTE_GIT_VERBS:
+        assert f"`{verb}`" in section, verb
+    assert "scratch-local verb" not in section, "write verbs are no longer run"

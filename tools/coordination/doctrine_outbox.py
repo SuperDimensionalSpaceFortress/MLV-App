@@ -134,6 +134,7 @@ import threading
 import time
 from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
+from typing import NamedTuple
 
 # ---------- constants that are fleet-wide, not per project ----------
 
@@ -2370,7 +2371,7 @@ def cmd_session_start(repo: pathlib.Path, ref: str, ledger: pathlib.Path) -> int
 #
 # THREE STEPS PER ROUTE, in this order:
 #   1. SAFETY SCREEN, for EVERY route (route_unsafe_reason). It runs nothing: a shell operator, a URL, a credential, a
-#      network client, `gh`, a git form that starts a helper (below) or anything inside the live bus is ROUTE_UNSAFE.
+#      network client, `gh`, git off its read-only option lists (below) or anything inside the live bus is ROUTE_UNSAFE.
 #   2. STATIC EXISTENCE CHECK, for EVERY route. It runs nothing. The route's program must resolve (PATH, or a path inside the
 #      scratch clone), and every script it names (python/py, node and its -r/--import preloads, a shell and its --rcfile, deno,
 #      bun, pwsh/powershell, awk -f, perl/ruby/php/lua/Rscript/osascript/tclsh) must be a file that resolves, symlinks and
@@ -2403,16 +2404,16 @@ def cmd_session_start(repo: pathlib.Path, ref: str, ledger: pathlib.Path) -> int
 #             Refused: a shell operator (pipe, `&&`, `;`, redirect); an environment-assignment prefix; a URL or `user@host:`
 #             remote in any argument; a credential assignment (`NAME=value` for ANTHROPIC_*, GH_*, *_TOKEN, *_KEY, *PASSWORD*,
 #             ...) or `--token`/`--password`; any `gh`; claude/codex `auth|login|logout`; a network client (curl, ssh, npx, ...);
-#             `find -exec`/`-delete`; a `git` that resolves only inside the clone or to a program that is not git; and git
-#             other than the allowlisted read-only or scratch-local verbs (no push, pull, fetch, ls-remote, clone, remote,
-#             submodule, aliases), with no `-c`/`--config-env`, no `config` write, `-C` only inside the scratch clone and never
-#             into (or under) a bare repository layout, no alternate git directory (ROUTE_GIT_ALT_DIR_OPTIONS: `--git-dir`,
-#             `--work-tree`, `--namespace`, `--super-prefix`, `--bare`; `rev-parse --git-dir` only prints), and none of the forms
-#             that start a helper (ROUTE_GIT_RUNS_COMMANDS, _route_git_helper_reason): `--exec`, `--upload-pack`,
-#             `--receive-pack`, `--ext-diff`, `-O`/`--open-files-in-pager`, `--output`, every abbreviation of a refused long
-#             option (_route_git_long_refused), a short-option cluster carrying `-O` on grep, `apply --unsafe-paths`,
-#             `-S`/`--gpg-sign` on commit, tag, merge, cherry-pick and revert, `tag -s|-u|--local-user`, `merge -s|--strategy`,
-#             and a `!` alias.
+#             `find -exec`/`-delete`; a `git` that resolves only inside the clone or to a program that is not git; and every git
+#             route that is not READ-ONLY GIT ON A POSITIVE LIST (r5 hub ruling; real card routes run no git, so nothing real is
+#             lost): before the verb only `-C`, inside the scratch clone and never into (or under) a bare repository layout (`-c`,
+#             `--config-env`, an alternate git directory in any form or abbreviation, ROUTE_GIT_ALT_DIR_OPTIONS, and every other
+#             global option are refused); the verb one of ROUTE_GIT_VERBS (no verb that can write: no commit, checkout, merge,
+#             apply, stash, ...; `branch` and `tag` in list form only; `config` in a read mode only); each option on that verb's
+#             own list (_route_git_options_reason): an EXACT token, so an abbreviation is refused; a long value only as
+#             `--name=value`; a short cluster letter by letter, a value letter taking the rest of the cluster or the next token;
+#             `--` ends the options. Every option value and every positional must resolve inside the scratch clone (`..`,
+#             symlinks, junctions, case), and a positional starting with `:` (pathspec magic, an index path) is refused.
 #   LIVE BUS HUB RULING (r2, binding): "refuse if --bus resolves to the live clone" means NO ROUTE runs with its working
 #             directory, a `-C`/`--git-dir`/`--work-tree` target, or any argument or --fill value (also the value of
 #             `--opt=VALUE`) that resolves INSIDE the live bus. The default $FACTORY_BUS_CLONE is still cloned, read-only.
@@ -2422,9 +2423,11 @@ def cmd_session_start(repo: pathlib.Path, ref: str, ledger: pathlib.Path) -> int
 # A route that IS run gets the interpreter-injection environment stripped (PYTHONPATH, PYTHONSTARTUP, PYTHONHOME, NODE_OPTIONS,
 # NODE_PATH, PERL5OPT, PERL5LIB, RUBYOPT, BASH_ENV, ENV), every credential-shaped variable, every GIT_* variable (GIT_EDITOR,
 # GIT_SEQUENCE_EDITOR, GIT_PAGER, GIT_ASKPASS, GIT_SSH, GIT_SSH_COMMAND, GIT_EXTERNAL_DIFF, GIT_CONFIG_PARAMETERS, ...) and the
-# generic helpers EDITOR, VISUAL, PAGER and SSH_ASKPASS (route_exercise_env), with git's user and system config switched off.
+# generic helpers EDITOR, VISUAL, PAGER and SSH_ASKPASS (route_exercise_env), with GIT_CONFIG_NOSYSTEM=1 and GIT_CONFIG_GLOBAL an
+# empty file beside the clone, so no driver or helper defined in the user, XDG or system config is reachable.
 # Git itself is started as `git -c core.pager=cat -c core.editor=false -c diff.external= -c core.hooksPath=<an empty directory in
-# the scratch> ...` (route_git_command), so no pager, editor, external diff or hook is reachable even through a verb that wants one.
+# the scratch> ...` (ROUTE_GIT_HARDENING, route_git_command), so no pager, editor, external diff, hook or signing program is
+# reachable even through a verb that wants one.
 # A credential's value is never printed: a diagnostic, a ROUTE line or an error shows `NAME=<redacted>`.
 # Any outcome but OK and NOT_EXECUTED fails the run (exit 1). The commands run in `git clone --local --no-hardlinks`
 # of --bus (default $FACTORY_BUS_CLONE) with `origin` removed, under a scratch directory this tool creates and removes by name.
@@ -2473,22 +2476,67 @@ ROUTE_PRELOAD_FLAGS = {"node": frozenset({"-r", "--require", "--import", "--load
                        "bun": frozenset({"-r", "--preload", "--require", "--import"}),
                        "shell": frozenset({"--rcfile", "--init-file"})}
 ROUTE_EXEC_ALLOW = frozenset({"git"})                   # the ONLY programs a route is ever run with (route_runs)
-ROUTE_GIT_ALLOWED = frozenset({
-    "log", "status", "show", "diff", "rev-parse", "rev-list", "ls-files", "ls-tree", "cat-file", "describe", "grep", "blame",
-    "shortlog", "merge-base", "for-each-ref", "show-ref", "name-rev", "diff-tree", "diff-index", "diff-files", "check-ignore",
-    "count-objects", "fsck", "version", "show-branch", "reflog", "branch", "tag", "add", "commit", "checkout", "switch",
-    "restore", "reset", "merge", "cherry-pick", "stash", "apply", "mv", "rm", "config"})
-ROUTE_GIT_CONFIG_READS = frozenset({"--get", "--get-all", "--get-regexp", "--get-urlmatch", "--list", "-l", "get", "list"})
-ROUTE_GIT_CONFIG_WRITES = frozenset({"--add", "--unset", "--unset-all", "--replace-all", "--edit", "-e", "--rename-section",
-                                     "--remove-section", "set", "unset", "edit", "rename-section", "remove-section"})
-ROUTE_GIT_RUNS_COMMANDS = frozenset({"--output", "--open-files-in-pager", "--upload-pack", "--receive-pack", "--exec", "--ext-diff"})
+
+
+class RouteGitVerb(NamedTuple):
+    """The options one read-only git verb accepts in a route; anything else is ROUTE_UNSAFE (_route_git_options_reason).
+    flags: exact long or short tokens that take no value. valued: long names accepted only as `--name=value`. letters / value_letters:
+    the short letters of a cluster; a value letter takes the rest of the cluster, or the next token when it is last. digits: `-<N>`
+    is accepted. positional: "any", "none", or "list" (only after a list flag or letter, so `branch fresh` never creates a branch).
+    first: when set, the first token after the verb must be one of these (config: a read mode before anything else)."""
+    flags: frozenset[str] = frozenset()
+    valued: frozenset[str] = frozenset()
+    letters: frozenset[str] = frozenset()
+    value_letters: frozenset[str] = frozenset()
+    digits: bool = False
+    positional: str = "any"
+    list_flags: frozenset[str] = frozenset()
+    list_letters: frozenset[str] = frozenset()
+    first: frozenset[str] = frozenset()
+
+
+def _verb(flags: str = "", valued: str = "", letters: str = "", value_letters: str = "", **rest) -> RouteGitVerb:
+    return RouteGitVerb(frozenset(flags.split()), frozenset(valued.split()), frozenset(letters), frozenset(value_letters), **rest)
+
+
+_ROUTE_GIT_DIFF_FLAGS = "--stat --shortstat --numstat --name-only --name-status --no-color --no-textconv --no-ext-diff --no-patch"
+ROUTE_GIT_VERBS: dict[str, RouteGitVerb] = {          # read-only verbs only; the per-verb lists are the whole option grammar
+    "log": _verb(f"{_ROUTE_GIT_DIFF_FLAGS} --oneline --all --branches --tags --reverse --first-parent --no-merges --merges "
+                 "--abbrev-commit --decorate --no-decorate --show-signature",
+                 "--format --pretty --since --until --author --grep --max-count --date", "s", "nS", digits=True),
+    "show": _verb(f"{_ROUTE_GIT_DIFF_FLAGS} --oneline --abbrev-commit --show-signature", "--format --pretty", "s"),
+    "diff": _verb(f"{_ROUTE_GIT_DIFF_FLAGS} --cached --staged --word-diff --quiet --exit-code", "", "s"),
+    "grep": _verb("", "", "nilcwFE", "e"),
+    "rev-parse": _verb("--verify --short --abbrev-ref --symbolic-full-name --show-toplevel --git-dir --is-inside-work-tree "
+                       "--is-bare-repository --quiet", "", "q"),
+    "rev-list": _verb("--count --all --reverse --first-parent --no-merges --merges", "--max-count --since --until", "", "n",
+                      digits=True),
+    "status": _verb("--short --porcelain --branch", "", "sb"),
+    "ls-files": _verb("--cached --deleted --modified --others --stage --exclude-standard --full-name --error-unmatch", "",
+                      "cdmostz"),
+    "ls-tree": _verb("--name-only --name-status --full-name --full-tree", "", "rtdlz"),
+    "cat-file": _verb("", "", "etsp"),
+    "describe": _verb("--tags --always --long --all"),
+    "blame": _verb("--porcelain --line-porcelain --root --no-textconv", "", "slewf", "L"),
+    "shortlog": _verb("--summary --numbered --email", "", "sne"),
+    "merge-base": _verb("--is-ancestor --all"),
+    "for-each-ref": _verb("", "--format --sort --count"),
+    "show-ref": _verb("--heads --tags --verify --hash --quiet", "", "q"),
+    "name-rev": _verb("--name-only --tags"),
+    "count-objects": _verb("--verbose --human-readable", "", "vH", positional="none"),
+    "version": _verb("--build-options", positional="none"),
+    "branch": _verb("--list --remotes --verbose --show-current --no-color", "", "lrv", positional="list",
+                    list_flags=frozenset({"--list"}), list_letters=frozenset("l")),
+    "tag": _verb("--list", "", "l", positional="list", list_flags=frozenset({"--list"}), list_letters=frozenset("l")),
+    "config": _verb("--get --get-all --get-regexp --list --show-origin", "", "l",
+                    first=frozenset({"--get", "--get-all", "--get-regexp", "--list", "-l"})),
+}
 ROUTE_GIT_ALT_DIR_OPTIONS = frozenset({"--git-dir", "--work-tree", "--namespace", "--super-prefix", "--bare"})   # another repository or tree
-ROUTE_GIT_SIGN_VERBS = frozenset({"commit", "tag", "merge", "cherry-pick", "revert"})          # verbs that can start gpg
-ROUTE_GIT_STRATEGY_VERBS = frozenset({"merge", "cherry-pick", "revert"})                       # verbs that look up git-merge-<name>
 ROUTE_GIT_HARDENING = ("core.pager=cat", "core.editor=false", "diff.external=", "core.fsmonitor=false", "commit.gpgsign=false",
                        "tag.gpgsign=false", "safe.bareRepository=explicit", "gpg.program=false", "gpg.ssh.program=false",
                        "gpg.x509.program=false")                                               # `-c` pairs before every run git
 ROUTE_NO_HOOKS_DIR = "outbox-route-no-hooks"                                                   # empty, beside the clone in the scratch
+ROUTE_EMPTY_GLOBAL_CONFIG = "outbox-route-empty-gitconfig"                                      # empty file, beside the clone: GIT_CONFIG_GLOBAL
 ROUTE_HELPER_ENV = frozenset({"EDITOR", "VISUAL", "PAGER", "SSH_ASKPASS"})                     # helpers git reads besides GIT_*
 ROUTE_STRIPPED_ENV_RE = re.compile(r"(?:TOKEN|SECRET|PASSWORD|API_?KEY|CREDENTIAL)|^(?:ANTHROPIC_|CLAUDE_CODE_|GH_|GIT_|GITHUB_)", re.I)
 ROUTE_INJECTION_ENV = frozenset({"PYTHONPATH", "PYTHONSTARTUP", "PYTHONHOME", "NODE_OPTIONS", "NODE_PATH", "PERL5OPT", "PERL5LIB",
@@ -2636,7 +2684,8 @@ def route_git_binary(cwd: str | os.PathLike) -> tuple[str | None, tuple[str, str
 def route_git_command(git_bin: str, argv: list[str], cwd: str | os.PathLike) -> list[str]:
     """The command line git is started with: `-c` overrides that switch off every pager, editor, external diff, hook, fsmonitor
     and signing helper (ROUTE_GIT_HARDENING and `core.hooksPath` = an empty directory beside the clone), then the route's own
-    words untouched. A route may not pass `-c` itself (_route_git_unsafe), so nothing it says can undo these."""
+    words untouched. A route may not pass `-c` or any other global option but `-C` (_route_git_unsafe), so nothing it says can
+    undo these."""
     hooks = pathlib.Path(cwd).parent / ROUTE_NO_HOOKS_DIR
     hooks.mkdir(exist_ok=True)
     pairs = [*ROUTE_GIT_HARDENING, f"core.hooksPath={hooks}"]
@@ -2745,10 +2794,10 @@ def _route_git_bare_layout(path: str, scratch: str) -> str | None:
 
 
 def _route_git_unsafe(argv: list[str], cwd: str, secrets: Iterable[str] = ()) -> str | None:
-    """git: a read-only or scratch-local verb only (allowlist), no `-c`, no `--config-env`, no `config` write, no option that can
-    name a program for git to start (long, abbreviated or inside a short-option cluster), no alternate git directory
-    (`--git-dir`, `--work-tree`, `--namespace`, `--super-prefix`, `--bare`), and `-C` only into a directory inside the scratch
-    clone (`cwd`) that is not itself, nor sits under, a bare repository layout."""
+    """git: before the verb only `-C` into a directory inside the scratch clone (`cwd`) that is not itself, nor sits under, a
+    bare repository layout (`-c`, an alternate git directory and every other global option are refused); then one READ-ONLY verb
+    of ROUTE_GIT_VERBS with only the options on its own list, every value and positional inside the clone
+    (_route_git_options_reason)."""
     scratch = route_real_path(cwd)
     here = cwd
     i, sub = 1, None
@@ -2756,12 +2805,6 @@ def _route_git_unsafe(argv: list[str], cwd: str, secrets: Iterable[str] = ()) ->
         tok = argv[i]
         if tok == "-c":
             return "git -c: a config override can smuggle in an alias, a helper or a pager"
-        refused = _route_git_long_refused(tok, (*ROUTE_GIT_RUNS_COMMANDS, "config-env", "exec-path"))
-        if refused:                                                     # before the verb too: `git --upload-pack=x log`
-            return f"git {tok.split('=', 1)[0]} ({refused}) changes what git runs, writes outside the scratch clone or runs another program"
-        if tok == "--attr-source" and i + 1 < len(argv):                # reads attributes from a tree-ish; its value is not the verb
-            i += 2
-            continue
         alternate = _route_git_long_refused(tok, ROUTE_GIT_ALT_DIR_OPTIONS)
         if alternate:
             tok_name = tok.split("=", 1)[0]
@@ -2791,49 +2834,97 @@ def _route_git_unsafe(argv: list[str], cwd: str, secrets: Iterable[str] = ()) ->
                 return (f"git -C targets {redact_route_text(here, secrets)!r}, which is or sits under a bare repository layout "
                         f"({pathlib.PurePath(bare).name}); git would open it as the repository and read its config")
             i += 1
-        elif not tok.startswith("-"):
+        elif tok.startswith("-"):
+            return (f"git {redact_route_text(tok.split('=', 1)[0], secrets)} is not an allowed global option (before the verb a "
+                    "route may pass only -C <a directory inside the scratch clone>)")
+        else:
             sub = tok
             break
         i += 1
     if sub is None:
-        return None
-    if sub.startswith("!"):
-        return "git !alias runs a shell command"
-    if sub not in ROUTE_GIT_ALLOWED:
-        return f"git {sub} is not an allowlisted read-only or scratch-local verb (online verbs, publishing, aliases and unlisted verbs are never run)"
-    after = argv[i + 1:]
-    if sub == "config":
-        if not any(t in ROUTE_GIT_CONFIG_READS for t in after) or any(t in ROUTE_GIT_CONFIG_WRITES for t in after):
-            return "git config is read-only in a route (--get, --get-all, --get-regexp, --list)"
-    for tok in after:
-        refused = _route_git_long_refused(tok, ROUTE_GIT_RUNS_COMMANDS)
-        if refused:
-            return f"git {sub} {tok.split('=', 1)[0]} ({refused}) writes outside the scratch clone or runs another program"
-        alternate = _route_git_long_refused(tok, ROUTE_GIT_ALT_DIR_OPTIONS)
-        if alternate and sub != "rev-parse":                            # `rev-parse --git-dir` only prints; everything else is refused
-            return f"git {sub} {tok.split('=', 1)[0]} ({alternate}) selects another git directory or work tree"
-        if sub == "grep" and "O" in (_route_flag_cluster(tok) or ""):
-            return f"git grep {tok}: a short-option cluster with -O names a pager program for git to start"
-    return _route_git_helper_reason(sub, after)
+        return "git with no verb: a route names one read-only verb"
+    spec = ROUTE_GIT_VERBS.get(sub)
+    if spec is None:
+        return (f"git {redact_route_text(sub, secrets)} is not an allowlisted read-only verb (a verb that can write, an online "
+                "verb, an alias and an unlisted verb are never run)")
+    return _route_git_options_reason(sub, spec, argv[i + 1:], here, scratch, secrets)
 
 
-def _route_git_helper_reason(sub: str, after: list[str]) -> str | None:
-    """Why an allowlisted verb with these options would still start a helper or write outside the clone, else None: `apply
-    --unsafe-paths`; gpg through `-S`/`--gpg-sign` (commit, tag, merge, cherry-pick, revert) or `tag -s|-u|--local-user`; a merge
-    driver looked up on PATH through `merge -s` / `--strategy`. A short option is read as a cluster, so `-aS` and `-sm` count."""
-    for tok in after:
-        if sub == "apply" and tok == "--unsafe-paths":
-            return "git apply --unsafe-paths writes outside the scratch clone"
-        short = tok[1:] if tok.startswith("-") and not tok.startswith("--") else ""
-        if sub in ROUTE_GIT_SIGN_VERBS and (tok.startswith("--gpg-sign") or "S" in short):
-            return f"git {sub} {tok.split('=', 1)[0]} starts gpg"
-        if sub == "tag" and (tok == "--sign" or tok.startswith("--local-user") or "s" in short or "u" in short):
-            return f"git tag {tok.split('=', 1)[0]} signs the tag and starts gpg"
-        if sub in ROUTE_GIT_STRATEGY_VERBS and tok.startswith("--strategy"):
-            return f"git {sub} {tok.split('=', 1)[0]} looks a merge driver up on PATH and runs it"
-        if sub == "merge" and short.startswith("s"):
-            return "git merge -s looks a merge driver up on PATH and runs it"
+def _route_git_options_reason(sub: str, spec: RouteGitVerb, after: list[str], here: str, scratch: str,
+                              secrets: Iterable[str] = ()) -> str | None:
+    """Why the words after an allowlisted verb are refused, else None. Each option must be on the verb's own list, matched as an
+    EXACT token (git reads any unambiguous prefix of a long option; the screen reads none, so `--onel` is refused); a long option
+    with a value only as `--name=value`; a short cluster letter by letter, where a value letter takes the rest of the cluster or
+    the next token; `--` ends the options. Then every option value and every positional (revision, path or pathspec) must
+    resolve, `..`, symlinks and junctions followed and case folded, inside the scratch clone, and no positional may start with
+    `:` (pathspec magic such as `:(top)` or `:/`, or an index path)."""
+    def shown(tok: str) -> str:
+        return redact_route_text(tok, secrets)
+
+    if spec.first and (not after or after[0] not in spec.first):
+        return f"git {sub} must start with one of {', '.join(sorted(spec.first))}: only its read modes are run"
+    values: list[str] = []
+    positionals: list[str] = []
+    listing, ended, i = False, False, 0
+    while i < len(after):
+        tok = after[i]
+        i += 1
+        if ended or not tok.startswith("-"):
+            positionals.append(tok)
+        elif tok == "--":
+            ended = True
+        elif tok.startswith("--"):
+            name, eq, value = tok.partition("=")
+            if eq and name in spec.valued:
+                values.append(value)
+            elif not eq and tok in spec.flags:
+                listing = listing or tok in spec.list_flags
+            else:
+                return (f"git {sub} {shown(name)}{'=...' if eq else ''} is not on the option list for git {sub} (exact tokens only; "
+                        "an abbreviation or a form the list does not name is refused)")
+        elif spec.digits and re.fullmatch(r"-\d+", tok):
+            continue
+        elif tok == "-":
+            return f"git {sub} -: reading standard input is not on the option list"
+        else:
+            cluster = tok[1:]
+            for pos, ch in enumerate(cluster):
+                if ch in spec.value_letters:
+                    if pos + 1 < len(cluster):
+                        values.append(cluster[pos + 1:])
+                    elif i < len(after):
+                        values.append(after[i])
+                        i += 1
+                    else:
+                        return f"git {sub} -{ch} needs a value"
+                    break
+                if ch not in spec.letters:
+                    return (f"git {sub} {shown(tok)}: -{ch} is not on the option list for git {sub} (a short cluster is read "
+                            "letter by letter)")
+                listing = listing or ch in spec.list_letters
+    if positionals and spec.positional == "none":
+        return f"git {sub} takes no argument in a route"
+    if positionals and spec.positional == "list" and not listing:
+        return f"git {sub} with a name creates, renames or deletes; a route runs only its list form (--list/-l)"
+    for tok in positionals:
+        if tok.startswith(":"):
+            return f"git {sub} {shown(tok)!r}: pathspec magic and index paths are refused"
+    for tok in (*values, *positionals):
+        if _route_git_operand_outside(tok, here, scratch):
+            return f"git {sub} argument {shown(tok)!r} resolves outside the scratch clone"
     return None
+
+
+def _route_git_operand_outside(tok: str, here: str, scratch: str) -> bool:
+    """True when `tok`, read as a path relative to the directory git runs in (`here`), does not resolve inside the scratch clone
+    (`scratch`, already real): `..`, symlinks, junctions and 8.3 names followed, case folded where the filesystem folds it. A
+    token that cannot be read as a path at all counts as outside, fail-closed."""
+    if "\0" in tok:
+        return True
+    try:
+        return not route_inside(route_real_path(tok, here), scratch)
+    except (OSError, ValueError):
+        return True
 
 
 def route_unsafe_reason(argv: list[str], cwd: str | os.PathLike | None = None, bus: str | os.PathLike | None = None,
@@ -3195,7 +3286,9 @@ def route_exercise_env(base: dict[str, str] | None = None, clone: str | os.PathL
     (ROUTE_INJECTION_ENV, any case: a startup hook or preload a launched interpreter would run), the generic helper variables
     (ROUTE_HELPER_ENV: EDITOR, VISUAL, PAGER, SSH_ASKPASS), any credential-shaped variable and every GIT_* variable (GIT_EDITOR,
     GIT_SEQUENCE_EDITOR, GIT_PAGER, GIT_ASKPASS, GIT_SSH[_COMMAND], GIT_EXTERNAL_DIFF, GIT_CONFIG_PARAMETERS, ...), then git
-    told to prompt for nothing and read no user or system config. PATH (any case of the key) keeps only its ABSOLUTE entries
+    told to prompt for nothing and read no system config (GIT_CONFIG_NOSYSTEM=1) and, as its global config, only an EMPTY file
+    beside the clone (route_git_global_config; os.devnull when no clone is given), so no driver, alias or helper defined in
+    ~/.gitconfig, the XDG config or the system config is reachable. PATH (any case of the key) keeps only its ABSOLUTE entries
     (route_absolute_entries) and, when `clone` is given, only those whose real path is outside the clone: a `false.exe` or `gpg`
     planted in the clone is never found through `.`, an empty entry, a relative one, a quoted one or a junction into it."""
     source = os.environ if base is None else base
@@ -3211,8 +3304,17 @@ def route_exercise_env(base: dict[str, str] | None = None, clone: str | os.PathL
             except (OSError, ValueError):
                 continue
         env[key] = os.pathsep.join(kept)
-    env.update({"GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull})
+    global_config = route_git_global_config(clone) if clone is not None else os.devnull
+    env.update({"GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": global_config})
     return env
+
+
+def route_git_global_config(clone: str | os.PathLike) -> str:
+    """The file a run git reads as its global config: ROUTE_EMPTY_GLOBAL_CONFIG beside the clone, in the scratch directory this
+    tool made, emptied on every call so nothing a previous route left there is read."""
+    path = pathlib.Path(clone).parent / ROUTE_EMPTY_GLOBAL_CONFIG
+    path.write_bytes(b"")
+    return str(path)
 
 
 class _WinJob:
