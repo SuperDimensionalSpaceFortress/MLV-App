@@ -3148,3 +3148,67 @@ TEST(GpuPlaybackReconWarmRun, AWarmReRunAfterTheChromaSmoothChangeMatchesPlay)
     ASSERT_TRUE(warmWords == playWords);
     ASSERT_EQ(0, llrpGpuPlaybackReconRetainedOutstandingCount());
 }
+
+// T-6: the fix, driven as MainWindow drives it (PlaybackReconWarmRunPolicy.h WarmStateGate). The warm is posted at
+// generation 0; Look Assist sets chroma smooth while it is in flight (toolButtonChromaSmoothChanged re-arms: the gate
+// bumps, nothing is posted yet); the done is stale, so its output is not staged and the warm is posted again; that done
+// is current and ITS state keys the staged slot. Play then passes preGate and its recon input is the warm's, byte for
+// byte: the local stand-in for a hit (the real AMaZE input compare needs CUDA).
+TEST(GpuPlaybackReconWarmRun, AStateGateReRunsTheWarmSoTheKeyMatchesPlay)
+{
+    const uint32_t kFrame = 1;
+    QTemporaryDir dumps;
+    ASSERT_TRUE(dumps.isValid());
+    const std::string root = dumps.path().toStdString();
+    GpuReconEnv env(true);
+    MlvPipelineFixture fixture;
+    ASSERT_TRUE(openGpuEligibleFixture(fixture));
+    ASSERT_FALSE(fixture.renderFrame8(0).empty());
+    const FakeGpuBackendScope fake;
+    WorkerState reconWorker;
+    playback_recon_warm_run::WarmStateGate gate;
+
+    // postPlaybackReconWarm: queued at generation 0
+    const quint64 firstGeneration = gate.posted();
+    std::vector<uint16_t> firstWords;
+    const playback_recon_warm_run::Outcome first = warmDumpedInto(fixture, kFrame, &reconWorker.state, root + "/warm", &firstWords);
+    ASSERT_TRUE(first.ran);
+    // toolButtonChromaSmoothChanged: the mode, then the re-arm (in flight: the done re-posts)
+    llrpSetChromaSmoothMode(fixture.video(), CS_2x2);
+    ASSERT_FALSE(gate.stateChanged());
+    // onPlaybackReconWarmDone: stale -> no AMaZE into the slot, not ran, re-posted as state_changed
+    const bool firstCurrent = gate.done(firstGeneration);
+    ASSERT_FALSE(firstCurrent);
+    ASSERT_FALSE(playback_recon_warm_run::guiAmazeAllowed(true, false, true, firstCurrent));
+    ASSERT_TRUE(playback_recon_warm_run::repostAfterSkip(playback_recon_warm_run::Reason::StateChanged, 1));
+
+    const quint64 secondGeneration = gate.posted();
+    std::vector<uint16_t> warmWords;
+    const playback_recon_warm_run::Outcome warm = warmDumpedInto(fixture, kFrame, &reconWorker.state, root + "/warm2", &warmWords);
+    ASSERT_TRUE(warm.ran);
+    const bool secondCurrent = gate.done(secondGeneration);
+    ASSERT_TRUE(secondCurrent);
+    ASSERT_TRUE(playback_recon_warm_run::guiAmazeAllowed(true, false, true, secondCurrent));
+    // the staged key takes this warm's own state (MainWindow: preparedStateFrom( outcome.prepared ))
+    const playback_warm_output_reuse::PreparedState warmState = playback_warm_output_reuse::preparedStateFrom(warm.prepared);
+
+    std::vector<uint16_t> playWords;
+    const playback_warm_output_reuse::PreparedState playState =
+        playDumpedInto(fixture, kFrame, &reconWorker.state, root + "/play", &playWords);
+    ASSERT_TRUE(playState.valid);
+    const playback_warm_output_reuse::Reason gateReason = reuseGateFor(warm, warmState, playState);
+    printChromaSmoothStates("T-6", warmState, playState, gateReason);
+    ASSERT_TRUE(playback_warm_output_reuse::Reason::None == gateReason);
+    int differences = 0;
+    for (const char * name : { "in.u16", "raw2ev.i32", "ev2raw.i32", "mix_curve.f64", "fullres_curve.f64",
+                               "randn05.f32", "scalars.txt" })
+    {
+        if (!warmAndPlayDumpsEqual("T-6", root + "/warm2", root + "/play", name)) ++differences;
+    }
+    ASSERT_EQ(0, differences);
+    ASSERT_TRUE(warmWords == playWords);
+    // the stale warm's key would have been refused
+    ASSERT_TRUE(playback_warm_output_reuse::Reason::StateMismatch
+                == reuseGateFor(first, playback_warm_output_reuse::preparedStateFrom(first.prepared), playState));
+    ASSERT_EQ(0, llrpGpuPlaybackReconRetainedOutstandingCount());
+}

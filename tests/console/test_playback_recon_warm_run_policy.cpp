@@ -160,6 +160,70 @@ TEST(PlaybackReconWarmRunPolicy, TheLogLineCarriesEveryField)
               line.format().toStdString());
 }
 
+// WARM-RUN-CHROMA-SMOOTH-PARITY-1 T-1: the venue order (54cd0a9e, 47d9b5b4, adfe56ec). The warm is posted at state
+// generation 0; Look Assist auto-applies chroma smooth while it is in flight (no second post yet); its done is stale:
+// no AMaZE into the staged slot, not counted as ran, re-posted; the re-run at generation 1 is current and keyed.
+TEST(PlaybackReconWarmRunPolicy, AChromaSmoothChangeWhileTheWarmIsInFlightReRunsIt)
+{
+    using playback_recon_warm_run::WarmStateGate;
+    using playback_recon_warm_run::guiAmazeAllowed;
+    using playback_recon_warm_run::repostAfterSkip;
+    WarmStateGate gate;
+    const quint64 first = gate.posted();
+    ASSERT_EQ(0u, (unsigned)first);
+    ASSERT_TRUE(gate.inFlight);
+    ASSERT_FALSE(gate.stateChanged());   // in flight: its done re-posts
+    ASSERT_EQ(1u, (unsigned)gate.generation);
+    const bool firstCurrent = gate.done(first);
+    ASSERT_FALSE(firstCurrent);
+    ASSERT_FALSE(gate.inFlight);
+    ASSERT_FALSE(guiAmazeAllowed(true, false, true, firstCurrent));
+    const bool firstRan = firstCurrent;   // MainWindow: m_playbackReconWarmRan only for a current done
+    ASSERT_FALSE(firstRan);
+    ASSERT_TRUE(repostAfterSkip(Reason::StateChanged, 0));
+    const quint64 second = gate.posted();
+    ASSERT_EQ(1u, (unsigned)second);
+    const bool secondCurrent = gate.done(second);
+    ASSERT_TRUE(secondCurrent);
+    ASSERT_TRUE(guiAmazeAllowed(true, false, true, secondCurrent));
+}
+
+// T-2: a change while nothing is in flight posts at once; a new clip clears the in-flight flag (its warm was dropped
+// at the close, so no done is owed) and keeps counting; the 3-arg gate means what it did.
+TEST(PlaybackReconWarmRunPolicy, AChromaSmoothChangeWhileIdlePostsNowAndANewClipResetsTheGate)
+{
+    using playback_recon_warm_run::WarmStateGate;
+    using playback_recon_warm_run::guiAmazeAllowed;
+    WarmStateGate gate;
+    ASSERT_TRUE(gate.stateChanged());
+    ASSERT_EQ(1u, (unsigned)gate.generation);
+    ASSERT_TRUE(gate.done(gate.posted()));
+    ASSERT_TRUE(gate.stateChanged());   // after a done, nothing is in flight
+    (void)gate.posted();
+    ASSERT_TRUE(gate.inFlight);
+    gate.reset();
+    ASSERT_FALSE(gate.inFlight);
+    ASSERT_EQ(2u, (unsigned)gate.generation);
+    ASSERT_TRUE(gate.stateChanged());
+    ASSERT_EQ(3u, (unsigned)gate.generation);
+    // a done for an older generation after a reset is stale, never current
+    ASSERT_FALSE(gate.done(2));
+    ASSERT_TRUE(guiAmazeAllowed(true, false, true) == guiAmazeAllowed(true, false, true, true));
+    ASSERT_TRUE(guiAmazeAllowed(true, true, true) == guiAmazeAllowed(true, true, true, true));
+    ASSERT_TRUE(guiAmazeAllowed(true, false, false) == guiAmazeAllowed(true, false, false, true));
+    ASSERT_TRUE(guiAmazeAllowed(false, false, true) == guiAmazeAllowed(false, false, true, true));
+}
+
+// T-3: the stale done's reason has a name, and its re-post shares the post budget.
+TEST(PlaybackReconWarmRunPolicy, AStateChangedRepostIsNamedAndBounded)
+{
+    using playback_recon_warm_run::kMaxPosts;
+    using playback_recon_warm_run::repostAfterSkip;
+    ASSERT_EQ(std::string("state_changed"), name(Reason::StateChanged));
+    ASSERT_TRUE(repostAfterSkip(Reason::StateChanged, kMaxPosts - 1));
+    ASSERT_FALSE(repostAfterSkip(Reason::StateChanged, kMaxPosts));
+}
+
 TEST(PlaybackReconWarmRunPolicy, ASkipLineSaysSkipAndWhy)
 {
     playback_recon_warm_run::Line line;
