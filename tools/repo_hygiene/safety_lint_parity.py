@@ -99,6 +99,25 @@ LINT_REL = "tools/coordination/lane-local-playback-lint.ps1"
 HOOK_TEST_REL = "tools/repo_hygiene/test_mlv_never_authorized.py"
 PLAYBACK_TEST_REL = "tools/repo_hygiene/test_hub_vm_no_local_playback.py"
 CORPUS_REL = "tools/repo_hygiene/safety_lint_parity_corpus.json"  # r6: where the BASELINE's copy of the static corpus is read from
+# NA2-RULE4-PER-LAUNCHER-SCOPE-1 r16c (hub ruling #2, ledger 2026-10-19 ~06:55Z): #465's RULE4_* seed tuples are NOT derived as head
+# must-refuse rows.  At 12,018 derived rows (211 + 11,807 from these 24 tuples, 6,000 of them seeded fuzz) the parity suite did not
+# finish in 1,198 s on a loaded host (r16b), so the cost is excluded by an EXPLICIT list: exact names, never a prefix or a regex, so a
+# new RULE4_* (or any other) tuple is derived and counted until someone lists it here.  The exclusion is HEAD-side only; a copy of
+# any of these names in the BASELINE module still joins the union.  The rows are covered by #465's own master-vs-head differential
+# (test_hub_vm_no_local_playback.LintDifferentialPinTests) for the families that corpus carries; the families it does not carry are
+# recorded in the r16c coverage audit.  Re-include them under card SAFETY-LINT-PARITY-SPEED-1 (a faster probe), then empty this set.
+# test_safety_lint_parity pins the excluded row count (EXACT_EXCLUDED_DIFFERENTIAL_ROWS) and fails on a stale entry.
+PARITY_EXCLUDED_DIFFERENTIAL_TUPLES = frozenset({
+    "RULE4_R10_FUZZ_REFUSE", "RULE4_R10_REFUSE",
+    "RULE4_R2_B_APP_REFUSE", "RULE4_R2_B_REFUSE",
+    "RULE4_R2_CROSS_GUARDS", "RULE4_R2_CROSS_RED", "RULE4_R2_CROSS_REFUSE",
+    "RULE4_R2_GUARDS", "RULE4_R2_MIXED_REFUSE", "RULE4_R2_OR_REFUSE", "RULE4_R2_REFUSE", "RULE4_R2_SINGLE_REFUSE",
+    "RULE4_R4_GUARDS", "RULE4_R4_RED", "RULE4_R4_REFUSE",
+    "RULE4_R6_GUARDS", "RULE4_R6_RED", "RULE4_R6_REFUSE",
+    "RULE4_R7_REFUSE", "RULE4_R8_REFUSE",
+    "RULE4_R9_FUZZ_REFUSE", "RULE4_R9_REFUSE",
+    "RULE4_SECOND_LAUNCHER_GUARDS", "RULE4_SECOND_LAUNCHER_REFUSE",
+})
 DEFAULT_CORPUS = HERE / "safety_lint_parity_corpus.json"
 DEFAULT_ALLOW = HERE / "safety_lint_parity_allow.json"
 CORPUS_SCHEMA = "safety-lint-parity-corpus.v1"
@@ -587,27 +606,42 @@ def run_hook(base_module, head_module, cases: list[HookCase]) -> list[dict]:
 
 # ------------------------------------------------------------------------------------------------ playback rows
 
-def _playback_rows_from(pb, source: str, which: str) -> list[dict]:
-    """Every must-refuse sentence of one playback test module (`which` names it: head or baseline); `source` tags the rows."""
+def _playback_rows_from(pb, source: str, which: str, exclusion: str = "keep") -> list[dict]:
+    """Every must-refuse sentence of one playback test module (`which` names it: head or baseline); `source` tags the rows.
+
+    `exclusion` (r16c): "keep" reads every tuple, "skip" leaves out the names in PARITY_EXCLUDED_DIFFERENTIAL_TUPLES (the derived head
+    corpus), "only" reads nothing but those names (the pinned excluded-row count)."""
+    if exclusion not in ("keep", "skip", "only"):
+        raise ValueError(f"exclusion must be keep, skip or only, not {exclusion!r}")
     rows: dict[str, dict] = {}
 
     def add(name: str, text: str, where: str) -> None:
         rows.setdefault(f"playback:{name}:{short_hash(text)}", {"text": text, "why": f"{PLAYBACK_TEST_REL} {where} ({which} copy)"})
 
     lints = pb.PromptLintTests
-    for name in sorted(dir(lints)):
-        if name.startswith("CLAUSE_MUST_REFUSE"):
-            for text in getattr(lints, name):
-                add(name, text, f"PromptLintTests.{name}")
-    for shape, kind, text in getattr(lints, "DEFEATER_AXIS", ()):
-        add("DEFEATER_AXIS", text, f"PromptLintTests.DEFEATER_AXIS ({shape}/{kind})")
+    if exclusion != "only":
+        for name in sorted(dir(lints)):
+            if name.startswith("CLAUSE_MUST_REFUSE"):
+                for text in getattr(lints, name):
+                    add(name, text, f"PromptLintTests.{name}")
+        for shape, kind, text in getattr(lints, "DEFEATER_AXIS", ()):
+            add("DEFEATER_AXIS", text, f"PromptLintTests.DEFEATER_AXIS ({shape}/{kind})")
     for name in sorted(vars(pb)):
         value = getattr(pb, name)
         if re.fullmatch(r"[A-Z0-9_]+_(REFUSE|GUARDS|RED)", name) and isinstance(value, tuple) and value and all(isinstance(t, str) for t in value):
+            excluded = name in PARITY_EXCLUDED_DIFFERENTIAL_TUPLES
+            if (exclusion == "skip" and excluded) or (exclusion == "only" and not excluded):
+                continue
             for text in value:
                 add(name, text, f"module-level {name}")
-    add("INCIDENT_LINE", "## VENUE\n" + pb.INCIDENT_LINE + "\n", "INCIDENT_LINE (the 2026-10-11 producer-prompt incident)")
+    if exclusion != "only":
+        add("INCIDENT_LINE", "## VENUE\n" + pb.INCIDENT_LINE + "\n", "INCIDENT_LINE (the 2026-10-11 producer-prompt incident)")
     return [{"id": k, "lint": "playback", "source": source, **v} for k, v in rows.items()]
+
+
+def excluded_playback_rows(pb) -> list[dict]:
+    """The rows of the head's tuples that PARITY_EXCLUDED_DIFFERENTIAL_TUPLES leaves out of the derived corpus (r16c), deduplicated by (name, text)."""
+    return _playback_rows_from(pb, "excluded", "head", "only")
 
 
 def derived_playback_rows(root: Path, base_ref: str | None = None) -> tuple[list[dict], object]:
@@ -615,7 +649,7 @@ def derived_playback_rows(root: Path, base_ref: str | None = None) -> tuple[list
     (the id carries a hash of the text, so a reworded sentence is a different row).  Also returns the HEAD's module, whose
     `_write_probe` / `_psq` / `PWSH` helpers drive the probe.  A baseline module that cannot be shown or executed raises ParityError."""
     pb = load_module(root / PLAYBACK_TEST_REL, "parity_head_playback_tests")
-    rows = _playback_rows_from(pb, "derived", "head")
+    rows = _playback_rows_from(pb, "derived", "head", "skip")
     if base_ref:
         base_pb = load_source_as(git(root, "show", f"{base_ref}:{PLAYBACK_TEST_REL}"), "parity_base_playback_tests", root / PLAYBACK_TEST_REL)
         have = {r["id"] for r in rows}

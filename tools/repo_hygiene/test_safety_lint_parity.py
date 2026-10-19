@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -58,6 +59,10 @@ MIN_DERIVED_HOOK_ROWS = 200  # DENY rows of test_mlv_never_authorized.CASES (203
 # the same commit; DELETING one fails this test. The floors above stay as the coarse lower bound.
 EXACT_DERIVED_HOOK_ROWS = 203      # DENY rows of test_mlv_never_authorized.CASES
 EXACT_DERIVED_PLAYBACK_ROWS = 211  # must-refuse sentences of test_hub_vm_no_local_playback.py, deduplicated by (name, text)
+# r16c (hub ruling #2): rows of #465's 24 RULE4_* seed tuples, left out of the derived corpus above by the explicit list
+# slp.PARITY_EXCLUDED_DIFFERENTIAL_TUPLES (parity cost: 12,018 rows did not finish in 1,198 s). Pinned so deleting one, or adding an unlisted
+# row to a listed tuple, is visible; 6,000 of them are seeded fuzz (RULE4_R9_FUZZ_REFUSE 3,600 + RULE4_R10_FUZZ_REFUSE 2,400).
+EXACT_EXCLUDED_DIFFERENTIAL_ROWS = 11807
 
 
 def _write(path: Path, text: str) -> Path:
@@ -280,11 +285,15 @@ def derived_pin_failures(root: Path) -> list[str]:
     the two deny suites, with one row deleted, can be judged by the very check the test runs (see the r4 RED proof in the PR body)."""
     failures = []
     hook = len(slp.derived_hook_cases(root))
-    playback = len(slp.derived_playback_rows(root)[0])
+    playback_rows, pb = slp.derived_playback_rows(root)
+    playback = len(playback_rows)
+    excluded = len(slp.excluded_playback_rows(pb))
     if hook != EXACT_DERIVED_HOOK_ROWS:
         failures.append(f"derived hook DENY rows: {hook} != pinned {EXACT_DERIVED_HOOK_ROWS}")
     if playback != EXACT_DERIVED_PLAYBACK_ROWS:
         failures.append(f"derived playback must-refuse rows: {playback} != pinned {EXACT_DERIVED_PLAYBACK_ROWS}")
+    if excluded != EXACT_EXCLUDED_DIFFERENTIAL_ROWS:
+        failures.append(f"excluded differential playback rows: {excluded} != pinned {EXACT_EXCLUDED_DIFFERENTIAL_ROWS}")
     return failures
 
 
@@ -323,6 +332,52 @@ class DerivedCorpusExactPinTests(unittest.TestCase):
             failures = derived_pin_failures(REPO_ROOT)
         self.assertEqual(len(failures), 1, failures)
         self.assertIn("derived playback must-refuse rows", failures[0])
+
+
+class ExplicitDifferentialExclusionTests(unittest.TestCase):
+    """r16c (hub ruling #2): #465's RULE4_* seed tuples are left out of the derived corpus by an exact-name list, not a prefix or a regex."""
+
+    def _head_module(self):
+        return slp.derived_playback_rows(REPO_ROOT)[1]
+
+    def test_every_excluded_name_is_a_tuple_of_strings_in_the_head_playback_suite(self):
+        pb = self._head_module()
+        stale = sorted(n for n in slp.PARITY_EXCLUDED_DIFFERENTIAL_TUPLES
+                       if not (isinstance(getattr(pb, n, None), tuple) and getattr(pb, n) and all(isinstance(t, str) for t in getattr(pb, n))))
+        self.assertEqual(stale, [], "a stale entry excludes nothing and would hide a rename; drop or fix it")
+
+    def test_the_excluded_rows_match_the_pin_and_the_derived_ids_do_not_overlap(self):
+        pb = self._head_module()
+        excluded = slp.excluded_playback_rows(pb)
+        self.assertEqual(len(excluded), EXACT_EXCLUDED_DIFFERENTIAL_ROWS, "raise or lower the pin in the same commit that adds or deletes an excluded row")
+        derived_ids = {r["id"] for r in slp.derived_playback_rows(REPO_ROOT)[0]}
+        self.assertEqual(derived_ids & {r["id"] for r in excluded}, set())
+        self.assertTrue(all(r["id"].split(":")[1] in slp.PARITY_EXCLUDED_DIFFERENTIAL_TUPLES for r in excluded))
+
+    def test_the_exclusion_is_an_exact_name_list(self):
+        self.assertTrue(all(re.fullmatch(r"[A-Z0-9_]+", n) for n in slp.PARITY_EXCLUDED_DIFFERENTIAL_TUPLES))
+        self.assertIsInstance(slp.PARITY_EXCLUDED_DIFFERENTIAL_TUPLES, frozenset)
+
+    def test_a_non_rule4_refuse_tuple_and_an_unlisted_rule4_tuple_are_still_derived(self):
+        fake = types.ModuleType("fake_playback_tests")
+        fake.PromptLintTests = type("PromptLintTests", (), {})
+        fake.INCIDENT_LINE = "incident"
+        fake.OTHER_CARD_REFUSE = ("other card sentence one", "other card sentence two")
+        fake.RULE4_UNLISTED_NEW_REFUSE = ("unlisted rule4 sentence",)
+        fake.RULE4_R9_FUZZ_REFUSE = ("listed fuzz sentence",)
+        derived = {r["id"].split(":")[1] for r in slp._playback_rows_from(fake, "derived", "head", "skip")}
+        self.assertIn("OTHER_CARD_REFUSE", derived)
+        self.assertIn("RULE4_UNLISTED_NEW_REFUSE", derived, "a new RULE4_* tuple must be counted until someone lists it")
+        self.assertNotIn("RULE4_R9_FUZZ_REFUSE", derived)
+        self.assertEqual({r["id"].split(":")[1] for r in slp.excluded_playback_rows(fake)}, {"RULE4_R9_FUZZ_REFUSE"})
+
+    def test_the_baseline_copy_is_never_excluded(self):
+        fake = types.ModuleType("fake_baseline_playback_tests")
+        fake.PromptLintTests = type("PromptLintTests", (), {})
+        fake.INCIDENT_LINE = "incident"
+        fake.RULE4_R9_FUZZ_REFUSE = ("baseline copy of a listed name",)
+        names = {r["id"].split(":")[1] for r in slp._playback_rows_from(fake, "derived-base", "baseline")}
+        self.assertIn("RULE4_R9_FUZZ_REFUSE", names, "master-side rows stay in the baseline union")
 
 
 BROKEN_BASELINES = {
