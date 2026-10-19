@@ -21,8 +21,8 @@ the hub tick or `merge-enqueue.ps1` yet.
 
 ## hub-profile.v1
 
-Every key is required and non-empty. A bad profile is `hub-profile-unreadable` (file absent or not
-a JSON object) or `hub-profile-missing-key: <key>`; the scanner turns either into
+Every key is required and non-empty. A bad profile is `hub-profile-unreadable` (file absent, not valid
+JSON, or a root that is not exactly one JSON object: a scalar or an array of any length, even `[ {profile} ]`) or `hub-profile-missing-key: <key>`; the scanner turns either into
 `UNKNOWN pr=- reason=...` and exit 20.
 
 | Key | Meaning |
