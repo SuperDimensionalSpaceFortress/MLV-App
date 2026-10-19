@@ -456,6 +456,27 @@ append-only (created with `CreateNew`; a repeat is refused, never overwritten). 
 the receipt -- the contact sheet, and, on a failed smoke run, `smoke-stderr.txt` / `smoke-stdout.txt`) is under `.claude-state\dual-venue\evidence\<receiptId>\`, which in production must sit under
 `.claude-state` too (the run log and result name an owner clip's run; they stay local like the receipt).
 
+### Staging a commit on a venue (tracked: `Invoke-VenueStageNightly.ps1`)
+
+`tools\profiling\dual-venue\Invoke-VenueStageNightly.ps1` is the tracked staging path (UM-REGULAR-BASELINE-STAGE-1). It runs the four steps
+above in order: the DLL pair on Ultra-Magnus (harvested when its single-use JobId already built the sha), the assemble on the board host under
+build-guard, the stage job, and the smoke-runner stage job. It stages at most one commit per night (default: the local `fork/master` ref, no fetch)
+and is ready for one scheduled call (UM-REGULAR-BASELINE-SCHEDULE-1: fetch fork, this driver, then `Invoke-VenueBaseline.ps1` on exit 0).
+
+```powershell
+pwsh -NoProfile -File tools\profiling\dual-venue\Invoke-VenueStageNightly.ps1 [-Venue ultra-magnus] [-SourceCommit <40-hex>] [-WhatIf]
+```
+
+- The cache is the truth, read by name. A sha whose `<agentShare>\cache\playback-attr-3-cuda-<sha12>-build.json`, three artifacts and smoke-runner
+  dir are already there is `STAGE_SKIP_ALREADY` and is never re-assembled. A re-assemble makes a new manifest (`assembledAtUtc`), so a spent default
+  stage JobId whose cache does not hold the assembled manifest is re-staged under `-JobIdSuffix n<yyyyMMddHHmm>` (#508). Every `STAGE_OK` is
+  re-hashed by name, and a mismatch is `STAGE_VERIFY_MISMATCH`.
+- The receipt row (`<main checkout>\.claude-state\dual-venue\stage-nightly.jsonl`, schema `mlv-app/venue-stage-nightly/v1`) records
+  `buildManifestSha256` as that by-name hash. It is the exact file `Invoke-VenueBaseline.ps1` and `Invoke-VenueLeg.ps1` hash.
+- It refuses over a live venue claim or ticket (`AGENT_BUSY`). It honours the shared board disk floor and commit ceiling
+  (`.claude-state\hub-autopilot\disk-floor.ps1`, `host-commit-gate.ps1`): exit 3 with the gate's own text, and a missing gate is
+  `GATE_UNAVAILABLE`. It bounds every child by `-MaxTotalSec`. The typed exit table is in the script header.
+
 ## How to read the evidence
 
 * **Acceptance** reads only receipts whose `venue.role` is `acceptance` for the card, and only `PASS`/`FAIL`.
