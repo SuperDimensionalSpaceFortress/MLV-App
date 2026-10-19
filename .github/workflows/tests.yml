@@ -218,6 +218,10 @@ jobs:
             tests\coordination `
             tests\docs `
             --ignore=tests\coordination\test_lane_containment.py `
+            --ignore=tests\coordination\test_doctrine_outbox.py `
+            --ignore=tests\coordination\test_doctrine_outbox_concerns.py `
+            --ignore=tests\coordination\test_doctrine_outbox_hooks.py `
+            --ignore=tests\coordination\test_retire_lane_worktree.py `
             -q
 
       - name: Run demote-factory-bridge refusal-path tests
@@ -268,6 +272,47 @@ jobs:
         shell: pwsh
         run: python -m pytest tests\coordination\test_lane_containment.py -q
 
+  repo-hygiene-python-windows-coordination-heavy:
+    # Hosted per-file times from run 39097564082 (head 8b504fdd, shard 8 guardrails step 31.0 min,
+    # 1173 tests): test_doctrine_outbox.py about 347 s, test_retire_lane_worktree.py about 285 s,
+    # test_doctrine_outbox_concerns.py about 126 s and test_doctrine_outbox_hooks.py about 105 s,
+    # about 14.4 min of the 31.0. They run here, in parallel with the shard matrix, and shard 8
+    # ignores exactly these four files, so each is collected in exactly one job. The aggregate
+    # `Repo Hygiene Python (windows-latest)` below requires this job, so a failed, cancelled or
+    # skipped run still fails the required check.
+    name: Repo Hygiene Python windows coordination heavy
+    runs-on: windows-latest
+    # About 16-20 min expected (14.4 min of tests plus setup); 45 leaves more than 2x for runner
+    # variance, the same margin as the lane containment job.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version-file: ".python-version"
+
+      - name: Install repo hygiene test dependencies
+        shell: pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$ErrorActionPreference = 'Stop'; $PSNativeCommandUseErrorActionPreference = $true; . '{0}'"
+        run: |
+          python -m pip install --disable-pip-version-check --no-input --only-binary=:all: --require-hashes -r .github/requirements/pip.txt
+          python -m pip install --disable-pip-version-check --no-input --only-binary=:all: --require-hashes -r .github/requirements/repo-hygiene.txt
+          python -m pip check
+
+      - name: Run heavy coordination tests
+        shell: pwsh
+        run: |
+          python -m pytest `
+            tests\coordination\test_doctrine_outbox.py `
+            tests\coordination\test_doctrine_outbox_concerns.py `
+            tests\coordination\test_doctrine_outbox_hooks.py `
+            tests\coordination\test_retire_lane_worktree.py `
+            -q
+
   repo-hygiene-python-windows:
     # Keeps the required status-check name `Repo Hygiene Python (windows-latest)` that
     # branch protection pins. It succeeds only when every Windows shard job succeeded: a
@@ -275,7 +320,7 @@ jobs:
     # (not `!cancelled()`) keeps it running when the whole run is cancelled, so a cancel
     # leaves the required check failed rather than condition-skipped, which GitHub accepts.
     name: Repo Hygiene Python (windows-latest)
-    needs: [repo-hygiene-python-windows-shard, repo-hygiene-python-windows-containment]
+    needs: [repo-hygiene-python-windows-shard, repo-hygiene-python-windows-containment, repo-hygiene-python-windows-coordination-heavy]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -293,6 +338,13 @@ jobs:
         run: |
           echo "windows lane containment result: $CONTAINMENT_RESULT"
           test "$CONTAINMENT_RESULT" = "success"
+
+      - name: Require the heavy coordination job to have passed
+        env:
+          HEAVY_RESULT: ${{ needs.repo-hygiene-python-windows-coordination-heavy.result }}
+        run: |
+          echo "windows coordination heavy result: $HEAVY_RESULT"
+          test "$HEAVY_RESULT" = "success"
 
   windows-product-oracles-part:
     name: Windows Product Oracles part ${{ matrix.part }}/3
