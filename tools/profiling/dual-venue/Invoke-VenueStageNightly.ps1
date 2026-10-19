@@ -247,6 +247,8 @@ $cacheBuildJson = Join-Path $cache $names.buildManifestName
 $buildDir = Join-Path $BuildRoot "build-$s12"
 $dllId = "playback-attr-3-cuda-dllpair-$s12"
 $stageDefaultId = "playback-attr-3-cuda-stage-$s12"
+# The ONLY leaf names this driver ever hands um-run as side files: this sha's build package (the DLL-pair source zip and the four artifacts the stage job verifies).
+$PackageSideNames = @("$dllId-source.zip", $names.packageZipName, $names.exeName, $names.reconName, $names.buildManifestName)
 
 if ($WhatIf) {
     Out-Line "STAGE_NIGHTLY_PLAN venue=$Venue sourceCommit=$commit nightKey=$nightKey agentShare=$share agentRoot=$agentRoot buildRoot=$BuildRoot receiptFile=$ReceiptFile maxTotalSec=$MaxTotalSec (plan only: nothing is built, submitted, probed or written)"
@@ -343,10 +345,22 @@ function Assert-Floors([string]$When) {
 Assert-Floors 'before the build'
 
 # ------------------------------------------------------------------ um-run, classified ------------------------------------------------------------------------------------
+function Assert-StagePackageSideFile([string[]]$Side, [string]$JobId, [string]$FailToken) {
+    # The owner-footage gate (test_dual_venue_owner_footage_gate.py): a side file is copied through the venue share, so this driver hands um-run ONLY this sha's
+    # build package from under -BuildRoot. Any other leaf name, or a package name outside -BuildRoot, is refused before um-run is called. This driver takes no clip.
+    foreach ($s in @($Side)) {
+        $full = [IO.Path]::GetFullPath([string]$s)
+        if ([IO.Path]::GetFileName($full) -cnotin $PackageSideNames -or -not $full.StartsWith($buildRootFull + '\', [StringComparison]::OrdinalIgnoreCase)) {
+            Stop-Nightly $FailToken "refused to hand um-run the side file '$s' for $JobId : only this sha's build package under $BuildRoot travels as a side file; nothing was submitted"
+        }
+    }
+}
+
 function Invoke-UmRun([string]$Step, [string]$JobFile, [string[]]$Side, [string]$JobId, [string]$Share, [int]$JobTimeoutSec, [string]$FailToken) {
     # Returns 'OK' (um-run returned; the caller reads the outbox result BY NAME) or 'IN_USE' (the outbox already holds this JobId). Every other end is a typed exit:
     # UNRESOLVED (or killed at the cap) -> STAGE_UNRESOLVED, never retried here; RETRACTED (never claimed) -> AGENT_BUSY; no heartbeat -> SHARE_UNREACHABLE.
     Assert-VenueFree "before the $Step submission"
+    Assert-StagePackageSideFile -Side $Side -JobId $JobId -FailToken $FailToken
     $remain = Get-RemainingSec
     if ($remain -lt 30) { Stop-Nightly 'STAGE_CAP_EXCEEDED' "only $remain s of the $MaxTotalSec s cap left before the $Step submission; nothing was submitted" }
     # um-run.ps1 reports every non-receipt end by THROWING; pwsh's own error view wraps and decorates that text, so the child catches it and prints the message

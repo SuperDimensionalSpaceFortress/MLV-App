@@ -112,7 +112,7 @@ exit 0
 """
 
 # um-run.ps1 stand-in: the agent is simulated in-process. A JobId whose outbox result exists is refused exactly as UmRunDrop refuses it (UMRUN_JOBID_IN_USE).
-# FAKE_UMRUN_<DLLPAIR|STAGE|SMOKE>: ok (default) | unresolved | retracted | fail | wrongcache (stage only: STAGE_OK, but the cache keeps other bytes).
+# FAKE_UMRUN_<DLLPAIR|STAGE|SMOKE>: ok (default) | unresolved | retracted | fail | wrongcache (stage only: STAGE_OK, but the cache keeps other bytes) | inuse | inuse-all.
 FAKE_UMRUN = r"""
 [CmdletBinding()] param([string]$ScriptPath, [string[]]$SideFile = @(), [string]$JobId = '', [string]$AgentShare = '', [int]$TimeoutSec = 0,
     [int]$MaxQueueWaitSec = 0, [int]$MaxClaimedWaitSec = 0, [int]$MaxAdmissionWaitSec = 0)
@@ -124,6 +124,8 @@ $res = Join-Path $outbox "$JobId.result.json"
 if (Test-Path -LiteralPath $res) { throw "UMRUN_JOBID_IN_USE outbox already holds $JobId.result.json" }
 $kind = $(if ($JobId -like 'playback-attr-3-cuda-dllpair-*') { 'DLLPAIR' } elseif ($JobId -like 'playback-attr-3-cuda-stage-*') { 'STAGE' } else { 'SMOKE' })
 $mode = [Environment]::GetEnvironmentVariable("FAKE_UMRUN_$kind"); if (-not $mode) { $mode = 'ok' }
+# inuse: the unsuffixed JobId turns out spent at submission (a racing submitter won it); inuse-all: every JobId does
+if ($mode -eq 'inuse-all' -or ($mode -eq 'inuse' -and $JobId -notmatch '-n\d{12}$')) { throw "UMRUN_JOBID_IN_USE outbox already holds $JobId.result.json" }
 $sha = $env:FAKE_SHA
 if ($mode -eq 'unresolved') { throw "UNRESOLVED: $JobId was claimed by the agent, but it stopped proving liveness (fixture) -- this client is stopping, not failing" }
 if ($mode -eq 'retracted') { throw "RETRACTED: $JobId reached its queue wait ceiling (fixture); not a failure, retry with a new -JobId if desired" }
@@ -217,8 +219,8 @@ class VenueStageNightlyTests(unittest.TestCase):
         self.calls_log = self.case / "calls.log"
 
     # ---------------------------------------------------------------- harness
-    def args(self, *extra: str, share: Path | None = None, commit: str | None = SHA, now: str | None = NOW) -> list[str]:
-        a = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(DRIVER), "-ReceiptFile", str(self.receipt), "-BuildRoot", str(self.build_root),
+    def args(self, *extra: str, share: Path | None = None, commit: str | None = SHA, now: str | None = NOW, driver: Path | None = None) -> list[str]:
+        a = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(driver or DRIVER), "-ReceiptFile", str(self.receipt), "-BuildRoot", str(self.build_root),
              "-AgentShare", str(share or self.share), "-ClaimDir", str(self.claims), "-GateDir", str(self.gates),
              "-UmRunScript", str(self.stubs / "um-run.ps1"), "-DllJobScript", str(self.stubs / "dll-gen.ps1"), "-AssembleScript", str(self.stubs / "assemble.ps1"),
              "-StageJobScript", str(self.stubs / "stage-gen.ps1"), "-SmokeRunnerJobScript", str(self.stubs / "smoke-gen.ps1"), "-ProbeTimeoutSec", "20"]
@@ -240,6 +242,17 @@ class VenueStageNightlyTests(unittest.TestCase):
 
     def submissions(self) -> list[str]:
         return self.calls("UMRUN")
+
+    def submitted_jobs(self) -> list[str]:
+        return [re.search(r"job=(\S+)", c).group(1) for c in self.submissions()]
+
+    def submitted_sides(self) -> dict[str, list[str]]:
+        return {re.search(r"job=(\S+)", c).group(1): [s for s in re.search(r" side=(.*?) timeout=", c).group(1).split(";") if s] for c in self.submissions()}
+
+    def assert_no_jobid_twice(self) -> None:
+        # SameJobIdRulingPremiseTests (test_attr3_footage_stage.py) trusts this driver as a um-run caller because it never submits one JobId twice in a call.
+        jobs = self.submitted_jobs()
+        self.assertEqual(len(jobs), len(set(jobs)), jobs)
 
     def rows(self) -> list[dict]:
         return [json.loads(l) for l in self.receipt.read_text(encoding="utf-8").splitlines() if l.strip()] if self.receipt.exists() else []
@@ -365,6 +378,64 @@ class VenueStageNightlyTests(unittest.TestCase):
         self.assertEqual(len(self.calls("COMMITGATE")), 1)
         log = self.calls()
         self.assertLess(log.index(self.calls("COMMITGATE")[0]), log.index(self.calls("ASSEMBLE")[0]))
+        self.assert_no_jobid_twice()
+
+    # ---------------------------------------------------------------- the owner-footage gate: side files are the build package, never anything else
+    def test_side_files_are_only_this_shas_build_package_under_the_build_root(self) -> None:
+        p = self.run_driver()
+        self.assert_exit(p, "STAGE_OK")
+        sides = self.submitted_sides()
+        dll_id = f"playback-attr-3-cuda-dllpair-{S12}"
+        self.assertEqual([Path(s).name for s in sides[dll_id]], [f"{dll_id}-source.zip"])
+        stage = sides[f"playback-attr-3-cuda-stage-{S12}"]
+        self.assertEqual(sorted(Path(s).name for s in stage), sorted(names().values()))
+        for s in stage:
+            self.assertEqual(Path(s).parent, self.build_root / f"build-{S12}", s)
+        self.assertEqual(sides[f"attr3-stage-smoke-runner-{S12}-bbbbbbbbbbbb"], [])
+        for s in sides[dll_id] + stage:
+            self.assertTrue(Path(s).resolve().is_relative_to(self.build_root.resolve()), s)
+
+    SIDES_LINE = "$sides = @($names.packageZipName, $names.exeName, $names.reconName, $names.buildManifestName | ForEach-Object { Join-Path $buildDir $_ })"
+
+    def assert_widened_side_files_are_refused(self, widened: str) -> None:
+        # The driver's own refusal, exercised on a copy whose side-file list was widened (the copy loads the real modules from the real dual-venue dir).
+        text = DRIVER.read_text(encoding="utf-8")
+        here = "$here = $PSScriptRoot"
+        self.assertEqual((text.count(here), text.count(self.SIDES_LINE)), (1, 1))
+        mutated = self.case / "mutated-driver" / "Invoke-VenueStageNightly.ps1"
+        mutated.parent.mkdir()
+        mutated.write_text(text.replace(here, f"$here = '{DV}'").replace(self.SIDES_LINE, widened), encoding="utf-8")
+        self.built_dll_pair()
+        p = self.run_driver(driver=mutated)
+        self.assert_exit(p, "STAGE_FAILED")
+        self.assertIn("refused to hand um-run the side file", p.stdout)
+        self.assertEqual(self.submissions(), [])
+
+    def test_a_side_file_with_a_name_outside_the_build_package_is_refused_before_um_run(self) -> None:
+        self.assert_widened_side_files_are_refused(self.SIDES_LINE + "; $sides += (Join-Path $buildDir 'not-the-build-package.txt')")
+
+    def test_a_build_package_name_outside_the_build_root_is_refused_before_um_run(self) -> None:
+        self.assert_widened_side_files_are_refused(self.SIDES_LINE.replace("Join-Path $buildDir $_", f"Join-Path '{self.case / 'elsewhere'}' $_"))
+
+    # ---------------------------------------------------------------- the same-JobId premise: never one JobId twice in a call
+    def test_a_stage_jobid_in_use_at_submission_is_restaged_once_under_a_new_id(self) -> None:
+        self.built_dll_pair()
+        p = self.run_driver(env={"FAKE_UMRUN_STAGE": "inuse"})
+        self.assert_exit(p, "STAGE_OK")
+        stage_jobs = [j for j in self.submitted_jobs() if j.startswith("playback-attr-3-cuda-stage-")]
+        self.assertEqual(len(stage_jobs), 2, stage_jobs)
+        self.assertEqual(stage_jobs[0], f"playback-attr-3-cuda-stage-{S12}")
+        self.assertRegex(stage_jobs[1], rf"^playback-attr-3-cuda-stage-{S12}-n\d{{12}}$")
+        self.assert_no_jobid_twice()
+
+    def test_a_second_in_use_refusal_is_stage_failed_with_no_third_submission(self) -> None:
+        self.built_dll_pair()
+        p = self.run_driver(env={"FAKE_UMRUN_STAGE": "inuse-all"})
+        self.assert_exit(p, "STAGE_FAILED")
+        stage_jobs = [j for j in self.submitted_jobs() if j.startswith("playback-attr-3-cuda-stage-")]
+        self.assertEqual(len(stage_jobs), 2, stage_jobs)
+        self.assert_no_jobid_twice()
+        self.assertFalse(any("smoke-runner" in j for j in self.submitted_jobs()))
 
     def test_a_dll_pair_already_built_is_harvested_not_resubmitted(self) -> None:
         art = self.built_dll_pair()
