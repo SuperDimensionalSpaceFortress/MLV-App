@@ -134,6 +134,97 @@ class CheckedInManifestTests(unittest.TestCase):
                     self.assertTrue(pin.startswith(rt.split("-", 1)[1] + "."), f"{r['id']}: {rt} vs .python-version {pin}")
 
 
+CITED_MODULE = (
+    "function Invoke-DvOther {\n"
+    "    $exe = 'C:\\Program Files\\PowerShell\\7\\pwsh.exe'\n"
+    "}\n"
+    "\n"
+    "function Invoke-DvLeg {\n"
+    "    param($Path)\n"
+    "    $exe = 'C:\\Program Files\\PowerShell\\7\\pwsh.exe'\n"
+    "    $unique = 'only-here'\n"
+    "}\n"
+    "\n"
+    "function Invoke-DvTail {\n"
+    "    $tail = 1\n"
+    "}\n"
+)
+
+
+class AnchorCitationTests(unittest.TestCase):
+    """A floor is cited by a unique text anchor, so an edit above it never turns the checked manifest red."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="rfs-anchor-"))
+        self.addCleanup(shutil.rmtree, str(self.root), True)
+        self.module = self.root / "mod.psm1"
+        self.module.write_text(CITED_MODULE, encoding="utf-8", newline="\n")
+
+    def problems(self, **item):
+        evidence = {"file": "mod.psm1", "line": 1, **item}
+        data = manifest_of(row("a", ["mod.psm1"], ["pwsh"], [{"kind": "ps-parse"}], evidence=[evidence]))
+        self.assertEqual([], rfs.validate_manifest(data))
+        return rfs.check_evidence(data, self.root)
+
+    def test_an_edit_above_the_cited_text_keeps_the_citation_clean(self):
+        cited = {"line": 8, "contains": "'only-here'"}
+        scoped = {"line": 7, "contains": "pwsh.exe", "within": "function Invoke-DvLeg"}
+        self.assertEqual([], self.problems(**cited))
+        self.assertEqual([], self.problems(**scoped))
+        self.module.write_text("# new header\n" * 40 + CITED_MODULE, encoding="utf-8", newline="\n")
+        self.assertEqual([], self.problems(**cited))
+        self.assertEqual([], self.problems(**scoped))
+
+    def test_a_stale_line_hint_is_never_a_problem(self):
+        self.assertEqual([], self.problems(line=9999, contains="'only-here'"))
+
+    def test_the_resolved_line_is_reported(self):
+        lines = CITED_MODULE.splitlines()
+        item = {"contains": "pwsh.exe", "within": "function Invoke-DvLeg"}
+        self.assertEqual((7, None), rfs.resolve_evidence(item, lines))
+
+    def test_a_contains_that_matches_twice_in_its_scope_is_a_problem(self):
+        found = self.problems(contains="pwsh.exe")
+        self.assertEqual(1, len(found), found)
+        self.assertIn("mod.psm1", found[0])
+        self.assertIn("matches 2 lines", found[0])
+
+    def test_within_scopes_a_repeated_literal_down_to_one_match(self):
+        self.assertEqual([], self.problems(contains="pwsh.exe", within="function Invoke-DvOther"))
+
+    def test_a_contains_that_matches_nowhere_is_a_problem(self):
+        found = self.problems(contains="no-such-text")
+        self.assertEqual(1, len(found), found)
+        self.assertIn("matches 0 lines", found[0])
+
+    def test_a_contains_outside_its_within_block_is_a_problem(self):
+        found = self.problems(contains="$tail", within="function Invoke-DvLeg")
+        self.assertEqual(1, len(found), found)
+        self.assertIn("matches 0 lines", found[0])
+
+    def test_a_missing_within_anchor_is_a_problem(self):
+        found = self.problems(contains="pwsh.exe", within="function Invoke-Gone")
+        self.assertEqual(1, len(found), found)
+        self.assertIn("mod.psm1", found[0])
+        self.assertIn("'function Invoke-Gone'", found[0])
+        self.assertIn("matches 0 lines", found[0])
+
+    def test_an_ambiguous_within_anchor_is_a_problem(self):
+        found = self.problems(contains="$tail", within="function Invoke-Dv")
+        self.assertEqual(1, len(found), found)
+        self.assertIn("matches 3 lines", found[0])
+
+    def test_validate_manifest_accepts_the_old_shape_and_the_anchor_shape(self):
+        old = {"file": "x", "line": 1, "contains": "x"}
+        for evidence in (old, {**old, "within": "y"}, {"file": "x", "contains": "x"}):
+            data = manifest_of(row("a", ["x"], ["pwsh"], [{"kind": "ps-parse"}], evidence=[evidence]))
+            self.assertEqual([], rfs.validate_manifest(data), evidence)
+        for evidence in ({**old, "within": ""}, {**old, "within": 3}, {**old, "line": "1"}, {**old, "line": True},
+                         {"file": "x", "line": 1}):
+            data = manifest_of(row("a", ["x"], ["pwsh"], [{"kind": "ps-parse"}], evidence=[evidence]))
+            self.assertTrue(rfs.validate_manifest(data), evidence)
+
+
 class ValidateManifestTests(unittest.TestCase):
     def test_rejects_each_malformed_shape(self):
         good = row("a", ["x/*.ps1"], ["pwsh"], [{"kind": "ps-parse"}])
