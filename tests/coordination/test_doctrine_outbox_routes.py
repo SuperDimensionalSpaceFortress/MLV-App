@@ -592,12 +592,42 @@ def test_b_a_relative_path_entry_never_finds_git(tmp_path, launches, monkeypatch
     assert not ob.route_inside(ob.route_real_path(launches[0]["argv"][0]), ob.route_real_path(str(clone)))
 
 
+def test_b_git_resolution_never_consults_the_current_directory(tmp_path, launches, monkeypatch):
+    """shutil.which looks in the current directory before PATH on win32. Resolution must not: git.exe, git.cmd, git.bat and a bare
+    `git` planted in the clone (the cwd while resolving) are never found, so the answer is the system git, or a refusal when
+    the system has none."""
+    monkeypatch.delenv("NoDefaultCurrentDirectoryInExePath", raising=False)   # a host that sets it would hide the bug; resolution must not depend on it
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    system = shutil.which("git")                                          # the system git, looked up from an empty cwd
+    clone = make_clone(tmp_path)
+    for name in ("git.exe", "git.cmd", "git.bat", "git"):
+        planted = clone / name
+        planted.write_text("", encoding="utf-8")
+        planted.chmod(0o755)
+    monkeypatch.chdir(clone)
+    found, refused = ob.route_git_binary(clone)
+    if system is None:
+        assert found is None and refused is not None and refused[0] in ("ROUTE_MISSING", "ROUTE_UNSAFE"), (found, refused)
+    else:
+        assert refused is None and found is not None, (found, refused)
+        assert not ob.route_inside(ob.route_real_path(found), ob.route_real_path(str(clone)))
+        assert ob.route_real_path(found) == ob.route_real_path(system)
+    status, detail = ob.exercise_route("git log", clone, 30, {})
+    if system is None:
+        assert status in ("ROUTE_MISSING", "ROUTE_UNSAFE") and launches == [], (status, detail)
+    else:
+        assert status == "ROUTE_OK" and len(launches) == 1, (status, detail)
+        assert not ob.route_inside(ob.route_real_path(launches[0]["argv"][0]), ob.route_real_path(str(clone)))
+
+
 def test_b_a_git_that_resolves_to_another_program_is_refused(tmp_path, launches, monkeypatch):
     clone = make_clone(tmp_path)
     other = tmp_path / "elsewhere" / ("python.exe" if os.name == "nt" else "python")
     other.parent.mkdir()
     other.write_text("", encoding="utf-8")
-    monkeypatch.setattr(ob.shutil, "which", lambda *a, **k: str(other))     # a `git` on PATH that really is python
+    monkeypatch.setattr(ob, "route_find_git", lambda entries: str(other))   # a `git` on PATH that really is python
     status, detail = ob.exercise_route("git log", clone, 30, {})
     assert status == "ROUTE_UNSAFE" and "not a git binary" in detail and launches == []
 

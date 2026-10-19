@@ -110,7 +110,9 @@ has its script checked. A miss is `ROUTE_MISSING` with a typed reason first in i
 **Only a route whose program is on the execution allowlist is run, and the allowlist is `git`.** It is decided on the
 program as the route spells it, a bare name (`git`, `git.exe`; never a path, so `tools/git` and `/usr/bin/git` are not on
 it), and on its resolved executable: the first `git` on a `PATH` stripped of every relative entry and every entry inside the
-scratch clone, whose real path is not inside the clone and is itself called `git`. A `git` that resolves only inside the
+scratch clone, whose real path is not inside the clone and is itself called `git`. Those entries are walked by hand and the
+current directory is never consulted (on Windows `shutil.which` searches it before `PATH`, so it would find a `git.exe` planted
+in the clone). A `git` that resolves only inside the
 clone, or to some other program, is `ROUTE_UNSAFE`; a `.cmd`/`.bat` shim is `ROUTE_MISSING PROGRAM_IS_SHIM`. Every other program is
 **existence-checked but not executed**: it prints `ROUTE_NOT_EXECUTED`, which is a skip and not a failure (so a card's
 `py -3 tools/x.py` still validates), and it is never launched, whatever its arguments. That includes every shell,

@@ -2551,22 +2551,44 @@ def route_runs(argv: list[str]) -> bool:
     return name in ROUTE_EXEC_ALLOW or (name.endswith(".exe") and name[:-4] in ROUTE_EXEC_ALLOW)
 
 
+def route_git_candidates(entry: str) -> list[str]:
+    """The files a `git` lookup tries in one directory: `git` itself, or on Windows `git` plus each PATHEXT extension in order."""
+    if os.name != "nt":
+        return [os.path.join(entry, "git")]
+    exts = [e for e in os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(os.pathsep) if e]
+    return [os.path.join(entry, "git" + e) for e in exts]
+
+
+def route_find_git(entries: Iterable[str]) -> str | None:
+    """The first existing, executable regular file named git in the ABSOLUTE directories `entries`, in order; None when there is
+    none. Walked by hand because shutil.which puts the current directory in front of any `path=` on Windows (unless
+    NoDefaultCurrentDirectoryInExePath is set), so it would find a git planted in the clone it runs from."""
+    for entry in entries:
+        for candidate in route_git_candidates(entry):
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                return candidate
+    return None
+
+
 def route_git_binary(cwd: str | os.PathLike) -> tuple[str | None, tuple[str, str] | None]:
     """The git executable a route may run, as (path, None), else (None, (ROUTE_* status, detail)). The first `git` on a PATH
     stripped of every relative entry (`.`, empty) and every entry inside the scratch clone `cwd`, so a git planted in the clone
-    (a copy, a hardlink, a link, a renamed program) is never found; its REAL path must not lie inside the clone and must itself
-    be called git, and it must not be a `.cmd`/`.bat` shim."""
+    (a copy, a hardlink, a link, a renamed program) is never found. Resolution never consults the current directory (the
+    implicit search shutil.which makes on Windows): only the absolute PATH entries are walked (route_find_git). The REAL path
+    of what is found must not lie inside the clone and must itself be called git, and it must not be a `.cmd`/`.bat` shim."""
     scratch = route_real_path(str(cwd))
-    kept = []
+    absolute, kept = [], []
     for entry in os.environ.get("PATH", "").split(os.pathsep):
         try:
-            if entry and os.path.isabs(entry) and not route_inside(route_real_path(entry), scratch):
-                kept.append(entry)
+            if entry and os.path.isabs(entry):
+                absolute.append(entry)
+                if not route_inside(route_real_path(entry), scratch):
+                    kept.append(entry)
         except (OSError, ValueError):
             continue
-    found = shutil.which("git", path=os.pathsep.join(kept))
+    found = route_find_git(kept)
     if found is None:
-        if shutil.which("git", path=os.environ.get("PATH")) is not None:
+        if route_find_git(absolute) is not None:
             return None, ("ROUTE_UNSAFE", "git resolves only inside the scratch clone; a git the bus carries is never run")
         return None, ("ROUTE_MISSING", "PROGRAM_NOT_FOUND: git: no such program on PATH")
     real = route_real_path(found)
