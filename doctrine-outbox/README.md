@@ -75,6 +75,61 @@ pattern, a user-home path, this host's name or account name, or anything in an o
 adds its own deny terms: `.claude-state`, `subject-ledger`, `fleet-runs`, `HUB_RUN_WAL`, `dual-lane`, and
 the name of the GPU host. A refusal names the class, never the matched value.
 
+## Routes are run, and candidates name what they supersede (CARD-ROUTE-EXERCISE-1)
+
+CoS work order FWO-DEFECT-PREVENT-1 items 3 and 4, both in `validate`.
+
+**Run a card's route before pushing it.** `python tools/coordination/doctrine_outbox.py validate --exercise
+--bus <bus clone> doctrine-outbox/<file>.md` (the bus defaults to `$FACTORY_BUS_CLONE`) clones the bus's committed
+tip into a scratch directory with `git clone --local --no-hardlinks`, drops its `origin`, and runs every command the
+item names there, without a shell, then removes that directory by name. The bus is only read. **"Refuse if `--bus`
+resolves to the live clone" means this (hub ruling, r2):** the default `$FACTORY_BUS_CLONE` is the live clone and is
+cloned read-only, but no route runs with its working directory, a `-C`/`--git-dir`/`--work-tree` target, or any
+argument or `--fill` value (also the value of `--opt=VALUE`) that resolves inside the live bus; that route is
+`ROUTE_UNSAFE`. A `--scratch-root` inside the bus is exit 2. "Inside" is decided on identity, not spelling: real path
+(junctions, symlinks and 8.3 names followed), `..` collapsed, case folded, trailing separators dropped. `<scratch>`
+in a route names the scratch clone. A bus clone behind its own `origin` prints `ROUTE_BUS_STALE <behind>` on stderr
+(the exit is unchanged). A command is:
+- a line of a fenced block whose info string starts `route` (`$ ` or `> ` prompt and `#` lines dropped); or
+- a backticked span of two or more words inside a route section, which opens at a `Route:` or `Adopt:` label
+  line (bullet and bold allowed) and runs to the next blank line, `#` heading or fence. Bullets right under it,
+  such as `- **Pin:**`, are in the section. A one-word span (`debt`, `RULINGS.md`) is a name, not a command.
+
+Each command prints one `ROUTE_OK`, `ROUTE_MISSING` (no such program, a `.cmd`/`.bat` shim that cannot start without
+`cmd /c`, or the python/node/bash/sh/pwsh script it names is not in the clone), `ROUTE_FAILED` (non-zero exit, an
+unfilled `<name>` placeholder, or it does not parse), `ROUTE_TIMEOUT` (`--timeout`, default 60 s; the whole process
+tree is killed, via a Job Object on Windows and a process group on POSIX) or `ROUTE_UNSAFE` line, then the item
+name and the command. Only the last 64 KiB of a route's output is kept. Route text is split like a POSIX shell
+(on Windows a backslash path stays whole). Anything but OK exits 1. Give `<name>` placeholders a value with
+`--fill name=VALUE`. A route must be exercisable offline, without credentials and only in the scratch clone, so
+these are `ROUTE_UNSAFE` and are not run:
+- a shell operator (pipe, redirect, `&&`, `;`) or an environment-assignment prefix;
+- a wrapper that runs another command (`cmd`, `env`, `sudo`, `xargs`, `start`, ...), and inline code (`python -c`
+  or `-Ic`, `bash -c`/`-lc`/`-ec`, `node -e`, `pwsh -c`/`-co`/`-e`/`-ec` or pwsh without `-File`);
+- `python -m` other than `pytest`, `unittest`, `json.tool`, `py_compile`, `compileall`, `doctest`;
+- git other than an allowlisted read-only or scratch-local verb (`log`, `status`, `show`, `diff`, `rev-parse`,
+  `commit`, `checkout`, ... but never `push`, `pull`, `fetch`, `ls-remote`, `clone`, `remote`, `submodule` or an
+  alias), `git -c`, `--config-env`, a `git config` write, and `-C`/`--git-dir`/`--work-tree` outside the scratch clone;
+- any `gh`, `claude`/`codex` `auth|login|logout`, a network client (`curl`, `ssh`, `npx`, ...), a package tool's
+  publish, upload, install or fetch verb (`pip install`, `npm install`, `yarn add`, ...), a URL or `user@host:`
+  argument, and a credential assignment (`GH_TOKEN=`, `ANTHROPIC_*=`, `*_TOKEN=`, `*_KEY=`, `*PASSWORD*=`) or `--token`.
+
+A credential's value is never printed: it shows as `NAME=<redacted>` in every diagnostic and route line, whatever it contains (shell syntax, `<name>`, a path, a backslash or a quote),
+because the one detail a route returns is redacted once, last (RX-06), in the form it was filled and in the form `repr()` writes it, so
+a diagnostic that quotes a token cannot print what a plain one hides (RX-07). The script a launcher names
+(`python`, `py`, `node`, `bash`, `pwsh -File`, ...) must resolve, symlinks and junctions followed, to a file inside the
+scratch clone: an absolute path, a `..` path or an outward link is `ROUTE_MISSING ... resolves outside the scratch clone`,
+never run (RX-08). That holds for every spelling PowerShell takes for `-File` (`-f`, `-fi`, `-fil`, any case, `/f`,
+`-f:<script>`): script discovery and the safety matcher share one file-flag test, so an abbreviation cannot skip the
+containment check (RX-08-PWSH-FILE-ALIASES). `--timeout` must be a finite number of seconds above zero; `nan`, `inf`, `0` and a negative value
+are refused before any route runs (RX-09). Put a
+command a card ships but the bus does not yet have in prose, not in a route.
+
+**A ruling candidate names the rules it overlaps.** An item whose `### ` heading holds `RULING CANDIDATE:` or whose
+body has a line opening `Ruling candidate` (a bullet or `>` quote marker may precede it) must carry a `touches/supersedes:` list: rule ids on that line, or as
+bullets under it, or the single entry `none: <reason of at least 4 words>`. `validate` refuses it otherwise
+(`RULING_CANDIDATE_NO_SUPERSEDES`, `_NONE_NEEDS_REASON`, `_NONE_WITH_RULES`), with or without `--exercise`.
+
 ## Concerns to the CoS (COS-CONCERN-CHANNEL-1)
 
 A project had no way to tell the CoS a concern: only the CoS writes `cos-feedback/`, and a project-owned
