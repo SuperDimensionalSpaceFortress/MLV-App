@@ -114,7 +114,7 @@ def validate_manifest(data: object) -> list[str]:
             if not runtimes:
                 problems.append(f"{label}: a declared floor needs at least one runtime")
             if not isinstance(evidence, list) or not evidence:
-                problems.append(f"{label}: a declared floor needs evidence (file, line, contains)")
+                problems.append(f"{label}: a declared floor needs evidence (file, contains; optional within, line hint)")
         elif floor == "undeclared":
             if runtimes:
                 problems.append(f"{label}: an undeclared floor must not list runtimes (nothing is invented)")
@@ -123,9 +123,10 @@ def validate_manifest(data: object) -> list[str]:
         if isinstance(evidence, list):
             for item in evidence:
                 if not (isinstance(item, dict) and isinstance(item.get("file"), str)
-                        and isinstance(item.get("line"), int) and isinstance(item.get("contains"), str)
-                        and item["contains"]):
-                    problems.append(f"{label}: each evidence item needs file, line, contains")
+                        and isinstance(item.get("contains"), str) and item["contains"]
+                        and isinstance(item.get("line", 1), int) and not isinstance(item.get("line"), bool)
+                        and isinstance(item.get("within", "x"), str) and item.get("within", "x")):
+                    problems.append(f"{label}: each evidence item needs file, contains; line (int hint) and within (string) are optional")
         mins = row.get("min_versions", {})
         if not isinstance(mins, dict) or any(k not in runtimes or not _version_tuple(str(v)) for k, v in mins.items()):
             problems.append(f"{label}: min_versions keys must be declared runtimes with numeric versions")
@@ -158,8 +159,38 @@ def load_manifest(path: Path) -> dict:
     return data
 
 
+def _indent(text: str) -> int:
+    return len(text) - len(text.lstrip())
+
+
+def resolve_evidence(item: dict, lines: list[str]) -> tuple[int | None, str | None]:
+    """Resolve one evidence item by its text anchor: (1-based line, None) or (None, problem).
+
+    ``contains`` must match exactly one line of the scope. The scope is the whole file, or with ``within`` the
+    block that opens at the one line holding that literal and runs over the lines indented deeper than it
+    (a function, a YAML job). ``line`` is only a hint: an edit above the cited text never turns it red.
+    """
+    scope = range(len(lines))
+    where = "the file"
+    anchor = item.get("within")
+    if anchor:
+        opens = [i for i, text in enumerate(lines) if anchor in text]
+        if len(opens) != 1:
+            return None, f"'within' anchor {anchor!r} matches {len(opens)} lines (need exactly 1)"
+        start = opens[0]
+        end = start + 1
+        while end < len(lines) and (not lines[end].strip() or _indent(lines[end]) > _indent(lines[start])):
+            end += 1
+        scope = range(start, end)
+        where = f"the block under {anchor!r}"
+    hits = [i for i in scope if item["contains"] in lines[i]]
+    if len(hits) != 1:
+        return None, f"{item['contains']!r} matches {len(hits)} lines of {where} (need exactly 1)"
+    return hits[0] + 1, None
+
+
 def check_evidence(manifest: dict, root: Path) -> list[str]:
-    """Each declared floor must cite a real line of a real file that contains the quoted text."""
+    """Each declared floor must cite, by a unique text anchor, a real file that contains the quoted text."""
     problems: list[str] = []
     for row in manifest["rows"]:
         for item in row.get("evidence", []):
@@ -168,10 +199,9 @@ def check_evidence(manifest: dict, root: Path) -> list[str]:
                 problems.append(f"{row['id']}: evidence file missing: {item['file']}")
                 continue
             lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
-            if not 1 <= item["line"] <= len(lines):
-                problems.append(f"{row['id']}: {item['file']} has no line {item['line']}")
-            elif item["contains"] not in lines[item["line"] - 1]:
-                problems.append(f"{row['id']}: {item['file']}:{item['line']} does not contain {item['contains']!r}")
+            _, problem = resolve_evidence(item, lines)
+            if problem:
+                problems.append(f"{row['id']}: {item['file']}: {problem}")
     return problems
 
 

@@ -90,7 +90,7 @@
       "runtimes": ["python-3.13"],
       "evidence": [
         {"file": ".python-version", "line": 1, "contains": "3.13"},
-        {"file": ".github/workflows/tests.yml", "line": 45, "contains": "python-version-file"}
+        {"file": ".github/workflows/tests.yml", "line": 45, "contains": "python-version-file", "within": "protected-check-route:"}
       ],
       "suites": [{"kind": "pytest", "path": "tools/repo_hygiene/test_runtime_floor_suites.py"}]
     },
@@ -101,7 +101,7 @@
       "runtimes": ["python-3.13"],
       "evidence": [
         {"file": ".python-version", "line": 1, "contains": "3.13"},
-        {"file": ".github/workflows/tests.yml", "line": 45, "contains": "python-version-file"}
+        {"file": ".github/workflows/tests.yml", "line": 45, "contains": "python-version-file", "within": "protected-check-route:"}
       ],
       "suites": [{"kind": "pytest", "path": "tools/coordination/test_check_lane_model_currency.py"}]
     },
@@ -112,7 +112,7 @@
       "runtimes": ["python-3.13"],
       "evidence": [
         {"file": ".python-version", "line": 1, "contains": "3.13"},
-        {"file": ".github/workflows/tests.yml", "line": 45, "contains": "python-version-file"}
+        {"file": ".github/workflows/tests.yml", "line": 45, "contains": "python-version-file", "within": "protected-check-route:"}
       ],
       "suites": [{"kind": "pytest", "path": "tools/coordination/test_resolve_codex_tier.py"}]
     },
@@ -123,7 +123,7 @@
       "runtimes": ["python-3.13"],
       "evidence": [
         {"file": ".python-version", "line": 1, "contains": "3.13"},
-        {"file": ".github/workflows/tests.yml", "line": 45, "contains": "python-version-file"}
+        {"file": ".github/workflows/tests.yml", "line": 45, "contains": "python-version-file", "within": "protected-check-route:"}
       ],
       "suites": [{"kind": "pytest", "path": "tools/coordination/test_get_doctrine_brief.py"}]
     },
@@ -134,7 +134,7 @@
       "runtimes": ["python-3.13"],
       "evidence": [
         {"file": ".python-version", "line": 1, "contains": "3.13"},
-        {"file": ".github/workflows/tests.yml", "line": 45, "contains": "python-version-file"}
+        {"file": ".github/workflows/tests.yml", "line": 45, "contains": "python-version-file", "within": "protected-check-route:"}
       ],
       "suites": [{"kind": "pytest", "path": "tools/coordination/test_record_workstream_completion.py", "slow": true}]
     },
@@ -145,7 +145,7 @@
       "runtimes": ["python-3.13"],
       "evidence": [
         {"file": ".python-version", "line": 1, "contains": "3.13"},
-        {"file": ".github/workflows/tests.yml", "line": 45, "contains": "python-version-file"}
+        {"file": ".github/workflows/tests.yml", "line": 45, "contains": "python-version-file", "within": "protected-check-route:"}
       ],
       "suites": [{"kind": "pytest", "path": "tools/repo_hygiene/test_freeze_factory_cards.py"}]
     },
@@ -156,7 +156,7 @@
       "runtimes": ["python-3.13"],
       "evidence": [
         {"file": ".python-version", "line": 1, "contains": "3.13"},
-        {"file": ".github/workflows/tests.yml", "line": 45, "contains": "python-version-file"}
+        {"file": ".github/workflows/tests.yml", "line": 45, "contains": "python-version-file", "within": "protected-check-route:"}
       ],
       "suites": [{"kind": "pytest", "path": "tools/repo_hygiene/test_roadmap_queue_parity.py"}]
     },
@@ -167,7 +167,7 @@
       "runtimes": ["python-3.13"],
       "evidence": [
         {"file": ".python-version", "line": 1, "contains": "3.13"},
-        {"file": ".github/workflows/tests.yml", "line": 45, "contains": "python-version-file"}
+        {"file": ".github/workflows/tests.yml", "line": 45, "contains": "python-version-file", "within": "protected-check-route:"}
       ],
       "suites": [{"kind": "pytest", "path": "tools/repo_hygiene/test_doctrine_guards.py"}]
     },
@@ -178,7 +178,7 @@
       "runtimes": ["python-3.13"],
       "evidence": [
         {"file": ".python-version", "line": 1, "contains": "3.13"},
-        {"file": ".github/workflows/tests.yml", "line": 45, "contains": "python-version-file"}
+        {"file": ".github/workflows/tests.yml", "line": 45, "contains": "python-version-file", "within": "protected-check-route:"}
       ],
       "suites": [{"kind": "pytest", "path": "tools/repo_hygiene/test_k9_witness.py", "slow": true}]
     },
@@ -189,7 +189,7 @@
       "runtimes": ["python-3.13"],
       "evidence": [
         {"file": ".python-version", "line": 1, "contains": "3.13"},
-        {"file": ".github/workflows/tests.yml", "line": 45, "contains": "python-version-file"}
+        {"file": ".github/workflows/tests.yml", "line": 45, "contains": "python-version-file", "within": "protected-check-route:"}
       ],
       "suites": [{"kind": "pytest", "path": "tools/repo_hygiene/test_vendored_native_payloads.py", "slow": true}]
     },
@@ -200,7 +200,7 @@
       "runtimes": ["python-3.13"],
       "evidence": [
         {"file": ".python-version", "line": 1, "contains": "3.13"},
-        {"file": ".github/workflows/tests.yml", "line": 45, "contains": "python-version-file"}
+        {"file": ".github/workflows/tests.yml", "line": 45, "contains": "python-version-file", "within": "protected-check-route:"}
       ],
       "suites": [{"kind": "pytest", "path": "tools/repo_hygiene/test_duration_as_proof_inventory.py"}]
     },
@@ -211,7 +211,7 @@
       "runtimes": ["python-3.13"],
       "evidence": [
         {"file": ".python-version", "line": 1, "contains": "3.13"},
-        {"file": ".github/workflows/tests.yml", "line": 45, "contains": "python-version-file"}
+        {"file": ".github/workflows/tests.yml", "line": 45, "contains": "python-version-file", "within": "protected-check-route:"}
       ],
       "suites": [{"kind": "pytest", "path": "tools/repo_hygiene/test_brokered_closeout.py", "slow": true}]
     },
@@ -222,7 +222,7 @@
       "runtimes": ["python-3.13"],
       "evidence": [
         {"file": ".python-version", "line": 1, "contains": "3.13"},
-        {"file": ".github/workflows/tests.yml", "line": 45, "contains": "python-version-file"}
+        {"file": ".github/workflows/tests.yml", "line": 45, "contains": "python-version-file", "within": "protected-check-route:"}
       ],
       "suites": [{"kind": "pytest", "path": "tools/repo_hygiene/test_candidate_acceptance.py", "slow": true}]
     },
@@ -233,7 +233,7 @@
       "runtimes": ["python-3.13"],
       "evidence": [
         {"file": ".python-version", "line": 1, "contains": "3.13"},
-        {"file": ".github/workflows/tests.yml", "line": 45, "contains": "python-version-file"}
+        {"file": ".github/workflows/tests.yml", "line": 45, "contains": "python-version-file", "within": "protected-check-route:"}
       ],
       "suites": [{"kind": "pytest", "path": "tools/repo_hygiene/test_repo_hygiene.py", "slow": true}]
     },
@@ -244,7 +244,7 @@
       "runtimes": ["python-3.13"],
       "evidence": [
         {"file": ".python-version", "line": 1, "contains": "3.13"},
-        {"file": ".github/workflows/tests.yml", "line": 45, "contains": "python-version-file"}
+        {"file": ".github/workflows/tests.yml", "line": 45, "contains": "python-version-file", "within": "protected-check-route:"}
       ],
       "suites": [{"kind": "pytest", "path": "tools/repo_hygiene/test_repo_slug_hygiene.py"}]
     },
@@ -255,7 +255,7 @@
       "runtimes": ["python-3.13"],
       "evidence": [
         {"file": ".python-version", "line": 1, "contains": "3.13"},
-        {"file": ".github/workflows/tests.yml", "line": 45, "contains": "python-version-file"}
+        {"file": ".github/workflows/tests.yml", "line": 45, "contains": "python-version-file", "within": "protected-check-route:"}
       ],
       "suites": [{"kind": "pytest", "path": "tools/repo_hygiene/test_shipping_defaults.py"}]
     },
