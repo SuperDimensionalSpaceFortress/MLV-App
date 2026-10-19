@@ -6,7 +6,7 @@ NA-7 admits (the hook's own worktree and the board), so every scratchpad write w
 fixture lane, read the TEMP it really got, and ask the hook's own decide() -- loaded from the lane's WorkDir,
 exactly as the registered `${CLAUDE_PROJECT_DIR}/tools/hooks/...` command loads it -- about a Write there.
 """
-import importlib.util, json, os, shutil, subprocess, sys
+import importlib.util, json, os, re, shutil, subprocess, sys
 from pathlib import Path
 
 import pytest
@@ -33,9 +33,11 @@ def git(*args, cwd):
                           check=True, capture_output=True, text=True, timeout=60)
 
 
-def run_lane(tree, extra=()):
+def run_lane(tree, extra=(), twice=False):
     """A fixture lane whose WorkDir is a git repo carrying THIS repo's .gitignore. Its first act records
-    TEMP/TMP/TMPDIR, writes a file into TEMP, and records what `git status` then sees."""
+    TEMP/TMP/TMPDIR, writes a file into TEMP, and records what `git status` then sees.
+    twice=True runs the same command again (the next receipt slot of the same run dir) and adds the second
+    run's TEMP to the returned dict as seen["TEMP_second"]."""
     root = tree["root"]
     cmd, env, receipt = prepare(tree, "normal")
     shutil.copyfile(ROOT / ".gitignore", root / ".gitignore")
@@ -56,7 +58,14 @@ def run_lane(tree, extra=()):
                             % (PWSH, pre, PWSH, tree["child"]), encoding="ascii")
     r = subprocess.run(cmd + list(extra), env=env, text=True, capture_output=True, timeout=180)
     assert r.returncode == 0, (r.stdout, r.stderr)
-    return json.loads(seen.read_text(encoding="utf-8-sig")), json.loads(receipt.read_text(encoding="utf-8"))
+    first, first_receipt = json.loads(seen.read_text(encoding="utf-8-sig")), json.loads(receipt.read_text(encoding="utf-8"))
+    if twice:
+        for leftover in ("child.json", "grand.json"):   # the fixture child moves a fresh file onto these names
+            (root / leftover).unlink(missing_ok=True)
+        r = subprocess.run(cmd + list(extra), env=env, text=True, capture_output=True, timeout=180)
+        assert r.returncode == 0, (r.stdout, r.stderr)
+        first["TEMP_second"] = json.loads(seen.read_text(encoding="utf-8-sig"))["TEMP"]
+    return first, first_receipt
 
 
 def hook_decide(worktree, board, monkeypatch, tool, tool_input):
@@ -90,6 +99,35 @@ def test_the_lane_scratchpad_is_a_path_its_hook_admits_and_git_does_not_see(fixt
     assert not Path(temp).exists()
 
 
+def test_the_default_scratch_leaf_is_short_fixed_width_and_unique_per_run_and_lane(fixture_tree):
+    seen, _receipt = run_lane(fixture_tree, twice=True)
+    root = fixture_tree["root"]
+    first, second = Path(seen["TEMP"]), Path(seen["TEMP_second"])
+    for p in (first, second):
+        assert p.parent == root / ".claude-state" / "ls", p
+        assert re.fullmatch(r"[0-9a-f]{8}", p.name), p.name
+    assert first != second, "two lane slots of one run dir shared a scratch dir"
+
+
+@pytest.mark.parametrize("card_len", [39, 60])
+def test_the_lane_temp_stays_within_the_length_the_shared_root_gave(fixture_tree, card_len):
+    # r3 opus B1 / T-01: TEMP is the prefix of every path a lane's pytest tmp_path repo makes, and git fails past
+    # MAX_PATH ("Filename too long" at a TEMP of ~97-110 on this host). The budget is the old shared-root TEMP,
+    # C:\mlvtmp\lane-scratch\<runleaf>-<lane slot>, for a real worktree named C:\mlvtmp\lane-<card>-<yyyymmdd>.
+    seen, _receipt = run_lane(fixture_tree)
+    root = fixture_tree["root"]
+    assert seen["TEMP"].startswith(str(root) + "\\"), seen["TEMP"]
+    suffix = len(seen["TEMP"]) - len(str(root))          # what the launcher adds to ANY WorkDir
+    card = "C" * card_len
+    worktree = "C:\\mlvtmp\\lane-%s-20261019" % card
+    old_temp = "C:\\mlvtmp\\lane-scratch\\lane-%s-r1-20261019T1755Z-sonnet-001" % card
+    assert len(old_temp) == 57 + card_len
+    new_temp = len(worktree) + suffix
+    assert new_temp <= len(old_temp), "TEMP grew from %d to %d chars at card length %d" % (len(old_temp), new_temp, card_len)
+    # And the git path that tripped the old limit: <TEMP>\pytest-of-x\pytest-0\test_name0\.git\objects\xx\<38 hex>.
+    assert new_temp + len("\\pytest-of-user\\pytest-12\\test_validate_refuses_a_filename0\\.git\\objects\\ab\\") + 38 < 260
+
+
 def test_an_explicit_scratch_root_still_wins_and_keep_scratch_still_keeps(fixture_tree, tmp_path):
     alt = tmp_path.with_name(tmp_path.name + "-alt") / "lane-scratch"
     try:
@@ -102,7 +140,7 @@ def test_an_explicit_scratch_root_still_wins_and_keep_scratch_still_keeps(fixtur
 
 
 def test_this_repo_ignores_the_worktree_scratch_root():
-    r = subprocess.run(["git", "-C", str(ROOT), "check-ignore", "-q", ".claude-state/lane-scratch/run-sonnet-001/claude/note.txt"],
+    r = subprocess.run(["git", "-C", str(ROOT), "check-ignore", "-q", ".claude-state/ls/0a1b2c3d/claude/note.txt"],
                        capture_output=True, text=True, timeout=60)
     assert r.returncode == 0, "the worktree-local lane scratch root is not git-ignored here: %r" % (r.stderr,)
 

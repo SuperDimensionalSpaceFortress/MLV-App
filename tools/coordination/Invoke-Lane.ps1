@@ -125,7 +125,8 @@ param(
     # MLV root. The run's own scratch dir is removed when the lane exits unless -KeepScratch;
     # its size is recorded in the receipt either way.
     # LANE-HOOK-DENY-RECURRENCE-1: when -ScratchRoot is NOT passed, the run's scratch dir goes under
-    # <WorkDir>\.claude-state\lane-scratch instead. The harness names TEMP as the lane's scratchpad, and
+    # <WorkDir>\.claude-state\ls\<8-hex run hash> instead (short on purpose: a longer TEMP breaks git in pytest
+    # tmp_path repos at MAX_PATH). The harness names TEMP as the lane's scratchpad, and
     # tools\hooks\mlv-never-authorized.py NA-7 admits writes under only the hook's own worktree and the
     # board, so every scratchpad write under this shared root was denied. .claude-state/ is git-ignored on
     # every branch and pruned by the repo's own tree walks. The value below stays the shared root that
@@ -1649,9 +1650,16 @@ if ($cfg.engine -eq 'claude') {
 # background work; see docs/lane-containment.md.
 # Per-run lane scratch under an MLV-owned root instead of the shared %TEMP%.
 $scratchDir = $null
-$scratchBase = if ($PSBoundParameters.ContainsKey('ScratchRoot')) { $ScratchRoot } else { Join-Path $WorkDir '.claude-state\lane-scratch' }
+$scratchBase = if ($PSBoundParameters.ContainsKey('ScratchRoot')) { $ScratchRoot } else { Join-Path $WorkDir '.claude-state\ls' }
 if ($scratchBase) {
-    $scratchDir = Join-Path $scratchBase ('{0}-{1}' -f (Split-Path $RunDir -Leaf), (Split-Path $base -Leaf))
+    $scratchLeaf = '{0}-{1}' -f (Split-Path $RunDir -Leaf), (Split-Path $base -Leaf)
+    if (-not $PSBoundParameters.ContainsKey('ScratchRoot')) {
+        # Short fixed-width leaf: TEMP is the prefix of every path a lane's pytest tmp_path repo creates, and git
+        # fails past MAX_PATH. 8 hex of sha256(run dir + lane slot) is unique per run and lane, 8 chars at any card length.
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        try { $scratchLeaf = ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($scratchLeaf.ToLowerInvariant()))) -replace '-', '').Substring(0, 8).ToLowerInvariant() } finally { $sha.Dispose() }
+    }
+    $scratchDir = Join-Path $scratchBase $scratchLeaf
     New-Item -ItemType Directory -Force -Path $scratchDir | Out-Null
     foreach ($v in 'TEMP', 'TMP', 'TMPDIR') { $psi.Environment[$v] = $scratchDir }
 }
