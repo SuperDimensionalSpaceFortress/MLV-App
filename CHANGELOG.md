@@ -72,8 +72,10 @@ maintained in this format.
     about a quarter of that at half and a sixteenth at quarter.
   - Any other render, decode or recon work goes first. A warm that finds work
     pending is skipped and tried again 0.5 s later (for up to 30 s). A warm
-    that is already running when Play starts finishes first, so that Play
-    waits for at most one recon run.
+    that is already running when Play starts finishes first, so Play waits
+    for it: one recon run, or two when the warm runs the frame again for a
+    dual-ISO match that was not yet settled
+    (PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1, below).
   - `MLVAPP_PLAYBACK_RECON_WARM_RUN` (default on, same values as
     `MLVAPP_PLAYBACK_ROUTE_PREWARM`) turns it off.
     `MLVAPP_PLAYBACK_ROUTE_PREWARM=0` still turns everything off.
@@ -155,3 +157,7 @@ maintained in this format.
     while the recon thread was still reading its settings for the warm's
     completion. The warm's completion no longer reads the clip once the
     warm is no longer counted as running.
+  - Closing a clip while a paused warm was still waiting for the recon
+    thread could let that thread start the warm on the freed clip. Closing
+    a clip now drops a warm that has not started, and waits for one that
+    has.

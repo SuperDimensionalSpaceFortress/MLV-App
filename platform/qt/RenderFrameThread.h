@@ -342,7 +342,8 @@ public:
         int slotIndex = -1;
         RenderRequest request;
         /* PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1 Row W: a paused recon warm run (no slot; request.frameNumber only).
-         * Never counted as pipeline work (phase3WorkInFlightLocked), dropped when real work is pending as it starts. */
+         * Never counted as pipeline work (phase3WorkInFlightLocked), dropped when real work is pending as it starts, and
+         * dropped by a clip close while still queued (detachClipBeforeFree). */
         bool warm = false;
         int warmScale = 1;
         quint64 warmClipGeneration = 0;
@@ -379,6 +380,10 @@ public:
      * the Play-time scale on the recon worker (PlaybackReconWarmRun.h). Reason::None when queued; RealRequestPending
      * when any render, decode or recon work is pending now. Its result arrives as playbackReconWarmDone. */
     playback_recon_warm_run::Reason requestPlaybackReconWarm( uint32_t frameNumber, int scale, quint64 clipGeneration );
+    /* PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1 r3 (U-02, GUI thread): a clip close calls this after its idle
+     * barrier and before it frees the clip. Drops every queued warm (not pipeline work, so the barrier did not wait for
+     * it), waits out a warm the worker took meanwhile, and clears the clip pointer until the next init(). */
+    void detachClipBeforeFree( void );
     bool isFrameReady( void );
     bool isIdle( void );
     /* PLAYBACK-DECODE-RENDER-OVERLAP-1: isIdle() for the playback advance. Speculative

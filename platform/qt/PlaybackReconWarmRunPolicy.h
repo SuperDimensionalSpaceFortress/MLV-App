@@ -112,6 +112,29 @@ inline bool guiAmazeAllowed( bool hasRetainedOutput, bool playing, bool clipGene
     return hasRetainedOutput && !playing && clipGenerationMatches;
 }
 
+/*! PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1 r3 (U-02): a queued warm is not pipeline work, so a clip close can
+ *  pass its idle barrier while one is still queued. The close drops every queued warm (RenderFrameThread::
+ *  detachClipBeforeFree, under the render thread's mutex) before the clip is freed, so the recon worker can never take
+ *  one onto a freed clip. Slot entries are kept, in order. Returns how many warms were dropped. */
+template <typename Queue>
+inline int dropQueuedWarms( Queue &queue )
+{
+    int dropped = 0;
+    for( auto it = queue.begin(); it != queue.end(); )
+    {
+        if( it->warm )
+        {
+            it = queue.erase( it );
+            ++dropped;
+        }
+        else
+        {
+            ++it;
+        }
+    }
+    return dropped;
+}
+
 struct Line
 {
     bool run = false;

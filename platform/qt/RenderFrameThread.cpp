@@ -1929,7 +1929,8 @@ bool RenderFrameThread::phase3WorkInFlightLocked( void ) const
 {
     // Row W: a queued paused warm run is not pipeline work (it has no slot and never publishes a frame) and is dropped
     // as it starts when real work is pending; a RUNNING one is, because it reads m_pMlvObject and its llrawproc settings
-    // (lock() and isIdle() wait it out before a clip change or a raw-level change)
+    // (lock() and isIdle() wait it out before a clip change or a raw-level change). r3 (U-02): a clip close drops the
+    // queued ones itself (detachClipBeforeFree)
     if( m_warmRunning ) return true;
     const bool reconWorkQueued =
         std::any_of( m_reconRequests.begin(), m_reconRequests.end(),
@@ -2196,6 +2197,19 @@ playback_recon_warm_run::Reason RenderFrameThread::requestPlaybackReconWarm( uin
     return playback_recon_warm_run::Reason::None;
 }
 
+/* PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1 r3 (U-02, sol r2 = fable r2): the clip close's barrier waits for
+ * isIdle() / lock(), which do not count a queued warm. Without this the worker could take that warm after the free and
+ * read the freed clip (m_pMlvObject->cpu_cores, run()). A dropped warm was never admitted and retained nothing, so no
+ * playbackReconWarmDone is owed for it (the next clip re-arms the warm: MainWindow::armPlaybackRoutePrewarm). */
+void RenderFrameThread::detachClipBeforeFree( void )
+{
+    QMutexLocker locker( &m_mutex );
+    playback_recon_warm_run::dropQueuedWarms( m_reconRequests );
+    // taken between the barrier and here: m_warmRunning is cleared before the worker's slot -1 completion wakes us
+    while( m_warmRunning ) m_waitCondition.wait( &m_mutex );
+    m_pMlvObject = nullptr;
+}
+
 /* PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1 Row W: the paused warm, on the recon worker that will run Play frame 0
  * (its worker state keys set_luts). No slot, no frameReady, no cache, and m_active* is never touched; the outcome --
  * with any retained token, which the GUI releases -- is posted to this object's (GUI) thread. */
@@ -2230,8 +2244,9 @@ void RenderFrameThread::warmReconForWorker( const ReconQueueEntry &entry,
     }
     // what the first recon present would be handed (drawFrame: the texture route's black level and WB). r2 (sol r1
     // B2): a warm dropped at take never held m_warmRunning, so a clip close may already be past isIdle(): it reads
-    // nothing of the clip (nothing reads its black level: it has no output)
-    done.blackLevel = ( m_pMlvObject && !entry.warmRealRequestPending ) ? getMlvBlackLevel( m_pMlvObject ) : 0;
+    // nothing of the clip (nothing reads its black level: it has no output). r3: not even the pointer, which a clip close
+    // clears under m_mutex (detachClipBeforeFree)
+    done.blackLevel = ( !entry.warmRealRequestPending && m_pMlvObject ) ? getMlvBlackLevel( m_pMlvObject ) : 0;
     done.wbMultipliers = normalizedWbMultipliers6500();
     done.renderMs = ( mlv_stage_timing_now() - startStageTime ) * 1000.0;
     {

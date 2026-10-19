@@ -3977,6 +3977,8 @@ void MainWindow::freeActiveMlvObjectAfterLifecycleBarrier( const char *reason )
     waitForRenderThreadIdleBeforeCoreMutation( barrierReason );
     drainLookAssistWorkers( barrierReason );
     m_clipLifecycleBarrier.waitForNoBorrowers();
+    // PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1 r3 (U-02): the barrier above does not count a queued recon warm
+    if( m_pRenderThread ) m_pRenderThread->detachClipBeforeFree();
 
     logInteractionEvent(
         QStringLiteral("clip_lifecycle.free"),

@@ -1086,8 +1086,9 @@ TEST(PlaybackWarmReconDeterminismWiring, NoWarmEntryReadsTheClipAfterItsLifetime
     const int released = warm.indexOf(QStringLiteral("m_warmRunning = false;"));
     ASSERT_TRUE(released >= 0);
     ASSERT_EQ(-1, (int)warm.indexOf(QStringLiteral("m_pMlvObject"), released));
+    // r3: the dropped warm's test comes first, so it does not even read the pointer a clip close clears
     ASSERT_TRUE(warm.contains(QStringLiteral(
-        "done.blackLevel = ( m_pMlvObject && !entry.warmRealRequestPending ) ? getMlvBlackLevel( m_pMlvObject ) : 0;")));
+        "done.blackLevel = ( !entry.warmRealRequestPending && m_pMlvObject ) ? getMlvBlackLevel( m_pMlvObject ) : 0;")));
 }
 
 // r3 (U-02, sol r2 = fable r2): a warm that is queued but not yet taken is not pipeline work, so the clip close's idle
