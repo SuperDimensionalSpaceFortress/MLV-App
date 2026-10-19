@@ -394,7 +394,8 @@ def test_the_alias_keeps_the_target_rules(tmp_path, capsys):
 
 # ---------- one --bus on validate (PR 514 adds one too: whichever merges second keeps exactly one) ----------
 
-def _validate_parser():
+def _subcommand_parsers():
+    """name -> subparser, for every subcommand build_parser() defines."""
     parser = ob.build_parser()
     subparsers = [a for a in parser._actions if isinstance(a, argparse._SubParsersAction)]
     assert len(subparsers) == 1
@@ -402,7 +403,7 @@ def _validate_parser():
 
 
 def test_build_parser_succeeds_and_defines_bus_exactly_once_on_validate():
-    choices = _validate_parser()
+    choices = _subcommand_parsers()
     options = [opt for action in choices["validate"]._actions for opt in action.option_strings]
     assert options.count("--bus") == 1, options
     parsed = ob.build_parser().parse_args(["validate", "--bus", "some-clone", "item.md"])
@@ -410,6 +411,231 @@ def test_build_parser_succeeds_and_defines_bus_exactly_once_on_validate():
 
 
 def test_no_subcommand_defines_any_option_string_twice():
-    for name, sub in _validate_parser().items():
+    for name, sub in _subcommand_parsers().items():
         options = [opt for action in sub._actions for opt in action.option_strings]
         assert len(options) == len(set(options)), (name, options)
+
+
+# ---------- r3: marker detection is Unicode-normalised and reads only where a block opens ----------
+# Sol r2 (10 of 22 marker probes bypassed, executed) and opus r2 (plain bus prose falsely refused; more bypasses).
+
+# every probe below was ACCEPTED bare by the 096d7493 tool and must now be refused; each goes where its shape belongs
+# (a body line after a blank line, or the item's first heading)
+SOL_R2_BODY_BYPASSES = [
+    "Ruling–candidate: X",                       # en dash between the words
+    "Ruling—candidate: X",                       # em dash
+    "Rul​ing candidate: X",                      # zero-width space inside a word
+    '"Ruling candidate (r2): X"',                     # straight quotes
+    "> ### proj - RULING CANDIDATE (r2): X",          # blockquoted heading
+    "- ### proj - RULING CANDIDATE (r2): X",          # bulleted heading
+    "### proj：RULING CANDIDATE (r2): X",         # full-width colon as the separator
+    "proj - RULING CANDIDATE (r2): X\n---",           # setext heading with a prefix
+]
+OPUS_R2_BODY_BYPASSES = [
+    '### "RULING CANDIDATE": X',                      # straight-quoted phrase
+    "### “RULING CANDIDATE”: X",            # curly-quoted phrase
+    "### ​RULING CANDIDATE (r2): X",             # zero-width space before the phrase
+    " Ruling candidate: x",                      # no-break space before the phrase
+    "> ### proj - RULING CANDIDATE: X",
+    "proj, 2026-10-19 - RULING CANDIDATE: X\n===",    # setext (===) with a prefix, later in the body
+    "**Proposed ruling candidate:** x",               # qualified
+    "[RULING CANDIDATE] x",                           # bracketed
+]
+OTHER_BODY_BYPASSES = [
+    "Rul­ing candidate: X",                      # soft hyphen (Cf) inside a word
+    "Ruling−candidate: X",                       # minus sign
+    "RULING‑CANDIDATE: x",                       # non-breaking hyphen
+    "Ruling candidate (r2): X",                  # no-break space between the words
+    "﻿Ruling candidate: x",                      # byte-order mark
+    "　Ruling candidate: x",                      # ideographic space
+    "＞ Ruling candidate: x",                     # full-width >
+    "Ｒuling candidate: x",                       # full-width R
+    "> > Ruling candidate: x",                        # nested blockquote
+    "Draft ruling candidate: x",
+    "New ruling candidate - x",
+    "2) ruling candidate",
+    "“Ruling candidate”",
+    "'Ruling candidate' x",
+    "> - **Proposed Ruling-candidate (r3):** x",
+    "Ruling candidate (r2) - X\n---",
+]
+BODY_BYPASSES = SOL_R2_BODY_BYPASSES + OPUS_R2_BODY_BYPASSES + OTHER_BODY_BYPASSES
+HEADING_BYPASSES = [
+    '"RULING CANDIDATE": X',
+    "“RULING CANDIDATE”: X",
+    "​RULING CANDIDATE (r2): X",
+    " RULING CANDIDATE: X",
+    "proj：RULING CANDIDATE: X",
+    "proj—RULING CANDIDATE: X",
+    "mlv-app, 2026-10-19 − RULING CANDIDATE (r2): X",
+    "[RULING CANDIDATE] X",
+    "Proposed ruling candidate: X",
+]
+
+
+@pytest.mark.parametrize("marker", BODY_BYPASSES)
+def test_r3_every_normalised_body_marker_is_refused_bare(tmp_path, capsys, marker):
+    rc, err = validate(tmp_path, body_with(marker), make_bus(tmp_path), capsys)
+    assert rc == 1 and "RULING_CANDIDATE_NO_SUPERSEDES" in err, (marker, err)
+
+
+@pytest.mark.parametrize("marker", BODY_BYPASSES)
+def test_r3_every_normalised_body_marker_is_accepted_with_a_declaration(tmp_path, capsys, marker):
+    rc, err = validate(tmp_path, body_with(marker, "touches/supersedes: R15\n"), make_bus(tmp_path), capsys)
+    assert rc == 0 and err == "", (marker, err)
+
+
+@pytest.mark.parametrize("heading", HEADING_BYPASSES)
+def test_r3_every_normalised_heading_marker_is_refused_bare(tmp_path, capsys, heading):
+    rc, err = validate(tmp_path, candidate(heading=f"### {heading}"), make_bus(tmp_path), capsys)
+    assert rc == 1 and "RULING_CANDIDATE_NO_SUPERSEDES" in err, (heading, err)
+
+
+@pytest.mark.parametrize("heading", HEADING_BYPASSES)
+def test_r3_every_normalised_heading_marker_is_accepted_with_a_declaration(tmp_path, capsys, heading):
+    rc, err = validate(tmp_path, candidate("touches/supersedes: R15\n", heading=f"### {heading}"), make_bus(tmp_path), capsys)
+    assert rc == 0 and err == "", (heading, err)
+
+
+def _receipt(body: str) -> str:
+    return f"---\ntarget: RECEIPTS.md\nkind: receipt\nsource_commit: PENDING\nlaw4: attested\n---\n{body}"
+
+
+# Lines copied VERBATIM from the doctrine bus (read only): plain prose that names ruling-candidates/ or the phrase, wrapped
+# by an author who hard-wraps. The 096d7493 tool refused every one of these with RULING_CANDIDATE_NO_SUPERSEDES.
+BUS_RECEIPTS_3876_3879 = (
+    "With the filing now `HARVESTED / open=0`, the steward's `open>0` trigger can never re-fire, so 20 dispositioned\n"
+    "findings count zero toward §5 permanently. Only `kernel-e2e.py` sees it (`filed_but_unrowed`, exit 1);\n"
+    "`harvest-status.py` and `arbitration-queue.py` both read clean. Predicate fix proposed in\n"
+    "`ruling-candidates/steward-filing-has-no-legal-row-writer-r1.md`.\n")
+BUS_RECEIPTS_3375_3378 = (
+    "3. **Our flagship negative is internally consistent but not third-party re-measurable.** Both arms ran\n"
+    "   against a base engine that lives outside the repository and is unpinned in the ledger. We filed a\n"
+    "   ruling candidate titled *filing-evidence-must-be-re-measurable* in the same push. Pin the engine\n"
+    "   digest in the binding, or the finding is ours alone — exactly the defect we asked the steward to fix.\n")
+BUS_TRAPS_9722_9725 = (
+    "**Corroboration that the qualified form is the durable one:** the evidence in this board's own\n"
+    "ruling-candidate deliberately avoided PR numbers and used `git ls-remote` instead - eight kernel review\n"
+    "refs, none belonging to AdversarialLLM. That claim survived the correction unchanged, while the\n"
+    "PR-numbered one did not.\n")
+BUS_RECEIPTS_1293_1295 = (
+    "- This receipt grants no fleet adoption, review credit, landing, or ruling\n"
+    "  authority. It records what was measured on this box. Companion candidate:\n"
+    "  `ruling-candidates/orchestrator-seat-fit-r1.md`.\n")
+BUS_HEADING_12698 = ("### mlv-app, 2026-10-06 — an MLV measurement for ruling candidate mechanical-outbox-every-member-r1 (bus 2877eff): "
+                     "merged outbox items waited 23.7 h and 49.5 h because only a session ran the drain; the hourly unattended drain is now adopted")
+BUS_HEADING_12951 = ("### airmypc, 2026-10-08 — ADOPT of ruling candidate mechanical-outbox-every-member-r1 (all three parts), and the heartbeat "
+                     "record has no slot for the debt that part 3 and fold-lag F4 ask it to carry")
+BUS_PRIOR_ART_12953 = ("**Prior art:** ruling-candidates/mechanical-outbox-every-member-r1.md listed airmypc as exporting by direct, hand-written "
+                       "commits \"only when a session remembers\".")
+
+FALSIFIER_BODIES = [
+    ("a wrapped line that opens with a ruling-candidates/ path (bus RECEIPTS 3876-3879)",
+     "### proj, 2026-10-19 - a measured fact\n\n" + BUS_RECEIPTS_3876_3879),
+    ("a wrapped numbered item whose line opens 'ruling candidate titled' (bus RECEIPTS 3375-3378)",
+     "### proj, 2026-10-19 - a measured fact\n\n" + BUS_RECEIPTS_3375_3378),
+    ("a wrapped paragraph whose line opens 'ruling-candidate deliberately avoided' (bus TRAPS 9722-9725)",
+     "### proj, 2026-10-19 - a measured fact\n\n" + BUS_TRAPS_9722_9725),
+    ("a bullet that wraps onto a ruling-candidates/ path (bus RECEIPTS 1293-1295)",
+     "### proj, 2026-10-19 - a measured fact\n\n" + BUS_RECEIPTS_1293_1295),
+    ("a bullet that is only a ruling-candidates/ path", "### proj, 2026-10-19 - a measured fact\n\n- `ruling-candidates/x.md`\n"),
+    ("a bullet that is a longer ruling-candidates/ path",
+     "### proj, 2026-10-19 - a measured fact\n\n- `ruling-candidates/steward-filing-has-no-legal-row-writer-r1.md`\n"),
+    ("a paragraph that opens with the plural", "### proj, 2026-10-19 - a measured fact\n\nruling candidates are filed under ruling-candidates/ by the steward.\n"),
+    ("a paragraph that opens with a slug", "### proj, 2026-10-19 - a measured fact\n\nRuling-candidate-check ran green on this box.\n"),
+    ("a paragraph that names the directory first", "### proj, 2026-10-19 - a measured fact\n\nruling-candidates/ holds the open proposals.\n"),
+    ("a heading that measures someone else's candidate, em dash separator (bus RECEIPTS 12698)", BUS_HEADING_12698 + "\n\nBody.\n"),
+    ("an ADOPT heading and its Prior art line (bus RECEIPTS 12951, 12953)", BUS_HEADING_12951 + "\n\n" + BUS_PRIOR_ART_12953 + "\n"),
+    ("a quoted slug inside a heading", "### proj, 2026-10-19 - the `outbox-ruling-candidate-check` trap\n\nBody.\n"),
+]
+
+
+@pytest.mark.parametrize("label, body", FALSIFIER_BODIES, ids=[label for label, _ in FALSIFIER_BODIES])
+def test_r3_plain_bus_prose_that_names_the_phrase_is_not_a_candidate(tmp_path, capsys, label, body):
+    rc, err = validate(tmp_path, _receipt(body), tmp_path / "no-such-clone", capsys)
+    assert rc == 0 and err == "", (label, err)
+
+
+def test_r3_a_trap_card_headed_by_a_ruling_candidate_slug_is_not_a_candidate(tmp_path, capsys):
+    text = ("---\ntarget: specs/mlv-app/cards.md\nkind: trap\nsource_commit: PENDING\nlaw4: attested\n---\n"
+            "## mlv-app/outbox-ruling-candidate-check\nrule: r\nmechanism: m\napplies: mlv-app\ncheck: c\nevidence: measured\n")
+    rc, err = validate(tmp_path, text, tmp_path / "no-such-clone", capsys)
+    assert rc == 0 and err == "", err
+
+
+def test_r3_a_marker_opens_a_block_so_the_same_words_after_a_blank_line_are_refused(tmp_path, capsys):
+    """The wrapped line of a paragraph is not a marker; the same words starting a paragraph are."""
+    wrapped = "### proj, 2026-10-19 - a measured fact\n\nWe filed a\nruling candidate titled x in the same push.\n"
+    opening = "### proj, 2026-10-19 - a measured fact\n\nWe filed a thing.\n\nruling candidate titled x in the same push.\n"
+    rc, err = validate(tmp_path, _receipt(wrapped), tmp_path / "no-such-clone", capsys)
+    assert rc == 0 and err == "", err
+    rc, err = validate(tmp_path, _receipt(opening), tmp_path / "no-such-clone", capsys)
+    assert rc == 1 and "RULING_CANDIDATE_NO_SUPERSEDES" in err, err
+
+
+def test_r3_a_quote_or_list_line_opens_a_block_even_without_a_blank_line_before_it(tmp_path, capsys):
+    for line in ("> Ruling candidate: x", "- ruling candidate: x", "1. Ruling candidate: x"):
+        text = _receipt("### proj, 2026-10-19 - a measured fact\n\nSome text that runs\n" + line + "\n")
+        rc, err = validate(tmp_path, text, tmp_path / "no-such-clone", capsys)
+        assert rc == 1 and "RULING_CANDIDATE_NO_SUPERSEDES" in err, (line, err)
+
+
+# ---------- the alias takes a verb per entry (the bus candidate template's rule 1) ----------
+
+@pytest.mark.parametrize("declaration", [
+    "Relationship to existing doctrine: extends R15; supersedes RULINGS.md:1126-1152\n",
+    "Relationship to existing doctrine: distinguishes R14.8, narrows tools/fleet-sweep.mjs\n",
+    "Relationship to existing doctrine: Adopts R15.3; Touches specs/mlv-app/cards.md\n",
+    "Relationship to existing doctrine:\n- extends R15\n- supersedes " + OPEN_CANDIDATE + "\n",
+    "touches/supersedes: extends R15 (the reference mechanism); R14.8\n",
+    "Relationship to existing doctrine: R15 (extends); supersedes R14.8\n",
+])
+def test_r3_a_leading_verb_per_entry_is_accepted_and_the_target_still_checked(tmp_path, capsys, declaration):
+    rc, err = validate(tmp_path, candidate(declaration), make_bus(tmp_path), capsys)
+    assert rc == 0 and err == "", (declaration, err)
+
+
+@pytest.mark.parametrize("declaration, code, named", [
+    ("Relationship to existing doctrine: extends R99\n", "RULING_CANDIDATE_TARGET_NOT_ON_BUS", "'extends R99'"),
+    ("Relationship to existing doctrine: extends R15; supersedes specs/mlv-app/nope.md\n", "RULING_CANDIDATE_TARGET_NOT_ON_BUS", "nope.md"),
+    ("Relationship to existing doctrine: extends fleet-sweep\n", "RULING_CANDIDATE_TARGET_MALFORMED", "fleet-sweep"),
+    ("Relationship to existing doctrine: extends\n", "RULING_CANDIDATE_TARGET_MALFORMED", "'extends'"),
+    ("Relationship to existing doctrine: replaces R15\n", "RULING_CANDIDATE_TARGET_MALFORMED", "replaces R15"),
+])
+def test_r3_a_verb_does_not_excuse_a_bad_target(tmp_path, capsys, declaration, code, named):
+    rc, err = validate(tmp_path, candidate(declaration), make_bus(tmp_path), capsys)
+    assert rc == 1 and code in err and named in err, (declaration, err)
+
+
+# ---------- every subcommand still parses (a second --bus raises for all of them, the push hook included) ----------
+
+SUBCOMMAND_ARGV = {
+    "validate": ["validate", "item.md"],
+    "debt": ["debt"],
+    "drain": ["drain", "--bus", "bus-clone"],
+    "kernel-filing": ["kernel-filing", "--bus", "bus-clone"],
+    "check-ledger": ["check-ledger"],
+    "check-commits": ["check-commits"],
+    "check-range": ["check-range"],
+    "check": ["check"],
+    "pre-push": ["pre-push"],
+    "stop": ["stop"],
+    "session-start": ["session-start"],
+    "install-hooks": ["install-hooks"],
+}
+
+
+def test_r3_the_argv_table_covers_every_subcommand_the_parser_defines():
+    assert set(SUBCOMMAND_ARGV) == set(_subcommand_parsers()), sorted(set(SUBCOMMAND_ARGV) ^ set(_subcommand_parsers()))
+
+
+@pytest.mark.parametrize("name", sorted(SUBCOMMAND_ARGV))
+def test_r3_parse_args_succeeds_for_every_subcommand(name):
+    parsed = ob.build_parser().parse_args(SUBCOMMAND_ARGV[name])
+    assert parsed.cmd == name
+
+
+def test_r3_the_validate_bus_help_names_no_flag_this_tool_does_not_have():
+    bus_help = [a.help for a in _subcommand_parsers()["validate"]._actions if "--bus" in a.option_strings][0]
+    assert "--exercise" not in bus_help and "second add_argument" not in bus_help, bus_help
+    assert not [a for a in _subcommand_parsers()["validate"]._actions if "--exercise" in a.option_strings]

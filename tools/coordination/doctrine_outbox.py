@@ -128,6 +128,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 from datetime import datetime, timedelta, timezone
 
 # ---------- constants that are fleet-wide, not per project ----------
@@ -2349,11 +2350,17 @@ def cmd_session_start(repo: pathlib.Path, ref: str, ledger: pathlib.Path) -> int
 # carries no `touches/supersedes:` declaration, names a target that is not shaped like one, or names one the bus clone
 # it reads does not hold. The bus is only READ, at its committed tip (HEAD); a bus the validator cannot read is UNKNOWN.
 
-RULING_CANDIDATE_PHRASE = r"ruling[\s-]+candidate"
-RULING_CANDIDATE_LEAD_RE = re.compile(RULING_CANDIDATE_PHRASE, re.I)
-RULING_CANDIDATE_AFTER_SEP_RE = re.compile(r"[-–—:][ \t]*" + RULING_CANDIDATE_PHRASE, re.I)
-RULING_CANDIDATE_COLON_RE = re.compile(RULING_CANDIDATE_PHRASE + r"\s*:", re.I)
-MARKER_PREFIX_RE = re.compile(r"[ \t]+|>|#{1,6}(?=[ \t]|$)|[-+*](?=[ \t])|\d+[.)](?=[ \t])|[*_`]+")
+# Whole words: the right boundary leaves out `ruling-candidates/`, `ruling-candidate-<slug>` and the plural.
+RULING_CANDIDATE_PHRASE = r"ruling[ \t-]+candidate(?![-\w/])"
+RULING_QUALIFIER = r"(?:(?:proposed|draft|new)[ \t]+)?"
+RULING_CANDIDATE_LEAD_RE = re.compile(RULING_QUALIFIER + RULING_CANDIDATE_PHRASE, re.I)
+RULING_CANDIDATE_AFTER_SEP_RE = re.compile(r"[-:][ \t]*" + RULING_QUALIFIER + RULING_CANDIDATE_PHRASE, re.I)
+RULING_CANDIDATE_COLON_RE = re.compile(r"(?<![\w/-])ruling[ \t-]+candidate[ \t]*:", re.I)
+# Markup that may sit in front of a marker, in any order: spaces, `>`, `#`s, a list bullet, emphasis, quotes, brackets.
+MARKER_FRONT_RE = re.compile(r"[ \t]+|(?P<quote>>)|(?P<atx>#{1,6})(?=[ \t]|$)|(?P<bullet>(?:[-+*]|\d+[.)])(?=[ \t]|$))"
+                             "|[*_`\"'“”‘’«»‹›\\[(]")
+MARKER_UNDERLINE_RE = re.compile(r"=+|-+")   # a setext underline, once the line is stripped
+RULING_TARGET_VERB_RE = re.compile(r"(?:extends|supersedes|distinguishes|touches|narrows|adopts)[ \t]+(?=\S)", re.I)
 TOUCHES_LABEL_RE = re.compile(r"^([ \t]*)([-*][ \t]+)?(?:\*\*)?(?:touches/supersedes|touches|supersedes|relationship[ \t]+to[ \t]+existing[ \t]+doctrine)(?:\*\*)?:(?:\*\*)?[ \t]*(.*?)[ \t]*$", re.I)
 TOUCHES_BULLET_RE = re.compile(r"^([ \t]*)[-*][ \t]+(\S.*?)[ \t]*$")
 TOUCHES_NONE_RE = re.compile(r"^none\b[ \t]*[:\-–—]?[ \t]*(.*)$", re.I)
@@ -2364,36 +2371,66 @@ RULING_BUS_ENV = "FACTORY_BUS_CLONE"
 RULINGS_FILE = "RULINGS.md"
 
 
-def marker_text(line: str) -> str:
-    """A line with its markdown furniture off: indent, blockquote `>`, heading `#`, list bullet (`-`, `*`, `+`,
-    `1.`) and leading emphasis come off the front, and `*`, `_` and backticks come out of the rest, so the words
-    a marker opens with are the first thing left."""
-    text = line.rstrip("\r")
+def normalise_marker_line(line: str) -> str:
+    """One line as the marker test reads it: Unicode NFKC (full-width forms and no-break spaces become their ASCII
+    twins), every format character (zero-width space or joiner, BOM, soft hyphen) deleted, every space separator
+    a plain space, every dash (en, em, minus, non-breaking hyphen) a `-`."""
+    out = []
+    for ch in unicodedata.normalize("NFKC", line.rstrip("\r\n")):
+        category = unicodedata.category(ch)
+        if category == "Cf":
+            continue
+        out.append(" " if category == "Zs" else "-" if category == "Pd" or ch == "−" else ch)
+    return "".join(out)
+
+
+def marker_line(line: str) -> tuple[str, int, bool, bool]:
+    """(text, quote depth, was a list item, was an ATX heading) for one line: its markup (`>`, `#`s, a bullet,
+    emphasis, quotes, brackets) comes off the front in any order, and `*`, `_` and backticks come out of the rest,
+    so the words a marker opens with are the first thing left."""
+    text, depth, bullet, heading = normalise_marker_line(line), 0, False, False
     while True:
-        found = MARKER_PREFIX_RE.match(text)
+        found = MARKER_FRONT_RE.match(text)
         if not found:
-            return re.sub(r"[*_`]", "", text)
+            return re.sub(r"[*_`]", "", text).strip(), depth, bullet, heading
+        depth += bool(found.group("quote"))
+        bullet = bullet or bool(found.group("bullet"))
+        heading = heading or bool(found.group("atx"))
         text = text[found.end():]
 
 
 def is_ruling_candidate(item: dict) -> bool:
-    """A ruling candidate is an item with a line that, once its markdown furniture is off (`marker_text`), opens with
-    `Ruling candidate` (any case, a space or hyphen between the words) whatever follows: `:`, ` (r2):`, ` - `, the
-    end of the line; bullet, quote, bold and heading forms alike. A heading line (any `#` line, and the first line of
-    the item) also counts when the phrase follows a ` - `, ` -- ` or `:` (`### proj, 2026-10-16 - RULING
-    CANDIDATE (r2): X`) or is followed by a colon. A line that only mentions the phrase mid-sentence, or a heading
-    that mentions someone else's candidate (`... for ruling candidate <id>`, no colon), is not a marker. When in
-    doubt it is a candidate: a fenced line counts too. A `kind: ruling` item is a ratified ruling
-    (`ratified_by` is required for it), not a candidate."""
-    first = item_heading(item)
-    for raw in item["body"].splitlines():
+    """A ruling candidate is an item with a marker line. A line can be one only where a block OPENS: the item's first
+    line, a line after a blank one, a heading, a list item, a line that starts a deeper blockquote, a setext heading
+    (a line over `===` or `---`), or any line in or at a fence (when in doubt it is a candidate). A continuation
+    line of a wrapped paragraph never is, so prose that wraps onto `ruling-candidates/x.md` or `ruling candidate
+    titled ...` is left alone. On such a line, once normalised (`normalise_marker_line`) and stripped of markup
+    (`marker_line`), the marker is `Ruling candidate` as whole words, any case, a space or dash between them, with
+    an optional `Proposed`, `Draft` or `New` before it, whatever follows (`:`, ` (r2):`, ` - `, the end of the line).
+    A heading-class line (ATX, setext, the item's first line) also counts when the phrase follows a `-` or `:`
+    (`### proj, 2026-10-16 - RULING CANDIDATE (r2): X`) or is followed by a colon. A line that only mentions the
+    phrase, or a heading that mentions someone else's candidate (`... for ruling candidate <id>`, no colon), is
+    not a marker. A `kind: ruling` item is a ratified ruling (`ratified_by` is required for it), not a candidate."""
+    lines = item["body"].splitlines()
+    fenced, seen_text, prev_blank, prev_depth = False, False, True, 0
+    for i, raw in enumerate(lines):
         line = raw.rstrip("\r")
-        text = marker_text(line)
-        if RULING_CANDIDATE_LEAD_RE.match(text):
-            return True
-        if line.lstrip().startswith("#") or line == first:
-            if RULING_CANDIDATE_AFTER_SEP_RE.search(text) or RULING_CANDIDATE_COLON_RE.search(text):
+        text, depth, bullet, heading = marker_line(line)
+        if _FENCE_OPEN_RE.match(line.lstrip(" \t>")):
+            fenced, at_fence = not fenced, True
+        else:
+            at_fence = False
+        setext = (bool(text) and not MARKER_UNDERLINE_RE.fullmatch(text) and i + 1 < len(lines)
+                  and bool(MARKER_UNDERLINE_RE.fullmatch(marker_line(lines[i + 1])[0])))
+        first = bool(text) and not seen_text
+        seen_text = seen_text or bool(text)
+        opens = prev_blank or bullet or heading or setext or fenced or at_fence or depth > prev_depth
+        if text and opens:
+            if RULING_CANDIDATE_LEAD_RE.match(text):
                 return True
+            if (heading or setext or first) and (RULING_CANDIDATE_AFTER_SEP_RE.search(text) or RULING_CANDIDATE_COLON_RE.search(text)):
+                return True
+        prev_blank, prev_depth = not text, depth
     return False
 
 
@@ -2439,9 +2476,10 @@ def touches_supersedes_entries(body: str) -> list[str] | None:
 def _ruling_target(entry: str) -> tuple[str, str] | None:
     """(kind, name) for one entry, or None when it is not shaped like a target. `rule` is an id like `R15` or `R14.8`;
     `path` is a bus-relative file or directory, with an optional `:<line>[-<line>]` or `#<anchor>` that is not
-    checked. A trailing parenthetical note is dropped. A bare word, an absolute or `..` path and a backslash path
-    are not targets."""
-    target = RULING_TARGET_NOTE_RE.sub("", entry).strip(" `")
+    checked. A leading verb (`extends`, `supersedes`, `distinguishes`, `touches`, `narrows`, `adopts`) and a
+    trailing parenthetical note are dropped. A bare word, an absolute or `..` path and a backslash path are not
+    targets."""
+    target = RULING_TARGET_NOTE_RE.sub("", RULING_TARGET_VERB_RE.sub("", entry, count=1)).strip(" `")
     if RULING_RULE_ID_RE.match(target):
         return "rule", target
     found = RULING_PATH_RE.match(target)
@@ -2587,8 +2625,7 @@ def build_parser() -> argparse.ArgumentParser:
     validate_p.add_argument("--deny-file", type=pathlib.Path, default=None)
     validate_p.add_argument("--bus", type=pathlib.Path, default=None,
                             help=f"the bus clone (default ${RULING_BUS_ENV}): a ruling candidate's touches/supersedes targets "
-                                 "must exist at its tip, and --exercise copies it; read, never written or run in. "
-                                 "The one --bus of validate: a second add_argument for it makes argparse raise")
+                                 "must exist at its tip; read, never written or run in")
 
     debt_p = sub.add_parser("debt", help="list unsent items; exit 1 if any, 2 if UNKNOWN")
     debt_p.add_argument("--ref", default=DEFAULT_REF)

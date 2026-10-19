@@ -78,14 +78,19 @@ the name of the GPU host. A refusal names the class, never the matched value.
 ## Ruling candidates name what they supersede (ROUTE-RULING-SUPERSEDES-1)
 
 A ruling candidate is an item with a heading or body line that opens with `Ruling candidate` (any case, a space or
-hyphen between the words) once its markdown is off: list bullets (`-`, `*`, `+`, `1.`), quote marks (`>`), heading
+hyphen between the words, whole words, optionally after `Proposed`, `Draft` or `New`) once its text is normalised (Unicode
+NFKC, zero-width and other format characters deleted, no-break spaces and en or em dashes made plain) and its markdown
+is off: list bullets (`-`, `*`, `+`, `1.`), quote marks (`>`), heading
 marks (`#`), bold, italics and backticks, whatever follows (`:`, ` (r2):`, ` - `, the end of the line). A heading
 line also counts when the phrase follows ` - ` or `:` (`### mlv-app, 2026-10-16 - RULING CANDIDATE (r2): X`). A line
-that only mentions the phrase mid-sentence is not a marker, and a marker inside a fence still counts (the check
+that only mentions the phrase mid-sentence is not a marker, and neither is a wrapped continuation line: a marker only
+sits where a block opens (the item's first line, a line after a blank one, a heading, a list item, a blockquote opener,
+a setext line), so prose that wraps onto `ruling-candidates/x.md` is left alone. A marker inside a fence still counts (the check
 fails closed). It must declare what it overlaps, so the producer finds a contradiction before the reviewer does
 (seed: PR 469 r1). `validate` refuses one without a `touches/supersedes:` declaration (`touches:` and `supersedes:`
 count too, as does `Relationship to existing doctrine:`, the field of the bus candidate template; same list and target
-rules; bold and a bullet allowed, entries add up across labels). The entries are rule ids (`R15`, `R14.8`) or
+rules; bold and a bullet allowed, entries add up across labels). Each entry may open with one verb (`extends`,
+`supersedes`, `distinguishes`, `touches`, `narrows`, `adopts`), whose target is still checked. The entries are rule ids (`R15`, `R14.8`) or
 bus-relative paths (`RULINGS.md:1126-1152`, `tools/fleet-sweep.mjs`), comma or semicolon separated on the label line
 or as bullets under it, or the single entry `none: <reason of at least 4 words>`. A label inside a fenced block does
 not count. Typed refusals (exit 1):
