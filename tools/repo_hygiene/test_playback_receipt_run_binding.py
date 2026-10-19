@@ -695,6 +695,10 @@ CONSUMER_FAILING_ACTION: dict[str, tuple[tuple[str, int], ...]] = {
     "tools/profiling/bachelor/playback-attr-3-cuda-job.ps1": (
         (r"\$smokeRc\s*=\s*\$LASTEXITCODE[\s\S]*?if\s*\(\$null\s+-ne\s+\$smokeLaunchException\s+-or\s+\$smokeRc\s+-ne\s+0[^\n]*\)\s*\{"
          r"[\s\S]*?result='SMOKE_RUN_FAILED'[\s\S]*?(?P<act>\bexit\s+18\b)", 1),),
+    # VENUE-REFERENCE-FRAME-JOB-1: a capture that exited non-zero (43 = its receipt check refused, 70 = it produced no exit code) is a failed job
+    # that exits with the capture's own code and writes no candidate.
+    "tools/profiling/bachelor/reference-frame-runner-job.ps1": (
+        (r"\$captureRc\s*=\s*\$LASTEXITCODE[\s\S]*?if\s*\(\$captureRc\s+-ne\s+0\)\s*\{[^}]*?(?P<act>\bexit\s+\$captureRc\b)", 1),),
     "tools/profiling/run-shipping-guard-smoke.ps1": (
         (r"\$code\s*=\s*\$LASTEXITCODE[\s\S]*?status\s*=\s*if\s*\(\$code\s+-eq\s+0\)\s*\{\s*\"success\"\s*\}\s*else\s*\{\s*(?P<act>\"failed\")", 1),),
     "tools/profiling/run-local-cuda-playback-dng-smoke.ps1": (

@@ -59,6 +59,13 @@ param(
     # candidate differed by mean|px| 28 across 99.92% of pixels, which is a different-frame
     # signature, not a colour change. 'off' makes presented-frame N equal timeline frame N.
     [ValidateSet('off','on','persisted')][string]$DropFrameMode = 'off',
+    # VENUE-REFERENCE-FRAME-JOB-1: the output-budget gate profile (tools/gates/output-budget.json), so a capture is the frame the gate
+    # compares. -StartFrame is the clip's startFrame (120 for M16-1243; the gate does not start at 0), -DisableLookAssist is the profile's
+    # disableLookAssist (the app's --no-look-assist), -PlaybackProcessing its playbackProcessing (the app's --playback-processing).
+    # Each default adds nothing to the app's argv: a caller that passes none of them gets the argv this script has always built.
+    [ValidateRange(0, 2147483647)][int]$StartFrame = 0,
+    [switch]$DisableLookAssist,
+    [ValidateSet('', 'auto', 'receipt', 'subset')][string]$PlaybackProcessing = '',
     [hashtable]$ExtraEnv = @{}
 )
 
@@ -110,7 +117,7 @@ if ($PresentedFrames -lt 0) {
     $capturedLength = Get-GuiSmokeClipLength -Path $Clip
     $PresentedFrames = if ($capturedLength.known) { Get-GuiSmokeMinPresentedFrames -Fps $capturedLength.fps } else { 0 }
 }
-$clipLengthGate = Test-GuiSmokeClipLength -Path $Clip -WindowSeconds $Seconds -TargetPresentedFrames $PresentedFrames
+$clipLengthGate = Test-GuiSmokeClipLength -Path $Clip -WindowSeconds $Seconds -StartFrame $StartFrame -TargetPresentedFrames $PresentedFrames
 if ($clipLengthGate.verdict -ne 'OK') {
     Write-Output "CAPTURE: REFUSED - $($clipLengthGate.message)"
     exit (Get-GuiSmokeGateExitCode -Verdict $clipLengthGate.verdict)
@@ -131,8 +138,11 @@ foreach ($staleReceipt in @($shot, (Join-Path $OutDir 'reference-frame-candidate
 # --loop is DELIBERATELY ABSENT when the frame is pinned: looping wraps the timeline and
 # reintroduces exactly the which-frame ambiguity --presented-frames exists to remove.
 $playArgs = @('--gui-smoke-playback','--input',$Clip,'--scope','none','--no-zebras',
-              '--seconds',[string]$Seconds,'--settle-ms',[string]$SettleMs,'--start-frame','0','--drop-frame-mode',$DropFrameMode)
+              '--seconds',[string]$Seconds,'--settle-ms',[string]$SettleMs,'--start-frame',[string]$StartFrame,'--drop-frame-mode',$DropFrameMode)
 if ($PresentedFrames -gt 0) { $playArgs += @('--presented-frames',[string]$PresentedFrames) }
+# VENUE-REFERENCE-FRAME-JOB-1: gate-profile flags, appended only when asked for; --screenshot-output stays last.
+if ($DisableLookAssist) { $playArgs += '--no-look-assist' }
+if ($PlaybackProcessing -ne '') { $playArgs += "--playback-processing=$PlaybackProcessing" }
 # PLAYBACK-CLIP-LENGTH-ENFORCE-1 (owner rule 2026-09-30): the old time-based fallback passed --loop.
 # Looping is never allowed; a time-based capture plays once over a window the clip outlasts.
 $playArgs += @('--screenshot-output',$shot)
@@ -233,6 +243,9 @@ $manifest = [ordered]@{
         settleMs        = $SettleMs
         presentedFrames = $PresentedFrames
         dropFrameMode   = $DropFrameMode
+        startFrame      = $StartFrame
+        lookAssistDisabled = [bool]$DisableLookAssist
+        playbackProcessing = $PlaybackProcessing
         # Records WHY the frame is (or is not) comparable across builds, so a reader never has to
         # infer it from the flag list.
         framePinned     = ($PresentedFrames -gt 0)

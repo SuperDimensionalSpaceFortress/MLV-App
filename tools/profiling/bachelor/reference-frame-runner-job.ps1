@@ -1,0 +1,547 @@
+# reference-frame-runner-job.ps1 -- GENERATOR (runs locally; nothing here runs on a venue).
+# VENUE-REFERENCE-FRAME-JOB-1. Emits ONE job that runs tools/profiling/capture-reference-frame.ps1 on a venue
+# (Bachelor, or Ultra-Magnus when Bachelor is held) against a STAGED build, on one consented clip, under the output-budget
+# gate profile, and publishes the reference-frame candidate it produced.
+#
+# THE GAP THIS CLOSES (OUTPUT-BUDGET-KNOWN-GOOD-PROPOSAL-1 design, NO_GO, 2026-10-19). No tracked venue job ran the capture
+# script, and the script's argv did not match the gate's wb_locked profile (start frame 0 where the gate compares the clip's
+# startFrame, no Look Assist or processing flags), so no known-good capture could be produced on a venue. This job is the
+# missing consumer; capture-reference-frame.ps1 takes the profile as its own -StartFrame / -DisableLookAssist /
+# -PlaybackProcessing arguments (defaults unchanged for every existing caller).
+#
+# WHAT IT DOES NOT DO. It never promotes anything: the candidate keeps status "candidate-unreviewed" (the capture script says
+# so itself, and this job never writes "reviewed_instrumented_known_good"). It never weakens the capture script's receipt
+# check -- source_advanced, the run nonce and exit 43 are the capture script's own, and the job treats any non-zero capture exit
+# as a failed capture. It never writes venue-clip-consent.json: consent is READ through Get-DvClipAdmission, from the tracked
+# file as COMMITTED (the owner's blanket record included, DualVenueRunner.psm1 Get-DvClipAdmission), and a clip it does not admit
+# is refused here, with a typed code, before any job is written. It launches nothing at generation time.
+#
+# TWO COMMITS, NEVER ONE. -SourceCommit is the commit the staged build was built from (the build under test: it can be older than
+# the gate-profile arguments). -ToolsCommit (default: HEAD of -RepoRoot) is the commit whose committed bytes supply the capture
+# script, its dependency and the gate spec. A -ToolsCommit whose capture script predates -StartFrame / -DisableLookAssist /
+# -PlaybackProcessing is refused (REFERENCE_FRAME_CAPTURE_SCRIPT_PREDATES_GATE_PROFILE) rather than failing at parameter binding on a venue.
+#
+# THE BUNDLE IS AN EXPLICIT, PINNED MANIFEST -- the pattern of attr3-stage-smoke-runner-job.ps1. The capture script is not
+# launchable alone: it dot-sources gui-smoke-length-gate.ps1 through $PSScriptRoot. The closure (below, $CaptureClosure) is a
+# fixed list, proved complete against the committed text by Assert-AttrCudaClosureComplete (an AST census over each file's load
+# sites, the same tripwire the smoke-runner closure uses). Every file's exact COMMITTED bytes (never the working tree) travel
+# INLINE in the emitted job, base64-encoded, each with its baked sha256. On the venue the job decodes and verifies EVERY file
+# before a single byte is written, writes them into its own fresh work directory, re-verifies each on disk, and re-verifies
+# again immediately before launching the capture. The closure is proved complete by a generator-time check (every sibling the
+# capture script loads through $PSScriptRoot is a bundle member) and by test_reference_frame_runner_job.py.
+#
+# `<jobId>.job.ps1 -VerifyOnly` runs the read-only prefix (name safety, base64 decode, hash for every bundle file) and exits
+# without creating or publishing anything.
+#
+# THE GATE PROFILE IS READ FROM THE COMMITTED SPEC, never typed: tools/gates/output-budget.json at -ToolsCommit supplies the
+# profile (disableLookAssist, playbackProcessing, qualityMode) and the clip's startFrame, and the spec's sha256 is recorded in the
+# job's result. A clip the spec does not name has no gate frame and is refused.
+#
+# THE CLIP IS A CLIP ID. Its parts are resolved by tools/gates/resolve_consented_clip.py (the one resolver; no path is ever typed
+# or printed), carried in the job as base64, and each part's length and sha256 are re-checked on the venue before anything runs.
+#
+# NOT COVERED HERE (named, not hidden): no display wake and no PresentMon. If the venue's display is asleep the capture fails
+# visibly (typed, non-zero) rather than producing a frame; the live run is OUTPUT-BUDGET-KNOWN-GOOD-PROPOSAL-2.
+#
+# Usage:
+#   pwsh -NoProfile -File "<repo>\tools\profiling\bachelor\reference-frame-runner-job.ps1" `
+#       -SourceCommit <40-hex> -BuildManifestSha256 <64-hex> -ClipId M16-1243 -OutFile <path>\<jobId>.job.ps1
+# then submit the emitted job through um-run.ps1 like every other venue job (NA-7: um-run is the only writer to a venue share).
+#
+# Exit codes: 0 emitted; 21 refused (RESULT=REFERENCE_FRAME_JOB_REFUSED CODE=<token>, nothing written).
+
+[CmdletBinding()]
+param(
+    # The commit the STAGED BUILD was built from (cache file names, the build manifest's sourceCommit, the capture's recorded identity).
+    [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{40}$')][string]$SourceCommit,
+    # The commit whose COMMITTED bytes supply the capture script, its dependencies and tools/gates/output-budget.json. It is NOT the build's
+    # commit: the build under test may be older than the capture script's gate-profile arguments (the June-era build the known-good bridge needs).
+    # Default: the HEAD of -RepoRoot, the tooling checkout this generator runs from.
+    [ValidatePattern('^([0-9a-f]{40})?$')][string]$ToolsCommit = '',
+    # The sha the assembler printed (MANIFEST_SHA256=) for the staged build: the job authenticates the cache's build.json
+    # against it BEFORE reading a field of it, exactly as playback-attr-3-cuda-job.ps1 does.
+    [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{64}$')][string]$BuildManifestSha256,
+    [Parameter(Mandatory = $true)][ValidatePattern('^[A-Za-z0-9_-]{1,40}$')][string]$ClipId,
+    [Parameter(Mandatory = $true)][string]$OutFile,
+    [ValidateSet('bachelor', 'ultra-magnus')][string]$Venue = 'bachelor',
+    # The gate profile id in tools/gates/output-budget.json (wb_locked is the one the gate's wb arm compares).
+    [ValidatePattern('^[a-z0-9_]{1,40}$')][string]$GateProfile = 'wb_locked',
+    # capture-reference-frame.ps1's own -Seconds (its fail-closed timeout) and -PresentedFrames (-1 = auto: the smallest N that plays the floor).
+    [ValidateRange(10, 3600)][int]$Seconds = 30,
+    [ValidateRange(-1, 100000)][int]$PresentedFrames = -1,
+    # Default: the venue table's agentRoot.
+    [string]$AgentRoot = '',
+    [string]$RepoRoot = '',
+    # TEST SEAMS. Refused unless -OfflineTestMode (production reads the consent and the venue table only as committed). A job
+    # generated in offline-test mode refuses to run on any host (it is not evidence), except under -VerifyOnly.
+    [switch]$OfflineTestMode,
+    [string]$ConsentPath = '',
+    [string]$VenueTablePath = ''
+)
+
+$ErrorActionPreference = 'Stop'
+
+foreach ($seam in 'ConsentPath', 'VenueTablePath') {
+    if ($PSBoundParameters.ContainsKey($seam) -and -not $OfflineTestMode) {
+        throw "REFERENCE_FRAME_TEST_SEAM_IN_PRODUCTION -$seam is a test-only override and is refused without -OfflineTestMode: consent and the venue table are read only from the committed tracked files"
+    }
+}
+
+# A refusal is typed, path-free, and happens before anything is generated: nothing below this function has written a file.
+function Stop-Refused([string]$Code) {
+    if ([string]::IsNullOrWhiteSpace($Code)) { $Code = 'REFERENCE_FRAME_REFUSAL_UNTYPED' }
+    Write-Output "RESULT=REFERENCE_FRAME_JOB_REFUSED CODE=$Code"
+    exit 21
+}
+
+$dvDir = Join-Path $PSScriptRoot '..\dual-venue'
+Import-Module (Join-Path $dvDir 'DualVenueRunner.psm1') -Force
+Import-Module (Join-Path $PSScriptRoot 'AttrCudaArtifacts.psm1') -Force
+
+if ([string]::IsNullOrWhiteSpace($RepoRoot)) { $RepoRoot = Join-Path $PSScriptRoot '..\..\..' }
+try { $RepoRoot = (Resolve-Path -LiteralPath $RepoRoot).Path } catch { throw 'REFERENCE_FRAME_REPOROOT_INVALID -RepoRoot does not resolve to an existing path' }
+if ([string]::IsNullOrWhiteSpace($ToolsCommit)) {
+    $ToolsCommit = ([string](& git -C $RepoRoot rev-parse --verify HEAD 2>$null)).Trim()
+    if ($ToolsCommit -cnotmatch '^[0-9a-f]{40}$') { Stop-Refused 'REFERENCE_FRAME_TOOLS_COMMIT_UNRESOLVED' }
+}
+
+# --- 1. consent: the ONE gate, from the committed files, before anything is resolved or generated ---------------------------------
+$sourceArgs = @{ RepoRoot = $RepoRoot }
+if ($OfflineTestMode) {
+    $sourceArgs['OfflineTestMode'] = $true
+    if ($PSBoundParameters.ContainsKey('ConsentPath')) { $sourceArgs['ConsentPath'] = $ConsentPath }
+    if ($PSBoundParameters.ContainsKey('VenueTablePath')) { $sourceArgs['VenueTablePath'] = $VenueTablePath }
+}
+$sources = Resolve-DvAdmissionSources @sourceArgs
+if (-not $sources.ok) { Stop-Refused ([string]$sources.reason) }
+try { $table = ConvertFrom-DvVenueTableText $sources.tableText } catch { Stop-Refused 'VENUE_TABLE_INVALID' }
+if ($null -eq $table.venues.PSObject.Properties[$Venue]) { Stop-Refused 'VENUE_UNKNOWN' }
+$admission = Get-DvClipAdmission -ClipId $ClipId -Venue $Venue -Table $table -ConsentText ([string]$sources.consentText) -RepoRoot $RepoRoot
+if (-not $admission.admitted) { Stop-Refused ([string]$admission.reason) }
+$admissionMode = if ($OfflineTestMode) { 'offline-test' } else { 'production' }
+
+# --- 2. the gate profile and the clip's start frame, from the spec COMMITTED at -SourceCommit ---------------------------------------
+$specRelativePath = 'tools/gates/output-budget.json'
+$specText = $null
+$specSha256 = $null
+$specTemp = Join-Path ([IO.Path]::GetTempPath()) "refframe-spec-$([Guid]::NewGuid().ToString('N')).tmp"
+try {
+    $specBlob = Resolve-AttrCudaCommittedBlobId -RepoRoot $RepoRoot -Commit $ToolsCommit -RepoRelativePath $specRelativePath
+    $specSha256 = Save-AttrCudaCommittedBlobBytes -RepoRoot $RepoRoot -BlobId $specBlob -Destination $specTemp
+    $specText = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($specTemp))
+} catch {
+    Stop-Refused 'REFERENCE_FRAME_GATE_SPEC_UNRESOLVED'
+} finally {
+    if (Test-Path -LiteralPath $specTemp) { Remove-Item -LiteralPath $specTemp -Force -ErrorAction SilentlyContinue }
+}
+try { $spec = $specText | ConvertFrom-Json } catch { Stop-Refused 'REFERENCE_FRAME_GATE_SPEC_INVALID' }
+$gateProfileSpec = @($spec.profiles | Where-Object { [string]$_.id -ceq $GateProfile }) | Select-Object -First 1
+if ($null -eq $gateProfileSpec) { Stop-Refused 'REFERENCE_FRAME_GATE_PROFILE_UNKNOWN' }
+$specClip = @($spec.clips | Where-Object { [string]$_.id -ceq $ClipId }) | Select-Object -First 1
+if ($null -eq $specClip) { Stop-Refused 'REFERENCE_FRAME_CLIP_NOT_IN_GATE_SPEC' }
+$gateStartFrame = 0
+if (-not [int]::TryParse([string]$specClip.startFrame, [ref]$gateStartFrame) -or $gateStartFrame -lt 0) { Stop-Refused 'REFERENCE_FRAME_GATE_START_FRAME_INVALID' }
+$gateProcessing = [string]$gateProfileSpec.playbackProcessing
+if ($gateProcessing -cnotin @('', 'auto', 'receipt', 'subset')) { Stop-Refused 'REFERENCE_FRAME_GATE_PROCESSING_INVALID' }
+$gateQualityMode = [string]$gateProfileSpec.qualityMode
+if ($gateQualityMode -cnotmatch '^[0-9]{0,2}$') { Stop-Refused 'REFERENCE_FRAME_GATE_QUALITY_MODE_INVALID' }
+if ($gateProfileSpec.disableLookAssist -isnot [bool]) { Stop-Refused 'REFERENCE_FRAME_GATE_LOOK_ASSIST_INVALID' }
+$disableLookAssistLiteral = if ([bool]$gateProfileSpec.disableLookAssist) { '$true' } else { '$false' }
+
+# --- 3. the clip's parts, by id (generator-side only; no path is printed) -----------------------------------------------------------
+# Mirrors playback-attr-3-cuda-job.ps1 Resolve-AttrCudaOwnerClipParts: the resolver is a CHILD PROCESS that writes paths only into a
+# private --emit-json temp file; this generator reads it in-process and deletes it. Each part's path travels as base64 from here on.
+function Resolve-ReferenceFrameClipParts([string]$Id) {
+    $resolverPath = Join-Path $PSScriptRoot '..\..\gates\resolve_consented_clip.py'
+    if (-not (Test-Path -LiteralPath $resolverPath -PathType Leaf)) { Stop-Refused 'REFERENCE_FRAME_CLIP_RESOLVER_MISSING' }
+    $resolverPath = (Resolve-Path -LiteralPath $resolverPath).Path
+    $python = Get-Command python.exe -ErrorAction SilentlyContinue
+    $pyArgs = @()
+    $pyExe = $null
+    if ($null -ne $python) {
+        $major = @(& $python.Source -c 'import sys; print(sys.version_info[0])' 2>$null)
+        if ($LASTEXITCODE -eq 0 -and $major.Count -eq 1 -and $major[0] -eq '3') { $pyExe = $python.Source }
+    }
+    if ($null -eq $pyExe) {
+        $launcher = Get-Command py.exe -ErrorAction SilentlyContinue
+        if ($null -eq $launcher) { Stop-Refused 'REFERENCE_FRAME_NO_PYTHON' }
+        $pyExe = $launcher.Source; $pyArgs = @('-3')
+    }
+    $emitPath = Join-Path ([IO.Path]::GetTempPath()) "refframe-clip-$([Guid]::NewGuid().ToString('N')).json"
+    try {
+        [void](& $pyExe @pyArgs $resolverPath '--clip-id' $Id '--repo-root' $RepoRoot '--emit-json' $emitPath 2>&1)
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $emitPath -PathType Leaf)) { Stop-Refused 'REFERENCE_FRAME_CLIP_RESOLVE_REFUSED' }
+        $resolved = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($emitPath)) | ConvertFrom-Json
+    } finally {
+        if (Test-Path -LiteralPath $emitPath) { Remove-Item -LiteralPath $emitPath -Force -ErrorAction SilentlyContinue }
+    }
+    if ([string]$resolved.clipId -cne $Id -or @($resolved.parts).Count -eq 0) { Stop-Refused 'REFERENCE_FRAME_CLIP_RESOLVE_REFUSED' }
+    $pathPattern = '^[A-Za-z]:(?:/[A-Za-z0-9_.-]+)+$'
+    @(@($resolved.parts) | Sort-Object { [int]$_.index } | ForEach-Object {
+        $sha = ([string]$_.sha256).ToLowerInvariant()
+        if (([string]$_.path) -notmatch $pathPattern -or $sha -notmatch '^[0-9a-f]{64}$') { Stop-Refused 'REFERENCE_FRAME_CLIP_PART_INVALID' }
+        [ordered]@{ index = [int]$_.index; pathBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$_.path)); length = [int64]$_.length; sha256 = $sha }
+    })
+}
+$ownerParts = @(Resolve-ReferenceFrameClipParts -Id $ClipId)
+$ownerPartsJson = ConvertTo-Json -InputObject @($ownerParts) -Compress -Depth 5
+
+# --- 4. the hash-pinned bundle: the capture script's pinned closure, as COMMITTED at -SourceCommit -------------------------------------
+$CaptureClosure = @(
+    'tools/profiling/capture-reference-frame.ps1',
+    'tools/profiling/gui-smoke-length-gate.ps1'
+)
+$closure = @(Resolve-AttrCudaSmokeRunnerClosure -RepoRoot $RepoRoot -Commit $ToolsCommit -RepoRelativePaths $CaptureClosure)
+
+function ConvertTo-ReferenceFramePsLiteral([string]$Value) { "'" + $Value.Replace("'", "''") + "'" }
+
+$bundleTemp = Join-Path ([IO.Path]::GetTempPath()) "refframe-bundle-$([Guid]::NewGuid().ToString('N'))"
+$bundleLines = @()
+try {
+    [void](New-Item -ItemType Directory -Path $bundleTemp -Force)
+    foreach ($entry in $closure) {
+        [void](Assert-AttrCudaSafeArtifactName -Name $entry.name)
+        if ($entry.sha256 -notmatch '^[0-9a-f]{64}$') { throw "ATTRCUDA_BLOB_SHA_MALFORMED bundle file sha256 is not 64 lowercase hex for $($entry.name)" }
+        $local = Join-Path $bundleTemp $entry.name
+        $saved = Save-AttrCudaCommittedBlobBytes -RepoRoot $RepoRoot -BlobId $entry.blobId -Destination $local
+        if ($saved -ne $entry.sha256) { throw "ATTRCUDA_BLOB_SHA_MALFORMED re-saved bytes for $($entry.name) hash to $saved, expected $($entry.sha256)" }
+        # Completeness tripwire (the AST census Assert-AttrCudaClosureComplete cannot be used here: it does not classify the capture
+        # script's own app launch, and its pinned exclusions live in a module this card does not touch). Every sibling the capture
+        # script loads through $PSScriptRoot must be a bundle member, or the job would die at its own first load line on the venue.
+        if ($entry.name -ceq 'capture-reference-frame.ps1') {
+            # The tooling commit must carry the gate-profile arguments the job passes; one that predates them would die at parameter binding on the venue.
+            $captureText = [IO.File]::ReadAllText($local)
+            foreach ($needed in '\[int\]\$StartFrame', '\[switch\]\$DisableLookAssist', '\[string\]\$PlaybackProcessing') {
+                if ($captureText -cnotmatch $needed) { Stop-Refused 'REFERENCE_FRAME_CAPTURE_SCRIPT_PREDATES_GATE_PROFILE' }
+            }
+            foreach ($loaded in [regex]::Matches([IO.File]::ReadAllText($local), "Join-Path \`$PSScriptRoot '([^']+)'")) {
+                if (@($closure | Where-Object { $_.name -ceq $loaded.Groups[1].Value }).Count -eq 0) { Stop-Refused 'REFERENCE_FRAME_BUNDLE_INCOMPLETE' }
+            }
+        }
+        $bundleLines += "    [pscustomobject]@{ name = $(ConvertTo-ReferenceFramePsLiteral $entry.name); sha256 = '$($entry.sha256)'; base64 = '$([Convert]::ToBase64String([IO.File]::ReadAllBytes($local)))' }"
+    }
+} finally {
+    if (Test-Path -LiteralPath $bundleTemp) { Remove-Item -LiteralPath $bundleTemp -Recurse -Force -ErrorAction SilentlyContinue }
+}
+$bundleEntriesLiteral = "@(`r`n" + ($bundleLines -join ",`r`n") + "`r`n)"
+$bundleDigest = Get-AttrCudaClosureDigestHex -Closure $closure
+
+# --- 5. the staged build's cache names and the venue's agent root -------------------------------------------------------------------
+$names = Get-AttrCudaArtifactNames -SourceCommit $SourceCommit
+foreach ($n in @($names.exeName, $names.reconName, $names.packageZipName, $names.buildManifestName, $names.packageExeName)) { [void](Assert-AttrCudaSafeArtifactName -Name $n) }
+$venueEntry = $table.venues.PSObject.Properties[$Venue].Value
+if ([string]::IsNullOrWhiteSpace($AgentRoot)) { $AgentRoot = [string]$venueEntry.agentRoot }
+if ($AgentRoot -notmatch '^[A-Za-z]:\\[A-Za-z0-9 _.~\\-]+$') { throw 'REFERENCE_FRAME_AGENTROOT_INVALID -AgentRoot contains characters outside the allowlist' }
+
+$jobId = "reference-frame-$($SourceCommit.Substring(0,12))-$ClipId-$($bundleDigest.Substring(0,12))"
+[void](Assert-AttrCudaSafeArtifactName -Name $jobId)
+
+$embeddedFunctions = Get-AttrCudaEmbeddedFunctionSource -Name @(
+    'Assert-AttrCudaSafeArtifactName',
+    'Assert-AttrCudaDirectChild',
+    'Assert-AttrCudaNoLinkBelowRoot',
+    'Assert-AttrCudaWritableFileSlot',
+    'Test-AttrCudaPathIsReparsePoint',
+    'Read-AttrCudaBase64Payload',
+    'Publish-AttrCudaBytes',
+    'Publish-AttrCudaText',
+    'Publish-AttrCudaFileCopy',
+    'New-AttrCudaDirectory',
+    'Remove-AttrCudaTree',
+    'Remove-AttrCudaPartialFile',
+    'Initialize-AttrCudaFileIdNative',
+    'ConvertTo-AttrCudaFileIdObject',
+    'Get-AttrCudaFileId',
+    'Remove-AttrCudaFileByProof',
+    'Remove-AttrCudaFileById',
+    'Add-AttrCudaOwnedRecord',
+    'Read-AttrCudaOwnedJournal',
+    'Get-AttrCudaOwnershipProof',
+    'New-AttrCudaOwnedRoot',
+    'New-AttrCudaOwnedFileStream',
+    'Add-AttrCudaTraceLine',
+    'Get-AttrCudaFileSha256Blocks',
+    'Test-AttrCudaFootagePart',
+    'Assert-AttrCudaBuildManifest'
+)
+
+# --- job body template (placeholders are substituted below, in one pass) -----------------------------------------------------------
+$template = @'
+# -VerifyOnly runs the read-only prefix (name safety, base64 decode, hash for every bundle file) and exits WITHOUT creating
+# anything. The agent never passes it; the behavioural tests do.
+param([switch]$VerifyOnly)
+
+$ErrorActionPreference = 'Stop'
+$JobId = '__JOB_ID__'
+$AgentRoot = '__AGENT_ROOT__'
+$SourceCommit = '__SOURCE_COMMIT__'
+$ToolsCommit = '__TOOLS_COMMIT__'
+$BuildManifestSha256 = '__BUILD_MANIFEST_SHA256__'
+$ClipId = '__CLIP_ID__'
+$Venue = '__VENUE__'
+$AdmissionMode = '__ADMISSION_MODE__'
+$ConsentKind = '__CONSENT_KIND__'
+$GateProfileId = '__GATE_PROFILE_ID__'
+$GateSpecSha256 = '__GATE_SPEC_SHA256__'
+$StartFrame = __START_FRAME__
+$PlaybackProcessing = '__PLAYBACK_PROCESSING__'
+$QualityMode = '__QUALITY_MODE__'
+$DisableLookAssist = __DISABLE_LOOK_ASSIST__
+$Seconds = __SECONDS__
+$PresentedFrames = __PRESENTED_FRAMES__
+$ExeName = '__EXE_NAME__'
+$ReconName = '__RECON_NAME__'
+$PackageZipName = '__PACKAGE_ZIP_NAME__'
+$PackageExeName = '__PACKAGE_EXE_NAME__'
+$BuildManifestName = '__BUILD_MANIFEST_NAME__'
+$OwnerPartsJson = '__OWNER_PARTS_JSON__'
+$BundleEntries = __BUNDLE_ENTRIES__
+$Cache = Join-Path $AgentRoot 'cache'
+$Work = Join-Path $AgentRoot "work\$JobId"
+$Pub = Join-Path $AgentRoot "outbox\$JobId.artifacts"
+$OwnedJournal = Join-Path $AgentRoot '.attrcuda-owned.jsonl'
+
+function Say([string]$Message) { Write-Output "[$JobId] $Message" }
+function Get-ShaLower([string]$Path) { (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant() }
+
+# --- verifiers, embedded VERBATIM from tools/profiling/bachelor/AttrCudaArtifacts.psm1 --------
+__EMBEDDED_FUNCTIONS__
+# --- end embedded verifiers -------------------------------------------------------------------
+
+$StepLog = [System.Collections.Specialized.OrderedDictionary]::new()
+$PubReady = $false
+
+function Complete-Failed([int]$Code, [string]$Step, [string]$Message) {
+    $StepLog[$Step] = $Code
+    Say "FAIL step=$Step exit=$Code $Message"
+    if ($PubReady -and (Test-Path -LiteralPath $Pub)) {
+        try {
+            [void](Publish-AttrCudaText -Path (Join-Path $Pub 'result.json') -Value (([ordered]@{
+                schema = 'mlvapp.reference-frame-runner.v1'; jobId = $JobId; exitCode = $Code; failedStep = $Step; message = $Message
+                stagedOnHost = $env:COMPUTERNAME; steps = $StepLog
+            }) | ConvertTo-Json -Depth 10))
+        } catch {
+            Say "RESULT_JSON_NOT_WRITTEN $($_.Exception.Message)"
+        }
+    }
+    Write-Output "RESULT=REFERENCE_FRAME_FAILED STEP=$Step EXIT=$Code"
+    exit $Code
+}
+
+function Assert-UnderAgentRoot([string]$Path, [string]$Label) {
+    $full = [IO.Path]::GetFullPath($Path)
+    $root = [IO.Path]::GetFullPath($AgentRoot)
+    if ($full -ne $root -and -not $full.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)) {
+        throw "job-owned path '$Label' resolves outside the agent root: $full"
+    }
+}
+foreach ($check in @(@{ path = $Cache; label = 'Cache' }, @{ path = $Work; label = 'Work' }, @{ path = $Pub; label = 'Pub' })) { Assert-UnderAgentRoot $check.path $check.label }
+
+Say "START clip=$ClipId profile=$GateProfileId startFrame=$StartFrame bundleFiles=$($BundleEntries.Count) admission=$AdmissionMode"
+
+# --- name safety, before anything is decoded, written or run -----------------------------------------------------------------------
+try {
+    foreach ($entry in $BundleEntries) { [void](Assert-AttrCudaSafeArtifactName -Name $entry.name) }
+    foreach ($n in @($ExeName, $ReconName, $PackageZipName, $PackageExeName, $BuildManifestName)) { [void](Assert-AttrCudaSafeArtifactName -Name $n) }
+} catch {
+    Complete-Failed 6 'artifactNameSafety' $_.Exception.Message
+}
+$StepLog['artifactNameSafety'] = 0
+
+# A job generated in offline-test mode is not evidence and never runs (VerifyOnly writes nothing, so it is allowed).
+if ($AdmissionMode -ne 'production' -and -not $VerifyOnly) {
+    Complete-Failed 22 'admissionMode' 'OFFLINE_TEST_JOB_REFUSED this job was generated with test seams and can never run'
+}
+
+# --- decode and verify EVERY bundle file BEFORE a single byte reaches disk --------------------------------------------------------
+$decoded = @{}
+try {
+    foreach ($entry in $BundleEntries) {
+        $payload = Read-AttrCudaBase64Payload -Base64 $entry.base64
+        if ($payload.sha256 -ne $entry.sha256) {
+            throw "sha256 mismatch for $($entry.name): baked $($entry.sha256), decoded $($payload.sha256)"
+        }
+        $decoded[$entry.name] = $payload.bytes
+    }
+} catch {
+    Complete-Failed 4 'bundleDecode' $_.Exception.Message
+}
+$StepLog['bundleDecode'] = 0
+
+if ($VerifyOnly) {
+    Write-Output "RESULT=VERIFY_ONLY_OK FILES=$($BundleEntries.Count) CLIP=$ClipId PROFILE=$GateProfileId"
+    exit 0
+}
+
+# --- job-owned directories, created fresh and recorded ------------------------------------------------------------------------------
+[void](New-AttrCudaDirectory -Path (Join-Path $AgentRoot 'work'))
+[void](New-AttrCudaDirectory -Path (Join-Path $AgentRoot 'outbox'))
+$workRoot = New-AttrCudaOwnedRoot -TrustedRoot $AgentRoot -Path $Work -OwnedJournal $OwnedJournal
+$pubRoot = New-AttrCudaOwnedRoot -TrustedRoot $AgentRoot -Path $Pub -OwnedJournal $OwnedJournal
+if ($workRoot.Quarantined -ne '') { Say "SCRATCH an unproven tree stood at the work path; left untouched at $($workRoot.Quarantined)" }
+if ($pubRoot.Quarantined -ne '') { Say "SCRATCH an unproven tree stood at the outbox path; left untouched at $($pubRoot.Quarantined)" }
+$PubReady = $true
+$Scratch = Join-Path $Work '.job-tmp'
+[void](New-AttrCudaDirectory -Path $Scratch)
+$env:TEMP = $Scratch
+$env:TMP = $Scratch
+
+# --- write the bundle into its own directory and re-verify every file on disk ---------------------------------------------------------
+$BundleDir = Join-Path $Work 'bundle'
+try {
+    [void](New-AttrCudaDirectory -Path $BundleDir)
+    foreach ($entry in $BundleEntries) {
+        $entryPath = Join-Path $BundleDir $entry.name
+        [void](Publish-AttrCudaBytes -Path $entryPath -Bytes $decoded[$entry.name] -OwnedJournal $OwnedJournal)
+        if ((Get-ShaLower $entryPath) -ne $entry.sha256) { throw "sha256 did not round-trip onto disk for $($entry.name)" }
+    }
+} catch {
+    Complete-Failed 20 'bundleWrite' $_.Exception.Message
+}
+$StepLog['bundleWrite'] = 0
+
+# --- the staged build: authenticate the manifest BEFORE reading a field of it, then every cached artifact against it ------------------
+try {
+    $buildManifest = Assert-AttrCudaBuildManifest -Path (Join-Path $Cache $BuildManifestName) -ExpectedSha256 $BuildManifestSha256 -ExpectedSourceCommit $SourceCommit
+    $artifactChecks = @(
+        @{ label = 'packageZip'; path = (Join-Path $Cache $PackageZipName); expectedSha = [string]$buildManifest.packageZip.sha256 },
+        @{ label = 'exe'; path = (Join-Path $Cache $ExeName); expectedSha = [string]$buildManifest.exe.sha256 },
+        @{ label = 'dll'; path = (Join-Path $Cache $ReconName); expectedSha = [string]$buildManifest.dll.sha256 }
+    )
+    $artifactHashes = @{}
+    foreach ($check in $artifactChecks) {
+        if (-not (Test-Path -LiteralPath $check.path)) { throw "cache missing $($check.path)" }
+        if ([string]::IsNullOrWhiteSpace($check.expectedSha)) { throw "build manifest $BuildManifestName is missing a sha256 for $($check.label)" }
+        $artifactHashes[$check.label] = Get-ShaLower $check.path
+        if ($artifactHashes[$check.label] -ne $check.expectedSha.ToLowerInvariant()) { throw "hash mismatch (vs build manifest $BuildManifestName) for $($check.path)" }
+    }
+} catch {
+    Complete-Failed 8 'buildVerify' $_.Exception.Message
+}
+$StepLog['buildVerify'] = 0
+
+# --- the clip: every part's length and sha256, on THIS host, before anything runs. A failure names the part index and a token, never a path. ---
+$verifiedParts = @()
+try {
+    foreach ($p in @($OwnerPartsJson | ConvertFrom-Json)) {
+        $partPath = ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([string]$p.pathBase64))).Replace('/', '\')
+        if ($partPath -notmatch '^[A-Za-z]:\\[A-Za-z0-9_.\\-]+$') { throw "part $($p.index) path is outside the allowlist" }
+        $status = Test-AttrCudaFootagePart -Path $partPath -ExpectedLength ([int64]$p.length) -ExpectedSha256 ([string]$p.sha256)
+        if ($status -ne 'PASS') { throw "FOOTAGE_PART_$status part=$($p.index)" }
+        $verifiedParts += [pscustomobject]@{ index = [int]$p.index; path = $partPath; length = [int64]$p.length; sha256 = [string]$p.sha256 }
+    }
+    if ($verifiedParts.Count -eq 0) { throw 'no clip parts' }
+} catch {
+    Complete-Failed 18 'footageVerify' $_.Exception.Message
+}
+$clipPath = @($verifiedParts | Sort-Object index)[0].path
+$StepLog['footageVerify'] = 0
+
+# --- deploy: the package, then the staged exe and the DLL pair over it, each verified after the copy ------------------------------------------
+try {
+    $PkgRoot = Join-Path $Work 'pkg'
+    Expand-Archive -LiteralPath (Join-Path $Cache $PackageZipName) -DestinationPath $PkgRoot -Force
+    $baseExe = Get-ChildItem -LiteralPath $PkgRoot -Recurse -Filter $PackageExeName | Select-Object -First 1
+    if (-not $baseExe) { throw "base package executable not found: $PackageExeName" }
+    $pkgDir = $baseExe.Directory.FullName
+    $exePath = Join-Path $pkgDir $ExeName
+    $reconDll = Join-Path $pkgDir 'igpu_recon_cuda.dll'
+    [void](Publish-AttrCudaFileCopy -Source (Join-Path $Cache $ExeName) -Destination $exePath)
+    [void](Publish-AttrCudaFileCopy -Source (Join-Path $Cache $ReconName) -Destination $reconDll)
+    if ((Get-ShaLower $exePath) -ne $artifactHashes['exe'] -or (Get-ShaLower $reconDll) -ne $artifactHashes['dll']) {
+        throw 'deployed artifact hash verification failed (copy from cache did not round-trip)'
+    }
+} catch {
+    Complete-Failed 9 'deploy' $_.Exception.Message
+}
+$StepLog['deploy'] = 0
+
+# --- run the capture script FROM THE VERIFIED BUNDLE, under the gate profile ------------------------------------------------------------------
+$bundleCapture = Join-Path $BundleDir 'capture-reference-frame.ps1'
+foreach ($entry in $BundleEntries) {
+    if ((Get-ShaLower (Join-Path $BundleDir $entry.name)) -ne $entry.sha256) { Complete-Failed 19 'bundleReverify' "bundle file $($entry.name) changed on disk after it was verified" }
+}
+$captureOut = Join-Path $Pub 'capture'
+[void](New-AttrCudaDirectory -Path $captureOut)
+$captureCommand = "& '$bundleCapture' -Exe '$exePath' -Clip '$clipPath' -OutDir '$captureOut' -Commit '$SourceCommit' -ProfileId $GateProfileId -Seconds $Seconds -StartFrame $StartFrame"
+if ($DisableLookAssist) { $captureCommand += ' -DisableLookAssist' }
+if ($PlaybackProcessing -ne '') { $captureCommand += " -PlaybackProcessing $PlaybackProcessing" }
+if ($PresentedFrames -ge 0) { $captureCommand += " -PresentedFrames $PresentedFrames" }
+if ($QualityMode -ne '') { $captureCommand += " -ExtraEnv @{ MLVAPP_PLAYBACK_QUALITY_MODE = '$QualityMode' }" }
+# FAIL CLOSED: a statement-terminating error inside the capture command (a parameter that does not bind, say) leaves $LASTEXITCODE null,
+# and `exit $null` is exit 0 -- a capture that never ran must never read as one that passed. 70 = the capture command produced no exit code.
+$captureCommand += '; if ($null -eq $LASTEXITCODE) { exit 70 }; exit $LASTEXITCODE'
+Say "step capture start profile=$GateProfileId startFrame=$StartFrame lookAssistDisabled=$DisableLookAssist processing=$PlaybackProcessing quality=$QualityMode"
+$captureOutput = @(& pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $captureCommand 2>&1 | ForEach-Object { "$_" })
+$captureRc = $LASTEXITCODE
+try { [void](Publish-AttrCudaText -Path (Join-Path $Pub 'capture-stdout.txt') -Value ($captureOutput -join "`n")) } catch { Say "CAPTURE_STDOUT_NOT_WRITTEN $($_.Exception.Message)" }
+# The capture script's own exit code is the verdict (0 = a valid candidate; 43 = its receipt check refused). It is never reinterpreted here.
+$StepLog['capture'] = $captureRc
+
+$candidatePath = Join-Path $captureOut 'reference-frame-candidate.json'
+$candidateSha256 = if ($captureRc -eq 0 -and (Test-Path -LiteralPath $candidatePath)) { Get-ShaLower $candidatePath } else { $null }
+try { [void](Publish-AttrCudaText -Path (Join-Path $Pub 'result.json') -Value (([ordered]@{
+    schema = 'mlvapp.reference-frame-runner.v1'; jobId = $JobId
+    exitCode = $captureRc; status = $(if ($captureRc -eq 0) { 'candidate-unreviewed' } else { 'capture-failed' })
+    sourceCommit = $SourceCommit; toolsCommit = $ToolsCommit; buildManifestSha256 = $BuildManifestSha256; clipId = $ClipId; venue = $Venue
+    admission = [ordered]@{ mode = $AdmissionMode; consentKind = $ConsentKind }
+    gateProfile = [ordered]@{ id = $GateProfileId; specSha256 = $GateSpecSha256; startFrame = $StartFrame; disableLookAssist = $DisableLookAssist; playbackProcessing = $PlaybackProcessing; qualityMode = $QualityMode }
+    bundle = @($BundleEntries | ForEach-Object { [ordered]@{ name = $_.name; sha256 = $_.sha256 } })
+    exeSha256 = $artifactHashes['exe']; candidateSha256 = $candidateSha256
+    clipParts = @($verifiedParts | ForEach-Object { [ordered]@{ index = $_.index; length = $_.length; sha256 = $_.sha256 } })
+    stagedOnHost = $env:COMPUTERNAME; steps = $StepLog
+}) | ConvertTo-Json -Depth 10)) } catch { Complete-Failed 23 'publishResult' $_.Exception.Message }
+if ($captureRc -ne 0) {
+    Write-Output "RESULT=REFERENCE_FRAME_CAPTURE_FAILED EXIT=$captureRc ARTIFACTS=$Pub"
+    exit $captureRc
+}
+Write-Output "RESULT=REFERENCE_FRAME_CAPTURE_OK CLIP=$ClipId PROFILE=$GateProfileId CANDIDATE_SHA256=$candidateSha256 ARTIFACTS=$Pub"
+exit 0
+'@
+
+$jobDir = Split-Path -Parent ([IO.Path]::GetFullPath($OutFile))
+if (-not (Test-Path -LiteralPath $jobDir)) { [void](New-Item -ItemType Directory -Path $jobDir -Force) }
+$text = Expand-AttrCudaTemplate -Template $template -Tokens ([ordered]@{
+    JOB_ID = $jobId
+    AGENT_ROOT = $AgentRoot
+    SOURCE_COMMIT = $SourceCommit
+    TOOLS_COMMIT = $ToolsCommit
+    BUILD_MANIFEST_SHA256 = $BuildManifestSha256
+    CLIP_ID = $ClipId
+    VENUE = $Venue
+    ADMISSION_MODE = $admissionMode
+    CONSENT_KIND = ([string]$admission.consentKind)
+    GATE_PROFILE_ID = $GateProfile
+    GATE_SPEC_SHA256 = $specSha256
+    START_FRAME = [string]$gateStartFrame
+    PLAYBACK_PROCESSING = $gateProcessing
+    QUALITY_MODE = $gateQualityMode
+    DISABLE_LOOK_ASSIST = $disableLookAssistLiteral
+    SECONDS = [string]$Seconds
+    PRESENTED_FRAMES = [string]$PresentedFrames
+    EXE_NAME = $names.exeName
+    RECON_NAME = $names.reconName
+    PACKAGE_ZIP_NAME = $names.packageZipName
+    PACKAGE_EXE_NAME = $names.packageExeName
+    BUILD_MANIFEST_NAME = $names.buildManifestName
+    OWNER_PARTS_JSON = $ownerPartsJson
+    BUNDLE_ENTRIES = $bundleEntriesLiteral
+    EMBEDDED_FUNCTIONS = $embeddedFunctions
+})
+[IO.File]::WriteAllText($OutFile, $text, [Text.UTF8Encoding]::new($false))
+
+Write-Output "RESULT=REFERENCE_FRAME_JOB_EMITTED SOURCE=$SourceCommit TOOLS=$ToolsCommit CLIP=$ClipId VENUE=$Venue GATE_PROFILE=$GateProfile START_FRAME=$gateStartFrame ADMISSION=$admissionMode BUNDLE_DIGEST=$bundleDigest JOB=$OutFile"
+
+[pscustomobject]@{
+    jobFile = $OutFile
+    jobId = $jobId
+    sourceCommit = $SourceCommit
+    toolsCommit = $ToolsCommit
+    clipId = $ClipId
+    venue = $Venue
+    gateProfile = $GateProfile
+    startFrame = $gateStartFrame
+    bundleDigest = $bundleDigest
+    files = @($closure | ForEach-Object { [ordered]@{ name = $_.name; sha256 = $_.sha256 } })
+    agentRoot = $AgentRoot
+}
