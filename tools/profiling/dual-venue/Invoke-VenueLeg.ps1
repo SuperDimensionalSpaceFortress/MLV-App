@@ -411,6 +411,8 @@ try {
         if ($spec.generatorArgs.PSObject.Properties['firstPresentCapture'] -and [bool]$spec.generatorArgs.firstPresentCapture) { $gen['FirstPresentCapture'] = $true }
         # PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1 F-diag: the app's opt-in warm-reuse miss dump, for any leg.
         if ($spec.generatorArgs.PSObject.Properties['warmReuseMissDump'] -and [bool]$spec.generatorArgs.warmReuseMissDump) { $gen['WarmReuseMissDump'] = $true }
+        # WARM-RUN-CHROMA-SMOOTH-PARITY-1: the app's opt-in warm output reuse (default OFF in the app), for any leg.
+        if ($spec.generatorArgs.PSObject.Properties['warmOutputReuse'] -and [bool]$spec.generatorArgs.warmOutputReuse) { $gen['WarmOutputReuse'] = $true }
         # CUDA-HEADROOM-1: an unpaced throughput leg (no pace guard, drop-frame off), for any leg; judged below by the app's own pace_unpaced line.
         if ($spec.generatorArgs.PSObject.Properties['unpaced'] -and [bool]$spec.generatorArgs.unpaced) { $gen['Unpaced'] = $true }
         # PLAYBACK-SCOPES-OPTION-1: the live scope the smoke forces on, and the app's playback scope throttle interval, for any leg.

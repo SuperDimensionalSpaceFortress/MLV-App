@@ -446,7 +446,8 @@ TEST(PlaybackReconWarmRunWiring, TheGuiReleasesTheTokenOnEveryPath)
     ASSERT_FALSE(done.isEmpty());
     // no early exit: every warm-done reaches the release
     ASSERT_FALSE(done.contains(QStringLiteral("return")));
-    const int gate = done.indexOf(QStringLiteral("if( playback_recon_warm_run::guiAmazeAllowed( hasOutput, playing, clipMatches ) )"));
+    // WARM-RUN-CHROMA-SMOOTH-PARITY-1: the gate also needs the warm's recon state to be current
+    const int gate = done.indexOf(QStringLiteral("if( playback_recon_warm_run::guiAmazeAllowed( hasOutput, playing, clipMatches, stateCurrent ) )"));
     const int amaze = done.indexOf(QStringLiteral("GpuDisplayWindow::warmStagedReconSlotFromDeviceBayer16IfActive("));
     const int release = done.indexOf(QStringLiteral(
         "line.released = llrpGpuPlaybackReconReleaseRetainedDeviceBayer16( outcome.retained.token ) != 0;"));

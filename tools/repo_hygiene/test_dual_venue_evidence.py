@@ -117,6 +117,12 @@ IDENTITY_LEGS = {f"legs/m16-1243-display-{cell}-identity.json": f"legs/m16-1243-
 # PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1 F-diag: the warm-reuse miss-dump twin of the windowed s1 cell, differing only in its legId and
 # generatorArgs.warmReuseMissDump true.
 MISSDUMP_LEGS = {"legs/m16-1243-display-windowed-s1-missdump.json": "legs/m16-1243-display-windowed-s1.json"}
+# WARM-RUN-CHROMA-SMOOTH-PARITY-1: the warm-output-reuse twins of the six display-matrix cells, of the windowed s1 identity leg and of the miss-dump
+# leg, each differing only in its legId and generatorArgs.warmOutputReuse true (the app's reuse is default OFF).
+WARMREUSE_LEGS = {**{f"legs/m16-1243-display-{mode}-s{scale}-warmreuse.json": f"legs/m16-1243-display-{mode}-s{scale}.json"
+                     for scale in (1, 2, 4) for mode in ("fullscreen", "windowed")},
+                  "legs/m16-1243-display-windowed-s1-identity-warmreuse.json": "legs/m16-1243-display-windowed-s1-identity.json",
+                  "legs/m16-1243-display-windowed-s1-warmreuse-missdump.json": "legs/m16-1243-display-windowed-s1-missdump.json"}
 # PLAYBACK-VISUAL-INSPECTION-1: the window-capture proof leg, a SPEED leg (windowed, scale 2) that names no visualCapture: absent means on.
 VISUAL_LEGS = ("legs/m16-1243-speed-windowed-s2.json",)
 # PLAYBACK-SCOPES-OPTION-1: the windowed scale-1 no-look scope matrix, per backend: N (no scope), T (histogram at the app's default throttle) and
@@ -144,7 +150,7 @@ SHIPPED_LEGS = ("legs/m16-1243-speed.json", "legs/m16-1243-look.json", "legs/m16
                 *(f"legs/m16-1243-look-scale2-{flavor}-agxoff.json" for flavor in ("cinematic", "film", "vision50d")),
                 *(f"legs/m16-1243-display-{mode}-s{scale}-vsync1.json" for scale in (1, 2, 4) for mode in ("fullscreen", "windowed")),
                 *CPU_REDUCED_LEGS, *UPSTREAM_BASELINE_LEGS, *PTRACE_LEGS, *VISUAL_LEGS, *SCOPE_LEGS, *SCOPE_LA_LEGS, *HEADROOM_LEGS, *IDENTITY_LEGS,
-                *MISSDUMP_LEGS)
+                *MISSDUMP_LEGS, *WARMREUSE_LEGS)
 # PLAYBACK-VSYNC-DEFAULT-1: the swap-interval-1 twins of the six display-matrix legs (the vsync A/B; the originals stay at the app's default 0).
 VSYNC1_LEGS = tuple(rel.replace(".json", "-vsync1.json") for rel in DISPLAY_MATRIX_LEGS)
 # LOOK-ASSIST-FILM-FLAVOR-2 r2: the AgX-off twins of the scale-2 Cinematic and Film legs carry a committed look receipt (look-receipts/agx-off.marxml).
@@ -845,6 +851,31 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
         mapping = ("if ($spec.generatorArgs.PSObject.Properties['warmReuseMissDump'] -and [bool]$spec.generatorArgs.warmReuseMissDump) "
                    "{ $gen['WarmReuseMissDump'] = $true }")
+        self.assertIn(mapping, runner)
+        self.assertLess(runner.index(mapping), runner.index("if (-not $isLook -and $spec.generatorArgs.PSObject.Properties['forceLookAssist']"),
+                        "the mapping must sit outside the forceLookAssist branch")
+
+    def test_the_warm_output_reuse_reaches_the_apps_env_only_when_asked(self) -> None:
+        """WARM-RUN-CHROMA-SMOOTH-PARITY-1: -WarmOutputReuse adds MLVAPP_PLAYBACK_WARM_OUTPUT_REUSE=1 (the app's default is OFF) to the app's env
+        list, exactly once; absent, the job is the text it was. With -WarmReuseMissDump too, both lines sit at the same site. The runner maps a
+        leg's generatorArgs.warmOutputReuse true for any leg."""
+        plain = self.generate(GENERATOR, "wor-plain.job.ps1", []).read_text(encoding="utf-8").replace("\r\n", "\n")
+        self.assertNotIn("MLVAPP_PLAYBACK_WARM_OUTPUT_REUSE", plain)
+        job = self.generate(GENERATOR, "wor-on.job.ps1", ["-WarmOutputReuse"])
+        self.assertEqual(self.parse_errors(job), 0)
+        text = job.read_text(encoding="utf-8").replace("\r\n", "\n")
+        line = "    'MLVAPP_PLAYBACK_WARM_OUTPUT_REUSE=1',\n"
+        self.assertIn("'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',\n" + line, text)
+        self.assertEqual(text.count("MLVAPP_PLAYBACK_WARM_OUTPUT_REUSE"), 1)
+        self.assertEqual(text.replace(line, ""), plain, "the switch is the only difference from the plain job")
+        both = self.generate(GENERATOR, "wor-md.job.ps1", ["-WarmOutputReuse", "-WarmReuseMissDump"])
+        self.assertEqual(self.parse_errors(both), 0)
+        both_text = both.read_text(encoding="utf-8").replace("\r\n", "\n")
+        dump_line = "    ('MLVAPP_PLAYBACK_WARM_REUSE_MISS_DUMP_DIR=' + (Join-Path $Pub 'warm-reuse-miss')),\n"
+        self.assertEqual(both_text.replace(line, "").replace(dump_line, ""), plain, "the two switches are the only difference")
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        mapping = ("if ($spec.generatorArgs.PSObject.Properties['warmOutputReuse'] -and [bool]$spec.generatorArgs.warmOutputReuse) "
+                   "{ $gen['WarmOutputReuse'] = $true }")
         self.assertIn(mapping, runner)
         self.assertLess(runner.index(mapping), runner.index("if (-not $isLook -and $spec.generatorArgs.PSObject.Properties['forceLookAssist']"),
                         "the mapping must sit outside the forceLookAssist branch")
@@ -6120,6 +6151,23 @@ class LegSpecSchemaTests(unittest.TestCase):
             self.assertIs(arm["generatorArgs"].pop("warmReuseMissDump"), True, rel)
             self.assertEqual(dict(arm, legId=twin["legId"]), twin, rel)
 
+    def test_the_warmreuse_legs_are_their_twins_with_the_reuse_on(self) -> None:
+        """WARM-RUN-CHROMA-SMOOTH-PARITY-1: a warm-reuse leg differs from its twin only in its legId (the twin's plus -warmreuse, before a
+        trailing -missdump) and generatorArgs.warmOutputReuse true."""
+        self.assertEqual(self.schema["properties"]["generatorArgs"]["properties"]["warmOutputReuse"]["type"], "boolean")
+        self.assertEqual(len(WARMREUSE_LEGS), 8)
+        for rel, twin_rel in WARMREUSE_LEGS.items():
+            arm = json.loads((DV / rel).read_text(encoding="utf-8"))
+            self.jsonschema.validate(arm, self.schema)
+            twin = json.loads((DV / twin_rel).read_text(encoding="utf-8"))
+            self.assertNotIn("warmOutputReuse", twin["generatorArgs"], twin_rel)
+            expected = (twin["legId"][:-len("-missdump")] + "-warmreuse-missdump" if twin["legId"].endswith("-missdump")
+                        else twin["legId"] + "-warmreuse")
+            self.assertEqual(arm["legId"], expected, rel)
+            self.assertEqual(arm["legId"], Path(rel).stem, rel)
+            self.assertIs(arm["generatorArgs"].pop("warmOutputReuse"), True, rel)
+            self.assertEqual(dict(arm, legId=twin["legId"]), twin, rel)
+
     def test_the_scope_legs_are_no_look_windowed_s1_speed_legs_differing_only_in_scope(self) -> None:
         """PLAYBACK-SCOPES-OPTION-1: every scope leg is a single-backend no-look SPEED leg at windowed scale 1 (LIGHT, the 95 % quiescence gate,
         informational criteria), and each scope arm is its backend's N leg plus only the scope fields."""
@@ -6200,8 +6248,10 @@ class LegSpecSchemaTests(unittest.TestCase):
             if spec["card"] == "DUAL-VENUE-DISPLAY-MATRIX-1":   # the display-matrix legs are cinematic look legs named by their cell (display mode and scale)
                 self.assertEqual(spec["legId"], path.stem, path.name)   # (-ptrace: the cell with the present trace on, PTRACE_LEGS;
                 # -identity: the cell with the first-present identity capture on, IDENTITY_LEGS; -missdump: the warm-reuse miss dump on,
-                # MISSDUMP_LEGS)
-                self.assertRegex(spec["legId"], r"^m16-1243-display-(fullscreen|windowed)-s[124](-ptrace|-identity|-missdump)?$", path.name)
+                # MISSDUMP_LEGS; -warmreuse: the app's warm output reuse on, WARMREUSE_LEGS)
+                self.assertRegex(spec["legId"],
+                                 r"^m16-1243-display-(fullscreen|windowed)-s[124](-ptrace|-identity|-missdump|-warmreuse|-identity-warmreuse|-warmreuse-missdump)?$",
+                                 path.name)
             elif spec["card"] == "PLAYBACK-VSYNC-DEFAULT-1":   # the swap-interval-1 twins of the display-matrix legs, named by their cell
                 self.assertEqual(spec["legId"], path.stem, path.name)
                 self.assertRegex(spec["legId"], r"^m16-1243-display-(fullscreen|windowed)-s[124]-vsync1$", path.name)

@@ -433,6 +433,9 @@ param(
     # AMaZE input words and their difference there, and logs one playback_warm_output_reuse_miss_dump line). Absent: nothing is set and the
     # emitted job is the text it was before this parameter.
     [switch]$WarmReuseMissDump,
+    # WARM-RUN-CHROMA-SMOOTH-PARITY-1: the app's opt-in paused-warm output reuse (MLVAPP_PLAYBACK_WARM_OUTPUT_REUSE=1; the app's default is
+    # OFF). Absent: nothing is set and the emitted job is the text it was before this parameter.
+    [switch]$WarmOutputReuse,
     # CUDA-HEADROOM-1: an unpaced throughput leg (MLVAPP_PLAYBACK_UNPACED=1 lifts the app's pace guard in an automation run, and the
     # smoke runs with -DropFrameMode off, so every frame is rendered and presented as fast as the pipeline allows). Absent: nothing is
     # set and the emitted job is the text it was before this parameter.
@@ -4514,6 +4517,16 @@ if ($WarmReuseMissDump) {
     $text = $missDumpAnchor.Replace($text, [System.Text.RegularExpressions.MatchEvaluator]{
         param($m)
         $m.Value + $m.Groups['ind'].Value + "('MLVAPP_PLAYBACK_WARM_REUSE_MISS_DUMP_DIR=' + (Join-Path `$Pub 'warm-reuse-miss'))," + $m.Groups['nl'].Value
+    })
+}
+
+# WARM-RUN-CHROMA-SMOOTH-PARITY-1: the same env-list site gains the warm output reuse switch, only when asked.
+if ($WarmOutputReuse) {
+    $warmReuseAnchor = [regex]"(?<ind>[ \t]*)'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',(?<nl>\r?\n)"
+    if ($warmReuseAnchor.Matches($text).Count -ne 1) { throw 'DUAL_VENUE_WARM_OUTPUT_REUSE_ANCHOR_MISSING the job template has no single env-list site to add MLVAPP_PLAYBACK_WARM_OUTPUT_REUSE to' }
+    $text = $warmReuseAnchor.Replace($text, [System.Text.RegularExpressions.MatchEvaluator]{
+        param($m)
+        $m.Value + $m.Groups['ind'].Value + "'MLVAPP_PLAYBACK_WARM_OUTPUT_REUSE=1'," + $m.Groups['nl'].Value
     })
 }
 

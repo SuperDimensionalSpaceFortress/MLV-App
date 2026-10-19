@@ -1698,6 +1698,10 @@ private:
     int m_playbackReconWarmPosts = 0;             // posts this clip (PlaybackReconWarmRunPolicy.h kMaxPosts)
     bool m_playbackReconWarmRepostArmed = false;  // a re-post timer is pending
     bool m_playbackReconWarmRan = false;          // first_present_split warm_run
+    // WARM-RUN-CHROMA-SMOOTH-PARITY-1: a recon setting the warm reads at run time (chroma smooth) changed while paused:
+    // a warm of the older state is not staged, and the warm runs again at the new one.
+    void rearmPlaybackReconWarmAfterStateChange( const char *why );
+    playback_recon_warm_run::WarmStateGate m_playbackReconWarmStateGate;
     // PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row K (PlaybackGpuClockKickPolicy.h): at Play, before the play-start
     // frame request, one bounded GPU clock kick on the loaded AMaZE backend; ended (and logged) at the first present,
     // Play stop, a clip change, a device loss, the next Play or its deadline. Also arms Row 0's session probe.

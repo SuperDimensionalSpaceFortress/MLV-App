@@ -347,6 +347,7 @@ public:
         bool warm = false;
         int warmScale = 1;
         quint64 warmClipGeneration = 0;
+        quint64 warmStateGeneration = 0;   // WARM-RUN-CHROMA-SMOOTH-PARITY-1: MainWindow's WarmStateGate generation
         bool warmRealRequestPending = false;
     };
 
@@ -355,6 +356,7 @@ public:
     struct PlaybackReconWarmDone
     {
         quint64 clipGeneration = 0;
+        quint64 stateGeneration = 0;        // the request's, handed back unchanged
         uint32_t frameNumber = 0;
         playback_recon_warm_run::Outcome outcome;
         int blackLevel = 0;
@@ -378,8 +380,10 @@ public:
     void setGpuPlaybackReconTextureLutSnapshotGeneration( uint64_t generation );
     /* PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1 Row W (GUI thread): queue ONE paused recon warm run of frameNumber at
      * the Play-time scale on the recon worker (PlaybackReconWarmRun.h). Reason::None when queued; RealRequestPending
-     * when any render, decode or recon work is pending now. Its result arrives as playbackReconWarmDone. */
-    playback_recon_warm_run::Reason requestPlaybackReconWarm( uint32_t frameNumber, int scale, quint64 clipGeneration );
+     * when any render, decode or recon work is pending now. Its result arrives as playbackReconWarmDone, which carries
+     * clipGeneration and stateGeneration back unchanged. */
+    playback_recon_warm_run::Reason requestPlaybackReconWarm( uint32_t frameNumber, int scale, quint64 clipGeneration,
+                                                              quint64 stateGeneration );
     /* PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1 r3 (U-02, GUI thread): a clip close calls this after its idle
      * barrier and before it frees the clip. Drops every queued warm (not pipeline work, so the barrier did not wait for
      * it), waits out a warm the worker took meanwhile, and clears the clip pointer until the next init(). */

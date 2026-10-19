@@ -161,3 +161,17 @@ maintained in this format.
     thread could let that thread start the warm on the freed clip. Closing
     a clip now drops a warm that has not started, and waits for one that
     has.
+- The paused warm runs again when chroma smooth changes while paused
+  (WARM-RUN-CHROMA-SMOOTH-PARITY-1).
+  - Look Assist turns on chroma smooth about 15 s after a clip opens, after
+    the warm has already run with it off. Play then ran with it on, so the
+    warm's debayer could never be reused (`reuse_reason=state_mismatch`,
+    `state_diff=chroma_smooth_method` on every venue run).
+  - Any change of the chroma smooth mode while paused now marks a warm
+    that was made with the old mode as stale: its output is not staged and
+    the warm runs again with the new mode. The `playback_recon_warm` line
+    adds `state_gen` and `state_current`, a stale warm says
+    `amaze_reason="state_changed"`, and each re-arm logs a
+    `playback_recon_warm_rearm` line.
+  - The reuse stays off by default. Venue legs turn it on with
+    `generatorArgs.warmOutputReuse` (`MLVAPP_PLAYBACK_WARM_OUTPUT_REUSE=1`).
