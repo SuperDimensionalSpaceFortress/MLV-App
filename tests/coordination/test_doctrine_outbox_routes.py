@@ -6,10 +6,13 @@ tests/coordination/ because CI runs that directory by name.
 CARD-ROUTE-EXERCISE-2 replaces CARD-ROUTE-EXERCISE-1 (PR 479, parked). That card launched launcher routes (`python x.py`,
 `pwsh -File x.ps1`) after two hand-written walks over one argv (a safety matcher and a script discovery) agreed the script
 was inside the clone, and every review round found a spelling where they disagreed. This card:
-  (a) checks that every route's program and named script EXIST, running nothing (launcher routes included);
-  (b) runs only a route whose program is not a launcher; a launcher route is ROUTE_NOT_EXECUTED_LAUNCHER, a skip;
+  (a) checks that every route's program and every script it names EXIST, running nothing (a route that is not run included);
+  (b) runs a route ONLY when its program is on the execution ALLOWLIST (`git`, by its bare name and its resolved executable
+      identity); every other program is ROUTE_NOT_EXECUTED, a skip (r1 kept a denylist of launcher names, so any code-running
+      program it did not list, pytest for one, was executed; r2 inverts it);
   (c) refuses every known PR 479 bypass repro before launch: one row each, the process launch mocked and asserted NOT called;
-  (d) strips the interpreter-injection environment from a route that is run.
+  (d) strips the interpreter-injection and git editor/pager/helper environment from a route that is run, and refuses the git
+      forms that start a helper (`-c`, signing, `merge -s`, `--exec`, `--upload-pack`, `!` aliases, ...) as ROUTE_UNSAFE.
 
 Seed RED rows come from the failures the CoS found by hand:
   #468 r3/r4  an adoption step `python factory-pins/pin-runner.py pin ...` against a bus without that file
@@ -17,7 +20,7 @@ Seed RED rows come from the failures the CoS found by hand:
 
 Named mutations (each turns the named rows red, then is reverted):
   M1  route_missing_reason returns None (no static check)        -> the (a) rows: test_a_*, test_seed_*
-  M2  route_is_launcher returns False (launchers get launched)    -> the (c) rows: test_c_*
+  M2  route_runs returns True (every program is launched)         -> the (b)/(c) rows: test_b_*, test_c_*
   M3  route_exercise_env returns the environment untouched        -> the (d) rows: test_d_*
 """
 from __future__ import annotations
@@ -25,6 +28,7 @@ from __future__ import annotations
 import importlib.util
 import io
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -60,7 +64,8 @@ def git(repo: Path, *args: str) -> str:
 
 
 LAUNCHER_PROGRAMS = ["sh", "bash", "zsh", "dash", "cmd", "pwsh", "powershell", "python", "python3", "py", "node", "deno",
-                     "perl", "ruby", "php", "env", "xargs", "nohup", "timeout"]
+                     "bun", "awk", "tclsh", "perl", "ruby", "php", "env", "xargs", "nohup", "timeout"]
+UNLISTED_PROGRAMS = ["pytest", "pyw", "ipython", "java", "go", "php-cgi", "jq"]   # names r1's launcher denylist did not know
 
 
 def fake_programs(monkeypatch, tmp_path: Path, *names: str) -> None:
@@ -77,7 +82,7 @@ def fake_programs(monkeypatch, tmp_path: Path, *names: str) -> None:
 
 @pytest.fixture
 def launchers(monkeypatch, tmp_path):
-    fake_programs(monkeypatch, tmp_path, *LAUNCHER_PROGRAMS)
+    fake_programs(monkeypatch, tmp_path, *LAUNCHER_PROGRAMS, *UNLISTED_PROGRAMS)
 
 
 @pytest.fixture
@@ -202,7 +207,7 @@ def test_a_a_launcher_naming_a_missing_script_is_route_missing_and_not_launched(
 def test_a_a_launcher_naming_an_existing_script_is_a_skip_not_a_failure(tmp_path, launchers, launches):
     clone = make_clone(tmp_path, {"tools/x.py": STUB})
     status, detail = check_argv(["python", "tools/x.py", "go"], clone)
-    assert status == "ROUTE_NOT_EXECUTED_LAUNCHER" and "LAUNCHER-ALLOWLIST-1" in detail
+    assert status == "ROUTE_NOT_EXECUTED" and "LAUNCHER-ALLOWLIST-1" in detail
     assert not launches
     assert status in ob.ROUTE_PASSING
 
@@ -218,11 +223,65 @@ def test_a_a_launcher_naming_an_existing_script_is_a_skip_not_a_failure(tmp_path
     (["perl", "tools/gone.pl"], "tools/gone.pl"),
     (["ruby", "tools/gone.rb"], "tools/gone.rb"),
     (["php", "tools/gone.php"], "tools/gone.php"),
+    # sol r1 blocker 3: the paths r1 never looked at
+    (["deno", "run", "tools/definitely-missing.ts"], "tools/definitely-missing.ts"),
+    (["deno", "run", "--allow-read", "-c", "tools/deno.json", "tools/gone.ts"], "tools/gone.ts"),   # -c takes an operand: not the script
+    (["deno", "test", "tools/gone.ts"], "tools/gone.ts"),
+    (["deno", "tools/gone.ts"], "tools/gone.ts"),
+    (["bun", "run", "tools/definitely-missing.js"], "tools/definitely-missing.js"),
+    (["bun", "tools/gone.ts"], "tools/gone.ts"),
+    (["bun", "run", "gone.mjs"], "gone.mjs"),
+    (["bun", "--preload", "tools/gone-preload.ts", "run", "tools/ok.ts"], "tools/gone-preload.ts"),
+    (["node", "--require", "tools/gone-preload.js", "tools/ok.js"], "tools/gone-preload.js"),
+    (["node", "-r", "tools/gone-preload.js", "tools/ok.js"], "tools/gone-preload.js"),
+    (["node", "--require=tools/gone-preload.js", "tools/ok.js"], "tools/gone-preload.js"),
+    (["node", "--import", "tools/gone-preload.mjs", "tools/ok.js"], "tools/gone-preload.mjs"),
+    (["node", "--loader=tools/gone-loader.mjs", "tools/ok.js"], "tools/gone-loader.mjs"),
+    (["bash", "--rcfile", "tools/gone.rc", "tools/ok.sh"], "tools/gone.rc"),
+    (["bash", "--init-file=tools/gone.rc", "tools/ok.sh"], "tools/gone.rc"),
+    (["awk", "-f", "tools/gone.awk", "data.txt"], "tools/gone.awk"),
+    (["gawk", "--file=tools/gone.awk", "data.txt"], "tools/gone.awk"),
+    (["tclsh", "tools/gone.tcl"], "tools/gone.tcl"),
 ])
 def test_a_every_launcher_family_has_its_named_script_checked(tmp_path, launchers, launches, argv, script):
-    clone = make_clone(tmp_path)
+    clone = make_clone(tmp_path, {"tools/ok.js": STUB, "tools/ok.ts": STUB, "tools/ok.sh": STUB})
     status, detail = check_argv(argv, clone)
     assert status == "ROUTE_MISSING" and detail.startswith("SCRIPT_NOT_FOUND:") and script in detail, (argv, detail)
+    assert not launches
+
+
+@pytest.mark.parametrize("argv", [
+    ["node", "-r", "{o}/outside.js", "tools/ok.js"],
+    ["node", "--require={o}/outside.js", "tools/ok.js"],
+    ["node", "--import", "{o}/outside.js", "tools/ok.js"],
+    ["bash", "--rcfile", "{o}/outside.sh", "tools/ok.sh"],
+    ["bun", "--preload", "{o}/outside.js", "run", "tools/ok.js"],
+    ["deno", "run", "{o}/outside.js"],
+    ["bun", "run", "{o}/outside.js"],
+    ["awk", "-f", "{o}/outside.sh", "data.txt"],
+])
+def test_a_a_preload_or_runner_target_outside_the_clone_is_outside(tmp_path, launchers, launches, argv):
+    clone, outside = bypass_layout(tmp_path)
+    status, detail = check_argv([t.replace("{o}", str(outside).replace("\\", "/")) for t in argv], clone)
+    assert status == "ROUTE_MISSING" and detail.startswith("SCRIPT_OUTSIDE_CLONE:"), (argv, status, detail)
+    assert not launches
+
+
+@pytest.mark.parametrize("argv", [
+    ["bun", "run", "build"], ["bun", "run", "test"], ["bun", "install"], ["deno", "task", "build"], ["deno", "fmt"],
+    ["deno", "eval", "1"], ["bun", "-e", "1"], ["awk", "{print}", "data.txt"], ["node", "-r", "tools/ok.js", "-e", "1"],
+])
+def test_a_a_runner_naming_no_file_is_checked_for_its_program_only(tmp_path, launchers, launches, argv):
+    clone = make_clone(tmp_path, {"tools/ok.js": STUB})
+    assert check_argv(argv, clone)[0] == "ROUTE_NOT_EXECUTED", argv
+    assert not launches
+
+
+def test_a_deno_and_bun_with_the_script_in_place_are_skips(tmp_path, launchers, launches):
+    clone = make_clone(tmp_path, {"tools/ok.ts": STUB, "tools/ok.js": STUB, "tools/pre.ts": STUB})
+    for argv in (["deno", "run", "tools/ok.ts"], ["bun", "run", "tools/ok.js"], ["bun", "--preload", "tools/pre.ts", "tools/ok.ts"],
+                 ["node", "-r", "tools/ok.js", "tools/ok.js"]):
+        assert check_argv(argv, clone)[0] == "ROUTE_NOT_EXECUTED", argv
     assert not launches
 
 
@@ -240,7 +299,7 @@ def test_a_every_launcher_family_has_its_named_script_checked(tmp_path, launcher
 ])
 def test_a_a_route_naming_no_file_is_checked_for_its_program_only(tmp_path, launchers, launches, argv):
     clone = make_clone(tmp_path)
-    assert check_argv(argv, clone)[0] == "ROUTE_NOT_EXECUTED_LAUNCHER", argv
+    assert check_argv(argv, clone)[0] == "ROUTE_NOT_EXECUTED", argv
     assert not launches
 
 
@@ -298,23 +357,24 @@ def test_a_a_program_path_inside_the_clone_resolves(tmp_path):
 
 
 @pytest.mark.skipif(os.name != "nt", reason="a .cmd shim is a Windows thing")
-def test_a_a_cmd_shim_that_would_be_run_is_typed_but_a_launcher_shim_is_only_existence_checked(tmp_path, monkeypatch, launches):
+def test_a_a_cmd_shim_standing_in_for_git_is_typed_but_any_other_shim_is_only_existence_checked(tmp_path, monkeypatch, launches):
     shims = tmp_path / "shims"
     shims.mkdir()
-    for name in ("fancytool", "npm"):
+    for name in ("git", "fancytool", "npm"):
         (shims / f"{name}.cmd").write_text("@echo off\r\n", encoding="utf-8")
     monkeypatch.setenv("PATH", str(shims) + os.pathsep + os.environ["PATH"])
     clone = make_clone(tmp_path)
-    status, detail = check_argv(["fancytool", "run"], clone)
+    status, detail = check_argv(["git", "log"], clone)
     assert status == "ROUTE_MISSING" and detail.startswith("PROGRAM_IS_SHIM:") and "shim" in detail
-    assert check_argv(["npm", "test"], clone)[0] == "ROUTE_NOT_EXECUTED_LAUNCHER"
+    assert check_argv(["fancytool", "run"], clone)[0] == "ROUTE_NOT_EXECUTED"
+    assert check_argv(["npm", "test"], clone)[0] == "ROUTE_NOT_EXECUTED"
     assert not launches
 
 
 @pytest.mark.skipif(os.name != "nt", reason="a backslash path in route text is a Windows thing")
 def test_a_a_backslash_path_in_route_text_is_kept(tmp_path, launchers, launches):
     clone = make_clone(tmp_path, {"tools/ok.py": STUB})
-    assert ob.exercise_route("python tools\\ok.py go", clone, 30, {})[0] == "ROUTE_NOT_EXECUTED_LAUNCHER"
+    assert ob.exercise_route("python tools\\ok.py go", clone, 30, {})[0] == "ROUTE_NOT_EXECUTED"
     assert ob.split_route('python "tools\\ok.py" "a b"') == ["python", "tools\\ok.py", "a b"]
     assert not launches
 
@@ -338,7 +398,7 @@ def test_seed_468_a_launcher_route_with_its_script_in_place_validates_without_be
     item = item_file(tmp_path, adopt(cmd))
     assert exercise(tmp_path, item, bus, "--fill", "bus-sha=abc1234", "--fill", "who=me", "--fill", "why=because") == 0
     out = capsys.readouterr().out
-    assert statuses(out) == ["ROUTE_NOT_EXECUTED_LAUNCHER"]
+    assert statuses(out) == ["ROUTE_NOT_EXECUTED"]
     assert "<bus-sha>" in route_lines(out)[0]       # the line shows the command as the card wrote it
     assert not launches
 
@@ -403,10 +463,10 @@ def test_a_launcher_skip_does_not_fail_the_run_but_a_missing_route_beside_it_doe
     capsys.readouterr()
     item = item_file(tmp_path, adopt("python tools/x.py go", "python tools/gone.py go"), name="20261017-route-fixture-2.md")
     assert exercise(tmp_path, item, bus) == 1
-    assert statuses(capsys.readouterr().out) == ["ROUTE_NOT_EXECUTED_LAUNCHER", "ROUTE_MISSING"]
+    assert statuses(capsys.readouterr().out) == ["ROUTE_NOT_EXECUTED", "ROUTE_MISSING"]
 
 
-# ---------- (b) only a route that starts no launcher is run ----------
+# ---------- (b) only a route whose program is on the execution allowlist (git) is run ----------
 
 LAUNCHER_ROUTES = [
     "sh tools/x.sh", "bash tools/x.sh", "zsh tools/x.sh", "dash tools/x.sh", "cmd /c tools/x.cmd", "pwsh -NoProfile -File tools/x.ps1",
@@ -425,16 +485,121 @@ def test_b_a_launcher_route_is_never_launched(tmp_path, launchers, launches, com
         path.chmod(0o755)
     clone = make_clone(tmp_path, {f"tools/x.{ext}": STUB for ext in ("sh", "cmd", "ps1", "py", "js", "ts", "pl", "rb", "php")})
     status, detail = ob.exercise_route(command, clone, 30, {})
-    assert status == "ROUTE_NOT_EXECUTED_LAUNCHER", (command, status, detail)
+    assert status == "ROUTE_NOT_EXECUTED", (command, status, detail)
     assert not launches
 
 
-def test_b_a_launcher_is_recognised_by_name_whatever_its_spelling():
-    for program in ("python", "Python3.12", "python3", "PYTHON.EXE", "C:\\Python312\\python.exe", "/usr/bin/python3.11", "bash.exe",
-                    "./tools/bash", "pwsh", "PowerShell.exe", "node.exe", "nodejs", "perl5.36", "ruby3.2", "env", "xargs", "cmd.exe"):
-        assert ob.route_is_launcher([program, "x"]), program
-    for program in ("git", "git.exe", "pytest", "jq", "doctrine-sync", "ls", "grep", "7z", "mytool"):
-        assert not ob.route_is_launcher([program, "x"]), program
+def test_b_only_git_by_its_bare_name_is_on_the_execution_allowlist():
+    assert ob.ROUTE_EXEC_ALLOW == frozenset({"git"})
+    for program in ("git", "git.exe"):
+        assert ob.route_runs([program, "log"]), program
+    if os.name == "nt":                                                  # the filesystem folds case there, and only there
+        assert ob.route_runs(["GIT.EXE", "log"]) and ob.route_runs(["Git", "log"])
+    for program in ("pytest", "python", "python3.12", "pwsh", "bash", "node", "jq", "ls", "grep", "env", "git-lfs", "gitk", "git2",
+                    "git.", "git ", "git.exe.", "/usr/bin/git", "./git", "tools/git", "C:\\Program Files\\Git\\cmd\\git.exe",
+                    "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\POWERS~1.EXE", "C:\\Windows\\py.exe.", ""):
+        assert not ob.route_runs([program, "x"]), program
+    assert not ob.route_runs([])
+
+
+@pytest.mark.parametrize("command", [
+    "pytest <o>/test_evil.py", "pyw <o>/evil.py", "ipython <o>/x.py", "java <o>/X.java", "go run <o>/m.go", "php-cgi <o>/x.php",
+    "jq -f <o>/x.jq .", "pytest -p evil_plugin tests", "pytest tests -q",
+])
+def test_b_a_code_running_program_off_the_allowlist_is_never_launched(tmp_path, launchers, launches, command):
+    """r1 pinned `pytest` as a non-launcher and ran it, and so ran Python it named (a test file, conftest, -p plugin, env)."""
+    clone, outside = bypass_layout(tmp_path)
+    status, detail = ob.exercise_route(command, clone, 30, {"o": str(outside).replace("\\", "/")})
+    assert status in ("ROUTE_NOT_EXECUTED", "ROUTE_MISSING"), (command, status, detail)
+    assert launches == [], f"{command} reached the process launch"
+
+
+def test_b_pytest_is_not_executed_but_a_missing_program_is_still_missing(tmp_path, launchers, launches):
+    clone = make_clone(tmp_path)
+    status, detail = check_argv(["pytest", "tests", "-q"], clone)
+    assert status == "ROUTE_NOT_EXECUTED" and "allowlist" in detail and launches == []
+    status, detail = check_argv(["no-such-test-runner-xyz", "tests"], clone)
+    assert status == "ROUTE_MISSING" and detail.startswith("PROGRAM_NOT_FOUND:") and launches == []
+
+
+@pytest.mark.parametrize("spelling", ["8.3 short name", "trailing dot", "path to git", "program in the clone"])
+def test_b_a_spelling_that_dodges_a_name_list_is_still_not_launched(tmp_path, launchers, launches, spelling):
+    clone, outside = bypass_layout(tmp_path)
+    folder = tmp_path / "fakebin"
+    shutil.copy(folder / ("python.exe" if os.name == "nt" else "python"), folder / "POWERS~1.EXE")
+    program = {
+        "8.3 short name": str(folder / "POWERS~1.EXE"),
+        "trailing dot": str(folder / ("python.exe" if os.name == "nt" else "python")) + ".",     # Windows folds the dot away
+        "path to git": shutil.which("git"),
+        "program in the clone": "tools/ok.py",
+    }[spelling]
+    status, detail = check_argv([program, f"{str(outside).replace(chr(92), '/')}/outside.py"], clone)
+    assert status != "ROUTE_OK", (spelling, status, detail)
+    assert launches == [], f"{spelling} reached the process launch"
+
+
+def test_b_a_renamed_or_linked_interpreter_is_read_by_what_it_resolves_to_and_never_run(tmp_path, launchers, launches, monkeypatch):
+    clone, outside = bypass_layout(tmp_path)
+    folder = tmp_path / "fakebin"
+    real = folder / ("python.exe" if os.name == "nt" else "python")
+    (clone / "tools" / "copy.exe").write_text("", encoding="utf-8")        # a renamed COPY: no way to read it back as python
+    outside_py = f"{str(outside).replace(chr(92), '/')}/outside.py"
+    assert check_argv(["tools/copy.exe", outside_py], clone)[0] == "ROUTE_NOT_EXECUTED"
+    with monkeypatch.context() as patched:                                   # sol's in-memory resolver repro (no link privilege needed)
+        patched.setattr(ob, "route_resolve_program", lambda program, cwd: str(real))
+        status, detail = check_argv(["tools/helper.exe", "../outside.py"], clone)
+    assert status == "ROUTE_MISSING" and detail.startswith("SCRIPT_OUTSIDE_CLONE:"), (status, detail)
+    assert launches == []
+    try:
+        (clone / "tools" / "helper.exe").symlink_to(real)                  # a LINK: its real name is python, so its script is checked
+    except (OSError, NotImplementedError):
+        pytest.skip("no symlink privilege on this host; the resolver half above ran")
+    status, detail = check_argv(["tools/helper.exe", outside_py], clone)
+    assert status == "ROUTE_MISSING" and detail.startswith("SCRIPT_OUTSIDE_CLONE:"), (status, detail)
+    assert launches == []
+
+
+def test_b_the_git_that_runs_is_the_system_git_never_one_in_the_clone(tmp_path, launches, monkeypatch):
+    clone = make_clone(tmp_path)
+    shadow = clone / "bin"
+    shadow.mkdir()
+    (shadow / ("git.exe" if os.name == "nt" else "git")).write_text("", encoding="utf-8")
+    (shadow / "git.cmd").write_text("", encoding="utf-8")
+    monkeypatch.setenv("PATH", str(shadow) + os.pathsep + os.environ["PATH"])
+    status, detail = ob.exercise_route("git log", clone, 30, {})
+    assert status == "ROUTE_OK" and len(launches) == 1, (status, detail)
+    ran = ob.route_real_path(launches[0]["argv"][0])
+    assert not ob.route_inside(ran, ob.route_real_path(str(clone))) and Path(ran).stem == "git"
+
+
+def test_b_a_git_only_inside_the_clone_is_refused(tmp_path, launches, monkeypatch):
+    clone = make_clone(tmp_path)
+    shadow = clone / "bin"
+    shadow.mkdir()
+    (shadow / ("git.exe" if os.name == "nt" else "git")).write_text("", encoding="utf-8")
+    monkeypatch.setenv("PATH", str(shadow))
+    status, detail = ob.exercise_route("git log", clone, 30, {})
+    assert status == "ROUTE_UNSAFE" and "scratch clone" in detail and launches == []
+
+
+def test_b_a_relative_path_entry_never_finds_git(tmp_path, launches, monkeypatch):
+    clone = make_clone(tmp_path)
+    (clone / ("git.exe" if os.name == "nt" else "git")).write_text("", encoding="utf-8")
+    monkeypatch.chdir(clone)
+    monkeypatch.setenv("PATH", os.pathsep.join([".", "", os.environ["PATH"]]))
+    status, detail = ob.exercise_route("git log", clone, 30, {})
+    assert status == "ROUTE_OK" and len(launches) == 1, (status, detail)
+    assert not ob.route_inside(ob.route_real_path(launches[0]["argv"][0]), ob.route_real_path(str(clone)))
+
+
+def test_b_a_git_that_resolves_to_another_program_is_refused(tmp_path, launches, monkeypatch):
+    clone = make_clone(tmp_path)
+    other = tmp_path / "elsewhere" / ("python.exe" if os.name == "nt" else "python")
+    other.parent.mkdir()
+    other.write_text("", encoding="utf-8")
+    monkeypatch.setattr(ob.shutil, "which", lambda *a, **k: str(other))     # a `git` on PATH that really is python
+    status, detail = ob.exercise_route("git log", clone, 30, {})
+    assert status == "ROUTE_UNSAFE" and "not a git binary" in detail and launches == []
 
 
 def test_b_a_route_with_no_launcher_is_run_once_in_the_scratch_clone_with_the_resolved_program(tmp_path, launches):
@@ -444,7 +609,7 @@ def test_b_a_route_with_no_launcher_is_run_once_in_the_scratch_clone_with_the_re
     assert exercise(tmp_path, item, bus, scratch=scratch) == 0
     assert len(launches) == 1
     call = launches[0]
-    assert Path(call["argv"][0]).stem.lower() == "git" and call["argv"][1:] == ["log", "--oneline"]
+    assert Path(call["argv"][0]).stem.lower() == "git" and call["argv"][-2:] == ["log", "--oneline"]
     assert call["cwd"].name == "bus" and call["cwd"].parent.parent == scratch and call["cwd"].resolve() != bus.resolve()
 
 
@@ -484,10 +649,35 @@ def test_a_filled_windows_path_is_not_reparsed(tmp_path, launches):
     clone = make_clone(tmp_path)
     value = "C:\\some dir\\back\\slash"
     status, _detail = ob.exercise_route("git log <where>", clone, 30, {"where": value})
-    assert status == "ROUTE_OK" and launches[0]["argv"][2] == value
+    assert status == "ROUTE_OK" and launches[0]["argv"][-1] == value and launches[0]["argv"][-2] == "log"
 
 
-# ---------- (b) unsafe non-launcher routes are refused before launch ----------
+def test_b_an_unfilled_placeholder_on_a_route_that_is_not_run_is_noted_and_not_a_failure(tmp_path, launchers, launches):
+    """r1 failed `python factory-pins/pin-runner.py pin --commit <bus-sha>` with ROUTE_FAILED though it is never run."""
+    clone = make_clone(tmp_path, {"tools/x.py": STUB})
+    status, detail = ob.exercise_route("python tools/x.py pin --commit <bus-sha> --reviewer <who>", clone, 30, {})
+    assert status == "ROUTE_NOT_EXECUTED" and "<bus-sha>" in detail and "<who>" in detail, detail
+    status, detail = ob.exercise_route("python <script> go", clone, 30, {})
+    assert status == "ROUTE_NOT_EXECUTED" and "<script>" in detail, detail
+    status, detail = ob.exercise_route("<tool> go", clone, 30, {})
+    assert status == "ROUTE_NOT_EXECUTED" and "<tool>" in detail, detail
+    status, detail = ob.exercise_route("python tools/gone.py <arg>", clone, 30, {})
+    assert status == "ROUTE_MISSING" and detail.startswith("SCRIPT_NOT_FOUND:"), detail
+    status, detail = ob.exercise_route("python tools/x.py <arg>", clone, 30, {"arg": "go"})
+    assert status == "ROUTE_NOT_EXECUTED" and "unfilled" not in detail, detail
+    assert launches == []
+
+
+def test_b_the_steward_card_of_this_pr_validates_without_fills_and_runs_nothing(tmp_path, capsys, launchers, launches):
+    bus = make_bus(tmp_path, {"factory-pins/pin-runner.py": STUB})
+    card = REPO_ROOT / "doctrine-outbox" / "20261017-doctrine-outbox-route-exercise-candidate.md"
+    assert exercise(tmp_path, card, bus) == 0
+    out = capsys.readouterr().out
+    assert statuses(out) == ["ROUTE_NOT_EXECUTED"] * 2, out
+    assert launches == []
+
+
+# ---------- (b) unsafe routes are refused before launch (the screen reads every route and runs nothing) ----------
 
 UNSAFE = [
     "git push origin master",
@@ -576,7 +766,7 @@ def test_a_wrapper_inline_code_or_package_route_is_a_launcher_skip_never_launche
         path.chmod(0o755)
     clone = make_clone(tmp_path)
     status, detail = ob.exercise_route(command, clone, 30, {})
-    assert status in ("ROUTE_NOT_EXECUTED_LAUNCHER", "ROUTE_MISSING"), (command, status, detail)
+    assert status in ("ROUTE_NOT_EXECUTED", "ROUTE_MISSING"), (command, status, detail)
     assert not launches
 
 
@@ -588,6 +778,119 @@ def test_an_unsafe_route_never_runs_and_its_safe_twin_does(tmp_path, capsys):
     twin = item_file(tmp_path, adopt("git branch exercised-here"), name="20261017-safe-twin.md")
     assert exercise(tmp_path, twin, bus) == 0
     assert git(bus, "branch", "--list", "exercised-here") == ""         # the branch was made in the scratch clone only
+
+
+# ---------- (d) git forms that start a helper are refused before launch: one row each ----------
+# sol r1 blocker 2 and opus r1 hardening. The allowlisted verbs still reach an editor, a pager, gpg, a merge driver, an external
+# diff or an `--exec` program through an option, a `-c` override, an alias or an environment variable.
+
+GIT_HELPER_FORMS = {
+    "-c override": "git -c core.editor=python commit --allow-empty",
+    "-c alias": "git -c alias.x=!id x",
+    "-c pager": "git -c core.pager=evil log",
+    "apply --unsafe-paths": "git apply --unsafe-paths ../x.patch",
+    "commit -S": "git commit -S -m x",
+    "commit -S<keyid>": "git commit -SKEYID -m x",
+    "commit --gpg-sign": "git commit --gpg-sign -m x",
+    "commit --gpg-sign=<keyid>": "git commit --gpg-sign=KEYID -m x",
+    "tag -s": "git tag -s v1",
+    "tag -u": "git tag -u KEYID v1",
+    "tag --local-user": "git tag --local-user=KEYID v1",
+    "merge -s": "git merge -s ours other",
+    "merge -s<name>": "git merge -sours other",
+    "merge --strategy=": "git merge --strategy=ours other",
+    "merge --strategy <name>": "git merge --strategy ours other",
+    "cherry-pick --strategy": "git cherry-pick --strategy=ours abc",
+    "--exec after the verb": "git log --exec=evil",
+    "--exec before the verb": "git --exec=evil log",
+    "--upload-pack after the verb": "git log --upload-pack=evil",
+    "--upload-pack before the verb": "git --upload-pack=evil log",
+    "--receive-pack after the verb": "git log --receive-pack=evil",
+    "--receive-pack before the verb": "git --receive-pack evil log",
+    "! alias": "git !echo hi",
+    "alias to a shell": "git config alias.x !id",
+    "--ext-diff": "git diff --ext-diff",
+    "grep -O": "git grep -Oevil needle",
+    "--open-files-in-pager": "git grep --open-files-in-pager=evil needle",
+}
+
+
+@pytest.mark.parametrize("name", list(GIT_HELPER_FORMS))
+def test_d_a_git_form_that_starts_a_helper_is_unsafe_before_launch(tmp_path, launches, name):
+    clone = make_clone(tmp_path)
+    status, detail = ob.exercise_route(GIT_HELPER_FORMS[name], clone, 30, {})
+    assert status == "ROUTE_UNSAFE", (name, status, detail)
+    assert launches == [], f"{name} reached the process launch"
+
+
+@pytest.mark.parametrize("command", [
+    "git commit --allow-empty -m x", "git commit -s -m x", "git commit -am x", "git tag v1", "git tag -l v*", "git tag -d v1",
+    "git merge other", "git merge --squash other", "git merge --no-edit other", "git log -S needle", "git log -s", "git diff -s",
+    "git apply x.patch", "git apply --check x.patch", "git cherry-pick abc", "git grep needle", "git config --get alias.x",
+])
+def test_d_the_safe_twin_of_a_refused_git_form_is_launched(tmp_path, launches, command):
+    clone = make_clone(tmp_path)
+    status, detail = ob.exercise_route(command, clone, 30, {})
+    assert status == "ROUTE_OK" and len(launches) == 1, (command, status, detail)
+
+
+GIT_HELPER_ENV = ["GIT_EDITOR", "GIT_SEQUENCE_EDITOR", "EDITOR", "VISUAL", "GIT_PAGER", "PAGER", "GIT_ASKPASS", "SSH_ASKPASS", "GIT_SSH",
+                  "GIT_SSH_COMMAND", "GIT_EXTERNAL_DIFF", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"]
+
+
+@pytest.mark.parametrize("name", GIT_HELPER_ENV)
+def test_d_a_git_helper_variable_is_not_in_the_environment_a_route_gets(name):
+    for spelled in (name, name.lower(), name.title()):
+        env = ob.route_exercise_env({spelled: "hostile", "PATH": "/bin", "KEEP_ME": "yes"})
+        assert "hostile" not in env.values() and "KEEP_ME" in env, spelled
+        assert spelled not in env or name == "GIT_CONFIG_GLOBAL"
+
+
+def test_d_the_editor_variables_of_the_hub_do_not_reach_a_git_commit(tmp_path, launches, monkeypatch):
+    """sol r1 blocker 2: EDITOR=python, VISUAL=python and EMAIL set, `git commit --allow-empty` launched with them retained."""
+    for name, value in (("EDITOR", "python"), ("VISUAL", "python"), ("EMAIL", "review@example.invalid"), ("GIT_EDITOR", "python"),
+                        ("PAGER", "python"), ("SSH_ASKPASS", "python")):
+        monkeypatch.setenv(name, value)
+    clone = make_clone(tmp_path)
+    assert ob.exercise_route("git commit --allow-empty", clone, 30, {})[0] == "ROUTE_OK"
+    env, argv = launches[0]["env"], launches[0]["argv"]
+    assert not {"EDITOR", "VISUAL", "GIT_EDITOR", "PAGER", "SSH_ASKPASS"} & {k.upper() for k in env}
+    assert "core.editor=false" in argv and "core.pager=cat" in argv
+
+
+def git_dash_c(argv: list[str]) -> list[str]:
+    """The `-c key=value` pairs git is started with, in order, up to the first token that is not one."""
+    found, i = [], 1
+    while i + 1 < len(argv) and argv[i] == "-c":
+        found.append(argv[i + 1])
+        i += 2
+    return found
+
+
+def test_d_a_run_git_route_gets_the_hardened_command_line(tmp_path, launches):
+    clone = make_clone(tmp_path)
+    assert ob.exercise_route("git log --oneline", clone, 30, {})[0] == "ROUTE_OK"
+    argv = launches[0]["argv"]
+    pairs = git_dash_c(argv)
+    assert {"core.pager=cat", "core.editor=false", "diff.external="} <= set(pairs)
+    hooks = [p.split("=", 1)[1] for p in pairs if p.startswith("core.hooksPath=")]
+    assert len(hooks) == 1 and Path(hooks[0]).is_dir() and list(Path(hooks[0]).iterdir()) == []
+    assert Path(hooks[0]).parent == clone.parent                                  # an empty directory in the scratch, not the clone
+    assert argv[1 + 2 * len(pairs):] == ["log", "--oneline"]                      # the route's own words come last, untouched
+
+
+def test_d_the_hardened_settings_reach_a_real_git(tmp_path, capsys):
+    bus = make_bus(tmp_path)
+    item = item_file(tmp_path, adopt("git config --get core.editor", "git config --get core.pager", "git config --get core.hooksPath",
+                                     "git config --get diff.external"))
+    assert exercise(tmp_path, item, bus) == 0
+    assert statuses(capsys.readouterr().out) == ["ROUTE_OK"] * 4
+
+
+def test_d_a_hooks_dir_is_not_made_for_a_route_that_is_refused(tmp_path, launches):
+    clone = make_clone(tmp_path)
+    assert ob.exercise_route("git commit -S -m x", clone, 30, {})[0] == "ROUTE_UNSAFE"
+    assert [p.name for p in tmp_path.iterdir()] == ["clone"] and launches == []
 
 
 # ---------- (c) every known PR 479 bypass repro is refused before launch ----------
@@ -652,7 +955,7 @@ def test_c_a_repro_is_not_launched_even_when_the_static_check_is_fooled(tmp_path
     monkeypatch.setattr(ob, "route_missing_reason", lambda *a, **k: None)
     build = {**BYPASS_REPROS, **EXTRA_REPROS}[name]
     status, _detail = check_argv(build(str(outside).replace("\\", "/")), clone)
-    assert status == "ROUTE_NOT_EXECUTED_LAUNCHER"
+    assert status == "ROUTE_NOT_EXECUTED"
     assert launches == [], f"{name} reached the process launch when the static check was fooled"
 
 
@@ -676,7 +979,7 @@ def test_c_the_in_clone_twin_of_a_repro_is_a_skip_and_also_not_launched(tmp_path
     twin = BYPASS_REPROS[name]("IGNORED")
     twin = [t.replace("IGNORED/outside", "tools/ok") for t in twin]
     status, _detail = check_argv(twin, clone)
-    assert status == "ROUTE_NOT_EXECUTED_LAUNCHER", (name, twin)
+    assert status == "ROUTE_NOT_EXECUTED", (name, twin)
     assert launches == []
 
 
@@ -1022,12 +1325,13 @@ def test_a_refused_credential_never_shows_its_value(tmp_path, capsys, launches, 
     assert status == "ROUTE_UNSAFE" and SENTINEL not in detail and not launches
 
 
-def test_a_launcher_route_carrying_a_credential_is_not_run_and_not_printed(tmp_path, capsys, launchers, launches):
+def test_a_route_off_the_allowlist_carrying_a_credential_is_refused_not_run_and_not_printed(tmp_path, capsys, launchers, launches):
+    """r2: the safety screen reads every route (it runs nothing), so a card never tells a steward to pass a credential."""
     bus = make_bus(tmp_path, {"tools/x.py": STUB})
     item = item_file(tmp_path, adopt("python tools/x.py --token <value>", f"python tools/x.py --token={SENTINEL}"))
-    assert exercise(tmp_path, item, bus, "--fill", f"value={SENTINEL}") == 0
+    assert exercise(tmp_path, item, bus, "--fill", f"value={SENTINEL}") == 1
     captured = capsys.readouterr()
-    assert statuses(captured.out) == ["ROUTE_NOT_EXECUTED_LAUNCHER"] * 2 and not launches
+    assert statuses(captured.out) == ["ROUTE_UNSAFE"] * 2 and not launches
     assert SENTINEL not in captured.out and SENTINEL not in captured.err
     assert "--token=<redacted>" in captured.out
 
@@ -1115,7 +1419,7 @@ def test_a_credential_value_that_also_appears_elsewhere_is_redacted_there_too(tm
     shared = "SHARED_ONE_SENTINEL SHARED_TWO_SENTINEL"
     status, detail = ob.exercise_route("git log <label> DB_PASSWORD=<value>", tmp_path, 30, {"label": shared, "value": shared})
     assert status == "ROUTE_UNSAFE" and "SHARED_ONE_SENTINEL" not in detail and "SHARED_TWO_SENTINEL" not in detail, detail
-    monkeypatch.setattr(ob, "run_route_process", lambda argv, cwd, env, timeout: (3, "", " ".join(argv[1:])))
+    monkeypatch.setattr(ob, "run_route_process", lambda argv, cwd, env, timeout: (3, "", " ".join(argv[-3:])))   # the route's own words
     status, detail = ob.exercise_route("git log <label> <db_password>", tmp_path, 30, {"label": shared, "db_password": shared})
     assert status == "ROUTE_FAILED" and "<redacted>" in detail
     assert "SHARED_ONE_SENTINEL" not in detail and "SHARED_TWO_SENTINEL" not in detail, detail
@@ -1190,6 +1494,19 @@ def test_a_credential_fill_with_an_escaped_character_is_not_printed_by_the_shell
     assert "<redacted>" in detail, detail
 
 
+@pytest.mark.parametrize("value", RX07_VALUES)
+def test_rx07_sols_r3_template_with_an_escaped_value_is_not_printed(tmp_path, value):
+    """Ported from #479 (dee057b5) to a git route: the python route it used is now a skip, so the UNSAFE path needs a run route."""
+    fills = {"label": value, "value": value}
+    status, detail = ob.exercise_route("git log <label> DB_PASSWORD=<value>", tmp_path, 30, fills)
+    assert status == "ROUTE_UNSAFE" and not rx07_leaks(detail, value), detail
+
+
+def test_rx07_the_shell_operator_reason_redacts_before_it_formats(tmp_path):
+    status, reason = ob.exercise_route("git log ><api_key>", tmp_path, 30, {"api_key": "RX07\\SENT"})
+    assert status == "ROUTE_UNSAFE" and "RX07" not in reason and "\\\\" not in reason, reason
+
+
 def test_the_choke_point_alone_redacts_the_escaped_forms_of_a_secret():
     for value in RX07_VALUES:
         text = f"a {value!r} b {repr(value)[1:-1]} c {value}"
@@ -1258,8 +1575,25 @@ def test_a_character_the_stream_cannot_encode_does_not_raise():
 
 def test_the_readme_catalogues_every_repro_and_states_the_launcher_rule():
     text = (REPO_ROOT / "doctrine-outbox" / "README.md").read_text(encoding="utf-8")
-    for needle in ("ROUTE_NOT_EXECUTED_LAUNCHER", "CARD-ROUTE-EXERCISE-LAUNCHER-ALLOWLIST-1", "existence-checked but not executed",
+    for needle in ("ROUTE_NOT_EXECUTED", "CARD-ROUTE-EXERCISE-LAUNCHER-ALLOWLIST-1", "existence-checked but not executed",
                    "PYTHONPATH", "NODE_OPTIONS", "BASH_ENV", "PERL5OPT", "RUBYOPT",
                    "pwsh -f", "pwsh <outside.ps1> -File", "pwsh -NoProfile <outside.ps1> -f", "node -r", "bash --rcfile",
                    "bash -o x", "--check-hash-based-pycs", "B1"):
         assert needle in text, needle
+    assert "ROUTE_NOT_EXECUTED_LAUNCHER" not in text, "the r1 status name is gone"
+    for needle in ("execution allowlist", "resolved executable", "pytest", "core.hooksPath", "core.editor=false", "--unsafe-paths",
+                   "GIT_EDITOR", "EDITOR", "SSH_ASKPASS", "GIT_EXTERNAL_DIFF", "--gpg-sign", "merge -s", "--upload-pack", "`!` alias"):
+        assert needle in text, needle
+
+
+def test_the_readme_claims_nothing_the_code_does_not_enforce():
+    """Every program the README says is run is on the allowlist, and every refused git form it lists is refused."""
+    text = (REPO_ROOT / "doctrine-outbox" / "README.md").read_text(encoding="utf-8")
+    section = text[text.index("## Card routes are checked before they ship"):]
+    assert "`pytest` is never run" in section
+    for program in ob.ROUTE_EXEC_ALLOW:
+        assert f"`{program}`" in section, program
+    for form in ("git apply --unsafe-paths ../x.patch", "git commit -S -m x", "git tag -s v1", "git merge -s ours other",
+                 "git log --exec=evil", "git !echo hi"):
+        status, _detail = ob.exercise_route(form, REPO_ROOT, 30, {})
+        assert status == "ROUTE_UNSAFE", form

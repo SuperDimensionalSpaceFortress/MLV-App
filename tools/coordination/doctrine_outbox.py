@@ -82,10 +82,10 @@ BEHAVIOURS
 11. Card routes are checked before they ship (CoS work order FWO-DEFECT-PREVENT-1 item 3; fail-closed, CARD-ROUTE-EXERCISE-2).
    `validate --exercise` takes every command an item names and, in a scratch `git clone --local --no-hardlinks` of the
    bus (`--bus`, default $FACTORY_BUS_CLONE) with `origin` removed, never in the bus itself, (a) checks that its program
-   and any script it names exist, running nothing, and (b) runs it only when its program is not a launcher (sh, bash, cmd,
-   pwsh, python, py, node, perl, ruby, an env/xargs-style wrapper, ...). A launcher route is existence-checked and then
-   skipped as `ROUTE_NOT_EXECUTED_LAUNCHER`, never launched. It prints one
-   `ROUTE_OK|ROUTE_NOT_EXECUTED_LAUNCHER|ROUTE_MISSING|ROUTE_FAILED|ROUTE_TIMEOUT|ROUTE_UNSAFE <item> <command>` line per
+   and every script it names exist, running nothing, and (b) runs it only when its program is on the execution ALLOWLIST
+   (`git`, by its bare name and its resolved executable). Every other program (a shell, an interpreter, pytest, ...) is
+   existence-checked and then skipped as `ROUTE_NOT_EXECUTED`, never launched. It prints one
+   `ROUTE_OK|ROUTE_NOT_EXECUTED|ROUTE_MISSING|ROUTE_FAILED|ROUTE_TIMEOUT|ROUTE_UNSAFE <item> <command>` line per
    command; anything but the first two exits 1. The extraction rule and the outcome meanings are the block comment above
    `extract_routes`.
 
@@ -2353,7 +2353,9 @@ def cmd_session_start(repo: pathlib.Path, ref: str, ledger: pathlib.Path) -> int
 # a card that names a command nobody ran ships a route that does not exist (#468 adoption steps; #469 `doctrine-sync debt`).
 # CARD-ROUTE-EXERCISE-2 is the fail-closed successor of CARD-ROUTE-EXERCISE-1 (PR 479, parked): that card decided which script
 # a launcher would run with two hand-written walks over one argv (a safety matcher and a script discovery), and every review
-# round found a spelling where they disagreed. This tool never launches a launcher, so no second grammar can disagree.
+# round found a spelling where they disagreed. r1 of this card then kept a DENYLIST of launcher names, so any code-running
+# program it did not list (pytest) was run. Fail-closed is the opposite: only an explicitly ALLOWLISTED program is ever run
+# (ROUTE_EXEC_ALLOW, decided by its bare name and its resolved executable); everything else is existence-checked and skipped.
 #
 # WHAT COUNTS AS A ROUTE COMMAND (the extraction rule, applied to the item body):
 #   1. Every non-blank line of a fenced block whose info string starts with `route` (```route or ~~~route), except a
@@ -2364,39 +2366,50 @@ def cmd_session_start(repo: pathlib.Path, ref: str, ledger: pathlib.Path) -> int
 #   A one-word span (`debt`, `RULINGS.md`) is a name, not a command. Spans outside a section are prose and are not run.
 # Commands are split without a shell (POSIX shlex; on Windows non-POSIX shlex so a backslash path stays whole), one per
 # line, and checked in a scratch clone of the bus. `<name>` placeholders are filled from --fill name=VALUE (`<scratch>` is
-# the scratch clone itself); one left unfilled is ROUTE_FAILED.
+# the scratch clone itself); one left unfilled is ROUTE_FAILED on a route that is run and is only NOTED on one that is not.
 #
-# TWO STEPS PER ROUTE, in this order:
-#   1. STATIC EXISTENCE CHECK, for EVERY route, launcher routes included. It runs nothing. The route's program must resolve
-#      (PATH, or a path inside the scratch clone), and when the route names a script (python/py, node, a shell, pwsh/powershell,
-#      perl/ruby/php/lua/Rscript/osascript) that script must be a file that resolves, symlinks and junctions followed, inside
-#      the scratch clone. A miss is ROUTE_MISSING with a typed reason first in its detail: PROGRAM_NOT_FOUND, PROGRAM_IS_SHIM
-#      (a `.cmd`/`.bat` shim cannot start without `cmd /c`), SCRIPT_NOT_FOUND or SCRIPT_OUTSIDE_CLONE. WHICH token is "the
-#      script" is a best-effort reading of the launcher's options, and nothing is launched on the strength of it.
-#   2. EXECUTION, only when the program is not a LAUNCHER. A launcher is a program that runs code named in its own arguments
-#      or environment: a shell (sh, bash, zsh, dash, ...), cmd, pwsh/powershell, python/py, node/deno/bun, perl/ruby/php/lua/
-#      Rscript/osascript, an env/xargs/nohup/timeout-style wrapper, a package tool (npm, pip, cargo, ...) or a build driver
-#      (make, ...). A launcher route that passes step 1 is `ROUTE_NOT_EXECUTED_LAUNCHER`: a skip, NOT a failure, so a card's
-#      `py -3 tools/x.py` still validates. It is NEVER launched, whatever its arguments (`pwsh <outside.ps1> -File <in-clone>`,
-#      `node -r <in-clone> <outside.js>`, `bash --rcfile <in-clone> <outside.sh>`, `python --check-hash-based-pycs default
-#      <outside.py>` and the other PR 479 repros are all launcher routes). Launching them is the separate later card
-#      CARD-ROUTE-EXERCISE-LAUNCHER-ALLOWLIST-1: exact shapes, a pinned (not PATH-shadowed) executable, and secondary execution
-#      inputs (preload flags, environment) have to be closed first.
+# THREE STEPS PER ROUTE, in this order:
+#   1. SAFETY SCREEN, for EVERY route (route_unsafe_reason). It runs nothing: a shell operator, a URL, a credential, a
+#      network client, `gh`, a git form that starts a helper (below) or anything inside the live bus is ROUTE_UNSAFE.
+#   2. STATIC EXISTENCE CHECK, for EVERY route. It runs nothing. The route's program must resolve (PATH, or a path inside the
+#      scratch clone), and every script it names (python/py, node and its -r/--import preloads, a shell and its --rcfile, deno,
+#      bun, pwsh/powershell, awk -f, perl/ruby/php/lua/Rscript/osascript/tclsh) must be a file that resolves, symlinks and
+#      junctions followed, inside the scratch clone. The program is read by what it RESOLVES to as well as by its name, so a
+#      link named `helper.exe` that is really python has its script checked. A miss is ROUTE_MISSING with a typed reason first
+#      in its detail: PROGRAM_NOT_FOUND, PROGRAM_IS_SHIM (a `.cmd`/`.bat` shim cannot start without `cmd /c`), SCRIPT_NOT_FOUND
+#      or SCRIPT_OUTSIDE_CLONE. WHICH token is "the script" is a best-effort reading of the program's options, and nothing is
+#      launched on the strength of it.
+#   3. EXECUTION, only when the program is on the EXECUTION ALLOWLIST (ROUTE_EXEC_ALLOW: `git`). The decision is the program as
+#      the route spells it, a bare name (`git`, `git.exe`; never a path, so `tools/git` and `/usr/bin/git` are not on it), AND
+#      the executable it resolves to: the first `git` on a PATH stripped of every relative entry and every entry inside the
+#      scratch clone, whose real path is not inside the clone and is itself called git (route_git_binary). Anything else (a
+#      shell, an interpreter, pytest, a renamed copy, a link, an unknown name) that passes steps 1 and 2 is `ROUTE_NOT_EXECUTED`:
+#      a skip, NOT a failure, so a card's `py -3 tools/x.py` still validates. It is NEVER launched, whatever its arguments, so
+#      there is no second grammar to disagree with the script reading above (`pwsh <outside.ps1> -File <in-clone>`, `node -r
+#      <in-clone> <outside.js>`, `bash --rcfile <in-clone> <outside.sh>`, `python --check-hash-based-pycs default <outside.py>`
+#      and the other PR 479 repros are all routes off the allowlist). Widening the allowlist is the separate later card
+#      CARD-ROUTE-EXERCISE-LAUNCHER-ALLOWLIST-1: exact shapes, a pinned executable, and secondary execution inputs (preload
+#      flags, environment) have to be closed first.
 #
-# OUTCOMES, one line each: `ROUTE_OK|ROUTE_NOT_EXECUTED_LAUNCHER|ROUTE_MISSING|ROUTE_FAILED|ROUTE_TIMEOUT|ROUTE_UNSAFE <item> <command>`.
+# OUTCOMES, one line each: `ROUTE_OK|ROUTE_NOT_EXECUTED|ROUTE_MISSING|ROUTE_FAILED|ROUTE_TIMEOUT|ROUTE_UNSAFE <item> <command>`.
 #   OK        it ran and exited 0.
-#   NOT_EXECUTED_LAUNCHER  it is a launcher route that passed the static check; not run, not a failure.
+#   NOT_EXECUTED  its program is not on the execution allowlist and it passed steps 1 and 2; not run, not a failure. An unfilled
+#             `<placeholder>` is noted in its detail, and the script check skips an operand that holds one.
 #   MISSING   the static check failed (the typed reasons above).
-#   FAILED    it ran and exited non-zero, or a placeholder was left unfilled, or the line does not parse.
+#   FAILED    it ran and exited non-zero, or a placeholder was left unfilled on a route that is run, or the line does not parse.
 #   TIMEOUT   it ran past --timeout seconds; its whole process tree was killed (a Job Object on Windows, a process
 #             group on POSIX), so nothing outlives the call. Only the last 64 KiB of each output stream is kept.
-#   UNSAFE    it was NOT run: a route that is run must be offline, credential-free and confined to the scratch clone.
+#   UNSAFE    it was NOT run: a route must be offline, credential-free and confined to the scratch clone.
 #             Refused: a shell operator (pipe, `&&`, `;`, redirect); an environment-assignment prefix; a URL or `user@host:`
 #             remote in any argument; a credential assignment (`NAME=value` for ANTHROPIC_*, GH_*, *_TOKEN, *_KEY, *PASSWORD*,
 #             ...) or `--token`/`--password`; any `gh`; claude/codex `auth|login|logout`; a network client (curl, ssh, npx, ...);
-#             `find -exec`/`-delete`; and git other than the allowlisted read-only or scratch-local verbs (no push, pull, fetch,
-#             ls-remote, clone, remote, submodule, aliases), with no `-c`/`--config-env`, no `config` write, and
-#             `-C`/`--git-dir`/`--work-tree` only inside the scratch clone.
+#             `find -exec`/`-delete`; a `git` that resolves only inside the clone or to a program that is not git; and git
+#             other than the allowlisted read-only or scratch-local verbs (no push, pull, fetch, ls-remote, clone, remote,
+#             submodule, aliases), with no `-c`/`--config-env`, no `config` write, `-C`/`--git-dir`/`--work-tree` only inside the
+#             scratch clone, and none of the forms that start a helper (ROUTE_GIT_RUNS_COMMANDS, _route_git_helper_reason):
+#             `--exec`, `--upload-pack`, `--receive-pack`, `--ext-diff`, `-O`/`--open-files-in-pager`, `--output`, `apply
+#             --unsafe-paths`, `-S`/`--gpg-sign` on commit, tag, merge, cherry-pick and revert, `tag -s|-u|--local-user`,
+#             `merge -s|--strategy`, and a `!` alias.
 #   LIVE BUS HUB RULING (r2, binding): "refuse if --bus resolves to the live clone" means NO ROUTE runs with its working
 #             directory, a `-C`/`--git-dir`/`--work-tree` target, or any argument or --fill value (also the value of
 #             `--opt=VALUE`) that resolves INSIDE the live bus. The default $FACTORY_BUS_CLONE is still cloned, read-only.
@@ -2404,10 +2417,13 @@ def cmd_session_start(repo: pathlib.Path, ref: str, ledger: pathlib.Path) -> int
 #             collapsed, case folded, trailing separators dropped) and compared by containment: a route that does is
 #             ROUTE_UNSAFE, and a --scratch-root inside the bus is exit 2.
 # A route that IS run gets the interpreter-injection environment stripped (PYTHONPATH, PYTHONSTARTUP, PYTHONHOME, NODE_OPTIONS,
-# NODE_PATH, PERL5OPT, PERL5LIB, RUBYOPT, BASH_ENV, ENV) and every credential-shaped variable, git's user and system config and
-# every GIT_* variable (route_exercise_env).
+# NODE_PATH, PERL5OPT, PERL5LIB, RUBYOPT, BASH_ENV, ENV), every credential-shaped variable, every GIT_* variable (GIT_EDITOR,
+# GIT_SEQUENCE_EDITOR, GIT_PAGER, GIT_ASKPASS, GIT_SSH, GIT_SSH_COMMAND, GIT_EXTERNAL_DIFF, GIT_CONFIG_PARAMETERS, ...) and the
+# generic helpers EDITOR, VISUAL, PAGER and SSH_ASKPASS (route_exercise_env), with git's user and system config switched off.
+# Git itself is started as `git -c core.pager=cat -c core.editor=false -c diff.external= -c core.hooksPath=<an empty directory in
+# the scratch> ...` (route_git_command), so no pager, editor, external diff or hook is reachable even through a verb that wants one.
 # A credential's value is never printed: a diagnostic, a ROUTE line or an error shows `NAME=<redacted>`.
-# Any outcome but OK and NOT_EXECUTED_LAUNCHER fails the run (exit 1). The commands run in `git clone --local --no-hardlinks`
+# Any outcome but OK and NOT_EXECUTED fails the run (exit 1). The commands run in `git clone --local --no-hardlinks`
 # of --bus (default $FACTORY_BUS_CLONE) with `origin` removed, under a scratch directory this tool creates and removes by name.
 # --bus is only READ, by that clone; no route runs in it. The scratch root may not be inside it (exit 2).
 # A bus clone behind its own origin/master prints a `ROUTE_BUS_STALE <behind>` warning on stderr; the exit is unchanged.
@@ -2432,21 +2448,28 @@ ROUTE_ENV_PREFIX_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 ROUTE_NETWORK_CLIENTS = frozenset({"curl", "wget", "ssh", "scp", "sftp", "ftp", "rsync", "nc", "ncat", "telnet",
                                    "invoke-webrequest", "iwr", "invoke-restmethod", "irm", "npx", "pnpx", "bunx", "uvx",
                                    "apt", "apt-get", "brew", "choco", "winget", "scoop", "bitsadmin", "certutil"})
-ROUTE_WRAPPERS = frozenset({"cmd", "env", "sudo", "doas", "runas", "start", "wsl", "xargs", "nohup", "command", "exec", "eval",
-                            "nice", "ionice", "time", "timeout", "stdbuf", "setsid", "watch", "busybox", "wscript", "cscript",
-                            "mshta", "rundll32", "regsvr32", "forfiles", "schtasks", "call", "builtin", "conhost", "wt",
-                            "invoke-expression", "iex", "invoke-command", "icm", "start-process", "saps", "invoke-item", "ii"})
-ROUTE_PACKAGE_TOOLS = frozenset({"npm", "pnpm", "yarn", "bun", "pip", "pip3", "pipx", "uv", "poetry", "conda", "mamba", "twine",
-                                 "docker", "cargo", "gem", "dotnet", "nuget", "composer", "flit", "hatch"})
 ROUTE_FIND_RUNS = frozenset({"-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprintf", "-fls"})
 ROUTE_SHELLS = frozenset({"bash", "sh", "zsh", "dash", "ksh", "ash", "fish", "csh", "tcsh"})
 ROUTE_PYTHONS = frozenset({"python", "pythonw", "pypy", "py"})
 ROUTE_POWERSHELLS = frozenset({"pwsh", "powershell", "pwsh-preview"})
 ROUTE_INLINE_INTERPRETERS = {"ruby": {"-e"}, "perl": {"-e", "-E"}, "php": {"-r"}, "lua": {"-e"}, "rscript": {"-e"},
                              "osascript": {"-e"}, "deno": {"eval"}, "bun": {"-e", "--eval", "-p", "--print"}}
-ROUTE_LAUNCHERS = (ROUTE_SHELLS | ROUTE_PYTHONS | ROUTE_POWERSHELLS | ROUTE_WRAPPERS | ROUTE_PACKAGE_TOOLS
-                   | frozenset(ROUTE_INLINE_INTERPRETERS)
-                   | {"node", "nodejs", "tclsh", "awk", "gawk", "mawk", "nawk", "make", "gmake", "mingw32-make", "cmake", "ninja", "msbuild"})
+ROUTE_AWKS = frozenset({"awk", "gawk", "mawk", "nawk"})
+ROUTE_SCRIPT_EXT_RE = re.compile(r"\.[cm]?[jt]sx?$", re.I)
+ROUTE_DENO_SCRIPT_VERBS = frozenset({"run", "test", "bench", "check", "compile", "serve"})
+ROUTE_DENO_OTHER_VERBS = frozenset({"task", "fmt", "lint", "doc", "info", "install", "uninstall", "upgrade", "repl", "init", "add",
+                                    "remove", "outdated", "publish", "jsr", "bundle", "cache", "clean", "completions", "coverage",
+                                    "types", "vendor", "eval", "help"})
+ROUTE_DENO_OPERAND_FLAGS = frozenset({"-c", "--config", "--import-map", "--cert", "--location", "--seed"})
+ROUTE_BUN_OTHER_VERBS = frozenset({"install", "i", "add", "a", "remove", "rm", "update", "upgrade", "link", "unlink", "pm", "x",
+                                   "create", "init", "build", "test", "exec", "repl", "audit", "outdated", "publish", "patch",
+                                   "info", "why", "completions", "help"})
+ROUTE_BUN_OPERAND_FLAGS = frozenset({"--cwd", "-c", "--config", "--env-file", "--tsconfig-override", "--port", "--define", "-d",
+                                     "--loader", "-l", "-r", "--preload", "--require", "--import"})
+ROUTE_PRELOAD_FLAGS = {"node": frozenset({"-r", "--require", "--import", "--loader", "--experimental-loader"}),
+                       "bun": frozenset({"-r", "--preload", "--require", "--import"}),
+                       "shell": frozenset({"--rcfile", "--init-file"})}
+ROUTE_EXEC_ALLOW = frozenset({"git"})                   # the ONLY programs a route is ever run with (route_runs)
 ROUTE_GIT_ALLOWED = frozenset({
     "log", "status", "show", "diff", "rev-parse", "rev-list", "ls-files", "ls-tree", "cat-file", "describe", "grep", "blame",
     "shortlog", "merge-base", "for-each-ref", "show-ref", "name-rev", "diff-tree", "diff-index", "diff-files", "check-ignore",
@@ -2456,6 +2479,12 @@ ROUTE_GIT_CONFIG_READS = frozenset({"--get", "--get-all", "--get-regexp", "--get
 ROUTE_GIT_CONFIG_WRITES = frozenset({"--add", "--unset", "--unset-all", "--replace-all", "--edit", "-e", "--rename-section",
                                      "--remove-section", "set", "unset", "edit", "rename-section", "remove-section"})
 ROUTE_GIT_RUNS_COMMANDS = frozenset({"--output", "--open-files-in-pager", "--upload-pack", "--receive-pack", "--exec", "--ext-diff"})
+ROUTE_GIT_SIGN_VERBS = frozenset({"commit", "tag", "merge", "cherry-pick", "revert"})          # verbs that can start gpg
+ROUTE_GIT_STRATEGY_VERBS = frozenset({"merge", "cherry-pick", "revert"})                       # verbs that look up git-merge-<name>
+ROUTE_GIT_HARDENING = ("core.pager=cat", "core.editor=false", "diff.external=", "core.fsmonitor=false", "commit.gpgsign=false",
+                       "tag.gpgsign=false")                                                    # `-c` pairs before every run git
+ROUTE_NO_HOOKS_DIR = "outbox-route-no-hooks"                                                   # empty, beside the clone in the scratch
+ROUTE_HELPER_ENV = frozenset({"EDITOR", "VISUAL", "PAGER", "SSH_ASKPASS"})                     # helpers git reads besides GIT_*
 ROUTE_STRIPPED_ENV_RE = re.compile(r"(?:TOKEN|SECRET|PASSWORD|API_?KEY|CREDENTIAL)|^(?:ANTHROPIC_|CLAUDE_CODE_|GH_|GIT_|GITHUB_)", re.I)
 ROUTE_INJECTION_ENV = frozenset({"PYTHONPATH", "PYTHONSTARTUP", "PYTHONHOME", "NODE_OPTIONS", "NODE_PATH", "PERL5OPT", "PERL5LIB",
                                  "RUBYOPT", "BASH_ENV", "ENV"})
@@ -2463,7 +2492,7 @@ ROUTE_SCRATCH_PREFIX = "outbox-exercise-"
 ROUTE_DEFAULT_TIMEOUT_S = 60.0
 ROUTE_OUTPUT_CAP_BYTES = 64 * 1024
 ROUTE_BUS_ENV = "FACTORY_BUS_CLONE"
-ROUTE_PASSING = ("ROUTE_OK", "ROUTE_NOT_EXECUTED_LAUNCHER")
+ROUTE_PASSING = ("ROUTE_OK", "ROUTE_NOT_EXECUTED")
 ROUTE_STATUSES = (*ROUTE_PASSING, "ROUTE_MISSING", "ROUTE_FAILED", "ROUTE_TIMEOUT", "ROUTE_UNSAFE")
 
 
@@ -2513,9 +2542,52 @@ def route_program_name(program: str) -> str:
     return re.sub(r"[\d.\-]+$", "", name) or name
 
 
-def route_is_launcher(argv: list[str]) -> bool:
-    """True when the route's program runs code named in its own arguments (ROUTE_LAUNCHERS). Such a route is never launched."""
-    return bool(argv) and route_program_name(argv[0]) in ROUTE_LAUNCHERS
+def route_runs(argv: list[str]) -> bool:
+    """True when the route's program is on the execution ALLOWLIST (ROUTE_EXEC_ALLOW): its bare name, `git` or `git.exe`, never
+    a path (`tools/git`, `/usr/bin/git`). Nothing else is ever launched; a route this refuses is only existence-checked."""
+    if not argv:
+        return False
+    name = os.path.normcase(argv[0])
+    return name in ROUTE_EXEC_ALLOW or (name.endswith(".exe") and name[:-4] in ROUTE_EXEC_ALLOW)
+
+
+def route_git_binary(cwd: str | os.PathLike) -> tuple[str | None, tuple[str, str] | None]:
+    """The git executable a route may run, as (path, None), else (None, (ROUTE_* status, detail)). The first `git` on a PATH
+    stripped of every relative entry (`.`, empty) and every entry inside the scratch clone `cwd`, so a git planted in the clone
+    (a copy, a hardlink, a link, a renamed program) is never found; its REAL path must not lie inside the clone and must itself
+    be called git, and it must not be a `.cmd`/`.bat` shim."""
+    scratch = route_real_path(str(cwd))
+    kept = []
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        try:
+            if entry and os.path.isabs(entry) and not route_inside(route_real_path(entry), scratch):
+                kept.append(entry)
+        except (OSError, ValueError):
+            continue
+    found = shutil.which("git", path=os.pathsep.join(kept))
+    if found is None:
+        if shutil.which("git", path=os.environ.get("PATH")) is not None:
+            return None, ("ROUTE_UNSAFE", "git resolves only inside the scratch clone; a git the bus carries is never run")
+        return None, ("ROUTE_MISSING", "PROGRAM_NOT_FOUND: git: no such program on PATH")
+    real = route_real_path(found)
+    if route_inside(real, scratch):
+        return None, ("ROUTE_UNSAFE", f"git resolves to {found!r}, inside the scratch clone; a git the bus carries is never run")
+    if pathlib.PurePath(real).stem.lower() != "git":
+        return None, ("ROUTE_UNSAFE", f"git resolves to {pathlib.PurePath(real).name!r}, which is not a git binary")
+    if os.name == "nt" and found.lower().endswith((".cmd", ".bat")):
+        return None, ("ROUTE_MISSING", f"PROGRAM_IS_SHIM: git: resolves to a {pathlib.PurePath(found).suffix.lower()} shim ({found}); "
+                                       "a shim is not exercisable without cmd /c, which a route may not use")
+    return found, None
+
+
+def route_git_command(git_bin: str, argv: list[str], cwd: str | os.PathLike) -> list[str]:
+    """The command line git is started with: `-c` overrides that switch off every pager, editor, external diff, hook, fsmonitor
+    and signing helper (ROUTE_GIT_HARDENING and `core.hooksPath` = an empty directory beside the clone), then the route's own
+    words untouched. A route may not pass `-c` itself (_route_git_unsafe), so nothing it says can undo these."""
+    hooks = pathlib.Path(cwd).parent / ROUTE_NO_HOOKS_DIR
+    hooks.mkdir(exist_ok=True)
+    pairs = [*ROUTE_GIT_HARDENING, f"core.hooksPath={hooks}"]
+    return [git_bin, *(part for pair in pairs for part in ("-c", pair)), *argv[1:]]
 
 
 def route_secret_values(template: list[str], fills: dict[str, str]) -> list[str]:
@@ -2603,6 +2675,8 @@ def _route_git_unsafe(argv: list[str], cwd: str, secrets: Iterable[str] = ()) ->
             return "git -c: a config override can smuggle in an alias, a helper or a pager"
         if tok.startswith("--config-env") or tok.startswith("--exec-path"):
             return f"git {tok.split('=', 1)[0]} changes what git runs"
+        if tok.split("=", 1)[0] in ROUTE_GIT_RUNS_COMMANDS:             # before the verb too: `git --upload-pack=x log`
+            return f"git {tok.split('=', 1)[0]} writes outside the scratch clone or runs another program"
         target = None
         if tok == "-C" and i + 1 < len(argv):
             here = os.path.join(here, os.path.expanduser(argv[i + 1]))
@@ -2626,6 +2700,8 @@ def _route_git_unsafe(argv: list[str], cwd: str, secrets: Iterable[str] = ()) ->
         i += 1
     if sub is None:
         return None
+    if sub.startswith("!"):
+        return "git !alias runs a shell command"
     if sub not in ROUTE_GIT_ALLOWED:
         return f"git {sub} is not an allowlisted read-only or scratch-local verb (online verbs, publishing, aliases and unlisted verbs are never run)"
     after = argv[i + 1:]
@@ -2635,13 +2711,32 @@ def _route_git_unsafe(argv: list[str], cwd: str, secrets: Iterable[str] = ()) ->
     for tok in after:
         if tok.split("=", 1)[0] in ROUTE_GIT_RUNS_COMMANDS or (sub == "grep" and tok.startswith("-O")):
             return f"git {sub} {tok.split('=', 1)[0]} writes outside the scratch clone or runs another program"
+    return _route_git_helper_reason(sub, after)
+
+
+def _route_git_helper_reason(sub: str, after: list[str]) -> str | None:
+    """Why an allowlisted verb with these options would still start a helper or write outside the clone, else None: `apply
+    --unsafe-paths`; gpg through `-S`/`--gpg-sign` (commit, tag, merge, cherry-pick, revert) or `tag -s|-u|--local-user`; a merge
+    driver looked up on PATH through `merge -s` / `--strategy`. A short option is read as a cluster, so `-aS` and `-sm` count."""
+    for tok in after:
+        if sub == "apply" and tok == "--unsafe-paths":
+            return "git apply --unsafe-paths writes outside the scratch clone"
+        short = tok[1:] if tok.startswith("-") and not tok.startswith("--") else ""
+        if sub in ROUTE_GIT_SIGN_VERBS and (tok.startswith("--gpg-sign") or "S" in short):
+            return f"git {sub} {tok.split('=', 1)[0]} starts gpg"
+        if sub == "tag" and (tok == "--sign" or tok.startswith("--local-user") or "s" in short or "u" in short):
+            return f"git tag {tok.split('=', 1)[0]} signs the tag and starts gpg"
+        if sub in ROUTE_GIT_STRATEGY_VERBS and tok.startswith("--strategy"):
+            return f"git {sub} {tok.split('=', 1)[0]} looks a merge driver up on PATH and runs it"
+        if sub == "merge" and short.startswith("s"):
+            return "git merge -s looks a merge driver up on PATH and runs it"
     return None
 
 
 def route_unsafe_reason(argv: list[str], cwd: str | os.PathLike | None = None, bus: str | os.PathLike | None = None,
                         secrets: Iterable[str] = ()) -> str | None:
-    """Why a parsed route must not be RUN, or None. Asked only of a route whose program is not a launcher (a launcher route is
-    never run, so it needs no verdict); the list is in the block comment above. A diagnostic never carries a credential's
+    """Why a parsed route is refused, or None. Asked of EVERY route (it only reads the argv, so a route that is never run is
+    screened too); the list is in the block comment above. A diagnostic never carries a credential's
     value (redact_route_text; `secrets` are the filled values bound to one, route_secret_values). `cwd` is the scratch clone
     (default: the current directory) and `bus` the live bus, when known."""
     if not argv:
@@ -2805,22 +2900,122 @@ def _route_powershell_script(rest: list[str]) -> str | None:
     return None
 
 
-def route_script_operand(argv: list[str]) -> str | None:
-    """The file a launcher route names as its script, for the STATIC existence check only (nothing is launched on its
-    strength); None when the route names none (a module, inline code, a wrapper, a program that is no interpreter)."""
-    name = route_program_name(argv[0])
+def _route_file_like(tok: str) -> bool:
+    """True when a `bun run` operand names a file (a path, or a .js/.ts/.mjs/... name), not a package.json script (`build`)."""
+    return bool(re.search(r"[\\/]", tok) or ROUTE_SCRIPT_EXT_RE.search(tok))
+
+
+def _route_deno_script(rest: list[str]) -> str | None:
+    """deno: the operand of `run|test|bench|check|compile|serve`, or the bare script (`deno x.ts`), past the options that take an
+    operand (`-c deno.json`); None for `task`, `eval`, `fmt` and the other verbs that name no script."""
+    i, verb = 0, None
+    while i < len(rest):
+        tok = rest[i]
+        if tok.startswith("-") and tok != "-":
+            i += 2 if tok in ROUTE_DENO_OPERAND_FLAGS else 1
+            continue
+        if verb is None and tok in ROUTE_DENO_SCRIPT_VERBS:
+            verb = tok
+        elif verb is None and tok in ROUTE_DENO_OTHER_VERBS:
+            return None
+        else:
+            return tok
+        i += 1
+    return None
+
+
+def _route_bun_script(rest: list[str]) -> str | None:
+    """bun: the file operand of `bun run <file>` or `bun <file>`, past the options that take an operand; None for inline code
+    (-e/-p), a package.json script (`bun run build`) and the verbs that name no file (`install`, `test`, ...)."""
+    i, verb = 0, None
+    while i < len(rest):
+        tok = rest[i]
+        if tok in ROUTE_INLINE_INTERPRETERS["bun"]:
+            return None
+        if tok.startswith("-") and tok != "-":
+            i += 2 if tok in ROUTE_BUN_OPERAND_FLAGS else 1
+            continue
+        if verb is None and tok == "run":
+            verb = tok
+        elif verb is None and tok in ROUTE_BUN_OTHER_VERBS:
+            return None
+        else:
+            return tok if _route_file_like(tok) else None
+        i += 1
+    return None
+
+
+def _route_flag_operands(rest: list[str], flags: frozenset[str], main: str | None) -> list[str]:
+    """The operand of every option in `flags` (`-r x`, `--require=x`) placed before the `main` script: one after it belongs to the
+    script, not to the program. A preload or rc file is code the program runs, so it is a named script too."""
+    found, i = [], 0
+    while i < len(rest):
+        tok = rest[i]
+        key = tok.split("=", 1)[0]
+        if key in flags:
+            if "=" in tok:
+                found.append(tok.split("=", 1)[1])
+                i += 1
+            elif i + 1 < len(rest):
+                found.append(rest[i + 1])
+                i += 2
+            else:
+                i += 1
+            continue
+        if main is not None and tok == main:
+            break
+        i += 1
+    return [f for f in found if f]
+
+
+def _route_awk_files(rest: list[str]) -> list[str]:
+    """awk/gawk/mawk/nawk: every program file named with `-f FILE`, `-fFILE` or `--file=FILE`; the program text itself is no file."""
+    found, i = [], 0
+    while i < len(rest):
+        tok = rest[i]
+        if tok in ("-f", "--file") and i + 1 < len(rest):
+            found.append(rest[i + 1])
+            i += 2
+            continue
+        if tok.startswith("--file="):
+            found.append(tok.split("=", 1)[1])
+        elif tok.startswith("-f") and len(tok) > 2 and not tok.startswith("--"):
+            found.append(tok[2:])
+        i += 1
+    return [f for f in found if f]
+
+
+def route_script_operands(argv: list[str], name: str | None = None) -> list[str]:
+    """Every file a route names as code its program runs, in order, for the STATIC existence check only (nothing is launched on
+    its strength): the script, plus node's -r/--import preloads, a shell's --rcfile, bun's --preload and awk's -f files. `name`
+    is the program family to read the options as (default: the program's own name). Empty when the route names none (a module,
+    inline code, a wrapper, a program that is no interpreter)."""
+    name = name or route_program_name(argv[0])
     rest = argv[1:]
     if name in ROUTE_PYTHONS:
-        return _route_python_script(rest)
-    if name in ROUTE_SHELLS:
-        return _route_shell_script(rest)
-    if name in ("node", "nodejs"):
-        return _route_node_script(rest)
-    if name in ROUTE_POWERSHELLS:
-        return _route_powershell_script(rest)
-    if name in ROUTE_INLINE_INTERPRETERS and name not in ("deno", "bun"):
-        return _route_generic_script(rest, ROUTE_INLINE_INTERPRETERS[name])
-    return None
+        found = [_route_python_script(rest)]
+    elif name in ROUTE_SHELLS:
+        main = _route_shell_script(rest)
+        found = [*_route_flag_operands(rest, ROUTE_PRELOAD_FLAGS["shell"], main), main]
+    elif name in ("node", "nodejs"):
+        main = _route_node_script(rest)
+        found = [*_route_flag_operands(rest, ROUTE_PRELOAD_FLAGS["node"], main), main]
+    elif name == "deno":
+        found = [_route_deno_script(rest)]
+    elif name == "bun":
+        main = _route_bun_script(rest)
+        found = [*_route_flag_operands(rest, ROUTE_PRELOAD_FLAGS["bun"], main), main]
+    elif name in ROUTE_POWERSHELLS:
+        found = [_route_powershell_script(rest)]
+    elif name in ROUTE_AWKS:
+        found = _route_awk_files(rest)
+    elif name == "tclsh":
+        found = [_route_generic_script(rest, set())]
+    elif name in ROUTE_INLINE_INTERPRETERS:
+        found = [_route_generic_script(rest, ROUTE_INLINE_INTERPRETERS[name])]
+    else:
+        found = []
+    return [f for f in found if f]
 
 
 def route_resolve_program(program: str, cwd: pathlib.Path) -> str | None:
@@ -2834,23 +3029,9 @@ def route_resolve_program(program: str, cwd: pathlib.Path) -> str | None:
     return shutil.which(program, path=os.environ.get("PATH"))
 
 
-def route_missing_reason(argv: list[str], cwd: pathlib.Path, launcher: bool | None = None) -> tuple[str, str] | None:
-    """The STATIC existence check; it runs nothing. (typed reason, text) when the route's program does not resolve, resolves
-    to a `.cmd`/`.bat` shim (only a route that will be RUN needs to start), or the script it names is not a file inside the
-    scratch clone (missing, or resolving outside it: an absolute path, `..` or an outward symlink or junction). None when
-    both exist."""
-    program = argv[0]
-    found = route_resolve_program(program, cwd)
-    if found is None:
-        return "PROGRAM_NOT_FOUND", f"{program}: no such program on PATH or in the scratch clone"
-    if launcher is None:
-        launcher = route_is_launcher(argv)
-    if not launcher and os.name == "nt" and found.lower().endswith((".cmd", ".bat")):
-        return "PROGRAM_IS_SHIM", (f"{program}: resolves to a {pathlib.PurePath(found).suffix.lower()} shim ({found}); "
-                                   "a shim is not exercisable without cmd /c, which a route may not use")
-    script = route_script_operand(argv)
-    if script is None:
-        return None
+def _route_script_problem(script: str, cwd: pathlib.Path) -> tuple[str, str] | None:
+    """(typed reason, text) when `script` is not a file inside the scratch clone `cwd`: missing, or resolving outside it (an
+    absolute path, `..` or an outward symlink or junction). None when it is."""
     try:
         real = (cwd / script).resolve(strict=False)                     # follows a symlink; an absolute `script` replaces cwd
         inside = real.is_relative_to(cwd.resolve())                     # containment by path, never a string prefix
@@ -2861,6 +3042,35 @@ def route_missing_reason(argv: list[str], cwd: pathlib.Path, launcher: bool | No
         return "SCRIPT_OUTSIDE_CLONE", f"{script}: resolves outside the scratch clone"
     if not is_file:
         return "SCRIPT_NOT_FOUND", f"{script}: no such script in the scratch clone"
+    return None
+
+
+def route_missing_reason(argv: list[str], cwd: pathlib.Path, will_run: bool = False,
+                         pending: frozenset[str] = frozenset()) -> tuple[str, str] | None:
+    """The STATIC existence check; it runs nothing. (typed reason, text) when the route's program does not resolve, resolves
+    to a `.cmd`/`.bat` shim (only a route that will be RUN needs to start), or any script it names (route_script_operands) is
+    not a file inside the scratch clone. The program is read under its own name AND under the name of the file it resolves to,
+    so a link or alias of an interpreter has its script checked too. `pending` holds the tokens that still carry an unfilled
+    `<placeholder>`: the program or script operand among them cannot be looked up and is skipped. None when all exist."""
+    program = argv[0]
+    if program in pending:
+        return None
+    found = route_resolve_program(program, cwd)
+    if found is None:
+        return "PROGRAM_NOT_FOUND", f"{program}: no such program on PATH or in the scratch clone"
+    if will_run and os.name == "nt" and found.lower().endswith((".cmd", ".bat")):
+        return "PROGRAM_IS_SHIM", (f"{program}: resolves to a {pathlib.PurePath(found).suffix.lower()} shim ({found}); "
+                                   "a shim is not exercisable without cmd /c, which a route may not use")
+    names = [route_program_name(program), route_program_name(os.path.realpath(found))]
+    checked: set[str] = set()
+    for name in dict.fromkeys(names):
+        for script in route_script_operands(argv, name):
+            if script in pending or script in checked:
+                continue
+            checked.add(script)
+            problem = _route_script_problem(script, cwd)
+            if problem:
+                return problem
     return None
 
 
@@ -2875,10 +3085,13 @@ def split_route(command: str) -> list[str]:
 
 def route_exercise_env(base: dict[str, str] | None = None) -> dict[str, str]:
     """The environment a route that IS run gets: `base` (default: this process's) without the interpreter-injection variables
-    (ROUTE_INJECTION_ENV, any case: a startup hook or preload a launched interpreter would run), any credential-shaped variable
-    and every GIT_* variable, then git told to prompt for nothing and read no user or system config."""
+    (ROUTE_INJECTION_ENV, any case: a startup hook or preload a launched interpreter would run), the generic helper variables
+    (ROUTE_HELPER_ENV: EDITOR, VISUAL, PAGER, SSH_ASKPASS), any credential-shaped variable and every GIT_* variable (GIT_EDITOR,
+    GIT_SEQUENCE_EDITOR, GIT_PAGER, GIT_ASKPASS, GIT_SSH[_COMMAND], GIT_EXTERNAL_DIFF, GIT_CONFIG_PARAMETERS, ...), then git
+    told to prompt for nothing and read no user or system config."""
     source = os.environ if base is None else base
-    env = {k: v for k, v in source.items() if k.upper() not in ROUTE_INJECTION_ENV and not ROUTE_STRIPPED_ENV_RE.search(k)}
+    env = {k: v for k, v in source.items()
+           if k.upper() not in ROUTE_INJECTION_ENV and k.upper() not in ROUTE_HELPER_ENV and not ROUTE_STRIPPED_ENV_RE.search(k)}
     env.update({"GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull})
     return env
 
@@ -3037,28 +3250,36 @@ def exercise_route(command: str, cwd: pathlib.Path, timeout: float, fills: dict[
 def _exercise_route_argv(argv: list[str], cwd: pathlib.Path, timeout: float, fills: dict[str, str],
                          bus: pathlib.Path | None, secrets: list[str]) -> tuple[str, str]:
     """exercise_route past the parse; its detail is redacted once by the caller (redact_secret_values)."""
-    unfilled = next((m for tok in argv for m in ROUTE_PLACEHOLDER_RE.finditer(tok) if m.group(1) not in fills), None)
-    if unfilled:                                                        # judged on the template: a filled value is never a placeholder
-        return "ROUTE_FAILED", f"unfilled placeholder <{unfilled.group(1)}>; pass --fill {unfilled.group(1)}=VALUE"
+    # Judged on the template: a filled value is never a placeholder, so a value shaped like `<x>` is not read as one.
+    unfilled = list(dict.fromkeys(m.group(1) for tok in argv for m in ROUTE_PLACEHOLDER_RE.finditer(tok) if m.group(1) not in fills))
     # Fill after splitting, so a filled value (a Windows path with backslashes) is never re-parsed as shell text.
-    argv = [ROUTE_PLACEHOLDER_RE.sub(lambda m: fills[m.group(1)], tok) for tok in argv]
+    filled = [ROUTE_PLACEHOLDER_RE.sub(lambda m: fills.get(m.group(1), m.group(0)), tok) for tok in argv]
+    pending = frozenset(new for old, new in zip(argv, filled)
+                        if any(m.group(1) not in fills for m in ROUTE_PLACEHOLDER_RE.finditer(old)))
+    # The screen reads an unfilled `<name>` as a plain word (`<bus-sha>` is no redirect), so it still judges the rest of the token.
+    screened = [ROUTE_PLACEHOLDER_RE.sub(lambda m: fills.get(m.group(1), "UNFILLED"), tok) for tok in argv]
+    argv = filled
     if not argv:
         return "ROUTE_FAILED", "empty command"
-    launcher = route_is_launcher(argv)
-    if not launcher:                                                    # only a route that will be run needs a safety verdict
-        unsafe = route_unsafe_reason(argv, cwd, bus, secrets)
-        if unsafe:
-            return "ROUTE_UNSAFE", unsafe
-    missing = route_missing_reason(argv, cwd, launcher)                 # the static check: every route, nothing runs
-    if missing:
-        return "ROUTE_MISSING", f"{missing[0]}: {missing[1]}"
-    if launcher:
-        return "ROUTE_NOT_EXECUTED_LAUNCHER", (f"{route_program_name(argv[0])} is a launcher: its program and script exist, "
-                                              "and it is never run (CARD-ROUTE-EXERCISE-LAUNCHER-ALLOWLIST-1)")
-    resolved = route_resolve_program(argv[0], cwd)                      # run the file the static check resolved
-    argv = [resolved or argv[0], *argv[1:]]
+    runs = route_runs(argv)                                             # the ONE decision whether anything is launched
+    if unfilled and runs:                                               # a route that is not run needs no value for its placeholder
+        return "ROUTE_FAILED", f"unfilled placeholder <{unfilled[0]}>; pass --fill {unfilled[0]}=VALUE"
+    unsafe = route_unsafe_reason(screened, cwd, bus, secrets)           # the safety screen reads every route and runs nothing
+    if unsafe:
+        return "ROUTE_UNSAFE", unsafe
+    if not runs:
+        missing = route_missing_reason(argv, cwd, False, pending)       # the static check: nothing runs
+        if missing:
+            return "ROUTE_MISSING", f"{missing[0]}: {missing[1]}"
+        noted = f"; unfilled {', '.join(f'<{n}>' for n in unfilled)} (not run, so none is needed)" if unfilled else ""
+        return "ROUTE_NOT_EXECUTED", (f"{route_program_name(argv[0])} is not on the execution allowlist ({', '.join(sorted(ROUTE_EXEC_ALLOW))}): "
+                                      "its program and scripts exist and it is never run (widening it is "
+                                      f"CARD-ROUTE-EXERCISE-LAUNCHER-ALLOWLIST-1){noted}")
+    git_bin, refused = route_git_binary(cwd)                            # the executable decides too, never the name alone
+    if refused:
+        return refused
     try:
-        returncode, out, err = run_route_process(argv, cwd, route_exercise_env(), timeout)
+        returncode, out, err = run_route_process(route_git_command(str(git_bin), argv, cwd), cwd, route_exercise_env(), timeout)
     except FileNotFoundError as e:
         return "ROUTE_MISSING", f"PROGRAM_NOT_FOUND: {redact_route_text(str(e), secrets)}"
     except OSError as e:
@@ -3113,7 +3334,7 @@ def make_exercise_scratch(bus: pathlib.Path, scratch_root: pathlib.Path) -> tupl
 
 def run_exercise(entries: list[tuple[str, dict]], bus: pathlib.Path | None, timeout: float,
                  fills: dict[str, str], scratch_root: pathlib.Path | None) -> int:
-    """Check the routes of already-validated items (name, item); 0 when every route is ROUTE_OK or a launcher skip."""
+    """Check the routes of already-validated items (name, item); 0 when every route is ROUTE_OK or ROUTE_NOT_EXECUTED."""
     plan = [(name, command) for name, item in entries for command in extract_routes(item["body"])]
     for name, item in entries:
         if not extract_routes(item["body"]):
@@ -3241,7 +3462,7 @@ def build_parser() -> argparse.ArgumentParser:
     validate_p.add_argument("--deny-file", type=pathlib.Path, default=None)
     validate_p.add_argument("--exercise", action="store_true",
                             help="also check every command each item names (see 'card routes') in a scratch clone of the bus: "
-                                 "existence for every route, execution only for a route that starts no launcher")
+                                 "existence for every route, execution only for a program on the allowlist (git)")
     validate_p.add_argument("--bus", type=pathlib.Path, default=None,
                             help=f"with --exercise: the bus clone to copy (default ${ROUTE_BUS_ENV}); read, never run in")
     validate_p.add_argument("--timeout", type=float, default=ROUTE_DEFAULT_TIMEOUT_S,
