@@ -369,6 +369,7 @@ minus `examined` minus `young` is what the budget left unvisited.
 
 ## Lane bulk scratch (LANE-RECEIPT-SCRATCH-CLEANUP-1)
 
+Without `-ScratchRoot`, TEMP/TMP default under `<WorkDir>\.claude-state\lane-scratch` (git-ignored; a path the hook's NA-7 admits).
 The per-run `-ScratchRoot` dir (TEMP/TMP) is removed at lane exit, but asm, shadow-build and probe dirs a
 lane names by hand under `C:\mlvtmp` were never removed by anything (the retention timer files them as
 `kind=other` / keep; 7 GiB across 73 dirs on 2026-10-12). A lane now lists each one, absolute path per

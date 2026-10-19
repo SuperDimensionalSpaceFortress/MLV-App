@@ -124,6 +124,12 @@ param(
     # %TEMP% (which every project on this box shares). C:\mlvtmp is a DiskGuard-registered
     # MLV root. The run's own scratch dir is removed when the lane exits unless -KeepScratch;
     # its size is recorded in the receipt either way.
+    # LANE-HOOK-DENY-RECURRENCE-1: when -ScratchRoot is NOT passed, the run's scratch dir goes under
+    # <WorkDir>\.claude-state\lane-scratch instead. The harness names TEMP as the lane's scratchpad, and
+    # tools\hooks\mlv-never-authorized.py NA-7 admits writes under only the hook's own worktree and the
+    # board, so every scratchpad write under this shared root was denied. .claude-state/ is git-ignored on
+    # every branch and pruned by the repo's own tree walks. The value below stays the shared root that
+    # Remove-LaneBulkScratch.ps1 refuses to touch. -ScratchRoot <dir> overrides; -ScratchRoot '' turns it off.
     [string]$ScratchRoot = 'C:\mlvtmp\lane-scratch',
     # LANE-RECEIPT-SCRATCH-CLEANUP-1: bulk scratch a lane creates OUTSIDE -ScratchRoot (asm, shadow-build,
     # probe dirs) is listed one absolute path per line in <RunDir>\scratch-paths.txt, normally through
@@ -1643,8 +1649,9 @@ if ($cfg.engine -eq 'claude') {
 # background work; see docs/lane-containment.md.
 # Per-run lane scratch under an MLV-owned root instead of the shared %TEMP%.
 $scratchDir = $null
-if ($ScratchRoot) {
-    $scratchDir = Join-Path $ScratchRoot ('{0}-{1}' -f (Split-Path $RunDir -Leaf), (Split-Path $base -Leaf))
+$scratchBase = if ($PSBoundParameters.ContainsKey('ScratchRoot')) { $ScratchRoot } else { Join-Path $WorkDir '.claude-state\lane-scratch' }
+if ($scratchBase) {
+    $scratchDir = Join-Path $scratchBase ('{0}-{1}' -f (Split-Path $RunDir -Leaf), (Split-Path $base -Leaf))
     New-Item -ItemType Directory -Force -Path $scratchDir | Out-Null
     foreach ($v in 'TEMP', 'TMP', 'TMPDIR') { $psi.Environment[$v] = $scratchDir }
 }
