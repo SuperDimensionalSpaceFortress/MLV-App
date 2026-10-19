@@ -79,12 +79,22 @@ BEHAVIOURS
    hook is MOVED to the splice point right after the shebang and `set` lines (`install-hooks` prints
    `repaired`), so a layer that reads git's stdin ahead of it cannot starve it. The hook and the debt checks still
    run the file at config `tool_rel`: a project keeps that local copy until a pin-aware release.
+11. Ruling candidates name what they touch or supersede (CoS work order FWO-DEFECT-PREVENT-1 item 4; seed #469 r1).
+   `validate` refuses an item that proposes a ruling candidate (a `### ` heading with `RULING CANDIDATE:`, or a body
+   line opening `Ruling candidate`) unless it carries a `touches/supersedes:` declaration (`touches:` and `supersedes:`
+   count too): rule ids (`R15`) or bus-relative paths (`RULINGS.md:1126-1152`) on that line, comma or semicolon
+   separated, or as bullets under it, or the single entry `none: <reason of >= 4 words>`. Typed refusals:
+   RULING_CANDIDATE_NO_SUPERSEDES, _NONE_NEEDS_REASON, _NONE_WITH_RULES, _TARGET_MALFORMED, and, when the bus clone
+   (`--bus`, default $FACTORY_BUS_CLONE) lacks a named target at its tip, _TARGET_NOT_ON_BUS. The bus is only read;
+   one that cannot be read is UNKNOWN (exit 2). With no bus the shape is still checked and the unchecked targets
+   are printed as a NOTE. The drain does not apply it, and sent items are not re-judged.
 
 Nothing here runs itself: the OS drain task, Stop hook and heartbeat debt are the project's wiring.
 
 Subcommands
 -----------
-    validate <item.md>...                       parse + screen item files
+    validate <item.md>... [--bus PATH]          parse + screen item files; a ruling candidate needs `touches/supersedes:`
+                                                naming rules or bus paths that exist at the bus tip (behaviour 11)
     debt [--ref R] [--ledger P] [--bus PATH] [--json]
     drain --bus PATH [--ref R] [--push] [--ledger P] [--deny-file P]
     kernel-filing --bus PATH [--ref R] [--push] [--ledger P] [--deny-file P]
@@ -2331,9 +2341,157 @@ def cmd_session_start(repo: pathlib.Path, ref: str, ledger: pathlib.Path) -> int
     return 0
 
 
+# ---------- ruling candidates must name what they touch or supersede ----------
+#
+# CoS work order FWO-DEFECT-PREVENT-1 item 4 (seed: #469 r1, where the candidate quietly contradicted RULINGS.md:1126-1152,
+# R15 and an open candidate and the reviewer, not the producer, found it). `validate` refuses a ruling candidate that
+# carries no `touches/supersedes:` declaration, names a target that is not shaped like one, or names one the bus clone
+# it reads does not hold. The bus is only READ, at its committed tip (HEAD); a bus the validator cannot read is UNKNOWN.
+
+RULING_CANDIDATE_HEADING_RE = re.compile(r"ruling[\s-]+candidate\s*:", re.I)
+RULING_CANDIDATE_LEAD_RE = re.compile(r"^[ \t]*(?:\*\*)?ruling[\s-]+candidate\b", re.I | re.M)
+TOUCHES_LABEL_RE = re.compile(r"^([ \t]*)([-*][ \t]+)?(?:\*\*)?(?:touches/supersedes|touches|supersedes):(?:\*\*)?[ \t]*(.*?)[ \t]*$", re.I)
+TOUCHES_BULLET_RE = re.compile(r"^([ \t]*)[-*][ \t]+(\S.*?)[ \t]*$")
+TOUCHES_NONE_RE = re.compile(r"^none\b[ \t]*[:\-–—]?[ \t]*(.*)$", re.I)
+RULING_RULE_ID_RE = re.compile(r"^R\d+(?:\.\d+)*$")
+RULING_PATH_RE = re.compile(r"^([A-Za-z0-9_][\w.@+-]*(?:/[\w.@+-]+)*)/?(?::\d+(?:-\d+)?|#[\w.-]+)?$")
+RULING_TARGET_NOTE_RE = re.compile(r"[ \t]+\(.*\)$")
+RULING_BUS_ENV = "FACTORY_BUS_CLONE"
+RULINGS_FILE = "RULINGS.md"
+
+
+def is_ruling_candidate(item: dict) -> bool:
+    """A ruling candidate is an item whose `### ` heading holds `RULING CANDIDATE:` (any case, a space or hyphen
+    between the words) or whose body has a line that opens with `Ruling candidate` (bold allowed). A heading that
+    only mentions someone else's candidate (`... for ruling candidate <id>`, no colon) is a measurement, not a
+    proposal. A `kind: ruling` item is a ratified ruling (`ratified_by` is required for it), not a candidate."""
+    return bool(RULING_CANDIDATE_HEADING_RE.search(item_heading(item)) or RULING_CANDIDATE_LEAD_RE.search(item["body"]))
+
+
+def touches_supersedes_entries(body: str) -> list[str] | None:
+    """The entries of a candidate's `touches/supersedes:` declaration, or None when no label is present. The label
+    is `touches/supersedes:`, `touches:` or `supersedes:`, may be a bullet and bold, and may repeat; entries add up.
+    Entries are the comma- or semicolon-separated names after a label on the same line, plus the bullet lines
+    indented under it (or, when the label is not a bullet, the bullets right below it) up to the first blank line or
+    non-bullet. A value that opens with `none` is one entry, whole, so its reason keeps its commas. A label inside
+    a fenced block does not count."""
+    lines = body.splitlines()
+    fence: tuple[str, int] | None = None
+    entries: list[str] | None = None
+    for i, raw in enumerate(lines):
+        line = raw.rstrip("\r")
+        opened = _FENCE_OPEN_RE.match(line)
+        if fence is not None:
+            if opened and opened.group(1)[0] == fence[0] and len(opened.group(1)) >= fence[1] and not line.strip(" `~"):
+                fence = None
+            continue
+        if opened:
+            fence = (opened.group(1)[0], len(opened.group(1)))
+            continue
+        found = TOUCHES_LABEL_RE.match(line)
+        if not found:
+            continue
+        indent, bullet, inline = len(found.group(1).expandtabs(4)), found.group(2), found.group(3).replace("**", "").strip()
+        entries = [] if entries is None else entries
+        if inline:
+            entries += [inline] if TOUCHES_NONE_RE.match(inline) else [e.strip(" `") for e in re.split(r"[;,]", inline) if e.strip(" `")]
+        for follow in lines[i + 1:]:
+            sub = TOUCHES_BULLET_RE.match(follow.rstrip("\r"))
+            if not sub:
+                break
+            depth = len(sub.group(1).expandtabs(4))
+            if bullet is not None and depth <= indent:
+                break
+            entries.append(sub.group(2).replace("**", "").strip(" `"))
+    return entries
+
+
+def _ruling_target(entry: str) -> tuple[str, str] | None:
+    """(kind, name) for one entry, or None when it is not shaped like a target. `rule` is an id like `R15` or `R14.8`;
+    `path` is a bus-relative file or directory, with an optional `:<line>[-<line>]` or `#<anchor>` that is not
+    checked. A trailing parenthetical note is dropped. A bare word, an absolute or `..` path and a backslash path
+    are not targets."""
+    target = RULING_TARGET_NOTE_RE.sub("", entry).strip(" `")
+    if RULING_RULE_ID_RE.match(target):
+        return "rule", target
+    found = RULING_PATH_RE.match(target)
+    if not found or re.match(r"^r\d+(?:\.\d+)*\.?$", target, re.I):   # `r15.` is a mistyped rule id, not a file
+        return None
+    path = found.group(1)
+    if ("/" not in path and "." not in path) or any(part in (".", "..") for part in path.split("/")):
+        return None
+    return "path", path
+
+
+def _bus_ruling_ids(bus: pathlib.Path) -> str:
+    return cat_file_blob(bus, "HEAD", RULINGS_FILE).decode("utf-8", errors="replace")
+
+
+def _bus_has_rule(rulings: str, rule_id: str) -> bool:
+    """A rule id is on the bus when a heading or a bold bullet of RULINGS.md opens with or names it (`## ... R15: ...`,
+    `- **R15.3 - ...`); an id mentioned only in prose does not count, and `R15` is not satisfied by `R150` or `R15.3`."""
+    token = re.compile(r"(?<![\w.])" + re.escape(rule_id) + r"(?![\w]|\.\d)")
+    for line in rulings.splitlines():
+        if (line.startswith("#") or re.match(r"^\s*[-*]?\s*\*\*", line)) and token.search(line[:240]):
+            return True
+    return False
+
+
+def screen_ruling_candidate(item: dict, bus: pathlib.Path | None = None) -> list[str]:
+    """Refuse a ruling candidate whose `touches/supersedes:` declaration is missing or empty, mixes `none` with rule
+    ids, gives `none` without a reason of NONE_REASON_MIN_WORDS words (the floor a `Doctrine-Export: none` carries),
+    names an entry that is not a rule id or a bus-relative path, or, when `bus` is given, names one the bus clone
+    does not hold at its tip. Returns the targets it could not check because no bus was given (empty otherwise).
+    A bus that cannot be read is UNKNOWN, never a pass. A non-candidate is not looked at."""
+    if not is_ruling_candidate(item):
+        return []
+    entries = touches_supersedes_entries(item["body"])
+    if not entries:
+        raise Refusal("RULING_CANDIDATE_NO_SUPERSEDES",
+                      "a ruling candidate needs a non-empty `touches/supersedes:` list (the rules or specs it overlaps, "
+                      "as rule ids or bus paths, or `none: <reason>`)")
+    nones = [e for e in entries if TOUCHES_NONE_RE.match(e)]
+    if nones:
+        if len(entries) > 1:
+            raise Refusal("RULING_CANDIDATE_NONE_WITH_RULES", "`none` cannot sit beside other entries in `touches/supersedes:`")
+        reason = TOUCHES_NONE_RE.match(nones[0]).group(1)
+        if len(reason.split()) < NONE_REASON_MIN_WORDS:
+            raise Refusal("RULING_CANDIDATE_NONE_NEEDS_REASON",
+                          f"`none` in `touches/supersedes:` needs a reason of at least {NONE_REASON_MIN_WORDS} words")
+        return []
+    targets = [(entry, _ruling_target(entry)) for entry in entries]
+    bad = [entry for entry, target in targets if target is None]
+    if bad:
+        raise Refusal("RULING_CANDIDATE_TARGET_MALFORMED",
+                      "each `touches/supersedes:` entry is a rule id (`R15`, `R14.8`) or a bus-relative path "
+                      "(`RULINGS.md:1126-1152`, `tools/fleet-sweep.mjs`); not one: " + "; ".join(repr(b) for b in bad[:4]))
+    if bus is None:
+        return [entry for entry, _target in targets]
+    rc, _out, _err = git_try(bus, "rev-parse", "--verify", "-q", "HEAD^{commit}")
+    if rc != 0:
+        raise Unknown("RULING_BUS_UNREADABLE", f"{bus} is not a git clone with a committed tip; the touches/supersedes targets cannot be checked")
+    rulings: str | None = None
+    missing: list[str] = []
+    for entry, target in targets:
+        kind, name = target
+        if kind == "rule":
+            rulings = _bus_ruling_ids(bus) if rulings is None else rulings
+            present = _bus_has_rule(rulings, name)
+        else:
+            present = git_try(bus, "cat-file", "-e", f"HEAD:{name}")[0] == 0
+        if not present:
+            missing.append(entry)
+    if missing:
+        raise Refusal("RULING_CANDIDATE_TARGET_NOT_ON_BUS",
+                      "not on the bus clone at its tip (a path is bus-relative, a rule id is a heading or bold bullet of "
+                      f"{RULINGS_FILE}): " + "; ".join(repr(m) for m in missing[:6]))
+    return []
+
+
 # ---------- CLI commands ----------
 
-def cmd_validate(paths: list[pathlib.Path], deny_terms: list[tuple[str, str]]) -> int:
+def cmd_validate(paths: list[pathlib.Path], deny_terms: list[tuple[str, str]],
+                 bus: pathlib.Path | None = None) -> int:
     ok = True
     concern_ids: dict[str, pathlib.Path] = {}
     for p in paths:
@@ -2348,6 +2506,10 @@ def cmd_validate(paths: list[pathlib.Path], deny_terms: list[tuple[str, str]]) -
             item = parse_item(text)
             screen_law4(item["body"], deny_terms)
             screen_rendered_card(item)
+            unchecked = screen_ruling_candidate(item, bus)
+            if unchecked:
+                print(f"[doctrine-outbox] NOTE {p}: touches/supersedes targets NOT checked against the bus (pass --bus <bus clone> "
+                      f"or set ${RULING_BUS_ENV}): {'; '.join(unchecked[:6])}", file=sys.stderr)
             if "concern" in item:
                 cid = item["concern"]["id"]
                 if cid in concern_ids:
@@ -2393,6 +2555,9 @@ def build_parser() -> argparse.ArgumentParser:
     validate_p = sub.add_parser("validate", help="parse + screen one or more item files")
     validate_p.add_argument("items", nargs="+", type=pathlib.Path)
     validate_p.add_argument("--deny-file", type=pathlib.Path, default=None)
+    validate_p.add_argument("--bus", type=pathlib.Path, default=None,
+                            help=f"a bus clone (default ${RULING_BUS_ENV}): a ruling candidate's touches/supersedes targets "
+                                 "must exist at its tip; read, never written")
 
     debt_p = sub.add_parser("debt", help="list unsent items; exit 1 if any, 2 if UNKNOWN")
     debt_p.add_argument("--ref", default=DEFAULT_REF)
@@ -2490,7 +2655,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.cmd == "validate":
             deny_terms = gather_deny_terms(resolve_deny_file(repo, args.deny_file))
-            return cmd_validate(args.items, deny_terms)
+            env_bus = os.environ.get(RULING_BUS_ENV)
+            bus = args.bus.resolve() if args.bus is not None else (pathlib.Path(env_bus).resolve() if env_bus else None)
+            return cmd_validate(args.items, deny_terms, bus)
         if args.cmd == "debt":
             ledger = resolve_ledger(repo, args.ledger)
             bus = args.bus.resolve() if args.bus is not None else None

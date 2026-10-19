@@ -75,6 +75,30 @@ pattern, a user-home path, this host's name or account name, or anything in an o
 adds its own deny terms: `.claude-state`, `subject-ledger`, `fleet-runs`, `HUB_RUN_WAL`, `dual-lane`, and
 the name of the GPU host. A refusal names the class, never the matched value.
 
+## Ruling candidates name what they supersede (ROUTE-RULING-SUPERSEDES-1)
+
+A ruling candidate (an item whose `### ` heading holds `RULING CANDIDATE:`, or whose body has a line opening
+`Ruling candidate`) must declare what it overlaps, so the producer finds a contradiction before the reviewer does
+(seed: PR 469 r1). `validate` refuses one without a `touches/supersedes:` declaration (`touches:` and `supersedes:`
+count too, bold and a bullet allowed, entries add up across labels). The entries are rule ids (`R15`, `R14.8`) or
+bus-relative paths (`RULINGS.md:1126-1152`, `tools/fleet-sweep.mjs`), comma or semicolon separated on the label line
+or as bullets under it, or the single entry `none: <reason of at least 4 words>`. A label inside a fenced block does
+not count. Typed refusals (exit 1):
+- `RULING_CANDIDATE_NO_SUPERSEDES`: no label, or an empty one;
+- `RULING_CANDIDATE_NONE_NEEDS_REASON`: `none` with fewer than 4 reason words;
+- `RULING_CANDIDATE_NONE_WITH_RULES`: `none` beside another entry;
+- `RULING_CANDIDATE_TARGET_MALFORMED`: an entry that is not a rule id or a bus-relative path (absolute, `..` and
+  backslash paths and bare words are not targets);
+- `RULING_CANDIDATE_TARGET_NOT_ON_BUS`: with a bus clone (`validate --bus PATH`, default `$FACTORY_BUS_CLONE`), an
+  entry the clone does not hold at its committed tip: a path that `git cat-file -e HEAD:<path>` cannot find, or a
+  rule id that is not a heading or bold bullet of `RULINGS.md` (prose mentions and `R15` against `R150` or `R15.3`
+  do not count). Line ranges and anchors are not checked. The bus is only read.
+
+A bus clone that cannot be read is UNKNOWN `RULING_BUS_UNREADABLE` (exit 2), never a pass. With no bus the shape is
+still checked and `validate` prints a NOTE naming the targets it could not check. Non-ruling items are not looked at,
+the drain does not apply this check, and an item already sent is not re-judged. The 450-word cap still holds, so a
+candidate replaces its prose "relationship" block with the list.
+
 ## Concerns to the CoS (COS-CONCERN-CHANNEL-1)
 
 A project had no way to tell the CoS a concern: only the CoS writes `cos-feedback/`, and a project-owned

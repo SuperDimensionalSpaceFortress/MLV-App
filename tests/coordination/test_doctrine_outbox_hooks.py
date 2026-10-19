@@ -143,7 +143,7 @@ def run_pre_push(ob, repo: Path, monkeypatch, stdin_text: str) -> int:
 # ---------- the tool carries no project value ----------
 
 CANDIDATE_BUS_PATH = "tools/factory/doctrine_outbox.py"
-HANDOFF_CARD = REPO_ROOT / "doctrine-outbox" / "20261016-doctrine-outbox-single-source-superset.md"
+HANDOFF_CARD = REPO_ROOT / "doctrine-outbox" / "20261019-doctrine-outbox-ruling-supersedes-candidate.md"
 OUTBOX_README = REPO_ROOT / "doctrine-outbox" / "README.md"
 
 

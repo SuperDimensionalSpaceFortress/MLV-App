@@ -21,6 +21,6 @@
   ],
   "bus_candidate": {
     "bus_path": "tools/factory/doctrine_outbox.py",
-    "sha256_lf": "9e6f2b55c2a646db7c218cf460851b55bb0eeff2390c4473ed358ad1b98eaabf"
+    "sha256_lf": "f80753f6e71200e75726dde678dcc884e6b4ada3d297d8003da097fdc46e2aa6"
   }
 }
