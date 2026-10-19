@@ -63,9 +63,9 @@ HISTORICAL: dict[str, str] = {
     "docs/lane-prompts/v2/ratify-plan-OPUS.md": "historical: plan-ratification prompt of 2026-09",
     "docs/lane-prompts/v2/ratify-plan-SOL.md": "historical: plan-ratification prompt of 2026-09",
     # HUB-TOOLS-TRACKED-1: the CoS open-ask scanner reads RECORDED bus headers (cos-feedback/mlv-app/pr-N.md) that were written
-    # before the transfer and still carry `repo: <old slug>`. Matching that name is its job (-RepoAlias), so the old slug IS the data
-    # here, exactly like repository_identity.py; it is never used to call GitHub (the scan passes -Repo, the new slug, to gh).
-    "tools/coordination/hub/cos-open-ask-scan.ps1": "recorded bus headers still carry the old repo name: the default -RepoAlias that keeps them scannable (gh is called with the new -Repo)",
+    # before the transfer and still carry `repo: <old slug>`. The old name reaches the scanner as DATA (hub-profile.json repoAliases,
+    # passed as -RepoAlias), so the scanner itself names it nowhere and is NOT allowlisted (SLUG-ALLOWLIST-SCANNER-COMMENT-ONLY-1):
+    # a live `gh -R <old slug>` added to it turns this test red. Its fixtures and profile below still carry the old name as data.
     "tools/coordination/hub/hub-profile.json": "repoAliases: the former repo name that recorded bus headers carry; ownerLogin/repoSlug name the live repo",
     "tools/coordination/hub/Test-CosOpenAskScan.ps1": "fixtures of legacy bus headers (repo: <old slug>) that must stay scannable, plus the case-insensitive variant",
     "tools/coordination/hub/cos-scan-fixtures-bus/pr-413.md": "verbatim copy of a recorded bus feedback file (the ledger's 14:28Z false-positive set); editing it would void the verbatim claim",
@@ -152,6 +152,21 @@ class RepoSlugHygieneTests(unittest.TestCase):
                 ["live.ps1", "lower.py"],
                 files_naming_old_slug(root, ["live.ps1", "lower.py", "clean.ps1", "absent.ps1"]),
             )
+
+    def test_the_cos_scanner_is_not_allowlisted_and_a_live_old_slug_call_in_it_is_caught(self):
+        # SLUG-ALLOWLIST-SCANNER-COMMENT-ONLY-1: the scanner names the old slug nowhere (its comments were reworded), so it is not
+        # allowlisted and a live `gh -R <old slug>` added to it must turn the slug test red. Mutation check on a scratch copy.
+        import tempfile
+
+        scanner = "tools/coordination/hub/cos-open-ask-scan.ps1"
+        self.assertNotIn(scanner, ALLOWED_OLD_SLUG)
+        text = (REPO_ROOT / scanner).read_text(encoding="utf-8")
+        with tempfile.TemporaryDirectory(prefix="mlv-slug-scanner-mutation-") as tmp:
+            root = Path(tmp)
+            (root / "clean.ps1").write_text(text, encoding="utf-8")
+            (root / "mutated.ps1").write_text(text + "\n& gh pr list -R " + OLD_SLUG + " --state all\n", encoding="utf-8")
+            self.assertEqual(["mutated.ps1"], files_naming_old_slug(root, ["clean.ps1", "mutated.ps1"]))
+        self.assertNotIn(scanner, files_naming_old_slug(REPO_ROOT, [scanner]))
 
     def test_scan_roots_cover_agents_github_and_lane_prompts(self):
         for root in ("agents", ".github", "docs/lane-prompts"):

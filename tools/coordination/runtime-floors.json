@@ -1,0 +1,295 @@
+{
+  "schema": "mlv-app/runtime-floors/v1",
+  "about": "Runtime floors for MLV tools (RUNTIME-FLOOR-LOCAL-MATRIX-1, CoS FWO-DEFECT-PREVENT-1 item 5). Each row maps tool path globs to the runtimes the tool DECLARES and the suites that pin it. tools/repo_hygiene/runtime_floor_suites.py runs the suites of every changed tool on each declared runtime this box has. A declared floor cites a real line (file, line, contains); test_runtime_floor_suites.py re-reads every citation, so a moved or reworded line fails CI. A tool with no evidence is floor=undeclared and lists what was searched; nothing is invented. Runtimes: powershell-5.1 (powershell.exe), pwsh (PowerShell 7+), python-3.X. A suite marked slow (over about a minute here) runs only with --include-slow.",
+  "rows": [
+    {
+      "id": "set-required-checks",
+      "globs": ["tools/coordination/set-required-checks.ps1"],
+      "floor": "declared",
+      "runtimes": ["pwsh"],
+      "min_versions": {"pwsh": "7.2"},
+      "evidence": [{"file": "tools/coordination/set-required-checks.ps1", "line": 1, "contains": "#requires -Version 7.2"}],
+      "suites": [
+        {"kind": "ps-parse"},
+        {"kind": "pytest", "path": "tools/repo_hygiene/test_set_required_checks.py"}
+      ]
+    },
+    {
+      "id": "promote-codex-pin",
+      "globs": ["tools/coordination/Promote-CodexPin.ps1"],
+      "floor": "declared",
+      "runtimes": ["pwsh"],
+      "evidence": [{"file": "tools/coordination/Promote-CodexPin.ps1", "line": 56, "contains": "PowerShell 7+"}],
+      "suites": [{"kind": "ps-parse"}]
+    },
+    {
+      "id": "select-review-key-b",
+      "globs": ["tools/coordination/Select-ReviewKeyB.ps1"],
+      "floor": "declared",
+      "runtimes": ["pwsh"],
+      "evidence": [{"file": "tools/coordination/Select-ReviewKeyB.ps1", "line": 31, "contains": "PowerShell 7+"}],
+      "suites": [
+        {"kind": "ps-parse"},
+        {"kind": "pytest", "path": "tools/coordination/test_select_review_key_b.py"}
+      ]
+    },
+    {
+      "id": "build-guard",
+      "globs": ["tools/coordination/build-guard.ps1"],
+      "floor": "declared",
+      "runtimes": ["pwsh"],
+      "min_versions": {"pwsh": "7.4"},
+      "evidence": [{"file": "tools/coordination/build-guard.ps1", "line": 417, "contains": "command mode needs PowerShell 7.4+"}],
+      "suites": [{"kind": "ps-parse"}]
+    },
+    {
+      "id": "lane-local-playback-lint",
+      "globs": ["tools/coordination/lane-local-playback-lint.ps1"],
+      "floor": "declared",
+      "runtimes": ["powershell-5.1", "pwsh"],
+      "evidence": [{"file": "tools/coordination/lane-local-playback-lint.ps1", "line": 119, "contains": "PowerShell 5.1 reads a BOM-less file"}],
+      "suites": [
+        {"kind": "ps-parse"},
+        {"kind": "pytest", "path": "tools/repo_hygiene/test_hub_vm_no_local_playback.py", "slow": true}
+      ]
+    },
+    {
+      "id": "gui-smoke-length-gate",
+      "globs": ["tools/profiling/gui-smoke-length-gate.ps1"],
+      "floor": "declared",
+      "runtimes": ["powershell-5.1", "pwsh"],
+      "evidence": [{"file": "tools/profiling/gui-smoke-length-gate.ps1", "line": 25, "contains": "Windows PowerShell 5.1 reads a BOM-less file"}],
+      "suites": [
+        {"kind": "ps-parse"},
+        {"kind": "pytest", "path": "tools/repo_hygiene/test_playback_clip_length_gate.py", "slow": true}
+      ]
+    },
+    {
+      "id": "dual-venue-leg-scripts",
+      "globs": ["tools/profiling/dual-venue/Invoke-VenueLeg.ps1", "tools/profiling/dual-venue/New-VenueFlavorPair.ps1"],
+      "floor": "declared",
+      "runtimes": ["pwsh"],
+      "evidence": [
+        {"file": "tools/profiling/dual-venue/Invoke-VenueLeg.ps1", "line": 4, "contains": "pwsh -NoProfile -File"},
+        {"file": "tools/profiling/dual-venue/New-VenueFlavorPair.ps1", "line": 10, "contains": "pwsh -NoProfile -File"}
+      ],
+      "suites": [{"kind": "ps-parse"}]
+    },
+    {
+      "id": "dual-venue-runner-module",
+      "globs": ["tools/profiling/dual-venue/DualVenueRunner.psm1"],
+      "floor": "declared",
+      "runtimes": ["pwsh"],
+      "evidence": [{"file": "tools/profiling/dual-venue/DualVenueRunner.psm1", "line": 2166, "contains": "PowerShell\\7\\pwsh.exe"}],
+      "suites": [{"kind": "ps-parse"}]
+    },
+    {
+      "id": "py-runtime-floor-suites",
+      "globs": ["tools/repo_hygiene/runtime_floor_suites.py", "tools/coordination/runtime-floors.json"],
+      "floor": "declared",
+      "runtimes": ["python-3.13"],
+      "evidence": [
+        {"file": ".python-version", "line": 1, "contains": "3.13"},
+        {"file": ".github/workflows/tests.yml", "line": 45, "contains": "python-version-file"}
+      ],
+      "suites": [{"kind": "pytest", "path": "tools/repo_hygiene/test_runtime_floor_suites.py"}]
+    },
+    {
+      "id": "py-check-lane-model-currency",
+      "globs": ["tools/coordination/check-lane-model-currency.py"],
+      "floor": "declared",
+      "runtimes": ["python-3.13"],
+      "evidence": [
+        {"file": ".python-version", "line": 1, "contains": "3.13"},
+        {"file": ".github/workflows/tests.yml", "line": 45, "contains": "python-version-file"}
+      ],
+      "suites": [{"kind": "pytest", "path": "tools/coordination/test_check_lane_model_currency.py"}]
+    },
+    {
+      "id": "py-resolve-codex-tier",
+      "globs": ["tools/coordination/resolve-codex-tier.py"],
+      "floor": "declared",
+      "runtimes": ["python-3.13"],
+      "evidence": [
+        {"file": ".python-version", "line": 1, "contains": "3.13"},
+        {"file": ".github/workflows/tests.yml", "line": 45, "contains": "python-version-file"}
+      ],
+      "suites": [{"kind": "pytest", "path": "tools/coordination/test_resolve_codex_tier.py"}]
+    },
+    {
+      "id": "py-get-doctrine-brief",
+      "globs": ["tools/coordination/get_doctrine_brief.py"],
+      "floor": "declared",
+      "runtimes": ["python-3.13"],
+      "evidence": [
+        {"file": ".python-version", "line": 1, "contains": "3.13"},
+        {"file": ".github/workflows/tests.yml", "line": 45, "contains": "python-version-file"}
+      ],
+      "suites": [{"kind": "pytest", "path": "tools/coordination/test_get_doctrine_brief.py"}]
+    },
+    {
+      "id": "py-record-workstream-completion",
+      "globs": ["tools/coordination/record_workstream_completion.py", "tools/coordination/workstream-completion.schema.json"],
+      "floor": "declared",
+      "runtimes": ["python-3.13"],
+      "evidence": [
+        {"file": ".python-version", "line": 1, "contains": "3.13"},
+        {"file": ".github/workflows/tests.yml", "line": 45, "contains": "python-version-file"}
+      ],
+      "suites": [{"kind": "pytest", "path": "tools/coordination/test_record_workstream_completion.py", "slow": true}]
+    },
+    {
+      "id": "py-freeze-factory-cards",
+      "globs": ["tools/coordination/freeze-factory-cards.py"],
+      "floor": "declared",
+      "runtimes": ["python-3.13"],
+      "evidence": [
+        {"file": ".python-version", "line": 1, "contains": "3.13"},
+        {"file": ".github/workflows/tests.yml", "line": 45, "contains": "python-version-file"}
+      ],
+      "suites": [{"kind": "pytest", "path": "tools/repo_hygiene/test_freeze_factory_cards.py"}]
+    },
+    {
+      "id": "py-roadmap-queue-parity",
+      "globs": ["tools/coordination/check_roadmap_queue_parity.py"],
+      "floor": "declared",
+      "runtimes": ["python-3.13"],
+      "evidence": [
+        {"file": ".python-version", "line": 1, "contains": "3.13"},
+        {"file": ".github/workflows/tests.yml", "line": 45, "contains": "python-version-file"}
+      ],
+      "suites": [{"kind": "pytest", "path": "tools/repo_hygiene/test_roadmap_queue_parity.py"}]
+    },
+    {
+      "id": "py-doctrine-outbox",
+      "globs": ["tools/coordination/doctrine_outbox.py"],
+      "floor": "declared",
+      "runtimes": ["python-3.13"],
+      "evidence": [
+        {"file": ".python-version", "line": 1, "contains": "3.13"},
+        {"file": ".github/workflows/tests.yml", "line": 45, "contains": "python-version-file"}
+      ],
+      "suites": [{"kind": "pytest", "path": "tools/repo_hygiene/test_doctrine_guards.py"}]
+    },
+    {
+      "id": "py-k9-witness",
+      "globs": ["tools/repo_hygiene/k9_witness.py"],
+      "floor": "declared",
+      "runtimes": ["python-3.13"],
+      "evidence": [
+        {"file": ".python-version", "line": 1, "contains": "3.13"},
+        {"file": ".github/workflows/tests.yml", "line": 45, "contains": "python-version-file"}
+      ],
+      "suites": [{"kind": "pytest", "path": "tools/repo_hygiene/test_k9_witness.py", "slow": true}]
+    },
+    {
+      "id": "py-vendored-native-payloads",
+      "globs": ["tools/repo_hygiene/vendored_native_payloads.py", "tools/repo_hygiene/extract_vendored_native_payload.py"],
+      "floor": "declared",
+      "runtimes": ["python-3.13"],
+      "evidence": [
+        {"file": ".python-version", "line": 1, "contains": "3.13"},
+        {"file": ".github/workflows/tests.yml", "line": 45, "contains": "python-version-file"}
+      ],
+      "suites": [{"kind": "pytest", "path": "tools/repo_hygiene/test_vendored_native_payloads.py", "slow": true}]
+    },
+    {
+      "id": "py-duration-as-proof-scan",
+      "globs": ["tools/repo_hygiene/duration_as_proof_scan.py", "tools/repo_hygiene/duration_as_proof_inventory.json"],
+      "floor": "declared",
+      "runtimes": ["python-3.13"],
+      "evidence": [
+        {"file": ".python-version", "line": 1, "contains": "3.13"},
+        {"file": ".github/workflows/tests.yml", "line": 45, "contains": "python-version-file"}
+      ],
+      "suites": [{"kind": "pytest", "path": "tools/repo_hygiene/test_duration_as_proof_inventory.py"}]
+    },
+    {
+      "id": "py-brokered-closeout",
+      "globs": ["tools/repo_hygiene/brokered_closeout.py", "tools/repo_hygiene/closeout.py", "tools/repo_hygiene/closeout_dashboard.py", "tools/repo_hygiene/cli.py", "tools/repo_hygiene/work_block_cli.py"],
+      "floor": "declared",
+      "runtimes": ["python-3.13"],
+      "evidence": [
+        {"file": ".python-version", "line": 1, "contains": "3.13"},
+        {"file": ".github/workflows/tests.yml", "line": 45, "contains": "python-version-file"}
+      ],
+      "suites": [{"kind": "pytest", "path": "tools/repo_hygiene/test_brokered_closeout.py", "slow": true}]
+    },
+    {
+      "id": "py-candidate-acceptance",
+      "globs": ["tools/repo_hygiene/candidate_acceptance.py"],
+      "floor": "declared",
+      "runtimes": ["python-3.13"],
+      "evidence": [
+        {"file": ".python-version", "line": 1, "contains": "3.13"},
+        {"file": ".github/workflows/tests.yml", "line": 45, "contains": "python-version-file"}
+      ],
+      "suites": [{"kind": "pytest", "path": "tools/repo_hygiene/test_candidate_acceptance.py", "slow": true}]
+    },
+    {
+      "id": "py-repo-hygiene-core",
+      "globs": ["tools/repo_hygiene/core.py", "tools/repo_hygiene/protected_check_router.py"],
+      "floor": "declared",
+      "runtimes": ["python-3.13"],
+      "evidence": [
+        {"file": ".python-version", "line": 1, "contains": "3.13"},
+        {"file": ".github/workflows/tests.yml", "line": 45, "contains": "python-version-file"}
+      ],
+      "suites": [{"kind": "pytest", "path": "tools/repo_hygiene/test_repo_hygiene.py", "slow": true}]
+    },
+    {
+      "id": "py-repository-identity",
+      "globs": ["tools/repo_hygiene/repository_identity.py", "tools/repo_hygiene/pipeline_golden_provenance.py"],
+      "floor": "declared",
+      "runtimes": ["python-3.13"],
+      "evidence": [
+        {"file": ".python-version", "line": 1, "contains": "3.13"},
+        {"file": ".github/workflows/tests.yml", "line": 45, "contains": "python-version-file"}
+      ],
+      "suites": [{"kind": "pytest", "path": "tools/repo_hygiene/test_repo_slug_hygiene.py"}]
+    },
+    {
+      "id": "py-shipping-defaults",
+      "globs": ["tools/repo_hygiene/shipping_defaults.py"],
+      "floor": "declared",
+      "runtimes": ["python-3.13"],
+      "evidence": [
+        {"file": ".python-version", "line": 1, "contains": "3.13"},
+        {"file": ".github/workflows/tests.yml", "line": 45, "contains": "python-version-file"}
+      ],
+      "suites": [{"kind": "pytest", "path": "tools/repo_hygiene/test_shipping_defaults.py"}]
+    },
+    {
+      "id": "undeclared-demote-factory-bridge",
+      "globs": ["tools/coordination/demote-factory-bridge.ps1"],
+      "floor": "undeclared",
+      "runtimes": [],
+      "note": "Searched the script for #requires, 'PowerShell 7' / '5.1' and powershell.exe: no floor is stated. Its pytest suite is pinned and run once; the PowerShell host axis stays empty until the script declares a floor.",
+      "suites": [{"kind": "pytest", "path": "tools/coordination/test_demote_factory_bridge.py", "slow": true}]
+    },
+    {
+      "id": "undeclared-attr3-footage-io-inventory-scan",
+      "globs": ["tools/repo_hygiene/attr3_footage_io_inventory_scan.ps1"],
+      "floor": "undeclared",
+      "runtimes": [],
+      "note": "Searched the script for #requires, 'PowerShell 7' / '5.1' and powershell.exe: no floor is stated.",
+      "suites": [{"kind": "pytest", "path": "tools/repo_hygiene/test_attr3_footage_io_inventory.py"}]
+    },
+    {
+      "id": "undeclared-coordination-powershell",
+      "globs": ["tools/coordination/*.ps1", "tools/coordination/*.psm1"],
+      "floor": "undeclared",
+      "runtimes": [],
+      "note": "Catch-all for coordination PowerShell with no declared row above: a header search for #requires, 'PowerShell 7' / '5.1' and powershell.exe found no floor. The only suite naming them, tools/coordination/test_coordination_guardrails.py, exceeded 300 s here.",
+      "suites": [{"kind": "pytest", "path": "tools/coordination/test_coordination_guardrails.py", "slow": true}]
+    },
+    {
+      "id": "undeclared-repo-hygiene-powershell",
+      "globs": ["tools/repo_hygiene/*.ps1", "tools/repo_hygiene/*.psm1"],
+      "floor": "undeclared",
+      "runtimes": [],
+      "note": "Catch-all for repo_hygiene PowerShell with no declared row above: no floor stated in the scripts.",
+      "suites": []
+    }
+  ]
+}
