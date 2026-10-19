@@ -9,10 +9,11 @@ ledger paths, Law-4 deny terms) comes from that config. The config schema is the
 and `configure()` below; no bus README documents it yet. This file is the candidate for the bus's
 `tools/factory/doctrine_outbox.py`. Once the bus steward lands it there, a project can run it from the
 bus BY PIN (`factory-pins/pin-runner.py run`, tools/factory/README.md); the pin names a reviewed bus
-SHA, so nothing runs until the project reviews and pins it. A project KEEPS its local copy at config
-`tool_rel` until a pin-aware release (card OUTBOX-PIN-AWARE-TOOL-AT-REF-1: a config-driven hook
-invocation plus a `require_tool_at_ref` that accepts a pinned tool), because the installed hook and the
-debt and drain checks still read that path. Until then this file is the only source.
+SHA, so nothing runs until the project reviews and pins it. This release is pin-aware (card
+OUTBOX-PIN-AWARE-TOOL-AT-REF-1): a config that names `tool_pin` has the installed hook run the pin through
+`factory-pins/pin-runner.py`, and `require_tool_at_ref` accept the pin runner plus a pins file naming it in
+place of the file at `tool_rel`. A project without `tool_pin` KEEPS its local copy at `tool_rel`, because
+the hook and the debt and drain checks then read that path. Until the bus holds the file this one is the only source.
 
 Lineage: the fleet bus's reference outbox -> agent-bridge's port -> a second project's port,
 whose behaviours are the superset below. The item format, front matter, `parse_item`, the Law-4
@@ -77,8 +78,10 @@ BEHAVIOURS
    whatever layer follows the guard (git lfs pre-push reads the same ref lines). A host with no python
    refuses the push (a guard that cannot run is not a pass), and an older guard block in an existing
    hook is MOVED to the splice point right after the shebang and `set` lines (`install-hooks` prints
-   `repaired`), so a layer that reads git's stdin ahead of it cannot starve it. The hook and the debt checks still
-   run the file at config `tool_rel`: a project keeps that local copy until a pin-aware release.
+   `repaired`), so a layer that reads git's stdin ahead of it cannot starve it. The hook and the debt checks run the
+   file at config `tool_rel`, or, when the config sets `tool_pin`, `python -I factory-pins/pin-runner.py run
+   <tool_pin> --` with the config path in $DOCTRINE_OUTBOX_CONFIG; `tool_rel` is then optional, and a pin that is
+   not provisioned on the machine refuses the push (the runner's exit passes through: a guard that cannot run is not a pass).
 
 Nothing here runs itself: the OS drain task, Stop hook and heartbeat debt are the project's wiring.
 
@@ -110,6 +113,7 @@ import json
 import os
 import pathlib
 import re
+import shlex
 import shutil
 import socket
 import stat
@@ -165,6 +169,10 @@ ITEM_NAME_RE = re.compile(r"^\d{8}-[a-z0-9][a-z0-9-]{2,60}\.md$")
 SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
 STALE_HOURS = 24
 PROJECT_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
+# A pin runner tool name (factory-pins/pin-runner.py's NAME), and where a consumer keeps the runner and its pins.
+PIN_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+PIN_RUNNER_REL = "factory-pins/pin-runner.py"
+PINS_REL = "factory-pins/factory-pins.json"
 TRAILER_KEY = "Doctrine-Export"
 TRAILER_MODES = ("reasoned", "bare")
 BARE_TRAILER_VALUES = ("none", "outbox")
@@ -193,6 +201,7 @@ OUTBOX_DIR = "doctrine-outbox"
 SENT_DIR = ""        # optional: a directory under OUTBOX_DIR whose items are already sent (moved there)
 SENT_PREFIX = ""     # f"{OUTBOX_DIR}/{SENT_DIR}/" when SENT_DIR is set, else ""
 TOOL_REL = ""
+TOOL_PIN = ""        # optional: the tool's name in factory-pins/factory-pins.json; when set the hook runs it by pin
 DEFAULT_REF = ""
 DEFAULT_RANGE = ""
 CARDS_TARGET = ""
@@ -230,7 +239,7 @@ CONFIG_ROOT: pathlib.Path | None = None
 CONFIG_ERROR: Refusal | None = None   # why the config found at import was refused; None once configure() succeeds
 
 _CONFIG_KEYS = frozenset({
-    "schema", "project", "tool_rel", "default_ref", "default_range", "outbox_dir", "sent_dir", "cards_target",
+    "schema", "project", "tool_rel", "tool_pin", "default_ref", "default_range", "outbox_dir", "sent_dir", "cards_target",
     "finding_path_prefixes", "finding_path_files", "finding_path_regexes", "trailer_mode", "pre_push_refs",
     "law4_extra", "state_dir", "ledger_rel", "deny_file_rel", "subject_ledger_rel", "watermark_rel",
     "subject_ledger_env", "watermark_env", "identity_name", "identity_email", "bus_candidate",
@@ -308,7 +317,13 @@ def load_config(path: pathlib.Path) -> dict:
 def configure(cfg: dict, config_path: pathlib.Path | None = None) -> None:
     """Install one project's values into the module. Atomic: every value is validated and built
     first, and the module is rebound only when all of them are good."""
+    tool_pin = cfg.get("tool_pin", "")
+    if not isinstance(tool_pin, str) or (tool_pin and not PIN_NAME_RE.match(tool_pin)):
+        raise Refusal("CONFIG_INVALID", f"tool_pin must match {PIN_NAME_RE.pattern}")
+    # A project that runs the tool by pin may keep no local copy, so `tool_rel` is required only without a pin.
     for key in ("project", "tool_rel", "default_ref"):
+        if key == "tool_rel" and tool_pin and "tool_rel" not in cfg:
+            continue
         if not isinstance(cfg.get(key), str) or not cfg[key]:
             raise Refusal("CONFIG_INVALID", f"{key} is required")
     project = cfg["project"]
@@ -364,7 +379,8 @@ def configure(cfg: dict, config_path: pathlib.Path | None = None) -> None:
         "OUTBOX_DIR": outbox_dir,
         "SENT_DIR": sent_dir,
         "SENT_PREFIX": f"{outbox_dir}/{sent_dir}/" if sent_dir else "",
-        "TOOL_REL": cfg["tool_rel"],
+        "TOOL_REL": cfg.get("tool_rel", ""),
+        "TOOL_PIN": tool_pin,
         "DEFAULT_REF": cfg["default_ref"],
         "DEFAULT_RANGE": default_range,
         "CARDS_TARGET": cards_target,
@@ -713,17 +729,39 @@ def screen_rendered_card(item: dict) -> None:
 
 # ---------- repository queries (committed bytes only, never the worktree) ----------
 
+def _require_pin_at_ref(repo: pathlib.Path, ref: str) -> None:
+    """Raise Unknown unless `ref` carries the pin runner AND a pins file that names TOOL_PIN. The pinned
+    bytes live on the bus, so a project that runs the tool by pin keeps no copy at `tool_rel`; a ref that
+    predates the pin still reads as TOOL_ABSENT_AT_REF, never as 'no debt'."""
+    rc, _out, _err = git_try(repo, "cat-file", "-e", f"{ref}:{PIN_RUNNER_REL}")
+    if rc != 0:
+        raise Unknown("TOOL_ABSENT_AT_REF", f"{PIN_RUNNER_REL} is not at {ref}")
+    rc, text, _err = git_try(repo, "show", f"{ref}:{PINS_REL}")
+    if rc != 0:
+        raise Unknown("TOOL_ABSENT_AT_REF", f"{PINS_REL} is not at {ref}")
+    try:
+        pinned = json.loads(text.lstrip("﻿")).get("tools", {})
+    except (ValueError, AttributeError):
+        raise Unknown("TOOL_ABSENT_AT_REF", f"{PINS_REL} at {ref} is not a pins file") from None
+    if not isinstance(pinned, dict) or TOOL_PIN not in pinned:
+        raise Unknown("TOOL_ABSENT_AT_REF", f"{PINS_REL} at {ref} has no pin named {TOOL_PIN}")
+
+
 def require_tool_at_ref(repo: pathlib.Path, ref: str) -> None:
-    """Raise Unknown unless `ref` resolves AND carries this tool and the items directory.
+    """Raise Unknown unless `ref` resolves AND carries this tool and the items directory. The tool is the
+    file at `tool_rel`, or, when the config names a `tool_pin`, the pin runner plus a pins file naming it.
     Called before any debt/drain answer, so a checkout that predates the tool can never
     read as 'no debt'."""
     require_configured()
     rc, _out, _err = git_try(repo, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}")
     if rc != 0:
         raise Unknown("REF_UNRESOLVED", ref)
-    rc, _out, _err = git_try(repo, "cat-file", "-e", f"{ref}:{TOOL_REL}")
-    if rc != 0:
-        raise Unknown("TOOL_ABSENT_AT_REF", f"{TOOL_REL} is not at {ref}")
+    if TOOL_PIN:
+        _require_pin_at_ref(repo, ref)
+    else:
+        rc, _out, _err = git_try(repo, "cat-file", "-e", f"{ref}:{TOOL_REL}")
+        if rc != 0:
+            raise Unknown("TOOL_ABSENT_AT_REF", f"{TOOL_REL} is not at {ref}")
     rc, out, _err = git_try(repo, "ls-tree", "--name-only", "-z", ref, "--", f"{OUTBOX_DIR}/")
     if rc != 0 or not out:
         raise Unknown("TOOL_ABSENT_AT_REF", f"{OUTBOX_DIR}/ is not at {ref}")
@@ -2065,6 +2103,21 @@ def check_commits(repo: pathlib.Path, rev_range: str, deny_terms: list[tuple[str
 
 # ---------- hook commands: pre-push, stop, session-start, install-hooks ----------
 
+def _hook_tool_command(repo: pathlib.Path) -> str:
+    """The shell words the guard runs ahead of `pre-push`: the file at `tool_rel`, or, when the config names a
+    `tool_pin`, the project's pin runner running that pin. A pinned run executes the bytes from a temp
+    directory (or in-process), where the tool cannot find the project's config beside itself, so the hook
+    hands it the config path in $DOCTRINE_OUTBOX_CONFIG. The pin runner is started isolated (`-I`), the form
+    its own docs give a hook."""
+    if not TOOL_PIN:
+        return f"\"$OUTBOX_PY\" \"$REPO_ROOT/{TOOL_REL}\""
+    try:
+        config = f"\"$REPO_ROOT/{CONFIG_PATH.relative_to(repo.resolve()).as_posix()}\""
+    except (ValueError, AttributeError):
+        config = shlex.quote(CONFIG_PATH.as_posix()) if CONFIG_PATH is not None else f"\"$REPO_ROOT/{CONFIG_NAME}\""
+    return f"{CONFIG_ENV}={config} \"$OUTBOX_PY\" -I \"$REPO_ROOT/{PIN_RUNNER_REL}\" run {TOOL_PIN} --"
+
+
 def install_pre_push(repo: pathlib.Path) -> str:
     """Idempotently splice the outbox guard into the repo's pre-push hook. Machine-local, so a
     SessionStart hook can do this on every machine and every rotation without being asked."""
@@ -2085,7 +2138,7 @@ def install_pre_push(repo: pathlib.Path) -> str:
                f"OUTBOX_STDIN=$(mktemp 2>/dev/null) || OUTBOX_STDIN=\"${{TMPDIR:-/tmp}}/outbox-pre-push.$$\"\n"
                f"cat > \"$OUTBOX_STDIN\"\n"
                f"if [ -n \"$OUTBOX_PY\" ]; then\n"
-               f"  \"$OUTBOX_PY\" \"$REPO_ROOT/{TOOL_REL}\" pre-push \"$REPO_ROOT\" \"$@\" < \"$OUTBOX_STDIN\" || {{ OUTBOX_RC=$?; rm -f \"$OUTBOX_STDIN\"; exit $OUTBOX_RC; }}\n"
+               f"  {_hook_tool_command(repo)} pre-push \"$REPO_ROOT\" \"$@\" < \"$OUTBOX_STDIN\" || {{ OUTBOX_RC=$?; rm -f \"$OUTBOX_STDIN\"; exit $OUTBOX_RC; }}\n"
                f"else\n"
                f"  echo \"doctrine-outbox: no python on PATH; push refused because the guard cannot run\" >&2\n"
                f"  rm -f \"$OUTBOX_STDIN\"; exit 1\n"
