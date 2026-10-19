@@ -2683,7 +2683,8 @@ std::vector<std::string> splitLines(const std::vector<unsigned char> & bytes)
 }
 
 // Compares one dumped file of the warm and of Play; on a difference prints the first differing line (text) or byte
-// offset (binary). Absent in both is equal (randn05 is only written with dither on).
+// offset (binary). Absent in both is equal only for randn05 (written only with dither on); r2 (sol r1 H1): a required
+// dump absent on both sides is a broken instrument, never equal (the fake's output ignores scalars.txt).
 bool warmAndPlayDumpsEqual(const char * variant, const std::string & warmDir, const std::string & playDir,
                            const char * name)
 {
@@ -2693,8 +2694,10 @@ bool warmAndPlayDumpsEqual(const char * variant, const std::string & warmDir, co
     const bool hasPlay = readFileBytes(playDir + "/" + name, &play);
     if (!hasWarm && !hasPlay)
     {
-        std::printf("[warm-recon-determinism] %s %s absent in both\n", variant, name);
-        return true;
+        const bool optional = std::string(name) == "randn05.f32";
+        std::printf("[warm-recon-determinism] %s %s absent in both%s\n", variant, name,
+                    optional ? "" : " MISMATCH (required)");
+        return optional;
     }
     if (hasWarm != hasPlay)
     {

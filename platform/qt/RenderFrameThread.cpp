@@ -2228,13 +2228,17 @@ void RenderFrameThread::warmReconForWorker( const ReconQueueEntry &entry,
                                                      m_warmRawScratch,
                                                      m_warmReducedScratch );
     }
-    // what the first recon present would be handed (drawFrame: the texture route's black level and WB)
-    done.blackLevel = m_pMlvObject ? getMlvBlackLevel( m_pMlvObject ) : 0;
+    // what the first recon present would be handed (drawFrame: the texture route's black level and WB). r2 (sol r1
+    // B2): a warm dropped at take never held m_warmRunning, so a clip close may already be past isIdle(): it reads
+    // nothing of the clip (nothing reads its black level: it has no output)
+    done.blackLevel = ( m_pMlvObject && !entry.warmRealRequestPending ) ? getMlvBlackLevel( m_pMlvObject ) : 0;
     done.wbMultipliers = normalizedWbMultipliers6500();
     done.renderMs = ( mlv_stage_timing_now() - startStageTime ) * 1000.0;
     {
         QMutexLocker locker( &m_mutex );
-        m_warmRunning = false;   // signalReconDoneFromWorker wakes lock() / isIdle() waiters next
+        // signalReconDoneFromWorker wakes lock() / isIdle() waiters next; from here on the clip may be freed, so
+        // nothing below (nor that slot -1 completion) reads it
+        m_warmRunning = false;
         done.realRequestArrivedDuringWarm = !entry.warmRealRequestPending && realWorkPendingLocked();
     }
     QMetaObject::invokeMethod( this, [this, done]() { emit playbackReconWarmDone( done ); }, Qt::QueuedConnection );
@@ -2892,8 +2896,11 @@ void RenderFrameThread::signalReconDoneFromWorker( int slotIndex )
     /* CPU-DEBAYERED16-REUSE-PHASE3-RECON-1 r2/r3: on the recon worker thread,
      * right after reconFrameForWorker: the HQ dual-ISO state and llrawproc
      * settings now, and whether this thread's last llrawproc run used the CUDA
-     * playback recon (debayered16ReconDoneStamp, shared with the tests). */
-    const Debayered16ReconDoneStamp reconDone = debayered16ReconDoneStamp( m_pMlvObject );
+     * playback recon (debayered16ReconDoneStamp, shared with the tests).
+     * PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1 r2 (sol r1 B2): only a slot is stamped. A paused warm
+     * (slot -1) has already released m_warmRunning, so a clip close may have freed the clip: it reads nothing. */
+    const Debayered16ReconDoneStamp reconDone = debayered16ReconDoneStampForEntry(
+        slotIndex, [this]() { return debayered16ReconDoneStamp( m_pMlvObject ); } );
     QMutexLocker locker( &m_mutex );
     m_overlapMeter.upstreamEnd( mlv_stage_timing_now() * 1000.0,
                                 playback_overlap::UpstreamStage::Recon );

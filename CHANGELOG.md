@@ -148,3 +148,10 @@ maintained in this format.
     `MLVAPP_PLAYBACK_WARM_OUTPUT_REUSE=1` turns it on. No venue run has
     shown it hitting yet, and a miss costs a comparison (0.25 to 36 ms
     measured) before the debayer runs anyway.
+  - With the reuse off, the paused warm no longer keeps its GPU copy of the
+    debayer input either: no allocation, copy or wait, and the
+    `playback_recon_warm` line says `reuse_capture=none`.
+  - Closing a clip right after a paused warm finished could free the clip
+    while the recon thread was still reading its settings for the warm's
+    completion. The warm's completion no longer reads the clip once the
+    warm is no longer counted as running.

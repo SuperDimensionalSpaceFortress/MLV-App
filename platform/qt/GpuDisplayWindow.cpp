@@ -700,7 +700,9 @@ bool GpuDisplayWindow::warmStagedReconSlotFromDeviceBayer16(const uint16_t *devi
     gpuAmazeDebayerArmProbe(0);
     // R2: ONLY after the warm's AMaZE succeeded is the staged output what Play frame 0's AMaZE would write: capture
     // its exact input, then key it. A failed capture leaves the key invalid (Play runs AMaZE).
-    if ( amazeOk )
+    // WARM-RECON-DETERMINISM-1 r2 (sol r1 B1): with the reuse off (the default) nothing is captured -- no device or
+    // pinned allocation, copy, sync or retained storage -- and the line says reuse_capture=none
+    if ( amazeOk && playbackWarmOutputReuseEnabled() )
     {
         quint64 captureId = 0;
         QString captureWhy;
