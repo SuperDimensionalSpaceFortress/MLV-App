@@ -2245,6 +2245,17 @@ if ($AllowEdits -and $cfg.engine -eq 'claude') {
         }
     }
 }
+# LANE-FSMONITOR-PIN-AND-RETIRE-HARDENING-1 r2 (sol r1 blocker): a worktree this lane leaves standing must not keep a daemon. Without
+# extensions.worktreeConfig the launch-time disable is skipped, so every `git status` above (the retire gate's, the sweep's, and the post-exit
+# dirty check) restarts the daemon. This stop therefore comes AFTER the last git call that touches $WorkDir; add no git call below it (a test pins
+# that). Fail-soft, and recorded in the receipt: a no-op once the worktree is retired (path absent).
+$fsmonitorStop = $null
+try {
+    $fsmonitorStopResult = Stop-LaneWorktreeFsmonitor -WorkDir $WorkDir
+    $fsmonitorStop = [ordered]@{ action = [string]$fsmonitorStopResult.action; reason = $fsmonitorStopResult.reason }
+} catch {
+    $fsmonitorStop = [ordered]@{ action = 'failed'; reason = "cannot-determine: $($_.Exception.Message)" }
+}
 # LANE-NO-BACKGROUND-END-TURN-1 round 7 (sol major 3): the copy this lane's hook actually ran
 # against sits in the per-run reserved slot specifically so it is outside the lane's own
 # writable worktree -- but an editing lane keeps Bash for its whole session, and Bash is not
@@ -2372,6 +2383,9 @@ $receipt = [ordered]@{
     bulkScratch  = $bulkScratch
     worktreeDisposition = $worktreeDisposition
     worktreeSweep = $worktreeSweep
+    # LANE-FSMONITOR-PIN-AND-RETIRE-HARDENING-1 r2: {action, reason} of the lane-end daemon stop (stopped | none | skipped | failed). Absence of a
+    # daemon is 'none'; 'failed' means one may still be running.
+    fsmonitorStop = $fsmonitorStop
     processEnded = $processEnded
     complete     = $workCompleted
     workEvidence = $workEvidence
