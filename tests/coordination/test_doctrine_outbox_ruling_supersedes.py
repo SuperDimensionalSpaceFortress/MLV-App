@@ -639,3 +639,165 @@ def test_r3_the_validate_bus_help_names_no_flag_this_tool_does_not_have():
     bus_help = [a.help for a in _subcommand_parsers()["validate"]._actions if "--bus" in a.option_strings][0]
     assert "--exercise" not in bus_help and "second add_argument" not in bus_help, bus_help
     assert not [a for a in _subcommand_parsers()["validate"]._actions if "--exercise" in a.option_strings]
+
+
+# ---------- r4: block-opening is also a property of the PREVIOUS line; invisible characters; render before the test ----------
+# Opus r3 (a marker directly under a heading, setext underline, thematic break or closing fence) and sol r3 (a zero-width
+# space BETWEEN the words; table cell, &nbsp;, &#160; and <strong> forms). Exotic forms move to ROUTE-RULING-MARKUP-FORMS-1.
+
+R4_MARKER = "**Ruling candidate (not law until ratified):** the hook is deny-only."
+R4_PREDECESSORS = [
+    ("an ATX heading", NEUTRAL_HEADING + "\n"),
+    ("a closed ATX heading", "### A title ###\n"),
+    ("a setext heading over ===", "A title\n===\n"),
+    ("a setext heading over ---", "A title\n---\n"),
+    ("a thematic break of dashes", "Some text.\n\n---\n"),
+    ("a thematic break of stars", "Some text.\n\n***\n"),
+    ("a thematic break of underscores", "Some text.\n\n___\n"),
+    ("a closing backtick fence", "```\ncode\n```\n"),
+    ("a closing tilde fence", "~~~\ncode\n~~~\n"),
+    ("a closing backtick fence with an info string above it", "```python\ncode\n```\n"),
+    ("a closing long fence", "````\ncode\n````\n"),
+    ("a closing tilde fence that holds a backtick fence line", "~~~\n```\n~~~\n"),
+]
+
+
+def after_predecessor(predecessor: str, marker: str, declaration: str = "") -> str:
+    """The marker sits on the VERY NEXT line after `predecessor`, no blank line between; a heading comes first so the
+    item's own first line is neutral."""
+    head = "" if predecessor.startswith(("#", NEUTRAL_HEADING)) else NEUTRAL_HEADING + "\n\n"
+    return _receipt(f"{head}{predecessor}{marker}\n\n{declaration}Rules: S1 one thing.\n")
+
+
+@pytest.mark.parametrize("label, predecessor", R4_PREDECESSORS, ids=[label for label, _ in R4_PREDECESSORS])
+def test_r4_a_marker_on_the_line_right_after_a_block_ending_line_is_refused_bare(tmp_path, capsys, label, predecessor):
+    rc, err = validate(tmp_path, after_predecessor(predecessor, R4_MARKER), make_bus(tmp_path), capsys)
+    assert rc == 1 and "RULING_CANDIDATE_NO_SUPERSEDES" in err, (label, err)
+
+
+@pytest.mark.parametrize("label, predecessor", R4_PREDECESSORS, ids=[label for label, _ in R4_PREDECESSORS])
+def test_r4_a_marker_on_the_line_right_after_a_block_ending_line_is_accepted_with_a_declaration(tmp_path, capsys, label, predecessor):
+    rc, err = validate(tmp_path, after_predecessor(predecessor, R4_MARKER, "touches/supersedes: R15\n"), make_bus(tmp_path), capsys)
+    assert rc == 0 and err == "", (label, err)
+
+
+def test_r4_a_wrapped_line_after_a_properly_closed_mixed_fence_is_still_not_a_marker(tmp_path, capsys):
+    """A backtick line inside a tilde fence does not close it (character and length must match), so the fence ends at the
+    second tilde line and the wrapped line that follows its paragraph start is prose, not a marker."""
+    body = NEUTRAL_HEADING + "\n\n~~~\n```\n~~~\nWe filed a\nruling candidate titled x in the same push.\n"
+    rc, err = validate(tmp_path, _receipt(body), tmp_path / "no-such-clone", capsys)
+    assert rc == 0 and err == "", err
+
+
+def test_r4_prose_directly_under_a_heading_that_does_not_open_with_the_phrase_is_not_a_candidate(tmp_path, capsys):
+    for text in ("### proj, 2026-10-19 - a measured fact\nWe filed a\nruling candidate titled x in the same push.\n",
+                 "### proj, 2026-10-19 - a measured fact\nSee ruling-candidates/x.md for the proposal.\n",
+                 "### proj, 2026-10-19 - a measured fact\n---\nSee ruling-candidates/x.md for the proposal.\n"):
+        rc, err = validate(tmp_path, _receipt(text), tmp_path / "no-such-clone", capsys)
+        assert rc == 0 and err == "", (text, err)
+
+
+# invisible characters between the words must not join them (sol r3 blocker 1: U+200B between the words)
+R4_INVISIBLE_BODY = [
+    "Ruling​candidate: X",           # zero-width space
+    "Ruling­candidate: X",           # soft hyphen
+    "Ruling⁠candidate: X",           # word joiner
+    "Ruling﻿candidate: X",           # byte-order mark
+    "Ruling​​candidate: X",     # two of them
+    "RULING​CANDIDATE (r2): X",
+    "**Ruling​candidate:** X",
+    "Ruling ​candidate: X",          # beside a plain space
+    "Ruling​-candidate: X",          # beside a hyphen
+]
+R4_INVISIBLE_HEADING = ["Ruling​candidate (r2): X", "proj - Ruling­candidate: X", "proj, 2026-10-19 - RULING​CANDIDATE: X"]
+
+
+@pytest.mark.parametrize("marker", R4_INVISIBLE_BODY)
+def test_r4_an_invisible_character_between_the_words_does_not_hide_a_body_marker(tmp_path, capsys, marker):
+    bus = make_bus(tmp_path)
+    rc, err = validate(tmp_path, body_with(marker), bus, capsys)
+    assert rc == 1 and "RULING_CANDIDATE_NO_SUPERSEDES" in err, (marker, err)
+    rc, err = validate(tmp_path, body_with(marker, "touches/supersedes: R15\n"), bus, capsys)
+    assert rc == 0 and err == "", (marker, err)
+
+
+@pytest.mark.parametrize("heading", R4_INVISIBLE_HEADING)
+def test_r4_an_invisible_character_between_the_words_does_not_hide_a_heading_marker(tmp_path, capsys, heading):
+    bus = make_bus(tmp_path)
+    rc, err = validate(tmp_path, candidate(heading=f"### {heading}"), bus, capsys)
+    assert rc == 1 and "RULING_CANDIDATE_NO_SUPERSEDES" in err, (heading, err)
+    rc, err = validate(tmp_path, candidate("touches/supersedes: R15\n", heading=f"### {heading}"), bus, capsys)
+    assert rc == 0 and err == "", (heading, err)
+
+
+@pytest.mark.parametrize("line", [
+    "rulingcandidate/x.md holds the open proposals.",
+    "rulingcandidates are filed by the steward.",
+    "rulingcandidate-check ran green on this box.",
+    "Ruling​candidates are filed under ruling-candidates/ by the steward.",
+    "Ruling​candidate-check ran green on this box.",
+    "Ruling​candidate/ holds the open proposals.",
+    "Ruling​-candidates/x.md holds the open proposals.",
+])
+def test_r4_a_single_word_slug_path_or_plural_is_still_not_a_marker(tmp_path, capsys, line):
+    rc, err = validate(tmp_path, _receipt(f"{NEUTRAL_HEADING}\n\n{line}\n"), tmp_path / "no-such-clone", capsys)
+    assert rc == 0 and err == "", (line, err)
+
+
+# rendered forms (sol r3 blocker 2): table cell, entities, tags, and combining marks are rendered before the marker test
+R4_RENDERED_BODY = [
+    "| Ruling candidate: X |\n| --- |\n| detail |",       # sol r3
+    "Ruling&nbsp;candidate: X",                            # sol r3
+    "Ruling&#160;candidate: X",                            # sol r3
+    "<strong>Ruling candidate:</strong> X",                # sol r3
+    "Ruling&#x00A0;candidate: X",
+    "Ruling&ensp;candidate: X",
+    "&#82;uling candidate: X",                             # a numeric entity for the R
+    "<b>Ruling</b> candidate: X",
+    "<b>Ruling</b><i> candidate</i>: X",
+    '<span class="status">Ruling candidate</span>: X',
+    "<p>Ruling candidate: X</p>",
+    "<strong>Ruling&nbsp;candidate</strong>: X",
+    "| Status | Ruling candidate: X |\n| --- | --- |",    # a later cell opens a block
+    "| Item | Note |\n| --- | --- |\n| 1 | Ruling candidate: X |",
+    "| 1 | Ruling candidate: X |",
+    "a | Ruling candidate: X",                             # no leading pipe
+    "| **Ruling candidate:** X |",
+    "Rúling candidate: X",                           # combining acute on the u
+    "Rulïng candidate: X",                            # precomposed i-diaeresis
+    "Ruling candidáte: X",
+    "Ru&#x301;ling candidate: X",                          # an entity for the combining mark
+]
+R4_RENDERED_HEADING = ["<strong>Ruling candidate</strong>: X", "proj - Ruling&nbsp;candidate: X", "Ruling&#160;candidate (r2): X",
+                       "| Ruling candidate: X |", "proj, 2026-10-19 - <b>RULING CANDIDATE</b>: X"]
+
+
+@pytest.mark.parametrize("marker", R4_RENDERED_BODY)
+def test_r4_a_rendered_body_marker_is_refused_bare_and_accepted_with_a_declaration(tmp_path, capsys, marker):
+    bus = make_bus(tmp_path)
+    rc, err = validate(tmp_path, body_with(marker), bus, capsys)
+    assert rc == 1 and "RULING_CANDIDATE_NO_SUPERSEDES" in err, (marker, err)
+    rc, err = validate(tmp_path, body_with(marker, "touches/supersedes: R15\n"), bus, capsys)
+    assert rc == 0 and err == "", (marker, err)
+
+
+@pytest.mark.parametrize("heading", R4_RENDERED_HEADING)
+def test_r4_a_rendered_heading_marker_is_refused_bare_and_accepted_with_a_declaration(tmp_path, capsys, heading):
+    bus = make_bus(tmp_path)
+    rc, err = validate(tmp_path, candidate(heading=f"### {heading}"), bus, capsys)
+    assert rc == 1 and "RULING_CANDIDATE_NO_SUPERSEDES" in err, (heading, err)
+    rc, err = validate(tmp_path, candidate("touches/supersedes: R15\n", heading=f"### {heading}"), bus, capsys)
+    assert rc == 0 and err == "", (heading, err)
+
+
+@pytest.mark.parametrize("label, body", [
+    ("a wrapped line whose phrase is joined by an entity", f"{NEUTRAL_HEADING}\n\nWe filed a\nruling&nbsp;candidate titled x in the same push.\n"),
+    ("a wrapped line that opens a tag around the phrase", f"{NEUTRAL_HEADING}\n\nWe filed a\n<b>ruling candidate</b> titled x in the same push.\n"),
+    ("a mention mid-sentence in a table cell", f"{NEUTRAL_HEADING}\n\n| Item | Note |\n| --- | --- |\n| 1 | the ruling candidate titled x was filed |\n"),
+    ("a comparison that is not a tag", f"{NEUTRAL_HEADING}\n\nIf a < b and c > d then the ruling candidate titled x stands.\n"),
+    ("a pipe in prose", f"{NEUTRAL_HEADING}\n\nUse the a|b form; see ruling-candidates/x.md.\n"),
+    ("a path with a combining accent", f"{NEUTRAL_HEADING}\n\nSee ruling-candidates/x.md and étude notes.\n"),
+])
+def test_r4_rendering_does_not_make_plain_prose_a_candidate(tmp_path, capsys, label, body):
+    rc, err = validate(tmp_path, _receipt(body), tmp_path / "no-such-clone", capsys)
+    assert rc == 0 and err == "", (label, err)

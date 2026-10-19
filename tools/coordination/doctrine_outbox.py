@@ -117,6 +117,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import html
 import json
 import os
 import pathlib
@@ -2350,12 +2351,14 @@ def cmd_session_start(repo: pathlib.Path, ref: str, ledger: pathlib.Path) -> int
 # carries no `touches/supersedes:` declaration, names a target that is not shaped like one, or names one the bus clone
 # it reads does not hold. The bus is only READ, at its committed tip (HEAD); a bus the validator cannot read is UNKNOWN.
 
-# Whole words: the right boundary leaves out `ruling-candidates/`, `ruling-candidate-<slug>` and the plural.
-RULING_CANDIDATE_PHRASE = r"ruling[ \t-]+candidate(?![-\w/])"
+# Whole words: the right boundary leaves out `ruling-candidates/`, `ruling-candidate-<slug>` and the plural. Zero spaces or
+# dashes may sit between the words, because deleting an invisible character (U+200B, a soft hyphen) joins them.
+RULING_CANDIDATE_PHRASE = r"ruling[ \t-]*candidate(?![-\w/])"
 RULING_QUALIFIER = r"(?:(?:proposed|draft|new)[ \t]+)?"
 RULING_CANDIDATE_LEAD_RE = re.compile(RULING_QUALIFIER + RULING_CANDIDATE_PHRASE, re.I)
 RULING_CANDIDATE_AFTER_SEP_RE = re.compile(r"[-:][ \t]*" + RULING_QUALIFIER + RULING_CANDIDATE_PHRASE, re.I)
-RULING_CANDIDATE_COLON_RE = re.compile(r"(?<![\w/-])ruling[ \t-]+candidate[ \t]*:", re.I)
+RULING_CANDIDATE_COLON_RE = re.compile(r"(?<![\w/-])ruling[ \t-]*candidate[ \t]*:", re.I)
+HTML_TAG_RE = re.compile(r"</?[A-Za-z][^<>]*>")
 # Markup that may sit in front of a marker, in any order: spaces, `>`, `#`s, a list bullet, emphasis, quotes, brackets.
 MARKER_FRONT_RE = re.compile(r"[ \t]+|(?P<quote>>)|(?P<atx>#{1,6})(?=[ \t]|$)|(?P<bullet>(?:[-+*]|\d+[.)])(?=[ \t]|$))"
                              "|[*_`\"'“”‘’«»‹›\\[(]")
@@ -2372,11 +2375,13 @@ RULINGS_FILE = "RULINGS.md"
 
 
 def normalise_marker_line(line: str) -> str:
-    """One line as the marker test reads it: Unicode NFKC (full-width forms and no-break spaces become their ASCII
-    twins), every format character (zero-width space or joiner, BOM, soft hyphen) deleted, every space separator
-    a plain space, every dash (en, em, minus, non-breaking hyphen) a `-`."""
+    """One line as the marker test reads it: Unicode NFKD with the combining marks (category Mn) dropped, then NFKC
+    (full-width forms and no-break spaces become their ASCII twins), every format character (zero-width space or
+    joiner, BOM, soft hyphen) deleted, every space separator a plain space, every dash (en, em, minus, non-breaking
+    hyphen) a `-`."""
     out = []
-    for ch in unicodedata.normalize("NFKC", line.rstrip("\r\n")):
+    decomposed = "".join(ch for ch in unicodedata.normalize("NFKD", line.rstrip("\r\n")) if unicodedata.category(ch) != "Mn")
+    for ch in unicodedata.normalize("NFKC", decomposed):
         category = unicodedata.category(ch)
         if category == "Cf":
             continue
@@ -2399,38 +2404,61 @@ def marker_line(line: str) -> tuple[str, int, bool, bool]:
         text = text[found.end():]
 
 
+def render_marker_lines(body: str) -> list[tuple[str, bool]]:
+    """The body as the marker test reads it, as (line, opens a block) pairs: HTML entities decoded (`&nbsp;`, `&#160;`),
+    HTML tags dropped with their text kept (`<strong>Ruling candidate:</strong>`), and a line with a `|` split into its
+    cells, each its own block-opening line (a leading pipe or a table delimiter row leaves no cell of its own)."""
+    rendered: list[tuple[str, bool]] = []
+    for raw in body.splitlines():
+        line = HTML_TAG_RE.sub("", html.unescape(raw.rstrip("\r")))
+        if "|" in line:
+            rendered += [(cell, True) for cell in [c for c in line.split("|") if c.strip()] or [""]]
+        else:
+            rendered.append((line, False))
+    return rendered
+
+
 def is_ruling_candidate(item: dict) -> bool:
     """A ruling candidate is an item with a marker line. A line can be one only where a block OPENS: the item's first
-    line, a line after a blank one, a heading, a list item, a line that starts a deeper blockquote, a setext heading
-    (a line over `===` or `---`), or any line in or at a fence (when in doubt it is a candidate). A continuation
-    line of a wrapped paragraph never is, so prose that wraps onto `ruling-candidates/x.md` or `ruling candidate
-    titled ...` is left alone. On such a line, once normalised (`normalise_marker_line`) and stripped of markup
+    line, a line after a blank one, a line after a heading (ATX or setext underline), a thematic break or a fence
+    line (opening or closing), a heading, a list item, a table cell, a line that starts a deeper blockquote, a setext
+    heading (a line over `===` or `---`), or any line in or at a fence (when in doubt it is a candidate; a fence
+    closes on the same character, at least as long). A continuation line of a wrapped paragraph never is, so prose
+    that wraps onto `ruling-candidates/x.md` or `ruling candidate titled ...` is left alone. The body is rendered
+    first (`render_marker_lines`). On such a line, once normalised (`normalise_marker_line`) and stripped of markup
     (`marker_line`), the marker is `Ruling candidate` as whole words, any case, a space or dash between them, with
     an optional `Proposed`, `Draft` or `New` before it, whatever follows (`:`, ` (r2):`, ` - `, the end of the line).
     A heading-class line (ATX, setext, the item's first line) also counts when the phrase follows a `-` or `:`
     (`### proj, 2026-10-16 - RULING CANDIDATE (r2): X`) or is followed by a colon. A line that only mentions the
     phrase, or a heading that mentions someone else's candidate (`... for ruling candidate <id>`, no colon), is
     not a marker. A `kind: ruling` item is a ratified ruling (`ratified_by` is required for it), not a candidate."""
-    lines = item["body"].splitlines()
-    fenced, seen_text, prev_blank, prev_depth = False, False, True, 0
-    for i, raw in enumerate(lines):
-        line = raw.rstrip("\r")
+    lines = render_marker_lines(item["body"])
+    fence: tuple[str, int] | None = None
+    seen_text, prev_blank, prev_depth, prev_closes = False, True, 0, False
+    for i, (line, forced) in enumerate(lines):
         text, depth, bullet, heading = marker_line(line)
-        if _FENCE_OPEN_RE.match(line.lstrip(" \t>")):
-            fenced, at_fence = not fenced, True
-        else:
-            at_fence = False
+        unquoted = line.lstrip(" \t>")
+        fence_line = _FENCE_OPEN_RE.match(unquoted)
+        at_fence = False
+        if fence is not None:
+            if fence_line and fence_line.group(1)[0] == fence[0] and len(fence_line.group(1)) >= fence[1] and not unquoted.strip(" `~"):
+                fence, at_fence = None, True
+        elif fence_line:
+            fence, at_fence = (fence_line.group(1)[0], len(fence_line.group(1))), True
         setext = (bool(text) and not MARKER_UNDERLINE_RE.fullmatch(text) and i + 1 < len(lines)
-                  and bool(MARKER_UNDERLINE_RE.fullmatch(marker_line(lines[i + 1])[0])))
+                  and bool(MARKER_UNDERLINE_RE.fullmatch(marker_line(lines[i + 1][0])[0])))
         first = bool(text) and not seen_text
         seen_text = seen_text or bool(text)
-        opens = prev_blank or bullet or heading or setext or fenced or at_fence or depth > prev_depth
+        opens = (prev_blank or prev_closes or forced or bullet or heading or setext or fence is not None or at_fence
+                 or depth > prev_depth)
         if text and opens:
             if RULING_CANDIDATE_LEAD_RE.match(text):
                 return True
             if (heading or setext or first) and (RULING_CANDIDATE_AFTER_SEP_RE.search(text) or RULING_CANDIDATE_COLON_RE.search(text)):
                 return True
+        # the next line opens a block when this one ended one: an ATX heading, a setext underline or thematic break, a fence line
         prev_blank, prev_depth = not text, depth
+        prev_closes = heading or at_fence or bool(MARKER_UNDERLINE_RE.fullmatch(text))
     return False
 
 

@@ -77,16 +77,20 @@ the name of the GPU host. A refusal names the class, never the matched value.
 
 ## Ruling candidates name what they supersede (ROUTE-RULING-SUPERSEDES-1)
 
-A ruling candidate is an item with a heading or body line that opens with `Ruling candidate` (any case, a space or
-hyphen between the words, whole words, optionally after `Proposed`, `Draft` or `New`) once its text is normalised (Unicode
-NFKC, zero-width and other format characters deleted, no-break spaces and en or em dashes made plain) and its markdown
+A ruling candidate is an item with a heading or body line that opens with `Ruling candidate` (any case, zero or more
+spaces or hyphens between the words, whole words, optionally after `Proposed`, `Draft` or `New`) once its text is
+rendered (HTML entities decoded, HTML tags dropped with their text kept, a table row split into cells) and normalised
+(Unicode NFKD with combining marks dropped, then NFKC, zero-width and other format characters deleted so they never join
+two words, no-break spaces and en or em dashes made plain) and its markdown
 is off: list bullets (`-`, `*`, `+`, `1.`), quote marks (`>`), heading
 marks (`#`), bold, italics and backticks, whatever follows (`:`, ` (r2):`, ` - `, the end of the line). A heading
 line also counts when the phrase follows ` - ` or `:` (`### mlv-app, 2026-10-16 - RULING CANDIDATE (r2): X`). A line
 that only mentions the phrase mid-sentence is not a marker, and neither is a wrapped continuation line: a marker only
-sits where a block opens (the item's first line, a line after a blank one, a heading, a list item, a blockquote opener,
-a setext line), so prose that wraps onto `ruling-candidates/x.md` is left alone. A marker inside a fence still counts (the check
-fails closed). It must declare what it overlaps, so the producer finds a contradiction before the reviewer does
+sits where a block opens: the item's first line, a line after a blank one, a line right after an ATX heading, a setext
+underline, a thematic break (`---`, `***`, `___`) or a code-fence line (backtick or tilde, opening or closing), a
+heading, a list item, a table cell, a blockquote opener, a setext line. So prose that wraps onto `ruling-candidates/x.md`
+is left alone. A marker inside a fence still counts (the check fails closed). Exotic forms (hidden HTML comments,
+definition lists, footnotes, look-alike letters from other scripts) are out of scope: card ROUTE-RULING-MARKUP-FORMS-1. It must declare what it overlaps, so the producer finds a contradiction before the reviewer does
 (seed: PR 469 r1). `validate` refuses one without a `touches/supersedes:` declaration (`touches:` and `supersedes:`
 count too, as does `Relationship to existing doctrine:`, the field of the bus candidate template; same list and target
 rules; bold and a bullet allowed, entries add up across labels). Each entry may open with one verb (`extends`,
