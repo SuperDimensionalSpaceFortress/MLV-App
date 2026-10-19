@@ -250,18 +250,25 @@ function Invoke-BoundedChain([string]$Backend) {
 function Get-RowFigures([string]$ReceiptPath, $Leg, [string]$Backend) {
     # The figures exactly as the receipt reports them (null when the receipt does not carry one; never a default). presentedFps / timelineFpsAfterFirstPresent come from
     # the receipt's own hashed run log through Get-DvMatrixRow, which refuses a log that no longer hashes to the receipt.
-    $f = [ordered]@{ receipt = $null; outcome = $null; fps = $null; drops = $null; stall = $null; verification = $null; rejected = $null }
+    $f = [ordered]@{ receipt = $null; outcome = $null; fps = $null; drops = $null; stall = $null; verification = $null; rejected = $null; noFigure = $null }
     if (-not $ReceiptPath -or -not (Test-Path -LiteralPath $ReceiptPath -PathType Leaf)) { return $f }
     try { $rc = [IO.File]::ReadAllText($ReceiptPath) | ConvertFrom-Json } catch { return $f }
     # The evidence-bearing validator (-RepoRoot re-derives the admission from the committed blobs and the run from the hashed evidence). Its verdict is recorded in the row AND gates
     # the figures: a production receipt is ADVISORY at best (valid=false by design, so `valid` is not the gate), and only ADVISORY / NO_SIGNAL / VERIFIED / VERIFIED_OFFLINE_TEST
-    # receipts have their figures copied. INVALID, INCOMPLETE, a validator error or any status not named here is `rejected`: no figure, the caller types the row.
+    # receipts have their figures copied. INVALID, INCOMPLETE, a validator error or any status not named here is `rejected`: no figure, the caller types the row. A figure needs
+    # MORE than that: the receipt's own outcome must be PASS or FAIL (a measurement) AND the status ADVISORY / VERIFIED*. NO_SIGNAL is the validator's answer for every other
+    # outcome, including the INVALID the tracked writer rewrites a refused PASS/FAIL to while keeping its metrics, so it carries no figure: `noFigure` names the typed reason.
     $v = try {
         if ($ValidatorScript) { $o = (& $pwshExe -NoProfile -NonInteractive -File $ValidatorScript -ReceiptPath $ReceiptPath) -join "`n"; if ($LASTEXITCODE -ne 0) { throw "validator exit $LASTEXITCODE" }; $o | ConvertFrom-Json }
         else { Test-DvReceiptValid -Receipt $rc -RepoRoot $repo }
     } catch { $null }
     $f.verification = $(if ($v -and [string]$v.status) { [ordered]@{ status = [string]$v.status; valid = [bool]$v.valid; reasons = @($v.reasons | Select-Object -First 3) } } else { [ordered]@{ status = 'VALIDATOR_ERROR'; valid = $false; reasons = @() } })
     if ($f.verification.status -cnotin @('ADVISORY', 'NO_SIGNAL', 'VERIFIED', 'VERIFIED_OFFLINE_TEST')) { $f.rejected = $f.verification.status; return $f }
+    $outcomeText = [string](Get-DvProp $rc 'outcome')
+    if (-not $outcomeText) { return $f }      # no outcome, no figure: the caller types a RAN leg whose receipt names none
+    $f.outcome = $outcomeText
+    if ($f.verification.status -ceq 'NO_SIGNAL') { $f.noFigure = 'RECEIPT_NO_SIGNAL'; return $f }
+    if ($outcomeText -cnotin @('PASS', 'FAIL')) { $f.noFigure = "RECEIPT_OUTCOME_$outcomeText"; return $f }
     $m =Get-DvProp $rc 'metrics'; $pb = Get-DvProp $rc 'playback'; $pm = Get-DvProp $m 'presentMonStats'
     $entry = [pscustomobject]@{ seq = 1; repeat = 1; cellId = $Leg.legId; backend = $Backend; displayMode = [string](Get-DvProp (Get-DvProp $rc 'display') 'requestedMode'); scaleFactor = Get-DvProp (Get-DvProp $rc 'scale') 'requestedScale' }
     $row = try { Get-DvMatrixRow -PlanEntry $entry -Receipt $rc } catch { $null }
@@ -316,11 +323,13 @@ foreach ($b in $StandardBackends) {
                 $failure = "$(if ($fig.rejected -ceq 'INVALID') { 'EVIDENCE_INVALID' } else { 'EVIDENCE_INCOMPLETE' }): the leg's receipt validated $($fig.rejected), so no figure is recorded"
                 if ($null -eq $typed) { $typed = @{ reason = 'LEG_FAILED'; detail = "a $b leg ($($planLeg.legId)) has a receipt the validator refused ($($fig.rejected)); no figure was recorded" } }
             }
+            elseif ($fig.noFigure) { $failure = "$($fig.noFigure): the leg's receipt is not a PASS/FAIL measurement (outcome $($fig.outcome), validator $($fig.verification.status)), so no figure is recorded" }
             elseif ($legStatus -ceq 'RAN' -and -not $fig.outcome) {
                 $failure = 'the leg is RAN but its receipt is missing or unreadable, so no figure can be recorded'
                 if ($null -eq $typed) { $typed = @{ reason = 'LEG_FAILED'; detail = "a $b leg ($($planLeg.legId)) is RAN but its receipt is missing or unreadable (EVIDENCE_INCOMPLETE)" } }
             }
             if ($failure -and $legStatus -ceq 'RAN') { $legStatus = 'EVIDENCE_INCOMPLETE'; $legOutcome = 'INVALID' }
+            if ($fig.noFigure) { $legOutcome = $fig.outcome }      # a noFigure row keeps the receipt's own outcome (the failure text names why it carries no figure)
             if ($failure) { $fig.fps = $null; $fig.drops = $null; $fig.stall = $null }      # a typed failure never carries figures, whatever the receipt held
             if ($fig.rejected -ceq 'INVALID' -and $legStatus -ceq 'EVIDENCE_INCOMPLETE') { $legStatus = 'EVIDENCE_INVALID' }
             $rows.Add([ordered]@{

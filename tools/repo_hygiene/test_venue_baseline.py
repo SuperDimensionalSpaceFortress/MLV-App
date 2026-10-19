@@ -74,7 +74,8 @@ $legs = foreach ($s in $specs) {
             $rd = Join-Path $env:FAKE_ROOT "receipts\CARD-1\$legId\$Venue"
             New-Item -ItemType Directory -Force -Path $rd | Out-Null
             $rp = Join-Path $rd ("rcpt-$Backend-$n.json")
-            $rc = [ordered]@{ schema = 'mlv-app/dual-venue-receipt/v1'; receiptId = "rcpt-$Backend-$n"; legId = $legId; outcome = 'PASS'
+            $outc = $(if ($env:FAKE_RECEIPT_OUTCOME) { $env:FAKE_RECEIPT_OUTCOME } else { 'PASS' })
+            $rc = [ordered]@{ schema = 'mlv-app/dual-venue-receipt/v1'; receiptId = "rcpt-$Backend-$n"; legId = $legId; outcome = $outc
                 venue = [ordered]@{ name = $Venue; role = 'supplementary' }
                 metrics = [ordered]@{ cpuFrames = 389; gpuFramesTotal = $(if ($Backend -eq 'cuda') { 600 } else { 0 }); skippedOrUnpresentedRatio = 0.35058430717863104; cpuPaceTimelineFps = $(if ($Backend -eq 'cpu') { 11.185 } else { $null })
                     presentMonTemporalMaxGapMs = 41.7; presentMonTemporalGapKind = 'positive-interval-rows'; presentMonStatus = 'ok'
@@ -83,7 +84,7 @@ $legs = foreach ($s in $specs) {
                 display = [ordered]@{ requestedMode = 'fullscreen' }; scale = [ordered]@{ requestedScale = 1 } }
             Set-Content -LiteralPath $rp -Value ($rc | ConvertTo-Json -Depth 8)
             if ($mode -ceq 'noreceipt') { Remove-Item -LiteralPath $rp -Force }
-            [pscustomobject]@{ name = $name; spec = $s; backend = $Backend; status = 'RAN'; verdict = 'QUIET'; outcome = 'PASS'; legExit = 0; receipt = $rp }
+            [pscustomobject]@{ name = $name; spec = $s; backend = $Backend; status = 'RAN'; verdict = 'QUIET'; outcome = $outc; legExit = 0; receipt = $rp }
         }
         { $_ -ceq 'legfail' -or ($_ -ceq 'ranfail' -and $n -gt 1) } { [pscustomobject]@{ name = $name; spec = $s; backend = $Backend; status = 'LEG_FAILED'; verdict = 'QUIET'; outcome = 'INVALID'; printedOutcome = 'PASS'; legExit = 5; receipt = $null } }
         default { [pscustomobject]@{ name = $name; spec = $s; backend = $Backend; status = 'NOT_RUN'; verdict = 'DEADLINE'; reason = 'deadline-before-leg' } }
@@ -114,6 +115,7 @@ switch ($env:FAKE_VALIDATOR_MODE) {
     'invalid' { '{"status":"INVALID","valid":false,"reasons":["PLAYBACK_NOT_FROM_EVIDENCE: playback.sourceAdvanced is not what the hashed run log and result re-derive"]}' }
     'incomplete' { '{"status":"INCOMPLETE","valid":false,"reasons":["EVIDENCE_ABSENT: summary.json is not in the evidence"]}' }
     'unknown' { '{"status":"SOMETHING_NEW","valid":true,"reasons":[]}' }
+    'nosignal' { '{"status":"NO_SIGNAL","valid":true,"reasons":[]}' }
     'error' { exit 3 }
     default { '{"status":"ADVISORY","valid":false,"reasons":["VENUE_ANCHOR_ABSENT"]}' }
 }
@@ -185,9 +187,9 @@ class VenueBaselineTests(unittest.TestCase):
             a += ["-SourceCommit", commit]
         return a + list(extra)
 
-    def run_baseline(self, *extra: str, mode: str = "ok", validator: str = "advisory", timeout: int = 240, **kw) -> subprocess.CompletedProcess:
+    def run_baseline(self, *extra: str, mode: str = "ok", validator: str = "advisory", outcome: str = "PASS", timeout: int = 240, **kw) -> subprocess.CompletedProcess:
         return subprocess.run(self.args(*extra, **kw), capture_output=True, text=True, timeout=timeout,
-                              env=self.env(FAKE_CHAIN_MODE=mode, FAKE_VALIDATOR_MODE=validator), stdin=subprocess.DEVNULL)
+                              env=self.env(FAKE_CHAIN_MODE=mode, FAKE_VALIDATOR_MODE=validator, FAKE_RECEIPT_OUTCOME=outcome), stdin=subprocess.DEVNULL)
 
     def chain_calls(self) -> list[str]:
         return self.chain_log.read_text(encoding="utf-8").splitlines() if self.chain_log.exists() else []
@@ -402,6 +404,49 @@ class VenueBaselineTests(unittest.TestCase):
             self.assertNotEqual(r["status"], "RAN", r)
             self.assertTrue(r["fps"] is None and r["drops"] is None and r["stall"] is None, r)
             self.assertIn(r["receiptVerification"]["status"], ("INVALID", "INCOMPLETE"), r)
+
+    # ---------------------------------------------------------------- r6b B1-R: a receipt that is not a PASS/FAIL measurement yields no figures
+    def assert_typed_no_figure_rows(self, rows: list[dict], token: str, outcome: str) -> None:
+        self.assertEqual(len(rows), 4, rows)
+        for r in rows:
+            self.assertNotEqual(r["status"], "RAN", r)
+            self.assertTrue(str(r["failure"]).startswith(token), r)
+            self.assertEqual(r["outcome"], outcome, r)      # the receipt's own outcome, not a rewritten one
+            self.assertTrue(r["fps"] is None and r["drops"] is None and r["stall"] is None, r)
+
+    def test_a_writer_refused_receipt_with_metrics_reads_no_signal_and_yields_no_figures(self) -> None:
+        # exit-0 chain, RAN legs, receipt outcome INVALID (the tracked writer rewrote a PASS/FAIL it refuses) with its metrics kept, and the read-side validator
+        # returns NO_SIGNAL valid=true for any non-PASS/FAIL outcome (DualVenueRunner.psm1 Test-DvReceiptValid). NO_SIGNAL must not carry the refused run's figures.
+        p = self.run_baseline(validator="nosignal", outcome="INVALID")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)      # an unmeasured run still exits OK here: that is BASELINE-EXIT-NO-MEASUREMENT-1, not this fix
+        rows = self.trend_rows()
+        self.assert_typed_no_figure_rows(rows, "RECEIPT_NO_SIGNAL", "INVALID")
+        for r in rows:
+            self.assertEqual(r["receiptVerification"]["status"], "NO_SIGNAL", r)
+
+    def test_a_no_signal_verdict_yields_no_figures_even_on_a_pass_outcome(self) -> None:
+        self.assert_typed_no_figure_rows(self.run_baseline_rows(validator="nosignal", outcome="PASS"), "RECEIPT_NO_SIGNAL", "PASS")
+
+    def test_a_non_pass_fail_outcome_yields_no_figures_whatever_the_verdict(self) -> None:
+        for verdict in ("advisory", "nosignal"):
+            with self.subTest(verdict=verdict):
+                self.trend.unlink(missing_ok=True)
+                rows = self.run_baseline_rows(validator=verdict, outcome="DEVICE_UNAVAILABLE")
+                self.assert_typed_no_figure_rows(rows, "RECEIPT_NO_SIGNAL" if verdict == "nosignal" else "RECEIPT_OUTCOME_DEVICE_UNAVAILABLE", "DEVICE_UNAVAILABLE")
+
+    def test_a_fail_outcome_with_an_advisory_verdict_keeps_its_figures(self) -> None:
+        rows = self.run_baseline_rows(validator="advisory", outcome="FAIL")
+        self.assertEqual(len(rows), 4, rows)
+        for r in rows:
+            self.assertEqual((r["status"], r["outcome"], r["failure"]), ("RAN", "FAIL", None), r)
+            self.assertIsNotNone(r["fps"], r)
+            self.assertIsNotNone(r["drops"], r)
+            self.assertIsNotNone(r["stall"], r)
+
+    def run_baseline_rows(self, **kw) -> list[dict]:
+        p = self.run_baseline(**kw)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        return self.trend_rows()
 
     # ---------------------------------------------------------------- r5 B2: a non-zero chain exit yields no figures, documented and agreeing or not
     def test_a_documented_nonzero_chain_exit_after_a_ran_leg_yields_no_figures(self) -> None:
