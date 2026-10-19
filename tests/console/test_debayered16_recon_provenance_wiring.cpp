@@ -10,9 +10,16 @@
 #include "../common/minitest.h"
 #include "../common/repo_paths.h"
 
+#include "../../platform/qt/Debayered16ReconReusePolicy.h"
+
 #include <QFile>
 #include <QString>
 #include <QTextStream>
+
+#include <condition_variable>
+#include <cstdio>
+#include <mutex>
+#include <thread>
 
 namespace
 {
@@ -85,4 +92,95 @@ TEST(Debayered16ReconProvenanceWiring, DrawFrameCopiesTheSlotProvenanceIntoThePo
     ASSERT_TRUE(between.indexOf(QStringLiteral("reuse.reconHqDualIso")) < 0);
     ASSERT_TRUE(between.indexOf(QStringLiteral("reuse.reconAcquisitionSucceeded")) < 0);
     ASSERT_TRUE(between.indexOf(QStringLiteral("reuse.reconSettingsAt")) < 0);
+}
+
+// PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1 r2 (sol r1 B2). A paused warm counts as pipeline work only while
+// RenderFrameThread::m_warmRunning holds; warmReconForWorker clears it, and only then does the worker call
+// signalReconDoneFromWorker( -1 ). A clip close (MainWindow::freeActiveMlvObjectAfterLifecycleBarrier) waits for
+// isIdle() / lock() and then frees the clip. The interleaving below is deterministic (a mutex and a condition variable,
+// no sleeps): the worker clears the guard and stops at an injected pause point; the "GUI" waits for idle, closes the
+// clip, then resumes the worker, which completes the entry through debayered16ReconDoneStampForEntry.
+namespace
+{
+
+struct WarmCompletionInterleaving
+{
+    std::mutex mutex;
+    std::condition_variable wake;
+    bool warmRunning = true;   // the take set it (takeReconRequestForWorker)
+    bool clipClosed = false;
+    bool resumeWorker = false;
+    int clipReads = 0;
+    int clipReadsAfterClose = 0;
+
+    // the clip read the stamp makes (debayered16ReconDoneStamp( m_pMlvObject ) in the app)
+    Debayered16ReconDoneStamp readClip()
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        ++clipReads;
+        if (clipClosed) ++clipReadsAfterClose;
+        Debayered16ReconDoneStamp stamp;
+        stamp.settings = 0x5EEDu;
+        return stamp;
+    }
+
+    template <typename Complete>
+    void run(Complete complete)
+    {
+        std::thread worker([this, &complete]()
+        {
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                warmRunning = false;   // warmReconForWorker's last critical section
+            }
+            wake.notify_all();
+            {
+                // the injected pause point: between the guard release and the completion's read
+                std::unique_lock<std::mutex> lock(mutex);
+                wake.wait(lock, [this]() { return resumeWorker; });
+            }
+            complete();   // signalReconDoneFromWorker( -1 )'s stamp
+        });
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            wake.wait(lock, [this]() { return !warmRunning; });   // isIdle() is true now
+            clipClosed = true;                                     // freeMlvObject( m_pMlvObject )
+            resumeWorker = true;
+        }
+        wake.notify_all();
+        worker.join();
+    }
+};
+
+} // namespace
+
+TEST(Debayered16ReconProvenanceWiring, AWarmEntryCompletedAfterAClipCloseReadsNothingOfTheClip)
+{
+    WarmCompletionInterleaving warm;
+    Debayered16ReconDoneStamp stamp;
+    stamp.settings = 1;
+    warm.run([&]() { stamp = debayered16ReconDoneStampForEntry(-1, [&]() { return warm.readClip(); }); });
+    printf("[B2] warm completion: clip_reads=%d after_close=%d\n", warm.clipReads, warm.clipReadsAfterClose);
+    ASSERT_TRUE(warm.clipClosed);
+    ASSERT_EQ(0, warm.clipReads);
+    ASSERT_EQ(0, warm.clipReadsAfterClose);
+    ASSERT_EQ((uint64_t)0, stamp.settings);   // the default (unused: there is no slot to store it in)
+}
+
+// The harness has teeth: the a93ee090 completion (the stamp read unconditionally, slot or not) reads the closed clip.
+TEST(Debayered16ReconProvenanceWiring, TheInterleavingCatchesAnUnconditionalStampRead)
+{
+    WarmCompletionInterleaving warm;
+    warm.run([&]() { (void)warm.readClip(); });
+    printf("[B2] unconditional stamp (a93ee090 shape): clip_reads=%d after_close=%d\n", warm.clipReads, warm.clipReadsAfterClose);
+    ASSERT_EQ(1, warm.clipReadsAfterClose);
+}
+
+// A slot entry is still stamped from the clip (its slot keeps the pipeline busy until it is published).
+TEST(Debayered16ReconProvenanceWiring, ASlotEntryIsStillStampedFromTheClip)
+{
+    WarmCompletionInterleaving slot;
+    const Debayered16ReconDoneStamp stamp = debayered16ReconDoneStampForEntry(0, [&]() { return slot.readClip(); });
+    ASSERT_EQ(1, slot.clipReads);
+    ASSERT_EQ((uint64_t)0x5EEDu, stamp.settings);
 }

@@ -12,6 +12,7 @@
 #include <QStringList>
 #include <QTextStream>
 
+#include <cstdio>
 #include <string>
 
 using playback_route_prewarm::Decision;
@@ -687,7 +688,7 @@ TEST(PlaybackWarmOutputReuseWiring, TheWarmKeysTheSlotOnlyAfterItsAmazeSucceeded
     ASSERT_TRUE(clearAt >= 0);
     ASSERT_TRUE(noOutput > clearAt);
     const int amaze = warm.indexOf(QStringLiteral("const bool amazeOk =\n        gpuAmazeDebayerRenderPostWbGlTextureFromDeviceBayer16(deviceBayer16,"));
-    const int gate = warm.indexOf(QStringLiteral("    if ( amazeOk )\n    {\n        quint64 captureId = 0;"));
+    const int gate = warm.indexOf(QStringLiteral("    if ( amazeOk && playbackWarmOutputReuseEnabled() )\n    {\n        quint64 captureId = 0;"));
     const int capture = warm.indexOf(QStringLiteral("gpuAmazeDebayerCaptureInputBayer16(deviceBayer16, width, height, &captureId, &captureWhy)"));
     const int keyed = warm.indexOf(QStringLiteral("m_stagedReconWarmKey = key;"));
     ASSERT_TRUE(amaze >= 0);
@@ -1012,4 +1013,78 @@ TEST(PlaybackWarmReconDeterminismWiring, TheMissDumpRunsOnlyWithItsEnvAndOnlyOnA
         "const bool mayDownload = enterAmazeRunUnlessCudaSuppressed(&live.runtime, GpuFieldTelemetry::enabled());")));
     ASSERT_TRUE(sourceFile("tools/gpu/backend/igpu_amaze_debayer_cuda.def").contains(
         QStringLiteral("    igpu_amaze_debayer_download_bayer16\n")));
+}
+
+// r2 (sol r1 B1): with MLVAPP_PLAYBACK_WARM_OUTPUT_REUSE unset (default OFF) a successful paused warm makes no reuse
+// capture at all: no device/pinned allocation, copy, stream sync or retained storage. The capture call's enclosing
+// branch reads the switch; it is the only capture call, and the backend export is reached only through that wrapper.
+TEST(PlaybackWarmReconDeterminismWiring, TheWarmCapturesItsInputOnlyWhenTheReuseIsOn)
+{
+    const QString window = sourceFile("platform/qt/GpuDisplayWindow.cpp");
+    const QString warm = codeLinesOnly(bodyBetween(window, QStringLiteral("bool GpuDisplayWindow::warmStagedReconSlotFromDeviceBayer16(const uint16_t"),
+                                                   QStringLiteral("bool GpuDisplayWindow::prewarmPlaybackReconRoute(int texWidth")));
+    ASSERT_FALSE(warm.isEmpty());
+    const QStringList lines = warm.split(QLatin1Char('\n'));
+    int captureLine = -1;
+    for (int i = 0; i < lines.size(); ++i)
+        if (lines[i].contains(QStringLiteral("gpuAmazeDebayerCaptureInputBayer16("))) { captureLine = i; break; }
+    ASSERT_TRUE(captureLine >= 0);
+    // walk out of the capture's block: the condition of the first unmatched '{' above it
+    int depth = 0;
+    QString enclosing;
+    for (int i = captureLine - 1; i >= 0 && enclosing.isEmpty(); --i)
+    {
+        depth += lines[i].count(QLatin1Char('}')) - lines[i].count(QLatin1Char('{'));
+        if (depth < 0)
+        {
+            const bool braceOnly = lines[i].trimmed() == QStringLiteral("{");
+            enclosing = (braceOnly && i > 0) ? lines[i - 1] : lines[i];
+        }
+    }
+    printf("[B1] capture branch: %s\n", enclosing.trimmed().toUtf8().constData());
+    ASSERT_TRUE(enclosing.contains(QStringLiteral("if (")));
+    ASSERT_TRUE(enclosing.contains(QStringLiteral("amazeOk")));
+    ASSERT_TRUE(enclosing.contains(QStringLiteral("playbackWarmOutputReuseEnabled()")));
+    // the default answer when it does not run
+    ASSERT_TRUE(warm.indexOf(QStringLiteral("if ( reuseCapture ) *reuseCapture = QStringLiteral(\"none\");")) >= 0);
+    ASSERT_TRUE(warm.indexOf(QStringLiteral("if ( reuseCapture ) *reuseCapture = QStringLiteral(\"none\");"))
+                < warm.indexOf(QStringLiteral("gpuAmazeDebayerCaptureInputBayer16(")));
+    ASSERT_EQ(1, (int)codeLinesOnly(window).count(QStringLiteral("gpuAmazeDebayerCaptureInputBayer16(")));
+    const QString debayer = codeLinesOnly(sourceFile("platform/qt/GpuDebayer.cpp"));
+    ASSERT_EQ(1, (int)debayer.count(QStringLiteral("live.runtime.captureInputBayer16(")));
+    const QString wrapper = bodyBetween(debayer, QStringLiteral("bool gpuAmazeDebayerCaptureInputBayer16("),
+                                        QStringLiteral("bool gpuAmazeDebayerInputBayer16MatchesCapture("));
+    ASSERT_TRUE(wrapper.contains(QStringLiteral("live.runtime.captureInputBayer16(")));
+}
+
+// r2 (sol r1 B2): a clip close waits only for RenderFrameThread::isIdle() / lock(), and a running warm counts as busy
+// only while m_warmRunning holds. Nothing the warm entry runs after that guard is released may read the clip: not the
+// rest of warmReconForWorker, and not signalReconDoneFromWorker( -1 )'s recon-done stamp (a warm has no slot to stamp).
+// A warm dropped at take never held the guard, so it reads nothing of the clip either.
+TEST(PlaybackWarmReconDeterminismWiring, NoWarmEntryReadsTheClipAfterItsLifetimeGuardIsReleased)
+{
+    const QString thread = sourceFile("platform/qt/RenderFrameThread.cpp");
+    const QString warm = codeLinesOnly(bodyBetween(thread, QStringLiteral("void RenderFrameThread::warmReconForWorker("),
+                                                   QStringLiteral("void RenderFrameThread::reconFrameForWorker(")));
+    ASSERT_FALSE(warm.isEmpty());
+    const int released = warm.indexOf(QStringLiteral("m_warmRunning = false;"));
+    ASSERT_TRUE(released >= 0);
+    ASSERT_EQ(-1, (int)warm.indexOf(QStringLiteral("m_pMlvObject"), released));
+    ASSERT_TRUE(warm.contains(QStringLiteral(
+        "done.blackLevel = ( m_pMlvObject && !entry.warmRealRequestPending ) ? getMlvBlackLevel( m_pMlvObject ) : 0;")));
+    // a warm entry is queued without a slot, and the worker signals its completion with that slot
+    ASSERT_TRUE(thread.contains(QStringLiteral("    entry.slotIndex = -1;\n    entry.request.frameNumber = frameNumber;\n    entry.warm = true;")));
+    const QString worker = sourceFile("platform/qt/ReconWorker.cpp");
+    const int recon = worker.indexOf(QStringLiteral("m_parent->reconFrameForWorker( entry, &m_workerState );"));
+    const int signal = worker.indexOf(QStringLiteral("m_parent->signalReconDoneFromWorker( entry.slotIndex );"));
+    ASSERT_TRUE(recon >= 0);
+    ASSERT_TRUE(signal > recon);
+    // the completion stamp is taken only for a slot (Debayered16ReconReusePolicy.h), never read unconditionally
+    const QString done = codeLinesOnly(bodyBetween(thread, QStringLiteral("void RenderFrameThread::signalReconDoneFromWorker( int slotIndex )"),
+                                                   QStringLiteral("int RenderFrameThread::waitForDecodedSlotLocked( void )")));
+    ASSERT_FALSE(done.isEmpty());
+    ASSERT_TRUE(done.contains(QStringLiteral("debayered16ReconDoneStampForEntry(")));
+    ASSERT_TRUE(done.contains(QStringLiteral("slotIndex, [this]() { return debayered16ReconDoneStamp( m_pMlvObject ); } );")));
+    ASSERT_FALSE(done.contains(QStringLiteral("const Debayered16ReconDoneStamp reconDone = debayered16ReconDoneStamp( m_pMlvObject );")));
+    ASSERT_EQ(1, (int)done.count(QStringLiteral("m_pMlvObject")));
 }
