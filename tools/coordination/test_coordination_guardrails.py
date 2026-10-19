@@ -4377,3 +4377,99 @@ def test_continuation_reuse_starts_and_leaves_no_fsmonitor_daemon(tmp_path, monk
             assert "is watching" not in seen, "a fsmonitor daemon was running in the reused worktree when the lane started: " + seen
     finally:
         fsmon_continuation_cleanup(tmp_path, wt, card_id)
+
+
+# ---------------------------------------------------------------- LANE-FSMONITOR-PIN-AND-RETIRE-HARDENING-1
+# Two hardening findings left open by the #485 review.
+# RETIRE-KEPT-WORKTREE-DAEMON-1: a worktree the retirement gate KEEPS (dirty, unpushed, held by a live process, ...) can hold a daemon that was
+# already running before the fix landed; the daemon was stopped only on the remove path. It has to be stopped on every path that keeps it.
+FSMON_RETIRE_LIB = ROOT / "tools" / "coordination" / "Retire-LaneWorktree.ps1"
+FSMON_NO_PROCS = "[pscustomobject]@{ Procs = @(); SelfPids = @($PID) }"
+
+
+def fsmon_retire(wt, snapshot=FSMON_NO_PROCS):
+    script = (
+        "$ErrorActionPreference='Stop'; Set-StrictMode -Version Latest; "
+        f". '{FSMON_RETIRE_LIB}'; $snap = {snapshot}; "
+        f"Invoke-RetireLaneWorktree -WorkDir '{wt}' -MergeTarget 'master' -ProcessSnapshot $snap | ConvertTo-Json -Depth 4"
+    )
+    done = subprocess.run([FSMON_PWSH, "-NoProfile", "-NonInteractive", "-Command", script], text=True, capture_output=True)
+    assert done.returncode == 0, (done.stdout, done.stderr)
+    return json.loads(done.stdout)
+
+
+@fsmon_only
+@pytest.mark.parametrize(
+    "extension,kept_reason,snapshot_for",
+    [
+        (True, "dirty", None),
+        (True, "unpushed", None),
+        (True, "live-process", lambda wt: "[pscustomobject]@{ Procs = @([pscustomobject]@{ ProcessId = 999999; Name = 'fake-editor.exe'; "
+                                          f"CommandLine = 'fake-editor.exe --open {wt}' }}); SelfPids = @($PID) }}"),
+        (False, "unpushed", None),
+    ],
+    ids=["dirty", "unpushed", "live-process", "unpushed-without-worktree-extension"],
+)
+def test_retire_stops_a_daemon_already_running_in_a_worktree_it_keeps(fsmon_board, extension, kept_reason, snapshot_for):
+    """The fixture leaves a daemon running (a worktree that predates the fix). The fixture board has no remote, so any HEAD is `unpushed`. Without
+    extensions.worktreeConfig the disable is skipped, so the gate's own status starts the daemon again: that case needs a stop at the end."""
+    main, wt = fsmon_board
+    if extension:
+        git(main, "config", "extensions.worktreeConfig", "true")
+    if kept_reason == "dirty":
+        (wt / "someone-elses-work.txt").write_text("uncommitted\n")
+    git(wt, "status", "--porcelain")
+    assert fsmon_watching(wt), "the fixture failed to start the daemon it is about to measure"
+    d = fsmon_retire(wt, snapshot_for(wt) if snapshot_for else FSMON_NO_PROCS)
+    assert d["action"] == "kept" and d["reason"].startswith(kept_reason), d
+    assert wt.exists()
+    assert not fsmon_watching(wt), "a worktree the retirement gate kept still has its fsmonitor daemon: " + str(d["reason"])
+
+
+def test_invoke_lane_stops_the_daemon_when_the_lane_ends_with_the_worktree_kept():
+    """A relaunched worktree without extensions.worktreeConfig cannot be disabled, so the lane's own status restarts the daemon after the launch-time
+    stop; with no -RetireWorktree nothing else ends it. The stop has to run after the retire and sweep blocks and before the receipt is built."""
+    lane = (ROOT / "tools" / "coordination" / "Invoke-Lane.ps1").read_text(encoding="utf-8")
+    tail = lane[lane.index("Invoke-SweepMergedLaneWorktrees -RepoRoot"):]
+    assert "Stop-LaneWorktreeFsmonitor -WorkDir $WorkDir" in tail[:tail.index("$processEnded = ")], "Invoke-Lane.ps1 never stops the worktree's daemon at lane end"
+
+
+# FSMONITOR-LANE-PIN-BARE-GIT-1: the order pin above looks for ONE git shape (`$x = Invoke-GitCaptureUtf8`), so a bare `& git ...`, `git status`, an
+# unassigned or nested Invoke-GitCaptureUtf8, a helper that wraps it, or Start-Process git placed BEFORE the disable would pass. This helper is
+# the pin's decision: does the text run a git command ahead of the disable?
+FSMON_DISABLE_LINE = "$null = Disable-LaneWorktreeFsmonitor -WorkDir $WorkDir"
+FSMON_INSERT_BEFORE = "try {\n    . (Join-Path $PSScriptRoot 'lane-fsmonitor.ps1')"
+
+
+def fsmon_lane_pin_violation(lane_text):
+    disable = lane_text.index(FSMON_DISABLE_LINE)
+    first_git = re.search(r"^\$\w+\s*=\s*Invoke-GitCaptureUtf8\b", lane_text, re.M)
+    return first_git is None or first_git.start() < disable
+
+
+def test_fsmonitor_lane_pin_accepts_the_shipped_invoke_lane():
+    lane = (ROOT / "tools" / "coordination" / "Invoke-Lane.ps1").read_text(encoding="utf-8")
+    assert not fsmon_lane_pin_violation(lane)
+
+
+@pytest.mark.parametrize(
+    "git_call",
+    [
+        "$null = Invoke-GitCaptureUtf8 -WorkDir $WorkDir -GitArgs @('status')",
+        "& git -C $WorkDir status --porcelain",
+        "& git.exe -C $WorkDir status --porcelain",
+        "git -C $WorkDir status --porcelain",
+        "Invoke-GitCaptureUtf8 -WorkDir $WorkDir -GitArgs @('status')",
+        "if ((Invoke-GitCaptureUtf8 -WorkDir $WorkDir -GitArgs @('status')).ok) { }",
+        "$dirt = Get-TrackedDirtyContentIdentity $WorkDir",
+        "Start-Process -FilePath git -ArgumentList 'status' -Wait",
+        "& $gitExe -C $WorkDir status",
+        "[void][System.Diagnostics.Process]::Start('git', 'status')",
+    ],
+    ids=["assigned-helper", "amp-git", "amp-git-exe", "bare-git", "unassigned-helper", "nested-helper", "wrapper-helper", "start-process", "amp-variable", "process-start"],
+)
+def test_fsmonitor_lane_pin_catches_a_git_command_inserted_before_the_disable(git_call):
+    lane = (ROOT / "tools" / "coordination" / "Invoke-Lane.ps1").read_text(encoding="utf-8")
+    assert FSMON_INSERT_BEFORE in lane, "the insertion anchor moved; re-pin this test"
+    mutated = lane.replace(FSMON_INSERT_BEFORE, git_call + "\n" + FSMON_INSERT_BEFORE, 1)
+    assert fsmon_lane_pin_violation(mutated), "the pin passes a lane script that runs git before the disable: " + git_call
