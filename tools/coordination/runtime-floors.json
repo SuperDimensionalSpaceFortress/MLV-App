@@ -47,7 +47,7 @@
       "globs": ["tools/coordination/lane-local-playback-lint.ps1"],
       "floor": "declared",
       "runtimes": ["powershell-5.1", "pwsh"],
-      "evidence": [{"file": "tools/coordination/lane-local-playback-lint.ps1", "line": 119, "contains": "PowerShell 5.1 reads a BOM-less file"}],
+      "evidence": [{"file": "tools/coordination/lane-local-playback-lint.ps1", "line": 128, "contains": "PowerShell 5.1 reads a BOM-less file"}],
       "suites": [
         {"kind": "ps-parse"},
         {"kind": "pytest", "path": "tools/repo_hygiene/test_hub_vm_no_local_playback.py", "slow": true}
