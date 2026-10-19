@@ -99,24 +99,18 @@ LINT_REL = "tools/coordination/lane-local-playback-lint.ps1"
 HOOK_TEST_REL = "tools/repo_hygiene/test_mlv_never_authorized.py"
 PLAYBACK_TEST_REL = "tools/repo_hygiene/test_hub_vm_no_local_playback.py"
 CORPUS_REL = "tools/repo_hygiene/safety_lint_parity_corpus.json"  # r6: where the BASELINE's copy of the static corpus is read from
-# NA2-RULE4-PER-LAUNCHER-SCOPE-1 r16c (hub ruling #2, ledger 2026-10-19 ~06:55Z): #465's RULE4_* seed tuples are NOT derived as head
-# must-refuse rows.  At 12,018 derived rows (211 + 11,807 from these 24 tuples, 6,000 of them seeded fuzz) the parity suite did not
-# finish in 1,198 s on a loaded host (r16b), so the cost is excluded by an EXPLICIT list: exact names, never a prefix or a regex, so a
-# new RULE4_* (or any other) tuple is derived and counted until someone lists it here.  The exclusion is HEAD-side only; a copy of
-# any of these names in the BASELINE module still joins the union.  The rows are covered by #465's own master-vs-head differential
-# (test_hub_vm_no_local_playback.LintDifferentialPinTests) for the families that corpus carries; the families it does not carry are
-# recorded in the r16c coverage audit.  Re-include them under card SAFETY-LINT-PARITY-SPEED-1 (a faster probe), then empty this set.
+# NA2-RULE4-PER-LAUNCHER-SCOPE-1 r18 (hub ruling #3, ledger 2026-10-19 ~09:00Z, amends ruling #2 of r16c): the two seeded FUZZ tuples of
+# #465 are NOT derived as must-refuse rows, on BOTH sides.  They are deterministic generated inputs (6,000 rows: 3,600 + 2,400) whose
+# parity cost dominates: at 12,018 derived rows the parity suite did not finish in 1,198 s on a loaded host (r16b).  The other RULE4_*
+# tuples, which r16c excluded too, are derived again.  The list is EXPLICIT: exact names, never a prefix or a regex, so a new RULE4_*
+# (or any other) tuple is derived and counted until someone lists it here.  The exclusion applies to the HEAD derivation AND to the
+# BASELINE union (derived_playback_rows): a baseline that carries these names (every `--base HEAD` run, and master once #465 lands)
+# would otherwise return the rows through the union and only defer the cost.  The rows are covered by #465's own master-vs-head
+# differential (test_hub_vm_no_local_playback.LintDifferentialPinTests) and by the count+sha256 pin of the fuzz generator, not by a
+# parity loosening check.  Re-include them under card SAFETY-LINT-PARITY-SPEED-1 (P1; a faster probe), then empty this set.
 # test_safety_lint_parity pins the excluded row count (EXACT_EXCLUDED_DIFFERENTIAL_ROWS) and fails on a stale entry.
 PARITY_EXCLUDED_DIFFERENTIAL_TUPLES = frozenset({
-    "RULE4_R10_FUZZ_REFUSE", "RULE4_R10_REFUSE",
-    "RULE4_R2_B_APP_REFUSE", "RULE4_R2_B_REFUSE",
-    "RULE4_R2_CROSS_GUARDS", "RULE4_R2_CROSS_RED", "RULE4_R2_CROSS_REFUSE",
-    "RULE4_R2_GUARDS", "RULE4_R2_MIXED_REFUSE", "RULE4_R2_OR_REFUSE", "RULE4_R2_REFUSE", "RULE4_R2_SINGLE_REFUSE",
-    "RULE4_R4_GUARDS", "RULE4_R4_RED", "RULE4_R4_REFUSE",
-    "RULE4_R6_GUARDS", "RULE4_R6_RED", "RULE4_R6_REFUSE",
-    "RULE4_R7_REFUSE", "RULE4_R8_REFUSE",
-    "RULE4_R9_FUZZ_REFUSE", "RULE4_R9_REFUSE",
-    "RULE4_SECOND_LAUNCHER_GUARDS", "RULE4_SECOND_LAUNCHER_REFUSE",
+    "RULE4_R9_FUZZ_REFUSE", "RULE4_R10_FUZZ_REFUSE",
 })
 DEFAULT_CORPUS = HERE / "safety_lint_parity_corpus.json"
 DEFAULT_ALLOW = HERE / "safety_lint_parity_allow.json"
@@ -609,8 +603,8 @@ def run_hook(base_module, head_module, cases: list[HookCase]) -> list[dict]:
 def _playback_rows_from(pb, source: str, which: str, exclusion: str = "keep") -> list[dict]:
     """Every must-refuse sentence of one playback test module (`which` names it: head or baseline); `source` tags the rows.
 
-    `exclusion` (r16c): "keep" reads every tuple, "skip" leaves out the names in PARITY_EXCLUDED_DIFFERENTIAL_TUPLES (the derived head
-    corpus), "only" reads nothing but those names (the pinned excluded-row count)."""
+    `exclusion` (r16c, both-side since r18): "keep" reads every tuple, "skip" leaves out the names in PARITY_EXCLUDED_DIFFERENTIAL_TUPLES
+    (the derived head corpus AND the baseline union), "only" reads nothing but those names (the pinned excluded-row count)."""
     if exclusion not in ("keep", "skip", "only"):
         raise ValueError(f"exclusion must be keep, skip or only, not {exclusion!r}")
     rows: dict[str, dict] = {}
@@ -653,7 +647,7 @@ def derived_playback_rows(root: Path, base_ref: str | None = None) -> tuple[list
     if base_ref:
         base_pb = load_source_as(git(root, "show", f"{base_ref}:{PLAYBACK_TEST_REL}"), "parity_base_playback_tests", root / PLAYBACK_TEST_REL)
         have = {r["id"] for r in rows}
-        rows += [r for r in _playback_rows_from(base_pb, "derived-base", "baseline") if r["id"] not in have]
+        rows += [r for r in _playback_rows_from(base_pb, "derived-base", "baseline", "skip") if r["id"] not in have]
     return rows, pb
 
 
