@@ -1662,6 +1662,11 @@ if ($scratchBase) {
     $scratchDir = Join-Path $scratchBase $scratchLeaf
     New-Item -ItemType Directory -Force -Path $scratchDir | Out-Null
     foreach ($v in 'TEMP', 'TMP', 'TMPDIR') { $psi.Environment[$v] = $scratchDir }
+    # T-03: the default scratch root is inside the lane's git worktree, so git repo discovery from a pytest tmp_path or
+    # tempfile dir would climb into the worktree. A ceiling at the scratch root stops it there and leaves git run from
+    # the worktree itself alone. An inherited ceiling is kept: the scratch root is appended with ';'.
+    $ceiling = if ($psi.Environment.ContainsKey('GIT_CEILING_DIRECTORIES')) { [string]$psi.Environment['GIT_CEILING_DIRECTORIES'] } else { '' }
+    $psi.Environment['GIT_CEILING_DIRECTORIES'] = if ($ceiling.Trim(';')) { '{0};{1}' -f $ceiling.TrimEnd(';'), $scratchBase } else { $scratchBase }
 }
 $psi.Environment['MLV_LANE_RUN_DIR'] = $RunDir
 $psi.Environment['MLV_LANE_SCRATCH_MANIFEST'] = (Join-Path $RunDir 'scratch-paths.txt')

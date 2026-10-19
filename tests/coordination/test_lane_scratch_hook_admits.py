@@ -33,13 +33,15 @@ def git(*args, cwd):
                           check=True, capture_output=True, text=True, timeout=60)
 
 
-def run_lane(tree, extra=(), twice=False):
+def run_lane(tree, extra=(), twice=False, extra_env=None):
     """A fixture lane whose WorkDir is a git repo carrying THIS repo's .gitignore. Its first act records
-    TEMP/TMP/TMPDIR, writes a file into TEMP, and records what `git status` then sees.
+    TEMP/TMP/TMPDIR, writes a file into TEMP, and records what `git status` then sees, plus what git repo
+    discovery finds from <TEMP>\\sub and from the WorkDir (T-03).
     twice=True runs the same command again (the next receipt slot of the same run dir) and adds the second
-    run's TEMP to the returned dict as seen["TEMP_second"]."""
+    run's TEMP to the returned dict as seen["TEMP_second"]. extra_env is added to the launcher's environment."""
     root = tree["root"]
     cmd, env, receipt = prepare(tree, "normal")
+    env = dict(env); env.update(extra_env or {})
     shutil.copyfile(ROOT / ".gitignore", root / ".gitignore")
     git("init", "-q", cwd=root)
     git("add", ".gitignore", cwd=root)
@@ -52,8 +54,13 @@ def run_lane(tree, extra=(), twice=False):
         "New-Item -ItemType Directory -Force -Path (Split-Path $f) | Out-Null\n"
         "'note' | Set-Content -LiteralPath $f\n"
         "$st = @(git -C '%s' -c core.quotepath=false status --porcelain -uall)\n"
-        "[ordered]@{ TEMP = $env:TEMP; TMP = $env:TMP; TMPDIR = $env:TMPDIR; note = $f; status = $st } | "
-        "ConvertTo-Json | Set-Content -LiteralPath '%s' -Encoding utf8NoBOM\n" % (root, seen), encoding="ascii")
+        "$sub = Join-Path $env:TEMP 'sub'\n"
+        "New-Item -ItemType Directory -Force -Path $sub | Out-Null\n"
+        "$gd = @(git -C $sub rev-parse --git-dir 2>&1 | ForEach-Object { \"$_\" }); $gdExit = $LASTEXITCODE\n"
+        "$top = @(git -C '%s' rev-parse --show-toplevel 2>&1 | ForEach-Object { \"$_\" }); $topExit = $LASTEXITCODE\n"
+        "[ordered]@{ TEMP = $env:TEMP; TMP = $env:TMP; TMPDIR = $env:TMPDIR; note = $f; status = $st;\n"
+        "  ceiling = $env:GIT_CEILING_DIRECTORIES; gitDir = $gd; gitDirExit = $gdExit; top = $top; topExit = $topExit } | "
+        "ConvertTo-Json | Set-Content -LiteralPath '%s' -Encoding utf8NoBOM\n" % (root, root, seen), encoding="ascii")
     tree["shim"].write_text('@echo off\r\n"%s" -NoProfile -NonInteractive -File "%s"\r\n"%s" -NoProfile -NonInteractive -File "%s" %%*\r\n'
                             % (PWSH, pre, PWSH, tree["child"]), encoding="ascii")
     r = subprocess.run(cmd + list(extra), env=env, text=True, capture_output=True, timeout=180)
@@ -107,6 +114,27 @@ def test_the_default_scratch_leaf_is_short_fixed_width_and_unique_per_run_and_la
         assert p.parent == root / ".claude-state" / "ls", p
         assert re.fullmatch(r"[0-9a-f]{8}", p.name), p.name
     assert first != second, "two lane slots of one run dir shared a scratch dir"
+
+
+def test_git_finds_no_repository_above_the_lane_temp(fixture_tree):
+    # r4 opus B1 / T-03: the default TEMP sits inside the lane's worktree, so without a ceiling git discovery from
+    # any pytest tmp_path / tempfile dir climbs into the worktree, and tests that need a dir outside any repo go red.
+    seen, _receipt = run_lane(fixture_tree)
+    root = fixture_tree["root"]
+    assert seen["gitDirExit"] != 0, "git found a repository above the lane TEMP: %r (TEMP=%s)" % (seen["gitDir"], seen["TEMP"])
+    assert "not a git repository" in " ".join(seen["gitDir"] or []), seen["gitDir"]
+    # git run in the worktree itself is untouched by the ceiling.
+    assert seen["topExit"] == 0, seen["top"]
+    assert os.path.normcase(os.path.normpath(seen["top"][0])) == os.path.normcase(str(root)), seen["top"]
+
+
+def test_an_inherited_git_ceiling_is_kept_and_the_scratch_root_appended(fixture_tree, tmp_path):
+    inherited = str(tmp_path.with_name(tmp_path.name + "-ceiling"))
+    seen, _receipt = run_lane(fixture_tree, extra_env={"GIT_CEILING_DIRECTORIES": inherited})
+    root = fixture_tree["root"]
+    parts = [os.path.normcase(p) for p in (seen["ceiling"] or "").split(";")]
+    assert parts == [os.path.normcase(inherited), os.path.normcase(str(root / ".claude-state" / "ls"))], seen["ceiling"]
+    assert seen["gitDirExit"] != 0, seen["gitDir"]
 
 
 @pytest.mark.parametrize("card_len", [39, 60])

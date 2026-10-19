@@ -98,6 +98,21 @@ def test_the_two_lane_scratch_tests_agree_that_a_bare_TEMP_is_scratch():
     assert census_tool.classify(["PARTIAL hook deny NA-7 (write to C:\\mlvtmp\\red-tree)"]) == "NA-7 outside-root"
 
 
+def test_a_windows_temp_dir_is_not_scratchpad_evidence():
+    # r4 sol B2 / CEN-01: the bare TEMP word matched the directory component of /c/windows/temp, so a correct NA-7
+    # outside-root denial (NA2-RULE4-PER-LAUNCHER-SCOPE-1 r19, ledger ruling 16:19:44Z) was counted as lane-scratch.
+    r19 = ["PARTIAL hook deny (NA-7) on my own scratch redirect",
+           "Hook: NA-7: write outside both the worktree and the board root (/c/windows/temp/r19-merge-report.txt)"]
+    assert census_tool.classify(r19) == "NA-7 outside-root"
+    for path in ("C:\\Windows\\Temp\\x.txt", "c:/windows/temp/x.txt", "C:\\\\Windows\\\\Temp\\\\x.txt",
+                 "%SystemRoot%\\Temp\\x.txt", "%windir%\\Temp\\x.txt", "$env:SystemRoot\\Temp\\x.txt"):
+        assert census_tool.classify(["PARTIAL hook deny NA-7 (write to %s) -> successor r2" % path]) == "NA-7 outside-root", path
+    # Harness-scratchpad evidence on an NA-7 line still wins, with or without a Windows Temp path beside it.
+    assert census_tool.classify(r19 + ["NA-7 again on the harness scratchpad"]) == "NA-7 lane-scratch"
+    assert census_tool.classify(["PARTIAL hook deny NA-7 on $env:TEMP\\x.txt -> successor r2"]) == "NA-7 lane-scratch"
+    assert census_tool.classify(["PARTIAL hook deny NA-7 on C:\\Users\\u\\AppData\\Local\\Temp\\x.txt -> successor r2"]) == "NA-7 lane-scratch"
+
+
 def test_unstamped_run_dirs_and_unreadable_summaries_are_counted_not_dropped(tmp_path, monkeypatch, capsys):
     def summary(name, text="PARTIAL hook deny NA-6 assert count fell\n"):
         d = tmp_path / name

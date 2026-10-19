@@ -7,7 +7,7 @@ summary line 1 starts with PARTIAL, and puts each in ONE class, first match wins
   placeholder        line 1 is still the early 'in-progress (lane started ...' placeholder
   STDIN-REPL         a python-on-stdin / -c / heredoc deny (check-python-stdin-trap)
   NA-7 lane-scratch  NA-7 on the harness scratchpad / TEMP / lane-scratch
-  NA-7 outside-root  any other NA-7
+  NA-7 outside-root  any other NA-7 (incl. C:\\Windows\\Temp, which is not the scratchpad)
   NA-2 shrink        NA-2 shrinking overwrite (incl. a shorter Edit replacement)
   NA-2 delete        NA-2 on a delete / move / cleanup
   NA-2 redirect      NA-2 on a shell redirect, tee, truncating write or --body-file
@@ -38,6 +38,9 @@ CLASSES = (
 _STAMP_RX = re.compile(r"-(\d{4})(\d{2})(\d{2})T\d{4}Z$")
 _DENY_WORD = re.compile(r"\bden(?:y|ied|ies)\b|hook[- ]blocked|blocked by (?:the )?(?:\S+ )?hook", re.I)
 _SCRATCH_WORDS = r"scratchpad|lane-scratch|%TEMP%|\$env:TEMP|\bTEMP\b"   # the one definition both lane-scratch tests use
+# CEN-01: the Windows Temp dir (C:\Windows\Temp, /c/windows/temp, %SystemRoot%\Temp) is outside every root and is not the
+# harness scratchpad, so its 'Temp' is masked before any rule reads a line (the mask word matches no rule).
+_WINDOWS_TEMP = re.compile(r"(?:%(?:SystemRoot|windir)%|\$env:(?:SystemRoot|windir)|(?<![\w-])windows)[\\/]+temp\b", re.I)
 _RULES = (
     ("placeholder", re.compile(r"^PARTIAL in-progress \(lane started", re.I)),
     ("STDIN-REPL", re.compile(r"stdin|python3? -c\b|python3? - <<|heredoc|STDIN-REPL", re.I)),
@@ -84,7 +87,8 @@ def classify(lines):
     recalls.  Line 1 decides the class when it names one.  When it only says "hook deny", or gives no reason,
     the body lines that carry deny evidence (a deny word, an NA-n token, 'hook', or NA-7's own message)
     decide.  An NA-7 round is 'lane-scratch' when any NA-7 evidence line names the scratchpad, whichever
-    line names the rule."""
+    line names the rule.  A Windows Temp path is not scratchpad evidence (CEN-01)."""
+    lines = [_WINDOWS_TEMP.sub("WINDOWS-SYSTEM-DIR", ln) for ln in lines]
     first = lines[0].strip().lstrip("#* ").strip() if lines else ""
     if _RULES[0][1].search(first):
         return "placeholder"
