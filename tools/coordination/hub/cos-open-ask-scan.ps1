@@ -6,7 +6,7 @@
 #      and an owner-account PR comment that holds one; an ACK answers it only when it is newer (strictly newer than a section / comment ask). An owner comment that itself starts with ACK: / DISTINGUISH: is never an ask.
 #   2. an ACK request in the bus text OR in an owner-account PR comment newer than the bus header is an ask whatever the header verdict says (OPEN PRs; CLOSED / MERGED keep the -ExplicitOnly rule).
 #      A green-header file with no ask text is therefore probed (`gh pr view`) when its PR is OPEN; the PR states come from ONE `gh pr list --state all` call (a failed call = UNKNOWN pr=- reason=pr-state-list-failed, exit 20).
-#   3. bus headers naming the repo's former name (-RepoAlias, default layibabalola/MLV-App) are scanned normally; a truly foreign repo header stays UNKNOWN + exit 20.
+#   3. bus headers naming the repo's former name (-RepoAlias, taken from the profile's repoAliases) are scanned normally; a truly foreign repo header stays UNKNOWN + exit 20.
 #   UNANSWERED and ANSWERED rows end with ` ask_src=<header|bus-commit|section|comment|bus-commit-latest>` (where the ask time came from).
 # COS-SCAN-UNDATED-ASK-1 r1b (sol SG-08): a follow-up ask appended to a bus file under an UNSTAMPED heading has no time of its own, so an older ACK looked like an answer to it. The commit time of the NEWEST bus commit that
 #   changed the file (`git log -1 --format=%cI <ref> -- <file>`) is now one more ask-time candidate (ask_src=bus-commit-latest): it applies when the file's text holds an ACK request (same HasAskText rule as the file, -ExplicitOnly on
@@ -49,7 +49,7 @@ param(
     [string]$OutFile,
     [string]$FixtureDir = '',
     [string]$FeedbackPath,
-    # COS-SCAN-LATEST-ASK-1 r1: repo names a bus header may carry for THIS repo (it was layibabalola/MLV-App before the org move; GitHub redirects it, PR numbers are unchanged). Passing -RepoAlias REPLACES the list.
+    # COS-SCAN-LATEST-ASK-1 r1: repo names a bus header may carry for THIS repo (the repo's pre-transfer name, listed in the profile's repoAliases; GitHub redirects it, PR numbers are unchanged). Passing -RepoAlias REPLACES the list.
     [string[]]$RepoAlias,
     # test seam: a JSON array of { number, state } read instead of `gh pr list --state all` (the scan asks GitHub for every PR's state once)
     [string]$PrStateFile = '',
@@ -350,7 +350,7 @@ if (-not $FixtureDir -and $files.Count -gt 0) {
     if ($PrStateFile) {
         try { $listRaw = [IO.File]::ReadAllText($PrStateFile, [Text.Encoding]::UTF8) } catch { $listErr = "state-file-unreadable $($_.Exception.Message)" }
     } else {
-        $gl = Exec 'gh' @('pr', 'list', '--repo', $Repo, '--state', 'all', '--limit', '5000', '--json', 'number,state') $GhTimeoutSec
+        $gl = Exec $GhExe @('pr', 'list', '--repo', $Repo, '--state', 'all', '--limit', '5000', '--json', 'number,state') $GhTimeoutSec
         if ($gl.ok) { $listRaw = $gl.out } else { $listErr = "gh-failed $($gl.err.Trim() -replace '\s+', ' ')" }
     }
     if (-not $listErr) {

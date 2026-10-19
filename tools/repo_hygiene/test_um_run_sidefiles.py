@@ -17,6 +17,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -1321,16 +1322,27 @@ class UmRunEndToEndTests(_Share):
         # The anchor is judged by TIME ALONE: a correct client sets claimedAt after the hook stamped
         # marker_placed_at and throws only once Now >= claimedAt + timeout_sec, so its verdict is
         # >= timeout_sec after the stamp whatever the scheduler does and however many polls it got
-        # (0.5 s of slack covers the millisecond truncation of the two stamps). The hour-back client
+        # (0.5 s of slack covers the clock-resolution difference between the PowerShell stamp and the
+        # Python reader; the stamps' own truncation is <= 2 ms). The hour-back client
         # decides on poll 2, about a second after the stamp. No poll-count bound is asserted: one
         # would reject a correct client whose polls were delayed (UMRUN-SIBLING-1122-VACUOUS-1 r3,
         # sol r2 BLOCKER); only the floor of two polls is, since the marker is removed on the second.
+        # The raw timing facts go to the log on the pass path too, so a scheduler-stalled false PASS
+        # (verdict >= 7.5 s after the stamp on a client that should decide in ~1 s) or a near-miss
+        # is visible in a hosted CI log (sol r3, Dot f936802c).
+        tick2_at = next((at for number, at in self.ticks() if number == 2), None)
+        timing_facts = (
+            f"decided_after={decided_after:.3f}s marker_placed_at={marker_placed_at:.3f} "
+            f"verdict_at={self.verdict_at():.3f} tick2_at="
+            + (f"{tick2_at:.3f}" if tick2_at is not None else "none")
+            + f" timeout_sec={timeout_sec}")
+        print(f"UMRUN-1122-TIMING {timing_facts}", file=sys.stderr)
         self.assertGreaterEqual(
             decided_after, timeout_sec - 0.5,
             "a stale agent-clock stamp observed at the queue deadline must not shrink the client's "
             f"own patience: it reached the liveness verdict {decided_after:.1f}s "
             f"after the marker was placed, before its own {timeout_sec}s budget (counted from "
-            "observing the marker) could elapse")
+            f"observing the marker) could elapse [{timing_facts}]")
         self.assertGreaterEqual(
             len(self.ticks()), 2,
             "the client never reached its second poll, the one on which the marker is removed")
