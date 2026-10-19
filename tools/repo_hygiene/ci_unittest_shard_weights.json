@@ -524,6 +524,7 @@
    "tools.repo_hygiene.test_vendored_native_payloads.VendoredNativePayloadTests": 38.9,
    "tools.repo_hygiene.test_venue_baseline.VenueBaselineTests": 0.0,
    "tools.repo_hygiene.test_venue_chain_runner.VenueChainRunnerTests": 0.0,
+   "tools.repo_hygiene.test_venue_chain_runner.VenueChainSupplementaryTests": 0.0,
    "tools.repo_hygiene.test_venue_claim_fifo.VenueClaimFifoTests": 0.0,
    "tools.repo_hygiene.test_verify_consented_footage.VerifyConsentedFootageTests": 0.0,
    "tools.repo_hygiene.test_workflow_pwsh_exit_guard.WorkflowPwshExitGuardTests": 0.0
@@ -1050,6 +1051,7 @@
    "tools.repo_hygiene.test_vendored_native_payloads.VendoredNativePayloadTests": 54.9,
    "tools.repo_hygiene.test_venue_baseline.VenueBaselineTests": 130.7,
    "tools.repo_hygiene.test_venue_chain_runner.VenueChainRunnerTests": 296.9,
+   "tools.repo_hygiene.test_venue_chain_runner.VenueChainSupplementaryTests": 296.9,
    "tools.repo_hygiene.test_venue_claim_fifo.VenueClaimFifoTests": 113.1,
    "tools.repo_hygiene.test_verify_consented_footage.VerifyConsentedFootageTests": 0.1,
    "tools.repo_hygiene.test_workflow_pwsh_exit_guard.WorkflowPwshExitGuardTests": 0.0

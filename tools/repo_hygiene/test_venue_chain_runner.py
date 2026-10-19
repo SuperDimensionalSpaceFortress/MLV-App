@@ -825,5 +825,397 @@ class VenueChainRunnerTests(unittest.TestCase):
             self.assertEqual(out, "0", f.name)
 
 
+# ---------------------------------------------------------------------------------------------------------------------------------------------------
+# VENUE-UM-SUPPLEMENTARY-WHEN-BACHELOR-HELD-1: a Bachelor chain also offers each leg on ultra-magnus as a SUPPLEMENTARY run. Offline like the class above: the
+# probe and the leg are fakes that record WHICH VENUE they were called for, ultra-magnus's agent share is a temp directory (its staged-build cache), and every
+# claim lives in a temp -ClaimDir. Nothing here reaches a venue.
+# ---------------------------------------------------------------------------------------------------------------------------------------------------
+FAKE_QUIET_V = r"""
+param([string]$Venue, [string]$WorkDir, [string]$GateLog, [double]$ThresholdPercent = 20, [int]$MaxWaitSec = 1800, [int]$RecheckSec = 90, [int]$MaxAdmissionWaitSec = 0)
+$runDir = Split-Path -Parent $WorkDir
+New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
+if ($env:FAKE_QUIET_LOG) { Add-Content -LiteralPath $env:FAKE_QUIET_LOG -Value ("{0} venue={1} maxWait={2} adm={3}" -f [DateTime]::UtcNow.Ticks, $Venue, $MaxWaitSec, $MaxAdmissionWaitSec) }
+if ($Venue -eq 'ultra-magnus') { $mode = $(if ($env:FAKE_UM_QUIET_MODE) { $env:FAKE_UM_QUIET_MODE } else { 'QUIET' }) }
+else {
+    $countFile = Join-Path $runDir 'fake-quiet-count.txt'
+    $n = $(if (Test-Path -LiteralPath $countFile) { [int](Get-Content -LiteralPath $countFile) } else { 0 })
+    Set-Content -LiteralPath $countFile -Value ($n + 1)
+    $modes = @(([string]$env:FAKE_QUIET_MODES) -split ',' | Where-Object { $_ })
+    if ($modes.Count -eq 0) { $modes = @('QUIET') }
+    $mode = $modes[[Math]::Min($n, $modes.Count - 1)]
+    if ($MaxWaitSec -gt 0 -and $env:FAKE_QUIET_SLEEP_PRE) { Start-Sleep -Milliseconds ([int]([double]$env:FAKE_QUIET_SLEEP_PRE * 1000)) }
+}
+switch ($mode) {
+    'QUIET' { "QUIET mean=5.0% threshold=$ThresholdPercent% waitedSec=1"; exit 0 }
+    'BUSY' { 'GATE_BUSY quiet-probe waitedSec=1'; exit 3 }
+    'UNKNOWN' { "VENUE_QUIET_UNKNOWN mean=UNKNOWN threshold=$ThresholdPercent% waitedSec=1 reason=probe-failed note=fake"; exit 6 }
+}
+"""
+
+FAKE_LEG_V = r"""
+param([string]$Venue, [string]$LegSpec, [string]$SourceCommit, [string]$BuildManifestSha256, [string]$Backend = '', [string]$SheetCopyDir = '')
+$leaf = Split-Path -Leaf $LegSpec
+Add-Content -LiteralPath $env:FAKE_LEG_LOG -Value ("START {0} {1} {2} {3}" -f [DateTime]::UtcNow.Ticks, $leaf, $Venue, $BuildManifestSha256.Substring(0, 8))
+if ($Venue -eq 'ultra-magnus' -and $env:FAKE_UM_LEG_SLEEP) { Start-Sleep -Milliseconds ([int]([double]$env:FAKE_UM_LEG_SLEEP * 1000)) }
+$rdir = Join-Path $env:FAKE_LEG_ROOT ('receipts\CARD-1\' + [IO.Path]::GetFileNameWithoutExtension($leaf) + '\' + $Venue)
+New-Item -ItemType Directory -Force -Path $rdir | Out-Null
+$rp = Join-Path $rdir ([guid]::NewGuid().ToString() + '.json')
+Set-Content -LiteralPath $rp -Value ('{"venue":{"role":"' + $(if ($Venue -eq 'ultra-magnus') { 'supplementary' } else { 'acceptance' }) + '"}}')
+if ($Venue -eq 'ultra-magnus' -and $env:FAKE_UM_LEG_MODE -eq 'crash') { 'DVE_OUTCOME=PASS'; exit 5 }
+if ($Venue -eq 'ultra-magnus' -and $env:FAKE_UM_LEG_MODE -eq 'fail') { 'DVE_OUTCOME=FAIL'; "DVE_RECEIPT_PATH=$rp"; exit 0 }
+'DVE_OUTCOME=PASS'
+"DVE_RECEIPT_PATH=$rp"
+exit 0
+"""
+
+
+@requires_windows_pwsh
+class VenueChainSupplementaryTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.tmp = Path(tempfile.mkdtemp(prefix="venue-supp-"))
+        cls.fake_quiet = cls.tmp / "fake-quiet-v.ps1"
+        cls.fake_quiet.write_text(FAKE_QUIET_V, encoding="utf-8")
+        cls.fake_leg = cls.tmp / "fake-leg-v.ps1"
+        cls.fake_leg.write_text(FAKE_LEG_V, encoding="utf-8")
+        cls.specs = []        # carry criteria.supplementary for cpu: offered on ultra-magnus
+        for name in ("sp-a", "sp-b"):
+            p = cls.tmp / f"{name}.json"
+            p.write_text(json.dumps({"legId": name, "backends": ["cpu"], "criteria": {"acceptance": {"cpu": []}, "supplementary": {"cpu": []}}}), encoding="utf-8")
+            cls.specs.append(p)
+        cls.bare = cls.tmp / "bare.json"   # no supplementary block
+        cls.bare.write_text(json.dumps({"legId": "bare", "backends": ["cpu"], "criteria": {"acceptance": {"cpu": []}}}), encoding="utf-8")
+        cls.staged_text = '{"fixture":"staged-on-ultra-magnus"}'
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def setUp(self) -> None:
+        import hashlib
+        self.case = Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp))
+        self.claims = self.case / "claims"
+        self.quiet_log = self.case / "quiet-calls.log"
+        self.leg_log = self.case / "leg-calls.log"
+        self.um_share = self.case / "um-share"          # STAGED: the cache holds the build manifest for SHA
+        (self.um_share / "cache").mkdir(parents=True)
+        staged = self.um_share / "cache" / f"playback-attr-3-cuda-{SHA[:12]}-build.json"
+        staged.write_text(self.staged_text, encoding="utf-8")
+        self.staged_sha = hashlib.sha256(staged.read_bytes()).hexdigest()
+        self.empty_share = self.case / "um-share-empty"  # NOT staged
+        (self.empty_share / "cache").mkdir(parents=True)
+
+    # ---------------------------------------------------------------- helpers
+    def env(self, **extra: str) -> dict:
+        e = dict(os.environ)
+        e.update({"FAKE_QUIET_LOG": str(self.quiet_log), "FAKE_LEG_LOG": str(self.leg_log), "FAKE_LEG_ROOT": str(self.case)})
+        e.update(extra)
+        return e
+
+    def chain_args(self, run_dir: Path, specs: list[Path], *extra: str, runner: Path = RUNNER, share: Path | None = None, venue: str = "bachelor", deadline_sec: int = 180) -> list[str]:
+        return [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(runner), "-Venue", venue,
+                "-LegSpec", ",".join(str(s) for s in specs), "-RunDir", str(run_dir), "-SourceCommit", SHA, "-BuildManifestSha256", MANIFEST,
+                "-ClaimDir", str(self.claims), "-QuietScript", str(self.fake_quiet), "-LegScript", str(self.fake_leg),
+                "-CooldownSec", "0", "-ClaimPollSec", "1", "-SupplementaryAgentShare", str(share or self.um_share),
+                "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=deadline_sec)), *extra]
+
+    def run_chain(self, run_dir: Path, specs: list[Path], *extra: str, env: dict | None = None, runner: Path = RUNNER, share: Path | None = None, venue: str = "bachelor") -> subprocess.CompletedProcess:
+        return subprocess.run(self.chain_args(run_dir, specs, *extra, runner=runner, share=share, venue=venue), capture_output=True, text=True, timeout=300, env=env or self.env())
+
+    def starts(self) -> list[tuple[str, str, str]]:
+        """(leaf, venue, manifest8) per START, in order."""
+        if not self.leg_log.exists():
+            return []
+        return [(p[2], p[3], p[4]) for p in (l.split() for l in self.leg_log.read_text(encoding="utf-8").splitlines()) if p[0] == "START"]
+
+    def quiet_calls(self) -> list[str]:
+        return self.quiet_log.read_text(encoding="utf-8").splitlines() if self.quiet_log.exists() else []
+
+    def chain_log(self, run_dir: Path) -> list[str]:
+        return (run_dir / "chain.log").read_text(encoding="utf-8").splitlines()
+
+    def write_um_claim(self) -> str:
+        self.claims.mkdir(parents=True, exist_ok=True)
+        text = json.dumps({"schema": "mlv-app/venue-claim/v1", "venue": "ultra-magnus", "ownerPid": os.getpid(), "ownerCreatedUtc": process_start_iso(os.getpid()),
+                           "host": os.environ.get("COMPUTERNAME", ""), "runDir": "C:\\elsewhere\\lane-UM-OWNER", "purpose": "fixture",
+                           "claimedUtc": utc_iso(datetime.now(timezone.utc)), "expiresUtc": utc_iso(datetime.now(timezone.utc) + timedelta(hours=3)), "nonce": "um-fixture-nonce"})
+        (self.claims / "ultra-magnus.claim.json").write_text(text, encoding="utf-8")
+        return text
+
+    def mutated_runner(self, old: str, new: str, count: int) -> Path:
+        d = Path(tempfile.mkdtemp(prefix="mut-", dir=self.case))
+        text = RUNNER.read_text(encoding="utf-8")
+        self.assertEqual(text.count(old), count, f"mutation anchor count changed: {old!r}")
+        (d / RUNNER.name).write_text(text.replace(old, new), encoding="utf-8")
+        shutil.copy2(MODULE, d / MODULE.name)
+        return d / RUNNER.name
+
+    # ---------------------------------------------------------------- (a) after each Bachelor leg, when ultra-magnus is idle
+    def test_idle_ultra_magnus_runs_each_leg_as_supplementary_after_the_bachelor_leg(self) -> None:
+        rd = self.case / "lane-IDLE"
+        r = self.run_chain(rd, self.specs)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        # Bachelor first, then the same leg on ultra-magnus, then the next Bachelor leg: the offer rides between legs
+        self.assertEqual([(l, v) for l, v, _ in self.starts()], [("sp-a.json", "bachelor"), ("sp-a.json", "ultra-magnus"), ("sp-b.json", "bachelor"), ("sp-b.json", "ultra-magnus")])
+        # the ultra-magnus run is handed ITS OWN staged manifest hash, never the Bachelor one
+        um = [m for _, v, m in self.starts() if v == "ultra-magnus"]
+        self.assertEqual(set(um), {self.staged_sha[:8]})
+        self.assertNotEqual(self.staged_sha, MANIFEST)
+        log = self.chain_log(rd)
+        runs = [l for l in log if " SUPPLEMENTARY_RUN " in l]
+        done = [l for l in log if " SUPPLEMENTARY_RAN " in l]
+        self.assertEqual((len(runs), len(done)), (2, 2), log)
+        for l in runs + done:
+            self.assertIn("venue=ultra-magnus role=supplementary", l)
+        self.assertIn("trigger=after-leg", runs[0])
+        res = chain_result(r.stdout)
+        # the result separates the two: Bachelor legs unchanged, the ultra-magnus runs only under `supplementary`
+        self.assertEqual([l["status"] for l in res["legs"]], ["RAN", "RAN"])
+        self.assertEqual((res["ran"], res["failed"], res["notRun"], res["exitCode"]), (2, 0, 0, 0))
+        sup = res["supplementary"]
+        self.assertEqual([(s["status"], s["venue"], s["role"], s["trigger"], s["outcome"], s["receiptRole"]) for s in sup], [("RAN", "ultra-magnus", "supplementary", "after-leg", "PASS", "supplementary")] * 2)
+        self.assertTrue(all(s["receipt"] and Path(s["receipt"]).exists() for s in sup), "a supplementary run writes its own receipt")
+        self.assertFalse(any("ultra-magnus" in l["receipt"] for l in res["legs"]), "no Bachelor leg may point at an ultra-magnus receipt")
+        # the UM probe is one probe that never waits for admission long; the UM claim is gone afterwards
+        um_probes = [c for c in self.quiet_calls() if "venue=ultra-magnus" in c]
+        self.assertEqual(len(um_probes), 2)
+        self.assertTrue(all("maxWait=0" in c and "adm=120" in c for c in um_probes), um_probes)
+        self.assertFalse((self.claims / "ultra-magnus.claim.json").exists(), "the ultra-magnus claim was left behind")
+        self.assertFalse((self.claims / "bachelor.claim.json").exists())
+
+    # ---------------------------------------------------------------- (a) busy ultra-magnus: skip, Bachelor unaffected
+    def test_busy_ultra_magnus_is_a_typed_skip_and_bachelor_is_unaffected(self) -> None:
+        fixture = self.write_um_claim()
+        rd = self.case / "lane-BUSY"
+        r = self.run_chain(rd, self.specs)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual([(l, v) for l, v, _ in self.starts()], [("sp-a.json", "bachelor"), ("sp-b.json", "bachelor")])
+        res = chain_result(r.stdout)
+        self.assertEqual([l["status"] for l in res["legs"]], ["RAN", "RAN"])
+        self.assertEqual((res["ran"], res["exitCode"], res["stopReason"]), (2, 0, None))
+        self.assertEqual([(s["status"], s["reason"]) for s in res["supplementary"]], [("SKIPPED", "UM_BUSY")] * 2)
+        log = self.chain_log(rd)
+        skip = [l for l in log if " SUPPLEMENTARY_SKIPPED " in l]
+        self.assertEqual(len(skip), 2, log)
+        self.assertRegex(skip[0], r"SUPPLEMENTARY_SKIPPED leg=01-sp-a-spec trigger=after-leg reason=UM_BUSY venue=ultra-magnus role=supplementary detail=holder pid=")
+        self.assertEqual([c for c in self.quiet_calls() if "venue=ultra-magnus" in c], [], "a busy ultra-magnus is not even probed")
+        self.assertEqual((self.claims / "ultra-magnus.claim.json").read_text(encoding="utf-8"), fixture, "another chain's live ultra-magnus claim was touched")
+
+    def test_an_ultra_magnus_that_is_not_quiet_is_skipped_and_its_claim_released(self) -> None:
+        for mode, reason_part in (("BUSY", "verdict=GATE_BUSY"), ("UNKNOWN", "verdict=VENUE_QUIET_UNKNOWN")):
+            with self.subTest(mode=mode):
+                self.leg_log.unlink(missing_ok=True)
+                rd = self.case / f"lane-NQ-{mode}"
+                r = self.run_chain(rd, self.specs[:1], env=self.env(FAKE_UM_QUIET_MODE=mode))
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                self.assertEqual([v for _, v, _ in self.starts()], ["bachelor"])
+                s = chain_result(r.stdout)["supplementary"]
+                self.assertEqual((s[0]["status"], s[0]["reason"]), ("SKIPPED", "UM_NOT_QUIET"))
+                self.assertIn(reason_part, s[0]["detail"])
+                self.assertFalse((self.claims / "ultra-magnus.claim.json").exists())
+
+    # ---------------------------------------------------------------- (b) held more than -SupplementaryHeldSec
+    def test_a_leg_held_past_the_threshold_is_offered_on_ultra_magnus_before_bachelor_runs_it(self) -> None:
+        rd = self.case / "lane-HELD"
+        # the first Bachelor probe takes 3 s and is BUSY (a gate that did not clear): the leg has now waited longer than the 2 s threshold
+        r = self.run_chain(rd, self.specs[:1], "-SupplementaryHeldSec", "2", env=self.env(FAKE_QUIET_MODES="BUSY,QUIET,QUIET", FAKE_QUIET_SLEEP_PRE="3"))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        # ultra-magnus FIRST (the offer while Bachelor is held), Bachelor after; and the after-leg offer does not repeat it
+        self.assertEqual([(l, v) for l, v, _ in self.starts()], [("sp-a.json", "ultra-magnus"), ("sp-a.json", "bachelor")])
+        res = chain_result(r.stdout)
+        self.assertEqual([(s["status"], s["trigger"]) for s in res["supplementary"]], [("RAN", "held")])
+        self.assertEqual([l["status"] for l in res["legs"]], ["RAN"])
+        log = self.chain_log(rd)
+        order = [l.split(" ", 2)[1] for l in log if not l.startswith("CHAIN_RESULT=")]
+        self.assertLess(order.index("SUPPLEMENTARY_CLAIM_TAKEN"), order.index("CLAIM_TAKEN"), "the offer came before the Bachelor claim")
+
+    def test_a_leg_that_has_not_waited_long_is_offered_only_after_it_ran(self) -> None:
+        rd = self.case / "lane-NOTHELD"
+        r = self.run_chain(rd, self.specs[:1], env=self.env(FAKE_QUIET_MODES="BUSY,QUIET,QUIET", FAKE_QUIET_SLEEP_PRE="3"))   # default threshold 1800 s
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual([(l, v) for l, v, _ in self.starts()], [("sp-a.json", "bachelor"), ("sp-a.json", "ultra-magnus")])
+        self.assertEqual([s["trigger"] for s in chain_result(r.stdout)["supplementary"]], ["after-leg"])
+
+    def test_held_offer_in_the_claim_line_does_not_lose_the_bachelor_place(self) -> None:
+        # another chain holds the BACHELOR claim for ~6 s: our leg waits in the claim line past the 2 s threshold, runs on ultra-magnus meanwhile, then runs on Bachelor
+        self.claims.mkdir(parents=True, exist_ok=True)
+        bclaim = self.claims / "bachelor.claim.json"
+        bclaim.write_text(json.dumps({"schema": "mlv-app/venue-claim/v1", "venue": "bachelor", "ownerPid": os.getpid(), "ownerCreatedUtc": process_start_iso(os.getpid()), "host": "",
+                                      "runDir": "C:\\elsewhere\\lane-OTHER", "purpose": "fixture", "claimedUtc": utc_iso(datetime.now(timezone.utc)),
+                                      "expiresUtc": utc_iso(datetime.now(timezone.utc) + timedelta(hours=3)), "nonce": "b-fixture"}), encoding="utf-8")
+        rd = self.case / "lane-LINE"
+        p = subprocess.Popen(self.chain_args(rd, self.specs[:1], "-SupplementaryHeldSec", "2"), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=self.env())
+        t0 = time.time()
+        while time.time() - t0 < 90 and not any(" SUPPLEMENTARY_RAN " in l for l in (self.chain_log(rd) if (rd / "chain.log").exists() else [])):
+            time.sleep(0.25)
+        bclaim.unlink()
+        out, _ = p.communicate(timeout=180)
+        self.assertEqual(p.returncode, 0, out)
+        self.assertEqual([(l, v) for l, v, _ in self.starts()], [("sp-a.json", "ultra-magnus"), ("sp-a.json", "bachelor")])
+        res = chain_result(out)
+        self.assertEqual([l["status"] for l in res["legs"]], ["RAN"])
+        self.assertEqual([(s["status"], s["trigger"]) for s in res["supplementary"]], [("RAN", "held")])
+        self.assertFalse([l for l in self.chain_log(rd) if "TICKET_STALE_REMOVED" in l], "the supplementary run cost the chain its place in the line")
+
+    # ---------------------------------------------------------------- (e) the opt-out
+    def test_no_supplementary_switch_runs_nothing_on_ultra_magnus(self) -> None:
+        rd = self.case / "lane-OPTOUT"
+        r = self.run_chain(rd, self.specs, "-NoSupplementary", "-SupplementaryHeldSec", "0")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual([v for _, v, _ in self.starts()], ["bachelor", "bachelor"])
+        self.assertEqual([c for c in self.quiet_calls() if "venue=ultra-magnus" in c], [])
+        log = self.chain_log(rd)
+        self.assertFalse([l for l in log if "SUPPLEMENTARY_" in l], log)   # every supplementary log token is upper-case with an underscore; CHAIN_START's own fields are lower-case
+        self.assertIn("supplementary=False", log[0])
+        self.assertEqual(chain_result(r.stdout)["supplementary"], [])
+        self.assertFalse((self.claims / "ultra-magnus.claim.json").exists())
+
+    def test_default_is_on(self) -> None:
+        rd = self.case / "lane-DEFAULT"
+        r = self.run_chain(rd, self.specs[:1])
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("supplementary=True", self.chain_log(rd)[0])
+        self.assertEqual([v for _, v, _ in self.starts()], ["bachelor", "ultra-magnus"])
+
+    def test_an_ultra_magnus_chain_never_offers_a_supplementary_leg(self) -> None:
+        rd = self.case / "lane-UMCHAIN"
+        r = self.run_chain(rd, self.specs[:1], venue="ultra-magnus")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual([v for _, v, _ in self.starts()], ["ultra-magnus"])
+        self.assertIn("supplementary=False", self.chain_log(rd)[0])
+        self.assertEqual(chain_result(r.stdout)["supplementary"], [])
+
+    # ---------------------------------------------------------------- (c)/(d) a failing supplementary leg never touches the chain's result
+    def test_a_crashing_supplementary_leg_leaves_the_bachelor_verdict_and_exit_code_alone(self) -> None:
+        rd = self.case / "lane-CRASH"
+        r = self.run_chain(rd, self.specs, env=self.env(FAKE_UM_LEG_MODE="crash"))
+        self.assertEqual(r.returncode, 0, "a supplementary crash must not move the chain exit code: " + r.stdout + r.stderr)
+        res = chain_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"], res["ran"], res["failed"], res["notRun"]), (0, None, 2, 0, 0))
+        self.assertEqual([(l["status"], l["outcome"]) for l in res["legs"]], [("RAN", "PASS"), ("RAN", "PASS")])
+        self.assertEqual([(s["status"], s["outcome"], s["printedOutcome"], s["legExit"]) for s in res["supplementary"]], [("FAILED", "INVALID", "PASS", 5)] * 2)
+        log = self.chain_log(rd)
+        self.assertEqual(len([l for l in log if " SUPPLEMENTARY_FAILED venue=ultra-magnus role=supplementary" in l]), 2)
+        self.assertFalse([l for l in log if " LEG_FAILED " in l], "a supplementary failure must never read as a Bachelor LEG_FAILED")
+        self.assertEqual([v for _, v, _ in self.starts()], ["bachelor", "ultra-magnus", "bachelor", "ultra-magnus"], "the chain went on to its next Bachelor leg")
+
+    def test_a_supplementary_fail_outcome_never_becomes_a_bachelor_outcome(self) -> None:
+        r = self.run_chain(self.case / "lane-UMFAIL", self.specs[:1], env=self.env(FAKE_UM_LEG_MODE="fail"))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        res = chain_result(r.stdout)
+        self.assertEqual([(l["status"], l["outcome"]) for l in res["legs"]], [("RAN", "PASS")])
+        self.assertEqual([(s["status"], s["outcome"]) for s in res["supplementary"]], [("RAN", "FAIL")])
+        self.assertEqual(res["exitCode"], 0)
+
+    def test_a_bachelor_failure_keeps_its_own_exit_code_whatever_ultra_magnus_does(self) -> None:
+        # Bachelor probe UNKNOWN stops the chain with exit 6; no supplementary run follows a leg that never ran, and the exit code is Bachelor's
+        rd = self.case / "lane-BU"
+        r = self.run_chain(rd, self.specs, env=self.env(FAKE_QUIET_MODES="UNKNOWN", FAKE_UM_QUIET_MODE="QUIET"))
+        self.assertEqual(r.returncode, 6, r.stdout + r.stderr)
+        self.assertEqual(self.starts(), [])
+        self.assertEqual(chain_result(r.stdout)["supplementary"], [])
+
+    # ---------------------------------------------------------------- (f) build not staged on ultra-magnus: typed skip, nothing staged or built
+    def test_build_not_staged_on_ultra_magnus_is_a_typed_skip(self) -> None:
+        rd = self.case / "lane-NOSTAGE"
+        r = self.run_chain(rd, self.specs, share=self.empty_share)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual([v for _, v, _ in self.starts()], ["bachelor", "bachelor"])
+        log = self.chain_log(rd)
+        skip = [l for l in log if " SUPPLEMENTARY_SKIPPED " in l]
+        self.assertEqual(len(skip), 2, log)
+        self.assertRegex(skip[0], r"SUPPLEMENTARY_SKIPPED leg=01-sp-a-spec trigger=after-leg reason=BUILD_NOT_STAGED venue=ultra-magnus role=supplementary detail=no staged build manifest for aaaaaaaaaaaa at ")
+        self.assertEqual([s["reason"] for s in chain_result(r.stdout)["supplementary"]], ["BUILD_NOT_STAGED"] * 2)
+        self.assertEqual([c for c in self.quiet_calls() if "venue=ultra-magnus" in c], [], "nothing is probed or claimed on a venue the build is not staged on")
+        self.assertFalse((self.claims / "ultra-magnus.claim.json").exists())
+        self.assertEqual(list((self.empty_share).rglob("*")), [self.empty_share / "cache"], "the chain staged something on the venue share")
+
+    def test_a_spec_without_a_supplementary_block_is_skipped_once_and_never_touches_ultra_magnus(self) -> None:
+        rd = self.case / "lane-NOCRIT"
+        r = self.run_chain(rd, [self.bare], "-SupplementaryHeldSec", "0")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual([v for _, v, _ in self.starts()], ["bachelor"])
+        skip = [l for l in self.chain_log(rd) if " SUPPLEMENTARY_SKIPPED " in l]
+        self.assertEqual(len(skip), 1, "a permanent skip is logged once, not at every checkpoint")
+        self.assertIn("reason=NO_SUPPLEMENTARY_CRITERIA", skip[0])
+        self.assertEqual([c for c in self.quiet_calls() if "venue=ultra-magnus" in c], [])
+
+    # ---------------------------------------------------------------- module helpers
+    def test_spec_skip_reasons(self) -> None:
+        both = self.case / "both.json"
+        both.write_text(json.dumps({"legId": "x", "backends": ["cuda", "cpu"], "criteria": {"acceptance": {"cuda": [], "cpu": []}, "supplementary": {"cpu": []}}}), encoding="utf-8")
+        junk = self.case / "junk.json"
+        junk.write_text("{not json", encoding="utf-8")
+        def skip(path: Path, backend: str) -> str:
+            return pwsh_text(f"Import-Module '{MODULE}' -Force -DisableNameChecking; $r = Get-VenueSupplementarySpecSkip -SpecPath '{path}' -Backend '{backend}'; if ($null -eq $r) {{ 'NONE' }} else {{ $r }}")
+        self.assertEqual(skip(both, "cpu"), "NONE")                                  # an EMPTY list is still a block: the leg is informational there
+        self.assertEqual(skip(both, "cuda"), "NO_SUPPLEMENTARY_CRITERIA")
+        self.assertEqual(skip(both, ""), "NO_SUPPLEMENTARY_CRITERIA")                # '' means the spec's first backend (cuda), as Invoke-VenueLeg does
+        self.assertEqual(skip(both, "gpu"), "BACKEND_NOT_IN_SPEC")
+        self.assertEqual(skip(junk, "cpu"), "SPEC_UNREADABLE")
+        self.assertEqual(skip(self.bare, "cpu"), "NO_SUPPLEMENTARY_CRITERIA")
+        real = DV / "legs" / "m16-1243-look.json"
+        spec = json.loads(real.read_text(encoding="utf-8"))
+        for b in spec["backends"]:
+            want = "NONE" if b in spec["criteria"].get("supplementary", {}) else "NO_SUPPLEMENTARY_CRITERIA"
+            self.assertEqual(skip(real, b), want, b)
+
+    def test_bounded_process_kills_a_child_past_its_timeout(self) -> None:
+        t0 = time.time()
+        out = pwsh_text(f"Import-Module '{MODULE}' -Force -DisableNameChecking; $r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Start-Sleep 60') -TimeoutSec 2; \"$($r.timedOut) [$($r.exit)]\"")
+        self.assertEqual(out, "True []")
+        self.assertLess(time.time() - t0, 45)
+        ok = pwsh_text(f"Import-Module '{MODULE}' -Force -DisableNameChecking; $r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Write-Output hi; exit 3') -TimeoutSec 60; \"$($r.timedOut) $($r.exit) $($r.stdout.Trim())\"")
+        self.assertEqual(ok, "False 3 hi")
+
+    def test_staged_manifest_states(self) -> None:
+        q = f"Import-Module '{MODULE}' -Force -DisableNameChecking; $r = Get-VenueStagedBuildManifest -AgentShare '{{}}' -SourceCommit '{SHA}' -TimeoutSec 20; \"$($r.state) $($r.sha256)\""
+        self.assertEqual(pwsh_text(q.format(self.um_share)), f"STAGED {self.staged_sha}")
+        self.assertEqual(pwsh_text(q.format(self.empty_share)), "NOT_STAGED")   # pwsh_text strips the trailing space of an empty sha
+
+    def test_idle_check_reads_the_claim_and_the_line_only(self) -> None:
+        q = f"Import-Module '{MODULE}' -Force -DisableNameChecking; $r = Get-VenueSupplementaryIdle -Venue ultra-magnus -ClaimDir '{self.claims}'; \"$($r.idle) $($r.claimState) $($r.liveTickets)\""
+        self.assertEqual(pwsh_text(q), "True FREE 0")
+        self.write_um_claim()
+        self.assertEqual(pwsh_text(q), "False LIVE 0")
+
+    # ---------------------------------------------------------------- mutations: the guards are what the scenarios rely on
+    def test_mutation_opt_out_ignored_runs_ultra_magnus_anyway(self) -> None:
+        mut = self.mutated_runner("-not $NoSupplementary", "$true", 1)
+        self.run_chain(self.case / "lane-MOPT", self.specs[:1], "-NoSupplementary", runner=mut)
+        self.assertIn("ultra-magnus", [v for _, v, _ in self.starts()], "the mutant should have run the supplementary leg despite -NoSupplementary")
+
+    def test_mutation_held_check_removed_leaves_only_the_after_leg_offer(self) -> None:
+        mut = self.mutated_runner("-ge $SupplementaryHeldSec) { Invoke-Supplementary $leg 'held' }", "-ge 999999) { Invoke-Supplementary $leg 'held' }", 2)
+        self.run_chain(self.case / "lane-MHELD", self.specs[:1], "-SupplementaryHeldSec", "2", runner=mut, env=self.env(FAKE_QUIET_MODES="BUSY,QUIET,QUIET", FAKE_QUIET_SLEEP_PRE="3"))
+        self.assertEqual([(l, v) for l, v, _ in self.starts()], [("sp-a.json", "bachelor"), ("sp-a.json", "ultra-magnus")], "without the held check the offer can only come after the leg")
+
+    def test_mutation_supplementary_failure_leaking_into_the_chain_exit_is_caught(self) -> None:
+        # a mutant that lets a supplementary crash set the chain exit code to 7 reproduces the defect test_a_crashing_supplementary_leg_... guards against
+        mut = self.mutated_runner("$sStatus = $(if ($sr.timedOut) { 'TIMEOUT' } elseif ($sr.exit -ne 0) { 'FAILED' } else { 'RAN' })",
+                                  "$sStatus = $(if ($sr.timedOut) { 'TIMEOUT' } elseif ($sr.exit -ne 0) { 'FAILED' } else { 'RAN' }); if ($sStatus -ceq 'FAILED') { $script:exitCode = 7 }", 1)
+        r = self.run_chain(self.case / "lane-MLEAK", self.specs[:1], runner=mut, env=self.env(FAKE_UM_LEG_MODE="crash"))
+        self.assertEqual(r.returncode, 7, "the mutant must reproduce the defect the real runner is tested against")
+
+    def test_mutation_supplementary_result_counted_as_a_bachelor_leg_is_caught(self) -> None:
+        # a mutant that files the supplementary run in the chain's own result list moves `ran` and `legs`: the idle test pins both
+        mut = self.mutated_runner("    $suppResults.Add([pscustomobject]$r)\n", "    $suppResults.Add([pscustomobject]$r); $results.Add([pscustomobject]$r)\n", 1)
+        r = self.run_chain(self.case / "lane-MCOUNT", self.specs[:1], runner=mut)
+        res = chain_result(r.stdout)
+        self.assertNotEqual([l["status"] for l in res["legs"]], ["RAN"], "the mutant must reproduce the defect: a supplementary entry inside legs")
+
+    # ---------------------------------------------------------------- the contract stays in the file
+    def test_runner_documents_the_supplementary_contract_and_stays_ascii(self) -> None:
+        text = RUNNER.read_text(encoding="utf-8")
+        header = "\n".join(l for l in text.splitlines() if l.startswith("#"))
+        for token in ("SUPPLEMENTARY LEGS (VENUE-UM-SUPPLEMENTARY-WHEN-BACHELOR-HELD-1", "-NoSupplementary", "SUPPLEMENTARY_SKIPPED leg=<n> trigger=<t> reason=<R>", "BUILD_NOT_STAGED", "never in `legs`"):
+            self.assertIn(token, header)
+        self.assertIn("[switch]$NoSupplementary", text)
+        self.assertIn("[ValidateRange(0, 86400)][int]$SupplementaryHeldSec = 1800", text)
+        self.assertTrue(all(b < 128 for b in MODULE.read_bytes()) and all(b < 128 for b in RUNNER.read_bytes()))
+        for needle in ("Get-CimInstance", "Win32_Process", "Get-Process -Name", "Get-WmiObject"):
+            self.assertNotIn(needle, text, f"{needle}: the idle check reads the claim and the line, never a process scan")
+
+
 if __name__ == "__main__":
     unittest.main()
