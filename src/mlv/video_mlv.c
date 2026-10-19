@@ -2696,6 +2696,8 @@ static void mlv_reset_processed8_prefetch_locked(mlvObject_t * video)
     video->processed8_prefetch_request_threads = 0;
     video->processed8_prefetch_request_scale = 0;
     mlv_reset_processed_frame_8bit_cache_locked(video);
+    /* Clearing request_pending can satisfy an idle waiter's predicate. */
+    pthread_cond_broadcast(&video->processed8_prefetch_cond);
 }
 
 void mlvInvalidateProcessed8PrefetchCache(mlvObject_t * video)
@@ -2786,7 +2788,9 @@ static void mlv_processed8_prefetch_note_request(mlvObject_t * video,
     video->processed8_prefetch_request_threads = threads;
     video->processed8_prefetch_request_scale = scaleFactor;
     video->processed8_prefetch_request_pending = 1;
-    pthread_cond_signal(&video->processed8_prefetch_cond);
+    /* Broadcast: the cond has several distinct-predicate waiters, and a signal
+     * absorbed by a test waiter would strand the worker with pending=1. */
+    pthread_cond_broadcast(&video->processed8_prefetch_cond);
     pthread_mutex_unlock(&video->processed8_prefetch_mutex);
 }
 
@@ -3064,6 +3068,7 @@ static void * mlv_processed8_prefetch_thread_main(void * opaque)
         if (prepare_failed)
         {
             video->processed8_prefetch_request_pending = 0;
+            pthread_cond_broadcast(&video->processed8_prefetch_cond);
             pthread_mutex_unlock(&video->processed8_prefetch_mutex);
             continue;
         }
@@ -9463,6 +9468,42 @@ int getMlvLastProcessed8PrefetchHit(void)
     return g_mlv_last_processed8_prefetch_hit;
 }
 
+/* Bounded wait on processed8_prefetch_cond against a MONOTONIC budget
+ * (mlv_stage_timing_now: QPC / CLOCK_MONOTONIC). The condvar keeps the default
+ * clock (it is shared with the worker's untimed wait), so each wait is a short
+ * slice with a fresh CLOCK_REALTIME abstime: a wall-clock step perturbs at most
+ * one slice, and a missed broadcast costs at most one slice. Caller holds the
+ * mutex and re-checks its predicate after every return. Returns 0 while budget
+ * remains (woken or slice elapsed), ETIMEDOUT once the budget is spent, or the
+ * clock_gettime failure as non-zero. */
+static int mlv_processed8_prefetch_wait_slice_locked(mlvObject_t * video,
+                                                     double deadline_s)
+{
+    const double remaining_s = deadline_s - mlv_stage_timing_now();
+    if (remaining_s <= 0.0)
+    {
+        return ETIMEDOUT;
+    }
+    const double slice_s = (remaining_s < 0.05) ? remaining_s : 0.05;
+    struct timespec abstime;
+    if (clock_gettime(CLOCK_REALTIME, &abstime) != 0)
+    {
+        return EINVAL;
+    }
+    const long slice_ns = (long)(slice_s * 1e9);
+    abstime.tv_nsec += slice_ns % 1000000000L;
+    abstime.tv_sec += (time_t)(slice_ns / 1000000000L);
+    if (abstime.tv_nsec >= 1000000000L)
+    {
+        ++abstime.tv_sec;
+        abstime.tv_nsec -= 1000000000L;
+    }
+    const int rc = pthread_cond_timedwait(&video->processed8_prefetch_cond,
+                                          &video->processed8_prefetch_mutex,
+                                          &abstime);
+    return (rc == ETIMEDOUT) ? 0 : rc;
+}
+
 int mlvWaitForProcessed8PrefetchIdleForTesting(mlvObject_t * video,
                                                uint32_t timeout_ms)
 {
@@ -9471,37 +9512,23 @@ int mlvWaitForProcessed8PrefetchIdleForTesting(mlvObject_t * video,
         return 1;
     }
 
-    struct timespec deadline;
-    if (clock_gettime(CLOCK_REALTIME, &deadline) != 0)
-    {
-        return 0;
-    }
-    deadline.tv_sec += (time_t)(timeout_ms / 1000u);
-    deadline.tv_nsec += (long)(timeout_ms % 1000u) * 1000000L;
-    if (deadline.tv_nsec >= 1000000000L)
-    {
-        ++deadline.tv_sec;
-        deadline.tv_nsec -= 1000000000L;
-    }
-
+    const double deadline_s = mlv_stage_timing_now() + (double)timeout_ms / 1000.0;
     pthread_mutex_lock(&video->processed8_prefetch_mutex);
     ++video->processed8_prefetch_test_idle_waiters;
     while (video->processed8_prefetch_worker_busy
            || video->processed8_prefetch_request_pending)
     {
-        const int wait_rc = pthread_cond_timedwait(&video->processed8_prefetch_cond,
-                                                   &video->processed8_prefetch_mutex,
-                                                   &deadline);
-        if (wait_rc == ETIMEDOUT)
+        if (mlv_processed8_prefetch_wait_slice_locked(video, deadline_s) != 0)
         {
-            --video->processed8_prefetch_test_idle_waiters;
-            pthread_mutex_unlock(&video->processed8_prefetch_mutex);
-            return 0;
+            break;
         }
     }
+    /* Re-check after the budget: the predicate decides, never the timeout alone. */
+    const int idle = !(video->processed8_prefetch_worker_busy
+                       || video->processed8_prefetch_request_pending);
     --video->processed8_prefetch_test_idle_waiters;
     pthread_mutex_unlock(&video->processed8_prefetch_mutex);
-    return 1;
+    return idle;
 }
 
 void mlvSetProcessed8PrefetchPrepareFailuresForTesting(mlvObject_t * video,
@@ -9539,33 +9566,19 @@ int mlvWaitForProcessed8PrefetchPausedBeforeStoreForTesting(mlvObject_t * video,
         return 0;
     }
 
-    struct timespec deadline;
-    if (clock_gettime(CLOCK_REALTIME, &deadline) != 0)
-    {
-        return 0;
-    }
-    deadline.tv_sec += (time_t)(timeout_ms / 1000u);
-    deadline.tv_nsec += (long)(timeout_ms % 1000u) * 1000000L;
-    if (deadline.tv_nsec >= 1000000000L)
-    {
-        ++deadline.tv_sec;
-        deadline.tv_nsec -= 1000000000L;
-    }
-
+    const double deadline_s = mlv_stage_timing_now() + (double)timeout_ms / 1000.0;
     pthread_mutex_lock(&video->processed8_prefetch_mutex);
     while (!video->processed8_prefetch_test_paused_before_store)
     {
-        const int wait_rc = pthread_cond_timedwait(&video->processed8_prefetch_cond,
-                                                   &video->processed8_prefetch_mutex,
-                                                   &deadline);
-        if (wait_rc == ETIMEDOUT)
+        if (mlv_processed8_prefetch_wait_slice_locked(video, deadline_s) != 0)
         {
-            pthread_mutex_unlock(&video->processed8_prefetch_mutex);
-            return 0;
+            break;
         }
     }
+    /* Re-check after the budget: the predicate decides, never the timeout alone. */
+    const int paused = video->processed8_prefetch_test_paused_before_store ? 1 : 0;
     pthread_mutex_unlock(&video->processed8_prefetch_mutex);
-    return 1;
+    return paused;
 }
 
 int getMlvProcessed8PrefetchEnabledForTesting(const mlvObject_t * video)
