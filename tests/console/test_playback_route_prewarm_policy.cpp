@@ -1064,6 +1064,22 @@ TEST(PlaybackWarmReconDeterminismWiring, TheWarmCapturesItsInputOnlyWhenTheReuse
 TEST(PlaybackWarmReconDeterminismWiring, NoWarmEntryReadsTheClipAfterItsLifetimeGuardIsReleased)
 {
     const QString thread = sourceFile("platform/qt/RenderFrameThread.cpp");
+    // the completion stamp is taken only for a slot (Debayered16ReconReusePolicy.h), never read unconditionally
+    const QString done = codeLinesOnly(bodyBetween(thread, QStringLiteral("void RenderFrameThread::signalReconDoneFromWorker( int slotIndex )"),
+                                                   QStringLiteral("int RenderFrameThread::waitForDecodedSlotLocked( void )")));
+    ASSERT_FALSE(done.isEmpty());
+    ASSERT_FALSE(done.contains(QStringLiteral("const Debayered16ReconDoneStamp reconDone = debayered16ReconDoneStamp( m_pMlvObject );")));
+    ASSERT_TRUE(done.contains(QStringLiteral("debayered16ReconDoneStampForEntry(")));
+    ASSERT_TRUE(done.contains(QStringLiteral("slotIndex, [this]() { return debayered16ReconDoneStamp( m_pMlvObject ); } );")));
+    ASSERT_EQ(1, (int)done.count(QStringLiteral("m_pMlvObject")));
+    // a warm entry is queued without a slot, and the worker signals its completion with that slot
+    ASSERT_TRUE(thread.contains(QStringLiteral("    entry.slotIndex = -1;\n    entry.request.frameNumber = frameNumber;\n    entry.warm = true;")));
+    const QString worker = sourceFile("platform/qt/ReconWorker.cpp");
+    const int recon = worker.indexOf(QStringLiteral("m_parent->reconFrameForWorker( entry, &m_workerState );"));
+    const int signal = worker.indexOf(QStringLiteral("m_parent->signalReconDoneFromWorker( entry.slotIndex );"));
+    ASSERT_TRUE(recon >= 0);
+    ASSERT_TRUE(signal > recon);
+    // the rest of the warm: nothing after the guard release reads the clip, and a dropped warm reads none of it
     const QString warm = codeLinesOnly(bodyBetween(thread, QStringLiteral("void RenderFrameThread::warmReconForWorker("),
                                                    QStringLiteral("void RenderFrameThread::reconFrameForWorker(")));
     ASSERT_FALSE(warm.isEmpty());
@@ -1072,19 +1088,4 @@ TEST(PlaybackWarmReconDeterminismWiring, NoWarmEntryReadsTheClipAfterItsLifetime
     ASSERT_EQ(-1, (int)warm.indexOf(QStringLiteral("m_pMlvObject"), released));
     ASSERT_TRUE(warm.contains(QStringLiteral(
         "done.blackLevel = ( m_pMlvObject && !entry.warmRealRequestPending ) ? getMlvBlackLevel( m_pMlvObject ) : 0;")));
-    // a warm entry is queued without a slot, and the worker signals its completion with that slot
-    ASSERT_TRUE(thread.contains(QStringLiteral("    entry.slotIndex = -1;\n    entry.request.frameNumber = frameNumber;\n    entry.warm = true;")));
-    const QString worker = sourceFile("platform/qt/ReconWorker.cpp");
-    const int recon = worker.indexOf(QStringLiteral("m_parent->reconFrameForWorker( entry, &m_workerState );"));
-    const int signal = worker.indexOf(QStringLiteral("m_parent->signalReconDoneFromWorker( entry.slotIndex );"));
-    ASSERT_TRUE(recon >= 0);
-    ASSERT_TRUE(signal > recon);
-    // the completion stamp is taken only for a slot (Debayered16ReconReusePolicy.h), never read unconditionally
-    const QString done = codeLinesOnly(bodyBetween(thread, QStringLiteral("void RenderFrameThread::signalReconDoneFromWorker( int slotIndex )"),
-                                                   QStringLiteral("int RenderFrameThread::waitForDecodedSlotLocked( void )")));
-    ASSERT_FALSE(done.isEmpty());
-    ASSERT_TRUE(done.contains(QStringLiteral("debayered16ReconDoneStampForEntry(")));
-    ASSERT_TRUE(done.contains(QStringLiteral("slotIndex, [this]() { return debayered16ReconDoneStamp( m_pMlvObject ); } );")));
-    ASSERT_FALSE(done.contains(QStringLiteral("const Debayered16ReconDoneStamp reconDone = debayered16ReconDoneStamp( m_pMlvObject );")));
-    ASSERT_EQ(1, (int)done.count(QStringLiteral("m_pMlvObject")));
 }
