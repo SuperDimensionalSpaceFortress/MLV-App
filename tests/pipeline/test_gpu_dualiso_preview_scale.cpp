@@ -46,6 +46,7 @@
 #include "../../src/processing/playback_downsample.h"
 #include "../../platform/qt/PlaybackScaling.h"
 #include "../../platform/qt/PlaybackReconWarmRun.h"
+#include "../../platform/qt/PlaybackWarmOutputReusePolicy.h"
 
 #include <QDir>
 #include <QTemporaryDir>
@@ -2942,4 +2943,208 @@ TEST(GpuPlaybackReconWarmRun, TheUncachedDecodeEqualsAPrefetchRingHit)
     ASSERT_TRUE(source == MLV_RAW_UINT16_SOURCE_HIT || source == MLV_RAW_UINT16_SOURCE_INFLIGHT_WAIT_HIT);
     ASSERT_TRUE(uncached == cached);
     mlvCancelPreviewPrefetch(video);
+}
+
+// WARM-RUN-CHROMA-SMOOTH-PARITY-1: at the venue the paused warm ran 15-17 s BEFORE Look Assist auto-applied chroma
+// smooth 2x2 (MainWindow: setToolButtonChromaSmooth( 1 ) -> toolButtonChromaSmoothChanged -> llrpSetChromaSmoothMode),
+// so the warm's key held cs=0 and Play frame 0's cs=1: warm_output_reuse=skip reuse_reason=state_mismatch
+// state_diff=chroma_smooth_method on every leg. The fake backend dumps what each run handed it (scalars.txt carries
+// chroma_smooth_method); the reuse key is built exactly as the staged slot's and the present's are, equal in every
+// non-state field, so preGate decides on the prepared state alone.
+namespace {
+
+// The warm (PlaybackReconWarmRun.h) of frame on the recon worker state, dumped into dir; its retained words are copied
+// out (the fake's retain hands out one shared pointer) and its token released.
+playback_recon_warm_run::Outcome warmDumpedInto(MlvPipelineFixture & fixture, uint32_t frame,
+                                                llrawprocWorkerState_t * worker, const std::string & dir,
+                                                std::vector<uint16_t> * words)
+{
+    std::vector<uint16_t> raw;
+    std::vector<uint16_t> reduced;
+    QDir().mkpath(QString::fromStdString(dir));
+    GPU_DUALISO_TEST_SETENV("MLVAPP_FAKE_GPU_RECON_DUMP_DIR", dir.c_str());
+    const playback_recon_warm_run::Outcome warm = playback_recon_warm_run::run(
+        fixture.video(), frame, 1, fixture.width(), fixture.height(), worker, 1, raw, reduced);
+    GPU_DUALISO_TEST_UNSETENV("MLVAPP_FAKE_GPU_RECON_DUMP_DIR");
+    words->clear();
+    if (warm.ran)
+    {
+        words->assign(warm.retained.device_bayer16,
+                      warm.retained.device_bayer16 + static_cast<size_t>(warm.width) * static_cast<size_t>(warm.height));
+        llrpGpuPlaybackReconReleaseRetainedDeviceBayer16(warm.retained.token);
+    }
+    return warm;
+}
+
+// Play frame 0 (playShapedX1Run) on the same worker state, dumped into dir; its prepared state stamped with the frame
+// as RenderFrameThread stamps Play's, its words copied out and its token released. valid=false when it did not run.
+playback_warm_output_reuse::PreparedState playDumpedInto(MlvPipelineFixture & fixture, uint32_t frame,
+                                                         llrawprocWorkerState_t * worker, const std::string & dir,
+                                                         std::vector<uint16_t> * words)
+{
+    QDir().mkpath(QString::fromStdString(dir));
+    GPU_DUALISO_TEST_SETENV("MLVAPP_FAKE_GPU_RECON_DUMP_DIR", dir.c_str());
+    const llrpGpuPlaybackRetainedDeviceBayer16_t play = playShapedX1Run(fixture, frame, worker);
+    GPU_DUALISO_TEST_UNSETENV("MLVAPP_FAKE_GPU_RECON_DUMP_DIR");
+    words->clear();
+    playback_warm_output_reuse::PreparedState state;
+    if (!play.valid || !play.device_bayer16) return state;
+    words->assign(play.device_bayer16, play.device_bayer16 + static_cast<size_t>(play.width) * play.height);
+    llrpGpuPlaybackReconState_t prepared = {};
+    if (llrpGpuPlaybackReconGetLastPreparedState(&prepared) != 0)
+    {
+        prepared.frame_id = frame;
+        state = playback_warm_output_reuse::preparedStateFrom(prepared);
+    }
+    llrpGpuPlaybackReconReleaseRetainedDeviceBayer16(play.token);
+    return state;
+}
+
+// "chroma_smooth_method=<n>" from a run's dumped scalars.txt; -1 when absent.
+int dumpedScalar(const std::string & dir, const std::string & key)
+{
+    std::vector<unsigned char> bytes;
+    if (!readFileBytes(dir + "/scalars.txt", &bytes)) return -1;
+    for (const std::string & line : splitLines(bytes))
+    {
+        if (line.compare(0, key.size() + 1, key + "=") == 0) return std::atoi(line.c_str() + key.size() + 1);
+    }
+    return -1;
+}
+
+// The staged slot's key (the warm's) and a present key equal to it in every non-state field: the warm's frame and
+// dims, the same black level, WB and H-Nyquist flag, and the live set_clip / set_luts counts.
+playback_warm_output_reuse::Key reuseKeyOf(const playback_recon_warm_run::Outcome & warm,
+                                           const playback_warm_output_reuse::PreparedState & state)
+{
+    playback_warm_output_reuse::Key key;
+    key.valid = true;
+    key.frame = static_cast<uint64_t>(warm.prepared.frame_id);
+    key.width = warm.width;
+    key.height = warm.height;
+    key.blackLevel = 2048;
+    key.wb[0] = 2.0;
+    key.wb[1] = 1.0;
+    key.wb[2] = 1.5;
+    key.reducedHnyquist = false;
+    key.setClipCountAfterWarm = warm.setClipCountAfter;
+    key.setLutsCountAfterWarm = warm.setLutsCountAfter;
+    key.captureId = 1;
+    key.state = state;
+    return key;
+}
+
+playback_warm_output_reuse::Reason reuseGateFor(const playback_recon_warm_run::Outcome & warm,
+                                                const playback_warm_output_reuse::PreparedState & warmState,
+                                                const playback_warm_output_reuse::PreparedState & playState)
+{
+    return playback_warm_output_reuse::preGate(true, true, reuseKeyOf(warm, warmState), reuseKeyOf(warm, playState),
+                                               false, false, llrpGpuPlaybackReconSetClipCount(),
+                                               llrpGpuPlaybackReconSetLutsCount());
+}
+
+void printChromaSmoothStates(const char * test, const playback_warm_output_reuse::PreparedState & warmState,
+                             const playback_warm_output_reuse::PreparedState & playState,
+                             playback_warm_output_reuse::Reason gate)
+{
+    const QString diff = playback_warm_output_reuse::preparedStateDiff(warmState, playState);
+    std::printf("[warm-chroma-smooth] %s warm_state=%s play_state=%s state_diff=%s pregate=%s\n", test,
+                playback_warm_output_reuse::preparedStateText(warmState).toUtf8().constData(),
+                playback_warm_output_reuse::preparedStateText(playState).toUtf8().constData(),
+                diff.isEmpty() ? "none" : diff.toUtf8().constData(), playback_warm_output_reuse::reasonName(gate));
+}
+
+} // namespace
+
+// T-4: the venue order, locally. The warm (cs off), then the chroma smooth change toolButtonChromaSmoothChanged makes,
+// then Play frame 0 on the same worker: the warm's output was made with cs 0 and Play's with cs 1, so the reuse key
+// refuses before any compare (state_mismatch, state_diff=chroma_smooth_method). A missed reuse, never a wrong frame;
+// it holds on the base and after the fix (the fix re-runs the warm, it never relabels this output).
+TEST(GpuPlaybackReconWarmRun, AChromaSmoothChangeAfterTheWarmIsAStateMismatchNotAHit)
+{
+    const uint32_t kFrame = 1;
+    QTemporaryDir dumps;
+    ASSERT_TRUE(dumps.isValid());
+    const std::string warmDir = dumps.path().toStdString() + "/warm";
+    const std::string playDir = dumps.path().toStdString() + "/play";
+    GpuReconEnv env(true);
+    MlvPipelineFixture fixture;
+    ASSERT_TRUE(openGpuEligibleFixture(fixture));   // chroma smooth off, as at clip load
+    ASSERT_FALSE(fixture.renderFrame8(0).empty());
+    const FakeGpuBackendScope fake;
+    WorkerState reconWorker;
+    std::vector<uint16_t> warmWords;
+    const playback_recon_warm_run::Outcome warm = warmDumpedInto(fixture, kFrame, &reconWorker.state, warmDir, &warmWords);
+    ASSERT_TRUE(warm.ran);
+    const playback_warm_output_reuse::PreparedState warmState = playback_warm_output_reuse::preparedStateFrom(warm.prepared);
+    ASSERT_TRUE(warmState.valid);
+
+    // Look Assist's auto-apply, ~15 s later at the venue
+    llrpSetChromaSmoothMode(fixture.video(), CS_2x2);
+
+    std::vector<uint16_t> playWords;
+    const playback_warm_output_reuse::PreparedState playState =
+        playDumpedInto(fixture, kFrame, &reconWorker.state, playDir, &playWords);
+    ASSERT_TRUE(playState.valid);
+    const playback_warm_output_reuse::Reason gate = reuseGateFor(warm, warmState, playState);
+    printChromaSmoothStates("T-4", warmState, playState, gate);
+    std::printf("[warm-chroma-smooth] T-4 dumped chroma_smooth_method warm=%d play=%d set_clip warm_after=%llu now=%llu "
+                "set_luts warm_after=%llu now=%llu\n",
+                dumpedScalar(warmDir, "chroma_smooth_method"), dumpedScalar(playDir, "chroma_smooth_method"),
+                static_cast<unsigned long long>(warm.setClipCountAfter),
+                static_cast<unsigned long long>(llrpGpuPlaybackReconSetClipCount()),
+                static_cast<unsigned long long>(warm.setLutsCountAfter),
+                static_cast<unsigned long long>(llrpGpuPlaybackReconSetLutsCount()));
+    ASSERT_EQ(0, dumpedScalar(warmDir, "chroma_smooth_method"));
+    ASSERT_EQ(1, dumpedScalar(playDir, "chroma_smooth_method"));
+    ASSERT_EQ(std::string("chroma_smooth_method"),
+              playback_warm_output_reuse::preparedStateDiff(warmState, playState).toStdString());
+    ASSERT_TRUE(playback_warm_output_reuse::Reason::StateMismatch == gate);
+    ASSERT_EQ(0, llrpGpuPlaybackReconRetainedOutstandingCount());
+}
+
+// T-5: the premise of the fix (ii), with the real llrawproc. A warm run AFTER the chroma smooth change is prepared
+// exactly as Play frame 0: no state difference, every dumped input byte-identical, the same retained words.
+TEST(GpuPlaybackReconWarmRun, AWarmReRunAfterTheChromaSmoothChangeMatchesPlay)
+{
+    const uint32_t kFrame = 1;
+    QTemporaryDir dumps;
+    ASSERT_TRUE(dumps.isValid());
+    const std::string root = dumps.path().toStdString();
+    GpuReconEnv env(true);
+    MlvPipelineFixture fixture;
+    ASSERT_TRUE(openGpuEligibleFixture(fixture));
+    ASSERT_FALSE(fixture.renderFrame8(0).empty());
+    const FakeGpuBackendScope fake;
+    WorkerState reconWorker;
+    std::vector<uint16_t> firstWords;
+    const playback_recon_warm_run::Outcome first = warmDumpedInto(fixture, kFrame, &reconWorker.state, root + "/warm", &firstWords);
+    ASSERT_TRUE(first.ran);
+    llrpSetChromaSmoothMode(fixture.video(), CS_2x2);
+
+    // the re-run warm (W2)
+    std::vector<uint16_t> warmWords;
+    const playback_recon_warm_run::Outcome warm = warmDumpedInto(fixture, kFrame, &reconWorker.state, root + "/warm2", &warmWords);
+    ASSERT_TRUE(warm.ran);
+    const playback_warm_output_reuse::PreparedState warmState = playback_warm_output_reuse::preparedStateFrom(warm.prepared);
+    std::vector<uint16_t> playWords;
+    const playback_warm_output_reuse::PreparedState playState =
+        playDumpedInto(fixture, kFrame, &reconWorker.state, root + "/play", &playWords);
+    ASSERT_TRUE(playState.valid);
+    const playback_warm_output_reuse::Reason gate = reuseGateFor(warm, warmState, playState);
+    printChromaSmoothStates("T-5", warmState, playState, gate);
+    ASSERT_EQ(1, dumpedScalar(root + "/warm2", "chroma_smooth_method"));
+    ASSERT_TRUE(playback_warm_output_reuse::preparedStateDiff(warmState, playState).isEmpty());
+    int differences = 0;
+    for (const char * name : { "in.u16", "raw2ev.i32", "ev2raw.i32", "mix_curve.f64", "fullres_curve.f64",
+                               "randn05.f32", "scalars.txt" })
+    {
+        if (!warmAndPlayDumpsEqual("T-5", root + "/warm2", root + "/play", name)) ++differences;
+    }
+    std::printf("[warm-chroma-smooth] T-5 dump differences=%d retained words warm=%zu play=%zu equal=%d\n", differences,
+                warmWords.size(), playWords.size(), warmWords == playWords ? 1 : 0);
+    ASSERT_EQ(0, differences);
+    ASSERT_FALSE(warmWords.empty());
+    ASSERT_TRUE(warmWords == playWords);
+    ASSERT_EQ(0, llrpGpuPlaybackReconRetainedOutstandingCount());
 }
