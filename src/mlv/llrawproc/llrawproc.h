@@ -273,6 +273,29 @@ size_t llrpGpuPlaybackReconGetLastInputBayer16(uint16_t * output,
 int llrpGpuPlaybackReconGetBackendInfo(llrpGpuPlaybackReconBackendInfo_t * info);
 /* As above, waiting at most wait_ms for the backend lock; 0 if it ran out. */
 int llrpGpuPlaybackReconGetBackendInfoWithin(llrpGpuPlaybackReconBackendInfo_t * info, int wait_ms);
+/* PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-SETUP-1 Row B: load and create the playback recon backend now (while
+ * paused) instead of on the first Play frame's render thread. Exactly the mutex-guarded loader the playback runs
+ * use, with the same prefer_playback_dll=1, so the first run neither releases nor reloads it. Never configures a
+ * clip or LUTs and never runs. 1 when the backend is available; load_ms (may be NULL) receives the call's wall
+ * time. Always 0 in a build without the GPU recon loader. */
+int llrpGpuPlaybackReconPreloadBackend(double * load_ms);
+/* PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1: the paused recon warm run (platform/qt/PlaybackReconWarmRun.h) runs the
+ * Play frame-0 prepare-only recon on the recon worker thread. Save moves this thread's last-run playback recon state
+ * (what the llrpGpuPlaybackReconGetLast* calls return) aside and leaves it empty; Restore drops what the warm left and
+ * puts the saved state back, so nothing on the thread can read the warm's prepared state or retained output. Save
+ * returns an opaque heap snapshot (NULL when it cannot allocate: the warm then skips); Restore frees it. */
+void * llrpGpuPlaybackReconSaveLastRunState(void);
+void llrpGpuPlaybackReconRestoreLastRunState(void * snapshot);
+/* PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1 F-a: the shared dual-ISO runtime state every run is seeded from
+ * (the ISO pattern, the auto / ev / black-delta exposure match and the DNG levels), read under llrawproc_mutex. A run
+ * publishes it when it changed, so the paused warm reads it before and after its run: a change means the warm solved
+ * the match that Play frame 0 will start from, settled. 0 when video or out is NULL. Equal compares every field
+ * exactly (auto included). */
+int llrpGetSharedRuntimeState(mlvObject_t * video, llrawproc_runtime_state_t * out);
+int llrpSharedRuntimeStateEqual(const llrawproc_runtime_state_t * lhs, const llrawproc_runtime_state_t * rhs);
+/* The calling thread's last recon run's set_clip / set_luts wall time (0 when that run needed neither). */
+double llrpGpuPlaybackReconLastSetClipMilliseconds(void);
+double llrpGpuPlaybackReconLastSetLutsMilliseconds(void);
 int llrpGpuPlaybackReconPreuploadFrame(uint64_t frame_id,
                                       const uint16_t * raw_input_bayer14,
                                       size_t raw_image_size);

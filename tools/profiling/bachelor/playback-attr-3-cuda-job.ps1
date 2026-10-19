@@ -428,6 +428,11 @@ param(
     # frame before the measured Play and the first present after its swap, both into the contact-sheet dir as identity-*). Absent: nothing is
     # set and the emitted job is the text it was before this parameter.
     [switch]$FirstPresentCapture,
+    # PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1 F-diag: the app's opt-in warm-reuse miss dump
+    # (MLVAPP_PLAYBACK_WARM_REUSE_MISS_DUMP_DIR=<published artifacts>\warm-reuse-miss: on a content miss the app writes the warm's and Play's
+    # AMaZE input words and their difference there, and logs one playback_warm_output_reuse_miss_dump line). Absent: nothing is set and the
+    # emitted job is the text it was before this parameter.
+    [switch]$WarmReuseMissDump,
     # CUDA-HEADROOM-1: an unpaced throughput leg (MLVAPP_PLAYBACK_UNPACED=1 lifts the app's pace guard in an automation run, and the
     # smoke runs with -DropFrameMode off, so every frame is rendered and presented as fast as the pipeline allows). Absent: nothing is
     # set and the emitted job is the text it was before this parameter.
@@ -4498,6 +4503,17 @@ if ($FirstPresentCapture) {
     $text = $identityAnchor.Replace($text, [System.Text.RegularExpressions.MatchEvaluator]{
         param($m)
         $m.Value + $m.Groups['ind'].Value + "'MLVAPP_SMOKE_FIRST_PRESENT_CAPTURE=1'," + $m.Groups['nl'].Value
+    })
+}
+
+# PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1 F-diag: the same env-list site gains the miss-dump directory, under the job's own
+# published artifacts (so the dump comes back with them), only when asked.
+if ($WarmReuseMissDump) {
+    $missDumpAnchor = [regex]"(?<ind>[ \t]*)'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',(?<nl>\r?\n)"
+    if ($missDumpAnchor.Matches($text).Count -ne 1) { throw 'DUAL_VENUE_WARM_REUSE_MISS_DUMP_ANCHOR_MISSING the job template has no single env-list site to add MLVAPP_PLAYBACK_WARM_REUSE_MISS_DUMP_DIR to' }
+    $text = $missDumpAnchor.Replace($text, [System.Text.RegularExpressions.MatchEvaluator]{
+        param($m)
+        $m.Value + $m.Groups['ind'].Value + "('MLVAPP_PLAYBACK_WARM_REUSE_MISS_DUMP_DIR=' + (Join-Path `$Pub 'warm-reuse-miss'))," + $m.Groups['nl'].Value
     })
 }
 
