@@ -80,7 +80,7 @@
       "globs": ["tools/profiling/dual-venue/DualVenueRunner.psm1"],
       "floor": "declared",
       "runtimes": ["pwsh"],
-      "evidence": [{"file": "tools/profiling/dual-venue/DualVenueRunner.psm1", "line": 2166, "contains": "PowerShell\\7\\pwsh.exe"}],
+      "evidence": [{"file": "tools/profiling/dual-venue/DualVenueRunner.psm1", "line": 2180, "contains": "PowerShell\\7\\pwsh.exe"}],
       "suites": [{"kind": "ps-parse"}]
     },
     {
