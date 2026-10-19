@@ -8,7 +8,9 @@ on purpose: the 2,900-line sibling suite takes more than ten minutes.
 """
 from __future__ import annotations
 
+import argparse
 import importlib.util
+import inspect
 import subprocess
 import sys
 from pathlib import Path
@@ -20,6 +22,17 @@ _spec = importlib.util.spec_from_file_location("doctrine_outbox_ruling_under_tes
 ob = importlib.util.module_from_spec(_spec)
 sys.modules["doctrine_outbox_ruling_under_test"] = ob
 _spec.loader.exec_module(ob)
+
+BUS_ENV = getattr(ob, "RULING_BUS_ENV", "FACTORY_BUS_CLONE")   # the baseline tool (before this card) has no such name
+
+
+def call_validate(paths, bus):
+    """cmd_validate with the signature of the tool that is loaded: the baseline at fork/master takes (paths, deny_terms)
+    and no bus, so a red run shows that OLD validator accepting the bad items instead of dying on a TypeError."""
+    if "bus" in inspect.signature(ob.cmd_validate).parameters:
+        return ob.cmd_validate(paths, [], bus)
+    return ob.cmd_validate(paths, [])
+
 
 GIT_ID = ["-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "core.autocrlf=false", "-c", "core.safecrlf=false"]
 FOLD_STANDARD = REPO_ROOT / "doctrine-outbox" / "20261016-fleet-fold-standard.md"
@@ -75,7 +88,7 @@ def write_item(tmp_path: Path, text: str, name: str = "20261019-ruling-candidate
 
 
 def validate(tmp_path: Path, text: str, bus: Path | None, capsys) -> tuple[int, str]:
-    rc = ob.cmd_validate([write_item(tmp_path, text)], [], bus)
+    rc = call_validate([write_item(tmp_path, text)], bus)
     return rc, capsys.readouterr().err
 
 
@@ -174,13 +187,13 @@ def test_with_no_bus_the_shape_is_checked_and_the_unchecked_targets_are_named(tm
 
 def test_a_bus_that_cannot_be_read_is_unknown_never_a_pass(tmp_path):
     with pytest.raises(ob.Unknown) as caught:
-        ob.cmd_validate([write_item(tmp_path, candidate("touches/supersedes: R15\n"))], [], tmp_path / "no-such-clone")
+        call_validate([write_item(tmp_path, candidate("touches/supersedes: R15\n"))], tmp_path / "no-such-clone")
     assert caught.value.code == "RULING_BUS_UNREADABLE"
     empty = tmp_path / "empty-bus"
     empty.mkdir()
     subprocess.run(["git", "init", "-q", str(empty)], check=True, capture_output=True, text=True)
     with pytest.raises(ob.Unknown):
-        ob.cmd_validate([write_item(tmp_path, candidate("touches/supersedes: R15\n"))], [], empty)
+        call_validate([write_item(tmp_path, candidate("touches/supersedes: R15\n"))], empty)
 
 
 # ---------- non-ruling items are unaffected ----------
@@ -194,7 +207,7 @@ def test_a_bus_that_cannot_be_read_is_unknown_never_a_pass(tmp_path):
      "---\ntarget: specs/mlv-app/cards.md\nkind: trap\nsource_commit: PENDING\nlaw4: attested\n---\n## mlv-app/a-trap\nrule: r\nmechanism: m\napplies: mlv-app\ncheck: c\nevidence: measured\n"),
 ])
 def test_a_non_ruling_item_is_unaffected(tmp_path, capsys, monkeypatch, label, text):
-    monkeypatch.setenv(ob.RULING_BUS_ENV, str(tmp_path / "no-such-clone"))   # an unreadable bus is never even looked at
+    monkeypatch.setenv(BUS_ENV, str(tmp_path / "no-such-clone"))   # an unreadable bus is never even looked at
     rc, err = validate(tmp_path, text, tmp_path / "no-such-clone", capsys)
     assert rc == 0 and err == "", (label, err)
 
@@ -255,14 +268,148 @@ def test_the_cli_takes_the_bus_from_the_flag_or_the_environment(tmp_path, capsys
     bus = make_bus(tmp_path)
     good = write_item(tmp_path, candidate("touches/supersedes: R15\n"), "20261019-ruling-candidate-good.md")
     bad = write_item(tmp_path, candidate("touches/supersedes: R99\n"), "20261019-ruling-candidate-bad.md")
-    monkeypatch.delenv(ob.RULING_BUS_ENV, raising=False)
+    monkeypatch.delenv(BUS_ENV, raising=False)
     assert ob.main(["validate", "--bus", str(bus), str(good)]) == 0
     assert ob.main(["validate", "--bus", str(bus), str(bad)]) == 1
     capsys.readouterr()
-    monkeypatch.setenv(ob.RULING_BUS_ENV, str(bus))
+    monkeypatch.setenv(BUS_ENV, str(bus))
     assert ob.main(["validate", str(good)]) == 0
     assert ob.main(["validate", str(bad)]) == 1
     assert "RULING_CANDIDATE_TARGET_NOT_ON_BUS" in capsys.readouterr().err
-    monkeypatch.setenv(ob.RULING_BUS_ENV, str(tmp_path / "no-such-clone"))
+    monkeypatch.setenv(BUS_ENV, str(tmp_path / "no-such-clone"))
     assert ob.main(["validate", str(good)]) == 2
     assert "RULING_BUS_UNREADABLE" in capsys.readouterr().err
+
+
+# ---------- marker variants: one normalizer for headings and body lines (sol r1 blocker, opus r1 hardening) ----------
+
+NEUTRAL_HEADING = "### mlv-app, 2026-10-19 - a hook cannot judge a thing"
+MARKER_LINES = [
+    "- **Ruling candidate**",
+    "> Ruling candidate:",
+    "RULING CANDIDATE (r2): X",
+    "RULING CANDIDATE - X",
+    "1. ruling candidate",
+    "*Ruling candidate*",
+    "  + _Ruling-candidate_ (not law until ratified)",
+    "> - **Ruling candidate (r3):** the hook is deny-only.",
+]
+HEADING_MARKERS = [
+    "RULING CANDIDATE (r2): one standard for X",
+    "RULING CANDIDATE - one standard for X",
+    "*Ruling candidate*",
+    "**Ruling candidate**",
+    "Ruling candidate",
+    "mlv-app, 2026-10-19 - RULING CANDIDATE: one standard for X",
+    "mlv-app, 2026-10-19 - Ruling-candidate (r2): one standard for X",
+]
+
+
+def body_with(marker_line: str, declaration: str = "") -> str:
+    return candidate(f"{marker_line}\n\n{declaration}", heading=NEUTRAL_HEADING)
+
+
+@pytest.mark.parametrize("marker", MARKER_LINES)
+def test_every_body_line_marker_variant_makes_a_candidate_that_is_refused_bare(tmp_path, capsys, marker):
+    rc, err = validate(tmp_path, body_with(marker), make_bus(tmp_path), capsys)
+    assert rc == 1 and "RULING_CANDIDATE_NO_SUPERSEDES" in err, (marker, err)
+
+
+@pytest.mark.parametrize("marker", MARKER_LINES)
+def test_every_body_line_marker_variant_is_accepted_with_a_declaration(tmp_path, capsys, marker):
+    rc, err = validate(tmp_path, body_with(marker, "touches/supersedes: R15\n"), make_bus(tmp_path), capsys)
+    assert rc == 0 and err == "", (marker, err)
+
+
+@pytest.mark.parametrize("heading", HEADING_MARKERS)
+def test_every_heading_marker_variant_makes_a_candidate_that_is_refused_bare(tmp_path, capsys, heading):
+    rc, err = validate(tmp_path, candidate(heading=f"### {heading}"), make_bus(tmp_path), capsys)
+    assert rc == 1 and "RULING_CANDIDATE_NO_SUPERSEDES" in err, (heading, err)
+
+
+@pytest.mark.parametrize("sub_heading", ["## RULING CANDIDATE: X", "# Ruling candidate (r2) - X", "#### **Ruling candidate**", "### mlv-app - RULING CANDIDATE: X"])
+def test_a_later_heading_line_marker_makes_a_candidate_that_is_refused_bare(tmp_path, capsys, sub_heading):
+    rc, err = validate(tmp_path, body_with(sub_heading), make_bus(tmp_path), capsys)
+    assert rc == 1 and "RULING_CANDIDATE_NO_SUPERSEDES" in err, (sub_heading, err)
+
+
+@pytest.mark.parametrize("heading", HEADING_MARKERS)
+def test_every_heading_marker_variant_is_accepted_with_a_declaration(tmp_path, capsys, heading):
+    rc, err = validate(tmp_path, candidate("touches/supersedes: R15\n", heading=f"### {heading}"), make_bus(tmp_path), capsys)
+    assert rc == 0 and err == "", (heading, err)
+
+
+@pytest.mark.parametrize("line", [
+    "Nothing here is a ruling candidate; it only cites one.",
+    "This is not a **ruling candidate** at all.",
+    "> quoted: see the ruling candidate on the bus",
+    "- measured against the ruling candidate named above",
+    "A ruling-candidate check is what this entry measures.",
+])
+def test_a_line_that_only_mentions_the_phrase_mid_sentence_is_not_a_marker(tmp_path, capsys, line):
+    rc, err = validate(tmp_path, body_with(line), tmp_path / "no-such-clone", capsys)
+    assert rc == 0 and err == "", (line, err)
+
+
+def test_a_marker_line_inside_a_fence_still_counts_because_the_check_fails_closed(tmp_path, capsys):
+    rc, err = validate(tmp_path, body_with("```\nRuling candidate: X\n```"), make_bus(tmp_path), capsys)
+    assert rc == 1 and "RULING_CANDIDATE_NO_SUPERSEDES" in err, err
+
+
+# ---------- the bus template's own field is an alias of touches/supersedes ----------
+
+@pytest.mark.parametrize("declaration", [
+    "Relationship to existing doctrine: R15, tools/fleet-sweep.mjs\n",
+    "relationship to existing doctrine: RULINGS.md:1126-1152; " + OPEN_CANDIDATE + "\n",
+    "- **Relationship to existing doctrine:** R15.3\n",
+    "**Relationship to existing doctrine**: R14.8\n",
+    "Relationship to existing doctrine:\n- R15\n- tools/doctrine-sync.mjs\n",
+    "Relationship to existing doctrine: none: it overlaps no standing rule or open candidate, checked by grep\n",
+    "touches: R15\nRelationship to existing doctrine: tools/fleet-sweep.mjs\n",
+])
+def test_the_relationship_to_existing_doctrine_alias_is_accepted(tmp_path, capsys, declaration):
+    rc, err = validate(tmp_path, candidate(declaration), make_bus(tmp_path), capsys)
+    assert rc == 0 and err == "", (declaration, err)
+
+
+@pytest.mark.parametrize("declaration", [
+    "Relationship to existing doctrine:\n",
+    "- **Relationship to existing doctrine:**\n",
+    "Relationship to existing doctrine: none\n",
+    "Relationship to existing doctrine (see the bus template) without a colon list\n",
+    "**Relationship to existing doctrine** (`ruling-candidates-name-what-they-supersede-r1`): prose, no list\n",
+])
+def test_the_alias_without_a_list_is_refused(tmp_path, capsys, declaration):
+    rc, err = validate(tmp_path, candidate(declaration), make_bus(tmp_path), capsys)
+    assert rc == 1 and ("RULING_CANDIDATE_NO_SUPERSEDES" in err or "RULING_CANDIDATE_NONE_NEEDS_REASON" in err), (declaration, err)
+
+
+def test_the_alias_keeps_the_target_rules(tmp_path, capsys):
+    bus = make_bus(tmp_path)
+    rc, err = validate(tmp_path, candidate("Relationship to existing doctrine: R15, R99\n"), bus, capsys)
+    assert rc == 1 and "RULING_CANDIDATE_TARGET_NOT_ON_BUS" in err and "'R99'" in err, err
+    rc, err = validate(tmp_path, candidate("Relationship to existing doctrine: fleet-sweep\n"), bus, capsys)
+    assert rc == 1 and "RULING_CANDIDATE_TARGET_MALFORMED" in err, err
+
+
+# ---------- one --bus on validate (PR 514 adds one too: whichever merges second keeps exactly one) ----------
+
+def _validate_parser():
+    parser = ob.build_parser()
+    subparsers = [a for a in parser._actions if isinstance(a, argparse._SubParsersAction)]
+    assert len(subparsers) == 1
+    return subparsers[0].choices
+
+
+def test_build_parser_succeeds_and_defines_bus_exactly_once_on_validate():
+    choices = _validate_parser()
+    options = [opt for action in choices["validate"]._actions for opt in action.option_strings]
+    assert options.count("--bus") == 1, options
+    parsed = ob.build_parser().parse_args(["validate", "--bus", "some-clone", "item.md"])
+    assert parsed.bus == Path("some-clone") and parsed.items == [Path("item.md")]
+
+
+def test_no_subcommand_defines_any_option_string_twice():
+    for name, sub in _validate_parser().items():
+        options = [opt for action in sub._actions for opt in action.option_strings]
+        assert len(options) == len(set(options)), (name, options)

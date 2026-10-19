@@ -80,9 +80,10 @@ BEHAVIOURS
    `repaired`), so a layer that reads git's stdin ahead of it cannot starve it. The hook and the debt checks still
    run the file at config `tool_rel`: a project keeps that local copy until a pin-aware release.
 11. Ruling candidates name what they touch or supersede (CoS work order FWO-DEFECT-PREVENT-1 item 4; seed #469 r1).
-   `validate` refuses an item that proposes a ruling candidate (a `### ` heading with `RULING CANDIDATE:`, or a body
-   line opening `Ruling candidate`) unless it carries a `touches/supersedes:` declaration (`touches:` and `supersedes:`
-   count too): rule ids (`R15`) or bus-relative paths (`RULINGS.md:1126-1152`) on that line, comma or semicolon
+   `validate` refuses an item that proposes a ruling candidate (any line that opens `Ruling candidate` once bullet,
+   quote, bold and heading marks are off, or a heading with `- RULING CANDIDATE` / `RULING CANDIDATE:` in it) unless it
+   carries a `touches/supersedes:` declaration (`touches:`, `supersedes:` and the bus template's `Relationship to
+   existing doctrine:` count too): rule ids (`R15`) or bus-relative paths (`RULINGS.md:1126-1152`) on that line, comma or semicolon
    separated, or as bullets under it, or the single entry `none: <reason of >= 4 words>`. Typed refusals:
    RULING_CANDIDATE_NO_SUPERSEDES, _NONE_NEEDS_REASON, _NONE_WITH_RULES, _TARGET_MALFORMED, and, when the bus clone
    (`--bus`, default $FACTORY_BUS_CLONE) lacks a named target at its tip, _TARGET_NOT_ON_BUS. The bus is only read;
@@ -2348,9 +2349,12 @@ def cmd_session_start(repo: pathlib.Path, ref: str, ledger: pathlib.Path) -> int
 # carries no `touches/supersedes:` declaration, names a target that is not shaped like one, or names one the bus clone
 # it reads does not hold. The bus is only READ, at its committed tip (HEAD); a bus the validator cannot read is UNKNOWN.
 
-RULING_CANDIDATE_HEADING_RE = re.compile(r"ruling[\s-]+candidate\s*:", re.I)
-RULING_CANDIDATE_LEAD_RE = re.compile(r"^[ \t]*(?:\*\*)?ruling[\s-]+candidate\b", re.I | re.M)
-TOUCHES_LABEL_RE = re.compile(r"^([ \t]*)([-*][ \t]+)?(?:\*\*)?(?:touches/supersedes|touches|supersedes):(?:\*\*)?[ \t]*(.*?)[ \t]*$", re.I)
+RULING_CANDIDATE_PHRASE = r"ruling[\s-]+candidate"
+RULING_CANDIDATE_LEAD_RE = re.compile(RULING_CANDIDATE_PHRASE, re.I)
+RULING_CANDIDATE_AFTER_SEP_RE = re.compile(r"[-–—:][ \t]*" + RULING_CANDIDATE_PHRASE, re.I)
+RULING_CANDIDATE_COLON_RE = re.compile(RULING_CANDIDATE_PHRASE + r"\s*:", re.I)
+MARKER_PREFIX_RE = re.compile(r"[ \t]+|>|#{1,6}(?=[ \t]|$)|[-+*](?=[ \t])|\d+[.)](?=[ \t])|[*_`]+")
+TOUCHES_LABEL_RE = re.compile(r"^([ \t]*)([-*][ \t]+)?(?:\*\*)?(?:touches/supersedes|touches|supersedes|relationship[ \t]+to[ \t]+existing[ \t]+doctrine)(?:\*\*)?:(?:\*\*)?[ \t]*(.*?)[ \t]*$", re.I)
 TOUCHES_BULLET_RE = re.compile(r"^([ \t]*)[-*][ \t]+(\S.*?)[ \t]*$")
 TOUCHES_NONE_RE = re.compile(r"^none\b[ \t]*[:\-–—]?[ \t]*(.*)$", re.I)
 RULING_RULE_ID_RE = re.compile(r"^R\d+(?:\.\d+)*$")
@@ -2360,17 +2364,43 @@ RULING_BUS_ENV = "FACTORY_BUS_CLONE"
 RULINGS_FILE = "RULINGS.md"
 
 
+def marker_text(line: str) -> str:
+    """A line with its markdown furniture off: indent, blockquote `>`, heading `#`, list bullet (`-`, `*`, `+`,
+    `1.`) and leading emphasis come off the front, and `*`, `_` and backticks come out of the rest, so the words
+    a marker opens with are the first thing left."""
+    text = line.rstrip("\r")
+    while True:
+        found = MARKER_PREFIX_RE.match(text)
+        if not found:
+            return re.sub(r"[*_`]", "", text)
+        text = text[found.end():]
+
+
 def is_ruling_candidate(item: dict) -> bool:
-    """A ruling candidate is an item whose `### ` heading holds `RULING CANDIDATE:` (any case, a space or hyphen
-    between the words) or whose body has a line that opens with `Ruling candidate` (bold allowed). A heading that
-    only mentions someone else's candidate (`... for ruling candidate <id>`, no colon) is a measurement, not a
-    proposal. A `kind: ruling` item is a ratified ruling (`ratified_by` is required for it), not a candidate."""
-    return bool(RULING_CANDIDATE_HEADING_RE.search(item_heading(item)) or RULING_CANDIDATE_LEAD_RE.search(item["body"]))
+    """A ruling candidate is an item with a line that, once its markdown furniture is off (`marker_text`), opens with
+    `Ruling candidate` (any case, a space or hyphen between the words) whatever follows: `:`, ` (r2):`, ` - `, the
+    end of the line; bullet, quote, bold and heading forms alike. A heading line (any `#` line, and the first line of
+    the item) also counts when the phrase follows a ` - `, ` -- ` or `:` (`### proj, 2026-10-16 - RULING
+    CANDIDATE (r2): X`) or is followed by a colon. A line that only mentions the phrase mid-sentence, or a heading
+    that mentions someone else's candidate (`... for ruling candidate <id>`, no colon), is not a marker. When in
+    doubt it is a candidate: a fenced line counts too. A `kind: ruling` item is a ratified ruling
+    (`ratified_by` is required for it), not a candidate."""
+    first = item_heading(item)
+    for raw in item["body"].splitlines():
+        line = raw.rstrip("\r")
+        text = marker_text(line)
+        if RULING_CANDIDATE_LEAD_RE.match(text):
+            return True
+        if line.lstrip().startswith("#") or line == first:
+            if RULING_CANDIDATE_AFTER_SEP_RE.search(text) or RULING_CANDIDATE_COLON_RE.search(text):
+                return True
+    return False
 
 
 def touches_supersedes_entries(body: str) -> list[str] | None:
     """The entries of a candidate's `touches/supersedes:` declaration, or None when no label is present. The label
-    is `touches/supersedes:`, `touches:` or `supersedes:`, may be a bullet and bold, and may repeat; entries add up.
+    is `touches/supersedes:`, `touches:`, `supersedes:` or `Relationship to existing doctrine:` (the bus candidate
+    template's own field), may be a bullet and bold, and may repeat; entries add up.
     Entries are the comma- or semicolon-separated names after a label on the same line, plus the bullet lines
     indented under it (or, when the label is not a bullet, the bullets right below it) up to the first blank line or
     non-bullet. A value that opens with `none` is one entry, whole, so its reason keeps its commas. A label inside
@@ -2448,8 +2478,8 @@ def screen_ruling_candidate(item: dict, bus: pathlib.Path | None = None) -> list
     entries = touches_supersedes_entries(item["body"])
     if not entries:
         raise Refusal("RULING_CANDIDATE_NO_SUPERSEDES",
-                      "a ruling candidate needs a non-empty `touches/supersedes:` list (the rules or specs it overlaps, "
-                      "as rule ids or bus paths, or `none: <reason>`)")
+                      "a ruling candidate needs a non-empty `touches/supersedes:` list (or `Relationship to existing "
+                      "doctrine:`): the rules or specs it overlaps, as rule ids or bus paths, or `none: <reason>`")
     nones = [e for e in entries if TOUCHES_NONE_RE.match(e)]
     if nones:
         if len(entries) > 1:
@@ -2556,8 +2586,9 @@ def build_parser() -> argparse.ArgumentParser:
     validate_p.add_argument("items", nargs="+", type=pathlib.Path)
     validate_p.add_argument("--deny-file", type=pathlib.Path, default=None)
     validate_p.add_argument("--bus", type=pathlib.Path, default=None,
-                            help=f"a bus clone (default ${RULING_BUS_ENV}): a ruling candidate's touches/supersedes targets "
-                                 "must exist at its tip; read, never written")
+                            help=f"the bus clone (default ${RULING_BUS_ENV}): a ruling candidate's touches/supersedes targets "
+                                 "must exist at its tip, and --exercise copies it; read, never written or run in. "
+                                 "The one --bus of validate: a second add_argument for it makes argparse raise")
 
     debt_p = sub.add_parser("debt", help="list unsent items; exit 1 if any, 2 if UNKNOWN")
     debt_p.add_argument("--ref", default=DEFAULT_REF)

@@ -77,10 +77,15 @@ the name of the GPU host. A refusal names the class, never the matched value.
 
 ## Ruling candidates name what they supersede (ROUTE-RULING-SUPERSEDES-1)
 
-A ruling candidate (an item whose `### ` heading holds `RULING CANDIDATE:`, or whose body has a line opening
-`Ruling candidate`) must declare what it overlaps, so the producer finds a contradiction before the reviewer does
+A ruling candidate is an item with a heading or body line that opens with `Ruling candidate` (any case, a space or
+hyphen between the words) once its markdown is off: list bullets (`-`, `*`, `+`, `1.`), quote marks (`>`), heading
+marks (`#`), bold, italics and backticks, whatever follows (`:`, ` (r2):`, ` - `, the end of the line). A heading
+line also counts when the phrase follows ` - ` or `:` (`### mlv-app, 2026-10-16 - RULING CANDIDATE (r2): X`). A line
+that only mentions the phrase mid-sentence is not a marker, and a marker inside a fence still counts (the check
+fails closed). It must declare what it overlaps, so the producer finds a contradiction before the reviewer does
 (seed: PR 469 r1). `validate` refuses one without a `touches/supersedes:` declaration (`touches:` and `supersedes:`
-count too, bold and a bullet allowed, entries add up across labels). The entries are rule ids (`R15`, `R14.8`) or
+count too, as does `Relationship to existing doctrine:`, the field of the bus candidate template; same list and target
+rules; bold and a bullet allowed, entries add up across labels). The entries are rule ids (`R15`, `R14.8`) or
 bus-relative paths (`RULINGS.md:1126-1152`, `tools/fleet-sweep.mjs`), comma or semicolon separated on the label line
 or as bullets under it, or the single entry `none: <reason of at least 4 words>`. A label inside a fenced block does
 not count. Typed refusals (exit 1):
@@ -98,6 +103,10 @@ A bus clone that cannot be read is UNKNOWN `RULING_BUS_UNREADABLE` (exit 2), nev
 still checked and `validate` prints a NOTE naming the targets it could not check. Non-ruling items are not looked at,
 the drain does not apply this check, and an item already sent is not re-judged. The 450-word cap still holds, so a
 candidate replaces its prose "relationship" block with the list.
+
+`validate --bus` is defined once. PR 514 (`--exercise`) adds the same option; whichever of the two merges second keeps
+exactly ONE `validate_p.add_argument("--bus", ...)`, because argparse raises on a duplicate for every subcommand, the
+push hook included. A test asserts `build_parser()` defines it exactly once.
 
 ## Concerns to the CoS (COS-CONCERN-CHANNEL-1)
 
