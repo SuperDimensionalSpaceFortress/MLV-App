@@ -28,6 +28,7 @@ import sys
 import tempfile
 import time
 import unittest
+import uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -48,6 +49,15 @@ def _import(extra: str) -> str:
 
 def _git(repo: Path, *args: str) -> str:
     return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, check=True, stdin=subprocess.DEVNULL).stdout.strip()
+
+
+def _in_module(case: unittest.TestCase, body: str, env_extra: dict[str, str] | None = None) -> str:
+    """Run ``body`` inside the module scope (Invoke-DvGit, its script-scope seams, counters and cache are module-private). Returns stdout."""
+    script = _import(f"& (Get-Module DualVenueRunner) {{\n{body}\n}}\n")
+    proc = subprocess.run([PWSH, *PWSH_ARGS, "-Command", script], capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL,
+                          env=dict(os.environ, **(env_extra or {})))
+    case.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+    return proc.stdout
 
 
 @requires_windows_pwsh
@@ -89,6 +99,32 @@ class LegLookupCostTests(unittest.TestCase):
         # Linear: per lookup one commit check and one listing (2), plus each blob read once (2 each). Quadratic is ~LEG_COUNT * (2 + LEG_COUNT) = 288.
         self.assertLessEqual(len(spawns), 6 * LEG_COUNT,
                              f"{len(spawns)} git spawns to find {LEG_COUNT} legs: every lookup re-reads every blob (quadratic in the leg count)")
+
+    def test_the_blob_cache_keeps_repos_that_differ_only_by_case_apart(self) -> None:
+        # HARDENING-2 (3), sol on #472: the default PowerShell hashtable compares keys case-insensitively, so /tmp/Repo and /tmp/repo (two repos
+        # on a case-sensitive filesystem) shared one entry. A blob id names its bytes, so no wrong measurement was shown; the cache is still
+        # ordinal so that it can never be wrong about which repository a hit belongs to.
+        blob = "a" * 40
+        out = _in_module(self,
+                         f"$c = $script:LegBlobCache\n$c['/tmp/Repo' + [char]0 + '{blob}'] = 1\n"
+                         f"Write-Output ('HIT ' + $c.ContainsKey('/tmp/repo' + [char]0 + '{blob}'))\n")
+        self.assertIn("HIT False", out, "repo paths differing only by case must be separate cache entries")
+
+    def test_the_blob_cache_normalises_the_repo_root_spelling(self) -> None:
+        # HARDENING-2 (3), fable on #472: 'C:\r' and 'C:\r\' (or r/../r) are one repo and must be one cache entry per blob, not one per spelling.
+        repo, head = self.make_repo()
+        sep = os.sep
+        spellings = [str(repo), str(repo) + sep, str(repo.parent) + sep + "." + sep + repo.name]
+        lookups = "".join(
+            f"$r = Find-DvCommittedLegSpec -RepoRoot '{spelling}' -Commit '{head}' -LegSpecSha256 $sha\n" for spelling in spellings)
+        out = _in_module(self,
+                         f"$f = Get-ChildItem -LiteralPath (Join-Path '{repo}' '{LEGS_REL}') -Filter leg-{LEG_COUNT - 1:02d}.json\n"
+                         f"$sha = Get-DvLegSpecSha256 ([IO.File]::ReadAllBytes($f.FullName))\n{lookups}"
+                         "Write-Output ('CACHED ' + $script:LegBlobCache.Count)\n")
+        match = re.search(r"CACHED (\d+)", out)
+        self.assertIsNotNone(match, out)
+        # The last leg is found after reading every blob before it, so the cache holds LEG_COUNT entries for ONE spelling of the repo.
+        self.assertEqual(int(match.group(1)), LEG_COUNT, f"three spellings of one repo made {match.group(1)} cache entries, expected {LEG_COUNT}")
 
 
 @requires_windows_pwsh
@@ -147,10 +183,10 @@ class GitCallsAreBoundedTests(unittest.TestCase):
     def test_a_child_that_outlives_git_holding_its_output_is_killed_and_fails_typed(self) -> None:
         # CoS I1 (PR #472, comment 6227363745), reproduced: git exits 0 but a process it started still holds stdout open. On 76999ae4 the call
         # returned git's own exit 0 with the partial bytes ("EXIT 0 OUT [partial]") after two unchecked 10 s waits, and the sleeper lived on.
-        before = _sleepers()
-        self.addCleanup(_kill_new_sleepers, before)
+        token = _own_sleep_token("60")
+        self.addCleanup(_kill_sleepers, token)
         started = time.monotonic()
-        done = self.invoke_dv_git(self.make_repo(), "'-c', 'alias.dvs=!echo partial; sleep 60 & exit 0', 'dvs'", {"DV_GIT_TIMEOUT_SECONDS": "5"}, timeout=45)
+        done = self.invoke_dv_git(self.make_repo(), f"'-c', 'alias.dvs=!echo partial; sleep {token} & exit 0', 'dvs'", {"DV_GIT_TIMEOUT_SECONDS": "5"}, timeout=45)
         self.assertIn("EXIT -1", done.stdout, "a straggler holding git's output must fail typed, never return git's exit code with partial bytes")
         self.assertIn("DV_GIT_PIPE_STRAGGLER", done.stdout)
         # CoS N4: "(killed)" is claimed because the call's pipes closed after the kill; "(kill not confirmed)" would mean they did not.
@@ -159,18 +195,99 @@ class GitCallsAreBoundedTests(unittest.TestCase):
         self.assertNotIn("partial", done.stdout.split("ERR ", 1)[0], "no partial bytes may be returned")
         self.assertLess(time.monotonic() - started, 30, "the drain bound is the 5 s git bound; the call must not wait out the 60 s child")
         deadline = time.monotonic() + 10
-        survivors = _sleepers() - before
+        survivors = _sleepers(token)
         while survivors and time.monotonic() < deadline:
             time.sleep(0.5)
-            survivors = _sleepers() - before
+            survivors = _sleepers(token)
         self.assertEqual(survivors, set(), "the sleeper git started must be killed, not left running")
 
-    def in_module(self, body: str) -> str:
-        """Run ``body`` inside the module scope (Invoke-DvGit, its script-scope seam and its counters are module-private). Returns stdout."""
-        script = _import(f"& (Get-Module DualVenueRunner) {{\n{body}\n}}\n")
-        proc = subprocess.run([PWSH, *PWSH_ARGS, "-Command", script], capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
-        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        return proc.stdout
+    def in_module(self, body: str, env_extra: dict[str, str] | None = None) -> str:
+        return _in_module(self, body, env_extra)
+
+    @unittest.skipUnless(sys.platform == "win32", "job objects exist on Windows only (on Linux and macOS opened = closed = 0)")
+    def test_a_successful_git_call_opens_and_closes_its_job_object(self) -> None:
+        # HARDENING-2 (1), fable on #472: the N3 test above only covers a failed Start (opened = closed = 0). The CloseHandle in the finally of a
+        # call that DID start is pinned here: a module without it leaves opened > closed.
+        repo = self.make_repo()
+        out = self.in_module(
+            "for ($i = 0; $i -lt 3; $i++) { $r = Invoke-DvGit -RepoRoot '" + str(repo) + "' -GitArgs @('rev-parse', '--is-inside-work-tree'); Write-Output ('EXIT ' + $r.exitCode) }\n"
+            "Write-Output ('JOBS opened=' + $script:DvJobsOpened + ' closed=' + $script:DvJobsClosed)\n")
+        self.assertEqual(out.count("EXIT 0"), 3, out)
+        match = re.search(r"JOBS opened=(\d+) closed=(\d+)", out)
+        self.assertIsNotNone(match, out)
+        self.assertEqual(match.group(1), "3", f"each started git call opens one job object: {out}")
+        self.assertEqual(match.group(1), match.group(2), "every job object a started call opened must be closed")
+
+    @unittest.skipUnless(sys.platform == "win32", "job objects exist on Windows only")
+    def test_the_job_handles_are_really_released_not_just_counted(self) -> None:
+        # r2 (opus DV-GIT-JOB-CLOSE-REAL-HANDLE-PIN-1): the opened = closed counters above move in the module's own code, so a build that keeps the
+        # counter and drops the CloseHandle call passes them. The process's real handle count does not lie: 30 calls that leak a job handle each
+        # grow it by 30 or more; a clean module's growth is the few handles the runtime itself caches.
+        repo = self.make_repo()
+        out = self.in_module(
+            "$self = [Diagnostics.Process]::GetCurrentProcess()\n"
+            "$null = Invoke-DvGit -RepoRoot '" + str(repo) + "' -GitArgs @('rev-parse', '--is-inside-work-tree')\n"
+            "[GC]::Collect(); [GC]::WaitForPendingFinalizers(); $self.Refresh(); $base = $self.HandleCount\n"
+            "for ($i = 0; $i -lt 30; $i++) { $null = Invoke-DvGit -RepoRoot '" + str(repo) + "' -GitArgs @('rev-parse', '--is-inside-work-tree') }\n"
+            "[GC]::Collect(); [GC]::WaitForPendingFinalizers(); $self.Refresh()\n"
+            "Write-Output ('GROWTH ' + ($self.HandleCount - $base))\n")
+        match = re.search(r"GROWTH (-?\d+)", out)
+        self.assertIsNotNone(match, out)
+        self.assertLess(int(match.group(1)), 15, f"30 git calls grew the process handle count by {match.group(1)}: job handles are leaking")
+
+    def test_a_faulted_pipe_read_is_a_typed_refusal_not_an_exception(self) -> None:
+        # HARDENING-2 (2), fable on #472: the drain WaitAll was outside any try, so a faulted output read (here: a sink that cannot hold git's
+        # output, a non-expandable one-byte MemoryStream) escaped Invoke-DvGit as an AggregateException. Now: exit -1, no bytes, DV_GIT_PIPE_FAULT.
+        repo = self.make_repo()
+        out = self.in_module(
+            "$script:DvGitNewSink = { [IO.MemoryStream]::new([byte[]]::new(1)) }\n"
+            f"try {{ $r = Invoke-DvGit -RepoRoot '{repo}' -GitArgs @('rev-parse', '--is-inside-work-tree'); Write-Output ('EXIT ' + $r.exitCode); Write-Output ('BYTES ' + $r.bytes.Length); Write-Output ('ERR ' + $r.stderr) }}\n"
+            "catch { Write-Output ('THREW ' + $_.Exception.GetType().Name) }\n"
+            "Write-Output ('JOBS opened=' + $script:DvJobsOpened + ' closed=' + $script:DvJobsClosed)\n")
+        self.assertNotIn("THREW", out, "a faulted pipe read must be a typed refusal, not an exception")
+        self.assertIn("EXIT -1", out)
+        self.assertIn("BYTES 0", out)
+        self.assertIn("ERR DV_GIT_PIPE_FAULT", out)
+        match = re.search(r"JOBS opened=(\d+) closed=(\d+)", out)
+        self.assertIsNotNone(match, out)
+        self.assertEqual(match.group(1), match.group(2), "the fault path must still close its job object")
+
+    def test_the_timeout_override_accepts_ascii_digits_only(self) -> None:
+        # HARDENING-2 (5), fable on #472: .NET's \d matches any Unicode decimal digit, and the [int] cast of Arabic-Indic digits throws. The
+        # override is [0-9]{1,3}; anything else is the 120 s default.
+        out = self.in_module(
+            "$arabic = ([string][char]0x0663) + ([string][char]0x0660)\n"
+            "foreach ($v in @($arabic, '30', '601', '0', 'off')) {\n"
+            "  $env:DV_GIT_TIMEOUT_SECONDS = $v\n"
+            "  try { Write-Output ('MS ' + (Get-DvGitTimeoutMilliseconds)) } catch { Write-Output ('THREW ' + $_.Exception.GetType().Name) }\n"
+            "}\n")
+        self.assertNotIn("THREW", out, "a non-ASCII digit override must fall to the default, never throw")
+        self.assertEqual([line for line in out.splitlines() if line.startswith("MS ")], ["MS 120000", "MS 30000", "MS 120000", "MS 120000", "MS 120000"])
+
+    def test_the_timeout_override_refuses_a_trailing_newline(self) -> None:
+        # r2 (opus P-01): .NET's `$` also matches before a final newline, so '30<LF>' was read as 30 s. `\z` is exact: it is the 120 s default.
+        out = self.in_module(
+            "foreach ($v in @(\"30`n\", \"30`r`n\", '30')) {\n"
+            "  $env:DV_GIT_TIMEOUT_SECONDS = $v\n"
+            "  Write-Output ('MS ' + (Get-DvGitTimeoutMilliseconds))\n"
+            "}\n")
+        self.assertEqual([line for line in out.splitlines() if line.startswith("MS ")], ["MS 120000", "MS 120000", "MS 30000"])
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "the escape needs /proc/<pid>/environ tag discovery (Linux) and POSIX env/sleep")
+    def test_a_straggler_that_scrubs_its_environment_is_refused_with_kill_not_confirmed(self) -> None:
+        # CI-DUALVENUE-GIT-KILL-NOT-CONFIRMED-ROW-1 (CoS #472 N5): `env -i` drops the per-call tag, so Stop-DvGitCall cannot find the child by
+        # /proc/<pid>/environ and its parent (sh) is gone, so Kill($true) misses it too: the pipes stay open and the kill is NOT confirmed. The
+        # refusal is the same typed exit -1 with no bytes; only the wording differs. Then the test kills the survivor itself.
+        token = _own_sleep_token("61")
+        self.addCleanup(_kill_sleepers, token)
+        done = self.invoke_dv_git(self.make_repo(), f"'-c', 'alias.dvscrub=!echo partial; env -i /bin/sleep {token} & exit 0', 'dvscrub'", {"DV_GIT_TIMEOUT_SECONDS": "5"}, timeout=60)
+        self.assertIn("EXIT -1", done.stdout)
+        self.assertIn("DV_GIT_PIPE_STRAGGLER", done.stdout)
+        self.assertIn("(kill not confirmed)", done.stdout)
+        self.assertNotIn("(killed)", done.stdout)
+        self.assertNotIn("partial", done.stdout.split("ERR ", 1)[0], "no partial bytes may be returned")
+        self.assertEqual(done.stdout.split("OUT ", 1)[1].split("\n", 1)[0].strip(), "", "no bytes at all")
+        self.assertTrue(_sleepers(token), "the scrubbed child must have escaped the kill: that is what makes the kill 'not confirmed'")
 
     def test_a_git_that_cannot_be_started_fails_typed_and_leaks_no_job_handle(self) -> None:
         # CoS N3 (PR #472, comment 6228350481): r2 created the job object BEFORE Process.Start and ran Start outside the try, so a Start that
@@ -211,21 +328,40 @@ class GitCallsAreBoundedTests(unittest.TestCase):
         self.assertNotIn("(killed)", unconfirmed)
 
 
-_SLEEPER = re.compile(r'sleep(\.exe)?"?\s+60\s*$')
+def _own_sleep_token(seconds: str = "60") -> str:
+    """A duration no other process on the host runs: ``<seconds>.<nine random digits>`` (``sleep 60.482913706``; GNU and BSD sleep take a
+    fraction). r2 (sol on #504): a before/after diff of every ``sleep 60`` pid is not identity, so two tests (or another lane) overlapping on
+    one host counted and killed each other's child. The token is the identity, carried in the child's argv (an ``env -i`` child keeps its argv;
+    it does not keep an environment marker). Both sleeper tests discover AND clean up by it, and only by it."""
+    return f"{seconds}.{uuid.uuid4().int % 10**9:09d}"
 
 
-def _sleepers() -> set[int]:
-    """Pids of the processes running `sleep 60` (the straggler of the alias above). Compared as a before/after set: other work on the host may
-    run its own sleeps, and only a NEW one is this test's."""
+def _sleeper_pids_from_ps(ps_output: str, token: str = "60") -> set[int]:
+    """Parse `ps -axo pid=,args=` (macOS has no /proc): the pids whose argv is exactly `sleep <token>`."""
+    found: set[int] = set()
+    for line in ps_output.splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[0].isdigit() and os.path.basename(parts[1]) in ("sleep", "sleep.exe") and parts[2] == token:
+            found.add(int(parts[0]))
+    return found
+
+
+def _sleepers(token: str) -> set[int]:
+    """Pids of the processes running exactly `sleep <token>` (the straggler of the aliases above; token from _own_sleep_token). There is no
+    before/after set: the token is the identity. HARDENING-2 (4): Windows asks CIM, Linux reads /proc, anything else with no /proc (macOS)
+    asks ps."""
     found: set[int] = set()
     if sys.platform == "win32":
+        pattern = re.compile(r'sleep(\.exe)?"?\s+' + re.escape(token) + r'\s*$', re.IGNORECASE)   # a sleep started by path reads `sleep.EXE`
         query = "Get-CimInstance Win32_Process -Filter \"Name='sleep.exe'\" | ForEach-Object { '' + $_.ProcessId + [char]9 + $_.CommandLine }"
         out = subprocess.run([PWSH, *PWSH_ARGS, "-Command", query], capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL).stdout
         for line in out.splitlines():
             pid, _, cmd = line.partition("\t")
-            if pid.strip().isdigit() and _SLEEPER.search(cmd.strip()):
+            if pid.strip().isdigit() and pattern.search(cmd.strip()):
                 found.add(int(pid))
         return found
+    if not Path("/proc").is_dir():
+        return _sleeper_pids_from_ps(subprocess.run(["ps", "-axo", "pid=,args="], capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL).stdout, token)
     for entry in Path("/proc").iterdir():
         if not entry.name.isdigit():
             continue
@@ -233,18 +369,54 @@ def _sleepers() -> set[int]:
             argv = (entry / "cmdline").read_bytes().split(b"\0")
         except OSError:
             continue
-        if len(argv) >= 2 and os.path.basename(argv[0]) in (b"sleep", b"sleep.exe") and argv[1] == b"60":
+        if len(argv) >= 2 and os.path.basename(argv[0]) in (b"sleep", b"sleep.exe") and argv[1] == token.encode():
             found.add(int(entry.name))
     return found
 
 
-def _kill_new_sleepers(before: set[int]) -> None:
-    """Cleanup only (the assertion above is the check): a RED run must not leave its 60 s sleeper behind."""
-    for pid in _sleepers() - before:
+def _kill_sleepers(token: str) -> None:
+    """Cleanup only (the assertion above is the check): a RED run must not leave its sleeper behind. It terminates what _sleepers(token) names,
+    that is this test's own child and nothing else."""
+    for pid in _sleepers(token):
         try:
             os.kill(pid, signal.SIGTERM)
         except OSError:
             pass
+
+
+class SleeperDiscoveryTests(unittest.TestCase):
+    """HARDENING-2 (4): process discovery must not assume /proc on every non-Windows platform (macOS has none)."""
+
+    def test_the_ps_form_finds_exactly_the_sleep_of_the_requested_duration(self) -> None:
+        listing = ("  101 /bin/sleep 60\n  102 sleep 61\n  103 /usr/bin/sleep 600\n  104 /usr/bin/python3 sleep 60\n  105 sleep\n  x 106 sleep 60\n"
+                   " 2107 -bash\n")
+        self.assertEqual(_sleeper_pids_from_ps(listing), {101})
+        self.assertEqual(_sleeper_pids_from_ps(listing, "61"), {102})
+
+    @unittest.skipIf(shutil.which("sleep") is None, "needs a sleep binary on PATH")
+    def test_two_overlapping_sleeper_tests_each_count_and_terminate_only_their_own_child(self) -> None:
+        # r2 (sol BLOCKER on #504): one process, no second pytest. Three same-duration sleepers are alive at once: this test's own, a plain
+        # `sleep 60` (another lane on the host) and another overlapping test's token sleeper. Discovery names only the own pid, cleanup ends
+        # only the own pid, and the other two are untouched until the test ends them itself by their Popen handles.
+        sleep = shutil.which("sleep")
+        own_token, other_token = _own_sleep_token("60"), _own_sleep_token("60")
+        self.assertNotEqual(own_token, other_token)
+        quiet = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        own, other_test, other_lane = (subprocess.Popen([sleep, arg], **quiet) for arg in (own_token, other_token, "60"))
+        for proc in (own, other_test, other_lane):
+            self.addCleanup(proc.wait)
+            self.addCleanup(proc.kill)
+        self.assertEqual(_sleepers(own_token), {own.pid}, "discovery must name this test's child only")
+        self.assertEqual(_sleepers(other_token), {other_test.pid})
+        _kill_sleepers(own_token)
+        own.wait(timeout=15)
+        self.assertIsNone(other_test.poll(), "the cleanup of one test killed another overlapping test's sleeper")
+        self.assertIsNone(other_lane.poll(), "the cleanup killed a same-duration sleeper that no test of this file started")
+        self.assertEqual(_sleepers(other_token), {other_test.pid})
+
+    @unittest.skipIf(sys.platform == "win32" or Path("/proc").is_dir(), "the ps path is for platforms without /proc (macOS)")
+    def test_discovery_runs_where_there_is_no_proc(self) -> None:
+        self.assertIsInstance(_sleepers(_own_sleep_token()), set)   # on macOS this used to raise FileNotFoundError at Path('/proc').iterdir()
 
 
 if __name__ == "__main__":
