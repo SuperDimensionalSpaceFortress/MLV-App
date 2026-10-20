@@ -2495,6 +2495,9 @@ def cmd_session_start(repo: pathlib.Path, ref: str, ledger: pathlib.Path) -> int
 # diff, hook or signing program is reachable even through a verb that wants one.
 # The SCRATCH CLONE is made under the same isolation (run_isolated_git: the same git, environment and `-c` pairs a route gets), so a
 # filter, hook or helper the host's config defines (git-lfs in the system config) never starts while the bus is being checked out.
+# Preparation also shares the route path's BOUNDS (run_bounded_process): output kept to its tail, the whole process tree killed at
+# ROUTE_PREP_TIMEOUT, and a timeout is the route outcome ROUTE_TIMEOUT (an Unknown, exit 2: it is no route's result). The stale-bus
+# check (bus_commits_behind_origin) reads the live bus through the same isolated git, so a host GIT_DIR or config cannot change it.
 # A credential's value is never printed: a diagnostic, a ROUTE line or an error shows `NAME=<redacted>`.
 # Any outcome but OK and NOT_EXECUTED fails the run (exit 1). The commands run in `git clone --local --no-hardlinks`
 # of --bus (default $FACTORY_BUS_CLONE) with `origin` removed, under a scratch directory this tool creates and removes by name.
@@ -2610,6 +2613,7 @@ ROUTE_INJECTION_ENV = frozenset({"PYTHONPATH", "PYTHONSTARTUP", "PYTHONHOME", "N
                                  "RUBYOPT", "BASH_ENV", "ENV"})
 ROUTE_SCRATCH_PREFIX = "outbox-exercise-"
 ROUTE_DEFAULT_TIMEOUT_S = 60.0
+ROUTE_PREP_TIMEOUT = 120.0                                                                      # seconds per git call that prepares the scratch
 ROUTE_OUTPUT_CAP_BYTES = 64 * 1024
 ROUTE_BUS_ENV = "FACTORY_BUS_CLONE"
 ROUTE_PASSING = ("ROUTE_OK", "ROUTE_NOT_EXECUTED")
@@ -3377,12 +3381,19 @@ def route_exercise_env(base: dict[str, str] | None = None, clone: str | os.PathL
 
 
 def run_isolated_git(git_bin: str, args: list[str], cwd: str | os.PathLike, clone: str | os.PathLike,
-                     timeout: float = 120) -> subprocess.CompletedProcess[str]:
-    """Run `git <args>` in `cwd` exactly as a route's git is run: the command line of route_git_command and the environment of
-    route_exercise_env, both keyed to the scratch `clone` (its parent directory holds the empty hooks directory and the empty
-    global config). The scratch clone is made and read through this one function, so preparation and routes cannot drift."""
-    return subprocess.run(route_git_command(git_bin, ["git", *args], clone), cwd=str(cwd), env=route_exercise_env(clone=clone),
-                          capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
+                     timeout: float | None = None) -> subprocess.CompletedProcess[str]:
+    """Run `git <args>` in `cwd` exactly as a route's git is run: the command line of route_git_command, the environment of
+    route_exercise_env (both keyed to the scratch `clone`, whose parent directory holds the empty hooks directory and the empty
+    global config) and the launcher of a route (run_bounded_process: output kept to its tail, the whole process tree killed on
+    timeout). The scratch clone is made and the bus read through this one function, so preparation and routes cannot drift.
+    A git still running after `timeout` (default ROUTE_PREP_TIMEOUT) is the route path's outcome, Unknown ROUTE_TIMEOUT."""
+    limit = ROUTE_PREP_TIMEOUT if timeout is None else timeout
+    returncode, out, err = run_bounded_process(route_git_command(git_bin, ["git", *args], clone), pathlib.Path(cwd),
+                                               route_exercise_env(clone=clone), limit)
+    if returncode is None:
+        verb = next((a for i, a in enumerate(args) if not a.startswith("-") and (i == 0 or args[i - 1] not in ("-c", "-C"))), "")
+        raise Unknown("ROUTE_TIMEOUT", f"git {verb} still running after {limit:g}s; its process tree was killed")
+    return subprocess.CompletedProcess(["git", *args], returncode, out, err)
 
 
 def route_git_global_config(clone: str | os.PathLike) -> str:
@@ -3493,9 +3504,15 @@ def _drain_tail(stream, cap: int, sink: list) -> None:
 
 def run_route_process(argv: list[str], cwd: pathlib.Path, env: dict[str, str], timeout: float) -> tuple[int | None, str, str]:
     """Run one route to completion or `timeout`: (returncode, stdout tail, stderr tail); returncode None on timeout.
-    The ONLY place a route is launched. On timeout the whole process tree is killed (a Job Object on Windows, a process
-    group on POSIX), so no descendant outlives the call or keeps a pipe open. Only the last ROUTE_OUTPUT_CAP_BYTES of each
-    stream are kept."""
+    The ONLY place a route is launched (run_bounded_process, which preparation shares)."""
+    return run_bounded_process(argv, cwd, env, timeout)
+
+
+def run_bounded_process(argv: list[str], cwd: pathlib.Path, env: dict[str, str], timeout: float) -> tuple[int | None, str, str]:
+    """Run `argv` to completion or `timeout`: (returncode, stdout tail, stderr tail); returncode None on timeout. The one bounded
+    launcher: a route and the scratch preparation (run_isolated_git) both run through it. On timeout the whole process tree is
+    killed (a Job Object on Windows, a process group on POSIX), so no descendant outlives the call or keeps a pipe open. Only the
+    last ROUTE_OUTPUT_CAP_BYTES of each stream are kept."""
     extra = {"start_new_session": True} if os.name != "nt" else {}
     proc = subprocess.Popen(argv, cwd=str(cwd), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             env=env, bufsize=0, **extra)
@@ -3661,7 +3678,8 @@ def run_exercise(entries: list[tuple[str, dict]], bus: pathlib.Path | None, time
     ok = True
     try:
         _route_say(f"ROUTE_BUS {tip[:12]} (scratch clone of {bus.name}; commands run there, never in the bus)")
-        behind = bus_commits_behind_origin(bus)
+        git_bin, refused = route_git_binary(clone)
+        behind = 0 if refused else bus_commits_behind_origin(bus, str(git_bin), clone)
         if behind:
             _route_say(f"ROUTE_BUS_STALE {behind} (the bus clone is {behind} commit(s) behind its origin as of its last fetch; "
                        f"git pull --ff-only there, or a script removed upstream still reads ROUTE_OK)", sys.stderr)
@@ -3685,15 +3703,18 @@ def _route_say(line: str, stream=None) -> None:
     print(line.encode(encoding, errors="replace").decode(encoding), file=stream)
 
 
-def bus_commits_behind_origin(bus: pathlib.Path) -> int:
+def bus_commits_behind_origin(bus: pathlib.Path, git_bin: str, clone: str | os.PathLike) -> int:
     """How many commits the bus clone's HEAD is behind its own origin/HEAD, origin/master or origin/main (the newest
-    of what its last fetch saw); 0 when none of those refs exists or the count cannot be read."""
+    of what its last fetch saw); 0 when none of those refs exists or the count cannot be read. Read through run_isolated_git
+    (`git_bin` and the scratch `clone` of the run), the isolation every other git call of the exercise gets: no host GIT_*
+    variable, config, hook or fsmonitor can change the verdict, and `--no-optional-locks` keeps the live bus untouched."""
     for ref in ("refs/remotes/origin/HEAD", "refs/remotes/origin/master", "refs/remotes/origin/main"):
         try:
-            if _run_git(bus, ["rev-parse", "--verify", "--quiet", ref]).returncode != 0:
+            where = ["--no-optional-locks", "-C", str(bus)]
+            if run_isolated_git(git_bin, [*where, "rev-parse", "--verify", "--quiet", ref], pathlib.Path(clone).parent, clone).returncode != 0:
                 continue
-            counted = _run_git(bus, ["rev-list", "--count", f"HEAD..{ref}"])
-        except (OSError, subprocess.SubprocessError):
+            counted = run_isolated_git(git_bin, [*where, "rev-list", "--count", f"HEAD..{ref}"], pathlib.Path(clone).parent, clone)
+        except (OSError, subprocess.SubprocessError, Unknown):
             return 0
         if counted.returncode == 0 and counted.stdout.strip().isdigit():
             return int(counted.stdout.strip())

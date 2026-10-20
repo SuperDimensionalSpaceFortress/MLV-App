@@ -2325,15 +2325,15 @@ def test_r6_preparing_the_scratch_clone_starts_no_program_and_checks_the_bytes_o
 def test_r6_every_git_call_of_preparation_gets_the_route_command_line_and_environment(tmp_path, monkeypatch):
     bus = make_bus(tmp_path)
     calls: list[tuple[list[str], dict[str, str]]] = []
-    real_run = subprocess.run
+    real_popen = subprocess.Popen                                                    # the bounded launcher starts every git call
 
     def spy(argv, *args, **kwargs):
         calls.append((list(argv), dict(kwargs["env"])))
-        return real_run(argv, *args, **kwargs)
+        return real_popen(argv, *args, **kwargs)
 
-    monkeypatch.setattr(ob.subprocess, "run", spy)
+    monkeypatch.setattr(ob.subprocess, "Popen", spy)
     base, clone, tip = ob.make_exercise_scratch(bus, tmp_path / "scratch")
-    monkeypatch.setattr(ob.subprocess, "run", real_run)
+    monkeypatch.setattr(ob.subprocess, "Popen", real_popen)
     assert len(calls) == 3 and calls[0][0][-1] == str(clone)                         # clone, remote remove, rev-parse
     for argv, env in calls:
         pairs = git_dash_c(argv)
@@ -2402,3 +2402,153 @@ def test_r6_the_readme_states_that_scratch_creation_runs_under_the_route_isolati
                    "-c core.excludesFile=", "git-lfs filter-process", "`run_isolated_git`"):
         assert needle in flat, needle
     assert "`log --show-signature` reaches" not in flat
+
+
+# ---------- ROUTE-EXERCISE-PREP-RESOURCE-ALIGN-1: preparation shares the route path's bounds; the stale-bus check is isolated ----------
+# CoS Dot record c7579197 on #523. (1) The scratch clone's git calls ran under subprocess.run: output unbounded, and a timeout reached
+# only the direct child. They now go through the one bounded launcher (run_bounded_process) the route path uses, and a timeout is
+# the route path's typed outcome (ROUTE_TIMEOUT, here an Unknown: it is no route's result). (2) The stale-bus check ran the
+# host-configured _run_git on the live bus; it now runs under run_isolated_git, so the host's GIT_* environment and config
+# cannot change the verdict. Each prep row drives a stand-in for git (a python program), the same seam the launcher rows use.
+
+PREP_FLOOD = ("import sys\nfor i in range(60000):\n    sys.stdout.write('x' * 100 + '\\n')\nprint('TAILMARK')\n"
+              "sys.stderr.write('E' * 200000 + 'ERRTAIL')\n")
+
+
+def prep_stand_in(monkeypatch, script: Path, *extra: str) -> None:
+    """Make the next preparation git call start `script` instead of git (the command line route_git_command would build)."""
+    monkeypatch.setattr(ob, "route_git_command", lambda git_bin, argv, cwd: [sys.executable, str(script), *extra])
+
+
+def prep_clone_dir(tmp_path: Path) -> Path:
+    clone = tmp_path / "scratch" / "bus"
+    clone.parent.mkdir(parents=True, exist_ok=True)
+    return clone
+
+
+def test_prep_git_output_is_bounded_to_its_tail(tmp_path, monkeypatch):
+    script = tmp_path / "flood.py"
+    script.write_text(PREP_FLOOD, encoding="utf-8")
+    prep_stand_in(monkeypatch, script)
+    clone = prep_clone_dir(tmp_path)
+    done = ob.run_isolated_git("git", ["status"], clone.parent, clone, timeout=60)
+    assert done.returncode == 0
+    assert len(done.stdout) <= ob.ROUTE_OUTPUT_CAP_BYTES and done.stdout.rstrip().endswith("TAILMARK")
+    assert len(done.stderr) <= ob.ROUTE_OUTPUT_CAP_BYTES and done.stderr.endswith("ERRTAIL")
+
+
+def test_prep_git_that_never_exits_is_timed_out_and_its_process_tree_killed(tmp_path, monkeypatch):
+    script = tmp_path / "spawn.py"
+    script.write_text(SPAWN, encoding="utf-8")
+    pidfile = tmp_path / "pids.txt"
+    prep_stand_in(monkeypatch, script, str(pidfile))
+    clone = prep_clone_dir(tmp_path)
+    result: list = []
+
+    def drive() -> None:
+        try:
+            result.append(ob.run_isolated_git("git", ["clone"], clone.parent, clone, timeout=2))
+        except BaseException as e:                                       # the typed outcome is what is under test
+            result.append(e)
+
+    runner = threading.Thread(target=drive, daemon=True)
+    started = time.monotonic()
+    runner.start()
+    try:
+        runner.join(30)                        # the unfixed code blocks here for as long as the grandchild sleeps
+        assert not runner.is_alive(), "run_isolated_git did not return: the preparation's process tree outlived the timeout"
+        assert time.monotonic() - started < 15
+        assert isinstance(result[0], ob.Unknown) and result[0].code == "ROUTE_TIMEOUT", result
+        assert "process tree was killed" in result[0].detail
+        parent, child = (int(p) for p in pidfile.read_text().split())
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and (pid_alive(parent) or pid_alive(child)):
+            time.sleep(0.2)
+        assert not pid_alive(child), "the grandchild survived the timeout"
+        assert not pid_alive(parent), "the preparation's own process survived the timeout"
+    finally:
+        if pidfile.exists():
+            for pid in pidfile.read_text().split():
+                force_kill(int(pid))
+
+
+def test_a_hung_scratch_preparation_is_the_route_timeout_outcome_and_leaves_no_scratch(tmp_path, monkeypatch):
+    bus = make_bus(tmp_path)
+    script = tmp_path / "spawn.py"
+    script.write_text(SPAWN, encoding="utf-8")
+    pidfile = tmp_path / "pids.txt"
+    prep_stand_in(monkeypatch, script, str(pidfile))
+    monkeypatch.setattr(ob, "ROUTE_PREP_TIMEOUT", 2)
+    result: list = []
+
+    def drive() -> None:
+        try:
+            result.append(ob.make_exercise_scratch(bus, tmp_path / "scratch"))
+        except BaseException as e:
+            result.append(e)
+
+    runner = threading.Thread(target=drive, daemon=True)
+    runner.start()
+    try:
+        runner.join(30)
+        assert not runner.is_alive(), "make_exercise_scratch did not return: the preparation's process tree outlived the timeout"
+        assert isinstance(result[0], ob.Unknown) and result[0].code == "ROUTE_TIMEOUT", result
+        assert list((tmp_path / "scratch").iterdir()) == [], "the half-made scratch directory was not removed"
+    finally:
+        if pidfile.exists():
+            for pid in pidfile.read_text().split():
+                force_kill(int(pid))
+
+
+def stale_bus_pair(tmp_path: Path, name: str, behind: bool) -> Path:
+    """A bus clone of its own upstream, `behind` commits behind it (after a fetch) or not."""
+    root = tmp_path / name
+    root.mkdir()
+    upstream, bus = make_upstream_and_bus(root)
+    if behind:
+        (upstream / "tools" / "two.txt").write_text("two", encoding="utf-8")
+        git(upstream, "add", "-A")
+        git(upstream, "commit", "-q", "-m", "two")
+        git(bus, "fetch", "-q", "origin")
+    return bus
+
+
+@pytest.mark.parametrize("bus_behind", [False, True])
+def test_the_stale_bus_verdict_ignores_a_git_dir_in_the_host_environment(tmp_path, monkeypatch, capsys, bus_behind):
+    bus = stale_bus_pair(tmp_path, "real", behind=bus_behind)
+    decoy = stale_bus_pair(tmp_path, "decoy", behind=not bus_behind)       # the opposite verdict, one variable away
+    item = item_file(tmp_path, adopt("git log"))
+    monkeypatch.setenv("GIT_DIR", str(decoy / ".git"))
+    assert exercise(tmp_path, item, bus) == 0
+    captured = capsys.readouterr()
+    assert statuses(captured.out) == ["ROUTE_OK"]
+    assert ("ROUTE_BUS_STALE 1" in captured.err) is bus_behind, captured.err
+
+
+def test_every_stale_bus_git_call_gets_the_route_isolation(tmp_path, monkeypatch, capsys):
+    bus = stale_bus_pair(tmp_path, "real", behind=True)
+    hostile = tmp_path / "host.gitconfig"
+    hostile.write_text("[alias]\n\trev-list = !exit 9\n[core]\n\tfsmonitor = true\n\thooksPath = /nonexistent\n", encoding="utf-8")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(hostile))
+    monkeypatch.delenv("GIT_CONFIG_NOSYSTEM", raising=False)
+    calls: list[tuple[list[str], dict[str, str]]] = []
+    real_popen = subprocess.Popen
+
+    def spy(argv, *args, **kwargs):
+        calls.append((list(argv), dict(kwargs.get("env") or os.environ)))
+        return real_popen(argv, *args, **kwargs)
+
+    monkeypatch.setattr(ob.subprocess, "Popen", spy)
+    assert exercise(tmp_path, item_file(tmp_path, adopt("git log")), bus) == 0
+    monkeypatch.setattr(ob.subprocess, "Popen", real_popen)
+    assert "ROUTE_BUS_STALE 1" in capsys.readouterr().err
+    stale = [(argv, env) for argv, env in calls if "--verify" in argv or "rev-list" in argv]
+    assert len(stale) >= 2, [argv for argv, _env in calls]
+    for argv, env in stale:
+        pairs = git_dash_c(argv)
+        assert set(ob.ROUTE_GIT_HARDENING) <= set(pairs) and "core.fsmonitor=false" in pairs, pairs
+        assert env["GIT_CONFIG_NOSYSTEM"] == "1" and env["GIT_ATTR_NOSYSTEM"] == "1"
+        assert Path(env["GIT_CONFIG_GLOBAL"]) != hostile and Path(env["GIT_CONFIG_GLOBAL"]).name == ob.ROUTE_EMPTY_GLOBAL_CONFIG
+        assert not [k for k in env if k.startswith("GIT_") and k not in
+                    {"GIT_CONFIG_NOSYSTEM", "GIT_ATTR_NOSYSTEM", "GIT_TERMINAL_PROMPT", "GIT_CONFIG_GLOBAL"}], sorted(env)
+        assert os.path.isabs(argv[0])

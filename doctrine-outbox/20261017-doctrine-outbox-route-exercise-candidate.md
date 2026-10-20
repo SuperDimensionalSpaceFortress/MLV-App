@@ -11,6 +11,6 @@ applies: mlv-app, airmypc, agent-bridge, conjugal
 check: on the bus run `node tools/tool-census.mjs`; once projects pin tools/factory/ and drop their copies, the family reads 1 distinct version.
 supersedes: mlv-app/one-config-driven-doctrine-outbox-pr-470 (its digest; same file plus route check)
 evidence: measured
-- **Adopt:** bus steward adds tools/coordination/doctrine_outbox.py from MLV-App card CARD-ROUTE-EXERCISE-3 as tools/factory/doctrine_outbox.py, byte for byte; sha256 of its LF bytes 5967e137cdfbc39893d8e1f8fc624a50fe0ef75e5776a4595245418fcf9c1ad1.
+- **Adopt:** bus steward adds tools/coordination/doctrine_outbox.py from MLV-App card CARD-ROUTE-EXERCISE-3 as tools/factory/doctrine_outbox.py, byte for byte; sha256 of its LF bytes db8f4e49964d05f459b888325102fd93f99ebd0b8ce6c121f6b72ff20ef2d029.
 - **Pin:** each project reviews that bus SHA and runs `python factory-pins/pin-runner.py pin doctrine-outbox --commit <bus-sha> --path tools/factory/doctrine_outbox.py --reviewer <who> --reason <why>`. A pinned run is `python factory-pins/pin-runner.py run doctrine-outbox -- --config doctrine-outbox.config.json <command>`. KEEP the local copy: deleting it bricks the push hook and reads debt as UNKNOWN TOOL_ABSENT_AT_REF.
-- **Follow-up:** OUTBOX-PIN-AWARE-TOOL-AT-REF-1 makes the hook config-driven and `require_tool_at_ref` accept a pinned tool; a project deletes its copy only after it ships.
+- **Pin-aware hook:** OUTBOX-PIN-AWARE-TOOL-AT-REF-1 shipped: with `tool_pin` set, the hook and `require_tool_at_ref` accept the pinned tool; a project deletes its copy only once its pin is reviewed.
