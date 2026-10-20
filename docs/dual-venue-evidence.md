@@ -473,6 +473,21 @@ pwsh -NoProfile -File tools\profiling\dual-venue\Invoke-VenueStageNightly.ps1 [-
   re-hashed by name, and a mismatch is `STAGE_VERIFY_MISMATCH`.
 - The receipt row (`<main checkout>\.claude-state\dual-venue\stage-nightly.jsonl`, schema `mlv-app/venue-stage-nightly/v1`) records
   `buildManifestSha256` as that by-name hash. It is the exact file `Invoke-VenueBaseline.ps1` and `Invoke-VenueLeg.ps1` hash.
+- The night is reserved before it is spent. Before the first staging step, the driver appends a `STAGE_RESERVED` row (venue, `nightKey`,
+  `sourceCommit`, a new `reservationId`). It flushes the row and reads it back. Every later row of that call carries the same `reservationId`.
+- The once-per-night check counts `STAGE_OK` rows and reservations. A reservation holds its night for its sha whether its call ended
+  `STAGE_OK`, failed, or never wrote its closing row (the call was killed, or its row was lost). For another sha that night:
+  - `NIGHT_ALREADY_BUILT` (exit 0) when the holder ended `STAGE_OK`;
+  - `NIGHT_RESERVED` (exit 52) otherwise. The hub then inspects the venue cache.
+
+  The same sha resumes, and its row lists, under `reconciled`, every incomplete reservation it took over.
+- Receipt I/O fails closed with `RECEIPT_IO_FAILED` (exit 51), never `STAGE_OK`/0, in three cases:
+  - a receipt that cannot be read for the night check;
+  - a reservation that cannot be persisted (nothing is staged);
+  - a closing row that cannot be appended. The result json names the `unpersistedOutcome`, and the persisted reservation still holds the night.
+- One driver per venue. The lock is the named mutex `Global\MLV-VenueStageNightly-<venue>`, with no caller-selected path in it. With the real
+  venue share, the only receipt accepted is the canonical `<main checkout>\.claude-state\dual-venue\stage-nightly.jsonl`, and any other
+  `-ReceiptFile` is `USAGE`. So the night cap has one ledger.
 - It refuses over a live venue claim or ticket (`AGENT_BUSY`). It honours the shared board disk floor and commit ceiling
   (`.claude-state\hub-autopilot\disk-floor.ps1`, `host-commit-gate.ps1`): exit 3 with the gate's own text, and a missing gate is
   `GATE_UNAVAILABLE`. It bounds every child by `-MaxTotalSec`. The typed exit table is in the script header.

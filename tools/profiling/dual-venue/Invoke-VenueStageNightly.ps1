@@ -21,9 +21,19 @@
 #   - the recorded buildManifestSha256 is ALWAYS that by-name hash of the cache file (the exact path Invoke-VenueBaseline and Invoke-VenueLeg hash), never a local one.
 # The share is probed by name only (never enumerated: CLAUDE.md rule 14), each probe bounded by -ProbeTimeoutSec.
 #
-# ORDER. resolve sha -> night key (the date of the next 08:00Z) and once-per-night check against -ReceiptFile -> venue claim / ticket check -> share probe ->
-# idempotency -> disk floor + commit ceiling -> DLL pair -> (floors again when the DLL-pair wait was long) -> assemble -> stage -> smoke-runner stage ->
-# by-name verify -> ONE receipt line. The claim is re-checked before every submission: this driver never submits over another lane's chain.
+# ORDER. resolve sha -> night key (the date of the next 08:00Z) -> the venue lock and the once-per-night check against -ReceiptFile -> venue claim / ticket check ->
+# share probe -> idempotency -> disk floor + commit ceiling -> the RESERVATION row -> DLL pair -> (floors again when the DLL-pair wait was long) -> assemble ->
+# stage -> smoke-runner stage -> by-name verify -> ONE closing receipt line. The claim is re-checked before every submission: this driver never submits over
+# another lane's chain.
+#
+# THE NIGHT IS RESERVED BEFORE IT IS SPENT (CoS Dot b21fb3be, PR #526). Before the first staging step the driver appends a STAGE_RESERVED row (venue, nightKey,
+# sourceCommit, a new reservationId), flushes it and reads it back; every later row of the call carries that reservationId. The once-per-night check counts
+# STAGE_OK rows AND reservations: a reservation holds its night for its sha whether its call ended STAGE_OK, failed, or never wrote its closing row (killed, or
+# its row was lost). Another sha that night is NIGHT_RESERVED (or NIGHT_ALREADY_BUILT when the holder ended STAGE_OK); the same sha resumes, and the row lists
+# every incomplete reservation it reconciled. A receipt that cannot be read, a reservation that cannot be persisted, and a closing row that cannot be appended
+# are all RECEIPT_IO_FAILED: an outcome the receipt does not hold is never reported as success, and staging never starts without a persisted reservation.
+# ONE DRIVER PER VENUE: the lock is the named mutex Global\MLV-VenueStageNightly-<venue>; no caller-selected path is in its name. With the real venue share
+# (no -AgentShare) the only receipt taken is the canonical <main checkout>\.claude-state\dual-venue\stage-nightly.jsonl, so the night cap has one ledger.
 #
 # FLOORS. The disk floor and the host commit ceiling are the ONE shared board scripts <main checkout>\.claude-state\hub-autopilot\disk-floor.ps1 (Test-DiskFloor) and
 # host-commit-gate.ps1 (Test-HostCommitGate), dot-sourced, never copied. A missing or unloadable gate script is GATE_UNAVAILABLE (fail closed, never an admit). A refusal
@@ -38,15 +48,18 @@
 #
 # Exit codes (typed; the STAGE_NIGHTLY_EXIT line and the STAGE_NIGHTLY_RESULT json carry the token):
 #   0  STAGE_OK (staged and verified by name) | STAGE_SKIP_ALREADY (already in the cache) | NIGHT_ALREADY_BUILT (another sha was staged this night) | PLAN_ONLY (-WhatIf)
-#   2  USAGE (bad venue table, a receipt file outside .claude-state, a build root inside the checkout)
+#   2  USAGE (bad venue table, a receipt file outside .claude-state, a non-canonical receipt for the real venue share, a build root inside the checkout)
 #   3  capacity: DISK_FLOOR_REFUSED | HOST_COMMIT_REFUSED | BUILD_GUARD_REFUSED (the refusal text is printed verbatim)
 #   40 AGENT_BUSY (a live claim or queued ticket, another driver holds the venue lock, or um-run RETRACTED a job the agent never claimed)
 #   41 SHARE_UNREACHABLE (the share did not answer by name inside -ProbeTimeoutSec, or the agent has no heartbeat)
 #   42 SOURCE_COMMIT_UNRESOLVED   43 GATE_UNAVAILABLE   44 DLLPAIR_FAILED   45 ASSEMBLE_FAILED   46 STAGE_FAILED   47 STAGE_VERIFY_MISMATCH
 #   48 SMOKE_RUNNER_STAGE_FAILED  49 STAGE_UNRESOLVED (um-run stopped while the agent may still own the job; not retried)  50 STAGE_CAP_EXCEEDED (-MaxTotalSec ran out)
+#   51 RECEIPT_IO_FAILED (the receipt could not be read for the night check, the reservation could not be persisted -- staging did not start -- or the closing
+#      row could not be appended; the result json names the unpersistedOutcome)
+#   52 NIGHT_RESERVED (another sha's reservation holds this night and did not end STAGE_OK: it failed, or it never completed; the hub inspects the venue cache)
 # The last two stdout lines are `STAGE_NIGHTLY_EXIT code=<n> reason=<TOKEN> sha=<40|none> manifest=<64|none>` and `STAGE_NIGHTLY_RESULT=<compact json>`.
-# Every exit after the plan (except -WhatIf and USAGE) appends ONE line (schema mlv-app/venue-stage-nightly/v1) to -ReceiptFile; only STAGE_OK and
-# STAGE_SKIP_ALREADY lines carry a buildManifestSha256.
+# Every exit after the plan (except -WhatIf and USAGE) appends ONE closing line (schema mlv-app/venue-stage-nightly/v1) to -ReceiptFile, after the STAGE_RESERVED
+# line when the call reached a staging step; only STAGE_OK and STAGE_SKIP_ALREADY lines carry a buildManifestSha256.
 #
 # NEVER: builds in or writes to the canonical checkout (the assembler builds from a git archive under -BuildRoot); deletes anything (retention is the assembler's own
 # journal-proven pass); enumerates the share; registers a task or a pending action; launches MLVApp playback (the assembler's launch probe is `--batch --help`).
@@ -89,6 +102,7 @@ $ExitCodes = [ordered]@{
     DISK_FLOOR_REFUSED = 3; HOST_COMMIT_REFUSED = 3; BUILD_GUARD_REFUSED = 3
     AGENT_BUSY = 40; SHARE_UNREACHABLE = 41; SOURCE_COMMIT_UNRESOLVED = 42; GATE_UNAVAILABLE = 43; DLLPAIR_FAILED = 44; ASSEMBLE_FAILED = 45
     STAGE_FAILED = 46; STAGE_VERIFY_MISMATCH = 47; SMOKE_RUNNER_STAGE_FAILED = 48; STAGE_UNRESOLVED = 49; STAGE_CAP_EXCEEDED = 50
+    RECEIPT_IO_FAILED = 51; NIGHT_RESERVED = 52
 }
 $Caller = 'Invoke-VenueStageNightly'
 $GateCard = 'venue-stage-nightly'
@@ -106,10 +120,42 @@ $script:Row = [ordered]@{
     buildManifestSha256 = $null; smokeRunnerCacheDir = $null; jobIds = [ordered]@{ dllPair = $null; stage = $null; smokeRunner = $null }
     steps = [ordered]@{ dllPair = 'not-run'; assemble = 'not-run'; stage = 'not-run'; smokeRunner = 'not-run' }
     timings = [ordered]@{ dllPairSec = $null; assembleSec = $null; stageSec = $null; runnerSec = $null; totalSec = $null }
-    cFreeGiB = [ordered]@{ start = $null; end = $null }; commitGiB = $null; buildDir = $null; detail = $null
+    cFreeGiB = [ordered]@{ start = $null; end = $null }; commitGiB = $null; buildDir = $null; detail = $null; reservationId = $null; reconciled = @()
 }
 $script:WriteRow = $false
 $script:Mutex = $null
+$script:ReservationId = $null
+
+function Open-ReceiptStream([IO.FileMode]$Mode, [IO.FileAccess]$Access, [IO.FileShare]$Share) {
+    # A few short retries ride out another opener's moment (sharing violation); anything else, or a violation that outlasts them, THROWS.
+    for ($try = 1; ; $try++) {
+        try { return [IO.File]::Open($ReceiptFile, $Mode, $Access, $Share) }
+        catch [IO.IOException] { if ($try -ge 5) { throw }; Start-Sleep -Milliseconds 200 }
+    }
+}
+
+function Add-ReceiptLine([string]$Line) {
+    # The ONE receipt write. It throws when the line was not appended; every caller fails closed on that.
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $ReceiptFile) | Out-Null
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes($Line + "`n")
+    $fs = Open-ReceiptStream ([IO.FileMode]::Append) ([IO.FileAccess]::Write) ([IO.FileShare]::Read)
+    try { $fs.Write($bytes, 0, $bytes.Length); $fs.Flush($true) } finally { $fs.Dispose() }
+}
+
+function Read-ReceiptLines {
+    # The receipt's non-blank lines (none when it does not exist yet). An unreadable receipt THROWS: an unknown night never admits.
+    if (-not (Test-Path -LiteralPath $ReceiptFile -PathType Leaf)) { return }
+    $fs = Open-ReceiptStream ([IO.FileMode]::Open) ([IO.FileAccess]::Read) ([IO.FileShare]::ReadWrite)
+    try { $text = [IO.StreamReader]::new($fs, [Text.UTF8Encoding]::new($false)).ReadToEnd() } finally { $fs.Dispose() }
+    $text -split "`r?`n" | Where-Object { $_.Trim() }
+}
+
+function Format-RowUtc($Value) {
+    # ConvertFrom-Json turns the row's ISO utc into a DateTime on PowerShell 7; print it back as the row wrote it.
+    if ($Value -isnot [DateTime]) { return [string]$Value }
+    $u = $(if ($Value.Kind -eq [DateTimeKind]::Unspecified) { [DateTime]::SpecifyKind($Value, [DateTimeKind]::Utc) } else { $Value.ToUniversalTime() })
+    $u.ToString('yyyy-MM-ddTHH:mm:ssZ')
+}
 
 function Get-CFree { try { [math]::Round((Get-PSDrive C).Free / 1GB, 1) } catch { $null } }
 function Get-CommitGiB {
@@ -127,11 +173,18 @@ function Stop-Nightly([string]$Reason, [string]$Detail = '', [string[]]$Verbatim
     $r.timings.totalSec = [math]::Round(([DateTime]::UtcNow - $startedUtc).TotalSeconds, 1)
     if ($script:WriteRow) {
         $r.cFreeGiB.end = Get-CFree
-        try {
-            New-Item -ItemType Directory -Force -Path (Split-Path -Parent $ReceiptFile) | Out-Null
-            $fs = [IO.File]::Open($ReceiptFile, [IO.FileMode]::Append, [IO.FileAccess]::Write, [IO.FileShare]::Read)
-            try { $bytes = [Text.UTF8Encoding]::new($false).GetBytes(($r | ConvertTo-Json -Compress -Depth 6) + "`n"); $fs.Write($bytes, 0, $bytes.Length) } finally { $fs.Dispose() }
-        } catch { Out-Line "STAGE_NIGHTLY_LOG receipt append failed: $($_.Exception.Message)" }
+        $r.reservationId = $script:ReservationId
+        try { Add-ReceiptLine ($r | ConvertTo-Json -Compress -Depth 6) }
+        catch {
+            # FAIL CLOSED (CoS Dot b21fb3be): an outcome the receipt does not hold is never reported, least of all as STAGE_OK / 0.
+            $lost = $Reason
+            $Reason = 'RECEIPT_IO_FAILED'; $code = [int]$ExitCodes[$Reason]
+            $held = $(if ($script:ReservationId) { "reservation $($script:ReservationId) for $($r.sourceCommit) is in the receipt and holds night $($r.nightKey)" } else { 'this call persisted no reservation' })
+            $msg = "the closing $lost row was not appended to $ReceiptFile ($($_.Exception.Message)); $held"
+            Out-Line "STAGE_NIGHTLY_DETAIL $msg"
+            $r.outcome = $Reason; $r.exitCode = $code; $r.buildManifestSha256 = $null; $r['unpersistedOutcome'] = $lost
+            $r.detail = $(if ($r.detail) { "$msg | $($r.detail)" } else { $msg })
+        }
     }
     if ($script:Mutex) { try { $script:Mutex.ReleaseMutex() } catch { }; $script:Mutex.Dispose() }
     $sha = $(if ($r.sourceCommit) { $r.sourceCommit } else { 'none' })
@@ -202,7 +255,8 @@ function Get-LastLine([string]$Text, [string]$Pattern) { @($Text -split "`r?`n" 
 $repo = $(if ($RepoRoot) { $RepoRoot } else { (Resolve-Path (Join-Path $here '..\..\..')).Path })
 $mainRoot = Get-VenueMainRoot -From $repo
 $tablePath = $(if ($VenueTablePath) { $VenueTablePath } else { Join-Path $here 'venues.json' })
-if (-not $ReceiptFile) { $ReceiptFile = Join-Path $mainRoot '.claude-state\dual-venue\stage-nightly.jsonl' }
+$canonicalReceipt = [IO.Path]::GetFullPath((Join-Path $mainRoot '.claude-state\dual-venue\stage-nightly.jsonl'))
+if (-not $ReceiptFile) { $ReceiptFile = $canonicalReceipt }
 if (-not $GateDir) { $GateDir = Join-Path $mainRoot '.claude-state\hub-autopilot' }
 $profiling = [IO.Path]::GetFullPath((Join-Path $here '..'))
 $UmRun = $(if ($UmRunScript) { $UmRunScript } else { Join-Path $profiling 'um-run.ps1' })
@@ -220,6 +274,9 @@ $share = $(if ($AgentShare) { $AgentShare } else { [string]$venueEntry.Value.age
 $dllShare = $(if ($AgentShare) { $AgentShare } else { [string]$umEntry.Value.agentShare }).TrimEnd('\')
 $agentRoot = [string]$venueEntry.Value.agentRoot
 if (-not (Test-DvUnderClaudeState -Path $ReceiptFile)) { Stop-Nightly 'USAGE' "-ReceiptFile must be under a .claude-state directory (board-local state): $ReceiptFile" }
+if (-not $AgentShare -and [IO.Path]::GetFullPath($ReceiptFile) -ine $canonicalReceipt) {
+    Stop-Nightly 'USAGE' "the real $Venue share takes only the canonical receipt $canonicalReceipt (the once-per-night reservations live there and nowhere else); -ReceiptFile '$ReceiptFile' is refused"
+}
 $buildRootFull = [IO.Path]::GetFullPath($BuildRoot).TrimEnd('\')
 foreach ($root in @($mainRoot, $repo)) {
     $rf = [IO.Path]::GetFullPath($root).TrimEnd('\')
@@ -264,23 +321,47 @@ if ($WhatIf) {
 $script:Deadline = $startedUtc.AddSeconds($MaxTotalSec)
 $script:Row.cFreeGiB.start = Get-CFree
 $script:Row.commitGiB = Get-CommitGiB
-$mutexName = 'Global\MLV-VenueStageNightly-' + $Venue + '-' + [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes(([IO.Path]::GetFullPath($ReceiptFile)).ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant()
+# One driver per VENUE. No caller-selected path is in the name (CoS Dot b21fb3be): two -ReceiptFile values can no longer stage one venue side by side. Only the
+# offline -AgentShare seam adds a hash of that share, so a temp-dir test never contends with a real nightly on the board host (production passes no -AgentShare).
+$seamTag = $(if ($AgentShare) { '-seam-' + [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes(([IO.Path]::GetFullPath($share)).ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant() } else { '' })
+$mutexName = 'Global\MLV-VenueStageNightly-' + $Venue + $seamTag
 $mtx = [Threading.Mutex]::new($false, $mutexName)
 $got = $false
 try { $got = $mtx.WaitOne(0) } catch [Threading.AbandonedMutexException] { $got = $true }
 if (-not $got) { $mtx.Dispose(); Stop-Nightly 'AGENT_BUSY' "another Invoke-VenueStageNightly for $Venue holds $mutexName" }
 $script:Mutex = $mtx
 
-if (Test-Path -LiteralPath $ReceiptFile -PathType Leaf) {
-    foreach ($line in [IO.File]::ReadAllLines($ReceiptFile)) {
-        if (-not $line.Trim()) { continue }
-        $prev = try { $line | ConvertFrom-Json } catch { $null }
-        if ($null -eq $prev) { continue }
-        if ([string]$prev.nightKey -ceq $nightKey -and [string]$prev.venue -ceq $Venue -and [string]$prev.outcome -ceq 'STAGE_OK' -and [string]$prev.sourceCommit -cne $commit) {
-            Stop-Nightly 'NIGHT_ALREADY_BUILT' "night $nightKey already staged $([string]$prev.sourceCommit) on $Venue at $([string]$prev.utc); at most one build per night"
-        }
+# Once per night counts RESERVATIONS, not only successes: a STAGE_RESERVED row holds its night for its sha whether its call ended STAGE_OK, failed, or never
+# wrote its closing row. A reservation no row closes is reconciled here (listed in this call's row); it still holds the night unless it is this sha's, which resumes.
+$receiptLines = try { @(Read-ReceiptLines) } catch { Stop-Nightly 'RECEIPT_IO_FAILED' "the receipt $ReceiptFile could not be read for the once-per-night check ($($_.Exception.Message)); an unknown night never admits" }
+$reservations = [ordered]@{}
+$built = $null
+$n = 0
+foreach ($line in $receiptLines) {
+    $n++
+    $prev = try { $line | ConvertFrom-Json } catch { $null }
+    if ($null -eq $prev -or [string]$prev.nightKey -cne $nightKey -or [string]$prev.venue -cne $Venue) { continue }
+    $rid = [string]$prev.reservationId
+    if ([string]$prev.outcome -ceq 'STAGE_RESERVED') {
+        if (-not $rid) { $rid = "unnamed-line-$n" }
+        $reservations[$rid] = [ordered]@{ reservationId = $rid; sourceCommit = [string]$prev.sourceCommit; utc = (Format-RowUtc $prev.utc); endedAs = $null }
+    } elseif ($rid -and $reservations.Contains($rid)) {
+        $reservations[$rid].endedAs = [string]$prev.outcome
     }
+    if ([string]$prev.outcome -ceq 'STAGE_OK' -and [string]$prev.sourceCommit -cne $commit -and -not $built) { $built = $prev }
 }
+$script:Row.reconciled = @(foreach ($x in @($reservations.Values | Where-Object { -not $_.endedAs })) {
+    [ordered]@{ reservationId = $x.reservationId; sourceCommit = $x.sourceCommit; utc = $x.utc; state = 'incomplete' }
+})
+if ($built) {
+    Stop-Nightly 'NIGHT_ALREADY_BUILT' "night $nightKey already staged $([string]$built.sourceCommit) on $Venue at $(Format-RowUtc $built.utc); at most one build per night"
+}
+$holder = @($reservations.Values | Where-Object { $_.sourceCommit -cne $commit }) | Select-Object -First 1
+if ($holder) {
+    $how = $(if ($holder.endedAs) { "ended $($holder.endedAs)" } else { 'never completed (no row closes it: its call died, or its closing row was lost)' })
+    Stop-Nightly 'NIGHT_RESERVED' "night $nightKey on $Venue is held by reservation $($holder.reservationId) for $($holder.sourceCommit) at $($holder.utc), which $how; at most one commit per night, so $commit is not staged tonight (the hub inspects the $Venue cache)"
+}
+if ($script:Row.reconciled.Count -gt 0) { Say "resuming $commit over its incomplete reservation(s) $(($script:Row.reconciled | ForEach-Object { $_.reservationId }) -join ', ')" }
 
 # ------------------------------------------------------------------ 3. the venue is free and the share answers ------------------------------------------------------------
 function Assert-VenueFree([string]$Before) {
@@ -343,6 +424,23 @@ function Assert-Floors([string]$When) {
     Say "floors $When : $($d.Message) | $($c.Message)"
 }
 Assert-Floors 'before the build'
+
+# ------------------------------------------------------------------ 5b. the reservation: persisted (and read back) BEFORE the first staging step ------------------------
+# From here on the venue cache can change, so the night is reserved first. A reservation that is not in the receipt afterwards is RECEIPT_IO_FAILED and nothing is staged.
+$rid = [guid]::NewGuid().ToString('N')
+$reservation = [ordered]@{
+    schema = 'mlv-app/venue-stage-nightly/v1'; utc = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'); nightKey = $nightKey; venue = $Venue; sourceCommit = $commit
+    outcome = 'STAGE_RESERVED'; exitCode = $null; reservationId = $rid; resumes = @($script:Row.reconciled | ForEach-Object { $_.reservationId })
+}
+$why = 'not found when the receipt was read back'
+$persisted = $false
+try {
+    Add-ReceiptLine ($reservation | ConvertTo-Json -Compress -Depth 4)
+    $persisted = @(Read-ReceiptLines | Where-Object { $_.Contains('"reservationId":"' + $rid + '"') }).Count -eq 1
+} catch { $why = $_.Exception.Message }
+if (-not $persisted) { Stop-Nightly 'RECEIPT_IO_FAILED' "the reservation of night $nightKey on $Venue for $commit could not be persisted to $ReceiptFile ($why); staging did not start" }
+$script:ReservationId = $rid
+Say "reserved night $nightKey on $Venue for $commit (reservation $rid)"
 
 # ------------------------------------------------------------------ um-run, classified ------------------------------------------------------------------------------------
 function Assert-StagePackageSideFile([string[]]$Side, [string]$JobId, [string]$FailToken) {

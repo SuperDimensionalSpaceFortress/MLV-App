@@ -12,6 +12,10 @@ WHAT IS PINNED
     never reported "reused"; after every STAGE_OK the cache file is re-hashed BY NAME, and a mismatch is STAGE_VERIFY_MISMATCH, never success;
   * capacity refusals (disk floor, commit ceiling, build-guard) exit 3 and print the gate's own text verbatim (hub-autopilot re-arms on that text);
   * typed refusals: a missing gate script, a live claim or queued ticket, an unreachable share, an UNRESOLVED um-run (no retry), a second build in one night;
+  * the reservation (CoS Dot b21fb3be): a STAGE_RESERVED row is persisted before the first staging step and holds the night for its sha whether or not the
+    call ever finished; another sha that night is NIGHT_RESERVED (52), the same sha resumes and names the reservation it reconciled; a receipt append or read
+    that fails is RECEIPT_IO_FAILED (51), never STAGE_OK/0; the venue mutex does not depend on the caller's receipt path, and the real venue share takes only
+    the canonical receipt;
   * a DLL pair that is already built is harvested, not re-submitted; every child is bounded by -MaxTotalSec and killed past it;
   * -WhatIf prints the plan and builds, submits, probes and writes nothing.
 
@@ -27,6 +31,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -49,7 +54,7 @@ S12 = SHA[:12]
 RUNNER_DIR = "smoke-runner-" + "b" * 16
 EXIT = {"OK": 0, "USAGE": 2, "CAPACITY": 3, "AGENT_BUSY": 40, "SHARE_UNREACHABLE": 41, "SOURCE_COMMIT_UNRESOLVED": 42, "GATE_UNAVAILABLE": 43,
         "DLLPAIR_FAILED": 44, "ASSEMBLE_FAILED": 45, "STAGE_FAILED": 46, "STAGE_VERIFY_MISMATCH": 47, "SMOKE_RUNNER_STAGE_FAILED": 48,
-        "STAGE_UNRESOLVED": 49, "STAGE_CAP_EXCEEDED": 50}
+        "STAGE_UNRESOLVED": 49, "STAGE_CAP_EXCEEDED": 50, "RECEIPT_IO_FAILED": 51, "NIGHT_RESERVED": 52}
 NOW = "2026-10-19T21:00:00Z"      # the night key of this instant is 2026-10-20 (the next 08:00Z)
 NIGHT = "2026-10-20"
 
@@ -123,6 +128,11 @@ New-Item -ItemType Directory -Force -Path $outbox, $cache | Out-Null
 $res = Join-Path $outbox "$JobId.result.json"
 if (Test-Path -LiteralPath $res) { throw "UMRUN_JOBID_IN_USE outbox already holds $JobId.result.json" }
 $kind = $(if ($JobId -like 'playback-attr-3-cuda-dllpair-*') { 'DLLPAIR' } elseif ($JobId -like 'playback-attr-3-cuda-stage-*') { 'STAGE' } else { 'SMOKE' })
+# FAKE_RECEIPT_READONLY=<kind>: this submission makes the driver's receipt file read-only, so every later append of that call fails (FAKE_RECEIPT names it)
+if ($env:FAKE_RECEIPT_READONLY -ceq $kind) {
+    if (-not (Test-Path -LiteralPath $env:FAKE_RECEIPT)) { New-Item -ItemType Directory -Force -Path (Split-Path -Parent $env:FAKE_RECEIPT) | Out-Null; [IO.File]::WriteAllText($env:FAKE_RECEIPT, '') }
+    (Get-Item -LiteralPath $env:FAKE_RECEIPT).IsReadOnly = $true
+}
 $mode = [Environment]::GetEnvironmentVariable("FAKE_UMRUN_$kind"); if (-not $mode) { $mode = 'ok' }
 # inuse: the unsuffixed JobId turns out spent at submission (a racing submitter won it); inuse-all: every JobId does
 if ($mode -eq 'inuse-all' -or ($mode -eq 'inuse' -and $JobId -notmatch '-n\d{12}$')) { throw "UMRUN_JOBID_IN_USE outbox already holds $JobId.result.json" }
@@ -217,10 +227,17 @@ class VenueStageNightlyTests(unittest.TestCase):
                            ("smoke-gen.ps1", FAKE_SMOKEGEN)):
             (self.stubs / name).write_text(text, encoding="utf-8")
         self.calls_log = self.case / "calls.log"
+        # The driver refuses a -BuildRoot inside its checkout. A lane's TEMP can sit inside the worktree (.claude-state\ls), so every case passes its own
+        # empty git checkout through the -RepoRoot seam: the refusal is then judged against that checkout, never against where TEMP happens to live.
+        self.checkout = self.case / "checkout"
+        self.checkout.mkdir()
+        subprocess.run(["git", "-C", str(self.checkout), "init", "-q"], check=True, capture_output=True, timeout=60, stdin=subprocess.DEVNULL)
 
     # ---------------------------------------------------------------- harness
-    def args(self, *extra: str, share: Path | None = None, commit: str | None = SHA, now: str | None = NOW, driver: Path | None = None) -> list[str]:
-        a = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(driver or DRIVER), "-ReceiptFile", str(self.receipt), "-BuildRoot", str(self.build_root),
+    def args(self, *extra: str, share: Path | None = None, commit: str | None = SHA, now: str | None = NOW, driver: Path | None = None,
+             repo: Path | None = None) -> list[str]:
+        a = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(driver or DRIVER), "-RepoRoot", str(repo or self.checkout),
+             "-ReceiptFile", str(self.receipt), "-BuildRoot", str(self.build_root),
              "-AgentShare", str(share or self.share), "-ClaimDir", str(self.claims), "-GateDir", str(self.gates),
              "-UmRunScript", str(self.stubs / "um-run.ps1"), "-DllJobScript", str(self.stubs / "dll-gen.ps1"), "-AssembleScript", str(self.stubs / "assemble.ps1"),
              "-StageJobScript", str(self.stubs / "stage-gen.ps1"), "-SmokeRunnerJobScript", str(self.stubs / "smoke-gen.ps1"), "-ProbeTimeoutSec", "20"]
@@ -323,14 +340,16 @@ class VenueStageNightlyTests(unittest.TestCase):
         git("add", "f.txt")
         git("commit", "-q", "-m", "one")
         head = git("rev-parse", "HEAD")
-        unresolved = self.run_driver("-WhatIf", "-RepoRoot", str(repo), commit=None)
+        unresolved = self.run_driver("-WhatIf", repo=repo, commit=None)
         self.assert_exit(unresolved, "SOURCE_COMMIT_UNRESOLVED")
         git("update-ref", "refs/remotes/fork/master", head)
-        ok = self.run_driver("-WhatIf", "-RepoRoot", str(repo), commit=None)
+        ok = self.run_driver("-WhatIf", repo=repo, commit=None)
         self.assert_exit(ok, "PLAN_ONLY")
         self.assertIn(f"sourceCommit={head}", ok.stdout)
 
     def test_receipt_file_outside_claude_state_is_refused(self) -> None:
+        if ".claude-state" in self.case.resolve().parts:
+            self.skipTest("TEMP sits under a .claude-state directory (lane scratch), so no temp path is outside one; hosted CI runs this case")
         a = self.args()
         a[a.index("-ReceiptFile") + 1] = str(self.case / "elsewhere" / "stage.jsonl")
         p = subprocess.run(a, capture_output=True, text=True, timeout=120, env=dict(os.environ, FAKE_CALLS=str(self.calls_log)), stdin=subprocess.DEVNULL)
@@ -357,8 +376,11 @@ class VenueStageNightlyTests(unittest.TestCase):
         cache_hash = sha256(self.share / "cache" / names()["build"])
         self.assertEqual(cache_hash, self.assembled_manifest_sha())
         rows = self.rows()
-        self.assertEqual(len(rows), 1, rows)
-        r = rows[0]
+        # the reservation is persisted before the first staging step; the call's own row closes it
+        self.assertEqual([x["outcome"] for x in rows], ["STAGE_RESERVED", "STAGE_OK"], rows)
+        self.assertEqual((rows[0]["sourceCommit"], rows[0]["nightKey"], rows[0]["exitCode"]), (SHA, NIGHT, None))
+        self.assertEqual(rows[1]["reservationId"], rows[0]["reservationId"])
+        r = rows[1]
         self.assertEqual(r["schema"], "mlv-app/venue-stage-nightly/v1")
         for key in ("utc", "nightKey", "venue", "sourceCommit", "outcome", "exitCode", "buildManifestSha256", "smokeRunnerCacheDir", "jobIds", "timings",
                     "cFreeGiB", "commitGiB", "buildDir", "detail"):
@@ -501,8 +523,8 @@ class VenueStageNightlyTests(unittest.TestCase):
         p = self.run_driver(env={"FAKE_UMRUN_STAGE": "wrongcache"})
         self.assert_exit(p, "STAGE_VERIFY_MISMATCH")
         rows = self.rows()
-        self.assertEqual([r["outcome"] for r in rows], ["STAGE_VERIFY_MISMATCH"])
-        self.assertIsNone(rows[0]["buildManifestSha256"])
+        self.assertEqual([r["outcome"] for r in rows], ["STAGE_RESERVED", "STAGE_VERIFY_MISMATCH"])
+        self.assertIsNone(rows[-1]["buildManifestSha256"])
         self.assertIn("manifest=none", p.stdout)
 
     # ---------------------------------------------------------------- capacity (exit 3, the gate's text verbatim)
@@ -595,11 +617,14 @@ class VenueStageNightlyTests(unittest.TestCase):
         self.assert_exit(p, "STAGE_FAILED")
 
     # ---------------------------------------------------------------- once per night
-    def seed_row(self, sha: str, outcome: str = "STAGE_OK", night: str = NIGHT) -> None:
+    def seed_row(self, sha: str, outcome: str = "STAGE_OK", night: str = NIGHT, reservation_id: str | None = None) -> None:
         self.receipt.parent.mkdir(parents=True, exist_ok=True)
+        row = {"schema": "mlv-app/venue-stage-nightly/v1", "utc": "2026-10-19T20:00:00Z", "nightKey": night, "venue": "ultra-magnus",
+               "sourceCommit": sha, "outcome": outcome, "exitCode": None if outcome == "STAGE_RESERVED" else EXIT.get(outcome, 0)}
+        if reservation_id:
+            row["reservationId"] = reservation_id
         with self.receipt.open("a", encoding="utf-8") as f:
-            f.write(json.dumps({"schema": "mlv-app/venue-stage-nightly/v1", "utc": "2026-10-19T20:00:00Z", "nightKey": night, "venue": "ultra-magnus",
-                                "sourceCommit": sha, "outcome": outcome, "exitCode": 0}) + "\n")
+            f.write(json.dumps(row) + "\n")
 
     def test_a_second_build_in_one_night_is_refused_for_another_sha(self) -> None:
         self.seed_row(OTHER_SHA)
@@ -629,6 +654,124 @@ class VenueStageNightlyTests(unittest.TestCase):
                 p = self.run_driver("-WhatIf", now=now)
                 self.assertIn(f"nightKey={night}", p.stdout)
 
+    # ---------------------------------------------------------------- the reservation and the fail-closed receipt (CoS Dot b21fb3be, PR #526)
+    def clear_readonly(self) -> None:
+        if self.receipt.is_file():
+            os.chmod(self.receipt, stat.S_IREAD | stat.S_IWRITE)
+
+    def receipt_goes_readonly_at_the_runner_submission(self) -> dict[str, str]:
+        # the stage has landed in the cache by then; only the receipt append of the call's end can fail
+        self.addCleanup(self.clear_readonly)
+        return {"FAKE_RECEIPT_READONLY": "SMOKE", "FAKE_RECEIPT": str(self.receipt)}
+
+    def test_a_receipt_append_failure_after_staging_is_a_typed_nonzero_exit_never_stage_ok(self) -> None:
+        self.built_dll_pair()
+        p = self.run_driver(env=self.receipt_goes_readonly_at_the_runner_submission())
+        self.assert_exit(p, "RECEIPT_IO_FAILED")
+        self.assertNotIn("reason=STAGE_OK", p.stdout)
+        self.assertEqual(self.result(p.stdout)["unpersistedOutcome"], "STAGE_OK")
+        self.clear_readonly()
+        rows = self.rows()
+        # the reservation written before the first staging step is the row that survives
+        self.assertEqual([r["outcome"] for r in rows], ["STAGE_RESERVED"], rows)
+        self.assertEqual((rows[0]["sourceCommit"], rows[0]["nightKey"], rows[0]["venue"]), (SHA, NIGHT, "ultra-magnus"))
+        self.assertTrue(rows[0]["reservationId"])
+
+    def test_a_lost_stage_ok_row_still_holds_the_night_against_a_second_sha(self) -> None:
+        self.built_dll_pair()
+        first = self.run_driver(env=self.receipt_goes_readonly_at_the_runner_submission())
+        self.assertNotEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.clear_readonly()
+        self.calls_log.unlink(missing_ok=True)
+        second = self.run_driver(commit=OTHER_SHA)
+        self.assertNotEqual(second.returncode, 0, second.stdout + second.stderr)
+        self.assert_exit(second, "NIGHT_RESERVED")
+        self.assertEqual(self.calls(), [])
+        r = self.rows()[-1]
+        self.assertEqual((r["outcome"], r["exitCode"], r["sourceCommit"]), ("NIGHT_RESERVED", EXIT["NIGHT_RESERVED"], OTHER_SHA))
+        self.assertIn(SHA, r["detail"])
+
+    def test_an_incomplete_reservation_for_the_same_sha_resumes_and_is_reconciled(self) -> None:
+        self.seed_row(SHA, outcome="STAGE_RESERVED", reservation_id="r-incomplete-1")
+        self.built_dll_pair()
+        p = self.run_driver()
+        self.assert_exit(p, "STAGE_OK")
+        rows = self.rows()
+        self.assertEqual([r["outcome"] for r in rows], ["STAGE_RESERVED", "STAGE_RESERVED", "STAGE_OK"], rows)
+        new_id = rows[1]["reservationId"]
+        self.assertNotEqual(new_id, "r-incomplete-1")
+        self.assertEqual(rows[2]["reservationId"], new_id)
+        self.assertEqual([(x["reservationId"], x["state"]) for x in rows[2]["reconciled"]], [("r-incomplete-1", "incomplete")])
+
+    def test_an_incomplete_reservation_for_another_sha_holds_the_night(self) -> None:
+        self.seed_row(OTHER_SHA, outcome="STAGE_RESERVED", reservation_id="r-incomplete-1")
+        p = self.run_driver()
+        self.assert_exit(p, "NIGHT_RESERVED")
+        self.assertEqual(self.calls(), [])
+        r = self.rows()[-1]
+        self.assertIn(OTHER_SHA, r["detail"])
+        self.assertIn("r-incomplete-1", r["detail"])
+        self.assertEqual([(x["reservationId"], x["state"]) for x in r["reconciled"]], [("r-incomplete-1", "incomplete")])
+
+    def test_a_failed_reservation_for_another_sha_still_holds_the_night(self) -> None:
+        self.seed_row(OTHER_SHA, outcome="STAGE_RESERVED", reservation_id="r-failed-1")
+        self.seed_row(OTHER_SHA, outcome="STAGE_UNRESOLVED", reservation_id="r-failed-1")
+        p = self.run_driver()
+        self.assert_exit(p, "NIGHT_RESERVED")
+        self.assertEqual(self.calls(), [])
+        self.assertIn("STAGE_UNRESOLVED", self.rows()[-1]["detail"])
+
+    def test_a_reservation_from_an_earlier_night_does_not_block(self) -> None:
+        self.seed_row(OTHER_SHA, outcome="STAGE_RESERVED", night="2026-10-19", reservation_id="r-yesterday")
+        self.built_dll_pair()
+        self.assert_exit(self.run_driver(), "STAGE_OK")
+
+    def test_a_reservation_that_cannot_be_written_fails_closed_before_staging(self) -> None:
+        self.receipt.parent.mkdir(parents=True)
+        self.receipt.write_text("", encoding="utf-8")
+        os.chmod(self.receipt, stat.S_IREAD)
+        self.addCleanup(self.clear_readonly)
+        self.built_dll_pair()
+        p = self.run_driver()
+        self.assert_exit(p, "RECEIPT_IO_FAILED")
+        for role in ("DLLGEN", "ASSEMBLE", "STAGEGEN", "UMRUN"):
+            self.assertEqual(self.calls(role), [], role)
+        self.assertIn("staging did not start", p.stdout)
+
+    # ---------------------------------------------------------------- venue exclusion does not depend on the caller's receipt path
+    def test_a_second_receipt_path_cannot_take_the_venue_mutex(self) -> None:
+        self.built_dll_pair()
+        env = dict(os.environ, FAKE_CALLS=str(self.calls_log), FAKE_SHA=SHA, FAKE_ASSEMBLE="sleep")
+        holder = subprocess.Popen(self.args("-MaxTotalSec", "45"), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, stdin=subprocess.DEVNULL)
+        try:
+            deadline = time.monotonic() + 120
+            while not self.calls("ASSEMBLE") and holder.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.5)
+            self.assertTrue(self.calls("ASSEMBLE"), "the holder never reached its assemble")
+            a = self.args("-MaxTotalSec", "20")
+            a[a.index("-ReceiptFile") + 1] = str(self.case / "other" / ".claude-state" / "stage-nightly.jsonl")
+            p = subprocess.run(a, capture_output=True, text=True, timeout=120, env=env, stdin=subprocess.DEVNULL)
+            self.assert_exit(p, "AGENT_BUSY")
+            self.assertIn("MLV-VenueStageNightly-ultra-magnus", p.stdout)
+            self.assertEqual(len(self.calls("ASSEMBLE")), 1, self.calls("ASSEMBLE"))
+        finally:
+            try:
+                holder.communicate(timeout=150)
+            except subprocess.TimeoutExpired:
+                holder.kill()
+                holder.communicate()
+
+    def test_the_real_venue_share_takes_only_the_canonical_receipt(self) -> None:
+        # No -AgentShare: the venues.json share. -WhatIf, so neither this driver nor an older one probes, builds or submits anything.
+        a = self.args("-WhatIf")
+        i = a.index("-AgentShare")
+        del a[i:i + 2]
+        p = subprocess.run(a, capture_output=True, text=True, timeout=120, env=dict(os.environ, FAKE_CALLS=str(self.calls_log)), stdin=subprocess.DEVNULL)
+        self.assertEqual(p.returncode, EXIT["USAGE"], p.stdout + p.stderr)
+        self.assertIn("canonical", p.stdout)
+        self.assertIn(str(Path(".claude-state") / "dual-venue" / "stage-nightly.jsonl"), p.stdout)
+        self.assertEqual(self.calls(), [])
+
     # ---------------------------------------------------------------- the cap
     def test_a_child_that_outlives_the_cap_is_killed_and_typed(self) -> None:
         self.built_dll_pair()
@@ -652,7 +795,7 @@ class VenueStageNightlyTests(unittest.TestCase):
                           "pending-actions", "-Recurse"):
             self.assertNotIn(forbidden, code, forbidden)
         for needed in ("Test-DiskFloor", "Test-HostCommitGate", "Get-VenueClaimStatus", "Get-DllPairReuse", "Get-StageReuse", "Test-UmRunJobIdInUseMessage",
-                       "-JobIdSuffix", "mlv-app/venue-stage-nightly/v1"):
+                       "-JobIdSuffix", "mlv-app/venue-stage-nightly/v1", "STAGE_RESERVED", "reservationId"):
             self.assertIn(needed, code, needed)
 
 
