@@ -92,7 +92,8 @@ class _Share(unittest.TestCase):
     # UmRunDrop.psm1 changes: production never passes the hook.
     def start_ticked(self, *um_run_args: str, hold_first_poll_until: Path | None = None,
                      queue_deadline_hook: str | None = None,
-                     tick_action: tuple[int, str] | None = None) -> subprocess.Popen:
+                     tick_action: tuple[int, str] | None = None,
+                     claim_hook: str | None = None) -> subprocess.Popen:
         """Start um-run.ps1 for JobId demo with the tick hook; failures print `THREW <message>` and exit 1.
 
         hold_first_poll_until: the client blocks (at most 120 s) at the top of its FIRST poll until this
@@ -106,17 +107,25 @@ class _Share(unittest.TestCase):
         after it logs that poll, so a side effect lands at a point in the client's own poll sequence
         and not at whatever moment the test process happens to get scheduled.
 
+        claim_hook: a PowerShell scriptblock literal (`{ ... }`) passed as
+        -TestHookAfterQueueDeadlineClaim; the client calls it with no arguments right after the
+        queue-deadline recheck sets `$claimedAt`, so a test can stamp, from its own clock, the
+        instant the claimed wait begins (never the client's `$claimedAt` value, which a broken
+        client would get wrong).
+
         On any throw the client's wrapper also stamps the instant of its own verdict (verdict_at()),
         so a test can judge WHEN the client decided without depending on when the parent noticed."""
         self.ticks_path = self.tmp / "client-ticks.log"
         self.verdict_path = self.tmp / "client-verdict-at.log"
         hold = _q(hold_first_poll_until) if hold_first_poll_until is not None else "''"
         queue_hook_arg = " -TestHookAtQueueDeadline $queueHook" if queue_deadline_hook is not None else ""
+        claim_hook_arg = " -TestHookAfterQueueDeadlineClaim $claimHook" if claim_hook is not None else ""
         action_poll, action_body = tick_action if tick_action is not None else (0, "")
         wrapper = self.tmp / "run-ticked.ps1"
         wrapper.write_text(
             "$ErrorActionPreference = 'Stop'\n"
             f"$queueHook = {queue_deadline_hook if queue_deadline_hook is not None else '$null'}\n"
+            f"$claimHook = {claim_hook if claim_hook is not None else '$null'}\n"
             f"$tickLog = {_q(self.ticks_path)}\n"
             f"$tickHold = {hold}\n"
             "$tickHook = {\n"
@@ -134,7 +143,7 @@ class _Share(unittest.TestCase):
             "}\n"
             "try {\n"
             f"  $r = & {_q(UM_RUN)} -ScriptPath {_q(self.job)} -AgentShare {_q(self.share)} "
-            f"-PollSeconds 1 -JobId 'demo' {' '.join(um_run_args)} -TestHookAtLoopTop $tickHook{queue_hook_arg}\n"
+            f"-PollSeconds 1 -JobId 'demo' {' '.join(um_run_args)} -TestHookAtLoopTop $tickHook{queue_hook_arg}{claim_hook_arg}\n"
             "  Write-Output ('E2E_RESULT=OK EXIT=' + $r.exitCode)\n"
             "} catch {\n"
             f"  Set-Content -LiteralPath {_q(self.verdict_path)} -Value ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()) -Encoding ascii\n"
@@ -1302,12 +1311,25 @@ class UmRunEndToEndTests(_Share):
             "-Value ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()) -Encoding ascii "
             "}"
         )
+        # UMRUN-SIBLING-1122-WAIT-LOCUS-1 r2: the claim instant is stamped by the client calling
+        # -TestHookAfterQueueDeadlineClaim the moment it sets $claimedAt. The hook reads the real
+        # clock (same PowerShell UtcNow as the other stamps) and is NOT handed $claimedAt: a client
+        # whose claim is anchored wrongly (an hour back) would otherwise vouch for its own claim.
+        # The in-wait bound below is anchored to this true wait entry and not to poll 2, which
+        # comes later by however long the scheduler delays it.
+        claim_at_path = self.tmp / "claim-at.log"
+        claim_hook = (
+            "{ "
+            f"Set-Content -LiteralPath {_q(claim_at_path)} "
+            "-Value ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()) -Encoding ascii "
+            "}"
+        )
         # The started marker's presence keeps a client waiting past its budget; it is removed (in the
         # client, on poll 2) so the stale-heartbeat verdict can fire (see the skew test above).
         remove_marker = f"Remove-Item -LiteralPath {_q(marker_path)} -Force"
         proc = self.start_ticked("-TimeoutSec", str(timeout_sec), "-MaxQueueWaitSec", "0",
                                  "-MaxHeartbeatAgeSec", "2", queue_deadline_hook=hook,
-                                 tick_action=(2, remove_marker))
+                                 tick_action=(2, remove_marker), claim_hook=claim_hook)
         try:
             stdout, stderr = proc.communicate(timeout=timeout_sec + 90)
         finally:
@@ -1322,10 +1344,11 @@ class UmRunEndToEndTests(_Share):
         # The anchor is judged by TIME ALONE: a correct client sets claimedAt after the hook stamped
         # marker_placed_at and throws only once Now >= claimedAt + timeout_sec, so its verdict is
         # >= timeout_sec after the stamp whatever the scheduler does and however many polls it got
-        # (0.5 s of slack covers scheduling and process start between the hook's stamp and the
-        # client's own claim; both the stamp and the verdict come from PowerShell
-        # DateTimeOffset.UtcNow, so it is not a PowerShell/Python clock difference, and the stamps'
-        # own truncation is <= 2 ms). The hour-back client
+        # (the 0.5 s of slack covers the stamps' millisecond truncation and a system-clock
+        # adjustment between the two samples; the interval between the hook's stamp and the
+        # client's own claim can only make decided_after LONGER and no process start happens in it,
+        # so it needs no slack; both the stamp and the verdict come from PowerShell
+        # DateTimeOffset.UtcNow, so it is not a PowerShell/Python clock difference). The hour-back client
         # decides on poll 2, about a second after the stamp. No poll-count bound is asserted: one
         # would reject a correct client whose polls were delayed (UMRUN-SIBLING-1122-VACUOUS-1 r3,
         # sol r2 BLOCKER); only the floor of two polls is, since the marker is removed on the second.
@@ -1335,24 +1358,30 @@ class UmRunEndToEndTests(_Share):
         #
         # UMRUN-SIBLING-1122-WAIT-LOCUS-1: elapsed wall time alone does not say WHERE the wait
         # happened, so the facts also record the wait locus. The client enters its claimed wait at
-        # poll 2 (the first loop top after the queue-deadline site set claimedAt and `continue`d; the
-        # tick hook stamps it with the same PowerShell clock) and leaves it at the throw its wrapper
-        # stamps as verdict_at. pre_wait is the time before that entry (the hook stamp to poll 2: no
-        # waiting by the client, only scheduling), in_wait the time inside it, tail the time from the
-        # last poll to the verdict, max_tick_gap the longest pause between two polls (a stall inside
-        # the wait shows as a gap far above the 1 s poll interval). A stall in pre_wait pushes
-        # decided_after over the bound for a client that decided at once; in_wait is judged below.
+        # the claim instant it hands to the claim hook (claim_at) and leaves it at the throw its
+        # wrapper stamps as verdict_at; all stamps are the same PowerShell clock. pre_wait is the
+        # time before that entry (the hook stamp to the claim: no waiting by the client, only
+        # scheduling), in_wait the time inside it, sched_gap the claim -> poll-2 gap (a scheduling
+        # delay between the claim and the first poll, which a correct client may have and which is
+        # recorded, not judged), tail the time from the last poll to the verdict, max_tick_gap the
+        # longest pause between two polls (a stall inside the wait shows as a gap far above the 1 s
+        # poll interval). A stall in pre_wait pushes decided_after over the bound for a client that
+        # decided at once; in_wait is judged below.
         all_ticks = self.ticks()
         verdict_time = self.verdict_at()
         tick2_at = next((at for number, at in all_ticks if number == 2), None)
-        locus_facts = " wait_locus=unknown(no poll 2)"
-        if tick2_at is not None:
+        claim_at = (int(claim_at_path.read_text(encoding="ascii").strip()) / 1000.0
+                    if claim_at_path.exists() else None)
+        locus_facts = " wait_locus=unknown(no claim stamp)"
+        if claim_at is not None:
             wait_ticks = [at for number, at in all_ticks if number >= 2]
             gaps = [later - earlier for earlier, later in zip(wait_ticks, wait_ticks[1:])]
+            sched_gap = f"{tick2_at - claim_at:.3f}s" if tick2_at is not None else "none"
             locus_facts = (
-                f" pre_wait={tick2_at - marker_placed_at:.3f}s in_wait={verdict_time - tick2_at:.3f}s"
-                f" tail={verdict_time - wait_ticks[-1]:.3f}s polls_in_wait={len(wait_ticks)}"
-                f" max_tick_gap={max(gaps, default=0.0):.3f}s")
+                f" claim_at={claim_at:.3f} pre_wait={claim_at - marker_placed_at:.3f}s"
+                f" in_wait={verdict_time - claim_at:.3f}s sched_gap={sched_gap}"
+                f" tail={verdict_time - (wait_ticks[-1] if wait_ticks else claim_at):.3f}s"
+                f" polls_in_wait={len(wait_ticks)} max_tick_gap={max(gaps, default=0.0):.3f}s")
         timing_facts = (
             f"decided_after={decided_after:.3f}s marker_placed_at={marker_placed_at:.3f} "
             f"verdict_at={verdict_time:.3f} tick2_at="
@@ -1369,17 +1398,20 @@ class UmRunEndToEndTests(_Share):
             len(self.ticks()), 2,
             "the client never reached its second poll, the one on which the marker is removed")
         # The waited interval must lie INSIDE the wait region: the time the client spent between
-        # entering its claimed wait (poll 2) and its verdict has to cover the budget by itself, so
-        # a stall before the wait (pre_wait) cannot carry decided_after over the bound above for a
-        # client that decided at once. Same 0.5 s slack as above (it also covers the sliver between
-        # the claim and poll 2's stamp); the bound is not looser than the one above.
-        self.assertIsNotNone(tick2_at, f"no poll-2 stamp, so the wait locus is unknown [{timing_facts}]")
+        # entering its claimed wait and its verdict has to cover the budget by itself, so a stall
+        # before the wait (pre_wait) cannot carry decided_after over the bound above for a client
+        # that decided at once. The wait is measured from the CLAIM INSTANT the client itself
+        # stamped, never from poll 2: a correct client throws once Now >= claimedAt + timeout_sec
+        # whatever delays its first poll, so a scheduling delay between the claim and poll 2
+        # (sched_gap) cannot fail it (r2, sol r1 BLOCKER). Same 0.5 s slack as above (stamp
+        # truncation and system-clock adjustment only); the bound is not looser than the one above.
+        self.assertIsNotNone(claim_at, f"no claim stamp, so the wait locus is unknown [{timing_facts}]")
         self.assertGreaterEqual(
-            verdict_time - tick2_at, timeout_sec - 0.5,
-            f"the client's verdict came {verdict_time - tick2_at:.1f}s after it entered its claimed "
-            f"wait (poll 2), inside its own {timeout_sec}s budget: the {decided_after:.1f}s measured "
-            "from the marker stamp was spent before the wait began (scheduler or hook time), not "
-            f"waiting [{timing_facts}]")
+            verdict_time - claim_at, timeout_sec - 0.5,
+            f"the client's verdict came {verdict_time - claim_at:.1f}s after it entered its claimed "
+            f"wait (its claim instant), inside its own {timeout_sec}s budget: the {decided_after:.1f}s "
+            "measured from the marker stamp was spent before the wait began (scheduler or hook time), "
+            f"not waiting [{timing_facts}]")
         # Whitespace-flattened, with "|" removed: PowerShell's own default uncaught-exception
         # formatting word-wraps a long message at a fixed console width, prefixing each
         # continuation line with a literal "| " margin -- both would otherwise split a long

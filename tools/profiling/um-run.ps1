@@ -124,7 +124,14 @@ param(
     # (round 12, item 3) to prove the structural catch around the whole loop converts it to
     # UNRESOLVED rather than letting it propagate raw or be misclassified CLASS=UNKNOWN by a
     # caller. Production never passes this.
-    [scriptblock]$TestHookAtLoopTop = $null
+    [scriptblock]$TestHookAtLoopTop = $null,
+    # Test-only: invoked with no arguments immediately after the QUEUE-DEADLINE recheck sets
+    # $claimedAt and before the `continue` -- lets a test stamp, from its own clock, the instant the
+    # client's claimed wait begins (UMRUN-SIBLING-1122-WAIT-LOCUS-1 r2), instead of the later poll-2
+    # stamp, which a scheduling delay can push past it. Deliberately NOT handed $claimedAt itself: a
+    # client whose claim is anchored wrongly must not be able to vouch for its own claim instant.
+    # Production never passes this.
+    [scriptblock]$TestHookAfterQueueDeadlineClaim = $null
 )
 
 $ErrorActionPreference = "Stop"
@@ -349,6 +356,7 @@ while ($true) {
             if ($deadlineClaim -eq 'launched') {
                 $claimedAt      = [DateTimeOffset]::Now
                 $budgetDeadline = $claimedAt.AddSeconds($TimeoutSec)
+                if ($TestHookAfterQueueDeadlineClaim) { & $TestHookAfterQueueDeadlineClaim }
                 continue
             }
             if ($deadlineClaim -ne 'none') {
