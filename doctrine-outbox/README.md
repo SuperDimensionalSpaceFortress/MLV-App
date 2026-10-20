@@ -75,6 +75,48 @@ pattern, a user-home path, this host's name or account name, or anything in an o
 adds its own deny terms: `.claude-state`, `subject-ledger`, `fleet-runs`, `HUB_RUN_WAL`, `dual-lane`, and
 the name of the GPU host. A refusal names the class, never the matched value.
 
+## Ruling candidates name what they supersede (ROUTE-RULING-SUPERSEDES-1)
+
+A ruling candidate is an item with a heading or body line that opens with `Ruling candidate` (any case, zero or more
+spaces or hyphens between the words, whole words, optionally after `Proposed`, `Draft` or `New`) once its text is
+rendered (HTML entities decoded, HTML tags dropped with their text kept, a table row split into cells) and normalised
+(Unicode NFKD with combining marks dropped, then NFKC, zero-width and other format characters deleted so they never join
+two words, no-break spaces and en or em dashes made plain) and its markdown
+is off: list bullets (`-`, `*`, `+`, `1.`), quote marks (`>`), heading
+marks (`#`), bold, italics and backticks, whatever follows (`:`, ` (r2):`, ` - `, the end of the line). A heading
+line also counts when the phrase follows ` - ` or `:` (`### mlv-app, 2026-10-16 - RULING CANDIDATE (r2): X`). A line
+that only mentions the phrase mid-sentence is not a marker, and neither is a wrapped continuation line: a marker only
+sits where a block opens: the item's first line, a line after a blank one, a line right after an ATX heading, a setext
+underline, a thematic break (`---`, `***`, `___`) or a code-fence line (backtick or tilde, opening or closing), a
+heading, a list item, a table cell, a blockquote opener, a setext line. So prose that wraps onto `ruling-candidates/x.md`
+is left alone. A marker inside a fence still counts (the check fails closed). Exotic forms (hidden HTML comments,
+definition lists, footnotes, look-alike letters from other scripts) are out of scope: card ROUTE-RULING-MARKUP-FORMS-1. It must declare what it overlaps, so the producer finds a contradiction before the reviewer does
+(seed: PR 469 r1). `validate` refuses one without a `touches/supersedes:` declaration (`touches:` and `supersedes:`
+count too, as does `Relationship to existing doctrine:`, the field of the bus candidate template; same list and target
+rules; bold and a bullet allowed, entries add up across labels). Each entry may open with one verb (`extends`,
+`supersedes`, `distinguishes`, `touches`, `narrows`, `adopts`), whose target is still checked. The entries are rule ids (`R15`, `R14.8`) or
+bus-relative paths (`RULINGS.md:1126-1152`, `tools/fleet-sweep.mjs`), comma or semicolon separated on the label line
+or as bullets under it, or the single entry `none: <reason of at least 4 words>`. A label inside a fenced block does
+not count. Typed refusals (exit 1):
+- `RULING_CANDIDATE_NO_SUPERSEDES`: no label, or an empty one;
+- `RULING_CANDIDATE_NONE_NEEDS_REASON`: `none` with fewer than 4 reason words;
+- `RULING_CANDIDATE_NONE_WITH_RULES`: `none` beside another entry;
+- `RULING_CANDIDATE_TARGET_MALFORMED`: an entry that is not a rule id or a bus-relative path (absolute, `..` and
+  backslash paths and bare words are not targets);
+- `RULING_CANDIDATE_TARGET_NOT_ON_BUS`: with a bus clone (`validate --bus PATH`, default `$FACTORY_BUS_CLONE`), an
+  entry the clone does not hold at its committed tip: a path that `git cat-file -e HEAD:<path>` cannot find, or a
+  rule id that is not a heading or bold bullet of `RULINGS.md` (prose mentions and `R15` against `R150` or `R15.3`
+  do not count). Line ranges and anchors are not checked. The bus is only read.
+
+A bus clone that cannot be read is UNKNOWN `RULING_BUS_UNREADABLE` (exit 2), never a pass. With no bus the shape is
+still checked and `validate` prints a NOTE naming the targets it could not check. Non-ruling items are not looked at,
+the drain does not apply this check, and an item already sent is not re-judged. The 450-word cap still holds, so a
+candidate replaces its prose "relationship" block with the list.
+
+`validate --bus` is defined once. PR 514 (`--exercise`) adds the same option; whichever of the two merges second keeps
+exactly ONE `validate_p.add_argument("--bus", ...)`, because argparse raises on a duplicate for every subcommand, the
+push hook included. A test asserts `build_parser()` defines it exactly once.
+
 ## Concerns to the CoS (COS-CONCERN-CHANNEL-1)
 
 A project had no way to tell the CoS a concern: only the CoS writes `cos-feedback/`, and a project-owned
