@@ -125,13 +125,15 @@ param(
     # UNRESOLVED rather than letting it propagate raw or be misclassified CLASS=UNKNOWN by a
     # caller. Production never passes this.
     [scriptblock]$TestHookAtLoopTop = $null,
-    # Test-only: invoked with no arguments immediately after the QUEUE-DEADLINE recheck sets
-    # $claimedAt and before the `continue` -- lets a test stamp, from its own clock, the instant the
-    # client's claimed wait begins (UMRUN-SIBLING-1122-WAIT-LOCUS-1 r2), instead of the later poll-2
-    # stamp, which a scheduling delay can push past it. Deliberately NOT handed $claimedAt itself: a
-    # client whose claim is anchored wrongly must not be able to vouch for its own claim instant.
-    # Production never passes this.
-    [scriptblock]$TestHookAfterQueueDeadlineClaim = $null
+    # Test-only: invoked with no arguments TWICE at the QUEUE-DEADLINE claim site -- immediately
+    # BEFORE the recheck sets $claimedAt and again immediately after it, before the `continue`
+    # (UMRUN-SIBLING-1122-WAIT-LOCUS-1 r3). A test stamps its own clock in each call: the first
+    # stamp (claim_lo) is never later than the true claim instant, the second (claim_hi) never
+    # earlier, so the claim is bracketed and a scheduling pause on either side of $claimedAt cannot
+    # make a correct client look early. Deliberately NOT handed $claimedAt itself: a client whose
+    # claim is anchored wrongly must not be able to vouch for its own claim instant. Production never
+    # passes this.
+    [scriptblock]$TestHookAroundQueueDeadlineClaim = $null
 )
 
 $ErrorActionPreference = "Stop"
@@ -354,9 +356,10 @@ while ($true) {
             if ($TestHookAtQueueDeadline) { & $TestHookAtQueueDeadline }
             $deadlineClaim = Get-UmRunClaimState -Path $startedMarker
             if ($deadlineClaim -eq 'launched') {
+                if ($TestHookAroundQueueDeadlineClaim) { & $TestHookAroundQueueDeadlineClaim }
                 $claimedAt      = [DateTimeOffset]::Now
                 $budgetDeadline = $claimedAt.AddSeconds($TimeoutSec)
-                if ($TestHookAfterQueueDeadlineClaim) { & $TestHookAfterQueueDeadlineClaim }
+                if ($TestHookAroundQueueDeadlineClaim) { & $TestHookAroundQueueDeadlineClaim }
                 continue
             }
             if ($deadlineClaim -ne 'none') {
