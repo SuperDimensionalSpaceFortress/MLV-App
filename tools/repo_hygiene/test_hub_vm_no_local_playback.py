@@ -1081,7 +1081,8 @@ def _differential_corpus(seeds: tuple[str, ...], members: tuple = ()) -> dict[st
 # NA2-RULE4-PER-LAUNCHER-SCOPE-1 r15 (merge of fork/master aed62a12): 34676 on master's seeds, plus the 4365 rows the RULE4_* seed catalogues of
 # this PR add (_full_differential_corpus lists them after CLAUSE_MUST_PASS_R13) = 39041. Derived, not estimated: the same expression without the
 # RULE4_* seeds still yields exactly 34676 under this PR's lint, so no row of master's corpus was lost.
-DIFFERENTIAL_CORPUS_ROWS = 39041
+# NA2-RULE4-SENTENCE-SPLIT-AND-CODESPAN-APP-1: + the 5 CoS / amend rows (RULE4_SPLIT_SEEDS) = 39046 (derived: 39041 without them).
+DIFFERENTIAL_CORPUS_ROWS = 39046
 
 
 def _full_differential_corpus(work: Path) -> dict[str, dict]:
@@ -1096,7 +1097,7 @@ def _full_differential_corpus(work: Path) -> dict[str, dict]:
                                 + PromptLintTests.CLAUSE_MUST_REFUSE_R13 + PromptLintTests.CLAUSE_MUST_PASS_R13
                                 + RULE4_SECOND_LAUNCHER_REFUSE + RULE4_SECOND_LAUNCHER_GUARDS + RULE4_BOTH_ROUTED_PASS
                                 + RULE4_R2_REFUSE + RULE4_R2_GUARDS + RULE4_R2_PASS + RULE4_R2_B_APP_REFUSE + RULE4_R4_SEEDS + RULE4_R6_SEEDS + RULE4_R7_SEEDS
-                                + RULE4_R10_SEEDS
+                                + RULE4_R10_SEEDS + RULE4_SPLIT_SEEDS
                                 + PromptLintTests.PROBE_ROWS
                                 + tuple(text for _, _, text in PromptLintTests.DEFEATER_AXIS) + PromptLintTests.DEFEATER_AXIS_CONTROLS,
                                 members=tuple(_list_member_rows(_lint_word_lists(LINT_PS1, work))))
@@ -1886,6 +1887,113 @@ def _rule4_r10_fuzz_rows(seed: int = RULE4_R10_FUZZ_SEED, count: int = RULE4_R10
 
 RULE4_R10_FUZZ_REFUSE, RULE4_R10_FUZZ_PASS = _rule4_r10_fuzz_rows()
 
+# NA2-RULE4-SENTENCE-SPLIT-AND-CODESPAN-APP-1 (the successor card of #465: CoS review 6231429063 soft notes on 318d5bac, and amends (a) and
+# (b) of the #465 r10 keys, ledger 2026-10-17T09:25:22Z). Refuse-only TIGHTENINGS: the pin RULE4_PRE_CHANGE_MASTER passes every RED row
+# below, so none of them is a parity flip.
+#  (1) Sentence split. Rule 4 reads one sentence at a time, so an app call with an argument in one sentence and its playback mode flag in
+#      the next one (`Run <app> <clip>. Add <mode>.`) was never one launch. A mode flag that no app launch of its own sentence holds (an
+#      ORPHAN flag) now reaches the ADJACENT sentences of its block: an app call there is scored as if the flag stood in its own sentence
+#      (the r10 reading), and so is an app token that ends its sentence (`Run <app>. Add <mode>.`, the no-argument twin).
+#  (2) Code span. The app pattern's quote class after `.exe` held ' and " only, so a code span closed right after the token
+#      (``Run `<app>` <mode>.``) passed (amend (a), RULE4-DIRECT-APP-BACKTICK-CLOSE-1). The tracked-script pattern had the same class
+#      (``Run `<script>` -Backend cpu.``) and is fixed with it.
+#  (b) RULE4-SLASH-MENTION-GUARD-ASYMMETRY-1: KEPT FAIL-CLOSED (RULE4_SPLIT_SLASH_GUARDS). Measured: the pin passes those rows and the base
+#      head refuses them (an r9 over-refusal: the clip launch has no separator-slash guard). Keeping them refused is a tightening against
+#      the pin, never a flip; mirroring the guard would be a refuse -> pass loosening against master, which a refuse-only card does not
+#      make. The prose passes once it stands in a sentence of its own (a `mention` row below).
+# Fixtures keep this file's `.dat` clip-name convention.
+RULE4_SPLIT_BASE_HEAD = "40b8e6a4913b6c92071b886c085b17d85e32a8be"  # fork/master this card branched from (#465 merged there)
+RULE4_SPLIT_SEPARATORS = (". ", "! ", "? ", ".\n")
+RULE4_SPLIT_MODE_SENTENCES = ("Add {m}", "Then add {m}", "{m}")
+RULE4_SPLIT_MODE_LEADS = ("Use {m}", "Add {m}")
+RULE4_SPLIT_ARGS = ("take01.dat", "--clip=take01.dat", "take01")
+
+
+def _rule4_split_rows() -> dict[str, tuple[str, ...]]:
+    """`named` (the CoS rows, `.dat` fixtures), `grid` (the app call with an argument, then the orphan mode flag in the next sentence, or the
+    flag first), `noarg` (the same with the app token ending its sentence), `codespan` (the app or script token in a code span closed
+    right after it), each with its routed twins (`*_routed`, must pass), `mention` (controls that must pass), `slash` (amend (b): the
+    slash-list prose in a sentence that also holds a routed launch; the base head refuses it and it stays refused, the pin passes it) and
+    `span_guards` (the mode flag in a code span of its own, refused by the base head already)."""
+    app_release = "MLVApp" + "Release.exe"
+    script = f"tools/profiling/{SMOKE_SCRIPT}"
+    named = (f"Run {app_release} take01.dat. Add {SMOKE_MODE}.",
+             f"Run `{app_release}` {SMOKE_MODE}.",
+             f"Run `C:\\build\\{app_release}` take01.dat {SMOKE_MODE}.",
+             f"Run {app_release}. Add {SMOKE_MODE}.",
+             f"Run `{script}` -Backend cpu.")
+    grid: list[str] = []
+    grid_routed: list[str] = []
+    noarg: list[str] = []
+    noarg_routed: list[str] = []
+    for verb, app, sep, mode in itertools.product(("Run", "Start"), (APP, app_release), RULE4_SPLIT_SEPARATORS, (SMOKE_MODE, PROFILE_MODE)):
+        for arg in RULE4_SPLIT_ARGS:
+            for tail in RULE4_SPLIT_MODE_SENTENCES:
+                grid.append(f"{verb} {app} {arg}{sep}{tail.format(m=mode)}.")
+                grid_routed.append(f"{verb} {app} {arg} {RULE4_R7_ROUTE}{sep}{tail.format(m=mode)}.")
+            for lead in RULE4_SPLIT_MODE_LEADS:
+                grid.append(f"{lead.format(m=mode)}{sep}{verb} {app} {arg}.")
+                grid_routed.append(f"{lead.format(m=mode)}{sep}{verb} {app} {arg} {RULE4_R7_ROUTE}.")
+        for tail in RULE4_SPLIT_MODE_SENTENCES:
+            noarg.append(f"{verb} {app}{sep}{tail.format(m=mode)}.")
+            noarg_routed.append(f"{verb} {app} {RULE4_R7_ROUTE}{sep}{tail.format(m=mode)}.")
+        for lead in RULE4_SPLIT_MODE_LEADS:
+            noarg.append(f"{lead.format(m=mode)}{sep}{verb} {app}.")
+            noarg_routed.append(f"{lead.format(m=mode)}{sep}{verb} {app} {RULE4_R7_ROUTE}.")
+    codespan: list[str] = []
+    codespan_routed: list[str] = []
+    span_guards: list[str] = []
+    for verb, app, mode in itertools.product(("Run", "Start", "Launch"), (APP, app_release, f"C:\\build\\{app_release}"), (SMOKE_MODE, PROFILE_MODE)):
+        for call in (f"`{app}` {mode}", f"`{app}` take01.dat {mode}", f"`{app}` --clip=take01.dat {mode}"):
+            codespan.append(f"{verb} {call}.")
+            codespan_routed.append(f"{verb} {call} {RULE4_R7_ROUTE}.")
+        # the mode flag in a code span of its own: the base head already refuses it (r10, an orphan flag in the app's own sentence)
+        span_guards.append(f"{verb} `{app}` `{mode}`.")
+        # refuse-only: a code-span launch that is the sentence's only direct launch must not switch off the r10 no-argument scoring
+        # (`<app>;` before it), which the base head applies because it saw no direct launch there
+        span_guards.append(f"Build `{app}`; then run `{app_release}` take01.dat {mode} {RULE4_R7_ROUTE}.")
+        span_guards.append(f"Build `{app}` ; then {verb.lower()} `C:\\build\\{app_release}` {mode} {RULE4_R7_ROUTE}.")
+    for verb, call in itertools.product(("Run", "Start"), (f"`{script}` -Backend cpu", f"`.\\{script}` -Backend cuda", f"& `{script}` -Backend cpu")):
+        codespan.append(f"{verb} {call}.")
+        codespan_routed.append(f"{verb} {call} {RULE4_R7_ROUTE}.")
+    mention: list[str] = []
+    for app, sep, mode in itertools.product((APP, app_release), RULE4_SPLIT_SEPARATORS, (SMOKE_MODE, PROFILE_MODE)):
+        # the card's controls: the app across two sentences with no mode flag, and a code span with the app and no mode flag
+        mention.append(f"Read the {app} log{sep}Then copy {app} take01.dat to the run dir.")
+        mention.append(f"Grep for `{app}` in every launcher{sep}Then read the summary.")
+        # the next sentence's flag belongs to a launch of its own (routed), so it is no orphan and the app mention stays a mention
+        mention.append(f"Build {app}{sep}Then run C:\\build\\{app_release} take01.dat {mode} {RULE4_R7_ROUTE}.")
+        mention.append(f"Copy {app} to the share{sep}Then run C:\\build\\{app_release} take01.dat {mode} {RULE4_R7_ROUTE}.")
+        # a separator slash is no argument (the mention path's guard), across a sentence too
+        mention.append(f"Grep for {app} / --seconds in every launcher{sep}Add {mode} to the venue job {RULE4_R7_ROUTE}.")
+        # a heading ends the reach of an orphan flag (a block ends at a heading)
+        mention.append(f"Run {app} take01.dat{sep.rstrip(' ')}\n## Next\nAdd {mode}.")
+        # an app mention after a sentence whose flag a routed launch holds
+        mention.append(f"The venue job runs C:\\build\\{app_release} take01.dat {mode} {RULE4_R7_ROUTE}{sep}{app} writes its log to the run dir.")
+    slash: list[str] = []
+    for app, mode, sep in itertools.product((APP, app_release), (SMOKE_MODE, PROFILE_MODE), (", then run ", "; then run ")):
+        slash.append(f"Grep for {app} / --seconds in every launcher{sep}C:\\build\\{app_release} take01.dat {mode} {RULE4_R7_ROUTE}.")
+        slash.append(f"Grep for {app} / --seconds / --autoplay / {mode} in every launcher{sep}C:\\build\\{app_release} take01.dat {mode} {RULE4_R7_ROUTE}.")
+    sets = {"named": named, "grid": grid, "grid_routed": grid_routed, "noarg": noarg, "noarg_routed": noarg_routed, "codespan": codespan,
+            "codespan_routed": codespan_routed, "mention": mention, "slash": slash, "span_guards": span_guards}
+    return {k: tuple(dict.fromkeys(v)) for k, v in sets.items()}
+
+
+_RULE4_SPLIT = _rule4_split_rows()
+RULE4_SPLIT_NAMED = _RULE4_SPLIT["named"]
+RULE4_SPLIT_GRID = _RULE4_SPLIT["grid"]
+RULE4_SPLIT_NOARG = _RULE4_SPLIT["noarg"]
+RULE4_SPLIT_CODESPAN = _RULE4_SPLIT["codespan"]
+RULE4_SPLIT_REFUSE = tuple(dict.fromkeys(RULE4_SPLIT_NAMED + RULE4_SPLIT_GRID + RULE4_SPLIT_NOARG + RULE4_SPLIT_CODESPAN))
+RULE4_SPLIT_PASS = tuple(dict.fromkeys(_RULE4_SPLIT["grid_routed"] + _RULE4_SPLIT["noarg_routed"] + _RULE4_SPLIT["codespan_routed"]
+                                       + _RULE4_SPLIT["mention"]))
+# amend (b), kept fail-closed: the pin passes them, the base head and this head refuse them (pinned in the sweep): no RED rows, no flip
+RULE4_SPLIT_SLASH_GUARDS = _RULE4_SPLIT["slash"]
+# the double code span (`<app>` `<mode>`): refused by the base head already, so no RED row; pinned so the fix keeps it refused
+RULE4_SPLIT_SPAN_GUARDS = _RULE4_SPLIT["span_guards"]
+# the rows the differential corpus carries as seeds (the CoS rows); the grid is judged by the split tests
+RULE4_SPLIT_SEEDS = RULE4_SPLIT_NAMED
+
 # r9 quote-class pin (CoS review 6230178238, Prevention; the B4 root cause). In a PowerShell double-quoted string a backtick escapes the NEXT
 # character, so `"['`"]"` silently evaluates to `['"]`: the class the author meant to hold a backtick does not. A comment can claim a
 # quote set the pattern does not hold, and a test on rows only sees it when a row happens to use that character. This reads the EVALUATED
@@ -1903,9 +2011,14 @@ RULE4_QUOTE_CLAIMS: dict[str, tuple[tuple[str, ...], int]] = {
     "pwshStop": (("'", '"'), 2),
     # a quotation of the incident wording opens with any of the three
     "incident": (("'", '"', "`"), 1),
+    # NA2-RULE4-SENTENCE-SPLIT-AND-CODESPAN-APP-1 (amend (a)): the app token and the tracked-script token close like the other app tokens
+    # (a markdown code span). The app pattern's own class, the two of appStop inside its gap, and the script pattern's class.
+    "direct": (("'", '"', "`"), 4),
+    # the app token that ends its sentence (the no-argument twin across a sentence) closes the same way
+    "appEnd": (("'", '"', "`"), 1),
 }
 # the r8 lead pieces (d30d1365); r9 deleted them with the lead lookbehind, the RED/GREEN proof below still reads them at that head
-RULE4_QUOTE_CLAIMS_R8 = {**{k: v for k, v in RULE4_QUOTE_CLAIMS.items() if k not in ("appBare", "clipMention")}, "leadOpen": (("'", '"', "`"), 1), "leadWords": (("'", '"', "`"), 2), "leadPath": (("'", '"', "`"), 1)}
+RULE4_QUOTE_CLAIMS_R8 = {**{k: v for k, v in RULE4_QUOTE_CLAIMS.items() if k not in ("appBare", "clipMention", "direct", "appEnd")}, "leadOpen": (("'", '"', "`"), 1), "leadWords": (("'", '"', "`"), 2), "leadPath": (("'", '"', "`"), 1)}
 # A deliberate single backtick before a bracket or an apostrophe inside a double-quoted pattern string must be named here with its
 # reason (none today; the `"` delimiter escape is the one legitimate single backtick and is covered by the evaluated check).
 RULE4_BACKTICK_ESCAPES: dict[str, str] = {}
@@ -3169,6 +3282,62 @@ class PromptLintTests(unittest.TestCase):
         self.assertEqual([], [t for t in RULE4_R10_GLUED_ROUTE if old[t] > 0], f"glued-route rows {r9[0]} refuses: they open only because of the hole")
         self.assertEqual([], [t for t in earlier if (old[t] > 0) != (new[t] > 0)][:20], f"an earlier rule-4 row changed its verdict against {r9[0]}")
 
+    def test_red_rule4_split_an_orphan_mode_flag_and_a_code_span_token_never_hide_the_launch(self):
+        """NA2-RULE4-SENTENCE-SPLIT-AND-CODESPAN-APP-1 (CoS review 6231429063 soft notes; amend (a) of the #465 r10 keys): an app call whose
+        mode flag stands in the ADJACENT sentence of its block (`Run <app> <clip>. Add <mode>.`, either order, and the no-argument twin) and
+        an app or script token in a code span closed right after it (``Run `<app>` <mode>.``) refuse; the same calls with their own route
+        pass, and so do the controls: the app across two sentences with no mode flag, a code span with no mode flag, a flag a routed launch
+        holds, a slash list in a sentence of its own, a heading between the call and the flag."""
+        self.assertEqual(5, len(RULE4_SPLIT_NAMED))
+        self.assertTrue(RULE4_SPLIT_GRID and RULE4_SPLIT_NOARG and RULE4_SPLIT_CODESPAN and RULE4_SPLIT_SLASH_GUARDS and RULE4_SPLIT_SPAN_GUARDS)
+        rows = list(dict.fromkeys(RULE4_SPLIT_REFUSE + RULE4_SPLIT_SLASH_GUARDS + RULE4_SPLIT_SPAN_GUARDS))
+        counts = _json_counts(LINT_PS1, rows, self.tmp, "rule4-split-refuse")
+        self.assertEqual([], [t for t, n in zip(rows, counts) if n == 0][:20], "split / code-span rows the lint passed that it must refuse")
+        rows = list(RULE4_SPLIT_PASS)
+        counts = _json_counts(LINT_PS1, rows, self.tmp, "rule4-split-pass")
+        self.assertEqual([], [t for t, n in zip(rows, counts) if n > 0][:20], "routed twins and mention controls the lint refused")
+
+    def test_rule4_split_sweep_is_refuse_only_against_the_pin(self):
+        """The split / code-span sweep against the PINNED pre-change master, with an EMPTY allow-list: no row the pin refuses passes on the
+        head; every RED row passes on the pin (a tightening, never a parity flip); every routed twin and control passes on the pin too.
+        Amend (b), kept fail-closed: the slash rows pass on the pin and refuse on the head. It does not skip once master carries this lint."""
+        self.maxDiff = None
+        pin = _rule4_r1_head_lint(RULE4_PRE_CHANGE_MASTER, "pre-change master", moot_once_master_carries_it=False)
+        path = self.tmp / "rule4-split-pin.ps1"
+        path.write_text(pin[1], encoding="utf-8")
+        texts = list(dict.fromkeys(RULE4_SPLIT_REFUSE + RULE4_SPLIT_PASS + RULE4_SPLIT_SLASH_GUARDS + RULE4_SPLIT_SPAN_GUARDS))
+        _prefetch_counts(self.tmp, [(path, texts, "rule4-split-pin"), (LINT_PS1, texts, "rule4-split-now")])
+        old = dict(zip(texts, _verdicts(path, texts)))
+        new = dict(zip(texts, _verdicts(LINT_PS1, texts)))
+        self.assertEqual([], [t for t in texts if old[t] > 0 and new[t] == 0][:20], f"rows {pin[0]} refuses that now pass")
+        self.assertEqual([], [t for t in RULE4_SPLIT_REFUSE if old[t] > 0][:20], f"{pin[0]} refuses a RED row: it would be a parity restore, not a tightening")
+        self.assertEqual([], [t for t in RULE4_SPLIT_PASS if old[t] > 0][:20], f"routed twins or controls {pin[0]} refuses")
+        self.assertEqual([], [t for t in RULE4_SPLIT_SLASH_GUARDS if old[t] > 0 or new[t] == 0][:20],
+                         "amend (b) rows: the pin passes them and the head keeps them refused (mirroring the slash guard would open them)")
+
+    def test_rule4_split_rows_are_red_on_the_base_head_and_every_earlier_row_keeps_its_verdict(self):
+        """RED proof kept in the suite: every split / code-span RED row PASSES on the lint of RULE4_SPLIT_BASE_HEAD (fork/master when this card
+        branched), and the guards (amend (b), the double code span) refuse there already. Against that head nothing else moves: the routed
+        twins and controls keep passing and every earlier rule-4 row keeps its verdict. Skips once master carries this lint."""
+        self.maxDiff = None
+        base = _rule4_r1_head_lint(RULE4_SPLIT_BASE_HEAD, "split base")
+        path = self.tmp / "rule4-split-base.ps1"
+        path.write_text(base[1], encoding="utf-8")
+        earlier = list(dict.fromkeys(RULE4_R2_REFUSE + RULE4_R2_GUARDS + RULE4_SECOND_LAUNCHER_REFUSE + RULE4_SECOND_LAUNCHER_GUARDS
+                                     + RULE4_R2_PASS + RULE4_BOTH_ROUTED_PASS + RULE4_R4_REFUSE + RULE4_R4_PASS + RULE4_R6_REFUSE + RULE4_R6_PASS
+                                     + RULE4_R7_REFUSE + RULE4_R7_PASS + RULE4_R8_REFUSE + RULE4_R8_PASS + RULE4_R8_OVERREFUSAL
+                                     + RULE4_R9_REFUSE + RULE4_R9_PASS + RULE4_R2_B_APP_REFUSE + RULE4_R9_FUZZ_REFUSE + RULE4_R9_FUZZ_PASS
+                                     + RULE4_R10_REFUSE + RULE4_R10_GRID_ROUTED + RULE4_R10_GLUED_ROUTE + RULE4_R10_NOARG_ROUTED
+                                     + RULE4_R10_MENTION_PASS + RULE4_R10_FUZZ_REFUSE + RULE4_R10_FUZZ_PASS))
+        mine = list(dict.fromkeys(RULE4_SPLIT_REFUSE + RULE4_SPLIT_PASS + RULE4_SPLIT_SLASH_GUARDS + RULE4_SPLIT_SPAN_GUARDS))
+        _prefetch_counts(self.tmp, [(path, earlier + mine, "rule4-split-base"), (LINT_PS1, earlier + mine, "rule4-split-base-now")])
+        old = dict(zip(earlier + mine, _verdicts(path, earlier + mine)))
+        new = dict(zip(earlier + mine, _verdicts(LINT_PS1, earlier + mine)))
+        self.assertEqual([], [t for t in RULE4_SPLIT_REFUSE if old[t] > 0][:20], f"{base[0]} already refuses a split / code-span row: not a RED row")
+        self.assertEqual([], [t for t in RULE4_SPLIT_SLASH_GUARDS + RULE4_SPLIT_SPAN_GUARDS if old[t] == 0][:20], f"guards {base[0]} passes")
+        self.assertEqual([], [t for t in RULE4_SPLIT_PASS if old[t] > 0][:20], f"routed twins or controls {base[0]} refuses: the ALLOW rows must be unchanged")
+        self.assertEqual([], [t for t in earlier if (old[t] > 0) != (new[t] > 0)][:20], f"an earlier rule-4 row changed its verdict against {base[0]}")
+
     def test_rule4_every_quote_class_holds_every_character_its_comment_claims(self):
         """r9 (CoS Prevention, the B4 root cause): the EVALUATED patterns, not their source, hold the quote characters their comments claim.
         Static guard: evaluated-only for the delimiter escape (see RULE4_BACKTICK_ESCAPES), because a backtick before `"` is also the one
@@ -3799,6 +3968,12 @@ class LintDifferentialPinTests(unittest.TestCase):
          "of its own, so `--opt=value`, `/opt`, a bare token and an option chain of any length refuse (RULE4_R7_REFUSE, the generated "
          "argument-grammar sweep); master refused the B3 rows (the first app call reaches a mode flag over the next launcher) and passes the "
          "rows whose clip launch is the SECOND launcher (N1)."),
+        ("rule4-sentence-split-and-codespan",
+         lambda text, f: f.get("tpl") == "seed" and text in RULE4_SPLIT_SEEDS,
+         "NA2-RULE4-SENTENCE-SPLIT-AND-CODESPAN-APP-1 (CoS review 6231429063 soft notes on #465, amend (a) of the r10 keys; listed in the PR "
+         "body): refuse-only tightenings, the pin 2f8d1a97 and master pass all five RULE4_SPLIT_SEEDS rows. An orphan mode flag reaches the "
+         "app call of the adjacent sentence ('Run <app> <clip>. Add <mode>.', 'Run <app>. Add <mode>.'), and the app and script tokens close "
+         "with a backtick (``Run `<app>` <mode>.``, ``Run `<script>` -Backend cpu.``)."),
     )
 
     # r7 PREVIOUS-HEAD gate (CoS Prevention on a595464f). Against the lint of the PR head this round started from, NOTHING may open:
@@ -3884,6 +4059,11 @@ class LintDifferentialPinTests(unittest.TestCase):
          "r7: any first argument after the app that is not the next launcher is a launch of its own (RULE4_R7_REFUSE, the generated "
          "argument-grammar sweep): d2f3cd05 and master refuse only the rows whose first app call reaches a mode flag over a later "
          "launcher (196 of the 913 unrouted rows, the B3 rows among them) and pass the rest, which are the rows that flip."),
+        ("rule4-sentence-split-and-codespan",
+         lambda text, f: f.get("tpl") == "seed" and text in RULE4_SPLIT_SEEDS,
+         "NA2-RULE4-SENTENCE-SPLIT-AND-CODESPAN-APP-1 (CoS review 6231429063 soft notes on #465, amend (a) of the r10 keys; listed in the PR "
+         "body): refuse-only tightenings that d2f3cd05, the pin 2f8d1a97 and master all pass. An orphan mode flag reaches the app call of the "
+         "adjacent sentence, and the app and script tokens close with a backtick (a markdown code span)."),
     )
 
     # CI-LINTDIFF-PIN-HOSTED-COST-1 spawn ceiling: the most pwsh processes this class may start. Derivation, for the widest case (a baseline
