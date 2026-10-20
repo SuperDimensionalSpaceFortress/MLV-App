@@ -145,8 +145,11 @@ def run_pre_push(ob, repo: Path, monkeypatch, stdin_text: str) -> int:
 CANDIDATE_BUS_PATH = "tools/factory/doctrine_outbox.py"
 # The earlier card (20261016-doctrine-outbox-single-source-superset.md) is already on the bus with the previous
 # digest, and 20261019-doctrine-outbox-pin-aware-hook-candidate.md carries the pin-aware tool's digest; the tool
-# changed again (ruling candidates), so the steward is handed this one, which supersedes both.
+# changed again (ruling candidates, then the route exercise), so the steward is handed these two cards, each naming
+# the merged tool's digest. HANDOFF_CARD is the ruling-candidate one the route test follows; ROUTE_EXERCISE_CARD is the
+# route-exercise one.
 HANDOFF_CARD = REPO_ROOT / "doctrine-outbox" / "20261019-doctrine-outbox-ruling-supersedes-candidate.md"
+ROUTE_EXERCISE_CARD = REPO_ROOT / "doctrine-outbox" / "20261017-doctrine-outbox-route-exercise-candidate.md"
 OUTBOX_README = REPO_ROOT / "doctrine-outbox" / "README.md"
 
 
@@ -167,6 +170,11 @@ def test_the_steward_handoff_card_names_the_candidate_digest():
     assert _bus_candidate()["sha256_lf"] in HANDOFF_CARD.read_text(encoding="utf-8")
 
 
+def test_the_route_exercise_card_names_the_candidate_digest():
+    """Both steward cards offer the merged tool, so both quote its digest; neither may go stale."""
+    assert _bus_candidate()["sha256_lf"] in ROUTE_EXERCISE_CARD.read_text(encoding="utf-8")
+
+
 PIN_AWARE_FOLLOW_UP = "OUTBOX-PIN-AWARE-TOOL-AT-REF-1"
 
 
@@ -178,6 +186,7 @@ def test_surfaces_keep_the_local_copy_and_name_the_pin_aware_follow_up():
     surfaces = {
         "config": (REPO_ROOT / "doctrine-outbox.config.json").read_text(encoding="utf-8"),
         "card": HANDOFF_CARD.read_text(encoding="utf-8"),
+        "route-exercise card": ROUTE_EXERCISE_CARD.read_text(encoding="utf-8"),
         "readme": OUTBOX_README.read_text(encoding="utf-8"),
         "tool docstring": ast.get_docstring(ast.parse(TOOL_SRC.read_text(encoding="utf-8"))) or "",
     }

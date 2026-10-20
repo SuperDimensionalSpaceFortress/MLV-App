@@ -246,6 +246,25 @@ def validate_exe(path: Path, commit: str, digest: str, repo_root: Path) -> dict[
     return {"path": str(path.resolve()), "sha256": actual_hash, "commit": commit, "embeddedCommit": embedded_commit, "dirty": dirty}
 
 
+def check_baseline_artifact(pinned: dict[str, Any], spec_path: Path) -> tuple[str | None, str]:
+    """(code, message) for a pinned baseline whose ``artifact`` is not a file matching ``executableSha256``; (None, "") if verified."""
+    raw = pinned["artifact"]
+    path = Path(raw) if _is_absolute_path(raw) else spec_path.resolve().parent / raw
+    try:
+        found = path.is_file()
+    except OSError:
+        found = False
+    if not found:
+        return "BASELINE_ARTIFACT_UNVERIFIED", f"baseline artifact does not resolve to a file: {raw}"
+    try:
+        actual = sha256_file(path)
+    except OSError as exc:
+        return "BASELINE_ARTIFACT_UNVERIFIED", f"baseline artifact unreadable: {path}: {exc}"
+    if actual != pinned["executableSha256"].upper():
+        return "BASELINE_ARTIFACT_SHA_MISMATCH", f"baseline artifact hash mismatch: expected {pinned['executableSha256'].upper()}, got {actual}"
+    return None, ""
+
+
 def preflight(spec_path: Path, repo_root: Path, baseline: tuple[Path, str, str] | None, candidate: tuple[Path, str, str] | None) -> tuple[dict[str, Any], int]:
     spec = validate_spec(load_json(spec_path))
     problems: list[str] = []
@@ -266,6 +285,12 @@ def preflight(spec_path: Path, repo_root: Path, baseline: tuple[Path, str, str] 
     validate_shipping_alignment(spec, shipping_path)
     if spec["baseline"]["status"] != "reviewed_instrumented_known_good":
         block("BASELINE_NOT_PINNED", "reviewed instrumented known-good baseline bridge is not pinned")
+    else:
+        # "pinned" is not "verified": the artifact must resolve to a file whose bytes are the pinned executableSha256,
+        # with or without baseline executables supplied.
+        artifact_code, artifact_message = check_baseline_artifact(spec["baseline"], spec_path)
+        if artifact_code:
+            block(artifact_code, artifact_message)
     unavailable_ids = [clip["id"] for clip in spec["clips"] if clip.get("evidenceStatus") == "required_corpus_not_acquired" and clip["required"]]
     for clip_id in unavailable_ids:
         block("REQUIRED_CLIP_NOT_ACQUIRED", f"required clip has no pinned length/hash: {clip_id}", clipId=clip_id)

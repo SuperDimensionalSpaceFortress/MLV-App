@@ -855,7 +855,8 @@ function Write-Utf8NoBomAtomic([string]$Path, [string]$Content) {
 }
 
 # Windows job ownership is established around an inert PowerShell host before that
-# host receives any provider configuration. Descendants then inherit kill-on-close.
+# host receives any provider configuration. Descendants then inherit kill-on-close. This is the Claude-engine path only: a Codex lane is started
+# without a job object, so nothing here contains its descendants.
 if (-not ('MlvLaneJob' -as [type])) {
     Add-Type -TypeDefinition @'
 using System;
@@ -1682,7 +1683,7 @@ if ($sw.Elapsed.TotalMilliseconds -ge ($TimeoutSec * 1000.0)) {
 
 if ($cfg.engine -eq 'claude') {
     # This trusted host is inert until it reads frame one. It is assigned to the job
-    # before frame one is sent, so the provider and every descendant inherit the job.
+    # before frame one is sent, so the provider and every descendant inherit the job. Claude-engine lanes only: the Codex branch below has no job.
     $hostSource = @'
 $ErrorActionPreference='Stop'; Set-StrictMode -Version Latest
 [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
@@ -1795,7 +1796,8 @@ $timedOut = $false
 $remainingMs = [math]::Max(0, [math]::Floor(($TimeoutSec * 1000.0) - $sw.Elapsed.TotalMilliseconds))
 if ($remainingMs -eq 0 -or -not $proc.WaitForExit([int]$remainingMs)) {
     $timedOut = $true
-    # Closing the job is the authoritative descendant cleanup. Do it before
+    # Closing the job is the authoritative descendant cleanup for a Claude-engine lane (a Codex lane has no
+    # job, so $jobHandle is zero and only the Kill($true) tree kill below applies). Do it before
     # harvesting pipes, which descendants could otherwise keep open indefinitely.
     if ($jobHandle -ne [IntPtr]::Zero) {
         [void][MlvLaneJob]::CloseHandle($jobHandle)
