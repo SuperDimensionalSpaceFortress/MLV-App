@@ -18,6 +18,7 @@
 #include "Debayered16ReconReusePolicy.h"
 #include "Phase3Mode.h"
 #include "PlaybackDecodeRenderOverlap.h"
+#include "PlaybackReconWarmRun.h"
 #include "PlaybackScaling.h"
 
 #include <array>
@@ -340,6 +341,26 @@ public:
     {
         int slotIndex = -1;
         RenderRequest request;
+        /* PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1 Row W: a paused recon warm run (no slot; request.frameNumber only).
+         * Never counted as pipeline work (phase3WorkInFlightLocked), dropped when real work is pending as it starts, and
+         * dropped by a clip close while still queued (detachClipBeforeFree). */
+        bool warm = false;
+        int warmScale = 1;
+        quint64 warmClipGeneration = 0;
+        bool warmRealRequestPending = false;
+    };
+
+    /* Row W: what one warm did, handed to the GUI thread (playbackReconWarmDone), which owns releasing
+     * outcome.retained.token on every path. */
+    struct PlaybackReconWarmDone
+    {
+        quint64 clipGeneration = 0;
+        uint32_t frameNumber = 0;
+        playback_recon_warm_run::Outcome outcome;
+        int blackLevel = 0;
+        std::array<double, 3> wbMultipliers{{1.0, 1.0, 1.0}};
+        double renderMs = 0.0;              // the whole warm on the recon worker
+        bool realRequestArrivedDuringWarm = false;
     };
 
     RenderFrameThread();
@@ -355,6 +376,14 @@ public:
                       const ReadyFrame::PresentationContext &presentationContext,
                       const PresentationPreparationOptions &presentationPreparation );
     void setGpuPlaybackReconTextureLutSnapshotGeneration( uint64_t generation );
+    /* PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1 Row W (GUI thread): queue ONE paused recon warm run of frameNumber at
+     * the Play-time scale on the recon worker (PlaybackReconWarmRun.h). Reason::None when queued; RealRequestPending
+     * when any render, decode or recon work is pending now. Its result arrives as playbackReconWarmDone. */
+    playback_recon_warm_run::Reason requestPlaybackReconWarm( uint32_t frameNumber, int scale, quint64 clipGeneration );
+    /* PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1 r3 (U-02, GUI thread): a clip close calls this after its idle
+     * barrier and before it frees the clip. Drops every queued warm (not pipeline work, so the barrier did not wait for
+     * it), waits out a warm the worker took meanwhile, and clears the clip pointer until the next init(). */
+    void detachClipBeforeFree( void );
     bool isFrameReady( void );
     bool isIdle( void );
     /* PLAYBACK-DECODE-RENDER-OVERLAP-1: isIdle() for the playback advance. Speculative
@@ -410,6 +439,9 @@ public:
 
 signals:
     void frameReady( void );
+    /* Row W: emitted on this object's (the GUI) thread, posted from the recon worker. The receiver releases
+     * done.outcome.retained.token whatever else it does. */
+    void playbackReconWarmDone( const RenderFrameThread::PlaybackReconWarmDone &done );
 
 private:
     struct FrameSlot
@@ -685,6 +717,11 @@ private:
     bool downstreamFrameInFlightLocked( int excludeSlotIndex ) const;
     bool upstreamWorkInFlightLocked( int excludeSlotIndex ) const;
     std::deque<ReconQueueEntry> m_reconRequests;
+    /* Row W: a warm is running on the recon worker (pipeline work: it reads m_pMlvObject). Under m_mutex. */
+    bool m_warmRunning = false;
+    /* Row W: the warm's throwaway decode and reduced buffers, touched only on the recon worker. */
+    std::vector<uint16_t> m_warmRawScratch;
+    std::vector<uint16_t> m_warmReducedScratch;
     std::deque<int> m_decodeReadySlots;
     std::deque<int> m_processReadySlots;
     QWaitCondition m_decodeWaitCondition;
@@ -706,6 +743,9 @@ private:
     void signalDecodeDoneFromWorker( int slotIndex );
     bool takeReconRequestForWorker( ReconQueueEntry *entry );
     void reconFrameForWorker( const ReconQueueEntry &entry, llrawprocWorkerState_t *workerState );
+    /* Row W: the warm entry's body, on the recon worker with its worker state. */
+    void warmReconForWorker( const ReconQueueEntry &entry, llrawprocWorkerState_t *workerState );
+    bool realWorkPendingLocked( void ) const;
     void signalReconDoneFromWorker( int slotIndex );
     int waitForDecodedSlotLocked( void );
     int waitForProcessReadySlotLocked( void );

@@ -339,6 +339,10 @@ static MLV_THREAD_LOCAL llrpGpuPlaybackRetainedDeviceBayer16_t
  * reader are provably the same thread for the lifetime of one frame. */
 static MLV_THREAD_LOCAL llrpGpuPlaybackReconPreuploadStatus_t
     g_llrawproc_gpu_playback_last_preupload_status = {0};
+/* PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1: the wall time run_backend() already measures for its set_clip / set_luts
+ * calls, kept for the calling thread (0 when the run needed neither). Read only by the paused warm run's log line. */
+static MLV_THREAD_LOCAL double g_llrawproc_gpu_last_set_clip_ms = 0.0;
+static MLV_THREAD_LOCAL double g_llrawproc_gpu_last_set_luts_ms = 0.0;
 
 static void llrawproc_gpu_export_reset_last_run_state(void)
 {
@@ -424,6 +428,74 @@ int llrpResetGpuPlaybackReconRunForTesting(void)
 {
     llrawproc_gpu_playback_reset_last_run_state();
     return 1;
+}
+
+/* PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1: this thread's last-run playback recon state, moved aside for the paused
+ * warm run and put back after it (llrawproc.h). The owned input copy moves with it, so neither side frees the other's. */
+typedef struct
+{
+    int run_attempted;
+    int run_rc;
+    int used;
+    int state_valid;
+    int prepare_only;
+    dualiso_gpu_recon_state_t prepared_state;
+    uint16_t * input_bayer16;
+    size_t input_words;
+    llrpGpuPlaybackRetainedDeviceBayer16_t retained_device_bayer16;
+    llrpGpuPlaybackReconPreuploadStatus_t preupload_status;
+} llrawprocGpuPlaybackLastRunSnapshot_t;
+
+void * llrpGpuPlaybackReconSaveLastRunState(void)
+{
+    llrawprocGpuPlaybackLastRunSnapshot_t * snapshot =
+        (llrawprocGpuPlaybackLastRunSnapshot_t *)calloc(1, sizeof(*snapshot));
+    if(!snapshot) return NULL;
+    snapshot->run_attempted = g_llrawproc_gpu_playback_last_run_attempted;
+    snapshot->run_rc = g_llrawproc_gpu_playback_last_run_rc;
+    snapshot->used = g_llrawproc_gpu_playback_last_used;
+    snapshot->state_valid = g_llrawproc_gpu_playback_last_state_valid;
+    snapshot->prepare_only = g_llrawproc_gpu_playback_last_prepare_only;
+    snapshot->prepared_state = g_llrawproc_gpu_playback_last_prepared_state;
+    snapshot->input_bayer16 = g_llrawproc_gpu_playback_last_input_bayer16;
+    snapshot->input_words = g_llrawproc_gpu_playback_last_input_words;
+    snapshot->retained_device_bayer16 = g_llrawproc_gpu_playback_last_retained_device_bayer16;
+    snapshot->preupload_status = g_llrawproc_gpu_playback_last_preupload_status;
+    /* the snapshot owns the input copy now; the reset below must not free it */
+    g_llrawproc_gpu_playback_last_input_bayer16 = NULL;
+    g_llrawproc_gpu_playback_last_input_words = 0;
+    llrawproc_gpu_playback_reset_last_run_state();
+    return snapshot;
+}
+
+void llrpGpuPlaybackReconRestoreLastRunState(void * snapshot_handle)
+{
+    llrawprocGpuPlaybackLastRunSnapshot_t * snapshot =
+        (llrawprocGpuPlaybackLastRunSnapshot_t *)snapshot_handle;
+    /* drop what the warm left (frees its owned input copy) */
+    llrawproc_gpu_playback_reset_last_run_state();
+    if(!snapshot) return;
+    g_llrawproc_gpu_playback_last_run_attempted = snapshot->run_attempted;
+    g_llrawproc_gpu_playback_last_run_rc = snapshot->run_rc;
+    g_llrawproc_gpu_playback_last_used = snapshot->used;
+    g_llrawproc_gpu_playback_last_state_valid = snapshot->state_valid;
+    g_llrawproc_gpu_playback_last_prepare_only = snapshot->prepare_only;
+    g_llrawproc_gpu_playback_last_prepared_state = snapshot->prepared_state;
+    g_llrawproc_gpu_playback_last_input_bayer16 = snapshot->input_bayer16;
+    g_llrawproc_gpu_playback_last_input_words = snapshot->input_words;
+    g_llrawproc_gpu_playback_last_retained_device_bayer16 = snapshot->retained_device_bayer16;
+    g_llrawproc_gpu_playback_last_preupload_status = snapshot->preupload_status;
+    free(snapshot);
+}
+
+double llrpGpuPlaybackReconLastSetClipMilliseconds(void)
+{
+    return g_llrawproc_gpu_last_set_clip_ms;
+}
+
+double llrpGpuPlaybackReconLastSetLutsMilliseconds(void)
+{
+    return g_llrawproc_gpu_last_set_luts_ms;
 }
 
 int llrpGpuExportLastRunAttemptedForTesting(void);
@@ -1954,6 +2026,16 @@ static int llrawproc_gpu_recon_backend_available_guarded(int prefer_playback_dll
     return available;
 }
 
+/* PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-SETUP-1 Row B: the playback runs pass prefer_playback_dll=1, so this loads
+ * the same DLL/backend name and the first run's llrawproc_gpu_export_backend_available(1) is a hit. */
+int llrpGpuPlaybackReconPreloadBackend(double * load_ms)
+{
+    const double start_s = mlv_stage_timing_now();
+    const int available = llrawproc_gpu_recon_backend_available_guarded(1);
+    if(load_ms) *load_ms = (mlv_stage_timing_now() - start_s) * 1000.0;
+    return available;
+}
+
 /* GPU-FIELD-TELEMETRY-1: one stage call's outcome, captured under the backend
  * mutex (or the preupload bypass claim) and handed to the sink after it is
  * released. */
@@ -2455,6 +2537,8 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
     if(device_width_out) *device_width_out = 0;
     if(device_height_out) *device_height_out = 0;
     if(retained_out) memset(retained_out, 0, sizeof(*retained_out));
+    g_llrawproc_gpu_last_set_clip_ms = 0.0;
+    g_llrawproc_gpu_last_set_luts_ms = 0.0;
     /* GPU-DEVICE-LOSS-SELF-HEAL-1: after a device loss no CUDA call is made on
      * any thread; checked before any lock or backend access (the fast path),
      * and again once the backend mutex is held (r6). */
@@ -2566,6 +2650,7 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
         set_clip_start_s = mlv_stage_timing_now();
         rc = g->set_clip(g->backend, &clip);
         set_clip_ms = (mlv_stage_timing_now() - set_clip_start_s) * 1000.0;
+        g_llrawproc_gpu_last_set_clip_ms = set_clip_ms;
         set_clip_rc = rc;
         set_clip_called = 1;
         InterlockedIncrement64(&g_llrawproc_gpu_set_clip_count);
@@ -2596,6 +2681,7 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
         set_luts_start_s = mlv_stage_timing_now();
         rc = g->set_luts(g->backend, &luts);
         set_luts_ms = (mlv_stage_timing_now() - set_luts_start_s) * 1000.0;
+        g_llrawproc_gpu_last_set_luts_ms = set_luts_ms;
         set_luts_rc = rc;
         set_luts_called = 1;
         InterlockedIncrement64(&g_llrawproc_gpu_set_luts_count);
@@ -3463,6 +3549,12 @@ static int llrawproc_gpu_recon_backend_available_guarded(int prefer_playback_dll
     return llrawproc_gpu_export_backend_available(prefer_playback_dll);
 }
 
+int llrpGpuPlaybackReconPreloadBackend(double * load_ms)
+{
+    if(load_ms) *load_ms = 0.0;
+    return 0;
+}
+
 int llrpResetGpuExportBackendForTesting(void);
 int llrpResetGpuExportBackendForTesting(void)
 {
@@ -4147,6 +4239,20 @@ static int llrawproc_runtime_state_equal(const llrawproc_runtime_state_t * lhs,
     if (lhs->dng_black_level != rhs->dng_black_level) return 0;
     if (lhs->dng_white_level != rhs->dng_white_level) return 0;
     return 1;
+}
+
+int llrpGetSharedRuntimeState(mlvObject_t * video, llrawproc_runtime_state_t * out)
+{
+    if (!video || !video->llrawproc || !out) return 0;
+    pthread_mutex_lock(&video->llrawproc_mutex);
+    *out = llrawproc_capture_shared_runtime_state(video->llrawproc);
+    pthread_mutex_unlock(&video->llrawproc_mutex);
+    return 1;
+}
+
+int llrpSharedRuntimeStateEqual(const llrawproc_runtime_state_t * lhs, const llrawproc_runtime_state_t * rhs)
+{
+    return llrawproc_runtime_state_equal(lhs, rhs, 1);
 }
 
 static void llrawproc_worker_ensure_luts(llrawprocWorkerState_t * worker, int32_t black_level)
