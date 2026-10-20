@@ -555,12 +555,13 @@ function Get-VenueSupplementaryIdle {
     <#
     .SYNOPSIS
     Is the venue idle for a supplementary leg? Read-only, from the venue's own claim and line (never a process scan): idle when its claim is FREE or STALE and no LIVE ticket
-    queues. .holder names the live claim or the queue when it is not.
+    queues. .holder names the live claim or the queue when it is not. -OwnNonce: the caller already holds the claim with that nonce (it does not count as held), so the
+    answer is "still no live ticket" -- the revalidation a supplementary claim makes BEFORE any work (Dot 180e287f: a waiter may queue between the first check and the claim).
     #>
-    param([Parameter(Mandatory)][string]$Venue, [string]$ClaimDir = '')
+    param([Parameter(Mandatory)][string]$Venue, [string]$ClaimDir = '', [string]$OwnNonce = '')
     $s = Get-VenueClaimStatus -Venue $Venue -ClaimDir $ClaimDir
     $live = @($s.tickets | Where-Object { $_.state -cne 'STALE' })
-    $held = ($s.claim.state -cin @('LIVE', 'BUSY'))
+    $held = ($s.claim.state -cin @('LIVE', 'BUSY')) -and -not ($OwnNonce -and $s.claim.claim -and [string]$s.claim.claim.nonce -ceq $OwnNonce)
     $holder = $(if ($s.claim.claim) { "pid=$($s.claim.claim.ownerPid) runDir=$($s.claim.claim.runDir)" } else { "claimState=$($s.claim.state)" })
     [pscustomobject]@{ idle = (-not $held -and $live.Count -eq 0); claimState = [string]$s.claim.state; liveTickets = $live.Count; holder = $holder }
 }

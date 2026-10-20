@@ -1015,6 +1015,44 @@ class VenueChainSupplementaryTests(unittest.TestCase):
                 self.assertIn(reason_part, s[0]["detail"])
                 self.assertFalse((self.claims / "ultra-magnus.claim.json").exists())
 
+    # ---------------------------------------------------------------- Dot 180e287f P2: a UM waiter that queues AFTER the idle check and BEFORE the claim
+    IDLE_LINE = "    if (-not $idle.idle) { Write-SuppSkip $Leg $Trigger 'UM_BUSY' \"holder $($idle.holder) liveTickets=$($idle.liveTickets)\" $false; return }\n"
+
+    def hooked_runner(self, hook: str) -> Path:
+        """The real runner with `hook` run right after the supplementary idle check: the deterministic interleaving seam (no sleeps, no clock)."""
+        return self.mutated_runner(self.IDLE_LINE, self.IDLE_LINE + "    " + hook + "\n", 1)
+
+    def test_a_um_waiter_that_queues_between_the_idle_check_and_the_claim_is_served_first(self) -> None:
+        waiter_rd = "C:\\elsewhere\\lane-UM-WAITER"
+        hook = f"[void](New-VenueTicket -Venue $suppVenue -RunDir '{waiter_rd}' -Purpose 'um waiter' -StaleAfterSec 3600 -ClaimDir $ClaimDir -OwnerPid {os.getpid()})   # a normal UM waiter takes its ticket now"
+        rd = self.case / "lane-RACE"
+        r = self.run_chain(rd, self.specs[:1], runner=self.hooked_runner(hook))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        # the supplementary leg does no work: no ultra-magnus probe, no ultra-magnus leg; Bachelor is unaffected
+        self.assertEqual([v for _, v, _ in self.starts()], ["bachelor"], "the supplementary took the claim ahead of a live UM ticket and ran")
+        self.assertEqual([c for c in self.quiet_calls() if "venue=ultra-magnus" in c], [], "a yielded offer must not even probe ultra-magnus")
+        res = chain_result(r.stdout)
+        self.assertEqual(([l["status"] for l in res["legs"]], res["exitCode"]), (["RAN"], 0))
+        self.assertEqual([(s["status"], s["reason"]) for s in res["supplementary"]], [("SKIPPED", "YIELDED_TO_TICKET")])
+        log = self.chain_log(rd)
+        self.assertTrue(any("SUPPLEMENTARY_CLAIM_RELEASED" in l and "result=RELEASED" in l for l in log), log)
+        # the claim ends FREE and the waiter's ticket, still first in line, is the one granted next
+        self.assertFalse((self.claims / "ultra-magnus.claim.json").exists(), "the yielded claim was left behind")
+        served = pwsh_text(
+            f"Import-Module '{MODULE}' -Force -DisableNameChecking; $row = @(Get-VenueTickets -Venue ultra-magnus -ClaimDir '{self.claims}' | Where-Object {{ $_.state -cne 'STALE' }}); "
+            f"$t = [pscustomobject]@{{ name = $row[0].name; path = $row[0].path; nonce = [string]$row[0].ticket.nonce }}; "
+            f"$q = Request-VenueClaim -Venue ultra-magnus -RunDir '{waiter_rd}' -ClaimDir '{self.claims}' -OwnerPid {os.getpid()} -Ticket $t -TicketStaleAfterSec 3600; "
+            f"[void](Release-VenueClaim -Venue ultra-magnus -Nonce $q.claim.nonce -ClaimDir '{self.claims}'); \"$($row.Count) $($q.granted) $($q.state) $($q.position) $($q.claim.runDir)\"")
+        self.assertEqual(served, f"1 True TAKEN 1 {waiter_rd}")
+
+    def test_control_no_ticket_between_the_idle_check_and_the_claim_runs_the_supplementary_as_before(self) -> None:
+        rd = self.case / "lane-RACE-CTL"
+        r = self.run_chain(rd, self.specs[:1], runner=self.hooked_runner("# no waiter queues"))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual([v for _, v, _ in self.starts()], ["bachelor", "ultra-magnus"])
+        self.assertEqual([(s["status"], s["trigger"]) for s in chain_result(r.stdout)["supplementary"]], [("RAN", "after-leg")])
+        self.assertFalse((self.claims / "ultra-magnus.claim.json").exists())
+
     # ---------------------------------------------------------------- (b) held more than -SupplementaryHeldSec
     def test_a_leg_held_past_the_threshold_is_offered_on_ultra_magnus_before_bachelor_runs_it(self) -> None:
         rd = self.case / "lane-HELD"
@@ -1268,6 +1306,9 @@ class VenueChainSupplementaryTests(unittest.TestCase):
         self.assertEqual(pwsh_text(q), "True FREE 0")
         self.write_um_claim()
         self.assertEqual(pwsh_text(q), "False LIVE 0")
+        own = q.replace("-ClaimDir", "-OwnNonce um-fixture-nonce -ClaimDir")   # the revalidation under our own claim: our claim is not "held", only a live ticket is
+        self.assertEqual(pwsh_text(own), "True LIVE 0")
+        self.assertEqual(pwsh_text(q.replace("-ClaimDir", "-OwnNonce someone-else -ClaimDir")), "False LIVE 0")
 
     # ---------------------------------------------------------------- mutations: the guards are what the scenarios rely on
     def test_mutation_opt_out_ignored_runs_ultra_magnus_anyway(self) -> None:

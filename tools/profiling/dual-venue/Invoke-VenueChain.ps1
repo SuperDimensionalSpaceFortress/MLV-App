@@ -34,8 +34,9 @@
 #      or under-claim quiet probe ends VENUE_QUIET_UNKNOWN (under the claim: Bachelor's claim is released first), before the leg is stopped. COVERAGE LIMIT: one probe BLOCKS the loop, and a heavy-slot admission hold inside it can last up to -ProbeAdmissionWaitSec
 #      (7200), so the held offer for an admission hold is made when that probe returns (at the latest at the admission ceiling), NOT at 30 minutes; a hold inside the leg child is offered after the leg. An offer needs: the spec's
 #      criteria.supplementary block for the backend; ultra-magnus's own claim FREE and no live ticket (Get-VenueSupplementaryIdle, never a process scan); the build ALREADY staged in its
-#      cache (the chain stages and builds nothing); the venue's claim taken (one shot, never waited on); one quiet probe (-MaxWaitSec 0) QUIET or COOLDOWN_UNMET. Anything else is one typed
-#      `SUPPLEMENTARY_SKIPPED leg=<n> trigger=<t> reason=<R>` line (NO_SUPPLEMENTARY_CRITERIA, BACKEND_NOT_IN_SPEC, SPEC_UNREADABLE, CHAIN_STOPPED, DEADLINE_NEAR, UM_BUSY, UM_NOT_QUIET,
+#      cache (the chain stages and builds nothing); the venue's claim taken (one shot, never waited on) and, UNDER it before any work, still no live ticket (else YIELDED_TO_TICKET:
+#      released at once, so a waiter that queued meanwhile is served first); one quiet probe (-MaxWaitSec 0) QUIET or COOLDOWN_UNMET. Anything else is one typed
+#      `SUPPLEMENTARY_SKIPPED leg=<n> trigger=<t> reason=<R>` line (NO_SUPPLEMENTARY_CRITERIA, BACKEND_NOT_IN_SPEC, SPEC_UNREADABLE, CHAIN_STOPPED, DEADLINE_NEAR, UM_BUSY, YIELDED_TO_TICKET, UM_NOT_QUIET,
 #      UM_SHARE_UNREACHABLE, UM_SHARE_UNKNOWN, BUILD_NOT_STAGED, SUPPLEMENTARY_ERROR) and the chain goes on. A run writes `LEG <n> SUPPLEMENTARY_RUN` then SUPPLEMENTARY_RAN | SUPPLEMENTARY_FAILED |
 #      SUPPLEMENTARY_TIMEOUT, each with `venue=ultra-magnus role=supplementary`, its own receipt (Invoke-VenueLeg) and leg-<n>-ultra-magnus-supplementary.out.txt. It is a bounded child
 #      (-SupplementaryMaxSec, 1800, and never past the chain deadline). A supplementary result lives ONLY in CHAIN_RESULT's `supplementary` list: it is never in `legs`, never in ran / failed /
@@ -323,6 +324,10 @@ function Invoke-SupplementaryCore([object]$Leg, [string]$Trigger) {
     $t0s = [DateTime]::UtcNow
     try {
         L "SUPPLEMENTARY_CLAIM_TAKEN leg=$($Leg.name) trigger=$Trigger venue=$suppVenue nonce=$($req.claim.nonce)"
+        # Revalidate UNDER the claim, before any work: a UM waiter writes its ticket THEN tries the claim, this path wrote the claim THEN reads the line, so one of the two always
+        # sees the other. A ticket that queued since the idle check above is served first: yield (the finally releases the claim) and do nothing (Dot 180e287f).
+        $own = Get-VenueSupplementaryIdle -Venue $suppVenue -ClaimDir $ClaimDir -OwnNonce $req.claim.nonce
+        if (-not $own.idle) { Write-SuppSkip $Leg $Trigger 'YIELDED_TO_TICKET' "liveTickets=$($own.liveTickets) claimState=$($own.claimState) (queued after the idle check)" $false; return }
         if ($script:ticket) { [void](Update-VenueTicket -Ticket $script:ticket -Phase 'supplementary' -StaleAfterSec ($suppProbeStaleSec + $SupplementaryMaxSec)) }
         $sq = Invoke-QuietProbe $Leg.name "um-suppl-$Trigger" 0 $suppVenue $suppProbeAdmissionSec
         L "SUPPLEMENTARY_PROBE leg=$($Leg.name) venue=$suppVenue exit=$($sq.code) verdict=$($sq.verdict) mean=$(Format-Mean $sq.mean)$(if ($sq.reason) { " reason=$($sq.reason)" })"
