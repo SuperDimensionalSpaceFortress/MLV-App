@@ -124,6 +124,13 @@ param(
     # %TEMP% (which every project on this box shares). C:\mlvtmp is a DiskGuard-registered
     # MLV root. The run's own scratch dir is removed when the lane exits unless -KeepScratch;
     # its size is recorded in the receipt either way.
+    # LANE-HOOK-DENY-RECURRENCE-1: when -ScratchRoot is NOT passed, the run's scratch dir goes under
+    # <WorkDir>\.claude-state\ls\<8-hex run hash> instead (short on purpose: a longer TEMP breaks git in pytest
+    # tmp_path repos at MAX_PATH). The harness names TEMP as the lane's scratchpad, and
+    # tools\hooks\mlv-never-authorized.py NA-7 admits writes under only the hook's own worktree and the
+    # board, so every scratchpad write under this shared root was denied. .claude-state/ is git-ignored on
+    # every branch and pruned by the repo's own tree walks. The value below stays the shared root that
+    # Remove-LaneBulkScratch.ps1 refuses to touch. -ScratchRoot <dir> overrides; -ScratchRoot '' turns it off.
     [string]$ScratchRoot = 'C:\mlvtmp\lane-scratch',
     # LANE-RECEIPT-SCRATCH-CLEANUP-1: bulk scratch a lane creates OUTSIDE -ScratchRoot (asm, shadow-build,
     # probe dirs) is listed one absolute path per line in <RunDir>\scratch-paths.txt, normally through
@@ -1643,10 +1650,23 @@ if ($cfg.engine -eq 'claude') {
 # background work; see docs/lane-containment.md.
 # Per-run lane scratch under an MLV-owned root instead of the shared %TEMP%.
 $scratchDir = $null
-if ($ScratchRoot) {
-    $scratchDir = Join-Path $ScratchRoot ('{0}-{1}' -f (Split-Path $RunDir -Leaf), (Split-Path $base -Leaf))
+$scratchBase = if ($PSBoundParameters.ContainsKey('ScratchRoot')) { $ScratchRoot } else { Join-Path $WorkDir '.claude-state\ls' }
+if ($scratchBase) {
+    $scratchLeaf = '{0}-{1}' -f (Split-Path $RunDir -Leaf), (Split-Path $base -Leaf)
+    if (-not $PSBoundParameters.ContainsKey('ScratchRoot')) {
+        # Short fixed-width leaf: TEMP is the prefix of every path a lane's pytest tmp_path repo creates, and git
+        # fails past MAX_PATH. 8 hex of sha256(run dir + lane slot) is unique per run and lane, 8 chars at any card length.
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        try { $scratchLeaf = ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($scratchLeaf.ToLowerInvariant()))) -replace '-', '').Substring(0, 8).ToLowerInvariant() } finally { $sha.Dispose() }
+    }
+    $scratchDir = Join-Path $scratchBase $scratchLeaf
     New-Item -ItemType Directory -Force -Path $scratchDir | Out-Null
     foreach ($v in 'TEMP', 'TMP', 'TMPDIR') { $psi.Environment[$v] = $scratchDir }
+    # T-03: the default scratch root is inside the lane's git worktree, so git repo discovery from a pytest tmp_path or
+    # tempfile dir would climb into the worktree. A ceiling at the scratch root stops it there and leaves git run from
+    # the worktree itself alone. An inherited ceiling is kept: the scratch root is appended with ';'.
+    $ceiling = if ($psi.Environment.ContainsKey('GIT_CEILING_DIRECTORIES')) { [string]$psi.Environment['GIT_CEILING_DIRECTORIES'] } else { '' }
+    $psi.Environment['GIT_CEILING_DIRECTORIES'] = if ($ceiling.Trim(';')) { '{0};{1}' -f $ceiling.TrimEnd(';'), $scratchBase } else { $scratchBase }
 }
 $psi.Environment['MLV_LANE_RUN_DIR'] = $RunDir
 $psi.Environment['MLV_LANE_SCRATCH_MANIFEST'] = (Join-Path $RunDir 'scratch-paths.txt')
@@ -2230,6 +2250,17 @@ if ($AllowEdits -and $cfg.engine -eq 'claude') {
         }
     }
 }
+# LANE-FSMONITOR-PIN-AND-RETIRE-HARDENING-1 r2 (sol r1 blocker): a worktree this lane leaves standing must not keep a daemon. Without
+# extensions.worktreeConfig the launch-time disable is skipped, so every `git status` above (the retire gate's, the sweep's, and the post-exit
+# dirty check) restarts the daemon. This stop therefore comes AFTER the last git call that touches $WorkDir; add no git call below it (a test pins
+# that). Fail-soft, and recorded in the receipt: a no-op once the worktree is retired (path absent).
+$fsmonitorStop = $null
+try {
+    $fsmonitorStopResult = Stop-LaneWorktreeFsmonitor -WorkDir $WorkDir
+    $fsmonitorStop = [ordered]@{ action = [string]$fsmonitorStopResult.action; reason = $fsmonitorStopResult.reason }
+} catch {
+    $fsmonitorStop = [ordered]@{ action = 'failed'; reason = "cannot-determine: $($_.Exception.Message)" }
+}
 # LANE-NO-BACKGROUND-END-TURN-1 round 7 (sol major 3): the copy this lane's hook actually ran
 # against sits in the per-run reserved slot specifically so it is outside the lane's own
 # writable worktree -- but an editing lane keeps Bash for its whole session, and Bash is not
@@ -2357,6 +2388,9 @@ $receipt = [ordered]@{
     bulkScratch  = $bulkScratch
     worktreeDisposition = $worktreeDisposition
     worktreeSweep = $worktreeSweep
+    # LANE-FSMONITOR-PIN-AND-RETIRE-HARDENING-1 r2: {action, reason} of the lane-end daemon stop (stopped | none | skipped | failed). Absence of a
+    # daemon is 'none'; 'failed' means one may still be running.
+    fsmonitorStop = $fsmonitorStop
     processEnded = $processEnded
     complete     = $workCompleted
     workEvidence = $workEvidence

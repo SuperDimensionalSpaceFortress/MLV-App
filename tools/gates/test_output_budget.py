@@ -1,5 +1,6 @@
 import hashlib
 import json
+import re
 import struct
 import tempfile
 import unittest
@@ -10,6 +11,12 @@ from unittest import mock
 from pathlib import Path
 
 from tools.gates import output_budget
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+REAL_SPEC = REPO_ROOT / "tools/gates/output-budget.json"
+WRAPPER = REPO_ROOT / "tools/gates/compare-output-budget.ps1"
+RUNNER = REPO_ROOT / "tools/profiling/run-release-gui-smoke.ps1"
+BINDINGS_DUMP = REPO_ROOT / "tools/gates/dump-runner-bindings.ps1"
 
 
 def png_bytes(width, height, pixels):
@@ -48,7 +55,7 @@ class OutputBudgetTests(unittest.TestCase):
             "shippingDefaults": {"path": "tools/gates/shipping-defaults.json", "sha256": output_budget.sha256_file(self.shipping)},
             "baseline": {"status": "reviewed_instrumented_known_good", "commit": "a" * 40, "executableSha256": "A" * 64, "artifact": "fixture://reviewed-baseline"},
             "receipt": {"path": str(self.receipt), "length": 7, "sha256": output_budget.sha256_file(self.receipt)},
-            "profiles": [{"id": "wb_locked", "disableLookAssist": True, "playbackProcessing": "none", "qualityMode": "1", "expectedQualityMode": 1, "scaleFactor": "", "expectedScaleRequest": 4, "selectionAuthority": "shipping-default-controlled"}],
+            "profiles": [{"id": "wb_locked", "disableLookAssist": True, "playbackProcessing": "subset", "qualityMode": "1", "expectedQualityMode": 1, "scaleFactor": "", "expectedScaleRequest": 4, "selectionAuthority": "shipping-default-controlled"}],
             "clips": [{"id": "clip", "required": True, "path": str(self.clip), "length": 4, "sha256": output_budget.sha256_file(self.clip), "startFrame": 4,
                        "parts": [{"path": str(self.clip), "length": 4, "sha256": output_budget.sha256_file(self.clip)}],
                        "aspect": {"mode": "presented-playback-stretch", "stretchX": 3.0, "stretchY": 1.0, "hStretchIndex": 0, "vStretchIndex": 3}}],
@@ -95,7 +102,7 @@ class OutputBudgetTests(unittest.TestCase):
             },
             "validation": {"ok": True, "screenshotProvenance": provenance},
             "screenshot": {"path": str(screenshot), "capture": {"image": {"sha256": output_budget.sha256_file(screenshot)}}},
-            "visualQuality": {"playbackPolicy": {"playback_processing_selected": "none"}, "visualState": {"look_assist_enabled": 0, "quality_mode": 1, "scale_request": 4}, "aspectEvidence": {"mode": "presented-playback-stretch", "stretchX": 3.0, "stretchY": 1.0, "hStretchIndex": 0, "vStretchIndex": 3}},
+            "visualQuality": {"playbackPolicy": {"playback_processing_selected": "subset"}, "visualState": {"look_assist_enabled": 0, "quality_mode": 1, "scale_request": 4}, "aspectEvidence": {"mode": "presented-playback-stretch", "stretchX": 3.0, "stretchY": 1.0, "hStretchIndex": 0, "vStretchIndex": 3}},
         }
         path = self.root / name
         path.write_text(json.dumps(result), encoding="utf-8")
@@ -250,6 +257,146 @@ class OutputBudgetTests(unittest.TestCase):
         self.assertEqual(4, code)
         self.assertFalse(report["authorizing"])
         self.assertTrue(any("no pinned length/hash" in item for item in report["failures"]))
+
+    def _preflight_codes(self, spec):
+        self.spec_path.write_text(json.dumps(spec), encoding="utf-8")
+        report, code = output_budget.preflight(self.spec_path, self.root, None, None)
+        return report, code, sorted((item["code"], item.get("clipId")) for item in report["typedFailures"])
+
+    def _unpinned(self):
+        spec = json.loads(json.dumps(self.spec))
+        spec["baseline"] = {"status": "pending_instrumented_known_good_bridge", "commit": None, "executableSha256": None, "artifact": None}
+        return spec
+
+    def test_missing_receipt_is_its_own_code_even_while_the_baseline_is_unpinned(self):
+        spec = self._unpinned()
+        spec["receipt"]["path"] = str(self.root / "no-such-receipt.marxml")
+        report, code, codes = self._preflight_codes(spec)
+        self.assertEqual(4, code)
+        self.assertEqual([("BASELINE_NOT_PINNED", None), ("RECEIPT_MISSING", None)], codes)
+        self.assertEqual(len(report["failures"]), len(report["typedFailures"]))
+
+    def test_receipt_length_and_hash_mismatch_are_distinct_codes(self):
+        spec = self._unpinned()
+        spec["receipt"]["length"] = 8
+        self.assertIn(("RECEIPT_LENGTH_MISMATCH", None), self._preflight_codes(spec)[2])
+        spec["receipt"]["length"] = 7
+        spec["receipt"]["sha256"] = "0" * 64
+        self.assertIn(("RECEIPT_HASH_MISMATCH", None), self._preflight_codes(spec)[2])
+
+    def test_unacquired_clip_and_unpinned_baseline_are_separate_entries(self):
+        spec = self._unpinned()
+        spec["clips"][0].update({"length": None, "sha256": None, "parts": [], "evidenceStatus": "required_corpus_not_acquired"})
+        _, code, codes = self._preflight_codes(spec)
+        self.assertEqual(4, code)
+        self.assertEqual([("BASELINE_NOT_PINNED", None), ("REQUIRED_CLIP_NOT_ACQUIRED", "clip")], codes)
+
+    def test_unacquired_clip_alone_is_reported_without_a_baseline_code(self):
+        spec = json.loads(json.dumps(self.spec))
+        spec["clips"][0].update({"length": None, "sha256": None, "parts": [], "evidenceStatus": "required_corpus_not_acquired"})
+        _, code, codes = self._preflight_codes(spec)
+        self.assertEqual(4, code)
+        self.assertEqual([("REQUIRED_CLIP_NOT_ACQUIRED", "clip")], codes)
+
+    def test_missing_clip_part_is_typed_when_the_contract_is_otherwise_clear(self):
+        spec = json.loads(json.dumps(self.spec))
+        missing = str(self.root / "missing-part.bin")
+        spec["clips"][0]["path"] = missing
+        spec["clips"][0]["parts"][0]["path"] = missing
+        _, code, codes = self._preflight_codes(spec)
+        self.assertEqual(4, code)
+        self.assertEqual([("CLIP_PART_MISSING", "clip")], codes)
+
+    def test_relative_receipt_path_resolves_against_the_repo_root_and_cannot_escape_it(self):
+        (self.root / "tools/gates/receipts").mkdir()
+        (self.root / "tools/gates/receipts/r.marxml").write_bytes(b"receipt")
+        spec = json.loads(json.dumps(self.spec))
+        spec["receipt"]["path"] = "tools/gates/receipts/r.marxml"
+        report, code, _ = self._preflight_codes(spec)
+        self.assertEqual(0, code, report["failures"])
+        for bad in ("../outside.marxml", "tools/../../outside.marxml"):
+            spec["receipt"]["path"] = bad
+            with self.assertRaises(output_budget.ContractError):
+                output_budget.validate_spec(spec)
+
+
+def _runner_bindings():
+    """Parse-only dump of the wrapper's runner call and the runner's param block (nothing is launched)."""
+    completed = subprocess.run(
+        [shutil.which("pwsh"), "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(BINDINGS_DUMP),
+         "-RunnerPath", str(RUNNER), "-WrapperPath", str(WRAPPER)],
+        capture_output=True, text=True)
+    if completed.returncode != 0:
+        raise AssertionError(f"runner binding dump failed: {completed.stdout}{completed.stderr}")
+    return json.loads(completed.stdout)
+
+
+class RealSpecBindingTests(unittest.TestCase):
+    """OUTPUT-BUDGET-GATE-BINDABLE-1: the committed spec must be runnable, not just well-formed."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.spec = output_budget.validate_spec(output_budget.load_json(REAL_SPEC))
+
+    @unittest.skipUnless(shutil.which("pwsh"), "PowerShell 7 is required for the static runner-binding check")
+    def test_every_profile_binds_to_the_smoke_runner_parameters(self):
+        bindings = _runner_bindings()
+        declared = bindings["runnerParams"]
+        profile_field = {}
+        for key, expression in bindings["wrapperArgs"].items():
+            match = re.fullmatch(r"\[\w+\]\s*\$profile\.(\w+)", expression.strip())
+            if match:
+                profile_field[key] = match.group(1)
+        self.assertIn("PlaybackProcessing", profile_field, "the wrapper must still derive -PlaybackProcessing from the profile")
+        self.assertTrue(self.spec["profiles"])
+        for profile in self.spec["profiles"]:
+            active = set(bindings["wrapperArgs"])
+            for guarded in bindings["guardedArgs"]:
+                if f"'{profile['playbackProcessing']}'" in guarded["guard"]:
+                    active.add(guarded["key"])
+            for key in sorted(active):
+                self.assertIn(key, declared, f"profile {profile['id']}: the wrapper splats -{key}, which the runner does not declare")
+            for key, field in profile_field.items():
+                allowed = declared[key]["validateSet"]
+                if allowed is not None:
+                    self.assertIn(str(profile[field]).lower(), [item.lower() for item in allowed],
+                                  f"profile {profile['id']}: -{key} {profile[field]!r} is outside the runner's ValidateSet {allowed}")
+
+    def test_profile_processing_is_a_value_the_app_can_report(self):
+        # the evaluator compares the profile value with the app's playback_processing_selected, which MainWindow
+        # selectedPlaybackProcessingLabel() renders as exactly "subset" or "receipt".
+        for profile in self.spec["profiles"]:
+            self.assertIn(profile["playbackProcessing"], ("subset", "receipt"), profile["id"])
+
+    def test_none_is_not_an_accepted_playback_processing(self):
+        broken = json.loads(REAL_SPEC.read_text(encoding="utf-8"))
+        broken["profiles"][0]["playbackProcessing"] = "none"
+        with self.assertRaises(output_budget.ContractError):
+            output_budget.validate_spec(broken)
+
+    def test_receipt_is_a_reachable_tracked_file_matching_its_pin(self):
+        path = output_budget.resolve_receipt_path(self.spec, REPO_ROOT)
+        self.assertTrue(path.is_file(), f"receipt is not reachable: {path}")
+        output_budget.validate_file(path, self.spec["receipt"]["length"], self.spec["receipt"]["sha256"], "receipt")
+        tracked = subprocess.run(["git", "-C", str(REPO_ROOT), "ls-files", "--error-unmatch", "--", path.relative_to(REPO_ROOT).as_posix()], capture_output=True, text=True)
+        self.assertEqual(0, tracked.returncode, "the pinned receipt must be tracked, not an ignored local copy")
+
+    @unittest.skipUnless(shutil.which("git"), "git is required for the attribute check")
+    def test_receipt_bytes_are_immune_to_autocrlf(self):
+        relative = output_budget.resolve_receipt_path(self.spec, REPO_ROOT).relative_to(REPO_ROOT).as_posix()
+        attrs = subprocess.run(["git", "-C", str(REPO_ROOT), "check-attr", "text", "eol", "--", relative], capture_output=True, text=True).stdout
+        self.assertIn("eol: lf", attrs)
+        self.assertIn("text: set", attrs)
+
+    def test_real_preflight_names_each_block_separately(self):
+        report, code = output_budget.preflight(REAL_SPEC, REPO_ROOT, None, None)
+        self.assertEqual(4, code)
+        self.assertFalse(report["authorizing"])
+        codes = [(item["code"], item.get("clipId")) for item in report["typedFailures"]]
+        self.assertIn(("BASELINE_NOT_PINNED", None), codes)
+        self.assertIn(("REQUIRED_CLIP_NOT_ACQUIRED", "M02-1344"), codes)
+        self.assertFalse([item for item in codes if item[0].startswith("RECEIPT_")], "the receipt is reachable, so it must not be reported")
+        self.assertEqual(len(report["failures"]), len(report["typedFailures"]))
 
 
 if __name__ == "__main__":

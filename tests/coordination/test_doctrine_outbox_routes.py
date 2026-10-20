@@ -1158,7 +1158,10 @@ def test_remove_exercise_scratch_only_removes_its_own_directory(tmp_path):
 
 def test_exercise_flags_need_exercise(tmp_path):
     item = item_file(tmp_path, adopt("git log"))
-    for flag in (["--bus", str(tmp_path)], ["--fill", "a=b"], ["--scratch-root", str(tmp_path)]):
+    # NA-6 (hub ruling at the #515 r4 line 15:11:38Z, applied in m1): `--bus` is the ruling-candidate check's option too,
+    # so a bare `--bus` is accepted; only `--fill` and `--scratch-root` need `--exercise`.
+    assert ob.main(["--repo", str(tmp_path), "validate", str(item), "--bus", str(tmp_path)]) == 0
+    for flag in (["--fill", "a=b"], ["--scratch-root", str(tmp_path)]):
         with pytest.raises(SystemExit) as excinfo:
             ob.main(["--repo", str(tmp_path), "validate", str(item), *flag])
         assert excinfo.value.code == 2

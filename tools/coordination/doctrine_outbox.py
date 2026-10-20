@@ -9,10 +9,11 @@ ledger paths, Law-4 deny terms) comes from that config. The config schema is the
 and `configure()` below; no bus README documents it yet. This file is the candidate for the bus's
 `tools/factory/doctrine_outbox.py`. Once the bus steward lands it there, a project can run it from the
 bus BY PIN (`factory-pins/pin-runner.py run`, tools/factory/README.md); the pin names a reviewed bus
-SHA, so nothing runs until the project reviews and pins it. A project KEEPS its local copy at config
-`tool_rel` until a pin-aware release (card OUTBOX-PIN-AWARE-TOOL-AT-REF-1: a config-driven hook
-invocation plus a `require_tool_at_ref` that accepts a pinned tool), because the installed hook and the
-debt and drain checks still read that path. Until then this file is the only source.
+SHA, so nothing runs until the project reviews and pins it. This release is pin-aware (card
+OUTBOX-PIN-AWARE-TOOL-AT-REF-1): a config that names `tool_pin` has the installed hook run the pin through
+`factory-pins/pin-runner.py`, and `require_tool_at_ref` accept the pin runner plus a pins file naming it in
+place of the file at `tool_rel`. A project without `tool_pin` KEEPS its local copy at `tool_rel`, because
+the hook and the debt and drain checks then read that path. Until the bus holds the file this one is the only source.
 
 Lineage: the fleet bus's reference outbox -> agent-bridge's port -> a second project's port,
 whose behaviours are the superset below. The item format, front matter, `parse_item`, the Law-4
@@ -77,9 +78,21 @@ BEHAVIOURS
    whatever layer follows the guard (git lfs pre-push reads the same ref lines). A host with no python
    refuses the push (a guard that cannot run is not a pass), and an older guard block in an existing
    hook is MOVED to the splice point right after the shebang and `set` lines (`install-hooks` prints
-   `repaired`), so a layer that reads git's stdin ahead of it cannot starve it. The hook and the debt checks still
-   run the file at config `tool_rel`: a project keeps that local copy until a pin-aware release.
-11. Card routes are checked before they ship (CoS work order FWO-DEFECT-PREVENT-1 item 3; fail-closed, CARD-ROUTE-EXERCISE-2).
+   `repaired`), so a layer that reads git's stdin ahead of it cannot starve it. The hook and the debt checks run the
+   file at config `tool_rel`, or, when the config sets `tool_pin`, `python -I factory-pins/pin-runner.py run
+   <tool_pin> --` with the config path in $DOCTRINE_OUTBOX_CONFIG; `tool_rel` is then optional, and a pin that is
+   not provisioned on the machine refuses the push (the runner's exit passes through: a guard that cannot run is not a pass).
+11. Ruling candidates name what they touch or supersede (CoS work order FWO-DEFECT-PREVENT-1 item 4; seed #469 r1).
+   `validate` refuses an item that proposes a ruling candidate (any line that opens `Ruling candidate` once bullet,
+   quote, bold and heading marks are off, or a heading with `- RULING CANDIDATE` / `RULING CANDIDATE:` in it) unless it
+   carries a `touches/supersedes:` declaration (`touches:`, `supersedes:` and the bus template's `Relationship to
+   existing doctrine:` count too): rule ids (`R15`) or bus-relative paths (`RULINGS.md:1126-1152`) on that line, comma or semicolon
+   separated, or as bullets under it, or the single entry `none: <reason of >= 4 words>`. Typed refusals:
+   RULING_CANDIDATE_NO_SUPERSEDES, _NONE_NEEDS_REASON, _NONE_WITH_RULES, _TARGET_MALFORMED, and, when the bus clone
+   (`--bus`, default $FACTORY_BUS_CLONE) lacks a named target at its tip, _TARGET_NOT_ON_BUS. The bus is only read;
+   one that cannot be read is UNKNOWN (exit 2). With no bus the shape is still checked and the unchecked targets
+   are printed as a NOTE. The drain does not apply it, and sent items are not re-judged.
+12. Card routes are checked before they ship (CoS work order FWO-DEFECT-PREVENT-1 item 3; fail-closed, CARD-ROUTE-EXERCISE-2).
    `validate --exercise` takes every command an item names and, in a scratch `git clone --local --no-hardlinks` of the
    bus (`--bus`, default $FACTORY_BUS_CLONE) with `origin` removed, never in the bus itself, (a) checks that its program
    and every script it names exist, running nothing, and (b) runs it only when its program is on the execution ALLOWLIST
@@ -87,15 +100,16 @@ BEHAVIOURS
    existence-checked and then skipped as `ROUTE_NOT_EXECUTED`, never launched. It prints one
    `ROUTE_OK|ROUTE_NOT_EXECUTED|ROUTE_MISSING|ROUTE_FAILED|ROUTE_TIMEOUT|ROUTE_UNSAFE <item> <command>` line per
    command; anything but the first two exits 1. The extraction rule and the outcome meanings are the block comment above
-   `extract_routes`.
+   `extract_routes`. `--bus` is one option shared with behaviour 11: it is accepted without `--exercise`.
 
 Nothing here runs itself: the OS drain task, Stop hook and heartbeat debt are the project's wiring.
 
 Subcommands
 -----------
-    validate <item.md>... [--exercise [--bus PATH] [--timeout S] [--fill NAME=VALUE]... [--scratch-root PATH]]
-                                                parse + screen item files; --exercise also checks every route command
-                                                an item names (behaviour 11)
+    validate <item.md>... [--bus PATH] [--exercise [--timeout S] [--fill NAME=VALUE]... [--scratch-root PATH]]
+                                                parse + screen item files; a ruling candidate needs `touches/supersedes:`
+                                                naming rules or bus paths that exist at the bus tip (behaviour 11);
+                                                --exercise also checks every route command an item names (behaviour 12)
     debt [--ref R] [--ledger P] [--bus PATH] [--json]
     drain --bus PATH [--ref R] [--push] [--ledger P] [--deny-file P]
     kernel-filing --bus PATH [--ref R] [--push] [--ledger P] [--deny-file P]
@@ -117,6 +131,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import html
 import json
 import math
 import os
@@ -132,6 +147,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
 from typing import NamedTuple
@@ -182,6 +198,10 @@ ITEM_NAME_RE = re.compile(r"^\d{8}-[a-z0-9][a-z0-9-]{2,60}\.md$")
 SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
 STALE_HOURS = 24
 PROJECT_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
+# A pin runner tool name (factory-pins/pin-runner.py's NAME), and where a consumer keeps the runner and its pins.
+PIN_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+PIN_RUNNER_REL = "factory-pins/pin-runner.py"
+PINS_REL = "factory-pins/factory-pins.json"
 TRAILER_KEY = "Doctrine-Export"
 TRAILER_MODES = ("reasoned", "bare")
 BARE_TRAILER_VALUES = ("none", "outbox")
@@ -210,6 +230,7 @@ OUTBOX_DIR = "doctrine-outbox"
 SENT_DIR = ""        # optional: a directory under OUTBOX_DIR whose items are already sent (moved there)
 SENT_PREFIX = ""     # f"{OUTBOX_DIR}/{SENT_DIR}/" when SENT_DIR is set, else ""
 TOOL_REL = ""
+TOOL_PIN = ""        # optional: the tool's name in factory-pins/factory-pins.json; when set the hook runs it by pin
 DEFAULT_REF = ""
 DEFAULT_RANGE = ""
 CARDS_TARGET = ""
@@ -247,7 +268,7 @@ CONFIG_ROOT: pathlib.Path | None = None
 CONFIG_ERROR: Refusal | None = None   # why the config found at import was refused; None once configure() succeeds
 
 _CONFIG_KEYS = frozenset({
-    "schema", "project", "tool_rel", "default_ref", "default_range", "outbox_dir", "sent_dir", "cards_target",
+    "schema", "project", "tool_rel", "tool_pin", "default_ref", "default_range", "outbox_dir", "sent_dir", "cards_target",
     "finding_path_prefixes", "finding_path_files", "finding_path_regexes", "trailer_mode", "pre_push_refs",
     "law4_extra", "state_dir", "ledger_rel", "deny_file_rel", "subject_ledger_rel", "watermark_rel",
     "subject_ledger_env", "watermark_env", "identity_name", "identity_email", "bus_candidate",
@@ -325,7 +346,13 @@ def load_config(path: pathlib.Path) -> dict:
 def configure(cfg: dict, config_path: pathlib.Path | None = None) -> None:
     """Install one project's values into the module. Atomic: every value is validated and built
     first, and the module is rebound only when all of them are good."""
+    tool_pin = cfg.get("tool_pin", "")
+    if not isinstance(tool_pin, str) or (tool_pin and not PIN_NAME_RE.match(tool_pin)):
+        raise Refusal("CONFIG_INVALID", f"tool_pin must match {PIN_NAME_RE.pattern}")
+    # A project that runs the tool by pin may keep no local copy, so `tool_rel` is required only without a pin.
     for key in ("project", "tool_rel", "default_ref"):
+        if key == "tool_rel" and tool_pin and "tool_rel" not in cfg:
+            continue
         if not isinstance(cfg.get(key), str) or not cfg[key]:
             raise Refusal("CONFIG_INVALID", f"{key} is required")
     project = cfg["project"]
@@ -381,7 +408,8 @@ def configure(cfg: dict, config_path: pathlib.Path | None = None) -> None:
         "OUTBOX_DIR": outbox_dir,
         "SENT_DIR": sent_dir,
         "SENT_PREFIX": f"{outbox_dir}/{sent_dir}/" if sent_dir else "",
-        "TOOL_REL": cfg["tool_rel"],
+        "TOOL_REL": cfg.get("tool_rel", ""),
+        "TOOL_PIN": tool_pin,
         "DEFAULT_REF": cfg["default_ref"],
         "DEFAULT_RANGE": default_range,
         "CARDS_TARGET": cards_target,
@@ -730,17 +758,39 @@ def screen_rendered_card(item: dict) -> None:
 
 # ---------- repository queries (committed bytes only, never the worktree) ----------
 
+def _require_pin_at_ref(repo: pathlib.Path, ref: str) -> None:
+    """Raise Unknown unless `ref` carries the pin runner AND a pins file that names TOOL_PIN. The pinned
+    bytes live on the bus, so a project that runs the tool by pin keeps no copy at `tool_rel`; a ref that
+    predates the pin still reads as TOOL_ABSENT_AT_REF, never as 'no debt'."""
+    rc, _out, _err = git_try(repo, "cat-file", "-e", f"{ref}:{PIN_RUNNER_REL}")
+    if rc != 0:
+        raise Unknown("TOOL_ABSENT_AT_REF", f"{PIN_RUNNER_REL} is not at {ref}")
+    rc, text, _err = git_try(repo, "show", f"{ref}:{PINS_REL}")
+    if rc != 0:
+        raise Unknown("TOOL_ABSENT_AT_REF", f"{PINS_REL} is not at {ref}")
+    try:
+        pinned = json.loads(text.lstrip("﻿")).get("tools", {})
+    except (ValueError, AttributeError):
+        raise Unknown("TOOL_ABSENT_AT_REF", f"{PINS_REL} at {ref} is not a pins file") from None
+    if not isinstance(pinned, dict) or TOOL_PIN not in pinned:
+        raise Unknown("TOOL_ABSENT_AT_REF", f"{PINS_REL} at {ref} has no pin named {TOOL_PIN}")
+
+
 def require_tool_at_ref(repo: pathlib.Path, ref: str) -> None:
-    """Raise Unknown unless `ref` resolves AND carries this tool and the items directory.
+    """Raise Unknown unless `ref` resolves AND carries this tool and the items directory. The tool is the
+    file at `tool_rel`, or, when the config names a `tool_pin`, the pin runner plus a pins file naming it.
     Called before any debt/drain answer, so a checkout that predates the tool can never
     read as 'no debt'."""
     require_configured()
     rc, _out, _err = git_try(repo, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}")
     if rc != 0:
         raise Unknown("REF_UNRESOLVED", ref)
-    rc, _out, _err = git_try(repo, "cat-file", "-e", f"{ref}:{TOOL_REL}")
-    if rc != 0:
-        raise Unknown("TOOL_ABSENT_AT_REF", f"{TOOL_REL} is not at {ref}")
+    if TOOL_PIN:
+        _require_pin_at_ref(repo, ref)
+    else:
+        rc, _out, _err = git_try(repo, "cat-file", "-e", f"{ref}:{TOOL_REL}")
+        if rc != 0:
+            raise Unknown("TOOL_ABSENT_AT_REF", f"{TOOL_REL} is not at {ref}")
     rc, out, _err = git_try(repo, "ls-tree", "--name-only", "-z", ref, "--", f"{OUTBOX_DIR}/")
     if rc != 0 or not out:
         raise Unknown("TOOL_ABSENT_AT_REF", f"{OUTBOX_DIR}/ is not at {ref}")
@@ -2082,6 +2132,21 @@ def check_commits(repo: pathlib.Path, rev_range: str, deny_terms: list[tuple[str
 
 # ---------- hook commands: pre-push, stop, session-start, install-hooks ----------
 
+def _hook_tool_command(repo: pathlib.Path) -> str:
+    """The shell words the guard runs ahead of `pre-push`: the file at `tool_rel`, or, when the config names a
+    `tool_pin`, the project's pin runner running that pin. A pinned run executes the bytes from a temp
+    directory (or in-process), where the tool cannot find the project's config beside itself, so the hook
+    hands it the config path in $DOCTRINE_OUTBOX_CONFIG. The pin runner is started isolated (`-I`), the form
+    its own docs give a hook."""
+    if not TOOL_PIN:
+        return f"\"$OUTBOX_PY\" \"$REPO_ROOT/{TOOL_REL}\""
+    try:
+        config = f"\"$REPO_ROOT/{CONFIG_PATH.relative_to(repo.resolve()).as_posix()}\""
+    except (ValueError, AttributeError):
+        config = shlex.quote(CONFIG_PATH.as_posix()) if CONFIG_PATH is not None else f"\"$REPO_ROOT/{CONFIG_NAME}\""
+    return f"{CONFIG_ENV}={config} \"$OUTBOX_PY\" -I \"$REPO_ROOT/{PIN_RUNNER_REL}\" run {TOOL_PIN} --"
+
+
 def install_pre_push(repo: pathlib.Path) -> str:
     """Idempotently splice the outbox guard into the repo's pre-push hook. Machine-local, so a
     SessionStart hook can do this on every machine and every rotation without being asked."""
@@ -2102,7 +2167,7 @@ def install_pre_push(repo: pathlib.Path) -> str:
                f"OUTBOX_STDIN=$(mktemp 2>/dev/null) || OUTBOX_STDIN=\"${{TMPDIR:-/tmp}}/outbox-pre-push.$$\"\n"
                f"cat > \"$OUTBOX_STDIN\"\n"
                f"if [ -n \"$OUTBOX_PY\" ]; then\n"
-               f"  \"$OUTBOX_PY\" \"$REPO_ROOT/{TOOL_REL}\" pre-push \"$REPO_ROOT\" \"$@\" < \"$OUTBOX_STDIN\" || {{ OUTBOX_RC=$?; rm -f \"$OUTBOX_STDIN\"; exit $OUTBOX_RC; }}\n"
+               f"  {_hook_tool_command(repo)} pre-push \"$REPO_ROOT\" \"$@\" < \"$OUTBOX_STDIN\" || {{ OUTBOX_RC=$?; rm -f \"$OUTBOX_STDIN\"; exit $OUTBOX_RC; }}\n"
                f"else\n"
                f"  echo \"doctrine-outbox: no python on PATH; push refused because the guard cannot run\" >&2\n"
                f"  rm -f \"$OUTBOX_STDIN\"; exit 1\n"
@@ -3635,11 +3700,252 @@ def bus_commits_behind_origin(bus: pathlib.Path) -> int:
     return 0
 
 
+# ---------- ruling candidates must name what they touch or supersede ----------
+#
+# CoS work order FWO-DEFECT-PREVENT-1 item 4 (seed: #469 r1, where the candidate quietly contradicted RULINGS.md:1126-1152,
+# R15 and an open candidate and the reviewer, not the producer, found it). `validate` refuses a ruling candidate that
+# carries no `touches/supersedes:` declaration, names a target that is not shaped like one, or names one the bus clone
+# it reads does not hold. The bus is only READ, at its committed tip (HEAD); a bus the validator cannot read is UNKNOWN.
+
+# Whole words: the right boundary leaves out `ruling-candidates/`, `ruling-candidate-<slug>` and the plural. Zero spaces or
+# dashes may sit between the words, because deleting an invisible character (U+200B, a soft hyphen) joins them.
+RULING_CANDIDATE_PHRASE = r"ruling[ \t-]*candidate(?![-\w/])"
+RULING_QUALIFIER = r"(?:(?:proposed|draft|new)[ \t]+)?"
+RULING_CANDIDATE_LEAD_RE = re.compile(RULING_QUALIFIER + RULING_CANDIDATE_PHRASE, re.I)
+RULING_CANDIDATE_AFTER_SEP_RE = re.compile(r"[-:][ \t]*" + RULING_QUALIFIER + RULING_CANDIDATE_PHRASE, re.I)
+RULING_CANDIDATE_COLON_RE = re.compile(r"(?<![\w/-])ruling[ \t-]*candidate[ \t]*:", re.I)
+HTML_TAG_RE = re.compile(r"</?[A-Za-z][^<>]*>")
+# Markup that may sit in front of a marker, in any order: spaces, `>`, `#`s, a list bullet, emphasis, quotes, brackets.
+MARKER_FRONT_RE = re.compile(r"[ \t]+|(?P<quote>>)|(?P<atx>#{1,6})(?=[ \t]|$)|(?P<bullet>(?:[-+*]|\d+[.)])(?=[ \t]|$))"
+                             "|[*_`\"'“”‘’«»‹›\\[(]")
+MARKER_UNDERLINE_RE = re.compile(r"=+|-+")   # a setext underline, once the line is stripped
+RULING_TARGET_VERB_RE = re.compile(r"(?:extends|supersedes|distinguishes|touches|narrows|adopts)[ \t]+(?=\S)", re.I)
+TOUCHES_LABEL_RE = re.compile(r"^([ \t]*)([-*][ \t]+)?(?:\*\*)?(?:touches/supersedes|touches|supersedes|relationship[ \t]+to[ \t]+existing[ \t]+doctrine)(?:\*\*)?:(?:\*\*)?[ \t]*(.*?)[ \t]*$", re.I)
+TOUCHES_BULLET_RE = re.compile(r"^([ \t]*)[-*][ \t]+(\S.*?)[ \t]*$")
+TOUCHES_NONE_RE = re.compile(r"^none\b[ \t]*[:\-–—]?[ \t]*(.*)$", re.I)
+RULING_RULE_ID_RE = re.compile(r"^R\d+(?:\.\d+)*$")
+RULING_PATH_RE = re.compile(r"^([A-Za-z0-9_][\w.@+-]*(?:/[\w.@+-]+)*)/?(?::\d+(?:-\d+)?|#[\w.-]+)?$")
+RULING_TARGET_NOTE_RE = re.compile(r"[ \t]+\(.*\)$")
+RULING_BUS_ENV = ROUTE_BUS_ENV   # one bus clone for the ruling-candidate check and the route exercise
+RULINGS_FILE = "RULINGS.md"
+
+
+def normalise_marker_line(line: str) -> str:
+    """One line as the marker test reads it: Unicode NFKD with the combining marks (category Mn) dropped, then NFKC
+    (full-width forms and no-break spaces become their ASCII twins), every format character (zero-width space or
+    joiner, BOM, soft hyphen) deleted, every space separator a plain space, every dash (en, em, minus, non-breaking
+    hyphen) a `-`."""
+    out = []
+    decomposed = "".join(ch for ch in unicodedata.normalize("NFKD", line.rstrip("\r\n")) if unicodedata.category(ch) != "Mn")
+    for ch in unicodedata.normalize("NFKC", decomposed):
+        category = unicodedata.category(ch)
+        if category == "Cf":
+            continue
+        out.append(" " if category == "Zs" else "-" if category == "Pd" or ch == "−" else ch)
+    return "".join(out)
+
+
+def marker_line(line: str) -> tuple[str, int, bool, bool]:
+    """(text, quote depth, was a list item, was an ATX heading) for one line: its markup (`>`, `#`s, a bullet,
+    emphasis, quotes, brackets) comes off the front in any order, and `*`, `_` and backticks come out of the rest,
+    so the words a marker opens with are the first thing left."""
+    text, depth, bullet, heading = normalise_marker_line(line), 0, False, False
+    while True:
+        found = MARKER_FRONT_RE.match(text)
+        if not found:
+            return re.sub(r"[*_`]", "", text).strip(), depth, bullet, heading
+        depth += bool(found.group("quote"))
+        bullet = bullet or bool(found.group("bullet"))
+        heading = heading or bool(found.group("atx"))
+        text = text[found.end():]
+
+
+def render_marker_lines(body: str) -> list[tuple[str, bool]]:
+    """The body as the marker test reads it, as (line, opens a block) pairs: HTML entities decoded (`&nbsp;`, `&#160;`),
+    HTML tags dropped with their text kept (`<strong>Ruling candidate:</strong>`), and a line with a `|` split into its
+    cells, each its own block-opening line (a leading pipe or a table delimiter row leaves no cell of its own)."""
+    rendered: list[tuple[str, bool]] = []
+    for raw in body.splitlines():
+        line = HTML_TAG_RE.sub("", html.unescape(raw.rstrip("\r")))
+        if "|" in line:
+            rendered += [(cell, True) for cell in [c for c in line.split("|") if c.strip()] or [""]]
+        else:
+            rendered.append((line, False))
+    return rendered
+
+
+def is_ruling_candidate(item: dict) -> bool:
+    """A ruling candidate is an item with a marker line. A line can be one only where a block OPENS: the item's first
+    line, a line after a blank one, a line after a heading (ATX or setext underline), a thematic break or a fence
+    line (opening or closing), a heading, a list item, a table cell, a line that starts a deeper blockquote, a setext
+    heading (a line over `===` or `---`), or any line in or at a fence (when in doubt it is a candidate; a fence
+    closes on the same character, at least as long). A continuation line of a wrapped paragraph never is, so prose
+    that wraps onto `ruling-candidates/x.md` or `ruling candidate titled ...` is left alone. The body is rendered
+    first (`render_marker_lines`). On such a line, once normalised (`normalise_marker_line`) and stripped of markup
+    (`marker_line`), the marker is `Ruling candidate` as whole words, any case, a space or dash between them, with
+    an optional `Proposed`, `Draft` or `New` before it, whatever follows (`:`, ` (r2):`, ` - `, the end of the line).
+    A heading-class line (ATX, setext, the item's first line) also counts when the phrase follows a `-` or `:`
+    (`### proj, 2026-10-16 - RULING CANDIDATE (r2): X`) or is followed by a colon. A line that only mentions the
+    phrase, or a heading that mentions someone else's candidate (`... for ruling candidate <id>`, no colon), is
+    not a marker. A `kind: ruling` item is a ratified ruling (`ratified_by` is required for it), not a candidate."""
+    lines = render_marker_lines(item["body"])
+    fence: tuple[str, int] | None = None
+    seen_text, prev_blank, prev_depth, prev_closes = False, True, 0, False
+    for i, (line, forced) in enumerate(lines):
+        text, depth, bullet, heading = marker_line(line)
+        unquoted = line.lstrip(" \t>")
+        fence_line = _FENCE_OPEN_RE.match(unquoted)
+        at_fence = False
+        if fence is not None:
+            if fence_line and fence_line.group(1)[0] == fence[0] and len(fence_line.group(1)) >= fence[1] and not unquoted.strip(" `~"):
+                fence, at_fence = None, True
+        elif fence_line:
+            fence, at_fence = (fence_line.group(1)[0], len(fence_line.group(1))), True
+        setext = (bool(text) and not MARKER_UNDERLINE_RE.fullmatch(text) and i + 1 < len(lines)
+                  and bool(MARKER_UNDERLINE_RE.fullmatch(marker_line(lines[i + 1][0])[0])))
+        first = bool(text) and not seen_text
+        seen_text = seen_text or bool(text)
+        opens = (prev_blank or prev_closes or forced or bullet or heading or setext or fence is not None or at_fence
+                 or depth > prev_depth)
+        if text and opens:
+            if RULING_CANDIDATE_LEAD_RE.match(text):
+                return True
+            if (heading or setext or first) and (RULING_CANDIDATE_AFTER_SEP_RE.search(text) or RULING_CANDIDATE_COLON_RE.search(text)):
+                return True
+        # the next line opens a block when this one ended one: an ATX heading, a setext underline or thematic break, a fence line
+        prev_blank, prev_depth = not text, depth
+        prev_closes = heading or at_fence or bool(MARKER_UNDERLINE_RE.fullmatch(text))
+    return False
+
+
+def touches_supersedes_entries(body: str) -> list[str] | None:
+    """The entries of a candidate's `touches/supersedes:` declaration, or None when no label is present. The label
+    is `touches/supersedes:`, `touches:`, `supersedes:` or `Relationship to existing doctrine:` (the bus candidate
+    template's own field), may be a bullet and bold, and may repeat; entries add up.
+    Entries are the comma- or semicolon-separated names after a label on the same line, plus the bullet lines
+    indented under it (or, when the label is not a bullet, the bullets right below it) up to the first blank line or
+    non-bullet. A value that opens with `none` is one entry, whole, so its reason keeps its commas. A label inside
+    a fenced block does not count."""
+    lines = body.splitlines()
+    fence: tuple[str, int] | None = None
+    entries: list[str] | None = None
+    for i, raw in enumerate(lines):
+        line = raw.rstrip("\r")
+        opened = _FENCE_OPEN_RE.match(line)
+        if fence is not None:
+            if opened and opened.group(1)[0] == fence[0] and len(opened.group(1)) >= fence[1] and not line.strip(" `~"):
+                fence = None
+            continue
+        if opened:
+            fence = (opened.group(1)[0], len(opened.group(1)))
+            continue
+        found = TOUCHES_LABEL_RE.match(line)
+        if not found:
+            continue
+        indent, bullet, inline = len(found.group(1).expandtabs(4)), found.group(2), found.group(3).replace("**", "").strip()
+        entries = [] if entries is None else entries
+        if inline:
+            entries += [inline] if TOUCHES_NONE_RE.match(inline) else [e.strip(" `") for e in re.split(r"[;,]", inline) if e.strip(" `")]
+        for follow in lines[i + 1:]:
+            sub = TOUCHES_BULLET_RE.match(follow.rstrip("\r"))
+            if not sub:
+                break
+            depth = len(sub.group(1).expandtabs(4))
+            if bullet is not None and depth <= indent:
+                break
+            entries.append(sub.group(2).replace("**", "").strip(" `"))
+    return entries
+
+
+def _ruling_target(entry: str) -> tuple[str, str] | None:
+    """(kind, name) for one entry, or None when it is not shaped like a target. `rule` is an id like `R15` or `R14.8`;
+    `path` is a bus-relative file or directory, with an optional `:<line>[-<line>]` or `#<anchor>` that is not
+    checked. A leading verb (`extends`, `supersedes`, `distinguishes`, `touches`, `narrows`, `adopts`) and a
+    trailing parenthetical note are dropped. A bare word, an absolute or `..` path and a backslash path are not
+    targets."""
+    target = RULING_TARGET_NOTE_RE.sub("", RULING_TARGET_VERB_RE.sub("", entry, count=1)).strip(" `")
+    if RULING_RULE_ID_RE.match(target):
+        return "rule", target
+    found = RULING_PATH_RE.match(target)
+    if not found or re.match(r"^r\d+(?:\.\d+)*\.?$", target, re.I):   # `r15.` is a mistyped rule id, not a file
+        return None
+    path = found.group(1)
+    if ("/" not in path and "." not in path) or any(part in (".", "..") for part in path.split("/")):
+        return None
+    return "path", path
+
+
+def _bus_ruling_ids(bus: pathlib.Path) -> str:
+    return cat_file_blob(bus, "HEAD", RULINGS_FILE).decode("utf-8", errors="replace")
+
+
+def _bus_has_rule(rulings: str, rule_id: str) -> bool:
+    """A rule id is on the bus when a heading or a bold bullet of RULINGS.md opens with or names it (`## ... R15: ...`,
+    `- **R15.3 - ...`); an id mentioned only in prose does not count, and `R15` is not satisfied by `R150` or `R15.3`."""
+    token = re.compile(r"(?<![\w.])" + re.escape(rule_id) + r"(?![\w]|\.\d)")
+    for line in rulings.splitlines():
+        if (line.startswith("#") or re.match(r"^\s*[-*]?\s*\*\*", line)) and token.search(line[:240]):
+            return True
+    return False
+
+
+def screen_ruling_candidate(item: dict, bus: pathlib.Path | None = None) -> list[str]:
+    """Refuse a ruling candidate whose `touches/supersedes:` declaration is missing or empty, mixes `none` with rule
+    ids, gives `none` without a reason of NONE_REASON_MIN_WORDS words (the floor a `Doctrine-Export: none` carries),
+    names an entry that is not a rule id or a bus-relative path, or, when `bus` is given, names one the bus clone
+    does not hold at its tip. Returns the targets it could not check because no bus was given (empty otherwise).
+    A bus that cannot be read is UNKNOWN, never a pass. A non-candidate is not looked at."""
+    if not is_ruling_candidate(item):
+        return []
+    entries = touches_supersedes_entries(item["body"])
+    if not entries:
+        raise Refusal("RULING_CANDIDATE_NO_SUPERSEDES",
+                      "a ruling candidate needs a non-empty `touches/supersedes:` list (or `Relationship to existing "
+                      "doctrine:`): the rules or specs it overlaps, as rule ids or bus paths, or `none: <reason>`")
+    nones = [e for e in entries if TOUCHES_NONE_RE.match(e)]
+    if nones:
+        if len(entries) > 1:
+            raise Refusal("RULING_CANDIDATE_NONE_WITH_RULES", "`none` cannot sit beside other entries in `touches/supersedes:`")
+        reason = TOUCHES_NONE_RE.match(nones[0]).group(1)
+        if len(reason.split()) < NONE_REASON_MIN_WORDS:
+            raise Refusal("RULING_CANDIDATE_NONE_NEEDS_REASON",
+                          f"`none` in `touches/supersedes:` needs a reason of at least {NONE_REASON_MIN_WORDS} words")
+        return []
+    targets = [(entry, _ruling_target(entry)) for entry in entries]
+    bad = [entry for entry, target in targets if target is None]
+    if bad:
+        raise Refusal("RULING_CANDIDATE_TARGET_MALFORMED",
+                      "each `touches/supersedes:` entry is a rule id (`R15`, `R14.8`) or a bus-relative path "
+                      "(`RULINGS.md:1126-1152`, `tools/fleet-sweep.mjs`); not one: " + "; ".join(repr(b) for b in bad[:4]))
+    if bus is None:
+        return [entry for entry, _target in targets]
+    rc, _out, _err = git_try(bus, "rev-parse", "--verify", "-q", "HEAD^{commit}")
+    if rc != 0:
+        raise Unknown("RULING_BUS_UNREADABLE", f"{bus} is not a git clone with a committed tip; the touches/supersedes targets cannot be checked")
+    rulings: str | None = None
+    missing: list[str] = []
+    for entry, target in targets:
+        kind, name = target
+        if kind == "rule":
+            rulings = _bus_ruling_ids(bus) if rulings is None else rulings
+            present = _bus_has_rule(rulings, name)
+        else:
+            present = git_try(bus, "cat-file", "-e", f"HEAD:{name}")[0] == 0
+        if not present:
+            missing.append(entry)
+    if missing:
+        raise Refusal("RULING_CANDIDATE_TARGET_NOT_ON_BUS",
+                      "not on the bus clone at its tip (a path is bus-relative, a rule id is a heading or bold bullet of "
+                      f"{RULINGS_FILE}): " + "; ".join(repr(m) for m in missing[:6]))
+    return []
+
+
 # ---------- CLI commands ----------
 
 def cmd_validate(paths: list[pathlib.Path], deny_terms: list[tuple[str, str]],
-                 exercise: dict | None = None) -> int:
-    """Validate item files; with `exercise` (bus, timeout, fills, scratch_root) also check each valid item's routes."""
+                 bus: pathlib.Path | None = None, exercise: dict | None = None) -> int:
+    """Validate item files; `bus` is the bus clone a ruling candidate's targets are read from. With `exercise`
+    (bus, timeout, fills, scratch_root) also check each valid item's routes."""
     ok = True
     valid: list[tuple[str, dict]] = []
     concern_ids: dict[str, pathlib.Path] = {}
@@ -3655,6 +3961,10 @@ def cmd_validate(paths: list[pathlib.Path], deny_terms: list[tuple[str, str]],
             item = parse_item(text)
             screen_law4(item["body"], deny_terms)
             screen_rendered_card(item)
+            unchecked = screen_ruling_candidate(item, bus)
+            if unchecked:
+                print(f"[doctrine-outbox] NOTE {p}: touches/supersedes targets NOT checked against the bus (pass --bus <bus clone> "
+                      f"or set ${RULING_BUS_ENV}): {'; '.join(unchecked[:6])}", file=sys.stderr)
             if "concern" in item:
                 cid = item["concern"]["id"]
                 if cid in concern_ids:
@@ -3708,7 +4018,8 @@ def build_parser() -> argparse.ArgumentParser:
                             help="also check every command each item names (see 'card routes') in a scratch clone of the bus: "
                                  "existence for every route, execution only for a program on the allowlist (git)")
     validate_p.add_argument("--bus", type=pathlib.Path, default=None,
-                            help=f"with --exercise: the bus clone to copy (default ${ROUTE_BUS_ENV}); read, never run in")
+                            help=f"the bus clone (default ${RULING_BUS_ENV}): a ruling candidate's touches/supersedes targets "
+                                 "must exist at its tip, and --exercise copies it; read, never written or run in")
     validate_p.add_argument("--timeout", type=float, default=ROUTE_DEFAULT_TIMEOUT_S,
                             help="with --exercise: seconds before a route is ROUTE_TIMEOUT (default %(default)s)")
     validate_p.add_argument("--fill", action="append", default=[], metavar="NAME=VALUE",
@@ -3812,6 +4123,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.cmd == "validate":
             deny_terms = gather_deny_terms(resolve_deny_file(repo, args.deny_file))
+            env_bus = os.environ.get(RULING_BUS_ENV)
+            bus = args.bus.resolve() if args.bus is not None else (pathlib.Path(env_bus).resolve() if env_bus else None)
             exercise = None
             if args.exercise:
                 if not math.isfinite(args.timeout) or args.timeout <= 0:
@@ -3822,10 +4135,10 @@ def main(argv: list[str] | None = None) -> int:
                     if not sep or not name:
                         parser.error("--fill wants NAME=VALUE; an argument without `=` was given (its text is not echoed: it may be a secret)")
                     fills[name] = value
-                exercise = {"bus": args.bus, "timeout": args.timeout, "fills": fills, "scratch_root": args.scratch_root}
-            elif args.bus is not None or args.fill or args.scratch_root is not None:
-                parser.error("--bus, --fill and --scratch-root need --exercise")
-            return cmd_validate(args.items, deny_terms, exercise)
+                exercise = {"bus": bus, "timeout": args.timeout, "fills": fills, "scratch_root": args.scratch_root}
+            elif args.fill or args.scratch_root is not None:
+                parser.error("--fill and --scratch-root need --exercise")
+            return cmd_validate(args.items, deny_terms, bus=bus, exercise=exercise)
         if args.cmd == "debt":
             ledger = resolve_ledger(repo, args.ledger)
             bus = args.bus.resolve() if args.bus is not None else None
