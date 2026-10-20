@@ -114,12 +114,14 @@ bool gpuAmazeDebayerApplyGpuOffscreenPostWb(const float * inputRawFrame,
  * left pending by a call nothing captures (create, destroy, the GL reset) is
  * stage "amaze:uncaptured", rc 0, role "orphan", with its own site. dropped is
  * the DLL queue's drops since the previous drain, on that drain's first record.
+ * notedUtcMs is the note's igpu_cuda_error_t.utc_ms (the wall clock when the DLL
+ * noted it), 0 with no note (GPU-FIELD-TELEMETRY-FAULT-UTC-STAMP-1).
  * GpuFieldTelemetry::install() installs it; NULL uninstalls (nothing is drained
  * then, so a code waits for an installed sink). */
 typedef void (*GpuAmazeStageTelemetrySink)(const char * stage, int rc, double ms,
                                            int cudaCode, const char * cudaName,
                                            const char * site, const char * role,
-                                           unsigned long long dropped);
+                                           unsigned long long dropped, double notedUtcMs);
 void gpuAmazeDebayerSetStageTelemetrySink(GpuAmazeStageTelemetrySink sink);
 
 /* r6: the AMaZE DLL's optional CUDA-error exports (igpu_cuda_error.h). drain

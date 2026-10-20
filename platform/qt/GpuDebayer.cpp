@@ -587,7 +587,7 @@ void noteAmazeStageTelemetry(GpuAmazeDebayerRuntime * runtime,
         igpu_amaze_debayer_timing_t backendTiming;
         if ( runtime->lastTiming && runtime->lastTiming(backend, &backendTiming) == 0 )
         {
-            sink(stage, 0, backendTiming.total_ms, 0, nullptr, nullptr, nullptr, 0);
+            sink(stage, 0, backendTiming.total_ms, 0, nullptr, nullptr, nullptr, 0, 0.0);
         }
         return;
     }
@@ -1377,7 +1377,7 @@ int gpuAmazeCudaErrorsEmitOrphans(const GpuAmazeCudaErrorSource & source, int ch
         for ( int i = 0; i < n; ++i, ++emitted )
         {
             sink("amaze:uncaptured", 0, -1.0, notes[i].code, notes[i].name, notes[i].site, "orphan",
-                 i == 0 ? dropped : 0);
+                 i == 0 ? dropped : 0, notes[i].utc_ms);
         }
     }
     return emitted;
@@ -1401,11 +1401,11 @@ int gpuAmazeCudaErrorsEmitFailure(const GpuAmazeCudaErrorSource & source, const 
         {
             error.name[sizeof(error.name) - 1] = '\0';
             error.site[sizeof(error.site) - 1] = '\0';
-            sink(stage, rc, -1.0, error.code, error.name, error.site, "primary", 0);
+            sink(stage, rc, -1.0, error.code, error.name, error.site, "primary", 0, error.utc_ms);
         }
         else
         {
-            sink(stage, rc, -1.0, 0, nullptr, nullptr, "primary", 0);
+            sink(stage, rc, -1.0, 0, nullptr, nullptr, "primary", 0, 0.0);
         }
         return 1;
     }
@@ -1414,13 +1414,13 @@ int gpuAmazeCudaErrorsEmitFailure(const GpuAmazeCudaErrorSource & source, const 
     const int n = drainAmazeCudaErrors(source, IGPU_CUDA_ERROR_CHANNEL_RENDER, notes, &dropped);
     if ( n == 0 )
     {
-        sink(stage, rc, -1.0, 0, nullptr, nullptr, "primary", dropped);
+        sink(stage, rc, -1.0, 0, nullptr, nullptr, "primary", dropped, 0.0);
         return 1;
     }
     for ( int i = 0; i < n; ++i )
     {
         sink(stage, rc, -1.0, notes[i].code, notes[i].name, notes[i].site,
-             i == 0 ? "primary" : "secondary", i == 0 ? dropped : 0);
+             i == 0 ? "primary" : "secondary", i == 0 ? dropped : 0, notes[i].utc_ms);
     }
     return n;
 }
