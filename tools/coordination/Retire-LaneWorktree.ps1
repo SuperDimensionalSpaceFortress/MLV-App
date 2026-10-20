@@ -731,10 +731,12 @@ function Invoke-RetireLaneWorktree {
     } catch {
         $d.action = 'kept'; $d.reason = "cannot-determine: $($_.Exception.Message)"
     } finally {
-        # Every path that leaves the worktree standing (kept, would-retire) ends with no daemon in it; a retired worktree is gone. Best effort, never throws.
+        # Every path that leaves the worktree standing (kept, would-retire) tries to leave no daemon in it; a retired worktree is gone. Best effort,
+        # never throws, and not a guarantee: a failed stop is recorded in fsmonitorStop, and a daemon may still be running.
         # Only when the disable did not take: after a successful disable the early stop already left none and nothing can start one.
         # LANE-FSMONITOR-FOLLOWUPS-1 (b): unless that early stop FAILED. The disable only prevents a new daemon; a daemon already running is still
-        # there, so this is the one retry (bounded: it is this single call, never a loop). Its outcome lands in `final`, the early failure stays in `early`.
+        # there, so this is the one retry (bounded in count: it is this single call, never a loop; not bounded in elapsed time, because
+        # Stop-LaneWorktreeFsmonitor sets no deadline of its own). Its outcome lands in `final`, the early failure stays in `early`.
         if ($wd -and $d.action -ne 'retired' -and $d.action -ne 'skipped') {
             $earlyStopFailed = ($null -ne $d.fsmonitorStop.early -and $d.fsmonitorStop.early -like 'failed*')
             if ($null -ne $d.fsmonitorStop.disable -and $d.fsmonitorStop.disable -eq 'disabled' -and -not $earlyStopFailed) {
