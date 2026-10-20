@@ -807,3 +807,295 @@ def test_r4_a_rendered_heading_marker_is_refused_bare_and_accepted_with_a_declar
 def test_r4_rendering_does_not_make_plain_prose_a_candidate(tmp_path, capsys, label, body):
     rc, err = validate(tmp_path, _receipt(body), tmp_path / "no-such-clone", capsys)
     assert rc == 0 and err == "", (label, err)
+
+
+# ---------- ROUTE-RULING-MARKUP-FORMS-1 (r1): every exotic form was counted on the real bus first ----------
+# Read-only sweep of the doctrine bus at origin/master 918e8e40 (816 text files, 6,640 heading blocks), per form:
+#   HTML comment 0 | footnote 0 | definition list 0 | look-alike letters 0 | bullet glyph 0 | heading-separator decoration 0
+#   | label the tool cannot read 0 | fence state out of step 0 | phrase after a pipe in prose 2 (neither a candidate)
+#   | a bullet that opens with the phrase and cites another candidate 1 (cos-feedback/_bus/pr-69.md:17).
+# Rendering every one of those forms first flips no block of the bus. A form with no bus use and no verdict effect is PINNED
+# below (today's result, so a later change to it is a decision and not an accident); the one form the bus uses is FIXED.
+
+CITATION_LINES = [
+    "- Ruling candidate `ruling-candidates/x.md` remains PROPOSED",
+    "- Ruling candidate `ruling-candidates/cli-parity-detection-vs-repair-r1.md` remains **PROPOSED — ZERO AUTHORITY**; keep it out of any consumer gate until ratification",   # cos-feedback/_bus/pr-69.md:17
+    "* ruling candidate ruling-candidates/x.md was filed with the push",
+    "> Ruling candidate `ruling-candidates/x.md` remains PROPOSED",
+    "Ruling candidate `ruling-candidates/x.md` is still open.",
+]
+CITATION_STILL_MARKERS = [
+    "- Ruling candidate ruling-candidates/x.md: the hook is deny-only.",
+    "- Ruling candidate: `ruling-candidates/x.md` remains PROPOSED",
+    "- Ruling candidate `ruling-candidates/x.md`",
+    "- Ruling candidate `ruling-candidates/x.md` - the hook is deny-only.",
+    "- Ruling candidate (r2): `ruling-candidates/x.md` remains PROPOSED",
+]
+
+
+@pytest.mark.parametrize("line", CITATION_LINES)
+def test_mf_a_line_that_opens_with_the_phrase_and_cites_another_candidate_is_not_a_marker(tmp_path, capsys, line):
+    rc, err = validate(tmp_path, _receipt(f"{NEUTRAL_HEADING}\n\n{line}\n"), tmp_path / "no-such-clone", capsys)
+    assert rc == 0 and err == "", (line, err)
+
+
+@pytest.mark.parametrize("line", CITATION_STILL_MARKERS)
+def test_mf_a_colon_a_dash_or_nothing_after_the_cited_path_is_still_a_marker(tmp_path, capsys, line):
+    bus = make_bus(tmp_path)
+    rc, err = validate(tmp_path, body_with(line), bus, capsys)
+    assert rc == 1 and "RULING_CANDIDATE_NO_SUPERSEDES" in err, (line, err)
+    rc, err = validate(tmp_path, body_with(line, "touches/supersedes: R15\n"), bus, capsys)
+    assert rc == 0 and err == "", (line, err)
+
+
+# PINNED, today's result. Each form has no use on the bus and flips no bus block; changing one is a new decision.
+PINNED_ACCEPTED_BARE = [
+    ("an HTML comment", "<!-- Ruling candidate: X -->"),
+    ("an HTML comment over lines", "<!--\nRuling candidate: X\n-->"),
+    ("a footnote definition", "[^p]: Ruling candidate: X"),
+    ("a definition-list value", "Proposal\n: Ruling candidate: X"),
+    ("a Cyrillic letter that looks like i", "Rulіng candidate: X"),
+    ("a Greek letter that looks like i", "Rulιng candidate: X"),
+    ("a Cyrillic letter that looks like a", "Ruling cаndidate: X"),
+    ("a bullet glyph that is not markdown", "• Ruling candidate: X"),
+]
+
+
+@pytest.mark.parametrize("label, marker", PINNED_ACCEPTED_BARE, ids=[label for label, _ in PINNED_ACCEPTED_BARE])
+def test_mf_pinned_an_exotic_marker_form_is_still_accepted_bare(tmp_path, capsys, label, marker):
+    rc, err = validate(tmp_path, body_with(marker), tmp_path / "no-such-clone", capsys)
+    assert rc == 0 and err == "", (label, err)
+
+
+@pytest.mark.parametrize("heading", ['proj - "RULING CANDIDATE": X', "proj - [RULING CANDIDATE]: X"])
+def test_mf_pinned_decoration_between_a_heading_separator_and_the_phrase_is_still_accepted_bare(tmp_path, capsys, heading):
+    rc, err = validate(tmp_path, candidate(heading=f"### {heading}"), tmp_path / "no-such-clone", capsys)
+    assert rc == 0 and err == "", (heading, err)
+
+
+@pytest.mark.parametrize("declaration", [
+    "> touches/supersedes: R15\n",
+    "1. touches: R15\n",
+    "+ touches: R15\n",
+    "touches/supersedes： R15\n",
+    " touches: R15\n",
+])
+def test_mf_pinned_a_declaration_label_in_a_form_the_tool_does_not_read_is_refused_closed(tmp_path, capsys, declaration):
+    rc, err = validate(tmp_path, candidate(declaration), make_bus(tmp_path), capsys)
+    assert rc == 1 and "RULING_CANDIDATE_NO_SUPERSEDES" in err, (declaration, err)
+
+
+def test_mf_pinned_an_indented_fence_line_leaves_the_fence_state_open_so_later_wrapped_prose_is_refused(tmp_path, capsys):
+    """The fence state toggles on any fence-like line at any indent (`    ```` is code content in markdown); the
+    state then stays open and every later line opens a block. Fails closed; no bus file does this."""
+    body = f"{NEUTRAL_HEADING}\n\n    ```\n\nWe filed a\nruling candidate titled x in the same push.\n"
+    rc, err = validate(tmp_path, _receipt(body), tmp_path / "no-such-clone", capsys)
+    assert rc == 1 and "RULING_CANDIDATE_NO_SUPERSEDES" in err, err
+
+
+def test_mf_pinned_prose_after_a_pipe_that_opens_with_the_phrase_is_refused(tmp_path, capsys):
+    """A cell after a pipe opens a block (the existing row `a | Ruling candidate: X` needs that), so prose that
+    continues `a | ruling candidate titled x` is refused too. Two bus lines have a pipe and the phrase; neither opens a cell."""
+    body = f"{NEUTRAL_HEADING}\n\nWe compared a | ruling candidate titled x.\n"
+    rc, err = validate(tmp_path, _receipt(body), tmp_path / "no-such-clone", capsys)
+    assert rc == 1 and "RULING_CANDIDATE_NO_SUPERSEDES" in err, err
+
+
+# the bus commit is captured once, and a missing target is not an unreadable bus
+
+def _commit_on_bus(bus: Path, files: dict[str, str], remove: tuple[str, ...] = (), message: str = "move on") -> None:
+    for rel in remove:
+        git(bus, "rm", "-q", rel)
+    for rel, text in files.items():
+        target = bus / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8", newline="\n")
+    git(bus, "add", "-A")
+    git(bus, "commit", "-q", "-m", message)
+
+
+def _drop_object(bus: Path, rev: str) -> None:
+    """Delete the loose object `rev` names from a scratch bus: the next read of it is an object-read failure."""
+    sha = git(bus, "rev-parse", rev)
+    path = bus / ".git" / "objects" / sha[:2] / sha[2:]
+    path.chmod(0o666)
+    path.unlink()
+
+
+def test_mf_every_lookup_reads_the_commit_captured_once(tmp_path, capsys, monkeypatch):
+    """Dot (PR 515 improvements): the bus tip is resolved once. If a writer advances the clone after that probe, every
+    target is still judged against the same commit; here HEAD moves on (R15 and fleet-sweep gone, later.mjs added)."""
+    bus = make_bus(tmp_path)
+    real, moved = ob.git_try, []
+
+    def advance_after_the_tip_probe(repo, *args, **kwargs):
+        out = real(repo, *args, **kwargs)
+        if not moved and "rev-parse" in args:
+            moved.append(True)
+            _commit_on_bus(bus, {"RULINGS.md": RULINGS.replace("R15", "Q15"), "tools/later.mjs": "// later\n"}, remove=("tools/fleet-sweep.mjs",))
+        return out
+
+    monkeypatch.setattr(ob, "git_try", advance_after_the_tip_probe)
+    rc, err = validate(tmp_path, candidate("touches/supersedes: R15, tools/fleet-sweep.mjs, tools/later.mjs\n"), bus, capsys)
+    assert moved, "the bus never advanced, so the test proved nothing"
+    assert rc == 1 and "RULING_CANDIDATE_TARGET_NOT_ON_BUS" in err and "'tools/later.mjs'" in err, err
+    assert "'R15'" not in err and "fleet-sweep" not in err, "targets that the captured commit holds are not reported missing: " + err
+
+
+def test_mf_a_missing_target_is_the_not_on_bus_refusal(tmp_path, capsys):
+    rc, err = validate(tmp_path, candidate("touches/supersedes: tools/nope.mjs, R99\n"), make_bus(tmp_path), capsys)
+    assert rc == 1 and "RULING_CANDIDATE_TARGET_NOT_ON_BUS" in err and "UNREADABLE" not in err, err
+    assert "'tools/nope.mjs'" in err and "'R99'" in err, err
+
+
+def test_mf_a_bus_tip_without_rulings_md_holds_no_rule_ids(tmp_path, capsys):
+    bus = make_bus(tmp_path, {"tools/fleet-sweep.mjs": "// sweep\n"})
+    rc, err = validate(tmp_path, candidate("touches/supersedes: R15\n"), bus, capsys)
+    assert rc == 1 and "RULING_CANDIDATE_TARGET_NOT_ON_BUS" in err and "'R15'" in err, err
+
+
+def test_mf_an_object_read_failure_on_a_path_target_is_unknown_not_a_missing_target(tmp_path):
+    bus = make_bus(tmp_path)
+    _drop_object(bus, "HEAD:tools")
+    with pytest.raises(ob.Unknown) as caught:
+        call_validate([write_item(tmp_path, candidate("touches/supersedes: tools/fleet-sweep.mjs\n"))], bus)
+    assert caught.value.code == "RULING_BUS_OBJECT_UNREADABLE", caught.value
+
+
+def test_mf_an_object_read_failure_on_rulings_md_is_unknown_not_a_missing_rule(tmp_path):
+    bus = make_bus(tmp_path)
+    _drop_object(bus, "HEAD:RULINGS.md")
+    with pytest.raises(ob.Unknown) as caught:
+        call_validate([write_item(tmp_path, candidate("touches/supersedes: R15\n"))], bus)
+    assert caught.value.code == "RULING_BUS_OBJECT_UNREADABLE", caught.value
+
+
+def test_mf_the_cli_exits_2_for_an_object_read_failure_and_1_for_a_missing_target(tmp_path, capsys, monkeypatch):
+    monkeypatch.delenv(BUS_ENV, raising=False)
+    bus = make_bus(tmp_path)
+    missing = write_item(tmp_path, candidate("touches/supersedes: tools/nope.mjs\n"), "20261019-ruling-candidate-missing.md")
+    assert ob.main(["validate", "--bus", str(bus), str(missing)]) == 1
+    assert "RULING_CANDIDATE_TARGET_NOT_ON_BUS" in capsys.readouterr().err
+    _drop_object(bus, "HEAD:tools")
+    present = write_item(tmp_path, candidate("touches/supersedes: tools/fleet-sweep.mjs\n"), "20261019-ruling-candidate-present.md")
+    assert ob.main(["validate", "--bus", str(bus), str(present)]) == 2
+    assert "RULING_BUS_OBJECT_UNREADABLE" in capsys.readouterr().err
+
+
+# ---------- ROUTE-RULING-MARKUP-FORMS-1 (r2): a listed path whose object is missing is UNKNOWN, never ACCEPT ----------
+# sol r1 blocker: `ls-tree` lists the path from the PARENT tree, so a missing blob (or a missing subtree) behind a readable
+# listing used to count as present. The directory entry is not the object; the object it names has to be read too.
+
+def test_r2_a_listed_path_whose_blob_is_missing_is_unknown_not_accepted(tmp_path):
+    bus = make_bus(tmp_path)
+    _drop_object(bus, "HEAD:tools/fleet-sweep.mjs")
+    assert "tools/fleet-sweep.mjs" in git(bus, "ls-tree", "-r", "--name-only", "HEAD"), "the parent tree must still list the path"
+    with pytest.raises(ob.Unknown) as caught:
+        call_validate([write_item(tmp_path, candidate("touches/supersedes: tools/fleet-sweep.mjs\n"))], bus)
+    assert caught.value.code == "RULING_BUS_OBJECT_UNREADABLE", caught.value
+
+
+def test_r2_a_listed_directory_whose_tree_is_missing_is_unknown_not_accepted(tmp_path):
+    bus = make_bus(tmp_path)
+    _drop_object(bus, "HEAD:specs/mlv-app")
+    with pytest.raises(ob.Unknown) as caught:
+        call_validate([write_item(tmp_path, candidate("touches/supersedes: specs/mlv-app\n"))], bus)
+    assert caught.value.code == "RULING_BUS_OBJECT_UNREADABLE", caught.value
+
+
+def test_r2_one_unreadable_target_among_present_ones_makes_the_whole_item_unknown(tmp_path):
+    bus = make_bus(tmp_path)
+    _drop_object(bus, "HEAD:tools/doctrine-sync.mjs")
+    with pytest.raises(ob.Unknown) as caught:
+        call_validate([write_item(tmp_path, candidate("touches/supersedes: R15, tools/fleet-sweep.mjs, tools/doctrine-sync.mjs\n"))], bus)
+    assert caught.value.code == "RULING_BUS_OBJECT_UNREADABLE", caught.value
+
+
+def test_r2_the_cli_exits_2_for_a_listed_path_whose_blob_is_missing(tmp_path, capsys, monkeypatch):
+    monkeypatch.delenv(BUS_ENV, raising=False)
+    bus = make_bus(tmp_path)
+    _drop_object(bus, "HEAD:tools/fleet-sweep.mjs")
+    item = write_item(tmp_path, candidate("touches/supersedes: tools/fleet-sweep.mjs\n"))
+    assert ob.main(["validate", "--bus", str(bus), str(item)]) == 2
+    assert "RULING_BUS_OBJECT_UNREADABLE" in capsys.readouterr().err
+
+
+def test_r2_a_path_whose_blob_is_readable_and_one_that_is_absent_keep_their_outcomes(tmp_path, capsys):
+    bus = make_bus(tmp_path)
+    rc, err = validate(tmp_path, candidate("touches/supersedes: tools/fleet-sweep.mjs, specs/mlv-app, specs/mlv-app/cards.md\n"), bus, capsys)
+    assert rc == 0 and err == "", err
+    rc, err = validate(tmp_path, candidate("touches/supersedes: tools/fleet-sweep.mjs, tools/nope.mjs\n"), bus, capsys)
+    assert rc == 1 and "RULING_CANDIDATE_TARGET_NOT_ON_BUS" in err and "'tools/nope.mjs'" in err and "fleet-sweep" not in err, err
+
+
+def test_r2_a_submodule_entry_is_present_without_its_commit_being_in_the_bus_object_store(tmp_path, capsys):
+    """A gitlink (mode 160000) names a commit that lives in another repository, so its object is NOT expected here."""
+    bus = make_bus(tmp_path)
+    git(bus, "update-index", "--add", "--cacheinfo", "160000," + "1" * 40 + ",vendor/sub")
+    git(bus, "commit", "-q", "-m", "add a gitlink")
+    rc, err = validate(tmp_path, candidate("touches/supersedes: vendor/sub\n"), bus, capsys)
+    assert rc == 0 and err == "", err
+
+
+# ---------- ROUTE-RULING-MARKUP-FORMS-1 (r2, opus h1): a citation is a statement ABOUT a candidate, not a proposal of one ----------
+# The citation exception used to match any `ruling-candidates/` path followed by a word. An item that opens with its own
+# candidate path and a verb of its own (`... proposes that X`) therefore passed with no declaration. An item does not carry its
+# own path, so the exception now excuses only a status word after the cited path (remains, is, was, ...).
+
+OWN_PATH_LINES = [
+    "- Ruling candidate `ruling-candidates/new-x.md` proposes that X",
+    "- Ruling candidate `ruling-candidates/new-x.md` adds a rule for Y",
+    "Ruling candidate ruling-candidates/new-x.md requires that Z",
+    "> ruling candidate `ruling-candidates/new-x.md` would bind every lane",
+]
+STATUS_CITATION_LINES = [
+    "- Ruling candidate `ruling-candidates/x.md` Remains PROPOSED",
+    "- Ruling candidate `ruling-candidates/x.md` stays open until ratified",
+    "- Ruling candidate `ruling-candidates/x.md` was filed with the push",
+]
+
+
+@pytest.mark.parametrize("line", OWN_PATH_LINES)
+def test_r2_a_line_with_the_phrase_a_candidate_path_and_a_verb_of_its_own_is_a_marker(tmp_path, capsys, line):
+    bus = make_bus(tmp_path)
+    rc, err = validate(tmp_path, _receipt(f"{NEUTRAL_HEADING}\n\n{line}\n"), bus, capsys)
+    assert rc == 1 and "RULING_CANDIDATE_NO_SUPERSEDES" in err, (line, err)
+    rc, err = validate(tmp_path, body_with(line, "touches/supersedes: R15\n"), bus, capsys)
+    assert rc == 0 and err == "", (line, err)
+
+
+@pytest.mark.parametrize("line", STATUS_CITATION_LINES)
+def test_r2_a_status_word_after_the_cited_path_is_still_a_citation(tmp_path, capsys, line):
+    rc, err = validate(tmp_path, _receipt(f"{NEUTRAL_HEADING}\n\n{line}\n"), tmp_path / "no-such-clone", capsys)
+    assert rc == 0 and err == "", (line, err)
+
+
+# ---------- ROUTE-RULING-MARKUP-FORMS-1 (r2, opus h2): the two forms r1 left unpinned, pinned at today's result ----------
+# Neither is used on the bus (U+2236: 0 occurrences) and no parser change is made; changing one of these is a decision.
+# U+2236 (RATIO) is not a dash or a colon after NFKC, so before the phrase it separates nothing; after the phrase the phrase
+# alone is the marker. A table delimiter row makes the cell right before it a setext heading, which is why `-` and `:` forms
+# count in the LAST cell of the row above it and in no other cell.
+RATIO = "∶"
+PINNED_RATIO_AND_TABLE = [
+    ("a heading with U+2236 before the phrase is accepted bare", f"### p {RATIO} RULING CANDIDATE X\n", 0),
+    ("a heading that opens with the phrase then U+2236 is refused bare", f"### RULING CANDIDATE {RATIO} X\n", 1),
+    ("a body line with U+2236 before the phrase is accepted bare", f"{NEUTRAL_HEADING}\n\np {RATIO} Ruling candidate X\n", 0),
+    ("a body line that opens with the phrase then U+2236 is refused bare", f"{NEUTRAL_HEADING}\n\nRuling candidate {RATIO} X\n", 1),
+    ("the last header cell with a separator form over a delimiter row is refused bare",
+     f"{NEUTRAL_HEADING}\n\n| a | proj - Ruling candidate X |\n| --- | --- |\n", 1),
+    ("the same cell with no delimiter row is accepted bare",
+     f"{NEUTRAL_HEADING}\n\n| a | proj - Ruling candidate X |\n", 0),
+    ("a header cell that is not the last of its row is accepted bare even over a delimiter row",
+     f"{NEUTRAL_HEADING}\n\n| proj - Ruling candidate X | b |\n| --- | --- |\n", 0),
+    ("the colon form in the last header cell over a delimiter row is refused bare",
+     f"{NEUTRAL_HEADING}\n\n| a | proj Ruling candidate: X |\n| --- | --- |\n", 1),
+]
+
+
+@pytest.mark.parametrize("label, body, refused", PINNED_RATIO_AND_TABLE, ids=[label for label, _, _ in PINNED_RATIO_AND_TABLE])
+def test_r2_pinned_u2236_and_table_delimiter_forms(tmp_path, capsys, label, body, refused):
+    rc, err = validate(tmp_path, _receipt(body), tmp_path / "no-such-clone", capsys)
+    if refused:
+        assert rc == 1 and "RULING_CANDIDATE_NO_SUPERSEDES" in err, (label, err)
+    else:
+        assert rc == 0 and err == "", (label, err)
