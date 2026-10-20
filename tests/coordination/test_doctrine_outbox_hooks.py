@@ -143,11 +143,14 @@ def run_pre_push(ob, repo: Path, monkeypatch, stdin_text: str) -> int:
 # ---------- the tool carries no project value ----------
 
 CANDIDATE_BUS_PATH = "tools/factory/doctrine_outbox.py"
-# The steward is handed one card; its `supersedes:` field names the card it replaces, whose digest is stale once the tool
-# changes (a card already on the bus is never edited: a changed body is a new idempotency key, so it would publish twice).
-# test_the_steward_handoff_card_supersedes_the_earlier_card derives the name from that card's own heading.
+# The steward is handed two cards for the merged tool, each naming its digest. HANDOFF_CARD is the markup-forms one (the
+# one the route test follows); its `supersedes:` field names the card it replaces (EARLIER_CARDS), whose digest is stale once
+# the tool changes (a card already on the bus is never edited: a changed body is a new idempotency key, so it would publish
+# twice). test_the_steward_handoff_card_supersedes_the_earlier_card derives the name from that card's own heading.
+# ROUTE_EXERCISE_CARD is the route-exercise one.
 HANDOFF_CARD = REPO_ROOT / "doctrine-outbox" / "20261020-doctrine-outbox-markup-forms-candidate.md"
 EARLIER_CARDS = (REPO_ROOT / "doctrine-outbox" / "20261019-doctrine-outbox-ruling-supersedes-candidate.md",)
+ROUTE_EXERCISE_CARD = REPO_ROOT / "doctrine-outbox" / "20261017-doctrine-outbox-route-exercise-candidate.md"
 OUTBOX_README = REPO_ROOT / "doctrine-outbox" / "README.md"
 
 
@@ -178,6 +181,11 @@ def test_the_steward_handoff_card_supersedes_the_earlier_card():
         assert len(ids) == 1 and ids[0] in fields[0], (earlier.name, ids, fields[0])
 
 
+def test_the_route_exercise_card_names_the_candidate_digest():
+    """Both steward cards offer the merged tool, so both quote its digest; neither may go stale."""
+    assert _bus_candidate()["sha256_lf"] in ROUTE_EXERCISE_CARD.read_text(encoding="utf-8")
+
+
 PIN_AWARE_FOLLOW_UP = "OUTBOX-PIN-AWARE-TOOL-AT-REF-1"
 
 
@@ -189,6 +197,7 @@ def test_surfaces_keep_the_local_copy_and_name_the_pin_aware_follow_up():
     surfaces = {
         "config": (REPO_ROOT / "doctrine-outbox.config.json").read_text(encoding="utf-8"),
         "card": HANDOFF_CARD.read_text(encoding="utf-8"),
+        "route-exercise card": ROUTE_EXERCISE_CARD.read_text(encoding="utf-8"),
         "readme": OUTBOX_README.read_text(encoding="utf-8"),
         "tool docstring": ast.get_docstring(ast.parse(TOOL_SRC.read_text(encoding="utf-8"))) or "",
     }

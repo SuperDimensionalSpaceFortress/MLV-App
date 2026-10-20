@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import inspect
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -30,7 +31,7 @@ def call_validate(paths, bus):
     """cmd_validate with the signature of the tool that is loaded: the baseline at fork/master takes (paths, deny_terms)
     and no bus, so a red run shows that OLD validator accepting the bad items instead of dying on a TypeError."""
     if "bus" in inspect.signature(ob.cmd_validate).parameters:
-        return ob.cmd_validate(paths, [], bus)
+        return ob.cmd_validate(paths, [], bus=bus)
     return ob.cmd_validate(paths, [])
 
 
@@ -392,7 +393,7 @@ def test_the_alias_keeps_the_target_rules(tmp_path, capsys):
     assert rc == 1 and "RULING_CANDIDATE_TARGET_MALFORMED" in err, err
 
 
-# ---------- one --bus on validate (PR 514 adds one too: whichever merges second keeps exactly one) ----------
+# ---------- one --bus on validate (shared with the route exercise since CARD-ROUTE-EXERCISE-3 m1) ----------
 
 def _subcommand_parsers():
     """name -> subparser, for every subcommand build_parser() defines."""
@@ -636,9 +637,14 @@ def test_r3_parse_args_succeeds_for_every_subcommand(name):
 
 
 def test_r3_the_validate_bus_help_names_no_flag_this_tool_does_not_have():
-    bus_help = [a.help for a in _subcommand_parsers()["validate"]._actions if "--bus" in a.option_strings][0]
-    assert "--exercise" not in bus_help and "second add_argument" not in bus_help, bus_help
-    assert not [a for a in _subcommand_parsers()["validate"]._actions if "--exercise" in a.option_strings]
+    # NA-6 (hub ruling at the #515 r4 line 15:11:38Z, applied in CARD-ROUTE-EXERCISE-3 m1): the merged tool has
+    # `--exercise`, so the help may name it; what it may not do is name a flag `validate` lacks.
+    validate_actions = _subcommand_parsers()["validate"]._actions
+    bus_help = [a.help for a in validate_actions if "--bus" in a.option_strings][0]
+    options = {opt for a in validate_actions for opt in a.option_strings}
+    assert "second add_argument" not in bus_help, bus_help
+    assert [a for a in validate_actions if "--exercise" in a.option_strings]
+    assert {flag for flag in re.findall(r"--[a-z][a-z-]*", bus_help)} <= options, bus_help
 
 
 # ---------- r4: block-opening is also a property of the PREVIOUS line; invisible characters; render before the test ----------
