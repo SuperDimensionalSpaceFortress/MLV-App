@@ -530,7 +530,11 @@ void recordFault(const CudaFault & fault)
     f.site = core::sanitize(fault.site, 95);
     f.role = core::sanitize(fault.role ? fault.role : "primary", 16);
     f.dropped = fault.dropped;
-    f.utcMs = nowUtcMs();
+    /* GPU-FIELD-TELEMETRY-FAULT-UTC-STAMP-1: the time the DLL noted it, so a
+     * code drained a call, a view close or an exit later still correlates with
+     * the right System-log interval; now only when no note time came with it. */
+    f.deliveredUtcMs = nowUtcMs();
+    f.utcMs = fault.utcMs > 0.0 ? fault.utcMs : f.deliveredUtcMs;
 
     State & s = state();
     std::function<void(const CudaFault &)> listener;
@@ -556,7 +560,7 @@ void recordFault(const CudaFault & fault)
 
 void stageSink(const char * dll, const char * stage, int rc, double ms, int cudaCode,
                const char * cudaName, const char * site, const char * role,
-               unsigned long long dropped)
+               unsigned long long dropped, double notedUtcMs)
 {
     if (rc == 0 && !role)
     {
@@ -572,22 +576,23 @@ void stageSink(const char * dll, const char * stage, int rc, double ms, int cuda
     fault.site = site;
     fault.role = role;
     fault.dropped = dropped;
+    fault.utcMs = notedUtcMs;
     recordFault(fault);
 }
 
 void reconStageSink(const char * stage, int rc, double ms, int cudaCode,
                     const char * cudaName, const char * site, const char * role,
-                    unsigned long long dropped)
+                    unsigned long long dropped, double notedUtcMs)
 {
-    stageSink("recon", stage, rc, ms, cudaCode, cudaName, site, role, dropped);
+    stageSink("recon", stage, rc, ms, cudaCode, cudaName, site, role, dropped, notedUtcMs);
 }
 
 /* r6: GpuDebayer's AMaZE records, the same shape as recon's. */
 void amazeStageSink(const char * stage, int rc, double ms, int cudaCode,
                     const char * cudaName, const char * site, const char * role,
-                    unsigned long long dropped)
+                    unsigned long long dropped, double notedUtcMs)
 {
-    stageSink("amaze", stage, rc, ms, cudaCode, cudaName, site, role, dropped);
+    stageSink("amaze", stage, rc, ms, cudaCode, cudaName, site, role, dropped, notedUtcMs);
 }
 
 } // namespace

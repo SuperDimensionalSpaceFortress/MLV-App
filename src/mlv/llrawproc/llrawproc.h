@@ -336,6 +336,10 @@ void llrpSetGpuReconEventLogger(llrpGpuReconEventLogger_t logger);
  * "recon:uncaptured", rc 0, role "orphan", with its own site, never as the new
  * call's. dropped (r5) is the number of notes the channel's queue dropped
  * since the previous drain, carried by the first record of that drain.
+ * noted_utc_ms (GPU-FIELD-TELEMETRY-FAULT-UTC-STAMP-1) is the note's own
+ * igpu_cuda_error_t.utc_ms, the wall clock when the DLL noted the code: an
+ * orphan can be drained a call, a view close or an app exit later. 0 when
+ * there is no note (a success, or a failure with no code noted).
  * A failed async preupload (llrpGpuPlaybackReconPreuploadFrame) is reported as
  * "recon:preupload" on the preupload's own thread, failure only; its "no free
  * slot" back-pressure return is not reported unless a CUDA code was noted.
@@ -344,7 +348,7 @@ void llrpSetGpuReconEventLogger(llrpGpuReconEventLogger_t logger);
 typedef void (*llrpGpuStageTelemetrySink_t)(const char * stage, int rc, double ms,
                                             int cuda_code, const char * cuda_name,
                                             const char * site, const char * role,
-                                            unsigned long long dropped);
+                                            unsigned long long dropped, double noted_utc_ms);
 void llrpSetGpuStageTelemetrySink(llrpGpuStageTelemetrySink_t sink);
 llrpGpuStageTelemetrySink_t llrpGetGpuStageTelemetrySinkForTesting(void);
 /* GPU-DEVICE-LOSS-SELF-HEAL-1: one process-wide flag, set by
