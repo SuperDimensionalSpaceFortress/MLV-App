@@ -99,3 +99,24 @@ platform/qt/FFmpeg/ffmpeg.exe
 # (softwarefactory-fleet-doctrine tools/doctrine-sync.mjs). Consumer-local
 # state, per-machine, never work product - same treatment as .claude-state/.
 .codex-state/
+
+# In-tree qmake / mingw32-make output under platform/qt (MLVApp.pro sets OBJECTS_DIR,
+# MOC_DIR, UI_DIR, RCC_DIR to obj moc ui rcc on windows and .obj .moc .ui .rcc on unix).
+# Build products only; no source extension is matched. Untracked-but-not-ignored, these made
+# the worktree-debris reclaim stage and the retire gate treat a built lane worktree as dirty.
+platform/qt/.qmake.stash
+platform/qt/Makefile
+platform/qt/Makefile.Debug
+platform/qt/Makefile.Release
+platform/qt/MLVApp_resource.rc
+platform/qt/object_script.*
+platform/qt/debug/
+platform/qt/release/
+platform/qt/moc/
+platform/qt/obj/
+platform/qt/rcc/
+platform/qt/ui/
+platform/qt/.moc/
+platform/qt/.obj/
+platform/qt/.rcc/
+platform/qt/.ui/
