@@ -2124,6 +2124,16 @@
       ]
     },
     {
+      "path": "platform/qt/GpuFieldTelemetry.cpp",
+      "anchor": "f . utcMs = fault . utcMs > 0.0 ? fault . utcMs : f . deliveredUtcMs ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "GPU-FIELD-TELEMETRY-FAULT-UTC-STAMP-1 recordFault: fault.utcMs is a wall-clock timestamp (the DLL note's igpu_cuda_error_t.utc_ms, Unix epoch ms), not a duration. A value > 0 is the DLL's own note time and is written as fault_utc_ms; 0 means no note time came with the fault (an older DLL, a validation failure, the fault-inject path), so the record falls back to the time the app recorded it. Selects which timestamp to write; never proof that any stage ran.",
+      "lines": [
+        537
+      ]
+    },
+    {
       "path": "tests/console/test_gpu_field_telemetry.cpp",
       "anchor": "\"    workerPool()->waitForDone(static_cast<int>(waitMs > 0 ? waitMs : 0));\" ,",
       "class": "not_run_proof_structural",

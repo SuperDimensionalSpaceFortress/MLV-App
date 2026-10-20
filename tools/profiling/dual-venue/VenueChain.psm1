@@ -530,6 +530,92 @@ function Select-VenueQuietWindow {
     [pscustomobject]$out
 }
 
+# SUPPLEMENTARY LEGS (VENUE-UM-SUPPLEMENTARY-WHEN-BACHELOR-HELD-1). A Bachelor chain may offer the same leg on ultra-magnus as a SUPPLEMENTARY run (Invoke-VenueChain.ps1).
+# These helpers only READ (the spec, the venue's claim and line, the venue's staged-build cache) or run one bounded child; none of them claims, stages, builds or submits.
+
+function Get-VenueSupplementarySpecSkip {
+    <#
+    .SYNOPSIS
+    $null when the leg spec carries a criteria.supplementary block for the backend (an empty list counts: the leg is informational there), else the typed skip reason:
+    SPEC_UNREADABLE | BACKEND_NOT_IN_SPEC | NO_SUPPLEMENTARY_CRITERIA. -Backend '' means the spec's first backend, as Invoke-VenueLeg does.
+    #>
+    param([Parameter(Mandatory)][string]$SpecPath, [string]$Backend = '')
+    $spec = $null
+    try { $spec = [IO.File]::ReadAllText($SpecPath) | ConvertFrom-Json -ErrorAction Stop } catch { return 'SPEC_UNREADABLE' }
+    $backends = @($spec.backends | Where-Object { $_ })
+    $b = $(if ($Backend) { $Backend } elseif ($backends.Count -gt 0) { [string]$backends[0] } else { '' })
+    if ($backends.Count -gt 0 -and $backends -cnotcontains $b) { return 'BACKEND_NOT_IN_SPEC' }
+    $block = $null
+    if ($null -ne $spec.criteria -and $null -ne $spec.criteria.supplementary -and $b) { $block = $spec.criteria.supplementary.PSObject.Properties[$b] }
+    if ($null -eq $block) { return 'NO_SUPPLEMENTARY_CRITERIA' }
+    $null
+}
+
+function Get-VenueSupplementaryIdle {
+    <#
+    .SYNOPSIS
+    Is the venue idle for a supplementary leg? Read-only, from the venue's own claim and line (never a process scan): idle when its claim is FREE or STALE and no LIVE ticket
+    queues. .holder names the live claim or the queue when it is not. -OwnNonce: the caller already holds the claim with that nonce (it does not count as held), so the
+    answer is "still no live ticket" -- the revalidation a supplementary claim makes BEFORE any work (Dot 180e287f: a waiter may queue between the first check and the claim).
+    #>
+    param([Parameter(Mandatory)][string]$Venue, [string]$ClaimDir = '', [string]$OwnNonce = '')
+    $s = Get-VenueClaimStatus -Venue $Venue -ClaimDir $ClaimDir
+    $live = @($s.tickets | Where-Object { $_.state -cne 'STALE' })
+    $held = ($s.claim.state -cin @('LIVE', 'BUSY')) -and -not ($OwnNonce -and $s.claim.claim -and [string]$s.claim.claim.nonce -ceq $OwnNonce)
+    $holder = $(if ($s.claim.claim) { "pid=$($s.claim.claim.ownerPid) runDir=$($s.claim.claim.runDir)" } else { "claimState=$($s.claim.state)" })
+    [pscustomobject]@{ idle = (-not $held -and $live.Count -eq 0); claimState = [string]$s.claim.state; liveTickets = $live.Count; holder = $holder }
+}
+
+function Get-VenueStagedBuildManifest {
+    <#
+    .SYNOPSIS
+    The sha256 of the build manifest already staged on a venue (<AgentShare>\cache\playback-attr-3-cuda-<sha12>-build.json, the file Invoke-VenueLeg hashes), read
+    on a worker thread and given up after -TimeoutSec (a UNC path of a host that is down can block a Test-Path for minutes). Never stages anything.
+    .OUTPUTS
+    [pscustomobject]@{ state (STAGED | NOT_STAGED | UNREACHABLE); sha256; path; error }
+    #>
+    param([Parameter(Mandatory)][string]$AgentShare, [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string]$SourceCommit, [ValidateRange(1, 600)][int]$TimeoutSec = 30)
+    $path = $AgentShare.TrimEnd('\') + '\cache\playback-attr-3-cuda-' + $SourceCommit.Substring(0, 12) + '-build.json'
+    $ps = [powershell]::Create()
+    try {
+        [void]$ps.AddScript({ param($p) if (Test-Path -LiteralPath $p -PathType Leaf) { (Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash.ToLowerInvariant() } else { '' } }.ToString())
+        [void]$ps.AddArgument($path)
+        $async = $ps.BeginInvoke()
+        if (-not $async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds($TimeoutSec))) {
+            try { [void]$ps.BeginStop($null, $null) } catch { }   # a worker still stuck is abandoned, never joined
+            return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = "no answer in $TimeoutSec s" }
+        }
+        $v = @($ps.EndInvoke($async))
+        $sha = $(if ($v.Count -gt 0) { [string]$v[0] } else { '' })
+        if ($sha -cmatch '^[0-9a-f]{64}$') { return [pscustomobject]@{ state = 'STAGED'; sha256 = $sha; path = $path; error = $null } }
+        [pscustomobject]@{ state = 'NOT_STAGED'; sha256 = $null; path = $path; error = $null }
+    } catch {
+        [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = $_.Exception.Message }
+    } finally { $ps.Dispose() }
+}
+
+function Invoke-VenueBoundedProcess {
+    <#
+    .SYNOPSIS
+    Run one child process and give up on it after -TimeoutSec (the child and its tree are killed). .exit is $null when it timed out.
+    .OUTPUTS
+    [pscustomobject]@{ exit; timedOut; stdout; stderr }
+    #>
+    param([Parameter(Mandatory)][string]$FilePath, [Parameter(Mandatory)][string[]]$ArgumentList, [Parameter(Mandatory)][ValidateRange(1, 86400)][int]$TimeoutSec)
+    $psi = [Diagnostics.ProcessStartInfo]::new($FilePath)
+    foreach ($a in $ArgumentList) { [void]$psi.ArgumentList.Add($a) }
+    $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.RedirectStandardInput = $true; $psi.CreateNoWindow = $true
+    $p = [Diagnostics.Process]::Start($psi)
+    $p.StandardInput.Close()
+    $outTask = $p.StandardOutput.ReadToEndAsync(); $errTask = $p.StandardError.ReadToEndAsync()
+    $timedOut = -not $p.WaitForExit($TimeoutSec * 1000)
+    if ($timedOut) { try { $p.Kill($true) } catch { }; [void]$p.WaitForExit(15000) }
+    [void]$outTask.Wait(15000); [void]$errTask.Wait(15000)
+    [pscustomobject]@{ exit = $(if ($timedOut) { $null } else { $p.ExitCode }); timedOut = $timedOut
+        stdout = $(if ($outTask.IsCompleted) { $outTask.Result } else { '' }); stderr = $(if ($errTask.IsCompleted) { $errTask.Result } else { '' }) }
+}
+
 Export-ModuleMember -Function Get-VenueMainRoot, Get-VenueClaimPath, Get-VenueClaim, Get-VenueClaimStaleReason, Request-VenueClaim, Release-VenueClaim,
     Get-VenueTicketDir, New-VenueTicket, Get-VenueTickets, Get-VenueTicketStaleReason, Get-VenueTicketProbeStaleSec, Update-VenueTicket, Remove-VenueTicket, Get-VenueClaimStatus, Format-VenueClaimStatus, Format-VenueTicketQueue,
-    ConvertFrom-VenueGateLog, Get-VenueQuietRateTable, Format-VenueQuietRateTable, Select-VenueQuietWindow
+    ConvertFrom-VenueGateLog, Get-VenueQuietRateTable, Format-VenueQuietRateTable, Select-VenueQuietWindow,
+    Get-VenueSupplementarySpecSkip, Get-VenueSupplementaryIdle, Get-VenueStagedBuildManifest, Invoke-VenueBoundedProcess

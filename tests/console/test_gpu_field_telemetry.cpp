@@ -570,6 +570,7 @@ TEST(GpuFieldTelemetry, LinesCarryTheFieldsAndNoPrivateData)
     f.cudaName = "cudaErrorLaunchTimeout";
     f.site = core::sanitize("IGPU_LT_SYNC_CALL(\"run:ev_after_dl\", cudaEventSynchronize(b->ev_after_dl)) /x\\y", 95);
     f.utcMs = 1791774588083.125;
+    f.deliveredUtcMs = 1791774590000.5;
     core::SystemLogResult sys;
     sys.status = "ok";
     sys.nvlddmkm153.count = 1;
@@ -618,6 +619,9 @@ TEST(GpuFieldTelemetry, LinesCarryTheFieldsAndNoPrivateData)
     ASSERT_EQ(std::string("cudaErrorLaunchTimeout"), fault.value(QStringLiteral("cuda_name")).toString().toStdString());
     ASSERT_TRUE(fault.value(QStringLiteral("site")).toString().startsWith(QStringLiteral("IGPU_LT_SYNC_CALL('run:ev_after_dl'")));
     ASSERT_TRUE(fault.value(QStringLiteral("device_loss")).toBool());
+    // GPU-FIELD-TELEMETRY-FAULT-UTC-STAMP-1: when noted, and when the app recorded it.
+    ASSERT_NEAR(1791774588083.125, fault.value(QStringLiteral("fault_utc_ms")).toDouble(), 1e-3);
+    ASSERT_NEAR(1791774590000.5, fault.value(QStringLiteral("fault_delivered_utc_ms")).toDouble(), 1e-3);
     const QJsonObject sysLine = parseLine(lines[4]);
     ASSERT_EQ(std::string("ok"), sysLine.value(QStringLiteral("status")).toString().toStdString());
     ASSERT_EQ(1, sysLine.value(QStringLiteral("nvlddmkm_153")).toObject().value(QStringLiteral("count")).toInt());

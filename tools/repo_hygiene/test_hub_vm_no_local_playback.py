@@ -18,17 +18,22 @@ Launch command lines in the fixtures are assembled at run time so this file itse
 
 from __future__ import annotations
 
+import ast
 import hashlib
+import inspect
 import itertools
 import json
 import os
+import random
 import re
 import shutil
 import subprocess
 import tempfile
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 HOSTS_JSON = ROOT / "tools" / "profiling" / "dual-venue" / "hub-hosts.json"
@@ -37,6 +42,15 @@ GUARD_HEADER = ROOT / "platform" / "qt" / "HubHostPlaybackGuard.h"
 LINT_PS1 = ROOT / "tools" / "coordination" / "lane-local-playback-lint.ps1"
 INVOKE_LANE = ROOT / "tools" / "coordination" / "Invoke-Lane.ps1"
 PROFILING = ROOT / "tools" / "profiling"
+
+
+def _lint_reading_body() -> str:
+    """The text where the lint READS its word lists: the cached pattern-set builder (Get-LintPatternSet, which turns every exposed list
+    into a pattern once per process since r11) through the end of the file, which includes the findings function. The structural pins
+    below check this region, so a list member cannot be exposed and left unread by either function."""
+    text = LINT_PS1.read_text(encoding="utf-8")
+    return text[text.index("function Get-LintPatternSet"):]
+
 
 PWSH = shutil.which("pwsh")
 requires_pwsh = unittest.skipIf(PWSH is None, "pwsh is not on PATH")
@@ -94,6 +108,14 @@ def _baseline_lint_source() -> tuple[str, str] | None:
 # d291f184; r10 started from r9 fd190b6d, and r9 changed no lint behaviour). It is checked to be an ancestor of HEAD, so a rebase that
 # drops it fails loudly in CI instead of silently weakening the gate.
 PREVIOUS_PR_HEAD = "d2f3cd05c311f60b8151fe578742c0b3fa104a22"
+# NA2-RULE4-PER-LAUNCHER-SCOPE-1: the r1 head of this PR (the lint CoS reproduced the cross-`;` swallow on). The r2 RED rows are
+# pinned against it in PromptLintTests (test_red_rule4_r2_*), apart from the previous-head differential above, whose r13 multi-line
+# closure assertions are tied to d2f3cd05.
+RULE4_R1_PR_HEAD = "75cb00e1213c7282c02f5f53f3908c2e26e4785c"
+# r4b (CoS Improvement 6224545625): the master this PR branched from (merge of #448), whose rule 4 read only the first launcher
+# occurrence. The RED proof of the r1 second-launcher rows is pinned to it (test_rule4_the_refuse_rows_are_red_on_the_baseline); it
+# never moves, because every later master carries the change.
+RULE4_PRE_CHANGE_MASTER = "2f8d1a97f954a69e45200fba130e9472e838a178"
 
 
 def _previous_head_lint_source() -> tuple[str, str] | None:
@@ -117,6 +139,22 @@ def _require_previous_head_lint() -> tuple[str, str]:
             raise AssertionError(message + " -- the hygiene jobs check out with fetch-depth: 0, so a missing commit is a stale PREVIOUS_PR_HEAD or a broken checkout")
         raise unittest.SkipTest(message)
     return prev
+
+
+def _rule4_r1_head_lint(head: str = RULE4_R1_PR_HEAD, label: str = "r1", moot_once_master_carries_it: bool = True) -> tuple[str, str]:
+    """(ref, text) of the lint at RULE4_R1_PR_HEAD (or another round head of this PR), with the same skip / fail policy as
+    _require_previous_head_lint. `moot_once_master_carries_it=False` is for a check that stays true after the merge (r7 sweep: nothing the
+    pre-change master refuses may pass), which must not skip when master already carries this lint."""
+    base = _baseline_lint_source()
+    if moot_once_master_carries_it and base is not None and base[1].replace("\r\n", "\n") == LINT_PS1.read_text(encoding="utf-8").replace("\r\n", "\n"):
+        raise unittest.SkipTest(f"{base[0]} already carries this lint; the {label} head is no longer a baseline")
+    done = subprocess.run(["git", "-C", str(ROOT), "show", f"{head}:{LINT_REL}"], capture_output=True, timeout=60)
+    if done.returncode == 0 and done.stdout:
+        return head[:8], done.stdout.decode("utf-8")
+    message = f"{label} PR head {head[:8]} is not in this clone; the RED proof of the next round needs the PR history"
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        raise AssertionError(message + " -- the hygiene jobs check out with fetch-depth: 0, so a missing commit is a broken checkout")
+    raise unittest.SkipTest(message)
 
 
 def _psq(path: object) -> str:
@@ -157,10 +195,11 @@ def _popen_pwsh(probe: Path) -> "subprocess.Popen":
     return proc
 
 
-def _run_pwsh(probe: Path, timeout: int) -> "subprocess.CompletedProcess":
+def _run_pwsh(probe: Path, timeout: float, encoding: "str | None" = None) -> "subprocess.CompletedProcess":
     """The one place a pwsh lint probe is run in the foreground; counted in _PWSH_SPAWNS."""
     _PWSH_SPAWNS.append(probe.name)
-    return subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(probe)], capture_output=True, text=True, timeout=timeout)
+    return subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(probe)], capture_output=True, text=True, encoding=encoding,
+                          timeout=timeout)
 
 
 def _lint_blob_id(lint: Path) -> str:
@@ -198,8 +237,8 @@ def _lint_word_lists(lint: Path, work: Path) -> dict[str, list[str]]:
     return {k: list(v) for k, v in _WORD_LIST_CACHE[blob].items()}
 
 
-def _json_counts(lint: Path, texts: list[str], work: Path, tag: str) -> list[int]:
-    """Finding count of every text under `lint`, texts passed as a JSON array so a text may hold line breaks (one pwsh process)."""
+def _start_json_counts(lint: Path, texts: list[str], work: Path, tag: str) -> "subprocess.Popen":
+    """Start ONE pwsh that counts the findings of every text under `lint`, the texts passed as a JSON array so a text may hold line breaks."""
     src = work / f"{tag}-in.json"
     src.write_text(json.dumps(texts), encoding="utf-8")
     probe = work / f"{tag}-probe.ps1"
@@ -211,32 +250,99 @@ def _json_counts(lint: Path, texts: list[str], work: Path, tag: str) -> list[int
         "foreach ($t in $texts) { $out.Add(@(Get-LocalPlaybackPromptFindings -Text ([string]$t)).Count) }\n"
         "ConvertTo-Json -InputObject @($out.ToArray()) -Compress\n",
     )
-    proc = _popen_pwsh(probe)  # one pwsh for the whole (small) list; counted in _PWSH_SPAWNS
-    try:
-        return _collect_counts(proc, len(texts))
-    finally:
-        _kill(proc)
+    return _popen_pwsh(probe)  # counted in _PWSH_SPAWNS
 
 
-def _batch_counts(lint: Path, texts: list[str], work: Path, tag: str) -> list[int]:
-    """Finding count of every text under `lint` (a text per line), sharded over up to BATCH_SHARDS pwsh processes: the member corpus
-    is ~32k rows at ~17 ms a row, which one process cannot finish inside a 600 s foreground call (r12)."""
-    shards: list = []
-    try:
-        _start_shards(lint, texts, work, tag, shards)
-        return _collect_shards(shards)
-    finally:
-        for proc, _ in shards:
-            _kill(proc)
+def _shard_chunks(texts: list[str], rows_per_shard: int) -> list[list[str]]:
+    """`texts` cut into up to BATCH_SHARDS chunks of about equal size, one chunk per `rows_per_shard` rows (at least one chunk)."""
+    count = max(1, min(BATCH_SHARDS, len(texts) // rows_per_shard))
+    size = -(-len(texts) // count) if texts else 0
+    return [texts[i:i + size] for i in range(0, len(texts), size)] if size else [texts]
 
 
 def _start_shards(lint: Path, texts: list[str], work: Path, tag: str, shards: list) -> None:
-    """Start the pwsh shards of one lint over `texts`, appending (Popen, chunk) to `shards` as each starts (the caller owns cleanup)."""
-    count = max(1, min(BATCH_SHARDS, len(texts) // 500))
-    size = -(-len(texts) // count) if texts else 0
-    chunks = [texts[i:i + size] for i in range(0, len(texts), size)] if size else [texts]
-    for n, chunk in enumerate(chunks):
+    """Start the pwsh shards of one lint over `texts` (a text per line), appending (Popen, chunk) to `shards` as each starts (the caller
+    owns cleanup). Up to BATCH_SHARDS processes: the member corpus is ~32k rows at ~17 ms a row, which one process cannot finish inside a
+    600 s foreground call (r12)."""
+    for n, chunk in enumerate(_shard_chunks(texts, 500)):
         shards.append((_lint_finding_counts(lint, chunk, work, f"{tag}-s{n}"), chunk))
+
+
+# r7 (Iverson I-iv2): the texts that hold a line break go through the JSON array probe, and they are cut into shards the same way as the
+# plain ones. Measured at r7: the multi-line catalogue is 34 texts (30 + 4 line-break rows) and the differential corpus holds none, so one
+# pwsh takes 0.9 s and the unsharded path was no tail; the split only starts at 200 texts (a shard per 100, a row here is a whole block that
+# the head and tail grammars read), so today it changes nothing and a catalogue that grows past that bound no longer queues in one process.
+MULTI_ROWS_PER_SHARD = 100
+
+
+def _start_json_shards(lint: Path, texts: list[str], work: Path, tag: str, shards: list) -> None:
+    """Start the pwsh shards of one lint over `texts` that may hold line breaks (JSON array probe), appending (Popen, chunk) to `shards`."""
+    for n, chunk in enumerate(_shard_chunks(texts, MULTI_ROWS_PER_SHARD)):
+        shards.append((_start_json_counts(lint, chunk, work, f"{tag}-s{n}"), chunk))
+
+
+# NA2-RULE4-PER-LAUNCHER-SCOPE-1 r3: the finding count of a text is a pure function of (the lint's bytes, the text), so it is computed at
+# most once per module run. The catalogue tests, the list-member setUp, the differential pins and the r1-head RED proof all ask for the
+# same (lint, text) pairs; before r3 each asked its own pwsh (the candidate lint alone ran the whole ~34k-row corpus three times).
+# The cache relies on Get-LocalPlaybackPromptFindings staying location- and env-independent: its verdict may depend only on the lint's
+# bytes and the text, never on the working directory, an environment variable, the clock or the host. A lint change that reads any of
+# those must key the cache on it too (or drop the cache).
+_VERDICTS: dict[tuple[str, str], int] = {}
+
+
+def _lint_digest(lint: Path) -> str:
+    """Identity of a lint copy: its bytes with CRLF folded to LF (the same equivalence the 'master already carries this lint' checks use)."""
+    return hashlib.sha256(Path(lint).read_bytes().replace(b"\r\n", b"\n")).hexdigest()
+
+
+def _prefetch_counts(work: Path, jobs: list[tuple[Path, list[str], str]]) -> None:
+    """Fill _VERDICTS for every (lint, texts, tag) job, running only the (lint bytes, text) pairs not computed yet. Every job's pwsh
+    processes run at the same time and are joined here. A text without a line break goes through the line-per-text shards; a text
+    with one (or an empty text) goes through the JSON array probe. All of them run inside ONE LINT_PROBE_BOUND_SEC budget (a probe still
+    running at the deadline fails the test typed, naming the probe and the elapsed time), never a fresh bound per probe."""
+    pending: list[tuple[str, list]] = []  # (lint digest, [(Popen, texts)])
+    queued: set[tuple[str, str]] = set()
+    deadline = time.monotonic() + LINT_PROBE_BOUND_SEC
+    try:
+        for lint, texts, tag in jobs:
+            digest = _lint_digest(lint)
+            missing = [t for t in dict.fromkeys(texts) if (digest, t) not in _VERDICTS and (digest, t) not in queued]
+            queued.update((digest, t) for t in missing)
+            plain = [t for t in missing if t and "\n" not in t and "\r" not in t]
+            multi = [t for t in missing if not (t and "\n" not in t and "\r" not in t)]
+            if plain:
+                shards: list = []
+                pending.append((digest, shards))
+                _start_shards(lint, plain, work, f"{tag}-p", shards)
+            if multi:
+                procs: list = []
+                pending.append((digest, procs))
+                _start_json_shards(lint, multi, work, f"{tag}-m", procs)
+        for digest, shards in pending:
+            for proc, chunk in shards:
+                for text, count in zip(chunk, _collect_counts(proc, len(chunk), deadline)):
+                    _VERDICTS[(digest, text)] = count
+    finally:
+        for _, shards in pending:
+            for proc, _ in shards:
+                _kill(proc)
+
+
+def _verdicts(lint: Path, texts: list[str]) -> list[int]:
+    """The finding count of every text under `lint`; _prefetch_counts must have run for it."""
+    digest = _lint_digest(lint)
+    return [_VERDICTS[(digest, t)] for t in texts]
+
+
+def _json_counts(lint: Path, texts: list[str], work: Path, tag: str) -> list[int]:
+    """Finding count of every text under `lint`; a text may hold line breaks. Computed once per (lint bytes, text) per module run."""
+    _prefetch_counts(work, [(lint, texts, tag)])
+    return _verdicts(lint, texts)
+
+
+def _batch_counts(lint: Path, texts: list[str], work: Path, tag: str) -> list[int]:
+    """Finding count of every text under `lint`, sharded over up to BATCH_SHARDS pwsh processes (see _start_shards)."""
+    return _json_counts(lint, texts, work, tag)
 
 
 def _collect_shards(shards: list, deadline: float | None = None) -> list[int]:
@@ -976,7 +1082,11 @@ def _differential_corpus(seeds: tuple[str, ...], members: tuple = ()) -> dict[st
 # change, derived with `_full_differential_corpus(...)` = _differential_corpus(the PromptLintTests catalogues + PROBE_ROWS + DEFEATER_AXIS
 # and its controls, members=_list_member_rows(the lint's word lists)) -> len(...). The corpus grows with the catalogues and the lint's
 # word lists, so a round that adds rows or list members raises this number in the same commit; it never falls without a reviewed reason.
-DIFFERENTIAL_CORPUS_ROWS = 34676
+# NA2-RULE4-PER-LAUNCHER-SCOPE-1 r15 (merge of fork/master aed62a12): 34676 on master's seeds, plus the 4365 rows the RULE4_* seed catalogues of
+# this PR add (_full_differential_corpus lists them after CLAUSE_MUST_PASS_R13) = 39041. Derived, not estimated: the same expression without the
+# RULE4_* seeds still yields exactly 34676 under this PR's lint, so no row of master's corpus was lost.
+# NA2-RULE4-SENTENCE-SPLIT-AND-CODESPAN-APP-1: + the 5 CoS / amend rows (RULE4_SPLIT_SEEDS) = 39046 (derived: 39041 without them).
+DIFFERENTIAL_CORPUS_ROWS = 39046
 
 
 def _full_differential_corpus(work: Path) -> dict[str, dict]:
@@ -989,6 +1099,9 @@ def _full_differential_corpus(work: Path) -> dict[str, dict]:
                                 + PromptLintTests.CLAUSE_MUST_REFUSE_R11 + PromptLintTests.CLAUSE_MUST_PASS_R11
                                 + PromptLintTests.CLAUSE_MUST_REFUSE_R12 + PromptLintTests.CLAUSE_MUST_PASS_R12
                                 + PromptLintTests.CLAUSE_MUST_REFUSE_R13 + PromptLintTests.CLAUSE_MUST_PASS_R13
+                                + RULE4_SECOND_LAUNCHER_REFUSE + RULE4_SECOND_LAUNCHER_GUARDS + RULE4_BOTH_ROUTED_PASS
+                                + RULE4_R2_REFUSE + RULE4_R2_GUARDS + RULE4_R2_PASS + RULE4_R2_B_APP_REFUSE + RULE4_R4_SEEDS + RULE4_R6_SEEDS + RULE4_R7_SEEDS
+                                + RULE4_R10_SEEDS + RULE4_SPLIT_SEEDS
                                 + PromptLintTests.PROBE_ROWS
                                 + tuple(text for _, _, text in PromptLintTests.DEFEATER_AXIS) + PromptLintTests.DEFEATER_AXIS_CONTROLS,
                                 members=tuple(_list_member_rows(_lint_word_lists(LINT_PS1, work))))
@@ -1018,10 +1131,13 @@ def _differential_flips(work: Path, baseline_text: str | None = None, previous_h
     baseline.write_text(text, encoding="utf-8")
     corpus = _full_differential_corpus(work)
     texts = list(corpus)
-    # Baseline and candidate start together as BATCH_SHARDS pwsh shards each (r12: ~32k rows, ~17 ms a row, does not fit one process), inside
-    # one LINT_PROBE_BOUND_SEC budget and one cleanup boundary (_corpus_counts). A lint text already evaluated by an earlier test of this
-    # process -- the candidate always, the baseline when it is the same text -- is read from the in-process cache instead of being run again.
-    before, after = _corpus_counts([baseline, LINT_PS1], texts, work, "diff")
+    # Both lints run at the same time, each as up to BATCH_SHARDS pwsh processes (r12: ~32k rows, ~17 ms a row, does not fit one process),
+    # inside one LINT_PROBE_BOUND_SEC budget (_prefetch_counts), and only for the (lint bytes, text) pairs no earlier test already computed
+    # (r3): the candidate lint's catalogue and list-member rows are known by now, and a baseline that IS the candidate (the
+    # identical-baseline row) costs nothing at all.
+    _prefetch_counts(work, [(baseline, texts, "base"), (LINT_PS1, texts, "cand")])
+    before = _verdicts(baseline, texts)
+    after = _verdicts(LINT_PS1, texts)
     opened = [(t, corpus[t]) for t, b, a in zip(texts, before, after) if b > 0 and a == 0]
     closed = [(t, corpus[t]) for t, b, a in zip(texts, before, after) if b == 0 and a > 0]
     return ref, opened, closed, len(texts)
@@ -1051,6 +1167,999 @@ def _pin_problems(opened, closed, allow_open, allow_closed) -> list[str]:
 
 def _code_lines(path: Path) -> list[str]:
     return [ln for ln in path.read_text(encoding="utf-8").splitlines() if not ln.lstrip().startswith("#")]
+
+
+# NA2-RULE4-PER-LAUNCHER-SCOPE-1 (CoS post-merge Blocker on PR #448, ask 6216180502; the seventh outside-probe bypass). Rule 4 scored only
+# the FIRST launcher occurrence of a sentence, so a venue-routed first launcher exempted an unrouted second one after a separator.
+# One row per separator x second-launcher shape x backend x launcher form x route of the first launcher. A command line is assembled
+# from SMOKE_SCRIPT / APP / SMOKE_MODE, so no literal launcher line sits in this file (the hub-VM hooks read the file text).
+RULE4_BACKENDS = ("cpu", "cuda")
+# (name, text between the two launchers, form of the second launcher: "run" = with a launch verb, "bare" = the command line alone)
+RULE4_SEPARATORS = (
+    ("semicolon", "; ", "bare"),
+    ("semicolon-then", "; then ", "run"),
+    ("comma-then", ", then ", "run"),
+    ("sentence-then", ". Then ", "run"),
+    ("then", " then ", "run"),
+    ("and", " and ", "run"),
+    ("semicolon-run", "; ", "run"),
+)
+RULE4_ROUTES = ("on Bachelor", "through the venue chain")
+# A separator that ends the SENTENCE was already read per sentence on master (the second sentence is judged alone): those rows are
+# regression guards, not RED rows.
+RULE4_ALREADY_REFUSED_SEPARATORS = ("sentence-then",)
+
+
+def _rule4_launcher(style: str, backend: str) -> str:
+    script = f"tools/profiling/{SMOKE_SCRIPT}"
+    return {
+        "path": f"{script} -Backend {backend}",
+        "pwsh": f"pwsh -File {script} -Backend {backend}",
+        "amp": f"& ./{script} -Backend {backend}",
+        "app": f"{APP} take01.dat {SMOKE_MODE}",
+        # r2 styles: the script alone by name, and pwsh with options before -File. (A QUOTED `& '<path>' -Backend ...` call is not
+        # matched by any rule-4 pattern at all, at 75cb00e1 and on master alike: reported open, not a row here.)
+        "bare": f"{SMOKE_SCRIPT} -Backend {backend}",
+        "pwshopt": f"pwsh -NoProfile -NonInteractive -File {script} -Backend {backend}",
+    }[style]
+
+
+def _rule4_styles(backend: str) -> tuple[str, ...]:
+    return ("path", "pwsh", "amp", "app") if backend == RULE4_BACKENDS[0] else ("path", "pwsh", "amp")
+
+
+def _rule4_second(form: str, launcher: str, route: str = "") -> str:
+    core = f"run {launcher}" if form == "run" else launcher
+    return f"{core} {route}".rstrip()
+
+
+def _rule4_rows() -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    """-> (second launcher unrouted after a routed first: every row must REFUSE, rows that were already refused: guards,
+    both launchers routed: every row must PASS)."""
+    refuse: list[str] = []
+    guards: list[str] = []
+    allow: list[str] = []
+    for style, backend, route in itertools.product(("path", "pwsh", "amp", "app"), RULE4_BACKENDS, RULE4_ROUTES):
+        if style not in _rule4_styles(backend):
+            continue
+        first = f"The venue job calls {_rule4_launcher(style, RULE4_BACKENDS[0])} {route}"
+        second = _rule4_launcher(style, backend)
+        for name, sep, form in RULE4_SEPARATORS:
+            (guards if name in RULE4_ALREADY_REFUSED_SEPARATORS else refuse).append(f"{first}{sep}{_rule4_second(form, second)}.")
+            for second_route in RULE4_ROUTES:
+                allow.append(f"{first}{sep}{_rule4_second(form, second, second_route)}.")
+        # two launchers in ONE clause (a comma with no verb is not a clause boundary). Master already refuses the first form (the venue
+        # phrase followed by a comma and a launcher is no locus); the second form is a shared route after a launcher list, which master
+        # passed for BOTH launchers and which now refuses (accepted over-refusal: give each launcher its own route).
+        guards.append(f"{first}, {second}.")
+        refuse.append(f"The venue job calls {_rule4_launcher(style, RULE4_BACKENDS[0])}, {second} {route}.")
+        # the UNROUTED launcher comes first: read first on master too
+        guards.append(f"Run {second}; then run {_rule4_launcher(style, RULE4_BACKENDS[0])} {route}.")
+    # the CoS repro lines, verbatim (ask 6216180502): the venue job's first launcher is routed, the second is not
+    cos_script = f"tools/profiling/{SMOKE_SCRIPT}"
+    cos_first = f"The venue job calls {cos_script} -Backend cpu on Bachelor"
+    cos_lines = (f"{cos_first}; then run {cos_script} -Backend cpu.", f"{cos_first}; {cos_script} -Backend cuda.")
+    guards.extend((f"Run {cos_script} -Backend cpu.", f"{cos_first}. Then run {cos_script} -Backend cpu."))
+    return (tuple(dict.fromkeys(list(cos_lines) + refuse)), tuple(dict.fromkeys(guards)), tuple(dict.fromkeys(allow)))
+
+
+RULE4_SECOND_LAUNCHER_REFUSE, RULE4_SECOND_LAUNCHER_GUARDS, RULE4_BOTH_ROUTED_PASS = _rule4_rows()
+
+# r2 (CoS review of 75cb00e1: a launcher's lazy gap crossed a `;` and swallowed the NEXT launcher, so the merged span took the first
+# clause's venue route). The r1 sets above are unchanged; everything below is new in r2.
+#   cross-clause   a venue-routed lead that is NOT itself a launcher ("pwsh -File build.ps1 on Bachelor", "<app> <file> on Bachelor")
+#                  followed by an UNROUTED launcher after each separator. The same-style pairs (pwsh + pwsh, app + app) are the CoS repro
+#                  shapes and PASSED at 75cb00e1 (RULE4_R2_CROSS_RED); the mixed-style pairs were refused there already.
+#   "or"           the separator the lint header promises (`or` is a Disjunct cut): the r1 product with " or " as the separator.
+#   single         one launcher per clause: routed passes, unrouted refuses. The verdict must equal the r1 verdict (parity).
+#   venue on B     the route belongs to launcher B only: with A a launcher A is refused; with A not a launcher the sentence passes.
+#   mixed styles   pwsh + app, & ./path + bare script name, pwsh with options before -File.
+RULE4_R2_SEPARATORS = RULE4_SEPARATORS + (("or", " or ", "run"),)
+RULE4_R2_PREFIXES = ("", "The venue job calls ")
+RULE4_R2_MIXED_PAIRS = (("pwsh", "app"), ("app", "pwsh"), ("path", "amp"), ("amp", "path"), ("amp", "bare"), ("bare", "amp"),
+                        ("pwsh", "bare"), ("app", "path"), ("pwshopt", "app"), ("bare", "pwshopt"))
+RULE4_R2_SINGLE_STYLES = ("path", "pwsh", "amp", "app", "bare", "pwshopt")
+
+
+def _rule4_lead(style: str, route: str) -> str:
+    """A venue-routed lead that is not itself a playback launcher: a pwsh call of another script, or the app with a file and no mode."""
+    return {"pwsh": f"pwsh -File build.ps1 {route}", "app": f"{APP} take01.dat {route}"}[style]
+
+
+def _rule4_r2_rows() -> dict[str, tuple[str, ...]]:
+    sets: dict[str, list[str]] = {k: [] for k in (
+        "cross_refuse", "cross_red", "cross_guards", "cross_allow", "or_refuse", "or_allow", "single_refuse", "single_pass",
+        "b_refuse", "b_pass", "b_app_refuse", "mixed_refuse", "mixed_allow")}
+    cos = f"tools/profiling/{SMOKE_SCRIPT}"
+    # the two CoS repro lines of review 6218718347 (a pwsh pair and an app pair), verbatim shapes
+    cos_pwsh = f"pwsh -File build.ps1 on Bachelor; pwsh -File {cos} -Backend cpu."
+    cos_app = f"{APP} take01.dat on Bachelor; then run {APP} take01.dat {SMOKE_MODE}."
+    for row in (cos_pwsh, cos_app):
+        sets["cross_refuse"].append(row)
+        sets["cross_red"].append(row)
+    for prefix, lead_style, route in itertools.product(RULE4_R2_PREFIXES, ("pwsh", "app"), RULE4_ROUTES):
+        lead = f"{prefix}{_rule4_lead(lead_style, route)}"
+        for second_style in ("pwsh", "path", "amp", "app", "bare", "pwshopt"):
+            second = _rule4_launcher(second_style, RULE4_BACKENDS[0])
+            for name, sep, form in RULE4_R2_SEPARATORS:
+                bucket = "cross_guards" if name in RULE4_ALREADY_REFUSED_SEPARATORS else "cross_refuse"
+                sets[bucket].append(f"{lead}{sep}{_rule4_second(form, second)}.")
+                # same family as the lead (a pwsh lead + a pwsh -File second, an app lead + an app second) = the CoS repro shapes
+                # (the options form is RED at 75cb00e1 only behind the plain route; behind the chain route that head refused it already)
+                if bucket == "cross_refuse" and ((lead_style, second_style) in (("pwsh", "pwsh"), ("app", "app"))
+                                                 or ((lead_style, second_style) == ("pwsh", "pwshopt") and route == RULE4_ROUTES[0])):
+                    sets["cross_red"].append(f"{lead}{sep}{_rule4_second(form, second)}.")
+                for second_route in RULE4_ROUTES:
+                    sets["cross_allow"].append(f"{lead}{sep}{_rule4_second(form, second, second_route)}.")
+    # " or " over the r1 product (same-style pairs, a launcher as the lead)
+    for style, backend, route in itertools.product(("path", "pwsh", "amp", "app"), RULE4_BACKENDS, RULE4_ROUTES):
+        if style not in _rule4_styles(backend):
+            continue
+        first = f"The venue job calls {_rule4_launcher(style, RULE4_BACKENDS[0])} {route}"
+        second = _rule4_launcher(style, backend)
+        sets["or_refuse"].append(f"{first} or run {second}.")
+        for second_route in RULE4_ROUTES:
+            sets["or_allow"].append(f"{first} or run {second} {second_route}.")
+    # single-launcher clauses: parity with r1
+    for style, backend in itertools.product(RULE4_R2_SINGLE_STYLES, RULE4_BACKENDS):
+        if style == "app" and backend != RULE4_BACKENDS[0]:
+            continue
+        launcher = _rule4_launcher(style, backend)
+        for lead in ("Run", "The venue job calls", "Then run"):
+            sets["single_refuse"].append(f"{lead} {launcher}.")
+            for route in RULE4_ROUTES:
+                sets["single_pass"].append(f"{lead} {launcher} {route}.")
+    # the route belongs to launcher B only
+    for a_style, b_style in itertools.product(("path", "pwsh", "amp", "app", "bare"), repeat=2):
+        a = _rule4_launcher(a_style, RULE4_BACKENDS[0])
+        b = _rule4_launcher(b_style, RULE4_BACKENDS[1] if b_style != "app" else RULE4_BACKENDS[0])
+        for sep in ("; ", "; then run ", " and run "):
+            sets["b_refuse"].append(f"Run {a}{sep}{b} on Bachelor.")
+    for lead_style, b_style in itertools.product(("pwsh", "app"), ("path", "pwsh", "amp", "app", "bare")):
+        lead = {"pwsh": "pwsh -File build.ps1", "app": f"{APP} take01.dat"}[lead_style]
+        b = _rule4_launcher(b_style, RULE4_BACKENDS[0])
+        for sep in ("; ", "; then run ", " and run "):
+            # r9 (hub ruling on CoS review 6230178238, B5): `<app> <clip>` IS an app launch of its own (a launch is decided from the app
+            # token and its own argument gap), so an app lead with no route of its own is refused although launcher B is routed. Those
+            # 15 rows left the routed-pass set for RULE4_R2_B_APP_REFUSE (an accepted over-refusal, named in the PR body).
+            sets["b_app_refuse" if lead_style == "app" else "b_pass"].append(f"{lead}{sep}{b} on Bachelor.")
+    # mixed-style pairs: the first launcher routed, the second not (refuse) / both routed (allow)
+    for (first_style, second_style), (name, sep, form), route in itertools.product(RULE4_R2_MIXED_PAIRS, RULE4_R2_SEPARATORS, RULE4_ROUTES):
+        if name in RULE4_ALREADY_REFUSED_SEPARATORS:
+            continue
+        first = f"The venue job calls {_rule4_launcher(first_style, RULE4_BACKENDS[0])} {route}"
+        second = _rule4_launcher(second_style, RULE4_BACKENDS[0])
+        sets["mixed_refuse"].append(f"{first}{sep}{_rule4_second(form, second)}.")
+        sets["mixed_allow"].append(f"{first}{sep}{_rule4_second(form, second, route)}.")
+    return {k: tuple(dict.fromkeys(v)) for k, v in sets.items()}
+
+
+_RULE4_R2 = _rule4_r2_rows()
+RULE4_R2_CROSS_REFUSE = _RULE4_R2["cross_refuse"]
+RULE4_R2_CROSS_RED = _RULE4_R2["cross_red"]
+RULE4_R2_CROSS_GUARDS = _RULE4_R2["cross_guards"]
+RULE4_R2_CROSS_ALLOW = _RULE4_R2["cross_allow"]
+RULE4_R2_OR_REFUSE = _RULE4_R2["or_refuse"]
+RULE4_R2_OR_ALLOW = _RULE4_R2["or_allow"]
+RULE4_R2_SINGLE_REFUSE = _RULE4_R2["single_refuse"]
+RULE4_R2_SINGLE_PASS = _RULE4_R2["single_pass"]
+RULE4_R2_B_REFUSE = _RULE4_R2["b_refuse"]
+RULE4_R2_B_PASS = _RULE4_R2["b_pass"]
+# r9: the 15 rows `<app> <clip><sep><routed script> on Bachelor.` (a routed launcher B behind an app lead with no route of its own). The
+# r2 sets held them as ALLOW rows; the r9 rule (an app token with an argument is a launch of its own) REFUSES them, so they are a named
+# refuse set, an accepted over-refusal (hub ruling on CoS review 6230178238): the first clause is an app launch with a clip and no route.
+RULE4_R2_B_APP_REFUSE = _RULE4_R2["b_app_refuse"]
+# the three B_PASS rows the r1 head refused (a same-family non-launcher lead: its gap swallowed launcher B), 3 separators x pwsh. (r2
+# listed six, with the app form; since r9 the app form is a launch of its own and sits in RULE4_R2_B_APP_REFUSE.)
+RULE4_R2_B_OPENED = tuple(f"{lead}{sep}{_rule4_launcher(style, RULE4_BACKENDS[0])} on Bachelor."
+                          for lead, style in (("pwsh -File build.ps1", "pwsh"),)
+                          for sep in ("; ", "; then run ", " and run "))
+RULE4_R2_MIXED_REFUSE = _RULE4_R2["mixed_refuse"]
+RULE4_R2_MIXED_ALLOW = _RULE4_R2["mixed_allow"]
+RULE4_R2_REFUSE = RULE4_R2_CROSS_REFUSE + RULE4_R2_OR_REFUSE + RULE4_R2_B_REFUSE + RULE4_R2_MIXED_REFUSE
+RULE4_R2_GUARDS = RULE4_R2_CROSS_GUARDS + RULE4_R2_SINGLE_REFUSE
+RULE4_R2_PASS = RULE4_R2_CROSS_ALLOW + RULE4_R2_OR_ALLOW + RULE4_R2_SINGLE_PASS + RULE4_R2_B_PASS + RULE4_R2_MIXED_ALLOW
+
+# r4 (sol r3 CHANGES_REQUESTED 6223587477, CoS / Iverson advisory 6223667455, both on 4b9c9387). The r3 head is the RED baseline of
+# these rows (PromptLintTests.test_rule4_r4_*).
+#   quoted     sol: a routed first launcher, then an UNROUTED quoted call `& '<script>' -Backend cuda` after `; `, `, then`, ` then`,
+#              `. Then` and a line break. No rule-4 pattern matched the quoted spelling at all (the closing quote sat between the
+#              script name and its parameter), so every row passed. The double-quoted spelling and a quoted app call are the same shape.
+#   path arg   Iverson: the app's argument gap refused any token that merely CONTAINED a launcher name, so a path argument such as
+#              `--log C:\MLVApp\out.txt` ended the gap before the mode flag and the launch was never seen. The verbatim repro strings
+#              (comment 6223667455) are the first rows; the pwsh gap had the same stop (`-WorkingDirectory C:\MLVApp\w -File <script>`).
+RULE4_R3_PR_HEAD = "4b9c938773a7d5995190d883c57ef46c0ec8e5c6"
+RULE4_R4_SEPARATORS = (("semicolon", "; "), ("comma-then", ", then "), ("then", " then "), ("sentence-then", ". Then "), ("newline", "\n"))
+
+
+def _rule4_r4_rows() -> dict[str, tuple[str, ...]]:
+    sets: dict[str, list[str]] = {k: [] for k in ("red", "guards", "pass")}
+    script = f"tools/profiling/{SMOKE_SCRIPT}"
+    app_release = "MLVApp" + "Release.exe"
+    first = f"The venue job calls {script} -Backend cpu on Bachelor"
+    quoted = (f"& '{script}' -Backend cuda", f'& "{script}" -Backend cuda')
+    for (_, sep), call in itertools.product(RULE4_R4_SEPARATORS, quoted):
+        sets["red"].append(f"{first}{sep}{call}.")
+        sets["pass"].append(f"{first}{sep}{call} on Bachelor.")
+    for call in quoted + (f"& '{APP}' take01.dat {SMOKE_MODE}", f"& 'C:\\build\\{app_release}' take01.dat {SMOKE_MODE}"):
+        sets["red"].append(f"Run {call}.")
+        sets["pass"].append(f"The venue job calls {call} on Bachelor.")
+    # Iverson's repro strings, verbatim: the two fail-open rows, then the plain-path control (refused at the r3 head too: a guard)
+    iverson = (f"Run {app_release} --log C:\\MLVApp\\out.txt {SMOKE_MODE}", f"Run {app_release} --out C:\\pwsh\\x.txt {SMOKE_MODE}")
+    sets["red"].extend(iverson)
+    sets["guards"].append(f"Run {app_release} --clip D:\\clips\\a.mlv {SMOKE_MODE}")
+    # the same stop on other path segments, and in the pwsh gap
+    sets["red"].extend((f"Run {app_release} --log C:\\MLVAppRelease\\out.txt {SMOKE_MODE}",
+                        f"Run {app_release} --out C:\\powershell\\x.txt {SMOKE_MODE}",
+                        f"Run {app_release} --log D:\\{APP}.d\\log.txt {SMOKE_MODE}",
+                        f"Run pwsh -NoProfile -WorkingDirectory C:\\MLVApp\\w -File {script}"))
+    # a launcher token that is a real second launcher still stops the gap, and the second launcher is scored on its own route
+    sets["guards"].append(f"Run pwsh -NoProfile -WorkingDirectory C:\\pwsh\\w -File {script}")
+    sets["guards"].append(f"Run {app_release} take01.dat on Bachelor and run C:\\build\\{app_release} take01.dat {SMOKE_MODE}.")
+    for row in iverson + (f"Run {app_release} --clip D:\\clips\\a.mlv {SMOKE_MODE}", f"Run pwsh -NoProfile -WorkingDirectory C:\\MLVApp\\w -File {script}"):
+        sets["pass"].append(f"{row} on Bachelor.")
+    # r4b (hub ruling, HUB-TICK 20261016T2244Z): a launch verb + the app + a clip argument is an app LAUNCH, so its own clause must carry
+    # the venue; the route on launcher B never covers it. The first row is the differential-pin seed master and d2f3cd05 refuse and the
+    # r3 / r4 heads passed (the r4 gap stops at the second app token, so the first app matched no pattern). A VERBLESS "<app> <clip>"
+    # lead stays the r2 non-launcher lead (RULE4_R2_B_PASS pins it; no new row of that shape is added here, so nothing opens against
+    # master or d2f3cd05 beyond r2's listed B_PASS opening), and a lead that carries its own route passes: the control below.
+    sets["red"].extend((f"Run {app_release} take01.dat and run C:\\build\\{app_release} take01.dat {SMOKE_MODE} on Bachelor.",
+                        f"Run {APP} take01.dat and run {APP} take01.dat {SMOKE_MODE} on Bachelor.",
+                        f"Run {app_release} take01.dat; run C:\\build\\{app_release} take01.dat {SMOKE_MODE} on Bachelor.",
+                        f"Open {APP} D:\\clips\\a.mlv, then run {APP} take01.dat {SMOKE_MODE} on Bachelor.",
+                        f"Run {app_release} take01.dat and run {script} -Backend cpu on Bachelor."))
+    sets["pass"].append(f"Run {app_release} take01.dat on Bachelor and run C:\\build\\{app_release} take01.dat {SMOKE_MODE} on Bachelor.")
+    return {k: tuple(dict.fromkeys(v)) for k, v in sets.items()}
+
+
+_RULE4_R4 = _rule4_r4_rows()
+RULE4_R4_RED = _RULE4_R4["red"]
+RULE4_R4_GUARDS = _RULE4_R4["guards"]
+RULE4_R4_PASS = _RULE4_R4["pass"]
+RULE4_R4_REFUSE = RULE4_R4_RED + RULE4_R4_GUARDS
+# the differential corpus is one text per line: the line-break rows are judged by the catalogue tests only
+RULE4_R4_SEEDS = tuple(t for t in RULE4_R4_REFUSE + RULE4_R4_PASS if "\n" not in t)
+
+# r6 (CoS review 6227161437 on 469e513d: Blocker B1, Improvement 1, Prevention; CoS Dot fold-in 6228249768: Blocker B2). The r4b head is the
+# RED baseline of these rows (PromptLintTests.test_rule4_r6_*). The r4b clip-launch pattern took a bare first argument with an extension and
+# nothing else, so an app launch whose clip follows an option (`--clip <clip>`, `-v <clip>`, `--input <path>`), has no extension, or is a
+# quoted path with a space never counted as a launch of its own: a venue route on the NEXT launcher then covered it. Master refused every
+# one of the B1 / B2 rows, so against master (and the pre-change pin) they are guards, not RED rows; Improvement 1's two rows pass on master
+# too. Fixture clips follow this file's clip-name convention (take01.dat, a.dat): the lint's clip test is extension-generic.
+#   axis     the clip-argument axis the Prevention note asks for: argument form x lead verb x separator x the launcher that carries the route
+#            (an app launch with a bare clip, a tracked script call), in both orders (the clip launch first, and as the SECOND launcher).
+RULE4_R4B_PR_HEAD = "469e513d6151655a0d11d6f3bd5c97f5190dcb40"
+RULE4_R6_LEADS = ("Run", "Open")
+RULE4_R6_SEPARATORS = ("; run ", ", then run ", " and run ")
+
+
+def _rule4_r6_rows() -> dict[str, tuple[str, ...]]:
+    app_release = "MLVApp" + "Release.exe"
+    script = f"tools/profiling/{SMOKE_SCRIPT}"
+    # argument forms the r4b pattern did not read as a clip launch (RED) and the ones it already read (guards)
+    red_args = ("--clip take01.dat", "-v take01.dat", "--input D:\\clips\\a.dat", "D:\\clips\\take01", "--fps 24 take01.dat", "-v --clip take01.dat",
+                "'D:\\my clips\\a.dat'", '"D:\\my clips\\a.dat"', "--clip 'D:\\my clips\\a.dat'", '--clip "D:\\my clips\\a.dat"')
+    guard_args = ("take01.dat", "D:\\clips\\a.dat", "'D:\\clips\\a.dat'", '"D:\\clips\\a.dat"')
+    routed_seconds = (f"C:\\build\\{app_release} take01.dat {SMOKE_MODE} on Bachelor", f"pwsh -File {script} -Backend cpu on Bachelor")
+    routed_first = f"C:\\build\\{app_release} take01.dat {SMOKE_MODE} on Bachelor"
+    sets: dict[str, list[str]] = {k: [] for k in ("red", "guards", "pass", "named")}
+    for args, key in ((red_args, "red"), (guard_args, "guards")):
+        for lead, sep, arg in itertools.product(RULE4_R6_LEADS, RULE4_R6_SEPARATORS, args):
+            for second in routed_seconds:
+                # the clip launch is the FIRST launcher and has no route of its own; the route on launcher B must not cover it
+                sets[key].append(f"{lead} {app_release} {arg}{sep}{second}.")
+                sets["pass"].append(f"{lead} {app_release} {arg} on Bachelor{sep}{second}.")
+            # the clip launch is the SECOND launcher and has no route of its own (Improvement 1)
+            sets[key].append(f"{lead} {routed_first}{sep}{app_release} {arg}.")
+            sets["pass"].append(f"{lead} {routed_first}{sep}{app_release} {arg} on Bachelor.")
+    # the CoS rows, verbatim in shape: B1 (six), Improvement 1 (two), B2 (two)
+    second = f"C:\\build\\{app_release} take01.dat {SMOKE_MODE} on Bachelor."
+    sets["named"].extend((f"Run {app_release} --clip take01.dat and run {second}",
+                          f"Run {app_release} --clip take01.dat; run {second}",
+                          f"Run {app_release} --clip take01.dat, then run {second}",
+                          f"Run {app_release} -v take01.dat and run {second}",
+                          f"Run {app_release} --input D:\\clips\\a.dat and run {second}",
+                          f"Run {app_release} D:\\clips\\take01 and run {second}",
+                          f"Run C:\\build\\{app_release} take01.dat {SMOKE_MODE} on Bachelor and run {app_release} --clip take02.dat.",
+                          f"Run {app_release} --clip D:\\clips\\a.dat and run pwsh -File {script} -Backend cpu on Bachelor.",
+                          f"Run {app_release} 'D:\\my clips\\a.dat' and run {second}",
+                          f'Run {app_release} "D:\\my clips\\a.dat" and run {second}'))
+    # every CoS row is a RED row against the r4b head (the axis holds most of them; two are in no axis cell)
+    sets["red"].extend(sets["named"])
+    return {k: tuple(dict.fromkeys(v)) for k, v in sets.items()}
+
+
+_RULE4_R6 = _rule4_r6_rows()
+RULE4_R6_RED = _RULE4_R6["red"]
+RULE4_R6_GUARDS = _RULE4_R6["guards"]
+RULE4_R6_PASS = _RULE4_R6["pass"]
+RULE4_R6_NAMED = _RULE4_R6["named"]
+RULE4_R6_REFUSE = RULE4_R6_RED + RULE4_R6_GUARDS
+RULE4_R6_SEEDS = tuple(RULE4_R6_REFUSE + RULE4_R6_PASS)
+
+# r7 (CoS review 6228973410 on 0fb1eb8c: Blocker B3, N1, N2, Prevention). The r6 head is the RED baseline of these rows
+# (PromptLintTests.test_rule4_r7_*). r4b and r6 each read a LIST of clip shapes and each list missed a form: B3 is `--clip=<clip>`, `/clip
+# <clip>` and a bare token with no extension, and N2 is seven options before the clip. The r7 pattern reads no shape at all (any first
+# argument after the app that is not the next launcher), and the sweep below is the check the CoS asked for: it is GENERATED from an
+# argument grammar, not from the shapes anybody remembered, and it is judged against the pinned pre-change master, not against a list.
+#   sweep    argument grammar (attached `=` values, `/` options, bare tokens, numbers, quoted values with and without a space, option
+#            chains of 1-8 flags and of 1-8 flag + value pairs) x lead verb (with the app name it launches) x separator x the routed
+#            launcher it sits next to (an app call, a script call) x the clip launch as the FIRST and as the SECOND launcher, once without
+#            a route of its own (must refuse) and once with one (must pass).
+#   fixtures the CoS rows name a real clip file; this round has no clip and NA-4 refuses that file extension in an edit, so every fixture keeps the
+#            CoS row exactly (the `=` attachment, the `/` option, the bare token, the separators, the launcher twins) and uses this file's
+#            `.dat` clip-name convention.
+RULE4_R6_PR_HEAD = "0fb1eb8c5c2453d9f1d1d8f704a220da37637619"
+RULE4_R7_LEAD_APPS = (("Run", "MLVApp" + "Release.exe"), ("Open", APP))
+RULE4_R7_SEPARATORS = ("; run ", ", then run ", " and run ")
+RULE4_R7_ROUTE = "on Bachelor"
+
+
+def _rule4_r7_args() -> tuple[str, ...]:
+    """The argument grammar: what can follow the app token of a launch, up to and including the clip."""
+    attached = ("--clip=take01.dat", "--clip=D:\\clips\\a.dat", "-c=take01.dat", "--fps=24", "--clip='D:\\my clips\\a.dat'", '--clip="D:\\my clips\\a.dat"')
+    slash = ("/clip take01.dat", "/v take01.dat", "/clip", "/clip D:\\clips\\a.dat")
+    bare = ("take01", "take01.dat", "D:\\clips\\take01", "24", "3.5")
+    quoted = ("'take01.dat'", '"take01.dat"', "'D:\\my clips\\a.dat'", '"D:\\my clips\\a.dat"', "--clip 'take01.dat'",
+              "--clip 'D:\\my clips\\a.dat'", '--clip "D:\\my clips\\a.dat"')
+    flags = tuple(" ".join(f"--o{i}" for i in range(1, n + 1)) + " take01.dat" for n in range(1, 9))
+    pairs = tuple(" ".join(f"--o{i} v{i}" for i in range(1, n + 1)) + " take01.dat" for n in range(1, 9))
+    return attached + slash + bare + quoted + flags + pairs
+
+
+def _rule4_r7_rows() -> dict[str, tuple[str, ...]]:
+    script = f"tools/profiling/{SMOKE_SCRIPT}"
+    app_release = "MLVApp" + "Release.exe"
+    twins = (f"C:\\build\\{app_release} take01.dat {SMOKE_MODE} {RULE4_R7_ROUTE}", f"pwsh -File {script} -Backend cpu {RULE4_R7_ROUTE}")
+    unrouted: list[str] = []
+    routed: list[str] = []
+    for (lead, app), sep, arg, twin in itertools.product(RULE4_R7_LEAD_APPS, RULE4_R7_SEPARATORS, _rule4_r7_args(), twins):
+        # the clip launch is the FIRST launcher: the route on the next launcher must not cover it
+        unrouted.append(f"{lead} {app} {arg}{sep}{twin}.")
+        routed.append(f"{lead} {app} {arg} {RULE4_R7_ROUTE}{sep}{twin}.")
+        # the clip launch is the SECOND launcher (the first one is routed)
+        unrouted.append(f"{lead} {twin}{sep}{app} {arg}.")
+        routed.append(f"{lead} {twin}{sep}{app} {arg} {RULE4_R7_ROUTE}.")
+    # the CoS rows of review 6228973410, verbatim in shape (`.dat` fixtures): B3 (four, each with its `; run` / `, then run` twins) and N1
+    second = f"C:\\build\\{app_release} take01.dat {SMOKE_MODE} {RULE4_R7_ROUTE}."
+    named: list[str] = []
+    for sep in (" and run ", "; run ", ", then run "):
+        named.extend((f"Run {app_release} --clip=take01.dat{sep}{second}",
+                      f"Run {app_release} --clip=D:\\clips\\a.dat{sep}{second}",
+                      f"Run {app_release} /clip take01.dat{sep}{second}",
+                      f"Run {app_release} take01{sep}{second}"))
+    named.append(f"Run C:\\build\\{app_release} take01.dat {SMOKE_MODE} {RULE4_R7_ROUTE} and run {app_release} --clip=take02.dat.")
+    named_b3 = tuple(named[:12])
+    return {"unrouted": tuple(dict.fromkeys(list(named) + unrouted)), "routed": tuple(dict.fromkeys(routed)), "named": tuple(named), "named_b3": named_b3}
+
+
+_RULE4_R7 = _rule4_r7_rows()
+RULE4_R7_REFUSE = _RULE4_R7["unrouted"]
+RULE4_R7_PASS = _RULE4_R7["routed"]
+RULE4_R7_NAMED = _RULE4_R7["named"]
+RULE4_R7_NAMED_B3 = _RULE4_R7["named_b3"]
+# The sweep's allow-list: a row the pre-change master refuses that passes on the head. It is EMPTY, and an entry needs a reason, so a
+# refuse -> pass flip of the argument grammar cannot be added without saying why.
+RULE4_R7_SWEEP_ALLOWED: dict[str, str] = {}
+RULE4_R7_SEEDS = tuple(RULE4_R7_REFUSE + RULE4_R7_PASS)
+
+# r8 (opus key on 03e7ae1b: Blocker + hardening 1-3). The r7 sweep generated the ARGUMENT after the app but fixed the LEAD at `Run <app>` /
+# `Open <app>`, so a markdown code span, `Re-run <app>` and `Run the <app> ...` hid the first launch and a later routed launcher's venue
+# covered it (a refuse -> pass flip against the pin). The r8 lint reads the lead by construction (any run of openers and plain words
+# between the listed verb and the app), and this sweep adds the two axes that were missing, judged by the same pinned-master test:
+#   lead wrapper  none, a backtick code span (with the second call bare and in a code span too), single quotes, double quotes, one word
+#                 and two words between the verb and the app.
+#   verb form     Run, run, Open, open, Launch, Start, Re-run, and `Then run`; the SECOND launcher takes the same verbs behind ` and `.
+# The argument axis is the two shapes that matter for the lead (a bare clip, an attached `--clip=` value): r7's sweep already covers the
+# argument grammar. The pwsh cost is bounded: ~1800 rows, one sharded prefetch, the time is in the PR body.
+# Fixtures keep the `.dat` clip-name convention of this file (no clip this round; NA-4 refuses the real extension in an edit).
+RULE4_R7_PR_HEAD = "03e7ae1b49d469d6be0139b528356bebea0cb8d7"
+RULE4_R8_VERBS = ("Run", "run", "Open", "open", "Launch", "Start", "Re-run", "Then run")
+RULE4_R8_SEPARATORS = ("; run ", ", then run ", " and run ")
+
+
+def _rule4_r8_wraps(app: str, arg: str) -> tuple[tuple[str, bool], ...]:
+    """The lead-wrapper axis: (the call as written after the verb, whether the other call is wrapped in a code span too)."""
+    return ((f"{app} {arg}", False),
+            (f"`{app} {arg}`", False),
+            (f"`{app} {arg}`", True),
+            (f"'{app}' {arg}", False),
+            (f'"{app}" {arg}', False),
+            (f"the {app} {arg}", False),
+            (f"the new {app} {arg}", False))
+
+
+def _rule4_r8_rows() -> dict[str, tuple[str, ...]]:
+    script = f"tools/profiling/{SMOKE_SCRIPT}"
+    app_release = "MLVApp" + "Release.exe"
+    route = RULE4_R7_ROUTE
+    twin_calls = (f"C:\\build\\{app_release} take01.dat {SMOKE_MODE}", f"pwsh -File {script} -Backend cpu")
+    unrouted: list[str] = []
+    routed: list[str] = []
+    for verb, sep, arg, twin_call in itertools.product(RULE4_R8_VERBS, RULE4_R8_SEPARATORS, ("take01.dat", "--clip=take01.dat"), twin_calls):
+        for call, span_twin in _rule4_r8_wraps(app_release, arg):
+            twin = f"`{twin_call}` {route}" if span_twin else f"{twin_call} {route}"
+            # the wrapped call is the FIRST launcher: the route on the next launcher must not cover it
+            unrouted.append(f"{verb} {call}{sep}{twin}.")
+            routed.append(f"{verb} {call} {route}{sep}{twin}.")
+    # the wrapped call is the SECOND launcher (the first one is routed), behind the same verb forms
+    for verb, arg, twin_call in itertools.product(RULE4_R8_VERBS, ("take01.dat", "--clip=take01.dat"), twin_calls):
+        for call, span_twin in _rule4_r8_wraps(app_release, arg):
+            first = f"`{twin_call}` {route}" if span_twin else f"{twin_call} {route}"
+            sep = f" and {verb.lower()} "
+            unrouted.append(f"Run {first}{sep}{call}.")
+            routed.append(f"Run {first}{sep}{call} {route}.")
+    # the opus rows: the code-span catalogue row with its `; run` / `, then run` twins, the second call with and without backticks, and the
+    # two hardening rows (a hyphen-prefixed verb, a word between the verb and the app) with the same three separators
+    second = f"C:\\build\\{app_release} take01.dat {SMOKE_MODE}"
+    named: list[str] = []
+    for sep in (" and run ", "; run ", ", then run "):
+        named.append(f"Run `{app_release} take01.dat`{sep}`{second}` {route}.")
+        named.append(f"Run `{app_release} take01.dat`{sep}{second} {route}.")
+        named.append(f"Re-run {app_release} take01.dat{sep}{second} {route}.")
+        named.append(f"Run the {app_release} build on take01.dat{sep}{second} {route}.")
+    return {"unrouted": tuple(dict.fromkeys(list(named) + unrouted)), "routed": tuple(dict.fromkeys(routed)), "named": tuple(named)}
+
+
+_RULE4_R8 = _rule4_r8_rows()
+RULE4_R8_REFUSE = _RULE4_R8["unrouted"]
+RULE4_R8_PASS = _RULE4_R8["routed"]
+RULE4_R8_NAMED = _RULE4_R8["named"]
+# Accepted over-refusal (opus note on 03e7ae1b, named in the PR body): any first argument after a launcher that follows a routed launch is
+# a launch of its own, so a harmless second call refuses where the pin passes it. It fails closed; route it or split the sentence.
+RULE4_R8_OVERREFUSAL = (f"Run C:\\build\\{'MLVApp' + 'Release.exe'} take01.dat {SMOKE_MODE} {RULE4_R7_ROUTE} and open {'MLVApp' + 'Release.exe'} --help.",)
+# The r8 sweep's allow-list: a row the pre-change master refuses that passes on the head. EMPTY; an entry needs a reason.
+RULE4_R8_SWEEP_ALLOWED: dict[str, str] = {}
+
+# r9 (CoS review 6230178238 on d30d1365, B5 + the Prevention; hub ruling). The r8 lint read the lead before the app token as a list of shapes
+# (openers, plain words, one path) and the CoS found 84 refuse -> pass rows in five families outside it. The r9 rule reads NO lead: an app
+# token is a launch when its OWN argument gap (up to the next separator or launcher) holds an argument and no playback mode, whatever
+# stands before it. The families below are the CoS rows (x six launch verbs x the three separators x two launcher twins); the fuzz is the
+# Prevention: a seeded generator draws the lead instead of anybody listing it.
+#   family 1  an unquoted path with a space          family 4  punctuation in the lead (`,` `:`)
+#   family 2  a word with an apostrophe              family 5  no verb right before the app (`Run:`, `Then`, `First`, a code span, an
+#   family 3  a hyphenated word                                environment-variable path, `the <app> build`)
+# Fixtures keep this file's `.dat` clip-name convention (no clip this round; NA-4 refuses the real extension in an edit).
+RULE4_R8_PR_HEAD = "d30d1365f05a5e9d014ed06fd25553068c450c4c"
+RULE4_R9_VERBS = ("Run", "Execute", "Re-run", "Launch", "Kick off", "Play")
+RULE4_R9_SEPARATORS = ("; run ", ", then run ", " and run ")
+RULE4_R9_FUZZ_SEED = 20261017
+RULE4_R9_FUZZ_ROWS = 3600
+# (family, lead template). {v} verb, {a} app name, {c} the call `<app> take01.dat`, {k} the clip. A template that holds {c} is the whole
+# first call; one that holds {a} and {k} writes the call itself (`the <app> build on <clip>`).
+RULE4_R9_LEADS = (
+    (1, "{v} C:\\Program Files\\MLVApp\\{c}"),
+    (1, "{v} D:\\my tools\\bin\\{c}"),
+    (2, "{v} Layi's {c}"),
+    (2, "{v} the team's {c}"),
+    (3, "{v} the x64-release {c}"),
+    (3, "{v} pwsh-free {c}"),
+    (3, "{v} the re-built {c}"),
+    (4, "{v}, as before, {c}"),
+    (4, "{v} again: {c}"),
+    (4, "{v}, then {c}"),
+    (5, "{v}: .\\{c}"),
+    (5, "Then {c}"),
+    (5, "First ~/bin/{c}"),
+    (5, "{v}: build\\{c}"),
+    (5, "First $env:BIN\\{c}"),
+    (5, "First %BIN%\\{c}"),
+    (5, "{v}: `{c}`"),
+    (5, "First the {a} build on {k}"),
+)
+
+
+def _rule4_r9_twins() -> tuple[str, ...]:
+    return (f"C:\\build\\{'MLVApp' + 'Release.exe'} take01.dat {SMOKE_MODE} {RULE4_R7_ROUTE}", f"pwsh -File tools/profiling/{SMOKE_SCRIPT} -Backend cpu {RULE4_R7_ROUTE}")
+
+
+def _rule4_r9_rows() -> dict[str, tuple[str, ...]]:
+    """The CoS families: `unrouted` (the first call has no route of its own: must refuse), `routed` (it has one: must pass), `named`
+    (the CoS example rows, verbatim in shape), `family` (family number per unrouted row)."""
+    unrouted: list[str] = []
+    routed: list[str] = []
+    family: dict[str, int] = {}
+    for (fam, template), verb, sep, twin, app in itertools.product(RULE4_R9_LEADS, RULE4_R9_VERBS, RULE4_R9_SEPARATORS, _rule4_r9_twins(), (APP, "MLVApp" + "Release.exe")):
+        lead = template.format(v=verb, a=app, c=f"{app} take01.dat", k="take01.dat")
+        row = f"{lead}{sep}{twin}."
+        unrouted.append(row)
+        family.setdefault(row, fam)
+        routed.append(f"{lead} {RULE4_R7_ROUTE}{sep}{twin}.")
+    app_release = "MLVApp" + "Release.exe"
+    second = f"C:\\build\\{app_release} take01.dat {SMOKE_MODE} {RULE4_R7_ROUTE}"
+    named = []
+    for sep in (" and run ", "; run ", ", then run "):
+        named.extend((f"Run C:\\Program Files\\MLVApp\\{app_release} take01.dat{sep}{second}.",
+                      f"Run Layi's {app_release} take01.dat{sep}{second}.",
+                      f"Run the x64-release {app_release} take01.dat{sep}{second}.",
+                      f"Run pwsh-free {app_release} take01.dat{sep}{second}.",
+                      f"Run, as before, {app_release} take01.dat{sep}{second}.",
+                      f"Run again: {app_release} take01.dat{sep}{second}.",
+                      f"Run: .\\{app_release} take01.dat{sep}{second}.",
+                      f"Then {APP} take01.dat{sep}{second}.",
+                      f"First ~/bin/{app_release} take01.dat{sep}{second}."))
+    return {"unrouted": tuple(dict.fromkeys(list(named) + unrouted)), "routed": tuple(dict.fromkeys(routed)), "named": tuple(named), "family": family}
+
+
+_RULE4_R9 = _rule4_r9_rows()
+RULE4_R9_REFUSE = _RULE4_R9["unrouted"]
+RULE4_R9_PASS = _RULE4_R9["routed"]
+RULE4_R9_NAMED = _RULE4_R9["named"]
+RULE4_R9_FAMILY = _RULE4_R9["family"]
+# The r9 sweep's allow-list: a row the pre-change master refuses that passes on the head. EMPTY; an entry needs a reason.
+RULE4_R9_SWEEP_ALLOWED: dict[str, str] = {}
+
+
+def _rule4_r9_draw_lead(rng: random.Random, arg: str = "take01.dat") -> str:
+    """One random LEAD plus the app call `<app> <arg>` that ends it (r10: lifted out of the r9 fuzz so the tail-axis fuzz draws the same
+    lead axis; with the default `arg` and the same `rng` it draws exactly what r9 drew, call for call)."""
+    words = ("build", "release", "x64", "debug", "nightly", "fresh", "same", "new", "old", "again", "as", "at", "the", "a", "one", "more", "time")
+    apostrophe = ("Layi's", "team's", "build's", "that's", "Layi's")
+    hyphen = ("x64-release", "pwsh-free", "re-built", "one-off", "pre-release", "clip-free")
+    punct = (",", ":", "*", "_", "[", "<", "{", "(", ")")
+    attached = ("again,", "before,", "now:", "build:", "release,", "step:")
+    spaced_paths = ("C:\\Program Files\\MLVApp\\", "D:\\my tools\\bin\\", "C:\\Some Dir\\x64 build\\", "E:\\the build\\out\\")
+    env_paths = ("$env:BIN\\", "%BIN%\\", "~/bin/", "build\\", ".\\", "./", "/usr/local/bin/", "$HOME/bin/", "..\\out\\")
+    verbs = RULE4_R9_VERBS + tuple(v.lower() for v in RULE4_R9_VERBS) + ("Open", "Start", "Then run", "run")
+    openers = ("", "", "Then", "First", "Next", "Finally", "Run:", "Step 1:", "Now:", "Also,")
+    apps = (APP, "MLVApp" + "Release.exe")
+    tokens: list[str] = []
+    for _ in range(rng.randrange(0, 5)):
+        kind = rng.randrange(0, 8)
+        if kind == 0:
+            tokens.append(rng.choice(words))
+        elif kind == 1:
+            tokens.append(rng.choice(apostrophe))
+        elif kind == 2:
+            tokens.append(rng.choice(hyphen))
+        elif kind == 3:
+            tokens.append(rng.choice(punct))
+        elif kind == 4:
+            tokens.append(rng.choice(attached))
+        elif kind == 5:
+            tokens.append("`" + rng.choice(words) + "`")
+        elif kind == 6:
+            q = rng.choice(("'", '"'))
+            tokens.append(q + rng.choice(words) + q)
+        else:
+            tokens.append(rng.choice(words + hyphen))
+    head = rng.choice(openers)
+    verb = rng.choice(verbs) if rng.randrange(0, 5) else ""
+    prefix = rng.choice(("", "", spaced_paths[rng.randrange(0, len(spaced_paths))], env_paths[rng.randrange(0, len(env_paths))]))
+    app = rng.choice(apps)
+    call = f"{prefix}{app} {arg}"
+    shape = rng.randrange(0, 5)
+    if shape == 0:
+        call = f"`{call}`"
+    elif shape == 1:
+        call = f"{prefix}'{app}' {arg}"
+    elif shape == 2:
+        call = f'{prefix}"{app}" {arg}'
+    return " ".join(part for part in (head, verb, *tokens, call) if part)
+
+
+def _rule4_r9_fuzz_rows(seed: int = RULE4_R9_FUZZ_SEED, count: int = RULE4_R9_FUZZ_ROWS) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """-> (unrouted rows, their routed twins). The Prevention of CoS review 6230178238: the LEAD (what stands between a verb, or no verb,
+    or a verbless clause opener, and the app token) is drawn at random, not listed (`_rule4_r9_draw_lead`). Pools: plain words, words
+    with an apostrophe or a hyphen, punctuation (`,` `:` `*` `_` `[` `<` `{` `(`), unquoted spaced paths, environment-variable and
+    relative paths, code spans and quotes. The same seed gives the same rows on every machine (random.Random(int) is a Mersenne Twister)."""
+    rng = random.Random(seed)
+    twins = _rule4_r9_twins()
+    unrouted: list[str] = []
+    routed: list[str] = []
+    seen: set[str] = set()
+    guard = 0
+    while len(unrouted) < count and guard < count * 50:
+        guard += 1
+        lead = _rule4_r9_draw_lead(rng)
+        sep = rng.choice(RULE4_R9_SEPARATORS)
+        twin = rng.choice(twins)
+        row = f"{lead}{sep}{twin}."
+        if row in seen:
+            continue
+        seen.add(row)
+        unrouted.append(row)
+        routed.append(f"{lead} {RULE4_R7_ROUTE}{sep}{twin}.")
+    return tuple(unrouted), tuple(routed)
+
+
+RULE4_R9_FUZZ_REFUSE, RULE4_R9_FUZZ_PASS = _rule4_r9_fuzz_rows()
+
+# r10 (CoS review 6230713095 on 96cdd148, B6 + the soft note + Recurrence 5; hub ruling). A `;` between the app's argument and its
+# playback mode cut the app gap (r2), the sentence then held no direct launch, the app-plus-argument call was never scored and the whole
+# sentence passed (`Run <app> <clip>; add <mode>.`). r10 scores the clip launch whenever the sentence holds a mode flag anywhere. The rows
+# below are the CoS rows plus the TAIL axis: what stands between the app's argument and the mode flag. Every earlier sweep fuzzed the lead
+# (what comes BEFORE the app) and kept the mode flag in the same clause; the tail was never an axis (Recurrence 5: a narrowing's parity
+# sweep fuzzes both sides of the token). Fixtures keep this file's `.dat` clip-name convention.
+RULE4_R9_PR_HEAD = "96cdd148e1a690e0b4dc9382398e76808d0d1bf6"
+RULE4_R10_FUZZ_SEED = 20261018
+RULE4_R10_FUZZ_ROWS = 2400
+PROFILE_MODE = "--profile-" + "playback"
+# the tail templates ({m} the mode flag): the separator and the clause that stands between the app's argument and the mode flag. Tails
+# with `here` are refused whatever the route says and so are never twinned.
+RULE4_R10_TAILS = (
+    ("semicolon", "; add {m}"),
+    ("semicolon-then", "; then add {m}"),
+    ("semicolon-no-space", ";add {m}"),
+    ("semicolon-no-space-then", ";then add {m}"),
+    ("spaced-semicolon", " ; add {m}"),
+    ("spaced-semicolon-bare-mode", " ; {m}"),
+    ("semicolon-bare-mode", "; {m}"),
+    ("later-clause-with-a-verb", "; copy the log, then pass {m}"),
+    ("later-clause-then-a-routed-run", "; add {m}; run the venue chain on Bachelor"),
+    ("negated-later-clause", "; do not pass {m} anywhere, run it on Bachelor"),
+    ("negated-later-clause-use", "; never use {m} locally, run it on Bachelor"),
+)
+RULE4_R10_ARGS = ("take01.dat", "take01.dat --verbose", "--clip=take01.dat", "-v take01.dat", "take01")
+
+
+def _rule4_r10_glued(tail: str) -> bool:
+    """A tail whose `;` has no space after it and is followed by a word that is no locus-preserving one. A route written right before it
+    (`on Bachelor;add ...`) is no venue locus to the lint (the text after a punctuation mark must be the end or a locus-preserving word;
+    `then` is one, so `on Bachelor;then add ...` is a route), on the pin and on every head alike: such a twin refuses everywhere, so it
+    is no ALLOW row (RULE4_R10_GLUED_ROUTE pins that both agree)."""
+    return tail.startswith(";") and tail[1:2].isalpha() and not tail.startswith(";then ")
+
+
+def _rule4_r10_rows() -> dict[str, tuple[str, ...]]:
+    """`named` (the CoS rows, fixtures with `.dat`), `grid` (verb x call x tail x mode), `routed` (the grid rows with the route on the app
+    call itself: must pass), `glued` (the same with a `;` glued to the route: refused by the pin and the head alike), `noarg` (the soft
+    note: the app token with no argument, `;` glued or spaced after it, then a mode: a tightening, the pin passes most of them),
+    `noarg_routed` (the same with a route on the app call)."""
+    app_release = "MLVApp" + "Release.exe"
+    named = (f"Run {app_release} take01.dat; add {SMOKE_MODE}.",
+             f"Run {app_release} take01.dat; use {SMOKE_MODE} here.",
+             f"Start {APP} take01.dat; pass {PROFILE_MODE}.",
+             f"Run {app_release} take01.dat;add {SMOKE_MODE}.",
+             f"Run {app_release} take01.dat ; {PROFILE_MODE}",
+             f"Run C:\\build\\{app_release} take01.dat --verbose; then add {SMOKE_MODE}.",
+             f"Run {app_release} take01.dat; add {SMOKE_MODE}; run the venue chain on Bachelor.",
+             f"Run {app_release} take01.dat; do not pass {SMOKE_MODE} here, run it on Bachelor.")
+    grid: list[str] = []
+    routed: list[str] = []
+    glued: list[str] = []
+    for verb, app, arg, (_, tail), mode in itertools.product(("Run", "Start", "Launch", "Re-run"), (APP, app_release), RULE4_R10_ARGS,
+                                                             RULE4_R10_TAILS, (SMOKE_MODE, PROFILE_MODE)):
+        call = f"{verb} {app} {arg}"
+        grid.append(f"{call}{tail.format(m=mode)}.")
+        (glued if _rule4_r10_glued(tail) else routed).append(f"{call} {RULE4_R7_ROUTE}{tail.format(m=mode)}.")
+    noarg: list[str] = []
+    noarg_routed: list[str] = []
+    # every tail starts with a `;` (glued to the app token: `<app>; add`, `<app>;add`) or a spaced one (`<app> ; add`)
+    for verb, app, (_, tail), mode in itertools.product(("Run", "Start"), (APP, app_release), RULE4_R10_TAILS, (SMOKE_MODE, PROFILE_MODE)):
+        noarg.append(f"{verb} {app}{tail.format(m=mode)}.")
+        if not _rule4_r10_glued(tail):
+            noarg_routed.append(f"{verb} {app} {RULE4_R7_ROUTE}{tail.format(m=mode)}.")
+    # a bare app mention (a build step, no argument) before a ROUTED direct launch is no launch: `$appBare` is scored only in a sentence
+    # with a mode flag and no direct launch, so these keep passing (the pin passes them too). The spaced ` ; run ` form is left out: the
+    # pin refuses it (its gap crossed the `;` and merged the mention with the routed launch) and r2 through r9 pass it, the same r2
+    # narrowing as the three RULE4_R2_B_OPENED rows (named in the PR body).
+    mention: list[str] = []
+    for verb, app, sep, mode in itertools.product(("Build", "Compile", "Copy"), (APP, app_release), ("; then run ", ";run ", "; run "),
+                                                  (SMOKE_MODE, PROFILE_MODE)):
+        mention.append(f"{verb} {app}{sep}C:\\build\\{app_release} take01.dat {mode} {RULE4_R7_ROUTE}.")
+        mention.append(f"{verb} {app}{sep}C:\\build\\{app_release} {mode} {RULE4_R7_ROUTE}.")
+    # prose that lists the app and the flags with a bare ` / ` between them is a mention, not a launch (the catalogue row of
+    # test_green_prompts_that_must_pass, which the first r10 cut refused)
+    for app, mode in itertools.product((APP, app_release), (SMOKE_MODE, PROFILE_MODE)):
+        mention.append(f"Grep for {app} / --seconds / --autoplay / {mode} in every launcher and apply the same oracle.")
+        mention.append(f"Grep for {app} / {mode} in every launcher.")
+    return {"named": named, "grid": tuple(dict.fromkeys(grid)), "routed": tuple(dict.fromkeys(routed)), "glued": tuple(dict.fromkeys(glued)),
+            "noarg": tuple(dict.fromkeys(noarg)), "noarg_routed": tuple(dict.fromkeys(noarg_routed)), "mention": tuple(dict.fromkeys(mention))}
+
+
+_RULE4_R10 = _rule4_r10_rows()
+RULE4_R10_NAMED = _RULE4_R10["named"]
+RULE4_R10_GRID = _RULE4_R10["grid"]
+RULE4_R10_GRID_ROUTED = _RULE4_R10["routed"]
+RULE4_R10_GLUED_ROUTE = _RULE4_R10["glued"]
+RULE4_R10_NOARG = _RULE4_R10["noarg"]
+RULE4_R10_NOARG_ROUTED = _RULE4_R10["noarg_routed"]
+RULE4_R10_MENTION_PASS = _RULE4_R10["mention"]
+RULE4_R10_REFUSE = tuple(dict.fromkeys(RULE4_R10_NAMED + RULE4_R10_GRID + RULE4_R10_NOARG))
+# the rows the differential corpus carries as seeds (the CoS rows and the no-argument form); the grid and the fuzz are judged by the r10 tests
+RULE4_R10_SEEDS = tuple(dict.fromkeys(RULE4_R10_NAMED + RULE4_R10_NOARG))
+# The r10 sweep's allow-list: a row the pin refuses that passes on the head. EMPTY; an entry needs a reason.
+RULE4_R10_SWEEP_ALLOWED: dict[str, str] = {}
+
+
+def _rule4_r10_fuzz_rows(seed: int = RULE4_R10_FUZZ_SEED, count: int = RULE4_R10_FUZZ_ROWS) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """-> (unrouted rows, their routed twins). Recurrence 5 (CoS review 6230713095): the TAIL axis (RULE4_R10_TAILS: `;`, `; then`, `;` with
+    no space, ` ; `, a later clause with a verb, a negated later clause, a later routed run) crossed with the LEAD axis of r9 (the same
+    generator, `_rule4_r9_draw_lead`) and with the app's argument (RULE4_R10_ARGS) and the mode flag. The twin carries the route on the app
+    call itself (none for a tail whose `;` is glued to the route: `_rule4_r10_glued`). The same seed gives the same rows on every machine."""
+    rng = random.Random(seed)
+    unrouted: list[str] = []
+    routed: list[str] = []
+    seen: set[str] = set()
+    guard = 0
+    while len(unrouted) < count and guard < count * 50:
+        guard += 1
+        arg = rng.choice(RULE4_R10_ARGS)
+        lead = _rule4_r9_draw_lead(rng, arg)
+        _, tail = rng.choice(RULE4_R10_TAILS)
+        mode = rng.choice((SMOKE_MODE, PROFILE_MODE))
+        row = f"{lead}{tail.format(m=mode)}."
+        if row in seen:
+            continue
+        seen.add(row)
+        unrouted.append(row)
+        if not _rule4_r10_glued(tail):
+            routed.append(f"{lead} {RULE4_R7_ROUTE}{tail.format(m=mode)}.")
+    return tuple(unrouted), tuple(routed)
+
+
+RULE4_R10_FUZZ_REFUSE, RULE4_R10_FUZZ_PASS = _rule4_r10_fuzz_rows()
+
+# NA2-RULE4-SENTENCE-SPLIT-AND-CODESPAN-APP-1 (the successor card of #465: CoS review 6231429063 soft notes on 318d5bac, and amends (a) and
+# (b) of the #465 r10 keys, ledger 2026-10-17T09:25:22Z). Refuse-only TIGHTENINGS: the pin RULE4_PRE_CHANGE_MASTER passes every RED row
+# below, so none of them is a parity flip.
+#  (1) Sentence split. Rule 4 reads one sentence at a time, so an app call with an argument in one sentence and its playback mode flag in
+#      the next one (`Run <app> <clip>. Add <mode>.`) was never one launch. A mode flag that no app launch of its own sentence holds (an
+#      ORPHAN flag) now reaches the ADJACENT sentences of its block: an app call there is scored as if the flag stood in its own sentence
+#      (the r10 reading), and so is an app token that ends its sentence (`Run <app>. Add <mode>.`, the no-argument twin).
+#  (2) Code span. The app pattern's quote class after `.exe` held ' and " only, so a code span closed right after the token
+#      (``Run `<app>` <mode>.``) passed (amend (a), RULE4-DIRECT-APP-BACKTICK-CLOSE-1). The tracked-script pattern had the same class
+#      (``Run `<script>` -Backend cpu.``) and is fixed with it.
+#  (b) RULE4-SLASH-MENTION-GUARD-ASYMMETRY-1: KEPT FAIL-CLOSED (RULE4_SPLIT_SLASH_GUARDS). Measured: the pin passes those rows and the base
+#      head refuses them (an r9 over-refusal: the clip launch has no separator-slash guard). Keeping them refused is a tightening against
+#      the pin, never a flip; mirroring the guard would be a refuse -> pass loosening against master, which a refuse-only card does not
+#      make. The prose passes once it stands in a sentence of its own (a `mention` row below).
+# Fixtures keep this file's `.dat` clip-name convention.
+RULE4_SPLIT_BASE_HEAD = "40b8e6a4913b6c92071b886c085b17d85e32a8be"  # fork/master this card branched from (#465 merged there)
+RULE4_SPLIT_SEPARATORS = (". ", "! ", "? ", ".\n")
+RULE4_SPLIT_MODE_SENTENCES = ("Add {m}", "Then add {m}", "{m}")
+RULE4_SPLIT_MODE_LEADS = ("Use {m}", "Add {m}")
+RULE4_SPLIT_ARGS = ("take01.dat", "--clip=take01.dat", "take01")
+
+
+def _rule4_split_rows() -> dict[str, tuple[str, ...]]:
+    """`named` (the CoS rows, `.dat` fixtures), `grid` (the app call with an argument, then the orphan mode flag in the next sentence, or the
+    flag first), `noarg` (the same with the app token ending its sentence), `codespan` (the app or script token in a code span closed
+    right after it), each with its routed twins (`*_routed`, must pass), `mention` (controls that must pass), `slash` (amend (b): the
+    slash-list prose in a sentence that also holds a routed launch; the base head refuses it and it stays refused, the pin passes it) and
+    `span_guards` (the mode flag in a code span of its own, refused by the base head already)."""
+    app_release = "MLVApp" + "Release.exe"
+    script = f"tools/profiling/{SMOKE_SCRIPT}"
+    named = (f"Run {app_release} take01.dat. Add {SMOKE_MODE}.",
+             f"Run `{app_release}` {SMOKE_MODE}.",
+             f"Run `C:\\build\\{app_release}` take01.dat {SMOKE_MODE}.",
+             f"Run {app_release}. Add {SMOKE_MODE}.",
+             f"Run `{script}` -Backend cpu.")
+    grid: list[str] = []
+    grid_routed: list[str] = []
+    noarg: list[str] = []
+    noarg_routed: list[str] = []
+    for verb, app, sep, mode in itertools.product(("Run", "Start"), (APP, app_release), RULE4_SPLIT_SEPARATORS, (SMOKE_MODE, PROFILE_MODE)):
+        for arg in RULE4_SPLIT_ARGS:
+            for tail in RULE4_SPLIT_MODE_SENTENCES:
+                grid.append(f"{verb} {app} {arg}{sep}{tail.format(m=mode)}.")
+                grid_routed.append(f"{verb} {app} {arg} {RULE4_R7_ROUTE}{sep}{tail.format(m=mode)}.")
+            for lead in RULE4_SPLIT_MODE_LEADS:
+                grid.append(f"{lead.format(m=mode)}{sep}{verb} {app} {arg}.")
+                grid_routed.append(f"{lead.format(m=mode)}{sep}{verb} {app} {arg} {RULE4_R7_ROUTE}.")
+        for tail in RULE4_SPLIT_MODE_SENTENCES:
+            noarg.append(f"{verb} {app}{sep}{tail.format(m=mode)}.")
+            noarg_routed.append(f"{verb} {app} {RULE4_R7_ROUTE}{sep}{tail.format(m=mode)}.")
+        for lead in RULE4_SPLIT_MODE_LEADS:
+            noarg.append(f"{lead.format(m=mode)}{sep}{verb} {app}.")
+            noarg_routed.append(f"{lead.format(m=mode)}{sep}{verb} {app} {RULE4_R7_ROUTE}.")
+    codespan: list[str] = []
+    codespan_routed: list[str] = []
+    span_guards: list[str] = []
+    for verb, app, mode in itertools.product(("Run", "Start", "Launch"), (APP, app_release, f"C:\\build\\{app_release}"), (SMOKE_MODE, PROFILE_MODE)):
+        for call in (f"`{app}` {mode}", f"`{app}` take01.dat {mode}", f"`{app}` --clip=take01.dat {mode}"):
+            codespan.append(f"{verb} {call}.")
+            codespan_routed.append(f"{verb} {call} {RULE4_R7_ROUTE}.")
+        # the mode flag in a code span of its own: the base head already refuses it (r10, an orphan flag in the app's own sentence)
+        span_guards.append(f"{verb} `{app}` `{mode}`.")
+        # refuse-only: a code-span launch that is the sentence's only direct launch must not switch off the r10 no-argument scoring
+        # (`<app>;` before it), which the base head applies because it saw no direct launch there
+        span_guards.append(f"Build `{app}`; then run `{app_release}` take01.dat {mode} {RULE4_R7_ROUTE}.")
+        span_guards.append(f"Build `{app}` ; then {verb.lower()} `C:\\build\\{app_release}` {mode} {RULE4_R7_ROUTE}.")
+    for verb, call in itertools.product(("Run", "Start"), (f"`{script}` -Backend cpu", f"`.\\{script}` -Backend cuda", f"& `{script}` -Backend cpu")):
+        codespan.append(f"{verb} {call}.")
+        codespan_routed.append(f"{verb} {call} {RULE4_R7_ROUTE}.")
+    mention: list[str] = []
+    for app, sep, mode in itertools.product((APP, app_release), RULE4_SPLIT_SEPARATORS, (SMOKE_MODE, PROFILE_MODE)):
+        # the card's controls: the app across two sentences with no mode flag, and a code span with the app and no mode flag
+        mention.append(f"Read the {app} log{sep}Then copy {app} take01.dat to the run dir.")
+        mention.append(f"Grep for `{app}` in every launcher{sep}Then read the summary.")
+        # the next sentence's flag belongs to a launch of its own (routed), so it is no orphan and the app mention stays a mention
+        mention.append(f"Build {app}{sep}Then run C:\\build\\{app_release} take01.dat {mode} {RULE4_R7_ROUTE}.")
+        mention.append(f"Copy {app} to the share{sep}Then run C:\\build\\{app_release} take01.dat {mode} {RULE4_R7_ROUTE}.")
+        # a separator slash is no argument (the mention path's guard), across a sentence too
+        mention.append(f"Grep for {app} / --seconds in every launcher{sep}Add {mode} to the venue job {RULE4_R7_ROUTE}.")
+        # a heading ends the reach of an orphan flag (a block ends at a heading)
+        mention.append(f"Run {app} take01.dat{sep.rstrip(' ')}\n## Next\nAdd {mode}.")
+        # an app mention after a sentence whose flag a routed launch holds
+        mention.append(f"The venue job runs C:\\build\\{app_release} take01.dat {mode} {RULE4_R7_ROUTE}{sep}{app} writes its log to the run dir.")
+    slash: list[str] = []
+    for app, mode, sep in itertools.product((APP, app_release), (SMOKE_MODE, PROFILE_MODE), (", then run ", "; then run ")):
+        slash.append(f"Grep for {app} / --seconds in every launcher{sep}C:\\build\\{app_release} take01.dat {mode} {RULE4_R7_ROUTE}.")
+        slash.append(f"Grep for {app} / --seconds / --autoplay / {mode} in every launcher{sep}C:\\build\\{app_release} take01.dat {mode} {RULE4_R7_ROUTE}.")
+    sets = {"named": named, "grid": grid, "grid_routed": grid_routed, "noarg": noarg, "noarg_routed": noarg_routed, "codespan": codespan,
+            "codespan_routed": codespan_routed, "mention": mention, "slash": slash, "span_guards": span_guards}
+    return {k: tuple(dict.fromkeys(v)) for k, v in sets.items()}
+
+
+_RULE4_SPLIT = _rule4_split_rows()
+RULE4_SPLIT_NAMED = _RULE4_SPLIT["named"]
+RULE4_SPLIT_GRID = _RULE4_SPLIT["grid"]
+RULE4_SPLIT_NOARG = _RULE4_SPLIT["noarg"]
+RULE4_SPLIT_CODESPAN = _RULE4_SPLIT["codespan"]
+RULE4_SPLIT_REFUSE = tuple(dict.fromkeys(RULE4_SPLIT_NAMED + RULE4_SPLIT_GRID + RULE4_SPLIT_NOARG + RULE4_SPLIT_CODESPAN))
+RULE4_SPLIT_PASS = tuple(dict.fromkeys(_RULE4_SPLIT["grid_routed"] + _RULE4_SPLIT["noarg_routed"] + _RULE4_SPLIT["codespan_routed"]
+                                       + _RULE4_SPLIT["mention"]))
+# amend (b), kept fail-closed: the pin passes them, the base head and this head refuse them (pinned in the sweep): no RED rows, no flip
+RULE4_SPLIT_SLASH_GUARDS = _RULE4_SPLIT["slash"]
+# the double code span (`<app>` `<mode>`): refused by the base head already, so no RED row; pinned so the fix keeps it refused
+RULE4_SPLIT_SPAN_GUARDS = _RULE4_SPLIT["span_guards"]
+# the rows the differential corpus carries as seeds (the CoS rows); the grid is judged by the split tests
+RULE4_SPLIT_SEEDS = RULE4_SPLIT_NAMED
+
+# r9 quote-class pin (CoS review 6230178238, Prevention; the B4 root cause). In a PowerShell double-quoted string a backtick escapes the NEXT
+# character, so `"['`"]"` silently evaluates to `['"]`: the class the author meant to hold a backtick does not. A comment can claim a
+# quote set the pattern does not hold, and a test on rows only sees it when a row happens to use that character. This reads the EVALUATED
+# strings: the lint is parsed (PowerShell AST), the assignments of the named pattern variables are evaluated in source order, and every
+# regex character class that holds a quote character is compared with the set its comment claims. A class that lost a character, or a
+# pattern that lost a class, fails. (names -> (the quote characters every quote-bearing class must hold, the least number of such classes))
+RULE4_QUOTE_CLAIMS: dict[str, tuple[tuple[str, ...], int]] = {
+    # r8: a backtick opens or closes an app token like a quote does (a markdown code span)
+    "appStop": (("'", '"', "`"), 2),
+    "clipLaunch": (("'", '"', "`"), 5),
+    # r10: the app token with no argument and a `;` after it opens or closes like the other app tokens (a markdown code span)
+    "appBare": (("'", '"', "`"), 1),
+    "clipMention": (("'", '"', "`"), 5),
+    # the pwsh token is quoted with ' or " only (r4 comment); the pwsh gap never claimed a backtick
+    "pwshStop": (("'", '"'), 2),
+    # a quotation of the incident wording opens with any of the three
+    "incident": (("'", '"', "`"), 1),
+    # NA2-RULE4-SENTENCE-SPLIT-AND-CODESPAN-APP-1 (amend (a)): the app token and the tracked-script token close like the other app tokens
+    # (a markdown code span). The app pattern's own class, the two of appStop inside its gap, and the script pattern's class.
+    "direct": (("'", '"', "`"), 4),
+    # the app token that ends its sentence (the no-argument twin across a sentence) closes the same way
+    "appEnd": (("'", '"', "`"), 1),
+}
+# the r8 lead pieces (d30d1365); r9 deleted them with the lead lookbehind, the RED/GREEN proof below still reads them at that head
+RULE4_QUOTE_CLAIMS_R8 = {**{k: v for k, v in RULE4_QUOTE_CLAIMS.items() if k not in ("appBare", "clipMention", "direct", "appEnd")}, "leadOpen": (("'", '"', "`"), 1), "leadWords": (("'", '"', "`"), 2), "leadPath": (("'", '"', "`"), 1)}
+# A deliberate single backtick before a bracket or an apostrophe inside a double-quoted pattern string must be named here with its
+# reason (none today; the `"` delimiter escape is the one legitimate single backtick and is covered by the evaluated check).
+RULE4_BACKTICK_ESCAPES: dict[str, str] = {}
+_QUOTE_PIECES = ("appStop", "appArg", "leadOpen", "leadWords", "leadPath")
+_QUOTE_PROBE = r"""param([string]$Lint, [string]$Names, [string]$Out)
+$errs = $null; $toks = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($Lint, [ref]$toks, [ref]$errs)
+$want = @($Names -split ',')
+$assigns = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left -is [System.Management.Automation.Language.VariableExpressionAst] -and ($want -contains $n.Left.VariablePath.UserPath) }, $true) | Sort-Object { $_.Extent.StartOffset })
+$verbs = 'run|open'; $b = '(?<![\w\-])'; $e = '(?![\w\-])'; $scripts = '(stub)\.ps1'
+foreach ($a in $assigns) { Invoke-Expression $a.Extent.Text }
+$values = @{}
+foreach ($n in $want) { $v = Get-Variable -Name $n -ValueOnly -ErrorAction SilentlyContinue; if ($null -ne $v) { $values[$n] = @($v | ForEach-Object { [string]$_ }) } }
+$dq = @($ast.FindAll({ param($n) ($n -is [System.Management.Automation.Language.StringConstantExpressionAst] -or $n -is [System.Management.Automation.Language.ExpandableStringExpressionAst]) -and $n.StringConstantType -eq 'DoubleQuoted' }, $true) | ForEach-Object { $_.Extent.Text })
+[System.IO.File]::WriteAllText($Out, (ConvertTo-Json -InputObject @{ values = $values; dq = $dq } -Compress -Depth 5), (New-Object System.Text.UTF8Encoding($false)))
+"""
+
+
+def _regex_classes(pattern: str) -> list[str]:
+    """The bodies of the regex character classes of `pattern` (an escaped bracket is no class)."""
+    classes: list[str] = []
+    i = 0
+    while i < len(pattern):
+        if pattern[i] == "\\":
+            i += 2
+        elif pattern[i] == "[":
+            j = i + 1
+            if j < len(pattern) and pattern[j] == "^":
+                j += 1
+            while j < len(pattern) and pattern[j] != "]":
+                j += 2 if pattern[j] == "\\" else 1
+            classes.append(pattern[i + 1:j])
+            i = j + 1
+        else:
+            i += 1
+    return classes
+
+
+def _single_backticks_before_bracket_or_quote(literal: str) -> list[str]:
+    """In the source of a double-quoted PowerShell string: every SINGLE backtick (not part of a doubled one) directly before `[`, `]`,
+    `(`, `)` or `'`, as the two-character sequence found. (A backtick before `"` is the delimiter escape and is not read here.)"""
+    found: list[str] = []
+    i = 0
+    while i < len(literal) - 1:
+        if literal[i] == "`":
+            if literal[i + 1] in "[]()'":
+                found.append(literal[i:i + 2])
+            i += 2
+        else:
+            i += 1
+    return found
+
+
+def _lint_pattern_probe(lint: Path, names: tuple[str, ...], work: Path, tag: str) -> dict:
+    """{'values': {name: [evaluated strings]}, 'dq': [source of every double-quoted literal]} of the lint at `lint`."""
+    probe = work / f"{tag}-quote-probe.ps1"
+    out = work / f"{tag}-quote-out.json"
+    _write_probe(probe, _QUOTE_PROBE)
+    # the pieces a composite pattern interpolates are evaluated too (in source order), or its value would hold an empty string for them
+    wanted = tuple(dict.fromkeys(names + _QUOTE_PIECES))
+    done = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(probe), "-Lint", str(lint), "-Names", ",".join(wanted), "-Out", str(out)],
+                          capture_output=True, text=True, timeout=120)
+    if done.returncode != 0 or not out.exists():
+        raise AssertionError(f"the quote-class probe failed: {(done.stderr or done.stdout).strip()[:300]}")
+    return json.loads(out.read_text(encoding="utf-8"))
+
+
+def _quote_class_problems(lint: Path, claims: dict, work: Path, tag: str) -> list[str]:
+    """Every way the evaluated patterns of `lint` differ from what their comments claim (empty = they hold every claimed quote character)."""
+    data = _lint_pattern_probe(lint, tuple(claims), work, tag)["values"]
+    problems: list[str] = []
+    for name, (chars, least) in claims.items():
+        if name not in data:
+            problems.append(f"{name}: no assignment found")
+            continue
+        bearing = [c for value in data[name] for c in _regex_classes(value) if "'" in c or '"' in c]
+        if len(bearing) < least:
+            problems.append(f"{name}: {len(bearing)} quote class(es), at least {least} expected")
+        for c in bearing:
+            held = tuple(q for q in ("'", '"', "`") if q in c)
+            if held != tuple(sorted(chars, key=("'", '"', "`").index)):
+                problems.append(f"{name}: class [{c}] claims {chars!r} but holds {held!r}")
+    return problems
+
+
+# r14c (NA2-RULE4-PER-LAUNCHER-SCOPE-1, sol r12d on PR #465): the r11 regex cache built a case-insensitive Regex once, under the culture of whatever
+# call warmed it, and .NET fixes a Regex's case table at CONSTRUCTION. A process warmed under tr-TR then ALLOWED under en-US the sentences dc124533
+# (which built the pattern under each call's own culture) refused. These helpers run the lint through a sequence of cultures in ONE process.
+def _culture_sequence_counts(lint: Path, texts: list[str], sequence: tuple[str, ...], work: Path, tag: str) -> list[list[int]]:
+    """Finding counts of every text, one list per culture in `sequence`; ONE pwsh dot-sources `lint` and visits the cultures in order, so the
+    regexes the first culture built are the ones every later culture uses. 'invariant' is the invariant culture."""
+    src = work / f"{tag}-in.json"
+    src.write_text(json.dumps(texts), encoding="utf-8")
+    probe = work / f"{tag}-probe.ps1"
+    _write_probe(
+        probe,
+        ". " + _psq(lint) + "\n"
+        "$texts = @(ConvertFrom-Json -InputObject ([System.IO.File]::ReadAllText(" + _psq(src) + ", [System.Text.Encoding]::UTF8)))\n"
+        "$steps = New-Object System.Collections.Generic.List[string]\n"
+        "foreach ($name in @(" + ", ".join(_psq(c) for c in sequence) + ")) {\n"
+        "    if ($name -eq 'invariant') { [System.Globalization.CultureInfo]::CurrentCulture = [System.Globalization.CultureInfo]::InvariantCulture }\n"
+        "    else { [System.Globalization.CultureInfo]::CurrentCulture = [System.Globalization.CultureInfo]::GetCultureInfo($name) }\n"
+        "    $row = New-Object System.Collections.Generic.List[int]\n"
+        "    foreach ($t in $texts) { $row.Add(@(Get-LocalPlaybackPromptFindings -Text ([string]$t)).Count) }\n"
+        "    $steps.Add('[' + ($row.ToArray() -join ',') + ']')\n"
+        "}\n"
+        "'[' + ($steps.ToArray() -join ',') + ']'\n",
+    )
+    done = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(probe)], capture_output=True, text=True, encoding="utf-8", timeout=600)
+    if done.returncode != 0 or not done.stdout.strip():
+        raise AssertionError(f"the culture-sequence probe failed: {(done.stderr or done.stdout).strip()[:300]}")
+    steps = json.loads(done.stdout.strip())
+    return [[int(n) for n in step] for step in steps]
+
+
+# What may build a Regex in the lint: New-LintRegex and nothing else. A static [regex]::Match / IsMatch goes through .NET's shared cache under
+# the CURRENT culture, `New-Object ...Regex` and a [regex] cast construct one under it, so each would bring the culture dependence back.
+_REGEX_BUILD = re.compile(r"\[regex\]::(?:new|match|matches|ismatch|replace|split)\b|New-Object\s+(?:System\.Text\.RegularExpressions\.)?Regex\b"
+                          r"|\[regex\]\s*['\"(]|=\s*\[regex\]|-as\s+\[regex\]|\bRegexOptions\b", re.IGNORECASE)  # a `[regex]$Grammar` PARAMETER takes an object already built
+
+
+def _regex_construction_problems(text: str) -> list[str]:
+    """Every way `text` (the lint source) builds a Regex outside New-LintRegex, or builds it there without the en-US culture."""
+    start = text.find("function New-LintRegex")
+    if start < 0:
+        return ["no function New-LintRegex: the cached Regex objects are built under whatever culture warms them"]
+    end = text.index("\n}\n", start) + 3
+    problems = []
+    if "GetCultureInfo('en-US')" not in text:
+        problems.append("the lint never resolves the en-US culture New-LintRegex builds under")
+    body = text[start:end]
+    if "CurrentCulture = $script:LintBuildCulture" not in body or "finally" not in body:
+        problems.append("New-LintRegex does not set the build culture and restore the caller's in a finally block")
+    outside = text[:start] + text[end:]
+    problems += [f"a Regex is built outside New-LintRegex: {ln.strip()[:100]}" for ln in outside.splitlines()
+                 if not ln.lstrip().startswith("#") and _REGEX_BUILD.search(ln)]
+    return problems
 
 
 class HubHostsFileTests(unittest.TestCase):
@@ -1782,6 +2891,517 @@ class PromptLintTests(unittest.TestCase):
         counts = _json_counts(LINT_PS1, rows, self.tmp, "r13-pass")
         self.assertEqual([], [t for t, n in zip(rows, counts) if n > 0], "r13 rows the lint refused that it must pass")
 
+    def test_red_rule4_a_second_unrouted_launcher_is_refused_after_every_separator(self):
+        """NA2-RULE4-PER-LAUNCHER-SCOPE-1: a venue locus exempts only the launcher it routes. The CoS repro lines (ask 6216180502) are
+        the first two rows; the rest is separator x second-launcher shape x backend x launcher form x route. The guards (a separate
+        sentence, an unrouted FIRST launcher) were refused before this change and must stay refused."""
+        script = f"tools/profiling/{SMOKE_SCRIPT}"
+        first = f"The venue job calls {script} -Backend cpu on Bachelor"
+        for line in (f"{first}; then run {script} -Backend cpu.", f"{first}; {script} -Backend cuda."):
+            self.assertIn(line, RULE4_SECOND_LAUNCHER_REFUSE)
+        for line in (f"Run {script} -Backend cpu.", f"{first}. Then run {script} -Backend cpu."):
+            self.assertIn(line, RULE4_SECOND_LAUNCHER_GUARDS)
+        for sep in ("; ", ", then ", ". Then ", " then "):  # each separator of the card, with a second launcher on both backends
+            for backend in RULE4_BACKENDS:
+                self.assertTrue(any(sep in t and f"-Backend {backend}." in t for t in RULE4_SECOND_LAUNCHER_REFUSE + RULE4_SECOND_LAUNCHER_GUARDS),
+                                f"no row for separator {sep!r} with backend {backend}")
+        rows = list(RULE4_SECOND_LAUNCHER_REFUSE + RULE4_SECOND_LAUNCHER_GUARDS)
+        counts = _json_counts(LINT_PS1, rows, self.tmp, "rule4-refuse")
+        self.assertEqual([], [t for t, n in zip(rows, counts) if n == 0], "rule-4 second-launcher rows the lint passed that it must refuse")
+
+    def test_green_rule4_both_launchers_venue_routed_pass(self):
+        rows = list(RULE4_BOTH_ROUTED_PASS)
+        counts = _json_counts(LINT_PS1, rows, self.tmp, "rule4-pass")
+        self.assertEqual([], [t for t, n in zip(rows, counts) if n > 0], "rule-4 rows with both launchers routed that the lint refused")
+
+    def test_red_rule4_r2_a_launcher_never_reaches_across_a_clause_into_the_next_launcher(self):
+        """r2 (CoS review of 75cb00e1): the two CoS repro lines, every cross-clause variant after every separator (` or ` included), the
+        route that belongs to launcher B only, and the mixed-style pairs are refused."""
+        cos = f"tools/profiling/{SMOKE_SCRIPT}"
+        for line in (f"pwsh -File build.ps1 on Bachelor; pwsh -File {cos} -Backend cpu.",
+                     f"{APP} take01.dat on Bachelor; then run {APP} take01.dat {SMOKE_MODE}."):
+            self.assertIn(line, RULE4_R2_CROSS_RED)
+        self.assertTrue(any(" or run " in t for t in RULE4_R2_CROSS_REFUSE + RULE4_R2_OR_REFUSE + RULE4_R2_MIXED_REFUSE), "no ` or ` separator row")
+        rows = list(RULE4_R2_REFUSE + RULE4_R2_GUARDS)
+        counts = _json_counts(LINT_PS1, rows, self.tmp, "rule4-r2-refuse")
+        self.assertEqual([], [t for t, n in zip(rows, counts) if n == 0], "r2 rows the lint passed that it must refuse")
+
+    def test_green_rule4_r2_routed_launchers_pass(self):
+        """r2: every launcher routed (cross-clause, ` or `, single-launcher clauses, route on B with a non-launcher A, mixed styles)."""
+        rows = list(RULE4_R2_PASS)
+        counts = _json_counts(LINT_PS1, rows, self.tmp, "rule4-r2-pass")
+        self.assertEqual([], [t for t, n in zip(rows, counts) if n > 0], "r2 rows with every launcher routed that the lint refused")
+
+    def test_rule4_r2_the_cross_clause_rows_are_red_on_the_r1_head_and_every_other_row_keeps_its_r1_verdict(self):
+        """RED proof kept in the suite: the CoS repro shapes (RULE4_R2_CROSS_RED) PASS on the lint of the r1 head 75cb00e1. Nothing else
+        moves against it except the listed opening: a route on launcher B whose lead A is NOT a launcher (RULE4_R2_B_PASS) was refused
+        at the r1 head (the span swallowed B and took A's clause) and passes now. The r1 sets keep their 98 / 196 rows and verdicts."""
+        self.maxDiff = None
+        r1 = _rule4_r1_head_lint()
+        (self.tmp / "rule4-r1-head.ps1").write_text(r1[1], encoding="utf-8")
+        self.assertEqual((98, 196), (len(RULE4_SECOND_LAUNCHER_REFUSE), len(RULE4_BOTH_ROUTED_PASS)))
+        red = list(RULE4_R2_CROSS_RED)
+        refuse_rows = list(RULE4_R2_REFUSE + RULE4_R2_GUARDS + RULE4_SECOND_LAUNCHER_REFUSE + RULE4_SECOND_LAUNCHER_GUARDS)
+        pass_rows = list(RULE4_R2_PASS + RULE4_BOTH_ROUTED_PASS)
+        texts = refuse_rows + pass_rows
+        # one pass over every row on each lint, both lints at once (the RED rows are among the refuse rows, so they cost nothing extra)
+        _prefetch_counts(self.tmp, [(self.tmp / "rule4-r1-head.ps1", red + texts, "rule4-r2-r1head"), (LINT_PS1, texts, "rule4-r2-now")])
+        counts = _json_counts(self.tmp / "rule4-r1-head.ps1", red, self.tmp, "rule4-r2-red")
+        self.assertEqual([], [t for t, n in zip(red, counts) if n > 0], f"rows {r1[0]} already refuses: not a RED row")
+        old = _json_counts(self.tmp / "rule4-r1-head.ps1", texts, self.tmp, "rule4-r2-r1head")
+        new = _json_counts(LINT_PS1, texts, self.tmp, "rule4-r2-now")
+        closed = [t for t, a, b in zip(texts, old, new) if a == 0 and b > 0]
+        opened = [t for t, a, b in zip(texts, old, new) if a > 0 and b == 0]
+        self.assertEqual([], [t for t in closed if t not in RULE4_R2_REFUSE], f"a row {r1[0]} passed that is not a listed r2 closure")
+        self.assertEqual([], [t for t in red if t not in closed], "every RED row must close")
+        # r4 (CoS / Iverson Improvement on 4b9c9387): the opening is pinned to its exact rows, not to a non-empty subset of B_PASS
+        self.assertEqual(sorted(RULE4_R2_B_OPENED), sorted(opened), "the route-on-B rows must be exactly the over-refusal r2 removed")
+        self.assertEqual(3, len(RULE4_R2_B_OPENED))
+
+    def test_red_rule4_r4_quoted_calls_and_path_arguments_refuse(self):
+        """r4: sol's quoted second launcher after every separator, the quoted app call, and Iverson's path-argument rows refuse."""
+        script = f"tools/profiling/{SMOKE_SCRIPT}"
+        first = f"The venue job calls {script} -Backend cpu on Bachelor"
+        for sep in ("; ", ", then ", " then ", ". Then ", "\n"):
+            self.assertIn(f"{first}{sep}& '{script}' -Backend cuda.", RULE4_R4_RED)
+        rows = list(RULE4_R4_REFUSE)
+        counts = _json_counts(LINT_PS1, rows, self.tmp, "rule4-r4-refuse")
+        self.assertEqual([], [t for t, n in zip(rows, counts) if n == 0], "r4 rows the lint passed that it must refuse")
+
+    def test_green_rule4_r4_routed_quoted_calls_and_path_arguments_pass(self):
+        rows = list(RULE4_R4_PASS)
+        counts = _json_counts(LINT_PS1, rows, self.tmp, "rule4-r4-pass")
+        self.assertEqual([], [t for t, n in zip(rows, counts) if n > 0], "r4 rows with every launcher routed that the lint refused")
+
+    def test_rule4_r4_rows_are_red_on_the_r3_head_and_every_earlier_row_keeps_its_verdict(self):
+        """RED proof kept in the suite: every RULE4_R4_RED row PASSES on the lint of the r3 head 4b9c9387 (and every guard is refused
+        there). Against that head nothing else moves: every r1 / r2 row keeps its verdict."""
+        self.maxDiff = None
+        r3 = _rule4_r1_head_lint(RULE4_R3_PR_HEAD, "r3")
+        (self.tmp / "rule4-r3-head.ps1").write_text(r3[1], encoding="utf-8")
+        earlier = list(dict.fromkeys(RULE4_R2_REFUSE + RULE4_R2_GUARDS + RULE4_SECOND_LAUNCHER_REFUSE + RULE4_SECOND_LAUNCHER_GUARDS
+                                     + RULE4_R2_PASS + RULE4_BOTH_ROUTED_PASS))
+        mine = list(RULE4_R4_REFUSE + RULE4_R4_PASS)
+        _prefetch_counts(self.tmp, [(self.tmp / "rule4-r3-head.ps1", earlier + mine, "rule4-r4-r3head"), (LINT_PS1, earlier + mine, "rule4-r4-now")])
+        old = dict(zip(earlier + mine, _verdicts(self.tmp / "rule4-r3-head.ps1", earlier + mine)))
+        new = dict(zip(earlier + mine, _verdicts(LINT_PS1, earlier + mine)))
+        self.assertEqual([], [t for t in RULE4_R4_RED if old[t] > 0], f"rows {r3[0]} already refuses: not a RED row")
+        self.assertEqual([], [t for t in RULE4_R4_GUARDS if old[t] == 0], f"guard rows {r3[0]} passes: they belong in the RED rows")
+        self.assertEqual([], [t for t in earlier if (old[t] > 0) != (new[t] > 0)], f"an r1 / r2 row changed its verdict against {r3[0]}")
+
+    def test_red_rule4_r6_a_clip_after_an_option_or_a_quoted_spaced_path_is_a_launch_of_its_own(self):
+        """r6: the CoS rows (B1, Improvement 1, B2) and the clip-argument axis (option forms, no extension, quoted with and without a space,
+        as the first and as the second launcher, after every separator) refuse; the same rows with their own route pass."""
+        for row in RULE4_R6_NAMED:
+            self.assertIn(row, RULE4_R6_REFUSE)
+        self.assertEqual(10, len(RULE4_R6_NAMED))
+        self.assertTrue(any("'D:\\my clips" in t for t in RULE4_R6_RED) and any('"D:\\my clips' in t for t in RULE4_R6_RED), "the quoted-with-space axis rows")
+        rows = list(RULE4_R6_REFUSE)
+        counts = _json_counts(LINT_PS1, rows, self.tmp, "rule4-r6-refuse")
+        self.assertEqual([], [t for t, n in zip(rows, counts) if n == 0], "r6 rows the lint passed that it must refuse")
+        rows = list(RULE4_R6_PASS)
+        counts = _json_counts(LINT_PS1, rows, self.tmp, "rule4-r6-pass")
+        self.assertEqual([], [t for t, n in zip(rows, counts) if n > 0], "r6 rows with every launcher routed that the lint refused")
+
+    def test_rule4_r6_rows_are_red_on_the_r4b_head_and_every_earlier_row_keeps_its_verdict(self):
+        """RED proof kept in the suite: every RULE4_R6_RED row PASSES on the lint of the r4b head 469e513d (and every guard is refused
+        there). Against that head nothing else moves: every earlier rule-4 row keeps its verdict."""
+        self.maxDiff = None
+        r4b = _rule4_r1_head_lint(RULE4_R4B_PR_HEAD, "r4b")
+        (self.tmp / "rule4-r4b-head.ps1").write_text(r4b[1], encoding="utf-8")
+        earlier = list(dict.fromkeys(RULE4_R2_REFUSE + RULE4_R2_GUARDS + RULE4_SECOND_LAUNCHER_REFUSE + RULE4_SECOND_LAUNCHER_GUARDS
+                                     + RULE4_R2_PASS + RULE4_BOTH_ROUTED_PASS + RULE4_R4_REFUSE + RULE4_R4_PASS))
+        mine = list(RULE4_R6_REFUSE + RULE4_R6_PASS)
+        _prefetch_counts(self.tmp, [(self.tmp / "rule4-r4b-head.ps1", earlier + mine, "rule4-r6-r4bhead"), (LINT_PS1, earlier + mine, "rule4-r6-now")])
+        old = dict(zip(earlier + mine, _verdicts(self.tmp / "rule4-r4b-head.ps1", earlier + mine)))
+        new = dict(zip(earlier + mine, _verdicts(LINT_PS1, earlier + mine)))
+        self.assertEqual([], [t for t in RULE4_R6_RED if old[t] > 0], f"rows {r4b[0]} already refuses: not a RED row")
+        self.assertEqual([], [t for t in RULE4_R6_GUARDS if old[t] == 0], f"guard rows {r4b[0]} passes: they belong in the RED rows")
+        self.assertEqual([], [t for t in RULE4_R6_PASS if old[t] > 0], f"routed rows {r4b[0]} refuses: the ALLOW rows must be unchanged")
+        self.assertEqual([], [t for t in earlier if (old[t] > 0) != (new[t] > 0)], f"an earlier rule-4 row changed its verdict against {r4b[0]}")
+
+    def test_red_rule4_r7_any_first_argument_after_the_app_is_a_launch_of_its_own(self):
+        """r7: the CoS rows (B3 with its `; run` / `, then run` twins, N1) and the generated argument-grammar sweep (attached `=` values,
+        `/` options, bare tokens, numbers, quoted values, option chains of 1-8, first and second launcher, every separator and launcher
+        twin) refuse without a route of their own; the same rows with their own route pass."""
+        self.assertEqual(13, len(RULE4_R7_NAMED))
+        self.assertEqual(12, len(RULE4_R7_NAMED_B3))
+        for row in RULE4_R7_NAMED:
+            self.assertIn(row, RULE4_R7_REFUSE)
+        args = _rule4_r7_args()
+        self.assertTrue(any("=" in a for a in args) and any(a.startswith("/") for a in args) and "take01" in args, "the B3 argument forms")
+        self.assertTrue(any(a.count("--o") == 8 for a in args), "the option chain of eight")
+        self.assertEqual((913, 912), (len(RULE4_R7_REFUSE), len(RULE4_R7_PASS)))
+        rows = list(RULE4_R7_REFUSE)
+        counts = _json_counts(LINT_PS1, rows, self.tmp, "rule4-r7-refuse")
+        self.assertEqual([], [t for t, n in zip(rows, counts) if n == 0], "r7 rows the lint passed that it must refuse")
+        rows = list(RULE4_R7_PASS)
+        counts = _json_counts(LINT_PS1, rows, self.tmp, "rule4-r7-pass")
+        self.assertEqual([], [t for t, n in zip(rows, counts) if n > 0], "r7 rows with every launcher routed that the lint refused")
+
+    def test_rule4_r7_sweep_no_row_the_pre_change_master_refuses_passes_on_the_head(self):
+        """The Prevention check: the rows are GENERATED from an argument grammar and judged against the pinned pre-change master, not against
+        a list of shapes. No row that RULE4_PRE_CHANGE_MASTER refuses may pass on the head unless RULE4_R7_SWEEP_ALLOWED names it (it is
+        empty). It does not skip once master carries this lint: the property stays true after the merge."""
+        self.maxDiff = None
+        pin = _rule4_r1_head_lint(RULE4_PRE_CHANGE_MASTER, "pre-change master", moot_once_master_carries_it=False)
+        (self.tmp / "rule4-r7-pin.ps1").write_text(pin[1], encoding="utf-8")
+        texts = list(RULE4_R7_REFUSE + RULE4_R7_PASS)
+        _prefetch_counts(self.tmp, [(self.tmp / "rule4-r7-pin.ps1", texts, "rule4-r7-pin"), (LINT_PS1, texts, "rule4-r7-now")])
+        old = dict(zip(texts, _verdicts(self.tmp / "rule4-r7-pin.ps1", texts)))
+        new = dict(zip(texts, _verdicts(LINT_PS1, texts)))
+        opened = [t for t in texts if old[t] > 0 and new[t] == 0 and t not in RULE4_R7_SWEEP_ALLOWED]
+        self.assertEqual([], opened, f"rows {pin[0]} refuses that now pass: an unlisted refuse -> pass flip of the argument grammar")
+        self.assertEqual([], [t for t, why in RULE4_R7_SWEEP_ALLOWED.items() if not why.strip()], "a sweep allow-list entry has no reason")
+        self.assertEqual([], [t for t in RULE4_R7_PASS if old[t] > 0], f"routed rows {pin[0]} refuses: the ALLOW rows must be unchanged")
+        # the B3 rows are the ones the pin refuses and a list-based head would pass: they are in the sweep, so the sweep covers them
+        for row in RULE4_R7_NAMED_B3:
+            self.assertGreater(old[row], 0, f"{pin[0]} passes the B3 row: it is not a refuse -> pass flip")
+
+    def test_rule4_r7_rows_are_red_on_the_r6_head_and_every_earlier_row_keeps_its_verdict(self):
+        """RED proof kept in the suite: the four B3 rows (and their twins) and N1 PASS on the lint of the r6 head 0fb1eb8c, and so do other
+        sweep rows (option chains past six, attached values, `/` options, bare tokens). Against that head nothing else moves: the routed
+        rows keep passing and every earlier rule-4 row keeps its verdict."""
+        self.maxDiff = None
+        r6 = _rule4_r1_head_lint(RULE4_R6_PR_HEAD, "r6")
+        (self.tmp / "rule4-r6-head.ps1").write_text(r6[1], encoding="utf-8")
+        earlier = list(dict.fromkeys(RULE4_R2_REFUSE + RULE4_R2_GUARDS + RULE4_SECOND_LAUNCHER_REFUSE + RULE4_SECOND_LAUNCHER_GUARDS
+                                     + RULE4_R2_PASS + RULE4_BOTH_ROUTED_PASS + RULE4_R4_REFUSE + RULE4_R4_PASS + RULE4_R6_REFUSE + RULE4_R6_PASS))
+        mine = list(RULE4_R7_REFUSE + RULE4_R7_PASS)
+        _prefetch_counts(self.tmp, [(self.tmp / "rule4-r6-head.ps1", earlier + mine, "rule4-r7-r6head"), (LINT_PS1, earlier + mine, "rule4-r7-r6now")])
+        old = dict(zip(earlier + mine, _verdicts(self.tmp / "rule4-r6-head.ps1", earlier + mine)))
+        new = dict(zip(earlier + mine, _verdicts(LINT_PS1, earlier + mine)))
+        for row in RULE4_R7_NAMED:
+            self.assertEqual(0, old[row], f"{r6[0]} already refuses a CoS row: not a RED row")
+        red = [t for t in RULE4_R7_REFUSE if old[t] == 0]
+        self.assertGreater(len(red), len(RULE4_R7_NAMED), "the sweep reaches past the named rows")
+        self.assertTrue(any("--o7" in t for t in red) and any("=take01" in t or "=D:" in t for t in red) and any("/clip" in t for t in red), "the N2 / B3 argument forms are RED")
+        self.assertEqual([], [t for t in RULE4_R7_PASS if old[t] > 0], f"routed rows {r6[0]} refuses: the ALLOW rows must be unchanged")
+        self.assertEqual([], [t for t in earlier if (old[t] > 0) != (new[t] > 0)], f"an earlier rule-4 row changed its verdict against {r6[0]}")
+
+    def test_red_rule4_r8_the_lead_of_a_launch_is_any_run_of_openers_and_plain_words(self):
+        """r8: the opus rows (a markdown code span, `Re-run`, a word between the verb and the app; each with its `; run` / `, then run`
+        twins) and the generated lead-wrapper x verb-form sweep refuse without a route of their own; the same rows with their own route
+        pass. The accepted over-refusal (a harmless second call after a routed launch) refuses."""
+        self.assertEqual(12, len(RULE4_R8_NAMED))
+        for row in RULE4_R8_NAMED:
+            self.assertIn(row, RULE4_R8_REFUSE)
+        self.assertTrue(any("`" in t for t in RULE4_R8_NAMED) and any(t.startswith("Re-run ") for t in RULE4_R8_NAMED)
+                        and any(t.startswith("Run the ") for t in RULE4_R8_NAMED), "the opus row shapes")
+        self.assertEqual({"Run", "run", "Open", "open", "Launch", "Start", "Re-run", "Then run"}, set(RULE4_R8_VERBS))
+        rows = list(RULE4_R8_REFUSE + RULE4_R8_OVERREFUSAL)
+        counts = _json_counts(LINT_PS1, rows, self.tmp, "rule4-r8-refuse")
+        self.assertEqual([], [t for t, n in zip(rows, counts) if n == 0], "r8 rows the lint passed that it must refuse")
+        rows = list(RULE4_R8_PASS)
+        counts = _json_counts(LINT_PS1, rows, self.tmp, "rule4-r8-pass")
+        self.assertEqual([], [t for t, n in zip(rows, counts) if n > 0], "r8 rows with every launcher routed that the lint refused")
+
+    def test_rule4_r8_sweep_no_row_the_pre_change_master_refuses_passes_on_the_head(self):
+        """The r8 Prevention check: the lead-wrapper x verb-form rows are GENERATED and judged against the pinned pre-change master. No row
+        it refuses may pass on the head unless RULE4_R8_SWEEP_ALLOWED names it (empty). It does not skip once master carries this lint."""
+        self.maxDiff = None
+        pin = _rule4_r1_head_lint(RULE4_PRE_CHANGE_MASTER, "pre-change master", moot_once_master_carries_it=False)
+        (self.tmp / "rule4-r8-pin.ps1").write_text(pin[1], encoding="utf-8")
+        texts = list(RULE4_R8_REFUSE + RULE4_R8_PASS + RULE4_R8_OVERREFUSAL)
+        _prefetch_counts(self.tmp, [(self.tmp / "rule4-r8-pin.ps1", texts, "rule4-r8-pin"), (LINT_PS1, texts, "rule4-r8-now")])
+        old = dict(zip(texts, _verdicts(self.tmp / "rule4-r8-pin.ps1", texts)))
+        new = dict(zip(texts, _verdicts(LINT_PS1, texts)))
+        opened = [t for t in texts if old[t] > 0 and new[t] == 0 and t not in RULE4_R8_SWEEP_ALLOWED]
+        self.assertEqual([], opened, f"rows {pin[0]} refuses that now pass: an unlisted refuse -> pass flip of the lead grammar")
+        self.assertEqual([], [t for t, why in RULE4_R8_SWEEP_ALLOWED.items() if not why.strip()], "a sweep allow-list entry has no reason")
+        self.assertEqual([], [t for t in RULE4_R8_PASS if old[t] > 0], f"routed rows {pin[0]} refuses: the ALLOW rows must be unchanged")
+        for row in RULE4_R8_NAMED:
+            self.assertGreater(old[row], 0, f"{pin[0]} passes the opus row: it is not a refuse -> pass flip")
+
+    def test_rule4_r8_rows_are_red_on_the_r7_head_and_every_earlier_row_keeps_its_verdict(self):
+        """RED proof kept in the suite: the opus rows PASS on the lint of the r7 head 03e7ae1b, and so do other sweep rows (wrapped and
+        prefixed leads). Against that head nothing else moves: the routed rows keep passing and every earlier rule-4 row keeps its verdict."""
+        self.maxDiff = None
+        r7 = _rule4_r1_head_lint(RULE4_R7_PR_HEAD, "r7")
+        (self.tmp / "rule4-r7-head.ps1").write_text(r7[1], encoding="utf-8")
+        earlier = list(dict.fromkeys(RULE4_R2_REFUSE + RULE4_R2_GUARDS + RULE4_SECOND_LAUNCHER_REFUSE + RULE4_SECOND_LAUNCHER_GUARDS
+                                     + RULE4_R2_PASS + RULE4_BOTH_ROUTED_PASS + RULE4_R4_REFUSE + RULE4_R4_PASS + RULE4_R6_REFUSE + RULE4_R6_PASS
+                                     + RULE4_R7_REFUSE + RULE4_R7_PASS))
+        mine = list(RULE4_R8_REFUSE + RULE4_R8_PASS + RULE4_R8_OVERREFUSAL)
+        _prefetch_counts(self.tmp, [(self.tmp / "rule4-r7-head.ps1", earlier + mine, "rule4-r8-r7head"), (LINT_PS1, earlier + mine, "rule4-r8-r7now")])
+        old = dict(zip(earlier + mine, _verdicts(self.tmp / "rule4-r7-head.ps1", earlier + mine)))
+        new = dict(zip(earlier + mine, _verdicts(LINT_PS1, earlier + mine)))
+        for row in RULE4_R8_NAMED:
+            self.assertEqual(0, old[row], f"{r7[0]} already refuses an opus row: not a RED row")
+        red = [t for t in RULE4_R8_REFUSE if old[t] == 0]
+        self.assertGreater(len(red), len(RULE4_R8_NAMED), "the sweep reaches past the named rows")
+        self.assertTrue(any("`" in t for t in red) and any("Re-run" in t for t in red) and any(" the " in t for t in red), "the lead-wrapper and verb-form axes are RED")
+        self.assertEqual([], [t for t in RULE4_R8_PASS if old[t] > 0], f"routed rows {r7[0]} refuses: the ALLOW rows must be unchanged")
+        self.assertEqual([], [t for t in earlier if (old[t] > 0) != (new[t] > 0)], f"an earlier rule-4 row changed its verdict against {r7[0]}")
+
+    def test_red_rule4_r9_an_app_token_is_a_launch_decided_from_its_own_gap_whatever_stands_before_it(self):
+        """r9 (CoS review 6230178238, B5; hub ruling): the five CoS families (an unquoted spaced path, an apostrophe word, a hyphenated
+        word, punctuation in the lead, no verb right before the app) x six launch verbs x the three separators x two launcher twins refuse
+        without a route of their own; the same rows with their own route pass. The 15 `<app> <clip><sep><routed script> on Bachelor.` rows
+        (RULE4_R2_B_APP_REFUSE) are an accepted over-refusal and refuse: the first clause is an app launch with a clip and no route."""
+        self.assertEqual(27, len(RULE4_R9_NAMED))
+        for row in RULE4_R9_NAMED:
+            self.assertIn(row, RULE4_R9_REFUSE)
+        self.assertEqual({1, 2, 3, 4, 5}, set(RULE4_R9_FAMILY.values()), "the five CoS families")
+        self.assertEqual(15, len(RULE4_R2_B_APP_REFUSE))
+        rows = list(RULE4_R9_REFUSE + RULE4_R2_B_APP_REFUSE)
+        counts = _json_counts(LINT_PS1, rows, self.tmp, "rule4-r9-refuse")
+        self.assertEqual([], [t for t, n in zip(rows, counts) if n == 0], "r9 rows the lint passed that it must refuse")
+        rows = list(RULE4_R9_PASS)
+        counts = _json_counts(LINT_PS1, rows, self.tmp, "rule4-r9-pass")
+        self.assertEqual([], [t for t, n in zip(rows, counts) if n > 0], "r9 rows with every launcher routed that the lint refused")
+
+    def test_rule4_r9_sweep_no_row_the_pre_change_master_refuses_passes_on_the_head(self):
+        """The r9 sweep against the PINNED pre-change master with an EMPTY allow-list: the CoS families, their routed twins, the 15 named
+        over-refusal rows and the seeded lead fuzz (RULE4_R9_FUZZ_ROWS rows, seed RULE4_R9_FUZZ_SEED). No row the pin refuses may pass on
+        the head. It does not skip once master carries this lint."""
+        self.maxDiff = None
+        self.assertGreaterEqual(len(RULE4_R9_FUZZ_REFUSE), 3000, "the fuzz is at least a few thousand rows")
+        self.assertEqual(len(RULE4_R9_FUZZ_REFUSE), len(set(RULE4_R9_FUZZ_REFUSE)))
+        pin = _rule4_r1_head_lint(RULE4_PRE_CHANGE_MASTER, "pre-change master", moot_once_master_carries_it=False)
+        (self.tmp / "rule4-r9-pin.ps1").write_text(pin[1], encoding="utf-8")
+        texts = list(RULE4_R9_REFUSE + RULE4_R9_PASS + RULE4_R2_B_APP_REFUSE + RULE4_R9_FUZZ_REFUSE + RULE4_R9_FUZZ_PASS)
+        _prefetch_counts(self.tmp, [(self.tmp / "rule4-r9-pin.ps1", texts, "rule4-r9-pin"), (LINT_PS1, texts, "rule4-r9-now")])
+        old = dict(zip(texts, _verdicts(self.tmp / "rule4-r9-pin.ps1", texts)))
+        new = dict(zip(texts, _verdicts(LINT_PS1, texts)))
+        opened = [t for t in texts if old[t] > 0 and new[t] == 0 and t not in RULE4_R9_SWEEP_ALLOWED]
+        self.assertEqual([], opened[:20], f"{len(opened)} row(s) {pin[0]} refuses that now pass: an unlisted refuse -> pass flip of the lead")
+        self.assertEqual([], [t for t, why in RULE4_R9_SWEEP_ALLOWED.items() if not why.strip()], "a sweep allow-list entry has no reason")
+        self.assertEqual([], [t for t in RULE4_R9_PASS + RULE4_R9_FUZZ_PASS if old[t] > 0], f"routed rows {pin[0]} refuses: the ALLOW rows must be unchanged")
+        for row in RULE4_R9_NAMED:
+            self.assertGreater(old[row], 0, f"{pin[0]} passes a CoS row: it is not a refuse -> pass flip")
+        # the fuzz refuses by construction: the first call has no route of its own, whatever stands in front of it
+        self.assertEqual([], [t for t in RULE4_R9_FUZZ_REFUSE if new[t] == 0][:20], "fuzz rows with no route of their own that the head passes")
+        self.assertEqual([], [t for t in RULE4_R9_FUZZ_PASS if new[t] > 0][:20], "fuzz rows with a route on every launcher that the head refuses")
+
+    def test_rule4_r9_rows_are_red_on_the_r8_head_and_every_earlier_row_keeps_its_verdict(self):
+        """RED proof kept in the suite: the CoS rows, the 15 named rows and a large part of the fuzz PASS on the lint of the r8 head
+        d30d1365 (and so does every family). Against that head nothing else moves: the routed rows keep passing and every earlier
+        rule-4 row keeps its verdict."""
+        self.maxDiff = None
+        r8 = _rule4_r1_head_lint(RULE4_R8_PR_HEAD, "r8")
+        (self.tmp / "rule4-r8-head.ps1").write_text(r8[1], encoding="utf-8")
+        pin = _rule4_r1_head_lint(RULE4_PRE_CHANGE_MASTER, "pre-change master", moot_once_master_carries_it=False)
+        (self.tmp / "rule4-r9-pin2.ps1").write_text(pin[1], encoding="utf-8")
+        earlier = list(dict.fromkeys(RULE4_R2_REFUSE + RULE4_R2_GUARDS + RULE4_SECOND_LAUNCHER_REFUSE + RULE4_SECOND_LAUNCHER_GUARDS
+                                     + RULE4_R2_PASS + RULE4_BOTH_ROUTED_PASS + RULE4_R4_REFUSE + RULE4_R4_PASS + RULE4_R6_REFUSE + RULE4_R6_PASS
+                                     + RULE4_R7_REFUSE + RULE4_R7_PASS + RULE4_R8_REFUSE + RULE4_R8_PASS + RULE4_R8_OVERREFUSAL))
+        mine = list(RULE4_R9_REFUSE + RULE4_R9_PASS + RULE4_R2_B_APP_REFUSE + RULE4_R9_FUZZ_REFUSE + RULE4_R9_FUZZ_PASS)
+        _prefetch_counts(self.tmp, [(self.tmp / "rule4-r8-head.ps1", earlier + mine, "rule4-r9-r8head"), (LINT_PS1, earlier + mine, "rule4-r9-r8now"),
+                                    (self.tmp / "rule4-r9-pin2.ps1", mine, "rule4-r9-pin2")])
+        old = dict(zip(earlier + mine, _verdicts(self.tmp / "rule4-r8-head.ps1", earlier + mine)))
+        new = dict(zip(earlier + mine, _verdicts(LINT_PS1, earlier + mine)))
+        pinned = dict(zip(mine, _verdicts(self.tmp / "rule4-r9-pin2.ps1", mine)))
+        for row in RULE4_R9_NAMED + RULE4_R2_B_APP_REFUSE:
+            self.assertEqual(0, old[row], f"{r8[0]} already refuses a CoS / named row: not a RED row")
+        red = [t for t in RULE4_R9_REFUSE if old[t] == 0]
+        self.assertEqual({1, 2, 3, 4, 5}, {RULE4_R9_FAMILY[t] for t in red if t in RULE4_R9_FAMILY}, "every CoS family has RED rows")
+        fuzz_red = [t for t in RULE4_R9_FUZZ_REFUSE if old[t] == 0 and pinned[t] > 0]
+        self.assertGreaterEqual(len(fuzz_red), 100, f"the fuzz reaches the lead holes: {len(fuzz_red)} row(s) the pin refuses and {r8[0]} passes")
+        self.assertEqual([], [t for t in RULE4_R9_PASS + RULE4_R9_FUZZ_PASS if old[t] > 0], f"routed rows {r8[0]} refuses: the ALLOW rows must be unchanged")
+        self.assertEqual([], [t for t in earlier if (old[t] > 0) != (new[t] > 0)][:20], f"an earlier rule-4 row changed its verdict against {r8[0]}")
+
+    def test_red_rule4_r10_a_semicolon_between_the_app_argument_and_its_mode_never_hides_the_launch(self):
+        """r10 (CoS review 6230713095, B6; hub ruling): an app call with an argument is scored whenever the sentence holds a playback mode
+        flag anywhere, so `<app> <clip>; add <mode>.` must carry its own route. The eight CoS rows, the tail grid (what stands between the
+        app's argument and the mode: `;`, `; then`, `;` with no space, ` ; `, a later clause with a verb, a negated later clause, a later
+        routed run), the no-argument form (the soft note) and the tail-axis fuzz refuse; the same calls with their own route pass; a
+        route glued to the `;` (`on Bachelor;add`) is no route and refuses."""
+        self.assertEqual(8, len(RULE4_R10_NAMED))
+        self.assertGreaterEqual(len(RULE4_R10_FUZZ_REFUSE), 2000, "the tail fuzz is at least a couple of thousand rows")
+        self.assertEqual(len(RULE4_R10_FUZZ_REFUSE), len(set(RULE4_R10_FUZZ_REFUSE)))
+        self.assertTrue(RULE4_R10_GLUED_ROUTE and RULE4_R10_NOARG and RULE4_R10_GRID_ROUTED)
+        rows = list(dict.fromkeys(RULE4_R10_REFUSE + RULE4_R10_FUZZ_REFUSE + RULE4_R10_GLUED_ROUTE))
+        counts = _json_counts(LINT_PS1, rows, self.tmp, "rule4-r10-refuse")
+        self.assertEqual([], [t for t, n in zip(rows, counts) if n == 0][:20], "r10 rows the lint passed that it must refuse")
+        rows = list(dict.fromkeys(RULE4_R10_GRID_ROUTED + RULE4_R10_NOARG_ROUTED + RULE4_R10_FUZZ_PASS + RULE4_R10_MENTION_PASS))
+        counts = _json_counts(LINT_PS1, rows, self.tmp, "rule4-r10-pass")
+        self.assertEqual([], [t for t, n in zip(rows, counts) if n > 0][:20],
+                         "r10 rows with a route on the app call (or a bare app mention before a routed launch) that the lint refused")
+
+    def test_rule4_r10_sweep_no_row_the_pin_or_master_refuses_passes_on_the_head(self):
+        """The r10 sweep against the PINNED pre-change master (and against the current baseline ref, when it still differs from the head)
+        with an EMPTY allow-list: the CoS rows, the tail grid, the no-argument form, the routed and glued twins, the 15 named over-refusal
+        rows and the tail-axis fuzz (RULE4_R10_FUZZ_ROWS rows, seed RULE4_R10_FUZZ_SEED). No row the pin refuses may pass on the head. It
+        does not skip once master carries this lint."""
+        self.maxDiff = None
+        pin = _rule4_r1_head_lint(RULE4_PRE_CHANGE_MASTER, "pre-change master", moot_once_master_carries_it=False)
+        (self.tmp / "rule4-r10-pin.ps1").write_text(pin[1], encoding="utf-8")
+        texts = list(dict.fromkeys(RULE4_R10_REFUSE + RULE4_R10_GRID_ROUTED + RULE4_R10_GLUED_ROUTE + RULE4_R10_NOARG_ROUTED + RULE4_R10_MENTION_PASS
+                                   + RULE4_R2_B_APP_REFUSE + RULE4_R10_FUZZ_REFUSE + RULE4_R10_FUZZ_PASS))
+        _prefetch_counts(self.tmp, [(self.tmp / "rule4-r10-pin.ps1", texts, "rule4-r10-pin"), (LINT_PS1, texts, "rule4-r10-now")])
+        old = dict(zip(texts, _verdicts(self.tmp / "rule4-r10-pin.ps1", texts)))
+        new = dict(zip(texts, _verdicts(LINT_PS1, texts)))
+        opened = [t for t in texts if old[t] > 0 and new[t] == 0 and t not in RULE4_R10_SWEEP_ALLOWED]
+        self.assertEqual([], opened[:20], f"{len(opened)} row(s) {pin[0]} refuses that now pass: an unlisted refuse -> pass flip of the tail")
+        self.assertEqual([], [t for t, why in RULE4_R10_SWEEP_ALLOWED.items() if not why.strip()], "a sweep allow-list entry has no reason")
+        self.assertEqual([], [t for t in RULE4_R10_GRID_ROUTED + RULE4_R10_NOARG_ROUTED + RULE4_R10_MENTION_PASS + RULE4_R10_FUZZ_PASS if old[t] > 0][:20],
+                         f"routed rows {pin[0]} refuses: the ALLOW rows must be unchanged")
+        for row in RULE4_R10_NAMED + RULE4_R10_GRID:
+            self.assertGreater(old[row], 0, f"{pin[0]} passes a CoS / grid row: it is not a refuse -> pass flip")
+        # a route glued to the `;` is no route on the pin either: the head agrees with it row for row
+        self.assertEqual([], [t for t in RULE4_R10_GLUED_ROUTE if (old[t] > 0) != (new[t] > 0)][:20], "glued-route rows where the pin and the head disagree")
+        # the no-argument form is a tightening: the head refuses every row, the pin does not
+        self.assertTrue(any(old[t] == 0 for t in RULE4_R10_NOARG), "the no-argument tightening is a flip against the pin (the pin passes some of it)")
+        # the fuzz refuses by construction: the app call has no route of its own, whatever stands in front of it or after it
+        self.assertEqual([], [t for t in RULE4_R10_FUZZ_REFUSE if new[t] == 0][:20], "tail fuzz rows with no route of their own that the head passes")
+        base = _baseline_lint_source()
+        if base is not None and base[1].replace("\r\n", "\n") != LINT_PS1.read_text(encoding="utf-8").replace("\r\n", "\n"):
+            (self.tmp / "rule4-r10-master.ps1").write_text(base[1], encoding="utf-8")
+            rows = list(dict.fromkeys(RULE4_R10_NAMED + RULE4_R10_GRID + RULE4_R10_GRID_ROUTED))
+            _prefetch_counts(self.tmp, [(self.tmp / "rule4-r10-master.ps1", rows, "rule4-r10-master")])
+            master = dict(zip(rows, _verdicts(self.tmp / "rule4-r10-master.ps1", rows)))
+            self.assertEqual([], [t for t in rows if master[t] > 0 and new[t] == 0][:20], f"rows {base[0]} refuses that now pass")
+
+    def test_rule4_r10_rows_are_red_on_the_r9_head_and_every_earlier_row_keeps_its_verdict(self):
+        """RED proof kept in the suite: the CoS rows, the tail grid, the no-argument form and the tail fuzz all PASS on the lint of the r9
+        head 96cdd148 (the app gap stops at `;`, the sentence holds no direct launch, nothing is scored), and the pin refuses the CoS
+        rows. Against that head nothing else moves: the routed rows keep passing and every earlier rule-4 row keeps its verdict."""
+        self.maxDiff = None
+        r9 = _rule4_r1_head_lint(RULE4_R9_PR_HEAD, "r9")
+        (self.tmp / "rule4-r9-head.ps1").write_text(r9[1], encoding="utf-8")
+        pin = _rule4_r1_head_lint(RULE4_PRE_CHANGE_MASTER, "pre-change master", moot_once_master_carries_it=False)
+        (self.tmp / "rule4-r10-pin2.ps1").write_text(pin[1], encoding="utf-8")
+        earlier = list(dict.fromkeys(RULE4_R2_REFUSE + RULE4_R2_GUARDS + RULE4_SECOND_LAUNCHER_REFUSE + RULE4_SECOND_LAUNCHER_GUARDS
+                                     + RULE4_R2_PASS + RULE4_BOTH_ROUTED_PASS + RULE4_R4_REFUSE + RULE4_R4_PASS + RULE4_R6_REFUSE + RULE4_R6_PASS
+                                     + RULE4_R7_REFUSE + RULE4_R7_PASS + RULE4_R8_REFUSE + RULE4_R8_PASS + RULE4_R8_OVERREFUSAL
+                                     + RULE4_R9_REFUSE + RULE4_R9_PASS + RULE4_R2_B_APP_REFUSE + RULE4_R9_FUZZ_REFUSE + RULE4_R9_FUZZ_PASS))
+        mine = list(dict.fromkeys(RULE4_R10_REFUSE + RULE4_R10_GRID_ROUTED + RULE4_R10_GLUED_ROUTE + RULE4_R10_NOARG_ROUTED + RULE4_R10_MENTION_PASS
+                                  + RULE4_R10_FUZZ_REFUSE + RULE4_R10_FUZZ_PASS))
+        _prefetch_counts(self.tmp, [(self.tmp / "rule4-r9-head.ps1", earlier + mine, "rule4-r10-r9head"), (LINT_PS1, earlier + mine, "rule4-r10-r9now"),
+                                    (self.tmp / "rule4-r10-pin2.ps1", mine, "rule4-r10-pin2")])
+        old = dict(zip(earlier + mine, _verdicts(self.tmp / "rule4-r9-head.ps1", earlier + mine)))
+        new = dict(zip(earlier + mine, _verdicts(LINT_PS1, earlier + mine)))
+        pinned = dict(zip(mine, _verdicts(self.tmp / "rule4-r10-pin2.ps1", mine)))
+        for row in RULE4_R10_NAMED + RULE4_R10_NOARG:
+            self.assertEqual(0, old[row], f"{r9[0]} already refuses a CoS / no-argument row: not a RED row")
+        for row in RULE4_R10_NAMED:
+            self.assertGreater(pinned[row], 0, f"{pin[0]} passes a CoS row: it would be a tightening, not a parity restore")
+        self.assertEqual([], [t for t in RULE4_R10_GRID if old[t] > 0][:20], f"grid rows {r9[0]} already refuses: not RED rows")
+        fuzz_red = [t for t in RULE4_R10_FUZZ_REFUSE if old[t] == 0 and pinned[t] > 0]
+        self.assertGreaterEqual(len(fuzz_red), 1000, f"the tail fuzz reaches the hole: {len(fuzz_red)} row(s) the pin refuses and {r9[0]} passes")
+        self.assertEqual([], [t for t in RULE4_R10_FUZZ_REFUSE if old[t] > 0][:20], f"tail fuzz rows {r9[0]} already refuses")
+        self.assertEqual([], [t for t in RULE4_R10_GRID_ROUTED + RULE4_R10_NOARG_ROUTED + RULE4_R10_MENTION_PASS + RULE4_R10_FUZZ_PASS if old[t] > 0],
+                         f"routed rows {r9[0]} refuses: the ALLOW rows must be unchanged")
+        self.assertEqual([], [t for t in RULE4_R10_GLUED_ROUTE if old[t] > 0], f"glued-route rows {r9[0]} refuses: they open only because of the hole")
+        self.assertEqual([], [t for t in earlier if (old[t] > 0) != (new[t] > 0)][:20], f"an earlier rule-4 row changed its verdict against {r9[0]}")
+
+    def test_red_rule4_split_an_orphan_mode_flag_and_a_code_span_token_never_hide_the_launch(self):
+        """NA2-RULE4-SENTENCE-SPLIT-AND-CODESPAN-APP-1 (CoS review 6231429063 soft notes; amend (a) of the #465 r10 keys): an app call whose
+        mode flag stands in the ADJACENT sentence of its block (`Run <app> <clip>. Add <mode>.`, either order, and the no-argument twin) and
+        an app or script token in a code span closed right after it (``Run `<app>` <mode>.``) refuse; the same calls with their own route
+        pass, and so do the controls: the app across two sentences with no mode flag, a code span with no mode flag, a flag a routed launch
+        holds, a slash list in a sentence of its own, a heading between the call and the flag."""
+        self.assertEqual(5, len(RULE4_SPLIT_NAMED))
+        self.assertTrue(RULE4_SPLIT_GRID and RULE4_SPLIT_NOARG and RULE4_SPLIT_CODESPAN and RULE4_SPLIT_SLASH_GUARDS and RULE4_SPLIT_SPAN_GUARDS)
+        rows = list(dict.fromkeys(RULE4_SPLIT_REFUSE + RULE4_SPLIT_SLASH_GUARDS + RULE4_SPLIT_SPAN_GUARDS))
+        counts = _json_counts(LINT_PS1, rows, self.tmp, "rule4-split-refuse")
+        self.assertEqual([], [t for t, n in zip(rows, counts) if n == 0][:20], "split / code-span rows the lint passed that it must refuse")
+        rows = list(RULE4_SPLIT_PASS)
+        counts = _json_counts(LINT_PS1, rows, self.tmp, "rule4-split-pass")
+        self.assertEqual([], [t for t, n in zip(rows, counts) if n > 0][:20], "routed twins and mention controls the lint refused")
+
+    def test_rule4_split_sweep_is_refuse_only_against_the_pin(self):
+        """The split / code-span sweep against the PINNED pre-change master, with an EMPTY allow-list: no row the pin refuses passes on the
+        head; every RED row passes on the pin (a tightening, never a parity flip); every routed twin and control passes on the pin too.
+        Amend (b), kept fail-closed: the slash rows pass on the pin and refuse on the head. It does not skip once master carries this lint."""
+        self.maxDiff = None
+        pin = _rule4_r1_head_lint(RULE4_PRE_CHANGE_MASTER, "pre-change master", moot_once_master_carries_it=False)
+        path = self.tmp / "rule4-split-pin.ps1"
+        path.write_text(pin[1], encoding="utf-8")
+        texts = list(dict.fromkeys(RULE4_SPLIT_REFUSE + RULE4_SPLIT_PASS + RULE4_SPLIT_SLASH_GUARDS + RULE4_SPLIT_SPAN_GUARDS))
+        _prefetch_counts(self.tmp, [(path, texts, "rule4-split-pin"), (LINT_PS1, texts, "rule4-split-now")])
+        old = dict(zip(texts, _verdicts(path, texts)))
+        new = dict(zip(texts, _verdicts(LINT_PS1, texts)))
+        self.assertEqual([], [t for t in texts if old[t] > 0 and new[t] == 0][:20], f"rows {pin[0]} refuses that now pass")
+        self.assertEqual([], [t for t in RULE4_SPLIT_REFUSE if old[t] > 0][:20], f"{pin[0]} refuses a RED row: it would be a parity restore, not a tightening")
+        self.assertEqual([], [t for t in RULE4_SPLIT_PASS if old[t] > 0][:20], f"routed twins or controls {pin[0]} refuses")
+        self.assertEqual([], [t for t in RULE4_SPLIT_SLASH_GUARDS if old[t] > 0 or new[t] == 0][:20],
+                         "amend (b) rows: the pin passes them and the head keeps them refused (mirroring the slash guard would open them)")
+
+    def test_rule4_split_rows_are_red_on_the_base_head_and_every_earlier_row_keeps_its_verdict(self):
+        """RED proof kept in the suite: every split / code-span RED row PASSES on the lint of RULE4_SPLIT_BASE_HEAD (fork/master when this card
+        branched), and the guards (amend (b), the double code span) refuse there already. Against that head nothing else moves: the routed
+        twins and controls keep passing and every earlier rule-4 row keeps its verdict. Skips once master carries this lint."""
+        self.maxDiff = None
+        base = _rule4_r1_head_lint(RULE4_SPLIT_BASE_HEAD, "split base")
+        path = self.tmp / "rule4-split-base.ps1"
+        path.write_text(base[1], encoding="utf-8")
+        earlier = list(dict.fromkeys(RULE4_R2_REFUSE + RULE4_R2_GUARDS + RULE4_SECOND_LAUNCHER_REFUSE + RULE4_SECOND_LAUNCHER_GUARDS
+                                     + RULE4_R2_PASS + RULE4_BOTH_ROUTED_PASS + RULE4_R4_REFUSE + RULE4_R4_PASS + RULE4_R6_REFUSE + RULE4_R6_PASS
+                                     + RULE4_R7_REFUSE + RULE4_R7_PASS + RULE4_R8_REFUSE + RULE4_R8_PASS + RULE4_R8_OVERREFUSAL
+                                     + RULE4_R9_REFUSE + RULE4_R9_PASS + RULE4_R2_B_APP_REFUSE + RULE4_R9_FUZZ_REFUSE + RULE4_R9_FUZZ_PASS
+                                     + RULE4_R10_REFUSE + RULE4_R10_GRID_ROUTED + RULE4_R10_GLUED_ROUTE + RULE4_R10_NOARG_ROUTED
+                                     + RULE4_R10_MENTION_PASS + RULE4_R10_FUZZ_REFUSE + RULE4_R10_FUZZ_PASS))
+        mine = list(dict.fromkeys(RULE4_SPLIT_REFUSE + RULE4_SPLIT_PASS + RULE4_SPLIT_SLASH_GUARDS + RULE4_SPLIT_SPAN_GUARDS))
+        _prefetch_counts(self.tmp, [(path, earlier + mine, "rule4-split-base"), (LINT_PS1, earlier + mine, "rule4-split-base-now")])
+        old = dict(zip(earlier + mine, _verdicts(path, earlier + mine)))
+        new = dict(zip(earlier + mine, _verdicts(LINT_PS1, earlier + mine)))
+        self.assertEqual([], [t for t in RULE4_SPLIT_REFUSE if old[t] > 0][:20], f"{base[0]} already refuses a split / code-span row: not a RED row")
+        self.assertEqual([], [t for t in RULE4_SPLIT_SLASH_GUARDS + RULE4_SPLIT_SPAN_GUARDS if old[t] == 0][:20], f"guards {base[0]} passes")
+        self.assertEqual([], [t for t in RULE4_SPLIT_PASS if old[t] > 0][:20], f"routed twins or controls {base[0]} refuses: the ALLOW rows must be unchanged")
+        self.assertEqual([], [t for t in earlier if (old[t] > 0) != (new[t] > 0)][:20], f"an earlier rule-4 row changed its verdict against {base[0]}")
+
+    def test_rule4_every_quote_class_holds_every_character_its_comment_claims(self):
+        """r9 (CoS Prevention, the B4 root cause): the EVALUATED patterns, not their source, hold the quote characters their comments claim.
+        Static guard: evaluated-only for the delimiter escape (see RULE4_BACKTICK_ESCAPES), because a backtick before `"` is also the one
+        legitimate escape in a double-quoted pattern (six strings use it), so the source form cannot tell a meant backtick from an escape;
+        every other single backtick before a bracket or an apostrophe in a double-quoted string is refused unless named."""
+        self.assertEqual([], _quote_class_problems(LINT_PS1, RULE4_QUOTE_CLAIMS, self.tmp, "quote-now"))
+        literals = _lint_pattern_probe(LINT_PS1, ("appStop",), self.tmp, "quote-static")["dq"]
+        self.assertGreater(len(literals), 20, "the double-quoted literals of the lint were read")
+        stray = [(lit[:60], hit) for lit in literals for hit in _single_backticks_before_bracket_or_quote(lit)
+                 if lit not in RULE4_BACKTICK_ESCAPES]
+        self.assertEqual([], stray, "a single backtick before [ ] ( ) or ' inside a double-quoted pattern string escapes that character")
+        self.assertEqual([], [k for k, why in RULE4_BACKTICK_ESCAPES.items() if not why.strip()], "a named backtick escape has no reason")
+
+    def test_rule4_the_quote_class_pin_bites_on_a_dropped_backtick_and_a_stray_escape(self):
+        """RED/GREEN proof kept in the suite: the r7 head 03e7ae1b (its app-token classes lack the backtick the r8 comment claims) fails the
+        pin; the r8 head d30d1365 (the fix, with the lead pieces) passes it; the static scanner flags a single backtick before a bracket
+        or an apostrophe and nothing else."""
+        r7 = _rule4_r1_head_lint(RULE4_R7_PR_HEAD, "r7")
+        (self.tmp / "quote-r7.ps1").write_text(r7[1], encoding="utf-8")
+        problems = _quote_class_problems(self.tmp / "quote-r7.ps1", {k: v for k, v in RULE4_QUOTE_CLAIMS.items() if k in ("appStop", "clipLaunch")}, self.tmp, "quote-r7")
+        self.assertTrue(any(p.startswith("appStop: class") for p in problems) and any(p.startswith("clipLaunch: class") for p in problems),
+                        f"{r7[0]} must fail the pin on the dropped backtick of both app-token patterns: {problems}")
+        r8 = _rule4_r1_head_lint(RULE4_R8_PR_HEAD, "r8")
+        (self.tmp / "quote-r8.ps1").write_text(r8[1], encoding="utf-8")
+        self.assertEqual([], _quote_class_problems(self.tmp / "quote-r8.ps1", RULE4_QUOTE_CLAIMS_R8, self.tmp, "quote-r8"))
+        self.assertEqual(["`'"], _single_backticks_before_bracket_or_quote('"[a`\'b]"'))
+        self.assertEqual(["`]"], _single_backticks_before_bracket_or_quote('"[a`]"'))
+        self.assertEqual([], _single_backticks_before_bracket_or_quote('"[&(\'`"``]*"'))
+        self.assertEqual([], _single_backticks_before_bracket_or_quote('"``[x]"'))
+
+    def test_rule4_the_refuse_rows_are_red_on_the_baseline(self):
+        """RED proof kept in the suite: every second-launcher row passes the lint of RULE4_PRE_CHANGE_MASTER, the master this PR branched
+        from (its rule 4 read only the first launcher occurrence).
+
+        r4b (CoS Improvement 6224545625): the proof is judged against that PINNED pre-change commit, never against fork/master or
+        HUB_VM_LINT_BASELINE_REF. Once this PR merges those refs carry the change, so the next lint PR (whose lint differs from master's
+        by one byte) failed here with 'already refuses: not a RED row'; only byte-identity used to skip. If the pinned baseline ever
+        refuses EVERY RED row it carries the change and is no RED baseline: the test skips with that reason instead of failing. The pin
+        never changes, so that skip can only fire in a broken clone or after a history rewrite (CoS nit on 469e513d); it is a guard, not a path.
+
+        Retirement: the pin never moves (re-pinning it to a later master would make it carry the change). The test is deleted, not
+        re-pinned, when the rule-4 catalogue retires; the candidate verdicts stay pinned by test_red_rule4_* either way."""
+        self.maxDiff = None
+        base = _rule4_r1_head_lint(RULE4_PRE_CHANGE_MASTER, "pre-change master")
+        (self.tmp / "rule4-master.ps1").write_text(base[1], encoding="utf-8")
+        rows = list(RULE4_SECOND_LAUNCHER_REFUSE)
+        # one pwsh pass over the refuse, guard and allow rows together
+        _prefetch_counts(self.tmp, [(self.tmp / "rule4-master.ps1", rows + list(RULE4_SECOND_LAUNCHER_GUARDS) + list(RULE4_BOTH_ROUTED_PASS), "rule4-master")])
+        counts = _json_counts(self.tmp / "rule4-master.ps1", rows, self.tmp, "rule4-red")
+        refused = [t for t, n in zip(rows, counts) if n > 0]
+        if rows and len(refused) == len(rows):
+            self.skipTest(f"{base[0]} already refuses every RED row: it carries the change, so it is no RED baseline")
+        self.assertEqual([], refused, f"rows {base[0]} already refuses: not a RED row, move it to the guards")
+        guards = list(RULE4_SECOND_LAUNCHER_GUARDS)
+        counts = _json_counts(self.tmp / "rule4-master.ps1", guards, self.tmp, "rule4-guards")
+        self.assertEqual([], [t for t, n in zip(guards, counts) if n == 0], f"guard rows {base[0]} passes: they belong in the RED rows")
+        allow = list(RULE4_BOTH_ROUTED_PASS)
+        counts = _json_counts(self.tmp / "rule4-master.ps1", allow, self.tmp, "rule4-allow")
+        self.assertEqual([], [t for t, n in zip(allow, counts) if n > 0], f"both-routed rows {base[0]} refuses: the ALLOW rows must be unchanged")
+
     def test_a_1mb_heading_free_prompt_completes_in_bounded_time(self):
         """r10 (opus r9 hardening HUB-VM-LINT-BLOCKTAIL-QUADRATIC-1): r9 copied the rest of the block per item, O(n^2) on a large
         heading-free prompt. ~1 MB of prose with venue-routed `locally` sentences, grammar-clean follow-ups and handling follow-ups,
@@ -1923,13 +3543,13 @@ class ListMemberDefeaterTests(unittest.TestCase):
 
     def test_the_lint_builds_its_patterns_from_those_lists(self):
         """The exposed lists must be the lists the lint USES, not a second copy that can drift: the findings function reads them, and the
-        literal alternation they replaced is gone."""
-        text = LINT_PS1.read_text(encoding="utf-8")
-        body = text[text.index("function Get-LocalPlaybackPromptFindings"):]
+        literal alternation they replaced is gone. Since r11 the reads live in the cached builder (Get-LintPatternSet), so the pin checks the
+        builder plus the findings function."""
+        body = _lint_reading_body()
         self.assertIn("Get-LocalPlaybackLintWordLists", body)
         for key in ("VenueFollowLocus", "VenueFollowPhrases", "HostDeterminers", "HostNouns", "HostNames", "HostPrepositions", "HostLocusPrepositions", "ContrastWords",
                     "RoutingPrepositionsLocally", "RoutingPrepositionsVenue", "VenueWords"):
-            self.assertIn(f"$lists.{key}", body, f"the findings function does not read list {key}")
+            self.assertIn(f"$lists.{key}", body, f"the lint does not read list {key}")
         self.assertNotRegex(body, r"\$venueFollow\s*=\s*'", "a literal follow alternation came back")
 
     def test_every_follow_member_is_documented_locus_preserving(self):
@@ -2063,10 +3683,9 @@ class ListMemberDefeaterTests(unittest.TestCase):
         no destination preposition can enter the grammar."""
         for key in ("TailLocusPrepositions", "TailArticles", "TailJoiners", "TailNegations", "TailNegationPrepositions", "TailPureLocus"):
             self.assertTrue(self.lists.get(key), f"list {key} is missing or empty")
-        text = LINT_PS1.read_text(encoding="utf-8")
-        body = text[text.index("function Get-LocalPlaybackPromptFindings"):]
+        body = _lint_reading_body()
         for key in ("TailLocusPrepositions", "TailArticles", "TailJoiners", "TailNegations", "TailNegationPrepositions", "TailPureLocus"):
-            self.assertIn(f"$lists.{key}", body, f"the findings function does not read list {key}")
+            self.assertIn(f"$lists.{key}", body, f"the lint (builder + findings function) does not read list {key}")
         for gone in ("TailHandlingVerbs", "TailLaunchVerbs", "TailDestinationPrepositions"):
             self.assertNotIn(gone, self.lists, f"{gone} came back: r10 decides a tail by a closed grammar, not by enumerating verbs")
         self.assertEqual(["at", "on", "through", "using", "via"], sorted(self.lists["TailLocusPrepositions"]))
@@ -2143,9 +3762,8 @@ class ListMemberDefeaterTests(unittest.TestCase):
         self.assertTrue(self.lists.get("HeadExecutableWords"), "list HeadExecutableWords is missing or empty")
         self.assertEqual([], [w for w in self.lists["HeadExecutableWords"] if w in self.lists["HeadObjectWords"]])
         self.assertEqual([], [w for w in self.lists["HeadObjectWords"] if w.lower().endswith(".exe") or w.lower().startswith("mlvapp")])
-        body = LINT_PS1.read_text(encoding="utf-8")
-        body = body[body.index("function Get-LocalPlaybackPromptFindings"):]
-        self.assertIn("$lists.HeadExecutableWords", body, "the findings function does not read list HeadExecutableWords")
+        body = _lint_reading_body()
+        self.assertIn("$lists.HeadExecutableWords", body, "the lint (builder + findings function) does not read list HeadExecutableWords")
 
     def test_r12_head_lists_are_exposed_read_by_the_lint_and_closed(self):
         """r12: the head grammar's lists are exposed and read by the findings function; the old blacklist machinery is gone, and no
@@ -2153,9 +3771,9 @@ class ListMemberDefeaterTests(unittest.TestCase):
         for key in ("LaunchVerbs", "HeadObjectWords", "HeadFillers", "HeadJoiners", "HeadProhibitions", "HeadContrasts"):
             self.assertTrue(self.lists.get(key), f"list {key} is missing or empty")
         text = LINT_PS1.read_text(encoding="utf-8")
-        body = text[text.index("function Get-LocalPlaybackPromptFindings"):]
+        body = _lint_reading_body()
         for key in ("LaunchVerbs", "HeadObjectWords", "HeadFillers", "HeadJoiners", "HeadProhibitions", "HeadContrasts"):
-            self.assertIn(f"$lists.{key}", body, f"the findings function does not read list {key}")
+            self.assertIn(f"$lists.{key}", body, f"the lint (builder + findings function) does not read list {key}")
         for gone in ("Get-LeftoverPrepositionIndex", "Test-HeadClauseBenign", "Test-SentenceHeadBenign", "Test-ItemDirty", "$headState.Budget",
                      "$headState.Memo"):
             self.assertNotIn(gone, text, f"{gone} came back: r12 reads the head by a closed whitelist, not by a blacklist")
@@ -2257,6 +3875,12 @@ class LintDifferentialPinTests(unittest.TestCase):
          "semicolon group that names no local host): 'Run playback on Bachelor rather than / instead of / without / nor / , not locally' -- the marker is the first "
          "thing of the contrast complement, so it is what the prompt rules out. (Only `locally` flips: the host and 'here' markers were "
          "already passed by the baseline's sentence-wide weak-negation / venue exemption.)"),
+        ("rule4-r2-route-on-launcher-b-with-a-non-launcher-lead",
+         lambda text, f: f.get("tpl") == "seed" and text in RULE4_R2_B_PASS,
+         "NA2-RULE4-PER-LAUNCHER-SCOPE-1 r2 (listed in the PR body): 'pwsh -File build.ps1; pwsh -File <script> -Backend cpu on Bachelor.' "
+         "(RULE4_R2_B_PASS, 15 rows; the app form moved to RULE4_R2_B_APP_REFUSE in r9) hold ONE launcher, the second, and it carries its own venue route; the first call is "
+         "not a playback launcher. Master's greedy gap ran over the ';' and scored the match in the first, unrouted clause, so it "
+         "refused them; a launcher's gap now stops at ';' and at the next launcher token, so only the real launcher is scored."),
     )
     _CLAUSE_SCOPED_TPLS = ("marker-contrast-venue", "marker-contrast-marker", "contrast-first", "marker-join-venue", "venue-join-marker")
     ALLOWED_PASS_TO_REFUSE = (
@@ -2326,6 +3950,34 @@ class LintDifferentialPinTests(unittest.TestCase):
          lambda text, f: f.get("tpl") == "handling-tail" and f.get("M") in ("on this host", "here"),
          "r1b over-refusal kept on purpose (card HUB-VM-LINT-LOG-COPY-OVERREFUSAL-1): 'copy the log on this host' after a venue run "
          "is refused like its `locally` twin; a handling-verb list would open 'Copy the clip locally and run playback.'"),
+        ("rule4-per-launcher-scope",
+         lambda text, f: f.get("tpl") == "seed" and (text in RULE4_SECOND_LAUNCHER_REFUSE or text in RULE4_R2_REFUSE or text in RULE4_R4_REFUSE
+                                                     or text in RULE4_R6_REFUSE or text in RULE4_R7_REFUSE or text in RULE4_R2_B_APP_REFUSE
+                                                     or text in RULE4_R10_SEEDS),
+         "r10 (hub ruling on CoS review 6230713095, B6, listed in the PR body): the app call before a `;` that cuts it from its playback mode "
+         "('Run <app> <clip>; add <mode>.', RULE4_R10_NAMED) is a launch of its own and needs its own route; master refuses the CoS rows "
+         "(its app gap crossed the `;`), so against master they are no flip. The no-argument form ('Run <app>; add <mode>.', RULE4_R10_NOARG) "
+         "refuses under the same rule: a tightening, master passes most of it. "
+         "r9 (hub ruling on CoS review 6230178238, listed in the PR body): the 15 rows `<app> <clip><sep><routed script> on Bachelor.` "
+         "(RULE4_R2_B_APP_REFUSE) are an accepted over-refusal -- the first clause is an app launch with a clip and no route of its own. "
+         "NA2-RULE4-PER-LAUNCHER-SCOPE-1, CoS post-merge Blocker on #448 (ask 6216180502): rule 4 scores EACH launcher occurrence, so a "
+         "venue locus exempts only the launcher it routes. Master read only the first occurrence and passed '<launcher> -Backend cpu on "
+         "Bachelor; then run <launcher> -Backend cpu.' and its relatives (RULE4_SECOND_LAUNCHER_REFUSE). r2 (CoS review of 75cb00e1): "
+         "the same for a venue-routed lead that is not a launcher, ` or `, a route that belongs to launcher B, and mixed-style pairs "
+         "(RULE4_R2_REFUSE). r4 (sol r3 + Iverson on 4b9c9387): the quoted call `& '<script>' -Param` is a launcher, and a launcher "
+         "name inside a path argument no longer ends a launcher's argument gap (RULE4_R4_REFUSE). r6 (CoS review of 469e513d, B1 + B2 + "
+         "Improvement 1): an app launch whose clip follows an option, has no extension, or is a quoted path with a space is a launch of its "
+         "own (RULE4_R6_REFUSE); master refused the B1 / B2 rows, and passes the clip-launch-as-second-launcher rows of Improvement 1. "
+         "r7 (CoS review of 0fb1eb8c, B3 + N1 + N2): ANY first argument after the app that is not the next launcher makes the call a launch "
+         "of its own, so `--opt=value`, `/opt`, a bare token and an option chain of any length refuse (RULE4_R7_REFUSE, the generated "
+         "argument-grammar sweep); master refused the B3 rows (the first app call reaches a mode flag over the next launcher) and passes the "
+         "rows whose clip launch is the SECOND launcher (N1)."),
+        ("rule4-sentence-split-and-codespan",
+         lambda text, f: f.get("tpl") == "seed" and text in RULE4_SPLIT_SEEDS,
+         "NA2-RULE4-SENTENCE-SPLIT-AND-CODESPAN-APP-1 (CoS review 6231429063 soft notes on #465, amend (a) of the r10 keys; listed in the PR "
+         "body): refuse-only tightenings, the pin 2f8d1a97 and master pass all five RULE4_SPLIT_SEEDS rows. An orphan mode flag reaches the "
+         "app call of the adjacent sentence ('Run <app> <clip>. Add <mode>.', 'Run <app>. Add <mode>.'), and the app and script tokens close "
+         "with a backtick (``Run `<app>` <mode>.``, ``Run `<script>` -Backend cpu.``)."),
     )
 
     # r7 PREVIOUS-HEAD gate (CoS Prevention on a595464f). Against the lint of the PR head this round started from, NOTHING may open:
@@ -2340,6 +3992,15 @@ class LintDifferentialPinTests(unittest.TestCase):
          "head grammar admits every member of HeadJoiners / HeadContrasts as its own piece, so a pure venue-routed launch, a joiner and a "
          "verbless host negation pass; the rows are the r12 ALLOW generator (r12-allow-head), refused by master too (`locally` + a "
          "listed launch verb), and each is terminal under the ruling's grammar."),
+        ("rule4-r2-route-on-launcher-b-with-a-non-launcher-lead",
+         lambda text, f: f.get("tpl") == "seed" and text in RULE4_R2_B_PASS,
+         "NA2-RULE4-PER-LAUNCHER-SCOPE-1 r2 (listed in the PR body): 'pwsh -File build.ps1; pwsh -File <script> -Backend cpu on Bachelor.' "
+         "(and the app form) has ONE launcher, the second, and it carries its own venue route; the first call is not a playback launcher. "
+         "d2f3cd05 (and the r1 head) let the first call's lazy gap run over the ';' so the merged span sat in the unrouted first clause "
+         "and the sentence was refused. A launcher's gap now stops at ';' and at the next launcher token, so only the real launcher is "
+         "scored, and it is routed (RULE4_R2_B_PASS; 3 rows open, one per separator; the app form is an app launch of its own since r9). "
+         "Master refuses them too (its greedy gap scored the match in the first, unrouted clause), so against master these rows are refuse "
+         "-> pass flips, as against d2f3cd05."),
     )
     ALLOWED_PREVIOUS_HEAD_PASS_TO_REFUSE = (
         ("r10-strictly-terminal-e1",
@@ -2381,6 +4042,32 @@ class LintDifferentialPinTests(unittest.TestCase):
          "named a real clip file; the fixtures use neutral made-up file arguments instead (the rule is that ANY file argument after an "
          "executable is a launch). An executable that carries its own route, follows a prohibition, or is the marker clause's own "
          "launch still passes (CLAUSE_MUST_PASS_R13)."),
+        ("rule4-per-launcher-scope",
+         lambda text, f: f.get("tpl") == "seed" and (text in RULE4_SECOND_LAUNCHER_REFUSE or text in RULE4_R2_REFUSE or text in RULE4_R4_REFUSE
+                                                     or text in RULE4_R6_REFUSE or text in RULE4_R7_REFUSE or text in RULE4_R2_B_APP_REFUSE
+                                                     or text in RULE4_R10_SEEDS),
+         "r10 (hub ruling on CoS review 6230713095, B6, listed in the PR body): the app call before a `;` that cuts it from its playback mode "
+         "('Run <app> <clip>; add <mode>.', RULE4_R10_NAMED) is a launch of its own and needs its own route; master refuses the CoS rows "
+         "(its app gap crossed the `;`), so against master they are no flip. The no-argument form ('Run <app>; add <mode>.', RULE4_R10_NOARG) "
+         "refuses under the same rule: a tightening, master passes most of it. "
+         "r9 (hub ruling on CoS review 6230178238, listed in the PR body): the 15 rows `<app> <clip><sep><routed script> on Bachelor.` "
+         "(RULE4_R2_B_APP_REFUSE) are an accepted over-refusal -- the first clause is an app launch with a clip and no route of its own. "
+         "NA2-RULE4-PER-LAUNCHER-SCOPE-1, CoS post-merge Blocker on #448 (ask 6216180502): a venue-routed first launcher no longer "
+         "exempts a second, unrouted one after ';', ', then' or ' then' (RULE4_SECOND_LAUNCHER_REFUSE). The d2f3cd05 lint passed every "
+         "one of them (rule 4 read only the first launcher occurrence), and master passes them too. r2 (CoS review of 75cb00e1): a "
+         "launcher's gap stops at ';' and at the next pwsh / powershell / app token and spans of different clauses never merge, so "
+         "RULE4_R2_REFUSE (cross-clause pairs, ` or `, a route on launcher B only, mixed styles) refuses as well. r4: the quoted call "
+         "and a launcher name inside a path argument (RULE4_R4_REFUSE), passed by d2f3cd05 and master alike. r6: an app launch whose clip "
+         "follows an option, has no extension, or is a quoted path with a space (RULE4_R6_REFUSE): d2f3cd05 and master "
+         "refuse 60 of the 182 RED rows (the six B1 rows and both B2 rows among them) and pass the other 122, which are the rows that flip. "
+         "r7: any first argument after the app that is not the next launcher is a launch of its own (RULE4_R7_REFUSE, the generated "
+         "argument-grammar sweep): d2f3cd05 and master refuse only the rows whose first app call reaches a mode flag over a later "
+         "launcher (196 of the 913 unrouted rows, the B3 rows among them) and pass the rest, which are the rows that flip."),
+        ("rule4-sentence-split-and-codespan",
+         lambda text, f: f.get("tpl") == "seed" and text in RULE4_SPLIT_SEEDS,
+         "NA2-RULE4-SENTENCE-SPLIT-AND-CODESPAN-APP-1 (CoS review 6231429063 soft notes on #465, amend (a) of the r10 keys; listed in the PR "
+         "body): refuse-only tightenings that d2f3cd05, the pin 2f8d1a97 and master all pass. An orphan mode flag reaches the app call of the "
+         "adjacent sentence, and the app and script tokens close with a backtick (a markdown code span)."),
     )
 
     # CI-LINTDIFF-PIN-HOSTED-COST-1 spawn ceiling: the most pwsh processes this class may start. Derivation, for the widest case (a baseline
@@ -2541,6 +4228,428 @@ class LintDifferentialPinTests(unittest.TestCase):
         self.assertEqual([], _pin_problems([], [], self.ALLOWED_REFUSE_TO_PASS, self.ALLOWED_PASS_TO_REFUSE),
                          "allow-list entries are a ceiling, never a required set")
         self.assertTrue(_pin_problems([], [], (("no-reason", lambda t, f: True, " "),), ()))
+
+
+@requires_pwsh
+class CultureIndependenceTests(unittest.TestCase):
+    """r14c (sol r12d, CHANGES_REQUESTED on PR #465 r11/r12). The lint's verdict must not depend on the culture a process warmed its cached
+    Regex objects under, nor on the culture it is called under. tr-TR is the case: its (?i) table pairs I with the dotless i, so a pattern built
+    there does not match "ON THIS HOST". dc124533 built every pattern under the culture of the call itself; r11 built each once per process, so a
+    process warmed under tr-TR allowed under en-US what dc124533 refused (and the reverse order refused a venue-routed sentence dc124533 allowed).
+    The reference for every row is the lint run alone under en-US, the behaviour dc124533 has under every culture but tr / az."""
+
+    DOTTED = chr(0x130)
+    DOTLESS = chr(0x131)
+    REFUSE = (
+        "Run playback ON THIS HOST.", "RUN PLAYBACK ON THIS HOST.", "Run playback on this host.", "Run playback ON THIS HUB.",
+        "Run playback ON THIS MACHINE.", "Run playback ON THIS BOX.", "Run playback ON VIRTUAL-TEN.", "Run playback LOCALLY.",
+        "Run the GUI smoke HERE.", "Run playback ON TH" + DOTTED + "S HOST.", "Run playback on th" + DOTTED + "s host.",
+    )
+    PASS = ("Run playback LOCALLY ON BACHELOR THROUGH THE VENUE CHAIN.",)
+    # a wording that sits on the edge of the Turkish case table: only parity with the en-US run is asserted, not a verdict
+    PARITY = ("Run playback on th" + DOTLESS + "s host.", "Run playback ON THE VM.", "Run playback ON THE HOST, not on Bachelor.")
+    SEQUENCES = (
+        ("tr-TR", "en-US"), ("en-US", "tr-TR"), ("az-Latn-AZ", "en-US"), ("tr-TR", "az-Latn-AZ", "en-US", "invariant"),
+        ("invariant", "en-US", "az-Latn-AZ", "tr-TR"), ("en-US", "invariant", "tr-TR", "en-US", "az-Latn-AZ"),
+    )
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = Path(tempfile.mkdtemp(prefix="hubvm-culture-"))
+        cls.rows = list(cls.REFUSE + cls.PASS + cls.PARITY)
+        cls.reference = _culture_sequence_counts(LINT_PS1, cls.rows, ("en-US",), cls.tmp, "ref")[0]
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def test_the_en_us_reference_refuses_and_passes_the_listed_rows(self):
+        verdicts = dict(zip(self.rows, self.reference))
+        for text in self.REFUSE:
+            self.assertGreater(verdicts[text], 0, f"{text!r} is not refused under en-US")
+        for text in self.PASS:
+            self.assertEqual(0, verdicts[text], f"{text!r} is refused under en-US")
+
+    def test_a_process_warmed_under_turkish_still_refuses_under_english(self):
+        """The sol r12d repro: warm under tr-TR, switch to en-US, lint "Run playback ON THIS HOST." -> must stay refused."""
+        steps = _culture_sequence_counts(LINT_PS1, self.rows, ("tr-TR", "en-US"), self.tmp, "tr-en")
+        for culture, counts in zip(("tr-TR", "en-US"), steps):
+            verdicts = dict(zip(self.rows, counts))
+            for text in self.REFUSE:
+                self.assertGreater(verdicts[text], 0, f"warmed under tr-TR, called under {culture}: {text!r} is allowed")
+
+    def test_a_process_warmed_under_english_still_refuses_under_turkish_and_still_passes_the_routed_sentence(self):
+        steps = _culture_sequence_counts(LINT_PS1, self.rows, ("en-US", "tr-TR"), self.tmp, "en-tr")
+        for culture, counts in zip(("en-US", "tr-TR"), steps):
+            verdicts = dict(zip(self.rows, counts))
+            for text in self.REFUSE:
+                self.assertGreater(verdicts[text], 0, f"warmed under en-US, called under {culture}: {text!r} is allowed")
+            for text in self.PASS:
+                self.assertEqual(0, verdicts[text], f"warmed under en-US, called under {culture}: {text!r} is refused")
+
+    def test_the_routed_sentence_passes_after_a_turkish_warm_up(self):
+        """The reverse direction of the fail-open: a Turkish-warmed cache REFUSED a venue-routed sentence dc124533 allows under en-US."""
+        steps = _culture_sequence_counts(LINT_PS1, list(self.PASS), ("tr-TR", "en-US", "tr-TR"), self.tmp, "routed")
+        for culture, counts in zip(("tr-TR", "en-US", "tr-TR"), steps):
+            self.assertEqual([0] * len(self.PASS), counts, f"{culture}: the venue-routed sentence is refused")
+
+    def test_every_order_of_cultures_in_one_process_gives_the_en_us_result_row_for_row(self):
+        for number, sequence in enumerate(self.SEQUENCES):
+            steps = _culture_sequence_counts(LINT_PS1, self.rows, sequence, self.tmp, f"seq{number}")
+            self.assertEqual(len(sequence), len(steps), sequence)
+            for culture, counts in zip(sequence, steps):
+                drift = [(t, want, got) for t, want, got in zip(self.rows, self.reference, counts) if want != got]
+                self.assertEqual([], drift, f"sequence {sequence}, called under {culture}: rows that differ from the en-US run (text, en-US, got)")
+
+    def test_a_regex_reads_its_case_table_at_construction_not_at_match(self):
+        """The premise of the fix, measured on the runtime that runs the lint: a pattern built under tr-TR misses an upper-case I whatever the
+        match-time culture is, and one built under en-US matches it whatever the match-time culture is. If .NET ever changes this, the fix's
+        reasoning (and New-LintRegex) must be revisited, so it fails here."""
+        probe = self.tmp / "premise-probe.ps1"
+        _write_probe(
+            probe,
+            "function Use-Culture([string]$n) { [System.Globalization.CultureInfo]::CurrentCulture = [System.Globalization.CultureInfo]::GetCultureInfo($n) }\n"
+            "$out = New-Object System.Collections.Generic.List[string]\n"
+            "foreach ($built in @('tr-TR', 'en-US')) {\n"
+            "    Use-Culture $built\n"
+            "    $rx = [regex]::new('(?i)this')\n"
+            "    foreach ($matched in @('en-US', 'tr-TR')) { Use-Culture $matched; $out.Add(\"$built|$matched|\" + [int]$rx.IsMatch('THIS')) }\n"
+            "}\n"
+            "$out\n",
+        )
+        done = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(probe)], capture_output=True, text=True, timeout=120)
+        self.assertEqual(0, done.returncode, done.stderr)
+        self.assertEqual(["tr-TR|en-US|0", "tr-TR|tr-TR|0", "en-US|en-US|1", "en-US|tr-TR|1"], done.stdout.split(), done.stdout)
+
+    def test_every_regex_is_built_by_new_lintregex_under_en_us(self):
+        self.assertEqual([], _regex_construction_problems(LINT_PS1.read_text(encoding="utf-8")))
+
+    def test_the_construction_pin_bites(self):
+        """Mutations of the lint source, each of which must be reported: a Regex built outside New-LintRegex (new, a static call, two casts, -as, New-Object), the
+        build culture dropped, the restore dropped, and the function removed."""
+        text = LINT_PS1.read_text(encoding="utf-8")
+        self.assertEqual([], _regex_construction_problems(text))
+        anchor = "    $rx = $script:LintRegexCache[$Pattern]\n"
+        self.assertIn(anchor, text)
+        for what, line in (("new", "    $dodge = [regex]::new('x')\n"), ("static", "    $dodge = [regex]::IsMatch('a', 'b')\n"),
+                           ("cast", "    $dodge = [regex]'x'\n"), ("cast-variable", "    $dodge = [regex]$Pattern\n"),
+                           ("as", "    $dodge = $Pattern -as [regex]\n"), ("object", "    $dodge = New-Object System.Text.RegularExpressions.Regex 'x'\n")):
+            self.assertTrue(_regex_construction_problems(text.replace(anchor, anchor + line, 1)), what)
+        self.assertTrue(_regex_construction_problems(text.replace("CurrentCulture = $script:LintBuildCulture", "CurrentCulture = $saved", 1)), "culture dropped")
+        self.assertTrue(_regex_construction_problems(text.replace("finally {", "catch {", 1)), "restore dropped")
+        self.assertTrue(_regex_construction_problems(text.replace("function New-LintRegex", "function New-OtherRegex", 1)), "function removed")
+        self.assertTrue(_regex_construction_problems(text.replace("GetCultureInfo('en-US')", "GetCultureInfo('tr-TR')")), "wrong culture")
+
+
+# LINT-CACHE-COLD-WARM-TESTS-1 (acting-cos Dot r12 record, PR #465). The r11 cache ($script:LintPatternSet, $script:LintRegexCache) lives for the life of
+# a process, so a verdict can depend on what EARLIER calls left behind. Every other test here lints each prompt in a process of its own, or one
+# corpus pass; these drive several calls through ONE process and compare each verdict with the verdict of the same prompt in a process of its own.
+def _probe_tail(text: "str | bytes | None", limit: int = 300) -> str:
+    """The last `limit` characters of a probe stream, or the literal <no output>: a failure message must never end in an empty colon."""
+    if isinstance(text, bytes):
+        text = text.decode("utf-8", errors="replace")
+    text = (text or "").strip()
+    return repr(text[-limit:]) if text else "<no output>"
+
+
+def _cache_probe(lint: Path, steps: list[dict], work: Path, tag: str, deadline: "float | None" = None) -> list[dict]:
+    """Run `steps` in order in ONE pwsh that dot-sources `lint` once. A step is {"op": "lint", "text": T} (findings of
+    Get-LocalPlaybackPromptFindings), {"op": "regex", "pattern": P, "input": I} (Get-LintRegex P, whether it matches I, and `slot`: the first step
+    that got the same Regex OBJECT) or {"op": "state"}. Every result also carries the cache state AFTER the step: `built` (pattern set exists),
+    `grammars` (it holds the E1 grammars) and `cache` (entries in the Regex cache).
+
+    LINT-CACHE-PROBE-SHARED-BOUND-1: the pwsh is started by _run_pwsh (counted in _PWSH_SPAWNS) and killed at LINT_PROBE_BOUND_SEC from now, or at
+    `deadline` (a time.monotonic() value derived from it) when the caller shares one budget among several probes. A probe that fails raises a
+    message with the tag, the return code, whether it timed out, elapsed against the bound and both stream tails."""
+    started = time.monotonic()
+    timeout = LINT_PROBE_BOUND_SEC if deadline is None else max(1.0, deadline - started)
+    src = work / f"{tag}-in.json"
+    src.write_text(json.dumps(steps), encoding="utf-8")
+    probe = work / f"{tag}-probe.ps1"
+    _write_probe(
+        probe,
+        ". " + _psq(lint) + "\n"
+        "$steps = @(ConvertFrom-Json -InputObject ([System.IO.File]::ReadAllText(" + _psq(src) + ", [System.Text.Encoding]::UTF8)))\n"
+        "$held = New-Object System.Collections.Generic.List[object]\n"
+        "$out = New-Object System.Collections.Generic.List[object]\n"
+        "foreach ($s in $steps) {\n"
+        "    $row = [ordered]@{ op = [string]$s.op }\n"
+        "    if ($s.op -eq 'lint') { $row.findings = @(Get-LocalPlaybackPromptFindings -Text ([string]$s.text) | ForEach-Object { [string]$_ }) }\n"
+        "    elseif ($s.op -eq 'regex') {\n"
+        "        $rx = Get-LintRegex ([string]$s.pattern)\n"
+        "        $slot = -1\n"
+        "        for ($i = 0; $i -lt $held.Count; $i++) { if ([object]::ReferenceEquals($held[$i], $rx)) { $slot = $i; break } }\n"
+        "        if ($slot -lt 0) { $held.Add($rx); $slot = $held.Count - 1 }\n"
+        "        $row.slot = $slot\n"
+        "        $row.match = $rx.IsMatch([string]$s.input)\n"
+        "    }\n"
+        "    $row.built = ($null -ne $script:LintPatternSet)\n"
+        "    $row.grammars = ($null -ne $script:LintPatternSet) -and $script:LintPatternSet.ContainsKey('TailGrammar')\n"
+        "    $row.cache = [int]$script:LintRegexCache.Count\n"
+        "    $out.Add([pscustomobject]$row)\n"
+        "}\n"
+        "ConvertTo-Json -InputObject $out.ToArray() -Depth 5 -Compress\n",
+    )
+    try:
+        done = _run_pwsh(probe, timeout, encoding="utf-8")
+    except subprocess.TimeoutExpired as expired:
+        raise AssertionError(f"the cache probe {tag} timed out and was killed after {time.monotonic() - started:.0f} s (bound {LINT_PROBE_BOUND_SEC} s); "
+                             f"stderr tail: {_probe_tail(expired.stderr)}; stdout tail: {_probe_tail(expired.stdout)}") from None
+    if done.returncode != 0 or not done.stdout.strip():
+        signal = f" (signal {-done.returncode})" if done.returncode < 0 else ""
+        raise AssertionError(f"the cache probe {tag} failed: rc={done.returncode}{signal}, not timed out, elapsed {time.monotonic() - started:.1f} s "
+                             f"of the {LINT_PROBE_BOUND_SEC} s bound; stderr tail: {_probe_tail(done.stderr)}; stdout tail: {_probe_tail(done.stdout)}")
+    rows = json.loads(done.stdout.strip())
+    if len(rows) != len(steps):
+        raise AssertionError(f"the cache probe {tag} answered {len(rows)} of {len(steps)} steps")
+    return rows
+
+
+@requires_pwsh
+class LintCacheColdWarmTests(unittest.TestCase):
+    """The verdict of a prompt must not depend on the calls that came before it in the same process. The oracle of every prompt is its OWN
+    verdict in a process of its own (a cold first call), computed in setUpClass and anchored to EXPECTED so it cannot drift with the lint."""
+
+    D_HOST = "Run playback on this host."
+    D_LOCALLY = "Run playback LOCALLY."
+    D_UPPER = "Run playback ON THIS HOST."
+    D_INCIDENT = "Run the exactness arms where a GUI desktop session and the clip exist."
+    D_DIRECT = f"Run {APP} {SMOKE_MODE} on the clip."
+    C_PLAIN = "Summarise the changelog and list the open pull requests."
+    C_PROHIBITED = "Do not run playback locally."
+    E1_CLEAN = "Run playback locally on Bachelor through the venue chain."
+    E1_TAIL_DIRTY = "Run playback locally on Bachelor through the venue chain.\nThen play it here."
+    E1_HEAD_DIRTY = "Play it here.\nRun playback locally on Bachelor through the venue chain."
+    E1_HEAD_SENTENCE = "First run playback on this host, then run playback locally on Bachelor through the venue chain."
+    E1_TWO_ITEMS = "Run playback locally on Bachelor through the venue chain.\nRun playback locally on Bachelor through the venue chain."
+    E1_CLEAN_THEN_HOST = "Run playback locally on Bachelor through the venue chain.\nThen run the GUI smoke on this host."
+
+    # prompt -> the rule labels the lint reports for it (the text before the first colon), in order
+    EXPECTED = {
+        D_HOST: ["run-playback-on-this-host"],
+        D_LOCALLY: ["run-playback-locally"],
+        D_UPPER: ["run-playback-on-this-host"],
+        D_INCIDENT: ["where-a-gui-session-exists"],
+        D_DIRECT: ["direct-playback-launch"],
+        C_PLAIN: [],
+        C_PROHIBITED: [],
+        E1_CLEAN: [],
+        E1_TAIL_DIRTY: ["run-playback-locally"],
+        E1_HEAD_DIRTY: ["run-playback-locally"],
+        E1_HEAD_SENTENCE: ["run-playback-locally"],
+        E1_TWO_ITEMS: ["run-playback-locally", "run-playback-locally"],
+        E1_CLEAN_THEN_HOST: ["run-playback-locally", "run-playback-on-this-host"],
+    }
+    DIRTY = (D_HOST, D_LOCALLY, D_UPPER, D_INCIDENT, D_DIRECT)
+    CLEAN = (C_PLAIN, C_PROHIBITED)
+    E1 = (E1_CLEAN, E1_TAIL_DIRTY, E1_HEAD_DIRTY, E1_HEAD_SENTENCE, E1_TWO_ITEMS, E1_CLEAN_THEN_HOST)
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = Path(tempfile.mkdtemp(prefix="hubvm-cache-"))
+        cls.addClassCleanup(shutil.rmtree, cls.tmp, ignore_errors=True)  # tearDownClass does not run when this method raises
+        prompts = list(cls.EXPECTED)
+        deadline = time.monotonic() + LINT_PROBE_BOUND_SEC  # one budget for all the fresh probes, not one bound per wave of the pool
+
+        def fresh(number: int) -> list[str]:
+            return _cache_probe(LINT_PS1, [{"op": "lint", "text": prompts[number]}], cls.tmp, f"fresh{number}", deadline)[0]["findings"]
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            cls.oracle = dict(zip(prompts, pool.map(fresh, range(len(prompts)))))
+
+    def _run(self, texts: list[str], tag: str) -> list[dict]:
+        return _cache_probe(LINT_PS1, [{"op": "lint", "text": t} for t in texts], self.tmp, tag)
+
+    def _assert_each_verdict_is_the_fresh_one(self, texts: list[str], rows: list[dict], label: str) -> None:
+        for number, (text, row) in enumerate(zip(texts, rows)):
+            self.assertEqual(self.oracle[text], row["findings"], f"{label}: call {number + 1} ({text!r}) differs from the same prompt in a process of its own")
+
+    @staticmethod
+    def _labels(findings: list[str]) -> list[str]:
+        return [f.split(":", 1)[0] for f in findings]
+
+    def test_the_fresh_process_oracle_is_anchored_to_the_expected_labels(self):
+        for text, want in self.EXPECTED.items():
+            self.assertEqual(want, self._labels(self.oracle[text]), f"{text!r} in a process of its own")
+
+    def test_cold_first_call_builds_the_set_and_flags_what_a_fresh_process_flags(self):
+        for number, text in enumerate(self.DIRTY + self.CLEAN):
+            rows = _cache_probe(LINT_PS1, [{"op": "state"}, {"op": "lint", "text": text}, {"op": "state"}], self.tmp, f"cold{number}")
+            before, call, after = rows
+            self.assertEqual((False, False, 0), (before["built"], before["grammars"], before["cache"]), "a new process starts with nothing cached")
+            self.assertEqual(self.oracle[text], call["findings"], text)
+            self.assertTrue(call["built"], f"{text!r}: the first call did not build the pattern set")
+            self.assertFalse(call["grammars"], f"{text!r}: the E1 grammars were built for a prompt that never reaches an E1 marker")
+            self.assertEqual(call["cache"], after["cache"], "a call-less step changed the Regex cache")
+
+    def test_cold_first_call_on_an_e1_prompt_upgrades_the_set_inside_the_call(self):
+        for number, text in enumerate(self.E1):
+            rows = _cache_probe(LINT_PS1, [{"op": "state"}, {"op": "lint", "text": text}], self.tmp, f"coldE1-{number}")
+            self.assertFalse(rows[0]["built"])
+            self.assertEqual(self.oracle[text], rows[1]["findings"], text)
+            self.assertTrue(rows[1]["grammars"], f"{text!r}: an E1 marker was reached and the grammars were not built")
+
+    def test_warm_clean_dirty_alternation_gives_the_fresh_verdict_every_time(self):
+        texts = []
+        for dirty, clean in zip(self.DIRTY, itertools.cycle(self.CLEAN)):
+            texts += [clean, dirty]
+        texts += [self.C_PLAIN, self.D_HOST, self.C_PROHIBITED, self.D_UPPER]
+        rows = self._run(texts, "alternate")
+        self._assert_each_verdict_is_the_fresh_one(texts, rows, "clean/dirty alternation")
+        reverse = list(reversed(texts))
+        self._assert_each_verdict_is_the_fresh_one(reverse, self._run(reverse, "alternate-reverse"), "reversed alternation")
+
+    def test_warm_repeating_a_prompt_repeats_its_verdict_and_adds_no_cache_entries(self):
+        for text in (self.D_HOST, self.C_PLAIN, self.D_INCIDENT, self.D_DIRECT):
+            rows = self._run([text, text, text], "repeat")
+            self._assert_each_verdict_is_the_fresh_one([text] * 3, rows, "repeat")
+            self.assertEqual(rows[0]["cache"], rows[2]["cache"], f"{text!r}: a repeat call grew the Regex cache (the pattern strings are not stable)")
+
+    def test_every_ordered_pair_of_prompts_in_one_process_gives_the_fresh_verdicts(self):
+        prompts = list(self.EXPECTED)
+        pairs = [(a, b) for a in prompts for b in prompts]
+        texts = [t for pair in pairs for t in pair]
+        self._assert_each_verdict_is_the_fresh_one(texts, self._run(texts, "pairs"), "ordered pairs")
+
+    def test_lazy_upgrade_runs_once_between_calls_and_later_verdicts_stay_fresh(self):
+        texts = [self.D_HOST, self.C_PLAIN, self.E1_CLEAN, self.D_LOCALLY, self.E1_TAIL_DIRTY, self.C_PROHIBITED, self.E1_CLEAN,
+                 self.E1_HEAD_DIRTY, self.D_DIRECT, self.E1_TWO_ITEMS, self.E1_CLEAN, self.E1_HEAD_SENTENCE, self.E1_CLEAN_THEN_HOST, self.E1_CLEAN]
+        rows = self._run(texts, "upgrade")
+        self._assert_each_verdict_is_the_fresh_one(texts, rows, "lazy upgrade")
+        first_e1 = texts.index(self.E1_CLEAN)
+        for number, row in enumerate(rows):
+            self.assertEqual(number >= first_e1, row["grammars"], f"call {number + 1}: the grammars must exist exactly from the first E1 call on, and never be dropped")
+
+    def test_a_prompt_judged_by_the_un_upgraded_set_is_judged_the_same_after_the_upgrade(self):
+        """The prompts here are cut from the same sentences as the E1 ones but never reach an E1 marker, so the un-upgraded set decides them."""
+        plain = (self.D_HOST, self.D_LOCALLY, self.D_UPPER, self.D_INCIDENT, self.D_DIRECT, self.C_PLAIN, self.C_PROHIBITED)
+        texts = list(plain) + [self.E1_CLEAN] + list(plain) + [self.E1_TAIL_DIRTY, self.E1_CLEAN] + list(reversed(plain))
+        rows = self._run(texts, "before-after")
+        self._assert_each_verdict_is_the_fresh_one(texts, rows, "before/after the upgrade")
+        for row in rows[:len(plain)]:
+            self.assertFalse(row["grammars"])
+        for row in rows[len(plain):]:
+            self.assertTrue(row["grammars"])
+
+    def test_a_dirty_e1_call_leaves_no_per_call_state_for_the_next_call(self):
+        """The head / tail state of E1 (the cursor, the memo of the first dirty later item) is rebuilt for every call: a one-item prompt
+        followed by a two-item one must not read the one-item memo, and a dirty head must not stay dirty for a clean prompt."""
+        texts = [self.E1_CLEAN, self.E1_TAIL_DIRTY, self.E1_CLEAN, self.E1_HEAD_DIRTY, self.E1_CLEAN, self.E1_TWO_ITEMS, self.E1_CLEAN,
+                 self.E1_CLEAN_THEN_HOST, self.E1_CLEAN, self.E1_HEAD_SENTENCE, self.E1_CLEAN, self.E1_TAIL_DIRTY, self.E1_TAIL_DIRTY]
+        self._assert_each_verdict_is_the_fresh_one(texts, self._run(texts, "per-call"), "per-call state")
+
+    def test_the_cache_key_is_ordinal_so_patterns_that_differ_only_in_case_do_not_share_a_regex(self):
+        steps = [{"op": "regex", "pattern": "abc", "input": "abc"}, {"op": "regex", "pattern": "ABC", "input": "abc"},
+                 {"op": "regex", "pattern": "abc", "input": "ABC"}, {"op": "regex", "pattern": "ABC", "input": "ABC"},
+                 {"op": "regex", "pattern": "abc", "input": "abc"}, {"op": "regex", "pattern": "ABC", "input": "ABC"}]
+        rows = _cache_probe(LINT_PS1, steps, self.tmp, "ordinal-cold")
+        self.assertEqual([0, 1, 0, 1, 0, 1], [r["slot"] for r in rows], "slots: one Regex object per distinct, case-sensitive pattern string")
+        self.assertEqual([True, False, False, True, True, True], [r["match"] for r in rows], "each pattern matches only its own case")
+        self.assertEqual(2, rows[-1]["cache"], "two case-variant patterns are two cache entries")
+        # the same after the cache is warm: lint calls first, then the case-variant pair, then lint calls again
+        warm = ([{"op": "lint", "text": t} for t in (self.D_HOST, self.E1_CLEAN, self.C_PLAIN)] + steps
+                + [{"op": "lint", "text": t} for t in (self.D_UPPER, self.E1_TAIL_DIRTY)])
+        rows = _cache_probe(LINT_PS1, warm, self.tmp, "ordinal-warm")
+        head, mid, tail = rows[:3], rows[3:3 + len(steps)], rows[3 + len(steps):]
+        self.assertEqual([r["slot"] for r in mid], [0, 1, 0, 1, 0, 1])
+        self.assertEqual([True, False, False, True, True, True], [r["match"] for r in mid])
+        self.assertEqual(head[-1]["cache"] + 2, mid[-1]["cache"], "the case-variant pair adds exactly two entries to a warm cache")
+        self.assertEqual([self.oracle[self.D_HOST], self.oracle[self.E1_CLEAN], self.oracle[self.C_PLAIN]], [r["findings"] for r in head])
+        self.assertEqual([self.oracle[self.D_UPPER], self.oracle[self.E1_TAIL_DIRTY]], [r["findings"] for r in tail])
+
+
+# LINT-CACHE-PROBE-SHARED-BOUND-1 (merge_group run 39471086289, PR #489: "the cache probe fresh8 failed: " with nothing after the colon).
+# _cache_probe used to run its own subprocess.run with a literal 600 s outside LINT_PROBE_BOUND_SEC and _PWSH_SPAWNS, and its failure message
+# held only stderr-or-stdout, so a pwsh that died with no output left an empty message. These tests run without pwsh: subprocess.run is replaced.
+class LintCacheProbeBoundTests(unittest.TestCase):
+    STEPS = [{"op": "state"}]
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="hubvm-cacheprobe-pin-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def _probe_with(self, outcome, tag: str = "pin"):
+        """_cache_probe with subprocess.run answering `outcome` (a CompletedProcess, or an exception to raise); returns (rows, the run mock)."""
+        with mock.patch.object(subprocess, "run", side_effect=[outcome]) as run:
+            return _cache_probe(LINT_PS1, self.STEPS, self.tmp, tag), run
+
+    def _failure_of(self, outcome, tag: str = "pin") -> str:
+        with self.assertRaises(AssertionError) as caught:
+            self._probe_with(outcome, tag)
+        return str(caught.exception)
+
+    def test_the_cache_probe_runs_through_the_counted_helper_and_the_shared_bound(self):
+        done = subprocess.CompletedProcess([], 0, stdout='[{"op":"state"}]', stderr="")
+        before = len(_PWSH_SPAWNS)
+        with mock.patch.dict(globals(), {"LINT_PROBE_BOUND_SEC": 7}):
+            rows, run = self._probe_with(done, "bound")
+        self.assertEqual([{"op": "state"}], rows)
+        self.assertEqual(["bound-probe.ps1"], _PWSH_SPAWNS[before:], "the probe must be counted in _PWSH_SPAWNS")
+        timeout = run.call_args.kwargs["timeout"]
+        self.assertTrue(0 < timeout <= 7, f"the probe's timeout {timeout} must come from LINT_PROBE_BOUND_SEC (7 here), never a literal of its own")
+
+    def test_the_cache_probe_source_has_no_spawn_or_timeout_of_its_own(self):
+        tree = ast.parse(inspect.getsource(_cache_probe))
+        calls = {ast.unparse(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)}
+        names = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+        self.assertFalse({c for c in calls if c.startswith("subprocess.")}, "_cache_probe must start pwsh only through _run_pwsh")
+        self.assertIn("_run_pwsh", calls)
+        self.assertIn("LINT_PROBE_BOUND_SEC", names)
+
+    def test_a_non_zero_exit_with_no_output_names_the_tag_the_return_code_and_the_empty_streams(self):
+        message = self._failure_of(subprocess.CompletedProcess([], 3, stdout="", stderr=""), "fresh8")
+        for needle in ("fresh8", "rc=3", "<no output>", "bound"):
+            self.assertIn(needle, message)
+
+    def test_a_signal_death_is_named_as_one(self):
+        message = self._failure_of(subprocess.CompletedProcess([], -9, stdout="", stderr=""), "fresh8")
+        self.assertIn("rc=-9", message)
+        self.assertIn("signal 9", message)
+
+    def test_a_zero_exit_with_empty_stdout_is_reported_with_its_stderr_tail(self):
+        message = self._failure_of(subprocess.CompletedProcess([], 0, stdout="  \n", stderr="warn: " + "x" * 600 + "END"), "fresh8")
+        self.assertIn("rc=0", message)
+        self.assertIn("END", message, "the tail of stderr, not its head, is what explains a failure")
+
+    def test_a_probe_killed_at_the_bound_fails_typed_with_elapsed_and_bound(self):
+        with mock.patch.dict(globals(), {"LINT_PROBE_BOUND_SEC": 7}):
+            message = self._failure_of(subprocess.TimeoutExpired(["pwsh"], 7, output=None, stderr=b"half a line"), "fresh8")
+        for needle in ("fresh8", "timed out", "7 s", "half a line"):
+            self.assertIn(needle, message)
+
+    @requires_pwsh
+    def test_a_real_pwsh_that_exits_non_zero_with_no_output_gives_a_typed_message(self):
+        with tempfile.TemporaryDirectory(prefix="hubvm-cacheprobe-real-") as tmp:
+            lint = Path(tmp) / "exits.ps1"
+            lint.write_text("[Environment]::Exit(7)\n", encoding="utf-8")  # ends the whole process (a bare `exit` only ends the dot-sourced scope)
+            with self.assertRaises(AssertionError) as caught:
+                _cache_probe(lint, [{"op": "state"}], Path(tmp), "real7")
+        message = str(caught.exception)
+        for needle in ("real7", "rc=7", "<no output>"):
+            self.assertIn(needle, message)
+
+    def test_a_probe_that_raises_in_setupclass_leaves_no_temp_dir(self):
+        made: list[Path] = []
+        real_mkdtemp = tempfile.mkdtemp
+
+        def spy(*args, **kwargs):
+            made.append(Path(real_mkdtemp(*args, **kwargs)))
+            return str(made[-1])
+
+        class Throwaway(LintCacheColdWarmTests):  # own cleanup list: the real class's must never be run from here
+            pass
+
+        Throwaway._class_cleanups = []
+        self.addCleanup(lambda: [shutil.rmtree(d, ignore_errors=True) for d in made])
+        with mock.patch.dict(globals(), {"_cache_probe": mock.Mock(side_effect=AssertionError("probe boom"))}), \
+                mock.patch.object(tempfile, "mkdtemp", spy):
+            try:
+                with self.assertRaises(AssertionError):
+                    Throwaway.setUpClass()
+            finally:
+                Throwaway.doClassCleanups()  # what unittest does after a failed setUpClass
+        self.assertEqual(1, len(made))
+        self.assertFalse(made[0].exists(), "setUpClass leaked its temp dir when a fresh probe raised")
 
 
 @requires_pwsh
