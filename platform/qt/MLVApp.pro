@@ -202,6 +202,7 @@ SOURCES += \
     GpuDebayer.cpp \
     GpuDisplayViewport.cpp \
     GpuDisplayWindow.cpp \
+    LookLabelOverlay.cpp \
     GpuFieldTelemetry.cpp \
     GpuDeviceLossBreaker.cpp \
         main.cpp \
@@ -391,6 +392,8 @@ HEADERS += MainWindow.h \
            PlaybackWorkerJoin.h \
            PlaybackPresentTrace.h \
            PlaybackSwapInterval.h \
+           LookLabelPolicy.h \
+           LookLabelOverlay.h \
            PlaybackScopesDuringPlayback.h \
            DisplayDeviceMapping.h \
            PlaybackGatePolicy.h \

@@ -409,6 +409,7 @@ private slots:
     void on_actionPlaybackPreviewResQuarter_triggered();
     void on_actionPlaybackShowQualityIndicator_triggered();
     void on_actionPlaybackVSync_triggered();
+    void on_actionShowLookLabelInFullscreen_triggered();
     void on_actionPlaybackScopesHide_triggered();
     void on_actionPlaybackScopesThrottled_triggered();
     void on_actionPlaybackScopesLive_triggered();
@@ -833,6 +834,10 @@ private:
     QTime m_lastPlaybackFpsStatusUpdateTime;
     QLabel *m_pFrameNumber;
     QLabel *m_pChosenDebayer;
+    QLabel *m_pLookLabelStatus = nullptr;   // LOOK-FULLSCREEN-PARITY-1: the current look, windowed
+    QString m_lookLabelText;                // the text both labels show (updateLookLabel)
+    bool m_lookLabelFullscreenShown = false;
+    bool m_lookLabelShowInFullscreen = true; // the persisted "Show Look Label in Fullscreen" setting
     QLabel *m_pPlaybackQualityIndicator = nullptr; // Phase 4E
     // Phase 4F-toolbar: Playback Quality dropdown on the main toolbar. The
     // button is a second view onto the same Playback Quality QActions used
@@ -1904,6 +1909,13 @@ private:
                                    int analysisFrame = -1 );
     void syncLookAssistDerivedUiToReceipt( ReceiptSettings *receipt );
     lookassist::LookAssistFlavor currentLookAssistFlavor();
+    // LOOK-FULLSCREEN-PARITY-1: re-derives the look label from the state the grade uses (Look Assist
+    // on, the flavor in force) and pushes it to the status bar and, in fullscreen, to the preview
+    // surface's corner. Does nothing when neither the text nor where it shows changed.
+    void updateLookLabel( void );
+    // The look label text actually on screen now, and where ("fullscreen_gpu_window",
+    // "fullscreen_cpu_viewport", "windowed_status_bar" or "none"): the receipt's lookLabelShown.
+    QString lookLabelShownText( QString *surface );
     void setGradientMask( void );
     uint16_t autoCorrectRawBlackLevel( void );
     uint16_t autoCorrectRawWhiteLevel( void );
