@@ -22,6 +22,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -108,9 +109,25 @@ def ob(tmp_path, monkeypatch):
     return mod
 
 
+# COST (CI-SHARD8-GUARDRAILS-COST-1): the project below took seven git processes to build and was rebuilt for
+# every test that asks for `repo`. It is now built once per pytest session by `_build_repo` (body unchanged) and
+# each test gets a private copy of that directory tree. The copy holds no remote, hence no absolute path.
+_REPO_TEMPLATE = {}
+
+
 @pytest.fixture
-def repo(tmp_path):
+def repo(tmp_path, tmp_path_factory):
     """A fixture project on master: the tool at its configured path, the outbox README, one root commit."""
+    if "dir" not in _REPO_TEMPLATE:
+        template = tmp_path_factory.mktemp("hooks-repo-template")
+        _build_repo(template)
+        _REPO_TEMPLATE["dir"] = template
+    r = tmp_path / "project"
+    shutil.copytree(_REPO_TEMPLATE["dir"] / "project", r)
+    return r
+
+
+def _build_repo(tmp_path):
     r = tmp_path / "project"
     r.mkdir()
     subprocess.run(["git", "init", "-q", "-b", "master", str(r)], check=True, capture_output=True, text=True)
