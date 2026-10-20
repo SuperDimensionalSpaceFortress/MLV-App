@@ -61,7 +61,7 @@
   },
   "generator": {
     "executable": "pipeline_tests.exe",
-    "source_state_commit": "4870583ea8abd40fb452eab1c8a14247e2764a7d",
+    "source_state_commit": "3bbf2136ae3ab13409425ecbc785815d1283a65c",
     "dependency_snapshot": {
       "complete": false,
       "scope": "listed_generator_sources_and_declared_fixture_receipt_inputs_only",
