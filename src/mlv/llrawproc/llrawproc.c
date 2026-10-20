@@ -1074,7 +1074,13 @@ static void llrawproc_fake_gpu_backend_note_cuda_error(int channel,
 {
     llrawprocFakeGpuCudaErrorRing_t * r;
     igpu_cuda_error_t * e;
+    FILETIME now;
+    ULARGE_INTEGER ticks;
     if(code == 0 || channel < 0 || channel > 1) return;
+    /* As igpu_cuda_error_slot.h's note(): wall clock when noted, Unix epoch ms. */
+    GetSystemTimeAsFileTime(&now);
+    ticks.LowPart = now.dwLowDateTime;
+    ticks.HighPart = now.dwHighDateTime;
     r = &g_llrawproc_fake_gpu_backend_cuda_errors[channel];
     if(r->size == LLRAWPROC_FAKE_GPU_CUDA_ERROR_PENDING)
     {
@@ -1087,6 +1093,7 @@ static void llrawproc_fake_gpu_backend_note_cuda_error(int channel,
     e->code = code;
     snprintf(e->name, sizeof(e->name), "%s", name ? name : "");
     snprintf(e->site, sizeof(e->site), "%s", site ? site : "");
+    e->utc_ms = (double)(ticks.QuadPart - 116444736000000000ULL) / 10000.0;
     e->count = ++g_llrawproc_fake_gpu_backend_cuda_error_count;
     ++r->size;
     __atomic_store_n(&g_llrawproc_fake_gpu_backend_cuda_error_pending[channel], r->size, __ATOMIC_RELAXED);
@@ -2174,23 +2181,23 @@ static void llrawproc_gpu_stage_telemetry_emit(llrpGpuStageTelemetrySink_t sink,
     {
         const igpu_cuda_error_t * e = &ev->orphans.notes[i];
         sink("recon:uncaptured", 0, -1.0, e->code, e->name, e->site, "orphan",
-             i == 0 ? ev->orphans.dropped : 0);
+             i == 0 ? ev->orphans.dropped : 0, e->utc_ms);
     }
     if(emit_call)
     {
         if(ev->rc == 0)
         {
-            sink(ev->stage, 0, ev->ms, 0, NULL, NULL, NULL, 0);
+            sink(ev->stage, 0, ev->ms, 0, NULL, NULL, NULL, 0, 0.0);
         }
         else if(ev->noted.count == 0)
         {
-            sink(ev->stage, ev->rc, ev->ms, 0, NULL, NULL, "primary", ev->noted.dropped);
+            sink(ev->stage, ev->rc, ev->ms, 0, NULL, NULL, "primary", ev->noted.dropped, 0.0);
         }
         for(i = 0; ev->rc != 0 && i < ev->noted.count; ++i)
         {
             const igpu_cuda_error_t * e = &ev->noted.notes[i];
             sink(ev->stage, ev->rc, ev->ms, e->code, e->name, e->site,
-                 i == 0 ? "primary" : "secondary", i == 0 ? ev->noted.dropped : 0);
+                 i == 0 ? "primary" : "secondary", i == 0 ? ev->noted.dropped : 0, e->utc_ms);
         }
     }
     if(ev->orphans.notes)

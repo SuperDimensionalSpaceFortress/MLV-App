@@ -185,22 +185,55 @@ class UltraMagnusAgentMetadataFallbackTests(unittest.TestCase):
         #
         # This test stops setUp's own default agent and starts a fresh one only once BOTH jobs are
         # already sitting in the inbox together, so the agent's very first Get-ChildItem
-        # deterministically captures both in one snapshot -- no wall-clock race with the agent's own
-        # poll timing is needed to reproduce the interleaving.
+        # captures both in one snapshot.
+        #
+        # Every ordering below is an EVENT, never a wall-clock budget (this test used to flake on
+        # loaded hosted runners): the client's queue-wait ceiling (-MaxQueueWaitSec 2) is anchored
+        # at ITS submission, so a cold pwsh start of the fresh agent slower than that ceiling let
+        # the client retract "demo" before the agent's first Get-ChildItem ever listed it -- the
+        # stale-snapshot interleaving this test exists to reproduce then never happened, and no
+        # receipt was published, correctly. So (1) the client is held at its own queue deadline by
+        # um-run.ps1's -TestHookAtQueueDeadline until the agent's claim marker for "aaa-blocker"
+        # exists -- that marker is written only AFTER the agent's single enumeration, so its
+        # presence proves "demo" is in the agent's snapshot; and (2) "aaa-blocker" itself parks
+        # until the test releases it (after it has seen RETRACTED), instead of sleeping a guessed
+        # number of seconds, so the agent cannot reach "demo" before the client has withdrawn it.
         self._stop_agent()
         inbox = self.share / "inbox"
         inbox.mkdir(parents=True, exist_ok=True)
+        blocker_claim = self.share / "running" / "aaa-blocker.started.json"
+        release = self.tmp / "release-blocker.flag"
         # Sorts before "demo" (Sort-Object Name) so the agent's single snapshot processes it FIRST,
-        # giving the client time to retract "demo" while the agent is still busy with this one.
+        # keeping the agent busy while the client retracts "demo". The 90 s cap is only a hang
+        # guard (below the 120 s agent budget) so a failed test never strands the child.
         blocker = inbox / "aaa-blocker.job.ps1"
-        blocker.write_text("Start-Sleep -Seconds 5\n", encoding="utf-8")
+        blocker.write_text(
+            f"$release = '{release}'\n"
+            "$until = (Get-Date).AddSeconds(90)\n"
+            "while (-not (Test-Path -LiteralPath $release) -and (Get-Date) -lt $until) { Start-Sleep -Milliseconds 100 }\n",
+            encoding="utf-8",
+        )
 
         demo_content_job = self.local / "demo-content.job.ps1"
         demo_content_job.write_text("Write-Output 'hi'\n", encoding="utf-8")
+        submit_script = self.tmp / "retracting-submit.ps1"
+        submit_script.write_text(
+            "$ErrorActionPreference = 'Stop'\n"
+            "try {\n"
+            f"  & '{UM_RUN}' -ScriptPath '{demo_content_job}' -AgentShare '{self.share}' "
+            "-JobId 'demo' -TimeoutSec 5 -PollSeconds 1 -MaxQueueWaitSec 2 -TestHookAtQueueDeadline {\n"
+            f"    $claim = '{blocker_claim}'\n"
+            "    $until = (Get-Date).AddSeconds(90)\n"
+            "    while (-not (Test-Path -LiteralPath $claim) -and (Get-Date) -lt $until) { Start-Sleep -Milliseconds 100 }\n"
+            "  } | Out-Null\n"
+            "  Write-Output 'SUBMIT_RESULT=RETURNED'\n"
+            "} catch {\n"
+            "  Write-Output ('SUBMIT_RESULT=THREW ' + $_.Exception.Message)\n"
+            "}\n",
+            encoding="utf-8",
+        )
         submit_proc = subprocess.Popen(
-            [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(UM_RUN),
-             "-ScriptPath", str(demo_content_job), "-AgentShare", str(self.share),
-             "-JobId", "demo", "-TimeoutSec", "5", "-PollSeconds", "1", "-MaxQueueWaitSec", "2"],
+            [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(submit_script)],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
         try:
@@ -211,25 +244,31 @@ class UltraMagnusAgentMetadataFallbackTests(unittest.TestCase):
             self.assertTrue(demo_job_path.exists(), "um-run.ps1 never published demo.job.ps1 to the inbox")
 
             # Both jobs are now sitting in the inbox together -- start a fresh agent so its very
-            # first Get-ChildItem enumerates both in the SAME snapshot.
+            # first Get-ChildItem enumerates both in the SAME snapshot. The 120 s agent budget
+            # keeps its default 2 s kill from ending "aaa-blocker" before the test releases it.
             self.agent_proc = subprocess.Popen(
                 [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(AGENT_SCRIPT),
-                 "-Root", str(self.share), "-PollSeconds", "1", "-JobTimeoutSec", "2"],
+                 "-Root", str(self.share), "-PollSeconds", "1", "-JobTimeoutSec", "120"],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
 
-            submit_stdout, submit_stderr = submit_proc.communicate(timeout=30)
+            # Returns as soon as the client has retracted (the hook above holds it until the
+            # agent's snapshot provably contains "demo"); the generous bound is a hang guard.
+            submit_stdout, submit_stderr = submit_proc.communicate(timeout=120)
         finally:
             if submit_proc.poll() is None:
                 submit_proc.kill()
                 submit_proc.communicate()
+            # Always release the blocker so the agent (stopped by cleanup anyway) never waits on it.
+            release.write_text("go\n", encoding="ascii")
         submit_combined = (submit_stdout or "") + (submit_stderr or "")
         self.assertIn("RETRACTED:", submit_combined, submit_combined)
         self.assertFalse(demo_job_path.exists(), "a genuinely retracted job's own file must be gone")
         self.assertFalse((inbox / "demo.meta.json").exists(), "retraction must clean up this submission's own metadata")
 
-        # The agent is still busy with "aaa-blocker" (up to ~5s) -- once it finishes, it proceeds to
-        # "demo" from its OWN earlier snapshot and tries to launch a script that is no longer there.
+        # The agent was parked on "aaa-blocker" until the release flag above -- now that it is
+        # released, the agent proceeds to "demo" from its OWN earlier snapshot and tries to launch
+        # a script that is no longer there.
         result_path = self.share / "outbox" / "demo.result.json"
         deadline = time.time() + 25
         while time.time() < deadline and not result_path.exists():

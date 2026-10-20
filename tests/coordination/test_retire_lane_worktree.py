@@ -42,8 +42,28 @@ def _git(cwd, *args):
     subprocess.run([GIT, "-C", str(cwd), *args], check=True, capture_output=True, text=True)
 
 
+# COST (CI-SHARD8-GUARDRAILS-COST-1): the repository below took eight git processes to build and was rebuilt for
+# each of this file's ~125 cases. It is now built once per pytest session by `_build_repo` (body unchanged) and
+# each case gets a private copy of that directory tree; the one absolute path a copy carries, main's `origin` url,
+# is repointed at the copy's own bare remote.
+_REPO_TEMPLATE = {}
+
+
 @pytest.fixture()
-def repo(tmp_path):
+def repo(tmp_path, tmp_path_factory):
+    if "dir" not in _REPO_TEMPLATE:
+        template = tmp_path_factory.mktemp("retire-repo-template")
+        _build_repo(template)
+        _REPO_TEMPLATE["dir"] = template
+    remote = tmp_path / "remote.git"
+    main = tmp_path / "main"
+    shutil.copytree(_REPO_TEMPLATE["dir"] / "remote.git", remote)
+    shutil.copytree(_REPO_TEMPLATE["dir"] / "main", main)
+    _git(main, "remote", "set-url", "origin", str(remote))
+    return tmp_path, main
+
+
+def _build_repo(tmp_path):
     remote = tmp_path / "remote.git"
     main = tmp_path / "main"
     _git(tmp_path, "init", "--bare", "-b", "master", str(remote))

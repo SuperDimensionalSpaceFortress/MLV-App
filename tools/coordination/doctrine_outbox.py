@@ -83,15 +83,25 @@ BEHAVIOURS
    <tool_pin> --` with the config path in $DOCTRINE_OUTBOX_CONFIG; `tool_rel` is then optional, and a pin that is
    not provisioned on the machine refuses the push (the runner's exit passes through: a guard that cannot run is not a pass).
 11. Ruling candidates name what they touch or supersede (CoS work order FWO-DEFECT-PREVENT-1 item 4; seed #469 r1).
-   `validate` refuses an item that proposes a ruling candidate (any line that opens `Ruling candidate` once bullet,
-   quote, bold and heading marks are off, or a heading with `- RULING CANDIDATE` / `RULING CANDIDATE:` in it) unless it
+   `validate` refuses an item that proposes a ruling candidate (a line that opens `Ruling candidate` where a block
+   opens, once the body is rendered (HTML entities and tags, table cells) and normalised (Unicode, invisible characters)
+   and its bullet, quote, bold and heading marks are off; or a heading with `- RULING CANDIDATE` / `RULING CANDIDATE:` in
+   it; a wrapped continuation line, a mid-sentence mention and a citation (the phrase, a `ruling-candidates/` path and
+   a status word such as `remains`) are not markers) unless it
    carries a `touches/supersedes:` declaration (`touches:`, `supersedes:` and the bus template's `Relationship to
    existing doctrine:` count too): rule ids (`R15`) or bus-relative paths (`RULINGS.md:1126-1152`) on that line, comma or semicolon
    separated, or as bullets under it, or the single entry `none: <reason of >= 4 words>`. Typed refusals:
    RULING_CANDIDATE_NO_SUPERSEDES, _NONE_NEEDS_REASON, _NONE_WITH_RULES, _TARGET_MALFORMED, and, when the bus clone
-   (`--bus`, default $FACTORY_BUS_CLONE) lacks a named target at its tip, _TARGET_NOT_ON_BUS. The bus is only read;
-   one that cannot be read is UNKNOWN (exit 2). With no bus the shape is still checked and the unchecked targets
-   are printed as a NOTE. The drain does not apply it, and sent items are not re-judged.
+   (`--bus`, default $FACTORY_BUS_CLONE) lacks a named target at the commit its HEAD resolves to (resolved once per
+   item: every target of one item is read at one commit, but two items in one `validate` call can be judged at
+   different tips), _TARGET_NOT_ON_BUS. The bus is only read; one that cannot be read, or whose object cannot be read
+   once the tip is known, including a path whose tree lists it but whose blob or subtree is missing
+   (RULING_BUS_UNREADABLE, RULING_BUS_OBJECT_UNREADABLE), is UNKNOWN (exit 2), never a missing target. With no bus the
+   shape is still checked and the unchecked targets are printed as a NOTE. The drain does not apply it, and sent items
+   are not re-judged. Not rendered, each pinned by a test (none is used on the bus): HTML comments, footnotes,
+   definition lists, look-alike letters, a bullet glyph that is not markdown, decoration between a heading separator and
+   the phrase, a U+2236 used as a colon, a declaration label in a form the tool does not read, an indented fence line,
+   prose after a pipe, and a table delimiter row (it makes the cell before it a setext heading).
 12. Card routes are checked before they ship (CoS work order FWO-DEFECT-PREVENT-1 item 3; fail-closed, CARD-ROUTE-EXERCISE-2).
    `validate --exercise` takes every command an item names and, in a scratch `git clone --local --no-hardlinks` of the
    bus (`--bus`, default $FACTORY_BUS_CLONE) with `origin` removed, never in the bus itself, (a) checks that its program
@@ -3726,7 +3736,8 @@ def bus_commits_behind_origin(bus: pathlib.Path, git_bin: str, clone: str | os.P
 # CoS work order FWO-DEFECT-PREVENT-1 item 4 (seed: #469 r1, where the candidate quietly contradicted RULINGS.md:1126-1152,
 # R15 and an open candidate and the reviewer, not the producer, found it). `validate` refuses a ruling candidate that
 # carries no `touches/supersedes:` declaration, names a target that is not shaped like one, or names one the bus clone
-# it reads does not hold. The bus is only READ, at its committed tip (HEAD); a bus the validator cannot read is UNKNOWN.
+# it reads does not hold. The bus is only READ, at its committed tip (the commit HEAD resolves to, once per item); a bus the validator
+# cannot read is UNKNOWN, and so is one whose object cannot be read after that (a read failure is not a missing target).
 
 # Whole words: the right boundary leaves out `ruling-candidates/`, `ruling-candidate-<slug>` and the plural. Zero spaces or
 # dashes may sit between the words, because deleting an invisible character (U+200B, a soft hyphen) joins them.
@@ -3735,6 +3746,12 @@ RULING_QUALIFIER = r"(?:(?:proposed|draft|new)[ \t]+)?"
 RULING_CANDIDATE_LEAD_RE = re.compile(RULING_QUALIFIER + RULING_CANDIDATE_PHRASE, re.I)
 RULING_CANDIDATE_AFTER_SEP_RE = re.compile(r"[-:][ \t]*" + RULING_QUALIFIER + RULING_CANDIDATE_PHRASE, re.I)
 RULING_CANDIDATE_COLON_RE = re.compile(r"(?<![\w/-])ruling[ \t-]*candidate[ \t]*:", re.I)
+# `Ruling candidate `ruling-candidates/x.md` remains PROPOSED`: the phrase, a space, a candidate's path (no colon), a space
+# and a STATUS word (remains, stays, is, was, ...). That is a statement about a candidate, not a marker (bus
+# cos-feedback/_bus/pr-69.md:17); a colon, a dash, a parenthesis, nothing, or any other word after the phrase or the path
+# keeps it a marker. An item does not carry its own path, so a verb of its own (`... proposes that X`) cannot be told from a
+# citation by the path and is refused by the verb.
+RULING_CANDIDATE_CITES_RE = re.compile(r"[ \t]+ruling-candidates/[^\s:]*[ \t]+(?i:remains?|stays?|stayed|is|are|was|were|has|have|had|becomes?|became)\b")
 HTML_TAG_RE = re.compile(r"</?[A-Za-z][^<>]*>")
 # Markup that may sit in front of a marker, in any order: spaces, `>`, `#`s, a list bullet, emphasis, quotes, brackets.
 MARKER_FRONT_RE = re.compile(r"[ \t]+|(?P<quote>>)|(?P<atx>#{1,6})(?=[ \t]|$)|(?P<bullet>(?:[-+*]|\d+[.)])(?=[ \t]|$))"
@@ -3804,8 +3821,9 @@ def is_ruling_candidate(item: dict) -> bool:
     that wraps onto `ruling-candidates/x.md` or `ruling candidate titled ...` is left alone. The body is rendered
     first (`render_marker_lines`). On such a line, once normalised (`normalise_marker_line`) and stripped of markup
     (`marker_line`), the marker is `Ruling candidate` as whole words, any case, a space or dash between them, with
-    an optional `Proposed`, `Draft` or `New` before it, whatever follows (`:`, ` (r2):`, ` - `, the end of the line).
-    A heading-class line (ATX, setext, the item's first line) also counts when the phrase follows a `-` or `:`
+    an optional `Proposed`, `Draft` or `New` before it, whatever follows (`:`, ` (r2):`, ` - `, the end of the line),
+    except a citation: the phrase, a `ruling-candidates/` path with no colon, and a status word (remains, stays, is,
+    was, ...: `Ruling candidate `ruling-candidates/x.md` remains PROPOSED`; any other word, `... proposes that X`, is a marker). A heading-class line (ATX, setext, the item's first line) also counts when the phrase follows a `-` or `:`
     (`### proj, 2026-10-16 - RULING CANDIDATE (r2): X`) or is followed by a colon. A line that only mentions the
     phrase, or a heading that mentions someone else's candidate (`... for ruling candidate <id>`, no colon), is
     not a marker. A `kind: ruling` item is a ratified ruling (`ratified_by` is required for it), not a candidate."""
@@ -3829,7 +3847,8 @@ def is_ruling_candidate(item: dict) -> bool:
         opens = (prev_blank or prev_closes or forced or bullet or heading or setext or fence is not None or at_fence
                  or depth > prev_depth)
         if text and opens:
-            if RULING_CANDIDATE_LEAD_RE.match(text):
+            lead = RULING_CANDIDATE_LEAD_RE.match(text)
+            if lead and not RULING_CANDIDATE_CITES_RE.match(text, lead.end()):
                 return True
             if (heading or setext or first) and (RULING_CANDIDATE_AFTER_SEP_RE.search(text) or RULING_CANDIDATE_COLON_RE.search(text)):
                 return True
@@ -3896,8 +3915,51 @@ def _ruling_target(entry: str) -> tuple[str, str] | None:
     return "path", path
 
 
-def _bus_ruling_ids(bus: pathlib.Path) -> str:
-    return cat_file_blob(bus, "HEAD", RULINGS_FILE).decode("utf-8", errors="replace")
+def _bus_tip(bus: pathlib.Path) -> str:
+    """The bus clone's committed tip, resolved ONCE per item (`screen_ruling_candidate` calls it once): every target of that
+    item is then read at this commit, so a writer that advances the clone mid-check cannot mix two snapshots into one
+    verdict. Two items in one `validate` call each resolve their own."""
+    rc, out, _err = git_try(bus, "rev-parse", "--verify", "-q", "HEAD^{commit}")
+    if rc != 0 or not out:
+        raise Unknown("RULING_BUS_UNREADABLE", f"{bus} is not a git clone with a committed tip; the touches/supersedes targets cannot be checked")
+    return out
+
+
+def _bus_ruling_ids(bus: pathlib.Path, tip: str) -> str:
+    """RULINGS.md at `tip` (empty when the tip has none: no rule id is then on the bus). A read failure is UNKNOWN."""
+    try:
+        return cat_file_blob(bus, tip, RULINGS_FILE).decode("utf-8", errors="replace")
+    except Refusal as e:
+        if e.code != "TIP_BLOB_READ_FAILED":
+            raise
+        raise Unknown("RULING_BUS_OBJECT_UNREADABLE", e.detail) from e
+
+
+def _bus_has_path(bus: pathlib.Path, tip: str, path: str) -> bool:
+    """Whether `path` (a file or a directory) is in the tree of `tip`. `git ls-tree` exits 0 with the path listed or with
+    no output when the tip is readable and lacks it; any other exit is a read failure of the bus, which is UNKNOWN and
+    never a missing target (`git cat-file -e` exits 128 for both, so it cannot tell them apart). A listing is only the
+    parent tree's entry, so the blob or subtree it names is read as well (`cat-file -e`, with no lazy fetch: the bus is
+    never written); an entry that lists but does not read is UNKNOWN too. A gitlink names a commit of another
+    repository, which this object store need not hold, so it is not read."""
+    proc = _run_git(bus, ["ls-tree", "-z", tip, "--", path])
+    if proc.returncode != 0:
+        raise Unknown("RULING_BUS_OBJECT_UNREADABLE", f"{tip[:12]}:{path}: {proc.stderr.strip()[:300]}")
+    for entry in proc.stdout.split("\0"):
+        meta, _tab, name = entry.partition("\t")
+        if name != path:
+            continue
+        fields = meta.split()
+        if len(fields) != 3:
+            raise Unknown("RULING_BUS_OBJECT_UNREADABLE", f"{tip[:12]}:{path}: unexpected ls-tree entry {entry[:120]!r}")
+        _mode, kind, oid = fields
+        if kind != "commit":
+            read = _run_git(bus, ["cat-file", "-e", oid], extra_env={"GIT_NO_LAZY_FETCH": "1"})
+            if read.returncode != 0:
+                raise Unknown("RULING_BUS_OBJECT_UNREADABLE",
+                              f"{tip[:12]}:{path}: listed as {kind} {oid[:12]}, but the object does not read: {read.stderr.strip()[:300] or 'missing'}")
+        return True
+    return False
 
 
 def _bus_has_rule(rulings: str, rule_id: str) -> bool:
@@ -3940,23 +4002,21 @@ def screen_ruling_candidate(item: dict, bus: pathlib.Path | None = None) -> list
                       "(`RULINGS.md:1126-1152`, `tools/fleet-sweep.mjs`); not one: " + "; ".join(repr(b) for b in bad[:4]))
     if bus is None:
         return [entry for entry, _target in targets]
-    rc, _out, _err = git_try(bus, "rev-parse", "--verify", "-q", "HEAD^{commit}")
-    if rc != 0:
-        raise Unknown("RULING_BUS_UNREADABLE", f"{bus} is not a git clone with a committed tip; the touches/supersedes targets cannot be checked")
+    tip = _bus_tip(bus)
     rulings: str | None = None
     missing: list[str] = []
     for entry, target in targets:
         kind, name = target
         if kind == "rule":
-            rulings = _bus_ruling_ids(bus) if rulings is None else rulings
+            rulings = _bus_ruling_ids(bus, tip) if rulings is None else rulings
             present = _bus_has_rule(rulings, name)
         else:
-            present = git_try(bus, "cat-file", "-e", f"HEAD:{name}")[0] == 0
+            present = _bus_has_path(bus, tip, name)
         if not present:
             missing.append(entry)
     if missing:
         raise Refusal("RULING_CANDIDATE_TARGET_NOT_ON_BUS",
-                      "not on the bus clone at its tip (a path is bus-relative, a rule id is a heading or bold bullet of "
+                      f"not on the bus clone at its tip {tip[:12]} (a path is bus-relative, a rule id is a heading or bold bullet of "
                       f"{RULINGS_FILE}): " + "; ".join(repr(m) for m in missing[:6]))
     return []
 

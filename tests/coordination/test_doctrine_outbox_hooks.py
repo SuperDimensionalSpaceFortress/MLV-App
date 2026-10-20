@@ -22,6 +22,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -108,9 +109,25 @@ def ob(tmp_path, monkeypatch):
     return mod
 
 
+# COST (CI-SHARD8-GUARDRAILS-COST-1): the project below took seven git processes to build and was rebuilt for
+# every test that asks for `repo`. It is now built once per pytest session by `_build_repo` (body unchanged) and
+# each test gets a private copy of that directory tree. The copy holds no remote, hence no absolute path.
+_REPO_TEMPLATE = {}
+
+
 @pytest.fixture
-def repo(tmp_path):
+def repo(tmp_path, tmp_path_factory):
     """A fixture project on master: the tool at its configured path, the outbox README, one root commit."""
+    if "dir" not in _REPO_TEMPLATE:
+        template = tmp_path_factory.mktemp("hooks-repo-template")
+        _build_repo(template)
+        _REPO_TEMPLATE["dir"] = template
+    r = tmp_path / "project"
+    shutil.copytree(_REPO_TEMPLATE["dir"] / "project", r)
+    return r
+
+
+def _build_repo(tmp_path):
     r = tmp_path / "project"
     r.mkdir()
     subprocess.run(["git", "init", "-q", "-b", "master", str(r)], check=True, capture_output=True, text=True)
@@ -143,12 +160,13 @@ def run_pre_push(ob, repo: Path, monkeypatch, stdin_text: str) -> int:
 # ---------- the tool carries no project value ----------
 
 CANDIDATE_BUS_PATH = "tools/factory/doctrine_outbox.py"
-# The earlier card (20261016-doctrine-outbox-single-source-superset.md) is already on the bus with the previous
-# digest, and 20261019-doctrine-outbox-pin-aware-hook-candidate.md carries the pin-aware tool's digest; the tool
-# changed again (ruling candidates, then the route exercise), so the steward is handed these two cards, each naming
-# the merged tool's digest. HANDOFF_CARD is the ruling-candidate one the route test follows; ROUTE_EXERCISE_CARD is the
-# route-exercise one.
-HANDOFF_CARD = REPO_ROOT / "doctrine-outbox" / "20261019-doctrine-outbox-ruling-supersedes-candidate.md"
+# The steward is handed two cards for the merged tool, each naming its digest. HANDOFF_CARD is the markup-forms one (the
+# one the route test follows); its `supersedes:` field names the card it replaces (EARLIER_CARDS), whose digest is stale once
+# the tool changes (a card already on the bus is never edited: a changed body is a new idempotency key, so it would publish
+# twice). test_the_steward_handoff_card_supersedes_the_earlier_card derives the name from that card's own heading.
+# ROUTE_EXERCISE_CARD is the route-exercise one.
+HANDOFF_CARD = REPO_ROOT / "doctrine-outbox" / "20261020-doctrine-outbox-markup-forms-candidate.md"
+EARLIER_CARDS = (REPO_ROOT / "doctrine-outbox" / "20261019-doctrine-outbox-ruling-supersedes-candidate.md",)
 ROUTE_EXERCISE_CARD = REPO_ROOT / "doctrine-outbox" / "20261017-doctrine-outbox-route-exercise-candidate.md"
 OUTBOX_README = REPO_ROOT / "doctrine-outbox" / "README.md"
 
@@ -168,6 +186,16 @@ def test_candidate_matches_the_recorded_digest():
 def test_the_steward_handoff_card_names_the_candidate_digest():
     """The card that asks the bus steward to adopt this file quotes its digest; it must not go stale."""
     assert _bus_candidate()["sha256_lf"] in HANDOFF_CARD.read_text(encoding="utf-8")
+
+
+def test_the_steward_handoff_card_supersedes_the_earlier_card():
+    """Structural evidence, not a narrated history: the card's single `supersedes:` field names the card it replaces by
+    the `## ` id that card carries, so a card that drops out of that field (or is renamed) fails here."""
+    fields = [line for line in HANDOFF_CARD.read_text(encoding="utf-8").splitlines() if line.startswith("supersedes:")]
+    assert len(fields) == 1, fields
+    for earlier in EARLIER_CARDS:
+        ids = [line[3:].strip() for line in earlier.read_text(encoding="utf-8").splitlines() if line.startswith("## ")]
+        assert len(ids) == 1 and ids[0] in fields[0], (earlier.name, ids, fields[0])
 
 
 def test_the_route_exercise_card_names_the_candidate_digest():
