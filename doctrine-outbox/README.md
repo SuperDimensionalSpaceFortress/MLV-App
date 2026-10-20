@@ -85,9 +85,12 @@ open a block) and normalised
 two words, so the phrase may have no separator at all, no-break spaces and en or em dashes made plain) and its markdown
 is off: list bullets (`-`, `*`, `+`, `1.`), quote marks (`>`), heading
 marks (`#`), bold, italics, backticks, straight and curly quotes and opening brackets, whatever follows (`:`, ` (r2):`,
-` - `, the end of the line). A line that opens with the phrase, then cites another candidate's path and a word
-(``- Ruling candidate `ruling-candidates/x.md` remains PROPOSED``) is a citation, not a marker; a colon, a dash or
-nothing after the phrase or the path keeps it one. A heading
+` - `, the end of the line). A line that opens with the phrase, then cites a candidate's path and a status word
+(`remains`, `stays`, `is`, `are`, `was`, `were`, `has`, `have`, `had`, `becomes`, `became`:
+``- Ruling candidate `ruling-candidates/x.md` remains PROPOSED``) is a citation, not a marker; a colon, a dash, nothing
+or any other word after the phrase or the path keeps it one (``... `ruling-candidates/x.md` proposes that X`` is a
+marker: an item does not carry its own path, so the verb is what tells a proposal from a citation, and an item's own path
+followed by a status word is still read as a citation). A heading
 line also counts when the phrase follows ` - ` or `:` (`### mlv-app, 2026-10-16 - RULING CANDIDATE (r2): X`). A line
 that only mentions the phrase mid-sentence is not a marker, and neither is a wrapped continuation line: a marker only
 sits where a block opens: the item's first line, a line after a blank one, a line right after an ATX heading, a setext
@@ -99,8 +102,11 @@ rendering them flips no bus block, so each is PINNED by a test and left alone): 
 lists, look-alike letters from other scripts, a bullet glyph that is not markdown, decoration between a heading
 separator and the phrase (`### p - "RULING CANDIDATE": X`), a declaration label written in a form the tool does not read
 (`> touches/supersedes: R15`, `1. touches: R15`, a full-width colon; refused, so it fails closed), a fence-like line
-indented four spaces (it leaves the fence state open, so later wrapped prose is refused, also closed), and prose
-after a pipe that opens with the phrase (refused: a cell opens a block). It must declare what it overlaps, so the producer finds a contradiction before the reviewer does
+indented four spaces (it leaves the fence state open, so later wrapped prose is refused, also closed), prose
+after a pipe that opens with the phrase (refused: a cell opens a block), U+2236 (RATIO) written as a colon (it is
+neither a `-`/`:` before the phrase nor a colon after it, so `### p ∶ RULING CANDIDATE X` is not a marker), and a table
+delimiter row (`| --- | --- |`: it makes the last cell of the row above a setext heading, so a `-` or `:` form in that
+cell counts there and nowhere else in the row). It must declare what it overlaps, so the producer finds a contradiction before the reviewer does
 (seed: PR 469 r1). `validate` refuses one without a `touches/supersedes:` declaration (`touches:` and `supersedes:`
 count too, as does `Relationship to existing doctrine:`, the field of the bus candidate template; same list and target
 rules; bold and a bullet allowed, entries add up across labels). Each entry may open with one verb (`extends`,
@@ -114,14 +120,16 @@ not count. Typed refusals (exit 1):
 - `RULING_CANDIDATE_TARGET_MALFORMED`: an entry that is not a rule id or a bus-relative path (absolute, `..` and
   backslash paths and bare words are not targets);
 - `RULING_CANDIDATE_TARGET_NOT_ON_BUS`: with a bus clone (`validate --bus PATH`, default `$FACTORY_BUS_CLONE`), an
-  entry the clone does not hold at its committed tip (the one commit `HEAD` resolves to when the check starts; every
-  target is read there): a path that `git ls-tree <tip> -- <path>` does not list, or a
+  entry the clone does not hold at its committed tip (the one commit `HEAD` resolves to when that item's check starts:
+  every target of one item is read there, but two items in one `validate` call each resolve their own, so they can be
+  judged at different tips): a path that `git ls-tree <tip> -- <path>` does not list, or a
   rule id that is not a heading or bold bullet of `RULINGS.md` (prose mentions and `R15` against `R150` or `R15.3`
   do not count). Line ranges and anchors are not checked. The bus is only read.
 
 A bus clone that cannot be read is UNKNOWN `RULING_BUS_UNREADABLE` (exit 2), never a pass; a clone whose tip is known but
-whose object cannot be read (a missing or corrupt tree or `RULINGS.md` blob) is UNKNOWN `RULING_BUS_OBJECT_UNREADABLE`
-(exit 2), never a missing target. "At the bus tip" holds only when a bus clone is configured. With no bus the shape is
+whose object cannot be read (a missing or corrupt tree or `RULINGS.md` blob, or a path the tree lists whose blob or
+subtree is absent: the entry is read with `git cat-file -e`, never fetched) is UNKNOWN `RULING_BUS_OBJECT_UNREADABLE`
+(exit 2), never a missing target and never a pass. "At the bus tip" holds only when a bus clone is configured. With no bus the shape is
 still checked and `validate` prints a NOTE naming the targets it could not check. Non-ruling items are not looked at,
 the drain does not apply this check, and an item already sent is not re-judged. The 450-word cap still holds, so a
 candidate replaces its prose "relationship" block with the list.

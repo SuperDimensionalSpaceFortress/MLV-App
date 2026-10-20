@@ -974,3 +974,122 @@ def test_mf_the_cli_exits_2_for_an_object_read_failure_and_1_for_a_missing_targe
     present = write_item(tmp_path, candidate("touches/supersedes: tools/fleet-sweep.mjs\n"), "20261019-ruling-candidate-present.md")
     assert ob.main(["validate", "--bus", str(bus), str(present)]) == 2
     assert "RULING_BUS_OBJECT_UNREADABLE" in capsys.readouterr().err
+
+
+# ---------- ROUTE-RULING-MARKUP-FORMS-1 (r2): a listed path whose object is missing is UNKNOWN, never ACCEPT ----------
+# sol r1 blocker: `ls-tree` lists the path from the PARENT tree, so a missing blob (or a missing subtree) behind a readable
+# listing used to count as present. The directory entry is not the object; the object it names has to be read too.
+
+def test_r2_a_listed_path_whose_blob_is_missing_is_unknown_not_accepted(tmp_path):
+    bus = make_bus(tmp_path)
+    _drop_object(bus, "HEAD:tools/fleet-sweep.mjs")
+    assert "tools/fleet-sweep.mjs" in git(bus, "ls-tree", "-r", "--name-only", "HEAD"), "the parent tree must still list the path"
+    with pytest.raises(ob.Unknown) as caught:
+        call_validate([write_item(tmp_path, candidate("touches/supersedes: tools/fleet-sweep.mjs\n"))], bus)
+    assert caught.value.code == "RULING_BUS_OBJECT_UNREADABLE", caught.value
+
+
+def test_r2_a_listed_directory_whose_tree_is_missing_is_unknown_not_accepted(tmp_path):
+    bus = make_bus(tmp_path)
+    _drop_object(bus, "HEAD:specs/mlv-app")
+    with pytest.raises(ob.Unknown) as caught:
+        call_validate([write_item(tmp_path, candidate("touches/supersedes: specs/mlv-app\n"))], bus)
+    assert caught.value.code == "RULING_BUS_OBJECT_UNREADABLE", caught.value
+
+
+def test_r2_one_unreadable_target_among_present_ones_makes_the_whole_item_unknown(tmp_path):
+    bus = make_bus(tmp_path)
+    _drop_object(bus, "HEAD:tools/doctrine-sync.mjs")
+    with pytest.raises(ob.Unknown) as caught:
+        call_validate([write_item(tmp_path, candidate("touches/supersedes: R15, tools/fleet-sweep.mjs, tools/doctrine-sync.mjs\n"))], bus)
+    assert caught.value.code == "RULING_BUS_OBJECT_UNREADABLE", caught.value
+
+
+def test_r2_the_cli_exits_2_for_a_listed_path_whose_blob_is_missing(tmp_path, capsys, monkeypatch):
+    monkeypatch.delenv(BUS_ENV, raising=False)
+    bus = make_bus(tmp_path)
+    _drop_object(bus, "HEAD:tools/fleet-sweep.mjs")
+    item = write_item(tmp_path, candidate("touches/supersedes: tools/fleet-sweep.mjs\n"))
+    assert ob.main(["validate", "--bus", str(bus), str(item)]) == 2
+    assert "RULING_BUS_OBJECT_UNREADABLE" in capsys.readouterr().err
+
+
+def test_r2_a_path_whose_blob_is_readable_and_one_that_is_absent_keep_their_outcomes(tmp_path, capsys):
+    bus = make_bus(tmp_path)
+    rc, err = validate(tmp_path, candidate("touches/supersedes: tools/fleet-sweep.mjs, specs/mlv-app, specs/mlv-app/cards.md\n"), bus, capsys)
+    assert rc == 0 and err == "", err
+    rc, err = validate(tmp_path, candidate("touches/supersedes: tools/fleet-sweep.mjs, tools/nope.mjs\n"), bus, capsys)
+    assert rc == 1 and "RULING_CANDIDATE_TARGET_NOT_ON_BUS" in err and "'tools/nope.mjs'" in err and "fleet-sweep" not in err, err
+
+
+def test_r2_a_submodule_entry_is_present_without_its_commit_being_in_the_bus_object_store(tmp_path, capsys):
+    """A gitlink (mode 160000) names a commit that lives in another repository, so its object is NOT expected here."""
+    bus = make_bus(tmp_path)
+    git(bus, "update-index", "--add", "--cacheinfo", "160000," + "1" * 40 + ",vendor/sub")
+    git(bus, "commit", "-q", "-m", "add a gitlink")
+    rc, err = validate(tmp_path, candidate("touches/supersedes: vendor/sub\n"), bus, capsys)
+    assert rc == 0 and err == "", err
+
+
+# ---------- ROUTE-RULING-MARKUP-FORMS-1 (r2, opus h1): a citation is a statement ABOUT a candidate, not a proposal of one ----------
+# The citation exception used to match any `ruling-candidates/` path followed by a word. An item that opens with its own
+# candidate path and a verb of its own (`... proposes that X`) therefore passed with no declaration. An item does not carry its
+# own path, so the exception now excuses only a status word after the cited path (remains, is, was, ...).
+
+OWN_PATH_LINES = [
+    "- Ruling candidate `ruling-candidates/new-x.md` proposes that X",
+    "- Ruling candidate `ruling-candidates/new-x.md` adds a rule for Y",
+    "Ruling candidate ruling-candidates/new-x.md requires that Z",
+    "> ruling candidate `ruling-candidates/new-x.md` would bind every lane",
+]
+STATUS_CITATION_LINES = [
+    "- Ruling candidate `ruling-candidates/x.md` Remains PROPOSED",
+    "- Ruling candidate `ruling-candidates/x.md` stays open until ratified",
+    "- Ruling candidate `ruling-candidates/x.md` was filed with the push",
+]
+
+
+@pytest.mark.parametrize("line", OWN_PATH_LINES)
+def test_r2_a_line_with_the_phrase_a_candidate_path_and_a_verb_of_its_own_is_a_marker(tmp_path, capsys, line):
+    bus = make_bus(tmp_path)
+    rc, err = validate(tmp_path, _receipt(f"{NEUTRAL_HEADING}\n\n{line}\n"), bus, capsys)
+    assert rc == 1 and "RULING_CANDIDATE_NO_SUPERSEDES" in err, (line, err)
+    rc, err = validate(tmp_path, body_with(line, "touches/supersedes: R15\n"), bus, capsys)
+    assert rc == 0 and err == "", (line, err)
+
+
+@pytest.mark.parametrize("line", STATUS_CITATION_LINES)
+def test_r2_a_status_word_after_the_cited_path_is_still_a_citation(tmp_path, capsys, line):
+    rc, err = validate(tmp_path, _receipt(f"{NEUTRAL_HEADING}\n\n{line}\n"), tmp_path / "no-such-clone", capsys)
+    assert rc == 0 and err == "", (line, err)
+
+
+# ---------- ROUTE-RULING-MARKUP-FORMS-1 (r2, opus h2): the two forms r1 left unpinned, pinned at today's result ----------
+# Neither is used on the bus (U+2236: 0 occurrences) and no parser change is made; changing one of these is a decision.
+# U+2236 (RATIO) is not a dash or a colon after NFKC, so before the phrase it separates nothing; after the phrase the phrase
+# alone is the marker. A table delimiter row makes the cell right before it a setext heading, which is why `-` and `:` forms
+# count in the LAST cell of the row above it and in no other cell.
+RATIO = "∶"
+PINNED_RATIO_AND_TABLE = [
+    ("a heading with U+2236 before the phrase is accepted bare", f"### p {RATIO} RULING CANDIDATE X\n", 0),
+    ("a heading that opens with the phrase then U+2236 is refused bare", f"### RULING CANDIDATE {RATIO} X\n", 1),
+    ("a body line with U+2236 before the phrase is accepted bare", f"{NEUTRAL_HEADING}\n\np {RATIO} Ruling candidate X\n", 0),
+    ("a body line that opens with the phrase then U+2236 is refused bare", f"{NEUTRAL_HEADING}\n\nRuling candidate {RATIO} X\n", 1),
+    ("the last header cell with a separator form over a delimiter row is refused bare",
+     f"{NEUTRAL_HEADING}\n\n| a | proj - Ruling candidate X |\n| --- | --- |\n", 1),
+    ("the same cell with no delimiter row is accepted bare",
+     f"{NEUTRAL_HEADING}\n\n| a | proj - Ruling candidate X |\n", 0),
+    ("a header cell that is not the last of its row is accepted bare even over a delimiter row",
+     f"{NEUTRAL_HEADING}\n\n| proj - Ruling candidate X | b |\n| --- | --- |\n", 0),
+    ("the colon form in the last header cell over a delimiter row is refused bare",
+     f"{NEUTRAL_HEADING}\n\n| a | proj Ruling candidate: X |\n| --- | --- |\n", 1),
+]
+
+
+@pytest.mark.parametrize("label, body, refused", PINNED_RATIO_AND_TABLE, ids=[label for label, _, _ in PINNED_RATIO_AND_TABLE])
+def test_r2_pinned_u2236_and_table_delimiter_forms(tmp_path, capsys, label, body, refused):
+    rc, err = validate(tmp_path, _receipt(body), tmp_path / "no-such-clone", capsys)
+    if refused:
+        assert rc == 1 and "RULING_CANDIDATE_NO_SUPERSEDES" in err, (label, err)
+    else:
+        assert rc == 0 and err == "", (label, err)
