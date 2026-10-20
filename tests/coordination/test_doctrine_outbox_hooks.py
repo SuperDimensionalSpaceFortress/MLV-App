@@ -144,8 +144,9 @@ def run_pre_push(ob, repo: Path, monkeypatch, stdin_text: str) -> int:
 
 CANDIDATE_BUS_PATH = "tools/factory/doctrine_outbox.py"
 # The earlier card (20261016-doctrine-outbox-single-source-superset.md) is already on the bus with the previous
-# digest; the tool changed, so the steward is handed this one, which supersedes it.
-HANDOFF_CARD = REPO_ROOT / "doctrine-outbox" / "20261019-doctrine-outbox-pin-aware-hook-candidate.md"
+# digest, and 20261019-doctrine-outbox-pin-aware-hook-candidate.md carries the pin-aware tool's digest; the tool
+# changed again (ruling candidates), so the steward is handed this one, which supersedes both.
+HANDOFF_CARD = REPO_ROOT / "doctrine-outbox" / "20261019-doctrine-outbox-ruling-supersedes-candidate.md"
 OUTBOX_README = REPO_ROOT / "doctrine-outbox" / "README.md"
 
 

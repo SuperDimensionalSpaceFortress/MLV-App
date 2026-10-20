@@ -82,12 +82,23 @@ BEHAVIOURS
    file at config `tool_rel`, or, when the config sets `tool_pin`, `python -I factory-pins/pin-runner.py run
    <tool_pin> --` with the config path in $DOCTRINE_OUTBOX_CONFIG; `tool_rel` is then optional, and a pin that is
    not provisioned on the machine refuses the push (the runner's exit passes through: a guard that cannot run is not a pass).
+11. Ruling candidates name what they touch or supersede (CoS work order FWO-DEFECT-PREVENT-1 item 4; seed #469 r1).
+   `validate` refuses an item that proposes a ruling candidate (any line that opens `Ruling candidate` once bullet,
+   quote, bold and heading marks are off, or a heading with `- RULING CANDIDATE` / `RULING CANDIDATE:` in it) unless it
+   carries a `touches/supersedes:` declaration (`touches:`, `supersedes:` and the bus template's `Relationship to
+   existing doctrine:` count too): rule ids (`R15`) or bus-relative paths (`RULINGS.md:1126-1152`) on that line, comma or semicolon
+   separated, or as bullets under it, or the single entry `none: <reason of >= 4 words>`. Typed refusals:
+   RULING_CANDIDATE_NO_SUPERSEDES, _NONE_NEEDS_REASON, _NONE_WITH_RULES, _TARGET_MALFORMED, and, when the bus clone
+   (`--bus`, default $FACTORY_BUS_CLONE) lacks a named target at its tip, _TARGET_NOT_ON_BUS. The bus is only read;
+   one that cannot be read is UNKNOWN (exit 2). With no bus the shape is still checked and the unchecked targets
+   are printed as a NOTE. The drain does not apply it, and sent items are not re-judged.
 
 Nothing here runs itself: the OS drain task, Stop hook and heartbeat debt are the project's wiring.
 
 Subcommands
 -----------
-    validate <item.md>...                       parse + screen item files
+    validate <item.md>... [--bus PATH]          parse + screen item files; a ruling candidate needs `touches/supersedes:`
+                                                naming rules or bus paths that exist at the bus tip (behaviour 11)
     debt [--ref R] [--ledger P] [--bus PATH] [--json]
     drain --bus PATH [--ref R] [--push] [--ledger P] [--deny-file P]
     kernel-filing --bus PATH [--ref R] [--push] [--ledger P] [--deny-file P]
@@ -109,6 +120,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import html
 import json
 import os
 import pathlib
@@ -121,6 +133,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 from datetime import datetime, timedelta, timezone
 
 # ---------- constants that are fleet-wide, not per project ----------
@@ -2384,9 +2397,250 @@ def cmd_session_start(repo: pathlib.Path, ref: str, ledger: pathlib.Path) -> int
     return 0
 
 
+# ---------- ruling candidates must name what they touch or supersede ----------
+#
+# CoS work order FWO-DEFECT-PREVENT-1 item 4 (seed: #469 r1, where the candidate quietly contradicted RULINGS.md:1126-1152,
+# R15 and an open candidate and the reviewer, not the producer, found it). `validate` refuses a ruling candidate that
+# carries no `touches/supersedes:` declaration, names a target that is not shaped like one, or names one the bus clone
+# it reads does not hold. The bus is only READ, at its committed tip (HEAD); a bus the validator cannot read is UNKNOWN.
+
+# Whole words: the right boundary leaves out `ruling-candidates/`, `ruling-candidate-<slug>` and the plural. Zero spaces or
+# dashes may sit between the words, because deleting an invisible character (U+200B, a soft hyphen) joins them.
+RULING_CANDIDATE_PHRASE = r"ruling[ \t-]*candidate(?![-\w/])"
+RULING_QUALIFIER = r"(?:(?:proposed|draft|new)[ \t]+)?"
+RULING_CANDIDATE_LEAD_RE = re.compile(RULING_QUALIFIER + RULING_CANDIDATE_PHRASE, re.I)
+RULING_CANDIDATE_AFTER_SEP_RE = re.compile(r"[-:][ \t]*" + RULING_QUALIFIER + RULING_CANDIDATE_PHRASE, re.I)
+RULING_CANDIDATE_COLON_RE = re.compile(r"(?<![\w/-])ruling[ \t-]*candidate[ \t]*:", re.I)
+HTML_TAG_RE = re.compile(r"</?[A-Za-z][^<>]*>")
+# Markup that may sit in front of a marker, in any order: spaces, `>`, `#`s, a list bullet, emphasis, quotes, brackets.
+MARKER_FRONT_RE = re.compile(r"[ \t]+|(?P<quote>>)|(?P<atx>#{1,6})(?=[ \t]|$)|(?P<bullet>(?:[-+*]|\d+[.)])(?=[ \t]|$))"
+                             "|[*_`\"'“”‘’«»‹›\\[(]")
+MARKER_UNDERLINE_RE = re.compile(r"=+|-+")   # a setext underline, once the line is stripped
+RULING_TARGET_VERB_RE = re.compile(r"(?:extends|supersedes|distinguishes|touches|narrows|adopts)[ \t]+(?=\S)", re.I)
+TOUCHES_LABEL_RE = re.compile(r"^([ \t]*)([-*][ \t]+)?(?:\*\*)?(?:touches/supersedes|touches|supersedes|relationship[ \t]+to[ \t]+existing[ \t]+doctrine)(?:\*\*)?:(?:\*\*)?[ \t]*(.*?)[ \t]*$", re.I)
+TOUCHES_BULLET_RE = re.compile(r"^([ \t]*)[-*][ \t]+(\S.*?)[ \t]*$")
+TOUCHES_NONE_RE = re.compile(r"^none\b[ \t]*[:\-–—]?[ \t]*(.*)$", re.I)
+RULING_RULE_ID_RE = re.compile(r"^R\d+(?:\.\d+)*$")
+RULING_PATH_RE = re.compile(r"^([A-Za-z0-9_][\w.@+-]*(?:/[\w.@+-]+)*)/?(?::\d+(?:-\d+)?|#[\w.-]+)?$")
+RULING_TARGET_NOTE_RE = re.compile(r"[ \t]+\(.*\)$")
+RULING_BUS_ENV = "FACTORY_BUS_CLONE"
+RULINGS_FILE = "RULINGS.md"
+
+
+def normalise_marker_line(line: str) -> str:
+    """One line as the marker test reads it: Unicode NFKD with the combining marks (category Mn) dropped, then NFKC
+    (full-width forms and no-break spaces become their ASCII twins), every format character (zero-width space or
+    joiner, BOM, soft hyphen) deleted, every space separator a plain space, every dash (en, em, minus, non-breaking
+    hyphen) a `-`."""
+    out = []
+    decomposed = "".join(ch for ch in unicodedata.normalize("NFKD", line.rstrip("\r\n")) if unicodedata.category(ch) != "Mn")
+    for ch in unicodedata.normalize("NFKC", decomposed):
+        category = unicodedata.category(ch)
+        if category == "Cf":
+            continue
+        out.append(" " if category == "Zs" else "-" if category == "Pd" or ch == "−" else ch)
+    return "".join(out)
+
+
+def marker_line(line: str) -> tuple[str, int, bool, bool]:
+    """(text, quote depth, was a list item, was an ATX heading) for one line: its markup (`>`, `#`s, a bullet,
+    emphasis, quotes, brackets) comes off the front in any order, and `*`, `_` and backticks come out of the rest,
+    so the words a marker opens with are the first thing left."""
+    text, depth, bullet, heading = normalise_marker_line(line), 0, False, False
+    while True:
+        found = MARKER_FRONT_RE.match(text)
+        if not found:
+            return re.sub(r"[*_`]", "", text).strip(), depth, bullet, heading
+        depth += bool(found.group("quote"))
+        bullet = bullet or bool(found.group("bullet"))
+        heading = heading or bool(found.group("atx"))
+        text = text[found.end():]
+
+
+def render_marker_lines(body: str) -> list[tuple[str, bool]]:
+    """The body as the marker test reads it, as (line, opens a block) pairs: HTML entities decoded (`&nbsp;`, `&#160;`),
+    HTML tags dropped with their text kept (`<strong>Ruling candidate:</strong>`), and a line with a `|` split into its
+    cells, each its own block-opening line (a leading pipe or a table delimiter row leaves no cell of its own)."""
+    rendered: list[tuple[str, bool]] = []
+    for raw in body.splitlines():
+        line = HTML_TAG_RE.sub("", html.unescape(raw.rstrip("\r")))
+        if "|" in line:
+            rendered += [(cell, True) for cell in [c for c in line.split("|") if c.strip()] or [""]]
+        else:
+            rendered.append((line, False))
+    return rendered
+
+
+def is_ruling_candidate(item: dict) -> bool:
+    """A ruling candidate is an item with a marker line. A line can be one only where a block OPENS: the item's first
+    line, a line after a blank one, a line after a heading (ATX or setext underline), a thematic break or a fence
+    line (opening or closing), a heading, a list item, a table cell, a line that starts a deeper blockquote, a setext
+    heading (a line over `===` or `---`), or any line in or at a fence (when in doubt it is a candidate; a fence
+    closes on the same character, at least as long). A continuation line of a wrapped paragraph never is, so prose
+    that wraps onto `ruling-candidates/x.md` or `ruling candidate titled ...` is left alone. The body is rendered
+    first (`render_marker_lines`). On such a line, once normalised (`normalise_marker_line`) and stripped of markup
+    (`marker_line`), the marker is `Ruling candidate` as whole words, any case, a space or dash between them, with
+    an optional `Proposed`, `Draft` or `New` before it, whatever follows (`:`, ` (r2):`, ` - `, the end of the line).
+    A heading-class line (ATX, setext, the item's first line) also counts when the phrase follows a `-` or `:`
+    (`### proj, 2026-10-16 - RULING CANDIDATE (r2): X`) or is followed by a colon. A line that only mentions the
+    phrase, or a heading that mentions someone else's candidate (`... for ruling candidate <id>`, no colon), is
+    not a marker. A `kind: ruling` item is a ratified ruling (`ratified_by` is required for it), not a candidate."""
+    lines = render_marker_lines(item["body"])
+    fence: tuple[str, int] | None = None
+    seen_text, prev_blank, prev_depth, prev_closes = False, True, 0, False
+    for i, (line, forced) in enumerate(lines):
+        text, depth, bullet, heading = marker_line(line)
+        unquoted = line.lstrip(" \t>")
+        fence_line = _FENCE_OPEN_RE.match(unquoted)
+        at_fence = False
+        if fence is not None:
+            if fence_line and fence_line.group(1)[0] == fence[0] and len(fence_line.group(1)) >= fence[1] and not unquoted.strip(" `~"):
+                fence, at_fence = None, True
+        elif fence_line:
+            fence, at_fence = (fence_line.group(1)[0], len(fence_line.group(1))), True
+        setext = (bool(text) and not MARKER_UNDERLINE_RE.fullmatch(text) and i + 1 < len(lines)
+                  and bool(MARKER_UNDERLINE_RE.fullmatch(marker_line(lines[i + 1][0])[0])))
+        first = bool(text) and not seen_text
+        seen_text = seen_text or bool(text)
+        opens = (prev_blank or prev_closes or forced or bullet or heading or setext or fence is not None or at_fence
+                 or depth > prev_depth)
+        if text and opens:
+            if RULING_CANDIDATE_LEAD_RE.match(text):
+                return True
+            if (heading or setext or first) and (RULING_CANDIDATE_AFTER_SEP_RE.search(text) or RULING_CANDIDATE_COLON_RE.search(text)):
+                return True
+        # the next line opens a block when this one ended one: an ATX heading, a setext underline or thematic break, a fence line
+        prev_blank, prev_depth = not text, depth
+        prev_closes = heading or at_fence or bool(MARKER_UNDERLINE_RE.fullmatch(text))
+    return False
+
+
+def touches_supersedes_entries(body: str) -> list[str] | None:
+    """The entries of a candidate's `touches/supersedes:` declaration, or None when no label is present. The label
+    is `touches/supersedes:`, `touches:`, `supersedes:` or `Relationship to existing doctrine:` (the bus candidate
+    template's own field), may be a bullet and bold, and may repeat; entries add up.
+    Entries are the comma- or semicolon-separated names after a label on the same line, plus the bullet lines
+    indented under it (or, when the label is not a bullet, the bullets right below it) up to the first blank line or
+    non-bullet. A value that opens with `none` is one entry, whole, so its reason keeps its commas. A label inside
+    a fenced block does not count."""
+    lines = body.splitlines()
+    fence: tuple[str, int] | None = None
+    entries: list[str] | None = None
+    for i, raw in enumerate(lines):
+        line = raw.rstrip("\r")
+        opened = _FENCE_OPEN_RE.match(line)
+        if fence is not None:
+            if opened and opened.group(1)[0] == fence[0] and len(opened.group(1)) >= fence[1] and not line.strip(" `~"):
+                fence = None
+            continue
+        if opened:
+            fence = (opened.group(1)[0], len(opened.group(1)))
+            continue
+        found = TOUCHES_LABEL_RE.match(line)
+        if not found:
+            continue
+        indent, bullet, inline = len(found.group(1).expandtabs(4)), found.group(2), found.group(3).replace("**", "").strip()
+        entries = [] if entries is None else entries
+        if inline:
+            entries += [inline] if TOUCHES_NONE_RE.match(inline) else [e.strip(" `") for e in re.split(r"[;,]", inline) if e.strip(" `")]
+        for follow in lines[i + 1:]:
+            sub = TOUCHES_BULLET_RE.match(follow.rstrip("\r"))
+            if not sub:
+                break
+            depth = len(sub.group(1).expandtabs(4))
+            if bullet is not None and depth <= indent:
+                break
+            entries.append(sub.group(2).replace("**", "").strip(" `"))
+    return entries
+
+
+def _ruling_target(entry: str) -> tuple[str, str] | None:
+    """(kind, name) for one entry, or None when it is not shaped like a target. `rule` is an id like `R15` or `R14.8`;
+    `path` is a bus-relative file or directory, with an optional `:<line>[-<line>]` or `#<anchor>` that is not
+    checked. A leading verb (`extends`, `supersedes`, `distinguishes`, `touches`, `narrows`, `adopts`) and a
+    trailing parenthetical note are dropped. A bare word, an absolute or `..` path and a backslash path are not
+    targets."""
+    target = RULING_TARGET_NOTE_RE.sub("", RULING_TARGET_VERB_RE.sub("", entry, count=1)).strip(" `")
+    if RULING_RULE_ID_RE.match(target):
+        return "rule", target
+    found = RULING_PATH_RE.match(target)
+    if not found or re.match(r"^r\d+(?:\.\d+)*\.?$", target, re.I):   # `r15.` is a mistyped rule id, not a file
+        return None
+    path = found.group(1)
+    if ("/" not in path and "." not in path) or any(part in (".", "..") for part in path.split("/")):
+        return None
+    return "path", path
+
+
+def _bus_ruling_ids(bus: pathlib.Path) -> str:
+    return cat_file_blob(bus, "HEAD", RULINGS_FILE).decode("utf-8", errors="replace")
+
+
+def _bus_has_rule(rulings: str, rule_id: str) -> bool:
+    """A rule id is on the bus when a heading or a bold bullet of RULINGS.md opens with or names it (`## ... R15: ...`,
+    `- **R15.3 - ...`); an id mentioned only in prose does not count, and `R15` is not satisfied by `R150` or `R15.3`."""
+    token = re.compile(r"(?<![\w.])" + re.escape(rule_id) + r"(?![\w]|\.\d)")
+    for line in rulings.splitlines():
+        if (line.startswith("#") or re.match(r"^\s*[-*]?\s*\*\*", line)) and token.search(line[:240]):
+            return True
+    return False
+
+
+def screen_ruling_candidate(item: dict, bus: pathlib.Path | None = None) -> list[str]:
+    """Refuse a ruling candidate whose `touches/supersedes:` declaration is missing or empty, mixes `none` with rule
+    ids, gives `none` without a reason of NONE_REASON_MIN_WORDS words (the floor a `Doctrine-Export: none` carries),
+    names an entry that is not a rule id or a bus-relative path, or, when `bus` is given, names one the bus clone
+    does not hold at its tip. Returns the targets it could not check because no bus was given (empty otherwise).
+    A bus that cannot be read is UNKNOWN, never a pass. A non-candidate is not looked at."""
+    if not is_ruling_candidate(item):
+        return []
+    entries = touches_supersedes_entries(item["body"])
+    if not entries:
+        raise Refusal("RULING_CANDIDATE_NO_SUPERSEDES",
+                      "a ruling candidate needs a non-empty `touches/supersedes:` list (or `Relationship to existing "
+                      "doctrine:`): the rules or specs it overlaps, as rule ids or bus paths, or `none: <reason>`")
+    nones = [e for e in entries if TOUCHES_NONE_RE.match(e)]
+    if nones:
+        if len(entries) > 1:
+            raise Refusal("RULING_CANDIDATE_NONE_WITH_RULES", "`none` cannot sit beside other entries in `touches/supersedes:`")
+        reason = TOUCHES_NONE_RE.match(nones[0]).group(1)
+        if len(reason.split()) < NONE_REASON_MIN_WORDS:
+            raise Refusal("RULING_CANDIDATE_NONE_NEEDS_REASON",
+                          f"`none` in `touches/supersedes:` needs a reason of at least {NONE_REASON_MIN_WORDS} words")
+        return []
+    targets = [(entry, _ruling_target(entry)) for entry in entries]
+    bad = [entry for entry, target in targets if target is None]
+    if bad:
+        raise Refusal("RULING_CANDIDATE_TARGET_MALFORMED",
+                      "each `touches/supersedes:` entry is a rule id (`R15`, `R14.8`) or a bus-relative path "
+                      "(`RULINGS.md:1126-1152`, `tools/fleet-sweep.mjs`); not one: " + "; ".join(repr(b) for b in bad[:4]))
+    if bus is None:
+        return [entry for entry, _target in targets]
+    rc, _out, _err = git_try(bus, "rev-parse", "--verify", "-q", "HEAD^{commit}")
+    if rc != 0:
+        raise Unknown("RULING_BUS_UNREADABLE", f"{bus} is not a git clone with a committed tip; the touches/supersedes targets cannot be checked")
+    rulings: str | None = None
+    missing: list[str] = []
+    for entry, target in targets:
+        kind, name = target
+        if kind == "rule":
+            rulings = _bus_ruling_ids(bus) if rulings is None else rulings
+            present = _bus_has_rule(rulings, name)
+        else:
+            present = git_try(bus, "cat-file", "-e", f"HEAD:{name}")[0] == 0
+        if not present:
+            missing.append(entry)
+    if missing:
+        raise Refusal("RULING_CANDIDATE_TARGET_NOT_ON_BUS",
+                      "not on the bus clone at its tip (a path is bus-relative, a rule id is a heading or bold bullet of "
+                      f"{RULINGS_FILE}): " + "; ".join(repr(m) for m in missing[:6]))
+    return []
+
+
 # ---------- CLI commands ----------
 
-def cmd_validate(paths: list[pathlib.Path], deny_terms: list[tuple[str, str]]) -> int:
+def cmd_validate(paths: list[pathlib.Path], deny_terms: list[tuple[str, str]],
+                 bus: pathlib.Path | None = None) -> int:
     ok = True
     concern_ids: dict[str, pathlib.Path] = {}
     for p in paths:
@@ -2401,6 +2655,10 @@ def cmd_validate(paths: list[pathlib.Path], deny_terms: list[tuple[str, str]]) -
             item = parse_item(text)
             screen_law4(item["body"], deny_terms)
             screen_rendered_card(item)
+            unchecked = screen_ruling_candidate(item, bus)
+            if unchecked:
+                print(f"[doctrine-outbox] NOTE {p}: touches/supersedes targets NOT checked against the bus (pass --bus <bus clone> "
+                      f"or set ${RULING_BUS_ENV}): {'; '.join(unchecked[:6])}", file=sys.stderr)
             if "concern" in item:
                 cid = item["concern"]["id"]
                 if cid in concern_ids:
@@ -2446,6 +2704,9 @@ def build_parser() -> argparse.ArgumentParser:
     validate_p = sub.add_parser("validate", help="parse + screen one or more item files")
     validate_p.add_argument("items", nargs="+", type=pathlib.Path)
     validate_p.add_argument("--deny-file", type=pathlib.Path, default=None)
+    validate_p.add_argument("--bus", type=pathlib.Path, default=None,
+                            help=f"the bus clone (default ${RULING_BUS_ENV}): a ruling candidate's touches/supersedes targets "
+                                 "must exist at its tip; read, never written or run in")
 
     debt_p = sub.add_parser("debt", help="list unsent items; exit 1 if any, 2 if UNKNOWN")
     debt_p.add_argument("--ref", default=DEFAULT_REF)
@@ -2543,7 +2804,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.cmd == "validate":
             deny_terms = gather_deny_terms(resolve_deny_file(repo, args.deny_file))
-            return cmd_validate(args.items, deny_terms)
+            env_bus = os.environ.get(RULING_BUS_ENV)
+            bus = args.bus.resolve() if args.bus is not None else (pathlib.Path(env_bus).resolve() if env_bus else None)
+            return cmd_validate(args.items, deny_terms, bus)
         if args.cmd == "debt":
             ledger = resolve_ledger(repo, args.ledger)
             bus = args.bus.resolve() if args.bus is not None else None
