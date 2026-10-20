@@ -4617,9 +4617,7 @@ class LintCacheProbeBoundTests(unittest.TestCase):
         for needle in ("fresh8", "timed out", "7 s", "half a line"):
             self.assertIn(needle, message)
 
-
-@requires_pwsh
-class LintCacheProbeRealFailureTests(unittest.TestCase):
+    @requires_pwsh
     def test_a_real_pwsh_that_exits_non_zero_with_no_output_gives_a_typed_message(self):
         with tempfile.TemporaryDirectory(prefix="hubvm-cacheprobe-real-") as tmp:
             lint = Path(tmp) / "exits.ps1"
@@ -4630,8 +4628,6 @@ class LintCacheProbeRealFailureTests(unittest.TestCase):
         for needle in ("real7", "rc=7", "<no output>"):
             self.assertIn(needle, message)
 
-
-class LintCacheSetUpClassCleanupTests(unittest.TestCase):
     def test_a_probe_that_raises_in_setupclass_leaves_no_temp_dir(self):
         made: list[Path] = []
         real_mkdtemp = tempfile.mkdtemp
