@@ -4541,11 +4541,12 @@ def test_invoke_lane_stops_the_daemon_when_the_lane_ends_with_the_worktree_kept(
 
 
 def test_invoke_lane_closes_its_kill_on_close_job_before_the_lane_end_stop():
-    """LANE-FSMONITOR-FOLLOWUPS-1 (c), evidence pin (no behaviour change). A descendant of the lane cannot restart fsmonitor between the job close and
-    the lane-end stop because the job's only limit is KILL_ON_JOB_CLOSE (0x2000): no BREAKAWAY_OK (0x800) or SILENT_BREAKAWAY_OK (0x1000), so no
-    descendant can leave it, and closing the handle kills every one. The first close sits at the top of the finally block, ahead of the retire gate,
-    the sweep, the post-exit dirty check and the lane-end stop. What this does NOT cover is a process started OUTSIDE the job (WMI, a scheduled task,
-    COM): that is the open question in LANE-FSMONITOR-DESCENDANT-RESTART-1."""
+    """LANE-FSMONITOR-FOLLOWUPS-1 (c), evidence pin (no behaviour change). For a CLAUDE-engine lane, a descendant cannot restart fsmonitor between the
+    job close and the lane-end stop because the job's only limit is KILL_ON_JOB_CLOSE (0x2000): no BREAKAWAY_OK (0x800) or SILENT_BREAKAWAY_OK
+    (0x1000), so no descendant can leave it, and closing the handle kills every one. The first close sits at the top of the finally block, ahead of
+    the retire gate, the sweep, the post-exit dirty check and the lane-end stop. What this does NOT cover: (1) a Codex-engine lane, which is started
+    without a job object (the job exists only on the Claude branch), so this ordering says nothing about its descendants; (2) a process started
+    OUTSIDE the job (WMI, a scheduled task, COM). Both are the open question in LANE-FSMONITOR-DESCENDANT-RESTART-1."""
     lane = FSMON_LANE_TEXT
     assert "value.BasicLimitInformation.LimitFlags=0x2000;" in lane, "the job limit changed; re-derive whether a descendant can now break away"
     finally_at = lane.index("# Cleanup must precede all receipt construction and I/O")
@@ -4618,7 +4619,9 @@ FSMON_STATEMENT_PREFIX = ";{(|= \t\r\n"
 
 # LANE-FSMONITOR-FOLLOWUPS-1 (a): names that STAND FOR git, found by reading the script's own assignments. `$tool = 'git'` / `$g = (Get-Command git).Source`
 # make `& $tool ...` and `Start-Process $tool` git calls whatever the variable is called, and `Set-Alias g git` makes a bare `g ...` one. A name
-# that is computed, read from the environment or returned by a helper is out of reach of a lexical scan (see FSMON_INDIRECT_KNOWN_GAPS).
+# that is computed, read from the environment or returned by a helper is out of reach of a lexical scan (see FSMON_INDIRECT_KNOWN_GAPS), and so is a
+# name that is reassigned to git after a non-git value, or held in a scope-qualified variable ($script:g, $global:g) or a `-Scope`d alias. The
+# discovery stays syntax-limited on purpose (LANE-FSMONITOR-FOLLOWUPS-2): those shapes are pinned as misses, not chased.
 FSMON_GIT_VALUE = (
     r"(?:['\"](?:[^'\"\n]*[\\/])?git(?:\.exe)?['\"]"
     r"|\(?[ \t]*Get-Command[ \t]+(?:-Name[ \t]+)?['\"]?(?:[^\s'\"|)]*[\\/])?git(?:\.exe)?(?![\w.-]))"
@@ -4800,6 +4803,7 @@ def test_fsmonitor_lane_pin_reads_powershell_lexing_shapes(git_call):
 # LANE-FSMONITOR-FOLLOWUPS-1 (a): the scanner is a regex over PowerShell text, so it is syntax-limited. These pin the indirect and aliased spellings of
 # "run git" it must catch (each one a probed shape, see FSMON_INDIRECT_CAUGHT) and name the ones it cannot (FSMON_INDIRECT_KNOWN_GAPS). Detection
 # is NOT claimed exhaustive: a name that is computed at run time or read from the environment hides git from any lexical scan.
+# 30 entries: 13 already caught before LANE-FSMONITOR-FOLLOWUPS-1 plus 17 it added (the #524 commit message says 31; the table holds 30, pinned below).
 FSMON_INDIRECT_CAUGHT = {
     # already caught before this card; pinned so a later regex edit cannot drop them
     "var-assigned-from-get-command": "$git = (Get-Command git.exe).Source\n& $git -C $WorkDir status",
@@ -4841,8 +4845,23 @@ FSMON_INDIRECT_KNOWN_GAPS = {
     "environment-supplied-path": "& $env:GIT_EXE -C $WorkDir status",
     "variable-from-helper-result": "$exe = Find-Tool 'vcs'\n& $exe -C $WorkDir status",
     "variable-from-other-variable": "$tool = $global:Vcs\n& $tool -C $WorkDir status",
+    # LANE-FSMONITOR-FOLLOWUPS-2: the discovery reads each assignment on its own line and does not follow a name through scopes or reassignment
+    "alias-reassigned-to-git-by-command": "New-Alias g ls\nSet-Alias g (Get-Command git)\ng -C $WorkDir status",
+    "alias-reassigned-from-environment": "Set-Alias g ls\nSet-Alias g $env:GIT_EXE\ng -C $WorkDir status",
+    "variable-reassigned-from-git-named-variable": "$tool = 'ls'\n$tool = $gitExe\n& $tool -C $WorkDir status",
+    "script-scoped-variable": "$script:g = 'git'\n& $script:g -C $WorkDir status",
+    "global-scoped-variable-from-get-command": "$global:tool = (Get-Command git).Source\n& $global:tool -C $WorkDir status",
+    "alias-with-scope-before-name": "Set-Alias -Scope Global -Name g -Value git\ng -C $WorkDir status",
 }
-FSMON_LANE_TEXT = (ROOT / "tools" / "coordination" / "Invoke-Lane.ps1").read_text(encoding="utf-8")
+# The opposite direction: the discovery also reads an alias or variable out of a `#` line comment, so a COMMENTED-OUT assignment makes the later call
+# look like git. That over-detects (a lane script gets refused a pin it would pass), which is the safe side; pinned so nobody mistakes it for a miss.
+# A <# block comment #> is blanked before discovery and is not read (see the unrelated-commands test).
+FSMON_INDIRECT_OVERREADS = {
+    "commented-out-alias": "# Set-Alias g git\ng -C $WorkDir status",
+    "commented-out-variable": "# $tool = 'git'\n& $tool -C $WorkDir status",
+    "reassigned-away-from-git": "$tool = 'git'\n$tool = 'ls'\n& $tool -C $WorkDir",
+}
+FSMON_LANE_TEXT =(ROOT / "tools" / "coordination" / "Invoke-Lane.ps1").read_text(encoding="utf-8")
 
 
 @pytest.mark.parametrize("git_call", list(FSMON_INDIRECT_CAUGHT.values()), ids=list(FSMON_INDIRECT_CAUGHT))
@@ -4867,6 +4886,20 @@ def test_fsmonitor_lane_pin_known_gaps_are_misses_on_purpose(git_call):
     assert not fsmon_lane_pin_violation(mutated), "known gap closed; promote it to FSMON_INDIRECT_CAUGHT: " + git_call
 
 
+@pytest.mark.parametrize("git_call", list(FSMON_INDIRECT_OVERREADS.values()), ids=list(FSMON_INDIRECT_OVERREADS))
+def test_fsmonitor_lane_pin_over_reads_a_commented_or_reassigned_away_alias_on_purpose(git_call):
+    """KNOWN OVER-DETECTION, safe direction. The discovery is syntax-limited, so it takes a commented-out alias or a variable later reassigned to a
+    non-git value for a name that stands for git. If this fails, the discovery got smarter: move the case to the not-git list."""
+    mutated = FSMON_LANE_TEXT.replace(FSMON_INSERT_BEFORE, git_call + "\n" + FSMON_INSERT_BEFORE, 1)
+    assert fsmon_lane_pin_violation(mutated), "the discovery stopped over-reading; move this case to the unrelated-commands test: " + git_call
+
+
+def test_fsmonitor_indirect_caught_table_holds_30_shapes():
+    """LANE-FSMONITOR-FOLLOWUPS-2 (d): the #524 commit message said 31; the table has 30 (13 earlier + 17 added). Update the comment above the table
+    when you add a shape."""
+    assert len(FSMON_INDIRECT_CAUGHT) == 30, len(FSMON_INDIRECT_CAUGHT)
+
+
 @pytest.mark.parametrize(
     "not_git",
     [
@@ -4875,8 +4908,9 @@ def test_fsmonitor_lane_pin_known_gaps_are_misses_on_purpose(git_call):
         "$tool = 'github-cli'\n& $tool status",
         "Start-Process notepad $gitNotes",
         "Write-Host 'git $args'",
+        "<# Set-Alias g git #>\ng -C $WorkDir status",
     ],
-    ids=["variable-holds-other-tool", "alias-to-other-command", "variable-holds-name-merely-containing-git", "start-process-other-tool", "string-mention"],
+    ids=["variable-holds-other-tool", "alias-to-other-command", "variable-holds-name-merely-containing-git", "start-process-other-tool", "string-mention", "block-commented-alias"],
 )
 def test_fsmonitor_lane_pin_indirect_shapes_do_not_flag_unrelated_commands(not_git):
     mutated = FSMON_LANE_TEXT.replace(FSMON_INSERT_BEFORE, not_git + "\n" + FSMON_INSERT_BEFORE, 1)
