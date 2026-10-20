@@ -75,6 +75,146 @@ pattern, a user-home path, this host's name or account name, or anything in an o
 adds its own deny terms: `.claude-state`, `subject-ledger`, `fleet-runs`, `HUB_RUN_WAL`, `dual-lane`, and
 the name of the GPU host. A refusal names the class, never the matched value.
 
+## Card routes are checked before they ship (CARD-ROUTE-EXERCISE-2)
+
+CoS work order FWO-DEFECT-PREVENT-1 item 3, in `validate --exercise`. It is fail-closed: it replaces the parked
+CARD-ROUTE-EXERCISE-1 (PR 479), whose launcher support relied on two hand-written walks over one command line (a safety
+matcher and a script discovery) that kept disagreeing about which script would run.
+
+`python tools/coordination/doctrine_outbox.py validate --exercise --bus <bus clone> doctrine-outbox/<file>.md` (the bus
+defaults to `$FACTORY_BUS_CLONE`) clones the bus's committed tip into a scratch directory with
+`git clone --local --no-hardlinks`, drops its `origin`, checks every command the item names there, without a shell, then
+removes that directory by name. The bus is only read. **"Refuse if `--bus` resolves to the live clone" means this (hub
+ruling, r2):** no route runs with its working directory, a `-C`/`--git-dir`/`--work-tree` target, or any argument or
+`--fill` value (also the value of `--opt=VALUE`) that resolves inside the live bus; that route is `ROUTE_UNSAFE`. A
+`--scratch-root` inside the bus is exit 2. "Inside" is decided on identity, not spelling: real path (junctions, symlinks
+and 8.3 names followed), `..` collapsed, case folded, trailing separators dropped. `<scratch>` in a route names the scratch
+clone. A bus clone behind its own `origin` prints `ROUTE_BUS_STALE <behind>` on stderr (the exit is unchanged). A command is:
+- a line of a fenced block whose info string starts `route` (`$ ` or `> ` prompt and `#` lines dropped); or
+- a backticked span of two or more words inside a route section, which opens at a `Route:` or `Adopt:` label
+  line (bullet and bold allowed) and runs to the next blank line, `#` heading or fence. Bullets right under it,
+  such as `- **Pin:**`, are in the section. A one-word span (`debt`, `RULINGS.md`) is a name, not a command.
+
+**Every route gets a safety screen and a static existence check, and neither runs anything.** The screen refuses a route
+that is not offline, credential-free and confined to the clone (the `ROUTE_UNSAFE` list below). The existence check needs
+the program to be a file in one of the absolute entries of `PATH` (walked by hand with `PATHEXT`; a relative, empty or quoted
+entry is dropped) or, when it is spelled as a path, a file inside the clone, never the current directory, and every script the
+route names to be a file inside the clone, symlinks and junctions followed: the script of `python`/`py`, `node` (and its `-r`/`--require`/`--import`/`--loader`
+preloads), a shell (and its `--rcfile`/`--init-file`), `deno run`, `bun run`/`bun <file>` (and `--preload`), `pwsh -File`,
+`awk -f`, `tclsh`, `perl`, `ruby`, `php`, ... A `bun run build` names a package script, not a file, and is not looked up.
+The program is read by what it resolves to as well as by its name, so a link called `helper.exe` that is really `python`
+has its script checked. A miss is `ROUTE_MISSING` with a typed reason first in its detail: `PROGRAM_NOT_FOUND`,
+`PROGRAM_IS_SHIM` (the `git` found is a `.cmd`/`.bat` shim, which cannot start without `cmd /c`), `SCRIPT_NOT_FOUND` or
+`SCRIPT_OUTSIDE_CLONE` (an absolute path, a `..` path or an outward link). This covers the #468 and #469 evidence: a nonexistent runner script, and a
+`doctrine-sync debt` no bus carries.
+
+**Only a route whose program is on the execution allowlist is run, and the allowlist is `git`.** It is decided on the
+program as the route spells it, a bare name (`git`, `git.exe`; never a path, so `tools/git` and `/usr/bin/git` are not on
+it), and on its resolved executable: the first `git` on a `PATH` stripped of every relative entry and every entry inside the
+scratch clone, whose real path is not inside the clone and is itself called `git`. Those entries are walked by hand (the same
+walk finds every other program's existence check) and the current directory is never consulted (on Windows `shutil.which`
+searches it before `PATH`, so it would find a `git.exe` or a `nosuch.exe` planted in the clone). A `git` that resolves only inside the
+clone, or to some other program, is `ROUTE_UNSAFE`; a `.cmd`/`.bat` shim is `ROUTE_MISSING PROGRAM_IS_SHIM`. Every other program is
+**existence-checked but not executed**: it prints `ROUTE_NOT_EXECUTED`, which is a skip and not a failure (so a card's
+`py -3 tools/x.py` still validates), and it is never launched, whatever its arguments. That includes every shell,
+interpreter and wrapper, and the programs a name list would have missed: `pytest` is never run (it executes Python named in
+its arguments, its conftest files, `-p` plugins and `PYTEST_ADDOPTS`), nor are `pyw`, `ipython`, `java`, `go`, `php-cgi`,
+`jq`, a renamed copy or a link of any of them, or a spelling of a path (`POWERS~1.EXE`, `py.exe.`). An unfilled `<name>`
+placeholder on a route that is not run is noted in its detail rather than failing it, and the script check skips an operand
+that holds one. Widening the allowlist is the separate later card CARD-ROUTE-EXERCISE-LAUNCHER-ALLOWLIST-1: exact shapes, a
+pinned executable and the secondary execution inputs (preload flags, environment) have to be closed first. Because nothing
+launches on the strength of the static check's reading of a program's options, the PR 479 bypass class (a check that accepts
+one script while the program runs another) cannot reach a launch. Each known repro has an acceptance test row that mocks the
+process launch and asserts it is not called:
+
+| Repro (none is on the allowlist) | Outcome |
+|---|---|
+| B1: `python <outside script that exists>` | `ROUTE_MISSING SCRIPT_OUTSIDE_CLONE`, not launched |
+| `pwsh -f <outside>` (and `-fi`, `-File:`, `/f`) | `ROUTE_MISSING SCRIPT_OUTSIDE_CLONE`, not launched |
+| `pwsh <outside.ps1> -File <in-clone>` (pwsh 7 runs the first bare argument) | `ROUTE_MISSING SCRIPT_OUTSIDE_CLONE`, not launched |
+| `pwsh -NoProfile <outside.ps1> -f` | `ROUTE_MISSING SCRIPT_OUTSIDE_CLONE`, not launched |
+| `node -r <in-clone> <outside.js>` | `ROUTE_MISSING SCRIPT_OUTSIDE_CLONE`, not launched |
+| `bash --rcfile <in-clone> <outside.sh>` | `ROUTE_MISSING SCRIPT_OUTSIDE_CLONE`, not launched |
+| `bash -o x <outside.sh>` | `ROUTE_MISSING SCRIPT_OUTSIDE_CLONE`, not launched |
+| `python --check-hash-based-pycs default <outside.py>` | `ROUTE_MISSING SCRIPT_OUTSIDE_CLONE`, not launched |
+
+A second row set forces the static check to pass everything and shows each repro is still `ROUTE_NOT_EXECUTED` and still not
+launched.
+
+**A `git` route runs only read-only verbs, each with its own option allowlist (r5, the final round).** Four rounds of
+refusing named git options each leaked one more option class, and the real card routes on the bus run no git at all, so the
+screen is now positive (`ROUTE_GIT_VERBS` in the tool is the whole grammar; anything it does not name is `ROUTE_UNSAFE`
+before launch):
+- Before the verb only `-C <dir>` is accepted, and only into a directory inside the scratch clone that is not, and does not sit
+  under, a bare repository layout (`HEAD`, `objects/` and `refs/`). `-c`, `--config-env`, `-p`/`--paginate`, `--exec-path`
+  and every other global option are refused, and so is an alternate git directory (`--git-dir`, `--work-tree`, `--namespace`,
+  `--super-prefix`, `--bare`) in any form or abbreviation, whether its target is outside the clone (the diagnostic says so)
+  or inside it.
+- The verb is one of the read-only verbs `log`, `show`, `diff`, `grep`, `rev-parse`, `rev-list`, `status`, `ls-files`,
+  `ls-tree`, `cat-file`, `describe`, `blame`, `shortlog`, `merge-base`, `for-each-ref`, `show-ref`, `name-rev`,
+  `count-objects`, `version`, `branch` and `tag` in list form only (no name unless `--list` is given, and for `tag` also `-l`;
+  `branch` has no `-l` letter, which an older git reads as `--create-reflog`; and no `-d`/`-D`/`-m`/`-c`/`-f`/`-a`/`-s`/`-u`),
+  and `config` in a read mode only (its first word `--get`, `--get-all`,
+  `--get-regexp`, `--list` or `-l`). No verb that can write is run: `commit`, `checkout`, `switch`, `restore`, `reset`,
+  `merge`, `cherry-pick`, `revert`, `stash`, `apply`, `am`, `mv`, `rm`, `rebase`, `add`, `notes`, `worktree`, `gc`, `fetch`,
+  `pull`, `push`, `clone`, `submodule`, ... are all `ROUTE_UNSAFE`, as is an alias (`git ship`, or a `!` alias such as
+  `git !echo hi`). (`status` and `diff` may refresh the scratch clone's own index, as git always does.)
+- Each option must be on that verb's list, matched as an exact token. Git reads any unambiguous prefix of a long option; the
+  screen reads none, so an abbreviation (`--onel`, `--unsafe-p`, `--build-f`, `--strat=`) is refused. A long option takes a
+  value only as `--name=value` (`--format=%h`), never as the next token. A short-option cluster is read letter by letter
+  against the verb's letters, and a value-taking letter takes the rest of the cluster or the next token (`-n3`, `-n 3`,
+  `grep -e TODO`), so `merge -qsoctopus`, `grep -nO` and `log -sp` are refused. `--` ends the options; what follows is
+  pathspecs. None of these is on any list: `--output`, `--no-index`, `--pathspec-from-file`, `--contents`, `--file`,
+  `--textconv`, `--ext-diff`, `-O`/`--open-files-in-pager`, `--exec`, `--upload-pack`, `--unsafe-paths`,
+  `--build-fake-ancestor`, `--strategy`/`merge -s` and `--gpg-sign`.
+- Every option value and every positional (a revision, a path or a pathspec) must resolve inside the scratch clone, read
+  relative to the `-C` directory: `..` collapsed, symlinks, junctions and 8.3 names followed, case folded on Windows. An
+  absolute path outside the clone, a `..` that leaves it and an outward link are refused, and so is a positional that starts
+  with `:` (pathspec magic such as `:(top)`, `:/` or `:!`, or an index path).
+
+A `git` route that is run gets the interpreter-injection environment stripped: `PYTHONPATH`, `PYTHONSTARTUP`, `PYTHONHOME`,
+`NODE_OPTIONS`, `NODE_PATH`, `PERL5OPT`, `PERL5LIB`, `RUBYOPT`, `BASH_ENV` and `ENV`, plus credential-shaped variables, every
+`GIT_*` variable (`GIT_EDITOR`, `GIT_SEQUENCE_EDITOR`, `GIT_PAGER`, `GIT_ASKPASS`, `GIT_SSH`, `GIT_SSH_COMMAND`,
+`GIT_EXTERNAL_DIFF`, `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT`, `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`, ...) and the
+generic helpers `EDITOR`, `VISUAL`, `PAGER` and `SSH_ASKPASS`. Its git config is isolated: `GIT_CONFIG_NOSYSTEM=1`,
+`GIT_ATTR_NOSYSTEM=1`, and
+`GIT_CONFIG_GLOBAL` names an empty file the tool writes beside the clone in its scratch directory (emptied before every run),
+so a driver, alias or helper defined in the system config, `~/.gitconfig` or the XDG config never applies; a test defines a
+textconv driver through `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`, `~/.gitconfig`, the XDG config (with an XDG attributes file
+selecting it) and `GIT_CONFIG_COUNT`, shows a plain `git show HEAD` runs it each time, and shows the route never does. Its `PATH`
+keeps only the absolute entries whose real path is outside the clone (a `.`, empty, relative or quoted entry, and a junction
+or link into the clone, are dropped), so a `false.exe` or `gpg` planted in the clone is never found. Git is started as
+`git -c core.pager=cat -c core.editor=false -c diff.external= -c core.fsmonitor=false -c commit.gpgsign=false
+-c tag.gpgsign=false -c safe.bareRepository=explicit -c gpg.program=false -c gpg.ssh.program=false
+-c gpg.x509.program=false -c core.attributesFile= -c core.excludesFile=
+-c core.hooksPath=<an empty directory beside the clone in the scratch> ...`, so no pager, editor, external diff, hook,
+signing program or attributes or excludes file of the host is reachable even through a verb that wants one (`--show-signature`
+is not on the option list of `log` or `show`), and a bare repository committed in the clone is never opened as the
+repository.
+
+The scratch clone is made under the same isolation as the routes, before any route is screened (`run_isolated_git`: the same
+git binary, environment and `-c` pairs, with `git clone --local` and the two follow-up calls going through it). Without that,
+`git clone` read the host's own config, and this host's system `gitconfig` defines `[filter "lfs"] process = git-lfs
+filter-process`, so a bus `.gitattributes` of `* filter=lfs` started git-lfs at checkout. A test builds a bus selecting
+a filter (`keyprobe`, and `lfs`) or a `post-checkout` hook that the host config defines (through `GIT_CONFIG_GLOBAL` and
+`GIT_CONFIG_SYSTEM`), shows a plain `git clone` starts the program, and shows `validate --exercise` never does and checks the
+committed bytes out as committed. A route must be exercisable
+offline and only in the scratch clone, so these are `ROUTE_UNSAFE` too, whether or not the program would be run:
+- a shell operator (pipe, redirect, `&&`, `;`) or an environment-assignment prefix;
+- any `gh`, `claude`/`codex` `auth|login|logout`, a network client (`curl`, `ssh`, `npx`, ...), `find -exec`, a URL or
+  `user@host:` argument, and a credential assignment (`GH_TOKEN=`, `ANTHROPIC_*=`, `*_TOKEN=`, `*_KEY=`, `*PASSWORD*=`)
+  or `--token`.
+
+Each route prints one `ROUTE_OK`, `ROUTE_NOT_EXECUTED`, `ROUTE_MISSING`, `ROUTE_FAILED` (non-zero exit, an unfilled `<name>`
+placeholder on a route that is run, or it does not parse), `ROUTE_TIMEOUT` (`--timeout`, default 60 s; the whole process tree
+is killed, via a Job Object on Windows and a process group on POSIX) or `ROUTE_UNSAFE` line, then the item name and the
+command. Anything but the first two exits 1. Only the last 64 KiB of a route's output is kept. Route text is split like a
+POSIX shell (on Windows a backslash path stays whole). Give `<name>` placeholders a value with `--fill name=VALUE`.
+`--timeout` must be a finite number of seconds above zero; `nan`, `inf`, `0` and a negative value are refused before any
+route runs. A credential's value is never printed: it shows as `NAME=<redacted>` in every diagnostic and route line, whatever
+it contains, in the form it was filled and in the form `repr()` writes it. Put a command a card ships but the bus does not
+yet have in prose, not in a route.
+
 ## Ruling candidates name what they supersede (ROUTE-RULING-SUPERSEDES-1)
 
 A ruling candidate is an item with a heading or body line that opens with `Ruling candidate` (any case, zero or more
@@ -113,9 +253,10 @@ still checked and `validate` prints a NOTE naming the targets it could not check
 the drain does not apply this check, and an item already sent is not re-judged. The 450-word cap still holds, so a
 candidate replaces its prose "relationship" block with the list.
 
-`validate --bus` is defined once. PR 514 (`--exercise`) adds the same option; whichever of the two merges second keeps
-exactly ONE `validate_p.add_argument("--bus", ...)`, because argparse raises on a duplicate for every subcommand, the
-push hook included. A test asserts `build_parser()` defines it exactly once.
+`validate --bus` is defined once, for both checks: the ruling-candidate check above reads it and `--exercise` copies it.
+It is accepted without `--exercise`; `--fill` and `--scratch-root` still need `--exercise`. A duplicate
+`validate_p.add_argument("--bus", ...)` makes argparse raise for every subcommand, the push hook included, so a test
+asserts `build_parser()` defines it exactly once.
 
 ## Concerns to the CoS (COS-CONCERN-CHANNEL-1)
 
