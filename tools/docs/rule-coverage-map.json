@@ -148,7 +148,7 @@
       "bullet": "agents/doctrine-consumer.md:20 Brief includes: short `RULINGS.md` digest, MLV-relevant `ruling-candid",
       "basis": "covers the MUST clause (surface the SoT-suspend candidate labeled CANDIDATE_ZERO_AUTHORITY); the RULINGS digest and specs-hash clauses are not asserted"
     },
-    "48f18ea7da37ed81ce582181b667ae5aec641c702a27abcfc55a42dfc9a8be65": {
+    "6c95ba4c2ef1401b9fdaf1d98444903c2ffb405bdea203dc79cbd8fff33f36d4": {
       "check": "test:tools/coordination/test_get_doctrine_brief.py::GetDoctrineBriefTests::test_fixture_cos_feedback_included_when_present",
       "bullet": "agents/doctrine-consumer.md:21 Brief includes `cos-feedback/mlv-app/pr-*.md` when present (Contents A",
       "basis": "asserts the pr-*.md is included when present; omit-when-missing half is test_fixture_missing_cos_feedback_omits_section_does_not_refuse"
