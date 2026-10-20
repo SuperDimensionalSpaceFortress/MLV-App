@@ -38,6 +38,18 @@
 # profile (disableLookAssist, playbackProcessing, qualityMode) and the clip's startFrame, and the spec's sha256 is recorded in the
 # job's result. A clip the spec does not name has no gate frame and is refused.
 #
+# RECEIPT PROFILES ARE REFUSED UNTIL THEY ARE SUPPORTED (CoS 81b6c553 on PR #529, r4). A profile whose playbackProcessing is 'receipt'
+# (committed_receipt), or that names a receipt of its own, needs the committed .marxml the canonical gate passes as --receipt
+# (compare-output-budget.ps1 hands its smoke runner spec.receipt.path). This job carries no receipt and capture-reference-frame.ps1 has no
+# -Receipt, so it could only RECORD such a profile, never apply it. The generator refuses it (REFERENCE_FRAME_RECEIPT_PROFILE_UNSUPPORTED,
+# nothing written), and an emitted job whose processing mode is 'receipt' refuses before it decodes, writes or launches anything (226
+# receiptProfile). Hash-pinned receipt transport is the follow-up that would lift this.
+#
+# THE JOB'S IDENTITY IS ITS EFFECTIVE CONFIGURATION (r4). The job id -- and so its work tree and outbox name -- carries a digest of the build,
+# the clip and its parts, the bundle, the gate profile id, the spec's sha256, every profile value the capture is given, -Seconds and
+# -PresentedFrames. Two jobs that would capture differently never share a work tree or an outbox. The same configuration is the same job: a
+# resubmission reuses the id, and the owned-root creation sets an unproven tree already standing there aside.
+#
 # THE CLIP IS A CLIP ID. Its parts are resolved by tools/gates/resolve_consented_clip.py (the one resolver; no path is ever typed
 # or printed), carried in the job as base64, and each part's length and sha256 are re-checked on the venue before anything runs.
 #
@@ -47,7 +59,10 @@
 # capture has exited), builds the neutral owner-clip view of it under its own work directory (AttrCudaOwnerFootage.psm1: a file
 # symbolic link where the venue can make one, else a verified byte copy, never a hard link), hashes each part THROUGH its view
 # while pinned, proves the views intact before and after the capture, and passes -Clip only the view. The workspace is closed
-# (handles released, view entries removed by identity) on every exit path after it was opened.
+# (handles released, view entries removed by identity) on every exit path after it was opened -- the bundle re-hash, the capture directory and
+# the command build included (r4): a throw in that window is a typed step failure (219 / 227), never an untyped exit that leaves a view behind.
+# A view that changed while the app read it (225) voids the capture: result.json says capture-failed AND the candidate manifest the capture
+# wrote is stamped invalid in place (status 'invalid', invalid, invalid_reasons), so the manifest alone never reads as a candidate.
 #
 # NOT COVERED HERE (named, not hidden): no display wake and no PresentMon. If the venue's display is asleep the capture fails
 # visibly (typed, non-zero) rather than producing a frame; the live run is OUTPUT-BUDGET-KNOWN-GOOD-PROPOSAL-2.
@@ -57,12 +72,13 @@
 #       -SourceCommit <40-hex> -BuildManifestSha256 <64-hex> -ClipId M16-1243 -OutFile <path>\<jobId>.job.ps1
 # then submit the emitted job through um-run.ps1 like every other venue job (NA-7: um-run is the only writer to a venue share).
 #
-# Exit codes: 0 emitted; 21 refused (RESULT=REFERENCE_FRAME_JOB_REFUSED CODE=<token>, nothing written).
+# Exit codes: 0 emitted; 21 refused (RESULT=REFERENCE_FRAME_JOB_REFUSED CODE=<token>, nothing written; a receipt profile is
+# CODE=REFERENCE_FRAME_RECEIPT_PROFILE_UNSUPPORTED).
 # The EMITTED job: 0 a candidate; a failed capture exits the capture's own code (all below 100: 43 its receipt check, 70 no exit code;
 # one outside 1-199 is folded to 199); a failed step exits its own 2xx code, which no capture code reaches (204 bundleDecode,
 # 206 artifactNameSafety, 208 buildVerify, 209 deploy, 218 footageVerify, 219 bundleReverify, 220 bundleWrite, 222 admissionMode,
-# 223 publishResult, 224 footageView, 225 footageViewIntact). The capture's raw code is result.json captureExitCode and the RESULT
-# line's CAPTURE_EXIT (REFERENCE-FRAME-JOB-EXIT-CODE-SPACE-1).
+# 223 publishResult, 224 footageView, 225 footageViewIntact, 226 receiptProfile, 227 captureSetup). The capture's raw code is result.json
+# captureExitCode and the RESULT line's CAPTURE_EXIT (REFERENCE-FRAME-JOB-EXIT-CODE-SPACE-1).
 
 [CmdletBinding()]
 param(
@@ -78,7 +94,8 @@ param(
     [Parameter(Mandatory = $true)][ValidatePattern('^[A-Za-z0-9_-]{1,40}$')][string]$ClipId,
     [Parameter(Mandatory = $true)][string]$OutFile,
     [ValidateSet('bachelor', 'ultra-magnus')][string]$Venue = 'bachelor',
-    # The gate profile id in tools/gates/output-budget.json (wb_locked is the one the gate's wb arm compares).
+    # The gate profile id in tools/gates/output-budget.json (wb_locked is the one the gate's wb arm compares). A profile that needs a committed
+    # receipt (committed_receipt) is refused: this job cannot hand the capture a receipt yet.
     [ValidatePattern('^[a-z0-9_]{1,40}$')][string]$GateProfile = 'wb_locked',
     # capture-reference-frame.ps1's own -Seconds (its fail-closed timeout) and -PresentedFrames (-1 = auto: the smallest N that plays the floor).
     [ValidateRange(10, 3600)][int]$Seconds = 30,
@@ -151,12 +168,14 @@ try {
 try { $spec = $specText | ConvertFrom-Json } catch { Stop-Refused 'REFERENCE_FRAME_GATE_SPEC_INVALID' }
 $gateProfileSpec = @($spec.profiles | Where-Object { [string]$_.id -ceq $GateProfile }) | Select-Object -First 1
 if ($null -eq $gateProfileSpec) { Stop-Refused 'REFERENCE_FRAME_GATE_PROFILE_UNKNOWN' }
+# A receipt profile is refused, never recorded and dropped (header: RECEIPT PROFILES ARE REFUSED UNTIL THEY ARE SUPPORTED).
+if ([string]$gateProfileSpec.playbackProcessing -ceq 'receipt' -or $null -ne $gateProfileSpec.PSObject.Properties['receipt']) { Stop-Refused 'REFERENCE_FRAME_RECEIPT_PROFILE_UNSUPPORTED' }
 $specClip = @($spec.clips | Where-Object { [string]$_.id -ceq $ClipId }) | Select-Object -First 1
 if ($null -eq $specClip) { Stop-Refused 'REFERENCE_FRAME_CLIP_NOT_IN_GATE_SPEC' }
 $gateStartFrame = 0
 if (-not [int]::TryParse([string]$specClip.startFrame, [ref]$gateStartFrame) -or $gateStartFrame -lt 0) { Stop-Refused 'REFERENCE_FRAME_GATE_START_FRAME_INVALID' }
 $gateProcessing = [string]$gateProfileSpec.playbackProcessing
-if ($gateProcessing -cnotin @('', 'auto', 'receipt', 'subset')) { Stop-Refused 'REFERENCE_FRAME_GATE_PROCESSING_INVALID' }
+if ($gateProcessing -cnotin @('', 'auto', 'subset')) { Stop-Refused 'REFERENCE_FRAME_GATE_PROCESSING_INVALID' }
 $gateQualityMode = [string]$gateProfileSpec.qualityMode
 if ($gateQualityMode -cnotmatch '^[0-9]{0,2}$') { Stop-Refused 'REFERENCE_FRAME_GATE_QUALITY_MODE_INVALID' }
 if ($gateProfileSpec.disableLookAssist -isnot [bool]) { Stop-Refused 'REFERENCE_FRAME_GATE_LOOK_ASSIST_INVALID' }
@@ -247,7 +266,15 @@ $venueEntry = $table.venues.PSObject.Properties[$Venue].Value
 if ([string]::IsNullOrWhiteSpace($AgentRoot)) { $AgentRoot = [string]$venueEntry.agentRoot }
 if ($AgentRoot -notmatch '^[A-Za-z]:\\[A-Za-z0-9 _.~\\-]+$') { throw 'REFERENCE_FRAME_AGENTROOT_INVALID -AgentRoot contains characters outside the allowlist' }
 
-$jobId = "reference-frame-$($SourceCommit.Substring(0,12))-$ClipId-$($bundleDigest.Substring(0,12))"
+# The job's identity is its effective configuration (header: THE JOB'S IDENTITY IS ITS EFFECTIVE CONFIGURATION).
+$identityText = @(
+    'mlvapp.reference-frame-job-identity.v1', "source=$SourceCommit", "buildManifestSha256=$BuildManifestSha256", "venue=$Venue", "clip=$ClipId",
+    "parts=$(@($ownerParts | ForEach-Object { $_.sha256 }) -join ',')", "bundle=$bundleDigest", "gateProfile=$GateProfile", "gateSpecSha256=$specSha256",
+    "startFrame=$gateStartFrame", "disableLookAssist=$disableLookAssistLiteral", "playbackProcessing=$gateProcessing", "qualityMode=$gateQualityMode",
+    "seconds=$Seconds", "presentedFrames=$PresentedFrames"
+) -join "`n"
+$jobIdentitySha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($identityText))).ToLowerInvariant()
+$jobId = "reference-frame-$($SourceCommit.Substring(0,12))-$ClipId-$($jobIdentitySha256.Substring(0,12))"
 [void](Assert-AttrCudaSafeArtifactName -Name $jobId)
 
 $embeddedFunctions = Get-AttrCudaEmbeddedFunctionSource -Name @(
@@ -300,6 +327,7 @@ param([switch]$VerifyOnly)
 
 $ErrorActionPreference = 'Stop'
 $JobId = '__JOB_ID__'
+$JobIdentitySha256 = '__JOB_IDENTITY_SHA256__'
 $AgentRoot = '__AGENT_ROOT__'
 $SourceCommit = '__SOURCE_COMMIT__'
 $ToolsCommit = '__TOOLS_COMMIT__'
@@ -385,6 +413,12 @@ try {
     Complete-Failed 206 'artifactNameSafety' $_.Exception.Message
 }
 $StepLog['artifactNameSafety'] = 0
+
+# A receipt profile needs the committed receipt the canonical gate passes as --receipt; this job carries none, so it could only record the
+# profile, never apply it. Refused before anything is decoded, written or launched (the generator refuses it too).
+if ($PlaybackProcessing -ceq 'receipt') {
+    Complete-Failed 226 'receiptProfile' 'RECEIPT_PROFILE_UNSUPPORTED this job carries no committed receipt, so it cannot run a receipt profile'
+}
 
 # A job generated in offline-test mode is not evidence and never runs (VerifyOnly writes nothing, so it is allowed).
 if ($AdmissionMode -ne 'production' -and -not $VerifyOnly) {
@@ -526,28 +560,37 @@ try {
     $token = if ($message -cmatch '^OWNER_[A-Z_]+(?: part \d+)?') { $Matches[0] } else { "OWNER_FOOTAGE_VIEW_FAILED part $(if ($null -ne $part) { $part.index } else { -1 })" }
     Complete-Failed 224 'footageView' $token
 }
-$StepLog['footageVerify'] = 0
-$StepLog['footageView'] = 0
-Say "footage view mode=$ownerViewMode parts=$($ownerViews.Count) pinned"
-
-# --- run the capture script FROM THE VERIFIED BUNDLE, under the gate profile ------------------------------------------------------------------
-$bundleCapture = Join-Path $BundleDir 'capture-reference-frame.ps1'
-foreach ($entry in $BundleEntries) {
-    if ((Get-ShaLower (Join-Path $BundleDir $entry.name)) -ne $entry.sha256) { Complete-Failed 219 'bundleReverify' "bundle file $($entry.name) changed on disk after it was verified" }
-}
-$captureOut = Join-Path $Pub 'capture'
-[void](New-AttrCudaDirectory -Path $captureOut)
-$captureCommand = "& '$bundleCapture' -Exe '$exePath' -Clip '$clipPath' -OutDir '$captureOut' -Commit '$SourceCommit' -ProfileId $GateProfileId -Seconds $Seconds -StartFrame $StartFrame"
-if ($DisableLookAssist) { $captureCommand += ' -DisableLookAssist' }
-if ($PlaybackProcessing -ne '') { $captureCommand += " -PlaybackProcessing $PlaybackProcessing" }
-if ($PresentedFrames -ge 0) { $captureCommand += " -PresentedFrames $PresentedFrames" }
-if ($QualityMode -ne '') { $captureCommand += " -ExtraEnv @{ MLVAPP_PLAYBACK_QUALITY_MODE = '$QualityMode' }" }
-# FAIL CLOSED: a statement-terminating error inside the capture command (a parameter that does not bind, say) leaves $LASTEXITCODE null,
-# and `exit $null` is exit 0 -- a capture that never ran must never read as one that passed. 70 = the capture command produced no exit code.
-$captureCommand += '; if ($null -eq $LASTEXITCODE) { exit 70 }; exit $LASTEXITCODE'
-Say "step capture start profile=$GateProfileId startFrame=$StartFrame lookAssistDisabled=$DisableLookAssist processing=$PlaybackProcessing quality=$QualityMode"
 $viewsIntactAfterCapture = $false
+# THE CLEANUP WINDOW (r4): from the moment the views exist until the capture has returned, every exit closes the owner-clip workspace -- the
+# finally below spans the bundle re-hash, the capture directory and the command build as well as the capture, and a throw in that window is
+# a typed step failure (219 bundleReverify, 227 captureSetup), never an untyped exit that leaves a view behind.
 try {
+    $StepLog['footageVerify'] = 0
+    $StepLog['footageView'] = 0
+    Say "footage view mode=$ownerViewMode parts=$($ownerViews.Count) pinned"
+
+    # --- run the capture script FROM THE VERIFIED BUNDLE, under the gate profile --------------------------------------------------------------
+    $bundleCapture = Join-Path $BundleDir 'capture-reference-frame.ps1'
+    foreach ($entry in $BundleEntries) {
+        $onDisk = 'unreadable'
+        try { $onDisk = Get-ShaLower (Join-Path $BundleDir $entry.name) } catch { $onDisk = 'unreadable' }
+        if ($onDisk -ne $entry.sha256) { Complete-Failed 219 'bundleReverify' "bundle file $($entry.name) changed on disk after it was verified ($onDisk)" }
+    }
+    try {
+        $captureOut = Join-Path $Pub 'capture'
+        [void](New-AttrCudaDirectory -Path $captureOut)
+        $captureCommand = "& '$bundleCapture' -Exe '$exePath' -Clip '$clipPath' -OutDir '$captureOut' -Commit '$SourceCommit' -ProfileId $GateProfileId -Seconds $Seconds -StartFrame $StartFrame"
+        if ($DisableLookAssist) { $captureCommand += ' -DisableLookAssist' }
+        if ($PlaybackProcessing -ne '') { $captureCommand += " -PlaybackProcessing $PlaybackProcessing" }
+        if ($PresentedFrames -ge 0) { $captureCommand += " -PresentedFrames $PresentedFrames" }
+        if ($QualityMode -ne '') { $captureCommand += " -ExtraEnv @{ MLVAPP_PLAYBACK_QUALITY_MODE = '$QualityMode' }" }
+        # FAIL CLOSED: a statement-terminating error inside the capture command (a parameter that does not bind, say) leaves $LASTEXITCODE null,
+        # and `exit $null` is exit 0 -- a capture that never ran must never read as one that passed. 70 = the capture command produced no exit code.
+        $captureCommand += '; if ($null -eq $LASTEXITCODE) { exit 70 }; exit $LASTEXITCODE'
+        Say "step capture start profile=$GateProfileId startFrame=$StartFrame lookAssistDisabled=$DisableLookAssist processing=$PlaybackProcessing quality=$QualityMode"
+    } catch {
+        Complete-Failed 227 'captureSetup' $_.Exception.Message
+    }
     $captureOutput = @(& pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $captureCommand 2>&1 | ForEach-Object { "$_" })
     $captureRc = $LASTEXITCODE
     # The views must still be the ones built and hashed above: a view that changed while the app read it voids the capture.
@@ -570,15 +613,33 @@ $candidateOk = ($captureRc -eq 0 -and -not $viewsChanged)
 
 $candidatePath = Join-Path $captureOut 'reference-frame-candidate.json'
 $candidateSha256 = if ($candidateOk -and (Test-Path -LiteralPath $candidatePath)) { Get-ShaLower $candidatePath } else { $null }
+# A capture voided by a changed view (225) leaves a manifest that still calls itself a candidate. It is stamped invalid IN PLACE -- the stamps
+# of gui-smoke-length-gate.ps1 Set-GuiSmokeReceiptInvalid (invalid, invalid_reasons) plus status 'invalid' -- so the manifest alone never
+# reads as a candidate. $null = there was nothing to invalidate; $false = the stamp failed (result.json still says capture-failed).
+$candidateInvalidated = $null
+if ($viewsChanged -and (Test-Path -LiteralPath $candidatePath -PathType Leaf)) {
+    $candidateInvalidated = $false
+    try {
+        $candidateDoc = [IO.File]::ReadAllText($candidatePath) | ConvertFrom-Json
+        $candidateDoc | Add-Member -NotePropertyName status -NotePropertyValue 'invalid' -Force
+        $candidateDoc | Add-Member -NotePropertyName invalid -NotePropertyValue $true -Force
+        $candidateDoc | Add-Member -NotePropertyName invalid_reasons -NotePropertyValue @('OWNER_FOOTAGE_VIEW_CHANGED_DURING_CAPTURE', 'reference-frame-runner step footageViewIntact exit 225') -Force
+        [void](Publish-AttrCudaText -Path $candidatePath -Value ($candidateDoc | ConvertTo-Json -Depth 64))
+        $candidateInvalidated = $true
+    } catch {
+        Say "CANDIDATE_NOT_INVALIDATED $($_.Exception.Message)"
+    }
+}
 try { [void](Publish-AttrCudaText -Path (Join-Path $Pub 'result.json') -Value (([ordered]@{
-    schema = 'mlvapp.reference-frame-runner.v1'; jobId = $JobId
+    schema = 'mlvapp.reference-frame-runner.v1'; jobId = $JobId; jobIdentitySha256 = $JobIdentitySha256
     exitCode = $(if ($viewsChanged) { 225 } else { $captureRc }); captureExitCode = $captureExitCode
     status = $(if ($candidateOk) { 'candidate-unreviewed' } else { 'capture-failed' })
     sourceCommit = $SourceCommit; toolsCommit = $ToolsCommit; buildManifestSha256 = $BuildManifestSha256; clipId = $ClipId; venue = $Venue
     admission = [ordered]@{ mode = $AdmissionMode; consentKind = $ConsentKind }
     gateProfile = [ordered]@{ id = $GateProfileId; specSha256 = $GateSpecSha256; startFrame = $StartFrame; disableLookAssist = $DisableLookAssist; playbackProcessing = $PlaybackProcessing; qualityMode = $QualityMode }
     bundle = @($BundleEntries | ForEach-Object { [ordered]@{ name = $_.name; sha256 = $_.sha256 } })
-    exeSha256 = $artifactHashes['exe']; candidateSha256 = $candidateSha256
+    captureParameters = [ordered]@{ seconds = $Seconds; presentedFrames = $PresentedFrames }
+    exeSha256 = $artifactHashes['exe']; candidateSha256 = $candidateSha256; candidateInvalidated = $candidateInvalidated
     clipParts = @($verifiedParts | ForEach-Object { [ordered]@{ index = $_.index; length = $_.length; sha256 = $_.sha256 } })
     footageView = [ordered]@{ mode = $ownerViewMode; intactAfterCapture = $viewsIntactAfterCapture }
     stagedOnHost = $env:COMPUTERNAME; steps = $StepLog
@@ -599,6 +660,7 @@ $jobDir = Split-Path -Parent ([IO.Path]::GetFullPath($OutFile))
 if (-not (Test-Path -LiteralPath $jobDir)) { [void](New-Item -ItemType Directory -Path $jobDir -Force) }
 $text = Expand-AttrCudaTemplate -Template $template -Tokens ([ordered]@{
     JOB_ID = $jobId
+    JOB_IDENTITY_SHA256 = $jobIdentitySha256
     AGENT_ROOT = $AgentRoot
     SOURCE_COMMIT = $SourceCommit
     TOOLS_COMMIT = $ToolsCommit
@@ -631,6 +693,7 @@ Write-Output "RESULT=REFERENCE_FRAME_JOB_EMITTED SOURCE=$SourceCommit TOOLS=$Too
 [pscustomobject]@{
     jobFile = $OutFile
     jobId = $jobId
+    jobIdentitySha256 = $jobIdentitySha256
     sourceCommit = $SourceCommit
     toolsCommit = $ToolsCommit
     clipId = $ClipId

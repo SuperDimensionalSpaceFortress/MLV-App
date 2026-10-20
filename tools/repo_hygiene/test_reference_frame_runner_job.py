@@ -11,7 +11,9 @@ staging, no app launch, no capture):
   3. the gate profile (Look Assist off, processing mode, quality mode, start frame) is read from the committed
      tools/gates/output-budget.json and reaches the capture command line in the job;
   4. capture-reference-frame.ps1's new arguments default to today's argv byte for byte, they reach the app's argv when given,
-     and its receipt check (source_advanced, run nonce, exit 43) still refuses under them.
+     and its receipt check (source_advanced, run nonce, exit 43) still refuses under them;
+  5. r4 (CoS 81b6c553): a gate profile that needs a committed receipt is refused (generator and emitted job), the job id is the effective
+     configuration, a failure between the neutral view and the capture still closes the workspace, and exit 225 stamps the candidate invalid.
 """
 
 from __future__ import annotations
@@ -246,6 +248,72 @@ class GeneratorTests(_GeneratorCase):
         self.refused(proc, "REFERENCE_FRAME_CLIP_NOT_IN_GATE_SPEC")
         self.assertFalse(out.exists())
 
+    # --- r4 (CoS 81b6c553 P2): a profile the job cannot apply is refused, never recorded and silently dropped ------------------------------------
+    def test_a_gate_profile_that_needs_a_committed_receipt_is_refused_before_any_job_is_written(self) -> None:
+        # compare-output-budget.ps1 hands a receipt profile spec.receipt.path; this job carries no receipt to the capture (the capture script has
+        # no -Receipt), so such a job would record a profile it cannot run under. Refused, typed, until receipt transport exists.
+        spec = json.loads(_git("show", f"{self.head}:tools/gates/output-budget.json"))
+        receipt_profiles = [p["id"] for p in spec["profiles"] if p.get("playbackProcessing") == "receipt" or "receipt" in p]
+        self.assertIn("committed_receipt", receipt_profiles, "the spec no longer names a receipt profile: this assertion is stale")
+        for profile_id in receipt_profiles:
+            proc, out = self.generate(f"receipt-{profile_id}", "-GateProfile", profile_id)
+            self.refused(proc, "REFERENCE_FRAME_RECEIPT_PROFILE_UNSUPPORTED")
+            self.assertFalse(out.exists(), f"{profile_id}: a refused receipt profile left a job behind")
+
+    def test_every_step_code_names_one_step_and_the_receipt_refusal_has_its_own(self) -> None:
+        job = self.emitted("stepcodes")
+        pairs = set(re.findall(r"Complete-Failed (\d+) '(\w+)'", job))
+        by_code: dict[int, set[str]] = {}
+        by_step: dict[str, set[int]] = {}
+        for code, step in pairs:
+            by_code.setdefault(int(code), set()).add(step)
+            by_step.setdefault(step, set()).add(int(code))
+        self.assertEqual({c: s for c, s in by_code.items() if len(s) > 1}, {}, "two steps share an exit code")
+        self.assertEqual({s: c for s, c in by_step.items() if len(c) > 1}, {}, "one step exits with two codes")
+        self.assertEqual(by_step.get("receiptProfile"), {226}, sorted(pairs))
+        self.assertNotIn(226, re.findall(r"\bexit (\d+)", _git("show", f"{self.head}:{CLOSURE[0]}").decode("utf-8")))
+
+    # --- r4 i1: the job's identity is its effective configuration -----------------------------------------------------------------------------------
+    @staticmethod
+    def job_id(job: str) -> str:
+        found = re.findall(r"(?m)^\$JobId = '([^']+)'$", job)
+        assert len(found) == 1, found
+        return found[0]
+
+    def test_two_jobs_that_differ_only_in_gate_profile_spec_or_a_capture_parameter_get_distinct_identities(self) -> None:
+        base = self.emitted("ident-base")
+        self.assertIn('$Work = Join-Path $AgentRoot "work\\$JobId"', base)
+        self.assertIn('$Pub = Join-Path $AgentRoot "outbox\\$JobId.artifacts"', base)
+        # the same configuration is the same job (a resubmission retries the same work and outbox names)
+        self.assertEqual(self.job_id(self.emitted("ident-again")), self.job_id(base))
+        ids = {"base": self.job_id(base)}
+        for label, extra in (("seconds", ("-Seconds", "31")), ("frames", ("-PresentedFrames", "10"))):
+            proc, out = self.generate(f"ident-{label}", *extra)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            ids[label] = self.job_id(out.read_text(encoding="utf-8"))
+        # a tooling commit whose spec differs (same closure bytes, so the bundle digest is unchanged), and a second profile id identical in content
+        clone = self.tmp / "ident-repo"
+        subprocess.run(["git", "clone", "-q", "--shared", "--no-checkout", str(ROOT), str(clone)], check=True)
+        subprocess.run(["git", "-C", str(clone), "sparse-checkout", "set", "--cone", "tools"], check=True)
+        subprocess.run(["git", "-C", str(clone), "checkout", "-q", self.head], check=True)
+        subprocess.run(["git", "-C", str(clone), "update-ref", "refs/remotes/fork/master", self.head], check=True)
+        spec_path = clone / "tools" / "gates" / "output-budget.json"
+        spec = json.loads(spec_path.read_text(encoding="utf-8"))
+        alt = dict(next(p for p in spec["profiles"] if p["id"] == "wb_locked"), id="wb_locked_alt")
+        spec["profiles"].append(alt)
+        spec_path.write_text(json.dumps(spec, indent=2) + "\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(clone), "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-q", "-a", "-m", "spec"], check=True)
+        for label, profile in (("spec", "wb_locked"), ("profile", "wb_locked_alt")):
+            out = self.tmp / f"ident-{label}.job.ps1"
+            proc = _run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(GENERATOR),
+                         "-SourceCommit", self.head, "-BuildManifestSha256", MANIFEST_SHA, "-ClipId", CLIP_ID, "-GateProfile", profile,
+                         "-RepoRoot", str(clone), "-OutFile", str(out)])
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            job = out.read_text(encoding="utf-8")
+            self.assertEqual(self.bundle(job), self.bundle(base), "the closure changed: this case no longer isolates the spec")
+            ids[label] = self.job_id(job)
+        self.assertEqual(len(set(ids.values())), len(ids), ids)
+
     # --- 3. the gate profile reaches the capture command line --------------------------------------------------------------------------------------
     def test_the_gate_profile_reaches_the_capture_command_line_in_the_job(self) -> None:
         spec = json.loads(_git("show", f"{self.head}:tools/gates/output-budget.json"))
@@ -259,7 +327,7 @@ class GeneratorTests(_GeneratorCase):
         self.assertIn(f"$QualityMode = '{profile['qualityMode']}'", job)
         self.assertIn("$DisableLookAssist = $true", job)
         # ... and are the arguments of the one capture invocation
-        invocation = next(line for line in job.splitlines() if line.startswith("$captureCommand =") and "-Exe" in line)
+        invocation = next(line.strip() for line in job.splitlines() if line.strip().startswith("$captureCommand =") and "-Exe" in line)
         self.assertIn("-StartFrame $StartFrame", invocation)
         self.assertIn("-ProfileId $GateProfileId", invocation)
         block = job[job.index(invocation):job.index("$captureOutput =")]
@@ -378,7 +446,8 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
         self.assertIn("ATTRCUDA_BUILD_MANIFEST_COMMIT_MISMATCH", ran.stdout)
 
     # --- the clip part check, against SYNTHETIC footage (the job's baked parts are swapped for a throwaway file; owner footage is never read) ---
-    def run_with_synthetic_part(self, name: str, *, data: bytes | None, declared_length: int, declared_sha: str) -> tuple[subprocess.CompletedProcess, Path]:
+    def run_with_synthetic_part(self, name: str, *, data: bytes | None, declared_length: int, declared_sha: str,
+                                edit: tuple[str, str] | None = None) -> tuple[subprocess.CompletedProcess, Path]:
         sha = self.stage_build()
         gen_out = self.tmp / f"{name}.job.ps1"
         gen = _run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(GENERATOR),
@@ -394,6 +463,9 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
         job = gen_out.read_text(encoding="utf-8")
         swapped, count = re.subn(r"(?m)^\$OwnerPartsJson = '.*'$", lambda _m: f"$OwnerPartsJson = '{parts}'", job)
         self.assertEqual(count, 1)
+        if edit is not None:   # a fault injected into the job's own text, at an anchor that must stay unique
+            self.assertEqual(swapped.count(edit[0]), 1, f"injection anchor {edit[0]!r} is not unique: this fixture is stale")
+            swapped = swapped.replace(edit[0], edit[1])
         gen_out.write_text(swapped, encoding="utf-8")
         return _run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(gen_out)]), part
 
@@ -433,12 +505,8 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
         self.assertFalse((self.artifacts() / "capture" / "reference-frame-candidate.json").exists())
 
     # --- F-01 footage-path-disclosure: a SUCCESSFUL capture publishes nothing that names the owner's part path ---------------------------------
-    def test_a_successful_capture_publishes_no_artifact_naming_the_part_path_and_the_capture_sees_only_the_neutral_view(self) -> None:
-        # The real capture script runs out of the verified bundle against a stand-in app (oracle_tests' fake: records its argv, writes a
-        # receipt carrying this run's nonce and a stand-in grab). The only edit to the emitted job is the two things a fixture cannot provide:
-        # the part (a synthetic 41 s clip in a directory, and under a name, that carry a distinctive marker) and the -Exe the capture launches
-        # (the stand-in, since the staged exe in a fixture cache is not a program). Everything between -- the part check, the view, the pin,
-        # the capture command, the publish -- is the job's own code.
+    def run_stand_in_capture(self, name: str, edit: tuple[str, str] | None = None) -> tuple[subprocess.CompletedProcess, Path, Path, str, Path, str]:
+        """The emitted job run end to end against a stand-in app; returns (ran, outbox, part, part sha256, the app's argv file, the path marker)."""
         marker = "OWNERREALPATHMARKERq7z3"
         owner_dir = self.tmp / f"{marker}-dir"
         owner_dir.mkdir(exist_ok=True)
@@ -446,7 +514,7 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
         part_bytes = part.read_bytes()
         part_sha = hashlib.sha256(part_bytes).hexdigest()
         sha = self.stage_build()
-        gen_out = self.tmp / "success.job.ps1"
+        gen_out = self.tmp / f"{name}.job.ps1"
         gen = _run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(GENERATOR),
                     "-SourceCommit", self.head, "-BuildManifestSha256", sha, "-ClipId", CLIP_ID, "-RepoRoot", str(self.repo),
                     "-OutFile", str(gen_out), "-AgentRoot", str(self.agent)])
@@ -467,10 +535,20 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
         self.assertEqual(count, 1)
         self.assertEqual(job.count("-Exe '$exePath'"), 1, "the capture's -Exe anchor moved: this fixture is stale")
         job = job.replace("-Exe '$exePath'", f"-Exe '{fake}'")
+        if edit is not None:
+            self.assertEqual(job.count(edit[0]), 1, f"injection anchor {edit[0]!r} is not unique: this fixture is stale")
+            job = job.replace(edit[0], edit[1])
         gen_out.write_text(job, encoding="utf-8")
-
         ran = _run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(gen_out)])
-        pub = self.artifacts()
+        return ran, self.artifacts(), part, part_sha, args_file, marker
+
+    def test_a_successful_capture_publishes_no_artifact_naming_the_part_path_and_the_capture_sees_only_the_neutral_view(self) -> None:
+        # The real capture script runs out of the verified bundle against a stand-in app (oracle_tests' fake: records its argv, writes a
+        # receipt carrying this run's nonce and a stand-in grab). The only edit to the emitted job is the two things a fixture cannot provide:
+        # the part (a synthetic 41 s clip in a directory, and under a name, that carry a distinctive marker) and the -Exe the capture launches
+        # (the stand-in, since the staged exe in a fixture cache is not a program). Everything between -- the part check, the view, the pin,
+        # the capture command, the publish -- is the job's own code.
+        ran, pub, part, part_sha, args_file, marker = self.run_stand_in_capture("success")
         captured = pub / "capture-stdout.txt"
         self.assertEqual(ran.returncode, 0, ran.stdout + ran.stderr + (captured.read_text(encoding="utf-8-sig") if captured.exists() else "<no capture-stdout.txt>"))
         self.assertIn("RESULT=REFERENCE_FRAME_CAPTURE_OK", ran.stdout)
@@ -505,6 +583,66 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
         # 3. the original is untouched, and the job removed its view entry when it closed the workspace
         self.assertEqual(hashlib.sha256(part.read_bytes()).hexdigest(), part_sha)
         self.assertEqual([p.name for p in (work / "owner-clip").iterdir()], [], "a view entry outlived the job")
+
+    # --- r4 (CoS 81b6c553 P2): the emitted job itself refuses a receipt profile, before anything is written or launched ---------------------------
+    def test_an_emitted_job_carrying_a_receipt_profile_refuses_before_anything_is_written_or_launched(self) -> None:
+        out = self.tmp / "receiptjob.job.ps1"
+        gen = _run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(GENERATOR),
+                    "-SourceCommit", self.head, "-BuildManifestSha256", self.stage_build(), "-ClipId", CLIP_ID, "-RepoRoot", str(self.repo),
+                    "-OutFile", str(out), "-AgentRoot", str(self.agent)])
+        self.assertEqual(gen.returncode, 0, gen.stdout + gen.stderr)
+        job, count = re.subn(r"(?m)^\$PlaybackProcessing = '[a-z]*'$", "$PlaybackProcessing = 'receipt'", out.read_text(encoding="utf-8"))
+        self.assertEqual(count, 1)
+        out.write_text(job, encoding="utf-8")
+        for args in ((), ("-VerifyOnly",)):
+            ran = _run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(out), *args])
+            self.assertEqual(ran.returncode, 226, ran.stdout + ran.stderr)
+            self.assertIn("RESULT=REFERENCE_FRAME_FAILED STEP=receiptProfile EXIT=226", ran.stdout)
+            self.assertIn("RECEIPT_PROFILE_UNSUPPORTED", ran.stdout)
+            self.assertNotIn("step capture start", ran.stdout)
+            self.assertFalse((self.agent / "work").exists(), "the job created its work tree before refusing")
+            self.assertFalse((self.agent / "outbox").exists(), "the job created its outbox before refusing")
+
+    # --- r4 i2: a failure between the neutral view and the capture still closes the owner-footage workspace -----------------------------------------
+    def assert_window_failure_closed_the_workspace(self, ran: subprocess.CompletedProcess, part: Path, data: bytes, step: str, code: int) -> None:
+        self.assertEqual(ran.returncode, code, ran.stdout + ran.stderr)
+        self.assertIn(f"RESULT=REFERENCE_FRAME_FAILED STEP={step} EXIT={code}", ran.stdout)
+        self.assertNotIn(part.name, ran.stdout + ran.stderr, "a footage path reached the output")
+        work = next((self.agent / "work").glob("reference-frame-*"))
+        self.assertEqual([p.name for p in (work / "owner-clip").iterdir()], [], "a neutral view outlived a failure in the cleanup window")
+        self.assertEqual(part.read_bytes(), data, "the original part changed")
+        self.assertFalse((self.artifacts() / "capture-stdout.txt").exists(), "the capture was launched")
+        result = json.loads((self.artifacts() / "result.json").read_text(encoding="utf-8-sig"))
+        self.assertEqual((result["failedStep"], result["exitCode"]), (step, code))
+
+    def test_the_workspace_is_closed_after_the_view_is_built_on_a_bundle_hash_read_failure(self) -> None:
+        data = b"synthetic-footage-0123456789"
+        ran, part = self.run_with_synthetic_part("winhash", data=data, declared_length=len(data), declared_sha=hashlib.sha256(data).hexdigest(),
+                                                 edit=("Get-ShaLower (Join-Path $BundleDir $entry.name)", "Get-ShaLower (Join-Path $BundleDir 'injected-absent-bundle-file')"))
+        self.assert_window_failure_closed_the_workspace(ran, part, data, "bundleReverify", 219)
+
+    def test_the_workspace_is_closed_after_the_view_is_built_on_a_capture_dir_create_failure(self) -> None:
+        data = b"synthetic-footage-0123456789"
+        ran, part = self.run_with_synthetic_part("windir", data=data, declared_length=len(data), declared_sha=hashlib.sha256(data).hexdigest(),
+                                                 edit=("[void](New-AttrCudaDirectory -Path $captureOut)", "throw 'INJECTED_CAPTURE_DIR_FAILURE'"))
+        self.assert_window_failure_closed_the_workspace(ran, part, data, "captureSetup", 227)
+
+    # --- r4 i3: exit 225 invalidates the candidate manifest as well as result.json -----------------------------------------------------------------
+    def test_a_view_that_changed_during_the_capture_marks_the_candidate_manifest_invalid(self) -> None:
+        ran, pub, _, _, _, _ = self.run_stand_in_capture("viewchanged", edit=(
+            "Assert-AttrCudaOwnerFootageViewsIntact -Views @($ownerViews); $viewsIntactAfterCapture = $true",
+            "throw 'INJECTED_VIEW_CHANGED'; $viewsIntactAfterCapture = $true"))
+        self.assertEqual(ran.returncode, 225, ran.stdout + ran.stderr)
+        self.assertIn("RESULT=REFERENCE_FRAME_FAILED STEP=footageViewIntact EXIT=225", ran.stdout)
+        result = json.loads((pub / "result.json").read_text(encoding="utf-8-sig"))
+        self.assertEqual((result["status"], result["exitCode"], result["captureExitCode"]), ("capture-failed", 225, 0))
+        self.assertIsNone(result["candidateSha256"])
+        candidate = json.loads((pub / "capture" / "reference-frame-candidate.json").read_text(encoding="utf-8-sig"))
+        self.assertNotEqual(candidate["status"], "candidate-unreviewed", "the candidate still describes itself as a candidate")
+        self.assertEqual(candidate["status"], "invalid")
+        self.assertIs(candidate["invalid"], True)
+        self.assertIn("OWNER_FOOTAGE_VIEW_CHANGED_DURING_CAPTURE", candidate["invalid_reasons"])
+        self.assertIs(result["candidateInvalidated"], True)
 
 
 @requires_pwsh
