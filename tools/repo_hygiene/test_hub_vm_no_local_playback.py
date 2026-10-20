@@ -29,6 +29,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -4154,6 +4155,205 @@ class CultureIndependenceTests(unittest.TestCase):
         self.assertTrue(_regex_construction_problems(text.replace("finally {", "catch {", 1)), "restore dropped")
         self.assertTrue(_regex_construction_problems(text.replace("function New-LintRegex", "function New-OtherRegex", 1)), "function removed")
         self.assertTrue(_regex_construction_problems(text.replace("GetCultureInfo('en-US')", "GetCultureInfo('tr-TR')")), "wrong culture")
+
+
+# LINT-CACHE-COLD-WARM-TESTS-1 (acting-cos Dot r12 record, PR #465). The r11 cache ($script:LintPatternSet, $script:LintRegexCache) lives for the life of
+# a process, so a verdict can depend on what EARLIER calls left behind. Every other test here lints each prompt in a process of its own, or one
+# corpus pass; these drive several calls through ONE process and compare each verdict with the verdict of the same prompt in a process of its own.
+def _cache_probe(lint: Path, steps: list[dict], work: Path, tag: str) -> list[dict]:
+    """Run `steps` in order in ONE pwsh that dot-sources `lint` once. A step is {"op": "lint", "text": T} (findings of
+    Get-LocalPlaybackPromptFindings), {"op": "regex", "pattern": P, "input": I} (Get-LintRegex P, whether it matches I, and `slot`: the first step
+    that got the same Regex OBJECT) or {"op": "state"}. Every result also carries the cache state AFTER the step: `built` (pattern set exists),
+    `grammars` (it holds the E1 grammars) and `cache` (entries in the Regex cache)."""
+    src = work / f"{tag}-in.json"
+    src.write_text(json.dumps(steps), encoding="utf-8")
+    probe = work / f"{tag}-probe.ps1"
+    _write_probe(
+        probe,
+        ". " + _psq(lint) + "\n"
+        "$steps = @(ConvertFrom-Json -InputObject ([System.IO.File]::ReadAllText(" + _psq(src) + ", [System.Text.Encoding]::UTF8)))\n"
+        "$held = New-Object System.Collections.Generic.List[object]\n"
+        "$out = New-Object System.Collections.Generic.List[object]\n"
+        "foreach ($s in $steps) {\n"
+        "    $row = [ordered]@{ op = [string]$s.op }\n"
+        "    if ($s.op -eq 'lint') { $row.findings = @(Get-LocalPlaybackPromptFindings -Text ([string]$s.text) | ForEach-Object { [string]$_ }) }\n"
+        "    elseif ($s.op -eq 'regex') {\n"
+        "        $rx = Get-LintRegex ([string]$s.pattern)\n"
+        "        $slot = -1\n"
+        "        for ($i = 0; $i -lt $held.Count; $i++) { if ([object]::ReferenceEquals($held[$i], $rx)) { $slot = $i; break } }\n"
+        "        if ($slot -lt 0) { $held.Add($rx); $slot = $held.Count - 1 }\n"
+        "        $row.slot = $slot\n"
+        "        $row.match = $rx.IsMatch([string]$s.input)\n"
+        "    }\n"
+        "    $row.built = ($null -ne $script:LintPatternSet)\n"
+        "    $row.grammars = ($null -ne $script:LintPatternSet) -and $script:LintPatternSet.ContainsKey('TailGrammar')\n"
+        "    $row.cache = [int]$script:LintRegexCache.Count\n"
+        "    $out.Add([pscustomobject]$row)\n"
+        "}\n"
+        "ConvertTo-Json -InputObject $out.ToArray() -Depth 5 -Compress\n",
+    )
+    done = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(probe)], capture_output=True, text=True, encoding="utf-8", timeout=600)
+    if done.returncode != 0 or not done.stdout.strip():
+        raise AssertionError(f"the cache probe {tag} failed: {(done.stderr or done.stdout).strip()[:300]}")
+    rows = json.loads(done.stdout.strip())
+    if len(rows) != len(steps):
+        raise AssertionError(f"the cache probe {tag} answered {len(rows)} of {len(steps)} steps")
+    return rows
+
+
+@requires_pwsh
+class LintCacheColdWarmTests(unittest.TestCase):
+    """The verdict of a prompt must not depend on the calls that came before it in the same process. The oracle of every prompt is its OWN
+    verdict in a process of its own (a cold first call), computed in setUpClass and anchored to EXPECTED so it cannot drift with the lint."""
+
+    D_HOST = "Run playback on this host."
+    D_LOCALLY = "Run playback LOCALLY."
+    D_UPPER = "Run playback ON THIS HOST."
+    D_INCIDENT = "Run the exactness arms where a GUI desktop session and the clip exist."
+    D_DIRECT = f"Run {APP} {SMOKE_MODE} on the clip."
+    C_PLAIN = "Summarise the changelog and list the open pull requests."
+    C_PROHIBITED = "Do not run playback locally."
+    E1_CLEAN = "Run playback locally on Bachelor through the venue chain."
+    E1_TAIL_DIRTY = "Run playback locally on Bachelor through the venue chain.\nThen play it here."
+    E1_HEAD_DIRTY = "Play it here.\nRun playback locally on Bachelor through the venue chain."
+    E1_HEAD_SENTENCE = "First run playback on this host, then run playback locally on Bachelor through the venue chain."
+    E1_TWO_ITEMS = "Run playback locally on Bachelor through the venue chain.\nRun playback locally on Bachelor through the venue chain."
+    E1_CLEAN_THEN_HOST = "Run playback locally on Bachelor through the venue chain.\nThen run the GUI smoke on this host."
+
+    # prompt -> the rule labels the lint reports for it (the text before the first colon), in order
+    EXPECTED = {
+        D_HOST: ["run-playback-on-this-host"],
+        D_LOCALLY: ["run-playback-locally"],
+        D_UPPER: ["run-playback-on-this-host"],
+        D_INCIDENT: ["where-a-gui-session-exists"],
+        D_DIRECT: ["direct-playback-launch"],
+        C_PLAIN: [],
+        C_PROHIBITED: [],
+        E1_CLEAN: [],
+        E1_TAIL_DIRTY: ["run-playback-locally"],
+        E1_HEAD_DIRTY: ["run-playback-locally"],
+        E1_HEAD_SENTENCE: ["run-playback-locally"],
+        E1_TWO_ITEMS: ["run-playback-locally", "run-playback-locally"],
+        E1_CLEAN_THEN_HOST: ["run-playback-locally", "run-playback-on-this-host"],
+    }
+    DIRTY = (D_HOST, D_LOCALLY, D_UPPER, D_INCIDENT, D_DIRECT)
+    CLEAN = (C_PLAIN, C_PROHIBITED)
+    E1 = (E1_CLEAN, E1_TAIL_DIRTY, E1_HEAD_DIRTY, E1_HEAD_SENTENCE, E1_TWO_ITEMS, E1_CLEAN_THEN_HOST)
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = Path(tempfile.mkdtemp(prefix="hubvm-cache-"))
+        prompts = list(cls.EXPECTED)
+
+        def fresh(number: int) -> list[str]:
+            return _cache_probe(LINT_PS1, [{"op": "lint", "text": prompts[number]}], cls.tmp, f"fresh{number}")[0]["findings"]
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            cls.oracle = dict(zip(prompts, pool.map(fresh, range(len(prompts)))))
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def _run(self, texts: list[str], tag: str) -> list[dict]:
+        return _cache_probe(LINT_PS1, [{"op": "lint", "text": t} for t in texts], self.tmp, tag)
+
+    def _assert_each_verdict_is_the_fresh_one(self, texts: list[str], rows: list[dict], label: str) -> None:
+        for number, (text, row) in enumerate(zip(texts, rows)):
+            self.assertEqual(self.oracle[text], row["findings"], f"{label}: call {number + 1} ({text!r}) differs from the same prompt in a process of its own")
+
+    @staticmethod
+    def _labels(findings: list[str]) -> list[str]:
+        return [f.split(":", 1)[0] for f in findings]
+
+    def test_the_fresh_process_oracle_is_anchored_to_the_expected_labels(self):
+        for text, want in self.EXPECTED.items():
+            self.assertEqual(want, self._labels(self.oracle[text]), f"{text!r} in a process of its own")
+
+    def test_cold_first_call_builds_the_set_and_flags_what_a_fresh_process_flags(self):
+        for number, text in enumerate(self.DIRTY + self.CLEAN):
+            rows = _cache_probe(LINT_PS1, [{"op": "state"}, {"op": "lint", "text": text}, {"op": "state"}], self.tmp, f"cold{number}")
+            before, call, after = rows
+            self.assertEqual((False, False, 0), (before["built"], before["grammars"], before["cache"]), "a new process starts with nothing cached")
+            self.assertEqual(self.oracle[text], call["findings"], text)
+            self.assertTrue(call["built"], f"{text!r}: the first call did not build the pattern set")
+            self.assertFalse(call["grammars"], f"{text!r}: the E1 grammars were built for a prompt that never reaches an E1 marker")
+            self.assertEqual(call["cache"], after["cache"], "a call-less step changed the Regex cache")
+
+    def test_cold_first_call_on_an_e1_prompt_upgrades_the_set_inside_the_call(self):
+        for number, text in enumerate(self.E1):
+            rows = _cache_probe(LINT_PS1, [{"op": "state"}, {"op": "lint", "text": text}], self.tmp, f"coldE1-{number}")
+            self.assertFalse(rows[0]["built"])
+            self.assertEqual(self.oracle[text], rows[1]["findings"], text)
+            self.assertTrue(rows[1]["grammars"], f"{text!r}: an E1 marker was reached and the grammars were not built")
+
+    def test_warm_clean_dirty_alternation_gives_the_fresh_verdict_every_time(self):
+        texts = []
+        for dirty, clean in zip(self.DIRTY, itertools.cycle(self.CLEAN)):
+            texts += [clean, dirty]
+        texts += [self.C_PLAIN, self.D_HOST, self.C_PROHIBITED, self.D_UPPER]
+        rows = self._run(texts, "alternate")
+        self._assert_each_verdict_is_the_fresh_one(texts, rows, "clean/dirty alternation")
+        reverse = list(reversed(texts))
+        self._assert_each_verdict_is_the_fresh_one(reverse, self._run(reverse, "alternate-reverse"), "reversed alternation")
+
+    def test_warm_repeating_a_prompt_repeats_its_verdict_and_adds_no_cache_entries(self):
+        for text in (self.D_HOST, self.C_PLAIN, self.D_INCIDENT, self.D_DIRECT):
+            rows = self._run([text, text, text], "repeat")
+            self._assert_each_verdict_is_the_fresh_one([text] * 3, rows, "repeat")
+            self.assertEqual(rows[0]["cache"], rows[2]["cache"], f"{text!r}: a repeat call grew the Regex cache (the pattern strings are not stable)")
+
+    def test_every_ordered_pair_of_prompts_in_one_process_gives_the_fresh_verdicts(self):
+        prompts = list(self.EXPECTED)
+        pairs = [(a, b) for a in prompts for b in prompts]
+        texts = [t for pair in pairs for t in pair]
+        self._assert_each_verdict_is_the_fresh_one(texts, self._run(texts, "pairs"), "ordered pairs")
+
+    def test_lazy_upgrade_runs_once_between_calls_and_later_verdicts_stay_fresh(self):
+        texts = [self.D_HOST, self.C_PLAIN, self.E1_CLEAN, self.D_LOCALLY, self.E1_TAIL_DIRTY, self.C_PROHIBITED, self.E1_CLEAN,
+                 self.E1_HEAD_DIRTY, self.D_DIRECT, self.E1_TWO_ITEMS, self.E1_CLEAN, self.E1_HEAD_SENTENCE, self.E1_CLEAN_THEN_HOST, self.E1_CLEAN]
+        rows = self._run(texts, "upgrade")
+        self._assert_each_verdict_is_the_fresh_one(texts, rows, "lazy upgrade")
+        first_e1 = texts.index(self.E1_CLEAN)
+        for number, row in enumerate(rows):
+            self.assertEqual(number >= first_e1, row["grammars"], f"call {number + 1}: the grammars must exist exactly from the first E1 call on, and never be dropped")
+
+    def test_a_prompt_judged_by_the_un_upgraded_set_is_judged_the_same_after_the_upgrade(self):
+        """The prompts here are cut from the same sentences as the E1 ones but never reach an E1 marker, so the un-upgraded set decides them."""
+        plain = (self.D_HOST, self.D_LOCALLY, self.D_UPPER, self.D_INCIDENT, self.D_DIRECT, self.C_PLAIN, self.C_PROHIBITED)
+        texts = list(plain) + [self.E1_CLEAN] + list(plain) + [self.E1_TAIL_DIRTY, self.E1_CLEAN] + list(reversed(plain))
+        rows = self._run(texts, "before-after")
+        self._assert_each_verdict_is_the_fresh_one(texts, rows, "before/after the upgrade")
+        for row in rows[:len(plain)]:
+            self.assertFalse(row["grammars"])
+        for row in rows[len(plain):]:
+            self.assertTrue(row["grammars"])
+
+    def test_a_dirty_e1_call_leaves_no_per_call_state_for_the_next_call(self):
+        """The head / tail state of E1 (the cursor, the memo of the first dirty later item) is rebuilt for every call: a one-item prompt
+        followed by a two-item one must not read the one-item memo, and a dirty head must not stay dirty for a clean prompt."""
+        texts = [self.E1_CLEAN, self.E1_TAIL_DIRTY, self.E1_CLEAN, self.E1_HEAD_DIRTY, self.E1_CLEAN, self.E1_TWO_ITEMS, self.E1_CLEAN,
+                 self.E1_CLEAN_THEN_HOST, self.E1_CLEAN, self.E1_HEAD_SENTENCE, self.E1_CLEAN, self.E1_TAIL_DIRTY, self.E1_TAIL_DIRTY]
+        self._assert_each_verdict_is_the_fresh_one(texts, self._run(texts, "per-call"), "per-call state")
+
+    def test_the_cache_key_is_ordinal_so_patterns_that_differ_only_in_case_do_not_share_a_regex(self):
+        steps = [{"op": "regex", "pattern": "abc", "input": "abc"}, {"op": "regex", "pattern": "ABC", "input": "abc"},
+                 {"op": "regex", "pattern": "abc", "input": "ABC"}, {"op": "regex", "pattern": "ABC", "input": "ABC"},
+                 {"op": "regex", "pattern": "abc", "input": "abc"}, {"op": "regex", "pattern": "ABC", "input": "ABC"}]
+        rows = _cache_probe(LINT_PS1, steps, self.tmp, "ordinal-cold")
+        self.assertEqual([0, 1, 0, 1, 0, 1], [r["slot"] for r in rows], "slots: one Regex object per distinct, case-sensitive pattern string")
+        self.assertEqual([True, False, False, True, True, True], [r["match"] for r in rows], "each pattern matches only its own case")
+        self.assertEqual(2, rows[-1]["cache"], "two case-variant patterns are two cache entries")
+        # the same after the cache is warm: lint calls first, then the case-variant pair, then lint calls again
+        warm = ([{"op": "lint", "text": t} for t in (self.D_HOST, self.E1_CLEAN, self.C_PLAIN)] + steps
+                + [{"op": "lint", "text": t} for t in (self.D_UPPER, self.E1_TAIL_DIRTY)])
+        rows = _cache_probe(LINT_PS1, warm, self.tmp, "ordinal-warm")
+        head, mid, tail = rows[:3], rows[3:3 + len(steps)], rows[3 + len(steps):]
+        self.assertEqual([r["slot"] for r in mid], [0, 1, 0, 1, 0, 1])
+        self.assertEqual([True, False, False, True, True, True], [r["match"] for r in mid])
+        self.assertEqual(head[-1]["cache"] + 2, mid[-1]["cache"], "the case-variant pair adds exactly two entries to a warm cache")
+        self.assertEqual([self.oracle[self.D_HOST], self.oracle[self.E1_CLEAN], self.oracle[self.C_PLAIN]], [r["findings"] for r in head])
+        self.assertEqual([self.oracle[self.D_UPPER], self.oracle[self.E1_TAIL_DIRTY]], [r["findings"] for r in tail])
 
 
 @requires_pwsh
