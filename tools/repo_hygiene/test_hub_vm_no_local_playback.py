@@ -18,7 +18,9 @@ Launch command lines in the fixtures are assembled at run time so this file itse
 
 from __future__ import annotations
 
+import ast
 import hashlib
+import inspect
 import itertools
 import json
 import os
@@ -31,6 +33,7 @@ import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 HOSTS_JSON = ROOT / "tools" / "profiling" / "dual-venue" / "hub-hosts.json"
@@ -192,10 +195,11 @@ def _popen_pwsh(probe: Path) -> "subprocess.Popen":
     return proc
 
 
-def _run_pwsh(probe: Path, timeout: int) -> "subprocess.CompletedProcess":
+def _run_pwsh(probe: Path, timeout: float, encoding: "str | None" = None) -> "subprocess.CompletedProcess":
     """The one place a pwsh lint probe is run in the foreground; counted in _PWSH_SPAWNS."""
     _PWSH_SPAWNS.append(probe.name)
-    return subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(probe)], capture_output=True, text=True, timeout=timeout)
+    return subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(probe)], capture_output=True, text=True, encoding=encoding,
+                          timeout=timeout)
 
 
 def _lint_blob_id(lint: Path) -> str:
@@ -4340,11 +4344,25 @@ class CultureIndependenceTests(unittest.TestCase):
 # LINT-CACHE-COLD-WARM-TESTS-1 (acting-cos Dot r12 record, PR #465). The r11 cache ($script:LintPatternSet, $script:LintRegexCache) lives for the life of
 # a process, so a verdict can depend on what EARLIER calls left behind. Every other test here lints each prompt in a process of its own, or one
 # corpus pass; these drive several calls through ONE process and compare each verdict with the verdict of the same prompt in a process of its own.
-def _cache_probe(lint: Path, steps: list[dict], work: Path, tag: str) -> list[dict]:
+def _probe_tail(text: "str | bytes | None", limit: int = 300) -> str:
+    """The last `limit` characters of a probe stream, or the literal <no output>: a failure message must never end in an empty colon."""
+    if isinstance(text, bytes):
+        text = text.decode("utf-8", errors="replace")
+    text = (text or "").strip()
+    return repr(text[-limit:]) if text else "<no output>"
+
+
+def _cache_probe(lint: Path, steps: list[dict], work: Path, tag: str, deadline: "float | None" = None) -> list[dict]:
     """Run `steps` in order in ONE pwsh that dot-sources `lint` once. A step is {"op": "lint", "text": T} (findings of
     Get-LocalPlaybackPromptFindings), {"op": "regex", "pattern": P, "input": I} (Get-LintRegex P, whether it matches I, and `slot`: the first step
     that got the same Regex OBJECT) or {"op": "state"}. Every result also carries the cache state AFTER the step: `built` (pattern set exists),
-    `grammars` (it holds the E1 grammars) and `cache` (entries in the Regex cache)."""
+    `grammars` (it holds the E1 grammars) and `cache` (entries in the Regex cache).
+
+    LINT-CACHE-PROBE-SHARED-BOUND-1: the pwsh is started by _run_pwsh (counted in _PWSH_SPAWNS) and killed at LINT_PROBE_BOUND_SEC from now, or at
+    `deadline` (a time.monotonic() value derived from it) when the caller shares one budget among several probes. A probe that fails raises a
+    message with the tag, the return code, whether it timed out, elapsed against the bound and both stream tails."""
+    started = time.monotonic()
+    timeout = LINT_PROBE_BOUND_SEC if deadline is None else max(1.0, deadline - started)
     src = work / f"{tag}-in.json"
     src.write_text(json.dumps(steps), encoding="utf-8")
     probe = work / f"{tag}-probe.ps1"
@@ -4372,9 +4390,15 @@ def _cache_probe(lint: Path, steps: list[dict], work: Path, tag: str) -> list[di
         "}\n"
         "ConvertTo-Json -InputObject $out.ToArray() -Depth 5 -Compress\n",
     )
-    done = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(probe)], capture_output=True, text=True, encoding="utf-8", timeout=600)
+    try:
+        done = _run_pwsh(probe, timeout, encoding="utf-8")
+    except subprocess.TimeoutExpired as expired:
+        raise AssertionError(f"the cache probe {tag} timed out and was killed after {time.monotonic() - started:.0f} s (bound {LINT_PROBE_BOUND_SEC} s); "
+                             f"stderr tail: {_probe_tail(expired.stderr)}; stdout tail: {_probe_tail(expired.stdout)}") from None
     if done.returncode != 0 or not done.stdout.strip():
-        raise AssertionError(f"the cache probe {tag} failed: {(done.stderr or done.stdout).strip()[:300]}")
+        signal = f" (signal {-done.returncode})" if done.returncode < 0 else ""
+        raise AssertionError(f"the cache probe {tag} failed: rc={done.returncode}{signal}, not timed out, elapsed {time.monotonic() - started:.1f} s "
+                             f"of the {LINT_PROBE_BOUND_SEC} s bound; stderr tail: {_probe_tail(done.stderr)}; stdout tail: {_probe_tail(done.stdout)}")
     rows = json.loads(done.stdout.strip())
     if len(rows) != len(steps):
         raise AssertionError(f"the cache probe {tag} answered {len(rows)} of {len(steps)} steps")
@@ -4423,17 +4447,15 @@ class LintCacheColdWarmTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.tmp = Path(tempfile.mkdtemp(prefix="hubvm-cache-"))
+        cls.addClassCleanup(shutil.rmtree, cls.tmp, ignore_errors=True)  # tearDownClass does not run when this method raises
         prompts = list(cls.EXPECTED)
+        deadline = time.monotonic() + LINT_PROBE_BOUND_SEC  # one budget for all the fresh probes, not one bound per wave of the pool
 
         def fresh(number: int) -> list[str]:
-            return _cache_probe(LINT_PS1, [{"op": "lint", "text": prompts[number]}], cls.tmp, f"fresh{number}")[0]["findings"]
+            return _cache_probe(LINT_PS1, [{"op": "lint", "text": prompts[number]}], cls.tmp, f"fresh{number}", deadline)[0]["findings"]
 
         with ThreadPoolExecutor(max_workers=4) as pool:
             cls.oracle = dict(zip(prompts, pool.map(fresh, range(len(prompts)))))
-
-    @classmethod
-    def tearDownClass(cls):
-        shutil.rmtree(cls.tmp, ignore_errors=True)
 
     def _run(self, texts: list[str], tag: str) -> list[dict]:
         return _cache_probe(LINT_PS1, [{"op": "lint", "text": t} for t in texts], self.tmp, tag)
@@ -4534,6 +4556,104 @@ class LintCacheColdWarmTests(unittest.TestCase):
         self.assertEqual(head[-1]["cache"] + 2, mid[-1]["cache"], "the case-variant pair adds exactly two entries to a warm cache")
         self.assertEqual([self.oracle[self.D_HOST], self.oracle[self.E1_CLEAN], self.oracle[self.C_PLAIN]], [r["findings"] for r in head])
         self.assertEqual([self.oracle[self.D_UPPER], self.oracle[self.E1_TAIL_DIRTY]], [r["findings"] for r in tail])
+
+
+# LINT-CACHE-PROBE-SHARED-BOUND-1 (merge_group run 39471086289, PR #489: "the cache probe fresh8 failed: " with nothing after the colon).
+# _cache_probe used to run its own subprocess.run with a literal 600 s outside LINT_PROBE_BOUND_SEC and _PWSH_SPAWNS, and its failure message
+# held only stderr-or-stdout, so a pwsh that died with no output left an empty message. These tests run without pwsh: subprocess.run is replaced.
+class LintCacheProbeBoundTests(unittest.TestCase):
+    STEPS = [{"op": "state"}]
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="hubvm-cacheprobe-pin-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def _probe_with(self, outcome, tag: str = "pin"):
+        """_cache_probe with subprocess.run answering `outcome` (a CompletedProcess, or an exception to raise); returns (rows, the run mock)."""
+        with mock.patch.object(subprocess, "run", side_effect=[outcome]) as run:
+            return _cache_probe(LINT_PS1, self.STEPS, self.tmp, tag), run
+
+    def _failure_of(self, outcome, tag: str = "pin") -> str:
+        with self.assertRaises(AssertionError) as caught:
+            self._probe_with(outcome, tag)
+        return str(caught.exception)
+
+    def test_the_cache_probe_runs_through_the_counted_helper_and_the_shared_bound(self):
+        done = subprocess.CompletedProcess([], 0, stdout='[{"op":"state"}]', stderr="")
+        before = len(_PWSH_SPAWNS)
+        with mock.patch.dict(globals(), {"LINT_PROBE_BOUND_SEC": 7}):
+            rows, run = self._probe_with(done, "bound")
+        self.assertEqual([{"op": "state"}], rows)
+        self.assertEqual(["bound-probe.ps1"], _PWSH_SPAWNS[before:], "the probe must be counted in _PWSH_SPAWNS")
+        timeout = run.call_args.kwargs["timeout"]
+        self.assertTrue(0 < timeout <= 7, f"the probe's timeout {timeout} must come from LINT_PROBE_BOUND_SEC (7 here), never a literal of its own")
+
+    def test_the_cache_probe_source_has_no_spawn_or_timeout_of_its_own(self):
+        tree = ast.parse(inspect.getsource(_cache_probe))
+        calls = {ast.unparse(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)}
+        names = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+        self.assertFalse({c for c in calls if c.startswith("subprocess.")}, "_cache_probe must start pwsh only through _run_pwsh")
+        self.assertIn("_run_pwsh", calls)
+        self.assertIn("LINT_PROBE_BOUND_SEC", names)
+
+    def test_a_non_zero_exit_with_no_output_names_the_tag_the_return_code_and_the_empty_streams(self):
+        message = self._failure_of(subprocess.CompletedProcess([], 3, stdout="", stderr=""), "fresh8")
+        for needle in ("fresh8", "rc=3", "<no output>", "bound"):
+            self.assertIn(needle, message)
+
+    def test_a_signal_death_is_named_as_one(self):
+        message = self._failure_of(subprocess.CompletedProcess([], -9, stdout="", stderr=""), "fresh8")
+        self.assertIn("rc=-9", message)
+        self.assertIn("signal 9", message)
+
+    def test_a_zero_exit_with_empty_stdout_is_reported_with_its_stderr_tail(self):
+        message = self._failure_of(subprocess.CompletedProcess([], 0, stdout="  \n", stderr="warn: " + "x" * 600 + "END"), "fresh8")
+        self.assertIn("rc=0", message)
+        self.assertIn("END", message, "the tail of stderr, not its head, is what explains a failure")
+
+    def test_a_probe_killed_at_the_bound_fails_typed_with_elapsed_and_bound(self):
+        with mock.patch.dict(globals(), {"LINT_PROBE_BOUND_SEC": 7}):
+            message = self._failure_of(subprocess.TimeoutExpired(["pwsh"], 7, output=None, stderr=b"half a line"), "fresh8")
+        for needle in ("fresh8", "timed out", "7 s", "half a line"):
+            self.assertIn(needle, message)
+
+
+@requires_pwsh
+class LintCacheProbeRealFailureTests(unittest.TestCase):
+    def test_a_real_pwsh_that_exits_non_zero_with_no_output_gives_a_typed_message(self):
+        with tempfile.TemporaryDirectory(prefix="hubvm-cacheprobe-real-") as tmp:
+            lint = Path(tmp) / "exits.ps1"
+            lint.write_text("[Environment]::Exit(7)\n", encoding="utf-8")  # ends the whole process (a bare `exit` only ends the dot-sourced scope)
+            with self.assertRaises(AssertionError) as caught:
+                _cache_probe(lint, [{"op": "state"}], Path(tmp), "real7")
+        message = str(caught.exception)
+        for needle in ("real7", "rc=7", "<no output>"):
+            self.assertIn(needle, message)
+
+
+class LintCacheSetUpClassCleanupTests(unittest.TestCase):
+    def test_a_probe_that_raises_in_setupclass_leaves_no_temp_dir(self):
+        made: list[Path] = []
+        real_mkdtemp = tempfile.mkdtemp
+
+        def spy(*args, **kwargs):
+            made.append(Path(real_mkdtemp(*args, **kwargs)))
+            return str(made[-1])
+
+        class Throwaway(LintCacheColdWarmTests):  # own cleanup list: the real class's must never be run from here
+            pass
+
+        Throwaway._class_cleanups = []
+        self.addCleanup(lambda: [shutil.rmtree(d, ignore_errors=True) for d in made])
+        with mock.patch.dict(globals(), {"_cache_probe": mock.Mock(side_effect=AssertionError("probe boom"))}), \
+                mock.patch.object(tempfile, "mkdtemp", spy):
+            try:
+                with self.assertRaises(AssertionError):
+                    Throwaway.setUpClass()
+            finally:
+                Throwaway.doClassCleanups()  # what unittest does after a failed setUpClass
+        self.assertEqual(1, len(made))
+        self.assertFalse(made[0].exists(), "setUpClass leaked its temp dir when a fresh probe raised")
 
 
 @requires_pwsh
