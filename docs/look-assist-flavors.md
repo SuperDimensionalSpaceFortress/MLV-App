@@ -355,3 +355,106 @@ The flavor applied is always reported, appended to the end of the existing lines
   selector, result lines), suite `LookAssistVision50dGrade` (T1..T6), the fixture gates and headless ownership cases in
   `LookAssistFlavorsFixture`, and the GPU parity cases `look_assist_vision50d_night_real_frame` and
   `look_assist_vision50d_shade_real_frame`. Listed by name in [look-assist-vision50d.md](look-assist-vision50d.md).
+
+## M16-1243 cast: #286 findings (measure-only, closed unmerged)
+
+PR #286 (LOOK-ASSIST-M16-CAST-6, branch `product/LOOK-ASSIST-M16-CAST-6`, head `0142c7fc`, stacked on #283 / #282 /
+#280) measured why Look Assist leaves a purple / magenta cast and floor blocks on the benchmark clip M16-1243. It was
+measure-only: its probes (`MLVAPP_LOOK_ASSIST_DISO_MATCH_TRACE`) sit in the `match_exposures` hot loop, and with the
+variable unset the picture was unchanged. **It is closed unmerged (owner ruling 2026-10-13, CoS #286 ACK) and its probes
+are not salvaged**: card M16-CAST-PROBES-SALVAGE-1 is retired, and its "land them behind a switch" option went with the
+colour goal. This section is the record of what it found. Nothing here describes shipped behaviour.
+
+**Source of every number below:** the one Bachelor trace leg, receipt `908aea7b-768b-4951-b58c-0ff44d47149d`
+(`.claude-state\dual-venue\receipts\DUAL-VENUE-EVIDENCE-1\m16-1243-look-scale2-trace\bachelor\`; leg
+`m16-1243-look-scale2-trace`, CPU scale-2 classic, build `0142c7fc`, HEALTHY, 1743 s of arms, source 603/600, scale
+honoured), three frames (f0, f374, f749). The tables were produced by `analyse.py` into
+`.claude-state\fleet-runs\lane-LOOK-ASSIST-M16-CAST-6-r3-20261007T0240Z\analyse.txt`, and the lane's own account is that
+run's `summary.md` (r1 and r2 ended BLOCKED-REDIRECT on the C: disk floor and measured nothing). The levels and OLS P2
+numbers for the unmodified recon first came from CAST-5's leg, receipt `201a0492` (PR #283).
+
+### What each probe or arm did
+
+| name | what it is |
+|---|---|
+| **P2r** (`dualiso_robust_fieldratio`) | A robust per-channel field-ratio fit beside P2's OLS on the same doubly valid samples: Theil's split-sample estimator on at most 20k samples, plus binned-median slopes in bands B1 (128..1024), B2 (..4096), B3 (..0.9 x clip). |
+| **Q0** (`dualiso_q0_estimate`) | Fit-free: the median of (Gr-black)/(Gb-black) per ISO field inside each hardware row pair. A = log2(m_dark / m_bright), also split by Gr column x mod 8. |
+| **X0** (llrawproc) | An isolated run that skips every pre-dual-ISO step (dark frame, vertical stripes, focus / bad pixels, pattern noise) and tells the recon no dark frame was subtracted. The trace logs `pre_steps=2 pre_applied=2` on the clip, which the lane read as vertical stripes being the only step the receipt-less open enables (5D Mark III, MainWindow.cpp:14753-14758). |
+| **R0** | The reference render: the recon as it is, no arm override. |
+| **A11** | CAST-5's per-channel field-match arm (#283); not restated here. |
+| **A11g / A11b / A11s** (the split A11 arms) | A11g: G1 (Gr) only. A11b: B only. A11s: slopes with the global black delta (the global `bd`). |
+| **A11r** | A11 with P2r's band-2 (B2) factors. |
+
+Each arm rendered at three balances: **LA** (Look Assist's own white-balance decision made on that arm's own render),
+**PIN** (3.80 / 6724 / 0) and **AS** (as-shot). A thread-local capture of the HQ recon's 16-bit Bayer output (linear,
+before white balance) over R0's overexposed map gave SEAM and BLOCK. OLIVE, PSH, LAV and MEANBR are display metrics on
+R0's fixed masks. NEUTRAL (the cast inside hand-picked neutral boxes, bar <= 8) was computed offline from the PNGs. Neutral
+pass was defined in advance as NEUTRAL <= 8 on every neutral box, |MEANBR| <= 10, and OLIVE <= max(1.5 x R0's OLIVE,
+R0's OLIVE + 2 pp). The PR body does not define LAV and PSH beyond "display metrics on R0's masks"; their code is in
+`analyse.py` of the r3 run dir.
+
+### Measured result: the field asymmetry (receipt `908aea7b`), R0 -> X0
+
+| frame | P2 G1 ev | P2 B ev / bd | P2r G1 Theil-Sen ev (G2 beside it) | Q0 A | dark G1 / G2 p99.99 under X0 |
+|---|---|---|---|---|---|
+| f0 | 4.966 -> 3.979 | 3.765 / -50.67 -> 3.980 / 20.52 | 4.993 -> 3.983 (3.989 -> 3.986) | -0.229 -> 0.000 | 3913 / 3916 |
+| f374 | 5.002 -> 3.984 | 3.718 / -86.11 -> 3.984 / 20.63 | 4.985 -> 3.982 (3.982 -> 3.979) | -0.931 -> 0.000 | 3324 / 3318 |
+| f749 | 4.953 -> 3.979 | 3.908 / -52.16 -> 3.980 / 20.38 | 4.992 -> 3.986 (3.989 -> 3.988) | -0.910 -> 0.002 | 7997 / 8014 |
+
+R and G2 stay at about 3.98 EV throughout. Q0 shows the asymmetry sits in the **bright** field (bright Gr reads 1.17 /
+1.91 / 1.88 x Gb on f0 / f374 / f749; the dark field is symmetric) and is uniform across x mod 8 (A -0.22 / -0.23 /
+-0.23 / -0.24 at columns 1 / 3 / 5 / 7 on f0, similar on the others), so the sub-lattice clause did not fire. R0's dark
+Gr top tail is about 1.86x Gb (p99.99 5540 vs 3923 on f0); under X0 it matches (3913 vs 3916). `noise_samples=0`
+(noise defaults to 8.00): recorded, not fixed. P1's map is 1808x2268 on every frame, so M16-1243 takes no GBRG row skip.
+
+### Measured result: the arms at LA (receipt `908aea7b`)
+
+Per frame f0 / f374 / f749 (LA balance, temp/tint, was R0 6000/0, 6500/0, 6000/0 and X0 6000/0, 6342/0, 6000/0):
+
+| arm | SEAM | BLOCK | PSH | OLIVE | NEUTRAL | MEANBR |
+|---|---|---|---|---|---|---|
+| R0 | 0.558 / 0.556 / 0.530 | 1.111 / 1.139 / 0.898 | 23.2 / 18.6 / 23.7 | 17.2 / 10.4 / 0.9 | 36.9 / 38.8 / 47.4 | 25.5 / 41.4 / 39.5 |
+| A11 | 0.995 / 0.602 / 1.354 | 0.155 / 0.153 / 0.623 | 0.3 / 0.3 / 0.5 | 93.7 / 84.0 / 88.6 | 41.1 / 42.1 / 21.9 | -40.6 / -9.5 / -43.7 |
+| A11g | 0.438 / 0.486 / 0.436 | 0.178 / 0.182 / 0.596 | 38.4 / 28.6 / 41.1 | 17.8 / 10.6 / 0.8 | 41.8 / 40.8 / 34.6 | 22.1 / 37.3 / 35.7 |
+| A11b | 0.987 / 0.677 / 1.606 | 1.119 / 1.078 / 0.928 | 0.0 / 0.0 / 0.1 | 88.1 / 76.7 / 84.5 | 37.0 / 47.4 / 53.4 | -14.6 / 18.0 / -17.5 |
+| A11s | 0.336 / 0.449 / 0.452 | 0.252 / 0.282 / 0.592 | 61.1 / 55.5 / 60.0 | 16.5 / 9.0 / 0.0 | 42.8 / 43.0 / 38.4 | 23.8 / 38.9 / 35.0 |
+| A11r | 0.738 / 0.494 / 0.613 | 0.876 / 0.287 / 0.586 | 0.3 / 28.8 / 30.5 | 85.4 / 11.8 / 11.0 | 35.4 / 38.7 / 8.8 | -27.5 / 12.8 / -1.6 |
+| **X0** | **0.040 / 0.035 / 0.197** | **0.108 / 0.176 / 0.143** | 3.8 / 0.3 / 6.8 | 26.8 / 13.9 / 23.3 | **12.2 / 12.4 / 15.9** | -9.8 / 7.7 / 2.0 |
+
+The PIN and AS columns for every arm are in `analyse.txt` and were in the PR body; they are not repeated here.
+
+What the eyeball added (lane's own look at the LA montages and full frames; the skin, neutral and the other PIN crops
+were generated but not all viewed): R0 is violet on dark clothing and shadows, with a lilac floor and teal stair-step
+blocks on f374 and purple blotches on f749; A11 removes most blocks but turns the whole frame olive / orange-yellow
+(f0, f749); A11g reduces the teal blocks but leaves a lilac-purple or blue-lavender floor; A11b is green / teal;
+A11s is strongly violet (the worst PSH); A11r is a muted grey-mauve with faint lilac blocks on f374. **X0 is the only
+arm without the purple / magenta cast**: a neutral grey floor, navy / black clothing, clean whites, with a slight cool
+green-grey tilt on the f749 floor. Numbers and eyeball agreed.
+
+### What was concluded
+
+* **Decision row B (a bug card), on 3 of 3 frames.** R0 |Q0 A| was 0.23 / 0.93 / 0.91 and P2r's G1 sat 1.00 EV off G2
+  on all three; under X0 |A| was <= 0.002 and P2r's G1 was within 0.004 EV of G2. The probes agree with each other (Q0
+  is fit-free and sees what P2 / P2r see), so the asymmetry is not a probe artefact.
+* **The cause is the pre-dual-ISO vertical-stripe correction.** On dual-ISO frames it rates the odd (Gr) columns of each
+  RG row against a green of the next row, which with `is_bright=0110` is in the other ISO field (stripes.c:225-277); the
+  ratio is clamped to +-1 EV (stripes.c:102) and applied where `pb < white && pa > black + 64` (stripes.c:417-424). That is a
+  field-dependent gain on exactly the two odd-column channels, Gr (G1) and B, about 1 EV on bright-field Gr. The r1
+  code-reading prediction was confirmed by the leg. It also explains the earlier "levels contradict one gain on G1"
+  premise (it came from the stripes step).
+* **No per-channel field match was needed, and none of the split A11 arms is a fix.** No arm passed the F numerics on any
+  frame, and every arm failed Neutral at LA (the nearest miss is A11r on f749 at NEUTRAL 8.8, against 35.4 on f0 and
+  38.7 on f374). X0 got closest but is not a Neutral pass yet: NEUTRAL 12.2 / 12.4 / 15.9 against <= 8, and OLIVE 26.8 / 13.9 /
+  23.3 against R0's 17.2 / 10.4 / 0.9. That residual was left to the fix card's own measure.
+* The recon has no per-channel field match (one global ev / bd in dualiso.c `compute_match_exposure_scalars`, a
+  channel-mixed histogram match, and scalars only on the GPU-prep path); that finding stands but was not acted on.
+* **Successor:** LOOK-ASSIST-DUALISO-VSTRIPES-1 (PR #295, queued 2026-10-07T06:52Z). Its r1 ended PARTIAL with the cast gone on
+  M16-1243 (R0 byte-identical to X0 on 6/6 renders, eyeball neutral) and later rounds re-pinned fixtures; this section does not
+  record that card's final outcome (not recorded here).
+
+### Known gaps in the #286 record
+
+* The 13 mutation tests, the console suite and the three-agent adversarial step were not run (disk floor in r1, out of scope in
+  r3, no Agent tool in a headless lane). The mutants were staged in the r1 run dir's `tools\mutate.ps1`.
+* The PR title still reads "BLOCKED disk, leg pending"; the body was updated to DONE row B in r3.
+* r1 and r2 receipts do not exist (no leg ran); r3's `908aea7b` is the only trace-leg receipt.
