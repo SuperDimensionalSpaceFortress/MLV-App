@@ -7934,6 +7934,9 @@ _CLAIM_CARRIERS_PINNED = (
     "tools/profiling/bachelor/attr3-footage-presence-job.ps1",
     "tools/profiling/bachelor/attr3-footage-read-rate-job.ps1",
     "tools/profiling/bachelor/playback-attr-3-cuda-job.ps1",
+    # VENUE-REFERENCE-FRAME-JOB-1 r2: the reference-frame job generator resolves a consented clip id to its parts.  Read: it
+    # asserts no exclusivity claim (the needle below runs clean over it).
+    "tools/profiling/bachelor/reference-frame-runner-job.ps1",
     "tools/profiling/dual-venue/DualVenueRunner.psm1",
     "tools/profiling/dual-venue/Invoke-VenueLeg.ps1",
     # LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1: the Classic | Cinematic pair driver refuses a non-consented clip id exactly as
