@@ -30,6 +30,7 @@ import zipfile
 from pathlib import Path
 
 from tools.repo_hygiene import test_playback_launcher_receipt_oracle as oracle_tests
+from tools.repo_hygiene.synthetic_mlv import MLV_EXTENSION, write_synthetic_mlv
 from tools.repo_hygiene.test_playback_clip_length_gate import PWSH, ROOT, _q, requires_pwsh
 
 GENERATOR = ROOT / "tools" / "profiling" / "bachelor" / "reference-frame-runner-job.ps1"
@@ -274,6 +275,32 @@ class GeneratorTests(_GeneratorCase):
         self.assertIn("if ($null -eq $LASTEXITCODE) { exit 70 }", job)
         self.assertNotIn("reviewed_instrumented_known_good", job)
 
+    def test_a_failed_capture_exits_outside_every_step_code(self) -> None:
+        # REFERENCE-FRAME-JOB-EXIT-CODE-SPACE-1: the capture's code stays the job's exit code (test_playback_receipt_run_binding.py pins that),
+        # so the job's OWN step codes moved to 2xx: the capture script's every exit is below 100 (70 from the command wrapper included), and a
+        # code outside 1-199 is folded to 199 -- no capture code can read as a step code.
+        job = self.emitted()
+        steps = {int(code) for code in re.findall(r"Complete-Failed (\d+) '", job)}
+        self.assertTrue(steps, "no step codes found: this assertion is stale")
+        self.assertTrue(all(200 <= code <= 255 for code in steps), sorted(steps))
+        self.assertIn("if ($captureRc -ne 0 -and ($captureRc -lt 1 -or $captureRc -gt 199)) { $captureRc = 199 }", job)
+        self.assertEqual(sorted(int(code) for code in re.findall(r"(?m)^\s*exit (\d+)\s*$", job)), [0, 0, 225])
+        capture_codes = {int(code) for code in re.findall(r"\bexit (\d+)", _git("show", f"{self.head}:{CLOSURE[0]}").decode("utf-8"))}
+        self.assertTrue(capture_codes and max(capture_codes) < 100, sorted(capture_codes))
+
+    def test_the_capture_is_handed_only_the_neutral_view_and_the_originals_are_pinned_first(self) -> None:
+        # F-01, statically (the fixture run above proves it in behaviour): the pin precedes the view, the view precedes the one content read,
+        # and the -Clip argument is the view of part 0 -- never a decoded part path.
+        job = self.emitted()
+        order = [job.index(needle) for needle in (
+            "Open-AttrCudaReadOnlyHandle -Path $part.path", "New-AttrCudaOwnerFootageView -Directory $OwnerClipDir",
+            "Test-AttrCudaFootagePart -Path $view.Path", "$captureCommand = ")]
+        self.assertEqual(order, sorted(order))
+        self.assertIn("if ($part.index -eq 0) { $clipPath = $view.Path }", job)
+        self.assertIn("-Clip '$clipPath'", job)
+        self.assertNotIn("$clipPath = @($verifiedParts", job, "the capture is handed a decoded part path again")
+        self.assertIn("$OwnerClipDir = New-AttrCudaDirectory -Path (Join-Path $Work 'owner-clip')", job)
+
     def test_the_generator_never_launches_the_app_or_writes_the_consent_file(self) -> None:
         code = re.sub(r"(?m)^\s*#.*$", "", GENERATOR.read_text(encoding="utf-8"))
         for forbidden in ("Start-Process", "MLVApp.exe", "Set-Content", "Out-File", "venue-clip-consent.json'"):
@@ -358,7 +385,8 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
                     "-SourceCommit", self.head, "-BuildManifestSha256", sha, "-ClipId", CLIP_ID, "-RepoRoot", str(self.repo),
                     "-OutFile", str(gen_out), "-AgentRoot", str(self.agent)])
         self.assertEqual(gen.returncode, 0, gen.stdout + gen.stderr)
-        part = self.tmp / f"{name}-synthetic-part.bin"
+        # the base extension a real part 0 carries (the job views part i under the neutral name for index i, which checks it)
+        part = self.tmp / (f"{name}-synthetic-part" + MLV_EXTENSION)
         if data is not None:
             part.write_bytes(data)
         encoded = base64.b64encode(str(part).replace("\\", "/").encode("utf-8")).decode("ascii")
@@ -387,20 +415,96 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
     def test_a_capture_the_script_refuses_is_a_failed_capture_carrying_the_scripts_own_exit_code(self) -> None:
         # The synthetic part is not footage, so capture-reference-frame.ps1 itself refuses before it would launch anything (its clip-length gate,
         # exit 42 CLIP_LENGTH_UNKNOWN). The job ran the capture script out of the verified bundle, under the gate profile, and never reinterprets
-        # its exit code: it is the job's exit code and the result's status is capture-failed, never a candidate.
+        # its exit code: it is the job's exit code (and captureExitCode, CAPTURE_EXIT=), no step code shares it (the job's own are 2xx,
+        # REFERENCE-FRAME-JOB-EXIT-CODE-SPACE-1), and the result's status is capture-failed, never a candidate.
         data = b"synthetic-footage-0123456789"
         ran, _ = self.run_with_synthetic_part("goodpart", data=data, declared_length=len(data), declared_sha=hashlib.sha256(data).hexdigest())
         captured = self.artifacts() / "capture-stdout.txt"
         self.assertEqual(ran.returncode, 42, ran.stdout + ran.stderr + (captured.read_text(encoding="utf-8-sig") if captured.exists() else "<no capture-stdout.txt>"))
-        self.assertIn("RESULT=REFERENCE_FRAME_CAPTURE_FAILED EXIT=42", ran.stdout)
+        self.assertIn("RESULT=REFERENCE_FRAME_CAPTURE_FAILED EXIT=42 CAPTURE_EXIT=42", ran.stdout)
         self.assertNotIn("CAPTURE_OK", ran.stdout)
         result = json.loads((self.artifacts() / "result.json").read_text(encoding="utf-8-sig"))
         self.assertEqual(result["status"], "capture-failed")
         self.assertEqual(result["exitCode"], 42)
+        self.assertEqual(result["captureExitCode"], 42)
         self.assertEqual(result["gateProfile"]["startFrame"], 120)
         self.assertIsNone(result["candidateSha256"])
         self.assertIn("CAPTURE: REFUSED", (self.artifacts() / "capture-stdout.txt").read_text(encoding="utf-8-sig"))
         self.assertFalse((self.artifacts() / "capture" / "reference-frame-candidate.json").exists())
+
+    # --- F-01 footage-path-disclosure: a SUCCESSFUL capture publishes nothing that names the owner's part path ---------------------------------
+    def test_a_successful_capture_publishes_no_artifact_naming_the_part_path_and_the_capture_sees_only_the_neutral_view(self) -> None:
+        # The real capture script runs out of the verified bundle against a stand-in app (oracle_tests' fake: records its argv, writes a
+        # receipt carrying this run's nonce and a stand-in grab). The only edit to the emitted job is the two things a fixture cannot provide:
+        # the part (a synthetic 41 s clip in a directory, and under a name, that carry a distinctive marker) and the -Exe the capture launches
+        # (the stand-in, since the staged exe in a fixture cache is not a program). Everything between -- the part check, the view, the pin,
+        # the capture command, the publish -- is the job's own code.
+        marker = "OWNERREALPATHMARKERq7z3"
+        owner_dir = self.tmp / f"{marker}-dir"
+        owner_dir.mkdir(exist_ok=True)
+        part = write_synthetic_mlv(owner_dir / (f"{marker}-part" + MLV_EXTENSION), oracle_tests.FORTY_SECONDS_AT_23976)
+        part_bytes = part.read_bytes()
+        part_sha = hashlib.sha256(part_bytes).hexdigest()
+        sha = self.stage_build()
+        gen_out = self.tmp / "success.job.ps1"
+        gen = _run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(GENERATOR),
+                    "-SourceCommit", self.head, "-BuildManifestSha256", sha, "-ClipId", CLIP_ID, "-RepoRoot", str(self.repo),
+                    "-OutFile", str(gen_out), "-AgentRoot", str(self.agent)])
+        self.assertEqual(gen.returncode, 0, gen.stdout + gen.stderr)
+        app_dir = self.tmp / "stand-in-app"
+        app_dir.mkdir(exist_ok=True)
+        log_template = app_dir / "app.log.template"
+        log_template.write_text("t0 playback_smoke.start session=1\nt1 " + oracle_tests._good_line() + "\n", encoding="utf-8")
+        grab = app_dir / "grab.template"
+        grab.write_bytes(b"\0" * 65536)
+        args_file = app_dir / "app-args.json"
+        fake = oracle_tests._make_fake_app(app_dir, exit_code=0, args_file=args_file, copies=(
+            (log_template, oracle_tests.LOG_DESTINATION), (grab, "%MLVAPP_CRASH_FORENSICS_LOG_DIR%\\reference-frame.png")))
+        encoded = base64.b64encode(str(part).replace("\\", "/").encode("utf-8")).decode("ascii")
+        parts = json.dumps([{"index": 0, "pathBase64": encoded, "length": len(part_bytes), "sha256": part_sha}], separators=(",", ":"))
+        job = gen_out.read_text(encoding="utf-8")
+        job, count = re.subn(r"(?m)^\$OwnerPartsJson = '.*'$", lambda _m: f"$OwnerPartsJson = '{parts}'", job)
+        self.assertEqual(count, 1)
+        self.assertEqual(job.count("-Exe '$exePath'"), 1, "the capture's -Exe anchor moved: this fixture is stale")
+        job = job.replace("-Exe '$exePath'", f"-Exe '{fake}'")
+        gen_out.write_text(job, encoding="utf-8")
+
+        ran = _run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(gen_out)])
+        pub = self.artifacts()
+        captured = pub / "capture-stdout.txt"
+        self.assertEqual(ran.returncode, 0, ran.stdout + ran.stderr + (captured.read_text(encoding="utf-8-sig") if captured.exists() else "<no capture-stdout.txt>"))
+        self.assertIn("RESULT=REFERENCE_FRAME_CAPTURE_OK", ran.stdout)
+        self.assertTrue((pub / "capture" / "reference-frame-candidate.json").is_file())
+
+        # 1. no published file -- the capture's stdout, result.json, the candidate manifest, the app's log, anything -- names the part
+        needles = {marker, part.name, str(part), str(part).replace("\\", "/"), str(part).replace("\\", "\\\\")}
+        leaks = []
+        for published in sorted(p for p in pub.rglob("*") if p.is_file()):
+            data = published.read_bytes()
+            for needle in needles:
+                if needle.encode("utf-8") in data or needle.encode("utf-16-le") in data:
+                    leaks.append(f"{published.relative_to(pub)} names {needle!r}")
+        self.assertEqual(leaks, [], "a published artifact names the owner's footage path (F-01)")
+        for stream in (ran.stdout, ran.stderr):
+            self.assertNotIn(marker, stream, "the job's own output names the owner's footage path")
+
+        # 2. the capture -- and so the app -- received only the neutral view under the job's work directory
+        argv = json.loads(args_file.read_text(encoding="utf-8"))
+        given = Path(argv[argv.index("--input") + 1])
+        work = next((self.agent / "work").glob("reference-frame-*"))
+        self.assertEqual(given.name.lower(), ("owner-clip" + MLV_EXTENSION).lower(), argv)
+        self.assertEqual(given.parent, work / "owner-clip", argv)
+        self.assertNotIn(marker, json.dumps(argv))
+        manifest = json.loads((pub / "capture" / "reference-frame-candidate.json").read_text(encoding="utf-8-sig"))
+        self.assertEqual(manifest["clip"]["sha256"].lower(), part_sha, "the view the capture hashed is not the verified part")
+        result = json.loads((pub / "result.json").read_text(encoding="utf-8-sig"))
+        self.assertEqual((result["status"], result["exitCode"], result["captureExitCode"]), ("candidate-unreviewed", 0, 0))
+        self.assertIn(result["footageView"]["mode"], ("symlink", "copy"))
+        self.assertIs(result["footageView"]["intactAfterCapture"], True)
+
+        # 3. the original is untouched, and the job removed its view entry when it closed the workspace
+        self.assertEqual(hashlib.sha256(part.read_bytes()).hexdigest(), part_sha)
+        self.assertEqual([p.name for p in (work / "owner-clip").iterdir()], [], "a view entry outlived the job")
 
 
 @requires_pwsh

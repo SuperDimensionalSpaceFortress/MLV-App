@@ -23,12 +23,13 @@
 #
 # THE BUNDLE IS AN EXPLICIT, PINNED MANIFEST -- the pattern of attr3-stage-smoke-runner-job.ps1. The capture script is not
 # launchable alone: it dot-sources gui-smoke-length-gate.ps1 through $PSScriptRoot. The closure (below, $CaptureClosure) is a
-# fixed list, proved complete against the committed text by Assert-AttrCudaClosureComplete (an AST census over each file's load
-# sites, the same tripwire the smoke-runner closure uses). Every file's exact COMMITTED bytes (never the working tree) travel
-# INLINE in the emitted job, base64-encoded, each with its baked sha256. On the venue the job decodes and verifies EVERY file
-# before a single byte is written, writes them into its own fresh work directory, re-verifies each on disk, and re-verifies
-# again immediately before launching the capture. The closure is proved complete by a generator-time check (every sibling the
-# capture script loads through $PSScriptRoot is a bundle member) and by test_reference_frame_runner_job.py.
+# fixed list. Every file's exact COMMITTED bytes (never the working tree) travel INLINE in the emitted job, base64-encoded, each
+# with its baked sha256. On the venue the job decodes and verifies EVERY file before a single byte is written, writes them into
+# its own fresh work directory, re-verifies each on disk, and re-verifies again immediately before launching the capture.
+# Completeness is checked at generation time by a LITERAL REGEX over the committed capture script: every
+# `Join-Path $PSScriptRoot '<name>'` it contains must name a bundle member, or the generator refuses
+# (REFERENCE_FRAME_BUNDLE_INCOMPLETE). It is not Assert-AttrCudaClosureComplete's AST census (step 4 says why that one cannot be
+# used here), so a load site spelled any other way is not seen by it; test_reference_frame_runner_job.py pins the same set.
 #
 # `<jobId>.job.ps1 -VerifyOnly` runs the read-only prefix (name safety, base64 decode, hash for every bundle file) and exits
 # without creating or publishing anything.
@@ -40,6 +41,14 @@
 # THE CLIP IS A CLIP ID. Its parts are resolved by tools/gates/resolve_consented_clip.py (the one resolver; no path is ever typed
 # or printed), carried in the job as base64, and each part's length and sha256 are re-checked on the venue before anything runs.
 #
+# NOTHING THIS JOB PUBLISHES NAMES A SOURCE PATH (F-01 footage-path-disclosure; the rule of playback-attr-3-cuda-job.ps1,
+# ATTR3-FOOTAGE-BIND-1 PR-B). The capture writes its manifest (clip.path), its stdout and the app's log into the published outbox,
+# so the capture is never handed the owner's path. The job pins each ORIGINAL part read-only (FileShare.Read, held until the
+# capture has exited), builds the neutral owner-clip view of it under its own work directory (AttrCudaOwnerFootage.psm1: a file
+# symbolic link where the venue can make one, else a verified byte copy, never a hard link), hashes each part THROUGH its view
+# while pinned, proves the views intact before and after the capture, and passes -Clip only the view. The workspace is closed
+# (handles released, view entries removed by identity) on every exit path after it was opened.
+#
 # NOT COVERED HERE (named, not hidden): no display wake and no PresentMon. If the venue's display is asleep the capture fails
 # visibly (typed, non-zero) rather than producing a frame; the live run is OUTPUT-BUDGET-KNOWN-GOOD-PROPOSAL-2.
 #
@@ -49,6 +58,11 @@
 # then submit the emitted job through um-run.ps1 like every other venue job (NA-7: um-run is the only writer to a venue share).
 #
 # Exit codes: 0 emitted; 21 refused (RESULT=REFERENCE_FRAME_JOB_REFUSED CODE=<token>, nothing written).
+# The EMITTED job: 0 a candidate; a failed capture exits the capture's own code (all below 100: 43 its receipt check, 70 no exit code;
+# one outside 1-199 is folded to 199); a failed step exits its own 2xx code, which no capture code reaches (204 bundleDecode,
+# 206 artifactNameSafety, 208 buildVerify, 209 deploy, 218 footageVerify, 219 bundleReverify, 220 bundleWrite, 222 admissionMode,
+# 223 publishResult, 224 footageView, 225 footageViewIntact). The capture's raw code is result.json captureExitCode and the RESULT
+# line's CAPTURE_EXIT (REFERENCE-FRAME-JOB-EXIT-CODE-SPACE-1).
 
 [CmdletBinding()]
 param(
@@ -120,7 +134,7 @@ $admission = Get-DvClipAdmission -ClipId $ClipId -Venue $Venue -Table $table -Co
 if (-not $admission.admitted) { Stop-Refused ([string]$admission.reason) }
 $admissionMode = if ($OfflineTestMode) { 'offline-test' } else { 'production' }
 
-# --- 2. the gate profile and the clip's start frame, from the spec COMMITTED at -SourceCommit ---------------------------------------
+# --- 2. the gate profile and the clip's start frame, from the spec COMMITTED at -ToolsCommit ----------------------------------------
 $specRelativePath = 'tools/gates/output-budget.json'
 $specText = $null
 $specSha256 = $null
@@ -186,7 +200,7 @@ function Resolve-ReferenceFrameClipParts([string]$Id) {
 $ownerParts = @(Resolve-ReferenceFrameClipParts -Id $ClipId)
 $ownerPartsJson = ConvertTo-Json -InputObject @($ownerParts) -Compress -Depth 5
 
-# --- 4. the hash-pinned bundle: the capture script's pinned closure, as COMMITTED at -SourceCommit -------------------------------------
+# --- 4. the hash-pinned bundle: the capture script's pinned closure, as COMMITTED at -ToolsCommit --------------------------------------
 $CaptureClosure = @(
     'tools/profiling/capture-reference-frame.ps1',
     'tools/profiling/gui-smoke-length-gate.ps1'
@@ -264,6 +278,19 @@ $embeddedFunctions = Get-AttrCudaEmbeddedFunctionSource -Name @(
     'Test-AttrCudaFootagePart',
     'Assert-AttrCudaBuildManifest'
 )
+# F-01: the neutral owner-clip view, the read-only pin and the identity-checked cleanup, embedded VERBATIM from
+# AttrCudaOwnerFootage.psm1 -- the same functions, extracted the same way, as playback-attr-3-cuda-job.ps1 embeds them.
+$embeddedFunctions = $embeddedFunctions + "`r`n`r`n" + (Get-AttrCudaEmbeddedFunctionSource -ModulePath (Join-Path $PSScriptRoot 'AttrCudaOwnerFootage.psm1') -Name @(
+    'Get-AttrCudaOwnerFootageNeutralName',
+    'Assert-AttrCudaOwnerPartsNaming',
+    'New-AttrCudaFileSymlink',
+    'Test-AttrCudaSymlinkCapability',
+    'Open-AttrCudaReadOnlyHandle',
+    'Assert-AttrCudaOwnerFootageCopySpace',
+    'New-AttrCudaOwnerFootageView',
+    'Assert-AttrCudaOwnerFootageViewsIntact',
+    'Close-AttrCudaOwnerFootageWorkspace'
+))
 
 # --- job body template (placeholders are substituted below, in one pass) -----------------------------------------------------------
 $template = @'
@@ -310,8 +337,19 @@ __EMBEDDED_FUNCTIONS__
 
 $StepLog = [System.Collections.Specialized.OrderedDictionary]::new()
 $PubReady = $false
+# The owner-clip workspace (F-01): the pins on the originals, the view entries and their held handles. Every failure exit closes it.
+$ownerViews = [System.Collections.Generic.List[object]]::new()
+$ownerViewHandles = [System.Collections.Generic.List[object]]::new()
+function Close-OwnerClipWorkspace {
+    if ($ownerViewHandles.Count -gt 0 -or $ownerViews.Count -gt 0) {
+        Close-AttrCudaOwnerFootageWorkspace -Handles @($ownerViewHandles) -Views @($ownerViews)
+        $ownerViewHandles.Clear()
+        $ownerViews.Clear()
+    }
+}
 
 function Complete-Failed([int]$Code, [string]$Step, [string]$Message) {
+    Close-OwnerClipWorkspace
     $StepLog[$Step] = $Code
     Say "FAIL step=$Step exit=$Code $Message"
     if ($PubReady -and (Test-Path -LiteralPath $Pub)) {
@@ -344,13 +382,13 @@ try {
     foreach ($entry in $BundleEntries) { [void](Assert-AttrCudaSafeArtifactName -Name $entry.name) }
     foreach ($n in @($ExeName, $ReconName, $PackageZipName, $PackageExeName, $BuildManifestName)) { [void](Assert-AttrCudaSafeArtifactName -Name $n) }
 } catch {
-    Complete-Failed 6 'artifactNameSafety' $_.Exception.Message
+    Complete-Failed 206 'artifactNameSafety' $_.Exception.Message
 }
 $StepLog['artifactNameSafety'] = 0
 
 # A job generated in offline-test mode is not evidence and never runs (VerifyOnly writes nothing, so it is allowed).
 if ($AdmissionMode -ne 'production' -and -not $VerifyOnly) {
-    Complete-Failed 22 'admissionMode' 'OFFLINE_TEST_JOB_REFUSED this job was generated with test seams and can never run'
+    Complete-Failed 222 'admissionMode' 'OFFLINE_TEST_JOB_REFUSED this job was generated with test seams and can never run'
 }
 
 # --- decode and verify EVERY bundle file BEFORE a single byte reaches disk --------------------------------------------------------
@@ -364,7 +402,7 @@ try {
         $decoded[$entry.name] = $payload.bytes
     }
 } catch {
-    Complete-Failed 4 'bundleDecode' $_.Exception.Message
+    Complete-Failed 204 'bundleDecode' $_.Exception.Message
 }
 $StepLog['bundleDecode'] = 0
 
@@ -396,7 +434,7 @@ try {
         if ((Get-ShaLower $entryPath) -ne $entry.sha256) { throw "sha256 did not round-trip onto disk for $($entry.name)" }
     }
 } catch {
-    Complete-Failed 20 'bundleWrite' $_.Exception.Message
+    Complete-Failed 220 'bundleWrite' $_.Exception.Message
 }
 $StepLog['bundleWrite'] = 0
 
@@ -416,26 +454,25 @@ try {
         if ($artifactHashes[$check.label] -ne $check.expectedSha.ToLowerInvariant()) { throw "hash mismatch (vs build manifest $BuildManifestName) for $($check.path)" }
     }
 } catch {
-    Complete-Failed 8 'buildVerify' $_.Exception.Message
+    Complete-Failed 208 'buildVerify' $_.Exception.Message
 }
 $StepLog['buildVerify'] = 0
 
-# --- the clip: every part's length and sha256, on THIS host, before anything runs. A failure names the part index and a token, never a path. ---
+# --- the clip: every part's existence and length, on THIS host, before anything runs (the content is hashed once, below, through its pinned
+# view). A failure names the part index and a token, never a path. ---
 $verifiedParts = @()
 try {
     foreach ($p in @($OwnerPartsJson | ConvertFrom-Json)) {
         $partPath = ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([string]$p.pathBase64))).Replace('/', '\')
         if ($partPath -notmatch '^[A-Za-z]:\\[A-Za-z0-9_.\\-]+$') { throw "part $($p.index) path is outside the allowlist" }
-        $status = Test-AttrCudaFootagePart -Path $partPath -ExpectedLength ([int64]$p.length) -ExpectedSha256 ([string]$p.sha256)
+        $status = Test-AttrCudaFootagePart -Path $partPath -ExpectedLength ([int64]$p.length) -ExpectedSha256 ([string]$p.sha256) -LengthOnly
         if ($status -ne 'PASS') { throw "FOOTAGE_PART_$status part=$($p.index)" }
         $verifiedParts += [pscustomobject]@{ index = [int]$p.index; path = $partPath; length = [int64]$p.length; sha256 = [string]$p.sha256 }
     }
     if ($verifiedParts.Count -eq 0) { throw 'no clip parts' }
 } catch {
-    Complete-Failed 18 'footageVerify' $_.Exception.Message
+    Complete-Failed 218 'footageVerify' $_.Exception.Message
 }
-$clipPath = @($verifiedParts | Sort-Object index)[0].path
-$StepLog['footageVerify'] = 0
 
 # --- deploy: the package, then the staged exe and the DLL pair over it, each verified after the copy ------------------------------------------
 try {
@@ -452,14 +489,51 @@ try {
         throw 'deployed artifact hash verification failed (copy from cache did not round-trip)'
     }
 } catch {
-    Complete-Failed 9 'deploy' $_.Exception.Message
+    Complete-Failed 209 'deploy' $_.Exception.Message
 }
 $StepLog['deploy'] = 0
+
+# --- the neutral owner-clip view (F-01), the pattern of playback-attr-3-cuda-job.ps1 ------------------------------------------------------------
+# Each ORIGINAL part is pinned read-only (FileShare.Read: no other process can write, truncate, rename or delete it) until the capture has
+# exited, a neutrally-named view of it is built under $Work\owner-clip (never under $Pub), and the part's one full content read -- the
+# sha256 against the consent record -- goes THROUGH that view while the pin is held, so the bytes the app reads are the bytes that were
+# hashed. The capture is handed only the view of part 0; the app finds the continuation parts beside it under their neutral names.
+# A failure carries only a token and the part index: an exception from opening an original can carry its path, so its text is never used.
+$clipPath = $null
+$ownerViewMode = ''
+$part = $null
+try {
+    $ownerAssertedParts = Assert-AttrCudaOwnerPartsNaming -Parts @($verifiedParts)
+    $OwnerClipDir = New-AttrCudaDirectory -Path (Join-Path $Work 'owner-clip')
+    $ownerViewCapability = Test-AttrCudaSymlinkCapability -Directory $OwnerClipDir -Journal $OwnedJournal
+    $ownerViewMode = if ($ownerViewCapability.Capable) { 'symlink' } else { 'copy' }
+    if ($ownerViewMode -eq 'copy') { Assert-AttrCudaOwnerFootageCopySpace -Directory $OwnerClipDir -Parts @($ownerAssertedParts) }
+    foreach ($part in $ownerAssertedParts) {
+        $pin = Open-AttrCudaReadOnlyHandle -Path $part.path
+        [void]$ownerViewHandles.Add($pin)
+        $view = New-AttrCudaOwnerFootageView -Directory $OwnerClipDir -Index $part.index -SourcePath $part.path -PinStream $pin -Mode $ownerViewMode -Journal $OwnedJournal
+        [void]$ownerViews.Add($view)
+        [void]$ownerViewHandles.Add($view.ViewStream)
+        $status = Test-AttrCudaFootagePart -Path $view.Path -ExpectedLength $part.length -ExpectedSha256 $part.sha256
+        if ($status -ne 'PASS') { throw "FOOTAGE_PART_$status part=$($part.index)" }
+        if ($part.index -eq 0) { $clipPath = $view.Path }
+    }
+    Assert-AttrCudaOwnerFootageViewsIntact -Views @($ownerViews)
+    if ([string]::IsNullOrEmpty($clipPath)) { throw 'OWNER_FOOTAGE_VIEW_FAILED part 0' }
+} catch {
+    $message = [string]$_.Exception.Message
+    if ($message -cmatch '^FOOTAGE_PART_[A-Z0-9_]+ part=\d+$') { Complete-Failed 218 'footageVerify' $message }
+    $token = if ($message -cmatch '^OWNER_[A-Z_]+(?: part \d+)?') { $Matches[0] } else { "OWNER_FOOTAGE_VIEW_FAILED part $(if ($null -ne $part) { $part.index } else { -1 })" }
+    Complete-Failed 224 'footageView' $token
+}
+$StepLog['footageVerify'] = 0
+$StepLog['footageView'] = 0
+Say "footage view mode=$ownerViewMode parts=$($ownerViews.Count) pinned"
 
 # --- run the capture script FROM THE VERIFIED BUNDLE, under the gate profile ------------------------------------------------------------------
 $bundleCapture = Join-Path $BundleDir 'capture-reference-frame.ps1'
 foreach ($entry in $BundleEntries) {
-    if ((Get-ShaLower (Join-Path $BundleDir $entry.name)) -ne $entry.sha256) { Complete-Failed 19 'bundleReverify' "bundle file $($entry.name) changed on disk after it was verified" }
+    if ((Get-ShaLower (Join-Path $BundleDir $entry.name)) -ne $entry.sha256) { Complete-Failed 219 'bundleReverify' "bundle file $($entry.name) changed on disk after it was verified" }
 }
 $captureOut = Join-Path $Pub 'capture'
 [void](New-AttrCudaDirectory -Path $captureOut)
@@ -472,27 +546,49 @@ if ($QualityMode -ne '') { $captureCommand += " -ExtraEnv @{ MLVAPP_PLAYBACK_QUA
 # and `exit $null` is exit 0 -- a capture that never ran must never read as one that passed. 70 = the capture command produced no exit code.
 $captureCommand += '; if ($null -eq $LASTEXITCODE) { exit 70 }; exit $LASTEXITCODE'
 Say "step capture start profile=$GateProfileId startFrame=$StartFrame lookAssistDisabled=$DisableLookAssist processing=$PlaybackProcessing quality=$QualityMode"
-$captureOutput = @(& pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $captureCommand 2>&1 | ForEach-Object { "$_" })
-$captureRc = $LASTEXITCODE
+$viewsIntactAfterCapture = $false
+try {
+    $captureOutput = @(& pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $captureCommand 2>&1 | ForEach-Object { "$_" })
+    $captureRc = $LASTEXITCODE
+    # The views must still be the ones built and hashed above: a view that changed while the app read it voids the capture.
+    try { Assert-AttrCudaOwnerFootageViewsIntact -Views @($ownerViews); $viewsIntactAfterCapture = $true } catch { $viewsIntactAfterCapture = $false }
+} finally {
+    Close-OwnerClipWorkspace
+}
 try { [void](Publish-AttrCudaText -Path (Join-Path $Pub 'capture-stdout.txt') -Value ($captureOutput -join "`n")) } catch { Say "CAPTURE_STDOUT_NOT_WRITTEN $($_.Exception.Message)" }
-# The capture script's own exit code is the verdict (0 = a valid candidate; 43 = its receipt check refused). It is never reinterpreted here.
+# The capture script's own exit code is the verdict (0 = a valid candidate; 43 = its receipt check refused). It is never reinterpreted:
+# a failed capture's code is the job's exit code, and no step code above shares it (REFERENCE-FRAME-JOB-EXIT-CODE-SPACE-1, below).
 $StepLog['capture'] = $captureRc
+# REFERENCE-FRAME-JOB-EXIT-CODE-SPACE-1: the capture's own code stays the job's exit code; the job's OWN step codes are 2xx, which no
+# capture code reaches (the capture script's codes are all below 100). A code outside 1-199 (a crashed host, say) is folded to 199 so it
+# cannot land in the step space either; the raw code is result.json captureExitCode and the RESULT line's CAPTURE_EXIT in every case.
+$captureExitCode = $captureRc
+if ($captureRc -ne 0 -and ($captureRc -lt 1 -or $captureRc -gt 199)) { $captureRc = 199 }
+$viewsChanged = ($captureRc -eq 0 -and -not $viewsIntactAfterCapture)
+if ($viewsChanged) { $StepLog['footageViewIntact'] = 225 }
+$candidateOk = ($captureRc -eq 0 -and -not $viewsChanged)
 
 $candidatePath = Join-Path $captureOut 'reference-frame-candidate.json'
-$candidateSha256 = if ($captureRc -eq 0 -and (Test-Path -LiteralPath $candidatePath)) { Get-ShaLower $candidatePath } else { $null }
+$candidateSha256 = if ($candidateOk -and (Test-Path -LiteralPath $candidatePath)) { Get-ShaLower $candidatePath } else { $null }
 try { [void](Publish-AttrCudaText -Path (Join-Path $Pub 'result.json') -Value (([ordered]@{
     schema = 'mlvapp.reference-frame-runner.v1'; jobId = $JobId
-    exitCode = $captureRc; status = $(if ($captureRc -eq 0) { 'candidate-unreviewed' } else { 'capture-failed' })
+    exitCode = $(if ($viewsChanged) { 225 } else { $captureRc }); captureExitCode = $captureExitCode
+    status = $(if ($candidateOk) { 'candidate-unreviewed' } else { 'capture-failed' })
     sourceCommit = $SourceCommit; toolsCommit = $ToolsCommit; buildManifestSha256 = $BuildManifestSha256; clipId = $ClipId; venue = $Venue
     admission = [ordered]@{ mode = $AdmissionMode; consentKind = $ConsentKind }
     gateProfile = [ordered]@{ id = $GateProfileId; specSha256 = $GateSpecSha256; startFrame = $StartFrame; disableLookAssist = $DisableLookAssist; playbackProcessing = $PlaybackProcessing; qualityMode = $QualityMode }
     bundle = @($BundleEntries | ForEach-Object { [ordered]@{ name = $_.name; sha256 = $_.sha256 } })
     exeSha256 = $artifactHashes['exe']; candidateSha256 = $candidateSha256
     clipParts = @($verifiedParts | ForEach-Object { [ordered]@{ index = $_.index; length = $_.length; sha256 = $_.sha256 } })
+    footageView = [ordered]@{ mode = $ownerViewMode; intactAfterCapture = $viewsIntactAfterCapture }
     stagedOnHost = $env:COMPUTERNAME; steps = $StepLog
-}) | ConvertTo-Json -Depth 10)) } catch { Complete-Failed 23 'publishResult' $_.Exception.Message }
+}) | ConvertTo-Json -Depth 10)) } catch { Complete-Failed 223 'publishResult' $_.Exception.Message }
+if ($viewsChanged) {
+    Write-Output "RESULT=REFERENCE_FRAME_FAILED STEP=footageViewIntact EXIT=225 ARTIFACTS=$Pub"
+    exit 225
+}
 if ($captureRc -ne 0) {
-    Write-Output "RESULT=REFERENCE_FRAME_CAPTURE_FAILED EXIT=$captureRc ARTIFACTS=$Pub"
+    Write-Output "RESULT=REFERENCE_FRAME_CAPTURE_FAILED EXIT=$captureRc CAPTURE_EXIT=$captureExitCode ARTIFACTS=$Pub"
     exit $captureRc
 }
 Write-Output "RESULT=REFERENCE_FRAME_CAPTURE_OK CLIP=$ClipId PROFILE=$GateProfileId CANDIDATE_SHA256=$candidateSha256 ARTIFACTS=$Pub"
