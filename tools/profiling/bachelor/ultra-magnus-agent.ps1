@@ -61,7 +61,11 @@ param(
     [ValidateRange(0, 3600)]
     [int]$GateIdleSampleSec = 60,
     # r1g/r1h: job ids the gate does not hold (light: ~1 s load probes, ~5 s venue health probes dve-*-health, agent maintenance). Anchored.
-    [string]$GateExemptJobPattern = '^(venue-quiet-probe|agent-swap)-|^dve-[A-Za-z0-9._-]+-health$'
+    [string]$GateExemptJobPattern = '^(venue-quiet-probe|agent-swap)-|^dve-[A-Za-z0-9._-]+-health$',
+    # AGENT-HEAVY-SLOT-2.3-ADAPT-1: a gated job whose effective timeout is over GateLongJobSec, or whose id names a stage,
+    # build or soak, is labelled "mlv-long <id>" (see Get-HeavySlotLabel). 900 s is heavy-slot.py 2.3.1's 15 min cap.
+    [int]$GateLongJobSec = 900,
+    [string]$GateLongJobPattern = '(^|[-_.])(stage|build|soak)([-_.]|$)'
 )
 
 $ErrorActionPreference = "Continue"
@@ -1319,6 +1323,7 @@ function Resolve-StartedMarkers {
 #      job needs an EMPTY machine and other runs kept refilling it between this agent's polls. So the
 #      agent no longer polls for a gap. It joins heavy-slot.py's own FIFO by running a slot HOLDER:
 #          python heavy-slot.py run --exclusive --label "mlv <jobId>" --slots N -- <psExe> -EncodedCommand <sentinel>
+#      ("mlv-long <jobId>" for a job over GateLongJobSec or named stage / build / soak: Get-HeavySlotLabel.)
 #      heavy-slot.py files the ticket (<slot dir>\queue\<ns>-<pid>.json), serves the oldest live
 #      ticket first, waits for an empty machine, acquires the slot exclusively, runs the sentinel and
 #      releases the slot when the sentinel exits. Dead waiters' tickets and dead owners' slots are
@@ -1352,7 +1357,8 @@ function Resolve-StartedMarkers {
 #
 # Every probe goes to logs\heavy-slot-gate.jsonl (also sampled every GateIdleSampleSec while idle), with an
 # hourly summary in agent.log and logs\heavy-slot-gate-hourly.jsonl. The heartbeat carries
-# "gate-wait job=<id> state=<s> waited=<n>s", which um-run.ps1 reads.
+# "gate-wait job=<id> state=<s> waited=<n>s", which um-run.ps1 reads, plus " holder=<label> held=<M>m" while another
+# run holds a slot (a trailing field: the prefix is unchanged).
 #
 # CLAIM (MLV-AGENT-HEAVY-SLOT-GATE-2 r2): a held job is CLAIMED before it waits -- running\<id>.started.json with
 # phase=admission-wait and childPid null. Without it the VM client (tools/profiling/um-run.ps1) saw no marker
@@ -1363,7 +1369,7 @@ function Resolve-StartedMarkers {
 # that finds launching adopts a live child found by command line, re-queues only on proof nothing launched (no
 # live child and no out file), and otherwise orphans (Resolve-LaunchingMarker).
 # ---------------------------------------------------------------------------
-$script:GateVersion = "heavy-slot-gate-1 r1k + heavy-slot-gate-2 r2e + wait-release r1c fifo-holder sustained-heat + r2 holder-owner-check (2026-10-12) + maint-dispatch r1 (2026-10-14)"
+$script:GateVersion = "heavy-slot-gate-1 r1k + heavy-slot-gate-2 r2e + wait-release r1c fifo-holder sustained-heat + r2 holder-owner-check (2026-10-12) + maint-dispatch r1 (2026-10-14) + long-label r1 (2026-10-20)"
 $script:HeavySlotHolder = $null
 $script:Admission = $null
 $script:ExemptDuringWaitOf = $null
@@ -1634,6 +1640,45 @@ exit 0
     return [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($text))
 }
 
+function Get-HeavySlotLabel {
+    # Pure. The label the job's exclusive heavy-slot.py ticket is filed under. heavy-slot.py 2.3.1 reads the literal
+    # prefix "mlv " (trailing space) as SHORT exclusive work: it serves it ahead of shared tickets, and a holder with that
+    # prefix that runs past 15 min writes a stop file that turns that ordering off for every tenant until the owner
+    # deletes it. A job whose effective timeout is over $GateLongJobSec, or whose id names a stage, build or soak, can
+    # legitimately run longer, so it is "mlv-long <id>", which that prefix test does not match. $TimeoutSec is the
+    # effective timeout Get-JobMetadata applies (1800 s when unset, so an unset timeout is long); 0 means none was passed.
+    param([Parameter(Mandatory = $true)][string]$JobId, [int]$TimeoutSec = 0)
+    if ($TimeoutSec -gt $GateLongJobSec -or $JobId -match $GateLongJobPattern) { return "mlv-long $JobId" }
+    return "mlv $JobId"
+}
+
+function Format-HeavySlotHolderNote {
+    # Pure. The trailing heartbeat field " holder=<label> held=<M>m" naming the longest-held holder among the other
+    # holders of a status probe ("<label> (pid P, since S, held M min) [exclusive]"), or "" when nobody holds a slot. The
+    # label is printable ASCII only, every run of control characters and whitespace collapsed to one space, capped at 64
+    # chars. held=?m when the line carries no held field (heavy-slot.py before 2.2.0).
+    param($Holders)
+    $best = $null
+    $bestMin = -1
+    foreach ($h in @($Holders)) {
+        $line = [string]$h
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        $label = $line
+        $min = -1
+        if ($line -match '(?s)^(.*?) \(pid \d+(?:, since [^,)]*)?(?:, held (\d+) min)?\)') {
+            $label = $Matches[1]
+            if ($Matches[2]) { $min = [int]$Matches[2] }
+        }
+        if ($null -eq $best -or $min -gt $bestMin) { $best = $label; $bestMin = $min }
+    }
+    if ($null -eq $best) { return "" }
+    $clean = ($best -replace '[^\x21-\x7E]+', ' ').Trim()
+    if ($clean.Length -gt 64) { $clean = $clean.Substring(0, 64).TrimEnd() }
+    if (-not $clean) { $clean = "?" }
+    $heldText = if ($bestMin -ge 0) { "${bestMin}m" } else { "?m" }
+    return " holder=$clean held=$heldText"
+}
+
 function Start-HeavySlotHolder {
     # Joins heavy-slot.py's FIFO for this job (see the gate block). Returns the holder (ok=$true), or ok=$false with
     # why when it cannot start: the job then keeps waiting -- a gated job never runs without a held slot.
@@ -1644,7 +1689,8 @@ function Start-HeavySlotHolder {
     $id = "$JobId.$([guid]::NewGuid().ToString('N').Substring(0, 12))"
     $acq = Join-Path $slotHolders "$id.acquired.json"
     $rel = Join-Path $slotHolders "$id.release"
-    $label = "mlv $JobId"
+    # The same metadata Wait-HeavySlotAdmission labels from, so the ticket and the wait's own-slot match agree.
+    $label = Get-HeavySlotLabel -JobId $JobId -TimeoutSec ([int](Get-JobMetadata -JobId $JobId).timeoutSec)
     $argv = @($HeavySlotScript, "run", "--exclusive", "--label", $label, "--slots", "$HeavySlotCount", "--",
         $psExe, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
         "-EncodedCommand", (New-HeavySlotSentinelCommand -AcquiredFile $acq -ReleaseFile $rel))
@@ -1842,7 +1888,8 @@ function Wait-HeavySlotAdmission {
     # is left behind. While waiting the job holds NO slot, only heavy-slot.py's FIFO ticket. No wait cap.
     param([Parameter(Mandatory = $true)][string]$JobId, [Parameter(Mandatory = $true)]$Job, [Parameter(Mandatory = $true)]$Metadata)
     $t0 = Get-Date
-    $label = "mlv $JobId"
+    $label = Get-HeavySlotLabel -JobId $JobId -TimeoutSec ([int]$Metadata.timeoutSec)
+    $holderNote = ""    # " holder=<label> held=<M>m" from the last probe that saw another holder; appended to the heartbeat
     $probes = 0
     $requeues = 0
     $holderStarts = 0
@@ -1882,8 +1929,9 @@ function Wait-HeavySlotAdmission {
                 # heavy-slot.py served this job's ticket and holds an EXCLUSIVE slot for it. Re-check with that slot excluded.
                 # r2 (sol r1 BLOCKER): the slot is excluded only when status shows it held by THIS holder (label and
                 # owner pid), and the holder must still hold it AFTER the probe; otherwise holder-lost, never clear.
-                $status = Invoke-HeavySlotStatus -HeartbeatActivity "gate-wait job=$JobId state=acquired waited=$([int]$waited)s"
+                $status = Invoke-HeavySlotStatus -HeartbeatActivity "gate-wait job=$JobId state=acquired waited=$([int]$waited)s$holderNote"
                 $v = Get-HeavySlotVerdict -Status $status -Feed (Read-HeavySlotFeedMetrics) -OwnSlot $hs.slot -OwnPid $hs.ownerPid -Label $label
+                $holderNote = Format-HeavySlotHolderNote -Holders $v.holders
                 $live = Test-HeavySlotHolderHeld -Holder $holder -Acquired $hs
                 if (-not $live.ok) { $v.state = "holder-lost"; $v.why = $live.why }
                 if ($v.state -eq "holder-lost") { Add-HeavySlotHolderLoss -JobId $JobId -Phase "acquired" -Why $v.why -Held $hs.held }
@@ -1916,7 +1964,8 @@ function Wait-HeavySlotAdmission {
             elseif ($now -ge $nextProbeAt) {
                 # Queued in heavy-slot.py (or between holders): a probe for the log only. The decision is heavy-slot.py's
                 # FIFO plus the re-check above.
-                $v = Get-HeavySlotVerdict -Status (Invoke-HeavySlotStatus -HeartbeatActivity "gate-wait job=$JobId state=$state waited=$([int]$waited)s") -Feed (Read-HeavySlotFeedMetrics) -Label $label
+                $v = Get-HeavySlotVerdict -Status (Invoke-HeavySlotStatus -HeartbeatActivity "gate-wait job=$JobId state=$state waited=$([int]$waited)s$holderNote") -Feed (Read-HeavySlotFeedMetrics) -Label $label
+                $holderNote = Format-HeavySlotHolderNote -Holders $v.holders
                 $probes++
                 $nextProbeAt = $now.AddSeconds($GateProbeSec)
                 if ($null -ne $holder) { $state = "queued"; $why = "heavy-slot.py FIFO position $($v.queuePos) of $($v.queueLen); $($v.why)" }
@@ -1931,7 +1980,7 @@ function Wait-HeavySlotAdmission {
                 Add-AgentLogLine "heavy-slot-gate: waiting job=$JobId state=$state why=[$why] waited=$([int]$waited)s requeues=$requeues holderPid=$(if ($null -ne $holder) { $holder.pid } else { 'none' })"
                 $lastLog = Get-Date
             }
-            Write-AgentHeartbeat -Activity "gate-wait job=$JobId state=$state waited=$([int]((Get-Date) - $t0).TotalSeconds)s"
+            Write-AgentHeartbeat -Activity "gate-wait job=$JobId state=$state waited=$([int]((Get-Date) - $t0).TotalSeconds)s$holderNote"
             Start-Sleep -Milliseconds 1000
         }
     }
