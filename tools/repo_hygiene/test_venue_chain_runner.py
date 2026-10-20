@@ -844,6 +844,7 @@ else {
     if ($modes.Count -eq 0) { $modes = @('QUIET') }
     $mode = $modes[[Math]::Min($n, $modes.Count - 1)]
     if ($MaxWaitSec -gt 0 -and $env:FAKE_QUIET_SLEEP_PRE) { Start-Sleep -Milliseconds ([int]([double]$env:FAKE_QUIET_SLEEP_PRE * 1000)) }
+    if ($MaxWaitSec -eq 0 -and $env:FAKE_QUIET_SLEEP_UNDER) { Start-Sleep -Milliseconds ([int]([double]$env:FAKE_QUIET_SLEEP_UNDER * 1000)) }   # the under-claim probe's own admission hold
 }
 switch ($mode) {
     'QUIET' { "QUIET mean=5.0% threshold=$ThresholdPercent% waitedSec=1"; exit 0 }
@@ -1101,6 +1102,51 @@ class VenueChainSupplementaryTests(unittest.TestCase):
         self.assertEqual([(l, v) for l, v, _ in self.starts()], [("sp-a.json", "ultra-magnus"), ("sp-b.json", "bachelor"), ("sp-b.json", "ultra-magnus")])
         self.assertEqual([(s["name"], s["trigger"], s["status"]) for s in res["supplementary"]], [("01-sp-a-spec", "held", "RAN"), ("02-sp-b-spec", "after-leg", "RAN")])
 
+    # ---------------------------------------------------------------- (b) held inside the UNDER-CLAIM probe (heavy-slot admission after the claim), r4 / sol r3 BLOCKER
+    def test_an_under_claim_probe_that_ends_not_measured_after_a_long_hold_still_gets_the_held_offer(self) -> None:
+        # Pre-claim probe QUIET (no hold), the Bachelor claim is granted, then the under-claim probe blocks past the 2 s threshold and returns VENUE_QUIET_UNKNOWN (admission
+        # exhausted). The leg never ran, so the after-leg offer cannot happen: the held offer must be made here, after the Bachelor claim is released and before OnUnknown
+        # Stop sets stopReason. Both OnUnknown modes. The Bachelor verdict stays fail-closed: NOT_RUN phase=under-claim, exit 6.
+        for mode in ("Stop", "Continue"):
+            with self.subTest(onUnknown=mode):
+                self.leg_log.unlink(missing_ok=True)
+                self.quiet_log.unlink(missing_ok=True)
+                rd = self.case / f"lane-UNDERCLAIM-{mode}"
+                r = self.run_chain(rd, self.specs[:1], "-SupplementaryHeldSec", "2", "-OnUnknown", mode, env=self.env(FAKE_QUIET_MODES="QUIET,UNKNOWN", FAKE_QUIET_SLEEP_UNDER="3"))
+                self.assertEqual(r.returncode, 6, r.stdout + r.stderr)
+                res = chain_result(r.stdout)
+                self.assertEqual([(l["status"], l["verdict"], l["phase"]) for l in res["legs"]], [("NOT_RUN", "VENUE_QUIET_UNKNOWN", "under-claim")])
+                self.assertEqual((res["ran"], res["failed"], res["notRun"], res["exitCode"], res["stopReason"]), (0, 0, 1, 6, "VENUE_QUIET_UNKNOWN" if mode == "Stop" else None))
+                # one offer, the held one, and only on ultra-magnus: Bachelor never ran the leg
+                self.assertEqual([(l, v) for l, v, _ in self.starts()], [("sp-a.json", "ultra-magnus")])
+                self.assertEqual([(s["status"], s["trigger"], s["venue"], s["role"]) for s in res["supplementary"]], [("RAN", "held", "ultra-magnus", "supplementary")])
+                log = self.chain_log(rd)
+                tokens = [l.split(" ", 2)[1] for l in log if not l.startswith("CHAIN_RESULT=")]
+                self.assertEqual(tokens.count("CLAIM_TAKEN"), 1, log)
+                self.assertEqual(tokens.count("CLAIM_RELEASED"), 1, "the Bachelor claim is released exactly once")
+                self.assertLess(tokens.index("CLAIM_RELEASED"), tokens.index("SUPPLEMENTARY_CLAIM_TAKEN"), "the Bachelor claim was released before the offer")
+                stopped = [i for i, l in enumerate(log) if " NOT_RUN VENUE_QUIET_UNKNOWN " in l and "phase=under-claim" in l]
+                offered = [i for i, l in enumerate(log) if " SUPPLEMENTARY_CLAIM_TAKEN " in l]
+                self.assertLess(offered[0], stopped[0], "the offer came before the Bachelor leg line")
+                self.assertFalse((self.claims / "bachelor.claim.json").exists())
+                self.assertFalse((self.claims / "ultra-magnus.claim.json").exists())
+
+    def test_an_under_claim_probe_that_ends_not_measured_after_a_short_hold_gets_no_offer(self) -> None:
+        # control: the same shape with the default 1800 s threshold, which a 3 s hold does not reach: NOT_RUN exactly as before, ultra-magnus never touched
+        for mode in ("Stop", "Continue"):
+            with self.subTest(onUnknown=mode):
+                self.leg_log.unlink(missing_ok=True)
+                self.quiet_log.unlink(missing_ok=True)
+                rd = self.case / f"lane-UNDERCLAIM-SHORT-{mode}"
+                r = self.run_chain(rd, self.specs[:1], "-OnUnknown", mode, env=self.env(FAKE_QUIET_MODES="QUIET,UNKNOWN", FAKE_QUIET_SLEEP_UNDER="3"))
+                self.assertEqual(r.returncode, 6, r.stdout + r.stderr)
+                res = chain_result(r.stdout)
+                self.assertEqual([(l["status"], l["phase"]) for l in res["legs"]], [("NOT_RUN", "under-claim")])
+                self.assertEqual((res["exitCode"], res["supplementary"]), (6, []))
+                self.assertEqual(self.starts(), [])
+                self.assertEqual([c for c in self.quiet_calls() if "venue=ultra-magnus" in c], [])
+                self.assertFalse((self.claims / "bachelor.claim.json").exists())
+
     # ---------------------------------------------------------------- (e) the opt-out
     def test_no_supplementary_switch_runs_nothing_on_ultra_magnus(self) -> None:
         rd = self.case / "lane-OPTOUT"
@@ -1235,10 +1281,16 @@ class VenueChainSupplementaryTests(unittest.TestCase):
         self.assertEqual([(l, v) for l, v, _ in self.starts()], [("sp-a.json", "bachelor"), ("sp-a.json", "ultra-magnus")], "without the held check the offer can only come after the leg")
 
     def test_mutation_offer_after_a_not_measured_probe_removed_reproduces_sol_r2(self) -> None:
-        mut = self.mutated_runner("            if ($suppEnabled -and ([DateTime]::UtcNow - $legWaitStart).TotalSeconds -ge $SupplementaryHeldSec) {\n", "            if ($false) {\n", 1)
+        mut = self.mutated_runner("\n            if ($suppEnabled -and ([DateTime]::UtcNow - $legWaitStart).TotalSeconds -ge $SupplementaryHeldSec) {\n", "\n            if ($false) {\n", 1)   # the 12-space pre-claim block only (r4 added a 16-space twin under the claim)
         r = self.run_chain(self.case / "lane-MADM", self.specs[:1], "-SupplementaryHeldSec", "2", runner=mut, env=self.env(FAKE_QUIET_MODES="UNKNOWN", FAKE_QUIET_SLEEP_PRE="3"))
         self.assertEqual(r.returncode, 6)
         self.assertEqual(self.starts(), [], "without the offer on a not-measured probe the admission-exhaustion path makes no offer at all (the defect)")
+
+    def test_mutation_offer_after_an_under_claim_not_measured_probe_removed_reproduces_sol_r3(self) -> None:
+        mut = self.mutated_runner("\n                if ($suppEnabled -and ([DateTime]::UtcNow - $legWaitStart).TotalSeconds -ge $SupplementaryHeldSec) {\n", "\n                if ($false) {\n", 1)
+        r = self.run_chain(self.case / "lane-MUNDER", self.specs[:1], "-SupplementaryHeldSec", "2", runner=mut, env=self.env(FAKE_QUIET_MODES="QUIET,UNKNOWN", FAKE_QUIET_SLEEP_UNDER="3"))
+        self.assertEqual(r.returncode, 6)
+        self.assertEqual(self.starts(), [], "without the offer on an under-claim not-measured probe the leg gets no offer at all (the defect)")
 
     def test_mutation_supplementary_failure_leaking_into_the_chain_exit_is_caught(self) -> None:
         # a mutant that lets a supplementary crash set the chain exit code to 7 reproduces the defect test_a_crashing_supplementary_leg_... guards against

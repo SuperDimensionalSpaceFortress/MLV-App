@@ -31,7 +31,7 @@
 #   6. SUPPLEMENTARY LEGS (VENUE-UM-SUPPLEMENTARY-WHEN-BACHELOR-HELD-1; owner directive 2026-10-18: every playback chain ALSO runs its legs on ultra-magnus when that agent is idle).
 #      Only a -Venue bachelor chain, ON by default, off with -NoSupplementary. The same leg is offered on ultra-magnus (role supplementary) (a) after each Bachelor leg ran, and (b) once a leg
 #      has waited more than -SupplementaryHeldSec (1800), checked each time the wait loop comes round (queue/heat gate that returns GATE_BUSY, claim line) AND once more when a Bachelor pre-claim
-#      quiet probe ends VENUE_QUIET_UNKNOWN, before the leg is stopped. COVERAGE LIMIT: one probe BLOCKS the loop, and a heavy-slot admission hold inside it can last up to -ProbeAdmissionWaitSec
+#      or under-claim quiet probe ends VENUE_QUIET_UNKNOWN (under the claim: Bachelor's claim is released first), before the leg is stopped. COVERAGE LIMIT: one probe BLOCKS the loop, and a heavy-slot admission hold inside it can last up to -ProbeAdmissionWaitSec
 #      (7200), so the held offer for an admission hold is made when that probe returns (at the latest at the admission ceiling), NOT at 30 minutes; a hold inside the leg child is offered after the leg. An offer needs: the spec's
 #      criteria.supplementary block for the backend; ultra-magnus's own claim FREE and no live ticket (Get-VenueSupplementaryIdle, never a process scan); the build ALREADY staged in its
 #      cache (the chain stages and builds nothing); the venue's claim taken (one shot, never waited on); one quiet probe (-MaxWaitSec 0) QUIET or COOLDOWN_UNMET. Anything else is one typed
@@ -453,6 +453,12 @@ foreach ($leg in $plan) {
             if ($re.verdict -ceq 'USAGE') { $stopReason = 'USAGE'; $exitCode = 2; Add-Result $leg 'NOT_RUN' @{ verdict = 'USAGE'; reason = 'phase=under-claim' }; L "LEG $($leg.name) NOT_RUN USAGE phase=under-claim"; break }
             if ($re.verdict -in @('GATE_UNREADABLE', 'HOST_MISMATCH')) { $stopReason = $re.verdict; $exitCode = $(if ($re.verdict -ceq 'GATE_UNREADABLE') { 4 } else { 5 }); Add-Result $leg 'NOT_RUN' @{ verdict = $re.verdict; reason = 'phase=under-claim' }; L "LEG $($leg.name) NOT_RUN $($re.verdict) phase=under-claim"; break }
             if ($re.verdict -ceq 'VENUE_QUIET_UNKNOWN') {
+                # (d1) the under-claim probe blocked in heavy-slot admission and ended not measured: same held offer as (a1), made AFTER Bachelor's claim is released (ultra-magnus is
+                # offered while Bachelor is free, never while this chain holds it) and BEFORE -OnUnknown Stop sets stopReason. The leg never ran, so no after-leg offer follows.
+                if ($suppEnabled -and ([DateTime]::UtcNow - $legWaitStart).TotalSeconds -ge $SupplementaryHeldSec) {
+                    L "CLAIM_RELEASED leg=$($leg.name) result=$(Release-VenueClaim -Venue $Venue -Nonce $claim.nonce -ClaimDir $ClaimDir) reason=not-measured-under-claim (the held offer follows)"; $released = $true
+                    Invoke-Supplementary $leg 'held'
+                }
                 Add-Result $leg 'NOT_RUN' @{ verdict = 'VENUE_QUIET_UNKNOWN'; reason = $re.reason; phase = 'under-claim' }
                 L "LEG $($leg.name) NOT_RUN VENUE_QUIET_UNKNOWN reason=$($re.reason) phase=under-claim (the venue was not measured; onUnknown=$OnUnknown)"
                 $exitCode = 6; if ($OnUnknown -ceq 'Stop') { $stopReason = 'VENUE_QUIET_UNKNOWN' }
