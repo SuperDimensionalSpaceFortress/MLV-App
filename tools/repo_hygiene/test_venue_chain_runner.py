@@ -858,6 +858,18 @@ param([string]$Venue, [string]$LegSpec, [string]$SourceCommit, [string]$BuildMan
 $leaf = Split-Path -Leaf $LegSpec
 Add-Content -LiteralPath $env:FAKE_LEG_LOG -Value ("START {0} {1} {2} {3}" -f [DateTime]::UtcNow.Ticks, $leaf, $Venue, $BuildManifestSha256.Substring(0, 8))
 if ($Venue -eq 'ultra-magnus' -and $env:FAKE_UM_LEG_SLEEP) { Start-Sleep -Milliseconds ([int]([double]$env:FAKE_UM_LEG_SLEEP * 1000)) }
+# VENUE-UM-SUPP-REMOTE-IDENTITY-AND-CACHE-BOUND-1: a client that SUBMITTED a remote job (prints its id when FAKE_UM_JOB_ID is set) and then never returns: the chain's bounded
+# child kills it, and the remote job it submitted is still out there. FAKE_JOB_DONE_ON_LEG: the leg of that name finishing is what lands the remote job's result in the share.
+if ($Venue -eq 'ultra-magnus' -and $env:FAKE_UM_HANG_LEAF -and $leaf -eq $env:FAKE_UM_HANG_LEAF) {
+    if ($env:FAKE_UM_JOB_ID) { "DVE_JOB_ID=$($env:FAKE_UM_JOB_ID)" }
+    Start-Sleep -Seconds 300
+    exit 0
+}
+if ($Venue -eq 'bachelor' -and $env:FAKE_JOB_DONE_ON_LEG -and $leaf -eq $env:FAKE_JOB_DONE_ON_LEG) {
+    $ob = Join-Path $env:FAKE_UM_SHARE 'outbox'
+    New-Item -ItemType Directory -Force -Path $ob | Out-Null
+    Set-Content -LiteralPath (Join-Path $ob ($env:FAKE_UM_JOB_ID + '.result.json')) -Value '{}'
+}
 $rdir = Join-Path $env:FAKE_LEG_ROOT ('receipts\CARD-1\' + [IO.Path]::GetFileNameWithoutExtension($leaf) + '\' + $Venue)
 New-Item -ItemType Directory -Force -Path $rdir | Out-Null
 $rp = Join-Path $rdir ([guid]::NewGuid().ToString() + '.json')
@@ -1310,6 +1322,102 @@ class VenueChainSupplementaryTests(unittest.TestCase):
         self.assertEqual(pwsh_text(own), "True LIVE 0")
         self.assertEqual(pwsh_text(q.replace("-ClaimDir", "-OwnNonce someone-else -ClaimDir")), "False LIVE 0")
 
+    # ---------------------------------------------------------------- VENUE-UM-SUPP-REMOTE-IDENTITY-AND-CACHE-BOUND-1 (a): a killed client's remote job outlives it
+    JOB_ID = "dve-sp-a-ultra-magnus-cpu-20261021000000"
+
+    def hang_env(self, **extra: str) -> dict:
+        return self.env(FAKE_UM_HANG_LEAF="sp-a.json", FAKE_UM_SHARE=str(self.um_share), **extra)
+
+    def test_a_timed_out_client_leaves_the_venue_busy_with_its_job_id_until_the_result_lands(self) -> None:
+        rd = self.case / "lane-RJBUSY"
+        # -SupplementaryHeldSec 0: each leg is offered on ultra-magnus BEFORE Bachelor runs it too, so two legs give three offers: sp-a (held: its client hangs and is killed),
+        # sp-b (held: its remote job unproven -> busy), sp-b again after its Bachelor leg, which is what lands sp-a's remote job result in the share (-> reconciled, runs).
+        r = self.run_chain(rd, self.specs, "-SupplementaryHeldSec", "0", "-TestSupplementaryCapSec", "3", env=self.hang_env(FAKE_UM_JOB_ID=self.JOB_ID, FAKE_JOB_DONE_ON_LEG="sp-b.json"))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)   # a supplementary never moves the chain exit code
+        self.assertEqual([(l, v) for l, v, _ in self.starts()], [("sp-a.json", "ultra-magnus"), ("sp-a.json", "bachelor"), ("sp-b.json", "bachelor"), ("sp-b.json", "ultra-magnus")])
+        res = chain_result(r.stdout)
+        self.assertEqual((res["ran"], res["exitCode"]), (2, 0))
+        sup = res["supplementary"]
+        self.assertEqual([s["status"] for s in sup], ["TIMEOUT", "SKIPPED", "RAN"])
+        # the killed client's remote job: identity kept, venue not idle -- the released claim proved nothing
+        self.assertEqual((sup[0]["trigger"], sup[0]["remoteJobIds"], sup[0]["remoteJobState"], sup[0]["venueIdle"]), ("held", [self.JOB_ID], "NOT_FINISHED", False))
+        self.assertEqual((sup[1]["trigger"], sup[1]["reason"]), ("held", "UM_REMOTE_JOB_UNRESOLVED"))
+        self.assertIn(f"jobId={self.JOB_ID} state=NOT_FINISHED", sup[1]["detail"])
+        self.assertEqual((sup[2]["trigger"], sup[2]["name"]), ("after-leg", "02-sp-b-spec"))
+        log = "\n".join(self.chain_log(rd))
+        self.assertRegex(log, r"SUPPLEMENTARY_REMOTE_JOB leg=01-sp-a-spec jobId=" + self.JOB_ID + r" state=NOT_FINISHED venueIdle=False")
+        self.assertIn(f"SUPPLEMENTARY_REMOTE_JOB_RECONCILED leg=02-sp-b-spec jobId={self.JOB_ID} state=FINISHED", log)
+        self.assertFalse((self.claims / "ultra-magnus.claim.json").exists(), "the claim itself is still released")
+
+    # V-01 (sol r1): the guard is armed at the timeout, before any fallible step. Writing the client's output file is one: a directory squatting on its path makes WriteAllText throw
+    # AFTER the client timed out and BEFORE the identity was kept.
+    def run_timeout_with_unwritable_output(self, name: str, **env_extra: str) -> tuple:
+        rd = self.case / name
+        (rd / "leg-01-sp-a-spec-ultra-magnus-supplementary.out.txt").mkdir(parents=True)
+        r = self.run_chain(rd, self.specs, "-SupplementaryHeldSec", "0", "-TestSupplementaryCapSec", "3", env=self.hang_env(**env_extra))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        return rd, chain_result(r.stdout)["supplementary"], "\n".join(self.chain_log(rd))
+
+    def test_v01_timeout_then_unwritable_output_keeps_the_job_identity_and_refuses_the_next_leg_until_finished(self) -> None:
+        rd, sup, log = self.run_timeout_with_unwritable_output("lane-V01", FAKE_UM_JOB_ID=self.JOB_ID, FAKE_JOB_DONE_ON_LEG="sp-b.json")
+        self.assertEqual((sup[0]["status"], sup[0]["reason"]), ("SKIPPED", "SUPPLEMENTARY_ERROR"), "the output write failed after the timeout")
+        # the unresolved identity is retained: the next leg is refused (not run) and names the killed client's job
+        self.assertEqual((sup[1]["status"], sup[1]["reason"]), ("SKIPPED", "UM_REMOTE_JOB_UNRESOLVED"))
+        self.assertIn(f"jobId={self.JOB_ID} state=NOT_FINISHED", sup[1]["detail"])
+        # ... and it runs only once the result has landed
+        self.assertEqual([(l, v) for l, v, _ in self.starts()], [("sp-a.json", "ultra-magnus"), ("sp-a.json", "bachelor"), ("sp-b.json", "bachelor"), ("sp-b.json", "ultra-magnus")])
+        self.assertEqual((sup[2]["status"], sup[2]["name"]), ("RAN", "02-sp-b-spec"))
+        self.assertIn(f"SUPPLEMENTARY_REMOTE_JOB_RECONCILED leg=02-sp-b-spec jobId={self.JOB_ID} state=FINISHED", log)
+        self.assertFalse((self.claims / "ultra-magnus.claim.json").exists(), "the claim itself is still released")
+
+    def test_v01_timeout_then_unwritable_output_with_no_identity_stays_busy(self) -> None:
+        rd, sup, log = self.run_timeout_with_unwritable_output("lane-V01NOID")   # the client printed no DVE_JOB_ID before it hung: nothing to look up
+        self.assertEqual((sup[0]["status"], sup[0]["reason"]), ("SKIPPED", "SUPPLEMENTARY_ERROR"))
+        self.assertTrue(all(s["status"] == "SKIPPED" for s in sup), [s["status"] for s in sup])
+        self.assertTrue(all(s["reason"] == "UM_REMOTE_JOB_UNRESOLVED" for s in sup[1:]) and len(sup) >= 2, [s.get("reason") for s in sup])
+        self.assertNotIn("ultra-magnus", [v for l, v, _ in self.starts() if l == "sp-b.json"], "a missing identity must remain busy: no later leg runs on ultra-magnus")
+        self.assertNotIn("SUPPLEMENTARY_REMOTE_JOB_RECONCILED", log)
+
+    # ---------------------------------------------------------------- the pieces, and (b): the cache read keeps its -TimeoutSec bound
+    def test_remote_job_ids_and_states_are_read_by_name_and_a_stalled_cache_read_keeps_its_bound(self) -> None:
+        # One process (the wall-time budget). Part 1: ids come only from printed well-formed lines; a state is FINISHED only when every named result landed. Part 2: a read
+        # that never answers ([Threading.Thread]::Sleep cannot be interrupted by a pipeline stop, like a UNC read blocked in the kernel) returns UNREACHABLE at TimeoutSec: an
+        # asynchronous stop followed by a synchronous Dispose() would wait the whole 20 s, and the host would wait for the abandoned thread at exit unless
+        # Complete-VenueProcess leaves first. The bound is TimeoutSec (2) plus a small fixed margin.
+        share = self.um_share
+        script = self.case / "pieces.ps1"
+        script.write_text(
+            f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
+            "function ids([string]$t) { $v = @(Get-VenueRemoteJobIds -Text $t); \"n=$($v.Count)[$($v -join '|')]\" }\n"
+            "ids \"DVE_LEGSET=x`nDVE_JOB_ID=dve-1`nDVE_JOB_ID=dve-2`r`nDVE_JOB_ID=dve-1`n\"; ids ''; ids \"DVE_OUTCOME=PASS`n\"\n"
+            "ids \"DVE_JOB_ID=..\\..\\x`n\"; ids \"DVE_JOB_ID=a b`n\"; ids \"DVE_JOB_ID=a/b`n\"; ids \"DVE_JOB_ID=-rf`nDVE_JOB_ID=`n\"\n"
+            f"function st($j) {{ (Get-VenueRemoteJobState -AgentShare '{share}' -JobId $j -TimeoutSec 20).state }}\n"
+            "st @(); st @('dve-1'); st @('dve-1', '')\n"
+            f"New-Item -ItemType Directory -Force -Path '{share}\\inbox','{share}\\outbox' | Out-Null; Set-Content -LiteralPath '{share}\\inbox\\dve-1.job.ps1' -Value x; st @('dve-1')\n"
+            f"Set-Content -LiteralPath '{share}\\outbox\\dve-1.result.json' -Value '{{}}'; st @('dve-1'); st @('dve-1', 'dve-2')\n"
+            f"Set-Content -LiteralPath '{share}\\outbox\\dve-2.result.json' -Value '{{}}'; st @('dve-1', 'dve-2')\n"
+            "$t0 = [DateTime]::UtcNow\n"
+            f"$r = Get-VenueStagedBuildManifest -AgentShare '{share}' -SourceCommit '{SHA}' -TimeoutSec 2 -ProbeScript {{ param($p) [Threading.Thread]::Sleep(20000); 'late' }}\n"
+            "\"$($r.state) [$($r.sha256)] $($r.error) inside=$([int][Math]::Floor(([DateTime]::UtcNow - $t0).TotalSeconds))\"\n"
+            "Complete-VenueProcess -ExitCode 7\nexit 7\n", encoding="utf-8")
+        t0 = time.time()
+        r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(script)], capture_output=True, text=True, timeout=90)
+        elapsed = time.time() - t0
+        lines = r.stdout.splitlines()
+        self.assertRegex(lines[-1], r"^UNREACHABLE \[\] no answer in 2 s inside=[23]$", r.stdout + r.stderr)
+        self.assertLess(elapsed, 14, f"the stalled read broke the bound: the whole process took {elapsed:.1f}s with a 20 s stuck read and -TimeoutSec 2")
+        self.assertEqual(r.returncode, 7)
+        self.assertEqual(lines[:-1], [
+            "n=2[dve-1|dve-2]",  # every printed id, in order, distinct (the client may have submitted a health probe job before the leg job)
+            "n=0[]", "n=0[]",    # nothing printed = no id
+            "n=1[]", "n=1[]", "n=1[]", "n=1[]",   # an id that is not a plain file name (it becomes a file name on the venue share) stays as ONE empty entry: named, never looked up
+            "UNKNOWN", "NOT_FINISHED", "UNKNOWN",   # no id; an id whose result is absent; an unusable id
+            "NOT_FINISHED",                          # the job file is still in the inbox: queued or running
+            "FINISHED",                              # its result landed
+            "NOT_FINISHED",                          # one of two results landed
+            "FINISHED",                              # both
+        ], r.stdout + r.stderr)
+
     # ---------------------------------------------------------------- mutations: the guards are what the scenarios rely on
     def test_mutation_opt_out_ignored_runs_ultra_magnus_anyway(self) -> None:
         mut = self.mutated_runner("-not $NoSupplementary", "$true", 1)
@@ -1351,8 +1459,10 @@ class VenueChainSupplementaryTests(unittest.TestCase):
     def test_runner_documents_the_supplementary_contract_and_stays_ascii(self) -> None:
         text = RUNNER.read_text(encoding="utf-8")
         header = "\n".join(l for l in text.splitlines() if l.startswith("#"))
-        for token in ("SUPPLEMENTARY LEGS (VENUE-UM-SUPPLEMENTARY-WHEN-BACHELOR-HELD-1", "-NoSupplementary", "SUPPLEMENTARY_SKIPPED leg=<n> trigger=<t> reason=<R>", "BUILD_NOT_STAGED", "never in `legs`"):
+        for token in ("SUPPLEMENTARY LEGS (VENUE-UM-SUPPLEMENTARY-WHEN-BACHELOR-HELD-1", "-NoSupplementary", "SUPPLEMENTARY_SKIPPED leg=<n> trigger=<t> reason=<R>", "BUILD_NOT_STAGED", "never in `legs`",
+                      "REMOTE JOB IDENTITY (VENUE-UM-SUPP-REMOTE-IDENTITY-AND-CACHE-BOUND-1)", "UM_REMOTE_JOB_UNRESOLVED", "SUPPLEMENTARY_REMOTE_JOB_RECONCILED", "DVE_JOB_ID=<id>"):
             self.assertIn(token, header)
+        self.assertIn("Complete-VenueProcess -ExitCode $exitCode", text)
         self.assertIn("[switch]$NoSupplementary", text)
         self.assertIn("[ValidateRange(0, 86400)][int]$SupplementaryHeldSec = 1800", text)
         self.assertTrue(all(b < 128 for b in MODULE.read_bytes()) and all(b < 128 for b in RUNNER.read_bytes()))
