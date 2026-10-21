@@ -148,7 +148,7 @@
       "bullet": "agents/doctrine-consumer.md:20 Brief includes: short `RULINGS.md` digest, MLV-relevant `ruling-candid",
       "basis": "covers the MUST clause (surface the SoT-suspend candidate labeled CANDIDATE_ZERO_AUTHORITY); the RULINGS digest and specs-hash clauses are not asserted"
     },
-    "48f18ea7da37ed81ce582181b667ae5aec641c702a27abcfc55a42dfc9a8be65": {
+    "6c95ba4c2ef1401b9fdaf1d98444903c2ffb405bdea203dc79cbd8fff33f36d4": {
       "check": "test:tools/coordination/test_get_doctrine_brief.py::GetDoctrineBriefTests::test_fixture_cos_feedback_included_when_present",
       "bullet": "agents/doctrine-consumer.md:21 Brief includes `cos-feedback/mlv-app/pr-*.md` when present (Contents A",
       "basis": "asserts the pr-*.md is included when present; omit-when-missing half is test_fixture_missing_cos_feedback_omits_section_does_not_refuse"
@@ -547,6 +547,21 @@
       "check": "prose-only: dormant (brokered auto-closeout is not live; HUB RULING 2026-10-16T16:44:15Z item 5)",
       "bullet": "agents/brokered-auto-closeout.md:71 Evidence-preserving transaction prune: Branches are transactions, not archives. ",
       "basis": "dormant: the brokered auto-closeout workflow is not live, so no check is expected; relabelled prose-only, never counted as coverage"
+    },
+    "ab892da6b791bb16bf9f230293a116c330c79c209173913ac1cbdc639196f12a": {
+      "check": "prose-only: enforced by the merge-enqueue.ps1 status gate (rule TIP_LEGS) in the board-local, untracked .claude-state/fleet-runs/hub-tools, not by a tracked check",
+      "bullet": "agents/orchestration-tiering.md:93 a `review/<seat>` commit status on the head SHA (success = APPROVE, failure or error = CHANGES_REQUESTED);",
+      "basis": "the only enforcement is the board-local merge-enqueue.ps1 TIP_LEGS gate, which is untracked and so cannot be cited as a tracked check; never counted as coverage"
+    },
+    "0f66d141966a73babb603f73a5fbf1e757c93d4ccac6a20aa08303ff18cf46b7": {
+      "check": "prose-only: enforced by the merge-enqueue.ps1 status gate (rule TIP_LEGS) in the board-local, untracked .claude-state/fleet-runs/hub-tools, not by a tracked check",
+      "bullet": "agents/orchestration-tiering.md:94 a `[[pub:<id>]]` JSON comment whose `head_sha` equals the head;",
+      "basis": "the only enforcement is the board-local merge-enqueue.ps1 TIP_LEGS gate, which is untracked and so cannot be cited as a tracked check; never counted as coverage"
+    },
+    "8e099f453a84d655854c3a738cdfebfbf9704bb18ba95c321fd18df7f4a338b9": {
+      "check": "prose-only: enforced by the merge-enqueue.ps1 status gate (rule TIP_LEGS) in the board-local, untracked .claude-state/fleet-runs/hub-tools, not by a tracked check",
+      "bullet": "agents/orchestration-tiering.md:95 a GitHub review whose `commit_id` equals the head.",
+      "basis": "the only enforcement is the board-local merge-enqueue.ps1 TIP_LEGS gate, which is untracked and so cannot be cited as a tracked check; never counted as coverage"
     }
   }
 }

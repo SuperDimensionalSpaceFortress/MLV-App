@@ -152,6 +152,18 @@ extern "C" int llrpGpuCudaSuppressed(void)
     return 0;
 }
 
+/* PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1: GpuDisplayWindow.cpp's warm-output reuse gate reads the GPU
+ * recon set_clip / set_luts counters (llrawproc.c); the GUI harness links no engine, so no recon was ever configured. */
+extern "C" uint64_t llrpGpuPlaybackReconSetClipCount(void)
+{
+    return 0;
+}
+
+extern "C" uint64_t llrpGpuPlaybackReconSetLutsCount(void)
+{
+    return 0;
+}
+
 /* PLAYBACK-CUDA-HONOUR-SCALE-1 r4: GpuDisplayWindow.cpp's play-stop summary reads the phase-tent
  * shrink counters (video_mlv.c); the GUI harness links no engine, so no shrink ever ran. */
 extern "C" uint64_t mlvDualIsoPhaseTentShrinkFrames(void)
