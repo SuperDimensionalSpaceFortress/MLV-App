@@ -9474,18 +9474,35 @@ int getMlvLastProcessed8PrefetchHit(void)
 }
 
 /* winpthreads and Apple wait processed8 slices relative to now, so their cond
- * keeps the default clock; elsewhere the slice abstime is CLOCK_MONOTONIC and
- * the cond must measure the same clock. Untimed waits are unaffected. */
-static void mlv_processed8_prefetch_cond_init(pthread_cond_t * cond)
+ * keeps the default clock and this returns 0. Elsewhere it returns 1 when the
+ * cond measures CLOCK_MONOTONIC, or 0 when the libc refused that clock and the
+ * cond fell back to the default CLOCK_REALTIME. The slice abstime must name
+ * the clock returned here (PROCESSED8-COND-CLOCK-INIT-RC-1): a MONOTONIC
+ * abstime on a REALTIME cond lies far in the past, so every slice would expire
+ * at once and the waiter would spin until its budget ends. Untimed waits are
+ * unaffected. */
+static int mlv_processed8_prefetch_cond_init(pthread_cond_t * cond)
 {
 #if defined(_WIN32) || defined(__APPLE__)
     pthread_cond_init(cond, NULL);
+    return 0;
 #else
+    int monotonic = 0;
     pthread_condattr_t attr;
-    pthread_condattr_init(&attr);
-    pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
-    pthread_cond_init(cond, &attr);
-    pthread_condattr_destroy(&attr);
+    if (pthread_condattr_init(&attr) == 0)
+    {
+        if (pthread_condattr_setclock(&attr, CLOCK_MONOTONIC) == 0
+            && pthread_cond_init(cond, &attr) == 0)
+        {
+            monotonic = 1;
+        }
+        pthread_condattr_destroy(&attr);
+    }
+    if (!monotonic)
+    {
+        pthread_cond_init(cond, NULL);
+    }
+    return monotonic;
 #endif
 }
 
@@ -9498,9 +9515,14 @@ static void mlv_processed8_prefetch_cond_init(pthread_cond_t * cond)
  * budget plus one slice. Caller holds the mutex and re-checks its predicate
  * after every return. Returns 0 while budget remains (woken or slice elapsed),
  * ETIMEDOUT once the budget is spent, or a wait/clock failure as non-zero.
- * The test wall-clock skew seam applies to CLOCK_REALTIME reads, so it has
- * nothing to skew here; the clock-step row is RED on the realtime abstime
- * this replaced (PROCESSED8-IDLE-WAIT-PREDICATE-RECHECK-1 r2). */
+ * The one exception is a libc that refused the MONOTONIC cond: the abstime
+ * then follows the cond onto CLOCK_REALTIME, the only wall-clock read here,
+ * and it goes through the test wall-clock skew seam (a backward step can
+ * stretch that slice, but the slice can never expire at once). On every other
+ * path the seam has nothing to skew; the clock-step row is RED on the
+ * realtime abstime this replaced (PROCESSED8-IDLE-WAIT-PREDICATE-RECHECK-1
+ * r2), and tools/repo_hygiene/test_processed8_wait_clock_static.py keeps any
+ * other wall-clock read out of this body. */
 static int mlv_processed8_prefetch_wait_slice_locked(mlvObject_t * video,
                                                      double deadline_s)
 {
@@ -9522,16 +9544,30 @@ static int mlv_processed8_prefetch_wait_slice_locked(mlvObject_t * video,
                                                       &video->processed8_prefetch_mutex,
                                                       &wait_time);
 #else
-    if (clock_gettime(CLOCK_MONOTONIC, &wait_time) != 0)
+    int64_t abstime_offset_ns = slice_ns;
+    if (!video->processed8_prefetch_cond_clock_monotonic)
+    {
+        if (clock_gettime(CLOCK_REALTIME, &wait_time) != 0)
+        {
+            return EINVAL;
+        }
+        abstime_offset_ns += video->processed8_prefetch_test_wall_clock_skew_ns;
+    }
+    else if (clock_gettime(CLOCK_MONOTONIC, &wait_time) != 0)
     {
         return EINVAL;
     }
-    wait_time.tv_nsec += (long)(slice_ns % 1000000000LL);
-    wait_time.tv_sec += (time_t)(slice_ns / 1000000000LL);
+    wait_time.tv_nsec += (long)(abstime_offset_ns % 1000000000LL);
+    wait_time.tv_sec += (time_t)(abstime_offset_ns / 1000000000LL);
     if (wait_time.tv_nsec >= 1000000000L)
     {
         ++wait_time.tv_sec;
         wait_time.tv_nsec -= 1000000000L;
+    }
+    else if (wait_time.tv_nsec < 0)
+    {
+        --wait_time.tv_sec;
+        wait_time.tv_nsec += 1000000000L;
     }
     const int rc = pthread_cond_timedwait(&video->processed8_prefetch_cond,
                                           &video->processed8_prefetch_mutex,
@@ -9702,7 +9738,8 @@ mlvObject_t * initMlvObject()
     pthread_mutex_init(&video->llrawproc_mutex, NULL);
     pthread_mutex_init(&video->llrawproc_worker_mutex, NULL);
     pthread_mutex_init(&video->processed8_prefetch_mutex, NULL);
-    mlv_processed8_prefetch_cond_init(&video->processed8_prefetch_cond);
+    video->processed8_prefetch_cond_clock_monotonic =
+        mlv_processed8_prefetch_cond_init(&video->processed8_prefetch_cond);
     pthread_mutex_init(&video->raw_uint16_prefetch_mutex, NULL);
     pthread_cond_init(&video->raw_uint16_prefetch_cond, NULL);
     video->llrawproc_workers = NULL;
