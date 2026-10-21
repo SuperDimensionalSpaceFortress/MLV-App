@@ -252,8 +252,14 @@ def failure_path(request, failure_paths_started):
 
 JOB_CLASS_RE = re.compile(r"(?s)if \(-not \('MlvLaneJob' -as \[type\]\)\) \{\s*Add-Type -TypeDefinition @'\r?\n(.*?)\r?\n'@")
 # any assignment operator (=, |=, &=, ^=, +=, -=, <<=, ...) whose target is a LimitFlags member; == is a comparison.
-# Whitespace between the member and the operator is allowed (comments are blanked to whitespace first).
-LIMIT_FLAGS_WRITE_RE = re.compile(r"\bLimitFlags\s*(?:<<|>>|[-+*/%&|^])?=(?!=)([^;]*)")
+# Whitespace and closing parens between the member and the operator are allowed, so `(x.LimitFlags) |= 1` is a write
+# too (comments are blanked to whitespace first; an opening paren before the target needs no handling).
+LIMIT_FLAGS_WRITE_RE = re.compile(r"\bLimitFlags[\s)]*(?:<<|>>|[-+*/%&|^])?=(?!=)([^;]*)")
+# Second, independent count that does not depend on the blanker: every LimitFlags token in the block, after dropping
+# only whole-line // comments. The block may hold the field declaration and the one write and nothing else.
+LIMIT_FLAGS_TOKEN_RE = re.compile(r"\bLimitFlags\b")
+LIMIT_FLAGS_DECL_RE = re.compile(r"\bUInt32\s+LimitFlags\s*;")
+WHOLE_LINE_SLASH_COMMENT_RE = re.compile(r"^[ \t]*//.*$", re.M)
 # C# tokens that can hide a write or fake one: string and char literals (kept, so a "//" inside one opens nothing)
 # and comments (blanked to one space, which is also what separates tokens in C#).
 CS_TOKEN_RE = re.compile(r"""@"(?:[^"]|"")*"|"(?:[^"\\\r\n]|\\.)*"|'(?:[^'\\\r\n]|\\.)*'|//[^\r\n]*|/\*.*?\*/""", re.S)
@@ -263,11 +269,20 @@ def blank_cs_comments(code):
     return CS_TOKEN_RE.sub(lambda m: m.group(0) if m.group(0)[0] in "@\"'" else " ", code)
 
 
-def limit_flag_writes(src):
-    """Right-hand sides of every LimitFlags write inside the MlvLaneJob Add-Type block, comments ignored."""
+def job_block(src):
     m = JOB_CLASS_RE.search(src)
     assert m, "MlvLaneJob Add-Type block not found in Invoke-Lane.ps1"
-    return [rhs.strip() for rhs in LIMIT_FLAGS_WRITE_RE.findall(blank_cs_comments(m.group(1)))]
+    return m.group(1)
+
+
+def limit_flag_writes(src):
+    """Right-hand sides of every LimitFlags write inside the MlvLaneJob Add-Type block, comments ignored."""
+    return [rhs.strip() for rhs in LIMIT_FLAGS_WRITE_RE.findall(blank_cs_comments(job_block(src)))]
+
+
+def limit_flag_tokens(src):
+    """Raw LimitFlags token count in the MlvLaneJob block, whole-line // comments dropped and nothing else parsed."""
+    return len(LIMIT_FLAGS_TOKEN_RE.findall(WHOLE_LINE_SLASH_COMMENT_RE.sub("", job_block(src))))
 
 
 def assert_kill_on_close_only(src):
@@ -275,6 +290,12 @@ def assert_kill_on_close_only(src):
     assert len(writes) == 1, f"MlvLaneJob must write LimitFlags exactly once, found {len(writes)}: {writes}"
     assert re.fullmatch(r"0[xX][0-9A-Fa-f]+", writes[0]), f"LimitFlags write is not a plain hex literal: {writes[0]}"
     assert int(writes[0], 16) == 0x2000, "lane job must be KILL_ON_JOB_CLOSE only (0x2000)"
+    # Fail closed on whatever the blanker misreads: the declarations plus the one write are the only legitimate tokens.
+    decls = len(LIMIT_FLAGS_DECL_RE.findall(job_block(src)))
+    tokens = limit_flag_tokens(src)
+    assert decls >= 1 and tokens == decls + 1, (
+        f"MlvLaneJob has {tokens} LimitFlags token(s) outside whole-line // comments; expected {decls} declaration(s) "
+        f"plus the single write ({decls + 1})")
 
 
 def test_job_object_is_kill_on_close_and_not_breakaway():
@@ -311,15 +332,47 @@ def test_a_limitflags_write_split_by_a_comment_is_caught(extra):
         assert_kill_on_close_only(src.replace(WRITE_0x2000, WRITE_0x2000 + "\n" + extra))
 
 
+def test_a_whole_line_commented_out_limitflags_write_does_not_count():
+    src = INVOKE_LANE.read_text(encoding="utf-8")
+    assert src.count(WRITE_0x2000) == 1, "Invoke-Lane.ps1 no longer has the expected single LimitFlags write"
+    assert_kill_on_close_only(src.replace(WRITE_0x2000, WRITE_0x2000 + "\n// LimitFlags = 0x800 removed"))
+
+
 @pytest.mark.parametrize("comment", [
-    "// LimitFlags = 0x800 removed",
     "/* LimitFlags |= 0x800 */",
     "/* multi-line\n   LimitFlags = 0x1000; */",
 ])
-def test_a_commented_out_limitflags_write_does_not_count(comment):
+def test_a_block_commented_limitflags_mention_is_rejected_fail_closed(comment):
+    # r3: the raw token count only forgives whole-line // comments; a /* */ mention is rejected rather than parsed.
     src = INVOKE_LANE.read_text(encoding="utf-8")
     assert src.count(WRITE_0x2000) == 1, "Invoke-Lane.ps1 no longer has the expected single LimitFlags write"
-    assert_kill_on_close_only(src.replace(WRITE_0x2000, WRITE_0x2000 + "\n" + comment))
+    with pytest.raises(AssertionError, match="LimitFlags token"):
+        assert_kill_on_close_only(src.replace(WRITE_0x2000, WRITE_0x2000 + "\n" + comment))
+
+
+@pytest.mark.parametrize("extra", [
+    "(value.BasicLimitInformation.LimitFlags) |= 0x800;",                 # parenthesized lvalue
+    "( value.BasicLimitInformation.LimitFlags ) |= 0x800;",               # whitespace inside the parens
+    "(value.BasicLimitInformation.LimitFlags)|=0x1000;",                  # tight, for 0x1000
+    "((value.BasicLimitInformation.LimitFlags)) |= 0x800;",               # doubly parenthesized
+])
+def test_a_parenthesized_limitflags_write_is_caught(extra):
+    src = INVOKE_LANE.read_text(encoding="utf-8")
+    assert src.count(WRITE_0x2000) == 1, "Invoke-Lane.ps1 no longer has the expected single LimitFlags write"
+    with pytest.raises(AssertionError, match="exactly once"):
+        assert_kill_on_close_only(src.replace(WRITE_0x2000, WRITE_0x2000 + "\n" + extra))
+
+
+@pytest.mark.parametrize("extra", [
+    # a nested literal inside an interpolation hole makes the blanker open a comment that is not one and swallow the write
+    'string s = $"{ "/*" }"; value.BasicLimitInformation.LimitFlags |=0x800; // */',
+    'string s = $"{ "//" }"; value.BasicLimitInformation.LimitFlags |=0x1000;',
+])
+def test_a_limitflags_write_hidden_by_a_nested_literal_is_caught(extra):
+    src = INVOKE_LANE.read_text(encoding="utf-8")
+    assert src.count(WRITE_0x2000) == 1, "Invoke-Lane.ps1 no longer has the expected single LimitFlags write"
+    with pytest.raises(AssertionError, match="LimitFlags token"):
+        assert_kill_on_close_only(src.replace(WRITE_0x2000, WRITE_0x2000 + "\n" + extra))
 
 
 def test_the_only_limitflags_write_must_be_0x2000():
