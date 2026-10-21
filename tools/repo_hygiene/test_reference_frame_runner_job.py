@@ -792,6 +792,111 @@ class CaptureScriptGateProfileArgumentTests(oracle_tests._LauncherCase):
             self.assertEqual(text.count(needle), 1, needle)
 
 
+M16_1243_FRAMES = 612          # 25.526 s at 23.976 fps; from -StartFrame 120 the footage left is 492 frames = 20.521 s
+M16_1243_START_FRAME = "120"
+
+
+@requires_pwsh
+class CaptureScriptPinnedWindowTests(oracle_tests._LauncherCase):
+    """REFERENCE-FRAME-PINNED-WINDOW-GATE-1: a pinned-frame capture needs the PINNED frame, not real-time pace.
+
+    OUTPUT-BUDGET-KNOWN-GOOD-PIN-2 r1 could not capture the known-good frame of M16-1243 (wb_locked, startFrame 120, 20.521 s of footage left):
+    `-Seconds 30` returned 41 CLIP_TOO_SHORT although the app only ever plays min(--seconds, N / fps) = 20.02 s of it (smokePlayRequestSeconds,
+    platform/qt/PlaybackFrameRange.h), and `-Seconds 20` came back as exit 4 with the app's exit 11 reading as an untyped `exited 11 (NONE)`.
+    A fake app records its argv and writes a chosen receipt; no venue, no footage, no app launch."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.clip = write_synthetic_mlv(self.tmp / ("m16" + MLV_EXTENSION), M16_1243_FRAMES)
+
+    def run_capture(self, line: str | None, *extra: str, exit_code: int = 0, stderr_text: str = "") -> tuple[subprocess.CompletedProcess, list[str]]:
+        out = self.tmp / "capture-out"
+        out.mkdir(exist_ok=True)
+        grab = self.tmp / "grab.template"
+        grab.write_bytes(b"\0" * 65536)
+        args_file = self.tmp / "app-args.json"
+        if args_file.exists():
+            args_file.unlink()
+        fake = oracle_tests._make_fake_app(self.tmp, exit_code=exit_code, args_file=args_file, stderr_text=stderr_text,
+                                           copies=self.log_template(line) + ((grab, str(out / "reference-frame.png")),))
+        proc = _run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(CAPTURE),
+                     "-Exe", str(fake), "-Clip", str(self.clip), "-OutDir", str(out), "-SettleMs", "100", "-StartFrame", M16_1243_START_FRAME,
+                     "-Commit", "0123456789abcdef0123456789abcdef01234567", *extra], timeout=240)
+        argv = json.loads(args_file.read_text(encoding="utf-8")) if args_file.exists() else []
+        return proc, argv
+
+    @staticmethod
+    def pinned_line(**overrides: object) -> str:
+        return oracle_tests._good_line(**{"total_frames": M16_1243_FRAMES, "clip_seconds": 25.526, "presented_frames": 480, **overrides})
+
+    def test_a_timeout_longer_than_the_footage_left_does_not_refuse_a_pinned_frame_capture(self) -> None:
+        """Failure shape 1: -Seconds 30 is a TIMEOUT for a pinned run, so it may exceed the 20.521 s left after startFrame 120."""
+        proc, argv = self.run_capture(self.pinned_line(), "-Seconds", "30")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn("CLIP_TOO_SHORT", proc.stdout)
+        self.assertEqual(argv[argv.index("--seconds") + 1], "30")
+        self.assertEqual(argv[argv.index("--presented-frames") + 1], "480")
+        self.assertEqual(argv[argv.index("--start-frame") + 1], M16_1243_START_FRAME)
+
+    def test_the_timeout_equal_to_the_footage_left_still_passes(self) -> None:
+        proc, _ = self.run_capture(self.pinned_line(), "-Seconds", "20")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+    def test_a_time_based_capture_still_refuses_a_window_longer_than_the_footage_left(self) -> None:
+        """-PresentedFrames 0 plays for -Seconds of wall clock, so there the window IS -Seconds and 41 stays."""
+        proc, argv = self.run_capture(self.pinned_line(), "-Seconds", "30", "-PresentedFrames", "0")
+        self.assertEqual(proc.returncode, 41, proc.stdout + proc.stderr)
+        self.assertIn("CLIP_TOO_SHORT", proc.stdout)
+        self.assertEqual(argv, [], "the app was launched past a refused window")
+
+    def test_a_pinned_frame_target_that_outlasts_the_footage_left_is_still_refused(self) -> None:
+        """The window is min(-Seconds, N / fps): N = 600 frames is 25.02 s, more than the 20.521 s left, whatever the timeout."""
+        proc, argv = self.run_capture(self.pinned_line(), "-Seconds", "30", "-PresentedFrames", "600")
+        self.assertEqual(proc.returncode, 41, proc.stdout + proc.stderr)
+        self.assertIn("CLIP_TOO_SHORT", proc.stdout)
+        self.assertEqual(argv, [])
+
+    def test_a_timeout_under_the_floor_is_still_refused_whatever_the_target(self) -> None:
+        proc, argv = self.run_capture(self.pinned_line(), "-Seconds", "10")
+        self.assertEqual(proc.returncode, 41, proc.stdout + proc.stderr)
+        self.assertIn("PLAY_WINDOW_TOO_SHORT", proc.stdout)
+        self.assertEqual(argv, [])
+
+    def test_a_target_under_the_floor_is_still_refused(self) -> None:
+        proc, argv = self.run_capture(self.pinned_line(), "-Seconds", "30", "-PresentedFrames", "24")
+        self.assertEqual(proc.returncode, 41, proc.stdout + proc.stderr)
+        self.assertIn("PLAY_WINDOW_TOO_SHORT", proc.stdout)
+        self.assertEqual(argv, [])
+
+    def test_the_receipt_oracle_still_judges_a_pinned_run_over_the_window_it_played(self) -> None:
+        """Widening the gate must not widen the verdict: a receipt that wrapped, or whose engine consumed fewer than the window, stays INVALID (43)."""
+        for label, line in (("wrapped", self.pinned_line(wrapped=1, wrap_count=1)),
+                            ("source frames short", self.pinned_line(source_advanced=479)),
+                            ("clip under the window it played", self.pinned_line(clip_seconds=19.0))):
+            with self.subTest(label):
+                proc, _ = self.run_capture(line, "-Seconds", "30")
+                self.assertEqual(proc.returncode, EXIT_INVALID, proc.stdout + proc.stderr)
+                self.assertIn("CAPTURE: INVALID", proc.stdout)
+                self.assertFalse((self.tmp / "capture-out" / "reference-frame-candidate.json").exists())
+
+    def test_a_pinned_frame_never_presented_is_a_typed_failure_not_a_candidate(self) -> None:
+        """Failure shape 2, as far as the tool can see it: the app exits 11 (`exact presented-frame target was not met`) and writes no frame."""
+        stderr = "[GUI-SMOKE] ERROR: exact presented-frame target was not met; target=480 observed=418."
+        proc, _ = self.run_capture(None, "-Seconds", "30", exit_code=11, stderr_text=stderr)
+        self.assertEqual(proc.returncode, 4, proc.stdout + proc.stderr)
+        self.assertIn("PINNED_FRAME_NOT_PRESENTED", proc.stdout)
+        self.assertIn("target=480", proc.stdout)
+        self.assertIn("observed=418", proc.stdout)
+        self.assertNotIn("(NONE)", proc.stdout)
+        self.assertFalse((self.tmp / "capture-out" / "reference-frame-candidate.json").exists())
+
+    def test_any_other_app_failure_keeps_its_own_reason(self) -> None:
+        proc, _ = self.run_capture(None, "-Seconds", "30", exit_code=7, stderr_text="[GUI-SMOKE] ERROR: Play action did not enter checked state.")
+        self.assertEqual(proc.returncode, 4, proc.stdout + proc.stderr)
+        self.assertNotIn("PINNED_FRAME_NOT_PRESENTED", proc.stdout)
+        self.assertIn("exe exited 7", proc.stdout)
+
+
 # HUB-VM-NO-LOCAL-PLAYBACK-1: CaptureScriptGateProfileArgumentTests runs the real capture script against a stand-in exe that is never launched.
 # The script refuses on the hub VM (tools/profiling/dual-venue/hub-hosts.json) unless the CI-fixture override is set, so set it for this
 # module's own subprocesses only, in the test process, exactly as the sibling playback test modules do.
