@@ -18,6 +18,15 @@ run_control(), whose finally kills each recorded pid whose creation time still m
 alone). That holds on the three failure paths a bare control-script `finally` cannot cover: the host fails
 after the WMI Create, the host never exits, and the subprocess timeout kills the control script itself.
 The failure-path runs start alongside the 60 s survival wait, so they add little wall time.
+
+LANE-DETACHED-CHILD-TEST-HARDENING-2 closes the rows #545's keys left open:
+  1. A child is reported reaped only after it was killed through a handle that carries SYNCHRONIZE and a bounded
+     WaitForSingleObject on that handle returned WAIT_OBJECT_0; anything else raises ReapFailed.
+  2. Every sleeper's command line carries a per-test token. After the record-based reap, run_control() sweeps by that
+     token plus a CreationDate lower bound (never by image name), so a sleeper whose record was never published, or
+     one created after the records were written, cannot escape.
+  3. The live job's LimitFlags is read back with QueryInformationJobObject(job, 9) and must equal 0x2000, so an
+     indirect write of a breakaway flag goes red even though the static one-write guard sees nothing.
 """
 
 import ctypes
@@ -27,8 +36,10 @@ import re
 import subprocess
 import sys
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import NamedTuple
 
 import pytest
 
@@ -46,8 +57,11 @@ HOST_WAIT_SEC = 90  # how long the control script waits for the inert host to ex
 HOST_PS1 = r"""
 param([Parameter(Mandatory = $true)][string]$Dir)
 $ErrorActionPreference = 'Stop'
-$fault = $env:MLV_TEST_HOST_FAULT   # test-only: 'start-process-throws' | 'host-hangs'
+$fault = $env:MLV_TEST_HOST_FAULT   # test-only: 'start-process-throws' | 'host-hangs' | 'late-wmi-child'
 $pidDir = Join-Path $Dir 'pids'
+# The per-test token rides on every sleeper's command line (never on the host's), so the Python finalizer can find a
+# sleeper whose record was never published.
+$token = ([IO.File]::ReadAllText((Join-Path $Dir 'token.txt'))).Trim()
 
 # Written the moment a child exists, before anything else can fail: the Python finalizer reads these.
 function Save-ChildRecord([string]$Name, [int]$ChildPid, [int64]$Created) {
@@ -59,13 +73,16 @@ function Save-ChildRecord([string]$Name, [int]$ChildPid, [int64]$Created) {
 
 $go = Join-Path $Dir 'go.flag'
 while (-not (Test-Path -LiteralPath $go)) { Start-Sleep -Milliseconds 25 }
-$sleep = 'Start-Sleep -Seconds __SLEEPER_SEC__'
+$sleep = 'Start-Sleep -Seconds __SLEEPER_SEC__ # ' + $token
 $si = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{ ShowWindow = [uint16]0 }
-$r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
-    CommandLine = ('pwsh.exe -NoProfile -NonInteractive -Command "' + $sleep + '"')
-    CurrentDirectory = $Dir; ProcessStartupInformation = $si }
-if ([int]$r.ReturnValue -ne 0) { throw ('wmi-create-rc-' + $r.ReturnValue) }
-$wmiProc = Get-Process -Id ([int]$r.ProcessId)
+function New-WmiSleeper {
+    $r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
+        CommandLine = ('pwsh.exe -NoProfile -NonInteractive -Command "' + $sleep + '"')
+        CurrentDirectory = $Dir; ProcessStartupInformation = $si }
+    if ([int]$r.ReturnValue -ne 0) { throw ('wmi-create-rc-' + $r.ReturnValue) }
+    return [int]$r.ProcessId
+}
+$wmiProc = Get-Process -Id (New-WmiSleeper)
 Save-ChildRecord 'wmi' $wmiProc.Id $wmiProc.StartTime.ToFileTimeUtc()
 if ($fault -eq 'start-process-throws') { throw 'injected-start-process-failure' }
 $sp = Start-Process -FilePath 'pwsh.exe' -ArgumentList @('-NoProfile', '-NonInteractive', '-Command', $sleep) -WindowStyle Hidden -PassThru
@@ -77,6 +94,11 @@ $doc = [ordered]@{
 $tmp = Join-Path $Dir 'children.json.tmp'
 [IO.File]::WriteAllText($tmp, ($doc | ConvertTo-Json -Depth 4), [Text.UTF8Encoding]::new($false))
 Move-Item -LiteralPath $tmp -Destination (Join-Path $Dir 'children.json')
+if ($fault -eq 'late-wmi-child') {
+    # a third sleeper that exists after the records were written and is never recorded: only the tag finds it
+    [void](New-WmiSleeper)
+    throw 'injected-unrecorded-late-child'
+}
 if ($fault -eq 'host-hangs') { Start-Sleep -Seconds 600 }
 """.replace("__SLEEPER_SEC__", str(SLEEPER_SEC))
 
@@ -85,13 +107,38 @@ param(
     [Parameter(Mandatory = $true)][string]$LaneScript,
     [Parameter(Mandatory = $true)][string]$Dir,
     [Parameter(Mandatory = $true)][int]$SurvivalSec,
-    [Parameter(Mandatory = $true)][int]$HostWaitSec
+    [Parameter(Mandatory = $true)][int]$HostWaitSec,
+    [switch]$ProbeOnly   # read the live job's limit flags back and stop: no host, no children
 )
 $ErrorActionPreference = 'Stop'
 $src = [IO.File]::ReadAllText($LaneScript)
 $m = [regex]::Match($src, "(?s)if \(-not \('MlvLaneJob' -as \[type\]\)\) \{\s*Add-Type -TypeDefinition @'\r?\n(.*?)\r?\n'@")
 if (-not $m.Success) { throw 'job-class-not-found-in-Invoke-Lane' }
 Add-Type -TypeDefinition $m.Groups[1].Value
+if (-not ('MlvTestJobProbe' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+public static class MlvTestJobProbe {
+  [DllImport("kernel32.dll", SetLastError=true)]
+  static extern bool QueryInformationJobObject(IntPtr job, int infoClass, IntPtr info, uint length, out uint returned);
+  // JobObjectExtendedLimitInformation (9): BasicLimitInformation.LimitFlags is the UInt32 at offset 16.
+  public static uint LimitFlags(IntPtr job) {
+    int size = IntPtr.Size == 8 ? 144 : 112;   // sizeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION); the call fails on any other length
+    IntPtr mem = Marshal.AllocHGlobal(size);
+    try {
+      for (int i = 0; i < size; i += 8) Marshal.WriteInt64(mem, i, 0);
+      uint returned;
+      if (!QueryInformationJobObject(job, 9, mem, (uint)size, out returned))
+        throw new Win32Exception(Marshal.GetLastWin32Error());
+      if (returned < 20) throw new InvalidOperationException("short JobObjectExtendedLimitInformation: " + returned);
+      return (uint)Marshal.ReadInt32(mem, 16);
+    } finally { Marshal.FreeHGlobal(mem); }
+  }
+}
+'@
+}
 
 function Test-Alive($Rec) {
     $p = Get-Process -Id ([int]$Rec.pid) -ErrorAction SilentlyContinue
@@ -102,6 +149,10 @@ function Test-Alive($Rec) {
 }
 
 $job = [MlvLaneJob]::CreateKillOnClose()
+if ($ProbeOnly) {
+    try { '{"limitFlags":' + [MlvTestJobProbe]::LimitFlags($job) + '}' } finally { [void][MlvLaneJob]::CloseHandle($job) }
+    return
+}
 $psi = [Diagnostics.ProcessStartInfo]::new()
 $psi.FileName = (Get-Command pwsh.exe -ErrorAction Stop).Source
 foreach ($a in @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', (Join-Path $Dir 'host.ps1'), '-Dir', $Dir)) { [void]$psi.ArgumentList.Add($a) }
@@ -129,7 +180,19 @@ try {
 }
 """
 
-_TERMINATE, _QUERY_LIMITED, _STILL_ACTIVE = 0x0001, 0x1000, 259
+_TERMINATE, _QUERY_LIMITED, _SYNCHRONIZE, _STILL_ACTIVE = 0x0001, 0x1000, 0x00100000, 259
+_WAIT_OBJECT_0, _WAIT_TIMEOUT, _WAIT_FAILED = 0, 0x102, 0xFFFFFFFF
+# SYNCHRONIZE is what WaitForSingleObject needs: on a handle without it the wait fails at once (error 5), so a kill
+# that was never confirmed would read as a reap.
+_REAP_ACCESS = _TERMINATE | _QUERY_LIMITED | _SYNCHRONIZE
+REAP_WAIT_MS = 5000
+SWEEP_QUERY_SEC = 90  # bound on the one CIM query a sweep makes
+_FILETIME_UNIX_EPOCH = 116444736000000000
+_TAG_RE = re.compile(r"MLVTAG[0-9a-f]{32}")  # also the only shape the LIKE filter below will ever see
+
+
+class ReapFailed(RuntimeError):
+    """A child that should be dead was not confirmed dead; never reported as reaped."""
 
 
 def _kernel32():
@@ -139,33 +202,90 @@ def _kernel32():
     k.GetProcessTimes.argtypes = [ctypes.c_void_p] + [ctypes.POINTER(ctypes.c_uint64)] * 4
     k.GetExitCodeProcess.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
     k.TerminateProcess.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    k.WaitForSingleObject.restype = ctypes.c_uint32
     k.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
     k.CloseHandle.argtypes = [ctypes.c_void_p]
     return k
 
 
-def reap_child(pid, created, *, kill=True):
-    """True when pid is a live process whose creation FILETIME equals `created` (killed first when `kill`).
+def reap_child(pid, created, *, kill=True, tolerance=0, not_before=0, access=None):
+    """True when pid is a live process whose creation FILETIME matches `created` (killed first when `kill`).
 
-    The kill goes through the handle the creation time was read from, so a pid recycled after this check
-    cannot be hit; a pid that was already recycled has a different creation time and is never touched."""
+    A kill is only reported once the process is confirmed terminated: the handle carries SYNCHRONIZE and the bounded
+    wait on it must return WAIT_OBJECT_0, otherwise ReapFailed is raised. The kill goes through the handle the creation
+    time was read from, so a pid recycled after this check cannot be hit; a pid that was already recycled has a
+    different creation time and is never touched. `tolerance` (100 ns units) lets a creation time that came from a
+    WMI CreationDate (microsecond resolution) match; `not_before` is a FILETIME lower bound on the creation time."""
     k = _kernel32()
-    h = k.OpenProcess(_TERMINATE | _QUERY_LIMITED, False, pid)
+    h = k.OpenProcess(_REAP_ACCESS if access is None else access, False, pid)
     if not h:
         return False
     try:
         times = [ctypes.c_uint64() for _ in range(4)]
-        if not k.GetProcessTimes(h, *[ctypes.byref(t) for t in times]) or times[0].value != created:
+        if not k.GetProcessTimes(h, *[ctypes.byref(t) for t in times]):
+            return False
+        if abs(times[0].value - created) > tolerance or times[0].value < not_before:
             return False
         code = ctypes.c_uint32()
         if not k.GetExitCodeProcess(h, ctypes.byref(code)) or code.value != _STILL_ACTIVE:
             return False  # exited; a leftover handle elsewhere keeps the pid openable
         if kill:
-            k.TerminateProcess(h, 1)
-            k.WaitForSingleObject(h, 5000)
+            if not k.TerminateProcess(h, 1):
+                raise ReapFailed(f"pid {pid}: TerminateProcess failed (error {ctypes.get_last_error()})")
+            waited = k.WaitForSingleObject(h, REAP_WAIT_MS)
+            if waited != _WAIT_OBJECT_0:
+                why = {_WAIT_TIMEOUT: "still running after the bounded wait", _WAIT_FAILED: "the wait failed"}
+                raise ReapFailed(f"pid {pid}: not confirmed terminated ({why.get(waited, waited)}; "
+                                 f"last error {ctypes.get_last_error()})")
         return True
     finally:
         k.CloseHandle(h)
+
+
+def filetime_now():
+    return int(time.time() * 10_000_000) + _FILETIME_UNIX_EPOCH
+
+
+def creation_floor():
+    """Lower bound for a sweep: now, less 2 s because the kernel stamps a process's creation time from a coarse tick
+    clock that can read a few milliseconds behind time.time()."""
+    return filetime_now() - 2 * 10_000_000
+
+
+def find_tagged(token):
+    """[(pid, creation FILETIME)] of every live process whose command line carries `token` (the CIM query's own
+    process excluded). The token travels in the environment, so the query never matches itself by name or text."""
+    assert _TAG_RE.fullmatch(token), f"not a sweep token: {token!r}"
+    script = ("$t = $env:MLV_SWEEP_TAG; "
+              "Get-CimInstance -ClassName Win32_Process -Filter (\"CommandLine LIKE '%\" + $t + \"%'\") | "
+              "Where-Object { $_.ProcessId -ne $PID } | "
+              "ForEach-Object { '{0} {1}' -f $_.ProcessId, $_.CreationDate.ToFileTimeUtc() }")
+    env = dict(os.environ, MLV_SWEEP_TAG=token)
+    cp = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+                        capture_output=True, text=True, timeout=SWEEP_QUERY_SEC, env=env)
+    if cp.returncode != 0:
+        raise ReapFailed(f"sweep query failed rc={cp.returncode}: {cp.stderr.strip()}")
+    return [tuple(int(x) for x in line.split()) for line in cp.stdout.splitlines() if line.strip()]
+
+
+def sweep_tagged(token, not_before, *, kill=True):
+    """Kill (and confirm dead) every live process tagged `token` and created at or after `not_before`; return the pids.
+
+    Matching is by the per-test command-line tag plus a CreationDate lower bound, never by image name, and each kill
+    still goes through reap_child's creation-time check (WMI's microsecond CreationDate against the handle's)."""
+    return [pid for pid, created in find_tagged(token)
+            if reap_child(pid, created, kill=kill, tolerance=10_000, not_before=not_before)]
+
+
+def probe_job_flags(d, lane_script=INVOKE_LANE):
+    """LimitFlags of the job object the lane script's own MlvLaneJob class creates, read back with
+    QueryInformationJobObject(job, JobObjectExtendedLimitInformation = 9)."""
+    cp = subprocess.run(
+        [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(d / "control.ps1"),
+         "-LaneScript", str(lane_script), "-Dir", str(d), "-SurvivalSec", "0", "-HostWaitSec", "0", "-ProbeOnly"],
+        capture_output=True, text=True, timeout=90)
+    assert cp.returncode == 0, f"job probe failed rc={cp.returncode}\nstdout={cp.stdout}\nstderr={cp.stderr}"
+    return json.loads(cp.stdout.strip().splitlines()[-1])["limitFlags"]
 
 
 def read_child_records(pid_dir):
@@ -183,19 +303,37 @@ def stage(d):
     (d / "pids").mkdir()
     (d / "host.ps1").write_text(HOST_PS1, encoding="ascii")
     (d / "control.ps1").write_text(CONTROL_PS1, encoding="ascii")
+    (d / "token.txt").write_text("MLVTAG" + uuid.uuid4().hex, encoding="ascii")
     return d
 
 
-def run_control(d, *, survival_sec, host_wait_sec=HOST_WAIT_SEC, timeout, fault=None):
-    """Run the control script; whatever happens, kill every recorded child that is still the same process.
+def stage_token(d):
+    return (d / "token.txt").read_text(encoding="ascii").strip()
 
-    Returns (completed_process_or_None, timed_out, records, reaped) where `reaped` names the children that were
-    still alive when the finalizer ran (the orphans this module would otherwise leave behind)."""
+
+class ControlRun(NamedTuple):
+    cp: object      # CompletedProcess, or None when the subprocess timed out
+    timed_out: bool
+    records: dict   # name -> (pid, creation FILETIME), as the host published them
+    reaped: list    # recorded children still alive when the finalizer ran
+    swept: list     # pids found by the command-line tag alone (no record) and still alive when the sweep ran
+    token: str
+
+
+def run_control(d, *, survival_sec, host_wait_sec=HOST_WAIT_SEC, timeout, fault=None):
+    """Run the control script; whatever happens, kill every recorded child that is still the same process, then
+    sweep any leftover sleeper by the test's command-line tag (a child whose record was never published).
+
+    `reaped` names the recorded children that were still alive when the finalizer ran (the orphans this module
+    would otherwise leave behind); `swept` lists the unrecorded ones the tag found. A kill that cannot be confirmed
+    raises ReapFailed once everything else has been tried."""
     env = dict(os.environ)
     env.pop("MLV_TEST_HOST_FAULT", None)
     if fault:
         env["MLV_TEST_HOST_FAULT"] = fault
-    cp, timed_out = None, False
+    token = stage_token(d)
+    floor = creation_floor()
+    cp, timed_out, errors, reaped, swept = None, False, [], [], []
     try:
         cp = subprocess.run(
             [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(d / "control.ps1"),
@@ -206,12 +344,28 @@ def run_control(d, *, survival_sec, host_wait_sec=HOST_WAIT_SEC, timeout, fault=
         timed_out = True
     finally:
         records = read_child_records(d / "pids")
-        reaped = [name for name, (pid, created) in records.items() if reap_child(pid, created)]
-    return cp, timed_out, records, reaped
+        for name, (pid, created) in records.items():
+            try:
+                if reap_child(pid, created):
+                    reaped.append(name)
+            except ReapFailed as e:
+                errors.append(f"{name}: {e}")
+        try:
+            swept = sweep_tagged(token, floor)
+        except (ReapFailed, subprocess.SubprocessError) as e:
+            errors.append(f"tag sweep: {e}")
+    if errors:
+        raise ReapFailed("; ".join(errors))
+    return ControlRun(cp, timed_out, records, reaped, swept, token)
 
 
 def children_alive(records):
     return {name: reap_child(pid, created, kill=False) for name, (pid, created) in records.items()}
+
+
+def tagged_alive(token):
+    """Pids still running with `token` on their command line (a zombie the CIM table still lists is not alive)."""
+    return [pid for pid, created in find_tagged(token) if reap_child(pid, created, kill=False, tolerance=10_000)]
 
 
 # name -> run_control arguments. Each leaves the WMI sleeper (outside the job) running unless the finalizer kills it.
@@ -219,8 +373,10 @@ FAILURE_PATHS = {
     "start-process-throws": dict(fault="start-process-throws", survival_sec=5, timeout=90),
     "host-does-not-exit": dict(fault="host-hangs", survival_sec=5, host_wait_sec=30, timeout=90),
     "subprocess-timeout": dict(survival_sec=SURVIVAL_WAIT_SEC, timeout=40),
+    # a WMI sleeper created after the records were written and never recorded: only its command-line tag finds it
+    "unrecorded-late-child": dict(fault="late-wmi-child", survival_sec=5, timeout=90),
 }
-# The two rows above are sized for a loaded runner (start-up of pwsh plus the WMI Create can take many seconds) yet
+# The rows above are sized for a loaded runner (start-up of pwsh plus the WMI Create can take many seconds) yet
 # stay inside the 60 s survival wait they overlap, so they add no wall time: the host waits 30 s, the timeout is 40 s.
 
 
@@ -236,7 +392,7 @@ def failure_paths_started(tmp_path_factory):
 @pytest.fixture(scope="module")
 def lifecycle(tmp_path_factory, failure_paths_started):
     d = stage(tmp_path_factory.mktemp("detached-child"))
-    cp, timed_out, _records, _reaped = run_control(
+    cp, timed_out, *_rest = run_control(
         d, survival_sec=SURVIVAL_WAIT_SEC, host_wait_sec=HOST_WAIT_SEC, timeout=SURVIVAL_WAIT_SEC + 150)
     assert not timed_out, "control script timed out"
     assert cp.returncode == 0, f"control script failed rc={cp.returncode}\nstdout={cp.stdout}\nstderr={cp.stderr}"
@@ -438,7 +594,8 @@ def test_start_process_child_dies_with_the_lane_job(lifecycle):
 # ---- no orphaned sleeper, whatever fails ------------------------------------------------------------------
 
 def test_no_sleeper_is_left_behind_on_a_failure_path(failure_path):
-    name, (cp, timed_out, records, reaped) = failure_path
+    name, run = failure_path
+    cp, timed_out, records, reaped = run.cp, run.timed_out, run.records, run.reaped
     # the path really happened, not a start-up error that never reached the WMI Create
     assert "wmi" in records, f"{name}: the host never recorded its WMI child; stdout={getattr(cp, 'stdout', None)}"
     if name == "subprocess-timeout":
@@ -448,6 +605,167 @@ def test_no_sleeper_is_left_behind_on_a_failure_path(failure_path):
     # the WMI child is outside the job, so it was still running when the finalizer ran: that is the orphan it killed
     assert "wmi" in reaped, f"{name}: the WMI sleeper was not alive for the finalizer to kill (reaped={reaped})"
     assert not any(children_alive(records).values()), f"{name}: a recorded sleeper is still alive: {children_alive(records)}"
+    # the record is not the only way to find a sleeper: nothing carrying this test's tag may be running either
+    assert tagged_alive(run.token) == [], f"{name}: a sleeper carrying the test tag is still alive"
+
+
+def test_a_sleeper_with_no_published_record_is_found_by_its_tag(failure_paths_started):
+    run = failure_paths_started["unrecorded-late-child"].result()
+    assert set(run.records) == {"wmi", "startProcess"}, f"the late sleeper must stay unrecorded: {run.records}"
+    # the recorded children are accounted for by their records; the third sleeper only the tag could reach
+    assert len(run.swept) == 1, f"expected exactly the one unrecorded sleeper from the sweep, got {run.swept}"
+    assert run.swept[0] not in {pid for pid, _created in run.records.values()}
+
+
+def _spawn_sleeper(tag=""):
+    """A pwsh sleeper; `tag` rides on its command line the way the host's sleepers carry the test token."""
+    return subprocess.Popen([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
+                             "Start-Sleep -Seconds 60" + (" # " + tag if tag else "")])
+
+
+def _wait_registered(proc, token):
+    """Poll (bounded) until the CIM table lists `proc` under `token`."""
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        if proc.pid in [pid for pid, _c in find_tagged(token)]:
+            return
+        time.sleep(0.5)
+    raise AssertionError("the tagged sleeper never appeared in the CIM process table")
+
+
+def test_the_sweep_kills_a_tagged_sleeper_and_confirms_it_dead():
+    token = "MLVTAG" + uuid.uuid4().hex
+    floor = creation_floor()
+    p = _spawn_sleeper(token)
+    try:
+        _wait_registered(p, token)
+        assert p.pid in sweep_tagged(token, floor)
+        assert p.poll() is not None, "sweep_tagged returned before the sleeper was confirmed terminated"
+    finally:
+        p.kill()
+        p.wait()
+
+
+def test_the_sweep_never_matches_by_image_name_alone():
+    token = "MLVTAG" + uuid.uuid4().hex
+    floor = creation_floor()
+    bystander = _spawn_sleeper()  # a pwsh.exe like the sleepers, but without the tag
+    tagged = _spawn_sleeper(token)
+    try:
+        _wait_registered(tagged, token)
+        assert tagged.pid in sweep_tagged(token, floor)
+        assert bystander.poll() is None, "an untagged pwsh.exe was killed: the sweep matched by image name"
+    finally:
+        for p in (bystander, tagged):
+            p.kill()
+            p.wait()
+
+
+def test_the_sweep_honours_the_creation_date_lower_bound():
+    token = "MLVTAG" + uuid.uuid4().hex
+    p = _spawn_sleeper(token)
+    try:
+        _wait_registered(p, token)
+        assert sweep_tagged(token, filetime_now() + 600 * 10_000_000) == [], "a sleeper older than the bound was swept"
+        assert p.poll() is None
+    finally:
+        p.kill()
+        p.wait()
+
+
+# ---- a reap is only reported once the child is confirmed terminated ----------------------------------------------
+
+def _creation_filetime(pid):
+    k = _kernel32()
+    h = k.OpenProcess(_QUERY_LIMITED, False, pid)
+    assert h, f"cannot open pid {pid}"
+    try:
+        times = [ctypes.c_uint64() for _ in range(4)]
+        assert k.GetProcessTimes(h, *[ctypes.byref(t) for t in times])
+        return times[0].value
+    finally:
+        k.CloseHandle(h)
+
+
+def test_reap_child_opens_with_synchronize_and_returns_only_after_the_child_is_dead():
+    assert _REAP_ACCESS & _SYNCHRONIZE, "the reap handle must carry SYNCHRONIZE or its wait cannot succeed"
+    p = _spawn_sleeper()
+    try:
+        created = _creation_filetime(p.pid)
+        assert reap_child(p.pid, created) is True
+        assert p.poll() is not None, "reap_child reported the child reaped while it was still running"
+    finally:
+        p.kill()
+        p.wait()
+
+
+def test_a_handle_without_synchronize_never_reads_as_reaped():
+    p = _spawn_sleeper()
+    try:
+        created = _creation_filetime(p.pid)
+        with pytest.raises(ReapFailed, match="not confirmed terminated"):
+            reap_child(p.pid, created, access=_TERMINATE | _QUERY_LIMITED)  # WaitForSingleObject -> WAIT_FAILED (5)
+    finally:
+        p.kill()
+        p.wait()
+
+
+def test_run_control_does_not_report_a_reap_it_could_not_confirm(tmp_path, monkeypatch):
+    # the finalizer's own guard: a recorded child whose termination is not confirmed fails the run, loudly
+    p = _spawn_sleeper()
+    d = stage(tmp_path)
+    try:
+        created = _creation_filetime(p.pid)
+        (d / "pids" / "wmi.json").write_text(json.dumps({"pid": p.pid, "created": created}), encoding="utf-8")
+        monkeypatch.setattr(sys.modules[__name__], "INVOKE_LANE", tmp_path / "missing-lane.ps1")  # control fails fast
+        monkeypatch.setattr(sys.modules[__name__], "_REAP_ACCESS", _TERMINATE | _QUERY_LIMITED)
+        with pytest.raises(ReapFailed, match="wmi: pid"):
+            run_control(d, survival_sec=0, host_wait_sec=1, timeout=60)
+    finally:
+        p.kill()
+        p.wait()
+
+
+# ---- the live job object's flags, read back from the kernel -----------------------------------------------------
+
+JOB_FLAGS_KILL_ON_CLOSE_ONLY = 0x2000
+
+
+@pytest.fixture(scope="module")
+def job_flags(tmp_path_factory):
+    return probe_job_flags(stage(tmp_path_factory.mktemp("job-probe")))
+
+
+def test_the_live_lane_job_reads_back_kill_on_close_and_nothing_else(job_flags):
+    # QueryInformationJobObject(job, 9) on the job Invoke-Lane.ps1's own class creates: an indirect write of a breakaway
+    # flag (Marshal.WriteInt32 on the marshalled struct, a second struct copy) changes this value even though the text
+    # guard above sees one plain `LimitFlags=0x2000;`.
+    assert job_flags == JOB_FLAGS_KILL_ON_CLOSE_ONLY, (
+        f"the lane job's LimitFlags is {job_flags:#x}, expected {JOB_FLAGS_KILL_ON_CLOSE_ONLY:#x} (KILL_ON_JOB_CLOSE only)")
+
+
+STRUCT_TO_PTR = "Marshal.StructureToPtr(value,mem,false);"
+# Writes that never spell the LimitFlags identifier a second time, so neither the write regex nor the raw token count
+# of the static guard can see them; each ORs BREAKAWAY_OK (0x800) into the marshalled struct before it is applied.
+INDIRECT_BREAKAWAY_WRITES = {
+    "Marshal.WriteInt32 constant": "Marshal.WriteInt32(mem,16,0x2000|0x800);",
+    "Marshal.WriteInt32 read-modify-write": "Marshal.WriteInt32(mem,16,Marshal.ReadInt32(mem,16)|0x800);",
+}
+
+
+@pytest.mark.parametrize("name", sorted(INDIRECT_BREAKAWAY_WRITES))
+def test_an_indirect_breakaway_write_is_invisible_to_the_text_guard_but_goes_red_at_runtime(name, tmp_path):
+    src = INVOKE_LANE.read_text(encoding="utf-8")
+    assert src.count(STRUCT_TO_PTR) == 1, "Invoke-Lane.ps1 no longer marshals the job struct the expected way"
+    mutated = src.replace(STRUCT_TO_PTR, STRUCT_TO_PTR + INDIRECT_BREAKAWAY_WRITES[name])
+    assert_kill_on_close_only(mutated)  # the static guard still passes: that is the gap this read-back closes
+    lane_copy = tmp_path / "Invoke-Lane.mutated.ps1"
+    lane_copy.write_text(mutated, encoding="utf-8")
+    probe_dir = tmp_path / "probe"
+    probe_dir.mkdir()
+    flags = probe_job_flags(stage(probe_dir), lane_copy)
+    assert flags == 0x2800, f"{name}: the runtime read-back saw {flags:#x}, expected KILL_ON_JOB_CLOSE|BREAKAWAY_OK 0x2800"
+    assert flags != JOB_FLAGS_KILL_ON_CLOSE_ONLY
 
 
 def test_the_finalizer_leaves_a_recycled_pid_alone():
