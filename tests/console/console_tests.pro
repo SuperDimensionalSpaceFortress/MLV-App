@@ -54,6 +54,7 @@ SOURCES += \
     $$REPO_ROOT/tests/console/test_gpu_window_swap_telemetry.cpp \
     $$REPO_ROOT/tests/console/test_gpu_window_swap_wiring.cpp \
     $$REPO_ROOT/tests/console/test_playback_smoke_foreground_wiring.cpp \
+    $$REPO_ROOT/tests/console/test_playback_smoke_processed8_liveness_wiring.cpp \
     $$REPO_ROOT/tests/console/test_playback_smoke_fullscreen_wiring.cpp \
     $$REPO_ROOT/tests/console/test_gui_smoke_display_select_wiring.cpp \
     $$REPO_ROOT/tests/console/test_display_device_mapping.cpp \

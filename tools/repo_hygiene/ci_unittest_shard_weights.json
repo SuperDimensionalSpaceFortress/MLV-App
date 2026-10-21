@@ -2,6 +2,9 @@
  "schema": 1,
  "seconds": {
   "ubuntu": {
+   "tools.repo_hygiene.test_analyze_frame_telemetry_na.AllNaFieldTests": 0.2,
+   "tools.repo_hygiene.test_analyze_frame_telemetry_na.MixedMeasuredFieldTests": 0.2,
+   "tools.repo_hygiene.test_analyze_frame_telemetry_na.NumericOnlyLogUnchangedTests": 0.1,
    "tools.repo_hygiene.test_attr3_footage_io_inventory.Attr3FootageIoInventoryTests": 7.5,
    "tools.repo_hygiene.test_attr3_footage_presence_job.FootagePresenceJobTests": 0.0,
    "tools.repo_hygiene.test_attr3_footage_presence_job.GetPresentPartIndexesTests": 0.0,
@@ -538,9 +541,18 @@
    "tools.repo_hygiene.test_venue_stage_nightly.VenueStageNightlyTests": 0.0,
    "tools.repo_hygiene.test_venue_stage_nightly.VenueStageReuseModuleTests": 0.0,
    "tools.repo_hygiene.test_verify_consented_footage.VerifyConsentedFootageTests": 0.0,
+   "tools.repo_hygiene.test_wmi_create_hidden_guard.WmiCreateHiddenGuardR2Tests": 2.0,
+   "tools.repo_hygiene.test_wmi_create_hidden_guard.WmiCreateHiddenGuardR4Tests": 2.0,
+   "tools.repo_hygiene.test_wmi_create_hidden_guard.WmiCreateHiddenGuardR5Tests": 2.0,
+   "tools.repo_hygiene.test_wmi_create_hidden_guard.WmiCreateHiddenGuardR6Tests": 2.0,
+   "tools.repo_hygiene.test_wmi_create_hidden_guard.WmiCreateHiddenGuardR7Tests": 2.0,
+   "tools.repo_hygiene.test_wmi_create_hidden_guard.WmiCreateHiddenGuardTests": 2.0,
    "tools.repo_hygiene.test_workflow_pwsh_exit_guard.WorkflowPwshExitGuardTests": 0.0
   },
   "windows": {
+   "tools.repo_hygiene.test_analyze_frame_telemetry_na.AllNaFieldTests": 0.2,
+   "tools.repo_hygiene.test_analyze_frame_telemetry_na.MixedMeasuredFieldTests": 0.2,
+   "tools.repo_hygiene.test_analyze_frame_telemetry_na.NumericOnlyLogUnchangedTests": 0.1,
    "tools.repo_hygiene.test_attr3_footage_io_inventory.Attr3FootageIoInventoryTests": 4.0,
    "tools.repo_hygiene.test_attr3_footage_presence_job.FootagePresenceJobTests": 25.0,
    "tools.repo_hygiene.test_attr3_footage_presence_job.GetPresentPartIndexesTests": 3.6,
@@ -578,7 +590,7 @@
    "tools.repo_hygiene.test_attr_cuda_display_block.TemplateDisplayBlockExecutionTests": 6.4,
    "tools.repo_hygiene.test_attr_cuda_display_block.WindowsDisplayInventoryRealExecutionTests": 0.9,
    "tools.repo_hygiene.test_bachelor_agent_heavy_slot_gate.BachelorAgentHeavySlotGatePins": 0.0,
-   "tools.repo_hygiene.test_bachelor_agent_heavy_slot_gate.BachelorAgentHeavySlotGateUnit": 5.3,
+   "tools.repo_hygiene.test_bachelor_agent_heavy_slot_gate.BachelorAgentHeavySlotGateUnit": 6.2,
    "tools.repo_hygiene.test_batch_header_hygiene.BatchTypesHeaderHygieneTests": 0.0,
    "tools.repo_hygiene.test_batch_no_mainwindow_include.BatchNoMainWindowIncludeTests": 0.0,
    "tools.repo_hygiene.test_brokered_closeout.BrokeredCloseoutTests": 588.8,
@@ -1077,6 +1089,12 @@
    "tools.repo_hygiene.test_venue_stage_nightly.VenueStageNightlyTests": 146.7,
    "tools.repo_hygiene.test_venue_stage_nightly.VenueStageReuseModuleTests": 1.2,
    "tools.repo_hygiene.test_verify_consented_footage.VerifyConsentedFootageTests": 0.0,
+   "tools.repo_hygiene.test_wmi_create_hidden_guard.WmiCreateHiddenGuardR2Tests": 2.0,
+   "tools.repo_hygiene.test_wmi_create_hidden_guard.WmiCreateHiddenGuardR4Tests": 2.0,
+   "tools.repo_hygiene.test_wmi_create_hidden_guard.WmiCreateHiddenGuardR5Tests": 2.0,
+   "tools.repo_hygiene.test_wmi_create_hidden_guard.WmiCreateHiddenGuardR6Tests": 2.0,
+   "tools.repo_hygiene.test_wmi_create_hidden_guard.WmiCreateHiddenGuardR7Tests": 2.0,
+   "tools.repo_hygiene.test_wmi_create_hidden_guard.WmiCreateHiddenGuardTests": 2.0,
    "tools.repo_hygiene.test_workflow_pwsh_exit_guard.WorkflowPwshExitGuardTests": 0.2
   }
  },

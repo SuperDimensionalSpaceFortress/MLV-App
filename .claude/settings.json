@@ -19,6 +19,11 @@
             "type": "command",
             "command": "\"C:/Users/obabalola/AppData/Local/Python/bin/python.exe\" \"${CLAUDE_PROJECT_DIR}/tools/hooks/mlv-never-authorized.py\" --project-dir \"${CLAUDE_PROJECT_DIR}\"",
             "statusMessage": "Never-authorized register gate"
+          },
+          {
+            "type": "command",
+            "command": "\"C:/Users/obabalola/AppData/Local/Python/bin/python.exe\" \"${CLAUDE_PROJECT_DIR}/tools/hooks/wmi-create-hidden-guard.py\"",
+            "statusMessage": "Hidden detached launch guard"
           }
         ]
       }

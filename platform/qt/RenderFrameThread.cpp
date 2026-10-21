@@ -3969,6 +3969,12 @@ void RenderFrameThread::drawFrame( int slotIndex,
      * CPU render entries, all called from the render dispatch below), so this
      * cannot clear a legitimate "ran" from the same frame. */
     llrpResetLastPreDualIsoFixTelemetry();
+    /* PROCESSED8-MS-TELEMETRY-STUCK-1: the processing timers (g_processing_last_*)
+     * are thread-local and only rewritten when this thread runs processing. A frame
+     * that never does (OutputDebayered16, GPU texture no-readback) would otherwise
+     * report the previous processed render's timings. Nothing earlier in this
+     * function runs processing. */
+    processingResetLastTimingTelemetry();
     if( preserveGpuPlaybackReconTextureSnapshot )
     {
         slot.gpuPlaybackReconTextureNoReadbackCandidate = true;
@@ -4956,6 +4962,11 @@ void RenderFrameThread::drawFrame( int slotIndex,
             r16AmazeTextureAvailability.rendererDescription );
     }
 
+    /* PROCESSED8-MS-TELEMETRY-STUCK-1: whether this draw ran the processed8 /
+     * processed16 stage; the g_mlv_last_processed8_* / processed16_* getters are
+     * thread-local and stale otherwise. */
+    bool renderThreadProcessed8StageRan = false;
+    bool renderThreadProcessed16StageRan = false;
     if( skipCpuDebayerForGpuTextureNoReadback )
     {
         slot.usedGpuAmazeDebayer = true;
@@ -4984,6 +4995,7 @@ void RenderFrameThread::drawFrame( int slotIndex,
     }
     else if ( outputMode == OutputProcessed16 && !slot.rawImage16.empty() )
     {
+        renderThreadProcessed16StageRan = true;
         getMlvProcessedFrame16Scaled( m_pMlvObject,
                                       frameNumber,
                                       slot.rawImage16.data(),
@@ -5382,6 +5394,8 @@ void RenderFrameThread::drawFrame( int slotIndex,
     }
     else if( !slot.rawImage8.empty() )
     {
+        // Every path below reaches one getMlvProcessedFrame8* entry.
+        renderThreadProcessed8StageRan = true;
         bool renderedFromPhase3Raw = false;
         bool renderedFromReducedRecon = false;
         bool renderedFromGpuTextureNoReadbackStatePath = false;
@@ -6938,6 +6952,28 @@ void RenderFrameThread::drawFrame( int slotIndex,
                                       processed8CacheHitScale );
     slot.stageTimingTelemetry.insert( QStringLiteral("processed8_prefetch_hit"),
                                       processed8PrefetchHit );
+    // PROCESSED8-MS-TELEMETRY-STUCK-1: a stage this draw did not run reports 0.0 plus
+    // a false *_stage_measured flag, never the previous processed render's carryover
+    // (every getMlvProcessedFrame8* entry resets and rewrites the processed16 timers too).
+    const bool processed8StageMeasured = renderThreadProcessed8StageRan;
+    const bool processed16StageMeasured =
+        renderThreadProcessed8StageRan || renderThreadProcessed16StageRan;
+    slot.stageTimingTelemetry.insert( QStringLiteral("processed8_stage_measured"),
+                                      processed8StageMeasured );
+    slot.stageTimingTelemetry.insert( QStringLiteral("processed16_stage_measured"),
+                                      processed16StageMeasured );
+    if( !processed8StageMeasured )
+    {
+        slot.stageTimingTelemetry.insert( QStringLiteral("processed8_total_ms"), 0.0 );
+        slot.stageTimingTelemetry.insert( QStringLiteral("processed8_cache_store_ms"), 0.0 );
+    }
+    if( !processed16StageMeasured )
+    {
+        slot.stageTimingTelemetry.insert( QStringLiteral("processed16_total_ms"), 0.0 );
+        slot.stageTimingTelemetry.insert( QStringLiteral("processed16_for_8bit_ms"), 0.0 );
+        slot.stageTimingTelemetry.insert( QStringLiteral("processed16_to_8bit_ms"), 0.0 );
+        slot.stageTimingTelemetry.insert( QStringLiteral("processed16_cache_store_ms"), 0.0 );
+    }
     if( skipCpuDebayerForGpuTextureNoReadback )
     {
         // The no-readback GPU AMaZE texture path does not run the CPU debayer, so the

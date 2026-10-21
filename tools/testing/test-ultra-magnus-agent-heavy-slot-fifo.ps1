@@ -153,7 +153,7 @@ function New-MockHolder([string]$Held) {
     return [pscustomobject]@{ ok = $true; id = 'j1.x'; jobId = 'j1'; label = 'mlv j1'; pid = [int]($Held -split ':')[1]; acquiredFile = $acq; releaseFile = "$acq.release"; recordFile = "$acq.holder.json"
         launch = [pscustomobject]@{ Process = [pscustomobject]@{ HasExited = $false; ExitCode = 0 } } }
 }
-function Start-HeavySlotHolder { param([string]$JobId) $script:Mock.starts++; return $script:Mock.holder }
+function Start-HeavySlotHolder { param([string]$JobId, [string]$Label) $script:Mock.starts++; return $script:Mock.holder }
 function Stop-HeavySlotHolder { param($Holder, [string]$Why) $script:Mock.stops += @($Why); $script:Mock.expire = $true }
 function Exit-HeavySlot { $h = $script:HeavySlotHolder; $script:HeavySlotHolder = $null; if ($null -ne $h) { Stop-HeavySlotHolder -Holder $h -Why 'job done' } }
 function Invoke-HeavySlotStatus {
@@ -295,6 +295,65 @@ try {
     $adm = Wait-HeavySlotAdmission -JobId 'j1' -Job ([pscustomobject]@{}) -Metadata $longMeta
     Assert-True ($adm.label -eq 'queue-expired' -and $script:Mock.probes[0] -eq 'holder-lost') "wait: a long job does not take a slot labelled 'mlv j1' as its own: $($adm.label) $($script:Mock.probes -join ',')"
     $unit.longLabel = [ordered]@{ cases = $labelCases; metadata = $metaCases; waitAdmitsOnLongLabel = 'clear'; waitRejectsShortLabel = $script:Mock.probes[0] }
+
+    # 5b. AGENT-HEAVY-SLOT-LABEL-SINGLE-READ-1. The wait resolves the label ONCE, from the metadata the job was queued
+    #     with, and the holder it creates is filed under that same label. Through the REAL Start-HeavySlotHolder (only its
+    #     process, record and path helpers mocked) and the REAL Wait-HeavySlotAdmission, the job's meta.json is rewritten
+    #     after the wait's metadata was read: 600 s then 1200 s with GateLongJobSec 900 must stay 'mlv', and 1200 s
+    #     then 600 s must stay 'mlv-long'. A second read inside the holder start used to file the ticket under the other
+    #     label, which Get-HeavySlotVerdict then reads as holder-lost.
+    $startFn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Start-HeavySlotHolder' }, $true)
+    Assert-True ($null -ne $startFn) "agent defines Start-HeavySlotHolder"
+    $mockStartHolder = ${function:Start-HeavySlotHolder}
+    # The names Start-HeavySlotHolder reads are the agent's own script variables; $HeavySlotScript is also this script's
+    # -HeavySlotScript parameter, so every one is put back after the case.
+    $savedAgentVars = @{}
+    foreach ($n in @('HeavySlotPython', 'HeavySlotScript', 'HeavySlotFeed', 'HeavySlotCount', 'slotHolders', 'logs', 'psExe')) {
+        $savedAgentVars[$n] = Get-Variable -Name $n -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+    }
+    . ([scriptblock]::Create($startFn.Extent.Text))
+    $HeavySlotPython = 'python-mock'
+    $HeavySlotScript = Join-Path $mockDir 'heavy-slot-mock.py'
+    [IO.File]::WriteAllText($HeavySlotScript, '# mock')
+    $HeavySlotFeed = Join-Path $mockDir 'feed-mock.csv'
+    $HeavySlotCount = 2
+    $slotHolders = $mockDir
+    $logs = $mockDir
+    $psExe = 'pwsh-mock'
+    $script:AgentProcessStartUtc = 'unit'
+    function Resolve-HeavySlotPython { return $HeavySlotPython }
+    function New-HeavySlotSentinelCommand { param($AcquiredFile, $ReleaseFile) return 'sentinel-mock' }
+    function Get-ProcessIdentity { param($ProcessId) return $null }
+    function Write-JsonFileAtomic { param($Path, $InputObject) $script:Mock.record = $InputObject; return [pscustomobject]@{ ok = $true } }
+    function Start-WindowlessRedirectedProcess {
+        param($FilePath, $ArgumentList, $OutFile, $ErrFile, $Environment)
+        $script:Mock.launchArgs = @($ArgumentList)
+        $script:Mock.expire = $true     # the next loop turn leaves the wait, so the case is one holder start
+        return [pscustomobject]@{ Process = [pscustomobject]@{ Id = 4242; StartTime = (Get-Date); HasExited = $false; ExitCode = 0 } }
+    }
+    $singleRead = [ordered]@{}
+    foreach ($c in @(
+            @{ k = 'shortThenLong'; queuedSec = 600; laterSec = 1200; want = 'mlv jslr' }
+            @{ k = 'longThenShort'; queuedSec = 1200; laterSec = 600; want = 'mlv-long jslr' })) {
+        Assert-True ((($c.queuedSec -le $GateLongJobSec) -ne ($c.laterSec -le $GateLongJobSec))) "single-read $($c.k): the two timeouts straddle GateLongJobSec ($GateLongJobSec)"
+        Reset-Mock "1:$PID" @('slot 1: free', 'slot 2: free') $false
+        [IO.File]::WriteAllText((Join-Path $inbox 'jslr.meta.json'), ('{{"jobId":"jslr","timeoutSec":{0}}}' -f $c.laterSec))
+        $queuedMeta = [pscustomobject]@{ maxQueueAgeSec = 1; timeoutSec = $c.queuedSec }
+        $adm = Wait-HeavySlotAdmission -JobId 'jslr' -Job ([pscustomobject]@{}) -Metadata $queuedMeta
+        Assert-True ($adm.label -eq 'queue-expired') "single-read $($c.k): the wait ended on the expiry, label $($adm.label)"
+        $argv = @($script:Mock.launchArgs)
+        $at = [array]::IndexOf($argv, '--label')
+        Assert-True ($at -ge 0 -and $at + 1 -lt $argv.Count) "single-read $($c.k): the holder was launched with a --label: [$($argv -join ' ')]"
+        $ticketLabel = [string]$argv[$at + 1]
+        Assert-True ($ticketLabel -ceq $c.want) "single-read $($c.k): the ticket is filed under the label resolved from the metadata the wait read ('$($c.want)'), got '$ticketLabel' (meta.json now says $($c.laterSec) s)"
+        Assert-True ([string]$script:Mock.record.label -ceq $c.want) "single-read $($c.k): the holder record carries the same label: '$($script:Mock.record.label)'"
+        Assert-True (@($script:Mock.probes) -notcontains 'holder-lost') "single-read $($c.k): no probe reads the holder as lost: $($script:Mock.probes -join ',')"
+        $singleRead[$c.k] = $ticketLabel
+    }
+    ${function:Start-HeavySlotHolder} = $mockStartHolder
+    Remove-Item Function:\Resolve-HeavySlotPython, Function:\New-HeavySlotSentinelCommand, Function:\Get-ProcessIdentity, Function:\Write-JsonFileAtomic, Function:\Start-WindowlessRedirectedProcess -ErrorAction SilentlyContinue
+    foreach ($n in $savedAgentVars.Keys) { Set-Variable -Name $n -Scope Script -Value $savedAgentVars[$n] }
+    $unit.singleRead = $singleRead
 
     # 6. The gate-wait heartbeat names the holder it is waiting behind. The prefix stays byte-identical:
     #    um-run.ps1 reads "gate-wait job=<id> state=<s> waited=<n>s" unanchored at the end, and the fifo e2e needs
