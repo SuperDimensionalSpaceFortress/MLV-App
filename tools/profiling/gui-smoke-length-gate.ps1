@@ -184,6 +184,8 @@ function Get-GuiSmokeClipLength {
     $unknown = { param($why) [pscustomobject]@{ known = $false; reason = $why; frames = 0; fps = 0.0; seconds = 0.0 } }
     $first = Read-GuiSmokeMlviHeader -Path $Path
     if (-not $first.ok) { return (& $unknown $first.reason) }
+    # Header validity precedes the block walk (as before the walk existed): a zero-fps header reports bad_fps, not the walk's verdict.
+    if ($first.fpsNom -le 0 -or $first.fpsDenom -le 0) { return (& $unknown 'bad_fps') }
     $clock = [System.Diagnostics.Stopwatch]::StartNew()
     $frames = [int64]0
     if ($first.fileCount -le 1) {
@@ -217,7 +219,6 @@ function Get-GuiSmokeClipLength {
         }
     }
     if ($frames -le 0) { return (& $unknown 'zero_frames') }
-    if ($first.fpsNom -le 0 -or $first.fpsDenom -le 0) { return (& $unknown 'bad_fps') }
     $fps = [double]$first.fpsNom / [double]$first.fpsDenom
     return [pscustomobject]@{ known = $true; reason = ''; frames = $frames; fps = $fps; seconds = ([double]$frames / $fps) }
 }
