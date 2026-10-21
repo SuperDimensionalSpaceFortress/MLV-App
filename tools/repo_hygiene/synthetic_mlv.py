@@ -1,7 +1,9 @@
 """Synthetic MLV files with a REAL 52-byte MLVI file header (PLAYBACK-CLIP-LENGTH-ENFORCE-1).
 
-The clip-length gate (tools/profiling/gui-smoke-length-gate.ps1) reads nothing but that header, so a
-test needs exactly those 52 bytes -- never footage. ``mlv_file_hdr_t`` in src/mlv/mlv.h:
+The clip-length gate (tools/profiling/gui-smoke-length-gate.ps1) reads that header and walks the 16-byte
+block headers behind it (it counts VIDF blocks, as the app does), so a test needs the 52 bytes plus one
+tiny VIDF block per frame -- never footage. A header with no block behind it is a truncated clip the gate
+refuses (``write_header_only_mlv``). ``mlv_file_hdr_t`` in src/mlv/mlv.h:
 
     fileMagic[4] blockSize u32 versionString[8] fileGuid u64 fileNum u16 fileCount u16
     fileFlags u32 videoClass u16 audioClass u16 videoFrameCount u32 audioFrameCount u32
@@ -35,11 +37,12 @@ def mlvi_header(
     file_count: int = 1,
     guid: int = 0x0123456789ABCDEF,
     magic: bytes = b"MLVI",
+    block_size: int = HEADER_BYTES,
 ) -> bytes:
     return struct.pack(
         HEADER_STRUCT,
         magic,
-        HEADER_BYTES,
+        block_size,
         b"v2.0\x00\x00\x00\x00",
         guid,
         file_num,
@@ -54,11 +57,16 @@ def mlvi_header(
     )
 
 
-def write_synthetic_mlv(path: Path, frames: int, **header_kwargs) -> Path:
-    """Write a header-only clip (the gate reads the header and nothing else)."""
+def write_header_only_mlv(path: Path, frames: int, **header_kwargs) -> Path:
+    """A 52-byte MLVI header declaring ``frames`` and NO block behind it: a truncated clip, which the app refuses."""
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(mlvi_header(frames, **header_kwargs))
     return path
+
+
+def write_synthetic_mlv(path: Path, frames: int, **header_kwargs) -> Path:
+    """Write a walkable clip: a header declaring ``frames`` and exactly ``frames`` VIDF blocks behind it."""
+    return write_synthetic_mlv_with_blocks(path, frames, frames, **header_kwargs)
 
 
 BLOCK_HEADER_STRUCT = "<4sIQ"  # mlv_hdr_t: blockType[4] blockSize u32 timestamp u64 == 16 bytes

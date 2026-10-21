@@ -37,6 +37,7 @@ from tools.repo_hygiene.synthetic_mlv import (
     block,
     mlv_bytes_with_random_vidf_payload,
     mlvi_header,
+    write_header_only_mlv,
     write_synthetic_mlv,
     write_synthetic_mlv_with_blocks,
 )
@@ -213,6 +214,41 @@ class ClipLengthGateTests(_TmpCase):
         verdict = _gate(path, 24)
         self.assertEqual(verdict["verdict"], "CLIP_LENGTH_UNKNOWN", verdict)
         self.assertEqual(verdict["message"], "CLIP_LENGTH_UNKNOWN (reason=header_vidf_count_mismatch)")
+
+    # r4 (sol r3 BLOCKER): the count-or-fail-closed rule has no header-only exception. A file cut off right after its
+    # MLVI header holds zero playable VIDF blocks (src/mlv/video_mlv.c rejects zero indexed frames), so the declared
+    # count is never admitted in its place.
+    def test_a_header_only_clip_declaring_720_frames_is_length_unknown_never_ok(self) -> None:
+        path = write_header_only_mlv(self.tmp / ("headeronly" + MLV_EXTENSION), FRAMES_30S_AT_23976)
+        self.assertEqual(path.stat().st_size, 52)
+        verdict = _gate(path, 24)
+        self.assertEqual(verdict["verdict"], "CLIP_LENGTH_UNKNOWN", verdict)
+        self.assertEqual(verdict["message"], "CLIP_LENGTH_UNKNOWN (reason=header_vidf_count_mismatch)")
+
+    def test_an_mlvi_block_that_skips_beyond_eof_is_length_unknown_never_ok(self) -> None:
+        # The MLVI block declares 1 MB in a 52-byte file: the walk skips past EOF having seen no VIDF at all.
+        path = self.tmp / ("oversizedmlvi" + MLV_EXTENSION)
+        path.write_bytes(mlvi_header(FRAMES_30S_AT_23976, block_size=1_000_000))
+        verdict = _gate(path, 24)
+        self.assertEqual(verdict["verdict"], "CLIP_LENGTH_UNKNOWN", verdict)
+        self.assertEqual(verdict["message"], "CLIP_LENGTH_UNKNOWN (reason=header_vidf_count_mismatch)")
+        # ... and with 720 real VIDF blocks behind it: an MLVI block that swallows them is still not a clip.
+        path.write_bytes(mlvi_header(FRAMES_30S_AT_23976, block_size=1_000_000) + b"".join(
+            block(b"VIDF") for _ in range(FRAMES_30S_AT_23976)))
+        verdict = _gate(path, 24)
+        self.assertEqual(verdict["verdict"], "CLIP_LENGTH_UNKNOWN", verdict)
+
+    def test_a_trailing_vidf_block_that_runs_past_eof_fails_closed(self) -> None:
+        # 720 whole VIDF blocks, then one whose declared size reaches past the end of the file.
+        path = write_synthetic_mlv_with_blocks(self.tmp / ("overrun" + MLV_EXTENSION), FRAMES_30S_AT_23976,
+                                               FRAMES_30S_AT_23976, extra=block(b"VIDF", size=1_000_000))
+        verdict = _gate(path, 24)
+        self.assertEqual(verdict["verdict"], "CLIP_LENGTH_UNKNOWN", verdict)
+        self.assertEqual(verdict["message"], "CLIP_LENGTH_UNKNOWN (reason=vidf_count_unverified)")
+
+    def test_a_zero_frame_header_with_no_blocks_is_still_zero_frames(self) -> None:
+        verdict = _gate(write_header_only_mlv(self.tmp / ("emptyheader" + MLV_EXTENSION), 0), 24)
+        self.assertEqual(verdict["message"], "CLIP_LENGTH_UNKNOWN (reason=zero_frames)")
 
     def test_a_block_walk_that_cannot_finish_fails_closed_and_typed(self) -> None:
         # blockSize 8 is below the 16-byte block header: the app refuses such a file (MLV_ERR_INVALID).
