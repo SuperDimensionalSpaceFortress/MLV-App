@@ -44,6 +44,32 @@ def _q(path: Path | str) -> str:
     return "'" + str(path).replace("'", "''") + "'"
 
 
+CLAIM_WAIT_PASS = "PASS"
+CLAIM_WAIT_FAIL = "FAIL"
+CLAIM_WAIT_INCONCLUSIVE = "INCONCLUSIVE"
+
+
+def judge_claim_wait(claim_lo: float, claim_hi: float, verdict_time: float, timeout_sec: float,
+                     slack: float = 0.5) -> str:
+    """Judge the claimed wait from three epoch-second stamps, with no process involved.
+
+    UMRUN-SIBLING-1122-CLAIM-WINDOW-ORACLE-1: pure so the verdict table is covered deterministically
+    (UmRunClaimWaitOracleTests) instead of by whatever the scheduler does to a live client.
+
+    FAIL: the verdict came before even the earliest possible claim (claim_lo) plus the budget: a
+    correct client cannot do that. PASS: the verdict is also a full budget after the LATEST possible
+    claim (claim_hi), so the wait was served whatever happened inside the claim window. Between the
+    two the stamps cannot say where the time went: a client that stalled ~8 s inside the window
+    (before or after assigning claimedAt) and a healthy one look alike, so the outcome is
+    INCONCLUSIVE, never a FAIL and never a PASS. The window is microseconds on a healthy host, so
+    this almost never triggers; it only stops a stalled run from vouching for a wrong anchor."""
+    if verdict_time - claim_lo < timeout_sec - slack:
+        return CLAIM_WAIT_FAIL
+    if verdict_time - claim_hi < timeout_sec - slack:
+        return CLAIM_WAIT_INCONCLUSIVE
+    return CLAIM_WAIT_PASS
+
+
 @unittest.skipIf(PWSH is None, "pwsh is not on PATH")
 @unittest.skipUnless(os.name == "nt", "um-run.ps1 targets Windows agent shares")
 class _Share(unittest.TestCase):
@@ -1368,8 +1394,9 @@ class UmRunEndToEndTests(_Share):
         # stamp to claim_lo: no waiting by the client, only scheduling), in_wait the time inside it
         # measured from claim_lo (so it can only over-state the wait, toward the client),
         # claim_gap the claim_lo -> claim_hi spread (scheduling between the two samples, recorded,
-        # not judged), sched_gap the claim_lo -> poll-2 gap (a scheduling delay between the claim
-        # and the first poll, which a correct client may have and which is recorded, not judged),
+        # not judged), lo_to_first_poll the claim_lo -> poll-2 gap (the first poll after the claim; it
+        # includes the claim window itself and so the time before the claim, a scheduling delay
+        # a correct client may have, recorded and not judged on its own),
         # tail the time from the last poll to the verdict, max_tick_gap the longest pause between
         # two polls (a stall inside the wait shows as a gap far above the 1 s poll interval). A
         # stall in pre_wait pushes decided_after over the bound for a client that decided at once;
@@ -1386,11 +1413,11 @@ class UmRunEndToEndTests(_Share):
         if claim_lo is not None:
             wait_ticks = [at for number, at in all_ticks if number >= 2]
             gaps = [later - earlier for earlier, later in zip(wait_ticks, wait_ticks[1:])]
-            sched_gap = f"{tick2_at - claim_lo:.3f}s" if tick2_at is not None else "none"
+            lo_to_first_poll = f"{tick2_at - claim_lo:.3f}s" if tick2_at is not None else "none"
             locus_facts = (
                 f" claim_lo={claim_lo:.3f} claim_hi={claim_hi:.3f} claim_gap={claim_hi - claim_lo:.3f}s"
                 f" pre_wait={claim_lo - marker_placed_at:.3f}s"
-                f" in_wait={verdict_time - claim_lo:.3f}s sched_gap={sched_gap}"
+                f" in_wait={verdict_time - claim_lo:.3f}s lo_to_first_poll={lo_to_first_poll}"
                 f" tail={verdict_time - (wait_ticks[-1] if wait_ticks else claim_lo):.3f}s"
                 f" polls_in_wait={len(wait_ticks)} max_tick_gap={max(gaps, default=0.0):.3f}s")
         timing_facts = (
@@ -1415,10 +1442,19 @@ class UmRunEndToEndTests(_Share):
         # BEFORE the client sets $claimedAt, never from poll 2 and never from the later claim_hi
         # sample: a correct client throws once Now >= claimedAt + timeout_sec, and claimedAt >=
         # claim_lo, so verdict - claim_lo can only be LONGER than the wait the client really did;
-        # a scheduling delay between the claim and either poll 2 (sched_gap) or the hook's later
+        # a scheduling delay between the claim and either poll 2 (lo_to_first_poll) or the hook's later
         # sample (claim_gap) cannot fail a correct client (r2 sol r1 BLOCKER; r3 sol r2 BLOCKER).
         # A stall that precedes claim_lo is still caught. Same 0.5 s slack as above (stamp
         # truncation and system-clock adjustment only); the bound is not looser than the one above.
+        #
+        # UMRUN-SIBLING-1122-CLAIM-WINDOW-ORACLE-1: that bound cannot see a stall INSIDE the claim
+        # window (claim_lo to the assignment), where an hour-back client pausing ~8 s still decides
+        # >= timeout_sec - 0.5 after claim_lo. So a pass that rests on time inside the window is not
+        # reported as a pass: judge_claim_wait() returns INCONCLUSIVE when the verdict is not also a
+        # full budget after claim_hi, and the test skips at the very end (after every other check
+        # below has run) rather than vouching for a client it could not tell from a broken one.
+        # The FAIL branch above is unchanged and no wall-clock ceiling is added; claim_gap stays a
+        # diagnostic. The verdict table is covered by UmRunClaimWaitOracleTests.
         self.assertIsNotNone(claim_lo, f"no claim bracket, so the wait locus is unknown [{timing_facts}]")
         self.assertGreaterEqual(
             verdict_time - claim_lo, timeout_sec - 0.5,
@@ -1437,6 +1473,11 @@ class UmRunEndToEndTests(_Share):
         self.assertIn("UNRESOLVED:", combined, combined)
         self.assertIn("stopped proving liveness", combined, combined)
         self.assertIn("its own started marker is gone too", combined, combined)
+        if judge_claim_wait(claim_lo, claim_hi, verdict_time, timeout_sec) == CLAIM_WAIT_INCONCLUSIVE:
+            self.skipTest(
+                "INCONCLUSIVE: the claim window (claim_lo -> claim_hi) was wide enough that a stall "
+                "inside it cannot be told from an hour-back client; every other check passed "
+                f"[{timing_facts}]")
 
     # ---- round 11 (sol BLOCKER, item 2): RETRACT at the queue deadline instead of leaving the job
     # ---- in the inbox for the agent to claim after this client has already given up ------------
@@ -2129,6 +2170,52 @@ class UmRunDeadlineTypeTests(unittest.TestCase):
                 f"a wait-loop deadline root assignment constructs {type_name}, not DateTimeOffset "
                 f"-- reintroducing the Kind-ambiguity a prior round had to remove: {result}",
             )
+
+
+class UmRunClaimWaitOracleTests(unittest.TestCase):
+    """UMRUN-SIBLING-1122-CLAIM-WINDOW-ORACLE-1 (Dot e3cb59d2 on #531 50a17a9c, hub ACK 6294165342).
+
+    The client sets `$claimedAt` at an instant the test cannot see, only bracket: claim_lo is stamped
+    just before it, claim_hi just after. An hour-back client that stalls ~8 s inside that window
+    reaches its poll-2 verdict ~8 s after claim_lo, so `verdict - claim_lo` alone cannot tell it from a
+    healthy client. These cases drive the verdict table with synthetic stamps (T = 8 s budget), so
+    the claim does not depend on what a live scheduler happens to do, and none of them adds a
+    wall-clock ceiling: a stamp pattern that cannot separate the two is INCONCLUSIVE, never FAIL."""
+
+    T = 8
+
+    def judge(self, claim_lo: float, claim_hi: float, verdict_time: float) -> str:
+        return judge_claim_wait(claim_lo, claim_hi, verdict_time, self.T)
+
+    def test_a_healthy_client_with_a_tight_claim_bracket_passes(self) -> None:
+        self.assertEqual(self.judge(0.0, 0.005, 8.2), CLAIM_WAIT_PASS)
+
+    def test_an_hour_back_client_that_decides_at_once_fails(self) -> None:
+        self.assertEqual(self.judge(0.0, 0.005, 1.1), CLAIM_WAIT_FAIL)
+
+    def test_an_hour_back_client_stalled_inside_the_claim_window_is_not_reported_as_a_pass(self) -> None:
+        # Dot's masking case: claim_lo stamped, the client stalls 8 s, assigns an hour-back claimedAt,
+        # claim_hi is stamped ~8 s after claim_lo, poll 2 decides ~1 s later. verdict - claim_lo
+        # = 9.0 s clears the bound, yet no wait happened inside the claimed wait.
+        self.assertEqual(self.judge(0.0, 8.0, 9.0), CLAIM_WAIT_INCONCLUSIVE)
+
+    def test_a_healthy_client_stalled_after_assigning_claimed_at_is_inconclusive_not_failed(self) -> None:
+        # The same stamps an hour-back client produces: claimedAt assigned at once, then an 8 s stall
+        # before claim_hi. It decides at claimedAt + T, ~8.1 s after claim_lo. Stamps alone cannot
+        # separate it from the case above, so neither may be judged either way.
+        self.assertEqual(self.judge(0.0, 8.0, 8.1), CLAIM_WAIT_INCONCLUSIVE)
+
+    def test_a_healthy_client_stalled_before_assigning_claimed_at_passes(self) -> None:
+        # Stall inside the window, THEN a correct assignment: the budget is spent after claim_hi.
+        self.assertEqual(self.judge(0.0, 8.0, 16.1), CLAIM_WAIT_PASS)
+
+    def test_the_conclusive_bound_uses_the_same_half_second_slack_as_the_other_bounds(self) -> None:
+        self.assertEqual(self.judge(0.0, 0.4, 8.0), CLAIM_WAIT_PASS)
+        self.assertEqual(self.judge(0.0, 0.6, 8.0), CLAIM_WAIT_INCONCLUSIVE)
+
+    def test_a_verdict_inside_the_budget_fails_whatever_the_bracket_width(self) -> None:
+        self.assertEqual(self.judge(0.0, 8.0, 7.0), CLAIM_WAIT_FAIL)
+        self.assertEqual(self.judge(0.0, 0.005, 7.0), CLAIM_WAIT_FAIL)
 
 
 def _git(args: list[str], cwd: Path) -> None:
