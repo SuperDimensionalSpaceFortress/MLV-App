@@ -23,8 +23,11 @@
 #include "../../tools/gpu/backend/igpu_cuda_error_slot.h"
 
 #include <QByteArray>
+#include <QDateTime>
 #include <QDir>
 #include <QFile>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QTemporaryDir>
 
 #include <atomic>
@@ -84,7 +87,7 @@ struct SinkCall
 std::vector<SinkCall> g_calls;
 
 void recordingSink(const char * stage, int rc, double ms, int cudaCode, const char * cudaName, const char * site,
-                   const char * role, unsigned long long dropped)
+                   const char * role, unsigned long long dropped, double /*notedUtcMs*/)
 {
     g_calls.push_back({stage ? stage : "", rc, ms, cudaCode, cudaName ? cudaName : "", site ? site : "",
                        role ? role : "", dropped});
@@ -176,7 +179,7 @@ void drainSlot()
 std::vector<SinkCall> g_amazeCalls;
 
 void amazeRecordingSink(const char * stage, int rc, double ms, int cudaCode, const char * cudaName,
-                        const char * site, const char * role, unsigned long long dropped)
+                        const char * site, const char * role, unsigned long long dropped, double /*notedUtcMs*/)
 {
     g_amazeCalls.push_back({stage ? stage : "", rc, ms, cudaCode, cudaName ? cudaName : "", site ? site : "",
                             role ? role : "", dropped});
@@ -1555,5 +1558,50 @@ TEST(GpuFieldTelemetryCapture, GlCopyNotesEveryEvaluatedCleanupCodeAtItsOwnSite)
         ASSERT_EQ(-1, cuda_slot::note_evaluated(allOk, amazeCopy ? 3 : 2, &fakeCudaErrorName));
         ASSERT_EQ(0, g_nameLookups);
         ASSERT_EQ(0L, (long)*cuda_slot::pending_word(kRender));
+    }
+}
+
+// GPU-FIELD-TELEMETRY-FAULT-UTC-STAMP-1 (CoS pr-409 / pr-435): a code drained long after the DLL
+// noted it is written with the time it was noted (igpu_cuda_error_t.utc_ms), not the time it was
+// drained, so it is correlated against the right System-log interval. Two late paths: a recon code
+// drained as an orphan at the next captured call's entry, and an AMaZE code drained by session end's
+// terminal drain, each kLateMs after its note. fault_delivered_utc_ms keeps the drain time. On
+// 73853131 recordFault stamped fault_utc_ms with the drain time on both.
+TEST(GpuFieldTelemetryCapture, LateDrainedFaultKeepsTheTimeTheDllNotedIt)
+{
+    constexpr int kLateMs = 300;
+    constexpr double kSlackMs = 20.0; // QDateTime is whole ms; the notes are stamped in between
+    QTemporaryDir dir;
+    ASSERT_TRUE(dir.isValid());
+    const AmazeSinkScope amaze;
+    double notedFrom = 0.0, notedTo = 0.0, drainedFrom = 0.0;
+    {
+        const FakeGpuBackendScope fake;
+        int rc = -99;
+        ASSERT_NE(0, runOnce(1, &rc));
+        GpuFieldTelemetry::appCloseForTesting(dir.path(), [&]() {
+            notedFrom = (double)QDateTime::currentMSecsSinceEpoch();
+            llrpFakeGpuBackendNoteCudaErrorForTesting(kRender, 719, "cudaErrorLaunchFailure", "gl_copy:late");
+            cuda_slot::note(709, "cudaErrorContextIsDestroyed", "gl_cache:late");
+            notedTo = (double)QDateTime::currentMSecsSinceEpoch();
+            std::this_thread::sleep_for(std::chrono::milliseconds(kLateMs));
+            drainedFrom = (double)QDateTime::currentMSecsSinceEpoch();
+            int next = -99;
+            runOnce(2, &next); // its entry drains the recon code as an orphan; session end drains AMaZE's
+        }, nullptr);
+    }
+    const std::vector<std::string> lines = logLines(dir);
+    for (const char * site : {"\"site\":\"gl_copy:late\"", "\"site\":\"gl_cache:late\""})
+    {
+        const std::vector<int> at = linesWith(lines, {"\"kind\":\"fault\"", site});
+        ASSERT_EQ(1, (int)at.size());
+        const QJsonObject o = QJsonDocument::fromJson(QByteArray::fromStdString(lines[at[0]])).object();
+        ASSERT_EQ(std::string("orphan"), o.value(QStringLiteral("role")).toString().toStdString());
+        const double faultUtcMs = o.value(QStringLiteral("fault_utc_ms")).toDouble();
+        ASSERT_TRUE(faultUtcMs >= notedFrom - kSlackMs);
+        ASSERT_TRUE(faultUtcMs <= notedTo + kSlackMs);
+        const double deliveredUtcMs = o.value(QStringLiteral("fault_delivered_utc_ms")).toDouble();
+        ASSERT_TRUE(deliveredUtcMs >= drainedFrom - kSlackMs);
+        ASSERT_TRUE(deliveredUtcMs - faultUtcMs >= kLateMs - kSlackMs);
     }
 }

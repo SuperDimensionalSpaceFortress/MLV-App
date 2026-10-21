@@ -15,6 +15,7 @@
 #include "../../src/batch/ReceiptApplier.h"
 #include "DualIsoLevelSyncPolicy.h"
 #include "PlaybackFpsMeterPolicy.h"
+#include "PlaybackScaleLabel.h"
 #include "AutomationSettings.h"
 #include "PlaybackEnvFlags.h"
 #include "PlaybackFrameRange.h"
@@ -243,6 +244,33 @@ static bool mlvappPlaybackAudioSyncLegacyRequested()
 static bool mlvappPlaybackRoutePrewarmDisabled()
 {
     static const bool disabled = !playbackEnvSwitch( "MLVAPP_PLAYBACK_ROUTE_PREWARM", true );
+    return disabled;
+}
+
+// PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-SETUP-1 Row B switch, read once: MLVAPP_PLAYBACK_RECON_BACKEND_PRELOAD=0 leaves
+// the recon backend DLL load + create to the first Play frame's render thread again. Default on; the route prewarm's
+// own switch still turns everything off.
+static bool mlvappPlaybackReconBackendPreloadDisabled()
+{
+    static const bool disabled = !playbackEnvSwitch( "MLVAPP_PLAYBACK_RECON_BACKEND_PRELOAD", true );
+    return disabled;
+}
+
+// PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1 Row W switch, read once: MLVAPP_PLAYBACK_RECON_WARM_RUN=0 leaves the first
+// GPU recon run (set_clip, set_luts, first-run allocations) to Play frame 0 again. Default on; the route prewarm's own
+// switch still turns everything off.
+static bool mlvappPlaybackReconWarmRunDisabled()
+{
+    static const bool disabled = !playbackEnvSwitch( "MLVAPP_PLAYBACK_RECON_WARM_RUN", true );
+    return disabled;
+}
+
+// PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row K switch, read once: the Play-start GPU clock kick
+// (PlaybackGpuClockKickPolicy.h). Default off; MLVAPP_PLAYBACK_GPU_CLOCK_KICK=1 opts in (HUB RULING
+// 2026-10-18T06:16:26Z item (1), applied by PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1 R0).
+static bool mlvappPlaybackGpuClockKickDisabled()
+{
+    static const bool disabled = !playbackEnvSwitch( "MLVAPP_PLAYBACK_GPU_CLOCK_KICK", false );
     return disabled;
 }
 
@@ -1575,6 +1603,7 @@ static bool lookAssistProcessedFloorLiftedPostInvalidShouldFailClosed(
 #include "GpuDisplayViewport.h"
 #include "GpuDisplayWindow.h"
 #include "GpuFieldTelemetry.h"
+#include "GpuDeviceLossBreaker.h"
 #include "MainWindowGpuPreviewPolicy.h"
 #include "PlaybackQualityPolicy.h"
 #include "PlaybackScaling.h"
@@ -2088,6 +2117,8 @@ static bool playback_recon_texture_present_requested_by_environment()
 
 static bool playback_recon_requested_by_environment()
 {
+    // GPU-DEVICE-LOSS-SELF-HEAL-1: no CUDA recon after a device loss or on a safe start.
+    if( llrpGpuCudaSuppressed() ) return false;
     const QString value =
         qEnvironmentVariable("MLVAPP_GPU_PLAYBACK_RECON").trimmed();
     return !value.isEmpty()
@@ -2374,6 +2405,8 @@ MainWindow::MainWindow(int &argc, char **argv, QWidget *parent) :
     m_pRenderThread = new RenderFrameThread();
     m_pRenderThread->start();
     connect( m_pRenderThread, SIGNAL(frameReady()), this, SLOT(drawFrameReady()) );
+    // PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1 Row W: emitted on this (GUI) thread, posted by the recon worker
+    connect( m_pRenderThread, &RenderFrameThread::playbackReconWarmDone, this, &MainWindow::onPlaybackReconWarmDone );
     while( !m_pRenderThread->isRunning() ) {}
 
     // Playback-prep worker handles heavy image work on a background thread and
@@ -2406,6 +2439,24 @@ MainWindow::MainWindow(int &argc, char **argv, QWidget *parent) :
     initLib();
     // PLAYBACK-CUDA-HONOUR-SCALE-1 r2: set_clip/set_luts events reach the log.
     llrpSetGpuReconEventLogger( gpuPresentEventLogReconLine );
+    // GPU-DEVICE-LOSS-SELF-HEAL-1: the non-modal device-loss notice (a queued startup notice shows now) and the
+    // refresh that moves the next frame onto the CPU route without a clip reload.
+    GpuDeviceLossBreaker::setNoticeSink( [this]( const QString &text )
+    {
+        if( text.isEmpty() )
+        {
+            statusBar()->clearMessage();
+            return;
+        }
+        statusBar()->showMessage( text, 0 );
+        qInfo().noquote() << "gpu_device_loss_notice:" << text;
+    } );
+    GpuDeviceLossBreaker::setRefreshCallback( [this]()
+    {
+        // PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row K: a device loss ends a kick still held (no CUDA call)
+        endPlaybackGpuClockKick( "device_loss" );
+        requestFrameRefresh( true, "gpu-device-loss-cpu-route" );
+    } );
 
     resetSliders();
 
@@ -3926,6 +3977,8 @@ void MainWindow::freeActiveMlvObjectAfterLifecycleBarrier( const char *reason )
     waitForRenderThreadIdleBeforeCoreMutation( barrierReason );
     drainLookAssistWorkers( barrierReason );
     m_clipLifecycleBarrier.waitForNoBorrowers();
+    // PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1 r3 (U-02): the barrier above does not count a queued recon warm
+    if( m_pRenderThread ) m_pRenderThread->detachClipBeforeFree();
 
     logInteractionEvent(
         QStringLiteral("clip_lifecycle.free"),
@@ -5426,6 +5479,28 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
             readyFrame.stageTimingTelemetry.insert(
                 QStringLiteral("gpu_playback_recon_texture_present_setup_lut_miss"),
                 QString::fromLatin1( st.lut_miss ? st.lut_miss : "none" ) );
+            // PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-SETUP-1 Row 0: the window's slot outcome and AMaZE-only parts
+            readyFrame.stageTimingTelemetry.insert(
+                QStringLiteral("gpu_playback_recon_texture_present_slot"),
+                QString::fromLatin1( st.slot ? st.slot : "none" ) );
+            readyFrame.stageTimingTelemetry.insert(
+                QStringLiteral("gpu_playback_recon_texture_present_amaze_kernel_ms"), st.amaze_kernel_ms );
+            readyFrame.stageTimingTelemetry.insert(
+                QStringLiteral("gpu_playback_recon_texture_present_amaze_download_ms"), st.amaze_download_ms );
+            // PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1 R3: did this call keep the paused warm's output
+            readyFrame.stageTimingTelemetry.insert(
+                QStringLiteral("gpu_playback_recon_texture_present_warm_output_reuse"),
+                QString::fromLatin1( st.warm_output_reuse ? st.warm_output_reuse : "none" ) );
+            readyFrame.stageTimingTelemetry.insert(
+                QStringLiteral("gpu_playback_recon_texture_present_reuse_reason"),
+                QString::fromLatin1( st.reuse_reason ? st.reuse_reason : "none" ) );
+            readyFrame.stageTimingTelemetry.insert(
+                QStringLiteral("gpu_playback_recon_texture_present_reuse_compare_ms"), st.reuse_compare_ms );
+            readyFrame.stageTimingTelemetry.insert(
+                QStringLiteral("gpu_playback_recon_texture_present_reuse_verify_ran"), st.reuse_verify_ran );
+            // PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1 F-key: both recon states on a state or content miss
+            readyFrame.stageTimingTelemetry.insert(
+                QStringLiteral("gpu_playback_recon_texture_present_reuse_states"), st.reuse_states );
         }
         readyFrame.stageTimingTelemetry.insert(
             QStringLiteral("gpu_playback_recon_texture_present_recon_wall_ms"),
@@ -6450,7 +6525,8 @@ void MainWindow::drawFrame( bool updateTimecodeLabel )
         GpuDisplayViewport::isInstalledOn( ui->graphicsView );
     renderPolicy.gpuPreviewProcessingBackendRequest = m_gpuPreviewProcessingBackendRequest;
     renderPolicy.gpuPreviewProcessingEnvironmentRequested =
-        gpuPreviewProcessingRequestedByEnvironment();
+        mainWindowGpuPreviewProcessingRequestedForSession(
+            gpuPreviewProcessingRequestedByEnvironment(), llrpGpuCudaSuppressed() != 0 );
     renderPolicy.gpuPreviewProcessingCompatible = gpuPreviewProcessingIsSupported( m_pProcessingObject );
     // PLAYBACK-SEEK-RENDER-PARITY-1: the texture-present routes draw through the live
     // display shader, which applies the full per-pixel chain but not these stages.
@@ -6466,7 +6542,7 @@ void MainWindow::drawFrame( bool updateTimecodeLabel )
         m_pMlvObject && doesMlvAlwaysUseAmaze( m_pMlvObject ) == 0;
     renderPolicy.gpuAmazeDebayerBackendRequest = m_gpuAmazeDebayerBackendRequest;
     renderPolicy.gpuAmazeDebayerEnvironmentRequested =
-        gpuAmazeDebayerRequestedByEnvironment();
+        gpuAmazeDebayerRequestedByEnvironment() && !llrpGpuCudaSuppressed();
     renderPolicy.gpuAmazeTexturePresentationEnvironmentRequested =
         gpuAmazeTexturePresentRequestedByEnvironment();
     renderPolicy.gpuPlaybackReconEnvironmentRequested =
@@ -6719,7 +6795,7 @@ void MainWindow::drawFrame( bool updateTimecodeLabel )
             !displayShaderRefusedStages.isEmpty()
                 ? gpuPreviewProcessingDisplayShaderRefusalReason( displayShaderRefusedStages )
                   + QStringLiteral(": the live display shader does not apply these stages, so GPU playback recon texture-present is refused and playback stays on a route that applies them")
-                : QStringLiteral("GPU playback recon texture-present requires an experimental GL presentation surface, GPU preview processing support, scopes hidden, MLVAPP_GPU_PLAYBACK_RECON=1, Decode/Reconstruct/Process playback mode, x1 scale, and caching off");
+                : QStringLiteral("GPU playback recon texture-present requires an experimental GL presentation surface, GPU preview processing support, scopes hidden, MLVAPP_GPU_PLAYBACK_RECON=1, Decode/Reconstruct/Process playback mode, Full res (1x) playback, and caching off");
     }
     requestContext.renderThreadUsingCpuPreviewProcessing = m_renderThreadUsingCpuPreviewProcessing;
     requestContext.renderThreadUsingPlaybackPreviewProcessing =
@@ -7869,10 +7945,10 @@ int MainWindow::runHeadlessPlaybackProfile(const PlaybackProfileOptions & option
             // Round 2 (hub ruling): the settle also HOLDS Play for the full 20 s floor before it stops it
             // (it used to stop at a 12 s deadline or as soon as the diagnostics settled), and requests that
             // 20 s window, so no settle Play is shorter than the floor. A refusal happens before Play; the
-            // caller returns the typed exit code.
+            // caller returns the typed exit code. HFR-10S-1: the floor is the clip's own (10 s for an HFR clip).
             forceLoopOffForAutomation( "profile-look-assist-settle" );
             if( !programmaticPlay( "profile-look-assist-settle",
-                                   playback_frame_range::kMinPlayWindowSeconds ) )
+                                   playGateMinPlayWindowSeconds() ) )
             {
                 lookAssistSettleSmokeStable = false;
                 lookAssistSettleSmokeFailure = m_lastPlayGateRefusalMessage;
@@ -8242,10 +8318,11 @@ int MainWindow::runHeadlessPlaybackProfile(const PlaybackProfileOptions & option
         // launch is gated HERE, in the app: the window from the current position (the start frame, set
         // above) to the cut-out must be >= 20 s, else Play is never triggered (typed exit 14, zero frames).
         // Round 2 (hub ruling): the exercise requests the 20 s floor and HOLDS Play for all of it -- it used to
-        // stop at the first advancing frame or a 5 s timeout, a Play of well under 20 s.
+        // stop at the first advancing frame or a 5 s timeout, a Play of well under 20 s. HFR-10S-1: the floor is the
+        // clip's own (10 s for an HFR clip).
         forceLoopOffForAutomation( "profile-exercise-play-action" );
         const bool playActionAdmitted = programmaticPlay( "profile-exercise-play-action",
-                                                          playback_frame_range::kMinPlayWindowSeconds );
+                                                          playGateMinPlayWindowSeconds() );
         playActionGateRefused = !playActionAdmitted;
         playActionSmokeStarted = playActionAdmitted && ui->actionPlay->isChecked();
         qApp->processEvents( QEventLoop::AllEvents );
@@ -8828,9 +8905,21 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         return 0;
     }
 
+    // PLAYBACK-CLIP-LENGTH-HFR-10S-1: main.cpp refuses at parse only what no clip could admit (the lowest floor);
+    // now the clip is open, --seconds (the play window) must reach THIS clip's floor (minPlayWindowSeconds of its
+    // native fps: 10 s for an HFR clip, 20 s otherwise or unknown). Refused before anything plays.
+    if( options.durationMs + 1e-6 < playGateMinPlayWindowSeconds() * 1000.0 )
+    {
+        ++m_programmaticPlayLedger.refused;
+        m_programmaticPlayLedger.lastRefusalReason = "PLAY_DURATION_TOO_SHORT";
+        err << "[GUI-SMOKE] ERROR: PLAY_DURATION_TOO_SHORT (--seconds=" << options.durationMs / 1000.0
+            << " window=" << playGateMinPlayWindowSeconds() << ")\n";
+        return 14;
+    }
     // PLAYBACK-CLIP-LENGTH-ENFORCE-1 round 2 (owner rule 2026-09-30): the app's own length gate, for a
     // launch that bypassed tools/profiling/run-release-gui-smoke.ps1 (a direct exe launch). The clip must
-    // be at least 20 s and must outlast the play window measured from --start-frame; path-free message.
+    // be at least its floor (HFR-10S-1: 10 s for an HFR clip, else 20 s) and must outlast the play window
+    // measured from --start-frame; path-free message.
     {
         const int guardFrames = static_cast<int>( getMlvFrames( m_pMlvObject ) );
         const double guardFps = static_cast<double>( getMlvFramerate( m_pMlvObject ) );
@@ -8840,8 +8929,9 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         const double guardRemainingSeconds = guardFps > 0.0
             ? guardClipSeconds - qMax( 0, options.startFrame ) / guardFps
             : 0.0;
-        const double guardRequiredSeconds = qMax( 20.0, guardWindowSeconds );
-        if( guardClipSeconds < 20.0 || guardRemainingSeconds < guardWindowSeconds )
+        const double guardFloorSeconds = playback_frame_range::minPlayWindowSeconds( guardFps );
+        const double guardRequiredSeconds = qMax( guardFloorSeconds, guardWindowSeconds );
+        if( guardClipSeconds < guardFloorSeconds || guardRemainingSeconds < guardWindowSeconds )
         {
             err << "[GUI-SMOKE] ERROR: CLIP_TOO_SHORT (clip="
                 << QString::number( guardRemainingSeconds < guardClipSeconds
@@ -8851,19 +8941,20 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         }
     }
     // ENFORCE-2 round 2 (sol B2): the lifecycle-stress leg STOPS the first clip's Play at the switch (the second
-    // clip is opened, seeked and closed but never played), so the switch may only happen after the 20 s floor.
-    // Also refused in main.cpp at parse time; refused here for any other way of building the options.
+    // clip is opened, seeked and closed but never played), so the switch may only happen after the clip's floor
+    // (HFR-10S-1: 10 s for an HFR clip, else 20 s). main.cpp refuses at parse what no clip could admit; the
+    // clip's own floor is applied here, for any way of building the options.
     if( options.exerciseClipLifecycleStress
-     && !playback_frame_range::stressSwitchReachesFloor( options.stressSwitchAtMs ) )
+     && !playback_frame_range::stressSwitchReachesFloor( options.stressSwitchAtMs, playGateMinPlayWindowSeconds() ) )
     {
         ++m_programmaticPlayLedger.refused;
         m_programmaticPlayLedger.lastRefusalReason = "PLAY_DURATION_TOO_SHORT";
         err << "[GUI-SMOKE] ERROR: PLAY_DURATION_TOO_SHORT (stress-switch-at-ms=" << options.stressSwitchAtMs
-            << " window=" << playback_frame_range::kMinPlayWindowMs << ")\n";
+            << " window=" << playback_frame_range::minPlayWindowMs( playGateNativeFps() ) << ")\n";
         return 14;
     }
     // The lifecycle-stress leg switches to a SECOND clip mid-play: read its MLVI
-    // header (mlv_file_hdr_t: frame count @36, fps nom/denom @44/@48) and apply the 20 s floor. A spanned
+    // header (mlv_file_hdr_t: frame count @36, fps nom/denom @44/@48) and apply its own floor. A spanned
     // or unreadable header is refused fail-closed (the runner sums spanned sets; a direct launch need not).
     if( options.exerciseClipLifecycleStress
      && QFileInfo( options.stressSwitchInputPath ).absoluteFilePath()
@@ -8881,7 +8972,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         const double stressFps = stressHeaderOk && u32( 48 ) > 0
             ? u32( 44 ) / static_cast<double>( u32( 48 ) ) : 0.0;
         const double stressSeconds = stressFps > 0.0 ? u32( 36 ) / stressFps : 0.0;
-        if( !stressHeaderOk || u16( 26 ) > 1 || stressSeconds < 20.0 )
+        if( !stressHeaderOk || u16( 26 ) > 1 || stressSeconds < playback_frame_range::minPlayWindowSeconds( stressFps ) )
         {
             err << "[GUI-SMOKE] ERROR: "
                 << ( stressHeaderOk && u16( 26 ) <= 1 ? "CLIP_TOO_SHORT" : "CLIP_LENGTH_UNKNOWN" )
@@ -11127,6 +11218,8 @@ int MainWindow::openMlv( QString fileName )
     }
     // GPU-FIELD-TELEMETRY-1: clip identity for the field log (cold; only the basename's hash is kept).
     if ( GpuFieldTelemetry::enabled() ) GpuFieldTelemetry::noteClip( (int)getMlvWidth( m_pMlvObject ), (int)getMlvHeight( m_pMlvObject ), (int)getMlvBitdepth( m_pMlvObject ), isMlvCompressed( m_pMlvObject ) != 0, llrpGetDualIsoValidity( m_pMlvObject ) == DISO_VALID && qEnvironmentVariableIntValue( "MLVAPP_GPU_PLAYBACK_RECON" ) != 0, QFileInfo( fileName ).fileName() );
+    // GPU-DEVICE-LOSS-SELF-HEAL-1: the clip half of the breaker's profile key.
+    GpuDeviceLossBreaker::noteClipOpened( (int)getMlvWidth( m_pMlvObject ), (int)getMlvHeight( m_pMlvObject ), (int)getMlvBitdepth( m_pMlvObject ), isMlvCompressed( m_pMlvObject ) != 0 );
 
     QString audioText;
     if( doesMlvHaveAudio( m_pMlvObject ) )
@@ -11584,7 +11677,7 @@ void MainWindow::showPerformanceProfilingDialog( void )
     cudaPlaybackPreset->setChecked(
         CrashForensics::cudaPlaybackProfilingSettingsEnabled() );
     cudaPlaybackPreset->setToolTip(
-        tr( "Requests the scoped GPU Tex NR telemetry path: GL viewport, GPU preview processing, CUDA playback reconstruction, texture presentation, Phase 3 HQ, and x1 scale." ) );
+        tr( "Requests the scoped GPU Tex NR telemetry path: GL viewport, GPU preview processing, CUDA playback reconstruction, texture presentation, Phase 3 HQ, and Full res (1x) playback." ) );
     presetLayout->addWidget( cudaPlaybackPreset );
 
     QCheckBox * dngAsyncPreset =
@@ -11635,6 +11728,8 @@ void MainWindow::showPerformanceProfilingDialog( void )
     const bool cudaEnabled = cudaPlaybackPreset->isChecked();
     CrashForensics::setCudaPlaybackProfilingSettingsEnabled( cudaEnabled );
     CrashForensics::applyCudaPlaybackProfilingEnvironment( cudaEnabled );
+    // GPU-DEVICE-LOSS-SELF-HEAL-1: turning the preset on is the user's "try the GPU again".
+    if( cudaEnabled ) GpuDeviceLossBreaker::userReenableGpu();
     const bool dngAsyncEnabled = dngAsyncPreset->isChecked();
     const int queueDepth = dngQueueDepth->value();
     const int threadCount = dngThreadCount->value();
@@ -12024,7 +12119,7 @@ void MainWindow::initGui( void )
         pPreviewResSub->addAction( ui->actionPlaybackPreviewResHalf );
         pPreviewResSub->addAction( ui->actionPlaybackPreviewResQuarter );
         m_pPlaybackQualityToolButtonMenu->addMenu( pPreviewResSub );
-        QMenu *pScaleFactorSub = new QMenu( tr( "Scale Factor" ),
+        QMenu *pScaleFactorSub = new QMenu( tr( "Playback Resolution" ),
                                             m_pPlaybackQualityToolButtonMenu );
         pScaleFactorSub->addAction( ui->actionPlaybackScaleAuto );
         pScaleFactorSub->addAction( ui->actionPlaybackScale1 );
@@ -12062,7 +12157,7 @@ void MainWindow::initGui( void )
         m_pPlaybackQualityToolButton->setText( tr( "Playback: Smooth ▾" ) );
         m_pPlaybackQualityToolButton->setToolTip(
             tr( "Playback Mode: choose Auto, Prioritize Quality, Prioritize Smoothness, "
-                "sharp/aggressive preview mode, and x1/x2/x4/x8 playback scale. "
+                "sharp/aggressive preview mode, and Full/Half/Quarter res playback resolution. "
                 "The status suffix reports the presented pipeline: CPU, GPU RB, "
                 "GPU Tex RB, or GPU Tex NR.\n"
                 "Keyboard shortcut: Q" ) );
@@ -19015,6 +19110,8 @@ GpuPreviewProcessingConfig MainWindow::gpuPreviewProcessingConfigForCurrentSetti
 
 void MainWindow::clearPresentationForClipOpen( const char *reason )
 {
+    // PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-SETUP-1 Row A: a clip close/open frees the prewarm's staged recon pair
+    GpuDisplayWindow::releaseStagedPlaybackReconSlotIfActive();
     invalidateDisplayPreviewCache();
     invalidatePlaybackPrepForDisplayChange( reason );
     m_pendingPresentationRequests.clear();
@@ -19136,7 +19233,8 @@ bool MainWindow::shouldUseGpuPreviewProcessingPath( void ) const
         GpuDisplayViewport::isInstalledOn( ui->graphicsView );
     policyState.gpuPreviewProcessingBackendRequest = m_gpuPreviewProcessingBackendRequest;
     policyState.gpuPreviewProcessingEnvironmentRequested =
-        gpuPreviewProcessingRequestedByEnvironment();
+        mainWindowGpuPreviewProcessingRequestedForSession(
+            gpuPreviewProcessingRequestedByEnvironment(), llrpGpuCudaSuppressed() != 0 );
     policyState.gpuPreviewProcessingCompatible = gpuPreviewProcessingIsSupported( m_pProcessingObject );
     const bool scopeDisplayVisible =
         scopeDisplayConsumesPresentedPixels( ui->dockWidgetEdit->isVisible() );
@@ -19159,7 +19257,8 @@ bool MainWindow::shouldUseGpuBilinearDebayerPath( void ) const
         GpuDisplayViewport::isInstalledOn( ui->graphicsView );
     policyState.gpuPreviewProcessingBackendRequest = m_gpuPreviewProcessingBackendRequest;
     policyState.gpuPreviewProcessingEnvironmentRequested =
-        gpuPreviewProcessingRequestedByEnvironment();
+        mainWindowGpuPreviewProcessingRequestedForSession(
+            gpuPreviewProcessingRequestedByEnvironment(), llrpGpuCudaSuppressed() != 0 );
     policyState.gpuPreviewProcessingCompatible = gpuPreviewProcessingIsSupported( m_pProcessingObject );
     policyState.gpuBilinearDebayerBackendRequest = m_gpuBilinearDebayerBackendRequest;
     policyState.gpuBilinearDebayerEnvironmentRequested =
@@ -19187,11 +19286,12 @@ bool MainWindow::shouldUseGpuAmazeDebayerPath( void ) const
         GpuDisplayViewport::isInstalledOn( ui->graphicsView );
     policyState.gpuPreviewProcessingBackendRequest = m_gpuPreviewProcessingBackendRequest;
     policyState.gpuPreviewProcessingEnvironmentRequested =
-        gpuPreviewProcessingRequestedByEnvironment();
+        mainWindowGpuPreviewProcessingRequestedForSession(
+            gpuPreviewProcessingRequestedByEnvironment(), llrpGpuCudaSuppressed() != 0 );
     policyState.gpuPreviewProcessingCompatible = gpuPreviewProcessingIsSupported( m_pProcessingObject );
     policyState.gpuAmazeDebayerBackendRequest = m_gpuAmazeDebayerBackendRequest;
     policyState.gpuAmazeDebayerEnvironmentRequested =
-        gpuAmazeDebayerRequestedByEnvironment();
+        gpuAmazeDebayerRequestedByEnvironment() && !llrpGpuCudaSuppressed();
     policyState.gpuAmazeDebayerCompatible =
         m_pMlvObject
         && doesMlvAlwaysUseAmaze( m_pMlvObject ) != 0
@@ -21972,9 +22072,10 @@ void MainWindow::updatePlaybackQualityIndicator( void )
          && m_lastPresentedRequestContext.playbackScaleFactor == requestedScale;
         if( activeScaleValid && sameRequest && activeScale != requestedScale )
         {
-            return tr( "x%1->x%2" ).arg( requestedScale ).arg( activeScale );
+            return tr( "%1->%2" ).arg( PlaybackScaleLabel::shortLabel( requestedScale ),
+                                       PlaybackScaleLabel::shortLabel( activeScale ) );
         }
-        return tr( "x%1" ).arg( requestedScale );
+        return PlaybackScaleLabel::shortLabel( requestedScale );
     };
 
     QString text;
@@ -22111,7 +22212,7 @@ void MainWindow::updatePlaybackQualityIndicator( void )
             "per-frame CPU readback." );
     QString toolButtonTooltip =
         tr( "Playback Mode: choose Auto, Prioritize Quality, Prioritize Smoothness, "
-            "sharp/aggressive preview mode, and x1/x2/x4/x8 playback scale. "
+            "sharp/aggressive preview mode, and Full/Half/Quarter res playback resolution. "
             "The status suffix reports the presented pipeline: CPU, GPU Preview, "
             "GPU RB, GPU Tex RB, or scoped GPU Tex NR.\n"
             "Keyboard shortcut: Q" );
@@ -22300,9 +22401,9 @@ int MainWindow::effectivePlaybackScaleFactorForRequest( void ) const
         {
             m_gpuReducedReconSessionReason =
                 requestedScale == 1
-                    ? QStringLiteral("preview scale 1 (full resolution)")
-                    : QStringLiteral("x%1 stays on the full-resolution texture route")
-                          .arg( requestedScale );
+                    ? PlaybackScaleLabel::resolutionLabel( 1 ) + QStringLiteral(" preview")
+                    : QStringLiteral("%1 stays on the full-resolution texture route")
+                          .arg( PlaybackScaleLabel::resolutionLabel( requestedScale ) );
         }
         else if( playbackGpuNoReadbackOutputValidationEnabled() )
         {
@@ -22583,7 +22684,8 @@ MainWindowGpuPreviewPolicyState MainWindow::gpuPreviewPolicyForCurrentScopeState
     policyState.gpuPreviewProcessingBackendRequest =
         m_gpuPreviewProcessingBackendRequest;
     policyState.gpuPreviewProcessingEnvironmentRequested =
-        gpuPreviewProcessingRequestedByEnvironment();
+        mainWindowGpuPreviewProcessingRequestedForSession(
+            gpuPreviewProcessingRequestedByEnvironment(), llrpGpuCudaSuppressed() != 0 );
     policyState.gpuPreviewProcessingCompatible =
         gpuPreviewProcessingIsSupported( m_pProcessingObject );
     policyState.gpuBilinearDebayerBackendRequest =
@@ -22594,7 +22696,7 @@ MainWindowGpuPreviewPolicyState MainWindow::gpuPreviewPolicyForCurrentScopeState
         m_pMlvObject && doesMlvAlwaysUseAmaze( m_pMlvObject ) == 0;
     policyState.gpuAmazeDebayerBackendRequest = m_gpuAmazeDebayerBackendRequest;
     policyState.gpuAmazeDebayerEnvironmentRequested =
-        gpuAmazeDebayerRequestedByEnvironment();
+        gpuAmazeDebayerRequestedByEnvironment() && !llrpGpuCudaSuppressed();
     policyState.gpuAmazeTexturePresentationEnvironmentRequested =
         gpuAmazeTexturePresentRequestedByEnvironment();
     policyState.gpuPlaybackReconEnvironmentRequested =
@@ -23990,6 +24092,9 @@ void MainWindow::on_actionFullscreen_triggered( bool checked )
         if( windowWasMaximized ) this->showMaximized();
         else this->showNormal();
         ui->statusBar->show();
+        // GPU-DEVICE-LOSS-SELF-HEAL-1: the device-loss notice survives fullscreen.
+        if( !GpuDeviceLossBreaker::currentNotice().isEmpty() )
+            statusBar()->showMessage( GpuDeviceLossBreaker::currentNotice(), 0 );
         ui->mainToolBar->show();
         ui->menuBar->show();
         ui->horizontalSliderPosition->show();
@@ -27590,13 +27695,234 @@ void MainWindow::runPlaybackRoutePrewarm( quint64 clipGeneration )
         scale, planOk, planOk ? plan.reducedWidth : 0, planOk ? plan.reducedHeight : 0 );
     QString summary;
     GpuDisplayWindow::prewarmPlaybackReconRouteIfActive( size.width, size.height, &summary );
-    qInfo().noquote() << QStringLiteral( "playback_route_prewarm decision=run scale=%1 %2" ).arg( scale ).arg( summary );
+    // PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-SETUP-1 Row B: the recon backend's DLL load + create, paid here while paused
+    // instead of on the first Play frame's render thread. Same predicate the render path enables the GPU playback recon
+    // with (MLVAPP_GPU_PLAYBACK_RECON; the Run decision above already requires the CUDA texture route). Loader only: no
+    // set_clip, set_luts or run.
+    int backendPreloadOk = 0;
+    double backendPreloadMs = 0.0;
+    const bool backendPreload = !mlvappPlaybackReconBackendPreloadDisabled() && playback_recon_requested_by_environment();
+    if( backendPreload ) backendPreloadOk = llrpGpuPlaybackReconPreloadBackend( &backendPreloadMs );
+    m_playbackReconBackendPreloaded = backendPreloadOk != 0;
+    // the summary is appended, never .arg()-substituted, so a '%' in its reason text cannot eat the fields after it
+    qInfo().noquote() << QStringLiteral( "playback_route_prewarm decision=run scale=%1 " ).arg( scale ) + summary
+                             + QStringLiteral( " backend_preload_ok=%1 backend_preload_ms=%2" )
+                                   .arg( backendPreload ? QString::number( backendPreloadOk ) : QStringLiteral( "skipped" ) )
+                                   .arg( backendPreloadMs, 0, 'f', 3 );
+    // PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1 Row W: with the backend loaded, the first GPU recon run itself (set_clip,
+    // set_luts, first-run allocations) is paid now, on the recon worker that will run Play frame 0, at the same scale.
+    m_playbackReconWarmPrewarmRan = true;
+    m_playbackReconWarmScale = scale;
+    postPlaybackReconWarm( clipGeneration );
+}
+
+// PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1 Row W (PlaybackReconWarmRunPolicy.h): post ONE paused warm of the current
+// frame to the recon worker. Never touches actionPlay, programmaticPlay(), the play ledger or Loop.
+void MainWindow::postPlaybackReconWarm( quint64 clipGeneration )
+{
+    m_playbackReconWarmRepostArmed = false;
+    // one warm per clip: a warm that ran is never repeated (a later raw-level change leaves set_clip to Play, correctly)
+    if( !m_pRenderThread || !m_fileLoaded || !m_pMlvObject || m_playbackReconWarmRan ) return;
+    playback_recon_warm_run::Decision decision = playback_recon_warm_run::decide(
+        !mlvappPlaybackReconWarmRunDisabled() && !mlvappPlaybackRoutePrewarmDisabled(),
+        ui->actionPlay->isChecked(),
+        clipGeneration == m_playbackRoutePrewarmClipGeneration,
+        m_playbackReconWarmPrewarmRan,
+        m_playbackReconBackendPreloaded,
+        llrpGpuCudaSuppressed() != 0,
+        !m_pRenderThread->isIdle() );
+    if( decision.run )
+    {
+        ++m_playbackReconWarmPosts;
+        // the paused frame on screen is the frame Play renders first
+        const int frame = m_lastPresentedRequestContextValid ? static_cast<int>( m_lastPresentedRequestContext.frameNumber )
+                                                             : ui->horizontalSliderPosition->value();
+        // the render thread re-checks for pending work under its lock as it queues, and again as the warm starts
+        const playback_recon_warm_run::Reason queued = m_pRenderThread->requestPlaybackReconWarm(
+            static_cast<uint32_t>( qMax( 0, frame ) ), m_playbackReconWarmScale, clipGeneration );
+        if( queued == playback_recon_warm_run::Reason::None ) return;   // the outcome arrives as playbackReconWarmDone
+        decision.run = false;
+        decision.reason = queued;
+    }
+    playback_recon_warm_run::Line line;
+    line.reason = decision.reason;
+    line.scale = m_playbackReconWarmScale;
+    line.released = true;   // nothing was retained
+    line.outstandingAfter = llrpGpuPlaybackReconRetainedOutstandingCount();
+    qInfo().noquote() << line.format();
+    schedulePlaybackReconWarmRepost( decision.reason, clipGeneration );
+}
+
+// Row W: real work was in the way (Look Assist settling, scrubbing): try again shortly; postPlaybackReconWarm re-decides
+// (Play, another clip or the post budget ends it).
+void MainWindow::schedulePlaybackReconWarmRepost( playback_recon_warm_run::Reason reason, quint64 clipGeneration )
+{
+    if( m_playbackReconWarmRepostArmed
+     || !playback_recon_warm_run::repostAfterSkip( reason, m_playbackReconWarmPosts ) ) return;
+    m_playbackReconWarmRepostArmed = true;
+    QTimer::singleShot( playback_recon_warm_run::kRepostDelayMs, this,
+                        [this, clipGeneration]() { postPlaybackReconWarm( clipGeneration ); } );
+}
+
+// Row W, GUI half: AMaZE from the warm's retained output into #473's staged slot (only for this clip, while paused),
+// then ALWAYS release the token -- including the skipped, stale-clip and playing cases.
+void MainWindow::onPlaybackReconWarmDone( const RenderFrameThread::PlaybackReconWarmDone &done )
+{
+    const playback_recon_warm_run::Outcome &outcome = done.outcome;
+    const bool playing = ui->actionPlay->isChecked();
+    const bool clipMatches = done.clipGeneration == m_playbackRoutePrewarmClipGeneration;
+    const bool hasOutput = outcome.ran && outcome.retained.device_bayer16 && outcome.retained.token != 0;
+    playback_recon_warm_run::Line line;
+    line.run = outcome.ran;
+    line.reason = outcome.reason;
+    line.scale = outcome.scale;
+    line.width = outcome.width;
+    line.height = outcome.height;
+    line.renderMs = done.renderMs;
+    line.setClipMs = outcome.setClipMs;
+    line.setLutsMs = outcome.setLutsMs;
+    line.runMs = outcome.runMs;
+    line.overlappedPlay = done.realRequestArrivedDuringWarm && playing;
+    QString amazeReason;
+    GpuAmazeDebayerBackendTiming amazeTiming;   // PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row 0: its probe
+    QString reuseCapture;   // PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1 R2: the warm key's input capture
+    if( playback_recon_warm_run::guiAmazeAllowed( hasOutput, playing, clipMatches ) )
+    {
+        const double wb[3] = { done.wbMultipliers[0], done.wbMultipliers[1], done.wbMultipliers[2] };
+        // PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1 F-key: the recon constants the warm's output was made with
+        const playback_warm_output_reuse::PreparedState warmState = playback_warm_output_reuse::preparedStateFrom( outcome.prepared );
+        line.amazeOk = GpuDisplayWindow::warmStagedReconSlotFromDeviceBayer16IfActive(
+            outcome.retained.device_bayer16, outcome.width, outcome.height, done.blackLevel, wb,
+            playbackReducedHnyquistWanted( outcome.scale > 1 ), &line.amazeKernelMs, &amazeReason, &amazeTiming,
+            static_cast<uint64_t>( done.frameNumber ), outcome.setClipCountAfter, outcome.setLutsCountAfter,
+            &reuseCapture, &warmState );
+    }
+    else if( hasOutput )
+    {
+        amazeReason = playing ? QStringLiteral( "playing" ) : QStringLiteral( "stale_clip" );
+    }
+    line.released = llrpGpuPlaybackReconReleaseRetainedDeviceBayer16( outcome.retained.token ) != 0;
+    line.outstandingAfter = llrpGpuPlaybackReconRetainedOutstandingCount();
+    if( hasOutput && clipMatches ) m_playbackReconWarmRan = true;
+    // a device loss mid-run leaves no token (released=1 above is the no-op release of token 0); the line says why
+    qInfo().noquote() << line.format()
+                             + playback_startup_split::amazeProbeFields( amazeTiming.probeAvailable, amazeTiming.probeValid,
+                                                                         amazeTiming.smMhzBefore, amazeTiming.smMhzAfter,
+                                                                         amazeTiming.deviceMs )
+                             + QStringLiteral( " frame=%1 decode_ms=%2 set_clip_calls=%3 set_luts_calls=%4 rc=%5 amaze_reason=\"" )
+                                             .arg( done.frameNumber )
+                                             .arg( outcome.decodeMs, 0, 'f', 3 )
+                                             .arg( static_cast<qulonglong>( outcome.setClipCalls ) )
+                                             .arg( static_cast<qulonglong>( outcome.setLutsCalls ) )
+                                             .arg( outcome.backendRc )
+                             + amazeReason + QStringLiteral( "\"" )
+                             + QStringLiteral( " warm_runs=" ) + QString::number( outcome.warmRuns )
+                             + playback_warm_output_reuse::captureField( reuseCapture );
+    if( clipMatches && !playing ) schedulePlaybackReconWarmRepost( outcome.reason, done.clipGeneration );
 }
 
 void MainWindow::armPlaybackRoutePrewarm()
 {
     ++m_playbackRoutePrewarmClipGeneration;   // a prewarm armed for an earlier clip is stale
+    // Row A: a pair staged for an earlier clip is never adopted by this one
+    GpuDisplayWindow::releaseStagedPlaybackReconSlotIfActive();
+    m_playbackReconBackendPreloaded = false;
+    // Row W: a new clip re-arms the warm with the prewarm (a pending warm of the old clip is dropped or releases only)
+    m_playbackReconWarmPrewarmRan = false;
+    m_playbackReconWarmPosts = 0;
+    m_playbackReconWarmRepostArmed = false;
+    m_playbackReconWarmRan = false;
     m_playbackRoutePrewarmArmed = !mlvappPlaybackRoutePrewarmDisabled();
+    // PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row K: a clip change ends a kick still held
+    endPlaybackGpuClockKick( "clip_change" );
+}
+
+// PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row K (PlaybackGpuClockKickPolicy.h) and Row 0: at Play, before the
+// play-start frame request. Row 0's session probe is armed for every Play (it never loads the DLL); the kick only runs
+// on the CUDA texture route with the AMaZE backend already loaded, never loading it.
+void MainWindow::beginPlaybackGpuClockKick()
+{
+    if( m_playbackGpuClockKickActive ) endPlaybackGpuClockKick( "next_play" );
+    gpuAmazeDebayerBeginProbeSession();
+    m_playbackGpuClockKickSession = static_cast<quint64>( m_playbackSmokeSessionId );
+    const bool routeAdmitted = m_lastPresentedRequestContextValid
+                            && m_lastPresentedRequestContext.gpuPlaybackReconTexturePresentRequested
+                            && m_lastPresentedRequestContext.gpuPlaybackReconAmazeTexturePresentAdmitted;
+    const bool cudaSuppressed = llrpGpuCudaSuppressed() != 0;
+    playback_gpu_clock_kick::Decision decision = playback_gpu_clock_kick::decide(
+        !mlvappPlaybackGpuClockKickDisabled(),
+        ui->actionPlay->isChecked(),
+        routeAdmitted,
+        routeAdmitted && !cudaSuppressed && gpuAmazeDebayerLiveBackendLoaded(),
+        cudaSuppressed,
+        false );
+    if( decision.run )
+    {
+        QString why;
+        double beginSteadyMs = 0.0;
+        if( gpuAmazeDebayerClockKickBegin( playback_gpu_clock_kick::kKickMaxMs, &why, &beginSteadyMs ) )
+        {
+            m_playbackGpuClockKickDecision = decision;
+            m_playbackGpuClockKickActive = true;
+            m_playbackGpuClockKickEndedAt.clear();
+            m_playbackGpuClockKickPendingRetries = 0;
+            m_playbackGpuClockKickBeginSteadyMs = beginSteadyMs;
+            // the kernel stops itself at kKickMaxMs; this collects and logs it when no present came first
+            const quint64 serial = ++m_playbackGpuClockKickSerial;
+            QTimer::singleShot( playback_gpu_clock_kick::kKickMaxMs + 50, this, [this, serial]()
+            {
+                if( serial == m_playbackGpuClockKickSerial ) endPlaybackGpuClockKick( "deadline_timer" );
+            } );
+            return;
+        }
+        decision.run = false;
+        decision.reason = playback_gpu_clock_kick::reasonFromBeginFailure( why );
+    }
+    m_playbackGpuClockKickDecision = decision;
+    playback_gpu_clock_kick::Line line;
+    line.session = m_playbackGpuClockKickSession;
+    line.decision = decision;
+    qInfo().noquote() << line.format();
+}
+
+// Row K: raise the stop flag, collect (no CUDA call, at most ~2 ms) and log. Once per kick; a no-op without one.
+void MainWindow::endPlaybackGpuClockKick( const char *site )
+{
+    if( !m_playbackGpuClockKickActive ) return;
+    if( m_playbackGpuClockKickEndedAt.isEmpty() ) m_playbackGpuClockKickEndedAt = QString::fromLatin1( site );
+    ++m_playbackGpuClockKickSerial;
+    const GpuAmazeClockKickReport report = gpuAmazeDebayerClockKickEnd();
+    // the stop flag is up, but the backend's feeder has not yet seen its last chunk finish (it waits a few ms at most):
+    // collect again shortly, up to kKickPendingRetries times, then log it as pending
+    if( report.state == 1 && m_playbackGpuClockKickPendingRetries < playback_gpu_clock_kick::kKickPendingRetries )
+    {
+        ++m_playbackGpuClockKickPendingRetries;
+        const quint64 serial = m_playbackGpuClockKickSerial;
+        QTimer::singleShot( playback_gpu_clock_kick::kKickPendingRetryMs, this, [this, serial]()
+        {
+            if( serial == m_playbackGpuClockKickSerial ) endPlaybackGpuClockKick( "pending_retry" );
+        } );
+        return;
+    }
+    m_playbackGpuClockKickActive = false;
+    const GpuAmazeProbeSessionRecord record = gpuAmazeDebayerProbeSessionRecord();
+    playback_gpu_clock_kick::Line line;
+    line.session = m_playbackGpuClockKickSession;
+    line.decision = m_playbackGpuClockKickDecision;
+    line.ranMs = report.ranMs;
+    line.samples = static_cast<int>( report.sampleMs.size() );
+    line.mhzFirst = playback_gpu_clock_kick::firstKnownMhz( report.intervalMhz );
+    line.mhzLast = playback_gpu_clock_kick::lastKnownMhz( report.intervalMhz );
+    line.rampMs = playback_gpu_clock_kick::rampMsTo80pct( report.sampleMs, report.intervalMhz );
+    line.stoppedBy = QString::fromLatin1( playback_gpu_clock_kick::stoppedByName( report.state, report.stoppedBy ) );
+    line.endedAt = m_playbackGpuClockKickEndedAt;   // where the end was first asked for
+    // frame 0's own probe: the first AMaZE run of this Play
+    if( record.calls > 0 )
+    {
+        if( record.probeAvailable && record.valid[0] ) line.mhzAtAmaze0 = record.smMhzBefore[0];
+        line.kickLeadMs = record.startSteadyMs[0] - m_playbackGpuClockKickBeginSteadyMs;
+    }
+    qInfo().noquote() << line.format();
 }
 
 QImage MainWindow::grabIdentityViewport( QString *reason )
@@ -28148,6 +28474,31 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                                                                    : QStringLiteral( "first_present" ) );
     // PLAYBACK-STARTUP-WAIT-PREWARM-1: where that wait went (PlaybackStartupSplit.h).
     qInfo().noquote() << m_playbackStartupSplit.line( static_cast<qulonglong>( m_playbackSmokeSessionId ) );
+    // PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-SETUP-1 Row 0: and where its first GPU window present went.
+    qInfo().noquote() << m_playbackStartupSplit.firstPresentLine( static_cast<qulonglong>( m_playbackSmokeSessionId ) );
+    // PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1 Row 0: and where its first render went.
+    qInfo().noquote() << m_playbackStartupSplit.renderFirstLine( static_cast<qulonglong>( m_playbackSmokeSessionId ) );
+    // PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row 0: and its first four AMaZE runs (kernel / device / SM MHz).
+    {
+        const GpuAmazeProbeSessionRecord record = gpuAmazeDebayerProbeSessionRecord();
+        playback_startup_split::AmazeFirstFrames frames;
+        // PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1 R3: a reused frame 0 has no record; R4's verify run
+        // (identity legs) is record 0 and is skipped, so record i is always labelled by its own frame
+        const playback_startup_split::FirstPresentSplit &firstSplit = m_playbackStartupSplit.firstPresentSplit();
+        frames.frame0Reused = firstSplit.frame0Reused();
+        const int skip = frames.frame0Reused && firstSplit.reuseVerifyRan ? 1 : 0;
+        frames.count = qMax( 0, qMin( record.calls - skip, playback_startup_split::AmazeFirstFrames::kFrames ) );
+        frames.probeAvailable = record.probeAvailable;
+        for( int i = 0; i < frames.count; ++i )
+        {
+            frames.kernelMs[i] = record.kernelMs[i + skip];
+            frames.deviceMs[i] = record.deviceMs[i + skip];
+            frames.smMhzBefore[i] = record.smMhzBefore[i + skip];
+            frames.valid[i] = record.valid[i + skip];
+        }
+        m_playbackStartupSplit.noteAmazeFirstFrames( frames );
+    }
+    qInfo().noquote() << m_playbackStartupSplit.amazeFirstFramesLine( static_cast<qulonglong>( m_playbackSmokeSessionId ) );
     // PLAYBACK-STARTUP-WAIT-PREWARM-1 Row A: how this Play's audio started (AudioPlayback::StartReport).
     {
         const AudioPlayback::StartReport audioStart =
@@ -29411,6 +29762,8 @@ void MainWindow::on_actionPlay_toggled(bool checked)
         // read by finishPlaybackSmokeTelemetry() below via m_playbackScreensaverBlockedCount
         // before that counter is reset by the next play-start.
         m_playbackDisplayRequiredActive = false;
+        // PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row K: a kick still held ends with its Play
+        endPlaybackGpuClockKick( "play_stop" );
         finishPlaybackSmokeTelemetry( "play-stop" );
         m_playbackStopped = true;
         m_playToFirstFramePending = false;
@@ -29455,6 +29808,9 @@ void MainWindow::on_actionPlay_toggled(bool checked)
         beginPlaybackSmokeTelemetry();
         beginPlayToFirstFrameMeasurement();
         m_playbackScopeLastUpdateTime = 0.0;
+        // PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row K: the GPU clocks ramp while frame 0 decodes, so the kick
+        // starts before the play-start frame request (PlaybackGpuClockKickPolicy.h)
+        beginPlaybackGpuClockKick();
         requestFrameRefresh( true, "play-start" );
         m_lastPlayStartPrerollRequested = primePlaybackCacheOnPlayStart();
         m_playbackFrameAdvancePending = true;
@@ -29484,12 +29840,22 @@ void MainWindow::on_actionPlay_toggled(bool checked)
 // The static class test (tools/repo_hygiene/test_playback_clip_length_gate.py) fails on any other
 // programmatic actionPlay->trigger(), any Loop-enable, and any setPlaying outside this commented list.
 // ---------------------------------------------------------------------------------------------------------
+double MainWindow::playGateNativeFps() const
+{
+    return ( m_fileLoaded && m_pMlvObject ) ? static_cast<double>( getMlvFramerate( m_pMlvObject ) ) : 0.0;
+}
+
+double MainWindow::playGateMinPlayWindowSeconds() const
+{
+    return playback_frame_range::minPlayWindowSeconds( playGateNativeFps() );
+}
+
 playback_frame_range::PlayableWindowVerdict MainWindow::checkPlayableWindow( const char *site, double requestedSeconds )
 {
     Q_UNUSED( site );
     const bool haveClip = m_fileLoaded && m_pMlvObject;
     const int totalFrames = haveClip ? static_cast<int>( getMlvFrames( m_pMlvObject ) ) : 0;
-    const double fps = haveClip ? static_cast<double>( getMlvFramerate( m_pMlvObject ) ) : 0.0;
+    const double fps = playGateNativeFps();
     // ENFORCE-2 round 2 (sol B3): measure the range the ENGINE plays -- with MLVAPP_F3_DISABLE_CUT_RANGE_REPAIR
     // set the play path leaves a collapsed / inverted range alone (normalizePlaybackCutRangeForLoadedClip), so
     // the gate must not assume the repair either. This is the one knob that changes the effective range.
@@ -29502,7 +29868,7 @@ playback_frame_range::PlayableWindowVerdict MainWindow::checkPlayableWindow( con
         ui->spinBoxCutIn->value(),
         ui->spinBoxCutOut->value(),
         totalFrames, fps, requestedSeconds,
-        playback_frame_range::kMinPlayWindowSeconds,
+        playback_frame_range::minPlayWindowSeconds( fps ),
         !f3CutRangeRepairDisabledByEnvironment(),
         enginePaceFps > 0.0 ? enginePaceFps : -1.0, automationPlayPaceMode() );
 }
@@ -29537,7 +29903,7 @@ bool MainWindow::programmaticPlay( const char *site, double requestedSeconds )
             m_lastPlayGateRefusalMessage = QStringLiteral(
                 "PLAY_DURATION_TOO_SHORT (requested=%1 window=%2; site=%3)" )
                 .arg( verdict.requestedSeconds, 0, 'f', 3 )
-                .arg( playback_frame_range::kMinPlayWindowSeconds, 0, 'f', 3 )
+                .arg( verdict.floorSeconds, 0, 'f', 3 )
                 .arg( QString::fromLatin1( site ) );
         }
         else if( reason == QLatin1String( "PLAY_PACE_TOO_SLOW" ) )
@@ -30860,6 +31226,74 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
         if( splitFirst ) m_playbackStartupSplit.noteFirstPresent( splitRenderMs, splitGuiPresentMs );
         else m_playbackStartupSplit.noteLaterPresent( splitRenderMs, splitGuiPresentMs );
     }
+    // PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-SETUP-1 Row 0: the first present's GPU window parts
+    // (playback_smoke.first_present_split), read from the telemetry its texture present just wrote.
+    if( splitFirst )
+    {
+        const QJsonObject &t = readyFrame.stageTimingTelemetry;
+        playback_startup_split::FirstPresentSplit fp;
+        const QString slot = telemetryStringValue( t, "gpu_playback_recon_texture_present_slot" );
+        const QString handoff = telemetryStringValue( t, "gpu_playback_recon_texture_present_handoff_mode" );
+        if( !slot.isEmpty() ) fp.slot = slot;
+        if( !handoff.isEmpty() ) fp.handoff = handoff;
+        fp.setupProgramMs = telemetryDoubleValue( t, "gpu_playback_recon_texture_present_setup_program_ms" );
+        fp.setupLutMs = telemetryDoubleValue( t, "gpu_playback_recon_texture_present_setup_lut_ms" );
+        fp.setupBlurMs = telemetryDoubleValue( t, "gpu_playback_recon_texture_present_setup_blur_drain_ms" )
+                       + telemetryDoubleValue( t, "gpu_playback_recon_texture_present_setup_blur_upload_ms" )
+                       + telemetryDoubleValue( t, "gpu_playback_recon_texture_present_setup_blur_check_ms" );
+        fp.setupReallocMs = telemetryDoubleValue( t, "gpu_playback_recon_texture_present_setup_realloc_ms" );
+        fp.setupSamplingMs = telemetryDoubleValue( t, "gpu_playback_recon_texture_present_setup_sampling_ms" );
+        fp.reconWallMs = telemetryDoubleValue( t, "gpu_playback_recon_texture_present_recon_wall_ms" );
+        fp.amazeKernelMs = telemetryDoubleValue( t, "gpu_playback_recon_texture_present_amaze_kernel_ms" );
+        fp.amazeDownloadMs = telemetryDoubleValue( t, "gpu_playback_recon_texture_present_amaze_download_ms" );
+        fp.paintMs = telemetryDoubleValue( t, "gpu_playback_recon_texture_present_post_ms" );
+        fp.guiPickupMs = playback_startup_split::guiPickupMs( readyFrame.frameReadyEmitStageTime, displayStart );
+        fp.backendPreloaded = m_playbackReconBackendPreloaded;
+        // PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1 Row 0: did the paused warm absorb the first set_clip / set_luts?
+        fp.warmRun = m_playbackReconWarmRan;
+        fp.setClipAtPlay = static_cast<long long>( llrpGpuPlaybackReconSetClipCount() - m_playbackSmokeStartGpuSetClipCount );
+        fp.setLutsAtPlay = static_cast<long long>( llrpGpuPlaybackReconSetLutsCount() - m_playbackSmokeStartGpuSetLutsCount );
+        // PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row 0: frame 0's AMaZE probe (the session's first probed run)
+        // and this Play's clock kick
+        const GpuAmazeProbeSessionRecord probeRecord = gpuAmazeDebayerProbeSessionRecord();
+        if( probeRecord.calls > 0 )
+        {
+            fp.probeAvailable = probeRecord.probeAvailable;
+            fp.probeValid = probeRecord.valid[0];
+            fp.amazeSmMhzBefore = probeRecord.smMhzBefore[0];
+            fp.amazeSmMhzAfter = probeRecord.smMhzAfter[0];
+            fp.amazeDeviceMs = probeRecord.deviceMs[0];
+            if( m_playbackGpuClockKickDecision.run )
+                fp.kickLeadMs = probeRecord.startSteadyMs[0] - m_playbackGpuClockKickBeginSteadyMs;
+        }
+        fp.clockKickRun = m_playbackGpuClockKickDecision.run;
+        fp.clockKickReason = QString::fromLatin1( playback_gpu_clock_kick::reasonName( m_playbackGpuClockKickDecision.reason ) );
+        // PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1 R3: the reuse outcome (absent: the CPU route, skip)
+        const QString reuse = telemetryStringValue( t, "gpu_playback_recon_texture_present_warm_output_reuse" );
+        const QString reuseReason = telemetryStringValue( t, "gpu_playback_recon_texture_present_reuse_reason" );
+        fp.warmOutputReuse = reuse.isEmpty() || reuse == QLatin1String( "none" ) ? QStringLiteral( "skip" ) : reuse;
+        fp.reuseReason = reuseReason.isEmpty() ? QStringLiteral( "cpu_route" ) : reuseReason;
+        fp.reuseCompareMs = telemetryDoubleValue( t, "gpu_playback_recon_texture_present_reuse_compare_ms" );
+        fp.reuseVerifyRan = t.value( QStringLiteral( "gpu_playback_recon_texture_present_reuse_verify_ran" ) ).toBool();
+        fp.reuseStates = telemetryStringValue( t, "gpu_playback_recon_texture_present_reuse_states" );
+        if( fp.frame0Reused() )
+        {
+            // frame 0 ran no AMaZE at Play: probe record 0 is frame 1 (or R4's verify run), never frame 0's
+            fp.probeValid = false;
+            fp.kickLeadMs = -1.0;
+        }
+        m_playbackStartupSplit.noteFirstPresentSplit( fp );
+        // Row 0: render_first by the first frame's existing stage timers (never a new hot-path timer)
+        playback_startup_split::RenderFirstSplit rf;
+        rf.renderFirstMs = telemetryDoubleValue( t, "render_thread_total_ms" );
+        rf.hasDecode = t.contains( QStringLiteral( "raw_uint16_ms" ) );
+        rf.decodeMs = telemetryDoubleValue( t, "raw_uint16_ms" );
+        rf.hasLlrawproc = t.contains( QStringLiteral( "llrawproc_total_ms" ) );
+        rf.llrawprocMs = telemetryDoubleValue( t, "llrawproc_total_ms" );
+        m_playbackStartupSplit.noteRenderFirstSplit( rf );
+    }
+    // PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row K: this Play's first present (painted) ends its clock kick
+    if( m_playbackGpuClockKickActive && ui->actionPlay->isChecked() ) endPlaybackGpuClockKick( "first_present" );
     double splitMark = splitFinishEntry;
     const auto splitStep = [&]( int step )
     {

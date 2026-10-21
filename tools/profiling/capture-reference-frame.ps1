@@ -59,6 +59,13 @@ param(
     # candidate differed by mean|px| 28 across 99.92% of pixels, which is a different-frame
     # signature, not a colour change. 'off' makes presented-frame N equal timeline frame N.
     [ValidateSet('off','on','persisted')][string]$DropFrameMode = 'off',
+    # VENUE-REFERENCE-FRAME-JOB-1: the output-budget gate profile (tools/gates/output-budget.json), so a capture is the frame the gate
+    # compares. -StartFrame is the clip's startFrame (120 for M16-1243; the gate does not start at 0), -DisableLookAssist is the profile's
+    # disableLookAssist (the app's --no-look-assist), -PlaybackProcessing its playbackProcessing (the app's --playback-processing).
+    # Each default adds nothing to the app's argv: a caller that passes none of them gets the argv this script has always built.
+    [ValidateRange(0, 2147483647)][int]$StartFrame = 0,
+    [switch]$DisableLookAssist,
+    [ValidateSet('', 'auto', 'receipt', 'subset')][string]$PlaybackProcessing = '',
     [hashtable]$ExtraEnv = @{}
 )
 
@@ -106,11 +113,20 @@ foreach ($envGate in @((Test-GuiSmokeParentEnvironment), (Test-GuiSmokeParentEnv
         exit 44
     }
 }
+$capturedLength = Get-GuiSmokeClipLength -Path $Clip
 if ($PresentedFrames -lt 0) {
-    $capturedLength = Get-GuiSmokeClipLength -Path $Clip
     $PresentedFrames = if ($capturedLength.known) { Get-GuiSmokeMinPresentedFrames -Fps $capturedLength.fps } else { 0 }
 }
-$clipLengthGate = Test-GuiSmokeClipLength -Path $Clip -WindowSeconds $Seconds -TargetPresentedFrames $PresentedFrames
+# REFERENCE-FRAME-PINNED-WINDOW-GATE-1: a pinned-frame run (-PresentedFrames N) needs the PINNED frame, not real-time pace, so -Seconds is only its
+# fail-closed timeout and the footage it asks for is the SOONER of the two: min(-Seconds, N / fps). This is the window the app requests (smokePlayRequestSeconds,
+# platform/qt/PlaybackFrameRange.h) and the one both checks below judge -- the length gate (a window may not outlast the footage left after -StartFrame; N / fps
+# itself must still reach the floor) and the receipt oracle (clip_seconds). A time-based run (-PresentedFrames 0) plays for -Seconds, so there it is -Seconds.
+# Without this, -Seconds 30 on the 20.521 s M16-1243 leaves (startFrame 120) was refused as CLIP_TOO_SHORT although the app plays 20.02 s of it.
+$playWindowSeconds = [double]$Seconds
+if ($PresentedFrames -gt 0 -and $capturedLength.known) {
+    $playWindowSeconds = [Math]::Min($playWindowSeconds, [double]$PresentedFrames / [double]$capturedLength.fps)
+}
+$clipLengthGate = Test-GuiSmokeClipLength -Path $Clip -WindowSeconds $playWindowSeconds -StartFrame $StartFrame -TargetPresentedFrames $PresentedFrames
 if ($clipLengthGate.verdict -ne 'OK') {
     Write-Output "CAPTURE: REFUSED - $($clipLengthGate.message)"
     exit (Get-GuiSmokeGateExitCode -Verdict $clipLengthGate.verdict)
@@ -131,8 +147,11 @@ foreach ($staleReceipt in @($shot, (Join-Path $OutDir 'reference-frame-candidate
 # --loop is DELIBERATELY ABSENT when the frame is pinned: looping wraps the timeline and
 # reintroduces exactly the which-frame ambiguity --presented-frames exists to remove.
 $playArgs = @('--gui-smoke-playback','--input',$Clip,'--scope','none','--no-zebras',
-              '--seconds',[string]$Seconds,'--settle-ms',[string]$SettleMs,'--start-frame','0','--drop-frame-mode',$DropFrameMode)
+              '--seconds',[string]$Seconds,'--settle-ms',[string]$SettleMs,'--start-frame',[string]$StartFrame,'--drop-frame-mode',$DropFrameMode)
 if ($PresentedFrames -gt 0) { $playArgs += @('--presented-frames',[string]$PresentedFrames) }
+# VENUE-REFERENCE-FRAME-JOB-1: gate-profile flags, appended only when asked for; --screenshot-output stays last.
+if ($DisableLookAssist) { $playArgs += '--no-look-assist' }
+if ($PlaybackProcessing -ne '') { $playArgs += "--playback-processing=$PlaybackProcessing" }
 # PLAYBACK-CLIP-LENGTH-ENFORCE-1 (owner rule 2026-09-30): the old time-based fallback passed --loop.
 # Looping is never allowed; a time-based capture plays once over a window the clip outlasts.
 $playArgs += @('--screenshot-output',$shot)
@@ -166,6 +185,12 @@ if (-not $captureKilled -and $null -eq $captureExitCode) {
 }
 if (-not $captureKilled -and $captureExitCode -ne 0) {
     $captureStderr = Get-Content -LiteralPath (Join-Path $OutDir 'capture.err.txt') -Raw -ErrorAction SilentlyContinue
+    # REFERENCE-FRAME-PINNED-WINDOW-GATE-1: the app's exit 11 is "the pinned frame was never presented" (MainWindow.cpp: exact presented-frame target was
+    # not met). It writes no frame, so it is a typed failure of its own -- never a candidate, never the generic `(NONE)`.
+    if ($captureExitCode -eq 11 -and ([string]$captureStderr) -match 'presented-frame target was not met; target=(\d+) observed=(\d+)') {
+        Write-Output ("CAPTURE: FAILED - PINNED_FRAME_NOT_PRESENTED (target={0} observed={1}); exe exited 11 and wrote no frame" -f $Matches[1], $Matches[2])
+        exit 4
+    }
     Write-Output ("CAPTURE: FAILED - exe exited {0} ({1})" -f $captureExitCode, (Get-GuiSmokeRefusalReason -ExitCode $captureExitCode -Message ([string]$captureStderr)))
     exit 4
 }
@@ -174,7 +199,7 @@ if (-not $captureKilled -and $captureExitCode -ne 0) {
 $captureSummary = Read-GuiSmokePlaybackSummaryFromLogDir -LogDir $OutDir -SinceUtc $captureStartedUtc
 $captureFrames = if ($null -ne $clipLengthGate.frames) { [int64]$clipLengthGate.frames } else { [int64]0 }
 $captureVerdict = Get-GuiSmokeEvidencePlayVerdict -Summary $captureSummary -ExitCode $captureExitCode `
-    -KilledByLauncher $captureKilled -WindowSeconds $Seconds -ClipFrames $captureFrames -ExpectedRunNonce $runNonce
+    -KilledByLauncher $captureKilled -WindowSeconds $playWindowSeconds -ClipFrames $captureFrames -ExpectedRunNonce $runNonce
 if ($captureVerdict.invalid) {
     Write-Output ("CAPTURE: INVALID - " + (($captureVerdict.failures) -join ' | '))
     # fable H2: the grab of an INVALID run is renamed <name>.INVALID.png and the directory is marked, so an offline reader
@@ -230,9 +255,13 @@ $manifest = [ordered]@{
     appSettings = $appSettings
     settings    = [ordered]@{
         seconds         = $Seconds
-        settleMs        = $SettleMs
+        playWindowSeconds = $playWindowSeconds
+        settleMs       = $SettleMs
         presentedFrames = $PresentedFrames
         dropFrameMode   = $DropFrameMode
+        startFrame      = $StartFrame
+        lookAssistDisabled = [bool]$DisableLookAssist
+        playbackProcessing = $PlaybackProcessing
         # Records WHY the frame is (or is not) comparable across builds, so a reader never has to
         # infer it from the flag list.
         framePinned     = ($PresentedFrames -gt 0)

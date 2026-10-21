@@ -260,6 +260,11 @@ typedef struct {
     int playback_scale_factor_active;
     pthread_mutex_t processed8_prefetch_mutex;
     pthread_cond_t processed8_prefetch_cond;
+    /* 1 when processed8_prefetch_cond measures CLOCK_MONOTONIC, 0 when it
+     * keeps the default clock (winpthreads/Apple relative waits, or a libc
+     * that refused the MONOTONIC cond). Set once at init; the slice abstime
+     * must name the same clock. */
+    int processed8_prefetch_cond_clock_monotonic;
     pthread_t processed8_prefetch_thread;
     processingObject_t * processed8_prefetch_processing;
     int processed8_prefetch_thread_started;
@@ -281,6 +286,18 @@ typedef struct {
     int processed8_prefetch_test_pause_before_store;
     int processed8_prefetch_test_paused_before_store;
     int processed8_prefetch_test_idle_waiters;
+    /* Production leaves this zero; tests force N worker cache-prepare failures. */
+    int processed8_prefetch_test_prepare_failures;
+    /* Slice-wait seams for the test waiters (mutex-protected). Production
+     * leaves slice_ms and wall_clock_skew_ns zero (50 ms slices, no skew).
+     * slice_ms widens the fallback slice so only a broadcast can return a
+     * waiter early; wall_clock_skew_ns is added to any CLOCK_REALTIME read
+     * that builds a slice deadline (a read that is ahead of the clock the
+     * cond waits on is what a backward wall-clock step after the read
+     * produces). slice_expiries counts slices that ran out without a wake. */
+    uint32_t processed8_prefetch_test_wait_slice_ms;
+    int64_t processed8_prefetch_test_wall_clock_skew_ns;
+    int processed8_prefetch_test_slice_expiries;
     /* Phase E6: scaleFactor accompanying the most recent note_request. The
      * worker uses this to record the slot's `scale` lane (so render-thread
      * lookups at the same scale match) and to set

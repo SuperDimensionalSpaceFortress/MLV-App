@@ -228,24 +228,265 @@ function Get-DvProp {
 }
 
 # --- where admission reads its inputs from (round 3, sol BLOCKER) ----------------------------------------------------
+function Get-DvGitTimeoutMilliseconds {
+    # CI-DUALVENUE-EVIDENCE-SHARD2-HANG-1: the longest one git call may run. 120 s by default; DV_GIT_TIMEOUT_SECONDS (1..600) overrides it.
+    # A shorter bound can only refuse more (a timed-out call is exit -1), never admit anything.
+    $seconds = 120
+    $raw = [Environment]::GetEnvironmentVariable('DV_GIT_TIMEOUT_SECONDS')
+    # r2 (opus P-01): \z, not $: .NET's $ also matches before a final newline, so '30<LF>' was accepted as 30 s.
+    if ($raw -match '^[0-9]{1,3}\z' -and [int]$raw -ge 1 -and [int]$raw -le 600) { $seconds = [int]$raw }
+    $seconds * 1000
+}
+
+$script:DvJobNative = $null
+$script:DvJobNativeTried = $false
+function Get-DvJobNative {
+    # Windows: the four kernel32 job-object calls plus the five that start a process SUSPENDED and read its exit code (CreateProcessW,
+    # CreatePipe, SetHandleInformation, ResumeThread, GetExitCodeProcess; Start-DvGitInJob), emitted ONCE per process with Reflection.Emit (about 45 ms; Add-Type's compiler costs 0.5-0.9 s
+    # in every pwsh process, which every test process would pay). Every struct is passed as an IntPtr to a raw buffer, so no struct type is emitted.
+    # $null elsewhere, or when the emit fails: the caller then has Kill($true) only.
+    if (-not $IsWindows) { return $null }
+    if ($script:DvJobNativeTried) { return $script:DvJobNative }
+    $script:DvJobNativeTried = $true
+    try {
+        $asm = [Reflection.Emit.AssemblyBuilder]::DefineDynamicAssembly([Reflection.AssemblyName]::new('DvGitJob'), [Reflection.Emit.AssemblyBuilderAccess]::Run)
+        $tb = $asm.DefineDynamicModule('DvGitJob').DefineType('DvGitJobNative', 'Public, Class, Abstract, Sealed')
+        foreach ($s in @(@('CreateJobObjectW', [IntPtr], @([IntPtr], [IntPtr])), @('AssignProcessToJobObject', [bool], @([IntPtr], [IntPtr])),
+                         @('TerminateJobObject', [bool], @([IntPtr], [uint32])), @('CloseHandle', [bool], @([IntPtr])),
+                         @('CreateProcessW', [bool], @([IntPtr], [IntPtr], [IntPtr], [IntPtr], [bool], [uint32], [IntPtr], [IntPtr], [IntPtr], [IntPtr])),
+                         @('CreatePipe', [bool], @([IntPtr].MakeByRefType(), [IntPtr].MakeByRefType(), [IntPtr], [uint32])),
+                         @('SetHandleInformation', [bool], @([IntPtr], [uint32], [uint32])), @('ResumeThread', [uint32], @([IntPtr])),
+                         @('GetExitCodeProcess', [bool], @([IntPtr], [uint32].MakeByRefType())))) {
+            $m = $tb.DefinePInvokeMethod($s[0], 'kernel32.dll', 'Public, Static, PinvokeImpl', 'Standard', $s[1], [Type[]]$s[2], 'Winapi', 'Unicode')
+            $m.SetImplementationFlags('PreserveSig')
+        }
+        $script:DvJobNative = $tb.CreateType()
+    } catch { $script:DvJobNative = $null }
+    $script:DvJobNative
+}
+
+function Stop-DvGitCall {
+    # Kill everything one git call started, including a child whose own parent has already exited. No parent-pid chain leads back to git
+    # then (`sh -c 'x & exit 0'`: sh is gone, the background child is not), so Kill($true) alone misses it. The call's job object reaches it
+    # on Windows; on Linux its environment tag in /proc/<pid>/environ does (every child inherits the tag unless it scrubs its environment).
+    # macOS has neither: it reaches only the direct child and its process tree (Kill($true)), so a child whose parent has already exited
+    # survives there. The callers therefore never claim a kill from this function: they claim it only once the call's pipes have closed.
+    param([Parameter(Mandatory)]$Proc, [IntPtr]$Job, [string]$Tag)
+    try { $Proc.Kill($true) } catch { $null = $_ }
+    $native = Get-DvJobNative
+    if ($null -ne $native -and $Job -ne [IntPtr]::Zero) { [void]$native::TerminateJobObject($Job, [uint32]1) }
+    if ($IsLinux -and -not [string]::IsNullOrEmpty($Tag)) {
+        $needle = "`0DV_GIT_CALL_TAG=$Tag`0"
+        foreach ($dir in [IO.Directory]::GetDirectories('/proc')) {
+            $name = [IO.Path]::GetFileName($dir)
+            if ($name -notmatch '^\d{1,9}$' -or [int]$name -eq $PID) { continue }
+            try { $envText = "`0" + [Text.Encoding]::Latin1.GetString([IO.File]::ReadAllBytes("$dir/environ")) } catch { continue }
+            if ($envText.Contains($needle)) { try { [System.Diagnostics.Process]::GetProcessById([int]$name).Kill() } catch { $null = $_ } }
+        }
+    }
+}
+
+function Get-DvStragglerMessage {
+    # The DV_GIT_PIPE_STRAGGLER stderr. "(killed)" is claimed only when the kill is CONFIRMED (the call's pipes closed after Stop-DvGitCall);
+    # otherwise "(kill not confirmed)": macOS cannot reach a child whose parent has exited. The refusal (exit -1) is the same either way.
+    param([Parameter(Mandatory)][int]$GitExit, [Parameter(Mandatory)][int]$Seconds, [Parameter(Mandatory)][bool]$KillConfirmed, [Parameter(Mandatory)][string[]]$GitArgs)
+    $state = $(if ($KillConfirmed) { 'killed' } else { 'kill not confirmed' })
+    "DV_GIT_PIPE_STRAGGLER git exited $GitExit but a process it started still held its output open after $Seconds s ($state): git $($GitArgs -join ' ')"
+}
+
+function ConvertTo-DvWindowsArg {
+    # One argument as CommandLineToArgvW reads it back: quoted when empty or holding a space, tab or quote; a backslash run before a quote
+    # (or before the closing quote) is doubled.
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Arg)
+    if ($Arg.Length -gt 0 -and $Arg -notmatch '[\s"]') { return $Arg }
+    '"' + [regex]::Replace([regex]::Replace($Arg, '(\\*)"', '$1$1\"'), '(\\+)$', '$1$1') + '"'
+}
+
+# Test seam, $null in production: runs between the child's creation and its job assignment. The child is suspended there, so however long the
+# hook takes it cannot have started anything (a test sets a sleep here to prove the escape window is closed).
+$script:DvStartGate = $null
+
+function Start-DvGitInJob {
+    # CI-FLAKE-DV-GIT-PIPE-STRAGGLER-KILL-1: start $Psi's program SUSPENDED, put it in $Job, then resume it, so that nothing git starts can
+    # ever be outside the job. Process.Start then AssignProcessToJobObject left a window (measured: 20 ms was enough on an idle host, and
+    # `sh -c 'x & exit 0'` was already in the grandchild's hands): a child started inside it escaped TerminateJobObject, its parent exited, and
+    # Kill($true) had no parent chain to follow, so the straggler kill was not confirmed on a loaded hosted runner.
+    # Returns @{ Process; Out; Err } (Out: stdout stream; Err: stderr reader), or $null on ANY failure with nothing left open: the caller then
+    # takes the Process.Start path, which also produces the typed DV_GIT_START_FAILED message. 64-bit only (the buffers below are x64 layouts).
+    param([Parameter(Mandatory)]$Native, [Parameter(Mandatory)][IntPtr]$Job, [Parameter(Mandatory)]$Psi)
+    if ([IntPtr]::Size -ne 8) { return $null }
+    $m = [Runtime.InteropServices.Marshal]
+    $handles = [Collections.Generic.List[IntPtr]]::new()   # every raw handle still ours to close
+    $mem = [Collections.Generic.List[IntPtr]]::new()
+    $suspendedThread = [IntPtr]::Zero
+    $suspendedProcess = [IntPtr]::Zero
+    try {
+        $alloc = { param([int]$n) $p = $m::AllocHGlobal($n); $m::Copy([byte[]]::new($n), 0, $p, $n); $mem.Add($p); $p }
+        $sa = & $alloc 24
+        $m::WriteInt32($sa, 0, 24); $m::WriteInt32($sa, 16, 1)   # SECURITY_ATTRIBUTES { nLength = 24; bInheritHandle = TRUE }
+        $pipe = {
+            param([bool]$ParentReads)
+            [IntPtr]$r = [IntPtr]::Zero; [IntPtr]$w = [IntPtr]::Zero
+            if (-not $Native::CreatePipe([ref]$r, [ref]$w, $sa, [uint32]0)) { throw 'CreatePipe failed' }
+            $handles.Add($r); $handles.Add($w)
+            # HANDLE_FLAG_INHERIT off on the parent's end: git inherits its own end only.
+            $parent = $(if ($ParentReads) { $r } else { $w })
+            if (-not $Native::SetHandleInformation($parent, [uint32]1, [uint32]0)) { throw 'SetHandleInformation failed' }
+            @($r, $w)
+        }
+        $in = & $pipe $false; $out = & $pipe $true; $err = & $pipe $true
+        $si = & $alloc 104
+        $m::WriteInt32($si, 0, 104); $m::WriteInt32($si, 60, 0x100)   # STARTUPINFOW { cb; dwFlags = STARTF_USESTDHANDLES; hStd* at 80, 88, 96 }
+        $m::WriteIntPtr($si, 80, $in[0]); $m::WriteIntPtr($si, 88, $out[1]); $m::WriteIntPtr($si, 96, $err[1])
+        $pi = & $alloc 24
+        $cmd = (@($Psi.FileName) + @($Psi.ArgumentList | ForEach-Object { $_ }) | ForEach-Object { ConvertTo-DvWindowsArg $_ }) -join ' '
+        $keys = [string[]]@($Psi.Environment.Keys); [Array]::Sort($keys, [StringComparer]::OrdinalIgnoreCase)
+        $envText = (($keys | ForEach-Object { $_ + '=' + $Psi.Environment[$_] }) -join "`0") + "`0`0"
+        $cmdPtr = $m::StringToHGlobalUni($cmd); $mem.Add($cmdPtr)
+        $envPtr = $m::StringToHGlobalUni($envText); $mem.Add($envPtr)
+        # CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW, the parent's current directory, handles inherited (as Process.Start does).
+        if (-not $Native::CreateProcessW([IntPtr]::Zero, $cmdPtr, [IntPtr]::Zero, [IntPtr]::Zero, $true, [uint32](0x4 -bor 0x400 -bor 0x08000000), $envPtr, [IntPtr]::Zero, $si, $pi)) { throw 'CreateProcessW failed' }
+        $suspendedProcess = $m::ReadIntPtr($pi, 0); $suspendedThread = $m::ReadIntPtr($pi, 8); $childPid = $m::ReadInt32($pi, 16)
+        try {
+            $proc = [System.Diagnostics.Process]::GetProcessById($childPid)
+            if ($null -ne $script:DvStartGate) { & $script:DvStartGate }
+            [void]$Native::AssignProcessToJobObject($Job, $suspendedProcess)   # a false return leaves Kill($true) only, as before
+        } catch {
+            # Never leave a suspended child behind, and never let the Process.Start fallback run a second git beside it.
+            try { [System.Diagnostics.Process]::GetProcessById($childPid).Kill() } catch { $null = $_ }
+            throw
+        }
+        [void]$Native::ResumeThread($suspendedThread)
+        # The child's ends and the stdin writer close here: the child holds its own copies, and a closed stdin reads EOF at once.
+        foreach ($h in @($in[0], $in[1], $out[1], $err[1])) { [void]$Native::CloseHandle($h); [void]$handles.Remove($h) }
+        $outStream = [System.IO.Pipes.AnonymousPipeClientStream]::new([System.IO.Pipes.PipeDirection]::In, [Microsoft.Win32.SafeHandles.SafePipeHandle]::new($out[0], $true))
+        [void]$handles.Remove($out[0])
+        $errStream = [System.IO.Pipes.AnonymousPipeClientStream]::new([System.IO.Pipes.PipeDirection]::In, [Microsoft.Win32.SafeHandles.SafePipeHandle]::new($err[0], $true))
+        [void]$handles.Remove($err[0])
+        # The process handle stays open for the caller (Handle): Process.ExitCode does not read for a process opened by id, GetExitCodeProcess does.
+        $handle = $suspendedProcess; $suspendedProcess = [IntPtr]::Zero
+        [pscustomobject]@{ Process = $proc; Handle = $handle; Out = $outStream; Err = [System.IO.StreamReader]::new($errStream, [Text.UTF8Encoding]::new($false), $true) }
+    } catch {
+        $null
+    } finally {
+        foreach ($h in $handles) { [void]$Native::CloseHandle($h) }
+        if ($suspendedThread -ne [IntPtr]::Zero) { [void]$Native::CloseHandle($suspendedThread) }
+        if ($suspendedProcess -ne [IntPtr]::Zero) { [void]$Native::CloseHandle($suspendedProcess) }
+        foreach ($p in $mem) { $m::FreeHGlobal($p) }
+    }
+}
+
+function Get-DvExitCode {
+    # The exit code of an exited git: Process.ExitCode, except for a process Start-DvGitInJob started (its Process was opened by id, whose
+    # ExitCode does not read), where it is GetExitCodeProcess on the handle the call kept. A signed int, as Process.ExitCode is.
+    param([Parameter(Mandatory)]$Proc, $Started, $Native)
+    if ($null -eq $Started) { return $Proc.ExitCode }
+    [uint32]$code = 0
+    [void]$Native::GetExitCodeProcess($Started.Handle, [ref]$code)
+    [BitConverter]::ToInt32([BitConverter]::GetBytes($code), 0)
+}
+
+# The program Invoke-DvGit starts. Module-private on purpose and NOT an environment variable: the caller's environment must never be able to
+# swap the git that admission reads from. A test sets it inside the module scope to make Process.Start throw.
+$script:DvGitExecutable = 'git'
+# Job objects opened and closed by Invoke-DvGit (Windows). Equal after every call; a test reads them to prove no handle leaks.
+$script:DvJobsOpened = 0
+$script:DvJobsClosed = 0
+# Where Invoke-DvGit collects git's stdout. Module-private seam: a test swaps in a sink that faults, to prove a faulted pipe read is typed.
+$script:DvGitNewSink = { [IO.MemoryStream]::new() }
+
 function Invoke-DvGit {
     # Run git in $RepoRoot; returns exit code, stdout BYTES (a blob must not be re-encoded or newline-translated) and stderr.
+    # Bounded (Get-DvGitTimeoutMilliseconds): a git that does not return is killed with its children and reported as exit -1 with a
+    # DV_GIT_TIMEOUT stderr, so the caller refuses typed instead of waiting out the CI job cap. git gets a closed stdin, no prompt and no pager.
+    # A git that exits while a process it started still holds its stdout/stderr open is killed the same way and is exit -1 with a
+    # DV_GIT_PIPE_STRAGGLER stderr: every bounded failure is exit -1 with a typed stderr, never git's exit code with partial bytes.
     param([Parameter(Mandatory)][string]$RepoRoot, [Parameter(Mandatory)][string[]]$GitArgs)
-    $psi = [System.Diagnostics.ProcessStartInfo]::new('git')
-    $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.CreateNoWindow = $true
+    $psi = [System.Diagnostics.ProcessStartInfo]::new($script:DvGitExecutable)
+    $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.RedirectStandardInput = $true; $psi.CreateNoWindow = $true
+    $psi.Environment['GIT_TERMINAL_PROMPT'] = '0'; $psi.Environment['GIT_PAGER'] = 'cat'
     # The repo is the one at $RepoRoot and nothing else: a GIT_DIR / GIT_WORK_TREE / GIT_INDEX_FILE / object-store override in the
     # caller's environment would point git at a scratch repo whose "committed" files are whatever the caller wrote, and a replace
     # ref would swap a blob for another one under the same id (--no-replace-objects).
     foreach ($name in @($psi.Environment.Keys | Where-Object { $_ -match '^GIT_(DIR|WORK_TREE|INDEX_FILE|OBJECT_DIRECTORY|ALTERNATE_OBJECT_DIRECTORIES|COMMON_DIR|NAMESPACE|REPLACE_REF_BASE|NO_REPLACE_OBJECTS)$' })) { [void]$psi.Environment.Remove($name) }
     foreach ($a in (@('--no-replace-objects', '-C', $RepoRoot) + $GitArgs)) { [void]$psi.ArgumentList.Add($a) }
-    $proc = [System.Diagnostics.Process]::Start($psi)
+    $limit = Get-DvGitTimeoutMilliseconds
+    # A fresh tag per call, inherited by everything git starts: how Stop-DvGitCall finds those children on Linux once their parent is gone.
+    $tag = [guid]::NewGuid().ToString('N')
+    $psi.Environment['DV_GIT_CALL_TAG'] = $tag
+    $native = Get-DvJobNative
+    $job = [IntPtr]::Zero
+    $proc = $null
+    $outTask = $null; $errTask = $null
+    $pipes = $null   # the raw pipe streams of the suspended-start path: closed here once both reads have completed (Process.Dispose closes the others)
     try {
-        $errTask = $proc.StandardError.ReadToEndAsync()
-        $ms = [IO.MemoryStream]::new()
-        $proc.StandardOutput.BaseStream.CopyTo($ms)
-        $proc.WaitForExit()
-        [pscustomobject]@{ exitCode = $proc.ExitCode; bytes = $ms.ToArray(); stderr = $errTask.Result }
-    } finally { $proc.Dispose() }
+        # r3 (CoS N3): the job object is created inside this try, so the finally below always closes it, and a Start that throws (git not on
+        # PATH) is a typed refusal like every other bounded failure, exit -1, never an exception the caller has not handled. r2 created the job
+        # first and started the process outside the try, which leaked the job handle when Start threw.
+        if ($null -ne $native) {
+            $job = $native::CreateJobObjectW([IntPtr]::Zero, [IntPtr]::Zero)
+            if ($job -ne [IntPtr]::Zero) { $script:DvJobsOpened++ }
+        }
+        # CI-FLAKE-DV-GIT-PIPE-STRAGGLER-KILL-1: on Windows git is started suspended and resumed only once it is in the job (Start-DvGitInJob),
+        # so everything it starts is in the job. Process.Start and then Assign (the fallback below) left a window in which a child escaped it.
+        $started = $(if ($job -ne [IntPtr]::Zero) { Start-DvGitInJob -Native $native -Job $job -Psi $psi })
+        if ($null -ne $started) {
+            $proc = $started.Process
+            $pipes = $started
+            $outStream = $started.Out
+            $errTask = $started.Err.ReadToEndAsync()
+        } else {
+            try { $proc = [System.Diagnostics.Process]::Start($psi) }
+            catch { return [pscustomobject]@{ exitCode = -1; bytes = [byte[]]@(); stderr = "DV_GIT_START_FAILED git could not be started: $($_.Exception.Message)" } }
+            if ($null -ne $script:DvStartGate) { & $script:DvStartGate }
+            # Everything git starts from here on is in the job. A child git started in the window before this call would escape it, but the
+            # refusals below do not depend on the kill: a timeout or a straggler is exit -1 whether or not its processes could be killed.
+            if ($job -ne [IntPtr]::Zero) { [void]$native::AssignProcessToJobObject($job, $proc.Handle) }
+            $proc.StandardInput.Close()
+            $errTask = $proc.StandardError.ReadToEndAsync()
+            $outStream = $proc.StandardOutput.BaseStream
+        }
+        $ms = & $script:DvGitNewSink
+        $outTask = $outStream.CopyToAsync($ms)
+        if (-not $proc.WaitForExit($limit)) {
+            # try { $proc.Kill($true) } catch { $null = $_ }   (r1; Stop-DvGitCall does this and also reaches children whose parent exited)
+            Stop-DvGitCall -Proc $proc -Job $job -Tag $tag
+            [void]$proc.WaitForExit(5000)
+            return [pscustomobject]@{ exitCode = -1; bytes = [byte[]]@(); stderr = "DV_GIT_TIMEOUT git did not return within $($limit / 1000) s: git $($GitArgs -join ' ')" }
+        }
+        # r1: "the pipes close when git (and anything it started) exits; a straggler holding one open must not outlast a bounded wait"
+        # r1: [void]$outTask.Wait(10000), then git's own exit code with $ms.ToArray(): the wait's result was dropped (CoS I1, PR #472).
+        # git has exited, but its pipes close only when every process holding them has exited too. A child that outlives git with stdout or
+        # stderr still open is a typed failure, exit -1 (DV_GIT_PIPE_STRAGGLER, a sibling of DV_GIT_TIMEOUT): never git's own exit code with
+        # the bytes that happened to arrive, and never ToArray() while CopyToAsync may still be writing. The drain shares the git bound.
+        $drain = [Math]::Min(10000, $limit)
+        # HARDENING-2 (2): a faulted pipe read makes WaitAll throw (AggregateException). That is a typed failure too, exit -1 DV_GIT_PIPE_FAULT.
+        $drained = $false; $fault = $null
+        try { $drained = [System.Threading.Tasks.Task]::WaitAll([System.Threading.Tasks.Task[]]@($outTask, $errTask), $drain) } catch { $fault = $_.Exception.GetBaseException() }
+        if ($null -ne $fault) {
+            Stop-DvGitCall -Proc $proc -Job $job -Tag $tag
+            return [pscustomobject]@{ exitCode = -1; bytes = [byte[]]@(); stderr = "DV_GIT_PIPE_FAULT reading git's output failed ($($fault.GetType().Name): $($fault.Message)): git $($GitArgs -join ' ')" }
+        }
+        if (-not $drained) {
+            $gitExit = Get-DvExitCode -Proc $proc -Started $pipes -Native $native
+            Stop-DvGitCall -Proc $proc -Job $job -Tag $tag
+            # r3 (CoS N4): the kill is confirmed by the evidence that matters, the pipes closing. Closed within 5 s = every holder of the pipe
+            # closed its copy of it (KILL-NOT-CONFIRMED-ROW-1: a holder that ended on its own in that window counts, as does one that was killed).
+            $confirmed = $false
+            try { $confirmed = [System.Threading.Tasks.Task]::WaitAll([System.Threading.Tasks.Task[]]@($outTask, $errTask), 5000) } catch { $null = $_ }
+            return [pscustomobject]@{ exitCode = -1; bytes = [byte[]]@(); stderr = (Get-DvStragglerMessage -GitExit $gitExit -Seconds ($drain / 1000) -KillConfirmed $confirmed -GitArgs $GitArgs) }
+        }
+        [pscustomobject]@{ exitCode = (Get-DvExitCode -Proc $proc -Started $pipes -Native $native); bytes = $ms.ToArray(); stderr = $errTask.Result }
+    } finally {
+        # Only when both reads are done: closing a pipe handle under a blocked read can block, and an unconfirmed straggler still holds it.
+        if ($null -ne $pipes -and $null -ne $outTask -and $null -ne $errTask -and $outTask.IsCompleted -and $errTask.IsCompleted) {
+            $pipes.Out.Dispose(); $pipes.Err.Dispose()
+        }
+        if ($null -ne $pipes) { [void]$native::CloseHandle($pipes.Handle) }
+        if ($null -ne $proc) { $proc.Dispose() }
+        # r2 (opus): the counter moves only on CloseHandle's own true return, so a build that drops the call can no longer pass the open = closed pin.
+        if ($job -ne [IntPtr]::Zero -and $native::CloseHandle($job)) { $script:DvJobsClosed++ }
+    }
 }
 
 function Get-DvCommittedFile {
@@ -315,6 +556,8 @@ function Get-DvBlobIdAtCommit {
 }
 
 $script:LegsRelativeDir = 'tools/profiling/dual-venue/legs'
+# Ordinal keys (HARDENING-2 (3)): @{} compares case-insensitively, so /tmp/Repo and /tmp/repo (two repos on a case-sensitive filesystem) shared an entry.
+$script:LegBlobCache = [hashtable]::new([StringComparer]::Ordinal)
 $script:LookReceiptPattern = '^look-receipts/[a-z0-9-]+\.marxml$'
 
 function Read-DvCommittedLookReceipt {
@@ -358,7 +601,17 @@ function Find-DvCommittedLegSpec {
         if ($row -cnotmatch '^[0-7]{6} blob (?<id>[0-9a-f]{40})\t(?<path>.+)$') { continue }
         $id = $Matches['id']; $path = $Matches['path'].Trim()
         if (-not $path.EndsWith('.json')) { continue }
-        $blob = Get-DvBlobById -RepoRoot $RepoRoot -BlobSha $id
+        # A blob id names its bytes for good, so a blob read once is not read again by the next lookup of this process: every lookup used to
+        # re-read every blob of the directory (two git spawns each), which made finding all N shipped legs quadratic in N.
+        # Keyed by repo AND blob id (CoS N1): a hit must not skip Get-DvBlobById's "a blob of this repository" check for a second repo
+        # that one process looks at (as the tests do). r1 keyed by $id alone.
+        # HARDENING-2 (3): the root is normalised, so 'C:\r', 'C:\r\' and 'C:\x\..\r' are one repo and one entry per blob.
+        $cacheKey = [IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetFullPath($RepoRoot)) + [char]0 + $id
+        $blob = $script:LegBlobCache[$cacheKey]
+        if ($null -eq $blob) {
+            $blob = Get-DvBlobById -RepoRoot $RepoRoot -BlobSha $id
+            if ($blob.ok) { $script:LegBlobCache[$cacheKey] = $blob }
+        }
         if ($blob.ok -and (Get-DvLegSpecSha256 $blob.bytes) -ceq $LegSpecSha256) {
             return [pscustomobject]@{ ok = $true; relativePath = $path; blobSha = $id; text = $blob.text }
         }
@@ -543,7 +796,22 @@ function Get-DvClipAdmission {
 # `$runNonce = ...`): 32 lowercase hex, no prefix. The rule accepts exactly that and nothing else; test_dual_venue_evidence.py
 # evaluates the launcher's own expression and feeds it to this rule, so a producer-format change turns a test red.
 $script:RunNoncePattern = '^[0-9a-f]{32}$'
-$script:MinPlaySeconds = 20.0
+# PLAYBACK-CLIP-LENGTH-HFR-10S-1 (owner amendment 2026-10-15): the floor is a function of the footage's NATIVE fps -- 10 s at
+# >= 50 fps (HFR), 20 s below, 20 s when unknown (fail closed). Mirrors platform/qt/PlaybackFrameRange.h minPlayWindowSeconds
+# and gui-smoke-length-gate.ps1 Get-GuiSmokeMinPlaySeconds (this module is loaded without that file); a parity test compares them.
+$script:StandardMinPlaySeconds = 20.0
+$script:HfrMinPlaySeconds = 10.0
+$script:HfrNativeFpsThreshold = 50.0
+
+function Get-DvMinPlaySeconds {
+    # The play floor of footage at -NativeFps; -LowestAnyClip: the floor where the footage is not known yet (a leg spec names a
+    # clip id, never its fps), i.e. only what NO clip could admit -- the venue's runner and the app apply the clip's own floor.
+    param([AllowNull()]$NativeFps, [switch]$LowestAnyClip)
+    if ($LowestAnyClip) { return $script:HfrMinPlaySeconds }
+    $fps = ConvertTo-DvDouble $NativeFps
+    if ($null -ne $fps -and -not [double]::IsNaN($fps) -and -not [double]::IsInfinity($fps) -and $fps -ge $script:HfrNativeFpsThreshold) { return $script:HfrMinPlaySeconds }
+    $script:StandardMinPlaySeconds
+}
 
 function ConvertTo-DvInt64 {
     # $null for absent / a bool / not an integer: an unparsable number is ABSENT, never zero.
@@ -651,14 +919,16 @@ function Get-DvPlaybackProblems {
     if ($null -eq $advanced) { $reasons.Add('RECEIPT_FIELD_ABSENT: source_advanced') }
     if ($null -eq $required) { $reasons.Add('RECEIPT_FIELD_ABSENT: required_source_frames') }
     elseif ($required -lt 20) { $reasons.Add("INVALID_SOURCE_FRAMES: required_source_frames=$required is under the 20-frame floor; the admitted Play was shorter than 20 s of footage") }
+    # The floor, derived here from the footage's own frame rate: ceil(floor x native fps) frames (HFR-10S-1: Get-DvMinPlaySeconds,
+    # 10 s at >= 50 fps, else 20 s).
+    $floorSeconds = Get-DvMinPlaySeconds -NativeFps $native
     if ($null -ne $advanced -and $null -ne $required) {
-        if ($advanced -lt $required) { $reasons.Add("INVALID_SOURCE_FRAMES: source_advanced=$advanced is under required_source_frames=$required; under 20 s of real footage is never evidence") }
+        if ($advanced -lt $required) { $reasons.Add("INVALID_SOURCE_FRAMES: source_advanced=$advanced is under required_source_frames=$required; under $floorSeconds s of real footage is never evidence") }
     }
-    # The 20 s floor, derived here from the footage's own frame rate: ceil(20 s x native fps) frames.
     if ($null -eq $native) { $reasons.Add('RECEIPT_FIELD_ABSENT: native_fps') }
     elseif ($native -le 0) { $reasons.Add("INVALID_SOURCE_FRAMES: native_fps=$native; the native frame rate is unknown, so 20 s of footage cannot be measured") }
-    elseif ($null -ne $required -and $required -lt [int64][Math]::Ceiling($script:MinPlaySeconds * $native - 0.02)) {
-        $reasons.Add("INVALID_SOURCE_FRAMES: required_source_frames=$required is under ceil(20 s x native_fps=$native); the Play was admitted for less than 20 s of footage")
+    elseif ($null -ne $required -and $required -lt [int64][Math]::Ceiling($floorSeconds * $native - 0.02)) {
+        $reasons.Add("INVALID_SOURCE_FRAMES: required_source_frames=$required is under ceil($floorSeconds s x native_fps=$native); the Play was admitted for less than $floorSeconds s of footage")
     }
     if ($null -eq $pace) { $reasons.Add('RECEIPT_FIELD_ABSENT: pace_fps') }
     elseif ($pace -le 0) { $reasons.Add("INVALID_SOURCE_FRAMES: pace_fps=$pace; a present engine pace that is not positive is unknown") }
@@ -771,6 +1041,24 @@ function Get-DvPlaybackEvidence {
     $pb['valid'] = ($problems.Count -eq 0)
     $pb['invalidReasons'] = $problems
     $pb
+}
+
+function Get-DvScaleLabel {
+    <#
+    .SYNOPSIS
+    The words a person reads for a playback scale FACTOR (SCALE-LABEL-CLARITY-1): 1 -> 'Full res (1x)', 2 -> 'Half res (0.5x)', 4 -> 'Quarter res (0.25x)', else 'Custom res (1/N)'.
+    Mirrors PlaybackScaleLabel::resolutionLabel in platform/qt/PlaybackScaleLabel.h; a null or non-numeric factor (scale not yet known) gives 'unknown res'. The factor stays in receipt keys and leg ids.
+    #>
+    [CmdletBinding()]
+    param([AllowNull()][object]$Factor)
+    $n = 0
+    if ($null -eq $Factor -or -not [int]::TryParse([string]$Factor, [ref]$n) -or $n -lt 1) { return 'unknown res' }
+    switch ($n) {
+        1 { 'Full res (1x)' }
+        2 { 'Half res (0.5x)' }
+        4 { 'Quarter res (0.25x)' }
+        default { "Custom res (1/$n)" }
+    }
 }
 
 function Get-DvScaleEvidence {
@@ -1094,7 +1382,8 @@ function ConvertTo-DvMatrixTable {
         $range = $(if ($pf.Count -gt 0) { '(' + (& $f ($pf | Measure-Object -Minimum).Minimum 2) + '-' + (& $f ($pf | Measure-Object -Maximum).Maximum 2) + ')' } else { '' })
         $presented = ((& $f (Get-DvMedian $pf) 2) + ' ' + $range).Trim()
         $observed = @($mine | ForEach-Object { $_.observedDisplay } | Sort-Object -Unique) -join ','
-        $eff = @($mine | ForEach-Object { "$($c.scaleFactor)->$($_.effectiveScale)" } | Sort-Object -Unique) -join ','
+        # The words a person reads (SCALE-LABEL-CLARITY-1 r2), from the same mapping as the plan line and outcomeDetail; the row's numeric requested/effective fields are unchanged.
+        $eff = @($mine | ForEach-Object { "$(Get-DvScaleLabel -Factor $c.scaleFactor)->$(Get-DvScaleLabel -Factor $_.effectiveScale)" } | Sort-Object -Unique) -join ','
         $win = @($mine | Where-Object { $_.windowSize } | ForEach-Object { if ($_.previewSize) { "$($_.windowSize) ($($_.previewSize))" } else { $_.windowSize } } | Sort-Object -Unique) -join ', '
         $outcomes = @($mine | ForEach-Object { $_.outcome } | Group-Object | Sort-Object Name | ForEach-Object { "$($_.Name) x$($_.Count)" }) -join ', '
         $lines.Add("| $($c.cellId) | $($c.backend) | $($c.displayMode) / $(if ($observed) { $observed } else { '-' }) | $eff | $(if ($win) { $win } else { '-' }) | $($meas.Count)/$($mine.Count) | $presented | $(& $f (Get-DvMedian @($meas | ForEach-Object { $_.timelineFpsAfterFirstPresent })) 2) | $(& $f (Get-DvMedian @($meas | ForEach-Object { $_.renderWorkMs })) 1) | $(& $f (Get-DvMedian @($meas | ForEach-Object { $_.dualIsoMs })) 1) | $(if ($outcomes) { $outcomes } else { '-' }) |")
@@ -1384,18 +1673,25 @@ function Get-DvVisualViewportPixels {
     .SYNOPSIS
     The video viewport of one captured window PNG, downscaled (high-quality bilinear) to -Width x -Height, as packed RGB bytes, plus their sha256
     (the frame's CONTENT hash: equal pictures hash equal whatever the chrome around them shows) and the pixel mean / standard deviation. The
-    viewport rectangle is the app's own (visual.json, in the saved image's pixels); absent or empty, the whole image is used.
+    viewport rectangle is the app's own (visual.json, in the saved image's pixels). Absent or empty it is UNUSABLE: with -RequireViewport the
+    function returns $null (the window's timecode and chrome change over a frozen picture, so the whole image never stands in for the picture);
+    without it the whole image is used (callers that only want pixels).
     #>
-    param([Parameter(Mandatory)][string]$Path, $Viewport, [int]$Width = 64, [int]$Height = 36)
+    param([Parameter(Mandatory)][string]$Path, $Viewport, [int]$Width = 64, [int]$Height = 36, [switch]$RequireViewport)
     Add-Type -AssemblyName System.Drawing
     $src = [System.Drawing.Bitmap]::new($Path)
     try {
         $rect = [System.Drawing.Rectangle]::new(0, 0, $src.Width, $src.Height)
+        $viewportUsable = $false
         if ($null -ne $Viewport) {
             $vx = [int](Get-DvProp $Viewport 'x'); $vy = [int](Get-DvProp $Viewport 'y'); $vw = [int](Get-DvProp $Viewport 'w'); $vh = [int](Get-DvProp $Viewport 'h')
             if ($vw -gt 0 -and $vh -gt 0) { $rect = [System.Drawing.Rectangle]::Intersect($rect, [System.Drawing.Rectangle]::new($vx, $vy, $vw, $vh)) }
+            $viewportUsable = ($vw -gt 0 -and $vh -gt 0 -and $rect.Width -gt 0 -and $rect.Height -gt 0)
         }
-        if ($rect.Width -le 0 -or $rect.Height -le 0) { $rect = [System.Drawing.Rectangle]::new(0, 0, $src.Width, $src.Height) }
+        if (-not $viewportUsable) {
+            if ($RequireViewport) { return $null }
+            $rect = [System.Drawing.Rectangle]::new(0, 0, $src.Width, $src.Height)
+        }
         # The viewport is CLONED out first and scaled with edge mirroring: a filtered scale of a sub-rectangle reads the pixels just outside it,
         # which are the window chrome -- and the chrome (timecode, fps) changes over a frozen picture.
         $crop = $src.Clone($rect, [System.Drawing.Imaging.PixelFormat]::Format24bppRgb)
@@ -1446,22 +1742,34 @@ function Get-DvVisualVerdict {
     <#
     .SYNOPSIS
     The visual gate, from numbers only (pure). FROZEN_DISPLAY: every play frame shows ONE picture while the app says it presented more than
-    one frame across them -- the measured trap where every cadence metric reads perfect over a frozen display; such a leg is NOT counted.
+    one frame across them AND the source frames are KNOWN to differ (-SourceDifference known-differ) -- the measured trap where every cadence metric
+    reads perfect over a frozen display; such a leg is NOT counted. The same picture over known-identical source frames is a static clip, not frozen
+    (OK); over an unknown source (the default: nothing records it, so it is never guessed) it is FROZEN_DISPLAY_SUSPECTED, counted and surfaced.
+    -PlayFrames is the number of JUDGED play frames (those with a usable viewport); -ViewportUnavailablePlayFrames are the saved ones without. The judged
+    frames are judged first: two or more of them are enough for FROZEN_DISPLAY and the other verdicts, whatever the rest lack.
+    VISUAL_ASSESSMENT_UNAVAILABLE: play frames lack a usable viewport rectangle AND fewer than two judged ones remain, so nothing is judged (counted, surfaced; never the whole window).
     VISUAL_DIVERGENCE: the playback-path frame is further than the threshold from its paused full-quality re-render; counted for speed and
     surfaced. CAPTURE_BLANK: every play frame's viewport is flat (a blank capture judges nothing). NOT_CAPTURED / NOT_REQUESTED: no captures.
     #>
     param([bool]$Requested, [bool]$Captured, [int]$PlayFrames, [int]$DistinctContentHashes, [int]$AppDistinctDisplayFrames, [int]$FlatPlayFrames,
-          $PlayVsPausedMeanAbsDiff, [bool]$SamePosition, [double]$Threshold = $script:VisualDivergenceThreshold)
+          $PlayVsPausedMeanAbsDiff, [bool]$SamePosition, [double]$Threshold = $script:VisualDivergenceThreshold,
+          [ValidateSet('known-differ', 'known-identical', 'unknown')][string]$SourceDifference = 'unknown', [int]$ViewportUnavailablePlayFrames = 0)
     if (-not $Requested) { return [pscustomobject]@{ verdict = 'NOT_REQUESTED'; counted = $true; reason = 'the leg spec opts out of window captures' } }
+    if ($ViewportUnavailablePlayFrames -gt 0 -and $PlayFrames -lt 2) { return [pscustomobject]@{ verdict = 'VISUAL_ASSESSMENT_UNAVAILABLE'; counted = $true; reason = "$ViewportUnavailablePlayFrames play frame(s) have no usable viewport rectangle (visual.json), leaving $PlayFrames judged, so the picture cannot be told from the window's timecode and chrome: no visual assessment" } }
     if (-not $Captured -or $PlayFrames -lt 2) { return [pscustomobject]@{ verdict = 'NOT_CAPTURED'; counted = $true; reason = "only $PlayFrames play frame(s) were captured" } }
     if ($FlatPlayFrames -ge $PlayFrames) { return [pscustomobject]@{ verdict = 'CAPTURE_BLANK'; counted = $true; reason = 'every play frame''s viewport is flat: the capture shows no picture, so it judges nothing' } }
-    if ($DistinctContentHashes -eq 1 -and $AppDistinctDisplayFrames -gt 1) {
-        return [pscustomobject]@{ verdict = 'FROZEN_DISPLAY'; counted = $false; reason = "the $PlayFrames play frames show ONE picture while the app presented $AppDistinctDisplayFrames distinct frames across them" }
+    if ($DistinctContentHashes -eq 1 -and $AppDistinctDisplayFrames -gt 1 -and $SourceDifference -ceq 'known-differ') {
+        return [pscustomobject]@{ verdict = 'FROZEN_DISPLAY'; counted = $false; reason = "the $PlayFrames play frames show ONE picture while the app presented $AppDistinctDisplayFrames distinct frames across them and the source frames are known to differ" }
+    }
+    if ($DistinctContentHashes -eq 1 -and $AppDistinctDisplayFrames -gt 1 -and $SourceDifference -ceq 'unknown') {
+        return [pscustomobject]@{ verdict = 'FROZEN_DISPLAY_SUSPECTED'; counted = $true; reason = "the $PlayFrames play frames show ONE picture while the app presented $AppDistinctDisplayFrames distinct frames across them, but nothing records whether the source frames differ (a static clip shows one picture legitimately): suspected, not excluded" }
     }
     if ($SamePosition -and $null -ne $PlayVsPausedMeanAbsDiff -and [double]$PlayVsPausedMeanAbsDiff -gt $Threshold) {
         return [pscustomobject]@{ verdict = 'VISUAL_DIVERGENCE'; counted = $true; reason = "the playback-path frame is $PlayVsPausedMeanAbsDiff (per-channel mean absolute difference, 0..255) from its paused full-quality re-render; the threshold is $Threshold" }
     }
-    [pscustomobject]@{ verdict = 'OK'; counted = $true; reason = $null }
+    # one picture over source frames the app itself records as identical: the frozen check was waived on its word, so the receipt says so
+    $waivedReason = $(if ($DistinctContentHashes -eq 1 -and $AppDistinctDisplayFrames -gt 1 -and $SourceDifference -ceq 'known-identical') { 'one picture; the app records the source frames as identical: a static clip' } else { $null })
+    [pscustomobject]@{ verdict = 'OK'; counted = $true; reason = $waivedReason }
 }
 
 function New-DvVisualStrip {
@@ -1525,18 +1833,24 @@ function Read-DvVisualCaptures {
     $block = [ordered]@{
         schema = $script:VisualSchema; requested = $Requested; optOutReason = $(if ($Requested) { $null } else { $OptOutReason })
         method = $null; forwarded = $null; probe = $null; probeReason = $null; captured = $false
-        frames = @(); playFrames = 0; distinctContentHashes = 0; appDistinctDisplayFrames = 0; flatPlayFrames = 0
+        frames = @(); playFrames = 0; savedPlayFrames = 0; distinctContentHashes = 0; appDistinctDisplayFrames = 0; flatPlayFrames = 0
+        sourceDifference = 'unknown'; viewportUnavailablePlayFrames = 0
         stopFrame = $null; pausedSettled = $null; pausedFrame = $null; samePosition = $false
         playVsPausedMeanAbsDiff = $null; playVsPausedMeanAbsDiffPerChannel = $null; divergenceThreshold = $script:VisualDivergenceThreshold
         tailBeginUtc = $null; tailEndUtc = $null; presentMonWindowEndUtc = $null
         stripPath = $null; stripSha256 = $null; stripCopyPath = $null
         verdict = $null; counted = $true; reason = $null; appError = $null
     }
+    $notJudgedNote = $null   # set once the frames are read; kept after a verdict reason rather than replaced by it
+    $stripNote = $null       # set when the strip cannot be composed; kept the same way, after the not-judged note
     $finish = {
         $v = Get-DvVisualVerdict -Requested $Requested -Captured ([bool]$block.captured) -PlayFrames ([int]$block.playFrames) -DistinctContentHashes ([int]$block.distinctContentHashes) `
-            -AppDistinctDisplayFrames ([int]$block.appDistinctDisplayFrames) -FlatPlayFrames ([int]$block.flatPlayFrames) -PlayVsPausedMeanAbsDiff $block.playVsPausedMeanAbsDiff -SamePosition ([bool]$block.samePosition)
+            -AppDistinctDisplayFrames ([int]$block.appDistinctDisplayFrames) -FlatPlayFrames ([int]$block.flatPlayFrames) -PlayVsPausedMeanAbsDiff $block.playVsPausedMeanAbsDiff -SamePosition ([bool]$block.samePosition) `
+            -SourceDifference ([string]$block.sourceDifference) -ViewportUnavailablePlayFrames ([int]$block.viewportUnavailablePlayFrames)
         # a gate reason replaces a step's reason, except that a NOT_CAPTURED leg keeps the step that says WHY nothing was captured
-        if ($null -ne $v.reason -and -not ($v.verdict -ceq 'NOT_CAPTURED' -and $null -ne $block.reason)) { $block.reason = $v.reason }
+        # (the verdict reason comes first, then the note that some saved play frames were not judged, then the strip failure)
+        $notes = (@($notJudgedNote, $stripNote) | Where-Object { $_ }) -join '; '
+        if ($null -ne $v.reason -and -not ($v.verdict -ceq 'NOT_CAPTURED' -and $null -ne $block.reason)) { $block.reason = $(if ($notes) { "$($v.reason); $notes" } else { $v.reason }) }
         $block.verdict = $v.verdict; $block.counted = $v.counted
         $block
     }
@@ -1562,6 +1876,9 @@ function Read-DvVisualCaptures {
     Copy-Item -LiteralPath $appJsonShare -Destination (Join-Path $dir 'app-visual.json') -Force
     try { $app = [IO.File]::ReadAllText((Join-Path $dir 'app-visual.json')) | ConvertFrom-Json -ErrorAction Stop } catch { $block.reason = 'the app''s visual.json is not valid JSON'; return (& $finish) }
     $block.method = [string](Get-DvProp $app 'method'); $block.appError = [string](Get-DvProp $app 'error')
+    # Whether the source frames differ: only the app's own record says so (differ | identical, exactly that case: `identical` waives the gate, so `IDENTICAL`
+    # is not the app's word); anything else, or nothing, is unknown -- never a guess.
+    $block.sourceDifference = $(switch -CaseSensitive ([string](Get-DvProp $app 'source_difference')) { 'differ' { 'known-differ' } 'identical' { 'known-identical' } default { 'unknown' } })
     $block.tailBeginUtc = ConvertTo-DvVisualUtcText (Get-DvProp $app 'tail_begin_utc'); $block.tailEndUtc = ConvertTo-DvVisualUtcText (Get-DvProp $app 'tail_end_utc')
     $frames = [System.Collections.Generic.List[object]]::new()
     $pixels = @{}
@@ -1571,7 +1888,7 @@ function Read-DvVisualCaptures {
         $kind = [string](Get-DvProp $f 'kind'); $index = [int](Get-DvProp $f 'index'); $file = [string](Get-DvProp $f 'file')
         if ($kind -cnotin @('play', 'stop', 'paused') -or $file -cnotmatch '^(play-\d+|stop|paused)\.png$') { continue }
         $legName = $(if ($kind -ceq 'play') { "$LegId-play-$index.png" } else { "$LegId-$kind.png" })
-        $entry = [ordered]@{ kind = $kind; index = $index; file = $legName; sha256 = $null; contentHash = $null; viewportMean = $null; viewportStd = $null
+        $entry = [ordered]@{ kind = $kind; index = $index; file = $legName; sha256 = $null; contentHash = $null; viewportMean = $null; viewportStd = $null; viewportAvailable = $true
                              displayFrame = Get-DvProp $f 'display_frame'; playActive = Get-DvProp $f 'play_active'; tailElapsedMs = Get-DvProp $f 'tail_elapsed_ms'
                              captureMs = Get-DvProp $f 'capture_ms'; viewport = Get-DvProp $f 'viewport'; saved = [bool](Get-DvProp $f 'saved'); appReason = Get-DvProp $f 'reason' }
         $src = Join-Path $share $file
@@ -1580,9 +1897,12 @@ function Read-DvVisualCaptures {
             Copy-Item -LiteralPath $src -Destination $local -Force
             $entry.sha256 = Get-DvSha256OfFile $local
             try {
-                $hashPx = Get-DvVisualViewportPixels -Path $local -Viewport $entry.viewport -Width $script:VisualHashSize[0] -Height $script:VisualHashSize[1]
-                $entry.contentHash = $hashPx.contentHash; $entry.viewportMean = $hashPx.mean; $entry.viewportStd = $hashPx.std
-                if ($kind -cne 'play') { $pixels[$kind] = (Get-DvVisualViewportPixels -Path $local -Viewport $entry.viewport -Width $script:VisualDiffSize[0] -Height $script:VisualDiffSize[1]).rgb }
+                $hashPx = Get-DvVisualViewportPixels -Path $local -Viewport $entry.viewport -Width $script:VisualHashSize[0] -Height $script:VisualHashSize[1] -RequireViewport
+                if ($null -eq $hashPx) { $entry.viewportAvailable = $false }   # no usable viewport rectangle: the whole window is never hashed in its place
+                else {
+                    $entry.contentHash = $hashPx.contentHash; $entry.viewportMean = $hashPx.mean; $entry.viewportStd = $hashPx.std
+                    if ($kind -cne 'play') { $pixels[$kind] = (Get-DvVisualViewportPixels -Path $local -Viewport $entry.viewport -Width $script:VisualDiffSize[0] -Height $script:VisualDiffSize[1] -RequireViewport).rgb }
+                }
             } catch { $entry.appReason = "the runner could not read the image: $($_.Exception.GetType().Name)" }
         }
         if ($kind -ceq 'paused') { $block.pausedSettled = Get-DvProp $f 'settled'; $block.pausedFrame = Get-DvProp $f 'settled_frame' }
@@ -1590,9 +1910,17 @@ function Read-DvVisualCaptures {
         $frames.Add([pscustomobject]$entry)
     }
     $block.frames = $frames.ToArray()
+    # `playFrames` counts the JUDGED play frames (those with a usable viewport); `savedPlayFrames` the play PNGs the app saved and the runner copied;
+    # `captured` is true when any was saved, so a leg whose every viewport is missing still says six pictures were captured and none judged.
     $play = @($frames | Where-Object { $_.kind -ceq 'play' -and $_.contentHash })
     $block.playFrames = $play.Count
-    $block.captured = ($play.Count -gt 0)
+    $block.savedPlayFrames = @($frames | Where-Object { $_.kind -ceq 'play' -and $_.sha256 }).Count
+    $block.captured = ($block.savedPlayFrames -gt 0)
+    $block.viewportUnavailablePlayFrames = @($frames | Where-Object { $_.kind -ceq 'play' -and $_.sha256 -and -not $_.viewportAvailable }).Count
+    if ($block.viewportUnavailablePlayFrames -gt 0 -and $play.Count -ge 2) {
+        $notJudgedNote = "$($block.viewportUnavailablePlayFrames) saved play frame(s) have no usable viewport rectangle and were not judged; the other $($play.Count) were"
+        if (-not $block.reason) { $block.reason = $notJudgedNote }
+    }
     $block.distinctContentHashes = @($play | ForEach-Object { $_.contentHash } | Sort-Object -Unique).Count
     $block.appDistinctDisplayFrames = @($play | ForEach-Object { $_.displayFrame } | Where-Object { $null -ne $_ -and [int]$_ -ge 0 } | Sort-Object -Unique).Count
     $block.flatPlayFrames = @($play | Where-Object { $null -ne $_.viewportStd -and [double]$_.viewportStd -lt $script:VisualFlatViewportStd }).Count
@@ -1607,12 +1935,16 @@ function Read-DvVisualCaptures {
         [pscustomobject]@{ path = $(if ($_.sha256) { Join-Path $dir $_.file } else { $null }); viewport = $_.viewport; label = $label } })
     if ($tiles.Count -gt 0) {
         $v = Get-DvVisualVerdict -Requested $true -Captured ([bool]$block.captured) -PlayFrames ([int]$block.playFrames) -DistinctContentHashes ([int]$block.distinctContentHashes) `
-            -AppDistinctDisplayFrames ([int]$block.appDistinctDisplayFrames) -FlatPlayFrames ([int]$block.flatPlayFrames) -PlayVsPausedMeanAbsDiff $block.playVsPausedMeanAbsDiff -SamePosition ([bool]$block.samePosition)
+            -AppDistinctDisplayFrames ([int]$block.appDistinctDisplayFrames) -FlatPlayFrames ([int]$block.flatPlayFrames) -PlayVsPausedMeanAbsDiff $block.playVsPausedMeanAbsDiff -SamePosition ([bool]$block.samePosition) `
+            -SourceDifference ([string]$block.sourceDifference) -ViewportUnavailablePlayFrames ([int]$block.viewportUnavailablePlayFrames)
         $head = "$Header  visual=$($v.verdict)  distinct=$($block.distinctContentHashes)/$($block.playFrames)  play-vs-paused=$($block.playVsPausedMeanAbsDiff)"
         try {
             $block.stripPath = New-DvVisualStrip -Tiles $tiles -OutPath (Join-Path $dir "$LegId-strip.png") -Header $head.Trim()
             $block.stripSha256 = Get-DvSha256OfFile $block.stripPath
-        } catch { $block.reason = "the strip could not be composed: $($_.Exception.GetType().Name)" }
+        } catch {
+            $stripNote = "the strip could not be composed: $($_.Exception.GetType().Name)"
+            $block.reason = $(if ($block.reason) { "$($block.reason); $stripNote" } else { $stripNote })   # a plain OK keeps the not-judged note beside it
+        }
     }
     & $finish
 }
@@ -2057,7 +2389,8 @@ function Test-DvCriteria {
     <#
     .SYNOPSIS
     Evaluate a list of {metric, op, value} criteria against the verbatim-copied metrics. An absent metric
-    FAILS the criterion -- a missing number is never a passing number. An empty list is "no gating
+    FAILS the criterion -- a missing number is never a passing number; when the metrics carry a
+    non-empty <metric>CouldNotCheck, that typed reason is the failure text. An empty list is "no gating
     criteria" (informational), reported as such.
     #>
     param($Criteria, $Metrics)
@@ -2068,7 +2401,13 @@ function Test-DvCriteria {
     foreach ($c in $criteriaList) {
         $prop = $null
         if ($null -ne $Metrics) { $prop = $Metrics.PSObject.Properties[[string]$c.metric] }
-        if ($null -eq $prop -or $null -eq $prop.Value) { $failures.Add("$($c.metric): metric absent"); continue }
+        if ($null -eq $prop -or $null -eq $prop.Value) {
+            # GPU-DEVICE-LOSS-SELF-HEAL-1 r10: a producer that could not read a metric names why in <metric>CouldNotCheck; the verdict carries that typed reason.
+            $why = $(if ($null -ne $Metrics) { $Metrics.PSObject.Properties["$($c.metric)CouldNotCheck"] } else { $null })
+            if ($null -ne $why -and -not [string]::IsNullOrWhiteSpace([string]$why.Value)) { $failures.Add("$($c.metric): $($why.Value)") }
+            else { $failures.Add("$($c.metric): metric absent") }
+            continue
+        }
         $actual = $prop.Value; $want = $c.value; $ok = $false
         switch ([string]$c.op) {
             'eq' { $ok = ($actual -eq $want) }
@@ -2204,7 +2543,7 @@ function Write-DvReceipt {
 Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-DvSha256OfBytes, Get-DvSha256OfText, Get-DvSha256OfFile,
     ConvertTo-DvLfBytes, Get-DvLegSpecSha256, Get-DvDerivedBackend, Get-DvBackendNotDerivable, Read-DvContactFrames, Get-DvSubjectDigest,
     Get-DvVisualViewportPixels, Get-DvVisualMeanAbsDiff, Get-DvVisualVerdict, New-DvVisualStrip, Read-DvVisualCaptures, Get-DvVisualCaptureRequest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
-    Test-DvUnderClaudeState, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvPlaybackProblems,
-    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvHealthVerdict,
+    Test-DvUnderClaudeState, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvMinPlaySeconds, Get-DvPlaybackProblems,
+    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvHealthVerdict,
     New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout,
     Get-DvResultToken, Resolve-DvJobOutcome, Test-DvCriteria, Get-DvVerbatimMetrics, New-DvReceipt, Write-DvReceipt

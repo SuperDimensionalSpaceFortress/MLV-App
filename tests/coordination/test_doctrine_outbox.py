@@ -18,6 +18,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -50,9 +51,42 @@ def dated(seconds_ago: float) -> dict[str, str]:
     return {"GIT_AUTHOR_DATE": stamp, "GIT_COMMITTER_DATE": stamp}
 
 
+# COST (CI-SHARD8-GUARDRAILS-COST-1): the bus and source fixtures below were rebuilt from scratch for every
+# test -- eight to ten git processes each, about 0.1 s apiece on a hosted Windows runner -- and this file
+# builds them for well over a hundred tests. Each distinct fixture is now built ONCE per pytest session by
+# the original builder (`_build_bus` / `_build_source`, bodies unchanged) and every test gets its own
+# private copy of that directory tree, so no test can see another's writes. The one absolute path a copy
+# carries (the clone's `origin` url) is repointed at the copy's own bare repo.
+_FIXTURE_TEMPLATES: dict = {}
+_TEMPLATE_BASE: dict = {}
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _fixture_template_base(tmp_path_factory):
+    _TEMPLATE_BASE["dir"] = tmp_path_factory.getbasetemp()
+
+
+def _fixture_template(key: tuple, build):
+    """Build `key`'s fixture once under a fresh directory in the session's base temp dir, then reuse it."""
+    if key not in _FIXTURE_TEMPLATES:
+        _FIXTURE_TEMPLATES[key] = build(Path(tempfile.mkdtemp(prefix="outbox-fixture-template-", dir=_TEMPLATE_BASE["dir"])))
+    return _FIXTURE_TEMPLATES[key]
+
+
 def init_bus(tmp_path: Path, crlf_target: str | None = None, name: str = "bus",
              traps: str | None = None) -> tuple[Path, Path]:
     """A bare repo as the bus 'origin', and a clone of it as the bus working repo."""
+    template_bare, template_clone = _fixture_template(
+        ("bus", crlf_target, traps), lambda root: _build_bus(root, crlf_target, "bus", traps))
+    bare = tmp_path / f"{name}-origin.git"
+    clone = tmp_path / f"{name}-clone"
+    shutil.copytree(template_bare, bare)
+    shutil.copytree(template_clone, clone)
+    git(clone, "remote", "set-url", "origin", str(bare))
+    return bare, clone
+
+
+def _build_bus(tmp_path: Path, crlf_target: str | None, name: str, traps: str | None) -> tuple[Path, Path]:
     bare = tmp_path / f"{name}-origin.git"
     clone = tmp_path / f"{name}-clone"
     subprocess.run(["git", "init", "--bare", "-b", "master", str(bare)], check=True, capture_output=True, text=True)
@@ -74,6 +108,13 @@ def init_bus(tmp_path: Path, crlf_target: str | None = None, name: str = "bus",
 
 def init_source(tmp_path: Path, name: str = "source", with_tool: bool = True) -> Path:
     """A small source repo on master. With the tool committed, as on a ref that has adopted it."""
+    template = _fixture_template(("source", with_tool), lambda root: _build_source(root, "source", with_tool))
+    src = tmp_path / name
+    shutil.copytree(template, src)
+    return src
+
+
+def _build_source(tmp_path: Path, name: str, with_tool: bool) -> Path:
     src = tmp_path / name
     src.mkdir()
     subprocess.run(["git", "init", "-b", "master", str(src)], check=True, capture_output=True, text=True)
@@ -1756,6 +1797,58 @@ def test_r14_a_gitlink_cards_entry_at_the_tip_is_refused(tmp_path):
 
     assert [r["code"] for r in report["refused"]] == ["CARDS_PATH_NOT_REGULAR_FILE"] and report["published"] == []
     assert report["pushed"] is False
+
+
+@needs_node
+@pytest.mark.parametrize("link_path", ["specs", "specs/mlv-app"])
+def test_r14_a_link_on_a_parent_of_the_cards_path_at_the_tip_is_a_per_item_refusal(tmp_path, link_path):
+    """CoS r3 review, I7 (cards path): a link at `specs` or `specs/mlv-app` made ls-tree on the leaf return nothing,
+    so the write-time guard aborted the whole drain; now only the card is refused, under its own code."""
+    bare, clone = init_bus(tmp_path)
+    add_validator(clone)
+    git(clone, "fetch", "-q", "origin")
+    git(clone, "checkout", "-q", "--detach", "origin/master")
+    blob = subprocess.run(["git", "-C", str(clone), "hash-object", "-w", "--stdin"], input="../../elsewhere", check=True,
+                          capture_output=True, text=True).stdout.strip()
+    git(clone, "rm", "-r", "-q", "--cached", "--ignore-unmatch", link_path)  # index only: the link replaces a directory
+    git(clone, "update-index", "--add", "--cacheinfo", f"120000,{blob},{link_path}")
+    git(clone, "commit", "-m", f"tip link at {link_path}")
+    git(clone, "push", "origin", "HEAD:refs/heads/master")
+    src = init_source(tmp_path)
+    add_item(src, "20261007-a-good-card.md", target=CARDS, body=CARD_BODY)
+    add_item(src, "20261007-b-receipt.md", target="RECEIPTS.md", kind="receipt", body="### A receipt\nbody\n")
+
+    report = ob.drain(src, clone, "HEAD", tmp_path / "sent.jsonl", [], push=True)
+
+    assert [(r["path"], r["code"]) for r in report["refused"]] == [("doctrine-outbox/20261007-a-good-card.md", "CARDS_PATH_IS_LINK")]
+    assert link_path in report["refused"][0]["detail"] and "120000" in report["refused"][0]["detail"]
+    assert [p["target"] for p in report["published"]] == ["RECEIPTS.md"], "the receipt is not held by the refused card"
+    assert git(bare, "ls-tree", "master", "--", link_path).startswith("120000 "), "the link itself is untouched"
+
+
+@needs_node
+def test_r14_a_regular_file_on_a_parent_of_the_cards_path_at_the_tip_is_refused_as_not_a_directory(tmp_path):
+    """CoS r4 review, N7 (cards path): a regular file at `specs` is a per-item refusal that says "not a directory"."""
+    bare, clone = init_bus(tmp_path)
+    add_validator(clone)
+    git(clone, "fetch", "-q", "origin")
+    git(clone, "checkout", "-q", "--detach", "origin/master")
+    blob = subprocess.run(["git", "-C", str(clone), "hash-object", "-w", "--stdin"], input="just a file\n", check=True,
+                          capture_output=True, text=True).stdout.strip()
+    git(clone, "rm", "-r", "-q", "--cached", "--ignore-unmatch", "specs")  # index only: the file replaces a directory
+    git(clone, "update-index", "--add", "--cacheinfo", f"100644,{blob},specs")
+    git(clone, "commit", "-m", "tip regular file at specs")
+    git(clone, "push", "origin", "HEAD:refs/heads/master")
+    src = init_source(tmp_path)
+    add_item(src, "20261007-a-good-card.md", target=CARDS, body=CARD_BODY)
+    add_item(src, "20261007-b-receipt.md", target="RECEIPTS.md", kind="receipt", body="### A receipt\nbody\n")
+
+    report = ob.drain(src, clone, "HEAD", tmp_path / "sent.jsonl", [], push=True)
+
+    assert [(r["path"], r["code"]) for r in report["refused"]] == [("doctrine-outbox/20261007-a-good-card.md", "CARDS_PATH_IS_LINK")]
+    assert "not a directory: mode 100644" in report["refused"][0]["detail"]
+    assert [p["target"] for p in report["published"]] == ["RECEIPTS.md"], "the receipt is not held by the refused card"
+    assert git(bare, "ls-tree", "master", "--", "specs").startswith("100644 "), "the file itself is untouched"
 
 
 def _make_dir_link(link: Path, target: Path) -> None:

@@ -119,7 +119,15 @@ $required = @(
     'igpu_amaze_debayer_run_post_wb_gl_texture_from_device_bayer16',
     'igpu_amaze_debayer_reset_live_gl_texture_resources',
     'igpu_amaze_debayer_set_reduced_hnyquist',
-    'igpu_amaze_debayer_last_timing'
+    'igpu_amaze_debayer_last_timing',
+    'igpu_amaze_debayer_arm_probe',
+    'igpu_amaze_debayer_last_probe',
+    'igpu_amaze_debayer_clock_kick_begin',
+    'igpu_amaze_debayer_clock_kick_end',
+    'igpu_amaze_debayer_capture_input_bayer16',
+    'igpu_amaze_debayer_input_bayer16_matches_capture',
+    'igpu_amaze_debayer_release_input_capture',
+    'igpu_amaze_debayer_download_bayer16'
 )
 $missing = @()
 foreach ($name in $required) {

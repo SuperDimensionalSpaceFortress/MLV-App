@@ -135,6 +135,10 @@
     worktree, ~93% in two CIM scans, so the sweep passes ONE process snapshot (-ProcessSnapshot).
 #>
 
+# HOST-FSMONITOR-DAEMON-LEAK-1: Disable-/Stop-LaneWorktreeFsmonitor live in a light sibling so callers that only create worktrees need not compile this
+# file's Add-Type readers. Loaded fail-soft (a fixture that copies this file alone just skips the fsmonitor calls below).
+$laneFsmonitorLib = Join-Path $PSScriptRoot 'lane-fsmonitor.ps1'
+if (Test-Path -LiteralPath $laneFsmonitorLib) { . $laneFsmonitorLib }
 $script:SweepStampName = 'mlv-sweep-examined'
 $script:RetireDebrisPattern ='(^|/)(__pycache__|\.pytest_cache|\.hypothesis|build-release|build-debug|build-avx-parity|build-console)/$|\.pyc$'
 $script:HolderScriptExt = 'ps1|psm1|py|cmd|bat|js|mjs'
@@ -602,7 +606,15 @@ function Invoke-RetireLaneWorktree {
         schema = 'mlv-app/lane-worktree-disposition/v1'; workDir = $WorkDir; action = 'kept'; reason = $null
         head = $null; branch = $null; quarantined = @(); holders = @(); cwdProbe = $null; cwdUnknown = @()
         cwdExempt = 0; worktreeCreatedUtc = $null; cwdExemptOwner = @(); cwdOwnerProbe = $null; cwdOwnerSkipped = @()
+        # LANE-FSMONITOR-PIN-AND-RETIRE-HARDENING-1 r2: what each fsmonitor step did, as 'action' or 'action: reason' ('stopped', 'none: no daemon',
+        # 'failed: ...', 'not-run: ...'). Best effort: never changes `action`/`reason`, but a 'failed' here means a daemon may still be running.
+        fsmonitorStop = [ordered]@{ disable = $null; early = $null; remove = $null; final = $null }
         utc = (Get-Date).ToUniversalTime().ToString('o')
+    }
+    function Get-FsmonitorStepNote([object]$Result) {
+        if ($null -eq $Result) { return 'not-run: helper not loaded' }
+        if ($Result.reason) { return "$($Result.action): $($Result.reason)" }
+        return [string]$Result.action
     }
     # Fail closed on the cwd probe's own blind spots (see CWD PROBE IS LOUD): true = refused, disposition filled in.
     function Test-CwdRefusal([object]$Sn) {
@@ -623,6 +635,7 @@ function Invoke-RetireLaneWorktree {
         $o = & git.exe -C $C @A 2>&1
         [pscustomobject]@{ code = $LASTEXITCODE; out = @($o | ForEach-Object { "$_" }) }
     }
+    $wd = $null
     try {
         if (-not (Test-Path -LiteralPath $WorkDir -PathType Container)) { $d.action = 'skipped'; $d.reason = 'not-a-linked-worktree: path absent'; return [pscustomobject]$d }
         $wd = (Resolve-Path -LiteralPath $WorkDir).Path.TrimEnd('\')
@@ -633,6 +646,16 @@ function Invoke-RetireLaneWorktree {
         if ($gd.out[0] -eq $cd.out[0]) { $d.action = 'skipped'; $d.reason = 'not-a-linked-worktree: main checkout'; return [pscustomobject]$d }
         if (($top.out[0] -replace '/', '\').TrimEnd('\') -ne $wd) { $d.action = 'skipped'; $d.reason = 'not-a-linked-worktree: WorkDir is a subdirectory'; return [pscustomobject]$d }
         $main = Split-Path -Parent ($cd.out[0] -replace '/', '\')
+        # HOST-FSMONITOR-DAEMON-LEAK-1 (a): off BEFORE the gate's own `status` calls, which would otherwise start a daemon in a worktree kept for any reason.
+        $disableResult = $null
+        if (Get-Command Disable-LaneWorktreeFsmonitor -ErrorAction SilentlyContinue) { $disableResult = Disable-LaneWorktreeFsmonitor -WorkDir $wd }
+        $d.fsmonitorStop.disable = Get-FsmonitorStepNote $disableResult
+        # LANE-FSMONITOR-PIN-AND-RETIRE-HARDENING-1: a daemon already running here (a worktree that predates the fix) survives every path below that KEEPS the
+        # worktree, so stop it now, before the gate. The finally further down repeats it only when the disable did not take (skipped or failed): a
+        # disabled worktree cannot have a daemon restarted by the gate's own status.
+        $stopResult = $null
+        if (Get-Command Stop-LaneWorktreeFsmonitor -ErrorAction SilentlyContinue) { $stopResult = Stop-LaneWorktreeFsmonitor -WorkDir $wd }
+        $d.fsmonitorStop.early = Get-FsmonitorStepNote $stopResult
 
         $h = Run-Git $wd @('rev-parse', 'HEAD'); if ($h.code) { $d.reason = 'cannot-determine: rev-parse HEAD'; return [pscustomobject]$d }
         $d.head = $h.out[0]
@@ -698,11 +721,33 @@ function Invoke-RetireLaneWorktree {
             $d.quarantined += $dst
         }
         $c = Run-Git $wd @('clean', '-fdX'); if ($c.code) { $d.reason = 'remove-failed: git clean -fdX: ' + ($c.out -join ' | '); return [pscustomobject]$d }
+        # HOST-FSMONITOR-DAEMON-LEAK-1 (b): ask this worktree's daemon to exit before its directory goes. Best effort; the result never changes the disposition.
+        $removeStop = $null
+        if (Get-Command Stop-LaneWorktreeFsmonitor -ErrorAction SilentlyContinue) { $removeStop = Stop-LaneWorktreeFsmonitor -WorkDir $wd }
+        $d.fsmonitorStop.remove = Get-FsmonitorStepNote $removeStop
         $r = Run-Git $main @('-c', 'core.longpaths=true', 'worktree', 'remove', $wd)
         if ($r.code) { $d.reason = 'remove-failed: ' + ($r.out -join ' | '); return [pscustomobject]$d }
         $d.action = 'retired'; $d.reason = 'ok'
     } catch {
         $d.action = 'kept'; $d.reason = "cannot-determine: $($_.Exception.Message)"
+    } finally {
+        # Every path that leaves the worktree standing (kept, would-retire) tries to leave no daemon in it; a retired worktree is gone. Best effort,
+        # never throws, and not a guarantee: a failed stop is recorded in fsmonitorStop, and a daemon may still be running.
+        # Only when the disable did not take: after a successful disable the early stop already left none and nothing can start one.
+        # LANE-FSMONITOR-FOLLOWUPS-1 (b): unless that early stop FAILED. The disable only prevents a new daemon; a daemon already running is still
+        # there, so this is the one retry (bounded in count: it is this single call, never a loop; not bounded in elapsed time, because
+        # Stop-LaneWorktreeFsmonitor sets no deadline of its own). Its outcome lands in `final`, the early failure stays in `early`.
+        if ($wd -and $d.action -ne 'retired' -and $d.action -ne 'skipped') {
+            $earlyStopFailed = ($null -ne $d.fsmonitorStop.early -and $d.fsmonitorStop.early -like 'failed*')
+            if ($null -ne $d.fsmonitorStop.disable -and $d.fsmonitorStop.disable -eq 'disabled' -and -not $earlyStopFailed) {
+                $d.fsmonitorStop.final = 'not-run: disable succeeded'
+            } elseif (Get-Command Stop-LaneWorktreeFsmonitor -ErrorAction SilentlyContinue) {
+                try { $d.fsmonitorStop.final = Get-FsmonitorStepNote (Stop-LaneWorktreeFsmonitor -WorkDir $wd) }
+                catch { $d.fsmonitorStop.final = "failed: cannot-determine: $($_.Exception.Message)" }
+            } else {
+                $d.fsmonitorStop.final = 'not-run: helper not loaded'
+            }
+        }
     }
     return [pscustomobject]$d
 }

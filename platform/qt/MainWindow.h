@@ -37,8 +37,10 @@
 #include "PlaybackScopesDuringPlayback.h"
 #include "PlaybackSlipHistogram.h"
 #include "PlaybackStartupSplit.h"
+#include "PlaybackGpuClockKickPolicy.h"
 #include "PlaybackFirstPresentIdentity.h"
 #include "PlaybackRoutePrewarmPolicy.h"
+#include "PlaybackReconWarmRunPolicy.h"
 #include "../../src/mlv_include.h"
 #include "InfoDialog.h"
 #include "StatusDialog.h"
@@ -205,7 +207,8 @@ public:
         bool exerciseClipLifecycleStress = false;
         QString stressSwitchInputPath;
         // ENFORCE-2 round 2: the switch stops Play on the first clip, so it may not happen before the
-        // 20 s play floor (playback_frame_range::kMinPlayWindowMs); runGuiPlaybackSmoke refuses less.
+        // clip's play floor (playback_frame_range::minPlayWindowMs: 20 s, 10 s for an HFR clip); runGuiPlaybackSmoke
+        // refuses less.
         int stressSwitchAtMs = 20000;
         int stressSeekFrame = 8;
         // UM-DISPLAY-SELECT-AND-LOG-1: when true, the smoke session is placed and maximized
@@ -1683,6 +1686,30 @@ private:
     void runPlaybackRoutePrewarm( quint64 clipGeneration );
     bool m_playbackRoutePrewarmArmed = false;
     quint64 m_playbackRoutePrewarmClipGeneration = 0;
+    // PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-SETUP-1 Row B: this clip's prewarm loaded the recon backend (first_present_split)
+    bool m_playbackReconBackendPreloaded = false;
+    // PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1 Row W (PlaybackReconWarmRunPolicy.h): after the prewarm, ONE paused recon
+    // warm run per clip on the recon worker; a skip for real work pending is re-posted kRepostDelayMs later.
+    void postPlaybackReconWarm( quint64 clipGeneration );
+    void onPlaybackReconWarmDone( const RenderFrameThread::PlaybackReconWarmDone &done );
+    void schedulePlaybackReconWarmRepost( playback_recon_warm_run::Reason reason, quint64 clipGeneration );
+    bool m_playbackReconWarmPrewarmRan = false;   // this clip's route prewarm decided Run
+    int m_playbackReconWarmScale = 1;             // the Play-time scale the prewarm sized for
+    int m_playbackReconWarmPosts = 0;             // posts this clip (PlaybackReconWarmRunPolicy.h kMaxPosts)
+    bool m_playbackReconWarmRepostArmed = false;  // a re-post timer is pending
+    bool m_playbackReconWarmRan = false;          // first_present_split warm_run
+    // PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row K (PlaybackGpuClockKickPolicy.h): at Play, before the play-start
+    // frame request, one bounded GPU clock kick on the loaded AMaZE backend; ended (and logged) at the first present,
+    // Play stop, a clip change, a device loss, the next Play or its deadline. Also arms Row 0's session probe.
+    void beginPlaybackGpuClockKick();
+    void endPlaybackGpuClockKick( const char *site );
+    bool m_playbackGpuClockKickActive = false;
+    playback_gpu_clock_kick::Decision m_playbackGpuClockKickDecision;   // this Play's (first_present_split)
+    double m_playbackGpuClockKickBeginSteadyMs = 0.0;
+    quint64 m_playbackGpuClockKickSerial = 0;     // cancels a stale deadline timer
+    quint64 m_playbackGpuClockKickSession = 0;
+    QString m_playbackGpuClockKickEndedAt;         // the first site that asked for the end (ended_at)
+    int m_playbackGpuClockKickPendingRetries = 0;  // collects that found the feeder still draining
     void writeFirstPresentIdentity( const QString &dir, int startPosition );
     // --gui-smoke-playback only (CUDA-PERF-PLAYBACK-FOREGROUND-1): forces the main window
     // and the GPU display window to the OS foreground and verifies with
@@ -1873,6 +1900,10 @@ private:
     // exercise modes, GUI-smoke measured Play) goes through programmaticPlay(); user input handlers
     // (on_actionPlay_triggered, the Loop menu) are never gated. See PlaybackFrameRange.h.
     playback_frame_range::PlayableWindowVerdict checkPlayableWindow( const char *site, double requestedSeconds );
+    // PLAYBACK-CLIP-LENGTH-HFR-10S-1: the loaded clip's NATIVE fps (0 when no clip: the 20 s floor) and the play floor
+    // derived from it (playback_frame_range::minPlayWindowSeconds).
+    double playGateNativeFps() const;
+    double playGateMinPlayWindowSeconds() const;
     bool programmaticPlay( const char *site, double requestedSeconds );
     void programmaticStop( const char *site );
     void forceLoopOffForAutomation( const char *site );

@@ -27,6 +27,8 @@ Windows-only: the job generator and runner are PowerShell-on-Windows tools (the 
 
 from __future__ import annotations
 
+import ast
+import concurrent.futures
 import hashlib
 import io
 import json
@@ -112,6 +114,9 @@ PTRACE_LEGS = {"legs/m16-1243-display-fullscreen-s4-ptrace.json": "legs/m16-1243
 # PLAYBACK-STARTUP-WAIT-PREWARM-1: the first-present identity twins of two display-matrix cells, differing only in their legId and
 # generatorArgs.firstPresentCapture true.
 IDENTITY_LEGS = {f"legs/m16-1243-display-{cell}-identity.json": f"legs/m16-1243-display-{cell}.json" for cell in ("windowed-s1", "fullscreen-s4")}
+# PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1 F-diag: the warm-reuse miss-dump twin of the windowed s1 cell, differing only in its legId and
+# generatorArgs.warmReuseMissDump true.
+MISSDUMP_LEGS = {"legs/m16-1243-display-windowed-s1-missdump.json": "legs/m16-1243-display-windowed-s1.json"}
 # PLAYBACK-VISUAL-INSPECTION-1: the window-capture proof leg, a SPEED leg (windowed, scale 2) that names no visualCapture: absent means on.
 VISUAL_LEGS = ("legs/m16-1243-speed-windowed-s2.json",)
 # PLAYBACK-SCOPES-OPTION-1: the windowed scale-1 no-look scope matrix, per backend: N (no scope), T (histogram at the app's default throttle) and
@@ -138,12 +143,16 @@ SHIPPED_LEGS = ("legs/m16-1243-speed.json", "legs/m16-1243-look.json", "legs/m16
                 "legs/m16-1243-look-scale2-film.json", "legs/m16-1243-look-scale2-vision50d.json",
                 *(f"legs/m16-1243-look-scale2-{flavor}-agxoff.json" for flavor in ("cinematic", "film", "vision50d")),
                 *(f"legs/m16-1243-display-{mode}-s{scale}-vsync1.json" for scale in (1, 2, 4) for mode in ("fullscreen", "windowed")),
-                *CPU_REDUCED_LEGS, *UPSTREAM_BASELINE_LEGS, *PTRACE_LEGS, *VISUAL_LEGS, *SCOPE_LEGS, *SCOPE_LA_LEGS, *HEADROOM_LEGS, *IDENTITY_LEGS)
+                *CPU_REDUCED_LEGS, *UPSTREAM_BASELINE_LEGS, *PTRACE_LEGS, *VISUAL_LEGS, *SCOPE_LEGS, *SCOPE_LA_LEGS, *HEADROOM_LEGS, *IDENTITY_LEGS,
+                *MISSDUMP_LEGS)
 # PLAYBACK-VSYNC-DEFAULT-1: the swap-interval-1 twins of the six display-matrix legs (the vsync A/B; the originals stay at the app's default 0).
 VSYNC1_LEGS = tuple(rel.replace(".json", "-vsync1.json") for rel in DISPLAY_MATRIX_LEGS)
 # LOOK-ASSIST-FILM-FLAVOR-2 r2: the AgX-off twins of the scale-2 Cinematic and Film legs carry a committed look receipt (look-receipts/agx-off.marxml).
 AGXOFF_LEGS = {f"m16-1243-look-scale2-{flavor}-agxoff": f"m16-1243-look-scale2-{flavor}" for flavor in ("cinematic", "film", "vision50d")}
 LOOK_RECEIPT_BASE = "6b6f66f52d5344a97de5068b2e7cae1a61edf295"   # the #328 head whose generator, legs and runner this round extends
+# GPU-DEVICE-LOSS-SELF-HEAL-1 r2: the L1..L4 self-heal proof, ONE cuda speed leg whose job runs three pre-launches and the measured run on one settings store.
+SELF_HEAL_LEG = "legs/m16-1243-gpu-self-heal-l1-l4.json"
+SHIPPED_LEGS = (*SHIPPED_LEGS, SELF_HEAL_LEG)
 SHIPPED_LEGS_PS = ", ".join(f"'{rel}'" for rel in SHIPPED_LEGS)
 OTHER_CLIP = "Z99-9999"
 MLV_EXT = "." + "mlv"  # never spelled as one literal token (the NA-4 gate trips on fixture basenames)
@@ -156,6 +165,14 @@ def run_pwsh(args: list[str], env_extra: dict | None = None, timeout: int = 600)
     env.update(env_extra or {})
     return subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", *args],
                           capture_output=True, text=True, timeout=timeout, env=env)
+
+
+def run_pwsh_many(arg_lists: list[list[str]], env_extra: dict | None = None, timeout: int = 600) -> list[subprocess.CompletedProcess]:
+    """run_pwsh for several independent invocations at once (a few pwsh at a time, never more than the host has cores), results in input order.
+    Only for runs that touch nothing in common: each is its own process with its own output file."""
+    import os
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(4, os.cpu_count() or 1))) as pool:
+        return list(pool.map(lambda args: run_pwsh(args, env_extra, timeout), arg_lists))
 
 
 def launcher_nonce_expression(launcher_text: str) -> str:
@@ -211,10 +228,15 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
     it against a sparse CLONE whose two fixture files are header-only ~30 s stand-ins (never real footage), the same
     device master's own generator tests use."""
 
+    warm_first = True   # the first `generate` of the class runs every request on `warm_requests` at once; read from the class's OWN __dict__ (see `generate`), so a subclass or a borrower never inherits it
+
     @classmethod
     def setUpClass(cls) -> None:
         cls._tmp = tempfile.TemporaryDirectory(prefix="dve-gen-")
         cls.tmp = Path(cls._tmp.name)
+        cls._generated = {}   # (script, arguments) -> (job file, the generator's CompletedProcess); see generate / warm_generated
+        cls._parse_cache = {}   # job file -> parse error count
+        cls._warmed = False
         cls.head = git("rev-parse", "HEAD")
         cls.repo = cls.tmp / "repo"
         subprocess.run(["git", "clone", "-q", "--shared", "--no-checkout", str(ROOT), str(cls.repo)], check=True)
@@ -236,11 +258,83 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
     def tearDownClass(cls) -> None:
         cls._tmp.cleanup()
 
+    @classmethod
+    def generator_command(cls, script: Path, out: Path, extra: list[str]) -> list[str]:
+        return ["-File", str(script), "-SourceCommit", cls.head, "-BuildManifestSha256", "ab" * 32,
+                "-ClipId", FIXTURE_IDS[0], "-FixtureSha256", "cd" * 32, "-RepoRoot", str(cls.repo),
+                "-OutFile", str(out), *extra]
+
+    @classmethod
+    def warm_requests(cls) -> list[tuple[Path, list[str]]]:
+        """Every distinct (script, arguments) the tests below ask `generate` for. A generator run is ~5 s (a pwsh start plus a 560 KB job to emit), so the first
+        `generate` of the class runs all of these at once, a few pwsh at a time, and each test then takes its job from the cache. This list is only an accelerator:
+        a request that is not on it is generated when a test asks for it (and cached), so a test added without extending it is correct, just not warmed."""
+        cs4 = ["-ContactSheet", "-ContactSheetFrames", "4"]
+        look = ["-ForceLookAssist", "-ContactSheet", "-LookFlavor", "cinematic"]
+        pace = ["-ForceLookAssist", "-LookPaceLeg", "-LookFlavor", "cinematic"]
+        heavy = ["-TelemetryArm", "HEAVY"]
+        store = [*heavy, "-AutomationSettingsDir", "gpu-self-heal-settings"]
+        cpu1 = ["-Backend", "cpu", "-ScaleFactor", "1"]
+        scope_base = [*cpu1, "-DisplayMode", "windowed", "-DisableLookAssist"]
+        byte_identical = [[], [*cs4, "-TelemetryArm", "LIGHT", "-DisablePaintPerSubmit"], ["-PlaySeconds", "30"]]
+        requests: list[tuple[Path, list[str]]] = [(GENERATOR, extra) for extra in byte_identical]
+        if cls.baseline_available:
+            old = cls.baseline_root / "tools" / "profiling" / "bachelor" / "playback-attr-3-cuda-job.ps1"
+            requests += [(old, extra) for extra in byte_identical]
+        for extra in (["-Venue", "bachelor", "-Backend", "cuda", "-ScaleFactor", "4", "-CpuQuiescenceThresholdPercent", "20.0"], ["-ExpectedScaleRequest", "1"],
+                      cs4, [*cs4, "-DisplayMode", "fullscreen"], [*cs4, "-DisplayMode", "windowed"], ["-DisplayMode", "windowed"],
+                      ["-ContactSheet", "-ContactSheetPairedSeek", "-DisplayMode", "windowed"], ["-Venue", "ultra-magnus"], ["-Backend", "cpu"], look, pace,
+                      [*pace, "-PlaybackRenderLookaheadFrames", "3"],
+                      *([*extra, "-SwapInterval", interval] for interval in ("0", "1") for extra in ([], look, [*look, "-DisplayMode", "windowed"])),
+                      *(["-CudaLaunchTimingMinMs", ms] for ms in ("0", "2", "2.5")), ["-SwapInterval", "1", "-CudaLaunchTimingMinMs", "2"],
+                      ["-PresentTrace"], ["-GpuFaultInject", "702@120"], ["-GpuSafeStart", "clear"], heavy, store,
+                      [*store, "-GpuPreLaunches", "702@120,702@120,none", "-GpuSafeStart", "clear"], ["-FirstPresentCapture"], ["-Unpaced"],
+                      ["-Unpaced", "-PresentTrace", "-SwapInterval", "0"], ["-Backend", "cpu", *cs4], ["-Backend", "cpu", *cs4, "-PlaybackProcessing", "receipt"],
+                      ["-Backend", "cpu", *cs4, "-PlaybackProcessing", ""], cpu1, [*cpu1, "-DisableLookAssist"],
+                      [*cpu1, "-DisplayMode", "windowed", "-DisableLookAssist"], scope_base, [*scope_base, "-Scope", "none"], [*scope_base, "-Scope", "histogram"],
+                      [*scope_base, "-Scope", "histogram", "-ScopeIntervalMs", "0"],
+                      ["-ScaleFactor", "1", "-DisplayMode", "windowed", "-DisableLookAssist", "-Scope", "waveform"],
+                      [*scope_base, "-Scope", "histogram"], [*scope_base, "-Scope", "histogram", "-ScopesDuringPlayback", "throttled"],
+                      ["-RawPrefetchDecoders", "0"], ["-RawPrefetchDecoders", "2"], [*pace, "-RawPrefetchDecoders", "1"],
+                      ["-ScaleFactor", "1", "-CpuQuiescenceThresholdPercent", "35.5"], ["-Venue", "ultra-magnus", "-PlaySeconds", "28"],
+                      ["-Backend", "cpu", "-PlaySeconds", "28"]):
+            requests.append((GENERATOR, extra))
+        return requests
+
+    @classmethod
+    def warm_generated(cls) -> None:
+        """Run `warm_requests` concurrently (every run is its own pwsh writing its own file) and parse-check the jobs in one more pwsh. The outcomes are kept
+        unasserted: `generate` asserts the exit code of the run its test asked for, exactly as before, so a failure is still reported by that test."""
+        unique: dict[tuple[str, tuple[str, ...]], tuple[Path, list[str]]] = {}
+        for script, extra in cls.warm_requests():
+            unique.setdefault((str(script), tuple(extra)), (script, extra))
+        jobs = [(key, script, extra, cls.tmp / f"warm-{n}.job.ps1") for n, (key, (script, extra)) in enumerate(unique.items())]
+        procs = run_pwsh_many([cls.generator_command(script, out, extra) for _key, script, extra, out in jobs])
+        for (key, _script, _extra, out), proc in zip(jobs, procs):
+            cls._generated[key] = (out, proc)
+        ok = [str(out) for (_k, _s, _e, out), proc in zip(jobs, procs) if proc.returncode == 0 and out.exists()]
+        script = ("foreach ($f in ($env:DVE_PARSE_FILES -split '\\|')) { $t=$null;$e=$null;"
+                  "[void][System.Management.Automation.Language.Parser]::ParseFile($f,[ref]$t,[ref]$e);Write-Output ($f + '|' + $e.Count) }")
+        parsed = run_pwsh(["-Command", script], env_extra={"DVE_PARSE_FILES": "|".join(ok)}) if ok else None
+        if parsed is not None and parsed.returncode == 0:
+            for line in parsed.stdout.splitlines():
+                path, _sep, count = line.rpartition("|")
+                if path and count.strip().isdigit():
+                    cls._parse_cache[path] = int(count)
+
     def generate(self, script: Path, out_name: str, extra: list[str]) -> Path:
-        out = self.tmp / out_name
-        proc = run_pwsh(["-File", str(script), "-SourceCommit", self.head, "-BuildManifestSha256", "ab" * 32,
-                         "-ClipId", FIXTURE_IDS[0], "-FixtureSha256", "cd" * 32, "-RepoRoot", str(self.repo),
-                         "-OutFile", str(out), *extra])
+        """The same script and arguments emit the same bytes whatever the output file is called, so a request is run once per class (see `warm_requests`).
+        The warm-up is opt-in per class: only a class that sets `warm_first = True` in its own body runs it. A subclass (CpuGeneratedJobs.Boot asks for ~5 jobs) or a
+        borrower that did not opt in would otherwise pay the whole ~60-job warm-up on its first request, and so would any future subclass."""
+        cls = type(self)
+        if cls.__dict__.get("warm_first", False) and not cls._warmed:
+            cls._warmed = True
+            cls.warm_generated()
+        key = (str(script), tuple(extra))
+        if key not in cls._generated:
+            out = self.tmp / f"gen-{len(cls._generated)}-{out_name}"   # (unique: a cached job is never overwritten by a later request that reuses a name)
+            cls._generated[key] = (out, run_pwsh(self.generator_command(script, out, extra)))
+        out, proc = cls._generated[key]
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         return out
 
@@ -292,6 +386,13 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
     HFR_CONFORM_OPEN = "HFR-CONFORM-AWARE-RECEIPT-ORACLES-1 >>>"
     HFR_CONFORM_CLOSE = "HFR-CONFORM-AWARE-RECEIPT-ORACLES-1 <<<"
     HFR_CONFORM_REGIONS = 3
+    # PLAYBACK-CLIP-LENGTH-HFR-10S-1 (owner amendment 2026-10-15): the HFR (>= 50 fps native) 10 s floor branch the embedded source-frame
+    # oracle (Get-AttrCudaSourceFramesVerdict) gains ahead of the unchanged 20 s branch, plus the HFR-only 10 s wording of the
+    # "under N s of real footage" message. Two regions; the baseline's 20 s lines stay verbatim outside them.
+    # The sentinel is the short card id: AttrCudaArtifacts.psm1 may not carry the full one (NoFootageTokensTests forbids its "clip" token there).
+    HFR_10S_OPEN = "HFR-10S-1 >>>"
+    HFR_10S_CLOSE = "HFR-10S-1 <<<"
+    HFR_10S_REGIONS = 2
 
     @classmethod
     def strip_regions(cls, text: str) -> tuple[str, dict[str, int]]:
@@ -302,7 +403,8 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
                     "keepalive-hung-probe": (cls.KEEPALIVE_HUNG_PROBE_OPEN, cls.KEEPALIVE_HUNG_PROBE_CLOSE),
                     "session-locked": (cls.SESSION_LOCKED_OPEN, cls.SESSION_LOCKED_CLOSE),
                     "playback-vsync": (cls.PLAYBACK_VSYNC_OPEN, cls.PLAYBACK_VSYNC_CLOSE),
-                    "hfr-conform-oracles": (cls.HFR_CONFORM_OPEN, cls.HFR_CONFORM_CLOSE)}
+                    "hfr-conform-oracles": (cls.HFR_CONFORM_OPEN, cls.HFR_CONFORM_CLOSE),
+                    "hfr-10s-floor": (cls.HFR_10S_OPEN, cls.HFR_10S_CLOSE)}
         kept: list[str] = []
         inside: str | None = None
         counts = {name: 0 for name in families}
@@ -351,6 +453,8 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         self.assertEqual(old_counts["playback-vsync"], self.PLAYBACK_VSYNC_REGIONS, "the baseline (the pinned GPU-PREF-REGISTRY-STOP-AND-PRUNE-1 generator commit) carries the same bracketed regions")
         self.assertEqual(new_counts["hfr-conform-oracles"], self.HFR_CONFORM_REGIONS, "the default job carries exactly the pinned number of bracketed HFR-CONFORM-AWARE-RECEIPT-ORACLES-1 regions")
         self.assertEqual(old_counts["hfr-conform-oracles"], self.HFR_CONFORM_REGIONS, "the baseline (the pinned GPU-PREF-REGISTRY-STOP-AND-PRUNE-1 generator commit) carries the same bracketed regions")
+        self.assertEqual(new_counts["hfr-10s-floor"], self.HFR_10S_REGIONS, "the default job carries exactly the pinned number of bracketed PLAYBACK-CLIP-LENGTH-HFR-10S-1 regions")
+        self.assertEqual(old_counts["hfr-10s-floor"], 0, "the baseline predates the owner's HFR 10 s amendment")
         self.assertEqual(stripped, old_stripped,
                          "the DEFAULT (bachelor/cuda) emitted job changed outside the bracketed regions -- it must stay byte-identical to the pinned baseline")
 
@@ -441,6 +545,8 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         self.assertFalse(out.exists())
 
     def parse_errors(self, job: Path) -> int:
+        if str(job) in self._parse_cache:   # (a job `warm_generated` parsed: a generated file is never rewritten)
+            return self._parse_cache[str(job)]
         script = ("$t=$null;$e=$null;[void][System.Management.Automation.Language.Parser]::ParseFile("
                   f"'{job}',[ref]$t,[ref]$e);Write-Output $e.Count")
         proc = run_pwsh(["-Command", script])
@@ -576,6 +682,135 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         self.assertLess(runner.index(mapping), runner.index("if (-not $isLook -and $spec.generatorArgs.PSObject.Properties['forceLookAssist']"),
                         "the mapping must sit outside the forceLookAssist branch")
 
+    # GPU-DEVICE-LOSS-SELF-HEAL-1 r2: the self-heal proof's job text (the generator's -GpuFaultInject / -GpuSafeStart / -AutomationSettingsDir / -GpuPreLaunches).
+    SELF_HEAL_PRE_OPEN = "# GPU-DEVICE-LOSS-SELF-HEAL-1 r2: the shared run-scoped settings store and the self-heal pre-launches"
+    SELF_HEAL_OWNER_ANCHOR = "# OWNER-FOOTAGE-NO-HARDLINK-1: the last look before the app can read anything."
+    SELF_HEAL_POST_OPEN = "# GPU-DEVICE-LOSS-SELF-HEAL-1 r2: publish the measured run's GPU field log"
+    SELF_HEAL_LAUNCH_DONE = 'Write-JobTrace "step smoke-launch done rc=$smokeRc"\n'
+
+    def test_the_gpu_fault_inject_and_safe_start_reach_the_apps_env_only_when_asked(self) -> None:
+        """GPU-DEVICE-LOSS-SELF-HEAL-1 r2: -GpuFaultInject <code>@<n> and -GpuSafeStart clear each add exactly one line at the env-list site;
+        absent, the job is the text it was. The runner maps the leg's generatorArgs for any leg."""
+        plain = self.generate(GENERATOR, "sh-plain.job.ps1", []).read_text(encoding="utf-8").replace("\r\n", "\n")
+        for token in ("MLVAPP_GPU_FAULT_INJECT", "MLVAPP_GPU_SAFE_START", "MLVAPP_AUTOMATION_SETTINGS_DIR", "self-heal", "function New-AttrCudaOwnedRoot"):
+            self.assertNotIn(token, plain)
+        for name, extra, line in (("inject", ["-GpuFaultInject", "702@120"], "    'MLVAPP_GPU_FAULT_INJECT=702@120',\n"),
+                                  ("clear", ["-GpuSafeStart", "clear"], "    'MLVAPP_GPU_SAFE_START=clear',\n")):
+            job = self.generate(GENERATOR, f"sh-{name}.job.ps1", extra)
+            self.assertEqual(self.parse_errors(job), 0, name)
+            text = job.read_text(encoding="utf-8").replace("\r\n", "\n")
+            self.assertIn("'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',\n" + line, text, name)
+            self.assertEqual(text.replace(line, ""), plain, f"{name}: the line is the only difference from the plain job")
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        branch = runner.index("if (-not $isLook -and $spec.generatorArgs.PSObject.Properties['forceLookAssist']")
+        for mapping in ("if ($spec.generatorArgs.PSObject.Properties['gpuFaultInject']) { $gen['GpuFaultInject'] = [string]$spec.generatorArgs.gpuFaultInject }",
+                        "if ($spec.generatorArgs.PSObject.Properties['gpuSafeStart']) { $gen['GpuSafeStart'] = [string]$spec.generatorArgs.gpuSafeStart }",
+                        "if ($spec.generatorArgs.PSObject.Properties['automationSettingsDir']) { $gen['AutomationSettingsDir'] = [string]$spec.generatorArgs.automationSettingsDir }",
+                        "if ($spec.generatorArgs.PSObject.Properties['gpuPreLaunches']) { $gen['GpuPreLaunches'] = [string[]]@($spec.generatorArgs.gpuPreLaunches) }"):
+            self.assertIn(mapping, runner)
+            self.assertLess(runner.index(mapping), branch, "the mapping must sit outside the forceLookAssist branch")
+        self.assertIn("Copy-Item -LiteralPath $selfHealShare -Destination (Join-Path $evidenceDir 'self-heal') -Recurse", runner)
+
+    def test_the_gpu_self_heal_pre_launches_share_one_store_and_delete_it_after(self) -> None:
+        """GPU-DEVICE-LOSS-SELF-HEAL-1 r2: -AutomationSettingsDir with -GpuPreLaunches adds the store's env line, the pre-launch block just before the
+        owner-footage check and the publish-and-delete block right after the measured smoke launch -- and nothing else: with those three removed the
+        job is the plain one, byte for byte. The pre-launches are refused without the store, on a contact-sheet leg and with a bad entry."""
+        plain = self.generate(GENERATOR, "shp-plain.job.ps1", ["-TelemetryArm", "HEAVY"]).read_text(encoding="utf-8").replace("\r\n", "\n")
+        job = self.generate(GENERATOR, "shp.job.ps1", ["-TelemetryArm", "HEAVY", "-AutomationSettingsDir", "gpu-self-heal-settings",
+                                                       "-GpuPreLaunches", "702@120,702@120,none", "-GpuSafeStart", "clear"])
+        self.assertEqual(self.parse_errors(job), 0)
+        text = job.read_text(encoding="utf-8").replace("\r\n", "\n")
+        env_lines = "    ('MLVAPP_AUTOMATION_SETTINGS_DIR=' + (Join-Path $Work 'gpu-self-heal-settings')),\n    'MLVAPP_GPU_SAFE_START=clear',\n"
+        self.assertIn("'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',\n" + env_lines, text)
+        self.assertEqual(text.count("function New-AttrCudaOwnedRoot"), 1)
+        self.assertEqual(text.count("$gpuPreLaunches = @('702@120', '702@120', 'none')\n"), 1)
+        self.assertIn("-Path (Join-Path $Work 'gpu-self-heal-settings') -OwnedJournal $OwnerJournal).Path\n", text)
+        self.assertIn("Remove-AttrCudaTree -TrustedRoot ", text[text.index(self.SELF_HEAL_POST_OPEN):])
+        pre = text.index(self.SELF_HEAL_PRE_OPEN)
+        self.assertLess(text.index("$cmd = \"& $(ConvertTo-PsSingleQuoted $smoke)"), pre, "the pre-launches reuse the measured run's $cmd")
+        self.assertLess(pre, text.index(self.SELF_HEAL_OWNER_ANCHOR))
+        self.assertLess(text.index(self.SELF_HEAL_OWNER_ANCHOR), text.index("$presentMonProc = Start-PresentMonCapture"))
+        post = text.index(self.SELF_HEAL_POST_OPEN)
+        self.assertEqual(text.index(self.SELF_HEAL_LAUNCH_DONE) + len(self.SELF_HEAL_LAUNCH_DONE), post)
+        text, r6_regions = self.SELF_HEAL_R6.subn("", text)
+        self.assertEqual(r6_regions, 2, "r6: the metrics computation and the success summary's metric lines")
+        stripped = text.replace(env_lines, "", 1)
+        stripped = stripped[:stripped.index(self.SELF_HEAL_PRE_OPEN)] + stripped[stripped.index(self.SELF_HEAL_OWNER_ANCHOR):]
+        post = stripped.index(self.SELF_HEAL_POST_OPEN)
+        post_end = stripped.index("\n}\n", stripped.index("} catch {", post)) + 3
+        self.assertEqual(stripped[:post] + stripped[post_end:], plain)
+        cases = ((["-GpuPreLaunches", "702@120"], "DUAL_VENUE_GPU_PRE_LAUNCH_NEEDS_SETTINGS_DIR"),
+                 (["-AutomationSettingsDir", "s", "-GpuPreLaunches", "702@120", "-ForceLookAssist", "-ContactSheet"], "DUAL_VENUE_GPU_PRE_LAUNCH_NEEDS_SPEED_LEG"),
+                 (["-AutomationSettingsDir", "s", "-GpuPreLaunches", "701@1"], "DUAL_VENUE_GPU_PRE_LAUNCH_INVALID"),
+                 (["-AutomationSettingsDir", "s", "-GpuPreLaunches", "none,none,none,none,none"], "DUAL_VENUE_GPU_PRE_LAUNCH_INVALID"),
+                 (["-GpuFaultInject", "701@1"], "GpuFaultInject"),
+                 (["-AutomationSettingsDir", "..\\x"], "AutomationSettingsDir"))
+        outs = [self.tmp / f"sh-refused-{n}.job.ps1" for n in range(len(cases))]
+        procs = run_pwsh_many([self.generator_command(GENERATOR, out, extra) for out, (extra, _token) in zip(outs, cases)])   # (independent runs, one pwsh each)
+        for out, (extra, token), proc in zip(outs, cases, procs):
+            self.assertNotEqual(proc.returncode, 0, token)
+            self.assertIn(token, proc.stdout + proc.stderr)
+            self.assertFalse(out.exists(), token)
+
+    def test_the_gpu_self_heal_leg_is_the_l1_to_l4_proof(self) -> None:
+        """GPU-DEVICE-LOSS-SELF-HEAL-1 r2: the one tracked self-heal leg is a cuda SPEED leg: L1 and L2 inject 702 (two losses inside the breaker's
+        window set the flag), L3 injects nothing (it must start on the CPU), and the measured run L4 clears the flag (it must render on CUDA again)."""
+        schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
+        args = schema["properties"]["generatorArgs"]["properties"]
+        self.assertEqual(args["gpuFaultInject"]["pattern"], "^(700|702|719|999)@[1-9][0-9]*$")
+        self.assertEqual(args["gpuSafeStart"]["enum"], ["clear"])
+        self.assertEqual((args["gpuPreLaunches"]["maxItems"], args["gpuPreLaunches"]["items"]["pattern"]), (4, "^((700|702|719|999)@[1-9][0-9]*|none)$"))
+        leg = json.loads((DV / SELF_HEAL_LEG).read_text(encoding="utf-8"))
+        import jsonschema
+        jsonschema.validate(leg, schema)
+        self.assertEqual((leg["legId"], leg["card"], leg["legType"], leg["backends"]), (Path(SELF_HEAL_LEG).stem, "GPU-DEVICE-LOSS-SELF-HEAL-1", "speed", ["cuda"]))
+        self.assertEqual(leg["generatorArgs"], {"telemetryArm": "HEAVY", "automationSettingsDir": "gpu-self-heal-settings",
+                                                "gpuPreLaunches": ["702@120", "702@120", "none"], "gpuSafeStart": "clear"})
+        for role in ("acceptance", "supplementary"):
+            self.assertIn({"metric": "gpuFramesTotal", "op": "gt", "value": 0}, leg["criteria"][role]["cuda"], role)
+            self.assertIn({"metric": "cpuFrames", "op": "eq", "value": 0}, leg["criteria"][role]["cuda"], role)
+        for bad in ({"gpuFaultInject": "702@0"}, {"gpuSafeStart": "set"}, {"automationSettingsDir": "a/b"}, {"gpuPreLaunches": []}, {"gpuPreLaunches": ["none"] * 5}):
+            broken = json.loads(json.dumps(leg))
+            broken["generatorArgs"].update(bad)
+            with self.assertRaises(jsonschema.ValidationError, msg=str(bad)):
+                jsonschema.validate(broken, schema)
+
+    SELF_HEAL_R6 = re.compile(r"(?ms)^[ ]*# GPU-DEVICE-LOSS-SELF-HEAL-1 r6 >>>.*?^[ ]*# GPU-DEVICE-LOSS-SELF-HEAL-1 r6 <<<\n")
+
+    def test_the_gpu_self_heal_job_writes_its_l1_to_l4_metrics_into_the_success_summary(self) -> None:
+        """GPU-DEVICE-LOSS-SELF-HEAL-1 r6 (CoS #437): with pre-launches the job computes the L1..L4 metrics (Get-AttrCudaSelfHealMetrics, embedded)
+        after the measured run published self-heal\\main and its run log is read, and writes one line per metric into the SUCCESS summary.json -- the
+        file whose scalars are the receipt's verbatim metrics, so the leg's criteria gate them and the validator re-derives them. Every metric the
+        tracked leg's criteria name is one the job writes. Without pre-launches neither region exists."""
+        job = self.generate(GENERATOR, "shm.job.ps1", ["-TelemetryArm", "HEAVY", "-AutomationSettingsDir", "gpu-self-heal-settings",
+                                                       "-GpuPreLaunches", "702@120,702@120,none", "-GpuSafeStart", "clear"])
+        self.assertEqual(self.parse_errors(job), 0)
+        text = lf(job.read_text(encoding="utf-8"))
+        self.assertEqual(len(self.SELF_HEAL_R6.findall(text)), 2)
+        self.assertEqual(text.count("function Get-AttrCudaSelfHealMetrics {"), 1)
+        self.assertEqual(text.count("function Get-AttrCudaSelfHealMetricNames {"), 1)
+        compute = text.index("$selfHealMetrics = Get-AttrCudaSelfHealMetrics -SelfHealDir $selfHealPub -PreLaunches $gpuPreLaunches "
+                             "-MeasuredLogText $rawLog -MeasuredSessionId $measuredSmokeSessionId\n")
+        success = text.index("# A SUCCESS summary.json, which the failure paths above all write")
+        self.assertLess(text.index(self.SELF_HEAL_POST_OPEN), compute, "after the measured run's self-heal\\main is published")
+        self.assertLess(text.index("$measuredSmokeSessionId = Get-MeasuredSmokeSessionId $rawLog\n"), compute)
+        self.assertLess(compute, success)
+        summary = text[success:text.index("\n})", success)]
+        proc = run_pwsh(["-Command", f"Import-Module '{ATTR_MODULE}' -Force; Get-AttrCudaSelfHealMetricNames -PreLaunchCount 3"])
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        names = proc.stdout.split()
+        self.assertEqual(len(names), 2 + 3 * (12 + 6) + 2)
+        for name in names:
+            self.assertEqual(summary.count(f"\n    {name} = $selfHealMetrics['{name}']\n"), 1, name)
+        leg = json.loads((DV / SELF_HEAL_LEG).read_text(encoding="utf-8"))
+        for role in ("acceptance", "supplementary"):
+            gated = {c["metric"] for c in leg["criteria"][role]["cuda"]}
+            self.assertEqual(gated - set(names), {"rows", "gpuFramesTotal", "cpuFrames"}, role)
+        store_only = lf(self.generate(GENERATOR, "shm-store.job.ps1", ["-TelemetryArm", "HEAVY", "-AutomationSettingsDir", "gpu-self-heal-settings"])
+                        .read_text(encoding="utf-8"))
+        self.assertNotIn("GPU-DEVICE-LOSS-SELF-HEAL-1 r6", store_only)
+        self.assertNotIn("Get-AttrCudaSelfHealMetrics", store_only)
+
     def test_the_first_present_capture_reaches_the_apps_env_only_when_asked(self) -> None:
         """PLAYBACK-STARTUP-WAIT-PREWARM-1: -FirstPresentCapture adds MLVAPP_SMOKE_FIRST_PRESENT_CAPTURE=1 to the app's env list; absent, the
         job is the text it was. The runner maps a leg's generatorArgs.firstPresentCapture true for any leg."""
@@ -593,6 +828,27 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         self.assertIn(mapping, runner)
         self.assertLess(runner.index(mapping), runner.index("if (-not $isLook -and $spec.generatorArgs.PSObject.Properties['forceLookAssist']"),
                         "the mapping must sit outside the forceLookAssist branch")
+
+    def test_the_warm_reuse_miss_dump_reaches_the_apps_env_only_when_asked(self) -> None:
+        """PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1 F-diag: -WarmReuseMissDump adds MLVAPP_PLAYBACK_WARM_REUSE_MISS_DUMP_DIR (a directory
+        under the job's published artifacts) to the app's env list; absent, the job is the text it was. The runner maps a leg's
+        generatorArgs.warmReuseMissDump true for any leg."""
+        plain = self.generate(GENERATOR, "wrmd-plain.job.ps1", []).read_text(encoding="utf-8").replace("\r\n", "\n")
+        self.assertNotIn("MLVAPP_PLAYBACK_WARM_REUSE_MISS_DUMP_DIR", plain)
+        job = self.generate(GENERATOR, "wrmd-on.job.ps1", ["-WarmReuseMissDump"])
+        self.assertEqual(self.parse_errors(job), 0)
+        text = job.read_text(encoding="utf-8").replace("\r\n", "\n")
+        line = "    ('MLVAPP_PLAYBACK_WARM_REUSE_MISS_DUMP_DIR=' + (Join-Path $Pub 'warm-reuse-miss')),\n"
+        self.assertIn("'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',\n" + line, text)
+        self.assertEqual(text.replace(line, ""), plain, "the dump dir is the only difference from the plain job")
+        self.assertLess(text.index("$Pub = Join-Path $Root"), text.index(line), "$Pub is defined before the env list reads it")
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        mapping = ("if ($spec.generatorArgs.PSObject.Properties['warmReuseMissDump'] -and [bool]$spec.generatorArgs.warmReuseMissDump) "
+                   "{ $gen['WarmReuseMissDump'] = $true }")
+        self.assertIn(mapping, runner)
+        self.assertLess(runner.index(mapping), runner.index("if (-not $isLook -and $spec.generatorArgs.PSObject.Properties['forceLookAssist']"),
+                        "the mapping must sit outside the forceLookAssist branch")
+
     def test_an_unpaced_leg_reaches_the_apps_env_and_the_smoke_only_when_asked(self) -> None:
         """CUDA-HEADROOM-1: -Unpaced adds MLVAPP_PLAYBACK_UNPACED=1 to the app's env list and -DropFrameMode off to the smoke command, each
         exactly once; absent, the job has neither. The runner maps a leg's generatorArgs.unpaced true for any leg; the schema declares it."""
@@ -773,16 +1029,16 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
             self.assertIn("$PlaySeconds = 28", text, name)
 
     def test_refused_combinations_throw_before_emitting(self) -> None:
-        for extra, token in ((["-Backend", "cpu", "-DisablePaintPerSubmit"], "DUAL_VENUE_CPU_BACKEND_CONFLICT"),
-                             (["-ForceLookAssist"], "DUAL_VENUE_LOOK_REQUIRES_CONTACT_SHEET"),
-                             (["-LookPaceLeg"], "DUAL_VENUE_LOOK_PACE_LEG_SHAPE"),
-                             (["-ForceLookAssist", "-ContactSheet", "-LookPaceLeg"], "DUAL_VENUE_LOOK_PACE_LEG_SHAPE"),
-                             (["-PlaybackRenderLookaheadFrames", "3"], "DUAL_VENUE_LOOKAHEAD_NEEDS_LOOK_PACE_LEG"),
-                             (["-ForceLookAssist", "-ContactSheet", "-DisableLookAssist"], "DUAL_VENUE_LOOK_ASSIST_CONFLICT"),
-                             (["-ForceLookAssist", "-LookPaceLeg", "-LookFlavor", "cinematic", "-DisableLookAssist"], "DUAL_VENUE_LOOK_ASSIST_CONFLICT")):
-            out = self.tmp / "refused.job.ps1"
-            proc = run_pwsh(["-File", str(GENERATOR), "-SourceCommit", self.head, "-BuildManifestSha256", "ab" * 32,
-                             "-ClipId", FIXTURE_IDS[0], "-FixtureSha256", "cd" * 32, "-RepoRoot", str(self.repo), "-OutFile", str(out), *extra])
+        cases = ((["-Backend", "cpu", "-DisablePaintPerSubmit"], "DUAL_VENUE_CPU_BACKEND_CONFLICT"),
+                 (["-ForceLookAssist"], "DUAL_VENUE_LOOK_REQUIRES_CONTACT_SHEET"),
+                 (["-LookPaceLeg"], "DUAL_VENUE_LOOK_PACE_LEG_SHAPE"),
+                 (["-ForceLookAssist", "-ContactSheet", "-LookPaceLeg"], "DUAL_VENUE_LOOK_PACE_LEG_SHAPE"),
+                 (["-PlaybackRenderLookaheadFrames", "3"], "DUAL_VENUE_LOOKAHEAD_NEEDS_LOOK_PACE_LEG"),
+                 (["-ForceLookAssist", "-ContactSheet", "-DisableLookAssist"], "DUAL_VENUE_LOOK_ASSIST_CONFLICT"),
+                 (["-ForceLookAssist", "-LookPaceLeg", "-LookFlavor", "cinematic", "-DisableLookAssist"], "DUAL_VENUE_LOOK_ASSIST_CONFLICT"))
+        outs = [self.tmp / f"refused-{n}.job.ps1" for n in range(len(cases))]
+        procs = run_pwsh_many([self.generator_command(GENERATOR, out, extra) for out, (extra, _token) in zip(outs, cases)])   # (independent runs, one pwsh each)
+        for out, (extra, token), proc in zip(outs, cases, procs):
             self.assertNotEqual(proc.returncode, 0)
             self.assertIn(token, proc.stdout + proc.stderr)
             self.assertFalse(out.exists())
@@ -795,9 +1051,9 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("CLIP_TOO_SHORT", proc.stdout + proc.stderr)
         self.assertFalse(out.exists())
-        # ... and a play window under 20 s never binds.
+        # ... and a play window under the lowest floor (PLAYBACK-CLIP-LENGTH-HFR-10S-1: an HFR clip's 10 s) never binds.
         proc = run_pwsh(["-File", str(GENERATOR), "-SourceCommit", self.head, "-BuildManifestSha256", "ab" * 32, "-ClipId", FIXTURE_IDS[0],
-                         "-FixtureSha256", "cd" * 32, "-RepoRoot", str(self.repo), "-OutFile", str(out), "-PlaySeconds", "19"])
+                         "-FixtureSha256", "cd" * 32, "-RepoRoot", str(self.repo), "-OutFile", str(out), "-PlaySeconds", "9"])
         self.assertNotEqual(proc.returncode, 0)
         self.assertFalse(out.exists())
 
@@ -858,7 +1114,7 @@ switch ($cfg.mainMode) {
 # The stub records every named argument it was handed (so a test can see that the runner passed a clip ID and a play
 # window, and never a path), and can be told to refuse the way the real generator does.
 STUB_GENERATOR = r"""
-param($SourceCommit,$BuildManifestSha256,$ClipId,$FixtureSha256,$OutFile,$RepoRoot,$Venue,$Backend,$ScaleFactor,$TelemetryArm,$CpuQuiescenceThresholdPercent,[switch]$ContactSheet,$ContactSheetFrames,[switch]$ForceLookAssist,$LookFlavor,$VenueTablePath,$PlaySeconds,$ExpectedScaleRequest,$DisplayMode,[switch]$VisualCapture)
+param($SourceCommit,$BuildManifestSha256,$ClipId,$FixtureSha256,$OutFile,$RepoRoot,$Venue,$Backend,$ScaleFactor,$TelemetryArm,$CpuQuiescenceThresholdPercent,[switch]$ContactSheet,$ContactSheetFrames,[switch]$ForceLookAssist,$LookFlavor,$VenueTablePath,$PlaySeconds,$ExpectedScaleRequest,$DisplayMode,[switch]$VisualCapture,$AutomationSettingsDir,$GpuPreLaunches)
 $cfg = Get-Content -LiteralPath $env:DVE_STUB -Raw | ConvertFrom-Json
 Add-Content -LiteralPath $cfg.genLog -Value (($PSBoundParameters.Keys | Sort-Object | ForEach-Object { $_ + '=' + $PSBoundParameters[$_] }) -join ';')
 if ($cfg.genRefusal) { throw $cfg.genRefusal }
@@ -1787,15 +2043,22 @@ class PlayWindowTests(RunnerHarness, unittest.TestCase):
         _, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(play_seconds=None))
         self.assertIn("PlaySeconds=25", self.generator_calls()[-1])
 
-    def test_a_window_under_20_seconds_is_refused_before_submission(self) -> None:
-        for window in (1, 19):
+    def test_a_window_under_the_lowest_floor_is_refused_before_submission(self) -> None:
+        # PLAYBACK-CLIP-LENGTH-HFR-10S-1: a leg names a clip id, never its fps, so it refuses what NO clip could admit (under the
+        # HFR clip's 10 s); a window under a non-HFR clip's 20 s is refused at the venue by the runner and the app (the clip's header).
+        for window in (1, 9):
             _, receipt, submitted = self.run_leg("ultra-magnus", self.write_spec(play_seconds=window))
             self.assertEqual(submitted, [])
             self.assertEqual(self.generator_calls(), [])
             self.assertEqual(receipt["refusal"], "PLAY_WINDOW_TOO_SHORT")
 
+    def test_a_ten_second_window_reaches_the_generator_for_an_hfr_clip(self) -> None:
+        _, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(play_seconds=10))
+        self.assertNotEqual(receipt.get("refusal"), "PLAY_WINDOW_TOO_SHORT", receipt)
+        self.assertIn("PlaySeconds=10", self.generator_calls()[-1])
+
     def test_mutation_without_the_window_floor_a_one_second_play_reaches_the_venue(self) -> None:
-        mutated = self.mutated_runner([("Invoke-VenueLeg.ps1", "if ($playSeconds -lt 20) {", "if ($false) {")])
+        mutated = self.mutated_runner([("Invoke-VenueLeg.ps1", "if ($playSeconds -lt (Get-DvMinPlaySeconds -LowestAnyClip)) {", "if ($false) {")])
         _, receipt, submitted = self.run_leg("ultra-magnus", self.write_spec(play_seconds=1), dv=mutated)
         self.assertNotEqual(submitted, [])
 
@@ -1912,11 +2175,28 @@ class ReceiptRederivesTheTwentySecondFloorTests(ModuleMutationMixin, unittest.Te
     # (sol's 20-frame repro, the valid=true repro and the floor mutation run through the evidence-bearing path:
     #  EvidenceBoundReceiptTests.test_sols_20_frame_repro_..., test_a_stored_valid_true_..., test_mutation_without_the_floor_...)
     def test_the_floor_is_ceil_20_seconds_times_the_native_fps(self) -> None:
-        for native, floor in ((24.0, 480), (23.976, 480), (25.0, 500), (30.0, 600), (60.0, 1200)):
+        # PLAYBACK-CLIP-LENGTH-HFR-10S-1 (owner amendment 2026-10-15): footage of >= 50 fps native needs 10 s, ceil(10 x native fps).
+        for native, floor, seconds in ((24.0, 480, 20), (23.976, 480, 20), (25.0, 500, 20), (30.0, 600, 20), (49.0, 980, 20),
+                                       (50.0, 500, 10), (59.94, 600, 10), (60.0, 600, 10)):
             ok = ps_problems(good_block(nativeFps=native, paceFps=native, requiredSourceFrames=floor, sourceAdvanced=floor + 10, jobRequiredSourceFrames=floor, jobSourceAdvanced=floor + 10))
             self.assertEqual(ok, [], f"native {native}: {floor} frames is exactly the floor")
             short = ps_problems(good_block(nativeFps=native, paceFps=native, requiredSourceFrames=floor - 1, sourceAdvanced=floor + 10, jobRequiredSourceFrames=floor - 1, jobSourceAdvanced=floor + 10))
-            self.assertTrue(any("ceil(20 s x native_fps" in p for p in short), f"native {native}: {floor - 1} frames is under 20 s: {short}")
+            self.assertTrue(any(f"ceil({seconds} s x native_fps" in p for p in short), f"native {native}: {floor - 1} frames is under {seconds} s: {short}")
+
+    def test_the_hfr_floor_mirrors_the_apps_one_derivation(self) -> None:
+        # PLAYBACK-CLIP-LENGTH-HFR-10S-1: this module cannot dot-source the gate, so it mirrors minPlayWindowSeconds; the constants
+        # agree with platform/qt/PlaybackFrameRange.h and the function agrees with the gate's on one table, unknown = 20 s.
+        header = (ROOT / "platform" / "qt" / "PlaybackFrameRange.h").read_text(encoding="utf-8")
+        module = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        for cpp, ps in (("kStandardMinPlayWindowSeconds", "StandardMinPlaySeconds"), ("kHfrMinPlayWindowSeconds", "HfrMinPlaySeconds"),
+                        ("kHfrNativeFpsThreshold", "HfrNativeFpsThreshold")):
+            value = re.search(rf"constexpr double {cpp} = ([0-9.]+);", header).group(1)
+            self.assertIn(f"$script:{ps} = {value}", module)
+        table = "@(59.94, 60, 50, 49.999, 29.97, 23.976, 0, -60, 'NaN', 'Infinity', 'abc', $null)"
+        mod = _ps_json(f"{table} | ForEach-Object {{ Get-DvMinPlaySeconds -NativeFps $_ }}; Get-DvMinPlaySeconds -LowestAnyClip\n",
+                       DV / "DualVenueRunner.psm1", {})
+        self.assertEqual(mod.returncode, 0, mod.stdout + mod.stderr)
+        self.assertEqual(mod.stdout.split(), ["10", "10", "10", "20", "20", "20", "20", "20", "20", "20", "20", "20", "10"])
 
     def test_pace_override_wrap_and_absent_fields_are_judged_from_the_receipts_own_fields(self) -> None:
         cases = {
@@ -2005,13 +2285,16 @@ class ProductionRepo:
     runner is exercised exactly as production runs it (no test seam), against the committed-revision rule."""
 
     def __init__(self, test: unittest.TestCase, records: list[dict], cleanup_gone: bool = False, mutations: list[tuple[str, str, str]] | None = None,
-                 blankets: list[dict] | None = None) -> None:
+                 blankets: list[dict] | None = None, shipped_legs: bool = False) -> None:
         self.test = test
         tmp = tempfile.TemporaryDirectory(prefix="dve-prod-")
         test.addCleanup(tmp.cleanup)
         self.root = Path(tmp.name) / "repo"
         self.dv = self.root / "tools" / "profiling" / "dual-venue"
-        shutil.copytree(DV, self.dv)
+        # The validator reads EVERY committed leg spec (two git spawns each) to find the one a receipt names by sha, so the ~70 shipped legs cost ~15 s
+        # per validation (the bulk of this file's runtime). A throwaway repo therefore carries only the legs a test commits itself (commit_leg);
+        # `shipped_legs=True` keeps the whole shipped legs/ directory for the tests that exercise the lookup against the real tree.
+        shutil.copytree(DV, self.dv, ignore=None if shipped_legs else lambda directory, names: [n for n in names if Path(directory) == DV / "legs" and n.endswith(".json")])
         for name, old, new in mutations or []:
             path = self.dv / name
             text = path.read_text(encoding="utf-8")
@@ -2600,9 +2883,10 @@ class EvidenceFactory(RunnerHarness):
     """Builds evidence-bearing receipts. Mixed into a TestCase whose setUp calls make_harness()."""
 
     def prod_repo(self, venue: str = "ultra-magnus", records: list[dict] | None = None, cleanup_gone: bool = True, leg_type: str = "speed",
-                  spec: Path | None = None, mutations: list[tuple[str, str, str]] | None = None, blankets: list[dict] | None = None) -> ProductionRepo:
+                  spec: Path | None = None, mutations: list[tuple[str, str, str]] | None = None, blankets: list[dict] | None = None,
+                  shipped_legs: bool = False) -> ProductionRepo:
         recs = [consent_record(venue, OWNER_CLIP)] if records is None else records
-        repo = ProductionRepo(self, records=recs, cleanup_gone=cleanup_gone, mutations=mutations, blankets=blankets)
+        repo = ProductionRepo(self, records=recs, cleanup_gone=cleanup_gone, mutations=mutations, blankets=blankets, shipped_legs=shipped_legs)
         self.spec_path = spec or self.write_spec(leg_type=leg_type)
         repo.commit_leg(self.spec_path, "unit-leg.json")
         return repo
@@ -2796,7 +3080,7 @@ class EvidenceBoundReceiptTests(EvidenceFactory, ModuleMutationMixin, unittest.T
 
     # -- the sound path -------------------------------------------------------------------------------------------------
     def test_a_receipt_built_through_the_evidence_path_is_verified_and_pass_vs_fail_is_derived_from_the_committed_criteria(self) -> None:
-        repo = self.prod_repo()
+        repo = self.prod_repo(shipped_legs=True)   # the one test that keeps the whole shipped legs/ tree, so the validator's scan of every committed leg stays covered
         ev = self.evidence("ok")
         self.assertAdvisory(self.receipt_for(repo, ev), repo)
         # the criteria come from the COMMITTED leg spec (supplementary/cuda: rows gt 0): a run whose rows are 0 is a derived FAIL
@@ -3116,11 +3400,12 @@ class EvidenceBoundReceiptTests(EvidenceFactory, ModuleMutationMixin, unittest.T
         callers = {n for n, t in texts.items() if re.search(r"Test-DvReceiptValid\s+-", t) and n != "tools/repo_hygiene/test_dual_venue_evidence.py"}
         # LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1 added New-VenueFlavorPair.ps1 (the Classic | Cinematic pair), which validates both receipts the same way.
         self.assertEqual(callers, {"tools/profiling/dual-venue/DualVenueRunner.psm1", "tools/profiling/dual-venue/New-VenueSheetPair.ps1",
-                                   "tools/profiling/dual-venue/New-VenueFlavorPair.ps1"})
+                                   "tools/profiling/dual-venue/New-VenueFlavorPair.ps1", "tools/profiling/dual-venue/Invoke-VenueBaseline.ps1"})
         self.assertEqual(self.readers_without_repo_root({n: texts[n] for n in callers}), [])
         # nothing else in the tree reads a receipt file: a new reader must call the validator (and be added to this list in review)
         readers = {n for n, t in texts.items() if ("dual-venue-receipt/v1" in t or "dual-venue\\receipts" in t or "dual-venue/receipts" in t)
-                   and n not in ("tools/repo_hygiene/test_dual_venue_evidence.py", "tools/repo_hygiene/test_mlv_never_authorized.py")}
+                   # (test files hold receipt-shaped fixtures they never read back; test_venue_baseline.py's stub chain writes one for the baseline runner, which IS a caller above)
+                   and n not in ("tools/repo_hygiene/test_dual_venue_evidence.py", "tools/repo_hygiene/test_mlv_never_authorized.py", "tools/repo_hygiene/test_venue_baseline.py")}
         self.assertEqual(readers, {"tools/profiling/dual-venue/DualVenueRunner.psm1", "tools/profiling/dual-venue/Invoke-VenueLeg.ps1"},
                          "an unknown reader of dual-venue receipts must call Test-DvReceiptValid -RepoRoot and be named here")
         mutated = texts["tools/profiling/dual-venue/New-VenueSheetPair.ps1"].replace("Test-DvReceiptValid -Receipt $r -RepoRoot $repoRoot", "Test-DvReceiptValid -Receipt $r")
@@ -4029,9 +4314,11 @@ class LineEndingsCannotHideACommittedFileTests(ModuleMutationMixin, unittest.Tes
 
     def test_each_shipped_leg_is_found_at_head_of_the_real_repo(self) -> None:
         head = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+        # one listing of the tracked files instead of one `git ls-files --error-unmatch` per leg (same assertion: every shipped leg is tracked)
+        tracked = set(subprocess.run(["git", "-C", str(ROOT), "ls-files", "-z", "--", "tools/profiling/dual-venue/legs"], capture_output=True, text=True,
+                                     check=True, stdin=subprocess.DEVNULL, timeout=120).stdout.split("\0"))
         for rel in SHIPPED_LEGS:
-            tracked = subprocess.run(["git", "-C", str(ROOT), "ls-files", "--error-unmatch", "tools/profiling/dual-venue/" + rel], capture_output=True, text=True)
-            self.assertEqual(tracked.returncode, 0, rel)
+            self.assertIn("tools/profiling/dual-venue/" + rel, tracked, rel)
         proc = _ps_json(f"$root = '{ROOT}'\n"
                         f"foreach ($rel in {SHIPPED_LEGS_PS}) {{\n"
                         "  $bytes = [IO.File]::ReadAllBytes((Join-Path $root ('tools/profiling/dual-venue/' + $rel)))\n"
@@ -4322,6 +4609,16 @@ class PlaybackScaleIsRequestedAndEffectiveTests(EvidenceFactory, ModuleMutationM
         self.assertEqual(receipt["scale"]["verdict"], "DECLARED_CLAMP")
         self.assertIn("requested scale 4", receipt["outcomeDetail"])
         self.assertIn("rendered at 1", receipt["outcomeDetail"])
+
+    def test_the_outcome_detail_names_the_resolution_next_to_each_scale_number(self) -> None:
+        """SCALE-LABEL-CLARITY-1: "scale 4" / "rendered at 1" read backwards; the number stays (asserted above) and the words follow it."""
+        _, receipt, _ = self.leg("cuda", 4, line={"scale_request_last": 1, "scale_active_last": 1}, accepted={"cuda": 1})
+        detail = receipt["outcomeDetail"]
+        self.assertIn("requested scale 4 [Quarter res (0.25x)]", detail)
+        self.assertIn("rendered at 1 [Full res (1x)]", detail)
+        self.assertIn("renders at 1 [Full res (1x)]", detail)
+        _, receipt, _ = self.leg("cuda", 2, line={"scale_request_last": 1, "scale_active_last": 1})
+        self.assertIn("requested scale 2 [Half res (0.5x)]", receipt["outcomeDetail"])
 
     def test_a_declaration_does_not_excuse_a_run_that_rendered_at_neither_the_request_nor_the_declared_scale(self) -> None:
         # the declaration is a claim about the route; if the route changes (cuda now renders 4) the spec is stale and the leg stops passing until it is edited
@@ -4627,6 +4924,48 @@ def run_pwsh_json(script: str, **env: str):
 
 
 @requires_windows_pwsh
+class ScaleLabelMirrorTests(unittest.TestCase):
+    """SCALE-LABEL-CLARITY-1 r2: Get-DvScaleLabel (PowerShell) and scale_label (make-contact-sheet.py) mirror PlaybackScaleLabel::resolutionLabel; the C++ header is the one
+    mapping, so a reworded label there fails here instead of drifting silently into receipts and sheet headers."""
+
+    HEADER = ROOT / "platform" / "qt" / "PlaybackScaleLabel.h"
+
+    def header_labels(self) -> dict:
+        body = self.HEADER.read_text(encoding="utf-8").split("static QString resolutionLabel", 1)[1].split("static QString shortLabel", 1)[0]
+        labels = {int(n): text for n, text in re.findall(r'case (\d+):\s*return QCoreApplication::translate\(\s*"PlaybackScaleLabel",\s*"([^"]+)"\s*\)', body)}
+        self.assertEqual(sorted(labels), [1, 2, 4], "the header maps exactly the three presets by name")
+        custom = re.search(r'default:\s*return QCoreApplication::translate\(\s*"PlaybackScaleLabel",\s*"([^"]+)"', body)
+        self.assertIsNotNone(custom)
+        labels[0] = custom.group(1)   # the template for any other factor, %1 = N
+        return labels
+
+    def test_the_powershell_mirror_equals_the_cpp_header(self) -> None:
+        want = self.header_labels()
+        proc, out = run_pwsh_json("(@(1, 2, 4, 8, 3) | ForEach-Object { [pscustomobject]@{ n = $_; label = (Get-DvScaleLabel -Factor $_) } }) | ConvertTo-Json -Compress")
+        self.assertIsNotNone(out, proc.stderr)
+        got = {row["n"]: row["label"] for row in out}
+        for n in (1, 2, 4):
+            self.assertEqual(got[n], want[n])
+        for n in (3, 8):
+            self.assertEqual(got[n], want[0].replace("%1", str(n)))
+
+    def test_the_contact_sheet_mirror_equals_the_cpp_header(self) -> None:
+        want = self.header_labels()
+        # The hosted Repo Hygiene runner has no numpy and make-contact-sheet.py imports it at module level, so the module is never executed: only the
+        # scale_label function is lifted out of the parsed source and run on its own (it uses builtins only).
+        source = (ROOT / "tools" / "profiling" / "make-contact-sheet.py").read_text(encoding="utf-8")
+        funcs = [node for node in ast.parse(source).body if isinstance(node, ast.FunctionDef) and node.name == "scale_label"]
+        self.assertEqual(len(funcs), 1, "make-contact-sheet.py defines exactly one top-level scale_label")
+        namespace: dict = {}
+        exec(compile(ast.Module(body=funcs, type_ignores=[]), "make-contact-sheet.py:scale_label", "exec"), namespace)
+        scale_label = namespace["scale_label"]
+        for n in (1, 2, 4):
+            self.assertEqual(scale_label(str(n)), want[n])
+        for n in (3, 8):
+            self.assertEqual(scale_label(str(n)), want[0].replace("%1", str(n)))
+
+
+@requires_windows_pwsh
 class UnpacedEvidenceTests(unittest.TestCase):
     """CUDA-HEADROOM-1, FAIL CLOSED: an unpaced leg counts only when the app's own pace_unpaced line for the MEASURED session says active=1 drop_frame=0."""
 
@@ -4770,6 +5109,7 @@ class DisplayMatrixLegSetTests(unittest.TestCase):
         self.assertIn("DVE_LEGSET=display-matrix CARD=DUAL-VENUE-DISPLAY-MATRIX-1 CLIP=M16-1243 CELLS=12 REPEATS=2 LEGS=24", proc.stdout)
         self.assertIn("DVE_PLAN 1/24 repeat=1 cell=cuda-fullscreen-s1 leg=m16-1243-display-fullscreen-s1 backend=cuda display=fullscreen scale=1", proc.stdout)
         self.assertIn("DVE_PLAN 2/24 repeat=1 cell=cuda-windowed-s1 leg=m16-1243-display-windowed-s1 backend=cuda display=windowed scale=1", proc.stdout)
+        self.assertIn("display=windowed scale=1 resolution=Full res (1x)", proc.stdout, "SCALE-LABEL-CLARITY-1: the plan line says the resolution beside the factor")
         self.assertNotIn("DVE_RECEIPT_PATH", proc.stdout, "a plan runs nothing: no leg, so no receipt")
 
     def test_a_leg_set_that_runs_needs_a_venue_a_commit_and_a_build(self) -> None:
@@ -4813,10 +5153,28 @@ class DisplayMatrixLegSetTests(unittest.TestCase):
         self.assertIn("render_work ms", lines[0])
         self.assertIn("dual-ISO ms", lines[0])
         windowed = lines[2]
-        self.assertTrue(windowed.startswith("| cuda-windowed-s2 | cuda | windowed / windowed | 2->1 | 2560x1529 (2380x1373) | 3/3 | 12.00 (11.80-12.10) | 19.40 | 28.5 | 25.0 | PASS x3 |"), windowed)
+        self.assertTrue(windowed.startswith("| cuda-windowed-s2 | cuda | windowed / windowed | Half res (0.5x)->Full res (1x) | 2560x1529 (2380x1373) | 3/3 | 12.00 (11.80-12.10) | 19.40 | 28.5 | 25.0 | PASS x3 |"), windowed)
         cpu = lines[3]
         self.assertIn("| 1/2 | 4.00 (4.00-4.00) |", cpu, "one measurement of two runs; the INVALID repeat is counted in 'ran' and shows no numbers")
         self.assertTrue(cpu.endswith("INVALID x1, PASS x1 |"), cpu)
+
+    def test_the_scale_column_reads_as_resolution_labels_never_bare_factors(self) -> None:
+        """SCALE-LABEL-CLARITY-1 r2: requested -> effective renders through the same mapping as the plan line and outcomeDetail (Get-DvScaleLabel); the
+        internal receipt fields stay numeric. An unread effective scale ('UNKNOWN') says so; an off-preset factor is 'Custom res (1/N)'."""
+        cells = [{"cellId": "cuda-windowed-s2", "backend": "cuda", "displayMode": "windowed", "scaleFactor": 2},
+                 {"cellId": "cpu-windowed-s4", "backend": "cpu", "displayMode": "windowed", "scaleFactor": 4},
+                 {"cellId": "cpu-windowed-s8", "backend": "cpu", "displayMode": "windowed", "scaleFactor": 8},
+                 {"cellId": "cpu-windowed-s1", "backend": "cpu", "displayMode": "windowed", "scaleFactor": 1}]
+        rows = [self.row("cuda-windowed-s2", effectiveScale=2), self.row("cpu-windowed-s4", effectiveScale=1),
+                self.row("cpu-windowed-s8", effectiveScale=8),
+                self.row("cpu-windowed-s1", outcome="INVALID", fps=None, presentedFps=None, effectiveScale="UNKNOWN")]
+        lines = self.table(rows, cells).splitlines()
+        self.assertIn("| Half res (0.5x)->Half res (0.5x) |", lines[2])
+        self.assertIn("| Quarter res (0.25x)->Full res (1x) |", lines[3])
+        self.assertIn("| Custom res (1/8)->Custom res (1/8) |", lines[4])
+        self.assertIn("| Full res (1x)->unknown res |", lines[5])
+        for line in lines[2:]:
+            self.assertNotRegex(line, r"\| \d->\S+ \|", "a bare factor in the scale column is the confusing form this card replaces")
 
     def test_a_cell_with_no_measurement_shows_dashes_and_its_outcome(self) -> None:
         cells = [{"cellId": "cpu-windowed-s1", "backend": "cpu", "displayMode": "windowed", "scaleFactor": 1}]
@@ -4898,8 +5256,8 @@ class DisplayMatrixRunTests(EvidenceFactory, unittest.TestCase):
         summary = re.search(r"DVE_MATRIX_SUMMARY=(.+)", proc.stdout).group(1).strip()
         text = Path(summary).read_text(encoding="utf-8")
         self.assertEqual(len([l for l in text.splitlines() if l.startswith("| cuda-")]), 6)
-        self.assertIn("| cuda-windowed-s1 | cuda | windowed / windowed | 1->1 | 2560x1529 (2380x1373) | 2/2 | 12.60 (12.60-12.60) | 19.40 | 28.5 | 25.5 | PASS x2 |", text)
-        self.assertIn("| cuda-fullscreen-s4 | cuda | fullscreen / fullscreen | 4->4 | 2560x1600 (2560x1600) | 2/2 | 12.40 (12.40-12.40) | 19.40 | 28.5 |", text)
+        self.assertIn("| cuda-windowed-s1 | cuda | windowed / windowed | Full res (1x)->Full res (1x) | 2560x1529 (2380x1373) | 2/2 | 12.60 (12.60-12.60) | 19.40 | 28.5 | 25.5 | PASS x2 |", text)
+        self.assertIn("| cuda-fullscreen-s4 | cuda | fullscreen / fullscreen | Quarter res (0.25x)->Quarter res (0.25x) | 2560x1600 (2560x1600) | 2/2 | 12.40 (12.40-12.40) | 19.40 | 28.5 |", text)
         bad_row = next(l for l in text.splitlines() if l.startswith(f"| {bad_cell} "))
         self.assertIn("| windowed / fullscreen |", bad_row)
         self.assertIn("| 0/2 | - | - | - | - | INVALID x2 |", bad_row)
@@ -5750,6 +6108,19 @@ class LegSpecSchemaTests(unittest.TestCase):
             self.assertIs(arm["generatorArgs"].pop("firstPresentCapture"), True, rel)
             self.assertEqual(dict(arm, legId=twin["legId"]), twin, rel)
 
+    def test_the_missdump_leg_is_its_twin_with_the_dump_on(self) -> None:
+        """PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1 F-diag: the miss-dump leg differs from its twin only in its legId and
+        generatorArgs.warmReuseMissDump true."""
+        self.assertEqual(self.schema["properties"]["generatorArgs"]["properties"]["warmReuseMissDump"]["type"], "boolean")
+        for rel, twin_rel in MISSDUMP_LEGS.items():
+            arm = json.loads((DV / rel).read_text(encoding="utf-8"))
+            self.jsonschema.validate(arm, self.schema)
+            twin = json.loads((DV / twin_rel).read_text(encoding="utf-8"))
+            self.assertNotIn("warmReuseMissDump", twin["generatorArgs"], twin_rel)
+            self.assertEqual(arm["legId"], twin["legId"] + "-missdump", rel)
+            self.assertIs(arm["generatorArgs"].pop("warmReuseMissDump"), True, rel)
+            self.assertEqual(dict(arm, legId=twin["legId"]), twin, rel)
+
     def test_the_scope_legs_are_no_look_windowed_s1_speed_legs_differing_only_in_scope(self) -> None:
         """PLAYBACK-SCOPES-OPTION-1: every scope leg is a single-backend no-look SPEED leg at windowed scale 1 (LIGHT, the 95 % quiescence gate,
         informational criteria), and each scope arm is its backend's N leg plus only the scope fields."""
@@ -5829,8 +6200,9 @@ class LegSpecSchemaTests(unittest.TestCase):
             flavored += 1
             if spec["card"] == "DUAL-VENUE-DISPLAY-MATRIX-1":   # the display-matrix legs are cinematic look legs named by their cell (display mode and scale)
                 self.assertEqual(spec["legId"], path.stem, path.name)   # (-ptrace: the cell with the present trace on, PTRACE_LEGS;
-                # -identity: the cell with the first-present identity capture on, IDENTITY_LEGS)
-                self.assertRegex(spec["legId"], r"^m16-1243-display-(fullscreen|windowed)-s[124](-ptrace|-identity)?$", path.name)
+                # -identity: the cell with the first-present identity capture on, IDENTITY_LEGS; -missdump: the warm-reuse miss dump on,
+                # MISSDUMP_LEGS)
+                self.assertRegex(spec["legId"], r"^m16-1243-display-(fullscreen|windowed)-s[124](-ptrace|-identity|-missdump)?$", path.name)
             elif spec["card"] == "PLAYBACK-VSYNC-DEFAULT-1":   # the swap-interval-1 twins of the display-matrix legs, named by their cell
                 self.assertEqual(spec["legId"], path.stem, path.name)
                 self.assertRegex(spec["legId"], r"^m16-1243-display-(fullscreen|windowed)-s[124]-vsync1$", path.name)
@@ -5994,9 +6366,10 @@ class LegSpecSchemaTests(unittest.TestCase):
             self.assertNotRegex(path.read_text(encoding="utf-8"), r"(?i)[a-z]:[\\/]|\.mlv\b", f"{path.name} must name no path")
 
     def test_the_schema_rejects_a_fixture_leg_a_path_and_a_short_window(self) -> None:
+        # A short window is one under the lowest floor (PLAYBACK-CLIP-LENGTH-HFR-10S-1: an HFR clip's 10 s); a leg cannot see the clip's fps.
         spec = json.loads(next(iter(sorted((DV / "legs").glob("*speed*.json")))).read_text(encoding="utf-8"))
         for override in ({"clipId": FIXTURE_IDS[0]}, {"clipId": FIXTURE_IDS[1]}, {"clipId": "C:/footage/" + OWNER_CLIP},
-                         {"playSeconds": 19}, {"clipPath": "C:/x"}):
+                         {"playSeconds": 9}, {"clipPath": "C:/x"}):
             with self.assertRaises(self.jsonschema.ValidationError, msg=str(override)):
                 self.jsonschema.validate(dict(spec, **override), self.schema)
 
@@ -6207,9 +6580,9 @@ class LookReceiptRunnerTests(RunnerHarness, unittest.TestCase):
             subprocess.run(["git", "-C", str(self.repo), *args], capture_output=True, text=True, check=True)
         self.working = self.committed.replace(b"<agx>0</agx>", b"<agx>1</agx>")
         target.write_bytes(self.working)   # the working copy now differs from the committed blob
-        param_tail = "$DisplayMode,[switch]$VisualCapture)"
+        param_tail = "$AutomationSettingsDir,$GpuPreLaunches)"
         self.assertIn(param_tail, STUB_GENERATOR, "STUB_GENERATOR param list changed; update this replace target")
-        self.gen.write_text(STUB_GENERATOR.replace(param_tail, "$DisplayMode,[switch]$VisualCapture,$LookReceiptPath)", 1), encoding="utf-8")
+        self.gen.write_text(STUB_GENERATOR.replace(param_tail, "$AutomationSettingsDir,$GpuPreLaunches,$LookReceiptPath)", 1), encoding="utf-8")
         self.work = self.tmp / "work"
 
     def spec(self, **look) -> Path:
@@ -6386,6 +6759,9 @@ class LookReceiptGeneratorTests(unittest.TestCase):
                 # HFR-CONFORM-AWARE-RECEIPT-ORACLES-1's regions: present in both too, at their pinned count.
                 self.assertEqual((new_counts.pop("hfr-conform-oracles"), old_counts.pop("hfr-conform-oracles")),
                                  (GeneratorByteIdentityAndVariantTests.HFR_CONFORM_REGIONS, GeneratorByteIdentityAndVariantTests.HFR_CONFORM_REGIONS), name)
+                # PLAYBACK-CLIP-LENGTH-HFR-10S-1's region: in the new job only (the base predates the owner's 2026-10-15 amendment).
+                self.assertEqual((new_counts.pop("hfr-10s-floor"), old_counts.pop("hfr-10s-floor")),
+                                 (GeneratorByteIdentityAndVariantTests.HFR_10S_REGIONS, 0), name)
                 self.assertEqual(new_counts, old_counts, f"{name}: the job without -LookReceiptPath carries the base generator's bracketed regions")
                 self.assertEqual(kept, old_kept, f"{name}: the job without -LookReceiptPath must be the base generator's bytes")
                 self.assertNotIn(b"LookReceipt", new)
@@ -6449,28 +6825,105 @@ function New-VisPng([string]$Path, [int]$Seed, [int]$Chrome, [int]$Bias, [bool]$
 def write_visual_captures(dest: Path, mode: str = "ok") -> None:
     """The job's published visual\\ directory, as the app and the job write it: play-0..5.png, stop.png, paused.png, visual.json, and the
     job's visual-capture-request.json. mode: ok | frozen (one picture, ticking chrome, advancing app frames) | blank | diverge (the paused
-    full-quality frame has another red level)."""
+    full-quality frame has another red level). PLAYBACK-FROZEN-DISPLAY-SOURCE-DIFF-1 modes: frozen (the app records source_difference "differ"),
+    frozen-unknown (it records nothing), frozen-identical (it records "identical": a static clip), noviewport (a ticking-chrome frozen picture whose
+    visual.json carries no viewport rectangle), frozen-partial (frozen + "differ", but play frame 5 alone carries no viewport rectangle),
+    frozen-upper-differ / frozen-upper-identical (the same record in the wrong case: "DIFFER" / "IDENTICAL"), partial-ok (six distinct pictures, but play
+    frame 5 alone carries no viewport rectangle: a plain OK with a not-judged note)."""
     if dest.exists():
         shutil.rmtree(dest)
     dest.mkdir(parents=True)
     calls = []
+    frozen = mode in ("frozen", "frozen-unknown", "frozen-identical", "frozen-partial", "frozen-upper-differ", "frozen-upper-identical", "noviewport")
+    viewport = None if mode == "noviewport" else VIEWPORT
+    source_difference = {"frozen": "differ", "frozen-partial": "differ", "frozen-identical": "identical",
+                         "frozen-upper-differ": "DIFFER", "frozen-upper-identical": "IDENTICAL"}.get(mode)
     for k in range(6):
-        seed = 1 if mode == "frozen" else k
+        seed = 1 if frozen else k
         calls.append(f"New-VisPng '{dest / f'play-{k}.png'}' {seed} {60 + k * 10} 0 ${'true' if mode == 'blank' else 'false'}")
     calls.append(f"New-VisPng '{dest / 'stop.png'}' 5 120 0 ${'true' if mode == 'blank' else 'false'}")
     calls.append(f"New-VisPng '{dest / 'paused.png'}' 5 120 {40 if mode == 'diverge' else 0} ${'true' if mode == 'blank' else 'false'}")
     proc = run_pwsh(["-Command", VISUAL_PNG_PS + "\n".join(calls)])
     assert proc.returncode == 0, proc.stdout + proc.stderr
     frames = [{"kind": "play", "index": k, "file": f"play-{k}.png", "display_frame": 600 + 2 * k, "serial": 900 + k, "play_active": True,
-               "tail_elapsed_ms": 250 + 500 * k, "capture_ms": 40.0, "viewport": VIEWPORT, "saved": True, "reason": ""} for k in range(6)]
-    frames.append({"kind": "stop", "index": 0, "file": "stop.png", "display_frame": 612, "play_active": False, "viewport": VIEWPORT, "saved": True, "reason": ""})
+               "tail_elapsed_ms": 250 + 500 * k, "capture_ms": 40.0, "viewport": (None if mode in ("frozen-partial", "partial-ok") and k == 5 else viewport), "saved": True, "reason": ""}
+              for k in range(6)]
+    frames.append({"kind": "stop", "index": 0, "file": "stop.png", "display_frame": 612, "play_active": False, "viewport": viewport, "saved": True, "reason": ""})
     frames.append({"kind": "paused", "index": 0, "file": "paused.png", "display_frame": 612, "settled": True, "settled_frame": 612, "play_active": False,
-                   "viewport": VIEWPORT, "saved": True, "reason": ""})
-    (dest / "visual.json").write_text(json.dumps({"schema": "mlv-app/visual-capture/v1", "method": "PrintWindow(PW_RENDERFULLCONTENT)", "tail_ms": 3000,
-                                                  "tail_begin_utc": "2026-10-13T22:00:00.000Z", "tail_end_utc": "2026-10-13T22:00:03.100Z",
-                                                  "frames": frames, "frames_written": 8, "error": ""}), encoding="utf-8")
+                   "viewport": viewport, "saved": True, "reason": ""})
+    visual = {"schema": "mlv-app/visual-capture/v1", "method": "PrintWindow(PW_RENDERFULLCONTENT)", "tail_ms": 3000,
+              "tail_begin_utc": "2026-10-13T22:00:00.000Z", "tail_end_utc": "2026-10-13T22:00:03.100Z",
+              "frames": frames, "frames_written": 8, "error": ""}
+    if source_difference:
+        visual["source_difference"] = source_difference
+    (dest / "visual.json").write_text(json.dumps(visual), encoding="utf-8")
     (dest / "visual-capture-request.json").write_text(json.dumps({"schema": "mlv-app/visual-capture-request/v1", "requested": True, "probe": "supported",
                                                                   "reason": None, "forwarded": True, "presentMonWindowEndUtc": "2026-10-13T22:00:00.000Z"}), encoding="utf-8")
+
+
+class GeneratorWarmUpIsOptInPerClassTests(unittest.TestCase):
+    """The generator class's concurrent warm-up (~60 jobs) belongs to the class that defines the warm list. A subclass that does not set `warm_first` in its own body
+    (test_dve_leg_terminals.CpuGeneratedJobs.Boot asks for ~5 jobs) performs zero warm runs. No pwsh runs here: `warm_generated` is counted, not executed."""
+
+    @staticmethod
+    def stubs() -> tuple[list[str], type, type, type]:
+        calls: list[str] = []
+        key = (str(Path("job-generator.ps1")), ())
+
+        class Defining(GeneratorByteIdentityAndVariantTests):
+            warm_first = True
+
+            @classmethod
+            def setUpClass(cls) -> None:
+                cls._generated = {key: (Path("cached.job.ps1"), subprocess.CompletedProcess([], 0, "", ""))}
+                cls._parse_cache = {}
+                cls._warmed = False
+
+            @classmethod
+            def tearDownClass(cls) -> None:
+                pass
+
+            @classmethod
+            def warm_generated(cls) -> None:
+                calls.append(cls.__name__)
+
+            def runTest(self) -> None:  # pragma: no cover - never run
+                pass
+
+        class Inheriting(Defining):
+            pass
+
+        class OptedIn(Defining):
+            warm_first = True
+
+        return calls, Defining, Inheriting, OptedIn
+
+    def request(self, cls: type) -> None:
+        cls.setUpClass()
+        cls("runTest").generate(Path("job-generator.ps1"), "x.job.ps1", [])
+
+    def test_the_real_generator_class_defines_the_flag_in_its_own_body(self) -> None:
+        self.assertIs(GeneratorByteIdentityAndVariantTests.__dict__.get("warm_first"), True)
+
+    def test_the_defining_class_still_warms_once(self) -> None:
+        calls, defining, _inheriting, _opted_in = self.stubs()
+        self.request(defining)
+        defining("runTest").generate(Path("job-generator.ps1"), "y.job.ps1", [])
+        self.assertEqual(calls, ["Defining"])
+
+    def test_a_subclass_that_does_not_opt_in_performs_zero_warm_runs(self) -> None:
+        calls, _defining, inheriting, _opted_in = self.stubs()
+        self.assertTrue(inheriting.warm_first, "the flag is still visible through inheritance; only the class's own body counts")
+        self.request(inheriting)
+        self.assertEqual(calls, [])
+
+    def test_a_subclass_can_opt_in_in_its_own_body(self) -> None:
+        calls, _defining, _inheriting, opted_in = self.stubs()
+        self.request(opted_in)
+        self.assertEqual(calls, ["OptedIn"])
+
+    def test_the_visual_capture_borrower_performs_zero_warm_runs(self) -> None:
+        self.assertFalse(VisualCaptureGeneratorTests.__dict__.get("warm_first", False))
 
 
 @requires_windows_pwsh
@@ -6479,7 +6932,9 @@ class VisualCaptureGeneratorTests(unittest.TestCase):
 
     setUpClass = classmethod(GeneratorByteIdentityAndVariantTests.setUpClass.__func__)
     tearDownClass = classmethod(GeneratorByteIdentityAndVariantTests.tearDownClass.__func__)
+    warm_first = False   # six requests, not the generator class's ~60: nothing to warm
     generate = GeneratorByteIdentityAndVariantTests.generate
+    generator_command = classmethod(GeneratorByteIdentityAndVariantTests.generator_command.__func__)
     parse_errors = GeneratorByteIdentityAndVariantTests.parse_errors
 
     @staticmethod
@@ -6534,6 +6989,49 @@ class VisualCaptureGeneratorTests(unittest.TestCase):
         self.assertIn(mapping, runner)
         self.assertGreater(runner.index(mapping), runner.index("if (-not $isLook -and $spec.generatorArgs.PSObject.Properties['forceLookAssist']"))
         self.assertLess(runner.index(mapping), runner.index("$gen['ContactSheet'] = $true; $gen['ContactSheetFrames']"))
+
+    def test_the_visual_capture_self_heal_pre_launches_keep_their_own_captures(self) -> None:
+        """GPU-DEVICE-LOSS-SELF-HEAL-1 r5: the probe adds '--visual-capture-dir', <$Work\\visual> to $cmd BEFORE the self-heal pre-launches run, so each
+        pre-launch (the fallback runs L1-L3) is pointed at its own pre-<n>\\visual and publishes it under self-heal\\pre-<n>; a swap that cannot be proven
+        empties the command (PRE_LAUNCH_COMMAND_UNDERIVABLE). Without -VisualCapture the self-heal job never names a pre-launch capture."""
+        self_heal = ["-TelemetryArm", "HEAVY", "-AutomationSettingsDir", "gpu-self-heal-settings", "-GpuPreLaunches", "702@120,702@120,none", "-GpuSafeStart", "clear"]
+        off = lf(self.generate(GENERATOR, "vis-sh-off.job.ps1", self_heal).read_text(encoding="utf-8"))
+        self.assertNotIn("preVisual", off)
+        on_job = self.generate(GENERATOR, "vis-sh-on.job.ps1", [*self_heal, "-VisualCapture"])
+        self.assertEqual(self.parse_errors(on_job), 0)
+        text = lf(on_job.read_text(encoding="utf-8"))
+        pre = text.index("# GPU-DEVICE-LOSS-SELF-HEAL-1 r2: the shared run-scoped settings store and the self-heal pre-launches")
+        self.assertLess(text.index("$cmd = Add-AttrCudaVisualCaptureArgument -Command $cmd -VisualCaptureDir $visualCaptureDir"), pre,
+                        "the measured run's capture argument is already on $cmd when the pre-launches derive theirs")
+        swap = text.index("    $preVisualDir = Join-Path $preDir 'visual'\n")
+        self.assertLess(text.index("    $preCmd = $cmd.Replace(", pre), swap)
+        self.assertLess(swap, text.index("    if (-not $preCmd.Contains($preResult)", pre), "the swap runs before the command is proven and launched")
+        publish = "    [void](Publish-AttrCudaVisualCaptures -Record $visualCaptureRecord -SourceDir $preVisualDir -PubRoot $prePub)\n"
+        self.assertEqual(text.count(publish), 1)
+        self.assertLess(text.index("    [void](New-AttrCudaDirectory -Path $prePub)\n"), text.index(publish))
+        # the swap itself, run on the command shape the probe produced (a quote in the path included), and fail closed when the pair is absent
+        lines = text[swap:text.index("    }\n", swap) + 6]
+        script = ("$ErrorActionPreference = 'Stop'; Import-Module '" + str(ATTR_MODULE) + "' -Force\n"
+                  "$visualCaptureRecord = @{ forwarded = $true }; $visualCaptureDir = \"C:\\w'k\\visual\"\n"
+                  "foreach ($case in 'ok', 'absent') {\n"
+                  "  $preDir = Join-Path $env:TEMP ('vis-sh-' + [guid]::NewGuid().ToString('N') + \"\\o'1\")\n"
+                  "  $preCmd = \"& 'smoke.ps1' -Output 'r.json' -AdditionalArgs @('--windowed')\"\n"
+                  "  if ($case -ceq 'ok') { $preCmd = Add-AttrCudaVisualCaptureArgument -Command $preCmd -VisualCaptureDir $visualCaptureDir }\n"
+                  + lines +
+                  "  Write-Output ($case + '=' + $preCmd)\n"
+                  "  Write-Output ($case + '_dir=' + (Test-Path -LiteralPath $preVisualDir -PathType Container))\n"
+                  "  Remove-Item -LiteralPath (Split-Path -Parent $preDir) -Recurse -Force -ErrorAction SilentlyContinue\n"
+                  "}\n")
+        proc = run_pwsh(["-Command", script])
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        out = dict(l.split("=", 1) for l in proc.stdout.splitlines() if "=" in l)
+        self.assertNotIn("C:\\w''k\\visual", out["ok"], "the measured run's capture directory is never handed to a pre-launch")
+        self.assertRegex(out["ok"], r"^& 'smoke\.ps1' -Output 'r\.json' -AdditionalArgs @\('--windowed', '--visual-capture-dir', '.*\\o''1\\visual'\)$")
+        self.assertEqual(out["ok_dir"], "True")
+        self.assertEqual(out["absent"], "", "a command whose capture pair cannot be swapped is emptied, so the job's proof check refuses it")
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        self.assertIn("Read-DvVisualCaptures -Requested $true -ArtifactsDir $preDir.FullName -EvidenceDir (Join-Path $preDir.FullName 'inspected')", runner)
+        self.assertIn("$receipt['selfHealVisual'][$preDir.Name] = $preVisual", runner)
 
 
 @requires_windows_pwsh
@@ -6608,7 +7106,6 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
     def test_the_visual_gate_freezes_diverges_and_blanks_only_on_its_own_evidence(self) -> None:
         rows = [  # requested, captured, play, distinct, appDistinct, flat, mad, samePosition -> verdict, counted
             ("$true", "$true", 6, 6, 6, 0, "2.0", "$true", "OK", True),
-            ("$true", "$true", 6, 1, 6, 0, "2.0", "$true", "FROZEN_DISPLAY", False),
             ("$true", "$true", 6, 1, 1, 0, "2.0", "$true", "OK", True),            # the app itself presented one frame: a stall, not a frozen display
             ("$true", "$true", 6, 1, 6, 6, "$null", "$false", "CAPTURE_BLANK", True),
             ("$true", "$true", 6, 6, 6, 0, "30.0", "$true", "VISUAL_DIVERGENCE", True),
@@ -6623,6 +7120,74 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
                                           f"-FlatPlayFrames {flat} -PlayVsPausedMeanAbsDiff {mad} -SamePosition {same} -Threshold 12 | ConvertTo-Json -Compress")
                 self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
                 self.assertEqual((out["verdict"], out["counted"]), (verdict, counted))
+
+    def test_the_visual_gate_judges_a_single_picture_by_whether_the_source_frames_differ(self) -> None:
+        """PLAYBACK-FROZEN-DISPLAY-SOURCE-DIFF-1 (CoS #428 Improvement): one picture across the play frames is a FROZEN display only when the source
+        frames are KNOWN to differ. A static clip legitimately shows one picture; an unknown source is suspected, reported and not excluded.
+        r2 (CoS #474 I1): the frames that HAVE a viewport are judged first; the gate is unavailable only when fewer than two of them remain."""
+        rows = [  # source difference (None = parameter omitted), judged (viewport) play frames, play frames without a viewport, distinct -> verdict, counted
+            ("known-differ", 6, 0, 1, "FROZEN_DISPLAY", False),            # known-differ + one picture: unchanged, excluded
+            ("known-identical", 6, 0, 1, "OK", True),                      # a static / repeated-picture clip: not frozen
+            ("unknown", 6, 0, 1, "FROZEN_DISPLAY_SUSPECTED", True),        # nothing records it: suspected, NOT excluded
+            (None, 6, 0, 1, "FROZEN_DISPLAY_SUSPECTED", True),             # the default is unknown, never a guess
+            ("known-differ", 6, 0, 6, "OK", True),                         # pictures moved: the source difference does not matter
+            ("unknown", 6, 0, 6, "OK", True),
+            ("known-differ", 0, 6, 0, "VISUAL_ASSESSMENT_UNAVAILABLE", True),   # no viewport rectangle at all: the whole window is never judged instead
+            (None, 1, 5, 1, "VISUAL_ASSESSMENT_UNAVAILABLE", True),             # one usable frame judges nothing
+            ("known-differ", 5, 1, 1, "FROZEN_DISPLAY", False),            # CoS I1: the five frames that have a viewport show one picture over a known-differ source
+            ("known-differ", 2, 4, 1, "FROZEN_DISPLAY", False),            # two usable frames are enough to judge
+            ("unknown", 5, 1, 1, "FROZEN_DISPLAY_SUSPECTED", True),
+            ("known-identical", 5, 1, 1, "OK", True),
+            ("known-differ", 5, 1, 5, "OK", True),                         # five distinct pictures and one frame without a viewport: judged, nothing wrong
+        ]
+        for src, play, unavailable, distinct, verdict, counted in rows:
+            with self.subTest(source=src, play=play, unavailable=unavailable, distinct=distinct):
+                out = self.visual_verdict(src, play, unavailable, distinct)
+                self.assertEqual((out["verdict"], out["counted"]), (verdict, counted), out["reason"])
+        proc, out = run_pwsh_json("Get-DvVisualVerdict -Requested $true -Captured $true -PlayFrames 6 -DistinctContentHashes 1 -AppDistinctDisplayFrames 6 "
+                                  "-FlatPlayFrames 0 -PlayVsPausedMeanAbsDiff 2.0 -SamePosition $true | ConvertTo-Json -Compress")
+        self.assertEqual((proc.returncode, out["verdict"]), (0, "FROZEN_DISPLAY_SUSPECTED"), "ViewportUnavailablePlayFrames defaults to 0")
+
+    def visual_verdict(self, src, play, unavailable, distinct):
+        """One Get-DvVisualVerdict call over `play` judged (viewport) play frames; src None omits -SourceDifference (the default)."""
+        src_arg = f"-SourceDifference {src} " if src else ""
+        proc, out = run_pwsh_json(f"Get-DvVisualVerdict -Requested $true -Captured $true -PlayFrames {play} -DistinctContentHashes {distinct} -AppDistinctDisplayFrames 6 "
+                                  f"-FlatPlayFrames 0 -PlayVsPausedMeanAbsDiff 2.0 -SamePosition $true {src_arg}-ViewportUnavailablePlayFrames {unavailable} | ConvertTo-Json -Compress")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return out
+
+    def test_the_visual_gate_says_why_a_known_identical_single_picture_is_ok(self) -> None:
+        """CoS #474 I3: the frozen check is waived on the app's own word, so the receipt carries that word (a wrong `identical` from a future build shows)."""
+        out = self.visual_verdict("known-identical", 6, 0, 1)
+        self.assertEqual((out["verdict"], out["counted"]), ("OK", True))
+        self.assertIn("the app records the source frames as identical", out["reason"])
+        self.assertIn("static clip", out["reason"])
+        self.assertIsNone(self.visual_verdict("known-identical", 6, 0, 6)["reason"], "six distinct pictures waive nothing: no reason")
+        self.assertIsNone(self.visual_verdict("known-differ", 6, 0, 6)["reason"])
+
+    # Prevention (CoS #474): when a pure verdict function gains a verdict, add rows that pair it with EVERY verdict that sets counted = false, and say which wins.
+    # (source difference, judged play frames, play frames without a viewport, distinct, winner); each pair must show BOTH of its verdicts winning somewhere.
+    NEW_VISUAL_VERDICT_PAIRINGS = {
+        ("FROZEN_DISPLAY_SUSPECTED", "FROZEN_DISPLAY"): [("unknown", 6, 0, 1, "FROZEN_DISPLAY_SUSPECTED"), ("known-differ", 6, 0, 1, "FROZEN_DISPLAY")],
+        ("VISUAL_ASSESSMENT_UNAVAILABLE", "FROZEN_DISPLAY"): [("known-differ", 5, 1, 1, "FROZEN_DISPLAY"), ("known-differ", 1, 5, 1, "VISUAL_ASSESSMENT_UNAVAILABLE"),
+                                                              ("known-differ", 0, 6, 0, "VISUAL_ASSESSMENT_UNAVAILABLE")],
+    }
+
+    def test_every_new_visual_verdict_is_paired_with_every_excluding_verdict(self) -> None:
+        text = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        body = text[text.index("function Get-DvVisualVerdict {"):text.index("function New-DvVisualStrip {")]
+        excluding = set(re.findall(r"verdict = '([A-Z_]+)'; counted = \$false", body))
+        self.assertTrue(excluding, "the verdict function names no counted = $false verdict (the pairing check lost its subject)")
+        for new in ("FROZEN_DISPLAY_SUSPECTED", "VISUAL_ASSESSMENT_UNAVAILABLE"):
+            for ex in sorted(excluding):
+                with self.subTest(new=new, excluding=ex):
+                    rows = self.NEW_VISUAL_VERDICT_PAIRINGS.get((new, ex))
+                    self.assertTrue(rows, f"add rows pairing {new} with the excluding verdict {ex} to NEW_VISUAL_VERDICT_PAIRINGS")
+                    self.assertEqual({r[-1] for r in rows}, {new, ex}, "both verdicts of the pair must win somewhere")
+                    for src, play, unavailable, distinct, winner in rows:
+                        out = self.visual_verdict(src, play, unavailable, distinct)
+                        self.assertEqual(out["verdict"], winner, f"{src} play={play} unavailable={unavailable} distinct={distinct}: {out['reason']}")
+        self.assertEqual({k[1] for k in self.NEW_VISUAL_VERDICT_PAIRINGS}, excluding, "a pairing names a verdict that no longer excludes")
 
     def test_the_default_divergence_threshold_is_six_not_twelve(self) -> None:
         # The gate table above passes -Threshold explicitly, so it cannot see the module default. These rows pass none: a same-position
@@ -6667,6 +7232,74 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
                     self.assertGreater(out["playVsPausedMeanAbsDiffPerChannel"][0], out["playVsPausedMeanAbsDiffPerChannel"][1], "the red shift shows in R")
                 else:
                     self.assertLess(mad, 1.0)
+
+    def test_the_visual_reader_takes_the_source_difference_from_the_apps_record_and_never_guesses(self) -> None:
+        """PLAYBACK-FROZEN-DISPLAY-SOURCE-DIFF-1: visual.json's source_difference (differ | identical) is the only record of whether the source frames differ;
+        absent or anything else is unknown (case counts: `DIFFER` / `IDENTICAL` are not the app's words). A missing viewport rectangle is an unavailable
+        assessment, not a judgement of the whole window; the frames that DO have one are still judged (CoS #474 I1). The receipt counts the saved play
+        frames (`savedPlayFrames`, `captured`) apart from the judged ones (`playFrames`) (CoS #474 N2)."""
+        # mode, verdict, counted, source, judged play frames, without a viewport
+        for mode, verdict, counted, source, judged, no_viewport in (("frozen", "FROZEN_DISPLAY", False, "known-differ", 6, 0),
+                                                                    ("frozen-identical", "OK", True, "known-identical", 6, 0),
+                                                                    ("frozen-unknown", "FROZEN_DISPLAY_SUSPECTED", True, "unknown", 6, 0),
+                                                                    ("frozen-upper-differ", "FROZEN_DISPLAY_SUSPECTED", True, "unknown", 6, 0),
+                                                                    ("frozen-upper-identical", "FROZEN_DISPLAY_SUSPECTED", True, "unknown", 6, 0),
+                                                                    ("frozen-partial", "FROZEN_DISPLAY", False, "known-differ", 5, 1),
+                                                                    ("noviewport", "VISUAL_ASSESSMENT_UNAVAILABLE", True, "unknown", 0, 6)):
+            with self.subTest(mode), tempfile.TemporaryDirectory(prefix=f"vis-{mode}-") as d:
+                art = Path(d) / "artifacts"
+                write_visual_captures(art / "visual", mode)
+                ev = Path(d) / "evidence"
+                proc, out = run_pwsh_json(f"Read-DvVisualCaptures -Requested $true -ArtifactsDir '{art}' -EvidenceDir '{ev}' -LegId 'unit-leg' -Header 'unit' | ConvertTo-Json -Depth 8 -Compress")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual((out["verdict"], out["counted"]), (verdict, counted), out["reason"])
+                self.assertEqual(out["sourceDifference"], source)
+                self.assertEqual(out["distinctContentHashes"], 0 if judged == 0 else 1, "no viewport: no whole-window hash stands in for the picture" if judged == 0 else "")
+                self.assertEqual(out["viewportUnavailablePlayFrames"], no_viewport)
+                self.assertEqual((out["captured"], out["savedPlayFrames"], out["playFrames"]), (True, 6, judged), "6 PNGs were saved; `playFrames` counts the judged ones")
+                if mode == "frozen-identical":
+                    self.assertIn("the app records the source frames as identical", out["reason"])
+                if mode == "frozen-partial":
+                    # CoS #474 N4: the verdict reason and the reader's not-judged note are both kept, verdict reason first
+                    frozen_at = out["reason"].find("show ONE picture")
+                    note_at = out["reason"].find("1 saved play frame(s) have no usable viewport rectangle and were not judged")
+                    self.assertGreaterEqual(frozen_at, 0, out["reason"])
+                    self.assertGreater(note_at, frozen_at, out["reason"])
+
+    def test_a_strip_that_cannot_be_composed_keeps_every_other_reason(self) -> None:
+        """CoS #474 N5: the strip failure used to be overwritten by any verdict reason, and on a plain OK it replaced the not-judged note. The reasons are
+        composed `<verdict reason>; <not-judged note>; <strip failure>`: none is dropped. The strip is made to fail by a directory sitting where its PNG goes."""
+        strip_failure = "the strip could not be composed"
+        not_judged = "1 saved play frame(s) have no usable viewport rectangle and were not judged"
+        # mode, verdict, texts that must all appear, in this order
+        for mode, verdict, texts in (("frozen", "FROZEN_DISPLAY", ["show ONE picture", strip_failure]),
+                                     ("frozen-partial", "FROZEN_DISPLAY", ["show ONE picture", not_judged, strip_failure]),
+                                     ("partial-ok", "OK", [not_judged, strip_failure]),
+                                     ("ok", "OK", [strip_failure])):
+            with self.subTest(mode), tempfile.TemporaryDirectory(prefix=f"vis-strip-{mode}-") as d:
+                art = Path(d) / "artifacts"
+                write_visual_captures(art / "visual", mode)
+                ev = Path(d) / "evidence"
+                (ev / "visual" / "unit-leg-strip.png").mkdir(parents=True)
+                proc, out = run_pwsh_json(f"Read-DvVisualCaptures -Requested $true -ArtifactsDir '{art}' -EvidenceDir '{ev}' -LegId 'unit-leg' -Header 'unit' | ConvertTo-Json -Depth 8 -Compress")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(out["verdict"], verdict, out["reason"])
+                self.assertIsNone(out["stripPath"])
+                at = [out["reason"].find(text) for text in texts]
+                self.assertTrue(all(i >= 0 for i in at), out["reason"])
+                self.assertEqual(at, sorted(at), out["reason"])
+
+    def test_a_strip_that_composes_leaves_the_reason_as_it_was(self) -> None:
+        """CoS #474 N5 (no change when the strip is fine): no strip text is added, and the partial-ok note stays the whole reason."""
+        for mode, reason in (("ok", None), ("partial-ok", "1 saved play frame(s) have no usable viewport rectangle and were not judged; the other 5 were")):
+            with self.subTest(mode), tempfile.TemporaryDirectory(prefix=f"vis-strip-ok-{mode}-") as d:
+                art = Path(d) / "artifacts"
+                write_visual_captures(art / "visual", mode)
+                ev = Path(d) / "evidence"
+                proc, out = run_pwsh_json(f"Read-DvVisualCaptures -Requested $true -ArtifactsDir '{art}' -EvidenceDir '{ev}' -LegId 'unit-leg' -Header 'unit' | ConvertTo-Json -Depth 8 -Compress")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual((out["verdict"], out["reason"]), ("OK", reason))
+                self.assertTrue(Path(out["stripPath"]).is_file())
 
     def test_a_visual_reader_without_a_published_directory_says_not_captured(self) -> None:
         with tempfile.TemporaryDirectory(prefix="vis-none-") as d:
@@ -6718,11 +7351,106 @@ class VisualCaptureRunnerTests(RunnerHarness, unittest.TestCase):
         self.assertIn("FROZEN_DISPLAY", receipt["outcomeDetail"])
         self.assertFalse(receipt["visual"]["counted"])
 
+    def run_self_heal_visual(self, measured: str, launches: dict, declared: int | None = None, **spec_fields):
+        """launches: pre-<n> -> a write_visual_captures mode, or None for a pre-launch that published its self-heal\\pre-<n> but no visual\\.
+        declared: the spec's generatorArgs.gpuPreLaunches count (the pre-launches the leg runs); None leaves the spec without them."""
+        self.write_artifacts()
+        write_visual_captures(self.artifacts / "visual", measured)
+        shutil.rmtree(self.artifacts / "self-heal", ignore_errors=True)
+        for name, mode in launches.items():
+            if mode is None:
+                (self.artifacts / "self-heal" / name).mkdir(parents=True)
+                (self.artifacts / "self-heal" / name / "pre-launch.json").write_text("{}", encoding="utf-8")
+            else:
+                write_visual_captures(self.artifacts / "self-heal" / name / "visual", mode)
+        if declared is not None:
+            spec_fields["generatorArgs"] = {"automationSettingsDir": "gpu-self-heal-settings", "gpuPreLaunches": (["702@120", "702@120", "none"] * 2)[:declared]}
+        spec = self.speed_spec(**spec_fields) if spec_fields else self.write_spec()
+        return self.run_leg("ultra-magnus", spec, extra=["-Backend", "cpu"])
+
+    def test_a_frozen_self_heal_pre_launch_makes_the_leg_invalid_whatever_the_measured_run_shows(self) -> None:
+        """GPU-DEVICE-LOSS-SELF-HEAL-1 r6 (CoS #437, Dot 46f5e496): r5 recorded each pre-launch's verdict in receipt.selfHealVisual but gated only
+        receipt.visual, so a frozen fallback run sat beside a PASS. Every pre-launch verdict is now folded into the outcome."""
+        _, receipt, _ = self.run_self_heal_visual("ok", {"pre-1": "ok", "pre-2": "frozen", "pre-3": "ok"})
+        self.assertEqual(receipt["visual"]["verdict"], "OK", "the measured run's own display moved")
+        self.assertEqual([receipt["selfHealVisual"][k]["verdict"] for k in ("pre-1", "pre-2", "pre-3")], ["OK", "FROZEN_DISPLAY", "OK"])
+        self.assertEqual(receipt["outcome"], "INVALID", receipt["outcomeDetail"])
+        self.assertIn("FROZEN_DISPLAY on self-heal pre-launch pre-2", receipt["outcomeDetail"])
+        self.assertNotIn("pre-1:", receipt["outcomeDetail"])
+
+    def test_a_self_heal_leg_whose_every_pre_launch_shows_an_ok_picture_passes(self) -> None:
+        """GPU-DEVICE-LOSS-SELF-HEAL-1 r7: the control for the pins below -- three declared pre-launches, each OK, beside an OK measured run."""
+        _, receipt, _ = self.run_self_heal_visual("ok", {"pre-1": "ok", "pre-2": "ok", "pre-3": "ok"}, declared=3)
+        self.assertEqual([receipt["selfHealVisual"][k]["verdict"] for k in ("pre-1", "pre-2", "pre-3")], ["OK", "OK", "OK"])
+        self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+        self.assertNotIn("self-heal pre-launch", receipt["outcomeDetail"])
+
+    def test_a_diverging_self_heal_pre_launch_makes_the_leg_invalid(self) -> None:
+        """GPU-DEVICE-LOSS-SELF-HEAL-1 r7 (sol r6 blocker; the 08:05:36Z ledger scope 'fail the leg on any non-OK pre-n visual verdict'): r6 counted a
+        VISUAL_DIVERGENCE pre-launch and asserted PASS here. The fallback runs are the leg's whole proof, so a picture that diverges is not counted."""
+        _, receipt, _ = self.run_self_heal_visual("ok", {"pre-1": "diverge", "pre-2": "ok"})
+        self.assertEqual(receipt["visual"]["verdict"], "OK", "the measured run's own picture is fine")
+        self.assertEqual(receipt["selfHealVisual"]["pre-1"]["verdict"], "VISUAL_DIVERGENCE")
+        self.assertEqual(receipt["outcome"], "INVALID", receipt["outcomeDetail"])
+        self.assertIn("VISUAL_DIVERGENCE on self-heal pre-launch pre-1", receipt["outcomeDetail"])
+        self.assertNotIn("pre-2", receipt["outcomeDetail"])
+
+    def test_a_self_heal_pre_launch_with_no_captures_makes_the_leg_invalid(self) -> None:
+        """GPU-DEVICE-LOSS-SELF-HEAL-1 r7: pre-2 published its self-heal\\pre-2 but no visual\\ (captured=false): NOT_CAPTURED is no picture of the fallback."""
+        _, receipt, _ = self.run_self_heal_visual("ok", {"pre-1": "ok", "pre-2": None, "pre-3": "ok"}, declared=3)
+        self.assertEqual((receipt["selfHealVisual"]["pre-2"]["verdict"], receipt["selfHealVisual"]["pre-2"]["captured"]), ("NOT_CAPTURED", False))
+        self.assertEqual(receipt["outcome"], "INVALID", receipt["outcomeDetail"])
+        self.assertIn("NOT_CAPTURED on self-heal pre-launch pre-2", receipt["outcomeDetail"])
+        self.assertNotIn("pre-1", receipt["outcomeDetail"])
+
+    def test_a_blank_self_heal_pre_launch_capture_makes_the_leg_invalid(self) -> None:
+        """GPU-DEVICE-LOSS-SELF-HEAL-1 r7: six flat frames (CAPTURE_BLANK) judge nothing about the fallback run, so the leg is not counted."""
+        _, receipt, _ = self.run_self_heal_visual("ok", {"pre-1": "ok", "pre-2": "ok", "pre-3": "blank"}, declared=3)
+        self.assertEqual(receipt["selfHealVisual"]["pre-3"]["verdict"], "CAPTURE_BLANK")
+        self.assertEqual(receipt["outcome"], "INVALID", receipt["outcomeDetail"])
+        self.assertIn("CAPTURE_BLANK on self-heal pre-launch pre-3", receipt["outcomeDetail"])
+
+    def test_a_declared_self_heal_pre_launch_with_no_visual_entry_makes_the_leg_invalid(self) -> None:
+        """GPU-DEVICE-LOSS-SELF-HEAL-1 r7: the spec declares three pre-launches (generatorArgs.gpuPreLaunches) but self-heal\\pre-2 never arrived, so the
+        receipt holds no selfHealVisual entry for it; and a leg that opted out of visual capture holds none for any of them (NOT_REQUESTED)."""
+        _, receipt, _ = self.run_self_heal_visual("ok", {"pre-1": "ok", "pre-3": "ok"}, declared=3)
+        self.assertNotIn("pre-2", receipt["selfHealVisual"])
+        self.assertEqual(receipt["outcome"], "INVALID", receipt["outcomeDetail"])
+        self.assertIn("NO_VISUAL_ENTRY on self-heal pre-launch pre-2", receipt["outcomeDetail"])
+        self.assertNotIn("pre-1", receipt["outcomeDetail"])
+        _, receipt, _ = self.run_self_heal_visual("ok", {"pre-1": "ok", "pre-2": "ok", "pre-3": "ok"}, declared=3, visualCapture=False,
+                                                  visualCaptureOptOutReason="a capture-free pace A/B arm")
+        self.assertEqual(receipt["visual"]["verdict"], "NOT_REQUESTED")
+        self.assertEqual(receipt["outcome"], "INVALID", receipt["outcomeDetail"])
+        for name in ("pre-1", "pre-2", "pre-3"):
+            self.assertIn(f"NO_VISUAL_ENTRY on self-heal pre-launch {name}", receipt["outcomeDetail"])
+
     def test_a_visual_divergence_is_counted_for_speed_and_surfaced(self) -> None:
         _, receipt, _ = self.run_visual("diverge")
         self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
         self.assertIn("VISUAL_DIVERGENCE", receipt["outcomeDetail"])
         self.assertEqual(receipt["visual"]["verdict"], "VISUAL_DIVERGENCE")
+
+    def test_a_single_picture_over_an_unknown_or_identical_source_is_counted_and_surfaced(self) -> None:
+        """PLAYBACK-FROZEN-DISPLAY-SOURCE-DIFF-1: only a source KNOWN to differ voids the leg. Unknown is surfaced in the detail (counted); identical is OK;
+        an unavailable viewport is surfaced too and never judges the whole window."""
+        _, receipt, _ = self.run_visual("frozen-unknown")
+        self.assertEqual((receipt["outcome"], receipt["visual"]["verdict"], receipt["visual"]["counted"]), ("PASS", "FROZEN_DISPLAY_SUSPECTED", True), receipt["outcomeDetail"])
+        self.assertIn("FROZEN_DISPLAY_SUSPECTED", receipt["outcomeDetail"])
+        _, receipt, _ = self.run_visual("frozen-identical")
+        self.assertEqual((receipt["outcome"], receipt["visual"]["verdict"]), ("PASS", "OK"), receipt["outcomeDetail"])
+        _, receipt, _ = self.run_visual("noviewport")
+        self.assertEqual((receipt["outcome"], receipt["visual"]["verdict"], receipt["visual"]["counted"]), ("PASS", "VISUAL_ASSESSMENT_UNAVAILABLE", True), receipt["outcomeDetail"])
+        self.assertIn("VISUAL_ASSESSMENT_UNAVAILABLE", receipt["outcomeDetail"])
+
+    def test_a_suspected_or_unassessable_self_heal_pre_launch_is_not_ok_and_voids_the_leg(self) -> None:
+        """The r7 self-heal gate is 'anything but OK is INVALID' and stays so: the two new verdicts are not OK, so a fallback run with either is not counted."""
+        for mode, verdict in (("frozen-unknown", "FROZEN_DISPLAY_SUSPECTED"), ("noviewport", "VISUAL_ASSESSMENT_UNAVAILABLE")):
+            with self.subTest(mode):
+                _, receipt, _ = self.run_self_heal_visual("ok", {"pre-1": "ok", "pre-2": mode}, declared=2)
+                self.assertEqual(receipt["selfHealVisual"]["pre-2"]["verdict"], verdict)
+                self.assertEqual(receipt["outcome"], "INVALID", receipt["outcomeDetail"])
+                self.assertIn(f"{verdict} on self-heal pre-launch pre-2", receipt["outcomeDetail"])
 
     def test_a_blank_visual_capture_judges_nothing(self) -> None:
         _, receipt, _ = self.run_visual("blank")
@@ -6753,6 +7481,180 @@ class VisualCaptureRunnerTests(RunnerHarness, unittest.TestCase):
         _, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(), gen_refusal="PLAYBACK_ATTR3_OWNER_NOT_CONSENTED stub")
         self.assertEqual(receipt["outcome"], "DEVICE_UNAVAILABLE")
         self.assertEqual((receipt["visual"]["requested"], receipt["visual"]["verdict"]), (True, "NOT_CAPTURED"))
+
+
+SELF_HEAL_ROUTE_FAILURE = ("gpu_texture_route_readback_regression: 528 frame(s) did not reach gpu_texture_no_readback (cpu_frames=528) while the GPU "
+                           "recon texture-present no-readback route was requested in GL-window mode; every frame must reach gpu_texture_no_readback.")
+
+
+# r10 (CoS #437, Dot c503450a): L3 gpu_summary counters as a run log could carry them unreadable. On a16845f1 [long] read each of these
+# (an absent key, an empty value, '0x0') as 0, so L3's zero-CUDA and zero-preview criteria passed without measuring anything.
+UNREADABLE_L3_COUNTERS = {
+    "counters-absent-l3": "",
+    "counters-null-l3": "gpu_preview_frames= gpu_recon_readback_frames= gpu_texture_readback_frames= gpu_texture_no_readback_frames=",
+    "counters-string-l3": "gpu_preview_frames=0x0 gpu_recon_readback_frames=0x0 gpu_texture_readback_frames=0x0 gpu_texture_no_readback_frames=0x0",
+    "counters-word-l3": "gpu_preview_frames=n/a gpu_recon_readback_frames=n/a gpu_texture_readback_frames=n/a gpu_texture_no_readback_frames=n/a",
+}
+
+
+def write_self_heal_evidence(root: Path, case: str = "good") -> None:
+    """<artifacts>\\self-heal as the r5 job published it on Bachelor (d3ed879b), reduced to the lines the metrics read: L1 and L2 inject 702 (L2's
+    second loss sets the flag), L3 starts on the CPU, the measured run L4 clears the flag. `case` breaks exactly one fact."""
+    if root.exists():
+        shutil.rmtree(root)
+    launches = {1: ("702@120", 58, 528, 22.597), 2: ("702@120", 58, 528, 22.4), 3: ("none", 0, 595, 23.289)}
+    for n, (inject, cuda, cpu, fps) in launches.items():
+        d = root / f"pre-{n}"
+        if case == "skipped-l2" and n == 2:
+            continue
+        d.mkdir(parents=True)
+        record = {"schema": "mlv-app/gpu-self-heal-pre-launch/v1", "index": n, "faultInject": inject, "startedUtc": "2026-10-15T08:26:35Z",
+                  "finishedUtc": "2026-10-15T08:27:58Z", "rc": 1, "error": None}
+        failures = [SELF_HEAL_ROUTE_FAILURE]
+        if case == "underivable-l1" and n == 1:
+            record.update(rc=None, error="PRE_LAUNCH_COMMAND_UNDERIVABLE")
+        if case == "smoke-failed-l1" and n == 1:
+            failures.append("Playback did not advance past frame 0.")
+        (d / "pre-launch.json").write_text(json.dumps(record), encoding="utf-8")
+        (d / "result.json").write_text(json.dumps({"schema": "mlvapp-gui-smoke-result.v2", "validation": {"failures": failures}}), encoding="utf-8")
+        preview = 12 if case == "gpu-preview-l3" and n == 3 else 0
+        refused = 397 if case == "refused-recon-l3" and n == 3 else 0
+        if case == "slow-l1" and n == 1:
+            fps = 10.6
+        counters = (f"gpu_preview_frames={preview} gpu_recon_readback_frames=0 gpu_texture_readback_frames=0 "
+                    f"gpu_texture_no_readback_frames={cuda}")
+        if n == 3 and case in UNREADABLE_L3_COUNTERS:
+            counters = UNREADABLE_L3_COUNTERS[case]
+        if case == "counters-null-l3" and n == 3:
+            refused = ""
+        (d / "result.json.run.log").write_text("\n".join([
+            "[2026-10-15T08:27:10.400Z] [INFO] [0xd900] playback_smoke.measured_session id=1",
+            f"[2026-10-15T08:27:36.324Z] [INFO] [0xd900] playback_smoke.summary session=1 reason=visual-capture presented_frames=586 presented_fps={fps} last_presented_frame=597",
+            f"[2026-10-15T08:27:36.326Z] [INFO] [0xd900] playback_smoke.gpu_summary session=1 cpu_frames={cpu} {counters}",
+            f"[2026-10-15T08:27:36.336Z] [INFO] [0xd900] playback_smoke.debayered16_recon_reuse_summary session=1 scope=presented_frames refused_acquisition_failed=0 "
+            f"refused_gpu_playback_recon={refused} reduced_consumed_frames={cpu}", ""]), encoding="utf-8")
+        rows = []
+        if inject != "none" and not (case == "no-fault-l2" and n == 2):
+            rows.append({"schema": "gpu-field-telemetry.v1", "kind": "fault", "dll": "inject", "stage": "recon:run", "rc": -1, "cuda_code": 702,
+                         "cuda_name": "cudaErrorLaunchTimeout", "site": "MLVAPP_GPU_FAULT_INJECT", "fault_utc_ms": 1792052833759.0 + n, "device_loss": True, "role": "primary"})
+            rows.append({"schema": "gpu-field-telemetry.v1", "kind": "recovery", "what": "device_loss", "outcome": "cuda_suppressed_session"})
+        if case == "fault-code-absent-l3" and n == 3:
+            rows.append({"schema": "gpu-field-telemetry.v1", "kind": "fault", "dll": "inject", "stage": "recon:run", "rc": -1,
+                         "site": "MLVAPP_GPU_FAULT_INJECT", "fault_utc_ms": 1792052833762.0, "device_loss": True, "role": "primary"})
+        if n == 2:
+            rows.append({"schema": "gpu-field-telemetry.v1", "kind": "recovery", "what": "safe_start_flag", "outcome": "set"})
+        if n == 3:
+            rows.append({"schema": "gpu-field-telemetry.v1", "kind": "recovery", "what": "safe_start", "outcome": "cpu_route"})
+        (d / "gpu-field-telemetry.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+        flag = n >= 2 and not (case == "no-flag-l2" and n == 2)
+        (d / "MLVApp.ini").write_text("[GpuDeviceLoss]\nRecentLosses=\"1792052833768|gpu;610.74;1808x2268x14c\"\n" + ("SafeStartEnabled=true\n" if flag else ""), encoding="utf-8")
+    main = root / "main"
+    main.mkdir(parents=True)
+    (main / "gpu-field-telemetry.jsonl").write_text(json.dumps({"schema": "gpu-field-telemetry.v1", "kind": "recovery", "what": "safe_start_flag",
+                                                                "outcome": "cleared_env"}) + "\n", encoding="utf-8")
+    (main / "MLVApp.ini").write_text("[GpuDeviceLoss]\nRecentLosses=\"1792052833768|gpu;610.74;1808x2268x14c\"\n"
+                                     + ("SafeStartEnabled=true\n" if case == "flag-kept-l4" else ""), encoding="utf-8")
+    (main / "settings-dir.json").write_text(json.dumps({"schema": "mlv-app/gpu-self-heal-settings-dir/v1", "treeRemoved": True, "filesRemoved": 1, "left": 0,
+                                                        "stillExists": False}), encoding="utf-8")
+
+
+@requires_windows_pwsh
+class SelfHealLegGatesTheL1ToL4FactsTests(unittest.TestCase):
+    """GPU-DEVICE-LOSS-SELF-HEAL-1 r6 (CoS #437): the tracked self-heal leg's criteria, evaluated by the runner's own Test-DvCriteria on the metrics the job
+    writes (Get-AttrCudaSelfHealMetrics, round-tripped through summary.json and Get-DvVerbatimMetrics as a receipt reads them). r1-r5 judged only the
+    measured run's counters, so a failed, skipped or underivable pre-launch, a breaker that never tripped or a slow fallback still passed."""
+
+    CASES = {  # case -> the criteria it must fail (good: none)
+        "good": [],
+        "l4-counters-only": ["selfHealPreLaunches", "selfHealL1PreLaunchOk", "selfHealL1BreakerTrip", "selfHealL2SafeStartFlag", "selfHealL3SafeStartRoute",
+                             "selfHealL4FlagCleared"],
+        "skipped-l2": ["selfHealPreLaunches", "selfHealL2PreLaunchOk", "selfHealL2InjectedFaultCode", "selfHealL2FpsRatio"],
+        "underivable-l1": ["selfHealL1PreLaunchOk"],
+        "smoke-failed-l1": ["selfHealL1PreLaunchOk"],
+        "no-fault-l2": ["selfHealL2InjectedFaultCode", "selfHealL2BreakerTrip"],
+        "no-flag-l2": ["selfHealL2SafeStartFlag"],
+        "gpu-preview-l3": ["selfHealL3GpuPreviewFrames"],
+        "refused-recon-l3": ["selfHealL3RefusedGpuPlaybackRecon"],
+        "slow-l1": ["selfHealL1FpsRatio"],
+        "flag-kept-l4": ["selfHealL4FlagCleared"],
+    }
+
+    # r10: an unreadable L3 counter or fault code -> (the criteria it must fail, the typed reason token their verdict names). The first three PASSED
+    # on a16845f1; there counters-word-l3 ([long]'n/a') and fault-code-absent-l3 (StrictMode on $j.cuda_code) threw and the metrics never existed.
+    COULD_NOT_CHECK_CASES = {
+        "counters-absent-l3": (["selfHealL3CudaFrames", "selfHealL3GpuPreviewFrames"], "COUNTER_ABSENT"),
+        "counters-null-l3": (["selfHealL3CudaFrames", "selfHealL3GpuPreviewFrames", "selfHealL3RefusedGpuPlaybackRecon"], "COUNTER_NULL"),
+        "counters-string-l3": (["selfHealL3CudaFrames", "selfHealL3GpuPreviewFrames"], "COUNTER_NOT_NUMERIC"),
+        "counters-word-l3": (["selfHealL3CudaFrames", "selfHealL3GpuPreviewFrames"], "COUNTER_NOT_NUMERIC"),
+        "fault-code-absent-l3": (["selfHealL3InjectedFaultCode"], "FAULT_CODE_ABSENT"),
+    }
+
+    def evaluate(self, cases) -> dict:
+        with tempfile.TemporaryDirectory(prefix="sh-gate-") as d:
+            measured = Path(d) / "measured.log"
+            measured.write_text("playback_smoke.measured_session id=1\nplayback_smoke.summary session=1 reason=visual-capture presented_frames=599 "
+                                "presented_fps=23.201\n", encoding="utf-8")
+            for case in cases:
+                if case != "l4-counters-only":
+                    write_self_heal_evidence(Path(d) / case / "self-heal", "good" if case == "good" else case)
+            script = (f"$ErrorActionPreference = 'Stop'; Import-Module '{ATTR_MODULE}' -Force; Import-Module '{DV / 'DualVenueRunner.psm1'}' -Force\n"
+                      f"$spec = [IO.File]::ReadAllText('{DV / SELF_HEAL_LEG}') | ConvertFrom-Json\n"
+                      f"$log = [IO.File]::ReadAllText('{measured}')\n"
+                      "$out = [ordered]@{}\n"
+                      f"foreach ($case in @({', '.join(repr(c) for c in cases)})) {{\n"
+                      "  $summary = [ordered]@{ result = 'MEASUREMENT_CAPTURED'; rows = 600; gpuFramesTotal = 599; cpuFrames = 0 }\n"
+                      "  if ($case -cne 'l4-counters-only') {\n"
+                      f"    $m = Get-AttrCudaSelfHealMetrics -SelfHealDir (Join-Path (Join-Path '{d}' $case) 'self-heal') -PreLaunches @('702@120', '702@120', 'none') -MeasuredLogText $log -MeasuredSessionId ''\n"
+                      "    foreach ($k in $m.Keys) { $summary[$k] = $m[$k] }\n"
+                      "  }\n"
+                      "  $metrics = Get-DvVerbatimMetrics -Summary (($summary | ConvertTo-Json -Depth 4) | ConvertFrom-Json) -EvidenceManifest $null\n"
+                      "  $v = Test-DvCriteria -Criteria $spec.criteria.acceptance.cuda -Metrics $metrics\n"
+                      "  $s = Test-DvCriteria -Criteria $spec.criteria.supplementary.cuda -Metrics $metrics\n"
+                      "  $out[$case] = [ordered]@{ pass = $v.pass; supplementaryPass = $s.pass; failures = @($v.failures); metrics = $metrics }\n"
+                      "}\n"
+                      "$out | ConvertTo-Json -Depth 6 -Compress")
+            proc = run_pwsh(["-Command", script])
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return json.loads(proc.stdout)
+
+    def test_the_self_heal_leg_passes_only_when_every_l1_to_l4_fact_holds(self) -> None:
+        out = self.evaluate(self.CASES)
+        good = out["good"]
+        self.assertTrue(good["pass"] and good["supplementaryPass"], good["failures"])
+        self.assertEqual((good["metrics"]["selfHealL1Rc"], good["metrics"]["selfHealL1PreLaunchOk"], good["metrics"]["selfHealL3CudaFrames"],
+                          good["metrics"]["selfHealL1FpsRatio"]), (1, 1, 0, 0.974))
+        for case, expected in self.CASES.items():
+            if case == "good":
+                continue
+            with self.subTest(case):
+                got = out[case]
+                self.assertFalse(got["pass"], case)
+                self.assertFalse(got["supplementaryPass"], case)
+                failed = sorted({f.split(" ")[0].rstrip(":") for f in got["failures"]})
+                for metric in expected:
+                    self.assertIn(metric, failed, f"{case}: {got['failures']}")
+                if case not in ("l4-counters-only", "skipped-l2"):
+                    self.assertEqual(sorted(expected), failed, f"{case} breaks exactly its own fact: {got['failures']}")
+
+    def test_an_unreadable_counter_is_could_not_check_never_zero(self) -> None:
+        """r10 (CoS #437, Dot c503450a): an L3 gpu_summary whose CUDA and preview counters are absent, empty or not decimal counts, a reuse summary
+        whose refused count is empty, and a fault row with no cuda_code each FAIL exactly their criteria with a typed COULD-NOT-CHECK reason in the
+        verdict -- never a 0 that passes. A present-and-zero counter still passes (good) and a present-and-nonzero one still fails (gpu-preview-l3)."""
+        out = self.evaluate(["good", "gpu-preview-l3", *self.COULD_NOT_CHECK_CASES])
+        self.assertTrue(out["good"]["pass"], out["good"]["failures"])
+        self.assertEqual(out["good"]["metrics"]["selfHealL3GpuPreviewFrames"], 0)
+        self.assertEqual({k: v for k, v in out["good"]["metrics"].items() if k.endswith("CouldNotCheck") and v is not None}, {})
+        self.assertEqual(out["gpu-preview-l3"]["failures"], ["selfHealL3GpuPreviewFrames eq 0 failed (actual 12)"])
+        for case, (expected, token) in self.COULD_NOT_CHECK_CASES.items():
+            with self.subTest(case):
+                got = out[case]
+                self.assertFalse(got["pass"], case)
+                self.assertFalse(got["supplementaryPass"], case)
+                self.assertEqual(sorted({f.split(" ")[0].rstrip(":") for f in got["failures"]}), sorted(expected), got["failures"])
+                for failure in got["failures"]:
+                    self.assertIn(f": COULD-NOT-CHECK {token} ", failure, case)
+                for metric in expected:
+                    self.assertIsNone(got["metrics"][metric], f"{case}: {metric} is never a default")
 
 
 class VisualCaptureSpecAndAppSourceTests(unittest.TestCase):

@@ -689,11 +689,14 @@ contains heavy denoise (RBF) above modest thresholds, Highlight
 Reconstruction with Cyan Highlight Fix, or any debayer other than
 AMaZE / Bilinear; full processing returns the moment playback stops).
 
-**Playback → Playback Quality → Scale Factor** lets you force the
-preview size with **Auto**, **x1**, **x2**, or **x4**. Use **x1** for
-the sharpest paused view, **x4** for the smoothest preview, and **Auto**
-to follow the current quality mode and sampler. The scale control is a
-UI equivalent of the old `MLVAPP_PLAYBACK_SCALE_FACTOR` override.
+**Playback → Playback Quality → Playback Resolution** lets you force the
+preview size with **Auto**, **Full res (1x)**, **Half res (0.5x)**,
+**Quarter res (0.25x)**, or **Custom res (1/8)**. Use **Full res** for
+the sharpest paused view, **Quarter res** for the smoothest preview, and
+**Auto** to follow the current quality mode and sampler. The toolbar
+indicator shows the same words (for example `Half res`). The control is a
+UI equivalent of the old `MLVAPP_PLAYBACK_SCALE_FACTOR` override, whose
+values 1, 2, 4 and 8 mean full, half, quarter and one-eighth resolution.
 
 **Playback → Playback Quality → Mode** defaults to **Auto**. Auto starts
 from a quality-preserving preview choice, watches the measured playback

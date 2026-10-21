@@ -289,6 +289,7 @@ void llrpSetGpuPlaybackReconTexturePrepareOnlyForCurrentThread(int enabled)
 
 static int llrawproc_gpu_playback_recon_enabled(void)
 {
+    if(llrpGpuCudaSuppressed()) return 0;
     return g_llrawproc_gpu_playback_recon_allowed
         && llrawproc_env_truthy_value(getenv("MLVAPP_GPU_PLAYBACK_RECON"));
 }
@@ -338,6 +339,10 @@ static MLV_THREAD_LOCAL llrpGpuPlaybackRetainedDeviceBayer16_t
  * reader are provably the same thread for the lifetime of one frame. */
 static MLV_THREAD_LOCAL llrpGpuPlaybackReconPreuploadStatus_t
     g_llrawproc_gpu_playback_last_preupload_status = {0};
+/* PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1: the wall time run_backend() already measures for its set_clip / set_luts
+ * calls, kept for the calling thread (0 when the run needed neither). Read only by the paused warm run's log line. */
+static MLV_THREAD_LOCAL double g_llrawproc_gpu_last_set_clip_ms = 0.0;
+static MLV_THREAD_LOCAL double g_llrawproc_gpu_last_set_luts_ms = 0.0;
 
 static void llrawproc_gpu_export_reset_last_run_state(void)
 {
@@ -423,6 +428,74 @@ int llrpResetGpuPlaybackReconRunForTesting(void)
 {
     llrawproc_gpu_playback_reset_last_run_state();
     return 1;
+}
+
+/* PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1: this thread's last-run playback recon state, moved aside for the paused
+ * warm run and put back after it (llrawproc.h). The owned input copy moves with it, so neither side frees the other's. */
+typedef struct
+{
+    int run_attempted;
+    int run_rc;
+    int used;
+    int state_valid;
+    int prepare_only;
+    dualiso_gpu_recon_state_t prepared_state;
+    uint16_t * input_bayer16;
+    size_t input_words;
+    llrpGpuPlaybackRetainedDeviceBayer16_t retained_device_bayer16;
+    llrpGpuPlaybackReconPreuploadStatus_t preupload_status;
+} llrawprocGpuPlaybackLastRunSnapshot_t;
+
+void * llrpGpuPlaybackReconSaveLastRunState(void)
+{
+    llrawprocGpuPlaybackLastRunSnapshot_t * snapshot =
+        (llrawprocGpuPlaybackLastRunSnapshot_t *)calloc(1, sizeof(*snapshot));
+    if(!snapshot) return NULL;
+    snapshot->run_attempted = g_llrawproc_gpu_playback_last_run_attempted;
+    snapshot->run_rc = g_llrawproc_gpu_playback_last_run_rc;
+    snapshot->used = g_llrawproc_gpu_playback_last_used;
+    snapshot->state_valid = g_llrawproc_gpu_playback_last_state_valid;
+    snapshot->prepare_only = g_llrawproc_gpu_playback_last_prepare_only;
+    snapshot->prepared_state = g_llrawproc_gpu_playback_last_prepared_state;
+    snapshot->input_bayer16 = g_llrawproc_gpu_playback_last_input_bayer16;
+    snapshot->input_words = g_llrawproc_gpu_playback_last_input_words;
+    snapshot->retained_device_bayer16 = g_llrawproc_gpu_playback_last_retained_device_bayer16;
+    snapshot->preupload_status = g_llrawproc_gpu_playback_last_preupload_status;
+    /* the snapshot owns the input copy now; the reset below must not free it */
+    g_llrawproc_gpu_playback_last_input_bayer16 = NULL;
+    g_llrawproc_gpu_playback_last_input_words = 0;
+    llrawproc_gpu_playback_reset_last_run_state();
+    return snapshot;
+}
+
+void llrpGpuPlaybackReconRestoreLastRunState(void * snapshot_handle)
+{
+    llrawprocGpuPlaybackLastRunSnapshot_t * snapshot =
+        (llrawprocGpuPlaybackLastRunSnapshot_t *)snapshot_handle;
+    /* drop what the warm left (frees its owned input copy) */
+    llrawproc_gpu_playback_reset_last_run_state();
+    if(!snapshot) return;
+    g_llrawproc_gpu_playback_last_run_attempted = snapshot->run_attempted;
+    g_llrawproc_gpu_playback_last_run_rc = snapshot->run_rc;
+    g_llrawproc_gpu_playback_last_used = snapshot->used;
+    g_llrawproc_gpu_playback_last_state_valid = snapshot->state_valid;
+    g_llrawproc_gpu_playback_last_prepare_only = snapshot->prepare_only;
+    g_llrawproc_gpu_playback_last_prepared_state = snapshot->prepared_state;
+    g_llrawproc_gpu_playback_last_input_bayer16 = snapshot->input_bayer16;
+    g_llrawproc_gpu_playback_last_input_words = snapshot->input_words;
+    g_llrawproc_gpu_playback_last_retained_device_bayer16 = snapshot->retained_device_bayer16;
+    g_llrawproc_gpu_playback_last_preupload_status = snapshot->preupload_status;
+    free(snapshot);
+}
+
+double llrpGpuPlaybackReconLastSetClipMilliseconds(void)
+{
+    return g_llrawproc_gpu_last_set_clip_ms;
+}
+
+double llrpGpuPlaybackReconLastSetLutsMilliseconds(void)
+{
+    return g_llrawproc_gpu_last_set_luts_ms;
 }
 
 int llrpGpuExportLastRunAttemptedForTesting(void);
@@ -831,6 +904,21 @@ static llrpGpuReconEventLogger_t g_llrawproc_gpu_recon_event_logger = NULL;
 static llrpGpuStageTelemetrySink_t g_llrawproc_gpu_stage_telemetry_sink = NULL;
 static volatile LONG g_llrawproc_gpu_recon_run_active = 0;
 static volatile LONG g_llrawproc_gpu_preupload_bypass_active = 0;
+/* GPU-DEVICE-LOSS-SELF-HEAL-1: see llrpSetGpuCudaSuppressed in llrawproc.h. */
+static volatile LONG g_llrawproc_gpu_cuda_suppressed = 0;
+/* r10 (CoS #437): frames that passed run_backend's check before the lock and
+ * are about to take the backend mutex; a test's pre-lock rendezvous. */
+static volatile LONG g_llrawproc_gpu_recon_lock_arrivals = 0;
+
+void llrpSetGpuCudaSuppressed(int suppressed)
+{
+    InterlockedExchange(&g_llrawproc_gpu_cuda_suppressed, suppressed ? 1 : 0);
+}
+
+int llrpGpuCudaSuppressed(void)
+{
+    return g_llrawproc_gpu_cuda_suppressed != 0;
+}
 
 /* Caller holds g_llrawproc_gpu_recon_backend_mutex; info is zeroed. */
 static void llrawproc_gpu_recon_fill_backend_info(llrpGpuPlaybackReconBackendInfo_t * info)
@@ -1058,7 +1146,13 @@ static void llrawproc_fake_gpu_backend_note_cuda_error(int channel,
 {
     llrawprocFakeGpuCudaErrorRing_t * r;
     igpu_cuda_error_t * e;
+    FILETIME now;
+    ULARGE_INTEGER ticks;
     if(code == 0 || channel < 0 || channel > 1) return;
+    /* As igpu_cuda_error_slot.h's note(): wall clock when noted, Unix epoch ms. */
+    GetSystemTimeAsFileTime(&now);
+    ticks.LowPart = now.dwLowDateTime;
+    ticks.HighPart = now.dwHighDateTime;
     r = &g_llrawproc_fake_gpu_backend_cuda_errors[channel];
     if(r->size == LLRAWPROC_FAKE_GPU_CUDA_ERROR_PENDING)
     {
@@ -1071,6 +1165,7 @@ static void llrawproc_fake_gpu_backend_note_cuda_error(int channel,
     e->code = code;
     snprintf(e->name, sizeof(e->name), "%s", name ? name : "");
     snprintf(e->site, sizeof(e->site), "%s", site ? site : "");
+    e->utc_ms = (double)(ticks.QuadPart - 116444736000000000ULL) / 10000.0;
     e->count = ++g_llrawproc_fake_gpu_backend_cuda_error_count;
     ++r->size;
     __atomic_store_n(&g_llrawproc_fake_gpu_backend_cuda_error_pending[channel], r->size, __ATOMIC_RELAXED);
@@ -1663,6 +1758,39 @@ void llrpHoldGpuReconBackendMutexForTesting(int hold)
     else pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
 }
 
+/* GPU-DEVICE-LOSS-SELF-HEAL-1 r10 test-only: how many frames have passed
+ * run_backend's check before the lock and reached the backend mutex. */
+long llrpGpuReconBackendLockArrivalsForTesting(void);
+long llrpGpuReconBackendLockArrivalsForTesting(void)
+{
+    return InterlockedCompareExchange(&g_llrawproc_gpu_recon_lock_arrivals, 0, 0);
+}
+
+/* TEST SEAM (GPU-LOSS-EMIT-BEFORE-UNLOCK-1), not a production feature: only
+ * tests/pipeline/test_gpu_device_loss_selfheal.cpp sets the hook. Called by
+ * each capturing section (run_backend, the preupload, the GL reset and the
+ * teardown drain) right after it releases the backend mutex (and the bypass
+ * claim) and before it emits to the telemetry sink: the gap a test holds open.
+ * NULL (the default, and always in the app) calls nothing: one pointer load.
+ * r4 (Iverson 6227232346): the slot is written with InterlockedExchangePointer and
+ * read with InterlockedCompareExchangePointer(&p, NULL, NULL), like the file's other
+ * cross-thread state (InterlockedExchange in llrpSetGpuCudaSuppressed), not a plain
+ * volatile load/store. The slot holds the function pointer as a PVOID. */
+static PVOID volatile g_llrawproc_gpu_recon_after_unlock_hook = NULL;
+
+void llrpSetGpuReconAfterUnlockHookForTesting(void (*hook)(void));
+void llrpSetGpuReconAfterUnlockHookForTesting(void (*hook)(void))
+{
+    InterlockedExchangePointer(&g_llrawproc_gpu_recon_after_unlock_hook, (PVOID)hook);
+}
+
+static void llrawproc_gpu_recon_after_unlock_for_testing(void)
+{
+    void (*hook)(void) = (void (*)(void))InterlockedCompareExchangePointer(
+        &g_llrawproc_gpu_recon_after_unlock_hook, NULL, NULL);
+    if(hook) hook();
+}
+
 /* Test-only: model an older DLL (present=0) that lacks
  * igpu_recon_set_reduced_iso_notch, or restore the symbol (present=1). */
 int llrpSetFakeGpuBackendReducedIsoNotchSymbolForTesting(int present);
@@ -1890,8 +2018,21 @@ static int llrawproc_gpu_recon_backend_available_guarded(int prefer_playback_dll
 {
     int available = 0;
     pthread_mutex_lock(&g_llrawproc_gpu_recon_backend_mutex);
-    available = llrawproc_gpu_export_backend_available(prefer_playback_dll);
+    /* GPU-DEVICE-LOSS-SELF-HEAL-1 r6: the check can create the backend (a CUDA
+     * call), so a suppressed session reads it as unavailable, under the lock. */
+    if(!llrpGpuCudaSuppressed())
+        available = llrawproc_gpu_export_backend_available(prefer_playback_dll);
     pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
+    return available;
+}
+
+/* PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-SETUP-1 Row B: the playback runs pass prefer_playback_dll=1, so this loads
+ * the same DLL/backend name and the first run's llrawproc_gpu_export_backend_available(1) is a hit. */
+int llrpGpuPlaybackReconPreloadBackend(double * load_ms)
+{
+    const double start_s = mlv_stage_timing_now();
+    const int available = llrawproc_gpu_recon_backend_available_guarded(1);
+    if(load_ms) *load_ms = (mlv_stage_timing_now() - start_s) * 1000.0;
     return available;
 }
 
@@ -1914,6 +2055,49 @@ typedef struct
     llrawprocGpuCudaNotes_t orphans; /* pending at the call's entry: not this call's */
     llrawprocGpuCudaNotes_t noted;   /* noted during this failed call: [0] primary */
 } llrawprocGpuStageTelemetryEvent_t;
+
+/* GPU-LOSS-EMIT-BEFORE-UNLOCK-1: see llrpSetGpuDeviceLossClassifier in llrawproc.h.
+ * r4 (Iverson 6227232346): written with InterlockedExchangePointer and read with
+ * InterlockedCompareExchangePointer(&p, NULL, NULL), not as a plain volatile. In the
+ * app it is set once, when the breaker installs (GpuDeviceLossBreaker.cpp, before any
+ * backend caller runs), and cleared only by its resetForTesting. Held as a PVOID. */
+static PVOID volatile g_llrawproc_gpu_device_loss_classifier = NULL;
+
+void llrpSetGpuDeviceLossClassifier(llrpGpuDeviceLossClassifier_t classifier)
+{
+    InterlockedExchangePointer(&g_llrawproc_gpu_device_loss_classifier, (PVOID)classifier);
+}
+
+/* GPU-LOSS-EMIT-BEFORE-UNLOCK-1: caller holds the backend mutex (or the preupload bypass
+ * claim) and has not released it yet. A device-loss code among the captured notes sets
+ * the flag now; the sink still gets every record after the unlock. */
+static void llrawproc_gpu_suppress_on_device_loss_locked(const llrawprocGpuStageTelemetryEvent_t * ev, int count)
+{
+    const llrpGpuDeviceLossClassifier_t classifier = (llrpGpuDeviceLossClassifier_t)
+        InterlockedCompareExchangePointer(&g_llrawproc_gpu_device_loss_classifier, NULL, NULL);
+    int i;
+    int j;
+    if(!classifier) return;
+    for(i = 0; i < count; ++i)
+    {
+        for(j = 0; j < ev[i].orphans.count; ++j)
+        {
+            if(classifier(ev[i].orphans.notes[j].code))
+            {
+                llrpSetGpuCudaSuppressed(1);
+                return;
+            }
+        }
+        for(j = 0; j < ev[i].noted.count; ++j)
+        {
+            if(classifier(ev[i].noted.notes[j].code))
+            {
+                llrpSetGpuCudaSuppressed(1);
+                return;
+            }
+        }
+    }
+}
 
 /* r5: take every note pending on `channel` (failure / non-empty path only).
  * Prefers the r5 drain export; an r4 DLL is drained by repeated takes. */
@@ -2079,23 +2263,23 @@ static void llrawproc_gpu_stage_telemetry_emit(llrpGpuStageTelemetrySink_t sink,
     {
         const igpu_cuda_error_t * e = &ev->orphans.notes[i];
         sink("recon:uncaptured", 0, -1.0, e->code, e->name, e->site, "orphan",
-             i == 0 ? ev->orphans.dropped : 0);
+             i == 0 ? ev->orphans.dropped : 0, e->utc_ms);
     }
     if(emit_call)
     {
         if(ev->rc == 0)
         {
-            sink(ev->stage, 0, ev->ms, 0, NULL, NULL, NULL, 0);
+            sink(ev->stage, 0, ev->ms, 0, NULL, NULL, NULL, 0, 0.0);
         }
         else if(ev->noted.count == 0)
         {
-            sink(ev->stage, ev->rc, ev->ms, 0, NULL, NULL, "primary", ev->noted.dropped);
+            sink(ev->stage, ev->rc, ev->ms, 0, NULL, NULL, "primary", ev->noted.dropped, 0.0);
         }
         for(i = 0; ev->rc != 0 && i < ev->noted.count; ++i)
         {
             const igpu_cuda_error_t * e = &ev->noted.notes[i];
             sink(ev->stage, ev->rc, ev->ms, e->code, e->name, e->site,
-                 i == 0 ? "primary" : "secondary", i == 0 ? ev->noted.dropped : 0);
+                 i == 0 ? "primary" : "secondary", i == 0 ? ev->noted.dropped : 0, e->utc_ms);
         }
     }
     if(ev->orphans.notes)
@@ -2162,7 +2346,9 @@ int llrpGpuPlaybackReconDrainCudaErrorsAtTeardown(int wait_ms)
         Sleep(1);
     }
     llrawproc_gpu_stage_telemetry_take_leftovers(g, leftovers);
+    llrawproc_gpu_suppress_on_device_loss_locked(leftovers, 2);
     pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
+    llrawproc_gpu_recon_after_unlock_for_testing();
     return llrawproc_gpu_stage_telemetry_emit_leftovers(sink, leftovers);
 }
 
@@ -2181,12 +2367,14 @@ int llrpGpuPlaybackReconPreuploadFrame(uint64_t frame_id,
     int locked = 0;
     int run_active = 0;
     int bypass_claimed = 0;
+    int suppressed = 0;
     int rc = 0;
     llrpGpuStageTelemetrySink_t telemetry_sink = NULL;
     llrawprocGpuStageTelemetryEvent_t telemetry_event;
     int telemetry_entered = 0;
     int telemetry_pending = 0;
     const uint64_t frame_token = llrpGpuPlaybackReconFrameToken(frame_id);
+    if(llrpGpuCudaSuppressed()) return 0;
     if(!llrawproc_env_truthy_value(
            getenv("MLVAPP_GPU_PLAYBACK_RECON_ASYNC_H2D"))
      || !raw_input_bayer14
@@ -2220,7 +2408,12 @@ int llrpGpuPlaybackReconPreuploadFrame(uint64_t frame_id,
      * pointers cannot be replaced until that call clears run_active and
      * releases the mutex.  This narrow bypass is what permits N+1 upload to
      * overlap N's kernels without racing backend teardown. */
-    if(g->backend
+    /* GPU-DEVICE-LOSS-SELF-HEAL-1 r6: the flag is read again once the lock (or
+     * the bypass claim) is held: a loss delivered since the check above stops
+     * this upload too. */
+    suppressed = llrpGpuCudaSuppressed();
+    if(!suppressed
+     && g->backend
      && g->clip_configured
      && g->preupload_frame
      && g->run_preuploaded
@@ -2263,16 +2456,18 @@ int llrpGpuPlaybackReconPreuploadFrame(uint64_t frame_id,
                 || telemetry_event.noted.count != 0;
         }
     }
+    if(telemetry_entered) llrawproc_gpu_suppress_on_device_loss_locked(&telemetry_event, 1);
     if(locked) pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
     if(bypass_claimed)
     {
         InterlockedDecrement(&g_llrawproc_gpu_preupload_bypass_active);
     }
+    llrawproc_gpu_recon_after_unlock_for_testing();
     if(telemetry_entered)
     {
         llrawproc_gpu_stage_telemetry_emit(telemetry_sink, &telemetry_event, telemetry_pending);
     }
-    return rc == 0;
+    return !suppressed && rc == 0;
 }
 
 static void llrawproc_gpu_recon_luts_key_from_state(
@@ -2342,6 +2537,16 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
     if(device_width_out) *device_width_out = 0;
     if(device_height_out) *device_height_out = 0;
     if(retained_out) memset(retained_out, 0, sizeof(*retained_out));
+    g_llrawproc_gpu_last_set_clip_ms = 0.0;
+    g_llrawproc_gpu_last_set_luts_ms = 0.0;
+    /* GPU-DEVICE-LOSS-SELF-HEAL-1: after a device loss no CUDA call is made on
+     * any thread; checked before any lock or backend access (the fast path),
+     * and again once the backend mutex is held (r6). */
+    if(llrpGpuCudaSuppressed())
+    {
+        if(rc_out) *rc_out = LLRP_GPU_PLAYBACK_RECON_RC_CUDA_SUPPRESSED;
+        return 0;
+    }
     if(!state || !state->valid || !gpu_input || raw_image_size == 0) return 0;
     if(out_kind == IGPU_OUT_CPU16 && !gpu_output) return 0;
     if(out_kind == IGPU_OUT_GL_TEXTURE && gl_texture_id == 0) return 0;
@@ -2380,7 +2585,16 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
     frame.playback_preview_scale_factor = state->playback_preview_scale_factor;
     frame.apply_dither = state->apply_dither;
 
+    InterlockedIncrement(&g_llrawproc_gpu_recon_lock_arrivals);
     pthread_mutex_lock(&g_llrawproc_gpu_recon_backend_mutex);
+    /* r6 (CoS #437, guard under the serializing lock): a caller that passed the
+     * check above and then waited here through a loss must not reach CUDA. */
+    if(llrpGpuCudaSuppressed())
+    {
+        pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
+        if(rc_out) *rc_out = LLRP_GPU_PLAYBACK_RECON_RC_CUDA_SUPPRESSED;
+        return 0;
+    }
     if(!llrawproc_gpu_export_backend_available(prefer_playback_dll))
     {
         pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
@@ -2436,6 +2650,7 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
         set_clip_start_s = mlv_stage_timing_now();
         rc = g->set_clip(g->backend, &clip);
         set_clip_ms = (mlv_stage_timing_now() - set_clip_start_s) * 1000.0;
+        g_llrawproc_gpu_last_set_clip_ms = set_clip_ms;
         set_clip_rc = rc;
         set_clip_called = 1;
         InterlockedIncrement64(&g_llrawproc_gpu_set_clip_count);
@@ -2466,6 +2681,7 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
         set_luts_start_s = mlv_stage_timing_now();
         rc = g->set_luts(g->backend, &luts);
         set_luts_ms = (mlv_stage_timing_now() - set_luts_start_s) * 1000.0;
+        g_llrawproc_gpu_last_set_luts_ms = set_luts_ms;
         set_luts_rc = rc;
         set_luts_called = 1;
         InterlockedIncrement64(&g_llrawproc_gpu_set_luts_count);
@@ -2672,7 +2888,9 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
                                               "recon:run",
                                               IGPU_CUDA_ERROR_CHANNEL_RENDER, run_rc, run_ms);
     }
+    llrawproc_gpu_suppress_on_device_loss_locked(telemetry_events, telemetry_event_count);
     pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
+    llrawproc_gpu_recon_after_unlock_for_testing();
 
     if(telemetry_sink)
     {
@@ -2729,7 +2947,9 @@ int llrpGpuPlaybackReconResetGlTextureResources(void)
      * last render: the terminal drain, so the reset's own code is kept. */
     telemetry_sink = g_llrawproc_gpu_stage_telemetry_sink;
     if(telemetry_sink) llrawproc_gpu_stage_telemetry_take_leftovers(g, leftovers);
+    if(telemetry_sink) llrawproc_gpu_suppress_on_device_loss_locked(leftovers, 2);
     pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
+    llrawproc_gpu_recon_after_unlock_for_testing();
     if(telemetry_sink) llrawproc_gpu_stage_telemetry_emit_leftovers(telemetry_sink, leftovers);
     return ok;
 }
@@ -3161,10 +3381,20 @@ int llrpGpuPlaybackReconCopyLastDeviceBayer16ToGlTexture(unsigned int gl_texture
     llrawprocGpuExportBackend_t * g = &g_llrawproc_gpu_export_backend;
     int rc = -1;
     if(rc_out) *rc_out = -1;
+    if(llrpGpuCudaSuppressed())
+    {
+        if(rc_out) *rc_out = LLRP_GPU_PLAYBACK_RECON_RC_CUDA_SUPPRESSED;
+        return 0;
+    }
     if(gl_texture_id == 0) return 0;
 
     pthread_mutex_lock(&g_llrawproc_gpu_recon_backend_mutex);
-    if(g->backend && !g->unavailable && g->copy_last_device_output_to_gl_texture)
+    /* r6: read again under the lock (see llrawproc_gpu_recon_run_backend). */
+    if(llrpGpuCudaSuppressed())
+    {
+        rc = LLRP_GPU_PLAYBACK_RECON_RC_CUDA_SUPPRESSED;
+    }
+    else if(g->backend && !g->unavailable && g->copy_last_device_output_to_gl_texture)
     {
         rc = g->copy_last_device_output_to_gl_texture(g->backend, gl_texture_id);
     }
@@ -3317,6 +3547,12 @@ static int llrawproc_gpu_export_backend_available(int prefer_playback_dll)
 static int llrawproc_gpu_recon_backend_available_guarded(int prefer_playback_dll)
 {
     return llrawproc_gpu_export_backend_available(prefer_playback_dll);
+}
+
+int llrpGpuPlaybackReconPreloadBackend(double * load_ms)
+{
+    if(load_ms) *load_ms = 0.0;
+    return 0;
 }
 
 int llrpResetGpuExportBackendForTesting(void);
@@ -3582,6 +3818,25 @@ void llrpSetGpuReconEventLogger(llrpGpuReconEventLogger_t logger)
 void llrpSetGpuStageTelemetrySink(llrpGpuStageTelemetrySink_t sink)
 {
     (void)sink;
+}
+
+/* GPU-DEVICE-LOSS-SELF-HEAL-1: no recon backend here, but GpuDebayer.cpp and
+ * the playback gate read the same flag on every platform. */
+static volatile int g_llrawproc_gpu_cuda_suppressed = 0;
+
+void llrpSetGpuCudaSuppressed(int suppressed)
+{
+    __atomic_store_n(&g_llrawproc_gpu_cuda_suppressed, suppressed ? 1 : 0, __ATOMIC_SEQ_CST);
+}
+
+int llrpGpuCudaSuppressed(void)
+{
+    return __atomic_load_n(&g_llrawproc_gpu_cuda_suppressed, __ATOMIC_RELAXED) != 0;
+}
+
+void llrpSetGpuDeviceLossClassifier(llrpGpuDeviceLossClassifier_t classifier)
+{
+    (void)classifier;
 }
 
 int llrpGpuPlaybackReconDrainCudaErrorsAtTeardown(int wait_ms)
@@ -3984,6 +4239,20 @@ static int llrawproc_runtime_state_equal(const llrawproc_runtime_state_t * lhs,
     if (lhs->dng_black_level != rhs->dng_black_level) return 0;
     if (lhs->dng_white_level != rhs->dng_white_level) return 0;
     return 1;
+}
+
+int llrpGetSharedRuntimeState(mlvObject_t * video, llrawproc_runtime_state_t * out)
+{
+    if (!video || !video->llrawproc || !out) return 0;
+    pthread_mutex_lock(&video->llrawproc_mutex);
+    *out = llrawproc_capture_shared_runtime_state(video->llrawproc);
+    pthread_mutex_unlock(&video->llrawproc_mutex);
+    return 1;
+}
+
+int llrpSharedRuntimeStateEqual(const llrawproc_runtime_state_t * lhs, const llrawproc_runtime_state_t * rhs)
+{
+    return llrawproc_runtime_state_equal(lhs, rhs, 1);
 }
 
 static void llrawproc_worker_ensure_luts(llrawprocWorkerState_t * worker, int32_t black_level)
@@ -5880,6 +6149,12 @@ int applyLLRawProcObjectWorker_with_dims(mlvObject_t * video,
                                          llrawprocWorkerState_t * worker,
                                          int flags)
 {
+    /* GPU-DEVICE-LOSS-SELF-HEAL-1 r4: this is the recon worker's reduced recon, so
+     * the thread's "last recon used CUDA" state describes THIS recon, as in
+     * applyLLRawProcObjectWorker. Without it, a CPU reduced recon after a device
+     * loss kept the last CUDA frame's flag, and the render refused every one
+     * ("recon ran on the CUDA playback recon"). The GPU texture branch resets it too. */
+    llrawproc_gpu_playback_reset_last_run_state();
     return llrawproc_apply_with_dims_internal(video, raw_image_buff, raw_image_size,
                                               override_w, override_h, worker, flags);
 }

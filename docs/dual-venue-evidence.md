@@ -386,7 +386,7 @@ the generator's `-DisplayMode windowed`; `fullscreen` passes nothing, so a full-
 * **The standard leg set** is `legsets/display-matrix.json`: the owner clip M16-1243, Look Assist Cinematic, `{fullscreen, windowed}` x `{scale 1 = full, 2 = half, 4 = quarter}` x `{cuda, cpu}` = **12 cells**.
   Each cell is an ordinary committed leg spec (`legs/m16-1243-display-<mode>-s<scale>.json`, six specs, each listing both backends); the set only names them. Why a set file and not one matrix spec the
   runner expands: a receipt is bound to a committed spec by its sha256 (`Find-DvCommittedLegSpec`), so a cell that is not a committed spec could never validate. The CUDA texture route honours scales 2 and 4
-  (PLAYBACK-CUDA-HONOUR-SCALE-1), so no cell declares a clamp: a CUDA cell that rendered at 1 reads `2->1` or `4->1` and ends `SCALE_NOT_HONOURED`.
+  (PLAYBACK-CUDA-HONOUR-SCALE-1), so no cell declares a clamp: a CUDA cell that rendered at full resolution reads `Half res (0.5x)->Full res (1x)` or `Quarter res (0.25x)->Full res (1x)` in the summary table (receipt fields stay the numbers `2`/`4` and `1`) and ends `SCALE_NOT_HONOURED`.
   Roles are declared in `venues.json` (`DUAL-VENUE-DISPLAY-MATRIX-1`: Bachelor acceptance, Ultra-Magnus supplementary).
 * **Run it** (one entry point, the same script; `-LegSet` and `-LegSpec` are different parameter sets):
 
@@ -456,6 +456,42 @@ append-only (created with `CreateNew`; a repeat is refused, never overwritten). 
 the receipt -- the contact sheet, and, on a failed smoke run, `smoke-stderr.txt` / `smoke-stdout.txt`) is under `.claude-state\dual-venue\evidence\<receiptId>\`, which in production must sit under
 `.claude-state` too (the run log and result name an owner clip's run; they stay local like the receipt).
 
+### Staging a commit on a venue (tracked: `Invoke-VenueStageNightly.ps1`)
+
+`tools\profiling\dual-venue\Invoke-VenueStageNightly.ps1` is the tracked staging path (UM-REGULAR-BASELINE-STAGE-1). It runs the four steps
+above in order: the DLL pair on Ultra-Magnus (harvested when its single-use JobId already built the sha), the assemble on the board host under
+build-guard, the stage job, and the smoke-runner stage job. It stages at most one commit per night (default: the local `fork/master` ref, no fetch)
+and is ready for one scheduled call (UM-REGULAR-BASELINE-SCHEDULE-1: fetch fork, this driver, then `Invoke-VenueBaseline.ps1` on exit 0).
+
+```powershell
+pwsh -NoProfile -File tools\profiling\dual-venue\Invoke-VenueStageNightly.ps1 [-Venue ultra-magnus] [-SourceCommit <40-hex>] [-WhatIf]
+```
+
+- The cache is the truth, read by name. A sha whose `<agentShare>\cache\playback-attr-3-cuda-<sha12>-build.json`, three artifacts and smoke-runner
+  dir are already there is `STAGE_SKIP_ALREADY` and is never re-assembled. A re-assemble makes a new manifest (`assembledAtUtc`), so a spent default
+  stage JobId whose cache does not hold the assembled manifest is re-staged under `-JobIdSuffix n<yyyyMMddHHmm>` (#508). Every `STAGE_OK` is
+  re-hashed by name, and a mismatch is `STAGE_VERIFY_MISMATCH`.
+- The receipt row (`<main checkout>\.claude-state\dual-venue\stage-nightly.jsonl`, schema `mlv-app/venue-stage-nightly/v1`) records
+  `buildManifestSha256` as that by-name hash. It is the exact file `Invoke-VenueBaseline.ps1` and `Invoke-VenueLeg.ps1` hash.
+- The night is reserved before it is spent. Before the first staging step, the driver appends a `STAGE_RESERVED` row (venue, `nightKey`,
+  `sourceCommit`, a new `reservationId`). It flushes the row and reads it back. Every later row of that call carries the same `reservationId`.
+- The once-per-night check counts `STAGE_OK` rows and reservations. A reservation holds its night for its sha whether its call ended
+  `STAGE_OK`, failed, or never wrote its closing row (the call was killed, or its row was lost). For another sha that night:
+  - `NIGHT_ALREADY_BUILT` (exit 0) when the holder ended `STAGE_OK`;
+  - `NIGHT_RESERVED` (exit 52) otherwise. The hub then inspects the venue cache.
+
+  The same sha resumes, and its row lists, under `reconciled`, every incomplete reservation it took over.
+- Receipt I/O fails closed with `RECEIPT_IO_FAILED` (exit 51), never `STAGE_OK`/0, in three cases:
+  - a receipt that cannot be read for the night check;
+  - a reservation that cannot be persisted (nothing is staged);
+  - a closing row that cannot be appended. The result json names the `unpersistedOutcome`, and the persisted reservation still holds the night.
+- One driver per venue. The lock is the named mutex `Global\MLV-VenueStageNightly-<venue>`, with no caller-selected path in it. With the real
+  venue share, the only receipt accepted is the canonical `<main checkout>\.claude-state\dual-venue\stage-nightly.jsonl`, and any other
+  `-ReceiptFile` is `USAGE`. So the night cap has one ledger.
+- It refuses over a live venue claim or ticket (`AGENT_BUSY`). It honours the shared board disk floor and commit ceiling
+  (`.claude-state\hub-autopilot\disk-floor.ps1`, `host-commit-gate.ps1`): exit 3 with the gate's own text, and a missing gate is
+  `GATE_UNAVAILABLE`. It bounds every child by `-MaxTotalSec`. The typed exit table is in the script header.
+
 ## How to read the evidence
 
 * **Acceptance** reads only receipts whose `venue.role` is `acceptance` for the card, and only `PASS`/`FAIL`.
@@ -470,7 +506,7 @@ the receipt -- the contact sheet, and, on a failed smoke run, `smoke-stderr.txt`
 * **`INVALID` is not a failure of the product**: the run could not show >= 20 s of distinct source frames (or
   the proof is absent). It carries no signal; the card stays open. Fix the venue or the clip and re-run.
 * **Every speed leg keeps window captures** (PLAYBACK-VISUAL-INSPECTION-1): the receipt's `visual` block, the frames under
-  `visual/` in the evidence and one strip per leg; a `FROZEN_DISPLAY` leg is `INVALID`. Open the strip before approving a playback
+  `visual/` in the evidence and one strip per leg; a `FROZEN_DISPLAY` leg (one picture over source frames known to differ) is `INVALID`; `FROZEN_DISPLAY_SUSPECTED` and `VISUAL_ASSESSMENT_UNAVAILABLE` are counted and surfaced. Open the strip before approving a playback
   PR. Design, gate and opt-out: [dual-venue-visual-capture.md](dual-venue-visual-capture.md).
 
 ## Outcome mapping (job `RESULT=` token -> receipt outcome)

@@ -191,6 +191,56 @@ ROUTE_DELETE_ALLOWED = {
 
 TRAILING_COMMENT = re.compile(r"\s+#\s.*$")
 
+# ---- the leg submits no side file --------------------------------------------------------------------
+
+# A dual-venue file that hands um-run side files -> why none of them can be owner footage. An entry holds only while side_file_problems() below finds the file
+# OFF the owner-leg route (no leg source names it), naming no clip / footage / consent, and refusing every side file that is not its build package before the
+# side-file list is built. Everything else under dual-venue/ still may not pass one.
+SIDE_FILE_ALLOWED = {
+    "Invoke-VenueStageNightly.ps1":
+        "UM-REGULAR-BASELINE-STAGE-1: the nightly stager puts a BUILD into the venue cache and is not a leg. Its side files are this sha's build package (the "
+        "DLL-pair source zip and the four artifacts playback-attr-3-cuda-stage-job.ps1 verifies as inboxSideFiles), and Assert-StagePackageSideFile refuses "
+        "any other leaf name, or any path outside -BuildRoot, before um-run is called.",
+}
+# The sources a dual-venue owner leg actually runs (besides ROUTE_PS_SOURCES / ROUTE_PY_SOURCES); none may name a SIDE_FILE_ALLOWED file.
+LEG_SOURCES = ("Invoke-VenueLeg.ps1", "DualVenueRunner.psm1", "New-VenueSheetPair.ps1")
+SIDE_FILE_GUARD = {"Invoke-VenueStageNightly.ps1": "Assert-StagePackageSideFile -Side $Side"}
+FOOTAGE_NAME = re.compile(r"(?i)clip|footage|consent")
+
+
+def _code_lines(text: str) -> list[str]:
+    return [line for line in text.splitlines() if not line.lstrip().startswith("#")]
+
+
+def side_file_problems(profiling: Path = PROFILING) -> list[str]:
+    """What breaks "an owner leg hands um-run no side file" under `profiling`/dual-venue."""
+    dual_venue = profiling / "dual-venue"
+    problems = []
+    for path in sorted(dual_venue.glob("*.ps*1")):
+        if "-SideFile" in path.read_text(encoding="utf-8") and path.name not in SIDE_FILE_ALLOWED:
+            problems.append(f"{path.name}: names -SideFile; an owner leg must never hand um-run a side file")
+    leg = [dual_venue / name for name in LEG_SOURCES] + [profiling / name for name in ROUTE_PS_SOURCES + ROUTE_PY_SOURCES]
+    for name in SIDE_FILE_ALLOWED:
+        path = dual_venue / name
+        if not path.is_file():
+            problems.append(f"{name}: SIDE_FILE_ALLOWED names a file that does not exist; delete the entry")
+            continue
+        text = path.read_text(encoding="utf-8")
+        code = "\n".join(_code_lines(text))
+        if "-SideFile" not in code:
+            problems.append(f"{name}: no longer passes a side file; delete its SIDE_FILE_ALLOWED entry")
+            continue
+        for source in leg:
+            if source.is_file() and name in "\n".join(_code_lines(source.read_text(encoding="utf-8"))):
+                problems.append(f"{name}: the leg source {source.name} names it, so it is on the owner-leg route and may not pass a side file")
+        hit = FOOTAGE_NAME.search(code)
+        if hit:
+            problems.append(f"{name}: names {hit.group(0)!r} in code; a side-file sender must take no clip, footage or consent")
+        guard = SIDE_FILE_GUARD.get(name, "")
+        if not guard or guard not in code or code.index(guard) > code.index("-SideFile"):
+            problems.append(f"{name}: the package-only side-file refusal ({guard or 'none named'}) must run before the side-file list is built")
+    return problems
+
 
 def route_sources(profiling: Path = PROFILING) -> list[Path]:
     found = [profiling / name for name in ROUTE_PS_SOURCES]
@@ -323,10 +373,9 @@ class RouteDeleteSurfaceTests(unittest.TestCase):
 
     def test_the_leg_submits_no_side_file(self) -> None:
         # The staged-copy path (UmRunDrop's .sidepart) is for packages; an owner leg must never hand um-run a side file, or the clip's
-        # bytes would be copied through a share the leg does not control.
-        for path in (PROFILING / "dual-venue").glob("*.ps*1"):
-            text = path.read_text(encoding="utf-8")
-            self.assertNotIn("-SideFile", text, path.name)
+        # bytes would be copied through a share the leg does not control. A package stager off the leg route is listed in SIDE_FILE_ALLOWED.
+        self.assertEqual(side_file_problems(), [])
+        self.assertNotIn("-SideFile", (PROFILING / "dual-venue" / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8"))
 
     # ---- mutations ----------------------------------------------------------------------------
 
@@ -353,6 +402,35 @@ class RouteDeleteSurfaceTests(unittest.TestCase):
                     self.assertIn(("Invoke-VenueLeg.ps1", payload), caught, payload)
                 finally:
                     target.write_bytes(original)
+
+    def _route_copy(self, tmp: str) -> Path:
+        profiling = Path(tmp) / "profiling"
+        shutil.copytree(PROFILING / "dual-venue", profiling / "dual-venue")
+        for name in ROUTE_PS_SOURCES + ROUTE_PY_SOURCES:
+            shutil.copyfile(PROFILING / name, profiling / name)
+        self.assertEqual(side_file_problems(profiling), [], "the unmutated copy must pass")
+        return profiling
+
+    def test_mutation_a_side_file_on_the_leg_or_an_unguarded_stager_is_caught(self) -> None:
+        stager = "Invoke-VenueStageNightly.ps1"
+        guard = SIDE_FILE_GUARD[stager]
+        mutations = (
+            ("Invoke-VenueLeg.ps1", lambda t: t + "\n$r = & $umRun -ScriptPath $job -JobId $id -SideFile $clip\n", "Invoke-VenueLeg.ps1: names -SideFile"),
+            ("Invoke-VenueLeg.ps1", lambda t: t + f"\n& (Join-Path $PSScriptRoot '{stager}')\n", "on the owner-leg route"),
+            (stager, lambda t: t.replace(guard, "$null = $Side"), "must run before the side-file list is built"),
+            (stager, lambda t: t + "\n$ClipId = 'x'\n", "names 'Clip'"),
+            (stager, lambda t: t.replace("-SideFile", "-NoSideFile"), "no longer passes a side file"),
+        )
+        for victim, mutate, expected in mutations:
+            with self.subTest(victim=victim, expected=expected), tempfile.TemporaryDirectory() as tmp:
+                profiling = self._route_copy(tmp)
+                target = profiling / "dual-venue" / victim
+                text = target.read_text(encoding="utf-8")
+                mutated = mutate(text)
+                self.assertNotEqual(mutated, text)
+                target.write_text(mutated, encoding="utf-8")
+                problems = side_file_problems(profiling)
+                self.assertTrue(any(expected in p for p in problems), problems)
 
     def test_mutation_a_deleted_primitive_makes_its_exception_stale(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
