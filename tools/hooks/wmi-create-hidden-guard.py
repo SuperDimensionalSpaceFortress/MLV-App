@@ -61,6 +61,8 @@ _SHOW = re.compile(r"(?i)ShowWindow")
 _COMMENT = re.compile(r"(^|\s)#.*$")
 _HEREDOC = re.compile(r"""<<-?[ \t]*(['"]?)([A-Za-z_]\w*)\1""")
 _QUOTED = re.compile(r"\"[^\"]*\"|'[^']*'")
+_HEAD = re.compile(r"\"([^\"]*)\"\s*|'([^']*)'\s*|(\S+)\s*")
+_HEREDOC_SUBST = re.compile(r"""\$\(\s*cat\s+<<-?[ \t]*(['"]?)([A-Za-z_]\w*)\1""")
 _LEDGER = re.compile(
     r"""(?i)^(?:&\s*)?(?:(?:pwsh|powershell)(?:\.exe)?\s+(?:-\w+\s+(?:[^\s-]\S*\s+)?)*-File\s+)?"""
     r"""(?:"(?:[^"]*[\\/])?Add-LedgerLine\.ps1"|(?:[^\s"']*[\\/])?Add-LedgerLine\.ps1(?=\s|$))"""
@@ -72,15 +74,21 @@ def offending_lines(text):
     lines = text.splitlines() or [text]
     out = []
     for i, raw in enumerate(lines):
-        code = _COMMENT.sub("", raw).replace(SEGMENT_MARK, " ")
-        if not (_PROC.search(code) and _CREATE.search(code) and _CALL.search(code)):
-            continue
-        # ShowWindow in a neighbouring line counts; in another segment of the Create line it does not.
-        own = next((p for p in raw.split(SEGMENT_MARK) if _CREATE.search(_COMMENT.sub("", p))), code)
-        lo, hi = max(0, i - BEFORE), min(len(lines) - 1, i + AFTER)
-        near = [ln.replace(SEGMENT_MARK, " ") for ln in lines[lo:i]] + [own] + [ln.replace(SEGMENT_MARK, " ") for ln in lines[i + 1:hi + 1]]
-        if not _SHOW.search("\n".join(near)):
-            out.append(i + 1)
+        # Every segment holding Create closes a launch group (the segments since the previous Create) and is judged on its own:
+        # ShowWindow in a neighbouring line counts; in another segment of the line it does not, so a hidden Create cannot mask a later one.
+        group = []
+        for seg in _COMMENT.sub("", raw).split(SEGMENT_MARK):
+            group.append(seg)
+            if not _CREATE.search(seg):
+                continue
+            joined, group = " ".join(group), []
+            if not (_PROC.search(joined) and _CALL.search(joined)):
+                continue
+            lo, hi = max(0, i - BEFORE), min(len(lines) - 1, i + AFTER)
+            near = [ln.replace(SEGMENT_MARK, " ") for ln in lines[lo:i]] + [seg] + [ln.replace(SEGMENT_MARK, " ") for ln in lines[i + 1:hi + 1]]
+            if not _SHOW.search("\n".join(near)):
+                out.append(i + 1)
+                break
     return out
 
 
@@ -160,10 +168,17 @@ def split_shell(text):
 
 
 def _first_words(segment):
-    words = _QUOTED.sub("Q", segment.strip()).split()
-    while words and words[0] in ("&", ".", "command", "sudo"):
-        words = words[1:]
-    return words
+    """The command word (a quoted interpreter path counts as the command) followed by the rest with quoted operands as Q."""
+    rest = segment.strip()
+    while True:
+        m = _HEAD.match(rest)
+        if not m:
+            return []
+        word = next(g for g in m.groups() if g is not None)
+        if m.group(3) is not None and word in ("&", ".", "command", "sudo"):
+            rest = rest[m.end():]
+            continue
+        return [word] + _QUOTED.sub("Q", rest[m.end():]).split()
 
 
 def _command_name(word):
@@ -183,9 +198,22 @@ def _subcommand(words):
     return ""
 
 
+def _without_commit_heredocs(segment):
+    """The segment with each complete commit-heredoc substitution (dollar-paren cat heredoc ... terminator, close paren) removed."""
+    while True:
+        m = _HEREDOC_SUBST.search(segment)
+        if not m:
+            return segment
+        end = re.search(r"(?m)^[ \t]*%s[ \t]*$" % re.escape(m.group(2)), segment[m.end():])
+        tail = segment[m.end() + end.end():].lstrip() if end else ""
+        if not tail.startswith(")"):
+            return segment  # unterminated: not the idiom, so its dollar-paren stays visible
+        segment = segment[:m.start()] + tail[1:]
+
+
 def is_data_segment(segment):
     """True when the segment only reads or reports text, so its quoted operands are data."""
-    if "$(" in segment and "$(cat <<" not in segment:
+    if "$(" in _without_commit_heredocs(segment):
         return False
     if _LEDGER.match(segment.strip()):
         return True

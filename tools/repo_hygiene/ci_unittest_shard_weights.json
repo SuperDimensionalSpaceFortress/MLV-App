@@ -538,6 +538,7 @@
    "tools.repo_hygiene.test_venue_stage_nightly.VenueStageReuseModuleTests": 0.0,
    "tools.repo_hygiene.test_verify_consented_footage.VerifyConsentedFootageTests": 0.0,
    "tools.repo_hygiene.test_wmi_create_hidden_guard.WmiCreateHiddenGuardR2Tests": 2.0,
+   "tools.repo_hygiene.test_wmi_create_hidden_guard.WmiCreateHiddenGuardR4Tests": 2.0,
    "tools.repo_hygiene.test_wmi_create_hidden_guard.WmiCreateHiddenGuardTests": 2.0,
    "tools.repo_hygiene.test_workflow_pwsh_exit_guard.WorkflowPwshExitGuardTests": 0.0
   },
@@ -1078,6 +1079,7 @@
    "tools.repo_hygiene.test_venue_stage_nightly.VenueStageReuseModuleTests": 1.2,
    "tools.repo_hygiene.test_verify_consented_footage.VerifyConsentedFootageTests": 0.0,
    "tools.repo_hygiene.test_wmi_create_hidden_guard.WmiCreateHiddenGuardR2Tests": 2.0,
+   "tools.repo_hygiene.test_wmi_create_hidden_guard.WmiCreateHiddenGuardR4Tests": 2.0,
    "tools.repo_hygiene.test_wmi_create_hidden_guard.WmiCreateHiddenGuardTests": 2.0,
    "tools.repo_hygiene.test_workflow_pwsh_exit_guard.WorkflowPwshExitGuardTests": 0.2
   }

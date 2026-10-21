@@ -183,5 +183,50 @@ class WmiCreateHiddenGuardR2Tests(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 2.0)
 
 
+# r4 (PR #547, sol r3 blockers B1-B3): the code did less than the declared contract.
+UNHIDDEN_ARGS = "Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine='cmd.exe /c exit'}"
+HIDDEN_ONE_LINE = ("Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments "
+                   "@{ProcessStartupInformation=(New-CimInstance Win32_ProcessStartup -ClientOnly -Property @{ShowWindow=0});CommandLine='cmd.exe /c exit'}")
+QUOTED_PWSH = "'C:/Program Files/PowerShell/7/pwsh.exe'"
+COMMIT_HEREDOC = "git commit -m \"$(cat <<'EOF'\n%s\nEOF\n)\""
+
+
+class WmiCreateHiddenGuardR4Tests(unittest.TestCase):
+    def test_every_create_on_a_line_is_judged_on_its_own_window(self):
+        # B1: a hidden Create's ShowWindow must not mask a later unhidden Create on the same line.
+        self.assertIsNotNone(GUARD.decide(ps(HIDDEN_ONE_LINE + "; " + UNHIDDEN_ARGS)))
+        self.assertIsNotNone(GUARD.decide(bash(HIDDEN_ONE_LINE + " && " + UNHIDDEN_ARGS)))
+        self.assertIsNotNone(GUARD.decide(ps(UNHIDDEN_ARGS + "; " + HIDDEN_ONE_LINE)))
+        # two hidden Creates, and a hidden Create followed by prose that merely says Create, stay allowed
+        self.assertIsNone(GUARD.decide(ps(HIDDEN_ONE_LINE + "; " + HIDDEN_ONE_LINE)))
+        self.assertIsNone(GUARD.decide(ps(HIDDEN_ONE_LINE + "; Write-Host 'Create done'")))
+        self.assertIsNone(GUARD.decide(ps(HIDDEN_ONE_LINE)))
+
+    def test_a_quoted_interpreter_path_is_still_an_interpreter_sink(self):
+        # B2: launch text piped into a quoted interpreter path is code, exactly as with the bare name.
+        launch = 'Write-Output "%s"' % UNHIDDEN_ARGS
+        for sink in ("pwsh -NoProfile -Command -",
+                     "& %s -NoProfile -Command -" % QUOTED_PWSH,
+                     "& \"C:\\Program Files\\PowerShell\\7\\pwsh.exe\" -NoProfile -Command -",
+                     "%s -NoProfile -Command -" % QUOTED_PWSH,
+                     ". \"powershell.exe\" -Command -"):
+            self.assertIsNotNone(GUARD.decide(ps("%s | %s" % (launch, sink))), sink)
+        # a quoted data tool is still data, and a quoted non-interpreter is not a sink
+        self.assertIsNone(GUARD.decide(ps("Get-Content x.ps1 | & 'C:/tools/rg.exe' -n \"%s\"" % FORM)))
+        self.assertIsNone(GUARD.decide(ps("%s | & 'C:/tools/other.exe' -x" % launch)))
+
+    def test_commit_heredoc_exempts_only_the_heredoc_substitution(self):
+        # B3: one heredoc marker must not exempt a second, executable dollar-paren substitution.
+        second = "$(pwsh -NoProfile -Command \"%s\")" % UNHIDDEN_ARGS
+        self.assertIsNotNone(GUARD.decide(bash(COMMIT_HEREDOC % "message" + " -m \"%s\"" % second)))
+        self.assertIsNotNone(GUARD.decide(bash("git commit -m \"%s\" -m \"%s\"" % (second, "$(cat <<'EOF'\nmessage\nEOF\n)"))))
+        # an unterminated heredoc substitution is not the idiom
+        self.assertIsNotNone(GUARD.decide(bash("git commit -m \"$(cat <<'EOF'\nGuard %s\n)\"" % FORM)))
+        # the idiom itself, with the form in its body or a dollar-paren inside its body, stays data
+        self.assertIsNone(GUARD.decide(bash(COMMIT_HEREDOC % ("Guard " + FORM))))
+        self.assertIsNone(GUARD.decide(bash(COMMIT_HEREDOC % "mentions $(pwsh -Command x) in prose")))
+        self.assertIsNone(GUARD.decide(bash(COMMIT_HEREDOC % ("Guard " + FORM) + " -m 'second %s'" % FORM)))
+
+
 if __name__ == "__main__":
     unittest.main()
