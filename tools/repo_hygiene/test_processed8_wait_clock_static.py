@@ -16,6 +16,11 @@ video_mlv.c must therefore consume its return value, and (PR #544 sol r1) the in
 its monotonic flag only in the branch where setclock and the cond init both returned exactly 0.
 PR #544 r2 keys: the helper may fall back to a default (REALTIME) cond only under 'if (!monotonic)',
 and initMlvObject must store that helper's return, and nothing else, in the clock field.
+PR #544 r3 keys (sol S1-S3, fable W-08), closed by class rather than by shape: grouping parentheses
+are collapsed before the write, address and call checks; no macro may name a clock, a cond call or a
+guarded name, or paste tokens; the field assignment must be a live top-level statement; the field
+and the helper are each named only where the guard expects them; and the MONOTONIC read must be the
+'else if' that follows the realtime-fallback branch, on a literal clock id.
 """
 import functools
 from pathlib import Path
@@ -60,14 +65,26 @@ INIT_OBJECT_FUNCTION = "initMlvObject"
 CLOCK_FIELD = "processed8_prefetch_cond_clock_monotonic"
 # The whole statement, from a statement boundary, so a '(void)' cast or a chained '=' cannot hide in it.
 FIELD_ASSIGNMENT = re.compile(
-    r"[;{}]\s*(video\s*->\s*" + CLOCK_FIELD + r")\s*=\s*" + COND_INIT_FUNCTION
-    + r"\s*\(\s*&\s*video\s*->\s*processed8_prefetch_cond\s*\)\s*;")
+    r"[;{}]\s*(video\s*->\s*" + CLOCK_FIELD + r")\s*=\s*(" + COND_INIT_FUNCTION
+    + r")\s*\(\s*&\s*video\s*->\s*processed8_prefetch_cond\s*\)\s*;")
 _FIELD_REF = r"(?:\w+\s*(?:->|\.)\s*)*" + CLOCK_FIELD + r"\b"
+# A closing ')' between the field and the operator, or an opening '(' after '++', '--' or '&', is a
+# parenthesized write or address take (PR #544 r3 sol S1).
 FIELD_WRITE = re.compile(
-    r"(?:\w+\s*(?:->|\.)\s*)*" + CLOCK_FIELD + r"\s*(?:(?:[-+*/%&|^]|<<|>>)?=(?!=)|\+\+|--)"
-    r"|(?:\+\+|--|(?<!&)&(?!&))\s*" + _FIELD_REF)
+    r"(?:\w+\s*(?:->|\.)\s*)*" + CLOCK_FIELD + r"\s*(?:\)\s*)*(?:(?:[-+*/%&|^]|<<|>>)?=(?!=)|\+\+|--)"
+    r"|(?:\+\+|--|(?<!&)&(?!&))[\s(]*" + _FIELD_REF)
 DIRECT_PREFETCH_COND_INIT = re.compile(
     r"\bpthread_cond_init\s*\(\s*&\s*(?:\w+\s*(?:->|\.)\s*)*processed8_prefetch_cond\s*,")
+GROUPED_CHAIN = re.compile(r"\(\s*[A-Za-z_]\w*(?:\s*(?:->|\.)\s*[A-Za-z_]\w*)*\s*\)")
+# A '(' after these keywords groups an expression; after any other identifier, ')' or ']' it opens a
+# call or a statement header and is kept.
+GROUPING_KEYWORDS = frozenset(("return", "else", "do", "case"))
+MACRO_DIRECTIVE = re.compile(r"(?m)^[ \t]*#[ \t]*(?:define|undef)\b(?:\\\r?\n|[^\n])*")
+GUARDED_MACRO_TEXT = re.compile(
+    r"CLOCK_REALTIME|CLOCK_MONOTONIC|pthread_cond_init|pthread_condattr_setclock|pthread_cond_timedwait"
+    r"|clock_gettime|" + COND_INIT_FUNCTION + "|" + SLICE_FUNCTION + r"|processed8_prefetch_cond")
+MONOTONIC_READ = re.compile(
+    r"\s*else\s+if\s*\(\s*clock_gettime\s*\(\s*CLOCK_MONOTONIC\s*,\s*&\s*wait_time\s*\)")
 
 
 @functools.lru_cache(maxsize=4)  # each check re-blanks the same ~0.5 MB source
@@ -96,6 +113,30 @@ def _blank_comments_and_literals(text: str) -> str:
                 out[blank] = " "
         index = end
     return "".join(out)
+
+
+@functools.lru_cache(maxsize=4)
+def _collapse_grouping_parens(code: str) -> str:
+    """Same-length copy of blanked code with every grouping '( <identifier or member chain> )' reduced
+    to the bare chain, so '(video->field) = 1' reads as 'video->field = 1' and '(helper)(x)' as
+    'helper (x)'. Call and statement-header parentheses are kept."""
+    while True:
+        out = list(code)
+        for group in GROUPED_CHAIN.finditer(code):
+            before = group.start() - 1
+            while before >= 0 and code[before].isspace():
+                before -= 1
+            word_end = before + 1
+            while before >= 0 and (code[before].isalnum() or code[before] == "_"):
+                before -= 1
+            word = code[before + 1:word_end]
+            if (word and word not in GROUPING_KEYWORDS) or (not word and before >= 0 and code[before] in ")]"):
+                continue
+            out[group.start()] = out[group.end() - 1] = " "
+        collapsed = "".join(out)
+        if collapsed == code:
+            return collapsed
+        code = collapsed
 
 
 def _matching_brace(text: str, open_index: int) -> int:
@@ -140,6 +181,23 @@ def slice_body_violations(source: str) -> list[str]:
             line = source.count("\n", 0, body_open + read.start()) + 1
             problems.append("wall-clock read %r at video_mlv.c:%d is outside the realtime-fallback branch"
                             % (read.group(0), line))
+    # PR #544 r3 sol S3 and fable W-08: a macro or numeric clock id hides a wall-clock read from the
+    # scan above, and a missing 'else' runs the MONOTONIC read after the REALTIME one.
+    grouped = _collapse_grouping_parens(code)[body_open:body_open + len(body)]
+    gettimes = list(re.finditer(r"\bclock_gettime\b", grouped))
+    if len(gettimes) != 2:
+        problems.append("the slice must name clock_gettime exactly twice (the REALTIME fallback read and "
+                        "the MONOTONIC read), found %d" % len(gettimes))
+    for read in gettimes:
+        call = re.match(r"clock_gettime\s*\(([^(),]*),", grouped[read.start():])
+        clock = call.group(1).strip() if call else ""
+        if clock not in ("CLOCK_REALTIME", "CLOCK_MONOTONIC"):
+            line = source.count("\n", 0, body_open + read.start()) + 1
+            problems.append("clock_gettime at video_mlv.c:%d must name CLOCK_REALTIME or CLOCK_MONOTONIC "
+                            "literally, found %r" % (line, clock))
+    if len(guards) == 1 and not MONOTONIC_READ.match(body, fallback[1]):
+        problems.append("the realtime-fallback branch must be followed directly by "
+                        "'else if (clock_gettime(CLOCK_MONOTONIC, &wait_time)'")
     return problems
 
 
@@ -321,22 +379,70 @@ def field_wiring_violations(source: str) -> list[str]:
         problems.append("%s must run 'video->%s = %s(&video->processed8_prefetch_cond);' exactly once, found %d"
                         % (INIT_OBJECT_FUNCTION, CLOCK_FIELD, COND_INIT_FUNCTION, len(assignments)))
     expected = [body_open + assignments[0].start(1)] if len(assignments) == 1 else []
-    for write in FIELD_WRITE.finditer(code):
+    # PR #544 r3 sol S1/S2: '(video->field) = 1' and '(helper)(...)' are checked as their bare forms.
+    grouped = _collapse_grouping_parens(code)
+    for write in FIELD_WRITE.finditer(grouped):
         if write.start() not in expected:
             problems.append("%s is written or aliased at video_mlv.c:%d outside the one helper assignment"
                             % (CLOCK_FIELD, source.count("\n", 0, write.start()) + 1))
-    calls = len(re.findall(r"\b" + COND_INIT_FUNCTION + r"\s*\(", code)) - 1
+    calls = len(re.findall(r"\b" + COND_INIT_FUNCTION + r"\s*\(", grouped)) - 1
     if calls != 1:
         problems.append("%s must be called exactly once (the field assignment), found %d" % (COND_INIT_FUNCTION, calls))
-    for direct in DIRECT_PREFETCH_COND_INIT.finditer(code):
+    for direct in DIRECT_PREFETCH_COND_INIT.finditer(grouped):
         problems.append("processed8_prefetch_cond is initialised at video_mlv.c:%d without %s"
                         % (source.count("\n", 0, direct.start()) + 1, COND_INIT_FUNCTION))
+    if len(assignments) == 1:
+        # PR #544 r3 sol S2: the assignment must run, so it is a top-level statement of initMlvObject
+        # that no 'if (0)', '#if 0', goto or earlier return can skip.
+        start = assignments[0].start(1)
+        before = body[:start]
+        line = source.count("\n", 0, body_open + start) + 1
+        if before.count("{") - before.count("}") != 1 or before.count("(") != before.count(")"):
+            problems.append("the %s assignment at video_mlv.c:%d must be a top-level statement of %s"
+                            % (CLOCK_FIELD, line, INIT_OBJECT_FUNCTION))
+        if re.search(r"\bgoto\b", body) or re.search(r"\breturn\b", before):
+            problems.append("the %s assignment at video_mlv.c:%d must not be skippable by a goto or an "
+                            "earlier return" % (CLOCK_FIELD, line))
+        conditionals = 0
+        for directive in re.finditer(r"(?m)^[ \t]*#[ \t]*(if|ifdef|ifndef|endif)\b", code[:body_open + start]):
+            conditionals += -1 if directive.group(1) == "endif" else 1
+        if conditionals:
+            problems.append("the %s assignment at video_mlv.c:%d sits inside a preprocessor conditional"
+                            % (CLOCK_FIELD, line))
+        # The field is named only by this assignment and the slice's fallback guard, and the helper
+        # only by its definition and this assignment.
+        allowed = {body_open + start + assignments[0].group(1).index(CLOCK_FIELD)}
+        slice_open, slice_body, _ = _function_body(code, SLICE_FUNCTION)
+        for guard in FALLBACK_GUARD.finditer(slice_body):
+            allowed.add(slice_open + guard.start() + guard.group(0).index(CLOCK_FIELD))
+        for ref in re.finditer(r"\b" + CLOCK_FIELD + r"\b", code):
+            if ref.start() not in allowed:
+                problems.append("%s is named at video_mlv.c:%d outside the %s assignment and the slice's "
+                                "fallback guard" % (CLOCK_FIELD, source.count("\n", 0, ref.start()) + 1,
+                                                    INIT_OBJECT_FUNCTION))
+        helper_refs = [ref.start() for ref in re.finditer(r"\b" + COND_INIT_FUNCTION + r"\b", code)]
+        if len(helper_refs) != 2 or body_open + assignments[0].start(2) not in helper_refs:
+            problems.append("%s must be named exactly twice (its definition and the %s assignment), found %d"
+                            % (COND_INIT_FUNCTION, INIT_OBJECT_FUNCTION, len(helper_refs)))
+    return problems
+
+
+def macro_violations(source: str) -> list[str]:
+    """PR #544 r3 sol S3: no '#define' or '#undef' in video_mlv.c may name a clock, a cond or clock
+    call, or a guarded name, and none may paste tokens, so the text checks see what the compiler sees."""
+    code = _blank_comments_and_literals(source)
+    problems = []
+    for directive in MACRO_DIRECTIVE.finditer(code):
+        text = directive.group(0)
+        if GUARDED_MACRO_TEXT.search(text) or "##" in text:
+            problems.append("macro at video_mlv.c:%d renames a guarded clock, call or name, or pastes tokens: %s"
+                            % (source.count("\n", 0, directive.start()) + 1, " ".join(text.split())))
     return problems
 
 
 def _all_violations(source: str) -> list[str]:
     return (slice_body_violations(source) + setclock_violations(source) + cond_init_violations(source)
-            + cond_reinit_violations(source) + field_wiring_violations(source))
+            + cond_reinit_violations(source) + field_wiring_violations(source) + macro_violations(source))
 
 
 GUARDED_SLICE = """
@@ -489,6 +595,55 @@ class Processed8WaitClockStaticTests(unittest.TestCase):
                 for old_part, new_part in zip(old.split("|"), new.split("|")):
                     self.assertEqual(1, mutated.count(old_part), name)
                     mutated = mutated.replace(old_part, new_part)
+                self.assertTrue(_all_violations(mutated), name)
+
+    def test_no_macro_renames_a_guarded_clock_call_or_name(self) -> None:
+        self.assertEqual([], macro_violations(self.source))
+
+    def test_guard_rejects_r3_text_bypass_classes_in_head_source(self) -> None:
+        # PR #544 r3 keys (sol S1-S3, fable W-08): each edit leaves the code compiling and the cond and
+        # the field on different clocks, or the MONOTONIC slice reading the wall clock. Each mutation
+        # is applied to the real head source.
+        assignment = ("    video->processed8_prefetch_cond_clock_monotonic =\n"
+                      "        mlv_processed8_prefetch_cond_init(&video->processed8_prefetch_cond);\n")
+        init_object = "mlvObject_t * initMlvObject()\n"
+        slice_definition = "static int %s(mlvObject_t * video,\n" % SLICE_FUNCTION
+        monotonic_read = "    else if (clock_gettime(CLOCK_MONOTONIC, &wait_time) != 0)\n"
+        mutations = {
+            "S1 parenthesized field write": [
+                (assignment, assignment + "    (video->%s) = 1;\n" % CLOCK_FIELD)],
+            "S1 parenthesized prefix increment": [
+                (assignment, assignment + "    ++(video->%s);\n" % CLOCK_FIELD)],
+            "S1 parenthesized postfix increment": [
+                (assignment, assignment + "    (video->%s)++;\n" % CLOCK_FIELD)],
+            "S1 parenthesized address take": [
+                (assignment, assignment + "    int * clock_flag = &(video->%s);\n    *clock_flag = 1;\n" % CLOCK_FIELD)],
+            "S2 dead assignment, live parenthesized helper call": [
+                (assignment, "    if (0)\n    {\n" + assignment + "    }\n"
+                             "    (%s)(&video->processed8_prefetch_cond);\n" % COND_INIT_FUNCTION)],
+            "S2 assignment skipped by goto": [
+                (assignment, "    goto skip_clock_field;\n" + assignment + "skip_clock_field:\n    ;\n")],
+            "S3 macro-aliased CLOCK_REALTIME in the MONOTONIC read": [
+                (slice_definition, "#define PROCESSED8_WAIT_CLOCK CLOCK_REALTIME\n" + slice_definition),
+                (monotonic_read, monotonic_read.replace("CLOCK_MONOTONIC", "PROCESSED8_WAIT_CLOCK"))],
+            "S3 object-like macro redirects the helper": [
+                (init_object, "static int %s_default(pthread_cond_t * cond)\n"
+                              "{\n    pthread_cond_init(cond, NULL);\n    return 1;\n}\n"
+                              "#define %s %s_default\n\n" % ((COND_INIT_FUNCTION,) * 3) + init_object)],
+            "S3 numeric clock id in the MONOTONIC read": [
+                (monotonic_read, monotonic_read.replace("CLOCK_MONOTONIC", "0"))],
+            "S3 token-pasted field write": [
+                (init_object, "#define MLV_PASTE(a, b) a##b\n\n" + init_object),
+                (assignment, assignment + "    video->MLV_PASTE(processed8_prefetch_cond_clock, _monotonic) = 1;\n")],
+            "W-08 else deleted before the MONOTONIC read": [
+                (monotonic_read, monotonic_read.replace("    else if", "    if"))],
+        }
+        for name, edits in mutations.items():
+            with self.subTest(mutation=name):
+                mutated = self.source
+                for old, new in edits:
+                    self.assertEqual(1, mutated.count(old), name)
+                    mutated = mutated.replace(old, new)
                 self.assertTrue(_all_violations(mutated), name)
 
 
