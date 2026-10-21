@@ -217,9 +217,11 @@ def children_alive(records):
 # name -> run_control arguments. Each leaves the WMI sleeper (outside the job) running unless the finalizer kills it.
 FAILURE_PATHS = {
     "start-process-throws": dict(fault="start-process-throws", survival_sec=5, timeout=90),
-    "host-does-not-exit": dict(fault="host-hangs", survival_sec=5, host_wait_sec=8, timeout=90),
-    "subprocess-timeout": dict(survival_sec=SURVIVAL_WAIT_SEC, timeout=15),
+    "host-does-not-exit": dict(fault="host-hangs", survival_sec=5, host_wait_sec=30, timeout=90),
+    "subprocess-timeout": dict(survival_sec=SURVIVAL_WAIT_SEC, timeout=40),
 }
+# The two rows above are sized for a loaded runner (start-up of pwsh plus the WMI Create can take many seconds) yet
+# stay inside the 60 s survival wait they overlap, so they add no wall time: the host waits 30 s, the timeout is 40 s.
 
 
 @pytest.fixture(scope="module")
@@ -249,15 +251,23 @@ def failure_path(request, failure_paths_started):
 # ---- the job object itself --------------------------------------------------------------------------------
 
 JOB_CLASS_RE = re.compile(r"(?s)if \(-not \('MlvLaneJob' -as \[type\]\)\) \{\s*Add-Type -TypeDefinition @'\r?\n(.*?)\r?\n'@")
-# any assignment operator (=, |=, &=, ^=, +=, -=, <<=, ...) whose target is a LimitFlags member; == is a comparison
+# any assignment operator (=, |=, &=, ^=, +=, -=, <<=, ...) whose target is a LimitFlags member; == is a comparison.
+# Whitespace between the member and the operator is allowed (comments are blanked to whitespace first).
 LIMIT_FLAGS_WRITE_RE = re.compile(r"\bLimitFlags\s*(?:<<|>>|[-+*/%&|^])?=(?!=)([^;]*)")
+# C# tokens that can hide a write or fake one: string and char literals (kept, so a "//" inside one opens nothing)
+# and comments (blanked to one space, which is also what separates tokens in C#).
+CS_TOKEN_RE = re.compile(r"""@"(?:[^"]|"")*"|"(?:[^"\\\r\n]|\\.)*"|'(?:[^'\\\r\n]|\\.)*'|//[^\r\n]*|/\*.*?\*/""", re.S)
+
+
+def blank_cs_comments(code):
+    return CS_TOKEN_RE.sub(lambda m: m.group(0) if m.group(0)[0] in "@\"'" else " ", code)
 
 
 def limit_flag_writes(src):
-    """Right-hand sides of every LimitFlags write inside the MlvLaneJob Add-Type block."""
+    """Right-hand sides of every LimitFlags write inside the MlvLaneJob Add-Type block, comments ignored."""
     m = JOB_CLASS_RE.search(src)
     assert m, "MlvLaneJob Add-Type block not found in Invoke-Lane.ps1"
-    return [rhs.strip() for rhs in LIMIT_FLAGS_WRITE_RE.findall(m.group(1))]
+    return [rhs.strip() for rhs in LIMIT_FLAGS_WRITE_RE.findall(blank_cs_comments(m.group(1)))]
 
 
 def assert_kill_on_close_only(src):
@@ -285,6 +295,31 @@ def test_a_second_limitflags_write_is_caught(extra):
     assert src.count(WRITE_0x2000) == 1, "Invoke-Lane.ps1 no longer has the expected single LimitFlags write"
     with pytest.raises(AssertionError, match="exactly once"):
         assert_kill_on_close_only(src.replace(WRITE_0x2000, WRITE_0x2000 + "\n" + extra))
+
+
+@pytest.mark.parametrize("extra", [
+    "value.BasicLimitInformation.LimitFlags /* breakaway */ |= 0x800;",   # comment between the member and the operator
+    "value.BasicLimitInformation.LimitFlags /* x */ |= 0x1000;",          # same, for 0x1000 (SILENT_BREAKAWAY_OK)
+    "value.BasicLimitInformation.LimitFlags |= /* x */ 0x1000;",          # comment after the operator
+    "value.BasicLimitInformation.LimitFlags/**/|=0x1000;",                # comment as the only separator
+    'string s = "//"; value.BasicLimitInformation.LimitFlags |= 0x800;',  # "//" in a string does not open a comment
+])
+def test_a_limitflags_write_split_by_a_comment_is_caught(extra):
+    src = INVOKE_LANE.read_text(encoding="utf-8")
+    assert src.count(WRITE_0x2000) == 1, "Invoke-Lane.ps1 no longer has the expected single LimitFlags write"
+    with pytest.raises(AssertionError, match="exactly once"):
+        assert_kill_on_close_only(src.replace(WRITE_0x2000, WRITE_0x2000 + "\n" + extra))
+
+
+@pytest.mark.parametrize("comment", [
+    "// LimitFlags = 0x800 removed",
+    "/* LimitFlags |= 0x800 */",
+    "/* multi-line\n   LimitFlags = 0x1000; */",
+])
+def test_a_commented_out_limitflags_write_does_not_count(comment):
+    src = INVOKE_LANE.read_text(encoding="utf-8")
+    assert src.count(WRITE_0x2000) == 1, "Invoke-Lane.ps1 no longer has the expected single LimitFlags write"
+    assert_kill_on_close_only(src.replace(WRITE_0x2000, WRITE_0x2000 + "\n" + comment))
 
 
 def test_the_only_limitflags_write_must_be_0x2000():
