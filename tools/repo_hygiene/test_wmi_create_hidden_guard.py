@@ -228,5 +228,109 @@ class WmiCreateHiddenGuardR4Tests(unittest.TestCase):
         self.assertIsNone(GUARD.decide(bash(COMMIT_HEREDOC % ("Guard " + FORM) + " -m 'second %s'" % FORM)))
 
 
+# r5 (PR #547, sol r4 blockers B1-B3): r4 closed one spelling of each family. The row generators below are the family tables.
+SINK_NAMES = ("pwsh", "pwsh.exe", "powershell", "powershell.exe", "cmd", "cmd.exe", "bash", "sh", "python", "py", "node", "wscript", "cscript")
+SINK_PATHS = ("C:/Program Files/PowerShell/7/pwsh.exe", "C:\\Windows\\System32\\cmd.exe", "/usr/bin/python",
+              "C:/Program Files/Git/bin/bash.exe", "C:\\Windows\\System32\\wscript.exe")
+CALL_OPS = ("", "& ", "&  ", "&", ". ", ".")
+LAUNCH = 'Write-Output "%s"' % UNHIDDEN_ARGS
+DATA_LAUNCH = 'echo "%s"' % UNHIDDEN_ARGS
+
+
+def invocation_rows():
+    """(spelling, command) for a launch fed to an interpreter spelled with a call operator, a quote, or both. Every row is DENY."""
+    for target in SINK_NAMES + SINK_PATHS:
+        for quote in ("", "'", '"'):
+            if quote == "" and " " in target:
+                continue
+            for op in CALL_OPS:
+                if quote == "" and op == ".":
+                    continue  # `.pwsh` is a file name, not a dot-source
+                head = "%s%s%s%s" % (op, quote, target, quote)
+                kind = "op=%r quote=%s" % (op, quote or "bare")
+                yield kind + " piped ' | '", "%s | %s -NoProfile -Command -" % (LAUNCH, head)
+                yield kind + " piped '|'", "%s|%s -NoProfile -Command -" % (LAUNCH, head)
+                yield kind + " inline", "%s -NoProfile -Command \"%s\"" % (head, UNHIDDEN_ARGS)
+
+
+REDIRECT_WRITES = (
+    "> run.ps1", ">run.ps1", ">> run.ps1", ">>run.ps1", ">| run.ps1", ">|run.ps1", ">& run.ps1", ">&run.ps1", ">& 'run.ps1'",
+    "&> run.ps1", "&>run.ps1", "&>> run.ps1", "1> run.ps1", "1>> run.ps1", "1>run.ps1", "3> run.ps1", "2> run.ps1", "2>> run.ps1",
+    "*> run.ps1", "*>> run.ps1", "*>run.ps1", "2>&1 > run.ps1", "> run.ps1 2>&1", ">& run.ps1 2>&1",
+    "| tee run.ps1", "|tee run.ps1", "| tee -a run.ps1", "|& tee run.ps1", "| Out-File run.ps1", "| Out-File -FilePath run.ps1",
+    "| Set-Content run.ps1", "| Set-Content -Path run.ps1 -Encoding utf8", "| Add-Content run.ps1", "| Tee-Object run.ps1",
+)
+FD_DUPLICATIONS = ("2>&1", ">&2", "1>&2", ">& 2", ">&-", "2>&-", "2>/dev/null", "2> /dev/null", "2>>/dev/null", "2>$null", "2>nul", "*>&1", "2>&1 | Select-String x")
+
+
+def redirect_rows():
+    """(spelling, expected_deny, command): a data command whose output goes to a file is code; fd duplication is not a redirect."""
+    for tail in REDIRECT_WRITES:
+        yield tail, True, "%s %s; pwsh -NoProfile -File run.ps1" % (DATA_LAUNCH, tail)
+    for tail in FD_DUPLICATIONS:
+        yield tail, False, "%s %s; echo done" % (DATA_LAUNCH, tail)
+        yield tail, False, "grep -n \"%s\" x.ps1 %s" % (FORM, tail)
+
+
+def heredoc_rows():
+    """(spelling, expected_deny, command) for the commit-message heredoc idiom and for standalone heredocs."""
+    subst = "$(pwsh -NoProfile -Command \"%s\")" % UNHIDDEN_ARGS
+    tick = "`pwsh -NoProfile -Command '%s'`" % UNHIDDEN_ARGS
+    for opener, literal in (("'EOF'", True), ("\"EOF\"", True), ("\\EOF", True), ("-'EOF'", True), ("-\"EOF\"", True), ("-\\EOF", True),
+                            ("EOF", False), ("-EOF", False), (" EOF", False), ("- EOF", False)):
+        commit = "git commit -m \"$(cat <<%s\n%%s\nEOF\n)\"" % opener
+        yield "commit %s prose" % opener, not literal, commit % ("Guard " + FORM)
+        yield "commit %s dollar-paren body" % opener, not literal, commit % subst
+        yield "commit %s backtick body" % opener, not literal, commit % tick
+        yield "commit %s second substitution" % opener, True, (commit % "message") + " -m \"%s\"" % subst
+        standalone = "cat <<%s\n%%s\nEOF" % opener
+        yield "standalone %s dollar-paren body" % opener, True, standalone % subst
+        yield "standalone %s backtick body" % opener, not literal, standalone % tick
+        yield "standalone %s prose" % opener, False, standalone % ("Guard " + FORM)
+        yield "commit -F %s dollar-paren body" % opener, True, "git commit -F - <<%s\n%s\nEOF" % (opener, subst)
+        yield "interpreter fed %s" % opener, True, "pwsh -NoProfile -Command - <<%s\n%s\nEOF" % (opener, UNHIDDEN_ARGS)
+
+
+class WmiCreateHiddenGuardR5Tests(unittest.TestCase):
+    def _verdicts(self, command):
+        return (GUARD.decide(bash(command)) is not None, GUARD.decide(ps(command)) is not None)
+
+    def test_invocation_family_every_spelling_is_a_sink(self):
+        # B1: a call operator, a dot-source, or a quote in any combination does not hide the interpreter.
+        rows = list(invocation_rows())
+        self.assertGreater(len(rows), 800)
+        for spelling, command in rows:
+            self.assertEqual((True, True), self._verdicts(command), "%s: %s" % (spelling, command))
+
+    def test_invocation_family_controls_and_separators(self):
+        # a quoted data tool or a non-interpreter stays data/ALLOW; `&` after a command is a separator, not a call operator
+        self.assertIsNone(GUARD.decide(ps("Get-Content x.ps1 | &'C:/tools/rg.exe' -n \"%s\"" % FORM)))
+        self.assertIsNone(GUARD.decide(ps("%s | &'C:/tools/other.exe' -x" % LAUNCH)))
+        self.assertIsNone(GUARD.decide(ps("%s |&\"C:/tools/other.exe\" -x" % LAUNCH)))
+        self.assertIsNone(GUARD.decide(ps("%s | . 'C:/tools/other.exe'" % LAUNCH)))
+        self.assertIsNotNone(GUARD.decide(bash("echo hi &'pwsh' -c \"%s\"" % UNHIDDEN_ARGS)))
+        self.assertIsNotNone(GUARD.decide(bash("echo hi ;&'pwsh' -c \"%s\"" % UNHIDDEN_ARGS)))
+        self.assertIsNotNone(GUARD.decide(ps("%s | ForEach-Object { $_ } |&'C:/Program Files/PowerShell/7/pwsh.exe' -NoProfile -Command -" % LAUNCH)))
+
+    def test_redirect_family_every_spelling(self):
+        # B2: any file redirect or writer turns a data command into code; fd duplication does not.
+        rows = list(redirect_rows())
+        self.assertGreater(len(rows), 40)
+        for spelling, deny, command in rows:
+            self.assertEqual((deny, deny), self._verdicts(command), "%s: %s" % (spelling, command))
+        # the sol repro verbatim
+        self.assertIsNotNone(GUARD.decide(bash("echo \"%s\" >& run.ps1; pwsh -NoProfile -File run.ps1" % UNHIDDEN_ARGS)))
+
+    def test_heredoc_family_only_a_quoted_delimiter_is_literal(self):
+        # B3: an unquoted heredoc body expands its substitutions, so it is scanned like any other command text.
+        rows = list(heredoc_rows())
+        self.assertGreater(len(rows), 80)
+        for spelling, deny, command in rows:
+            self.assertEqual((deny, deny), self._verdicts(command), "%s: %s" % (spelling, command))
+        # the sol repro verbatim, and the allowed commit idiom with a quoted delimiter
+        self.assertIsNotNone(GUARD.decide(bash("git commit -m \"$(cat <<EOF\n$(pwsh -NoProfile -Command \"%s\")\nEOF\n)\"" % UNHIDDEN_ARGS)))
+        self.assertIsNone(GUARD.decide(bash(COMMIT_HEREDOC % ("Guard " + FORM))))
+
+
 if __name__ == "__main__":
     unittest.main()

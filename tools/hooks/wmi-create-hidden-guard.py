@@ -23,7 +23,7 @@ double ampersand, pipe, double pipe and newline, and each segment is judged on i
 appear within the window with no ShowWindow=0. Data segments are not scanned: read and search commands, git
 commit/log/show/diff/grep/blame/tag/notes, gh pr/issue, Add-LedgerLine.ps1. A data segment is code again when it redirects
 with a greater-than sign, sits in a pipeline with a writer or interpreter sink, or holds a dollar-paren substitution (except
-the commit heredoc idiom). An unbalanced quote disables every exemption. Write/Edit/NotebookEdit content is scanned only for
+the quoted-delimiter commit heredoc idiom). An unbalanced quote disables every exemption. Write/Edit/NotebookEdit content is scanned only for
 executable script types (.ps1 .psm1 .psd1 .bat .cmd .py .js .mjs .cjs .vbs .sh and .ipynb code cells); Test-* and test_*
 fixtures are exempt.
 Non-promises: it does not catch a non-zero ShowWindow value or a ShowWindow comment in the window; Win32_Process and Create
@@ -48,7 +48,7 @@ DATA_COMMANDS = frozenset((
 ))
 SINK_COMMANDS = frozenset((
     "set-content", "sc", "add-content", "ac", "out-file", "tee", "tee-object", "invoke-expression", "iex",
-    "sh", "bash", "pwsh", "powershell", "cmd", "python", "py", "node",
+    "sh", "bash", "pwsh", "powershell", "cmd", "python", "python3", "py", "node", "wscript", "cscript",
 ))
 GIT_DATA = frozenset(("grep", "log", "show", "diff", "commit", "blame", "tag", "notes"))
 GH_DATA = frozenset(("pr", "issue"))
@@ -59,10 +59,13 @@ _CREATE = re.compile(r"(?i)\bCreate\b")
 _CALL = re.compile(r"(?i)Invoke-(Cim|Wmi)Method|\[wmiclass\]|\.Create\(")
 _SHOW = re.compile(r"(?i)ShowWindow")
 _COMMENT = re.compile(r"(^|\s)#.*$")
-_HEREDOC = re.compile(r"""<<-?[ \t]*(['"]?)([A-Za-z_]\w*)\1""")
+_HEREDOC = re.compile(r"""<<-?[ \t]*(?:(['"])([^'"\n]+)\1|(\\?)([A-Za-z_]\w*))""")  # a quote or a backslash makes the body literal
 _QUOTED = re.compile(r"\"[^\"]*\"|'[^']*'")
 _HEAD = re.compile(r"\"([^\"]*)\"\s*|'([^']*)'\s*|(\S+)\s*")
-_HEREDOC_SUBST = re.compile(r"""\$\(\s*cat\s+<<-?[ \t]*(['"]?)([A-Za-z_]\w*)\1""")
+_HEREDOC_SUBST = re.compile(r"""\$\(\s*cat\s+<<-?[ \t]*(?:(['"])([^'"\n]+)\1|\\([A-Za-z_]\w*))""")  # quoted delimiters only
+_CALL_OP = re.compile(r"""(?:&|\.)(?=['"])|&(?=[^\s&>|;])""")  # call operator or dot-source glued to the command word
+_FD_DUP = re.compile(r">&[ \t]*(?:\d+-?|-)(?=[\s;&|)]|$)")
+_NULL_TARGET = re.compile(r">>?[ \t]*(?:/dev/null|\$null|nul)(?![\w./\\-])", re.I)
 _LEDGER = re.compile(
     r"""(?i)^(?:&\s*)?(?:(?:pwsh|powershell)(?:\.exe)?\s+(?:-\w+\s+(?:[^\s-]\S*\s+)?)*-File\s+)?"""
     r"""(?:"(?:[^"]*[\\/])?Add-LedgerLine\.ps1"|(?:[^\s"']*[\\/])?Add-LedgerLine\.ps1(?=\s|$))"""
@@ -92,9 +95,24 @@ def offending_lines(text):
     return out
 
 
-def split_shell(text):
-    """Split on ; & && | || and newlines outside quotes. Rows are [segment, separator_after, has_redirect].
+def _writes_file(text, i):
+    """True when the greater-than sign at text[i] sends output to a file (any fd, >>, >|, &>, *>, >& WORD).
 
+    fd duplication (>&2, 2>&1, >&-) is not a file write, and neither is stderr (2>) sent to the null device.
+    """
+    if i and text[i - 1] == ">":
+        return False  # the second sign of >>: the first one decided
+    if _FD_DUP.match(text, i):
+        return False
+    if i and text[i - 1] == "2" and (i == 1 or text[i - 2] in " \t\n;&|("):
+        return not _NULL_TARGET.match(text, i)
+    return True
+
+
+def split_shell(text):
+    """Split on ; & && | || and newlines outside quotes. Rows are [segment, separator_after, forces_code].
+
+    forces_code is set by a file redirect or by an unquoted heredoc body holding a backtick substitution.
     A heredoc body stays in the segment that opened it. Returns None when a quote is left open.
     """
     rows, cur, quote, heredocs = [], [], None, []
@@ -121,7 +139,7 @@ def split_shell(text):
         if text.startswith("<<", i) and not text.startswith("<<<", i):
             m = _HEREDOC.match(text, i)
             if m:
-                heredocs.append(m.group(2))
+                heredocs.append((m.group(2) or m.group(4), bool(m.group(1) or m.group(3))))
                 cur.append(m.group(0))
                 i = m.end()
                 continue
@@ -129,8 +147,11 @@ def split_shell(text):
             quote = ch
         elif ch == "\n":
             if heredocs:
-                m = re.search(r"(?m)^[ \t]*%s[ \t]*$" % re.escape(heredocs.pop(0)), text[i + 1:])
+                tag, literal = heredocs.pop(0)
+                m = re.search(r"(?m)^[ \t]*%s[ \t]*$" % re.escape(tag), text[i + 1:])
                 end = i + 1 + m.end() if m else n
+                if not literal and "`" in text[i:end]:
+                    redirect = True  # an unquoted heredoc body expands backtick substitutions, so the segment is code
                 cur.append(text[i:end])
                 i = end
                 continue
@@ -157,7 +178,7 @@ def split_shell(text):
                 i += 1
                 continue
         elif ch == ">":
-            if not (text.startswith(">&", i) or (i and text[i - 1] == "2")):
+            if _writes_file(text, i):
                 redirect = True
         cur.append(ch)
         i += 1
@@ -171,6 +192,10 @@ def _first_words(segment):
     """The command word (a quoted interpreter path counts as the command) followed by the rest with quoted operands as Q."""
     rest = segment.strip()
     while True:
+        op = _CALL_OP.match(rest)
+        if op:  # &'C:/x/pwsh.exe', &"pwsh", &pwsh, ."pwsh.exe": the operator needs no space before the command word
+            rest = rest[op.end():]
+            continue
         m = _HEAD.match(rest)
         if not m:
             return []
@@ -199,12 +224,14 @@ def _subcommand(words):
 
 
 def _without_commit_heredocs(segment):
-    """The segment with each complete commit-heredoc substitution (dollar-paren cat heredoc ... terminator, close paren) removed."""
+    """The segment with each complete quoted-delimiter commit-heredoc substitution (dollar-paren cat heredoc ... terminator, close paren) removed.
+
+    An unquoted delimiter expands its body, so that substitution is not removed and stays visible."""
     while True:
         m = _HEREDOC_SUBST.search(segment)
         if not m:
             return segment
-        end = re.search(r"(?m)^[ \t]*%s[ \t]*$" % re.escape(m.group(2)), segment[m.end():])
+        end = re.search(r"(?m)^[ \t]*%s[ \t]*$" % re.escape(m.group(2) or m.group(3)), segment[m.end():])
         tail = segment[m.end() + end.end():].lstrip() if end else ""
         if not tail.startswith(")"):
             return segment  # unterminated: not the idiom, so its dollar-paren stays visible
