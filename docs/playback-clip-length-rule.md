@@ -264,7 +264,7 @@ self-test). A new consumer is neither, so it fails until a reviewer classifies i
 | `run-release-cuda-playback-ab.ps1` | baseline / candidate exit codes are proof failures |
 | `run-ultramagnus-p3-validation.ps1` | a non-zero smoke exit is a clip failure |
 | `bachelor/playback-attr-3-cuda-job.ps1` | a non-zero runner exit is `SMOKE_RUN_FAILED` |
-| `bachelor/reference-frame-runner-job.ps1` (VENUE-REFERENCE-FRAME-JOB-1) | runs `capture-reference-frame.ps1` from a hash-pinned bundle under the gate profile; the capture's exit code is the job's exit code (`CAPTURE_FAILED`, 43 included), and only exit 0 writes `candidate-unreviewed` |
+| `bachelor/reference-frame-runner-job.ps1` (VENUE-REFERENCE-FRAME-JOB-1) | runs `capture-reference-frame.ps1` from a hash-pinned bundle under the gate profile; the capture's exit code is the job's exit code (`CAPTURE_FAILED`, 43 included), and only exit 0 writes `candidate-unreviewed`; a capture voided by a changed footage view (225) is stamped invalid in place AND marked by a sibling `reference-frame-candidate.invalid`, which a reader honours whatever the manifest says (`frame_provenance.py` does) |
 | `run-shipping-guard-smoke.ps1`, `run-local-cuda-playback-dng-smoke.ps1`, `invoke-ultramagnus-p3-evidence.ps1`, `export-release-cuda-dogfood-kit.ps1` | callers of the consumers above: each turns a child's exit code into its own status / exit |
 | `dual-venue/Invoke-VenueLeg.ps1` (DUAL-VENUE-EVIDENCE-1 r2) | submits the attribution job through um-run and reads the job's exit code: a printed capture with a non-zero exit is `INVALID`; a PASS/FAIL receipt also needs the job oracle's verdict (`source_advanced`, `required_source_frames`, run nonce, wrap, clip id) or it is `INVALID`. Legs name a clip id, never a path; a fixture is refused by the length gate before anything is generated; a venue without an owner-typed record in `venue-clip-consent.json` refuses before submitting (`docs/dual-venue-evidence.md`) |
 | `dual-venue/Invoke-VenueChain.ps1` (VENUE-CHAIN-RUNNER-1 r2) | runs each leg through `Invoke-VenueLeg.ps1` and reads its exit code: a leg that exits non-zero is `LEG_FAILED` / `INVALID` (whatever `DVE_OUTCOME` it printed first), never `RAN`, and the chain exits 7 |
@@ -286,7 +286,7 @@ without playing (`--exercise-play-action --help` returns 0 before it writes anyt
 launcher that judges a receipt, with three independent layers (each one alone rejects the repro; the tests remove each in
 turn and a stale receipt is accepted only with all removed):
 
-1. **Set aside.** A pre-existing receipt or output (`-Output`, `reference-frame.png` and its candidate manifest, last run's
+1. **Set aside.** A pre-existing receipt or output (`-Output`, `reference-frame.png`, its candidate manifest and its `.invalid` marker, last run's
    `cap-NNN.png`, the runner's result JSON) is renamed `STALE-<utc>-<name>` BEFORE the launch (`Move-GuiSmokeStaleReceiptAside`;
    never deleted, and a stale file that cannot be moved stops the launch with exit 43).
 2. **Nonce.** The launcher generates `New-GuiSmokeRunNonce` (`n` + a GUID), hands it to the app as `MLVAPP_RUN_NONCE`

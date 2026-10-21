@@ -390,6 +390,7 @@ class CaptureReferenceFrameRunBindingTests(_BindingCase):
             (out / "reference-frame.png").write_bytes(b"\1" * 65536)
             (out / "reference-frame-candidate.json").write_text(json.dumps({"status": "candidate-unreviewed", "sourceFrames": {"verdict": "VALID"}}),
                                                                  encoding="utf-8")
+            (out / "reference-frame-candidate.invalid").write_text("{}", encoding="utf-8")   # last run's invalid marker (runner job, exit 225)
         grab = self.tmp / "grab.template"
         grab.write_bytes(b"\0" * 65536)
         copies = self.log_template(line) + (((grab, str(out / "reference-frame.png")),) if write_grab else ())
@@ -425,6 +426,8 @@ class CaptureReferenceFrameRunBindingTests(_BindingCase):
         self.assertFalse((out / "reference-frame-candidate.json").exists(), "last run's candidate manifest must not survive")
         self.assertEqual(len(list(out.glob("STALE-*reference-frame.png"))), 1)
         self.assertEqual(len(list(out.glob("STALE-*reference-frame-candidate.json"))), 1)
+        self.assertFalse((out / "reference-frame-candidate.invalid").exists(), "last run's invalid marker must not void this run's capture")
+        self.assertEqual(len(list(out.glob("STALE-*reference-frame-candidate.invalid"))), 1)
 
     def test_the_set_aside_and_the_nonce_are_each_mutation_tested(self) -> None:
         text = CAPTURE.read_text(encoding="utf-8")

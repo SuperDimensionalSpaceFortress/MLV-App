@@ -22,6 +22,9 @@ from typing import Any
 
 SCHEMA = "mlv-app/frame-provenance.v1"
 CANDIDATE_NAME = "reference-frame-candidate.json"
+# VENUE-REFERENCE-FRAME-CANDIDATE-INVALID-MARKER-1: the runner job writes this beside a manifest it voided (exit 225) because the in-place
+# "invalid" stamp is best effort. Present = not a candidate, whatever the manifest says (it may still parse and still say candidate-unreviewed).
+INVALID_MARKER_NAME = "reference-frame-candidate.invalid"
 FRAME_NAME = "reference-frame.png"
 
 
@@ -37,11 +40,13 @@ def index_capture_records(outbox_root: str) -> dict[str, str]:
     """Map pixel-SHA256 -> candidate manifest path, for every capture under a root.
 
     A manifest whose sibling frame is missing is skipped: it describes a capture whose
-    image is gone, so it can never be the source of a frame we hold.
+    image is gone, so it can never be the source of a frame we hold. A manifest beside an
+    ``INVALID_MARKER_NAME`` file is skipped for the same reason in the other direction: the
+    capture was voided, so its pixels are not a candidate.
     """
     index: dict[str, str] = {}
     for dirpath, _dirnames, filenames in os.walk(outbox_root):
-        if CANDIDATE_NAME not in filenames:
+        if CANDIDATE_NAME not in filenames or INVALID_MARKER_NAME in filenames:
             continue
         frame = os.path.join(dirpath, FRAME_NAME)
         if not os.path.isfile(frame):
