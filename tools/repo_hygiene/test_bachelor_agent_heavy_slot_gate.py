@@ -60,7 +60,9 @@ class BachelorAgentHeavySlotGatePins(unittest.TestCase):
 
     def test_heavy_job_is_held_through_heavy_slot_py_run_exclusive(self) -> None:
         # AGENT-HEAVY-SLOT-2.3-ADAPT-1: the label is "mlv <jobId>" or "mlv-long <jobId>" (Get-HeavySlotLabel).
-        self.assertIn("$label = Get-HeavySlotLabel -JobId $JobId -TimeoutSec ([int](Get-JobMetadata -JobId $JobId).timeoutSec)", self.code)
+        # AGENT-HEAVY-SLOT-LABEL-SINGLE-READ-1: the wait resolves it once and hands it to the holder start.
+        self.assertIn("$label = Get-HeavySlotLabel -JobId $JobId -TimeoutSec ([int]$Metadata.timeoutSec)", self.code)
+        self.assertIn("$h = Start-HeavySlotHolder -JobId $JobId -Label $label", self.code)
         self.assertRegex(self.code, r'\$HeavySlotScript,\s*"run",\s*"--exclusive",\s*"--label",\s*\$label,\s*"--slots"')
         # A holder must take its own slot, never pass through as nested under a stale HEAVY_SLOT_HELD.
         self.assertIn("HEAVY_SLOT_HELD = $null", self.code)
@@ -163,10 +165,19 @@ class BachelorAgentHeavySlotGatePins(unittest.TestCase):
         self.assertIn('"mlv $JobId"', label)
         self.assertRegex(self.text, r"\[int\]\$GateLongJobSec = 900\b")
         self.assertRegex(self.text, r"\[string\]\$GateLongJobPattern = '[^']*stage\|build\|soak[^']*'")
-        # The second label source is the metadata the agent applies (default 1800 s), never a restated number.
+        # The label's timeout is the metadata the agent applies (default 1800 s), never a restated number; it is read
+        # once per job, in the wait, and the holder start takes the resolved label instead of reading metadata again.
+        wait = self.code[self.code.index("function Wait-HeavySlotAdmission"):]
+        wait = wait[:wait.index("\n}\n")]
+        self.assertEqual(wait.count("Get-HeavySlotLabel"), 1, "the wait resolves the label once")
+        self.assertIn("[int]$Metadata.timeoutSec", wait)
         start = self.code[self.code.index("function Start-HeavySlotHolder"):]
         start = start[:start.index("\n}\n")]
-        self.assertIn("Get-JobMetadata -JobId $JobId", start)
+        self.assertNotIn("Get-JobMetadata", start, "the holder start must not read the metadata a second time")
+        self.assertNotIn("Get-HeavySlotLabel", start, "the holder start must not resolve a label of its own")
+        self.assertRegex(start, r"\[Parameter\(Mandatory = \$true\)\]\[string\]\$Label")
+        self.assertEqual(self.code.count("Start-HeavySlotHolder -JobId"), 1, "one holder-start call site, and it passes the label")
+        self.assertEqual(self.code.count("Get-HeavySlotLabel -JobId"), 1, "one label resolution per job admission path")
 
 
 @unittest.skipIf(PWSH is None, "pwsh is not on PATH")
@@ -202,6 +213,10 @@ class BachelorAgentHeavySlotGateUnit(unittest.TestCase):
         self.assertEqual(unit["longLabel"]["metadata"]["explicit900"], "900 -> mlv m900")
         self.assertEqual(unit["longLabel"]["waitAdmitsOnLongLabel"], "clear")
         self.assertEqual(unit["longLabel"]["waitRejectsShortLabel"], "holder-lost")
+        # AGENT-HEAVY-SLOT-LABEL-SINGLE-READ-1: meta.json rewritten after the wait read it (600 -> 1200 s and 1200 -> 600 s
+        # with GateLongJobSec 900) does not change the label the ticket is filed under.
+        self.assertEqual(unit["singleRead"]["shortThenLong"], "mlv jslr")
+        self.assertEqual(unit["singleRead"]["longThenShort"], "mlv-long jslr")
         self.assertEqual(unit["heartbeat"]["busy"], "gate-wait job=j1 state=queued waited=Ns holder=suite X held=62m")
         self.assertEqual(unit["heartbeat"]["free"], "gate-wait job=j1 state=queued waited=Ns")
         self.assertEqual(unit["heartbeat"]["umRunState"], "queued")
