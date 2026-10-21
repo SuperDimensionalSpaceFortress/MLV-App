@@ -260,6 +260,11 @@ typedef struct {
     int playback_scale_factor_active;
     pthread_mutex_t processed8_prefetch_mutex;
     pthread_cond_t processed8_prefetch_cond;
+    /* 1 when processed8_prefetch_cond measures CLOCK_MONOTONIC, 0 when it
+     * keeps the default clock (winpthreads/Apple relative waits, or a libc
+     * that refused the MONOTONIC cond). Set once at init; the slice abstime
+     * must name the same clock. */
+    int processed8_prefetch_cond_clock_monotonic;
     pthread_t processed8_prefetch_thread;
     processingObject_t * processed8_prefetch_processing;
     int processed8_prefetch_thread_started;
