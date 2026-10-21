@@ -60,5 +60,83 @@ class WmiCreateHiddenGuardTests(unittest.TestCase):
         self.assertEqual(0, subprocess.run([sys.executable, str(HOOK)], input="not json", capture_output=True, text=True, timeout=30).returncode)
 
 
+# r2 (PR #547 fix round): prose vs code, compound commands, own source, breadth.
+FORM = "Invoke-CimMethod -ClassName Win32_Process -MethodName Create"
+D6A_LINE = "- Never hand-write Invoke-CimMethod / Invoke-WmiMethod / [wmiclass] Win32_Process Create, inline or in a script."
+SCRIPT_EXTS = (".ps1", ".psm1", ".psd1", ".bat", ".cmd", ".py", ".js", ".mjs", ".vbs", ".sh")
+
+
+def write(path, content):
+    return {"tool_name": "Write", "tool_input": {"file_path": path, "content": content}}
+
+
+def ps(cmd):
+    return {"tool_name": "PowerShell", "tool_input": {"command": cmd}}
+
+
+class WmiCreateHiddenGuardR2Tests(unittest.TestCase):
+    def test_prose_quoting_the_form_is_allowed_outside_script_files(self):
+        quoted = "Use the helper instead of `%s`." % FORM
+        self.assertIsNone(GUARD.decide(write("C:/x/prompt.md", quoted)))
+        self.assertIsNone(GUARD.decide(write("C:/x/lane-X-r1/prompt.md", "## TOOLING\n" + D6A_LINE + "\n")))
+        self.assertIsNone(GUARD.decide({"tool_name": "Edit", "tool_input": {"file_path": "C:/x/subject-ledger.md", "new_string": quoted}}))
+        for name in ("notes.txt", "data.json", "ci.yml", "ledger.jsonl"):
+            self.assertIsNone(GUARD.decide(write("C:/x/" + name, quoted)), name)
+
+    def test_executable_script_types_are_still_scanned(self):
+        for ext in SCRIPT_EXTS:
+            self.assertIsNotNone(GUARD.decide(write("C:/x/run" + ext, SWAP_DRIVER_LINE)), ext)
+
+    def test_quoted_operands_of_data_commands_are_allowed(self):
+        for cmd in (
+            'cat "%s"' % FORM,
+            'Get-Content "%s"' % FORM,
+            "gh pr list --search '%s'" % FORM,
+            "git commit -m 'Guard %s'" % FORM,
+            'gh pr comment 547 --body "never hand-write %s"' % FORM,
+            "Get-Content x.ps1 | Select-String '%s'" % FORM,
+            "pwsh -NoProfile -File \"C:\\x\\Add-LedgerLine.ps1\" -Text 'avoid %s'" % FORM,
+            "git commit -F - <<'EOF'\nGuard %s\nEOF" % FORM,
+        ):
+            self.assertIsNone(GUARD.decide(bash(cmd)), cmd)
+
+    def test_data_commands_that_write_or_execute_are_still_scanned(self):
+        for cmd in (
+            "echo '%s' > run.ps1" % SWAP_DRIVER_LINE,
+            "echo '%s' | Set-Content run.ps1" % SWAP_DRIVER_LINE,
+            "cat > run.ps1 <<'EOF'\n%s\nEOF" % SWAP_DRIVER_LINE,
+            "echo \"$(%s)\"" % SWAP_DRIVER_LINE,
+        ):
+            self.assertIsNotNone(GUARD.decide(bash(cmd)), cmd)
+
+    def test_search_exemption_is_per_segment_not_first_word(self):
+        self.assertIsNotNone(GUARD.decide(bash("rg x x.ps1; Set-Content run.ps1 '%s'" % SWAP_DRIVER_LINE)))
+        self.assertIsNotNone(GUARD.decide(bash("rg 'a;b' . && %s" % SWAP_DRIVER_LINE)))
+        self.assertIsNotNone(GUARD.decide(bash("rg x x.ps1\n%s" % SWAP_DRIVER_LINE)))
+        self.assertIsNone(GUARD.decide(bash("cd d && rg -n '%s' ." % FORM)))
+        self.assertIsNone(GUARD.decide(bash("cd d; git grep -n '%s'" % FORM)))
+
+    def test_hook_does_not_trip_on_its_own_source(self):
+        text = HOOK.read_text(encoding="utf-8")
+        self.assertIsNone(GUARD.decide(write("C:/x/tools/hooks/wmi-create-hidden-guard.py", text)))
+        self.assertIsNone(GUARD.decide({"tool_name": "Edit", "tool_input": {"file_path": "C:/x/tools/hooks/wmi-create-hidden-guard.py", "new_string": text}}))
+
+    def test_notebookedit_allow_and_deny(self):
+        nb = "C:/x/a.ipynb"
+        self.assertIsNotNone(GUARD.decide({"tool_name": "NotebookEdit", "tool_input": {"notebook_path": nb, "new_source": SWAP_DRIVER_LINE}}))
+        self.assertIsNone(GUARD.decide({"tool_name": "NotebookEdit", "tool_input": {"notebook_path": nb, "new_source": HIDDEN}}))
+        self.assertIsNone(GUARD.decide({"tool_name": "NotebookEdit", "tool_input": {"notebook_path": nb, "new_source": "see `%s`" % FORM, "cell_type": "markdown"}}))
+
+    def test_powershell_and_edit_allow_cases(self):
+        self.assertIsNone(GUARD.decide(ps(HIDDEN)))
+        self.assertIsNone(GUARD.decide(ps("Get-CimInstance Win32_Process | Select-Object ProcessId")))
+        self.assertIsNone(GUARD.decide({"tool_name": "Edit", "tool_input": {"file_path": "C:/x/a.ps1", "new_string": HIDDEN}}))
+
+    def test_search_command_exemptions_and_test_file_exemption(self):
+        for cmd in ("rg -n '%s' ." % FORM, "findstr /s /c:\"%s\" *.ps1" % FORM, "Select-String -Path x.ps1 -Pattern '%s'" % FORM):
+            self.assertIsNone(GUARD.decide(bash(cmd)), cmd)
+        self.assertIsNone(GUARD.decide(write("C:/x/test_live.py", SWAP_DRIVER_LINE)))
+
+
 if __name__ == "__main__":
     unittest.main()
