@@ -361,6 +361,12 @@ function Invoke-SupplementaryCore([object]$Leg, [string]$Trigger) {
         if ($SheetCopyDir) { $sArgs += @('-SheetCopyDir', $SheetCopyDir) }
         L "LEG $($Leg.name) SUPPLEMENTARY_RUN venue=$suppVenue role=supplementary trigger=$Trigger quietVerdict=$($sq.verdict) quietMean=$(Format-Mean $sq.mean) capSec=$capSec umManifestSha256=$($built.sha256) spec=$($Leg.spec) backend=$(if ($Leg.backend) { $Leg.backend } else { 'spec' })"
         $sr = Invoke-VenueBoundedProcess -FilePath $pwshExe -ArgumentList $sArgs -TimeoutSec $capSec
+        if ($sr.timedOut) {
+            # Arm the unresolved-job guard at once, BEFORE any fallible step (the output write below, the receipt read, the share reads): the client was killed, the job it submitted was not,
+            # and an exception from here on must leave the venue read as busy-or-unknown, never idle. Armed with no ids first, so even a failure reading the ids fails closed.
+            $script:suppRemote = @{ leg = $Leg.name; jobIds = @(); state = 'UNKNOWN' }
+            $script:suppRemote.jobIds = @(Get-VenueRemoteJobIds -Text $sr.stdout)
+        }
         [IO.File]::WriteAllText($sOut, $sr.stdout + $(if ($sr.stderr) { "`n--- stderr ---`n$($sr.stderr)" } else { '' }))
         $sLines = @($sr.stdout -split "`r?`n")
         $so = $sLines | Where-Object { $_ -match '^DVE_OUTCOME=(\S+)' } | Select-Object -Last 1
@@ -379,8 +385,7 @@ function Invoke-SupplementaryCore([object]$Leg, [string]$Trigger) {
         if ($sr.timedOut) {
             # The client was killed, the job it submitted was not: keep the job's identity (what the client printed before it went silent) and reconcile it BEFORE the venue is read as idle.
             # No id printed = nothing to look up = the venue is busy-or-unknown, never open. The claim is still released below; it is not the proof.
-            $rjIds = @(Get-VenueRemoteJobIds -Text $sr.stdout)
-            $script:suppRemote = @{ leg = $Leg.name; jobIds = $rjIds; state = 'UNKNOWN' }   # fail closed first: an exception below must not leave the venue read as idle
+            $rjIds = $script:suppRemote.jobIds   # kept above, where the guard was armed at the timeout
             $rjs = Get-VenueRemoteJobState -AgentShare $share -JobId $rjIds -TimeoutSec 30
             $extra.remoteJobIds = $rjIds; $extra.remoteJobState = $rjs.state; $extra.venueIdle = ($rjs.state -ceq 'FINISHED')
             L "SUPPLEMENTARY_REMOTE_JOB leg=$($Leg.name) jobId=$(Format-RemoteJobIds $rjIds) state=$($rjs.state) venueIdle=$($extra.venueIdle)$(if ($rjs.error) { " reason=$($rjs.error)" }) venue=$suppVenue role=supplementary (a released claim is not proof of idleness; later offers reconcile this first)"

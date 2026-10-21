@@ -1349,6 +1349,35 @@ class VenueChainSupplementaryTests(unittest.TestCase):
         self.assertIn(f"SUPPLEMENTARY_REMOTE_JOB_RECONCILED leg=02-sp-b-spec jobId={self.JOB_ID} state=FINISHED", log)
         self.assertFalse((self.claims / "ultra-magnus.claim.json").exists(), "the claim itself is still released")
 
+    # V-01 (sol r1): the guard is armed at the timeout, before any fallible step. Writing the client's output file is one: a directory squatting on its path makes WriteAllText throw
+    # AFTER the client timed out and BEFORE the identity was kept.
+    def run_timeout_with_unwritable_output(self, name: str, **env_extra: str) -> tuple:
+        rd = self.case / name
+        (rd / "leg-01-sp-a-spec-ultra-magnus-supplementary.out.txt").mkdir(parents=True)
+        r = self.run_chain(rd, self.specs, "-SupplementaryHeldSec", "0", "-TestSupplementaryCapSec", "3", env=self.hang_env(**env_extra))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        return rd, chain_result(r.stdout)["supplementary"], "\n".join(self.chain_log(rd))
+
+    def test_v01_timeout_then_unwritable_output_keeps_the_job_identity_and_refuses_the_next_leg_until_finished(self) -> None:
+        rd, sup, log = self.run_timeout_with_unwritable_output("lane-V01", FAKE_UM_JOB_ID=self.JOB_ID, FAKE_JOB_DONE_ON_LEG="sp-b.json")
+        self.assertEqual((sup[0]["status"], sup[0]["reason"]), ("SKIPPED", "SUPPLEMENTARY_ERROR"), "the output write failed after the timeout")
+        # the unresolved identity is retained: the next leg is refused (not run) and names the killed client's job
+        self.assertEqual((sup[1]["status"], sup[1]["reason"]), ("SKIPPED", "UM_REMOTE_JOB_UNRESOLVED"))
+        self.assertIn(f"jobId={self.JOB_ID} state=NOT_FINISHED", sup[1]["detail"])
+        # ... and it runs only once the result has landed
+        self.assertEqual([(l, v) for l, v, _ in self.starts()], [("sp-a.json", "ultra-magnus"), ("sp-a.json", "bachelor"), ("sp-b.json", "bachelor"), ("sp-b.json", "ultra-magnus")])
+        self.assertEqual((sup[2]["status"], sup[2]["name"]), ("RAN", "02-sp-b-spec"))
+        self.assertIn(f"SUPPLEMENTARY_REMOTE_JOB_RECONCILED leg=02-sp-b-spec jobId={self.JOB_ID} state=FINISHED", log)
+        self.assertFalse((self.claims / "ultra-magnus.claim.json").exists(), "the claim itself is still released")
+
+    def test_v01_timeout_then_unwritable_output_with_no_identity_stays_busy(self) -> None:
+        rd, sup, log = self.run_timeout_with_unwritable_output("lane-V01NOID")   # the client printed no DVE_JOB_ID before it hung: nothing to look up
+        self.assertEqual((sup[0]["status"], sup[0]["reason"]), ("SKIPPED", "SUPPLEMENTARY_ERROR"))
+        self.assertTrue(all(s["status"] == "SKIPPED" for s in sup), [s["status"] for s in sup])
+        self.assertTrue(all(s["reason"] == "UM_REMOTE_JOB_UNRESOLVED" for s in sup[1:]) and len(sup) >= 2, [s.get("reason") for s in sup])
+        self.assertNotIn("ultra-magnus", [v for l, v, _ in self.starts() if l == "sp-b.json"], "a missing identity must remain busy: no later leg runs on ultra-magnus")
+        self.assertNotIn("SUPPLEMENTARY_REMOTE_JOB_RECONCILED", log)
+
     # ---------------------------------------------------------------- the pieces, and (b): the cache read keeps its -TimeoutSec bound
     def test_remote_job_ids_and_states_are_read_by_name_and_a_stalled_cache_read_keeps_its_bound(self) -> None:
         # One process (the wall-time budget). Part 1: ids come only from printed well-formed lines; a state is FINISHED only when every named result landed. Part 2: a read
