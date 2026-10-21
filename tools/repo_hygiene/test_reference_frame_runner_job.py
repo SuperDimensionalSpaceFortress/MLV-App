@@ -19,6 +19,7 @@ staging, no app launch, no capture):
 from __future__ import annotations
 
 import base64
+import concurrent.futures
 import hashlib
 import io
 import json
@@ -54,6 +55,21 @@ def _run(command: list[str], timeout: int = 300) -> subprocess.CompletedProcess:
     return subprocess.run(command, capture_output=True, text=True, timeout=timeout)
 
 
+_fixture_repo: dict[str, object] = {}
+
+
+def _shared_fixture_repo(head: str) -> Path:
+    """One read-only clone of this repository at HEAD for the whole module: the generator only reads it (the blanket case asserts it stays clean),
+    and every case that needs a repository it may change makes a clone of its own. Removed by tearDownModule."""
+    if "repo" not in _fixture_repo:
+        holder = tempfile.TemporaryDirectory(prefix="refframe-repo-")
+        _fixture_repo["holder"] = holder
+        repo = Path(os.path.realpath(holder.name)) / "repo"
+        _GeneratorCase.clone_fixture_repo(repo, head)
+        _fixture_repo["repo"] = repo
+    return _fixture_repo["repo"]  # type: ignore[return-value]
+
+
 class _GeneratorCase(unittest.TestCase):
     """A shared clone of this repository at HEAD (the committed consent, venue table and gate spec) and a way to run the generator on it."""
 
@@ -62,12 +78,17 @@ class _GeneratorCase(unittest.TestCase):
         cls._tmp = tempfile.TemporaryDirectory(prefix="refframe-gen-")
         cls.tmp = Path(os.path.realpath(cls._tmp.name))
         cls.head = _git("rev-parse", "HEAD").decode().strip()
-        cls.repo = cls.tmp / "repo"
-        subprocess.run(["git", "clone", "-q", "--shared", "--no-checkout", str(ROOT), str(cls.repo)], check=True)
-        subprocess.run(["git", "-C", str(cls.repo), "sparse-checkout", "set", "--cone", "tools"], check=True)
-        subprocess.run(["git", "-C", str(cls.repo), "checkout", "-q", cls.head], check=True)
+        cls.repo = _shared_fixture_repo(cls.head)
+        cls._default_emission: str | None = None
+        cls._emission_by_inputs: dict[tuple[str, str], str] = {}
+
+    @staticmethod
+    def clone_fixture_repo(repo: Path, head: str) -> None:
+        subprocess.run(["git", "clone", "-q", "--shared", "--no-checkout", str(ROOT), str(repo)], check=True)
+        subprocess.run(["git", "-C", str(repo), "sparse-checkout", "set", "--cone", "tools"], check=True)
+        subprocess.run(["git", "-C", str(repo), "checkout", "-q", head], check=True)
         # the clip resolver reads the spec from the full ref refs/remotes/fork/master, never the working tree
-        subprocess.run(["git", "-C", str(cls.repo), "update-ref", "refs/remotes/fork/master", cls.head], check=True)
+        subprocess.run(["git", "-C", str(repo), "update-ref", "refs/remotes/fork/master", head], check=True)
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -80,11 +101,24 @@ class _GeneratorCase(unittest.TestCase):
                      "-RepoRoot", str(self.repo), "-OutFile", str(out), *extra])
         return proc, out
 
-    def emitted(self, name: str = "fix") -> str:
+    def emitted(self, name: str = "fix", *, fresh: bool = False) -> str:
+        """The job text for the default inputs. The generator is a pure function of its pinned inputs (the identity test asserts a second run
+        is byte-identical in id), so the tests that only read the text share one pwsh launch per class; `fresh` forces a launch of its own."""
+        if not fresh and self._default_emission is not None:
+            return self._default_emission
         proc, out = self.generate(name)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("RESULT=REFERENCE_FRAME_JOB_EMITTED", proc.stdout)
-        return out.read_text(encoding="utf-8")
+        text = out.read_text(encoding="utf-8")
+        if not fresh:
+            type(self)._default_emission = text
+        return text
+
+    def emitted_file(self, name: str) -> Path:
+        """The default emission written to a file of this test's own, for a test that runs or mutates the job."""
+        out = self.tmp / f"{name}.job.ps1"
+        out.write_text(self.emitted(), encoding="utf-8")
+        return out
 
     @staticmethod
     def bundle(job: str) -> dict[str, tuple[str, str]]:
@@ -139,10 +173,7 @@ class GeneratorTests(_GeneratorCase):
     def test_a_tooling_commit_whose_capture_script_predates_the_gate_profile_is_refused(self) -> None:
         # a throwaway clone with one extra commit that removes -StartFrame from the capture script: the job would die at parameter binding on a venue
         clone = self.tmp / "predates-repo"
-        subprocess.run(["git", "clone", "-q", "--shared", "--no-checkout", str(ROOT), str(clone)], check=True)
-        subprocess.run(["git", "-C", str(clone), "sparse-checkout", "set", "--cone", "tools"], check=True)
-        subprocess.run(["git", "-C", str(clone), "checkout", "-q", self.head], check=True)
-        subprocess.run(["git", "-C", str(clone), "update-ref", "refs/remotes/fork/master", self.head], check=True)
+        self.clone_fixture_repo(clone, self.head)
         script = clone / "tools" / "profiling" / "capture-reference-frame.ps1"
         text = script.read_bytes().decode("utf-8")
         mutated = text.replace("[ValidateRange(0, 2147483647)][int]$StartFrame = 0,", "")
@@ -158,8 +189,7 @@ class GeneratorTests(_GeneratorCase):
         self.assertFalse(out.exists())
 
     def test_verify_only_accepts_the_pinned_bundle_and_writes_nothing(self) -> None:
-        proc, out = self.generate("verify")
-        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        out = self.emitted_file("verify")
         before = set(self.tmp.iterdir())
         ran = _run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(out), "-VerifyOnly"])
         self.assertEqual(ran.returncode, 0, ran.stdout + ran.stderr)
@@ -167,8 +197,7 @@ class GeneratorTests(_GeneratorCase):
         self.assertEqual(set(self.tmp.iterdir()), before)
 
     def test_a_tampered_bundle_is_refused_before_a_byte_is_written(self) -> None:
-        proc, out = self.generate("tamper")
-        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        out = self.emitted_file("tamper")
         job = out.read_text(encoding="utf-8")
         name, (sha, payload) = next(iter(self.bundle(job).items()))
         raw = bytearray(base64.b64decode(payload))
@@ -218,7 +247,7 @@ class GeneratorTests(_GeneratorCase):
     def test_the_committed_blanket_record_admits_the_clip_and_the_consent_file_is_never_written(self) -> None:
         consent = self.repo / "tools" / "profiling" / "dual-venue" / "venue-clip-consent.json"
         before = hashlib.sha256(consent.read_bytes()).hexdigest()
-        job = self.emitted("blanket")
+        job = self.emitted("blanket", fresh=True)
         self.assertIn("$AdmissionMode = 'production'", job)
         self.assertEqual(hashlib.sha256(consent.read_bytes()).hexdigest(), before)
         self.assertEqual(_git("status", "--porcelain", cwd=self.repo).decode().strip(), "", "the generator dirtied the repository")
@@ -284,34 +313,51 @@ class GeneratorTests(_GeneratorCase):
         base = self.emitted("ident-base")
         self.assertIn('$Work = Join-Path $AgentRoot "work\\$JobId"', base)
         self.assertIn('$Pub = Join-Path $AgentRoot "outbox\\$JobId.artifacts"', base)
-        # the same configuration is the same job (a resubmission retries the same work and outbox names)
-        self.assertEqual(self.job_id(self.emitted("ident-again")), self.job_id(base))
-        ids = {"base": self.job_id(base)}
-        for label, extra in (("seconds", ("-Seconds", "31")), ("frames", ("-PresentedFrames", "10"))):
-            proc, out = self.generate(f"ident-{label}", *extra)
-            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-            ids[label] = self.job_id(out.read_text(encoding="utf-8"))
-        # a tooling commit whose spec differs (same closure bytes, so the bundle digest is unchanged), and a second profile id identical in content
-        clone = self.tmp / "ident-repo"
-        subprocess.run(["git", "clone", "-q", "--shared", "--no-checkout", str(ROOT), str(clone)], check=True)
-        subprocess.run(["git", "-C", str(clone), "sparse-checkout", "set", "--cone", "tools"], check=True)
-        subprocess.run(["git", "-C", str(clone), "checkout", "-q", self.head], check=True)
-        subprocess.run(["git", "-C", str(clone), "update-ref", "refs/remotes/fork/master", self.head], check=True)
-        spec_path = clone / "tools" / "gates" / "output-budget.json"
-        spec = json.loads(spec_path.read_text(encoding="utf-8"))
-        alt = dict(next(p for p in spec["profiles"] if p["id"] == "wb_locked"), id="wb_locked_alt")
-        spec["profiles"].append(alt)
-        spec_path.write_text(json.dumps(spec, indent=2) + "\n", encoding="utf-8")
-        subprocess.run(["git", "-C", str(clone), "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-q", "-a", "-m", "spec"], check=True)
-        for label, profile in (("spec", "wb_locked"), ("profile", "wb_locked_alt")):
+        # Six independent generator launches (each a pwsh start plus git reads). They share no output file, so they run concurrently: the wall
+        # time of this case is the slowest launch, not their sum. Every launch is still asserted below, on its own result.
+        def spec_clone_launch(label: str, profile: str) -> tuple[subprocess.CompletedProcess, Path]:
+            clone = self.tmp / "ident-repo"   # a tooling commit whose spec differs (same closure bytes, so the bundle digest is unchanged)
             out = self.tmp / f"ident-{label}.job.ps1"
             proc = _run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(GENERATOR),
                          "-SourceCommit", self.head, "-BuildManifestSha256", MANIFEST_SHA, "-ClipId", CLIP_ID, "-GateProfile", profile,
                          "-RepoRoot", str(clone), "-OutFile", str(out)])
-            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-            job = out.read_text(encoding="utf-8")
-            self.assertEqual(self.bundle(job), self.bundle(base), "the closure changed: this case no longer isolates the spec")
-            ids[label] = self.job_id(job)
+            return proc, out
+
+        def make_spec_clone() -> None:
+            clone = self.tmp / "ident-repo"
+            self.clone_fixture_repo(clone, self.head)
+            spec_path = clone / "tools" / "gates" / "output-budget.json"
+            spec = json.loads(spec_path.read_text(encoding="utf-8"))
+            alt = dict(next(p for p in spec["profiles"] if p["id"] == "wb_locked"), id="wb_locked_alt")   # a second profile id identical in content
+            spec["profiles"].append(alt)
+            spec_path.write_text(json.dumps(spec, indent=2) + "\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(clone), "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-q", "-a", "-m", "spec"], check=True)
+
+        def clone_then_launch(label: str, profile: str, ready: concurrent.futures.Future) -> tuple[subprocess.CompletedProcess, Path]:
+            ready.result()
+            return spec_clone_launch(label, profile)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+            clone_ready = pool.submit(make_spec_clone)
+            again = pool.submit(self.emitted, "ident-again", fresh=True)
+            plain = {label: pool.submit(self.generate, f"ident-{label}", *extra)
+                     for label, extra in (("seconds", ("-Seconds", "31")), ("frames", ("-PresentedFrames", "10")))}
+            cloned = {label: pool.submit(clone_then_launch, label, profile, clone_ready)
+                      for label, profile in (("spec", "wb_locked"), ("profile", "wb_locked_alt"))}
+            clone_ready.result()
+            # the same configuration is the same job (a resubmission retries the same work and outbox names)
+            self.assertEqual(self.job_id(again.result()), self.job_id(base))
+            ids = {"base": self.job_id(base)}
+            for label, future in plain.items():
+                proc, out = future.result()
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                ids[label] = self.job_id(out.read_text(encoding="utf-8"))
+            for label, future in cloned.items():
+                proc, out = future.result()
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                job = out.read_text(encoding="utf-8")
+                self.assertEqual(self.bundle(job), self.bundle(base), "the closure changed: this case no longer isolates the spec")
+                ids[label] = self.job_id(job)
         self.assertEqual(len(set(ids.values())), len(ids), ids)
 
     # --- 3. the gate profile reaches the capture command line --------------------------------------------------------------------------------------
@@ -390,7 +436,8 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
         """A cache holding the four files of a staged build, as the assembler and the stage job leave them; returns build.json's sha256."""
         package = io.BytesIO()
         with zipfile.ZipFile(package, "w") as archive:   # the release package: the unrenamed build name inside, a stand-in (never executed)
-            archive.writestr("MLVApp-release/MLVApp.exe", b"stand-in")
+            # a fixed timestamp, so the same build stages to the same sha256 in every test (the emitted job pins it)
+            archive.writestr(zipfile.ZipInfo("MLVApp-release/MLVApp.exe", date_time=(2026, 10, 20, 0, 0, 0)), b"stand-in")
         files = {f"MLVApp-playback-attr-3-cuda-{self.short}-pkg.zip": package.getvalue(), f"MLVApp-playback-attr-3-cuda-{self.short}.exe": b"exe",
                  f"igpu_recon_cuda-playback-attr-3-cuda-{self.short}.dll": b"dll"}
         for name, data in files.items():
@@ -404,14 +451,33 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
         path.write_text(json.dumps(manifest), encoding="utf-8")
         return hashlib.sha256(path.read_bytes()).hexdigest()
 
-    def emit_and_run(self, manifest_sha: str, name: str, clip_id: str = CLIP_ID) -> tuple[subprocess.CompletedProcess, subprocess.CompletedProcess]:
-        out = self.tmp / f"{name}.job.ps1"
-        gen = _run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(GENERATOR),
-                    "-SourceCommit", self.head, "-BuildManifestSha256", manifest_sha, "-ClipId", clip_id, "-RepoRoot", str(self.repo),
-                    "-OutFile", str(out), "-AgentRoot", str(self.agent)])
-        self.assertEqual(gen.returncode, 0, gen.stdout + gen.stderr)
-        ran = _run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(out)])
-        return gen, ran
+    def job_for_this_agent(self, manifest_sha: str, name: str, clip_id: str = CLIP_ID) -> Path:
+        """The emitted job for this test's own agent root, written to `<name>.job.ps1`.
+
+        The generator is a pure function of (commit, manifest sha, clip) plus the agent root it bakes into ONE line, `$AgentRoot = '...'`. Every
+        test here wants the same job on a different throwaway root, so the generator is launched once per distinct (manifest sha, clip) per class
+        -- with an -AgentRoot of its own, so its substitution and allowlist are exercised for real -- and each test re-points that single line at
+        its own root. The swap asserts the anchor is unique, so a generator that moved or doubled the line fails loudly here."""
+        cache = type(self)._emission_by_inputs
+        key = (manifest_sha, clip_id)
+        if key not in cache:
+            template_root = self.tmp / f"agent-template-{len(cache)}"
+            template_root.mkdir()
+            out = self.tmp / f"template-{len(cache)}.job.ps1"
+            gen = _run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(GENERATOR),
+                        "-SourceCommit", self.head, "-BuildManifestSha256", manifest_sha, "-ClipId", clip_id, "-RepoRoot", str(self.repo),
+                        "-OutFile", str(out), "-AgentRoot", str(template_root)])
+            self.assertEqual(gen.returncode, 0, gen.stdout + gen.stderr)
+            cache[key] = out.read_text(encoding="utf-8")
+        job, count = re.subn(r"(?m)^\$AgentRoot = '[^']*'$", lambda _m: f"$AgentRoot = '{self.agent}'", cache[key])
+        self.assertEqual(count, 1, "the emitted job's $AgentRoot line moved or doubled: this fixture is stale")
+        path = self.tmp / f"{name}.job.ps1"
+        path.write_text(job, encoding="utf-8")
+        return path
+
+    def emit_and_run(self, manifest_sha: str, name: str, clip_id: str = CLIP_ID) -> subprocess.CompletedProcess:
+        out = self.job_for_this_agent(manifest_sha, name, clip_id)
+        return _run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(out)])
 
     def artifacts(self) -> Path:
         found = list((self.agent / "outbox").glob("reference-frame-*.artifacts"))
@@ -426,7 +492,7 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
         return {Path(rel).name: hashlib.sha256(_git("show", f"{self.head}:{rel}")).hexdigest() for rel in CLOSURE}
 
     def test_without_a_staged_build_the_job_writes_the_verified_bundle_then_fails_typed_at_the_build_and_never_runs_the_capture(self) -> None:
-        _, ran = self.emit_and_run(MANIFEST_SHA, "nobuild")
+        ran = self.emit_and_run(MANIFEST_SHA, "nobuild")
         self.assertNotEqual(ran.returncode, 0, ran.stdout + ran.stderr)
         self.assertIn("RESULT=REFERENCE_FRAME_FAILED STEP=buildVerify", ran.stdout)
         self.assertEqual(self.bundle_on_disk(), self.pinned(), "the bundle on disk is not the pinned bundle")
@@ -436,24 +502,20 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
 
     def test_a_build_json_that_is_not_the_pinned_one_is_refused_before_a_field_of_it_is_read(self) -> None:
         self.stage_build()
-        _, ran = self.emit_and_run(MANIFEST_SHA, "wrongmanifest")
+        ran = self.emit_and_run(MANIFEST_SHA, "wrongmanifest")
         self.assertIn("RESULT=REFERENCE_FRAME_FAILED STEP=buildVerify", ran.stdout)
         self.assertIn("ATTRCUDA_BUILD_MANIFEST_SHA_MISMATCH", ran.stdout)
 
     def test_a_staged_build_of_another_commit_is_refused(self) -> None:
         sha = self.stage_build(manifest_commit="0" * 40)
-        _, ran = self.emit_and_run(sha, "othercommit")
+        ran = self.emit_and_run(sha, "othercommit")
         self.assertIn("ATTRCUDA_BUILD_MANIFEST_COMMIT_MISMATCH", ran.stdout)
 
     # --- the clip part check, against SYNTHETIC footage (the job's baked parts are swapped for a throwaway file; owner footage is never read) ---
     def run_with_synthetic_part(self, name: str, *, data: bytes | None, declared_length: int, declared_sha: str,
                                 edit: tuple[str, str] | None = None) -> tuple[subprocess.CompletedProcess, Path]:
         sha = self.stage_build()
-        gen_out = self.tmp / f"{name}.job.ps1"
-        gen = _run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(GENERATOR),
-                    "-SourceCommit", self.head, "-BuildManifestSha256", sha, "-ClipId", CLIP_ID, "-RepoRoot", str(self.repo),
-                    "-OutFile", str(gen_out), "-AgentRoot", str(self.agent)])
-        self.assertEqual(gen.returncode, 0, gen.stdout + gen.stderr)
+        gen_out = self.job_for_this_agent(sha, name)
         # the base extension a real part 0 carries (the job views part i under the neutral name for index i, which checks it)
         part = self.tmp / (f"{name}-synthetic-part" + MLV_EXTENSION)
         if data is not None:
@@ -514,11 +576,7 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
         part_bytes = part.read_bytes()
         part_sha = hashlib.sha256(part_bytes).hexdigest()
         sha = self.stage_build()
-        gen_out = self.tmp / f"{name}.job.ps1"
-        gen = _run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(GENERATOR),
-                    "-SourceCommit", self.head, "-BuildManifestSha256", sha, "-ClipId", CLIP_ID, "-RepoRoot", str(self.repo),
-                    "-OutFile", str(gen_out), "-AgentRoot", str(self.agent)])
-        self.assertEqual(gen.returncode, 0, gen.stdout + gen.stderr)
+        gen_out = self.job_for_this_agent(sha, name)
         app_dir = self.tmp / "stand-in-app"
         app_dir.mkdir(exist_ok=True)
         log_template = app_dir / "app.log.template"
@@ -586,11 +644,7 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
 
     # --- r4 (CoS 81b6c553 P2): the emitted job itself refuses a receipt profile, before anything is written or launched ---------------------------
     def test_an_emitted_job_carrying_a_receipt_profile_refuses_before_anything_is_written_or_launched(self) -> None:
-        out = self.tmp / "receiptjob.job.ps1"
-        gen = _run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(GENERATOR),
-                    "-SourceCommit", self.head, "-BuildManifestSha256", self.stage_build(), "-ClipId", CLIP_ID, "-RepoRoot", str(self.repo),
-                    "-OutFile", str(out), "-AgentRoot", str(self.agent)])
-        self.assertEqual(gen.returncode, 0, gen.stdout + gen.stderr)
+        out = self.job_for_this_agent(self.stage_build(), "receiptjob")
         job, count = re.subn(r"(?m)^\$PlaybackProcessing = '[a-z]*'$", "$PlaybackProcessing = 'receipt'", out.read_text(encoding="utf-8"))
         self.assertEqual(count, 1)
         out.write_text(job, encoding="utf-8")
@@ -752,6 +806,10 @@ def setUpModule() -> None:
 
 
 def tearDownModule() -> None:
+    holder = _fixture_repo.pop("holder", None)
+    _fixture_repo.clear()
+    if holder is not None:
+        holder.cleanup()   # type: ignore[attr-defined]
     if _hub_fixture_env_before is None:
         os.environ.pop(_HUB_FIXTURE_ENV, None)
     else:
