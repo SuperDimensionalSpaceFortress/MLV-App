@@ -63,7 +63,7 @@ class BachelorAgentHeavySlotGatePins(unittest.TestCase):
         # AGENT-HEAVY-SLOT-LABEL-SINGLE-READ-1: the wait resolves it once and hands it to the holder start.
         self.assertIn("$label = Get-HeavySlotLabel -JobId $JobId -TimeoutSec ([int]$Metadata.timeoutSec)", self.code)
         self.assertIn("$h = Start-HeavySlotHolder -JobId $JobId -Label $label", self.code)
-        self.assertRegex(self.code, r'\$HeavySlotScript,\s*"run",\s*"--exclusive",\s*"--label",\s*\$label,\s*"--slots"')
+        self.assertRegex(self.code, r'\$HeavySlotScript,\s*"run",\s*"--exclusive",\s*"--label",\s*\$Label,\s*"--slots"')
         # A holder must take its own slot, never pass through as nested under a stale HEAVY_SLOT_HELD.
         self.assertIn("HEAVY_SLOT_HELD = $null", self.code)
         # The job runs inside the holder's slot and inherits it (heavy-slot.py NESTING contract).
@@ -155,7 +155,8 @@ class BachelorAgentHeavySlotGatePins(unittest.TestCase):
         # "mlv " (trailing space) as short-exclusive and writes a stop file when one runs past 15 min. A gated job over
         # 900 s, or a stage / build / soak job, is "mlv-long <id>", which that prefix does not match.
         self.assertEqual(self.code.count('"mlv $JobId"'), 1, "the short label is spelled once, inside Get-HeavySlotLabel")
-        for fn in ("function Start-HeavySlotHolder", "function Wait-HeavySlotAdmission"):
+        # AGENT-HEAVY-SLOT-LABEL-SINGLE-READ-1: only the wait resolves it; the holder start takes it as -Label (pinned below).
+        for fn in ("function Wait-HeavySlotAdmission",):
             body = self.code[self.code.index(fn):]
             body = body[:body.index("\n}\n")]
             self.assertIn("Get-HeavySlotLabel", body, fn)
