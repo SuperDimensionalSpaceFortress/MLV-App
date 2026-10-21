@@ -1162,30 +1162,35 @@ def _check_without_fetch(tmp_path: Path, bus: Path, declaration: str, oid: str, 
     assert caught is not None and caught.code == code, f"expected UNKNOWN {code}, got {caught!r}"
 
 
+@needs_no_lazy_fetch_git
 def test_nlf_a_missing_rulings_md_blob_is_unknown_and_not_fetched(tmp_path):
     bus = _promisor_bus(tmp_path)
     oid = _dropped_oid(bus, "HEAD:RULINGS.md")
     _check_without_fetch(tmp_path, bus, "touches/supersedes: R15\n", oid, "RULING_BUS_OBJECT_UNREADABLE")
 
 
+@needs_no_lazy_fetch_git
 def test_nlf_a_missing_tree_on_the_way_to_a_path_is_unknown_and_not_fetched(tmp_path):
     bus = _promisor_bus(tmp_path)
     oid = _dropped_oid(bus, "HEAD:specs")
     _check_without_fetch(tmp_path, bus, "touches/supersedes: specs/mlv-app/cards.md\n", oid, "RULING_BUS_OBJECT_UNREADABLE")
 
 
+@needs_no_lazy_fetch_git
 def test_nlf_a_missing_root_tree_is_unknown_and_not_fetched(tmp_path):
     bus = _promisor_bus(tmp_path)
     oid = _dropped_oid(bus, "HEAD^{tree}")
     _check_without_fetch(tmp_path, bus, "touches/supersedes: tools/fleet-sweep.mjs\n", oid, "RULING_BUS_OBJECT_UNREADABLE")
 
 
+@needs_no_lazy_fetch_git
 def test_nlf_a_missing_blob_behind_a_listing_is_unknown_and_not_fetched(tmp_path):
     bus = _promisor_bus(tmp_path)
     oid = _dropped_oid(bus, "HEAD:tools/fleet-sweep.mjs")
     _check_without_fetch(tmp_path, bus, "touches/supersedes: tools/fleet-sweep.mjs\n", oid, "RULING_BUS_OBJECT_UNREADABLE")
 
 
+@needs_no_lazy_fetch_git
 def test_nlf_a_missing_tip_commit_is_unknown_and_not_fetched(tmp_path):
     bus = _promisor_bus(tmp_path)
     oid = _dropped_oid(bus, "HEAD")
