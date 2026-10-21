@@ -136,7 +136,8 @@ class ClipLengthGateTests(_TmpCase):
             "badmagic": (mlvi_header(720, magic=b"NOPE"), "bad_magic"),
             "truncated": (mlvi_header(720)[:40], "header_truncated"),
             "empty": (b"", "header_truncated"),
-            "zero_fps": (mlvi_header(720, fps_denom=0), "bad_fps"),
+            # real VIDF blocks behind it (a header alone is header_vidf_count_mismatch): the walk passes, so bad_fps is reached
+            "zero_fps": (mlvi_header(720, fps_denom=0) + b"".join(block(b"VIDF") for _ in range(720)), "bad_fps"),
         }
         for name, (payload, reason) in cases.items():
             with self.subTest(name):

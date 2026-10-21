@@ -110,14 +110,16 @@ function Get-GuiSmokeMlvVidfCount {
     <#
     .SYNOPSIS
     Counts the VIDF blocks of ONE part file the way the app's block walk does (start at offset 0, skip each block by its
-    blockSize). Returns @{ ok; vidf; blocks; reason }. ok=$false means the walk did not finish (reason: unreadable,
-    invalid_block_size, truncated_block_header, walk_bound_blocks, walk_bound_seconds); never throws.
+    blockSize). Returns @{ ok; vidf; blocks; overrun; reason }. ok=$false means the walk did not finish (reason: unreadable,
+    invalid_block_size, truncated_block_header, walk_bound_blocks, walk_bound_seconds); never throws. overrun=$true means some
+    block's declared blockSize reaches past the end of the file (an MLVI block that swallows the file, a cut-off last block).
     #>
     param([Parameter(Mandatory = $true)][string]$Path, [AllowNull()][System.Diagnostics.Stopwatch]$Clock = $null)
     if ($null -eq $Clock) { $Clock = [System.Diagnostics.Stopwatch]::StartNew() }
     $hdr = New-Object byte[] $script:GuiSmokeBlockHeaderBytes
     $vidf = [int64]0
     $blocks = [int64]0
+    $overrun = $false
     $fs = $null
     try {
         # bufferSize 1 = unbuffered: each seek reads 16 bytes, not a 4 KiB page (a clip on a share is walked block by block).
@@ -144,28 +146,30 @@ function Get-GuiSmokeMlvVidfCount {
             if ($hdr[0] -eq 0x56 -and $hdr[1] -eq 0x49 -and $hdr[2] -eq 0x44 -and $hdr[3] -eq 0x46) { $vidf++ }   # 'VIDF'
             $blocks++
             $pos += $blockSize
+            if ($pos -gt $size) { $overrun = $true }
         }
     } catch {
-        return @{ ok = $false; vidf = $vidf; blocks = $blocks; reason = 'unreadable' }
+        return @{ ok = $false; vidf = $vidf; blocks = $blocks; overrun = $overrun; reason = 'unreadable' }
     } finally {
         if ($null -ne $fs) { $fs.Dispose() }
     }
-    return @{ ok = $true; vidf = $vidf; blocks = $blocks; reason = '' }
+    return @{ ok = $true; vidf = $vidf; blocks = $blocks; overrun = $overrun; reason = '' }
 }
 
 function Get-GuiSmokePartFrames {
     <#
     .SYNOPSIS
-    The frames the app plays from ONE part: its VIDF block count. Returns @{ ok; frames; reason }. A part with no block past
-    the MLVI header (a header-only fixture) keeps its header count, since nothing contradicts it; blocks but no VIDF while the
-    header declares frames is header_vidf_count_mismatch; a walk that cannot finish is vidf_count_unverified.
+    The frames the app plays from ONE part: its VIDF block count, and nothing else -- the header count is never admitted in its
+    place (the app rejects a file with zero indexed frames). Returns @{ ok; frames; reason }. No VIDF block while the header
+    declares frames (a file cut off after the MLVI header, an MLVI block that swallows the file, a random body) is
+    header_vidf_count_mismatch; a walk that cannot finish, or whose last counted block runs past EOF, is vidf_count_unverified.
     #>
     param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)][int64]$HeaderFrames,
           [AllowNull()][System.Diagnostics.Stopwatch]$Clock = $null)
     $walk = Get-GuiSmokeMlvVidfCount -Path $Path -Clock $Clock
     if (-not $walk.ok) { return @{ ok = $false; frames = [int64]0; reason = 'vidf_count_unverified' } }
-    if ($walk.blocks -le 1) { return @{ ok = $true; frames = $HeaderFrames; reason = '' } }   # the MLVI block alone
     if ($walk.vidf -le 0 -and $HeaderFrames -gt 0) { return @{ ok = $false; frames = [int64]0; reason = 'header_vidf_count_mismatch' } }
+    if ($walk.overrun -and $walk.vidf -gt 0) { return @{ ok = $false; frames = [int64]0; reason = 'vidf_count_unverified' } }
     return @{ ok = $true; frames = [int64]$walk.vidf; reason = '' }
 }
 
