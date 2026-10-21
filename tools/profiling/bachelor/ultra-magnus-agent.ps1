@@ -64,7 +64,17 @@ param(
     [string]$GateExemptJobPattern = '^(venue-quiet-probe|agent-swap)-|^dve-[A-Za-z0-9._-]+-health$',
     # AGENT-HEAVY-SLOT-2.3-ADAPT-1: a gated job whose effective timeout is over GateLongJobSec, or whose id names a stage,
     # build or soak, is labelled "mlv-long <id>" (see Get-HeavySlotLabel). 900 s is heavy-slot.py 2.3.1's 15 min cap.
+    # Override bounds (AGENT-HEAVY-SLOT-LABEL-SINGLE-READ-1): GateLongJobSec must stay at or below 900. A larger value files
+    # a job that can run 15 min or more under the short "mlv " prefix, and heavy-slot.py then writes its stop file, which
+    # turns short-exclusive-first off for every tenant until the owner deletes it. A smaller value is safe (more jobs are
+    # "mlv-long", which only loses the short-exclusive ordering). It is a whole number of seconds, 1 or more. The label is
+    # resolved once per job (Wait-HeavySlotAdmission) from the timeout in the job's metadata, so an override only changes
+    # which label every job gets, never whether a job's ticket and its own-slot checks agree.
     [int]$GateLongJobSec = 900,
+    # GateLongJobPattern is matched against the job id, case-insensitively. Narrowing it so a stage, build or soak job no
+    # longer matches is the unsafe direction (that job gets the short label and can trip the stop file); a pattern may
+    # widen the long set freely, but must not match every id (that makes the short label unreachable). Keep it anchored on
+    # the separators ("-", "_", ".", start, end) as the default is, so "upstage-1" and "rebuilder-2" stay short.
     [string]$GateLongJobPattern = '(^|[-_.])(stage|build|soak)([-_.]|$)'
 )
 
@@ -1682,16 +1692,16 @@ function Format-HeavySlotHolderNote {
 function Start-HeavySlotHolder {
     # Joins heavy-slot.py's FIFO for this job (see the gate block). Returns the holder (ok=$true), or ok=$false with
     # why when it cannot start: the job then keeps waiting -- a gated job never runs without a held slot.
-    param([Parameter(Mandatory = $true)][string]$JobId)
+    # AGENT-HEAVY-SLOT-LABEL-SINGLE-READ-1: $Label is the one Wait-HeavySlotAdmission resolved from the metadata the job was
+    # queued with; this function never re-reads the metadata, so the ticket and every later own-slot match share one label.
+    param([Parameter(Mandatory = $true)][string]$JobId, [Parameter(Mandatory = $true)][string]$Label)
     $py = Resolve-HeavySlotPython
     if (-not $py) { return [pscustomobject]@{ ok = $false; why = "python not found ($HeavySlotPython)" } }
     if (-not (Test-Path -LiteralPath $HeavySlotScript -PathType Leaf)) { return [pscustomobject]@{ ok = $false; why = "heavy-slot.py not found ($HeavySlotScript)" } }
     $id = "$JobId.$([guid]::NewGuid().ToString('N').Substring(0, 12))"
     $acq = Join-Path $slotHolders "$id.acquired.json"
     $rel = Join-Path $slotHolders "$id.release"
-    # The same metadata Wait-HeavySlotAdmission labels from, so the ticket and the wait's own-slot match agree.
-    $label = Get-HeavySlotLabel -JobId $JobId -TimeoutSec ([int](Get-JobMetadata -JobId $JobId).timeoutSec)
-    $argv = @($HeavySlotScript, "run", "--exclusive", "--label", $label, "--slots", "$HeavySlotCount", "--",
+    $argv = @($HeavySlotScript, "run", "--exclusive", "--label", $Label, "--slots", "$HeavySlotCount", "--",
         $psExe, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
         "-EncodedCommand", (New-HeavySlotSentinelCommand -AcquiredFile $acq -ReleaseFile $rel))
     try {
@@ -1913,7 +1923,7 @@ function Wait-HeavySlotAdmission {
                 return [pscustomobject]@{ gate = $script:GateVersion; label = "queue-expired"; state = "expired"; waitedSec = [int]$waited; probes = $probes; requeues = $requeues; slot = $null; thermal = $null; why = "queue age ${age}s > ${maxAge}s while waiting"; queueAgeSec = $age }
             }
             if ($null -eq $holder -and $now -ge $nextHolderAt) {
-                $h = Start-HeavySlotHolder -JobId $JobId
+                $h = Start-HeavySlotHolder -JobId $JobId -Label $label
                 if ($h.ok) { $holder = $h; $holderStarts++; $state = "queued"; $why = "ticket filed by heavy-slot.py run --exclusive" }
                 else { $state = "holder-unavailable"; $why = $h.why; $nextHolderAt = $now.AddSeconds($GateProbeSec) }
             }

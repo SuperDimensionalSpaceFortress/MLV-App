@@ -578,7 +578,7 @@
    "tools.repo_hygiene.test_attr_cuda_display_block.TemplateDisplayBlockExecutionTests": 6.4,
    "tools.repo_hygiene.test_attr_cuda_display_block.WindowsDisplayInventoryRealExecutionTests": 0.9,
    "tools.repo_hygiene.test_bachelor_agent_heavy_slot_gate.BachelorAgentHeavySlotGatePins": 0.0,
-   "tools.repo_hygiene.test_bachelor_agent_heavy_slot_gate.BachelorAgentHeavySlotGateUnit": 5.3,
+   "tools.repo_hygiene.test_bachelor_agent_heavy_slot_gate.BachelorAgentHeavySlotGateUnit": 6.2,
    "tools.repo_hygiene.test_batch_header_hygiene.BatchTypesHeaderHygieneTests": 0.0,
    "tools.repo_hygiene.test_batch_no_mainwindow_include.BatchNoMainWindowIncludeTests": 0.0,
    "tools.repo_hygiene.test_brokered_closeout.BrokeredCloseoutTests": 588.8,
