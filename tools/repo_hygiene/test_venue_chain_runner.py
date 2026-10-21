@@ -1378,6 +1378,62 @@ class VenueChainSupplementaryTests(unittest.TestCase):
         self.assertNotIn("ultra-magnus", [v for l, v, _ in self.starts() if l == "sp-b.json"], "a missing identity must remain busy: no later leg runs on ultra-magnus")
         self.assertNotIn("SUPPLEMENTARY_REMOTE_JOB_RECONCILED", log)
 
+    # ---------------------------------------------------------------- VENUE-LEG-PRINT-DVE-JOB-ID-1: the REAL leg prints the id it submits under, so the reconcile above has something to read
+    LEG = DV / "Invoke-VenueLeg.ps1"
+
+    def test_the_leg_prints_dve_job_id_before_each_submit_with_the_id_it_submits_under(self) -> None:
+        text = self.LEG.read_text(encoding="utf-8")
+        code = [l.strip() for l in text.splitlines() if l.strip() and not l.strip().startswith("#")]
+        calls = [k for k, l in enumerate(code) if re.match(r"\$\w+ = Submit-VenueJob\b", l)]
+        self.assertEqual(len(calls), 2, "the health probe and the leg: a third submit must print its id too, and extend this row")
+        for k in calls:
+            submitted = re.search(r"-JobId\s+(\"[^\"]*\"|\$\w+)", code[k])
+            printed = re.match(r"Write-Output\s+\"DVE_JOB_ID=(.*?)\"\s*(?:#.*)?$", code[k - 1])
+            self.assertIsNotNone(submitted, code[k])
+            self.assertIsNotNone(printed, f"the statement before the submit must print the job id on stdout: {code[k]}")
+            self.assertEqual(printed.group(1), submitted.group(1).strip('"'), "the printed id is the submitted one")
+        self.assertEqual(len([l for l in code if "DVE_JOB_ID=" in l]), 2, "one print per submit")
+        self.assertIn("6>$null", text)   # um-run's own output stays suppressed: only the id line is added
+
+    def test_a_real_leg_killed_at_the_chain_timeout_leaves_its_printed_id_to_reconcile_not_unknown(self) -> None:
+        # The real Invoke-VenueLeg.ps1 (offline test mode, stub generator, a stub um-run that submits and then never returns) is the ultra-magnus leg; the fake leg stays Bachelor's.
+        # The chain's bounded child kills it at the cap; the id it printed before the submit must be what the chain reconciles (NOT_FINISHED: no result landed), never UNKNOWN.
+        from tools.repo_hygiene import test_dual_venue_evidence as dve
+        h = dve.RunnerHarness()
+        h.addCleanup = self.addCleanup
+        h.make_harness()
+        spec = h.write_spec(leg_id="sp-real")
+        body = json.loads(spec.read_text(encoding="utf-8"))
+        body["backends"] = ["cpu"]
+        body["criteria"] = {"acceptance": {"cpu": []}, "supplementary": {"cpu": []}}
+        spec.write_text(json.dumps(body), encoding="utf-8")
+        stub_cfg = h.tmp / "stub.json"
+        stub_cfg.write_text(json.dumps({"genLog": str(h.tmp / "gen.log"), "genRefusal": None, "clipContentSha256": dve.CLIP_CONTENT_SHA}), encoding="utf-8")
+        um_log = h.tmp / "um-submits.log"
+        um_stub = h.tmp / "um-run-hangs.ps1"
+        um_stub.write_text("param([string]$ScriptPath,[string]$JobId,[string]$AgentShare,[int]$TimeoutSec,[int]$MaxQueueWaitSec,[int]$MaxClaimedWaitSec)\n"
+                           "Add-Content -LiteralPath $env:FAKE_UM_STUB_LOG -Value $JobId\nStart-Sleep -Seconds 120\n", encoding="utf-8")
+        wrapper = h.tmp / "leg-wrapper.ps1"
+        wrapper.write_text(
+            "param([string]$Venue, [string]$LegSpec, [string]$SourceCommit, [string]$BuildManifestSha256, [string]$Backend = '', [string]$SheetCopyDir = '')\n"
+            f"if ($Venue -ne 'ultra-magnus') {{ & '{self.fake_leg}' -Venue $Venue -LegSpec $LegSpec -SourceCommit $SourceCommit -BuildManifestSha256 $BuildManifestSha256; exit 0 }}\n"
+            "$be = @(); if ($Backend) { $be = @('-Backend', $Backend) }   # the chain passes -Backend only when the spec lists more than one\n"
+            f"& '{self.LEG}' -Venue $Venue -LegSpec $LegSpec -SourceCommit '{h.sha}' -BuildManifestSha256 $BuildManifestSha256 @be -VenueTablePath '{h.table}' "
+            f"-ReceiptRoot '{h.receipts}' -OfflineTestMode -UmRunScript '{um_stub}' -GeneratorScript '{h.gen}' -WorkDir '{h.tmp / 'work'}' -ConsentPath '{h.consent}' "
+            f"-RepoRoot '{ROOT}' -Actor unit-test\nexit 0\n", encoding="utf-8")
+        rd = self.case / "lane-REALLEG"
+        args = self.chain_args(rd, [spec], "-SupplementaryHeldSec", "0", "-TestSupplementaryCapSec", "10")
+        args[args.index("-LegScript") + 1] = str(wrapper)
+        r = subprocess.run(args, capture_output=True, text=True, timeout=300, env=self.env(DVE_STUB=str(stub_cfg), FAKE_UM_STUB_LOG=str(um_log), FAKE_UM_SHARE=str(self.um_share)))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        sup = chain_result(r.stdout)["supplementary"]
+        leg_out = next(rd.glob("leg-*-ultra-magnus-supplementary.out.txt"), None)
+        self.assertEqual(sup[0]["status"], "TIMEOUT", f"{[s.get('status') for s in sup]}: {leg_out.read_text(encoding='utf-8') if leg_out else 'no leg output'}")
+        submitted = [l.strip() for l in um_log.read_text(encoding="utf-8").splitlines() if l.strip()]
+        self.assertEqual(len(submitted), 1, f"the health probe is the one submit the stub never answers: {submitted}")
+        self.assertRegex(submitted[0], r"^dve-sp-real-ultra-magnus-cpu-\d{14}-health$")
+        self.assertEqual((sup[0]["remoteJobIds"], sup[0]["remoteJobState"], sup[0]["venueIdle"]), ([submitted[0]], "NOT_FINISHED", False))
+
     # ---------------------------------------------------------------- the pieces, and (b): the cache read keeps its -TimeoutSec bound
     def test_remote_job_ids_and_states_are_read_by_name_and_a_stalled_cache_read_keeps_its_bound(self) -> None:
         # One process (the wall-time budget). Part 1: ids come only from printed well-formed lines; a state is FINISHED only when every named result landed. Part 2: a read

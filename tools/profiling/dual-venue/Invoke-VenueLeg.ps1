@@ -451,7 +451,11 @@ try {
     # --- 4. health probe (P5), bounded -------------------------------------------------------------
     $probeJob = Join-Path $workDirResolved "$jobStem-health.job.ps1"
     [IO.File]::WriteAllText($probeJob, (New-DvHealthProbeJobText -AgentRoot $agentRoot), [Text.UTF8Encoding]::new($false))
-    $probeRun = Submit-VenueJob -ScriptPath $probeJob -JobId "$jobStem-health" -TimeoutSec 120 -QueueSec 120 -ClaimedExtraSec 60
+    # VENUE-LEG-PRINT-DVE-JOB-ID-1: the id this call submits under goes to stdout BEFORE the submit, so a chain that kills this client mid-wait still holds the remote job's identity
+    # (Get-VenueRemoteJobIds in VenueChain.psm1 reads `DVE_JOB_ID=<id>` lines). um-run's own output stays suppressed (6>$null in Submit-VenueJob).
+    $probeJobId = "$jobStem-health"
+    Write-Output "DVE_JOB_ID=$probeJobId"
+    $probeRun = Submit-VenueJob -ScriptPath $probeJob -JobId $probeJobId -TimeoutSec 120 -QueueSec 120 -ClaimedExtraSec 60
     $receipt.evidence.umRunOutcome = $probeRun.umOutcome
     $probe = $null
     if ($probeRun.umOutcome -eq 'RECEIPT' -and $null -ne $probeRun.result) { $probe = ConvertFrom-DvProbeStdout ([string]$probeRun.result.stdout) }
@@ -506,6 +510,7 @@ try {
 
     # --- 6. submit (the venue's settings are isolated by the app; the receipt proves it from the run log) -----
     $timeoutSec = [int]$generated.recommendedJobTimeoutSec + 120
+    Write-Output "DVE_JOB_ID=$jobStem"   # VENUE-LEG-PRINT-DVE-JOB-ID-1: before the submit, same id (see the health probe above)
     $run = Submit-VenueJob -ScriptPath $jobFile -JobId $jobStem -TimeoutSec $timeoutSec -QueueSec ([int]$spec.timeouts.queueWaitSec) -ClaimedExtraSec ([int]$spec.timeouts.extraClaimedWaitSec)
     $receipt.evidence.umRunOutcome = $run.umOutcome
 } catch {
