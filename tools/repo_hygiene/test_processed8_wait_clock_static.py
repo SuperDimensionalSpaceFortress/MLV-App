@@ -21,6 +21,9 @@ are collapsed before the write, address and call checks; no macro may name a clo
 guarded name, or paste tokens; the field assignment must be a live top-level statement; the field
 and the helper are each named only where the guard expects them; and the MONOTONIC read must be the
 'else if' that follows the realtime-fallback branch, on a literal clock id.
+PR #544 r4 key (sol): every check first runs C translation phases 1 and 2 (trigraphs, backslash-newline
+splicing) and reads digraphs as their tokens, so a directive or name split across lines, or spelled
+'%:define', is checked as the compiler sees it.
 """
 import functools
 from pathlib import Path
@@ -85,11 +88,38 @@ GUARDED_MACRO_TEXT = re.compile(
     r"|clock_gettime|" + COND_INIT_FUNCTION + "|" + SLICE_FUNCTION + r"|processed8_prefetch_cond")
 MONOTONIC_READ = re.compile(
     r"\s*else\s+if\s*\(\s*clock_gettime\s*\(\s*CLOCK_MONOTONIC\s*,\s*&\s*wait_time\s*\)")
+# C translation phases 1 and 2 (PR #544 r4 sol blocker): trigraphs, which -std=c99 builds enable, and
+# backslash-newline splices, which GCC also takes across trailing blanks.
+TRIGRAPH = re.compile(r"\?\?([=(/)'<!>-])")
+TRIGRAPHS = {"=": "#", "(": "[", "/": "\\", ")": "]", "'": "^", "<": "{", "!": "|", ">": "}", "-": "~"}
+SPLICED_LINE_END = re.compile(r"\\[ \t\f\v]*\r?\Z")
+# Digraph tokens, longest first, mapped to same-length spellings of the tokens they stand for.
+DIGRAPHS = {"%:%:": "##  ", "%:": "# ", "<:": "[ ", ":>": " ]", "<%": "{ ", "%>": " }"}
+DIGRAPH = re.compile("|".join(re.escape(digraph) for digraph in DIGRAPHS))
+
+
+@functools.lru_cache(maxsize=4)
+def _translated(source: str) -> str:
+    """source after C translation phases 1 and 2, so a directive or identifier split across lines is
+    seen whole, as the compiler sees it. The newlines a logical line absorbed are re-emitted after it,
+    so every later line keeps its number. Every check translates its raw source exactly once."""
+    lines = TRIGRAPH.sub(lambda match: TRIGRAPHS[match.group(1)], source).split("\n")
+    pieces, absorbed = [], 0
+    for index, line in enumerate(lines):
+        spliced = SPLICED_LINE_END.sub("", line) if index < len(lines) - 1 else line
+        if spliced != line:
+            pieces.append(spliced)
+            absorbed += 1
+        else:
+            pieces.append(line + "\n" * (absorbed + (index < len(lines) - 1)))
+            absorbed = 0
+    return "".join(pieces)
 
 
 @functools.lru_cache(maxsize=4)  # each check re-blanks the same ~0.5 MB source
 def _blank_comments_and_literals(text: str) -> str:
-    """Same-length copy of text with comments and string/char literals replaced by spaces."""
+    """Same-length copy of translated text with comments and string/char literals replaced by spaces
+    and each digraph replaced by the token it spells."""
     out = list(text)
     index = 0
     while index < len(text):
@@ -112,7 +142,7 @@ def _blank_comments_and_literals(text: str) -> str:
             if out[blank] != "\n":
                 out[blank] = " "
         index = end
-    return "".join(out)
+    return DIGRAPH.sub(lambda match: DIGRAPHS[match.group(0)], "".join(out))
 
 
 @functools.lru_cache(maxsize=4)
@@ -153,6 +183,7 @@ def _matching_brace(text: str, open_index: int) -> int:
 
 def slice_body_violations(source: str) -> list[str]:
     """Problems with the slice helper's clock reads; empty when the source is guarded."""
+    source = _translated(source)
     code = _blank_comments_and_literals(source)
     # A definition starts at column 0 with its return type; a call site is indented.
     definitions = list(re.finditer(
@@ -203,6 +234,7 @@ def slice_body_violations(source: str) -> list[str]:
 
 def setclock_violations(source: str) -> list[str]:
     """Every pthread_condattr_setclock call must consume its return value; at least one must exist."""
+    source = _translated(source)
     code = _blank_comments_and_literals(source)
     calls = list(SETCLOCK_CALL.finditer(code))
     if not calls:
@@ -231,6 +263,7 @@ def _matching_paren(text: str, open_index: int) -> int:
 def cond_init_violations(source: str) -> list[str]:
     """The cond-init helper may report CLOCK_MONOTONIC only when setclock and the cond init both
     returned exactly 0 (PR #544 sol r1: '>= 0' takes a positive EINVAL as success)."""
+    source = _translated(source)
     code = _blank_comments_and_literals(source)
     definitions = list(re.finditer(
         r"(?m)^[A-Za-z_][\w \t*]*\b" + COND_INIT_FUNCTION + r"\s*\([^;{}]*\)\s*\{", code))
@@ -304,6 +337,7 @@ def cond_reinit_violations(source: str) -> list[str]:
     """PR #544 r2 key3 K-01: inside the cond-init helper a default-attr (CLOCK_REALTIME) cond init
     may run only in the platform branch that returns 0, or as the sole statement of the top-level
     'if (!monotonic)' re-init that runs after the attr init and right before 'return monotonic;'."""
+    source = _translated(source)
     code = _blank_comments_and_literals(source)
     body_open, body, problem = _function_body(code, COND_INIT_FUNCTION)
     if problem:
@@ -369,6 +403,7 @@ def field_wiring_violations(source: str) -> list[str]:
     """PR #544 r2 key3 K-02 and sol mutations A/B: initMlvObject must store the guarded helper's
     return for &video->processed8_prefetch_cond in the clock field, once, and nothing else may write
     that field, call the helper or init that cond."""
+    source = _translated(source)
     code = _blank_comments_and_literals(source)
     body_open, body, problem = _function_body(code, INIT_OBJECT_FUNCTION)
     if problem:
@@ -430,6 +465,7 @@ def field_wiring_violations(source: str) -> list[str]:
 def macro_violations(source: str) -> list[str]:
     """PR #544 r3 sol S3: no '#define' or '#undef' in video_mlv.c may name a clock, a cond or clock
     call, or a guarded name, and none may paste tokens, so the text checks see what the compiler sees."""
+    source = _translated(source)
     code = _blank_comments_and_literals(source)
     problems = []
     for directive in MACRO_DIRECTIVE.finditer(code):
@@ -645,6 +681,44 @@ class Processed8WaitClockStaticTests(unittest.TestCase):
                     self.assertEqual(1, mutated.count(old), name)
                     mutated = mutated.replace(old, new)
                 self.assertTrue(_all_violations(mutated), name)
+
+    def test_guard_rejects_lexer_phase_evasions_in_head_source(self) -> None:
+        # PR #544 r4 sol blocker and fable "line-splice/digraph lexer evasion": the compiler splices
+        # backslash-newlines and reads '%:' as '#' before it sees a directive or an identifier, so
+        # each edit below compiles into a macro alias or a wall-clock read that the text checks must
+        # still find. Each mutation is applied to the real head source.
+        cond_init_definition = "static int %s(pthread_cond_t * cond)\n" % COND_INIT_FUNCTION
+        slice_definition = "static int %s(mlvObject_t * video,\n" % SLICE_FUNCTION
+        after_monotonic_read = "    wait_time.tv_nsec += (long)(abstime_offset_ns % 1000000000LL);\n"
+        mutations = {
+            "L-01 spliced setclock macro reports success": [
+                (cond_init_definition, "#define pthread_condattr_set\\\nclock(attr, clk) (0)\n" + cond_init_definition)],
+            "L-02 spliced realtime read after the MONOTONIC read": [
+                (after_monotonic_read, "    clock_gett\\\nime(CLOCK_REAL\\\nTIME, &wait_time);\n" + after_monotonic_read)],
+            "L-03 spliced directives alias CLOCK_MONOTONIC to CLOCK_REALTIME": [
+                (slice_definition, "#un\\\ndef CLOCK_MONOTONIC\n#def\\\nine CLOCK_MONOTONIC CLOCK_REALTIME\n"
+                                   + slice_definition)],
+            "L-04 digraph directive reroutes the slice clock": [
+                (slice_definition, "%:define PROCESSED8_WAIT_CLOCK CLOCK_REALTIME\n"
+                                   "%:define clock_gettime(clock, ts) clock_gettime(PROCESSED8_WAIT_CLOCK, ts)\n"
+                                   + slice_definition)],
+        }
+        for name, edits in mutations.items():
+            with self.subTest(mutation=name):
+                mutated = self.source
+                for old, new in edits:
+                    self.assertEqual(1, mutated.count(old), name)
+                    mutated = mutated.replace(old, new)
+                self.assertTrue(_all_violations(mutated), name)
+
+    def test_translation_phases_match_the_compiler(self) -> None:
+        # Phase 1 folds trigraphs (-std=c99 builds enable them), phase 2 deletes every backslash-newline
+        # (GCC also splices across trailing blanks), and the lines a splice absorbed are re-emitted so
+        # later line numbers hold. Digraphs read as their tokens outside comments and literals.
+        self.assertEqual("#define ab x\n\n\nint y;\n", _translated("??=define a\\\nb \\  \nx\nint y;\n"))
+        code = _blank_comments_and_literals('%:define M <%a<:0:>%> %:%: "%:" /* <% */\n')
+        self.assertEqual("# define M { a[ 0 ] } ##  ", code[:26])
+        self.assertEqual("", code[26:].strip())
 
 
 if __name__ == "__main__":
