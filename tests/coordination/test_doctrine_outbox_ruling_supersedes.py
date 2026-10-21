@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import inspect
+import os
 import re
 import subprocess
 import sys
@@ -1099,3 +1100,118 @@ def test_r2_pinned_u2236_and_table_delimiter_forms(tmp_path, capsys, label, body
         assert rc == 1 and "RULING_CANDIDATE_NO_SUPERSEDES" in err, (label, err)
     else:
         assert rc == 0 and err == "", (label, err)
+
+
+# ---------- ROUTE-RULING-NO-LAZY-FETCH-ALL-BUS-READS-1: no bus read on the route-ruling path may lazy-fetch ----------
+# The bus is never written. A partial (promisor) clone fetches a missing object from its promisor remote on any read,
+# which would write into the bus and could stall on the network, so every git read the lookup makes sets
+# GIT_NO_LAZY_FETCH=1 (the final `cat-file -e` probe had it; the tip probe, the RULINGS.md read and the `ls-tree` did not).
+# The bus here is a scratch clone configured as a promisor clone of a scratch origin that still holds every object, so a
+# read that lazy-fetches succeeds and leaves the dropped object back in the bus: that is how a fetch shows.
+
+GIT_TIMEOUT = 60
+
+
+def _promisor_bus(tmp_path: Path) -> Path:
+    """make_bus, then made a promisor clone of a full scratch origin (so a missing object is fetchable)."""
+    bus = make_bus(tmp_path)
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "clone", "-q", "--bare", "--no-local", str(bus), str(origin)], check=True, capture_output=True, text=True, timeout=GIT_TIMEOUT)
+    git(origin, "config", "uploadpack.allowAnySHA1InWant", "true")
+    git(bus, "config", "core.repositoryformatversion", "1")
+    git(bus, "config", "extensions.partialclone", "origin")
+    git(bus, "remote", "add", "origin", origin.as_uri())
+    git(bus, "config", "remote.origin.promisor", "true")
+    git(bus, "config", "remote.origin.partialclonefilter", "blob:none")
+    return bus
+
+
+def _git_version() -> tuple[int, ...]:
+    out = subprocess.run(["git", "--version"], capture_output=True, text=True, timeout=GIT_TIMEOUT).stdout
+    return tuple(int(n) for n in re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", out).groups(default="0"))
+
+
+# git reads GIT_NO_LAZY_FETCH from 2.44 (older builds ignore it and fetch anyway), so the behavioural checks below can only
+# be met on such a git; the call-level check (every bus git call carries the variable) holds on any version.
+needs_no_lazy_fetch_git = pytest.mark.skipif(_git_version() < (2, 44), reason="this git predates GIT_NO_LAZY_FETCH (2.44)")
+
+
+def _held(bus: Path, oid: str) -> bool:
+    """Whether the bus object store holds `oid` locally right now. `--batch-all-objects` lists local objects only and never
+    lazy-fetches, on any git version."""
+    out = subprocess.run(["git", "-C", str(bus), "cat-file", "--batch-all-objects", "--batch-check"], capture_output=True, text=True,
+                         env={**os.environ, "GIT_NO_LAZY_FETCH": "1"}, timeout=GIT_TIMEOUT).stdout
+    return any(line.split(" ", 1)[0] == oid for line in out.splitlines())
+
+
+def _dropped_oid(bus: Path, rev: str) -> str:
+    oid = git(bus, "rev-parse", rev)
+    _drop_object(bus, rev)
+    assert not _held(bus, oid), "the object must be gone from the bus before the lookup"
+    return oid
+
+
+def _check_without_fetch(tmp_path: Path, bus: Path, declaration: str, oid: str, code: str) -> None:
+    """The lookup ends UNKNOWN `code`, and the dropped object was not fetched back into the bus."""
+    caught = None
+    try:
+        call_validate([write_item(tmp_path, candidate(declaration))], bus)
+    except ob.Unknown as e:
+        caught = e
+    assert not _held(bus, oid), f"a bus read lazy-fetched {oid[:12]} from the promisor remote (GIT_NO_LAZY_FETCH was not set)"
+    assert caught is not None and caught.code == code, f"expected UNKNOWN {code}, got {caught!r}"
+
+
+def test_nlf_a_missing_rulings_md_blob_is_unknown_and_not_fetched(tmp_path):
+    bus = _promisor_bus(tmp_path)
+    oid = _dropped_oid(bus, "HEAD:RULINGS.md")
+    _check_without_fetch(tmp_path, bus, "touches/supersedes: R15\n", oid, "RULING_BUS_OBJECT_UNREADABLE")
+
+
+def test_nlf_a_missing_tree_on_the_way_to_a_path_is_unknown_and_not_fetched(tmp_path):
+    bus = _promisor_bus(tmp_path)
+    oid = _dropped_oid(bus, "HEAD:specs")
+    _check_without_fetch(tmp_path, bus, "touches/supersedes: specs/mlv-app/cards.md\n", oid, "RULING_BUS_OBJECT_UNREADABLE")
+
+
+def test_nlf_a_missing_root_tree_is_unknown_and_not_fetched(tmp_path):
+    bus = _promisor_bus(tmp_path)
+    oid = _dropped_oid(bus, "HEAD^{tree}")
+    _check_without_fetch(tmp_path, bus, "touches/supersedes: tools/fleet-sweep.mjs\n", oid, "RULING_BUS_OBJECT_UNREADABLE")
+
+
+def test_nlf_a_missing_blob_behind_a_listing_is_unknown_and_not_fetched(tmp_path):
+    bus = _promisor_bus(tmp_path)
+    oid = _dropped_oid(bus, "HEAD:tools/fleet-sweep.mjs")
+    _check_without_fetch(tmp_path, bus, "touches/supersedes: tools/fleet-sweep.mjs\n", oid, "RULING_BUS_OBJECT_UNREADABLE")
+
+
+def test_nlf_a_missing_tip_commit_is_unknown_and_not_fetched(tmp_path):
+    bus = _promisor_bus(tmp_path)
+    oid = _dropped_oid(bus, "HEAD")
+    _check_without_fetch(tmp_path, bus, "touches/supersedes: R15\n", oid, "RULING_BUS_UNREADABLE")
+
+
+def test_nlf_every_bus_git_call_on_the_route_ruling_path_sets_no_lazy_fetch(tmp_path, monkeypatch):
+    bus = _promisor_bus(tmp_path)
+    seen: list[tuple[list[str], str | None]] = []
+    real = subprocess.run
+
+    def spy(cmd, *args, **kwargs):
+        if isinstance(cmd, list) and cmd[:1] == ["git"] and str(bus) in cmd:
+            seen.append((cmd, (kwargs.get("env") or {}).get("GIT_NO_LAZY_FETCH")))
+        return real(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(ob.subprocess, "run", spy)
+    call_validate([write_item(tmp_path, candidate("touches/supersedes: R15, tools/fleet-sweep.mjs, specs/mlv-app, tools/nope.mjs\n"))], bus)
+    assert len(seen) >= 4, f"the spy saw too few bus git calls to prove anything: {seen}"
+    unguarded = [" ".join(cmd[3:]) for cmd, flag in seen if flag != "1"]
+    assert not unguarded, "bus git calls without GIT_NO_LAZY_FETCH=1: " + "; ".join(unguarded)
+
+
+def test_nlf_a_promisor_bus_that_holds_every_object_answers_as_a_full_clone_does(tmp_path, capsys):
+    bus = _promisor_bus(tmp_path)
+    rc, err = validate(tmp_path, candidate("touches/supersedes: R15, R14.8, tools/fleet-sweep.mjs, specs/mlv-app, specs/mlv-app/cards.md\n"), bus, capsys)
+    assert rc == 0 and err == "", err
+    rc, err = validate(tmp_path, candidate("touches/supersedes: R99, tools/nope.mjs\n"), bus, capsys)
+    assert rc == 1 and "RULING_CANDIDATE_TARGET_NOT_ON_BUS" in err and "'R99'" in err and "'tools/nope.mjs'" in err, err
