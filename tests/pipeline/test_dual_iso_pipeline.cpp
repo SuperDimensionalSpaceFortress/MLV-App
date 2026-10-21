@@ -4684,15 +4684,25 @@ TEST(DualIsoPipeline, DngFrameAsyncWriterDebugMsEnvRejectsMalformedValues)
     qunsetenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER_DEBUG_DELAY_MS");
     qunsetenv("MLVAPP_CDNG_EXPORT_PAYLOAD_HANDOFF");
 
+    // Every value is checked and every writer finished before the one assertion, so a run names
+    // each value that arms the hook rather than stopping at the first. Values are quoted so
+    // " 300" and "300 " read apart.
     const char * const malformed[] = { "1garbage", " 300", "300 ", "+300", "-300", "0x10" };
+    std::string armed_by;
     for(const char * value : malformed)
     {
         qputenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER_DEBUG_HOLD_UNTIL_FULL_MS", QByteArray(value));
         dngPayloadWriter_t * writer = createDngPayloadWriter();
         ASSERT_TRUE(writer != nullptr);
-        ASSERT_EQ(DNG_PAYLOAD_WRITER_DEBUG_HOLD_OFF, dngPayloadWriterDebugWaitHoldResult(writer, 0u));
-        ASSERT_EQ(0, finishDngPayloadWriter(writer));
+        const int hold = dngPayloadWriterDebugWaitHoldResult(writer, 0u);
+        const int finish_rc = finishDngPayloadWriter(writer);
+        if(hold != DNG_PAYLOAD_WRITER_DEBUG_HOLD_OFF || finish_rc != 0)
+        {
+            armed_by += std::string(armed_by.empty() ? "" : "; ") + "\"" + value + "\" hold="
+                + std::to_string(hold) + " finish=" + std::to_string(finish_rc);
+        }
     }
+    ASSERT_EQ(std::string(), armed_by);
 
     // A well-formed bound still arms the hold (control for the cases above).
     qputenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER_DEBUG_HOLD_UNTIL_FULL_MS", QByteArrayLiteral("300"));
