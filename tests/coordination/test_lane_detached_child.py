@@ -11,13 +11,23 @@ to the job, let it start one child each way, let the host exit, close the job ha
 wait SURVIVAL_WAIT_SEC, then read both children. Start-HiddenDetached.ps1 (board tooling, untracked) is the
 sanctioned wrapper around the same single Create call; this test makes the call directly so it needs nothing
 outside the tracked tree.
+
+LANE-DETACHED-CHILD-TEST-HARDENING-1: the WMI child is outside the job, so nothing but this module can reap it.
+The host records each child's pid and creation time the moment the child exists, and every run goes through
+run_control(), whose finally kills each recorded pid whose creation time still matches (a reused pid is left
+alone). That holds on the three failure paths a bare control-script `finally` cannot cover: the host fails
+after the WMI Create, the host never exits, and the subprocess timeout kills the control script itself.
+The failure-path runs start alongside the 60 s survival wait, so they add little wall time.
 """
 
+import ctypes
 import json
+import os
 import re
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -30,11 +40,23 @@ PWSH = "pwsh.exe"
 
 # The card names 60 s: long enough that a kill-on-close that fires late (after the handle is closed) is seen.
 SURVIVAL_WAIT_SEC = 60
-SLEEPER_SEC = 150  # outlives the wait plus a loaded host's start-up; the test kills it by pid in any case
+SLEEPER_SEC = 150  # outlives the wait plus a loaded host's start-up; run_control() kills it by pid in any case
+HOST_WAIT_SEC = 90  # how long the control script waits for the inert host to exit
 
 HOST_PS1 = r"""
 param([Parameter(Mandatory = $true)][string]$Dir)
 $ErrorActionPreference = 'Stop'
+$fault = $env:MLV_TEST_HOST_FAULT   # test-only: 'start-process-throws' | 'host-hangs'
+$pidDir = Join-Path $Dir 'pids'
+
+# Written the moment a child exists, before anything else can fail: the Python finalizer reads these.
+function Save-ChildRecord([string]$Name, [int]$ChildPid, [int64]$Created) {
+    $tmp = Join-Path $pidDir ($Name + '.json.tmp')
+    $doc = [ordered]@{ pid = $ChildPid; created = $Created }
+    [IO.File]::WriteAllText($tmp, ($doc | ConvertTo-Json -Compress), [Text.UTF8Encoding]::new($false))
+    Move-Item -LiteralPath $tmp -Destination (Join-Path $pidDir ($Name + '.json')) -Force
+}
+
 $go = Join-Path $Dir 'go.flag'
 while (-not (Test-Path -LiteralPath $go)) { Start-Sleep -Milliseconds 25 }
 $sleep = 'Start-Sleep -Seconds __SLEEPER_SEC__'
@@ -43,22 +65,27 @@ $r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
     CommandLine = ('pwsh.exe -NoProfile -NonInteractive -Command "' + $sleep + '"')
     CurrentDirectory = $Dir; ProcessStartupInformation = $si }
 if ([int]$r.ReturnValue -ne 0) { throw ('wmi-create-rc-' + $r.ReturnValue) }
-$sp = Start-Process -FilePath 'pwsh.exe' -ArgumentList @('-NoProfile', '-NonInteractive', '-Command', $sleep) -WindowStyle Hidden -PassThru
 $wmiProc = Get-Process -Id ([int]$r.ProcessId)
+Save-ChildRecord 'wmi' $wmiProc.Id $wmiProc.StartTime.ToFileTimeUtc()
+if ($fault -eq 'start-process-throws') { throw 'injected-start-process-failure' }
+$sp = Start-Process -FilePath 'pwsh.exe' -ArgumentList @('-NoProfile', '-NonInteractive', '-Command', $sleep) -WindowStyle Hidden -PassThru
+Save-ChildRecord 'startProcess' $sp.Id $sp.StartTime.ToFileTimeUtc()
 $doc = [ordered]@{
-    wmi = [ordered]@{ pid = [int]$r.ProcessId; created = $wmiProc.StartTime.ToFileTimeUtc() }
+    wmi = [ordered]@{ pid = $wmiProc.Id; created = $wmiProc.StartTime.ToFileTimeUtc() }
     startProcess = [ordered]@{ pid = $sp.Id; created = $sp.StartTime.ToFileTimeUtc() }
 }
 $tmp = Join-Path $Dir 'children.json.tmp'
 [IO.File]::WriteAllText($tmp, ($doc | ConvertTo-Json -Depth 4), [Text.UTF8Encoding]::new($false))
 Move-Item -LiteralPath $tmp -Destination (Join-Path $Dir 'children.json')
+if ($fault -eq 'host-hangs') { Start-Sleep -Seconds 600 }
 """.replace("__SLEEPER_SEC__", str(SLEEPER_SEC))
 
 CONTROL_PS1 = r"""
 param(
     [Parameter(Mandatory = $true)][string]$LaneScript,
     [Parameter(Mandatory = $true)][string]$Dir,
-    [Parameter(Mandatory = $true)][int]$SurvivalSec
+    [Parameter(Mandatory = $true)][int]$SurvivalSec,
+    [Parameter(Mandatory = $true)][int]$HostWaitSec
 )
 $ErrorActionPreference = 'Stop'
 $src = [IO.File]::ReadAllText($LaneScript)
@@ -80,11 +107,10 @@ $psi.FileName = (Get-Command pwsh.exe -ErrorAction Stop).Source
 foreach ($a in @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', (Join-Path $Dir 'host.ps1'), '-Dir', $Dir)) { [void]$psi.ArgumentList.Add($a) }
 $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
 $host_ = [Diagnostics.Process]::Start($psi)
-$recs = $null
 try {
     [MlvLaneJob]::AssignOrThrow($job, $host_.Handle)            # the inert host is in the job before it does anything
     [IO.File]::WriteAllText((Join-Path $Dir 'go.flag'), 'go')
-    if (-not $host_.WaitForExit(90000)) { throw 'host-did-not-exit' }
+    if (-not $host_.WaitForExit($HostWaitSec * 1000)) { throw 'host-did-not-exit' }
     if ($host_.ExitCode -ne 0) { throw ('host-exit-' + $host_.ExitCode) }
     $recs = Get-Content -LiteralPath (Join-Path $Dir 'children.json') -Raw | ConvertFrom-Json
     $aliveBeforeClose = [ordered]@{ wmi = (Test-Alive $recs.wmi); startProcess = (Test-Alive $recs.startProcess) }
@@ -100,33 +126,299 @@ try {
     $result | ConvertTo-Json -Depth 4 -Compress
 } finally {
     if ($job -ne [IntPtr]::Zero) { [void][MlvLaneJob]::CloseHandle($job) }
-    if ($null -ne $recs) {
-        foreach ($k in 'wmi', 'startProcess') { if (Test-Alive $recs.$k) { Stop-Process -Id ([int]$recs.$k.pid) -Force -ErrorAction SilentlyContinue } }
-    }
 }
 """
 
+_TERMINATE, _QUERY_LIMITED, _STILL_ACTIVE = 0x0001, 0x1000, 259
 
-@pytest.fixture(scope="module")
-def lifecycle(tmp_path_factory):
-    d = tmp_path_factory.mktemp("detached-child")
+
+def _kernel32():
+    k = ctypes.WinDLL("kernel32", use_last_error=True)
+    k.OpenProcess.restype = ctypes.c_void_p
+    k.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    k.GetProcessTimes.argtypes = [ctypes.c_void_p] + [ctypes.POINTER(ctypes.c_uint64)] * 4
+    k.GetExitCodeProcess.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
+    k.TerminateProcess.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    k.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    k.CloseHandle.argtypes = [ctypes.c_void_p]
+    return k
+
+
+def reap_child(pid, created, *, kill=True):
+    """True when pid is a live process whose creation FILETIME equals `created` (killed first when `kill`).
+
+    The kill goes through the handle the creation time was read from, so a pid recycled after this check
+    cannot be hit; a pid that was already recycled has a different creation time and is never touched."""
+    k = _kernel32()
+    h = k.OpenProcess(_TERMINATE | _QUERY_LIMITED, False, pid)
+    if not h:
+        return False
+    try:
+        times = [ctypes.c_uint64() for _ in range(4)]
+        if not k.GetProcessTimes(h, *[ctypes.byref(t) for t in times]) or times[0].value != created:
+            return False
+        code = ctypes.c_uint32()
+        if not k.GetExitCodeProcess(h, ctypes.byref(code)) or code.value != _STILL_ACTIVE:
+            return False  # exited; a leftover handle elsewhere keeps the pid openable
+        if kill:
+            k.TerminateProcess(h, 1)
+            k.WaitForSingleObject(h, 5000)
+        return True
+    finally:
+        k.CloseHandle(h)
+
+
+def read_child_records(pid_dir):
+    recs = {}
+    for f in sorted(pid_dir.glob("*.json")):
+        try:
+            doc = json.loads(f.read_text(encoding="utf-8"))
+            recs[f.stem] = (int(doc["pid"]), int(doc["created"]))
+        except (OSError, ValueError, KeyError):
+            continue  # a half-written record is only ever the .tmp name; anything else unreadable is skipped
+    return recs
+
+
+def stage(d):
+    (d / "pids").mkdir()
     (d / "host.ps1").write_text(HOST_PS1, encoding="ascii")
     (d / "control.ps1").write_text(CONTROL_PS1, encoding="ascii")
-    cp = subprocess.run(
-        [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(d / "control.ps1"),
-         "-LaneScript", str(INVOKE_LANE), "-Dir", str(d), "-SurvivalSec", str(SURVIVAL_WAIT_SEC)],
-        capture_output=True, text=True, timeout=SURVIVAL_WAIT_SEC + 150)
+    return d
+
+
+def run_control(d, *, survival_sec, host_wait_sec=HOST_WAIT_SEC, timeout, fault=None):
+    """Run the control script; whatever happens, kill every recorded child that is still the same process.
+
+    Returns (completed_process_or_None, timed_out, records, reaped) where `reaped` names the children that were
+    still alive when the finalizer ran (the orphans this module would otherwise leave behind)."""
+    env = dict(os.environ)
+    env.pop("MLV_TEST_HOST_FAULT", None)
+    if fault:
+        env["MLV_TEST_HOST_FAULT"] = fault
+    cp, timed_out = None, False
+    try:
+        cp = subprocess.run(
+            [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(d / "control.ps1"),
+             "-LaneScript", str(INVOKE_LANE), "-Dir", str(d), "-SurvivalSec", str(survival_sec),
+             "-HostWaitSec", str(host_wait_sec)],
+            capture_output=True, text=True, timeout=timeout, env=env)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+    finally:
+        records = read_child_records(d / "pids")
+        reaped = [name for name, (pid, created) in records.items() if reap_child(pid, created)]
+    return cp, timed_out, records, reaped
+
+
+def children_alive(records):
+    return {name: reap_child(pid, created, kill=False) for name, (pid, created) in records.items()}
+
+
+# name -> run_control arguments. Each leaves the WMI sleeper (outside the job) running unless the finalizer kills it.
+FAILURE_PATHS = {
+    "start-process-throws": dict(fault="start-process-throws", survival_sec=5, timeout=90),
+    "host-does-not-exit": dict(fault="host-hangs", survival_sec=5, host_wait_sec=30, timeout=90),
+    "subprocess-timeout": dict(survival_sec=SURVIVAL_WAIT_SEC, timeout=40),
+}
+# The two rows above are sized for a loaded runner (start-up of pwsh plus the WMI Create can take many seconds) yet
+# stay inside the 60 s survival wait they overlap, so they add no wall time: the host waits 30 s, the timeout is 40 s.
+
+
+@pytest.fixture(scope="module")
+def failure_paths_started(tmp_path_factory):
+    pool = ThreadPoolExecutor(max_workers=len(FAILURE_PATHS))
+    futures = {name: pool.submit(run_control, stage(tmp_path_factory.mktemp("failure-" + name)), **kw)
+               for name, kw in FAILURE_PATHS.items()}
+    yield futures
+    pool.shutdown(wait=True)
+
+
+@pytest.fixture(scope="module")
+def lifecycle(tmp_path_factory, failure_paths_started):
+    d = stage(tmp_path_factory.mktemp("detached-child"))
+    cp, timed_out, _records, _reaped = run_control(
+        d, survival_sec=SURVIVAL_WAIT_SEC, host_wait_sec=HOST_WAIT_SEC, timeout=SURVIVAL_WAIT_SEC + 150)
+    assert not timed_out, "control script timed out"
     assert cp.returncode == 0, f"control script failed rc={cp.returncode}\nstdout={cp.stdout}\nstderr={cp.stderr}"
     return json.loads(cp.stdout.strip().splitlines()[-1])
 
 
+@pytest.fixture(scope="module", params=sorted(FAILURE_PATHS))
+def failure_path(request, failure_paths_started):
+    return request.param, failure_paths_started[request.param].result()
+
+
+# ---- the job object itself --------------------------------------------------------------------------------
+
+JOB_CLASS_RE = re.compile(r"(?s)if \(-not \('MlvLaneJob' -as \[type\]\)\) \{\s*Add-Type -TypeDefinition @'\r?\n(.*?)\r?\n'@")
+# any assignment operator (=, |=, &=, ^=, +=, -=, <<=, ...) whose target is a LimitFlags member; == is a comparison.
+# Whitespace and closing parens between the member and the operator are allowed, so `(x.LimitFlags) |= 1` is a write
+# too (comments are blanked to whitespace first; an opening paren before the target needs no handling).
+LIMIT_FLAGS_WRITE_RE = re.compile(r"\bLimitFlags[\s)]*(?:>>>|<<|>>|[-+*/%&|^])?=(?!=)([^;]*)")
+# Second, independent count that does not parse anything: over the RAW MlvLaneJob block (nothing dropped, nothing
+# blanked) the `LimitFlags` identifier occurs exactly as often as in the known-good block at fork/master, and so do the
+# `UInt32 LimitFlags;` declarations. Both counts read the same text, so no comment, literal or interpolation hole can
+# make one of them see less than the other. A comment that mentions LimitFlags in the block therefore fails closed.
+LIMIT_FLAGS_TOKEN_RE = re.compile(r"\bLimitFlags\b")
+LIMIT_FLAGS_DECL_RE = re.compile(r"\bUInt32\s+LimitFlags\s*;")
+# Invoke-Lane.ps1 at fork/master: the field declaration (`public UInt32 LimitFlags;`) and the single `LimitFlags=0x2000;`.
+KNOWN_GOOD_LIMIT_FLAGS_DECLS = 1
+KNOWN_GOOD_LIMIT_FLAGS_TOKENS = 2
+# C# tokens that can hide a write or fake one: string and char literals (kept, so a "//" inside one opens nothing)
+# and comments (blanked to one space, which is also what separates tokens in C#).
+CS_TOKEN_RE = re.compile(r"""@"(?:[^"]|"")*"|"(?:[^"\\\r\n]|\\.)*"|'(?:[^'\\\r\n]|\\.)*'|//[^\r\n]*|/\*.*?\*/""", re.S)
+
+
+def blank_cs_comments(code):
+    return CS_TOKEN_RE.sub(lambda m: m.group(0) if m.group(0)[0] in "@\"'" else " ", code)
+
+
+def job_block(src):
+    m = JOB_CLASS_RE.search(src)
+    assert m, "MlvLaneJob Add-Type block not found in Invoke-Lane.ps1"
+    return m.group(1)
+
+
+def limit_flag_writes(src):
+    """Right-hand sides of every LimitFlags write inside the MlvLaneJob Add-Type block, comments ignored."""
+    return [rhs.strip() for rhs in LIMIT_FLAGS_WRITE_RE.findall(blank_cs_comments(job_block(src)))]
+
+
+def limit_flag_tokens(src):
+    """Raw LimitFlags token count in the MlvLaneJob block; nothing is dropped and nothing is parsed."""
+    return len(LIMIT_FLAGS_TOKEN_RE.findall(job_block(src)))
+
+
+def limit_flag_decls(src):
+    """Raw `UInt32 LimitFlags;` declaration count in the same block text the token count reads."""
+    return len(LIMIT_FLAGS_DECL_RE.findall(job_block(src)))
+
+
+def assert_kill_on_close_only(src):
+    writes = limit_flag_writes(src)
+    assert len(writes) == 1, f"MlvLaneJob must write LimitFlags exactly once, found {len(writes)}: {writes}"
+    assert re.fullmatch(r"0[xX][0-9A-Fa-f]+", writes[0]), f"LimitFlags write is not a plain hex literal: {writes[0]}"
+    assert int(writes[0], 16) == 0x2000, "lane job must be KILL_ON_JOB_CLOSE only (0x2000)"
+    # Fail closed on whatever the blanker misreads: both raw counts must equal the known-good block's.
+    decls = limit_flag_decls(src)
+    assert decls == KNOWN_GOOD_LIMIT_FLAGS_DECLS, (
+        f"MlvLaneJob has {decls} LimitFlags declaration(s) in the raw block; expected {KNOWN_GOOD_LIMIT_FLAGS_DECLS}")
+    tokens = limit_flag_tokens(src)
+    assert tokens == KNOWN_GOOD_LIMIT_FLAGS_TOKENS, (
+        f"MlvLaneJob has {tokens} LimitFlags token(s) in the raw block; expected {KNOWN_GOOD_LIMIT_FLAGS_TOKENS} "
+        f"(the declaration and the single write)")
+
+
 def test_job_object_is_kill_on_close_and_not_breakaway():
     # The route below only works because the job has no way for a member to leave it except a parent outside it.
-    src = INVOKE_LANE.read_text(encoding="utf-8")
-    m = re.search(r"value\.BasicLimitInformation\.LimitFlags=(0x[0-9A-Fa-f]+);", src)
-    assert m, "MlvLaneJob.CreateKillOnClose no longer sets LimitFlags in the expected form"
-    assert int(m.group(1), 16) == 0x2000, "lane job must be KILL_ON_JOB_CLOSE only (0x2000)"
+    assert_kill_on_close_only(INVOKE_LANE.read_text(encoding="utf-8"))
 
+
+WRITE_0x2000 = "value.BasicLimitInformation.LimitFlags=0x2000;"
+
+
+@pytest.mark.parametrize("extra", [
+    "value.BasicLimitInformation.LimitFlags|=0x800;",                    # BREAKAWAY_OK or'ed in after the assignment
+    "value.BasicLimitInformation.LimitFlags = 0x2000 | 0x1000;",         # a second plain assignment
+    "value.BasicLimitInformation.LimitFlags<<=1;",                       # shifted away from 0x2000
+])
+def test_a_second_limitflags_write_is_caught(extra):
+    src = INVOKE_LANE.read_text(encoding="utf-8")
+    assert src.count(WRITE_0x2000) == 1, "Invoke-Lane.ps1 no longer has the expected single LimitFlags write"
+    with pytest.raises(AssertionError, match="exactly once"):
+        assert_kill_on_close_only(src.replace(WRITE_0x2000, WRITE_0x2000 + "\n" + extra))
+
+
+@pytest.mark.parametrize("extra", [
+    "value.BasicLimitInformation.LimitFlags /* breakaway */ |= 0x800;",   # comment between the member and the operator
+    "value.BasicLimitInformation.LimitFlags /* x */ |= 0x1000;",          # same, for 0x1000 (SILENT_BREAKAWAY_OK)
+    "value.BasicLimitInformation.LimitFlags |= /* x */ 0x1000;",          # comment after the operator
+    "value.BasicLimitInformation.LimitFlags/**/|=0x1000;",                # comment as the only separator
+    'string s = "//"; value.BasicLimitInformation.LimitFlags |= 0x800;',  # "//" in a string does not open a comment
+])
+def test_a_limitflags_write_split_by_a_comment_is_caught(extra):
+    src = INVOKE_LANE.read_text(encoding="utf-8")
+    assert src.count(WRITE_0x2000) == 1, "Invoke-Lane.ps1 no longer has the expected single LimitFlags write"
+    with pytest.raises(AssertionError, match="exactly once"):
+        assert_kill_on_close_only(src.replace(WRITE_0x2000, WRITE_0x2000 + "\n" + extra))
+
+
+def test_a_whole_line_commented_out_limitflags_write_is_rejected_fail_closed():
+    # r4: flipped from accepted. The raw token count has no comment exemption, so even a whole-line // mention fails.
+    src = INVOKE_LANE.read_text(encoding="utf-8")
+    assert src.count(WRITE_0x2000) == 1, "Invoke-Lane.ps1 no longer has the expected single LimitFlags write"
+    with pytest.raises(AssertionError, match="LimitFlags token"):
+        assert_kill_on_close_only(src.replace(WRITE_0x2000, WRITE_0x2000 + "\n// LimitFlags = 0x800 removed"))
+
+
+@pytest.mark.parametrize("comment", [
+    "/* LimitFlags |= 0x800 */",
+    "/* multi-line\n   LimitFlags = 0x1000; */",
+])
+def test_a_block_commented_limitflags_mention_is_rejected_fail_closed(comment):
+    # a /* */ mention is rejected rather than parsed (r4: so is a whole-line // mention, see below).
+    src = INVOKE_LANE.read_text(encoding="utf-8")
+    assert src.count(WRITE_0x2000) == 1, "Invoke-Lane.ps1 no longer has the expected single LimitFlags write"
+    with pytest.raises(AssertionError, match="LimitFlags token"):
+        assert_kill_on_close_only(src.replace(WRITE_0x2000, WRITE_0x2000 + "\n" + comment))
+
+
+@pytest.mark.parametrize("extra", [
+    "(value.BasicLimitInformation.LimitFlags) |= 0x800;",                 # parenthesized lvalue
+    "( value.BasicLimitInformation.LimitFlags ) |= 0x800;",               # whitespace inside the parens
+    "(value.BasicLimitInformation.LimitFlags)|=0x1000;",                  # tight, for 0x1000
+    "((value.BasicLimitInformation.LimitFlags)) |= 0x800;",               # doubly parenthesized
+])
+def test_a_parenthesized_limitflags_write_is_caught(extra):
+    src = INVOKE_LANE.read_text(encoding="utf-8")
+    assert src.count(WRITE_0x2000) == 1, "Invoke-Lane.ps1 no longer has the expected single LimitFlags write"
+    with pytest.raises(AssertionError, match="exactly once"):
+        assert_kill_on_close_only(src.replace(WRITE_0x2000, WRITE_0x2000 + "\n" + extra))
+
+
+@pytest.mark.parametrize("extra", [
+    # a nested literal inside an interpolation hole makes the blanker open a comment that is not one and swallow the write
+    'string s = $"{ "/*" }"; value.BasicLimitInformation.LimitFlags |=0x800; // */',
+    'string s = $"{ "//" }"; value.BasicLimitInformation.LimitFlags |=0x1000;',
+])
+def test_a_limitflags_write_hidden_by_a_nested_literal_is_caught(extra):
+    src = INVOKE_LANE.read_text(encoding="utf-8")
+    assert src.count(WRITE_0x2000) == 1, "Invoke-Lane.ps1 no longer has the expected single LimitFlags write"
+    with pytest.raises(AssertionError, match="LimitFlags token"):
+        assert_kill_on_close_only(src.replace(WRITE_0x2000, WRITE_0x2000 + "\n" + extra))
+
+
+def _mutated(replacement):
+    src = INVOKE_LANE.read_text(encoding="utf-8")
+    assert src.count(WRITE_0x2000) == 1, "Invoke-Lane.ps1 no longer has the expected single LimitFlags write"
+    return src.replace(WRITE_0x2000, replacement)
+
+
+# r4: both raw counts must match the known-good block; a commented-out declaration can no longer balance a hidden write.
+@pytest.mark.parametrize("extra", [
+    # J-05 (sol r3): a commented declaration offsets a second write that a nested literal hides from the blanker
+    '// UInt32 LimitFlags;\nstring s = $"{ "/*" }"; value.BasicLimitInformation.LimitFlags |=0x800; // */',
+    '// UInt32 LimitFlags;\nstring s = $"{ "//" }"; value.BasicLimitInformation.LimitFlags |=0x1000;',
+    # J-06 (opus r3): a write on a line that starts with // inside a verbatim interpolated string the blanker mis-ends
+    'GC.KeepAlive($@"{ "x" }\n// "); value.BasicLimitInformation.LimitFlags |= 0x800;',
+])
+def test_a_commented_declaration_cannot_offset_a_hidden_limitflags_write(extra):
+    with pytest.raises(AssertionError, match="LimitFlags (token|declaration)"):
+        assert_kill_on_close_only(_mutated(WRITE_0x2000 + "\n" + extra))
+
+
+def test_an_unsigned_right_shift_assignment_counts_as_a_limitflags_write():
+    # C# 11 `>>>=` turns 0x2000 into 0x800
+    assert len(limit_flag_writes(_mutated(WRITE_0x2000 + "\nvalue.BasicLimitInformation.LimitFlags >>>= 2;"))) == 2
+
+
+def test_the_only_limitflags_write_must_be_0x2000():
+    src = INVOKE_LANE.read_text(encoding="utf-8")
+    with pytest.raises(AssertionError, match="0x2000"):
+        assert_kill_on_close_only(src.replace(WRITE_0x2000, "value.BasicLimitInformation.LimitFlags=0x2800;"))
+
+
+# ---- the lifecycle ----------------------------------------------------------------------------------------
 
 def test_both_children_are_running_before_the_lane_job_closes(lifecycle):
     assert lifecycle["aliveBeforeClose"] == {"wmi": True, "startProcess": True}
@@ -141,3 +433,30 @@ def test_wmi_created_child_is_alive_60s_after_the_lane_job_closes(lifecycle):
 def test_start_process_child_dies_with_the_lane_job(lifecycle):
     assert lifecycle["startProcessAlive"] is False, (
         "a child started with Start-Process stays in the kill-on-close job and must die with the lane")
+
+
+# ---- no orphaned sleeper, whatever fails ------------------------------------------------------------------
+
+def test_no_sleeper_is_left_behind_on_a_failure_path(failure_path):
+    name, (cp, timed_out, records, reaped) = failure_path
+    # the path really happened, not a start-up error that never reached the WMI Create
+    assert "wmi" in records, f"{name}: the host never recorded its WMI child; stdout={getattr(cp, 'stdout', None)}"
+    if name == "subprocess-timeout":
+        assert timed_out, "the control script finished inside the timeout; the timeout path was not exercised"
+    else:
+        assert not timed_out and cp.returncode != 0, f"{name}: expected the control script to fail, rc={cp and cp.returncode}"
+    # the WMI child is outside the job, so it was still running when the finalizer ran: that is the orphan it killed
+    assert "wmi" in reaped, f"{name}: the WMI sleeper was not alive for the finalizer to kill (reaped={reaped})"
+    assert not any(children_alive(records).values()), f"{name}: a recorded sleeper is still alive: {children_alive(records)}"
+
+
+def test_the_finalizer_leaves_a_recycled_pid_alone():
+    # A live process whose creation time differs from the recorded one is some other process: never touched.
+    p = subprocess.Popen([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 30"])
+    try:
+        time.sleep(0.5)
+        assert reap_child(p.pid, 1) is False
+        assert p.poll() is None, "a process with a different creation time must not be killed"
+    finally:
+        p.kill()
+        p.wait()
