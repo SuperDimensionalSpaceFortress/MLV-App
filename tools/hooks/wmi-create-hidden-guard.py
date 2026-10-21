@@ -18,7 +18,9 @@ CODE vs PROSE (r2, PR #547). Only code is scanned:
     Add-LedgerLine.ps1. A segment stops being data when it redirects with `>`, sits in a pipeline that feeds a writer or an
     interpreter (Set-Content, tee, pwsh, python ...), or holds a `$(` substitution. An unbalanced quote disables every exemption.
 Contract (declared for WMI-CREATE-HIDDEN-GUARD-HOOK-1 r3; the code below must say exactly this, and a difference is a defect in the code):
-Parser: a quote-aware tokenizer, not an AST. Bash/PowerShell command text is split outside quotes on semicolon, ampersand,
+Parser: a quote-aware tokenizer, not an AST. Comments are stripped before the exemption grammar runs: an unquoted # that
+starts a word runs to the end of its line (PowerShell <#...#> blocks too), so a quote or heredoc opener inside one opens
+nothing, and a PowerShell # that may or may not start a comment disables every exemption. Bash/PowerShell command text is split outside quotes on semicolon, ampersand,
 double ampersand, pipe, double pipe and newline, and each segment is judged on its own: DENY when Win32_Process and Create
 appear within the window with no ShowWindow=0. Data segments are not scanned: read and search commands, git
 commit/log/show/diff/grep/blame/tag/notes, gh pr/issue, Add-LedgerLine.ps1. A data segment is code again when it redirects
@@ -60,6 +62,10 @@ _CALL = re.compile(r"(?i)Invoke-(Cim|Wmi)Method|\[wmiclass\]|\.Create\(")
 _SHOW = re.compile(r"(?i)ShowWindow")
 _COMMENT = re.compile(r"(^|\s)#.*$")
 _HEREDOC_META = ";&|<>()"  # an unquoted one of these ends a heredoc delimiter word, as whitespace does
+_WORD_BREAK = " \t\n;&|()"  # an unquoted # at the start of the text or after one of these starts a comment
+_BASH_WORD_BREAK = _WORD_BREAK + "<>"  # bash also starts a word after a redirection operator (echo x >#f is a syntax error)
+_PS_WORD_BREAK = _WORD_BREAK + "\r{},'\""  # PowerShell also starts a token after a brace, a comma or a closing quote
+_PS_WORD = "_$`#<\\"  # with letters and digits: a # after one of these is inside a PowerShell word
 _QUOTED = re.compile(r"\"[^\"]*\"|'[^']*'")
 _HEAD = re.compile(r"\"([^\"]*)\"\s*|'([^']*)'\s*|(\S+)\s*")
 _SUBST_CAT = re.compile(r"\$\(\s*cat\s+(?=<<)")  # the head of the commit-message idiom; _heredoc_opener reads the delimiter
@@ -163,16 +169,76 @@ def _heredoc_end(text, pos, tag, strip):
     return m.end() if m else -1
 
 
-def split_shell(text):
+def _escaped(text, j, esc):
+    """True when an odd run of the escape character esc stands right before text[j]."""
+    k = j
+    while k > 0 and text[k - 1] == esc:
+        k -= 1
+    return (j - k) % 2 == 1
+
+
+def _starts_comment(text, i, powershell):
+    """Whether the unquoted text[i] (a #, or the < of a PowerShell <#) starts a comment: True, False, or None when unknown.
+
+    A comment starts a word: at the start of the text, or after unquoted, unescaped whitespace or ; & | ( ). The escape is the
+    backslash in bash and the backtick in PowerShell, and an escaped newline (a line continuation) is skipped first. Bash also
+    starts a word after < or >. PowerShell also starts a token after a brace (not ${, a braced variable name), a comma or a
+    closing quote. A # glued to anything else
+    in PowerShell (= > + ...) is a comment in expression mode and a word character in argument mode: None, so the caller
+    fails closed.
+    """
+    esc = "`" if powershell else "\\"
+    j = i
+    while j >= 2 and text[j - 1] == "\n" and _escaped(text, j - 1, esc):
+        j -= 2
+    if j == 0:
+        return True
+    prev = text[j - 1]
+    if not powershell:
+        return prev in _BASH_WORD_BREAK and not _escaped(text, j - 1, esc)
+    if prev == "{" and j >= 2 and text[j - 2] == "$":
+        return False
+    if prev in _PS_WORD_BREAK:
+        return not _escaped(text, j - 1, esc)
+    if prev.isalnum() or prev in _PS_WORD:
+        return False
+    return None
+
+
+def _comment_end(text, i, powershell, tick):
+    """Index where the comment starting at text[i] ends, or -1 for an unclosed PowerShell block comment.
+
+    A <#...#> block ends after its #>. A # comment ends at its line's newline, which is not part of it, so the line still ends
+    its segment; inside a bash backtick substitution (tick) it ends at the closing backtick, as bash finds that backtick first.
+    """
+    if powershell and text.startswith("<#", i):
+        k = text.find("#>", i + 2)
+        return k + 2 if k >= 0 else -1
+    end = text.find("\n", i)
+    end = len(text) if end < 0 else end
+    k = i
+    while tick:
+        k = text.find("`", k + 1, end)
+        if k < 0:
+            break
+        if not _escaped(text, k, "\\"):
+            return k
+    return end
+
+
+def split_shell(text, powershell=False):
     """Split on ; & && | || and newlines outside quotes. Rows are [segment, separator_after, forces_code].
 
     forces_code is set by a file redirect or by an unquoted heredoc body holding a backtick substitution.
     A heredoc body belongs to the segment whose command line opened it, whatever segments follow on that line,
     and several heredocs on one line are read in order. The delimiter word is bash's (see _heredoc_opener).
-    Returns None when a quote is left open or a heredoc has no terminator line.
+    Comments are removed first (see _starts_comment and _comment_end), so a quote, separator or heredoc opener inside one
+    does nothing, and a # inside a heredoc body is body text. A multi-line block comment leaves its newlines behind.
+    Returns None when a quote is left open, a heredoc has no terminator line, a block comment is not closed,
+    or PowerShell may or may not read a # as a comment.
     """
     rows, cur, quote, heredocs = [], [], None, []
-    redirect = False
+    redirect = tick = False
     i, n = 0, len(text)
 
     def cut(sep):
@@ -192,6 +258,19 @@ def split_shell(text):
                 quote = None
             i += 1
             continue
+        if ch == "#" or (powershell and text.startswith("<#", i)):
+            start = _starts_comment(text, i, powershell)
+            if start is None:
+                return None  # PowerShell may or may not read a comment here: fail closed like an open quote
+            if start:
+                end = _comment_end(text, i, powershell, tick)
+                if end < 0:
+                    return None  # an unclosed block comment: fail closed
+                cur.append("\n" * text.count("\n", i, end))
+                i = end
+                continue
+        if ch == "`" and not powershell and not _escaped(text, i, "\\"):
+            tick = not tick  # inside a bash backtick substitution a comment ends at the closing backtick
         if text.startswith("<<<", i):  # a here-string, not a heredoc
             cur.append("<<<")
             i += 3
@@ -331,9 +410,9 @@ def is_sink_segment(segment):
     return bool(words) and _command_name(words[0]) in SINK_COMMANDS and not _LEDGER.match(segment.strip())
 
 
-def code_view(command):
-    """The command text with data segments blanked (newlines kept, so line windows still line up)."""
-    rows = split_shell(command)
+def code_view(command, powershell=False):
+    """The command text with comments removed and data segments blanked (newlines kept, so line windows still line up)."""
+    rows = split_shell(command, powershell)
     if rows is None:
         return command
     out, group = [], []
@@ -364,7 +443,7 @@ def decide(payload):
     tool = payload.get("tool_name", "")
     ti = payload.get("tool_input") or {}
     if tool in ("Bash", "PowerShell"):
-        text = code_view(ti.get("command") or "")
+        text = code_view(ti.get("command") or "", tool == "PowerShell")
     elif tool in ("Write", "Edit", "NotebookEdit"):
         path = (ti.get("file_path") or ti.get("notebook_path") or "").replace("\\", "/")
         name = path.rsplit("/", 1)[-1].lower()

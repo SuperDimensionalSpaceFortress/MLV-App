@@ -474,5 +474,133 @@ class WmiCreateHiddenGuardR6Tests(unittest.TestCase):
             self.assertEqual((deny, deny), self._verdicts(command), "%s: %r" % (spelling, command))
 
 
+# r7 (PR #547, sol r6 C1; opus r6 H-17/H-18): comments are closed by grammar, as r6 closed heredocs.
+#   * a comment is an unquoted # at the start of a word (start of text, or after unquoted whitespace or ; & | ( )) to the end of its line
+#   * the tokenizer removes it before it looks for heredoc openers, quotes or separators; the code before it on its line stays
+#   * # mid-word (a#b, ${#x}, $#), inside quotes or after a backslash is not a comment; # in a heredoc body is body text
+#   * PowerShell: backtick is the escape, a closing quote, { and , also start a token, <#...#> is a block comment; a # glued to an
+#     operator (= > ...) is a comment only in expression mode, so that reading is ambiguous and fails closed like an open quote
+COMMENT_OPENERS = ("<<'true'", "<<true", "<<-true", '<<"true"')
+COMMENT_PREFIXES = ("echo ready # heredoc example: ", "echo ready\t# ", "echo ready;# ", "echo ready ;# ", "echo ready && # ",
+                    "echo ready | # ", "echo ready & # ", "(echo ready) # ", "# ", "echo ready\n# ", "(# ")
+COMMENT_QUOTES = (("don't block", "it's detached"), ('say "hi', 'bye" now'), ("a'b", "c'd"))
+NOT_COMMENT_WORDS = ("a#b", "${#x}", "$#", "x#", "a\\#b", "a##b", "'# x'", '"# x"', "'a'b#")
+
+
+def comment_rows():
+    """(spelling, expected_deny, command) for the comment grammar, judged the same by the Bash and PowerShell tools."""
+    launch = 'pwsh -NoProfile -Command "%s"' % UNHIDDEN_ARGS
+    hidden = 'pwsh -NoProfile -Command "%s"' % HIDDEN_ONE_LINE
+    prose = "Guard " + FORM
+    # C1: a heredoc opener inside a comment opens nothing, wherever the comment starts
+    for prefix in COMMENT_PREFIXES:
+        for opener in COMMENT_OPENERS:
+            close = "\n)" if prefix.startswith("(#") else ""
+            yield "C1 %r %s" % (prefix, opener), True, "%s%s\n%s\ntrue%s" % (prefix, opener, launch, close)
+    yield "C1 full-line comment holding <<EOF, then a launch", True, "# see <<EOF\n%s\nEOF" % launch
+    yield "C1 data line, full-line comment holding <<EOF, then a launch", True, "echo start\n# see <<EOF\n%s\nEOF" % launch
+    # opus H-17: a quote inside a comment does not unbalance anything
+    for first, second in COMMENT_QUOTES:
+        for prefix in ("echo starting # ", "echo starting;# ", "echo starting\t# "):
+            yield "QUOTE %r %r around a launch" % (first, second), True, "%s%s\n%s\necho done # %s" % (prefix, first, launch, second)
+    yield "QUOTE line-continued comment around a launch", True, "echo a \\\n# don't\n%s\necho b # it's" % launch
+    # opus H-18: a comment heredoc does not swallow a real writer heredoc
+    yield "H18 comment <<EOF then a writer heredoc", True, "echo start # via <<EOF\ncat > run.ps1 <<EOF\n%s\nEOF\npwsh -File run.ps1" % UNHIDDEN_ARGS
+    # not a comment: # mid-word or inside quotes; the heredoc after it is real, so its literal body is data and a launch after it is code
+    for word in NOT_COMMENT_WORDS:
+        yield "WORD %s <<'EOF', launch in the literal body" % word, False, "echo %s <<'EOF'\n%s\nEOF" % (word, UNHIDDEN_ARGS)
+        yield "WORD %s <<'EOF', launch after the terminator" % word, True, "echo %s <<'EOF'\nmessage\nEOF\n%s" % (word, launch)
+    for arg in ('"# <<EOF"', "'# <<EOF'", "\"# don't <<EOF\""):
+        yield "QUOTED %s argument, then a launch" % arg, True, "echo %s\n%s" % (arg, launch)
+    yield "QUOTED search pattern '# <<EOF', then a launch", True, "grep -n '# <<EOF' x.sh\n%s" % launch
+    # the comment hides only itself: code before it on its line stays, and comment text is not code
+    yield "SAME launch before a comment holding a heredoc opener", True, "%s # don't <<'EOF'" % launch
+    yield "SAME launch before ;#", True, "%s;# note" % launch
+    yield "SAME launch in a later segment before a comment", True, "echo ok; %s # note" % launch
+    yield "TEXT launch text after # is a comment", False, "echo ok # %s" % launch
+    yield "TEXT launch text after ;# is a comment", False, "echo ok;# %s" % launch
+    yield "TEXT launch text on a full-line comment", False, "# %s" % launch
+    yield "TEXT apostrophe in a comment after a heredoc opener", False, "cat <<'EOF' # it's a note\n%s\nEOF" % prose
+    # a comment after a hidden launch does not hide a later unhidden one
+    yield "HIDDEN comment after a hidden launch, unhidden launch later", True, "%s # hidden, don't worry\necho one\necho two\necho three\n%s" % (hidden, launch)
+    yield "HIDDEN comment heredoc after a hidden launch", True, "%s # note <<'X'\necho one\necho two\necho three\n%s\nX" % (hidden, launch)
+    yield "HIDDEN hidden launch, data line with a comment heredoc", True, "%s\necho ok # see <<'X'\necho one\necho two\n%s\nX" % (hidden, launch)
+    # inside a heredoc body # is body text; the r6 rules still decide literal versus scanned
+    yield "BODY # in a literal body", False, "cat <<'EOF'\n# body comment <<X don't\n%s\nEOF" % UNHIDDEN_ARGS
+    # (a substitution on the same line after ' #' is the declared space-hash non-promise, WMI-GUARD-EVASIONS-1)
+    yield "BODY # line in an unquoted body, the substitution after it still runs", True, "cat <<EOF\n# don't <<X\n$(%s)\nEOF" % launch
+    yield "BODY # in a writer body", True, "cat > run.ps1 <<'EOF'\n# comment\n%s\nEOF" % UNHIDDEN_ARGS
+    # the quoted-delimiter commit idiom with comment lines stays data
+    yield "KEEP commit idiom, # line in the body", False, COMMIT_HEREDOC % ("# comment line\n" + prose)
+    yield "KEEP commit idiom, # line with a quote and <<EOF in the body", False, COMMIT_HEREDOC % ("# don't <<EOF it's\n" + prose)
+    yield "KEEP commit idiom, trailing comment", False, COMMIT_HEREDOC % prose + " # trailing comment"
+    yield "KEEP commit -F idiom, # line in the body", False, "git commit -F - <<'EOF'\n# comment, don't\n%s\nEOF" % prose
+
+
+class WmiCreateHiddenGuardR7Tests(unittest.TestCase):
+    def _verdicts(self, command):
+        return (GUARD.decide(bash(command)) is not None, GUARD.decide(ps(command)) is not None)
+
+    def test_c1_repro_a_heredoc_opener_in_a_comment_opens_nothing(self):
+        # sol r6 C1 verbatim shape: the commented <<'true' swallowed the launch into the echo data row.
+        launch = 'pwsh -NoProfile -Command "%s"' % UNHIDDEN_ARGS
+        repro = "echo ready # heredoc example: <<'true'\n%s\ntrue" % launch
+        self.assertEqual((True, True), self._verdicts(repro))
+        self.assertEqual((True, True), self._verdicts(repro.replace(" # heredoc example: <<'true'", "")))
+        rows = GUARD.split_shell(repro)
+        self.assertEqual(["echo ready ", launch, "true"], [r[0] for r in rows])
+
+    def test_opus_h17_h18_comment_quotes_and_comment_heredocs(self):
+        launch = 'pwsh -NoProfile -Command "%s"' % UNHIDDEN_ARGS
+        h17 = "echo starting # don't block\n%s\necho done # it's detached" % launch
+        h18 = "echo start # via <<EOF\ncat > run.ps1 <<EOF\n%s\nEOF\npwsh -File run.ps1" % UNHIDDEN_ARGS
+        self.assertEqual((True, True), self._verdicts(h17))
+        self.assertEqual((True, True), self._verdicts(h18))
+        # comment text is removed, the newline that ends its line is kept
+        self.assertEqual([["pwsh -File x.ps1 ", "\n", False], ["ls", "", False]], GUARD.split_shell("pwsh -File x.ps1 # don't\nls"))
+
+    def test_comment_grammar_table(self):
+        rows = list(comment_rows())
+        self.assertGreater(len(rows), 90)
+        for spelling, deny, command in rows:
+            self.assertEqual((deny, deny), self._verdicts(command), "%s: %r" % (spelling, command))
+
+    def test_each_shell_reads_its_own_escapes_and_token_starts(self):
+        # (spelling, bash_deny, powershell_deny, command): bash escapes with a backslash, PowerShell with a backtick; PowerShell
+        # also starts a token after a closing quote; a bash comment inside a backtick substitution ends at the closing backtick.
+        launch = 'pwsh -NoProfile -Command "%s"' % UNHIDDEN_ARGS
+        for spelling, bash_deny, ps_deny, command in (
+            ("backslash-space keeps # mid-word in bash only", False, True, "echo a\\ #<<'EOF'\n%s\nEOF" % UNHIDDEN_ARGS),
+            ("an escaped backslash leaves the space real", True, True, "echo a\\\\ #<<'EOF'\n%s\nEOF" % UNHIDDEN_ARGS),
+            # bash glues a# across the backslash-newline, so # is mid-word; the segmenter still cuts at that newline
+            # (WMI-GUARD-LINE-CONTINUATION-1 debt), so the bash verdict stays on the conservative side
+            ("backslash-newline glues # to the word in bash", True, True, "echo a\\\n# <<'EOF'\n%s\nEOF" % launch),
+            ("# after a closing double quote: PowerShell comment", False, True, "echo \"a\"#<<'EOF'\n%s\nEOF" % UNHIDDEN_ARGS),
+            ("# after a closing single quote: PowerShell comment", False, True, "echo 'a'#<<'EOF'\n%s\nEOF" % UNHIDDEN_ARGS),
+            # bash reads "a"# as one word, so its quote really runs to it's and the launch is quoted text
+            ("PowerShell closing-quote comments around a launch", False, True,"echo \"a\"# don't\n%s\necho \"b\"# it's" % launch),
+            ("bash comment in backticks ends at the backtick", True, False, "echo `echo a #c` ; %s" % launch),
+            ("a backtick in a top-level comment opens nothing", True, False, "echo ok # a `tick\necho `echo b #c` ; %s" % launch),
+            # bash starts a word after < or >, so <# is a comment there (a syntax error); in PowerShell it opens an unclosed block
+            ("<# holding a heredoc opener: a bash comment, an unclosed PowerShell block", True, True, "echo ready <# <<'true'\n%s\ntrue" % launch),
+            ("# glued to = : ambiguous in PowerShell, fails closed", False, True,"echo ok =#<<'EOF'\nGuard %s\nEOF" % FORM),
+        ):
+            self.assertEqual((bash_deny, ps_deny), self._verdicts(command), "%s: %r" % (spelling, command))
+
+    def test_powershell_block_comment(self):
+        launch = 'pwsh -NoProfile -Command "%s"' % UNHIDDEN_ARGS
+        for spelling, deny, command in (
+            ("a heredoc opener in a block comment opens nothing", True, "echo ready <# heredoc <<'true' #>\n%s\ntrue" % launch),
+            ("quotes in block comments do not pair", True, "echo ready <# don't\n#>\n%s\necho done <# it's #>" % launch),
+            ("launch text in a one-line block comment", False, "echo ok <# %s #>" % launch),
+            ("launch text in a multi-line block comment", False, "echo ok <#\n%s\n#>" % launch),
+            ("an unclosed block comment fails closed", True, "echo ok <# never closed\n%s" % launch),
+            ("<# mid-word is not a block comment", True, "echo a<#b\n%s\n#>" % launch),
+        ):
+            self.assertEqual(deny, GUARD.decide(ps(command)) is not None, "%s: %r" % (spelling, command))
+        # a multi-line block comment keeps its newlines, so line numbers still line up
+        self.assertIn("line 4", GUARD.decide(ps("echo ok <# a\nb\n#>\n%s" % launch)))
+
+
 if __name__ == "__main__":
     unittest.main()
