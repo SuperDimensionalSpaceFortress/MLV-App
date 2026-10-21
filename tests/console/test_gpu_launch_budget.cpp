@@ -79,6 +79,16 @@ const WholeFrameLaunch kWholeFrameLaunches[] = {
     {"amaze", "k_reduced_hnyquist121"},
     {"amaze", "k_pack_rgb16_to_rgba16"},
     {"amaze", "k_pack_rgb16_to_rgba16_post_wb_undo"},
+    // PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1: outside the tile bodies but NOT frame-sized: a <<<1, 1>>> spin of
+    // kProbeSpinNs (50 us), and the clock kick's <<<1, 32>>> chunk, each launch bounded by kClockKickChunkMs (20 ms),
+    // whatever the frame. Neither runs on the measured M16-1456 fixture path (armed / Play-start only).
+    {"amaze", "k_sm_clock_probe"},
+    {"amaze", "k_clock_kick"},
+    // PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1 R1: the warm-output reuse's exact input compare. Its grid is
+    // capped at 1024 x 256 threads (grid-stride), but its work grows with the frame: two Bayer16 reads, 2 x 70.8 MB at the
+    // 8192x4320 max frame, about 1.4 ms at 100 GB/s, far under the 100 ms per-launch budget. Not on the measured M16-1456
+    // fixture path (once, at the first Play present after a successful paused warm).
+    {"amaze", "k_bayer16_differs"},
 };
 
 QString readRepoFile(const QString & relativePath)
@@ -409,7 +419,9 @@ TEST(GpuLaunchBudget, WholeFrameLaunchesAreAnExplicitList)
     const QString recon = readRepoFile(QString::fromLatin1(kRecon));
     const QString amaze = readRepoFile(QString::fromLatin1(kAmaze));
     ASSERT_EQ(std::string(), wholeFrameListProblems(recon, amaze).join(QStringLiteral("\n")).toStdString());
-    ASSERT_EQ(3, (int)launchSites(amazeOutsideTiles(amaze)).size());
+    // 3 frame-sized packs/filters + PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1's probe and kick (constant-size grids)
+    // + PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1's input compare (grid-stride, capped grid)
+    ASSERT_EQ(6, (int)launchSites(amazeOutsideTiles(amaze)).size());
 
     // RED on a new whole-frame launch, with the message that says what to do.
     const QString added = QStringLiteral(

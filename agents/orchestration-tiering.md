@@ -84,3 +84,27 @@ with a disposable shim and so can never reach a real model regardless of the val
   does not run concurrently with a high-effort Sol lane.
 - Before scaling Sonnet dispatch, land HOOK-FALSE-POSITIVE-1: the project hook's shell-text rule
   denied ordinary diagnostic commands and cost 14 of 27 editing runs on 2026-09-07.
+
+## A citation is not a review leg
+
+A key verdict cited in a commit message, a PR body or a ledger line never counts as a review leg.
+Only one of three published forms counts, each bound to the PR's exact current head SHA:
+
+1. a `review/<seat>` commit status on the head SHA (success = APPROVE, failure or error = CHANGES_REQUESTED);
+2. a `[[pub:<id>]]` JSON comment whose `head_sha` equals the head;
+3. a GitHub review whose `commit_id` equals the head.
+
+A merge needs two legs on the current head: one from a Claude-family seat and one from a Codex-family
+seat; the newest leg per family decides. Two legs from the same family are one family's verdict, not two
+legs.
+
+Never write "keyed" or "APPROVE" for a PR in a summary or an ACK unless one of the three exists on its
+current head; a later push moves the head and voids earlier legs. The factory is stricter than the CoS
+ask on purpose: a free-text seat-verdict PR comment naming seat, full SHA and verdict is not counted by
+the gate, because it cannot be bound mechanically to the head; the key run's `[[pub:]]` JSON comment is
+a form that counts. All three forms count as legs for a summary, an ACK and the CoS check. The
+merge-enqueue guard, `.claude-state/fleet-runs/hub-tools/merge-enqueue.ps1` status gate (rule TIP_LEGS),
+counts only form 1, the `review/<seat>` status, and refuses a head that has only forms 2 or 3
+(REFUSED_LEGS), so every key run must publish its status. The gate is board-local and
+untracked, so it is not in this repo: a reader of the repo alone cannot inspect or test it.
+Origin: CoS ask 6219052910 on PR 454, hub ACK 6223438673.

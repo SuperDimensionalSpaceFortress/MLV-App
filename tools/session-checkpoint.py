@@ -52,8 +52,12 @@ def scan_fleet_runs(repo, session_id):
     if not session_id or not fleet_runs.exists():
         return None
 
+    # Receipts sit at depth 0 or 1 only. 2026-10-20: rglob walked the ~95 full
+    # repo copies under hub-tools and pinned the host (93% CPU, ~100k file ops/s).
+    receipts = [*fleet_runs.glob("*-*.receipt.json"), *fleet_runs.glob("*/*-*.receipt.json")]
+
     # Look for receipts from this session
-    for receipt_file in sorted(fleet_runs.rglob("*-*.receipt.json"), reverse=True):
+    for receipt_file in sorted(receipts, reverse=True):
         try:
             receipt = json.loads(receipt_file.read_text(encoding="utf-8"))
             if not isinstance(receipt, dict) or receipt.get("sessionId") != session_id:

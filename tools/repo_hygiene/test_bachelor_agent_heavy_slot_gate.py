@@ -6,8 +6,9 @@ The design (owner-relayed from the Bachelor heat-coordination session, which own
   1. SUSTAINED heat: blocked only when > 6 of the last 60 feed rows are throttled or their mean
      is >= 88 C (heavy-slot.py's first-run rule). Turbo spikes with 0 throttled rows never block.
   2. FAIRNESS, no wait cap: each gated job joins heavy-slot.py's own FIFO through
-     `heavy-slot.py run --exclusive --label "mlv <jobId>"`; heavy-slot.py files and reclaims the
-     tickets and the slots. The agent never writes a slot or a ticket itself.
+     `heavy-slot.py run --exclusive --label "mlv <jobId>"` ("mlv-long <jobId>" for a job over 900 s or named
+     stage / build / soak, so heavy-slot.py 2.3.1's 15 min short-exclusive self-stop cannot trip on it);
+     heavy-slot.py files and reclaims the tickets and the slots. The agent never writes a slot or a ticket itself.
   3. A WAITING job holds no slot, and a heavy job starts only when no other slot is held.
 
 The behaviour is proven end to end by tools/testing/test-ultra-magnus-agent-heavy-slot-fifo.ps1
@@ -58,7 +59,8 @@ class BachelorAgentHeavySlotGatePins(unittest.TestCase):
         self.assertIsNone(re.search(r"queue\\", self.code))
 
     def test_heavy_job_is_held_through_heavy_slot_py_run_exclusive(self) -> None:
-        self.assertIn('$label = "mlv $JobId"', self.code)
+        # AGENT-HEAVY-SLOT-2.3-ADAPT-1: the label is "mlv <jobId>" or "mlv-long <jobId>" (Get-HeavySlotLabel).
+        self.assertIn("$label = Get-HeavySlotLabel -JobId $JobId -TimeoutSec ([int](Get-JobMetadata -JobId $JobId).timeoutSec)", self.code)
         self.assertRegex(self.code, r'\$HeavySlotScript,\s*"run",\s*"--exclusive",\s*"--label",\s*\$label,\s*"--slots"')
         # A holder must take its own slot, never pass through as nested under a stale HEAVY_SLOT_HELD.
         self.assertIn("HEAVY_SLOT_HELD = $null", self.code)
@@ -139,8 +141,32 @@ class BachelorAgentHeavySlotGatePins(unittest.TestCase):
         self.assertIn("if (-not (Test-Path -LiteralPath $job.FullName -PathType Leaf)) { continue }", loop)
 
     def test_heartbeat_keeps_the_um_run_gate_wait_shape(self) -> None:
-        # tools/profiling/um-run.ps1 parses "gate-wait job=<id> state=<\S*> waited=<n>s".
-        self.assertIn('"gate-wait job=$JobId state=$state waited=$([int]((Get-Date) - $t0).TotalSeconds)s"', self.code)
+        # tools/profiling/um-run.ps1 parses "gate-wait job=<id> state=<\S*> waited=<n>s" (unanchored at the end), so the
+        # busy-slot holder note is a trailing field: the prefix stays byte-identical.
+        self.assertIn('"gate-wait job=$JobId state=$state waited=$([int]((Get-Date) - $t0).TotalSeconds)s$holderNote"', self.code)
+        # The two status probes heartbeat the same shape (they heartbeat while the status call runs).
+        self.assertIn('-HeartbeatActivity "gate-wait job=$JobId state=acquired waited=$([int]$waited)s$holderNote"', self.code)
+        self.assertIn('-HeartbeatActivity "gate-wait job=$JobId state=$state waited=$([int]$waited)s$holderNote"', self.code)
+
+    def test_label_is_decided_in_one_place_and_long_jobs_are_not_short_exclusive(self) -> None:
+        # AGENT-HEAVY-SLOT-2.3-ADAPT-1: heavy-slot.py 2.3.1 treats an exclusive holder labelled with the literal prefix
+        # "mlv " (trailing space) as short-exclusive and writes a stop file when one runs past 15 min. A gated job over
+        # 900 s, or a stage / build / soak job, is "mlv-long <id>", which that prefix does not match.
+        self.assertEqual(self.code.count('"mlv $JobId"'), 1, "the short label is spelled once, inside Get-HeavySlotLabel")
+        for fn in ("function Start-HeavySlotHolder", "function Wait-HeavySlotAdmission"):
+            body = self.code[self.code.index(fn):]
+            body = body[:body.index("\n}\n")]
+            self.assertIn("Get-HeavySlotLabel", body, fn)
+        label = self.code[self.code.index("function Get-HeavySlotLabel"):]
+        label = label[:label.index("\n}\n")]
+        self.assertIn('"mlv-long $JobId"', label)
+        self.assertIn('"mlv $JobId"', label)
+        self.assertRegex(self.text, r"\[int\]\$GateLongJobSec = 900\b")
+        self.assertRegex(self.text, r"\[string\]\$GateLongJobPattern = '[^']*stage\|build\|soak[^']*'")
+        # The second label source is the metadata the agent applies (default 1800 s), never a restated number.
+        start = self.code[self.code.index("function Start-HeavySlotHolder"):]
+        start = start[:start.index("\n}\n")]
+        self.assertIn("Get-JobMetadata -JobId $JobId", start)
 
 
 @unittest.skipIf(PWSH is None, "pwsh is not on PATH")
@@ -166,6 +192,20 @@ class BachelorAgentHeavySlotGateUnit(unittest.TestCase):
         self.assertEqual(unit["maintDispatch"]["dispatched"], ["agent-swap-U1", "venue-quiet-probe-U2"])
         self.assertTrue(unit["maintDispatch"]["singleObject"])
         self.assertEqual(unit["maintDispatch"]["label"], "queue-expired")
+        # AGENT-HEAVY-SLOT-2.3-ADAPT-1: long jobs are "mlv-long <id>"; the busy heartbeat names the holder.
+        cases = unit["longLabel"]["cases"]
+        self.assertEqual(cases["at900"], "mlv jobA")
+        self.assertEqual(cases["at901"], "mlv-long jobA")
+        self.assertEqual(cases["stage"], "mlv-long playback-attr-3-cuda-stage-1a2b3c")
+        self.assertEqual(cases["notAToken"], "mlv upstage-1")
+        self.assertEqual(unit["longLabel"]["metadata"]["noMeta"], "1800 -> mlv-long mNone")
+        self.assertEqual(unit["longLabel"]["metadata"]["explicit900"], "900 -> mlv m900")
+        self.assertEqual(unit["longLabel"]["waitAdmitsOnLongLabel"], "clear")
+        self.assertEqual(unit["longLabel"]["waitRejectsShortLabel"], "holder-lost")
+        self.assertEqual(unit["heartbeat"]["busy"], "gate-wait job=j1 state=queued waited=Ns holder=suite X held=62m")
+        self.assertEqual(unit["heartbeat"]["free"], "gate-wait job=j1 state=queued waited=Ns")
+        self.assertEqual(unit["heartbeat"]["umRunState"], "queued")
+        self.assertLessEqual(unit["heartbeat"]["capped"], 64)
 
 
 if __name__ == "__main__":
