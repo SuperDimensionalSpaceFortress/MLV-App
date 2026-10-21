@@ -1457,11 +1457,13 @@ class RepoHygieneTests(unittest.TestCase):
         tokens = block.replace("`", " ").split()
         for path in (
             "tools\\coordination\\test_coordination_guardrails.py",
-            "tools\\coordination\\stuck_queue_checks\\test_stuck_queue_checks.py",
             "tests\\coordination",
             "tests\\docs",
         ):
             self.assertIn(path, tokens)
+        # PR #464 reverts the #454 CI line that ran this suite in the step; it stays
+        # allowlisted local-only in test_ci_collects_every_test.py.
+        self.assertNotIn("tools\\coordination\\stuck_queue_checks\\test_stuck_queue_checks.py", tokens)
 
     def test_product_oracles_are_split_into_parts_behind_the_required_name(self) -> None:
         workflow = (ROOT / ".github" / "workflows" / "tests.yml").read_text(encoding="utf-8").replace("\r\n", "\n")
