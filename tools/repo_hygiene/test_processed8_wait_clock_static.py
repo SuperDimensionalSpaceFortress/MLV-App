@@ -14,7 +14,10 @@ pthread_condattr_setclock, so a libc that refused CLOCK_MONOTONIC left the cond 
 under a MONOTONIC abstime and every slice expired at once. Every pthread_condattr_setclock call in
 video_mlv.c must therefore consume its return value, and (PR #544 sol r1) the init helper may set
 its monotonic flag only in the branch where setclock and the cond init both returned exactly 0.
+PR #544 r2 keys: the helper may fall back to a default (REALTIME) cond only under 'if (!monotonic)',
+and initMlvObject must store that helper's return, and nothing else, in the clock field.
 """
+import functools
 from pathlib import Path
 import re
 import unittest
@@ -49,8 +52,25 @@ EXACT_SUCCESS = re.compile(
 ATTR_COND_INIT = re.compile(r"\bpthread_cond_init\s*\(\s*[^(),]+,\s*&")
 FLAG_WRITE = re.compile(
     r"\bmonotonic\s*(?:[-+*/%&|^]|<<|>>)?=(?!=)|(?:\+\+|--)\s*monotonic\b|\bmonotonic\s*(?:\+\+|--)")
+COND_INIT_CALL = re.compile(r"\bpthread_cond_init\s*\(")
+PLATFORM_DEFAULT_INIT = re.compile(
+    r"#[ \t]*if[ \t]+defined\s*\(\s*_WIN32\s*\)\s*\|\|\s*defined\s*\(\s*__APPLE__\s*\)[ \t]*\n"
+    r"\s*pthread_cond_init\s*\(\s*\w+\s*,\s*NULL\s*\)\s*;\s*return\s+0\s*;\s*#[ \t]*else\b")
+INIT_OBJECT_FUNCTION = "initMlvObject"
+CLOCK_FIELD = "processed8_prefetch_cond_clock_monotonic"
+# The whole statement, from a statement boundary, so a '(void)' cast or a chained '=' cannot hide in it.
+FIELD_ASSIGNMENT = re.compile(
+    r"[;{}]\s*(video\s*->\s*" + CLOCK_FIELD + r")\s*=\s*" + COND_INIT_FUNCTION
+    + r"\s*\(\s*&\s*video\s*->\s*processed8_prefetch_cond\s*\)\s*;")
+_FIELD_REF = r"(?:\w+\s*(?:->|\.)\s*)*" + CLOCK_FIELD + r"\b"
+FIELD_WRITE = re.compile(
+    r"(?:\w+\s*(?:->|\.)\s*)*" + CLOCK_FIELD + r"\s*(?:(?:[-+*/%&|^]|<<|>>)?=(?!=)|\+\+|--)"
+    r"|(?:\+\+|--|(?<!&)&(?!&))\s*" + _FIELD_REF)
+DIRECT_PREFETCH_COND_INIT = re.compile(
+    r"\bpthread_cond_init\s*\(\s*&\s*(?:\w+\s*(?:->|\.)\s*)*processed8_prefetch_cond\s*,")
 
 
+@functools.lru_cache(maxsize=4)  # each check re-blanks the same ~0.5 MB source
 def _blank_comments_and_literals(text: str) -> str:
     """Same-length copy of text with comments and string/char literals replaced by spaces."""
     out = list(text)
@@ -213,8 +233,110 @@ def cond_init_violations(source: str) -> list[str]:
     return problems
 
 
+def _function_body(code: str, name: str) -> tuple[int, str, str]:
+    """(open-brace offset, body, problem) of the one column-0 definition of name in blanked code."""
+    definitions = list(re.finditer(r"(?m)^[A-Za-z_][\w \t*]*\b" + name + r"\s*\([^;{}]*\)\s*\{", code))
+    if len(definitions) != 1:
+        return -1, "", "expected exactly one definition of %s, found %d" % (name, len(definitions))
+    body_open = definitions[0].end() - 1
+    return body_open, code[body_open:_matching_brace(code, body_open) + 1], ""
+
+
+def cond_reinit_violations(source: str) -> list[str]:
+    """PR #544 r2 key3 K-01: inside the cond-init helper a default-attr (CLOCK_REALTIME) cond init
+    may run only in the platform branch that returns 0, or as the sole statement of the top-level
+    'if (!monotonic)' re-init that runs after the attr init and right before 'return monotonic;'."""
+    code = _blank_comments_and_literals(source)
+    body_open, body, problem = _function_body(code, COND_INIT_FUNCTION)
+    if problem:
+        return [problem]
+
+    def line(offset: int) -> int:
+        return source.count("\n", 0, body_open + offset) + 1
+
+    problems = []
+    if len(re.findall(r"(?m)^[ \t]*#[ \t]*if", body)) != 1:
+        problems.append("%s must have exactly one preprocessor conditional, the platform split"
+                        % COND_INIT_FUNCTION)
+    platform = list(PLATFORM_DEFAULT_INIT.finditer(body))
+    if len(platform) != 1:
+        problems.append("%s must open with '#if defined(_WIN32) || defined(__APPLE__)' "
+                        "pthread_cond_init(<cond>, NULL); return 0; '#else', found %d" % (COND_INIT_FUNCTION, len(platform)))
+    allowed = [(match.start(), match.end()) for match in platform]
+    attr_inits, default_inits = [], []
+    for call in COND_INIT_CALL.finditer(body):
+        args = re.sub(r"\s+", "", body[call.end():_matching_paren(body, call.end() - 1)]).split(",")
+        if len(args) == 2 and args[1].startswith("&"):
+            attr_inits.append((call, args[0]))
+        elif len(args) == 2 and args[1] == "NULL":
+            default_inits.append((call, args[0]))
+        else:
+            problems.append("unrecognized pthread_cond_init at video_mlv.c:%d" % line(call.start()))
+    reinits = []
+    for branch in re.finditer(r"\bif\s*\(", body):
+        close = _matching_paren(body, branch.end() - 1)
+        if re.sub(r"\s+", "", body[branch.end():close]) == "!monotonic":
+            reinits.append((branch, close))
+    if len(reinits) != 1 or len(attr_inits) != 1:
+        problems.append("expected exactly one 'if (!monotonic)' re-init after exactly one attr cond init "
+                        "in %s, found %d and %d" % (COND_INIT_FUNCTION, len(reinits), len(attr_inits)))
+    else:
+        (branch, close), (attr_call, cond) = reinits[0], attr_inits[0]
+        brace = re.match(r"\s*\{", body[close + 1:])
+        depth = body[:branch.start()].count("{") - body[:branch.start()].count("}")
+        if not brace or depth != 1 or branch.start() < attr_call.start():
+            problems.append("the re-init 'if (!monotonic)' at video_mlv.c:%d must be a braced top-level "
+                            "branch after the attr cond init" % line(branch.start()))
+        else:
+            reinit_open = close + 1 + brace.end() - 1
+            reinit_close = _matching_brace(body, reinit_open)
+            if re.sub(r"\s+", "", body[reinit_open + 1:reinit_close]) != "pthread_cond_init(%s,NULL);" % cond:
+                problems.append("the re-init branch at video_mlv.c:%d must hold only "
+                                "'pthread_cond_init(%s, NULL);'" % (line(branch.start()), cond))
+            else:
+                allowed.append((reinit_open, reinit_close))
+            if not re.match(r"\s*return\s+monotonic\s*;\s*#[ \t]*endif\s*\}\s*\Z", body[reinit_close + 1:]):
+                problems.append("the re-init branch at video_mlv.c:%d must be followed only by "
+                                "'return monotonic;' and '#endif'" % line(branch.start()))
+    if platform and len(re.findall(r"\breturn\b", body[platform[0].end():])) != 1:
+        problems.append("the POSIX branch of %s must return exactly once, after the re-init" % COND_INIT_FUNCTION)
+    for call, _ in default_inits:
+        if not any(start <= call.start() < end for start, end in allowed):
+            problems.append("default-attr pthread_cond_init at video_mlv.c:%d is outside the platform "
+                            "branch and the 'if (!monotonic)' re-init" % line(call.start()))
+    return problems
+
+
+def field_wiring_violations(source: str) -> list[str]:
+    """PR #544 r2 key3 K-02 and sol mutations A/B: initMlvObject must store the guarded helper's
+    return for &video->processed8_prefetch_cond in the clock field, once, and nothing else may write
+    that field, call the helper or init that cond."""
+    code = _blank_comments_and_literals(source)
+    body_open, body, problem = _function_body(code, INIT_OBJECT_FUNCTION)
+    if problem:
+        return [problem]
+    problems = []
+    assignments = list(FIELD_ASSIGNMENT.finditer(body))
+    if len(assignments) != 1:
+        problems.append("%s must run 'video->%s = %s(&video->processed8_prefetch_cond);' exactly once, found %d"
+                        % (INIT_OBJECT_FUNCTION, CLOCK_FIELD, COND_INIT_FUNCTION, len(assignments)))
+    expected = [body_open + assignments[0].start(1)] if len(assignments) == 1 else []
+    for write in FIELD_WRITE.finditer(code):
+        if write.start() not in expected:
+            problems.append("%s is written or aliased at video_mlv.c:%d outside the one helper assignment"
+                            % (CLOCK_FIELD, source.count("\n", 0, write.start()) + 1))
+    calls = len(re.findall(r"\b" + COND_INIT_FUNCTION + r"\s*\(", code)) - 1
+    if calls != 1:
+        problems.append("%s must be called exactly once (the field assignment), found %d" % (COND_INIT_FUNCTION, calls))
+    for direct in DIRECT_PREFETCH_COND_INIT.finditer(code):
+        problems.append("processed8_prefetch_cond is initialised at video_mlv.c:%d without %s"
+                        % (source.count("\n", 0, direct.start()) + 1, COND_INIT_FUNCTION))
+    return problems
+
+
 def _all_violations(source: str) -> list[str]:
-    return slice_body_violations(source) + setclock_violations(source) + cond_init_violations(source)
+    return (slice_body_violations(source) + setclock_violations(source) + cond_init_violations(source)
+            + cond_reinit_violations(source) + field_wiring_violations(source))
 
 
 GUARDED_SLICE = """
@@ -317,6 +439,10 @@ class Processed8WaitClockStaticTests(unittest.TestCase):
     def test_cond_init_reports_monotonic_only_after_exact_success(self) -> None:
         self.assertEqual([], cond_init_violations(self.source))
 
+    def test_fallback_reinit_and_field_wiring_are_pinned(self) -> None:
+        self.assertEqual([], cond_reinit_violations(self.source))
+        self.assertEqual([], field_wiring_violations(self.source))
+
     def test_cond_init_guard_rejects_other_monotonic_escapes_in_head_source(self) -> None:
         mutations = {
             "return 1": ("    return monotonic;\n#endif", "    return 1;\n#endif"),
@@ -335,6 +461,35 @@ class Processed8WaitClockStaticTests(unittest.TestCase):
                           "    rc = pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);",
                           "    ok = ok && pthread_condattr_setclock(&attr, CLOCK_MONOTONIC) == 0;"):
             self.assertEqual([], setclock_violations("{\n" + statement + "\n}\n"), statement)
+
+    def test_guard_rejects_fallback_reinit_and_field_wiring_slips_in_head_source(self) -> None:
+        # PR #544 r2 keys (key3 opus K-01/K-02, sol mutations A/B): each slip leaves the cond on one
+        # clock and the field naming the other. Each mutation is applied to the real head source.
+        reinit = "    if (!monotonic)\n    {\n        pthread_cond_init(cond, NULL);\n    }\n"
+        assignment = ("    video->processed8_prefetch_cond_clock_monotonic =\n"
+                      "        mlv_processed8_prefetch_cond_init(&video->processed8_prefetch_cond);\n")
+        init_object = "mlvObject_t * initMlvObject()\n"
+        mutations = {
+            "fallback re-init on monotonic": (reinit, reinit.replace("if (!monotonic)", "if (monotonic)")),
+            "fallback re-init unconditional": (reinit, "    pthread_cond_init(cond, NULL);\n"),
+            "field assignment deleted": (
+                assignment, "    mlv_processed8_prefetch_cond_init(&video->processed8_prefetch_cond);\n"),
+            "field forced to 1, helper result ignored": (
+                assignment, "    video->processed8_prefetch_cond_clock_monotonic = 1;\n"
+                            "    (void)mlv_processed8_prefetch_cond_init(&video->processed8_prefetch_cond);\n"),
+            "field from a default-attr helper": (
+                assignment + "|" + init_object,
+                assignment.replace("mlv_processed8_prefetch_cond_init(", "mlv_processed8_prefetch_cond_init_default(")
+                + "|static int mlv_processed8_prefetch_cond_init_default(pthread_cond_t * cond)\n"
+                  "{\n    pthread_cond_init(cond, NULL);\n    return 1;\n}\n\n" + init_object),
+        }
+        for name, (old, new) in mutations.items():
+            with self.subTest(mutation=name):
+                mutated = self.source
+                for old_part, new_part in zip(old.split("|"), new.split("|")):
+                    self.assertEqual(1, mutated.count(old_part), name)
+                    mutated = mutated.replace(old_part, new_part)
+                self.assertTrue(_all_violations(mutated), name)
 
 
 if __name__ == "__main__":
