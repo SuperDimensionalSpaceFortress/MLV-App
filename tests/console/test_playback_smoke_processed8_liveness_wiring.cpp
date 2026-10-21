@@ -15,6 +15,7 @@
 #include <QFile>
 #include <QRegularExpression>
 #include <QString>
+#include <QStringList>
 #include <QTextStream>
 
 namespace
@@ -36,6 +37,36 @@ QString functionBody(const QString & source, const QString & signature, const QS
     const int next = nextSignature.isEmpty() ? source.length() : source.indexOf(nextSignature, at);
     if (at < 0 || next <= at) return QString();
     return source.mid(at, next - at);
+}
+
+// The balanced { ... } block that directly follows `anchor` (only whitespace between them);
+// empty when the anchor is missing or is not followed by a block.
+QString bracedBlockAfter(const QString & source, const QString & anchor)
+{
+    const int at = source.indexOf(anchor);
+    if (at < 0) return QString();
+    int open = at + anchor.length();
+    while (open < source.length() && source.at(open).isSpace()) ++open;
+    if (open >= source.length() || source.at(open) != QLatin1Char('{')) return QString();
+    int depth = 0;
+    for (int i = open; i < source.length(); ++i)
+    {
+        if (source.at(i) == QLatin1Char('{')) ++depth;
+        else if (source.at(i) == QLatin1Char('}') && --depth == 0) return source.mid(open, i - open + 1);
+    }
+    return QString();
+}
+
+int countMatches(const QString & text, const QString & pattern)
+{
+    int count = 0;
+    QRegularExpressionMatchIterator it = QRegularExpression(pattern).globalMatch(text);
+    while (it.hasNext())
+    {
+        it.next();
+        ++count;
+    }
+    return count;
 }
 
 QString drawFrameBody()
@@ -101,6 +132,19 @@ TEST(Processed8TelemetryLiveness, DrawFrameMarksTheStageRanOnlyInsideTheProcesse
     const int p8SetAt = body.indexOf(QStringLiteral("renderThreadProcessed8StageRan = true;"));
     ASSERT_TRUE(p16SetAt > p16BranchAt && p16SetAt < d16BranchAt);
     ASSERT_TRUE(p8SetAt > p8BranchAt);
+
+    // Two-sided: each flag is set as the first statement of its own branch (comments
+    // aside), and nowhere else; the only other assignment is the false declaration.
+    ASSERT_TRUE(QRegularExpression(QStringLiteral(
+        "else if \\( outputMode == OutputProcessed16 && !slot\\.rawImage16\\.empty\\(\\) \\)\\s*\\{\\s*"
+        "(?://[^\\n]*\\s*)*renderThreadProcessed16StageRan = true;")).match(body).hasMatch());
+    ASSERT_TRUE(QRegularExpression(QStringLiteral(
+        "else if\\( !slot\\.rawImage8\\.empty\\(\\) \\)\\s*\\{\\s*"
+        "(?://[^\\n]*\\s*)*renderThreadProcessed8StageRan = true;")).match(body).hasMatch());
+    ASSERT_TRUE(body.contains(QStringLiteral("bool renderThreadProcessed8StageRan = false;")));
+    ASSERT_TRUE(body.contains(QStringLiteral("bool renderThreadProcessed16StageRan = false;")));
+    ASSERT_EQ(2, countMatches(body, QStringLiteral("renderThreadProcessed8StageRan\\s*(?:\\|=|&=|=(?!=))")));
+    ASSERT_EQ(2, countMatches(body, QStringLiteral("renderThreadProcessed16StageRan\\s*(?:\\|=|&=|=(?!=))")));
 }
 
 TEST(Processed8TelemetryLiveness, DrawFrameInsertsTheMeasuredFlags)
@@ -111,6 +155,28 @@ TEST(Processed8TelemetryLiveness, DrawFrameInsertsTheMeasuredFlags)
     ASSERT_TRUE(body.contains(QStringLiteral("QStringLiteral(\"processed16_stage_measured\")")));
 }
 
+TEST(Processed8TelemetryLiveness, DrawFrameMeasuredFlagsCarryTheStageRanState)
+{
+    // A constant (or any value other than the stage-ran flags) would tag every frame,
+    // including Debayered16 frames that never ran the stage, as measured.
+    const QString body = drawFrameBody();
+    ASSERT_FALSE(body.isEmpty());
+    ASSERT_TRUE(QRegularExpression(QStringLiteral(
+        "const bool processed8StageMeasured = renderThreadProcessed8StageRan;")).match(body).hasMatch());
+    ASSERT_TRUE(QRegularExpression(QStringLiteral(
+        "const bool processed16StageMeasured =\\s*"
+        "renderThreadProcessed8StageRan \\|\\| renderThreadProcessed16StageRan;")).match(body).hasMatch());
+    ASSERT_TRUE(QRegularExpression(QStringLiteral(
+        "insert\\(\\s*QStringLiteral\\(\"processed8_stage_measured\"\\),\\s*processed8StageMeasured\\s*\\);"))
+        .match(body).hasMatch());
+    ASSERT_TRUE(QRegularExpression(QStringLiteral(
+        "insert\\(\\s*QStringLiteral\\(\"processed16_stage_measured\"\\),\\s*processed16StageMeasured\\s*\\);"))
+        .match(body).hasMatch());
+    // Inserted once each, so no later insert can overwrite the flag.
+    ASSERT_EQ(1, body.count(QStringLiteral("QStringLiteral(\"processed8_stage_measured\")")));
+    ASSERT_EQ(1, body.count(QStringLiteral("QStringLiteral(\"processed16_stage_measured\")")));
+}
+
 TEST(Processed8TelemetryLiveness, PresentedFrameReadsTheMeasuredFlags)
 {
     const QString body = notePresentedFrameBody();
@@ -119,6 +185,54 @@ TEST(Processed8TelemetryLiveness, PresentedFrameReadsTheMeasuredFlags)
     ASSERT_TRUE(body.contains(QStringLiteral("telemetryBoolValue( timing, \"processed16_stage_measured\" )")));
     ASSERT_TRUE(body.contains(QStringLiteral("++m_playbackSmokeProcessed8MeasuredFrames;")));
     ASSERT_TRUE(body.contains(QStringLiteral("++m_playbackSmokeProcessed16MeasuredFrames;")));
+}
+
+TEST(Processed8TelemetryLiveness, PresentedFrameAccumulatesOnlyMeasuredFrames)
+{
+    // Each counter and sum the measured-only averages divide is updated exactly once, inside
+    // the block guarded by its measured flag; dropping the guard would add unmeasured 0.0 rows.
+    const QString body = notePresentedFrameBody();
+    ASSERT_FALSE(body.isEmpty());
+    const QString gated8 = bracedBlockAfter(body, QStringLiteral("if( processed8Measured )"));
+    const QString gated16 = bracedBlockAfter(body, QStringLiteral("if( processed16Measured )"));
+    ASSERT_FALSE(gated8.isEmpty());
+    ASSERT_FALSE(gated16.isEmpty());
+
+    const QStringList updates8 = {
+        QStringLiteral("++m_playbackSmokeProcessed8MeasuredFrames;"),
+        QStringLiteral("m_playbackSmokeProcessed8SumMs += processed8Ms;"),
+        QStringLiteral("m_playbackSmokeProcessed8CacheStoreSumMs += processed8CacheStoreMs;"),
+        QStringLiteral("m_playbackSmokeProcessed8SetupSumMs += processed8SetupMs;"),
+        QStringLiteral("m_playbackSmokeProcessed8CoreMathSumMs += processed8CoreMathMs;"),
+        QStringLiteral("m_playbackSmokeProcessed8LocalToneSumMs += processed8LocalToneMs;"),
+        QStringLiteral("m_playbackSmokeProcessed8ThreadingOverheadSumMs += processed8ThreadingOverheadMs;"),
+    };
+    const QStringList updates16 = {
+        QStringLiteral("++m_playbackSmokeProcessed16MeasuredFrames;"),
+        QStringLiteral("m_playbackSmokeProcessed16SetupSumMs += processed16SetupMs;"),
+        QStringLiteral("m_playbackSmokeProcessed16CoreMathSumMs += processed16CoreMathMs;"),
+        QStringLiteral("m_playbackSmokeProcessed16LocalToneSumMs += processed16LocalToneMs;"),
+        QStringLiteral("m_playbackSmokeProcessed16ThreadingOverheadSumMs += processed16ThreadingOverheadMs;"),
+    };
+    for (const QString & update : updates8)
+    {
+        ASSERT_EQ(1, gated8.count(update));
+        ASSERT_EQ(1, body.count(update));
+    }
+    for (const QString & update : updates16)
+    {
+        ASSERT_EQ(1, gated16.count(update));
+        ASSERT_EQ(1, body.count(update));
+    }
+    // No other write to these accumulators anywhere in the function.
+    ASSERT_EQ(7, countMatches(body, QStringLiteral(
+        "m_playbackSmokeProcessed8(?:MeasuredFrames|SumMs|CacheStoreSumMs|SetupSumMs|CoreMathSumMs"
+        "|LocalToneSumMs|ThreadingOverheadSumMs)\\s*(?:[-+*/]?=(?!=)|\\+\\+|--)"
+        "|(?:\\+\\+|--)\\s*m_playbackSmokeProcessed8MeasuredFrames")));
+    ASSERT_EQ(5, countMatches(body, QStringLiteral(
+        "m_playbackSmokeProcessed16(?:MeasuredFrames|SetupSumMs|CoreMathSumMs|LocalToneSumMs"
+        "|ThreadingOverheadSumMs)\\s*(?:[-+*/]?=(?!=)|\\+\\+|--)"
+        "|(?:\\+\\+|--)\\s*m_playbackSmokeProcessed16MeasuredFrames")));
 }
 
 TEST(Processed8TelemetryLiveness, FrameRowPrintsNaInsteadOfAStaleProcessed8Number)
@@ -137,6 +251,39 @@ TEST(Processed8TelemetryLiveness, FrameRowPrintsNaInsteadOfAStaleProcessed8Numbe
     ASSERT_TRUE(row.contains(QStringLiteral("processed16_measured=")));
 }
 
+TEST(Processed8TelemetryLiveness, FrameRowFormatsEachProcessedFieldThroughItsMeasuredFlag)
+{
+    const QString body = notePresentedFrameBody();
+    ASSERT_FALSE(body.isEmpty());
+    // The formatter prints "na" for an unmeasured stage; an always-numeric formatter would
+    // print the 0.0 the render thread inserts for a stage it did not run.
+    ASSERT_TRUE(QRegularExpression(QStringLiteral(
+        "const auto measuredMsText = \\[\\]\\( bool measured, double ms \\) -> QString\\s*\\{\\s*"
+        "return measured \\? QString::number\\( ms, 'f', 3 \\) : QStringLiteral\\(\"na\"\\);\\s*\\};"))
+        .match(body).hasMatch());
+    ASSERT_EQ(1, body.count(QStringLiteral("const auto measuredMsText")));
+
+    const QString row = body.mid(body.indexOf(QStringLiteral("playback_smoke.frame session=%1")));
+    const QStringList processed8Args = {
+        QStringLiteral("processed8Ms"), QStringLiteral("processed8SetupMs"),
+        QStringLiteral("processed8CoreMathMs"), QStringLiteral("processed8LocalToneMs"),
+        QStringLiteral("processed8ThreadingOverheadMs"),
+    };
+    const QStringList processed16Args = {
+        QStringLiteral("processed16SetupMs"), QStringLiteral("processed16CoreMathMs"),
+        QStringLiteral("processed16LocalToneMs"), QStringLiteral("processed16ThreadingOverheadMs"),
+    };
+    for (const QString & arg : processed8Args)
+    {
+        ASSERT_EQ(1, row.count(QStringLiteral(".arg( measuredMsText( processed8Measured, %1 ) )").arg(arg)));
+    }
+    for (const QString & arg : processed16Args)
+    {
+        ASSERT_EQ(1, row.count(QStringLiteral(".arg( measuredMsText( processed16Measured, %1 ) )").arg(arg)));
+    }
+    ASSERT_EQ(9, row.count(QStringLiteral("measuredMsText(")));
+}
+
 TEST(Processed8TelemetryLiveness, Processed8AveragesDivideByTheMeasuredFrameCount)
 {
     const QString body = finishSmokeBody();
@@ -149,6 +296,10 @@ TEST(Processed8TelemetryLiveness, Processed8AveragesDivideByTheMeasuredFrameCoun
     ASSERT_TRUE(body.contains(QStringLiteral("m_playbackSmokeProcessed8MeasuredFrames")));
     ASSERT_TRUE(body.contains(QStringLiteral("m_playbackSmokeProcessed16MeasuredFrames")));
     ASSERT_TRUE(body.contains(QStringLiteral("processed8_measured_frames=%5 processed16_measured_frames=%6")));
+    // With no measured frame the average prints "na", never 0.000.
+    ASSERT_TRUE(QRegularExpression(QStringLiteral(
+        "return measuredFrames > 0\\s*\\?\\s*QString::number\\( sum / static_cast<double>\\( measuredFrames \\), 'f', 3 \\)"
+        "\\s*:\\s*QStringLiteral\\(\"na\"\\);")).match(body).hasMatch());
 }
 
 TEST(Processed8TelemetryLiveness, MeasuredFrameCountersAreDeclaredAndResetPerSession)
