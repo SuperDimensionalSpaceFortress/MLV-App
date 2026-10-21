@@ -506,6 +506,10 @@ _autoconfigure()
 
 # ---------- git plumbing ----------
 
+# The bus clone is only read here, never written: a partial (promisor) clone must answer from what it holds and not fetch
+# a missing object from its remote mid-lookup. git reads this from 2.44; an older git ignores it.
+NO_LAZY_FETCH_ENV = {"GIT_NO_LAZY_FETCH": "1"}
+
 def _run_git(repo: pathlib.Path, args: list[str], input_text: str | None = None,
              extra_env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
@@ -544,20 +548,21 @@ def git_paths(repo: pathlib.Path, *args: str) -> list[str]:
     return [p for p in proc.stdout.split("\0") if p]
 
 
-def cat_file_blob(repo: pathlib.Path, ref: str, path: str) -> bytes:
+def cat_file_blob(repo: pathlib.Path, ref: str, path: str, extra_env: dict[str, str] | None = None) -> bytes:
     """The raw bytes of `path` at `ref`, or b"" if it does not exist there (a target
     missing at the tip counts as empty). A failed read is NOT absence: `git cat-file` exits 128 both
     for a missing path and for a bad ref, a non-blob or an unreadable object, so when it fails the
     path is looked up with `git ls-tree`, which exits 0 with no output only when `ref` is readable
     and carries no such path. Anything else raises Refusal TIP_BLOB_READ_FAILED, so a read failure
-    is never mistaken for an empty file."""
+    is never mistaken for an empty file. `extra_env` (opt-in, NO_LAZY_FETCH_ENV for a read-only bus) reaches both git calls;
+    None leaves the environment untouched."""
     proc = subprocess.run(
         ["git", "-C", str(repo), "cat-file", "blob", f"{ref}:{path}"],
-        capture_output=True, timeout=120,
+        capture_output=True, timeout=120, **({"env": {**os.environ, **extra_env}} if extra_env else {}),
     )
     if proc.returncode == 0:
         return proc.stdout
-    listing = _run_git(repo, ["ls-tree", "-z", "--name-only", ref, "--", path])
+    listing = _run_git(repo, ["ls-tree", "-z", "--name-only", ref, "--", path], extra_env=extra_env)
     if listing.returncode == 0 and not listing.stdout:
         return b""
     why = proc.stderr.decode("utf-8", errors="replace").strip() or listing.stderr.strip() or "the path is listed but did not read as a blob"
@@ -3919,7 +3924,7 @@ def _bus_tip(bus: pathlib.Path) -> str:
     """The bus clone's committed tip, resolved ONCE per item (`screen_ruling_candidate` calls it once): every target of that
     item is then read at this commit, so a writer that advances the clone mid-check cannot mix two snapshots into one
     verdict. Two items in one `validate` call each resolve their own."""
-    rc, out, _err = git_try(bus, "rev-parse", "--verify", "-q", "HEAD^{commit}")
+    rc, out, _err = git_try(bus, "rev-parse", "--verify", "-q", "HEAD^{commit}", extra_env=NO_LAZY_FETCH_ENV)
     if rc != 0 or not out:
         raise Unknown("RULING_BUS_UNREADABLE", f"{bus} is not a git clone with a committed tip; the touches/supersedes targets cannot be checked")
     return out
@@ -3928,7 +3933,7 @@ def _bus_tip(bus: pathlib.Path) -> str:
 def _bus_ruling_ids(bus: pathlib.Path, tip: str) -> str:
     """RULINGS.md at `tip` (empty when the tip has none: no rule id is then on the bus). A read failure is UNKNOWN."""
     try:
-        return cat_file_blob(bus, tip, RULINGS_FILE).decode("utf-8", errors="replace")
+        return cat_file_blob(bus, tip, RULINGS_FILE, extra_env=NO_LAZY_FETCH_ENV).decode("utf-8", errors="replace")
     except Refusal as e:
         if e.code != "TIP_BLOB_READ_FAILED":
             raise
@@ -3942,7 +3947,7 @@ def _bus_has_path(bus: pathlib.Path, tip: str, path: str) -> bool:
     parent tree's entry, so the blob or subtree it names is read as well (`cat-file -e`, with no lazy fetch: the bus is
     never written); an entry that lists but does not read is UNKNOWN too. A gitlink names a commit of another
     repository, which this object store need not hold, so it is not read."""
-    proc = _run_git(bus, ["ls-tree", "-z", tip, "--", path])
+    proc = _run_git(bus, ["ls-tree", "-z", tip, "--", path], extra_env=NO_LAZY_FETCH_ENV)
     if proc.returncode != 0:
         raise Unknown("RULING_BUS_OBJECT_UNREADABLE", f"{tip[:12]}:{path}: {proc.stderr.strip()[:300]}")
     for entry in proc.stdout.split("\0"):
@@ -3954,7 +3959,7 @@ def _bus_has_path(bus: pathlib.Path, tip: str, path: str) -> bool:
             raise Unknown("RULING_BUS_OBJECT_UNREADABLE", f"{tip[:12]}:{path}: unexpected ls-tree entry {entry[:120]!r}")
         _mode, kind, oid = fields
         if kind != "commit":
-            read = _run_git(bus, ["cat-file", "-e", oid], extra_env={"GIT_NO_LAZY_FETCH": "1"})
+            read = _run_git(bus, ["cat-file", "-e", oid], extra_env=NO_LAZY_FETCH_ENV)
             if read.returncode != 0:
                 raise Unknown("RULING_BUS_OBJECT_UNREADABLE",
                               f"{tip[:12]}:{path}: listed as {kind} {oid[:12]}, but the object does not read: {read.stderr.strip()[:300] or 'missing'}")
