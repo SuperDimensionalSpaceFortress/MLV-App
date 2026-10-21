@@ -541,6 +541,7 @@
    "tools.repo_hygiene.test_wmi_create_hidden_guard.WmiCreateHiddenGuardR2Tests": 2.0,
    "tools.repo_hygiene.test_wmi_create_hidden_guard.WmiCreateHiddenGuardR4Tests": 2.0,
    "tools.repo_hygiene.test_wmi_create_hidden_guard.WmiCreateHiddenGuardR5Tests": 2.0,
+   "tools.repo_hygiene.test_wmi_create_hidden_guard.WmiCreateHiddenGuardR6Tests": 2.0,
    "tools.repo_hygiene.test_wmi_create_hidden_guard.WmiCreateHiddenGuardTests": 2.0,
    "tools.repo_hygiene.test_workflow_pwsh_exit_guard.WorkflowPwshExitGuardTests": 0.0
   },
@@ -1084,6 +1085,7 @@
    "tools.repo_hygiene.test_wmi_create_hidden_guard.WmiCreateHiddenGuardR2Tests": 2.0,
    "tools.repo_hygiene.test_wmi_create_hidden_guard.WmiCreateHiddenGuardR4Tests": 2.0,
    "tools.repo_hygiene.test_wmi_create_hidden_guard.WmiCreateHiddenGuardR5Tests": 2.0,
+   "tools.repo_hygiene.test_wmi_create_hidden_guard.WmiCreateHiddenGuardR6Tests": 2.0,
    "tools.repo_hygiene.test_wmi_create_hidden_guard.WmiCreateHiddenGuardTests": 2.0,
    "tools.repo_hygiene.test_workflow_pwsh_exit_guard.WorkflowPwshExitGuardTests": 0.2
   }

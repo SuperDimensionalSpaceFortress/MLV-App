@@ -59,10 +59,10 @@ _CREATE = re.compile(r"(?i)\bCreate\b")
 _CALL = re.compile(r"(?i)Invoke-(Cim|Wmi)Method|\[wmiclass\]|\.Create\(")
 _SHOW = re.compile(r"(?i)ShowWindow")
 _COMMENT = re.compile(r"(^|\s)#.*$")
-_HEREDOC = re.compile(r"""<<-?[ \t]*(?:(['"])([^'"\n]+)\1|(\\?)([A-Za-z_]\w*))""")  # a quote or a backslash makes the body literal
+_HEREDOC_META = ";&|<>()"  # an unquoted one of these ends a heredoc delimiter word, as whitespace does
 _QUOTED = re.compile(r"\"[^\"]*\"|'[^']*'")
 _HEAD = re.compile(r"\"([^\"]*)\"\s*|'([^']*)'\s*|(\S+)\s*")
-_HEREDOC_SUBST = re.compile(r"""\$\(\s*cat\s+<<-?[ \t]*(?:(['"])([^'"\n]+)\1|\\([A-Za-z_]\w*))""")  # quoted delimiters only
+_SUBST_CAT = re.compile(r"\$\(\s*cat\s+(?=<<)")  # the head of the commit-message idiom; _heredoc_opener reads the delimiter
 _CALL_OP = re.compile(r"""(?:&|\.)(?=['"])|&(?=[^\s&>|;])""")  # call operator or dot-source glued to the command word
 _FD_DUP = re.compile(r">&[ \t]*(?:\d+-?|-)(?=[\s;&|)]|$)")
 _NULL_TARGET = re.compile(r">>?[ \t]*(?:/dev/null|\$null|nul)(?![\w./\\-])", re.I)
@@ -109,11 +109,67 @@ def _writes_file(text, i):
     return True
 
 
+def _heredoc_opener(text, i):
+    """Read the heredoc operator at text[i] (<< or <<-) as bash does: (tag, literal, strip_tabs, end), or None.
+
+    The delimiter word runs to unquoted whitespace or an unquoted ; & | < > ( ), so punctuation stays in the word.
+    Quote removal gives the tag, and any quoted part ('x', "x", \\x) makes the body literal. None for a here-string,
+    a missing word, or a quote left open (the caller then treats the text as ordinary command text).
+    """
+    n = len(text)
+    j = i + 2
+    if text.startswith("<", j):
+        return None
+    strip = text.startswith("-", j)
+    j += strip
+    while j < n and text[j] in " \t":
+        j += 1
+    tag, literal = [], False
+    while j < n and text[j] not in " \t\n" and text[j] not in _HEREDOC_META:
+        ch = text[j]
+        if ch == "'":
+            k = text.find("'", j + 1)
+            if k < 0:
+                return None
+            tag.append(text[j + 1:k])
+            literal, j = True, k + 1
+        elif ch == '"':
+            k, part = j + 1, []
+            while k < n and text[k] != '"':
+                if text[k] == "\\" and k + 1 < n and text[k + 1] in '"\\$`':
+                    k += 1
+                part.append(text[k])
+                k += 1
+            if k >= n:
+                return None
+            tag.append("".join(part))
+            literal, j = True, k + 1
+        elif ch == "\\":
+            if j + 1 >= n or text[j + 1] == "\n":
+                return None
+            tag.append(text[j + 1])
+            literal, j = True, j + 2
+        else:
+            tag.append(ch)
+            j += 1
+    if not tag:
+        return None
+    return "".join(tag), literal, strip, j
+
+
+def _heredoc_end(text, pos, tag, strip):
+    """Index just past the terminator line of the heredoc whose body starts at pos, or -1: the exact line, with leading tabs only for <<-."""
+    m = re.compile(r"(?m)^%s%s$" % ("\t*" if strip else "", re.escape(tag))).search(text, pos)
+    return m.end() if m else -1
+
+
 def split_shell(text):
     """Split on ; & && | || and newlines outside quotes. Rows are [segment, separator_after, forces_code].
 
     forces_code is set by a file redirect or by an unquoted heredoc body holding a backtick substitution.
-    A heredoc body stays in the segment that opened it. Returns None when a quote is left open.
+    A heredoc body belongs to the segment whose command line opened it, whatever segments follow on that line,
+    and several heredocs on one line are read in order. The delimiter word is bash's (see _heredoc_opener).
+    Returns None when a quote is left open or a heredoc has no terminator line.
     """
     rows, cur, quote, heredocs = [], [], None, []
     redirect = False
@@ -136,23 +192,34 @@ def split_shell(text):
                 quote = None
             i += 1
             continue
-        if text.startswith("<<", i) and not text.startswith("<<<", i):
-            m = _HEREDOC.match(text, i)
-            if m:
-                heredocs.append((m.group(2) or m.group(4), bool(m.group(1) or m.group(3))))
-                cur.append(m.group(0))
-                i = m.end()
+        if text.startswith("<<<", i):  # a here-string, not a heredoc
+            cur.append("<<<")
+            i += 3
+            continue
+        if text.startswith("<<", i):
+            op = _heredoc_opener(text, i)
+            if op:
+                tag, literal, strip, end = op
+                heredocs.append((tag, literal, strip, len(rows)))
+                cur.append(text[i:end])
+                i = end
                 continue
         if ch in "'\"":
             quote = ch
         elif ch == "\n":
             if heredocs:
-                tag, literal = heredocs.pop(0)
-                m = re.search(r"(?m)^[ \t]*%s[ \t]*$" % re.escape(tag), text[i + 1:])
-                end = i + 1 + m.end() if m else n
-                if not literal and "`" in text[i:end]:
-                    redirect = True  # an unquoted heredoc body expands backtick substitutions, so the segment is code
-                cur.append(text[i:end])
+                tag, literal, strip, owner = heredocs.pop(0)
+                end = _heredoc_end(text, i + 1, tag, strip)
+                if end < 0:
+                    return None  # no terminator line: fail closed, no exemption for anything after the opener
+                body = text[i:end]
+                code = not literal and "`" in body  # an unquoted heredoc body expands backtick substitutions, so the segment is code
+                if owner < len(rows):  # the opener's segment was cut already: the body is still its own
+                    rows[owner][0] += body
+                    rows[owner][2] = rows[owner][2] or code
+                else:
+                    cur.append(body)
+                    redirect = redirect or code
                 i = end
                 continue
             cut("\n")
@@ -182,7 +249,7 @@ def split_shell(text):
                 redirect = True
         cur.append(ch)
         i += 1
-    if quote:
+    if quote or heredocs:
         return None
     cut("")
     return rows
@@ -228,13 +295,15 @@ def _without_commit_heredocs(segment):
 
     An unquoted delimiter expands its body, so that substitution is not removed and stays visible."""
     while True:
-        m = _HEREDOC_SUBST.search(segment)
+        m = _SUBST_CAT.search(segment)
         if not m:
             return segment
-        end = re.search(r"(?m)^[ \t]*%s[ \t]*$" % re.escape(m.group(2) or m.group(3)), segment[m.end():])
-        tail = segment[m.end() + end.end():].lstrip() if end else ""
+        op = _heredoc_opener(segment, m.end())
+        nl = segment.find("\n", op[3]) if op and op[1] else -1
+        end = _heredoc_end(segment, nl + 1, op[0], op[2]) if nl >= 0 and not segment[op[3]:nl].strip() else -1
+        tail = segment[end:].lstrip() if end >= 0 else ""
         if not tail.startswith(")"):
-            return segment  # unterminated: not the idiom, so its dollar-paren stays visible
+            return segment  # unquoted, redirected, or unterminated: not the idiom, so its dollar-paren stays visible
         segment = segment[:m.start()] + tail[1:]
 
 

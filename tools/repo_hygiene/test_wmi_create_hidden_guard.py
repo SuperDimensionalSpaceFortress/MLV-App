@@ -332,5 +332,147 @@ class WmiCreateHiddenGuardR5Tests(unittest.TestCase):
         self.assertIsNone(GUARD.decide(bash(COMMIT_HEREDOC % ("Guard " + FORM))))
 
 
+# r6 (PR #547, opus r5 H1 and sol r5 H2): the heredoc reader is one grammar, not a list of spellings.
+#   * the delimiter word is bash's: up to unquoted whitespace or ; & | < > ( ) with quote removal; any quoted part makes the body literal
+#   * the body belongs to the segment whose command line opened it, whatever segments follow on that line
+#   * a terminator is the exact line (leading tabs allowed only for <<-); a heredoc with no terminator fails closed like an open quote
+LITERAL_WORDS = ("'EOF'", '"EOF"', "\\EOF", 'E"OF"', "E'OF'", "EO\\F", "'E''OF'", '"E"OF', "E\\OF", "'E'\"O\"F")
+PUNCT_TAGS = ("END-MESSAGE", "EOF.1", "EOF/END", "EOF_1", "END:X", "END+X", "1EOF", "a.b-c_d", "E-", "EOF=1", "EOF,1", "END!", "{END}", "EOF@x")
+OPENER_WRITERS = ("cat > run.ps1", "cat >> run.ps1", "cat >| run.ps1", "tee run.ps1", "tee -a run.ps1")
+OPENER_SEPS = ("&&", ";", "||", "|", "&")
+DATA_FOLLOWERS = ("cat run.ps1", "echo ok", "grep -n x run.ps1", "ls")
+
+
+def grammar_rows():
+    """(spelling, expected_deny, command) for the heredoc grammar: opener ownership, delimiter words, terminators, unterminated bodies."""
+    launch = 'pwsh -NoProfile -Command "%s"' % UNHIDDEN_ARGS
+    tick = "`pwsh -NoProfile -Command '%s'`" % UNHIDDEN_ARGS
+    prose = "Guard " + FORM
+    # H1: the body is the opener's, whichever data command follows it on the opener line
+    for writer in OPENER_WRITERS:
+        for sep in OPENER_SEPS:
+            for follower in DATA_FOLLOWERS:
+                for word in ("'EOF'", "EOF"):
+                    yield "H1 %s <<%s %s %s" % (writer, word, sep, follower), True, "%s <<%s %s %s\n%s\nEOF" % (writer, word, sep, follower, UNHIDDEN_ARGS)
+    for sep in OPENER_SEPS:
+        for follower in DATA_FOLLOWERS:
+            yield "H1 data opener %s %s, prose body" % (sep, follower), False, "cat <<'EOF' %s %s\n%s\nEOF" % (sep, follower, prose)
+            yield "H1 interpreter opener %s %s" % (sep, follower), True, "pwsh -NoProfile -Command - <<'EOF' %s %s\n%s\nEOF" % (sep, follower, UNHIDDEN_ARGS)
+    # the body is not the follower's: a code segment after a data opener does not read it, but a pipe into an interpreter does
+    for sep in ("&&", ";", "||", "&"):
+        yield "H1 data opener %s code follower, prose body" % sep, False, "cat <<'EOF' %s pwsh -NoProfile -File run.ps1\n%s\nEOF" % (sep, prose)
+    yield "H1 data opener | interpreter, prose body", True, "cat <<'EOF' | pwsh -NoProfile -Command -\n%s\nEOF" % prose
+    yield "H1 data opener ; hidden launch on the opener line", True, "cat <<'EOF'; %s\nmessage\nEOF" % launch
+    # several heredocs on one line are read in order, each owned by its own opener
+    yield "MULTI data then writer", True, "cat <<'A' && cat > run.ps1 <<'B'\n%s\nA\n%s\nB" % (prose, UNHIDDEN_ARGS)
+    yield "MULTI writer then data", True, "cat > run.ps1 <<'A' && cat <<'B'\n%s\nA\n%s\nB" % (UNHIDDEN_ARGS, prose)
+    yield "MULTI data and data", False, "cat <<'A' && cat <<'B'\n%s\nA\n%s\nB" % (prose, prose)
+    yield "MULTI one command two heredocs", False, "cat <<'A' <<'B'\n%s\nA\n%s\nB" % (prose, prose)
+    yield "MULTI one command, second body substitution", True, "cat <<'A' <<'B'\n%s\nA\n$(%s)\nB" % (prose, launch)
+    yield "MULTI second unterminated", True, "cat <<'A' <<'B'\n%s\nA\n%s" % (prose, prose)
+    yield "MULTI launch after both", True, "cat <<'A' <<'B'\nx\nA\ny\nB\n%s" % launch
+    # H2: the delimiter word keeps its punctuation, quoted or not
+    for tag in PUNCT_TAGS:
+        for quote in ("", "'", '"'):
+            word = quote + tag + quote
+            yield "H2 <<%s launch after terminator" % word, True, "cat <<%s\nmessage\n%s\n%s" % (word, tag, launch)
+            yield "H2 <<%s backtick body" % word, not quote, "cat <<%s\n%s\n%s" % (word, tick, tag)
+            yield "H2 <<%s prose body" % word, False, "cat <<%s\n%s\n%s" % (word, prose, tag)
+            yield "H2 <<%s wrong terminator fails closed" % word, True, "cat <<%s\n%s\n%sX" % (word, prose, tag)
+    # quote removal: any quoted part makes the body literal, whatever the spelling
+    for word in LITERAL_WORDS:
+        yield "WORD <<%s launch after terminator" % word, True, "cat <<%s\nmessage\nEOF\n%s" % (word, launch)
+        yield "WORD <<%s backtick body is literal" % word, False, "cat <<%s\n%s\nEOF" % (word, tick)
+        yield "WORD <<%s prose body" % word, False, "cat <<%s\n%s\nEOF" % (word, prose)
+        yield "WORD <<%s unterminated" % word, True, "cat <<%s\n%s\nEND" % (word, prose)
+        yield "WORD <<-%s tab-indented terminator" % word, False, "cat <<-%s\n\t%s\n\tEOF" % (word, prose)
+        if '"' not in word:  # a double quote in the delimiter cannot sit inside the double-quoted commit message
+            yield "WORD commit idiom with %s" % word, False, "git commit -m \"$(cat <<%s\n%s\nEOF\n)\"" % (word, prose)
+    # the word ends at an unquoted metacharacter
+    yield "WORD <<EOF>out redirect", True, "cat <<EOF>out.ps1\n%s\nEOF" % UNHIDDEN_ARGS
+    yield "WORD <<EOF|interpreter", True, "cat <<EOF|pwsh -NoProfile -Command -\n%s\nEOF" % UNHIDDEN_ARGS
+    yield "WORD <<EOF&& data", False, "cat <<EOF&& cat x\n%s\nEOF" % prose
+    yield "WORD <<EOF; launch", True, "cat <<EOF; %s\nx\nEOF" % launch
+    yield "WORD <<'E OF' (a space inside quotes)", True, "cat <<'E OF'\nx\nE OF\n%s" % launch
+    yield "WORD <<EOF with no space before it", True, "cat<<EOF\nx\nEOF\n%s" % launch
+    # terminators: the exact line; <<- strips leading tabs only
+    yield "TERM <<- tab-indented", False, "cat <<-'EOF'\n\t%s\n\tEOF" % prose
+    yield "TERM <<- tab-indented, launch after", True, "cat <<-EOF\n\tx\n\tEOF\n%s" % launch
+    yield "TERM <<- two tabs", False, "cat <<-'EOF'\n\t\t%s\n\t\tEOF" % prose
+    yield "TERM <<- space-indented is not a terminator", True, "cat <<-'EOF'\n%s\n    EOF" % prose
+    yield "TERM << tab-indented is not a terminator", True, "cat <<'EOF'\n%s\n\tEOF" % prose
+    yield "TERM << space-indented is not a terminator", True, "cat <<'EOF'\n%s\n EOF" % prose
+    yield "TERM trailing space is not a terminator", True, "cat <<'EOF'\n%s\nEOF " % prose
+    yield "TERM trailing space, later real terminator", False, "cat <<'EOF'\n%s\nEOF \nmore\nEOF" % prose
+    yield "TERM trailing tab is not a terminator", True, "cat <<'EOF'\n%s\nEOF\t" % prose
+    yield "TERM terminator is a prefix of a longer line", True, "cat <<'EOF'\n%s\nEOFX" % prose
+    yield "TERM <<- strips a tab but not the tag", True, "cat <<-'EOF'\n%s\n\tEOFX" % prose
+    yield "TERM terminator on the last line, no newline", False, "cat <<'EOF'\n%s\nEOF" % prose
+    yield "TERM terminator then newline then launch", True, "cat <<'EOF'\n%s\nEOF\n%s" % (prose, launch)
+    yield "TERM empty quoted delimiter ends at an empty line", False, "cat <<''\n%s\n\n" % prose
+    # fail closed: no terminator line means no exemption for anything after the opener
+    yield "OPEN no terminator, prose body", True, "cat <<'EOF'\n%s" % prose
+    yield "OPEN no terminator, launch after", True, "cat <<EOF\nmessage\n%s" % launch
+    yield "OPEN opener with no body at all", True, "cat <<'EOF' %s" % prose
+    yield "OPEN first terminated, second not", True, "cat <<'A'; cat <<'B'\n%s\nA\n%s" % (prose, prose)
+    yield "OPEN unquoted unterminated, data command swallowing", True, "echo \"%s\"; cat <<EOF\nx" % UNHIDDEN_ARGS
+    # the quoted-delimiter commit idiom stays data, with the same grammar
+    yield "KEEP commit idiom", False, COMMIT_HEREDOC % prose
+    yield "KEEP commit idiom <<-", False, "git commit -m \"$(cat <<-'EOF'\n\t%s\n\tEOF\n)\"" % prose
+    yield "KEEP commit idiom punctuated tag", False, "git commit -m \"$(cat <<'END-MESSAGE'\n%s\nEND-MESSAGE\n)\"" % prose
+    yield "KEEP commit idiom, wrong terminator is not the idiom", True, "git commit -m \"$(cat <<'END-MESSAGE'\n%s\nEND\n)\"" % prose
+    yield "KEEP commit idiom, trailing-space terminator is not the idiom", True, "git commit -m \"$(cat <<'EOF'\n%s\nEOF \n)\"" % prose
+    yield "KEEP commit idiom, unquoted punctuated tag is scanned", True, "git commit -m \"$(cat <<END-MSG\n%s\nEND-MSG\n)\"" % prose
+    yield "KEEP commit idiom, redirect on the opener line", True, "git commit -m \"$(cat <<'EOF' > run.ps1\n%s\nEOF\n)\"" % UNHIDDEN_ARGS
+    yield "KEEP here-string is not a heredoc", False, "cat <<< \"%s\"" % prose
+    yield "KEEP here-string then launch", True, "cat <<< x; %s" % launch
+    yield "KEEP no heredoc at all", False, "echo \"%s\"" % prose
+
+
+class WmiCreateHiddenGuardR6Tests(unittest.TestCase):
+    def _verdicts(self, command):
+        return (GUARD.decide(bash(command)) is not None, GUARD.decide(ps(command)) is not None)
+
+    def test_h1_repro_and_the_body_belongs_to_the_opener(self):
+        # opus r5 H-16 verbatim: the writer's content was judged as the data command's.
+        repro = "cat > run.ps1 <<'EOF' && cat run.ps1\n%s\nEOF" % UNHIDDEN_ARGS
+        self.assertIsNotNone(GUARD.decide(bash(repro)))
+        self.assertIsNotNone(GUARD.decide(bash(repro.replace("&& cat run.ps1", "; echo ok"))))
+        self.assertIsNotNone(GUARD.decide(bash("tee run.ps1 <<'EOF' >/dev/null && echo ok\n%s\nEOF" % UNHIDDEN_ARGS)))
+        # the segment that opened the heredoc holds its body; the follower on the same line does not
+        rows = GUARD.split_shell(repro)
+        self.assertIn(UNHIDDEN_ARGS, rows[0][0])
+        self.assertNotIn(UNHIDDEN_ARGS, rows[1][0])
+        rows = GUARD.split_shell("cat <<'A' && cat > run.ps1 <<'B'\nfirst\nA\nsecond\nB")
+        self.assertIn("first", rows[0][0])
+        self.assertNotIn("second", rows[0][0])
+        self.assertIn("second", rows[1][0])
+        # prose held by a data opener is allowed whatever follows on its line
+        self.assertIsNone(GUARD.decide(bash("cat <<'EOF'; echo ok\nGuard %s\nEOF" % FORM)))
+
+    def test_h2_repro_a_punctuated_delimiter_is_one_word(self):
+        # sol r5 verbatim: END-MESSAGE was cut to END, the terminator was never found and the pwsh line was swallowed.
+        launch = 'pwsh -NoProfile -Command "%s"' % UNHIDDEN_ARGS
+        repro = "cat <<END-MESSAGE\nmessage\nEND-MESSAGE\n%s" % launch
+        self.assertEqual((True, True), self._verdicts(repro))
+        for tag in ("EOF.1", "EOF/END", "EOF_1"):
+            self.assertEqual((True, True), self._verdicts("cat <<%s\nmessage\n%s\n%s" % (tag, tag, launch)), tag)
+        rows = GUARD.split_shell(repro)
+        self.assertEqual(["cat <<END-MESSAGE\nmessage\nEND-MESSAGE", launch], [r[0] for r in rows if r[0]])
+
+    def test_unterminated_heredoc_fails_closed_like_an_open_quote(self):
+        for command in ("cat <<'EOF'\nGuard %s" % FORM, "cat <<EOF\nGuard %s\nEOF \n" % FORM, "cat <<'EOF' Guard %s" % FORM):
+            self.assertIsNone(GUARD.split_shell(command), command)
+            self.assertEqual(command, GUARD.code_view(command))
+            self.assertEqual((True, True), self._verdicts(command.replace("Guard " + FORM, UNHIDDEN_ARGS)), command)
+        self.assertIsNotNone(GUARD.split_shell("cat <<'EOF'\nx\nEOF"))
+
+    def test_heredoc_grammar_table(self):
+        rows = list(grammar_rows())
+        self.assertGreater(len(rows), 450)
+        for spelling, deny, command in rows:
+            self.assertEqual((deny, deny), self._verdicts(command), "%s: %r" % (spelling, command))
+
+
 if __name__ == "__main__":
     unittest.main()
