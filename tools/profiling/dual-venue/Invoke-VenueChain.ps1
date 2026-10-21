@@ -37,10 +37,16 @@
 #      cache (the chain stages and builds nothing); the venue's claim taken (one shot, never waited on) and, UNDER it before any work, still no live ticket (else YIELDED_TO_TICKET:
 #      released at once, so a waiter that queued meanwhile is served first); one quiet probe (-MaxWaitSec 0) QUIET or COOLDOWN_UNMET. Anything else is one typed
 #      `SUPPLEMENTARY_SKIPPED leg=<n> trigger=<t> reason=<R>` line (NO_SUPPLEMENTARY_CRITERIA, BACKEND_NOT_IN_SPEC, SPEC_UNREADABLE, CHAIN_STOPPED, DEADLINE_NEAR, UM_BUSY, YIELDED_TO_TICKET, UM_NOT_QUIET,
-#      UM_SHARE_UNREACHABLE, UM_SHARE_UNKNOWN, BUILD_NOT_STAGED, SUPPLEMENTARY_ERROR) and the chain goes on. A run writes `LEG <n> SUPPLEMENTARY_RUN` then SUPPLEMENTARY_RAN | SUPPLEMENTARY_FAILED |
+#      UM_SHARE_UNREACHABLE, UM_SHARE_UNKNOWN, UM_REMOTE_JOB_UNRESOLVED, BUILD_NOT_STAGED, SUPPLEMENTARY_ERROR) and the chain goes on. A run writes `LEG <n> SUPPLEMENTARY_RUN` then SUPPLEMENTARY_RAN | SUPPLEMENTARY_FAILED |
 #      SUPPLEMENTARY_TIMEOUT, each with `venue=ultra-magnus role=supplementary`, its own receipt (Invoke-VenueLeg) and leg-<n>-ultra-magnus-supplementary.out.txt. It is a bounded child
 #      (-SupplementaryMaxSec, 1800, and never past the chain deadline). A supplementary result lives ONLY in CHAIN_RESULT's `supplementary` list: it is never in `legs`, never in ran / failed /
 #      notRun, never moves exitCode, the streak rule or a verdict, and an exception in it is a typed skip, never a chain failure. The ultra-magnus build is hashed from ITS cache.
+#      REMOTE JOB IDENTITY (VENUE-UM-SUPP-REMOTE-IDENTITY-AND-CACHE-BOUND-1): killing a timed-out client does not stop a remote job it already submitted, and the claim the chain then releases says
+#      nothing about that job. The ids the client printed (`DVE_JOB_ID=<id>` lines of its stdout, see Get-VenueRemoteJobIds) go on the TIMEOUT entry (remoteJobIds, remoteJobState, venueIdle) and in
+#      one `SUPPLEMENTARY_REMOTE_JOB` line, and are reconciled with named reads of <share>\outbox\<id>.result.json (Get-VenueRemoteJobState): FINISHED (every result landed) is the only idle answer.
+#      NOT_FINISHED, or UNKNOWN (no id printed, an unusable id, the share silent) keeps the venue busy for the rest of the chain: every later offer is `SUPPLEMENTARY_SKIPPED ... reason=UM_REMOTE_JOB_UNRESOLVED
+#      detail=jobId=<ids> ...` (never a run, never silently idle) until the result lands (`SUPPLEMENTARY_REMOTE_JOB_RECONCILED`). The cache read behind BUILD_NOT_STAGED / UM_SHARE_UNREACHABLE is bounded by
+#      its 30 s -TimeoutSec: a read that does not answer is abandoned, never joined or disposed.
 #
 #   pwsh -NoProfile -File tools\profiling\dual-venue\Invoke-VenueChain.ps1 -Venue bachelor -LegSet display-matrix -Backend cpu -RunDir <rd> `
 #       -SourceCommit <40-hex> -BuildManifestSha256 <64-hex> [-PreferQuietWindows] [-OnUnknown Continue] [-DeadlineUtc <iso>]
@@ -55,7 +61,7 @@
 # VENUE-CHAIN-STREAK-DETAIL-NORMALISE-1: the leading reason token, else the text with every number replaced by #, so 'freeDiskGiB 42.4 < 50' and '41.9 < 50' are one fault),
 # or the first one carried an owner-only detail token; the rest are NOT_RUN VENUE_UNHEALTHY_STREAK. 8 replaces 0 or 7 (it stops the chain, 7 does not); codes 2-6 above are kept.
 # -UnhealthyStreakStop 0 switches off the COUNT rule only: the owner-only first-occurrence stop applies whatever N is.
-# -QuietScript / -LegScript / -ClaimDir / -NowUtc / -SupplementaryAgentShare are seams for the offline tests (tools/repo_hygiene/test_venue_chain_runner.py); production passes none.
+# -QuietScript / -LegScript / -ClaimDir / -NowUtc / -SupplementaryAgentShare / -TestSupplementaryCapSec (a bound under 60 s for the supplementary child) are seams for the offline tests (tools/repo_hygiene/test_venue_chain_runner.py); production passes none.
 [CmdletBinding(DefaultParameterSetName = 'Chain')]
 param(
     [ValidateSet('bachelor', 'ultra-magnus')][string]$Venue = 'bachelor',
@@ -85,6 +91,7 @@ param(
     [Parameter(ParameterSetName = 'Chain')][ValidateRange(0, 86400)][int]$SupplementaryHeldSec = 1800,
     [Parameter(ParameterSetName = 'Chain')][ValidateRange(60, 14400)][int]$SupplementaryMaxSec = 1800,
     [Parameter(ParameterSetName = 'Chain')][string]$SupplementaryAgentShare = '',
+    [Parameter(ParameterSetName = 'Chain')][ValidateRange(0, 600)][int]$TestSupplementaryCapSec = 0,
     [Parameter(ParameterSetName = 'Chain')][string]$ChainLog = '',
     [Parameter(ParameterSetName = 'Chain')][switch]$PreferQuietWindows,
     [Parameter(ParameterSetName = 'Chain')][ValidateRange(0, 50)][int]$UnhealthyStreakStop = 3,
@@ -286,12 +293,17 @@ $suppState = @{}               # leg name -> @{ done; nextUtc }: offered until a
 $suppRetrySec = 300
 $suppProbeAdmissionSec = 120
 $suppProbeStaleSec = Get-VenueTicketProbeStaleSec -QuietMaxWaitSec 0 -AdmissionWaitSec $suppProbeAdmissionSec -MarginSec $ticketPollStaleSec
+# A supplementary client killed at its timeout may have SUBMITTED a remote job that keeps running on ultra-magnus: that job, not the (released) claim, decides whether the venue is idle.
+# $null, or @{ leg; jobIds; state } while the killed client's jobs are not all proven finished; every later offer must reconcile it first (header item 6).
+$script:suppRemote = $null
 
 function Add-SuppResult([object]$Leg, [string]$Trigger, [string]$Status, [hashtable]$Extra) {
     $r = [ordered]@{ name = $Leg.name; spec = $Leg.spec; backend = $Leg.backend; venue = $suppVenue; role = 'supplementary'; trigger = $Trigger; status = $Status }
     foreach ($k in $Extra.Keys) { $r[$k] = $Extra[$k] }
     $suppResults.Add([pscustomobject]$r)
 }
+
+function Format-RemoteJobIds($Ids) { $v = @($Ids | ForEach-Object { if ($_) { $_ } else { 'UNUSABLE' } }); if ($v.Count -gt 0) { $v -join ',' } else { 'UNKNOWN' } }
 
 function Write-SuppSkip([object]$Leg, [string]$Trigger, [string]$Reason, [string]$Detail, [bool]$Final) {
     Add-SuppResult $Leg $Trigger 'SKIPPED' @{ reason = $Reason; detail = $Detail }
@@ -315,6 +327,14 @@ function Invoke-SupplementaryCore([object]$Leg, [string]$Trigger) {
     $share = $SupplementaryAgentShare
     if (-not $share) { $share = try { [string](([IO.File]::ReadAllText((Join-Path $here 'venues.json')) | ConvertFrom-Json).venues.$suppVenue.agentShare) } catch { '' } }
     if (-not $share) { Write-SuppSkip $Leg $Trigger 'UM_SHARE_UNKNOWN' 'venues.json names no ultra-magnus agentShare' $true; return }
+    if ($null -ne $script:suppRemote) {
+        # A released claim is not proof the venue is idle: the client of an earlier supplementary leg was killed with remote jobs it had submitted. Reconcile them (named, bounded reads) before any offer.
+        $rem = $script:suppRemote
+        $rs = Get-VenueRemoteJobState -AgentShare $share -JobId $rem.jobIds -TimeoutSec 30
+        if ($rs.state -cne 'FINISHED') { Write-SuppSkip $Leg $Trigger 'UM_REMOTE_JOB_UNRESOLVED' "jobId=$(Format-RemoteJobIds $rem.jobIds) state=$($rs.state) from leg=$($rem.leg) (a released claim is not proof ultra-magnus is idle)" $false; return }
+        L "SUPPLEMENTARY_REMOTE_JOB_RECONCILED leg=$($Leg.name) jobId=$(Format-RemoteJobIds $rem.jobIds) state=FINISHED from leg=$($rem.leg) venue=$suppVenue role=supplementary"
+        $script:suppRemote = $null
+    }
     $built = Get-VenueStagedBuildManifest -AgentShare $share -SourceCommit $SourceCommit -TimeoutSec 30
     if ($built.state -ceq 'UNREACHABLE') { Write-SuppSkip $Leg $Trigger 'UM_SHARE_UNREACHABLE' "$($built.error)" $false; return }
     if ($built.state -ceq 'NOT_STAGED') { Write-SuppSkip $Leg $Trigger 'BUILD_NOT_STAGED' "no staged build manifest for $($SourceCommit.Substring(0, 12)) at $($built.path); the chain stages and builds nothing" $true; return }
@@ -333,7 +353,8 @@ function Invoke-SupplementaryCore([object]$Leg, [string]$Trigger) {
         L "SUPPLEMENTARY_PROBE leg=$($Leg.name) venue=$suppVenue exit=$($sq.code) verdict=$($sq.verdict) mean=$(Format-Mean $sq.mean)$(if ($sq.reason) { " reason=$($sq.reason)" })"
         if ($sq.verdict -cnotin @('QUIET', 'COOLDOWN_UNMET')) { Write-SuppSkip $Leg $Trigger 'UM_NOT_QUIET' "verdict=$($sq.verdict) mean=$(Format-Mean $sq.mean)$(if ($sq.reason) { " reason=$($sq.reason)" })" $false; return }
         $capSec = [Math]::Min($SupplementaryMaxSec, [int][Math]::Floor(($deadline - [DateTime]::UtcNow).TotalSeconds))
-        if ($capSec -lt 60) { Write-SuppSkip $Leg $Trigger 'DEADLINE_NEAR' "remainingSec=$capSec after the probe" $false; return }
+        if ($TestSupplementaryCapSec -gt 0) { $capSec = $TestSupplementaryCapSec }   # offline test seam only (header): production passes none
+        if ($capSec -lt 60 -and $TestSupplementaryCapSec -eq 0) { Write-SuppSkip $Leg $Trigger 'DEADLINE_NEAR' "remainingSec=$capSec after the probe" $false; return }
         $sOut = Join-Path $RunDir "leg-$($Leg.name)-ultra-magnus-supplementary.out.txt"
         $sArgs = @('-NoProfile', '-NonInteractive', '-File', $LegScript, '-Venue', $suppVenue, '-LegSpec', $Leg.spec, '-SourceCommit', $SourceCommit, '-BuildManifestSha256', $built.sha256)
         if ($Leg.backend) { $sArgs += @('-Backend', $Leg.backend) }
@@ -353,8 +374,19 @@ function Invoke-SupplementaryCore([object]$Leg, [string]$Trigger) {
         $sStatus = $(if ($sr.timedOut) { 'TIMEOUT' } elseif ($sr.exit -ne 0) { 'FAILED' } else { 'RAN' })
         # Whatever the leg printed, a leg that died or timed out is INVALID evidence, never a measurement (the Bachelor rule); and nothing here is read as a timing verdict.
         $shownOutcome = $(if ($sStatus -ceq 'RAN') { $sOutcome } else { 'INVALID' })
-        Add-SuppResult $Leg $Trigger $sStatus @{ quietVerdict = $sq.verdict; quietMean = $sq.mean; outcome = $shownOutcome; printedOutcome = $sOutcome; legExit = $sr.exit; timedOut = $sr.timedOut; receipt = $sReceipt; receiptRole = $sRole
+        $extra = @{ quietVerdict = $sq.verdict; quietMean = $sq.mean; outcome = $shownOutcome; printedOutcome = $sOutcome; legExit = $sr.exit; timedOut = $sr.timedOut; receipt = $sReceipt; receiptRole = $sRole
             umManifestSha256 = $built.sha256; elapsedSec = [int]([DateTime]::UtcNow - $t0s).TotalSeconds; outcomeDetail = $sDetail }
+        if ($sr.timedOut) {
+            # The client was killed, the job it submitted was not: keep the job's identity (what the client printed before it went silent) and reconcile it BEFORE the venue is read as idle.
+            # No id printed = nothing to look up = the venue is busy-or-unknown, never open. The claim is still released below; it is not the proof.
+            $rjIds = @(Get-VenueRemoteJobIds -Text $sr.stdout)
+            $script:suppRemote = @{ leg = $Leg.name; jobIds = $rjIds; state = 'UNKNOWN' }   # fail closed first: an exception below must not leave the venue read as idle
+            $rjs = Get-VenueRemoteJobState -AgentShare $share -JobId $rjIds -TimeoutSec 30
+            $extra.remoteJobIds = $rjIds; $extra.remoteJobState = $rjs.state; $extra.venueIdle = ($rjs.state -ceq 'FINISHED')
+            L "SUPPLEMENTARY_REMOTE_JOB leg=$($Leg.name) jobId=$(Format-RemoteJobIds $rjIds) state=$($rjs.state) venueIdle=$($extra.venueIdle)$(if ($rjs.error) { " reason=$($rjs.error)" }) venue=$suppVenue role=supplementary (a released claim is not proof of idleness; later offers reconcile this first)"
+            if ($rjs.state -ceq 'FINISHED') { $script:suppRemote = $null } else { $script:suppRemote.state = $rjs.state }
+        }
+        Add-SuppResult $Leg $Trigger $sStatus $extra
         L "LEG $($Leg.name) SUPPLEMENTARY_$sStatus venue=$suppVenue role=supplementary trigger=$Trigger exit=$($sr.exit) outcome=$shownOutcome printedOutcome=$sOutcome receipt=$sReceipt receiptRole=$sRole quietVerdict=$($sq.verdict) quietMean=$(Format-Mean $sq.mean)$(if ($sDetail) { " detail=$sDetail" }) (supplementary: no timing verdict, no effect on the chain result)"
         $st.done = $true
     } finally { L "SUPPLEMENTARY_CLAIM_RELEASED leg=$($Leg.name) venue=$suppVenue result=$(Release-VenueClaim -Venue $suppVenue -Nonce $req.claim.nonce -ClaimDir $ClaimDir)" }
@@ -539,4 +571,5 @@ if ($streakStop) { $summary['unhealthyStop'] = $streakStop }
 $resultLine = 'CHAIN_RESULT=' + ($summary | ConvertTo-Json -Compress -Depth 6)
 Add-Content -LiteralPath $ChainLog -Value $resultLine
 Write-Output $resultLine
+Complete-VenueProcess -ExitCode $exitCode   # a share read abandoned at its timeout would otherwise keep this process alive until it ends
 exit $exitCode
