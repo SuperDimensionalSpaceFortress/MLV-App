@@ -24,6 +24,26 @@ and the helper are each named only where the guard expects them; and the MONOTON
 PR #544 r4 key (sol): every check first runs C translation phases 1 and 2 (trigraphs, backslash-newline
 splicing) and reads digraphs as their tokens, so a directive or name split across lines, or spelled
 '%:define', is checked as the compiler sees it.
+
+PROCESSED8-COND-INIT-GUARD-FLAG-ALIAS-1 (folds PROCESSED8-COND-REINIT-GUARD-NO-IF-PREFIX-1,
+PROCESSED8-FIELD-GUARD-PAREN-LVALUE-AND-COND-ALIAS-1, PROCESSED8-SLICE-GUARD-LIVE-REALTIME-READ-1), the
+hardening cards the #544 keys left open, each closed by class:
+- the helper's local flag is named only by its declaration, the one exact-success 'monotonic = 1;' (a
+  statement, so 'int monotonic = 1;' is not it), 'if (!monotonic)' and 'return monotonic;', and the helper
+  holds no directive besides the platform split, so no pointer, shadow or macro writes it;
+- the 'if (!monotonic)' re-init must start a statement ('}' or ';' before it), so no braceless 'if (0)',
+  'else' or loop owns it;
+- the cond field is named in video_mlv.c only as '&<chain>processed8_prefetch_cond' straight into a pthread
+  wait, signal, broadcast or destroy call or the guarded helper, so memset, assignment, address
+  arithmetic, a pointer alias and a dereferenced or indexed base are all refused;
+- in the slice, the realtime-fallback branch is a plain statement of the '#else' branch (one preprocessor
+  conditional, no control flow before it), opens with the unconditional REALTIME read, and applies the
+  skew seam as a top-level statement, so no dead 'if', '#if 0', short-circuit or early return hides the read.
+Non-promises (a text guard over video_mlv.c cannot see these without refusing the real tree):
+- a whole-object overwrite after the helper assignment ('memset(video, ...)', '*video = ...') names
+  neither the field nor the cond;
+- a write from another translation unit, a macro supplied by a header or '-D', and inline asm;
+- the runtime clock-step row, not this test, is the defence for anything that leaves these texts intact.
 """
 import functools
 from pathlib import Path
@@ -85,7 +105,23 @@ GROUPING_KEYWORDS = frozenset(("return", "else", "do", "case"))
 MACRO_DIRECTIVE = re.compile(r"(?m)^[ \t]*#[ \t]*(?:define|undef)\b(?:\\\r?\n|[^\n])*")
 GUARDED_MACRO_TEXT = re.compile(
     r"CLOCK_REALTIME|CLOCK_MONOTONIC|pthread_cond_init|pthread_condattr_setclock|pthread_cond_timedwait"
-    r"|clock_gettime|" + COND_INIT_FUNCTION + "|" + SLICE_FUNCTION + r"|processed8_prefetch_cond")
+    r"|clock_gettime|" + COND_INIT_FUNCTION + "|" + SLICE_FUNCTION + r"|processed8_prefetch_cond"
+    r"|\bmonotonic\b")
+COND_NAME = re.compile(r"\bprocessed8_prefetch_cond\b")
+COND_USE = re.compile(
+    r"\b(?:pthread_cond_(?:wait|timedwait|timedwait_relative_np|broadcast|signal|destroy)|"
+    + COND_INIT_FUNCTION + r")\s*\(\s*&\s*(?:\w+\s*(?:->|\.)\s*)*(processed8_prefetch_cond)\s*[,)]")
+PREPROCESSOR_CONDITIONAL = re.compile(r"(?m)^[ \t]*#[ \t]*(if|ifdef|ifndef|elif|elifdef|elifndef)\b")
+PLATFORM_SPLIT = re.compile(r"(?m)^[ \t]*#[ \t]*if[ \t]+defined\s*\(\s*_WIN32\s*\)\s*\|\|\s*defined\s*\(\s*__APPLE__\s*\)[ \t]*$")
+CONTROL_FLOW = re.compile(r"\b(?:if|else|while|for|do|switch|case|goto|return|break|continue)\b")
+# The fallback branch's first statement and its seam statement, as statements (PR #544 keys: a dead 'if (0)'
+# or a short-circuited condition would keep the same words but never take the read).
+LIVE_REALTIME_READ = re.compile(
+    r"\{\s*if\s*\(\s*clock_gettime\s*\(\s*CLOCK_REALTIME\s*,\s*&\s*wait_time\s*\)\s*!=\s*0\s*\)")
+LIVE_SKEW_SEAM = re.compile(
+    r"[;{}]\s*abstime_offset_ns\s*\+=\s*video\s*->\s*" + SKEW_SEAM + r"\s*;")
+LOCAL_FLAG = "monotonic"
+FLAG_REFERENCE = re.compile(r"\b" + LOCAL_FLAG + r"\b")
 MONOTONIC_READ = re.compile(
     r"\s*else\s+if\s*\(\s*clock_gettime\s*\(\s*CLOCK_MONOTONIC\s*,\s*&\s*wait_time\s*\)")
 # C translation phases 1 and 2 (PR #544 r4 sol blocker): trigraphs, which -std=c99 builds enable, and
@@ -229,6 +265,50 @@ def slice_body_violations(source: str) -> list[str]:
     if len(guards) == 1 and not MONOTONIC_READ.match(body, fallback[1]):
         problems.append("the realtime-fallback branch must be followed directly by "
                         "'else if (clock_gettime(CLOCK_MONOTONIC, &wait_time)'")
+    problems += _live_fallback_violations(source, body_open, body, guards, fallback)
+    return problems
+
+
+def _live_fallback_violations(source: str, body_open: int, body: str, guards: list, fallback: tuple) -> list[str]:
+    """PROCESSED8-SLICE-GUARD-LIVE-REALTIME-READ-1: the REALTIME read and the skew seam must run, not
+    merely appear. A textual read under 'if (0)', '#if 0', a short-circuit, a loop that never enters
+    or a live early return still satisfies the scans above while the abstime never takes that read."""
+    def line(offset: int) -> int:
+        return source.count("\n", 0, body_open + offset) + 1
+
+    problems = []
+    conditionals = [match.group(1) for match in PREPROCESSOR_CONDITIONAL.finditer(body)]
+    platform_split = PLATFORM_SPLIT.search(body)
+    else_directive = re.search(r"(?m)^[ \t]*#[ \t]*else\b", body)
+    if conditionals != ["if"] or not platform_split or len(re.findall(r"(?m)^[ \t]*#[ \t]*else\b", body)) != 1:
+        problems.append("the slice must hold exactly one preprocessor conditional, "
+                        "'#if defined(_WIN32) || defined(__APPLE__)' ... '#else', so no '#if 0' hides a read")
+    if len(guards) != 1:
+        return problems
+    guard = guards[0]
+    if else_directive and guard.start() > else_directive.end():
+        between = body[else_directive.end():guard.start()]
+        if CONTROL_FLOW.search(between) or "{" in between or "}" in between:
+            problems.append("video_mlv.c:%d: nothing but declarations may run between '#else' and the "
+                            "realtime-fallback branch, so no early exit skips it" % line(else_directive.end()))
+    elif else_directive:
+        problems.append("the realtime-fallback branch at video_mlv.c:%d must sit in the '#else' (POSIX) branch"
+                        % line(guard.start()))
+    if not body[:guard.start()].rstrip().endswith((";", "{", "}")):
+        problems.append("the realtime-fallback branch at video_mlv.c:%d must be a plain statement, not the "
+                        "body of an 'if', 'else' or loop that may not run" % line(guard.start()))
+    branch = body[fallback[0]:fallback[1]]
+    if not LIVE_REALTIME_READ.match(branch):
+        problems.append("the realtime-fallback branch at video_mlv.c:%d must open with "
+                        "'if (clock_gettime(CLOCK_REALTIME, &wait_time) != 0)' so the read always runs"
+                        % line(fallback[0]))
+    seams = [seam for seam in LIVE_SKEW_SEAM.finditer(branch)
+             if branch[:seam.start()].count("{") - branch[:seam.start()].count("}") + (
+                 1 if seam.group(0)[0] == "{" else -1 if seam.group(0)[0] == "}" else 0) == 1]
+    if len(seams) != 1 or branch.count(SKEW_SEAM) != 1:
+        problems.append("the realtime-fallback branch at video_mlv.c:%d must apply "
+                        "'abstime_offset_ns += video->%s;' once, as a top-level statement of the branch"
+                        % (line(fallback[0]), SKEW_SEAM))
     return problems
 
 
@@ -311,12 +391,30 @@ def cond_init_violations(source: str) -> list[str]:
         if declaration and write.start() == declaration.start() + declaration.group(0).index("monotonic"):
             continue
         inside = success is not None and success[0] <= write.start() < success[1]
-        if not inside or not re.match(r"monotonic\s*=\s*1\s*;", body[write.start():]):
+        # A statement start, so 'int monotonic = 1;' (a shadowing declaration) is not the assignment.
+        starts_statement = body[:write.start()].rstrip().endswith((";", "{", "}"))
+        if not inside or not starts_statement or not re.match(r"monotonic\s*=\s*1\s*;", body[write.start():]):
             problems.append("monotonic is written at video_mlv.c:%d outside 'monotonic = 1;' in the "
                             "exact-success branch" % line(write.start()))
         sets.append(write)
     if not sets:
         problems.append("%s never sets monotonic = 1" % COND_INIT_FUNCTION)
+    # PROCESSED8-COND-INIT-GUARD-FLAG-ALIAS-1: the flag is named only where the helper expects it, so no
+    # pointer to it, no second declaration that shadows it and no macro stands in for it.
+    named = {write.start() for write in sets}
+    if declaration:
+        named.add(declaration.start() + declaration.group(0).index(LOCAL_FLAG))
+    for known in (re.finditer(r"\bif\s*\(\s*!\s*(" + LOCAL_FLAG + r")\s*\)", body),
+                  re.finditer(r"\breturn\s+(" + LOCAL_FLAG + r")\s*;", body)):
+        named.update(match.start(1) for match in known)
+    for reference in FLAG_REFERENCE.finditer(body):
+        if reference.start() not in named:
+            problems.append("monotonic is named at video_mlv.c:%d outside its declaration, the exact-success "
+                            "'monotonic = 1;', 'if (!monotonic)' and 'return monotonic;'" % line(reference.start()))
+    for directive in re.finditer(r"(?m)^[ \t]*#[ \t]*(\w+)", body):
+        if directive.group(1) not in ("if", "else", "endif"):
+            problems.append("%s may hold only the platform split directives; video_mlv.c:%d has '#%s'"
+                            % (COND_INIT_FUNCTION, line(directive.start()), directive.group(1)))
     for ret in re.finditer(r"\breturn\b([^;]*);", body):
         if ret.group(1).strip() not in ("0", "monotonic"):
             problems.append("%s may return only 0 or monotonic; video_mlv.c:%d returns %r"
@@ -376,9 +474,13 @@ def cond_reinit_violations(source: str) -> list[str]:
         (branch, close), (attr_call, cond) = reinits[0], attr_inits[0]
         brace = re.match(r"\s*\{", body[close + 1:])
         depth = body[:branch.start()].count("{") - body[:branch.start()].count("}")
-        if not brace or depth != 1 or branch.start() < attr_call.start():
+        # PROCESSED8-COND-REINIT-GUARD-NO-IF-PREFIX-1: it must start a statement, so no braceless 'if (0)',
+        # 'else' or loop owns it and decides whether it runs.
+        starts_statement = body[:branch.start()].rstrip().endswith(("}", ";"))
+        if not brace or depth != 1 or branch.start() < attr_call.start() or not starts_statement:
             problems.append("the re-init 'if (!monotonic)' at video_mlv.c:%d must be a braced top-level "
-                            "branch after the attr cond init" % line(branch.start()))
+                            "statement after the attr cond init, not the body of an 'if', 'else' or loop"
+                            % line(branch.start()))
         else:
             reinit_open = close + 1 + brace.end() - 1
             reinit_close = _matching_brace(body, reinit_open)
@@ -476,9 +578,23 @@ def macro_violations(source: str) -> list[str]:
     return problems
 
 
+def cond_name_violations(source: str) -> list[str]:
+    """PROCESSED8-FIELD-GUARD-PAREN-LVALUE-AND-COND-ALIAS-1: the cond field is named in video_mlv.c only
+    as '&<chain>processed8_prefetch_cond' straight into a pthread wait, signal, broadcast or destroy call
+    or the guarded helper. A re-init, memset, assignment, pointer alias, address arithmetic or a
+    dereferenced or indexed base all name it some other way, so each is refused as a class."""
+    source = _translated(source)
+    code = _collapse_grouping_parens(_blank_comments_and_literals(source))
+    allowed = {use.start(1) for use in COND_USE.finditer(code)}
+    return ["processed8_prefetch_cond is named at video_mlv.c:%d outside a pthread wait, signal, broadcast "
+            "or destroy call and %s" % (source.count("\n", 0, name.start()) + 1, COND_INIT_FUNCTION)
+            for name in COND_NAME.finditer(code) if name.start() not in allowed]
+
+
 def _all_violations(source: str) -> list[str]:
     return (slice_body_violations(source) + setclock_violations(source) + cond_init_violations(source)
-            + cond_reinit_violations(source) + field_wiring_violations(source) + macro_violations(source))
+            + cond_reinit_violations(source) + field_wiring_violations(source) + macro_violations(source)
+            + cond_name_violations(source))
 
 
 GUARDED_SLICE = """
@@ -633,6 +749,10 @@ class Processed8WaitClockStaticTests(unittest.TestCase):
                     mutated = mutated.replace(old_part, new_part)
                 self.assertTrue(_all_violations(mutated), name)
 
+    def test_cond_field_is_named_only_by_pthread_waits_and_the_helper(self) -> None:
+        self.assertEqual([], cond_name_violations(self.source))
+        self.assertEqual([], _all_violations(self.source))
+
     def test_no_macro_renames_a_guarded_clock_call_or_name(self) -> None:
         self.assertEqual([], macro_violations(self.source))
 
@@ -710,6 +830,82 @@ class Processed8WaitClockStaticTests(unittest.TestCase):
                     self.assertEqual(1, mutated.count(old), name)
                     mutated = mutated.replace(old, new)
                 self.assertTrue(_all_violations(mutated), name)
+
+    def _assert_head_mutations_rejected(self, mutations: dict) -> None:
+        for name, edits in mutations.items():
+            with self.subTest(mutation=name):
+                mutated = self.source
+                for old, new in edits:
+                    self.assertEqual(1, mutated.count(old), name)
+                    mutated = mutated.replace(old, new)
+                self.assertTrue(_all_violations(mutated), name)
+
+    def test_guard_rejects_the_four_open_pr544_evasion_cards_in_head_source(self) -> None:
+        # The four hardening cards PR #544's keys filed and left open. Each mutation compiles into a
+        # cond on one clock under a flag or an abstime naming the other, and is applied to the real
+        # head source. A row prefixed [x] is a shape the guard already caught before this change.
+        reinit = "    if (!monotonic)\n    {\n        pthread_cond_init(cond, NULL);\n    }\n"
+        success = "            monotonic = 1;\n"
+        helper_definition = "static int %s(pthread_cond_t * cond)\n" % COND_INIT_FUNCTION
+        assignment = ("    video->processed8_prefetch_cond_clock_monotonic =\n"
+                      "        mlv_processed8_prefetch_cond_init(&video->processed8_prefetch_cond);\n")
+        cond = "video->processed8_prefetch_cond"
+        realtime_read = ("        if (clock_gettime(CLOCK_REALTIME, &wait_time) != 0)\n"
+                         "        {\n            return EINVAL;\n        }\n")
+        skew = "        abstime_offset_ns += video->%s;\n" % SKEW_SEAM
+        guard = "    if (!video->%s)\n" % CLOCK_FIELD
+        offset_declaration = "    int64_t abstime_offset_ns = slice_ns;\n"
+        mutations = {
+            "[FLAG-ALIAS] pointer alias of the flag written after the attr block": [
+                (reinit, "    int * flag = &monotonic;\n    *flag = 1;\n" + reinit)],
+            "[FLAG-ALIAS] flag shadowed inside the exact-success branch": [
+                (success, "            int monotonic = 1;\n")],
+            "[FLAG-ALIAS] flag address handed to a writer": [
+                (reinit, "    memset(&monotonic, 1, sizeof monotonic);\n" + reinit)],
+            "[FLAG-ALIAS] flag aliased by a macro defined before the helper": [
+                (helper_definition, "#define MLV_COND_FLAG monotonic\n" + helper_definition),
+                (reinit, "    MLV_COND_FLAG = 1;\n" + reinit)],
+            "[FLAG-ALIAS] flag shadowed by a nested block before the re-init": [
+                (reinit, "    {\n        int monotonic = 1;\n    }\n" + reinit)],
+            "[NO-IF-PREFIX] dead braceless outer if before the re-init": [
+                (reinit, "    if (0)\n" + reinit)],
+            "[NO-IF-PREFIX] re-init chained as an else if": [
+                (reinit, "    else\n" + reinit)],
+            "[NO-IF-PREFIX] loop-bounded re-init that never runs": [
+                (reinit, "    while (0)\n" + reinit)],
+            "[PAREN-LVALUE] [x] parenthesized field write": [
+                (assignment, assignment + "    (video->%s) = 1;\n" % CLOCK_FIELD)],
+            "[PAREN-LVALUE] dereferenced field write": [
+                (assignment, assignment + "    (*video).%s = 1;\n" % CLOCK_FIELD)],
+            "[PAREN-LVALUE] indexed field write": [
+                (assignment, assignment + "    video[0].%s = 1;\n" % CLOCK_FIELD)],
+            "[COND-ALIAS] re-init through pointer arithmetic": [
+                (assignment, assignment + "    pthread_cond_init(&%s + 0, NULL);\n" % cond)],
+            "[COND-ALIAS] re-init through a dereferenced base": [
+                (assignment, assignment + "    pthread_cond_init(&(*video).processed8_prefetch_cond, NULL);\n")],
+            "[COND-ALIAS] re-init through an indexed base": [
+                (assignment, assignment + "    pthread_cond_init(&video[0].processed8_prefetch_cond, NULL);\n")],
+            "[COND-ALIAS] memset of the cond": [
+                (assignment, assignment + "    memset(&%s, 0, sizeof(%s));\n" % (cond, cond))],
+            "[COND-ALIAS] re-init through a pointer alias": [
+                (assignment, assignment + "    pthread_cond_t * c = &%s;\n    pthread_cond_init(c, NULL);\n" % cond)],
+            "[COND-ALIAS] cond overwritten by its static initializer": [
+                (assignment, assignment + "    %s = (pthread_cond_t)PTHREAD_COND_INITIALIZER;\n" % cond)],
+            "[LIVE-REALTIME-READ] REALTIME read under a dead if": [
+                (realtime_read, "        if (0)\n        {\n" + realtime_read + "        }\n")],
+            "[LIVE-REALTIME-READ] REALTIME read short-circuited off": [
+                (realtime_read, realtime_read.replace("(clock_gettime(CLOCK_REALTIME, &wait_time) != 0)",
+                                                      "(0 && clock_gettime(CLOCK_REALTIME, &wait_time) != 0)"))],
+            "[LIVE-REALTIME-READ] skew seam under a dead braceless if": [
+                (skew, "        if (0)\n" + skew)],
+            "[LIVE-REALTIME-READ] fallback guard behind a dead if": [
+                (guard, "    if (0)\n" + guard)],
+            "[LIVE-REALTIME-READ] fallback read behind #if 0": [
+                (realtime_read, "#if 0\n" + realtime_read + "#endif\n")],
+            "[LIVE-REALTIME-READ] live early return before the fallback guard": [
+                (offset_declaration, offset_declaration + "    if (slice_ns >= 0)\n    {\n        return EINVAL;\n    }\n")],
+        }
+        self._assert_head_mutations_rejected(mutations)
 
     def test_translation_phases_match_the_compiler(self) -> None:
         # Phase 1 folds trigraphs (-std=c99 builds enable them), phase 2 deletes every backslash-newline
