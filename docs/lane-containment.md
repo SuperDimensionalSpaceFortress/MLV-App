@@ -398,3 +398,14 @@ appends one absolute path to `<RunDir>\scratch-paths.txt`, dedupes, and refuses 
 passes `-RunDir $env:MLV_LANE_RUN_DIR` with no hand-built path; a detached WMI chain script does not inherit
 environment variables, so its launcher puts the run dir on the chain's command line and the chain passes
 `-RunDir` explicitly. Guard: `tests/coordination/test_lane_bulk_scratch.py`.
+
+## Detached children (LANE-DETACHED-CHILD-SURVIVES-LANE-EXIT-1)
+
+A process a Claude lane starts with `Start-Process` (or any direct child) stays inside the kill-on-close job, so
+it dies when the lane ends; measured 2026-10-21 through a real lane, 63 s after the lane process exited, the
+`Start-Process` sleeper was dead and a `Win32_Process.Create` sleeper was alive. The sanctioned route for work
+that must outlive a lane (a venue run, a watcher) is one `Win32_Process.Create` with `ShowWindow` 0, per child,
+from its own `pwsh` process, which is what the board's `hub-tools\Start-HiddenDetached.ps1` does: WMI parents the
+child to `WmiPrvSE`, outside the job. A lane must still finish its own turn in the foreground; a detached child
+has no one to wake it. Its logs go to a fresh path, because a relaunch that reuses a finished job's id is refused
+by the job queue (`UMRUN_JOBID_IN_USE`). Guard: `tests/coordination/test_lane_detached_child.py`.
