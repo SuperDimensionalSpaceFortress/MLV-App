@@ -59,3 +59,28 @@ def write_synthetic_mlv(path: Path, frames: int, **header_kwargs) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(mlvi_header(frames, **header_kwargs))
     return path
+
+
+BLOCK_HEADER_STRUCT = "<4sIQ"  # mlv_hdr_t: blockType[4] blockSize u32 timestamp u64 == 16 bytes
+BLOCK_HEADER_BYTES = struct.calcsize(BLOCK_HEADER_STRUCT)
+assert BLOCK_HEADER_BYTES == 16
+BLOCK_PAYLOAD_BYTES = 16
+
+
+def block(block_type: bytes, payload_bytes: int = BLOCK_PAYLOAD_BYTES, *, size: int | None = None) -> bytes:
+    """One block: a real 16-byte block header and a zero payload (``size`` overrides the declared blockSize)."""
+    declared = BLOCK_HEADER_BYTES + payload_bytes if size is None else size
+    return struct.pack(BLOCK_HEADER_STRUCT, block_type, declared, 0) + bytes(payload_bytes)
+
+
+def write_synthetic_mlv_with_blocks(path: Path, header_frames: int, vidf_blocks: int, *, extra: bytes = b"",
+                                    **header_kwargs) -> Path:
+    """A clip whose MLVI header declares ``header_frames`` but which really carries ``vidf_blocks`` VIDF blocks.
+
+    ``src/mlv/video_mlv.c`` getMlvFrames counts the VIDF blocks, never the header field, so a test that
+    wants the app's frame count must put real blocks behind the header. ``extra`` is appended verbatim.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    body = b"".join(block(b"VIDF") for _ in range(vidf_blocks))
+    path.write_bytes(mlvi_header(header_frames, **header_kwargs) + body + extra)
+    return path

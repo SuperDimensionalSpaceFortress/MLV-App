@@ -95,17 +95,99 @@ function Read-GuiSmokeMlviHeader {
     }
 }
 
+# GUI-SMOKE-LENGTH-GATE-VIDF-COUNT-1: the app plays the VIDF BLOCKS it indexes, never the MLVI header's videoFrameCount.
+# src/mlv/video_mlv.c walks every part block by block (16-byte mlv_hdr_t: blockType[4] blockSize u32 timestamp u64), counts
+# each "VIDF" into video_frames and assigns that to video->frames, which getMlvFrames returns; a blockSize under 16 makes the
+# app refuse the file (MLV_ERR_INVALID). M16-1243's headers declared 612 frames while 937 VIDF blocks were indexed, so the
+# header-only gate saw a 25.5 s clip where the app plays 39.1 s. The walk is bounded in blocks and seconds (a venue leg must
+# not hang on a huge clip); a walk that cannot finish fails closed (vidf_count_unverified). The app's MAPP sidecar caches
+# this same walk (load_mapp sets video->frames from it), so counting the blocks is the quantity both paths agree on.
+$script:GuiSmokeBlockHeaderBytes = 16
+$script:GuiSmokeVidfWalkMaxBlocks = 2000000
+$script:GuiSmokeVidfWalkMaxSeconds = 30.0
+
+function Get-GuiSmokeMlvVidfCount {
+    <#
+    .SYNOPSIS
+    Counts the VIDF blocks of ONE part file the way the app's block walk does (start at offset 0, skip each block by its
+    blockSize). Returns @{ ok; vidf; blocks; reason }. ok=$false means the walk did not finish (reason: unreadable,
+    invalid_block_size, truncated_block_header, walk_bound_blocks, walk_bound_seconds); never throws.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Path, [AllowNull()][System.Diagnostics.Stopwatch]$Clock = $null)
+    if ($null -eq $Clock) { $Clock = [System.Diagnostics.Stopwatch]::StartNew() }
+    $hdr = New-Object byte[] $script:GuiSmokeBlockHeaderBytes
+    $vidf = [int64]0
+    $blocks = [int64]0
+    $fs = $null
+    try {
+        # bufferSize 1 = unbuffered: each seek reads 16 bytes, not a 4 KiB page (a clip on a share is walked block by block).
+        $fs = New-Object System.IO.FileStream($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read,
+                                              [System.IO.FileShare]::ReadWrite, 1)
+        $size = [int64]$fs.Length
+        $pos = [int64]0
+        while ($pos -lt $size) {
+            if ($blocks -ge $script:GuiSmokeVidfWalkMaxBlocks) { return @{ ok = $false; vidf = $vidf; blocks = $blocks; reason = 'walk_bound_blocks' } }
+            if (($blocks % 256) -eq 0 -and $Clock.Elapsed.TotalSeconds -gt $script:GuiSmokeVidfWalkMaxSeconds) {
+                return @{ ok = $false; vidf = $vidf; blocks = $blocks; reason = 'walk_bound_seconds' }
+            }
+            if (($size - $pos) -lt $script:GuiSmokeBlockHeaderBytes) { return @{ ok = $false; vidf = $vidf; blocks = $blocks; reason = 'truncated_block_header' } }
+            [void]$fs.Seek($pos, [System.IO.SeekOrigin]::Begin)
+            $got = 0
+            while ($got -lt $hdr.Length) {
+                $n = $fs.Read($hdr, $got, $hdr.Length - $got)
+                if ($n -le 0) { break }
+                $got += $n
+            }
+            if ($got -lt $hdr.Length) { return @{ ok = $false; vidf = $vidf; blocks = $blocks; reason = 'truncated_block_header' } }
+            $blockSize = [int64][BitConverter]::ToUInt32($hdr, 4)
+            if ($blockSize -lt $script:GuiSmokeBlockHeaderBytes) { return @{ ok = $false; vidf = $vidf; blocks = $blocks; reason = 'invalid_block_size' } }
+            if ($hdr[0] -eq 0x56 -and $hdr[1] -eq 0x49 -and $hdr[2] -eq 0x44 -and $hdr[3] -eq 0x46) { $vidf++ }   # 'VIDF'
+            $blocks++
+            $pos += $blockSize
+        }
+    } catch {
+        return @{ ok = $false; vidf = $vidf; blocks = $blocks; reason = 'unreadable' }
+    } finally {
+        if ($null -ne $fs) { $fs.Dispose() }
+    }
+    return @{ ok = $true; vidf = $vidf; blocks = $blocks; reason = '' }
+}
+
+function Get-GuiSmokePartFrames {
+    <#
+    .SYNOPSIS
+    The frames the app plays from ONE part: its VIDF block count. Returns @{ ok; frames; reason }. A part with no block past
+    the MLVI header (a header-only fixture) keeps its header count, since nothing contradicts it; blocks but no VIDF while the
+    header declares frames is header_vidf_count_mismatch; a walk that cannot finish is vidf_count_unverified.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)][int64]$HeaderFrames,
+          [AllowNull()][System.Diagnostics.Stopwatch]$Clock = $null)
+    $walk = Get-GuiSmokeMlvVidfCount -Path $Path -Clock $Clock
+    if (-not $walk.ok) { return @{ ok = $false; frames = [int64]0; reason = 'vidf_count_unverified' } }
+    if ($walk.blocks -le 1) { return @{ ok = $true; frames = $HeaderFrames; reason = '' } }   # the MLVI block alone
+    if ($walk.vidf -le 0 -and $HeaderFrames -gt 0) { return @{ ok = $false; frames = [int64]0; reason = 'header_vidf_count_mismatch' } }
+    return @{ ok = $true; frames = [int64]$walk.vidf; reason = '' }
+}
+
 function Get-GuiSmokeClipLength {
     <#
     .SYNOPSIS
-    Length of a clip (all spanned parts) from its headers alone. Returns
+    Length of a clip (all spanned parts): the VIDF blocks the app will play (Get-GuiSmokePartFrames), with the MLVI headers
+    for identity, fps and the spanned set. Returns
     [pscustomobject]@{ known; reason; frames; fps; seconds }. known=$false means FAIL CLOSED.
     #>
     param([Parameter(Mandatory = $true)][string]$Path)
     $unknown = { param($why) [pscustomobject]@{ known = $false; reason = $why; frames = 0; fps = 0.0; seconds = 0.0 } }
     $first = Read-GuiSmokeMlviHeader -Path $Path
     if (-not $first.ok) { return (& $unknown $first.reason) }
-    $frames = [int64]$first.videoFrames
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
+    $frames = [int64]0
+    if ($first.fileCount -le 1) {
+        # A spanned set walks every part (the first included) in the loop below, so the first part is walked once.
+        $partFrames = Get-GuiSmokePartFrames -Path $Path -HeaderFrames ([int64]$first.videoFrames) -Clock $clock
+        if (-not $partFrames.ok) { return (& $unknown $partFrames.reason) }
+        $frames = [int64]$partFrames.frames
+    }
     if ($first.fileCount -gt 1) {
         # Spanned: the per-file header counts only that file's frames, so the total is the sum over
         # the WHOLE set, and the set must be complete (and one recording) or the length is unknown.
@@ -124,7 +206,9 @@ function Get-GuiSmokeClipLength {
             if ($h.fileGuid -ne $first.fileGuid -or $h.fileNum -ne $idx -or $h.fileCount -ne $first.fileCount) {
                 return (& $unknown 'spanned_set_mismatch')
             }
-            $frames += [int64]$h.videoFrames
+            $pf = Get-GuiSmokePartFrames -Path $part.FullName -HeaderFrames ([int64]$h.videoFrames) -Clock $clock
+            if (-not $pf.ok) { return (& $unknown $pf.reason) }
+            $frames += [int64]$pf.frames
             $idx++
         }
     }
