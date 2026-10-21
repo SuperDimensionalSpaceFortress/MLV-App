@@ -84,3 +84,23 @@ def write_synthetic_mlv_with_blocks(path: Path, header_frames: int, vidf_blocks:
     body = b"".join(block(b"VIDF") for _ in range(vidf_blocks))
     path.write_bytes(mlvi_header(header_frames, **header_kwargs) + body + extra)
     return path
+
+
+def mlv_bytes_with_random_vidf_payload(frames: int, total_bytes: int, **header_kwargs) -> bytes:
+    """``total_bytes`` of a walkable clip: the MLVI header, then ``frames`` VIDF blocks of random payload.
+
+    For a test about how often the BYTES are read, where the content must be incompressible and a fixed size
+    but the length gate must still count ``frames`` VIDF blocks (a random body after the header is not a
+    playable clip: the gate walks it and refuses it). The last block absorbs the division remainder.
+    """
+    import os
+
+    room = total_bytes - HEADER_BYTES
+    if frames < 1 or room < frames * BLOCK_HEADER_BYTES:
+        raise ValueError(f"{total_bytes} bytes cannot hold the header and {frames} VIDF blocks")
+    each = room // frames
+    sizes = [each] * (frames - 1) + [room - each * (frames - 1)]
+    body = b"".join(
+        struct.pack(BLOCK_HEADER_STRUCT, b"VIDF", size, 0) + os.urandom(size - BLOCK_HEADER_BYTES) for size in sizes
+    )
+    return mlvi_header(frames, **header_kwargs) + body

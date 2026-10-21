@@ -29,7 +29,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tools.repo_hygiene.synthetic_mlv import FRAMES_30S_AT_23976, mlvi_header
+from tools.repo_hygiene.synthetic_mlv import FRAMES_30S_AT_23976, mlv_bytes_with_random_vidf_payload
 from tools.repo_hygiene.test_playback_attr_3_cuda_behaviour import (
     ATTRIBUTION_GENERATOR,
     MODULE,
@@ -504,8 +504,10 @@ class CompleteChainSingleReadTests(_PwshCase):
         self.clip_dir.mkdir()
         # PLAYBACK-CLIP-LENGTH-ENFORCE-1: the REAL runner now reads the first part's 52-byte header and
         # refuses anything that is not a >= 20 s clip before it hashes or launches. This test is about how
-        # many times the BYTES are read, so part 0 carries a genuine ~30 s header in front of its random body.
-        self.data = [mlvi_header(FRAMES_30S_AT_23976) + os.urandom(700_000 - 52), os.urandom(4_321)]
+        # many times the BYTES are read, so part 0 is a genuine ~30 s clip: its header AND that many VIDF blocks
+        # (GUI-SMOKE-LENGTH-GATE-VIDF-COUNT-1: the gate counts the blocks the app plays, so a header in front of
+        # a random body is refused as header_vidf_count_mismatch before the runner reads anything).
+        self.data = [mlv_bytes_with_random_vidf_payload(FRAMES_30S_AT_23976, 700_000), os.urandom(4_321)]
         self.parts = [
             self.clip_dir / ("owner-clip" + _BASE_EXT),
             self.clip_dir / ("owner-clip" + _CONT_EXT),

@@ -35,6 +35,7 @@ from tools.repo_hygiene.synthetic_mlv import (
     FRAMES_SHORT_FIXTURE,
     MLV_EXTENSION,
     block,
+    mlv_bytes_with_random_vidf_payload,
     mlvi_header,
     write_synthetic_mlv,
     write_synthetic_mlv_with_blocks,
@@ -220,6 +221,23 @@ class ClipLengthGateTests(_TmpCase):
         verdict = _gate(path, 24)
         self.assertEqual(verdict["verdict"], "CLIP_LENGTH_UNKNOWN", verdict)
         self.assertEqual(verdict["message"], "CLIP_LENGTH_UNKNOWN (reason=vidf_count_unverified)")
+
+    def test_a_header_in_front_of_a_random_body_is_refused_as_a_vidf_mismatch(self) -> None:
+        # The shape test_attr3_owner_clip_stage_stall used before this card: a genuine header, then random bytes.
+        path = self.tmp / ("randombody" + MLV_EXTENSION)
+        path.write_bytes(mlvi_header(FRAMES_30S_AT_23976) + os.urandom(700_000 - 52))
+        verdict = _gate(path, 24)
+        self.assertEqual(verdict["verdict"], "CLIP_LENGTH_UNKNOWN", verdict)
+        self.assertEqual(verdict["message"], "CLIP_LENGTH_UNKNOWN (reason=header_vidf_count_mismatch)")
+
+    def test_a_random_payload_clip_of_a_fixed_size_still_counts_its_frames(self) -> None:
+        path = self.tmp / ("randompayload" + MLV_EXTENSION)
+        data = mlv_bytes_with_random_vidf_payload(FRAMES_30S_AT_23976, 700_000)
+        path.write_bytes(data)
+        self.assertEqual(len(data), 700_000)
+        verdict = _gate(path, 24)
+        self.assertEqual(verdict["verdict"], "OK", verdict)
+        self.assertEqual(verdict["frames"], FRAMES_30S_AT_23976, verdict)
 
     def test_the_block_walk_is_bounded(self) -> None:
         path = write_synthetic_mlv_with_blocks(self.tmp / ("bounded" + MLV_EXTENSION), 720, 50)
