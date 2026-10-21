@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -136,6 +137,50 @@ class WmiCreateHiddenGuardR2Tests(unittest.TestCase):
         for cmd in ("rg -n '%s' ." % FORM, "findstr /s /c:\"%s\" *.ps1" % FORM, "Select-String -Path x.ps1 -Pattern '%s'" % FORM):
             self.assertIsNone(GUARD.decide(bash(cmd)), cmd)
         self.assertIsNone(GUARD.decide(write("C:/x/test_live.py", SWAP_DRIVER_LINE)))
+
+    def test_notebook_write_scans_code_cells_only(self):
+        # r3 contract: ".ipynb code cells". A markdown cell quoting the form is prose.
+        def nb(*cells):
+            return json.dumps({"cells": [{"cell_type": kind, "source": src.splitlines(True)} for kind, src in cells]})
+        path = "C:/x/a.ipynb"
+        self.assertIsNone(GUARD.decide(write(path, nb(("markdown", "never `%s`" % FORM), ("code", "print(1)")))))
+        self.assertIsNotNone(GUARD.decide(write(path, nb(("markdown", "prose"), ("code", FORM)))))
+        self.assertIsNone(GUARD.decide(write(path, nb(("code", "$si = New-CimInstance -Property @{ ShowWindow = [uint16]0 }\n" + FORM)))))
+        self.assertIsNone(GUARD.decide({"tool_name": "Edit", "tool_input": {"file_path": path, "new_string": nb(("markdown", FORM))}}))
+        self.assertIsNotNone(GUARD.decide(write(path, "not json\n" + FORM)))
+
+    def test_showwindow_in_another_segment_of_the_same_line_does_not_count(self):
+        # r3 contract: each segment is judged on its own; the window spans neighbouring lines, not neighbouring segments.
+        self.assertIsNotNone(GUARD.decide(ps("$si = 'ShowWindow'; " + FORM)))
+        self.assertIsNotNone(GUARD.decide(ps(FORM + " | Out-Null; $x = 'ShowWindow'")))
+        self.assertIsNotNone(GUARD.decide(bash("echo ShowWindow && " + FORM)))
+        self.assertIsNone(GUARD.decide(ps("$si = 'ShowWindow'\n" + FORM)))
+        self.assertIsNone(GUARD.decide(ps(FORM + " -Arguments @{ ShowWindow = 0 }")))
+        # a semicolon inside a hashtable splits the line, but Win32_Process and Create are still found together
+        self.assertIsNotNone(GUARD.decide(ps("Invoke-CimMethod -ClassName Win32_Process -Arguments @{ a = 1; b = 2 } -MethodName Create")))
+        self.assertIsNone(GUARD.decide(write("C:/x/a.ps1", "$si = 'ShowWindow'; " + FORM)))
+
+    def test_ledger_helper_pattern_keeps_its_verdicts_and_has_no_ambiguous_loop(self):
+        # r3: CodeQL py/redos flagged the option loop. Same verdicts, unambiguous shape, linear on a pumped input.
+        led = "Add-LedgerLine.ps1"
+        for cmd, expect in (
+            (led + " -Text x", True),
+            ("& \"C:\\x\\%s\" -Text x" % led, True),
+            ("pwsh -File %s -Text x" % led, True),
+            ("pwsh.exe -NoProfile -File \"C:\\x\\%s\" -Text x" % led, True),
+            ("pwsh -NoProfile -ExecutionPolicy Bypass -File C:\\x\\%s -Text x" % led, True),
+            ("powershell -NoLogo -NonInteractive -File %s" % led, True),
+            ("pwsh -NoProfile -Command %s" % led, False),
+            ("pwsh -NoProfile %s" % led, False),
+            ("pwsh -File other.ps1 -Text x", False),
+            ("python %s" % led, False),
+        ):
+            self.assertEqual(expect, bool(GUARD._LEDGER.match(cmd)), cmd)
+        self.assertNotIn(r"(?!-)", GUARD._LEDGER.pattern)
+        pumped = "pwsh" + " -0" * 20000 + " x"
+        started = time.monotonic()
+        self.assertIsNone(GUARD._LEDGER.match(pumped))
+        self.assertLess(time.monotonic() - started, 2.0)
 
 
 if __name__ == "__main__":

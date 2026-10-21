@@ -17,6 +17,21 @@ CODE vs PROSE (r2, PR #547). Only code is scanned:
     (grep, rg, findstr, Select-String, cat, Get-Content, echo ...), `git commit|log|show|diff|grep ...`, `gh pr|issue ...`, or
     Add-LedgerLine.ps1. A segment stops being data when it redirects with `>`, sits in a pipeline that feeds a writer or an
     interpreter (Set-Content, tee, pwsh, python ...), or holds a `$(` substitution. An unbalanced quote disables every exemption.
+Contract (declared for WMI-CREATE-HIDDEN-GUARD-HOOK-1 r3; the code below must say exactly this, and a difference is a defect in the code):
+Parser: a quote-aware tokenizer, not an AST. Bash/PowerShell command text is split outside quotes on semicolon, ampersand,
+double ampersand, pipe, double pipe and newline, and each segment is judged on its own: DENY when Win32_Process and Create
+appear within the window with no ShowWindow=0. Data segments are not scanned: read and search commands, git
+commit/log/show/diff/grep/blame/tag/notes, gh pr/issue, Add-LedgerLine.ps1. A data segment is code again when it redirects
+with a greater-than sign, sits in a pipeline with a writer or interpreter sink, or holds a dollar-paren substitution (except
+the commit heredoc idiom). An unbalanced quote disables every exemption. Write/Edit/NotebookEdit content is scanned only for
+executable script types (.ps1 .psm1 .psd1 .bat .cmd .py .js .mjs .cjs .vbs .sh and .ipynb code cells); Test-* and test_*
+fixtures are exempt.
+Non-promises: it does not catch a non-zero ShowWindow value or a ShowWindow comment in the window; Win32_Process and Create
+split across lines (backtick continuation or splatting); the class held in a variable
+([wmiclass] then .Create()); a computed method name; -EncodedCommand; a space-hash literal hiding the call; an Edit that
+removes only the ShowWindow line; Edit fragments judged without file context; real launchers named Test-* or test_*.
+These are WMI-GUARD-EVASIONS-1 debt; the run-dir scanner meter wmi-create-offenders is the second layer.
+
 Exit 2 blocks (the message goes to the model); exit 0 allows. Any unparseable input allows (fail-open: this is a lint, and the
 never-authorized gate stays the safety boundary).
 """
@@ -25,6 +40,7 @@ import re
 import sys
 
 BEFORE, AFTER = 2, 3
+SEGMENT_MARK = "\x00"  # code_view puts this where a ; & && | || separator was, so each segment is judged on its own
 SCRIPT_EXTS = (".ps1", ".psm1", ".psd1", ".bat", ".cmd", ".py", ".js", ".mjs", ".cjs", ".vbs", ".sh", ".ipynb")
 DATA_COMMANDS = frozenset((
     "grep", "egrep", "fgrep", "rg", "findstr", "select-string", "sls", "cat", "type", "get-content", "gc",
@@ -46,7 +62,7 @@ _COMMENT = re.compile(r"(^|\s)#.*$")
 _HEREDOC = re.compile(r"""<<-?[ \t]*(['"]?)([A-Za-z_]\w*)\1""")
 _QUOTED = re.compile(r"\"[^\"]*\"|'[^']*'")
 _LEDGER = re.compile(
-    r"""(?i)^(?:&\s*)?(?:(?:pwsh|powershell)(?:\.exe)?\s+(?:-\w+(?:\s+(?!-)\S+)?\s+)*-File\s+)?"""
+    r"""(?i)^(?:&\s*)?(?:(?:pwsh|powershell)(?:\.exe)?\s+(?:-\w+\s+(?:[^\s-]\S*\s+)?)*-File\s+)?"""
     r"""(?:"(?:[^"]*[\\/])?Add-LedgerLine\.ps1"|(?:[^\s"']*[\\/])?Add-LedgerLine\.ps1(?=\s|$))"""
 )
 
@@ -56,11 +72,14 @@ def offending_lines(text):
     lines = text.splitlines() or [text]
     out = []
     for i, raw in enumerate(lines):
-        code = _COMMENT.sub("", raw)
+        code = _COMMENT.sub("", raw).replace(SEGMENT_MARK, " ")
         if not (_PROC.search(code) and _CREATE.search(code) and _CALL.search(code)):
             continue
+        # ShowWindow in a neighbouring line counts; in another segment of the Create line it does not.
+        own = next((p for p in raw.split(SEGMENT_MARK) if _CREATE.search(_COMMENT.sub("", p))), code)
         lo, hi = max(0, i - BEFORE), min(len(lines) - 1, i + AFTER)
-        if not _SHOW.search("\n".join(lines[lo:hi + 1])):
+        near = [ln.replace(SEGMENT_MARK, " ") for ln in lines[lo:i]] + [own] + [ln.replace(SEGMENT_MARK, " ") for ln in lines[i + 1:hi + 1]]
+        if not _SHOW.search("\n".join(near)):
             out.append(i + 1)
     return out
 
@@ -201,9 +220,19 @@ def code_view(command):
         sink = any(r[2] or is_sink_segment(r[0]) for r in group)
         for seg, sep, _ in group:
             out.append("\n" * seg.count("\n") if not sink and is_data_segment(seg) else seg)
-            out.append(sep)
+            out.append(sep if sep in ("\n", "") else SEGMENT_MARK)
         group = []
     return "".join(out)
+
+
+def notebook_code(text):
+    """The code-cell sources of a whole .ipynb document; any other text (a fragment, bad JSON) is returned unchanged."""
+    try:
+        cells = json.loads(text)["cells"]
+        sources = [c["source"] for c in cells if c.get("cell_type") == "code"]
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return text
+    return "\n".join(s if isinstance(s, str) else "".join(s) for s in sources)
 
 
 def decide(payload):
@@ -220,6 +249,8 @@ def decide(payload):
         if not name.endswith(SCRIPT_EXTS) or ti.get("cell_type") == "markdown":
             return None
         text = ti.get("content") or ti.get("new_string") or ti.get("new_source") or ""
+        if name.endswith(".ipynb"):
+            text = notebook_code(text)
     else:
         return None
     bad = offending_lines(text)
