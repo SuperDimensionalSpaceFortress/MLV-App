@@ -148,11 +148,16 @@ function Test-Alive($Rec) {
     return ($p.StartTime.ToFileTimeUtc() -eq [int64]$Rec.created)
 }
 
-$job = [MlvLaneJob]::CreateKillOnClose()
 if ($ProbeOnly) {
-    try { '{"limitFlags":' + [MlvTestJobProbe]::LimitFlags($job) + '}' } finally { [void][MlvLaneJob]::CloseHandle($job) }
+    # Read back the handle the way the lane holds it: run Invoke-Lane.ps1's own `$jobHandle = ...CreateKillOnClose()`
+    # statement (the whole line, whatever it now does to the handle) and probe $jobHandle, not a fresh job from the class.
+    $site = [regex]::Matches($src, '(?m)^[ \t]*(\$jobHandle[ \t]*=[ \t]*\[MlvLaneJob\]::CreateKillOnClose\(\)[^\r\n]*)\r?$')
+    if ($site.Count -ne 1) { throw ('job-call-site-not-unique-' + $site.Count) }
+    Invoke-Expression $site[0].Groups[1].Value
+    try { '{"limitFlags":' + [MlvTestJobProbe]::LimitFlags($jobHandle) + '}' } finally { [void][MlvLaneJob]::CloseHandle($jobHandle) }
     return
 }
+$job = [MlvLaneJob]::CreateKillOnClose()
 $psi = [Diagnostics.ProcessStartInfo]::new()
 $psi.FileName = (Get-Command pwsh.exe -ErrorAction Stop).Source
 foreach ($a in @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', (Join-Path $Dir 'host.ps1'), '-Dir', $Dir)) { [void]$psi.ArgumentList.Add($a) }
@@ -272,9 +277,19 @@ def sweep_tagged(token, not_before, *, kill=True):
     """Kill (and confirm dead) every live process tagged `token` and created at or after `not_before`; return the pids.
 
     Matching is by the per-test command-line tag plus a CreationDate lower bound, never by image name, and each kill
-    still goes through reap_child's creation-time check (WMI's microsecond CreationDate against the handle's)."""
-    return [pid for pid, created in find_tagged(token)
-            if reap_child(pid, created, kill=kill, tolerance=10_000, not_before=not_before)]
+    still goes through reap_child's creation-time check (WMI's microsecond CreationDate against the handle's).
+    Like the recorded-child loop in run_control, one child that cannot be confirmed dead does not stop the sweep: every
+    tagged pid is visited, then ONE ReapFailed names every failure."""
+    swept, errors = [], []
+    for pid, created in find_tagged(token):
+        try:
+            if reap_child(pid, created, kill=kill, tolerance=10_000, not_before=not_before):
+                swept.append(pid)
+        except ReapFailed as e:
+            errors.append(str(e))
+    if errors:
+        raise ReapFailed("; ".join(errors))
+    return swept
 
 
 def probe_job_flags(d, lane_script=INVOKE_LANE):
@@ -450,6 +465,35 @@ def limit_flag_decls(src):
     return len(LIMIT_FLAGS_DECL_RE.findall(job_block(src)))
 
 
+# Every way Invoke-Lane.ps1 may mention the lane's job handle. The runtime read-back runs the call-site line and probes
+# $jobHandle, so a later second write to the handle (a copy, a re-assignment, a flag change on the live job) has to be
+# a deliberate edit to this list. Matching is case-insensitive in PowerShell, so the leftover scan is too; `${jobHandle}`
+# and `$script:jobHandle` are mentions, and they match none of these shapes.
+JOB_HANDLE_CALL_SITE_RE = re.compile(r"(?m)^[ \t]*\$jobHandle = \[MlvLaneJob\]::CreateKillOnClose\(\)[ \t]*\r?$")
+JOB_HANDLE_KNOWN_SHAPES = (
+    JOB_HANDLE_CALL_SITE_RE,                                                 # the one place the job is created
+    re.compile(r"\$jobHandle = \[IntPtr\]::Zero\b"),                         # initial value and every post-close reset
+    re.compile(r"\[MlvLaneJob\]::AssignOrThrow\(\$jobHandle, \$proc\.Handle\)"),
+    re.compile(r"if \(\$jobHandle -ne \[IntPtr\]::Zero\)"),
+    re.compile(r"\[void\]\[MlvLaneJob\]::CloseHandle\(\$jobHandle\)"),
+)
+JOB_HANDLE_MENTION_RE = re.compile(r"jobHandle", re.I)
+
+
+def job_handle_unknown_mentions(src):
+    """Lines that still mention the job handle once every known shape and every whole-line `#` comment is removed."""
+    text = re.sub(r"(?m)^[ \t]*#.*$", "", src)
+    for shape in JOB_HANDLE_KNOWN_SHAPES:
+        text = shape.sub("", text)
+    return [line.strip() for line in text.splitlines() if JOB_HANDLE_MENTION_RE.search(line)]
+
+
+def assert_job_handle_shapes(src):
+    assert len(JOB_HANDLE_CALL_SITE_RE.findall(src)) == 1, "the job-handle call site must be exactly one whole line"
+    unknown = job_handle_unknown_mentions(src)
+    assert not unknown, f"jobHandle appears in a shape the guard does not know (a second write to the handle?): {unknown}"
+
+
 def assert_kill_on_close_only(src):
     writes = limit_flag_writes(src)
     assert len(writes) == 1, f"MlvLaneJob must write LimitFlags exactly once, found {len(writes)}: {writes}"
@@ -463,6 +507,7 @@ def assert_kill_on_close_only(src):
     assert tokens == KNOWN_GOOD_LIMIT_FLAGS_TOKENS, (
         f"MlvLaneJob has {tokens} LimitFlags token(s) in the raw block; expected {KNOWN_GOOD_LIMIT_FLAGS_TOKENS} "
         f"(the declaration and the single write)")
+    assert_job_handle_shapes(src)
 
 
 def test_job_object_is_kill_on_close_and_not_breakaway():
@@ -574,6 +619,39 @@ def test_the_only_limitflags_write_must_be_0x2000():
         assert_kill_on_close_only(src.replace(WRITE_0x2000, "value.BasicLimitInformation.LimitFlags=0x2800;"))
 
 
+JOB_CALL_SITE = "$jobHandle = [MlvLaneJob]::CreateKillOnClose()"
+
+
+@pytest.mark.parametrize("extra", [
+    "$h2 = $jobHandle",                                              # a copy that a later statement could change the job through
+    "${jobHandle}",                                                  # braced spelling of the same variable
+    "$h2 = ${jobHandle}",
+    "$JOBHANDLE = [IntPtr]::Zero + 1",                               # PowerShell variable names are case-insensitive
+    "$script:jobHandle = [MlvLaneJob]::CreateKillOnClose()",         # a second job created under the same name
+    "Set-Variable -Name jobHandle -Value 5",                         # indirect write, no `$` at all
+    "[MlvLaneJob]::CloseHandle($jobHandle, 1)",                      # a known name in an unknown call shape
+])
+def test_a_job_handle_mention_in_an_unknown_shape_is_caught(extra):
+    src = INVOKE_LANE.read_text(encoding="utf-8")
+    assert src.count(JOB_CALL_SITE) == 1, "Invoke-Lane.ps1 no longer has the expected single job call site"
+    with pytest.raises(AssertionError, match="jobHandle appears in a shape"):
+        assert_kill_on_close_only(src.replace(JOB_CALL_SITE, JOB_CALL_SITE + "\n" + extra))
+
+
+def test_a_second_statement_on_the_job_call_site_line_is_caught():
+    src = INVOKE_LANE.read_text(encoding="utf-8")
+    assert src.count(JOB_CALL_SITE) == 1, "Invoke-Lane.ps1 no longer has the expected single job call site"
+    with pytest.raises(AssertionError, match="call site must be exactly one whole line"):
+        assert_kill_on_close_only(src.replace(JOB_CALL_SITE, JOB_CALL_SITE + "; [void]$jobHandle"))
+
+
+def test_a_whole_line_comment_naming_the_job_handle_is_not_a_mention():
+    # Invoke-Lane.ps1 already has one (`# job, so $jobHandle is zero ...`); the shape guard must not trip on comments.
+    src = INVOKE_LANE.read_text(encoding="utf-8")
+    assert src.count(JOB_CALL_SITE) == 1, "Invoke-Lane.ps1 no longer has the expected single job call site"
+    assert job_handle_unknown_mentions(src.replace(JOB_CALL_SITE, JOB_CALL_SITE + "\n# $jobHandle is only read below")) == []
+
+
 # ---- the lifecycle ----------------------------------------------------------------------------------------
 
 def test_both_children_are_running_before_the_lane_job_closes(lifecycle):
@@ -673,6 +751,81 @@ def test_the_sweep_honours_the_creation_date_lower_bound():
         p.wait()
 
 
+def _two_tagged_sleepers():
+    """Two live tagged sleepers and the (pid, creation FILETIME) entries find_tagged reports for them, in a fixed
+    order, so a test can make 'the first one' fail deterministically."""
+    token = "MLVTAG" + uuid.uuid4().hex
+    floor = creation_floor()
+    procs = [_spawn_sleeper(token), _spawn_sleeper(token)]
+    for p in procs:
+        _wait_registered(p, token)
+    entries = sorted(find_tagged(token))
+    assert sorted(pid for pid, _c in entries) == sorted(p.pid for p in procs)
+    return token, floor, {p.pid: p for p in procs}, entries
+
+
+def _fail_reap_for(monkeypatch, entries, failing_pids):
+    """Pin find_tagged to `entries` and make reap_child raise ReapFailed (killing nothing) for `failing_pids`."""
+    module = sys.modules[__name__]
+    real = module.reap_child
+
+    def reap(pid, created, **kw):
+        if pid in failing_pids:
+            raise ReapFailed(f"pid {pid}: injected reap failure")
+        return real(pid, created, **kw)
+
+    monkeypatch.setattr(module, "find_tagged", lambda _token: entries)
+    monkeypatch.setattr(module, "reap_child", reap)
+
+
+def test_the_sweep_visits_every_tagged_pid_when_the_first_reap_fails(monkeypatch):
+    token, floor, procs, entries = _two_tagged_sleepers()
+    first, second = entries[0][0], entries[1][0]
+    try:
+        _fail_reap_for(monkeypatch, entries, {first})
+        with pytest.raises(ReapFailed, match=f"pid {first}: injected reap failure"):
+            sweep_tagged(token, floor)
+        assert procs[second].poll() is not None, "the sweep stopped at the first failed reap; the second child was never visited"
+        assert procs[first].poll() is None, "the failed child was killed anyway: the injected failure did not take hold"
+    finally:
+        for p in procs.values():
+            p.kill()
+            p.wait()
+
+
+def test_the_sweep_raises_one_error_naming_every_failed_pid(monkeypatch):
+    # both reaps fail for real (a handle without SYNCHRONIZE cannot confirm the kill), none is injected
+    token, floor, procs, entries = _two_tagged_sleepers()
+    try:
+        module = sys.modules[__name__]
+        real = module.reap_child
+        monkeypatch.setattr(module, "reap_child",
+                            lambda pid, created, **kw: real(pid, created, access=_TERMINATE | _QUERY_LIMITED, **kw))
+        with pytest.raises(ReapFailed) as err:
+            sweep_tagged(token, floor)
+        for pid, _created in entries:
+            assert f"pid {pid}: not confirmed terminated" in str(err.value), f"pid {pid} missing from: {err.value}"
+    finally:
+        for p in procs.values():
+            p.kill()
+            p.wait()
+
+
+def test_a_failed_sweep_lands_in_the_run_control_error(tmp_path, monkeypatch):
+    # run_control still reports the sweep's failures once everything else has been tried
+    d = stage(tmp_path)
+    token = stage_token(d)
+
+    def sweep(_token, _floor, **_kw):
+        raise ReapFailed("pid 1: injected reap failure; pid 2: injected reap failure")
+
+    monkeypatch.setattr(sys.modules[__name__], "sweep_tagged", sweep)
+    monkeypatch.setattr(sys.modules[__name__], "INVOKE_LANE", tmp_path / "missing-lane.ps1")  # control fails fast
+    with pytest.raises(ReapFailed, match=r"tag sweep: pid 1: injected reap failure; pid 2: injected reap failure"):
+        run_control(d, survival_sec=0, host_wait_sec=1, timeout=60)
+    assert token  # the staged token is what the sweep would have been given
+
+
 # ---- a reap is only reported once the child is confirmed terminated ----------------------------------------------
 
 def _creation_filetime(pid):
@@ -745,11 +898,20 @@ def test_the_live_lane_job_reads_back_kill_on_close_and_nothing_else(job_flags):
 
 
 STRUCT_TO_PTR = "Marshal.StructureToPtr(value,mem,false);"
+_CS_ESCAPE = chr(0x5C) + "u"  # the two characters that open a C# unicode escape
 # Writes that never spell the LimitFlags identifier a second time, so neither the write regex nor the raw token count
 # of the static guard can see them; each ORs BREAKAWAY_OK (0x800) into the marshalled struct before it is applied.
 INDIRECT_BREAKAWAY_WRITES = {
-    "Marshal.WriteInt32 constant": "Marshal.WriteInt32(mem,16,0x2000|0x800);",
-    "Marshal.WriteInt32 read-modify-write": "Marshal.WriteInt32(mem,16,Marshal.ReadInt32(mem,16)|0x800);",
+    "Marshal.WriteInt32 constant": STRUCT_TO_PTR + "Marshal.WriteInt32(mem,16,0x2000|0x800);",
+    "Marshal.WriteInt32 read-modify-write": STRUCT_TO_PTR + "Marshal.WriteInt32(mem,16,Marshal.ReadInt32(mem,16)|0x800);",
+    # C# resolves a unicode escape inside an identifier before it tokenizes, so these ARE LimitFlags writes (they land on
+    # the struct before it is marshalled) that neither \bLimitFlags\b regex nor the raw token count can match. The
+    # backslash is built with chr() so no editor, formatter or Python string literal can decode the escape before the
+    # C# compiler sees it.
+    "unicode escape in the middle of the member name":
+        "value.BasicLimitInformation.Limit" + _CS_ESCAPE + "0046lags|=0x800;" + STRUCT_TO_PTR,
+    "unicode escape for the first letter of the member name":
+        "value.BasicLimitInformation." + _CS_ESCAPE + "004cimitFlags|=0x800;" + STRUCT_TO_PTR,
 }
 
 
@@ -757,7 +919,8 @@ INDIRECT_BREAKAWAY_WRITES = {
 def test_an_indirect_breakaway_write_is_invisible_to_the_text_guard_but_goes_red_at_runtime(name, tmp_path):
     src = INVOKE_LANE.read_text(encoding="utf-8")
     assert src.count(STRUCT_TO_PTR) == 1, "Invoke-Lane.ps1 no longer marshals the job struct the expected way"
-    mutated = src.replace(STRUCT_TO_PTR, STRUCT_TO_PTR + INDIRECT_BREAKAWAY_WRITES[name])
+    assert "LimitFlags" not in INDIRECT_BREAKAWAY_WRITES[name], f"{name}: the case spells LimitFlags, so it is not indirect"
+    mutated = src.replace(STRUCT_TO_PTR, INDIRECT_BREAKAWAY_WRITES[name])
     assert_kill_on_close_only(mutated)  # the static guard still passes: that is the gap this read-back closes
     lane_copy = tmp_path / "Invoke-Lane.mutated.ps1"
     lane_copy.write_text(mutated, encoding="utf-8")
@@ -766,6 +929,31 @@ def test_an_indirect_breakaway_write_is_invisible_to_the_text_guard_but_goes_red
     flags = probe_job_flags(stage(probe_dir), lane_copy)
     assert flags == 0x2800, f"{name}: the runtime read-back saw {flags:#x}, expected KILL_ON_JOB_CLOSE|BREAKAWAY_OK 0x2800"
     assert flags != JOB_FLAGS_KILL_ON_CLOSE_ONLY
+
+
+# A second statement on the call-site line itself: it ORs BREAKAWAY_OK (0x800) into the flags of the job the line just
+# created, through the class's private SetInformationJobObject (no LimitFlags spelling, no struct copy in the text).
+JOB_CALL_SITE_ORS_0x800 = (
+    "; $f = [MlvTestJobProbe]::LimitFlags($jobHandle) -bor 0x800"
+    "; $m = [Runtime.InteropServices.Marshal]::AllocHGlobal(144)"
+    "; 0..17 | ForEach-Object { [Runtime.InteropServices.Marshal]::WriteInt64($m, $_ * 8, 0) }"
+    "; [Runtime.InteropServices.Marshal]::WriteInt32($m, 16, $f)"
+    "; [void][MlvLaneJob].GetMethod('SetInformationJobObject', [Reflection.BindingFlags]'NonPublic,Static')"
+    ".Invoke($null, @($jobHandle, 9, $m, [uint32]144))")
+
+
+def test_a_call_site_that_changes_the_job_it_just_created_is_caught_statically_and_at_runtime(tmp_path):
+    src = INVOKE_LANE.read_text(encoding="utf-8")
+    assert src.count(JOB_CALL_SITE) == 1, "Invoke-Lane.ps1 no longer has the expected single job call site"
+    mutated = src.replace(JOB_CALL_SITE, JOB_CALL_SITE + JOB_CALL_SITE_ORS_0x800)
+    with pytest.raises(AssertionError, match="call site must be exactly one whole line"):
+        assert_kill_on_close_only(mutated)
+    lane_copy = tmp_path / "Invoke-Lane.mutated.ps1"
+    lane_copy.write_text(mutated, encoding="utf-8")
+    probe_dir = tmp_path / "probe"
+    probe_dir.mkdir()
+    flags = probe_job_flags(stage(probe_dir), lane_copy)
+    assert flags == 0x2800, f"the call-site read-back saw {flags:#x}, expected KILL_ON_JOB_CLOSE|BREAKAWAY_OK 0x2800"
 
 
 def test_the_finalizer_leaves_a_recycled_pid_alone():
