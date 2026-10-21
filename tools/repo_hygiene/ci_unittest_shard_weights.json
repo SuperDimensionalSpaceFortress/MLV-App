@@ -2,6 +2,9 @@
  "schema": 1,
  "seconds": {
   "ubuntu": {
+   "tools.repo_hygiene.test_analyze_frame_telemetry_na.AllNaFieldTests": 0.2,
+   "tools.repo_hygiene.test_analyze_frame_telemetry_na.MixedMeasuredFieldTests": 0.2,
+   "tools.repo_hygiene.test_analyze_frame_telemetry_na.NumericOnlyLogUnchangedTests": 0.1,
    "tools.repo_hygiene.test_attr3_footage_io_inventory.Attr3FootageIoInventoryTests": 7.5,
    "tools.repo_hygiene.test_attr3_footage_presence_job.FootagePresenceJobTests": 0.0,
    "tools.repo_hygiene.test_attr3_footage_presence_job.GetPresentPartIndexesTests": 0.0,
@@ -541,6 +544,9 @@
    "tools.repo_hygiene.test_workflow_pwsh_exit_guard.WorkflowPwshExitGuardTests": 0.0
   },
   "windows": {
+   "tools.repo_hygiene.test_analyze_frame_telemetry_na.AllNaFieldTests": 0.2,
+   "tools.repo_hygiene.test_analyze_frame_telemetry_na.MixedMeasuredFieldTests": 0.2,
+   "tools.repo_hygiene.test_analyze_frame_telemetry_na.NumericOnlyLogUnchangedTests": 0.1,
    "tools.repo_hygiene.test_attr3_footage_io_inventory.Attr3FootageIoInventoryTests": 4.0,
    "tools.repo_hygiene.test_attr3_footage_presence_job.FootagePresenceJobTests": 25.0,
    "tools.repo_hygiene.test_attr3_footage_presence_job.GetPresentPartIndexesTests": 3.6,

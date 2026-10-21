@@ -24914,6 +24914,8 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     m_playbackSmokeQueueWaitSumMs = 0.0;
     m_playbackSmokeLlrawprocSumMs = 0.0;
     m_playbackSmokeProcessed8SumMs = 0.0;
+    m_playbackSmokeProcessed8MeasuredFrames = 0;
+    m_playbackSmokeProcessed16MeasuredFrames = 0;
     m_playbackSmokeProcessed8CacheStoreSumMs = 0.0;
     m_playbackSmokeRawUint16SumMs = 0.0;
     m_playbackSmokeRawUint16DecompressSumMs = 0.0;
@@ -25332,6 +25334,12 @@ void MainWindow::notePlaybackSmokePresentedFrame(
         telemetryDoubleValue( timing, "llrawproc_ms" );
     const double processed8Ms =
         telemetryDoubleValue( timing, "processed8_total_ms" );
+    // PROCESSED8-MS-TELEMETRY-STUCK-1: false when the render thread did not run the
+    // stage this frame (an absent key is "not measured"); its timings are then not a cost.
+    const bool processed8Measured =
+        telemetryBoolValue( timing, "processed8_stage_measured" );
+    const bool processed16Measured =
+        telemetryBoolValue( timing, "processed16_stage_measured" );
     const double rawUint16Ms =
         telemetryDoubleValue( timing, "raw_uint16_ms" );
     const double rawUint16DecompressMs =
@@ -25917,16 +25925,24 @@ void MainWindow::notePlaybackSmokePresentedFrame(
     m_playbackSmokePresentRenderSlotReleaseSumMs += presentRenderSlotReleaseMs;
     m_playbackSmokePresentPacingSumMs += presentPacingMs;
     m_playbackSmokeLlrawprocSumMs += llrawprocMs;
-    m_playbackSmokeProcessed8SumMs += processed8Ms;
-    m_playbackSmokeProcessed8CacheStoreSumMs += processed8CacheStoreMs;
-    m_playbackSmokeProcessed16SetupSumMs += processed16SetupMs;
-    m_playbackSmokeProcessed16CoreMathSumMs += processed16CoreMathMs;
-    m_playbackSmokeProcessed16LocalToneSumMs += processed16LocalToneMs;
-    m_playbackSmokeProcessed16ThreadingOverheadSumMs += processed16ThreadingOverheadMs;
-    m_playbackSmokeProcessed8SetupSumMs += processed8SetupMs;
-    m_playbackSmokeProcessed8CoreMathSumMs += processed8CoreMathMs;
-    m_playbackSmokeProcessed8LocalToneSumMs += processed8LocalToneMs;
-    m_playbackSmokeProcessed8ThreadingOverheadSumMs += processed8ThreadingOverheadMs;
+    if( processed8Measured )
+    {
+        ++m_playbackSmokeProcessed8MeasuredFrames;
+        m_playbackSmokeProcessed8SumMs += processed8Ms;
+        m_playbackSmokeProcessed8CacheStoreSumMs += processed8CacheStoreMs;
+        m_playbackSmokeProcessed8SetupSumMs += processed8SetupMs;
+        m_playbackSmokeProcessed8CoreMathSumMs += processed8CoreMathMs;
+        m_playbackSmokeProcessed8LocalToneSumMs += processed8LocalToneMs;
+        m_playbackSmokeProcessed8ThreadingOverheadSumMs += processed8ThreadingOverheadMs;
+    }
+    if( processed16Measured )
+    {
+        ++m_playbackSmokeProcessed16MeasuredFrames;
+        m_playbackSmokeProcessed16SetupSumMs += processed16SetupMs;
+        m_playbackSmokeProcessed16CoreMathSumMs += processed16CoreMathMs;
+        m_playbackSmokeProcessed16LocalToneSumMs += processed16LocalToneMs;
+        m_playbackSmokeProcessed16ThreadingOverheadSumMs += processed16ThreadingOverheadMs;
+    }
     m_playbackSmokeRawUint16SumMs += rawUint16Ms;
     m_playbackSmokeRawUint16DecompressSumMs += rawUint16DecompressMs;
     m_playbackSmokeRawUint16UnpackSumMs += rawUint16UnpackMs;
@@ -26411,8 +26427,12 @@ void MainWindow::notePlaybackSmokePresentedFrame(
 
     if( m_playbackSmokeFrameLogEnabled )
     {
+        const auto measuredMsText = []( bool measured, double ms ) -> QString
+        {
+            return measured ? QString::number( ms, 'f', 3 ) : QStringLiteral("na");
+        };
         qInfo().noquote()
-            << QStringLiteral(
+            << ( QStringLiteral(
                    "playback_smoke.frame session=%1 index=%2 elapsed_ms=%3 "
                    "interval_ms=%4 display_frame=%5 position=%6 serial=%7 "
                    "scale_request=%8 scale_active=%9 worker_threads=%10 "
@@ -26459,7 +26479,7 @@ void MainWindow::notePlaybackSmokePresentedFrame(
                    .arg( renderWorkMs, 0, 'f', 3 )
                    .arg( queueWaitMs, 0, 'f', 3 )
                    .arg( llrawprocMs, 0, 'f', 3 )
-                   .arg( processed8Ms, 0, 'f', 3 )
+                   .arg( measuredMsText( processed8Measured, processed8Ms ) )
                    .arg( drawTotalMs, 0, 'f', 3 )
                    .arg( bool01( m_frameStillDrawing ) )
                    .arg( bool01( m_playbackFrameAdvancePending ) )
@@ -26469,14 +26489,14 @@ void MainWindow::notePlaybackSmokePresentedFrame(
                    .arg( presentOverlaysScopesMs, 0, 'f', 3 )
                    .arg( presentRenderSlotReleaseMs, 0, 'f', 3 )
                    .arg( presentPacingMs, 0, 'f', 3 )
-                   .arg( processed16SetupMs, 0, 'f', 3 )
-                   .arg( processed16CoreMathMs, 0, 'f', 3 )
-                   .arg( processed16LocalToneMs, 0, 'f', 3 )
-                   .arg( processed16ThreadingOverheadMs, 0, 'f', 3 )
-                   .arg( processed8SetupMs, 0, 'f', 3 )
-                   .arg( processed8CoreMathMs, 0, 'f', 3 )
-                   .arg( processed8LocalToneMs, 0, 'f', 3 )
-                   .arg( processed8ThreadingOverheadMs, 0, 'f', 3 )
+                   .arg( measuredMsText( processed16Measured, processed16SetupMs ) )
+                   .arg( measuredMsText( processed16Measured, processed16CoreMathMs ) )
+                   .arg( measuredMsText( processed16Measured, processed16LocalToneMs ) )
+                   .arg( measuredMsText( processed16Measured, processed16ThreadingOverheadMs ) )
+                   .arg( measuredMsText( processed8Measured, processed8SetupMs ) )
+                   .arg( measuredMsText( processed8Measured, processed8CoreMathMs ) )
+                   .arg( measuredMsText( processed8Measured, processed8LocalToneMs ) )
+                   .arg( measuredMsText( processed8Measured, processed8ThreadingOverheadMs ) )
                    .arg( bool01( telemetryBoolValue(
                        timing, "gpu_playback_recon_async_h2d_env_enabled" ) ) )
                    .arg( bool01( telemetryBoolValue(
@@ -26521,7 +26541,10 @@ void MainWindow::notePlaybackSmokePresentedFrame(
                        0, 'f', 3 )
                    .arg( telemetryDoubleValue(
                        timing, "playback_prep_region_unattributed_ms" ),
-                       0, 'f', 3 );
+                       0, 'f', 3 )
+               + QStringLiteral( " processed8_measured=%1 processed16_measured=%2" ) )
+                   .arg( bool01( processed8Measured ) )
+                   .arg( bool01( processed16Measured ) );
         qInfo().noquote()
             << QStringLiteral(
                    "playback_smoke.request_state session=%1 index=%2 serial=%3 "
@@ -28209,11 +28232,22 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
             ? m_playbackSmokeLlrawprocSumMs
               / static_cast<double>( m_playbackSmokePresentedFrames )
             : 0.0;
-    const double avgProcessed8Ms =
-        m_playbackSmokePresentedFrames > 0
-            ? m_playbackSmokeProcessed8SumMs
-              / static_cast<double>( m_playbackSmokePresentedFrames )
-            : 0.0;
+    // PROCESSED8-MS-TELEMETRY-STUCK-1: processed8/processed16 averages cover only the
+    // frames whose render ran that stage, and print "na" when none did.
+    const auto avgMeasuredMsText = []( double sum, int measuredFrames ) -> QString
+    {
+        return measuredFrames > 0
+            ? QString::number( sum / static_cast<double>( measuredFrames ), 'f', 3 )
+            : QStringLiteral("na");
+    };
+    const auto avgProcessed8MsText = [&]( double sum ) -> QString
+    {
+        return avgMeasuredMsText( sum, m_playbackSmokeProcessed8MeasuredFrames );
+    };
+    const auto avgProcessed16MsText = [&]( double sum ) -> QString
+    {
+        return avgMeasuredMsText( sum, m_playbackSmokeProcessed16MeasuredFrames );
+    };
     const double avgDrawTotalMs =
         m_playbackSmokePresentedFrames > 0
             ? m_playbackSmokeDrawTotalSumMs
@@ -28334,7 +28368,7 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                .arg( avgRenderWorkMs, 0, 'f', 3 )
                .arg( avgQueueWaitMs, 0, 'f', 3 )
                .arg( avgLlrawprocMs, 0, 'f', 3 )
-               .arg( avgProcessed8Ms, 0, 'f', 3 )
+               .arg( avgProcessed8MsText( m_playbackSmokeProcessed8SumMs ) )
                .arg( avgDrawTotalMs, 0, 'f', 3 )
                .arg( m_playbackSmokeDrawTotalMaxMs, 0, 'f', 3 )
                .arg( m_playbackSmokeStartWorkerThreads )
@@ -28774,8 +28808,11 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
         insertNullableDouble(
             &averageFrame,
             QStringLiteral("stage_process_ms"),
-            avgSmokeMs( m_playbackSmokeProcessed8SumMs ),
-            hasFrames );
+            m_playbackSmokeProcessed8MeasuredFrames > 0
+                ? m_playbackSmokeProcessed8SumMs
+                  / static_cast<double>( m_playbackSmokeProcessed8MeasuredFrames )
+                : 0.0,
+            m_playbackSmokeProcessed8MeasuredFrames > 0 );
         insertNullableDouble(
             &averageFrame,
             QStringLiteral("stage_queue_wait_ms"),
@@ -29093,16 +29130,16 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                .arg( avgSmokeMs( m_playbackSmokeProcessingCoreCreativeCurveSumMs ), 0, 'f', 3 )
                .arg( avgSmokeMs( m_playbackSmokeProcessingCoreCreativeGradationSumMs ), 0, 'f', 3 )
                .arg( avgSmokeMs( m_playbackSmokeProcessingCoreCreativeAgxInverseSumMs ), 0, 'f', 3 )
-               .arg( avgSmokeMs( m_playbackSmokeProcessed16SetupSumMs ), 0, 'f', 3 )
-               .arg( avgSmokeMs( m_playbackSmokeProcessed16CoreMathSumMs ), 0, 'f', 3 )
-               .arg( avgSmokeMs( m_playbackSmokeProcessed16LocalToneSumMs ), 0, 'f', 3 )
-               .arg( avgSmokeMs( m_playbackSmokeProcessed16ThreadingOverheadSumMs ), 0, 'f', 3 )
+               .arg( avgProcessed16MsText( m_playbackSmokeProcessed16SetupSumMs ) )
+               .arg( avgProcessed16MsText( m_playbackSmokeProcessed16CoreMathSumMs ) )
+               .arg( avgProcessed16MsText( m_playbackSmokeProcessed16LocalToneSumMs ) )
+               .arg( avgProcessed16MsText( m_playbackSmokeProcessed16ThreadingOverheadSumMs ) )
                .arg( avgSmokeMs( m_playbackSmokeProcessed16CacheStoreSumMs ), 0, 'f', 3 )
-               .arg( avgSmokeMs( m_playbackSmokeProcessed8SetupSumMs ), 0, 'f', 3 )
-               .arg( avgSmokeMs( m_playbackSmokeProcessed8CoreMathSumMs ), 0, 'f', 3 )
-               .arg( avgSmokeMs( m_playbackSmokeProcessed8LocalToneSumMs ), 0, 'f', 3 )
-               .arg( avgSmokeMs( m_playbackSmokeProcessed8ThreadingOverheadSumMs ), 0, 'f', 3 )
-               .arg( avgSmokeMs( m_playbackSmokeProcessed8CacheStoreSumMs ), 0, 'f', 3 );
+               .arg( avgProcessed8MsText( m_playbackSmokeProcessed8SetupSumMs ) )
+               .arg( avgProcessed8MsText( m_playbackSmokeProcessed8CoreMathSumMs ) )
+               .arg( avgProcessed8MsText( m_playbackSmokeProcessed8LocalToneSumMs ) )
+               .arg( avgProcessed8MsText( m_playbackSmokeProcessed8ThreadingOverheadSumMs ) )
+               .arg( avgProcessed8MsText( m_playbackSmokeProcessed8CacheStoreSumMs ) );
 
     qInfo().noquote()
         << QStringLiteral(
@@ -29126,24 +29163,27 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                .arg( avgSmokeMs( m_playbackSmokePresentOverlaysScopesSumMs ), 0, 'f', 3 )
                .arg( avgSmokeMs( m_playbackSmokePresentRenderSlotReleaseSumMs ), 0, 'f', 3 )
                .arg( avgSmokeMs( m_playbackSmokePresentPacingSumMs ), 0, 'f', 3 )
-               .arg( avgSmokeMs( m_playbackSmokeProcessed16SetupSumMs ), 0, 'f', 3 )
-               .arg( avgSmokeMs( m_playbackSmokeProcessed16CoreMathSumMs ), 0, 'f', 3 )
-               .arg( avgSmokeMs( m_playbackSmokeProcessed16LocalToneSumMs ), 0, 'f', 3 )
-               .arg( avgSmokeMs( m_playbackSmokeProcessed16ThreadingOverheadSumMs ), 0, 'f', 3 )
-               .arg( avgSmokeMs( m_playbackSmokeProcessed8SetupSumMs ), 0, 'f', 3 )
-               .arg( avgSmokeMs( m_playbackSmokeProcessed8CoreMathSumMs ), 0, 'f', 3 )
-               .arg( avgSmokeMs( m_playbackSmokeProcessed8LocalToneSumMs ), 0, 'f', 3 )
-               .arg( avgSmokeMs( m_playbackSmokeProcessed8ThreadingOverheadSumMs ), 0, 'f', 3 );
+               .arg( avgProcessed16MsText( m_playbackSmokeProcessed16SetupSumMs ) )
+               .arg( avgProcessed16MsText( m_playbackSmokeProcessed16CoreMathSumMs ) )
+               .arg( avgProcessed16MsText( m_playbackSmokeProcessed16LocalToneSumMs ) )
+               .arg( avgProcessed16MsText( m_playbackSmokeProcessed16ThreadingOverheadSumMs ) )
+               .arg( avgProcessed8MsText( m_playbackSmokeProcessed8SetupSumMs ) )
+               .arg( avgProcessed8MsText( m_playbackSmokeProcessed8CoreMathSumMs ) )
+               .arg( avgProcessed8MsText( m_playbackSmokeProcessed8LocalToneSumMs ) )
+               .arg( avgProcessed8MsText( m_playbackSmokeProcessed8ThreadingOverheadSumMs ) );
 
     qInfo().noquote()
         << QStringLiteral(
                "playback_smoke.processed8_cache_summary session=%1 "
                "processed8_cache_hits=%2 processed8_prefetch_hits=%3 "
-               "processed8_direct_path_frames=%4" )
+               "processed8_direct_path_frames=%4 "
+               "processed8_measured_frames=%5 processed16_measured_frames=%6" )
                .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
                .arg( m_playbackSmokeProcessed8CacheHits )
                .arg( m_playbackSmokeProcessed8PrefetchHits )
-               .arg( m_playbackSmokeProcessed8DirectPathFrames );
+               .arg( m_playbackSmokeProcessed8DirectPathFrames )
+               .arg( m_playbackSmokeProcessed8MeasuredFrames )
+               .arg( m_playbackSmokeProcessed16MeasuredFrames );
 
     /* CPU-DUALISO-AT-PREVIEW-SCALE-1: which recon scale the phase-3 worker ran
      * for the presented frames (avg_llrawproc_* in cpu_summary is the recon at
