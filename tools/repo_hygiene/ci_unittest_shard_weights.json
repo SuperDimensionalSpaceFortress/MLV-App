@@ -534,6 +534,8 @@
    "tools.repo_hygiene.test_venue_chain_runner.VenueChainRunnerTests": 0.0,
    "tools.repo_hygiene.test_venue_chain_runner.VenueChainSupplementaryTests": 0.0,
    "tools.repo_hygiene.test_venue_claim_fifo.VenueClaimFifoTests": 0.0,
+   "tools.repo_hygiene.test_venue_stage_nightly.VenueStageNightlyTests": 0.0,
+   "tools.repo_hygiene.test_venue_stage_nightly.VenueStageReuseModuleTests": 0.0,
    "tools.repo_hygiene.test_verify_consented_footage.VerifyConsentedFootageTests": 0.0,
    "tools.repo_hygiene.test_workflow_pwsh_exit_guard.WorkflowPwshExitGuardTests": 0.0
   },
@@ -546,7 +548,7 @@
    "tools.repo_hygiene.test_attr3_footage_stage.FootageStageJobTests": 74.2,
    "tools.repo_hygiene.test_attr3_footage_stage.NoPathInAnyBranchTests": 8.5,
    "tools.repo_hygiene.test_attr3_footage_stage.QueueWaitBoundTests": 0.0,
-   "tools.repo_hygiene.test_attr3_footage_stage.SameJobIdRulingPremiseTests": 3.0,
+   "tools.repo_hygiene.test_attr3_footage_stage.SameJobIdRulingPremiseTests": 3.3,
    "tools.repo_hygiene.test_attr3_footage_stage.SendPartToStagingTests": 14.0,
    "tools.repo_hygiene.test_attr3_owner_clip_stage_stall.CompleteChainSingleReadTests": 16.7,
    "tools.repo_hygiene.test_attr3_owner_clip_stage_stall.FootagePartVerifierModesTests": 3.5,
@@ -671,7 +673,7 @@
    "tools.repo_hygiene.test_dual_venue_git_calls.LegLookupCostTests": 9.3,
    "tools.repo_hygiene.test_dual_venue_git_calls.SleeperDiscoveryTests": 1.4,
    "tools.repo_hygiene.test_dual_venue_owner_footage_gate.GateBindsToItsGuardsTests": 0.3,
-   "tools.repo_hygiene.test_dual_venue_owner_footage_gate.RouteDeleteSurfaceTests": 2.5,
+   "tools.repo_hygiene.test_dual_venue_owner_footage_gate.RouteDeleteSurfaceTests": 4.8,
    "tools.repo_hygiene.test_duration_as_proof_inventory.DurationAsProofInventoryTests": 7.0,
    "tools.repo_hygiene.test_dve_leg_terminals.BackendNotDerivableRuleTests": 0.8,
    "tools.repo_hygiene.test_dve_leg_terminals.CpuLegSkippedRatioIsMeasuredNotGatedTests": 26.0,
@@ -1070,6 +1072,8 @@
    "tools.repo_hygiene.test_venue_chain_runner.VenueChainRunnerTests": 284.9,
    "tools.repo_hygiene.test_venue_chain_runner.VenueChainSupplementaryTests": 166.1,
    "tools.repo_hygiene.test_venue_claim_fifo.VenueClaimFifoTests": 113.1,
+   "tools.repo_hygiene.test_venue_stage_nightly.VenueStageNightlyTests": 146.7,
+   "tools.repo_hygiene.test_venue_stage_nightly.VenueStageReuseModuleTests": 1.2,
    "tools.repo_hygiene.test_verify_consented_footage.VerifyConsentedFootageTests": 0.0,
    "tools.repo_hygiene.test_workflow_pwsh_exit_guard.WorkflowPwshExitGuardTests": 0.2
   }
