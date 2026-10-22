@@ -115,7 +115,7 @@ def build(frames_dir: str, outbox_root: str) -> dict[str, Any]:
             row["provenance"] = "orphaned - no capture record with these pixels under the searched root"
         else:
             matched += 1
-            with open(manifest_path, encoding="utf-8") as fh:
+            with open(manifest_path, encoding="utf-8-sig") as fh:
                 row.update(_identity(json.load(fh)))
             row["manifest"] = manifest_path
         records.append(row)

@@ -778,6 +778,8 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
         self.assertFalse((pub / "capture" / "reference-frame-candidate.invalid").exists())
         manifest = json.loads((pub / "capture" / "reference-frame-candidate.json").read_text(encoding="utf-8-sig"))
         self.assertEqual((manifest["status"], manifest["invalid"]), ("invalid", True))
+        # No `skipped` argument first, so a reader that predates the stamp check fails here on the assertion, not on a TypeError for the new parameter.
+        self.assertEqual(self._frame_provenance().index_capture_records(str(pub)), {}, "frame_provenance still indexes the stamped-invalid capture")
         skipped: list[dict] = []
         self.assertEqual(self._frame_provenance().index_capture_records(str(pub), skipped), {}, "frame_provenance still indexes the stamped-invalid capture")
         self.assertEqual([s["reason"] for s in skipped], ["manifest-stamped-invalid"])
