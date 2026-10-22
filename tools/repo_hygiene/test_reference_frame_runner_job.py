@@ -799,6 +799,21 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
         self.assert_quarantined_to(ran, pub, "reference-frame-candidate.INVALID.2.json",
                                    ("reference-frame-candidate.INVALID.json", "reference-frame-candidate.INVALID.1.json"))
 
+    def test_a_marker_that_cannot_be_written_but_a_stamp_that_lands_is_still_not_a_candidate_to_the_reader(self) -> None:
+        """REFERENCE-FRAME-CONSUMER-HONORS-INVALID-STAMP-1: marker publish fails, stamp succeeds -> no marker and no quarantine (the job only does
+        either when the stamp failed too), so the stamp alone must keep frame_provenance from indexing the voided capture."""
+        ran, pub, _, _, _, _ = self.run_stand_in_capture("markerfails", edit=self.VIEW_CHANGED, more_edits=(self.MARKER_PUBLISH_FAILS,))
+        self.assertEqual(ran.returncode, 225, ran.stdout + ran.stderr)
+        self.assertIn("CANDIDATE_MARKER_NOT_WRITTEN", ran.stdout)
+        result = json.loads((pub / "result.json").read_text(encoding="utf-8-sig"))
+        self.assertEqual((result["candidateInvalidated"], result["candidateInvalidMarker"], result["candidateQuarantined"]), (True, False, None))
+        self.assertFalse((pub / "capture" / "reference-frame-candidate.invalid").exists())
+        manifest = json.loads((pub / "capture" / "reference-frame-candidate.json").read_text(encoding="utf-8-sig"))
+        self.assertEqual((manifest["status"], manifest["invalid"]), ("invalid", True))
+        skipped: list[dict] = []
+        self.assertEqual(self._frame_provenance().index_capture_records(str(pub), skipped), {}, "frame_provenance still indexes the stamped-invalid capture")
+        self.assertEqual([s["reason"] for s in skipped], ["manifest-stamped-invalid"])
+
     def test_a_capture_that_passed_writes_no_invalid_marker_and_reports_none(self) -> None:
         ran, pub, _, _, _, _ = self.run_stand_in_capture("nomarkerok")
         self.assertEqual(ran.returncode, 0, ran.stdout + ran.stderr)

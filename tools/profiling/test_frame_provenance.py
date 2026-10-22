@@ -136,6 +136,101 @@ def test_a_capture_with_an_invalid_marker_is_not_indexed_whatever_its_manifest_s
     assert (result["matched"], result["orphaned"]) == (0, 1)
 
 
+def _stamp_invalid(capture_dir: str, **fields) -> None:
+    """Rewrite a capture's manifest the way reference-frame-runner-job.ps1 stamps a voided one (status, invalid, invalid_reasons)."""
+    path = os.path.join(capture_dir, "reference-frame-candidate.json")
+    with open(path, encoding="utf-8") as fh:
+        doc = json.load(fh)
+    doc.update(fields)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(doc, fh)
+
+
+@pytest.mark.parametrize("fields", [
+    {"status": "invalid", "invalid": True, "invalid_reasons": ["OWNER_FOOTAGE_VIEW_CHANGED_DURING_CAPTURE"]},
+    {"invalid": True},
+    {"status": "invalid"},
+], ids=["full-runner-stamp", "invalid-flag-only", "status-only"])
+def test_a_manifest_stamped_invalid_is_not_indexed_even_with_no_marker_and_no_quarantine(tmp_path, fields):
+    """REFERENCE-FRAME-CONSUMER-HONORS-INVALID-STAMP-1: when the runner job cannot publish the marker but CAN stamp the manifest, it writes no
+    marker and does not quarantine (it only does either when the stamp failed too). The stamp is then the only record that the capture was
+    voided, so the consumer must read it: the voided pixels bind to nothing and the skip carries a typed reason."""
+    ob = tmp_path / "outbox"
+    d = _capture(str(ob), "voided", b"PIXELS-V", _manifest("aaaaaaaaaaaa"))
+    _capture(str(ob), "good", b"PIXELS-G", _manifest("bbbbbbbbbbbb"))
+    _stamp_invalid(d, **fields)
+    assert not os.path.exists(os.path.join(d, "reference-frame-candidate.invalid"))
+    assert os.path.isfile(os.path.join(d, "reference-frame-candidate.json"))
+
+    skipped: list[dict] = []
+    index = index_capture_records(str(ob), skipped)
+
+    assert len(index) == 1
+    assert list(index.values())[0].endswith(os.path.join("good", "reference-frame-candidate.json"))
+    assert [(s["reason"], os.path.basename(s["capture"])) for s in skipped] == [("manifest-stamped-invalid", "voided")]
+    frames = tmp_path / "frames"
+    frames.mkdir()
+    (frames / "v.png").write_bytes(b"PIXELS-V")
+    (frames / "g.png").write_bytes(b"PIXELS-G")
+    result = build(str(frames), str(ob))
+    assert (result["matched"], result["orphaned"]) == (1, 1)
+    assert [(s["reason"], os.path.basename(s["capture"])) for s in result["skipped"]] == [("manifest-stamped-invalid", "voided")]
+
+
+def test_a_stamped_invalid_manifest_binds_nothing_through_the_unchanged_api(tmp_path):
+    """The behavioural core, through the signatures that existed before the skip report: a frame with a stamped-invalid capture's pixels is an orphan."""
+    ob = tmp_path / "outbox"
+    d = _capture(str(ob), "voided", b"PIXELS-V", _manifest("aaaaaaaaaaaa"))
+    _stamp_invalid(d, status="invalid", invalid=True, invalid_reasons=["OWNER_FOOTAGE_VIEW_CHANGED_DURING_CAPTURE"])
+    frames = tmp_path / "frames"
+    frames.mkdir()
+    (frames / "v.png").write_bytes(b"PIXELS-V")
+
+    assert index_capture_records(str(ob)) == {}
+    result = build(str(frames), str(ob))
+    assert (result["matched"], result["orphaned"]) == (0, 1)
+    assert "commit" not in result["frames"][0]
+
+
+def test_a_marker_skip_carries_its_own_typed_reason(tmp_path):
+    ob = tmp_path / "outbox"
+    d = _capture(str(ob), "voided", b"PIXELS-V", _manifest("aaaaaaaaaaaa"))
+    with open(os.path.join(d, "reference-frame-candidate.invalid"), "w", encoding="utf-8") as fh:
+        fh.write("{}")
+    skipped: list[dict] = []
+
+    assert index_capture_records(str(ob), skipped) == {}
+    assert [s["reason"] for s in skipped] == ["invalid-marker"]
+
+
+def test_a_valid_capture_output_is_unchanged_and_names_no_skips(tmp_path):
+    """Valid-capture behaviour is byte-identical: no 'skipped' key appears, and a manifest whose invalid/status fields are present but benign
+    (invalid false, status candidate-unreviewed) is still a candidate."""
+    ob = tmp_path / "outbox"
+    d = _capture(str(ob), "run1", b"PIXELS-A", _manifest("aaaaaaaaaaaa"))
+    _stamp_invalid(d, status="candidate-unreviewed", invalid=False)
+    frames = tmp_path / "frames"
+    frames.mkdir()
+    (frames / "f.png").write_bytes(b"PIXELS-A")
+
+    result = build(str(frames), str(ob))
+
+    assert (result["matched"], result["orphaned"]) == (1, 0)
+    assert "skipped" not in result
+
+
+def test_an_unparseable_manifest_without_a_marker_keeps_its_existing_behaviour(tmp_path):
+    """Not widened: a manifest that does not parse and has no marker is indexed exactly as before (the stamp cannot be read, so nothing is claimed)."""
+    ob = tmp_path / "outbox"
+    d = _capture(str(ob), "broken", b"PIXELS-B", _manifest("aaaaaaaaaaaa"))
+    with open(os.path.join(d, "reference-frame-candidate.json"), "w", encoding="utf-8") as fh:
+        fh.write('{"status": "candidate-unreviewed", "trunc')
+    skipped: list[dict] = []
+
+    assert len(index_capture_records(str(ob), skipped)) == 1
+    assert skipped == []
+
+
 def test_an_unparseable_manifest_with_a_marker_does_not_crash_the_index(tmp_path):
     ob = tmp_path / "outbox"
     d = _capture(str(ob), "broken", b"PIXELS-B", _manifest("aaaaaaaaaaaa"))

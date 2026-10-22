@@ -36,17 +36,42 @@ def sha256_file(path: str) -> str:
     return h.hexdigest()
 
 
-def index_capture_records(outbox_root: str) -> dict[str, str]:
+def _manifest_stamped_invalid(manifest_path: str) -> bool:
+    """True when the manifest itself says the capture was voided (the runner job's in-place stamp: ``invalid`` true and/or status ``invalid``).
+
+    REFERENCE-FRAME-CONSUMER-HONORS-INVALID-STAMP-1: the runner job writes the marker first, but when only the marker publish fails and the
+    stamp lands it writes no marker and does not quarantine, so the stamp is the only record. A manifest that cannot be read or parsed is not
+    claimed to be stamped (False): that case keeps its prior behaviour.
+    """
+    try:
+        with open(manifest_path, encoding="utf-8-sig") as fh:
+            doc = json.load(fh)
+    except (OSError, ValueError):
+        return False
+    return isinstance(doc, dict) and (doc.get("invalid") is True or doc.get("status") == "invalid")
+
+
+def index_capture_records(outbox_root: str, skipped: list[dict[str, str]] | None = None) -> dict[str, str]:
     """Map pixel-SHA256 -> candidate manifest path, for every capture under a root.
 
     A manifest whose sibling frame is missing is skipped: it describes a capture whose
     image is gone, so it can never be the source of a frame we hold. A manifest beside an
     ``INVALID_MARKER_NAME`` file is skipped for the same reason in the other direction: the
-    capture was voided, so its pixels are not a candidate.
+    capture was voided, so its pixels are not a candidate. So is a manifest that is itself
+    stamped invalid. When ``skipped`` is given, each voided capture is appended to it as
+    ``{"capture": <dir>, "reason": "invalid-marker" | "manifest-stamped-invalid"}``.
     """
     index: dict[str, str] = {}
     for dirpath, _dirnames, filenames in os.walk(outbox_root):
-        if CANDIDATE_NAME not in filenames or INVALID_MARKER_NAME in filenames:
+        if CANDIDATE_NAME not in filenames:
+            continue
+        if INVALID_MARKER_NAME in filenames:
+            if skipped is not None:
+                skipped.append({"capture": dirpath, "reason": "invalid-marker"})
+            continue
+        if _manifest_stamped_invalid(os.path.join(dirpath, CANDIDATE_NAME)):
+            if skipped is not None:
+                skipped.append({"capture": dirpath, "reason": "manifest-stamped-invalid"})
             continue
         frame = os.path.join(dirpath, FRAME_NAME)
         if not os.path.isfile(frame):
@@ -72,7 +97,8 @@ def _identity(manifest: dict[str, Any]) -> dict[str, Any]:
 
 def build(frames_dir: str, outbox_root: str) -> dict[str, Any]:
     """Bind every ``*.png`` in ``frames_dir`` to a capture record, or mark it orphaned."""
-    index = index_capture_records(outbox_root)
+    skipped: list[dict[str, str]] = []
+    index = index_capture_records(outbox_root, skipped)
     records: list[dict[str, Any]] = []
     matched = 0
     for name in sorted(os.listdir(frames_dir)):
@@ -93,7 +119,7 @@ def build(frames_dir: str, outbox_root: str) -> dict[str, Any]:
                 row.update(_identity(json.load(fh)))
             row["manifest"] = manifest_path
         records.append(row)
-    return {
+    result: dict[str, Any] = {
         "schema": SCHEMA,
         "framesDir": frames_dir,
         "outboxRoot": outbox_root,
@@ -102,6 +128,10 @@ def build(frames_dir: str, outbox_root: str) -> dict[str, Any]:
         "orphaned": len(records) - matched,
         "frames": records,
     }
+    if skipped:
+        # Only present when a voided capture was passed over, so a root with none renders byte-identically to before.
+        result["skipped"] = skipped
+    return result
 
 
 def main(argv: list[str] | None = None) -> int:
