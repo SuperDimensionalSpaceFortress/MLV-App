@@ -2129,6 +2129,8 @@ def check_commit(repo: pathlib.Path, sha: str, added_items: set[str],
 
 SENT_LEDGER_ABSENT = "sent-ledger-absent"
 SENT_LEDGER_UNREADABLE = "sent-ledger-unreadable"
+SENT_LEDGER_PARTIAL = "sent-ledger-partial"
+SENT_KEY_RE = re.compile(r"[0-9a-f]{16}")   # idempotency_key(): sha256 hexdigest, first 16 characters
 SUPERSEDES_LINE_RE = re.compile(r"^\s*(?:[-*]\s+)?(?:\*\*)?supersedes:(?:\*\*)?(.*)$", re.IGNORECASE)
 SUPERSEDES_SPLIT_RE = re.compile(r"[\s,;]+")
 SUPERSEDES_TOKEN_EDGE = "()[]{}<>`'\"*.:"
@@ -2159,16 +2161,45 @@ def find_sent_ledger(repo: pathlib.Path, ledger: pathlib.Path | None) -> pathlib
     `ledger_rel`, then the same path in the checkout that owns the git dir: the ledger is untracked, so a linked
     worktree (where lanes work) never holds it."""
     if ledger is not None:
-        return ledger if ledger.is_file() else None
+        return ledger if ledger.exists() else None
     own = repo / LEDGER_REL
-    if own.is_file():
+    if own.exists():
         return own
     rc, common, _err = git_try(repo, "rev-parse", "--git-common-dir")
     if rc == 0 and common:
         main_git = (repo / common).resolve()
-        if main_git.name == ".git" and (main_git.parent / LEDGER_REL).is_file():
+        if main_git.name == ".git" and (main_git.parent / LEDGER_REL).exists():
             return main_git.parent / LEDGER_REL
     return None
+
+
+def read_sent_ledger(ledger: pathlib.Path) -> tuple[set[str], int, int]:
+    """(usable keys, non-blank rows, rows that carry no usable key) for the sent ledger the guard judges against.
+    Stricter than `read_ledger_keys` (the drain's read): the guard exists to stop a republish, so a read it could not
+    complete is UNKNOWN, never a pass. A path that cannot be opened or decoded raises Unknown(SENT_LEDGER_UNREADABLE).
+    A row is usable only when it is a JSON object whose `key` matches SENT_KEY_RE, the shape `idempotency_key` writes."""
+    try:
+        text = ledger.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as e:
+        raise Unknown(SENT_LEDGER_UNREADABLE, f"{ledger}: {e}") from e
+    keys: set[str] = set()
+    rows = bad = 0
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        rows += 1
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            bad += 1
+            continue
+        key = row.get("key") if isinstance(row, dict) else None
+        if isinstance(key, str) and SENT_KEY_RE.fullmatch(key):
+            keys.add(key)
+        else:
+            bad += 1
+    return keys, rows, bad
 
 
 def _item_paths(paths: Iterable[str]) -> list[str]:
@@ -2221,7 +2252,10 @@ def check_commits(repo: pathlib.Path, rev_range: str, deny_terms: list[tuple[str
     when the range cannot be resolved -- an unresolvable range is not a passing one.
     The sent-item-edit check needs the sent ledger (see find_sent_ledger). With none, it is NOT run and
     `sent-ledger-absent: <path>` is appended to `skips` for the caller to print: unchecked is not checked. A ledger
-    that exists but yields no key cannot say what was sent, so it is the same skip, `sent-ledger-unreadable: <path>`."""
+    with no row at all cannot say what was sent, so it is the same skip, `sent-ledger-unreadable: <path>`.
+    A ledger that exists but cannot be opened or decoded raises Unknown(`sent-ledger-unreadable`), and one with any row
+    that is not a JSON object carrying a well-formed `key` raises Unknown(`sent-ledger-partial`, "<path>: N of M ..."):
+    the guard would otherwise run on a partial key set without saying so. Both fail closed (exit 2; pre-push refuses)."""
     require_configured()
     for end in [e for e in re.split(r"\.{2,3}", rev_range) if e]:
         rc, _out, _err = git_try(repo, "rev-parse", "--verify", "--quiet", f"{end}^{{commit}}")
@@ -2230,7 +2264,11 @@ def check_commits(repo: pathlib.Path, rev_range: str, deny_terms: list[tuple[str
     shas = git(repo, "rev-list", "--no-merges", "--reverse", rev_range).split()
     added = range_added_items(repo, rev_range)
     found = find_sent_ledger(repo, ledger)
-    sent_keys = read_ledger_keys(found) if found is not None else None
+    sent_keys: set[str] | None = None
+    if found is not None:
+        sent_keys, rows, bad = read_sent_ledger(found)
+        if bad:
+            raise Unknown(SENT_LEDGER_PARTIAL, f"{found}: {bad} of {rows} row(s) are unparseable or carry no well-formed key")
     if skips is not None and not sent_keys:
         skips.append(f"{SENT_LEDGER_UNREADABLE}: {found}" if found is not None else
                      f"{SENT_LEDGER_ABSENT}: {ledger if ledger is not None else repo / LEDGER_REL}")

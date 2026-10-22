@@ -1535,15 +1535,138 @@ def test_a_supersedes_naming_the_sent_item_exactly_by_each_accepted_form_allows_
     assert _check_commits(ob, repo, base, ledger) == 0
 
 
-def test_a_ledger_with_no_readable_key_is_a_typed_skip_not_a_pass(ob, repo, tmp_path, capsys):
-    """A ledger that exists but yields no key (empty, truncated, wrong shape) cannot say what was sent: the check did not run."""
+def test_a_ledger_with_no_rows_is_a_typed_skip_not_a_pass(ob, repo, tmp_path, capsys):
+    """A ledger that exists but holds no row at all (empty, blank lines) cannot say what was sent: the check did not run."""
     commit(repo, {SENT_ITEM: item_text()}, "file it\n\nDoctrine-Export: outbox\n")
     base = git(repo, "rev-parse", "HEAD")
     commit(repo, {SENT_ITEM: item_text(body="### A finding\nEdited.\n")}, "edit\n\nDoctrine-Export: none\n")
-    for n, content in enumerate(("", "\n\n", "{not json\n", '{"item": "no-key"}\n', '["key"]\n')):
+    for n, content in enumerate(("", "\n\n")):
         ledger = tmp_path / f"unreadable-{n}.jsonl"
         ledger.write_text(content, encoding="utf-8")
         assert _check_commits(ob, repo, base, ledger) == 0
         out = capsys.readouterr().out
         assert "sent-ledger-unreadable" in out and "SKIPPED" in out and "trailers only" in out, (content, out)
         assert "check-commits OK" not in out, (content, out)
+
+
+# ---- the sent-ledger read fails CLOSED (OUTBOX-SENT-GUARD-LEDGER-READ-HARDENING-1) ----
+# A ledger the guard cannot open or decode, or one with rows it cannot use, must not let a range pass: the guard exists
+# to stop a republish, so "could not look" and "looked at part of it" are both UNKNOWN (exit 2), never a quiet pass.
+
+def _edited_sent_item_range(ob, repo: Path, ledger: Path) -> tuple[str, str]:
+    """Send SENT_ITEM (a good row lands in `ledger`), then edit it; returns (base sha, the sent key)."""
+    key = _record_sent(ob, repo, ledger)
+    base = git(repo, "rev-parse", "HEAD")
+    commit(repo, {SENT_ITEM: item_text(body="### A finding\nEdited after it was sent.\n")}, "edit\n\nDoctrine-Export: none\n")
+    return base, key
+
+
+def test_a_ledger_that_cannot_be_opened_fails_closed(ob, repo, tmp_path, capsys):
+    ledger = tmp_path / "sent.jsonl"
+    ledger.mkdir()   # exists, is not a file: reading it raises OSError (PermissionError / IsADirectoryError)
+    commit(repo, {SENT_ITEM: item_text()}, "file it\n\nDoctrine-Export: outbox\n")
+    base = git(repo, "rev-parse", "HEAD")
+    commit(repo, {SENT_ITEM: item_text(body="### A finding\nEdited.\n")}, "edit\n\nDoctrine-Export: none\n")
+    assert _check_commits(ob, repo, base, ledger) == 2
+    cap = capsys.readouterr()
+    assert "UNKNOWN" in cap.err and "sent-ledger-unreadable" in cap.err and str(ledger) in cap.err, cap.err
+    assert "check-commits OK" not in cap.out and "SKIPPED" not in cap.out, cap.out
+
+
+def test_a_ledger_whose_read_raises_oserror_fails_closed(ob, repo, tmp_path, capsys, monkeypatch):
+    """A locked ledger: the file is there (is_file is true) but the read raises. No real lock, so nothing can hang."""
+    ledger = tmp_path / "sent.jsonl"
+    base, _key = _edited_sent_item_range(ob, repo, ledger)
+    real_read_text = Path.read_text
+
+    def locked(self, *args, **kwargs):
+        if self == ledger:
+            raise PermissionError(13, "The process cannot access the file because it is being used by another process")
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", locked)
+    assert _check_commits(ob, repo, base, ledger) == 2
+    cap = capsys.readouterr()
+    assert "UNKNOWN" in cap.err and "sent-ledger-unreadable" in cap.err and "being used by another process" in cap.err, cap.err
+    assert "check-commits OK" not in cap.out and "SKIPPED" not in cap.out, cap.out
+
+
+def test_a_ledger_with_invalid_utf8_fails_closed(ob, repo, tmp_path, capsys):
+    ledger = tmp_path / "sent.jsonl"
+    base, _key = _edited_sent_item_range(ob, repo, ledger)
+    with open(ledger, "ab") as fh:
+        fh.write(b'{"key": "\xff\xfe\xfa", "item": "latin-1 junk"}\n')
+    assert _check_commits(ob, repo, base, ledger) == 2
+    cap = capsys.readouterr()
+    assert "UNKNOWN" in cap.err and "sent-ledger-unreadable" in cap.err, cap.err
+    assert "check-commits OK" not in cap.out and "SKIPPED" not in cap.out, cap.out
+
+
+def test_pre_push_refuses_a_push_it_could_not_check_against_an_unreadable_default_ledger(ob, repo, monkeypatch, capsys):
+    """The pre-push hook already turns an Unknown into a refused push (exit 1), the same shape an unresolvable range gets."""
+    ledger = repo / ob.LEDGER_REL
+    base, _key = _edited_sent_item_range(ob, repo, ledger)
+    ledger.write_bytes(ledger.read_bytes() + b"\xff\xfe\n")
+    head = git(repo, "rev-parse", "HEAD")
+    assert run_pre_push(ob, repo, monkeypatch, push_line(head, base)) == 1
+    err = capsys.readouterr().err
+    assert "PUSH REFUSED" in err and "sent-ledger-unreadable" in err, err
+
+
+@pytest.mark.parametrize("bad_line", [
+    "{not json",                                         # unparseable
+    json.dumps({"item": "no-key"}),                      # no key
+    json.dumps({"key": "", "item": "empty-key"}),        # empty key
+    json.dumps({"key": 42, "item": "int-key"}),          # non-string key
+    json.dumps({"key": None, "item": "null-key"}),
+    json.dumps({"key": "not-a-sixteen-hex-key"}),        # string, wrong shape (the writer emits 16 lowercase hex)
+    json.dumps({"key": "0123456789ABCDEF"}),             # uppercase hex is not what the writer emits
+    json.dumps({"key": "0123456789abcde"}),              # one short
+    json.dumps(["key"]),                                 # a row that is not an object
+])
+def test_a_ledger_with_a_malformed_row_beside_a_good_one_fails_closed_and_counts_it(ob, repo, tmp_path, capsys, bad_line):
+    """Not a quiet use of the good rows: the guard would run on a partial key set without saying so."""
+    ledger = tmp_path / "sent.jsonl"
+    base, _key = _edited_sent_item_range(ob, repo, ledger)
+    with open(ledger, "a", encoding="utf-8", newline="\n") as fh:
+        fh.write(bad_line + "\n")
+    assert _check_commits(ob, repo, base, ledger) == 2
+    cap = capsys.readouterr()
+    assert "UNKNOWN" in cap.err and "sent-ledger-partial" in cap.err and "1 of 2" in cap.err, (bad_line, cap.err)
+    assert "check-commits OK" not in cap.out and "SKIPPED" not in cap.out, (bad_line, cap.out)
+
+
+def test_a_ledger_of_only_malformed_rows_fails_closed(ob, repo, tmp_path, capsys):
+    commit(repo, {SENT_ITEM: item_text()}, "file it\n\nDoctrine-Export: outbox\n")
+    base = git(repo, "rev-parse", "HEAD")
+    commit(repo, {SENT_ITEM: item_text(body="### A finding\nEdited.\n")}, "edit\n\nDoctrine-Export: none\n")
+    ledger = tmp_path / "sent.jsonl"
+    ledger.write_text('{not json\n{"item": "no-key"}\n["key"]\n', encoding="utf-8")
+    assert _check_commits(ob, repo, base, ledger) == 2
+    cap = capsys.readouterr()
+    assert "sent-ledger-partial" in cap.err and "3 of 3" in cap.err, cap.err
+
+
+def test_a_clean_ledger_with_blank_lines_still_judges_and_still_catches_the_edit(ob, repo, tmp_path, capsys):
+    """Blank lines are not rows: a clean ledger behaves as before, the edit is refused by name and key."""
+    ledger = tmp_path / "sent.jsonl"
+    base, key = _edited_sent_item_range(ob, repo, ledger)
+    ledger.write_text("\n" + ledger.read_text(encoding="utf-8") + "\n   \n", encoding="utf-8")
+    assert _check_commits(ob, repo, base, ledger) == 1
+    cap = capsys.readouterr()
+    assert f"SENT_ITEM_EDITED {SENT_ITEM} key={key}" in cap.err and "sent-ledger" not in cap.err, cap.err
+
+
+def test_a_clean_ledger_and_an_absent_ledger_behave_as_before(ob, repo, tmp_path, capsys):
+    """Pins both ends: a clean ledger lets an unsent-item edit pass with OK (no skip line); an absent ledger is the typed skip."""
+    clean = tmp_path / "sent.jsonl"
+    commit(repo, {SENT_ITEM: item_text()}, "file it\n\nDoctrine-Export: outbox\n")
+    clean.write_text(json.dumps({"key": "0123456789abcdef"}) + "\n", encoding="utf-8")
+    base = git(repo, "rev-parse", "HEAD")
+    commit(repo, {SENT_ITEM: item_text(body="### A finding\nStill editable.\n")}, "edit\n\nDoctrine-Export: none\n")
+    assert _check_commits(ob, repo, base, clean) == 0
+    out = capsys.readouterr().out
+    assert "check-commits OK" in out and "SKIPPED" not in out, out
+    assert _check_commits(ob, repo, base, tmp_path / "no-such-ledger.jsonl") == 0
+    out = capsys.readouterr().out
+    assert "sent-ledger-absent" in out and "SKIPPED" in out and "check-commits OK" not in out, out
