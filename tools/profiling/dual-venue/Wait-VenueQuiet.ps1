@@ -34,6 +34,18 @@
 #      failed counter read makes the check UNKNOWN, never quiet.
 #   4. re-probes every -RecheckSec until QUIET or -MaxWaitSec, then prints `QUIET mean=<x>` or `COOLDOWN_UNMET mean=<x>` (a MEASURED busy venue) and the top
 #      processes, or -- when the FINAL decision is UNKNOWN -- `VENUE_QUIET_UNKNOWN mean=UNKNOWN ... reason=<why>` and exit 6.
+#      FOREIGN FLOOR EARLY EXIT (BACHELOR-VENUE-FOREIGN-FLOOR-FAST-FAIL-1): a floor owned by other software does not drop by waiting (Bachelor: explorer, TextInputHost, Bloody7, other
+#      projects' guardians and sessions; MLV-owned CPU was about 1 point), so waiting the whole -MaxWaitSec only delays a leg that then runs as COOLDOWN_UNMET anyway. When
+#      -ForeignFloorProbes (default 3; 0 switches the early exit off) CONSECUTIVE measured BUSY probes (an UNKNOWN or a probe that names no foreign owner resets the count) each
+#      carry a v2 top_processes list whose top 3 owners are not MLV's, and the floor shows NO DOWNWARD TREND -- the newest mean is not below the first mean of those N probes by
+#      more than -ForeignFloorTrendMarginPoints (default 2.0; a drop of exactly the margin is not a trend) -- the wait ends at once and prints, BEFORE the usual verdict line,
+#        FOREIGN_FLOOR owners=<name:pid>,<name:pid>,<name:pid> floorMean=<x>% waitedSec=<n> probes=<n>
+#      (floorMean = the mean of those N probe means; owners = the newest probe's top 3 by percent of the whole machine, in rank order, whitespace in a name written as _), then the
+#      SAME `COOLDOWN_UNMET mean=<x> threshold=<t>% waitedSec=<n>` line as a full wait, the top and attr lines, and exit 0. It is never QUIET: a caller that parses
+#      `^(QUIET|COOLDOWN_UNMET) mean=` classifies the leg as the contended COOLDOWN_UNMET it is. OWNER CLASSIFIER (the smallest pinned one; this script had none): a top_processes
+#      row is MLV's when its instance name (lower case, the "#n" suffix stripped) starts with `mlv`, `ultra-magnus` or `um-run`; `pwsh` / `powershell` rows are skipped, because
+#      the probe job itself and the venue agent run in them and the name cannot tell them from a foreign script. The top 3 of the REST must contain no MLV row; a probe with no v2
+#      top_processes (a v1 line, a null list) names no owner and is never a foreign floor. The early exit changes no other exit code and never replaces VENUE_QUIET_UNKNOWN.
 # A measured COOLDOWN_UNMET is recorded and the caller proceeds: it decides nothing. VENUE_QUIET_UNKNOWN means the venue was NOT MEASURED (no um-run.ps1, a failed
 # submission, a result without a VENUE_QUIET line, or samples that are not 3 finite values in [0, 100]): the caller must fail or skip its leg loudly, never run
 # it as if the venue had been measured. The probe never kills, stops or changes any process.
@@ -56,7 +68,7 @@
 # directory) are exit 2 before anything is created. HOST ECHO: the probe job reports $env:COMPUTERNAME; if it is not the venue's expectedHost in venues.json
 # (case-insensitive; a missing host counts) the gate prints `HOST_MISMATCH ...` and exits 5 BEFORE any QUIET / COOLDOWN_UNMET line, so an alias of another
 # host's share (acknowledged with -AllowShareOverride) can never yield a verdict for the named venue.
-# Exit codes: 0 QUIET or a measured COOLDOWN_UNMET (read stdout); 3 GATE_BUSY (the queue never cleared); 4 GATE_UNREADABLE (the agent share could not be
+# Exit codes: 0 QUIET or a measured COOLDOWN_UNMET, including one that took the FOREIGN_FLOOR early exit (read stdout); 3 GATE_BUSY (the queue never cleared); 4 GATE_UNREADABLE (the agent share could not be
 # read -- typed line `GATE_UNREADABLE ...` then `DECISION UNKNOWN`, never an empty-queue line; no probe is submitted); 5 HOST_MISMATCH (the probe was
 # answered by a host that is not the venue's); 6 VENUE_QUIET_UNKNOWN (the venue was not measured: typed line `VENUE_QUIET_UNKNOWN mean=UNKNOWN threshold=<t>%
 # waitedSec=<n> reason=<probe-failed|no-VENUE_QUIET-line|invalid-samples>`, never a QUIET / COOLDOWN_UNMET line); 2 a usage error (including a -SamplesJson that is
@@ -75,6 +87,8 @@ param(
     [Parameter(ParameterSetName = 'Live')][int]$ReadAttempts = 3,
     [Parameter(ParameterSetName = 'Live')][int]$ReadBackoffSec = 2,
     [Parameter(ParameterSetName = 'Live')][ValidateRange(1, 86400)][int]$MaxAdmissionWaitSec = 7200,
+    [Parameter(ParameterSetName = 'Live')][ValidateRange(0, 100)][int]$ForeignFloorProbes = 3,
+    [Parameter(ParameterSetName = 'Live')][ValidateRange(0.0, 100.0)][double]$ForeignFloorTrendMarginPoints = 2.0,
     [Parameter(ParameterSetName = 'Offline', Mandatory = $true)][string]$SamplesJson,
     [double]$ThresholdPercent = 20.0
 )
@@ -476,7 +490,24 @@ function Write-AttributionLines($Probe) {
     } catch { Write-Gate ("  attr UNPRINTABLE {0}" -f $_.Exception.Message) }
 }
 
+# FOREIGN FLOOR (see the header). PURE: the top-3 owners ("name:pid") of one probe when none of them is MLV's, else an empty list. Rows come from the v2 top_processes (already
+# ranked by percent of the whole machine); pwsh / powershell rows are skipped (the probe job and the agent run in them). Anything malformed names no owner.
+function Get-ForeignFloorOwners($Probe) {
+    try {
+        if ([string]$Probe.schema -cne 'mlv-app/venue-quiet-probe/v2') { return @() }
+        $rows = @(@($Probe.top_processes) | Where-Object { $null -ne $_ -and -not [string]::IsNullOrWhiteSpace([string]$_.instance) } |
+            Where-Object { ([string]$_.instance).ToLowerInvariant() -replace '#\d+$', '' -notmatch '^(pwsh|powershell)$' } | Select-Object -First 3)
+        if ($rows.Count -eq 0) { return @() }
+        if (@($rows | Where-Object { ([string]$_.instance).ToLowerInvariant() -replace '#\d+$', '' -match '^(mlv|ultra-magnus|um-run)' }).Count -gt 0) { return @() }
+        return @($rows | ForEach-Object { ('{0}:{1}' -f (([string]$_.instance) -replace '\s+', '_'), $(if ($null -eq $_.pid) { 'n/a' } else { $_.pid })) })
+    } catch { return @() }
+}
+
+# PURE: no downward trend over the window of means, oldest first (the newest is not below the first by more than the margin; the epsilon only absorbs float noise).
+function Test-NoDownwardTrend([double[]]$Means, [double]$MarginPoints) { ($Means[0] - $Means[-1]) -le ($MarginPoints + 1e-9) }
+
 $last = $null
+$floorMeans = @(); $foreignFloor = $null
 while ($true) {
     Wait-QueueGate 'quiet-probe'
     if ($script:GateState -ceq 'UNREADABLE') { Write-Gate 'DECISION UNKNOWN mean=UNKNOWN'; exit 4 }
@@ -508,6 +539,16 @@ while ($true) {
     Write-Gate "PROBE $jobId $Venue samples=$sampleText mean=$(Format-Mean $d.mean) state=$($d.state)$(if ($why) { " note=$why" }) $([DateTime]::UtcNow.ToString('HH:mm:ssZ'))"
     if ($rawPath) { Write-Gate "  raw $rawPath" } elseif ($rawErr) { Write-Gate "  raw UNWRITABLE $rawErr" }
     if ($d.state -ceq 'QUIET') { break }
+    # the run of consecutive MEASURED busy probes that name foreign owners; anything else (UNKNOWN, an MLV owner, no owner named) starts it again
+    $owners = $(if ($d.state -ceq 'BUSY') { @(Get-ForeignFloorOwners $probe) } else { @() })
+    if ($owners.Count -gt 0) { $floorMeans += [double]$d.mean } else { $floorMeans = @() }
+    if ($ForeignFloorProbes -gt 0 -and $floorMeans.Count -ge $ForeignFloorProbes) {
+        $window = [double[]]@($floorMeans[($floorMeans.Count - $ForeignFloorProbes)..($floorMeans.Count - 1)])
+        if (Test-NoDownwardTrend $window $ForeignFloorTrendMarginPoints) {
+            $foreignFloor = [pscustomobject]@{ owners = $owners; floorMean = (($window | Measure-Object -Average).Average); probes = $ForeignFloorProbes }
+            break
+        }
+    }
     if ((Get-Date).AddSeconds($RecheckSec) -gt $deadline) { break }
     Start-Sleep -Seconds $RecheckSec
 }
@@ -516,6 +557,7 @@ if ($last.decision.state -ceq 'UNKNOWN') {
     Write-Gate "VENUE_QUIET_UNKNOWN mean=UNKNOWN threshold=$ThresholdPercent% waitedSec=$([int]((Get-Date) - $t0).TotalSeconds) reason=$($last.whyKind)$(if ($last.why) { " note=$($last.why)" })"
     exit 6
 }
+if ($null -ne $foreignFloor) { Write-Gate "FOREIGN_FLOOR owners=$($foreignFloor.owners -join ',') floorMean=$(Format-Mean $foreignFloor.floorMean) waitedSec=$([int]((Get-Date) - $t0).TotalSeconds) probes=$($foreignFloor.probes)" }
 $verdict = $(if ($last.decision.state -ceq 'QUIET') { 'QUIET' } else { 'COOLDOWN_UNMET' })
 Write-Gate "$verdict mean=$(Format-Mean $last.decision.mean) threshold=$ThresholdPercent% waitedSec=$([int]((Get-Date) - $t0).TotalSeconds)"
 if ($null -ne $last.probe) { foreach ($p in @($last.probe.top)) { Write-Gate ("  top {0} pid={1} cpuSeconds={2}" -f $p.name, $p.pid, $p.cpuSeconds) } }

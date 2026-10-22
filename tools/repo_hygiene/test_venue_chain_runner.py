@@ -60,6 +60,7 @@ if ($env:FAKE_QUIET_LOG) { Add-Content -LiteralPath $env:FAKE_QUIET_LOG -Value (
 switch ($mode) {
     'QUIET' { 'PROBE venue-quiet-probe-x bachelor samples=5.0/5.0/5.0 mean=5.0% state=QUIET'; "QUIET mean=5.0% threshold=$ThresholdPercent% waitedSec=1"; exit 0 }
     'COOLDOWN' { "COOLDOWN_UNMET mean=32.0% threshold=$ThresholdPercent% waitedSec=544"; exit 0 }
+    'FOREIGN' { 'FOREIGN_FLOOR owners=explorer:17204,textinputhost:23596,bloody7:21612 floorMean=32.0% waitedSec=180 probes=3'; "COOLDOWN_UNMET mean=32.0% threshold=$ThresholdPercent% waitedSec=180"; exit 0 }
     'UNKNOWN' { "VENUE_QUIET_UNKNOWN mean=UNKNOWN threshold=$ThresholdPercent% waitedSec=1 reason=probe-failed note=fake"; exit 6 }
     'NOVERDICT' { 'GATE quiet-probe bachelor queued=0 running=0'; exit 0 }
     'BUSY' { 'GATE_BUSY quiet-probe waitedSec=1'; exit 3 }
@@ -391,6 +392,74 @@ class VenueChainRunnerTests(unittest.TestCase):
         self.assertEqual(got, [("COOLDOWN_UNMET", 29.6, "COOLDOWN_UNMET"), ("QUIET", 20.2, "QUIET_PRELOAD_OK"), ("QUIET", 43.9, "QUIET_PRELOAD_HIGH")])
         ran = [l for l in self.chain_log(rd) if " RAN " in l]
         self.assertIn("verdict=COOLDOWN_UNMET quietMean=32.0 preLoadMean=29.6 class=COOLDOWN_UNMET", ran[0])
+
+    # BACHELOR-VENUE-FOREIGN-FLOOR-FAST-FAIL-1: Wait-VenueQuiet's FOREIGN_FLOOR early exit prints a typed line and then the same COOLDOWN_UNMET line; the chain must
+    # still classify the leg COOLDOWN_UNMET (contended, never counted), never QUIET_PRELOAD_* and never VENUE_QUIET_UNKNOWN.
+    def test_a_foreign_floor_early_exit_is_still_a_cooldown_unmet_leg(self) -> None:
+        rd = self.case / "lane-FF"
+        env = self.env(FAKE_QUIET_MODES="FOREIGN,FOREIGN,FOREIGN,FOREIGN,FOREIGN,FOREIGN", FAKE_LEG_PRELOADS="5.0,5.0,5.0")
+        r = self.run_chain(rd, self.specs, env=env)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        res = chain_result(r.stdout)
+        got = [(l["verdict"], l["quietMean"], l["class"]) for l in res["legs"]]
+        self.assertEqual(got, [("COOLDOWN_UNMET", 32.0, "COOLDOWN_UNMET")] * 3, "a low preLoad must not promote an early-exit leg to a counted class")
+        ran = [l for l in self.chain_log(rd) if " RAN " in l]
+        self.assertIn("verdict=COOLDOWN_UNMET quietMean=32.0 preLoadMean=5.0 class=COOLDOWN_UNMET", ran[0])
+        self.assertNotIn("VENUE_QUIET_UNKNOWN", r.stdout)
+
+    # r3 (Sol r2 blocker): a PRE-claim FOREIGN_FLOOR keeps the leg contended even when the later under-claim probe reads QUIET. Probe order per leg is pre-claim then under-claim.
+    def test_a_pre_claim_foreign_floor_keeps_the_leg_contended_when_the_under_claim_probe_is_quiet(self) -> None:
+        rd = self.case / "lane-FFQ"
+        env = self.env(FAKE_QUIET_MODES="FOREIGN,QUIET,FOREIGN,QUIET,FOREIGN,QUIET", FAKE_LEG_PRELOADS="5.0,5.0,5.0")
+        r = self.run_chain(rd, self.specs, env=env)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        res = chain_result(r.stdout)
+        got = [(l["verdict"], bool(l.get("preClaimForeignFloor")), l["class"]) for l in res["legs"]]
+        self.assertEqual(got, [("QUIET", True, "COOLDOWN_UNMET")] * 3, "a pre-claim FOREIGN_FLOOR must not be promoted to a counted class by a later QUIET probe")
+        ran = [l for l in self.chain_log(rd) if " RAN " in l]
+        self.assertIn("verdict=QUIET quietMean=5.0 preLoadMean=5.0 class=COOLDOWN_UNMET", ran[0])
+        self.assertIn("preClaimForeignFloor=1", ran[0])
+
+    # r4 (Sol r3 blocker): the FOREIGN_FLOOR marker is sticky across a GATE_BUSY retry of the SAME leg. Probe order: attempt 1 pre-claim FOREIGN, under-claim BUSY (claim
+    # released, leg retried); attempt 2 pre-claim QUIET, under-claim QUIET with a low preLoad. The leg stays contended; the next leg starts clean.
+    def test_a_foreign_floor_survives_a_gate_busy_retry_of_the_same_leg_and_does_not_leak_to_the_next_leg(self) -> None:
+        rd = self.case / "lane-FFB"
+        env = self.env(FAKE_QUIET_MODES="FOREIGN,BUSY,QUIET,QUIET,QUIET,QUIET", FAKE_LEG_PRELOADS="5.0,5.0")
+        r = self.run_chain(rd, self.specs[:2], env=env)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        res = chain_result(r.stdout)
+        got = [(l["verdict"], bool(l.get("preClaimForeignFloor")), l["class"]) for l in res["legs"]]
+        self.assertEqual(got, [("QUIET", True, "COOLDOWN_UNMET"), ("QUIET", False, "QUIET_PRELOAD_OK")], "a FOREIGN_FLOOR seen on an attempt that ended GATE_BUSY must keep that leg (and only that leg) contended")
+        ran = [l for l in self.chain_log(rd) if " RAN " in l]
+        self.assertIn("class=COOLDOWN_UNMET", ran[0])
+        self.assertIn("preClaimForeignFloor=1", ran[0])
+        self.assertIn("class=QUIET_PRELOAD_OK", ran[1])
+        self.assertNotIn("ForeignFloor=1", ran[1])
+
+    def test_a_gate_busy_retry_that_never_saw_a_foreign_floor_is_still_a_counted_leg(self) -> None:
+        rd = self.case / "lane-QBQ"
+        env = self.env(FAKE_QUIET_MODES="QUIET,BUSY,QUIET,QUIET", FAKE_LEG_PRELOADS="5.0")
+        r = self.run_chain(rd, self.specs[:1], env=env)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        res = chain_result(r.stdout)
+        self.assertEqual([(bool(l.get("preClaimForeignFloor")), l["class"]) for l in res["legs"]], [(False, "QUIET_PRELOAD_OK")])
+
+    def test_a_quiet_pre_claim_and_quiet_under_claim_probe_is_still_a_counted_leg(self) -> None:
+        rd = self.case / "lane-QQ"
+        env = self.env(FAKE_QUIET_MODES="QUIET,QUIET,QUIET,QUIET,QUIET,QUIET", FAKE_LEG_PRELOADS="5.0,5.0,5.0")
+        r = self.run_chain(rd, self.specs, env=env)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        res = chain_result(r.stdout)
+        self.assertEqual([(bool(l.get("preClaimForeignFloor")), l["class"]) for l in res["legs"]], [(False, "QUIET_PRELOAD_OK")] * 3)
+        self.assertNotIn("ForeignFloor=1", "\n".join(self.chain_log(rd)))
+
+    def test_a_plain_pre_claim_cooldown_timeout_without_a_foreign_floor_line_keeps_todays_class(self) -> None:
+        rd = self.case / "lane-CQ"
+        env = self.env(FAKE_QUIET_MODES="COOLDOWN,QUIET,COOLDOWN,QUIET,COOLDOWN,QUIET", FAKE_LEG_PRELOADS="5.0,5.0,5.0")
+        r = self.run_chain(rd, self.specs, env=env)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        res = chain_result(r.stdout)
+        self.assertEqual([(bool(l.get("preClaimForeignFloor")), l["class"]) for l in res["legs"]], [(False, "QUIET_PRELOAD_OK")] * 3, "no FOREIGN_FLOOR line: no behaviour change")
 
     # ---------------------------------------------------------------- r2: a leg that exits non-zero is never a successful leg
     def test_a_leg_that_exits_nonzero_is_leg_failed_invalid_never_ran(self) -> None:
