@@ -87,7 +87,7 @@ BEHAVIOURS
    opens, once the body is rendered (HTML entities and tags, table cells) and normalised (Unicode, invisible characters)
    and its bullet, quote, bold and heading marks are off; or a heading with `- RULING CANDIDATE` / `RULING CANDIDATE:` in
    it; a wrapped continuation line, a mid-sentence mention and a citation (the phrase, a `ruling-candidates/` path and
-   a status word such as `remains`) are not markers) unless it
+   a status word such as `remains`, with no colon after it and not the item's own path) are not markers) unless it
    carries a `touches/supersedes:` declaration (`touches:`, `supersedes:` and the bus template's `Relationship to
    existing doctrine:` count too): rule ids (`R15`) or bus-relative paths (`RULINGS.md:1126-1152`) on that line, comma or semicolon
    separated, or as bullets under it, or the single entry `none: <reason of >= 4 words>`. Typed refusals:
@@ -3754,9 +3754,32 @@ RULING_CANDIDATE_COLON_RE = re.compile(r"(?<![\w/-])ruling[ \t-]*candidate[ \t]*
 # `Ruling candidate `ruling-candidates/x.md` remains PROPOSED`: the phrase, a space, a candidate's path (no colon), a space
 # and a STATUS word (remains, stays, is, was, ...). That is a statement about a candidate, not a marker (bus
 # cos-feedback/_bus/pr-69.md:17); a colon, a dash, a parenthesis, nothing, or any other word after the phrase or the path
-# keeps it a marker. An item does not carry its own path, so a verb of its own (`... proposes that X`) cannot be told from a
-# citation by the path and is refused by the verb.
-RULING_CANDIDATE_CITES_RE = re.compile(r"[ \t]+ruling-candidates/[^\s:]*[ \t]+(?i:remains?|stays?|stayed|is|are|was|were|has|have|had|becomes?|became)\b")
+# keeps it a marker, and so does a colon after the status word (`is: every lane must X` states a rule). A verb of its own
+# (`... proposes that X`) is refused by the verb. An item's own path (its outbox file's slug, `own_candidate_slug`) is no
+# citation: an item that cites itself proposes itself.
+RULING_CANDIDATE_CITES_RE = re.compile(r"[ \t]+ruling-candidates/(?P<path>[^\s:]*)[ \t]+(?i:remains?|stays?|stayed|is|are|was|were|has|have|had|becomes?|became)\b(?![ \t]*:)")
+RULING_CANDIDATE_REVISION_RE = re.compile(r"-r\d+$")
+
+
+def own_candidate_slug(item_name: str) -> str | None:
+    """The slug an outbox file `YYYYMMDD-<slug>.md` files its ruling candidate under (`ruling-candidates/<slug>[-rN].md`),
+    or None when the name is not an item name."""
+    return item_name[9:-3].lower() if ITEM_NAME_RE.match(item_name) else None
+
+
+def cites_another_candidate(text: str, pos: int, own: str | None = None) -> bool:
+    """True when `text` at `pos` is a citation: a `ruling-candidates/` path (no colon), a status word, and no colon after
+    the status word (`is: every lane must X` states a rule). The path must not be the item's own (`own`, from
+    `own_candidate_slug`): an item that cites itself proposes itself."""
+    found = RULING_CANDIDATE_CITES_RE.match(text, pos)
+    if not found:
+        return False
+    if own:
+        path = found.group("path").lower()
+        stem = path.split(".md", 1)[0] if ".md" in path else path.rstrip("`\"')]>*_,.;")
+        if stem == own or RULING_CANDIDATE_REVISION_RE.sub("", stem) == own:
+            return False
+    return True
 HTML_TAG_RE = re.compile(r"</?[A-Za-z][^<>]*>")
 # Markup that may sit in front of a marker, in any order: spaces, `>`, `#`s, a list bullet, emphasis, quotes, brackets.
 MARKER_FRONT_RE = re.compile(r"[ \t]+|(?P<quote>>)|(?P<atx>#{1,6})(?=[ \t]|$)|(?P<bullet>(?:[-+*]|\d+[.)])(?=[ \t]|$))"
@@ -3817,7 +3840,7 @@ def render_marker_lines(body: str) -> list[tuple[str, bool]]:
     return rendered
 
 
-def is_ruling_candidate(item: dict) -> bool:
+def is_ruling_candidate(item: dict, own: str | None = None) -> bool:
     """A ruling candidate is an item with a marker line. A line can be one only where a block OPENS: the item's first
     line, a line after a blank one, a line after a heading (ATX or setext underline), a thematic break or a fence
     line (opening or closing), a heading, a list item, a table cell, a line that starts a deeper blockquote, a setext
@@ -3828,7 +3851,7 @@ def is_ruling_candidate(item: dict) -> bool:
     (`marker_line`), the marker is `Ruling candidate` as whole words, any case, a space or dash between them, with
     an optional `Proposed`, `Draft` or `New` before it, whatever follows (`:`, ` (r2):`, ` - `, the end of the line),
     except a citation: the phrase, a `ruling-candidates/` path with no colon, and a status word (remains, stays, is,
-    was, ...: `Ruling candidate `ruling-candidates/x.md` remains PROPOSED`; any other word, `... proposes that X`, is a marker). A heading-class line (ATX, setext, the item's first line) also counts when the phrase follows a `-` or `:`
+    was, ...: `Ruling candidate `ruling-candidates/x.md` remains PROPOSED`; any other word, `... proposes that X`, a colon after the status word, or the item's own path (`own`), is a marker). A heading-class line (ATX, setext, the item's first line) also counts when the phrase follows a `-` or `:`
     (`### proj, 2026-10-16 - RULING CANDIDATE (r2): X`) or is followed by a colon. A line that only mentions the
     phrase, or a heading that mentions someone else's candidate (`... for ruling candidate <id>`, no colon), is
     not a marker. A `kind: ruling` item is a ratified ruling (`ratified_by` is required for it), not a candidate."""
@@ -3853,7 +3876,7 @@ def is_ruling_candidate(item: dict) -> bool:
                  or depth > prev_depth)
         if text and opens:
             lead = RULING_CANDIDATE_LEAD_RE.match(text)
-            if lead and not RULING_CANDIDATE_CITES_RE.match(text, lead.end()):
+            if lead and not cites_another_candidate(text, lead.end(), own):
                 return True
             if (heading or setext or first) and (RULING_CANDIDATE_AFTER_SEP_RE.search(text) or RULING_CANDIDATE_COLON_RE.search(text)):
                 return True
@@ -3977,13 +4000,13 @@ def _bus_has_rule(rulings: str, rule_id: str) -> bool:
     return False
 
 
-def screen_ruling_candidate(item: dict, bus: pathlib.Path | None = None) -> list[str]:
+def screen_ruling_candidate(item: dict, bus: pathlib.Path | None = None, own: str | None = None) -> list[str]:
     """Refuse a ruling candidate whose `touches/supersedes:` declaration is missing or empty, mixes `none` with rule
     ids, gives `none` without a reason of NONE_REASON_MIN_WORDS words (the floor a `Doctrine-Export: none` carries),
     names an entry that is not a rule id or a bus-relative path, or, when `bus` is given, names one the bus clone
     does not hold at its tip. Returns the targets it could not check because no bus was given (empty otherwise).
     A bus that cannot be read is UNKNOWN, never a pass. A non-candidate is not looked at."""
-    if not is_ruling_candidate(item):
+    if not is_ruling_candidate(item, own):
         return []
     entries = touches_supersedes_entries(item["body"])
     if not entries:
@@ -4047,7 +4070,7 @@ def cmd_validate(paths: list[pathlib.Path], deny_terms: list[tuple[str, str]],
             item = parse_item(text)
             screen_law4(item["body"], deny_terms)
             screen_rendered_card(item)
-            unchecked = screen_ruling_candidate(item, bus)
+            unchecked = screen_ruling_candidate(item, bus, own_candidate_slug(p.name))
             if unchecked:
                 print(f"[doctrine-outbox] NOTE {p}: touches/supersedes targets NOT checked against the bus (pass --bus <bus clone> "
                       f"or set ${RULING_BUS_ENV}): {'; '.join(unchecked[:6])}", file=sys.stderr)
