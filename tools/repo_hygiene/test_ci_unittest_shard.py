@@ -5,6 +5,7 @@ import io
 import json
 import re
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -226,23 +227,38 @@ class FakeClock:
         self.now += seconds
 
 
-def _fake_case(clock: FakeClock, name: str, seconds: float, *, fail: bool = False) -> unittest.TestCase:
-    """One test of a class built here (not at module level, so discovery never collects it)."""
+def _fake_case(
+    clock: FakeClock, name: str, seconds: float, *, fail: bool = False, setup: float = 0.0, teardown: float = 0.0
+) -> unittest.TestCase:
+    """One test of a class built here (not at module level, so discovery never collects it).
+
+    ``setup`` and ``teardown`` are the fake seconds its setUpClass and tearDownClass take.
+    """
 
     def test_it(self: unittest.TestCase) -> None:
         clock.advance(seconds)
         if fail:
             self.fail("boom")
 
-    cls = type(name, (unittest.TestCase,), {"test_it": test_it, "__module__": "fake_mod"})
+    members: dict[str, object] = {"test_it": test_it, "__module__": "fake_mod"}
+    if setup:
+        members["setUpClass"] = classmethod(lambda cls: clock.advance(setup))
+    if teardown:
+        members["tearDownClass"] = classmethod(lambda cls: clock.advance(teardown))
+    cls = type(name, (unittest.TestCase,), members)
     return cls("test_it")
 
 
 def _run_fake_shard(
-    cases: list[tuple[str, float]], *, profile: str = "ubuntu", fail: bool = False, environ: dict | None = None
+    cases: list[tuple[str, float]],
+    *,
+    profile: str = "ubuntu",
+    fail: bool = False,
+    environ: dict | None = None,
+    fixtures: dict[str, dict[str, float]] | None = None,
 ) -> tuple[int, str]:
     clock = FakeClock()
-    tests = [_fake_case(clock, name, seconds, fail=fail) for name, seconds in cases]
+    tests = [_fake_case(clock, name, seconds, fail=fail, **(fixtures or {}).get(name, {})) for name, seconds in cases]
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
         code = shard.run_shard(
@@ -332,6 +348,102 @@ class ShardTimingReportTests(unittest.TestCase):
         result.stopTestRun()
         self.assertEqual(calls, ["ran"])
         self.assertEqual(result.class_seconds, {"fake_mod.Probe": 8.0})
+
+    def test_class_teardown_is_charged_to_its_owning_class(self) -> None:
+        # r2 blocker B2: CleanupHeavy's tearDownClass runs when the next class starts, so it was
+        # charged to Quick (51 s) and the report blamed the wrong class.
+        _, out = _run_fake_shard(
+            [("CleanupHeavy", 1.0), ("Quick", 1.0)], fixtures={"CleanupHeavy": {"teardown": 50.0}}
+        )
+        lines = out.splitlines()
+        start = next(index for index, line in enumerate(lines) if line.startswith("SHARD_SLOWEST"))
+        self.assertEqual(
+            lines[start + 1 : start + 3], ["  51.0s fake_mod.CleanupHeavy", "  1.0s fake_mod.Quick"]
+        )
+
+    def test_the_last_class_teardown_is_charged_to_that_class(self) -> None:
+        _, out = _run_fake_shard(
+            [("Quick", 1.0), ("CleanupHeavy", 1.0)], fixtures={"CleanupHeavy": {"teardown": 50.0}}
+        )
+        self.assertIn("  51.0s fake_mod.CleanupHeavy", out.splitlines())
+        self.assertIn("  1.0s fake_mod.Quick", out.splitlines())
+
+    def test_class_setup_is_charged_to_the_class_it_sets_up(self) -> None:
+        _, out = _run_fake_shard(
+            [("Quick", 1.0), ("SetupHeavy", 1.0)], fixtures={"SetupHeavy": {"setup": 30.0}}
+        )
+        self.assertIn("  31.0s fake_mod.SetupHeavy", out.splitlines())
+        self.assertIn("  1.0s fake_mod.Quick", out.splitlines())
+
+    def test_the_timing_suite_overrides_hooks_that_unittest_still_has(self) -> None:
+        # ClassTimingSuite wraps unittest's private class/module fixture steps; a CPython that
+        # renames one would silently drop the attribution, so it goes red here instead.
+        for name in ("_tearDownPreviousClass", "_handleModuleFixture", "_handleModuleTearDown", "_handleClassSetUp"):
+            with self.subTest(name=name):
+                self.assertTrue(callable(getattr(unittest.TestSuite, name, None)))
+                self.assertIn(name, vars(shard.ClassTimingSuite))
+
+
+class BudgetWarningDuringRunTests(unittest.TestCase):
+    """r2 blocker B1: the warning is emitted when the threshold is crossed, not after the run."""
+
+    def test_a_cancelled_shard_has_already_warned_and_still_reports(self) -> None:
+        clock = FakeClock()
+        out = io.StringIO()
+        seen: list[str] = []
+
+        class Cancelled(unittest.TestCase):
+            def test_a_long(self) -> None:
+                clock.advance(46.0)  # 77 % of the 60 s cap
+
+            def test_b_cancel(self) -> None:
+                seen.append(out.getvalue())
+                clock.advance(15.0)
+                raise KeyboardInterrupt
+
+        Cancelled.__module__ = "fake_mod"
+        Cancelled.__qualname__ = "Cancelled"
+        tests = [Cancelled("test_a_long"), Cancelled("test_b_cancel")]
+        with contextlib.redirect_stdout(out), self.assertRaises(KeyboardInterrupt):
+            shard.run_shard(tests, "ubuntu", 2, 8, clock=clock, environ={shard.CAP_ENV: "1"}, stream=io.StringIO())
+        self.assertEqual(len(seen), 1)
+        self.assertIn("::warning title=Shard budget::shard 2/8 used 77% of the 1 min job cap;", seen[0])
+        lines = out.getvalue().splitlines()
+        self.assertEqual(sum(line.startswith("::warning") for line in lines), 1, out.getvalue())
+        self.assertEqual(sum(line.startswith("SHARD_BUDGET_WARN") for line in lines), 1)
+        self.assertIn("SHARD_SLOWEST profile=ubuntu shard=2/8 total=61.0s", lines)
+
+    def test_the_watch_warns_once_at_the_moment_the_cap_share_is_crossed(self) -> None:
+        clock = FakeClock()
+        result = shard.ClassTimingResult(io.StringIO(), True, 0, clock=clock)
+        watch = shard.BudgetWatch("ubuntu", 2, 8, 1.0, 0.0, clock, result.snapshot)
+        out = io.StringIO()
+        result.startTestRun()
+        result.startTest(_fake_case(clock, "Slow", 0.0))
+        with contextlib.redirect_stdout(out):
+            clock.advance(44.0)
+            watch.check()
+            self.assertEqual(out.getvalue(), "")
+            clock.advance(2.0)  # 46 s of a 60 s cap, still inside the running test
+            watch.check()
+            clock.advance(5.0)
+            watch.check()
+        lines = out.getvalue().splitlines()
+        self.assertEqual(len(lines), 2, out.getvalue())
+        self.assertIn("used 77% of the 1 min job cap; slowest class fake_mod.Slow 46.0s", lines[0])
+
+    def test_the_poll_thread_warns_while_a_test_is_still_running(self) -> None:
+        begin = time.monotonic() - 100.0  # already past 75 % of a 1 min cap
+        watch = shard.BudgetWatch("ubuntu", 1, 3, 1.0, begin, time.monotonic, lambda: {"a.A": 1.0}, poll_seconds=0.01)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            watch.start()
+            deadline = time.monotonic() + 10.0
+            while not watch.warned and time.monotonic() < deadline:
+                time.sleep(0.01)
+            watch.stop()
+        self.assertTrue(watch.warned)
+        self.assertIn("::warning title=Shard budget::", out.getvalue())
 
 
 class ShardExitCodeTests(unittest.TestCase):
