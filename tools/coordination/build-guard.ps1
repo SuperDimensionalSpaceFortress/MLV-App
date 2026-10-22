@@ -95,6 +95,17 @@ function Write-BuildGuardLog([string]$Message) {
     [Console]::Error.WriteLine("[build-guard] $Message")
 }
 
+function Add-BuildGuardLogLine([string]$Path, [string]$Line, [Text.Encoding]$Encoding) {
+    # LEDGER-APPEND-ATOMIC-BUILD-LOGS-1: pwsh 7 Add-Content opens FileMode.Append, which records EOF as the
+    # stream's own offset, so two concurrent writers overwrite each other's line (measured ~14 % lost across 6
+    # writers). FILE_APPEND_DATA only (no WRITE_DATA) makes the OS append at the current end of file atomically.
+    # Same bytes as before: the line, then the platform newline, no BOM.
+    $full = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
+    $bytes = $Encoding.GetBytes($Line + [Environment]::NewLine)
+    $fs = [IO.FileSystemAclExtensions]::Create([IO.FileInfo]::new($full), [IO.FileMode]::OpenOrCreate, [Security.AccessControl.FileSystemRights]::AppendData, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete), 4096, [IO.FileOptions]::None, $null)
+    try { $fs.Write($bytes, 0, $bytes.Length); $fs.Flush() } finally { $fs.Dispose() }
+}
+
 function ConvertTo-BuildGuardUtc($Value) {
     try { return ([datetime]$Value).ToUniversalTime().ToString('o') } catch { return [string]$Value }
 }
@@ -253,7 +264,7 @@ function Invoke-BuildGuard {
         try {
             $logDir = Split-Path -Parent $o.ExemptLogPath
             if ($logDir -and -not (Test-Path -LiteralPath $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
-            Add-Content -LiteralPath $o.ExemptLogPath -Value $line -Encoding ascii
+            Add-BuildGuardLogLine -Path $o.ExemptLogPath -Line $line -Encoding ([Text.Encoding]::ASCII)
         } catch { Write-BuildGuardLog "exemption log not written: $($_.Exception.Message)" }
     }
     $started = [DateTime]::UtcNow
