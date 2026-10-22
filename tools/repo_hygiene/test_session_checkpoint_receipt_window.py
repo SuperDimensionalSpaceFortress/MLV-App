@@ -1,10 +1,13 @@
-"""HOST-FILE-CHURN-POOL-GROWTH-1: the per-turn receipt scan reads only recent run dirs.
+"""HOST-FILE-CHURN-POOL-GROWTH-1: the receipt scan opens only receipt files touched in the window.
 
-session-checkpoint.py runs at every turn end. After #539 bounded the glob to two depths it still
-listed every run dir under .claude-state/fleet-runs and parsed every receipt (about 4,700 opens and
-100k directory entries per turn on the board, 2026-10-22) just to find none for an ordinary chat
-session. A lane's receipt for THIS session is written while the session is alive, so receipts in
-run dirs untouched for days cannot be this session's in-flight work and are not opened.
+When this tools/session-checkpoint.py runs its Stop event it walked fleet-runs and parsed every
+receipt (about 4,700 opens and 100k directory entries per run on the board, 2026-10-22, measured
+in-process) just to find none for an ordinary chat session. This project copy is not wired in any
+settings file today and who launched it in the 2026-10-21 trace is UNKNOWN; the live per-turn hook
+is the user-scope ~/.claude/hooks/session-checkpoint.py, which this file does not change. A lane's
+receipt for THIS session is rewritten while the session is alive, so a receipt FILE untouched for
+the window is not opened. The filter is the file's own mtime, never its directory's: on NTFS an
+in-place rewrite does not move the parent directory's mtime (r2 B2).
 """
 import importlib.util
 import json
@@ -48,24 +51,66 @@ class ReceiptWindowTests(unittest.TestCase):
         result = CHECKPOINT.scan_fleet_runs(self.repo, SESSION)
         self.assertEqual(str(receipt), result["receipt"])
 
-    def test_old_run_dir_is_not_opened_or_listed(self):
+    def test_old_receipt_is_not_opened(self):
         self.run_dir("stale", age_days=30)
-        opened, listed = [], []
-        real_scandir, real_read = os.scandir, Path.read_text
-
-        def scandir(path="."):
-            listed.append(Path(path).name)
-            return real_scandir(path)
+        opened = []
+        real_read = Path.read_text
 
         def read_text(self_, *a, **k):
             opened.append(self_.name)
             return real_read(self_, *a, **k)
 
-        with patch.object(CHECKPOINT.os, "scandir", scandir), patch.object(Path, "read_text", read_text):
+        with patch.object(Path, "read_text", read_text):
             result = CHECKPOINT.scan_fleet_runs(self.repo, SESSION)
         self.assertIsNone(result)
         self.assertEqual([], opened)
-        self.assertNotIn("stale", listed)
+
+    def test_receipt_rewritten_in_an_old_run_dir_is_found(self):
+        # r2 B2: on NTFS, rewriting an existing file does not move its parent directory's mtime, so
+        # a lane finishing inside a run dir created days ago leaves the directory looking idle.
+        run, receipt = self.run_dir("old-dir-fresh-receipt", age_days=10)
+        now = time.time()
+        os.utime(receipt, (now, now))
+        result = CHECKPOINT.scan_fleet_runs(self.repo, SESSION)
+        self.assertEqual(str(receipt), result["receipt"])
+        self.assertEqual("IN_PROGRESS", result["status"])
+
+    def test_receipt_older_than_the_window_is_not_surfaced_from_a_fresh_run_dir(self):
+        # The per-file mtime check on its own: the directory is fresh, only the file is stale.
+        run, receipt = self.run_dir("fresh-dir-stale-receipt", age_days=10)
+        now = time.time()
+        os.utime(run, (now, now))
+        opened = []
+        real_read = Path.read_text
+
+        def read_text(self_, *a, **k):
+            opened.append(self_.name)
+            return real_read(self_, *a, **k)
+
+        with patch.object(Path, "read_text", read_text):
+            result = CHECKPOINT.scan_fleet_runs(self.repo, SESSION)
+        self.assertIsNone(result)
+        self.assertEqual([], opened)
+
+    def test_receipts_below_depth_one_are_never_read(self):
+        # The depth bound (#539): fleet-runs/<run>/<receipt> is the deepest place a receipt lives;
+        # lane dirs hold full repo copies whose nested fixtures must not be walked.
+        run = self.fleet / "recent-run"
+        nested = run / "scratch" / "fixtures"
+        nested.mkdir(parents=True)
+        receipt = nested / "luna-001.receipt.json"
+        receipt.write_text(json.dumps(dict(sessionId=SESSION, lane="luna", exitCode=None)), encoding="utf-8")
+        listed = []
+        real_scandir = os.scandir
+
+        def scandir(path="."):
+            listed.append(Path(path).relative_to(self.fleet).as_posix())
+            return real_scandir(path)
+
+        with patch.object(CHECKPOINT.os, "scandir", scandir):
+            result = CHECKPOINT.scan_fleet_runs(self.repo, SESSION)
+        self.assertIsNone(result)
+        self.assertEqual([".", "recent-run"], sorted(listed))
 
     def test_recent_receipt_wins_over_an_old_one(self):
         self.run_dir("stale", age_days=30)

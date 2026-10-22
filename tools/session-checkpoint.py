@@ -46,14 +46,16 @@ def worktree_scan(repo):
     return out
 
 
-# A lane's receipt for THIS session is written while the session is alive, so a run dir untouched
-# for days cannot hold in-flight work for it. Skipping those keeps a turn end from listing every
-# run dir and parsing every receipt (2026-10-22: ~4,700 opens and ~100k entries per turn).
+# A lane's receipt for THIS session is rewritten while the session is alive, so a receipt FILE
+# untouched for days cannot be its in-flight work. Filtering on the file's own mtime keeps a turn
+# end from opening and parsing every receipt (2026-10-22: ~4,700 opens per turn). It is the FILE's
+# mtime, never its directory's: on NTFS rewriting an existing receipt in place (a lane finishing)
+# does not move the parent directory's mtime, so a directory filter loses exactly that receipt.
 RECEIPT_WINDOW_SECONDS = 72 * 3600
 
 
 def recent_receipts(fleet_runs):
-    """Receipt files at depth 0 or 1 of fleet-runs whose run dir and file were touched in the window."""
+    """Receipt files at depth 0 or 1 of fleet-runs whose own mtime is inside the window."""
     cutoff = time.time() - RECEIPT_WINDOW_SECONDS
     found = []
 
@@ -62,12 +64,11 @@ def recent_receipts(fleet_runs):
             with os.scandir(directory) as entries:
                 for entry in entries:
                     try:
-                        if entry.stat().st_mtime < cutoff:
-                            continue
                         if entry.is_dir():
                             if recurse:
                                 collect(entry.path, False)
-                        elif fnmatch.fnmatch(entry.name, "*-*.receipt.json"):
+                        elif (fnmatch.fnmatch(entry.name, "*-*.receipt.json")
+                              and entry.stat().st_mtime >= cutoff):
                             found.append(Path(entry.path))
                     except OSError:
                         continue

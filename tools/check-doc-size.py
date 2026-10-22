@@ -132,10 +132,33 @@ EXEMPT = [
     "**/*.bak",
 ]
 
-# Directories scanned even though git does not track them. .claude-state is 58%
-# of this repo's markdown mass; a tracked-only scan would report compliance while
-# the largest, hottest files sat outside it.
+# Git-ignored directories scanned anyway: the hub-tier coordination ledgers a
+# tracked-only scan would silently ungovern. HOST-FILE-CHURN-POOL-GROWTH-1 r2: an
+# explicit allowlist, never `.claude-state` whole -- that tree also holds lane
+# scratch, validation copies of tracked docs and disk-hygiene quarantine of whole
+# repo checkouts, and this check runs at every turn end. A tree not listed here is
+# enumerated ZERO times. A new ledger home goes here by name, in the same change
+# that creates it; test_check_doc_size_walk pins that the list never names the
+# state tree whole.
 EXTRA_ROOTS: list[str] = [
+    ".claude-state/adjudications",   # hub rulings (BREACH-eligible ledgers)
+    ".claude-state/closeout",        # closeout contract + remediation notes
+    ".claude-state/continuity",      # resume/handoff designs, bus drafts
+    ".claude-state/coordination",    # lane ledgers + dual-lane channel (COORDINATION-PRUNE-POLICY)
+    ".claude-state/doctrine-outbox",
+    ".claude-state/escalation",
+    ".claude-state/handoff",
+    ".claude-state/handoff-archive",
+    ".claude-state/heartbeat",       # board-snapshot / inflight
+    ".claude-state/hub-autopilot",
+    ".claude-state/kernel",          # subject-ledger.md
+    ".claude-state/planning",
+    ".claude-state/project-memory",  # canonical durable memory (docs list in README.md)
+]
+
+# Directories whose OWN markdown files (depth 0, no descent) are governed, e.g.
+# .claude-state/SESSION-HANDOFF.md and RESUME.md.
+EXTRA_DEPTH0_DIRS: list[str] = [
     ".claude-state",
 ]
 
@@ -213,6 +236,17 @@ def dir_is_exempt(rel_dir: str) -> bool:
 
 def untracked_markdown(repo: Path) -> list[str]:
     out: list[str] = []
+    for root in EXTRA_DEPTH0_DIRS:
+        base = repo / root
+        try:
+            with os.scandir(base) as entries:
+                out.extend(
+                    (Path(root) / e.name).as_posix()
+                    for e in entries
+                    if e.name.endswith(".md") and e.is_file()
+                )
+        except OSError:
+            continue
     for root in EXTRA_ROOTS:
         base = repo / root
         if not base.is_dir():
