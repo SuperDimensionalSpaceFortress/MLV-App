@@ -10,6 +10,7 @@ import json
 import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -622,6 +623,80 @@ def test_holder_exit_releases_the_worktree_for_real_retirement(repo):
     d, _ = _gate_real(wt, whatif=False)
     assert (d["action"], d["reason"]) == ("retired", "ok"), d
     assert not wt.exists()
+
+
+# --- CI-FLAKE-RETIRE-HOLDER-EXIT-PERMISSION-DENIED-1: a handle that outlives the holder's gate-visible life ---
+# 2026-10-17 PR #481 windows shard 8/8 (run 39049834615, job 117460346707): the holder had exited and the gate saw no holder, but Windows
+# still held a handle inside the worktree when `git worktree remove` ran: "failed to delete ...\wt-release: Permission denied".
+# git half-fails there (the worktree is deregistered, its files stay), so the same command cannot be re-run; the tool must finish the
+# removal itself, bounded, keyed to the access-denied / sharing-violation condition, and report `retired` only with the directory gone.
+
+def _spawn_file_handle_holder(path, ready, release, tmp):
+    """A child that opens `path` (read, no delete share) and keeps it open until `release` exists. The path goes in the
+    ENVIRONMENT, not on the command line, so the gate (which reads command lines and cwds) does not see a holder, exactly
+    like a handle that outlives its process's visibility."""
+    script = ("$f = [IO.File]::Open($env:HOLD_FILE, 'Open', 'Read', 'Read'); "
+              "[IO.File]::WriteAllText($env:HOLD_READY, 'open'); "
+              "$t = [Diagnostics.Stopwatch]::StartNew(); "
+              "while (-not (Test-Path -LiteralPath $env:HOLD_RELEASE) -and $t.Elapsed.TotalSeconds -lt 90) { Start-Sleep -Milliseconds 50 }; "
+              "$f.Dispose()")
+    env = dict(os.environ, HOLD_FILE=str(path), HOLD_READY=str(ready), HOLD_RELEASE=str(release))
+    p = subprocess.Popen([PWSH, "-NoProfile", "-NonInteractive", "-Command", script], cwd=str(tmp), env=env,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    deadline = datetime.datetime.now() + datetime.timedelta(seconds=60)
+    while not Path(ready).exists():
+        assert p.poll() is None and datetime.datetime.now() < deadline, "holder child did not open the file"
+        time.sleep(0.05)
+    return p
+
+
+def _release_on_first_wait(release, budget_ms=20000, delay_ms=50):
+    """Prelude: the tool's own first back-off creates `release`, so the child's handle drops (and the child exits) after the
+    first failed removal. No timing guess: a tool that never waits never lets go, and stays red."""
+    return (f"$script:RemoveRetryBudgetMs = {budget_ms}; $script:RemoveRetryDelayMs = {delay_ms}; "
+            "function Start-Sleep { param([int]$Milliseconds = 0, [double]$Seconds = 0) "
+            f"if (-not (Test-Path -LiteralPath '{release}')) {{ [IO.File]::WriteAllText('{release}', 'go') }}; "
+            "Microsoft.PowerShell.Utility\\Start-Sleep -Milliseconds ([Math]::Max($Milliseconds, 400)) }; ")
+
+
+def test_a_handle_that_outlives_the_holder_is_waited_out_and_the_worktree_is_really_retired(repo):
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-handle")
+    ready, release = tmp / "hold.ready", tmp / "hold.release"
+    p = _spawn_file_handle_holder(wt / "a.txt", ready, release, tmp)
+    try:
+        d, _ = _gate_real(wt, whatif=False, prelude=_release_on_first_wait(release))
+    finally:
+        release.write_text("go")
+        p.wait(timeout=60)
+    assert (d["action"], d["reason"]) == ("retired", "ok"), d
+    assert not wt.exists(), "retired must mean the directory is gone"
+    assert d["removeAttempts"] >= 2 and d["removeNotes"], d
+
+
+def test_a_handle_that_never_lets_go_ends_remove_failed_naming_the_attempts(repo):
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-stuck")
+    ready, release = tmp / "hold.ready", tmp / "hold.release"
+    p = _spawn_file_handle_holder(wt / "a.txt", ready, release, tmp)
+    try:
+        d, _ = _gate_real(wt, whatif=False, prelude="$script:RemoveRetryBudgetMs = 1500; $script:RemoveRetryDelayMs = 100; ")
+    finally:
+        release.write_text("go")
+        p.wait(timeout=60)
+    assert d["action"] == "kept" and d["reason"].startswith("remove-failed: "), d
+    assert "attempt" in d["reason"] and d["removeAttempts"] >= 2, d
+
+
+def test_the_removal_retry_is_keyed_to_access_denied_and_sharing_violation_only():
+    """Source pin: the loop is entered only for a failure message matching RemoveRetryablePattern, and that pattern names the two
+    Windows conditions (git renders them as "Permission denied" / "Invalid argument"; native tools as "Access is denied" / "being used
+    by another process"). Anything else is the first and only attempt."""
+    src = HELPER.read_text(encoding="utf-8")
+    assert "-notmatch $script:RemoveRetryablePattern" in src
+    pat = src[src.index("$script:RemoveRetryablePattern"):].splitlines()[0]
+    for needle in ("Permission denied", "Access is denied", "being used by another process", "Invalid argument"):
+        assert needle in pat, pat
 
 
 def test_sweep_keeps_a_worktree_held_only_by_a_process_cwd(repo):
