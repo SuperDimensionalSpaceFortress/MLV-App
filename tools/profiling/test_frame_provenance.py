@@ -473,3 +473,85 @@ def test_an_unparseable_manifest_with_a_marker_does_not_crash_the_index(tmp_path
         fh.write("{}")
 
     assert index_capture_records(str(ob)) == {}
+
+
+@pytest.mark.parametrize("field", ["executable", "clip"])
+@pytest.mark.parametrize("value", ["abc", 5, True, ["x"], []], ids=["string", "number", "bool", "list", "empty-list"])
+def test_a_manifest_whose_nested_executable_or_clip_is_not_an_object_gives_an_unreadable_row_not_a_crash(tmp_path, field, value):
+    """R18-ADVISORY-TAIL-572-573-574-576-1 (Dot R18 advisory on #576): ``_identity`` did ``(manifest.get("executable") or {}).get("sha256")``, so a truthy
+    scalar such as ``"executable": "abc"`` raised AttributeError outside the unreadable-manifest guard and aborted the report for every other frame. A
+    non-object nested field now leaves its sha None and the frame is recorded the way an unreadable manifest is: typed ``provenance``, pixel hash,
+    manifest path, not counted as matched, no half identity."""
+    ob = tmp_path / "outbox"
+    manifest = _manifest("aaaaaaaaaaaa")
+    manifest[field] = value
+    bad = _capture(str(ob), "bad", b"PIXELS-BAD", manifest)
+    _capture(str(ob), "good", b"PIXELS-G", _manifest("bbbbbbbbbbbb"))
+    frames = tmp_path / "frames"
+    frames.mkdir()
+    (frames / "a.png").write_bytes(b"PIXELS-BAD")
+    (frames / "z.png").write_bytes(b"PIXELS-G")
+
+    result = build(str(frames), str(ob))
+
+    assert (result["recordsIndexed"], result["matched"], result["orphaned"]) == (2, 1, 1)
+    rows = {r["frame"]: r for r in result["frames"]}
+    assert list(rows) == ["a.png", "z.png"], "a frame row was dropped"
+    assert rows["a.png"]["sha256"] == hashlib.sha256(b"PIXELS-BAD").hexdigest()
+    assert rows["a.png"]["provenance"].startswith("unreadable - ")
+    assert f"malformed field: {field}" in rows["a.png"]["provenance"]
+    assert "commit" not in rows["a.png"], "no half identity on a row that is not counted as matched"
+    assert rows["a.png"]["manifest"] == os.path.join(bad, "reference-frame-candidate.json")
+    assert rows["z.png"]["commit"] == "bbbbbbbbbbbb" and "provenance" not in rows["z.png"]
+
+
+def test_identity_gives_none_for_a_nested_sha_whose_parent_is_not_an_object():
+    ident = fp._identity({"commit": "c", "executable": "abc", "clip": ["x"]})
+    assert ident["exeSha256"] is None and ident["clipSha256"] is None and ident["commit"] == "c"
+    ok = fp._identity({"executable": {"sha256": "e" * 64}, "clip": {"sha256": "c" * 64}})
+    assert (ok["exeSha256"], ok["clipSha256"]) == ("e" * 64, "c" * 64)
+
+
+def _capture_under_job(root: str, job: str, pixels: bytes, result_text: str | None) -> str:
+    """The runner job's real layout: ``<outbox>/<jobId>.artifacts/{result.json, capture/reference-frame*}``."""
+    job_dir = os.path.join(root, f"{job}.artifacts")
+    capture = _capture(job_dir, "capture", pixels, _manifest("aaaaaaaaaaaa"))
+    if result_text is not None:
+        with open(os.path.join(job_dir, "result.json"), "w", encoding="utf-8") as fh:
+            fh.write(result_text)
+    return capture
+
+
+def test_a_capture_whose_parent_result_says_capture_failed_is_not_indexed_even_with_no_stamp_marker_or_quarantine(tmp_path):
+    """Dot R18 advisory on #573: stamp, marker and quarantine can ALL fail after a capture-failed/225, leaving unchanged candidate bytes (a plain
+    ``candidate-unreviewed`` manifest, no marker). The parent ``result.json`` still says ``capture-failed``; the index must honour it."""
+    ob = tmp_path / "outbox"
+    capture = _capture_under_job(str(ob), "job1", b"PIXELS-A", json.dumps({"status": "capture-failed", "exitCode": 225, "candidateQuarantined": False}))
+    skipped: list = []
+
+    assert index_capture_records(str(ob), skipped) == {}
+    assert skipped == [{"capture": capture, "reason": "result-capture-failed"}]
+    frames = tmp_path / "frames"
+    frames.mkdir()
+    (frames / "a.png").write_bytes(b"PIXELS-A")
+    result = build(str(frames), str(ob))
+    assert (result["matched"], result["orphaned"]) == (0, 1)
+    assert result["skipped"] == [{"capture": capture, "reason": "result-capture-failed"}]
+
+
+@pytest.mark.parametrize("result_text", [
+    json.dumps({"status": "candidate-unreviewed", "exitCode": 0}),
+    "{not json",
+    "[]",
+    json.dumps({"exitCode": 225}),
+    None,
+], ids=["candidate-unreviewed", "unparseable", "not-an-object", "no-status", "absent"])
+def test_a_parent_result_that_does_not_say_capture_failed_leaves_the_capture_indexable(tmp_path, result_text):
+    """Only a readable ``status: capture-failed`` voids a capture; an absent, unreadable or other result keeps the prior behaviour (the residual:
+    a result that cannot be read cannot be honoured, so the stamp/marker/quarantine layers remain the only guard there)."""
+    ob = tmp_path / "outbox"
+    capture = _capture_under_job(str(ob), "job1", b"PIXELS-A", result_text)
+    skipped: list = []
+
+    assert index_capture_records(str(ob), skipped) == {hashlib.sha256(b"PIXELS-A").hexdigest(): os.path.join(capture, "reference-frame-candidate.json")}
+    assert skipped == []

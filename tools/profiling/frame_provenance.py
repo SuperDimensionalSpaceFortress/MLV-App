@@ -26,6 +26,7 @@ CANDIDATE_NAME = "reference-frame-candidate.json"
 # "invalid" stamp is best effort. Present = not a candidate, whatever the manifest says (it may still parse and still say candidate-unreviewed).
 INVALID_MARKER_NAME = "reference-frame-candidate.invalid"
 FRAME_NAME = "reference-frame.png"
+RESULT_NAME = "result.json"
 
 
 def sha256_file(path: str) -> str:
@@ -51,6 +52,25 @@ def _manifest_stamped_invalid(manifest_path: str) -> bool:
     return isinstance(doc, dict) and (doc.get("invalid") is True or doc.get("status") == "invalid")
 
 
+def _parent_result_capture_failed(capture_dir: str) -> bool:
+    """True when the ``result.json`` beside the capture directory says ``status: capture-failed``.
+
+    R18-ADVISORY-TAIL-572-573-574-576-1 (Dot R18 advisory on #573): the runner job lays a capture out as
+    ``<jobId>.artifacts/{result.json, capture/}`` and, after a capture-failed/225, voids the candidate with a marker, an in-place stamp and a
+    quarantine rename. All three are best effort; if every one fails the manifest keeps the candidate name and unchanged bytes, and only the
+    parent result.json still says the capture failed. Reading it needs no change to the result contract (``status`` is already written).
+
+    Residual, deliberately not closed: a result.json that is absent (the job could not publish it, exit 223), unreadable or not an object is
+    not claimed to be a failure (False), so that case keeps its prior behaviour and the three voiding layers stay the only guard there.
+    """
+    try:
+        with open(os.path.join(os.path.dirname(capture_dir), RESULT_NAME), encoding="utf-8-sig") as fh:
+            doc = json.load(fh)
+    except (OSError, ValueError):
+        return False
+    return isinstance(doc, dict) and doc.get("status") == "capture-failed"
+
+
 def index_capture_records(outbox_root: str, skipped: list[dict[str, str]] | None = None) -> dict[str, str]:
     """Map pixel-SHA256 -> candidate manifest path, for every capture under a root.
 
@@ -58,8 +78,9 @@ def index_capture_records(outbox_root: str, skipped: list[dict[str, str]] | None
     image is gone, so it can never be the source of a frame we hold. A manifest beside an
     ``INVALID_MARKER_NAME`` file is skipped for the same reason in the other direction: the
     capture was voided, so its pixels are not a candidate. So is a manifest that is itself
-    stamped invalid. When ``skipped`` is given, each voided capture is appended to it as
-    ``{"capture": <dir>, "reason": "invalid-marker" | "manifest-stamped-invalid"}``.
+    stamped invalid, and a capture whose parent ``result.json`` says ``capture-failed``. When
+    ``skipped`` is given, each voided capture is appended to it as ``{"capture": <dir>, "reason":
+    "invalid-marker" | "manifest-stamped-invalid" | "result-capture-failed"}``.
     """
     index: dict[str, str] = {}
     for dirpath, _dirnames, filenames in os.walk(outbox_root):
@@ -73,6 +94,10 @@ def index_capture_records(outbox_root: str, skipped: list[dict[str, str]] | None
             if skipped is not None:
                 skipped.append({"capture": dirpath, "reason": "manifest-stamped-invalid"})
             continue
+        if _parent_result_capture_failed(dirpath):
+            if skipped is not None:
+                skipped.append({"capture": dirpath, "reason": "result-capture-failed"})
+            continue
         frame = os.path.join(dirpath, FRAME_NAME)
         if not os.path.isfile(frame):
             continue
@@ -83,13 +108,30 @@ def index_capture_records(outbox_root: str, skipped: list[dict[str, str]] | None
     return index
 
 
+NESTED_OBJECT_FIELDS = ("executable", "clip")
+
+
+class _MalformedFieldError(ValueError):
+    """A readable manifest object whose nested identity field has the wrong JSON type; its message names the field(s)."""
+
+
+def _malformed_nested_fields(manifest: dict[str, Any]) -> list[str]:
+    """Names of the nested identity fields that are present but not JSON objects (absent / null stay a quiet None sha, as before)."""
+    return [k for k in NESTED_OBJECT_FIELDS if manifest.get(k) is not None and not isinstance(manifest[k], dict)]
+
+
+def _nested_sha(manifest: dict[str, Any], key: str) -> Any:
+    nested = manifest.get(key)
+    return nested.get("sha256") if isinstance(nested, dict) else None
+
+
 def _identity(manifest: dict[str, Any]) -> dict[str, Any]:
     return {
         "commit": manifest.get("commit"),
         "host": manifest.get("host"),
         "capturedUtc": manifest.get("capturedUtc"),
-        "exeSha256": (manifest.get("executable") or {}).get("sha256"),
-        "clipSha256": (manifest.get("clip") or {}).get("sha256"),
+        "exeSha256": _nested_sha(manifest, "executable"),
+        "clipSha256": _nested_sha(manifest, "clip"),
         "settings": manifest.get("settings"),
         "appSettings": manifest.get("appSettings"),
     }
@@ -119,12 +161,16 @@ def build(frames_dir: str, outbox_root: str) -> dict[str, Any]:
                     doc = json.load(fh)
                 if not isinstance(doc, dict):
                     raise ValueError("manifest is not a JSON object")
+                if _malformed_nested_fields(doc):
+                    # R18-ADVISORY-TAIL-572-573-574-576-1 (Dot R18 advisory on #576): a truthy scalar here used to raise out of _identity and abort the report.
+                    raise _MalformedFieldError("malformed field: " + ", ".join(_malformed_nested_fields(doc)))
             except (OSError, ValueError) as exc:
                 # The index accepted this manifest (an unparseable one is indexed on purpose) but it cannot be read now: malformed, not an
                 # object, undecodable, or gone since indexing. One bad record must not abort the report for every other frame. The pixels
                 # matched a record whose identity we could not read, so the frame is not counted as matched (main() then exits 4, as for an
                 # orphan) and keeps the path so the operator can go and look.
-                row["provenance"] = f"unreadable - a capture record matched these pixels but could not be read ({type(exc).__name__})"
+                detail = str(exc) if isinstance(exc, _MalformedFieldError) else type(exc).__name__
+                row["provenance"] = f"unreadable - a capture record matched these pixels but could not be read ({detail})"
                 row["manifest"] = manifest_path
             else:
                 matched += 1
