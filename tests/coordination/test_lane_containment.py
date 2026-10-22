@@ -18,6 +18,29 @@ PWSH = "pwsh.exe"
 # loaded host -- and matches the 30 s per-run allowance the #316 startup-budget fixtures give a cold pwsh.
 PWSH_PROBE_TIMEOUT_SEC = 30
 
+# CI-FLAKE-LANE-CONTAINMENT-READ-ONLY-ARGV-TIMEOUT-1: every test that runs a fixture Invoke-Lane.ps1 used a bare 20 s
+# bound. The FIRST test of the file (test_read_only_argv_json_stdin_and_tool_denial) pays the runner's cold costs --
+# first pwsh launch, Defender scanning pwsh/csc/the C# Add-Type of the Job Object type, cold file cache -- and
+# raised subprocess.TimeoutExpired on hosted windows runs twice (#555 on 2026-10-21: 1 failed / 166 passed in 509 s;
+# #575 head a8a96404, run 39806467571: 1 failed / 166 passed in 511.58 s). Every other test in those runs passed
+# on the same 20 s, at ~3.1 s average per test (511.58 s / 167), so the bound is a first-launch race, not a property
+# under test. 60 s is twice the 30 s -TimeoutSec the fixture hands the lane itself, ~20x the hosted average and ~6x
+# the slowest local run measured on a busy host (10.3 s); it only ever binds on a stalled launch. It applies to every
+# prepare()-built Invoke-Lane run that used a 10-30 s bound; runs sized for a hold, a delay or a lane timeout keep
+# their own larger bound. A timeout still FAILS the test (run_lane re-raises as AssertionError naming the command and
+# the budget); it is never swallowed, skipped or retried.
+LANE_RUN_TIMEOUT_SEC = 60
+
+
+def run_lane(cmd, env, timeout=None, **kwargs):
+    budget = LANE_RUN_TIMEOUT_SEC if timeout is None else timeout
+    try:
+        return subprocess.run(cmd, env=env, text=True, capture_output=True, timeout=budget, **kwargs)
+    except subprocess.TimeoutExpired as exc:
+        raise AssertionError(
+            f"lane run exceeded its {budget} s budget (LANE_RUN_TIMEOUT_SEC): {subprocess.list2cmdline([str(c) for c in cmd])}"
+        ) from exc
+
 # PR #105 round 4: Invoke-Lane.ps1 classifies containment.ownerAbsentReason into a
 # CLOSED set of fixed tokens, chosen by WHERE a failure happened rather than by what
 # its raw exception message said -- free text is not admissible evidence about a
@@ -345,7 +368,7 @@ def settings_path_for(receipt):
 
 def test_read_only_argv_json_stdin_and_tool_denial(fixture_tree):
     cmd,env,receipt=prepare(fixture_tree,"normal")
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    r=run_lane(cmd,env)
     assert r.returncode==0,(r.stdout,r.stderr)
     q=json.loads(receipt.read_text(encoding="utf-8")); assert q["state"]=="complete" and q["complete"]
     assert q["containment"]["jobAssigned"] and q["containment"]["promptDelivered"]
@@ -394,7 +417,7 @@ def test_prompt_file_path_reaches_the_child_as_mlv_lane_prompt(fixture_tree):
     prompt_dir=fixture_tree["root"]/"!Layi Wkspc"/"prompts"; prompt_dir.mkdir(parents=True)
     prompt_file=prompt_dir/"lane prompt!.md"; prompt_file.write_text("- CLIP_OR_NONE: none\nfile prompt body\n",encoding="utf-8")
     cmd,env,receipt=prepare(fixture_tree,"normal"); env.pop("MLV_LANE_PROMPT",None)
-    r=subprocess.run(_with_prompt_file(cmd,prompt_file),env=env,text=True,capture_output=True,timeout=20)
+    r=run_lane(_with_prompt_file(cmd,prompt_file),env)
     assert r.returncode==0,(r.stdout,r.stderr)
     assert _lane_prompt_seen_by_child(fixture_tree)==str(prompt_file)
     assert os.path.isabs(_lane_prompt_seen_by_child(fixture_tree))
@@ -407,7 +430,7 @@ def test_relative_prompt_file_is_exported_as_an_absolute_path(fixture_tree):
     prompt_dir=fixture_tree["root"]/"rel dir!"; prompt_dir.mkdir()
     (prompt_dir/"p.md").write_text("- CLIP_OR_NONE: none\n",encoding="utf-8")
     cmd,env,receipt=prepare(fixture_tree,"normal"); env.pop("MLV_LANE_PROMPT",None)
-    r=subprocess.run(_with_prompt_file(cmd,"p.md"),env=env,text=True,capture_output=True,timeout=20,cwd=prompt_dir)
+    r=run_lane(_with_prompt_file(cmd,"p.md"),env,cwd=prompt_dir)
     assert r.returncode==0,(r.stdout,r.stderr)
     assert _lane_prompt_seen_by_child(fixture_tree)==str((prompt_dir/"p.md").resolve())
 
@@ -431,7 +454,7 @@ def test_mlv_lane_prompt_is_scoped_to_the_child_and_never_leaks_into_the_caller(
 def test_inline_prompt_drops_an_inherited_mlv_lane_prompt(fixture_tree):
     # No prompt FILE means nothing for NA-4 to read; a stale path from the caller must not authorize clips for a prompt it never described.
     cmd,env,receipt=prepare(fixture_tree,"normal"); env["MLV_LANE_PROMPT"]=str(fixture_tree["root"]/"stale-prompt.md")
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    r=run_lane(cmd,env)
     assert r.returncode==0,(r.stdout,r.stderr)
     assert _lane_prompt_seen_by_child(fixture_tree)==""
 
@@ -450,7 +473,7 @@ def test_resolved_model_ignores_an_auxiliary_model_beside_the_lane_model(fixture
         "sonnet": {"canonicalModel": "claude-sonnet-5"},
     }) + "}"
     cmd,env,receipt=prepare(fixture_tree,"normal",result_json=result_json)
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    r=run_lane(cmd,env)
     assert r.returncode==0,(r.stdout,r.stderr)
     q=json.loads(receipt.read_text(encoding="utf-8"))
     assert q["requestedModel"]=="sonnet"
@@ -462,7 +485,7 @@ def test_resolved_model_ignores_an_auxiliary_model_beside_the_lane_model(fixture
 def test_no_worktree_sweep_leaves_the_receipt_key_null(fixture_tree):
     cmd,env,receipt=prepare(fixture_tree,"normal")
     assert "-NoWorktreeSweep" in cmd
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    r=run_lane(cmd,env)
     assert r.returncode==0,(r.stdout,r.stderr)
     q=json.loads(receipt.read_text(encoding="utf-8"))
     assert "worktreeSweep" in q and q["worktreeSweep"] is None
@@ -473,7 +496,7 @@ def test_no_worktree_sweep_leaves_the_receipt_key_null(fixture_tree):
 def test_worktree_sweep_failure_is_recorded_and_never_blocks_the_receipt(fixture_tree):
     cmd,env,receipt=prepare(fixture_tree,"normal")
     cmd=[c for c in cmd if c!="-NoWorktreeSweep"]+["-WorktreeSweepRoot",str(fixture_tree["root"]/"no-lanes")]
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    r=run_lane(cmd,env)
     assert r.returncode==0,(r.stdout,r.stderr)
     q=json.loads(receipt.read_text(encoding="utf-8"))
     assert q["worktreeSweep"]["error"].startswith("cannot-determine")
@@ -487,7 +510,7 @@ def test_resolved_model_is_unknown_when_the_requested_family_is_absent(fixture_t
         "claude-haiku-4-5-20251001": {"canonicalModel": "claude-haiku-4-5-20251001"},
     }) + "}"
     cmd,env,receipt=prepare(fixture_tree,"normal",result_json=result_json)
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    r=run_lane(cmd,env)
     assert r.returncode==0,(r.stdout,r.stderr)
     q=json.loads(receipt.read_text(encoding="utf-8"))
     assert q["requestedModel"]=="sonnet"
@@ -504,7 +527,7 @@ def test_resolved_model_is_unknown_when_canonical_model_is_missing(fixture_tree)
         "sonnet": {},
     }) + "}"
     cmd,env,receipt=prepare(fixture_tree,"normal",result_json=result_json)
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    r=run_lane(cmd,env)
     assert r.returncode==0,(r.stdout,r.stderr)
     q=json.loads(receipt.read_text(encoding="utf-8"))
     assert q["requestedModel"]=="sonnet"
@@ -523,7 +546,7 @@ def test_resolved_model_is_unknown_when_canonical_model_is_missing(fixture_tree)
 # docs/Start-EditingLane.ps1.
 def test_read_only_settings_json_wires_lane_no_background_hook(fixture_tree):
     cmd,env,receipt=prepare(fixture_tree,"normal")
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    r=run_lane(cmd,env)
     assert r.returncode==0,(r.stdout,r.stderr)
     argv=json.loads((fixture_tree["root"]/"args.json").read_text(encoding="utf-8-sig"))
     i=argv.index("--settings")
@@ -558,7 +581,7 @@ def test_read_only_settings_json_wires_lane_no_background_hook(fixture_tree):
 
 def test_bulk_reads_lane_still_gets_the_hook_without_the_deny_rules(fixture_tree):
     cmd,env,receipt=prepare(fixture_tree,"normal",allow_bulk_reads=True)
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    r=run_lane(cmd,env)
     assert r.returncode==0,(r.stdout,r.stderr)
     settings=json.loads(settings_path_for(receipt).read_text(encoding="utf-8-sig"))
     assert "permissions" not in settings
@@ -568,7 +591,7 @@ def test_bulk_reads_lane_still_gets_the_hook_without_the_deny_rules(fixture_tree
 
 def test_editing_settings_json_also_wires_lane_no_background_hook(fixture_tree):
     cmd,env,receipt=prepare(fixture_tree,"normal",editing=True,allowed_tools="Read,Write,Edit")
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    r=run_lane(cmd,env)
     assert r.returncode==0,(r.stdout,r.stderr)
     argv=json.loads((fixture_tree["root"]/"args.json").read_text(encoding="utf-8-sig"))
     assert "--settings" in argv
@@ -601,7 +624,7 @@ def test_codex_lane_resolves_tier_to_the_highest_version_slug_in_the_cache(fixtu
     cache.write_text(codex_models_cache_text(("gpt-5.6-sol","gpt-6-sol","gpt-6-solar")),encoding="utf-8")
     cmd,env,receipt=prepare(fixture_tree,"normal",lane="sol")
     env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    r=run_lane(cmd,env)
     assert r.returncode==0,(r.stdout,r.stderr)
     argv=json.loads((fixture_tree["root"]/"args.json").read_text(encoding="utf-8-sig"))
     assert argv[argv.index("-m")+1]=="gpt-6-sol"
@@ -618,7 +641,7 @@ def test_codex_lane_resolves_tier_to_the_highest_version_slug_in_the_cache(fixtu
 def test_model_override_bypasses_tier_resolution_and_is_recorded(fixture_tree):
     cmd,env,receipt=prepare(fixture_tree,"normal",lane="luna")
     cmd=cmd+["-ModelOverride","gpt-9-luna-pinned-for-test"]
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    r=run_lane(cmd,env)
     assert r.returncode==0,(r.stdout,r.stderr)
     argv=json.loads((fixture_tree["root"]/"args.json").read_text(encoding="utf-8-sig"))
     assert argv[argv.index("-m")+1]=="gpt-9-luna-pinned-for-test"
@@ -631,7 +654,7 @@ def test_model_override_bypasses_tier_resolution_and_is_recorded(fixture_tree):
 def test_model_override_on_a_claude_lane_bypasses_the_alias(fixture_tree):
     cmd,env,receipt=prepare(fixture_tree,"normal",lane="sonnet")
     cmd=cmd+["-ModelOverride","claude-sonnet-5-pinned-for-test"]
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    r=run_lane(cmd,env)
     assert r.returncode==0,(r.stdout,r.stderr)
     argv=json.loads((fixture_tree["root"]/"args.json").read_text(encoding="utf-8-sig"))
     assert argv[argv.index("--model")+1]=="claude-sonnet-5-pinned-for-test"
@@ -646,7 +669,7 @@ def test_codex_tier_resolution_fails_closed_when_the_cache_is_unavailable(fixtur
     # which codex would silently reject or mis-launch.
     cmd,env,receipt=prepare(fixture_tree,"normal",lane="sol")
     env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(fixture_tree["root"]/"no-such-cache.json")
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    r=run_lane(cmd,env)
     assert r.returncode!=0,(r.stdout,r.stderr)
     q=json.loads(receipt.read_text(encoding="utf-8"))
     assert q["state"]=="failed"
@@ -673,7 +696,7 @@ def test_codex_start_failure_leaves_resolved_model_unknown_with_selected_model_r
                "}")
         return text.replace(old, new)
     cmd,env,receipt=prepare(fixture_tree,"normal",lane="sol",mutation=mutation)
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    r=run_lane(cmd,env)
     assert r.returncode!=0,(r.stdout,r.stderr)
     q=json.loads(receipt.read_text(encoding="utf-8"))
     assert q["state"]=="failed"
@@ -690,7 +713,7 @@ def test_codex_resolver_degenerate_json_without_ok_field_fails_closed_with_typed
     cmd,env,receipt=prepare(fixture_tree,"normal",lane="sol")
     resolver=fixture_tree["root"]/"resolve-codex-tier.py"
     resolver.write_text("import json\nprint(json.dumps({}))\n", encoding="utf-8")
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    r=run_lane(cmd,env)
     assert r.returncode!=0,(r.stdout,r.stderr)
     q=json.loads(receipt.read_text(encoding="utf-8"))
     assert q["state"]=="failed"
@@ -714,7 +737,7 @@ def test_real_lane_launch_refuses_non_high_effort(fixture_tree):
         shim_literal = str(fixture_tree["shim"]).replace("'", "''")
         return text.replace(old, "$REAL_CLAUDE_EXE = '" + shim_literal + "'")
     cmd,env,receipt=prepare(fixture_tree,"normal",lane="sonnet",mutation=mutation)
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    r=run_lane(cmd,env)
     assert r.returncode!=0,(r.stdout,r.stderr)
     q=json.loads(receipt.read_text(encoding="utf-8"))
     assert q["state"]=="failed"
@@ -727,7 +750,7 @@ def test_real_lane_launch_refuses_non_high_effort(fixture_tree):
 
 def test_codex_lane_gets_no_settings_file_or_flag(fixture_tree):
     cmd,env,receipt=prepare(fixture_tree,"normal",lane="sol")
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    r=run_lane(cmd,env)
     assert r.returncode==0,(r.stdout,r.stderr)
     argv=json.loads((fixture_tree["root"]/"args.json").read_text(encoding="utf-8-sig"))
     assert "--settings" not in argv
@@ -744,7 +767,7 @@ def test_codex_lane_gets_no_settings_file_or_flag(fixture_tree):
 # actually registered.
 def test_hook_copy_is_reserved_in_run_dir_not_resolved_from_worktree(fixture_tree):
     cmd,env,receipt=prepare(fixture_tree,"normal",editing=True,allowed_tools="Read,Write,Edit")
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    r=run_lane(cmd,env)
     assert r.returncode==0,(r.stdout,r.stderr)
     run_dir=fixture_tree["root"]/"run"
     copies=list(run_dir.glob("*.lane-no-background.py"))
@@ -911,7 +934,7 @@ def test_launch_refuses_when_background_gate_selftest_fails(fixture_tree):
     # runs) with a script that always allows, simulating a gate that would fail open.
     (fixture_tree["root"]/"lane-no-background.py").write_text(
         "import sys\nsys.exit(0)\n", encoding="ascii")
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    r=run_lane(cmd,env)
     assert r.returncode!=0,(r.stdout,r.stderr)
     assert not (fixture_tree["root"]/"child.json").exists()
     assert not (fixture_tree["root"]/"args.json").exists()
@@ -932,7 +955,7 @@ def test_launch_refuses_when_background_gate_selftest_fails(fixture_tree):
 # between being hashed and being self-tested).
 def test_launch_proceeds_and_registers_exec_form_exactly_when_python_override_resolves(fixture_tree):
     cmd,env,receipt=prepare(fixture_tree,"normal")
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    r=run_lane(cmd,env)
     assert r.returncode==0,(r.stdout,r.stderr)
     q=json.loads(receipt.read_text(encoding="utf-8"))
     assert q["state"]=="complete" and q["complete"]
@@ -968,7 +991,7 @@ def test_shell_override_env_vars_no_longer_affect_the_launch(fixture_tree):
     cmd,env,receipt=prepare(fixture_tree,"normal")
     env["MLV_GIT_BASH"]=str(fixture_tree["root"]/"nonexistent-bash.exe")
     env["MLV_LANE_POWERSHELL_EXE"]=str(fixture_tree["root"]/"nonexistent-powershell.exe")
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    r=run_lane(cmd,env)
     assert r.returncode==0,(r.stdout,r.stderr)
     q=json.loads(receipt.read_text(encoding="utf-8"))
     assert q["state"]=="complete" and q["complete"]
@@ -1000,7 +1023,7 @@ def test_launch_refuses_when_python_override_points_at_a_present_but_non_python_
     findstr=Path(os.environ.get("WINDIR", r"C:\Windows"))/"System32"/"findstr.exe"
     assert findstr.is_file(), "findstr.exe not found -- pick a different always-present decoy binary"
     env["MLV_LANE_PYTHON_EXE"]=str(findstr)
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    r=run_lane(cmd,env)
     assert r.returncode!=0,(r.stdout,r.stderr)
     assert not (fixture_tree["root"]/"child.json").exists()
     assert not settings_path_for(receipt).exists()
@@ -1033,7 +1056,7 @@ def test_launch_refuses_when_hook_copy_goes_missing_before_selftest_even_though_
         broken = needle + "\n        [System.IO.File]::Delete($hookCopyPath)"
         return text.replace(needle, broken)
     cmd,env,receipt=prepare(fixture_tree,"normal",mutation=delete_hook_copy_before_selftest)
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    r=run_lane(cmd,env)
     assert r.returncode!=0,(r.stdout,r.stderr)
     assert not (fixture_tree["root"]/"child.json").exists()
     assert not (fixture_tree["root"]/"args.json").exists()
@@ -1066,7 +1089,7 @@ def test_launch_refuses_when_hook_copy_is_syntactically_broken_before_selftest(f
         broken = needle + "\n        [System.IO.File]::WriteAllText($hookCopyPath, 'this is not python(')"
         return text.replace(needle, broken)
     cmd,env,receipt=prepare(fixture_tree,"normal",mutation=corrupt_hook_copy_before_selftest)
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    r=run_lane(cmd,env)
     assert r.returncode!=0,(r.stdout,r.stderr)
     assert not (fixture_tree["root"]/"child.json").exists()
     assert not (fixture_tree["root"]/"args.json").exists()
@@ -1089,7 +1112,7 @@ def test_launch_refuses_when_python_override_is_not_a_valid_win32_executable_and
     fake_python=fixture_tree["root"]/"corrupt-python.exe"
     fake_python.write_bytes(b"not a real executable")
     env["MLV_LANE_PYTHON_EXE"]=str(fake_python)
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    r=run_lane(cmd,env)
     assert r.returncode!=0,(r.stdout,r.stderr)
     assert not (fixture_tree["root"]/"child.json").exists()
     assert not settings_path_for(receipt).exists()
@@ -1105,7 +1128,7 @@ def test_launch_refuses_when_python_override_is_not_a_valid_win32_executable_and
 def test_launch_refuses_when_python_override_is_unresolvable(fixture_tree):
     cmd,env,receipt=prepare(fixture_tree,"normal")
     env["MLV_LANE_PYTHON_EXE"]=str(fixture_tree["root"]/"nonexistent-python.exe")
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    r=run_lane(cmd,env)
     assert r.returncode!=0,(r.stdout,r.stderr)
     assert not (fixture_tree["root"]/"child.json").exists()
     q=json.loads(receipt.read_text(encoding="utf-8"))
@@ -1123,7 +1146,7 @@ def test_launch_refuses_when_python_override_is_unresolvable(fixture_tree):
 def test_post_run_tamper_check_catches_hook_copy_rewritten_during_the_run(fixture_tree):
     cmd,env,receipt=prepare(fixture_tree,"normal")
     env["MLV_FIXTURE_TAMPER_HOOK_COPY"]="modify"
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    r=run_lane(cmd,env)
     assert r.returncode==0,(r.stdout,r.stderr)
     q=json.loads(receipt.read_text(encoding="utf-8"))
     assert q["authority"]["backgroundGate"]=="background-gate-tampered"
@@ -1134,7 +1157,7 @@ def test_post_run_tamper_check_catches_hook_copy_rewritten_during_the_run(fixtur
 def test_post_run_tamper_check_catches_hook_copy_deleted_during_the_run(fixture_tree):
     cmd,env,receipt=prepare(fixture_tree,"normal")
     env["MLV_FIXTURE_TAMPER_HOOK_COPY"]="delete"
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    r=run_lane(cmd,env)
     assert r.returncode==0,(r.stdout,r.stderr)
     q=json.loads(receipt.read_text(encoding="utf-8"))
     assert q["authority"]["backgroundGate"]=="background-gate-tampered"
@@ -1162,7 +1185,7 @@ def test_post_run_tamper_check_catches_interpreter_replaced_during_the_run(fixtu
     env["MLV_LANE_PYTHON_EXE"]=str(interpreter)
     env["PYTHONHOME"]=str(Path(sys.executable).parent)
     env["MLV_FIXTURE_TAMPER_INTERPRETER"]="modify"
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    r=run_lane(cmd,env)
     assert r.returncode==0,(r.stdout,r.stderr)
     q=json.loads(receipt.read_text(encoding="utf-8"))
     assert q["state"]=="complete" and q["complete"]
@@ -1181,7 +1204,7 @@ def test_post_run_tamper_check_catches_interpreter_deleted_during_the_run(fixtur
     env["MLV_LANE_PYTHON_EXE"]=str(interpreter)
     env["PYTHONHOME"]=str(Path(sys.executable).parent)
     env["MLV_FIXTURE_TAMPER_INTERPRETER"]="delete"
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    r=run_lane(cmd,env)
     assert r.returncode==0,(r.stdout,r.stderr)
     q=json.loads(receipt.read_text(encoding="utf-8"))
     assert q["state"]=="complete" and q["complete"]
@@ -1199,7 +1222,7 @@ def test_post_run_tamper_check_reports_both_hook_copy_and_interpreter_tamper_tog
     env["PYTHONHOME"]=str(Path(sys.executable).parent)
     env["MLV_FIXTURE_TAMPER_INTERPRETER"]="delete"
     env["MLV_FIXTURE_TAMPER_HOOK_COPY"]="delete"
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    r=run_lane(cmd,env)
     assert r.returncode==0,(r.stdout,r.stderr)
     q=json.loads(receipt.read_text(encoding="utf-8"))
     assert q["authority"]["backgroundGate"]=="background-gate-tampered"
@@ -1210,7 +1233,7 @@ def test_post_run_tamper_check_reports_both_hook_copy_and_interpreter_tamper_tog
 
 def test_timeout_kills_owned_child_and_grandchild(fixture_tree):
     cmd,env,receipt=prepare_timeout_after_ready(fixture_tree)
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    r=run_lane(cmd,env)
     assert r.returncode==124,(r.stdout,r.stderr)
     # A timed-out run ENDED but did not complete its work (2026-09-14: complete means work evidence).
     q=json.loads(receipt.read_text(encoding="utf-8")); assert q["state"]=="ended-incomplete" and q["timedOut"]
@@ -1274,7 +1297,7 @@ def test_wait_json_waits_out_a_file_that_is_still_empty(tmp_path):
 
 def test_assignment_failure_starts_no_provider(fixture_tree):
     cmd,env,receipt=prepare(fixture_tree,"normal",True)
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=15)
+    r=run_lane(cmd,env)
     assert r.returncode==127,(r.stdout,r.stderr)
     q=json.loads(receipt.read_text(encoding="utf-8")); assert q["state"]=="failed" and not q["complete"]
     assert not q["containment"]["jobAssigned"] and q["containment"]["assignmentErrorCode"]==5
@@ -1285,7 +1308,7 @@ def test_assignment_failure_starts_no_provider(fixture_tree):
 
 def test_editing_argv_preserves_allowlist_and_denies_nested_tools(fixture_tree):
     cmd,env,receipt=prepare(fixture_tree,"normal",editing=True,allowed_tools="Read,Write,Edit")
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    r=run_lane(cmd,env)
     assert r.returncode==0,(r.stdout,r.stderr)
     argv=json.loads((fixture_tree["root"]/"args.json").read_text(encoding="utf-8-sig"))
     assert argv[argv.index("--permission-mode")+1]=="acceptEdits"
@@ -1307,7 +1330,7 @@ def test_editing_argv_preserves_allowlist_and_denies_nested_tools(fixture_tree):
     "Workflow","Read, WORKFLOW ,Write","TaskCreate","Read,taskcreate,Write"])
 def test_editing_explicit_nested_tool_is_rejected_before_reservation(fixture_tree,bad):
     cmd,env,receipt=prepare(fixture_tree,"normal",editing=True,allowed_tools=bad)
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=10)
+    r=run_lane(cmd,env)
     assert r.returncode!=0 and "nested-agent-tool-forbidden" in r.stderr
     assert not receipt.exists() and not (fixture_tree["root"]/"child.json").exists()
 
@@ -1318,7 +1341,7 @@ def test_every_disallowed_tool_is_individually_rejected_from_an_editing_allowlis
     # variants above) so a future partial fix -- e.g. one that catches Agent/Task/Monitor but
     # misses a later addition to the deny list -- fails exactly the case it broke.
     cmd,env,receipt=prepare(fixture_tree,"normal",editing=True,allowed_tools=f"Read,{tool}")
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=10)
+    r=run_lane(cmd,env)
     assert r.returncode!=0 and "nested-agent-tool-forbidden" in r.stderr
     assert not receipt.exists() and not (fixture_tree["root"]/"child.json").exists()
 
@@ -1377,14 +1400,14 @@ def test_codex_editing_lane_with_denied_tool_in_allowlist_is_not_rejected_by_the
         return text.replace(old, "# fixture: codex-never-edits neutralised for this test only")
     cmd,env,receipt=prepare(fixture_tree,"normal",editing=True,allowed_tools="Read,Agent,Write",
                              lane="sol",mutation=bypass_codex_never_edits)
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    r=run_lane(cmd,env)
     assert "nested-agent-tool-forbidden" not in r.stderr, (r.stdout, r.stderr)
     assert r.returncode==0,(r.stdout,r.stderr)
 
 
 def test_codex_launch_stays_direct_without_claude_flags(fixture_tree):
     cmd,env,receipt=prepare(fixture_tree,"normal",lane="sol")
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    r=run_lane(cmd,env)
     assert r.returncode==0,(r.stdout,r.stderr)
     argv=json.loads((fixture_tree["root"]/"args.json").read_text(encoding="utf-8-sig"))
     assert argv[0]=="exec" and "--disallowedTools" not in argv and "--allowedTools" not in argv
@@ -1413,7 +1436,7 @@ def _windows_sandbox_overrides(argv):
 
 def test_codex_read_only_lane_runs_unelevated_windows_sandbox(fixture_tree):
     cmd,env,receipt=prepare(fixture_tree,"normal",lane="sol")
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    r=run_lane(cmd,env)
     assert r.returncode==0,(r.stdout,r.stderr)
     argv=json.loads((fixture_tree["root"]/"args.json").read_text(encoding="utf-8-sig"))
     assert argv[argv.index("-s")+1]=="read-only"
@@ -1439,7 +1462,7 @@ def test_codex_workspace_write_lane_keeps_default_windows_sandbox(fixture_tree):
         return text.replace(old, "# fixture: codex-never-edits neutralised for this test only")
     cmd,env,receipt=prepare(fixture_tree,"normal",editing=True,allowed_tools="Read,Write",
                              lane="sol",mutation=bypass_codex_never_edits)
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    r=run_lane(cmd,env)
     assert r.returncode==0,(r.stdout,r.stderr)
     argv=json.loads((fixture_tree["root"]/"args.json").read_text(encoding="utf-8-sig"))
     assert argv[argv.index("-s")+1]=="workspace-write"
@@ -1471,7 +1494,7 @@ def _codex_lane_with_stderr(fixture_tree, stderr, prompt="fixture prompt"):
     cmd[cmd.index("-Prompt")+1]=prompt
     p=fixture_tree["root"]/"fixture-stderr.txt"; p.write_bytes(stderr.encode("utf-8"))
     env["MLV_FIXTURE_STDERR"]=str(p)
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    r=run_lane(cmd,env)
     assert r.returncode==0,(r.stdout,r.stderr)
     return json.loads(receipt.read_text(encoding="utf-8"))
 
@@ -1574,7 +1597,7 @@ def _bypass_codex_never_edits(text):
 
 def test_codex_read_only_lane_disables_every_mcp_server(fixture_tree):
     cmd,env,receipt=prepare(fixture_tree,"normal",lane="sol")
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    r=run_lane(cmd,env)
     assert r.returncode==0,(r.stdout,r.stderr)
     listed=json.loads((fixture_tree["root"]/"mcp-args.json").read_text(encoding="utf-8-sig"))
     assert listed[:3]==["mcp","list","--json"] and "features.plugins=false" in listed, listed
@@ -1594,7 +1617,7 @@ def test_codex_read_only_lane_with_no_listed_mcp_server_still_disables_plugins_a
     cmd,env,receipt=prepare(fixture_tree,"normal",lane="sol")
     listing=fixture_tree["root"]/"mcp-list.json"; listing.write_text("[]",encoding="utf-8")
     env["MLV_FIXTURE_MCP_LIST_OUTPUT"]=str(listing)
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    r=run_lane(cmd,env)
     assert r.returncode==0,(r.stdout,r.stderr)
     argv=json.loads((fixture_tree["root"]/"args.json").read_text(encoding="utf-8-sig"))
     assert _mcp_overrides(argv)==["features.plugins=false","features.apps=false"], argv
@@ -1605,7 +1628,7 @@ def test_codex_read_only_lane_with_no_listed_mcp_server_still_disables_plugins_a
 def test_codex_workspace_write_lane_keeps_mcp_servers_unchanged(fixture_tree):
     cmd,env,receipt=prepare(fixture_tree,"normal",editing=True,allowed_tools="Read,Write",
                              lane="sol",mutation=_bypass_codex_never_edits)
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    r=run_lane(cmd,env)
     assert r.returncode==0,(r.stdout,r.stderr)
     assert not (fixture_tree["root"]/"mcp-args.json").exists(), "workspace-write must not probe mcp list"
     argv=json.loads((fixture_tree["root"]/"args.json").read_text(encoding="utf-8-sig"))
@@ -1626,7 +1649,7 @@ def test_codex_read_only_lane_refuses_launch_when_mcp_list_is_unreadable(fixture
     cmd,env,receipt=prepare(fixture_tree,"normal",lane="sol")
     listing=fixture_tree["root"]/"mcp-list.json"; listing.write_text(output,encoding="utf-8")
     env["MLV_FIXTURE_MCP_LIST_OUTPUT"]=str(listing); env["MLV_FIXTURE_MCP_LIST_EXIT"]=exit_code
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    r=run_lane(cmd,env)
     assert r.returncode!=0,(r.stdout,r.stderr)
     q=json.loads(receipt.read_text(encoding="utf-8"))
     assert q["state"]=="failed"
@@ -1889,7 +1912,7 @@ def test_codex_tier_resolution_refuses_a_stale_models_cache(fixture_tree):
     write_codex_models_cache(cache, fetched_at="2020-01-01T00:00:00.000000000Z")
     cmd, env, receipt = prepare(fixture_tree, "normal", lane="sol")
     env = dict(env); env["MLV_CODEX_MODELS_CACHE"] = str(cache)
-    r = subprocess.run(cmd, env=env, text=True, capture_output=True, timeout=20)
+    r = run_lane(cmd, env)
     assert r.returncode != 0, (r.stdout, r.stderr)
     q = json.loads(receipt.read_text(encoding="utf-8"))
     assert q["state"] == "failed" and "codex-tier-resolution-failed" in (q["failure"] or "")
@@ -2161,7 +2184,7 @@ def test_codex_pin_promoter_child_holding_the_pipes_after_timeout_fails_within_b
 
 def test_claude_lane_receipt_carries_a_null_codex_exe(fixture_tree):
     cmd, env, receipt = prepare(fixture_tree, "normal")
-    r = subprocess.run(cmd, env=env, text=True, capture_output=True, timeout=20)
+    r = run_lane(cmd, env)
     assert r.returncode == 0, (r.stdout, r.stderr)
     q = json.loads(receipt.read_text(encoding="utf-8"))
     assert "codexExe" in q and q["codexExe"] is None
@@ -2173,7 +2196,7 @@ def test_startup_consumes_same_deadline_without_starting_provider(fixture_tree):
         return text.replace("$line=[Console]::In.ReadLine(); if([string]::IsNullOrWhiteSpace($line)){throw 'launch-frame-missing'}", "Start-Sleep -Seconds 8\n$line=[Console]::In.ReadLine(); if([string]::IsNullOrWhiteSpace($line)){throw 'launch-frame-missing'}")
     cmd,env,receipt=prepare(fixture_tree,"normal",mutation=delay)
     cmd[cmd.index("-TimeoutSec")+1]="1"
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=15)
+    r=run_lane(cmd,env)
     assert r.returncode==124,(r.stdout,r.stderr)
     q=json.loads(receipt.read_text(encoding="utf-8"))
     assert q["timedOut"]
@@ -2218,7 +2241,7 @@ def test_zero_timeout_exhausts_budget_before_spawn_and_names_the_reason(fixture_
     # naming why.
     cmd,env,receipt=prepare(fixture_tree,"normal")
     cmd[cmd.index("-TimeoutSec")+1]="0"
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=15)
+    r=run_lane(cmd,env)
     assert r.returncode==124,(r.stdout,r.stderr)
     q=json.loads(receipt.read_text(encoding="utf-8"))
     assert q["timedOut"]
@@ -2243,7 +2266,7 @@ def test_start_threw_is_classified_as_no_host(fixture_tree):
         # non-claude branch and must stay untouched.
         return text.replace(old, "throw 'fixture-start-threw'", 1)
     cmd,env,receipt=prepare(fixture_tree,"normal",mutation=break_start)
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=15)
+    r=run_lane(cmd,env)
     assert r.returncode==127,(r.stdout,r.stderr)
     assert not (fixture_tree["root"]/"child.json").exists()
     q=json.loads(receipt.read_text(encoding="utf-8"))
@@ -2281,7 +2304,7 @@ def test_post_start_unrecorded_is_named_not_hidden(fixture_tree):
         marker_literal = str(marker).replace("'", "''")
         return text.replace(old, "Write-Utf8NoBom '%s' ([string]$hostPid)\n    throw 'fixture-post-start-unrecorded'" % marker_literal)
     cmd,env,receipt=prepare(fixture_tree,"normal",mutation=break_containedHost_build)
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=15)
+    r=run_lane(cmd,env)
     assert r.returncode==127,(r.stdout,r.stderr)
     assert not (fixture_tree["root"]/"child.json").exists()
     q=json.loads(receipt.read_text(encoding="utf-8"))
@@ -2321,7 +2344,7 @@ def test_pre_assignment_kill_failure_is_recorded_not_swallowed(fixture_tree):
         assert text.count(old_kill) == 1
         return text.replace(old_kill, "throw 'fixture-kill-failed'")
     cmd,env,receipt=prepare(fixture_tree,"normal",mutation=break_kill)
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=15)
+    r=run_lane(cmd,env)
     assert r.returncode==127,(r.stdout,r.stderr)
     q=json.loads(receipt.read_text(encoding="utf-8"))
     containment=q["containment"]
@@ -2380,7 +2403,7 @@ def test_pre_assignment_kill_wait_timeout_is_recorded_not_killed(fixture_tree):
         assert text.count(old) == 1
         return text.replace(old, "$exitedWithinWait = $false")
     cmd,env,receipt=prepare(fixture_tree,"normal",assignment_failure=True,mutation=force_wait_false)
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=15)
+    r=run_lane(cmd,env)
     assert r.returncode==127,(r.stdout,r.stderr)
     q=json.loads(receipt.read_text(encoding="utf-8"))
     containment=q["containment"]
@@ -2439,7 +2462,7 @@ def test_setup_origin_and_expired_budget_are_deterministic(fixture_tree, elapsed
         return text.replace(old, "Write-Utf8NoBom '%s' 'start'\n    %s" % (str(marker).replace("'", "''"), old))
     cmd, env, receipt = prepare(fixture_tree, "normal", mutation=clocks)
     cmd[cmd.index("-TimeoutSec") + 1] = "3"
-    result = subprocess.run(cmd, env=env, text=True, capture_output=True, timeout=20)
+    result = run_lane(cmd, env)
     assert result.returncode == expected_exit, (result.stdout, result.stderr)
     assert marker.exists() == (expected_exit == 0)
     q = json.loads(receipt.read_text(encoding="utf-8"))
@@ -2492,7 +2515,7 @@ def prepare_timeout_after_ready(tree, *extra_mutations):
 def _final_receipt_io_failure_run(fixture_tree, grand_start_delay_ms=None):
     cmd,env,receipt=prepare_timeout_after_ready(fixture_tree,_fail_final_receipt_write)
     if grand_start_delay_ms is not None: env["MLV_FIXTURE_GRAND_START_DELAY_MS"]=str(grand_start_delay_ms)
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    r=run_lane(cmd,env)
     assert r.returncode!=0 and 'fixture-final-receipt-write-failed' in r.stderr
     q=json.loads(receipt.read_text(encoding="utf-8"))
     assert q['state']=='running' and not q['complete']
@@ -2520,7 +2543,7 @@ def test_direct_launch_writes_a_reserved_versioned_ledger_row_naming_its_receipt
     # product-ratio guard must see, so it writes its own 'reserved' row.
     cmd,env,receipt=prepare(fixture_tree,"normal")
     env.pop("MLV_DISPATCH_RESERVATION_ID",None)
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=30)
+    r=run_lane(cmd,env)
     assert r.returncode==0,(r.stdout,r.stderr)
     rows=ledger_rows(fixture_tree["root"])
     assert len(rows)==1
@@ -2535,7 +2558,7 @@ def test_direct_launch_writes_a_reserved_versioned_ledger_row_naming_its_receipt
 def test_dispatcher_launch_writes_a_linked_row_not_a_second_reservation(fixture_tree):
     cmd,env,receipt=prepare(fixture_tree,"normal")
     env["MLV_DISPATCH_RESERVATION_ID"]="11111111-2222-3333-4444-555555555555"
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=30)
+    r=run_lane(cmd,env)
     assert r.returncode==0,(r.stdout,r.stderr)
     rows=ledger_rows(fixture_tree["root"])
     assert [(x["state"],x["reservationId"]) for x in rows]==[("linked","11111111-2222-3333-4444-555555555555")]
@@ -2602,7 +2625,7 @@ def test_pre_launch_git_capture_failure_is_unavailable_and_never_flips_state(fix
     cmd,env,receipt=prepare(fixture_tree,"normal",editing=True,allowed_tools="Read,Write,Edit",
                              mutation=_inject_git_capture_failure)
     env["MLV_FIXTURE_GIT_FAIL_MODE"]="pre"
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    r=run_lane(cmd,env)
     assert r.returncode==0,(r.stdout,r.stderr)
     q=json.loads(receipt.read_text(encoding="utf-8"))
     assert q["state"]=="complete" and q["complete"] is True
@@ -2624,7 +2647,7 @@ def test_post_exit_git_capture_failure_is_unavailable_and_never_claims_clean(fix
                              mutation=_inject_git_capture_failure)
     env["MLV_FIXTURE_GIT_FAIL_MODE"]="post"
     env["MLV_FIXTURE_DIRTY_TRACKED_PATH"]=str(root/"tracked.txt")
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    r=run_lane(cmd,env)
     assert r.returncode==0,(r.stdout,r.stderr)
     q=json.loads(receipt.read_text(encoding="utf-8"))
     assert q["state"]=="complete" and q["complete"] is True
@@ -2659,7 +2682,7 @@ def test_pre_launch_revparse_head_failure_is_unavailable_not_not_applicable(fixt
     cmd,env,receipt=prepare(fixture_tree,"normal",editing=True,allowed_tools="Read,Write,Edit",
                              mutation=_inject_git_revparse_failure)
     env["MLV_FIXTURE_GIT_FAIL_MODE"]="pre"
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    r=run_lane(cmd,env)
     assert r.returncode==0,(r.stdout,r.stderr)
     q=json.loads(receipt.read_text(encoding="utf-8"))
     assert q["state"]=="complete" and q["complete"] is True
@@ -2674,7 +2697,7 @@ def test_post_exit_revparse_head_failure_is_unavailable_not_head_moved(fixture_t
     cmd,env,receipt=prepare(fixture_tree,"normal",editing=True,allowed_tools="Read,Write,Edit",
                              mutation=_inject_git_revparse_failure)
     env["MLV_FIXTURE_GIT_FAIL_MODE"]="post"
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    r=run_lane(cmd,env)
     assert r.returncode==0,(r.stdout,r.stderr)
     q=json.loads(receipt.read_text(encoding="utf-8"))
     assert q["state"]=="complete" and q["complete"] is True
@@ -2703,7 +2726,7 @@ def test_further_edit_of_pre_dirty_binary_tracked_file_is_ended_incomplete(fixtu
     binary_path.write_bytes(bytes([0x00,0xAA,0xBB,0xCC,0xDD,0xFF]))
     cmd,env,receipt=prepare(fixture_tree,"normal",editing=True,allowed_tools="Read,Write,Edit")
     env["MLV_FIXTURE_FURTHER_EDIT_BINARY_TRACKED_PATH"]=str(binary_path)
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    r=run_lane(cmd,env)
     assert r.returncode==0,(r.stdout,r.stderr)
     q=json.loads(receipt.read_text(encoding="utf-8"))
     assert q["state"]=="ended-incomplete"
@@ -2724,7 +2747,7 @@ def test_dirty_tracked_worktree_introduced_by_editing_lane_is_ended_incomplete(f
     _seed_git_repo(root)
     cmd,env,receipt=prepare(fixture_tree,"normal",editing=True,allowed_tools="Read,Write,Edit")
     env["MLV_FIXTURE_DIRTY_TRACKED_PATH"]=str(root/"tracked.txt")
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    r=run_lane(cmd,env)
     assert r.returncode==0,(r.stdout,r.stderr)
     q=json.loads(receipt.read_text(encoding="utf-8"))
     assert q["state"]=="ended-incomplete"
@@ -2743,7 +2766,7 @@ def test_further_edit_of_already_dirty_tracked_file_is_ended_incomplete(fixture_
     (root/"tracked.txt").write_text("dirty-before-the-lane-ever-ran\n",encoding="ascii")
     cmd,env,receipt=prepare(fixture_tree,"normal",editing=True,allowed_tools="Read,Write,Edit")
     env["MLV_FIXTURE_FURTHER_EDIT_TRACKED_PATH"]=str(root/"tracked.txt")
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    r=run_lane(cmd,env)
     assert r.returncode==0,(r.stdout,r.stderr)
     q=json.loads(receipt.read_text(encoding="utf-8"))
     assert q["state"]=="ended-incomplete"
@@ -2771,7 +2794,7 @@ def test_further_edit_of_already_dirty_tracked_path_with_space_and_non_ascii_nam
     tracked_path.write_text("dirty-before-the-lane-ever-ran\n", encoding="utf-8")
     cmd,env,receipt=prepare(fixture_tree,"normal",editing=True,allowed_tools="Read,Write,Edit")
     env["MLV_FIXTURE_FURTHER_EDIT_TRACKED_PATH"]=str(tracked_path)
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    r=run_lane(cmd,env)
     assert r.returncode==0,(r.stdout,r.stderr)
     q=json.loads(receipt.read_text(encoding="utf-8"))
     assert q["state"]=="ended-incomplete"
@@ -2784,7 +2807,7 @@ def test_untracked_only_dirt_does_not_trigger_dirty_no_commit(fixture_tree):
     _seed_git_repo(root)
     (root/"scratch.log").write_text("untracked scratch output\n",encoding="ascii")
     cmd,env,receipt=prepare(fixture_tree,"normal",editing=True,allowed_tools="Read,Write,Edit")
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    r=run_lane(cmd,env)
     assert r.returncode==0,(r.stdout,r.stderr)
     q=json.loads(receipt.read_text(encoding="utf-8"))
     assert q["state"]=="complete" and q["complete"] is True
@@ -2797,7 +2820,7 @@ def test_clean_git_worktree_is_still_marked_complete(fixture_tree):
     root=fixture_tree["root"]
     _seed_git_repo(root)
     cmd,env,receipt=prepare(fixture_tree,"normal",editing=True,allowed_tools="Read,Write,Edit")
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    r=run_lane(cmd,env)
     assert r.returncode==0,(r.stdout,r.stderr)
     q=json.loads(receipt.read_text(encoding="utf-8"))
     assert q["state"]=="complete" and q["complete"] is True
@@ -2848,7 +2871,7 @@ def test_pre_existing_tracked_dirt_unchanged_by_editing_lane_stays_complete(fixt
     _seed_git_repo(root)
     (root/"tracked.txt").write_text("dirty-before-the-lane-ever-ran\n",encoding="ascii")
     cmd,env,receipt=prepare(fixture_tree,"normal",editing=True,allowed_tools="Read,Write,Edit")
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    r=run_lane(cmd,env)
     assert r.returncode==0,(r.stdout,r.stderr)
     q=json.loads(receipt.read_text(encoding="utf-8"))
     assert q["state"]=="complete" and q["complete"] is True
@@ -2865,7 +2888,7 @@ def test_committed_work_with_leftover_tracked_dirt_stays_complete(fixture_tree):
     _seed_git_repo(root)
     cmd,env,receipt=prepare(fixture_tree,"normal",editing=True,allowed_tools="Read,Write,Edit")
     env["MLV_FIXTURE_COMMIT_TRACKED_PATH"]=str(root/"tracked.txt")
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    r=run_lane(cmd,env)
     assert r.returncode==0,(r.stdout,r.stderr)
     q=json.loads(receipt.read_text(encoding="utf-8"))
     assert q["state"]=="complete" and q["complete"] is True
@@ -2881,7 +2904,7 @@ def test_codex_lane_with_dirty_tracked_worktree_is_never_ended_incomplete_by_thi
     _seed_git_repo(root)
     (root/"tracked.txt").write_text("dirty-tracked-file\n",encoding="ascii")
     cmd,env,receipt=prepare(fixture_tree,"normal",lane="sol")
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    r=run_lane(cmd,env)
     assert r.returncode==0,(r.stdout,r.stderr)
     q=json.loads(receipt.read_text(encoding="utf-8"))
     assert q["state"]=="complete" and q["complete"] is True
@@ -2897,7 +2920,7 @@ def test_read_only_claude_lane_with_dirty_tracked_worktree_is_never_ended_incomp
     _seed_git_repo(root)
     (root/"tracked.txt").write_text("dirty-but-uncommitted\n",encoding="ascii")
     cmd,env,receipt=prepare(fixture_tree,"normal")
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    r=run_lane(cmd,env)
     assert r.returncode==0,(r.stdout,r.stderr)
     q=json.loads(receipt.read_text(encoding="utf-8"))
     assert q["state"]=="complete" and q["complete"] is True
@@ -2942,7 +2965,7 @@ def test_ran_and_timed_out_lane_keeps_ended_incomplete_unchanged(fixture_tree):
     # CONTROL for the test above: a lane whose child DID run and then hit its deadline is still
     # ended-incomplete / timedOut / exit 124 with failure null and no launchNoChild block.
     cmd,env,receipt=prepare_timeout_after_ready(fixture_tree)
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    r=run_lane(cmd,env)
     assert r.returncode==124,(r.stdout,r.stderr)
     q=json.loads(receipt.read_text(encoding="utf-8"))
     assert q["state"]=="ended-incomplete" and q["timedOut"] is True and q["failure"] is None
@@ -2954,7 +2977,7 @@ def test_exhausted_budget_before_child_stays_a_timeout_not_launch_no_child(fixtu
     # CONTROL: the lane's OWN deadline really passed (-TimeoutSec 0): that is a timeout and must not be retyped.
     cmd,env,receipt=prepare(fixture_tree,"normal")
     cmd[cmd.index("-TimeoutSec")+1]="0"
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=15)
+    r=run_lane(cmd,env)
     assert r.returncode==124,(r.stdout,r.stderr)
     q=json.loads(receipt.read_text(encoding="utf-8"))
     assert q["timedOut"] is True and q["failure"] is None and "launchNoChild" not in q
@@ -3013,3 +3036,23 @@ def test_host_exit_after_the_lane_deadline_stays_a_timeout_not_launch_no_child(f
     assert q["timedOut"] is True
     assert r.returncode==124,(r.returncode,r.stdout,r.stderr)
     assert q["containment"]["childPid"] is None and q["containment"]["promptDelivered"] is False
+
+
+def test_lane_run_timeout_fails_naming_the_command_and_the_budget():
+    # CI-FLAKE-LANE-CONTAINMENT-READ-ONLY-ARGV-TIMEOUT-1: a stalled launch must still FAIL, loudly, and say which
+    # command and which budget -- not surface as a bare TimeoutExpired, and not be skipped or retried.
+    with pytest.raises(AssertionError) as caught:
+        run_lane([sys.executable, "-c", "import time; time.sleep(30)"], dict(os.environ), timeout=1)
+    message = str(caught.value)
+    assert "1 s budget" in message and "LANE_RUN_TIMEOUT_SEC" in message and "time.sleep(30)" in message
+    assert isinstance(caught.value.__cause__, subprocess.TimeoutExpired)
+
+
+def test_lane_runs_share_one_named_budget_that_outlasts_a_cold_first_launch():
+    # The hosted failures were a 20 s bound hit by the first pwsh launch of the file. Guard the budget (it must stay
+    # above that bound and above the 30 s the fixture gives the lane itself) and the call shape (a prepare()-built
+    # lane run with a bare 10-30 s literal is the regression).
+    assert LANE_RUN_TIMEOUT_SEC >= 60
+    source = Path(__file__).read_text(encoding="utf-8")
+    bare = re.findall(r"subprocess\.run\(\s*(?:cmd|_with_prompt_file\([^)]*\)),\s*env=env[^)]*timeout=(?:10|15|20|30)\b", source)
+    assert bare == [], bare

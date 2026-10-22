@@ -272,30 +272,94 @@ class AtomicWriteTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             self.assert_overlapped(stats)
 
+    def test_reads_in_the_idle_tail_after_two_generations_do_not_raise_the_overlap_count(self):
+        # The writer publishes generation 0, then 1, then idles for 2 s. Every read of the idle tail sees generation 1 and no
+        # change after it, so none of them was taken during an active rewrite.
+        target = self.start_target()
+        cmd = (". $env:PS_SCRIPT; "
+               "Write-FileAtomic $env:PS_TARGET ('{\"verdict\":\"GREEN\",\"i\":0,\"pad\":\"' + ('y' * 2000) + '\"}'); "
+               "Start-Sleep -Milliseconds 100; "
+               "Write-FileAtomic $env:PS_TARGET ('{\"verdict\":\"GREEN\",\"i\":1,\"pad\":\"' + ('y' * 2000) + '\"}'); "
+               "Start-Sleep -Seconds 2")
+        returncode, output, stats = self.drive_writer(target, cmd)
+        self.assertEqual(returncode, 0, output)
+        self.assertEqual(stats['generations'], 2, f'the reader must watch both rewrites: {stats}')
+        self.assertGreater(stats['idle_tail'], 50, f'the idle tail must accrue enough reads to defeat a bare read count: {stats}')
+        self.assertLess(stats['overlapped'], stats['idle_tail'], f'idle-tail reads were counted as overlapping rewrites: {stats}')
+        self.assertLessEqual(stats['overlapped'] + stats['idle_tail'], stats['reads'], f'{stats}')
+
+    def test_bracket_counts_only_reads_between_two_observed_generation_changes(self):
+        count = self.count_bracketed_reads
+        self.assertEqual(count([]), 0)
+        self.assertEqual(count([None] * 30), 0, 'a seed file alone is no generation')
+        self.assertEqual(count([None, None, 0, 0, 0]), 0, 'one generation has no change to bracket a read')
+        # Reads 3 and 4 follow generation 0 and precede generation 1; the seed reads before generation 0 do not count.
+        self.assertEqual(count([None, None, 0, 0, 0, 1]), 2)
+        # The writer publishes generations 0 and 1 and idles: the 500 reads of the idle tail are not bracketed.
+        idle = [None, 0, 0, 1] + [1] * 500
+        self.assertEqual(count(idle), 1)
+        self.assertEqual(count(idle), count(idle[:4]), 'appending idle reads must not change the count')
+        # Reads that failed mid-swap sit between observed generations and do overlap a rewrite.
+        self.assertEqual(count([0, None, None, 1, 1, 1]), 2)
+        self.assertEqual(count([0, 1, 2, 3]), 2, 'the first and the last read have no generation on both sides')
+
     @staticmethod
-    def poll_while_running(writer, target, deadline_sec):
+    def count_bracketed_reads(trace):
+        """Counts the reads that fall between two OBSERVED generation changes.
+
+        trace holds one entry per read: the generation number it saw, or None for the seed file and for a read that failed.
+        The writer's generation number only grows. A read counts only when an earlier read had already seen a generation and a
+        later read sees a newer one than this read and every read before it did, so reads taken while pwsh starts up, or
+        after the writer has stopped rewriting, can never raise the count.
+        """
+        newest_later = [None] * len(trace)  # per read: the newest generation any later read saw
+        newest = None
+        for k in range(len(trace) - 1, -1, -1):
+            newest_later[k] = newest
+            if trace[k] is not None:
+                newest = trace[k] if newest is None else max(newest, trace[k])
+        newest_so_far = None  # the newest generation seen up to and including the previous read
+        bracketed = 0
+        for k, generation in enumerate(trace):
+            if newest_so_far is not None and newest_later[k] is not None:
+                if newest_later[k] > (newest_so_far if generation is None else max(newest_so_far, generation)):
+                    bracketed += 1
+            if generation is not None:
+                newest_so_far = generation if newest_so_far is None else max(newest_so_far, generation)
+        return bracketed
+
+    @classmethod
+    def poll_while_running(cls, writer, target, deadline_sec):
         deadline = time.monotonic() + deadline_sec
-        stats = {'reads': 0, 'overlapped': 0, 'absent': 0, 'partial': 0, 'timed_out': False}
-        # The seed file has no 'i'; every rewrite carries its generation number. A read counts as overlapped only once the
-        # reader has seen the writer publish a generation it had not seen when reading started.
-        generations = set()
+        stats = {'reads': 0, 'absent': 0, 'partial': 0, 'timed_out': False}
+        # The seed file has no 'i'; every rewrite carries its generation number. Each read is recorded in trace and the
+        # overlap count is derived from it afterwards, once the last generation change the reader saw is known.
+        trace = []
+        last_generation = None
+        last_change = None
         while writer.poll() is None:
             if time.monotonic() > deadline:
                 stats['timed_out'] = True
                 break
             stats['reads'] += 1
-            if len(generations) > 1:
-                stats['overlapped'] += 1
+            generation = None
             try:
-                generations.add(json.loads(target.read_text(encoding='ascii')).get('i'))
+                generation = json.loads(target.read_text(encoding='ascii')).get('i')
             except FileNotFoundError:
                 stats['absent'] += 1
             except ValueError:
                 stats['partial'] += 1
             except PermissionError:
                 pass  # a sharing violation while the swap is in flight: the file exists, the read is simply retried
+            trace.append(generation)
+            if generation is not None and generation != last_generation:
+                last_generation = generation
+                last_change = len(trace) - 1
             time.sleep(0.0005)
-        stats['generations'] = len(generations - {None})
+        stats['generations'] = len(set(trace) - {None})
+        stats['overlapped'] = cls.count_bracketed_reads(trace)
+        # Reads after the last generation change the reader saw: the writer had stopped rewriting, or the reader missed it.
+        stats['idle_tail'] = len(trace) if last_change is None else len(trace) - 1 - last_change
         return stats
 
 

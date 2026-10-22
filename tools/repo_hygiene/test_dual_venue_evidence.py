@@ -94,7 +94,11 @@ OWNER_CLIP = "M16-1243"   # a consented clip ID (an id is not footage); the runn
 DISPLAY_MATRIX_LEGS = tuple(f"legs/m16-1243-display-{mode}-s{scale}.json" for scale in (1, 2, 4) for mode in ("fullscreen", "windowed"))
 # PLAYBACK-BACHELOR-PRESENT-JITTER-1 added three capture-free PACE legs: speed legs that force Look Assist (cinematic) through generatorArgs and take no
 # contact sheet, so no GUI-thread framebuffer grab lands inside the timed Play.
-PACE_LEGS = ("legs/m16-1243-pace-cinematic-fullscreen-s4.json", "legs/m16-1243-pace-cinematic-fullscreen-s2.json", "legs/m16-1243-pace-cinematic-windowed-s4.json")
+PACE_LEGS = ("legs/m16-1243-pace-cinematic-fullscreen-s4.json", "legs/m16-1243-pace-cinematic-fullscreen-s2.json", "legs/m16-1243-pace-cinematic-windowed-s4.json",
+             # LOOK-LEG-PACE-TWIN-COVERAGE-1: the three display-matrix cells that had no pace twin (fullscreen s1, windowed s1, windowed s2).
+             "legs/m16-1243-pace-cinematic-fullscreen-s1.json", "legs/m16-1243-pace-cinematic-windowed-s1.json", "legs/m16-1243-pace-cinematic-windowed-s2.json")
+# LOOK-LEG-PACE-TWIN-COVERAGE-1: the capture-free pace twins of the four cpu-reduced look legs (playbackProcessing receipt, cpu only).
+CPU_REDUCED_PACE_LEGS = tuple(f"legs/m16-1243-pace-cinematic-cpu-reduced-{mode}-s{scale}.json" for scale in (2, 4) for mode in ("fullscreen", "windowed"))
 # ... and the lookahead A/B arm: the owner-shape pace leg at MLVAPP_PLAYBACK_RENDER_LOOKAHEAD_FRAMES=3 (the other arm is the pace leg itself, unset).
 LOOKAHEAD_LEGS = ("legs/m16-1243-pace-cinematic-fullscreen-s4-la3.json",)
 # ... and (r2) the stall-stage diagnostic: the owner-shape pace leg at telemetryArm HEAVY, which keeps the per-frame playback_smoke.frame log
@@ -143,7 +147,7 @@ SHIPPED_LEGS = ("legs/m16-1243-speed.json", "legs/m16-1243-look.json", "legs/m16
                 "legs/m16-1243-look-scale2-film.json", "legs/m16-1243-look-scale2-vision50d.json",
                 *(f"legs/m16-1243-look-scale2-{flavor}-agxoff.json" for flavor in ("cinematic", "film", "vision50d")),
                 *(f"legs/m16-1243-display-{mode}-s{scale}-vsync1.json" for scale in (1, 2, 4) for mode in ("fullscreen", "windowed")),
-                *CPU_REDUCED_LEGS, *UPSTREAM_BASELINE_LEGS, *PTRACE_LEGS, *VISUAL_LEGS, *SCOPE_LEGS, *SCOPE_LA_LEGS, *HEADROOM_LEGS, *IDENTITY_LEGS,
+                *CPU_REDUCED_LEGS, *CPU_REDUCED_PACE_LEGS, *UPSTREAM_BASELINE_LEGS, *PTRACE_LEGS, *VISUAL_LEGS, *SCOPE_LEGS, *SCOPE_LA_LEGS, *HEADROOM_LEGS, *IDENTITY_LEGS,
                 *MISSDUMP_LEGS)
 # PLAYBACK-VSYNC-DEFAULT-1: the swap-interval-1 twins of the six display-matrix legs (the vsync A/B; the originals stay at the app's default 0).
 VSYNC1_LEGS = tuple(rel.replace(".json", "-vsync1.json") for rel in DISPLAY_MATRIX_LEGS)
@@ -6011,7 +6015,25 @@ class LegSpecSchemaTests(unittest.TestCase):
                 self.assertEqual(pace[key], cell[key], f"{rel}: {key}")
             self.assertEqual(pace.get("acceptedEffectiveScale"), cell.get("acceptedEffectiveScale"), f"{rel}: declares its cell's CUDA texture-route clamp")
         self.assertEqual(sorted(json.loads((DV / rel).read_text(encoding="utf-8"))["legId"] for rel in PACE_LEGS),
-                         sorted(["m16-1243-pace-cinematic-fullscreen-s4", "m16-1243-pace-cinematic-fullscreen-s2", "m16-1243-pace-cinematic-windowed-s4"]))
+                         sorted(["m16-1243-pace-cinematic-fullscreen-s4", "m16-1243-pace-cinematic-fullscreen-s2", "m16-1243-pace-cinematic-windowed-s4",
+                                 "m16-1243-pace-cinematic-fullscreen-s1", "m16-1243-pace-cinematic-windowed-s1", "m16-1243-pace-cinematic-windowed-s2"]))
+
+    def test_each_cpu_reduced_pace_leg_is_its_cpu_reduced_cell_without_the_contact_sheet(self) -> None:
+        """LOOK-LEG-PACE-TWIN-COVERAGE-1: a cpu-reduced pace twin runs its cpu-reduced look leg (same display mode, scale, playbackProcessing receipt,
+        cpu only, same criteria) as a SPEED leg with Look Assist forced at the cell's flavor, so it takes no contact sheet inside the timed Play."""
+        self.assertEqual(len(CPU_REDUCED_PACE_LEGS), len(CPU_REDUCED_LEGS))
+        for rel in CPU_REDUCED_PACE_LEGS:
+            pace = json.loads((DV / rel).read_text(encoding="utf-8"))
+            self.jsonschema.validate(pace, self.schema)
+            cell = json.loads((DV / "legs" / f"m16-1243-cpu-reduced-{pace['displayMode']}-s{pace['scaleFactor']}.json").read_text(encoding="utf-8"))
+            self.assertEqual(pace["legType"], "speed", rel)
+            self.assertNotIn("look", pace, rel)
+            self.assertEqual(pace["legId"], "m16-1243-pace-cinematic-cpu-reduced-" + rel.rsplit("cpu-reduced-", 1)[1][:-len(".json")], rel)
+            self.assertEqual(pace["backends"], ["cpu"], rel)
+            self.assertEqual(pace["generatorArgs"]["playbackProcessing"], "receipt", rel)
+            self.assertEqual(pace["generatorArgs"], dict(cell["generatorArgs"], forceLookAssist=True, lookFlavor=cell["look"]["lookFlavor"]), rel)
+            for key in ("clipId", "playSeconds", "backends", "scaleFactor", "displayMode", "timeouts", "criteria"):
+                self.assertEqual(pace[key], cell[key], f"{rel}: {key}")
 
     def test_the_lookahead_leg_is_the_owner_shape_pace_leg_at_depth_3(self) -> None:
         """PLAYBACK-BACHELOR-PRESENT-JITTER-1: the lookahead A/B's depth-3 arm differs from the owner-shape pace leg only in its legId and
@@ -6208,7 +6230,7 @@ class LegSpecSchemaTests(unittest.TestCase):
                 self.assertRegex(spec["legId"], r"^m16-1243-display-(fullscreen|windowed)-s[124]-vsync1$", path.name)
             elif spec["card"] == "PLAYBACK-BACHELOR-PRESENT-JITTER-1":   # the capture-free pace legs, named by flavor and cell
                 self.assertEqual(spec["legId"], path.stem, path.name)
-                self.assertRegex(spec["legId"], rf"^m16-1243-pace-{flavor}-(fullscreen|windowed)-s[124](-la[0-3]|-heavy)?(-dec[0-4])?$", path.name)
+                self.assertRegex(spec["legId"], rf"^m16-1243-pace-{flavor}(-cpu-reduced)?-(fullscreen|windowed)-s[124](-la[0-3]|-heavy)?(-dec[0-4])?$", path.name)
             elif spec["card"] == "CPU-DUALISO-REDUCED-ISO-NOTCH-1":   # the cpu-only legs that engage the CPU reduced recon, named by their cell
                 self.assertEqual(spec["legId"], path.stem, path.name)
                 self.assertRegex(spec["legId"], r"^m16-1243-cpu-reduced-(fullscreen|windowed)-s[24]$", path.name)
@@ -6402,6 +6424,95 @@ class LegSpecSchemaTests(unittest.TestCase):
         bad = dict(spec, backends=["cuda", "vulkan"])
         with self.assertRaises(self.jsonschema.ValidationError):
             self.jsonschema.validate(bad, self.schema)
+
+
+# LOOK-LEG-PACE-TWIN-COVERAGE-1: a look leg takes contact-sheet frame grabs DURING the timed Play, so it cannot support an absolute fps / drop / jitter / pace
+# claim; the claim needs the look leg's capture-free pace twin (a speed leg that forces Look Assist at the same clip, display, scale, flavor and condition).
+# A look leg with no twin must be listed here with the reason it has none; the reason is one line. The census that produced the list (KEY-PROMPT-LOOK-LEG-
+# FPS-CAPTURE-FREE-ARM-1 r1, re-run on fork/master 4cf92c33) found 23 untwinned look legs; this card twinned the 9 that merged playback PRs cite for absolute
+# figures (the display matrix cells fullscreen s1, windowed s1 and windowed s2 -- which also cover the s1 identity and miss-dump diagnostics -- and the four
+# cpu-reduced cells) and lists the other 14.
+NO_PACE_TWIN_BY_DESIGN = {
+    **{f"m16-1243-display-{mode}-s{scale}-vsync1": "swapInterval 1 A/B arm; no merged PR cites an absolute figure from it, so a swapInterval 1 pace twin waits for the first PR that does"
+       for mode in ("fullscreen", "windowed") for scale in (1, 2, 4)},
+    "m16-1243-look": "Classic flavor-parity contact-sheet leg (also a supplementary row of the nightly baseline); pace claims use the Cinematic display-matrix twins",
+    "m16-1243-look-scale2": "Classic flavor-parity contact-sheet leg at scale 2; pace claims use the Cinematic display-matrix twins",
+    "m16-1243-look-film": "Film flavor-parity contact-sheet leg; no merged PR cites an absolute figure from it",
+    "m16-1243-look-scale2-film": "Film flavor-parity contact-sheet leg at scale 2; no merged PR cites an absolute figure from it",
+    "m16-1243-look-scale2-vision50d": "Vision50d flavor-parity contact-sheet leg at scale 2; no merged PR cites an absolute figure from it",
+    **{f"m16-1243-look-scale2-{flavor}-agxoff": "carries a look receipt (agx-off.marxml) that a speed leg cannot carry, so no speed leg can be the same condition"
+       for flavor in ("cinematic", "film", "vision50d")},
+}
+
+
+def find_capture_free_pace_twin(look_spec: dict, specs: dict) -> str | None:
+    """The legId of a pace twin of `look_spec` among `specs` ({legId: spec}), else None. A twin is a SPEED leg that forces Look Assist at the look leg's
+    flavor, is paced, and matches its clip, display mode (absent = fullscreen), scale and condition, over a backend set that covers the look leg's. Condition =
+    generatorArgs minus the keys that do not change what is timed: the quiescence gate and telemetry arm, the speed side's forceLookAssist / lookFlavor and the
+    look side's diagnostics (firstPresentCapture, presentTrace, warmReuseMissDump). A look leg that carries a look receipt has no twin: a speed leg cannot."""
+    neutral = {"cpuQuiescenceThresholdPercent", "telemetryArm"}
+    look_diag = {"firstPresentCapture", "presentTrace", "warmReuseMissDump"}
+    speed_only = {"forceLookAssist", "lookFlavor"}
+    look = look_spec.get("look", {})
+    if "receipt" in look:
+        return None
+    want = {k: v for k, v in look_spec.get("generatorArgs", {}).items() if k not in neutral | look_diag}
+    for leg_id, spec in sorted(specs.items()):
+        args = spec.get("generatorArgs", {})
+        if spec.get("legType") != "speed" or args.get("forceLookAssist") is not True or args.get("unpaced"):
+            continue
+        if args.get("lookFlavor") != look.get("lookFlavor"):
+            continue
+        if any(spec.get(k) != look_spec.get(k) for k in ("clipId", "scaleFactor")) or spec.get("displayMode", "fullscreen") != look_spec.get("displayMode", "fullscreen"):
+            continue
+        if not set(look_spec["backends"]) <= set(spec["backends"]):
+            continue
+        if {k: v for k, v in args.items() if k not in neutral | speed_only} == want:
+            return leg_id
+    return None
+
+
+class LookLegPaceTwinCoverageTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.specs = {}
+        for path in sorted((DV / "legs").glob("*.json")):
+            spec = json.loads(path.read_text(encoding="utf-8"))
+            self.specs[spec["legId"]] = spec
+        self.looks = {k: v for k, v in self.specs.items() if v["legType"] == "look"}
+
+    def test_every_look_leg_has_a_capture_free_pace_twin_or_a_by_design_entry(self) -> None:
+        missing = sorted(k for k, v in self.looks.items() if find_capture_free_pace_twin(v, self.specs) is None and k not in NO_PACE_TWIN_BY_DESIGN)
+        self.assertEqual(missing, [], "look legs with no capture-free pace twin and no NO_PACE_TWIN_BY_DESIGN entry: add the twin (a speed leg with generatorArgs.forceLookAssist "
+                                     "true and the same clip, display, scale, flavor and condition) or list the leg with a one-line reason")
+
+    def test_the_by_design_list_names_only_untwinned_look_legs_and_gives_a_reason(self) -> None:
+        for leg_id, reason in NO_PACE_TWIN_BY_DESIGN.items():
+            self.assertIn(leg_id, self.looks, f"{leg_id}: not a look leg under legs/ (stale entry)")
+            self.assertIsNone(find_capture_free_pace_twin(self.looks[leg_id], self.specs), f"{leg_id}: has a pace twin now, so drop it from the by-design list")
+            self.assertTrue(reason.strip() and "\n" not in reason and len(reason) >= 20, f"{leg_id}: the reason must be one real line")
+
+    def test_the_twin_rule_accepts_a_matching_speed_leg_and_rejects_each_mismatch(self) -> None:
+        look = {"legId": "x-look", "legType": "look", "clipId": "C", "scaleFactor": 2, "displayMode": "windowed", "backends": ["cuda", "cpu"],
+                "generatorArgs": {"telemetryArm": "LIGHT", "cpuQuiescenceThresholdPercent": 95, "presentTrace": True}, "look": {"lookFlavor": "cinematic"}}
+        twin = {"legId": "x-pace", "legType": "speed", "clipId": "C", "scaleFactor": 2, "displayMode": "windowed", "backends": ["cuda", "cpu"],
+                "generatorArgs": {"telemetryArm": "HEAVY", "forceLookAssist": True, "lookFlavor": "cinematic"}}
+        self.assertEqual(find_capture_free_pace_twin(look, {"x-pace": twin}), "x-pace")
+        for name, change in (("another clip", {"clipId": "D"}), ("another scale", {"scaleFactor": 4}), ("another display", {"displayMode": "fullscreen"}),
+                             ("a look leg, not a speed leg", {"legType": "look"}), ("backends that do not cover the look leg", {"backends": ["cpu"]}),
+                             ("look assist not forced", {"generatorArgs": {"lookFlavor": "cinematic"}}),
+                             ("another flavor", {"generatorArgs": {"forceLookAssist": True, "lookFlavor": "film"}}),
+                             ("unpaced", {"generatorArgs": {"forceLookAssist": True, "lookFlavor": "cinematic", "unpaced": True}}),
+                             ("another swap interval", {"generatorArgs": {"forceLookAssist": True, "lookFlavor": "cinematic", "swapInterval": 1}}),
+                             ("another playback processing", {"generatorArgs": {"forceLookAssist": True, "lookFlavor": "cinematic", "playbackProcessing": "receipt"}})):
+            self.assertIsNone(find_capture_free_pace_twin(look, {"x-pace": dict(twin, **change)}), name)
+        receipt = dict(look, look={"lookFlavor": "cinematic", "receipt": "look-receipts/agx-off.marxml"})
+        self.assertIsNone(find_capture_free_pace_twin(receipt, {"x-pace": twin}), "a look receipt cannot be carried by a speed leg")
+        self.assertIsNone(find_capture_free_pace_twin(look, {}), "no speed legs at all")
+
+    def test_the_display_matrix_cells_and_the_cpu_reduced_cells_are_all_twinned(self) -> None:
+        for leg_id in (*(rel[len("legs/"):-len(".json")] for rel in (*DISPLAY_MATRIX_LEGS, *CPU_REDUCED_LEGS, *PTRACE_LEGS, *IDENTITY_LEGS, *MISSDUMP_LEGS)),
+                       "m16-1243-look-cinematic", "m16-1243-look-scale2-cinematic"):
+            self.assertIsNotNone(find_capture_free_pace_twin(self.looks[leg_id], self.specs), leg_id)
 
 
 @requires_windows_pwsh
