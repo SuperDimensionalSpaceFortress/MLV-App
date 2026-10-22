@@ -567,7 +567,8 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
         self.assertFalse((self.artifacts() / "capture" / "reference-frame-candidate.json").exists())
 
     # --- F-01 footage-path-disclosure: a SUCCESSFUL capture publishes nothing that names the owner's part path ---------------------------------
-    def run_stand_in_capture(self, name: str, edit: tuple[str, str] | None = None) -> tuple[subprocess.CompletedProcess, Path, Path, str, Path, str]:
+    def run_stand_in_capture(self, name: str, edit: tuple[str, str] | None = None,
+                             more_edits: tuple[tuple[str, str], ...] = ()) -> tuple[subprocess.CompletedProcess, Path, Path, str, Path, str]:
         """The emitted job run end to end against a stand-in app; returns (ran, outbox, part, part sha256, the app's argv file, the path marker)."""
         marker = "OWNERREALPATHMARKERq7z3"
         owner_dir = self.tmp / f"{marker}-dir"
@@ -593,9 +594,9 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
         self.assertEqual(count, 1)
         self.assertEqual(job.count("-Exe '$exePath'"), 1, "the capture's -Exe anchor moved: this fixture is stale")
         job = job.replace("-Exe '$exePath'", f"-Exe '{fake}'")
-        if edit is not None:
-            self.assertEqual(job.count(edit[0]), 1, f"injection anchor {edit[0]!r} is not unique: this fixture is stale")
-            job = job.replace(edit[0], edit[1])
+        for anchor, injected in (() if edit is None else (edit,)) + tuple(more_edits):
+            self.assertEqual(job.count(anchor), 1, f"injection anchor {anchor!r} is not unique: this fixture is stale")
+            job = job.replace(anchor, injected)
         gen_out.write_text(job, encoding="utf-8")
         ran = _run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(gen_out)])
         return ran, self.artifacts(), part, part_sha, args_file, marker
@@ -697,6 +698,88 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
         self.assertIs(candidate["invalid"], True)
         self.assertIn("OWNER_FOOTAGE_VIEW_CHANGED_DURING_CAPTURE", candidate["invalid_reasons"])
         self.assertIs(result["candidateInvalidated"], True)
+        self.assertIs(result["candidateInvalidMarker"], True, "the marker is written whenever a manifest is invalidated, not only when the stamp fails")
+
+    # --- VENUE-REFERENCE-FRAME-CANDIDATE-INVALID-MARKER-1: the in-place stamp is best effort, so a durable marker backs it -------------------------
+    VIEW_CHANGED = ("Assert-AttrCudaOwnerFootageViewsIntact -Views @($ownerViews); $viewsIntactAfterCapture = $true",
+                    "throw 'INJECTED_VIEW_CHANGED'; $viewsIntactAfterCapture = $true")
+    # (a) the manifest on disk does not parse when the job comes to stamp it
+    UNPARSEABLE_MANIFEST = ("$candidatePath = Join-Path $captureOut 'reference-frame-candidate.json'",
+                            "$candidatePath = Join-Path $captureOut 'reference-frame-candidate.json'; "
+                            "[IO.File]::WriteAllText($candidatePath, '{\"status\": \"candidate-unreviewed\", \"truncated')")
+    # (b) the manifest parses, but publishing the stamped copy fails
+    STAMP_PUBLISH_FAILS = ("[void](Publish-AttrCudaText -Path $candidatePath -Value ($candidateDoc | ConvertTo-Json -Depth 64))",
+                           "throw 'INJECTED_CANDIDATE_PUBLISH_FAILURE'")
+    # (c) the marker cannot be written either
+    MARKER_PUBLISH_FAILS = ("[void](Publish-AttrCudaText -Path $candidateMarkerPath ",
+                            "throw 'INJECTED_MARKER_PUBLISH_FAILURE'; [void](Publish-AttrCudaText -Path $candidateMarkerPath ")
+
+    @staticmethod
+    def _frame_provenance():
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("frame_provenance_under_test", ROOT / "tools" / "profiling" / "frame_provenance.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def assert_failed_stamp_left_a_marker_and_no_candidate(self, ran: subprocess.CompletedProcess, pub: Path) -> dict:
+        self.assertEqual(ran.returncode, 225, ran.stdout + ran.stderr)
+        self.assertIn("RESULT=REFERENCE_FRAME_FAILED STEP=footageViewIntact EXIT=225", ran.stdout)
+        result = json.loads((pub / "result.json").read_text(encoding="utf-8-sig"))
+        self.assertEqual((result["status"], result["exitCode"], result["captureExitCode"]), ("capture-failed", 225, 0))
+        self.assertIsNone(result["candidateSha256"])
+        self.assertIs(result["candidateInvalidated"], False, "the stamp did not land: result.json must not say it did")
+        marker = pub / "capture" / "reference-frame-candidate.invalid"
+        self.assertTrue(marker.is_file(), "no durable invalid marker: the manifest still reads as a candidate")
+        document = json.loads(marker.read_text(encoding="utf-8-sig"))
+        self.assertIs(document["invalid"], True)
+        self.assertIn("OWNER_FOOTAGE_VIEW_CHANGED_DURING_CAPTURE", document["invalid_reasons"])
+        self.assertIs(result["candidateInvalidMarker"], True)
+        # the reader in tree honours it: marker present = not a candidate, whatever the manifest says
+        self.assertEqual(self._frame_provenance().index_capture_records(str(pub)), {}, "frame_provenance still indexes the capture as a candidate")
+        return result
+
+    def test_a_manifest_that_does_not_parse_leaves_a_marker_even_so(self) -> None:
+        ran, pub, _, _, _, _ = self.run_stand_in_capture("unparseable", edit=self.VIEW_CHANGED, more_edits=(self.UNPARSEABLE_MANIFEST,))
+        self.assertIn("CANDIDATE_NOT_INVALIDATED", ran.stdout)
+        self.assert_failed_stamp_left_a_marker_and_no_candidate(ran, pub)
+        with self.assertRaises(ValueError):
+            json.loads((pub / "capture" / "reference-frame-candidate.json").read_text(encoding="utf-8-sig"))
+
+    def test_a_stamp_that_cannot_be_published_leaves_a_marker_anyway(self) -> None:
+        ran, pub, _, _, _, _ = self.run_stand_in_capture("stampfails", edit=self.VIEW_CHANGED, more_edits=(self.STAMP_PUBLISH_FAILS,))
+        self.assertIn("CANDIDATE_NOT_INVALIDATED", ran.stdout)
+        self.assert_failed_stamp_left_a_marker_and_no_candidate(ran, pub)
+        # the manifest kept its old, unstamped text: this is exactly the case the marker exists for
+        manifest = json.loads((pub / "capture" / "reference-frame-candidate.json").read_text(encoding="utf-8-sig"))
+        self.assertEqual(manifest["status"], "candidate-unreviewed")
+
+    def test_when_neither_the_stamp_nor_the_marker_can_be_written_the_manifest_is_moved_out_of_the_candidate_name(self) -> None:
+        ran, pub, _, _, _, _ = self.run_stand_in_capture("nomarker", edit=self.VIEW_CHANGED,
+                                                         more_edits=(self.STAMP_PUBLISH_FAILS, self.MARKER_PUBLISH_FAILS))
+        self.assertEqual(ran.returncode, 225, ran.stdout + ran.stderr)
+        self.assertIn("CANDIDATE_MARKER_NOT_WRITTEN", ran.stdout)
+        result = json.loads((pub / "result.json").read_text(encoding="utf-8-sig"))
+        self.assertEqual((result["status"], result["exitCode"], result["captureExitCode"]), ("capture-failed", 225, 0))
+        self.assertIsNone(result["candidateSha256"])
+        self.assertEqual((result["candidateInvalidated"], result["candidateInvalidMarker"], result["candidateQuarantined"]), (False, False, True))
+        self.assertFalse((pub / "capture" / "reference-frame-candidate.json").exists(), "the manifest still carries the candidate name")
+        self.assertFalse((pub / "capture" / "reference-frame-candidate.invalid").exists())
+        self.assertEqual(self._frame_provenance().index_capture_records(str(pub)), {})
+
+    def test_a_capture_that_passed_writes_no_invalid_marker_and_reports_none(self) -> None:
+        ran, pub, _, _, _, _ = self.run_stand_in_capture("nomarkerok")
+        self.assertEqual(ran.returncode, 0, ran.stdout + ran.stderr)
+        self.assertFalse((pub / "capture" / "reference-frame-candidate.invalid").exists())
+        result = json.loads((pub / "result.json").read_text(encoding="utf-8-sig"))
+        self.assertEqual((result["candidateInvalidated"], result["candidateInvalidMarker"], result["candidateQuarantined"]), (None, None, None))
+        self.assertEqual(len(self._frame_provenance().index_capture_records(str(pub))), 1)
+
+    def test_the_comment_states_the_marker_rule_and_no_longer_claims_the_manifest_alone_decides(self) -> None:
+        text = GENERATOR.read_text(encoding="utf-8")
+        self.assertNotIn("so the manifest alone never\n# reads as a candidate", text)
+        self.assertIn("reference-frame-candidate.invalid", text)
+        self.assertIn("marker present = not a candidate", text)
 
 
 @requires_pwsh

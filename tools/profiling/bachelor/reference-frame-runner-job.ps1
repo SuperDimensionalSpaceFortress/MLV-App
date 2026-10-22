@@ -613,21 +613,45 @@ $candidateOk = ($captureRc -eq 0 -and -not $viewsChanged)
 
 $candidatePath = Join-Path $captureOut 'reference-frame-candidate.json'
 $candidateSha256 = if ($candidateOk -and (Test-Path -LiteralPath $candidatePath)) { Get-ShaLower $candidatePath } else { $null }
-# A capture voided by a changed view (225) leaves a manifest that still calls itself a candidate. It is stamped invalid IN PLACE -- the stamps
-# of gui-smoke-length-gate.ps1 Set-GuiSmokeReceiptInvalid (invalid, invalid_reasons) plus status 'invalid' -- so the manifest alone never
-# reads as a candidate. $null = there was nothing to invalidate; $false = the stamp failed (result.json still says capture-failed).
+# A capture voided by a changed view (225) leaves a manifest that still calls itself a candidate. Two layers say otherwise, and the in-place
+# stamp is only the second: the manifest is rewritten invalid IN PLACE (the stamps of gui-smoke-length-gate.ps1 Set-GuiSmokeReceiptInvalid --
+# invalid, invalid_reasons -- plus status 'invalid'), which is best effort, because it needs the manifest to parse and the rewrite to publish.
+# So a sibling marker, reference-frame-candidate.invalid, is written FIRST and depends on neither: marker present = not a candidate, whatever
+# the manifest says (tools/profiling/frame_provenance.py honours it). If neither layer can be written the manifest is moved out of the
+# candidate name. $null = there was nothing to invalidate (or, for the quarantine, it was not needed); $false = that layer failed
+# (result.json says capture-failed and the job exits 225 in every case).
+$candidateMarkerPath = Join-Path $captureOut 'reference-frame-candidate.invalid'
 $candidateInvalidated = $null
+$candidateInvalidMarker = $null
+$candidateQuarantined = $null
 if ($viewsChanged -and (Test-Path -LiteralPath $candidatePath -PathType Leaf)) {
     $candidateInvalidated = $false
+    $candidateInvalidMarker = $false
+    $candidateInvalidReasons = @('OWNER_FOOTAGE_VIEW_CHANGED_DURING_CAPTURE', 'reference-frame-runner step footageViewIntact exit 225')
+    try {
+        [void](Publish-AttrCudaText -Path $candidateMarkerPath -Value ([ordered]@{ schema = 'mlvapp.reference-frame-candidate-invalid.v1'; invalid = $true; invalid_reasons = $candidateInvalidReasons } | ConvertTo-Json -Depth 4))
+        $candidateInvalidMarker = $true
+    } catch {
+        Say "CANDIDATE_MARKER_NOT_WRITTEN $($_.Exception.Message)"
+    }
     try {
         $candidateDoc = [IO.File]::ReadAllText($candidatePath) | ConvertFrom-Json
         $candidateDoc | Add-Member -NotePropertyName status -NotePropertyValue 'invalid' -Force
         $candidateDoc | Add-Member -NotePropertyName invalid -NotePropertyValue $true -Force
-        $candidateDoc | Add-Member -NotePropertyName invalid_reasons -NotePropertyValue @('OWNER_FOOTAGE_VIEW_CHANGED_DURING_CAPTURE', 'reference-frame-runner step footageViewIntact exit 225') -Force
+        $candidateDoc | Add-Member -NotePropertyName invalid_reasons -NotePropertyValue $candidateInvalidReasons -Force
         [void](Publish-AttrCudaText -Path $candidatePath -Value ($candidateDoc | ConvertTo-Json -Depth 64))
         $candidateInvalidated = $true
     } catch {
         Say "CANDIDATE_NOT_INVALIDATED $($_.Exception.Message)"
+    }
+    if (-not $candidateInvalidated -and -not $candidateInvalidMarker) {
+        $candidateQuarantined = $false
+        try {
+            Move-Item -LiteralPath $candidatePath -Destination (Join-Path $captureOut 'reference-frame-candidate.INVALID.json') -ErrorAction Stop
+            $candidateQuarantined = $true
+        } catch {
+            Say "CANDIDATE_NOT_QUARANTINED $($_.Exception.Message)"
+        }
     }
 }
 try { [void](Publish-AttrCudaText -Path (Join-Path $Pub 'result.json') -Value (([ordered]@{
@@ -640,6 +664,7 @@ try { [void](Publish-AttrCudaText -Path (Join-Path $Pub 'result.json') -Value ((
     bundle = @($BundleEntries | ForEach-Object { [ordered]@{ name = $_.name; sha256 = $_.sha256 } })
     captureParameters = [ordered]@{ seconds = $Seconds; presentedFrames = $PresentedFrames }
     exeSha256 = $artifactHashes['exe']; candidateSha256 = $candidateSha256; candidateInvalidated = $candidateInvalidated
+    candidateInvalidMarker = $candidateInvalidMarker; candidateQuarantined = $candidateQuarantined
     clipParts = @($verifiedParts | ForEach-Object { [ordered]@{ index = $_.index; length = $_.length; sha256 = $_.sha256 } })
     footageView = [ordered]@{ mode = $ownerViewMode; intactAfterCapture = $viewsIntactAfterCapture }
     stagedOnHost = $env:COMPUTERNAME; steps = $StepLog
