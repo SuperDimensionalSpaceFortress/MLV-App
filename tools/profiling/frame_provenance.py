@@ -114,10 +114,22 @@ def build(frames_dir: str, outbox_root: str) -> dict[str, Any]:
             # implying the frame itself is unusable.
             row["provenance"] = "orphaned - no capture record with these pixels under the searched root"
         else:
-            matched += 1
-            with open(manifest_path, encoding="utf-8-sig") as fh:
-                row.update(_identity(json.load(fh)))
-            row["manifest"] = manifest_path
+            try:
+                with open(manifest_path, encoding="utf-8-sig") as fh:
+                    doc = json.load(fh)
+                if not isinstance(doc, dict):
+                    raise ValueError("manifest is not a JSON object")
+            except (OSError, ValueError) as exc:
+                # The index accepted this manifest (an unparseable one is indexed on purpose) but it cannot be read now: malformed, not an
+                # object, undecodable, or gone since indexing. One bad record must not abort the report for every other frame. The pixels
+                # matched a record whose identity we could not read, so the frame is not counted as matched (main() then exits 4, as for an
+                # orphan) and keeps the path so the operator can go and look.
+                row["provenance"] = f"unreadable - a capture record matched these pixels but could not be read ({type(exc).__name__})"
+                row["manifest"] = manifest_path
+            else:
+                matched += 1
+                row.update(_identity(doc))
+                row["manifest"] = manifest_path
         records.append(row)
     result: dict[str, Any] = {
         "schema": SCHEMA,

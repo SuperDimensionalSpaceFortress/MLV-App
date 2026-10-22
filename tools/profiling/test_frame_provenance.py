@@ -11,6 +11,7 @@ import os
 
 import pytest
 
+import frame_provenance as fp
 from frame_provenance import SCHEMA, build, index_capture_records
 
 
@@ -297,6 +298,170 @@ def test_an_unparseable_manifest_without_a_marker_keeps_its_existing_behaviour(t
 
     assert len(index_capture_records(str(ob), skipped)) == 1
     assert skipped == []
+
+
+STAMP_SHAPES = [
+    {"status": "invalid", "invalid": True, "invalid_reasons": ["OWNER_FOOTAGE_VIEW_CHANGED_DURING_CAPTURE"]},
+    {"invalid": True},
+    {"status": "invalid"},
+]
+STAMP_SHAPE_IDS = ["full-runner-stamp", "invalid-flag-only", "status-only"]
+
+
+def _prefix_bom(capture_dir: str) -> None:
+    """Re-save a capture's manifest with the UTF-8 BOM that PowerShell 5.1 writes, and prove the fixture kept it."""
+    path = os.path.join(capture_dir, "reference-frame-candidate.json")
+    with open(path, "rb") as fh:
+        raw = fh.read()
+    assert not raw.startswith(b"\xef\xbb\xbf"), "fixture already had a BOM"
+    with open(path, "wb") as fh:
+        fh.write(b"\xef\xbb\xbf" + raw)
+    with open(path, "rb") as fh:
+        assert fh.read(3) == b"\xef\xbb\xbf", "fixture lost its BOM"
+
+
+@pytest.mark.parametrize("fields", STAMP_SHAPES, ids=STAMP_SHAPE_IDS)
+def test_a_bom_prefixed_manifest_stamped_invalid_is_skipped_like_its_unprefixed_twin(tmp_path, fields):
+    """REFERENCE-FRAME-STAMP-BOM-INVALID-PINS-1: the stamp tests above and the BOM test below each cover one half. A voided manifest written by
+    PowerShell 5.1 carries both a BOM and a stamp, so every stamp shape must be skipped with the same typed reason and the same counts as the
+    unprefixed manifest -- a reader that opened the manifest as plain utf-8 would fail to parse it, claim nothing, and index the voided pixels."""
+    ob = tmp_path / "outbox"
+    d = _capture(str(ob), "voided", b"PIXELS-V", _manifest("aaaaaaaaaaaa"))
+    _capture(str(ob), "good", b"PIXELS-G", _manifest("bbbbbbbbbbbb"))
+    _stamp_invalid(d, **fields)
+    _prefix_bom(d)
+    assert not os.path.exists(os.path.join(d, "reference-frame-candidate.invalid"))
+    frames = tmp_path / "frames"
+    frames.mkdir()
+    (frames / "v.png").write_bytes(b"PIXELS-V")
+    (frames / "g.png").write_bytes(b"PIXELS-G")
+
+    skipped: list[dict] = []
+    index = index_capture_records(str(ob), skipped)
+    result = build(str(frames), str(ob))
+
+    assert len(index) == 1
+    assert list(index.values())[0].endswith(os.path.join("good", "reference-frame-candidate.json"))
+    assert [(s["reason"], os.path.basename(s["capture"])) for s in skipped] == [("manifest-stamped-invalid", "voided")]
+    assert (result["recordsIndexed"], result["matched"], result["orphaned"]) == (1, 1, 1)
+    assert [(s["reason"], os.path.basename(s["capture"])) for s in result["skipped"]] == [("manifest-stamped-invalid", "voided")]
+    by_name = {r["frame"]: r for r in result["frames"]}
+    assert "commit" not in by_name["v.png"] and "manifest" not in by_name["v.png"]
+    assert by_name["g.png"]["commit"] == "bbbbbbbbbbbb"
+
+
+@pytest.mark.parametrize("fields", STAMP_SHAPES, ids=STAMP_SHAPE_IDS)
+def test_a_bom_prefixed_stamped_manifest_binds_nothing_through_the_signatures_that_predate_the_skip_report(tmp_path, fields):
+    """The BOM twin of the no-``skipped`` test above: the same three stamp shapes, with no skip list passed, bind nothing."""
+    ob = tmp_path / "outbox"
+    d = _capture(str(ob), "voided", b"PIXELS-V", _manifest("aaaaaaaaaaaa"))
+    _stamp_invalid(d, **fields)
+    _prefix_bom(d)
+    frames = tmp_path / "frames"
+    frames.mkdir()
+    (frames / "v.png").write_bytes(b"PIXELS-V")
+
+    assert index_capture_records(str(ob)) == {}
+    result = build(str(frames), str(ob))
+
+    assert (result["recordsIndexed"], result["matched"], result["orphaned"]) == (0, 0, 1)
+    assert "commit" not in result["frames"][0] and "manifest" not in result["frames"][0]
+
+
+def _corrupt_manifest_after_indexing(monkeypatch, mutate) -> None:
+    """Make build()'s own index pass see a readable manifest, then run ``mutate(manifest_path)`` before the per-frame read -- the window between
+    indexing and the read, in which a capture can be rewritten or removed."""
+    real = fp.index_capture_records
+
+    def index_then_mutate(root, skipped=None):
+        index = real(root, skipped)
+        for manifest_path in index.values():
+            mutate(manifest_path)
+        return index
+
+    monkeypatch.setattr(fp, "index_capture_records", index_then_mutate)
+
+
+def _write_bytes(data: bytes):
+    def mutate(path: str) -> None:
+        with open(path, "wb") as fh:
+            fh.write(data)
+    return mutate
+
+
+def _delete(path: str) -> None:
+    os.remove(path)
+
+
+@pytest.mark.parametrize("mutate", [
+    _write_bytes(b'{"commit": "aaaaaaaaaaaa", "trunc'),
+    _write_bytes(b"\xef\xbb\xbf" + b'{"commit": "aaaaaaaaaaaa", "trunc'),
+    _write_bytes(b"\xff\xfe\x00\x81{}"),
+    _write_bytes(b"[]"),
+    _delete,
+], ids=["truncated-json", "truncated-json-with-bom", "invalid-utf8", "not-a-json-object", "deleted"])
+def test_a_matched_manifest_that_goes_bad_after_indexing_keeps_the_frame_row_and_the_rest_of_the_report(tmp_path, monkeypatch, mutate):
+    """REFERENCE-FRAME-STAMP-BOM-INVALID-PINS-1 part 2: a matched manifest that is unreadable by the time the row is built (malformed, not an
+    object, undecodable, or gone) used to raise out of the per-frame loop and abort the whole report. Now the frame keeps its row with a typed
+    ``provenance`` and its pixel hash, is not counted as matched, and every other frame still renders."""
+    ob = tmp_path / "outbox"
+    bad = _capture(str(ob), "bad", b"PIXELS-BAD", _manifest("aaaaaaaaaaaa"))
+    _capture(str(ob), "good", b"PIXELS-G", _manifest("bbbbbbbbbbbb"))
+    frames = tmp_path / "frames"
+    frames.mkdir()
+    (frames / "a.png").write_bytes(b"PIXELS-BAD")
+    (frames / "z.png").write_bytes(b"PIXELS-G")
+    bad_manifest = os.path.join(bad, "reference-frame-candidate.json")
+
+    def mutate_bad_only(path: str) -> None:
+        if path == bad_manifest:
+            mutate(path)
+
+    _corrupt_manifest_after_indexing(monkeypatch, mutate_bad_only)
+
+    result = fp.build(str(frames), str(ob))
+
+    assert (result["recordsIndexed"], result["matched"], result["orphaned"]) == (2, 1, 1)
+    rows = {r["frame"]: r for r in result["frames"]}
+    assert list(rows) == ["a.png", "z.png"], "a frame row was dropped"
+    assert rows["a.png"]["sha256"] == hashlib.sha256(b"PIXELS-BAD").hexdigest()
+    assert rows["a.png"]["provenance"].startswith("unreadable - ")
+    assert "commit" not in rows["a.png"]
+    assert rows["a.png"]["manifest"] == bad_manifest, "the operator needs the path to go and look"
+    assert rows["z.png"]["commit"] == "bbbbbbbbbbbb" and "provenance" not in rows["z.png"]
+    assert "skipped" not in result, "no new top-level shape: the unreadable manifest is carried on the frame row"
+
+
+@pytest.mark.parametrize("content", [b'{"commit": "aaaaaaaaaaaa", "trunc', b"[]"], ids=["truncated-json", "not-a-json-object"])
+def test_a_malformed_manifest_with_no_marker_gives_an_unreadable_row_not_a_crash(tmp_path, content):
+    """No monkeypatch: the index deliberately keeps indexing an unparseable manifest (test above), so build() meets it for real."""
+    ob = tmp_path / "outbox"
+    d = _capture(str(ob), "broken", b"PIXELS-B", _manifest("aaaaaaaaaaaa"))
+    with open(os.path.join(d, "reference-frame-candidate.json"), "wb") as fh:
+        fh.write(content)
+    frames = tmp_path / "frames"
+    frames.mkdir()
+    (frames / "f.png").write_bytes(b"PIXELS-B")
+
+    result = build(str(frames), str(ob))
+
+    assert (result["recordsIndexed"], result["matched"], result["orphaned"]) == (1, 0, 1)
+    assert result["frames"][0]["provenance"].startswith("unreadable - ")
+
+
+def test_an_unreadable_manifest_makes_main_exit_nonzero_and_still_writes_the_report(tmp_path):
+    """An unbound frame is reported the way an orphan is: exit 4, with the document written."""
+    ob = tmp_path / "outbox"
+    d = _capture(str(ob), "broken", b"PIXELS-B", _manifest("aaaaaaaaaaaa"))
+    with open(os.path.join(d, "reference-frame-candidate.json"), "w", encoding="utf-8") as fh:
+        fh.write("{not json")
+    frames = tmp_path / "frames"
+    frames.mkdir()
+    (frames / "f.png").write_bytes(b"PIXELS-B")
+    out = tmp_path / "out.json"
+
+    assert fp.main(["--frames-dir", str(frames), "--outbox-root", str(ob), "--out", str(out)]) == 4
+    assert json.loads(out.read_text(encoding="utf-8"))["frames"][0]["provenance"].startswith("unreadable - ")
 
 
 def test_an_unparseable_manifest_with_a_marker_does_not_crash_the_index(tmp_path):
