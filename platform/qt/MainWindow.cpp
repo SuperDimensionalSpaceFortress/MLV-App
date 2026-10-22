@@ -27744,7 +27744,8 @@ void MainWindow::runPlaybackRoutePrewarm( quint64 clipGeneration )
 void MainWindow::postPlaybackReconWarm( quint64 clipGeneration )
 {
     m_playbackReconWarmRepostArmed = false;
-    // one warm per clip: a warm that ran is never repeated (a later raw-level change leaves set_clip to Play, correctly)
+    // one warm per clip, re-run only after a recon-state change re-arms it (rearmPlaybackReconWarmAfterStateChange; a
+    // later raw-level change leaves set_clip to Play, correctly)
     if( !m_pRenderThread || !m_fileLoaded || !m_pMlvObject || m_playbackReconWarmRan ) return;
     playback_recon_warm_run::Decision decision = playback_recon_warm_run::decide(
         !mlvappPlaybackReconWarmRunDisabled() && !mlvappPlaybackRoutePrewarmDisabled(),
@@ -27762,8 +27763,12 @@ void MainWindow::postPlaybackReconWarm( quint64 clipGeneration )
                                                              : ui->horizontalSliderPosition->value();
         // the render thread re-checks for pending work under its lock as it queues, and again as the warm starts
         const playback_recon_warm_run::Reason queued = m_pRenderThread->requestPlaybackReconWarm(
-            static_cast<uint32_t>( qMax( 0, frame ) ), m_playbackReconWarmScale, clipGeneration );
-        if( queued == playback_recon_warm_run::Reason::None ) return;   // the outcome arrives as playbackReconWarmDone
+            static_cast<uint32_t>( qMax( 0, frame ) ), m_playbackReconWarmScale, clipGeneration, m_playbackReconWarmStateGate.generation );
+        if( queued == playback_recon_warm_run::Reason::None )
+        {
+            m_playbackReconWarmStateGate.posted();
+            return;   // the outcome arrives as playbackReconWarmDone
+        }
         decision.run = false;
         decision.reason = queued;
     }
@@ -27794,6 +27799,9 @@ void MainWindow::onPlaybackReconWarmDone( const RenderFrameThread::PlaybackRecon
     const playback_recon_warm_run::Outcome &outcome = done.outcome;
     const bool playing = ui->actionPlay->isChecked();
     const bool clipMatches = done.clipGeneration == m_playbackRoutePrewarmClipGeneration;
+    // WARM-RUN-CHROMA-SMOOTH-PARITY-1: a warm posted before the last recon-state change made its output with the old
+    // state; the gate is read only for a done of this clip (an older clip's warm never belonged to it)
+    const bool stateCurrent = clipMatches && m_playbackReconWarmStateGate.done( done.stateGeneration );
     const bool hasOutput = outcome.ran && outcome.retained.device_bayer16 && outcome.retained.token != 0;
     playback_recon_warm_run::Line line;
     line.run = outcome.ran;
@@ -27809,7 +27817,7 @@ void MainWindow::onPlaybackReconWarmDone( const RenderFrameThread::PlaybackRecon
     QString amazeReason;
     GpuAmazeDebayerBackendTiming amazeTiming;   // PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row 0: its probe
     QString reuseCapture;   // PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1 R2: the warm key's input capture
-    if( playback_recon_warm_run::guiAmazeAllowed( hasOutput, playing, clipMatches ) )
+    if( playback_recon_warm_run::guiAmazeAllowed( hasOutput, playing, clipMatches, stateCurrent ) )
     {
         const double wb[3] = { done.wbMultipliers[0], done.wbMultipliers[1], done.wbMultipliers[2] };
         // PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1 F-key: the recon constants the warm's output was made with
@@ -27822,11 +27830,13 @@ void MainWindow::onPlaybackReconWarmDone( const RenderFrameThread::PlaybackRecon
     }
     else if( hasOutput )
     {
-        amazeReason = playing ? QStringLiteral( "playing" ) : QStringLiteral( "stale_clip" );
+        amazeReason = playing ? QStringLiteral( "playing" )
+                    : !clipMatches ? QStringLiteral( "stale_clip" )
+                                   : QStringLiteral( "state_changed" );
     }
     line.released = llrpGpuPlaybackReconReleaseRetainedDeviceBayer16( outcome.retained.token ) != 0;
     line.outstandingAfter = llrpGpuPlaybackReconRetainedOutstandingCount();
-    if( hasOutput && clipMatches ) m_playbackReconWarmRan = true;
+    if( hasOutput && stateCurrent ) m_playbackReconWarmRan = true;
     // a device loss mid-run leaves no token (released=1 above is the no-op release of token 0); the line says why
     qInfo().noquote() << line.format()
                              + playback_startup_split::amazeProbeFields( amazeTiming.probeAvailable, amazeTiming.probeValid,
@@ -27840,8 +27850,13 @@ void MainWindow::onPlaybackReconWarmDone( const RenderFrameThread::PlaybackRecon
                                              .arg( outcome.backendRc )
                              + amazeReason + QStringLiteral( "\"" )
                              + QStringLiteral( " warm_runs=" ) + QString::number( outcome.warmRuns )
+                             + QStringLiteral( " state_gen=" ) + QString::number( done.stateGeneration )
+                             + QStringLiteral( " state_current=" ) + QString::number( stateCurrent ? 1 : 0 )
                              + playback_warm_output_reuse::captureField( reuseCapture );
-    if( clipMatches && !playing ) schedulePlaybackReconWarmRepost( outcome.reason, done.clipGeneration );
+    // a stale done re-posts as state_changed (the gate's generation is already the new state's)
+    if( clipMatches && !playing )
+        schedulePlaybackReconWarmRepost( stateCurrent ? outcome.reason : playback_recon_warm_run::Reason::StateChanged,
+                                         done.clipGeneration );
 }
 
 void MainWindow::armPlaybackRoutePrewarm()
@@ -27855,9 +27870,27 @@ void MainWindow::armPlaybackRoutePrewarm()
     m_playbackReconWarmPosts = 0;
     m_playbackReconWarmRepostArmed = false;
     m_playbackReconWarmRan = false;
+    m_playbackReconWarmStateGate.reset();   // WARM-RUN-CHROMA-SMOOTH-PARITY-1: the old clip's queued warm was dropped
     m_playbackRoutePrewarmArmed = !mlvappPlaybackRoutePrewarmDisabled();
     // PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row K: a clip change ends a kick still held
     endPlaybackGpuClockKick( "clip_change" );
+}
+
+// WARM-RUN-CHROMA-SMOOTH-PARITY-1: a recon setting the paused warm reads at run time changed (chroma smooth: Look Assist
+// auto-applies it ~15 s after the prewarm's warm ran). The generation is bumped first, so a warm in flight (or one posted
+// before a prewarm ran) is stale on its done; then, while paused after this clip's prewarm, the warm is re-armed: posted
+// now when nothing is in flight, else by the stale done's re-post. The staged slot keeps the old key until the re-run
+// re-keys it, and preGate refuses that key at Play (state_mismatch): a missed reuse, never a wrong frame.
+void MainWindow::rearmPlaybackReconWarmAfterStateChange( const char *why )
+{
+    const bool postNow = m_playbackReconWarmStateGate.stateChanged();
+    if( !m_playbackReconWarmPrewarmRan || ui->actionPlay->isChecked() ) return;
+    m_playbackReconWarmRan = false;
+    m_playbackReconWarmPosts = 0;
+    qInfo().noquote() << QStringLiteral( "playback_recon_warm_rearm why=" ) + QString::fromLatin1( why )
+                             + QStringLiteral( " in_flight=" ) + QString::number( postNow ? 0 : 1 )
+                             + QStringLiteral( " generation=" ) + QString::number( m_playbackReconWarmStateGate.generation );
+    if( postNow ) schedulePlaybackReconWarmRepost( playback_recon_warm_run::Reason::StateChanged, m_playbackRoutePrewarmClipGeneration );
 }
 
 // PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row K (PlaybackGpuClockKickPolicy.h) and Row 0: at Play, before the
@@ -30135,6 +30168,7 @@ void MainWindow::toolButtonBadPixelsIntMethodChanged( void )
 //Chroma Smooth changed
 void MainWindow::toolButtonChromaSmoothChanged( void )
 {
+    const int chromaSmoothBefore = llrpGetChromaSmoothMode( m_pMlvObject );
     switch( toolButtonChromaSmoothCurrentIndex() )
     {
     case 0:
@@ -30155,6 +30189,10 @@ void MainWindow::toolButtonChromaSmoothChanged( void )
     resetMlvCache( m_pMlvObject );
     resetMlvCachedFrame( m_pMlvObject );
     m_frameChanged = true;
+    // WARM-RUN-CHROMA-SMOOTH-PARITY-1: every chroma smooth change reaches the shared mode here (Look Assist's auto-apply
+    // included); the paused recon warm read the old one. Only a real change re-arms it: setToolButtonChromaSmooth's
+    // toggled signals and its explicit call land here more than once per change.
+    if( llrpGetChromaSmoothMode( m_pMlvObject ) != chromaSmoothBefore ) rearmPlaybackReconWarmAfterStateChange( "chroma_smooth" );
 }
 
 //Pattern Noise changed

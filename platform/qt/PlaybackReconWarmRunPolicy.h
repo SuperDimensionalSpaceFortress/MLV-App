@@ -43,7 +43,10 @@ enum class Reason
     SnapshotFailed,       // the last-run state could not be saved
     // PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1 F-a: the shared dual-ISO runtime state (the exposure match Play
     // is seeded from) still changed on the warm's second run: no output is kept, Play runs normally
-    NotConverged
+    NotConverged,
+    // WARM-RUN-CHROMA-SMOOTH-PARITY-1: a recon setting the warm reads at run time (chroma smooth) changed after it was
+    // posted (WarmStateGate): its output is not staged and the warm is re-posted
+    StateChanged
 };
 
 struct Decision
@@ -90,6 +93,7 @@ inline const char *reasonName( Reason reason )
     case Reason::PipelineCapture: return "pipeline_capture";
     case Reason::SnapshotFailed: return "snapshot_failed";
     case Reason::NotConverged: return "not_converged";
+    case Reason::StateChanged: return "state_changed";
     }
     return "none";
 }
@@ -99,18 +103,57 @@ inline const char *reasonName( Reason reason )
 constexpr int kMaxPosts = 60;
 constexpr int kRepostDelayMs = 500;
 
-/*! A skipped warm is re-posted only when real work was in the way and posts remain. */
+/*! A skipped warm is re-posted only when real work was in the way, or its recon state changed (a stale warm-done or a
+ *  re-arm), and posts remain. */
 inline bool repostAfterSkip( Reason reason, int postsSoFar )
 {
-    return reason == Reason::RealRequestPending && postsSoFar < kMaxPosts;
+    return ( reason == Reason::RealRequestPending || reason == Reason::StateChanged ) && postsSoFar < kMaxPosts;
 }
 
-/*! The GUI's AMaZE step into the staged slot runs only for a warm of the current clip, while paused; every other
- *  warm-done (stale clip, Play started, no output) releases its token and does nothing else. */
+/*! The GUI's AMaZE step into the staged slot runs only for a warm of the current clip and recon state, while paused;
+ *  every other warm-done (stale clip, stale state, Play started, no output) releases its token and does nothing else. */
+inline bool guiAmazeAllowed( bool hasRetainedOutput, bool playing, bool clipGenerationMatches, bool stateCurrent )
+{
+    return hasRetainedOutput && !playing && clipGenerationMatches && stateCurrent;
+}
+
 inline bool guiAmazeAllowed( bool hasRetainedOutput, bool playing, bool clipGenerationMatches )
 {
-    return hasRetainedOutput && !playing && clipGenerationMatches;
+    return guiAmazeAllowed( hasRetainedOutput, playing, clipGenerationMatches, true );
 }
+
+/*! WARM-RUN-CHROMA-SMOOTH-PARITY-1: the warm reads the shared recon settings (chroma smooth) when it RUNS, and its key
+ *  takes that state, so a setting changed after it ran (Look Assist auto-applies chroma smooth ~15 s after the prewarm)
+ *  leaves the staged output keyed on the old state: state_mismatch at Play, every time. A change while paused bumps the
+ *  generation; a warm-done of an older generation is stale (not staged, not counted as ran) and the warm runs again. One
+ *  warm in flight at a time: a change while one is in flight is picked up by its done's re-post. */
+struct WarmStateGate
+{
+    quint64 generation = 0;
+    bool inFlight = false;
+
+    // new clip: the generation keeps counting (a done of the old clip is stale either way), and nothing is in flight
+    // (a queued warm of the old clip was dropped at its close and owes no done)
+    void reset() { inFlight = false; }
+    // a warm was queued at the current generation
+    quint64 posted()
+    {
+        inFlight = true;
+        return generation;
+    }
+    // the recon state changed: true when nothing is in flight, so the warm is posted now
+    bool stateChanged()
+    {
+        ++generation;
+        return !inFlight;
+    }
+    // a warm-done: true when it was posted at the current generation
+    bool done( quint64 postedGeneration )
+    {
+        inFlight = false;
+        return postedGeneration == generation;
+    }
+};
 
 /*! PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1 r3 (U-02): a queued warm is not pipeline work, so a clip close can
  *  pass its idle barrier while one is still queued. The close drops every queued warm (RenderFrameThread::

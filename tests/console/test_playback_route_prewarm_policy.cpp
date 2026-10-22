@@ -589,7 +589,8 @@ TEST(PlaybackReconWarmRunWiring, TheGuiReleasesTheTokenOnEveryPath)
     ASSERT_FALSE(done.isEmpty());
     // no early exit: every warm-done reaches the release
     ASSERT_FALSE(done.contains(QStringLiteral("return")));
-    const int gate = done.indexOf(QStringLiteral("if( playback_recon_warm_run::guiAmazeAllowed( hasOutput, playing, clipMatches ) )"));
+    // WARM-RUN-CHROMA-SMOOTH-PARITY-1: the gate also needs the warm's recon state to be current
+    const int gate = done.indexOf(QStringLiteral("if( playback_recon_warm_run::guiAmazeAllowed( hasOutput, playing, clipMatches, stateCurrent ) )"));
     const int amaze = done.indexOf(QStringLiteral("GpuDisplayWindow::warmStagedReconSlotFromDeviceBayer16IfActive("));
     const int release = done.indexOf(QStringLiteral(
         "line.released = llrpGpuPlaybackReconReleaseRetainedDeviceBayer16( outcome.retained.token ) != 0;"));
@@ -1267,4 +1268,63 @@ TEST(PlaybackWarmReconDeterminismWiring, AClipCloseDropsEveryQueuedWarmBeforeThe
     ASSERT_TRUE(thread.contains(QStringLiteral("m_pMlvObject ? qMax( 1, m_pMlvObject->cpu_cores ) : 1,")));
     ASSERT_TRUE(sourceFile("platform/qt/PlaybackReconWarmRun.h").contains(
         QStringLiteral("if( !video || !worker || fullWidth <= 0 || fullHeight <= 0 )")));
+}
+
+// WARM-RUN-CHROMA-SMOOTH-PARITY-1: Look Assist's auto-apply reaches llrpSetChromaSmoothMode only through
+// toolButtonChromaSmoothChanged, AFTER the paused warm ran (cs 0 in the warm's key, cs 1 in Play's: state_mismatch at
+// every venue leg). The slot re-arms the warm after it sets the mode; a warm done for an older state generation is
+// stale (no AMaZE into the staged slot, not counted as ran, re-posted); a new clip resets the gate.
+TEST(PlaybackWarmReconDeterminismWiring, AChromaSmoothChangeReArmsThePausedWarm)
+{
+    const QString main = sourceFile("platform/qt/MainWindow.cpp");
+    const QString slot = codeLinesOnly(bodyBetween(main, QStringLiteral("void MainWindow::toolButtonChromaSmoothChanged( void )"),
+                                                   QStringLiteral("\n}\n")));
+    ASSERT_FALSE(slot.isEmpty());
+    const int set = slot.lastIndexOf(QStringLiteral("llrpSetChromaSmoothMode(m_pMlvObject, CS_OFF);"));
+    const int reset = slot.indexOf(QStringLiteral("resetMlvCachedFrame( m_pMlvObject );"));
+    const int rearm = slot.indexOf(QStringLiteral("rearmPlaybackReconWarmAfterStateChange( \"chroma_smooth\" );"));
+    printf("[WCS1] slot: set=%d reset=%d rearm=%d\n", set, reset, rearm);
+    ASSERT_TRUE(set >= 0);
+    ASSERT_TRUE(reset > set);
+    ASSERT_TRUE(rearm > reset);
+    // the re-arm bumps the generation first (even when no warm can run yet), then decides
+    const QString rearmBody = codeLinesOnly(bodyBetween(main, QStringLiteral("void MainWindow::rearmPlaybackReconWarmAfterStateChange( const char *why )"),
+                                                        QStringLiteral("\n}\n")));
+    ASSERT_FALSE(rearmBody.isEmpty());
+    const int bumped = rearmBody.indexOf(QStringLiteral("const bool postNow = m_playbackReconWarmStateGate.stateChanged();"));
+    const int guard = rearmBody.indexOf(QStringLiteral("if( !m_playbackReconWarmPrewarmRan || ui->actionPlay->isChecked() ) return;"));
+    const int notRan = rearmBody.indexOf(QStringLiteral("m_playbackReconWarmRan = false;"));
+    const int repost = rearmBody.indexOf(QStringLiteral(
+        "if( postNow ) schedulePlaybackReconWarmRepost( playback_recon_warm_run::Reason::StateChanged, m_playbackRoutePrewarmClipGeneration );"));
+    ASSERT_TRUE(bumped >= 0);
+    ASSERT_TRUE(guard > bumped);
+    ASSERT_TRUE(notRan > guard);
+    ASSERT_TRUE(repost > notRan);
+    ASSERT_TRUE(rearmBody.contains(QStringLiteral("playback_recon_warm_rearm why=")));
+    // the done: the gate is read only for a done of this clip, and gates the AMaZE step and the ran flag
+    const QString done = codeLinesOnly(bodyBetween(main, QStringLiteral("void MainWindow::onPlaybackReconWarmDone( const RenderFrameThread::PlaybackReconWarmDone &done )"),
+                                                   QStringLiteral("\n}\n")));
+    ASSERT_FALSE(done.isEmpty());
+    ASSERT_TRUE(done.contains(QStringLiteral(
+        "const bool stateCurrent = clipMatches && m_playbackReconWarmStateGate.done( done.stateGeneration );")));
+    ASSERT_TRUE(done.contains(QStringLiteral("playback_recon_warm_run::guiAmazeAllowed( hasOutput, playing, clipMatches, stateCurrent )")));
+    ASSERT_TRUE(done.contains(QStringLiteral("if( hasOutput && stateCurrent ) m_playbackReconWarmRan = true;")));
+    ASSERT_FALSE(done.contains(QStringLiteral("if( hasOutput && clipMatches ) m_playbackReconWarmRan = true;")));
+    ASSERT_TRUE(done.contains(QStringLiteral(" state_gen=")));
+    ASSERT_TRUE(done.contains(QStringLiteral(" state_current=")));
+    // the post carries the generation and marks the gate in flight only when queued
+    const QString post = codeLinesOnly(bodyBetween(main, QStringLiteral("void MainWindow::postPlaybackReconWarm( quint64 clipGeneration )"),
+                                                   QStringLiteral("\n}\n")));
+    ASSERT_TRUE(post.contains(QStringLiteral("m_playbackReconWarmScale, clipGeneration, m_playbackReconWarmStateGate.generation );")));
+    ASSERT_TRUE(post.contains(QStringLiteral(
+        "if( queued == playback_recon_warm_run::Reason::None )")));
+    ASSERT_TRUE(post.contains(QStringLiteral("m_playbackReconWarmStateGate.posted();")));
+    // a new clip resets it
+    const QString arm = codeLinesOnly(bodyBetween(main, QStringLiteral("void MainWindow::armPlaybackRoutePrewarm()"),
+                                                  QStringLiteral("\n}\n")));
+    ASSERT_TRUE(arm.contains(QStringLiteral("m_playbackReconWarmStateGate.reset();")));
+    // the render thread hands the generation back unchanged
+    const QString thread = sourceFile("platform/qt/RenderFrameThread.cpp");
+    ASSERT_TRUE(thread.contains(QStringLiteral("    entry.warmStateGeneration = stateGeneration;\n")));
+    ASSERT_TRUE(thread.contains(QStringLiteral("    done.stateGeneration = entry.warmStateGeneration;\n")));
 }
