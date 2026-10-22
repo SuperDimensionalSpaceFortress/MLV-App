@@ -12,6 +12,10 @@
 # Output (one JSON object on stdout): the verdict record plus cache (run|hit|backoff|stale|refreshing|none), ageSec, stale, line
 # ("Product share (7 d): <verdict> <share> of <threshold>") and, with -CardsPath, plan (see Get-ProductSlotPlan).
 # Dot-sourcing this file defines the functions and runs nothing (the tests and the beat's D step use Get-ProductSlotPlan that way).
+# PowerShell 7 only: Write-FileAtomic needs the File.Move(src, dst, overwrite) overload, which Windows PowerShell 5.1 lacks, so 5.1
+# is refused at start (PRODUCT-SHARE-REQUIRES-PS7-1). Every caller is pwsh 7: the worker relaunches with (Get-Process -Id $PID).Path
+# and the staged live wiring starts 'pwsh'. A refused start exits non-zero, which is fine: no caller runs this under 5.1.
+#Requires -Version 7
 param(
     [string]$RepoRoot,
     [string]$SourceRef,
@@ -92,8 +96,11 @@ function Write-FileAtomic([string]$Path, [string]$Text) {
     [System.IO.File]::WriteAllText($tmp, $Text, [System.Text.UTF8Encoding]::new($false))
     # Move-Item -Force DELETES the destination and then moves, so a concurrent reader sees no file at all (measured: 20876
     # FileNotFoundError in 193475 reads while 1809 of 3000 writes failed). File.Replace was also measured and still opens a
-    # gap; File.Move(overwrite) is one MoveFileEx(REPLACE_EXISTING), so the path always exists. A reader holding the old file
-    # open makes it throw a sharing violation, which is retried briefly.
+    # gap (255 absent reads in 3357); File.Move(overwrite) is one MoveFileEx(REPLACE_EXISTING), so the path always exists
+    # (0 absent). A reader holding the old file open makes it throw a sharing violation, which is retried briefly.
+    # Figures: 3000 rewrites against one concurrent reader, from PR #565 (CI-FLAKE-PRODUCT-SHARE-DETACH-REFRESH-1 r1); probe
+    # scripts probe_atomic.py and probe_replace_variants.py and its pr-body.md are in the run dir
+    # .claude-state/fleet-runs/lane-CI-FLAKE-PRODUCT-SHARE-DETACH-REFRESH-1-r1-20261022T0721Z (git-ignored board state, not in the repo).
     for ($attempt = 1; $attempt -le 100; $attempt++) {
         try {
             [System.IO.File]::Move($tmp, $Path, $true)

@@ -215,45 +215,88 @@ class AtomicWriteTests(unittest.TestCase):
     destination before moving the temp file onto it shows readers no file at all, which is what lost two merge_group runs.
     """
     WRITES = 400
+    DEADLINE_SEC = 90
 
-    def test_rewriting_the_verdict_never_shows_a_reader_an_absent_or_partial_file(self):
+    def start_target(self):
         target = Path(tempfile.mkdtemp(prefix='product-share-atomic-')) / 'state' / 'product-share-verdict.json'
         self.addCleanup(shutil.rmtree, target.parent.parent, True)
         target.parent.mkdir(parents=True)
         target.write_text(json.dumps({'verdict': 'RED', 'pad': 'x' * 2000}), encoding='ascii')
+        return target
+
+    def drive_writer(self, target, cmd):
+        """Runs the writer child while polling the target; returns (writer returncode, writer output, poll stats)."""
         env = dict(os.environ, PS_SCRIPT=str(SCRIPT), PS_TARGET=str(target), PS_WRITES=str(self.WRITES))
-        cmd = (". $env:PS_SCRIPT; for ($i = 0; $i -lt [int]$env:PS_WRITES; $i++) { "
-               "Write-FileAtomic $env:PS_TARGET ('{\"verdict\":\"GREEN\",\"i\":' + $i + ',\"pad\":\"' + ('y' * 2000) + '\"}') }")
         # Output goes to files, not pipes: a failing writer is chatty and a full pipe would block it while this loop keeps polling.
         out_path = target.parent.parent / 'writer.out.txt'
         err_path = target.parent.parent / 'writer.err.txt'
         with open(out_path, 'w') as out_f, open(err_path, 'w') as err_f:
             writer = subprocess.Popen(PWSH + ['-Command', cmd], stdout=out_f, stderr=err_f, env=env)
-            reads, absent, partial = self.poll_while_running(writer, target)
+            try:
+                stats = self.poll_while_running(writer, target, self.DEADLINE_SEC)
+            finally:
+                # A writer that is still alive here hung or timed out; it must not outlive the test or keep the output files open.
+                if writer.poll() is None:
+                    writer.terminate()
+                    try:
+                        writer.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        writer.kill()
+                writer.wait()
         out = out_path.read_text(errors='replace')[:2000]
         err = err_path.read_text(errors='replace')[:2000]
-        self.assertEqual(writer.returncode, 0, f'the writer must not fail while a reader holds the file: {err}\n{out}')
-        self.assertGreater(reads, 50, 'the reader must overlap the writes for this test to prove anything')
-        self.assertEqual((absent, partial), (0, 0), f'{absent} absent and {partial} partial reads out of {reads}')
+        return writer.returncode, f'{err}\n{out}', stats
+
+    def assert_overlapped(self, stats):
+        # Reads taken while pwsh starts, or after a stalled writer, prove nothing: the reader must have watched the file change.
+        self.assertGreaterEqual(stats['generations'], 2, f'the reader saw fewer than 2 distinct rewrites: {stats}')
+        self.assertGreater(stats['overlapped'], 50, f'too few reads overlapped active rewrites: {stats}')
+
+    def test_rewriting_the_verdict_never_shows_a_reader_an_absent_or_partial_file(self):
+        target = self.start_target()
+        cmd = (". $env:PS_SCRIPT; for ($i = 0; $i -lt [int]$env:PS_WRITES; $i++) { "
+               "Write-FileAtomic $env:PS_TARGET ('{\"verdict\":\"GREEN\",\"i\":' + $i + ',\"pad\":\"' + ('y' * 2000) + '\"}') }")
+        returncode, output, stats = self.drive_writer(target, cmd)
+        self.assertFalse(stats['timed_out'], f'the writer did not finish within {self.DEADLINE_SEC}s: {output}')
+        self.assertEqual(returncode, 0, f'the writer must not fail while a reader holds the file: {output}')
+        self.assert_overlapped(stats)
+        self.assertEqual((stats['absent'], stats['partial']), (0, 0), f'{stats}')
         self.assertEqual(json.loads(target.read_text(encoding='ascii'))['i'], self.WRITES - 1)
 
+    def test_overlap_check_rejects_a_writer_that_publishes_no_new_generation(self):
+        # More than 50 reads accrue while pwsh starts up and idles, yet no rewrite ever overlapped them.
+        target = self.start_target()
+        returncode, output, stats = self.drive_writer(target, 'Start-Sleep -Seconds 3')
+        self.assertEqual(returncode, 0, output)
+        self.assertGreater(stats['reads'], 50, 'the stub must still accrue enough reads to defeat a bare read count')
+        with self.assertRaises(AssertionError):
+            self.assert_overlapped(stats)
+
     @staticmethod
-    def poll_while_running(writer, target):
-        reads = 0
-        absent = 0
-        partial = 0
+    def poll_while_running(writer, target, deadline_sec):
+        deadline = time.monotonic() + deadline_sec
+        stats = {'reads': 0, 'overlapped': 0, 'absent': 0, 'partial': 0, 'timed_out': False}
+        # The seed file has no 'i'; every rewrite carries its generation number. A read counts as overlapped only once the
+        # reader has seen the writer publish a generation it had not seen when reading started.
+        generations = set()
         while writer.poll() is None:
-            reads += 1
+            if time.monotonic() > deadline:
+                stats['timed_out'] = True
+                break
+            stats['reads'] += 1
+            if len(generations) > 1:
+                stats['overlapped'] += 1
             try:
-                json.loads(target.read_text(encoding='ascii'))
+                generations.add(json.loads(target.read_text(encoding='ascii')).get('i'))
             except FileNotFoundError:
-                absent += 1
+                stats['absent'] += 1
             except ValueError:
-                partial += 1
+                stats['partial'] += 1
             except PermissionError:
                 pass  # a sharing violation while the swap is in flight: the file exists, the read is simply retried
             time.sleep(0.0005)
-        return reads, absent, partial
+        stats['generations'] = len(generations - {None})
+        return stats
 
 
 class PlanTests(unittest.TestCase):
@@ -332,6 +375,29 @@ class ExitCodeInvariantTests(ProductShareBase):
 
     def test_act_still_runs_when_the_verdict_step_is_broken(self):
         self.assertEqual(self.run_act(self.tmp / 'no-such-guard.ps1', 5), 5)
+
+
+class RequiresPowerShell7Tests(ProductShareBase):
+    """Write-FileAtomic uses File.Move(src, dst, overwrite), which Windows PowerShell 5.1 lacks (PRODUCT-SHARE-REQUIRES-PS7-1).
+
+    Every caller already runs pwsh 7: the worker relaunches itself with (Get-Process -Id $PID).Path and the staged live wiring
+    starts 'pwsh'. So the script refuses to start on 5.1 instead of reading UNKNOWN step-error after 100 failed writes.
+    """
+
+    def test_script_declares_requires_version_7(self):
+        lines = SCRIPT.read_text(encoding='ascii').splitlines()
+        self.assertIn('#Requires -Version 7', [line.strip() for line in lines if line.startswith('#Requires')])
+
+    @unittest.skipUnless(shutil.which('powershell.exe'), 'Windows PowerShell 5.1 is not installed')
+    def test_windows_powershell_5_1_is_refused_instead_of_reporting_a_step_error(self):
+        args = ['powershell.exe', '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', str(SCRIPT),
+                '-GuardPath', str(self.green_guard()), '-RepoRoot', str(self.tmp), '-SourceRef', 'fork/master',
+                '-VerdictPath', str(self.verdict_path), '-ProfilePath', str(PROFILE)]
+        r = subprocess.run(args, text=True, capture_output=True, env=self.env, timeout=120)
+        self.assertNotEqual(r.returncode, 0, f'5.1 must be refused, not run to a verdict: {r.stdout}')
+        self.assertIn('requires', (r.stderr + r.stdout).lower())
+        self.assertNotIn('step-error', r.stdout)
+        self.assertFalse(self.verdict_path.exists(), 'a refused start must not write a verdict')
 
 
 class AsciiOnlyTests(unittest.TestCase):
