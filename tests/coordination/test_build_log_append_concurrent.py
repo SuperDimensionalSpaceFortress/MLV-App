@@ -65,30 +65,43 @@ EXCLUSIVE_WRITER = (
 )
 
 
-def _run_writers(tmp_path: Path, script_text: str, args_for) -> None:
-    """Start WRITERS pwsh children on one start instant; wait for all; kill every one in finally."""
+def _run_writers(tmp_path: Path, script_text: str, args_for, start_delay_sec: int = START_DELAY_SEC,
+                 timeout_sec: int = WRITER_TIMEOUT_SEC) -> None:
+    """Start WRITERS pwsh children on one start instant; wait for all; kill every one in finally.
+
+    Child output goes to files, not pipes: build-guard echoes each exemption line to stderr, and a writer
+    blocked on a full pipe while the parent drains an earlier writer would serialise the writers and hide
+    the very collisions these tests exist to cause.
+    """
     script = tmp_path / "writer.ps1"
     script.write_text(script_text, encoding="ascii")
-    start_ms = int((time.time() + START_DELAY_SEC) * 1000)
+    start_ms = int((time.time() + start_delay_sec) * 1000)
     procs = []
+    handles = []
     try:
         for writer_id in range(WRITERS):
+            out_fh = open(tmp_path / f"writer{writer_id}.out", "wb")
+            err_fh = open(tmp_path / f"writer{writer_id}.err", "wb")
+            handles += [out_fh, err_fh]
             procs.append(
                 subprocess.Popen(
                     [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
                      "-File", str(script), *args_for(writer_id, start_ms)],
-                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                    stdin=subprocess.DEVNULL, stdout=out_fh, stderr=err_fh,
                 )
             )
-        deadline = time.monotonic() + WRITER_TIMEOUT_SEC
-        for proc in procs:
-            out, err = proc.communicate(timeout=max(1.0, deadline - time.monotonic()))
-            assert proc.returncode == 0, f"writer failed rc={proc.returncode}\n{out}\n{err}"
+        deadline = time.monotonic() + timeout_sec
+        for writer_id, proc in enumerate(procs):
+            proc.wait(timeout=max(1.0, deadline - time.monotonic()))
+            err = (tmp_path / f"writer{writer_id}.err").read_text(encoding="utf-8", errors="replace")
+            assert proc.returncode == 0, f"writer {writer_id} failed rc={proc.returncode}\n{err[-2000:]}"
     finally:
         for proc in procs:
             if proc.poll() is None:
                 proc.kill()
-                proc.communicate()
+                proc.wait()
+        for fh in handles:
+            fh.close()
 
 
 def test_build_guard_exempt_log_keeps_every_concurrent_append(tmp_path: Path) -> None:
@@ -150,3 +163,187 @@ def test_exclusive_runner_ownership_log_keeps_every_concurrent_append(tmp_path: 
         owners.append(record["owner"])
     assert sorted(owners) == expected
     assert raw.endswith(b"\r\n"), "Add-Content ended each line with the platform newline; keep it"
+
+
+# --- LEDGER-APPEND-ATOMIC-LARGE-RECORD-PINS-1 ------------------------------------------------------------
+# The tests above only write short ASCII records. The claim #569 made is wider: one FILE_APPEND_DATA write
+# lands at the current end of file as a unit, whatever its size and bytes. These tests pin that for records
+# straddling and well above one 4096-byte buffer (the FileStream buffer size both scripts pass) and for
+# non-ASCII values, with every record checked byte for byte against what its writer was asked to write.
+#
+# Each writer's records are distinguishable from every other writer's at every offset (the filler walks a
+# per-writer rotation), so a record that was split into two writes, or interleaved with another writer's
+# bytes, cannot read back as a valid record of its own writer.
+
+LARGE_RECORDS_EACH = 18
+LARGE_START_DELAY_SEC = 10
+LARGE_WRITER_TIMEOUT_SEC = 240
+
+# (non-ASCII?, filler length in characters). Lengths under, at and far over one 4096-byte write: the guard line
+# adds about 80 bytes of framing and the ownership record about 230, so 3800..4030 puts records on both sides.
+_LARGE_KINDS = [
+    (False, 6000), (True, 6000), (False, 9000), (True, 3800), (False, 3950), (True, 9000), (False, 7500), (True, 4030),
+]
+# BMP 2-byte (e-acute, A-macron), BMP 3-byte (euro, CJK), a supplementary-plane character (a UTF-16 surrogate
+# pair in .NET, 4 bytes in UTF-8) and one ASCII letter.
+_NON_ASCII_CYCLE = "a\u00e9\u20ac\u6f22\U0001F600\u0100"
+
+
+def _large_reasons(writer_id: int, unicode_scale: float) -> list:
+    """The values writer ``writer_id`` is asked to append, in order. ``unicode_scale`` shrinks the non-ASCII
+    runs where a character costs several output bytes, so the record sizes land in the same band."""
+    reasons = []
+    for i in range(LARGE_RECORDS_EACH):
+        non_ascii, length = _LARGE_KINDS[(writer_id + i) % len(_LARGE_KINDS)]
+        head = f"w{writer_id}-i{i}-"
+        if non_ascii:
+            n = int(length * unicode_scale)
+            body = "".join(_NON_ASCII_CYCLE[(writer_id + k) % len(_NON_ASCII_CYCLE)] for k in range(n))
+        else:
+            body = "".join(chr(ord("a") + (writer_id * 7 + k) % 26) for k in range(length))
+        reasons.append(head + body)
+    return reasons
+
+
+def _write_reasons(tmp_path: Path, unicode_scale: float) -> dict:
+    """Write one ASCII-only JSON file of reasons per writer (``\\u`` escapes keep the file encoding-proof)."""
+    expected = {}
+    for writer_id in range(WRITERS):
+        reasons = _large_reasons(writer_id, unicode_scale)
+        (tmp_path / f"reasons{writer_id}.json").write_text(json.dumps(reasons), encoding="ascii")
+        for i, reason in enumerate(reasons):
+            expected[(writer_id, i)] = reason
+    return expected
+
+
+def _dotnet_ascii(text: str) -> bytes:
+    """What ``[Text.Encoding]::ASCII.GetBytes`` writes: ASCII as is, one '?' per UTF-16 code unit otherwise."""
+    return "".join(c if c.isascii() else "?" * (len(c.encode("utf-16-le")) // 2) for c in text).encode("ascii")
+
+
+def _split_records(raw: bytes) -> list:
+    """Split on the exact CRLF terminator (``str.splitlines`` would also split on U+0085, U+2028 and friends)."""
+    assert raw.endswith(b"\r\n"), "every record ends with the platform newline, including the last"
+    parts = raw.split(b"\r\n")
+    assert parts.pop() == b""
+    return parts
+
+
+def _report_sizes(label: str, lines: list, elapsed: float) -> None:
+    sizes = [len(line) + 2 for line in lines]
+    print(f"[large-record:{label}] records={len(lines)} bytes min={min(sizes)} max={max(sizes)} "
+          f"over4096={sum(s > 4096 for s in sizes)} elapsed={elapsed:.1f}s")
+
+
+GUARD_LARGE_WRITER = (
+    "param([string]$Guard, [string]$LogPath, [string]$Probe, [string]$Table, [string]$ReasonsFile, [int]$Id, [long]$StartMs)\n"
+    "$ErrorActionPreference = 'Stop'\n"
+    ". $Guard -Library\n"
+    "$reasons = @([IO.File]::ReadAllText($ReasonsFile) | ConvertFrom-Json)\n"
+    + _BARRIER
+    + "for ($i = 0; $i -lt $reasons.Count; $i++) {\n"
+    "    $opts = @{ ExemptLogPath = $LogPath; MemoryProbeFile = $Probe; ProcessTableFile = $Table }\n"
+    "    Invoke-BuildGuard -Label \"w$Id\" -ExemptReason $reasons[$i] -NoSlot -Options $opts -Action { param($Jobs) } 2>$null | Out-Null\n"
+    "}\n"
+)
+
+EXCLUSIVE_LARGE_WRITER = (
+    "param([string]$Script, [string]$Root, [string]$Exe, [string]$ReasonsFile, [int]$Id, [long]$StartMs)\n"
+    "$reasons = @([IO.File]::ReadAllText($ReasonsFile) | ConvertFrom-Json)\n"
+    + _BARRIER
+    + "for ($i = 0; $i -lt $reasons.Count; $i++) {\n"
+    # A writer that loses the exclusive lock throws 'busy'; its finally block still appends its record.
+    "    try { & $Script -RepoRoot $Root -Owner $reasons[$i] -FilePath $Exe -ArgumentList @('/c', 'exit 0') -TimeoutSeconds 60 *> $null } catch { }\n"
+    "}\n"
+)
+
+
+def test_build_guard_exempt_log_large_and_non_ascii_records_are_whole(tmp_path: Path) -> None:
+    probe = tmp_path / "mem.json"
+    probe.write_text(json.dumps([{"freePhysGB": 10, "freeCommitGB": 20}]), encoding="ascii")
+    table = tmp_path / "procs.json"
+    table.write_text("[]", encoding="ascii")
+    log = tmp_path / "exempt.log"
+    # build-guard writes the log through [Text.Encoding]::ASCII, one output byte per character.
+    expected = _write_reasons(tmp_path, unicode_scale=1.0)
+
+    started = time.monotonic()
+    _run_writers(
+        tmp_path,
+        GUARD_LARGE_WRITER,
+        lambda i, start_ms: [str(GUARD), str(log), str(probe), str(table), str(tmp_path / f"reasons{i}.json"),
+                             str(i), str(start_ms)],
+        start_delay_sec=LARGE_START_DELAY_SEC,
+        timeout_sec=LARGE_WRITER_TIMEOUT_SEC,
+    )
+    elapsed = time.monotonic() - started
+
+    raw = log.read_bytes()
+    assert not raw.startswith(b"\xef\xbb\xbf"), "the exemption log is ASCII; no BOM"
+    assert raw.isascii(), "non-ASCII input must be transcoded, never written as raw multi-byte sequences"
+    lines = _split_records(raw)
+    _report_sizes("build-guard", lines, elapsed)
+    assert len(lines) == WRITERS * LARGE_RECORDS_EACH, (
+        f"expected {WRITERS * LARGE_RECORDS_EACH} records, found {len(lines)}"
+    )
+    shape = re.compile(rb"BUILD_GUARD_EXEMPT label=w(\d+) reason=(w(\d+)-i(\d+)-\S*) utc=\S+ pid=\d+")
+    seen = set()
+    for line in lines:
+        m = shape.fullmatch(line)
+        assert m, f"record split, interleaved or malformed ({len(line)} bytes): {line[:100]!r} ... {line[-60:]!r}"
+        key = (int(m.group(3)), int(m.group(4)))
+        assert int(m.group(1)) == key[0], f"label/reason writer mismatch, a record was spliced: {line[:100]!r}"
+        assert key not in seen, f"record {key} appears twice"
+        seen.add(key)
+        # What the script does with non-ASCII: every UTF-16 code unit becomes one '?' (observed: .NET's ASCII
+        # replacement fallback turns a surrogate pair into '??'); the record stays one whole line.
+        assert m.group(2) == _dotnet_ascii(expected[key]), (
+            f"record {key} is not byte-identical to what its writer appended"
+        )
+    assert seen == set(expected)
+    sizes = [len(line) + 2 for line in lines]
+    assert max(sizes) > 8192 and sum(s > 4096 for s in sizes) >= len(sizes) // 2, "the test must really write large records"
+
+
+def test_exclusive_runner_ownership_log_large_and_non_ascii_records_are_whole(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    cmd = os.environ.get("ComSpec") or r"C:\Windows\System32\cmd.exe"
+    # The ownership log is UTF-8: a non-ASCII character costs 2-4 bytes, so shrink those runs to keep sizes in band.
+    expected = _write_reasons(tmp_path, unicode_scale=0.4)
+
+    started = time.monotonic()
+    _run_writers(
+        tmp_path,
+        EXCLUSIVE_LARGE_WRITER,
+        lambda i, start_ms: [str(EXCLUSIVE), str(root), cmd, str(tmp_path / f"reasons{i}.json"), str(i), str(start_ms)],
+        start_delay_sec=LARGE_START_DELAY_SEC,
+        timeout_sec=LARGE_WRITER_TIMEOUT_SEC,
+    )
+    elapsed = time.monotonic() - started
+
+    log = root / ".claude-state" / "coordination" / "build-ownership.jsonl"
+    raw = log.read_bytes()
+    assert not raw.startswith(b"\xef\xbb\xbf"), "UTF-8 without a BOM"
+    lines = _split_records(raw)
+    _report_sizes("invoke-mlv-exclusive", lines, elapsed)
+    assert len(lines) == WRITERS * LARGE_RECORDS_EACH, (
+        f"expected {WRITERS * LARGE_RECORDS_EACH} records, found {len(lines)}"
+    )
+    seen = set()
+    for line in lines:
+        try:
+            record = json.loads(line.decode("utf-8"))  # strict: a split inside a multi-byte character fails here
+        except ValueError:
+            pytest.fail(f"record split, interleaved or not valid UTF-8 JSON ({len(line)} bytes): {line[:100]!r} ... {line[-60:]!r}")
+        assert {"owner", "startTimeUtc", "outcome", "endTimeUtc"} <= set(record), record
+        owner = record["owner"]
+        m = re.match(r"w(\d+)-i(\d+)-", owner)
+        assert m, f"owner lost its head: {owner[:60]!r}"
+        key = (int(m.group(1)), int(m.group(2)))
+        assert key not in seen, f"record {key} appears twice"
+        seen.add(key)
+        assert owner == expected[key], f"record {key} did not round-trip byte-identical"
+    assert seen == set(expected)
+    sizes = [len(line) + 2 for line in lines]
+    assert max(sizes) > 8192 and sum(s > 4096 for s in sizes) >= len(sizes) // 2, "the test must really write large records"
