@@ -112,6 +112,47 @@ class ReceiptWindowTests(unittest.TestCase):
         self.assertIsNone(result)
         self.assertEqual([".", "recent-run"], sorted(listed))
 
+    def receipt_at(self, directory, mtime):
+        receipt = directory / "luna-001.receipt.json"
+        receipt.write_text(json.dumps(dict(sessionId=SESSION, lane="luna", exitCode=None)), encoding="utf-8")
+        os.utime(receipt, (mtime, mtime))
+        return receipt
+
+    def test_receipt_exactly_at_the_cutoff_is_found_and_one_second_older_is_not(self):
+        # Dot advisory 13ef349b on #563: pin the boundary with a frozen clock, not a 10-day margin.
+        # The filter is `mtime >= cutoff`, so a receipt exactly RECEIPT_WINDOW_SECONDS old is in.
+        now = 2_000_000_000.0
+        cutoff = now - CHECKPOINT.RECEIPT_WINDOW_SECONDS
+        edge = self.fleet / "edge"
+        edge.mkdir()
+        receipt = self.receipt_at(edge, cutoff)
+        with patch.object(CHECKPOINT.time, "time", lambda: now):
+            self.assertEqual(str(receipt), CHECKPOINT.scan_fleet_runs(self.repo, SESSION)["receipt"])
+        os.utime(receipt, (cutoff - 1, cutoff - 1))
+        with patch.object(CHECKPOINT.time, "time", lambda: now):
+            self.assertIsNone(CHECKPOINT.scan_fleet_runs(self.repo, SESSION))
+
+    def test_receipt_directly_under_fleet_runs_is_found(self):
+        # Depth 0: the receipt sits in fleet-runs itself, not in a run directory.
+        receipt = self.receipt_at(self.fleet, time.time())
+        result = CHECKPOINT.scan_fleet_runs(self.repo, SESSION)
+        self.assertEqual(str(receipt), result["receipt"])
+        self.assertEqual("IN_PROGRESS", result["status"])
+
+    def test_stale_receipt_directly_under_fleet_runs_is_not_opened(self):
+        self.receipt_at(self.fleet, time.time() - 30 * DAY)
+        opened = []
+        real_read = Path.read_text
+
+        def read_text(self_, *a, **k):
+            opened.append(self_.name)
+            return real_read(self_, *a, **k)
+
+        with patch.object(Path, "read_text", read_text):
+            result = CHECKPOINT.scan_fleet_runs(self.repo, SESSION)
+        self.assertIsNone(result)
+        self.assertEqual([], opened)
+
     def test_recent_receipt_wins_over_an_old_one(self):
         self.run_dir("stale", age_days=30)
         _, receipt = self.run_dir("fresh", age_days=1)

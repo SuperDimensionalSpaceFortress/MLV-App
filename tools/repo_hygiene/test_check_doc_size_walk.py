@@ -8,7 +8,9 @@ paged-pool churn. These fixtures pin that the walk never enters a directory whos
 exempt, still reports the coordination ledgers the `hub` tier exists to govern, and (r2) never
 enumerates an ignored tree that is not on the explicit EXTRA_ROOTS allowlist.
 """
+import contextlib
 import importlib.util
+import io
 import os
 from pathlib import Path
 import tempfile
@@ -130,6 +132,81 @@ class DocSizeWalkTests(unittest.TestCase):
         self.assertIn(".claude-state/SESSION-HANDOFF.md", found)
         self.assertNotIn(".claude-state/unlisted-bulk/deep.md", found)
         self.assertNotIn(".claude-state/unlisted-bulk", listed)
+
+    def depth_zero_scan_with_failing_entry(self, failing):
+        """Run untracked_scan with the named depth-zero entry raising OSError from its metadata call.
+
+        The failing entry is yielded FIRST, so a scan that abandons the directory on one bad
+        entry loses everything that follows it.
+        """
+        real = os.scandir
+
+        class Entry:
+            def __init__(self, inner):
+                self.inner = inner
+                self.name = inner.name
+                self.path = inner.path
+
+            def is_file(self, *a, **k):
+                if self.name == failing:
+                    raise PermissionError(13, "Access is denied", self.path)
+                return self.inner.is_file(*a, **k)
+
+            def is_dir(self, *a, **k):
+                return self.inner.is_dir(*a, **k)
+
+        class Entries:
+            def __init__(self, inner):
+                found = sorted(inner, key=lambda e: (e.name != failing, e.name))
+                self.found = [Entry(e) for e in found]
+
+            def __enter__(self):
+                return iter(self.found)
+
+            def __exit__(self, *exc):
+                return False
+
+        def scandir(path="."):
+            if Path(path).resolve() == (self.repo / ".claude-state").resolve():
+                return Entries(real(path))
+            return real(path)
+
+        state = self.repo / ".claude-state"
+        (state / failing).write_text("# locked\n", encoding="utf-8")
+        (state / "SESSION-HANDOFF.md").write_text("# handoff\n", encoding="utf-8")
+        (state / "brand-new-home").mkdir()
+        stderr = io.StringIO()
+        with patch.object(DOCSIZE.os, "scandir", scandir), contextlib.redirect_stderr(stderr):
+            found, unlisted = DOCSIZE.untracked_scan(self.repo)
+        return found, unlisted, stderr.getvalue()
+
+    def test_one_inaccessible_depth_zero_entry_does_not_abandon_the_rest(self):
+        # Dot advisory 13ef349b on #563: the outer OSError catch left the whole directory loop on
+        # the first entry whose metadata call raised, so every later depth-zero entry vanished.
+        found, unlisted, _ = self.depth_zero_scan_with_failing_entry("aaa-locked.md")
+        self.assertIn(".claude-state/SESSION-HANDOFF.md", found)
+        self.assertIn(".claude-state/brand-new-home", unlisted)
+        self.assertIn(".claude-state/coordination/ledger.md", found)
+
+    def test_the_inaccessible_depth_zero_entry_is_reported_not_dropped(self):
+        found, _, stderr = self.depth_zero_scan_with_failing_entry("aaa-locked.md")
+        self.assertNotIn(".claude-state/aaa-locked.md", found)
+        self.assertIn("unreadable: .claude-state/aaa-locked.md", stderr)
+
+    def test_trace_governed_count_excludes_unlisted_root_rows(self):
+        # The text summary counts governed files as the rows that are not synthetic UNLISTED_ROOT
+        # warnings; the --trace record must say the same number.
+        def row(path, tier, state="ok"):
+            return {"path": path, "bytes": 10 if tier != UNLISTED_ROOT else 0, "tier": tier,
+                    "soft": 0, "hard": 0, "state": state}
+
+        rows = [row("a.md", "entry"), row("b.md", "entry"), row(".claude-state/x", UNLISTED_ROOT, "WARN")]
+        trace = self.repo / "trace.log"
+        argv = ["check-doc-size.py", "--repo", str(self.repo), "--warn-only", "--trace", str(trace)]
+        with patch.object(DOCSIZE, "scan", lambda repo: rows), patch.object(DOCSIZE.sys, "argv", argv), \
+                contextlib.redirect_stdout(io.StringIO()):
+            DOCSIZE.main()
+        self.assertIn(" governed=2 ", trace.read_text(encoding="utf-8"))
 
     def test_the_allowlist_never_names_the_state_tree_whole(self):
         for root in DOCSIZE.EXTRA_ROOTS:

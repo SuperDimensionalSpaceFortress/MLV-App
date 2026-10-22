@@ -369,15 +369,19 @@ def untracked_scan(repo: Path) -> tuple[list[str], list[str]]:
             with os.scandir(base) as entries:
                 for e in entries:
                     rel = (Path(root) / e.name).as_posix()
-                    if e.name.endswith(".md") and e.is_file():
-                        out.append(rel)
-                    elif (
-                        e.name not in WALK_SKIP
-                        and rel not in EXTRA_ROOTS
-                        and not dir_is_exempt(rel)
-                        and e.is_dir()
-                    ):
-                        unlisted.append(rel)
+                    try:
+                        if e.name.endswith(".md") and e.is_file():
+                            out.append(rel)
+                        elif (
+                            e.name not in WALK_SKIP
+                            and rel not in EXTRA_ROOTS
+                            and not dir_is_exempt(rel)
+                            and e.is_dir()
+                        ):
+                            unlisted.append(rel)
+                    except OSError:
+                        # One entry whose metadata cannot be read must not hide its siblings.
+                        print(f"unreadable: {rel}", file=sys.stderr)
         except OSError:
             continue
     for root in EXTRA_ROOTS:
@@ -527,6 +531,7 @@ def main() -> int:
 
     breaches = [r for r in rows if r["state"] == "BREACH"]
     warns = [r for r in rows if r["state"] == "WARN"]
+    files = [r for r in rows if r["tier"] != UNLISTED_ROOT_TIER]
 
     if args.json:
         print(json.dumps(
@@ -541,7 +546,6 @@ def main() -> int:
                 print(f"{r['bytes']:>9,}  {r['tier']:8} {r['state']:6} {r['path']}")
             print()
         unlisted = [r for r in warns if r["tier"] == UNLISTED_ROOT_TIER]
-        files = [r for r in rows if r["tier"] != UNLISTED_ROOT_TIER]
         governed = sum(r["bytes"] for r in files)
         print(
             f"DOC SIZE: {len(files)} governed files, {governed:,} bytes, "
@@ -557,7 +561,7 @@ def main() -> int:
             print("link and pinned string must keep resolving.")
 
     if args.trace:
-        _write_trace(repo, args.trace, len(rows), len(breaches), len(warns))
+        _write_trace(repo, args.trace, len(files), len(breaches), len(warns))
 
     if args.warn_only:
         return 0
