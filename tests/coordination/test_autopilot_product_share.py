@@ -180,15 +180,23 @@ class CacheTests(ProductShareBase):
         self.assertTrue(res['stale'])
         self.assertEqual(res['cache'], 'refreshing')
         self.assertIn('[stale]', res['line'])
-        deadline = time.monotonic() + 60
+        started = time.monotonic()
+        deadline = started + 60
         refreshed = None
+        last_error = None
         while time.monotonic() < deadline:
-            saved = json.loads(self.verdict_path.read_text(encoding='ascii'))
-            if saved['verdict'] == 'GREEN':
-                refreshed = saved
-                break
-            time.sleep(0.5)
-        self.assertIsNotNone(refreshed, 'the detached worker never refreshed the verdict file')
+            # The refresh rewrites the file while this loop reads it; a read that races the swap is retried, not fatal.
+            try:
+                saved = json.loads(self.verdict_path.read_text(encoding='ascii'))
+            except (OSError, ValueError) as e:
+                last_error = repr(e)
+            else:
+                if saved['verdict'] == 'GREEN':
+                    refreshed = saved
+                    break
+            time.sleep(0.2)
+        self.assertIsNotNone(refreshed, 'the detached worker never refreshed the verdict file within %.1fs (last read error: %s)'
+                             % (time.monotonic() - started, last_error))
         after = self.run_step(guard, '-Detach')
         self.assertEqual(after['cache'], 'hit')
         self.assertEqual(after['verdict'], 'GREEN')
@@ -198,6 +206,54 @@ class CacheTests(ProductShareBase):
         res = self.run_step(sleeper, '-Detach', '-WorkerDeadlineSec', '2')
         self.assertEqual(res['verdict'], 'UNKNOWN')
         self.assertIn(res['cache'], ('refreshing', 'none'))
+
+
+class AtomicWriteTests(unittest.TestCase):
+    """Write-FileAtomic must swap the verdict under a path that always exists (CI-FLAKE-PRODUCT-SHARE-DETACH-REFRESH-1).
+
+    The detached worker rewrites the verdict file while the beat (and the detach test) read it. A writer that deletes the
+    destination before moving the temp file onto it shows readers no file at all, which is what lost two merge_group runs.
+    """
+    WRITES = 400
+
+    def test_rewriting_the_verdict_never_shows_a_reader_an_absent_or_partial_file(self):
+        target = Path(tempfile.mkdtemp(prefix='product-share-atomic-')) / 'state' / 'product-share-verdict.json'
+        self.addCleanup(shutil.rmtree, target.parent.parent, True)
+        target.parent.mkdir(parents=True)
+        target.write_text(json.dumps({'verdict': 'RED', 'pad': 'x' * 2000}), encoding='ascii')
+        env = dict(os.environ, PS_SCRIPT=str(SCRIPT), PS_TARGET=str(target), PS_WRITES=str(self.WRITES))
+        cmd = (". $env:PS_SCRIPT; for ($i = 0; $i -lt [int]$env:PS_WRITES; $i++) { "
+               "Write-FileAtomic $env:PS_TARGET ('{\"verdict\":\"GREEN\",\"i\":' + $i + ',\"pad\":\"' + ('y' * 2000) + '\"}') }")
+        # Output goes to files, not pipes: a failing writer is chatty and a full pipe would block it while this loop keeps polling.
+        out_path = target.parent.parent / 'writer.out.txt'
+        err_path = target.parent.parent / 'writer.err.txt'
+        with open(out_path, 'w') as out_f, open(err_path, 'w') as err_f:
+            writer = subprocess.Popen(PWSH + ['-Command', cmd], stdout=out_f, stderr=err_f, env=env)
+            reads, absent, partial = self.poll_while_running(writer, target)
+        out = out_path.read_text(errors='replace')[:2000]
+        err = err_path.read_text(errors='replace')[:2000]
+        self.assertEqual(writer.returncode, 0, f'the writer must not fail while a reader holds the file: {err}\n{out}')
+        self.assertGreater(reads, 50, 'the reader must overlap the writes for this test to prove anything')
+        self.assertEqual((absent, partial), (0, 0), f'{absent} absent and {partial} partial reads out of {reads}')
+        self.assertEqual(json.loads(target.read_text(encoding='ascii'))['i'], self.WRITES - 1)
+
+    @staticmethod
+    def poll_while_running(writer, target):
+        reads = 0
+        absent = 0
+        partial = 0
+        while writer.poll() is None:
+            reads += 1
+            try:
+                json.loads(target.read_text(encoding='ascii'))
+            except FileNotFoundError:
+                absent += 1
+            except ValueError:
+                partial += 1
+            except PermissionError:
+                pass  # a sharing violation while the swap is in flight: the file exists, the read is simply retried
+            time.sleep(0.0005)
+        return reads, absent, partial
 
 
 class PlanTests(unittest.TestCase):
