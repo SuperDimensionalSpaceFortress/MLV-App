@@ -53,6 +53,80 @@ QString bodyBetween(const QString & source, const QString & signature, const QSt
     return source.mid(at, next - at);
 }
 
+// POLICY-CALLSITE-FULL-ARG-PINS-1: the top-level arguments of the first call opened by `call` (which ends in "("), block
+// comments dropped and whitespace collapsed, so a pin asserts the WHOLE list by position instead of one substring.
+QStringList callArguments(const QString & source, const QString & call)
+{
+    const int at = source.indexOf(call);
+    if (at < 0) return QStringList();
+    QStringList args;
+    QString current;
+    int depth = 1;
+    for (int i = at + call.size(); i < source.size(); ++i) {
+        const QChar ch = source.at(i);
+        if (ch == QLatin1Char('/') && i + 1 < source.size() && source.at(i + 1) == QLatin1Char('*')) {
+            const int end = source.indexOf(QStringLiteral("*/"), i + 2);
+            if (end < 0) return QStringList();
+            current += QLatin1Char(' ');
+            i = end + 1;
+            continue;
+        }
+        if (ch == QLatin1Char('(')) {
+            ++depth;
+        } else if (ch == QLatin1Char(')') && --depth == 0) {
+            args << current.simplified();
+            return args;
+        }
+        if (ch == QLatin1Char(',') && depth == 1) {
+            args << current.simplified();
+            current.clear();
+        } else {
+            current += ch;
+        }
+    }
+    return QStringList();
+}
+
+// Every statement between `from` and `to`, whitespace collapsed.
+QStringList statementsBetween(const QString & source, const QString & from, const QString & to)
+{
+    const int at = source.indexOf(from);
+    const int end = source.indexOf(to, at);
+    if (at < 0 || end <= at) return QStringList();
+    QStringList statements;
+    for (const QString & statement : source.mid(at + from.size(), end - at - from.size()).split(QLatin1Char(';'))) {
+        if (!statement.simplified().isEmpty()) statements << statement.simplified();
+    }
+    return statements;
+}
+
+struct PinnedArgument
+{
+    const char *param;
+    const char *expr;
+};
+
+// One "param=expr; " line per position, so a failure names the parameter whose argument moved, changed or vanished.
+std::string describeArguments(const QStringList & actual, std::initializer_list<PinnedArgument> expected)
+{
+    std::string out;
+    int index = 0;
+    for (const PinnedArgument & arg : expected) {
+        out += std::string(arg.param) + "="
+             + (index < actual.size() ? actual.at(index).toStdString() : std::string("<missing>")) + "; ";
+        ++index;
+    }
+    for (; index < actual.size(); ++index) out += "<extra>=" + actual.at(index).toStdString() + "; ";
+    return out;
+}
+
+std::string describeArguments(std::initializer_list<PinnedArgument> expected)
+{
+    std::string out;
+    for (const PinnedArgument & arg : expected) out += std::string(arg.param) + "=" + arg.expr + "; ";
+    return out;
+}
+
 } // namespace
 
 TEST(PlaybackRoutePrewarmPolicy, AnEligiblePausedClipIsWarmed)
@@ -240,6 +314,75 @@ TEST(PlaybackRouteStagedSlotWiring, TheReallocBranchAdoptsTheStagedPairBeforeDes
     ASSERT_TRUE(present.indexOf(QStringLiteral("\"window_r16_texture_realloc\""), destroyAt) > destroyAt);
     // a failed present still frees whatever slot it holds (an adopted one included), so it is never shown
     ASSERT_TRUE(present.contains(QStringLiteral("    if ( !ok )\n    {\n        destroyTexture();")));
+}
+
+// POLICY-CALLSITE-FULL-ARG-PINS-1 (CoS #473 N1): every argument of the staged-slot decide( call, by position. The two
+// substring checks above still pass with !m_textureFromGpuRecon, an inverted stageEnabled, or swapped widths.
+TEST(PolicyCallsiteFullArgumentPins, TheStagedSlotDecideCallPassesEveryArgumentInPosition)
+{
+    const QString window = sourceFile("platform/qt/GpuDisplayWindow.cpp");
+    const QString present = bodyBetween(window, QStringLiteral("bool GpuDisplayWindow::setPresentedGpuPlaybackReconAmazePostWbTexture("),
+                                        QStringLiteral("bool GpuDisplayWindow::readGpuReconSourceBayer16Texture("));
+    ASSERT_FALSE(present.isEmpty());
+    ASSERT_EQ(1, present.count(QStringLiteral("playback_route_staged_slot::decide(")));
+    const std::initializer_list<PinnedArgument> expected = {
+        {"stageEnabled", "playbackRoutePrewarmStageEnabled()"},
+        {"stagedValid", "m_stagedReconOutput && m_stagedReconSource"},
+        {"stagedWidth", "m_stagedReconWidth"},
+        {"stagedHeight", "m_stagedReconHeight"},
+        {"texWidth", "texWidth"},
+        {"texHeight", "texHeight"},
+        {"currentTextureIsRecon", "m_textureFromGpuRecon"},
+        {"reconSourceExists", "m_gpuReconSourceTexture != nullptr"},
+    };
+    ASSERT_EQ(describeArguments(expected),
+              describeArguments(callArguments(present, QStringLiteral("playback_route_staged_slot::decide(")), expected));
+}
+
+// The prewarm's Inputs: all seven fields, each assigned once, in declaration order, with nothing else in between.
+TEST(PolicyCallsiteFullArgumentPins, ThePrewarmDecideInputsAssignEveryFieldInOrder)
+{
+    const QString source = sourceFile("platform/qt/MainWindow.cpp");
+    const QString run = bodyBetween(source, QStringLiteral("void MainWindow::runPlaybackRoutePrewarm( quint64 clipGeneration )"),
+                                    QStringLiteral("void MainWindow::armPlaybackRoutePrewarm()"));
+    ASSERT_FALSE(run.isEmpty());
+    const QStringList statements = statementsBetween(run, QStringLiteral("playback_route_prewarm::Inputs in;"),
+                                                     QStringLiteral("const playback_route_prewarm::Decision decision = playback_route_prewarm::decide( in );"));
+    const QStringList expected = {
+        QStringLiteral("in.enabled = !mlvappPlaybackRoutePrewarmDisabled()"),
+        QStringLiteral("in.playing = ui->actionPlay->isChecked()"),
+        QStringLiteral("in.fileLoaded = m_fileLoaded && m_pMlvObject"),
+        QStringLiteral("in.clipGenerationMatches = clipGeneration == m_playbackRoutePrewarmClipGeneration"),
+        QStringLiteral("in.gpuWindowActive = GpuDisplayWindow::isActive()"),
+        QStringLiteral("in.textureRouteRequested = m_lastPresentedRequestContextValid && m_lastPresentedRequestContext.gpuPlaybackReconTexturePresentRequested"),
+        QStringLiteral("in.r16TextureBackendAdmitted = m_lastPresentedRequestContextValid && m_lastPresentedRequestContext.gpuPlaybackReconAmazeTexturePresentAdmitted"),
+    };
+    ASSERT_EQ(expected.join(QStringLiteral("; ")).toStdString(), statements.join(QStringLiteral("; ")).toStdString());
+    ASSERT_EQ(std::string("in"), callArguments(run, QStringLiteral("playback_route_prewarm::decide(")).join(QStringLiteral(",")).toStdString());
+}
+
+// The prewarm's textureSize( call: all six arguments by position, and the planOk it passes as reducedPlanOk.
+TEST(PolicyCallsiteFullArgumentPins, ThePrewarmTextureSizeCallPassesEveryArgumentInPosition)
+{
+    const QString source = sourceFile("platform/qt/MainWindow.cpp");
+    const QString run = bodyBetween(source, QStringLiteral("void MainWindow::runPlaybackRoutePrewarm( quint64 clipGeneration )"),
+                                    QStringLiteral("void MainWindow::armPlaybackRoutePrewarm()"));
+    ASSERT_FALSE(run.isEmpty());
+    ASSERT_EQ(1, run.count(QStringLiteral("playback_route_prewarm::textureSize(")));
+    ASSERT_TRUE(statementsBetween(run, QStringLiteral("mlvDualIsoPreviewScaleRecon_t plan;"),
+                                  QStringLiteral("const playback_route_prewarm::Size size")).contains(QStringLiteral(
+        "const bool planOk = ( scale == 2 || scale == 4 ) && mlvDualIsoGpuPreviewScaleReconPlan( m_pMlvObject, scale, 0, &plan ) != 0"
+        " && plan.scale == scale")));
+    const std::initializer_list<PinnedArgument> expected = {
+        {"clipWidth", "static_cast<int>( getMlvWidth( m_pMlvObject ) )"},
+        {"clipHeight", "static_cast<int>( getMlvHeight( m_pMlvObject ) )"},
+        {"playbackScale", "scale"},
+        {"reducedPlanOk", "planOk"},
+        {"planWidth", "planOk ? plan.reducedWidth : 0"},
+        {"planHeight", "planOk ? plan.reducedHeight : 0"},
+    };
+    ASSERT_EQ(describeArguments(expected),
+              describeArguments(callArguments(run, QStringLiteral("playback_route_prewarm::textureSize(")), expected));
 }
 
 TEST(PlaybackRouteStagedSlotWiring, TheStagedPairIsFreedResetFirstOnContextCleanupClipChangeAndRearm)
