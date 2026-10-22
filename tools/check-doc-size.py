@@ -119,6 +119,104 @@ EXEMPT = [
     ".claude/worktrees/**",
     ".claude-state/worktrees/**",
     ".claude-state/closeout/repo-sweep/integration-probes/**",
+    # Frozen lane run evidence (receipts, outputs, and the full repo copies a lane stages).
+    # HOST-FILE-CHURN-POOL-GROWTH-1: 75k markdown files / ~614k directory touches per
+    # Stop-hook run on the board, 45 findings on files nobody may split. Same reason as
+    # profiling above; the live coordination ledgers elsewhere under .claude-state stay hub-tier.
+    ".claude-state/fleet-runs/**",
+    # HOST-FILE-CHURN-POOL-GROWTH-1 r3 (hub ruling on B1): a report row leaves the board only because
+    # a NAMED pattern below says so, never because the walk skipped its tree unnamed. Each entry is
+    # one top-level state dir that is not a ledger home; the tracked originals of any doc copied
+    # into them stay governed through git. No `.claude-state/**`-wide entry (test-pinned). A new
+    # top-level state dir that is on neither this list nor EXTRA_ROOTS shows up as an
+    # UNLISTED_ROOT row until it is named in one of the two.
+    # -- scratch / evidence copies (held 2,398 report rows in r2, incl. 11 BREACH copies of tracked docs):
+    ".claude-state/tmp/**",              # lane scratch incl. full copies of the doctrine bus files
+    ".claude-state/validation/**",       # frozen validation copies of tracked docs
+    ".claude-state/disk-hygiene/**",     # retention and quarantine copies of whole repo checkouts
+    ".claude-state/dual-venue/**",       # dual-venue evidence
+    ".claude-state/project-audit/**",    # audit scratch
+    ".claude-state/playback-review/**",  # playback review evidence
+    ".claude-state/cos-acks-20261015/**",  # dated Chief-of-Staff ack evidence
+    ".claude-state/cos-acks-20261016/**",
+    ".claude-state/sbp-development/**",  # sbp evidence
+    ".claude-state/sbp-deploy/**",
+    ".claude-state/crash-analysis/**",
+    ".claude-state/analysis/**",
+    ".claude-state/ls/**",
+    ".claude-state/dist/**",
+    ".claude-state/tools/**",            # untracked helper copies, not the tracked tools/ tree
+    ".claude-state/gpu-4090-bundle/**",
+    ".claude-state/gpu-amaze-dll-bundle/**",
+    ".claude-state/repin-20260921/**",
+    ".claude-state/repin-20260921b/**",
+    ".claude-state/repin-20260922/**",
+    ".claude-state/design/**",
+    ".claude-state/disk-containment/**",
+    ".claude-state/cpu-triage/**",
+    ".claude-state/deliverables/**",
+    ".claude-state/docs-audit/**",
+    ".claude-state/doctrine/**",
+    ".claude-state/jev/**",
+    ".claude-state/known-good-artifacts/**",
+    ".claude-state/ml-gates/**",
+    ".claude-state/perf-leaderboard/**",
+    ".claude-state/preservation/**",
+    ".claude-state/repo-hygiene/**",
+    # -- state dirs that held NO markdown file on the 2026-10-22 board report (logs, builds, captures,
+    #    toolchains, ssh/openssh, smoke output). Named so the UNLISTED_ROOT report stays quiet for
+    #    them; a ledger home must never be added here, put it in EXTRA_ROOTS.
+    ".claude-state/advance-backup-f1-20260708/**",
+    ".claude-state/advance-backup-f3-20260706/**",
+    ".claude-state/advance-backup-seq209-20260705/**",
+    ".claude-state/agent-bridge/**",
+    ".claude-state/artifacts/**",
+    ".claude-state/audit-scratch/**",
+    ".claude-state/auto-look-full-sweep/**",
+    ".claude-state/automation/**",
+    ".claude-state/bin/**",
+    ".claude-state/browser-review/**",
+    ".claude-state/build/**",
+    ".claude-state/build-console-tests/**",
+    ".claude-state/build-logs/**",
+    ".claude-state/build-tmp-68f161aea8f3/**",
+    ".claude-state/ci-cost/**",
+    ".claude-state/ci-debug/**",
+    ".claude-state/closeout-log/**",
+    ".claude-state/env-backups/**",
+    ".claude-state/evidence/**",
+    ".claude-state/fleet-runs$D/**",
+    ".claude-state/green-regression-capture/**",
+    ".claude-state/green-regression-capture-after/**",
+    ".claude-state/green-regression-capture-final/**",
+    ".claude-state/green-regression-smoke/**",
+    ".claude-state/green-regression-smoke-after/**",
+    ".claude-state/laptop-bench/**",
+    ".claude-state/logs/**",
+    ".claude-state/look-assist-smoke/**",
+    ".claude-state/look-previews/**",
+    ".claude-state/nothrow-ab/**",
+    ".claude-state/openssh/**",
+    ".claude-state/ops/**",
+    ".claude-state/playback-smoke/**",
+    ".claude-state/pr84-review-20260907T174014Z/**",
+    ".claude-state/pwsh/**",
+    ".claude-state/python-libs/**",
+    ".claude-state/quarantine/**",
+    ".claude-state/recovered/**",
+    ".claude-state/review/**",
+    ".claude-state/sbp-remediation/**",
+    ".claude-state/scale-smoke/**",
+    ".claude-state/scale-toggle-smoke/**",
+    ".claude-state/scratch/**",
+    ".claude-state/scratch-um-watchdog/**",
+    ".claude-state/scripts/**",
+    ".claude-state/ssh/**",
+    ".claude-state/telemetry/**",
+    ".claude-state/test-logs/**",
+    ".claude-state/toolchains/**",
+    ".claude-state/um-one-off/**",
+    ".claude-state/venue-sheets/**",
     # Generated artifacts: regenerate rather than edit.
     ".claude-state/commit-message-rewrite/**",
     # Packaged brief corpora: frozen inputs to an external consumer.
@@ -127,14 +225,41 @@ EXEMPT = [
     "**/*.bak",
 ]
 
-# Directories scanned even though git does not track them. .claude-state is 58%
-# of this repo's markdown mass; a tracked-only scan would report compliance while
-# the largest, hottest files sat outside it.
+# Git-ignored directories scanned anyway: the hub-tier coordination ledgers a
+# tracked-only scan would silently ungovern. HOST-FILE-CHURN-POOL-GROWTH-1 r2: an
+# explicit allowlist, never `.claude-state` whole -- that tree also holds lane
+# scratch, validation copies of tracked docs and disk-hygiene quarantine of whole
+# repo checkouts, and this check runs at every turn end. A tree not listed here is
+# enumerated ZERO times, and (r3) a top-level state dir named in neither this list
+# nor EXEMPT is reported as an UNLISTED_ROOT WARN row. A new ledger home goes here
+# by name, in the same change that creates it; test_check_doc_size_walk pins that
+# the list never names the state tree whole.
 EXTRA_ROOTS: list[str] = [
+    ".claude-state/adjudications",   # hub rulings (BREACH-eligible ledgers)
+    ".claude-state/closeout",        # closeout contract + remediation notes
+    ".claude-state/continuity",      # resume/handoff designs, bus drafts
+    ".claude-state/coordination",    # lane ledgers + dual-lane channel (COORDINATION-PRUNE-POLICY)
+    ".claude-state/doctrine-outbox",
+    ".claude-state/escalation",
+    ".claude-state/handoff",
+    ".claude-state/handoff-archive",
+    ".claude-state/heartbeat",       # board-snapshot / inflight
+    ".claude-state/hub-autopilot",
+    ".claude-state/kernel",          # subject-ledger.md
+    ".claude-state/planning",
+    ".claude-state/project-memory",  # canonical durable memory (docs list in README.md)
+]
+
+# Directories whose OWN markdown files (depth 0, no descent) are governed, e.g.
+# .claude-state/SESSION-HANDOFF.md and RESUME.md.
+EXTRA_DEPTH0_DIRS: list[str] = [
     ".claude-state",
 ]
 
 WALK_SKIP = {".git", "node_modules", "__pycache__", ".venv", "venv"}
+
+# Tier name of the report row for an EXTRA_DEPTH0_DIRS child that is on neither EXTRA_ROOTS nor EXEMPT.
+UNLISTED_ROOT_TIER = "UNLISTED_ROOT"
 
 # This fork's markdown ancestry is not cleanly separable by ref, and the handful
 # of genuinely-upstream docs are listed in EXEMPT instead. Left off.
@@ -196,19 +321,85 @@ def tracked_markdown(repo: Path) -> list[str]:
     return [p for p in proc.stdout.split("\0") if p]
 
 
-def untracked_markdown(repo: Path) -> list[str]:
+_DIR_EXEMPT_CACHE: dict[tuple[str, ...], tuple[frozenset[str], tuple[str, ...]]] = {}
+
+
+def _dir_exempt_patterns() -> tuple[frozenset[str], tuple[str, ...]]:
+    """EXEMPT's directory patterns (`.../**`) split into literal stems and wildcard patterns."""
+    key = tuple(EXEMPT)
+    hit = _DIR_EXEMPT_CACHE.get(key)
+    if hit is None:
+        dir_patterns = [p for p in key if p.endswith("/**")]
+        literal = [p[:-3] for p in dir_patterns if not any(c in p[:-3] for c in "*?[")]
+        wild = tuple(p for p in dir_patterns if any(c in p[:-3] for c in "*?["))
+        hit = _DIR_EXEMPT_CACHE[key] = (frozenset(os.path.normcase(s) for s in literal), wild)
+    return hit
+
+
+def dir_is_exempt(rel_dir: str) -> bool:
+    """True when every file under this directory is exempt, so the walk need not open it.
+
+    Only EXEMPT patterns ending in `/**` can prove that for a whole directory; a file pattern
+    such as `**/*.bak` says nothing about a directory that merely has that name.
+    """
+    rel_dir = rel_dir.rstrip("/")
+    stems, wild = _dir_exempt_patterns()
+    parts = rel_dir.split("/")
+    # `lit/**` with no wildcard in `lit` exempts a directory iff `lit` is that directory or one of
+    # its ancestors: a set lookup per ancestor instead of one fnmatch per EXEMPT entry, which the
+    # walk would pay for every directory it visits (r3 added ~100 named entries).
+    if any(os.path.normcase("/".join(parts[:i])) in stems for i in range(1, len(parts) + 1)):
+        return True
+    probe = rel_dir + "/x"
+    return any(_match(probe, p) for p in wild)
+
+
+def untracked_scan(repo: Path) -> tuple[list[str], list[str]]:
+    """(markdown paths, unlisted top-level dirs) of the git-ignored state this check governs.
+
+    The depth-0 listing of each EXTRA_DEPTH0_DIRS entry is the only look at a directory that is
+    neither allowlisted nor exempt: it is named in the second list and never opened
+    (HOST-FILE-CHURN-POOL-GROWTH-1 r3), so a new ledger home surfaces instead of vanishing.
+    """
     out: list[str] = []
+    unlisted: list[str] = []
+    for root in EXTRA_DEPTH0_DIRS:
+        base = repo / root
+        try:
+            with os.scandir(base) as entries:
+                for e in entries:
+                    rel = (Path(root) / e.name).as_posix()
+                    if e.name.endswith(".md") and e.is_file():
+                        out.append(rel)
+                    elif (
+                        e.name not in WALK_SKIP
+                        and rel not in EXTRA_ROOTS
+                        and not dir_is_exempt(rel)
+                        and e.is_dir()
+                    ):
+                        unlisted.append(rel)
+        except OSError:
+            continue
     for root in EXTRA_ROOTS:
         base = repo / root
         if not base.is_dir():
             continue
         for dirpath, dirnames, filenames in os.walk(base):
-            dirnames[:] = [d for d in dirnames if d not in WALK_SKIP]
+            # Prune before descending: classify() would drop these later, but only after every
+            # directory in them had been opened (HOST-FILE-CHURN-POOL-GROWTH-1).
+            here = Path(dirpath).relative_to(repo)
+            dirnames[:] = [
+                d for d in dirnames
+                if d not in WALK_SKIP and not dir_is_exempt((here / d).as_posix())
+            ]
             for name in filenames:
                 if name.endswith(".md"):
-                    rel = (Path(dirpath) / name).relative_to(repo)
-                    out.append(rel.as_posix())
-    return out
+                    out.append((here / name).as_posix())
+    return out, unlisted
+
+
+def untracked_markdown(repo: Path) -> list[str]:
+    return untracked_scan(repo)[0]
 
 
 def row_for(repo: Path, rel: str, upstream: frozenset[str]) -> dict | None:
@@ -239,13 +430,24 @@ def scan(repo: Path) -> list[dict]:
     upstream = frozenset(upstream_markdown(repo))
     seen: set[str] = set()
     rows: list[dict] = []
-    for rel in tracked_markdown(repo) + untracked_markdown(repo):
+    untracked, unlisted = untracked_scan(repo)
+    for rel in tracked_markdown(repo) + untracked:
         if rel in seen:
             continue
         seen.add(rel)
         row = row_for(repo, rel, upstream)
         if row:
             rows.append(row)
+    # One WARN row per state dir nobody has named: size unknown because it is not opened.
+    for rel in unlisted:
+        rows.append({
+            "path": rel,
+            "bytes": 0,
+            "tier": UNLISTED_ROOT_TIER,
+            "soft": 0,
+            "hard": 0,
+            "state": "WARN",
+        })
     rows.sort(key=lambda r: (-r["bytes"], r["path"]))
     return rows
 
@@ -338,11 +540,17 @@ def main() -> int:
             for r in shown:
                 print(f"{r['bytes']:>9,}  {r['tier']:8} {r['state']:6} {r['path']}")
             print()
-        governed = sum(r["bytes"] for r in rows)
+        unlisted = [r for r in warns if r["tier"] == UNLISTED_ROOT_TIER]
+        files = [r for r in rows if r["tier"] != UNLISTED_ROOT_TIER]
+        governed = sum(r["bytes"] for r in files)
         print(
-            f"DOC SIZE: {len(rows)} governed files, {governed:,} bytes, "
-            f"{len(breaches)} over hard cap, {len(warns)} over soft cap"
+            f"DOC SIZE: {len(files)} governed files, {governed:,} bytes, "
+            f"{len(breaches)} over hard cap, {len(warns) - len(unlisted)} over soft cap, "
+            f"{len(unlisted)} unlisted state roots"
         )
+        if unlisted:
+            print("UNLISTED_ROOT: name each in EXTRA_ROOTS (a ledger home) or EXEMPT (scratch) in")
+            print("tools/check-doc-size.py; until then nothing under it is size-checked.")
         if breaches:
             print("Over the hard cap -> demote the file to an index IN PLACE and move")
             print("the detail into children. Do NOT rename the parent: every existing")
