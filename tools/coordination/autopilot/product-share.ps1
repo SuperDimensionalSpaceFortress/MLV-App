@@ -90,7 +90,19 @@ function Write-FileAtomic([string]$Path, [string]$Text) {
     if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
     $tmp = "$Path.$PID.tmp"
     [System.IO.File]::WriteAllText($tmp, $Text, [System.Text.UTF8Encoding]::new($false))
-    Move-Item -LiteralPath $tmp -Destination $Path -Force
+    # Move-Item -Force DELETES the destination and then moves, so a concurrent reader sees no file at all (measured: 20876
+    # FileNotFoundError in 193475 reads while 1809 of 3000 writes failed). File.Replace was also measured and still opens a
+    # gap; File.Move(overwrite) is one MoveFileEx(REPLACE_EXISTING), so the path always exists. A reader holding the old file
+    # open makes it throw a sharing violation, which is retried briefly.
+    for ($attempt = 1; $attempt -le 100; $attempt++) {
+        try {
+            [System.IO.File]::Move($tmp, $Path, $true)
+            return
+        } catch {
+            if ($attempt -eq 100) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue; throw }
+            Start-Sleep -Milliseconds 20
+        }
+    }
 }
 
 function Read-JsonFile([string]$Path) {
