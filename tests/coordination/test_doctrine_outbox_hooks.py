@@ -166,9 +166,10 @@ CANDIDATE_BUS_PATH = "tools/factory/doctrine_outbox.py"
 # (OUTBOX-SENT-CARD-NEVER-EDITED-1; the guard is test_a_commit_that_edits_a_sent_item_is_refused_by_name_and_key). A tool
 # change adds the next superseding card instead. test_the_steward_handoff_card_supersedes_the_earlier_card derives the name
 # from that card's own heading. ROUTE_EXERCISE_CARD is the oldest, long since superseded; only its static route text is checked.
-HANDOFF_CARD = REPO_ROOT / "doctrine-outbox" / "20261022-doctrine-outbox-sent-ledger-read-candidate.md"
-EARLIER_CARDS = (REPO_ROOT / "doctrine-outbox" / "20261022-doctrine-outbox-sent-item-guard-candidate.md",)
-OLDER_SENT_CARDS = (REPO_ROOT / "doctrine-outbox" / "20261020-doctrine-outbox-markup-forms-candidate.md",)
+HANDOFF_CARD = REPO_ROOT / "doctrine-outbox" / "20261022-doctrine-outbox-comment-history-candidate.md"
+EARLIER_CARDS = (REPO_ROOT / "doctrine-outbox" / "20261022-doctrine-outbox-sent-ledger-read-candidate.md",)
+OLDER_SENT_CARDS = (REPO_ROOT / "doctrine-outbox" / "20261020-doctrine-outbox-markup-forms-candidate.md",
+                    REPO_ROOT / "doctrine-outbox" / "20261022-doctrine-outbox-sent-item-guard-candidate.md")
 ROUTE_EXERCISE_CARD = REPO_ROOT / "doctrine-outbox" / "20261017-doctrine-outbox-route-exercise-candidate.md"
 OUTBOX_README = REPO_ROOT / "doctrine-outbox" / "README.md"
 
