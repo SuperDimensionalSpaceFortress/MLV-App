@@ -28,6 +28,7 @@ extern "C" {
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 #include <thread>
 #include <string>
 #include <utility>
@@ -695,8 +696,7 @@ class ScopedAsyncWriterEnvironment
 {
 public:
     ScopedAsyncWriterEnvironment()
-    {
-        static const char * const keys[] = {
+        : ScopedAsyncWriterEnvironment({
             "MLVAPP_EXPORT_STAGE_PROFILER",
             "MLVAPP_EXPORT_STAGE_PROFILE_FILE",
             "MLVAPP_EXPORT_STAGE_PROFILE_BUILD_ID",
@@ -705,7 +705,14 @@ public:
             "MLVAPP_CDNG_EXPORT_ASYNC_WRITER_QUEUE_DEPTH",
             "MLVAPP_CDNG_EXPORT_ASYNC_WRITER_THREADS",
             "MLVAPP_CDNG_EXPORT_ASYNC_WRITER_COMPRESS"
-        };
+        })
+    {
+    }
+
+    /* Saves and restores an arbitrary key set: a key that was unset stays unset,
+     * a key that was set gets its prior value back. */
+    ScopedAsyncWriterEnvironment(std::initializer_list<const char *> keys)
+    {
         for(const char * key : keys)
         {
             Entry entry;
@@ -9474,6 +9481,67 @@ public:
     }
 };
 
+/* DUALISO-PREFETCH-TEST-ENV-RESTORE-ON-FAIL-1: scope for the process state the
+ * processed8 prefetch tests mutate. Declare it BEFORE the first set and before
+ * the fixture, so every exit path (a failing ASSERT_* returning early, an
+ * exception, the normal end) restores the prior env values and returns the
+ * playback preview modes to off after the fixture has been torn down. */
+class ScopedProcessed8PrefetchTestState
+{
+public:
+    ScopedProcessed8PrefetchTestState()
+        : env_({
+            "MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH",
+            "MLVAPP_PROCESSED8_PREFETCH_INDIRECT",
+            "MLVAPP_PREFETCH_INDIRECT_X2",
+            "MLVAPP_DISABLE_QUARTERRES_X2_PROCESSING"
+        })
+    {
+    }
+
+    ~ScopedProcessed8PrefetchTestState()
+    {
+        processingSetPlaybackPreviewMode(0);
+        processingSetPlaybackAggressivePreviewMode(0);
+    }
+
+private:
+    ScopedAsyncWriterEnvironment env_;
+};
+
+TEST(DualIsoPipeline, Processed8PrefetchTestStateRestoresEnvAndPreviewModeOnEarlyReturn)
+{
+    constexpr const char * kWasSet = "MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH";
+    constexpr const char * kWasUnset = "MLVAPP_PROCESSED8_PREFETCH_INDIRECT";
+    MLVAPP_TEST_SETENV(kWasSet, "prior");
+    MLVAPP_TEST_UNSETENV(kWasUnset);
+    processingSetPlaybackPreviewMode(0);
+
+    /* Models a test whose ASSERT_* fails after the sets: it returns without
+     * reaching any straight-line restore at the end of the body. */
+    const auto body_that_returns_early = []() {
+        ScopedProcessed8PrefetchTestState state;
+        MLVAPP_TEST_SETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH", "1");
+        MLVAPP_TEST_SETENV("MLVAPP_PROCESSED8_PREFETCH_INDIRECT", "0");
+        processingSetPlaybackPreviewMode(1);
+        return;
+    };
+    body_that_returns_early();
+
+    const bool was_set_restored = qEnvironmentVariableIsSet(kWasSet) && qgetenv(kWasSet) == QByteArray("prior");
+    const bool was_unset_restored = !qEnvironmentVariableIsSet(kWasUnset);
+    const int preview_mode_after = processingPlaybackPreviewModeEnabled();
+
+    /* Put the process back before asserting so a failure here cannot cascade. */
+    MLVAPP_TEST_UNSETENV(kWasSet);
+    MLVAPP_TEST_UNSETENV(kWasUnset);
+    processingSetPlaybackPreviewMode(0);
+
+    ASSERT_TRUE(was_set_restored);
+    ASSERT_TRUE(was_unset_restored);
+    ASSERT_EQ(0, preview_mode_after);
+}
+
 /* Phase: Mean23 playback override (this commit). The receipt asks for AMaZE
  * (dualIsoInterpolation == 0). With the playback-only override clear the HQ
  * recon must run AMaZE; flipping diso_playback_force_mean23=1 must redirect
@@ -9594,6 +9662,7 @@ extern "C" int llrpReinitMean23OverrideDispatchForTesting(void);
  * without having to also strip the override from the receipt path. */
 TEST(DualIsoPipeline, Phase4A_TestProcessed8CacheScaleKeyIsolation)
 {
+    ScopedProcessed8PrefetchTestState process8_state;
     /* Phase 4A/4B: render at scale=1, then at scale=2, then again at
      * scale=1. The cache key MUST differ between scale=1 and scale=2
      * (Phase 4A guarantee). Phase 4B further makes the scale=2 output
@@ -9680,8 +9749,6 @@ TEST(DualIsoPipeline, Phase4A_TestProcessed8CacheScaleKeyIsolation)
      * the public-API surface stays compatible. */
     const std::vector<uint8_t> nonScaled_frame = fixture.renderFrame8(0, 1);
     ASSERT_TRUE(scale1_frame == nonScaled_frame);
-
-    MLVAPP_TEST_UNSETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH");
 }
 
 TEST(DualIsoPipeline, DualIsoPlaybackOverrideRespectsMean23DisableEnv)
@@ -11877,6 +11944,7 @@ TEST(DualIsoPipeline, Processed8PrefetchEnablesAggressiveScaleOneTwoAndFour)
 
 TEST(DualIsoPipeline, Processed8PrefetchEnablesStandardScaleTwoFourAndEightButNotOne)
 {
+    ScopedProcessed8PrefetchTestState process8_state;
     MlvPipelineFixture fixture;
     QString error_message;
     ASSERT_TRUE(fixture.openTinyDualIso(&error_message));
@@ -11903,8 +11971,6 @@ TEST(DualIsoPipeline, Processed8PrefetchEnablesStandardScaleTwoFourAndEightButNo
 
     fixture.video()->playback_scale_factor_active = 8;
     ASSERT_EQ(1, getMlvProcessed8PrefetchEnabledForTesting(fixture.video()));
-
-    processingSetPlaybackPreviewMode(0);
 }
 
 /* DUALISO-PREFETCH-INDIRECT-WORKER-HIT-ORACLE-FLAKE-1: wait until the
@@ -12014,6 +12080,7 @@ static int readProcessed8SliceExpiries(mlvObject_t * video)
  * consumes is carried by the prefetch state copy. */
 TEST(DualIsoPipeline, Processed8PrefetchIndirectWorkerHitMatchesForegroundReference)
 {
+    ScopedProcessed8PrefetchTestState process8_state;
     MLVAPP_TEST_SETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH", "1");
     MLVAPP_TEST_UNSETENV("MLVAPP_PROCESSED8_PREFETCH_INDIRECT");
     processingSetPlaybackPreviewMode(1);
@@ -12034,8 +12101,6 @@ TEST(DualIsoPipeline, Processed8PrefetchIndirectWorkerHitMatchesForegroundRefere
     if ((reference_fixture.width() % 4) != 0 || (reference_fixture.height() % 4) != 0)
     {
         std::printf("Processed8PrefetchIndirect: fixture not x4-divisible, guarded out\n");
-        processingSetPlaybackPreviewMode(0);
-        MLVAPP_TEST_UNSETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH");
         return;
     }
 
@@ -12112,9 +12177,6 @@ TEST(DualIsoPipeline, Processed8PrefetchIndirectWorkerHitMatchesForegroundRefere
     ASSERT_EQ(0, getMlvLastProcessed8CacheHit());
     ASSERT_EQ(0, getMlvLastProcessed8PrefetchHit());
     ASSERT_TRUE(first_prefetched_bytes == forced_fresh);
-
-    processingSetPlaybackPreviewMode(0);
-    MLVAPP_TEST_UNSETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH");
 }
 
 /* Iteration 4 (2026-06-11): aggressive x4/x8 consult the cache again, served
@@ -12122,6 +12184,7 @@ TEST(DualIsoPipeline, Processed8PrefetchIndirectWorkerHitMatchesForegroundRefere
  * test above, under ambient Aggressive Performance. */
 TEST(DualIsoPipeline, Processed8PrefetchIndirectAggressiveX4WorkerHitMatchesReference)
 {
+    ScopedProcessed8PrefetchTestState process8_state;
     ScopedAggressivePreviewMode aggressivePreview(1);
     MLVAPP_TEST_SETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH", "1");
     MLVAPP_TEST_UNSETENV("MLVAPP_PROCESSED8_PREFETCH_INDIRECT");
@@ -12140,8 +12203,6 @@ TEST(DualIsoPipeline, Processed8PrefetchIndirectAggressiveX4WorkerHitMatchesRefe
     if ((reference_fixture.width() % 4) != 0 || (reference_fixture.height() % 4) != 0)
     {
         std::printf("Processed8PrefetchIndirectAggressive: fixture not x4-divisible, guarded out\n");
-        processingSetPlaybackPreviewMode(0);
-        MLVAPP_TEST_UNSETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH");
         return;
     }
 
@@ -12199,13 +12260,11 @@ TEST(DualIsoPipeline, Processed8PrefetchIndirectAggressiveX4WorkerHitMatchesRefe
                 static_cast<unsigned long long>(mismatched_bytes));
     ASSERT_TRUE(prefetched_hits >= 1);
     ASSERT_EQ(static_cast<std::uint64_t>(0), mismatched_bytes);
-
-    processingSetPlaybackPreviewMode(0);
-    MLVAPP_TEST_UNSETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH");
 }
 
 TEST(DualIsoPipeline, Processed8PrefetchIndirectDisableEnvKeepsSkip)
 {
+    ScopedProcessed8PrefetchTestState process8_state;
     MLVAPP_TEST_SETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH", "1");
     MLVAPP_TEST_SETENV("MLVAPP_PROCESSED8_PREFETCH_INDIRECT", "0");
     processingSetPlaybackPreviewMode(1);
@@ -12222,9 +12281,6 @@ TEST(DualIsoPipeline, Processed8PrefetchIndirectDisableEnvKeepsSkip)
 
     if ((fixture.width() % 4) != 0 || (fixture.height() % 4) != 0)
     {
-        processingSetPlaybackPreviewMode(0);
-        MLVAPP_TEST_UNSETENV("MLVAPP_PROCESSED8_PREFETCH_INDIRECT");
-        MLVAPP_TEST_UNSETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH");
         return;
     }
 
@@ -12243,14 +12299,11 @@ TEST(DualIsoPipeline, Processed8PrefetchIndirectDisableEnvKeepsSkip)
     }
 
     ASSERT_EQ(0, prefetched_hits);
-
-    processingSetPlaybackPreviewMode(0);
-    MLVAPP_TEST_UNSETENV("MLVAPP_PROCESSED8_PREFETCH_INDIRECT");
-    MLVAPP_TEST_UNSETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH");
 }
 
 TEST(DualIsoPipeline, Processed8PrefetchIndirectUnsupportedStateKeepsSkip)
 {
+    ScopedProcessed8PrefetchTestState process8_state;
     MLVAPP_TEST_SETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH", "1");
     MLVAPP_TEST_UNSETENV("MLVAPP_PROCESSED8_PREFETCH_INDIRECT");
     processingSetPlaybackPreviewMode(1);
@@ -12270,8 +12323,6 @@ TEST(DualIsoPipeline, Processed8PrefetchIndirectUnsupportedStateKeepsSkip)
 
     if ((fixture.width() % 4) != 0 || (fixture.height() % 4) != 0)
     {
-        processingSetPlaybackPreviewMode(0);
-        MLVAPP_TEST_UNSETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH");
         return;
     }
 
@@ -12292,12 +12343,11 @@ TEST(DualIsoPipeline, Processed8PrefetchIndirectUnsupportedStateKeepsSkip)
     ASSERT_EQ(0, prefetched_hits);
 
     fixture.processing()->lut_on = 0;
-    processingSetPlaybackPreviewMode(0);
-    MLVAPP_TEST_UNSETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH");
 }
 
 TEST(DualIsoPipeline, Processed8PrefetchIndirectClarityKeepsSkip)
 {
+    ScopedProcessed8PrefetchTestState process8_state;
     MLVAPP_TEST_SETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH", "1");
     MLVAPP_TEST_UNSETENV("MLVAPP_PROCESSED8_PREFETCH_INDIRECT");
     processingSetPlaybackPreviewMode(1);
@@ -12315,8 +12365,6 @@ TEST(DualIsoPipeline, Processed8PrefetchIndirectClarityKeepsSkip)
 
     if ((fixture.width() % 4) != 0 || (fixture.height() % 4) != 0)
     {
-        processingSetPlaybackPreviewMode(0);
-        MLVAPP_TEST_UNSETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH");
         return;
     }
 
@@ -12330,13 +12378,11 @@ TEST(DualIsoPipeline, Processed8PrefetchIndirectClarityKeepsSkip)
         ASSERT_TRUE(waitForProcessed8PrefetchIdleOrHang(fixture.video()));
     }
     ASSERT_EQ(0, prefetched_hits);
-
-    processingSetPlaybackPreviewMode(0);
-    MLVAPP_TEST_UNSETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH");
 }
 
 TEST(DualIsoPipeline, Processed8InvalidationIsGenerationBarrierAndForcesSnapshotRefresh)
 {
+    ScopedProcessed8PrefetchTestState process8_state;
     MLVAPP_TEST_SETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH", "1");
     processingSetPlaybackPreviewMode(1);
     processingSetPlaybackAggressivePreviewMode(0);
@@ -12350,8 +12396,6 @@ TEST(DualIsoPipeline, Processed8InvalidationIsGenerationBarrierAndForcesSnapshot
 
     if ((fixture.width() % 4) != 0 || (fixture.height() % 4) != 0)
     {
-        processingSetPlaybackPreviewMode(0);
-        MLVAPP_TEST_UNSETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH");
         return;
     }
 
@@ -12400,13 +12444,11 @@ TEST(DualIsoPipeline, Processed8InvalidationIsGenerationBarrierAndForcesSnapshot
     ASSERT_EQ(0, dirty_after_request);
     ASSERT_EQ(replacement, snapshot_level);
     ASSERT_TRUE(waitForProcessed8PrefetchIdleOrHang(fixture.video()));
-
-    processingSetPlaybackPreviewMode(0);
-    MLVAPP_TEST_UNSETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH");
 }
 
 TEST(DualIsoPipeline, Processed8InvalidationRejectsInFlightOldGenerationStoreAndWakesWaiter)
 {
+    ScopedProcessed8PrefetchTestState process8_state;
     MLVAPP_TEST_SETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH", "1");
     processingSetPlaybackPreviewMode(1);
     processingSetPlaybackAggressivePreviewMode(0);
@@ -12421,8 +12463,6 @@ TEST(DualIsoPipeline, Processed8InvalidationRejectsInFlightOldGenerationStoreAnd
     if ((fixture.width() % 4) != 0 || (fixture.height() % 4) != 0
         || getMlvFrames(fixture.video()) < 2)
     {
-        processingSetPlaybackPreviewMode(0);
-        MLVAPP_TEST_UNSETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH");
         return;
     }
 
@@ -12496,9 +12536,6 @@ TEST(DualIsoPipeline, Processed8InvalidationRejectsInFlightOldGenerationStoreAnd
     ASSERT_TRUE(waiter_ms < 1000.0);
     /* Woken by the invalidation broadcast, not by a slice running out. */
     ASSERT_EQ(0, slice_expiries);
-
-    processingSetPlaybackPreviewMode(0);
-    MLVAPP_TEST_UNSETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH");
 }
 
 /* PROCESSED8-IDLE-WAIT-PREDICATE-RECHECK-1: when the worker's cache prepare
@@ -12521,6 +12558,7 @@ TEST(DualIsoPipeline, Processed8InvalidationRejectsInFlightOldGenerationStoreAnd
  * one critical section, leaving the waiter parked on the pending request. */
 TEST(DualIsoPipeline, Processed8PrefetchIdleWaitWakesWhenWorkerPrepareFails)
 {
+    ScopedProcessed8PrefetchTestState process8_state;
     MLVAPP_TEST_SETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH", "1");
     processingSetPlaybackPreviewMode(1);
     processingSetPlaybackAggressivePreviewMode(0);
@@ -12534,8 +12572,6 @@ TEST(DualIsoPipeline, Processed8PrefetchIdleWaitWakesWhenWorkerPrepareFails)
 
     if ((fixture.width() % 4) != 0 || (fixture.height() % 4) != 0)
     {
-        processingSetPlaybackPreviewMode(0);
-        MLVAPP_TEST_UNSETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH");
         return;
     }
 
@@ -12625,9 +12661,6 @@ TEST(DualIsoPipeline, Processed8PrefetchIdleWaitWakesWhenWorkerPrepareFails)
     /* Woken by the prepare-failure broadcast, not by a slice running out:
      * deleting that broadcast leaves the waiter asleep for the whole slice. */
     ASSERT_EQ(0, slice_expiries);
-
-    processingSetPlaybackPreviewMode(0);
-    MLVAPP_TEST_UNSETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH");
 }
 
 /* PROCESSED8-IDLE-WAIT-PREDICATE-RECHECK-1 r2, broadcast pin for
@@ -12640,6 +12673,7 @@ TEST(DualIsoPipeline, Processed8PrefetchIdleWaitWakesWhenWorkerPrepareFails)
  * the reset broadcast can return the waiter before the budget runs out. */
 TEST(DualIsoPipeline, Processed8PrefetchIdleWaitWakesOnCancelClear)
 {
+    ScopedProcessed8PrefetchTestState process8_state;
     MLVAPP_TEST_SETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH", "1");
     processingSetPlaybackPreviewMode(1);
     processingSetPlaybackAggressivePreviewMode(0);
@@ -12653,8 +12687,6 @@ TEST(DualIsoPipeline, Processed8PrefetchIdleWaitWakesOnCancelClear)
 
     if ((fixture.width() % 4) != 0 || (fixture.height() % 4) != 0)
     {
-        processingSetPlaybackPreviewMode(0);
-        MLVAPP_TEST_UNSETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH");
         return;
     }
 
@@ -12712,9 +12744,6 @@ TEST(DualIsoPipeline, Processed8PrefetchIdleWaitWakesOnCancelClear)
     ASSERT_EQ(1, waiter_result);
     ASSERT_EQ(0, slice_expiries);
     ASSERT_TRUE(wake_ms < 1000.0);
-
-    processingSetPlaybackPreviewMode(0);
-    MLVAPP_TEST_UNSETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH");
 }
 
 /* PROCESSED8-IDLE-WAIT-PREDICATE-RECHECK-1 r2, broadcast pin for
@@ -12727,6 +12756,7 @@ TEST(DualIsoPipeline, Processed8PrefetchIdleWaitWakesOnCancelClear)
  * did not run. */
 TEST(DualIsoPipeline, Processed8PrefetchIdleWaitWakesWorkerOnRepeatRequest)
 {
+    ScopedProcessed8PrefetchTestState process8_state;
     MLVAPP_TEST_SETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH", "1");
     processingSetPlaybackPreviewMode(1);
     processingSetPlaybackAggressivePreviewMode(0);
@@ -12740,8 +12770,6 @@ TEST(DualIsoPipeline, Processed8PrefetchIdleWaitWakesWorkerOnRepeatRequest)
 
     if ((fixture.width() % 4) != 0 || (fixture.height() % 4) != 0)
     {
-        processingSetPlaybackPreviewMode(0);
-        MLVAPP_TEST_UNSETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH");
         return;
     }
 
@@ -12784,9 +12812,6 @@ TEST(DualIsoPipeline, Processed8PrefetchIdleWaitWakesWorkerOnRepeatRequest)
     ASSERT_EQ(1, waiter_result);
     ASSERT_EQ(0, pending_after);
     ASSERT_EQ(0, slice_expiries);
-
-    processingSetPlaybackPreviewMode(0);
-    MLVAPP_TEST_UNSETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH");
 }
 
 /* PROCESSED8-IDLE-WAIT-PREDICATE-RECHECK-1 r2, timeout branch (sol r1
@@ -12891,6 +12916,7 @@ TEST(DualIsoPipeline, Processed8PrefetchIdleWaitSilentClearReturnsOnSliceRecheck
  * incompatible lanes never consult the main cache). */
 TEST(DualIsoPipeline, Processed8PrefetchIndirectX2WorkerHitMatchesForegroundReference)
 {
+    ScopedProcessed8PrefetchTestState process8_state;
     MLVAPP_TEST_SETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH", "1");
     MLVAPP_TEST_UNSETENV("MLVAPP_PROCESSED8_PREFETCH_INDIRECT");
     MLVAPP_TEST_SETENV("MLVAPP_PREFETCH_INDIRECT_X2", "1");
@@ -12914,8 +12940,6 @@ TEST(DualIsoPipeline, Processed8PrefetchIndirectX2WorkerHitMatchesForegroundRefe
     if ((reference_fixture.width() % 4) != 0 || (reference_fixture.height() / 16) * 16 < 16)
     {
         std::printf("Processed8PrefetchIndirectX2: fixture not quarter-core compatible, guarded out\n");
-        processingSetPlaybackPreviewMode(0);
-        MLVAPP_TEST_UNSETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH");
         return;
     }
 
@@ -12973,14 +12997,11 @@ TEST(DualIsoPipeline, Processed8PrefetchIndirectX2WorkerHitMatchesForegroundRefe
                 static_cast<unsigned long long>(mismatched_bytes));
     ASSERT_TRUE(prefetched_hits >= 1);
     ASSERT_EQ(static_cast<std::uint64_t>(0), mismatched_bytes);
-
-    processingSetPlaybackPreviewMode(0);
-    MLVAPP_TEST_UNSETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH");
-    MLVAPP_TEST_UNSETENV("MLVAPP_PREFETCH_INDIRECT_X2");
 }
 
 TEST(DualIsoPipeline, Processed8PrefetchIndirectX2DefaultKeepsSkip)
 {
+    ScopedProcessed8PrefetchTestState process8_state;
     MLVAPP_TEST_SETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH", "1");
     MLVAPP_TEST_UNSETENV("MLVAPP_PROCESSED8_PREFETCH_INDIRECT");
     MLVAPP_TEST_UNSETENV("MLVAPP_PREFETCH_INDIRECT_X2");
@@ -12998,9 +13019,6 @@ TEST(DualIsoPipeline, Processed8PrefetchIndirectX2DefaultKeepsSkip)
 
     if ((fixture.width() % 4) != 0 || (fixture.height() / 16) * 16 < 16)
     {
-        processingSetPlaybackPreviewMode(0);
-        MLVAPP_TEST_UNSETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH");
-        MLVAPP_TEST_UNSETENV("MLVAPP_PREFETCH_INDIRECT_X2");
         return;
     }
 
@@ -13019,14 +13037,11 @@ TEST(DualIsoPipeline, Processed8PrefetchIndirectX2DefaultKeepsSkip)
     }
 
     ASSERT_EQ(0, prefetched_hits);
-
-    processingSetPlaybackPreviewMode(0);
-    MLVAPP_TEST_UNSETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH");
-    MLVAPP_TEST_UNSETENV("MLVAPP_PREFETCH_INDIRECT_X2");
 }
 
 TEST(DualIsoPipeline, Processed8PrefetchIndirectX2AggressiveKeepsSkip)
 {
+    ScopedProcessed8PrefetchTestState process8_state;
     MLVAPP_TEST_SETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH", "1");
     MLVAPP_TEST_UNSETENV("MLVAPP_PROCESSED8_PREFETCH_INDIRECT");
     /* Opted IN deliberately: aggressive must keep skipping even then. */
@@ -13045,9 +13060,6 @@ TEST(DualIsoPipeline, Processed8PrefetchIndirectX2AggressiveKeepsSkip)
 
     if ((fixture.width() % 4) != 0 || (fixture.height() / 16) * 16 < 16)
     {
-        processingSetPlaybackPreviewMode(0);
-        MLVAPP_TEST_UNSETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH");
-        MLVAPP_TEST_UNSETENV("MLVAPP_PREFETCH_INDIRECT_X2");
         return;
     }
 
@@ -13066,10 +13078,6 @@ TEST(DualIsoPipeline, Processed8PrefetchIndirectX2AggressiveKeepsSkip)
     }
 
     ASSERT_EQ(0, prefetched_hits);
-
-    processingSetPlaybackPreviewMode(0);
-    MLVAPP_TEST_UNSETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH");
-    MLVAPP_TEST_UNSETENV("MLVAPP_PREFETCH_INDIRECT_X2");
 }
 
 TEST(DualIsoPipeline, Phase4B_NonDualIsoScaleEightAggressiveSkipsProcessed8CacheBookkeeping)
