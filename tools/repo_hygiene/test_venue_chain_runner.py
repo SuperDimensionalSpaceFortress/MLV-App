@@ -60,6 +60,7 @@ if ($env:FAKE_QUIET_LOG) { Add-Content -LiteralPath $env:FAKE_QUIET_LOG -Value (
 switch ($mode) {
     'QUIET' { 'PROBE venue-quiet-probe-x bachelor samples=5.0/5.0/5.0 mean=5.0% state=QUIET'; "QUIET mean=5.0% threshold=$ThresholdPercent% waitedSec=1"; exit 0 }
     'COOLDOWN' { "COOLDOWN_UNMET mean=32.0% threshold=$ThresholdPercent% waitedSec=544"; exit 0 }
+    'FOREIGN' { 'FOREIGN_FLOOR owners=explorer:17204,textinputhost:23596,bloody7:21612 floorMean=32.0% waitedSec=180 probes=3'; "COOLDOWN_UNMET mean=32.0% threshold=$ThresholdPercent% waitedSec=180"; exit 0 }
     'UNKNOWN' { "VENUE_QUIET_UNKNOWN mean=UNKNOWN threshold=$ThresholdPercent% waitedSec=1 reason=probe-failed note=fake"; exit 6 }
     'NOVERDICT' { 'GATE quiet-probe bachelor queued=0 running=0'; exit 0 }
     'BUSY' { 'GATE_BUSY quiet-probe waitedSec=1'; exit 3 }
@@ -391,6 +392,20 @@ class VenueChainRunnerTests(unittest.TestCase):
         self.assertEqual(got, [("COOLDOWN_UNMET", 29.6, "COOLDOWN_UNMET"), ("QUIET", 20.2, "QUIET_PRELOAD_OK"), ("QUIET", 43.9, "QUIET_PRELOAD_HIGH")])
         ran = [l for l in self.chain_log(rd) if " RAN " in l]
         self.assertIn("verdict=COOLDOWN_UNMET quietMean=32.0 preLoadMean=29.6 class=COOLDOWN_UNMET", ran[0])
+
+    # BACHELOR-VENUE-FOREIGN-FLOOR-FAST-FAIL-1: Wait-VenueQuiet's FOREIGN_FLOOR early exit prints a typed line and then the same COOLDOWN_UNMET line; the chain must
+    # still classify the leg COOLDOWN_UNMET (contended, never counted), never QUIET_PRELOAD_* and never VENUE_QUIET_UNKNOWN.
+    def test_a_foreign_floor_early_exit_is_still_a_cooldown_unmet_leg(self) -> None:
+        rd = self.case / "lane-FF"
+        env = self.env(FAKE_QUIET_MODES="FOREIGN,FOREIGN,FOREIGN,FOREIGN,FOREIGN,FOREIGN", FAKE_LEG_PRELOADS="5.0,5.0,5.0")
+        r = self.run_chain(rd, self.specs, env=env)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        res = chain_result(r.stdout)
+        got = [(l["verdict"], l["quietMean"], l["class"]) for l in res["legs"]]
+        self.assertEqual(got, [("COOLDOWN_UNMET", 32.0, "COOLDOWN_UNMET")] * 3, "a low preLoad must not promote an early-exit leg to a counted class")
+        ran = [l for l in self.chain_log(rd) if " RAN " in l]
+        self.assertIn("verdict=COOLDOWN_UNMET quietMean=32.0 preLoadMean=5.0 class=COOLDOWN_UNMET", ran[0])
+        self.assertNotIn("VENUE_QUIET_UNKNOWN", r.stdout)
 
     # ---------------------------------------------------------------- r2: a leg that exits non-zero is never a successful leg
     def test_a_leg_that_exits_nonzero_is_leg_failed_invalid_never_ran(self) -> None:

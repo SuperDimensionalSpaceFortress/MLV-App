@@ -5974,6 +5974,169 @@ class VenueQuietValidSampleTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------------------------------
+# BACHELOR-VENUE-FOREIGN-FLOOR-FAST-FAIL-1: on Bachelor the busy floor is FOREIGN (explorer, TextInputHost, Bloody7, other projects' guardians and sessions; MLV-owned CPU was
+# about 1 point in the BACHELOR-UNGATED-PRIVILEGED-LOAD-2 sample), so a leg waited the whole -MaxWaitSec (1800 s) for a floor that never dropped and then ran as COOLDOWN_UNMET anyway.
+# Now N (-ForeignFloorProbes, default 3, 0 = off) consecutive MEASURED busy probes whose top owners are not MLV's, with no downward trend (newest mean not below the first of the N by
+# more than -ForeignFloorTrendMarginPoints, default 2.0), print `FOREIGN_FLOOR ...` and then the SAME `COOLDOWN_UNMET mean=` line and exit 0. It is never QUIET.
+# The probe is a stub um-run.ps1 that answers call k with line k (the last repeats) of UMSTUB_SEQ, so the live loop is driven by synthetic probes; nothing is submitted.
+STUB_UM_RUN_SEQUENCE = r"""param([string]$ScriptPath, [string]$JobId, [string]$AgentShare, [int]$TimeoutSec, [int]$MaxQueueWaitSec, [int]$MaxClaimedWaitSec)
+# test stub for tools\profiling\um-run.ps1: the n-th call (counted in UMSTUB_STATE) answers with line n of the UMSTUB_SEQ file verbatim, the last line repeating
+$lines = @(Get-Content -LiteralPath $env:UMSTUB_SEQ | Where-Object { $_ })
+$n = $(if (Test-Path -LiteralPath $env:UMSTUB_STATE) { [int](Get-Content -LiteralPath $env:UMSTUB_STATE) } else { 0 })
+Set-Content -LiteralPath $env:UMSTUB_STATE -Value ($n + 1)
+[pscustomobject]@{ exitCode = 0; stdout = 'VENUE_QUIET=' + $lines[[Math]::Min($n, $lines.Count - 1)] }
+"""
+FOREIGN_OWNERS = [("explorer", 17204, 3.66), ("textinputhost", 23596, 1.91), ("bloody7", 21612, 1.48), ("claude#4", 9120, 1.1), ("pwsh#3", 67876, 0.86)]
+
+
+def foreign_probe(mean, owners=FOREIGN_OWNERS, **extra) -> dict:
+    top = [{"instance": n, "pid": p, "percent": pc} for (n, p, pc) in owners]
+    return dict(V2_PROBE, samples=[mean, mean, mean], top_processes=top, **extra)
+
+
+@requires_windows_pwsh
+class VenueQuietForeignFloorTests(unittest.TestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory(prefix="venue-quiet-foreign-")
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+        self.tree = self.tmp / "tree"
+        self.dv = self.tree / "tools" / "profiling" / "dual-venue"
+        shutil.copytree(DV, self.dv, ignore=shutil.ignore_patterns("__pycache__"))
+        share = self.tmp / "share-bachelor"
+        (share / "inbox").mkdir(parents=True)
+        (share / "running").mkdir()
+        table = json.loads((self.dv / "venues.json").read_text(encoding="utf-8"))
+        table["venues"]["bachelor"]["agentShare"] = str(share)
+        table["venues"]["bachelor"]["agentRoot"] = str(share) + "-root"
+        (self.dv / "venues.json").write_text(json.dumps(table), encoding="utf-8")
+        (self.tree / "tools" / "profiling" / "um-run.ps1").write_text(STUB_UM_RUN_SEQUENCE, encoding="utf-8")
+        self.work = self.tmp / "work"
+
+    def gate(self, probes: list, max_wait: int = 8, *extra: str) -> subprocess.CompletedProcess:
+        import os
+        seq = self.tmp / "seq.jsonl"
+        seq.write_text("\n".join(json.dumps(p) for p in probes) + "\n", encoding="utf-8")
+        state = self.tmp / "state.txt"
+        state.unlink(missing_ok=True)
+        return subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(self.dv / "Wait-VenueQuiet.ps1"), "-Venue", "bachelor",
+                               "-WorkDir", str(self.work), "-MaxWaitSec", str(max_wait), "-RecheckSec", "1", *extra],
+                              capture_output=True, text=True, timeout=180, env=dict(os.environ, UMSTUB_SEQ=str(seq), UMSTUB_STATE=str(state)))
+
+    @staticmethod
+    def probe_lines(proc: subprocess.CompletedProcess) -> int:
+        return len(re.findall(r"(?m)^PROBE venue-quiet-probe-", proc.stdout))
+
+    def assert_waited_the_whole_cooldown(self, proc: subprocess.CompletedProcess, min_probes: int = 5) -> None:
+        text = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 0, text)
+        self.assertNotIn("FOREIGN_FLOOR", proc.stdout, text)
+        self.assertRegex(proc.stdout, r"(?m)^COOLDOWN_UNMET mean=")
+        self.assertGreaterEqual(self.probe_lines(proc), min_probes, text)
+
+    def test_three_flat_busy_probes_with_foreign_owners_exit_early_as_foreign_floor_then_cooldown_unmet(self) -> None:
+        proc = self.gate([foreign_probe(35.0)], 20)
+        out = proc.stdout
+        self.assertEqual(proc.returncode, 0, out + proc.stderr)
+        m = re.search(r"(?m)^FOREIGN_FLOOR owners=(\S+) floorMean=(\d+\.\d)% waitedSec=(\d+) probes=(\d+)$", out)
+        self.assertIsNotNone(m, out)
+        self.assertEqual(m.group(1), "explorer:17204,textinputhost:23596,bloody7:21612", "the top 3 owners, name:pid, in rank order; pwsh (the probe's own shell) is never an owner")
+        self.assertEqual(m.group(2), "35.0")
+        self.assertEqual(m.group(4), "3")
+        self.assertLessEqual(int(m.group(3)), 8, "the wait ends after probe 3, far below -MaxWaitSec 20")
+        self.assertEqual(self.probe_lines(proc), 3, out)
+        self.assertRegex(out, r"(?m)^COOLDOWN_UNMET mean=35\.0% threshold=20(\.0)?% waitedSec=\d+$", "the SAME verdict line callers parse today")
+        self.assertLess(out.index("FOREIGN_FLOOR"), out.index("COOLDOWN_UNMET mean="), "the typed line comes first, the verdict line stays the last word")
+        self.assertNotRegex(out, r"(?m)^QUIET ", "an early exit is never QUIET")
+        self.assertRegex(out, r"(?m)^  attr proc explorer pid=17204 ", "the attribution of the last probe still follows the verdict")
+
+    def test_a_falling_floor_keeps_waiting_as_today(self) -> None:
+        self.assert_waited_the_whole_cooldown(self.gate([foreign_probe(m) for m in (99, 92, 85, 78, 71, 64, 57, 50, 43, 36)]))
+
+    def test_an_mlv_owned_top_owner_keeps_waiting_as_today(self) -> None:
+        owners = [("explorer", 17204, 3.66), ("mlvapp#1", 4040, 3.0), ("textinputhost", 23596, 1.91), ("bloody7", 21612, 1.48)]
+        self.assert_waited_the_whole_cooldown(self.gate([foreign_probe(35.0, owners)]))
+
+    def test_the_agent_and_um_run_count_as_mlv_owned_too(self) -> None:
+        for name in ("mlv-agent", "ultra-magnus-agent", "um-run"):
+            with self.subTest(name=name):
+                owners = [(name, 4040, 3.0), ("explorer", 17204, 2.0), ("textinputhost", 23596, 1.9), ("bloody7", 21612, 1.4)]
+                self.assert_waited_the_whole_cooldown(self.gate([foreign_probe(35.0, owners)], 6), 4)
+
+    def test_an_mlv_row_below_the_top_three_foreign_owners_does_not_block(self) -> None:
+        owners = [("explorer", 17204, 3.66), ("textinputhost", 23596, 1.91), ("bloody7", 21612, 1.48), ("mlvapp", 4040, 0.2)]
+        proc = self.gate([foreign_probe(35.0, owners)], 20)
+        self.assertIn("FOREIGN_FLOOR owners=explorer:17204,textinputhost:23596,bloody7:21612 ", proc.stdout)
+
+    def test_a_quiet_probe_is_quiet_and_never_a_foreign_floor(self) -> None:
+        proc = self.gate([foreign_probe(5.0)])
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertRegex(proc.stdout, r"(?m)^QUIET mean=5\.0% ")
+        self.assertNotIn("FOREIGN_FLOOR", proc.stdout)
+        self.assertNotIn("COOLDOWN_UNMET", proc.stdout)
+        proc = self.gate([foreign_probe(35.0), foreign_probe(35.0), foreign_probe(5.0)])
+        self.assertRegex(proc.stdout, r"(?m)^QUIET mean=5\.0% ")
+        self.assertNotIn("FOREIGN_FLOOR", proc.stdout, "two busy probes are below the default three")
+
+    def test_foreign_floor_probes_zero_is_the_old_behaviour(self) -> None:
+        self.assert_waited_the_whole_cooldown(self.gate([foreign_probe(35.0)], 8, "-ForeignFloorProbes", "0"))
+
+    def test_a_larger_probe_count_waits_for_that_many(self) -> None:
+        proc = self.gate([foreign_probe(35.0)], 20, "-ForeignFloorProbes", "5")
+        self.assertRegex(proc.stdout, r"(?m)^FOREIGN_FLOOR owners=\S+ floorMean=35\.0% waitedSec=\d+ probes=5$")
+        self.assertEqual(self.probe_lines(proc), 5, proc.stdout)
+
+    def test_an_unreadable_probe_is_still_exit_six_and_never_a_foreign_floor(self) -> None:
+        unreadable = dict(foreign_probe(35.0), samples=[35.0, None, 35.0])
+        proc = self.gate([unreadable])
+        self.assertEqual(proc.returncode, 6, proc.stdout + proc.stderr)
+        self.assertRegex(proc.stdout, r"(?m)^VENUE_QUIET_UNKNOWN mean=UNKNOWN threshold=")
+        self.assertNotIn("FOREIGN_FLOOR", proc.stdout)
+        # busy, busy, then unreadable for the rest: the FINAL decision is UNKNOWN, so exit 6 and no early exit
+        proc = self.gate([foreign_probe(35.0), foreign_probe(35.0), unreadable], 6)
+        self.assertEqual(proc.returncode, 6, proc.stdout + proc.stderr)
+        self.assertNotIn("FOREIGN_FLOOR", proc.stdout)
+
+    def test_an_unreadable_probe_resets_the_consecutive_count(self) -> None:
+        unreadable = dict(foreign_probe(35.0), samples=[35.0, None, 35.0])
+        proc = self.gate([foreign_probe(35.0), foreign_probe(35.0), unreadable, foreign_probe(35.0)], 20)
+        self.assertRegex(proc.stdout, r"FOREIGN_FLOOR .* probes=3")
+        self.assertEqual(self.probe_lines(proc), 6, "busy x2, unknown, then busy x3 consecutive: fires on probe 6, not probe 3")
+
+    def test_a_v1_probe_that_names_no_owner_keeps_waiting(self) -> None:
+        self.assert_waited_the_whole_cooldown(self.gate([dict(V1_PROBE, samples=[35.0, 35.0, 35.0])]))
+        self.assert_waited_the_whole_cooldown(self.gate([foreign_probe(35.0, [])]))
+        self.assert_waited_the_whole_cooldown(self.gate([foreign_probe(35.0, [("pwsh", 1, 2.0), ("powershell#2", 2, 1.0)])]))
+
+    def test_the_trend_margin_is_exact(self) -> None:
+        # 50 -> 48.0: a drop of exactly 2.0 is NOT more than the margin, so probe 3 fires
+        proc = self.gate([foreign_probe(50.0), foreign_probe(49.0), foreign_probe(48.0)], 20)
+        self.assertEqual(self.probe_lines(proc), 3, proc.stdout)
+        self.assertIn("FOREIGN_FLOOR ", proc.stdout)
+        # 50 -> 47.9: a drop of 2.1 is a downward trend; the window slides and fires on probe 4 (48.5, 47.9, 47.9)
+        proc = self.gate([foreign_probe(50.0), foreign_probe(48.5), foreign_probe(47.9)], 20)
+        self.assertEqual(self.probe_lines(proc), 4, proc.stdout)
+        self.assertIn("FOREIGN_FLOOR ", proc.stdout)
+        # a rising floor is not falling
+        proc = self.gate([foreign_probe(30.0), foreign_probe(40.0), foreign_probe(50.0)], 20)
+        self.assertEqual(self.probe_lines(proc), 3, proc.stdout)
+
+    def test_a_wider_margin_parameter_is_honoured(self) -> None:
+        proc = self.gate([foreign_probe(50.0), foreign_probe(48.5), foreign_probe(47.9)], 20, "-ForeignFloorTrendMarginPoints", "5")
+        self.assertEqual(self.probe_lines(proc), 3, proc.stdout)
+
+    def test_the_header_documents_the_foreign_floor_line_the_parameters_and_the_unchanged_exit_codes(self) -> None:
+        text = (DV / "Wait-VenueQuiet.ps1").read_text(encoding="utf-8")
+        header = text.split("[CmdletBinding", 1)[0]
+        for needle in ("FOREIGN_FLOOR owners=<name:pid", "floorMean=", "-ForeignFloorProbes", "-ForeignFloorTrendMarginPoints", "never QUIET", "COOLDOWN_UNMET"):
+            self.assertIn(needle, header)
+        code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+        self.assertEqual(len(re.findall(r"\bexit 6\b", code)), 1, "exit 6 stays reserved for the UNKNOWN verdict")
+        self.assertEqual(len(re.findall(r"\bexit 0\b", code)), 2, "offline decision + the one verdict exit: the early exit adds no exit of its own")
+        self.assertNotRegex(code, r"(?m)^\s*Write-Gate \"QUIET", "no QUIET line outside the verdict")
+
+
+# ---------------------------------------------------------------------------------------------------
 class LegSpecSchemaTests(unittest.TestCase):
     def setUp(self) -> None:
         try:
