@@ -70,6 +70,17 @@ def judge_claim_wait(claim_lo: float, claim_hi: float, verdict_time: float, time
     return CLAIM_WAIT_PASS
 
 
+def skip_if_claim_wait_inconclusive(test: unittest.TestCase, claim_lo: float, claim_hi: float,
+                                    verdict_time: float, timeout_sec: float, timing_facts: str) -> None:
+    """The live wait test's last step, extracted so a committed test can drive it without a UM client
+    (UMRUN-CLAIM-WINDOW-ORACLE-BOUNDARY-PINS-1): an INCONCLUSIVE verdict skips, anything else returns."""
+    if judge_claim_wait(claim_lo, claim_hi, verdict_time, timeout_sec) == CLAIM_WAIT_INCONCLUSIVE:
+        test.skipTest(
+            "INCONCLUSIVE: the claim window (claim_lo -> claim_hi) was wide enough that a stall "
+            "inside it cannot be told from an hour-back client; every other check passed "
+            f"[{timing_facts}]")
+
+
 @unittest.skipIf(PWSH is None, "pwsh is not on PATH")
 @unittest.skipUnless(os.name == "nt", "um-run.ps1 targets Windows agent shares")
 class _Share(unittest.TestCase):
@@ -1473,11 +1484,7 @@ class UmRunEndToEndTests(_Share):
         self.assertIn("UNRESOLVED:", combined, combined)
         self.assertIn("stopped proving liveness", combined, combined)
         self.assertIn("its own started marker is gone too", combined, combined)
-        if judge_claim_wait(claim_lo, claim_hi, verdict_time, timeout_sec) == CLAIM_WAIT_INCONCLUSIVE:
-            self.skipTest(
-                "INCONCLUSIVE: the claim window (claim_lo -> claim_hi) was wide enough that a stall "
-                "inside it cannot be told from an hour-back client; every other check passed "
-                f"[{timing_facts}]")
+        skip_if_claim_wait_inconclusive(self, claim_lo, claim_hi, verdict_time, timeout_sec, timing_facts)
 
     # ---- round 11 (sol BLOCKER, item 2): RETRACT at the queue deadline instead of leaving the job
     # ---- in the inbox for the agent to claim after this client has already given up ------------
@@ -2216,6 +2223,91 @@ class UmRunClaimWaitOracleTests(unittest.TestCase):
     def test_a_verdict_inside_the_budget_fails_whatever_the_bracket_width(self) -> None:
         self.assertEqual(self.judge(0.0, 8.0, 7.0), CLAIM_WAIT_FAIL)
         self.assertEqual(self.judge(0.0, 0.005, 7.0), CLAIM_WAIT_FAIL)
+
+    # UMRUN-CLAIM-WINDOW-ORACLE-BOUNDARY-PINS-1 (Dot 89837a67 on #555 6a8c3b35, items 1+2): the cases
+    # above sit NEAR the two T-minus-slack boundaries; these sit EXACTLY on them and one step either
+    # side, to pin the two strict `<` comparisons in judge_claim_wait(). T = 8 and slack = 0.5, so
+    # both boundaries are 7.5. Every stamp below (0.0, 0.5, 7.5, 8.0, 7.5 -/+ 1/64) is a dyadic
+    # rational, exact in binary floating point, so each "exactly on the boundary" subtraction really
+    # is equal to 7.5 rather than off by a rounding error.
+    _STEP = 1 / 64
+
+    def test_a_verdict_exactly_t_minus_slack_after_claim_lo_is_not_failed(self) -> None:
+        # verdict - claim_lo == 7.5 == T - slack: strict `<` is False, so not FAIL. claim_hi == claim_lo
+        # keeps the second comparison at 7.5 < 7.5, also False, so the outcome is PASS.
+        self.assertEqual(self.judge(0.0, 0.0, 7.5), CLAIM_WAIT_PASS)
+
+    def test_a_verdict_one_step_short_of_t_minus_slack_after_claim_lo_fails(self) -> None:
+        self.assertEqual(self.judge(0.0, 0.0, 7.5 - self._STEP), CLAIM_WAIT_FAIL)
+
+    def test_a_verdict_exactly_t_minus_slack_after_claim_hi_is_conclusive_not_inconclusive(self) -> None:
+        # verdict - claim_hi == 7.5 == T - slack: strict `<` is False, so not INCONCLUSIVE. The first
+        # comparison is 8.0 - 0.0 = 8.0 >= 7.5, so it does not fail either: PASS.
+        self.assertEqual(self.judge(0.0, 0.5, 8.0), CLAIM_WAIT_PASS)
+
+    def test_a_verdict_one_step_short_of_t_minus_slack_after_claim_hi_is_inconclusive(self) -> None:
+        self.assertEqual(self.judge(0.0, 0.5 + self._STEP, 8.0), CLAIM_WAIT_INCONCLUSIVE)
+
+    def test_both_boundaries_hold_when_they_coincide_at_a_shared_stamp_offset(self) -> None:
+        # claim_lo == claim_hi == 1.0 and verdict 8.5: both differences are exactly 7.5.
+        self.assertEqual(self.judge(1.0, 1.0, 8.5), CLAIM_WAIT_PASS)
+
+    def test_the_slack_is_subtracted_from_the_budget_not_ignored(self) -> None:
+        # With no slack the first bound would be 8.0 and a verdict at 7.5 would FAIL; the half
+        # second is what makes it a PASS. Passing slack=0.0 explicitly shows the contrast.
+        self.assertEqual(judge_claim_wait(0.0, 0.0, 7.5, self.T), CLAIM_WAIT_PASS)
+        self.assertEqual(judge_claim_wait(0.0, 0.0, 7.5, self.T, slack=0.0), CLAIM_WAIT_FAIL)
+
+
+class UmRunClaimWaitSkipWiringTests(unittest.TestCase):
+    """UMRUN-CLAIM-WINDOW-ORACLE-BOUNDARY-PINS-1 (Dot 89837a67 on #555, item 2): an INCONCLUSIVE
+    claim-window verdict must reach skipTest in the live wait test, which had only been exercised in
+    review. skip_if_claim_wait_inconclusive() is the seam the live test now calls as its last step."""
+
+    T = 8
+    FACTS = "decided_after=9.000s timeout_sec=8"
+
+    @staticmethod
+    def _run(claim_lo: float, claim_hi: float, verdict_time: float) -> unittest.TestResult:
+        class _Probe(unittest.TestCase):
+            def runTest(self) -> None:
+                skip_if_claim_wait_inconclusive(
+                    self, claim_lo, claim_hi, verdict_time, UmRunClaimWaitSkipWiringTests.T,
+                    UmRunClaimWaitSkipWiringTests.FACTS)
+
+        result = unittest.TestResult()
+        _Probe().run(result)
+        return result
+
+    def test_an_inconclusive_stamp_pattern_is_recorded_as_a_skip_with_the_inconclusive_reason(self) -> None:
+        # Dot's masking case: judge_claim_wait() rules (0.0, 8.0, 9.0) INCONCLUSIVE.
+        self.assertEqual(judge_claim_wait(0.0, 8.0, 9.0, self.T), CLAIM_WAIT_INCONCLUSIVE)
+        result = self._run(0.0, 8.0, 9.0)
+        self.assertEqual(len(result.skipped), 1, result.skipped)
+        self.assertEqual((result.errors, result.failures), ([], []))
+        reason = result.skipped[0][1]
+        self.assertTrue(reason.startswith("INCONCLUSIVE:"), reason)
+        self.assertTrue(reason.endswith(f"[{self.FACTS}]"), reason)
+
+    def test_a_pass_stamp_pattern_does_not_skip(self) -> None:
+        self.assertEqual(judge_claim_wait(0.0, 0.005, 8.2, self.T), CLAIM_WAIT_PASS)
+        result = self._run(0.0, 0.005, 8.2)
+        self.assertEqual((result.skipped, result.errors, result.failures), ([], [], []))
+        self.assertEqual(result.testsRun, 1)
+
+    def test_a_fail_stamp_pattern_does_not_skip(self) -> None:
+        # The FAIL branch is asserted by the live test's own assertGreaterEqual before this step; the
+        # seam must not turn it into a skip either.
+        self.assertEqual(judge_claim_wait(0.0, 0.005, 1.1, self.T), CLAIM_WAIT_FAIL)
+        result = self._run(0.0, 0.005, 1.1)
+        self.assertEqual((result.skipped, result.errors, result.failures), ([], [], []))
+
+    def test_the_live_wait_test_ends_by_calling_the_seam(self) -> None:
+        import inspect
+        source = inspect.getsource(UmRunEndToEndTests)
+        calls = source.count(
+            "skip_if_claim_wait_inconclusive(self, claim_lo, claim_hi, verdict_time, timeout_sec, timing_facts)")
+        self.assertEqual(calls, 1, "the live wait test no longer routes its INCONCLUSIVE verdict through the seam")
 
 
 def _git(args: list[str], cwd: Path) -> None:
