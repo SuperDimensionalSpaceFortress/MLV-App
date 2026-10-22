@@ -420,6 +420,30 @@ class VenueChainRunnerTests(unittest.TestCase):
         self.assertIn("verdict=QUIET quietMean=5.0 preLoadMean=5.0 class=COOLDOWN_UNMET", ran[0])
         self.assertIn("preClaimForeignFloor=1", ran[0])
 
+    # r4 (Sol r3 blocker): the FOREIGN_FLOOR marker is sticky across a GATE_BUSY retry of the SAME leg. Probe order: attempt 1 pre-claim FOREIGN, under-claim BUSY (claim
+    # released, leg retried); attempt 2 pre-claim QUIET, under-claim QUIET with a low preLoad. The leg stays contended; the next leg starts clean.
+    def test_a_foreign_floor_survives_a_gate_busy_retry_of_the_same_leg_and_does_not_leak_to_the_next_leg(self) -> None:
+        rd = self.case / "lane-FFB"
+        env = self.env(FAKE_QUIET_MODES="FOREIGN,BUSY,QUIET,QUIET,QUIET,QUIET", FAKE_LEG_PRELOADS="5.0,5.0")
+        r = self.run_chain(rd, self.specs[:2], env=env)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        res = chain_result(r.stdout)
+        got = [(l["verdict"], bool(l.get("preClaimForeignFloor")), l["class"]) for l in res["legs"]]
+        self.assertEqual(got, [("QUIET", True, "COOLDOWN_UNMET"), ("QUIET", False, "QUIET_PRELOAD_OK")], "a FOREIGN_FLOOR seen on an attempt that ended GATE_BUSY must keep that leg (and only that leg) contended")
+        ran = [l for l in self.chain_log(rd) if " RAN " in l]
+        self.assertIn("class=COOLDOWN_UNMET", ran[0])
+        self.assertIn("preClaimForeignFloor=1", ran[0])
+        self.assertIn("class=QUIET_PRELOAD_OK", ran[1])
+        self.assertNotIn("ForeignFloor=1", ran[1])
+
+    def test_a_gate_busy_retry_that_never_saw_a_foreign_floor_is_still_a_counted_leg(self) -> None:
+        rd = self.case / "lane-QBQ"
+        env = self.env(FAKE_QUIET_MODES="QUIET,BUSY,QUIET,QUIET", FAKE_LEG_PRELOADS="5.0")
+        r = self.run_chain(rd, self.specs[:1], env=env)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        res = chain_result(r.stdout)
+        self.assertEqual([(bool(l.get("preClaimForeignFloor")), l["class"]) for l in res["legs"]], [(False, "QUIET_PRELOAD_OK")])
+
     def test_a_quiet_pre_claim_and_quiet_under_claim_probe_is_still_a_counted_leg(self) -> None:
         rd = self.case / "lane-QQ"
         env = self.env(FAKE_QUIET_MODES="QUIET,QUIET,QUIET,QUIET,QUIET,QUIET", FAKE_LEG_PRELOADS="5.0,5.0,5.0")
