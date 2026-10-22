@@ -8,7 +8,7 @@ Never runs a git write or generates commands that mutate a checkout or relaunch
 a provider. Receipts without an explicit full sessionId cannot establish lane
 ownership and are omitted. Process completion is not delivery acceptance.
 Owned dirt = files dirty now that were not dirty at SessionStart."""
-import json, os, shutil, subprocess, sys, time
+import fnmatch, json, os, shutil, subprocess, sys, time
 from pathlib import Path
 
 RUNBOOK_CANDIDATES = ["docs/ops/ROTATION.md", "knowledge/ROTATION.md",
@@ -46,6 +46,38 @@ def worktree_scan(repo):
     return out
 
 
+# A lane's receipt for THIS session is written while the session is alive, so a run dir untouched
+# for days cannot hold in-flight work for it. Skipping those keeps a turn end from listing every
+# run dir and parsing every receipt (2026-10-22: ~4,700 opens and ~100k entries per turn).
+RECEIPT_WINDOW_SECONDS = 72 * 3600
+
+
+def recent_receipts(fleet_runs):
+    """Receipt files at depth 0 or 1 of fleet-runs whose run dir and file were touched in the window."""
+    cutoff = time.time() - RECEIPT_WINDOW_SECONDS
+    found = []
+
+    def collect(directory, recurse):
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    try:
+                        if entry.stat().st_mtime < cutoff:
+                            continue
+                        if entry.is_dir():
+                            if recurse:
+                                collect(entry.path, False)
+                        elif fnmatch.fnmatch(entry.name, "*-*.receipt.json"):
+                            found.append(Path(entry.path))
+                    except OSError:
+                        continue
+        except OSError:
+            pass
+
+    collect(fleet_runs, True)
+    return found
+
+
 def scan_fleet_runs(repo, session_id):
     """Read pointers only from receipts naming this exact, nonempty session."""
     fleet_runs = repo / ".claude-state" / "fleet-runs"
@@ -54,7 +86,7 @@ def scan_fleet_runs(repo, session_id):
 
     # Receipts sit at depth 0 or 1 only. 2026-10-20: rglob walked the ~95 full
     # repo copies under hub-tools and pinned the host (93% CPU, ~100k file ops/s).
-    receipts = [*fleet_runs.glob("*-*.receipt.json"), *fleet_runs.glob("*/*-*.receipt.json")]
+    receipts = recent_receipts(fleet_runs)
 
     # Look for receipts from this session
     for receipt_file in sorted(receipts, reverse=True):

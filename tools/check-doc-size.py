@@ -119,6 +119,11 @@ EXEMPT = [
     ".claude/worktrees/**",
     ".claude-state/worktrees/**",
     ".claude-state/closeout/repo-sweep/integration-probes/**",
+    # Frozen lane run evidence (receipts, outputs, and the full repo copies a lane stages).
+    # HOST-FILE-CHURN-POOL-GROWTH-1: 75k markdown files / ~614k directory touches per
+    # Stop-hook run on the board, 45 findings on files nobody may split. Same reason as
+    # profiling above; the live coordination ledgers elsewhere under .claude-state stay hub-tier.
+    ".claude-state/fleet-runs/**",
     # Generated artifacts: regenerate rather than edit.
     ".claude-state/commit-message-rewrite/**",
     # Packaged brief corpora: frozen inputs to an external consumer.
@@ -196,6 +201,16 @@ def tracked_markdown(repo: Path) -> list[str]:
     return [p for p in proc.stdout.split("\0") if p]
 
 
+def dir_is_exempt(rel_dir: str) -> bool:
+    """True when every file under this directory is exempt, so the walk need not open it.
+
+    Only EXEMPT patterns ending in `/**` can prove that for a whole directory; a file pattern
+    such as `**/*.bak` says nothing about a directory that merely has that name.
+    """
+    probe = rel_dir.rstrip("/") + "/x"
+    return any(p.endswith("/**") and _match(probe, p) for p in EXEMPT)
+
+
 def untracked_markdown(repo: Path) -> list[str]:
     out: list[str] = []
     for root in EXTRA_ROOTS:
@@ -203,11 +218,16 @@ def untracked_markdown(repo: Path) -> list[str]:
         if not base.is_dir():
             continue
         for dirpath, dirnames, filenames in os.walk(base):
-            dirnames[:] = [d for d in dirnames if d not in WALK_SKIP]
+            # Prune before descending: classify() would drop these later, but only after every
+            # directory in them had been opened (HOST-FILE-CHURN-POOL-GROWTH-1).
+            here = Path(dirpath).relative_to(repo)
+            dirnames[:] = [
+                d for d in dirnames
+                if d not in WALK_SKIP and not dir_is_exempt((here / d).as_posix())
+            ]
             for name in filenames:
                 if name.endswith(".md"):
-                    rel = (Path(dirpath) / name).relative_to(repo)
-                    out.append(rel.as_posix())
+                    out.append((here / name).as_posix())
     return out
 
 
