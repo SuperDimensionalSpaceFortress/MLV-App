@@ -139,5 +139,10 @@ try {
     }
     if ($stream) { $stream.Dispose() }
     $record.endTimeUtc = (Get-Date).ToUniversalTime().ToString('o')
-    Add-Content -LiteralPath $coordination -Value ($record | ConvertTo-Json -Compress) -Encoding UTF8
+    # LEDGER-APPEND-ATOMIC-BUILD-LOGS-1: pwsh 7 Add-Content (FileMode.Append) loses lines under concurrent writers
+    # (~14 % across 6 writers). FILE_APPEND_DATA only makes the OS append at the current end of file atomically.
+    # Same bytes as before: the JSON line, then the platform newline, UTF-8 without a BOM.
+    $ownershipBytes = [System.Text.UTF8Encoding]::new($false).GetBytes(($record | ConvertTo-Json -Compress) + [Environment]::NewLine)
+    $ownershipLog = [System.IO.FileSystemAclExtensions]::Create([System.IO.FileInfo]::new($coordination), [System.IO.FileMode]::OpenOrCreate, [System.Security.AccessControl.FileSystemRights]::AppendData, ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete), 4096, [System.IO.FileOptions]::None, $null)
+    try { $ownershipLog.Write($ownershipBytes, 0, $ownershipBytes.Length); $ownershipLog.Flush() } finally { $ownershipLog.Dispose() }
 }
