@@ -1753,7 +1753,7 @@ def test_runner_finalizes_after_child_exit_when_a_descendant_holds_the_output_pi
 
 def test_runner_reports_no_output_drain_timeout_when_the_pipes_close_normally(fixture_tree):
     cmd,env,receipt=prepare(fixture_tree,"normal")
-    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=30)
+    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=LANE_RUN_TIMEOUT_SEC)
     assert r.returncode==0,(r.stdout,r.stderr)
     q=json.loads(receipt.read_text(encoding="utf-8"))
     assert q["state"]=="complete" and q["outputDrainTimedOut"] is False
