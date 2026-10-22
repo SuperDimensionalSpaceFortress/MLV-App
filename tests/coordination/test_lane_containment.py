@@ -239,6 +239,14 @@ if($env:MLV_FIXTURE_MODE -ne 'normal'){
 $text=[Console]::In.ReadToEnd()
 $text|Set-Content -Encoding utf8NoBOM $env:MLV_FIXTURE_PROMPT
 if($env:MLV_FIXTURE_MODE -ne 'normal'){Start-Sleep -Seconds 60}
+# LANE-RUNNER-IDLE-AFTER-CHILD-EXIT-1: MLV_FIXTURE_HOLD_PIPE_SECONDS (test-only, unset = no-op) leaves a
+# descendant that inherited this child's redirected stdout/stderr alive for that long AFTER this process exits.
+if($env:MLV_FIXTURE_HOLD_PIPE_SECONDS){
+  $hp=[System.Diagnostics.ProcessStartInfo]::new([Environment]::ProcessPath); $hp.UseShellExecute=$false
+  foreach($x in @('-NoProfile','-NonInteractive','-Command',"Set-Content -LiteralPath '$env:MLV_FIXTURE_HOLD_PID' -Value `$PID; Start-Sleep -Seconds $env:MLV_FIXTURE_HOLD_PIPE_SECONDS")){[void]$hp.ArgumentList.Add($x)}
+  [void][System.Diagnostics.Process]::Start($hp)
+  $end=(Get-Date).AddSeconds(30); while(-not (Test-Path -LiteralPath $env:MLV_FIXTURE_HOLD_PID) -and (Get-Date) -lt $end){Start-Sleep -Milliseconds 100}
+}
 # LANE-MODEL-CURRENCY-1: lets a test substitute the child's own JSON result (e.g. to add a
 # modelUsage block) without touching the fixed default every other test still relies on.
 if($env:MLV_FIXTURE_RESULT_JSON){
@@ -1690,6 +1698,65 @@ def test_codex_read_only_lane_refuses_launch_when_mcp_list_output_exceeds_the_ca
     assert q["state"]=="failed"
     assert "codex-mcp-list-unreadable: 'codex mcp list --json' stdout exceeded the 1048576 character cap" in (q["failure"] or ""), q["failure"]
     assert not (fixture_tree["root"]/"args.json").exists(), "the codex exec lane must never start"
+
+
+# LANE-RUNNER-IDLE-AFTER-CHILD-EXIT-1: a runner must finalize its receipt a bounded time after its DIRECT child
+# exits, even when a descendant that inherited the child's redirected stdout/stderr outlives it (a parameterless
+# Process.WaitForExit() and a bare ReadToEndAsync().Result both wait for pipe EOF, not for the process). Measured
+# 2026-10-22: KEY-JSON-SUBJECT-SHA-VERBATIM-1 r1's runner sat state=running ~20 min after its claude child exited.
+# The fixture child exits 0 at once with a valid result while a descendant holds the pipes for HOLD seconds; the
+# drain grace is shortened by mutation (the anchor is optional so the pre-fix launcher can be run unchanged for RED).
+HOLD_PIPE_SEC = 90
+OUTPUT_DRAIN_GRACE_MS = 3000
+HELD_PIPE_BOUND_SEC = 45   # launcher wall bound: cold pwsh starts + the 3 s grace, far below HOLD_PIPE_SEC
+
+
+def _shorten_output_drain_grace(text):
+    anchor = "$OUTPUT_DRAIN_GRACE_MS = 10000"
+    return text.replace(anchor, f"$OUTPUT_DRAIN_GRACE_MS = {OUTPUT_DRAIN_GRACE_MS}") if anchor in text else text
+
+
+def _run_with_held_pipe(fixture_tree, lane):
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane=lane,mutation=_shorten_output_drain_grace)
+    cmd[cmd.index("-TimeoutSec")+1]="120"   # the lane's own deadline must not be what ends the run
+    hold_pid=fixture_tree["root"]/"hold.pid"
+    env["MLV_FIXTURE_HOLD_PIPE_SECONDS"]=str(HOLD_PIPE_SEC); env["MLV_FIXTURE_HOLD_PID"]=str(hold_pid)
+    out=fixture_tree["root"]/"launcher.out.txt"   # files, not pipes: the descendant may inherit the launcher's handles
+    started=time.monotonic(); hung=False
+    try:
+        with open(out,"wb") as f:
+            try:
+                r=subprocess.run(cmd,env=env,stdout=f,stderr=subprocess.STDOUT,timeout=HELD_PIPE_BOUND_SEC)
+            except subprocess.TimeoutExpired:
+                hung=True; r=None
+    finally:
+        if hold_pid.exists():
+            subprocess.run(["taskkill","/F","/T","/PID",hold_pid.read_text(encoding="utf-8-sig").strip()],capture_output=True,check=False)
+    return r,hung,time.monotonic()-started,receipt,out
+
+
+@pytest.mark.parametrize("lane", ["sonnet", "sol"], ids=["claude-contained-host", "codex-direct"])
+def test_runner_finalizes_after_child_exit_when_a_descendant_holds_the_output_pipes(fixture_tree, lane):
+    r,hung,elapsed,receipt,out=_run_with_held_pipe(fixture_tree, lane)
+    assert not hung, f"runner still alive {HELD_PIPE_BOUND_SEC}s after its child exited (a descendant held the pipes {HOLD_PIPE_SEC}s)"
+    assert r.returncode==0,out.read_text(encoding="utf-8",errors="replace")
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert q["state"]=="complete" and q["complete"] and q["exitCode"]==0 and not q["timedOut"], q["state"]
+    assert q["outputDrainTimedOut"] is True
+    assert q["outputDrain"]["graceMs"]==OUTPUT_DRAIN_GRACE_MS
+    if lane=="sonnet": assert q["outputDrain"]["hostReportedTimeout"] is True   # the contained host bounded its own drain of the child's pipes
+    # what was read before the pipes were abandoned is kept, not dropped
+    assert "fixture-result" in (Path(q["stdoutPath"]).read_text(encoding="utf-8"))
+    assert q["outputBytes"]>0
+    assert elapsed<HELD_PIPE_BOUND_SEC
+
+
+def test_runner_reports_no_output_drain_timeout_when_the_pipes_close_normally(fixture_tree):
+    cmd,env,receipt=prepare(fixture_tree,"normal")
+    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=LANE_RUN_TIMEOUT_SEC)
+    assert r.returncode==0,(r.stdout,r.stderr)
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert q["state"]=="complete" and q["outputDrainTimedOut"] is False
 
 
 # CODEX-KEY-PRIVATE-PIN-1: a read-only codex lane runs the private install named by the tracked
