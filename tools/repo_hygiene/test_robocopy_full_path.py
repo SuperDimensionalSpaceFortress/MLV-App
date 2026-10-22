@@ -228,6 +228,8 @@ def scan_python(text: str) -> list[tuple[int, str]]:
 
 
 def scan_text(relpath: str, text: str) -> list[tuple[int, str]]:
+    if "robocopy" not in text.lower():  # every pattern needs the literal; skips the per-character masking for nearly every file
+        return []
     suffix = Path(relpath).suffix.lower()
     if suffix in (".ps1", ".psm1"):
         return scan_powershell(text)
