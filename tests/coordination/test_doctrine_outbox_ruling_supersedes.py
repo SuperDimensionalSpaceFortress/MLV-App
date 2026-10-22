@@ -1220,3 +1220,43 @@ def test_nlf_a_promisor_bus_that_holds_every_object_answers_as_a_full_clone_does
     assert rc == 0 and err == "", err
     rc, err = validate(tmp_path, candidate("touches/supersedes: R99, tools/nope.mjs\n"), bus, capsys)
     assert rc == 1 and "RULING_CANDIDATE_TARGET_NOT_ON_BUS" in err and "'R99'" in err and "'tools/nope.mjs'" in err, err
+
+
+# ---------- ROUTE-RULING-CITATION-STATUS-WORD-COLON-1 + ROUTE-RULING-CITATION-SELF-PATH-STATUS-1: what a citation is NOT ----------
+# A citation is a statement ABOUT another candidate. (a) A status word that opens a colon (`... is: every lane must X`) states a
+# rule, so it is a marker. (b) An item cannot cite itself: its own candidate path (its outbox file `YYYYMMDD-<slug>.md` files as
+# `ruling-candidates/<slug>[-rN].md`) followed by a status word is the item proposing itself, so it is a marker too. A DIFFERENT
+# candidate's path with a status word and no colon stays a citation.
+
+COLON_STATUS_LINES = [
+    "- Ruling candidate `ruling-candidates/x.md` is: every lane must X",
+    "Ruling candidate ruling-candidates/x.md remains: the hook is deny-only",
+    "- Ruling candidate `ruling-candidates/x.md` **is**: every lane must X",
+]
+SELF_PATH_STATUS_LINES = [
+    "- Ruling candidate `ruling-candidates/foo.md` is every lane's rule",
+    "Ruling candidate ruling-candidates/foo-r1.md remains PROPOSED",
+]
+
+
+def _validate_named(tmp_path: Path, text: str, name: str, capsys) -> tuple[int, str]:
+    rc = call_validate([write_item(tmp_path, text, name=name)], tmp_path / "no-such-clone")
+    return rc, capsys.readouterr().err
+
+
+@pytest.mark.parametrize("line", COLON_STATUS_LINES)
+def test_a_status_word_followed_by_a_colon_is_a_ruling_not_a_citation(tmp_path, capsys, line):
+    rc, err = _validate_named(tmp_path, _receipt(f"{NEUTRAL_HEADING}\n\n{line}\n"), "20261022-foo.md", capsys)
+    assert rc == 1 and "RULING_CANDIDATE_NO_SUPERSEDES" in err, (line, err)
+
+
+@pytest.mark.parametrize("line", SELF_PATH_STATUS_LINES)
+def test_an_items_own_candidate_path_followed_by_a_status_word_is_a_marker(tmp_path, capsys, line):
+    rc, err = _validate_named(tmp_path, _receipt(f"{NEUTRAL_HEADING}\n\n{line}\n"), "20261022-foo.md", capsys)
+    assert rc == 1 and "RULING_CANDIDATE_NO_SUPERSEDES" in err, (line, err)
+
+
+def test_a_different_candidates_path_followed_by_a_status_word_is_still_a_citation(tmp_path, capsys):
+    for line in ("- Ruling candidate `ruling-candidates/bar.md` is still open", "Ruling candidate ruling-candidates/foo-bar-r1.md remains PROPOSED"):
+        rc, err = _validate_named(tmp_path, _receipt(f"{NEUTRAL_HEADING}\n\n{line}\n"), "20261022-foo.md", capsys)
+        assert rc == 0 and err == "", (line, err)
