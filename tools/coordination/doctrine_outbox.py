@@ -2128,7 +2128,30 @@ def check_commit(repo: pathlib.Path, sha: str, added_items: set[str],
 
 
 SENT_LEDGER_ABSENT = "sent-ledger-absent"
-SUPERSEDES_LINE_RE = re.compile(r"^\s*(?:[-*]\s+)?(?:\*\*)?supersedes:", re.IGNORECASE)
+SENT_LEDGER_UNREADABLE = "sent-ledger-unreadable"
+SUPERSEDES_LINE_RE = re.compile(r"^\s*(?:[-*]\s+)?(?:\*\*)?supersedes:(?:\*\*)?(.*)$", re.IGNORECASE)
+SUPERSEDES_SPLIT_RE = re.compile(r"[\s,;]+")
+SUPERSEDES_TOKEN_EDGE = "()[]{}<>`'\"*.:"
+
+
+def superseded_names(text: str) -> set[str]:
+    """The COMPLETE tokens a card names on its `supersedes:` lines: each whitespace/comma/semicolon-separated word with
+    markup and punctuation trimmed, also without a `.md` suffix and without the outbox directory. Compared by equality
+    only: `example-10` and `example-1-followup` name different items from `example-1`."""
+    names: set[str] = set()
+    for line in text.splitlines():
+        found = SUPERSEDES_LINE_RE.match(line)
+        if found is None:
+            continue
+        for token in (*SUPERSEDES_SPLIT_RE.split(found.group(1)), found.group(1)):
+            token = token.strip(SUPERSEDES_TOKEN_EDGE + " \t")
+            if not token:
+                continue
+            names.add(token)
+            bare = token.removesuffix(".md")
+            names.add(bare)
+            names.add(bare.removeprefix(OUTBOX_DIR + "/"))
+    return names
 
 
 def find_sent_ledger(repo: pathlib.Path, ledger: pathlib.Path | None) -> pathlib.Path | None:
@@ -2171,22 +2194,22 @@ def _item_key(repo: pathlib.Path, rev: str, path: str) -> tuple[dict, str] | Non
 def check_sent_item_edits(repo: pathlib.Path, sha: str, sent_keys: set[str]) -> list[str]:
     """`SENT_ITEM_EDITED <path> key=<old key>` for each outbox item this commit edits whose pre-edit key the sent
     ledger records and whose key the edit changes: the drain would publish it again. The one allowed edit is the one
-    a NEW item added in the same commit names, on a `supersedes:` line, by the old item's file stem, card id or key."""
+    a NEW item added in the same commit names, as a complete token on a `supersedes:` line, by the old item's file
+    stem, card id or key (superseded_names)."""
     modified = _item_paths(git_paths(repo, "diff-tree", "--no-commit-id", "--name-only", "-r", "--diff-filter=M", sha))
     problems: list[str] = []
-    successors: list[str] | None = None
+    superseded: set[str] | None = None
     for path in modified:
         old, new = _item_key(repo, f"{sha}^", path), _item_key(repo, sha, path)
         if old is None or new is None or old[1] not in sent_keys or old[1] == new[1]:
             continue
-        if successors is None:
-            successors = [git(repo, "show", f"{sha}:{p}") for p in
-                          _item_paths(git_paths(repo, "diff-tree", "--no-commit-id", "--name-only", "-r", "--diff-filter=A", sha))]
+        if superseded is None:
+            superseded = set().union(*(superseded_names(git(repo, "show", f"{sha}:{p}")) for p in
+                                       _item_paths(git_paths(repo, "diff-tree", "--no-commit-id", "--name-only", "-r", "--diff-filter=A", sha))))
         stem = path.rsplit("/", 1)[-1].removesuffix(".md")
         heading = item_heading(old[0])
-        names = [stem, old[1], *([heading[3:].strip()] if heading.startswith("## ") else [])]
-        if not any(SUPERSEDES_LINE_RE.match(line) and any(n in line for n in names)
-                   for text in successors for line in text.splitlines()):
+        names = {stem, old[1], *([heading[3:].strip()] if heading.startswith("## ") else [])}
+        if not names & superseded:
             problems.append(f"SENT_ITEM_EDITED {path} key={old[1]} (already sent: editing it republishes it; "
                             f"add a new item whose `supersedes:` line names it, in this commit)")
     return problems
@@ -2197,7 +2220,8 @@ def check_commits(repo: pathlib.Path, rev_range: str, deny_terms: list[tuple[str
     """{sha: problems} for every non-merge commit in `rev_range` that fails. Raises Unknown
     when the range cannot be resolved -- an unresolvable range is not a passing one.
     The sent-item-edit check needs the sent ledger (see find_sent_ledger). With none, it is NOT run and
-    `sent-ledger-absent: <path>` is appended to `skips` for the caller to print: unchecked is not checked."""
+    `sent-ledger-absent: <path>` is appended to `skips` for the caller to print: unchecked is not checked. A ledger
+    that exists but yields no key cannot say what was sent, so it is the same skip, `sent-ledger-unreadable: <path>`."""
     require_configured()
     for end in [e for e in re.split(r"\.{2,3}", rev_range) if e]:
         rc, _out, _err = git_try(repo, "rev-parse", "--verify", "--quiet", f"{end}^{{commit}}")
@@ -2207,8 +2231,9 @@ def check_commits(repo: pathlib.Path, rev_range: str, deny_terms: list[tuple[str
     added = range_added_items(repo, rev_range)
     found = find_sent_ledger(repo, ledger)
     sent_keys = read_ledger_keys(found) if found is not None else None
-    if sent_keys is None and skips is not None:
-        skips.append(f"{SENT_LEDGER_ABSENT}: {ledger if ledger is not None else repo / LEDGER_REL}")
+    if skips is not None and not sent_keys:
+        skips.append(f"{SENT_LEDGER_UNREADABLE}: {found}" if found is not None else
+                     f"{SENT_LEDGER_ABSENT}: {ledger if ledger is not None else repo / LEDGER_REL}")
     failures: dict[str, list[str]] = {}
     for sha in shas:
         problems = check_commit(repo, sha, added, deny_terms)
@@ -4173,8 +4198,10 @@ def cmd_check_commits(repo: pathlib.Path, rev_range: str, deny_terms: list[tuple
     skips: list[str] = []
     failures = check_commits(repo, rev_range, deny_terms, ledger, skips)
     if not failures:
-        note = f" -- trailers only; the sent-item-edit check was SKIPPED ({skips[0]})" if skips else ""
-        print(f"[doctrine-outbox] check-commits OK over {rev_range}{note}")
+        if skips:  # not "OK": the sent-item-edit check did not run (exit stays 0 so hosted CI, with no ledger, passes)
+            print(f"[doctrine-outbox] check-commits over {rev_range} -- trailers only; the sent-item-edit check was SKIPPED ({skips[0]})")
+        else:
+            print(f"[doctrine-outbox] check-commits OK over {rev_range}")
         return 0
     for sha, problems in failures.items():
         for p in problems:
@@ -4256,7 +4283,7 @@ def build_parser() -> argparse.ArgumentParser:
                                help="the SENT ledger (sent.jsonl) the sent-item-edit check reads (default: the config's, here or "
                                     f"in the main checkout); with none the check is a typed skip, {SENT_LEDGER_ABSENT}")
 
-    check_p =sub.add_parser("check", help="exit 1 when an unsent item is older than MAX_AGE_MIN (default "
+    check_p = sub.add_parser("check", help="exit 1 when an unsent item is older than MAX_AGE_MIN (default "
                                            f"{HOOK_CHECK_WINDOW_MIN}); args: [REPO [MAX_AGE_MIN]]")
     check_p.add_argument("legacy", nargs="*")
     check_p.add_argument("--ref", default=DEFAULT_REF)

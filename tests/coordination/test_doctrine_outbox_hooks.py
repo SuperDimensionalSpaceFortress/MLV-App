@@ -1374,9 +1374,9 @@ def test_new_branch_push_with_no_guarded_base_judges_the_whole_history(tmp_path,
 SENT_ITEM = f"{OUTBOX_DIR}/20261016-the-fix.md"
 
 
-def _record_sent(ob, repo: Path, ledger: Path, item_rel: str = SENT_ITEM) -> str:
+def _record_sent(ob, repo: Path, ledger: Path, item_rel: str = SENT_ITEM, text: str | None = None) -> str:
     """Commit the item, then write the ledger row a drain would have written for it; returns that key."""
-    commit(repo, {item_rel: item_text()}, "file it\n\nDoctrine-Export: outbox\n")
+    commit(repo, {item_rel: text or item_text()}, "file it\n\nDoctrine-Export: outbox\n")
     item = ob.parse_item((repo / item_rel).read_text(encoding="utf-8"))
     key = ob.idempotency_key(git(repo, "log", "--diff-filter=A", "--format=%H", "-n", "1", "--", item_rel),
                              item["meta"]["target"], item["body"])
@@ -1458,6 +1458,7 @@ def test_no_sent_ledger_is_a_typed_skip_not_a_pass(ob, repo, tmp_path, capsys):
         assert _check_commits(ob, repo, base, ledger) == 0
         out = capsys.readouterr().out
         assert "sent-ledger-absent" in out and "SKIPPED" in out and "trailers only" in out, out
+        assert "check-commits OK" not in out, out
 
 
 def test_a_linked_worktree_finds_the_ledger_in_the_main_checkout(ob, repo, tmp_path, capsys):
@@ -1470,3 +1471,79 @@ def test_a_linked_worktree_finds_the_ledger_in_the_main_checkout(ob, repo, tmp_p
     assert not (lane / ob.LEDGER_REL).exists()
     assert _check_commits(ob, lane, base, None) == 1
     assert f"SENT_ITEM_EDITED {SENT_ITEM} key={key}" in capsys.readouterr().err
+
+
+# ---- the `supersedes:` exception names the sent item by a COMPLETE token (OUTBOX-SUPERSEDES-MATCH-EXACT-1) ----
+# A substring test let `example-10` and `example-1-followup` excuse an edit to `example-1`.
+
+SENT_CARD = f"{OUTBOX_DIR}/20261016-example-1.md"
+SENT_CARD_ID = "fixture/example-1"
+
+
+def _edit_sent_card_with_successor(ob, repo: Path, tmp_path: Path, supersedes_value: str) -> tuple[int, str, str]:
+    """Send the card `## fixture/example-1`, then edit it in a commit that also adds a card whose `supersedes:` line
+    says `supersedes_value`; returns (check-commits exit code, the sent key, the card's stem)."""
+    ledger = tmp_path / "sent.jsonl"
+    key = _record_sent(ob, repo, ledger, SENT_CARD, item_text(ob.CARDS_TARGET, f"## {SENT_CARD_ID}\nWhat was sent.\n"))
+    base = git(repo, "rev-parse", "HEAD")
+    successor = item_text(ob.CARDS_TARGET, f"## fixture/successor-9\nsupersedes: {supersedes_value}\nWhy.\n")
+    commit(repo, {SENT_CARD: item_text(ob.CARDS_TARGET, f"## {SENT_CARD_ID}\nWhat was sent, reworded.\n"),
+                  f"{OUTBOX_DIR}/20261022-successor-9.md": successor},
+           "supersede it\n\nDoctrine-Export: outbox\n")
+    return _check_commits(ob, repo, base, ledger), key, "20261016-example-1"
+
+
+@pytest.mark.parametrize("value", [
+    "fixture/example-10",                          # card id that merely starts with the sent id
+    "fixture/example-1-followup",
+    "20261016-example-10",                         # file stem that merely starts with the sent stem
+    "20261016-example-1-followup",                 # a different file whose stem extends the sent one
+    "20261016-example-1-followup.md",
+    "coordination/doctrine-outbox/20261016-example-10.md",
+    "xfixture/example-1",                          # ends with the sent id
+    "pre-20261016-example-1",                      # ends with the sent stem
+])
+def test_a_supersedes_naming_a_longer_or_different_token_does_not_excuse_the_edit(ob, repo, tmp_path, capsys, value):
+    code, key, _stem = _edit_sent_card_with_successor(ob, repo, tmp_path, value)
+    assert code == 1
+    assert f"SENT_ITEM_EDITED {SENT_CARD} key={key}" in capsys.readouterr().err
+
+
+def test_a_supersedes_naming_the_key_plus_extra_characters_does_not_excuse_the_edit(ob, repo, tmp_path, capsys):
+    ledger = tmp_path / "sent.jsonl"
+    key = _record_sent(ob, repo, ledger, SENT_CARD, item_text(ob.CARDS_TARGET, f"## {SENT_CARD_ID}\nWhat was sent.\n"))
+    base = git(repo, "rev-parse", "HEAD")
+    successor = item_text(ob.CARDS_TARGET, f"## fixture/successor-9\nsupersedes: {key}0\nWhy.\n")
+    commit(repo, {SENT_CARD: item_text(ob.CARDS_TARGET, f"## {SENT_CARD_ID}\nReworded.\n"),
+                  f"{OUTBOX_DIR}/20261022-successor-9.md": successor}, "supersede it\n\nDoctrine-Export: outbox\n")
+    assert _check_commits(ob, repo, base, ledger) == 1
+    assert f"SENT_ITEM_EDITED {SENT_CARD} key={key}" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("form", ["stem", "stem.md", "path", "card-id", "key", "wrapped-card-id", "list"])
+def test_a_supersedes_naming_the_sent_item_exactly_by_each_accepted_form_allows_the_edit(ob, repo, tmp_path, form):
+    """File stem, card id and key are the three accepted names; each may be wrapped in markup or sit in a list."""
+    ledger = tmp_path / "sent.jsonl"
+    key = _record_sent(ob, repo, ledger, SENT_CARD, item_text(ob.CARDS_TARGET, f"## {SENT_CARD_ID}\nWhat was sent.\n"))
+    value = {"stem": "20261016-example-1", "stem.md": "20261016-example-1.md", "path": SENT_CARD,
+             "card-id": SENT_CARD_ID, "key": key, "wrapped-card-id": f"(`{SENT_CARD_ID}`, reworded)",
+             "list": f"20260101-other.md, {SENT_CARD_ID}; fixture/example-10"}[form]
+    base = git(repo, "rev-parse", "HEAD")
+    successor = item_text(ob.CARDS_TARGET, f"## fixture/successor-9\nsupersedes: {value}\nWhy.\n")
+    commit(repo, {SENT_CARD: item_text(ob.CARDS_TARGET, f"## {SENT_CARD_ID}\nReworded.\n"),
+                  f"{OUTBOX_DIR}/20261022-successor-9.md": successor}, "supersede it\n\nDoctrine-Export: outbox\n")
+    assert _check_commits(ob, repo, base, ledger) == 0
+
+
+def test_a_ledger_with_no_readable_key_is_a_typed_skip_not_a_pass(ob, repo, tmp_path, capsys):
+    """A ledger that exists but yields no key (empty, truncated, wrong shape) cannot say what was sent: the check did not run."""
+    commit(repo, {SENT_ITEM: item_text()}, "file it\n\nDoctrine-Export: outbox\n")
+    base = git(repo, "rev-parse", "HEAD")
+    commit(repo, {SENT_ITEM: item_text(body="### A finding\nEdited.\n")}, "edit\n\nDoctrine-Export: none\n")
+    for n, content in enumerate(("", "\n\n", "{not json\n", '{"item": "no-key"}\n', '["key"]\n')):
+        ledger = tmp_path / f"unreadable-{n}.jsonl"
+        ledger.write_text(content, encoding="utf-8")
+        assert _check_commits(ob, repo, base, ledger) == 0
+        out = capsys.readouterr().out
+        assert "sent-ledger-unreadable" in out and "SKIPPED" in out and "trailers only" in out, (content, out)
+        assert "check-commits OK" not in out, (content, out)
