@@ -7,14 +7,16 @@
 #     longer deadline (-WorkerDeadlineSec, default 900) and this call returns at once with the last definitive verdict marked
 #     stale (up to -MaxStaleMinutes, default 1440), else UNKNOWN. The guard was measured at 529 s on the board, so a foreground
 #     90 s run always times out there; the detached refresh is what makes the verdict visible every tick.
-# Bus rule B: the verdict NEVER changes a caller's exit code. This script exits 0 for GREEN, RED and UNKNOWN alike and never
-# throws to its caller. It reads the repo and writes only its own verdict/attempt/lock files (outside the repo by default).
+# Bus rule B: the verdict NEVER changes a caller's exit code. Once running, this script exits 0 for GREEN, RED and UNKNOWN alike
+# and never throws to its caller; the one intentional exception is the non-zero refusal on an unsupported PowerShell version
+# (see #Requires below). It reads the repo and writes only its own verdict/attempt/lock files (outside the repo by default).
 # Output (one JSON object on stdout): the verdict record plus cache (run|hit|backoff|stale|refreshing|none), ageSec, stale, line
 # ("Product share (7 d): <verdict> <share> of <threshold>") and, with -CardsPath, plan (see Get-ProductSlotPlan).
 # Dot-sourcing this file defines the functions and runs nothing (the tests and the beat's D step use Get-ProductSlotPlan that way).
 # PowerShell 7 only: Write-FileAtomic needs the File.Move(src, dst, overwrite) overload, which Windows PowerShell 5.1 lacks, so 5.1
 # is refused at start (PRODUCT-SHARE-REQUIRES-PS7-1). Every caller is pwsh 7: the worker relaunches with (Get-Process -Id $PID).Path
-# and the staged live wiring starts 'pwsh'. A refused start exits non-zero, which is fine: no caller runs this under 5.1.
+# and the staged live wiring starts 'pwsh'. A refused start exits non-zero, which is fine: no caller runs this under 5.1. That
+# refusal happens before any verdict logic runs.
 #Requires -Version 7
 param(
     [string]$RepoRoot,
