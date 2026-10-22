@@ -22070,12 +22070,8 @@ void MainWindow::updatePlaybackQualityIndicator( void )
         const bool sameRequest =
             m_lastPresentedRequestContextValid
          && m_lastPresentedRequestContext.playbackScaleFactor == requestedScale;
-        if( activeScaleValid && sameRequest && activeScale != requestedScale )
-        {
-            return tr( "%1->%2" ).arg( PlaybackScaleLabel::shortLabel( requestedScale ),
-                                       PlaybackScaleLabel::shortLabel( activeScale ) );
-        }
-        return PlaybackScaleLabel::shortLabel( requestedScale );
+        return PlaybackScaleLabel::indicatorText(
+            requestedScale, ( activeScaleValid && sameRequest ) ? activeScale : requestedScale );
     };
 
     QString text;
@@ -22399,11 +22395,15 @@ int MainWindow::effectivePlaybackScaleFactorForRequest( void ) const
         m_gpuReducedReconSessionScale = 1;
         if( requestedScale != 2 && requestedScale != 4 )
         {
+            /* SCALE-LABEL-TELEMETRY-REASON-CONSISTENCY-1: log reasons use ONE form, the
+             * C seam's (video_mlv.c plan->reason: "preview scale 1 (full resolution)",
+             * "x8 stays on the full-resolution texture route"). A log line is not UI
+             * text, so the factor form stays here, not resolutionLabel(). */
             m_gpuReducedReconSessionReason =
                 requestedScale == 1
-                    ? PlaybackScaleLabel::resolutionLabel( 1 ) + QStringLiteral(" preview")
-                    : QStringLiteral("%1 stays on the full-resolution texture route")
-                          .arg( PlaybackScaleLabel::resolutionLabel( requestedScale ) );
+                    ? QStringLiteral("preview scale 1 (full resolution)")
+                    : QStringLiteral("x%1 stays on the full-resolution texture route")
+                          .arg( requestedScale );
         }
         else if( playbackGpuNoReadbackOutputValidationEnabled() )
         {

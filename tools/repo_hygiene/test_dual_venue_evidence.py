@@ -4927,10 +4927,8 @@ def run_pwsh_json(script: str, **env: str):
         return proc, None
 
 
-@requires_windows_pwsh
-class ScaleLabelMirrorTests(unittest.TestCase):
-    """SCALE-LABEL-CLARITY-1 r2: Get-DvScaleLabel (PowerShell) and scale_label (make-contact-sheet.py) mirror PlaybackScaleLabel::resolutionLabel; the C++ header is the one
-    mapping, so a reworded label there fails here instead of drifting silently into receipts and sheet headers."""
+class _ScaleLabelHeaderMixin:
+    """Reads the one mapping (PlaybackScaleLabel::resolutionLabel) out of the C++ header for both mirror test classes below."""
 
     HEADER = ROOT / "platform" / "qt" / "PlaybackScaleLabel.h"
 
@@ -4943,6 +4941,12 @@ class ScaleLabelMirrorTests(unittest.TestCase):
         labels[0] = custom.group(1)   # the template for any other factor, %1 = N
         return labels
 
+
+@requires_windows_pwsh
+class ScaleLabelMirrorTests(_ScaleLabelHeaderMixin, unittest.TestCase):
+    """SCALE-LABEL-CLARITY-1 r2: Get-DvScaleLabel (PowerShell) mirrors PlaybackScaleLabel::resolutionLabel; the C++ header is the one mapping, so a reworded label there
+    fails here instead of drifting silently into receipts. The contact-sheet mirror is ungated, in ContactSheetScaleLabelMirrorTests."""
+
     def test_the_powershell_mirror_equals_the_cpp_header(self) -> None:
         want = self.header_labels()
         proc, out = run_pwsh_json("(@(1, 2, 4, 8, 3) | ForEach-Object { [pscustomobject]@{ n = $_; label = (Get-DvScaleLabel -Factor $_) } }) | ConvertTo-Json -Compress")
@@ -4952,6 +4956,11 @@ class ScaleLabelMirrorTests(unittest.TestCase):
             self.assertEqual(got[n], want[n])
         for n in (3, 8):
             self.assertEqual(got[n], want[0].replace("%1", str(n)))
+
+
+class ContactSheetScaleLabelMirrorTests(_ScaleLabelHeaderMixin, unittest.TestCase):
+    """SCALE-LABEL-CLARITY-FOLLOWUP-1 (b): scale_label (make-contact-sheet.py) mirrors PlaybackScaleLabel::resolutionLabel. Needs no pwsh (pure Python, header text only), so it is
+    NOT behind requires_windows_pwsh and the Ubuntu hygiene shards pin it too."""
 
     def test_the_contact_sheet_mirror_equals_the_cpp_header(self) -> None:
         want = self.header_labels()
