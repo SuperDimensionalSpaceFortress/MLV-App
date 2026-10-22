@@ -21,18 +21,29 @@ once, and no module failed to import.
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import os
 import sys
+import time
 import unittest
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
+from typing import TextIO
 
 START_DIR = "tools/repo_hygiene"
 PATTERN = "test_*.py"
 TOP_LEVEL_DIR = "."
 DEFAULT_TEST_SECONDS = 0.5
 PROFILES = ("windows", "ubuntu")
+# The `timeout-minutes` of the matching shard job in .github/workflows/tests.yml, pinned by
+# test_ci_unittest_shard.JobCapPinTests. The job cap is the only time alarm on a shard, so a
+# shard that uses more than BUDGET_WARN_SHARE of it warns, naming its slowest class, before a
+# cancel leaves no test id behind.
+JOB_CAP_MINUTES = {"ubuntu": 30, "windows": 50}
+BUDGET_WARN_SHARE = 0.75
+TOP_CLASSES = 10
+CAP_ENV = "CI_SHARD_JOB_CAP_MINUTES"
 WEIGHTS_PATH = Path(__file__).with_name("ci_unittest_shard_weights.json")
 
 
@@ -133,6 +144,100 @@ def verify_partition(profile: str, shards: int) -> int:
     return 1 if problems else 0
 
 
+class ClassTimingResult(unittest.TextTestResult):
+    """``TextTestResult`` that also charges wall time to each test's ``module.Class``.
+
+    A test is charged the time since the previous test finished (or the run started), so a
+    class also carries its ``setUpClass`` and the fixtures that run before its first test.
+    Output and pass/fail semantics are those of ``TextTestResult``.
+    """
+
+    def __init__(self, *args: object, clock: Callable[[], float] = time.monotonic, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self._clock = clock
+        self._mark = clock()
+        self.class_seconds: dict[str, float] = {}
+
+    def startTestRun(self) -> None:  # noqa: N802
+        super().startTestRun()
+        self._mark = self._clock()
+
+    def stopTest(self, test: unittest.TestCase) -> None:  # noqa: N802
+        super().stopTest(test)
+        now = self._clock()
+        key = unit_key(test)
+        self.class_seconds[key] = self.class_seconds.get(key, 0.0) + (now - self._mark)
+        self._mark = now
+
+
+def job_cap_minutes(profile: str, environ: Mapping[str, str]) -> float:
+    """The profile's job cap; ``CAP_ENV`` overrides it (a short cap for tests)."""
+    try:
+        override = float(environ[CAP_ENV])
+    except (KeyError, ValueError):
+        return float(JOB_CAP_MINUTES[profile])
+    return override if override > 0 else float(JOB_CAP_MINUTES[profile])
+
+
+def slowest_block(
+    profile: str, index: int, of: int, total: float, class_seconds: Mapping[str, float], limit: int = TOP_CLASSES
+) -> list[str]:
+    """The ``SHARD_SLOWEST`` header and the ``limit`` slowest classes, slowest first."""
+    ranked = sorted(class_seconds.items(), key=lambda item: (-item[1], item[0]))[:limit]
+    lines = [f"SHARD_SLOWEST profile={profile} shard={index}/{of} total={total:.1f}s"]
+    lines.extend(f"  {seconds:.1f}s {key}" for key, seconds in ranked)
+    return lines
+
+
+def budget_warning(
+    profile: str, index: int, of: int, total: float, class_seconds: Mapping[str, float], cap_minutes: float
+) -> list[str]:
+    """Empty unless the shard used more than ``BUDGET_WARN_SHARE`` of the job cap."""
+    if not class_seconds or total <= cap_minutes * 60 * BUDGET_WARN_SHARE:
+        return []
+    used = total / (cap_minutes * 60) * 100
+    slowest, slowest_seconds = min(class_seconds.items(), key=lambda item: (-item[1], item[0]))
+    cap = f"{cap_minutes:g}"
+    return [
+        f"::warning title=Shard budget::shard {index}/{of} used {used:.0f}% of the {cap} min job cap; "
+        f"slowest class {slowest} {slowest_seconds:.1f}s",
+        f"SHARD_BUDGET_WARN profile={profile} shard={index}/{of} used={used:.0f}% cap_minutes={cap} "
+        f"slowest={slowest} slowest_seconds={slowest_seconds:.1f}",
+    ]
+
+
+def run_shard(
+    members: list[unittest.TestCase],
+    profile: str,
+    index: int,
+    of: int,
+    *,
+    clock: Callable[[], float] = time.monotonic,
+    environ: Mapping[str, str] | None = None,
+    stream: TextIO | None = None,
+    started: float | None = None,
+) -> int:
+    """Run the shard's tests, then print its slowest classes and any budget warning.
+
+    The report is informational: the exit code is the test outcome alone.
+    """
+    begin = clock() if started is None else started
+    runner = unittest.TextTestRunner(
+        stream=stream, verbosity=2, resultclass=functools.partial(ClassTimingResult, clock=clock)
+    )
+    result = runner.run(unittest.TestSuite(members))
+    if result.testsRun == 0:
+        print("ERROR: no tests ran", file=sys.stderr)
+        return 5
+    total = clock() - begin
+    report = slowest_block(profile, index, of, total, result.class_seconds)
+    report += budget_warning(
+        profile, index, of, total, result.class_seconds, job_cap_minutes(profile, os.environ if environ is None else environ)
+    )
+    print("\n".join(report), flush=True)
+    return 0 if result.wasSuccessful() else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--repo-root", default=".")
@@ -143,6 +248,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--list", action="store_true", help="print the shard's classes and exit")
     parser.add_argument("--list-tests", action="store_true", help="print the shard's test ids and exit")
     args = parser.parse_args(argv)
+    started = time.monotonic()
     repo_root = Path(args.repo_root).resolve()
     sys.path.insert(0, str(repo_root))
     os.chdir(repo_root)
@@ -168,11 +274,7 @@ def main(argv: list[str] | None = None) -> int:
         print("\n".join(test.id() for test in members))
         return 0
     print(f"shard {args.shard}/{args.of}: {len(bucket)} classes, {len(members)} tests", flush=True)
-    result = unittest.TextTestRunner(verbosity=2).run(unittest.TestSuite(members))
-    if result.testsRun == 0:
-        print("ERROR: no tests ran", file=sys.stderr)
-        return 5
-    return 0 if result.wasSuccessful() else 1
+    return run_shard(members, args.profile, args.shard, args.of, started=started)
 
 
 if __name__ == "__main__":
