@@ -64,7 +64,8 @@
 # A view that changed while the app read it (225) voids the capture: result.json says capture-failed AND the candidate manifest the capture
 # wrote is stamped invalid in place (status 'invalid', invalid, invalid_reasons), a best effort, and a sibling marker,
 # reference-frame-candidate.invalid, is written first and independently of the stamp; a reader honours the marker whatever the manifest says. If neither
-# layer can be written the manifest is moved out of the candidate name (numbered .INVALID target).
+# layer can be written the manifest is moved out of the candidate name (numbered .INVALID target); that last resort is best effort too: if the move
+# throws (CANDIDATE_NOT_QUARANTINED, result.json candidateQuarantined=false) the manifest keeps the candidate name, and the job still exits 225.
 #
 # NOT COVERED HERE (named, not hidden): no display wake and no PresentMon. If the venue's display is asleep the capture fails
 # visibly (typed, non-zero) rather than producing a frame; the live run is OUTPUT-BUDGET-KNOWN-GOOD-PROPOSAL-2.
@@ -649,8 +650,9 @@ if ($viewsChanged -and (Test-Path -LiteralPath $candidatePath -PathType Leaf)) {
     if (-not $candidateInvalidated -and -not $candidateInvalidMarker) {
         $candidateQuarantined = $false
         try {
-            # numbered the way Set-GuiSmokeReceiptInvalid numbers its target (.INVALID.json, then .INVALID.1.json ...): a same-jobId rerun finds
-            # the earlier run's quarantine in place, and nothing is overwritten.
+            # numbered the way Set-GuiSmokeReceiptInvalid numbers its target (.INVALID.json, then .INVALID.1.json ...). Defense-in-depth, not the
+            # ordinary same-jobId rerun (that recreates the outbox fresh: New-AttrCudaOwnedRoot above): if the target is occupied anyway, nothing
+            # is overwritten.
             $quarantineTarget = Join-Path $captureOut 'reference-frame-candidate.INVALID.json'
             $quarantineCounter = 1
             while (Test-Path -LiteralPath $quarantineTarget) { $quarantineTarget = Join-Path $captureOut "reference-frame-candidate.INVALID.$quarantineCounter.json"; $quarantineCounter++ }

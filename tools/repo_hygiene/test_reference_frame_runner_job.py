@@ -767,8 +767,9 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
         self.assertFalse((pub / "capture" / "reference-frame-candidate.invalid").exists())
         self.assertEqual(self._frame_provenance().index_capture_records(str(pub)), {})
 
-    # REFERENCE-FRAME-QUARANTINE-NUMBERED-TARGET-1: a same-jobId rerun finds the quarantine target of the earlier run in place. The numbering is
-    # Set-GuiSmokeReceiptInvalid's (<stem>.INVALID<ext>, then <stem>.INVALID.<n><ext>); nothing is overwritten and the move does not throw.
+    # REFERENCE-FRAME-QUARANTINE-NUMBERED-TARGET-1: defense-in-depth, not the ordinary same-jobId rerun (that recreates the outbox fresh, so the
+    # fixture plants the earlier quarantine by hand). The numbering is Set-GuiSmokeReceiptInvalid's (<stem>.INVALID<ext>, then
+    # <stem>.INVALID.<n><ext>); nothing is overwritten and the move does not throw.
     @staticmethod
     def occupied_quarantine_target(*names: str) -> tuple[str, str]:
         writes = "; ".join(f"[IO.File]::WriteAllText((Join-Path $captureOut '{name}'), 'earlier-run-{name}')" for name in names)
@@ -798,6 +799,27 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
             self.occupied_quarantine_target("reference-frame-candidate.INVALID.json", "reference-frame-candidate.INVALID.1.json")))
         self.assert_quarantined_to(ran, pub, "reference-frame-candidate.INVALID.2.json",
                                    ("reference-frame-candidate.INVALID.json", "reference-frame-candidate.INVALID.1.json"))
+
+    # REFERENCE-FRAME-QUARANTINE-FOLLOWUPS-1: the quarantine is best effort too. When the move itself throws, the job still exits 225 and says so:
+    # CANDIDATE_NOT_QUARANTINED is printed, result.json carries candidateQuarantined=false, and the manifest is left exactly as the capture wrote it.
+    def test_a_quarantine_rename_that_throws_is_reported_and_leaves_the_candidate_unchanged(self) -> None:
+        before = self.tmp / "candidate-before-quarantine.json"
+        move = "Move-Item -LiteralPath $candidatePath -Destination $quarantineTarget -ErrorAction Stop"
+        failing_move = (move, f"[IO.File]::Copy($candidatePath, '{str(before).replace(chr(39), chr(39) * 2)}'); throw 'INJECTED_QUARANTINE_RENAME_FAILURE'")
+        ran, pub, _, _, _, _ = self.run_stand_in_capture("quarantinemovefails", edit=self.VIEW_CHANGED, more_edits=(
+            self.STAMP_PUBLISH_FAILS, self.MARKER_PUBLISH_FAILS, failing_move))
+        self.assertEqual(ran.returncode, 225, ran.stdout + ran.stderr)
+        self.assertIn("RESULT=REFERENCE_FRAME_FAILED STEP=footageViewIntact EXIT=225", ran.stdout)
+        self.assertIn("CANDIDATE_NOT_QUARANTINED", ran.stdout, "the swallowed rename failure left no diagnostic")
+        self.assertIn("INJECTED_QUARANTINE_RENAME_FAILURE", ran.stdout, "the diagnostic does not carry the rename's error")
+        result = json.loads((pub / "result.json").read_text(encoding="utf-8-sig"))
+        self.assertEqual((result["status"], result["exitCode"], result["captureExitCode"]), ("capture-failed", 225, 0))
+        self.assertIsNone(result["candidateSha256"])
+        self.assertEqual((result["candidateInvalidated"], result["candidateInvalidMarker"], result["candidateQuarantined"]), (False, False, False))
+        capture = pub / "capture"
+        self.assertTrue(before.is_file(), "the injected failure did not run: this fixture is stale")
+        self.assertEqual((capture / "reference-frame-candidate.json").read_bytes(), before.read_bytes(), "the candidate manifest changed")
+        self.assertEqual(sorted(p.name for p in capture.glob("*INVALID*")), [], "a quarantine target or marker was written")
 
     def test_a_marker_that_cannot_be_written_but_a_stamp_that_lands_is_still_not_a_candidate_to_the_reader(self) -> None:
         """REFERENCE-FRAME-CONSUMER-HONORS-INVALID-STAMP-1: marker publish fails, stamp succeeds -> no marker and no quarantine (the job only does
