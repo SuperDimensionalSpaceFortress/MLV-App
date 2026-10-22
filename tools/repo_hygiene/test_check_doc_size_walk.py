@@ -133,9 +133,11 @@ class DocSizeWalkTests(unittest.TestCase):
         self.assertNotIn(".claude-state/unlisted-bulk/deep.md", found)
         self.assertNotIn(".claude-state/unlisted-bulk", listed)
 
-    def depth_zero_scan_with_failing_entry(self, failing):
+    def depth_zero_scan_with_failing_entry(self, failing, raising="is_file"):
         """Run untracked_scan with the named depth-zero entry raising OSError from its metadata call.
 
+        ``raising`` names the call that fails: ``is_file`` (a Markdown-named file, the first
+        branch of the scan) or ``is_dir`` (a non-Markdown directory, the second branch).
         The failing entry is yielded FIRST, so a scan that abandons the directory on one bad
         entry loses everything that follows it.
         """
@@ -148,11 +150,13 @@ class DocSizeWalkTests(unittest.TestCase):
                 self.path = inner.path
 
             def is_file(self, *a, **k):
-                if self.name == failing:
+                if self.name == failing and raising == "is_file":
                     raise PermissionError(13, "Access is denied", self.path)
                 return self.inner.is_file(*a, **k)
 
             def is_dir(self, *a, **k):
+                if self.name == failing and raising == "is_dir":
+                    raise PermissionError(13, "Access is denied", self.path)
                 return self.inner.is_dir(*a, **k)
 
         class Entries:
@@ -172,7 +176,10 @@ class DocSizeWalkTests(unittest.TestCase):
             return real(path)
 
         state = self.repo / ".claude-state"
-        (state / failing).write_text("# locked\n", encoding="utf-8")
+        if raising == "is_dir":
+            (state / failing).mkdir()
+        else:
+            (state / failing).write_text("# locked\n", encoding="utf-8")
         (state / "SESSION-HANDOFF.md").write_text("# handoff\n", encoding="utf-8")
         (state / "brand-new-home").mkdir()
         stderr = io.StringIO()
@@ -192,6 +199,21 @@ class DocSizeWalkTests(unittest.TestCase):
         found, _, stderr = self.depth_zero_scan_with_failing_entry("aaa-locked.md")
         self.assertNotIn(".claude-state/aaa-locked.md", found)
         self.assertIn("unreadable: .claude-state/aaa-locked.md", stderr)
+
+    def test_one_inaccessible_non_markdown_directory_does_not_abandon_the_rest(self):
+        # Dot R18 advisory on #572 (R18-ADVISORY-TAIL-572-573-574-576-1): the fixture above raises only from
+        # is_file(), the Markdown branch. A non-Markdown name skips that branch and reaches is_dir(), the
+        # second metadata call; it must be contained the same way.
+        found, unlisted, _ = self.depth_zero_scan_with_failing_entry("aaa-locked-dir", raising="is_dir")
+        self.assertIn(".claude-state/SESSION-HANDOFF.md", found)
+        self.assertIn(".claude-state/brand-new-home", unlisted)
+        self.assertIn(".claude-state/coordination/ledger.md", found)
+
+    def test_the_inaccessible_non_markdown_directory_is_reported_not_dropped_or_listed_as_unlisted(self):
+        found, unlisted, stderr = self.depth_zero_scan_with_failing_entry("aaa-locked-dir", raising="is_dir")
+        self.assertNotIn(".claude-state/aaa-locked-dir", found)
+        self.assertNotIn(".claude-state/aaa-locked-dir", unlisted)
+        self.assertIn("unreadable: .claude-state/aaa-locked-dir", stderr)
 
     def test_trace_governed_count_excludes_unlisted_root_rows(self):
         # The text summary counts governed files as the rows that are not synthetic UNLISTED_ROOT

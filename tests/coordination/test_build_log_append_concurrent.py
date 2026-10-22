@@ -13,6 +13,12 @@ and runs the REAL append path M times per writer: build-guard through its docume
 (``Invoke-BuildGuard -NoSlot``, memory and process table injected through the existing seams), the
 exclusive runner by invoking the script itself. Every line must survive and be well formed. Every child is
 bounded by a timeout and killed in ``finally``.
+
+R18-ADVISORY-TAIL-572-573-574-576-1 (Dot R18 advisory on #574): a shared start instant encourages overlap but
+cannot prove it on a loaded host (a late-starting writer can finish after an early one is done). So after its
+FIRST append each writer signals and then waits, bounded, for every peer to have made its first append; only
+then does it do the rest. Each writer records its append interval, and the test asserts from those records
+that the intervals overlap. No sleep is involved: the wait is a spin on the signal files, under a timeout.
 """
 
 import json
@@ -40,29 +46,90 @@ WRITERS = 6
 APPENDS_EACH = 40
 START_DELAY_SEC = 6
 WRITER_TIMEOUT_SEC = 150
+HANDSHAKE_TIMEOUT_SEC = 100
 
 # Spin (no sleep) until the shared start instant so the writers' first appends overlap.
 _BARRIER = "while ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -lt $StartMs) { }\n"
+
+# Append-interval record and bounded handshake (see the module docstring). ``$spanStart`` is taken before the
+# first append, ``$readyTicks`` right after it, and ``span<Id>.txt`` ("start ready end", UTC ticks) after the
+# last. Signal files ``ready<Id>`` live beside the writer script (``$PSScriptRoot`` is the test's tmp_path).
+_SPAN_BEGIN = "$spanStart = [DateTime]::UtcNow.Ticks\n$readyTicks = 0\n"
+_SPAN_SYNC = (
+    "    if ($i -eq 0) {\n"
+    "        $readyTicks = [DateTime]::UtcNow.Ticks\n"
+    '        [IO.File]::WriteAllText((Join-Path $PSScriptRoot "ready$Id"), [string]$readyTicks)\n'
+    "        $give = [Diagnostics.Stopwatch]::StartNew()\n"
+    f"        while ([IO.Directory]::GetFiles($PSScriptRoot, 'ready*').Count -lt {WRITERS}) {{\n"
+    f"            if ($give.Elapsed.TotalSeconds -gt {HANDSHAKE_TIMEOUT_SEC}) {{ throw 'append-overlap handshake timed out: a peer writer never made its first append' }}\n"
+    "        }\n"
+    "    }\n"
+)
+_SPAN_END = '[IO.File]::WriteAllText((Join-Path $PSScriptRoot "span$Id.txt"), "$spanStart $readyTicks $([DateTime]::UtcNow.Ticks)")\n'
 
 GUARD_WRITER = (
     "param([string]$Guard, [string]$LogPath, [string]$Probe, [string]$Table, [int]$Id, [int]$Count, [long]$StartMs)\n"
     "$ErrorActionPreference = 'Stop'\n"
     ". $Guard -Library\n"
     + _BARRIER
+    + _SPAN_BEGIN
     + "for ($i = 0; $i -lt $Count; $i++) {\n"
     "    $opts = @{ ExemptLogPath = $LogPath; MemoryProbeFile = $Probe; ProcessTableFile = $Table }\n"
     "    Invoke-BuildGuard -Label \"w$Id\" -ExemptReason \"w$Id-i$i\" -NoSlot -Options $opts -Action { param($Jobs) } 2>$null | Out-Null\n"
-    "}\n"
+    + _SPAN_SYNC
+    + "}\n"
+    + _SPAN_END
 )
 
 EXCLUSIVE_WRITER = (
     "param([string]$Script, [string]$Root, [string]$Exe, [int]$Id, [int]$Count, [long]$StartMs)\n"
     + _BARRIER
+    + _SPAN_BEGIN
     + "for ($i = 0; $i -lt $Count; $i++) {\n"
     # A writer that loses the exclusive lock throws 'busy'; its finally block still appends its record.
     "    try { & $Script -RepoRoot $Root -Owner \"w$Id-i$i\" -FilePath $Exe -ArgumentList @('/c', 'exit 0') -TimeoutSeconds 60 *> $null } catch { }\n"
-    "}\n"
+    + _SPAN_SYNC
+    + "}\n"
+    + _SPAN_END
 )
+
+
+def _read_spans(tmp_path: Path) -> list:
+    """Each writer's recorded (start, ready, end) UTC ticks: before its first append, after it, after its last."""
+    spans = []
+    for writer_id in range(WRITERS):
+        record = tmp_path / f"span{writer_id}.txt"
+        assert record.is_file(), f"writer {writer_id} left no append-interval record"
+        start, ready, end = (int(part) for part in record.read_text(encoding="ascii").split())
+        assert 0 < start <= ready <= end, f"writer {writer_id} recorded an impossible interval {(start, ready, end)} (no first-append signal?)"
+        spans.append((start, ready, end))
+    return spans
+
+
+def _assert_appends_overlapped(spans: list) -> None:
+    """The writers' append intervals overlap, judged from what each recorded rather than from the shared start."""
+    latest_start = max(start for start, _, _ in spans)
+    latest_ready = max(ready for _, ready, _ in spans)
+    earliest_end = min(end for _, _, end in spans)
+    assert latest_start < earliest_end, (
+        f"no instant at which every writer was inside its append loop (latest start {latest_start}, earliest end {earliest_end})"
+    )
+    assert latest_ready <= earliest_end, (
+        f"a writer finished before a peer made its first append, so the loops were serialised (latest first-append {latest_ready}, earliest end {earliest_end})"
+    )
+
+
+def test_overlap_check_accepts_overlapping_intervals_and_rejects_serialised_ones() -> None:
+    overlapped = [(100 + w, 110 + w, 200 + w) for w in range(WRITERS)]
+    _assert_appends_overlapped(overlapped)
+    # Writer 0 is done before writer 1 even starts: a shared start instant would not have noticed.
+    serialised = [(100, 110, 150)] + [(160 + w, 170 + w, 300 + w) for w in range(WRITERS - 1)]
+    with pytest.raises(AssertionError, match="no instant at which every writer"):
+        _assert_appends_overlapped(serialised)
+    # Everyone started together, but writer 0 had finished before the last peer made its first append.
+    late_first_append = [(100, 110, 150)] + [(100, 160, 300)] + [(100, 120, 300)] * (WRITERS - 2)
+    with pytest.raises(AssertionError, match="serialised"):
+        _assert_appends_overlapped(late_first_append)
 
 
 def _run_writers(tmp_path: Path, script_text: str, args_for, start_delay_sec: int = START_DELAY_SEC,
@@ -95,6 +162,7 @@ def _run_writers(tmp_path: Path, script_text: str, args_for, start_delay_sec: in
             proc.wait(timeout=max(1.0, deadline - time.monotonic()))
             err = (tmp_path / f"writer{writer_id}.err").read_text(encoding="utf-8", errors="replace")
             assert proc.returncode == 0, f"writer {writer_id} failed rc={proc.returncode}\n{err[-2000:]}"
+        _assert_appends_overlapped(_read_spans(tmp_path))
     finally:
         for proc in procs:
             if proc.poll() is None:
@@ -241,20 +309,26 @@ GUARD_LARGE_WRITER = (
     ". $Guard -Library\n"
     "$reasons = @([IO.File]::ReadAllText($ReasonsFile) | ConvertFrom-Json)\n"
     + _BARRIER
+    + _SPAN_BEGIN
     + "for ($i = 0; $i -lt $reasons.Count; $i++) {\n"
     "    $opts = @{ ExemptLogPath = $LogPath; MemoryProbeFile = $Probe; ProcessTableFile = $Table }\n"
     "    Invoke-BuildGuard -Label \"w$Id\" -ExemptReason $reasons[$i] -NoSlot -Options $opts -Action { param($Jobs) } 2>$null | Out-Null\n"
-    "}\n"
+    + _SPAN_SYNC
+    + "}\n"
+    + _SPAN_END
 )
 
 EXCLUSIVE_LARGE_WRITER = (
     "param([string]$Script, [string]$Root, [string]$Exe, [string]$ReasonsFile, [int]$Id, [long]$StartMs)\n"
     "$reasons = @([IO.File]::ReadAllText($ReasonsFile) | ConvertFrom-Json)\n"
     + _BARRIER
+    + _SPAN_BEGIN
     + "for ($i = 0; $i -lt $reasons.Count; $i++) {\n"
     # A writer that loses the exclusive lock throws 'busy'; its finally block still appends its record.
     "    try { & $Script -RepoRoot $Root -Owner $reasons[$i] -FilePath $Exe -ArgumentList @('/c', 'exit 0') -TimeoutSeconds 60 *> $null } catch { }\n"
-    "}\n"
+    + _SPAN_SYNC
+    + "}\n"
+    + _SPAN_END
 )
 
 
