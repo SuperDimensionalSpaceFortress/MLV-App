@@ -882,21 +882,61 @@ def resolve_deny_file(repo: pathlib.Path, deny_file: pathlib.Path | None) -> pat
     return deny_file.resolve() if deny_file is not None else (repo / DENY_FILE_REL)
 
 
-def read_ledger_keys(ledger: pathlib.Path) -> set[str]:
-    if not ledger.is_file():
-        return set()
+SENT_LEDGER_ABSENT = "sent-ledger-absent"
+SENT_LEDGER_UNREADABLE = "sent-ledger-unreadable"
+SENT_LEDGER_PARTIAL = "sent-ledger-partial"
+SENT_KEY_RE = re.compile(r"[0-9a-f]{16}")   # idempotency_key(): sha256 hexdigest, first 16 characters
+
+
+def ledger_present(ledger: pathlib.Path) -> bool:
+    """True when the ledger path exists, False only when it is not there (FileNotFoundError). `Path.exists()` would
+    read any other failure to stat it (an ACL-protected folder: PermissionError) as ABSENT, and an absent ledger skips
+    the guard and lets the drain republish, so every other OSError is Unknown(SENT_LEDGER_UNREADABLE)."""
+    try:
+        ledger.stat()
+    except FileNotFoundError:
+        return False
+    except OSError as e:
+        raise Unknown(SENT_LEDGER_UNREADABLE, f"{ledger}: {e}") from e
+    return True
+
+
+def read_sent_ledger(ledger: pathlib.Path) -> tuple[set[str], int]:
+    """(usable keys, non-blank rows) of an existing sent ledger: THE read every ledger consumer shares (the drain,
+    the kernel-filing drain, debt, and the check-commits guard). A ledger that is there is judged whole or not at all:
+    a path that cannot be opened or decoded raises Unknown(SENT_LEDGER_UNREADABLE), and any row that is not a JSON
+    object whose `key` matches SENT_KEY_RE (the shape `idempotency_key` writes) raises Unknown(SENT_LEDGER_PARTIAL,
+    "<path>: N of M ..."): a key set missing a row is how an already-sent item is published again."""
+    try:
+        text = ledger.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as e:
+        raise Unknown(SENT_LEDGER_UNREADABLE, f"{ledger}: {e}") from e
     keys: set[str] = set()
-    for line in ledger.read_text(encoding="utf-8").splitlines():
+    rows = bad = 0
+    for line in text.splitlines():
         line = line.strip()
         if not line:
             continue
+        rows += 1
         try:
             row = json.loads(line)
         except json.JSONDecodeError:
+            bad += 1
             continue
-        if isinstance(row, dict) and isinstance(row.get("key"), str):
-            keys.add(row["key"])
-    return keys
+        key = row.get("key") if isinstance(row, dict) else None
+        if isinstance(key, str) and SENT_KEY_RE.fullmatch(key):
+            keys.add(key)
+        else:
+            bad += 1
+    if bad:
+        raise Unknown(SENT_LEDGER_PARTIAL, f"{ledger}: {bad} of {rows} row(s) are unparseable or carry no well-formed key")
+    return keys, rows
+
+
+def read_ledger_keys(ledger: pathlib.Path) -> set[str]:
+    """The sent keys the drain, the kernel-filing drain and debt judge by. An ABSENT ledger is the empty set (a first
+    run, or a lost ledger the bus tip then answers for); one that is there goes through `read_sent_ledger`."""
+    return read_sent_ledger(ledger)[0] if ledger_present(ledger) else set()
 
 
 def append_ledger_rows(ledger: pathlib.Path, rows: list[dict]) -> None:
@@ -2127,8 +2167,6 @@ def check_commit(repo: pathlib.Path, sha: str, added_items: set[str],
     return problems
 
 
-SENT_LEDGER_ABSENT = "sent-ledger-absent"
-SENT_LEDGER_UNREADABLE = "sent-ledger-unreadable"
 SUPERSEDES_LINE_RE = re.compile(r"^\s*(?:[-*]\s+)?(?:\*\*)?supersedes:(?:\*\*)?(.*)$", re.IGNORECASE)
 SUPERSEDES_SPLIT_RE = re.compile(r"[\s,;]+")
 SUPERSEDES_TOKEN_EDGE = "()[]{}<>`'\"*.:"
@@ -2157,16 +2195,17 @@ def superseded_names(text: str) -> set[str]:
 def find_sent_ledger(repo: pathlib.Path, ledger: pathlib.Path | None) -> pathlib.Path | None:
     """The sent ledger to judge against, or None. An explicit path is used as given. Otherwise the repo's own
     `ledger_rel`, then the same path in the checkout that owns the git dir: the ledger is untracked, so a linked
-    worktree (where lanes work) never holds it."""
+    worktree (where lanes work) never holds it. A candidate that cannot be looked at is Unknown(SENT_LEDGER_UNREADABLE)
+    (see ledger_present), never None."""
     if ledger is not None:
-        return ledger if ledger.is_file() else None
+        return ledger if ledger_present(ledger) else None
     own = repo / LEDGER_REL
-    if own.is_file():
+    if ledger_present(own):
         return own
     rc, common, _err = git_try(repo, "rev-parse", "--git-common-dir")
     if rc == 0 and common:
         main_git = (repo / common).resolve()
-        if main_git.name == ".git" and (main_git.parent / LEDGER_REL).is_file():
+        if main_git.name == ".git" and ledger_present(main_git.parent / LEDGER_REL):
             return main_git.parent / LEDGER_REL
     return None
 
@@ -2221,7 +2260,10 @@ def check_commits(repo: pathlib.Path, rev_range: str, deny_terms: list[tuple[str
     when the range cannot be resolved -- an unresolvable range is not a passing one.
     The sent-item-edit check needs the sent ledger (see find_sent_ledger). With none, it is NOT run and
     `sent-ledger-absent: <path>` is appended to `skips` for the caller to print: unchecked is not checked. A ledger
-    that exists but yields no key cannot say what was sent, so it is the same skip, `sent-ledger-unreadable: <path>`."""
+    with no row at all cannot say what was sent, so it is the same skip, `sent-ledger-unreadable: <path>`.
+    A ledger that exists but cannot be opened or decoded raises Unknown(`sent-ledger-unreadable`), and one with any row
+    that is not a JSON object carrying a well-formed `key` raises Unknown(`sent-ledger-partial`, "<path>: N of M ..."):
+    the guard would otherwise run on a partial key set without saying so. Both fail closed (exit 2; pre-push refuses)."""
     require_configured()
     for end in [e for e in re.split(r"\.{2,3}", rev_range) if e]:
         rc, _out, _err = git_try(repo, "rev-parse", "--verify", "--quiet", f"{end}^{{commit}}")
@@ -2230,7 +2272,9 @@ def check_commits(repo: pathlib.Path, rev_range: str, deny_terms: list[tuple[str
     shas = git(repo, "rev-list", "--no-merges", "--reverse", rev_range).split()
     added = range_added_items(repo, rev_range)
     found = find_sent_ledger(repo, ledger)
-    sent_keys = read_ledger_keys(found) if found is not None else None
+    sent_keys: set[str] | None = None
+    if found is not None:
+        sent_keys, _rows = read_sent_ledger(found)
     if skips is not None and not sent_keys:
         skips.append(f"{SENT_LEDGER_UNREADABLE}: {found}" if found is not None else
                      f"{SENT_LEDGER_ABSENT}: {ledger if ledger is not None else repo / LEDGER_REL}")
