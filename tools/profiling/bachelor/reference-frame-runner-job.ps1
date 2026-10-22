@@ -62,7 +62,9 @@
 # (handles released, view entries removed by identity) on every exit path after it was opened -- the bundle re-hash, the capture directory and
 # the command build included (r4): a throw in that window is a typed step failure (219 / 227), never an untyped exit that leaves a view behind.
 # A view that changed while the app read it (225) voids the capture: result.json says capture-failed AND the candidate manifest the capture
-# wrote is stamped invalid in place (status 'invalid', invalid, invalid_reasons), so the manifest alone never reads as a candidate.
+# wrote is stamped invalid in place (status 'invalid', invalid, invalid_reasons), a best effort, and a sibling marker,
+# reference-frame-candidate.invalid, is written first and independently of the stamp; a reader honours the marker whatever the manifest says. If neither
+# layer can be written the manifest is moved out of the candidate name (numbered .INVALID target).
 #
 # NOT COVERED HERE (named, not hidden): no display wake and no PresentMon. If the venue's display is asleep the capture fails
 # visibly (typed, non-zero) rather than producing a frame; the live run is OUTPUT-BUDGET-KNOWN-GOOD-PROPOSAL-2.
@@ -647,7 +649,12 @@ if ($viewsChanged -and (Test-Path -LiteralPath $candidatePath -PathType Leaf)) {
     if (-not $candidateInvalidated -and -not $candidateInvalidMarker) {
         $candidateQuarantined = $false
         try {
-            Move-Item -LiteralPath $candidatePath -Destination (Join-Path $captureOut 'reference-frame-candidate.INVALID.json') -ErrorAction Stop
+            # numbered the way Set-GuiSmokeReceiptInvalid numbers its target (.INVALID.json, then .INVALID.1.json ...): a same-jobId rerun finds
+            # the earlier run's quarantine in place, and nothing is overwritten.
+            $quarantineTarget = Join-Path $captureOut 'reference-frame-candidate.INVALID.json'
+            $quarantineCounter = 1
+            while (Test-Path -LiteralPath $quarantineTarget) { $quarantineTarget = Join-Path $captureOut "reference-frame-candidate.INVALID.$quarantineCounter.json"; $quarantineCounter++ }
+            Move-Item -LiteralPath $candidatePath -Destination $quarantineTarget -ErrorAction Stop
             $candidateQuarantined = $true
         } catch {
             Say "CANDIDATE_NOT_QUARANTINED $($_.Exception.Message)"

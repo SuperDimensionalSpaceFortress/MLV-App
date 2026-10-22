@@ -767,6 +767,38 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
         self.assertFalse((pub / "capture" / "reference-frame-candidate.invalid").exists())
         self.assertEqual(self._frame_provenance().index_capture_records(str(pub)), {})
 
+    # REFERENCE-FRAME-QUARANTINE-NUMBERED-TARGET-1: a same-jobId rerun finds the quarantine target of the earlier run in place. The numbering is
+    # Set-GuiSmokeReceiptInvalid's (<stem>.INVALID<ext>, then <stem>.INVALID.<n><ext>); nothing is overwritten and the move does not throw.
+    @staticmethod
+    def occupied_quarantine_target(*names: str) -> tuple[str, str]:
+        writes = "; ".join(f"[IO.File]::WriteAllText((Join-Path $captureOut '{name}'), 'earlier-run-{name}')" for name in names)
+        anchor = "$candidatePath = Join-Path $captureOut 'reference-frame-candidate.json'"
+        return (anchor, f"{anchor}; {writes}")
+
+    def assert_quarantined_to(self, ran: subprocess.CompletedProcess, pub: Path, target: str, kept: tuple[str, ...]) -> None:
+        self.assertEqual(ran.returncode, 225, ran.stdout + ran.stderr)
+        self.assertNotIn("CANDIDATE_NOT_QUARANTINED", ran.stdout, "the quarantine rename threw on an occupied target")
+        result = json.loads((pub / "result.json").read_text(encoding="utf-8-sig"))
+        self.assertEqual((result["candidateInvalidated"], result["candidateInvalidMarker"], result["candidateQuarantined"]), (False, False, True))
+        capture = pub / "capture"
+        self.assertFalse((capture / "reference-frame-candidate.json").exists(), "the manifest still carries the candidate name")
+        self.assertIn("candidate-unreviewed", (capture / target).read_text(encoding="utf-8-sig"), "the manifest is not at the numbered target")
+        for name in kept:
+            self.assertEqual((capture / name).read_text(encoding="utf-8-sig"), f"earlier-run-{name}", f"{name} was overwritten")
+        self.assertEqual(self._frame_provenance().index_capture_records(str(pub)), {})
+
+    def test_an_occupied_quarantine_target_is_numbered_not_overwritten_and_the_manifest_still_leaves_the_candidate_name(self) -> None:
+        ran, pub, _, _, _, _ = self.run_stand_in_capture("quarantineoccupied", edit=self.VIEW_CHANGED, more_edits=(
+            self.STAMP_PUBLISH_FAILS, self.MARKER_PUBLISH_FAILS, self.occupied_quarantine_target("reference-frame-candidate.INVALID.json")))
+        self.assert_quarantined_to(ran, pub, "reference-frame-candidate.INVALID.1.json", ("reference-frame-candidate.INVALID.json",))
+
+    def test_a_second_occupied_quarantine_target_numbers_past_the_first(self) -> None:
+        ran, pub, _, _, _, _ = self.run_stand_in_capture("quarantineoccupied2", edit=self.VIEW_CHANGED, more_edits=(
+            self.STAMP_PUBLISH_FAILS, self.MARKER_PUBLISH_FAILS,
+            self.occupied_quarantine_target("reference-frame-candidate.INVALID.json", "reference-frame-candidate.INVALID.1.json")))
+        self.assert_quarantined_to(ran, pub, "reference-frame-candidate.INVALID.2.json",
+                                   ("reference-frame-candidate.INVALID.json", "reference-frame-candidate.INVALID.1.json"))
+
     def test_a_marker_that_cannot_be_written_but_a_stamp_that_lands_is_still_not_a_candidate_to_the_reader(self) -> None:
         """REFERENCE-FRAME-CONSUMER-HONORS-INVALID-STAMP-1: marker publish fails, stamp succeeds -> no marker and no quarantine (the job only does
         either when the stamp failed too), so the stamp alone must keep frame_provenance from indexing the voided capture."""
@@ -795,6 +827,22 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
         self.assertNotIn("so the manifest alone never\n# reads as a candidate", text)
         self.assertIn("reference-frame-candidate.invalid", text)
         self.assertIn("marker present = not a candidate", text)
+
+    # REFERENCE-FRAME-JOB-HEADER-CLAIM-QUALIFY-1: the same claim, in the header comment (unwrapped) and in the doc, is qualified the way the body is.
+    UNCONDITIONAL_CLAIM = re.compile(r"manifest\s+alone\s+never\s+reads\s+as\s+a\s+candidate", re.IGNORECASE)
+
+    def test_no_comment_claims_the_stamped_manifest_alone_never_reads_as_a_candidate_wrapped_or_not(self) -> None:
+        text = GENERATOR.read_text(encoding="utf-8")
+        self.assertIsNone(self.UNCONDITIONAL_CLAIM.search(re.sub(r"\s*\n#\s*", " ", text)), "an unconditional 'the manifest alone never reads as a candidate' survives")
+        self.assertIsNone(self.UNCONDITIONAL_CLAIM.search(text))
+        header = text.split("# NOT COVERED HERE", 1)[0]
+        self.assertIn("best effort", header, "the header does not say the in-place stamp is best effort")
+        self.assertIn("reference-frame-candidate.invalid", header, "the header does not name the marker that backs the stamp")
+        doc = (ROOT / "docs" / "playback-clip-length-rule.md").read_text(encoding="utf-8")
+        row = next(line for line in doc.splitlines() if "bachelor/reference-frame-runner-job.ps1" in line and "VENUE-REFERENCE-FRAME-JOB-1" in line)
+        self.assertIsNone(self.UNCONDITIONAL_CLAIM.search(row))
+        self.assertIn("best effort", row, "the doc row presents the in-place stamp as unconditional")
+        self.assertIn("moved out of the candidate name", row, "the doc row omits the last-resort quarantine")
 
 
 @requires_pwsh
