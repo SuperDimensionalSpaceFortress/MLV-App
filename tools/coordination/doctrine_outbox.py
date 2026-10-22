@@ -2464,12 +2464,7 @@ def _remote_default_base(repo: pathlib.Path, remote: str, local_sha: str) -> str
     judged when they landed); the remote's HEAD, master and main count only when that config guards them."""
     if not remote:
         return None
-    # r8 (Iverson advisory on b5310592, ACK 6227530991): a base is taken only from a branch the hook guards
-    # (`pre_push_refs`), by its WHOLE name after refs/heads/. r1-r7 also tried the remote's HEAD and
-    # `{remote}/master` / `{remote}/main` whatever the config guarded, and read the name after the last
-    # slash (refs/heads/release/1.0 became `1.0`), so the walk could start from a ref the hook never judged:
-    #     candidates.extend(f"{remote}/{ref.rsplit('/', 1)[-1]}" for ref in PRE_PUSH_REFS)
-    #     candidates.extend((f"{remote}/master", f"{remote}/main"))
+    # Invariant: a base comes only from a branch in pre_push_refs, by its whole name after refs/heads/.
     guarded = [ref[len("refs/heads/"):] for ref in PRE_PUSH_REFS if ref.startswith("refs/heads/")]
     candidates: list[str] = []
     rc, out, _err = git_try(repo, "symbolic-ref", "--quiet", "--short", f"refs/remotes/{remote}/HEAD")
