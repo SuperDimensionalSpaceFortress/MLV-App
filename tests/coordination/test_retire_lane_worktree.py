@@ -650,10 +650,20 @@ def _spawn_file_handle_holder(path, ready, release, tmp):
     return p
 
 
+# The retry window scans the host again before EVERY attempt (r2), and a long-lived host pwsh caught exiting mid-scan reads as
+# cwd-unknown (relative-script-unresolved) and refuses a removal, by design (reproduced 1 in 4 in isolation). These cases are about the
+# TEST'S OWN holders, so their snapshot is limited to pytest's direct children; the real-holder children are all that matters to them.
+ONLY_PYTEST_CHILDREN = (
+    "$origChildrenOnly = ${function:Get-LaneProcessSnapshot}; "
+    "function Get-LaneProcessSnapshot { $s = & $origChildrenOnly; "
+    "[pscustomobject]@{ Procs = @($s.Procs | Where-Object { $_.ParentProcessId -eq " + str(PYTEST_PID) + " }); SelfPids = $s.SelfPids; CapturedUtc = $s.CapturedUtc } }; "
+)
+
+
 def _release_on_first_wait(release, budget_ms=20000, delay_ms=50):
     """Prelude: the tool's own first back-off creates `release`, so the child's handle drops (and the child exits) after the
     first failed removal. No timing guess: a tool that never waits never lets go, and stays red."""
-    return (f"$script:RemoveRetryBudgetMs = {budget_ms}; $script:RemoveRetryDelayMs = {delay_ms}; "
+    return (ONLY_PYTEST_CHILDREN + f"$script:RemoveRetryBudgetMs = {budget_ms}; $script:RemoveRetryDelayMs = {delay_ms}; "
             "function Start-Sleep { param([int]$Milliseconds = 0, [double]$Seconds = 0) "
             f"if (-not (Test-Path -LiteralPath '{release}')) {{ [IO.File]::WriteAllText('{release}', 'go') }}; "
             "Microsoft.PowerShell.Utility\\Start-Sleep -Milliseconds ([Math]::Max($Milliseconds, 400)) }; ")
@@ -680,12 +690,71 @@ def test_a_handle_that_never_lets_go_ends_remove_failed_naming_the_attempts(repo
     ready, release = tmp / "hold.ready", tmp / "hold.release"
     p = _spawn_file_handle_holder(wt / "a.txt", ready, release, tmp)
     try:
-        d, _ = _gate_real(wt, whatif=False, prelude="$script:RemoveRetryBudgetMs = 1500; $script:RemoveRetryDelayMs = 100; ")
+        d, _ = _gate_real(wt, whatif=False, prelude=ONLY_PYTEST_CHILDREN + "$script:RemoveRetryBudgetMs = 1500; $script:RemoveRetryDelayMs = 100; ")
     finally:
         release.write_text("go")
         p.wait(timeout=60)
     assert d["action"] == "kept" and d["reason"].startswith("remove-failed: "), d
     assert "attempt" in d["reason"] and d["removeAttempts"] >= 2, d
+
+
+# r2 (Sol r1 B1/B2): a holder that appears AFTER the first decision must stop the retry too. The retry window is where the worktree is
+# half-removed and a handle still blocks it, so a process that starts in it is exactly the one the gate was written to refuse.
+# Scans are numbered: 1 = the gate, 2 = the last look before removal, 3.. = one fresh scan before each retry attempt that may delete.
+
+def _counted_scans_and_sleeps(release, release_at_sleep):
+    """Prelude: count every process scan in $script:SnapN, and create `release` (the file holder lets go) at the Nth back-off."""
+    return (ONLY_PYTEST_CHILDREN + "$script:SnapN = 0; $script:SleepN = 0; $script:RemoveRetryBudgetMs = 20000; $script:RemoveRetryDelayMs = 50; "
+            "$origSnapCount = ${function:Get-LaneProcessSnapshot}; "
+            "function Get-LaneProcessSnapshot { $script:SnapN++; & $origSnapCount }; "
+            "function Start-Sleep { param([int]$Milliseconds = 0, [double]$Seconds = 0) $script:SleepN++; "
+            f"if ($script:SleepN -ge {release_at_sleep} -and -not (Test-Path -LiteralPath '{release}')) {{ [IO.File]::WriteAllText('{release}', 'go') }}; "
+            "Microsoft.PowerShell.Utility\\Start-Sleep -Milliseconds ([Math]::Max($Milliseconds, 400)) }; ")
+
+
+def test_an_unreadable_cwd_holder_that_appears_during_the_retry_keeps_the_worktree(repo):
+    """R-03: sharing-violation half-removal, then a process whose cwd cannot be read shows up. Refused as in the first decision."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-late-unknown")
+    ready, release = tmp / "hold.ready", tmp / "hold.release"
+    p = _spawn_file_handle_holder(wt / "a.txt", ready, release, tmp)
+    late = _spawn(["-Command", "Start-Sleep -Seconds 120"], cwd=tmp)   # not the holder of anything; its cwd just cannot be read
+    prelude = (_counted_scans_and_sleeps(release, 1)
+               + "$origCwdLate = ${function:Get-ProcessCurrentDirectory}; "
+               f"function Get-ProcessCurrentDirectory {{ param([int]$ProcessId) if ($script:SnapN -ge 3 -and $ProcessId -eq {late.pid}) {{ return $null }}; & $origCwdLate -ProcessId $ProcessId }}; ")
+    try:
+        d, err = _gate_real(wt, whatif=False, prelude=prelude)
+    finally:
+        _stop(late)
+        release.write_text("go")
+        p.wait(timeout=60)
+    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown"), d
+    assert any(u.startswith(f"{late.pid} ") for u in d["cwdUnknown"]), d
+    assert f"pid={late.pid}" in err and "via=cwd-unknown" in err, err
+    assert d["removeAttempts"] == 2, d   # stopped at the first retry attempt, before its deletion
+
+
+def test_a_cwd_holder_that_appears_after_the_first_leftover_deletion_keeps_the_worktree(repo):
+    """R-04: the first leftover deletion hits the sharing violation, then a process whose cwd is the worktree appears. The retry
+    that follows must look again (it used to look once), and keep the worktree before deleting anything more."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-late-cwd")
+    ready, release = tmp / "hold.ready", tmp / "hold.release"
+    p = _spawn_file_handle_holder(wt / "a.txt", ready, release, tmp)
+    # Scan 3 (attempt 2) is clear and its deletion fails on the file handle; the handle drops at the 2nd back-off; scan 4 (attempt 3) sees the cwd holder.
+    prelude = (_counted_scans_and_sleeps(release, 2)
+               + "$origSnapLate = ${function:Get-LaneProcessSnapshot}; "
+               "function Get-LaneProcessSnapshot { $s = & $origSnapLate; if ($script:SnapN -ge 4) { "
+               f"$row = [pscustomobject]@{{ ProcessId = 999990; Name = 'late-holder.exe'; CommandLine = 'late-holder.exe'; SessionId = 1; CurrentDirectory = '{wt}' }}; "
+               "return [pscustomobject]@{ Procs = @($s.Procs) + @($row); SelfPids = $s.SelfPids; CapturedUtc = $s.CapturedUtc } }; $s }; ")
+    try:
+        d, err = _gate_real(wt, whatif=False, prelude=prelude)
+    finally:
+        release.write_text("go")
+        p.wait(timeout=60)
+    assert d["action"] == "kept" and d["reason"].startswith("live-process: 999990 late-holder.exe"), d
+    assert "999990 late-holder.exe cwd" in d["holders"], d
+    assert d["removeAttempts"] == 3, d   # stopped at the third attempt, before its deletion
 
 
 def test_the_removal_retry_is_keyed_to_access_denied_and_sharing_violation_only():

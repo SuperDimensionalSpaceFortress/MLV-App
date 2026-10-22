@@ -747,9 +747,8 @@ function Invoke-RetireLaneWorktree {
             # git half-fails here (TRAPS, worktree removal on Windows): it deregisters the worktree and deletes its `.git` link, then stops with
             # files left behind, so the same command cannot be re-run ("is not a working tree"). Each round therefore asks what state git left:
             # still registered -> run git again; deregistered and the directory remains -> finish the delete ourselves (nothing the gate did not
-            # already clear: clean, pushed, merged, no live holder), after one fresh holder scan.
+            # already clear: clean, pushed, merged, no live holder), after a fresh holder + cwd scan before EACH attempt.
             $sw = [Diagnostics.Stopwatch]::StartNew()
-            $rescanned = $false
             while ($true) {
                 $d.removeNotes += "attempt $($d.removeAttempts) at $($sw.ElapsedMilliseconds) ms: $last"
                 if ($sw.ElapsedMilliseconds -ge $script:RemoveRetryBudgetMs -or $d.removeAttempts -ge $script:RemoveRetryMaxAttempts) { break }
@@ -758,23 +757,26 @@ function Invoke-RetireLaneWorktree {
                 $wl2 = Run-Git $main @('worktree', 'list', '--porcelain')
                 if ($wl2.code) { $last = 'cannot-determine: worktree list: ' + ($wl2.out -join ' | '); break }
                 $stillRegistered = @($wl2.out | Where-Object { $_ -like 'worktree *' } | Where-Object { (($_.Substring(9) -replace '/', '\').TrimEnd('\')) -ieq $wd }).Count -gt 0
+                # Sol r1 B1/B2: EVERY attempt that may delete (git again, or our own delete) first runs the first decision's refusal set - positive
+                # holders, then the cwd probe - on a snapshot taken now. A holder that started during the retry window refuses here, as it would have
+                # at the gate; the worktree is kept and nothing more is deleted. A failed scan is not an all-clear.
+                if ($stillRegistered -or (Test-Path -LiteralPath $wd)) {
+                    $fresh2 = try { Get-LaneProcessSnapshot } catch { $null }
+                    if ($null -eq $fresh2) { $last = 'cannot-determine: process rescan before the removal retry'; break }
+                    $live2 = @(Find-WorktreeHolders -WorktreePath $wd -Snapshot $fresh2)
+                    if ($live2.Count) {
+                        $d.holders = @($live2 | ForEach-Object { "$($_.ProcessId) $($_.Name) $($_.Via)" })
+                        Write-RefusedHolders -WorktreePath $wd -Holders $live2
+                        $d.reason = 'live-process: ' + (($live2 | ForEach-Object { "$($_.ProcessId) $($_.Name) [$($_.Via)]" }) -join ', ')
+                        return [pscustomobject]$d
+                    }
+                    if (Test-CwdRefusal $fresh2) { return [pscustomobject]$d }
+                }
                 if ($stillRegistered) {
                     $r = Run-Git $main $removeArgs
                     $last = if ($r.code) { $r.out -join ' | ' } else { $null }
                 } elseif (Test-Path -LiteralPath $wd) {
                     if (Test-Path -LiteralPath (Join-Path $wd '.git')) { $last = 'a .git entry is still in a deregistered directory; not deleting it'; break }
-                    if (-not $rescanned) {
-                        $rescanned = $true
-                        $fresh2 = try { Get-LaneProcessSnapshot } catch { $null }
-                        if ($null -eq $fresh2) { $last = 'cannot-determine: process rescan before finishing the removal'; break }
-                        $live2 = @(Find-WorktreeHolders -WorktreePath $wd -Snapshot $fresh2)
-                        if ($live2.Count) {
-                            $d.holders = @($live2 | ForEach-Object { "$($_.ProcessId) $($_.Name) $($_.Via)" })
-                            Write-RefusedHolders -WorktreePath $wd -Holders $live2
-                            $last = 'live-process: ' + (($live2 | ForEach-Object { "$($_.ProcessId) $($_.Name) [$($_.Via)]" }) -join ', ')
-                            break
-                        }
-                    }
                     $last = try { [IO.Directory]::Delete($wd, $true); $null } catch { $_.Exception.Message }
                 } else {
                     $last = $null
