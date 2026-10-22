@@ -9,6 +9,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -216,6 +217,7 @@ class AtomicWriteTests(unittest.TestCase):
     """
     WRITES = 400
     DEADLINE_SEC = 90
+    MIN_OVERLAPPED = 50
 
     def start_target(self):
         target = Path(tempfile.mkdtemp(prefix='product-share-atomic-')) / 'state' / 'product-share-verdict.json'
@@ -224,16 +226,23 @@ class AtomicWriteTests(unittest.TestCase):
         target.write_text(json.dumps({'verdict': 'RED', 'pad': 'x' * 2000}), encoding='ascii')
         return target
 
-    def drive_writer(self, target, cmd):
-        """Runs the writer child while polling the target; returns (writer returncode, writer output, poll stats)."""
+    def drive_writer(self, target, cmd, handshake=False):
+        """Runs the writer child while polling the target; returns (writer returncode, writer output, poll stats).
+
+        With handshake=True the reader creates PS_SEEN0 once it has read generation 0, and the writer cmd waits for that file.
+        """
         env = dict(os.environ, PS_SCRIPT=str(SCRIPT), PS_TARGET=str(target), PS_WRITES=str(self.WRITES))
+        seen0 = None
+        if handshake:
+            seen0 = target.parent.parent / 'seen-generation-0.flag'
+            env['PS_SEEN0'] = str(seen0)
         # Output goes to files, not pipes: a failing writer is chatty and a full pipe would block it while this loop keeps polling.
         out_path = target.parent.parent / 'writer.out.txt'
         err_path = target.parent.parent / 'writer.err.txt'
         with open(out_path, 'w') as out_f, open(err_path, 'w') as err_f:
             writer = subprocess.Popen(PWSH + ['-Command', cmd], stdout=out_f, stderr=err_f, env=env)
             try:
-                stats = self.poll_while_running(writer, target, self.DEADLINE_SEC)
+                stats = self.poll_while_running(writer, target, self.DEADLINE_SEC, seen0)
             finally:
                 # A writer that is still alive here hung or timed out; it must not outlive the test or keep the output files open.
                 if writer.poll() is None:
@@ -250,7 +259,11 @@ class AtomicWriteTests(unittest.TestCase):
     def assert_overlapped(self, stats):
         # Reads taken while pwsh starts, or after a stalled writer, prove nothing: the reader must have watched the file change.
         self.assertGreaterEqual(stats['generations'], 2, f'the reader saw fewer than 2 distinct rewrites: {stats}')
-        self.assertGreater(stats['overlapped'], 50, f'too few reads overlapped active rewrites: {stats}')
+        self.assertGreater(stats['overlapped'], self.MIN_OVERLAPPED, f'too few reads overlapped active rewrites: {stats}')
+        # Make the margin above the floor visible on success, so a slowly eroding margin shows before it turns into a red run.
+        print(f'overlap check passed: {stats["overlapped"]} bracketed reads of {stats["reads"]} '
+              f'(floor > {self.MIN_OVERLAPPED}, margin {stats["overlapped"] - self.MIN_OVERLAPPED}), '
+              f'{stats["generations"]} generations', file=sys.stderr)
 
     def test_rewriting_the_verdict_never_shows_a_reader_an_absent_or_partial_file(self):
         target = self.start_target()
@@ -273,15 +286,19 @@ class AtomicWriteTests(unittest.TestCase):
             self.assert_overlapped(stats)
 
     def test_reads_in_the_idle_tail_after_two_generations_do_not_raise_the_overlap_count(self):
-        # The writer publishes generation 0, then 1, then idles for 2 s. Every read of the idle tail sees generation 1 and no
-        # change after it, so none of them was taken during an active rewrite.
+        # The writer publishes generation 0, waits (bounded) until the reader signals it has read generation 0, publishes 1, then
+        # idles for 2 s. A fixed sleep here let a reader descheduled past it miss generation 0 and see generations == 1. Every
+        # read of the idle tail sees generation 1 and no change after it, so none of them was taken during an active rewrite.
         target = self.start_target()
         cmd = (". $env:PS_SCRIPT; "
                "Write-FileAtomic $env:PS_TARGET ('{\"verdict\":\"GREEN\",\"i\":0,\"pad\":\"' + ('y' * 2000) + '\"}'); "
-               "Start-Sleep -Milliseconds 100; "
+               "$sw = [Diagnostics.Stopwatch]::StartNew(); "
+               "while (-not (Test-Path -LiteralPath $env:PS_SEEN0)) { "
+               "if ($sw.Elapsed.TotalSeconds -gt 10) { [Console]::Error.WriteLine('the reader never signalled it observed generation 0 within 10 s'); exit 3 }; "
+               "Start-Sleep -Milliseconds 10 }; "
                "Write-FileAtomic $env:PS_TARGET ('{\"verdict\":\"GREEN\",\"i\":1,\"pad\":\"' + ('y' * 2000) + '\"}'); "
                "Start-Sleep -Seconds 2")
-        returncode, output, stats = self.drive_writer(target, cmd)
+        returncode, output, stats = self.drive_writer(target, cmd, handshake=True)
         self.assertEqual(returncode, 0, output)
         self.assertEqual(stats['generations'], 2, f'the reader must watch both rewrites: {stats}')
         self.assertGreater(stats['idle_tail'], 50, f'the idle tail must accrue enough reads to defeat a bare read count: {stats}')
@@ -329,7 +346,7 @@ class AtomicWriteTests(unittest.TestCase):
         return bracketed
 
     @classmethod
-    def poll_while_running(cls, writer, target, deadline_sec):
+    def poll_while_running(cls, writer, target, deadline_sec, seen0=None):
         deadline = time.monotonic() + deadline_sec
         stats = {'reads': 0, 'absent': 0, 'partial': 0, 'timed_out': False}
         # The seed file has no 'i'; every rewrite carries its generation number. Each read is recorded in trace and the
@@ -352,6 +369,8 @@ class AtomicWriteTests(unittest.TestCase):
             except PermissionError:
                 pass  # a sharing violation while the swap is in flight: the file exists, the read is simply retried
             trace.append(generation)
+            if seen0 is not None and generation == 0 and not seen0.exists():
+                seen0.touch()  # handshake: tells a waiting writer this reader has observed generation 0
             if generation is not None and generation != last_generation:
                 last_generation = generation
                 last_change = len(trace) - 1
