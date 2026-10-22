@@ -145,6 +145,15 @@ $script:HolderScriptExt = 'ps1|psm1|py|cmd|bat|js|mjs'
 $script:HolderMaxFilesPerProcess = 40
 $script:HolderMaxBytes = 524288
 $script:HolderMaxDepth = 3
+# CI-FLAKE-RETIRE-HOLDER-EXIT-PERMISSION-DENIED-1: a handle can outlive the process that held it (a exited holder, Defender, the indexer), so the one
+# `git worktree remove` can fail with access-denied after the gate saw nothing. Git renders the Windows errors as "Permission denied" (EACCES) or
+# "Invalid argument" (EINVAL from a sharing violation on a file open without FILE_SHARE_DELETE); native tools as "Access is denied" / "being used by
+# another process". Only a failure matching this pattern is retried; any other message is the first and only attempt.
+$script:RemoveRetryablePattern = 'Permission denied|Access is denied|Access to the path|Invalid argument|being used by another process|sharing violation|Device or resource busy'
+# The retry budget is bounded in both time and attempts; tests shrink it through these two seams.
+$script:RemoveRetryBudgetMs = 15000
+$script:RemoveRetryDelayMs = 250
+$script:RemoveRetryMaxAttempts = 40
 
 if (-not ('MlvProcCwd' -as [type])) {
     # Current directory of another process: Win32_Process does not expose it. Reads PEB->ProcessParameters->CurrentDirectory
@@ -609,6 +618,8 @@ function Invoke-RetireLaneWorktree {
         # LANE-FSMONITOR-PIN-AND-RETIRE-HARDENING-1 r2: what each fsmonitor step did, as 'action' or 'action: reason' ('stopped', 'none: no daemon',
         # 'failed: ...', 'not-run: ...'). Best effort: never changes `action`/`reason`, but a 'failed' here means a daemon may still be running.
         fsmonitorStop = [ordered]@{ disable = $null; early = $null; remove = $null; final = $null }
+        # CI-FLAKE-RETIRE-HOLDER-EXIT-PERMISSION-DENIED-1: how many removal attempts ran (0 = never reached) and one note per failed attempt.
+        removeAttempts = 0; removeNotes = @()
         utc = (Get-Date).ToUniversalTime().ToString('o')
     }
     function Get-FsmonitorStepNote([object]$Result) {
@@ -725,8 +736,62 @@ function Invoke-RetireLaneWorktree {
         $removeStop = $null
         if (Get-Command Stop-LaneWorktreeFsmonitor -ErrorAction SilentlyContinue) { $removeStop = Stop-LaneWorktreeFsmonitor -WorkDir $wd }
         $d.fsmonitorStop.remove = Get-FsmonitorStepNote $removeStop
-        $r = Run-Git $main @('-c', 'core.longpaths=true', 'worktree', 'remove', $wd)
-        if ($r.code) { $d.reason = 'remove-failed: ' + ($r.out -join ' | '); return [pscustomobject]$d }
+        $removeArgs = @('-c', 'core.longpaths=true', 'worktree', 'remove', $wd)
+        $r = Run-Git $main $removeArgs
+        $d.removeAttempts = 1
+        $last = if ($r.code) { $r.out -join ' | ' } elseif (Test-Path -LiteralPath $wd) { 'Permission denied: worktree remove exited 0 but the directory is still there' } else { $null }
+        if ($last) {
+            # CI-FLAKE-RETIRE-HOLDER-EXIT-PERMISSION-DENIED-1: the gate saw no holder, yet a handle can still be open (an exited holder's, Defender's).
+            # Only an access-denied / sharing-violation failure is retried; anything else is the answer as it stands.
+            if ($last -notmatch $script:RemoveRetryablePattern) { $d.reason = 'remove-failed: ' + $last; return [pscustomobject]$d }
+            # git half-fails here (TRAPS, worktree removal on Windows): it deregisters the worktree and deletes its `.git` link, then stops with
+            # files left behind, so the same command cannot be re-run ("is not a working tree"). Each round therefore asks what state git left:
+            # still registered -> run git again; deregistered and the directory remains -> finish the delete ourselves (nothing the gate did not
+            # already clear: clean, pushed, merged, no live holder), after a fresh holder + cwd scan before EACH attempt.
+            $sw = [Diagnostics.Stopwatch]::StartNew()
+            while ($true) {
+                $d.removeNotes += "attempt $($d.removeAttempts) at $($sw.ElapsedMilliseconds) ms: $last"
+                if ($sw.ElapsedMilliseconds -ge $script:RemoveRetryBudgetMs -or $d.removeAttempts -ge $script:RemoveRetryMaxAttempts) { break }
+                Start-Sleep -Milliseconds $script:RemoveRetryDelayMs
+                $d.removeAttempts++
+                $wl2 = Run-Git $main @('worktree', 'list', '--porcelain')
+                if ($wl2.code) { $last = 'cannot-determine: worktree list: ' + ($wl2.out -join ' | '); break }
+                $stillRegistered = @($wl2.out | Where-Object { $_ -like 'worktree *' } | Where-Object { (($_.Substring(9) -replace '/', '\').TrimEnd('\')) -ieq $wd }).Count -gt 0
+                # Sol r1 B1/B2: EVERY attempt that may delete (git again, or our own delete) first runs the first decision's refusal set - positive
+                # holders, then the cwd probe - on a snapshot taken now. A holder that started during the retry window refuses here, as it would have
+                # at the gate; the worktree is kept and nothing more is deleted. A failed scan is not an all-clear.
+                if ($stillRegistered -or (Test-Path -LiteralPath $wd)) {
+                    $fresh2 = try { Get-LaneProcessSnapshot } catch { $null }
+                    if ($null -eq $fresh2) { $last = 'cannot-determine: process rescan before the removal retry'; break }
+                    $live2 = @(Find-WorktreeHolders -WorktreePath $wd -Snapshot $fresh2)
+                    if ($live2.Count) {
+                        $d.holders = @($live2 | ForEach-Object { "$($_.ProcessId) $($_.Name) $($_.Via)" })
+                        Write-RefusedHolders -WorktreePath $wd -Holders $live2
+                        $d.reason = 'live-process: ' + (($live2 | ForEach-Object { "$($_.ProcessId) $($_.Name) [$($_.Via)]" }) -join ', ')
+                        return [pscustomobject]$d
+                    }
+                    if (Test-CwdRefusal $fresh2) { return [pscustomobject]$d }
+                }
+                if ($stillRegistered) {
+                    $r = Run-Git $main $removeArgs
+                    $last = if ($r.code) { $r.out -join ' | ' } else { $null }
+                } elseif (Test-Path -LiteralPath $wd) {
+                    if (Test-Path -LiteralPath (Join-Path $wd '.git')) { $last = 'a .git entry is still in a deregistered directory; not deleting it'; break }
+                    $last = try { [IO.Directory]::Delete($wd, $true); $null } catch { $_.Exception.Message }
+                } else {
+                    $last = $null
+                }
+                # Success is the directory being gone, never an exit code.
+                if (-not (Test-Path -LiteralPath $wd)) { $last = $null; break }
+                if (-not $last) { $last = 'Permission denied: the directory is still there after the removal' }
+                if ($last -notmatch $script:RemoveRetryablePattern) { break }
+            }
+            if (Test-Path -LiteralPath $wd) {
+                $d.reason = "remove-failed: $last (after $($d.removeAttempts) attempt(s) over $($sw.ElapsedMilliseconds) ms; budget $($script:RemoveRetryBudgetMs) ms)"
+                return [pscustomobject]$d
+            }
+        }
+        if (Test-Path -LiteralPath $wd) { $d.reason = 'remove-failed: the directory is still there after the removal'; return [pscustomobject]$d }
         $d.action = 'retired'; $d.reason = 'ok'
     } catch {
         $d.action = 'kept'; $d.reason = "cannot-determine: $($_.Exception.Message)"
