@@ -5,6 +5,7 @@ filename matching, or treating an orphan as a match.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 
@@ -192,6 +193,31 @@ def test_a_stamped_invalid_manifest_binds_nothing_through_the_unchanged_api(tmp_
     assert "commit" not in result["frames"][0]
 
 
+@pytest.mark.parametrize("fields", [
+    {"status": "invalid", "invalid": True, "invalid_reasons": ["OWNER_FOOTAGE_VIEW_CHANGED_DURING_CAPTURE"]},
+    {"invalid": True},
+    {"status": "invalid"},
+], ids=["full-runner-stamp", "invalid-flag-only", "status-only"])
+def test_every_stamp_shape_binds_nothing_through_the_signatures_that_predate_the_skip_report(tmp_path, fields):
+    """REFERENCE-FRAME-STAMP-SHAPES-BEHAVIOURAL-RED-1: the parametrized test above calls ``index_capture_records(root, skipped)``, so on a reader
+    that predates #564 all three of its cases die with a TypeError on the new parameter and never reach the behaviour. This one passes no
+    ``skipped`` at all, so against that reader it fails on the assertion: a stamped manifest is still indexed (1 entry, not 0)."""
+    ob = tmp_path / "outbox"
+    d = _capture(str(ob), "voided", b"PIXELS-V", _manifest("aaaaaaaaaaaa"))
+    _stamp_invalid(d, **fields)
+    assert not os.path.exists(os.path.join(d, "reference-frame-candidate.invalid"))
+    frames = tmp_path / "frames"
+    frames.mkdir()
+    (frames / "v.png").write_bytes(b"PIXELS-V")
+
+    index = index_capture_records(str(ob))
+    result = build(str(frames), str(ob))
+
+    assert len(index) == 0, "a manifest stamped invalid was indexed as a candidate"
+    assert (result["recordsIndexed"], result["matched"], result["orphaned"]) == (0, 0, 1)
+    assert "commit" not in result["frames"][0] and "manifest" not in result["frames"][0]
+
+
 def test_a_marker_skip_carries_its_own_typed_reason(tmp_path):
     ob = tmp_path / "outbox"
     d = _capture(str(ob), "voided", b"PIXELS-V", _manifest("aaaaaaaaaaaa"))
@@ -217,6 +243,48 @@ def test_a_valid_capture_output_is_unchanged_and_names_no_skips(tmp_path):
 
     assert (result["matched"], result["orphaned"]) == (1, 0)
     assert "skipped" not in result
+    # The whole document, key order included, so a future key (or a reordering) in the valid case cannot slip past a counts-only check.
+    manifest = _manifest("aaaaaaaaaaaa")
+    expected = {
+        "schema": SCHEMA,
+        "framesDir": str(frames),
+        "outboxRoot": str(ob),
+        "recordsIndexed": 1,
+        "matched": 1,
+        "orphaned": 0,
+        "frames": [{
+            "frame": "f.png",
+            "sha256": hashlib.sha256(b"PIXELS-A").hexdigest(),
+            "commit": "aaaaaaaaaaaa",
+            "host": "BENCH",
+            "capturedUtc": "2026-09-03T12:00:00Z",
+            "exeSha256": manifest["executable"]["sha256"],
+            "clipSha256": manifest["clip"]["sha256"],
+            "settings": manifest["settings"],
+            "appSettings": manifest["appSettings"],
+            "manifest": os.path.join(str(d), "reference-frame-candidate.json"),
+        }],
+    }
+    assert json.dumps(result) == json.dumps(expected)
+
+
+def test_a_manifest_with_a_utf8_bom_binds_like_any_other(tmp_path):
+    """The reader opens a manifest as utf-8-sig (PowerShell 5.1 writes a BOM); build() must too, or a BOM-prefixed manifest that the index
+    accepted raises JSONDecodeError when the matched row's identity is read."""
+    ob = tmp_path / "outbox"
+    d = _capture(str(ob), "bom", b"PIXELS-A", _manifest("aaaaaaaaaaaa"))
+    with open(os.path.join(d, "reference-frame-candidate.json"), "w", encoding="utf-8-sig") as fh:
+        json.dump(_manifest("aaaaaaaaaaaa"), fh)
+    with open(os.path.join(d, "reference-frame-candidate.json"), "rb") as fh:
+        assert fh.read(3) == b"\xef\xbb\xbf", "fixture lost its BOM"
+    frames = tmp_path / "frames"
+    frames.mkdir()
+    (frames / "f.png").write_bytes(b"PIXELS-A")
+
+    result = build(str(frames), str(ob))
+
+    assert (result["matched"], result["orphaned"]) == (1, 0)
+    assert result["frames"][0]["commit"] == "aaaaaaaaaaaa"
 
 
 def test_an_unparseable_manifest_without_a_marker_keeps_its_existing_behaviour(tmp_path):
