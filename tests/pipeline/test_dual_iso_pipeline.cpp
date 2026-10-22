@@ -4686,8 +4686,9 @@ TEST(DualIsoPipeline, DngFrameAsyncWriterDebugMsEnvRejectsMalformedValues)
 
     // Every value is checked and every writer finished before the one assertion, so a run names
     // each value that arms the hook rather than stopping at the first. Values are quoted so
-    // " 300" and "300 " read apart.
-    const char * const malformed[] = { "1garbage", " 300", "300 ", "+300", "-300", "0x10" };
+    // " 300" and "300 " read apart. " " is the whitespace-only value; an empty value is not
+    // testable here because qputenv("") reads as unset on Windows.
+    const char * const malformed[] = { "1garbage", " 300", "300 ", "+300", "-300", "0x10", " " };
     std::string armed_by;
     for(const char * value : malformed)
     {
