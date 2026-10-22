@@ -140,7 +140,7 @@ $shot = Join-Path $OutDir 'reference-frame.png'
 $runNonce = New-GuiSmokeRunNonce
 $env:MLVAPP_RUN_NONCE = $runNonce
 $applied += 'MLVAPP_RUN_NONCE'
-foreach ($staleReceipt in @($shot, (Join-Path $OutDir 'reference-frame-candidate.json'))) {
+foreach ($staleReceipt in @($shot, (Join-Path $OutDir 'reference-frame-candidate.json'), (Join-Path $OutDir 'reference-frame-candidate.invalid'))) {
     $asideResult = Move-GuiSmokeStaleReceiptAside -Path $staleReceipt
     if (-not $asideResult.ok) { Write-Output "CAPTURE: INVALID - $($asideResult.message)"; exit 43 }
 }

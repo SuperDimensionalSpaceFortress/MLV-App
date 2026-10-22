@@ -113,3 +113,35 @@ def test_non_png_files_are_ignored(tmp_path):
 
     r = build(str(frames), str(ob))
     assert [f["frame"] for f in r["frames"]] == ["f.png"]
+
+
+def test_a_capture_with_an_invalid_marker_is_not_indexed_whatever_its_manifest_says(tmp_path):
+    """VENUE-REFERENCE-FRAME-CANDIDATE-INVALID-MARKER-1: the runner job stamps a voided manifest invalid in place on a best-effort basis; when
+    the stamp cannot be written it leaves reference-frame-candidate.invalid beside it. Marker present = not a candidate, so the pixels of that
+    capture bind to nothing -- even when the manifest still parses and still says candidate-unreviewed."""
+    ob = tmp_path / "outbox"
+    d = _capture(str(ob), "voided", b"PIXELS-V", _manifest("aaaaaaaaaaaa"))
+    _capture(str(ob), "good", b"PIXELS-G", _manifest("bbbbbbbbbbbb"))
+    with open(os.path.join(d, "reference-frame-candidate.invalid"), "w", encoding="utf-8") as fh:
+        json.dump({"invalid": True, "invalid_reasons": ["OWNER_FOOTAGE_VIEW_CHANGED_DURING_CAPTURE"]}, fh)
+
+    index = index_capture_records(str(ob))
+
+    assert len(index) == 1
+    assert list(index.values())[0].endswith(os.path.join("good", "reference-frame-candidate.json"))
+    frames = tmp_path / "frames"
+    frames.mkdir()
+    (frames / "v.png").write_bytes(b"PIXELS-V")
+    result = build(str(frames), str(ob))
+    assert (result["matched"], result["orphaned"]) == (0, 1)
+
+
+def test_an_unparseable_manifest_with_a_marker_does_not_crash_the_index(tmp_path):
+    ob = tmp_path / "outbox"
+    d = _capture(str(ob), "broken", b"PIXELS-B", _manifest("aaaaaaaaaaaa"))
+    with open(os.path.join(d, "reference-frame-candidate.json"), "w", encoding="utf-8") as fh:
+        fh.write('{"status": "candidate-unreviewed", "trunc')
+    with open(os.path.join(d, "reference-frame-candidate.invalid"), "w", encoding="utf-8") as fh:
+        fh.write("{}")
+
+    assert index_capture_records(str(ob)) == {}
