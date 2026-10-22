@@ -9509,37 +9509,79 @@ private:
     ScopedAsyncWriterEnvironment env_;
 };
 
+/* DUALISO-PREFETCH-TEST-ENV-GUARD-FOLLOWUPS-1: the regression for the guard
+ * above. It covers every restoration path the guard owns: each of the four env
+ * keys (two that were set before the body, two that were unset) and both
+ * playback preview modes (plain and aggressive). The outer
+ * ScopedProcessed8PrefetchTestState snapshots the values the process had on
+ * entry (a developer's exported MLVAPP_* key included) and gives them back on
+ * every exit path of this test, so the regression leaves nothing behind. It is
+ * the same guard type, not a second one: it already snapshots and restores. */
 TEST(DualIsoPipeline, Processed8PrefetchTestStateRestoresEnvAndPreviewModeOnEarlyReturn)
 {
-    constexpr const char * kWasSet = "MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH";
-    constexpr const char * kWasUnset = "MLVAPP_PROCESSED8_PREFETCH_INDIRECT";
-    MLVAPP_TEST_SETENV(kWasSet, "prior");
-    MLVAPP_TEST_UNSETENV(kWasUnset);
-    processingSetPlaybackPreviewMode(0);
+    constexpr const char * kPrefetch = "MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH";
+    constexpr const char * kIndirect = "MLVAPP_PROCESSED8_PREFETCH_INDIRECT";
+    constexpr const char * kIndirectX2 = "MLVAPP_PREFETCH_INDIRECT_X2";
+    constexpr const char * kQuarterResX2 = "MLVAPP_DISABLE_QUARTERRES_X2_PROCESSING";
 
-    /* Models a test whose ASSERT_* fails after the sets: it returns without
-     * reaching any straight-line restore at the end of the body. */
-    const auto body_that_returns_early = []() {
-        ScopedProcessed8PrefetchTestState state;
-        MLVAPP_TEST_SETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH", "1");
-        MLVAPP_TEST_SETENV("MLVAPP_PROCESSED8_PREFETCH_INDIRECT", "0");
-        processingSetPlaybackPreviewMode(1);
-        return;
+    struct Incoming
+    {
+        bool was_set;
+        QByteArray value;
     };
-    body_that_returns_early();
+    const auto read_incoming = [](const char * key) {
+        return Incoming{ qEnvironmentVariableIsSet(key), qgetenv(key) };
+    };
+    const Incoming incoming_prefetch = read_incoming(kPrefetch);
+    const Incoming incoming_indirect = read_incoming(kIndirect);
+    const Incoming incoming_indirect_x2 = read_incoming(kIndirectX2);
+    const Incoming incoming_quarter_x2 = read_incoming(kQuarterResX2);
 
-    const bool was_set_restored = qEnvironmentVariableIsSet(kWasSet) && qgetenv(kWasSet) == QByteArray("prior");
-    const bool was_unset_restored = !qEnvironmentVariableIsSet(kWasUnset);
-    const int preview_mode_after = processingPlaybackPreviewModeEnabled();
+    {
+        ScopedProcessed8PrefetchTestState outer;
 
-    /* Put the process back before asserting so a failure here cannot cascade. */
-    MLVAPP_TEST_UNSETENV(kWasSet);
-    MLVAPP_TEST_UNSETENV(kWasUnset);
-    processingSetPlaybackPreviewMode(0);
+        /* Baseline the inner guard must hand back: two keys set, two unset. */
+        MLVAPP_TEST_SETENV(kPrefetch, "prior-prefetch");
+        MLVAPP_TEST_UNSETENV(kIndirect);
+        MLVAPP_TEST_SETENV(kIndirectX2, "prior-indirect-x2");
+        MLVAPP_TEST_UNSETENV(kQuarterResX2);
+        processingSetPlaybackPreviewMode(0);
+        processingSetPlaybackAggressivePreviewMode(0);
 
-    ASSERT_TRUE(was_set_restored);
-    ASSERT_TRUE(was_unset_restored);
-    ASSERT_EQ(0, preview_mode_after);
+        /* Models a test whose ASSERT_* fails after the sets: it returns without
+         * reaching any straight-line restore at the end of the body. */
+        const auto body_that_returns_early = []() {
+            ScopedProcessed8PrefetchTestState state;
+            MLVAPP_TEST_SETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH", "1");
+            MLVAPP_TEST_SETENV("MLVAPP_PROCESSED8_PREFETCH_INDIRECT", "0");
+            MLVAPP_TEST_SETENV("MLVAPP_PREFETCH_INDIRECT_X2", "1");
+            MLVAPP_TEST_SETENV("MLVAPP_DISABLE_QUARTERRES_X2_PROCESSING", "1");
+            processingSetPlaybackPreviewMode(1);
+            processingSetPlaybackAggressivePreviewMode(1);
+            return;
+        };
+        body_that_returns_early();
+
+        ASSERT_TRUE(qEnvironmentVariableIsSet(kPrefetch) && qgetenv(kPrefetch) == QByteArray("prior-prefetch"));
+        ASSERT_TRUE(!qEnvironmentVariableIsSet(kIndirect));
+        ASSERT_TRUE(qEnvironmentVariableIsSet(kIndirectX2) && qgetenv(kIndirectX2) == QByteArray("prior-indirect-x2"));
+        ASSERT_TRUE(!qEnvironmentVariableIsSet(kQuarterResX2));
+        ASSERT_EQ(0, processingPlaybackPreviewModeEnabled());
+        ASSERT_EQ(0, processingPlaybackAggressivePreviewModeEnabled());
+    }
+
+    /* The outer guard is gone: the values this process entered the test with
+     * are back, a set key with its exact value and an unset key unset. */
+    const auto matches_incoming = [](const char * key, const Incoming & incoming) {
+        return qEnvironmentVariableIsSet(key) == incoming.was_set
+            && (!incoming.was_set || qgetenv(key) == incoming.value);
+    };
+    ASSERT_TRUE(matches_incoming(kPrefetch, incoming_prefetch));
+    ASSERT_TRUE(matches_incoming(kIndirect, incoming_indirect));
+    ASSERT_TRUE(matches_incoming(kIndirectX2, incoming_indirect_x2));
+    ASSERT_TRUE(matches_incoming(kQuarterResX2, incoming_quarter_x2));
+    ASSERT_EQ(0, processingPlaybackPreviewModeEnabled());
+    ASSERT_EQ(0, processingPlaybackAggressivePreviewModeEnabled());
 }
 
 /* Phase: Mean23 playback override (this commit). The receipt asks for AMaZE
