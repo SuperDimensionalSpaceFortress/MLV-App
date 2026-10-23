@@ -306,13 +306,40 @@ function ConvertTo-DvWindowsArg {
 # hook takes it cannot have started anything (a test sets a sleep here to prove the escape window is closed).
 $script:DvStartGate = $null
 
+# Test seams, empty in production (DV-GIT-NATIVE-START-TYPED-FAILURE-1). DvNativeFault maps a native call's name (AssignProcessToJobObject,
+# ResumeThread, GetExitCodeProcess) to the result to read INSTEAD of the real one; the real call still runs, so the child exists and the
+# cleanup is real. DvNewPipeStream builds one parent-side pipe stream from a raw handle; a test swaps in one that throws.
+$script:DvNativeFault = @{}
+$script:DvNewPipeStream = { param([IntPtr]$h) [System.IO.Pipes.AnonymousPipeClientStream]::new([System.IO.Pipes.PipeDirection]::In, [Microsoft.Win32.SafeHandles.SafePipeHandle]::new($h, $true)) }
+
+function Resolve-DvNativeResult {
+    param([Parameter(Mandatory)][string]$Name, $Real)
+    if ($script:DvNativeFault.ContainsKey($Name)) { return $script:DvNativeFault[$Name] }
+    $Real
+}
+
 function Start-DvGitInJob {
     # CI-FLAKE-DV-GIT-PIPE-STRAGGLER-KILL-1: start $Psi's program SUSPENDED, put it in $Job, then resume it, so that nothing git starts can
     # ever be outside the job. Process.Start then AssignProcessToJobObject left a window (measured: 20 ms was enough on an idle host, and
     # `sh -c 'x & exit 0'` was already in the grandchild's hands): a child started inside it escaped TerminateJobObject, its parent exited, and
     # Kill($true) had no parent chain to follow, so the straggler kill was not confirmed on a loaded hosted runner.
-    # Returns @{ Process; Out; Err } (Out: stdout stream; Err: stderr reader), or $null on ANY failure with nothing left open: the caller then
-    # takes the Process.Start path, which also produces the typed DV_GIT_START_FAILED message. 64-bit only (the buffers below are x64 layouts).
+    # Returns @{ Failure = $null; Process; Handle; Out; Err } (Handle: the process handle, the caller's to close; Out: stdout stream; Err: stderr
+    # reader), or
+    #   * $null when NO child exists yet (CreatePipe / SetHandleInformation / CreateProcessW failed, or not 64-bit) with nothing left open: the
+    #     caller then takes the Process.Start path, which also produces the typed DV_GIT_START_FAILED message; or
+    #   * @{ Failure = <token>; Detail } once a child HAS been created: DV_GIT_START_FAILED (a step before the job assignment threw),
+    #     DV_GIT_JOB_ASSIGN_FAILED (AssignProcessToJobObject returned false), DV_GIT_RESUME_FAILED (ResumeThread returned -1 or left the thread
+    #     suspended), DV_GIT_STREAM_FAILED (a throw building the pipe streams after the resume). The child is then already terminated (with its job)
+    #     and every handle and stream closed, and the caller must NOT start another git: it refuses, exit -1. Each token is its own status and is
+    #     never DV_GIT_TIMEOUT. 64-bit only (the buffers below are x64 layouts).
+    # LIMIT (F, DV-GIT-NATIVE-START-TYPED-FAILURE-1): CreateProcessW is called with bInheritHandles = TRUE and NO PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+    # so the child inherits every inheritable handle of this process, not only its three pipe ends. The pipe ends are created inheritable (the
+    # SECURITY_ATTRIBUTES below) and the parent's ends are made non-inheritable straight after, so today the window is the few calls between
+    # CreatePipe and CreateProcessW in ONE thread. Nothing here is thread-safe (the script-scope seams, the counters and the cached $Native are
+    # per module), and no caller runs two Invoke-DvGit calls at once. Before a parallel caller exists this MUST get an explicit handle list
+    # (InitializeProcThreadAttributeList + UpdateProcThreadAttribute with the three child ends, EXTENDED_STARTUPINFO_PRESENT, STARTUPINFOEXW),
+    # or a process-wide lock around create-pipe .. CreateProcessW. Not done here: it needs three more P/Invokes, a STARTUPINFOEXW layout and a
+    # test that enumerates the child's handles, and a half-built list is worse than the documented limit.
     param([Parameter(Mandatory)]$Native, [Parameter(Mandatory)][IntPtr]$Job, [Parameter(Mandatory)]$Psi)
     if ([IntPtr]::Size -ne 8) { return $null }
     $m = [Runtime.InteropServices.Marshal]
@@ -320,6 +347,10 @@ function Start-DvGitInJob {
     $mem = [Collections.Generic.List[IntPtr]]::new()
     $suspendedThread = [IntPtr]::Zero
     $suspendedProcess = [IntPtr]::Zero
+    $childPid = 0
+    $created = $false
+    $step = 'DV_GIT_START_FAILED'   # the token a throw is reported under once the child exists
+    $proc = $null; $outStream = $null; $errStream = $null
     try {
         $alloc = { param([int]$n) $p = $m::AllocHGlobal($n); $m::Copy([byte[]]::new($n), 0, $p, $n); $mem.Add($p); $p }
         $sa = & $alloc 24
@@ -347,27 +378,42 @@ function Start-DvGitInJob {
         # CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW, the parent's current directory, handles inherited (as Process.Start does).
         if (-not $Native::CreateProcessW([IntPtr]::Zero, $cmdPtr, [IntPtr]::Zero, [IntPtr]::Zero, $true, [uint32](0x4 -bor 0x400 -bor 0x08000000), $envPtr, [IntPtr]::Zero, $si, $pi)) { throw 'CreateProcessW failed' }
         $suspendedProcess = $m::ReadIntPtr($pi, 0); $suspendedThread = $m::ReadIntPtr($pi, 8); $childPid = $m::ReadInt32($pi, 16)
-        try {
-            $proc = [System.Diagnostics.Process]::GetProcessById($childPid)
-            if ($null -ne $script:DvStartGate) { & $script:DvStartGate }
-            [void]$Native::AssignProcessToJobObject($Job, $suspendedProcess)   # a false return leaves Kill($true) only, as before
-        } catch {
-            # Never leave a suspended child behind, and never let the Process.Start fallback run a second git beside it.
-            try { [System.Diagnostics.Process]::GetProcessById($childPid).Kill() } catch { $null = $_ }
-            throw
-        }
-        [void]$Native::ResumeThread($suspendedThread)
+        $created = $true
+        $proc = [System.Diagnostics.Process]::GetProcessById($childPid)
+        if ($null -ne $script:DvStartGate) { & $script:DvStartGate }
+        $step = 'DV_GIT_JOB_ASSIGN_FAILED'
+        if (-not (Resolve-DvNativeResult 'AssignProcessToJobObject' ($Native::AssignProcessToJobObject($Job, $suspendedProcess)))) { throw 'AssignProcessToJobObject returned false' }
+        $step = 'DV_GIT_RESUME_FAILED'
+        # ResumeThread returns the previous suspend count: 1 for the thread CREATE_SUSPENDED made (now running), -1 (0xFFFFFFFF) on failure,
+        # and more than 1 when the thread stays suspended.
+        $resumed = [uint32](Resolve-DvNativeResult 'ResumeThread' ($Native::ResumeThread($suspendedThread)))
+        if ($resumed -eq [uint32]::MaxValue -or $resumed -gt 1) { throw "ResumeThread returned $resumed" }
+        $step = 'DV_GIT_STREAM_FAILED'   # from here on the child is RUNNING: any throw terminates it and is typed, never a null
         # The child's ends and the stdin writer close here: the child holds its own copies, and a closed stdin reads EOF at once.
         foreach ($h in @($in[0], $in[1], $out[1], $err[1])) { [void]$Native::CloseHandle($h); [void]$handles.Remove($h) }
-        $outStream = [System.IO.Pipes.AnonymousPipeClientStream]::new([System.IO.Pipes.PipeDirection]::In, [Microsoft.Win32.SafeHandles.SafePipeHandle]::new($out[0], $true))
+        $outStream = & $script:DvNewPipeStream $out[0]
         [void]$handles.Remove($out[0])
-        $errStream = [System.IO.Pipes.AnonymousPipeClientStream]::new([System.IO.Pipes.PipeDirection]::In, [Microsoft.Win32.SafeHandles.SafePipeHandle]::new($err[0], $true))
+        $errStream = & $script:DvNewPipeStream $err[0]
         [void]$handles.Remove($err[0])
+        $reader = [System.IO.StreamReader]::new($errStream, [Text.UTF8Encoding]::new($false), $true)
         # The process handle stays open for the caller (Handle): Process.ExitCode does not read for a process opened by id, GetExitCodeProcess does.
         $handle = $suspendedProcess; $suspendedProcess = [IntPtr]::Zero
-        [pscustomobject]@{ Process = $proc; Handle = $handle; Out = $outStream; Err = [System.IO.StreamReader]::new($errStream, [Text.UTF8Encoding]::new($false), $true) }
+        [pscustomobject]@{ Failure = $null; Process = $proc; Handle = $handle; Out = $outStream; Err = $reader }
     } catch {
-        $null
+        if ($created) {
+            # One cleanup for every failure after the child exists (before: some paths killed the suspended child, the stream path left a running
+            # one unwatched): terminate it and everything in its job, close the streams and the Process, and report a typed failure. Never a null,
+            # which would make the caller start another git beside this one.
+            $detail = $_.Exception.Message
+            try { if ($null -ne $proc) { $proc.Kill($true) } else { [System.Diagnostics.Process]::GetProcessById($childPid).Kill($true) } } catch { $null = $_ }
+            [void]$Native::TerminateJobObject($Job, [uint32]1)
+            try { if ($null -ne $proc) { [void]$proc.WaitForExit(5000) } } catch { $null = $_ }
+            foreach ($s in @($errStream, $outStream)) { if ($null -ne $s) { try { $s.Dispose() } catch { $null = $_ } } }
+            if ($null -ne $proc) { try { $proc.Dispose() } catch { $null = $_ } }
+            [pscustomobject]@{ Failure = $step; Detail = $detail }
+        } else {
+            $null
+        }
     } finally {
         foreach ($h in $handles) { [void]$Native::CloseHandle($h) }
         if ($suspendedThread -ne [IntPtr]::Zero) { [void]$Native::CloseHandle($suspendedThread) }
@@ -379,10 +425,12 @@ function Start-DvGitInJob {
 function Get-DvExitCode {
     # The exit code of an exited git: Process.ExitCode, except for a process Start-DvGitInJob started (its Process was opened by id, whose
     # ExitCode does not read), where it is GetExitCodeProcess on the handle the call kept. A signed int, as Process.ExitCode is.
+    # $null when GetExitCodeProcess fails (DV-GIT-NATIVE-START-TYPED-FAILURE-1 I3: the code starts at 0, so ignoring the return read a failure
+    # as git exiting 0); the callers refuse typed (DV_GIT_EXITCODE_FAILED), never admit.
     param([Parameter(Mandatory)]$Proc, $Started, $Native)
     if ($null -eq $Started) { return $Proc.ExitCode }
     [uint32]$code = 0
-    [void]$Native::GetExitCodeProcess($Started.Handle, [ref]$code)
+    if (-not (Resolve-DvNativeResult 'GetExitCodeProcess' ($Native::GetExitCodeProcess($Started.Handle, [ref]$code)))) { return $null }
     [BitConverter]::ToInt32([BitConverter]::GetBytes($code), 0)
 }
 
@@ -430,6 +478,11 @@ function Invoke-DvGit {
         # CI-FLAKE-DV-GIT-PIPE-STRAGGLER-KILL-1: on Windows git is started suspended and resumed only once it is in the job (Start-DvGitInJob),
         # so everything it starts is in the job. Process.Start and then Assign (the fallback below) left a window in which a child escaped it.
         $started = $(if ($job -ne [IntPtr]::Zero) { Start-DvGitInJob -Native $native -Job $job -Psi $psi })
+        if ($null -ne $started -and $null -ne $started.Failure) {
+            # DV-GIT-NATIVE-START-TYPED-FAILURE-1: a child was created and has been terminated and cleaned up. Refuse typed; starting another git
+            # here (the Process.Start path below) is exactly what a null used to cause.
+            return [pscustomobject]@{ exitCode = -1; bytes = [byte[]]@(); stderr = "$($started.Failure) git was created but could not be started cleanly ($($started.Detail)): git $($GitArgs -join ' ')" }
+        }
         if ($null -ne $started) {
             $proc = $started.Process
             $pipes = $started
@@ -470,13 +523,16 @@ function Invoke-DvGit {
         if (-not $drained) {
             $gitExit = Get-DvExitCode -Proc $proc -Started $pipes -Native $native
             Stop-DvGitCall -Proc $proc -Job $job -Tag $tag
+            if ($null -eq $gitExit) { return [pscustomobject]@{ exitCode = -1; bytes = [byte[]]@(); stderr = "DV_GIT_EXITCODE_FAILED GetExitCodeProcess failed for an exited git (and a process it started held its output open): git $($GitArgs -join ' ')" } }
             # r3 (CoS N4): the kill is confirmed by the evidence that matters, the pipes closing. Closed within 5 s = every holder of the pipe
             # closed its copy of it (KILL-NOT-CONFIRMED-ROW-1: a holder that ended on its own in that window counts, as does one that was killed).
             $confirmed = $false
             try { $confirmed = [System.Threading.Tasks.Task]::WaitAll([System.Threading.Tasks.Task[]]@($outTask, $errTask), 5000) } catch { $null = $_ }
             return [pscustomobject]@{ exitCode = -1; bytes = [byte[]]@(); stderr = (Get-DvStragglerMessage -GitExit $gitExit -Seconds ($drain / 1000) -KillConfirmed $confirmed -GitArgs $GitArgs) }
         }
-        [pscustomobject]@{ exitCode = (Get-DvExitCode -Proc $proc -Started $pipes -Native $native); bytes = $ms.ToArray(); stderr = $errTask.Result }
+        $gitExit = Get-DvExitCode -Proc $proc -Started $pipes -Native $native
+        if ($null -eq $gitExit) { return [pscustomobject]@{ exitCode = -1; bytes = [byte[]]@(); stderr = "DV_GIT_EXITCODE_FAILED GetExitCodeProcess failed for an exited git: git $($GitArgs -join ' ')" } }
+        [pscustomobject]@{ exitCode = $gitExit; bytes = $ms.ToArray(); stderr = $errTask.Result }
     } finally {
         # Only when both reads are done: closing a pipe handle under a blocked read can block, and an unconfirmed straggler still holds it.
         if ($null -ne $pipes -and $null -ne $outTask -and $null -ne $errTask -and $outTask.IsCompleted -and $errTask.IsCompleted) {

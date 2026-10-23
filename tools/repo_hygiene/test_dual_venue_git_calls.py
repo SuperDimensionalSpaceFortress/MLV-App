@@ -13,7 +13,10 @@ Pinned here:
   * (r2, CoS I1) a child that outlives git holding its output is killed and is a typed ``DV_GIT_PIPE_STRAGGLER`` failure (exit -1, no
     partial bytes), never git's own exit code;
   * (r3, CoS N3) a git that cannot be started is a typed ``DV_GIT_START_FAILED`` refusal and leaks no job object;
-  * (r3, CoS N4) the straggler message says "(killed)" only when the kill is confirmed, "(kill not confirmed)" otherwise.
+  * (r3, CoS N4) the straggler message says "(killed)" only when the kill is confirmed, "(kill not confirmed)" otherwise;
+  * (DV-GIT-NATIVE-START-TYPED-FAILURE-1) a failed AssignProcessToJobObject, a failed ResumeThread, a throw building the pipe streams after the
+    resume and a failed GetExitCodeProcess are each their own typed refusal (exit -1, no bytes; never a timeout, never a success, never a null
+    that lets a second git start), and the child that was started is terminated.
 The tests run wherever pwsh does (Windows and the ubuntu shards; CoS N2).
 """
 
@@ -364,6 +367,97 @@ class GitCallsAreBoundedTests(unittest.TestCase):
         match = re.search(r"JOBS opened=(\d+) closed=(\d+)", out)
         self.assertIsNotNone(match, out)
         self.assertEqual(match.group(1), match.group(2), "every job object opened must be closed (a Start that throws must not leak one)")
+
+    # DV-GIT-NATIVE-START-TYPED-FAILURE-1 (CoS Dot on #511, all nonblocking hardening): every native call of the suspended start is checked and a
+    # failure after the child exists is a TYPED refusal (exit -1, no bytes), never a null that lets the caller start a second git beside the
+    # first, and never a success. The module's seams: $script:DvNativeFault (a native call's name -> the result to read instead of the real
+    # one; the real call still runs, so the child exists and the cleanup has something to prove) and $script:DvNewPipeStream (builds one
+    # parent-side pipe stream; a test swaps in one that throws).
+    def run_native_fault(self, setup: str, git_args: str = "'rev-parse', '--is-inside-work-tree'", env_extra: dict[str, str] | None = None,
+                         trace: bool = False) -> tuple[str, list[str]]:
+        repo = self.make_repo()
+        env = dict(env_extra or {})
+        trace_file = None
+        if trace:
+            trace_dir = Path(tempfile.mkdtemp(prefix="dve-trace-"))
+            self.addCleanup(shutil.rmtree, trace_dir, True)
+            trace_file = trace_dir / "git-trace.txt"
+            env["GIT_TRACE"] = str(trace_file)
+        out = self.in_module(
+            f"{setup}\n"
+            f"try {{ $r = Invoke-DvGit -RepoRoot '{repo}' -GitArgs @({git_args}); Write-Output ('EXIT ' + $r.exitCode); Write-Output ('BYTES ' + $r.bytes.Length); Write-Output ('ERR ' + $r.stderr) }}\n"
+            "catch { Write-Output ('THREW ' + $_.Exception.Message) }\n"
+            "Write-Output ('JOBS opened=' + $script:DvJobsOpened + ' closed=' + $script:DvJobsClosed)\n", env)
+        spawns = []
+        if trace_file is not None and trace_file.exists():
+            spawns = [line for line in trace_file.read_text(encoding="utf-8", errors="replace").splitlines() if "trace: built-in:" in line]
+        return out, spawns
+
+    def assert_typed_refusal(self, out: str, token: str) -> None:
+        self.assertNotIn("THREW", out, "a failed native call must be a typed refusal, not an exception")
+        self.assertIn("EXIT -1", out)
+        self.assertIn("BYTES 0", out)
+        self.assertIn(f"ERR {token}", out)
+        self.assertNotIn("DV_GIT_TIMEOUT", out, "a start failure is its own status, never read as a later timeout")
+        match = re.search(r"JOBS opened=(\d+) closed=(\d+)", out)
+        self.assertIsNotNone(match, out)
+        self.assertEqual(match.group(1), match.group(2), "the failure path must still close its job object")
+
+    @unittest.skipUnless(sys.platform == "win32", "the suspended start is Windows only")
+    def test_a_failed_job_assignment_is_a_typed_refusal_and_no_second_git_starts(self) -> None:
+        # I1: AssignProcessToJobObject's return was dropped, so a child outside the job ran on and a timeout could not reach its children.
+        out, spawns = self.run_native_fault("$script:DvNativeFault = @{ AssignProcessToJobObject = $false }", trace=True)
+        self.assert_typed_refusal(out, "DV_GIT_JOB_ASSIGN_FAILED")
+        self.assertEqual(spawns, [], "the suspended child must never run, and the Process.Start fallback must not start a second git")
+
+    @unittest.skipUnless(sys.platform == "win32", "the suspended start is Windows only")
+    def test_a_failed_resume_is_a_typed_refusal_and_no_second_git_starts(self) -> None:
+        # I1: ResumeThread's return was dropped; 0xFFFFFFFF means the thread was never resumed and the call then waited out the whole bound.
+        started = time.monotonic()
+        out, spawns = self.run_native_fault("$script:DvNativeFault = @{ ResumeThread = [uint32]::MaxValue }", env_extra={"DV_GIT_TIMEOUT_SECONDS": "20"}, trace=True)
+        self.assert_typed_refusal(out, "DV_GIT_RESUME_FAILED")
+        self.assertLess(time.monotonic() - started, 15, "a failed resume is refused at once, not after the git bound")
+        self.assertLessEqual(len(spawns), 1, "the Process.Start fallback must not start a second git beside the first")
+
+    @unittest.skipUnless(sys.platform == "win32", "the suspended start is Windows only")
+    def test_a_stream_construction_throw_after_resume_is_typed_and_cleans_up_the_started_child(self) -> None:
+        # I2: a throw building the pipe streams AFTER the child was resumed returned null, and the caller then started another git beside the
+        # running first one (leaked, unwatched, still in the job). Now the started child is killed with its children and the call is exit -1.
+        for label, fail_on in (("first", 1), ("second", 2)):
+            with self.subTest(stream=label):
+                token = _own_sleep_token("63")
+                self.addCleanup(_kill_sleepers, token)
+                started = time.monotonic()
+                out, spawns = self.run_native_fault(
+                    "$script:StreamCalls = 0\n"
+                    "$script:DvNewPipeStream = { param($h) $script:StreamCalls++\n"
+                    f"  if ($script:StreamCalls -eq {fail_on}) {{ throw 'injected stream failure' }}\n"
+                    "  [System.IO.Pipes.AnonymousPipeClientStream]::new([System.IO.Pipes.PipeDirection]::In, [Microsoft.Win32.SafeHandles.SafePipeHandle]::new($h, $true)) }",
+                    f"'-c', 'alias.dvs=!sleep {token}', 'dvs'", {"DV_GIT_TIMEOUT_SECONDS": "3"}, trace=True)
+                self.assert_typed_refusal(out, "DV_GIT_STREAM_FAILED")
+                self.assertIn("injected stream failure", out)
+                self.assertLess(time.monotonic() - started, 25, "the refusal must not wait out the git bound or the 63 s child")
+                self.assertLessEqual(len(spawns), 1, "the Process.Start fallback must not start a second git beside the first")
+                deadline = time.monotonic() + 10
+                survivors = _sleepers(token)
+                while survivors and time.monotonic() < deadline:
+                    time.sleep(0.5)
+                    survivors = _sleepers(token)
+                self.assertEqual(survivors, set(), "the child that was resumed must be terminated with its children, not left running")
+
+    @unittest.skipUnless(sys.platform == "win32", "the suspended start is Windows only")
+    def test_a_failed_exit_code_read_is_a_typed_refusal_not_a_success(self) -> None:
+        # I3: GetExitCodeProcess's return was dropped while the code started at 0, so a failed read looked like git exiting 0.
+        out, _ = self.run_native_fault("$script:DvNativeFault = @{ GetExitCodeProcess = $false }")
+        self.assert_typed_refusal(out, "DV_GIT_EXITCODE_FAILED")
+
+    @unittest.skipUnless(sys.platform == "win32", "the suspended start is Windows only")
+    def test_the_native_fault_seam_is_inert_when_no_fault_is_injected(self) -> None:
+        # The happy path is byte-for-byte what it was: no seam entry, the real results are read.
+        out, _ = self.run_native_fault("$script:DvNativeFault = @{}")
+        self.assertIn("EXIT 0", out)
+        self.assertIn("BYTES 5", out)   # 'true' plus the newline
+        self.assertNotIn("ERR DV_GIT", out)
 
     def test_the_straggler_message_claims_a_kill_only_when_it_is_confirmed(self) -> None:
         # CoS N4: macOS reaches only the direct child, so the message must not say "(killed)" unless the kill was confirmed. The refusal is the
