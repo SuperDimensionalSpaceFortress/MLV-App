@@ -15,7 +15,7 @@
 #      -MaxTotalSec (+ -KillGraceSec): the chain's own -DeadlineUtc stops it gracefully, the kill is the backstop, so nothing here can wait unbounded;
 #      The chain's exit code is read before any row is built (a pinned consumer of the evidence launchers: tools/repo_hygiene/test_playback_evidence_completeness.py).
 #      A leg is recorded RAN, with figures, only when the chain ended on its own with exit 0 that agrees with its CHAIN_RESULT, and the leg's receipt is readable, is THIS
-#      run's receipt (receiptId = its file name, legId, venue and buildManifestSha256 as planned, startedUtc after this run began; anything else is receipt identity
+#      run's receipt (receiptId = its file name, legId, venue, subject.backend and buildManifestSha256 as planned, startedUtc after this run began; anything else is receipt identity
 #      EVIDENCE_INCOMPLETE and the receipt is not even validated) and its validator verdict is ADVISORY / VERIFIED* (INVALID, INCOMPLETE and a validator error are refused;
 #      NO_SIGNAL is readable but carries no figure: RECEIPT_NO_SIGNAL); otherwise the row is status EVIDENCE_INCOMPLETE
 #      (EVIDENCE_INVALID for an INVALID verdict) / outcome INVALID with a `failure` text and NO figures. An undocumented or disagreeing exit exits CHAIN_FAILED (27); a documented
@@ -329,6 +329,10 @@ function Get-RowFigures([string]$ReceiptPath, $Leg, [string]$Backend) {
     if ([string](Get-DvProp $rc 'legId') -cne $Leg.legId) { $idProblems.Add("legId '$([string](Get-DvProp $rc 'legId'))' is not the planned $($Leg.legId)") }
     if ([string](Get-DvProp (Get-DvProp $rc 'venue') 'name') -cne $Venue) { $idProblems.Add("venue '$([string](Get-DvProp (Get-DvProp $rc 'venue') 'name'))' is not $Venue") }
     if (([string](Get-DvProp (Get-DvProp $rc 'subject') 'buildManifestSha256')).ToLowerInvariant() -cne $manifest.ToLowerInvariant()) { $idProblems.Add('buildManifestSha256 is not the staged manifest this run passed to the chain') }
+    # The receipt's own backend must be the one this leg was planned for: the validator checks receipt/backend consistency, not the baseline's plan, so a valid CUDA receipt
+    # would otherwise land its figures in a cpu-labelled row (and the reverse). A receipt that names no backend fails closed.
+    $rcBackend = [string](Get-DvProp (Get-DvProp $rc 'subject') 'backend')
+    if (-not $rcBackend -or $rcBackend -ne $Backend) { $idProblems.Add("backend '$rcBackend' is not the planned $Backend") }
     $rcStartRaw = Get-DvProp $rc 'startedUtc'
     $rcStart = [DateTime]::MinValue
     $rcStartOk = $(if ($rcStartRaw -is [DateTime]) { $rcStart = $rcStartRaw.ToUniversalTime(); $true }

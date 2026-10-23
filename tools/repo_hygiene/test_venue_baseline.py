@@ -75,18 +75,19 @@ $legs = foreach ($s in $specs) {
             New-Item -ItemType Directory -Force -Path $rd | Out-Null
             $rp = Join-Path $rd ("rcpt-$Backend-$n.json")
             $outc = $(if ($env:FAKE_RECEIPT_OUTCOME) { $env:FAKE_RECEIPT_OUTCOME } else { 'PASS' })
-            # FAKE_RECEIPT_IDENTITY: stale | wrongid | wrongleg | wrongbuild | wrongvenue -- a receipt that is NOT the one this run's leg wrote (it still parses and carries figures)
+            # FAKE_RECEIPT_IDENTITY: stale | wrongid | wrongleg | wrongbuild | wrongvenue | wrongbackend | nobackend (upperbackend: the planned backend upper-cased, a PASSING control) -- a receipt that is NOT the one this run's leg wrote (it still parses and carries figures)
             $idm = $env:FAKE_RECEIPT_IDENTITY
             $rc = [ordered]@{ schema = 'mlv-app/dual-venue-receipt/v1'; receiptId = $(if ($idm -ceq 'wrongid') { 'someone-elses-receipt' } else { "rcpt-$Backend-$n" })
                 legId = $(if ($idm -ceq 'wrongleg') { 'some-other-leg' } else { $legId }); outcome = $outc
                 startedUtc = $(if ($idm -ceq 'stale') { [DateTime]::UtcNow.AddDays(-1).ToString('o') } else { [DateTime]::UtcNow.ToString('o') })
-                subject = [ordered]@{ buildManifestSha256 = $(if ($idm -ceq 'wrongbuild') { 'e' * 64 } else { $BuildManifestSha256 }) }
-                venue = [ordered]@{ name = $(if ($idm -ceq 'wrongvenue') { 'bachelor' } else { $Venue }); role = 'supplementary' }
+                subject = [ordered]@{ buildManifestSha256 = $(if ($idm -ceq 'wrongbuild') { 'e' * 64 } else { $BuildManifestSha256 }); backend = $(if ($idm -ceq 'wrongbackend') { $(if ($Backend -ceq 'cuda') { 'cpu' } else { 'cuda' }) } elseif ($idm -ceq 'upperbackend') { $Backend.ToUpperInvariant() } else { $Backend }) }
+                venue =[ordered]@{ name = $(if ($idm -ceq 'wrongvenue') { 'bachelor' } else { $Venue }); role = 'supplementary' }
                 metrics = [ordered]@{ cpuFrames = 389; gpuFramesTotal = $(if ($Backend -eq 'cuda') { 600 } else { 0 }); skippedOrUnpresentedRatio = 0.35058430717863104; cpuPaceTimelineFps = $(if ($Backend -eq 'cpu') { 11.185 } else { $null })
                     presentMonTemporalMaxGapMs = 41.7; presentMonTemporalGapKind = 'positive-interval-rows'; presentMonStatus = 'ok'
                     presentMonStats = [ordered]@{ count = 12; meanMs = 16.7; p99Ms = 33.4; fpsEquivalentMean = $(if ($Backend -eq 'cuda') { 59.9 } else { $null }) } }
                 playback = [ordered]@{ sourceAdvanced = 600; requiredSourceFrames = 600; nativeFps = 23.976; paceFps = 23.976 }
                 display = [ordered]@{ requestedMode = 'fullscreen' }; scale = [ordered]@{ requestedScale = 1 } }
+            if ($idm -ceq 'nobackend') { $rc.subject.Remove('backend') }
             Set-Content -LiteralPath $rp -Value ($rc | ConvertTo-Json -Depth 8)
             if ($mode -ceq 'noreceipt') { Remove-Item -LiteralPath $rp -Force }
             [pscustomobject]@{ name = $name; spec = $s; backend = $Backend; status = 'RAN'; verdict = 'QUIET'; outcome = $outc; legExit = 0; receipt = $rp }
@@ -733,6 +734,39 @@ class VenueBaselineTests(unittest.TestCase):
                     self.assertTrue(str(r["failure"]).startswith("EVIDENCE_INCOMPLETE: receipt identity"), r)
                     self.assertTrue(r["fps"] is None and r["drops"] is None and r["stall"] is None, r)
                 self.assertEqual(self.validator_calls(), [], "a receipt of another run is never validated, let alone trusted")
+
+    # F r2 (sol blocker): the receipt's subject.backend must be the planned backend, so a CUDA measurement can never land in a CPU-labelled row (or the reverse).
+    def test_f_r2_a_receipt_of_the_other_backend_or_naming_none_yields_no_figures(self) -> None:
+        for ident in ("wrongbackend", "nobackend"):
+            with self.subTest(identity=ident):
+                self.trend.unlink(missing_ok=True)
+                self.validator_log.unlink(missing_ok=True)
+                p = self.run_with_env(self.args(), FAKE_CHAIN_MODE="ok", FAKE_VALIDATOR_MODE="advisory", FAKE_RECEIPT_OUTCOME="PASS", FAKE_RECEIPT_IDENTITY=ident)
+                self.assertEqual(p.returncode, EXIT["LEG_FAILED"], p.stdout + p.stderr)
+                rows = self.trend_rows()
+                self.assertEqual(len(rows), 4, rows)
+                self.assertEqual({r["backend"] for r in rows}, {"cuda", "cpu"}, rows)    # both directions: a planned-cpu leg with a cuda receipt AND a planned-cuda leg with a cpu one
+                for r in rows:
+                    self.assertEqual((r["status"], r["outcome"]), ("EVIDENCE_INCOMPLETE", "INVALID"), r)
+                    self.assertTrue(str(r["failure"]).startswith("EVIDENCE_INCOMPLETE: receipt identity"), r)
+                    self.assertIn("backend", str(r["failure"]), r)
+                    self.assertTrue(r["fps"] is None and r["drops"] is None and r["stall"] is None, r)
+                self.assertEqual(self.validator_calls(), [], "a receipt of another backend is never validated, let alone trusted")
+
+    def test_f_r2_a_receipt_of_the_planned_backend_keeps_its_figures_whatever_its_case(self) -> None:
+        for ident in ("", "upperbackend"):
+            with self.subTest(identity=ident):
+                self.trend.unlink(missing_ok=True)
+                p = self.run_with_env(self.args(), FAKE_CHAIN_MODE="ok", FAKE_VALIDATOR_MODE="advisory", FAKE_RECEIPT_OUTCOME="PASS", FAKE_RECEIPT_IDENTITY=ident)
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                rows = self.trend_rows()
+                self.assertEqual(len(rows), 4, rows)
+                for r in rows:
+                    self.assertEqual(r["status"], "RAN", r)
+                    self.assertIsNone(r["failure"], r)
+                cuda = [r for r in rows if r["backend"] == "cuda"]
+                self.assertEqual(len(cuda), 2, rows)
+                self.assertTrue(all(r["drops"]["gpuFramesTotal"] == 600 and r["fps"]["presentMonFpsEquivalentMean"] == 59.9 for r in cuda), cuda)
 
     # F: the trend append is safe under concurrency.
     def test_f_an_appender_holding_the_trend_file_open_does_not_lose_the_rows(self) -> None:
