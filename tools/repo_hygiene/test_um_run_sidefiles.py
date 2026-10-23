@@ -95,8 +95,8 @@ def seam_call_position_problem(source: str, class_name: str, method_name: str | 
     `method_name` is given, the call must also sit in the method of that name.
 
     Final-statement placement is a positional contract only: it does not prove the call is reached at
-    run time (an early return, a raised skip or an exception above it still bypasses it). The live
-    test's own asserts are what make it reachable."""
+    run time (an early return, a raised skip or an exception above it still bypasses it). The
+    earlier checks in the live test must pass before execution reaches the call."""
     classes = [node for node in ast.walk(ast.parse(source))
                if isinstance(node, ast.ClassDef) and node.name == class_name]
     if len(classes) != 1:
