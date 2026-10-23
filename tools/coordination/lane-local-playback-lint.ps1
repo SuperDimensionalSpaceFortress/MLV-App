@@ -132,6 +132,16 @@
 # and tracked-script tokens close with a backtick like the other app tokens (a markdown code span), so ``Run `<app>` <mode>.`` is a
 # direct launch. Refuse-only: the pin 2f8d1a97 passes every row this adds a refusal for.
 #
+# Compile step and read-only mention (LOCAL-PLAYBACK-LINT-COMPILE-WORD-FP-1 / LOCAL-PLAYBACK-LINT-PARAM-MENTION-FP-1; accept-only, both fail
+# closed, both listed in the PR body). C1: "..., assemble locally (-j2), stage to Bachelor, stage the smoke runner, then run" (the chains on
+# the next line) was refused as run-playback-locally because `locally` sat in a sentence with a playback word and a launch verb. Rule 2 now
+# skips a marker that is the adverb of a compile step (Test-CompileStepLocally: CompileVerbs, no launch verb in the marker's clause) when every
+# OTHER launch clause of the sentence is a venue-chain drive (DriveObjects, or the bare verb at the end of its line). C2: "Confirm from the runner
+# (<launcher> -Param ValidateSet), ..." was refused as a direct launch. Rule 4 now skips the bare `<launcher> -Param` form inside a parenthesis
+# that a ReadOnlyVerbs word introduces, in a sentence with no launch verb outside a prohibition (Test-ReadOnlyLauncherMention); `pwsh -File`,
+# the call operator, an explicit relative path, any word but MentionParenWords before the launcher, a colon or prose still refuse. Rules 3, 3b
+# and the app patterns are unchanged. Accepted over-refusal: a read-only mention outside a parenthesis ("Read <launcher> -Param to see ...").
+#
 # ASCII only (PowerShell 5.1 reads a BOM-less file as the ANSI code page). No Set-StrictMode here: a dot-sourced file would leak it into the caller.
 
 function Get-HubHostConfig {
@@ -362,6 +372,42 @@ function Test-VenueExempts {
     return -not (Test-LocalHostInScope -Sentence $Sentence -Clauses $Clauses -Clause $Clause -HostPatterns $HostPatterns)
 }
 
+# C1 (LOCAL-PLAYBACK-LINT-COMPILE-WORD-FP-1): `locally` as the adverb of a COMPILE step ("..., assemble locally (-j2), stage to Bachelor,
+# stage the smoke runner, then run"). The marker's own clause holds no launch verb, and the text since the marker's last comma / colon /
+# semicolon / open parenthesis is a listed compile verb plus up to four plain words ($CompilePiece). Fail closed on the REST of the
+# sentence: every other clause that holds a launch verb (a prohibition aside) must be a venue-chain drive ($DriveTail: the verb alone at the
+# end of its clause, or the verb + a listed DriveObjects word and no second launch verb). "Assemble locally and run playback", "Build locally,
+# then play the clip" and "Run playback, then assemble locally" keep their verdict. This exempts the marker only; rules 3, 3b and 4 still read
+# the sentence ("..., then run the chains on this host" is refused by rule 3).
+function Test-CompileStepLocally {
+    param([string]$Sentence, [object[]]$Clauses, [object]$Clause, [int]$Index, [string]$CompilePiece, [string]$DriveTail)
+    if ($Clause.HasVerb -or $Clause.Contrast -or $Index -lt $Clause.Start) { return $false }
+    if (-not (Get-LintRegex $CompilePiece).IsMatch($Sentence.Substring($Clause.Start, $Index - $Clause.Start))) { return $false }
+    foreach ($k in $Clauses) {
+        if ([object]::ReferenceEquals($k, $Clause) -or -not $k.HasVerb -or $k.Strong) { continue }
+        if (-not (Get-LintRegex $DriveTail).IsMatch($Sentence.Substring($k.Start, $k.End - $k.Start))) { return $false }
+    }
+    return $true
+}
+
+# C2 (LOCAL-PLAYBACK-LINT-PARAM-MENTION-FP-1): a tracked launcher named with a parameter INSIDE a parenthetical that a read-only verb
+# introduces ("Confirm from the runner (<launcher> -Param ValidateSet), ...") is a mention, not a launch. Fail closed: the occurrence is
+# the bare `<launcher> -Param` form only (not `pwsh -File`, not the call operator, not an explicit relative path), the sentence holds no
+# launch verb outside a prohibition, a ReadOnlyVerbs word stands in the occurrence's clause before the parenthesis that holds it (balanced
+# one-level parentheses may sit between), nothing but one MentionParenWords word stands between that parenthesis and the launcher, and the
+# parenthesis closes after it. A mention with no read-only verb ("Then (<launcher> -Param cuda)"), after a colon, or in prose stays a launch.
+function Test-ReadOnlyLauncherMention {
+    param([string]$Sentence, [object[]]$Clauses, [object]$Clause, [int]$SpanStart, [string]$SpanValue, [string]$MentionPre, [string]$Relative)
+    foreach ($k in $Clauses) { if ($k.HasVerb -and -not $k.Strong) { return $false } }
+    if ($SpanValue.Contains('&') -or (Get-LintRegex $Relative).IsMatch($SpanValue)) { return $false }
+    $lead = if ($SpanValue -match '^[\s`&(]') { 1 } else { 0 }
+    $opened = (Get-LintRegex '^[(\x60\x27\x22\[]*').Match($SpanValue.Substring($lead)).Value
+    $to = $SpanStart + $lead + $opened.Length
+    if ($to -lt $Clause.Start -or $to -gt $Sentence.Length) { return $false }
+    if (-not (Get-LintRegex $MentionPre).IsMatch($Sentence.Substring($Clause.Start, $to - $Clause.Start))) { return $false }
+    return ($Sentence.IndexOf(')', $to) -ge 0)
+}
+
 # The CLOSED word lists the exemptions depend on (r5). Every pattern in Get-LocalPlaybackPromptFindings is built from these lists, and
 # tools/repo_hygiene/test_hub_vm_no_local_playback.py (ListMemberDefeaterTests) reads them back and generates one defeater row PER MEMBER,
 # so a word added here is tested by construction. A word joins VenueFollowLocus only with a reason in LOCUS_FOLLOW_REASONS there.
@@ -413,6 +459,16 @@ function Get-LocalPlaybackLintWordLists {
         HeadJoiners                = @('and', 'or', 'then', 'but', 'so')
         HeadProhibitions           = @('never', 'do not', "don't", 'must not', "mustn't", 'may not')
         HeadContrasts              = @('rather than', 'instead of', 'not', 'never', 'nor')
+        # LOCAL-PLAYBACK-LINT-COMPILE-WORD-FP-1 (C1) and LOCAL-PLAYBACK-LINT-PARAM-MENTION-FP-1 (C2). Closed lists, they only ADMIT; none of
+        # them may hold a LaunchVerbs member (a launch verb here would exempt a launch).
+        #   CompileVerbs       the verb of a compile step whose adverb is `locally` ("assemble locally (-j2), stage to Bachelor, ...").
+        #   DriveObjects       what a LATER launch clause of that sentence may run: the venue chain / leg itself, never a clip, an app or a runner.
+        #   ReadOnlyVerbs      the verb of a read-only clause that may name a tracked launcher with a parameter ("Confirm from the runner (<launcher> -Param ...)").
+        #   MentionParenWords  the only word that may stand between the opening parenthesis and the launcher in that mention ("(see <launcher> -Param ...)").
+        CompileVerbs               = @('assemble', 'assembles', 'assembling', 'build', 'builds', 'building', 'compile', 'compiles', 'compiling', 'rebuild', 'rebuilds', 'rebuilding')
+        DriveObjects               = @('chain', 'chains', 'venue chain', 'venue chains', 'leg', 'legs', 'venue leg', 'venue legs', 'chain runner')
+        ReadOnlyVerbs              = @('confirm', 'confirms', 'check', 'checks', 'verify', 'verifies', 'inspect', 'inspects', 'read', 'reads', 'review', 'reviews', 'see', 'grep', 'compare', 'cite', 'quote')
+        MentionParenWords          = @('see', 'per', 'in', 'from', 'cf')
     }
 }
 
@@ -548,6 +604,20 @@ function Get-LintPatternSet {
         $hostLocusRef += "|(?<!${b}(?:${destinationPreposition})\s+(?:${hostDeterminer})\s+)${b}(?:$(ConvertTo-LintAlternation -Words $nounNames -Loose))(?!\w)"
     }
     $hostDefeatersLaunch = @($hostMarker, $hereDefeater, $hostLocusRef)
+    # C1 (Test-CompileStepLocally): the text before `locally` ends in a compile step, and a launch clause elsewhere in the sentence is a
+    # venue-chain drive. The compile piece starts at a comma / colon / semicolon / parenthesis (or the clause start), an optional list mark
+    # and filler words; the object is up to four plain words. The drive tail is read from the clause's first token: a launch verb, then
+    # nothing at all (the object is on the next line) or a listed DriveObjects word with no second launch verb after it.
+    $compileVerb = ConvertTo-LintAlternation -Words @($lists.CompileVerbs)
+    $driveObject = ConvertTo-LintAlternation -Words @($lists.DriveObjects)
+    $compilePiece = "(?i)(?:^|[,(:;])\s*(?:(?:[-*+>]|\d{1,3}[.)])\s+)?(?:(?:please|just|also|now)\s+)*(?:${compileVerb})${e}(?:\s+[\w'.+\-]+){0,4}\s*\z"
+    $driveTail = "(?i)^\W*(?:(?:then|and|just|also|please|so)\s+)*(?:${verbs})${e}(?:\s*\W*\z|\s+(?:(?:the|a|an)\s+)?(?:${driveObject})${e}(?!.*${b}(?:${verbs})${e}))"
+    # C2 (Test-ReadOnlyLauncherMention): a ReadOnlyVerbs word, then the clause up to the parenthesis that holds the launcher (one level of
+    # balanced parentheses may sit between), then that parenthesis, at most one MentionParenWords word and quote / backtick marks, and the end.
+    $readVerb = ConvertTo-LintAlternation -Words @($lists.ReadOnlyVerbs)
+    $parenWord = ConvertTo-LintAlternation -Words @($lists.MentionParenWords)
+    $mentionPre = "(?i)${b}(?:${readVerb})${e}(?:[^()]|\([^()]*\))*\(\s*(?:(?:${parenWord})${e}\s+)?[\x60\x27\x22]*\z"
+    $mentionRelative = '(?<![\w.])\.{1,2}[\\/]'
     $tailGrammar = $null; $headGrammar = $null; $itemGrammar = $null
     if ($WithGrammars) {
     # r10: the closed allow-grammar of the strictly terminal E1 (Test-VenueTerminalTail), a whitelist tokenizer as ONE anchored regex.
@@ -673,6 +743,7 @@ function Get-LintPatternSet {
         VenueQualified = $venueQualified; PlaybackWord = $playbackWord; VenueLocus = $venueLocus; RoutingLocally = $routingLocally
         Incident = $incident; LocalMarker = $localMarker; HostMarker = $hostMarker; HereMarker = $hereMarker
         HostDefeaters = $hostDefeaters; HostDefeatersLaunch = $hostDefeatersLaunch
+        CompilePiece = $compilePiece; DriveTail = $driveTail; MentionPre = $mentionPre; MentionRelative = $mentionRelative
         Direct = $direct; ClipLaunch = $clipLaunch; ClipMention = $clipMention; AppBare = $appBare; AppEnd = $appEnd; ModeFlag = $modeFlag
         # the rule triggers, in the order they were always tried (the incident phrase, the three markers, the mode flag, then the launch patterns)
         Triggers = @((New-LintRegex $incident), (New-LintRegex $localMarker), (New-LintRegex $hostMarker), (New-LintRegex $hereMarker), (New-LintRegex $modeFlag)) + @($direct | ForEach-Object { New-LintRegex $_ })
@@ -780,6 +851,8 @@ function Get-LocalPlaybackPromptFindings {
                     }
                     if ((Test-ContrastLead -Sentence $s -Clause $c -Index $m.Index) -and
                         -not (Test-LocalHostInScope -Sentence $s -Clauses $clauses -Clause $c -HostPatterns $hostDefeaters)) { continue }
+                    # C1: `locally` is the adverb of a compile step and nothing else in the sentence launches except a venue-chain drive
+                    if (Test-CompileStepLocally -Sentence $s -Clauses $clauses -Clause $c -Index $m.Index -CompilePiece $patterns.CompilePiece -DriveTail $patterns.DriveTail) { continue }
                     # E1 is strictly terminal (r10): the rest of the sentence and of the block must be in the closed, verbless allow-grammar
                     # (Test-VenueTerminalTail). r12: the HEAD is read the same way -- everything of this sentence before `locally` (every
                     # earlier clause, every earlier ';' group, the marker clause's own prefix) must be in the closed head grammar, and so
@@ -829,7 +902,7 @@ function Get-LocalPlaybackPromptFindings {
                         # <mode> on Bachelor.` stays refused.
                         $tokenEnd = if ($pi -eq 0) { $m4.Value.IndexOf('.exe', [StringComparison]::OrdinalIgnoreCase) + 4 } elseif ($pi -eq 2) { $m4.Value.LastIndexOf('.ps1', [StringComparison]::OrdinalIgnoreCase) + 4 } else { -1 }
                         $spanOnly = $tokenEnd -ge 4 -and $tokenEnd -lt $m4.Value.Length -and $m4.Value[$tokenEnd] -eq [char]96
-                        $launchSpans.Add([pscustomobject]@{ Start = [int]$m4.Index; End = [int]($m4.Index + $m4.Length); App = ($pi -eq 0); CodeSpanOnly = $spanOnly })
+                        $launchSpans.Add([pscustomobject]@{ Start = [int]$m4.Index; End = [int]($m4.Index + $m4.Length); App = ($pi -eq 0); CodeSpanOnly = $spanOnly; Pi = $pi; Value = [string]$m4.Value })
                     }
                 }
                 # r4b: an app launch with a clip argument is one launcher of its own (an app span: it never merges)
@@ -857,8 +930,8 @@ function Get-LocalPlaybackPromptFindings {
                     # r2: spans that START in different clauses are different launchers, however they overlap; only same-clause spans merge.
                     # r4: and only the two spans of ONE pwsh call merge (pwsh -File <script>, <script> -Param); an app span is one launcher per
                     # match and never absorbs, or is absorbed by, another span (its gap no longer stops at a pwsh token).
-                    if ($last -and -not $last.App -and -not $sp.App -and $sp.Start -lt $last.End -and [object]::ReferenceEquals($last.Clause, $spClause)) { if ($sp.End -gt $last.End) { $last.End = $sp.End } }
-                    else { $occurrences.Add([pscustomobject]@{ Start = $sp.Start; End = $sp.End; Clause = $spClause; App = $sp.App }) }
+                    if ($last -and -not $last.App -and -not $sp.App -and $sp.Start -lt $last.End -and [object]::ReferenceEquals($last.Clause, $spClause)) { $last.Merged = $true; if ($sp.End -gt $last.End) { $last.End = $sp.End } }
+                    else { $occurrences.Add([pscustomobject]@{ Start = $sp.Start; End = $sp.End; Clause = $spClause; App = $sp.App; Pi = $sp.Pi; Value = $sp.Value; Merged = $false }) }
                 }
                 # r4 (Dot advisory 68040a98): the occurrences are sorted by start and a clause is a contiguous range, so the launchers of one
                 # clause are one contiguous run; each run is read once (r3 rescanned every occurrence for its clause mates: quadratic).
@@ -880,7 +953,9 @@ function Get-LocalPlaybackPromptFindings {
                         }
                         $exempt = $c.Strong -or $c.Weak -or
                             ($routed -and (Test-VenueExempts -Sentence $s -Clauses $clauses -Clause $c -HostPatterns $hostDefeatersLaunch)) -or
-                            (Test-ContrastLead -Sentence $s -Clause $c -Index $occ.Start)
+                            (Test-ContrastLead -Sentence $s -Clause $c -Index $occ.Start) -or
+                            # C2: the bare `<launcher> -Param` form inside a parenthetical that a read-only verb introduces is a mention
+                            (($occ.Pi -eq 2) -and -not $occ.Merged -and (Test-ReadOnlyLauncherMention -Sentence $s -Clauses $clauses -Clause $c -SpanStart $occ.Start -SpanValue $occ.Value -MentionPre $patterns.MentionPre -Relative $patterns.MentionRelative))
                         if (-not $exempt) { $hit = 'direct-playback-launch'; break }
                     }
                     $i = $j + 1

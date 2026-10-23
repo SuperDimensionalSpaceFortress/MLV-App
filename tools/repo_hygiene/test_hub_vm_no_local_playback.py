@@ -3516,6 +3516,140 @@ class PromptLintTests(unittest.TestCase):
 
 
 @requires_pwsh
+class CompileStepAndReadMentionTests(unittest.TestCase):
+    """LOCAL-PLAYBACK-LINT-COMPILE-WORD-FP-1 (C1) and LOCAL-PLAYBACK-LINT-PARAM-MENTION-FP-1 (C2): two false positives of the prompt lint.
+
+    C1 -- the WARM-RUN-CHROMA-SMOOTH-PARITY-1 design prompt (design-WARM-RUN-CHROMA-SMOOTH-PARITY-1-20261019T1015Z/opus-001.last.txt:192) said
+    "..., assemble locally (-j2), stage to Bachelor, stage the smoke runner, then run" and the chains on the next line. `locally` there is the
+    adverb of a COMPILE step; the lint read it as run-playback-locally and the producer was refused three times. A `locally` marker whose
+    own comma piece is a compile step (a listed compile verb, no launch verb in its clause) is not a launch -- but ONLY when no other clause
+    of the sentence launches anything except a venue chain / leg (DriveObjects) or a bare launch verb at the end of its line.
+
+    C2 -- review-pr522-keys-r1-20261019T1835Z/key-prompt-sol.md:9 asked a key seat to "Confirm from the runner (<launcher> -PlaybackProcessing
+    ValidateSet), the wrapper splat ...". Rule 4 read a tracked launcher named with a parameter as a direct launch, and both r1 key seats were
+    refused before reserve. A launcher + parameter mention INSIDE a parenthetical that a read-only verb (ReadOnlyVerbs) introduces, in a
+    sentence with no launch verb, is not a launch. The call operator, an explicit relative path, `pwsh -File` and any word but a listed one
+    between the parenthesis and the launcher keep it a launch.
+
+    Every row names its card; the negatives (must pass) and the safety-floor positives (must still be refused) are ONE table each."""
+
+    LAUNCHER = SMOKE_SCRIPT
+    PARAM = LAUNCHER + " -PlaybackProcessing "
+    C2_REAL = (f"Confirm from the runner ({PARAM}ValidateSet), the wrapper splat (compare-output-budget.ps1) and the app "
+               "(MainWindow::selectedPlaybackProcessingLabel) that \"subset\" is the mode the wb_locked profile intended (no receipt), "
+               "and that no other profile changes meaning.")
+    C1_REAL_LINE = "Ultra-Magnus (DLL_PAIR_OK SOURCE=<head>), assemble locally (-j2), stage to Bachelor, stage the smoke runner, then run"
+    C1_REAL_PARAGRAPH = ("No .cu changed, but a DLL pair is bound to the head sha: run the pair on\n" + C1_REAL_LINE
+                         + "\nthe chains with a detached driver copied from venue-wrd1b.ps1 (read-only queue gate waiting for an EMPTY queue).")
+
+    # (label, text): the lint must return NO finding.
+    MUST_PASS = (
+        ("c1-real-line", C1_REAL_LINE),
+        ("c1-real-paragraph", C1_REAL_PARAGRAPH),
+        ("c1-one-sentence", "Assemble locally (-j2), stage to Bachelor, stage the smoke runner, then run the chains."),
+        ("c1-build-venue-chains", "Build locally (-j2), stage the smoke runner to Bachelor, then run the venue chains."),
+        ("c1-compile-legs", "Compile locally, stage the smoke runner to Bachelor, then run the legs."),
+        ("c1-rebuild-app-object", "Rebuild the app locally, stage the smoke runner to Bachelor, then run the chain runner."),
+        ("c2-real-sentence", C2_REAL),
+        ("c2-bare-parenthetical", f"Confirm from the runner ({PARAM}ValidateSet)."),
+        ("c2-check-parenthetical", f"Check the options of the runner ({PARAM}ValidateSet) before editing."),
+        ("c2-see-in-parenthetical", f"Verify against the runner (see {PARAM}ValidateSet) that the value is accepted."),
+        ("c2-tracked-path-parenthetical", f"Inspect the runner (tools/profiling/{PARAM}ValidateSet)."),
+    )
+    # (label, text): the safety floor -- every one is refused today and must stay refused.
+    MUST_REFUSE = (
+        ("floor-run-playback-locally", "Run playback locally."),
+        ("floor-run-smoke-runner-locally", "Run the smoke runner locally."),
+        ("c1-compile-then-run-playback", "Assemble locally and run playback."),
+        ("c1-build-then-run-playback", "Build locally, then run playback."),
+        ("c1-build-app-then-play-clip", "Build MLVApp locally, then play the clip."),
+        ("c1-stage-then-run-it", "Assemble locally, stage to Bachelor, stage the smoke runner, then run it."),
+        ("c1-then-run-smoke-runner", "Assemble locally, then run the smoke runner."),
+        ("c1-launch-before-compile", "Run playback, then assemble locally."),
+        ("c1-compile-and-run-in-one-clause", "Build and run playback locally."),
+        ("c1-second-locally", "Build locally, stage the smoke runner, then run the chains locally."),
+        ("c1-chains-on-this-host", "Assemble locally, stage the smoke runner, then run the chains on this host."),
+        ("c1-app-launch-after-compile", f"Assemble locally (-j2), then launch {APP} {SMOKE_MODE} take01.dat."),
+        ("c1-drive-chain-and-play", "Assemble locally, stage the smoke runner to Bachelor, then run the chains and play the clip."),
+        ("c2-run-launcher", f"Run {PARAM}cuda."),
+        ("c2-run-in-parentheses", f"Run ({PARAM}cuda)."),
+        ("c2-confirm-then-run", f"Confirm the value, then run {PARAM}cuda."),
+        ("c2-inspect-then-run-it", f"Inspect {PARAM}ValidateSet, then run it."),
+        ("c2-pwsh-file", f"pwsh -NoProfile -File {PARAM}cuda"),
+        ("c2-read-clause-no-parenthesis", f"Confirm from the runner: {PARAM}cuda."),
+        ("c2-read-clause-bare-mention", f"Read {PARAM}ValidateSet to see which values it accepts."),
+        ("c2-paren-with-a-launch-verb-after", f"Confirm from the runner ({PARAM}ValidateSet) and run it."),
+        ("c2-second-launcher-outside-parenthesis", f"Confirm from the runner ({PARAM}ValidateSet); {PARAM}cuda."),
+        ("c2-no-read-verb", f"Then ({PARAM}cuda)."),
+        ("c2-call-operator", f"Confirm from the runner (& {PARAM}cuda)."),
+        ("c2-explicit-relative-path", f"Confirm from the runner (.\\{PARAM}cuda)."),
+        ("c2-unlisted-word-before-launcher", f"Confirm from the runner (using {PARAM}cuda)."),
+        ("c2-pwsh-file-in-parentheses", f"Confirm from the runner (pwsh -File {PARAM}ValidateSet)."),
+        ("c2-launch-verb-in-the-sentence", f"Confirm the runner by executing ({PARAM}ValidateSet)."),
+        ("c2-app-in-parentheses", f"Confirm from the runner ({APP} {SMOKE_MODE} take01.dat)."),
+    )
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = Path(tempfile.mkdtemp(prefix="hubvm-compile-mention-"))
+        cls.lists = _lint_word_lists(LINT_PS1, cls.tmp)
+        cls.member_rows = cls._member_rows(cls.lists)
+        texts = [t for _, t in cls.MUST_PASS] + [t for _, t in cls.MUST_REFUSE] + [t for _, _, t in cls.member_rows]
+        counts = _batch_counts(LINT_PS1, texts, cls.tmp, "compile-mention")
+        cls.verdicts = dict(zip(texts, counts))
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    @classmethod
+    def _member_rows(cls, lists: dict[str, list[str]]) -> list[tuple[str, bool, str]]:
+        """(label, must_pass, text): one allow row and one defeater row per member of each list the two exemptions read."""
+        rows: list[tuple[str, bool, str]] = []
+        for verb in lists.get("CompileVerbs", []):
+            v = verb.capitalize()
+            rows.append((f"CompileVerbs:{verb}:allow", True, f"{v} locally, stage the smoke runner to Bachelor, then run the chains."))
+            rows.append((f"CompileVerbs:{verb}:defeater", False, f"{v} locally, then run playback."))
+        for verb in lists.get("ReadOnlyVerbs", []):
+            v = verb.capitalize()
+            rows.append((f"ReadOnlyVerbs:{verb}:allow", True, f"{v} from the runner ({cls.PARAM}ValidateSet)."))
+            rows.append((f"ReadOnlyVerbs:{verb}:defeater", False, f"{v} from the runner: {cls.PARAM}cuda."))
+        for obj in lists.get("DriveObjects", []):
+            rows.append((f"DriveObjects:{obj}:allow", True, f"Assemble locally, stage the smoke runner to Bachelor, then run the {obj}."))
+            rows.append((f"DriveObjects:{obj}:defeater", False, f"Assemble locally, stage the smoke runner to Bachelor, then run the {obj} and play the clip."))
+        for word in lists.get("MentionParenWords", []):
+            rows.append((f"MentionParenWords:{word}:allow", True, f"Confirm from the runner ({word} {cls.PARAM}ValidateSet)."))
+            rows.append((f"MentionParenWords:{word}:defeater", False, f"Confirm from the runner ({word} & {cls.PARAM}cuda)."))
+        return rows
+
+    def test_every_negative_fixture_passes(self):
+        wrong = [label for label, text in self.MUST_PASS if self.verdicts[text] != 0]
+        self.assertEqual([], wrong, "false positives the lint still refuses")
+
+    def test_every_safety_floor_positive_is_still_refused(self):
+        wrong = [label for label, text in self.MUST_REFUSE if self.verdicts[text] == 0]
+        self.assertEqual([], wrong, "real launch shapes the lint no longer refuses")
+
+    def test_the_lint_exposes_the_lists_the_two_exemptions_read(self):
+        for key in ("CompileVerbs", "ReadOnlyVerbs", "DriveObjects", "MentionParenWords"):
+            self.assertTrue(self.lists.get(key), f"list {key} is missing or empty")
+        body = _lint_reading_body()
+        for key in ("CompileVerbs", "ReadOnlyVerbs", "DriveObjects", "MentionParenWords"):
+            self.assertIn(f"$lists.{key}", body, f"the lint does not read list {key}")
+
+    def test_no_listed_verb_of_the_new_lists_is_a_launch_verb(self):
+        launch = {w.lower() for w in self.lists["LaunchVerbs"]}
+        for key in ("CompileVerbs", "ReadOnlyVerbs"):
+            clash = [w for w in self.lists.get(key, []) if w.lower() in launch]
+            self.assertEqual([], clash, f"{key} holds a launch verb: such a word would exempt a launch")
+
+    def test_every_member_of_the_new_lists_has_an_allow_row_and_a_defeater_row(self):
+        self.assertTrue(self.member_rows, "the new lists are not exposed, so no member row exists")
+        wrong = [label for label, must_pass, text in self.member_rows if (self.verdicts[text] == 0) != must_pass]
+        self.assertEqual([], wrong)
+
+
+@requires_pwsh
 class ListMemberDefeaterTests(unittest.TestCase):
     """r5 (CoS prevention note on PR #448 r4, ruling candidate mlv-safety-lint-exemption-defeater-corpus-r1 WITH the CoS amendment).
 
