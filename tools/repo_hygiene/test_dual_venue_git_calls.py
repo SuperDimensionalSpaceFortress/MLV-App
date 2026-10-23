@@ -463,26 +463,53 @@ class GitCallsAreBoundedTests(unittest.TestCase):
     # $script:DvNativeSkipCall (a native call's name -> the real call is NOT made, only the DvNativeFault result is read; the child is then
     # genuinely outside the job), $script:DvNativeFaultHits (the names a fault was read for: proof the fault fired) and $script:DvCleanupGate
     # (called with the child's pid, process handle and the job as the failure cleanup starts: the child's state at that moment).
+    # DV-ISPROCESSINJOB-SUCCESS-ASSERT-1 (Dot R18 advisory 5b7ca117 on #614): the probe used to discard IsProcessInJob's BOOL return and seed
+    # `$r = $true`, so a failed call (a bad handle) left `$r` to whatever the marshaller wrote back and the test read a membership answer the
+    # API never gave. Now the declaration sets SetLastError, the BOOL return is kept as `ok`, `$r` is an int seeded -1 (neither 0 nor 1, so an
+    # unanswered call matches no expectation) and `inJob` is only a bool when the call succeeded and answered 0 or 1.
     CHILD_PROBE_PS = (
-        "Add-Type -Namespace DvT -Name K -MemberDefinition '[System.Runtime.InteropServices.DllImport(\"kernel32.dll\")] "
-        "public static extern bool IsProcessInJob(System.IntPtr p, System.IntPtr j, out bool r);'\n"
+        "Add-Type -Namespace DvT -Name K -MemberDefinition '[System.Runtime.InteropServices.DllImport(\"kernel32.dll\", SetLastError=true)] "
+        "public static extern bool IsProcessInJob(System.IntPtr p, System.IntPtr j, out int r);'\n"
         "$script:Seen = @{}\n"
         "$script:DvCleanupGate = { param($ChildPid, $Process, $Job)\n"
-        "  $r = $true; [void][DvT.K]::IsProcessInJob($Process, $Job, [ref]$r)\n"
-        "  $script:Seen = @{ pid = $ChildPid; inJob = $r; alive = (-not [Diagnostics.Process]::GetProcessById($ChildPid).HasExited) } }\n")
+        "  [int]$r = -1; $ok = [DvT.K]::IsProcessInJob($Process, $Job, [ref]$r); $err = [Runtime.InteropServices.Marshal]::GetLastWin32Error()\n"
+        "  $answer = if ($ok -and ($r -eq 0 -or $r -eq 1)) { [bool]$r } else { 'Unanswered' }\n"
+        "  $script:Seen = @{ pid = $ChildPid; ok = [bool]$ok; win32 = $err; inJob = $answer; alive = (-not [Diagnostics.Process]::GetProcessById($ChildPid).HasExited) } }\n")
     CHILD_REPORT_PS = (
         "Write-Output ('HITS ' + (@($script:DvNativeFaultHits) -join ','))\n"
-        "Write-Output ('SEEN pid=' + $script:Seen.pid + ' injob=' + $script:Seen.inJob + ' alive=' + $script:Seen.alive)\n"
+        "Write-Output ('SEEN pid=' + $script:Seen.pid + ' ok=' + $script:Seen.ok + ' win32=' + $script:Seen.win32 + ' injob=' + $script:Seen.inJob + ' alive=' + $script:Seen.alive)\n"
         "$gone = $false\n"
         "try { $gone = [Diagnostics.Process]::GetProcessById([int]$script:Seen.pid).HasExited } catch { $gone = $true }\n"
         "Write-Output ('GONE ' + $gone)\n")
 
-    def assert_child_was_unassigned_alive_then_gone(self, out: str) -> None:
-        seen = re.search(r"SEEN pid=(\d{2,}) injob=(\w+) alive=(\w+)", out)
+    def read_child_probe(self, out: str) -> tuple[str, str]:
+        """(in-job, alive) as the cleanup gate saw them, after proving IsProcessInJob itself answered: a failed call is reported with its Win32 error."""
+        seen = re.search(r"SEEN pid=(\d{2,}) ok=(\w+) win32=(\d+) injob=(\w+) alive=(\w+)", out)
         self.assertIsNotNone(seen, f"the cleanup gate never saw a created child: {out}")
-        self.assertEqual(seen.group(2), "False", "the child must be OUTSIDE the job when the cleanup starts: that is the case under test")
-        self.assertEqual(seen.group(3), "True", "the suspended child must be alive when the cleanup starts")
+        self.assertEqual(seen.group(2), "True", f"IsProcessInJob failed (GetLastError={seen.group(3)}), so its membership answer was never given: {out}")
+        self.assertIn(seen.group(4), ("True", "False"), f"IsProcessInJob returned no 0/1 membership answer: {out}")
+        return seen.group(4), seen.group(5)
+
+    def assert_child_was_unassigned_alive_then_gone(self, out: str) -> None:
+        in_job, alive = self.read_child_probe(out)
+        self.assertEqual(in_job, "False", "the child must be OUTSIDE the job when the cleanup starts: that is the case under test")
+        self.assertEqual(alive, "True", "the suspended child must be alive when the cleanup starts")
         self.assertIn("GONE True", out, "the unassigned child must be terminated by the failure cleanup (a job close does not reach it)")
+
+    @unittest.skipUnless(sys.platform == "win32", "the suspended start is Windows only")
+    def test_the_in_job_probe_reads_true_for_a_child_that_is_assigned_to_the_job(self) -> None:
+        # Positive control for the probe above: only the unassigned (False) answer was ever exercised, so a probe that always said False passed.
+        # Here the AssignProcessToJobObject fault is read but the REAL call still runs (no DvNativeSkipCall), so the suspended child IS in the job
+        # when the cleanup gate asks, through the same helper, and must read True.
+        out, spawns = self.run_native_fault(
+            self.CHILD_PROBE_PS + "$script:DvNativeFault = @{ AssignProcessToJobObject = $false }\n", trace=True, after=self.CHILD_REPORT_PS)
+        self.assert_typed_refusal(out, "DV_GIT_JOB_ASSIGN_FAILED")
+        self.assertIn("HITS AssignProcessToJobObject", out)
+        in_job, alive = self.read_child_probe(out)
+        self.assertEqual(in_job, "True", "a child assigned to the job must read in-job = true, or the probe cannot say yes")
+        self.assertEqual(alive, "True", "the suspended child must be alive when the cleanup starts")
+        self.assertIn("GONE True", out, "the assigned child is still terminated by the failure cleanup")
+        self.assertEqual(spawns, [], "the suspended child must never run, and the Process.Start fallback must not start a second git")
 
     @unittest.skipUnless(sys.platform == "win32", "the suspended start is Windows only")
     def test_a_child_never_assigned_to_the_job_is_terminated_by_the_failure_cleanup(self) -> None:
