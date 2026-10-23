@@ -3562,6 +3562,9 @@ class CompileStepAndReadMentionTests(unittest.TestCase):
         ("c2-check-parenthetical", f"Check the options of the runner ({PARAM}ValidateSet) before editing."),
         ("c2-see-in-parenthetical", f"Verify against the runner (see {PARAM}ValidateSet) that the value is accepted."),
         ("c2-tracked-path-parenthetical", f"Inspect the runner (tools/profiling/{PARAM}ValidateSet)."),
+        # r4: a verbless coordinated object after the drive passes when it is itself a drive object, or names its own venue route.
+        ("c1-chains-and-legs", "Assemble locally, then run the chains and the legs."),
+        ("c1-chains-and-smoke-runner-on-bachelor", "Assemble locally, then run the chains and the smoke runner on Bachelor."),
     )
     # (label, text): the safety floor -- every one is refused today and must stay refused.
     MUST_REFUSE = (
@@ -3613,6 +3616,42 @@ class CompileStepAndReadMentionTests(unittest.TestCase):
         ("c2-declaration-locally", f"Verify locally from the runner ({PARAM}ValidateSet)."),
         ("c2-declaration-by-calling", f"Verify by calling the runner ({PARAM}ValidateSet)."),
         ("c2-backticked-invocation", f"Verify playback by calling (`{PARAM}cuda`)."),
+        # r4 (sol r3 CHANGES_REQUESTED on 3799f0de, findings[0].repro, verbatim): a verbless coordinated clause after the drive carries a
+        # launch object with a local destination. Merge-base c4b1fb49 refuses both (run-playback-locally).
+        ("c1-sol-r3-chains-and-smoke-runner-here", "Assemble locally, then run the chains and the smoke runner here."),
+        ("c1-sol-r3-chains-and-playback-here", "Assemble locally, then run the chains and playback here."),
+        # r4: the shapes around the sol rows. A verbless coordinated object inherits the drive's verb and needs its own venue route.
+        ("c1-chains-and-smoke-runner-no-route", "Assemble locally, then run the chains and the smoke runner."),
+        ("c1-chains-then-smoke-runner-on-this-host", "Assemble locally, then run the chains, then the smoke runner on this host."),
+        ("c1-chains-or-the-arms", "Assemble locally, then run the chains or the arms."),
+        ("c1-chains-and-smoke-runner-locally", "Assemble locally, then run the chains and the smoke runner locally."),
+        ("c1-chains-and-legs-here", "Assemble locally, then run the chains and the legs here with the smoke runner."),
+        ("c1-next-line-chains-on-my-machine", "Build MLVApp locally, then run\nthe chains on my machine with the smoke runner."),
+    )
+    # (label, text): r4 (sol r3 findings[1], LOCAL-PLAYBACK-LINT-C1-MUTATION-FIXTURES-1). Each guard of the C1 exemption has a row that only
+    # that guard refuses, so removing the guard turns the row red (test_each_guard_mutation_turns_its_fixture_red). The first two are sol's
+    # findings[1].repro verbatim; the lint refuses all of them. Sol's second row is also refused by the r4 drive-remainder guard (`clip`),
+    # so the lookahead's own row drives a pronoun object no other guard reads.
+    MUTATION_REFUSE = (
+        ("mut-own-clause-launch-verb", "Build MLVApp to play locally."),
+        ("sol-r3-drive-tail-second-verb", "Assemble locally, stage the smoke runner to Bachelor, then run the chains to play the clip."),
+        ("mut-drive-tail-second-verb", "Assemble locally, stage the smoke runner to Bachelor, then run the chains to play it."),
+        ("mut-coordinated-object", "Assemble locally, then run the chains and the smoke runner."),
+        ("mut-drive-remainder-object", "Assemble locally, then run the chains with the smoke runner."),
+        ("mut-sentence-host-reference", "Assemble locally, stage the smoke runner here, then run the chains."),
+    )
+    # (guard label, exact text of the guard in the lint, its mutation, the MUTATION_REFUSE label the mutation must turn red). Each source
+    # string must occur exactly once in the lint, so a renamed or removed guard fails this table too.
+    GUARD_MUTATIONS = (
+        ("own-clause HasVerb guard", "if ($Clause.HasVerb -or $Clause.Contrast -or $Index -lt $Clause.Start) { return $false }",
+         "if ($Clause.Contrast -or $Index -lt $Clause.Start) { return $false }", "mut-own-clause-launch-verb"),
+        ("driveTail second-launch-verb lookahead", "(?:${driveObject})${e}(?!.*${b}(?:${verbs})${e})\"\n    $driveBare",
+         "(?:${driveObject})${e}\"\n    $driveBare", "mut-drive-tail-second-verb"),
+        ("coordinated verbless object", "if ($launched -and -not (Test-DriveObjectClause", "if ($false -and -not (Test-DriveObjectClause",
+         "mut-coordinated-object"),
+        ("drive remainder launch object", "if ($rest -match $LaunchObject) { return $false }", "if ($false) { return $false }",
+         "mut-drive-remainder-object"),
+        ("sentence host reference", "if ($hm.Index -ne $Index) { return $false }", "if ($false) { return $false }", "mut-sentence-host-reference"),
     )
 
     @classmethod
@@ -3620,7 +3659,8 @@ class CompileStepAndReadMentionTests(unittest.TestCase):
         cls.tmp = Path(tempfile.mkdtemp(prefix="hubvm-compile-mention-"))
         cls.lists = _lint_word_lists(LINT_PS1, cls.tmp)
         cls.member_rows = cls._member_rows(cls.lists)
-        texts = [t for _, t in cls.MUST_PASS] + [t for _, t in cls.MUST_REFUSE] + [t for _, _, t in cls.member_rows]
+        texts = ([t for _, t in cls.MUST_PASS] + [t for _, t in cls.MUST_REFUSE] + [t for _, t in cls.MUTATION_REFUSE]
+                 + [t for _, _, t in cls.member_rows])
         counts = _batch_counts(LINT_PS1, texts, cls.tmp, "compile-mention")
         cls.verdicts = dict(zip(texts, counts))
 
@@ -3681,6 +3721,22 @@ class CompileStepAndReadMentionTests(unittest.TestCase):
         self.assertTrue(self.member_rows, "the new lists are not exposed, so no member row exists")
         wrong = [label for label, must_pass, text in self.member_rows if (self.verdicts[text] == 0) != must_pass]
         self.assertEqual([], wrong)
+
+    def test_each_guard_mutation_turns_its_fixture_red(self):
+        """r4 (LOCAL-PLAYBACK-LINT-C1-MUTATION-FIXTURES-1): every MUTATION_REFUSE row is refused, and removing ONE guard of the C1
+        exemption (a copy of the lint with that guard's text replaced) admits the row named for it. A guard whose text is gone fails here."""
+        wrong = [label for label, text in self.MUTATION_REFUSE if self.verdicts[text] == 0]
+        self.assertEqual([], wrong, "a mutation fixture is not refused by the unmodified lint")
+        source = LINT_PS1.read_text(encoding="utf-8")
+        rows = dict(self.MUTATION_REFUSE)
+        survivors = []
+        for n, (guard, old, new, label) in enumerate(self.GUARD_MUTATIONS):
+            self.assertEqual(1, source.count(old), f"guard '{guard}' does not occur exactly once in the lint")
+            mutant = self.tmp / f"mutant-{n}.ps1"
+            mutant.write_text(source.replace(old, new), encoding="utf-8")
+            if _batch_counts(mutant, [rows[label]], self.tmp, f"mutant-{n}") != [0]:
+                survivors.append(guard)
+        self.assertEqual([], survivors, "removing these guards admits nothing, so no fixture pins them")
 
 
 @requires_pwsh

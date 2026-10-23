@@ -147,6 +147,11 @@
 # passes). C2 exempts a MENTION, never an invocation: the launcher's parameter must be followed by a MentionParamWords word (the parameter's
 # declaration, never a value) and the closing parenthesis, and the sentence must hold no InvokeWords word and no locally / host / here marker
 # ("Verify playback on this host by calling (<launcher> -Param cuda)" refuses again).
+# r4 (sol r3 on 3799f0de, refuse-only): C1 skipped a verbless clause, so "..., then run the chains and the smoke runner here" rode the
+# drive's verb unchecked. A verbless clause after a launch clause now passes only as a drive object or with its own venue route; the rest
+# of a drive object holds no app / runner / smoke / clip / playback word; and any other local-host reference in the sentence (or on the
+# next line of a bare verb) voids C1. Accepted over-refusal: a launch clause with a verb of its own and a venue route ("..., then run the
+# smoke runner on Bachelor") is still no drive, as in r1-r3.
 #
 # ASCII only (PowerShell 5.1 reads a BOM-less file as the ANSI code page). No Set-StrictMode here: a dot-sourced file would leak it into the caller.
 
@@ -389,18 +394,45 @@ function Test-VenueExempts {
 # $NextLine (the next line of the same block, $null when there is none) opens with a DriveObjects word ($DriveNext) and holds no launch verb
 # and no rule trigger ($NextDefeaters: the next line is linted on its own, without the verb, so "then run\nthe chains on this host" would
 # otherwise pass). "Build MLVApp locally, then run\nit with <the smoke mode>." and "..., then run" with no next line refuse.
+# r4 (sol r3 C1 on 3799f0de): a verbless coordinated clause after a launch clause ("..., then run the chains and the smoke runner here")
+# inherits that launch verb, so it is read for its OWN object: it passes only when it is itself a drive object ($DriveNext, nothing in its
+# rest a $LaunchObject) or names its own venue route (Test-VenueExempts). A drive object's rest (after the DriveObjects word, here and on
+# the next line) holds no $LaunchObject ("run the chains with the smoke runner" refuses). Any local-host reference in the sentence but the
+# marker itself ($HostPatterns: here, this host, my machine, a second locally) voids the exemption, and so does one on the next line.
+function Test-DriveObjectClause {
+    param([string]$Text, [string]$Pattern, [string]$LaunchObject)
+    $m = (Get-LintRegex $Pattern).Match($Text)
+    if (-not $m.Success) { return $false }
+    $rest = $Text.Substring($m.Length)
+    if ($rest -match $LaunchObject) { return $false }
+    return $true
+}
+
 function Test-CompileStepLocally {
     param([string]$Sentence, [object[]]$Clauses, [object]$Clause, [int]$Index, [string]$CompilePiece, [string]$DriveTail, [string]$DriveBare,
-        [string]$DriveNext, [object[]]$NextDefeaters, [AllowNull()][string]$NextLine)
+        [string]$DriveNext, [object[]]$NextDefeaters, [AllowNull()][string]$NextLine, [string]$LaunchObject, [string[]]$HostPatterns)
     if ($Clause.HasVerb -or $Clause.Contrast -or $Index -lt $Clause.Start) { return $false }
     if (-not (Get-LintRegex $CompilePiece).IsMatch($Sentence.Substring($Clause.Start, $Index - $Clause.Start))) { return $false }
+    foreach ($pattern in $HostPatterns) {
+        foreach ($hm in (Get-LintRegex $pattern).Matches($Sentence)) {
+            if ($hm.Index -ne $Index) { return $false }
+        }
+    }
+    $launched = $false
     foreach ($k in $Clauses) {
-        if ([object]::ReferenceEquals($k, $Clause) -or -not $k.HasVerb -or $k.Strong) { continue }
+        if ([object]::ReferenceEquals($k, $Clause) -or $k.Strong) { continue }
         $kText = $Sentence.Substring($k.Start, $k.End - $k.Start)
-        if ((Get-LintRegex $DriveTail).IsMatch($kText)) { continue }
+        if (-not $k.HasVerb) {
+            if ($launched -and -not (Test-DriveObjectClause -Text $kText -Pattern $DriveNext -LaunchObject $LaunchObject) -and
+                -not (Test-VenueExempts -Sentence $Sentence -Clauses $Clauses -Clause $k -HostPatterns $HostPatterns)) { return $false }
+            continue
+        }
+        $launched = $true
+        if (Test-DriveObjectClause -Text $kText -Pattern $DriveTail -LaunchObject $LaunchObject) { continue }
         if ($k.End -ne $Sentence.Length -or [string]::IsNullOrEmpty($NextLine) -or -not (Get-LintRegex $DriveBare).IsMatch($kText)) { return $false }
-        if (-not (Get-LintRegex $DriveNext).IsMatch($NextLine)) { return $false }
+        if (-not (Test-DriveObjectClause -Text $NextLine -Pattern $DriveNext -LaunchObject $LaunchObject)) { return $false }
         foreach ($rx in $NextDefeaters) { if ($rx.IsMatch($NextLine)) { return $false } }
+        foreach ($pattern in $HostPatterns) { if ((Get-LintRegex $pattern).IsMatch($NextLine)) { return $false } }
     }
     return $true
 }
@@ -643,6 +675,8 @@ function Get-LintPatternSet {
     $driveTail = "${driveLead}\s+(?:(?:the|a|an)\s+)?(?:${driveObject})${e}(?!.*${b}(?:${verbs})${e})"
     $driveBare = "${driveLead}\s*\z"
     $driveNext = "(?i)^\W*(?:(?:the|a|an)\s+)?(?:${driveObject})${e}(?!.*${b}(?:${verbs})${e})"
+    # r4 (sol r3 C1): what the rest of a drive clause may not name -- a playback word, or an app / runner / smoke / clip object.
+    $launchObject = "${playbackWord}|${b}(?:app|apps|runner|runners|smoke|clip|clips)${e}"
     # C2 (Test-ReadOnlyLauncherMention): a ReadOnlyVerbs word, then the clause up to the parenthesis that holds the launcher (one level of
     # balanced parentheses may sit between), then that parenthesis, at most one MentionParenWords word and quote / backtick marks, and the end.
     $readVerb = ConvertTo-LintAlternation -Words @($lists.ReadOnlyVerbs)
@@ -778,7 +812,7 @@ function Get-LintPatternSet {
         VenueQualified = $venueQualified; PlaybackWord = $playbackWord; VenueLocus = $venueLocus; RoutingLocally = $routingLocally
         Incident = $incident; LocalMarker = $localMarker; HostMarker = $hostMarker; HereMarker = $hereMarker
         HostDefeaters = $hostDefeaters; HostDefeatersLaunch = $hostDefeatersLaunch
-        CompilePiece = $compilePiece; DriveTail = $driveTail; DriveBare = $driveBare; DriveNext = $driveNext
+        CompilePiece = $compilePiece; DriveTail = $driveTail; DriveBare = $driveBare; DriveNext = $driveNext; LaunchObject = $launchObject
         MentionPre = $mentionPre; MentionRelative = $mentionRelative; MentionPost = $mentionPost
         MentionDefeaters = @((New-LintRegex $mentionInvoke), (New-LintRegex $localMarker), (New-LintRegex $hostMarker), (New-LintRegex $hereMarker))
         Direct = $direct; ClipLaunch = $clipLaunch; ClipMention = $clipMention; AppBare = $appBare; AppEnd = $appEnd; ModeFlag = $modeFlag
@@ -895,7 +929,7 @@ function Get-LocalPlaybackPromptFindings {
                     # r3: a bare launch verb ending the line reads its object on the NEXT line (adjacent, same block; none -> $null)
                     $nextLine = $null
                     if ($itemIndex + 1 -lt $items.Count -and $items[$itemIndex + 1].Line -eq $items[$itemIndex].Line + 1 -and $items[$itemIndex + 1].Block -eq $block) { $nextLine = $items[$itemIndex + 1].LineText.Trim() }
-                    if (Test-CompileStepLocally -Sentence $s -Clauses $clauses -Clause $c -Index $m.Index -CompilePiece $patterns.CompilePiece -DriveTail $patterns.DriveTail -DriveBare $patterns.DriveBare -DriveNext $patterns.DriveNext -NextDefeaters $triggers -NextLine $nextLine) { continue }
+                    if (Test-CompileStepLocally -Sentence $s -Clauses $clauses -Clause $c -Index $m.Index -CompilePiece $patterns.CompilePiece -DriveTail $patterns.DriveTail -DriveBare $patterns.DriveBare -DriveNext $patterns.DriveNext -NextDefeaters $triggers -NextLine $nextLine -LaunchObject $patterns.LaunchObject -HostPatterns $hostDefeaters) { continue }
                     # E1 is strictly terminal (r10): the rest of the sentence and of the block must be in the closed, verbless allow-grammar
                     # (Test-VenueTerminalTail). r12: the HEAD is read the same way -- everything of this sentence before `locally` (every
                     # earlier clause, every earlier ';' group, the marker clause's own prefix) must be in the closed head grammar, and so
