@@ -187,7 +187,11 @@ function Read-HeavySlotFeedMetrics { return @{ metrics = $null; why = 'feed miss
 
 function Set-Fake([hashtable]$Control) { [IO.File]::WriteAllText((Join-Path $fx 'fake-control.json'), ($Control | ConvertTo-Json -Compress)) }
 function Get-Calls { $p = Join-Path $fx 'calls.jsonl'; if (-not (Test-Path -LiteralPath $p)) { return @() }; return @(Get-Content -LiteralPath $p | Where-Object { $_ } | ForEach-Object { $_ | ConvertFrom-Json }) }
-function Reset-Case([hashtable]$Control) {
+function Reset-Case([hashtable]$Control, [int]$GraceSec = 120) {
+    # The agent abandons a request pending past LeasePendingMaxSec + LeasePendingGraceSec and asks again (designed: a second,
+    # sequential request after the first was stopped). Python start-up on a loaded runner counts against that bound, so only the
+    # case that EXERCISES the abandon keeps a tight grace; every other case gets a grace no start-up delay can cross.
+    $script:LeasePendingGraceSec = $GraceSec
     Set-Fake $Control
     Remove-Item -LiteralPath (Join-Path $fx 'calls.jsonl'), (Join-Path $fx 'quiet-lease.json') -Force -ErrorAction SilentlyContinue
     Get-ChildItem -LiteralPath $fx -Filter 'release-*' -File | Remove-Item -Force
@@ -300,7 +304,7 @@ try {
     $results.failed = [ordered]@{ reason = @($adm.leaseRefusals)[0].reason }
 
     # ------------------------------------------------------------ pending past the agent's bound -> abandoned
-    Reset-Case @{ request = 'hang' }
+    Reset-Case @{ request = 'hang' } -GraceSec 1
     $script:ExpireWhen = { @($script:Log | Where-Object { $_ -like 'quiet-lease: ended job=jP*why=`[lease abandoned`]*' }).Count -ge 1 }
     $script:AgeAfter = (Get-Date).AddSeconds(60)
     $adm = Wait-QuietLeaseAdmission -JobId 'jP' -Job ([pscustomobject]@{}) -Metadata $meta
