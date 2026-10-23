@@ -7572,6 +7572,66 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
                 self.assertTrue(all(i >= 0 for i in at), out["reason"])
                 self.assertEqual(at, sorted(at), out["reason"])
 
+    def test_a_not_captured_leg_whose_strip_also_fails_keeps_both_reasons(self) -> None:
+        """PLAYBACK-VISUAL-STRIP-REASON-NOT-CAPTURED-1 (the named follow-up of #503): no play frame was saved AND the strip cannot be composed. The NOT_CAPTURED
+        leg used to keep only the strip failure, dropping `only N play frame(s) were captured`. Both survive, capture-count first. The strip is made to fail by a
+        directory sitting where its PNG goes; the control leg (strip fine) keeps the capture-count reason alone."""
+        capture_count = "only 0 play frame(s) were captured"
+        strip_failure = "the strip could not be composed"
+        for mode, texts in (("strip-fails", [capture_count, strip_failure]), ("strip-composes", [capture_count])):
+            with self.subTest(mode), tempfile.TemporaryDirectory(prefix=f"vis-nc-{mode}-") as d:
+                art = Path(d) / "artifacts"
+                write_visual_captures(art / "visual", "ok")
+                visual_json = art / "visual" / "visual.json"
+                visual = json.loads(visual_json.read_text(encoding="utf-8"))
+                for frame in visual["frames"]:
+                    if frame["kind"] == "play":
+                        frame["saved"] = False
+                visual_json.write_text(json.dumps(visual), encoding="utf-8")
+                ev = Path(d) / "evidence"
+                if mode == "strip-fails":
+                    (ev / "visual" / "unit-leg-strip.png").mkdir(parents=True)
+                proc, out = run_pwsh_json(f"Read-DvVisualCaptures -Requested $true -ArtifactsDir '{art}' -EvidenceDir '{ev}' -LegId 'unit-leg' -Header 'unit' | ConvertTo-Json -Depth 8 -Compress")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual((out["verdict"], out["counted"], out["savedPlayFrames"]), ("NOT_CAPTURED", True, 0), out["reason"])
+                if mode == "strip-fails":
+                    self.assertIsNone(out["stripPath"])
+                    at = [out["reason"].find(text) for text in texts]
+                    self.assertTrue(all(i >= 0 for i in at), out["reason"])
+                    self.assertEqual(at, sorted(at), out["reason"])
+                else:
+                    self.assertTrue(Path(out["stripPath"]).is_file())
+                    self.assertEqual(out["reason"], capture_count)
+
+    def test_a_not_captured_leg_with_a_prior_step_reason_keeps_all_three_reasons_in_order(self) -> None:
+        """DV-VISUAL-STRIP-PRIOR-REASON-FIXTURE-1 (Dot advisory 3a8b205c on #600): the NOT_CAPTURED reason is the join of THREE parts, `<verdict reason>; <the step
+        reason standing when the strip failed>; <strip failure>`, and the test above only runs with an empty middle part, so dropping or reordering `$reasonBeforeStrip`
+        stayed green. Here a malformed visual-capture-request.json sets the step reason BEFORE the strip fails (no play frame saved, strip PNG path blocked by a
+        directory): all three survive, in that order, each exactly once."""
+        capture_count = "only 0 play frame(s) were captured"
+        prior_step = "the job's visual-capture request record is not valid JSON"
+        strip_failure = "the strip could not be composed"
+        with tempfile.TemporaryDirectory(prefix="vis-nc-prior-") as d:
+            art = Path(d) / "artifacts"
+            write_visual_captures(art / "visual", "ok")
+            (art / "visual" / "visual-capture-request.json").write_text("{ this is not json", encoding="utf-8")
+            visual_json = art / "visual" / "visual.json"
+            visual = json.loads(visual_json.read_text(encoding="utf-8"))
+            for frame in visual["frames"]:
+                if frame["kind"] == "play":
+                    frame["saved"] = False
+            visual_json.write_text(json.dumps(visual), encoding="utf-8")
+            ev = Path(d) / "evidence"
+            (ev / "visual" / "unit-leg-strip.png").mkdir(parents=True)
+            proc, out = run_pwsh_json(f"Read-DvVisualCaptures -Requested $true -ArtifactsDir '{art}' -EvidenceDir '{ev}' -LegId 'unit-leg' -Header 'unit' | ConvertTo-Json -Depth 8 -Compress")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual((out["verdict"], out["counted"], out["savedPlayFrames"]), ("NOT_CAPTURED", True, 0), out["reason"])
+        self.assertIsNone(out["stripPath"])
+        self.assertEqual([out["reason"].count(text) for text in (capture_count, prior_step, strip_failure)], [1, 1, 1], out["reason"])
+        at = [out["reason"].find(text) for text in (capture_count, prior_step, strip_failure)]
+        self.assertEqual(at, sorted(at), out["reason"])
+        self.assertEqual(out["reason"].split("; ")[1], prior_step, "the prior step reason sits between the verdict reason and the strip failure")
+
     def test_a_strip_that_composes_leaves_the_reason_as_it_was(self) -> None:
         """CoS #474 N5 (no change when the strip is fine): no strip text is added, and the partial-ok note stays the whole reason."""
         for mode, reason in (("ok", None), ("partial-ok", "1 saved play frame(s) have no usable viewport rectangle and were not judged; the other 5 were")):

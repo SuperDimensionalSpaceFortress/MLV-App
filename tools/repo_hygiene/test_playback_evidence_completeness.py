@@ -385,6 +385,8 @@ CONSUMER_EXEMPT: dict[str, str] = {
     "tools/gates/test_output_budget.py": "unit test of compare-output-budget.ps1 (runs it against fakes).",
     "tools/coordination/lane-local-playback-lint.ps1":
         "static prompt-text safety lint: it names the venue chain only to recognise venue routing in a prompt and never launches anything.",
+    "tools/testing/test-ultra-magnus-agent-quiet-lease.ps1":
+        "static self-test: reads playback-attr-3-cuda-job.ps1 as text to pin its quiet-lease call and CPU threshold; it never launches it.",
 }
 
 

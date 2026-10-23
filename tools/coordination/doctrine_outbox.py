@@ -140,6 +140,7 @@ config that is present but wrong is the refusal CONFIG_INVALID (exit 1, naming t
 from __future__ import annotations
 
 import argparse
+import functools
 import hashlib
 import html
 import json
@@ -509,6 +510,43 @@ _autoconfigure()
 # The bus clone is only read here, never written: a partial (promisor) clone must answer from what it holds and not fetch
 # a missing object from its remote mid-lookup. git reads this from 2.44; an older git ignores it.
 NO_LAZY_FETCH_ENV = {"GIT_NO_LAZY_FETCH": "1"}
+NO_LAZY_FETCH_MIN_GIT = (2, 44, 0)
+_GIT_VERSION_RE = re.compile(r"^git version (\d+)\.(\d+)(?:\.(\d+))?")
+
+
+@functools.lru_cache(maxsize=1)
+def git_version_text() -> str:
+    """`git --version`, probed once per process (the seam the tests replace). A git that cannot be run raises OSError."""
+    return subprocess.run(["git", "--version"], capture_output=True, text=True, timeout=30).stdout
+
+
+def parse_git_version(text: str) -> tuple[int, int, int] | None:
+    """(major, minor, patch) from `git version 2.40.0.windows.1`, or None when the text is not a git version line."""
+    found = _GIT_VERSION_RE.match(text.strip())
+    return None if found is None else (int(found.group(1)), int(found.group(2)), int(found.group(3) or 0))
+
+
+def require_no_lazy_fetch_honoured(bus: pathlib.Path) -> None:
+    """Raise Unknown GIT_TOO_OLD_FOR_NO_LAZY_FETCH when the guard above would silently do nothing: this git is older than
+    NO_LAZY_FETCH_MIN_GIT, or its version cannot be read (unknown is never a pass), AND `bus` is a partial (promisor) clone,
+    the only kind that can lazy-fetch. A bus holding every object has nothing to fetch, so it is read as before on any git.
+    A git that honours the variable returns at once, with no further git call. Called before the first bus read."""
+    try:
+        text = git_version_text()
+    except (OSError, subprocess.SubprocessError):
+        text = ""
+    version = parse_git_version(text)
+    if version is not None and version >= NO_LAZY_FETCH_MIN_GIT:
+        return
+    rc, out, _err = git_try(bus, "config", "--get-regexp", r"^(extensions\.partialclone|remote\..*\.promisor)$",
+                          extra_env=NO_LAZY_FETCH_ENV)
+    if rc != 0 or not out:   # rc 1: no promisor setting. Any other rc is an unreadable bus, which the tip lookup reports as such
+        return
+    required = ".".join(str(n) for n in NO_LAZY_FETCH_MIN_GIT[:2])
+    found = f"git {'.'.join(str(n) for n in version)}" if version else f"an unparseable `git --version` ({text.strip()[:80]!r})"
+    raise Unknown("GIT_TOO_OLD_FOR_NO_LAZY_FETCH",
+                  f"{found} is not known to honour GIT_NO_LAZY_FETCH (git {required} or newer does), and {bus} is a partial clone, so a "
+                  f"bus read could lazy-fetch from its promisor remote; use git {required}+ or a full clone of the bus")
 
 def _run_git(repo: pathlib.Path, args: list[str], input_text: str | None = None,
              extra_env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -4087,7 +4125,9 @@ def _ruling_target(entry: str) -> tuple[str, str] | None:
 def _bus_tip(bus: pathlib.Path) -> str:
     """The bus clone's committed tip, resolved ONCE per item (`screen_ruling_candidate` calls it once): every target of that
     item is then read at this commit, so a writer that advances the clone mid-check cannot mix two snapshots into one
-    verdict. Two items in one `validate` call each resolve their own."""
+    verdict. Two items in one `validate` call each resolve their own. The first bus read, so it is where a git that
+    cannot honour GIT_NO_LAZY_FETCH is refused (require_no_lazy_fetch_honoured)."""
+    require_no_lazy_fetch_honoured(bus)
     rc, out, _err = git_try(bus, "rev-parse", "--verify", "-q", "HEAD^{commit}", extra_env=NO_LAZY_FETCH_ENV)
     if rc != 0 or not out:
         raise Unknown("RULING_BUS_UNREADABLE", f"{bus} is not a git clone with a committed tip; the touches/supersedes targets cannot be checked")

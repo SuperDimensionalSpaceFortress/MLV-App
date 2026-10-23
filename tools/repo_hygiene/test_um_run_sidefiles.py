@@ -11,6 +11,7 @@ The placement code is exercised two ways:
 
 from __future__ import annotations
 
+import ast
 import re
 import hashlib
 import json
@@ -79,6 +80,44 @@ def skip_if_claim_wait_inconclusive(test: unittest.TestCase, claim_lo: float, cl
             "INCONCLUSIVE: the claim window (claim_lo -> claim_hi) was wide enough that a stall "
             "inside it cannot be told from an hour-back client; every other check passed "
             f"[{timing_facts}]")
+
+
+_SEAM_CALL_ARGS = ["self", "claim_lo", "claim_hi", "verdict_time", "timeout_sec", "timing_facts"]
+_SEAM_CALL_METHOD = "test_a_clock_skewed_claim_marker_observed_at_the_queue_deadline_does_not_shrink_the_clients_patience"
+
+
+def seam_call_position_problem(source: str, class_name: str, method_name: str | None = None) -> str | None:
+    """UMRUN-SEAM-CALL-POSITION-PIN-1: None when `class_name` in `source` calls
+    skip_if_claim_wait_inconclusive exactly once, as the FINAL top-level statement of a method body
+    and with the live test's own arguments; otherwise a sentence saying what is wrong. The seam only
+    skips after every other check has run, so a call placed earlier would skip past the UNRESOLVED /
+    started-marker asserts below it. Takes source text so a test can feed it a mutated copy. When
+    `method_name` is given, the call must also sit in the method of that name.
+
+    Final-statement placement is a positional contract only: it does not prove the call is reached at
+    run time (an early return, a raised skip or an exception above it still bypasses it). The live
+    test's own asserts are what make it reachable."""
+    classes = [node for node in ast.walk(ast.parse(source))
+               if isinstance(node, ast.ClassDef) and node.name == class_name]
+    if len(classes) != 1:
+        return f"expected exactly one class {class_name}, found {len(classes)}"
+    calls = [(member, node) for member in classes[0].body for node in ast.walk(member)
+             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+             and node.func.id == "skip_if_claim_wait_inconclusive"]
+    if len(calls) != 1:
+        return f"expected exactly one seam call in {class_name}, found {len(calls)}"
+    method, call = calls[0]
+    if not isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return "the seam call is not inside a method body"
+    if method_name is not None and method.name != method_name:
+        return f"the seam call is in {method.name}, not in the expected method {method_name}"
+    if [ast.unparse(arg) for arg in call.args] != _SEAM_CALL_ARGS or call.keywords:
+        return f"{method.name} calls the seam with unexpected arguments: {ast.unparse(call)}"
+    final = method.body[-1]
+    if not (isinstance(final, ast.Expr) and final.value is call):
+        return (f"{method.name}: the seam call (line {call.lineno}) is not the final top-level "
+                f"statement of the method body (that is line {final.lineno})")
+    return None
 
 
 @unittest.skipIf(PWSH is None, "pwsh is not on PATH")
@@ -2308,6 +2347,98 @@ class UmRunClaimWaitSkipWiringTests(unittest.TestCase):
         calls = source.count(
             "skip_if_claim_wait_inconclusive(self, claim_lo, claim_hi, verdict_time, timeout_sec, timing_facts)")
         self.assertEqual(calls, 1, "the live wait test no longer routes its INCONCLUSIVE verdict through the seam")
+
+    # UMRUN-SEAM-CALL-POSITION-PIN-1 (opus r1 on #592): the count above is blind to WHERE the call
+    # sits; these pin it as the live wait test's final top-level statement.
+    _SEAM_CALL = "skip_if_claim_wait_inconclusive(self, claim_lo, claim_hi, verdict_time, timeout_sec, timing_facts)"
+    _SYNTH = (
+        "class Live:\n"
+        "    def test_it(self):\n"
+        "{body}"
+        "\n"
+    )
+
+    @classmethod
+    def _synth(cls, *body: str) -> str:
+        return cls._SYNTH.format(body="".join(f"        {line}\n" for line in body))
+
+    @classmethod
+    def _real_source(cls) -> str:
+        return Path(__file__).read_text(encoding="utf-8")
+
+    @classmethod
+    def _real_source_with_call_moved_above(cls, marker: str) -> str:
+        """The file's own source with the live wait test's seam call moved to just above the first
+        line in that test containing `marker`."""
+        source = cls._real_source()
+        lines = source.splitlines()
+        live = next(node for node in ast.walk(ast.parse(source))
+                    if isinstance(node, ast.ClassDef) and node.name == "UmRunEndToEndTests")
+        method = next(m for m in live.body if isinstance(m, ast.FunctionDef) and m.end_lineno is not None
+                      and lines[m.end_lineno - 1].strip() == cls._SEAM_CALL)
+        call_idx = method.end_lineno - 1
+        target_idx = next(i for i in range(method.lineno - 1, call_idx) if marker in lines[i])
+        lines.insert(target_idx, lines.pop(call_idx))
+        return "\n".join(lines) + "\n"
+
+    def test_the_live_wait_tests_final_statement_is_the_seam_call(self) -> None:
+        self.assertIsNone(seam_call_position_problem(
+            self._real_source(), "UmRunEndToEndTests", method_name=_SEAM_CALL_METHOD))
+
+    # UMRUN-SIBLING-1122-SLACK-COMMENT-SAME-CLOCK-1 (Dot c91c2dda on #597, H1): bind the method name.
+    def test_the_seam_call_moved_into_a_differently_named_method_is_rejected_when_the_name_is_bound(self) -> None:
+        source = self._synth(self._SEAM_CALL).replace("def test_it(", "def test_other(")
+        problem = seam_call_position_problem(source, "Live", method_name="test_it")
+        self.assertIsNotNone(problem)
+        self.assertIn("test_other", problem)
+        self.assertIn("test_it", problem)
+
+    def test_the_seam_call_in_the_renamed_real_live_wait_test_is_rejected_when_the_name_is_bound(self) -> None:
+        mutated = self._real_source().replace(f"def {_SEAM_CALL_METHOD}(", "def test_renamed_live_wait(", 1)
+        self.assertNotEqual(mutated, self._real_source())
+        problem = seam_call_position_problem(mutated, "UmRunEndToEndTests", method_name=_SEAM_CALL_METHOD)
+        self.assertIsNotNone(problem)
+        self.assertIn("test_renamed_live_wait", problem)
+        self.assertIn(_SEAM_CALL_METHOD, problem)
+
+    def test_a_seam_call_in_the_bound_method_name_is_accepted(self) -> None:
+        self.assertIsNone(seam_call_position_problem(self._synth(self._SEAM_CALL), "Live", method_name="test_it"))
+
+    def test_the_seam_call_moved_above_the_unresolved_assert_is_rejected_though_the_count_still_passes(self) -> None:
+        for marker in ('self.assertIn("UNRESOLVED:"', 'self.assertIn("its own started marker is gone too"'):
+            with self.subTest(marker=marker):
+                mutated = self._real_source_with_call_moved_above(marker)
+                class_node = next(node for node in ast.parse(mutated).body
+                                  if isinstance(node, ast.ClassDef) and node.name == "UmRunEndToEndTests")
+                # The mutation is one the old count-only pin cannot see ...
+                self.assertEqual(ast.get_source_segment(mutated, class_node).count(self._SEAM_CALL), 1)
+                # ... and the position pin rejects it.
+                problem = seam_call_position_problem(mutated, "UmRunEndToEndTests")
+                self.assertIsNotNone(problem)
+                self.assertIn("not the final top-level statement", problem)
+
+    def test_a_seam_call_followed_by_any_further_statement_is_rejected(self) -> None:
+        source = self._synth(self._SEAM_CALL, "self.assertTrue(True)")
+        self.assertIn("not the final", seam_call_position_problem(source, "Live") or "")
+
+    def test_a_seam_call_nested_in_a_branch_or_assigned_is_not_the_final_statement(self) -> None:
+        for body in (("if claim_lo:", "    " + self._SEAM_CALL),
+                     (f"outcome = {self._SEAM_CALL}",),
+                     (f"return {self._SEAM_CALL}",)):
+            with self.subTest(body=body):
+                self.assertIsNotNone(seam_call_position_problem(self._synth(*body), "Live"))
+
+    def test_a_missing_or_duplicated_seam_call_is_rejected(self) -> None:
+        self.assertIn("found 0", seam_call_position_problem(self._synth("pass"), "Live") or "")
+        self.assertIn("found 2", seam_call_position_problem(
+            self._synth(self._SEAM_CALL, self._SEAM_CALL), "Live") or "")
+
+    def test_a_seam_call_with_different_arguments_is_rejected(self) -> None:
+        source = self._synth("skip_if_claim_wait_inconclusive(self, claim_hi, claim_lo, verdict_time, timeout_sec, timing_facts)")
+        self.assertIn("unexpected arguments", seam_call_position_problem(source, "Live") or "")
+
+    def test_a_final_seam_call_is_accepted(self) -> None:
+        self.assertIsNone(seam_call_position_problem(self._synth("self.assertTrue(True)", self._SEAM_CALL), "Live"))
 
 
 def _git(args: list[str], cwd: Path) -> None:

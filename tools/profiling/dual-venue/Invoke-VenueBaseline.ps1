@@ -14,12 +14,23 @@
 #   4. runs the standard legs through the tracked Invoke-VenueChain.ps1 -PreferQuietWindows, once per backend (cuda, then cpu), as a CHILD process bounded by
 #      -MaxTotalSec (+ -KillGraceSec): the chain's own -DeadlineUtc stops it gracefully, the kill is the backstop, so nothing here can wait unbounded;
 #      The chain's exit code is read before any row is built (a pinned consumer of the evidence launchers: tools/repo_hygiene/test_playback_evidence_completeness.py).
-#      A leg is recorded RAN, with figures, only when the chain ended on its own with exit 0 that agrees with its CHAIN_RESULT, and the leg's receipt is readable and
-#      its validator verdict is ADVISORY / NO_SIGNAL / VERIFIED* (INVALID, INCOMPLETE and a validator error are refused); otherwise the row is status EVIDENCE_INCOMPLETE
+#      A leg is recorded RAN, with figures, only when the chain ended on its own with exit 0 that agrees with its CHAIN_RESULT, and the leg's receipt is readable, is THIS
+#      run's receipt (receiptId = its file name, legId, venue, subject.backend and buildManifestSha256 as planned, startedUtc after this run began; anything else is receipt identity
+#      EVIDENCE_INCOMPLETE and the receipt is not even validated) and its validator verdict is ADVISORY / VERIFIED* (INVALID, INCOMPLETE and a validator error are refused;
+#      NO_SIGNAL is readable but carries no figure: RECEIPT_NO_SIGNAL); otherwise the row is status EVIDENCE_INCOMPLETE
 #      (EVIDENCE_INVALID for an INVALID verdict) / outcome INVALID with a `failure` text and NO figures. An undocumented or disagreeing exit exits CHAIN_FAILED (27); a documented
 #      non-zero exit (7, 3, gate) keeps its own typed exit but its legs carry no figures either.
 #   5. appends ONE JSON line per leg that touched the venue to the trend file (default <main checkout>\.claude-state\dual-venue\baseline-trend.jsonl), then
-#      samples the hub-VM load again; the same two samples sit in every row of the run.
+#      samples the hub-VM load again; the same two samples sit in every row of the run. The append is ONE write under a machine-wide named mutex, opened with
+#      FileShare.ReadWrite: two runs appending to one trend file queue behind each other, no row is lost and no line is interleaved (TREND_APPEND_FAILED when the mutex
+#      is not won in 60 s; the rows are then still in <RunDir>\baseline-rows.jsonl, written first).
+#
+# WALL-CLOCK BOUND (BASELINE_BOUND line, `wallClockBound` in BASELINE_RESULT). The chains, the fetch and the preflight reads are bounded by -MaxTotalSec (+ -KillGraceSec for the
+# chain). What runs AFTER the chain is NOT counted in -MaxTotalSec: the end hub-load sample (CIM + counter, a bounded child: -ProbeTimeoutSec) and each -ValidatorScript call (a bounded
+# child: -ProbeTimeoutSec) are bounded each, so the worst case past the cap is KillGraceSec + (1 + legs) x ProbeTimeoutSec; the in-process receipt read and validator
+# (Test-DvReceiptValid over local files) and the trend append (60 s mutex wait) have no bound of their own. The run is therefore NOT promised to end by MaxTotalSec, only by MaxTotalSec
+# + KillGraceSec + that bookkeeping. A kill past the cap is an ATTEMPT until the pid is re-queried: killAttempted and terminationConfirmed are reported apart (confirmed = the pid is gone,
+# or is a process with another start time); an unconfirmed termination is named as such in the detail.
 #
 # STAGING. The chain never builds or stages: Invoke-VenueLeg refuses (DEVICE_UNAVAILABLE BUILD_NOT_STAGED) a build that is not in the venue's cache. This script adds
 # no staging logic. It finds the manifest the tracked staging path already published (<agentShare>\cache\playback-attr-3-cuda-<sha12>-build.json, the file
@@ -28,15 +39,19 @@
 #
 #   pwsh -NoProfile -File "<repo>\tools\profiling\dual-venue\Invoke-VenueBaseline.ps1" [-Venue ultra-magnus] [-SourceCommit <40-hex>] [-TrendFile <path>] [-WhatIf]
 #
-# Exit codes (typed; the BASELINE_EXIT line and BASELINE_RESULT json carry the token): 0 every planned leg ran (the chain exited 0 for both backends); 2 usage;
+# Exit codes (typed; the BASELINE_EXIT line and BASELINE_RESULT json carry the token): 0 every planned leg ran (the chain exited 0 for both backends) AND at least one row
+# carries a figure (reason OK); 0 also for reason NO_MEASUREMENT (every row is unmeasured: no figure at all -- never reported as OK; the exit code stays 0 until
+# BASELINE-EXIT-NO-MEASUREMENT-1 changes it, `measuredRows` in BASELINE_RESULT counts the rows with a figure); 2 usage;
 # 20 AGENT_BUSY (a live claim or queued ticket, or the venue never went quiet before the deadline with no leg run); 21 SHARE_UNREACHABLE; 22 BUILD_NOT_STAGED;
 # 23 GATE_REFUSED (the chain stopped on GATE_UNREADABLE / HOST_MISMATCH / VENUE_QUIET_UNKNOWN / an unhealthy streak: chain exits 4, 5, 6, 8);
 # 24 BASELINE_CAP_EXCEEDED (-MaxTotalSec ran out; rows for the legs that did run are still appended); 25 LEG_FAILED (a leg process died: chain exit 7);
 # 26 SOURCE_COMMIT_UNRESOLVED; 27 CHAIN_FAILED (the chain ended with no CHAIN_RESULT or an undocumented exit);
-# 28 FETCH_TIMEOUT (-Fetch: git fetch outlived -MaxTotalSec and was killed). 17 is NOT used: it is the hub-VM playback refusal.
+# 28 FETCH_TIMEOUT (-Fetch: git fetch outlived -MaxTotalSec and a kill was attempted: the detail says whether the termination was confirmed);
+# 29 TREND_APPEND_FAILED (the trend file could not be appended: mutex not won in 60 s, or the write failed; the rows are in <RunDir>\baseline-rows.jsonl).
+# 17 is NOT used: it is the hub-VM playback refusal.
 #
 # NO LOCAL PLAYBACK: this script never starts MLVApp. Playback happens only on the venue, through the chain (hub-hosts.json, HUB-VM-NO-LOCAL-PLAYBACK-1).
-# -ChainScript / -ValidatorScript / -GitExe / -HubLoadScript / -AgentShare / -ClaimDir / -VenueTablePath / -RepoRoot are seams for the offline tests (tools/repo_hygiene/test_venue_baseline.py);
+# -ChainScript / -ValidatorScript / -GitExe / -HubLoadScript / -ProcessProbeScript / -AgentShare / -ClaimDir / -VenueTablePath / -RepoRoot are seams for the offline tests (tools/repo_hygiene/test_venue_baseline.py);
 # production passes none. Scheduling is NOT here: the hub wires one call into MLVHubAutopilot (see the PR body).
 [CmdletBinding()]
 param(
@@ -56,6 +71,7 @@ param(
     [string]$ValidatorScript = '',
     [string]$GitExe = 'git',
     [string]$HubLoadScript = '',
+    [string]$ProcessProbeScript = '',
     [string]$AgentShare = '',
     [string]$ClaimDir = '',
     [string]$VenueTablePath = '',
@@ -70,7 +86,8 @@ $StandardLegs = @('legs\m16-1243-look.json', 'legs\m16-1243-display-fullscreen-s
 $StandardBackends = @('cuda', 'cpu')
 $ExitCodes = [ordered]@{
     OK = 0; USAGE = 2; AGENT_BUSY = 20; SHARE_UNREACHABLE = 21; BUILD_NOT_STAGED = 22; GATE_REFUSED = 23
-    BASELINE_CAP_EXCEEDED = 24; LEG_FAILED = 25; SOURCE_COMMIT_UNRESOLVED = 26; CHAIN_FAILED = 27; FETCH_TIMEOUT = 28
+    BASELINE_CAP_EXCEEDED = 24; LEG_FAILED = 25; SOURCE_COMMIT_UNRESOLVED = 26; CHAIN_FAILED = 27; FETCH_TIMEOUT = 28; TREND_APPEND_FAILED = 29
+    NO_MEASUREMENT = 0      # an all-unmeasured run: exit 0 (unchanged; BASELINE-EXIT-NO-MEASUREMENT-1 owns that) but never the token OK
 }
 $startedUtc = [DateTime]::UtcNow
 $pwshExe = [Environment]::ProcessPath
@@ -104,21 +121,64 @@ function Invoke-Bounded([scriptblock]$Script, [object[]]$ArgList, [int]$Sec) {
     finally { $ps.Dispose() }
 }
 
+function Invoke-BoundedChild([string[]]$ArgList, [int]$Sec) {
+    # Run pwsh with $ArgList as a CHILD bounded by $Sec seconds (killed with its tree past it, the pipes read on tasks so a full pipe cannot stall it). ok = it ended on its own with exit 0.
+    $psi = [Diagnostics.ProcessStartInfo]::new($pwshExe)
+    foreach ($a in $ArgList) { [void]$psi.ArgumentList.Add($a) }
+    $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.RedirectStandardInput = $true; $psi.CreateNoWindow = $true
+    $p = [Diagnostics.Process]::Start($psi)
+    $p.StandardInput.Close()
+    $outTask = $p.StandardOutput.ReadToEndAsync(); [void]$p.StandardError.ReadToEndAsync()
+    $timedOut = -not $p.WaitForExit([int]($Sec * 1000))
+    if ($timedOut) { try { $p.Kill($true) } catch { }; [void]$p.WaitForExit(5000) }
+    $out = $(if ($outTask.Wait(5000)) { $outTask.Result } else { '' })
+    [pscustomobject]@{ ok = ((-not $timedOut) -and ($p.ExitCode -eq 0)); timedOut = $timedOut; exit = $(if ($timedOut) { $null } else { $p.ExitCode }); stdout = $out }
+}
+
+# The hub-load reading as a bounded child: a CIM query or a counter that hangs costs -ProbeTimeoutSec, never an unbounded wait (I1). Same formula the venue health probe uses (commitUsedGiB).
+$HubLoadProbeCommand = @'
+$r = [ordered]@{ commitGiB = $null; cpuPercent = $null }
+try { $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop; $r.commitGiB = [math]::Round(($os.TotalVirtualMemorySize - $os.FreeVirtualMemory) / 1MB, 1) } catch { }
+try { $c = (Get-Counter -Counter '\Processor(_Total)\% Processor Time' -SampleInterval 1 -MaxSamples 3 -ErrorAction Stop).CounterSamples | ForEach-Object { $_.CookedValue }; $r.cpuPercent = [math]::Round((($c | Measure-Object -Average).Average), 1) } catch { }
+$r | ConvertTo-Json -Compress
+'@
+
 function Get-HubLoad {
-    # {utc, host, commitGiB, cpuPercent} of THIS host (the hub VM). A reading that cannot be taken is $null, never zero. -HubLoadScript (tests) prints one JSON object.
+    # {utc, host, commitGiB, cpuPercent} of THIS host (the hub VM). A reading that cannot be taken (or does not return inside -ProbeTimeoutSec) is $null, never zero.
+    # -HubLoadScript (tests) prints one JSON object.
     $s = [ordered]@{ utc = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'); host = $env:COMPUTERNAME; commitGiB = $null; cpuPercent = $null }
     try {
-        if ($HubLoadScript) {
-            $o = (& $pwshExe -NoProfile -NonInteractive -File $HubLoadScript) -join "`n" | ConvertFrom-Json
-            $s.commitGiB = $o.commitGiB; $s.cpuPercent = $o.cpuPercent
-            return [pscustomobject]$s
-        }
-        $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
-        $s.commitGiB = [math]::Round(($os.TotalVirtualMemorySize - $os.FreeVirtualMemory) / 1MB, 1)   # the same formula the venue health probe uses (commitUsedGiB)
-        $c = (Get-Counter -Counter '\Processor(_Total)\% Processor Time' -SampleInterval 1 -MaxSamples 3 -ErrorAction Stop).CounterSamples | ForEach-Object { $_.CookedValue }
-        $s.cpuPercent = [math]::Round((($c | Measure-Object -Average).Average), 1)
+        $argv = $(if ($HubLoadScript) { @('-NoProfile', '-NonInteractive', '-File', $HubLoadScript) } else { @('-NoProfile', '-NonInteractive', '-Command', $HubLoadProbeCommand) })
+        $r = Invoke-BoundedChild $argv $ProbeTimeoutSec
+        if ($r.ok) { $o = $r.stdout | ConvertFrom-Json; $s.commitGiB = $o.commitGiB; $s.cpuPercent = $o.cpuPercent }
     } catch { }
     [pscustomobject]$s
+}
+
+function Test-ProcessAlive([int]$ProcessId, $StartedAt) {
+    # Re-query the pid: alive only while a process with that id AND the start time recorded at launch still exists (a reused pid is another process). A probe that cannot answer
+    # is ALIVE (an unconfirmed termination is never rounded up to a confirmed one). -ProcessProbeScript (tests) prints ALIVE or GONE.
+    if ($ProcessProbeScript) {
+        $o = Invoke-BoundedChild @('-NoProfile', '-NonInteractive', '-File', $ProcessProbeScript, '-ProcessId', [string]$ProcessId) 20
+        return (-not $o.ok) -or ($o.stdout.Trim() -cne 'GONE')
+    }
+    $q = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+    if ($null -eq $q) { return $false }
+    try { if ($null -ne $StartedAt -and $q.StartTime -ne $StartedAt) { return $false } } catch { }
+    $true
+}
+
+function Stop-ProcessConfirmed($Proc, $StartedAt) {
+    # I2: Kill($true) is an ATTEMPT. The termination is confirmed only when the pid is re-queried after it and is gone (or is a process with another start time).
+    $killError = $null
+    try { $Proc.Kill($true) } catch { $killError = $_.Exception.Message }
+    try { [void]$Proc.WaitForExit(15000) } catch { }
+    [pscustomobject]@{ killAttempted = $true; terminationConfirmed = (-not (Test-ProcessAlive $Proc.Id $StartedAt)); processId = $Proc.Id; killError = $killError }
+}
+
+function Format-Termination($Kill) {
+    if ($Kill.terminationConfirmed) { return "kill attempted, termination confirmed (pid $($Kill.processId) is gone)" }
+    "kill attempted, termination NOT confirmed (pid $($Kill.processId) still answers after the attempt$(if ($Kill.killError) { ": $($Kill.killError)" }))"
 }
 
 # ------------------------------------------------------------------ 1. the plan --------------------------------------------------------------------------------
@@ -149,24 +209,26 @@ foreach ($rel in $StandardLegs) {
 $deadline = $startedUtc.AddSeconds($MaxTotalSec)
 
 function Invoke-BoundedFetch {
-    # `git fetch fork master` as a CHILD bounded by the same -MaxTotalSec budget as everything else: past the deadline the child and its tree are killed. Returns $true when it timed out.
+    # `git fetch fork master` as a CHILD bounded by the same -MaxTotalSec budget as everything else: past the deadline a kill of the child and its tree is attempted. Returns $null when
+    # it ended in time, else the kill record (killAttempted, terminationConfirmed: the pid is re-queried, an attempt is not a confirmation).
     $psi = [Diagnostics.ProcessStartInfo]::new($GitExe)
     foreach ($a in @('-C', $repo, 'fetch', '--quiet', 'fork', 'master')) { [void]$psi.ArgumentList.Add($a) }
     $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.RedirectStandardInput = $true; $psi.CreateNoWindow = $true
     $p = [Diagnostics.Process]::Start($psi)
+    $startedAt = try { $p.StartTime } catch { $null }
     $p.StandardInput.Close()
     [void]$p.StandardOutput.ReadToEndAsync(); [void]$p.StandardError.ReadToEndAsync()
     $done = $p.WaitForExit([int][Math]::Max(1000, ($deadline - [DateTime]::UtcNow).TotalMilliseconds))
-    if (-not $done) { try { $p.Kill($true) } catch { }; [void]$p.WaitForExit(15000) }
-    -not $done
+    if (-not $done) { return (Stop-ProcessConfirmed $p $startedAt) }
+    $null
 }
 
 $commit = $SourceCommit
 if (-not $commit) {
     # -WhatIf never fetches (it runs nothing); a failed fetch is not an error (the local fork/master ref is used), a stalled one is FETCH_TIMEOUT.
     if ($Fetch -and -not $WhatIf) {
-        $fetchTimedOut = try { Invoke-BoundedFetch } catch { $false }
-        if ($fetchTimedOut) { Stop-Baseline 'FETCH_TIMEOUT' "git fetch fork master was still running at the $MaxTotalSec s cap and was killed" }
+        $fetchKill = try { Invoke-BoundedFetch } catch { $null }
+        if ($fetchKill) { Stop-Baseline 'FETCH_TIMEOUT' "git fetch fork master was still running at the $MaxTotalSec s cap; $(Format-Termination $fetchKill)" }
     }
     $ref = (& git -C $repo rev-parse --verify --quiet 'refs/remotes/fork/master^{commit}' 2>$null)
     if ($LASTEXITCODE -ne 0 -or [string]$ref -cnotmatch '^[0-9a-f]{40}$') { Stop-Baseline 'SOURCE_COMMIT_UNRESOLVED' 'refs/remotes/fork/master does not resolve; pass -SourceCommit <40-hex> or fetch fork' }
@@ -204,6 +266,9 @@ $script:RunDirResolved = $RunDir
 $hubStart = Get-HubLoad
 Out-Line "BASELINE_START venue=$Venue sourceCommit=$commit runDir=$RunDir deadlineUtc=$($deadline.ToString('o')) hubLoadStart=$($hubStart | ConvertTo-Json -Compress)"
 
+$wallClockBound = "the chains and the fetch end by MaxTotalSec $MaxTotalSec s + KillGraceSec $KillGraceSec s; the end hub-load sample and each -ValidatorScript call are bounded children of ProbeTimeoutSec $ProbeTimeoutSec s each; the in-process receipt read + validator and the trend append (60 s mutex wait) are NOT counted in MaxTotalSec"
+Out-Line "BASELINE_BOUND maxTotalSec=$MaxTotalSec killGraceSec=$KillGraceSec probeTimeoutSec=$ProbeTimeoutSec ($wallClockBound)"
+
 $status = Get-VenueClaimStatus -Venue $Venue -ClaimDir $ClaimDir
 $liveTickets = @($status.tickets | Where-Object { $_.state -cne 'STALE' })
 if ($status.claim.state -cin @('LIVE', 'BUSY') -or $liveTickets.Count -gt 0) {
@@ -234,32 +299,62 @@ function Invoke-BoundedChain([string]$Backend) {
     foreach ($a in (Get-ChainArgs $Backend $chainRun $manifest)) { [void]$psi.ArgumentList.Add($a) }
     $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.RedirectStandardInput = $true; $psi.CreateNoWindow = $true
     $p = [Diagnostics.Process]::Start($psi)
+    $startedAt = try { $p.StartTime } catch { $null }
     $p.StandardInput.Close()
     $outTask = $p.StandardOutput.ReadToEndAsync(); $errTask = $p.StandardError.ReadToEndAsync()
     $waitMs = [int][Math]::Max(1000, ($deadline - [DateTime]::UtcNow).TotalMilliseconds + ($KillGraceSec * 1000))
     $timedOut = -not $p.WaitForExit($waitMs)
-    if ($timedOut) { try { $p.Kill($true) } catch { }; [void]$p.WaitForExit(15000) }
+    $kill = $null
+    if ($timedOut) { $kill = Stop-ProcessConfirmed $p $startedAt }
     [void]$outTask.Wait(15000); [void]$errTask.Wait(15000)
     $out = $(if ($outTask.IsCompleted) { $outTask.Result } else { '' }); $err = $(if ($errTask.IsCompleted) { $errTask.Result } else { '' })
     [IO.File]::WriteAllText((Join-Path $RunDir "chain-$Backend.out.txt"), $out + $(if ($err) { "`n--- stderr ---`n$err" } else { '' }))
     $resultLine = @($out -split "`r?`n" | Where-Object { $_ -like 'CHAIN_RESULT=*' }) | Select-Object -Last 1
     $result = $(if ($resultLine) { try { $resultLine.Substring('CHAIN_RESULT='.Length) | ConvertFrom-Json } catch { $null } } else { $null })
-    [pscustomobject]@{ backend = $Backend; exit = $(if ($timedOut) { $null } else { $p.ExitCode }); timedOut = $timedOut; result = $result; stderr = $err }
+    [pscustomobject]@{ backend = $Backend; exit = $(if ($timedOut) { $null } else { $p.ExitCode }); timedOut = $timedOut; result = $result; stderr = $err
+        kill = $kill; killAttempted = [bool]$kill; terminationConfirmed = $(if ($kill) { [bool]$kill.terminationConfirmed } else { $null }) }
 }
 
 function Get-RowFigures([string]$ReceiptPath, $Leg, [string]$Backend) {
     # The figures exactly as the receipt reports them (null when the receipt does not carry one; never a default). presentedFps / timelineFpsAfterFirstPresent come from
     # the receipt's own hashed run log through Get-DvMatrixRow, which refuses a log that no longer hashes to the receipt.
-    $f = [ordered]@{ receipt = $null; outcome = $null; fps = $null; drops = $null; stall = $null; verification = $null; rejected = $null; noFigure = $null }
+    $f = [ordered]@{ receipt = $null; outcome = $null; fps = $null; drops = $null; stall = $null; verification = $null; rejected = $null; noFigure = $null; identity = $null }
     if (-not $ReceiptPath -or -not (Test-Path -LiteralPath $ReceiptPath -PathType Leaf)) { return $f }
     try { $rc = [IO.File]::ReadAllText($ReceiptPath) | ConvertFrom-Json } catch { return $f }
+    # The receipt must be the one THIS run's leg wrote, not a stale or foreign file the chain's path happens to name: its receiptId is its file name, its legId / venue /
+    # buildManifestSha256 are the planned ones, and it started after this run did (the hub VM stamps it on the same clock). Anything else is `identity`: not validated, no figure.
+    $idProblems = [System.Collections.Generic.List[string]]::new()
+    $rcId = [string](Get-DvProp $rc 'receiptId')
+    if (-not $rcId -or $rcId -cne [IO.Path]::GetFileNameWithoutExtension($ReceiptPath)) { $idProblems.Add("receiptId '$rcId' is not the receipt's file name") }
+    if ([string](Get-DvProp $rc 'legId') -cne $Leg.legId) { $idProblems.Add("legId '$([string](Get-DvProp $rc 'legId'))' is not the planned $($Leg.legId)") }
+    if ([string](Get-DvProp (Get-DvProp $rc 'venue') 'name') -cne $Venue) { $idProblems.Add("venue '$([string](Get-DvProp (Get-DvProp $rc 'venue') 'name'))' is not $Venue") }
+    if (([string](Get-DvProp (Get-DvProp $rc 'subject') 'buildManifestSha256')).ToLowerInvariant() -cne $manifest.ToLowerInvariant()) { $idProblems.Add('buildManifestSha256 is not the staged manifest this run passed to the chain') }
+    # The receipt's own backend must be the one this leg was planned for: the validator checks receipt/backend consistency, not the baseline's plan, so a valid CUDA receipt
+    # would otherwise land its figures in a cpu-labelled row (and the reverse). A receipt that names no backend fails closed.
+    $rcBackend = [string](Get-DvProp (Get-DvProp $rc 'subject') 'backend')
+    if (-not $rcBackend -or $rcBackend -ne $Backend) { $idProblems.Add("backend '$rcBackend' is not the planned $Backend") }
+    $rcStartRaw = Get-DvProp $rc 'startedUtc'
+    $rcStart = [DateTime]::MinValue
+    $rcStartOk = $(if ($rcStartRaw -is [DateTime]) { $rcStart = $rcStartRaw.ToUniversalTime(); $true }
+                   else { [DateTime]::TryParse([string]$rcStartRaw, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]'AdjustToUniversal,AssumeUniversal', [ref]$rcStart) })
+    if (-not $rcStartOk -or $rcStart -lt $startedUtc.AddSeconds(-5) -or $rcStart -gt [DateTime]::UtcNow.AddSeconds(5)) { $idProblems.Add("startedUtc '$rcStartRaw' is not inside this run (began $($startedUtc.ToString('o')))") }
+    if ($idProblems.Count -gt 0) {
+        $f.identity = $idProblems -join '; '
+        $f.verification = [ordered]@{ status = 'NOT_VALIDATED'; valid = $false; reasons = @('RECEIPT_IDENTITY_MISMATCH') }
+        return $f
+    }
     # The evidence-bearing validator (-RepoRoot re-derives the admission from the committed blobs and the run from the hashed evidence). Its verdict is recorded in the row AND gates
-    # the figures: a production receipt is ADVISORY at best (valid=false by design, so `valid` is not the gate), and only ADVISORY / NO_SIGNAL / VERIFIED / VERIFIED_OFFLINE_TEST
-    # receipts have their figures copied. INVALID, INCOMPLETE, a validator error or any status not named here is `rejected`: no figure, the caller types the row. A figure needs
-    # MORE than that: the receipt's own outcome must be PASS or FAIL (a measurement) AND the status ADVISORY / VERIFIED*. NO_SIGNAL is the validator's answer for every other
-    # outcome, including the INVALID the tracked writer rewrites a refused PASS/FAIL to while keeping its metrics, so it carries no figure: `noFigure` names the typed reason.
+    # the figures: a production receipt is ADVISORY at best (valid=false by design, so `valid` is not the gate). Only ADVISORY / VERIFIED / VERIFIED_OFFLINE_TEST receipts can have
+    # their figures copied; NO_SIGNAL is readable (not rejected) but carries no figure. INVALID, INCOMPLETE, a validator error or any status not named here is `rejected`: no figure,
+    # the caller types the row. A figure needs MORE than that: the receipt's own outcome must be PASS or FAIL (a measurement) AND the status ADVISORY / VERIFIED*. NO_SIGNAL is
+    # the validator's answer for every other outcome, including the INVALID the tracked writer rewrites a refused PASS/FAIL to while keeping its metrics, so it has no figure: `noFigure`
+    # names the typed reason.
     $v = try {
-        if ($ValidatorScript) { $o = (& $pwshExe -NoProfile -NonInteractive -File $ValidatorScript -ReceiptPath $ReceiptPath) -join "`n"; if ($LASTEXITCODE -ne 0) { throw "validator exit $LASTEXITCODE" }; $o | ConvertFrom-Json }
+        if ($ValidatorScript) {
+            $vr = Invoke-BoundedChild @('-NoProfile', '-NonInteractive', '-File', $ValidatorScript, '-ReceiptPath', $ReceiptPath) $ProbeTimeoutSec
+            if (-not $vr.ok) { throw "validator exit $($vr.exit) timedOut=$($vr.timedOut)" }
+            $vr.stdout | ConvertFrom-Json
+        }
         else { Test-DvReceiptValid -Receipt $rc -RepoRoot $repo }
     } catch { $null }
     $f.verification = $(if ($v -and [string]$v.status) { [ordered]@{ status = [string]$v.status; valid = [bool]$v.valid; reasons = @($v.reasons | Select-Object -First 3) } } else { [ordered]@{ status = 'VALIDATOR_ERROR'; valid = $false; reasons = @() } })
@@ -297,6 +392,7 @@ foreach ($b in $StandardBackends) {
     Out-Line "BASELINE_CHAIN backend=$b start"
     $c = Invoke-BoundedChain $b
     $chains.Add($c)
+    if ($c.killAttempted) { Out-Line "BASELINE_KILL backend=$b pid=$($c.kill.processId) $(Format-Termination $c.kill)" }
     # The chain's exit code is read BEFORE any row is built. A leg is recorded RAN only when the chain ended on its own with a documented exit that agrees with the
     # exit its CHAIN_RESULT reports (the guard in test_playback_evidence_completeness.py pins this statement). Anything else is a typed EVIDENCE_INCOMPLETE row.
     $resultExit = $(if ($c.result -and $c.result.PSObject.Properties['exitCode']) { [int]$c.result.exitCode } else { $null })
@@ -319,6 +415,10 @@ foreach ($b in $StandardBackends) {
             $failure = $null
             if (-not $chainComplete) { $failure = "the $b chain did not end on its own with a documented exit that agrees with its CHAIN_RESULT (exit=$($c.exit) timedOut=$($c.timedOut) resultExit=$resultExit)" }
             elseif (-not $chainClean) { $failure = "the $b chain ended on its own with a documented non-zero exit ($($c.exit), stopReason=$($c.result.stopReason)), so none of its legs is a clean measurement and no figure is recorded" }
+            elseif ($fig.identity) {
+                $failure = "EVIDENCE_INCOMPLETE: receipt identity is not this run's ($($fig.identity)), so the receipt is not validated and no figure is recorded"
+                if ($null -eq $typed) { $typed = @{ reason = 'LEG_FAILED'; detail = "a $b leg ($($planLeg.legId)) names a receipt that is not this run's ($($fig.identity)); no figure was recorded" } }
+            }
             elseif ($fig.rejected) {
                 $failure = "$(if ($fig.rejected -ceq 'INVALID') { 'EVIDENCE_INVALID' } else { 'EVIDENCE_INCOMPLETE' }): the leg's receipt validated $($fig.rejected), so no figure is recorded"
                 if ($null -eq $typed) { $typed = @{ reason = 'LEG_FAILED'; detail = "a $b leg ($($planLeg.legId)) has a receipt the validator refused ($($fig.rejected)); no figure was recorded" } }
@@ -341,7 +441,7 @@ foreach ($b in $StandardBackends) {
         }
     }
     $stop = $c.result.stopReason
-    if ($c.timedOut) { if ($null -eq $typed) { $typed = @{ reason = 'BASELINE_CAP_EXCEEDED'; detail = "the $b chain was still running at the $MaxTotalSec s cap + $KillGraceSec s grace and was killed" } }; break }
+    if ($c.timedOut) { if ($null -eq $typed) { $typed = @{ reason = 'BASELINE_CAP_EXCEEDED'; detail = "the $b chain was still running at the $MaxTotalSec s cap + $KillGraceSec s grace; $(Format-Termination $c.kill)" } }; break }
     if (-not $chainComplete) { if ($null -eq $typed) { $typed = @{ reason = 'CHAIN_FAILED'; detail = "the $b chain exit ($($c.exit)) and its CHAIN_RESULT (exitCode $resultExit) are not a documented, agreeing pair; its legs are recorded as EVIDENCE_INCOMPLETE" } }; break }
     switch ($c.exit) {
         0 { }
@@ -367,18 +467,35 @@ $load = [ordered]@{ host = $hubStart.host; start = [ordered]@{ utc = $hubStart.u
 if ($rows.Count -gt 0) {
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $TrendFile) | Out-Null
     $text = ($rows | ForEach-Object { $_['hubLoad'] = $load; ($_ | ConvertTo-Json -Compress -Depth 8) }) -join "`n"
-    $fs = [IO.File]::Open($TrendFile, [IO.FileMode]::Append, [IO.FileAccess]::Write, [IO.FileShare]::Read)
-    try { $bytes = [Text.UTF8Encoding]::new($false).GetBytes($text + "`n"); $fs.Write($bytes, 0, $bytes.Length) } finally { $fs.Dispose() }
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes($text + "`n")
+    # F: ONE write under a machine-wide named mutex, the file opened shared for read AND write: a second run appending to the same trend file waits its turn (no sharing violation,
+    # no row lost, no line interleaved). The rows are first written to the run dir, so a lost mutex or a failed write still leaves them on disk.
+    [IO.File]::WriteAllBytes((Join-Path $RunDir 'baseline-rows.jsonl'), $bytes)
+    $mutexName = 'Global\MLV-VenueBaselineTrend-' + [BitConverter]::ToString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes([IO.Path]::GetFullPath($TrendFile).ToLowerInvariant()))).Replace('-', '').Substring(0, 24)
+    $trendMutex = [Threading.Mutex]::new($false, $mutexName)
+    $held = $false
+    try {
+        try { $held = $trendMutex.WaitOne([TimeSpan]::FromSeconds(60)) } catch [Threading.AbandonedMutexException] { $held = $true }      # an abandoned mutex is ours; a whole-line append by a dead run left no torn line
+        if (-not $held) { throw 'the trend-file mutex was not won in 60 s' }
+        $fs = [IO.File]::Open($TrendFile, [IO.FileMode]::Append, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite)
+        try { $fs.Write($bytes, 0, $bytes.Length) } finally { $fs.Dispose() }
+    } catch { if ($null -eq $typed) { $typed = @{ reason = 'TREND_APPEND_FAILED'; detail = "the trend file '$TrendFile' was not appended ($($_.Exception.Message)); the rows are in $RunDir\baseline-rows.jsonl" } } }
+    finally { if ($held) { try { $trendMutex.ReleaseMutex() } catch { } }; $trendMutex.Dispose() }
 }
-$reason = $(if ($typed) { $typed.reason } else { 'OK' })
+# I3: a run in which no row carries a figure is never OK. It keeps exit 0 (the BASELINE-EXIT-NO-MEASUREMENT-1 behaviour) under its own token.
+$measuredRows = @($rows | Where-Object { $_.status -ceq 'RAN' -and $null -ne $_.fps }).Count
+$reason = $(if ($typed) { $typed.reason } elseif ($measuredRows -eq 0) { 'NO_MEASUREMENT' } else { 'OK' })
 $code = [int]$ExitCodes[$reason]
+$noMeasurementDetail = "no row carries a figure ($($rows.Count) row(s) appended, 0 measured); this is NOT an OK run"
 $summary = [ordered]@{
     schema = 'mlv-app/venue-baseline-result/v1'; venue = $Venue; sourceCommit = $commit; buildManifestSha256 = $manifest; runDir = $RunDir; trendFile = $TrendFile
     startedUtc = $startedUtc.ToString('o'); finishedUtc = [DateTime]::UtcNow.ToString('o'); maxTotalSec = $MaxTotalSec; exitCode = $code; reason = $reason
-    detail = $(if ($typed) { $typed.detail } else { $null }); rowsAppended = $rows.Count; hubLoad = $load
-    chains = @($chains | ForEach-Object { [ordered]@{ backend = $_.backend; exit = $_.exit; timedOut = $_.timedOut; stopReason = $_.result.stopReason; ran = $_.result.ran; failed = $_.result.failed; notRun = $_.result.notRun } })
+    detail = $(if ($typed) { $typed.detail } elseif ($reason -ceq 'NO_MEASUREMENT') { $noMeasurementDetail } else { $null }); rowsAppended = $rows.Count; measuredRows = $measuredRows
+    wallClockBound = $wallClockBound; hubLoad = $load
+    chains = @($chains | ForEach-Object { [ordered]@{ backend = $_.backend; exit = $_.exit; timedOut = $_.timedOut; killAttempted = $_.killAttempted; terminationConfirmed = $_.terminationConfirmed
+        stopReason = $_.result.stopReason; ran = $_.result.ran; failed = $_.result.failed; notRun = $_.result.notRun } })
 }
 [IO.File]::WriteAllText((Join-Path $RunDir 'baseline-result.json'), ($summary | ConvertTo-Json -Compress -Depth 8))
-Out-Line "BASELINE_EXIT code=$code reason=$reason rows=$($rows.Count)$(if ($typed) { " detail=$($typed.detail)" })"
+Out-Line "BASELINE_EXIT code=$code reason=$reason rows=$($rows.Count)$(if ($typed) { " detail=$($typed.detail)" } elseif ($reason -ceq 'NO_MEASUREMENT') { " detail=$noMeasurementDetail" })"
 Out-Line ('BASELINE_RESULT=' + ($summary | ConvertTo-Json -Compress -Depth 8))
 exit $code

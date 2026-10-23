@@ -266,13 +266,14 @@ def _run_fake_shard(
     fail: bool = False,
     environ: dict | None = None,
     fixtures: dict[str, dict[str, float]] | None = None,
+    run_kwargs: dict | None = None,
 ) -> tuple[int, str]:
     clock = FakeClock()
     tests = [_fake_case(clock, name, seconds, fail=fail, **(fixtures or {}).get(name, {})) for name, seconds in cases]
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
         code = shard.run_shard(
-            tests, profile, 2, 8, clock=clock, environ=environ or {}, stream=io.StringIO()
+            tests, profile, 2, 8, clock=clock, environ=environ or {}, stream=io.StringIO(), **(run_kwargs or {})
         )
     return code, out.getvalue()
 
@@ -528,6 +529,110 @@ class BudgetWarningDuringRunTests(unittest.TestCase):
         self.assertNotIn("key_previous.Quick", annotation[0])
         self.assertIn("  47.0s key_next.SetupHeavy", lines)
         self.assertIn("  1.0s key_previous.Quick", lines)
+
+
+class JobStartOriginTests(unittest.TestCase):
+    """CI-SHARD-BUDGET-WARN-JOB-ELAPSED-1: the budget clock can start at the runner's job start.
+
+    ``main()`` starts after checkout, pip and --verify-partition, so a shard with 2 minutes of
+    setup used to warn at 82 % of its cap instead of 75 %. ``CI_SHARD_JOB_START_EPOCH`` (exported
+    by the workflow's first step) moves the origin to the job start; ``main()`` stays the fallback.
+    """
+
+    def _warning_lines(self, out: str) -> tuple[list[str], list[str]]:
+        lines = out.splitlines()
+        return (
+            [line for line in lines if line.startswith("::warning")],
+            [line for line in lines if line.startswith("SHARD_BUDGET_WARN")],
+        )
+
+    def test_setup_time_before_main_counts_toward_the_warning(self) -> None:
+        # 1 min cap: the tests use 20 s (33 %), the job started 30 s before run_shard (real clock).
+        env = {shard.CAP_ENV: "1", shard.JOB_START_ENV: str(time.time() - 30.0)}
+        code, out = _run_fake_shard([("Slow", 20.0)], environ=env)
+        annotation, record = self._warning_lines(out)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(annotation), 1, out)
+        self.assertEqual(len(record), 1, out)
+        self.assertRegex(annotation[0], r"used (8\d)% of the 1 min job cap")
+        self.assertIn("origin=job_start", record[0])
+        self.assertIn("clock origin job_start", annotation[0])
+
+    def test_the_same_run_without_the_epoch_does_not_warn(self) -> None:
+        _, out = _run_fake_shard([("Slow", 20.0)], environ={shard.CAP_ENV: "1"})
+        self.assertNotIn("SHARD_BUDGET_WARN", out)
+
+    def test_two_minutes_of_ubuntu_setup_warns_at_75_percent_of_the_job_not_82(self) -> None:
+        # The card's example: 30 min cap, 2 min of setup. 21 min of tests is 70 % of the cap, 76.7 % of the job.
+        env = {shard.JOB_START_ENV: "1000"}
+        code, out = _run_fake_shard([("Slow", 21 * 60.0)], environ=env, run_kwargs={"wall_clock": lambda: 1120.0})
+        annotation, record = self._warning_lines(out)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(annotation), 1, out)
+        self.assertIn("used 77% of the 30 min job cap", annotation[0])
+        self.assertIn("origin=job_start", record[0])
+        # The class table and its total stay what the tests themselves took.
+        self.assertIn("SHARD_SLOWEST profile=ubuntu shard=2/8 total=1260.0s", out.splitlines())
+
+    def test_without_the_epoch_main_is_the_origin_and_says_so(self) -> None:
+        _, out = _run_fake_shard([("Slow", 46.0)], environ={shard.CAP_ENV: "1"})
+        annotation, record = self._warning_lines(out)
+        self.assertIn("used 77% of the 1 min job cap", annotation[0])
+        self.assertIn("origin=main", record[0])
+        self.assertNotIn("origin=main_invalid_job_start", record[0])
+        self.assertIn("clock origin main", annotation[0])
+
+    def test_an_unbelievable_epoch_falls_back_to_main_and_still_warns(self) -> None:
+        now = time.time()
+        bad = ["nan", "inf", "-inf", "1e1000", "abc", "", "0", "-5", str(now + 3600), str(now - 3600), str(now * 1000)]
+        for raw in bad:
+            with self.subTest(raw=raw):
+                code, out = _run_fake_shard([("Slow", 46.0)], environ={shard.CAP_ENV: "1", shard.JOB_START_ENV: raw})
+                annotation, record = self._warning_lines(out)
+                self.assertEqual(code, 0)
+                self.assertEqual(len(annotation), 1, out)
+                self.assertIn("used 77% of the 1 min job cap", annotation[0])
+                self.assertIn("origin=main_invalid_job_start", record[0])
+
+    def test_an_epoch_after_main_started_is_not_believed(self) -> None:
+        # main began 100 s ago on the monotonic clock; a job start only 10 s ago cannot be right.
+        clock = FakeClock()
+        clock.advance(100.0)
+        tests = [_fake_case(clock, "Slow", 46.0)]
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            shard.run_shard(
+                tests,
+                "ubuntu",
+                2,
+                8,
+                clock=clock,
+                environ={shard.CAP_ENV: "1", shard.JOB_START_ENV: "990"},
+                stream=io.StringIO(),
+                started=0.0,
+                wall_clock=lambda: 1000.0,
+            )
+        annotation, record = self._warning_lines(out.getvalue())
+        self.assertEqual(len(annotation), 1, out.getvalue())
+        self.assertIn("origin=main_invalid_job_start", record[0])
+
+    def test_job_elapsed_seconds_accepts_a_sane_epoch_only(self) -> None:
+        self.assertEqual(shard.job_elapsed_seconds({shard.JOB_START_ENV: "1000"}, 1120.0, 30.0), 120.0)
+        self.assertEqual(shard.job_elapsed_seconds({shard.JOB_START_ENV: "1000.5"}, 1120.5, 30.0), 120.0)
+        self.assertIsNone(shard.job_elapsed_seconds({}, 1120.0, 30.0))
+        self.assertIsNone(shard.job_elapsed_seconds({shard.JOB_START_ENV: "1121"}, 1120.0, 30.0), "future")
+        limit = (30.0 + shard.JOB_START_MARGIN_MINUTES) * 60
+        self.assertEqual(shard.job_elapsed_seconds({shard.JOB_START_ENV: "0"}, limit, 30.0), limit)
+        self.assertIsNone(shard.job_elapsed_seconds({shard.JOB_START_ENV: "0"}, limit + 1, 30.0), "older than cap + margin")
+        for raw in ("nan", "inf", "-inf", "1e1000", "abc", ""):
+            with self.subTest(raw=raw):
+                self.assertIsNone(shard.job_elapsed_seconds({shard.JOB_START_ENV: raw}, 1120.0, 30.0))
+
+    def test_the_budget_warning_line_carries_its_origin(self) -> None:
+        lines = shard.budget_warning("ubuntu", 1, 3, 100.0, {"a.A": 1.0}, 1.0, origin="job_start")
+        self.assertTrue(lines[0].endswith("clock origin job_start"), lines[0])
+        self.assertTrue(lines[1].endswith("origin=job_start"), lines[1])
+        self.assertEqual(shard.budget_warning("ubuntu", 1, 3, 100.0, {"a.A": 1.0}, 1.0)[1].split()[-1], "origin=main")
 
 
 class ShardExitCodeTests(unittest.TestCase):

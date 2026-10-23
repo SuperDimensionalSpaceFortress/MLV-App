@@ -466,6 +466,13 @@ finally {
 }
 $results.unit = $unit
 
+# BACHELOR-AGENT-QUIET-LEASE-1: the quiet-lease cases (lease mode, the default) run in their own process against a fake
+# heavy-slot.py, so this script's status-mode mocks never meet them. A failure there fails this run.
+$leaseTest = Join-Path $PSScriptRoot 'test-ultra-magnus-agent-quiet-lease.ps1'
+$leaseOut = & (Get-Process -Id $PID).Path -NoLogo -NoProfile -NonInteractive -File $leaseTest -RepoRoot $RepoRoot -AgentScript $agentScript 2>&1
+Assert-True ($LASTEXITCODE -eq 0) "quiet-lease cases ($leaseTest) pass: $($leaseOut -join ' | ')"
+$results.quietLease = ($leaseOut -join "`n") | ConvertFrom-Json
+
 if ($UnitOnly) {
     [pscustomobject]@{ status = 'PASS'; mode = 'unit-only'; results = $results } | ConvertTo-Json -Depth 8
     return
@@ -510,7 +517,9 @@ function Start-Agent($c) {
             '-HeavySlotDir', $c.slots, '-HeavySlotFeed', $c.feed, '-GateProbeSec', '2', '-GateIdleSampleSec', '0',
             # AGENT-HEAVY-SLOT-2.3-ADAPT-1: an unset timeout is the 1800 s default, which labels a job "mlv-long <id>".
             # These test jobs are short, so they keep the "mlv <id>" label the cases below match on.
-            '-JobTimeoutSec', '600')) { [void]$si.ArgumentList.Add($a) }
+            '-JobTimeoutSec', '600',
+            # BACHELOR-AGENT-QUIET-LEASE-1: these cases prove the r1c holder path, which is now the -HeavySlotMode status rollback.
+            '-HeavySlotMode', 'status')) { [void]$si.ArgumentList.Add($a) }
     $si.UseShellExecute = $false; $si.CreateNoWindow = $true
     $si.RedirectStandardOutput = $true; $si.RedirectStandardError = $true
     $p = [Diagnostics.Process]::Start($si)

@@ -45,6 +45,15 @@ JOB_CAP_MINUTES = {"ubuntu": 30, "windows": 50}
 BUDGET_WARN_SHARE = 0.75
 TOP_CLASSES = 10
 CAP_ENV = "CI_SHARD_JOB_CAP_MINUTES"
+# Unix epoch seconds the workflow's first step exports, so checkout, pip and --verify-partition
+# count toward the budget. Optional: without it (or with a value that cannot be right) the clock
+# starts at main(), as it always did. A runner that has been up longer than the job cap plus this
+# margin cannot be the same job.
+JOB_START_ENV = "CI_SHARD_JOB_START_EPOCH"
+JOB_START_MARGIN_MINUTES = 10
+ORIGIN_JOB_START = "job_start"
+ORIGIN_MAIN = "main"
+ORIGIN_MAIN_INVALID = "main_invalid_job_start"
 WEIGHTS_PATH = Path(__file__).with_name("ci_unittest_shard_weights.json")
 
 
@@ -269,6 +278,47 @@ def job_cap_minutes(profile: str, environ: Mapping[str, str]) -> float:
     return override if math.isfinite(override) and override > 0 else float(JOB_CAP_MINUTES[profile])
 
 
+def job_elapsed_seconds(environ: Mapping[str, str], wall_now: float, cap_minutes: float) -> float | None:
+    """Seconds since the job start named by ``JOB_START_ENV``, or None when absent or not believable.
+
+    Not believable: not a finite number, in the future, or older than the cap plus
+    ``JOB_START_MARGIN_MINUTES`` (a millisecond epoch lands in the future; zero lands far in the past).
+    """
+    try:
+        epoch = float(environ[JOB_START_ENV])
+    except (KeyError, ValueError):
+        return None
+    if not math.isfinite(epoch):
+        return None
+    elapsed = wall_now - epoch
+    if elapsed < 0 or elapsed > (cap_minutes + JOB_START_MARGIN_MINUTES) * 60:
+        return None
+    return elapsed
+
+
+def budget_origin(
+    environ: Mapping[str, str],
+    clock: Callable[[], float],
+    main_begin: float,
+    wall_clock: Callable[[], float],
+    cap_minutes: float,
+) -> tuple[float, str]:
+    """The budget clock's start on ``clock`` and which origin supplied it.
+
+    The job start when ``JOB_START_ENV`` is believable and not later than ``main_begin`` (a job
+    cannot start after the process that runs in it); otherwise ``main_begin``, labelled
+    ``ORIGIN_MAIN_INVALID`` if a value was given. Never raises.
+    """
+    if JOB_START_ENV not in environ:
+        return main_begin, ORIGIN_MAIN
+    elapsed = job_elapsed_seconds(environ, wall_clock(), cap_minutes)
+    if elapsed is not None:
+        job_begin = clock() - elapsed
+        if job_begin <= main_begin:
+            return job_begin, ORIGIN_JOB_START
+    return main_begin, ORIGIN_MAIN_INVALID
+
+
 def slowest_block(
     profile: str, index: int, of: int, total: float, class_seconds: Mapping[str, float], limit: int = TOP_CLASSES
 ) -> list[str]:
@@ -280,9 +330,18 @@ def slowest_block(
 
 
 def budget_warning(
-    profile: str, index: int, of: int, total: float, class_seconds: Mapping[str, float], cap_minutes: float
+    profile: str,
+    index: int,
+    of: int,
+    total: float,
+    class_seconds: Mapping[str, float],
+    cap_minutes: float,
+    origin: str = ORIGIN_MAIN,
 ) -> list[str]:
-    """Empty unless the shard used more than ``BUDGET_WARN_SHARE`` of the job cap."""
+    """Empty unless the shard used more than ``BUDGET_WARN_SHARE`` of the job cap.
+
+    ``origin`` names where ``total`` was measured from (``budget_origin``).
+    """
     if not class_seconds or total <= cap_minutes * 60 * BUDGET_WARN_SHARE:
         return []
     used = total / (cap_minutes * 60) * 100
@@ -290,9 +349,9 @@ def budget_warning(
     cap = f"{cap_minutes:g}"
     return [
         f"::warning title=Shard budget::shard {index}/{of} used {used:.0f}% of the {cap} min job cap; "
-        f"slowest class {slowest} {slowest_seconds:.1f}s",
+        f"slowest class {slowest} {slowest_seconds:.1f}s; clock origin {origin}",
         f"SHARD_BUDGET_WARN profile={profile} shard={index}/{of} used={used:.0f}% cap_minutes={cap} "
-        f"slowest={slowest} slowest_seconds={slowest_seconds:.1f}",
+        f"slowest={slowest} slowest_seconds={slowest_seconds:.1f} origin={origin}",
     ]
 
 
@@ -315,7 +374,9 @@ class BudgetWatch:
         *,
         poll_seconds: float = 5.0,
         out: TextIO | None = None,
+        origin: str = ORIGIN_MAIN,
     ) -> None:
+        self._origin = origin
         self._profile = profile
         self._index = index
         self._of = of
@@ -337,7 +398,9 @@ class BudgetWatch:
         with self._lock:
             if self.warned:
                 return
-            lines = budget_warning(self._profile, self._index, self._of, elapsed, self._snapshot(), self._cap_minutes)
+            lines = budget_warning(
+                self._profile, self._index, self._of, elapsed, self._snapshot(), self._cap_minutes, self._origin
+            )
             if lines:
                 self.warned = True
                 print("\n".join(lines), file=self._out if self._out is not None else sys.stdout, flush=True)
@@ -366,8 +429,13 @@ def run_shard(
     stream: TextIO | None = None,
     started: float | None = None,
     poll_seconds: float = 5.0,
+    wall_clock: Callable[[], float] = time.time,
 ) -> int:
     """Run the shard's tests, warning when it passes the budget share and reporting its slowest classes.
+
+    The budget clock starts at the job start when the workflow exported ``JOB_START_ENV`` (read
+    through ``wall_clock``) and the value is believable, else at ``started`` (``main()``); the
+    warning names which. ``SHARD_SLOWEST`` totals stay measured from ``started``.
 
     The warning is printed during the run (``BudgetWatch``) and the report from a ``finally``,
     so a cancellation (``KeyboardInterrupt``) gets both before it propagates. Both are
@@ -379,17 +447,21 @@ def run_shard(
     """
     out = sys.stdout
     begin = clock() if started is None else started
+    env = os.environ if environ is None else environ
+    cap_minutes = job_cap_minutes(profile, env)
+    budget_begin, origin = budget_origin(env, clock, begin, wall_clock, cap_minutes)
     made: list[ClassTimingResult] = []
     watch = BudgetWatch(
         profile,
         index,
         of,
-        job_cap_minutes(profile, os.environ if environ is None else environ),
-        begin,
+        cap_minutes,
+        budget_begin,
         clock,
         lambda: made[0].snapshot() if made else {},
         poll_seconds=poll_seconds,
         out=out,
+        origin=origin,
     )
 
     def make_result(*args: object, **kwargs: object) -> ClassTimingResult:
