@@ -68,7 +68,7 @@ EXACT_HOOK_DEFEATER_FAMILY_ROWS = {
 # derived playback rows had no pin at all). The derived rows are the whole of the head's own deny suites, so any change in their
 # number is a corpus change that a reviewer should see: adding a deny row to either suite means raising the matching number here in
 # the same commit; DELETING one fails this test. The floors above stay as the coarse lower bound.
-EXACT_DERIVED_HOOK_ROWS = 203      # DENY rows of test_mlv_never_authorized.CASES
+EXACT_DERIVED_HOOK_ROWS = 204      # DENY rows of test_mlv_never_authorized.CASES
 EXACT_DERIVED_PLAYBACK_ROWS = 6776  # must-refuse sentences of test_hub_vm_no_local_playback.py, deduplicated by (name, text): 211 + 5,807 non-fuzz RULE4_* rows
 # + 758 of NA2-RULE4-SENTENCE-SPLIT-AND-CODESPAN-APP-1 (RULE4_SPLIT_REFUSE 700, RULE4_SPLIT_SLASH_GUARDS 16, RULE4_SPLIT_SPAN_GUARDS 42)
 # r18 (hub ruling #3, amends #2): rows of #465's two seeded FUZZ tuples, left out of the derived corpus above, head AND baseline, by the
@@ -637,7 +637,7 @@ class BaselineDerivedRowsTests(ParityRunnerCase):
         _, tests = self.scratch_head()
         with self.redirect_head_hook_tests(tests):
             swapped = slp.derived_hook_cases(REPO_ROOT, "HEAD")
-        self.assertEqual(len(swapped), EXACT_DERIVED_HOOK_ROWS + 1, "the swapped-out row comes back from the baseline: head's 203 + 1 base-only")
+        self.assertEqual(len(swapped), EXACT_DERIVED_HOOK_ROWS + 1, "the swapped-out row comes back from the baseline: head's 204 + 1 base-only")
         self.assertEqual([c.source for c in swapped if c.id == LOOSENED_ROW_ID], ["derived-base"])
 
     def test_B1_a_baseline_test_module_that_cannot_be_loaded_is_exit_2_never_a_skip(self):
