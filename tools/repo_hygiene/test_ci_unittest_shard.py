@@ -708,6 +708,48 @@ class TimingsTests(unittest.TestCase):
             {"tools.repo_hygiene.test_x.AlphaTests": 5.0, "tools.repo_hygiene.test_x.GammaTests": 1.5},
         )
 
+    def test_an_unexpected_success_docstring_test_clears_pending(self) -> None:
+        # fable r1-p1 on #629: "unexpected success" is a result line too. Left unmatched it
+        # never cleared the pending test, so test_a went uncounted.
+        log = (
+            "2026-10-04T00:00:00.0000000Z started\n"
+            "2026-10-04T00:00:01.0000000Z test_a (tools.repo_hygiene.test_x.A.test_a)\n"
+            "2026-10-04T00:00:03.0000000Z x ... unexpected success\n"
+            "2026-10-04T00:00:04.0000000Z test_b (tools.repo_hygiene.test_x.B.test_b)\n"
+            "2026-10-04T00:00:05.0000000Z y ... ok\n"
+        )
+        self.assertEqual(
+            timings.class_seconds(log),
+            {"tools.repo_hygiene.test_x.A": 2.0, "tools.repo_hygiene.test_x.B": 1.0},
+        )
+
+    def test_a_one_line_unexpected_success_is_counted_to_its_class(self) -> None:
+        log = (
+            "2026-10-04T00:00:00.0000000Z started\n"
+            "2026-10-04T00:00:03.0000000Z test_a (tools.repo_hygiene.test_x.A.test_a) ... unexpected success\n"
+            "2026-10-04T00:00:04.0000000Z test_b (tools.repo_hygiene.test_x.B.test_b) ... ok\n"
+        )
+        self.assertEqual(
+            timings.class_seconds(log),
+            {"tools.repo_hygiene.test_x.A": 3.0, "tools.repo_hygiene.test_x.B": 1.0},
+        )
+
+    def test_a_pending_test_that_never_printed_a_result_keeps_its_interval(self) -> None:
+        # Dot R18 on #629: a docstring id line, then a plain "... ok" line with no result line
+        # for the first test (crash, interleaved output). The plain line closes the pending
+        # test: head -> plain line is charged to the PENDING class, as for a result line, and
+        # the plain test is not charged (its own time is not separable from the pending one's).
+        log = (
+            "2026-10-04T00:00:00.0000000Z started\n"
+            "2026-10-04T00:00:01.0000000Z test_a (tools.repo_hygiene.test_x.A.test_a)\n"
+            "2026-10-04T00:00:05.0000000Z test_b (tools.repo_hygiene.test_x.B.test_b) ... ok\n"
+            "2026-10-04T00:00:06.0000000Z test_c (tools.repo_hygiene.test_x.C.test_c) ... ok\n"
+        )
+        self.assertEqual(
+            timings.class_seconds(log),
+            {"tools.repo_hygiene.test_x.A": 4.0, "tools.repo_hygiene.test_x.C": 1.0},
+        )
+
     def test_average_is_over_the_jobs_that_ran_the_class(self) -> None:
         self.assertEqual(
             timings.average([{"a.A": 10.0, "b.B": 4.0}, {"a.A": 20.0}]), {"a.A": 15.0, "b.B": 4.0}

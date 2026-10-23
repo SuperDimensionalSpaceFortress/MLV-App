@@ -28,12 +28,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 STAMP = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)\.(\d+)Z (.*)$")
-TEST_LINE = re.compile(r"^\S+ \(([A-Za-z0-9_.]+)\) \.\.\. (?:ok|FAIL|ERROR|skipped.*|expected failure)$")
+RESULT = r"(?:ok|FAIL|ERROR|skipped.*|expected failure|unexpected success)"
+TEST_LINE = re.compile(rf"^\S+ \(([A-Za-z0-9_.]+)\) \.\.\. {RESULT}$")
 KEY_PREFIX = "tools.repo_hygiene.test_"
 # A test with a docstring prints ``name (module.Class.name)`` on its own line and
 # ``<first docstring line> ... ok`` on the next, so TEST_LINE alone never sees it.
 DOC_HEAD = re.compile(r"^\S+ \(([A-Za-z0-9_.]+)\)$")
-DOC_RESULT = re.compile(r"^.* \.\.\. (?:ok|FAIL|ERROR|skipped.*|expected failure)$")
+DOC_RESULT = re.compile(rf"^.* \.\.\. {RESULT}$")
 
 
 def _seconds(stamp: re.Match[str]) -> float:
@@ -55,7 +56,9 @@ def class_seconds(log_text: str) -> dict[str, float]:
         test = TEST_LINE.match(text)
         doc_head = None if test else DOC_HEAD.match(text)
         if test:
-            name, pending = test.group(1), None
+            # A plain result line while a docstring test is pending: that test never printed
+            # its result, so it keeps head -> this line and the plain test is not charged.
+            name, pending = (pending or test.group(1)), None
         elif doc_head:
             name, pending = None, doc_head.group(1)
         elif pending is not None and DOC_RESULT.match(text):
