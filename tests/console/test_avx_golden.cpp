@@ -124,6 +124,8 @@ static const int kBuildProcessTimeoutMs = 30 * 60 * 1000;
 // merge_group runs (2026-10-21..23), so a healthy helper run never comes near this bound. Before
 // this bound, a hung helper held the merge queue for the 30 minute build bound.
 static const int kHelperTimeoutMs = 5 * 60 * 1000;
+static_assert(kHelperTimeoutMs <= 10 * 60 * 1000 && kHelperTimeoutMs < kBuildProcessTimeoutMs,
+              "the helper bound must stay well under the build bound");
 static const int kOutputTailBytes = 4096;
 
 struct ProcessRunResult {
@@ -242,8 +244,9 @@ static QString describe_process_failure(const QString & label,
     return text;
 }
 
-// A single retry, for the timeout shape only. A crash or a non-zero exit is reported as is, and
-// the caller still runs the full hash comparison on the retried output.
+// A helper timeout is a failure. It earns one rerun for diagnostics only: the rerun's outcome is
+// logged, its hash json is removed, and the first, timed-out result is returned, so a hang can
+// never turn into PASS. A crash or a non-zero exit is reported as is, with no rerun.
 static ProcessRunResult run_helper_with_retry(const QString & label,
                                               const QString & program,
                                               const QStringList & arguments,
@@ -257,11 +260,19 @@ static ProcessRunResult run_helper_with_retry(const QString & label,
     if (!first.timed_out) {
         return first;
     }
-    diagnostics << "AVX_PARITY_HELPER_TIMEOUT_RETRY "
+    diagnostics << "AVX_PARITY_HELPER_TIMEOUT_RETRY attempt=1 "
                 << describe_process_failure(label, program, first, output_path).toStdString() << "\n";
     diagnostics.flush();
     QFile::remove(output_path);
-    return run_process_bounded(program, arguments, working_directory, environment, timeout_ms);
+    const ProcessRunResult rerun = run_process_bounded(program, arguments, working_directory, environment, timeout_ms);
+    diagnostics << "AVX_PARITY_HELPER_DIAGNOSTIC_RERUN attempt=2 outcome="
+                << (rerun.ok() ? "ok" : "failed") << " (result discarded; attempt 1 timed out)\n";
+    if (!rerun.ok()) {
+        diagnostics << describe_process_failure(label, program, rerun, output_path).toStdString() << "\n";
+    }
+    diagnostics.flush();
+    QFile::remove(output_path);
+    return first;
 }
 
 static QString find_built_helper(const QString & build_directory)
@@ -544,4 +555,48 @@ TEST(AvxParityRunner, HelperTimeoutRetriesOnceAndReportsTheFirstAttempt)
     ASSERT_TRUE(text.find(marker, first + marker.size()) == std::string::npos);
     ASSERT_TRUE(text.find("helper=avx") != std::string::npos);
     ASSERT_TRUE(text.find("timed_out=yes") != std::string::npos);
+}
+
+// Hangs on the first run; on the second run writes a valid hash json and exits 0.
+static QStringList hang_then_pass_arguments(const QString & first_run_marker, const QString & output_path)
+{
+    return stand_in_arguments(
+        QStringLiteral("if (Test-Path -LiteralPath '%1') { "
+                       "Set-Content -LiteralPath '%2' -Value '{\"build_avx\":false,\"clip\":\"0123abcd\"}'; exit 0 "
+                       "} else { New-Item -ItemType File -Path '%1' | Out-Null; Start-Sleep -Seconds 60 }")
+            .arg(first_run_marker, output_path),
+        QStringLiteral("if [ -e '%1' ]; then printf '{\"build_avx\":false,\"clip\":\"0123abcd\"}' > '%2'; exit 0; "
+                       "else : > '%1'; sleep 60; fi")
+            .arg(first_run_marker, output_path));
+}
+
+TEST(AvxParityRunner, FirstHelperTimeoutFailsEvenWhenTheRetryWouldPass)
+{
+    const QString shell = stand_in_shell();
+    if (shell.isEmpty()) {
+        SKIP_TEST("no shell found to stand in for a hung helper");
+    }
+
+    const QString marker = QDir(QDir::tempPath()).filePath(QStringLiteral("avx_parity_runner_first_run.marker"));
+    QFile::remove(marker);
+    const QString output_path = missing_output_json();
+    std::ostringstream diagnostics;
+    const ProcessRunResult result = run_helper_with_retry(QStringLiteral("default"),
+                                                          shell,
+                                                          hang_then_pass_arguments(marker, output_path),
+                                                          QDir::tempPath(),
+                                                          QProcessEnvironment::systemEnvironment(),
+                                                          8000,
+                                                          output_path,
+                                                          diagnostics);
+    QFile::remove(marker);
+
+    // The first attempt hung, so the run fails however the second attempt ends.
+    ASSERT_TRUE(result.timed_out);
+    ASSERT_FALSE(result.ok());
+    // The second attempt's hashes never reach the parity comparison.
+    ASSERT_FALSE(QFileInfo::exists(output_path));
+    const std::string text = diagnostics.str();
+    ASSERT_TRUE(text.find("AVX_PARITY_HELPER_TIMEOUT_RETRY attempt=1") != std::string::npos);
+    ASSERT_TRUE(text.find("AVX_PARITY_HELPER_DIAGNOSTIC_RERUN attempt=2 outcome=ok") != std::string::npos);
 }
