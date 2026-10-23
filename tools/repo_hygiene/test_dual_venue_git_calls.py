@@ -35,6 +35,7 @@ import time
 import unittest
 import uuid
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 MODULE = ROOT / "tools" / "profiling" / "dual-venue" / "DualVenueRunner.psm1"
@@ -654,7 +655,13 @@ def _sleepers(token: str) -> set[int]:
         return found
     if not Path("/proc").is_dir():
         return _sleeper_pids_from_ps(subprocess.run(["ps", "-axo", "pid=,args="], capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL).stdout, token)
-    for entry in Path("/proc").iterdir():
+    return _sleepers_from_proc(token)
+
+
+def _sleepers_from_proc(token: str, proc_root: Path = Path("/proc")) -> set[int]:
+    """The Linux scan of `_sleepers`, with the /proc root injectable so a fixture tree can stand in for it."""
+    found: set[int] = set()
+    for entry in proc_root.iterdir():
         if not entry.name.isdigit():
             continue
         try:
@@ -663,6 +670,59 @@ def _sleepers(token: str) -> set[int]:
             continue
         if len(argv) >= 2 and os.path.basename(argv[0]) in (b"sleep", b"sleep.exe") and argv[1] == token.encode():
             found.add(int(entry.name))
+    return found
+
+
+def _describe_pid(pid: int, proc_root: Path = Path("/proc")) -> str:
+    """What /proc says about one pid right now: whether it exists, its raw cmdline bytes, and its State and PPid lines. Built only for a failure
+    message; every read is guarded because the pid may vanish between two of them."""
+    base = proc_root / str(pid)
+    if not base.is_dir():
+        return f"pid {pid}: {base} absent"
+    try:
+        cmdline: object = (base / "cmdline").read_bytes()
+    except OSError as exc:
+        cmdline = f"unreadable ({exc!r})"
+    try:
+        status = [line for line in (base / "status").read_text(errors="replace").splitlines() if line.startswith(("State:", "PPid:"))]
+    except OSError as exc:
+        status = [f"status unreadable ({exc!r})"]
+    return f"pid {pid}: cmdline={cmdline!r} status={status}"
+
+
+def _parent_chain(pid: int, proc_root: Path = Path("/proc"), limit: int = 8) -> list[int]:
+    """`pid` then its parents (PPid) up to `limit` hops or pid 1; for a failure message."""
+    chain = [pid]
+    while len(chain) <= limit and chain[-1] > 1:
+        try:
+            line = next(ln for ln in (proc_root / str(chain[-1]) / "status").read_text(errors="replace").splitlines() if ln.startswith("PPid:"))
+            chain.append(int(line.split()[1]))
+        except (OSError, StopIteration, ValueError, IndexError):
+            break
+    return chain
+
+
+def _sleeper_diagnostic(token: str, proc: subprocess.Popen, found: set[int], proc_root: Path = Path("/proc")) -> str:
+    """The failure message's evidence (called only on a mismatch, so the passing path is unchanged): what discovery returned for `token`, and
+    for the test's own child and every pid discovery did return, what /proc held at that moment."""
+    lines = [f"token={token} found={sorted(found)} own.pid={proc.pid} own.poll()={proc.poll()!r}"]
+    if not proc_root.is_dir():
+        return lines[0] + f" ({proc_root} is not a directory on this platform; no per-pid detail)"
+    for pid in sorted({proc.pid, *found}):
+        lines.append(f"  {_describe_pid(pid, proc_root)} parents={_parent_chain(pid, proc_root)}")
+    return "\n".join(lines)
+
+
+def _wait_for_sleeper(token: str, proc: subprocess.Popen, timeout: float = 5.0, interval: float = 0.02) -> set[int]:
+    """Scan for `sleep <token>`, and while the test's own child `proc` is alive but not yet named, scan again until it is or `timeout` passes.
+    Popen returns once exec has begun, not once the new image's argv is published (Linux sets mm->arg_end late in the ELF load, so /proc/<pid>/
+    cmdline reads empty in between). This waits for a pid the test just started; it never widens what discovery may name, and the caller still
+    asserts the exact set, so an extra pid or a child that never shows up still fails."""
+    found = _sleepers(token)
+    deadline = time.monotonic() + timeout
+    while proc.pid not in found and proc.poll() is None and time.monotonic() < deadline:
+        time.sleep(interval)
+        found = _sleepers(token)
     return found
 
 
@@ -685,6 +745,13 @@ class SleeperDiscoveryTests(unittest.TestCase):
         self.assertEqual(_sleeper_pids_from_ps(listing), {101})
         self.assertEqual(_sleeper_pids_from_ps(listing, "61"), {102})
 
+    def _assert_discovers_only(self, token: str, proc: subprocess.Popen, message: str) -> None:
+        """Wait (bounded) for `proc` to be discoverable, then require discovery to name exactly it. A mismatch carries what /proc held."""
+        found = _wait_for_sleeper(token, proc)
+        if found != {proc.pid}:
+            message = f"{message}\n{_sleeper_diagnostic(token, proc, found)}"
+        self.assertEqual(found, {proc.pid}, message)
+
     @unittest.skipIf(shutil.which("sleep") is None, "needs a sleep binary on PATH")
     def test_two_overlapping_sleeper_tests_each_count_and_terminate_only_their_own_child(self) -> None:
         # r2 (sol BLOCKER on #504): one process, no second pytest. Three same-duration sleepers are alive at once: this test's own, a plain
@@ -698,13 +765,84 @@ class SleeperDiscoveryTests(unittest.TestCase):
         for proc in (own, other_test, other_lane):
             self.addCleanup(proc.wait)
             self.addCleanup(proc.kill)
-        self.assertEqual(_sleepers(own_token), {own.pid}, "discovery must name this test's child only")
-        self.assertEqual(_sleepers(other_token), {other_test.pid})
+        self._assert_discovers_only(own_token, own, "discovery must name this test's child only")
+        self._assert_discovers_only(other_token, other_test, "discovery must name the other test's child only")
         _kill_sleepers(own_token)
         own.wait(timeout=15)
         self.assertIsNone(other_test.poll(), "the cleanup of one test killed another overlapping test's sleeper")
         self.assertIsNone(other_lane.poll(), "the cleanup killed a same-duration sleeper that no test of this file started")
         self.assertEqual(_sleepers(other_token), {other_test.pid})
+
+    @unittest.skipIf(shutil.which("sleep") is None, "needs a sleep binary on PATH")
+    def test_a_child_whose_argv_is_not_yet_visible_to_discovery_is_waited_for(self) -> None:
+        # DV-SLEEPER-OVERLAP-EXTRA-PID-DIAG-1: merge_group run 39943319734 saw the first scan miss the test's OWN child. Reproduced
+        # deterministically: the first scan for every token reads as if the child's argv were not published yet (the real test, run inside
+        # this one, must wait for its own pid rather than fail).
+        module = sys.modules[__name__]
+        real, blind_once = module._sleepers, set()
+
+        def blind_on_first_scan(token: str) -> set[int]:
+            if token not in blind_once:
+                blind_once.add(token)
+                return set()
+            return real(token)
+
+        inner = SleeperDiscoveryTests("test_two_overlapping_sleeper_tests_each_count_and_terminate_only_their_own_child")
+        result = unittest.TestResult()
+        with mock.patch.object(module, "_sleepers", blind_on_first_scan):
+            inner.run(result)
+        self.assertTrue(result.wasSuccessful(), f"failures={result.failures} errors={result.errors}")
+        self.assertEqual(len(blind_once), 2, "the first scan of both the own and the other test's token was blinded")
+
+    def _fixture_proc(self, entries: dict[str, dict[str, bytes]]) -> Path:
+        root = Path(tempfile.mkdtemp(prefix="dv-fake-proc-"))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        for name, files in entries.items():
+            (root / name).mkdir()
+            for fname, data in files.items():
+                (root / name / fname).write_bytes(data)
+        return root
+
+    def test_the_proc_scan_names_only_the_token_and_skips_an_empty_or_unreadable_cmdline(self) -> None:
+        root = self._fixture_proc({
+            "101": {"cmdline": b"/usr/bin/sleep\x0060.123456789\x00"},
+            "102": {"cmdline": b""},                                   # exec under way: argv not published yet
+            "103": {"cmdline": b"sleep\x0060.999999999\x00"},          # another test's token
+            "104": {},                                                 # no cmdline file at all (the pid vanished)
+            "self": {"cmdline": b"sleep\x0060.123456789\x00"},         # not a pid
+        })
+        self.assertEqual(_sleepers_from_proc("60.123456789", root), {101})
+
+    def test_the_failure_message_carries_what_proc_held_for_the_own_child_and_each_found_pid(self) -> None:
+        root = self._fixture_proc({
+            "201": {"cmdline": b"", "status": b"Name:\tsleep\nState:\tR (running)\nPPid:\t200\n"},
+            "200": {"cmdline": b"python3\x00-m\x00pytest\x00", "status": b"State:\tS (sleeping)\nPPid:\t1\n"},
+            "202": {"cmdline": b"sleep\x0060.5\x00", "status": b"State:\tS (sleeping)\nPPid:\t200\n"},
+        })
+        own = mock.Mock(pid=201, **{"poll.return_value": None})
+        text = _sleeper_diagnostic("60.5", own, {202}, root)
+        self.assertIn("found=[202]", text)
+        self.assertIn("own.pid=201 own.poll()=None", text)
+        self.assertIn("pid 201: cmdline=b''", text)
+        self.assertIn("State:\\tR (running)", text)
+        self.assertIn("PPid:\\t200", text)
+        self.assertIn("parents=[201, 200, 1]", text)
+        self.assertIn("pid 202: cmdline=b'sleep\\x0060.5\\x00'", text)
+        self.assertIn("pid 999: " + str(root / "999") + " absent", _sleeper_diagnostic("60.5", mock.Mock(pid=999, **{"poll.return_value": 0}), set(), root))
+
+    def test_the_wait_for_the_own_child_is_bounded_and_never_accepts_a_different_pid(self) -> None:
+        alive = mock.Mock(pid=301, **{"poll.return_value": None})
+        with mock.patch.object(sys.modules[__name__], "_sleepers", side_effect=[set(), set(), {301}]) as scan:
+            self.assertEqual(_wait_for_sleeper("60.5", alive, timeout=5.0, interval=0.0), {301})
+            self.assertEqual(scan.call_count, 3, "it stops scanning as soon as the own child is named")
+        started = time.monotonic()
+        with mock.patch.object(sys.modules[__name__], "_sleepers", return_value={999}):
+            self.assertEqual(_wait_for_sleeper("60.5", alive, timeout=0.2, interval=0.01), {999}, "a foreign pid is returned as it is, never waited for as if it were the own child")
+        self.assertLess(time.monotonic() - started, 5.0, "the wait is bounded by its timeout")
+        exited = mock.Mock(pid=302, **{"poll.return_value": 1})
+        with mock.patch.object(sys.modules[__name__], "_sleepers", return_value=set()) as scan:
+            self.assertEqual(_wait_for_sleeper("60.5", exited, timeout=5.0), set())
+            self.assertEqual(scan.call_count, 1, "an own child that has already exited is not waited for")
 
     @unittest.skipIf(sys.platform == "win32" or Path("/proc").is_dir(), "the ps path is for platforms without /proc (macOS)")
     def test_discovery_runs_where_there_is_no_proc(self) -> None:
