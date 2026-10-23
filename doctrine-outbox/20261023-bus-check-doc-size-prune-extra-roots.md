@@ -7,7 +7,7 @@ law4: attested
 ## mlv-app/check-doc-size-prune-before-descent-and-extra-roots
 rule: A per-turn doc-size gate must not walk what it will never govern. In a worktree scan, prune a directory before descending when an exempt glob of the form <dir>/** or <dir>/* covers its whole subtree, and let a config name extra_roots so only those directories plus the top-level files are walked.
 mechanism: bus tools/factory/check-doc-size.py (c82bddb) enters every directory and filters by exempt afterwards: on a large board 837,710 paths per run, 155,544 pruned, 47,215 with roots. Pruning is verdict-neutral (fnmatch star crosses slash); other glob shapes still walk. extra_roots is a non-empty list, scan worktree only (else exit 2); a bad root is a typed note, never a crash.
-applies: mlv-app, conjugal, cloudvore, magic-lantern
+applies: mlv-app, conjugal, cloudvore
 check: git apply the pinned patch (see Adopt) to bus c82bddb, run tools/factory/check-doc-size.tests.py: old tool red 5 of 28, patched green 28 of 28; the 3 fixture configs print byte-identical output (sha256 pinned in the tests).
 supersedes: none
 evidence: measured
