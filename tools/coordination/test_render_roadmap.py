@@ -7,8 +7,10 @@ Run: py -3 -m unittest tools.coordination.test_render_roadmap -v
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import importlib.util
+import io
 import json
 import subprocess
 import sys
@@ -251,6 +253,97 @@ class CliTests(unittest.TestCase):
         foreign.write_text(json.dumps({"schema": "something/else", "rows": []}), encoding="utf-8")
         self.assertEqual(self.run_cli("--card-queue", str(foreign), "--out", str(self.out)).returncode, 2)
         self.assertFalse(self.out.exists())
+
+
+class InputValidationTests(unittest.TestCase):
+    """Malformed card-queue values exit 2 naming file, row and field; they never traceback (exit 1)."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.queue = Path(self.tmp.name) / "card-queue.json"
+        self.out = Path(self.tmp.name) / "roadmap.md"
+
+    def run_main(self, data: dict) -> tuple[int, str]:
+        """main([...]) against a temp card-queue.json; returns (SystemExit code or return value, stderr)."""
+        self.queue.write_text(json.dumps(data), encoding="utf-8")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            try:
+                code = render_roadmap.main(["--card-queue", str(self.queue), "--out", str(self.out)])
+            except SystemExit as exc:
+                code = exc.code
+        return code, err.getvalue()
+
+    def assert_rejected(self, data: dict, *needles: str) -> None:
+        code, err = self.run_main(data)
+        self.assertEqual(code, 2, err)
+        for needle in (str(self.queue), *needles):
+            self.assertIn(needle, err)
+        self.assertFalse(self.out.exists())
+
+    def test_malformed_generated_utc_exits_2(self) -> None:
+        data = synthetic(1, 0, 0)
+        data["generated_utc"] = "not-a-date"
+        self.assert_rejected(data, "generated_utc")
+
+    def test_malformed_source_ledger_stamp_exits_2_naming_the_row(self) -> None:
+        data = synthetic(2, 0, 0)
+        data["rows"][1]["source_ledger_stamp"] = "2026-13-45T00:00:00Z"
+        self.assert_rejected(data, "row 1", "source_ledger_stamp")
+
+    def test_non_string_pinned_utc_exits_2_naming_the_row(self) -> None:
+        data = synthetic(1, 1, 0)
+        data["rows"][1]["pinned_utc"] = 20261023
+        self.assert_rejected(data, "row 1", "pinned_utc")
+
+    def test_order_chain_as_a_string_exits_2_naming_the_row(self) -> None:
+        data = synthetic(2, 0, 0)
+        data["rows"][1]["order_chain"] = "ORDER-1 #1 first"
+        self.assert_rejected(data, "row 1", "order_chain")
+
+    def test_order_chain_missing_index_exits_2_naming_the_row(self) -> None:
+        data = synthetic(2, 0, 0)
+        data["rows"][1]["order_chain"] = {"chain": "ORDER-1", "predecessor": None}
+        self.assert_rejected(data, "row 1", "order_chain", "index")
+
+    def test_other_order_chain_shapes_exit_2(self) -> None:
+        for bad in ({"chain": 7, "index": 1}, {"chain": "C", "index": "1"}, {"chain": "C", "index": True},
+                    {"chain": "C", "index": 1, "predecessor": 5}):
+            with self.subTest(order_chain=bad):
+                data = synthetic(1, 0, 0)
+                data["rows"][0]["order_chain"] = bad
+                self.assert_rejected(data, "row 0", "order_chain")
+
+    def test_malformed_merged_utc_exits_2_even_on_an_unmerged_row(self) -> None:
+        data = synthetic(1, 0, 0)
+        data["rows"][0]["merged_utc"] = "yesterday"
+        self.assert_rejected(data, "row 0", "merged_utc")
+
+    def test_a_well_formed_queue_still_renders(self) -> None:
+        data = synthetic(2, 1, 1)
+        data["rows"][0]["order_chain"] = {"chain": "ORDER-1", "index": 2, "predecessor": "OPEN-1"}
+        data["rows"][1]["pinned_utc"] = "2026-10-22T01:00:00Z"
+        code, err = self.run_main(data)
+        self.assertEqual(code, 0, err)
+        self.assertIn("ORDER-1 #2 after OPEN-1", self.out.read_text(encoding="utf-8"))
+
+    def test_merged_utc_beats_the_newest_other_stamp(self) -> None:
+        # Declared 10-21 would win max(); the row's own merged_utc says it landed 10-19.
+        data = synthetic(1, 0, 0)
+        data["rows"].append(row("MERGED-OWN-STAMP", "merged", "2026-10-18T05:00:00Z",
+                                evidence="declared@2026-10-21T05:00:00Z", pinned_utc="2026-10-22T05:00:00Z",
+                                merged_utc="2026-10-19T08:00:00Z"))
+        text = render_roadmap.render(data)
+        self.assertIn("| 2026-10-19 | 1 | 0 |", text)
+        self.assertIn("| 2026-10-21 | 0 | 0 |", text)
+        self.assertIn("| 2026-10-22 | 0 | 0 |", text)
+
+    def test_without_merged_utc_the_newest_stamp_is_still_the_approximation(self) -> None:
+        data = synthetic(1, 0, 0)
+        data["rows"].append(row("MERGED-NO-OWN-STAMP", "merged", "2026-10-18T05:00:00Z",
+                                evidence="declared@2026-10-21T05:00:00Z", pinned_utc="2026-10-22T05:00:00Z"))
+        self.assertIn("| 2026-10-22 | 1 | 0 |", render_roadmap.render(data))
 
 
 if __name__ == "__main__":
