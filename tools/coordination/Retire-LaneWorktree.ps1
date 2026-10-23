@@ -172,6 +172,8 @@
         f. r10 (Dot R18 B1): re-creating the admin entry or the `.git` link records checkoutOwed in record.json (under the claim, before
            either is re-created), so a retry after a failed repair still runs checkout-index; the record is dropped only once checkout-index
            and status have run. A record.json absent at the sweep's read is a record settled (or being written) by its owner: gone / owned.
+        g. r11 (sol r1 blocker on PR #632): every decision is made from record.json re-read UNDER the claim, never from the snapshot the
+           caller read before it (that may predate another restorer's checkoutOwed). Gone under the claim: gone; unreadable: failed, kept.
       renameRestore.state (and each sweep strandedRestore row / disposition.strandedRestore):
         not-renamed          no rename happened in this call
         retired              the rename was followed by a real retirement; the record is dropped
@@ -848,6 +850,20 @@ function Restore-LaneWorktreeRename {
             # r10: -Record $null is the sweep's record whose record.json was absent at its read; present now, its owner wrote it after the
             # listing (under the lock it has since let go). It was not read in this pass, so nothing is touched; the next sweep reads it.
             if ($null -eq $Record) { $res.state = 'owned'; $res.note = "record.json of $RecordDir was written by its owner after this sweep listed it; nothing touched, the next sweep reads it"; return $res }
+        }
+        # r11 (sol r1 blocker on PR #632; catalogue row: stale record snapshot before a debt update -> reload under the claim and perform the
+        # owed checkout): -Record was read BEFORE the claim. Between that read and the claim, another restorer may have claimed the record,
+        # persisted checkoutOwed, re-created the admin entry and the link, failed its repair and let go; deciding from the old snapshot then
+        # finds nothing to re-create, skips the checkout and drops the record over missing tracked files. So every decision below is made from
+        # record.json as it is NOW, under this call's claim; the caller's snapshot only located the record. Unreadable now: fail closed.
+        $rj = Join-Path $RecordDir 'record.json'
+        if (-not (Test-Path -LiteralPath $rj)) { $res.state = 'gone'; $res.note = "the rename record $RecordDir has no record.json under the claim"; $drop = $true; return $res }
+        try {
+            $Record = Get-Content -LiteralPath $rj -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            if ($null -eq $Record -or -not (Get-RetireRecordValue $Record 'original') -or -not (Get-RetireRecordValue $Record 'retiring')) { throw 'no original/retiring in it' }
+        } catch {
+            $res.state = 'failed'; $res.note = "cannot-determine: record.json of $RecordDir cannot be read under the claim ($($_.Exception.Message)); nothing touched, the record stays"
+            return $res
         }
         $orig = [string]$Record.original; $ret = [string]$Record.retiring
         $notes = @()

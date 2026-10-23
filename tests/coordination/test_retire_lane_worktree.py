@@ -1039,6 +1039,67 @@ def test_a_half_removed_tree_whose_first_repair_fails_is_re_checked_out_by_the_r
     _assert_back_at_its_own_path(main, wt)
 
 
+def _restore_with_snapshot(rec_dir, snapshot):
+    """Restore-LaneWorktreeRename as a sweep calls it: with the record it read BEFORE claiming (here, the JSON text in `snapshot`)."""
+    script = ("$ErrorActionPreference='Stop'; Set-StrictMode -Version Latest; "
+              f". '{HELPER}'; $old = Get-Content -LiteralPath '{snapshot}' -Raw | ConvertFrom-Json; "
+              f"Restore-LaneWorktreeRename -Record $old -RecordDir '{rec_dir}' | ConvertTo-Json -Depth 5")
+    return json.loads(subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", script], check=True, capture_output=True, text=True).stdout)
+
+
+def _half_removed_with_a_snapshot(tmp, main, wt):
+    """A stranded, half-removed tree (as in the test above), plus a copy of its record.json as a sweep B reads it before any restore ran:
+    no checkoutOwed in it. Returns (record dir, snapshot path)."""
+    _strand_registered(main, wt)
+    recs = _pending_records(main)
+    assert len(recs) == 1, recs
+    rec_dir = Path(main) / ".git" / "mlv-retire-pending" / recs[0]
+    shutil.rmtree(_admin_dir(main, wt))
+    for f in (".git", "a.txt", ".gitignore"):
+        (_retiring_of(wt) / f).unlink()
+    snapshot = tmp / "b-snapshot.json"
+    snapshot.write_text((rec_dir / "record.json").read_text(encoding="utf-8-sig"), encoding="utf-8")
+    assert "checkoutOwed" not in json.loads(snapshot.read_text(encoding="utf-8")), "B's snapshot predates the debt"
+    return rec_dir, snapshot
+
+
+def test_a_restore_holding_a_stale_snapshot_still_performs_the_checkout_owed_under_its_claim(repo):
+    """NEW CATALOGUE ROW (sol r1 blocker on PR #632): stale record snapshot before a debt update -> reload under the claim and perform the
+    owed checkout. Sweep B reads the record (no checkoutOwed). Restorer A then claims it, persists checkoutOwed, re-creates the admin entry
+    and the link, fails its repair and lets go. B claims with its OLD snapshot: admin and link exist and the repair succeeds, so deciding
+    from the snapshot skipped checkout-index, reported 'restored' and dropped the record with tracked files missing. Ordered by the test
+    itself, no sleeps: snapshot first, A's whole round second, B's restore third."""
+    tmp, main = repo
+    root = tmp / "lanes"
+    wt = _add_wt(main, root / "wt-stale-snapshot")
+    rec_dir, snapshot = _half_removed_with_a_snapshot(tmp, main, wt)
+    # A's round: a sweep whose repair fails. It persists the debt, re-creates admin entry and link, and releases its claim on exit.
+    seam = "function Repair-LaneWorktreePath { param([string]$Main, [string]$Path) 'git worktree repair: seam failure' }; "
+    s = json.loads(subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", _sweep_script(main, root, tmp, seam)],
+                                  check=True, capture_output=True, text=True).stdout)
+    assert [r["state"] for r in s["strandedRestore"]] == ["restored-unrepaired"], s
+    assert json.loads((rec_dir / "record.json").read_text(encoding="utf-8-sig")).get("checkoutOwed") is True
+    assert _admin_dir(main, wt).exists() and (wt / ".git").exists() and not (wt / "a.txt").exists(), "A left nothing to re-create"
+    # B: claims now, holding the snapshot it read before A's round.
+    r = _restore_with_snapshot(rec_dir, snapshot)
+    assert r["state"] == "restored" and "status clean" in r["note"], r   # checkout-index and status ran before the drop
+    assert (wt / "a.txt").exists() and (wt / ".gitignore").exists(), "the owed checkout ran: every tracked file is back"
+    _assert_back_at_its_own_path(main, wt)
+
+
+def test_a_record_unreadable_under_the_claim_fails_closed_and_is_kept(repo):
+    """r2 on PR #632: the record is re-read under the claim. Present but unparseable then is not decided from the caller's snapshot: the
+    restore fails closed, touches neither path, and the record stays."""
+    tmp, main = repo
+    root = tmp / "lanes"
+    wt = _add_wt(main, root / "wt-garbled")
+    rec_dir, snapshot = _half_removed_with_a_snapshot(tmp, main, wt)
+    (rec_dir / "record.json").write_text("{ not json", encoding="utf-8")
+    r = _restore_with_snapshot(rec_dir, snapshot)
+    assert r["state"] == "failed" and "cannot be read under the claim" in r["note"], r
+    assert _retiring_of(wt).exists() and not wt.exists() and (rec_dir / "record.json").exists(), "nothing touched, the record stays"
+
+
 def test_a_record_settled_by_its_owner_between_the_listing_and_the_read_is_gone_not_failed(repo):
     """Fable/Grok note on PR #603: the owner settles a record by emptying it (record.json first) while it holds owner.lock, then deletes the
     directory. A sweep that listed the directory before that and reads record.json after it must not report a 'failed' (unreadable) row:
