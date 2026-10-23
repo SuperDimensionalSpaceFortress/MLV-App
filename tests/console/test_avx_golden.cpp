@@ -14,6 +14,10 @@
 #include <QStringList>
 #include <QTemporaryDir>
 
+#include <chrono>
+#include <future>
+#include <thread>
+
 static bool running_on_x86()
 {
 #if defined(__i386__) || defined(__x86_64__) || defined(_M_IX86) || defined(_M_X64)
@@ -502,6 +506,13 @@ static QStringList chatty_failure_arguments()
                        "echo AVX_PARITY_TAIL_MARKER; exit 7"));
 }
 
+// Where one run's scratch lives, kept so a test can check it is gone once the run has ended.
+struct ScratchPaths {
+    QString dir;
+    QString marker;
+    QString output_json;
+};
+
 // The first-run marker and hash json paths one runner test uses. Each run gets its own fresh
 // directory under `root`, so two console_tests processes running at once never read or delete each
 // other's files; the run removes only that directory when it ends.
@@ -513,12 +524,26 @@ public:
         ASSERT_TRUE(dir_.isValid());
     }
 
+    QString dir() const { return dir_.path(); }
     QString marker() const { return dir_.filePath(QStringLiteral("first_run.marker")); }
     QString output_json() const { return dir_.filePath(QStringLiteral("hashes.json")); }
+    ScratchPaths paths() const { return {dir(), marker(), output_json()}; }
 
 private:
     QTemporaryDir dir_;
 };
+
+// Empty when a finished run's directory, marker and hash json are all gone; otherwise what is left.
+static std::string scratch_left_behind(const ScratchPaths & paths)
+{
+    QStringList left;
+    for (const QString & path : {paths.dir, paths.marker, paths.output_json}) {
+        if (QFileInfo::exists(path)) {
+            left << path;
+        }
+    }
+    return left.join(QStringLiteral(", ")).toStdString();
+}
 
 TEST(AvxParityRunner, BoundedRunKillsAHungChildWithinItsTimeout)
 {
@@ -551,17 +576,24 @@ TEST(AvxParityRunner, FailingHelperDiagnosticNamesHelperExitCodeAndOutputTail)
         SKIP_TEST("no shell found to stand in for a failing helper");
     }
 
-    const RunnerScratch scratch(QDir::tempPath());
-    const QString output_path = scratch.output_json();
+    ScratchPaths scratch_paths;
+    ProcessRunResult result;
     std::ostringstream diagnostics;
-    const ProcessRunResult result = run_helper_with_retry(QStringLiteral("default"),
-                                                          shell,
-                                                          chatty_failure_arguments(),
-                                                          QDir::tempPath(),
-                                                          QProcessEnvironment::systemEnvironment(),
-                                                          60 * 1000,
-                                                          output_path,
-                                                          diagnostics);
+    {
+        const RunnerScratch scratch(QDir::tempPath());
+        scratch_paths = scratch.paths();
+        result = run_helper_with_retry(QStringLiteral("default"),
+                                       shell,
+                                       chatty_failure_arguments(),
+                                       QDir::tempPath(),
+                                       QProcessEnvironment::systemEnvironment(),
+                                       60 * 1000,
+                                       scratch_paths.output_json,
+                                       diagnostics);
+    }
+    // A failed run leaves nothing behind once it has ended.
+    ASSERT_EQ(std::string(), scratch_left_behind(scratch_paths));
+    const QString output_path = scratch_paths.output_json;
 
     ASSERT_FALSE(result.ok());
     ASSERT_FALSE(result.timed_out);
@@ -591,18 +623,25 @@ TEST(AvxParityRunner, HelperTimeoutRetriesOnceAndReportsTheFirstAttempt)
         SKIP_TEST("no shell found to stand in for a hung helper");
     }
 
-    const RunnerScratch scratch(QDir::tempPath());
+    ScratchPaths scratch_paths;
+    ProcessRunResult result;
     std::ostringstream diagnostics;
     QElapsedTimer timer;
     timer.start();
-    const ProcessRunResult result = run_helper_with_retry(QStringLiteral("avx"),
-                                                          shell,
-                                                          sleeper_arguments(20),
-                                                          QDir::tempPath(),
-                                                          QProcessEnvironment::systemEnvironment(),
-                                                          1500,
-                                                          scratch.output_json(),
-                                                          diagnostics);
+    {
+        const RunnerScratch scratch(QDir::tempPath());
+        scratch_paths = scratch.paths();
+        result = run_helper_with_retry(QStringLiteral("avx"),
+                                       shell,
+                                       sleeper_arguments(20),
+                                       QDir::tempPath(),
+                                       QProcessEnvironment::systemEnvironment(),
+                                       1500,
+                                       scratch_paths.output_json,
+                                       diagnostics);
+    }
+    // A run whose child was killed leaves nothing behind once it has ended.
+    ASSERT_EQ(std::string(), scratch_left_behind(scratch_paths));
 
     ASSERT_TRUE(result.timed_out);
     ASSERT_FALSE(result.ok());
@@ -637,23 +676,31 @@ TEST(AvxParityRunner, FirstHelperTimeoutFailsEvenWhenTheRetryWouldPass)
         SKIP_TEST("no shell found to stand in for a hung helper");
     }
 
-    const RunnerScratch scratch(QDir::tempPath());
-    const QString output_path = scratch.output_json();
+    ScratchPaths scratch_paths;
+    ProcessRunResult result;
     std::ostringstream diagnostics;
-    const ProcessRunResult result = run_helper_with_retry(QStringLiteral("default"),
-                                                          shell,
-                                                          hang_then_pass_arguments(scratch.marker(), output_path),
-                                                          QDir::tempPath(),
-                                                          QProcessEnvironment::systemEnvironment(),
-                                                          8000,
-                                                          output_path,
-                                                          diagnostics);
+    {
+        const RunnerScratch scratch(QDir::tempPath());
+        scratch_paths = scratch.paths();
+        result = run_helper_with_retry(QStringLiteral("default"),
+                                       shell,
+                                       hang_then_pass_arguments(scratch_paths.marker, scratch_paths.output_json),
+                                       QDir::tempPath(),
+                                       QProcessEnvironment::systemEnvironment(),
+                                       8000,
+                                       scratch_paths.output_json,
+                                       diagnostics);
 
-    // The first attempt hung, so the run fails however the second attempt ends.
-    ASSERT_TRUE(result.timed_out);
-    ASSERT_FALSE(result.ok());
-    // The second attempt's hashes never reach the parity comparison.
-    ASSERT_FALSE(QFileInfo::exists(output_path));
+        // The first attempt hung, so the run fails however the second attempt ends.
+        ASSERT_TRUE(result.timed_out);
+        ASSERT_FALSE(result.ok());
+        // The second attempt's hashes never reach the parity comparison.
+        ASSERT_FALSE(QFileInfo::exists(scratch_paths.output_json));
+        // The killed first attempt left its marker, which the second attempt found.
+        ASSERT_TRUE(QFileInfo::exists(scratch_paths.marker));
+    }
+    // Once the run has ended, its marker and directory are gone too.
+    ASSERT_EQ(std::string(), scratch_left_behind(scratch_paths));
     const std::string text = diagnostics.str();
     ASSERT_TRUE(text.find("AVX_PARITY_HELPER_TIMEOUT_RETRY attempt=1") != std::string::npos);
     ASSERT_TRUE(text.find("AVX_PARITY_HELPER_DIAGNOSTIC_RERUN attempt=2 outcome=ok") != std::string::npos);
@@ -695,6 +742,149 @@ TEST(AvxParityRunner, RunsSharingATempRootNeverShareOrRemoveEachOthersFiles)
     // Each run removes what it created.
     ASSERT_FALSE(QFileInfo::exists(first_marker));
     ASSERT_FALSE(QFileInfo::exists(first_output_json));
+    ASSERT_TRUE(QDir(root.path()).entryList(QDir::AllEntries | QDir::NoDotAndDotDot | QDir::Hidden).isEmpty());
+}
+
+// The filler line an overlapping run prints over and over; it names the run, so any of it found in
+// the other run's output came from the wrong child.
+static QByteArray overlap_filler_tag(const QString & label)
+{
+    return ("AVX_OVERLAP_FILL " + label + " ").toUtf8();
+}
+
+// How many filler lines an overlapping run prints. Each line is the tag five times, so 1000 lines
+// come to more than 100 KB, well past what the parent keeps.
+static const int kOverlapFillerLines = 1000;
+
+// Marks its own start, waits until the peer run has marked its start, prints its filler lines, then
+// its marker last, writes a hash json naming itself and exits 0. If the peer has not started within
+// `peer_wait_seconds` it exits 9, so two such runs only both pass when they are alive at the same time.
+static QStringList overlapping_run_arguments(const QString & label,
+                                             const QString & own_started,
+                                             const QString & peer_started,
+                                             const QString & output_path,
+                                             int peer_wait_seconds)
+{
+    const QString filler = QString::fromUtf8(overlap_filler_tag(label));
+    return stand_in_arguments(
+        QStringLiteral("New-Item -ItemType File -Path '%2' | Out-Null; $deadline = (Get-Date).AddSeconds(%5); "
+                       "while (-not (Test-Path -LiteralPath '%3')) { if ((Get-Date) -gt $deadline) { "
+                       "[Console]::Out.WriteLine('AVX_OVERLAP_PEER_NEVER_STARTED %1'); exit 9 }; Start-Sleep -Milliseconds 50 }; "
+                       "$line = '%6' * 5; for ($i = 0; $i -lt %7; $i++) { [Console]::Out.WriteLine($line) }; "
+                       "[Console]::Out.WriteLine('AVX_OVERLAP_SAW_PEER %1'); "
+                       "Set-Content -LiteralPath '%4' -Value '{\"label\":\"%1\"}'; exit 0")
+            .arg(label, own_started, peer_started, output_path, QString::number(peer_wait_seconds), filler,
+                 QString::number(kOverlapFillerLines)),
+        QStringLiteral(": > '%2'; i=0; while [ ! -e '%3' ]; do if [ $i -ge %5 ]; then "
+                       "echo 'AVX_OVERLAP_PEER_NEVER_STARTED %1'; exit 9; fi; sleep 0.1; i=$((i+1)); done; "
+                       "line='%6%6%6%6%6'; i=0; while [ $i -lt %7 ]; do echo \"$line\"; i=$((i+1)); done; "
+                       "echo 'AVX_OVERLAP_SAW_PEER %1'; printf '{\"label\":\"%1\"}' > '%4'; exit 0")
+            .arg(label, own_started, peer_started, output_path, QString::number(peer_wait_seconds * 10), filler,
+                 QString::number(kOverlapFillerLines)));
+}
+
+// Two runner calls on two threads, each running its own helper process against one shared temp root,
+// stand in for two console_tests processes whose helpers run at once.
+TEST(AvxParityRunner, OverlappingHelperRunsKeepTheirOwnOutputsAndRemoveTheirScratch)
+{
+    const QString shell = stand_in_shell();
+    if (shell.isEmpty()) {
+        SKIP_TEST("no shell found to stand in for overlapping helpers");
+    }
+
+    QTemporaryDir root;
+    ASSERT_TRUE(root.isValid());
+
+    struct Run {
+        QString label;
+        ScratchPaths paths;
+        QString started;
+        ProcessRunResult result;
+        std::ostringstream diagnostics;
+        qint64 start_ms = -1;
+        qint64 end_ms = -1;
+    };
+    Run runs[2];
+    runs[0].label = QStringLiteral("first");
+    runs[1].label = QStringLiteral("second");
+    {
+        const RunnerScratch first(root.path());
+        const RunnerScratch second(root.path());
+        runs[0].paths = first.paths();
+        runs[1].paths = second.paths();
+        for (Run & run : runs) {
+            run.started = QDir(run.paths.dir).filePath(QStringLiteral("started"));
+        }
+
+        // Both threads wait on one gate so their helpers start together. Each runner call is bounded
+        // by its helper timeout, so a hung helper fails the test instead of stalling the joins.
+        const auto clock_start = std::chrono::steady_clock::now();
+        const auto now_ms = [clock_start]() {
+            return static_cast<qint64>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                           std::chrono::steady_clock::now() - clock_start).count());
+        };
+        std::promise<void> go;
+        const std::shared_future<void> gate = go.get_future().share();
+        const auto invoke = [gate, &shell, now_ms](Run & run, const Run & peer) {
+            gate.wait();
+            run.start_ms = now_ms();
+            run.result = run_helper_with_retry(run.label,
+                                               shell,
+                                               overlapping_run_arguments(run.label, run.started, peer.started,
+                                                                         run.paths.output_json, 20),
+                                               run.paths.dir,
+                                               QProcessEnvironment::systemEnvironment(),
+                                               45 * 1000,
+                                               run.paths.output_json,
+                                               run.diagnostics);
+            run.end_ms = now_ms();
+        };
+        std::thread first_thread(invoke, std::ref(runs[0]), std::cref(runs[1]));
+        std::thread second_thread(invoke, std::ref(runs[1]), std::cref(runs[0]));
+        go.set_value();
+        first_thread.join();
+        second_thread.join();
+
+        std::cout << "AVX_OVERLAP_EVIDENCE first=[" << runs[0].start_ms << "," << runs[0].end_ms
+                  << "] ms second=[" << runs[1].start_ms << "," << runs[1].end_ms << "] ms\n";
+        for (const Run & run : runs) {
+            if (!run.result.ok()) {
+                std::cerr << run.diagnostics.str()
+                          << describe_process_failure(run.label, shell, run.result, run.paths.output_json).toStdString()
+                          << "\n";
+            }
+        }
+        for (const Run & run : runs) {
+            ASSERT_TRUE(run.result.ok());
+            // The helper saw its peer's start mark before it finished, so the two processes overlapped.
+            ASSERT_TRUE(run.result.output.contains(("AVX_OVERLAP_SAW_PEER " + run.label).toUtf8()));
+        }
+        // Each run printed more than the parent keeps, so what it kept is a bounded tail of that run's
+        // output alone: its own filler and marker, and not one line of the peer's.
+        for (int index = 0; index < 2; ++index) {
+            const Run & run = runs[index];
+            const Run & peer = runs[1 - index];
+            ASSERT_TRUE(run.result.output_total_bytes > kRetainedOutputBytes);
+            ASSERT_TRUE(run.result.output.contains(overlap_filler_tag(run.label)));
+            ASSERT_FALSE(run.result.output.contains(overlap_filler_tag(peer.label)));
+            ASSERT_FALSE(run.result.output.contains(("AVX_OVERLAP_SAW_PEER " + peer.label).toUtf8()));
+            ASSERT_TRUE(run.result.output.size() <= kRetainedOutputBytes);
+        }
+        // Each runner call started before the other one returned.
+        ASSERT_TRUE(runs[0].start_ms < runs[1].end_ms);
+        ASSERT_TRUE(runs[1].start_ms < runs[0].end_ms);
+        // Each run's hash json is its own.
+        ASSERT_TRUE(runs[0].paths.output_json != runs[1].paths.output_json);
+        for (const Run & run : runs) {
+            ASSERT_EQ(run.label.toStdString(),
+                      load_json_file(run.paths.output_json).value(QStringLiteral("label")).toString().toStdString());
+        }
+    }
+    // Once both runs have ended, each one's scratch is gone and nothing is left in the shared root.
+    for (const Run & run : runs) {
+        ASSERT_EQ(std::string(), scratch_left_behind(run.paths));
+        ASSERT_FALSE(QFileInfo::exists(run.started));
+    }
     ASSERT_TRUE(QDir(root.path()).entryList(QDir::AllEntries | QDir::NoDotAndDotDot | QDir::Hidden).isEmpty());
 }
 
