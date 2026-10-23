@@ -719,6 +719,12 @@ CONSUMER_FAILING_ACTION: dict[str, tuple[tuple[str, int], ...]] = {
     "tools/profiling/dual-venue/Invoke-VenueChain.ps1": (
         (r"\$legCode\s*=\s*\$LASTEXITCODE[\s\S]*?if\s*\(\$legCode\s+-ne\s+0\)\s*\{\s*"
          r"(?P<act>Add-Result\s+\$leg\s+'LEG_FAILED'\s+@\{[^\n]*outcome\s*=\s*'INVALID'[^\n]*\})", 1),),
+    # BACHELOR-LEASE-BATCH-LEGS-1: the same rule inside one quiet lease per batch: a leg that exited non-zero is recorded LEG_FAILED / INVALID (never RAN, never
+    # counted) in the batch and the run results, and the run exits 7.
+    "tools/profiling/dual-venue/Invoke-VenueLeaseBatch.ps1": (
+        (r"\$legCode\s*=\s*\$LASTEXITCODE[\s\S]*?if\s*\(\$legCode\s+-ne\s+0\)\s*\{\s*"
+         r"(?P<act>\$row\s*=\s*\[ordered\]@\{[^\n]*status\s*=\s*'LEG_FAILED';\s*outcome\s*=\s*'INVALID'[^\n]*\}\s*"
+         r"\$b\.legs\.Add\(\[pscustomobject\]\$row\);\s*Add-Result\s+\$leg\s+'LEG_FAILED'\s+\$row)", 1),),
     # UM-REGULAR-BASELINE-1 r3: a chain that did not end on its own with a documented exit that agrees with its CHAIN_RESULT gives its legs the
     # failure text and an EVIDENCE_INCOMPLETE / INVALID row with no figures, types the run CHAIN_FAILED (27); a dead leg (chain exit 7) types it
     # LEG_FAILED (25); the typed reason becomes the process exit code.

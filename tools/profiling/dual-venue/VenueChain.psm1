@@ -723,6 +723,72 @@ function Get-VenueLegPreLoadMean {
     } catch { $null }
 }
 
+function Get-VenueLeaseLedgerPath {
+    # BACHELOR-LEASE-BATCH-LEGS-1 r2: <ClaimDir>\<venue>.lease-ledger.jsonl, one line per quiet lease a lease-batch run took (any run on this host), beside the claim.
+    param([Parameter(Mandatory)][string]$Venue, [string]$ClaimDir = '')
+    Join-Path (Split-Path -Parent (Get-VenueClaimPath -Venue $Venue -ClaimDir $ClaimDir)) "$Venue.lease-ledger.jsonl"
+}
+
+function Read-VenueLeaseLedger {
+    # The ledger's leases that end after -SinceUtc, as @{ startUtc; endUtc; leaseId } (UTC DateTime). A line that does not parse is skipped. Written only under the
+    # venue claim, so one writer at a time.
+    param([Parameter(Mandatory)][string]$Venue, [string]$ClaimDir = '', $SinceUtc = $null)
+    $path = Get-VenueLeaseLedgerPath -Venue $Venue -ClaimDir $ClaimDir
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return @() }
+    $since = $(if ($null -ne $SinceUtc) { ConvertTo-VenueUtc $SinceUtc } else { [DateTime]::MinValue })
+    @(foreach ($line in [IO.File]::ReadAllLines($path)) {
+            $r = try { $line | ConvertFrom-Json } catch { $null }
+            if ($null -eq $r) { continue }
+            $s = ConvertTo-VenueUtc $r.startUtc; $e = ConvertTo-VenueUtc $r.endUtc
+            if ($null -ne $s -and $null -ne $e -and $e -gt $s -and $e -gt $since) { [pscustomobject]@{ startUtc = $s; endUtc = $e; leaseId = [string]$r.leaseId } }
+        })
+}
+
+function Add-VenueLeaseLedger {
+    # Appends one lease to the ledger (the caller holds the venue claim).
+    param([Parameter(Mandatory)][string]$Venue, [string]$ClaimDir = '', [Parameter(Mandatory)]$Row)
+    $path = Get-VenueLeaseLedgerPath -Venue $Venue -ClaimDir $ClaimDir
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $path) | Out-Null
+    [IO.File]::AppendAllText($path, (($Row | ConvertTo-Json -Compress -Depth 4) + "`n"), [Text.UTF8Encoding]::new($false))
+}
+
+function Get-VenueLeaseBudgetWait {
+    <#
+    .SYNOPSIS
+    How long to wait before asking Bachelor's heavy-slot.py for the next quiet lease (BACHELOR-LEASE-BATCH-LEGS-1 r2; its caps, CAPS-ADDENDUM 2026-10-23: a lease is at
+    most -CapSec (45 min), none starts within -CooldownSec (30 min) of the last one's end, and leased time is at most -BudgetSec (90 min) in any -WindowSec (3 h)).
+    The open time is the first moment, on a -StepSec grid, that is past the cooldown and whose WORST window (the one ending when a full-length lease opened then would
+    end) holds at most BudgetSec - CapSec of the -Leases already taken. Pure: -Leases are @{ startUtc; endUtc }, -NowUtc is passed in.
+    .OUTPUTS
+    [pscustomobject]@{ reason (NONE | COOLDOWN | BUDGET); waitSec; openUtc; usedSec (in that window at openUtc); budgetRoomSec (at most CapSec); lastEndUtc }
+    #>
+    param([object[]]$Leases = @(), [Parameter(Mandatory)]$NowUtc, [int]$CapSec = 2700, [int]$CooldownSec = 1800, [int]$WindowSec = 10800, [int]$BudgetSec = 5400,
+        [ValidateRange(1, 600)][int]$StepSec = 30)
+    $now = ConvertTo-VenueUtc $NowUtc
+    $rows = @(foreach ($l in @($Leases)) {
+            if ($null -eq $l) { continue }
+            $s = ConvertTo-VenueUtc $l.startUtc; $e = ConvertTo-VenueUtc $l.endUtc
+            if ($null -ne $s -and $null -ne $e -and $e -gt $s) { [pscustomobject]@{ s = $s; e = $e } }
+        })
+    $used = {
+        param([DateTime]$T)
+        $from = $T.AddSeconds($CapSec - $WindowSec)
+        $sum = 0.0
+        foreach ($r in $rows) {
+            $a = $(if ($r.s -gt $from) { $r.s } else { $from }); $z = $(if ($r.e -lt $T) { $r.e } else { $T })
+            if ($z -gt $a) { $sum += ($z - $a).TotalSeconds }
+        }
+        $sum
+    }
+    $lastEnd = $(if ($rows.Count -gt 0) { ($rows | Sort-Object e | Select-Object -Last 1).e } else { $null })
+    $t = $now; $reason = 'NONE'
+    if ($null -ne $lastEnd -and $lastEnd.AddSeconds($CooldownSec) -gt $t) { $t = $lastEnd.AddSeconds($CooldownSec); $reason = 'COOLDOWN' }
+    $limit = $t.AddSeconds($WindowSec)
+    while ((& $used $t) + $CapSec -gt $BudgetSec -and $t -lt $limit) { $t = $t.AddSeconds($StepSec); $reason = 'BUDGET' }
+    $u = [int][Math]::Round((& $used $t))
+    [pscustomobject]@{ reason = $reason; waitSec = [int][Math]::Ceiling(($t - $now).TotalSeconds); openUtc = $t; usedSec = $u; budgetRoomSec = [int][Math]::Min($CapSec, $BudgetSec - $u); lastEndUtc = $lastEnd }
+}
+
 function Invoke-VenueBoundedProcess {
     <#
     .SYNOPSIS
@@ -748,4 +814,4 @@ Export-ModuleMember -Function Get-VenueMainRoot, Get-VenueClaimPath, Get-VenueCl
     Get-VenueTicketDir, New-VenueTicket, Get-VenueTickets, Get-VenueTicketStaleReason, Get-VenueTicketProbeStaleSec, Update-VenueTicket, Remove-VenueTicket, Get-VenueClaimStatus, Format-VenueClaimStatus, Format-VenueTicketQueue,
     ConvertFrom-VenueGateLog, Get-VenueQuietRateTable, Format-VenueQuietRateTable, Select-VenueQuietWindow,
     Get-VenueSupplementarySpecSkip, Get-VenueSupplementaryIdle, Get-VenueStagedBuildManifest, Get-VenueRemoteJobIds, Get-VenueRemoteJobState, Invoke-VenueBoundedProcess, Complete-VenueProcess,
-    Get-VenueJobResult, Read-VenueLeaseBatchReceipt, Get-VenueLegPreLoadMean
+    Get-VenueJobResult, Read-VenueLeaseBatchReceipt, Get-VenueLegPreLoadMean, Get-VenueLeaseLedgerPath, Read-VenueLeaseLedger, Add-VenueLeaseLedger, Get-VenueLeaseBudgetWait

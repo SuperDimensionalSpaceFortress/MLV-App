@@ -1462,8 +1462,10 @@ function Resolve-StartedMarkers {
 # that finds launching adopts a live child found by command line, re-queues only on proof nothing launched (no
 # live child and no out file), and otherwise orphans (Resolve-LaunchingMarker).
 # ---------------------------------------------------------------------------
-$script:GateVersion = "heavy-slot-gate-1 r1k + heavy-slot-gate-2 r2e + wait-release r1c fifo-holder sustained-heat + r2 holder-owner-check (2026-10-12) + maint-dispatch r1 (2026-10-14) + long-label r1 (2026-10-20) + quiet-lease r1 (2026-10-23) + lease-batch r1 (2026-10-23)"
+$script:GateVersion = "heavy-slot-gate-1 r1k + heavy-slot-gate-2 r2e + wait-release r1c fifo-holder sustained-heat + r2 holder-owner-check (2026-10-12) + maint-dispatch r1 (2026-10-14) + long-label r1 (2026-10-20) + quiet-lease r1 (2026-10-23) + lease-batch r2 (2026-10-23)"
 $script:QuietLeaseLabel = "quiet-lease mlv"
+# lease-batch r2: heavy-slot.py's renew_stale_s. A lease with no successful renew for longer is demoted (non-exclusive).
+$script:LeaseRenewStaleSec = 120
 $script:QuietLease = $null
 $script:QuietLeaseWaiting = $null
 # lease-batch r1: the parked (or in-use) batch lease, and "the admitted batch job launched and ended" for Exit-HeavySlot.
@@ -2297,6 +2299,7 @@ function Start-QuietLeaseRequest {
         outLines = [System.Collections.Generic.List[string]]::new(); outTask = $p.StandardOutput.ReadLineAsync(); outEof = $false
         errTask = $p.StandardError.ReadToEndAsync(); active = $null; activeAt = $null; ownerCheck = $null
         renewCall = $null; lastRenewStart = $null; renewStarts = 0; renewsOk = 0; renewFailures = 0; renewSlow = 0; renewMaxGapSec = 0
+        lastRenewOkStart = $null; renewOkMaxGapSec = 0
         lostLogged = $false; why = $null
     }
     Add-AgentLogLine "quiet-lease: request started job=$JobId pid=$($p.Id) label='$($script:QuietLeaseLabel)' minutes=$Minutes admitTimeout=${LeasePendingMaxSec}s record=$($w.ok)"
@@ -2356,6 +2359,28 @@ function Update-QuietLeaseRequest {
     return [pscustomobject]@{ state = "pending"; rc = $null; why = "pending $([int]((Get-Date) - $Lease.requested).TotalSeconds)s" }
 }
 
+function Register-QuietLeaseRenewOk {
+    # lease-batch r2: a renew that returned rc 0. heavy-slot.py demotes a lease not renewed for renew_stale_s (120 s), so the
+    # gap that matters is between SUCCESSFUL renews (activation counts as the first). Measured from the previous success's
+    # call start to now (the result's collection), an upper bound on heavy-slot.py's own gap: it never under-reads one.
+    param([Parameter(Mandatory = $true)]$Lease, [Parameter(Mandatory = $true)][datetime]$CallStarted)
+    $prev = if ($null -ne $Lease.lastRenewOkStart) { $Lease.lastRenewOkStart } else { $Lease.activeAt }
+    if ($null -ne $prev) {
+        $gap = ((Get-Date) - $prev).TotalSeconds
+        if ($gap -gt $Lease.renewOkMaxGapSec) { $Lease.renewOkMaxGapSec = [Math]::Round($gap, 1) }
+    }
+    $Lease.lastRenewOkStart = $CallStarted
+}
+
+function Get-QuietLeaseRenewOkGapSec {
+    # lease-batch r2: the longest gap between successful renews of an ACTIVE lease so far, the open one up to now included,
+    # or $null when it is not active. Over $script:LeaseRenewStaleSec, heavy-slot.py has demoted the lease (non-exclusive).
+    param($Lease)
+    if ($null -eq $Lease -or $null -eq $Lease.activeAt) { return $null }
+    $prev = if ($null -ne $Lease.lastRenewOkStart) { $Lease.lastRenewOkStart } else { $Lease.activeAt }
+    return [Math]::Round([Math]::Max([double]$Lease.renewOkMaxGapSec, ((Get-Date) - $prev).TotalSeconds), 1)
+}
+
 function Update-QuietLeaseRenew {
     # One renew step for an ACTIVE lease: collects (or, past LeaseRenewTimeoutSec, kills) the renew in flight, and starts the
     # next one once LeaseRenewSec has passed since the last. Never waits on a renew and never ends the lease: a slow or failed
@@ -2367,7 +2392,7 @@ function Update-QuietLeaseRenew {
         if ($c.proc.HasExited) {
             $r = Receive-HeavySlotCli -Call $c
             $Lease.renewCall = $null
-            if ($r.rc -eq 0) { $Lease.renewsOk++ }
+            if ($r.rc -eq 0) { $Lease.renewsOk++; Register-QuietLeaseRenewOk -Lease $Lease -CallStarted $c.started }
             else {
                 $Lease.renewFailures++
                 Add-AgentLogLine "quiet-lease: renew-failed job=$($Lease.jobId) rc=$($r.rc) out=[$($r.stdout)] err=[$($r.stderr)]; not fatal (the lease goes stale at 120 s without a renew)"
@@ -2472,6 +2497,7 @@ function Confirm-QuietLeaseHeldForLaunch {
     if ($l.active.held -ne [string]$script:Admission.heavySlotHeld) { return [pscustomobject]@{ ok = $false; reason = "holder-lost"; why = "lease held=$($l.active.held), admitted with HEAVY_SLOT_HELD=$($script:Admission.heavySlotHeld)" } }
     if ($null -ne $l.renewCall) { Stop-HeavySlotCli -Call $l.renewCall; $l.renewCall = $null }
     $l.renewStarts++
+    $preLaunchStart = Get-Date
     $r = Complete-HeavySlotCli -Call (Start-HeavySlotCli -Arguments @("lease", "renew", "--label", $l.label)) -TimeoutSec $LeaseRenewTimeoutSec -HeartbeatActivity "pre-launch job=$JobId"
     if (-not $r.done) { $l.renewSlow++; return [pscustomobject]@{ ok = $false; reason = "holder-lost"; why = "pre-launch lease renew: $($r.why)" } }
     $flag = $null
@@ -2481,6 +2507,7 @@ function Confirm-QuietLeaseHeldForLaunch {
         return [pscustomobject]@{ ok = $false; reason = "holder-lost"; why = "pre-launch lease renew rc=$($r.rc) did not return this lease's active flag (slot $($l.active.slot), pid $($l.active.ownerPid)): out=[$($r.stdout)] err=[$($r.stderr)]" }
     }
     $l.renewsOk++
+    Register-QuietLeaseRenewOk -Lease $l -CallStarted $preLaunchStart
     $l.lastRenewStart = Get-Date
     return [pscustomobject]@{ ok = $true; reason = $null; why = "quiet lease slot $($l.active.slot) held=$($l.active.held) renewed pre-launch" }
 }
@@ -2504,11 +2531,14 @@ function Confirm-QuietLeaseHeldForLaunch {
 #      is released (Close-LeaseBatch, which is Stop-QuietLease) on: a gated job that is not of this batch (other-job), a gated
 #      job outside lease mode (mode-status), the light job "lease-batch-close-<x>-lb<token>" (closed), no job for
 #      LeaseBatchIdleSec (idle), less than LeaseBatchMinRemainingSec left (remaining-short), the wrapper gone (lease-ended),
-#      or the agent leaving (agent-exit). A hard kill leaves the lease record in slot-holders\, so the successor's
+#      more than 120 s between successful renews (demoted, r2: heavy-slot.py has made it non-exclusive, so no later job may
+#      run on it as if it were exclusive), or the agent leaving (agent-exit). A hard kill leaves the lease record in slot-holders\, so the successor's
 #      Stop-StaleQuietLeases ends it exactly as for an unbatched lease.
 #   5. RECEIPT. A released batch lease appends ONE line to logs\lease-batch-<token>.jsonl (mlv-agent-lease-batch.v1): lease id,
 #      held, slot, activeUtc, untilEpoch, endedUtc, heldSec, the jobs it ran (id, seq, start, end, exit), the light jobs run
-#      under it, the opening request's refusals, renew counts, endReason and releaseRc.
+#      under it, the opening request's refusals, renew counts (r2: okMaxGapSec, the longest gap between successful renews),
+#      endReason and releaseRc. r2: every batch job's admission.leaseBatch and its result's admission.leaseRenew carry
+#      okMaxGapSec too, so the VM counts a leg only when the lease was never demoted up to the leg's end.
 # No new kill path and no new renew call site: release is Stop-QuietLease and renewal is the tick.
 # ---------------------------------------------------------------------------
 
@@ -2535,7 +2565,7 @@ function Get-QuietLeaseRemainingSec {
 function Get-LeaseBatchAdmission {
     # The admission's leaseBatch block for the batch's current job.
     param([Parameter(Mandatory = $true)]$Batch, [bool]$Reused)
-    return [pscustomobject]@{ token = $Batch.token; leaseId = $Batch.lease.id; seq = $Batch.seq; reused = $Reused; untilEpoch = $Batch.lease.active.until; remainingSec = (Get-QuietLeaseRemainingSec -Lease $Batch.lease) }
+    return [pscustomobject]@{ token = $Batch.token; leaseId = $Batch.lease.id; seq = $Batch.seq; reused = $Reused; untilEpoch = $Batch.lease.active.until; remainingSec = (Get-QuietLeaseRemainingSec -Lease $Batch.lease); renewOkMaxGapSec = (Get-QuietLeaseRenewOkGapSec -Lease $Batch.lease) }
 }
 
 function Open-LeaseBatch {
@@ -2562,6 +2592,8 @@ function Use-LeaseBatchForJob {
     $l = $b.lease
     $u = Update-QuietLeaseRequest -Lease $l
     if ($u.state -ne "active") { Close-LeaseBatch -Reason "lease-ended" -Why "job=$JobId found it $($u.state): $($u.why)"; return $null }
+    $gap = Get-QuietLeaseRenewOkGapSec -Lease $l
+    if ($gap -gt $script:LeaseRenewStaleSec) { Close-LeaseBatch -Reason "demoted" -Why "job=$JobId found a ${gap}s gap between successful renews > $($script:LeaseRenewStaleSec)s"; return $null }
     $rem = Get-QuietLeaseRemainingSec -Lease $l
     if ($rem -lt $LeaseBatchMinRemainingSec) { Close-LeaseBatch -Reason "remaining-short" -Why "job=$JobId found ${rem}s left < ${LeaseBatchMinRemainingSec}s"; return $null }
     $b.seq++
@@ -2607,7 +2639,7 @@ function Write-LeaseBatchReceipt {
         activeUtc = $Batch.activeUtc; untilEpoch = $(if ($null -ne $l.active) { $l.active.until } else { $null }); endedUtc = $now.ToString("o"); heldSec = $heldSec
         openedBy = $Batch.openedBy; jobsRun = $Batch.jobs.Count; jobs = @($Batch.jobs.ToArray()); lightJobs = @($Batch.lightJobs.ToArray())
         requests = $Batch.requests; refusals = @($Batch.refusals)
-        renews = [ordered]@{ intervalSec = $LeaseRenewSec; starts = $l.renewStarts; ok = $l.renewsOk; failures = $l.renewFailures; slow = $l.renewSlow; maxGapSec = $l.renewMaxGapSec }
+        renews = [ordered]@{ intervalSec = $LeaseRenewSec; starts = $l.renewStarts; ok = $l.renewsOk; failures = $l.renewFailures; slow = $l.renewSlow; maxGapSec = $l.renewMaxGapSec; okMaxGapSec = (Get-QuietLeaseRenewOkGapSec -Lease $l); staleSec = $script:LeaseRenewStaleSec }
         endReason = $Reason; why = $Why; releaseRc = $(if ($null -ne $Stop) { [string]$Stop.releaseRc } else { $null }); wrapperRc = $(if ($null -ne $Stop) { [string]$Stop.rc } else { $null }); agentPid = $PID
     }
     try {
@@ -2652,6 +2684,8 @@ function Update-LeaseBatchHold {
     Invoke-QuietLeaseRenewTick
     $u = Update-QuietLeaseRequest -Lease $b.lease
     if ($u.state -ne "active") { Close-LeaseBatch -Reason "lease-ended" -Why "$($u.state): $($u.why)"; return }
+    $gap = Get-QuietLeaseRenewOkGapSec -Lease $b.lease
+    if ($gap -gt $script:LeaseRenewStaleSec) { Close-LeaseBatch -Reason "demoted" -Why "${gap}s between successful renews > $($script:LeaseRenewStaleSec)s"; return }
     $rem = Get-QuietLeaseRemainingSec -Lease $b.lease
     if ($rem -lt $LeaseBatchMinRemainingSec) { Close-LeaseBatch -Reason "remaining-short" -Why "${rem}s left < ${LeaseBatchMinRemainingSec}s"; return }
     $idle = ((Get-Date) - $b.lastActivity).TotalSeconds
@@ -3026,7 +3060,7 @@ function Invoke-QueuedJob {
     # quiet-lease r1: the lease's renew record joins the admission (the result's shape is unchanged).
     if ($null -ne $script:QuietLease -and $null -ne $script:Admission) {
         $ql = $script:QuietLease
-        $script:Admission | Add-Member -NotePropertyName leaseRenew -NotePropertyValue ([pscustomobject]@{ intervalSec = $LeaseRenewSec; starts = $ql.renewStarts; ok = $ql.renewsOk; failures = $ql.renewFailures; slow = $ql.renewSlow; maxGapSec = $ql.renewMaxGapSec }) -Force
+        $script:Admission | Add-Member -NotePropertyName leaseRenew -NotePropertyValue ([pscustomobject]@{ intervalSec = $LeaseRenewSec; starts = $ql.renewStarts; ok = $ql.renewsOk; failures = $ql.renewFailures; slow = $ql.renewSlow; maxGapSec = $ql.renewMaxGapSec; okMaxGapSec = (Get-QuietLeaseRenewOkGapSec -Lease $ql); staleSec = $script:LeaseRenewStaleSec }) -Force
     }
 
     $result = [pscustomobject]@{

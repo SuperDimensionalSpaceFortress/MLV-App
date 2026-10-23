@@ -23,7 +23,9 @@ param(
 #   batch     - BACHELOR-LEASE-BATCH-LEGS-1: the legs of one batch (job ids ending -lb<token>) share ONE lease: parked between
 #               legs, renewed by the hold step, reused with no request (RED: one lease per leg pays the cooldown per leg), and
 #               released with a typed receipt on close, idle, too little left, another job, the status rollback, a lost
-#               wrapper, a job that never launched, or agent exit; a dead agent's parked lease is still ended by its successor
+#               wrapper, a job that never launched, or agent exit; a dead agent's parked lease is still ended by its successor.
+#               r2: more than 120 s between SUCCESSFUL renews (heavy-slot.py's demotion) releases a parked lease (demoted)
+#               and no later leg is ever admitted on it; the gap is carried in every batch admission and the receipt
 #   cpu       - the legs' <= 20 % CPU quiescence check is kept, and the job launches only after the lease is active
 #   status    - -HeavySlotMode status / heavy-slot-mode.txt keep the r1c holder path (its own suite stays green)
 # Prints one JSON object with status PASS, or throws.
@@ -58,8 +60,10 @@ foreach ($name in $lift) { . ([scriptblock]::Create((Get-FunctionBody $name))) }
 # that predates them; the batch case asserts they exist only after it has shown the behaviour.
 $liftBatch = @('Get-LeaseBatchToken', 'Test-LeaseBatchCloseJobId', 'Get-QuietLeaseRemainingSec', 'Get-LeaseBatchAdmission', 'Open-LeaseBatch',
     'Use-LeaseBatchForJob', 'Complete-LeaseBatchJob', 'Write-LeaseBatchReceipt', 'Close-LeaseBatch', 'Sync-LeaseBatchForJob', 'Update-LeaseBatchHold')
+# lease-batch r2 (the renew-gap demotion): the same, asserted by the demoted case after it has shown the behaviour.
+$liftBatchR2 = @('Register-QuietLeaseRenewOk', 'Get-QuietLeaseRenewOkGapSec')
 $batchLifted = [System.Collections.Generic.List[string]]::new()
-foreach ($name in $liftBatch) {
+foreach ($name in $liftBatch + $liftBatchR2) {
     $fn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $true)
     if ($null -ne $fn) { . ([scriptblock]::Create($fn.Extent.Text)); $batchLifted.Add($name) }
 }
@@ -202,6 +206,8 @@ $script:QuietLease = $null
 $script:QuietLeaseWaiting = $null
 $script:LeaseBatch = $null
 $script:LeaseBatchKeep = $false
+# lease-batch r2: heavy-slot.py's renew_stale_s, as the agent assigns it (asserted in the demoted case).
+$script:LeaseRenewStaleSec = 120
 $script:Admission = $null
 # The agent's label constant, read from its own assignment (not restated here).
 $labelAst = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$script:QuietLeaseLabel' }, $true)
@@ -494,6 +500,40 @@ try {
     Stop-StaleQuietLeases
     Assert-True ((Wait-Until { -not (Test-PidAlive $pb.lease.pid) } 8) -and -not (Test-Path -LiteralPath $pb.lease.recordFile)) "batch: a successor agent ends a dead agent's parked lease (Stop-StaleQuietLeases)"
     try { $pb.lease.proc.Dispose() } catch { }
+
+    # ------------------------------------------------------------ batch r2: a renew gap over 120 s (heavy-slot.py's demotion) ends the lease for the batch
+    # The caps: renew about every 60 s; after 120 s with no renew the lease is demoted and other heavy runs may join. A parked
+    # lease that had such a gap is released (demoted), and the next leg of its batch is never admitted on it.
+    Reset-Case @{ request = 'active' }
+    $pb = Start-ParkedBatch 'aaaaaaaaaaa9'
+    # 130 s since the last renew that succeeded (Add-Member, so the RED run on an agent without the field reaches the assertion)
+    $pb.lease | Add-Member -NotePropertyName lastRenewOkStart -NotePropertyValue (Get-Date).AddSeconds(-130) -Force; $pb.lease.lastRenewStart = Get-Date
+    Update-LeaseBatchHold
+    $ends.demotedParked = (Get-BatchEnds 'aaaaaaaaaaa9') -join ','
+    Assert-True ($null -eq $script:LeaseBatch -and $ends.demotedParked -ceq 'demoted') "batch r2: a parked lease with a renew gap over 120 s is released (demoted): '$($ends.demotedParked)'"
+
+    Reset-Case @{ request = 'active' }
+    $pb = Start-ParkedBatch 'aaaaaaaaaab0'
+    $pb.lease | Add-Member -NotePropertyName lastRenewOkStart -NotePropertyValue (Get-Date).AddSeconds(-130) -Force; $pb.lease.lastRenewStart = Get-Date
+    $adm = Wait-QuietLeaseAdmission -JobId 'dve-d-bachelor-cpu-1-lbaaaaaaaaaab0' -Job ([pscustomobject]@{}) -Metadata $meta
+    $script:Admission = $adm
+    $ends.demotedReuse = (Get-BatchEnds 'aaaaaaaaaab0') -join ','
+    Assert-True ($adm.leaseBatch.leaseId -cne $pb.lease.id -and -not $adm.leaseBatch.reused -and $ends.demotedReuse -ceq 'demoted') "batch r2: the next leg is never admitted on a demoted lease (it was released first: '$($ends.demotedReuse)'; the leg's lease $($adm.leaseBatch.leaseId), the batch's $($pb.lease.id))"
+    Assert-True ($null -ne $adm.leaseBatch.renewOkMaxGapSec -and $adm.leaseBatch.renewOkMaxGapSec -lt 60) "batch r2: a fresh batch admission carries its own renew-ok gap ($($adm.leaseBatch.renewOkMaxGapSec))"
+    Exit-HeavySlot
+    $rcptD = @(Get-Content -LiteralPath (Join-Path $fx 'lease-batch-aaaaaaaaaab0.jsonl') | ForEach-Object { $_ | ConvertFrom-Json })
+    Assert-True ($rcptD[0].renews.okMaxGapSec -ge 130 -and $rcptD[0].renews.staleSec -eq 120) "batch r2: the receipt types the gap that demoted it: $($rcptD[0].renews | ConvertTo-Json -Compress)"
+
+    foreach ($name in $liftBatchR2) { Assert-True ($batchLifted -contains $name) "batch r2: the agent defines $name" }
+    # The gap is between SUCCESSFUL renews: a failed or slow renew does not reset it; activation counts as the first.
+    $fake = [pscustomobject]@{ activeAt = (Get-Date).AddSeconds(-50); lastRenewOkStart = $null; renewOkMaxGapSec = 0 }
+    Register-QuietLeaseRenewOk -Lease $fake -CallStarted (Get-Date)
+    $g1 = Get-QuietLeaseRenewOkGapSec -Lease $fake
+    $fake.lastRenewOkStart = (Get-Date).AddSeconds(-125)
+    $g2 = Get-QuietLeaseRenewOkGapSec -Lease $fake
+    Assert-True ($fake.renewOkMaxGapSec -ge 49 -and $fake.renewOkMaxGapSec -lt 55 -and $g1 -ge 49 -and $g2 -ge 125 -and $null -eq (Get-QuietLeaseRenewOkGapSec -Lease ([pscustomobject]@{ activeAt = $null }))) "batch r2: renew-ok gap: first success after activation $($fake.renewOkMaxGapSec) s, open gap counted ($g2 s)"
+    Assert-True ($agentText -match '\$script:LeaseRenewStaleSec = 120\b') "batch r2: the agent's demotion bound is heavy-slot.py's 120 s"
+    Assert-True ((Get-FunctionBody 'Update-QuietLeaseRenew').Contains('Register-QuietLeaseRenewOk -Lease $Lease -CallStarted $c.started') -and (Get-FunctionBody 'Confirm-QuietLeaseHeldForLaunch').Contains('Register-QuietLeaseRenewOk -Lease $l -CallStarted $preLaunchStart')) "batch r2: both successful renew paths (the tick and the pre-launch proof) record the gap"
     $results.batchEnds = $ends
 
     # ------------------------------------------------------------ batch: the wiring in Invoke-QueuedJob and the inbox loop

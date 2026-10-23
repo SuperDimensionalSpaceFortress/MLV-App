@@ -82,7 +82,15 @@ if ($JobId -like 'lease-batch-open-*') {
         leaseRefusals = @([ordered]@{ reason = 'refused'; rc = 75; why = 'quiet lease cooldown' }) }
     if ($mode -ne 'nobatch') { $adm['leaseBatch'] = [ordered]@{ token = $token; leaseId = $lid; seq = 1; reused = $false; untilEpoch = $now.ToUnixTimeSeconds() + $remain; remainingSec = $remain } }
     [pscustomobject]@{ opens = $n + 1; leaseId = $lid; token = $token } | ConvertTo-Json | Set-Content -LiteralPath $stateFile
-    return [pscustomobject]@{ jobId = $JobId; exitCode = 0; endedUtc = $now.ToString('o'); admission = [pscustomobject]$adm; stdout = 'LEASE_BATCH_OPEN' }
+    $res = [pscustomobject]@{ jobId = $JobId; exitCode = 0; endedUtc = $now.ToString('o'); admission = [pscustomobject]$adm; stdout = 'LEASE_BATCH_OPEN' }
+    if ($mode -eq 'gatewait') {
+        # um-run gave up while the agent still held the open in its gate (exit-75 refusals); the agent admits it later and its result lands by name.
+        $outbox = Join-Path $AgentShare 'outbox'
+        New-Item -ItemType Directory -Force -Path $outbox | Out-Null
+        $res | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $outbox "$JobId.result.json")
+        throw "UNRESOLVED: $JobId was held unlaunched in the agent's heavy-slot admission gate (fake) for the full -MaxAdmissionWaitSec"
+    }
+    return $res
 }
 if ($JobId -like 'lease-batch-close-*') {
     $logs = Join-Path $AgentShare 'logs'
@@ -119,6 +127,9 @@ $remain = [int](Pick $env:FAKE_LEG_REMAIN $k '2600')
 $outbox = Join-Path $share 'outbox'
 New-Item -ItemType Directory -Force -Path $outbox | Out-Null
 $res = [ordered]@{ jobId = $jobId; exitCode = 0; endedUtc = $now.ToString('o'); admission = [ordered]@{ mode = 'lease'; label = 'clear'; leaseBatch = [ordered]@{ token = $LeaseBatch; leaseId = $lid; seq = $k + 2; reused = $true; untilEpoch = $now.ToUnixTimeSeconds() + $remain } } }
+# the agent's renew record at the leg's end: okMaxGapSec from FAKE_LEG_GAPS (default 3 s; 'none' = no record)
+$gap = Pick $env:FAKE_LEG_GAPS $k '3'
+if ($gap -ne 'none') { $res.admission['leaseRenew'] = [ordered]@{ intervalSec = 60; ok = 5; okMaxGapSec = [double]$gap; staleSec = 120 } }
 $res | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $outbox "$jobId.result.json")
 $id = [guid]::NewGuid().ToString()
 $rdir = Join-Path $env:FAKE_LEG_ROOT "receipts\CARD-1\$leaf\$Venue"
@@ -178,7 +189,9 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
                 "-RunDir", str(self.run_dir), "-SourceCommit", SHA, "-BuildManifestSha256", MANIFEST, "-ClaimDir", str(self.claims),
                 "-QuietScript", str(self.tmp / "fake-quiet.ps1"), "-LegScript", str(self.tmp / "fake-leg.ps1"), "-UmRunScript", str(self.tmp / "fake-umrun.ps1"),
                 "-AgentShare", str(self.share), "-LegBudgetSec", "60", "-LeaseMarginSec", "0", "-ClaimPollSec", "1", "-RecheckSec", "1",
-                "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=240)), *extra]
+                "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=240)),
+                # Bachelor's 30 min cooldown is waited out between batches; the offline cases (a stub um-run) relax it unless they test it
+                *(() if "-LeaseCooldownSec" in extra else ("-LeaseCooldownSec", "0")), *extra]
         return subprocess.run(args, capture_output=True, text=True, timeout=600, env=e)
 
     def kinds(self) -> list[str]:
@@ -323,6 +336,114 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         [b] = self.batches()
         self.assertEqual((b["legs"][0]["class"], b["legs"][0]["counted"], b["legsRan"], b["legsCounted"]), ("QUIET_PRELOAD_HIGH", False, 1, 0))
+
+    # ---------------------------------------------------------------- r2: Bachelor's lease caps (CAPS-ADDENDUM 2026-10-23), each a BLOCKER for the keys
+    def test_a_renew_gap_over_120_s_demotes_the_lease_and_the_legs_after_it_are_uncounted(self) -> None:
+        # leg 1 ends with 3 s between successful renews; by leg 2's end there was a 130 s gap (heavy-slot.py demoted the lease): leg 2 is typed
+        # LEASE_DEMOTED, never counted, the batch ends, and leg 3 runs in a fresh batch.
+        r = self.run_batch(self.specs, FAKE_LEG_GAPS="3,130,3")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        b1, b2 = self.batches()
+        self.assertEqual([(l["class"], l["counted"]) for l in b1["legs"]], [("QUIET_PRELOAD_OK", True), ("LEASE_DEMOTED", False)])
+        self.assertEqual((b1["endReason"], b1["legsRan"], b1["legsCounted"], b1["renewOkMaxGapSec"]), ("LEASE_DEMOTED", 2, 1, 130.0))
+        self.assertEqual(b1["legs"][1]["renewOkMaxGapSec"], 130.0)
+        self.assertEqual((b2["legsRan"], b2["legsCounted"], b2["endReason"]), (1, 1, "ALL_LEGS_DONE"))
+        self.assertEqual((batch_result(r.stdout)["ran"], batch_result(r.stdout)["counted"]), (3, 2))
+        # no JobId twice in one run (test_attr3_footage_stage.py's same-JobId premise for this um-run caller): two batches, four distinct jobs
+        jobs = [l.split(" ", 3)[2] for l in self.events_raw() if " UMRUN " in l]
+        self.assertEqual((len(jobs), len(set(jobs))), (4, 4), jobs)
+
+    def test_a_leg_with_no_renew_record_is_never_counted(self) -> None:
+        r = self.run_batch([self.specs[0]], FAKE_LEG_GAPS="none")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        [b] = self.batches()
+        self.assertEqual((b["legs"][0]["class"], b["legs"][0]["counted"], b["endReason"]), ("LEASE_RENEW_UNKNOWN", False, "LEASE_RENEW_UNKNOWN"))
+
+    def test_exit_75_refusals_are_typed_wait_and_retry_not_a_failure(self) -> None:
+        r = self.run_batch([self.specs[0]])
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        [b] = self.batches()
+        self.assertEqual((b["exit75Refusals"], b["exit75Class"]), (1, "WAIT_RETRY"))
+        self.assertEqual(b["legsCounted"], 1)
+
+    def test_an_open_still_waiting_in_the_agent_gate_is_read_by_name_not_failed(self) -> None:
+        # um-run stops UNRESOLVED while the agent still holds the open in its gate (exit-75 refusals); the runner waits for the open's result by
+        # name instead of stopping with exit 9, and the batch runs.
+        r = self.run_batch([self.specs[0]], FAKE_OPEN_MODES="gatewait")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        [b] = self.batches()
+        self.assertEqual((b["openOutcome"], b["openLeaseWait"], b["exit75Class"], b["legsCounted"]), ("RECEIPT_BY_NAME", "EXIT_75_WAIT", "WAIT_RETRY", 1))
+        self.assertEqual(len([x for x in self.kinds() if x.startswith("OPEN:")]), 1, "the open is never resubmitted")
+
+    def test_the_cooldown_is_waited_out_before_the_next_open_and_without_the_claim(self) -> None:
+        r = self.run_batch(self.specs[:2], "-LeaseCooldownSec", "4", FAKE_LEASE_REMAIN="70,2700", FAKE_LEG_REMAIN="50,2600")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        b1, b2 = self.batches()
+        self.assertEqual(b1["preOpenWait"]["reason"], "NONE")
+        self.assertEqual(b2["preOpenWait"]["reason"], "COOLDOWN")
+        self.assertGreaterEqual(b2["preOpenWait"]["waitSec"], 1)
+        ticks = {}
+        for line in self.events_raw():
+            t, kind, rest = line.split(" ", 2)
+            if kind == "UMRUN":
+                ticks.setdefault(rest.split()[0].split("-")[2], []).append(int(t))
+        close1, open2 = ticks["close"][0], ticks["open"][1]
+        self.assertGreaterEqual((open2 - close1) / 1e7, 3.5, "the second open came inside the cooldown")
+        log = (self.run_dir / "batch.log").read_text(encoding="utf-8")
+        self.assertLess(log.index(" BATCH_WAIT batch=2 reason=COOLDOWN"), log.index(" CLAIM_TAKEN batch=2 "), "the claim was held through the cooldown")
+        rows = [json.loads(l) for l in (self.claims / "bachelor.lease-ledger.jsonl").read_text(encoding="utf-8").splitlines() if l.strip()]
+        self.assertEqual([x["leaseId"] for x in rows], ["lease-1", "lease-2"], "every lease this runner took is in the venue's ledger")
+
+    def test_the_3_hour_budget_from_an_earlier_run_is_waited_out_or_typed_at_the_deadline(self) -> None:
+        # an earlier run's two 45-min leases (ledger) leave no room for a third in this 3 h window: the runner never opens, and says why.
+        self.claims.mkdir(parents=True, exist_ok=True)
+        now = datetime.now(timezone.utc)
+        rows = [{"venue": "bachelor", "leaseId": "old-1", "startUtc": utc_iso(now - timedelta(minutes=105)), "endUtc": utc_iso(now - timedelta(minutes=60))},
+                {"venue": "bachelor", "leaseId": "old-2", "startUtc": utc_iso(now - timedelta(minutes=45)), "endUtc": utc_iso(now - timedelta(minutes=1))}]
+        (self.claims / "bachelor.lease-ledger.jsonl").write_text("".join(json.dumps(x) + "\n" for x in rows), encoding="utf-8")
+        r = self.run_batch([self.specs[0]])
+        self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+        [b] = self.batches()
+        self.assertEqual((b["endReason"], b["preOpenWait"]["reason"]), ("DEADLINE", "BUDGET"))
+        self.assertIn("lease-budget-wait", b["endDetail"])
+        # the first lease leaves the window ending at open + 45 min only about 75 min from now; old-2 (44 min) is still in it then
+        self.assertGreater(b["preOpenWait"]["waitSec"], 4000)
+        self.assertGreater(b["preOpenWait"]["usedSec"], 2500)
+        self.assertEqual(self.kinds(), [], "nothing is submitted when the budget has no room before the deadline")
+
+    def test_the_caps_cannot_be_relaxed_against_the_real_um_run(self) -> None:
+        base = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(RUNNER), "-LegSpec", str(self.specs[0]), "-RunDir", str(self.run_dir),
+                "-SourceCommit", SHA, "-BuildManifestSha256", MANIFEST, "-ClaimDir", str(self.claims), "-QuietScript", str(self.tmp / "fake-quiet.ps1"),
+                "-LegScript", str(self.tmp / "fake-leg.ps1"), "-AgentShare", str(self.share)]
+        for extra, needle in ((["-LeaseCooldownSec", "0"], "LEASE_CAP_RELAXED"), (["-LeaseBudgetWindowSec", "3600"], "LEASE_CAP_RELAXED"),
+                              (["-LeaseCapSec", "2701"], "LeaseCapSec"), (["-RenewGapMaxSec", "121"], "RenewGapMaxSec"), (["-LeaseBudgetSec", "5401"], "LeaseBudgetSec")):
+            with self.subTest(extra=extra):
+                out = subprocess.run(base + extra, capture_output=True, text=True, timeout=120)
+                self.assertNotEqual(out.returncode, 0, out.stdout + out.stderr)
+                self.assertIn(needle, out.stdout + out.stderr)
+        self.assertFalse(self.claim_path.exists())
+        self.assertFalse(self.events.exists(), "nothing was submitted")
+
+    def test_the_budget_wait_rule(self) -> None:
+        # Get-VenueLeaseBudgetWait: a lease is opened only when the 3 h window ending at its LAST possible second (open + 45 min) holds at most
+        # 90 min of leased time, and never within 30 min of the last lease's end.
+        now = datetime(2026, 10, 23, 12, 0, tzinfo=timezone.utc)
+        def m(x: float) -> str:
+            return utc_iso(now + timedelta(minutes=x))
+        cases = {"none": [], "cooldown": [(m(-40), m(-10))], "budget": [(m(-120), m(-75)), (m(-45), m(0))], "old": [(m(-400), m(-355))]}
+        script = f"Import-Module '{MODULE}' -Force -DisableNameChecking\n$now = '{utc_iso(now)}'\n$o = [ordered]@{{}}\n"
+        for name, leases in cases.items():
+            arr = ", ".join(f"[pscustomobject]@{{ startUtc = '{s}'; endUtc = '{e}' }}" for s, e in leases)
+            script += f"$w = Get-VenueLeaseBudgetWait -Leases @({arr}) -NowUtc $now; $o['{name}'] = [ordered]@{{ reason = $w.reason; waitSec = $w.waitSec; usedSec = $w.usedSec }}\n"
+        script += "$o | ConvertTo-Json -Compress -Depth 4\n"
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        got = json.loads(out.stdout)
+        self.assertEqual(got["none"], {"reason": "NONE", "waitSec": 0, "usedSec": 0})
+        self.assertEqual((got["cooldown"]["reason"], got["cooldown"]["waitSec"]), ("COOLDOWN", 1200))
+        # leases at -120..-75 and -45..0 min: the cooldown ends at +30, and the first lease leaves the window ending at open + 45 only at +60
+        self.assertEqual((got["budget"]["reason"], got["budget"]["waitSec"], got["budget"]["usedSec"]), ("BUDGET", 3600, 2700))
+        self.assertEqual(got["old"], {"reason": "NONE", "waitSec": 0, "usedSec": 0})
 
     # ---------------------------------------------------------------- the job-id contract with the agent
     def test_invoke_venue_leg_tags_its_job_with_the_batch_token_the_agent_reads(self) -> None:
