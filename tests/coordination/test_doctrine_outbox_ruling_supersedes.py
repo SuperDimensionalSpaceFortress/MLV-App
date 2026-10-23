@@ -15,6 +15,7 @@ import os
 import re
 import subprocess
 import sys
+import warnings
 from pathlib import Path
 
 import pytest
@@ -1198,6 +1199,7 @@ def test_nlf_a_missing_tip_commit_is_unknown_and_not_fetched(tmp_path):
 
 
 def test_nlf_every_bus_git_call_on_the_route_ruling_path_sets_no_lazy_fetch(tmp_path, monkeypatch):
+    monkeypatch.setattr(ob, "git_version_text", lambda: "git version 2.44.0")   # a call-level check: it must run on any real git
     bus = _promisor_bus(tmp_path)
     seen: list[tuple[list[str], str | None]] = []
     real = subprocess.run
@@ -1214,12 +1216,119 @@ def test_nlf_every_bus_git_call_on_the_route_ruling_path_sets_no_lazy_fetch(tmp_
     assert not unguarded, "bus git calls without GIT_NO_LAZY_FETCH=1: " + "; ".join(unguarded)
 
 
-def test_nlf_a_promisor_bus_that_holds_every_object_answers_as_a_full_clone_does(tmp_path, capsys):
+def test_nlf_a_promisor_bus_that_holds_every_object_answers_as_a_full_clone_does(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(ob, "git_version_text", lambda: "git version 2.44.0")   # the answer, not the old-git refusal, is under test
     bus = _promisor_bus(tmp_path)
     rc, err = validate(tmp_path, candidate("touches/supersedes: R15, R14.8, tools/fleet-sweep.mjs, specs/mlv-app, specs/mlv-app/cards.md\n"), bus, capsys)
     assert rc == 0 and err == "", err
     rc, err = validate(tmp_path, candidate("touches/supersedes: R99, tools/nope.mjs\n"), bus, capsys)
     assert rc == 1 and "RULING_CANDIDATE_TARGET_NOT_ON_BUS" in err and "'R99'" in err and "'tools/nope.mjs'" in err, err
+
+
+# ---------- ROUTE-RULING-NLF-OLD-GIT-REFUSE-1: a git that ignores GIT_NO_LAZY_FETCH must not be trusted to honour it ----------
+# Before 2.44 git ignores the variable, so on a partial (promisor) bus the guard silently does nothing and a read can still
+# lazy-fetch. The lookup then ends UNKNOWN GIT_TOO_OLD_FOR_NO_LAZY_FETCH, naming the found and the required version, before
+# any bus object is read. A bus that holds every object (no promisor remote) has nothing to lazy-fetch and is read as before.
+# The version is injected through `ob.git_version_text`; no test needs a real old git.
+
+OLD_GIT_CODE = "GIT_TOO_OLD_FOR_NO_LAZY_FETCH"
+RESOLVABLE = "touches/supersedes: R15, tools/fleet-sweep.mjs\n"
+
+
+def _pretend_git(monkeypatch, text: str) -> None:
+    monkeypatch.setattr(ob, "git_version_text", lambda: text, raising=False)
+
+
+def _refused_for_old_git(tmp_path: Path, bus: Path) -> ob.Unknown:
+    with pytest.raises(ob.Unknown) as caught:
+        call_validate([write_item(tmp_path, candidate(RESOLVABLE))], bus)
+    return caught.value
+
+
+@pytest.mark.parametrize("reported, found", [("git version 2.40.0.windows.1", "2.40.0"), ("git version 2.43.5", "2.43.5"), ("git version 1.9.1", "1.9.1")])
+def test_nlf_old_git_on_a_promisor_bus_is_refused_with_the_versions_named(tmp_path, monkeypatch, reported, found):
+    bus = _promisor_bus(tmp_path)
+    _pretend_git(monkeypatch, reported)
+    error = _refused_for_old_git(tmp_path, bus)
+    assert error.code == OLD_GIT_CODE, error
+    assert found in error.detail and "2.44" in error.detail, error.detail
+
+
+def test_nlf_old_git_is_refused_before_any_bus_object_is_read(tmp_path, monkeypatch):
+    bus = _promisor_bus(tmp_path)
+    _pretend_git(monkeypatch, "git version 2.40.0.windows.1")
+    reads: list[list[str]] = []
+    real = subprocess.run
+    monkeypatch.setattr(ob.subprocess, "run", lambda cmd, *a, **k: (reads.append(cmd), real(cmd, *a, **k))[1])
+    error = _refused_for_old_git(tmp_path, bus)
+    assert error.code == OLD_GIT_CODE, error
+    object_reads = [c for c in reads if isinstance(c, list) and any(v in c for v in ("rev-parse", "cat-file", "ls-tree"))]
+    assert not object_reads, f"a bus object was read on a git that cannot guard it: {object_reads}"
+
+
+@pytest.mark.parametrize("reported", ["", "git", "git version", "git version unknown", "garbage 2.44.0 rest", "git version 2"])
+def test_nlf_an_unparseable_git_version_is_refused_the_same_way(tmp_path, monkeypatch, reported):
+    bus = _promisor_bus(tmp_path)
+    _pretend_git(monkeypatch, reported)
+    error = _refused_for_old_git(tmp_path, bus)
+    assert error.code == OLD_GIT_CODE and "unparseable" in error.detail and "2.44" in error.detail, error
+
+
+def test_nlf_a_git_that_cannot_be_run_for_its_version_is_refused_the_same_way(tmp_path, monkeypatch):
+    bus = _promisor_bus(tmp_path)
+
+    def broken() -> str:
+        raise OSError("no git on PATH")
+
+    monkeypatch.setattr(ob, "git_version_text", broken, raising=False)
+    error = _refused_for_old_git(tmp_path, bus)
+    assert error.code == OLD_GIT_CODE and "unparseable" in error.detail, error
+
+
+@pytest.mark.parametrize("reported", ["git version 2.44.0", "git version 2.44.0.windows.1", "git version 2.51.2", "git version 3.0.0"])
+def test_nlf_a_git_that_honours_the_variable_behaves_exactly_as_before(tmp_path, capsys, monkeypatch, reported):
+    bus = _promisor_bus(tmp_path)
+    _pretend_git(monkeypatch, reported)
+    rc, err = validate(tmp_path, candidate("touches/supersedes: R15, R14.8, tools/fleet-sweep.mjs, specs/mlv-app\n"), bus, capsys)
+    assert rc == 0 and err == "", err
+    rc, err = validate(tmp_path, candidate("touches/supersedes: R99\n"), bus, capsys)
+    assert rc == 1 and "RULING_CANDIDATE_TARGET_NOT_ON_BUS" in err, err
+
+
+def test_nlf_old_git_on_a_bus_with_no_promisor_remote_is_read_as_before(tmp_path, capsys, monkeypatch):
+    bus = make_bus(tmp_path)   # a full local repository: every object is held, so nothing can be lazy-fetched
+    _pretend_git(monkeypatch, "git version 2.40.0.windows.1")
+    rc, err = validate(tmp_path, candidate(RESOLVABLE), bus, capsys)
+    assert rc == 0 and err == "", err
+
+
+def test_nlf_the_version_is_probed_once_per_process(tmp_path, monkeypatch):
+    bus = _promisor_bus(tmp_path)
+    ob.git_version_text.cache_clear()   # the probe is cached per process; this test reads the real one
+    seen: list[list[str]] = []
+    real = subprocess.run
+    monkeypatch.setattr(ob.subprocess, "run", lambda cmd, *a, **k: (seen.append(cmd), real(cmd, *a, **k))[1])
+    for _ in range(3):
+        try:
+            call_validate([write_item(tmp_path, candidate(RESOLVABLE))], bus)
+        except ob.Unknown:
+            pass   # a real git older than 2.44 refuses; the count is the same
+    assert sum(1 for c in seen if c == ["git", "--version"]) == 1, seen
+
+
+def test_nlf_the_running_git_version_is_recorded_in_the_log(record_property):
+    """Never skips. Hosted CI's git version is then in its log whichever side of 2.44 it falls (the behavioural checks above
+    skip on an old git, so without this a green run would not say which half of the suite ran)."""
+    text = ob.git_version_text()
+    version = ob.parse_git_version(text)
+    honours = version is not None and version >= ob.NO_LAZY_FETCH_MIN_GIT
+    line = f"[nlf] running git: {text.strip()!r} parsed={version} honours_GIT_NO_LAZY_FETCH(>=2.44)={honours}"
+    print(line)
+    record_property("running_git", text.strip())
+    record_property("honours_no_lazy_fetch", honours)
+    if not honours:
+        warnings.warn(line + " -- the nlf behavioural tests are SKIPPED on this git", stacklevel=1)
+    assert version is not None, f"the running git reports an unparseable version: {text!r}"
 
 
 # ---------- ROUTE-RULING-CITATION-STATUS-WORD-COLON-1 + ROUTE-RULING-CITATION-SELF-PATH-STATUS-1: what a citation is NOT ----------
