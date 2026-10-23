@@ -745,26 +745,42 @@ TEST(AvxParityRunner, RunsSharingATempRootNeverShareOrRemoveEachOthersFiles)
     ASSERT_TRUE(QDir(root.path()).entryList(QDir::AllEntries | QDir::NoDotAndDotDot | QDir::Hidden).isEmpty());
 }
 
-// Marks its own start, waits until the peer run has marked its start, then writes a hash json naming
-// itself and exits 0. If the peer has not started within `peer_wait_seconds` it exits 9, so two such
-// runs only both pass when they are alive at the same time.
+// The filler line an overlapping run prints over and over; it names the run, so any of it found in
+// the other run's output came from the wrong child.
+static QByteArray overlap_filler_tag(const QString & label)
+{
+    return ("AVX_OVERLAP_FILL " + label + " ").toUtf8();
+}
+
+// How many filler lines an overlapping run prints. Each line is the tag five times, so 1000 lines
+// come to more than 100 KB, well past what the parent keeps.
+static const int kOverlapFillerLines = 1000;
+
+// Marks its own start, waits until the peer run has marked its start, prints its filler lines, then
+// its marker last, writes a hash json naming itself and exits 0. If the peer has not started within
+// `peer_wait_seconds` it exits 9, so two such runs only both pass when they are alive at the same time.
 static QStringList overlapping_run_arguments(const QString & label,
                                              const QString & own_started,
                                              const QString & peer_started,
                                              const QString & output_path,
                                              int peer_wait_seconds)
 {
+    const QString filler = QString::fromUtf8(overlap_filler_tag(label));
     return stand_in_arguments(
         QStringLiteral("New-Item -ItemType File -Path '%2' | Out-Null; $deadline = (Get-Date).AddSeconds(%5); "
                        "while (-not (Test-Path -LiteralPath '%3')) { if ((Get-Date) -gt $deadline) { "
                        "[Console]::Out.WriteLine('AVX_OVERLAP_PEER_NEVER_STARTED %1'); exit 9 }; Start-Sleep -Milliseconds 50 }; "
+                       "$line = '%6' * 5; for ($i = 0; $i -lt %7; $i++) { [Console]::Out.WriteLine($line) }; "
                        "[Console]::Out.WriteLine('AVX_OVERLAP_SAW_PEER %1'); "
                        "Set-Content -LiteralPath '%4' -Value '{\"label\":\"%1\"}'; exit 0")
-            .arg(label, own_started, peer_started, output_path, QString::number(peer_wait_seconds)),
+            .arg(label, own_started, peer_started, output_path, QString::number(peer_wait_seconds), filler,
+                 QString::number(kOverlapFillerLines)),
         QStringLiteral(": > '%2'; i=0; while [ ! -e '%3' ]; do if [ $i -ge %5 ]; then "
                        "echo 'AVX_OVERLAP_PEER_NEVER_STARTED %1'; exit 9; fi; sleep 0.1; i=$((i+1)); done; "
+                       "line='%6%6%6%6%6'; i=0; while [ $i -lt %7 ]; do echo \"$line\"; i=$((i+1)); done; "
                        "echo 'AVX_OVERLAP_SAW_PEER %1'; printf '{\"label\":\"%1\"}' > '%4'; exit 0")
-            .arg(label, own_started, peer_started, output_path, QString::number(peer_wait_seconds * 10)));
+            .arg(label, own_started, peer_started, output_path, QString::number(peer_wait_seconds * 10), filler,
+                 QString::number(kOverlapFillerLines)));
 }
 
 // Two runner calls on two threads, each running its own helper process against one shared temp root,
@@ -842,6 +858,17 @@ TEST(AvxParityRunner, OverlappingHelperRunsKeepTheirOwnOutputsAndRemoveTheirScra
             ASSERT_TRUE(run.result.ok());
             // The helper saw its peer's start mark before it finished, so the two processes overlapped.
             ASSERT_TRUE(run.result.output.contains(("AVX_OVERLAP_SAW_PEER " + run.label).toUtf8()));
+        }
+        // Each run printed more than the parent keeps, so what it kept is a bounded tail of that run's
+        // output alone: its own filler and marker, and not one line of the peer's.
+        for (int index = 0; index < 2; ++index) {
+            const Run & run = runs[index];
+            const Run & peer = runs[1 - index];
+            ASSERT_TRUE(run.result.output_total_bytes > kRetainedOutputBytes);
+            ASSERT_TRUE(run.result.output.contains(overlap_filler_tag(run.label)));
+            ASSERT_FALSE(run.result.output.contains(overlap_filler_tag(peer.label)));
+            ASSERT_FALSE(run.result.output.contains(("AVX_OVERLAP_SAW_PEER " + peer.label).toUtf8()));
+            ASSERT_TRUE(run.result.output.size() <= kRetainedOutputBytes);
         }
         // Each runner call started before the other one returned.
         ASSERT_TRUE(runs[0].start_ms < runs[1].end_ms);
