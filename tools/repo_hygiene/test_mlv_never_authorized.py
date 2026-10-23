@@ -4611,6 +4611,91 @@ CASES = [
         "reason_contains": "walks out of the worktree with `..`",
         "fixture": "lane_prompt_unset",
     },
+    # (xi) A REDIRECT NESTED INSIDE A QUOTED SHELL PAYLOAD IS STILL A WRITE (HOOK-NA7-NESTED-
+    # SHELL-REDIRECT-DENY-ROW-1).  `_REDIRECT_DEST_RX` is quote-blind on purpose: it scans the
+    # WHOLE command text, so the `>` inside `pwsh -Command "..."` or `cmd /c "..."` is found
+    # exactly like a bare one, and its destination is judged by the ordinary NA-7 roots.  No
+    # row pinned that, so a quote-aware rewrite of the regex -- one that treats a quoted
+    # region as opaque text -- would have turned all four shapes into ALLOW with the suite
+    # green.  Each shape is measured on BOTH shell tools, because a quote-aware change could
+    # land in either tool's payload path.
+    #
+    # Every destination is `{OUTSIDE}`, a tmp tree that is neither the worktree nor the
+    # board, and the arm is pinned by its reason text so a different rule refusing the same
+    # string cannot stand in for it.  Shapes: (a) double-quoted `>`, (b) single-quoted `>>`,
+    # (c) `cmd /c` with a double-quoted `>`, (d) `cmd /c` with an inner `2>`.
+    {
+        "name": "na7 nested a pwsh -Command double-quoted inner redirect outside via PowerShell",
+        "group": "na7nested",
+        "tool": "PowerShell",
+        "input": {"command": 'pwsh -Command "echo hello > {OUTSIDE}/stray.txt"'},
+        "expect": "DENY",
+        "na": "NA-7",
+        "reason_contains": "outside both the worktree and the board root",
+    },
+    {
+        "name": "na7 nested a pwsh -Command double-quoted inner redirect outside via Bash",
+        "group": "na7nested",
+        "tool": "Bash",
+        "input": {"command": 'pwsh -Command "echo hello > {OUTSIDE}/stray.txt"'},
+        "expect": "DENY",
+        "na": "NA-7",
+        "reason_contains": "outside both the worktree and the board root",
+    },
+    {
+        "name": "na7 nested b pwsh -Command single-quoted inner append outside via PowerShell",
+        "group": "na7nested",
+        "tool": "PowerShell",
+        "input": {"command": "pwsh -Command 'echo hello >> {OUTSIDE}/stray.txt'"},
+        "expect": "DENY",
+        "na": "NA-7",
+        "reason_contains": "outside both the worktree and the board root",
+    },
+    {
+        "name": "na7 nested b pwsh -Command single-quoted inner append outside via Bash",
+        "group": "na7nested",
+        "tool": "Bash",
+        "input": {"command": "pwsh -Command 'echo hello >> {OUTSIDE}/stray.txt'"},
+        "expect": "DENY",
+        "na": "NA-7",
+        "reason_contains": "outside both the worktree and the board root",
+    },
+    {
+        "name": "na7 nested c cmd /c double-quoted inner redirect outside via PowerShell",
+        "group": "na7nested",
+        "tool": "PowerShell",
+        "input": {"command": 'cmd /c "echo hello > {OUTSIDE}/stray.txt"'},
+        "expect": "DENY",
+        "na": "NA-7",
+        "reason_contains": "outside both the worktree and the board root",
+    },
+    {
+        "name": "na7 nested c cmd /c double-quoted inner redirect outside via Bash",
+        "group": "na7nested",
+        "tool": "Bash",
+        "input": {"command": 'cmd /c "echo hello > {OUTSIDE}/stray.txt"'},
+        "expect": "DENY",
+        "na": "NA-7",
+        "reason_contains": "outside both the worktree and the board root",
+    },
+    {
+        "name": "na7 nested d cmd /c inner stderr redirect outside via PowerShell",
+        "group": "na7nested",
+        "tool": "PowerShell",
+        "input": {"command": 'cmd /c "dir nope 2> {OUTSIDE}/err.txt"'},
+        "expect": "DENY",
+        "na": "NA-7",
+        "reason_contains": "outside both the worktree and the board root",
+    },
+    {
+        "name": "na7 nested d cmd /c inner stderr redirect outside via Bash",
+        "group": "na7nested",
+        "tool": "Bash",
+        "input": {"command": 'cmd /c "dir nope 2> {OUTSIDE}/err.txt"'},
+        "expect": "DENY",
+        "na": "NA-7",
+        "reason_contains": "outside both the worktree and the board root",
+    },
     # ------------------------------------------------------- the 6 benign ALLOW controls
     {
         "name": "benign git push fork product branch",
