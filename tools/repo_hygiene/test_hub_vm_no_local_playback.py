@@ -28,6 +28,7 @@ import random
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -4301,7 +4302,8 @@ class LintDifferentialPinTests(unittest.TestCase):
 
         spawns = len(_PWSH_SPAWNS)
         try:
-            with mock.patch.dict(globals(), {"_start_shards": start_nothing, "_collect_shards": collect_fails}):
+            with mock.patch.object(sys.modules[__name__], "_start_shards", start_nothing), \
+                    mock.patch.object(sys.modules[__name__], "_collect_shards", collect_fails):
                 with self.assertRaises(AssertionError) as first:
                     _corpus_counts([LINT_PS1], rows, self.tmp, "w3")
                 self.assertEqual(1, len(starts), "the first call evaluates")
@@ -4781,8 +4783,8 @@ class LintCacheProbeBoundTests(unittest.TestCase):
     def test_the_cache_probe_runs_through_the_counted_helper_and_the_shared_bound(self):
         done = subprocess.CompletedProcess([], 0, stdout='[{"op":"state"}]', stderr="")
         before = len(_PWSH_SPAWNS)
-        with mock.patch.dict(globals(), {"LINT_PROBE_BOUND_SEC": 7}):
-            rows, run = self._probe_with(done, "bound")
+        with mock.patch.object(sys.modules[__name__], "LINT_PROBE_BOUND_SEC", 7):
+            rows, run =self._probe_with(done, "bound")
         self.assertEqual([{"op": "state"}], rows)
         self.assertEqual(["bound-probe.ps1"], _PWSH_SPAWNS[before:], "the probe must be counted in _PWSH_SPAWNS")
         timeout = run.call_args.kwargs["timeout"]
@@ -4812,8 +4814,8 @@ class LintCacheProbeBoundTests(unittest.TestCase):
         self.assertIn("END", message, "the tail of stderr, not its head, is what explains a failure")
 
     def test_a_probe_killed_at_the_bound_fails_typed_with_elapsed_and_bound(self):
-        with mock.patch.dict(globals(), {"LINT_PROBE_BOUND_SEC": 7}):
-            message = self._failure_of(subprocess.TimeoutExpired(["pwsh"], 7, output=None, stderr=b"half a line"), "fresh8")
+        with mock.patch.object(sys.modules[__name__], "LINT_PROBE_BOUND_SEC", 7):
+            message =self._failure_of(subprocess.TimeoutExpired(["pwsh"], 7, output=None, stderr=b"half a line"), "fresh8")
         for needle in ("fresh8", "timed out", "7 s", "half a line"):
             self.assertIn(needle, message)
 
@@ -4841,7 +4843,7 @@ class LintCacheProbeBoundTests(unittest.TestCase):
 
         Throwaway._class_cleanups = []
         self.addCleanup(lambda: [shutil.rmtree(d, ignore_errors=True) for d in made])
-        with mock.patch.dict(globals(), {"_cache_probe": mock.Mock(side_effect=AssertionError("probe boom"))}), \
+        with mock.patch.object(sys.modules[__name__], "_cache_probe", mock.Mock(side_effect=AssertionError("probe boom"))), \
                 mock.patch.object(tempfile, "mkdtemp", spy):
             try:
                 with self.assertRaises(AssertionError):

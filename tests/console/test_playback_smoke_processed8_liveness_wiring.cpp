@@ -302,6 +302,39 @@ TEST(Processed8TelemetryLiveness, Processed8AveragesDivideByTheMeasuredFrameCoun
         "\\s*:\\s*QStringLiteral\\(\"na\"\\);")).match(body).hasMatch());
 }
 
+TEST(Processed8TelemetryLiveness, EachAverageHelperPassesItsOwnMeasuredFrameCounterAsTheDivisor)
+{
+    // The guards above only forbid two spellings of a wrong divisor. A helper whose body is
+    // re-pointed at m_playbackSmokePresentedFrames would slip past them, so pin each helper's
+    // divisor identity: its body passes its own *MeasuredFrames member and nothing else.
+    const QString body = finishSmokeBody();
+    ASSERT_FALSE(body.isEmpty());
+
+    struct HelperPin
+    {
+        const char * anchor;
+        const char * ownCounter;
+    };
+    const HelperPin pins[] = {
+        { "const auto avgProcessed8MsText = [&]( double sum ) -> QString",
+          "m_playbackSmokeProcessed8MeasuredFrames" },
+        { "const auto avgProcessed16MsText = [&]( double sum ) -> QString",
+          "m_playbackSmokeProcessed16MeasuredFrames" },
+    };
+    for (const HelperPin & pin : pins)
+    {
+        const QString anchor = QString::fromLatin1(pin.anchor);
+        const QString counter = QString::fromLatin1(pin.ownCounter);
+        ASSERT_EQ(1, body.count(anchor));
+        const QString helper = bracedBlockAfter(body, anchor);
+        ASSERT_FALSE(helper.isEmpty());
+        ASSERT_TRUE(QRegularExpression(QStringLiteral(
+            "^\\{\\s*return avgMeasuredMsText\\( sum, %1 \\);\\s*\\}$").arg(counter))
+            .match(helper).hasMatch());
+        ASSERT_FALSE(helper.contains(QStringLiteral("m_playbackSmokePresentedFrames")));
+    }
+}
+
 TEST(Processed8TelemetryLiveness, MeasuredFrameCountersAreDeclaredAndResetPerSession)
 {
     const QString header = readRepoFile(QStringLiteral("platform/qt/MainWindow.h"));

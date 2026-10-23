@@ -311,10 +311,23 @@ $script:DvStartGate = $null
 # cleanup is real. DvNewPipeStream builds one parent-side pipe stream from a raw handle; a test swaps in one that throws.
 $script:DvNativeFault = @{}
 $script:DvNewPipeStream = { param([IntPtr]$h) [System.IO.Pipes.AnonymousPipeClientStream]::new([System.IO.Pipes.PipeDirection]::In, [Microsoft.Win32.SafeHandles.SafePipeHandle]::new($h, $true)) }
+# DV-GIT-NATIVE-START-UNASSIGNED-CHILD-CLEANUP-1, also empty in production. DvNativeSkipCall names the native calls (AssignProcessToJobObject,
+# CreatePipe, CreateProcessW) whose REAL call is not made when DvNativeFault also names them: the fault then happens BEFORE the call, so a child
+# stays genuinely outside the job (the fault alone lets the real assignment run first). DvNativeFaultHits records the names a fault was read
+# for. DvCleanupGate, $null in production, is called with (child pid, child process handle, job) as the failure cleanup of Start-DvGitInJob
+# begins: it sees the child's state at that moment.
+$script:DvNativeSkipCall = @{}
+$script:DvNativeFaultHits = [Collections.Generic.List[string]]::new()
+$script:DvCleanupGate = $null
+
+function Test-DvNativeSkipped {
+    param([Parameter(Mandatory)][string]$Name)
+    $script:DvNativeFault.ContainsKey($Name) -and $script:DvNativeSkipCall.ContainsKey($Name)
+}
 
 function Resolve-DvNativeResult {
     param([Parameter(Mandatory)][string]$Name, $Real)
-    if ($script:DvNativeFault.ContainsKey($Name)) { return $script:DvNativeFault[$Name] }
+    if ($script:DvNativeFault.ContainsKey($Name)) { $script:DvNativeFaultHits.Add($Name); return $script:DvNativeFault[$Name] }
     $Real
 }
 
@@ -358,11 +371,11 @@ function Start-DvGitInJob {
         $pipe = {
             param([bool]$ParentReads)
             [IntPtr]$r = [IntPtr]::Zero; [IntPtr]$w = [IntPtr]::Zero
-            if (-not $Native::CreatePipe([ref]$r, [ref]$w, $sa, [uint32]0)) { throw 'CreatePipe failed' }
+            if (-not (Resolve-DvNativeResult 'CreatePipe' $(if (Test-DvNativeSkipped 'CreatePipe') { $false } else { $Native::CreatePipe([ref]$r, [ref]$w, $sa, [uint32]0) }))) { throw 'CreatePipe failed' }
             $handles.Add($r); $handles.Add($w)
             # HANDLE_FLAG_INHERIT off on the parent's end: git inherits its own end only.
             $parent = $(if ($ParentReads) { $r } else { $w })
-            if (-not $Native::SetHandleInformation($parent, [uint32]1, [uint32]0)) { throw 'SetHandleInformation failed' }
+            if (-not (Resolve-DvNativeResult 'SetHandleInformation' $Native::SetHandleInformation($parent, [uint32]1, [uint32]0))) { throw 'SetHandleInformation failed' }
             @($r, $w)
         }
         $in = & $pipe $false; $out = & $pipe $true; $err = & $pipe $true
@@ -376,13 +389,13 @@ function Start-DvGitInJob {
         $cmdPtr = $m::StringToHGlobalUni($cmd); $mem.Add($cmdPtr)
         $envPtr = $m::StringToHGlobalUni($envText); $mem.Add($envPtr)
         # CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW, the parent's current directory, handles inherited (as Process.Start does).
-        if (-not $Native::CreateProcessW([IntPtr]::Zero, $cmdPtr, [IntPtr]::Zero, [IntPtr]::Zero, $true, [uint32](0x4 -bor 0x400 -bor 0x08000000), $envPtr, [IntPtr]::Zero, $si, $pi)) { throw 'CreateProcessW failed' }
+        if (-not (Resolve-DvNativeResult 'CreateProcessW' $(if (Test-DvNativeSkipped 'CreateProcessW') { $false } else { $Native::CreateProcessW([IntPtr]::Zero, $cmdPtr, [IntPtr]::Zero, [IntPtr]::Zero, $true, [uint32](0x4 -bor 0x400 -bor 0x08000000), $envPtr, [IntPtr]::Zero, $si, $pi) }))) { throw 'CreateProcessW failed' }
         $suspendedProcess = $m::ReadIntPtr($pi, 0); $suspendedThread = $m::ReadIntPtr($pi, 8); $childPid = $m::ReadInt32($pi, 16)
         $created = $true
         $proc = [System.Diagnostics.Process]::GetProcessById($childPid)
         if ($null -ne $script:DvStartGate) { & $script:DvStartGate }
         $step = 'DV_GIT_JOB_ASSIGN_FAILED'
-        if (-not (Resolve-DvNativeResult 'AssignProcessToJobObject' ($Native::AssignProcessToJobObject($Job, $suspendedProcess)))) { throw 'AssignProcessToJobObject returned false' }
+        if (-not (Resolve-DvNativeResult 'AssignProcessToJobObject' $(if (Test-DvNativeSkipped 'AssignProcessToJobObject') { $false } else { $Native::AssignProcessToJobObject($Job, $suspendedProcess) }))) { throw 'AssignProcessToJobObject returned false' }
         $step = 'DV_GIT_RESUME_FAILED'
         # ResumeThread returns the previous suspend count: 1 for the thread CREATE_SUSPENDED made (now running), -1 (0xFFFFFFFF) on failure,
         # and more than 1 when the thread stays suspended.
@@ -405,6 +418,7 @@ function Start-DvGitInJob {
             # one unwatched): terminate it and everything in its job, close the streams and the Process, and report a typed failure. Never a null,
             # which would make the caller start another git beside this one.
             $detail = $_.Exception.Message
+            if ($null -ne $script:DvCleanupGate) { try { & $script:DvCleanupGate $childPid $suspendedProcess $Job } catch { $null = $_ } }
             try { if ($null -ne $proc) { $proc.Kill($true) } else { [System.Diagnostics.Process]::GetProcessById($childPid).Kill($true) } } catch { $null = $_ }
             [void]$Native::TerminateJobObject($Job, [uint32]1)
             try { if ($null -ne $proc) { [void]$proc.WaitForExit(5000) } } catch { $null = $_ }

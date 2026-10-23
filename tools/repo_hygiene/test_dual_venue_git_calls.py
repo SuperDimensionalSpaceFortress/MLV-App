@@ -52,6 +52,13 @@ def _import(extra: str) -> str:
     return f"Import-Module '{MODULE}' -Force\n{extra}"
 
 
+def _is_git_spawn_trace(line: str) -> bool:
+    """One GIT_TRACE line that marks one git run. A built-in (`rev-parse`) logs `trace: built-in:`; a shell alias (`alias.x=!cmd`) is not a
+    built-in and logs `trace: exec: git-<alias>` instead, so counting only the first form read 0 for every alias run (DV-GIT-NATIVE-START-
+    UNASSIGNED-CHILD-CLEANUP-1 U3: the "at most one git" checks of the alias tests were vacuous)."""
+    return "trace: built-in:" in line or "trace: exec: git-" in line
+
+
 def _git(repo: Path, *args: str) -> str:
     return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, check=True, stdin=subprocess.DEVNULL).stdout.strip()
 
@@ -374,7 +381,7 @@ class GitCallsAreBoundedTests(unittest.TestCase):
     # one; the real call still runs, so the child exists and the cleanup has something to prove) and $script:DvNewPipeStream (builds one
     # parent-side pipe stream; a test swaps in one that throws).
     def run_native_fault(self, setup: str, git_args: str = "'rev-parse', '--is-inside-work-tree'", env_extra: dict[str, str] | None = None,
-                         trace: bool = False) -> tuple[str, list[str]]:
+                         trace: bool = False, after: str = "") -> tuple[str, list[str]]:
         repo = self.make_repo()
         env = dict(env_extra or {})
         trace_file = None
@@ -387,10 +394,11 @@ class GitCallsAreBoundedTests(unittest.TestCase):
             f"{setup}\n"
             f"try {{ $r = Invoke-DvGit -RepoRoot '{repo}' -GitArgs @({git_args}); Write-Output ('EXIT ' + $r.exitCode); Write-Output ('BYTES ' + $r.bytes.Length); Write-Output ('ERR ' + $r.stderr) }}\n"
             "catch { Write-Output ('THREW ' + $_.Exception.Message) }\n"
+            f"{after}\n"
             "Write-Output ('JOBS opened=' + $script:DvJobsOpened + ' closed=' + $script:DvJobsClosed)\n", env)
         spawns = []
         if trace_file is not None and trace_file.exists():
-            spawns = [line for line in trace_file.read_text(encoding="utf-8", errors="replace").splitlines() if "trace: built-in:" in line]
+            spawns = [line for line in trace_file.read_text(encoding="utf-8", errors="replace").splitlines() if _is_git_spawn_trace(line)]
         return out, spawns
 
     def assert_typed_refusal(self, out: str, token: str) -> None:
@@ -450,6 +458,113 @@ class GitCallsAreBoundedTests(unittest.TestCase):
         # I3: GetExitCodeProcess's return was dropped while the code started at 0, so a failed read looked like git exiting 0.
         out, _ = self.run_native_fault("$script:DvNativeFault = @{ GetExitCodeProcess = $false }")
         self.assert_typed_refusal(out, "DV_GIT_EXITCODE_FAILED")
+
+    # DV-GIT-NATIVE-START-UNASSIGNED-CHILD-CLEANUP-1 (Dot R18 advisory on #607). The seams added for it, all empty in production:
+    # $script:DvNativeSkipCall (a native call's name -> the real call is NOT made, only the DvNativeFault result is read; the child is then
+    # genuinely outside the job), $script:DvNativeFaultHits (the names a fault was read for: proof the fault fired) and $script:DvCleanupGate
+    # (called with the child's pid, process handle and the job as the failure cleanup starts: the child's state at that moment).
+    CHILD_PROBE_PS = (
+        "Add-Type -Namespace DvT -Name K -MemberDefinition '[System.Runtime.InteropServices.DllImport(\"kernel32.dll\")] "
+        "public static extern bool IsProcessInJob(System.IntPtr p, System.IntPtr j, out bool r);'\n"
+        "$script:Seen = @{}\n"
+        "$script:DvCleanupGate = { param($ChildPid, $Process, $Job)\n"
+        "  $r = $true; [void][DvT.K]::IsProcessInJob($Process, $Job, [ref]$r)\n"
+        "  $script:Seen = @{ pid = $ChildPid; inJob = $r; alive = (-not [Diagnostics.Process]::GetProcessById($ChildPid).HasExited) } }\n")
+    CHILD_REPORT_PS = (
+        "Write-Output ('HITS ' + (@($script:DvNativeFaultHits) -join ','))\n"
+        "Write-Output ('SEEN pid=' + $script:Seen.pid + ' injob=' + $script:Seen.inJob + ' alive=' + $script:Seen.alive)\n"
+        "$gone = $false\n"
+        "try { $gone = [Diagnostics.Process]::GetProcessById([int]$script:Seen.pid).HasExited } catch { $gone = $true }\n"
+        "Write-Output ('GONE ' + $gone)\n")
+
+    def assert_child_was_unassigned_alive_then_gone(self, out: str) -> None:
+        seen = re.search(r"SEEN pid=(\d{2,}) injob=(\w+) alive=(\w+)", out)
+        self.assertIsNotNone(seen, f"the cleanup gate never saw a created child: {out}")
+        self.assertEqual(seen.group(2), "False", "the child must be OUTSIDE the job when the cleanup starts: that is the case under test")
+        self.assertEqual(seen.group(3), "True", "the suspended child must be alive when the cleanup starts")
+        self.assertIn("GONE True", out, "the unassigned child must be terminated by the failure cleanup (a job close does not reach it)")
+
+    @unittest.skipUnless(sys.platform == "win32", "the suspended start is Windows only")
+    def test_a_child_never_assigned_to_the_job_is_terminated_by_the_failure_cleanup(self) -> None:
+        # U1: the AssignProcessToJobObject fault used to let the REAL call run first, so the child was in the job when the cleanup ran and a
+        # job-based kill could have hidden a cleanup that does not reach it. Here the real call is skipped: the child is genuinely unassigned.
+        out, spawns = self.run_native_fault(
+            self.CHILD_PROBE_PS + "$script:DvNativeFault = @{ AssignProcessToJobObject = $false }\n$script:DvNativeSkipCall = @{ AssignProcessToJobObject = $true }\n",
+            trace=True, after=self.CHILD_REPORT_PS)
+        self.assert_typed_refusal(out, "DV_GIT_JOB_ASSIGN_FAILED")
+        self.assertIn("HITS AssignProcessToJobObject", out)
+        self.assert_child_was_unassigned_alive_then_gone(out)
+        self.assertEqual(spawns, [], "the suspended child must never run, and the Process.Start fallback must not start a second git")
+
+    @unittest.skipUnless(sys.platform == "win32", "the suspended start is Windows only")
+    def test_a_throw_between_creation_and_assignment_terminates_the_unassigned_child(self) -> None:
+        # U2: DvStartGate runs between CreateProcessW and the assignment. A throw there is the earliest failure with a child alive.
+        out, spawns = self.run_native_fault(
+            self.CHILD_PROBE_PS + "$script:DvStartGate = { throw 'injected gate failure' }\n", trace=True, after=self.CHILD_REPORT_PS)
+        self.assert_typed_refusal(out, "DV_GIT_START_FAILED")
+        self.assertIn("injected gate failure", out)
+        self.assert_child_was_unassigned_alive_then_gone(out)
+        self.assertEqual(spawns, [], "the suspended child must never run, and the Process.Start fallback must not start a second git")
+
+    def handle_delta(self, setup: str, calls: int = 25) -> str:
+        """Run Invoke-DvGit `calls` times after a warm-up and print how many handles this pwsh gained (a leak of even one handle per call shows)."""
+        repo = self.make_repo()
+        return self.in_module(
+            f"{setup}\n"
+            "function Get-DvTestHandles { [GC]::Collect(); [GC]::WaitForPendingFinalizers(); [GC]::Collect(); (Get-Process -Id $PID).HandleCount }\n"
+            f"$call = {{ $script:Last = Invoke-DvGit -RepoRoot '{repo}' -GitArgs @('rev-parse', '--is-inside-work-tree') }}\n"
+            "1..3 | ForEach-Object { & $call }\n"
+            "$before = Get-DvTestHandles\n"
+            f"1..{calls} | ForEach-Object {{ & $call }}\n"
+            "$after = Get-DvTestHandles\n"
+            "Write-Output ('DELTA ' + ($after - $before))\n"
+            "Write-Output ('LAST ' + $script:Last.exitCode + ' ' + $script:Last.stderr)\n"
+            "Write-Output ('HITS ' + (@($script:DvNativeFaultHits | Select-Object -Unique) -join ','))\n"
+            "Write-Output ('JOBS opened=' + $script:DvJobsOpened + ' closed=' + $script:DvJobsClosed)\n")
+
+    @unittest.skipUnless(sys.platform == "win32", "the suspended start is Windows only")
+    def test_every_early_return_before_the_job_assignment_releases_its_handles(self) -> None:
+        # U2: each step that can fail before the assignment (the second and third rows have created some pipes; the gate row has created the
+        # suspended child) must leave no handle behind, call after call. The first three fall back to Process.Start (no child existed), which
+        # is git's own result; the gate row is the typed refusal. A leak shows as at least one handle per call, so the bound is half that.
+        calls = 25
+        cases = (
+            ("CreatePipe", "$script:DvNativeFault = @{ CreatePipe = $false }; $script:DvNativeSkipCall = @{ CreatePipe = $true }", "LAST 0 ", "CreatePipe"),
+            ("SetHandleInformation", "$script:DvNativeFault = @{ SetHandleInformation = $false }", "LAST 0 ", "SetHandleInformation"),
+            ("CreateProcessW", "$script:DvNativeFault = @{ CreateProcessW = $false }; $script:DvNativeSkipCall = @{ CreateProcessW = $true }", "LAST 0 ", "CreateProcessW"),
+            ("gate", "$script:DvStartGate = { throw 'injected gate failure' }", "LAST -1 DV_GIT_START_FAILED", ""),
+        )
+        for label, setup, last, hit in cases:
+            with self.subTest(step=label):
+                out = self.handle_delta(setup, calls)
+                self.assertIn(last, out, out)
+                if hit:
+                    self.assertIn(f"HITS {hit}", out, "the fault must have fired, or the case proves nothing")
+                delta = re.search(r"DELTA (-?\d+)", out)
+                self.assertIsNotNone(delta, out)
+                self.assertLess(int(delta.group(1)), calls // 2, f"{label}: handles leaked across {calls} calls: {out}")
+                jobs = re.search(r"JOBS opened=(\d+) closed=(\d+)", out)
+                self.assertIsNotNone(jobs, out)
+                self.assertEqual(jobs.group(1), jobs.group(2), "every job object opened must be closed")
+
+    # U3: the alias tests above counted only `trace: built-in:` lines, which an alias never writes (see _is_git_spawn_trace), so their "at most
+    # one git" bounds held for any number of gits. These two pin the count through a shell alias: exactly one run on the success path (the
+    # control that the counter sees an alias at all) and none when the suspended child is refused before it can run.
+    @unittest.skipUnless(sys.platform == "win32", "the suspended start is Windows only")
+    def test_a_shell_alias_through_the_native_start_is_traced_as_exactly_one_git(self) -> None:
+        out, spawns = self.run_native_fault("$script:DvNativeFault = @{}", "'-c', 'alias.dvhi=!echo hi', 'dvhi'", trace=True)
+        self.assertIn("EXIT 0", out)
+        self.assertEqual(len(spawns), 1, f"one alias call is one git run in the trace: {spawns}")
+
+    @unittest.skipUnless(sys.platform == "win32", "the suspended start is Windows only")
+    def test_a_refused_start_through_a_shell_alias_never_runs_the_alias(self) -> None:
+        for label, setup in (("assign", "$script:DvNativeFault = @{ AssignProcessToJobObject = $false }"),
+                             ("gate", "$script:DvStartGate = { throw 'injected gate failure' }")):
+            with self.subTest(step=label):
+                out, spawns = self.run_native_fault(setup, "'-c', 'alias.dvhi=!echo hi', 'dvhi'", trace=True)
+                self.assertIn("EXIT -1", out)
+                self.assertIn("BYTES 0", out)
+                self.assertEqual(spawns, [], "the suspended child was refused before it could run, and no second git was started")
 
     @unittest.skipUnless(sys.platform == "win32", "the suspended start is Windows only")
     def test_the_native_fault_seam_is_inert_when_no_fault_is_injected(self) -> None:

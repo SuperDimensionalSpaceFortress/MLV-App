@@ -152,7 +152,10 @@ PATHNAME_DELETE_ALLOWED = {
     ("ultra-magnus-agent.ps1", "Remove-Item -LiteralPath $Holder.acquiredFile, $Holder.releaseFile, $Holder.recordFile -Force -ErrorAction SilentlyContinue"):
         "slot-holders\\<jobId>.<guid>.acquired.json / .release / .holder.json: the ended holder's own side files.",
     ("ultra-magnus-agent.ps1", "Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue"):
-        "Stop-StaleHeavySlotHolders: a slot-holders\\*.holder.json record (Get-ChildItem -Filter '*.holder.json').",
+        "Stop-StaleHeavySlotHolders / Stop-StaleQuietLeases: a slot-holders\\*.holder.json or *.lease.json record "
+        "(Get-ChildItem -Filter '*.holder.json' / '*.lease.json').",
+    ("ultra-magnus-agent.ps1", "Remove-Item -LiteralPath $Lease.recordFile -Force -ErrorAction SilentlyContinue"):
+        "Stop-QuietLease: slot-holders\\<jobId>.<guid>.lease.json, the ended quiet lease's own record (BACHELOR-AGENT-QUIET-LEASE-1).",
     ("ultra-magnus-agent.ps1", "Get-ChildItem -LiteralPath $slotHolders -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '\\.(acquired\\.json|release|tmp)$' } | Remove-Item -Force -ErrorAction SilentlyContinue"):
         "slot-holders\\ side files only (*.acquired.json, *.release, *.tmp) left by a dead agent's holders.",
     ("ultra-magnus-agent.ps1", "Remove-Item Env:\\MLV_AGENT_ADMISSION, Env:\\MLV_AGENT_ADMISSION_THERMAL, Env:\\MLV_AGENT_ADMISSION_WAIT_SEC, Env:\\HEAVY_SLOT_HELD -ErrorAction SilentlyContinue"):

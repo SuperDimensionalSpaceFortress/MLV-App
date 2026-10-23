@@ -867,6 +867,7 @@ READONLY_AUTH_STATUS = " ".join(("claude", "au" + "th", "status"))
 NA10_SETTINGS = "{REPO}/.claude/settings.json"
 NA10_HOOK_SCRIPT = "{REPO}/tools/hooks/mlv-never-authorized.py"
 NA10_VERIFIER = "{REPO}/tools/gates/verify_consented_footage.py"
+NA10_WMI_GUARD = "{REPO}/tools/hooks/wmi-create-hidden-guard.py"
 NA10_UNRELATED = "{REPO}/src/mlv/video_mlv.c"
 NA10_NEW_TEXT = "# rewritten by the lane this gate governs\n"
 
@@ -4080,6 +4081,18 @@ CASES = [
         "fixture": "venue_at_worktree",
     },
     {
+        # NA10-WMI-GUARD-TAIL-1: the card's repro. A lane Write of the WMI guard with an
+        # always-pass body was ALLOWed at a lane venue; it is the fifth gate tail now.
+        "name": "na10 lane rewrites the hidden WMI create guard",
+        "group": "na10",
+        "tool": "Write",
+        "input": {"file_path": NA10_WMI_GUARD, "content": "import sys; sys.exit(0)\n"},
+        "expect": "DENY",
+        "na": "NA-10",
+        "reason_contains": "OWN gate",
+        "fixture": "venue_at_worktree",
+    },
+    {
         # THE CONTROL.  An ordinary source edit in the same worktree at the same venue: NA-10
         # is about four files, not about a lane's right to edit code.
         "name": "na10 control unrelated worktree edit at a lane venue",
@@ -6838,10 +6851,11 @@ class MlvNeverAuthorizedHookTests(unittest.TestCase):
         # rule about PERSISTENCE.  `na10` is the hub extension: two DENY writes at a lane
         # venue, the same two ALLOW at the board venue, the shell arm, and the unrelated-file
         # control that keeps it about the GATE and not about the worktree.  `na10` grew 6 -> 7
-        # at NA4-OWNER-CONSENTED-FOOTAGE-1 round 3 (E): the consent verifier's DENY row.
+        # at NA4-OWNER-CONSENTED-FOOTAGE-1 round 3 (E): the consent verifier's DENY row, and
+        # 7 -> 8 at NA10-WMI-GUARD-TAIL-1 (register v28): the hidden-WMI-guard DENY row.
         self.assertEqual(counts.get("na3"), 5, "5 NA-3 claude-auth rows")
         self.assertEqual(counts.get("na3_persistent"), 6, "6 NA-3 O129 persistent-scope rows")
-        self.assertEqual(counts.get("na10"), 7, "7 NA-10 self-edit rows")
+        self.assertEqual(counts.get("na10"), 8, "8 NA-10 self-edit rows")
         # `na11` is NEW at register v27 via #107 (Agent Bridge SoT suspend, owner ruling
         # 2026-09-09): three DENY writes at a lane venue (Write, nested Edit, shell
         # Set-Content), one DENY at the BOARD venue (NA-11 has no venue unlock), and the
@@ -8773,6 +8787,9 @@ class OwnerConsentedFootageTests(unittest.TestCase):
         self.assertIn("tools/gates/verify_consented_footage.py", self.module.NA10_GUARDED_TAILS)
         na10 = [item for item in register["items"] if item["id"] == "NA-10"]
         self.assertIn("tools/gates/verify_consented_footage.py", na10[0]["act"])
+        # NA10-WMI-GUARD-TAIL-1 (register v28): the WMI guard is a gate tail too.
+        self.assertIn("tools/hooks/wmi-create-hidden-guard.py", self.module.NA10_GUARDED_TAILS)
+        self.assertIn("tools/hooks/wmi-create-hidden-guard.py", na10[0]["act"])
 
 
 # NA6-WORKFLOW-WHOLEFILE-1: one example per skip/neutralise marker, keyed by the hook's OWN

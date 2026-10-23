@@ -9,6 +9,12 @@ is UNMEASURED, never zero: percentiles, means and the stage split use measured r
 only, per field; a field with no measured row prints `na`; and when the log has any
 `na` cell every line names its measured row count. A log with no `na` cell prints
 exactly what it printed before.
+
+The slowest-decile `%` column is a RATIO: a stage's measured-only mean divided by the
+all-decile render_total mean. At full coverage that is the stage's share of the frame;
+below 100 % coverage the numerator averages fewer frames than the denominator, so the
+percentages are descriptive ratios and do NOT sum to a per-frame budget. The split then
+ends with a `note:` line saying so (a fully measured log prints no note).
 """
 import re
 import sys
@@ -113,6 +119,15 @@ def analyze(path):
               f"{count(len(measured(slow, 'draw_total_ms')), n)}")
         print(f"  worst interval in decile        {ms(max(intervals) if intervals else None)}"
               f"{count(len(intervals), n)}")
+        # Every % above divides a measured-only stage mean by the all-frame render_total mean
+        # (rt), so below 100 % coverage it is a descriptive ratio, not an additive budget.
+        partial = (
+            (decode is not None and len(joint) < n)
+            or any(avg(f) is not None and len(measured(slow, f)) < n
+                   for f in ("llrawproc_ms", "processed8_ms")))
+        if partial:
+            print("  note: % = ratio of measured-only mean to all-frame render mean; "
+                  "not additive when coverage < 100 %")
 
 
 for p in sys.argv[1:]:
