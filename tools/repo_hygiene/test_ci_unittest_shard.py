@@ -4,10 +4,14 @@ import contextlib
 import io
 import json
 import re
+import sys
 import tempfile
 import time
+import types
 import unittest
+from collections.abc import Callable
 from pathlib import Path
+from unittest import mock
 
 from tools.repo_hygiene import ci_unittest_shard as shard
 from tools.repo_hygiene import ci_unittest_shard_timings as timings
@@ -227,6 +231,12 @@ class FakeClock:
         self.now += seconds
 
 
+def _wait_until(predicate: Callable[[], bool], seconds: float = 10.0) -> None:
+    deadline = time.monotonic() + seconds
+    while not predicate() and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+
 def _fake_case(
     clock: FakeClock, name: str, seconds: float, *, fail: bool = False, setup: float = 0.0, teardown: float = 0.0
 ) -> unittest.TestCase:
@@ -297,6 +307,15 @@ class ShardTimingReportTests(unittest.TestCase):
         self.assertNotIn("SHARD_BUDGET_WARN", quiet)
         _, loud = _run_fake_shard([("Slow", 70.0)], environ={shard.CAP_ENV: "1"})
         self.assertIn("used 117% of the 1 min job cap", loud)
+
+    def test_a_non_finite_or_unusable_cap_override_falls_back_to_the_default(self) -> None:
+        # r3 hardening F3: "inf" and "1e1000" parse to infinity, which would mute the warning forever.
+        default = float(shard.JOB_CAP_MINUTES["ubuntu"])
+        for raw in ("inf", "-inf", "Infinity", "1e1000", "nan", "", "abc", "0", "-5"):
+            with self.subTest(raw=raw):
+                self.assertEqual(shard.job_cap_minutes("ubuntu", {shard.CAP_ENV: raw}), default)
+        self.assertEqual(shard.job_cap_minutes("ubuntu", {shard.CAP_ENV: "1.5"}), 1.5)
+        self.assertEqual(shard.job_cap_minutes("ubuntu", {}), default)
 
     def test_the_windows_profile_uses_the_windows_cap(self) -> None:
         cases = [("Slow", shard.JOB_CAP_MINUTES["windows"] * 60 * 0.8)]
@@ -385,7 +404,10 @@ class ShardTimingReportTests(unittest.TestCase):
 
 
 class BudgetWarningDuringRunTests(unittest.TestCase):
-    """r2 blocker B1: the warning is emitted when the threshold is crossed, not after the run."""
+    """r2 blocker B1: the warning is emitted when the threshold is crossed, not after the run.
+
+    r3 adds where it is emitted (the job's real stdout) and which class it names.
+    """
 
     def test_a_cancelled_shard_has_already_warned_and_still_reports(self) -> None:
         clock = FakeClock()
@@ -444,6 +466,68 @@ class BudgetWarningDuringRunTests(unittest.TestCase):
             watch.stop()
         self.assertTrue(watch.warned)
         self.assertIn("::warning title=Shard budget::", out.getvalue())
+
+    # r3 blockers F1 (warning swallowed by a test's redirect_stdout) and F2 (setUpModule time).
+    def test_a_warning_fired_inside_a_tests_redirect_stdout_reaches_the_real_stdout(self) -> None:
+        clock = FakeClock()
+        real = io.StringIO()
+        captured = io.StringIO()
+
+        class Quiet(unittest.TestCase):
+            def test_a_long(self) -> None:
+                clock.advance(44.0)  # 73 % of the 60 s cap
+
+            def test_b_capturing(self) -> None:
+                with contextlib.redirect_stdout(captured):
+                    clock.advance(12.0)  # crosses 75 % while sys.stdout is `captured`
+                    _wait_until(lambda: "SHARD_BUDGET_WARN" in real.getvalue() + captured.getvalue())
+
+        Quiet.__module__ = "fake_mod"
+        Quiet.__qualname__ = "Quiet"
+        tests = [Quiet("test_a_long"), Quiet("test_b_capturing")]
+        with contextlib.redirect_stdout(real):
+            code = shard.run_shard(
+                tests, "ubuntu", 2, 8, clock=clock, environ={shard.CAP_ENV: "1"}, stream=io.StringIO(), poll_seconds=0.01
+            )
+        self.assertEqual(code, 0)
+        self.assertEqual(captured.getvalue(), "", "the budget warning must not land in a test's captured stdout")
+        lines = real.getvalue().splitlines()
+        self.assertEqual(sum(line.startswith("::warning") for line in lines), 1, real.getvalue())
+        self.assertEqual(sum(line.startswith("SHARD_BUDGET_WARN") for line in lines), 1, real.getvalue())
+        self.assertTrue(any(line.startswith("SHARD_SLOWEST") for line in lines))
+
+    def test_setup_module_time_is_charged_to_the_upcoming_class_in_the_warning(self) -> None:
+        clock = FakeClock()
+        out = io.StringIO()
+        previous_module = types.ModuleType("key_previous")
+        next_module = types.ModuleType("key_next")
+
+        def set_up_module() -> None:
+            clock.advance(46.0)  # 77 % of the 60 s cap, spent in the NEXT module's setUpModule
+            _wait_until(lambda: "SHARD_BUDGET_WARN" in out.getvalue())
+
+        next_module.setUpModule = set_up_module  # type: ignore[attr-defined]
+
+        def make(module: str, name: str, seconds: float) -> unittest.TestCase:
+            def test_it(self: unittest.TestCase) -> None:
+                clock.advance(seconds)
+
+            cls = type(name, (unittest.TestCase,), {"test_it": test_it, "__module__": module})
+            return cls("test_it")
+
+        tests = [make("key_previous", "Quick", 1.0), make("key_next", "SetupHeavy", 1.0)]
+        with mock.patch.dict(sys.modules, {"key_previous": previous_module, "key_next": next_module}):
+            with contextlib.redirect_stdout(out):
+                shard.run_shard(
+                    tests, "ubuntu", 2, 8, clock=clock, environ={shard.CAP_ENV: "1"}, stream=io.StringIO(), poll_seconds=0.01
+                )
+        lines = out.getvalue().splitlines()
+        annotation = [line for line in lines if line.startswith("::warning")]
+        self.assertEqual(len(annotation), 1, out.getvalue())
+        self.assertIn("slowest class key_next.SetupHeavy 46.0s", annotation[0])
+        self.assertNotIn("key_previous.Quick", annotation[0])
+        self.assertIn("  47.0s key_next.SetupHeavy", lines)
+        self.assertIn("  1.0s key_previous.Quick", lines)
 
 
 class ShardExitCodeTests(unittest.TestCase):

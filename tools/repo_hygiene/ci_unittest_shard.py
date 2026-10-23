@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import threading
@@ -196,6 +197,11 @@ class ClassTimingResult(unittest.TextTestResult):
         if self._on_tick is not None:
             self._on_tick()
 
+    def running(self) -> str | None:
+        """The class last entered, so a nested fixture step can put it back."""
+        with self._lock:
+            return self._current
+
     def snapshot(self) -> dict[str, float]:
         """``class_seconds`` plus the time since the mark, charged to the class now running."""
         with self._lock:
@@ -236,8 +242,16 @@ class ClassTimingSuite(unittest.TestSuite):
         _timed(result, _class_key(previous), super()._tearDownPreviousClass, test, result)
 
     def _handleModuleTearDown(self, result: unittest.TestResult) -> None:  # noqa: N802
+        # unittest calls this from _handleModuleFixture just before the next module's
+        # setUpModule, so the class entered for that fixture is put back afterwards: a snapshot
+        # taken during setUpModule must name the upcoming class, not the one being torn down.
+        running = getattr(result, "running", None)
+        outer = running() if running is not None else None
         previous = getattr(result, "_previousTestClass", None)
         _timed(result, _class_key(previous), super()._handleModuleTearDown, result)
+        enter = getattr(result, "enter", None)
+        if enter is not None and outer is not None:
+            enter(outer)
 
     def _handleModuleFixture(self, test: object, result: unittest.TestResult) -> None:  # noqa: N802
         _timed(result, _class_key(type(test)), super()._handleModuleFixture, test, result)
@@ -252,7 +266,7 @@ def job_cap_minutes(profile: str, environ: Mapping[str, str]) -> float:
         override = float(environ[CAP_ENV])
     except (KeyError, ValueError):
         return float(JOB_CAP_MINUTES[profile])
-    return override if override > 0 else float(JOB_CAP_MINUTES[profile])
+    return override if math.isfinite(override) and override > 0 else float(JOB_CAP_MINUTES[profile])
 
 
 def slowest_block(
@@ -300,6 +314,7 @@ class BudgetWatch:
         snapshot: Callable[[], Mapping[str, float]],
         *,
         poll_seconds: float = 5.0,
+        out: TextIO | None = None,
     ) -> None:
         self._profile = profile
         self._index = index
@@ -309,6 +324,7 @@ class BudgetWatch:
         self._clock = clock
         self._snapshot = snapshot
         self._poll_seconds = poll_seconds
+        self._out = out
         self._lock = threading.Lock()
         self._stopped = threading.Event()
         self._thread = threading.Thread(target=self._poll, name="shard-budget-watch", daemon=True)
@@ -324,7 +340,7 @@ class BudgetWatch:
             lines = budget_warning(self._profile, self._index, self._of, elapsed, self._snapshot(), self._cap_minutes)
             if lines:
                 self.warned = True
-                print("\n".join(lines), flush=True)
+                print("\n".join(lines), file=self._out if self._out is not None else sys.stdout, flush=True)
 
     def start(self) -> None:
         self._thread.start()
@@ -349,13 +365,19 @@ def run_shard(
     environ: Mapping[str, str] | None = None,
     stream: TextIO | None = None,
     started: float | None = None,
+    poll_seconds: float = 5.0,
 ) -> int:
     """Run the shard's tests, warning when it passes the budget share and reporting its slowest classes.
 
     The warning is printed during the run (``BudgetWatch``) and the report from a ``finally``,
     so a cancellation (``KeyboardInterrupt``) gets both before it propagates. Both are
     informational: the exit code is the test outcome alone.
+
+    ``sys.stdout`` is captured once here, before any test runs. ``contextlib.redirect_stdout``
+    swaps it for the whole process, so a warning printed by the poll thread to the live
+    ``sys.stdout`` would land in whichever test happens to be capturing, and never reach the log.
     """
+    out = sys.stdout
     begin = clock() if started is None else started
     made: list[ClassTimingResult] = []
     watch = BudgetWatch(
@@ -366,6 +388,8 @@ def run_shard(
         begin,
         clock,
         lambda: made[0].snapshot() if made else {},
+        poll_seconds=poll_seconds,
+        out=out,
     )
 
     def make_result(*args: object, **kwargs: object) -> ClassTimingResult:
@@ -382,7 +406,7 @@ def run_shard(
         seconds = made[0].snapshot() if made else {}
         if seconds:
             watch.check()
-            print("\n".join(slowest_block(profile, index, of, clock() - begin, seconds)), flush=True)
+            print("\n".join(slowest_block(profile, index, of, clock() - begin, seconds)), file=out, flush=True)
     if result.testsRun == 0:
         print("ERROR: no tests ran", file=sys.stderr)
         return 5
