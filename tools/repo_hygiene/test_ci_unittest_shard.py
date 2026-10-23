@@ -187,17 +187,19 @@ class ShardDurationBudgetTests(unittest.TestCase):
 
     def test_the_table_measures_nearly_every_discovered_test(self) -> None:
         # An unmeasured class costs DEFAULT_TEST_SECONDS per test whatever it really takes;
-        # 101 of them hid that shard 2 was at 31 min while the table claimed 10.6.
-        for profile in ("windows",):
-            weights = shard.load_weights(profile)
-            unmeasured = {key: n for key, n in _COUNTS.items() if key not in weights}
-            share = sum(unmeasured.values()) / sum(_COUNTS.values())
-            self.assertLessEqual(
-                share,
-                MAX_UNMEASURED_TEST_SHARE,
-                f"{profile}: {sum(unmeasured.values())} tests in {len(unmeasured)} classes have no "
-                f"measured weight ({share:.0%}); re-run ci_unittest_shard_timings on hosted logs",
-            )
+        # 101 of them hid that shard 2 was at 31 min while the table claimed 10.6. Every
+        # profile is pinned (CoS on #449: ubuntu was left out, 22.3 % unmeasured then).
+        for profile in shard.PROFILES:
+            with self.subTest(profile=profile):
+                weights = shard.load_weights(profile)
+                unmeasured = {key: n for key, n in _COUNTS.items() if key not in weights}
+                share = sum(unmeasured.values()) / sum(_COUNTS.values())
+                self.assertLessEqual(
+                    share,
+                    MAX_UNMEASURED_TEST_SHARE,
+                    f"{profile}: {sum(unmeasured.values())} tests in {len(unmeasured)} classes have no "
+                    f"measured weight ({share:.0%}); re-run ci_unittest_shard_timings on hosted logs",
+                )
 
 
 class JobCapPinTests(unittest.TestCase):
