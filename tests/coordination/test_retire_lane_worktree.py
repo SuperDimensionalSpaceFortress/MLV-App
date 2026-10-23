@@ -1122,6 +1122,88 @@ def test_a_record_settled_by_its_owner_between_the_listing_and_the_read_is_gone_
     assert _pending_records(main) == [], "the emptied record is dropped, as the claim-time branch drops it"
 
 
+def _sweep_publish_race(main, root, tmp, published, hold_lock, sweep_args=""):
+    """Sweep with a Get-Content seam: the FIRST read of a record.json finds it absent (the owner has created the directory, as
+    New-RetirePendingRecord does, but not yet written record.json), and before the read returns the owner publishes `published` (the record
+    text, or None for the original text) and, with `hold_lock`, keeps owner.lock open (FileShare.None) through the rest of the sweep.
+    Ordered by the seam, no sleeps. Every claim attempt is counted. Returns (sweep summary, claim attempts)."""
+    text = "[IO.File]::ReadAllText($rj)" if published is None else "'" + published.replace("'", "''") + "'"
+    lock = ("$script:OwnerLock = [IO.File]::Open((Join-Path (Split-Path $rj -Parent) 'owner.lock'), 'OpenOrCreate', 'ReadWrite', 'None'); "
+            if hold_lock else "")
+    seam = ("$script:Raced = $false; $script:ClaimCalls = 0; $script:OwnerLock = $null; $origEnter = ${function:Enter-RetirePendingRecord}; "
+            "function Enter-RetirePendingRecord { $script:ClaimCalls++; & $origEnter @args }; "
+            "function Get-Content { $hit = @($args | Where-Object { $_ -is [string] -and $_ -like '*\\record.json' }); "
+            "if ($hit.Count -and -not $script:Raced) { $script:Raced = $true; $rj = $hit[0]; "
+            f"$text = {text}; [IO.File]::Delete($rj); "
+            f"try {{ Microsoft.PowerShell.Management\\Get-Content @args }} finally {{ {lock}[IO.File]::WriteAllText($rj, $text) }} }} "
+            "else { Microsoft.PowerShell.Management\\Get-Content @args } }; ")
+    script = ("$ErrorActionPreference='Stop'; Set-StrictMode -Version Latest; "
+              f". '{HELPER}'; {HOST_SNAPSHOT_FILTER}{seam}"
+              f"$s = Invoke-SweepMergedLaneWorktrees -RepoRoot '{main}' -Root '{root}' -MergeTarget 'origin/master' -MinIdleHours 24 "
+              f"-QuarantineRoot '{tmp / 'q'}' {sweep_args}; if ($script:OwnerLock) {{ $script:OwnerLock.Dispose() }}; "
+              "[pscustomobject]@{ sweep = $s; claimCalls = $script:ClaimCalls } | ConvertTo-Json -Depth 6")
+    out = json.loads(subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", script],
+                                    check=True, capture_output=True, text=True).stdout)
+    return out["sweep"], out["claimCalls"]
+
+
+def test_a_record_published_after_the_sweep_read_it_while_its_owner_holds_the_lock_is_owned_not_failed(repo):
+    """NEW CATALOGUE ROW (sol r2 blocker on PR #632): record absent during enumeration, published before sweep classification, owner.lock
+    held -> owned, never failed. The sweep checked record.json's existence AFTER its failed read and called a record present then corrupt,
+    without ever trying the claim. A record missing at the read goes through the claim: held by a live owner it is 'owned' and untouched."""
+    tmp, main = repo
+    root = tmp / "lanes"
+    wt = _add_wt(main, root / "wt-published-owned")
+    _strand_registered(main, wt)
+    recs = _pending_records(main)
+    s, claims = _sweep_publish_race(main, root, tmp, published=None, hold_lock=True)
+    rows = s["strandedRestore"]
+    assert len(rows) == 1 and rows[0]["state"] == "owned", s
+    assert claims >= 1, f"the sweep must try the claim before classifying the record (claimCalls={claims})"
+    assert _retiring_of(wt).exists() and not wt.exists() and _pending_records(main) == recs, "nothing renamed, the record is kept"
+    assert (Path(main) / ".git" / "mlv-retire-pending" / recs[0] / "record.json").exists()
+
+
+def test_a_record_published_after_the_sweep_read_it_with_the_lock_free_is_restored_from_the_record_read_under_the_claim(repo):
+    """Companion: the same race, but the owner has let go of the lock. The claim is taken and record.json, re-read under it, is a good
+    record: the restore runs as normal from it."""
+    tmp, main = repo
+    root = tmp / "lanes"
+    wt = _add_wt(main, root / "wt-published-free")
+    _strand_registered(main, wt)
+    s, claims = _sweep_publish_race(main, root, tmp, published=None, hold_lock=False)
+    rows = s["strandedRestore"]
+    assert [r["state"] for r in rows] == ["restored"] and claims >= 1, s
+    _assert_back_at_its_own_path(main, wt)
+
+
+def test_a_record_published_garbled_after_the_sweep_read_it_with_the_lock_free_fails_closed_and_is_kept(repo):
+    """Companion: the record published in the race is present but unparseable, and the lock is free. That is decided under the claim, as
+    any record unreadable there is: failed, nothing touched, the record kept."""
+    tmp, main = repo
+    root = tmp / "lanes"
+    wt = _add_wt(main, root / "wt-published-garbled")
+    _strand_registered(main, wt)
+    recs = _pending_records(main)
+    s, claims = _sweep_publish_race(main, root, tmp, published="{ not json", hold_lock=False)
+    rows = s["strandedRestore"]
+    assert len(rows) == 1 and rows[0]["state"] == "failed" and "cannot be read under the claim" in rows[0]["note"] and claims >= 1, s
+    assert _retiring_of(wt).exists() and not wt.exists() and _pending_records(main) == recs, "nothing touched, the record stays"
+
+
+def test_a_record_published_after_the_sweep_read_it_naming_an_excluded_path_is_never_restored(repo):
+    """Companion: the sweep's -Root / -Exclude filter could only run on a record it had read. A record first read under the claim is
+    filtered there, before any rename: one naming an excluded path gets no row, and neither path nor the record is touched."""
+    tmp, main = repo
+    root = tmp / "lanes"
+    wt = _add_wt(main, root / "wt-published-excluded")
+    _strand_registered(main, wt)
+    recs = _pending_records(main)
+    s, _ = _sweep_publish_race(main, root, tmp, published=None, hold_lock=False, sweep_args=f"-Exclude '{wt}'")
+    assert s["strandedRestore"] == [], s
+    assert _retiring_of(wt).exists() and not wt.exists() and _pending_records(main) == recs, "nothing touched, the record stays"
+
+
 # r2 (Sol r1 B1/B2): a holder that appears AFTER the first decision must stop the retry too. The retry window is where the worktree is
 # half-removed and a handle still blocks it, so a process that starts in it is exactly the one the gate was written to refuse.
 # Scans are numbered: 1 = the gate, 2 = the last look before removal, 3.. = one fresh scan before each retry attempt that may delete.

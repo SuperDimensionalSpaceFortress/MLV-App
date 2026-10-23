@@ -171,9 +171,13 @@
         e. H1: the sweep's restore-first counts against -BudgetSeconds; once spent, each remaining record is 'not-reached: budget' and kept.
         f. r10 (Dot R18 B1): re-creating the admin entry or the `.git` link records checkoutOwed in record.json (under the claim, before
            either is re-created), so a retry after a failed repair still runs checkout-index; the record is dropped only once checkout-index
-           and status have run. A record.json absent at the sweep's read is a record settled (or being written) by its owner: gone / owned.
+           and status have run.
         g. r11 (sol r1 blocker on PR #632): every decision is made from record.json re-read UNDER the claim, never from the snapshot the
            caller read before it (that may predate another restorer's checkoutOwed). Gone under the claim: gone; unreadable: failed, kept.
+        h. r12 (sol r2 blocker on PR #632): a record the sweep could not read is never classified from that read or from a later existence
+           check (its owner creates the directory and holds owner.lock BEFORE it writes record.json). It goes through the claim like any
+           record: held -> owned; claimed -> (g). The sweep's -Root / -Exclude filter runs on the record read under the claim, before any
+           rename; a record out of that scope gets no row and is not touched.
       renameRestore.state (and each sweep strandedRestore row / disposition.strandedRestore):
         not-renamed          no rename happened in this call
         retired              the rename was followed by a real retirement; the record is dropped
@@ -833,7 +837,9 @@ function Restore-LaneWorktreeRename {
     # earlier call that could not repair, or by another actor): if Test-RenamedTreeIdentity says it is this record's tree, the registration
     # steps below run on it; otherwise the record is 'gone'. A failed repair is 'restored-unrepaired': the tree is back but git does not list
     # it there, so the record stays and the next call or sweep repairs it.
-    param([object]$Record, [string]$RecordDir, [object]$Claim = $null, [int]$BudgetMs = 0)
+    # r12: -InScope (the sweep's -Root / -Exclude filter) is called with the record's original as read UNDER the claim; $false returns
+    # 'out-of-scope' with nothing touched and the record kept. -Record may be $null (the sweep could not read it): it only locates the record.
+    param([object]$Record, [string]$RecordDir, [object]$Claim = $null, [int]$BudgetMs = 0, [scriptblock]$InScope = $null)
     $res = [ordered]@{ state = 'failed'; note = $null; attempts = 0 }
     $drop = $false
     try {
@@ -847,9 +853,6 @@ function Restore-LaneWorktreeRename {
             }
             # The owner empties its record before releasing it (Remove-RetirePendingRecord); a claim taken in between finds no record.json.
             if (-not (Test-Path -LiteralPath (Join-Path $RecordDir 'record.json'))) { $res.state = 'gone'; $res.note = "the rename record $RecordDir was settled by its owner"; $drop = $true; return $res }
-            # r10: -Record $null is the sweep's record whose record.json was absent at its read; present now, its owner wrote it after the
-            # listing (under the lock it has since let go). It was not read in this pass, so nothing is touched; the next sweep reads it.
-            if ($null -eq $Record) { $res.state = 'owned'; $res.note = "record.json of $RecordDir was written by its owner after this sweep listed it; nothing touched, the next sweep reads it"; return $res }
         }
         # r11 (sol r1 blocker on PR #632; catalogue row: stale record snapshot before a debt update -> reload under the claim and perform the
         # owed checkout): -Record was read BEFORE the claim. Between that read and the claim, another restorer may have claimed the record,
@@ -866,6 +869,7 @@ function Restore-LaneWorktreeRename {
             return $res
         }
         $orig = [string]$Record.original; $ret = [string]$Record.retiring
+        if ($InScope -and -not (& $InScope $orig)) { $res.state = 'out-of-scope'; $res.note = "$orig is outside the caller's scope; nothing touched, the record stays"; return $res }
         $notes = @()
         if (-not (Test-Path -LiteralPath $ret)) {
             if (-not (Test-Path -LiteralPath $orig)) { $res.state = 'gone'; $res.note = "$ret no longer exists"; $drop = $true; return $res }
@@ -1314,21 +1318,25 @@ function Invoke-SweepMergedLaneWorktrees {
         # restore counts against -BudgetSeconds (H1): once it is spent, each remaining record is 'not-reached: budget' and kept for the next sweep.
         $cdo = @(& git.exe -C $RepoRoot rev-parse --path-format=absolute --git-common-dir 2>$null)
         if (-not $LASTEXITCODE -and $cdo.Count) {
+            # r12: the scope filter, applied to the snapshot here and again by the restore to the record it reads under its claim. $seen
+            # carries the last original it judged back to the row (dynamic scope: the restore invokes it from inside this function's call).
+            $seen = @{ original = $null }
+            $inScope = { param([string]$o) $p = Get-FullNoSlash $o; $seen.original = $p; $p.StartsWith($rootFull + '\', [StringComparison]::OrdinalIgnoreCase) -and -not @($excl | Where-Object { $_ -ieq $p }).Count }
             foreach ($pr in @(Get-RetirePendingRecords -CommonDir ($cdo[0] -replace '/', '\'))) {
-                # r10: no record.json at the read is not a failure. Its owner empties a record (record.json first) before it deletes the
-                # directory, and writes record.json only after it has claimed it, so this is a record settled (or still being written) between
-                # the listing and the read: the restore's claim says which (gone / owned). Only a record.json that exists but cannot be read fails.
-                $po = $null
-                if ($null -eq $pr.Record) {
-                    if (Test-Path -LiteralPath (Join-Path $pr.Dir 'record.json')) { $sum.strandedRestore += [pscustomobject]@{ original = $null; state = 'failed'; note = "unreadable rename record $($pr.Dir): $($pr.Error)"; attempts = 0 }; continue }
-                } else {
-                    $po = Get-FullNoSlash ([string]$pr.Record.original)
-                    if (-not $po.StartsWith($rootFull + '\', [StringComparison]::OrdinalIgnoreCase) -or @($excl | Where-Object { $_ -ieq $po }).Count) { continue }
+                # r10/r12: an unreadable record.json at the read is not a failure, and neither is one present by the time anything looks again:
+                # its owner creates the directory and holds owner.lock BEFORE it writes record.json, and empties a record (record.json first)
+                # before it deletes the directory. Whatever the read saw, the restore's claim decides (owned / gone / the record re-read under it).
+                $po = $null; $seen.original = $null
+                if ($null -ne $pr.Record) {
+                    $in = & $inScope ([string]$pr.Record.original); $po = $seen.original
+                    if (-not $in) { continue }
                 }
                 $leftMs = [int]([Math]::Max(0, $BudgetSeconds * 1000 - $sw.ElapsedMilliseconds))
                 $r = if ($WhatIf) { [ordered]@{ state = 'not-run: WhatIf'; note = 'a real sweep restores it first'; attempts = 0 } }
                      elseif ($leftMs -le 0) { [ordered]@{ state = 'not-reached: budget'; note = "-BudgetSeconds $BudgetSeconds was spent before this record; it and the tree are kept for the next sweep"; attempts = 0 } }
-                     else { Restore-LaneWorktreeRename -Record $pr.Record -RecordDir $pr.Dir -BudgetMs $leftMs }
+                     else { Restore-LaneWorktreeRename -Record $pr.Record -RecordDir $pr.Dir -BudgetMs $leftMs -InScope $inScope }
+                if ($r.state -eq 'out-of-scope') { continue }
+                if ($null -eq $po) { $po = $seen.original }
                 $sum.strandedRestore += [pscustomobject]@{ original = $po; state = $r.state; note = $r.note; attempts = $r.attempts }
             }
         }
