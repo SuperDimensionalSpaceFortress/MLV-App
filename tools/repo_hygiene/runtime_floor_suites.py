@@ -175,10 +175,19 @@ def resolve_evidence(item: dict, lines: list[str]) -> tuple[int | None, str | No
 
     The scope ends at the first non-blank line indented no deeper than the ``within`` line, so it ends EARLY at a
     comment at the same indent, a column-zero line (a here-string body), or an opening brace on the line after the
-    ``within`` line. An early end can only turn a citation red (``matches 0 lines``): ``contains`` must still be
-    unique inside the shorter scope, so it never resolves to a different line.
+    ``within`` line. An early end never lets ``contains`` resolve to a line other than the one it names in the
+    shorter scope, and it can only turn a citation red (``matches 0 lines``), with one qualification:
+
+    * An early end at a COMMENT is seen through. The comment line itself says nothing about where the block ends,
+      so a second match past it (up to the next non-comment line indented no deeper) makes the citation red
+      (``matches 2 lines ... past an early scope end``) rather than letting it resolve to the first match.
+    * An early end at a column-zero code line or a brace is NOT seen through: a here-string body cannot be told
+      from the next top-level declaration, so a second match beyond it is invisible and the citation resolves to
+      the first one. Cite a ``contains`` that is unique in the whole block, or a ``within`` anchor that closes
+      before such a line.
     """
     scope = range(len(lines))
+    wide = scope
     where = "the file"
     anchor = item.get("within")
     if anchor:
@@ -186,15 +195,34 @@ def resolve_evidence(item: dict, lines: list[str]) -> tuple[int | None, str | No
         if len(opens) != 1:
             return None, f"'within' anchor {anchor!r} matches {len(opens)} lines (need exactly 1)"
         start = opens[0]
-        end = start + 1
-        while end < len(lines) and (not lines[end].strip() or _indent(lines[end]) > _indent(lines[start])):
-            end += 1
-        scope = range(start, end)
+        scope = range(start, _scope_end(lines, start, see_through_comments=False))
+        wide = range(start, _scope_end(lines, start, see_through_comments=True))
         where = f"the block under {anchor!r}"
     hits = [i for i in scope if item["contains"] in lines[i]]
-    if len(hits) != 1:
-        return None, f"{item['contains']!r} matches {len(hits)} lines of {where} (need exactly 1)"
-    return hits[0] + 1, None
+    if len(hits) == 1:
+        beyond = [i for i in wide if i not in scope and item["contains"] in lines[i]]
+        if beyond:
+            return None, (f"{item['contains']!r} matches {len(hits) + len(beyond)} lines of {where}, "
+                          f"{len(beyond)} of them past an early scope end at line {scope.stop + 1} (need exactly 1)")
+        return hits[0] + 1, None
+    return None, f"{item['contains']!r} matches {len(hits)} lines of {where} (need exactly 1)"
+
+
+def _is_comment(text: str) -> bool:
+    return text.lstrip().startswith(("#", "//"))
+
+
+def _scope_end(lines: list[str], start: int, see_through_comments: bool) -> int:
+    """Index one past the ``within`` block that opens at ``start``: the first non-blank line indented no deeper than
+    it. With ``see_through_comments`` a comment line never ends the block (it only marks where a narrow scope ends
+    early); the first code line indented no deeper still does."""
+    end = start + 1
+    while end < len(lines):
+        text = lines[end]
+        if text.strip() and _indent(text) <= _indent(lines[start]) and not (see_through_comments and _is_comment(text)):
+            break
+        end += 1
+    return end
 
 
 def _walk_evidence(manifest: dict, root: Path):
@@ -518,7 +546,7 @@ def main(argv: list[str] | None = None, detect=detect_runtime) -> int:
             result["evidence"] = report
             if not args.json:
                 print("\n".join(report))
-            bad = sum("UNRESOLVED" in line for line in report)
+            bad = len(check_evidence(manifest, worktree))
             if bad:
                 return emit(1, "FAIL", f"{bad} of {len(report)} citation(s) unresolved")
             return emit(0, "PASS", f"{len(report)} citation(s) resolved")

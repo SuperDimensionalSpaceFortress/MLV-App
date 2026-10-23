@@ -244,6 +244,17 @@ YAML_JOBS = (
     "    steps:\n"
     "      - run: other-step\n"
 )
+YAML_BLANK_LINE = (
+    "jobs:\n"
+    "  route:\n"
+    "    steps:\n"
+    "      - run: before-blank\n"
+    "\n"
+    "      - run: after-blank\n"
+    "  other:\n"
+    "    steps:\n"
+    "      - run: other-step\n"
+)
 YAML_COMMENT_SPLIT = (
     "jobs:\n"
     "  route:\n"
@@ -261,7 +272,8 @@ class ScopeBoundaryTests(unittest.TestCase):
     """RUNTIME-FLOOR-CITE-ANCHOR-FOLLOWUPS-1: the ``within`` scope ends at the first non-blank line indented no deeper
     than the anchor line. Rows marked PIN record that behaviour; each one is an EARLY end, which can only turn a
     citation red (``matches 0 lines``) and can never resolve it to a different line, because ``contains`` must still
-    be unique inside the shorter scope."""
+    be unique inside the shorter scope. An early end at a comment is seen through, so a duplicate past it is red;
+    one past a column-zero code line is not (the PIN marked known limit)."""
 
     def resolve(self, text, contains, within):
         return rfs.resolve_evidence({"contains": contains, "within": within}, text.splitlines())
@@ -278,7 +290,8 @@ class ScopeBoundaryTests(unittest.TestCase):
         self.assertEqual((11, None), self.resolve(YAML_JOBS, "python tools/x.py", "  route:"))
 
     def test_yaml_blank_line_does_not_end_the_job_scope(self):  # PIN
-        self.assertEqual((11, None), self.resolve(YAML_JOBS, "tools/x.py", "  route:"))
+        # the cited line sits AFTER the blank line, so the scope must have run through it
+        self.assertEqual((6, None), self.resolve(YAML_BLANK_LINE, "after-blank", "  route:"))
 
     def test_yaml_sibling_job_is_outside_the_scope(self):  # PIN
         self.assertUnresolved(self.resolve(YAML_JOBS, "other-step", "  route:"))
@@ -303,6 +316,32 @@ class ScopeBoundaryTests(unittest.TestCase):
         text = "function Foo {\n    $tag = 1\n# col-zero\n    $tag = 2\n}\n"
         self.assertEqual((2, None), self.resolve(text, "$tag = 1", "function Foo"))
         self.assertUnresolved(self.resolve(text, "$tag = 2", "function Foo"))
+
+
+    def test_a_duplicate_across_a_comment_early_end_is_ambiguous_not_unique(self):
+        # the same-indent comment ends the narrow scope, but the job goes on: a second match after it must keep the
+        # cite from resolving as unique to the first
+        text = YAML_COMMENT_SPLIT.replace("run: after", "run: before")
+        line, problem = self.resolve(text, "run: before", "  route:")
+        self.assertIsNone(line)
+        self.assertIn("matches 2 lines", problem)
+        self.assertIn("early", problem)
+
+    def test_a_comment_at_column_zero_does_not_hide_a_duplicate(self):
+        text = "function Foo {\n    $tag = 1\n# col-zero\n    $tag = 1\n}\n"
+        line, problem = self.resolve(text, "$tag = 1", "function Foo")
+        self.assertIsNone(line)
+        self.assertIn("matches 2 lines", problem)
+
+    def test_a_comment_before_a_sibling_does_not_widen_the_scope_into_it(self):  # PIN
+        text = YAML_JOBS.replace("other-step", "python tools/x.py")
+        self.assertEqual((11, None), self.resolve(text, "python tools/x.py", "  route:"))
+
+    def test_a_duplicate_past_a_column_zero_code_line_is_not_seen(self):  # PIN (known limit)
+        # a here-string body at column zero cannot be told from the next top-level declaration, so the scope ends
+        # there and a second match beyond it is invisible: the cite resolves to the first
+        text = "function Foo {\n    $tag = 1\ncol-zero text\n    $tag = 1\n}\n"
+        self.assertEqual((2, None), self.resolve(text, "$tag = 1", "function Foo"))
 
 
 class EvidenceReportTests(unittest.TestCase):
@@ -358,6 +397,14 @@ class EvidenceReportTests(unittest.TestCase):
         code, out = self.run_cli(self.manifest({"line": 1, "contains": "no-such-text"}))
         self.assertEqual(1, code, out)
         self.assertIn("UNRESOLVED", out)
+
+    def test_check_evidence_flag_counts_problems_not_the_word_unresolved(self):
+        data = manifest_of(row("UNRESOLVED-example", ["mod.psm1"], ["pwsh"], [{"kind": "ps-parse"}],
+                               evidence=[{"file": "mod.psm1", "line": 8, "contains": "'only-here'"}]))
+        self.assertEqual([], rfs.check_evidence(data, self.root))
+        code, out = self.run_cli(data)
+        self.assertEqual(0, code, out)
+        self.assertIn("PASS: 1 citation(s) resolved", out)
 
     def test_check_evidence_flag_passes_on_the_checked_in_manifest(self):
         buffer = io.StringIO()
