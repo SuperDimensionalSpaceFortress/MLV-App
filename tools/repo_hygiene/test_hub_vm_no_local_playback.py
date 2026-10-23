@@ -4075,7 +4075,10 @@ class LintDifferentialPinTests(unittest.TestCase):
     # multi-line probes (_json_counts: candidate, previous head, master) + 2 probes of test_a_lint_text_is_evaluated_once_per_corpus
     # + 1 probe of test_a_slow_probe_fails_typed_with_its_name_and_elapsed_time = 25. Before the change the same case started
     # 3 tests x (1 word-list probe + 2 lints x 6 shards) + 3 multi-line probes = 42.
-    MAX_PWSH_SPAWNS = 25
+    # CI-LINTDIFF-PIN-DETERMINISM-WITNESS-1 adds 3 single-shard probes (a 3-row corpus is one shard): the WITNESS_ROWS corpus (shared by the
+    # changed-corpus and reordered-corpus tests, whichever runs first starts it), the changed corpus and the reordered corpus; the
+    # cached-failure test starts none (its collector is stubbed) = 28.
+    MAX_PWSH_SPAWNS = 28
 
     @classmethod
     def setUpClass(cls):
@@ -4115,6 +4118,69 @@ class LintDifferentialPinTests(unittest.TestCase):
         self.assertEqual(2, len(_PWSH_SPAWNS) - start, "a different lint text is evaluated by its own probe")
         self.assertEqual(len(rows), len(different))
         self.assertGreater(first[0], 0, "`Run playback locally.` is refused: the cached verdicts are real counts")
+
+    # CI-LINTDIFF-PIN-DETERMINISM-WITNESS-1 (Dot's record of #501, cos-feedback/mlv-app/pr-501.md line 25): committed witnesses that the
+    # _corpus_counts key carries the corpus digest and that a cached failure is reused. The rows are not test_a_lint_text_is_evaluated_once_
+    # per_corpus's, so neither test depends on which of them runs first; W1 and W2 share this base corpus, and each measures only the spawn
+    # delta of its own call (the base call starts 1 probe or, when the other already ran, none).
+    WITNESS_ROWS = ["Run playback locally now.", "Run playback on Bachelor now.", "Build the console tests."]
+
+    def test_a_changed_corpus_under_unchanged_lint_bytes_is_its_own_evaluation(self):
+        """CI-LINTDIFF-PIN-DETERMINISM-WITNESS-1 (W1, Dot's #501 record): one row swapped, the lint bytes unchanged -> exactly one new
+        probe, and the swapped row carries its own verdict, never the earlier corpus's."""
+        base, = _corpus_counts([LINT_PS1], self.WITNESS_ROWS, self.tmp, "w1-base")
+        self.assertGreater(base[0], 0, "`Run playback locally now.` is refused")
+        self.assertEqual(0, base[1], "`Run playback on Bachelor now.` passes")
+        changed_rows = [self.WITNESS_ROWS[1], self.WITNESS_ROWS[1], self.WITNESS_ROWS[2]]  # row 0: the refused row swapped for a passing one
+        start = len(_PWSH_SPAWNS)
+        changed, = _corpus_counts([LINT_PS1], changed_rows, self.tmp, "w1-changed")
+        self.assertEqual(1, len(_PWSH_SPAWNS) - start, "a corpus that differs in one row is a different key: one new probe")
+        self.assertEqual([base[1], base[1], base[2]], changed, "each row of the changed corpus carries its own verdict")
+        self.assertNotEqual(base[0], changed[0], "row 0 must not borrow the earlier corpus's verdict")
+
+    def test_a_reordered_corpus_under_unchanged_lint_bytes_follows_the_new_order(self):
+        """CI-LINTDIFF-PIN-DETERMINISM-WITNESS-1 (W2, Dot's #501 record): the same rows in another order are a different key (one new
+        probe) and the verdicts follow the new order -- no positional verdict is borrowed."""
+        base, = _corpus_counts([LINT_PS1], self.WITNESS_ROWS, self.tmp, "w2-base")
+        self.assertNotEqual(base[0], base[1], "the witness needs rows whose verdicts differ")
+        order = [2, 0, 1]
+        start = len(_PWSH_SPAWNS)
+        reordered, = _corpus_counts([LINT_PS1], [self.WITNESS_ROWS[i] for i in order], self.tmp, "w2-reordered")
+        self.assertEqual(1, len(_PWSH_SPAWNS) - start, "the same rows in another order are a different key: one new probe")
+        self.assertEqual([base[i] for i in order], reordered, "the verdicts are the earlier ones permuted the same way as the rows")
+        self.assertNotEqual(base, reordered)
+
+    def test_a_cached_failure_is_reused_without_respawning(self):
+        """CI-LINTDIFF-PIN-DETERMINISM-WITNESS-1 (W3, Dot's #501 record): once a (lint, corpus) evaluation failed, the next call for the
+        same key raises the same message and starts nothing. The failure is produced by a collector that raises (no real probe, 0 pwsh)."""
+        rows = ["Cached-failure witness row one.", "Cached-failure witness row two."]
+        known = set(_COUNT_CACHE)
+        starts: list = []
+        collects: list = []
+
+        def start_nothing(lint, texts, work, tag, shards):
+            starts.append(tag)
+
+        def collect_fails(shards, deadline=None):
+            collects.append(shards)
+            raise AssertionError("witness probe failed: boom")
+
+        spawns = len(_PWSH_SPAWNS)
+        try:
+            with mock.patch.dict(globals(), {"_start_shards": start_nothing, "_collect_shards": collect_fails}):
+                with self.assertRaises(AssertionError) as first:
+                    _corpus_counts([LINT_PS1], rows, self.tmp, "w3")
+                self.assertEqual(1, len(starts), "the first call evaluates")
+                with self.assertRaises(AssertionError) as second:
+                    _corpus_counts([LINT_PS1], rows, self.tmp, "w3-again")
+        finally:
+            for key in set(_COUNT_CACHE) - known:
+                del _COUNT_CACHE[key]
+        self.assertEqual("witness probe failed: boom", str(first.exception))
+        self.assertEqual(str(first.exception), str(second.exception), "the cached failure is re-raised with the same message")
+        self.assertEqual(1, len(starts), "the second call must not start an evaluation")
+        self.assertEqual(1, len(collects), "the second call must not collect (re-evaluate) either")
+        self.assertEqual(spawns, len(_PWSH_SPAWNS), "a cached failure starts no pwsh")
 
     def test_a_slow_probe_fails_typed_with_its_name_and_elapsed_time(self):
         """CI-LINTDIFF-PIN-HOSTED-COST-1 bound: a probe that outlives the budget raises an AssertionError naming it, not TimeoutExpired."""
