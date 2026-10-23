@@ -169,11 +169,15 @@
            otherwise the record is gone.
         d. H2: a good rename back whose repair fails is restored-unrepaired, never restored: the record stays and the next call repairs it.
         e. H1: the sweep's restore-first counts against -BudgetSeconds; once spent, each remaining record is 'not-reached: budget' and kept.
+        f. r10 (Dot R18 B1): re-creating the admin entry or the `.git` link records checkoutOwed in record.json (under the claim, before
+           either is re-created), so a retry after a failed repair still runs checkout-index; the record is dropped only once checkout-index
+           and status have run. A record.json absent at the sweep's read is a record settled (or being written) by its owner: gone / owned.
       renameRestore.state (and each sweep strandedRestore row / disposition.strandedRestore):
         not-renamed          no rename happened in this call
         retired              the rename was followed by a real retirement; the record is dropped
         restored             back at <root>, registered, record dropped
-        restored-unrepaired  back at <root> but git does not list it there; record kept, the next call or sweep repairs it
+        restored-unrepaired  back at <root> but git does not list it there, or its owed re-checkout did not run; record kept, the next
+                             call or sweep repairs it
         failed               the rename back kept failing (or cannot-determine); <root>.retiring and the record stay for the next try
         refused              <root> exists again and <root>.retiring too; neither is touched, the record stays
         gone                 nothing left to restore (<root>.retiring absent and <root> absent or not this tree); the record is dropped
@@ -735,6 +739,16 @@ function New-RetirePendingRecord {
     return [pscustomobject]@{ Dir = $dir; Record = [pscustomobject]$rec; Lock = $lock }
 }
 
+function Write-RetirePendingRecordFile {
+    # r10: rewrite record.json of a record the caller has CLAIMED (holds its owner.lock). Written beside it, then moved over it (one rename on
+    # the same volume), so a reader sees the old or the new record, never a torn one. Throws on failure; the old record.json then stays.
+    param([string]$Dir, [object]$Record)
+    $dest = Join-Path $Dir 'record.json'
+    $tmp = "$dest.$([guid]::NewGuid().ToString('N').Substring(0, 8)).tmp"
+    try { [IO.File]::WriteAllText($tmp, ($Record | ConvertTo-Json)); [IO.File]::Move($tmp, $dest, $true) }
+    finally { if (Test-Path -LiteralPath $tmp) { try { [IO.File]::Delete($tmp) } catch { } } }
+}
+
 function Remove-RetirePendingRecord {
     # r8: drop a rename record once its rename is settled (retired or restored). Best effort.
     # r9: -Claim is the caller's open owner.lock. Everything but the lock goes first, WHILE it is held, so a restorer that claims the lock in
@@ -825,12 +839,15 @@ function Restore-LaneWorktreeRename {
             if (-not (Test-Path -LiteralPath $RecordDir)) { $res.state = 'gone'; $res.note = "the rename record $RecordDir no longer exists"; return $res }
             $Claim = Enter-RetirePendingRecord $RecordDir
             if (-not $Claim) {
-                $op = Get-RetireRecordValue $Record 'ownerPid'
+                $op = if ($null -ne $Record) { Get-RetireRecordValue $Record 'ownerPid' }
                 $res.state = 'owned'; $res.note = "held by a live operation$(if ($op) { " (record written by pid $op)" }): its owner.lock is open, so neither path nor the record is touched"
                 return $res
             }
             # The owner empties its record before releasing it (Remove-RetirePendingRecord); a claim taken in between finds no record.json.
             if (-not (Test-Path -LiteralPath (Join-Path $RecordDir 'record.json'))) { $res.state = 'gone'; $res.note = "the rename record $RecordDir was settled by its owner"; $drop = $true; return $res }
+            # r10: -Record $null is the sweep's record whose record.json was absent at its read; present now, its owner wrote it after the
+            # listing (under the lock it has since let go). It was not read in this pass, so nothing is touched; the next sweep reads it.
+            if ($null -eq $Record) { $res.state = 'owned'; $res.note = "record.json of $RecordDir was written by its owner after this sweep listed it; nothing touched, the next sweep reads it"; return $res }
         }
         $orig = [string]$Record.original; $ret = [string]$Record.retiring
         $notes = @()
@@ -854,15 +871,25 @@ function Restore-LaneWorktreeRename {
                 return $res
             }
         }
-        $reRegistered = $false
         $admin = [string]$Record.adminDir
-        if (-not (Test-Path -LiteralPath $admin)) {
+        $link = Join-Path $orig '.git'
+        $needAdmin = -not (Test-Path -LiteralPath $admin); $needLink = -not (Test-Path -LiteralPath $link)
+        # r10 (Dot R18 B1, RETIRE-RESTORE-PENDING-CHECKOUT-PERSIST-1): re-creating the admin entry or the link means git half-removed the tree,
+        # so tracked files it deleted are owed a checkout-index. That debt goes into the record (under this call's claim) BEFORE either is
+        # re-created: a repair that fails leaves both present, and the retry, finding nothing to re-create, would otherwise skip the re-checkout
+        # and drop the record over a tree with tracked files missing.
+        $needCheckout = [bool](Get-RetireRecordValue $Record 'checkoutOwed')
+        if (($needAdmin -or $needLink) -and -not $needCheckout) {
+            $Record | Add-Member -NotePropertyName checkoutOwed -NotePropertyValue $true -Force
+            Write-RetirePendingRecordFile -Dir $RecordDir -Record $Record
+            $needCheckout = $true
+        }
+        if ($needAdmin) {
             New-Item -ItemType Directory -Force -Path (Split-Path $admin -Parent) -ErrorAction Stop | Out-Null
             Copy-Item -LiteralPath (Join-Path $RecordDir 'admin') -Destination $admin -Recurse -ErrorAction Stop
-            $notes += 'git admin entry restored from the pre-rename copy'; $reRegistered = $true
+            $notes += 'git admin entry restored from the pre-rename copy'
         }
-        $link = Join-Path $orig '.git'
-        if (-not (Test-Path -LiteralPath $link)) { [IO.File]::WriteAllText($link, [string]$Record.gitLink); $notes += '.git link rewritten'; $reRegistered = $true }
+        if ($needLink) { [IO.File]::WriteAllText($link, [string]$Record.gitLink); $notes += '.git link rewritten' }
         $fix = Repair-LaneWorktreePath -Main ([string]$Record.main) -Path $orig
         if ($fix) {
             # H2 (RETIRE-RESTORE-REPAIR-FAILED-STATE-1): back at its path but not registered there. Keep the record: the next call recognises
@@ -871,12 +898,24 @@ function Restore-LaneWorktreeRename {
             $res.state = 'restored-unrepaired'; $res.note = ($notes -join '; ') + '; the rename record stays and the next call or sweep repairs it'
             return $res
         }
-        if ($reRegistered) {
-            & git.exe -c core.longpaths=true -C $orig checkout-index -a -q 2>$null | Out-Null
-            $st = @(& git.exe -c core.quotepath=false -C $orig status --porcelain 2>&1 | ForEach-Object { "$_" } | Where-Object { $_ })
-            $notes += $(if ($LASTEXITCODE) { 'status after the re-checkout failed: ' + ($st -join ' | ') }
-                        elseif ($st.Count) { "$($st.Count) path(s) still differ from HEAD after the re-checkout, first: $($st[0])" }
-                        else { 'missing tracked files re-checked-out; status clean' })
+        if ($needCheckout) {
+            # r10: a re-checkout that did not run to the end is not 'restored'. It is restored-unrepaired, the state that already means "back at
+            # <root>, the record stays and the next call or sweep finishes it"; the record keeps checkoutOwed, so that call runs this again.
+            $co = @(& git.exe -c core.longpaths=true -C $orig checkout-index -a -q 2>&1 | ForEach-Object { "$_" })
+            if ($LASTEXITCODE) { $notes += 'checkout-index after the re-registration failed: ' + ($co -join ' | ') }
+            else {
+                $st = @(& git.exe -c core.quotepath=false -C $orig status --porcelain 2>&1 | ForEach-Object { "$_" } | Where-Object { $_ })
+                if ($LASTEXITCODE) { $notes += 'status after the re-checkout failed: ' + ($st -join ' | ') }
+                else {
+                    $notes += $(if ($st.Count) { "$($st.Count) path(s) still differ from HEAD after the re-checkout, first: $($st[0])" }
+                                else { 'missing tracked files re-checked-out; status clean' })
+                    $needCheckout = $false
+                }
+            }
+            if ($needCheckout) {
+                $res.state = 'restored-unrepaired'; $res.note = ($notes -join '; ') + '; the rename record stays and the next call or sweep re-checks it out'
+                return $res
+            }
         }
         $res.state = 'restored'; $res.note = $(if ($notes.Count) { $notes -join '; ' } else { $null })
         $drop = $true
@@ -1260,9 +1299,16 @@ function Invoke-SweepMergedLaneWorktrees {
         $cdo = @(& git.exe -C $RepoRoot rev-parse --path-format=absolute --git-common-dir 2>$null)
         if (-not $LASTEXITCODE -and $cdo.Count) {
             foreach ($pr in @(Get-RetirePendingRecords -CommonDir ($cdo[0] -replace '/', '\'))) {
-                if ($null -eq $pr.Record) { $sum.strandedRestore += [pscustomobject]@{ original = $null; state = 'failed'; note = "unreadable rename record $($pr.Dir): $($pr.Error)"; attempts = 0 }; continue }
-                $po = Get-FullNoSlash ([string]$pr.Record.original)
-                if (-not $po.StartsWith($rootFull + '\', [StringComparison]::OrdinalIgnoreCase) -or @($excl | Where-Object { $_ -ieq $po }).Count) { continue }
+                # r10: no record.json at the read is not a failure. Its owner empties a record (record.json first) before it deletes the
+                # directory, and writes record.json only after it has claimed it, so this is a record settled (or still being written) between
+                # the listing and the read: the restore's claim says which (gone / owned). Only a record.json that exists but cannot be read fails.
+                $po = $null
+                if ($null -eq $pr.Record) {
+                    if (Test-Path -LiteralPath (Join-Path $pr.Dir 'record.json')) { $sum.strandedRestore += [pscustomobject]@{ original = $null; state = 'failed'; note = "unreadable rename record $($pr.Dir): $($pr.Error)"; attempts = 0 }; continue }
+                } else {
+                    $po = Get-FullNoSlash ([string]$pr.Record.original)
+                    if (-not $po.StartsWith($rootFull + '\', [StringComparison]::OrdinalIgnoreCase) -or @($excl | Where-Object { $_ -ieq $po }).Count) { continue }
+                }
                 $leftMs = [int]([Math]::Max(0, $BudgetSeconds * 1000 - $sw.ElapsedMilliseconds))
                 $r = if ($WhatIf) { [ordered]@{ state = 'not-run: WhatIf'; note = 'a real sweep restores it first'; attempts = 0 } }
                      elseif ($leftMs -le 0) { [ordered]@{ state = 'not-reached: budget'; note = "-BudgetSeconds $BudgetSeconds was spent before this record; it and the tree are kept for the next sweep"; attempts = 0 } }

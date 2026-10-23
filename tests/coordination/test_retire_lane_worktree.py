@@ -1000,6 +1000,67 @@ def test_a_failed_repair_after_a_good_rename_back_is_restored_unrepaired_and_ret
     _assert_back_at_its_own_path(main, wt)
 
 
+def _sweep_script(main, root, tmp, prelude=""):
+    return ("$ErrorActionPreference='Stop'; Set-StrictMode -Version Latest; "
+            f". '{HELPER}'; {HOST_SNAPSHOT_FILTER}{prelude}"
+            f"Invoke-SweepMergedLaneWorktrees -RepoRoot '{main}' -Root '{root}' -MergeTarget 'origin/master' -MinIdleHours 24 "
+            f"-QuarantineRoot '{tmp / 'q'}' | ConvertTo-Json -Depth 5")
+
+
+def test_a_half_removed_tree_whose_first_repair_fails_is_re_checked_out_by_the_retry(repo):
+    """Dot R18 B1 on PR #603 (RETIRE-RESTORE-PENDING-CHECKOUT-PERSIST-1): git half-removed the tree (admin entry, `.git` link and tracked
+    files deleted). The first restore re-creates the admin entry and the link, then its repair fails: restored-unrepaired, record kept. The
+    retry finds both present, so a re-registration flag local to one call said nothing was owed and checkout-index never ran: 'restored'
+    and the record dropped with the tracked files still missing. The debt now lives in the record until the re-checkout has run."""
+    tmp, main = repo
+    root = tmp / "lanes"
+    wt = _add_wt(main, root / "wt-half-unrepaired")
+    _strand_registered(main, wt)
+    recs = _pending_records(main)
+    ret = _retiring_of(wt)
+    # What a half-failed `git worktree remove` leaves: the admin entry and the `.git` link gone, tracked files deleted.
+    shutil.rmtree(_admin_dir(main, wt))   # named at `worktree add` time; the rename does not change it
+    for f in (".git", "a.txt", ".gitignore"):
+        (ret / f).unlink()
+    seam = "function Repair-LaneWorktreePath { param([string]$Main, [string]$Path) 'git worktree repair: seam failure' }; "
+    s = json.loads(subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", _sweep_script(main, root, tmp, seam)],
+                                  check=True, capture_output=True, text=True).stdout)
+    rows = s["strandedRestore"]
+    assert len(rows) == 1 and rows[0]["state"] == "restored-unrepaired" and "seam failure" in rows[0]["note"], s
+    assert "admin entry restored" in rows[0]["note"] and ".git link rewritten" in rows[0]["note"], rows
+    assert wt.exists() and not ret.exists() and _pending_records(main) == recs, "the record stays until the repair succeeds"
+    assert not (wt / "a.txt").exists(), "the fixture must leave the tracked files missing into the retry"
+    rec = json.loads((Path(main) / ".git" / "mlv-retire-pending" / recs[0] / "record.json").read_text(encoding="utf-8-sig"))
+    assert rec.get("checkoutOwed") is True, rec   # the debt outlives the call that incurred it
+    s = _sweep(main, Root=str(root), MergeTarget="origin/master", MinIdleHours=24, QuarantineRoot=str(tmp / "q"))
+    rows = s["strandedRestore"]
+    assert [r["state"] for r in rows] == ["restored"] and "status clean" in rows[0]["note"], s
+    assert (wt / "a.txt").exists() and (wt / ".gitignore").exists(), "every tracked file is back"
+    _assert_back_at_its_own_path(main, wt)
+
+
+def test_a_record_settled_by_its_owner_between_the_listing_and_the_read_is_gone_not_failed(repo):
+    """Fable/Grok note on PR #603: the owner settles a record by emptying it (record.json first) while it holds owner.lock, then deletes the
+    directory. A sweep that listed the directory before that and reads record.json after it must not report a 'failed' (unreadable) row:
+    the record is gone, settled by its owner, as the restore's own claim-time check already says."""
+    tmp, main = repo
+    root = tmp / "lanes"
+    wt = _add_wt(main, root / "wt-settled-midread")
+    _strand_registered(main, wt)
+    assert len(_pending_records(main)) == 1
+    # Get-Content seam: on the first read of a record.json, the owner's settle happens first (everything but owner.lock deleted).
+    seam = ("$script:Settled = $false; function Get-Content { "
+            "$hit = @($args | Where-Object { $_ -is [string] -and $_ -like '*\\record.json' }); "
+            "if ($hit.Count -and -not $script:Settled) { $script:Settled = $true; "
+            "Get-ChildItem -LiteralPath (Split-Path $hit[0] -Parent) -Force | Where-Object { $_.Name -ne 'owner.lock' } | "
+            "Remove-Item -Recurse -Force }; Microsoft.PowerShell.Management\\Get-Content @args }; ")
+    s = json.loads(subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", _sweep_script(main, root, tmp, seam)],
+                                  check=True, capture_output=True, text=True).stdout)
+    rows = s["strandedRestore"]
+    assert len(rows) == 1 and rows[0]["state"] == "gone" and "settled by its owner" in rows[0]["note"], s
+    assert _pending_records(main) == [], "the emptied record is dropped, as the claim-time branch drops it"
+
+
 # r2 (Sol r1 B1/B2): a holder that appears AFTER the first decision must stop the retry too. The retry window is where the worktree is
 # half-removed and a handle still blocks it, so a process that starts in it is exactly the one the gate was written to refuse.
 # Scans are numbered: 1 = the gate, 2 = the last look before removal, 3.. = one fresh scan before each retry attempt that may delete.
