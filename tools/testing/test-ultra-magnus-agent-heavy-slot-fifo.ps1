@@ -296,6 +296,65 @@ try {
     Assert-True ($adm.label -eq 'queue-expired' -and $script:Mock.probes[0] -eq 'holder-lost') "wait: a long job does not take a slot labelled 'mlv j1' as its own: $($adm.label) $($script:Mock.probes -join ',')"
     $unit.longLabel = [ordered]@{ cases = $labelCases; metadata = $metaCases; waitAdmitsOnLongLabel = 'clear'; waitRejectsShortLabel = $script:Mock.probes[0] }
 
+    # 5a. UM-AGENT-HEAVY-SLOT-OVERRIDE-BOUNDS-VALIDATE-1. The bounds the agent documents for -GateLongJobSec and
+    #     -GateLongJobPattern are enforced at parameter binding: an out-of-bounds override is refused with ONE typed token
+    #     (HEAVY_SLOT_OVERRIDE_OUT_OF_BOUNDS) in the message, and an in-bounds one still binds. The binding is exercised
+    #     through a scriptblock built from those two parameters' own AST text (attributes included), so the agent's main
+    #     loop never runs and no share is touched.
+    $overrideToken = 'HEAVY_SLOT_OVERRIDE_OUT_OF_BOUNDS'
+    $boundParams = @($ast.ParamBlock.Parameters | Where-Object { @('GateLongJobSec', 'GateLongJobPattern') -contains $_.Name.VariablePath.UserPath })
+    Assert-True ($boundParams.Count -eq 2) "agent param block declares GateLongJobSec and GateLongJobPattern (found $($boundParams.Count))"
+    $bindSb = [scriptblock]::Create("param(`n" + (($boundParams | ForEach-Object { $_.Extent.Text }) -join ",`n") + "`n)`n[pscustomobject]@{ sec = `$GateLongJobSec; pattern = `$GateLongJobPattern }")
+    function Test-OverrideBinding([hashtable]$Splat) {
+        try { $r = & $bindSb @Splat; return [pscustomobject]@{ ok = $true; sec = $r.sec; pattern = $r.pattern; message = '' } }
+        catch { return [pscustomobject]@{ ok = $false; sec = $null; pattern = $null; message = [string]$_.Exception.Message } }
+    }
+    $overrideRefused = [ordered]@{}
+    $overrideMisses = @()
+    foreach ($c in @(
+            @{ k = 'sec0'; a = @{ GateLongJobSec = 0 } }
+            @{ k = 'secMinus1'; a = @{ GateLongJobSec = -1 } }
+            @{ k = 'sec901'; a = @{ GateLongJobSec = 901 } }
+            @{ k = 'sec86400'; a = @{ GateLongJobSec = 86400 } }
+            @{ k = 'patBadRegex'; a = @{ GateLongJobPattern = '(' } }
+            @{ k = 'patBadClass'; a = @{ GateLongJobPattern = '[a-' } }
+            @{ k = 'patEmpty'; a = @{ GateLongJobPattern = '' } }
+            @{ k = 'patBlank'; a = @{ GateLongJobPattern = '   ' } }
+            @{ k = 'patMatchAll'; a = @{ GateLongJobPattern = '.*' } }
+            @{ k = 'patMatchAllAnchor'; a = @{ GateLongJobPattern = '^' } }
+            @{ k = 'patMatchAllOptional'; a = @{ GateLongJobPattern = '(stage|build|soak)?' } }
+            @{ k = 'patNoStage'; a = @{ GateLongJobPattern = '(^|[-_.])(build|soak)([-_.]|$)' } }
+            @{ k = 'patNoBuild'; a = @{ GateLongJobPattern = '(^|[-_.])(stage|soak)([-_.]|$)' } }
+            @{ k = 'patNoSoak'; a = @{ GateLongJobPattern = '(^|[-_.])(stage|build)([-_.]|$)' } }
+            @{ k = 'patUnrelated'; a = @{ GateLongJobPattern = 'zzz-only' } })) {
+        $r = Test-OverrideBinding $c.a
+        # Misses are collected and asserted once below, so a RED run names every case that still binds.
+        if ($r.ok) { $overrideMisses += "$($c.k): $(@($c.a.Keys)[0]) = '$(@($c.a.Values)[0])' bound (sec=$($r.sec) pattern=$($r.pattern))" }
+        elseif (-not $r.message.Contains($overrideToken)) { $overrideMisses += "$($c.k): refused without ${overrideToken}: $($r.message)" }
+        else { $overrideRefused[$c.k] = $overrideToken }
+    }
+    Assert-True ($overrideMisses.Count -eq 0) "$($overrideMisses.Count) out-of-bounds override(s) not refused with $overrideToken -- $($overrideMisses -join ' || ')"
+    $overrideBound = [ordered]@{}
+    foreach ($c in @(
+            @{ k = 'sec1'; a = @{ GateLongJobSec = 1 }; sec = 1 }
+            @{ k = 'sec600'; a = @{ GateLongJobSec = 600 }; sec = 600 }
+            @{ k = 'sec900'; a = @{ GateLongJobSec = 900 }; sec = 900 }
+            @{ k = 'patDefault'; a = @{ GateLongJobPattern = $GateLongJobPattern }; pattern = $GateLongJobPattern }
+            @{ k = 'patWidened'; a = @{ GateLongJobPattern = '(^|[-_.])(stage|build|soak|trace)([-_.]|$)' }; pattern = '(^|[-_.])(stage|build|soak|trace)([-_.]|$)' }
+            @{ k = 'patWidenedUnanchored'; a = @{ GateLongJobPattern = 'stage|build|soak|trace' }; pattern = 'stage|build|soak|trace' }
+            @{ k = 'patUpperCase'; a = @{ GateLongJobPattern = '(^|[-_.])(STAGE|BUILD|SOAK)([-_.]|$)' }; pattern = '(^|[-_.])(STAGE|BUILD|SOAK)([-_.]|$)' }
+            @{ k = 'bothInBounds'; a = @{ GateLongJobSec = 900; GateLongJobPattern = $GateLongJobPattern }; sec = 900; pattern = $GateLongJobPattern })) {
+        $r = Test-OverrideBinding $c.a
+        Assert-True $r.ok "override accepted $($c.k): an in-bounds override must bind, got: $($r.message)"
+        if ($c.ContainsKey('sec')) { Assert-True ($r.sec -eq $c.sec) "override accepted $($c.k): sec bound as $($r.sec), wanted $($c.sec)" }
+        if ($c.ContainsKey('pattern')) { Assert-True ($r.pattern -ceq $c.pattern) "override accepted $($c.k): pattern bound as '$($r.pattern)', wanted '$($c.pattern)'" }
+        $overrideBound[$c.k] = 'bound'
+    }
+    # No override: both parameters keep the defaults the label cases above run on (validation does not touch a default).
+    $noOverride = Test-OverrideBinding @{}
+    Assert-True ($noOverride.ok -and $noOverride.sec -eq $GateLongJobSec -and $noOverride.pattern -ceq $GateLongJobPattern) "no override binds the defaults ($GateLongJobSec / '$GateLongJobPattern'), got $($noOverride.sec) / '$($noOverride.pattern)' $($noOverride.message)"
+    $unit.overrideBounds = [ordered]@{ refused = $overrideRefused; bound = $overrideBound; token = $overrideToken }
+
     # 5b. AGENT-HEAVY-SLOT-LABEL-SINGLE-READ-1. The wait resolves the label ONCE, from the metadata the job was queued
     #     with, and the holder it creates is filed under that same label. Through the REAL Start-HeavySlotHolder (only its
     #     process, record and path helpers mocked) and the REAL Wait-HeavySlotAdmission, the job's meta.json is rewritten

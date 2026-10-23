@@ -21,7 +21,7 @@
 #   slot-holders\                - r1c: each gated job's heavy-slot.py holder (record, acquired, release files);
 #                                  quiet-lease r1: <id>.lease.json, the record of a lease request wrapper
 #   heavy-slot-mode.txt          - optional, "lease" or "status": the gate mode when -HeavySlotMode is not passed
-#   logs\                       - per-job stdout/stderr capture plus agent.log
+#   logs\                        - per-job stdout/stderr capture plus agent.log
 #   heartbeat.txt                - rewritten every poll so the VM can prove liveness
 #
 # Child launch contract: every submitted PowerShell root is created with
@@ -72,11 +72,38 @@ param(
     # "mlv-long", which only loses the short-exclusive ordering). It is a whole number of seconds, 1 or more. The label is
     # resolved once per job (Wait-HeavySlotAdmission) from the timeout in the job's metadata, so an override only changes
     # which label every job gets, never whether a job's ticket and its own-slot checks agree.
+    # UM-AGENT-HEAVY-SLOT-OVERRIDE-BOUNDS-VALIDATE-1: the bound is enforced at binding. A ValidateScript (not ValidateRange)
+    # so the refusal carries the typed token HEAVY_SLOT_OVERRIDE_OUT_OF_BOUNDS, as the pattern's refusals do; the 1..900
+    # range is checked in the script and stated in the message.
+    [ValidateScript({
+            if ($_ -lt 1 -or $_ -gt 900) { throw "HEAVY_SLOT_OVERRIDE_OUT_OF_BOUNDS: -GateLongJobSec $_ is outside 1..900 (a value over 900 files a 15 min job under the short 'mlv ' label, and heavy-slot.py then writes its stop file for every tenant)" }
+            $true
+        })]
     [int]$GateLongJobSec = 900,
     # GateLongJobPattern is matched against the job id, case-insensitively. Narrowing it so a stage, build or soak job no
     # longer matches is the unsafe direction (that job gets the short label and can trip the stop file); a pattern may
     # widen the long set freely, but must not match every id (that makes the short label unreachable). Keep it anchored on
     # the separators ("-", "_", ".", start, end) as the default is, so "upstage-1" and "rebuilder-2" stay short.
+    # UM-AGENT-HEAVY-SLOT-OVERRIDE-BOUNDS-VALIDATE-1: refused at binding unless the pattern compiles (1 s match timeout),
+    # matches none of the short probe ids below, and matches every one of the long probe ids.
+    [ValidateScript({
+            $shortProbeIds = @('venue-quiet-probe-1', 'job-1')
+            $longProbeIds = @('x-stage-1', 'x-build-2', 'x-soak-3')
+            $why = $null
+            if ([string]::IsNullOrWhiteSpace($_)) { $why = 'it is empty or blank' }
+            else {
+                try {
+                    $re = [regex]::new($_, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase, [TimeSpan]::FromSeconds(1))
+                    $shortHit = @($shortProbeIds | Where-Object { $re.IsMatch($_) })
+                    $longMiss = @($longProbeIds | Where-Object { -not $re.IsMatch($_) })
+                    if ($shortHit.Count -gt 0) { $why = "it matches short job id(s) $($shortHit -join ', ') (a pattern must not match every id)" }
+                    elseif ($longMiss.Count -gt 0) { $why = "it no longer matches long job id(s) $($longMiss -join ', ') (narrowing the long set is the unsafe direction)" }
+                }
+                catch { $why = "it does not compile or match within 1 s ($($_.Exception.Message))" }
+            }
+            if ($why) { throw "HEAVY_SLOT_OVERRIDE_OUT_OF_BOUNDS: -GateLongJobPattern '$_' refused: $why" }
+            $true
+        })]
     [string]$GateLongJobPattern = '(^|[-_.])(stage|build|soak)([-_.]|$)',
     # BACHELOR-AGENT-QUIET-LEASE-1 (heavy-slot.py 2.4.1, 2026-10-22): how a gated job gets its quiet machine. "lease" (the
     # default) holds an on-demand QUIET LEASE for the job (see the quiet-lease block above Wait-QuietLeaseAdmission).
