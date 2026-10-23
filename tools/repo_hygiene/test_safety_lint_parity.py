@@ -50,10 +50,19 @@ ALWAYS_ALLOW_HOOK ="def decide(payload, project_dir):\n    return 0, ''\n\n\ndef
 ALWAYS_THROW_HOOK = "def decide(payload, project_dir):\n    raise RuntimeError('synthetic rule crash')\n\n\ndef main():\n    return 0\n"
 
 # Pinned floors. A shrinking corpus is a red test; raise these when rows are added, never lower them.
-MIN_STATIC_ROWS = 410      # the JSON corpus: 205 kept static rows + the 180-row #455 sweep when this card landed (385), + the 25 r5 CoS #465 B5/B6 rows (410)
-MIN_HOOK_ROWS = 247        # hook share of the JSON corpus: 67 static #455 rows + the 180-row sweep (247 when this card landed)
+MIN_STATIC_ROWS = 517      # the JSON corpus: 205 kept static rows + the 180-row #455 sweep when this card landed (385), + the 25 r5 CoS #465 B5/B6 rows (410), + the 107 SAFETY-LINT-DEFEATER-CORPUS-1 hook defeater rows (517)
+MIN_HOOK_ROWS = 354        # hook share of the JSON corpus: 67 static #455 rows + the 180-row sweep (247 when this card landed), + 107 defeater rows (354)
 MIN_PLAYBACK_ROWS = 163    # playback share: the #465 RULE4 rows master refuses + the authored spaced-clip rows (138 when this card landed), + 25 r5 B5/B6 rows (163)
 MIN_DERIVED_HOOK_ROWS = 200  # DENY rows of test_mlv_never_authorized.CASES (203 when this card landed)
+# SAFETY-LINT-DEFEATER-CORPUS-1: rows per hook defeater family (corpus group id prefix), measured against fork/master 530d70e9. The
+# playback-lint families are deferred to PLAYBACK-LINT-DEFEATER-CORPUS-1.
+EXACT_HOOK_DEFEATER_FAMILY_ROWS = {
+    "defeater-glued-switch": 23,
+    "defeater-delimiter": 26,
+    "defeater-quoting": 14,
+    "defeater-argument-position": 24,
+    "defeater-extensionless": 20,
+}
 
 # r4 EXACT pins (sol r1 HARDENING: the floor of 200 let three existing DENY rows vanish with the count pin still green, and the
 # derived playback rows had no pin at all). The derived rows are the whole of the head's own deny suites, so any change in their
@@ -260,6 +269,17 @@ class CorpusPinTests(unittest.TestCase):
     def test_the_sweep_generator_expands_to_180_rows(self):
         sweep = [r for r in slp.load_corpus(slp.DEFAULT_CORPUS) if r["id"].startswith("b455-sweep-")]
         self.assertEqual(len(sweep), 180)  # 4 verbs x 9 tails x 5 wrappers, all distinct
+
+    def test_each_hook_defeater_family_keeps_its_exact_row_count(self):
+        # SAFETY-LINT-DEFEATER-CORPUS-1: one group per hook rule family, every row one fork/master DENIED when it was kept. A family that
+        # loses a row is a red test; raise its number in the commit that ADDS a master-denied row.
+        rows = slp.load_corpus(slp.DEFAULT_CORPUS)
+        for family, count in sorted(EXACT_HOOK_DEFEATER_FAMILY_ROWS.items()):
+            with self.subTest(family=family):
+                group = [r for r in rows if r["id"].startswith(family + "-")]
+                self.assertEqual(len(group), count)
+                self.assertTrue(all(r["lint"] == "hook" for r in group), family)
+                self.assertTrue(all("mlv-safety-lint-exemption-defeater-corpus-r1" in r["why"] for r in group), family)
 
     def test_the_derived_hook_rows_cannot_silently_shrink(self):
         self.assertGreaterEqual(len(slp.derived_hook_cases(REPO_ROOT)), MIN_DERIVED_HOOK_ROWS)
