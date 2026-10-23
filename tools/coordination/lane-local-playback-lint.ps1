@@ -141,6 +141,12 @@
 # that a ReadOnlyVerbs word introduces, in a sentence with no launch verb outside a prohibition (Test-ReadOnlyLauncherMention); `pwsh -File`,
 # the call operator, an explicit relative path, any word but MentionParenWords before the launcher, a colon or prose still refuse. Rules 3, 3b
 # and the app patterns are unchanged. Accepted over-refusal: a read-only mention outside a parenthesis ("Read <launcher> -Param to see ...").
+# r3 (sol r2 on 31e0d567, both refuse-only): C1 no longer exempts on the launch verb alone. A bare verb at the end of a line is a drive only
+# when the NEXT line of the same block opens with a DriveObjects word and holds no launch verb and no rule trigger ("then run\n<the app's
+# smoke mode>" and "then run" with no next line refuse again: the c1-real-line negative now refuses, the c1-real-paragraph one still
+# passes). C2 exempts a MENTION, never an invocation: the launcher's parameter must be followed by a MentionParamWords word (the parameter's
+# declaration, never a value) and the closing parenthesis, and the sentence must hold no InvokeWords word and no locally / host / here marker
+# ("Verify playback on this host by calling (<launcher> -Param cuda)" refuses again).
 #
 # ASCII only (PowerShell 5.1 reads a BOM-less file as the ANSI code page). No Set-StrictMode here: a dot-sourced file would leak it into the caller.
 
@@ -379,13 +385,22 @@ function Test-VenueExempts {
 # end of its clause, or the verb + a listed DriveObjects word and no second launch verb). "Assemble locally and run playback", "Build locally,
 # then play the clip" and "Run playback, then assemble locally" keep their verdict. This exempts the marker only; rules 3, 3b and 4 still read
 # the sentence ("..., then run the chains on this host" is refused by rule 3).
+# r3 (sol r2 C1): the verb ALONE is never a drive. It is one only when it is the last word of the sentence, the sentence ends its line, and
+# $NextLine (the next line of the same block, $null when there is none) opens with a DriveObjects word ($DriveNext) and holds no launch verb
+# and no rule trigger ($NextDefeaters: the next line is linted on its own, without the verb, so "then run\nthe chains on this host" would
+# otherwise pass). "Build MLVApp locally, then run\nit with <the smoke mode>." and "..., then run" with no next line refuse.
 function Test-CompileStepLocally {
-    param([string]$Sentence, [object[]]$Clauses, [object]$Clause, [int]$Index, [string]$CompilePiece, [string]$DriveTail)
+    param([string]$Sentence, [object[]]$Clauses, [object]$Clause, [int]$Index, [string]$CompilePiece, [string]$DriveTail, [string]$DriveBare,
+        [string]$DriveNext, [object[]]$NextDefeaters, [AllowNull()][string]$NextLine)
     if ($Clause.HasVerb -or $Clause.Contrast -or $Index -lt $Clause.Start) { return $false }
     if (-not (Get-LintRegex $CompilePiece).IsMatch($Sentence.Substring($Clause.Start, $Index - $Clause.Start))) { return $false }
     foreach ($k in $Clauses) {
         if ([object]::ReferenceEquals($k, $Clause) -or -not $k.HasVerb -or $k.Strong) { continue }
-        if (-not (Get-LintRegex $DriveTail).IsMatch($Sentence.Substring($k.Start, $k.End - $k.Start))) { return $false }
+        $kText = $Sentence.Substring($k.Start, $k.End - $k.Start)
+        if ((Get-LintRegex $DriveTail).IsMatch($kText)) { continue }
+        if ($k.End -ne $Sentence.Length -or [string]::IsNullOrEmpty($NextLine) -or -not (Get-LintRegex $DriveBare).IsMatch($kText)) { return $false }
+        if (-not (Get-LintRegex $DriveNext).IsMatch($NextLine)) { return $false }
+        foreach ($rx in $NextDefeaters) { if ($rx.IsMatch($NextLine)) { return $false } }
     }
     return $true
 }
@@ -396,9 +411,16 @@ function Test-CompileStepLocally {
 # launch verb outside a prohibition, a ReadOnlyVerbs word stands in the occurrence's clause before the parenthesis that holds it (balanced
 # one-level parentheses may sit between), nothing but one MentionParenWords word stands between that parenthesis and the launcher, and the
 # parenthesis closes after it. A mention with no read-only verb ("Then (<launcher> -Param cuda)"), after a colon, or in prose stays a launch.
+# r3 (sol r2 C2): a read-only verb is not enough. The parameter must be followed by a MentionParamWords word and the closing parenthesis
+# ($MentionPost: the parameter's declaration is named, no value is passed), and the sentence must hold no InvokeWords word and no locally /
+# host / here marker ($MentionDefeaters). "Verify playback on this host by calling (<launcher> -Param cuda)" is an invocation and refuses.
 function Test-ReadOnlyLauncherMention {
-    param([string]$Sentence, [object[]]$Clauses, [object]$Clause, [int]$SpanStart, [string]$SpanValue, [string]$MentionPre, [string]$Relative)
+    param([string]$Sentence, [object[]]$Clauses, [object]$Clause, [int]$SpanStart, [string]$SpanValue, [string]$MentionPre, [string]$Relative,
+        [string]$MentionPost, [object[]]$MentionDefeaters)
     foreach ($k in $Clauses) { if ($k.HasVerb -and -not $k.Strong) { return $false } }
+    foreach ($rx in $MentionDefeaters) { if ($rx.IsMatch($Sentence)) { return $false } }
+    $spanEnd = $SpanStart + $SpanValue.Length
+    if ($spanEnd -gt $Sentence.Length -or -not (Get-LintRegex $MentionPost).IsMatch($Sentence.Substring($spanEnd))) { return $false }
     if ($SpanValue.Contains('&') -or (Get-LintRegex $Relative).IsMatch($SpanValue)) { return $false }
     $lead = if ($SpanValue -match '^[\s`&(]') { 1 } else { 0 }
     $opened = (Get-LintRegex '^[(\x60\x27\x22\[]*').Match($SpanValue.Substring($lead)).Value
@@ -469,6 +491,10 @@ function Get-LocalPlaybackLintWordLists {
         DriveObjects               = @('chain', 'chains', 'venue chain', 'venue chains', 'leg', 'legs', 'venue leg', 'venue legs', 'chain runner')
         ReadOnlyVerbs              = @('confirm', 'confirms', 'check', 'checks', 'verify', 'verifies', 'inspect', 'inspects', 'read', 'reads', 'review', 'reviews', 'see', 'grep', 'compare', 'cite', 'quote')
         MentionParenWords          = @('see', 'per', 'in', 'from', 'cf')
+        # r3 (sol r2 C2). MentionParamWords only ADMITS: the word that must follow the parameter, a declaration (never a value the
+        # parameter could be passed). InvokeWords only DEFEATS: a sentence that holds one calls the launcher, whatever its read-only verb.
+        MentionParamWords          = @('ValidateSet', 'ValidateRange', 'ValidatePattern', 'ValidateScript')
+        InvokeWords                = @('call', 'calls', 'calling', 'called', 'use', 'uses', 'using', 'used', 'trigger', 'triggers', 'triggering', 'spawn', 'spawns', 'spawning', 'fire', 'fires', 'firing', 'exec', 'dot-source', 'dot-sourcing')
     }
 }
 
@@ -611,13 +637,22 @@ function Get-LintPatternSet {
     $compileVerb = ConvertTo-LintAlternation -Words @($lists.CompileVerbs)
     $driveObject = ConvertTo-LintAlternation -Words @($lists.DriveObjects)
     $compilePiece = "(?i)(?:^|[,(:;])\s*(?:(?:[-*+>]|\d{1,3}[.)])\s+)?(?:(?:please|just|also|now)\s+)*(?:${compileVerb})${e}(?:\s+[\w'.+\-]+){0,4}\s*\z"
-    $driveTail = "(?i)^\W*(?:(?:then|and|just|also|please|so)\s+)*(?:${verbs})${e}(?:\s*\W*\z|\s+(?:(?:the|a|an)\s+)?(?:${driveObject})${e}(?!.*${b}(?:${verbs})${e}))"
+    # r3 (sol r2 C1): the bare verb is no longer an alternative of the drive tail. $driveBare is the verb with nothing after it, a drive only
+    # when $driveNext (a DriveObjects word, no launch verb after it) opens the next line (Test-CompileStepLocally).
+    $driveLead = "(?i)^\W*(?:(?:then|and|just|also|please|so)\s+)*(?:${verbs})${e}"
+    $driveTail = "${driveLead}\s+(?:(?:the|a|an)\s+)?(?:${driveObject})${e}(?!.*${b}(?:${verbs})${e})"
+    $driveBare = "${driveLead}\s*\z"
+    $driveNext = "(?i)^\W*(?:(?:the|a|an)\s+)?(?:${driveObject})${e}(?!.*${b}(?:${verbs})${e})"
     # C2 (Test-ReadOnlyLauncherMention): a ReadOnlyVerbs word, then the clause up to the parenthesis that holds the launcher (one level of
     # balanced parentheses may sit between), then that parenthesis, at most one MentionParenWords word and quote / backtick marks, and the end.
     $readVerb = ConvertTo-LintAlternation -Words @($lists.ReadOnlyVerbs)
     $parenWord = ConvertTo-LintAlternation -Words @($lists.MentionParenWords)
     $mentionPre = "(?i)${b}(?:${readVerb})${e}(?:[^()]|\([^()]*\))*\(\s*(?:(?:${parenWord})${e}\s+)?[\x60\x27\x22]*\z"
     $mentionRelative = '(?<![\w.])\.{1,2}[\\/]'
+    # r3 (sol r2 C2): what follows the `-Param` of the span -- one MentionParamWords word, quote / backtick marks and the closing parenthesis
+    # -- and the InvokeWords that void the mention anywhere in the sentence.
+    $mentionPost = "(?i)^\s+(?:$(ConvertTo-LintAlternation -Words @($lists.MentionParamWords)))${e}[\x60\x27\x22]*\s*\)"
+    $mentionInvoke = "(?i)${b}(?:$(ConvertTo-LintAlternation -Words @($lists.InvokeWords)))${e}"
     $tailGrammar = $null; $headGrammar = $null; $itemGrammar = $null
     if ($WithGrammars) {
     # r10: the closed allow-grammar of the strictly terminal E1 (Test-VenueTerminalTail), a whitelist tokenizer as ONE anchored regex.
@@ -743,7 +778,9 @@ function Get-LintPatternSet {
         VenueQualified = $venueQualified; PlaybackWord = $playbackWord; VenueLocus = $venueLocus; RoutingLocally = $routingLocally
         Incident = $incident; LocalMarker = $localMarker; HostMarker = $hostMarker; HereMarker = $hereMarker
         HostDefeaters = $hostDefeaters; HostDefeatersLaunch = $hostDefeatersLaunch
-        CompilePiece = $compilePiece; DriveTail = $driveTail; MentionPre = $mentionPre; MentionRelative = $mentionRelative
+        CompilePiece = $compilePiece; DriveTail = $driveTail; DriveBare = $driveBare; DriveNext = $driveNext
+        MentionPre = $mentionPre; MentionRelative = $mentionRelative; MentionPost = $mentionPost
+        MentionDefeaters = @((New-LintRegex $mentionInvoke), (New-LintRegex $localMarker), (New-LintRegex $hostMarker), (New-LintRegex $hereMarker))
         Direct = $direct; ClipLaunch = $clipLaunch; ClipMention = $clipMention; AppBare = $appBare; AppEnd = $appEnd; ModeFlag = $modeFlag
         # the rule triggers, in the order they were always tried (the incident phrase, the three markers, the mode flag, then the launch patterns)
         Triggers = @((New-LintRegex $incident), (New-LintRegex $localMarker), (New-LintRegex $hostMarker), (New-LintRegex $hereMarker), (New-LintRegex $modeFlag)) + @($direct | ForEach-Object { New-LintRegex $_ })
@@ -780,10 +817,13 @@ function Get-LocalPlaybackPromptFindings {
     # cannot hide behind formatting.
     $items = New-Object System.Collections.Generic.List[object]
     $blockId = 0
+    # r3 (sol r2 C1): every item knows its line, so the compile-step exemption can read the line that continues a bare launch verb.
+    $lineNo = 0
     foreach ($line in ($scan -split "\r?\n")) {
+        $lineNo++
         if ($line -match '^\s*#{1,6}\s') { $blockId++ }
         foreach ($piece in ($line -split '(?<=[.!?])\s+')) {
-            if ($piece.Trim()) { $items.Add([pscustomobject]@{ Text = $piece.Trim(); Block = $blockId }) }
+            if ($piece.Trim()) { $items.Add([pscustomobject]@{ Text = $piece.Trim(); Block = $blockId; Line = $lineNo; LineText = $line }) }
         }
     }
     # NA2-RULE4-SENTENCE-SPLIT-AND-CODESPAN-APP-1: an item holds an ORPHAN mode flag when one of its mode flags sits in no app launch match of
@@ -852,7 +892,10 @@ function Get-LocalPlaybackPromptFindings {
                     if ((Test-ContrastLead -Sentence $s -Clause $c -Index $m.Index) -and
                         -not (Test-LocalHostInScope -Sentence $s -Clauses $clauses -Clause $c -HostPatterns $hostDefeaters)) { continue }
                     # C1: `locally` is the adverb of a compile step and nothing else in the sentence launches except a venue-chain drive
-                    if (Test-CompileStepLocally -Sentence $s -Clauses $clauses -Clause $c -Index $m.Index -CompilePiece $patterns.CompilePiece -DriveTail $patterns.DriveTail) { continue }
+                    # r3: a bare launch verb ending the line reads its object on the NEXT line (adjacent, same block; none -> $null)
+                    $nextLine = $null
+                    if ($itemIndex + 1 -lt $items.Count -and $items[$itemIndex + 1].Line -eq $items[$itemIndex].Line + 1 -and $items[$itemIndex + 1].Block -eq $block) { $nextLine = $items[$itemIndex + 1].LineText.Trim() }
+                    if (Test-CompileStepLocally -Sentence $s -Clauses $clauses -Clause $c -Index $m.Index -CompilePiece $patterns.CompilePiece -DriveTail $patterns.DriveTail -DriveBare $patterns.DriveBare -DriveNext $patterns.DriveNext -NextDefeaters $triggers -NextLine $nextLine) { continue }
                     # E1 is strictly terminal (r10): the rest of the sentence and of the block must be in the closed, verbless allow-grammar
                     # (Test-VenueTerminalTail). r12: the HEAD is read the same way -- everything of this sentence before `locally` (every
                     # earlier clause, every earlier ';' group, the marker clause's own prefix) must be in the closed head grammar, and so
@@ -955,7 +998,7 @@ function Get-LocalPlaybackPromptFindings {
                             ($routed -and (Test-VenueExempts -Sentence $s -Clauses $clauses -Clause $c -HostPatterns $hostDefeatersLaunch)) -or
                             (Test-ContrastLead -Sentence $s -Clause $c -Index $occ.Start) -or
                             # C2: the bare `<launcher> -Param` form inside a parenthetical that a read-only verb introduces is a mention
-                            (($occ.Pi -eq 2) -and -not $occ.Merged -and (Test-ReadOnlyLauncherMention -Sentence $s -Clauses $clauses -Clause $c -SpanStart $occ.Start -SpanValue $occ.Value -MentionPre $patterns.MentionPre -Relative $patterns.MentionRelative))
+                            (($occ.Pi -eq 2) -and -not $occ.Merged -and (Test-ReadOnlyLauncherMention -Sentence $s -Clauses $clauses -Clause $c -SpanStart $occ.Start -SpanValue $occ.Value -MentionPre $patterns.MentionPre -Relative $patterns.MentionRelative -MentionPost $patterns.MentionPost -MentionDefeaters $patterns.MentionDefeaters))
                         if (-not $exempt) { $hit = 'direct-playback-launch'; break }
                     }
                     $i = $j + 1

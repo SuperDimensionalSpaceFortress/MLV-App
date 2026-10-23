@@ -3532,6 +3532,12 @@ class CompileStepAndReadMentionTests(unittest.TestCase):
     sentence with no launch verb, is not a launch. The call operator, an explicit relative path, `pwsh -File` and any word but a listed one
     between the parenthesis and the launcher keep it a launch.
 
+    r3 (sol r2 CHANGES_REQUESTED on 31e0d567): C1 exempted on the launch verb ALONE, so a line break between the verb and its app / smoke
+    object hid the launch; C2 took a read-only word as enough to exempt an invocation that passes a value and says it calls the launcher on
+    this host. A bare verb now drives only when the NEXT line opens with a DriveObjects word (no launch verb, no rule trigger), and a mention
+    must name the parameter's declaration (MentionParamWords) in a sentence with no InvokeWords word and no locally / host / here marker.
+    The r1 negative c1-real-line (the verb with no next line) now refuses: its object is missing, and the safety floor wins.
+
     Every row names its card; the negatives (must pass) and the safety-floor positives (must still be refused) are ONE table each."""
 
     LAUNCHER = SMOKE_SCRIPT
@@ -3545,8 +3551,8 @@ class CompileStepAndReadMentionTests(unittest.TestCase):
 
     # (label, text): the lint must return NO finding.
     MUST_PASS = (
-        ("c1-real-line", C1_REAL_LINE),
         ("c1-real-paragraph", C1_REAL_PARAGRAPH),
+        ("c1-next-line-venue-chains", "Build MLVApp locally, stage the smoke runner to Bachelor, then run\nthe venue chains on Bachelor."),
         ("c1-one-sentence", "Assemble locally (-j2), stage to Bachelor, stage the smoke runner, then run the chains."),
         ("c1-build-venue-chains", "Build locally (-j2), stage the smoke runner to Bachelor, then run the venue chains."),
         ("c1-compile-legs", "Compile locally, stage the smoke runner to Bachelor, then run the legs."),
@@ -3588,6 +3594,25 @@ class CompileStepAndReadMentionTests(unittest.TestCase):
         ("c2-pwsh-file-in-parentheses", f"Confirm from the runner (pwsh -File {PARAM}ValidateSet)."),
         ("c2-launch-verb-in-the-sentence", f"Confirm the runner by executing ({PARAM}ValidateSet)."),
         ("c2-app-in-parentheses", f"Confirm from the runner ({APP} {SMOKE_MODE} take01.dat)."),
+        # r3 (sol r2 CHANGES_REQUESTED on 31e0d567, findings[0].repro and findings[1].repro, verbatim): merge-base refuses all three.
+        ("c1-sol-r2-launch-object-on-the-next-line", "Build MLVApp locally, then run\nit with the smoke mode."),
+        ("c2-sol-r2-verify-by-calling-on-this-host", f"Verify playback on this host by calling ({PARAM}cuda)."),
+        ("c2-sol-r2-check-by-calling-on-this-host", f"Check playback on this host by calling ({PARAM}cuda)."),
+        # r3: the shapes around the two sol rows. The r1 negative c1-real-line moved here (its launch verb has no object at all).
+        ("c1-real-line-object-missing", C1_REAL_LINE),
+        ("c1-bare-verb-then-period", "Build MLVApp locally, then run.\nthe chains."),
+        ("c1-next-line-smoke-runner", "Build MLVApp locally, then run\nthe smoke runner."),
+        ("c1-next-line-chains-on-this-host", "Build MLVApp locally, then run\nthe chains on this host."),
+        ("c1-next-line-chains-then-play", "Build MLVApp locally, then run\nthe chains and play the clip."),
+        ("c1-next-line-after-a-blank-line", "Build MLVApp locally, then run\n\nthe chains."),
+        ("c1-next-line-is-a-heading", "Build MLVApp locally, then run\n## the chains"),
+        ("c1-bare-verb-mid-sentence", "Build MLVApp locally, then run, then stage the chains."),
+        ("c2-value-not-a-declaration", f"Verify from the runner ({PARAM}cuda)."),
+        ("c2-declaration-then-value", f"Verify from the runner ({PARAM}ValidateSet cuda)."),
+        ("c2-declaration-on-this-host", f"Verify from the runner ({PARAM}ValidateSet) on this host."),
+        ("c2-declaration-locally", f"Verify locally from the runner ({PARAM}ValidateSet)."),
+        ("c2-declaration-by-calling", f"Verify by calling the runner ({PARAM}ValidateSet)."),
+        ("c2-backticked-invocation", f"Verify playback by calling (`{PARAM}cuda`)."),
     )
 
     @classmethod
@@ -3618,9 +3643,17 @@ class CompileStepAndReadMentionTests(unittest.TestCase):
         for obj in lists.get("DriveObjects", []):
             rows.append((f"DriveObjects:{obj}:allow", True, f"Assemble locally, stage the smoke runner to Bachelor, then run the {obj}."))
             rows.append((f"DriveObjects:{obj}:defeater", False, f"Assemble locally, stage the smoke runner to Bachelor, then run the {obj} and play the clip."))
+            # r3: the same object on the NEXT line of a bare verb
+            rows.append((f"DriveObjects:{obj}:next-line-allow", True, f"Assemble locally, stage the smoke runner to Bachelor, then run\nthe {obj} on Bachelor."))
+            rows.append((f"DriveObjects:{obj}:next-line-defeater", False, f"Assemble locally, stage the smoke runner to Bachelor, then run\nthe {obj} here."))
         for word in lists.get("MentionParenWords", []):
             rows.append((f"MentionParenWords:{word}:allow", True, f"Confirm from the runner ({word} {cls.PARAM}ValidateSet)."))
             rows.append((f"MentionParenWords:{word}:defeater", False, f"Confirm from the runner ({word} & {cls.PARAM}cuda)."))
+        for word in lists.get("MentionParamWords", []):
+            rows.append((f"MentionParamWords:{word}:allow", True, f"Confirm from the runner ({cls.PARAM}{word})."))
+            rows.append((f"MentionParamWords:{word}:defeater", False, f"Confirm from the runner ({cls.PARAM}{word} cuda)."))
+        for word in lists.get("InvokeWords", []):
+            rows.append((f"InvokeWords:{word}:defeater", False, f"Confirm the runner by {word} ({cls.PARAM}ValidateSet)."))
         return rows
 
     def test_every_negative_fixture_passes(self):
@@ -3632,10 +3665,10 @@ class CompileStepAndReadMentionTests(unittest.TestCase):
         self.assertEqual([], wrong, "real launch shapes the lint no longer refuses")
 
     def test_the_lint_exposes_the_lists_the_two_exemptions_read(self):
-        for key in ("CompileVerbs", "ReadOnlyVerbs", "DriveObjects", "MentionParenWords"):
+        for key in ("CompileVerbs", "ReadOnlyVerbs", "DriveObjects", "MentionParenWords", "MentionParamWords", "InvokeWords"):
             self.assertTrue(self.lists.get(key), f"list {key} is missing or empty")
         body = _lint_reading_body()
-        for key in ("CompileVerbs", "ReadOnlyVerbs", "DriveObjects", "MentionParenWords"):
+        for key in ("CompileVerbs", "ReadOnlyVerbs", "DriveObjects", "MentionParenWords", "MentionParamWords", "InvokeWords"):
             self.assertIn(f"$lists.{key}", body, f"the lint does not read list {key}")
 
     def test_no_listed_verb_of_the_new_lists_is_a_launch_verb(self):
