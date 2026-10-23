@@ -1204,6 +1204,88 @@ def test_a_record_published_after_the_sweep_read_it_naming_an_excluded_path_is_n
     assert _retiring_of(wt).exists() and not wt.exists() and _pending_records(main) == recs, "nothing touched, the record stays"
 
 
+# r4 on PR #632 (sol r3 blocker): the record directory exists when the restore checks it, and is gone before its claim opens owner.lock.
+# The Enter-RetirePendingRecord seam runs `claim` (PowerShell; $dir is the record directory) in place of the claim's first step, so the
+# disappearance lands exactly between the existence check and the open. Ordered by the seam, no sleeps.
+OWNER_SETTLES_BEFORE_THE_CLAIM = "[IO.Directory]::Delete($dir, $true); & $origEnter $dir"
+
+
+def _sweep_claim_seam(main, root, tmp, claim):
+    """Sweep in which the enumeration read of every record.json fails (Record = $null, as for a record not yet published) and each claim
+    attempt is counted and runs `claim`. Returns (sweep summary, claim attempts)."""
+    seam = ("$script:ClaimCalls = 0; $origEnter = ${function:Enter-RetirePendingRecord}; "
+            f"function Enter-RetirePendingRecord {{ param([string]$dir) $script:ClaimCalls++; {claim} }}; "
+            "$script:Hid = $false; function Get-Content { $hit = @($args | Where-Object { $_ -is [string] -and $_ -like '*\\record.json' }); "
+            "if ($hit.Count -and -not $script:Hid) { $script:Hid = $true; throw [IO.FileNotFoundException]::new('seam: record.json not yet published') }; "
+            "Microsoft.PowerShell.Management\\Get-Content @args }; ")
+    script = ("$ErrorActionPreference='Stop'; Set-StrictMode -Version Latest; "
+              f". '{HELPER}'; {HOST_SNAPSHOT_FILTER}{seam}"
+              f"$s = Invoke-SweepMergedLaneWorktrees -RepoRoot '{main}' -Root '{root}' -MergeTarget 'origin/master' -MinIdleHours 24 "
+              f"-QuarantineRoot '{tmp / 'q'}'; [pscustomobject]@{{ sweep = $s; claimCalls = $script:ClaimCalls }} | ConvertTo-Json -Depth 6")
+    out = json.loads(subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", script],
+                                    check=True, capture_output=True, text=True).stdout)
+    return out["sweep"], out["claimCalls"]
+
+
+def test_a_record_directory_its_owner_removes_between_the_existence_check_and_the_claim_is_gone_not_failed(repo):
+    """NEW CATALOGUE ROW (sol r3 blocker on PR #632): missing record.json during enumeration; the owner deletes the emptied record
+    directory after the restore's Test-Path succeeds but before owner.lock opens -> gone, never failed. Opening owner.lock in a directory
+    that no longer exists throws DirectoryNotFoundException; that, with the directory confirmed absent afterwards, is the owner's
+    settlement, not a failure. Nothing is renamed."""
+    tmp, main = repo
+    root = tmp / "lanes"
+    wt = _add_wt(main, root / "wt-dir-vanished")
+    _strand_registered(main, wt)
+    assert len(_pending_records(main)) == 1
+    s, claims = _sweep_claim_seam(main, root, tmp, OWNER_SETTLES_BEFORE_THE_CLAIM)
+    rows = s["strandedRestore"]
+    assert len(rows) == 1 and rows[0]["state"] == "gone" and "settled by its owner" in rows[0]["note"], s
+    assert claims == 1 and s["error"] is None, (claims, s)
+    assert _retiring_of(wt).exists() and not wt.exists() and _pending_records(main) == [], "nothing renamed; nothing left to keep"
+
+
+def test_a_claim_refused_for_permission_while_the_record_directory_exists_stays_failed_and_the_record_is_kept(repo):
+    """Companion: only the owner's settlement is 'gone'. A claim that fails for any other reason, here access denied with the record
+    directory still present, stays 'failed' with its error text, and the record and both paths are kept."""
+    tmp, main = repo
+    root = tmp / "lanes"
+    wt = _add_wt(main, root / "wt-claim-denied")
+    _strand_registered(main, wt)
+    recs = _pending_records(main)
+    s, claims = _sweep_claim_seam(main, root, tmp, "throw [UnauthorizedAccessException]::new('seam: access to owner.lock is denied')")
+    rows = s["strandedRestore"]
+    assert len(rows) == 1 and rows[0]["state"] == "failed" and "access to owner.lock is denied" in rows[0]["note"] and claims == 1, s
+    assert _retiring_of(wt).exists() and not wt.exists() and _pending_records(main) == recs, "nothing touched, the record stays"
+
+
+def test_a_claim_reporting_directory_not_found_while_the_record_directory_still_exists_stays_failed(repo):
+    """Companion: DirectoryNotFoundException alone is not the settlement. With the record directory still there after the failure the
+    exception is not masked: 'failed' with its error text, the record kept."""
+    tmp, main = repo
+    root = tmp / "lanes"
+    wt = _add_wt(main, root / "wt-claim-dnf-present")
+    _strand_registered(main, wt)
+    recs = _pending_records(main)
+    s, claims = _sweep_claim_seam(main, root, tmp, "throw [IO.DirectoryNotFoundException]::new('seam: a part of the path was not found')")
+    rows = s["strandedRestore"]
+    assert len(rows) == 1 and rows[0]["state"] == "failed" and "a part of the path was not found" in rows[0]["note"] and claims == 1, s
+    assert _retiring_of(wt).exists() and not wt.exists() and _pending_records(main) == recs, "nothing touched, the record stays"
+
+
+def test_the_next_call_for_a_stranded_worktree_whose_record_directory_vanishes_before_the_claim_reports_gone(repo):
+    """The same race on the per-call restore entry (Restore-StrandedRetiring -> Restore-LaneWorktreeRename): its record read fine, then
+    the owner settles it before the claim. strandedRestore is 'gone', the call keeps the worktree with that reason, and nothing is renamed."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-call-dir-vanished")
+    _strand_registered(main, wt)
+    prelude = ("$origEnter = ${function:Enter-RetirePendingRecord}; "
+               f"function Enter-RetirePendingRecord {{ param([string]$dir) {OWNER_SETTLES_BEFORE_THE_CLAIM} }}; ")
+    d, _ = _gate_real(wt, whatif=False, prelude=prelude)
+    assert d["strandedRestore"]["state"] == "gone" and "settled by its owner" in d["strandedRestore"]["note"], d
+    assert d["action"] == "kept" and d["reason"].startswith("stranded-retiring: "), d
+    assert _retiring_of(wt).exists() and not wt.exists() and _pending_records(main) == [], "nothing renamed; nothing left to keep"
+
+
 # r2 (Sol r1 B1/B2): a holder that appears AFTER the first decision must stop the retry too. The retry window is where the worktree is
 # half-removed and a handle still blocks it, so a process that starts in it is exactly the one the gate was written to refuse.
 # Scans are numbered: 1 = the gate, 2 = the last look before removal, 3.. = one fresh scan before each retry attempt that may delete.

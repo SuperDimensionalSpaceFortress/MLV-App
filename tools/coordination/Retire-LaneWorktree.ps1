@@ -845,7 +845,17 @@ function Restore-LaneWorktreeRename {
     try {
         if (-not $Claim) {
             if (-not (Test-Path -LiteralPath $RecordDir)) { $res.state = 'gone'; $res.note = "the rename record $RecordDir no longer exists"; return $res }
-            $Claim = Enter-RetirePendingRecord $RecordDir
+            # r13 (sol r3 blocker on PR #632; catalogue row: the owner deletes the emptied record directory after the check above, before
+            # owner.lock opens -> gone, never failed): opening owner.lock in a directory that is no longer there throws a not-found error. Only
+            # that, with the directory confirmed absent afterwards, is the owner's settlement; any other claim failure goes on to 'failed'.
+            try { $Claim = Enter-RetirePendingRecord $RecordDir }
+            catch {
+                $cx = $_.Exception; while ($cx.InnerException) { $cx = $cx.InnerException }
+                if (($cx -is [IO.DirectoryNotFoundException] -or $cx -is [IO.FileNotFoundException]) -and -not (Test-Path -LiteralPath $RecordDir)) {
+                    $res.state = 'gone'; $res.note = "the rename record $RecordDir was settled by its owner before the claim"; return $res
+                }
+                throw
+            }
             if (-not $Claim) {
                 $op = if ($null -ne $Record) { Get-RetireRecordValue $Record 'ownerPid' }
                 $res.state = 'owned'; $res.note = "held by a live operation$(if ($op) { " (record written by pid $op)" }): its owner.lock is open, so neither path nor the record is touched"
