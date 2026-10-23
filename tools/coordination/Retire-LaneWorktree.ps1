@@ -21,13 +21,14 @@
                                        fresh scan right before anything is moved or deleted.
       kept     cwd-probe-unavailable   (r2) the current-directory probe cannot run here (Add-Type failed, ConstrainedLanguage,
                                        32-bit host), so a holder whose only link is its cwd cannot be seen. Fail closed.
-      kept     cwd-unknown             (r2) a live process that could hold the path has a current directory the probe could
-                                       not read (other user, elevated, protected) and that was created at/after the worktree
-                                       or has no readable creation time (r3), and whose owner the SCM cannot name as a
-                                       well-known service identity bound to the live process (r4, r5), or runs a
-                                       relative script path with an unknown cwd. Fail closed. Fields: disposition.cwdProbe,
-                                       cwdUnknown, cwdExempt, worktreeCreatedUtc, cwdExemptOwner, cwdOwnerProbe,
-                                       cwdOwnerSkipped.
+      kept     cwd-unknown             (r2) a live process that could hold the path runs a relative script path with an unknown
+                                       cwd, or an -EncodedCommand the gate cannot decode (r6). Fail closed. (r7: an UNREADABLE
+                                       cwd (other user, elevated, protected) is no longer in this set - see RENAME PROBE below;
+                                       it is still listed in disposition.cwdUnknown as evidence, with the r3-r5 exemption
+                                       fields cwdExempt, worktreeCreatedUtc, cwdExemptOwner, cwdOwnerProbe, cwdOwnerSkipped.)
+      kept     in-use                  (r7) the worktree root could not be renamed to <root>.retiring: some handle is open beneath it
+      kept     cannot-determine        (r7) <root>.retiring already exists, or the rename failed for a reason other than a handle
+      kept     remove-failed           (r7) the removal failed after a good rename: the root is renamed back and git repointed at it
       kept     dirty                  `git status --porcelain -uall` is non-empty
       kept     unpushed                HEAD has commits not on any remote
       kept     unmerged                HEAD is on a remote but not an ancestor of -MergeTarget
@@ -105,6 +106,31 @@
     that is not base64 of UTF-16LE text (or a switch with no value) is a holder the gate cannot read, so it is kept like an
     unreadable cwd (kept / cwd-unknown, Why=encoded-command-undecodable, no creation-time or service-owner exemption).
     NOT adopted from dng: its seat-ancestry exemption and report-leftovers-only reclaim (retire refuses on ANY live holder).
+
+    RENAME PROBE (r7, 2026-10-23, LANE-RETIRE-CWD-UNKNOWN-RENAME-PROBE-1): the cwd-unknown rule retired 0 worktrees in 55 lane
+      receipts. Its question - "could a process whose cwd I cannot read be sitting in this tree?" - is one the ACL of that
+      process puts out of reach, and on this host ~14 unreadable pids (IIS w3wp.exe app pools, TeamViewer_Desktop, WmiPrvSE,
+      elevated pwsh/conhost, sleep.exe) were always newer than the worktree, so every MERGED-PR lane checkout was kept.
+      RENAMING the worktree root to <root>.retiring is the probe instead: NTFS refuses a directory rename while ANY handle
+      beneath it is open (a cwd counts; so does a file, whatever its share mode - measured 2026-10-22), and it does so whoever
+      owns the handle. The rename asks the file system the question directly, so it needs no read access to the holder.
+      Order: the readable-cwd, command-line, script and encoded-command checks run first and still name their holders
+      (live-process, cwd-unknown for a relative script / undecodable -EncodedCommand, cwd-probe-unavailable); then every
+      other gate; then the fresh rescan; then the rename.
+      Rename fails -> kept / in-use, nothing moved. Rename ok -> `git worktree repair` repoints git's admin entry at the renamed
+      directory (CHOSEN over renaming back before the removal: the tree stays under a name no process knows for the whole
+      removal, so nothing can step into it between the probe and the delete, and `git worktree remove` / `list` / `prune` agree
+      with the disk at every moment), and the existing clean / quarantine / `git worktree remove` / retry steps run on the renamed
+      path. Any outcome but `retired` renames the root BACK and repairs again, so a kept worktree is never left as .retiring;
+      the outcome is in disposition.renameRestore (state: not-renamed | restored | failed | gone, note). Only a rename-back that
+      itself fails leaves <root>.retiring behind (stderr: LEFT-RETIRING ...); while git still lists it, which it does unless `git worktree
+      remove` had already half-failed and deregistered it, the next sweep judges it under -Root like any other worktree. A leftover <root>.retiring from a crash between the rename and the repair is never overwritten (kept,
+      cannot-determine). -WhatIf never renames: its would-retire says renameProbe 'not-run: WhatIf' and means "retires unless the
+      rename finds a handle". RESIDUAL RISK, accepted: a handle opened in the moment between the rename and the rename-back is
+      refused by the rename-back, not prevented; one rename attempt per call (a transient scanner handle keeps the worktree for
+      this sweep, the next lane exit asks again).
+      Get-CwdUnknownRefusal keeps its fail-closed default for its other caller (Remove-LaneBulkScratch.ps1, which has no rename
+      to lean on); this function opts in with -DeferUnreadableCwd.
 
     Branch refs are NEVER deleted, so every retirement is undoable with `git worktree add`.
     ASCII-only by project convention.
@@ -541,7 +567,10 @@ function Get-CwdUnknownRefusal {
     # r5: and only when that configured account is bound to the LIVE process: every service at the pid has a registry key
     # last written strictly EARLIER than the process CreationDate. Key newer (scm-config-newer-than-process:<svc>), key
     # time unreadable (scm-config-time-unreadable:<svc>) or process time unreadable (scm-process-time-unreadable): refused.
-    param([object]$Snapshot, [string]$WorktreePath)
+    # r7: -DeferUnreadableCwd (the retirement gate only) moves every row whose ONLY problem is an unreadable cwd (cwd-unreadable, or
+    # the r5 scm-* binding refusals derived from it) out of Unknown/Reason/Rows into Deferred: the rename probe answers it. Rows
+    # that name a different problem (relative-script-unresolved, encoded-command-undecodable, cwd-probe-unavailable) stay refusals.
+    param([object]$Snapshot, [string]$WorktreePath, [switch]$DeferUnreadableCwd)
     $idx = Get-LaneHolderIndex -Snapshot $Snapshot
     $wtCreated = try { (Get-Item -LiteralPath $WorktreePath -ErrorAction Stop).CreationTimeUtc } catch { $null }
     $unk = @(); $exempt = 0; $owner = @(); $ownerProbe = $null; $ownerSkipped = @()
@@ -575,8 +604,15 @@ function Get-CwdUnknownRefusal {
         $unk += $u
     }
     $made = if ($null -ne $wtCreated) { ([datetime]$wtCreated).ToString('o') } else { $null }
+    $describe = { param($u) $t = if ($u.CreatedUtc) { ([datetime]$u.CreatedUtc).ToString('o') } else { 'unreadable' }; "$($u.ProcessId) $($u.Name) $($u.Why) created=$t" }
+    $deferred = @()
+    if ($DeferUnreadableCwd -and $idx.CwdProbe -eq 'ok') {
+        $deferred = @($unk | Where-Object { $_.Why -ne 'relative-script-unresolved' -and $_.Why -ne 'encoded-command-undecodable' })
+        $unk = @($unk | Where-Object { $_.Why -eq 'relative-script-unresolved' -or $_.Why -eq 'encoded-command-undecodable' })
+    }
     $res = [pscustomobject]@{ Probe = [string]$idx.CwdProbe; Reason = $null; Rows = @(); Unknown = @(); Exempt = $exempt; WorktreeCreatedUtc = $made
-                              ExemptOwner = $owner; OwnerProbe = $ownerProbe; OwnerSkipped = $ownerSkipped }
+                              ExemptOwner = $owner; OwnerProbe = $ownerProbe; OwnerSkipped = $ownerSkipped
+                              Deferred = @($deferred | ForEach-Object { & $describe $_ }) }
     if (-not $unk.Count) { return $res }
     $first = ($unk | Select-Object -First 5 | ForEach-Object { "$($_.ProcessId) $($_.Name) ($($_.Why))" }) -join ', '
     $res.Reason = if ($idx.CwdProbe -ne 'ok') { "cwd-probe-unavailable: the current-directory probe cannot run, so $($unk.Count) process(es) cannot be ruled out as holders, first: $first" }
@@ -586,8 +622,29 @@ function Get-CwdUnknownRefusal {
         $res.Reason += ' (encoded-command-undecodable: an -EncodedCommand argument that does not decode as UTF-16LE base64 is never treated as "not a holder")'
     }
     $res.Rows = @($unk | Select-Object -First 20 | ForEach-Object { [pscustomobject]@{ ProcessId = $_.ProcessId; Name = $_.Name; Via = $(if ($_.Why -eq 'encoded-command-undecodable') { 'encoded-command-undecodable' } else { $via }) } })
-    $res.Unknown = @($unk | ForEach-Object { $t = if ($_.CreatedUtc) { ([datetime]$_.CreatedUtc).ToString('o') } else { 'unreadable' }; "$($_.ProcessId) $($_.Name) $($_.Why) created=$t" })
+    $res.Unknown = @($unk | ForEach-Object { & $describe $_ })
     return $res
+}
+
+function Move-LaneWorktreeRoot {
+    # r7: rename a worktree root. Returns $null on success, else the failure message. NTFS refuses the rename while any handle is
+    # open beneath the directory; that refusal IS the holder test. A seam: a test wraps it to act between the probe and the removal.
+    param([string]$From, [string]$To)
+    try { [IO.Directory]::Move($From, $To); return $null } catch { return [string]$_.Exception.Message }
+}
+
+function Repair-LaneWorktreePath {
+    # r7: after a worktree root is renamed, repoint git's admin entry (<common>\worktrees\<name>\gitdir) at its new location, then
+    # confirm `git worktree list` shows exactly that path. Returns $null on success, else the failure message. A seam for tests.
+    param([string]$Main, [string]$Path)
+    $o = @(& git.exe -c core.longpaths=true -C $Main worktree repair $Path 2>&1 | ForEach-Object { "$_" })
+    if ($LASTEXITCODE) { return 'git worktree repair: ' + ($o -join ' | ') }
+    $wl = @(& git.exe -C $Main worktree list --porcelain 2>&1 | ForEach-Object { "$_" })
+    if ($LASTEXITCODE) { return 'git worktree list after repair: ' + ($wl -join ' | ') }
+    $want = ($Path -replace '/', '\').TrimEnd('\')
+    $listed = @($wl | Where-Object { $_ -like 'worktree *' } | Where-Object { (($_.Substring(9) -replace '/', '\').TrimEnd('\')) -ieq $want })
+    if (-not $listed.Count) { return "git worktree list does not show $want after the repair" + $(if ($o.Count) { ': ' + ($o -join ' | ') } else { '' }) }
+    return $null
 }
 
 function Write-RefusedHolders {
@@ -620,6 +677,9 @@ function Invoke-RetireLaneWorktree {
         fsmonitorStop = [ordered]@{ disable = $null; early = $null; remove = $null; final = $null }
         # CI-FLAKE-RETIRE-HOLDER-EXIT-PERMISSION-DENIED-1: how many removal attempts ran (0 = never reached) and one note per failed attempt.
         removeAttempts = 0; removeNotes = @()
+        # r7 (RENAME PROBE): 'not-run' | 'not-run: WhatIf ...' | 'ok' | 'in-use: <why>'. renameRestore is a nested table on purpose: the finally
+        # block fills it after a `return` has already copied the top-level fields (state: not-renamed | restored | failed | gone).
+        renameProbe = 'not-run'; renameRestore = [ordered]@{ state = 'not-renamed'; note = $null }
         utc = (Get-Date).ToUniversalTime().ToString('o')
     }
     function Get-FsmonitorStepNote([object]$Result) {
@@ -629,15 +689,16 @@ function Invoke-RetireLaneWorktree {
     }
     # Fail closed on the cwd probe's own blind spots (see CWD PROBE IS LOUD): true = refused, disposition filled in.
     function Test-CwdRefusal([object]$Sn) {
-        $r = Get-CwdUnknownRefusal -Snapshot $Sn -WorktreePath $wd
+        $r = Get-CwdUnknownRefusal -Snapshot $Sn -WorktreePath $wd -DeferUnreadableCwd
         $d.cwdProbe = [string]$r.Probe
+        # r7: unreadable-cwd pids are evidence, not a refusal; the rename probe settles them.
+        $d.cwdUnknown = @($r.Deferred) + @($r.Unknown)
         $d.cwdExempt = [int]$r.Exempt
         $d.worktreeCreatedUtc = $r.WorktreeCreatedUtc
         $d.cwdExemptOwner = @($r.ExemptOwner)
         $d.cwdOwnerProbe = $r.OwnerProbe
         $d.cwdOwnerSkipped = @($r.OwnerSkipped)
         if (-not @($r.Unknown).Count) { return $false }
-        $d.cwdUnknown = $r.Unknown
         Write-RefusedHolders -WorktreePath $wd -Holders $r.Rows
         $d.reason = $r.Reason
         return $true
@@ -646,7 +707,7 @@ function Invoke-RetireLaneWorktree {
         $o = & git.exe -C $C @A 2>&1
         [pscustomobject]@{ code = $LASTEXITCODE; out = @($o | ForEach-Object { "$_" }) }
     }
-    $wd = $null
+    $wd = $null; $origWd = $null; $renamed = $false
     try {
         if (-not (Test-Path -LiteralPath $WorkDir -PathType Container)) { $d.action = 'skipped'; $d.reason = 'not-a-linked-worktree: path absent'; return [pscustomobject]$d }
         $wd = (Resolve-Path -LiteralPath $WorkDir).Path.TrimEnd('\')
@@ -707,7 +768,11 @@ function Invoke-RetireLaneWorktree {
         $keep = @($ign.out | Where-Object { $_ -like '!!*' } | ForEach-Object { $_.Substring(3) } | Where-Object { $_ -notmatch $script:RetireDebrisPattern })
         if ($keep.Count -and -not $QuarantineRoot) { $d.reason = "cannot-determine: $($keep.Count) ignored non-debris entr(y/ies) and no -QuarantineRoot"; return [pscustomobject]$d }
         if (Test-CwdRefusal $snap) { return [pscustomobject]$d }
-        if ($WhatIf) { $d.action = 'would-retire'; $d.reason = 'ok'; $d.quarantined = $keep; return [pscustomobject]$d }
+        if ($WhatIf) {
+            $d.action = 'would-retire'; $d.reason = 'ok'; $d.quarantined = $keep
+            $d.renameProbe = 'not-run: WhatIf (a real retire renames the root to <root>.retiring first; an open handle there keeps it as in-use)'
+            return [pscustomobject]$d
+        }
 
         # Last look before anything is moved or deleted, on a FRESH scan: the gate above took seconds (a sweep reuses a
         # snapshot up to 30 s old), and a holder that started since is not in it. A failed scan is not an all-clear.
@@ -722,8 +787,24 @@ function Invoke-RetireLaneWorktree {
         }
         if (Test-CwdRefusal $fresh) { return [pscustomobject]$d }
 
+        # r7 RENAME PROBE (see the header): the file system, not the ACL of a holder, says whether anything is open beneath the root.
+        $origWd = $wd
+        $retiring = $wd + '.retiring'
+        if (Test-Path -LiteralPath $retiring) { $d.reason = "cannot-determine: $retiring already exists (left by an earlier run); not overwritten"; return [pscustomobject]$d }
+        $mv = Move-LaneWorktreeRoot -From $wd -To $retiring
+        if ($mv) {
+            $d.renameProbe = 'in-use: ' + $mv
+            $d.reason = if ($mv -match $script:RemoveRetryablePattern) { "in-use: the worktree root cannot be renamed to $retiring, so a handle is open beneath it ($mv)" }
+                        else { "cannot-determine: renaming the worktree root to $retiring failed ($mv)" }
+            return [pscustomobject]$d
+        }
+        $renamed = $true; $wd = $retiring
+        $d.renameProbe = 'ok'
+        $fix = Repair-LaneWorktreePath -Main $main -Path $wd
+        if ($fix) { $d.reason = "cannot-determine: git could not be repointed at the renamed worktree ($fix)"; return [pscustomobject]$d }
+
         # <leaf>-<utc stamp>: two same-named worktrees retired the same day must not nest into each other.
-        $qDir = Join-Path $QuarantineRoot ('{0}-{1}' -f (Split-Path $wd -Leaf), (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssfffZ'))
+        $qDir = Join-Path $QuarantineRoot ('{0}-{1}' -f (Split-Path $origWd -Leaf), (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssfffZ'))
         foreach ($rel in $keep) {
             $relWin = $rel.TrimEnd('/') -replace '/', '\'
             $dst = Join-Path $qDir $relWin
@@ -792,10 +873,29 @@ function Invoke-RetireLaneWorktree {
             }
         }
         if (Test-Path -LiteralPath $wd) { $d.reason = 'remove-failed: the directory is still there after the removal'; return [pscustomobject]$d }
-        $d.action = 'retired'; $d.reason = 'ok'
+        $d.action = 'retired'; $d.reason = 'ok'; $d.renameRestore.state = 'retired'
     } catch {
         $d.action = 'kept'; $d.reason = "cannot-determine: $($_.Exception.Message)"
     } finally {
+        # r7: undo the rename probe's rename for every outcome but `retired` (the early `return`s above all pass through here). The rename
+        # back comes first: the fsmonitor stop below, and the caller, address the worktree by its own path. Never throws.
+        if ($renamed -and $d.action -ne 'retired') {
+            $rs = $d.renameRestore
+            try {
+                if (-not (Test-Path -LiteralPath $wd)) { $rs.state = 'gone'; $rs.note = "$wd no longer exists" }
+                else {
+                    $back = Move-LaneWorktreeRoot -From $wd -To $origWd
+                    if ($back) {
+                        $rs.state = 'failed'; $rs.note = "rename back to $origWd failed ($back); the directory stays at $wd"
+                        try { [Console]::Error.WriteLine("LEFT-RETIRING worktree-rename-back path=$wd wanted=$origWd utc=$((Get-Date).ToUniversalTime().ToString('o')) why=$back") } catch { }
+                    } else {
+                        $wd = $origWd; $renamed = $false
+                        $fix = Repair-LaneWorktreePath -Main $main -Path $wd
+                        $rs.state = 'restored'; $rs.note = $(if ($fix) { "git repoint after the rename back: $fix" } else { $null })
+                    }
+                }
+            } catch { $rs.state = 'failed'; $rs.note = "cannot-determine: $($_.Exception.Message)" }
+        }
         # Every path that leaves the worktree standing (kept, would-retire) tries to leave no daemon in it; a retired worktree is gone. Best effort,
         # never throws, and not a guarantee: a failed stop is recorded in fsmonitorStop, and a daemon may still be running.
         # Only when the disable did not take: after a successful disable the early stop already left none and nothing can start one.

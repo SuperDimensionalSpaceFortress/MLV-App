@@ -631,23 +631,39 @@ def test_holder_exit_releases_the_worktree_for_real_retirement(repo):
 # git half-fails there (the worktree is deregistered, its files stay), so the same command cannot be re-run; the tool must finish the
 # removal itself, bounded, keyed to the access-denied / sharing-violation condition, and report `retired` only with the directory gone.
 
-def _spawn_file_handle_holder(path, ready, release, tmp):
+def _spawn_file_handle_holder(path, ready, release, tmp, trigger=None):
     """A child that opens `path` (read, no delete share) and keeps it open until `release` exists. The path goes in the
     ENVIRONMENT, not on the command line, so the gate (which reads command lines and cwds) does not see a holder, exactly
-    like a handle that outlives its process's visibility."""
-    script = ("$f = [IO.File]::Open($env:HOLD_FILE, 'Open', 'Read', 'Read'); "
+    like a handle that outlives its process's visibility.
+    r7 (rename probe): a handle open BEFORE the gate runs now keeps the worktree as in-use (the rename is refused), so the cases that
+    exercise the removal RETRY need the handle to appear AFTER the rename. With `trigger` the child waits for that file, then opens
+    `path` (the renamed location) and writes `ready`; the caller does not wait for it (see _handle_appears_after_the_rename)."""
+    script = (("while (-not (Test-Path -LiteralPath $env:HOLD_TRIGGER)) { Start-Sleep -Milliseconds 20 }; " if trigger else "")
+              + "$f = [IO.File]::Open($env:HOLD_FILE, 'Open', 'Read', 'Read'); "
               "[IO.File]::WriteAllText($env:HOLD_READY, 'open'); "
               "$t = [Diagnostics.Stopwatch]::StartNew(); "
               "while (-not (Test-Path -LiteralPath $env:HOLD_RELEASE) -and $t.Elapsed.TotalSeconds -lt 90) { Start-Sleep -Milliseconds 50 }; "
               "$f.Dispose()")
-    env = dict(os.environ, HOLD_FILE=str(path), HOLD_READY=str(ready), HOLD_RELEASE=str(release))
+    env = dict(os.environ, HOLD_FILE=str(path), HOLD_READY=str(ready), HOLD_RELEASE=str(release), HOLD_TRIGGER=str(trigger or ""))
     p = subprocess.Popen([PWSH, "-NoProfile", "-NonInteractive", "-Command", script], cwd=str(tmp), env=env,
                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if trigger:
+        return p
     deadline = datetime.datetime.now() + datetime.timedelta(seconds=60)
     while not Path(ready).exists():
         assert p.poll() is None and datetime.datetime.now() < deadline, "holder child did not open the file"
         time.sleep(0.05)
     return p
+
+
+def _handle_appears_after_the_rename(trigger, ready):
+    """Prelude: wraps the rename seam. Right after the rename to <root>.retiring succeeds it creates `trigger` (the holder child opens its
+    file in the renamed directory) and waits for `ready`, so a handle exists by the time the removal runs, as one that outlives its
+    holder (a scanner, an indexer) does. The rename BACK is passed through untouched."""
+    return ("$origMoveRoot = ${function:Move-LaneWorktreeRoot}; "
+            "function Move-LaneWorktreeRoot { param([string]$From, [string]$To) $e = & $origMoveRoot -From $From -To $To; "
+            f"if (-not $e -and $To -like '*.retiring') {{ [IO.File]::WriteAllText('{trigger}', 'go'); $t = [Diagnostics.Stopwatch]::StartNew(); "
+            f"while (-not (Test-Path -LiteralPath '{ready}') -and $t.Elapsed.TotalSeconds -lt 30) {{ Microsoft.PowerShell.Utility\\Start-Sleep -Milliseconds 20 }} }}; $e }}; ")
 
 
 # The retry window scans the host again before EVERY attempt (r2), and a long-lived host pwsh caught exiting mid-scan reads as
@@ -672,30 +688,33 @@ def _release_on_first_wait(release, budget_ms=20000, delay_ms=50):
 def test_a_handle_that_outlives_the_holder_is_waited_out_and_the_worktree_is_really_retired(repo):
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-handle")
-    ready, release = tmp / "hold.ready", tmp / "hold.release"
-    p = _spawn_file_handle_holder(wt / "a.txt", ready, release, tmp)
+    ready, release, trigger = tmp / "hold.ready", tmp / "hold.release", tmp / "hold.trigger"
+    p = _spawn_file_handle_holder(_retiring_of(wt) / "a.txt", ready, release, tmp, trigger=trigger)
     try:
-        d, _ = _gate_real(wt, whatif=False, prelude=_release_on_first_wait(release))
+        d, _ = _gate_real(wt, whatif=False, prelude=_release_on_first_wait(release) + _handle_appears_after_the_rename(trigger, ready))
     finally:
         release.write_text("go")
         p.wait(timeout=60)
     assert (d["action"], d["reason"]) == ("retired", "ok"), d
-    assert not wt.exists(), "retired must mean the directory is gone"
+    assert not wt.exists() and not _retiring_of(wt).exists(), "retired must mean the directory is gone"
     assert d["removeAttempts"] >= 2 and d["removeNotes"], d
 
 
 def test_a_handle_that_never_lets_go_ends_remove_failed_naming_the_attempts(repo):
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-stuck")
-    ready, release = tmp / "hold.ready", tmp / "hold.release"
-    p = _spawn_file_handle_holder(wt / "a.txt", ready, release, tmp)
+    ready, release, trigger = tmp / "hold.ready", tmp / "hold.release", tmp / "hold.trigger"
+    p = _spawn_file_handle_holder(_retiring_of(wt) / "a.txt", ready, release, tmp, trigger=trigger)
     try:
-        d, _ = _gate_real(wt, whatif=False, prelude=ONLY_PYTEST_CHILDREN + "$script:RemoveRetryBudgetMs = 1500; $script:RemoveRetryDelayMs = 100; ")
+        d, _ = _gate_real(wt, whatif=False, prelude=ONLY_PYTEST_CHILDREN + "$script:RemoveRetryBudgetMs = 1500; $script:RemoveRetryDelayMs = 100; "
+                          + _handle_appears_after_the_rename(trigger, ready))
     finally:
         release.write_text("go")
         p.wait(timeout=60)
     assert d["action"] == "kept" and d["reason"].startswith("remove-failed: "), d
     assert "attempt" in d["reason"] and d["removeAttempts"] >= 2, d
+    # the same open handle that failed the removal refuses the rename back: said loudly, never silently left as a lost directory
+    assert d["renameRestore"]["state"] == "failed" and "rename back" in d["renameRestore"]["note"], d
 
 
 # r2 (Sol r1 B1/B2): a holder that appears AFTER the first decision must stop the retry too. The retry window is where the worktree is
@@ -712,14 +731,16 @@ def _counted_scans_and_sleeps(release, release_at_sleep):
             "Microsoft.PowerShell.Utility\\Start-Sleep -Milliseconds ([Math]::Max($Milliseconds, 400)) }; ")
 
 
-def test_an_unreadable_cwd_holder_that_appears_during_the_retry_keeps_the_worktree(repo):
-    """R-03: sharing-violation half-removal, then a process whose cwd cannot be read shows up. Refused as in the first decision."""
+def test_an_unreadable_cwd_process_that_appears_during_the_retry_no_longer_stops_it(repo):
+    """R-03, r7: sharing-violation half-removal, then a process whose cwd cannot be read shows up. It used to be refused as cwd-unknown
+    at every retry scan; now the retry names it as evidence and carries on (a process that really sat in the tree would be the very
+    handle that fails the removal, and the rename already proved none did), so the worktree is retired once the handle drops."""
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-late-unknown")
-    ready, release = tmp / "hold.ready", tmp / "hold.release"
-    p = _spawn_file_handle_holder(wt / "a.txt", ready, release, tmp)
+    ready, release, trigger = tmp / "hold.ready", tmp / "hold.release", tmp / "hold.trigger"
+    p = _spawn_file_handle_holder(_retiring_of(wt) / "a.txt", ready, release, tmp, trigger=trigger)
     late = _spawn(["-Command", "Start-Sleep -Seconds 120"], cwd=tmp)   # not the holder of anything; its cwd just cannot be read
-    prelude = (_counted_scans_and_sleeps(release, 1)
+    prelude = (_counted_scans_and_sleeps(release, 1) + _handle_appears_after_the_rename(trigger, ready)
                + "$origCwdLate = ${function:Get-ProcessCurrentDirectory}; "
                f"function Get-ProcessCurrentDirectory {{ param([int]$ProcessId) if ($script:SnapN -ge 3 -and $ProcessId -eq {late.pid}) {{ return $null }}; & $origCwdLate -ProcessId $ProcessId }}; ")
     try:
@@ -728,10 +749,10 @@ def test_an_unreadable_cwd_holder_that_appears_during_the_retry_keeps_the_worktr
         _stop(late)
         release.write_text("go")
         p.wait(timeout=60)
-    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown"), d
-    assert any(u.startswith(f"{late.pid} ") for u in d["cwdUnknown"]), d
-    assert f"pid={late.pid}" in err and "via=cwd-unknown" in err, err
-    assert d["removeAttempts"] == 2, d   # stopped at the first retry attempt, before its deletion
+    assert (d["action"], d["reason"]) == ("retired", "ok"), d
+    assert any(u.startswith(f"{late.pid} ") for u in d["cwdUnknown"]), d   # named at the retry scan that saw it
+    assert f"pid={late.pid}" not in err, err                               # but not a REFUSED line
+    assert d["removeAttempts"] >= 2 and not wt.exists() and not _retiring_of(wt).exists(), d
 
 
 def test_a_cwd_holder_that_appears_after_the_first_leftover_deletion_keeps_the_worktree(repo):
@@ -739,13 +760,14 @@ def test_a_cwd_holder_that_appears_after_the_first_leftover_deletion_keeps_the_w
     that follows must look again (it used to look once), and keep the worktree before deleting anything more."""
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-late-cwd")
-    ready, release = tmp / "hold.ready", tmp / "hold.release"
-    p = _spawn_file_handle_holder(wt / "a.txt", ready, release, tmp)
+    ready, release, trigger = tmp / "hold.ready", tmp / "hold.release", tmp / "hold.trigger"
+    p = _spawn_file_handle_holder(_retiring_of(wt) / "a.txt", ready, release, tmp, trigger=trigger)
     # Scan 3 (attempt 2) is clear and its deletion fails on the file handle; the handle drops at the 2nd back-off; scan 4 (attempt 3) sees the cwd holder.
-    prelude = (_counted_scans_and_sleeps(release, 2)
+    # r7: the removal runs on the RENAMED root, so a process already in the tree has its cwd under <wt>.retiring.
+    prelude = (_counted_scans_and_sleeps(release, 2) + _handle_appears_after_the_rename(trigger, ready)
                + "$origSnapLate = ${function:Get-LaneProcessSnapshot}; "
                "function Get-LaneProcessSnapshot { $s = & $origSnapLate; if ($script:SnapN -ge 4) { "
-               f"$row = [pscustomobject]@{{ ProcessId = 999990; Name = 'late-holder.exe'; CommandLine = 'late-holder.exe'; SessionId = 1; CurrentDirectory = '{wt}' }}; "
+               f"$row = [pscustomobject]@{{ ProcessId = 999990; Name = 'late-holder.exe'; CommandLine = 'late-holder.exe'; SessionId = 1; CurrentDirectory = '{wt}.retiring' }}; "
                "return [pscustomobject]@{ Procs = @($s.Procs) + @($row); SelfPids = $s.SelfPids; CapturedUtc = $s.CapturedUtc } }; $s }; ")
     try:
         d, err = _gate_real(wt, whatif=False, prelude=prelude)
@@ -813,6 +835,13 @@ def _wt_created(wt, minutes):
     return f"(Get-Item -LiteralPath '{wt}').CreationTimeUtc.AddMinutes({minutes})"
 
 
+def _assert_deferred_to_rename(d):
+    """r7 (LANE-RETIRE-CWD-UNKNOWN-RENAME-PROBE-1): a process whose cwd cannot be read is evidence (listed in cwdUnknown), no longer a refusal.
+    The gate says would-retire and the rename of the root settles it for real (-WhatIf never renames)."""
+    assert (d["action"], d["reason"]) == ("would-retire", "ok"), d
+    assert d["renameProbe"].startswith("not-run: WhatIf"), d
+
+
 def test_healthy_cwd_probe_is_reported_ok_and_backs_the_would_retire(repo):
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-probe-ok")
@@ -843,18 +872,18 @@ def test_probe_unavailable_refusal_holds_on_a_real_removal_too(repo):
     assert wt.exists()
 
 
-def test_a_pid_whose_cwd_read_fails_is_refused_as_cwd_unknown(repo):
+def test_a_pid_whose_cwd_read_fails_is_listed_and_left_to_the_rename_probe(repo):
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-cwd-unknown")
     p = _spawn(["-Command", "Start-Sleep -Seconds 120"], cwd=tmp)   # does not hold the worktree, but the gate cannot tell
     try:
         d, err = _gate_real(wt, prelude=_cwd_unreadable_for(p.pid))
-        control, _ = _gate_real(wt)                                  # same process, cwd readable: no refusal for it
+        control, _ = _gate_real(wt)                                  # same process, cwd readable: not listed at all
     finally:
         _stop(p)
-    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown"), d
+    assert (d["action"], d["reason"]) == ("would-retire", "ok"), d   # r7: no longer a refusal (the rename settles it)
     assert d["cwdProbe"] == "ok" and any(u.startswith(f"{p.pid} ") for u in d["cwdUnknown"]), d
-    assert f"pid={p.pid}" in err and "via=cwd-unknown" in err, err
+    assert f"pid={p.pid}" not in err, err                            # and no REFUSED line for it
     assert not any(u.startswith(f"{p.pid} ") for u in control["cwdUnknown"]), control
     assert wt.exists()
 
@@ -878,11 +907,11 @@ def test_snapshot_pid_that_has_exited_is_not_a_candidate_holder(repo):
     assert (d["action"], d["reason"]) == ("would-retire", "ok"), d
 
 
-def test_snapshot_user_session_process_with_unreadable_cwd_is_cwd_unknown(repo):
+def test_snapshot_user_session_process_with_unreadable_cwd_is_listed_and_left_to_the_rename(repo):
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-sess1")
     d = _gate_with_snapshot(wt, _fake_row("$PID"), prelude=CWD_UNREADABLE_FOR_EVERY_PID)
-    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown"), d
+    _assert_deferred_to_rename(d)
 
 
 def test_snapshot_session0_process_with_unreadable_cwd_is_no_longer_exempt_by_session_id(repo):
@@ -891,30 +920,30 @@ def test_snapshot_session0_process_with_unreadable_cwd_is_no_longer_exempt_by_se
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-sess0")
     d = _gate_with_snapshot(wt, _fake_row("$PID", session=0), prelude=CWD_UNREADABLE_FOR_EVERY_PID)
-    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown"), d
+    _assert_deferred_to_rename(d)
 
 
 # --- r3 (WORKTREE-REMOVED-UNDER-LIVE-CHAIN-1 hub ruling HUB-TICK 20261009T1004Z, sol blockers on 2d261a18) ---
 # A: a null command line is a LIVE process.  B: a session id is not evidence; creation time before the worktree is.
 
 @pytest.mark.parametrize("cmd", ["pwsh.exe -File C:\\\\elsewhere\\\\quiet.ps1", "svchost.exe -k netsvcs"], ids=["absolute-script", "native-command"])
-def test_snapshot_session0_process_with_unreadable_cwd_created_after_the_worktree_is_cwd_unknown(repo, cmd):
+def test_snapshot_session0_process_with_unreadable_cwd_created_after_the_worktree_is_listed_not_exempt(repo, cmd):
     """Sol r2 row 2. REPLACES the r2 expectation (session 0 + unreadable cwd = would-retire): a session id proves nothing."""
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-sess0")
     row = _fake_row("$PID", cmd=cmd, session=0, name=cmd.split()[0], created=_wt_created(wt, 5))
     d = _gate_with_snapshot(wt, row, prelude=CWD_UNREADABLE_FOR_EVERY_PID)
-    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown"), d
+    _assert_deferred_to_rename(d)
     assert any("cwd-unreadable" in u for u in d["cwdUnknown"]) and d["cwdExempt"] == 0, d
 
 
-def test_snapshot_process_with_null_command_line_and_unreadable_cwd_is_cwd_unknown(repo):
+def test_snapshot_process_with_null_command_line_and_unreadable_cwd_is_listed_and_left_to_the_rename(repo):
     """Sol r2 row 1: CommandLine = $null used to be filtered out of the snapshot before any cwd check."""
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-nullcmd")
     row = _fake_row("$PID", cmd=None, created=_wt_created(wt, 5))
     d = _gate_with_snapshot(wt, row, prelude=CWD_UNREADABLE_FOR_EVERY_PID)
-    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown"), d
+    _assert_deferred_to_rename(d)
     assert any(" cwd-unreadable created=" in u for u in d["cwdUnknown"]), d
 
 
@@ -945,20 +974,20 @@ def test_snapshot_exempt_process_whose_command_line_names_the_worktree_is_still_
 
 
 @pytest.mark.parametrize("created", [None, "$null", "'not a date'"], ids=["no-property", "null", "not-a-datetime"])
-def test_snapshot_unreadable_cwd_with_unreadable_creation_date_is_refused(repo, created):
+def test_snapshot_unreadable_cwd_with_unreadable_creation_date_is_listed_not_exempt(repo, created):
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-nodate")
     d = _gate_with_snapshot(wt, _fake_row("$PID", created=created), prelude=CWD_UNREADABLE_FOR_EVERY_PID)
-    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown"), d
+    _assert_deferred_to_rename(d)
     assert any("created=unreadable" in u for u in d["cwdUnknown"]), d
 
 
-def test_snapshot_unreadable_cwd_created_exactly_when_the_worktree_was_is_refused(repo):
+def test_snapshot_unreadable_cwd_created_exactly_when_the_worktree_was_is_listed_not_exempt(repo):
     """Strictly earlier is required: equal is not earlier."""
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-same-instant")
     d = _gate_with_snapshot(wt, _fake_row("$PID", created=_wt_created(wt, 0)), prelude=CWD_UNREADABLE_FOR_EVERY_PID)
-    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown"), d
+    _assert_deferred_to_rename(d)
 
 
 def test_creation_time_does_not_exempt_a_relative_script_whose_cwd_is_unknown(repo):
@@ -1101,68 +1130,68 @@ def test_service_sid_owned_unreadable_cwd_process_created_after_the_worktree_is_
     assert len(d["cwdExemptOwner"]) == 1 and f"exempt=service-sid:{sid} via=scm:BITS,gpsvc" in d["cwdExemptOwner"][0], d
 
 
-def test_same_user_session0_process_with_no_service_owner_is_still_cwd_unknown(repo):
+def test_same_user_session0_process_with_no_service_owner_is_still_not_exempt(repo):
     """A lane started by a Scheduled Task runs as THIS user in session 0: no SCM row names it, so its owner is unread."""
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-svc-lane")
     row = _fake_row("$PID", cmd="pwsh.exe -File C:\\\\elsewhere\\\\lane.ps1", session=0, name="pwsh.exe", created=_wt_created(wt, 5))
     d = _gate_with_snapshot(wt, row, prelude=CWD_UNREADABLE_FOR_EVERY_PID + _svc_rows(("4321", "BITS", "LocalSystem", "Share Process", SVCHOST)))
-    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown"), d
+    _assert_deferred_to_rename(d)
     assert d["cwdExemptOwner"] == [], d
 
 
 @pytest.mark.parametrize("start,stype", [(".\\obabalola", "Own Process"), ("", "Unknown")], ids=["service-as-this-user", "per-user-service-instance"])
-def test_service_running_as_a_user_account_is_still_cwd_unknown(repo, start, stype):
+def test_service_running_as_a_user_account_is_still_not_exempt(repo, start, stype):
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-svc-user")
     prelude = CWD_UNREADABLE_FOR_EVERY_PID + _svc_rows(("$PID", "CDPUserSvc_6d6616", start, stype, SVCHOST))
     d = _gate_with_snapshot(wt, _svchost_row(wt), prelude=prelude)
-    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown"), d
+    _assert_deferred_to_rename(d)
     assert d["cwdExemptOwner"] == [], d
 
 
-def test_owner_unreadable_process_is_still_cwd_unknown(repo):
+def test_owner_unreadable_process_is_still_not_exempt(repo):
     """SearchProtocolHost: session 0, cwd and token unreadable, hosts no service, so the SCM cannot name its owner."""
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-svc-unread")
     row = _fake_row("$PID", cmd=None, session=0, name="SearchProtocolHost.exe", created=_wt_created(wt, 5))
     d = _gate_with_snapshot(wt, row, prelude=CWD_UNREADABLE_FOR_EVERY_PID + _svc_rows())
-    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown"), d
+    _assert_deferred_to_rename(d)
 
 
-def test_service_owner_query_failure_is_still_cwd_unknown(repo):
+def test_service_owner_query_failure_is_still_not_exempt(repo):
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-svc-fail")
     prelude = CWD_UNREADABLE_FOR_EVERY_PID + "function Get-RunningServiceRows { throw 'scm unavailable' };"
     d = _gate_with_snapshot(wt, _svchost_row(wt), prelude=prelude)
-    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown"), d
+    _assert_deferred_to_rename(d)
     assert d["cwdOwnerProbe"] == "scm-failed" and d["cwdExemptOwner"] == [], d
 
 
-def test_another_user_service_process_is_still_cwd_unknown(repo):
+def test_another_user_service_process_is_still_not_exempt(repo):
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-svc-other")
     prelude = CWD_UNREADABLE_FOR_EVERY_PID + _svc_rows(("$PID", "TBSage", "VIRTUAL-TEN\\tbco903149bf4109", "Own Process", SVCHOST))
     d = _gate_with_snapshot(wt, _svchost_row(wt), prelude=prelude)
-    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown"), d
+    _assert_deferred_to_rename(d)
 
 
-def test_service_pid_whose_snapshot_image_differs_is_still_cwd_unknown(repo):
+def test_service_pid_whose_snapshot_image_differs_is_still_not_exempt(repo):
     """Pid reuse: the SCM says pid N hosts svchost.exe, the snapshot row at pid N is pwsh.exe. Not the same process."""
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-svc-reuse")
     row = _fake_row("$PID", session=0, name="pwsh.exe", created=_wt_created(wt, 5))
     d = _gate_with_snapshot(wt, row, prelude=CWD_UNREADABLE_FOR_EVERY_PID + _svc_rows(("$PID", "BITS", "LocalSystem", "Share Process", SVCHOST)))
-    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown"), d
+    _assert_deferred_to_rename(d)
 
 
-def test_service_pid_with_mixed_accounts_is_still_cwd_unknown(repo):
+def test_service_pid_with_mixed_accounts_is_still_not_exempt(repo):
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-svc-mixed")
     prelude = CWD_UNREADABLE_FOR_EVERY_PID + _svc_rows(("$PID", "BITS", "LocalSystem", "Share Process", SVCHOST),
                                                        ("$PID", "Odd", ".\\obabalola", "Share Process", SVCHOST))
     d = _gate_with_snapshot(wt, _svchost_row(wt), prelude=prelude)
-    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown"), d
+    _assert_deferred_to_rename(d)
 
 
 @pytest.mark.parametrize("via", ["cwd", "cmdline"])
@@ -1211,7 +1240,7 @@ NSSM = "C:\\tools\\nssm\\nssm.exe"
 
 
 @pytest.mark.parametrize("key_minutes", [10, 5], ids=["key-written-after-start", "key-written-at-start"])
-def test_service_reconfigured_to_localsystem_after_the_process_started_is_still_cwd_unknown(repo, key_minutes):
+def test_service_reconfigured_to_localsystem_after_the_process_started_is_still_not_exempt(repo, key_minutes):
     """sol r1 blocker 1: a user-owned nssm.exe service reconfigured to LocalSystem and not yet restarted. The process was
     created at worktree+5 min; its service key was written at/after that, so the configured account is not the live one."""
     tmp, main = repo
@@ -1219,37 +1248,38 @@ def test_service_reconfigured_to_localsystem_after_the_process_started_is_still_
     row = _fake_row("$PID", cmd=None, session=0, name="nssm.exe", created=_wt_created(wt, 5))
     prelude = CWD_UNREADABLE_FOR_EVERY_PID + _svc_rows(("$PID", "LaneSvc", "LocalSystem", "Own Process", NSSM)) + _key_written(wt, key_minutes)
     d = _gate_with_snapshot(wt, row, prelude=prelude)
-    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown"), d
+    _assert_deferred_to_rename(d)
     assert d["cwdExemptOwner"] == [] and any("scm-config-newer-than-process:LaneSvc" in u for u in d["cwdUnknown"]), d
 
 
-def test_service_key_time_unreadable_is_still_cwd_unknown(repo):
+def test_service_key_time_unreadable_is_still_not_exempt(repo):
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-svc-keyunread")
     prelude = CWD_UNREADABLE_FOR_EVERY_PID + _svc_rows(("$PID", "BITS", "LocalSystem", "Share Process", SVCHOST)) + _key_written(wt, None)
     d = _gate_with_snapshot(wt, _svchost_row(wt), prelude=prelude)
-    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown"), d
+    _assert_deferred_to_rename(d)
     assert d["cwdExemptOwner"] == [] and any("scm-config-time-unreadable:BITS" in u for u in d["cwdUnknown"]), d
 
 
-def test_service_process_creation_time_unreadable_is_still_cwd_unknown(repo):
+def test_service_process_creation_time_unreadable_is_still_not_exempt(repo):
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-svc-procunread")
     row = _fake_row("$PID", cmd=None, session=0, name="svchost.exe")   # no CreationDate at all
     prelude = CWD_UNREADABLE_FOR_EVERY_PID + _svc_rows(("$PID", "BITS", "LocalSystem", "Share Process", SVCHOST)) + _key_written(wt, -60)
     d = _gate_with_snapshot(wt, row, prelude=prelude)
-    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown"), d
+    _assert_deferred_to_rename(d)
     assert d["cwdExemptOwner"] == [] and any("scm-process-time-unreadable" in u for u in d["cwdUnknown"]), d
 
 
-def test_share_process_with_one_service_key_newer_than_the_process_is_still_cwd_unknown(repo):
+def test_share_process_with_one_service_key_newer_than_the_process_is_still_not_exempt(repo):
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-svc-sharenewer")
     prelude = (CWD_UNREADABLE_FOR_EVERY_PID + _svc_rows(("$PID", "BITS", "LocalSystem", "Share Process", SVCHOST),
                                                         ("$PID", "gpsvc", "LocalSystem", "Share Process", SVCHOST))
                + _key_written(wt, -60, gpsvc=30))
     d = _gate_with_snapshot(wt, _svchost_row(wt), prelude=prelude)
-    assert d["action"] == "kept" and any("scm-config-newer-than-process:gpsvc" in u for u in d["cwdUnknown"]), d
+    _assert_deferred_to_rename(d)
+    assert any("scm-config-newer-than-process:gpsvc" in u for u in d["cwdUnknown"]), d
 
 
 def test_service_key_written_before_the_process_started_is_exempt_and_bound(repo):
@@ -1284,13 +1314,13 @@ def test_live_binding_does_not_rewrite_the_shared_index_row_for_the_next_worktre
 
 
 @pytest.mark.parametrize("stype", ["Unknown", "Interactive Process"], ids=["unknown", "interactive"])
-def test_localsystem_service_of_a_non_own_or_share_type_is_still_cwd_unknown(repo, stype):
+def test_localsystem_service_of_a_non_own_or_share_type_is_still_not_exempt(repo, stype):
     """fable r1 h1: pins the ServiceType guard. StartName, image and the key binding all pass, so only the type refuses."""
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-svc-type")
     prelude = CWD_UNREADABLE_FOR_EVERY_PID + _svc_rows(("$PID", "BITS", "LocalSystem", stype, SVCHOST)) + _key_written(wt, -60)
     d = _gate_with_snapshot(wt, _svchost_row(wt), prelude=prelude)
-    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown"), d
+    _assert_deferred_to_rename(d)
     assert d["cwdExemptOwner"] == [], d
 
 
@@ -1322,7 +1352,7 @@ def test_unparsable_scm_row_at_the_same_pid_drops_that_pid(repo):
     prelude = (CWD_UNREADABLE_FOR_EVERY_PID + "function Get-RunningServiceRows { @(" + GOOD_BITS_ROW + ", " + bad + ") };"
                + _key_written(wt, -60))
     d = _gate_with_snapshot(wt, _svchost_row(wt), prelude=prelude)
-    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown"), d
+    _assert_deferred_to_rename(d)
     assert d["cwdExemptOwner"] == [] and len(d["cwdOwnerSkipped"]) == 1, d
 
 
@@ -1515,3 +1545,117 @@ def test_encoded_command_switch_table_matches_pwsh_own_parameter_resolution():
     out = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", script], check=True, capture_output=True, text=True).stdout
     got = [(r["Present"], r["Failed"]) for r in json.loads(out)]
     assert got == [(p, f) for _, p, f in table]
+
+
+# --- LANE-RETIRE-CWD-UNKNOWN-RENAME-PROBE-1 (r1): an unreadable cwd no longer refuses; the rename of the worktree root is the probe ---
+# NTFS refuses a directory rename while ANY handle beneath it is open (a cwd, a file, whatever the share mode: measured), and it does so
+# whatever the ACL of the process that holds it. So a process whose cwd this user cannot read (an IIS app pool, TeamViewer, an elevated
+# shell) is neither a reason to keep nor a way to hide: if it holds the tree the rename fails (kept / in-use), if not the retire goes ahead.
+
+def _worktree_paths(main):
+    out = subprocess.run([GIT, "-C", str(main), "worktree", "list", "--porcelain"], check=True, capture_output=True, text=True).stdout
+    return [_norm(l[len("worktree "):]) for l in out.splitlines() if l.startswith("worktree ")]
+
+
+def _retiring_of(wt):
+    return Path(str(wt) + ".retiring")
+
+
+def test_rename_probe_refuses_an_unseen_cwd_holder_and_leaves_the_worktree_intact(repo):
+    """(a) A real process whose cwd is INSIDE the worktree, with a cwd the gate cannot read and a command line that does not name it:
+    the cwd and cmdline checks have nothing to see, so only the rename can tell. Kept / in-use, worktree untouched at its own path."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-rename-inuse")
+    p = _spawn(["-Command", "Start-Sleep -Seconds 120"], cwd=wt)
+    try:
+        d, _ = _gate_real(wt, whatif=False, prelude=_cwd_unreadable_for(p.pid))
+    finally:
+        _stop(p)
+    assert d["action"] == "kept" and d["reason"].startswith("in-use"), d
+    assert d["renameProbe"].startswith("in-use"), d
+    assert (wt / ".git").exists() and (wt / "a.txt").exists(), "the worktree must be intact"
+    assert not _retiring_of(wt).exists(), "no .retiring directory may be left behind"
+    assert _norm(wt) in _worktree_paths(main), "git must still know the worktree at its own path"
+
+
+def test_unreadable_cwd_with_no_handle_in_the_worktree_no_longer_blocks_retirement(repo):
+    """(b) The 2026-10-21 incident shape: a live process whose cwd cannot be read, nowhere near the worktree. Retired."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-rename-free")
+    p = _spawn(["-Command", "Start-Sleep -Seconds 120"], cwd=tmp)
+    try:
+        d, _ = _gate_real(wt, whatif=False, prelude=_cwd_unreadable_for(p.pid))
+    finally:
+        _stop(p)
+    assert (d["action"], d["reason"]) == ("retired", "ok"), d
+    assert d["renameProbe"] == "ok", d
+    assert any(u.startswith(f"{p.pid} ") for u in d["cwdUnknown"]), "the unreadable pid is still named as evidence"
+    assert not wt.exists() and not _retiring_of(wt).exists()
+
+
+def test_readable_cwd_inside_the_worktree_is_still_refused_ahead_of_the_rename_probe(repo):
+    """(c) Unchanged rule: a readable cwd is a named holder (live-process), found before any rename is attempted."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-rename-readable")
+    p = _spawn(["-Command", "Start-Sleep -Seconds 120"], cwd=wt)
+    try:
+        d, _ = _gate_real(wt, whatif=False)
+    finally:
+        _stop(p)
+    assert d["action"] == "kept" and d["reason"].startswith(f"live-process: {p.pid} "), d
+    assert d["renameProbe"] == "not-run", d
+    assert wt.exists() and not _retiring_of(wt).exists()
+
+
+def test_a_retire_that_fails_after_a_good_rename_renames_back_and_keeps(repo):
+    """(d) The rename succeeds, then `git worktree remove` is refused (a LOCKED worktree: a non-retryable failure). The directory
+    goes back to its own name, git is repointed at it, and no .retiring directory is left."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-rename-back")
+    _git(main, "worktree", "lock", "--reason", "rename-probe-test", str(wt))
+    d, _ = _gate_real(wt, whatif=False)
+    assert d["action"] == "kept" and d["reason"].startswith("remove-failed"), d
+    assert d["renameProbe"] == "ok", d
+    assert wt.exists() and (wt / ".git").exists() and (wt / "a.txt").exists()
+    assert not _retiring_of(wt).exists(), "no .retiring directory may be left behind"
+    assert _norm(wt) in _worktree_paths(main) and not any(p.endswith(".retiring") for p in _worktree_paths(main)), _worktree_paths(main)
+    st = subprocess.run([GIT, "-C", str(wt), "status", "--porcelain"], capture_output=True, text=True)
+    assert st.returncode == 0, st.stderr   # git can still use the checkout at its original path
+
+
+def test_a_successful_retire_leaves_no_worktree_entry_and_no_retiring_directory(repo):
+    """(e) The git-consistency pin: after a rename-then-remove, `git worktree list` has no entry for the worktree (not the original
+    path, not the .retiring path), its admin dir is gone, and `git worktree prune` has nothing left to prune."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-rename-ok")
+    admin = _admin_dir(main, wt)
+    d, _ = _gate_real(wt, whatif=False)
+    assert (d["action"], d["reason"]) == ("retired", "ok"), d
+    assert d["renameProbe"] == "ok", d
+    assert not wt.exists() and not _retiring_of(wt).exists()
+    assert _norm(wt) not in _worktree_paths(main) and not any(p.endswith(".retiring") for p in _worktree_paths(main)), _worktree_paths(main)
+    assert not Path(admin).exists(), "the worktree admin dir must be gone, not dangling"
+    pr = subprocess.run([GIT, "-C", str(main), "worktree", "prune", "--verbose"], check=True, capture_output=True, text=True)
+    assert (pr.stdout + pr.stderr).strip() == "", pr
+
+
+def test_whatif_does_not_rename_and_says_so(repo):
+    """A would-retire is never backed by a rename: -WhatIf must not move a real lane worktree, even for an instant."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-rename-whatif")
+    d, _ = _gate_real(wt, whatif=True)
+    assert (d["action"], d["reason"]) == ("would-retire", "ok"), d
+    assert d["renameProbe"].startswith("not-run: WhatIf"), d
+    assert wt.exists() and not _retiring_of(wt).exists()
+
+
+def test_an_existing_retiring_directory_is_not_overwritten_and_keeps_the_worktree(repo):
+    """A leftover `<root>.retiring` (a crashed earlier run) must not be merged into or clobbered: kept, cannot-determine, untouched."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-rename-leftover")
+    _retiring_of(wt).mkdir()
+    (_retiring_of(wt) / "marker.txt").write_text("leftover", encoding="utf-8")
+    d, _ = _gate_real(wt, whatif=False)
+    assert d["action"] == "kept" and d["reason"].startswith("cannot-determine: ") and ".retiring" in d["reason"], d
+    assert wt.exists() and (wt / ".git").exists()
+    assert (_retiring_of(wt) / "marker.txt").read_text(encoding="utf-8") == "leftover"
