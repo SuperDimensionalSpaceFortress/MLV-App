@@ -665,6 +665,64 @@ function Get-VenueRemoteJobState {
     & $out 'NOT_FINISHED' $pending $null
 }
 
+function Get-VenueJobResult {
+    <#
+    .SYNOPSIS
+    One venue job's result.json, read by NAME (<AgentShare>\outbox\<JobId>.result.json; the share is never listed) on one bounded worker (BACHELOR-LEASE-BATCH-LEGS-1: the
+    batch runner reads a leg's admission from it, to prove the leg ran on the batch's lease).
+    .OUTPUTS
+    [pscustomobject]@{ state (FOUND | ABSENT | UNKNOWN); result (the parsed result when FOUND); error }
+    #>
+    param([Parameter(Mandatory)][string]$AgentShare, [string]$JobId = '', [ValidateRange(1, 600)][int]$TimeoutSec = 30)
+    if ($JobId -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$') { return [pscustomobject]@{ state = 'UNKNOWN'; result = $null; error = 'no usable job id' } }
+    $path = $AgentShare.TrimEnd('\') + '\outbox\' + $JobId + '.result.json'
+    $r = Invoke-VenueBoundedRead -ScriptText 'if (Test-Path -LiteralPath $args[0] -PathType Leaf) { [IO.File]::ReadAllText($args[0]) } else { "<ABSENT>" }' -Argument $path -TimeoutSec $TimeoutSec
+    if (-not $r.answered) { return [pscustomobject]@{ state = 'UNKNOWN'; result = $null; error = $r.error } }
+    $text = [string](@($r.value) -join "`n")
+    if ($text -ceq '<ABSENT>') { return [pscustomobject]@{ state = 'ABSENT'; result = $null; error = $null } }
+    try { return [pscustomobject]@{ state = 'FOUND'; result = ($text | ConvertFrom-Json); error = $null } }
+    catch { return [pscustomobject]@{ state = 'UNKNOWN'; result = $null; error = "result.json does not parse: $($_.Exception.Message)" } }
+}
+
+function Read-VenueLeaseBatchReceipt {
+    <#
+    .SYNOPSIS
+    The venue agent's own receipt for one batch lease (ultra-magnus-agent.ps1 lease-batch item 5): the line of <AgentShare>\logs\lease-batch-<Token>.jsonl whose leaseId is
+    -LeaseId, read by NAME on one bounded worker.
+    .OUTPUTS
+    [pscustomobject]@{ state (FOUND | ABSENT | UNKNOWN); record; error }
+    #>
+    param([Parameter(Mandatory)][string]$AgentShare, [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{12}$')][string]$Token, [string]$LeaseId = '', [ValidateRange(1, 600)][int]$TimeoutSec = 30)
+    $path = $AgentShare.TrimEnd('\') + '\logs\lease-batch-' + $Token + '.jsonl'
+    $r = Invoke-VenueBoundedRead -ScriptText 'if (Test-Path -LiteralPath $args[0] -PathType Leaf) { [IO.File]::ReadAllLines($args[0]) } else { "<ABSENT>" }' -Argument $path -TimeoutSec $TimeoutSec
+    if (-not $r.answered) { return [pscustomobject]@{ state = 'UNKNOWN'; record = $null; error = $r.error } }
+    $lines = @($r.value | ForEach-Object { [string]$_ } | Where-Object { $_ })
+    if ($lines.Count -eq 1 -and $lines[0] -ceq '<ABSENT>') { return [pscustomobject]@{ state = 'ABSENT'; record = $null; error = $null } }
+    foreach ($line in $lines) {
+        $rec = try { $line | ConvertFrom-Json } catch { $null }
+        if ($null -ne $rec -and [string]$rec.leaseId -ceq $LeaseId) { return [pscustomobject]@{ state = 'FOUND'; record = $rec; error = $null } }
+    }
+    [pscustomobject]@{ state = 'ABSENT'; record = $null; error = "no line for lease $LeaseId among $($lines.Count)" }
+}
+
+function Get-VenueLegPreLoadMean {
+    <#
+    .SYNOPSIS
+    The leg's own pre-load mean, read from the run's summary.json (cpuQuiescence.timeMeanPercent), never from the receipt file. Invoke-VenueLeg writes the receipt as
+    <root>\<card>\<legId>\<venue>\<receiptId>.json and the run evidence to <parent of root>\evidence\<receiptId>. $null when absent. (Same rule as Invoke-VenueChain's own.)
+    #>
+    param([string]$ReceiptPath)
+    try {
+        if (-not $ReceiptPath) { return $null }
+        $root = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $ReceiptPath)))
+        $summary = Join-Path (Join-Path (Join-Path (Split-Path -Parent $root) 'evidence') ([IO.Path]::GetFileNameWithoutExtension($ReceiptPath))) 'summary.json'
+        if (-not (Test-Path -LiteralPath $summary -PathType Leaf)) { return $null }
+        $q = ([IO.File]::ReadAllText($summary) | ConvertFrom-Json).cpuQuiescence
+        if ($null -eq $q -or $null -eq $q.timeMeanPercent) { return $null }
+        [double]$q.timeMeanPercent
+    } catch { $null }
+}
+
 function Invoke-VenueBoundedProcess {
     <#
     .SYNOPSIS
@@ -689,4 +747,5 @@ function Invoke-VenueBoundedProcess {
 Export-ModuleMember -Function Get-VenueMainRoot, Get-VenueClaimPath, Get-VenueClaim, Get-VenueClaimStaleReason, Request-VenueClaim, Release-VenueClaim,
     Get-VenueTicketDir, New-VenueTicket, Get-VenueTickets, Get-VenueTicketStaleReason, Get-VenueTicketProbeStaleSec, Update-VenueTicket, Remove-VenueTicket, Get-VenueClaimStatus, Format-VenueClaimStatus, Format-VenueTicketQueue,
     ConvertFrom-VenueGateLog, Get-VenueQuietRateTable, Format-VenueQuietRateTable, Select-VenueQuietWindow,
-    Get-VenueSupplementarySpecSkip, Get-VenueSupplementaryIdle, Get-VenueStagedBuildManifest, Get-VenueRemoteJobIds, Get-VenueRemoteJobState, Invoke-VenueBoundedProcess, Complete-VenueProcess
+    Get-VenueSupplementarySpecSkip, Get-VenueSupplementaryIdle, Get-VenueStagedBuildManifest, Get-VenueRemoteJobIds, Get-VenueRemoteJobState, Invoke-VenueBoundedProcess, Complete-VenueProcess,
+    Get-VenueJobResult, Read-VenueLeaseBatchReceipt, Get-VenueLegPreLoadMean

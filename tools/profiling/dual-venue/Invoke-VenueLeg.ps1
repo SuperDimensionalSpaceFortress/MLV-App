@@ -66,6 +66,9 @@ param(
     [ValidateSet('cuda', 'cpu')][string]$Backend = '',
     # Run only the health probe (and P6) and stop: records the venue's state without running the leg.
     [switch]$HealthOnly,
+    # BACHELOR-LEASE-BATCH-LEGS-1: the batch token of Invoke-VenueLeaseBatch.ps1. The leg's job id then ends "-lb<token>", so the venue agent runs
+    # it on that batch's parked quiet lease instead of requesting one (ultra-magnus-agent.ps1, lease-batch block). Nothing else about the leg changes.
+    [Parameter(ParameterSetName = 'Leg')][ValidatePattern('^[0-9a-f]{12}$')][string]$LeaseBatch = '',
     [string]$Actor = '',
     # Where receipts go. Default: <main checkout>\.claude-state\dual-venue\receipts (gitignored). Must sit under a
     # `.claude-state` directory in production (a receipt and its evidence name an owner clip's run).
@@ -329,7 +332,7 @@ function Stop-Leg([string]$Outcome, [string]$Detail) {
 
 $workDirResolved = if ([string]::IsNullOrWhiteSpace($WorkDir)) { Join-Path ([IO.Path]::GetTempPath()) "dve-$runStamp-$([guid]::NewGuid().ToString('N').Substring(0,8))" } else { $WorkDir }
 New-Item -ItemType Directory -Force -Path $workDirResolved | Out-Null
-$jobStem = "dve-$($spec.legId)-$Venue-$Backend-$runStamp"
+$jobStem = "dve-$($spec.legId)-$Venue-$Backend-$runStamp$(if ($LeaseBatch) { "-lb$LeaseBatch" })"
 
 $terminal = $null
 $run = $null
