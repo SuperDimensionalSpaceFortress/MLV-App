@@ -53,13 +53,18 @@ def class_seconds(log_text: str) -> dict[str, float]:
         now = _seconds(stamp)
         text = stamp.group(3)
         test = TEST_LINE.match(text)
+        doc_head = None if test else DOC_HEAD.match(text)
         if test:
             name, pending = test.group(1), None
+        elif doc_head:
+            name, pending = None, doc_head.group(1)
         elif pending is not None and DOC_RESULT.match(text):
             name, pending = pending, None
+        elif pending is not None:
+            # A line the pending docstring test logged: it stays pending, and its clock keeps
+            # running from its id line, so the result line is charged head -> result.
+            continue
         else:
-            doc_head = DOC_HEAD.match(text)
-            pending = doc_head.group(1) if doc_head else None
             name = None
         if name and previous is not None and name.startswith(KEY_PREFIX):
             totals[name.rsplit(".", 1)[0]] += max(0.0, now - previous)

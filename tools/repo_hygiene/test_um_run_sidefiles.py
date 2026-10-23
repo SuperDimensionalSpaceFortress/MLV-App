@@ -212,9 +212,17 @@ class _Share(unittest.TestCase):
             "    while (-not (Test-Path -LiteralPath $tickHold) -and [DateTime]::UtcNow -lt $tickUntil) { Start-Sleep -Milliseconds 20 }\n"
             "  }\n"
             "  $tickLine = '{0} {1}' -f $tickN, [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()\n"
+            "  $tickWritten = $false; $tickError = ''\n"
             "  for ($tickTry = 0; $tickTry -lt 40; $tickTry++) {\n"
-            "    try { Add-Content -LiteralPath $tickLog -Value $tickLine -Encoding ascii -ErrorAction Stop; break }\n"
-            "    catch { Start-Sleep -Milliseconds 25 }\n"
+            "    try { Add-Content -LiteralPath $tickLog -Value $tickLine -Encoding ascii -ErrorAction Stop; $tickWritten = $true; break }\n"
+            "    catch { $tickError = $_.Exception.Message; Start-Sleep -Milliseconds 25 }\n"
+            "  }\n"
+            # um-run's loop catch rewraps a hook throw as UNRESOLVED naming only the exception type,
+            # so the path and the last error also go to stderr, where the waiting test reports them.
+            "  if (-not $tickWritten) {\n"
+            "    $tickFail = \"TICK_LOG_WRITE_EXHAUSTED: 40 tries to append poll $tickN to $tickLog all failed; last error: $tickError\"\n"
+            "    [Console]::Error.WriteLine($tickFail)\n"
+            "    throw $tickFail\n"
             "  }\n"
             f"  if ($tickN -eq {action_poll}) {{ {action_body} }}\n"
             "}\n"
@@ -254,7 +262,10 @@ class _Share(unittest.TestCase):
         while time.monotonic() < deadline:
             if len(self.ticks()) >= count:
                 return
-            self.assertIsNone(proc.poll(), f"um-run exited before it started poll {count}")
+            if proc.poll() is not None:
+                stdout, stderr = proc.communicate()
+                output = _ANSI_ESCAPE.sub("", (stdout or "") + (stderr or "")).strip()
+                self.fail(f"um-run exited before it started poll {count}: {output[-2000:]}")
             time.sleep(0.05)
         self.fail(f"um-run never started poll {count} within {within}s (saw {len(self.ticks())})")
 
@@ -921,6 +932,27 @@ class UmRunEndToEndTests(_Share):
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("UMRUN_TIMEOUT_SEC_INVALID", proc.stdout + proc.stderr)
         self.assertEqual(self.names(), [], "a rejected -TimeoutSec must submit nothing at all")
+
+    def test_a_tick_log_that_cannot_be_written_fails_naming_the_path_and_the_last_error(self) -> None:
+        # CoS on #460: the tick hook's write retry (40 tries, catch -> sleep) used to end silently
+        # when every try failed, so a test waiting on polls saw no poll and no reason. A directory
+        # at the tick log's path makes every Add-Content fail; the client must stop at its first
+        # poll and the waiting test must fail with the path and the last error.
+        ticks_path = self.tmp / "client-ticks.log"
+        ticks_path.mkdir()
+        proc = self.start_ticked("-TimeoutSec", "1", "-MaxQueueWaitSec", "1")
+        try:
+            with self.assertRaises(AssertionError) as caught:
+                self.wait_for_polls(proc, 1)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            proc.communicate()
+        message = str(caught.exception)
+        self.assertIn(f"TICK_LOG_WRITE_EXHAUSTED: 40 tries to append poll 1 to {ticks_path} all failed",
+                      message, message)
+        self.assertIn("last error:", message, message)
+        self.assertIn("THREW UNRESOLVED:", message, message)
 
     def test_the_callers_timeout_reaches_the_agent_as_the_jobs_own_budget(self) -> None:
         # The bug this closes: -TimeoutSec bounded only the client poll, so the agent ran every job
