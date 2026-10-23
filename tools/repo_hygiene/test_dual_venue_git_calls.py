@@ -31,6 +31,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import uuid
@@ -621,6 +622,34 @@ class GitCallsAreBoundedTests(unittest.TestCase):
         self.assertNotIn("(killed)", unconfirmed)
 
 
+SLEEPER_SCAN_CALL_CAP_SECONDS = 60.0   # the most one discovery subprocess may take, however large the wait budget is
+SLEEPER_SCAN_FLOOR_SECONDS = 0.5       # the least a discovery call is given, so a spent budget never hands subprocess a zero or negative timeout
+SLEEPER_WAIT_TOTAL_SECONDS = 30.0      # total elapsed bound of `_wait_for_sleeper`, discovery calls included (a healthy run returns on its first scan)
+HANG_GUARD_SECONDS = 30.0              # the watchdog limit for a test whose regression would spin or block
+
+
+def _call_with_hang_guard(test: unittest.TestCase, fn, limit: float):
+    """Run `fn()` on a daemon thread and fail `test` if it has not returned within `limit` seconds, so a regression that hangs (a loop that stops
+    honouring its deadline, a call that never times out) fails this test instead of stalling the shard until the job timeout. Returns fn's value;
+    an exception it raised is re-raised here. A hung body is abandoned (daemon), not killed."""
+    box: dict[str, object] = {}
+
+    def body() -> None:
+        try:
+            box["value"] = fn()
+        except BaseException as exc:   # re-raised on the calling thread, assertion failures included
+            box["error"] = exc
+
+    worker = threading.Thread(target=body, daemon=True)
+    worker.start()
+    worker.join(limit)
+    if worker.is_alive():
+        test.fail(f"the guarded body did not return within {limit} s (hung): a deadline or timeout stopped bounding it")
+    if "error" in box:
+        raise box["error"]   # type: ignore[misc]
+    return box.get("value")
+
+
 def _own_sleep_token(seconds: str = "60") -> str:
     """A duration no other process on the host runs: ``<seconds>.<nine random digits>`` (``sleep 60.482913706``; GNU and BSD sleep take a
     fraction). r2 (sol on #504): a before/after diff of every ``sleep 60`` pid is not identity, so two tests (or another lane) overlapping on
@@ -639,22 +668,22 @@ def _sleeper_pids_from_ps(ps_output: str, token: str = "60") -> set[int]:
     return found
 
 
-def _sleepers(token: str) -> set[int]:
+def _sleepers(token: str, timeout: float = SLEEPER_SCAN_CALL_CAP_SECONDS) -> set[int]:
     """Pids of the processes running exactly `sleep <token>` (the straggler of the aliases above; token from _own_sleep_token). There is no
     before/after set: the token is the identity. HARDENING-2 (4): Windows asks CIM, Linux reads /proc, anything else with no /proc (macOS)
-    asks ps."""
+    asks ps. `timeout` bounds the CIM / ps subprocess (subprocess.TimeoutExpired past it); /proc is a directory read and has none."""
     found: set[int] = set()
     if sys.platform == "win32":
         pattern = re.compile(r'sleep(\.exe)?"?\s+' + re.escape(token) + r'\s*$', re.IGNORECASE)   # a sleep started by path reads `sleep.EXE`
         query = "Get-CimInstance Win32_Process -Filter \"Name='sleep.exe'\" | ForEach-Object { '' + $_.ProcessId + [char]9 + $_.CommandLine }"
-        out = subprocess.run([PWSH, *PWSH_ARGS, "-Command", query], capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL).stdout
+        out = subprocess.run([PWSH, *PWSH_ARGS, "-Command", query], capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL).stdout
         for line in out.splitlines():
             pid, _, cmd = line.partition("\t")
             if pid.strip().isdigit() and pattern.search(cmd.strip()):
                 found.add(int(pid))
         return found
     if not Path("/proc").is_dir():
-        return _sleeper_pids_from_ps(subprocess.run(["ps", "-axo", "pid=,args="], capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL).stdout, token)
+        return _sleeper_pids_from_ps(subprocess.run(["ps", "-axo", "pid=,args="], capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL).stdout, token)
     return _sleepers_from_proc(token)
 
 
@@ -713,16 +742,27 @@ def _sleeper_diagnostic(token: str, proc: subprocess.Popen, found: set[int], pro
     return "\n".join(lines)
 
 
-def _wait_for_sleeper(token: str, proc: subprocess.Popen, timeout: float = 5.0, interval: float = 0.02) -> set[int]:
+def _wait_for_sleeper(token: str, proc: subprocess.Popen, timeout: float = SLEEPER_WAIT_TOTAL_SECONDS, interval: float = 0.02) -> set[int]:
     """Scan for `sleep <token>`, and while the test's own child `proc` is alive but not yet named, scan again until it is or `timeout` passes.
     Popen returns once exec has begun, not once the new image's argv is published (Linux sets mm->arg_end late in the ELF load, so /proc/<pid>/
     cmdline reads empty in between). This waits for a pid the test just started; it never widens what discovery may name, and the caller still
-    asserts the exact set, so an extra pid or a child that never shows up still fails."""
-    found = _sleepers(token)
+    asserts the exact set, so an extra pid or a child that never shows up still fails.
+    `timeout` is the TOTAL bound, first scan included: the one deadline starts before the first scan and every discovery call is handed the budget
+    left (at most SLEEPER_SCAN_CALL_CAP_SECONDS, at least SLEEPER_SCAN_FLOOR_SECONDS), so a slow call cannot run past it. Worst case is `timeout`
+    plus the floor plus one `interval`. A call that exhausts its budget counts as a scan that named nothing, and the caller's assertion fails."""
     deadline = time.monotonic() + timeout
+
+    def scan() -> set[int]:
+        budget = max(SLEEPER_SCAN_FLOOR_SECONDS, min(deadline - time.monotonic(), SLEEPER_SCAN_CALL_CAP_SECONDS))
+        try:
+            return _sleepers(token, timeout=budget)
+        except subprocess.TimeoutExpired:
+            return set()
+
+    found = scan()
     while proc.pid not in found and proc.poll() is None and time.monotonic() < deadline:
         time.sleep(interval)
-        found = _sleepers(token)
+        found = scan()
     return found
 
 
@@ -781,11 +821,11 @@ class SleeperDiscoveryTests(unittest.TestCase):
         module = sys.modules[__name__]
         real, blind_once = module._sleepers, set()
 
-        def blind_on_first_scan(token: str) -> set[int]:
+        def blind_on_first_scan(token: str, **kwargs: float) -> set[int]:
             if token not in blind_once:
                 blind_once.add(token)
                 return set()
-            return real(token)
+            return real(token, **kwargs)
 
         inner = SleeperDiscoveryTests("test_two_overlapping_sleeper_tests_each_count_and_terminate_only_their_own_child")
         result = unittest.TestResult()
@@ -831,6 +871,11 @@ class SleeperDiscoveryTests(unittest.TestCase):
         self.assertIn("pid 999: " + str(root / "999") + " absent", _sleeper_diagnostic("60.5", mock.Mock(pid=999, **{"poll.return_value": 0}), set(), root))
 
     def test_the_wait_for_the_own_child_is_bounded_and_never_accepts_a_different_pid(self) -> None:
+        # DV-SLEEPER-RESCAN-DEADLINE-SCOPE-1: this is the test a regression would hang (a rescan loop that stops honouring its deadline spins
+        # forever), so its body runs under a watchdog that fails it instead of letting it stall the shard.
+        _call_with_hang_guard(self, self._check_the_wait_is_bounded, HANG_GUARD_SECONDS)
+
+    def _check_the_wait_is_bounded(self) -> None:
         alive = mock.Mock(pid=301, **{"poll.return_value": None})
         with mock.patch.object(sys.modules[__name__], "_sleepers", side_effect=[set(), set(), {301}]) as scan:
             self.assertEqual(_wait_for_sleeper("60.5", alive, timeout=5.0, interval=0.0), {301})
@@ -843,6 +888,86 @@ class SleeperDiscoveryTests(unittest.TestCase):
         with mock.patch.object(sys.modules[__name__], "_sleepers", return_value=set()) as scan:
             self.assertEqual(_wait_for_sleeper("60.5", exited, timeout=5.0), set())
             self.assertEqual(scan.call_count, 1, "an own child that has already exited is not waited for")
+
+    def test_the_hang_guard_fails_a_body_that_never_returns_instead_of_hanging(self) -> None:
+        release = threading.Event()
+        self.addCleanup(release.set)   # lets the abandoned daemon thread end once the assertion below has seen the failure
+        started = time.monotonic()
+        with self.assertRaises(self.failureException) as raised:
+            _call_with_hang_guard(self, lambda: release.wait(60), 0.3)
+        self.assertLess(time.monotonic() - started, 10.0, "the guard returns at its limit, not when the body does")
+        self.assertIn("did not return within 0.3 s", str(raised.exception))
+        self.assertEqual(_call_with_hang_guard(self, lambda: 7, 5.0), 7)
+        with self.assertRaises(KeyError):
+            _call_with_hang_guard(self, lambda: {}["missing"], 5.0)
+
+    def _slow_first_discovery(self, first_call_seconds: float, found_after_first: set[int]):
+        """A stand-in for `_sleepers` whose first call takes `first_call_seconds` of wall time and which, like the real subprocess, honours the
+        timeout it is given (it raises TimeoutExpired once that passes). Records every timeout it was handed."""
+        timeouts: list[float | None] = []
+
+        def discovery(token: str, timeout: float | None = None) -> set[int]:
+            timeouts.append(timeout)
+            first = len(timeouts) == 1
+            limit = first_call_seconds if first else 0.0
+            allowed = timeout if timeout is not None else 60.0
+            time.sleep(min(limit, allowed))
+            if limit > allowed:
+                raise subprocess.TimeoutExpired("discovery", allowed)
+            return set() if first else set(found_after_first)
+
+        return discovery, timeouts
+
+    def test_a_slow_first_discovery_cannot_stretch_the_wait_past_its_total_bound(self) -> None:
+        # DV-SLEEPER-RESCAN-DEADLINE-SCOPE-1 (Dot R18 advisory on #624): the deadline used to start AFTER the first scan and could not interrupt a
+        # call already running, so "5 s" bounded only the retry window and one 60 s discovery call sat outside it. Fixture: the first discovery call
+        # would take 1.5 s, the total budget is 1.0 s. The wait must give up at about the budget (plus the floor of one call), not after
+        # 1.5 s + a fresh 1.0 s window.
+        discovery, timeouts = self._slow_first_discovery(1.5, set())
+        alive = mock.Mock(pid=401, **{"poll.return_value": None})
+
+        def run() -> set[int]:
+            with mock.patch.object(sys.modules[__name__], "_sleepers", discovery):
+                return _wait_for_sleeper("60.5", alive, timeout=1.0, interval=0.01)
+
+        started = time.monotonic()
+        found = _call_with_hang_guard(self, run, HANG_GUARD_SECONDS)
+        elapsed = time.monotonic() - started
+        self.assertEqual(found, set(), "a discovery that never answered inside the budget names nothing; the caller's assertion then fails with a diagnostic")
+        self.assertLess(elapsed, 1.0 + SLEEPER_SCAN_FLOOR_SECONDS + 0.5, f"total elapsed {elapsed:.2f} s exceeds budget + one floor-sized call + slack")
+        self.assertTrue(timeouts and timeouts[0] is not None and 0 < timeouts[0] <= 1.0, f"the first call must be handed the remaining budget, got {timeouts}")
+        for given in timeouts:
+            self.assertTrue(given is not None and SLEEPER_SCAN_FLOOR_SECONDS <= given <= SLEEPER_SCAN_CALL_CAP_SECONDS, f"every call is handed a timeout between the floor and the per-call cap: {timeouts}")
+
+    def test_each_discovery_call_gets_the_remaining_budget_capped_per_call_and_floored(self) -> None:
+        alive = mock.Mock(pid=402, **{"poll.return_value": None})
+        seen: list[float] = []
+
+        def discovery(token: str, timeout: float | None = None) -> set[int]:
+            seen.append(timeout)
+            return set()
+
+        with mock.patch.object(sys.modules[__name__], "_sleepers", discovery):
+            started = time.monotonic()
+            _wait_for_sleeper("60.5", alive, timeout=1.0, interval=0.05)
+            self.assertLess(time.monotonic() - started, 5.0)
+        self.assertGreater(len(seen), 1, "an unnamed own child is rescanned until the budget is spent")
+        self.assertLessEqual(seen[0], 1.0,"the first call is bounded by the whole budget, not by the 60 s per-call cap")
+        self.assertEqual(seen[-1], SLEEPER_SCAN_FLOOR_SECONDS, "past the deadline a call is floored, never zero or negative")
+        self.assertTrue(all(0 < t <= SLEEPER_SCAN_CALL_CAP_SECONDS for t in seen), seen)
+        big: list[float] = []
+        with mock.patch.object(sys.modules[__name__], "_sleepers", lambda token, timeout=None: (big.append(timeout), {402})[1]):
+            self.assertEqual(_wait_for_sleeper("60.5", alive, timeout=500.0), {402})
+        self.assertEqual(big, [SLEEPER_SCAN_CALL_CAP_SECONDS], "a budget larger than the per-call cap is clamped to the cap")
+
+    def test_a_slow_but_healthy_first_discovery_inside_the_budget_still_names_the_child(self) -> None:
+        # The flakiness guard for the bound: a host whose first discovery is slow (0.4 s here against a 2 s budget) must still pass.
+        discovery, timeouts = self._slow_first_discovery(0.4, {403})
+        alive = mock.Mock(pid=403, **{"poll.return_value": None})
+        with mock.patch.object(sys.modules[__name__], "_sleepers", discovery):
+            found = _call_with_hang_guard(self, lambda: _wait_for_sleeper("60.5", alive, timeout=2.0, interval=0.01), HANG_GUARD_SECONDS)
+        self.assertEqual(found, {403})
+        self.assertEqual(len(timeouts), 2, "one slow miss, then one hit on the rescan")
 
     @unittest.skipIf(sys.platform == "win32" or Path("/proc").is_dir(), "the ps path is for platforms without /proc (macOS)")
     def test_discovery_runs_where_there_is_no_proc(self) -> None:
