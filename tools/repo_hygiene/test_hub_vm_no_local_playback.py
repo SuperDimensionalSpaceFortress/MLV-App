@@ -3654,13 +3654,74 @@ class CompileStepAndReadMentionTests(unittest.TestCase):
         ("sentence host reference", "if ($hm.Index -ne $Index) { return $false }", "if ($false) { return $false }", "mut-sentence-host-reference"),
     )
 
+    # LOCAL-PLAYBACK-LINT-EXEMPT-SENTENCE-PRONOUN-FOLLOWUP-1 (Dot R18 advisory 58a56d93 on #619). An exemption covers its OWN sentence (C1 also
+    # reads the next line of a bare launch verb) and nothing after it. What a LATER sentence or line says is judged by the lint on its own.
+    # (label, exempted text, joiner, follow-up): the joiner is a space (one block, one line) or a line break (adjacent lines).
+    C1_EXEMPT = "Assemble locally, stage the smoke runner to Bachelor, then run the chains."
+    C1_COMPILE = "Build it locally with qmake."
+    C2_EXEMPT = f"Confirm from the runner ({PARAM}ValidateSet)."
+    SPACE, BREAK = " ", "\n"
+    # (label, text): C1's bare launch verb ends the line and a PRONOUN object opens the next line. The drive object must be a DriveObjects
+    # word, so every pronoun is refused (it, that, this, this build, the build, the app, them), with and without a clip, bare and on a clip.
+    NEXT_LINE_PRONOUNS = ("it", "that", "this", "this build", "the build", "the app", "them")
+    # (label, exempted text, joiner, follow-up): the follow-up names its own playback / launcher, so the lint refuses IT; the exemption of the
+    # first sentence must not hide it, whether it sits in the same line or on the next one.
+    FOLLOW_UP_REFUSE = (
+        ("c1-then-playback-here", C1_EXEMPT, SPACE, "Then run playback here."),
+        ("c1-line-playback-here", C1_EXEMPT, BREAK, "Then run playback here."),
+        ("c1-then-smoke-runner-here", C1_EXEMPT, SPACE, "Then run the smoke runner here."),
+        ("c1-line-smoke-runner-locally", C1_EXEMPT, BREAK, "Then run the smoke runner locally."),
+        ("c1-compile-then-playback-here", C1_COMPILE, SPACE, "Then run playback here."),
+        ("c1-compile-line-playback-here", C1_COMPILE, BREAK, "Then run playback here."),
+        ("c2-then-playback-here", C2_EXEMPT, SPACE, "Then run playback here."),
+        ("c2-line-playback-here", C2_EXEMPT, BREAK, "Then run playback here."),
+        ("c2-then-launcher-cuda", C2_EXEMPT, SPACE, f"Then run {PARAM}cuda."),
+        ("c2-line-launcher-cuda", C2_EXEMPT, BREAK, f"Then run {PARAM}cuda."),
+    )
+    # (label, exempted text, joiner, follow-up): the follow-up is not a launch, so the pair stays ALLOWED.
+    FOLLOW_UP_PASS = (
+        ("d-compile-then-commit", C1_COMPILE, SPACE, "Then commit it."),
+        ("d-compile-line-commit", C1_COMPILE, BREAK, "Then commit it."),
+        ("d-c1-then-commit", C1_EXEMPT, SPACE, "Then commit it."),
+        ("d-c1-line-commit", C1_EXEMPT, BREAK, "Then commit it."),
+        ("d-c2-then-commit", C2_EXEMPT, SPACE, "Then commit it."),
+        ("d-c2-line-commit", C2_EXEMPT, BREAK, "Then commit it."),
+    )
+    # (label, exempted text, joiner, follow-up): KNOWN GAP, not caused by C1 or C2. The follow-up is a pronoun launch with no playback word, so
+    # the lint (sentence-local, no antecedent resolution) allows it ALONE as well ("Then run it on M16-1243." is allowed with no exemption in play,
+    # see test_pronoun_only_follow_ups_are_a_gap_of_the_whole_lint_not_of_the_exemptions). Dot's examples are the first rows. If the lint ever
+    # learns to refuse a pronoun launch, these rows turn red and move to FOLLOW_UP_REFUSE in the same change.
+    FOLLOW_UP_PRONOUN_GAP = (
+        ("gap-compile-then-run-it-on-a-clip", C1_COMPILE, SPACE, "Then run it on M16-1243."),
+        ("gap-compile-line-run-it-on-a-clip", C1_COMPILE, BREAK, "Then run it on M16-1243."),
+        ("gap-c2-then-run-it-with-cuda", C2_EXEMPT, SPACE, "Then run it with cuda."),
+        ("gap-c2-line-run-it-with-cuda", C2_EXEMPT, BREAK, "Then run it with cuda."),
+        ("gap-c1-then-run-it-here", C1_EXEMPT, SPACE, "Then run it here."),
+        ("gap-c1-line-run-it-locally", C1_EXEMPT, BREAK, "Then run it locally."),
+    )
+
+    @classmethod
+    def _next_line_pronoun_rows(cls) -> list[tuple[str, str]]:
+        rows = []
+        for pron in cls.NEXT_LINE_PRONOUNS:
+            rows.append((f"c1-next-line-pronoun-{pron.replace(' ', '-')}-on-a-clip", f"Build MLVApp locally, then run\n{pron} on M16-1243."))
+            rows.append((f"c1-next-line-pronoun-{pron.replace(' ', '-')}-bare", f"Build MLVApp locally, then run\n{pron}."))
+        return rows
+
+    @classmethod
+    def _pairs(cls, table) -> list[tuple[str, str, str, str]]:
+        """(label, pair text, exempted text, follow-up): the pair is the two texts joined as the table says."""
+        return [(label, first + joiner + follow, first, follow) for label, first, joiner, follow in table]
+
     @classmethod
     def setUpClass(cls):
         cls.tmp = Path(tempfile.mkdtemp(prefix="hubvm-compile-mention-"))
         cls.lists = _lint_word_lists(LINT_PS1, cls.tmp)
         cls.member_rows = cls._member_rows(cls.lists)
+        cls.pair_tables = {name: cls._pairs(getattr(cls, name)) for name in ("FOLLOW_UP_REFUSE", "FOLLOW_UP_PASS", "FOLLOW_UP_PRONOUN_GAP")}
         texts = ([t for _, t in cls.MUST_PASS] + [t for _, t in cls.MUST_REFUSE] + [t for _, t in cls.MUTATION_REFUSE]
-                 + [t for _, _, t in cls.member_rows])
+                 + [t for _, _, t in cls.member_rows] + [t for _, t in cls._next_line_pronoun_rows()]
+                 + [x for rows in cls.pair_tables.values() for _, pair, first, follow in rows for x in (pair, first, follow)])
         counts = _batch_counts(LINT_PS1, texts, cls.tmp, "compile-mention")
         cls.verdicts = dict(zip(texts, counts))
 
@@ -3737,6 +3798,39 @@ class CompileStepAndReadMentionTests(unittest.TestCase):
             if _batch_counts(mutant, [rows[label]], self.tmp, f"mutant-{n}") != [0]:
                 survivors.append(guard)
         self.assertEqual([], survivors, "removing these guards admits nothing, so no fixture pins them")
+
+    def test_a_pronoun_on_the_next_line_of_a_bare_launch_verb_is_refused(self):
+        """LOCAL-PLAYBACK-LINT-EXEMPT-SENTENCE-PRONOUN-FOLLOWUP-1: C1 reads the next line of a bare launch verb, and only a DriveObjects word may open it."""
+        rows = self._next_line_pronoun_rows()
+        self.assertEqual(2 * len(self.NEXT_LINE_PRONOUNS), len(rows))
+        wrong = [label for label, text in rows if self.verdicts[text] == 0]
+        self.assertEqual([], wrong, "a pronoun object carried the launch through the compile-step exemption")
+
+    def test_a_follow_up_with_its_own_marker_is_refused_after_an_exempted_sentence(self):
+        """The exemption of the first sentence hides nothing in the second: the pair is refused, and the follow-up alone is refused too."""
+        rows = self.pair_tables["FOLLOW_UP_REFUSE"]
+        self.assertTrue(rows)
+        wrong = [label for label, pair, first, follow in rows
+                 if self.verdicts[first] != 0 or self.verdicts[follow] == 0 or self.verdicts[pair] != self.verdicts[follow]]
+        self.assertEqual([], wrong, "an exempted sentence swallowed (or changed) the verdict of the sentence after it")
+
+    def test_a_follow_up_that_is_not_a_launch_stays_allowed_after_an_exempted_sentence(self):
+        rows = self.pair_tables["FOLLOW_UP_PASS"]
+        self.assertTrue(rows)
+        wrong = [label for label, pair, first, follow in rows if self.verdicts[pair] != 0 or self.verdicts[follow] != 0]
+        self.assertEqual([], wrong, "the exemption leaked a refusal onto a follow-up that launches nothing")
+
+    def test_pronoun_only_follow_ups_are_a_gap_of_the_whole_lint_not_of_the_exemptions(self):
+        """Dot's R18 examples ("Build it locally. Then run it on M16-1243.") are ALLOWED -- and so is the follow-up ALONE, with no exemption in
+        play: the lint is sentence-local and refuses a launch only when its own sentence holds a playback word, so a bare pronoun object
+        ("run it", "run it here", "run it on a clip") is invisible to every rule. That is a different card (it needs an antecedent policy:
+        "run it" after a build is a launch, "run it" after a test list is not); this table pins that C1 and C2 neither cause nor widen it.
+        A lint that starts refusing a pronoun launch turns these rows red: move them to FOLLOW_UP_REFUSE in that change."""
+        rows = self.pair_tables["FOLLOW_UP_PRONOUN_GAP"]
+        self.assertTrue(rows)
+        wrong = [label for label, pair, first, follow in rows
+                 if self.verdicts[first] != 0 or self.verdicts[follow] != 0 or self.verdicts[pair] != 0]
+        self.assertEqual([], wrong, "a pronoun follow-up is now refused (the gap is closed: move the row to FOLLOW_UP_REFUSE) or the exemption broke")
 
 
 @requires_pwsh
