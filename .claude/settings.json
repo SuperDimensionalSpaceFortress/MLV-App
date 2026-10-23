@@ -50,7 +50,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"C:/Users/obabalola/AppData/Local/Python/bin/python.exe\" \"${CLAUDE_PROJECT_DIR}/tools/check-doc-size.py\" --repo \"${CLAUDE_PROJECT_DIR}\" --warn-only --trace .claude-state/doc-size-runs.log",
+            "command": "\"C:/Users/obabalola/AppData/Local/Python/bin/python.exe\" \"${CLAUDE_PROJECT_DIR}/tools/docs/run_doc_size.py\" --repo \"${CLAUDE_PROJECT_DIR}\" --warn-only --trace .claude-state/doc-size-runs.log",
             "statusMessage": "Doc size budget report"
           },
           {

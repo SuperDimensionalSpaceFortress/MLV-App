@@ -15,7 +15,6 @@ Enforced by two scripts, deliberately separate:
 | Script | Checks | Comparable across fleet |
 |---|---|---|
 | [`tools/docs/run_doc_size.py`](../tools/docs/run_doc_size.py) -> the bus `check-doc-size` **run by pin** (`factory-pins/factory-pins.json`), budgets in [`tools/docs/doc-size-budget.config.json`](../tools/docs/doc-size-budget.config.json) | byte budgets by role | yes - one implementation, the pinned bus bytes; only the config is repo-specific |
-| `tools/check-doc-size.py` (**retiring** - see "Pinned runs") | the same budgets, old project copy | no - its only remaining caller is the `Stop` hook below |
 | [`tools/docs/check_pinned_tokens.py`](../tools/docs/check_pinned_tokens.py) | splits do not drop closeout-asserted substrings | no - this hazard is specific to this repo |
 
 Re-derive every number below rather than trusting the snapshot:
@@ -252,7 +251,7 @@ across all repos sharing the sentinel and land in the same work block.
 
 | Mechanism | Status |
 |---|---|
-| `Stop` hook -> `tools/check-doc-size.py --warn-only --trace` (still the old copy: moving it to `tools/docs/run_doc_size.py` is an edit of `.claude/settings.json`, which CHECK-DOC-SIZE-SINGLE-SOURCE-1 r1 could not make - successor card) | **wired and OBSERVED FIRING** 2026-07-27T21:59:43Z; always exits 0 |
+| `Stop` hook -> `tools/docs/run_doc_size.py --warn-only --trace` (moved off the retired project copy by CHECK-DOC-SIZE-SINGLE-SOURCE-2) | **wired and OBSERVED FIRING** 2026-07-27T21:59:43Z; always exits 0 |
 | `PostToolUse` hook -> `check_pinned_tokens.py --hook` | **wired and OBSERVED FIRING**; fails open on any input |
 | Closeout audit harness gate | **deliberately not wired** |
 | Pre-commit gate | **not touched** |
