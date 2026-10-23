@@ -182,6 +182,28 @@ class MixedMeasuredFieldTests(unittest.TestCase):
         self.assertRegex(row, r"\s19\.0 ms\s+18\.2%\s+\(measured 1/10\)$")
 
 
+RATIO_DISCLOSURE = (
+    "  note: % = ratio of measured-only mean to all-frame render mean; "
+    "not additive when coverage < 100 %\n"
+)
+
+
+class RatioDisclosureTests(unittest.TestCase):
+    def test_mixed_coverage_split_discloses_the_percentages_are_ratios(self) -> None:
+        output = run_analyzer(mixed_log())
+        self.assertIn(RATIO_DISCLOSURE, output)
+        # The note closes the split block, after its last row.
+        self.assertTrue(output.endswith(RATIO_DISCLOSURE), output)
+        # Disclosure is label-only: the percentage cells keep their pre-note values.
+        self.assertRegex(
+            split_row(output, "processed8 (processing+pack)"), r"\s20\.0 ms\s+19\.1%\s+\(measured 1/10\)$"
+        )
+
+    def test_full_coverage_logs_carry_no_disclosure(self) -> None:
+        self.assertNotIn("note:", run_analyzer(numeric_only_log()))
+        self.assertNotIn("note:", run_analyzer(all_na_log()))
+
+
 class NumericOnlyLogUnchangedTests(unittest.TestCase):
     def test_numeric_only_output_is_byte_identical_to_the_pre_na_analyzer(self) -> None:
         self.assertEqual(NUMERIC_ONLY_EXPECTED, run_analyzer(numeric_only_log()))
