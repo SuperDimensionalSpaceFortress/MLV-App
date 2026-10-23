@@ -1326,9 +1326,65 @@ def test_nlf_the_running_git_version_is_recorded_in_the_log(record_property):
     print(line)
     record_property("running_git", text.strip())
     record_property("honours_no_lazy_fetch", honours)
-    if not honours:
-        warnings.warn(line + " -- the nlf behavioural tests are SKIPPED on this git", stacklevel=1)
+    step_summary = os.environ.get("GITHUB_STEP_SUMMARY")   # hosted runners set it; a missing or unwritable file is not a failure
+    if step_summary:
+        try:
+            with open(step_summary, "a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+        except OSError:
+            pass
+    # Warn on BOTH branches: a passing run drops print() and an un-exported record_property, but prints its warnings summary.
+    warnings.warn(line + ("" if honours else " -- the nlf behavioural tests are SKIPPED on this git"), stacklevel=1)
     assert version is not None, f"the running git reports an unparseable version: {text!r}"
+
+
+# The hosted step is a plain `python -m pytest ... -q`: default capture, no JUnit export. A passing test's print() is dropped
+# there, and record_property reaches nobody without a JUnit file, so the record has to travel as a warning (the warnings
+# summary prints under -q) and, on a hosted runner, as a line in the file GITHUB_STEP_SUMMARY names. The repo sets no
+# filterwarnings anywhere (no pytest.ini / pyproject.toml / setup.cfg / tox.ini; tests/coordination/conftest.py only installs
+# the fast-git shim), so a plain UserWarning is neither hidden nor turned into a failure.
+_PIN_GIT_PLUGIN = '''\
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _pin_running_git(request):
+    request.module.ob.git_version_text = lambda: "git version 2.44.0"
+'''
+
+
+def _run_recording_test_like_hosted_ci(tmp_path: Path, step_summary: Path | None) -> subprocess.CompletedProcess:
+    (tmp_path / "nlf_pin_git_plugin.py").write_text(_PIN_GIT_PLUGIN, encoding="utf-8")
+    env = {k: v for k, v in os.environ.items() if k not in ("GITHUB_STEP_SUMMARY", "PYTEST_ADDOPTS", "PYTHONPATH")}
+    env["PYTHONPATH"] = str(tmp_path)
+    if step_summary is not None:
+        env["GITHUB_STEP_SUMMARY"] = str(step_summary)
+    test_id = f"{Path(__file__).resolve()}::test_nlf_the_running_git_version_is_recorded_in_the_log"
+    return subprocess.run([sys.executable, "-m", "pytest", test_id, "-q", "-p", "no:cacheprovider", "-p", "nlf_pin_git_plugin"],
+                          cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=300)
+
+
+def test_nlf_a_modern_git_passing_run_still_retains_the_version_line(tmp_path):
+    done = _run_recording_test_like_hosted_ci(tmp_path, None)
+    out = done.stdout + done.stderr
+    assert done.returncode == 0 and "1 passed" in out, out
+    assert "git version 2.44.0" in out and "honours_GIT_NO_LAZY_FETCH(>=2.44)=True" in out, out
+    assert "=True -- the nlf behavioural tests are SKIPPED" not in out, out   # a modern git skips nothing; the line must not claim it did
+
+
+def test_nlf_the_version_line_is_appended_to_the_hosted_step_summary(tmp_path):
+    step_summary = tmp_path / "step-summary.md"
+    step_summary.write_text("earlier step\n", encoding="utf-8")
+    done = _run_recording_test_like_hosted_ci(tmp_path, step_summary)
+    assert done.returncode == 0, done.stdout + done.stderr
+    written = step_summary.read_text(encoding="utf-8")
+    assert written.startswith("earlier step\n") and "git version 2.44.0" in written and "honours_GIT_NO_LAZY_FETCH(>=2.44)=True" in written, written
+
+
+def test_nlf_an_unwritable_step_summary_never_fails_the_recording_test(tmp_path):
+    done = _run_recording_test_like_hosted_ci(tmp_path, tmp_path / "no-such-dir" / "step-summary.md")
+    out = done.stdout + done.stderr
+    assert done.returncode == 0 and "1 passed" in out and "honours_GIT_NO_LAZY_FETCH(>=2.44)=True" in out, out
 
 
 # ---------- ROUTE-RULING-CITATION-STATUS-WORD-COLON-1 + ROUTE-RULING-CITATION-SELF-PATH-STATUS-1: what a citation is NOT ----------
